@@ -82,13 +82,12 @@
 //! and real trailers. It is not an HTTPS/2 or ALPN claim, not a full
 //! client, and not a full RFC feature clone.
 //!
-//! gRPC: [`GrpcRouter`] layers unary plus first server-streaming and
-//! client-streaming `prost` messages with typed [`GrpcStatus`] trailers
-//! on that HTTP/2 h2c server. It rejects compression, caps message
-//! bytes before protobuf decode, maps service call timeout to
-//! `DeadlineExceeded`, and keeps bidirectional streaming, interceptors,
-//! reflection, production pooled clients, and TLS ALPN out of this
-//! first form.
+//! gRPC: [`GrpcRouter`] layers unary, server-streaming, client-streaming,
+//! and first bidirectional streaming `prost` messages with typed
+//! [`GrpcStatus`] trailers on that HTTP/2 h2c server. It rejects
+//! compression, caps message bytes before protobuf decode, maps service call
+//! timeout to `DeadlineExceeded`, and keeps interceptors, reflection,
+//! production pooled clients, and TLS ALPN out of this first form.
 //!
 //! WebSocket: [`websocket_upgrade`] validates server-side HTTP/1.1
 //! upgrades for [`HttpListener`] and [`HttpsListener`]. After the
@@ -137,9 +136,12 @@ pub use body_metrics::{BodyCapacityFull, BodyMetrics, BodyPressureReport};
 pub use client::{HttpClient, HttpClientMsg, OutboundCall};
 pub use connection::{HttpConnection, HttpConnectionMsg, response_for_call_outcome};
 pub use grpc::{
-    GrpcClientStreamingRequest, GrpcError, GrpcLimits, GrpcRequest, GrpcResponse, GrpcRouter,
-    GrpcRouterMsg, GrpcServerStreamingResponse, GrpcStatus, GrpcStatusCode,
-    decode_streaming_request, decode_unary_request, encode_grpc_message, grpc_unary_call_h2c,
+    GrpcClientStreamingRequest, GrpcError, GrpcLimits, GrpcRawStreamingRequest,
+    GrpcRawStreamingResponse, GrpcRequest, GrpcRequestStream, GrpcResponse, GrpcRouter,
+    GrpcRouterMsg, GrpcServerStreamingResponse, GrpcStatus, GrpcStatusCode, GrpcStreamReply,
+    GrpcStreamingCall, GrpcStreamingResponse, decode_streaming_request, decode_unary_request,
+    encode_grpc_message, grpc_status_trailers, grpc_stream_finish, grpc_stream_message,
+    grpc_unary_call_h2c,
 };
 pub use http2::{
     Http2Connection, Http2ConnectionMsg, Http2ConnectionReply, Http2ConnectionReport, Http2Limits,

@@ -690,6 +690,35 @@ build effects itself — that would force `tina` to depend on
 behind one helper call. Long explicit code is okay, short
 dishonest code is not.
 
+For *cancelable deferred replies* started from `handle_call`, store the whole
+pending token in `tina_runtime::PendingCancelableCallSet<K, Q, R>`. The token
+owns both the original caller authority and the child cancel handle, so
+admission failure must return it to you:
+
+```rust
+match call_ctx
+    .defer_cancelable(call_cancelable(target, msg, timeout))
+    .try_admit(&mut self.pending, id, Msg::Returned)
+{
+    Ok(effect) => effect,
+    Err(PendingCancelableInsertError::Full { token }) => {
+        reply_to_request(token.into_request_context(), Reply::Busy)
+    }
+    Err(PendingCancelableInsertError::DuplicateKey { token }) => {
+        reply_to_request(token.into_request_context(), Reply::Duplicate)
+    }
+}
+```
+
+The `id` is the domain key; the ticket carried into `Msg::Returned` is the
+exact admitted instance. Use both when removing on completion. That keeps an
+old continuation from removing a newer pending call after key reuse.
+
+On owner stop or local shutdown, drain the set and settle every token. If child
+work may still be pending, cancel the token and reply from that cancel
+continuation. Dropping the token leaks caller authority; replying without
+canceling drops the child handle and leaves the runtime doing work nobody owns.
+
 ### Deadlines
 
 `Deadline` is a value, not a wish. It does not retry, does not

@@ -10,6 +10,131 @@
   full-duplex HTTP/2 proof, grpcurl/tonic interop where practical, and clear
   client/TLS deferrals.
 - Do not run beside broad `tina-http` protocol rewrites without file ownership.
+- Current shipped HTTP/2 facts at start of Phase 098:
+  - `Http2Listener` is server-side prior-knowledge h2c only;
+  - response DATA can stream from `ResponseChunkMsg` chunk sources, is split by
+    `max_frame_size`, obeys connection/stream send windows, and resumes on
+    `WINDOW_UPDATE`;
+  - gRPC requests are exposed early as `Http2RequestStream` pull sources, with
+    window credit returned only as chunks are delivered;
+  - peer `RST_STREAM` removes the stream, replies error to a pending request
+    pull, cancels the accepted service call, and sends `ResponseChunkMsg::Cancel`
+    to a response source;
+  - request trailers are rejected/reset, not supported as a compatibility
+    claim;
+  - content-length overrun/underrun and body caps are pinned by live tests;
+  - missing at start: explicit full-duplex proof while outbound response DATA is
+    blocked and inbound DATA on the same connection continues.
+- Current shipped gRPC facts at start of Phase 098:
+  - public router names: `GrpcRouter::unary`, `GrpcRouter::server_streaming`,
+    and `GrpcRouter::client_streaming`;
+  - server-streaming returns `GrpcServerStreamingResponse` with a Tina
+    `ResponseChunkMsg` source and final status in response trailers;
+  - client-streaming currently buffers all pulled HTTP/2 request chunks inside
+    `GrpcRouter` before invoking the user handler;
+  - tonic h2c interop exists in the specimen for unary, server-streaming, and
+    client-streaming with tonic `0.12`;
+  - missing at start: bidirectional public API and tonic h2c bidi proof.
+- Phase 098 target API names:
+  - add `GrpcRouter::streaming` for bidirectional streaming RPCs;
+  - add `GrpcStreamingCall<Req, Resp>`, `GrpcRequestStream<Req>`,
+    `GrpcStreamReply<Req>`, and `GrpcStreamingResponse<Resp>`;
+  - add `GrpcRouter::streaming_raw`, `GrpcRawStreamingRequest<T>`, and
+    `GrpcRawStreamingResponse` as the advanced escape hatch.
+- Request/response ownership model for bidi:
+  - HTTP/2 owns the socket, frame parsing, stream table, and flow-control
+    windows;
+  - the Tina service receives an explicit `GrpcRequestStream<Req>` handle
+    through `GrpcStreamingCall` and pulls request messages only when ready;
+  - the response source is still a Tina `ResponseChunkMsg` source, but ordinary
+    service code can use `grpc_stream_message` and `grpc_stream_finish` instead
+    of hand-building gRPC DATA and trailers;
+  - `streaming_raw` can still expose `Http2RequestStream` and already-framed
+    response bytes for protocol adapters/tests; no Tokio/hyper/h2 runtime is
+    hidden.
+- Final-status ownership rule:
+  - successful route construction owns exactly one final status, encoded as
+    HTTP/2 trailers on the returned `HttpResponse`;
+  - streaming sources may finish with `ResponseChunkReply::GrpcStatus` when the
+    final gRPC status is discovered while processing request DATA;
+  - peer reset/cancel does not send gRPC trailers after reset; HTTP/2 cancels
+    pending request pulls, accepted service work, and response sources;
+  - service construction errors map once to typed `GrpcStatus` trailers.
+- Interop targets:
+  - required: tonic `0.12` h2c client to Tina server for unary,
+    server-streaming, client-streaming, and bidi in
+    `examples/specimen_grpc_counter`;
+  - grpcurl remains best-effort and is deferred if reflection/descriptor
+    plumbing grows beyond a small command fixture.
+- Deferrals remain exact:
+  - no production pooled Tina gRPC client;
+  - no TLS ALPN / HTTPS/2;
+  - no reflection unless deliberately scoped;
+  - no compression.
+- Completed in this PR:
+  - added `GrpcRouter::streaming`, `GrpcStreamingCall<Req, Resp>`,
+    `GrpcRequestStream<Req>`, `GrpcStreamReply<Req>`, and
+    `GrpcStreamingResponse<Resp>`;
+  - added `GrpcRouter::streaming_raw`, `GrpcRawStreamingRequest<T>`, and
+    `GrpcRawStreamingResponse` for the raw substrate escape hatch;
+  - added `ResponseChunkMsg::Http2RequestChunk` so a Tina response source can
+    pull an HTTP/2 request stream and receive the continuation through the same
+    bounded source protocol, without a hidden scheduler/runtime;
+  - added `ResponseChunkReply::GrpcStatus` so bidi sources can end with
+    non-`OK` gRPC status discovered mid-stream instead of lying with
+    precomputed `OK` trailers;
+  - added `grpc_stream_message` and `grpc_stream_finish` so user code does not
+    hand-build gRPC frame bytes or trailer maps on the typed path;
+  - proved stream-window blocked outbound DATA on one stream does not prevent
+    an unrelated stream from completing when connection credit is available;
+  - proved inbound request DATA can still be consumed while another response
+    stream is blocked on its stream window;
+  - proved bidi gRPC can send a response before request EOF;
+  - proved concurrent bidi streams do not cross-talk;
+  - proved the `streaming_raw` escape hatch can send a response before request
+    EOF and still finish with typed gRPC status trailers;
+  - proved malformed/compressed bidi request frames and declared oversized bidi
+    messages set final gRPC status;
+  - proved peer reset cancels a bidi response source;
+  - extended the specimen tonic h2c interop test to unary, server-streaming,
+    client-streaming, sequential bidirectional streaming, and concurrent
+    bidirectional clients with tonic `0.12.3`;
+  - fixed the existing deprecated `IsolateCall::reply` use in
+    `tina-http/src/websocket.rs` because the required clippy command treats it
+    as an error.
+- Hostile self-review:
+  - finding fixed: `bidi_streaming` naming was too implementation-shaped and
+    the happy path was too raw; the primary API is now `streaming`, while
+    `streaming_raw` holds the advanced HTTP/2 escape hatch;
+  - finding fixed: late bidi parse/cap failures could previously inherit `OK`
+    trailers; sources can now return explicit final trailers and tests prove
+    non-`OK` status for hostile request frames;
+  - finding fixed: the specimen/test route originally used one bidi source for
+    the whole server; it now allocates from a bounded per-call source pool and
+    tests concurrent tonic/native bidi clients;
+  - finding fixed: `GrpcRequestStream` and `GrpcStreamingCall` were cloneable
+    even though the request stream owns decoder state; the typed stream handle
+    is now single-owner and examples borrow it only to construct pull effects;
+  - finding fixed: the response chunk API exposed generic-looking trailers but
+    only serialized gRPC status; streaming gRPC sources now finish with
+    `ResponseChunkReply::GrpcStatus`, keeping final status typed and exact;
+  - finding fixed: `streaming_raw` was public but not exercised; a live raw
+    streaming test now proves response-before-request-EOF plus final status;
+  - finding fixed: the specimen's source-pool capacity was implicit route
+    plumbing; it is now a named pool with a visible `ResourceExhausted` message
+    and README note;
+  - finding: grpcurl was not added because reflection/descriptor plumbing would
+    be a separate compatibility surface; docs defer it explicitly;
+  - finding: no production Tina gRPC client or TLS ALPN was touched.
+- Required check results:
+  - `cargo fmt --all --check` passed;
+  - `cargo test -p tina-http --test http2_live -- --nocapture` passed;
+  - `cargo test -p tina-http --test grpc_live -- --nocapture` passed;
+  - `cargo test --manifest-path examples/specimen_grpc_counter/Cargo.toml`
+    passed, including tonic `0.12.3` h2c interop for all four modes;
+  - `cargo test -p tina-http` passed;
+  - `cargo clippy -p tina-http --tests -- -D warnings` passed;
+  - `RUSTDOCFLAGS="-D warnings" cargo doc -p tina-http --no-deps` passed.
 
 ## Grug Truth
 
@@ -124,7 +249,7 @@ Add the smallest Tina-shaped bidi surface.
 Candidate shape:
 
 ```rust
-router.bidi_streaming(path, |stream| { ... })
+router.streaming(path, |call| { ... })
 ```
 
 The service must see explicit handles, not an async stream illusion:

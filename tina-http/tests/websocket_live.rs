@@ -216,7 +216,7 @@ impl Harness {
     fn start(limits: WebSocketLimits) -> Self {
         let serial_guard = websocket_live_test_lock()
             .lock()
-            .expect("websocket live test lock");
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let runtime = ThreadedRuntime::with_config(
             TestShard,
             DefaultThreadedMailboxFactory,
@@ -586,21 +586,26 @@ fn websocket_control_frame_rules_are_enforced() {
 
 #[test]
 fn websocket_malformed_fragmentation_rejects() {
-    let harness = Harness::start(WebSocketLimits::default());
-    let mut continuation_without_start = connect_ws(harness.addr);
-    continuation_without_start
-        .write_all(&masked_fragment(true, 0x0, b"bad"))
-        .unwrap();
-    assert_eq!(read_server_frame(&mut continuation_without_start).0, 0x8);
+    {
+        let harness = Harness::start(WebSocketLimits::default());
+        let mut stream = connect_ws(harness.addr);
+        stream
+            .write_all(&masked_fragment(true, 0x0, b"bad"))
+            .unwrap();
+        assert_eq!(read_server_frame(&mut stream).0, 0x8);
+    }
 
-    let mut nested_data_fragment = connect_ws(harness.addr);
-    nested_data_fragment
-        .write_all(&masked_fragment(false, 0x1, b"one"))
-        .unwrap();
-    nested_data_fragment
-        .write_all(&masked_fragment(false, 0x2, b"two"))
-        .unwrap();
-    assert_eq!(read_server_frame(&mut nested_data_fragment).0, 0x8);
+    {
+        let harness = Harness::start(WebSocketLimits::default());
+        let mut stream = connect_ws(harness.addr);
+        stream
+            .write_all(&masked_fragment(false, 0x1, b"one"))
+            .unwrap();
+        stream
+            .write_all(&masked_fragment(false, 0x2, b"two"))
+            .unwrap();
+        assert_eq!(read_server_frame(&mut stream).0, 0x8);
+    }
 }
 
 #[test]
@@ -659,6 +664,7 @@ fn websocket_bad_close_payload_rejects() {
     let mut stream = connect_ws(harness.addr);
     stream.write_all(&masked_frame(0x8, &[0x03])).unwrap();
     assert_eq!(read_server_frame(&mut stream).0, 0x8);
+    drop(stream);
 
     let mut stream = connect_ws(harness.addr);
     let mut payload = 1000u16.to_be_bytes().to_vec();
