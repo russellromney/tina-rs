@@ -1670,8 +1670,44 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Http2Connection<
             if self.closing_after_write {
                 return self.close_now();
             }
+            self.flush_deferred_request_window_credit();
+            if !self.write_queue.is_empty() {
+                return self.write_more();
+            }
         }
         noop()
+    }
+
+    fn flush_deferred_request_window_credit(&mut self) {
+        if self.pending_recv_window_credit == 0
+            && self
+                .streams
+                .iter()
+                .all(|stream| stream.pending_recv_window_credit == 0)
+        {
+            return;
+        }
+
+        let stream_ids: Vec<u32> = self
+            .streams
+            .iter()
+            .filter(|stream| {
+                self.pending_recv_window_credit > 0 || stream.pending_recv_window_credit > 0
+            })
+            .map(|stream| stream.id)
+            .collect();
+        for stream_id in stream_ids {
+            if self
+                .maybe_flush_request_window_credit(stream_id, true)
+                .is_err()
+            {
+                self.report.protocol_errors += 1;
+                return;
+            }
+            if self.write_queue.len() >= self.limits.connection_outbound_queue_capacity {
+                return;
+            }
+        }
     }
 
     fn enqueue_frame(&mut self, frame: Frame) -> Result<(), Http2ProtocolError> {
