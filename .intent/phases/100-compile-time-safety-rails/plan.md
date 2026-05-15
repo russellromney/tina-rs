@@ -267,8 +267,8 @@ Private protocol typestate candidates:
 Default: private only. Do not leak protocol typestate into user service code.
 
 This rock must not block the main callable/send-only win. Record any deferred
-work against the typed config and protocol state safety roadmap item, not as
-vague future polish.
+work against the typed config and protocol state safety phase, not as vague
+future polish.
 
 ## Rock 5: User Proof Matrix
 
