@@ -413,9 +413,8 @@ shallow enough that compile errors do not become type-state soup; pressure
 helpers must not smuggle in retries, fairness, priority, or unbounded queues.
 
 Bridge-backed bounded lanes add one more concrete checklist. The
-`system_bounded_object_lane` real-S3 probe proved that Tina admission can stay
-bounded in front of a real external client, but the specimen-local bridge is
-not the production contract:
+`system_bounded_object_lane` specimen deliberately stays hermetic because the
+real-S3 temptation exposed the production contract a real AWS bridge must own:
 
 - completion delivery must be observed (`Full` / `Closed` / worker stopped), not
   best-effort `try_send`, so a dropped completion cannot leak in-flight

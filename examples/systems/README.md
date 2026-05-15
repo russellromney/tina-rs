@@ -88,7 +88,7 @@ Keep a separate system only when it finds a different class of pain.
 
 | System | Build | Pulls On |
 |---|---|---|
-| `system_mini_saas_api` | HTTP API with item CRUD, SQLite bridge, outbound webhook, health/readiness, and shutdown. | Host HTTP edge, `tina-sqlite-bridge`, `tina-reqwest-bridge`, multi-turn replies, bridge lifecycle. |
+| `mini_saas_api` | Native HTTP API with routes, SQLite bridge pool shape, outbound keepalive webhook, graceful shutdown, health/readiness, capacity report, and live-replay fact. Run with `cargo test --manifest-path examples/systems/mini_saas_api/Cargo.toml`. | `tina-http`, `tina-sqlite-bridge`, keepalive pool, tracing, capacity reports, service shutdown. |
 | `system_bounded_object_lane` | Tiny S3-shaped object lane with concurrent callers, bounded in-flight work, typed busy replies, and optional real S3 PUTs. | Request contexts, runtime-owned time, bounded in-flight admission, pressure vocabulary, optional bridge-to-real-service probe. |
 | `system_realtime_rooms` | Chat/game rooms with join/leave, presence, ticks, durable replay-on-join, slow clients, ping/pong. | WebSocket shape, child/session lifecycle, recurring timers, slow-consumer pressure, bounded fanout, persistence. |
 | `system_job_queue` | Submit jobs, bounded workers, cancel jobs, retry, progress polling, worker panic/restart. | Supervision, child lifecycle, join-many, `PendingCallSet`, cancellation, worker pools, topology report. |
@@ -130,7 +130,7 @@ These are not lost. They are folded into bigger systems:
 
 Start with small systems that pull hard:
 
-1. `system_mini_saas_api`
+1. `mini_saas_api`
 2. `system_cache_with_fill`
 3. `system_job_queue`
 4. `system_metrics_shipper`
