@@ -222,12 +222,14 @@ The production-shaped copy path for SQLite plus native outbound HTTP is
 
 ```sh
 cargo run --manifest-path examples/systems/mini_saas_api/Cargo.toml -- smoke
+cargo run --manifest-path examples/systems/mini_saas_api/Cargo.toml -- pressure
 ```
 
 It uses `SqliteWorker` as the honest one-lane pool shape and
 `build_keepalive_pool` for outbound notifications. The route code keeps
 bridge-layer `Full` / `Closed` / `Timeout` distinct from worker or upstream
-failures.
+failures, and `/debug/capacity` reports DB full/closed/timeout counts beside
+outbound keepalive waiters, leases, full, closed, and cancellation counts.
 
 `flatten_outcome(outcome)` is available when the call site does not
 need to distinguish bridge-layer from worker-layer failures.
