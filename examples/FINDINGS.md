@@ -471,6 +471,59 @@ What still needs work but is deferred:
 loud-API constructors, `body_io_error_count` proves mid-stream
 client close).
 
+### 21. Host-side `call_blocking` on `ThreadedMultiShardRuntime`
+
+**Surfaced by:** `system_cache_with_fill`, `system_job_queue`,
+`system_session_auth`.
+
+`ThreadedRuntime::call_blocking(addr, msg, timeout)` is the natural shape
+for host-driven smoke scenarios — the smoke test reads top-to-bottom like
+the spec it describes. `ThreadedMultiShardRuntime` has no equivalent. The
+cross-shard tests in `tina-runtime/tests/sharded_threaded.rs` get around
+it with a `Tracker` isolate, `try_send` with `reply_to: Address<...>`,
+and host-side wait-until polling — the boilerplate is roughly the size
+of the test's actual scenario.
+
+The effect is that every system specimen that wants to exercise real
+sharded placement falls back to `ThreadedRuntime` and demonstrates
+sharding in-isolate (cache_with_fill: one isolate; job_queue: workers
+under one queue; session_auth: N HashMaps inside one isolate). The
+"sharding hurts" specimens in the roadmap (`system_tenant_rate_limiter`,
+`system_order_book`) will hit this same wall.
+
+**Build:** `ThreadedMultiShardRuntime::call_blocking_on(shard, addr, msg,
+timeout) -> Result<CallOutcome<R>, ThreadedRuntimeError>`, mirroring the
+single-shard version. Same `HostCallDriver` shape, routed to the worker
+that owns `shard`. Once shipped, the next sharded specimen should use
+real cross-shard placement and the in-isolate fallback note should
+disappear from these READMEs.
+
+### 22. Startup hook for isolates with start-up effects
+
+**Surfaced by:** `system_job_queue`, `system_session_auth`.
+
+Both specimens have a startup effect (job_queue spawns N worker children;
+session_auth schedules the first sweep timer). The current ceremony in
+both cases:
+
+1. Define a public `Msg::Bootstrap` variant on the message enum.
+2. Handle it in `handle` to emit the startup effect.
+3. After `register_with_capacity`, have the host remember to
+   `try_send(addr, Msg::Bootstrap)`.
+
+Forgetting step 3 produces a quiet service that accepts requests but
+never runs the startup effect — no workers spawn, no sweep timer fires.
+The failure mode is "silent and looks healthy," which is the worst
+shape. The public `Bootstrap` variant is also a small lie: it is in the
+message enum because the macro needs every public op there, but no host
+should ever send it after the first time.
+
+**Build:** an `on_start(&mut self) -> Effect<Self>` hook on `Isolate`,
+called once after the mailbox is bound. Alternative: a
+`register_with_bootstrap_effect(isolate, capacity, |self_addr| effect)`
+on the runtime, so the startup effect is wired at the same call site
+as the registration and does not need a public message variant.
+
 ## Closed
 
 Findings shipped by recent phases. Numbers are kept stable so
