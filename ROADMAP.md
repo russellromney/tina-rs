@@ -337,11 +337,80 @@ framework before public release-story work.
 | **085 race / join helpers** | Tina-shaped equivalents for the useful parts of `select!`, `join!`, and `JoinSet`: bounded named call groups, first-success race with visible loser cancellation, join-all with partial deadline report, `CallContext`/`RequestContext` integration, and no hidden retry or anonymous branch outcomes. This builds on 086 call contexts, 072 pending call sets, 079 cancellation, and ideally 084 child refs. |
 | **086 call context reply obligation** | Replace warning-only `CallReplyAbandoned` with the real Tina contract: send handlers have no caller, call handlers receive a typed `CallContext`, and that reply authority must be replied, rejected, or carried forward as `RequestContext`. Returning unused authority rejects immediately and reclaims capacity. This is project-wide API work, not helper polish. |
 | **087 testing infrastructure** | `tina-test` dev-dependency crate: simulator presets, assertion helpers, `#[tina_sim::test]` macro. Expand Miri to all `unsafe`-touching crates; Loom to shard-pair queues and runtime atomics; `proptest`/`quickcheck` over simulator; `cargo-llvm-cov` in CI; compile-fail tests for proc macros. Soak/stress and model-checking are tracked but not pre-release blockers. |
-| **RequestContext helper polish** | Tiny helper after 086, no full phase unless it grows: add `reply_with_current_request(call, f)` on call/observed-call builders as sugar for `call.into_request_context()` plus `reply_with_request(...)`. The helper consumes explicit call authority, not generic `Context`. Docs should still show the expanded form once so users know where caller authority lives. |
+| **088 mailbox-first devex polish** | Turn the mini-service pain into small blessed primitives without making Tina look like `async` in costume: delayed-reply-to-self helpers over `CallContext`/`RequestContext`, capability-style bridge calls (`db.query(...).call(...)`, `db.execute(...).call(...)`, `db.probe()`), isolate-local admission/pressure helpers, and a tiny service-edge harness for readiness/shutdown/error mapping. This builds on 086's reply authority, 077's pool consumers, 081's bridge convention audit, 082's capacity reports/scopes, 083's production service skeleton, and 085's race/join helpers. |
 | **056 native HTTP/2 service stack** | Second-form HTTP after HTTP/1 body/chunked/cancellation semantics are boring. Adopt sync codec crates where they exist; Tina owns sockets, flow control, stream state, bounded queues, DST, and trace. Not a full RFC/tonic clone. |
 | **057 native gRPC service stack** | Third-form RPC after 056 HTTP/2 lands. Small layer on top: `prost`, generated Tina-shaped service trait template, typed status, unary and server-streaming first form, client and server, DST for status/cancel. Bidirectional streaming and interceptor feature-parity are later. |
 | **Alpaca rename** | Before public launch, rename the project/crates/docs away from Tina to Alpaca so the lineage is respectful and clear: independently maintained Rust framework, inspired by Peter Mbanugo's Tina/Odin and Seastar, not an official Tina port. |
 | **Barend Biesheuvel visible flow ergonomics** | Optional high-level ergonomics only after the local runtime core feels boring: a `flow!`-style authoring surface that preserves named suspension points, visible failure policy, trace step names, and ordinary Tina message/effect expansion. No fake async, no hidden retries, no hidden queues. |
+
+### 088 mailbox-first devex polish sketch
+
+The goal is to remove accidental ceremony from the code users and LLM coding
+agents will write most often while preserving Tina's load-bearing weirdness:
+handlers stay synchronous, all delayed work returns through a mailbox, caller
+authority is explicit, and pressure remains a typed service fact.
+
+The current raw shape is honest but easy to make visually noisy:
+
+```rust
+let request = ctx.take_request_context().unwrap();
+sleep(self.work).reply_with_request(request, move |request, result| {
+    LaneMsg::PutFinished { request, key, result }
+})
+```
+
+088 should look for a blessed spelling closer to:
+
+```rust
+ctx.defer_reply(sleep(self.work))
+    .to_self(move |reply, result| LaneMsg::PutFinished { reply, key, result })
+```
+
+or, after 086 gives call handlers explicit reply authority:
+
+```rust
+call.reply_after(sleep(self.work))
+    .to_self(move |reply, result| LaneMsg::PutFinished { reply, key, result })
+```
+
+This helper must not run user state mutation in a hidden callback. The
+continuation still produces an ordinary message to self; the final state change
+and final reply happen in the isolate handler.
+
+The same phase should harden two other repeated footguns found by the
+system-shaped examples:
+
+- Bridge calls should become harder to misuse by construction. A health check
+  should not require remembering whether `SELECT 1` is query-shaped or
+  execute-shaped:
+
+  ```rust
+  db.probe().call(self.db_timeout)
+  db.query("SELECT 1").limit(1).call(self.db_timeout)
+  db.execute("INSERT INTO items ...").call(self.db_timeout)
+  ```
+
+- Bounded lanes should have a tiny isolate-local admission vocabulary. It
+  should be mechanism, not policy: admit, release, snapshot, reply busy. Pool
+  phases and capacity phases already cover richer reports and shared/weighted
+  capacity; 088 is the small ergonomic surface for the common "cap in-flight
+  work and shed visibly" case:
+
+  ```rust
+  if let Some(permit) = self.in_flight.try_admit() {
+      call.reply_after(work).to_self(move |reply, result| {
+          LaneMsg::Finished { permit, reply, result }
+      })
+  } else {
+      call.reply(LaneReply::Busy(self.in_flight.snapshot()))
+  }
+  ```
+
+Keep the hidden-bug list explicit during review: permits must release exactly
+once on timeout, cancellation, shutdown, and late completion; reply authority
+must be impossible to reply twice or silently drop; bridge DSLs should stay
+shallow enough that compile errors do not become type-state soup; pressure
+helpers must not smuggle in retries, fairness, priority, or unbounded queues.
 
 ## Capability layers still needed
 
