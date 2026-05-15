@@ -51,34 +51,63 @@ The smoke suite exercises five behaviours:
 What felt good:
 - `sleep(d).then(...)` plus a per-entry `expiry_token` is a clean
   substitute for a real cancel: renewals never need to chase a timer
-  handle, and expiry processing is one equality check.
+  handle, and expiry processing is one equality check. In a Tokio
+  build this would be `JoinHandle::abort` plus a oneshot cancel
+  channel; here the wake just gets ignored.
 - `PendingReplies::try_insert` with a manual waiter id worked well for
   parking acquire-callers behind one global cap. The same table
   protects every key.
 - The `(key, holder_id)` pair is enough for stale-handle detection;
   `holder_id` is monotonic and never reused.
-- Hand-off as a single helper (`hand_off`) used by both release and
-  expiry paths kept the FIFO invariant in one place.
+- Hand-off as a single helper used by both release and expiry paths
+  kept the FIFO invariant in one place.
+- The split between `handle` (internal events) and `handle_call`
+  (caller authority) made stale-handle detection trivial: the slot
+  is either in the pending box or it isn't. No "does this caller
+  still have a reply token?" check.
+- The compiler caught mistakes fast. `Effect<I>` typing meant pasting
+  the wrong reply variant or forgetting to consume `CallContext`
+  failed loudly.
 
 What felt rough:
 - Per-key wait queue length is a hand-rolled `VecDeque<u64>` next to a
-  global `PendingReplies`. The pattern "bounded global pending box plus
-  per-bucket FIFO order" repeats in every place that wants fair queuing
-  (cache_with_fill is the obvious neighbour). A small `WaitList` helper
-  could share the cap accounting and the "skip waiters whose slot was
-  reclaimed" loop.
-- Lease bookkeeping is two numbers (`holder_id`, `expiry_token`) plus
-  a reply discriminator. Easy to mis-pair across renew / hand-off if a
-  future change forgets to bump one of them. A typed `Lease` newtype
-  with a single `bump()` would catch this at compile time.
-- `LockMsg::LeaseExpired` is rejected from `handle_call` as
-  `UnsupportedMessage`. The split between `handle` (internal events)
-  and `handle_call` (caller authority) is correct, but the rejection
-  ceremony repeats once per internal variant.
-- The smoke harness still hand-rolls the "fan threads through a
-  barrier, count outcome variants" shape that `system_cache_with_fill`
-  also writes by hand. Worth a small host-side helper if a third
-  system needs it.
+  global `PendingReplies`, including the "skip waiters whose slot was
+  reclaimed" loop. Same shape as `system_cache_with_fill`. Promoted to
+  `examples/FINDINGS.md` as a `WaitList` helper candidate.
+- Lease bookkeeping is two unrelated `u64`s (`holder_id`,
+  `expiry_token`) that have to be bumped in lockstep at the right
+  times (new acquire, renew, hand-off). Easy to mis-pair if a future
+  change forgets to bump one. A typed `Lease` newtype with one
+  `bump()` would make this a compile-time invariant instead of a
+  discipline thing. Local to this specimen for now.
+- `LockMsg::LeaseExpired` is an internal event but still needs a
+  `handle_call` arm that returns `call.reject(UnsupportedMessage)`.
+  Same ceremony as `system_cache_with_fill::CacheMsg::FillDone`.
+  Promoted to `examples/FINDINGS.md`.
+- `CallContext::into_request_context().into_deferred()` is two hops
+  to get a slot to stash. Worked, but felt like one hop too many for
+  the common "park this caller" case. A
+  `CallContext::into_deferred()` shortcut would name the intent.
+- Whether a single global `PendingReplies` cap is the right shape for
+  a lock manager is genuinely unclear. One noisy key can starve
+  waiters on every other key. A real lock manager probably wants the
+  per-key cap as primary admission control and a global cap only as
+  a backstop. Followed the prompt's "every wait queue and per-isolate
+  map needs a cap" but flagging the sharing pattern as worth more
+  thought for non-toy versions.
+
+What felt rough in the smoke harness, not the framework:
+- The contended-FIFO test needed a sequential admission gate
+  (sleep 20ms between threads) because `Barrier` releases all four
+  threads simultaneously and the order in which their `Acquire`
+  messages reach the isolate is racy. Always true of concurrent FIFO
+  testing, but a `host_burst_in_order` helper would pay for itself
+  across cache, queue, and lock.
+- The first cut of the busy-overflow test deadlocked because granted
+  threads didn't auto-release, so the hand-off chain blocked behind a
+  long lease (lease_ms == call_timeout_ms). Fixed by releasing on
+  grant, but the `lease_ms` / `call_timeout_ms` interaction is a
+  sharp edge for test design.
 
 Tina capability pulled:
 - Bounded deferred replies (`PendingReplies`).
@@ -87,10 +116,9 @@ Tina capability pulled:
 - Generation-stamped messages for stale-event dedup.
 
 Suggested follow-up:
-- Consider a `WaitList` helper if `system_tenant_rate_limiter` ends up
-  with the same per-key FIFO + global pending shape.
-- Promote the host barrier-burst pattern to a shared scenarios module
-  if a fourth system writes it again.
+- See `examples/FINDINGS.md` items for the cross-system patterns.
+- Local: try a `Lease` newtype if a future change to this specimen
+  forces a third bump-site for `expiry_token`.
 
 Verdict:
 - keep
