@@ -240,9 +240,10 @@ Proof:
 
 ## Rock 4: Optional Type Rails
 
-Phase 101 and Phase 102 own the broad versions of this work.
+A later typed config and protocol state safety phase owns the broad version of
+this work.
 
-Do not minimize those follow-ups. They are important.
+Do not minimize that follow-up. It is important.
 
 In this phase, only do config/protocol type rails if they are needed to make
 the service split land cleanly or if Rock 0 finds a copied, common,
@@ -266,7 +267,8 @@ Private protocol typestate candidates:
 Default: private only. Do not leak protocol typestate into user service code.
 
 This rock must not block the main callable/send-only win. Record any deferred
-work against 101 or 102, not as vague future polish.
+work against the typed config and protocol state safety roadmap item, not as
+vague future polish.
 
 ## Rock 5: User Proof Matrix
 
