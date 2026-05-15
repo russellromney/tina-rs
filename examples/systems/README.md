@@ -106,7 +106,7 @@ Keep a separate system only when it finds a different class of pain.
 | `system_audit_log` | Append audit events, batch fsync, serve queries, recover from torn writes in tests. | Persistence correctness, append-before-apply, shutdown flush, DST crash/replay shape. |
 | `system_rpc_gateway` | HTTP gateway to internal RPC services with deadlines, retries, and partial failure. | `tina-rpc`, HTTP routing, deadline propagation, race/join helpers, bridge conventions. |
 | `system_api_gateway_limits` | Proxy-ish gateway with per-route and per-tenant caps, upstream pools, overload policy. | Capacity scopes, outbound pools, backpressure policy, health/readiness, pressure reports. |
-| `system_lock_manager` | Local lock manager with leases, renewals, expiry, wait queues, and stale release handling. | Timers, bounded waiters, cancellation, FIFO fairness, stale handle detection. |
+| `system_lock_manager` | Local lock manager with leases, renewals, lease-expiry hand-off, FIFO per-key wait queues, and stale-handle detection. Run with `cargo test --manifest-path examples/systems/system_lock_manager/Cargo.toml`. | `PendingReplies`, `CallContext`, runtime-owned `sleep`, FIFO fairness, stale handle detection, bounded waiters. |
 | `system_order_book` | Sharded in-memory order books for hot symbols with matching, snapshots, and streaming readers. | Hot-key pressure, sharded state, deterministic replay, slow streaming readers, capacity scopes. |
 | `system_soak_http_db` | One-hour-ish load script over HTTP + DB + outbound calls, report high-water/full/leaks. | Load/soak harness, capacity summaries, tracing, health/readiness, shutdown, CI-friendly reports. |
 
