@@ -258,6 +258,87 @@ framework before public release-story work.
 | **Alpaca rename** | Before public launch, rename the project/crates/docs away from Tina to Alpaca so the lineage is respectful and clear: independently maintained Rust framework, inspired by Peter Mbanugo's Tina/Odin and Seastar, not an official Tina port. |
 | **Barend Biesheuvel visible flow ergonomics** | Optional high-level ergonomics only after the local runtime core feels boring: a `flow!`-style authoring surface that preserves named suspension points, visible failure policy, trace step names, and ordinary Tina message/effect expansion. No fake async, no hidden retries, no hidden queues. |
 
+### Visible race and call-capture ergonomics
+
+The rule for Phase 100 is:
+
+```text
+smooth mechanical repetition
+do not flatten semantic truth
+```
+
+`examples/systems/ergonomics_playground` is the evidence. It now has five small
+probes:
+
+- first-success quote race: reply to the original caller once, cancel the loser,
+  and keep loser-cancel settlement visible
+- no-winner quote race: both providers reply unavailable, so the gateway waits
+  for all branch outcomes before answering `Unavailable`
+- late cancelled reply: the cancelled loser eventually replies and the trace
+  records `CallerCancelled` rejected truth instead of delivering a normal
+  gateway message
+- debounced batch drain: callers parked in `PendingReplies` are all replied
+  `Closed` when admission is drained
+- single-flight cache fill: five callers miss the same key, one upstream fill
+  runs, three admitted callers share the result, and two overflow callers get
+  `Full`
+
+These cases show what must remain visible in any helper:
+
+- caller authority: the original `RequestContext` is replied exactly once
+- bounded storage: pending waiters live in a named fixed-capacity container
+- branch identity: each race branch has a key/token and a terminal outcome
+- cancellation truth: loser waits are explicitly cancelled and cancel outcomes
+  are recorded
+- late-result truth: cancellation means "Tina stopped waiting," not "external
+  work stopped"; late replies still become rejected trace facts
+- aggregate failure: no-winner races wait for all relevant branch outcomes
+  instead of treating first reply as success
+- overload: rejected admission is `Full`/`Closed`/`Timeout` vocabulary, not
+  hidden buffering
+
+The intended helper shape is therefore modest. A `CallGroup` helper may replace
+the repeated:
+
+```rust
+let token = group.reserve_token()?;
+let (effect, handle) = call_cancelable(addr, msg, timeout).then(...);
+group.insert_reserved(key, token, handle)?;
+```
+
+with a start helper such as:
+
+```rust
+self.race.start(key, addr, msg, timeout, Msg::Returned)?;
+```
+
+but the later handler must still explicitly call `record_reply`, return
+`cancel_call(...)` effects for losers, feed continuations into `record_cancel`,
+check `report_ready`, and answer the parked `RequestContext`.
+
+Likewise, a `PendingReplies::try_capture_call(...)` helper may replace manual
+capacity pre-check plus:
+
+```rust
+pending.try_insert(qid, call.into_request_context().into_deferred())?;
+```
+
+but failed admission must return the unconsumed `CallContext` so the service can
+reply or reject deliberately:
+
+```rust
+match pending.try_capture_call(call, qid) {
+    Ok(()) => { /* start or join visible work */ }
+    Err(CaptureCallError::Full(call)) => call.reply(Reply::Full),
+    Err(CaptureCallError::DuplicateKey(call, _)) => call.reject(...),
+}
+```
+
+Non-goals stay explicit: no `select!` clone, no race DSL, no hidden scheduler,
+no fake async surface, no hidden retry, no auto-cancel that erases terminal
+facts, and no helper that implies cancellation stopped work outside Tina's owned
+wait.
+
 ## Capability layers still needed
 
 These are not planning phases. They are capability gaps to close as real
