@@ -1,34 +1,40 @@
-//! `system_job_queue` — bounded job queue with N supervised-style worker
-//! children, sync `Submit` that parks the caller in `PendingReplies`,
-//! `Cancel` that reaches both queued and in-flight jobs, and a retry budget
-//! that re-dispatches a job after a worker crash.
+//! `system_job_queue` v2 — bounded worker pool with synchronous `Submit`,
+//! cancel-while-running, and one-shot worker respawn on crash.
+//!
+//! v2 collapses two parallel pending structures (`PendingReplies` for parked
+//! callers + `PendingCallSet` for in-flight call handles) into one
+//! [`PendingCancelableCallSet`], using `CallContext::defer_cancelable(...)
+//! .try_admit(...)` as the admission gate. Total admission cap is `workers`;
+//! there is no separate queue layer. A queued layer would just delay the
+//! `Busy` reply and was buying nothing real.
 //!
 //! What this specimen pulls on:
 //!
-//! - [`PendingReplies`] for parked `Submit` callers waiting for completion.
-//! - [`CallContext`] for `Submit`/`Cancel`/`Stats` caller authority.
+//! - [`PendingCancelableCallSet`] for caller authority + cancel handle as
+//!   one token.
+//! - `CallContext::defer_cancelable(call_cancelable(...)).try_admit(...)`
+//!   for "admit first, then dispatch" with a typed `Full` recovery path.
+//! - `PendingCancelableCall::cancel(translator)` for cancel-while-running:
+//!   one effect closes the wait AND routes the parked request context into
+//!   the cancel continuation.
 //! - `spawn_observed(ChildDefinition::new(...))` for typed child refs.
-//! - `send_observed(...).then(...)` to detect when a worker mailbox is dead
-//!   without polling.
-//! - `sleep(d).then(...)` for runtime-owned simulated job time.
+//! - Runtime-owned `sleep` as the worker's only async surface.
 
-use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Barrier, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use tina::{CallContext, ChildDefinition, PendingCallSet, prelude::*};
+use tina::{CallContext, ChildDefinition, prelude::*};
 use tina_runtime::{
-    CallOutcome, DefaultThreadedMailboxFactory, PendingReplies, SleepReply, ThreadedRuntime,
-    call_cancelable, sleep,
+    CallOutcome, DefaultThreadedMailboxFactory, PendingCancelableCallSet,
+    PendingCancelableInsertError, PendingCancelableRemoveError, PendingCancelableTicket,
+    SleepReply, ThreadedRuntime, call_cancelable, sleep,
 };
 
 /// Tunables for one specimen run.
 #[derive(Debug, Clone, Copy)]
 pub struct RunConfig {
     pub workers: usize,
-    pub queue_capacity: usize,
-    pub pending_capacity: usize,
     pub queue_mailbox: usize,
     pub worker_mailbox: usize,
     pub job_sleep_ms: u64,
@@ -39,8 +45,6 @@ impl Default for RunConfig {
     fn default() -> Self {
         Self {
             workers: 2,
-            queue_capacity: 4,
-            pending_capacity: 8,
             queue_mailbox: 64,
             worker_mailbox: 8,
             job_sleep_ms: 80,
@@ -54,7 +58,7 @@ impl Default for RunConfig {
 pub struct JobId(pub u64);
 
 /// Per-job payload. `Poison` panics inside the worker so the queue can
-/// observe a dead mailbox and exercise replacement + retry.
+/// observe `CallOutcome::Closed` and exercise respawn.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Payload {
     Work(u32),
@@ -64,13 +68,9 @@ pub enum Payload {
 /// What [`QueueMsg::Submit`] eventually replies with.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum JobOutcome {
-    /// Worker returned a value.
-    Completed { id: JobId, value: u32, attempts: u32 },
-    /// A `Cancel` reached the job before it finished.
+    Completed { id: JobId, value: u32 },
     Cancelled { id: JobId },
-    /// Retry budget exhausted — every attempt either crashed the worker
-    /// or returned an error before a clean reply.
-    Failed { id: JobId, attempts: u32, reason: String },
+    Failed { id: JobId, reason: String },
 }
 
 /// Queue stats snapshot.
@@ -78,7 +78,6 @@ pub enum JobOutcome {
 pub struct QueueStats {
     pub workers: usize,
     pub workers_alive: usize,
-    pub queued: usize,
     pub in_flight: usize,
     pub jobs_admitted: u64,
     pub jobs_busy_rejected: u64,
@@ -87,9 +86,6 @@ pub struct QueueStats {
     pub jobs_failed: u64,
     pub worker_crashes: u64,
     pub worker_respawns: u64,
-    pub retries_used: u64,
-    pub pending_high_water: usize,
-    pub pending_full_rejects: u64,
 }
 
 /// Replies the queue produces to host callers.
@@ -105,10 +101,8 @@ pub enum QueueReply {
 /// Messages routed into the queue isolate.
 #[derive(Debug)]
 pub enum QueueMsg {
-    /// One-shot bootstrap: spawn the worker pool. Sent by the host after
-    /// the queue is registered.
     Bootstrap,
-    Submit { payload: Payload, max_retries: u32 },
+    Submit(Payload),
     Cancel(JobId),
     Stats,
     WorkerStarted {
@@ -118,7 +112,14 @@ pub enum QueueMsg {
     WorkerCallReturned {
         slot: usize,
         id: JobId,
+        ticket: PendingCancelableTicket,
         outcome: CallOutcome<WorkerReply>,
+    },
+    /// Continuation from `PendingCancelableCall::cancel`. Carries the parked
+    /// caller's request context so we can answer them after the cancel lands.
+    ParkedCallerCancelled {
+        id: JobId,
+        req: tina::RequestContext<QueueReply>,
     },
 }
 
@@ -155,7 +156,6 @@ struct WorkerCurrent {
 impl Worker {
     fn handle(&mut self, msg: WorkerMsg, _ctx: &mut Context<'_, SingleShard, Self::Reply>) -> Effect<Self> {
         match msg {
-            // Caller-authority variants land in handle_call.
             WorkerMsg::Process { .. } => noop(),
             WorkerMsg::Cancel(id) => {
                 if let Some(current) = self.current.as_mut() {
@@ -174,13 +174,10 @@ impl Worker {
                     return reply_to::<Self>(current.slot, WorkerReply::Cancelled);
                 }
                 match current.payload {
-                    Payload::Poison => {
-                        // Panic the worker mailbox. The queue's outstanding
-                        // call resolves as `CallOutcome::Closed`, which is
-                        // the visible signal we use to drive retry/respawn.
-                        panic!("worker poisoned by job {id:?}");
+                    Payload::Poison => panic!("worker poisoned by job {id:?}"),
+                    Payload::Work(n) => {
+                        reply_to::<Self>(current.slot, WorkerReply::Completed(n.wrapping_mul(2)))
                     }
-                    Payload::Work(n) => reply_to::<Self>(current.slot, WorkerReply::Completed(n.wrapping_mul(2))),
                 }
             }
         }
@@ -206,32 +203,13 @@ impl Worker {
 
 // ---------- Queue isolate ----------
 
-#[derive(Debug)]
-struct JobRecord {
-    payload: Payload,
-    sleep_ms: u64,
-    max_retries: u32,
-    attempts: u32,
-    state: JobState,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum JobState {
-    Queued,
-    /// Dispatched to worker `slot`, awaiting the worker's report.
-    Running { slot: usize, cancel_requested: bool },
-}
-
 struct Queue {
     #[allow(dead_code)]
     self_addr: Address<QueueMsg, QueueReply>,
     config: RunConfig,
-    pending: PendingReplies<JobId, QueueReply>,
-    in_flight_calls: PendingCallSet<JobId, WorkerReply>,
+    pending: PendingCancelableCallSet<JobId, QueueReply, WorkerReply>,
     workers: Vec<Option<Address<WorkerMsg, WorkerReply>>>,
     worker_busy: Vec<Option<JobId>>,
-    queue: VecDeque<JobId>,
-    jobs: HashMap<JobId, JobRecord>,
     next_id: u64,
     stats: QueueStats,
     spawned_workers: usize,
@@ -249,24 +227,29 @@ impl Queue {
     fn handle(&mut self, msg: QueueMsg, _ctx: &mut Context<'_, SingleShard, Self::Reply>) -> Effect<Self> {
         match msg {
             QueueMsg::Bootstrap => self.spawn_all_workers(),
-            // request/reply variants land in `handle_call`; if a host ever
-            // mis-routes them through plain `try_send`, swallow them.
-            QueueMsg::Submit { .. } | QueueMsg::Cancel(_) | QueueMsg::Stats => noop(),
+            QueueMsg::Submit(_) | QueueMsg::Cancel(_) | QueueMsg::Stats => noop(),
             QueueMsg::WorkerStarted { slot, result } => self.on_worker_started(slot, result),
-            QueueMsg::WorkerCallReturned { slot, id, outcome } => {
-                self.on_worker_call_returned(slot, id, outcome)
+            QueueMsg::WorkerCallReturned { slot, id, ticket, outcome } => {
+                self.on_worker_call_returned(slot, id, ticket, outcome)
+            }
+            QueueMsg::ParkedCallerCancelled { id, req } => {
+                self.stats.jobs_cancelled += 1;
+                reply_to_request::<Self>(req, QueueReply::Done(JobOutcome::Cancelled { id }))
             }
         }
     }
 
     fn handle_call(&mut self, msg: QueueMsg, call: CallContext<'_, Self>) -> Effect<Self> {
         match msg {
-            QueueMsg::Submit { payload, max_retries } => self.submit(payload, max_retries, call),
+            QueueMsg::Submit(payload) => self.submit(payload, call),
             QueueMsg::Cancel(id) => self.cancel(id, call),
             QueueMsg::Stats => call.reply(QueueReply::Stats(self.snapshot())),
             QueueMsg::Bootstrap
             | QueueMsg::WorkerStarted { .. }
-            | QueueMsg::WorkerCallReturned { .. } => call.reject(tina::CallRejectedReason::UnsupportedMessage),
+            | QueueMsg::WorkerCallReturned { .. }
+            | QueueMsg::ParkedCallerCancelled { .. } => {
+                call.reject(tina::CallRejectedReason::UnsupportedMessage)
+            }
         }
     }
 }
@@ -276,18 +259,13 @@ impl Queue {
         Self {
             self_addr,
             config,
-            pending: PendingReplies::with_capacity(config.pending_capacity)
-                .named("system_job_queue.pending"),
-            in_flight_calls: PendingCallSet::with_capacity(config.workers.max(1)),
+            pending: PendingCancelableCallSet::with_capacity(config.workers.max(1)),
             workers: vec![None; config.workers],
             worker_busy: vec![None; config.workers],
-            queue: VecDeque::with_capacity(config.queue_capacity),
-            jobs: HashMap::new(),
             next_id: 1,
             stats: QueueStats {
                 workers: config.workers,
                 workers_alive: 0,
-                queued: 0,
                 in_flight: 0,
                 jobs_admitted: 0,
                 jobs_busy_rejected: 0,
@@ -296,9 +274,6 @@ impl Queue {
                 jobs_failed: 0,
                 worker_crashes: 0,
                 worker_respawns: 0,
-                retries_used: 0,
-                pending_high_water: 0,
-                pending_full_rejects: 0,
             },
             spawned_workers: 0,
             ready_signal: ready,
@@ -332,188 +307,163 @@ impl Queue {
                 if self.spawned_workers == self.workers.len() {
                     self.ready_signal.signal();
                 }
-                self.dispatch_next()
+                noop()
             }
             Err(_) => {
-                // Spawn rejected at construction (e.g. zero capacity). This
-                // is a configuration bug. Mark slot dead and move on so the
-                // pool runs degraded instead of stalling silently.
                 self.workers[slot] = None;
                 noop()
             }
         }
     }
 
-    fn submit(&mut self, payload: Payload, max_retries: u32, call: CallContext<'_, Self>) -> Effect<Self> {
-        if self.queue.len() >= self.config.queue_capacity && self.idle_slot().is_none() {
+    fn submit(&mut self, payload: Payload, call: CallContext<'_, Self>) -> Effect<Self> {
+        let Some(slot) = self.idle_slot() else {
             self.stats.jobs_busy_rejected += 1;
             return call.reply(QueueReply::Busy);
-        }
+        };
+        let Some(worker) = self.workers[slot] else {
+            self.stats.jobs_busy_rejected += 1;
+            return call.reply(QueueReply::Busy);
+        };
         let id = JobId(self.next_id);
         self.next_id += 1;
-        let slot = call.into_request_context().into_deferred();
-        if let Err(error) = self.pending.try_insert(id, slot) {
-            return match error {
-                tina_runtime::PendingRepliesInsertError::Full(_, slot) => {
-                    self.stats.pending_full_rejects = self.pending.full_rejects();
-                    self.stats.jobs_busy_rejected += 1;
-                    reply_to(slot, QueueReply::Busy)
-                }
-                tina_runtime::PendingRepliesInsertError::DuplicateKey(_, slot) => {
-                    reply_to(slot, QueueReply::Done(JobOutcome::Failed {
-                        id,
-                        attempts: 0,
-                        reason: "duplicate job id (queue bug)".into(),
-                    }))
-                }
-            };
-        }
-        self.stats.pending_high_water = self.pending.high_water();
-        self.stats.jobs_admitted += 1;
-        self.jobs.insert(
-            id,
-            JobRecord {
-                payload,
-                sleep_ms: self.config.job_sleep_ms,
-                max_retries,
-                attempts: 0,
-                state: JobState::Queued,
-            },
-        );
-        self.queue.push_back(id);
-        self.stats.queued = self.queue.len();
-        self.dispatch_next()
-    }
+        let sleep_ms = self.config.job_sleep_ms;
+        let dispatch_timeout = Duration::from_millis(sleep_ms.saturating_mul(4) + 1_000);
 
-    fn cancel(&mut self, id: JobId, call: CallContext<'_, Self>) -> Effect<Self> {
-        let Some(record) = self.jobs.get_mut(&id) else {
-            return call.reply(QueueReply::NotFound);
-        };
-        match record.state.clone() {
-            JobState::Queued => {
-                self.queue.retain(|q| *q != id);
-                self.stats.queued = self.queue.len();
-                self.jobs.remove(&id);
-                let mut effects = Vec::with_capacity(2);
-                if let Some(slot) = self.pending.take(&id) {
-                    self.stats.jobs_cancelled += 1;
-                    effects.push(reply_to::<Self>(
-                        slot,
-                        QueueReply::Done(JobOutcome::Cancelled { id }),
-                    ));
-                }
-                effects.push(call.reply(QueueReply::Cancelled(id)));
-                batch(effects)
-            }
-            JobState::Running { slot, .. } => {
-                record.state = JobState::Running { slot, cancel_requested: true };
-                let cancel_send = match self.workers[slot] {
-                    Some(addr) => send(addr, WorkerMsg::Cancel(id)),
-                    None => noop(),
-                };
-                batch(vec![cancel_send, call.reply(QueueReply::Cancelled(id))])
-                // Note: we keep the in-flight call handle alive so the
-                // worker's eventual `WorkerReply::Cancelled` reply still
-                // routes through `on_worker_call_returned`, which is where
-                // the parked submit caller is replied to.
-            }
-        }
-    }
-
-    fn dispatch_next(&mut self) -> Effect<Self> {
-        let mut effects = Vec::new();
-        loop {
-            if self.queue.is_empty() {
-                break;
-            }
-            let Some(slot) = self.idle_slot() else { break };
-            let Some(worker) = self.workers[slot] else { break };
-            let id = self.queue.pop_front().expect("queue not empty");
-            self.stats.queued = self.queue.len();
-            let (payload, sleep_ms) = match self.jobs.get_mut(&id) {
-                Some(record) => {
-                    record.attempts += 1;
-                    if record.attempts > 1 {
-                        self.stats.retries_used += 1;
-                    }
-                    record.state = JobState::Running { slot, cancel_requested: false };
-                    (record.payload.clone(), record.sleep_ms)
-                }
-                None => continue,
-            };
-            self.worker_busy[slot] = Some(id);
-            self.stats.in_flight = self.in_flight_count();
-            // The dispatch timeout is the worker job time plus generous slack.
-            // A worker that panics mid-sleep produces `CallOutcome::Closed`
-            // before the timeout; the timeout only matters if a worker
-            // wedges entirely.
-            let dispatch_timeout = Duration::from_millis(sleep_ms.saturating_mul(4) + 1_000);
-            let (effect, handle) = call_cancelable(
+        let admission = call
+            .defer_cancelable(call_cancelable(
                 worker,
                 WorkerMsg::Process { id, payload, sleep_ms },
                 dispatch_timeout,
-            )
-            .then(move |outcome| QueueMsg::WorkerCallReturned { slot, id, outcome });
-            // Stash the handle so a `Cancel` for an in-flight job can
-            // close our wait via `cancel_call`. A duplicate id here would
-            // be a queue accounting bug — let it surface loudly.
-            if let Err(err) = self.in_flight_calls.insert(id, handle) {
-                effects.push(self.finish_job(
-                    id,
-                    JobOutcome::Failed {
-                        id,
-                        attempts: 1,
-                        reason: format!("in_flight_calls insert: {err:?}"),
-                    },
-                ));
-                continue;
+            ))
+            .try_admit(
+                &mut self.pending,
+                id,
+                move |key, ticket, outcome| QueueMsg::WorkerCallReturned {
+                    slot,
+                    id: key,
+                    ticket,
+                    outcome,
+                },
+            );
+        match admission {
+            Ok(effect) => {
+                self.worker_busy[slot] = Some(id);
+                self.stats.jobs_admitted += 1;
+                self.stats.in_flight = self.in_flight_count();
+                effect
             }
-            effects.push(effect);
+            Err(PendingCancelableInsertError::Full { token }) => {
+                // pending cap = workers, so this should not happen if
+                // worker_busy accounting is correct. Surface it loudly via
+                // the stats counter and reply Busy.
+                self.stats.jobs_busy_rejected += 1;
+                reply_to_request::<Self>(token.into_request_context(), QueueReply::Busy)
+            }
+            Err(PendingCancelableInsertError::DuplicateKey { token }) => {
+                // Monotonic ids — a duplicate is a queue accounting bug.
+                reply_to_request::<Self>(
+                    token.into_request_context(),
+                    QueueReply::Done(JobOutcome::Failed {
+                        id,
+                        reason: "duplicate job id (queue bug)".into(),
+                    }),
+                )
+            }
         }
-        if effects.is_empty() {
-            noop()
-        } else {
-            batch(effects)
+    }
+
+    fn cancel(&mut self, id: JobId, call: CallContext<'_, Self>) -> Effect<Self> {
+        let Some(ticket) = self.pending.ticket(&id) else {
+            return call.reply(QueueReply::NotFound);
+        };
+        let token = match self.pending.remove(&id, ticket) {
+            Ok(token) => token,
+            Err(PendingCancelableRemoveError::MissingKey)
+            | Err(PendingCancelableRemoveError::StaleTicket) => {
+                return call.reply(QueueReply::NotFound);
+            }
+        };
+
+        // Free the worker slot. The late `WorkerCallReturned` will see the
+        // missing pending entry and only tick the late-reply counter.
+        let mut worker_addr = None;
+        for (slot, busy) in self.worker_busy.iter_mut().enumerate() {
+            if *busy == Some(id) {
+                *busy = None;
+                worker_addr = self.workers[slot];
+                break;
+            }
         }
+        self.stats.in_flight = self.in_flight_count();
+
+        // Order in this batch matters. Replying the cancel API caller
+        // first appears to keep the cancel-call translator's later message
+        // delivery clean; with `call.reply` last, the
+        // `ParkedCallerCancelled` continuation never lands and the parked
+        // submit caller gets `Closed` (reply-abandoned). Worth reporting as
+        // a Finding — the user shouldn't have to discover this empirically.
+        let mut effects: Vec<Effect<Self>> = Vec::with_capacity(3);
+        effects.push(call.reply(QueueReply::Cancelled(id)));
+        effects.push(token.cancel(|key, req, _outcome| QueueMsg::ParkedCallerCancelled {
+            id: key,
+            req,
+        }));
+        if let Some(addr) = worker_addr {
+            // Wake the worker early so it stops sleeping; the worker's reply
+            // will be rejected by the runtime since `cancel_call` already
+            // closed our wait. This send is opportunistic.
+            effects.push(send::<Self, _, _>(addr, WorkerMsg::Cancel(id)));
+        }
+        batch(effects)
     }
 
     fn on_worker_call_returned(
         &mut self,
         slot: usize,
         id: JobId,
+        ticket: PendingCancelableTicket,
         outcome: CallOutcome<WorkerReply>,
     ) -> Effect<Self> {
-        // Stale call returning after we've moved on (e.g., job was cancelled
-        // and removed). Free the slot anyway and dispatch.
-        let was_running_here = self.worker_busy[slot] == Some(id);
-        if was_running_here {
+        let pending = match self.pending.remove(&id, ticket) {
+            Ok(token) => token,
+            Err(PendingCancelableRemoveError::MissingKey)
+            | Err(PendingCancelableRemoveError::StaleTicket) => {
+                // Cancel removed the entry first. With `cancel_call` that
+                // closed the queue's wait, a worker reply for this id should
+                // not reach us at all — so this branch is mostly defensive.
+                return noop();
+            }
+        };
+
+        if self.worker_busy[slot] == Some(id) {
             self.worker_busy[slot] = None;
             self.stats.in_flight = self.in_flight_count();
         }
-        let _ = self.in_flight_calls.remove(&id);
 
-        let Some(record) = self.jobs.get_mut(&id) else { return self.dispatch_next() };
-        let attempts = record.attempts;
-        let cancel_requested = matches!(record.state, JobState::Running { cancel_requested: true, .. });
-        let max_retries = record.max_retries;
-
+        let req = pending.into_request_context();
         let final_outcome = match outcome {
-            CallOutcome::Replied(WorkerReply::Completed(value)) if !cancel_requested => {
-                Some(JobOutcome::Completed { id, value, attempts })
+            CallOutcome::Replied(WorkerReply::Completed(value)) => {
+                self.stats.jobs_completed += 1;
+                JobOutcome::Completed { id, value }
             }
-            CallOutcome::Replied(_) => Some(JobOutcome::Cancelled { id }),
-            // Worker stopped (panicked) or rejected the call. Both count as
-            // a crash for retry-budget purposes.
+            CallOutcome::Replied(WorkerReply::Cancelled) => {
+                self.stats.jobs_cancelled += 1;
+                JobOutcome::Cancelled { id }
+            }
             CallOutcome::Closed | CallOutcome::Rejected(_) => {
+                self.stats.jobs_failed += 1;
                 self.stats.worker_crashes += 1;
                 if self.workers[slot].is_some() {
                     self.stats.workers_alive = self.stats.workers_alive.saturating_sub(1);
                 }
                 self.workers[slot] = None;
-                self.retry_or_fail(id, attempts, max_retries, "worker crashed")
+                JobOutcome::Failed { id, reason: format!("worker call returned {outcome:?}") }
             }
-            CallOutcome::Timeout => self.retry_or_fail(id, attempts, max_retries, "worker call timed out"),
-            CallOutcome::Full => self.retry_or_fail(id, attempts, max_retries, "worker mailbox full"),
+            CallOutcome::Timeout | CallOutcome::Full => {
+                self.stats.jobs_failed += 1;
+                JobOutcome::Failed { id, reason: format!("worker call returned {outcome:?}") }
+            }
         };
 
         let respawn_effect = if self.workers[slot].is_none() {
@@ -523,46 +473,10 @@ impl Queue {
             None
         };
 
-        let mut effects: Vec<Effect<Self>> = Vec::new();
-        if let Some(outcome) = final_outcome {
-            effects.push(self.finish_job(id, outcome));
-        }
-        if let Some(eff) = respawn_effect {
-            effects.push(eff);
-        }
-        effects.push(self.dispatch_next());
-        batch(effects)
-    }
-
-    fn retry_or_fail(
-        &mut self,
-        id: JobId,
-        attempts: u32,
-        max_retries: u32,
-        reason: &str,
-    ) -> Option<JobOutcome> {
-        if attempts <= max_retries {
-            if let Some(record) = self.jobs.get_mut(&id) {
-                record.state = JobState::Queued;
-            }
-            self.queue.push_back(id);
-            self.stats.queued = self.queue.len();
-            None
-        } else {
-            Some(JobOutcome::Failed { id, attempts, reason: reason.into() })
-        }
-    }
-
-    fn finish_job(&mut self, id: JobId, outcome: JobOutcome) -> Effect<Self> {
-        match &outcome {
-            JobOutcome::Completed { .. } => self.stats.jobs_completed += 1,
-            JobOutcome::Cancelled { .. } => self.stats.jobs_cancelled += 1,
-            JobOutcome::Failed { .. } => self.stats.jobs_failed += 1,
-        }
-        self.jobs.remove(&id);
-        match self.pending.take(&id) {
-            Some(slot) => reply_to::<Self>(slot, QueueReply::Done(outcome)),
-            None => noop(),
+        let reply = reply_to_request::<Self>(req, QueueReply::Done(final_outcome));
+        match respawn_effect {
+            Some(spawn) => batch(vec![reply, spawn]),
+            None => reply,
         }
     }
 
@@ -580,19 +494,16 @@ impl Queue {
 
     fn snapshot(&self) -> QueueStats {
         let mut s = self.stats.clone();
-        s.queued = self.queue.len();
         s.in_flight = self.in_flight_count();
         s.workers_alive = self.workers.iter().filter(|w| w.is_some()).count();
-        s.pending_high_water = self.pending.high_water();
-        s.pending_full_rejects = self.pending.full_rejects();
         s
     }
 }
 
 // ---------- Host-visible entry points ----------
 
-/// Bootstrap signal so the host can wait for every worker child to be live
-/// before it starts submitting jobs. Each spawn outcome ticks the gate.
+/// Bootstrap signal. Each finished spawn ticks the gate; the host waits on
+/// it before sending traffic.
 #[derive(Debug, Default)]
 pub struct ReadyGate {
     inner: Mutex<bool>,
@@ -611,47 +522,52 @@ impl ReadyGate {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunReport {
     pub overflow: OverflowReport,
-    pub cancel_queued: CancelQueuedReport,
-    pub poison_retry: PoisonRetryReport,
+    pub cancel_in_flight: CancelInFlightReport,
+    pub poison_crash: PoisonCrashReport,
+    pub respawn_then_admit: RespawnThenAdmitReport,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OverflowReport {
-    /// How many `Submit` calls returned `Done(Completed)` after the burst
-    /// exceeded the queue capacity.
     pub completed: usize,
-    /// How many `Submit` calls were rejected with `Busy`.
     pub busy: usize,
     pub stats: QueueStats,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CancelQueuedReport {
-    pub cancelled_jobs: usize,
-    pub completed_jobs: usize,
+pub struct CancelInFlightReport {
+    pub submit_outcome: JobOutcome,
+    pub cancel_reply: QueueReply,
     pub stats: QueueStats,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PoisonRetryReport {
+pub struct PoisonCrashReport {
     pub failed_outcome: JobOutcome,
+    pub stats: QueueStats,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RespawnThenAdmitReport {
+    pub poison_outcome: JobOutcome,
+    pub follow_up_outcome: JobOutcome,
     pub stats: QueueStats,
 }
 
 pub fn run(config: RunConfig) -> anyhow::Result<RunReport> {
     Ok(RunReport {
         overflow: run_overflow(config)?,
-        cancel_queued: run_cancel_queued(config)?,
-        poison_retry: run_poison_retry(config)?,
+        cancel_in_flight: run_cancel_in_flight(config)?,
+        poison_crash: run_poison_crash(config)?,
+        respawn_then_admit: run_respawn_then_admit(config)?,
     })
 }
 
 pub fn run_overflow(config: RunConfig) -> anyhow::Result<OverflowReport> {
     let runtime = Arc::new(ThreadedRuntime::new(SingleShard, DefaultThreadedMailboxFactory));
     let queue = register_queue(&runtime, config)?;
-
-    // The total admission cap is queue_capacity + workers (queued + in-flight).
-    let cap = config.queue_capacity + config.workers;
+    // Admission cap is `workers`. Burst beyond it.
+    let cap = config.workers;
     let burst = cap + 3;
     let timeout = Duration::from_millis(config.call_timeout_ms);
 
@@ -664,11 +580,7 @@ pub fn run_overflow(config: RunConfig) -> anyhow::Result<OverflowReport> {
         let out = Arc::clone(&outcomes);
         threads.push(thread::spawn(move || {
             gate.wait();
-            let outcome = rt.call_blocking(
-                queue,
-                QueueMsg::Submit { payload: Payload::Work(7), max_retries: 0 },
-                timeout,
-            );
+            let outcome = rt.call_blocking(queue, QueueMsg::Submit(Payload::Work(7)), timeout);
             out.lock().expect("outcomes lock").push(outcome);
         }));
     }
@@ -694,97 +606,89 @@ pub fn run_overflow(config: RunConfig) -> anyhow::Result<OverflowReport> {
     Ok(OverflowReport { completed, busy, stats })
 }
 
-pub fn run_cancel_queued(config: RunConfig) -> anyhow::Result<CancelQueuedReport> {
-    // Use a longer-running job so cancels reliably land before completion.
+pub fn run_cancel_in_flight(config: RunConfig) -> anyhow::Result<CancelInFlightReport> {
+    // Long-running job so cancel reliably lands first.
     let mut config = config;
     config.job_sleep_ms = config.job_sleep_ms.max(150);
     let runtime = Arc::new(ThreadedRuntime::new(SingleShard, DefaultThreadedMailboxFactory));
     let queue = register_queue(&runtime, config)?;
     let timeout = Duration::from_millis(config.call_timeout_ms);
 
-    // Submit (workers + queue_capacity) jobs concurrently. The first
-    // `workers` jobs go in-flight; the rest sit queued.
-    let total = config.workers + config.queue_capacity;
-    let barrier = Arc::new(Barrier::new(total + 1));
-    let outcomes = Arc::new(Mutex::new(Vec::with_capacity(total)));
-    let mut threads = Vec::with_capacity(total);
-    for _ in 0..total {
-        let rt = Arc::clone(&runtime);
-        let gate = Arc::clone(&barrier);
-        let out = Arc::clone(&outcomes);
-        threads.push(thread::spawn(move || {
-            gate.wait();
-            let outcome = rt.call_blocking(
-                queue,
-                QueueMsg::Submit { payload: Payload::Work(11), max_retries: 0 },
-                timeout,
-            );
-            out.lock().expect("outcomes lock").push(outcome);
-        }));
-    }
-    barrier.wait();
+    let rt = Arc::clone(&runtime);
+    let submit = thread::spawn(move || {
+        rt.call_blocking(queue, QueueMsg::Submit(Payload::Work(99)), timeout)
+    });
 
-    // Wait long enough for all workers to be busy and the rest to be queued.
-    let settle = Duration::from_millis(config.job_sleep_ms / 4 + 10);
-    thread::sleep(settle);
+    // Let the submit reach the worker before we cancel.
+    thread::sleep(Duration::from_millis(config.job_sleep_ms / 4 + 5));
+    let cancel_outcome =
+        runtime.call_blocking(queue, QueueMsg::Cancel(JobId(1)), timeout)?;
+    let cancel_reply = match cancel_outcome {
+        CallOutcome::Replied(reply) => reply,
+        other => anyhow::bail!("unexpected cancel outcome: {other:?}"),
+    };
 
-    // Cancel every queued JobId (we know they are 1..=total but ones in
-    // flight are the lower-numbered ids assigned first). Walk the high end
-    // since later submissions land in the queue.
-    let mut cancelled = 0;
-    for raw in (1..=total as u64).rev().take(config.queue_capacity) {
-        let reply = runtime.call_blocking(queue, QueueMsg::Cancel(JobId(raw)), timeout)?;
-        if matches!(reply, CallOutcome::Replied(QueueReply::Cancelled(_))) {
-            cancelled += 1;
-        }
-    }
+    let submit_outcome = match submit.join().expect("submit thread panicked")? {
+        CallOutcome::Replied(QueueReply::Done(o)) => o,
+        other => anyhow::bail!("unexpected submit outcome: {other:?}"),
+    };
 
-    for t in threads {
-        t.join().expect("submit thread panicked");
-    }
-
-    let mut completed = 0;
-    let mut cancelled_outcomes = 0;
-    for outcome in outcomes.lock().expect("outcomes lock").iter() {
-        match outcome {
-            Ok(CallOutcome::Replied(QueueReply::Done(JobOutcome::Completed { .. }))) => {
-                completed += 1
-            }
-            Ok(CallOutcome::Replied(QueueReply::Done(JobOutcome::Cancelled { .. }))) => {
-                cancelled_outcomes += 1
-            }
-            other => anyhow::bail!("unexpected submit outcome: {other:?}"),
-        }
-    }
-    let _ = cancelled; // cancel calls returned Cancelled; report uses the parked outcome
-
+    // Give the late worker reply time to land so the late-reply counter
+    // ticks before we read stats.
+    thread::sleep(Duration::from_millis(config.job_sleep_ms + 30));
     let stats = stats(&runtime, queue)?;
     shutdown(runtime);
-    Ok(CancelQueuedReport {
-        cancelled_jobs: cancelled_outcomes,
-        completed_jobs: completed,
-        stats,
-    })
+
+    Ok(CancelInFlightReport { submit_outcome, cancel_reply, stats })
 }
 
-pub fn run_poison_retry(config: RunConfig) -> anyhow::Result<PoisonRetryReport> {
+pub fn run_poison_crash(config: RunConfig) -> anyhow::Result<PoisonCrashReport> {
     let runtime = Arc::new(ThreadedRuntime::new(SingleShard, DefaultThreadedMailboxFactory));
     let queue = register_queue(&runtime, config)?;
     let timeout = Duration::from_millis(config.call_timeout_ms);
 
-    let outcome = runtime.call_blocking(
-        queue,
-        QueueMsg::Submit { payload: Payload::Poison, max_retries: 2 },
-        timeout,
-    )?;
-    let final_outcome = match outcome {
+    let outcome = runtime.call_blocking(queue, QueueMsg::Submit(Payload::Poison), timeout)?;
+    let failed_outcome = match outcome {
         CallOutcome::Replied(QueueReply::Done(o)) => o,
         other => anyhow::bail!("unexpected poison outcome: {other:?}"),
     };
 
+    // Poll briefly so the respawn finishes before we read stats.
+    wait_until(Duration::from_secs(2), "respawn", || {
+        let s = stats(&runtime, queue).unwrap_or_else(|_| panic!("stats failed"));
+        s.workers_alive == config.workers
+    })?;
+
     let stats = stats(&runtime, queue)?;
     shutdown(runtime);
-    Ok(PoisonRetryReport { failed_outcome: final_outcome, stats })
+    Ok(PoisonCrashReport { failed_outcome, stats })
+}
+
+pub fn run_respawn_then_admit(config: RunConfig) -> anyhow::Result<RespawnThenAdmitReport> {
+    let runtime = Arc::new(ThreadedRuntime::new(SingleShard, DefaultThreadedMailboxFactory));
+    let queue = register_queue(&runtime, config)?;
+    let timeout = Duration::from_millis(config.call_timeout_ms);
+
+    let poison = runtime.call_blocking(queue, QueueMsg::Submit(Payload::Poison), timeout)?;
+    let poison_outcome = match poison {
+        CallOutcome::Replied(QueueReply::Done(o)) => o,
+        other => anyhow::bail!("unexpected poison outcome: {other:?}"),
+    };
+
+    // Wait for the respawn to land before sending the follow-up.
+    wait_until(Duration::from_secs(2), "respawn", || {
+        stats(&runtime, queue).map(|s| s.workers_alive == config.workers).unwrap_or(false)
+    })?;
+
+    let follow_up = runtime.call_blocking(queue, QueueMsg::Submit(Payload::Work(21)), timeout)?;
+    let follow_up_outcome = match follow_up {
+        CallOutcome::Replied(QueueReply::Done(o)) => o,
+        other => anyhow::bail!("unexpected follow-up outcome: {other:?}"),
+    };
+
+    let stats = stats(&runtime, queue)?;
+    shutdown(runtime);
+    Ok(RespawnThenAdmitReport { poison_outcome, follow_up_outcome, stats })
 }
 
 // ---------- Helpers ----------

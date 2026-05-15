@@ -1,12 +1,20 @@
 # Job Queue
 
-A bounded job queue with `N` worker isolates spawned as the queue's children.
-Callers `Submit` and block until the job finishes. The queue parks each
-caller in `PendingReplies` keyed by job id, dispatches work to idle workers
-via `call_cancelable`, and stashes every in-flight call handle in a
-`PendingCallSet`. A `Poison` payload panics the worker; the queue sees
-`CallOutcome::Closed` on the call, respawns the worker into the same slot,
-and retries the job until its `max_retries` budget is gone.
+A bounded worker pool with synchronous `Submit`, cancel-while-running, and
+one-shot worker respawn on crash. Total admission cap is `workers`; a
+queued layer on top would just delay the `Busy` reply.
+
+The queue spawns `N` worker isolates as supervised-style children. Submit
+goes through `CallContext::defer_cancelable(call_cancelable(worker, ...))
+.try_admit(&mut self.pending, JobId, ...)` — the new admission helper from
+PR #92 that returns the child effect only after the parked caller is
+stored in a `PendingCancelableCallSet`. Cancel uses
+`PendingCancelableCall::cancel(translator)` to atomically close the wait
+and route the parked request context into the cancel continuation.
+
+A `Poison` payload panics the worker; the queue sees `CallOutcome::Closed`,
+respawns the worker into the same slot, and replies `Failed` to the parked
+caller. Retry is intentionally not supported — see Findings.
 
 ## Run
 
@@ -18,56 +26,75 @@ cargo test --manifest-path examples/systems/system_job_queue/Cargo.toml
 ## Findings
 
 What felt good:
-- `register_with_capacity_using` plus `spawn_observed(ChildDefinition::new(...))`
-  is the right shape for a parent that needs both its own address and typed
-  child references at startup.
-- Routing dispatch through `call_cancelable` instead of `try_send` makes a
-  worker death visible: `CallOutcome::Closed` arrives without any extra
-  watchdog. The retry-or-fail decision then lives in one place.
-- `PendingReplies` for parked `Submit` callers and `PendingCallSet` for
-  in-flight worker handles are two clean primitives at the same time, on
-  different sides of the same job lifecycle.
+- `try_admit` is the right shape. The "admit caller authority before
+  dispatching the child effect" rule is encoded by the type, so the easy
+  bug ("dispatch first, then forget to store the token") is unreachable.
+  Recovering on `Full` is a single `token.into_request_context()` away.
+- `PendingCancelableCall::cancel(translator)` collapses the v1 two-step
+  ("send `WorkerMsg::Cancel` AND keep the call handle alive in
+  `PendingCallSet` so the late reply still routes through one place")
+  into one effect. The cancel API caller is replied immediately; the
+  parked submit caller is replied through the cancel continuation.
+- Collapsing v1's parallel `PendingReplies` (parked callers) +
+  `PendingCallSet` (call handles) into one `PendingCancelableCallSet`
+  removed about 130 lines of accounting. The two halves were always keyed
+  by the same `JobId`; one structure says it once.
 
 What felt rough:
-- There is no in-isolate hook for "my child restarted." The parent isolate
-  has to infer worker death indirectly (here, from `CallOutcome::Closed`)
-  and respawn manually. `runtime.observe_child_restarted(parent)` exists,
-  but only outside the isolate. A first-class child-lifecycle event
-  (`ChildStopped`, `ChildRestarted`) inside `handle` would remove a class
-  of bugs where a queue forgets a dead worker until it next dispatches.
-- Bootstrapping the worker pool requires a one-shot `QueueMsg::Bootstrap`
-  message because spawn effects only return from `handle`, not from the
-  isolate constructor. The host has to send the message after registration.
-  A `register_then_send` helper would remove the boilerplate.
-- Cancel-while-running needs *two* coordinated actions (send `WorkerMsg::Cancel`
-  to nudge the worker, leave the in-flight call handle in `PendingCallSet`
-  so the eventual `Cancelled` reply still routes through one place). Easy
-  to forget one half. A `cancel_via_worker(worker_addr, id, handle)`
-  helper that does both atomically would make this less footgun-shaped.
-- `call_cancelable(...).then(...)` returns `(Effect, CallHandle)`. Pairing
-  the handle with isolate state always reads as boilerplate; a single
-  `call_cancelable_into_set(set, key, ...)` builder would express the
-  intent directly.
-- Reused job ids would silently collide with `PendingCallSet::insert`'s
-  `DuplicateKey` rule. Monotonic ids work here but the failure mode is
-  worth a louder name than "queue accounting bug."
+- **`try_admit` does not compose with retry-on-crash.** The pattern binds
+  one `RequestContext` to one `CallHandle` at admission time. If the
+  worker dies, the token's `RequestContext` is consumed (or the token is
+  dropped) — there is no API for "take the request context out, keep it,
+  and rebind it to a *fresh* `call_cancelable` to retry on a different
+  worker." So v2 marks `Failed` on first crash. v1 had a retry budget.
+  This is a real specimen finding, not a missing feature: a system that
+  needs retry has to keep separate `pending_callers: HashMap<JobId,
+  RequestContext>` and `in_flight_handles: HashMap<JobId, CallHandle>`
+  structures, which is exactly what v1 did.
+- **Batch ordering matters in subtle ways.** With `call.reply(Cancelled)`
+  *last* in the cancel handler's batch, the cancel translator's
+  `ParkedCallerCancelled` continuation was never delivered and the parked
+  submit caller saw `Closed`. With `call.reply` *first*, everything works.
+  The user shouldn't have to discover this empirically — see the comment
+  in `Queue::cancel`.
+- **`cancel_call` closes the wait so cleanly that there is no late-reply
+  observation surface.** v2 originally tried to count
+  `late_replies_swallowed`; the counter was always 0 because the runtime
+  rejects the worker's late reply before our translator can fire. That is
+  the right behavior, but it means a `WorkerMsg::Cancel` send to nudge
+  the worker is purely best-effort — there is no place to confirm the
+  worker stopped early.
+- Bootstrap-message ceremony is still required. The queue cannot spawn
+  its workers from its constructor; the host has to send a one-shot
+  `QueueMsg::Bootstrap` after registration so the `spawn_observed`
+  effects can return from `handle`.
+- There is still no in-isolate hook for "my child stopped." The queue
+  detects a dead worker through `CallOutcome::Closed` on the in-flight
+  call. That works for jobs in flight; a worker that dies *between* jobs
+  is silently absent until the next dispatch tries it (and is then
+  replaced reactively). `runtime.observe_child_restarted(parent)` exists,
+  but only outside the isolate.
 
 Tina capability pulled:
-- Parent isolate that supervises its children's address book.
-- `spawn_observed` with `ChildDefinition`.
-- `call_cancelable` from one isolate to another, with handles stashed in
-  `PendingCallSet`.
-- `PendingReplies` for caller-authority parking across multi-turn work.
-- `CallContext` request/reply surface on both queue and worker.
+- `PendingCancelableCallSet` + `defer_cancelable(...).try_admit(...)` for
+  one-step caller admission with typed `Full` recovery.
+- `PendingCancelableCall::cancel(translator)` for atomic
+  cancel-and-answer-original-caller.
+- `spawn_observed(ChildDefinition::new(...))` for typed child refs.
+- `register_with_capacity_using` so the queue learns its own address at
+  construction.
 - Runtime-owned `sleep` as the worker's only async surface.
 
 Suggested follow-up:
-- In-isolate child-stopped / child-restarted events (see above).
-- `register_then_send(msg)` shorthand for "spawn me, then deliver this
-  bootstrap message."
-- A `WorkerLane` helper that combines the worker-address slot, the busy
-  marker, and the pending call handle so the queue does not have to keep
-  three parallel `Vec`s in sync.
+- Document the batch ordering interaction (cancel handler's
+  `call.reply(...)` should come first), or change the runtime so the
+  ordering is order-insensitive for caller-authority effects.
+- An API for "take the request context out and rebind it to a fresh
+  cancelable child call" if retry-on-crash is supposed to be expressible
+  with this helper. Otherwise the docs should explicitly say "for retry
+  semantics, do not use `PendingCancelableCallSet`."
+- In-isolate child-stopped / child-restarted events. Same finding as the
+  v1 README and `system_bounded_object_lane`.
 
 Verdict:
 - keep

@@ -471,6 +471,33 @@ What still needs work but is deferred:
 loud-API constructors, `body_io_error_count` proves mid-stream
 client close).
 
+### 21. Request/reply variants in `handle` compile but reject at runtime
+
+**Surfaced by:** `system_cache_with_fill`, `system_job_queue` (Worker
+isolate).
+
+A request/reply isolate routes incoming messages through `handle` for
+fire-and-forget variants and `handle_call` for variants that carry caller
+authority. Both handlers receive the same `Message` type. The split is by
+*entry point*, not by *variant*: putting `Submit { .. }` in `handle`
+compiles cleanly, but if a host actually calls that variant the runtime
+rejects it as `CallRejectedReason::UnsupportedMessage`. The author has to
+remember which variants belong on which side and route the other arms by
+hand (`call.reject(UnsupportedMessage)` in `handle_call`, `noop()` in
+`handle`). Both specimens have the same `match msg { ... =>
+call.reject(UnsupportedMessage), ... }` boilerplate, with the same
+opportunity to forget an arm and either silently drop a request or panic.
+
+**Build:** make the split unrepresentable at the type level. The current
+roadmap proposal in `ROADMAP.md` (added by PR #95) sketches an opt-in
+shape where the isolate macro takes separate `event` and `request` types,
+e.g. `#[tina_runtime::isolate(event = CacheEvent, request = CacheRequest,
+reply = CacheReply)]`. The desired property: events are mailbox facts,
+requests are caller-authority facts, runtime work returns as events, and
+the compiler refuses if a request variant is matched in the event handler
+or vice versa. Closing this finding probably means landing some form of
+that proposal.
+
 ## Closed
 
 Findings shipped by recent phases. Numbers are kept stable so
