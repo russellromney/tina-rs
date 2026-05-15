@@ -1,252 +1,251 @@
 # Phase 101 - Mailbox-First Service Ergonomics
 
-Status: Planned. Build after the current system-specimen PRs settle, or in
-parallel with protocol work if the branch stays mostly in `tina` /
-`tina-runtime`.
+Status: Ready to implement.
+
+This is not a planning phase. The choices are pinned here. Build the helpers
+below, migrate the named specimens, and prove the behavior.
+
+## Locked Choices
+
+Ship in this phase:
+
+- keep `CallContext::defer(work).reply(...)` as the blessed non-cancelable
+  multi-turn reply spelling;
+- add a small recurring-tick service helper on top of existing
+  `TimerInterval`;
+- add a small isolate-local in-flight permit helper;
+- add a small explicit drain-state helper;
+- add a register-and-bootstrap helper that enqueues one explicit startup
+  message after registration;
+- add small explicit Full-handling policy state for shed/retry-with-backoff;
+- update docs and the two named system specimens.
+
+Do not ship in this phase:
+
+- startup hooks / `on_start`;
+- hidden async/await-like callbacks;
+- hidden retries;
+- hidden resource close.
+
+Startup hooks are real future work, but not here. The current Tina truth stays:
+startup work begins from an explicit mailbox message such as `Bootstrap`. This
+phase makes that harder to forget by adding a helper that registers and enqueues
+the bootstrap message in one call.
+
+Backpressure policy in this phase is tiny and explicit: choose `Shed` or
+`RetryBackoff`, return a typed decision, and let the service schedule the sleep
+or reply. No helper resends a message by itself.
 
 ## Grug Truth
 
-System specimens are now hitting the same pain in different clothes:
+System specimens keep hitting the same ceremony:
 
-- `system_metrics_shipper`: stale tick tokens, single-flight flush bool, manual
-  drain.
-- `system_job_queue`: bootstrap message, cancel + pending-handle pairing,
-  child lifecycle pain.
-- `system_session_auth`: recurring sweep bootstrap, sharded host-call gap,
-  startup effects.
-- `system_lock_manager`: lease-expiry tokens, FIFO wait queues, stale handles.
-- `system_bounded_object_lane`: bounded in-flight admission and deferred reply
-  ceremony.
+- one delayed runtime work item must carry caller authority to a later mailbox
+  turn;
+- periodic work needs a missed-tick rule;
+- local "work in flight" bools/counters need one boring helper;
+- graceful shutdown needs the same stop-admit / drain / report shape;
+- startup bootstrap messages are easy to forget;
+- retry-on-Full code repeats the same budget/backoff ceremony.
 
-This phase should remove mechanical ceremony. It must not hide Tina truth.
+Remove that ceremony. Do not hide Tina truth.
+
 Continuation messages stay visible. State mutation stays in handlers. Full /
 Closed / Timeout stay typed outcomes. Cancellation still means "Tina stopped
 waiting" unless Tina owns the rail and proves stronger cancel.
-
-## Goal
-
-Make common long-lived service code easier for humans and LLMs to write
-correctly:
-
-- defer one runtime-owned work item and carry caller authority into the next
-  mailbox turn;
-- run recurring ticks with a named missed-tick policy;
-- cap in-flight local work with a permit instead of hand-rolled bools;
-- shut down services through a small explicit drain helper;
-- start services that need startup effects without a forgotten host
-  `try_send(Bootstrap)`;
-- update system specimens to prove the helpers are copyable.
-
-This phase may ship as two PRs if needed:
-
-1. low-risk helper rocks: deferred-work docs/API polish, recurring ticks,
-   local permits, drain state;
-2. startup hook only if its design is clean enough after review.
-
-If Rock 5 is not clean, leave it as a design note and do not block the rest of
-the phase.
-
-## Non-Goals
-
-- No fake async/await surface.
-- No hidden callbacks that mutate user state.
-- No hidden retries.
-- No hidden queues.
-- No helper that says external work was cancelled when only the wait was
-  cancelled.
-- No broad event/request split here. Phase 100 owns that bigger model change.
-- No broad bridge framework. Bridge convention audit owns that.
 
 ## API Homes
 
 Do not scatter helpers.
 
-- `tina::time`: timer decision/state types only.
-- `tina-runtime`: runtime-effect builders, local permits, drain helpers, tests.
-- `tina`: only tiny trait-surface additions needed by `CallContext`.
+- `tina::time`: timer decision/state types.
+- `tina-runtime`: runtime-effect builders, register-bootstrap helpers,
+  `LocalPermitGate`, `DrainState`, `FullHandling`, tests.
+- `tina`: only tiny trait hooks needed by caller authority.
 - examples/specimens: policy-heavy shapes that are not proven twice.
 
 If a helper needs both `tina` and `tina-runtime`, prefer the smallest trait hook
 in `tina` and the concrete implementation in `tina-runtime`.
 
-## Rock 0 - Evidence Sweep
+## Rock 0 - Confirm Inputs
 
-Before coding, read the current merged versions and any still-open PRs for:
+Read current main before editing:
 
 - `examples/systems/system_metrics_shipper`
+- `examples/systems/system_bounded_object_lane`
 - `examples/systems/system_job_queue`
 - `examples/systems/system_session_auth`
-- `examples/systems/system_lock_manager`
-- `examples/systems/system_bounded_object_lane`
-- `examples/systems/system_cache_with_fill`
 - `examples/systems/ergonomics_playground`
+- `tina/src/time.rs`
+- `tina-runtime/src/single_call_gate.rs`
+- `tina-runtime/src/call.rs`
 
-Write a short status block at the top of this plan with:
+This is only to avoid stale branch assumptions. Do not reopen scope.
 
-- which rough shapes repeated at least twice;
-- which helpers are allowed to ship;
-- which rough shapes stay specimen-local.
+Allowed implementation targets are Rocks 1-7.
 
-Also record which open PRs were already merged. Do not design against stale
-branch copies.
+## Rock 1 - Blessed Deferred Work Docs and Proofs
 
-## Rock 1 - Deferred Work to Self
-
-First improve the copied non-cancelable shape from `handle_call`.
-
-Today the safe shape is roughly:
+Do not rename the good path. The blessed spelling is:
 
 ```rust
-call.defer(sleep(work)).reply(|request, outcome| Msg::Done {
-    request,
-    outcome,
-})
+call_ctx
+    .defer(work)
+    .reply(|request, outcome| Msg::Done { request, outcome })
 ```
 
-That is honest, but users still have to know the builder vocabulary and often
-fall back to older `reply_with_request` forms.
+The continuation message carries `RequestContext<R>`. The later handler answers
+with `reply_to_request(request, value)`.
 
-Ship one blessed spelling if it is actually clearer. Candidate:
+Implementation work:
 
-```rust
-call.defer(work).to_self(|reply, outcome| Msg::Done { reply, outcome })
-```
-
-or keep `.reply(...)` and improve docs/examples if the shipped API is already
-the best name.
+- make docs and examples consistently use `CallContext::defer(...).reply(...)`;
+- demote older raw `reply_with_request` examples to "escape hatch" text;
+- improve rustdoc wording so the old shape does not look like the copied path;
+- do not add a `to_self` alias in this phase. More names make learning worse.
 
 Hard rules:
 
-- the helper returns an ordinary `Effect<I>`;
-- the continuation message carries a `RequestContext`;
-- the later handler must call `reply_to_request`;
-- the helper does not auto-reply;
-- the helper does not run user mutation inside the translator;
-- error messages and docs point users away from deprecated
-  `reply_with_request`.
+- helper returns an ordinary `Effect<I>`;
+- no auto-reply;
+- no hidden state mutation;
+- no hidden callback that mutates user state;
+- old call-site docs must not teach losing caller authority.
 
 Proof:
 
-- one unit test for a deferred sleep from `handle_call`;
-- one compile-fail or doc-fail proving the continuation has to carry the
-  request context;
-- one test that the deferred helper does not auto-reply; the caller only
-  completes when the continuation handler calls `reply_to_request`;
-- migrate one system specimen.
+- unit test: deferred sleep from `handle_call` returns only after the
+  continuation handler calls `reply_to_request`;
+- doc/compile-fail proof: `RequestContext` is move-only and cannot be answered
+  twice;
+- migrate one system specimen that still uses older wording or comments.
 
-## Rock 2 - Recurring Work and Missed Ticks
+## Rock 2 - Recurring Tick Service Helper
 
-`TimerInterval` exists. The missing piece is a service-shaped recurring loop
-that is boring to copy.
+Existing `TimerInterval` is useful but still too raw for services. Add one
+small helper/state wrapper for service loops.
 
-Build a small helper/pattern for recurring ticks:
+Add these public `tina::time` types:
+
+- `RecurringTick`
+- `RecurringTickDecision`
+- `RecurringTickToken`
+- `RecurringTickReport`
+
+Use the existing `MissedTickPolicy`.
 
 ```rust
 RecurringTick::every(period)
-    .missed(MissedTickPolicy::Skip)
-    .next(ctx.now())
+    .missed_tick_policy(MissedTickPolicy::Skip)
 ```
 
-Exact naming may differ. Keep the helper stateful and explicit.
+The helper must compute decisions only. The service still schedules the effect:
 
-Required policies:
+```rust
+match self.flush_tick.next(ctx.now()) {
+    RecurringDecision::Sleep(delay, token) => sleep(delay).then(Msg::FlushTick(token)),
+    RecurringDecision::Skip(report) => ...
+}
+```
 
-- `Skip`: one late tick produces at most one visible skipped decision;
-- `CatchUpBounded(n)`: catch up at most `n` ticks, never loop forever;
-- `Delay`: schedule next tick from the current time.
+- `Skip`: coalesce missed ticks into one visible decision; never loop forever;
+- `CatchUpBounded(n)`: allow at most `n` immediate catch-up ticks;
+- `Delay`: schedule the next tick from the current observed time;
+- stale ticks are detected by explicit token/ordinal/deadline state, not by
+  wall-clock guessing.
 
 Hard rules:
 
 - no background thread;
 - no ambient clock;
-- helper only computes the next delay / decision;
-- service still returns `sleep(delay).then(Msg::Tick)`;
-- virtual time and live time use the same visible decision shape.
-- stale ticks must be detected by explicit token/ordinal/deadline state, not by
-  guessing from wall-clock timing.
+- no hidden self-send;
+- no hidden work execution;
+- live and sim expose the same decision shape.
 
 Proof:
 
 - unit tests for each missed-tick policy;
 - stale tick after size-triggered flush is ignored visibly;
-- catch-up cap is honored after a large time jump;
-- simulator test for deterministic recurring ticks;
-- migrate `system_metrics_shipper` or `specimen_periodic_batcher`.
+- large time jump honors the catch-up cap;
+- simulator test proves deterministic recurring ticks;
+- migrate `system_metrics_shipper`.
 
-## Rock 3 - Local In-Flight Permit
+## Rock 3 - Isolate-Local In-Flight Permits
 
-Several specimens use one bool or one counter to mean "work admitted but not
-settled." Make that shape boring.
+Several services use one bool/counter to mean "local work admitted but not
+settled." Build `tina_runtime::LocalPermitGate`. This is not a pool.
 
-Candidate:
+Copied shape:
 
 ```rust
-if let Some(permit) = self.in_flight.try_admit() {
-    call.defer(work).to_self(move |reply, result| Msg::Done {
-        permit,
-        reply,
-        result,
-    })
-} else {
-    call.reply(Reply::Busy(self.in_flight.snapshot()))
+match self.in_flight.try_admit() {
+    Ok(permit) => call_ctx.defer(work).reply(move |request, result| {
+        Msg::Done { permit, request, result }
+    }),
+    Err(full) => call_ctx.reply(Reply::Busy(full.report())),
 }
 ```
-
-This is not a pool. This is isolate-local admission.
 
 Helper requirements:
 
 - fixed count capacity;
-- optional name for capacity/discovery reports;
+- optional static name for capacity/discovery reports;
 - `Permit` is move-only and carries generation/id;
-- release/retire exactly once through the helper;
-- late/double release is visible in tests;
-- snapshot/report says capacity, current, full_count, high_water.
-- `Drop` must not silently release unless the design proves that cannot hide
-  still-running work. Preferred first form: explicit release only; drain can
-  retire outstanding permits and report them.
+- release/retire exactly once through the gate;
+- stale/double release is visible;
+- report type is `LocalPermitReport`;
+- report says capacity, current, full_count, high_water, retired_count;
+- `Drop` must not silently release. First form requires explicit release or
+  explicit retire.
+
+Hard rules:
+
+- no hidden queue;
+- no hidden retry;
+- no pool behavior;
+- no auto-release on drop.
 
 Proof:
 
 - fill-refuse-release-refill;
 - stale permit from before close/drain cannot release a newer generation;
 - double release is rejected or reported;
-- shutdown drains or reports outstanding permits;
-- migrate `system_bounded_object_lane` or `system_metrics_shipper`.
+- shutdown/drain reports outstanding permits;
+- capacity report uses a valid token-like surface name;
+- migrate `system_bounded_object_lane`.
 
-## Rock 4 - Graceful Drain Helper
+## Rock 4 - Explicit Drain State
 
-Specimens keep hand-rolling:
+Build `tina_runtime::DrainState` for the common shutdown state:
 
 1. stop new admission;
-2. finish or cancel in-flight work;
-3. flush buffered work;
-4. reply to parked callers;
-5. stop with final report.
+2. settle parked callers;
+3. wait for or retire local permits;
+4. flush final report;
+5. stop.
 
-Build one tiny helper if it can stay explicit.
-
-Candidate:
+Copied shape:
 
 ```rust
 self.drain.begin();
 self.pending.drain_into_effect(&mut effects, Reply::Closed);
-self.in_flight.close();
-effects.push(stop_with(report));
+self.in_flight.close_for_drain();
+if self.drain.can_stop(self.in_flight.report()) {
+    effects.push(stop_with(report));
+}
 Effect::Batch(effects)
 ```
 
-This may land as docs + small `DrainState`, not a mega helper.
+This is small state plus docs. It must not become a shutdown framework.
 
 Hard rules:
 
 - no hidden ordering;
 - no hidden resource close;
 - every parked caller gets a typed terminal reply;
-- outstanding work is either allowed to finish or visibly cancelled;
-- late completion after drain is rejected/tombstoned visibly or routed to a
-  terminal report; it must not reopen admission or leak a permit;
-- final report names admitted/completed/cancelled/dropped/full.
+- outstanding work is either allowed to finish or visibly retired/cancelled;
+- late completion after drain is visible and must not reopen admission;
+- final report names admitted, completed, cancelled/retired, dropped, full.
 
 Proof:
 
@@ -255,89 +254,119 @@ Proof:
 - stop while one in-flight operation exists;
 - new request during drain returns `Closed` / `Stopping`;
 - late completion after drain is visible and does not mutate closed state;
-- migrate `system_metrics_shipper` or `system_job_queue`.
+- migrate `system_metrics_shipper`.
 
-## Rock 5 - Startup Effects
+## Rock 5 - Register and Bootstrap
 
-`system_job_queue` and `system_session_auth` both need a host-sent
-`Bootstrap` only to start child/tick effects. Forgetting it makes a quiet
-service.
+Do not add `on_start` yet. Add a helper that keeps startup as an ordinary
+mailbox message but removes the host-side "register then remember to
+`try_send(Bootstrap)`" footgun.
 
-Design and ship one small startup hook if it fits current runtime shape.
-
-Candidate:
+Build these helpers on the public registration surfaces:
 
 ```rust
-fn on_start(&mut self, ctx: &mut Context<'_, S, R>) -> Effect<Self> {
-    ...
+runtime.register_with_capacity_and_bootstrap::<I, Outbound>(
+    isolate,
+    mailbox_capacity,
+    bootstrap_msg,
+)
+```
+
+and shard-aware mirror:
+
+```rust
+runtime.register_with_capacity_and_bootstrap_on::<I, Outbound>(
+    shard,
+    isolate,
+    mailbox_capacity,
+    bootstrap_msg,
+)
+```
+
+Mirror the helper on `Runtime`, `ThreadedRuntime`, `MultiShardRuntime`, and
+`ThreadedMultiShardRuntime` wherever the matching plain registration method
+already exists.
+
+Behavior:
+
+- register the isolate normally;
+- enqueue exactly one `bootstrap_msg` to that isolate immediately after
+  registration succeeds;
+- return the address only after the bootstrap message is admitted;
+- bootstrap is just a normal message and normal trace-visible delivery;
+- no special lifecycle callback;
+- no hidden effect execution before the first mailbox turn;
+- no retry if the bootstrap message cannot be admitted.
+
+Failure rules:
+
+- `mailbox_capacity == 0` is rejected by existing validation;
+- because the mailbox is empty after registration, bootstrap admission succeeds
+  for a valid capacity;
+- if admission somehow fails, remove/tombstone the just-registered isolate or
+  return a typed registration error that makes the failure loud. Do not return
+  an address for a service whose bootstrap was not admitted.
+
+Proof:
+
+- helper registers and first delivered message is `Bootstrap`;
+- no host `try_send(Bootstrap)` appears in migrated specimen setup;
+- bootstrap can schedule first recurring tick;
+- bootstrap can spawn children using normal handler code;
+- live and sim/multishard mirrors behave the same where those registration
+  surfaces exist;
+- no address is returned on forced bootstrap-admission failure.
+
+Migrate:
+
+- `system_session_auth` recurring sweep bootstrap;
+- `system_job_queue` child startup bootstrap.
+
+## Rock 6 - Full Handling Policy State
+
+Build tiny state for the repeated "on Full, shed or retry with backoff" shape.
+This is policy state, not a retry engine.
+
+Public shape:
+
+```rust
+let decision = self.full_policy.on_full(ctx.now(), self.deadline);
+match decision {
+    FullDecision::Shed(report) => call_ctx.reply(Reply::Busy(report)),
+    FullDecision::RetryAfter(delay, report) => sleep(delay).then(Msg::Retry(report.token())),
+    FullDecision::Exhausted(report) => call_ctx.reply(Reply::Busy(report)),
 }
 ```
 
-or:
+Required types:
 
-```rust
-register_started_with_capacity(isolate, cap)
-```
+- `FullHandling`
+- `FullDecision`
+- `FullHandlingReport`
 
-Questions to pin:
-
-- Does startup run after mailbox/address registration succeeds?
-- What happens if startup returns `Stop`?
-- What happens if startup panics?
-- Does restart run startup again?
-- Is startup trace-visible?
-- Does simulator do the same thing?
-- Is startup allowed to send/call/spawn before the isolate has processed any
-  mailbox message?
-- What address/generation does startup observe?
+Use existing `Backoff` for retry timing.
 
 Hard rules:
 
-- no address escapes from failed registration;
-- startup effect is trace-visible;
-- restart behavior is explicit;
-- no hidden unbounded startup queue.
-- if constructor succeeds but startup fails, the terminal state is typed and
-  observable.
-
-Proof:
-
-- startup schedules first tick;
-- startup spawns children;
-- startup panic / stop has clear terminal truth;
-- live and sim match for the same small case.
-
-If any of these cannot be proven without a larger runtime model change, do not
-ship startup hooks in this phase. Leave the design note and keep Bootstrap.
-
-## Rock 6 - Backpressure Policy Objects
-
-Only build this if the evidence sweep shows two real call sites with the same
-policy. One retry-on-Full case is not enough.
-
-Small policy objects may help with repeated `Full` handling:
-
-```rust
-RetryPolicy::bounded(max_attempts, Backoff::constant(...))
-ShedPolicy::reply(...)
-ClosePolicy::close(...)
-```
-
-Hard rules:
-
-- caller chooses idempotency;
+- no hidden resend;
+- no hidden sleep;
+- no default retry;
+- caller chooses idempotency before using retry mode;
 - attempts are capped;
-- sleeps are Tina timers;
-- every retry attempt is visible;
-- no default retry.
+- every retry delay is a Tina `sleep`;
+- report separates first-attempt Full, retry Full, retry success, exhausted.
 
 Proof:
 
-- one retry-on-Full specimen path;
-- one shed-on-Full specimen path;
-- report separates first-attempt `Full`, retry success, retry exhausted.
+- shed-on-Full returns one typed decision and no sleep;
+- retry-on-Full returns bounded sleep decisions and then `Exhausted`;
+- deadline elapsed returns `Exhausted` / `DeadlineElapsed` without scheduling;
+- retry success resets or completes the state explicitly;
+- migrated specimen/report shows first-attempt Full separately from retry Full.
 
-If the two call sites are not truly the same shape, leave policy in specimens.
+Migrate one existing Full-retry path:
+
+- `specimen_hot_key_fairness`.
 
 ## Rock 7 - Docs and Specimen Migrations
 
@@ -350,13 +379,26 @@ Update:
 - `examples/FINDINGS.md`
 - relevant system specimen READMEs.
 
-Migrate at least two system specimens. Preferred:
+Migrate exactly these two system specimens:
 
-- `system_metrics_shipper` for recurring ticks, single-flight, drain;
-- `system_bounded_object_lane` for local permit and deferred work;
-- `system_session_auth` for startup tick hook if Rock 5 ships.
+- `system_metrics_shipper` for recurring ticks, single-flight/permit, drain;
+- `system_bounded_object_lane` for local permits and deferred work.
 
-Do not rewrite every specimen by force. Migrate the ones that prove the helper.
+Also migrate both bootstrap specimens through Rock 5:
+
+- `system_session_auth`;
+- `system_job_queue`.
+
+Do not rewrite every specimen by force.
+
+Docs must say plainly:
+
+- use `CallContext::defer(...).reply(...)` for ordinary multi-turn replies;
+- use explicit `Bootstrap` for startup work until a later startup phase;
+- use register-and-bootstrap helper when a service always needs its first
+  bootstrap message;
+- use local permits for isolate-local admitted work;
+- use pools only when the resource is actually leased across handlers.
 
 ## Required Checks
 
@@ -365,11 +407,11 @@ Run focused checks for touched crates/specimens:
 - `cargo fmt --all --check`
 - `cargo test -p tina`
 - `cargo test -p tina-runtime`
-- `cargo test -p tina-sim` if startup/timer sim behavior changes
+- `cargo test -p tina-sim`
 - touched system specimen `cargo test --manifest-path ...`
 - touched specimen smoke tests
 - `cargo clippy` for touched crates/specimens with `-D warnings`
-- doc tests / compile-fail tests for any new public helper docs.
+- doc tests / compile-fail tests for new or changed public helper docs.
 
 If a live test fails twice, treat it as a bug and inspect the code/logs. Do not
 rerun until green by luck.
