@@ -38,3 +38,29 @@ and visible Tina sleeps.
 The phase could waste time rewriting the world. Rock 7 now asks for at least two
 targeted system migrations and explicitly says not to force every specimen.
 
+## Finding 7 [P2] API homes were too loose
+
+The first plan said the branch should stay mostly in `tina` / `tina-runtime`,
+but did not pin where helpers belong. That invites one helper in `tina`, one in
+`tina-runtime`, and one specimen-local copy. The plan now names homes:
+`tina::time` for timer state, `tina-runtime` for concrete runtime/service
+helpers, `tina` only for tiny trait hooks, examples for policy-heavy shapes.
+
+## Finding 8 [P2] Missed-tick semantics were fuzzy
+
+`Skip` originally said "if work already happened," which is not an
+implementation rule. The plan now requires explicit token/ordinal/deadline
+state, stale-tick proof after size-triggered flush, and bounded catch-up after a
+large time jump.
+
+## Finding 9 [P2] Startup hook should be allowed to fail design review
+
+Startup is useful but dangerous. The plan now splits the phase into low-risk
+helpers plus startup hook only if registration/restart truth survives review.
+Design-only startup is a valid outcome.
+
+## Finding 10 [P3] Required checks missed `tina` and doc tests
+
+New public helper docs and trait hooks can fail in `tina` even when
+`tina-runtime` is green. The required checks now include `cargo test -p tina`
+and doc/compile-fail tests for new public helper docs.
