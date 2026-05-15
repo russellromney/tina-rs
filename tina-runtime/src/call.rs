@@ -2665,7 +2665,9 @@ where
     Q: 'static,
 {
     /// Builds the worker-return continuation and the pending token that must be
-    /// stored by the service while the child call is in flight.
+    /// stored by the service while the child call is in flight. The
+    /// continuation receives the token ticket so stale completions can be
+    /// rejected with [`PendingCancelableCallSet::remove`].
     ///
     /// Prefer [`DeferredCancelableCall::try_admit`] when using
     /// [`PendingCancelableCallSet`]. This lower-level form returns the child
@@ -2678,22 +2680,11 @@ where
     ) -> (PendingCancelableCall<K, Q, R>, tina::Effect<I>)
     where
         I: tina::Isolate<Message = M, Reply = Q, Call = RuntimeCall<M>>,
-        F: FnOnce(K, CallOutcome<R>) -> M + 'static,
+        F: FnOnce(K, PendingCancelableTicket, CallOutcome<R>) -> M + 'static,
         K: Clone + 'static,
         M: 'static,
     {
-        let ticket = PendingCancelableTicket(self.request.slot_id());
-        let continuation_key = key.clone();
-        let (effect, handle) = self
-            .inner
-            .then(move |outcome| translator(continuation_key, outcome));
-        let pending = PendingCancelableCall {
-            key,
-            ticket,
-            request: self.request,
-            handle,
-        };
-        (pending, effect)
+        self.reply_with_ticket(key, translator)
     }
 
     /// Builds the worker-return continuation and includes the pending token's
