@@ -37,6 +37,15 @@ correctly:
   `try_send(Bootstrap)`;
 - update system specimens to prove the helpers are copyable.
 
+This phase may ship as two PRs if needed:
+
+1. low-risk helper rocks: deferred-work docs/API polish, recurring ticks,
+   local permits, drain state;
+2. startup hook only if its design is clean enough after review.
+
+If Rock 5 is not clean, leave it as a design note and do not block the rest of
+the phase.
+
 ## Non-Goals
 
 - No fake async/await surface.
@@ -47,6 +56,18 @@ correctly:
   cancelled.
 - No broad event/request split here. Phase 100 owns that bigger model change.
 - No broad bridge framework. Bridge convention audit owns that.
+
+## API Homes
+
+Do not scatter helpers.
+
+- `tina::time`: timer decision/state types only.
+- `tina-runtime`: runtime-effect builders, local permits, drain helpers, tests.
+- `tina`: only tiny trait-surface additions needed by `CallContext`.
+- examples/specimens: policy-heavy shapes that are not proven twice.
+
+If a helper needs both `tina` and `tina-runtime`, prefer the smallest trait hook
+in `tina` and the concrete implementation in `tina-runtime`.
 
 ## Rock 0 - Evidence Sweep
 
@@ -65,6 +86,9 @@ Write a short status block at the top of this plan with:
 - which rough shapes repeated at least twice;
 - which helpers are allowed to ship;
 - which rough shapes stay specimen-local.
+
+Also record which open PRs were already merged. Do not design against stale
+branch copies.
 
 ## Rock 1 - Deferred Work to Self
 
@@ -106,6 +130,8 @@ Proof:
 - one unit test for a deferred sleep from `handle_call`;
 - one compile-fail or doc-fail proving the continuation has to carry the
   request context;
+- one test that the deferred helper does not auto-reply; the caller only
+  completes when the continuation handler calls `reply_to_request`;
 - migrate one system specimen.
 
 ## Rock 2 - Recurring Work and Missed Ticks
@@ -125,9 +151,9 @@ Exact naming may differ. Keep the helper stateful and explicit.
 
 Required policies:
 
-- `Skip`: if work already happened, skip stale tick;
-- `CatchUpBounded(n)`: catch up at most `n` ticks;
-- `Delay`: schedule next tick from now.
+- `Skip`: one late tick produces at most one visible skipped decision;
+- `CatchUpBounded(n)`: catch up at most `n` ticks, never loop forever;
+- `Delay`: schedule next tick from the current time.
 
 Hard rules:
 
@@ -136,10 +162,14 @@ Hard rules:
 - helper only computes the next delay / decision;
 - service still returns `sleep(delay).then(Msg::Tick)`;
 - virtual time and live time use the same visible decision shape.
+- stale ticks must be detected by explicit token/ordinal/deadline state, not by
+  guessing from wall-clock timing.
 
 Proof:
 
 - unit tests for each missed-tick policy;
+- stale tick after size-triggered flush is ignored visibly;
+- catch-up cap is honored after a large time jump;
 - simulator test for deterministic recurring ticks;
 - migrate `system_metrics_shipper` or `specimen_periodic_batcher`.
 
@@ -168,16 +198,19 @@ Helper requirements:
 
 - fixed count capacity;
 - optional name for capacity/discovery reports;
-- `Permit` is move-only;
-- release exactly once;
+- `Permit` is move-only and carries generation/id;
+- release/retire exactly once through the helper;
 - late/double release is visible in tests;
 - snapshot/report says capacity, current, full_count, high_water.
+- `Drop` must not silently release unless the design proves that cannot hide
+  still-running work. Preferred first form: explicit release only; drain can
+  retire outstanding permits and report them.
 
 Proof:
 
 - fill-refuse-release-refill;
-- dropped permit either releases on drop or is deliberately forbidden by type
-  shape. Pick one and document it;
+- stale permit from before close/drain cannot release a newer generation;
+- double release is rejected or reported;
 - shutdown drains or reports outstanding permits;
 - migrate `system_bounded_object_lane` or `system_metrics_shipper`.
 
@@ -211,6 +244,8 @@ Hard rules:
 - no hidden resource close;
 - every parked caller gets a typed terminal reply;
 - outstanding work is either allowed to finish or visibly cancelled;
+- late completion after drain is rejected/tombstoned visibly or routed to a
+  terminal report; it must not reopen admission or leak a permit;
 - final report names admitted/completed/cancelled/dropped/full.
 
 Proof:
@@ -219,6 +254,7 @@ Proof:
 - stop while pending callers are parked;
 - stop while one in-flight operation exists;
 - new request during drain returns `Closed` / `Stopping`;
+- late completion after drain is visible and does not mutate closed state;
 - migrate `system_metrics_shipper` or `system_job_queue`.
 
 ## Rock 5 - Startup Effects
@@ -251,6 +287,9 @@ Questions to pin:
 - Does restart run startup again?
 - Is startup trace-visible?
 - Does simulator do the same thing?
+- Is startup allowed to send/call/spawn before the isolate has processed any
+  mailbox message?
+- What address/generation does startup observe?
 
 Hard rules:
 
@@ -258,6 +297,8 @@ Hard rules:
 - startup effect is trace-visible;
 - restart behavior is explicit;
 - no hidden unbounded startup queue.
+- if constructor succeeds but startup fails, the terminal state is typed and
+  observable.
 
 Proof:
 
@@ -266,9 +307,13 @@ Proof:
 - startup panic / stop has clear terminal truth;
 - live and sim match for the same small case.
 
+If any of these cannot be proven without a larger runtime model change, do not
+ship startup hooks in this phase. Leave the design note and keep Bootstrap.
+
 ## Rock 6 - Backpressure Policy Objects
 
-Only build this if the evidence sweep shows two real call sites.
+Only build this if the evidence sweep shows two real call sites with the same
+policy. One retry-on-Full case is not enough.
 
 Small policy objects may help with repeated `Full` handling:
 
@@ -291,6 +336,8 @@ Proof:
 - one retry-on-Full specimen path;
 - one shed-on-Full specimen path;
 - report separates first-attempt `Full`, retry success, retry exhausted.
+
+If the two call sites are not truly the same shape, leave policy in specimens.
 
 ## Rock 7 - Docs and Specimen Migrations
 
@@ -316,12 +363,13 @@ Do not rewrite every specimen by force. Migrate the ones that prove the helper.
 Run focused checks for touched crates/specimens:
 
 - `cargo fmt --all --check`
+- `cargo test -p tina`
 - `cargo test -p tina-runtime`
 - `cargo test -p tina-sim` if startup/timer sim behavior changes
 - touched system specimen `cargo test --manifest-path ...`
 - touched specimen smoke tests
 - `cargo clippy` for touched crates/specimens with `-D warnings`
+- doc tests / compile-fail tests for any new public helper docs.
 
 If a live test fails twice, treat it as a bug and inspect the code/logs. Do not
 rerun until green by luck.
-
