@@ -347,8 +347,72 @@ framework before public release-story work.
 | **Typed config and protocol state safety phase** | Later broad safety phase after the service-model split. Combine typed config/budget manifests with private protocol typestate because the goal is the same: make impossible states hard to write. Build typed builders/manifests for copied service knobs like mailbox caps, pool caps, body caps, bridge in-flight caps, deadlines, retry budgets, shared capacity scopes, and startup config. Use private state-token/typestate shapes in `tina-http` where they eliminate real protocol bugs: HTTP/2 stream lifecycle, DATA/trailers ordering, WebSocket close handshake, gRPC final-status ownership, and body stream states. Runtime validation still owns env/file config; user service code must stay simple. No phase number until this is ready to execute. |
 | **096 WebSocket production replacement start** | Started on PR #83 as the post-094 production push: subprotocol offer inspection/selection, extension-offer visibility, browser-selected protocol proof, and a hostile review of the remaining replacement surface. Plan: `.intent/phases/096-websocket-production-replacement/plan.md`. |
 | **WebSocket replacement follow-up** | After 097, close the broader replacement claims that are harness-heavy or product-choice-heavy: Autobahn classification, live trace to simulator replay for WebSocket facts, Tina-native WebSocket client if external clients are not enough, extracting a small `tina-websocket-room`-style helper crate if repeated apps need the specimen's room registry/admission/fanout/slow-peer policies, and bounded `permessage-deflate` only if compression becomes a real requirement. |
+| **Event/request split proposal** | Future IDD candidate pulled by `system_cache_with_fill`: split fire-and-forget mailbox events from caller-authority requests in the public authoring model so request/reply traffic cannot accidentally live only in `handle`. Likely folds into, or follows, Phase 100. See sketch below. |
 | **Alpaca rename** | Before public launch, rename the project/crates/docs away from Tina to Alpaca so the lineage is respectful and clear: independently maintained Rust framework, inspired by Peter Mbanugo's Tina/Odin and Seastar, not an official Tina port. |
 | **Barend Biesheuvel visible flow ergonomics** | Optional high-level ergonomics only after the local runtime core feels boring: a `flow!`-style authoring surface that preserves named suspension points, visible failure policy, trace step names, and ordinary Tina message/effect expansion. No fake async, no hidden retries, no hidden queues. |
+
+### Event/request split proposal
+
+`system_cache_with_fill` exposed a general footgun in the current authoring
+surface: a request/reply variant can be handled in `handle`, compile cleanly,
+and still be rejected at runtime as `UnsupportedMessage` when the caller uses
+`call(...)` / `call_blocking(...)`, because caller authority enters
+`handle_call`. That behavior is honest, but the safer Tina move is to make the
+wrong shape unrepresentable.
+
+Target model:
+
+```rust
+trait Isolate {
+    type Event;
+    type Request;
+    type Reply;
+
+    fn handle_event(&mut self, event: Self::Event, ctx: &mut Context<...>) -> Effect<Self>;
+
+    fn handle_request(
+        &mut self,
+        request: Self::Request,
+        call: CallContext<'_, Self>,
+    ) -> Effect<Self>;
+}
+```
+
+Authoring should make the domain split visible:
+
+```rust
+enum CacheEvent {
+    FillDone { key: String, generation: u64, result: SleepReply },
+}
+
+enum CacheRequest {
+    Get { key: String },
+    Invalidate { key: String },
+    Stats,
+}
+```
+
+Runtime work returns as events; external callers enter through requests. A
+request is not "just a message with a timeout" because it carries reply
+authority. The type system should teach that distinction to humans and LLMs.
+
+Likely implementation path:
+
+- add an opt-in macro form first, for example
+  `#[tina_runtime::isolate(event = CacheEvent, request = CacheRequest, reply = CacheReply)]`;
+- preserve the existing single-`message` form during migration;
+- have registration return or expose typed event and request addresses, or an
+  isolate handle with `.events()` and `.requests()` views, while both still
+  point at the same isolate id/generation/mailbox internally;
+- update `send(...)` to accept only event addresses and `call(...)` to accept
+  only request addresses in the new surface;
+- migrate the cache specimen, service skeleton, pools, bridges, and selected
+  protocol examples before considering a core trait-breaking cutover.
+
+Non-goals: no doc-only warning, no heuristic "maybe this `handle` arm should
+have been callable" lint as the final answer, and no fake async surface. The
+point is to sharpen Tina's model: events are mailbox facts; requests are
+caller-authority facts; runtime work returns as events.
 
 ### Mailbox-first devex polish sketch
 
@@ -436,6 +500,7 @@ real-S3 temptation exposed the production contract a real AWS bridge must own:
 - any SDK-backed bridge must name the weakened boundary honestly: Tina can bound
   admission into the SDK, but SDK-internal queues/threads are not Tina-owned
   unless the bridge proves and reports them.
+
 ### Visible race and call-capture ergonomics
 
 The rule for Phase 100 is:
@@ -516,6 +581,7 @@ Non-goals stay explicit: no `select!` clone, no race DSL, no hidden scheduler,
 no fake async surface, no hidden retry, no auto-cancel that erases terminal
 facts, and no helper that implies cancellation stopped work outside Tina's owned
 wait.
+
 ## Capability layers still needed
 
 These are not planning phases. They are capability gaps to close as real
