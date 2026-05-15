@@ -1153,6 +1153,19 @@ where
     /// caller authority inside the worker continuation. That token owns the
     /// [`RequestContext`] and the runtime cancel handle together, so both
     /// worker-return and cancel-return paths can explicitly answer the caller.
+    ///
+    /// Runtime crates may provide a bounded admission helper for this builder.
+    /// For `tina_runtime::call_cancelable(...)`, prefer the copyable shape:
+    ///
+    /// ```text
+    /// call_ctx
+    ///     .defer_cancelable(call_cancelable(...))
+    ///     .try_admit(&mut pending, key, Msg::Returned)
+    /// ```
+    ///
+    /// That helper returns the child effect only after the pending token is
+    /// stored. On `Full` or duplicate admission, the rejected token remains
+    /// available so the caller can recover authority and answer immediately.
     pub fn defer_cancelable<W>(self, work: W) -> W::DeferredCancelable
     where
         W: DeferCancelableThrough<I>,
@@ -1218,9 +1231,13 @@ where
 /// Runtime-provided support for [`CallContext::defer_cancelable`].
 ///
 /// Implementations must consume the caller authority into a visible pending
-/// token that user code stores in isolate state. They must not hide the
-/// [`RequestContext`] solely inside a worker-return continuation, because a
-/// cancellation path must still be able to answer the original caller.
+/// token that user code admits into bounded isolate state. They must not hide
+/// the [`RequestContext`] solely inside a worker-return continuation, because
+/// a cancellation path must still be able to answer the original caller.
+///
+/// A concrete runtime builder should prefer a helper that makes admission the
+/// step that returns the child effect, so storage failure cannot accidentally
+/// dispatch child work.
 pub trait DeferCancelableThrough<I>
 where
     I: Isolate,
