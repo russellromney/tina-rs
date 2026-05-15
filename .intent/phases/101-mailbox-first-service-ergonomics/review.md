@@ -12,8 +12,10 @@ merged specimens. Docs/examples may be the right output.
 Startup effects are attractive, but this touches the same dangerous area as
 self-address registration: address allocation, constructor failure, panic,
 restart, and trace order. The plan must require explicit answers before code.
-Rock 5 now pins these questions and allows design-only success if the hook is
-not safe yet.
+This is not allowed to stay as "figure it out while implementing." The plan now
+removes `on_start` from Phase 101 but still fixes the user footgun by shipping
+`register_with_capacity_and_bootstrap(...)`: startup remains an ordinary
+mailbox message, admitted before the address is returned.
 
 ## Finding 3 [P2] Permit drop semantics must be explicit
 
@@ -29,13 +31,14 @@ docs plus tiny helpers. The ordering stays visible.
 
 ## Finding 5 [P3] Backpressure policy can become fake retry magic
 
-Retry-on-Full is policy, not mechanism. The plan now gates policy objects on at
-least two real call sites and requires caller-owned idempotency, capped attempts,
-and visible Tina sleeps.
+Retry-on-Full is policy, not mechanism. A broad retry framework would be fake
+magic. The plan now ships only tiny `FullHandling` state: it returns
+`Shed`/`RetryAfter`/`Exhausted`; the service still schedules the Tina sleep or
+replies. No helper resends messages.
 
 ## Finding 6 [P3] Too many migrations can blur the proof
 
-The phase could waste time rewriting the world. Rock 7 now asks for at least two
+The phase could waste time rewriting the world. Rock 5 now asks for at least two
 targeted system migrations and explicitly says not to force every specimen.
 
 ## Finding 7 [P2] API homes were too loose
@@ -53,14 +56,28 @@ implementation rule. The plan now requires explicit token/ordinal/deadline
 state, stale-tick proof after size-triggered flush, and bounded catch-up after a
 large time jump.
 
-## Finding 9 [P2] Startup hook should be allowed to fail design review
+## Finding 9 [P2] Startup hook should not be in this implementation phase
 
-Startup is useful but dangerous. The plan now splits the phase into low-risk
-helpers plus startup hook only if registration/restart truth survives review.
-Design-only startup is a valid outcome.
+Startup is useful but dangerous. Allowing "design-only startup" made this phase
+partly a planning phase. The plan now says no lifecycle hook in 101. It ships
+register-and-bootstrap instead, which is smaller and preserves mailbox truth.
 
 ## Finding 10 [P3] Required checks missed `tina` and doc tests
 
 New public helper docs and trait hooks can fail in `tina` even when
 `tina-runtime` is green. The required checks now include `cargo test -p tina`
 and doc/compile-fail tests for new public helper docs.
+
+## Finding 11 [P2] The plan still had "decide while coding" escape hatches
+
+Phase plans should be executable, not a place to re-run product design. The plan
+now locks the choices: no `to_self` alias, no `on_start`, exact bootstrap
+helper, exact recurring/permit/drain helper names, and a tiny Full-handling
+state instead of a retry framework.
+
+## Finding 12 [P2] "Small" was hiding useful work
+
+The previous revision dropped startup and Full-handling because they were
+dangerous when vague. That made the phase smaller, but not better. The current
+plan includes them in grug form: explicit bootstrap message admission and
+decision-only Full handling. Bigger surface, less mush.
