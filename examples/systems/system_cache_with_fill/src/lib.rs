@@ -6,7 +6,8 @@ use std::time::Duration;
 
 use tina::{CallContext, prelude::*};
 use tina_runtime::{
-    CallOutcome, DefaultThreadedMailboxFactory, PendingReplies, SleepReply, ThreadedRuntime, sleep,
+    CallOutcome, DefaultThreadedMailboxFactory, PendingReplies, ServiceHandle, SleepReply,
+    ThreadedRuntime, sleep,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -336,8 +337,8 @@ pub fn run_single_flight(config: RunConfig) -> anyhow::Result<SingleFlightReport
         let out = Arc::clone(&outcomes);
         threads.push(thread::spawn(move || {
             gate.wait();
-            let outcome = rt.call_blocking(
-                cache,
+            let outcome = rt.call_blocking_typed(
+                cache.call,
                 CacheMsg::Get {
                     key: "shared".into(),
                 },
@@ -367,8 +368,8 @@ pub fn run_single_flight(config: RunConfig) -> anyhow::Result<SingleFlightReport
     }
 
     let hit_after_fill = matches!(
-        runtime.call_blocking(
-            cache,
+        runtime.call_blocking_typed(
+            cache.call,
             CacheMsg::Get {
                 key: "shared".into()
             },
@@ -379,7 +380,7 @@ pub fn run_single_flight(config: RunConfig) -> anyhow::Result<SingleFlightReport
             ..
         })
     );
-    let stats = stats(&runtime, cache)?;
+    let stats = stats(&runtime, cache.call)?;
     shutdown(runtime);
 
     Ok(SingleFlightReport {
@@ -401,9 +402,10 @@ pub fn run_stale_invalidation(config: RunConfig) -> anyhow::Result<StaleInvalida
     let timeout = Duration::from_millis(config.call_timeout_ms);
 
     let rt = Arc::clone(&runtime);
+    let cache_call = cache.call;
     let first = thread::spawn(move || {
-        rt.call_blocking(
-            cache,
+        rt.call_blocking_typed(
+            cache_call,
             CacheMsg::Get {
                 key: "invalidate-me".into(),
             },
@@ -412,8 +414,8 @@ pub fn run_stale_invalidation(config: RunConfig) -> anyhow::Result<StaleInvalida
     });
 
     thread::sleep(Duration::from_millis((config.fill_ms / 4).max(1)));
-    let _ = runtime.call_blocking(
-        cache,
+    let _ = runtime.call_blocking_typed(
+        cache.call,
         CacheMsg::Invalidate {
             key: "invalidate-me".into(),
         },
@@ -427,8 +429,8 @@ pub fn run_stale_invalidation(config: RunConfig) -> anyhow::Result<StaleInvalida
 
     thread::sleep(Duration::from_millis(config.fill_ms + 20));
     let replacement_filled = matches!(
-        runtime.call_blocking(
-            cache,
+        runtime.call_blocking_typed(
+            cache.call,
             CacheMsg::Get {
                 key: "invalidate-me".into()
             },
@@ -439,7 +441,7 @@ pub fn run_stale_invalidation(config: RunConfig) -> anyhow::Result<StaleInvalida
             ..
         })
     );
-    let stats = stats(&runtime, cache)?;
+    let stats = stats(&runtime, cache.call)?;
     shutdown(runtime);
 
     Ok(StaleInvalidationReport {
@@ -452,9 +454,9 @@ pub fn run_stale_invalidation(config: RunConfig) -> anyhow::Result<StaleInvalida
 fn register_cache(
     runtime: &ThreadedRuntime<SingleShard, DefaultThreadedMailboxFactory>,
     config: RunConfig,
-) -> anyhow::Result<Address<CacheMsg, CacheReply>> {
+) -> anyhow::Result<ServiceHandle<CacheMsg, CacheReply>> {
     runtime
-        .register_with_capacity::<_, Infallible>(
+        .register_service::<_, Infallible>(
             Cache::new(
                 config.pending_capacity,
                 Duration::from_millis(config.fill_ms),
@@ -466,9 +468,9 @@ fn register_cache(
 
 fn stats(
     runtime: &ThreadedRuntime<SingleShard, DefaultThreadedMailboxFactory>,
-    cache: Address<CacheMsg, CacheReply>,
+    cache: tina::CallAddress<CacheMsg, CacheReply>,
 ) -> anyhow::Result<CacheStats> {
-    match runtime.call_blocking(cache, CacheMsg::Stats, Duration::from_secs(1))? {
+    match runtime.call_blocking_typed(cache, CacheMsg::Stats, Duration::from_secs(1))? {
         CallOutcome::Replied(CacheReply::Stats(stats)) => Ok(stats),
         other => anyhow::bail!("stats failed: {other:?}"),
     }

@@ -100,6 +100,68 @@ pub use local_system::{
     LocalSystemTerminalReport, LocalSystemTerminalSummary, ShutdownUncleanReason, TraceSnapshot,
 };
 pub use multi_shard::{MultiShardRuntime, MultiShardRuntimeConfig};
+
+/// Capability-typed handles for one registered callable service.
+///
+/// Returned by [`Runtime::register_service`]. The `send` lane is a
+/// [`SendAddress<M>`](tina::SendAddress) for ordinary send/continuation
+/// traffic; the `call` lane is a [`CallAddress<M, R>`](tina::CallAddress) for
+/// callable traffic. Splitting the address into capabilities at the boundary
+/// turns "called a send-only handle" / "sent through a call-only handle" into
+/// compile errors rather than runtime
+/// [`tina::CallRejectedReason::UnsupportedMessage`] rejections.
+///
+/// Both lanes point at the same underlying isolate. The split is purely a
+/// type-level capability check at the caller; the runtime continues to route
+/// based on whether the inbound message arrived with a reply slot.
+#[derive(Debug)]
+pub struct ServiceHandle<M, R> {
+    /// Send-only capability for the service's mailbox.
+    pub send: tina::SendAddress<M>,
+    /// Callable capability for the service's mailbox.
+    pub call: tina::CallAddress<M, R>,
+}
+
+impl<M, R> Copy for ServiceHandle<M, R> {}
+
+impl<M, R> Clone for ServiceHandle<M, R> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<M, R> ServiceHandle<M, R> {
+    /// Wraps a raw [`Address<M, R>`](tina::Address) as both capabilities.
+    pub const fn from_address(address: tina::Address<M, R>) -> Self {
+        Self {
+            send: address.send_only(),
+            call: address.callable(),
+        }
+    }
+
+    /// Returns the underlying raw [`Address<M, R>`](tina::Address).
+    pub const fn address(self) -> tina::Address<M, R> {
+        self.call.address()
+    }
+}
+
+/// Capability-typed handle for one registered send-only service.
+///
+/// Returned by [`Runtime::register_service_send_only`]. Exposes only a
+/// [`SendAddress`](tina::SendAddress): no callable lane is constructed.
+#[derive(Debug)]
+pub struct SendOnlyServiceHandle<M> {
+    /// Send-only capability for the service's mailbox.
+    pub send: tina::SendAddress<M>,
+}
+
+impl<M> Copy for SendOnlyServiceHandle<M> {}
+
+impl<M> Clone for SendOnlyServiceHandle<M> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
 pub use single_call_gate::SingleCallGate;
 pub use threaded::{DEFAULT_SHUTDOWN_LANE_DRAIN_TIMEOUT, ThreadedRuntime, ThreadedRuntimeConfig};
 pub use threaded_multi_shard::ThreadedMultiShardRuntime;
@@ -139,13 +201,13 @@ pub use call::{
     TcpStreamCloseReply, TcpWriteReply, TlsAcceptReply, TlsBindReply, TlsCloseReply,
     TlsConnectReply, TlsListenerCloseReply, TlsListenerId, TlsReadReply, TlsStreamId,
     TlsWriteReply, TypedCall, UdpBindReply, UdpCloseSocketReply, UdpRecvFromReply, UdpSendToReply,
-    UdpSocketId, call, call_cancelable, call_handle_call_id, call_with_handle, cancel_call,
-    dns_lookup, file_close, file_create, file_fsync, file_open, file_read, file_read_at, file_size,
-    file_write, file_write_at, journal_append, journal_replay, mkdir, path_metadata, process_run,
-    read_dir, remove_file, rename_replace, send_observed, signal_wait, sleep, sleep_then,
-    snapshot_commit, snapshot_load, sync_parent, tcp_accept, tcp_bind, tcp_close_listener,
-    tcp_close_stream, tcp_connect, tcp_read, tcp_write, tls_accept, tls_bind, tls_close,
-    tls_close_listener, tls_connect, tls_read, tls_write, udp_bind, udp_close_socket,
+    UdpSocketId, call, call_cancelable, call_handle_call_id, call_typed, call_with_handle,
+    cancel_call, dns_lookup, file_close, file_create, file_fsync, file_open, file_read,
+    file_read_at, file_size, file_write, file_write_at, journal_append, journal_replay, mkdir,
+    path_metadata, process_run, read_dir, remove_file, rename_replace, send_observed, signal_wait,
+    sleep, sleep_then, snapshot_commit, snapshot_load, sync_parent, tcp_accept, tcp_bind,
+    tcp_close_listener, tcp_close_stream, tcp_connect, tcp_read, tcp_write, tls_accept, tls_bind,
+    tls_close, tls_close_listener, tls_connect, tls_read, tls_write, udp_bind, udp_close_socket,
     udp_recv_from, udp_send_to,
 };
 pub use call_group::{
@@ -876,6 +938,102 @@ where
         );
 
         Address::new_with_generation(address.shard, address.isolate, address.generation)
+    }
+
+    /// Registers one isolate as a callable service and returns capability-typed
+    /// handles for the `.send` and `.call` lanes.
+    ///
+    /// The returned [`ServiceHandle`] exposes a [`SendAddress`](tina::SendAddress)
+    /// for ordinary send/continuation traffic and a
+    /// [`CallAddress`](tina::CallAddress) for callable traffic. Mixing the two
+    /// becomes a compile error at the call boundary instead of a runtime
+    /// `CallRejectedReason::UnsupportedMessage`.
+    ///
+    /// `I` must implement [`tina::CallableIsolate`]. The
+    /// `#[tina::isolate]` / `#[tina_runtime::isolate]` macros emit that impl
+    /// automatically when the impl block defines `fn handle_call(...)`. An
+    /// isolate without `handle_call` is not callable; registering it through
+    /// `register_service` is a compile error rather than a service whose every
+    /// caller silently sees `UnsupportedMessage`. Use
+    /// [`register_service_send_only`](Self::register_service_send_only) for the
+    /// send-only shape.
+    ///
+    /// Negative fixture: an isolate without `handle_call` is not a callable
+    /// service.
+    ///
+    /// ```compile_fail
+    /// use std::convert::Infallible;
+    /// use tina::prelude::*;
+    /// use tina_runtime::{DefaultMailboxFactory, Runtime};
+    ///
+    /// #[derive(Debug)]
+    /// enum Msg { Tick }
+    ///
+    /// struct NoCallHandler;
+    ///
+    /// #[tina_runtime::isolate(message = Msg)]
+    /// impl NoCallHandler {
+    ///     fn handle(
+    ///         &mut self,
+    ///         _msg: Msg,
+    ///         _ctx: &mut Context<'_, SingleShard, Self::Reply>,
+    ///     ) -> Effect<Self> {
+    ///         noop()
+    ///     }
+    /// }
+    ///
+    /// let mut runtime = Runtime::new(SingleShard, DefaultMailboxFactory);
+    /// // `NoCallHandler` is not a callable service.
+    /// let _ = runtime.register_service::<NoCallHandler, Infallible>(NoCallHandler, 4);
+    /// ```
+    ///
+    /// Internally this is exactly [`register_with_capacity`](Self::register_with_capacity);
+    /// the raw [`Address`] stays available through
+    /// [`CallAddress::address`](tina::CallAddress::address) for low-level
+    /// interop.
+    #[allow(private_bounds)]
+    pub fn register_service<I, Outbound>(
+        &mut self,
+        isolate: I,
+        mailbox_capacity: usize,
+    ) -> ServiceHandle<I::Message, I::Reply>
+    where
+        I: Isolate<Shard = S, Send = TinaOutbound<Outbound>> + tina::CallableIsolate + 'static,
+        I::Message: 'static,
+        I::Reply: 'static,
+        I::Spawn: IntoErasedSpawn<S, F> + 'static,
+        I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
+        I::Call: IntoErasedCall<I::Message> + 'static,
+        Outbound: 'static,
+    {
+        let address = self.register_with_capacity::<I, Outbound>(isolate, mailbox_capacity);
+        ServiceHandle::from_address(address)
+    }
+
+    /// Registers one isolate as a send-only service.
+    ///
+    /// Returned [`SendOnlyServiceHandle`] exposes only the `.send` lane. The
+    /// isolate must declare `type Reply = ()` (or wrap its reply as
+    /// [`std::convert::Infallible`]) so callers cannot construct a
+    /// [`tina::CallAddress`] in the first place.
+    #[allow(private_bounds)]
+    pub fn register_service_send_only<I, Outbound>(
+        &mut self,
+        isolate: I,
+        mailbox_capacity: usize,
+    ) -> SendOnlyServiceHandle<I::Message>
+    where
+        I: Isolate<Shard = S, Send = TinaOutbound<Outbound>, Reply = ()> + 'static,
+        I::Message: 'static,
+        I::Spawn: IntoErasedSpawn<S, F> + 'static,
+        I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
+        I::Call: IntoErasedCall<I::Message> + 'static,
+        Outbound: 'static,
+    {
+        let address = self.register_with_capacity::<I, Outbound>(isolate, mailbox_capacity);
+        SendOnlyServiceHandle {
+            send: address.send_only(),
+        }
     }
 
     /// Registers one isolate and prefills its mailbox with `bootstrap` so the

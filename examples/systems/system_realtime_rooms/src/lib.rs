@@ -219,6 +219,12 @@ impl Isolate for Room {
     }
 }
 
+// Hand-rolled `tina::isolate_types!` block above does not detect
+// `handle_call`, so the macro-generated `CallableIsolate` impl from
+// `#[tina_runtime::isolate]` is not present. The trait-level rail must still
+// be stamped to register through `register_service`.
+impl tina::CallableIsolate for Room {}
+
 impl Room {
     fn dispatch(&mut self, msg: WebSocketSessionMsg, now: Instant) -> Effect<Self> {
         match msg {
@@ -517,7 +523,13 @@ enum GoneReason {
 /// HTTP gateway isolate. Routes `/ws` → WebSocket upgrade, `/health` → 200,
 /// `/report` → JSON stats. Everything else is 404.
 struct Gateway {
-    room: Address<WebSocketSessionMsg, WebSocketSessionOutcome>,
+    // Capability-typed callable handle: the gateway only ever calls the room
+    // (via the HTTP connection's later send-outcome / inbound delivery path),
+    // never directly sends. Phase 100's `CallAddress` enforces that contract
+    // at the type boundary instead of through the runtime-level
+    // `UnsupportedMessage` rejection that used to land here when an internal
+    // continuation reached `handle_call` by mistake.
+    room: tina::CallAddress<WebSocketSessionMsg, WebSocketSessionOutcome>,
     limits: WebSocketLimits,
     report: Arc<SharedReport>,
 }
@@ -545,11 +557,19 @@ impl Isolate for Gateway {
     }
 }
 
+impl tina::CallableIsolate for Gateway {}
+
 impl Gateway {
     fn respond(&mut self, request: HttpRequest) -> HttpResponse {
         match (request.method.clone(), request.path.as_str()) {
             (Method::GET, "/ws") => match websocket_upgrade(&request, self.limits) {
-                Ok(upgrade) => HttpResponse::websocket(upgrade.accept(self.room, self.limits)),
+                Ok(upgrade) => {
+                    // tina-http currently takes a raw `Address`; unwrap the
+                    // callable capability for that boundary. The wrapping
+                    // capability still pins the lane in this isolate's
+                    // fields.
+                    HttpResponse::websocket(upgrade.accept(self.room.address(), self.limits))
+                }
                 Err(_) => HttpResponse::bad_request(),
             },
             (Method::GET, "/health") => {
@@ -604,7 +624,12 @@ pub struct RoomServer {
     addr: std::net::SocketAddr,
     runtime: ThreadedRuntime<RoomShard, DefaultThreadedMailboxFactory>,
     listener: Address<HttpListenerMsg>,
-    room: Address<WebSocketSessionMsg, WebSocketSessionOutcome>,
+    // Both lanes are needed at startup: a `try_send` for bootstrap/shutdown
+    // (internal continuations) and a `CallAddress` for the gateway → room
+    // call-shaped path. Holding the full `ServiceHandle` keeps both lanes
+    // capability-typed at this field; consumers downstream still pick the
+    // narrow lane they need.
+    room: tina_runtime::ServiceHandle<WebSocketSessionMsg, WebSocketSessionOutcome>,
     report: Arc<SharedReport>,
 }
 
@@ -629,7 +654,7 @@ impl RoomServer {
         };
 
         let room = runtime
-            .register_with_capacity::<Room, HttpConnectionMsg>(
+            .register_service::<Room, HttpConnectionMsg>(
                 Room {
                     members: BTreeMap::new(),
                     last_seen: BTreeMap::new(),
@@ -647,9 +672,9 @@ impl RoomServer {
             .expect("register room");
 
         let gateway = runtime
-            .register_with_capacity::<Gateway, Infallible>(
+            .register_service::<Gateway, Infallible>(
                 Gateway {
-                    room,
+                    room: room.call,
                     limits,
                     report: report.clone(),
                 },
@@ -659,7 +684,7 @@ impl RoomServer {
 
         let listener_isolate = HttpListener::<RoomShard>::new(
             "127.0.0.1:0".parse().unwrap(),
-            gateway,
+            gateway.address(),
             HttpLimits::default(),
             // Generous service-call timeout: the connection isolate calls
             // back into the room to deliver SendOutcome / inbound events,
@@ -682,9 +707,13 @@ impl RoomServer {
         let addr = bound.wait(Duration::from_secs(2)).expect("bound address");
 
         // Bootstrap the room's recurring tick. Forgetting this is the
-        // exact "quiet service" failure Finding 22 calls out.
+        // exact "quiet service" failure Finding 22 calls out. The bootstrap
+        // is an internal continuation: route it through the send lane.
         runtime
-            .try_send(room, WebSocketSessionMsg::Text(BOOTSTRAP_TEXT.into()))
+            .try_send(
+                room.send.address(),
+                WebSocketSessionMsg::Text(BOOTSTRAP_TEXT.into()),
+            )
             .expect("bootstrap");
 
         Self {
@@ -710,7 +739,7 @@ impl RoomServer {
 
     pub fn shutdown_room(&self) -> RoomStats {
         let _ = self.runtime.try_send(
-            self.room,
+            self.room.send.address(),
             WebSocketSessionMsg::Shutdown {
                 code: Some(WebSocketCloseCode(1001)),
                 reason: b"server shutdown".to_vec(),

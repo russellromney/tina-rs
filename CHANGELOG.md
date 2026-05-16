@@ -4,6 +4,46 @@ This file records completed work.
 
 ## Unreleased
 
+### Phase 100 Compile-Time Safety Rails
+
+- Added capability-typed addresses `tina::SendAddress<M>` and
+  `tina::CallAddress<M, R>` so the wrong path becomes a compile error instead
+  of a runtime `CallRejectedReason::UnsupportedMessage`. Wrapped raw
+  `Address<M, R>` is the explicit escape hatch.
+- Added `tina_runtime::ServiceHandle<M, R>` and `SendOnlyServiceHandle<M>`,
+  plus `Runtime::register_service` / `register_service_send_only` and threaded
+  mirrors that return the capability-typed handle.
+- Added the `tina::CallableIsolate` marker trait with a stable
+  `#[diagnostic::on_unimplemented]` phrase. The `#[tina::isolate]` and
+  `#[tina_runtime::isolate]` macros emit the impl automatically when the
+  block defines `fn handle_call(...)`. Registering a non-callable isolate
+  through `register_service` is now a compile error rather than a service
+  whose every caller silently sees `UnsupportedMessage`.
+- Added the `send_only` macro flag: forces `Reply = ()` and rejects an
+  authored `handle_call`. Send-only services register through
+  `register_service_send_only` which exposes only the `.send` lane.
+- Added capability-typed `tina_runtime::call_typed` and
+  `ThreadedRuntime::call_blocking_typed`. The older `call` /
+  `call_blocking` keep working with raw `Address` for low-level interop.
+- Added `tina::send_to(SendAddress, msg)` as the capability-typed companion
+  to `tina::send`.
+- Added the user-shape proof matrix in `tina-runtime/tests/safety_rails.rs`
+  (positive fixtures) and compile_fail doctests pinned to `SendAddress`,
+  `CallAddress`, `call_typed`, and `register_service` (negative fixtures).
+- Migrated `system_cache_with_fill` to `register_service` /
+  `call_blocking_typed` so the public call lane is type-tagged at every
+  caller boundary. Migrated `system_realtime_rooms` to hold the room as a
+  `ServiceHandle` and to type-tag the gateway's call lane as a
+  `CallAddress`. Stamped `impl tina::CallableIsolate` on hand-rolled
+  `isolate_types!` isolates that define `handle_call`.
+- Documented the rails and the review rule
+  ("could this runtime rejection be a type error?") in
+  `docs/tina-user-guide/21-compile-time-safety-rails.md`.
+- Deferred: the wire-enum split (separate `InternalMsg` and `PublicCall`
+  types so calling an internal continuation by accident becomes a compile
+  error) and the cancelable-admission rail (owned by Phase 097's
+  `PendingCancelableCallSet`).
+
 ### Phase 095 Call Context Defer Ergonomics
 
 - Added `CallContext::defer(work).reply(...)` so multi-turn call handlers start
