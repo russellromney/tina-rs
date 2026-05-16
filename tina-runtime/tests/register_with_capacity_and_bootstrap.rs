@@ -337,20 +337,20 @@ fn threaded_bootstrap_error_passes_through() {
 }
 
 #[test]
-fn bootstrap_can_call_back_through_runtime() {
+fn bootstrap_can_call_back_through_runtime_and_was_delivered_first() {
     // Bootstrap handler can do anything an ordinary handler does. Prove that
-    // an isolate registered through the helper can be `call`ed and replies.
+    // an isolate registered through the helper saw Bootstrap as its first
+    // delivered message AND can be `call`ed afterwards.
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum EchoReply {
-        Ack(u32),
-        Bootstrapped,
+        AckBooted { booted: bool, value: u32 },
     }
 
     #[derive(Debug)]
     enum EchoMsg {
         Bootstrap,
-        Ask(u32),
+        AskBooted(u32),
     }
 
     #[derive(Debug)]
@@ -370,14 +370,17 @@ fn bootstrap_can_call_back_through_runtime() {
                     self.booted = true;
                     noop()
                 }
-                EchoMsg::Ask(_) => noop(),
+                EchoMsg::AskBooted(_) => noop(),
             }
         }
 
         fn handle_call(&mut self, msg: EchoMsg, call: tina::CallContext<'_, Self>) -> Effect<Self> {
             match msg {
-                EchoMsg::Bootstrap => call.reply(EchoReply::Bootstrapped),
-                EchoMsg::Ask(n) => call.reply(EchoReply::Ack(n)),
+                EchoMsg::Bootstrap => call.reject(tina::CallRejectedReason::UnsupportedMessage),
+                EchoMsg::AskBooted(value) => call.reply(EchoReply::AckBooted {
+                    booted: self.booted,
+                    value,
+                }),
             }
         }
     }
@@ -395,9 +398,18 @@ fn bootstrap_can_call_back_through_runtime() {
         .expect("threaded bootstrap admitted");
 
     let outcome = runtime
-        .call_blocking(addr, EchoMsg::Ask(7), Duration::from_secs(2))
+        .call_blocking(addr, EchoMsg::AskBooted(7), Duration::from_secs(2))
         .unwrap();
-    assert!(matches!(outcome, CallOutcome::Replied(EchoReply::Ack(7))));
+    match outcome {
+        CallOutcome::Replied(EchoReply::AckBooted { booted, value }) => {
+            assert!(
+                booted,
+                "Bootstrap must have been delivered before AskBooted"
+            );
+            assert_eq!(value, 7);
+        }
+        other => panic!("expected AckBooted, got {other:?}"),
+    }
 
     if let Ok(rt) = Arc::try_unwrap(runtime) {
         let _ = rt.shutdown();

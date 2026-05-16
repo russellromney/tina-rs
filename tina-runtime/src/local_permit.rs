@@ -184,9 +184,13 @@ impl LocalPermitGate {
     ///
     /// After reset, permits issued before the reset return
     /// [`LocalPermitReleaseError::StaleOrUnknown`] from
-    /// [`release`](Self::release) and [`retire`](Self::retire). `current`
-    /// remains zero only if the caller has explicitly drained outstanding
-    /// permits before calling `reset`.
+    /// [`release`](Self::release) and [`retire`](Self::retire).
+    ///
+    /// `current` is always set to zero regardless of outstanding permits.
+    /// If permits are still live when this is called, the gate will
+    /// under-count subsequent admissions: stale releases return an error
+    /// instead of restoring the slot. Drain outstanding permits before
+    /// calling `reset` unless you intend to abandon them.
     pub fn reset(&mut self) {
         self.generation = self.generation.saturating_add(1);
         self.current = 0;

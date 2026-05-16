@@ -218,8 +218,9 @@ impl Shipper {
     fn handle(
         &mut self,
         msg: ShipperMsg,
-        _ctx: &mut Context<'_, SingleShard, Self::Reply>,
+        ctx: &mut Context<'_, SingleShard, Self::Reply>,
     ) -> Effect<Self> {
+        let now = ctx.now();
         match msg {
             ShipperMsg::Tick { token } => self.on_tick(token),
             ShipperMsg::FlushDone {
@@ -227,7 +228,7 @@ impl Shipper {
                 count,
                 permit,
                 outcome,
-            } => self.on_flush_done(kind, count, permit, outcome),
+            } => self.on_flush_done(kind, count, permit, outcome, now),
             // Call-only shapes get dropped here. The host always calls them.
             ShipperMsg::Submit { .. } | ShipperMsg::Stats | ShipperMsg::Stop => noop(),
         }
@@ -269,6 +270,7 @@ impl Shipper {
     }
 
     fn on_submit(&mut self, event: Event, call: CallContext<'_, Self>) -> Effect<Self> {
+        let now = call.now();
         if !self.drain.is_open() {
             let _ = self.drain.admit();
             self.stats.stopping_rejects += 1;
@@ -305,7 +307,7 @@ impl Shipper {
             && self.flush_tick.next_due().is_none()
             && !self.buffer.is_empty()
         {
-            return Effect::Batch(vec![call.reply(ShipperReply::Accepted), self.arm_tick()]);
+            return Effect::Batch(vec![call.reply(ShipperReply::Accepted), self.arm_tick(now)]);
         }
         call.reply(ShipperReply::Accepted)
     }
@@ -353,6 +355,7 @@ impl Shipper {
         count: usize,
         permit: Permit,
         outcome: CallOutcome<SinkReply>,
+        now: std::time::Instant,
     ) -> Effect<Self> {
         let _ = self
             .flush_gate
@@ -398,7 +401,7 @@ impl Shipper {
             }
             // Smaller leftover after a flush: re-arm time window.
             if self.flush_tick.next_due().is_none() {
-                return self.arm_tick();
+                return self.arm_tick(now);
             }
         }
         noop()
@@ -425,22 +428,20 @@ impl Shipper {
         )
     }
 
-    fn arm_tick(&mut self) -> Effect<Self> {
-        // We assume the caller computed `now` correctly; for the live runtime
-        // this is std::time::Instant::now() since the isolate handler is on a
-        // real clock. The decision is what matters: it carries a token that
-        // self-detects stale fires.
-        let now = std::time::Instant::now();
+    fn arm_tick(&mut self, now: std::time::Instant) -> Effect<Self> {
         let decision = self.flush_tick.next(now);
         self.stats.ticks_armed += 1;
         match decision {
             RecurringTickDecision::Sleep { delay, token, .. } => {
                 sleep(delay).then(move |_| ShipperMsg::Tick { token })
             }
-            RecurringTickDecision::Skip(_) => {
-                // Skip is a visible decision: record it on the stats and let
-                // the next user action arm a fresh tick.
-                self.stats.ticks_fired_stale += 1;
+            RecurringTickDecision::Skip(report) => {
+                // Skip means whole periods were missed since this isolate
+                // arm. With the helper's tightened semantics this only fires
+                // when `report.missed_ticks > 0`; record the coalesced count
+                // and let the caller's next action arm a fresh tick.
+                self.stats.ticks_fired_stale =
+                    self.stats.ticks_fired_stale.saturating_add(report.missed_ticks);
                 noop()
             }
         }

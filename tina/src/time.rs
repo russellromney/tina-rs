@@ -698,16 +698,25 @@ impl RecurringTick {
                 self.arm_sleep(self.period, new_scheduled_at, now, 0)
             }
             RecurringCatchUp::Skip => {
-                // Coalesce all overdue periods into one visible Skip. Advance
-                // next_due past the overdue burst; the next `next` call will
-                // arm a fresh Sleep from that future slot.
+                let missed = elapsed_periods.saturating_sub(1);
+                if missed == 0 {
+                    // Slightly late but no full period was missed. Surfacing a
+                    // Skip here would tell the caller to drop the tick; arm a
+                    // fresh Sleep from now instead so a recurring service does
+                    // not stall after a barely-late observation.
+                    let new_scheduled_at = checked_add_or_max(now, self.period);
+                    self.next_due = Some(new_scheduled_at);
+                    return self.arm_sleep(self.period, new_scheduled_at, now, 0);
+                }
+                // Coalesce missed periods into one visible Skip. Advance
+                // next_due past the overdue burst; the next `next` call arms a
+                // fresh Sleep from that future slot.
                 let advance = duration_mul_saturating(self.period, u128::from(elapsed_periods));
                 let new_scheduled_at = scheduled_at
                     .checked_add(advance)
                     .filter(|slot| *slot > now)
                     .unwrap_or_else(|| checked_add_or_max(now, self.period));
                 self.next_due = Some(new_scheduled_at);
-                let missed = elapsed_periods.saturating_sub(1);
                 let tick_number = self.next_tick_number.saturating_add(missed);
                 self.next_tick_number = tick_number.saturating_add(1);
                 // No live ordinal during a Skip — a continuation arriving now
@@ -1085,6 +1094,32 @@ mod tests {
                 assert!(tick.validate(token).is_ok());
             }
             other => panic!("expected future Sleep after bounded burst, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn recurring_tick_skip_policy_returns_sleep_when_overdue_by_less_than_one_period() {
+        // A barely-overdue arm under Skip policy must not surface Skip(missed=0)
+        // — that would cause caller loops that treat Skip as "drop the tick" to
+        // stall. The helper arms a fresh Sleep from now instead.
+        let now = Instant::now();
+        let mut tick = RecurringTick::every(Duration::from_millis(10))
+            .unwrap()
+            .catch_up(RecurringCatchUp::Skip);
+        assert!(matches!(
+            tick.next(now),
+            RecurringTickDecision::Sleep { .. }
+        ));
+
+        // Observe 11ms later: scheduled_at was now+10ms, so we are 1ms past
+        // the scheduled slot with no full period missed.
+        let slightly_late = now + Duration::from_millis(11);
+        match tick.next(slightly_late) {
+            RecurringTickDecision::Sleep { delay, token, .. } => {
+                assert_eq!(delay, Duration::from_millis(10));
+                assert!(tick.validate(token).is_ok());
+            }
+            other => panic!("expected Sleep when overdue by < 1 period, got {other:?}"),
         }
     }
 

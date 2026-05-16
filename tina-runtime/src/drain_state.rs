@@ -128,10 +128,11 @@ impl DrainState {
         }
     }
 
-    /// Records one admission. Returns `true` if the service should accept it,
-    /// `false` if the service should reject with a typed "Stopping" / "Closed"
+    /// Records one admission. Returns [`AdmitDecision::Accept`] when the
+    /// service should reserve a slot, or [`AdmitDecision::Stopping`] when the
+    /// service should reject the caller with a typed "Stopping" / "Closed"
     /// reply. Capacity decisions remain with the caller; this only refuses
-    /// when [`begin`](Self::begin) has been called.
+    /// after [`begin`](Self::begin) has been called.
     pub fn admit(&mut self) -> AdmitDecision {
         if self.is_open() {
             self.admitted = self.admitted.saturating_add(1);
