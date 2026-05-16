@@ -1,0 +1,23 @@
+error[E0277]: `NoCallHandler` is not a callable service
+  --> tests/safety_rails_compile_fail/missing_handle_call.rs:32:40
+   |
+32 |     let _ = runtime.register_service::<NoCallHandler, Infallible>(NoCallHandler, 4);
+   |                     ----------------   ^^^^^^^^^^^^^ missing `fn handle_call`
+   |                     |
+   |                     required by a bound introduced by this call
+   |
+help: the trait `CallableIsolate` is not implemented for `NoCallHandler`
+  --> tests/safety_rails_compile_fail/missing_handle_call.rs:17:1
+   |
+17 | struct NoCallHandler;
+   | ^^^^^^^^^^^^^^^^^^^^
+   = note: callable services must define `handle_call(&mut self, msg, call)` on the isolate impl
+   = note: send-only services must register through `register_service_send_only` instead
+note: required by a bound in `Runtime::<S, F>::register_service`
+  --> src/lib.rs
+   |
+   |     pub fn register_service<I, Outbound>(
+   |            ---------------- required by a bound in this associated function
+...
+   |         I: Isolate<Shard = S, Send = TinaOutbound<Outbound>> + tina::CallableIsolate + 'static,
+   |                                                                ^^^^^^^^^^^^^^^^^^^^^ required by this bound in `Runtime::<S, F>::register_service`

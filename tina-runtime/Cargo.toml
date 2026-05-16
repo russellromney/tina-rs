@@ -29,3 +29,8 @@ signal-hook = { version = "0.3", default-features = false }
 [dev-dependencies]
 proptest = { version = "1.6.0", default-features = false, features = ["std"] }
 rcgen = "0.13"
+# Phase 100 safety-rails proof matrix: pin the diagnostic phrase emitted by
+# `tina::CallableIsolate`'s `#[diagnostic::on_unimplemented]`. Plain
+# `compile_fail` doctests pin compilation failure but not the message, so a
+# regression that weakened the diagnostic to trait-soup would slip through.
+trybuild = "1"

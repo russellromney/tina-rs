@@ -1559,15 +1559,6 @@ impl<M, R> CallAddress<M, R> {
     pub const fn generation(self) -> AddressGeneration {
         self.address.generation()
     }
-
-    /// Drops the callable capability and returns the send-only view.
-    ///
-    /// Used when a caller intentionally hands a service handle's call lane
-    /// to a worker that should only ever push, never call. Intentional, not
-    /// implicit.
-    pub const fn into_send_only(self) -> SendAddress<M> {
-        SendAddress::from_address(self.address)
-    }
 }
 
 impl<M, R> Address<M, R> {
