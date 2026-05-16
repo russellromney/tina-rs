@@ -46,6 +46,93 @@ impl fmt::Display for ThreadedRuntimeError {
 
 impl Error for ThreadedRuntimeError {}
 
+/// Error returned by `register_with_capacity_and_bootstrap` (and its mirrors)
+/// when the bootstrap message could not be prefilled into the newly allocated
+/// mailbox before the isolate entry was inserted.
+///
+/// No isolate is registered and no address is returned. The bootstrap message
+/// is returned to the caller so it can decide whether to retry with a larger
+/// mailbox capacity or surface the failure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RegisterBootstrapError<M> {
+    /// The mailbox refused the bootstrap message because it was already full.
+    /// This is impossible for a default mailbox of capacity >= 1 (the mailbox
+    /// is empty before the prefill), but a user-supplied mailbox can still
+    /// refuse. The message is returned untouched.
+    Full(M),
+    /// The mailbox refused the bootstrap message because it had already been
+    /// closed. The message is returned untouched.
+    Closed(M),
+}
+
+impl<M> fmt::Display for RegisterBootstrapError<M> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Full(_) => write!(
+                f,
+                "bootstrap prefill refused: mailbox full (capacity must be >= 1)"
+            ),
+            Self::Closed(_) => write!(
+                f,
+                "bootstrap prefill refused: mailbox already closed before registration"
+            ),
+        }
+    }
+}
+
+impl<M: fmt::Debug> Error for RegisterBootstrapError<M> {}
+
+/// Threaded mirror of [`RegisterBootstrapError`].
+///
+/// Adds [`Self::WorkerStopped`] so the threaded runtime surface can report a
+/// command-channel failure separately from a typed mailbox-prefill refusal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ThreadedRegisterBootstrapError<M> {
+    /// The mailbox refused the bootstrap message because it was already full.
+    Full(M),
+    /// The mailbox refused the bootstrap message because it had been closed.
+    Closed(M),
+    /// The worker thread stopped before it could process the command.
+    WorkerStopped,
+    /// A multi-shard operation targeted a shard this runtime does not own.
+    UnknownShard(ShardId),
+}
+
+impl<M> fmt::Display for ThreadedRegisterBootstrapError<M> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Full(_) => write!(
+                f,
+                "bootstrap prefill refused: mailbox full (capacity must be >= 1)"
+            ),
+            Self::Closed(_) => write!(
+                f,
+                "bootstrap prefill refused: mailbox already closed before registration"
+            ),
+            Self::WorkerStopped => write!(
+                f,
+                "worker thread stopped before it could process register-and-bootstrap"
+            ),
+            Self::UnknownShard(shard) => write!(
+                f,
+                "shard {} is not owned by this multi-shard runtime",
+                shard.get()
+            ),
+        }
+    }
+}
+
+impl<M: fmt::Debug> Error for ThreadedRegisterBootstrapError<M> {}
+
+impl<M> ThreadedRegisterBootstrapError<M> {
+    pub(crate) fn from_register(err: RegisterBootstrapError<M>) -> Self {
+        match err {
+            RegisterBootstrapError::Full(m) => Self::Full(m),
+            RegisterBootstrapError::Closed(m) => Self::Closed(m),
+        }
+    }
+}
+
 /// Error returned by [`crate::Runtime::try_supervise`] and the threaded equivalents.
 ///
 /// Replaces a panic on unknown / stale parent registration

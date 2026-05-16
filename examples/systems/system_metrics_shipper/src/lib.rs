@@ -16,8 +16,14 @@ use std::sync::{Barrier, Mutex};
 use std::thread;
 use std::time::Duration;
 
+use tina::time::{
+    RecurringCatchUp, RecurringTick, RecurringTickDecision, RecurringTickToken,
+};
 use tina::{CallContext, RequestContext, prelude::*, reply_to_request};
-use tina_runtime::{CallOutcome, DefaultThreadedMailboxFactory, ThreadedRuntime, call, sleep};
+use tina_runtime::{
+    AdmitDecision, CallOutcome, DefaultThreadedMailboxFactory, DrainState, LocalPermitGate,
+    LocalPermitName, Permit, ThreadedRuntime, call, sleep,
+};
 
 /// One submitted metric event. Payload is opaque; the specimen only cares
 /// about counts and the order in which they are delivered.
@@ -141,11 +147,12 @@ pub enum ShipperMsg {
     Stats,
     Stop,
     Tick {
-        token: u64,
+        token: RecurringTickToken,
     },
     FlushDone {
         kind: FlushKind,
         count: usize,
+        permit: Permit,
         outcome: CallOutcome<SinkReply>,
     },
 }
@@ -188,13 +195,18 @@ struct Shipper {
     sink: SinkAddr,
     buffer_capacity: usize,
     batch_size: usize,
-    batch_window: Duration,
     flush_timeout: Duration,
     buffer: VecDeque<Event>,
-    flush_in_flight: bool,
-    tick_token: u64,
-    armed_tick: Option<u64>,
-    draining: bool,
+    /// One in-flight flush at a time. The permit's name makes the
+    /// "max-1 outstanding flush" rule structural rather than a bool.
+    flush_gate: LocalPermitGate,
+    /// Time-based flush schedule. Stale-tick detection lives in the token,
+    /// so a size-triggered flush that pre-empts a pending tick is visibly
+    /// rejected when the tick continuation lands.
+    flush_tick: RecurringTick,
+    /// Drain bookkeeping: who is waiting on the Stop reply, and the typed
+    /// admission/completion counters used by Tina's Phase 101 helper.
+    drain: DrainState,
     pending_stop: Option<RequestContext<ShipperReply>>,
     drained_events: usize,
     drained_batches: usize,
@@ -206,15 +218,17 @@ impl Shipper {
     fn handle(
         &mut self,
         msg: ShipperMsg,
-        _ctx: &mut Context<'_, SingleShard, Self::Reply>,
+        ctx: &mut Context<'_, SingleShard, Self::Reply>,
     ) -> Effect<Self> {
+        let now = ctx.now();
         match msg {
             ShipperMsg::Tick { token } => self.on_tick(token),
             ShipperMsg::FlushDone {
                 kind,
                 count,
+                permit,
                 outcome,
-            } => self.on_flush_done(kind, count, outcome),
+            } => self.on_flush_done(kind, count, permit, outcome, now),
             // Call-only shapes get dropped here. The host always calls them.
             ShipperMsg::Submit { .. } | ShipperMsg::Stats | ShipperMsg::Stop => noop(),
         }
@@ -238,13 +252,13 @@ impl Shipper {
             sink,
             buffer_capacity: config.buffer_capacity,
             batch_size: config.batch_size,
-            batch_window: Duration::from_millis(config.batch_window_ms),
             flush_timeout: Duration::from_millis(config.flush_timeout_ms),
             buffer: VecDeque::with_capacity(config.buffer_capacity),
-            flush_in_flight: false,
-            tick_token: 0,
-            armed_tick: None,
-            draining: false,
+            flush_gate: LocalPermitGate::with_capacity(1).named(LocalPermitName("flush")),
+            flush_tick: RecurringTick::every(Duration::from_millis(config.batch_window_ms))
+                .expect("batch_window_ms > 0")
+                .catch_up(RecurringCatchUp::Skip),
+            drain: DrainState::new(),
             pending_stop: None,
             drained_events: 0,
             drained_batches: 0,
@@ -256,86 +270,100 @@ impl Shipper {
     }
 
     fn on_submit(&mut self, event: Event, call: CallContext<'_, Self>) -> Effect<Self> {
-        if self.draining {
+        let now = call.now();
+        if !self.drain.is_open() {
+            let _ = self.drain.admit();
             self.stats.stopping_rejects += 1;
             return call.reply(ShipperReply::Stopping);
         }
+        // Capacity decision stays with the service: gate the buffer, not the
+        // drain admission. Drain admission is for caller-obligation tracking
+        // and is not the same as the in-memory buffer cap.
         if self.buffer.len() >= self.buffer_capacity {
+            self.drain.record_full();
             self.stats.buffer_full_rejects += 1;
             return call.reply(ShipperReply::Dropped);
         }
+        debug_assert!(matches!(self.drain.admit(), AdmitDecision::Accept));
         self.buffer.push_back(event);
         if self.buffer.len() > self.stats.buffer_high_water {
             self.stats.buffer_high_water = self.buffer.len();
         }
 
-        // Size-based flush wins over the time window. When this fires, the
-        // already-armed tick becomes stale because `armed_tick` advances.
-        if self.buffer.len() >= self.batch_size && !self.flush_in_flight {
+        // Size-based flush wins over the time window. Clearing the recurring
+        // tick makes any in-flight Tick continuation visibly stale via
+        // `flush_tick.validate()`.
+        if self.buffer.len() >= self.batch_size && self.flush_gate.is_idle() {
             return Effect::Batch(vec![
                 call.reply(ShipperReply::Accepted),
                 self.start_flush(FlushKind::Size),
             ]);
         }
 
-        // Time-based flush: arm a tick the first time the buffer goes
-        // non-empty and no flush is in flight. While a flush is in flight
-        // the FlushDone handler decides whether to re-arm.
-        if !self.flush_in_flight && self.armed_tick.is_none() && !self.buffer.is_empty() {
-            return Effect::Batch(vec![call.reply(ShipperReply::Accepted), self.arm_tick()]);
+        // Time-based flush: arm the recurring tick the first time the buffer
+        // goes non-empty and no flush is in flight. After a flush completes
+        // FlushDone decides whether to re-arm.
+        if self.flush_gate.is_idle()
+            && self.flush_tick.next_due().is_none()
+            && !self.buffer.is_empty()
+        {
+            return Effect::Batch(vec![call.reply(ShipperReply::Accepted), self.arm_tick(now)]);
         }
         call.reply(ShipperReply::Accepted)
     }
 
     fn on_stop(&mut self, call: CallContext<'_, Self>) -> Effect<Self> {
-        if self.draining {
+        if !self.drain.is_open() {
             return call.reject(tina::CallRejectedReason::UnsupportedMessage);
         }
-        self.draining = true;
-        // Any in-flight tick is now stale; the drain handshake takes over.
-        self.armed_tick = None;
+        self.drain.begin();
+        // Any in-flight tick is now stale; drain handshake takes over.
+        self.flush_tick.clear();
 
-        if self.buffer.is_empty() && !self.flush_in_flight {
+        if self.buffer.is_empty() && self.flush_gate.is_idle() {
+            self.drain.finish();
             return call.reply(ShipperReply::Stopped {
                 flushed_on_drain: self.drained_events,
                 drained_batches: self.drained_batches,
             });
         }
         self.pending_stop = Some(call.into_request_context());
-        if !self.flush_in_flight {
+        if self.flush_gate.is_idle() {
             self.start_flush(FlushKind::Drain)
         } else {
             noop()
         }
     }
 
-    fn on_tick(&mut self, token: u64) -> Effect<Self> {
-        match self.armed_tick {
-            Some(expected) if expected == token => {
-                self.armed_tick = None;
-                if self.buffer.is_empty() || self.flush_in_flight {
-                    self.stats.ticks_fired_idle += 1;
-                    return noop();
-                }
-                self.stats.ticks_fired_useful += 1;
-                self.start_flush(FlushKind::Time)
-            }
-            _ => {
-                self.stats.ticks_fired_stale += 1;
-                noop()
-            }
+    fn on_tick(&mut self, token: RecurringTickToken) -> Effect<Self> {
+        if self.flush_tick.validate(token).is_err() {
+            self.stats.ticks_fired_stale += 1;
+            return noop();
         }
+        self.flush_tick.clear();
+        if self.buffer.is_empty() || !self.flush_gate.is_idle() {
+            self.stats.ticks_fired_idle += 1;
+            return noop();
+        }
+        self.stats.ticks_fired_useful += 1;
+        self.start_flush(FlushKind::Time)
     }
 
     fn on_flush_done(
         &mut self,
         kind: FlushKind,
         count: usize,
+        permit: Permit,
         outcome: CallOutcome<SinkReply>,
+        now: std::time::Instant,
     ) -> Effect<Self> {
-        self.flush_in_flight = false;
+        let _ = self
+            .flush_gate
+            .release(permit)
+            .expect("flush permit released exactly once by FlushDone");
         let succeeded = matches!(outcome, CallOutcome::Replied(SinkReply::Ack));
         if succeeded {
+            self.drain.record_complete();
             match kind {
                 FlushKind::Size => self.stats.batches_flushed_by_size += 1,
                 FlushKind::Time => self.stats.batches_flushed_by_time += 1,
@@ -346,13 +374,15 @@ impl Shipper {
                 }
             }
         } else {
+            self.drain.record_cancelled_or_retired();
             self.stats.flush_failures += 1;
             self.stats.events_lost_on_flush += count as u64;
         }
 
-        let drain_done = self.draining && self.buffer.is_empty();
+        let drain_done = !self.drain.is_open() && self.buffer.is_empty();
         if drain_done {
             if let Some(req) = self.pending_stop.take() {
+                self.drain.finish();
                 let reply = ShipperReply::Stopped {
                     flushed_on_drain: self.drained_events,
                     drained_batches: self.drained_batches,
@@ -363,43 +393,58 @@ impl Shipper {
         }
 
         if !self.buffer.is_empty() {
-            if self.draining {
+            if !self.drain.is_open() {
                 return self.start_flush(FlushKind::Drain);
             }
             if self.buffer.len() >= self.batch_size {
                 return self.start_flush(FlushKind::Size);
             }
             // Smaller leftover after a flush: re-arm time window.
-            if self.armed_tick.is_none() {
-                return self.arm_tick();
+            if self.flush_tick.next_due().is_none() {
+                return self.arm_tick(now);
             }
         }
         noop()
     }
 
     fn start_flush(&mut self, kind: FlushKind) -> Effect<Self> {
+        let permit = self
+            .flush_gate
+            .try_admit()
+            .expect("start_flush only called when flush_gate is idle");
         let take = self.batch_size.min(self.buffer.len());
         let batch: Vec<Event> = self.buffer.drain(..take).collect();
         let count = batch.len();
-        self.flush_in_flight = true;
-        // Any tick currently sleeping cannot satisfy a future flush
-        // because `armed_tick` advances before the timer payload returns.
-        self.armed_tick = None;
+        // Any tick currently sleeping cannot satisfy a future flush because
+        // `flush_tick.clear()` advances the helper's armed ordinal.
+        self.flush_tick.clear();
         call::<SinkMsg, SinkReply>(self.sink, SinkMsg::Flush { batch }, self.flush_timeout).then(
             move |outcome| ShipperMsg::FlushDone {
                 kind,
                 count,
+                permit,
                 outcome,
             },
         )
     }
 
-    fn arm_tick(&mut self) -> Effect<Self> {
-        self.tick_token += 1;
-        let token = self.tick_token;
-        self.armed_tick = Some(token);
+    fn arm_tick(&mut self, now: std::time::Instant) -> Effect<Self> {
+        let decision = self.flush_tick.next(now);
         self.stats.ticks_armed += 1;
-        sleep(self.batch_window).then(move |_| ShipperMsg::Tick { token })
+        match decision {
+            RecurringTickDecision::Sleep { delay, token, .. } => {
+                sleep(delay).then(move |_| ShipperMsg::Tick { token })
+            }
+            RecurringTickDecision::Skip(report) => {
+                // Skip means whole periods were missed since this isolate
+                // arm. With the helper's tightened semantics this only fires
+                // when `report.missed_ticks > 0`; record the coalesced count
+                // and let the caller's next action arm a fresh tick.
+                self.stats.ticks_fired_stale =
+                    self.stats.ticks_fired_stale.saturating_add(report.missed_ticks);
+                noop()
+            }
+        }
     }
 
     fn snapshot(&self) -> ShipperStats {

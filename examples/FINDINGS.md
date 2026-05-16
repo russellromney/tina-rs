@@ -497,6 +497,39 @@ past reclaimed slots. Must keep typed admission errors
 Revisit only after a third specimen needs the same shape so the helper
 shape is informed by three call sites, not two.
 
+### 23. Mailbox-first service ergonomics — Phase 101 shipped
+
+**Surfaced by:** `system_metrics_shipper`, `system_bounded_object_lane`,
+the recurring-tick / single-flight / drain / Full-handling repetition
+across system specimens.
+
+Shipped helpers:
+
+- `tina::time::RecurringTick` — fixed-period service ticks with
+  `Skip` / `Bounded(n)` / `Delay` catch-up policies; explicit
+  `RecurringTickToken` for stale-tick detection. `system_metrics_shipper`
+  now uses it for time-window flushes.
+- `tina_runtime::LocalPermitGate` — fixed-capacity, move-only `Permit`,
+  explicit release/retire; reports
+  capacity/current/full_count/high_water/retired_count/completed_count/
+  invalid_release_count. `system_bounded_object_lane` and the metrics
+  shipper's single-flight flush slot both run on it.
+- `tina_runtime::DrainState` — small admit/complete/cancel/drop
+  counter state plus `begin/finish/can_stop`. Late completions counted
+  separately. Resource close still belongs to the service.
+- `runtime.register_with_capacity_and_bootstrap[_on]` — prefills the
+  mailbox with the bootstrap message before inserting the isolate entry.
+  No cleanup-after-registration path; typed `RegisterBootstrapError` on
+  prefill refusal. Available on `Runtime`, `ThreadedRuntime`,
+  `MultiShardRuntime`, `ThreadedMultiShardRuntime`.
+- `tina_runtime::FullHandling` — decision-only state for the
+  "on Full, shed or retry-with-backoff" shape; the service still
+  schedules the visible Tina sleep.
+
+Out of scope here: lifecycle `on_start` callbacks (not shipped,
+register-and-bootstrap covers the common footgun without breaking
+mailbox truth), broad retry frameworks (FullHandling is the only one).
+
 ### 22. Internal-event variants need a `handle_call` rejection arm
 
 **Surfaced by:** `system_cache_with_fill`, `system_lock_manager`.

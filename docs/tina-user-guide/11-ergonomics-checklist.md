@@ -101,6 +101,132 @@ Do not hand-roll the same `match send_and_observe { Full | IngressFull
 => sleep, Closed => bail, ... }` retry loop at every host-side
 shutdown call site.
 
+### Multi-turn reply
+
+Use `call_ctx.defer(work).reply(|req, outcome| Msg::Done { req, outcome })`
+to consume the caller authority, run one visible runtime call, and answer
+later from the continuation handler via `reply_to_request(req, value)`.
+
+```rust
+call_ctx
+    .defer(call(child, ChildMsg::Run, timeout))
+    .reply(|req, outcome| Msg::ChildReturned { req, outcome })
+```
+
+This is the blessed shape for any handler that wants to answer after one
+runtime call. The continuation message stays visible. The reply is never
+auto-sent. Pair with `defer_cancelable(...).try_admit(...)` for the
+cancelable variant.
+
+Do not call `ctx.take_request_context().expect(...)` plus
+`call(...).then_with_request(...)` by hand; the older
+`call(...).reply_with_request(req, ...)` spelling is an escape hatch for
+sites that already own the `RequestContext`.
+
+### Recurring service tick
+
+Use `tina::time::RecurringTick` for service loops that periodically
+arm `sleep(period).then(Tick)`:
+
+```rust
+let mut tick = RecurringTick::every(period)?
+    .catch_up(RecurringCatchUp::Skip);
+
+match tick.next(ctx.now()) {
+    RecurringTickDecision::Sleep { delay, token, .. } =>
+        sleep(delay).then(move |_| Msg::Tick { token }),
+    RecurringTickDecision::Skip(report) => /* record missed ticks */,
+}
+```
+
+Each `Sleep` decision carries a `RecurringTickToken`; the continuation
+handler calls `tick.validate(token)` to detect stale ticks rearmed
+under it. Size-triggered work that pre-empts a pending tick calls
+`tick.clear()` so the stale fire is visibly rejected, not silently
+re-executed.
+
+Do not invent ad-hoc `armed_tick: Option<u64>` token state in every
+batcher.
+
+### Isolate-local in-flight permits
+
+Use `tina_runtime::LocalPermitGate` for "this isolate admitted local work
+that has not settled yet":
+
+```rust
+match self.gate.try_admit() {
+    Ok(permit) => call_ctx.defer(work).reply(move |req, result|
+        Msg::Done { permit, req, result }),
+    Err(full) => call_ctx.reply(Reply::Busy(full.report())),
+}
+```
+
+The permit is move-only; release it via `gate.release(permit)` (records a
+completion) or `gate.retire(permit)` (records an explicit abandon). Stale
+or unknown release returns `LocalPermitReleaseError::StaleOrUnknown`.
+`Drop` does not silently release: the gate stays charged for the slot
+and the process-wide `tina_runtime::dropped_permit_count()` increments.
+
+Do not invent per-service `in_flight: usize` plus `cap: usize` shapes.
+A pool is something else: it leases a resource across handlers and has
+waiter semantics. `LocalPermitGate` is not that.
+
+### Drain state
+
+Use `tina_runtime::DrainState` for shutdown bookkeeping. It records the
+stage (`Open` / `Draining` / `Stopped`), counts admit/complete events,
+and exposes `can_stop(outstanding)`:
+
+```rust
+self.drain.begin();
+self.tick.clear();
+if self.drain.can_stop(self.gate.current() as u64) {
+    self.drain.finish();
+    return call.reply(Reply::Stopped);
+}
+self.pending_stop = Some(call.into_request_context());
+```
+
+Late completions after `finish()` are visible (counted in
+`late_completions`) and never reopen admission.
+
+### Backpressure policy on Full
+
+Use `tina_runtime::FullHandling` for the "on Full, shed or retry-with-backoff"
+shape. `on_full(now, deadline)` returns a typed `Shed` / `RetryAfter` /
+`Exhausted` decision; the service still schedules the sleep or reply.
+
+```rust
+match self.full_policy.on_full(ctx.now(), self.deadline) {
+    FullDecision::Shed(report) => call_ctx.reply(Reply::Busy(report)),
+    FullDecision::RetryAfter { delay, token, .. } =>
+        sleep(delay).then(move |_| Msg::Retry(token)),
+    FullDecision::Exhausted { reason, report } =>
+        call_ctx.reply(Reply::Busy(report)),
+}
+```
+
+No helper resends a message by itself. Caller chooses idempotency before
+using retry mode. Every retry delay is a visible Tina `sleep`.
+
+### Register and bootstrap
+
+When a service always needs its first bootstrap message delivered before
+any other work, use `runtime.register_with_capacity_and_bootstrap(...)`
+(and shard-aware mirrors). The helper:
+
+1. allocates the mailbox;
+2. prefills it with the bootstrap message via the mailbox's own
+   `try_send`;
+3. only then inserts the isolate entry into the registry.
+
+If the prefill fails, no address is returned and no isolate is
+registered. There is no cleanup-after-registration path.
+
+Honesty: the returned address may have a full mailbox until `Bootstrap`
+is delivered. Sending immediately after this call can see `Full`. That
+is honest pressure, not a bug.
+
 ### Single-in-flight timer
 
 Use `tina_runtime::SingleCallGate` for isolates whose rate-limit

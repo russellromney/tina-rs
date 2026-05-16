@@ -1189,6 +1189,13 @@ where
         self.ctx.shard_id()
     }
 
+    /// Returns the runtime's current observed time. Mirrors
+    /// [`Context::now`](crate::Context::now) so call handlers can thread the
+    /// runtime clock into helpers without exposing the inner [`Context`].
+    pub fn now(&self) -> std::time::Instant {
+        self.ctx.now()
+    }
+
     /// Builds an [`Address`] for the currently executing isolate.
     pub fn me(&self) -> Address<I::Message, I::Reply> {
         Address::<I::Message, I::Reply>::new_with_generation(
@@ -2587,8 +2594,9 @@ pub mod prelude {
         isolate, isolate_types, noop, reply, reply_to, reply_to_request, restart_children, send,
         sequence, spawn, spawn_observed, stop, stop_with,
         time::{
-            Backoff, BackoffDelay, IntervalDelay, MissedTickPolicy, TimerConfigError,
-            TimerDecision, TimerInterval,
+            Backoff, BackoffDelay, IntervalDelay, MissedTickPolicy, RecurringCatchUp,
+            RecurringTick, RecurringTickDecision, RecurringTickReport, RecurringTickStale,
+            RecurringTickToken, TimerConfigError, TimerDecision, TimerInterval,
         },
     };
 }
