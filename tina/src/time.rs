@@ -458,11 +458,14 @@ fn checked_add_or_max(now: Instant, after: Duration) -> Instant {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RecurringCatchUp {
     /// Coalesce all missed ticks into one visible [`RecurringTickDecision::Skip`]
-    /// report. The next `next(now)` call returns a fresh future [`Sleep`].
+    /// report. The next `next(now)` call returns a fresh future
+    /// [`Sleep`](RecurringTickDecision::Sleep).
     Skip,
     /// Allow at most `n` immediate catch-up ticks. Each one resolves as a
-    /// [`Sleep`] with a zero delay (fire-now) and consumes one catch-up budget.
-    /// After the budget is exhausted, behaves like [`Skip`].
+    /// [`Sleep`](RecurringTickDecision::Sleep) with a zero delay (fire-now)
+    /// and consumes one catch-up budget. After the budget is exhausted, the
+    /// remaining missed ticks are dropped and counted in the first catch-up
+    /// `Sleep`'s `missed_ticks`.
     Bounded(u32),
     /// Drift forward: schedule the next tick `period` after the observed
     /// `now`. No catch-up; missed ticks become zero.
