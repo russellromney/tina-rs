@@ -735,6 +735,24 @@ impl RecurringTick {
                 // budget is dropped, and the count of dropped ticks is carried
                 // visibly on the first Sleep(0) via `missed_ticks`. Subsequent
                 // queued catch-ups report `missed_ticks = 0`.
+                if budget == 0 {
+                    let advance = duration_mul_saturating(self.period, u128::from(elapsed_periods));
+                    let new_scheduled_at = scheduled_at
+                        .checked_add(advance)
+                        .filter(|slot| *slot > now)
+                        .unwrap_or_else(|| checked_add_or_max(now, self.period));
+                    self.next_due = Some(new_scheduled_at);
+                    self.armed_ordinal = None;
+                    let tick_number = self.next_tick_number.saturating_add(elapsed_periods);
+                    self.next_tick_number = tick_number.saturating_add(1);
+                    return RecurringTickDecision::Skip(RecurringTickReport {
+                        tick_number,
+                        scheduled_at,
+                        observed_at: now,
+                        missed_ticks: elapsed_periods,
+                        catch_up_remaining: 0,
+                    });
+                }
                 let immediate = u64::from(budget).min(elapsed_periods);
                 let skipped = elapsed_periods - immediate;
                 // The first immediate tick is fired now; queue the rest.
@@ -1094,6 +1112,38 @@ mod tests {
                 assert!(tick.validate(token).is_ok());
             }
             other => panic!("expected future Sleep after bounded burst, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn recurring_tick_bounded_zero_skips_without_immediate_sleep() {
+        let now = Instant::now();
+        let mut tick = RecurringTick::every(Duration::from_millis(10))
+            .unwrap()
+            .catch_up(RecurringCatchUp::Bounded(0));
+        assert!(matches!(
+            tick.next(now),
+            RecurringTickDecision::Sleep { .. }
+        ));
+
+        let late = now + Duration::from_millis(35);
+        match tick.next(late) {
+            RecurringTickDecision::Skip(report) => {
+                assert!(
+                    report.missed_ticks >= 3,
+                    "all overdue ticks should be reported as skipped"
+                );
+                assert_eq!(report.catch_up_remaining, 0);
+            }
+            other => panic!("expected Skip for zero catch-up budget, got {other:?}"),
+        }
+
+        match tick.next(late) {
+            RecurringTickDecision::Sleep { delay, token, .. } => {
+                assert!(delay > Duration::ZERO);
+                assert!(tick.validate(token).is_ok());
+            }
+            other => panic!("expected future Sleep after zero-budget Skip, got {other:?}"),
         }
     }
 
