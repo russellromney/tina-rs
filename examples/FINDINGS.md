@@ -471,7 +471,53 @@ What still needs work but is deferred:
 loud-API constructors, `body_io_error_count` proves mid-stream
 client close).
 
-### 21. Host-side `call_blocking` on `ThreadedMultiShardRuntime`
+### 21. Per-bucket FIFO wait list next to a global `PendingReplies`
+
+**Surfaced by:** `system_cache_with_fill`, `system_lock_manager`.
+
+Both specimens want "one bounded global pending box, plus a FIFO
+wait list per cache key / lock key, plus a hand-off loop that skips
+slots whose caller went away." Each writes the same shape by hand:
+
+- `pending: PendingReplies<u64, Reply>` keyed by a monotonic waiter id;
+- per-bucket `VecDeque<u64>` of waiter ids inside the bucket's state;
+- on hand-off / fill-done, pop a waiter id from the queue, `take` from
+  pending, and if the slot is gone (caller cancelled / timed out) loop
+  to the next id.
+
+The cap accounting splits awkwardly: the global cap lives on
+`PendingReplies`; the per-bucket cap lives in handler code; the
+"skip reclaimed" loop is repeated.
+
+**Build:** a small `WaitList<K, R>` (or `KeyedPendingReplies<K, R>`)
+helper that owns both caps, takes the inbound `CallContext`, and
+exposes a single `pop_next(&K) -> Option<DeferredReply<R>>` that walks
+past reclaimed slots. Must keep typed admission errors
+(`Full` / `BucketFull`) so callers can reply `Busy` distinctly.
+Revisit only after a third specimen needs the same shape so the helper
+shape is informed by three call sites, not two.
+
+### 22. Internal-event variants need a `handle_call` rejection arm
+
+**Surfaced by:** `system_cache_with_fill`, `system_lock_manager`.
+
+Specimens that mix caller-authority messages (`Acquire`, `Get`) with
+runtime-owned continuations (`LeaseExpired`, `FillDone`) end up writing
+a `handle_call` arm whose only job is
+`call.reject(CallRejectedReason::UnsupportedMessage)` for every
+internal variant. The split between `handle` and `handle_call` is
+correct — caller authority should be visible at the type boundary —
+but the rejection ceremony repeats once per internal variant and per
+isolate.
+
+**Build:** either a derive / macro that generates the rejection arm
+from a "this variant is internal" attribute, or a typed split where
+`Self::Message` is an enum-of-enums (`Caller(...) | Internal(...)`)
+so the runtime never delivers an `Internal` variant through
+`handle_call` at all. The second shape is cleaner but a bigger ask.
+Hold until a third specimen pays the same toll.
+
+### 23. Host-side `call_blocking` on `ThreadedMultiShardRuntime`
 
 **Surfaced by:** `system_cache_with_fill`, `system_job_queue`,
 `system_session_auth`.
@@ -498,7 +544,7 @@ that owns `shard`. Once shipped, the next sharded specimen should use
 real cross-shard placement and the in-isolate fallback note should
 disappear from these READMEs.
 
-### 22. Startup hook for isolates with start-up effects
+### 24. Register-and-bootstrap helper for start-up effects
 
 **Surfaced by:** `system_job_queue`, `system_session_auth`.
 
@@ -518,11 +564,11 @@ shape. The public `Bootstrap` variant is also a small lie: it is in the
 message enum because the macro needs every public op there, but no host
 should ever send it after the first time.
 
-**Build:** an `on_start(&mut self) -> Effect<Self>` hook on `Isolate`,
-called once after the mailbox is bound. Alternative: a
-`register_with_bootstrap_effect(isolate, capacity, |self_addr| effect)`
-on the runtime, so the startup effect is wired at the same call site
-as the registration and does not need a public message variant.
+**Build:** Phase 101's `register_with_capacity_and_bootstrap(...)`
+helper. It should prefill the mailbox with `Bootstrap` before inserting
+the isolate entry, return the address only after the bootstrap message
+is admitted, and keep startup as an ordinary mailbox turn. No hidden
+`on_start` callback.
 
 ## Closed
 
