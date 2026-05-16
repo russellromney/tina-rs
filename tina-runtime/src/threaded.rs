@@ -28,12 +28,13 @@ use crate::errors::{
 use crate::host_burst::HostBurstOutcomes;
 use crate::live_report::{LiveShardMetrics, LiveShardState, LiveTopologyReport};
 use crate::local_system::{
-    LocalSystemState, LocalSystemTerminalReport, ThreadedCommandFn, ThreadedIoLoopFactory,
-    ThreadedWorkerExit, ThreadedWorkerJoin, TraceSnapshot,
+    LocalSystemTerminalReport, ThreadedCommandFn, ThreadedIoLoopFactory, ThreadedWorkerExit,
+    TraceSnapshot,
 };
 use crate::mailbox::MailboxFactory;
 use crate::observation::{self, BoundAddressWaiter};
 use crate::observer::TraceObserver;
+use crate::shutdown::{SharedShutdownState, ShutdownWorker, ThreadedShutdownHandle, handle_for};
 use crate::trace::{CallKind, RuntimeEvent};
 use crate::{
     IdSource, IntoErasedSpawn, IntoErasedSpawnObserved, PreallocationConfig, Runtime,
@@ -182,14 +183,20 @@ where
 /// backlog. This is the Betelgeuse live substrate shape; the
 /// explicit-step [`crate::Runtime`] and [`crate::MultiShardRuntime`] remain the semantic
 /// oracle.
+///
+/// Lifetime: the runtime value is the owner. Dropping it requests shutdown
+/// and joins the worker. Cloneable [`ThreadedShutdownHandle`]s obtained via
+/// [`Self::shutdown_handle`] do not extend the runtime's lifetime; they
+/// only let host threads request shutdown and observe the cached terminal
+/// report without `Arc::try_unwrap(runtime)`.
 pub struct ThreadedRuntime<S, F>
 where
     S: Shard + Send + 'static,
     F: MailboxFactory + Send + 'static,
 {
     commands: std::sync::mpsc::SyncSender<ThreadedCommand<S, F>>,
-    handle: Option<ThreadedWorkerJoin>,
     metrics: Arc<LiveShardMetrics>,
+    shutdown: Arc<SharedShutdownState<S, F>>,
 }
 
 impl<S, F> ThreadedRuntime<S, F>
@@ -310,10 +317,17 @@ where
             })
             .expect("failed to spawn Tina threaded worker");
 
+        let shutdown = Arc::new(SharedShutdownState::single_shard(ShutdownWorker {
+            shard: shard_id,
+            commands: commands.clone(),
+            handle: Some(handle),
+            metrics: Arc::clone(&metrics),
+        }));
+
         Self {
             commands,
-            handle: Some(handle),
             metrics,
+            shutdown,
         }
     }
 
@@ -431,7 +445,11 @@ where
             Err(ThreadedRuntimeError::UnknownShard(shard)) => {
                 Err(ThreadedRegisterBootstrapError::UnknownShard(shard))
             }
-            Err(ThreadedRuntimeError::DriverShutdownFailed) => {
+            Err(ThreadedRuntimeError::DriverShutdownFailed)
+            | Err(ThreadedRuntimeError::CommandFull) => {
+                // `call` is blocking-admission, so `CommandFull` is
+                // unreachable today. Map defensively in case the inner
+                // helper is ever migrated.
                 Err(ThreadedRegisterBootstrapError::WorkerStopped)
             }
         }
@@ -1055,7 +1073,7 @@ where
             sender: reply_tx,
             _marker: PhantomData,
         };
-        self.call(move |runtime| {
+        let command = ThreadedCommand::Run(Box::new(move |runtime| {
             let driver_addr =
                 runtime.register_with_capacity::<HostCallDriver<S, M, R>, Infallible>(driver, 2);
             match runtime.try_send(
@@ -1074,7 +1092,17 @@ where
                     panic!("fresh host-call driver mailbox was unexpectedly closed");
                 }
             }
-        })?;
+        }));
+        match self.commands.try_send(command) {
+            Ok(()) => {}
+            Err(std::sync::mpsc::TrySendError::Full(_)) => {
+                return Err(ThreadedRuntimeError::CommandFull);
+            }
+            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                self.metrics.set_state(LiveShardState::Failed);
+                return Err(ThreadedRuntimeError::WorkerStopped);
+            }
+        }
 
         match reply_rx.recv_timeout(timeout) {
             Ok(outcome) => Ok(outcome),
@@ -1104,6 +1132,24 @@ where
         self.call_blocking(address.address(), message, timeout)
     }
 
+    /// Returns a cloneable handle that controls runtime-level shutdown
+    /// without consuming the runtime value.
+    ///
+    /// Host threads can call [`ThreadedShutdownHandle::request_shutdown`]
+    /// and [`ThreadedShutdownHandle::wait_report`] from any thread without
+    /// the `Arc::try_unwrap(runtime)` ceremony that consuming
+    /// [`Self::shutdown_report`] requires when the runtime is shared
+    /// behind an `Arc`.
+    ///
+    /// Dropping the handle does **not** trigger shutdown. The runtime
+    /// owner still controls lifetime. Service-level drain (admit/quiesce
+    /// on app-level `Stop`/`Drain` messages) stays the service's
+    /// responsibility; this handle only asks the runtime/control plane
+    /// to begin shutdown.
+    pub fn shutdown_handle(&self) -> ThreadedShutdownHandle {
+        handle_for(&self.shutdown)
+    }
+
     /// Returns the live runtime capability table for this worker.
     pub fn capabilities(&self) -> RuntimeCapabilities {
         RuntimeCapabilities::threaded_with_capacities(
@@ -1126,20 +1172,15 @@ where
     }
 
     /// Requests shutdown and joins the worker, always returning terminal truth.
-    pub fn shutdown_report(mut self) -> LocalSystemTerminalReport {
-        let (shutdown_result, trace) = self.shutdown_inner_with_available_trace();
-        match shutdown_result {
-            Ok(()) => LocalSystemTerminalReport::new_with_topology(
-                LocalSystemState::Closed,
-                trace,
-                self.topology(),
-            ),
-            Err(error) => LocalSystemTerminalReport::failed_with_topology_and_trace(
-                error,
-                self.topology(),
-                trace,
-            ),
-        }
+    ///
+    /// Routes through the same shared shutdown state as
+    /// [`Self::shutdown_handle`] and `Drop`; a handle that already
+    /// requested shutdown or already waited the terminal report sees the
+    /// same cached report when this consuming form is called next.
+    pub fn shutdown_report(self) -> LocalSystemTerminalReport {
+        let shared = Arc::clone(&self.shutdown);
+        drop(self);
+        shared.wait_report_blocking()
     }
 
     fn call<R, C>(&self, command: C) -> Result<R, ThreadedRuntimeError>
@@ -1162,33 +1203,32 @@ where
         })
     }
 
-    fn shutdown_inner(&mut self) -> Result<Vec<RuntimeEvent>, ThreadedRuntimeError> {
-        let (result, trace) = self.shutdown_inner_with_available_trace();
-        result.map(|()| trace)
-    }
-
-    pub(crate) fn shutdown_inner_with_available_trace(
-        &mut self,
-    ) -> (Result<(), ThreadedRuntimeError>, Vec<RuntimeEvent>) {
-        let Some(handle) = self.handle.take() else {
-            return (Ok(()), Vec::new());
-        };
-        let _ = self.commands.send(ThreadedCommand::Shutdown);
-        match handle.join() {
-            Ok(exit) => {
-                if let Some(error) = exit.error {
-                    self.metrics.set_state(LiveShardState::Failed);
-                    (Err(error), exit.trace)
-                } else {
-                    self.metrics.set_state(LiveShardState::Stopped);
-                    (Ok(()), exit.trace)
-                }
+    /// Bounded-admission mirror of [`Self::call`] used by host-control
+    /// helpers that must not block on a full worker command queue.
+    fn try_call<R, C>(&self, command: C) -> Result<R, ThreadedRuntimeError>
+    where
+        R: Send + 'static,
+        C: FnOnce(&mut Runtime<S, F>) -> R + Send + 'static,
+    {
+        let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+        match self
+            .commands
+            .try_send(ThreadedCommand::Run(Box::new(move |runtime| {
+                let _ = reply_tx.send(command(runtime));
+            }))) {
+            Ok(()) => {}
+            Err(std::sync::mpsc::TrySendError::Full(_)) => {
+                return Err(ThreadedRuntimeError::CommandFull);
             }
-            Err(_) => {
+            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
                 self.metrics.set_state(LiveShardState::Failed);
-                (Err(ThreadedRuntimeError::WorkerStopped), Vec::new())
+                return Err(ThreadedRuntimeError::WorkerStopped);
             }
         }
+        reply_rx.recv().map_err(|_| {
+            self.metrics.set_state(LiveShardState::Failed);
+            ThreadedRuntimeError::WorkerStopped
+        })
     }
 }
 
@@ -1198,7 +1238,8 @@ where
     F: MailboxFactory + Send + 'static,
 {
     fn drop(&mut self) {
-        let _ = self.shutdown_inner();
+        self.shutdown.shutdown_blocking();
+        let _ = self.shutdown.wait_report_blocking();
     }
 }
 

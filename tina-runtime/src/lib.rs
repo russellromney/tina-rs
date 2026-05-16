@@ -73,6 +73,7 @@ pub mod persistence;
 pub mod pool;
 pub mod pressure;
 pub mod sharded;
+mod shutdown;
 mod single_call_gate;
 pub mod tcp_loops;
 mod threaded;
@@ -81,8 +82,9 @@ mod trace;
 
 pub use drain_state::{AdmitDecision, DrainReport, DrainStage, DrainState};
 pub use errors::{
-    RegisterBootstrapError, SendObservedUntilError, SuperviseError, ThreadedRegisterBootstrapError,
-    ThreadedRuntimeError, ThreadedSendObservedError, ThreadedTrySendError,
+    RegisterBootstrapError, SendObservedUntilError, ShutdownRequestError, ShutdownWaitError,
+    SuperviseError, ThreadedRegisterBootstrapError, ThreadedRuntimeError,
+    ThreadedSendObservedError, ThreadedTrySendError,
 };
 pub use full_handling::{
     FullDecision, FullExhaustionReason, FullHandling, FullHandlingReport, FullHandlingToken,
@@ -162,6 +164,7 @@ impl<M> Clone for SendOnlyServiceHandle<M> {
         *self
     }
 }
+pub use shutdown::ThreadedShutdownHandle;
 pub use single_call_gate::SingleCallGate;
 pub use threaded::{DEFAULT_SHUTDOWN_LANE_DRAIN_TIMEOUT, ThreadedRuntime, ThreadedRuntimeConfig};
 pub use threaded_multi_shard::ThreadedMultiShardRuntime;

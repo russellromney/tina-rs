@@ -581,6 +581,44 @@ Tina inside a Tokio edge.
 
 Do not do `Arc::try_unwrap` shutdown dances in examples.
 
+### Host shutdown handle
+
+Use `runtime.shutdown_handle()` and the cloneable
+`ThreadedShutdownHandle` (single- or multi-shard) when host code or
+tests need to drive runtime teardown without consuming the runtime
+value.
+
+```rust
+let handle = runtime.shutdown_handle();
+handle.request_shutdown()?;
+let report = handle.wait_report(Duration::from_secs(5))?;
+```
+
+Do not call `Arc::try_unwrap(runtime).ok().unwrap().shutdown()` in
+host examples. The handle is cloneable, `request_shutdown` is
+nonblocking, and the terminal report is cached so multiple waiters
+get the same `LocalSystemTerminalReport`.
+
+This is **runtime-level** control. Service-level drain stays the
+service's responsibility (`DrainState`, app `Stop`/`Drain` protocol).
+
+### Host call from tests
+
+Use `runtime.call_blocking(addr, msg, timeout)` on either threaded
+runtime to drive one service call from the host thread.
+
+The multi-shard form routes by `addr.shard()` exactly like
+`try_send`. There is no `call_blocking_on(shard, addr, ...)` —
+passing the shard twice is a place to introduce a mismatch bug.
+
+Both forms admit the one-shot driver isolate through a **bounded**
+worker command queue. A full queue surfaces as
+`ThreadedRuntimeError::CommandFull`, not as a silent host hang past
+the call timeout.
+
+Do not call `call_blocking` from inside an isolate handler. Handlers
+must stay synchronous and non-blocking; use `call(...).then(...)`.
+
 ### Bridge state aliases
 
 Use `tina_tower_bridge::TinaService<M, R>`. Do not spell out the

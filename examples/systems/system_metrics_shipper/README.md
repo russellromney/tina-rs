@@ -129,12 +129,15 @@ What felt rough (with the planned roadmap row that already names the fix):
   the next `FlushDone` calls `DrainState::finish()` and answers via
   `reply_to_request`. Ordering is visible, no hidden close.
 
-Not yet on the roadmap:
-- `Arc::try_unwrap(runtime)` for shutdown silently fails if any caller
-  thread still holds an Arc clone. Both reference specimens use this
-  shape. A `runtime.request_shutdown(timeout)` that did not depend on
-  no-other-owners would be friendlier and would compose with the
-  shutdown orchestration graph above.
+Closed by Phase 102 (host-control ergonomics):
+- `Arc::try_unwrap(runtime)` is gone from this specimen. The host now
+  takes a cloneable `ThreadedShutdownHandle` from
+  `runtime.shutdown_handle()`, calls `request_shutdown()` (nonblocking,
+  idempotent, fails fast with `ShutdownRequestError::CommandFull`
+  rather than hanging), and waits on the cached terminal report via
+  `wait_report(timeout)`. The handle controls **runtime** shutdown;
+  the shipper's own `Stop`/`DrainState` protocol still owns
+  service-level drain.
 
 Related shapes:
 - `ergonomics_playground::debounced_batch` parks each submitter in
@@ -159,8 +162,6 @@ Suggested follow-up:
   first defer sugar, backpressure policies, shutdown orchestration).
   This specimen is one piece of evidence those rows are pulling on real
   pain, not speculative ergonomics.
-- One new finding worth recording: a `request_shutdown` runtime API
-  that does not require sole `Arc` ownership.
 
 Verdict:
 - keep

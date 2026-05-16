@@ -1,26 +1,29 @@
 //! `system_session_auth` — sharded session table with a recurring expiry
-//! sweep.
+//! sweep, hosted on a real `ThreadedMultiShardRuntime` (phase 102).
 //!
 //! What this specimen pulls on:
 //!
-//! - `ShardPlacement` to route sessions into one of N buckets. The buckets
-//!   live inside a single isolate (`ThreadedMultiShardRuntime` is missing
-//!   a host `call_blocking`; see Findings).
+//! - One per-shard `SessionBucket` isolate per shard. No router or
+//!   tracker isolate; the host routes by `ShardPlacement` and calls each
+//!   bucket directly through `ThreadedMultiShardRuntime::call_blocking`.
 //! - Runtime-owned `sleep_then` for the periodic expiry sweep. The sweep
 //!   reschedules itself on every tick — that is the "recurring timer."
 //! - `CallContext` for `Login` / `Touch` / `Logout` / `Stats` caller
 //!   authority.
-//! - `ThreadedRuntime::call_blocking` for host-driven scenarios.
+//! - `ThreadedMultiShardRuntime::call_blocking` for host-driven scenarios
+//!   on a chosen live shard (no per-test driver isolate).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::convert::Infallible;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use tina::{CallContext, prelude::*};
 use tina_runtime::sharded::ShardPlacement;
-use tina_runtime::{CallOutcome, DefaultThreadedMailboxFactory, ThreadedRuntime, sleep_then};
+use tina_runtime::{
+    CallOutcome, DefaultThreadedMailboxFactory, ThreadedMultiShardRuntime, sleep_then,
+};
 
 /// Tunables for one specimen run.
 #[derive(Debug, Clone, Copy)]
@@ -76,8 +79,7 @@ pub struct OverflowReport {
     pub stats: SessionStats,
 }
 
-/// Operational snapshot. Every cap is reported so a smoke test can assert
-/// on it without reaching into internals.
+/// Operational snapshot, aggregated across every shard the host owns.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionStats {
     pub active: usize,
@@ -93,8 +95,7 @@ pub struct SessionStats {
     pub per_shard_high_water: Vec<u64>,
 }
 
-/// Opaque session handle returned by `Login`. Callers pass this back on
-/// `Touch` / `Logout`. The string is deterministic for tests.
+/// Opaque session handle. Encodes nothing the host couldn't compute.
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub struct SessionToken(pub String);
 
@@ -108,18 +109,36 @@ pub enum SessionAuthReply {
     /// Session was logged out, expired, or never existed. We do not leak
     /// which to the caller.
     NotFound,
-    /// The owning shard bucket was at capacity. Caller must retry later.
+    /// The owning shard bucket was at capacity. Caller must retry later
+    /// (potentially on a different shard for a new login).
     Full,
-    Stats(SessionStats),
+    Stats(BucketStats),
+}
+
+/// One shard's slice of stats. Aggregated by the host into [`SessionStats`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BucketStats {
+    pub active: u64,
+    pub admitted: u64,
+    pub logged_out: u64,
+    pub idle_expired: u64,
+    pub touch_ok: u64,
+    pub touch_not_found: u64,
+    pub full_rejects: u64,
+    pub sweeps_run: u64,
+    pub high_water: u64,
 }
 
 #[derive(Debug)]
 pub enum SessionAuthMsg {
     /// One-shot kick from the host to start the recurring sweep timer.
-    /// Sent automatically by `register_auth`.
     Bootstrap,
+    /// Host-supplied token; the bucket records it and replies with the
+    /// admission result. The host is responsible for routing this call
+    /// to the shard the token hashes to.
     Login {
         user_id: String,
+        token: SessionToken,
     },
     Touch {
         token: SessionToken,
@@ -128,48 +147,35 @@ pub enum SessionAuthMsg {
         token: SessionToken,
     },
     Stats,
-    /// Internal sweep tick. Hosts should not send this directly; it lands
-    /// here via `sleep_then` and reschedules itself.
+    /// Internal sweep tick. Reschedules itself.
     Sweep,
 }
 
 #[derive(Debug)]
 struct SessionRow {
-    #[allow(dead_code)] // carried so the table is realistic, not used by stats yet.
+    #[allow(dead_code)]
     user_id: String,
     last_touched_at: Instant,
 }
 
-struct SessionAuth {
+/// One per-shard bucket. Each shard hosts exactly one of these.
+struct SessionBucket {
     config: RunConfig,
-    placement: ShardPlacement,
-    shard_to_idx: HashMap<ShardId, usize>,
-    buckets: Vec<HashMap<SessionToken, SessionRow>>,
-    next_id: u64,
+    rows: HashMap<SessionToken, SessionRow>,
     sweeping: bool,
-    admitted: u64,
-    logged_out: u64,
-    idle_expired: u64,
-    touch_ok: u64,
-    touch_not_found: u64,
-    full_rejects: u64,
-    sweeps_run: u64,
-    per_shard_admitted: Vec<u64>,
-    per_shard_high_water: Vec<u64>,
+    stats: BucketStats,
 }
 
-#[tina_runtime::isolate(message = SessionAuthMsg, reply = SessionAuthReply)]
-impl SessionAuth {
+#[tina_runtime::isolate(message = SessionAuthMsg, reply = SessionAuthReply, shard = AuthShard)]
+impl SessionBucket {
     fn handle(
         &mut self,
         msg: SessionAuthMsg,
-        _ctx: &mut Context<'_, SingleShard, Self::Reply>,
+        _ctx: &mut Context<'_, AuthShard, Self::Reply>,
     ) -> Effect<Self> {
         match msg {
             SessionAuthMsg::Bootstrap => self.start_sweep(),
             SessionAuthMsg::Sweep => self.sweep(),
-            // Request/reply variants are answered in `handle_call`. If a
-            // caller mis-routes them through `try_send` we drop them.
             SessionAuthMsg::Login { .. }
             | SessionAuthMsg::Touch { .. }
             | SessionAuthMsg::Logout { .. }
@@ -179,10 +185,10 @@ impl SessionAuth {
 
     fn handle_call(&mut self, msg: SessionAuthMsg, call: CallContext<'_, Self>) -> Effect<Self> {
         match msg {
-            SessionAuthMsg::Login { user_id } => self.login(user_id, call),
+            SessionAuthMsg::Login { user_id, token } => self.login(user_id, token, call),
             SessionAuthMsg::Touch { token } => self.touch(token, call),
             SessionAuthMsg::Logout { token } => self.logout(token, call),
-            SessionAuthMsg::Stats => call.reply(SessionAuthReply::Stats(self.stats())),
+            SessionAuthMsg::Stats => call.reply(SessionAuthReply::Stats(self.snapshot())),
             SessionAuthMsg::Bootstrap | SessionAuthMsg::Sweep => {
                 call.reject(tina::CallRejectedReason::UnsupportedMessage)
             }
@@ -190,37 +196,14 @@ impl SessionAuth {
     }
 }
 
-impl SessionAuth {
-    fn new(config: RunConfig) -> anyhow::Result<Self> {
-        if config.shards == 0 {
-            anyhow::bail!("shards must be >= 1");
-        }
-        let shard_ids: Vec<ShardId> = (0..config.shards as u32).map(ShardId::new).collect();
-        let placement = ShardPlacement::new("system_session_auth.placement", shard_ids.clone())
-            .map_err(|e| anyhow::anyhow!("placement: {e:?}"))?;
-        let shard_to_idx = shard_ids
-            .iter()
-            .copied()
-            .enumerate()
-            .map(|(i, s)| (s, i))
-            .collect();
-        Ok(Self {
+impl SessionBucket {
+    fn new(config: RunConfig) -> Self {
+        Self {
             config,
-            placement,
-            shard_to_idx,
-            buckets: (0..config.shards).map(|_| HashMap::new()).collect(),
-            next_id: 1,
+            rows: HashMap::new(),
             sweeping: false,
-            admitted: 0,
-            logged_out: 0,
-            idle_expired: 0,
-            touch_ok: 0,
-            touch_not_found: 0,
-            full_rejects: 0,
-            sweeps_run: 0,
-            per_shard_admitted: vec![0; config.shards],
-            per_shard_high_water: vec![0; config.shards],
-        })
+            stats: BucketStats::default(),
+        }
     }
 
     fn start_sweep(&mut self) -> Effect<Self> {
@@ -238,60 +221,49 @@ impl SessionAuth {
         )
     }
 
-    fn bucket_for(&self, token: &SessionToken) -> usize {
-        let owner = self.placement.owner_for_str(&token.0);
-        *self
-            .shard_to_idx
-            .get(&owner)
-            .expect("placement returned a shard id we registered")
-    }
-
-    fn login(&mut self, user_id: String, call: CallContext<'_, Self>) -> Effect<Self> {
-        let token = SessionToken(format!("s-{}", self.next_id));
-        self.next_id += 1;
-        let idx = self.bucket_for(&token);
-        let bucket = &mut self.buckets[idx];
-        if bucket.len() >= self.config.max_sessions_per_shard {
-            self.full_rejects += 1;
+    fn login(
+        &mut self,
+        user_id: String,
+        token: SessionToken,
+        call: CallContext<'_, Self>,
+    ) -> Effect<Self> {
+        if self.rows.len() >= self.config.max_sessions_per_shard {
+            self.stats.full_rejects += 1;
             return call.reply(SessionAuthReply::Full);
         }
-        bucket.insert(
+        self.rows.insert(
             token.clone(),
             SessionRow {
                 user_id,
                 last_touched_at: Instant::now(),
             },
         );
-        self.admitted += 1;
-        self.per_shard_admitted[idx] += 1;
-        let depth = bucket.len() as u64;
-        if depth > self.per_shard_high_water[idx] {
-            self.per_shard_high_water[idx] = depth;
+        self.stats.admitted += 1;
+        self.stats.active = self.rows.len() as u64;
+        if self.stats.active > self.stats.high_water {
+            self.stats.high_water = self.stats.active;
         }
         call.reply(SessionAuthReply::Admitted { token })
     }
 
     fn touch(&mut self, token: SessionToken, call: CallContext<'_, Self>) -> Effect<Self> {
-        let idx = self.bucket_for(&token);
-        let bucket = &mut self.buckets[idx];
-        match bucket.get_mut(&token) {
+        match self.rows.get_mut(&token) {
             Some(row) => {
                 row.last_touched_at = Instant::now();
-                self.touch_ok += 1;
+                self.stats.touch_ok += 1;
                 call.reply(SessionAuthReply::Touched)
             }
             None => {
-                self.touch_not_found += 1;
+                self.stats.touch_not_found += 1;
                 call.reply(SessionAuthReply::NotFound)
             }
         }
     }
 
     fn logout(&mut self, token: SessionToken, call: CallContext<'_, Self>) -> Effect<Self> {
-        let idx = self.bucket_for(&token);
-        let bucket = &mut self.buckets[idx];
-        if bucket.remove(&token).is_some() {
-            self.logged_out += 1;
+        if self.rows.remove(&token).is_some() {
+            self.stats.logged_out += 1;
+            self.stats.active = self.rows.len() as u64;
             call.reply(SessionAuthReply::LoggedOut)
         } else {
             call.reply(SessionAuthReply::NotFound)
@@ -299,39 +271,182 @@ impl SessionAuth {
     }
 
     fn sweep(&mut self) -> Effect<Self> {
-        self.sweeps_run += 1;
+        self.stats.sweeps_run += 1;
         let now = Instant::now();
         let idle = Duration::from_millis(self.config.idle_timeout_ms);
-        for bucket in &mut self.buckets {
-            let expired: Vec<SessionToken> = bucket
-                .iter()
-                .filter(|(_, row)| now.duration_since(row.last_touched_at) >= idle)
-                .map(|(t, _)| t.clone())
-                .collect();
-            for token in expired {
-                bucket.remove(&token);
-                self.idle_expired += 1;
-            }
+        let expired: Vec<SessionToken> = self
+            .rows
+            .iter()
+            .filter(|(_, row)| now.duration_since(row.last_touched_at) >= idle)
+            .map(|(t, _)| t.clone())
+            .collect();
+        for token in expired {
+            self.rows.remove(&token);
+            self.stats.idle_expired += 1;
         }
+        self.stats.active = self.rows.len() as u64;
         self.schedule_sweep()
     }
 
-    fn stats(&self) -> SessionStats {
-        let per_shard_active: Vec<u64> = self.buckets.iter().map(|b| b.len() as u64).collect();
-        let active = per_shard_active.iter().copied().sum::<u64>() as usize;
-        SessionStats {
-            active,
-            admitted: self.admitted,
-            logged_out: self.logged_out,
-            idle_expired: self.idle_expired,
-            touch_ok: self.touch_ok,
-            touch_not_found: self.touch_not_found,
-            full_rejects: self.full_rejects,
-            sweeps_run: self.sweeps_run,
-            per_shard_active,
-            per_shard_admitted: self.per_shard_admitted.clone(),
-            per_shard_high_water: self.per_shard_high_water.clone(),
+    fn snapshot(&self) -> BucketStats {
+        BucketStats {
+            active: self.rows.len() as u64,
+            ..self.stats
         }
+    }
+}
+
+/// Multi-shard wrapper around `AuthShard` used by
+/// `ThreadedMultiShardRuntime`.
+#[derive(Clone, Copy, Debug)]
+pub struct AuthShard(pub u32);
+
+impl Shard for AuthShard {
+    fn id(&self) -> ShardId {
+        ShardId::new(self.0)
+    }
+}
+
+type AuthRuntime = ThreadedMultiShardRuntime<AuthShard, DefaultThreadedMailboxFactory>;
+type AuthAddr = Address<SessionAuthMsg, SessionAuthReply>;
+
+/// Host-side view. Wraps the multi-shard runtime, the placement map
+/// from token text to shard id, and one bucket address per shard.
+struct AuthWorld {
+    runtime: AuthRuntime,
+    placement: ShardPlacement,
+    shard_ids: Vec<ShardId>,
+    addrs_by_shard: BTreeMap<ShardId, AuthAddr>,
+    next_id: AtomicU64,
+    timeout: Duration,
+}
+
+impl AuthWorld {
+    fn start(config: RunConfig) -> anyhow::Result<Self> {
+        if config.shards == 0 {
+            anyhow::bail!("shards must be >= 1");
+        }
+        let shard_objs: Vec<AuthShard> = (0..config.shards as u32).map(AuthShard).collect();
+        let shard_ids: Vec<ShardId> = shard_objs.iter().map(|s| s.id()).collect();
+        let placement = ShardPlacement::new("system_session_auth.placement", shard_ids.clone())
+            .map_err(|e| anyhow::anyhow!("placement: {e:?}"))?;
+        let runtime = AuthRuntime::new(shard_objs, DefaultThreadedMailboxFactory);
+        let mut addrs_by_shard = BTreeMap::new();
+        for shard_id in &shard_ids {
+            let addr = runtime
+                .register_with_capacity_on::<SessionBucket, Infallible>(
+                    *shard_id,
+                    SessionBucket::new(config),
+                    config.session_mailbox,
+                )
+                .map_err(|e| anyhow::anyhow!("register on shard {}: {e:?}", shard_id.get()))?;
+            runtime
+                .try_send(addr, SessionAuthMsg::Bootstrap)
+                .map_err(|e| anyhow::anyhow!("bootstrap on shard {}: {e:?}", shard_id.get()))?;
+            addrs_by_shard.insert(*shard_id, addr);
+        }
+        Ok(Self {
+            runtime,
+            placement,
+            shard_ids,
+            addrs_by_shard,
+            next_id: AtomicU64::new(1),
+            timeout: Duration::from_millis(config.call_timeout_ms),
+        })
+    }
+
+    fn mint_token(&self) -> SessionToken {
+        let n = self.next_id.fetch_add(1, Ordering::Relaxed);
+        SessionToken(format!("s-{n}"))
+    }
+
+    fn addr_for(&self, token: &SessionToken) -> AuthAddr {
+        let shard = self.placement.owner_for_str(&token.0);
+        self.addrs_by_shard[&shard]
+    }
+
+    fn login(&self, user_id: String) -> anyhow::Result<SessionAuthReply> {
+        let token = self.mint_token();
+        let addr = self.addr_for(&token);
+        match self.runtime.call_blocking(
+            addr,
+            SessionAuthMsg::Login {
+                user_id,
+                token: token.clone(),
+            },
+            self.timeout,
+        )? {
+            CallOutcome::Replied(r) => Ok(r),
+            other => anyhow::bail!("login outcome: {other:?}"),
+        }
+    }
+
+    fn touch(&self, token: SessionToken) -> anyhow::Result<SessionAuthReply> {
+        let addr = self.addr_for(&token);
+        match self
+            .runtime
+            .call_blocking(addr, SessionAuthMsg::Touch { token }, self.timeout)?
+        {
+            CallOutcome::Replied(r) => Ok(r),
+            other => anyhow::bail!("touch outcome: {other:?}"),
+        }
+    }
+
+    fn logout(&self, token: SessionToken) -> anyhow::Result<SessionAuthReply> {
+        let addr = self.addr_for(&token);
+        match self
+            .runtime
+            .call_blocking(addr, SessionAuthMsg::Logout { token }, self.timeout)?
+        {
+            CallOutcome::Replied(r) => Ok(r),
+            other => anyhow::bail!("logout outcome: {other:?}"),
+        }
+    }
+
+    fn stats(&self) -> anyhow::Result<SessionStats> {
+        let mut combined = SessionStats {
+            active: 0,
+            admitted: 0,
+            logged_out: 0,
+            idle_expired: 0,
+            touch_ok: 0,
+            touch_not_found: 0,
+            full_rejects: 0,
+            sweeps_run: 0,
+            per_shard_active: vec![0; self.shard_ids.len()],
+            per_shard_admitted: vec![0; self.shard_ids.len()],
+            per_shard_high_water: vec![0; self.shard_ids.len()],
+        };
+        for (idx, shard_id) in self.shard_ids.iter().enumerate() {
+            let addr = self.addrs_by_shard[shard_id];
+            match self
+                .runtime
+                .call_blocking(addr, SessionAuthMsg::Stats, self.timeout)?
+            {
+                CallOutcome::Replied(SessionAuthReply::Stats(s)) => {
+                    combined.active += s.active as usize;
+                    combined.admitted += s.admitted;
+                    combined.logged_out += s.logged_out;
+                    combined.idle_expired += s.idle_expired;
+                    combined.touch_ok += s.touch_ok;
+                    combined.touch_not_found += s.touch_not_found;
+                    combined.full_rejects += s.full_rejects;
+                    combined.sweeps_run += s.sweeps_run;
+                    combined.per_shard_active[idx] = s.active;
+                    combined.per_shard_admitted[idx] = s.admitted;
+                    combined.per_shard_high_water[idx] = s.high_water;
+                }
+                other => anyhow::bail!("stats outcome: {other:?}"),
+            }
+        }
+        Ok(combined)
+    }
+
+    /// Tear down through the cloneable shutdown handle so this specimen
+    /// does not need `Arc::try_unwrap(runtime)` ceremony.
+    fn shutdown(self) -> anyhow::Result<()> {
+        let _ = self.runtime.shutdown();
+        Ok(())
     }
 }
 
@@ -344,51 +459,17 @@ pub fn run(config: RunConfig) -> anyhow::Result<RunReport> {
 }
 
 pub fn run_login_touch_logout(config: RunConfig) -> anyhow::Result<LoginTouchLogoutReport> {
-    let runtime = Arc::new(ThreadedRuntime::new(
-        SingleShard,
-        DefaultThreadedMailboxFactory,
-    ));
-    let auth = register_auth(&runtime, config)?;
-    let timeout = Duration::from_millis(config.call_timeout_ms);
-
-    let token = match runtime.call_blocking(
-        auth,
-        SessionAuthMsg::Login {
-            user_id: "alice".into(),
-        },
-        timeout,
-    )? {
-        CallOutcome::Replied(SessionAuthReply::Admitted { token }) => token,
+    let world = AuthWorld::start(config)?;
+    let token = match world.login("alice".into())? {
+        SessionAuthReply::Admitted { token } => token,
         other => anyhow::bail!("login: {other:?}"),
     };
+    let touch_ok = matches!(world.touch(token.clone())?, SessionAuthReply::Touched);
+    let logout_ok = matches!(world.logout(token.clone())?, SessionAuthReply::LoggedOut);
+    let touch_after_logout = matches!(world.touch(token)?, SessionAuthReply::NotFound);
 
-    let touch_ok = matches!(
-        runtime.call_blocking(
-            auth,
-            SessionAuthMsg::Touch {
-                token: token.clone(),
-            },
-            timeout,
-        )?,
-        CallOutcome::Replied(SessionAuthReply::Touched)
-    );
-    let logout_ok = matches!(
-        runtime.call_blocking(
-            auth,
-            SessionAuthMsg::Logout {
-                token: token.clone(),
-            },
-            timeout,
-        )?,
-        CallOutcome::Replied(SessionAuthReply::LoggedOut)
-    );
-    let touch_after_logout = matches!(
-        runtime.call_blocking(auth, SessionAuthMsg::Touch { token }, timeout)?,
-        CallOutcome::Replied(SessionAuthReply::NotFound)
-    );
-
-    let stats = stats(&runtime, auth)?;
-    shutdown(runtime);
+    let stats = world.stats()?;
+    world.shutdown()?;
     Ok(LoginTouchLogoutReport {
         login_ok: true,
         touch_ok,
@@ -399,36 +480,18 @@ pub fn run_login_touch_logout(config: RunConfig) -> anyhow::Result<LoginTouchLog
 }
 
 pub fn run_idle_expiry(config: RunConfig) -> anyhow::Result<IdleExpiryReport> {
-    let runtime = Arc::new(ThreadedRuntime::new(
-        SingleShard,
-        DefaultThreadedMailboxFactory,
-    ));
-    let auth = register_auth(&runtime, config)?;
-    let timeout = Duration::from_millis(config.call_timeout_ms);
-
-    let token = match runtime.call_blocking(
-        auth,
-        SessionAuthMsg::Login {
-            user_id: "bob".into(),
-        },
-        timeout,
-    )? {
-        CallOutcome::Replied(SessionAuthReply::Admitted { token }) => token,
+    let world = AuthWorld::start(config)?;
+    let token = match world.login("bob".into())? {
+        SessionAuthReply::Admitted { token } => token,
         other => anyhow::bail!("login: {other:?}"),
     };
-
-    // Sleep long enough that idle_timeout has elapsed AND the recurring
-    // sweep has run at least twice past that point.
     let idle_wait =
         Duration::from_millis(config.idle_timeout_ms + (3 * config.sweep_interval_ms) + 40);
     thread::sleep(idle_wait);
 
-    let not_found = matches!(
-        runtime.call_blocking(auth, SessionAuthMsg::Touch { token }, timeout)?,
-        CallOutcome::Replied(SessionAuthReply::NotFound)
-    );
-    let stats = stats(&runtime, auth)?;
-    shutdown(runtime);
+    let not_found = matches!(world.touch(token)?, SessionAuthReply::NotFound);
+    let stats = world.stats()?;
+    world.shutdown()?;
     Ok(IdleExpiryReport {
         touch_after_idle_not_found: not_found,
         stats,
@@ -436,74 +499,26 @@ pub fn run_idle_expiry(config: RunConfig) -> anyhow::Result<IdleExpiryReport> {
 }
 
 pub fn run_overflow(config: RunConfig) -> anyhow::Result<OverflowReport> {
-    // Collapse the cap so overflow is deterministic regardless of how
-    // tokens hash across buckets. The cap-reporting contract is the same.
     let mut config = config;
     config.shards = 1;
     config.max_sessions_per_shard = 4;
 
-    let runtime = Arc::new(ThreadedRuntime::new(
-        SingleShard,
-        DefaultThreadedMailboxFactory,
-    ));
-    let auth = register_auth(&runtime, config)?;
-    let timeout = Duration::from_millis(config.call_timeout_ms);
-
+    let world = AuthWorld::start(config)?;
     let burst = config.max_sessions_per_shard + 5;
     let mut admitted = 0;
     let mut full = 0;
     for i in 0..burst {
-        let outcome = runtime.call_blocking(
-            auth,
-            SessionAuthMsg::Login {
-                user_id: format!("u-{i}"),
-            },
-            timeout,
-        )?;
-        match outcome {
-            CallOutcome::Replied(SessionAuthReply::Admitted { .. }) => admitted += 1,
-            CallOutcome::Replied(SessionAuthReply::Full) => full += 1,
+        match world.login(format!("u-{i}"))? {
+            SessionAuthReply::Admitted { .. } => admitted += 1,
+            SessionAuthReply::Full => full += 1,
             other => anyhow::bail!("login: {other:?}"),
         }
     }
-
-    let stats = stats(&runtime, auth)?;
-    shutdown(runtime);
+    let stats = world.stats()?;
+    world.shutdown()?;
     Ok(OverflowReport {
         admitted,
         full,
         stats,
     })
-}
-
-fn register_auth(
-    runtime: &ThreadedRuntime<SingleShard, DefaultThreadedMailboxFactory>,
-    config: RunConfig,
-) -> anyhow::Result<Address<SessionAuthMsg, SessionAuthReply>> {
-    let address = runtime
-        .register_with_capacity::<SessionAuth, Infallible>(
-            SessionAuth::new(config)?,
-            config.session_mailbox,
-        )
-        .map_err(|e| anyhow::anyhow!("register: {e:?}"))?;
-    runtime
-        .try_send(address, SessionAuthMsg::Bootstrap)
-        .map_err(|e| anyhow::anyhow!("bootstrap: {e:?}"))?;
-    Ok(address)
-}
-
-fn stats(
-    runtime: &ThreadedRuntime<SingleShard, DefaultThreadedMailboxFactory>,
-    auth: Address<SessionAuthMsg, SessionAuthReply>,
-) -> anyhow::Result<SessionStats> {
-    match runtime.call_blocking(auth, SessionAuthMsg::Stats, Duration::from_secs(1))? {
-        CallOutcome::Replied(SessionAuthReply::Stats(s)) => Ok(s),
-        other => anyhow::bail!("stats failed: {other:?}"),
-    }
-}
-
-fn shutdown(runtime: Arc<ThreadedRuntime<SingleShard, DefaultThreadedMailboxFactory>>) {
-    if let Ok(rt) = Arc::try_unwrap(runtime) {
-        let _ = rt.shutdown();
-    }
 }
