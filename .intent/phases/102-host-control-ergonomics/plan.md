@@ -1,7 +1,9 @@
 # Phase 102 - Host Control Ergonomics
 
-Status: Ready to implement. Can run in parallel with 094/100/101 because the
-code work is in `tina-runtime` plus targeted specimen/docs migrations.
+Status: Ready to implement. Phase 101 is now merged. Can run in parallel with
+100 if file ownership is coordinated; if 100 lands first, use its new
+request/event handle shape in the migrated specimens. Code work is in
+`tina-runtime` plus targeted specimen/docs migrations.
 
 This is not a planning phase. Build the pinned host-control helpers below.
 
@@ -116,8 +118,8 @@ Migration:
 
 - migrate `system_session_auth` to real `ThreadedMultiShardRuntime` placement
   for the host smoke path.
-- If the implementation branch lands after Phase 100 changes service handles,
-  use the new blessed handle shape, but still migrate `system_session_auth`.
+- If Phase 100 changes service handles first, use the new blessed handle shape,
+  but still migrate `system_session_auth`.
 
 ## Rock 2 - Non-Consuming Shutdown Request Handle
 
@@ -241,6 +243,9 @@ Proof:
 Migration:
 
 - migrate `system_metrics_shipper`.
+- It already uses Phase 101 `DrainState`, `RecurringTick`, and
+  `LocalPermitGate`; keep those helpers and replace only the host/runtime
+  shutdown ceremony.
 - README must say the helper controls the runtime, not the service's internal
   drain policy.
 

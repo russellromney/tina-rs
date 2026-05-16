@@ -4,8 +4,12 @@
 
 - IDD phase.
 - One PR.
-- Runs after Phase 095 call-context defer ergonomics.
-- Builds on completed Phase 083 `examples/systems/mini_saas_api`.
+- Runs after Phase 095, 097, and 101. Prefer running after Phase 100 and Phase
+  102 so the skeleton teaches the new service handle and host-control shape
+  once, not twice. If it runs first, leave a status note naming the expected
+  migration.
+- Builds on completed Phase 083 `examples/systems/mini_saas_api` and the
+  Phase 101 service helpers.
 - Owns the system specimen refresh, copied docs, and small helper extraction
   only if repeated service code proves it.
 
@@ -19,6 +23,13 @@ But Tina changed under it:
 - ordinary continuations are `then(...)`;
 - cancelable multi-turn work has a sharp admission rule;
 - service layers have more pressure/capacity/lifecycle vocabulary.
+- Phase 101 added `RecurringTick`, `DrainState`, `LocalPermitGate`,
+  `FullHandling`, and register-and-bootstrap helpers. Use them where they make
+  the copied service smaller without hiding truth.
+- Phase 100 may split public requests from internal events. If it has landed,
+  the skeleton must use that split handle shape.
+- Phase 102 may add host-control helpers. If it has landed, the skeleton should
+  use them instead of host driver/shutdown ceremony.
 
 The copied service must teach the current shape, not old ceremony.
 
@@ -64,7 +75,11 @@ Read:
 - `.intent/phases/083-production-service-layers/plan.md`;
 - `.intent/phases/095-call-context-defer-ergonomics/plan.md`;
 - `.intent/phases/097-cancelable-deferred-admission/plan.md`;
+- `.intent/phases/100-compile-time-safety-rails/plan.md`;
+- `.intent/phases/101-mailbox-first-service-ergonomics/plan.md`;
+- `.intent/phases/102-host-control-ergonomics/plan.md`;
 - `examples/systems/mini_saas_api`;
+- `examples/systems/system_realtime_rooms/README.md`;
 - `docs/tina-user-guide/00-agent-quickstart.md`;
 - `docs/tina-user-guide/04-request-reply.md`;
 - `docs/tina-user-guide/10-service-patterns.md`;
@@ -97,6 +112,11 @@ Rules:
   teaches why `defer(...)` exists;
 - if cancelable deferred work exists, either use Phase 097 helper if landed or
   keep explicit admission-before-dispatch code.
+- if Phase 100 has landed, keep public requests and internal continuations in
+  separate message/capability types.
+- avoid the `system_realtime_rooms` footgun: a public request must not return
+  call-shaped work whose completion reenters the same service as a public
+  request unless that is the intended API.
 
 Proof:
 
@@ -135,6 +155,10 @@ Proof:
 
 Refresh shutdown to the current lifecycle vocabulary.
 
+Use Phase 101 `DrainState` for service-local drain bookkeeping. If Phase 102
+has landed, use `ThreadedShutdownHandle` for host/runtime shutdown instead of
+`Arc::try_unwrap(runtime)` or a one-off shutdown driver.
+
 Required order:
 
 1. stop accepting new work;
@@ -151,6 +175,7 @@ Proof:
 - after shutdown, new work is rejected/closed visibly;
 - no `Arc<Mutex<Option<Report>>>` completion mailbox if `stop_with` /
   `observe_result` works.
+- no `Arc::try_unwrap(runtime)` shutdown dance if Phase 102 has landed.
 
 ## Rock 4: Helper Extraction Only If Earned
 
