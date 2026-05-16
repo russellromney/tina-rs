@@ -201,26 +201,26 @@ impl Isolate for Room {
     fn handle(
         &mut self,
         msg: WebSocketSessionMsg,
-        _ctx: &mut Context<'_, RoomShard, Self::Reply>,
+        ctx: &mut Context<'_, RoomShard, Self::Reply>,
     ) -> Effect<Self> {
-        self.dispatch(msg)
+        self.dispatch(msg, ctx.now())
     }
 
     fn handle_call(
         &mut self,
         msg: WebSocketSessionMsg,
-        _call: CallContext<'_, Self>,
+        call: CallContext<'_, Self>,
     ) -> Effect<Self> {
         // Tina's connection owner uses `try_send` for app deliveries that
         // arrive at `handle`, and `call` for ones that need a reply
         // (SessionOpen/SessionText/etc.). We accept both shapes through
         // the same `dispatch` so the room stays single-source-of-truth.
-        self.dispatch(msg)
+        self.dispatch(msg, call.now())
     }
 }
 
 impl Room {
-    fn dispatch(&mut self, msg: WebSocketSessionMsg) -> Effect<Self> {
+    fn dispatch(&mut self, msg: WebSocketSessionMsg, now: Instant) -> Effect<Self> {
         match msg {
             // ---- internal scheduling messages (encoded as Text) -----------
             WebSocketSessionMsg::Text(text) if text == BOOTSTRAP_TEXT => self.on_bootstrap(),
@@ -234,17 +234,17 @@ impl Room {
                     .strip_prefix(TICK_PREFIX)
                     .and_then(|n| n.parse::<u64>().ok())
                     .expect("guard checked above");
-                self.on_tick(generation)
+                self.on_tick(generation, now)
             }
             // ---- session lifecycle ----------------------------------------
-            WebSocketSessionMsg::SessionOpen { session } => self.on_session_open(session),
+            WebSocketSessionMsg::SessionOpen { session } => self.on_session_open(session, now),
             WebSocketSessionMsg::SessionText { session_id, text } => {
-                self.on_session_text(session_id, text)
+                self.on_session_text(session_id, text, now)
             }
             WebSocketSessionMsg::SessionBinary { session_id, .. } => {
                 // Touch liveness on inbound binary; we don't echo binary in
                 // this specimen.
-                self.last_seen.insert(session_id, Instant::now());
+                self.last_seen.insert(session_id, now);
                 self.report.update(|s| s.messages_in += 1);
                 reply(WebSocketSessionOutcome::None)
             }
@@ -300,7 +300,7 @@ impl Room {
         sleep_then(self.presence_tick, WebSocketSessionMsg::Text(label))
     }
 
-    fn on_tick(&mut self, generation: u64) -> Effect<Self> {
+    fn on_tick(&mut self, generation: u64, now: Instant) -> Effect<Self> {
         if self.shutting_down || generation != self.tick_generation {
             return reply(WebSocketSessionOutcome::None);
         }
@@ -308,7 +308,6 @@ impl Room {
 
         // Evict members not seen recently. "Seen" advances when an inbound
         // SessionText arrives. A slow / silent peer ages out.
-        let now = Instant::now();
         let stale: Vec<WebSocketSessionId> = self
             .last_seen
             .iter()
@@ -350,7 +349,7 @@ impl Room {
         batch(effects)
     }
 
-    fn on_session_open(&mut self, session: WebSocketSessionHandle) -> Effect<Self> {
+    fn on_session_open(&mut self, session: WebSocketSessionHandle, now: Instant) -> Effect<Self> {
         let session_id = session.session_id();
         if self.shutting_down {
             self.report.update(|s| s.rejected_shutdown += 1);
@@ -367,7 +366,7 @@ impl Room {
             ));
         }
         self.members.insert(session_id, session);
-        self.last_seen.insert(session_id, Instant::now());
+        self.last_seen.insert(session_id, now);
         self.report.update(|s| {
             s.joined += 1;
             s.live_members = self.members.len();
@@ -381,14 +380,19 @@ impl Room {
         )))
     }
 
-    fn on_session_text(&mut self, session_id: WebSocketSessionId, text: String) -> Effect<Self> {
+    fn on_session_text(
+        &mut self,
+        session_id: WebSocketSessionId,
+        text: String,
+        now: Instant,
+    ) -> Effect<Self> {
         if !self.members.contains_key(&session_id) {
             // A stray text after we already evicted the member. The
             // connection owner will close it shortly via lifecycle msgs;
             // nothing to do.
             return reply(WebSocketSessionOutcome::None);
         }
-        self.last_seen.insert(session_id, Instant::now());
+        self.last_seen.insert(session_id, now);
         self.report.update(|s| s.messages_in += 1);
 
         let body = format!("room:{text}");
