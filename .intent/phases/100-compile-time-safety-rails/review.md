@@ -92,3 +92,23 @@ shape.
 
 Resolution: the plan now requires nearby passing fixtures for each important
 failure family.
+
+## Finding 10 [P2] Public request and internal completion can still cross wires
+
+The plan originally split send and call messages, but did not explicitly cover
+the newer `system_realtime_rooms` bug: a public request starts runtime work, and
+the completion later reenters the target as a public `handle_call` message.
+That creates `UnsupportedMessage` at runtime even though the program shape is
+wrong at authoring time.
+
+Resolution: Rock 0, Rock 2, and the proof matrix now require a rail for
+request-started work whose completion must land as an internal event by
+default.
+
+## Finding 11 [P3] Phase 101/102 ordering can cause churn
+
+Phase 101 is now merged and Phase 102 may land before or during this work.
+Ignoring either would leave the safety plan pointing at stale copied paths.
+
+Resolution: status now says Phase 101 helpers are part of the copied service
+shape, and Phase 102 host-control APIs should be preserved if they land first.

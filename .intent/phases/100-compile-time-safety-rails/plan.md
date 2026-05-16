@@ -5,8 +5,11 @@
 - IDD phase.
 - One PR if the first slice stays mechanical. Split if the send/call address
   split becomes a broad migration.
-- Runs after Phase 095. Coordinate with Phase 097 if it already owns
-  cancelable deferred admission.
+- Runs after Phase 095, 097, and 101. Those helpers are now part of the copied
+  service shape.
+- Can run in parallel with Phase 102 if file ownership is coordinated. If 102
+  lands first, preserve the host-control API and migrate examples to the new
+  service handle shape instead of old `Address<M, R>` where practical.
 - Must include user-style compile-pass and compile-fail proof. Unit tests alone
   are not enough.
 - Strong bias: change the heart of the service model if it makes wrong code
@@ -28,6 +31,8 @@ Compile time should catch impossible-program facts:
 - calling a send-only service;
 - calling an internal continuation message;
 - forgetting `handle_call` on a callable service;
+- returning call-shaped work from a request handler that later routes internal
+  runtime completions back through `handle_call`;
 - returning an effect the isolate did not declare;
 - dispatching cancelable deferred work before bounded admission, if the API can
   make that impossible;
@@ -85,6 +90,8 @@ Read:
 - `tina/src/pending_call_set.rs`;
 - `tina-http/src/http2.rs`;
 - `tina-http/src/grpc.rs`;
+- `examples/systems/system_cache_with_fill`;
+- `examples/systems/system_realtime_rooms`;
 - docs request/reply and ergonomics checklist;
 - systems/specimens that return `UnsupportedMessage`.
 
@@ -102,6 +109,8 @@ Include these failures:
 - non-`Send` / non-`'static` user payload;
 - wrong shard/reply shape;
 - cancelable deferred dispatch before admission;
+- request handler starts child/runtime work and its completion is delivered as
+  a public request instead of an internal event;
 - protocol transition after EOF/trailers/close;
 - missing/zero config where zero is never valid.
 
@@ -203,6 +212,11 @@ Rules:
 - internal continuation messages cannot be called;
 - callable services must implement the call handler;
 - `handle_call` should match public call variants explicitly;
+- runtime and child completions are internal events by default, even when the
+  work was started from `handle_call`;
+- a request handler may start runtime work, but the completion must land in the
+  internal event channel unless the target is explicitly another public request
+  endpoint;
 - old `Address<M, R>` may stay as compatibility/low-level escape hatch;
 - new docs and new service specimens use the split handle by default.
 
@@ -216,6 +230,10 @@ Coordinate with 097.
 
 If 097 ships `PendingCancelableCallSet`, use it. If not, either implement the
 type rail here or update 097 to own it.
+
+Phase 097 is expected to own the storage helper. This phase owns the capability
+shape around it: failed admission must leave caller authority answerable, and
+the child effect should not be easy to dispatch before admission.
 
 Target copied shape:
 
@@ -295,6 +313,7 @@ Negative fixtures:
 | `wrong_send_effect.rs` | isolate did not declare outbound send capability |
 | `non_send_message.rs` | user payload is not `Send`, if cleanly pinnable |
 | `cancelable_dispatch_before_admit.rs` | if 097/type rail supports this |
+| `completion_as_public_request.rs` | runtime completion for request-started work is not callable public API |
 
 Positive fixtures:
 
@@ -305,6 +324,7 @@ Positive fixtures:
 | `send_only_isolate.rs` | no-call isolate needs no `handle_call` |
 | `defer_multiturn_good.rs` | `call_ctx.defer(...).reply(...)` is copied path |
 | `register_service_handle.rs` | split service handle exposes `.send` and `.call` |
+| `request_started_work_returns_internal_event.rs` | public request starts work and receives internal completion safely |
 
 Prefer `trybuild` if acceptable. Otherwise use `compile_fail` doctests. Each
 negative fixture needs a nearby passing fixture.

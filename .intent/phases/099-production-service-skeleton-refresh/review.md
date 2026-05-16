@@ -39,3 +39,29 @@ Real shutdown has in-flight work, closed pools, and rejected new work.
 
 Resolution: Rock 3 requires shutdown while one request is in flight plus a
 post-shutdown rejection/closed proof.
+
+## Finding 6 [P2] Recent service helpers can make the skeleton stale on day one
+
+Phase 101 shipped recurring tick, drain, local permit, register/bootstrap, and
+Full-handling helpers. A refreshed skeleton that keeps hand-rolled versions of
+those patterns would teach old Tina.
+
+Resolution: status and grug truth now require reading Phase 101 and using the
+helpers where they reduce ceremony without hiding message/effect truth.
+
+## Finding 7 [P2] The realtime-rooms failure can leak into the copied service
+
+`system_realtime_rooms` showed a sharp request/event bug: work started from
+`handle_call` can accidentally route later runtime completions back through
+`handle_call` as public requests. A production skeleton must not copy that.
+
+Resolution: Rock 1 now names the footgun and says request-started work must
+land as internal events unless another public request endpoint is intended.
+
+## Finding 8 [P3] Host shutdown ceremony may churn after Phase 102
+
+If Phase 102 lands first, `Arc::try_unwrap(runtime)` or one-off shutdown driver
+code becomes stale immediately.
+
+Resolution: status and Rock 3 now say to use `ThreadedShutdownHandle` when it
+exists, and to leave a migration note if this phase runs first.
