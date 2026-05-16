@@ -2917,6 +2917,45 @@ where
     IsolateCall::new(destination, message, timeout)
 }
 
+/// Capability-typed call that accepts only a [`tina::CallAddress`].
+///
+/// `call_typed(call_address, msg, timeout)` is the preferred call entry point.
+/// Passing a [`SendAddress`](tina::SendAddress) or the `.send` lane of a
+/// [`ServiceHandle`](crate::ServiceHandle) is a compile error. The runtime
+/// semantics are identical to [`call`]; the only difference is the boundary
+/// type-check.
+///
+/// Negative fixture: calling a send-only address is a compile error.
+///
+/// ```compile_fail
+/// use std::time::Duration;
+/// use tina::{Address, AddressGeneration, IsolateId, SendAddress, ShardId};
+/// use tina_runtime::call_typed;
+///
+/// enum Msg { Tick }
+/// struct Reply;
+///
+/// let raw: Address<Msg, Reply> = Address::new_with_generation(
+///     ShardId::new(0),
+///     IsolateId::new(1),
+///     AddressGeneration::new(0),
+/// );
+/// let send_only: SendAddress<Msg> = raw.send_only();
+/// // Expected `CallAddress`, found `SendAddress`.
+/// let _ = call_typed(send_only, Msg::Tick, Duration::from_millis(1));
+/// ```
+pub fn call_typed<T, R>(
+    destination: tina::CallAddress<T, R>,
+    message: T,
+    timeout: Duration,
+) -> IsolateCall<T, R>
+where
+    T: Send + 'static,
+    R: 'static,
+{
+    IsolateCall::new(destination.address(), message, timeout)
+}
+
 /// Returns a sleep effect that ignores the infallible timer payload and
 /// delivers `message` back later.
 ///

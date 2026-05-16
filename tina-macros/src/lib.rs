@@ -9,8 +9,8 @@ use proc_macro::TokenStream;
 use quote::quote;
 use syn::parse::{Parse, ParseStream};
 use syn::{
-    Error, FnArg, ImplItem, ImplItemFn, ItemImpl, Pat, Path, Result, ReturnType, Token, Type,
-    parse_macro_input,
+    Error, FnArg, Ident, ImplItem, ImplItemFn, ItemImpl, Pat, Path, Result, ReturnType, Token,
+    Type, parse_macro_input,
 };
 
 struct IsolateArgs {
@@ -21,6 +21,7 @@ struct IsolateArgs {
     spawn_observed: Option<Type>,
     call: Option<Type>,
     shard: Option<Type>,
+    send_only: Option<Ident>,
 }
 
 impl Parse for IsolateArgs {
@@ -33,33 +34,48 @@ impl Parse for IsolateArgs {
             spawn_observed: None,
             call: None,
             shard: None,
+            send_only: None,
         };
 
         while !input.is_empty() {
             let key: Path = input.parse()?;
-            input.parse::<Token![=]>()?;
-            let value: Type = input.parse()?;
-
-            let Some(ident) = key.get_ident().map(|ident| ident.to_string()) else {
+            let Some(ident_owned) = key.get_ident().cloned() else {
                 return Err(Error::new_spanned(
                     key,
                     "expected a simple isolate option name",
                 ));
             };
+            let name = ident_owned.to_string();
 
-            match ident.as_str() {
-                "message" => set_once(&mut args.message, value, "message")?,
-                "reply" => set_once(&mut args.reply, value, "reply")?,
-                "send" => set_once(&mut args.send, value, "send")?,
-                "spawn" => set_once(&mut args.spawn, value, "spawn")?,
-                "spawn_observed" => set_once(&mut args.spawn_observed, value, "spawn_observed")?,
-                "call" => set_once(&mut args.call, value, "call")?,
-                "shard" => set_once(&mut args.shard, value, "shard")?,
-                _ => {
+            // `send_only` is a bare flag, not `key = value`.
+            if name == "send_only" {
+                if args.send_only.is_some() {
                     return Err(Error::new_spanned(
-                        key,
-                        "expected one of: message, reply, send, spawn, spawn_observed, call, shard",
+                        ident_owned,
+                        "duplicate isolate option `send_only`",
                     ));
+                }
+                args.send_only = Some(ident_owned);
+            } else {
+                input.parse::<Token![=]>()?;
+                let value: Type = input.parse()?;
+
+                match name.as_str() {
+                    "message" => set_once(&mut args.message, value, "message")?,
+                    "reply" => set_once(&mut args.reply, value, "reply")?,
+                    "send" => set_once(&mut args.send, value, "send")?,
+                    "spawn" => set_once(&mut args.spawn, value, "spawn")?,
+                    "spawn_observed" => {
+                        set_once(&mut args.spawn_observed, value, "spawn_observed")?
+                    }
+                    "call" => set_once(&mut args.call, value, "call")?,
+                    "shard" => set_once(&mut args.shard, value, "shard")?,
+                    _ => {
+                        return Err(Error::new_spanned(
+                            key,
+                            "expected one of: message, reply, send, spawn, spawn_observed, call, shard, send_only",
+                        ));
+                    }
                 }
             }
 
@@ -136,6 +152,28 @@ fn build_isolate(
         .shard
         .unwrap_or_else(|| syn::parse_quote!(::tina::SingleShard));
 
+    // `send_only` declares the isolate has no public callable surface. The
+    // reply type defaults to `()` so it can be registered through
+    // `register_service_send_only` (which requires `Reply = ()`). Authoring
+    // `handle_call` on a `send_only` isolate is a compile error: the
+    // capability-typed `SendOnlyServiceHandle` returned by registration has no
+    // `.call` lane, so any reachable call would be a routing bug, not a
+    // user-visible API.
+    if let Some(send_only) = &args.send_only {
+        if args.reply.is_some() {
+            return Err(Error::new_spanned(
+                send_only,
+                "`send_only` isolates must not declare a `reply` (the reply type is forced to `()`)",
+            ));
+        }
+        if args.call.is_some() {
+            return Err(Error::new_spanned(
+                send_only,
+                "`send_only` isolates must not declare a `call` channel",
+            ));
+        }
+    }
+
     let reply = args.reply.unwrap_or_else(|| syn::parse_quote!(()));
     let send = args
         .send
@@ -178,6 +216,12 @@ fn build_isolate(
         let ImplItem::Fn(method) = item.items.remove(index) else {
             unreachable!("handle_call_index only matches functions")
         };
+        if let Some(send_only) = &args.send_only {
+            return Err(Error::new_spanned(
+                send_only,
+                "`send_only` isolates must not define `handle_call`; remove the flag or remove `handle_call`",
+            ));
+        }
         Some(validate_handle_call(&method)?)
     } else {
         None
@@ -185,6 +229,7 @@ fn build_isolate(
 
     let attrs = &handle.attrs;
     let body = &handle.block;
+    let has_handle_call = handle_call.is_some();
     let handle_call_tokens = if let Some((attrs, msg_name, call_name, body)) = handle_call {
         quote! {
             #(#attrs)*
@@ -195,6 +240,13 @@ fn build_isolate(
             ) -> ::tina::Effect<Self> {
                 #body
             }
+        }
+    } else {
+        quote! {}
+    };
+    let callable_marker_impl = if has_handle_call {
+        quote! {
+            impl #impl_generics ::tina::CallableIsolate for #isolate #ty_generics #where_clause {}
         }
     } else {
         quote! {}
@@ -228,6 +280,8 @@ fn build_isolate(
 
             #handle_call_tokens
         }
+
+        #callable_marker_impl
     })
 }
 

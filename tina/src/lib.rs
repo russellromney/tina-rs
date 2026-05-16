@@ -321,6 +321,31 @@ pub trait Isolate: Sized {
     }
 }
 
+/// Marker that an [`Isolate`] exposes a meaningful `handle_call` and is
+/// therefore safe to register through `tina_runtime::Runtime::register_service`.
+///
+/// The default `handle_call` on [`Isolate`] always rejects with
+/// `CallRejectedReason::UnsupportedMessage`. Registering such an isolate
+/// through the callable lane would create a service whose every call returns
+/// a runtime rejection — exactly the silent failure Phase 100 moves to the
+/// compile boundary. `CallableIsolate` is the type-level "this isolate's
+/// `handle_call` is intentional" stamp.
+///
+/// The `#[tina::isolate]` and `#[tina_runtime::isolate]` macros emit
+/// `impl CallableIsolate for ...` automatically when the impl block defines
+/// `fn handle_call(...)`. Hand-rolled isolates may implement this trait
+/// manually after defining their own `handle_call`.
+///
+/// Send-only services intentionally do not implement `CallableIsolate` and
+/// must be registered through `register_service_send_only`.
+#[diagnostic::on_unimplemented(
+    message = "`{Self}` is not a callable service",
+    label = "missing `fn handle_call`",
+    note = "callable services must define `handle_call(&mut self, msg, call)` on the isolate impl",
+    note = "send-only services must register through `register_service_send_only` instead"
+)]
+pub trait CallableIsolate: Isolate {}
+
 /// A closed set of actions that an [`Isolate`] may request from the runtime.
 ///
 /// The enum is closed so later runtime crates can implement a single effect
@@ -436,6 +461,19 @@ where
     I: Isolate<Send = Outbound<M>>,
 {
     Effect::Send(Outbound::new(destination, message))
+}
+
+/// Returns an effect that sends one typed message to a send-only address.
+///
+/// This is the preferred form when a service exposes a [`SendAddress<M>`] via
+/// `tina_runtime::Runtime::register_service`. It carries the same runtime
+/// semantics as [`send`] but takes a capability-typed address so a callable
+/// service handle cannot be passed by accident.
+pub fn send_to<I, M>(destination: SendAddress<M>, message: M) -> Effect<I>
+where
+    I: Isolate<Send = Outbound<M>>,
+{
+    Effect::Send(Outbound::new(destination.address(), message))
 }
 
 /// Returns an effect that asks the runtime to spawn one child.
@@ -1355,6 +1393,186 @@ impl<M, R> Address<M, R> {
     /// mostly useful for tests that manually construct addresses.
     pub const fn with_reply<Reply>(self) -> Address<M, Reply> {
         Address::new_with_generation(self.shard, self.isolate, self.generation)
+    }
+}
+
+/// A send-only capability for one isolate.
+///
+/// `SendAddress<M>` is the compile-time rail for "send a message and do not
+/// expect a reply." It wraps an [`Address<M, ()>`](Address) and refuses to be
+/// converted into a [`CallAddress`]: a function that takes a `CallAddress`
+/// cannot accept a `SendAddress`, so the wrong path is a compile error rather
+/// than a runtime rejection.
+///
+/// Construct one through [`Address::send_only`] or through the typed handles
+/// returned by `tina_runtime::Runtime::register_service`. The escape hatch
+/// [`SendAddress::address`] returns the underlying raw [`Address`] for the rare
+/// case where low-level access is required.
+///
+/// ```compile_fail
+/// # use tina::{Address, IsolateId, SendAddress, ShardId};
+/// # enum Msg { Tick }
+/// # struct Reply;
+/// fn want_call(_call: tina::CallAddress<Msg, Reply>) {}
+///
+/// let raw: Address<Msg, Reply> =
+///     Address::new_with_generation(ShardId::new(0), IsolateId::new(1), tina::AddressGeneration::new(0));
+/// let send_only: SendAddress<Msg> = raw.send_only();
+/// // SendAddress is not a CallAddress, so this does not compile.
+/// want_call(send_only);
+/// ```
+#[derive(Debug)]
+#[repr(transparent)]
+pub struct SendAddress<M> {
+    address: Address<M, ()>,
+}
+
+impl<M> Copy for SendAddress<M> {}
+
+impl<M> Clone for SendAddress<M> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<M> PartialEq for SendAddress<M> {
+    fn eq(&self, other: &Self) -> bool {
+        self.address.shard() == other.address.shard()
+            && self.address.isolate() == other.address.isolate()
+            && self.address.generation() == other.address.generation()
+    }
+}
+
+impl<M> Eq for SendAddress<M> {}
+
+impl<M> SendAddress<M> {
+    /// Wraps a runtime-issued [`Address`] as a send-only capability.
+    ///
+    /// The reply marker is erased: a `SendAddress` cannot recover a typed
+    /// reply lane and is therefore not callable through `tina_runtime::call`.
+    pub const fn from_address<R>(address: Address<M, R>) -> Self {
+        Self {
+            address: address.with_reply::<()>(),
+        }
+    }
+
+    /// Returns the underlying raw [`Address`].
+    ///
+    /// This is the escape hatch for low-level code that needs the original
+    /// [`Address`]. Prefer keeping `SendAddress` at the boundary so wrong-path
+    /// calls remain compile-time errors.
+    pub const fn address(self) -> Address<M, ()> {
+        self.address
+    }
+
+    /// Returns the shard that owns this address.
+    pub const fn shard(self) -> ShardId {
+        self.address.shard()
+    }
+
+    /// Returns the isolate identifier on the owning shard.
+    pub const fn isolate(self) -> IsolateId {
+        self.address.isolate()
+    }
+
+    /// Returns the isolate generation this address targets.
+    pub const fn generation(self) -> AddressGeneration {
+        self.address.generation()
+    }
+}
+
+/// A callable capability for one isolate.
+///
+/// `CallAddress<M, R>` is the compile-time rail for "send a message and wait
+/// for a reply of type `R`." Runtime helpers like
+/// `tina_runtime::call_typed` accept only `CallAddress`, so passing a
+/// [`SendAddress`] (or a raw [`Address`] without the explicit upgrade) is a
+/// compile error.
+///
+/// Construct one through [`Address::callable`] or through the typed handles
+/// returned by `tina_runtime::Runtime::register_service`. The escape hatch
+/// [`CallAddress::address`] returns the underlying raw [`Address`].
+///
+/// ```compile_fail
+/// # use std::time::Duration;
+/// # use tina::{Address, IsolateId, SendAddress, ShardId};
+/// # enum Msg { Tick }
+/// # struct Reply;
+/// fn want_send(_send: SendAddress<Msg>) {}
+///
+/// let raw: Address<Msg, Reply> =
+///     Address::new_with_generation(ShardId::new(0), IsolateId::new(1), tina::AddressGeneration::new(0));
+/// let callable: tina::CallAddress<Msg, Reply> = raw.callable();
+/// // CallAddress is not a SendAddress, so this does not compile.
+/// want_send(callable);
+/// ```
+#[derive(Debug)]
+#[repr(transparent)]
+pub struct CallAddress<M, R> {
+    address: Address<M, R>,
+}
+
+impl<M, R> Copy for CallAddress<M, R> {}
+
+impl<M, R> Clone for CallAddress<M, R> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<M, R> PartialEq for CallAddress<M, R> {
+    fn eq(&self, other: &Self) -> bool {
+        self.address.shard() == other.address.shard()
+            && self.address.isolate() == other.address.isolate()
+            && self.address.generation() == other.address.generation()
+    }
+}
+
+impl<M, R> Eq for CallAddress<M, R> {}
+
+impl<M, R> CallAddress<M, R> {
+    /// Wraps a runtime-issued [`Address`] as a callable capability.
+    pub const fn from_address(address: Address<M, R>) -> Self {
+        Self { address }
+    }
+
+    /// Returns the underlying raw [`Address`].
+    ///
+    /// This is the escape hatch for low-level code that needs the original
+    /// [`Address<M, R>`]. Prefer keeping `CallAddress` at the boundary so the
+    /// wrong-path "send a callable as if it were send-only" is a compile error.
+    pub const fn address(self) -> Address<M, R> {
+        self.address
+    }
+
+    /// Returns the shard that owns this address.
+    pub const fn shard(self) -> ShardId {
+        self.address.shard()
+    }
+
+    /// Returns the isolate identifier on the owning shard.
+    pub const fn isolate(self) -> IsolateId {
+        self.address.isolate()
+    }
+
+    /// Returns the isolate generation this address targets.
+    pub const fn generation(self) -> AddressGeneration {
+        self.address.generation()
+    }
+}
+
+impl<M, R> Address<M, R> {
+    /// Returns a send-only capability for this address.
+    ///
+    /// The reply marker is erased so the resulting [`SendAddress`] cannot be
+    /// used as a [`CallAddress`].
+    pub const fn send_only(self) -> SendAddress<M> {
+        SendAddress::from_address(self)
+    }
+
+    /// Returns a callable capability for this address.
+    pub const fn callable(self) -> CallAddress<M, R> {
+        CallAddress::from_address(self)
     }
 }
 

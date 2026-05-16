@@ -338,6 +338,61 @@ where
         })
     }
 
+    /// Threaded mirror of [`Runtime::register_service`](crate::Runtime::register_service).
+    ///
+    /// Returns a capability-typed [`ServiceHandle`](crate::ServiceHandle) so
+    /// callers see the `.send` and `.call` lanes split at the type boundary.
+    /// Requires `I: tina::CallableIsolate`, which the
+    /// `#[tina_runtime::isolate]` macro emits automatically when the impl
+    /// block defines `fn handle_call(...)`.
+    #[allow(private_bounds)]
+    pub fn register_service<I, Outbound>(
+        &self,
+        isolate: I,
+        mailbox_capacity: usize,
+    ) -> Result<crate::ServiceHandle<I::Message, I::Reply>, ThreadedRuntimeError>
+    where
+        I: Isolate<Shard = S, Send = TinaOutbound<Outbound>>
+            + tina::CallableIsolate
+            + Send
+            + 'static,
+        I::Message: 'static,
+        I::Reply: 'static,
+        I::Spawn: IntoErasedSpawn<S, F> + 'static,
+        I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
+        I::Call: IntoErasedCall<I::Message> + 'static,
+        Outbound: 'static,
+    {
+        self.register_with_capacity::<I, Outbound>(isolate, mailbox_capacity)
+            .map(crate::ServiceHandle::from_address)
+    }
+
+    /// Threaded mirror of
+    /// [`Runtime::register_service_send_only`](crate::Runtime::register_service_send_only).
+    ///
+    /// Returns a [`SendOnlyServiceHandle`](crate::SendOnlyServiceHandle) with
+    /// only the `.send` lane. The isolate must have `Reply = ()` so no caller
+    /// can construct a callable handle in the first place.
+    #[allow(private_bounds)]
+    pub fn register_service_send_only<I, Outbound>(
+        &self,
+        isolate: I,
+        mailbox_capacity: usize,
+    ) -> Result<crate::SendOnlyServiceHandle<I::Message>, ThreadedRuntimeError>
+    where
+        I: Isolate<Shard = S, Send = TinaOutbound<Outbound>, Reply = ()> + Send + 'static,
+        I::Message: 'static,
+        I::Spawn: IntoErasedSpawn<S, F> + 'static,
+        I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
+        I::Call: IntoErasedCall<I::Message> + 'static,
+        Outbound: 'static,
+    {
+        self.register_with_capacity::<I, Outbound>(isolate, mailbox_capacity)
+            .map(|address| crate::SendOnlyServiceHandle {
+                send: address.send_only(),
+            })
+    }
+
     /// Threaded mirror of [`Runtime::register_with_capacity_and_bootstrap`].
     ///
     /// The mailbox is allocated and the bootstrap message is prefilled before
@@ -1029,6 +1084,24 @@ where
                 Err(ThreadedRuntimeError::WorkerStopped)
             }
         }
+    }
+
+    /// Capability-typed [`call_blocking`](Self::call_blocking) that accepts only
+    /// a [`tina::CallAddress`].
+    ///
+    /// Passing a [`tina::SendAddress`] or the `.send` lane of a
+    /// [`ServiceHandle`](crate::ServiceHandle) is a compile error.
+    pub fn call_blocking_typed<M, R>(
+        &self,
+        address: tina::CallAddress<M, R>,
+        message: M,
+        timeout: Duration,
+    ) -> Result<CallOutcome<R>, ThreadedRuntimeError>
+    where
+        M: Send + 'static,
+        R: Send + 'static,
+    {
+        self.call_blocking(address.address(), message, timeout)
     }
 
     /// Returns the live runtime capability table for this worker.

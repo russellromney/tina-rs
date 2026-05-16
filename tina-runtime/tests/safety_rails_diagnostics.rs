@@ -1,0 +1,21 @@
+//! Diagnostic-phrase pinning for the Phase 100 safety rails.
+//!
+//! Compile-fail doctests (see `tina-runtime/src/lib.rs` and `src/call.rs`)
+//! prove that the wrong path fails to compile. They do **not** prove which
+//! diagnostic phrase appeared: a fixture that broke for any other reason
+//! would still pass the doctest. This test uses `trybuild` to compare full
+//! `stderr` against committed fixtures so a regression that softens
+//! `#[diagnostic::on_unimplemented]` on [`tina::CallableIsolate`] (or that
+//! changes the `register_service` bound message) shows up as a diff against
+//! `.stderr`.
+//!
+//! Updating the expected output: when a Rust compiler version changes the
+//! surrounding text, regenerate with `TRYBUILD=overwrite cargo test
+//! -p tina-runtime --test safety_rails_diagnostics` and review the diff for
+//! the still-pinned Tina-facing phrases.
+
+#[test]
+fn diagnostic_phrases_are_pinned() {
+    let cases = trybuild::TestCases::new();
+    cases.compile_fail("tests/safety_rails_compile_fail/missing_handle_call.rs");
+}
