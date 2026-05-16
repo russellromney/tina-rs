@@ -16,6 +16,10 @@ pub enum ThreadedRuntimeError {
     /// The worker could not prove backend completion-slot ownership was
     /// released during shutdown.
     DriverShutdownFailed,
+    /// The bounded worker command queue could not accept the host-control
+    /// command immediately. The host call did not block and no work was
+    /// admitted; the caller can retry once the queue has drained.
+    CommandFull,
 }
 
 impl fmt::Display for ThreadedRuntimeError {
@@ -38,6 +42,12 @@ impl fmt::Display for ThreadedRuntimeError {
                 write!(
                     f,
                     "driver shutdown failed: completion-slot ownership not released"
+                )
+            }
+            Self::CommandFull => {
+                write!(
+                    f,
+                    "worker command queue is full; host-control command not admitted"
                 )
             }
         }
@@ -242,6 +252,81 @@ impl fmt::Display for SendObservedUntilError {
 
 impl Error for SendObservedUntilError {}
 
+/// Error returned by [`crate::ThreadedShutdownHandle::request_shutdown`].
+///
+/// The handle must not block forever behind a full command queue. Both
+/// variants name the offending shard on multi-shard runtimes; single-shard
+/// runtimes use `None`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShutdownRequestError {
+    /// The worker command queue could not accept the shutdown command
+    /// immediately. The caller can retry once the queue has drained.
+    CommandFull {
+        /// Owning shard id on multi-shard runtimes; `None` on single-shard.
+        shard: Option<ShardId>,
+    },
+    /// The worker thread had already stopped before the shutdown command
+    /// could be enqueued.
+    WorkerStopped {
+        /// Owning shard id on multi-shard runtimes; `None` on single-shard.
+        shard: Option<ShardId>,
+    },
+}
+
+impl fmt::Display for ShutdownRequestError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::CommandFull { shard: Some(s) } => write!(
+                f,
+                "shard {} command queue is full; shutdown request not admitted",
+                s.get()
+            ),
+            Self::CommandFull { shard: None } => {
+                write!(f, "command queue is full; shutdown request not admitted")
+            }
+            Self::WorkerStopped { shard: Some(s) } => write!(
+                f,
+                "shard {} worker thread already stopped before shutdown could be requested",
+                s.get()
+            ),
+            Self::WorkerStopped { shard: None } => write!(
+                f,
+                "worker thread already stopped before shutdown could be requested"
+            ),
+        }
+    }
+}
+
+impl Error for ShutdownRequestError {}
+
+/// Error returned by [`crate::ThreadedShutdownHandle::wait_report`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShutdownWaitError {
+    /// The timeout elapsed before a terminal report could be produced.
+    /// Possible reasons: no caller has requested shutdown (and the runtime
+    /// has not been dropped); shutdown is in progress but did not complete
+    /// in time.
+    Timeout,
+    /// The joiner thread that produces the terminal report stopped
+    /// abnormally (typically a panic on the joiner). The terminal report
+    /// is unavailable from this handle.
+    WorkerStopped,
+}
+
+impl fmt::Display for ShutdownWaitError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Timeout => write!(f, "shutdown wait timed out before a terminal report"),
+            Self::WorkerStopped => write!(
+                f,
+                "shutdown joiner stopped abnormally before a terminal report"
+            ),
+        }
+    }
+}
+
+impl Error for ShutdownWaitError {}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -267,6 +352,37 @@ mod tests {
             ThreadedRuntimeError::DriverShutdownFailed,
             "driver shutdown",
         );
+        assert_error(ThreadedRuntimeError::CommandFull, "command queue is full");
+    }
+
+    #[test]
+    fn shutdown_request_error_implements_display_and_error() {
+        assert_error(
+            ShutdownRequestError::CommandFull { shard: None },
+            "command queue is full",
+        );
+        assert_error(
+            ShutdownRequestError::CommandFull {
+                shard: Some(tina::ShardId::new(3)),
+            },
+            "shard 3",
+        );
+        assert_error(
+            ShutdownRequestError::WorkerStopped { shard: None },
+            "worker thread already stopped",
+        );
+        assert_error(
+            ShutdownRequestError::WorkerStopped {
+                shard: Some(tina::ShardId::new(9)),
+            },
+            "shard 9",
+        );
+    }
+
+    #[test]
+    fn shutdown_wait_error_implements_display_and_error() {
+        assert_error(ShutdownWaitError::Timeout, "timed out");
+        assert_error(ShutdownWaitError::WorkerStopped, "joiner stopped");
     }
 
     #[test]

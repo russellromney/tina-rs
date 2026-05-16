@@ -278,6 +278,41 @@ For any service with real I/O, test:
 
 This is where many runtime bugs hide.
 
+## Host Shutdown Handle
+
+`ThreadedRuntime` and `ThreadedMultiShardRuntime` expose a cloneable
+shutdown handle so host threads and tests can drive runtime teardown
+without `Arc::try_unwrap(runtime)`:
+
+```rust
+let handle = runtime.shutdown_handle();
+handle.request_shutdown()?;
+let report = handle.wait_report(Duration::from_secs(5))?;
+```
+
+Pinned contract:
+
+- `request_shutdown()` is **idempotent** and **non-blocking**. A full
+  command queue surfaces as `ShutdownRequestError::CommandFull`; a
+  worker that has already stopped surfaces as
+  `ShutdownRequestError::WorkerStopped`. On multi-shard runtimes both
+  variants name the offending shard.
+- `wait_report(timeout)` **does not** request shutdown. While the
+  runtime is still live and no one has requested or dropped shutdown,
+  it returns `ShutdownWaitError::Timeout`. Call `request_shutdown()`
+  first (or rely on the runtime owner's `Drop`).
+- The terminal `LocalSystemTerminalReport` is **cached** after the
+  first join. Every later waiter — including consuming
+  `runtime.shutdown_report(self)` and a future `Drop` — gets the same
+  cloned report.
+- Dropping the handle does **not** trigger shutdown. The runtime owner
+  controls lifetime.
+
+This is **runtime-level** control. Service-level drain — the app's
+own `Stop` / `Drain` protocol (see `DrainState`) — stays the service's
+responsibility. The handle only asks the runtime/control plane to
+begin shutdown.
+
 ## Substrate Question
 
 Runtime people will ask: what wakes the loop, and what work can never be

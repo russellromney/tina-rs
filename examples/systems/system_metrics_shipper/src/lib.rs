@@ -22,7 +22,7 @@ use tina::time::{
 use tina::{CallContext, RequestContext, prelude::*, reply_to_request};
 use tina_runtime::{
     AdmitDecision, CallOutcome, DefaultThreadedMailboxFactory, DrainState, LocalPermitGate,
-    LocalPermitName, Permit, ThreadedRuntime, call, sleep,
+    LocalPermitName, Permit, ThreadedRuntime, ThreadedShutdownHandle, call, sleep,
 };
 
 /// One submitted metric event. Payload is opaque; the specimen only cares
@@ -682,6 +682,7 @@ pub fn run_shutdown(config: &RunConfig) -> anyhow::Result<ShutdownReport> {
 
 struct World {
     runtime: Arc<ThreadedRuntime<SingleShard, DefaultThreadedMailboxFactory>>,
+    shutdown: ThreadedShutdownHandle,
     shipper: ShipperAddr,
     sink: SinkAddr,
     call_timeout: Duration,
@@ -710,8 +711,13 @@ impl World {
                 config.shipper_mailbox,
             )
             .map_err(|e| anyhow::anyhow!("register shipper: {e:?}"))?;
+        // Cloneable shutdown handle: lets the host drive runtime
+        // teardown without `Arc::try_unwrap(runtime)` once the burst
+        // threads have joined.
+        let shutdown = runtime.shutdown_handle();
         Ok(Self {
             runtime,
+            shutdown,
             shipper,
             sink,
             call_timeout: Duration::from_millis(config.call_timeout_ms),
@@ -835,13 +841,26 @@ impl World {
         Ok(clean)
     }
 
+    /// Tear down the runtime through the cloneable shutdown handle. No
+    /// `Arc::try_unwrap(runtime)` ceremony: the handle requests shutdown,
+    /// waits for the terminal report, and the runtime Arc can be dropped
+    /// independently.
+    ///
+    /// Service-level drain (the shipper's own `Stop`/`DrainState`
+    /// protocol) is the shipper's responsibility and is driven separately
+    /// by [`Self::stop_and_shutdown`]; this helper controls the runtime
+    /// only.
     fn shutdown(self) -> anyhow::Result<bool> {
-        match Arc::try_unwrap(self.runtime) {
-            Ok(rt) => rt
-                .shutdown()
-                .map(|_| true)
-                .map_err(|e| anyhow::anyhow!("runtime shutdown: {e:?}")),
-            Err(_) => anyhow::bail!("runtime arc still shared on shutdown"),
-        }
+        self.shutdown
+            .request_shutdown()
+            .map_err(|e| anyhow::anyhow!("runtime shutdown request: {e:?}"))?;
+        let report = self
+            .shutdown
+            .wait_report(Duration::from_secs(5))
+            .map_err(|e| anyhow::anyhow!("runtime shutdown wait: {e:?}"))?;
+        // Drop the Arc; the runtime owner's `Drop` short-circuits via
+        // the cached terminal report so this does not re-join.
+        drop(self.runtime);
+        Ok(report.error().is_none())
     }
 }

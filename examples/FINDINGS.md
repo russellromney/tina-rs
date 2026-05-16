@@ -550,32 +550,21 @@ so the runtime never delivers an `Internal` variant through
 `handle_call` at all. The second shape is cleaner but a bigger ask.
 Hold until a third specimen pays the same toll.
 
-### 23. Host-side `call_blocking` on `ThreadedMultiShardRuntime`
+### 23. Host-side `call_blocking` on `ThreadedMultiShardRuntime` *(closed by phase 102)*
 
-**Surfaced by:** `system_cache_with_fill`, `system_job_queue`,
-`system_session_auth`.
+`ThreadedMultiShardRuntime::call_blocking(addr, msg, timeout)` now
+ships and routes by `addr.shard()` — same convention as `try_send` and
+`observe_result`. Bounded admission: a full worker command queue
+surfaces as `ThreadedRuntimeError::CommandFull` instead of a host
+hang. Single-shard `ThreadedRuntime::call_blocking` got the same
+bounded-admission treatment. `system_session_auth` was migrated to
+real multi-shard placement (one bucket isolate per shard, host routes
+by `ShardPlacement`); the in-isolate fallback note is gone.
 
-`ThreadedRuntime::call_blocking(addr, msg, timeout)` is the natural shape
-for host-driven smoke scenarios — the smoke test reads top-to-bottom like
-the spec it describes. `ThreadedMultiShardRuntime` has no equivalent. The
-cross-shard tests in `tina-runtime/tests/sharded_threaded.rs` get around
-it with a `Tracker` isolate, `try_send` with `reply_to: Address<...>`,
-and host-side wait-until polling — the boilerplate is roughly the size
-of the test's actual scenario.
-
-The effect is that every system specimen that wants to exercise real
-sharded placement falls back to `ThreadedRuntime` and demonstrates
-sharding in-isolate (cache_with_fill: one isolate; job_queue: workers
-under one queue; session_auth: N HashMaps inside one isolate). The
-"sharding hurts" specimens in the roadmap (`system_tenant_rate_limiter`,
-`system_order_book`) will hit this same wall.
-
-**Build:** `ThreadedMultiShardRuntime::call_blocking_on(shard, addr, msg,
-timeout) -> Result<CallOutcome<R>, ThreadedRuntimeError>`, mirroring the
-single-shard version. Same `HostCallDriver` shape, routed to the worker
-that owns `shard`. Once shipped, the next sharded specimen should use
-real cross-shard placement and the in-isolate fallback note should
-disappear from these READMEs.
+No `call_blocking_on(shard, addr, ...)` ships — passing the shard
+twice is a place to introduce a mismatch bug. A future host-to-shard
+variant only earns its place when a real caller needs "call as if
+from shard A into target shard B" and has a remote-path proof.
 
 ### 24. Register-and-bootstrap helper for start-up effects
 
@@ -772,6 +761,11 @@ Short summary of patterns no new code should copy:
 - one-off shard types for single-shard programs: use `SingleShard` or omit
   `shard = ...`;
 - `Arc::try_unwrap` bridge shutdown dances: use the bridge host lifecycle;
+- `Arc::try_unwrap(runtime)` host shutdown dances on threaded runtimes:
+  use `runtime.shutdown_handle()` and the cloneable
+  `ThreadedShutdownHandle` (`request_shutdown` is nonblocking and
+  idempotent; `wait_report(timeout)` returns the cached terminal
+  report; see [docs/tina-user-guide/14-lifecycle-and-shutdown.md](../docs/tina-user-guide/14-lifecycle-and-shutdown.md));
 - old shared comparison harnesses: examples are specimens, tests are proof;
 - `Arc<Outcome>` / `Arc<Mutex<Vec<_>>>` for an isolate's *final* app
   value: use `stop_with(value)` +

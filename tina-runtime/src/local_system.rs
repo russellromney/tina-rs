@@ -202,7 +202,11 @@ pub enum LocalSystemState {
 }
 
 /// Terminal report returned by [`LocalSystem`] and [`LocalMultiShardSystem`] shutdown.
-#[derive(Debug)]
+///
+/// `Clone` is implemented so a cached terminal report can be returned
+/// independently to every [`crate::ThreadedShutdownHandle::wait_report`] waiter
+/// without contention.
+#[derive(Debug, Clone)]
 pub struct LocalSystemTerminalReport {
     state: LocalSystemState,
     trace: Vec<RuntimeEvent>,
@@ -938,22 +942,10 @@ where
 
     /// Joins the worker and always returns the terminal lifecycle report.
     pub fn join_report(mut self) -> LocalSystemTerminalReport {
-        let Some(mut runtime) = self.runtime.take() else {
+        let Some(runtime) = self.runtime.take() else {
             return LocalSystemTerminalReport::new(LocalSystemState::Closed, Vec::new());
         };
-        let (shutdown_result, trace) = runtime.shutdown_inner_with_available_trace();
-        match shutdown_result {
-            Ok(()) => LocalSystemTerminalReport::new_with_topology(
-                LocalSystemState::Closed,
-                trace,
-                runtime.topology(),
-            ),
-            Err(error) => LocalSystemTerminalReport::failed_with_topology_and_trace(
-                error,
-                runtime.topology(),
-                trace,
-            ),
-        }
+        runtime.shutdown_report()
     }
 }
 
@@ -1221,21 +1213,9 @@ where
 
     /// Joins all workers and always returns the terminal lifecycle report.
     pub fn join_report(mut self) -> LocalSystemTerminalReport {
-        let Some(mut runtime) = self.runtime.take() else {
+        let Some(runtime) = self.runtime.take() else {
             return LocalSystemTerminalReport::new(LocalSystemState::Closed, Vec::new());
         };
-        let (shutdown_result, trace) = runtime.shutdown_inner_with_available_trace();
-        match shutdown_result {
-            Ok(()) => LocalSystemTerminalReport::new_with_topology(
-                LocalSystemState::Closed,
-                trace,
-                runtime.topology(),
-            ),
-            Err(error) => LocalSystemTerminalReport::failed_with_topology_and_trace(
-                error,
-                runtime.topology(),
-                trace,
-            ),
-        }
+        runtime.shutdown_report()
     }
 }

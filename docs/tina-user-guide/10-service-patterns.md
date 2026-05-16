@@ -392,6 +392,50 @@ reply, reject, or defer the `CallContext`.
 a handler signature can say "I carry the promise across turns" instead of
 "I hold an opaque slot." Use whichever spelling makes the code clearer.
 
+## Host Call From Tests And Setup
+
+Tests, specimens, and setup code often need to drive one service call
+from the host thread and read the result. Both threaded runtimes expose
+`call_blocking` for exactly this:
+
+```rust
+// single-shard
+let outcome = runtime.call_blocking(addr, MyMsg::Probe, Duration::from_secs(2));
+
+// multi-shard, routed by the address's owning shard
+let outcome = multi_runtime.call_blocking(shard_addr, MyMsg::Probe, Duration::from_secs(2));
+```
+
+Both forms:
+
+- register a one-shot driver isolate behind a **bounded** worker
+  command admission — a full queue surfaces as
+  `ThreadedRuntimeError::CommandFull`, not as a silent host hang;
+- preserve the normal Tina call outcomes: `Replied`, `Full`,
+  `Closed`, `Timeout`, `Rejected`;
+- do **not** cancel accepted work when the host wait ends.
+
+The multi-shard form panics on an unknown shard, matching `try_send`
+and `observe_result`. There is no `call_blocking_on` in this phase;
+the routing-by-address-shard shape removes one place callers can get
+the shard id wrong.
+
+**Do not call `call_blocking` from inside an isolate handler.**
+Handlers must stay synchronous and non-blocking. Use
+`call(...).then(...)` inside isolates.
+
+Copied sharded smoke shape:
+
+```rust
+let runtime = ThreadedMultiShardRuntime::new(shards, DefaultThreadedMailboxFactory);
+let addr = runtime.register_with_capacity_on::<MyService, _>(shard_id, svc, cap)?;
+runtime.try_send(addr, MyMsg::Bootstrap)?;
+let outcome = runtime.call_blocking(addr, MyMsg::Ping, Duration::from_secs(2))?;
+```
+
+See `examples/systems/system_session_auth` for a real sharded
+specimen using `ThreadedMultiShardRuntime::call_blocking`.
+
 ## Macro Rule
 
 A future `#[service]` macro may hide byte encoding.

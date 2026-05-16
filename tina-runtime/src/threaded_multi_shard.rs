@@ -8,15 +8,20 @@
 
 use std::alloc::Global;
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::convert::Infallible;
+use std::marker::PhantomData;
+use std::sync::{Arc, mpsc};
 use std::thread;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use betelgeuse::io_loop;
-use tina::{Address, Isolate, Outbound as TinaOutbound, Shard, ShardId};
+use tina::{
+    Address, Context, Effect, Isolate, Outbound as TinaOutbound, Shard, ShardId,
+    TrySendError as TinaTrySendError,
+};
 use tina_supervisor::SupervisorConfig;
 
-use crate::call::{IntoErasedCall, RuntimeCall};
+use crate::call::{CallOutcome, IntoErasedCall, RuntimeCall, call};
 use crate::capabilities::RuntimeCapabilities;
 use crate::clock::MonotonicClock;
 use crate::driver::BetelgeuseDriver;
@@ -24,14 +29,12 @@ use crate::errors::{ThreadedRegisterBootstrapError, ThreadedRuntimeError, Thread
 use crate::live_report::{
     LiveQueueMetrics, LiveRemoteQueueReport, LiveShardMetrics, LiveShardState, LiveTopologyReport,
 };
-use crate::local_system::{
-    LocalSystemState, LocalSystemTerminalReport, ThreadedWorkerExit, ThreadedWorkerJoin,
-    TraceSnapshot,
-};
+use crate::local_system::{LocalSystemTerminalReport, ThreadedWorkerExit, TraceSnapshot};
 use crate::mailbox::MailboxFactory;
 use crate::observation;
 use crate::observer::TraceObserver;
 use crate::sharded::ReplyAdapter;
+use crate::shutdown::{SharedShutdownState, ShutdownWorker, ThreadedShutdownHandle, handle_for};
 use crate::threaded::{ThreadedCommand, ThreadedRuntimeConfig, deliver_shutdown_signal_and_drain};
 use crate::trace::{RuntimeEvent, SendRejectedReason};
 use crate::{
@@ -52,9 +55,9 @@ where
     F: MailboxFactory + Send + Clone + 'static,
 {
     commands: BTreeMap<ShardId, std::sync::mpsc::SyncSender<ThreadedCommand<S, F>>>,
-    handles: Vec<(ShardId, ThreadedWorkerJoin)>,
     shard_metrics: BTreeMap<ShardId, Arc<LiveShardMetrics>>,
     remote_metrics: BTreeMap<(ShardId, ShardId), Arc<LiveQueueMetrics>>,
+    shutdown: Arc<SharedShutdownState<S, F>>,
 }
 
 struct ThreadedRemoteWiring {
@@ -267,11 +270,37 @@ where
             ));
         }
 
+        let workers: Vec<ShutdownWorker<S, F>> = handles
+            .into_iter()
+            .map(|(shard_id, handle)| {
+                let metrics = Arc::clone(
+                    shard_metrics
+                        .get(&shard_id)
+                        .expect("shard metrics exist for worker"),
+                );
+                let commands_sender = commands
+                    .get(&shard_id)
+                    .expect("commands sender exists for worker")
+                    .clone();
+                ShutdownWorker {
+                    shard: shard_id,
+                    commands: commands_sender,
+                    handle: Some(handle),
+                    metrics,
+                    signaled: false,
+                }
+            })
+            .collect();
+        let shutdown = Arc::new(SharedShutdownState::multi_shard(
+            workers,
+            remote_metrics.clone(),
+        ));
+
         Self {
             commands,
-            handles,
             shard_metrics,
             remote_metrics,
+            shutdown,
         }
     }
 
@@ -331,7 +360,11 @@ where
             Err(ThreadedRuntimeError::UnknownShard(s)) => {
                 Err(ThreadedRegisterBootstrapError::UnknownShard(s))
             }
-            Err(ThreadedRuntimeError::DriverShutdownFailed) => {
+            Err(ThreadedRuntimeError::DriverShutdownFailed)
+            | Err(ThreadedRuntimeError::CommandFull) => {
+                // `call_on` is blocking-admission, so `CommandFull` is
+                // unreachable today. Map defensively in case the inner
+                // helper is ever migrated.
                 Err(ThreadedRegisterBootstrapError::WorkerStopped)
             }
         }
@@ -554,19 +587,131 @@ where
     }
 
     /// Requests shutdown and joins every worker, always returning terminal truth.
-    pub fn shutdown_report(mut self) -> LocalSystemTerminalReport {
-        let (shutdown_result, trace) = self.shutdown_inner_with_available_trace();
-        match shutdown_result {
-            Ok(()) => LocalSystemTerminalReport::new_with_topology(
-                LocalSystemState::Closed,
-                trace,
-                self.topology(),
-            ),
-            Err(error) => LocalSystemTerminalReport::failed_with_topology_and_trace(
-                error,
-                self.topology(),
-                trace,
-            ),
+    ///
+    /// Routes through the same shared shutdown state as
+    /// [`Self::shutdown_handle`] and `Drop`; a handle that already
+    /// requested shutdown or already waited the terminal report sees the
+    /// same cached report when this consuming form is called next.
+    pub fn shutdown_report(self) -> LocalSystemTerminalReport {
+        let shared = Arc::clone(&self.shutdown);
+        drop(self);
+        shared.wait_report_blocking()
+    }
+
+    /// Returns a cloneable handle that controls runtime-level shutdown
+    /// without consuming the runtime value.
+    ///
+    /// See [`crate::ThreadedRuntime::shutdown_handle`] for the contract.
+    /// The multi-shard handle requests shutdown on every owned shard; a
+    /// single shard's full command queue surfaces in
+    /// [`crate::ShutdownRequestError::CommandFull`] with the offending
+    /// shard id attached.
+    pub fn shutdown_handle(&self) -> ThreadedShutdownHandle {
+        handle_for(&self.shutdown)
+    }
+
+    /// Performs one typed isolate call from the host thread on the shard
+    /// that owns `address` and waits for its ordinary [`CallOutcome`].
+    ///
+    /// Same host-convenience shape as
+    /// [`crate::ThreadedRuntime::call_blocking`] but routed to the shard
+    /// implied by the address. The host-call driver isolate is registered
+    /// on that shard through bounded admission via `try_send` on the
+    /// worker command queue.
+    ///
+    /// # Routing
+    ///
+    /// The call is driven from the shard that owns `address`, exactly
+    /// matching how [`Self::try_send`] and [`Self::observe_result`] route
+    /// by `address.shard()`. There is no explicit `*_on` variant in this
+    /// phase: a future host-to-shard variant is only worth shipping with
+    /// a real caller and a cross-shard remote-path proof.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `address.shard()` is not owned by this runtime — same
+    /// programmer-error convention as [`Self::try_send`] and
+    /// [`Self::observe_result`].
+    ///
+    /// # Errors
+    ///
+    /// - [`ThreadedRuntimeError::CommandFull`] — the bounded worker
+    ///   command queue could not accept the host-control admission
+    ///   command immediately.
+    /// - [`ThreadedRuntimeError::WorkerStopped`] — the target shard
+    ///   worker is gone before the host call could be driven.
+    pub fn call_blocking<M, R>(
+        &self,
+        address: Address<M, R>,
+        message: M,
+        timeout: Duration,
+    ) -> Result<CallOutcome<R>, ThreadedRuntimeError>
+    where
+        M: Send + 'static,
+        R: Send + 'static,
+    {
+        let shard = address.shard();
+        if !self.commands.contains_key(&shard) {
+            panic!(
+                "ThreadedMultiShardRuntime::call_blocking targeted unknown shard {}",
+                shard.get()
+            );
+        }
+        let (reply_tx, reply_rx) = mpsc::channel();
+        let driver = HostCallDriverMS::<S, M, R> {
+            sender: reply_tx,
+            _marker: PhantomData,
+        };
+        let Some(sender) = self.commands.get(&shard) else {
+            panic!(
+                "ThreadedMultiShardRuntime::call_blocking targeted unknown shard {}",
+                shard.get()
+            );
+        };
+        let command = ThreadedCommand::Run(Box::new(move |runtime| {
+            let driver_addr = runtime
+                .register_sendable_with_capacity::<HostCallDriverMS<S, M, R>, Infallible>(
+                    driver, 2,
+                );
+            match runtime.try_send(
+                driver_addr,
+                HostCallMsg::Begin {
+                    target: address,
+                    message,
+                    timeout,
+                },
+            ) {
+                Ok(()) => {}
+                Err(TinaTrySendError::Full(_)) => {
+                    panic!("fresh host-call driver mailbox was unexpectedly full");
+                }
+                Err(TinaTrySendError::Closed(_)) => {
+                    panic!("fresh host-call driver mailbox was unexpectedly closed");
+                }
+            }
+        }));
+        match sender.try_send(command) {
+            Ok(()) => {}
+            Err(std::sync::mpsc::TrySendError::Full(_)) => {
+                return Err(ThreadedRuntimeError::CommandFull);
+            }
+            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                if let Some(metrics) = self.shard_metrics.get(&shard) {
+                    metrics.set_state(LiveShardState::Failed);
+                }
+                return Err(ThreadedRuntimeError::WorkerStopped);
+            }
+        }
+
+        match reply_rx.recv_timeout(timeout) {
+            Ok(outcome) => Ok(outcome),
+            Err(mpsc::RecvTimeoutError::Timeout) => Ok(CallOutcome::Timeout),
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                if let Some(metrics) = self.shard_metrics.get(&shard) {
+                    metrics.set_state(LiveShardState::Failed);
+                }
+                Err(ThreadedRuntimeError::WorkerStopped)
+            }
         }
     }
 
@@ -596,48 +741,6 @@ where
             ThreadedRuntimeError::WorkerStopped
         })
     }
-
-    fn shutdown_inner(&mut self) -> Result<Vec<RuntimeEvent>, ThreadedRuntimeError> {
-        let (result, events) = self.shutdown_inner_with_available_trace();
-        result.map(|()| events)
-    }
-
-    pub(crate) fn shutdown_inner_with_available_trace(
-        &mut self,
-    ) -> (Result<(), ThreadedRuntimeError>, Vec<RuntimeEvent>) {
-        for sender in self.commands.values() {
-            let _ = sender.send(ThreadedCommand::Shutdown);
-        }
-
-        let mut events = Vec::new();
-        let mut failure = None;
-        for (shard, handle) in std::mem::take(&mut self.handles) {
-            match handle.join() {
-                Ok(exit) => {
-                    if let Some(error) = exit.error {
-                        if let Some(metrics) = self.shard_metrics.get(&shard) {
-                            metrics.set_state(LiveShardState::Failed);
-                        }
-                        failure = Some(error);
-                    } else if let Some(metrics) = self.shard_metrics.get(&shard) {
-                        metrics.set_state(LiveShardState::Stopped);
-                    }
-                    events.extend(exit.trace);
-                }
-                Err(_) => {
-                    if let Some(metrics) = self.shard_metrics.get(&shard) {
-                        metrics.set_state(LiveShardState::Failed);
-                    }
-                    failure = Some(ThreadedRuntimeError::WorkerStopped);
-                }
-            }
-        }
-        events.sort_by_key(|event| event.id());
-        if let Some(error) = failure {
-            return (Err(error), events);
-        }
-        (Ok(()), events)
-    }
 }
 
 impl<S, F> Drop for ThreadedMultiShardRuntime<S, F>
@@ -646,7 +749,61 @@ where
     F: MailboxFactory + Send + Clone + 'static,
 {
     fn drop(&mut self) {
-        let _ = self.shutdown_inner();
+        self.shutdown.shutdown_blocking();
+        let _ = self.shutdown.wait_report_blocking();
+    }
+}
+
+// ---------- Multi-shard host-call driver isolate ----------
+
+enum HostCallMsg<M, R> {
+    Begin {
+        target: Address<M, R>,
+        message: M,
+        timeout: Duration,
+    },
+    Returned(CallOutcome<R>),
+}
+
+struct HostCallDriverMS<S, M, R>
+where
+    S: Shard + 'static,
+{
+    sender: mpsc::Sender<CallOutcome<R>>,
+    _marker: PhantomData<(S, M)>,
+}
+
+impl<S, M, R> Isolate for HostCallDriverMS<S, M, R>
+where
+    S: Shard + 'static,
+    M: Send + 'static,
+    R: Send + 'static,
+{
+    tina::isolate_types! {
+        message: HostCallMsg<M, R>,
+        reply: (),
+        send: TinaOutbound<Infallible>,
+        spawn: Infallible,
+        call: RuntimeCall<HostCallMsg<M, R>>,
+        shard: S,
+    }
+
+    fn handle(
+        &mut self,
+        msg: HostCallMsg<M, R>,
+        _ctx: &mut Context<'_, S, Self::Reply>,
+    ) -> Effect<Self> {
+        match msg {
+            HostCallMsg::Begin {
+                target,
+                message,
+                timeout,
+            } => call(target, message, timeout).then(HostCallMsg::Returned),
+            HostCallMsg::Returned(outcome) => {
+                let _ = self.sender.send(outcome);
+                tina::stop()
+            }
+        }
     }
 }
 

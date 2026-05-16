@@ -1,8 +1,6 @@
 # Phase 102 - Host Control Ergonomics
 
-Status: Ready to implement. Phase 101 is now merged. Can run in parallel with
-100 if file ownership is coordinated; if 100 lands first, use its new
-request/event handle shape in the migrated specimens. Code work is in
+Status: In progress (2026-05-16). Phase 101 is merged. Code work is in
 `tina-runtime` plus targeted specimen/docs migrations.
 
 This is not a planning phase. Build the pinned host-control helpers below.
