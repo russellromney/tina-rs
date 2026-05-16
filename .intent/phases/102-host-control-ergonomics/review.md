@@ -83,3 +83,13 @@ If `Drop` keeps the old private shutdown path, handles that outlive the runtime
 can never observe the terminal report. The plan now requires `Drop`,
 `shutdown_report(self)`, and `ThreadedShutdownHandle::wait_report` to all use
 the same shared join/report state.
+
+## Finding 12 [P2] Host calls can still block before the call timeout starts
+
+The copied `call_blocking` path has to register a temporary driver through the
+worker command queue before it can issue the normal Tina call. If that command
+admission uses blocking `send` on a full `sync_channel`, the host can hang
+before the Tina call timeout even exists. The plan now requires bounded or
+nonblocking command admission and a public `ThreadedRuntimeError::CommandFull`
+outcome for both the new multi-shard host call and the existing single-shard
+host call.
