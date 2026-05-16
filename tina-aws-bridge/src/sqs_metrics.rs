@@ -32,6 +32,10 @@ pub struct SqsMetrics {
     /// Highest `in_flight_current` observed.
     pub in_flight_high_water: u64,
     /// Configured SDK attempts per admitted operation.
+    ///
+    /// `0` means unknown because the bridge was built around a
+    /// caller-supplied SQS client. In that path, SDK retry settings
+    /// live entirely on the supplied client.
     pub sdk_max_attempts: u64,
 }
 

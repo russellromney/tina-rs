@@ -99,6 +99,27 @@
 //!
 //! The bridge does not retry, auto-delete after receive, or infer
 //! idempotency. It only bounds and observes admitted SDK work.
+//!
+//! # Supplied client (S3 and SQS)
+//!
+//! [`S3Worker::with_supplied_client`] and
+//! [`SqsWorker::with_supplied_client`] wrap a caller-built SDK
+//! client plus Tokio runtime handle. The supplied client owns
+//! credentials, region, endpoint, HTTP connector, TLS, and the SDK
+//! retry policy. The bridge does not re-apply [`S3Config`] /
+//! [`SqsConfig`] credentials, endpoint, or retry fields on this
+//! path, and reports `sdk_max_attempts = 0` (unknown) because the
+//! retry policy lives entirely on the supplied client. The bridge
+//! still owns Tina-side `mailbox_capacity`, `max_in_flight`,
+//! body/message caps, and the per-operation timeout. The caller's
+//! Tokio runtime is never shut down by the bridge.
+//!
+//! # Tracing
+//!
+//! S3 and SQS workers emit lifecycle and per-call events on the
+//! `tina_aws.bridge` and `tina_aws.bridge.call` targets. Events
+//! include `kind = "admitted"` / `"timeout"` / `"admission_rejected"`
+//! at the call layer, plus `kind = "close"` at the bridge layer.
 
 mod helpers;
 mod metrics;

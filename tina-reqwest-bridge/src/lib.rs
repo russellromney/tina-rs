@@ -133,10 +133,40 @@
 //!
 //! # Close
 //!
-//! [`ReqwestCloser::close`] is a graceful drain: new sends reply
-//! [`ReqwestError::Closed`], in-flight requests run to natural
-//! completion (or hit their per-attempt timeout). To force-cancel
-//! in-flight work, drop the hosting Tina runtime.
+//! [`ReqwestCloser::close`] flips the worker into the closed state:
+//! new sends reply [`ReqwestError::Closed`] at admission. Already
+//! spawned reqwest tasks continue to natural completion or their
+//! per-attempt timeout — `close` does **not** wait for them and the
+//! bridge does not ship a bounded drain helper.
+//!
+//! Forced cancellation depends on which install path you used:
+//!
+//! - **Owned runtime** ([`ReqwestWorker::install`]): the bridge holds
+//!   the `tokio::runtime::Runtime`. Dropping the worker isolate
+//!   drops that runtime and calls
+//!   [`tokio::runtime::Runtime::shutdown_background`], which aborts
+//!   every still-running reqwest task. Bytes already on the wire
+//!   stay on the wire.
+//! - **Supplied runtime**
+//!   ([`ReqwestWorker::with_supplied_client`]): the bridge does
+//!   **not** own the runtime and does not shut it down. Dropping the
+//!   bridge isolate leaves spawned reqwest tasks running on the
+//!   caller's runtime until they hit the bridge's per-attempt
+//!   `tokio::time::timeout` or their natural completion. The caller
+//!   must shut the runtime down separately to force-cancel.
+//!
+//! # Supplied client
+//!
+//! [`ReqwestWorker::with_supplied_client`] wraps a caller-built
+//! `reqwest::Client` and Tokio runtime handle. The supplied client
+//! owns redirect policy, the reqwest `Client::timeout`, connection
+//! reuse, TLS config, and proxy settings; the bridge does **not**
+//! re-apply [`ReqwestConfig`]'s redirect or client-level fields to
+//! it. The bridge still enforces its own per-attempt deadline
+//! (`request.timeout.unwrap_or(config.default_timeout)`) via
+//! `tokio::time::timeout(...)` on every attempt, so set the supplied
+//! client's `Client::timeout` to a value at least as large. The
+//! caller's Tokio runtime is never shut down by the bridge.
 //!
 //! # Retry
 //!
