@@ -278,14 +278,39 @@ impl<S: Shard + 'static> S3Worker<S> {
         let request_kind = request.kind();
         if self.closed.load(Ordering::Acquire) {
             self.metrics.closed.fetch_add(1, Ordering::Relaxed);
+            #[cfg(feature = "tracing")]
+            event!(
+                target: TRACE_TARGET_CALL,
+                Level::WARN,
+                kind = "admission_rejected",
+                reason = "Closed",
+                request_kind,
+            );
             return Self::complete_request(request_context, Err(S3Error::Closed));
         }
         if let Err(err) = validate_request(&request, &self.config) {
             tally_admission_error(&self.metrics, &err);
+            #[cfg(feature = "tracing")]
+            event!(
+                target: TRACE_TARGET_CALL,
+                Level::WARN,
+                kind = "admission_rejected",
+                reason = admission_reason(&err),
+                request_kind,
+                detail = %err,
+            );
             return Self::complete_request(request_context, Err(err));
         }
         if self.in_flight.len() >= self.config.max_in_flight {
             self.metrics.full.fetch_add(1, Ordering::Relaxed);
+            #[cfg(feature = "tracing")]
+            event!(
+                target: TRACE_TARGET_CALL,
+                Level::WARN,
+                kind = "admission_rejected",
+                reason = "Full",
+                request_kind,
+            );
             return Self::complete_request(request_context, Err(S3Error::Full));
         }
 
@@ -325,6 +350,14 @@ impl<S: Shard + 'static> S3Worker<S> {
         self.metrics.note_admit_kind(request_kind);
         self.metrics.set_in_flight(in_flight);
         self.metrics.note_in_flight(in_flight);
+        #[cfg(feature = "tracing")]
+        event!(
+            target: TRACE_TARGET_CALL,
+            Level::DEBUG,
+            kind = "admitted",
+            request_kind,
+            in_flight,
+        );
         sleep(self.config.poll_interval).then(move |_| S3Msg::Poll(id))
     }
 
@@ -349,6 +382,7 @@ impl<S: Shard + 'static> S3Worker<S> {
                         Level::WARN,
                         kind = "timeout",
                         request_kind = in_flight.request_kind,
+                        elapsed_ms = in_flight.started_at.elapsed().as_millis() as u64,
                     );
                     let request_context = in_flight.request_context.take();
                     self.in_flight.insert(id, in_flight);
@@ -624,6 +658,21 @@ fn tally_admission_error(metrics: &MetricsInner, err: &S3Error) {
         S3Error::InvalidRequest(_) => metrics.invalid.fetch_add(1, Ordering::Relaxed),
         _ => metrics.invalid.fetch_add(1, Ordering::Relaxed),
     };
+}
+
+/// Maps an admission-class [`S3Error`] to the wire-stable tracing
+/// `reason` label. Only the two variants `validate_request` can
+/// produce are listed; other variants are not reachable on the
+/// admission tracing path.
+#[cfg(feature = "tracing")]
+fn admission_reason(err: &S3Error) -> &'static str {
+    match err {
+        S3Error::RequestTooLarge => "RequestTooLarge",
+        S3Error::InvalidRequest(_) => "InvalidRequest",
+        // Unreachable: validate_request only emits RequestTooLarge or
+        // InvalidRequest. See [`admission_reason`] above.
+        _ => "Invalid",
+    }
 }
 
 fn tally_terminal(metrics: &MetricsInner, result: &S3Result) {

@@ -137,8 +137,23 @@
 //! new sends reply [`ReqwestError::Closed`] at admission. Already
 //! spawned reqwest tasks continue to natural completion or their
 //! per-attempt timeout — `close` does **not** wait for them and the
-//! bridge does not ship a bounded drain helper. To force-cancel
-//! in-flight work, drop the hosting Tina runtime.
+//! bridge does not ship a bounded drain helper.
+//!
+//! Forced cancellation depends on which install path you used:
+//!
+//! - **Owned runtime** ([`ReqwestWorker::install`]): the bridge holds
+//!   the `tokio::runtime::Runtime`. Dropping the worker isolate
+//!   drops that runtime and calls
+//!   [`tokio::runtime::Runtime::shutdown_background`], which aborts
+//!   every still-running reqwest task. Bytes already on the wire
+//!   stay on the wire.
+//! - **Supplied runtime**
+//!   ([`ReqwestWorker::with_supplied_client`]): the bridge does
+//!   **not** own the runtime and does not shut it down. Dropping the
+//!   bridge isolate leaves spawned reqwest tasks running on the
+//!   caller's runtime until they hit the bridge's per-attempt
+//!   `tokio::time::timeout` or their natural completion. The caller
+//!   must shut the runtime down separately to force-cancel.
 //!
 //! # Supplied client
 //!

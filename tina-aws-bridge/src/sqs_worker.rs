@@ -23,16 +23,16 @@ use tokio::sync::oneshot;
 use tracing::{Level, event};
 
 use crate::sqs_metrics::{SqsMetricsHandle, SqsMetricsInner};
-
-#[cfg(feature = "tracing")]
-const TRACE_TARGET_CALL: &str = "tina_aws.bridge.call";
-#[cfg(feature = "tracing")]
-const TRACE_TARGET_BRIDGE: &str = "tina_aws.bridge";
 use crate::sqs_types::{
     SqsConfig, SqsConfigError, SqsDeletedMessage, SqsError, SqsMessage, SqsReceivedMessages,
     SqsRequest, SqsResponse, SqsSentMessage,
 };
 use crate::types::SdkRetryPolicy;
+
+#[cfg(feature = "tracing")]
+const TRACE_TARGET_CALL: &str = "tina_aws.bridge.call";
+#[cfg(feature = "tracing")]
+const TRACE_TARGET_BRIDGE: &str = "tina_aws.bridge";
 
 /// Worker reply type.
 pub type SqsResult = Result<SqsResponse, SqsError>;
@@ -379,6 +379,7 @@ impl<S: Shard + 'static> SqsWorker<S> {
                         Level::WARN,
                         kind = "timeout",
                         request_kind = in_flight.request_kind,
+                        elapsed_ms = in_flight.started_at.elapsed().as_millis() as u64,
                     );
                     let request_context = in_flight.request_context.take();
                     self.in_flight.insert(id, in_flight);
@@ -703,11 +704,19 @@ fn tally_admission_error(metrics: &SqsMetricsInner, err: &SqsError) {
     };
 }
 
+/// Maps an admission-class [`SqsError`] to the wire-stable tracing
+/// `reason` label. Only the two variants `validate_request` can
+/// produce are listed; other variants are not reachable on the
+/// admission tracing path.
 #[cfg(feature = "tracing")]
 fn admission_reason(err: &SqsError) -> &'static str {
     match err {
         SqsError::MessageTooLarge => "MessageTooLarge",
         SqsError::InvalidRequest(_) => "InvalidRequest",
+        // Unreachable: validate_request only emits MessageTooLarge or
+        // InvalidRequest. Match arm is required for exhaustiveness;
+        // the label keeps the tracing schema stable if the error
+        // shape grows.
         _ => "Invalid",
     }
 }
