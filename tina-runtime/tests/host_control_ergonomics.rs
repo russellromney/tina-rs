@@ -669,11 +669,14 @@ fn multi_shard_partial_command_full_does_not_deadlock_subsequent_shutdown() {
             },
         );
     let flag = Arc::new(AtomicBool::new(false));
+    let entered_a = Arc::new(AtomicBool::new(false));
+    let entered_b = Arc::new(AtomicBool::new(false));
     let spinner_a = runtime
         .register_with_capacity_on::<SpinnerMS, Infallible>(
             ShardId::new(1),
             SpinnerMS {
                 flag: Arc::clone(&flag),
+                entered: Arc::clone(&entered_a),
             },
             8,
         )
@@ -684,12 +687,16 @@ fn multi_shard_partial_command_full_does_not_deadlock_subsequent_shutdown() {
             ShardId::new(2),
             SpinnerMS {
                 flag: Arc::clone(&flag),
+                entered: Arc::clone(&entered_b),
             },
             8,
         )
         .expect("register spinner B");
     // Kick shard B repeatedly until its command queue is full.
     runtime.try_send(spinner_b, SpinnerMsg::Tick).expect("kick");
+    while !entered_b.load(Ordering::Relaxed) {
+        thread::yield_now();
+    }
     let _ = spinner_a;
 
     let handle = runtime.shutdown_handle();
