@@ -62,8 +62,6 @@ fn smoke_covers_service_layers() {
     assert_eq!(capacity["http.body_io_error"], "0");
     assert_eq!(capacity["controller.mailbox"], "2");
     assert_eq!(capacity["drain.stage"], "open");
-    assert_eq!(capacity["drain.admits_after_drain"], "0");
-    assert_at_least(&capacity, "drain.admitted", 5);
     assert_eq!(capacity["db.capacity"], "1");
     assert_eq!(capacity["db.waiters"], "0");
     assert_eq!(capacity["db.max_waiters"], "0");
@@ -83,7 +81,6 @@ fn smoke_covers_service_layers() {
 
     let shutdown_capacity = capacity_fields(&report.capacity_during_shutdown_line);
     assert_eq!(shutdown_capacity["drain.stage"], "draining");
-    assert_at_least(&shutdown_capacity, "drain.admits_after_drain", 1);
 
     let terminal = capacity_fields(&report.terminal_line);
     assert_eq!(terminal["db.capacity"], "1");

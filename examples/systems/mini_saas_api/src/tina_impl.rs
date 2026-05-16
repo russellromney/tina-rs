@@ -20,8 +20,8 @@ use tina_http::{
 };
 use tina_runtime::pool::{WorkerPoolMsg, WorkerPoolReply};
 use tina_runtime::{
-    AdmitDecision, CallOutcome, DefaultThreadedMailboxFactory, DrainReport, DrainStage, DrainState,
-    RuntimeCall, RuntimeEvent, RuntimeEventKind, ThreadedRuntime, call, sleep,
+    CallOutcome, DefaultThreadedMailboxFactory, DrainStage, DrainState, RuntimeCall, RuntimeEvent,
+    RuntimeEventKind, ThreadedRuntime, call, sleep,
 };
 use tina_sim::dst::{
     LiveReplayCapture, LiveReplayFact, LiveReplayReport, ReplayCase as DstReplayCase, ReplayConfig,
@@ -149,6 +149,9 @@ pub fn run(mode: RunMode) -> anyhow::Result<RunReport> {
         during_shutdown.status,
         &during_shutdown.body,
     ));
+    let capacity_during_shutdown = get(addr, "/debug/capacity")?;
+    report.capacity_during_shutdown_line =
+        format!("capacity_during_shutdown {}", capacity_during_shutdown.body);
     let rejected_after_close = post(addr, "/items", "name=after-close")?;
     report.ingress_rejects_after_close =
         rejected_after_close.status == 503 && rejected_after_close.body.contains("ingress_stopped");
@@ -157,12 +160,6 @@ pub fn run(mode: RunMode) -> anyhow::Result<RunReport> {
         rejected_after_close.status,
         &rejected_after_close.body,
     ));
-    // Probe capacity *after* the rejection so `drain.admits_after_drain` is
-    // already non-zero. The capacity line is the proof that the helper
-    // counted at least one post-drain admission attempt.
-    let capacity_during_shutdown = get(addr, "/debug/capacity")?;
-    report.capacity_during_shutdown_line =
-        format!("capacity_during_shutdown {}", capacity_during_shutdown.body);
 
     sqlite.closer.close();
     let after_db_close = get(addr, "/ready")?;
@@ -567,9 +564,11 @@ struct Controller {
     outbound_pool: PoolAddr,
     body_metrics: BodyMetrics,
     next_id: i64,
-    /// Public-ingress admission state. `DrainState` records typed
-    /// admit/reject counters so the capacity report stays honest after drain
-    /// begins; resource close still lives in the host shutdown sequence.
+    /// Public-ingress admission state. The controller drives `Open` →
+    /// `Draining` on `CloseIngress`; per-request completion lives in the
+    /// listener/runtime, so the helper is used purely for the typed stage
+    /// label surfaced in `/debug/capacity`. The host owns terminal proof, so
+    /// `drain.finish()` is never called from inside the controller.
     drain: DrainState,
     live_items: HashMap<i64, String>,
 }
@@ -792,7 +791,7 @@ impl Isolate for Controller {
                     req,
                     text(
                         StatusCode::OK,
-                        capacity_body(body, db, outbound, self.drain.report()),
+                        capacity_body(body, db, outbound, self.drain.stage()),
                     ),
                 )
             }
@@ -836,7 +835,7 @@ impl Controller {
                     ))
                     .reply(ControllerMsg::CapacityPool)
             }
-            _ if matches!(self.drain.admit(), AdmitDecision::Stopping) => {
+            _ if !self.drain.is_open() => {
                 call_ctx.reply(text(StatusCode::SERVICE_UNAVAILABLE, "ingress_stopped\n"))
             }
             (http::Method::POST, "/items") => self.create_item(request, call_ctx),
@@ -1006,16 +1005,15 @@ fn capacity_body(
     body: BodyPressureReport,
     db: SqlitePressureReport,
     outbound: PoolPressureReport,
-    drain: DrainReport,
+    drain_stage: DrainStage,
 ) -> String {
-    let stage = drain_stage_label(drain.stage);
+    let stage = drain_stage_label(drain_stage);
     format!(
         "http.body_cap={BODY_CAP_BYTES} http.request_body_current={} \
          http.request_body_high_water={} http.response_body_current={} \
          http.response_body_high_water={} http.body_full={} http.body_timeout={} \
          http.body_io_error={} \
          controller.mailbox={CONTROLLER_MAILBOX_CAPACITY} drain.stage={stage} \
-         drain.admitted={} drain.admits_after_drain={} \
          db.capacity={} db.waiters={} db.max_waiters={} db.in_flight={} db.high_water={} \
          db.full={} db.closed={} db.timeout={} outbound.capacity={} outbound.waiters={} \
          outbound.max_waiters={} outbound.in_flight={} outbound.high_water_waiters={} \
@@ -1027,8 +1025,6 @@ fn capacity_body(
         body.body_full_count,
         body.body_timeout_count,
         body.body_io_error_count,
-        drain.admitted,
-        drain.admits_after_drain,
         db.capacity,
         db.waiters,
         db.max_waiters,
@@ -1049,6 +1045,9 @@ fn capacity_body(
     )
 }
 
+// `Stopped` is unreachable in this specimen: the host owns the terminal
+// report and tears down the controller before `drain.finish()` would run.
+// The arm exists so the label match stays exhaustive against `DrainStage`.
 fn drain_stage_label(stage: DrainStage) -> &'static str {
     match stage {
         DrainStage::Open => "open",
