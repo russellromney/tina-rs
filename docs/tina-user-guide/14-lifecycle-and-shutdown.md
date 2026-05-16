@@ -131,24 +131,41 @@ self.pending_stop = Some(call.into_request_context());
 
 `DrainState` does not close resources, choose ordering, or hide messages.
 It is small state plus a report. Resource close still belongs to the
-service. `examples/systems/system_metrics_shipper` is the worked example.
+service. `examples/systems/system_metrics_shipper` is the worked example
+for a service that owns its own drain handshake and reaches `Stopped`;
+`examples/systems/mini_saas_api` is the worked example for a host-driven
+HTTP service where the controller publishes the typed `drain.stage` field in
+its `/debug/capacity` report, the host closes the surrounding resources, and
+the helper stays at `Draining` until the runtime tears the controller down.
 
 ## Service Shutdown Skeleton
 
 `examples/systems/mini_saas_api` has the current copyable local-service
 shutdown order:
 
-1. Mark public ingress closed in the controller so new service work is rejected.
+1. Begin the controller `DrainState` so the next public request reads
+   `drain.is_open() == false`.
 2. Let an already-admitted notify request finish with a typed reply while
    later public work is rejected as `ingress_stopped`.
 3. Probe `/ready` and surface `ingress_stopped`.
-4. Close the SQLite bridge admission with its closer.
-5. Probe `/ready` and surface `db_closed`.
-6. Call `shutdown_keepalive_pool(..., CloseMode::Drain, ...)` for the outbound
+4. Probe `/debug/capacity` and surface `drain.stage=draining`.
+5. Send one post-drain POST and prove the typed `503 ingress_stopped`
+   response.
+6. Close the SQLite bridge admission with its closer.
+7. Probe `/ready` and surface `db_closed`.
+8. Call `shutdown_keepalive_pool(..., CloseMode::Drain, ...)` for the outbound
    pool.
-7. Stop the private notification listener.
-8. Stop the public listener, then shutdown the runtime and inspect
-   trace/capacity facts.
+9. Stop the private notification listener.
+10. Stop the public listener, then shutdown the runtime and inspect
+    trace/capacity facts.
+
+The controller never calls `drain.finish()`: the host owns terminal proof
+through the runtime trace and the keepalive pool shutdown report, so the
+controller's drain stays at `Draining` until the runtime tears it down.
+That keeps host-driven services and service-owned drains visibly
+different shapes — `system_metrics_shipper` is the worked example for the
+service-owned form where the service answers a `Stop` call and reaches
+`Stopped` itself.
 
 The exact smoke command is:
 

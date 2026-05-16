@@ -20,8 +20,8 @@ use tina_http::{
 };
 use tina_runtime::pool::{WorkerPoolMsg, WorkerPoolReply};
 use tina_runtime::{
-    CallOutcome, DefaultThreadedMailboxFactory, RuntimeCall, RuntimeEvent, RuntimeEventKind,
-    ThreadedRuntime, call, sleep,
+    CallOutcome, DefaultThreadedMailboxFactory, DrainStage, DrainState, RuntimeCall, RuntimeEvent,
+    RuntimeEventKind, ThreadedRuntime, call, sleep,
 };
 use tina_sim::dst::{
     LiveReplayCapture, LiveReplayFact, LiveReplayReport, ReplayCase as DstReplayCase, ReplayConfig,
@@ -564,7 +564,12 @@ struct Controller {
     outbound_pool: PoolAddr,
     body_metrics: BodyMetrics,
     next_id: i64,
-    ingress_open: bool,
+    /// Public-ingress admission state. The controller drives `Open` →
+    /// `Draining` on `CloseIngress`; per-request completion lives in the
+    /// listener/runtime, so the helper is used purely for the typed stage
+    /// label surfaced in `/debug/capacity`. The host owns terminal proof, so
+    /// `drain.finish()` is never called from inside the controller.
+    drain: DrainState,
     live_items: HashMap<i64, String>,
 }
 
@@ -581,7 +586,7 @@ impl Controller {
             outbound_pool,
             body_metrics,
             next_id: 1,
-            ingress_open: true,
+            drain: DrainState::new(),
             live_items: HashMap::new(),
         }
     }
@@ -660,7 +665,7 @@ impl Isolate for Controller {
         match msg {
             ControllerMsg::Http(_) => noop(),
             ControllerMsg::CloseIngress => {
-                self.ingress_open = false;
+                self.drain.begin();
                 noop()
             }
             ControllerMsg::ReadyDb(req, ingress_stopped, outcome) => match outcome {
@@ -786,7 +791,7 @@ impl Isolate for Controller {
                     req,
                     text(
                         StatusCode::OK,
-                        capacity_body(body, db, outbound, !self.ingress_open),
+                        capacity_body(body, db, outbound, self.drain.stage()),
                     ),
                 )
             }
@@ -797,7 +802,7 @@ impl Isolate for Controller {
         match msg {
             ControllerMsg::Http(request) => self.route(request, call),
             ControllerMsg::CloseIngress => {
-                self.ingress_open = false;
+                self.drain.begin();
                 call.reply(text(StatusCode::OK, "ingress_closed\n"))
             }
             _ => call.reject(tina::CallRejectedReason::UnsupportedMessage),
@@ -812,7 +817,7 @@ impl Controller {
         match (method, path.as_str()) {
             (http::Method::GET, "/health") => call_ctx.reply(text(StatusCode::OK, "alive\n")),
             (http::Method::GET, "/ready") => {
-                let ingress_stopped = !self.ingress_open;
+                let ingress_stopped = !self.drain.is_open();
                 call_ctx
                     .defer(send_request(
                         self.db,
@@ -830,7 +835,7 @@ impl Controller {
                     ))
                     .reply(ControllerMsg::CapacityPool)
             }
-            _ if !self.ingress_open => {
+            _ if !self.drain.is_open() => {
                 call_ctx.reply(text(StatusCode::SERVICE_UNAVAILABLE, "ingress_stopped\n"))
             }
             (http::Method::POST, "/items") => self.create_item(request, call_ctx),
@@ -1000,14 +1005,15 @@ fn capacity_body(
     body: BodyPressureReport,
     db: SqlitePressureReport,
     outbound: PoolPressureReport,
-    shutdown_started: bool,
+    drain_stage: DrainStage,
 ) -> String {
+    let stage = drain_stage_label(drain_stage);
     format!(
         "http.body_cap={BODY_CAP_BYTES} http.request_body_current={} \
          http.request_body_high_water={} http.response_body_current={} \
          http.response_body_high_water={} http.body_full={} http.body_timeout={} \
          http.body_io_error={} \
-         controller.mailbox={CONTROLLER_MAILBOX_CAPACITY} shutdown.started={shutdown_started} \
+         controller.mailbox={CONTROLLER_MAILBOX_CAPACITY} drain.stage={stage} \
          db.capacity={} db.waiters={} db.max_waiters={} db.in_flight={} db.high_water={} \
          db.full={} db.closed={} db.timeout={} outbound.capacity={} outbound.waiters={} \
          outbound.max_waiters={} outbound.in_flight={} outbound.high_water_waiters={} \
@@ -1037,6 +1043,17 @@ fn capacity_body(
         outbound.closed_count,
         outbound.cancel_count,
     )
+}
+
+// `Stopped` is unreachable in this specimen: the host owns the terminal
+// report and tears down the controller before `drain.finish()` would run.
+// The arm exists so the label match stays exhaustive against `DrainStage`.
+fn drain_stage_label(stage: DrainStage) -> &'static str {
+    match stage {
+        DrainStage::Open => "open",
+        DrainStage::Draining => "draining",
+        DrainStage::Stopped => "stopped",
+    }
 }
 
 fn body_text(request: &HttpRequest) -> String {

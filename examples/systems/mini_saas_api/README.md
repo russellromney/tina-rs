@@ -41,9 +41,12 @@ outbound connection leases. No domain state is hidden behind
 | outbound keepalive pool | one connection, zero waiters |
 
 `GET /debug/capacity` returns a small key=value line with real HTTP body
-current/high-water/full/timeout/io counters, controller mailbox cap, shutdown
-state, DB capacity/waiters/in-flight/full/closed/timeout counts, and outbound
-keepalive capacity/waiters/leased/full/closed/cancel counts.
+current/high-water/full/timeout/io counters, controller mailbox cap, the
+controller's typed `drain.stage` (`open` / `draining` / `stopped`), DB
+capacity/waiters/in-flight/full/closed/timeout counts, and outbound keepalive
+capacity/waiters/leased/full/closed/cancel counts. The stage field comes from
+the `tina_runtime::DrainState` helper, so the same typed vocabulary appears
+here as in any other Tina service that drains.
 
 ## Readiness
 
@@ -53,15 +56,24 @@ typed reasons such as `db_closed`, `db_full`, `db_timeout`, `outbound_full`,
 
 ## Shutdown Order
 
-1. Mark public ingress closed in the controller.
+1. Begin the controller drain (`DrainState::begin`) so the next public
+   request reads `drain.is_open() == false` and replies `ingress_stopped`.
 2. Let one already-admitted slow notify request finish with a typed reply.
-3. Reject new public work with `ingress_stopped`.
-4. Probe readiness over HTTP so `ingress_stopped` is visible.
-5. Close the SQLite bridge.
-6. Probe readiness so `db_closed` is visible.
-7. Drain and stop the outbound keepalive pool with `shutdown_keepalive_pool`.
-8. Stop the notification listener and public listener.
-9. Shutdown the runtime and assert the terminal report/trace facts.
+3. Probe readiness over HTTP so `ingress_stopped` is visible.
+4. Probe `/debug/capacity` so `drain.stage=draining` is visible in the report.
+5. Send one new POST and prove the typed `503 ingress_stopped` reply.
+6. Close the SQLite bridge.
+7. Probe readiness so `db_closed` is visible.
+8. Drain and stop the outbound keepalive pool with `shutdown_keepalive_pool`.
+9. Stop the notification listener and public listener.
+10. Shutdown the runtime and assert the terminal report/trace facts.
+
+The controller stays in `Draining` for the rest of its life. `Stopped` is the
+`DrainState` terminal arm that fires when a service owns its own drain
+handshake; here the host owns terminal proof through the runtime trace and the
+keepalive pool shutdown report, so `drain.finish()` is never called from
+inside the controller. `examples/systems/system_metrics_shipper` is the
+worked example for the service-owned drain shape, where `Stopped` is reached.
 
 ## Multi-Turn Replies
 
@@ -69,15 +81,19 @@ typed reasons such as `db_closed`, `db_full`, `db_timeout`, `outbound_full`,
 
 ```text
 HTTP call -> Controller CallContext
-  -> call_ctx.defer(SQLite query).reply(...)
-  -> outbound pool acquire continuation
-  -> keepalive request continuation
-  -> release continuation
-  -> final HttpResponse
+  -> call_ctx.defer(SQLite query).reply(NotifyLoaded)
+  -> call(...).then_with_request(req, NotifyAcquired)   // outbound pool acquire
+  -> call(...).then_with_request(req, NotifySent)       // keepalive request
+  -> call(...).then_with_request(req, NotifyReleased)   // pool release
+  -> reply_to_request(req, ...)                          // final HttpResponse
 ```
 
-The route replies several turns after the original HTTP/controller call.
-`Full`, `Closed`, and `Timeout` remain distinct in the route bodies.
+The first hop uses `call_ctx.defer(work).reply(...)` to consume caller
+authority and carry it into the next continuation as `RequestContext<R>`.
+Each follow-on hop calls `then_with_request(req, ...)` to keep that context
+moving across messages. The final turn settles the caller with
+`reply_to_request`. There is no hidden caller context preservation; `Full`,
+`Closed`, and `Timeout` remain distinct in the route bodies at every hop.
 
 ## Live-Replay Fact
 
@@ -142,7 +158,14 @@ claim from this small smoke.
 ## Findings
 
 What felt good:
-- `call_ctx.defer(...).reply(...)` makes the caller-preserving path easy to copy.
+- `call_ctx.defer(...).reply(...)` for the first hop plus
+  `then_with_request(...)` for follow-on hops keeps the caller-preserving path
+  easy to copy without hidden context.
+- `DrainState` names the host-driven `Open` → `Draining` transition with
+  one typed stage field in `/debug/capacity`, instead of hiding it behind a
+  service-local `bool`. The terminal `Stopped` arm exists in the helper but
+  is reached by services that own their own drain handshake, not by a
+  host-driven HTTP service like this one.
 - SQLite and keepalive pool pressure reports already had the right vocabulary.
 
 What felt rough:
@@ -152,7 +175,7 @@ What felt rough:
 
 Tina capability pulled:
 - Native HTTP, SQLite bridge, keepalive pool, readiness, shutdown, capacity,
-  and trace-derived multi-turn proof.
+  `DrainState`, and trace-derived multi-turn proof.
 
 Suggested follow-up:
 - Keep shutdown/report formatting local until another system repeats the same
