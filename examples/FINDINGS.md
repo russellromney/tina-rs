@@ -597,6 +597,37 @@ the compiler refuses if a request variant is matched in the event handler
 or vice versa. Closing this finding probably means landing some form of
 that proposal.
 
+### 26. Call-shaped sends from `handle_call` deliver completions back as calls
+
+**Surfaced by:** `system_realtime_rooms`.
+
+A request/reply isolate received `WebSocketSessionMsg::SessionText` via
+`handle_call` and returned a batch that included
+`handle.text_effect::<Self>(text, timeout)` for each room member.
+`text_effect` expands to `call(handle.target(), handle.send(text), timeout).then(|outcome| SendOutcome(...))`.
+Observed concrete behaviour: the FIRST `tcp_write` triggered downstream
+of that call delivered its `Wrote(Ok)` completion back to the
+`HttpConnection` isolate via `handle_call` (with
+`HttpConnectionMsg::Wrote(_)` as the inbound message). `HttpConnection::handle_call`
+has no arm for `Wrote(_)` and routes the default branch to
+`call.reject(CallRejectedReason::UnsupportedMessage)`. The connection
+never drained its outbound queue; subsequent admits succeeded into the
+queue and the room (correctly) evicted the peer after the queue filled.
+Switching the room to `tina::send(handle.target(), handle.send(...))`
+(plain `Effect::Send`, try_send semantics) made the connection take the
+`handle_websocket_send` path and routed the `Wrote` completion back via
+`handle` as expected. Both code paths are publicly supported, so callers
+have to know that "`.then`-style outcome chains emitted from `handle_call`
+return values" carry hidden routing.
+
+**Build:** either (a) guarantee that an `Effect`'s downstream `.then`
+completions always route through the isolate's `handle`, regardless of
+which entry point produced the effect, or (b) document the asymmetry on
+`text_effect` / `send_effect` / `report_effect` so callers know to keep
+them in `handle` and use `tina::send` from `handle_call`. The first form
+of `WebSocketSessionHandle::send_effect` should also probably gain a
+debug-only assertion if it is invoked from inside a `CallContext`.
+
 ## Closed
 
 Findings shipped by recent phases. Numbers are kept stable so
