@@ -322,6 +322,7 @@ where
             commands: commands.clone(),
             handle: Some(handle),
             metrics: Arc::clone(&metrics),
+            signaled: false,
         }));
 
         Self {

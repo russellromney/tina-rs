@@ -632,6 +632,74 @@ fn shutdown_report_after_drop_returns_same_cached_report() {
 }
 
 #[test]
+fn multi_shard_partial_command_full_does_not_deadlock_subsequent_shutdown() {
+    // Two shards, one saturated. The first request_shutdown is expected
+    // to fail with CommandFull on the saturated shard. The runtime must
+    // still shut down cleanly once the queue drains — neither the
+    // joiner nor Drop should hang.
+    let runtime =
+        ThreadedMultiShardRuntime::<TestShard, DefaultThreadedMailboxFactory>::with_config(
+            [TestShard::a(), TestShard::b()],
+            DefaultThreadedMailboxFactory,
+            ThreadedRuntimeConfig {
+                command_capacity: 1,
+                shard_pair_capacity: 4,
+                idle_wait: Duration::from_millis(1),
+                ..Default::default()
+            },
+        );
+    let flag = Arc::new(AtomicBool::new(false));
+    let spinner_a = runtime
+        .register_with_capacity_on::<SpinnerMS, Infallible>(
+            ShardId::new(1),
+            SpinnerMS {
+                flag: Arc::clone(&flag),
+            },
+            8,
+        )
+        .expect("register spinner A");
+    // Saturate shard B's command queue. Shard A stays idle.
+    let spinner_b = runtime
+        .register_with_capacity_on::<SpinnerMS, Infallible>(
+            ShardId::new(2),
+            SpinnerMS {
+                flag: Arc::clone(&flag),
+            },
+            8,
+        )
+        .expect("register spinner B");
+    // Kick shard B repeatedly until its command queue is full.
+    runtime.try_send(spinner_b, SpinnerMsg::Tick).expect("kick");
+    let _ = spinner_a;
+
+    let handle = runtime.shutdown_handle();
+    // Retry until the runtime fully shuts down (or CommandFull becomes
+    // Ok after the queue drains). request_shutdown is bounded and
+    // nonblocking; the loop must converge to Ok well before any deadline.
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let result = handle.request_shutdown();
+        match result {
+            Ok(()) => break,
+            Err(ShutdownRequestError::CommandFull { .. }) => {
+                if Instant::now() >= deadline {
+                    panic!("request_shutdown never converged within deadline");
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+            Err(other) => panic!("unexpected shutdown error {other:?}"),
+        }
+    }
+    flag.store(true, Ordering::Relaxed);
+    let report = handle
+        .wait_report(Duration::from_secs(3))
+        .expect("wait report");
+    assert!(report.error().is_none(), "clean shutdown after partial");
+    // Drop completes without hanging.
+    drop(runtime);
+}
+
+#[test]
 fn three_concurrent_waiters_all_get_terminal_report() {
     let runtime = Arc::new(single_runtime(64));
     let handle = runtime.shutdown_handle();

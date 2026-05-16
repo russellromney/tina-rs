@@ -19,8 +19,9 @@
 //!   route through the same shared state — no second shutdown path.
 
 use std::collections::BTreeMap;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::mpsc::{SyncSender, TrySendError};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -60,13 +61,25 @@ impl ThreadedShutdownHandle {
 
     /// Requests that the runtime begin shutdown. Idempotent and nonblocking.
     ///
-    /// Returns immediately. On success, the runtime workers will see the
-    /// shutdown command and exit; the terminal report becomes available
-    /// through [`Self::wait_report`].
+    /// Returns immediately. On success, every owned worker has had a
+    /// `Shutdown` command admitted and the terminal report becomes
+    /// available through [`Self::wait_report`].
     ///
-    /// On `CommandFull` the worker command queue could not accept the
-    /// shutdown command without blocking; no shutdown signal was sent.
-    /// On `WorkerStopped` the worker was already gone.
+    /// On a multi-shard runtime, the call walks workers in deterministic
+    /// shard-id order. Each shard whose command queue admits `Shutdown`
+    /// is marked signaled and **stays signaled across retries** — a
+    /// later [`Self::request_shutdown`] resumes from where the previous
+    /// attempt stopped. This keeps the request idempotent in the useful
+    /// sense (a fully-shut-down runtime returns `Ok` without re-sending)
+    /// while honoring the "nonblocking" contract: a saturated shard
+    /// bails immediately with `CommandFull` rather than blocking.
+    ///
+    /// Errors:
+    /// - `CommandFull { shard }` — the named shard's command queue was
+    ///   full at this attempt. Earlier shards in iteration order may
+    ///   have been signaled. Retry to continue.
+    /// - `WorkerStopped { shard }` — the named worker was already gone;
+    ///   it is treated as already signaled so a retry will not re-try it.
     pub fn request_shutdown(&self) -> Result<(), ShutdownRequestError> {
         self.inner.request_shutdown()
     }
@@ -110,6 +123,10 @@ where
     pub(crate) commands: SyncSender<ThreadedCommand<S, F>>,
     pub(crate) handle: Option<ThreadedWorkerJoin>,
     pub(crate) metrics: Arc<LiveShardMetrics>,
+    /// `true` once a `Shutdown` command has been admitted to this
+    /// worker (or the worker was already gone). Skipping re-signal on
+    /// retries keeps partial-shutdown attempts idempotent.
+    pub(crate) signaled: bool,
 }
 
 /// Shared, internally synchronised shutdown coordinator.
@@ -181,31 +198,64 @@ where
     }
 
     /// Blocking shutdown used by `Drop` and consuming `shutdown_report`.
-    #[allow(clippy::type_complexity)]
+    ///
+    /// Only signals workers that have not been marked `signaled` by a
+    /// prior bounded `request_shutdown`. The runtime-owner path uses
+    /// blocking `send` so teardown always converges even if the queue is
+    /// currently full.
+    /// Blocking shutdown used by `Drop` and consuming `shutdown_report`.
+    ///
+    /// Only signals workers that have not been marked `signaled` by a
+    /// prior bounded `request_shutdown`. The runtime-owner path uses
+    /// blocking `send` so teardown always converges even if the queue is
+    /// currently full.
+    ///
+    /// Note: send-side errors are not used as a `Failed` signal here. A
+    /// `Disconnected` send only proves the worker thread has exited —
+    /// possibly cleanly via `Shutdown`. The joiner uses `handle.join()`
+    /// as the single source of truth for terminal state.
     pub(crate) fn shutdown_blocking(self: &Arc<Self>) {
-        let mut state = self.state.lock().unwrap();
-        if !state.shutdown_requested {
-            let senders: Vec<(SyncSender<ThreadedCommand<S, F>>, Arc<LiveShardMetrics>)> = state
+        // Snapshot unsignaled senders, drop the lock, then send blocking.
+        // The send happens without the lock so a saturated command queue
+        // doesn't lock the runtime owner against handles that hold the
+        // shared state's lock.
+        let pending: Vec<(usize, SyncSender<ThreadedCommand<S, F>>)> = {
+            let state = self.lock_state();
+            state
                 .workers
                 .iter()
-                .map(|w| (w.commands.clone(), Arc::clone(&w.metrics)))
-                .collect();
-            state.shutdown_requested = true;
-            drop(state);
-            for (sender, metrics) in senders {
-                if sender.send(ThreadedCommand::Shutdown).is_err() {
-                    metrics.set_state(LiveShardState::Failed);
-                }
+                .enumerate()
+                .filter(|(_, w)| !w.signaled)
+                .map(|(i, w)| (i, w.commands.clone()))
+                .collect()
+        };
+        for (idx, sender) in pending {
+            let _ = sender.send(ThreadedCommand::Shutdown);
+            let mut state = self.lock_state();
+            if let Some(worker) = state.workers.get_mut(idx) {
+                worker.signaled = true;
             }
-        } else {
-            drop(state);
+        }
+        // Mark the request as committed so `request_shutdown_bounded`
+        // becomes idempotent and `wait_report_*` stops returning
+        // pre-request `Timeout`.
+        {
+            let mut state = self.lock_state();
+            state.shutdown_requested = true;
         }
         self.ensure_joiner_started();
     }
 
     fn ensure_joiner_started(self: &Arc<Self>) {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.lock_state();
         if state.joining || state.report.is_some() {
+            return;
+        }
+        // Only start the joiner once every shard has had a `Shutdown`
+        // command admitted (or been observed gone). Joining a worker
+        // that hasn't seen `Shutdown` would block the joiner forever
+        // because the worker is still waiting on its command queue.
+        if !state.workers.iter().all(|w| w.signaled) {
             return;
         }
         let mut joinable: Vec<(ShardId, ThreadedWorkerJoin, Arc<LiveShardMetrics>)> = Vec::new();
@@ -223,12 +273,12 @@ where
         let shared = Arc::clone(self);
         let spawn_result = thread::Builder::new()
             .name("tina-shutdown-joiner".to_string())
-            .spawn(move || run_joiner(shared, joinable));
+            .spawn(move || joiner_main(shared, joinable));
         if spawn_result.is_err() {
             // Failed to spawn the joiner thread (rare). Join inline so the
-            // runtime cannot leak its OS threads. We still hold no lock.
-            let mut state = self.state.lock().unwrap();
-            state.joining = false;
+            // runtime cannot leak its OS threads. The inline path still
+            // runs through the panic-safe `joiner_main` wrapper.
+            let mut state = self.lock_state();
             let mut joinable: Vec<(ShardId, ThreadedWorkerJoin, Arc<LiveShardMetrics>)> =
                 Vec::new();
             for worker in &mut state.workers {
@@ -236,15 +286,20 @@ where
                     joinable.push((worker.shard, h, Arc::clone(&worker.metrics)));
                 }
             }
-            state.joining = true;
             drop(state);
-            run_joiner(Arc::clone(self), joinable);
+            joiner_main(Arc::clone(self), joinable);
         }
+    }
+
+    /// Acquire the state lock, transparently recovering from a poisoned
+    /// mutex so a joiner-thread panic doesn't cascade-panic every waiter.
+    fn lock_state(&self) -> MutexGuard<'_, ShutdownState<S, F>> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Blocking wait used by `Drop` and consuming `shutdown_report`.
     pub(crate) fn wait_report_blocking(&self) -> LocalSystemTerminalReport {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.lock_state();
         loop {
             if let Some(report) = &state.report {
                 return report.clone();
@@ -252,19 +307,30 @@ where
             if state.joiner_failed {
                 return failed_report_from_state(&state, &self.remote_metrics);
             }
-            state = self.condvar.wait(state).unwrap();
+            state = self
+                .condvar
+                .wait(state)
+                .unwrap_or_else(PoisonError::into_inner);
         }
     }
 
     fn request_shutdown_bounded(self: &Arc<Self>) -> Result<(), ShutdownRequestError> {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.lock_state();
         if state.shutdown_requested {
             return Ok(());
         }
         let multi = self.is_multi_shard;
-        for worker in &state.workers {
+        // Walk unsignaled workers; mark each one as signaled the moment
+        // its `Shutdown` command is admitted (or it is observed gone).
+        // Bail on the first `Full` shard so the caller can retry later.
+        for worker in state.workers.iter_mut() {
+            if worker.signaled {
+                continue;
+            }
             match worker.commands.try_send(ThreadedCommand::Shutdown) {
-                Ok(()) => {}
+                Ok(()) => {
+                    worker.signaled = true;
+                }
                 Err(TrySendError::Full(_)) => {
                     return Err(ShutdownRequestError::CommandFull {
                         shard: if multi { Some(worker.shard) } else { None },
@@ -272,12 +338,18 @@ where
                 }
                 Err(TrySendError::Disconnected(_)) => {
                     worker.metrics.set_state(LiveShardState::Failed);
+                    // The worker is already gone — equivalent to having
+                    // received `Shutdown`. Mark signaled so a retry will
+                    // not target it again and the joiner can run once
+                    // every shard reaches this state.
+                    worker.signaled = true;
                     return Err(ShutdownRequestError::WorkerStopped {
                         shard: if multi { Some(worker.shard) } else { None },
                     });
                 }
             }
         }
+        // Every worker is now signaled; commit the request.
         state.shutdown_requested = true;
         drop(state);
         self.ensure_joiner_started();
@@ -288,7 +360,7 @@ where
         &self,
         timeout: Duration,
     ) -> Result<LocalSystemTerminalReport, ShutdownWaitError> {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.lock_state();
         if let Some(report) = &state.report {
             return Ok(report.clone());
         }
@@ -308,7 +380,10 @@ where
                 return Err(ShutdownWaitError::Timeout);
             }
             let remaining = deadline.saturating_duration_since(now);
-            let (s, result) = self.condvar.wait_timeout(state, remaining).unwrap();
+            let (s, result) = self
+                .condvar
+                .wait_timeout(state, remaining)
+                .unwrap_or_else(PoisonError::into_inner);
             state = s;
             if let Some(report) = &state.report {
                 return Ok(report.clone());
@@ -364,6 +439,27 @@ where
     ThreadedShutdownHandle::new(inner)
 }
 
+/// Panic-safe joiner entry point. Catches any unwind inside
+/// [`run_joiner`] so waiters surface
+/// [`ShutdownWaitError::WorkerStopped`] instead of hanging on a
+/// condvar that will never be notified.
+fn joiner_main<S, F>(
+    shared: Arc<SharedShutdownState<S, F>>,
+    joinable: Vec<(ShardId, ThreadedWorkerJoin, Arc<LiveShardMetrics>)>,
+) where
+    S: Shard + Send + 'static,
+    F: MailboxFactory + Send + 'static,
+{
+    let shared_for_guard = Arc::clone(&shared);
+    let result = catch_unwind(AssertUnwindSafe(|| run_joiner(shared, joinable)));
+    if result.is_err() {
+        let mut state = shared_for_guard.lock_state();
+        state.joiner_failed = true;
+        state.joining = false;
+        shared_for_guard.condvar.notify_all();
+    }
+}
+
 /// Joiner thread body. Joins every worker, builds the terminal report,
 /// caches it under the shared lock, and notifies every waiter.
 fn run_joiner<S, F>(
@@ -398,7 +494,7 @@ fn run_joiner<S, F>(
         }
     };
 
-    let mut state = shared.state.lock().unwrap();
+    let mut state = shared.lock_state();
     state.report = Some(report);
     state.joining = false;
     shared.condvar.notify_all();
@@ -426,7 +522,7 @@ where
     S: Shard + Send + 'static,
     F: MailboxFactory + Send + 'static,
 {
-    let state = shared.state.lock().unwrap();
+    let state = shared.lock_state();
     let shards: Vec<_> = state.workers.iter().map(|w| w.metrics.report()).collect();
     drop(state);
     if shared.is_multi_shard {

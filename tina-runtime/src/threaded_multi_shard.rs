@@ -287,6 +287,7 @@ where
                     commands: commands_sender,
                     handle: Some(handle),
                     metrics,
+                    signaled: false,
                 }
             })
             .collect();
