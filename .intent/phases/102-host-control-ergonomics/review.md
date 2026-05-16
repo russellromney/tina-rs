@@ -15,12 +15,14 @@ hangs would be awful, and single-claim `AlreadyJoined` would make host code
 annoying. The plan now pins the better shape: cache terminal truth and let
 multiple waiters receive equal `LocalSystemTerminalReport` values.
 
-## Finding 3 [P2] `call_blocking_on` could infer the wrong shard
+## Finding 3 [P2] `call_blocking_on` made the copied path worse than existing host APIs
 
-Inferring from the address is tempting, but this phase is about making host
-control explicit. The plan keeps the shard argument and requires a
-shard/address mismatch proof. A later convenience wrapper can infer if this
-gets annoying.
+The first draft required `call_blocking_on(shard, addr, ...)`. That is easy to
+get wrong and inconsistent with `try_send` / `observe_result`, which route by
+the address shard. The plan now ships the boring copied path:
+`ThreadedMultiShardRuntime::call_blocking(addr, msg, timeout)`. No explicit
+`*_on` variant ships until a real caller needs "host call from shard A into
+target shard B."
 
 ## Finding 4 [P2] Timeout semantics need to match single-shard `call_blocking`
 
@@ -39,16 +41,17 @@ choose made the plan less executable. The plan now pins the migration:
 ## Finding 6 [P3] Unknown-shard behavior must match local convention
 
 Some current host APIs panic on unknown shard as programmer error. The plan
-does not invent a new error vocabulary; it now pins `call_blocking_on` to panic
-on unknown shard and shard/address mismatch, matching existing multi-shard host
-API convention.
+does not invent a new error vocabulary; it now pins multi-shard `call_blocking`
+to panic on unknown address shard, matching existing multi-shard host API
+convention.
 
 ## Finding 7 [P2] Non-consuming shutdown needs an ownership refactor
 
 A cloneable shutdown handle cannot produce the existing terminal report unless
 it can claim the worker join handle and retained trace/topology truth. The plan
-now says this explicitly: refactor threaded runtime internals so the first
-waiter joins and caches terminal truth, and every later waiter or consuming
+now says this explicitly: refactor threaded runtime internals into one shared
+shutdown state. The first waiter, consuming `shutdown_report(self)`, or runtime
+`Drop` joins and caches terminal truth. Every later waiter or consuming
 `shutdown_report(self)` returns that same cached report. This avoids a fake
 polling-only shutdown handle that cannot return real terminal truth.
 
@@ -56,3 +59,27 @@ polling-only shutdown handle that cannot return real terminal truth.
 
 This is host-control ergonomics, not a core service trait redesign. The plan now
 pins API home to `tina-runtime`; `tina` trait-crate changes are out of scope.
+
+## Finding 9 [P2] Shutdown request must not hang behind the command queue
+
+The first draft made `request_shutdown()` infallible. That invites an
+implementation that calls blocking `send(ThreadedCommand::Shutdown)` on a full
+bounded command queue. Host-control shutdown should not create a new stuck-host
+path. The plan now pins `request_shutdown() -> Result<(), ShutdownRequestError>`
+with `CommandFull` / `WorkerStopped`, and requires a proof that full/stopped
+request paths do not block forever.
+
+## Finding 10 [P2] Wait-before-request behavior needed a rule
+
+A cloneable wait handle can be used wrong. If `wait_report(timeout)` silently
+requests shutdown, it hides control flow. If it blocks forever, it is a footgun.
+The plan now says `wait_report` only waits; it does not request shutdown. While
+the runtime is still live and no one has requested/dropped shutdown, it returns
+`ShutdownWaitError::Timeout`.
+
+## Finding 11 [P2] Runtime Drop must share the same terminal cache
+
+If `Drop` keeps the old private shutdown path, handles that outlive the runtime
+can never observe the terminal report. The plan now requires `Drop`,
+`shutdown_report(self)`, and `ThreadedShutdownHandle::wait_report` to all use
+the same shared join/report state.
