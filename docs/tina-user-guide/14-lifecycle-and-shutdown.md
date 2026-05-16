@@ -106,6 +106,33 @@ wait bounded time for completions
 report what remains
 ```
 
+## Drain State Helper
+
+For services that drain their own in-flight work (rather than just stop a
+listener), `tina_runtime::DrainState` records the four-stage shape:
+
+1. `Open` — admit new work.
+2. `Draining` — `begin()` flips admission; new attempts return a typed
+   `Stopping` outcome via `admit()`.
+3. Settle outstanding work using local permits or pending sets the service
+   already owns.
+4. `Stopped` — `finish()` emits the final report. Late completions counted
+   via `late_completions`; admission stays closed.
+
+```rust
+self.drain.begin();
+self.tick.clear();
+if self.drain.can_stop(self.gate.current() as u64) {
+    self.drain.finish();
+    return call.reply(Reply::Stopped { /* final report */ });
+}
+self.pending_stop = Some(call.into_request_context());
+```
+
+`DrainState` does not close resources, choose ordering, or hide messages.
+It is small state plus a report. Resource close still belongs to the
+service. `examples/systems/system_metrics_shipper` is the worked example.
+
 ## Service Shutdown Skeleton
 
 `examples/systems/mini_saas_api` has the current copyable local-service

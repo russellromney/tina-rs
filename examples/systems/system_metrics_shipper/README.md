@@ -112,39 +112,22 @@ What felt rough (with the planned roadmap row that already names the fix):
     vocabulary` (periodic service patterns beyond the current debounce/
     throttle helper state). This specimen's hand-rolled token *is* a
     missed-tick policy.
-- The single-flight flush is implemented as `flush_in_flight: bool`. It
-  is a one-bit `PendingReplies`. If another system also wants "one
-  outstanding call to a fixed peer," that should grow a helper rather
-  than living as a field on each isolate.
-  - Planned fix: the bounded-lanes admission vocabulary in ROADMAP.md
-    `Mailbox-first devex polish sketch`
-    (`try_admit` / `permit` / `snapshot` / typed `Busy`). Specializes
-    cleanly to N=1 and replaces the bool with a counter-shaped report.
-- `Sink` needs three message shapes (`Flush` call, `Complete`
-  continuation, `Stats` call) only because the slow sink wants a
-  `defer(sleep)` path that produces an internal message variant.
-  - Planned fix: ROADMAP.md `Mailbox-first devex polish sketch`
-    proposes `call.reply_after(work).to_self(|reply, result| ...)` as
-    the blessed sugar over `ctx.take_request_context().unwrap()`
-    plus `reply_with_request`. The continuation message still exists
-    (no hidden state mutation), but the call site collapses to one
-    fluent line and `into_request_context` stops being a discoverability
-    cliff.
-- "Events lost on flush" is real but feels too cheap. A real shipper
-  would want to re-enqueue the batch on a `Full` or `Closed` sink and
-  retry once. The specimen punts on retry because it is out of scope,
-  but the typed counter makes the gap visible.
-  - Planned fix: ROADMAP.md `Backpressure policies` (explicit policy
-    objects for shed, bounded wait, retry with backoff, degrade, close,
-    each returning typed outcomes). Retry-once-on-`Full` is one of the
-    named policies.
-- Drain is hand-rolled choreography: set `draining = true`, stash the
-  `Stop` `RequestContext`, let the next `FlushDone` reply. Works, but
-  the order is now load-bearing across three handlers.
-  - Planned fix: ROADMAP.md `Shutdown orchestration graph` (ordered
-    helpers for stop ingress, cancel/close pools, drain in-flight work,
-    flush batchers, terminal report). This specimen's `Stop` handler
-    implements three of those five steps by hand.
+- The single-flight flush now uses `tina_runtime::LocalPermitGate` with
+  capacity 1, named `"flush"`. The pressure invariant ("one in-flight
+  flush") is structural and the gate's report (current, capacity,
+  full_count, high_water, retired_count) is one line.
+- `Sink` continues to need three message shapes (`Flush` call, `Complete`
+  continuation, `Stats` call) for the slow sink, but the call site now
+  uses `call.defer(sleep(...)).reply(|req, _| SinkMsg::Complete { req, batch })`
+  with no `into_request_context()` cliff in sight.
+- "Events lost on flush" is still real. A real shipper would want a
+  retry-once-on-`Full` policy via `tina_runtime::FullHandling`; the
+  helper now exists and the typed counter makes the gap visible.
+- Drain is now state plus tiny helpers: `DrainState::begin()` flips
+  admission, `flush_tick.clear()` invalidates pending timer
+  continuations, the `Stop` handler stashes its `RequestContext`, and
+  the next `FlushDone` calls `DrainState::finish()` and answers via
+  `reply_to_request`. Ordering is visible, no hidden close.
 
 Not yet on the roadmap:
 - `Arc::try_unwrap(runtime)` for shutdown silently fails if any caller

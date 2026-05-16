@@ -20,7 +20,7 @@ use crate::call::{IntoErasedCall, RuntimeCall};
 use crate::capabilities::RuntimeCapabilities;
 use crate::clock::MonotonicClock;
 use crate::driver::BetelgeuseDriver;
-use crate::errors::{ThreadedRuntimeError, ThreadedTrySendError};
+use crate::errors::{ThreadedRegisterBootstrapError, ThreadedRuntimeError, ThreadedTrySendError};
 use crate::live_report::{
     LiveQueueMetrics, LiveRemoteQueueReport, LiveShardMetrics, LiveShardState, LiveTopologyReport,
 };
@@ -295,6 +295,46 @@ where
         self.call_on(shard, move |runtime| {
             runtime.register_sendable_with_capacity::<I, Outbound>(isolate, mailbox_capacity)
         })
+    }
+
+    /// Threaded multi-shard mirror of
+    /// [`Runtime::register_with_capacity_and_bootstrap`].
+    #[allow(private_bounds, clippy::type_complexity)]
+    pub fn register_with_capacity_and_bootstrap_on<I, Outbound>(
+        &self,
+        shard: ShardId,
+        isolate: I,
+        mailbox_capacity: usize,
+        bootstrap: I::Message,
+    ) -> Result<Address<I::Message, I::Reply>, ThreadedRegisterBootstrapError<I::Message>>
+    where
+        I: Isolate<Shard = S, Send = TinaOutbound<Outbound>> + Send + 'static,
+        I::Message: Send + 'static,
+        I::Reply: Send + 'static,
+        I::Spawn: IntoErasedSpawn<S, F> + 'static,
+        I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
+        I::Call: IntoErasedCall<I::Message> + 'static,
+        Outbound: Send + 'static,
+    {
+        match self.call_on(shard, move |runtime| {
+            runtime.register_sendable_with_capacity_and_bootstrap::<I, Outbound>(
+                isolate,
+                mailbox_capacity,
+                bootstrap,
+            )
+        }) {
+            Ok(Ok(address)) => Ok(address),
+            Ok(Err(err)) => Err(ThreadedRegisterBootstrapError::from_register(err)),
+            Err(ThreadedRuntimeError::WorkerStopped) => {
+                Err(ThreadedRegisterBootstrapError::WorkerStopped)
+            }
+            Err(ThreadedRuntimeError::UnknownShard(s)) => {
+                Err(ThreadedRegisterBootstrapError::UnknownShard(s))
+            }
+            Err(ThreadedRuntimeError::DriverShutdownFailed) => {
+                Err(ThreadedRegisterBootstrapError::WorkerStopped)
+            }
+        }
     }
 
     /// Register a [`ReplyAdapter<M, T, S>`] on a chosen shard.

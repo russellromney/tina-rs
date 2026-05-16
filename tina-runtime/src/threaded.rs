@@ -22,8 +22,8 @@ use crate::capabilities::RuntimeCapabilities;
 use crate::clock::MonotonicClock;
 use crate::driver::{self, BetelgeuseDriver};
 use crate::errors::{
-    SendObservedUntilError, SuperviseError, ThreadedRuntimeError, ThreadedSendObservedError,
-    ThreadedTrySendError,
+    SendObservedUntilError, SuperviseError, ThreadedRegisterBootstrapError, ThreadedRuntimeError,
+    ThreadedSendObservedError, ThreadedTrySendError,
 };
 use crate::host_burst::HostBurstOutcomes;
 use crate::live_report::{LiveShardMetrics, LiveShardState, LiveTopologyReport};
@@ -336,6 +336,50 @@ where
         self.call(move |runtime| {
             runtime.register_with_capacity::<I, Outbound>(isolate, mailbox_capacity)
         })
+    }
+
+    /// Threaded mirror of [`Runtime::register_with_capacity_and_bootstrap`].
+    ///
+    /// The mailbox is allocated and the bootstrap message is prefilled before
+    /// the isolate entry is inserted. The returned address points at an
+    /// isolate whose first delivered message is `bootstrap`. Sends issued
+    /// immediately after this call can still see `Full` until the bootstrap
+    /// message is consumed; that is honest pressure, not a bug.
+    #[allow(private_bounds, clippy::type_complexity)]
+    pub fn register_with_capacity_and_bootstrap<I, Outbound>(
+        &self,
+        isolate: I,
+        mailbox_capacity: usize,
+        bootstrap: I::Message,
+    ) -> Result<Address<I::Message, I::Reply>, ThreadedRegisterBootstrapError<I::Message>>
+    where
+        I: Isolate<Shard = S, Send = TinaOutbound<Outbound>> + Send + 'static,
+        I::Message: Send + 'static,
+        I::Reply: 'static,
+        I::Spawn: IntoErasedSpawn<S, F> + 'static,
+        I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
+        I::Call: IntoErasedCall<I::Message> + 'static,
+        Outbound: 'static,
+    {
+        match self.call(move |runtime| {
+            runtime.register_with_capacity_and_bootstrap::<I, Outbound>(
+                isolate,
+                mailbox_capacity,
+                bootstrap,
+            )
+        }) {
+            Ok(Ok(address)) => Ok(address),
+            Ok(Err(err)) => Err(ThreadedRegisterBootstrapError::from_register(err)),
+            Err(ThreadedRuntimeError::WorkerStopped) => {
+                Err(ThreadedRegisterBootstrapError::WorkerStopped)
+            }
+            Err(ThreadedRuntimeError::UnknownShard(shard)) => {
+                Err(ThreadedRegisterBootstrapError::UnknownShard(shard))
+            }
+            Err(ThreadedRuntimeError::DriverShutdownFailed) => {
+                Err(ThreadedRegisterBootstrapError::WorkerStopped)
+            }
+        }
     }
 
     /// Threaded mirror of [`Runtime::register_with_capacity_using`].

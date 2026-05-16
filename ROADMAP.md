@@ -345,6 +345,8 @@ framework before public release-story work.
 | **099 production service skeleton refresh** | Refresh `examples/systems/mini_saas_api` after Phase 095 so the copied service path uses `call_ctx.defer(...)`, current pressure/capacity reports, and current shutdown vocabulary. This is not a framework; it is the one real service shape cheap models should copy. Plan: `.intent/phases/099-production-service-skeleton-refresh/plan.md`. |
 | **100 compile-time safety rails** | Move common silent failures left by changing the default service model: public call messages and internal continuation messages split into separate capabilities/handles, callable handlers are required/diagnosed, trait/macro errors get user-facing diagnostics, and cancelable deferred admission gets a safer copied shape or explicit handoff to 097. Runtime still owns `Full`/`Closed`/`Timeout` truth. Plan: `.intent/phases/100-compile-time-safety-rails/plan.md`. |
 | **101 mailbox-first service ergonomics** | Build the helpers repeatedly pulled by system specimens: lock in `CallContext::defer(...).reply(...)` as the copied multi-turn reply path, add recurring tick/missed-tick service state, isolate-local in-flight permits, explicit drain state, register-and-bootstrap helpers, and tiny explicit Full-handling state for shed/retry-with-backoff. No `on_start`, no fake async, no hidden mutation, no hidden retry. Plan: `.intent/phases/101-mailbox-first-service-ergonomics/plan.md`. |
+| **Natural-key and keyed-wait pending helpers** | Follow-up to 097 plus system specimens. Build the missing bounded pending vocabulary for natural keys: `PendingCancelableCallSlab<K, Q, R>` or equivalent for multiple cancelable entries per natural key, and likely `KeyedPendingReplies` / `WaitList<K, R>` for per-key FIFO waiters backed by one global cap. Must keep `(key, ticket)` ABA truth, typed `Full`/`BucketFull` admission errors, caller-authority recovery on failed admission, and skip-reclaimed-slot proof. No hidden dedup, no automatic key-versioning. |
+| **102 host control ergonomics** | Combine the two host-control findings from systems: add address-routed `ThreadedMultiShardRuntime::call_blocking(addr, msg, timeout)`, make single-shard `call_blocking` reject full command queues instead of hanging, and add `ThreadedShutdownHandle` so host code can request/wait runtime shutdown without `Arc::try_unwrap(runtime)`. Tests must prove normal call outcomes, timeout/stale/unknown-shard behavior, command-full host-control admission, nonblocking shutdown request errors, cached terminal shutdown report truth, and one real sharded + one shutdown-heavy specimen migration. Plan: `.intent/phases/102-host-control-ergonomics/plan.md`. |
 | **Typed config and protocol state safety phase** | Later broad safety phase after the service-model split. Combine typed config/budget manifests with private protocol typestate because the goal is the same: make impossible states hard to write. Build typed builders/manifests for copied service knobs like mailbox caps, pool caps, body caps, bridge in-flight caps, deadlines, retry budgets, shared capacity scopes, and startup config. Use private state-token/typestate shapes in `tina-http` where they eliminate real protocol bugs: HTTP/2 stream lifecycle, DATA/trailers ordering, WebSocket close handshake, gRPC final-status ownership, and body stream states. Runtime validation still owns env/file config; user service code must stay simple. No phase number until this is ready to execute. |
 | **096 WebSocket production replacement start** | Started on PR #83 as the post-094 production push: subprotocol offer inspection/selection, extension-offer visibility, browser-selected protocol proof, and a hostile review of the remaining replacement surface. Plan: `.intent/phases/096-websocket-production-replacement/plan.md`. |
 | **WebSocket replacement follow-up** | After 097, close the broader replacement claims that are harness-heavy or product-choice-heavy: Autobahn classification, live trace to simulator replay for WebSocket facts, Tina-native WebSocket client if external clients are not enough, extracting a small `tina-websocket-room`-style helper crate if repeated apps need the specimen's room registry/admission/fanout/slow-peer policies, and bounded `permessage-deflate` only if compression becomes a real requirement. |
@@ -661,10 +663,25 @@ discipline, not from removing it.
 **Surfaces this would unblock.** `system_session_auth`,
 `system_tenant_rate_limiter`, `system_webhook_relay`, `system_lock_manager`,
 and the worker-index variant of `system_job_queue` are all natural-key
-shaped and currently have to invent the workaround themselves. Promoting
-this to a real phase should wait for at least one of those specimens to
-actually run into it; today the case is one specimen (`system_job_queue`)
-that successfully sidestepped it.
+shaped and currently have to invent the workaround themselves. This is now
+strong enough to be a near-term follow-up after 100/101 if those phases do not
+already reshape the service handle enough to change the helper boundary.
+
+### Keyed wait lists over bounded pending replies
+
+`system_cache_with_fill` and `system_lock_manager` both wrote the same
+waiter shape:
+
+- global `PendingReplies` cap owns parked caller authority;
+- each key/bucket owns a FIFO of waiter ids;
+- handoff loops pop ids until one still has a live deferred reply;
+- per-key caps and global caps are reported separately by handwritten code.
+
+Build a small `KeyedPendingReplies<K, R>` / `WaitList<K, R>` helper once the
+third call site confirms the exact shape, or earlier if it blocks a system.
+The helper must own both caps, return typed `Full` vs `BucketFull`, recover the
+caller on failed admission, and make skip-reclaimed-slot behavior explicit. No
+hidden per-key unbounded queues.
 
 ## Capability layers still needed
 

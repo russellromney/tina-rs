@@ -21,16 +21,20 @@ cargo test --manifest-path examples/systems/system_bounded_object_lane/Cargo.tom
 ## Findings
 
 What felt good:
-- The in-flight cap is ordinary isolate state, not a pool mutex or scheduler
-  side effect.
+- The in-flight cap is `tina_runtime::LocalPermitGate`: fixed-capacity,
+  move-only `Permit`, explicit release. The pressure invariant is structural
+  rather than a bool/counter pair.
 - Overload is a typed reply (`Busy`) instead of a hidden wait queue.
-- `RequestContext` plus `reply_with_request` makes multi-turn replies explicit.
+- `call_ctx.defer(sleep(work)).reply(...)` carries `RequestContext` into the
+  continuation in one line. Multi-turn replies stay visible and the permit
+  rides along with the continuation, so the release point is obvious.
 
 What felt rough:
-- The request-context shape is correct, but still visually heavy for a common
-  "accept now, reply after runtime call" path.
 - The mini service wants a standard pressure-report helper so `accepted`,
   `busy`, `completed`, and `in_flight` do not become per-service vocabulary.
+  `LocalPermitGate::report()` covers most of this now (current, capacity,
+  full_count, high_water, retired_count, completed_count,
+  invalid_release_count).
 - The real S3 temptation was useful: completion delivery must be observed, not
   best-effort `try_send`, or in-flight capacity can leak.
 
