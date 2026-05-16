@@ -1203,34 +1203,6 @@ where
             ThreadedRuntimeError::WorkerStopped
         })
     }
-
-    /// Bounded-admission mirror of [`Self::call`] used by host-control
-    /// helpers that must not block on a full worker command queue.
-    fn try_call<R, C>(&self, command: C) -> Result<R, ThreadedRuntimeError>
-    where
-        R: Send + 'static,
-        C: FnOnce(&mut Runtime<S, F>) -> R + Send + 'static,
-    {
-        let (reply_tx, reply_rx) = std::sync::mpsc::channel();
-        match self
-            .commands
-            .try_send(ThreadedCommand::Run(Box::new(move |runtime| {
-                let _ = reply_tx.send(command(runtime));
-            }))) {
-            Ok(()) => {}
-            Err(std::sync::mpsc::TrySendError::Full(_)) => {
-                return Err(ThreadedRuntimeError::CommandFull);
-            }
-            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
-                self.metrics.set_state(LiveShardState::Failed);
-                return Err(ThreadedRuntimeError::WorkerStopped);
-            }
-        }
-        reply_rx.recv().map_err(|_| {
-            self.metrics.set_state(LiveShardState::Failed);
-            ThreadedRuntimeError::WorkerStopped
-        })
-    }
 }
 
 impl<S, F> Drop for ThreadedRuntime<S, F>

@@ -741,7 +741,6 @@ where
             ThreadedRuntimeError::WorkerStopped
         })
     }
-
 }
 
 impl<S, F> Drop for ThreadedMultiShardRuntime<S, F>

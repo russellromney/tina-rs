@@ -143,6 +143,7 @@ enum SpinnerMsg {
 }
 struct SpinnerMS {
     flag: Arc<AtomicBool>,
+    entered: Arc<AtomicBool>,
 }
 #[tina_runtime::isolate(message = SpinnerMsg, reply = (), shard = TestShard)]
 impl SpinnerMS {
@@ -153,7 +154,8 @@ impl SpinnerMS {
     ) -> Effect<Self> {
         match msg {
             SpinnerMsg::Tick => {
-                let target = Instant::now() + Duration::from_millis(80);
+                self.entered.store(true, Ordering::Relaxed);
+                let target = Instant::now() + Duration::from_millis(500);
                 while Instant::now() < target {
                     if self.flag.load(Ordering::Relaxed) {
                         break;
@@ -198,6 +200,7 @@ enum SpinnerSimpleMsg {
 }
 struct SpinnerSimple {
     flag: Arc<AtomicBool>,
+    entered: Arc<AtomicBool>,
 }
 #[tina_runtime::isolate(message = SpinnerSimpleMsg, reply = ())]
 impl SpinnerSimple {
@@ -208,7 +211,8 @@ impl SpinnerSimple {
     ) -> Effect<Self> {
         match msg {
             SpinnerSimpleMsg::Tick => {
-                let target = Instant::now() + Duration::from_millis(80);
+                self.entered.store(true, Ordering::Relaxed);
+                let target = Instant::now() + Duration::from_millis(500);
                 while Instant::now() < target {
                     if self.flag.load(Ordering::Relaxed) {
                         break;
@@ -259,10 +263,12 @@ fn multi_runtime(
 fn single_shard_call_blocking_returns_command_full_when_queue_saturated() {
     let runtime = single_runtime(1);
     let flag = Arc::new(AtomicBool::new(false));
+    let entered = Arc::new(AtomicBool::new(false));
     let spinner = runtime
         .register_with_capacity::<SpinnerSimple, Infallible>(
             SpinnerSimple {
                 flag: Arc::clone(&flag),
+                entered: Arc::clone(&entered),
             },
             4,
         )
@@ -270,20 +276,24 @@ fn single_shard_call_blocking_returns_command_full_when_queue_saturated() {
     runtime
         .try_send(spinner, SpinnerSimpleMsg::Tick)
         .expect("kick spinner");
-
-    let mut saw_full = false;
-    for _ in 0..32 {
-        if let Err(ThreadedRuntimeError::CommandFull) =
-            runtime.call_blocking(spinner, SpinnerSimpleMsg::Tick, Duration::from_millis(20))
-        {
-            saw_full = true;
-            break;
-        }
+    while !entered.load(Ordering::Relaxed) {
+        thread::yield_now();
     }
+
+    let queued = runtime.call_blocking(spinner, SpinnerSimpleMsg::Tick, Duration::from_millis(20));
+    assert!(
+        matches!(
+            queued,
+            Ok(CallOutcome::Timeout) | Err(ThreadedRuntimeError::CommandFull)
+        ),
+        "first host call should either occupy the single command slot or observe it full; got {queued:?}"
+    );
+    let saturated =
+        runtime.call_blocking(spinner, SpinnerSimpleMsg::Tick, Duration::from_millis(20));
     flag.store(true, Ordering::Relaxed);
     assert!(
-        saw_full,
-        "call_blocking against a full command queue must surface CommandFull"
+        matches!(saturated, Err(ThreadedRuntimeError::CommandFull)),
+        "call_blocking against a full command queue must surface CommandFull; got {saturated:?}"
     );
     let _ = runtime.shutdown();
 }
@@ -512,10 +522,12 @@ fn shutdown_handle_request_does_not_block_when_queue_full() {
     // timeout. Either outcome proves the contract.
     let runtime = single_runtime(1);
     let flag = Arc::new(AtomicBool::new(false));
+    let entered = Arc::new(AtomicBool::new(false));
     let spinner = runtime
         .register_with_capacity::<SpinnerSimple, Infallible>(
             SpinnerSimple {
                 flag: Arc::clone(&flag),
+                entered: Arc::clone(&entered),
             },
             8,
         )
@@ -523,6 +535,9 @@ fn shutdown_handle_request_does_not_block_when_queue_full() {
     runtime
         .try_send(spinner, SpinnerSimpleMsg::Tick)
         .expect("kick spinner");
+    while !entered.load(Ordering::Relaxed) {
+        thread::yield_now();
+    }
     let handle = runtime.shutdown_handle();
     for _ in 0..32 {
         let start = Instant::now();
@@ -572,16 +587,21 @@ fn multi_shard_shutdown_handle_carries_shard_id_when_command_full() {
             },
         );
     let flag = Arc::new(AtomicBool::new(false));
+    let entered = Arc::new(AtomicBool::new(false));
     let spinner = runtime
         .register_with_capacity_on::<SpinnerMS, Infallible>(
             ShardId::new(1),
             SpinnerMS {
                 flag: Arc::clone(&flag),
+                entered: Arc::clone(&entered),
             },
             8,
         )
         .expect("register spinner");
     runtime.try_send(spinner, SpinnerMsg::Tick).expect("kick");
+    while !entered.load(Ordering::Relaxed) {
+        thread::yield_now();
+    }
     let handle = runtime.shutdown_handle();
     for _ in 0..32 {
         let start = Instant::now();
