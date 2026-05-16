@@ -2587,8 +2587,9 @@ pub mod prelude {
         isolate, isolate_types, noop, reply, reply_to, reply_to_request, restart_children, send,
         sequence, spawn, spawn_observed, stop, stop_with,
         time::{
-            Backoff, BackoffDelay, IntervalDelay, MissedTickPolicy, TimerConfigError,
-            TimerDecision, TimerInterval,
+            Backoff, BackoffDelay, IntervalDelay, MissedTickPolicy, RecurringCatchUp,
+            RecurringTick, RecurringTickDecision, RecurringTickReport, RecurringTickStale,
+            RecurringTickToken, TimerConfigError, TimerDecision, TimerInterval,
         },
     };
 }

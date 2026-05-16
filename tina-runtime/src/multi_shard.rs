@@ -190,6 +190,32 @@ where
             .register_with_capacity::<I, Outbound>(isolate, mailbox_capacity)
     }
 
+    /// Multi-shard mirror of [`Runtime::register_with_capacity_and_bootstrap`].
+    #[allow(private_bounds, clippy::type_complexity)]
+    pub fn register_with_capacity_and_bootstrap_on<I, Outbound>(
+        &mut self,
+        shard: ShardId,
+        isolate: I,
+        mailbox_capacity: usize,
+        bootstrap: I::Message,
+    ) -> Result<Address<I::Message, I::Reply>, crate::errors::RegisterBootstrapError<I::Message>>
+    where
+        I: Isolate<Shard = S, Send = TinaOutbound<Outbound>> + 'static,
+        I::Message: 'static,
+        I::Reply: 'static,
+        I::Spawn: IntoErasedSpawn<S, F> + 'static,
+        I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
+        I::Call: IntoErasedCall<I::Message> + 'static,
+        Outbound: 'static,
+    {
+        self.runtime_mut(shard)
+            .register_with_capacity_and_bootstrap::<I, Outbound>(
+                isolate,
+                mailbox_capacity,
+                bootstrap,
+            )
+    }
+
     /// Register a [`ReplyAdapter<M, T, S>`] on a chosen shard.
     ///
     /// Translates inbound `M` to outbound `T` via the user-provided

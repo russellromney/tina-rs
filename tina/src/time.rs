@@ -454,6 +454,293 @@ fn checked_add_or_max(now: Instant, after: Duration) -> Instant {
         .unwrap_or_else(|| now.checked_add(TIMER_SATURATION_CEILING).unwrap_or(now))
 }
 
+/// What [`RecurringTick`] does when the caller is overdue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RecurringCatchUp {
+    /// Coalesce all missed ticks into one visible [`RecurringTickDecision::Skip`]
+    /// report. The next `next(now)` call returns a fresh future [`Sleep`].
+    Skip,
+    /// Allow at most `n` immediate catch-up ticks. Each one resolves as a
+    /// [`Sleep`] with a zero delay (fire-now) and consumes one catch-up budget.
+    /// After the budget is exhausted, behaves like [`Skip`].
+    Bounded(u32),
+    /// Drift forward: schedule the next tick `period` after the observed
+    /// `now`. No catch-up; missed ticks become zero.
+    Delay,
+}
+
+/// Opaque token issued for each scheduled [`Sleep`](RecurringTickDecision::Sleep)
+/// decision. Carry it inside the continuation message and call
+/// [`RecurringTick::validate`] when the message arrives to distinguish a
+/// live tick from a stale one whose schedule has already been rearmed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[must_use = "store the token on the continuation and call validate(token) when it arrives"]
+pub struct RecurringTickToken {
+    ordinal: u64,
+}
+
+impl RecurringTickToken {
+    /// Strictly increasing ordinal of this token across the [`RecurringTick`]'s
+    /// lifetime. Useful for trace-visible reports; not used for liveness logic.
+    pub const fn ordinal(self) -> u64 {
+        self.ordinal
+    }
+}
+
+/// Description of a single [`RecurringTick`] decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct RecurringTickReport {
+    /// One-based tick number for the tick this decision schedules or fires.
+    pub tick_number: u64,
+    /// Time slot the tick was scheduled against (before any catch-up).
+    pub scheduled_at: Instant,
+    /// `now` the caller supplied to produce this decision.
+    pub observed_at: Instant,
+    /// Number of missed periods coalesced into this decision. Zero when on
+    /// time. Non-zero on [`RecurringTickDecision::Skip`] and on the first
+    /// `Sleep` after a `Skip`.
+    pub missed_ticks: u64,
+    /// How many bounded catch-up ticks remain on this run.
+    pub catch_up_remaining: u32,
+}
+
+/// A [`RecurringTick`] decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[must_use = "handle both Sleep and Skip; never re-enter without using the report"]
+pub enum RecurringTickDecision {
+    /// Sleep `delay` and then deliver a continuation message carrying `token`.
+    /// When the continuation arrives, validate it via [`RecurringTick::validate`].
+    Sleep {
+        /// Duration to pass to runtime sleep.
+        delay: Duration,
+        /// Token to embed in the continuation message.
+        token: RecurringTickToken,
+        /// Report describing the scheduled tick.
+        report: RecurringTickReport,
+    },
+    /// The caller is overdue. The configured policy coalesced missed ticks
+    /// into this visible report. The caller records the report and calls
+    /// [`RecurringTick::next`] again to obtain a fresh future `Sleep`.
+    Skip(RecurringTickReport),
+}
+
+/// Error returned by [`RecurringTick::validate`] when a continuation token
+/// does not match the current expected ordinal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RecurringTickStale {
+    /// The carried token was issued before the current schedule.
+    StaleOrdinal {
+        /// The token the continuation carried.
+        token_ordinal: u64,
+        /// The ordinal the helper currently expects.
+        expected_ordinal: u64,
+    },
+    /// The helper has been cleared since this token was issued and no
+    /// schedule is currently armed.
+    Cleared {
+        /// The ordinal carried by the stale continuation token.
+        token_ordinal: u64,
+    },
+}
+
+/// Recurring service-tick helper.
+///
+/// Like [`TimerInterval`], `RecurringTick` only computes decisions. The caller
+/// owns the continuation message and the sleep effect. Each `Sleep` decision
+/// carries a [`RecurringTickToken`]; the continuation handler must call
+/// [`validate`](Self::validate) to detect stale ticks rearmed under it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[must_use = "RecurringTick is state; store it and call next(ctx.now()) when you want to (re)arm"]
+pub struct RecurringTick {
+    period: Duration,
+    catch_up: RecurringCatchUp,
+    next_due: Option<Instant>,
+    next_tick_number: u64,
+    next_ordinal: u64,
+    /// Currently-armed Sleep ordinal, if any. Cleared by [`Self::clear`] and
+    /// during a [`Skip`](RecurringTickDecision::Skip) decision.
+    armed_ordinal: Option<u64>,
+    /// Number of immediate catch-up ticks still owed for the current overdue
+    /// burst. Each [`Bounded`](RecurringCatchUp::Bounded) overdue observation
+    /// loads this; each call drains one with `delay = 0`.
+    catch_up_pending: u32,
+}
+
+impl RecurringTick {
+    /// Creates a recurring tick state with period `period` and the default
+    /// catch-up policy [`RecurringCatchUp::Delay`].
+    pub fn every(period: Duration) -> Result<Self, TimerConfigError> {
+        if period.is_zero() {
+            return Err(TimerConfigError::ZeroIntervalPeriod);
+        }
+        Ok(Self {
+            period,
+            catch_up: RecurringCatchUp::Delay,
+            next_due: None,
+            next_tick_number: 1,
+            next_ordinal: 1,
+            armed_ordinal: None,
+            catch_up_pending: 0,
+        })
+    }
+
+    /// Picks the catch-up policy for overdue ticks.
+    pub const fn catch_up(mut self, policy: RecurringCatchUp) -> Self {
+        self.catch_up = policy;
+        self
+    }
+
+    /// Returns the configured catch-up policy.
+    pub const fn catch_up_policy(self) -> RecurringCatchUp {
+        self.catch_up
+    }
+
+    /// Returns the interval period.
+    pub const fn period(self) -> Duration {
+        self.period
+    }
+
+    /// Returns the next scheduled instant, if a `Sleep` is currently armed.
+    pub const fn next_due(self) -> Option<Instant> {
+        self.next_due
+    }
+
+    /// Clears the schedule. Any continuation message still in flight is now
+    /// stale and will fail [`validate`](Self::validate).
+    pub fn clear(&mut self) {
+        self.next_due = None;
+        self.armed_ordinal = None;
+        self.catch_up_pending = 0;
+    }
+
+    /// Validates a continuation token against the currently armed ordinal.
+    pub fn validate(
+        &self,
+        token: RecurringTickToken,
+    ) -> Result<RecurringTickToken, RecurringTickStale> {
+        match self.armed_ordinal {
+            Some(expected) if expected == token.ordinal => Ok(token),
+            Some(expected) => Err(RecurringTickStale::StaleOrdinal {
+                token_ordinal: token.ordinal,
+                expected_ordinal: expected,
+            }),
+            None => Err(RecurringTickStale::Cleared {
+                token_ordinal: token.ordinal,
+            }),
+        }
+    }
+
+    fn arm_sleep(
+        &mut self,
+        delay: Duration,
+        scheduled_at: Instant,
+        observed_at: Instant,
+        missed_ticks: u64,
+    ) -> RecurringTickDecision {
+        let ordinal = self.next_ordinal;
+        self.next_ordinal = ordinal.saturating_add(1);
+        self.armed_ordinal = Some(ordinal);
+        let tick_number = self.next_tick_number.saturating_add(missed_ticks);
+        self.next_tick_number = tick_number.saturating_add(1);
+        let report = RecurringTickReport {
+            tick_number,
+            scheduled_at,
+            observed_at,
+            missed_ticks,
+            catch_up_remaining: self.catch_up_pending,
+        };
+        RecurringTickDecision::Sleep {
+            delay,
+            token: RecurringTickToken { ordinal },
+            report,
+        }
+    }
+
+    /// Returns the next decision for the caller-supplied `now`.
+    pub fn next(&mut self, now: Instant) -> RecurringTickDecision {
+        // First: if a bounded burst has buffered catch-up ticks, drain one.
+        // The interval's `next_due` stays parked at the future slot; the
+        // helper hands out `Sleep(0)` with fresh tokens until the burst is
+        // drained.
+        if self.catch_up_pending > 0 {
+            self.catch_up_pending -= 1;
+            let scheduled_at = self.next_due.unwrap_or(now);
+            return self.arm_sleep(Duration::ZERO, scheduled_at, now, 1);
+        }
+
+        // No catch-up pending: arm or advance the schedule against now.
+        let scheduled_at = match self.next_due {
+            Some(scheduled_at) => scheduled_at,
+            None => {
+                let scheduled_at = checked_add_or_max(now, self.period);
+                self.next_due = Some(scheduled_at);
+                scheduled_at
+            }
+        };
+
+        if scheduled_at > now {
+            let delay = scheduled_at.duration_since(now);
+            return self.arm_sleep(delay, scheduled_at, now, 0);
+        }
+
+        // Overdue: compute how many periods have elapsed since scheduled_at.
+        let overdue = now.saturating_duration_since(scheduled_at);
+        let elapsed_periods = (overdue.as_nanos() / self.period.as_nanos()) as u64 + 1;
+
+        match self.catch_up {
+            RecurringCatchUp::Delay => {
+                // Drift forward: next tick is `now + period`.
+                let new_scheduled_at = checked_add_or_max(now, self.period);
+                self.next_due = Some(new_scheduled_at);
+                self.arm_sleep(self.period, new_scheduled_at, now, 0)
+            }
+            RecurringCatchUp::Skip => {
+                // Coalesce all overdue periods into one visible Skip. Advance
+                // next_due past the overdue burst; the next `next` call will
+                // arm a fresh Sleep from that future slot.
+                let advance = duration_mul_saturating(self.period, u128::from(elapsed_periods));
+                let new_scheduled_at = scheduled_at
+                    .checked_add(advance)
+                    .filter(|slot| *slot > now)
+                    .unwrap_or_else(|| checked_add_or_max(now, self.period));
+                self.next_due = Some(new_scheduled_at);
+                let missed = elapsed_periods.saturating_sub(1);
+                let tick_number = self.next_tick_number.saturating_add(missed);
+                self.next_tick_number = tick_number.saturating_add(1);
+                // No live ordinal during a Skip — a continuation arriving now
+                // is stale by construction.
+                self.armed_ordinal = None;
+                RecurringTickDecision::Skip(RecurringTickReport {
+                    tick_number,
+                    scheduled_at,
+                    observed_at: now,
+                    missed_ticks: missed,
+                    catch_up_remaining: 0,
+                })
+            }
+            RecurringCatchUp::Bounded(budget) => {
+                // Fire at most `budget` immediate ticks. Anything past the
+                // budget is dropped, and the count of dropped ticks is carried
+                // visibly on the first Sleep(0) via `missed_ticks`. Subsequent
+                // queued catch-ups report `missed_ticks = 0`.
+                let immediate = u64::from(budget).min(elapsed_periods);
+                let skipped = elapsed_periods - immediate;
+                // The first immediate tick is fired now; queue the rest.
+                self.catch_up_pending =
+                    u32::try_from(immediate.saturating_sub(1)).unwrap_or(u32::MAX);
+                // Advance the schedule past the whole overdue burst.
+                let advance = duration_mul_saturating(self.period, u128::from(elapsed_periods));
+                let new_scheduled_at = scheduled_at
+                    .checked_add(advance)
+                    .filter(|slot| *slot > now)
+                    .unwrap_or_else(|| checked_add_or_max(now, self.period));
+                self.next_due = Some(new_scheduled_at);
+                self.arm_sleep(Duration::ZERO, scheduled_at, now, skipped)
+            }
+        }
+    }
+}
+
 fn duration_mul_saturating(duration: Duration, factor: u128) -> Duration {
     let nanos = duration.as_nanos().saturating_mul(factor);
     let secs = nanos / NANOS_PER_SEC;
@@ -646,6 +933,209 @@ mod tests {
         assert_eq!(
             backoff.next_delay_until(now + Duration::from_millis(3), Some(deadline)),
             TimerDecision::DeadlineElapsed
+        );
+    }
+
+    #[test]
+    fn recurring_tick_first_sleep_arms_token_one() {
+        let now = Instant::now();
+        let mut tick = RecurringTick::every(Duration::from_millis(10)).unwrap();
+
+        match tick.next(now) {
+            RecurringTickDecision::Sleep {
+                delay,
+                token,
+                report,
+            } => {
+                assert_eq!(delay, Duration::from_millis(10));
+                assert_eq!(token.ordinal(), 1);
+                assert_eq!(report.tick_number, 1);
+                assert_eq!(report.missed_ticks, 0);
+                assert_eq!(report.scheduled_at, now + Duration::from_millis(10));
+                assert!(tick.validate(token).is_ok());
+            }
+            other => panic!("expected sleep, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn recurring_tick_token_detects_stale_after_rearm() {
+        let now = Instant::now();
+        let mut tick = RecurringTick::every(Duration::from_millis(10)).unwrap();
+
+        let first_token = match tick.next(now) {
+            RecurringTickDecision::Sleep { token, .. } => token,
+            other => panic!("expected first sleep, got {other:?}"),
+        };
+
+        // External event (e.g. a size-triggered flush) clears the schedule and
+        // arms a fresh tick. The first token must now be stale.
+        tick.clear();
+        match tick.validate(first_token) {
+            Err(RecurringTickStale::Cleared { token_ordinal }) => {
+                assert_eq!(token_ordinal, 1);
+            }
+            other => panic!("expected Cleared after clear, got {other:?}"),
+        }
+
+        let second_token = match tick.next(now) {
+            RecurringTickDecision::Sleep { token, .. } => token,
+            other => panic!("expected second sleep, got {other:?}"),
+        };
+        assert_eq!(second_token.ordinal(), 2);
+        assert!(tick.validate(second_token).is_ok());
+        assert!(matches!(
+            tick.validate(first_token),
+            Err(RecurringTickStale::StaleOrdinal {
+                token_ordinal: 1,
+                expected_ordinal: 2,
+            })
+        ));
+    }
+
+    #[test]
+    fn recurring_tick_skip_policy_coalesces_missed_into_one_skip() {
+        let now = Instant::now();
+        let mut tick = RecurringTick::every(Duration::from_millis(10))
+            .unwrap()
+            .catch_up(RecurringCatchUp::Skip);
+        assert!(matches!(
+            tick.next(now),
+            RecurringTickDecision::Sleep { .. }
+        ));
+
+        // Caller observes time 35ms later — three periods elapsed.
+        let late = now + Duration::from_millis(35);
+        match tick.next(late) {
+            RecurringTickDecision::Skip(report) => {
+                assert!(report.missed_ticks >= 2);
+                assert_eq!(report.catch_up_remaining, 0);
+            }
+            other => panic!("expected Skip, got {other:?}"),
+        }
+
+        // Next call returns a fresh future Sleep, never loops on missed ticks.
+        match tick.next(late) {
+            RecurringTickDecision::Sleep { delay, token, .. } => {
+                assert!(delay > Duration::ZERO);
+                assert!(tick.validate(token).is_ok());
+            }
+            other => panic!("expected Sleep after Skip, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn recurring_tick_bounded_catch_up_caps_immediate_ticks() {
+        let now = Instant::now();
+        let mut tick = RecurringTick::every(Duration::from_millis(10))
+            .unwrap()
+            .catch_up(RecurringCatchUp::Bounded(2));
+        assert!(matches!(
+            tick.next(now),
+            RecurringTickDecision::Sleep { .. }
+        ));
+
+        // Five periods late: bounded(2) fires two immediate ticks with the
+        // dropped ones visibly recorded on the first Sleep, then returns to
+        // ordinary future scheduling.
+        let late = now + Duration::from_millis(55);
+
+        let (first_delay, first_missed) = match tick.next(late) {
+            RecurringTickDecision::Sleep {
+                delay,
+                report,
+                token,
+            } => {
+                assert!(tick.validate(token).is_ok());
+                (delay, report.missed_ticks)
+            }
+            other => panic!("expected bounded Sleep, got {other:?}"),
+        };
+        assert_eq!(first_delay, Duration::ZERO);
+        assert!(
+            first_missed >= 3,
+            "skipped count must surface on the first catch-up sleep (got {first_missed})"
+        );
+
+        let (second_delay, second_missed) = match tick.next(late) {
+            RecurringTickDecision::Sleep {
+                delay,
+                report,
+                token,
+            } => {
+                assert!(tick.validate(token).is_ok());
+                (delay, report.missed_ticks)
+            }
+            other => panic!("expected second bounded Sleep, got {other:?}"),
+        };
+        assert_eq!(second_delay, Duration::ZERO);
+        assert_eq!(
+            second_missed, 1,
+            "queued catch-up reports one tick per fire, not the dropped burst"
+        );
+
+        // After the bounded budget drains, the next decision is a regular
+        // future Sleep — never loop forever.
+        match tick.next(late) {
+            RecurringTickDecision::Sleep { delay, token, .. } => {
+                assert!(delay > Duration::ZERO);
+                assert!(tick.validate(token).is_ok());
+            }
+            other => panic!("expected future Sleep after bounded burst, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn recurring_tick_delay_policy_drifts_no_catch_up() {
+        let now = Instant::now();
+        let mut tick = RecurringTick::every(Duration::from_millis(10))
+            .unwrap()
+            .catch_up(RecurringCatchUp::Delay);
+        assert!(matches!(
+            tick.next(now),
+            RecurringTickDecision::Sleep { .. }
+        ));
+
+        let late = now + Duration::from_millis(35);
+        match tick.next(late) {
+            RecurringTickDecision::Sleep {
+                delay,
+                report,
+                token,
+            } => {
+                assert_eq!(delay, Duration::from_millis(10));
+                assert_eq!(report.missed_ticks, 0);
+                assert!(tick.validate(token).is_ok());
+            }
+            other => panic!("expected drifting Sleep, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn recurring_tick_clear_makes_in_flight_token_stale() {
+        let now = Instant::now();
+        let mut tick = RecurringTick::every(Duration::from_millis(10)).unwrap();
+        let token = match tick.next(now) {
+            RecurringTickDecision::Sleep { token, .. } => token,
+            other => panic!("expected sleep, got {other:?}"),
+        };
+        assert!(tick.validate(token).is_ok());
+
+        // Service did a size-triggered flush and cleared the recurring tick;
+        // the already-scheduled continuation must report stale rather than
+        // double-firing the flush.
+        tick.clear();
+        assert!(matches!(
+            tick.validate(token),
+            Err(RecurringTickStale::Cleared { token_ordinal: 1 })
+        ));
+    }
+
+    #[test]
+    fn recurring_tick_rejects_zero_period() {
+        assert_eq!(
+            RecurringTick::every(Duration::ZERO).err(),
+            Some(TimerConfigError::ZeroIntervalPeriod)
         );
     }
 

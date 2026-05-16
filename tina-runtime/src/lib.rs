@@ -56,10 +56,13 @@ mod capabilities;
 pub mod capacity;
 mod clock;
 pub mod deferred;
+mod drain_state;
 mod driver;
 mod errors;
+mod full_handling;
 mod host_burst;
 mod live_report;
+mod local_permit;
 mod local_system;
 mod mailbox;
 mod multi_shard;
@@ -76,11 +79,20 @@ mod threaded;
 mod threaded_multi_shard;
 mod trace;
 
+pub use drain_state::{AdmitDecision, DrainReport, DrainStage, DrainState};
 pub use errors::{
-    SendObservedUntilError, SuperviseError, ThreadedRuntimeError, ThreadedSendObservedError,
-    ThreadedTrySendError,
+    RegisterBootstrapError, SendObservedUntilError, SuperviseError, ThreadedRegisterBootstrapError,
+    ThreadedRuntimeError, ThreadedSendObservedError, ThreadedTrySendError,
+};
+pub use full_handling::{
+    FullDecision, FullExhaustionReason, FullHandling, FullHandlingReport, FullHandlingToken,
+    FullPolicyMode,
 };
 pub use host_burst::{HostBurstOutcomes, HostBurstSnapshot, HostBurstWaitError};
+pub use local_permit::{
+    LocalPermitFull, LocalPermitGate, LocalPermitName, LocalPermitReleaseError, LocalPermitReport,
+    Permit, dropped_permit_count,
+};
 pub use local_system::{
     LocalMultiShardSystem, LocalMultiShardSystemShutdown, LocalSystem, LocalSystemConfig,
     LocalSystemConfigError, LocalSystemMultiShardBuilder, LocalSystemShutdown,
@@ -864,6 +876,58 @@ where
         );
 
         Address::new_with_generation(address.shard, address.isolate, address.generation)
+    }
+
+    /// Registers one isolate and prefills its mailbox with `bootstrap` so the
+    /// first delivered message is always `bootstrap`.
+    ///
+    /// The mailbox is allocated, `bootstrap` is admitted via the mailbox's
+    /// own `try_send`, and only then is the isolate entry inserted into the
+    /// registry. If the prefill fails, no entry is created and no address is
+    /// returned. There is no cleanup-after-registration path.
+    ///
+    /// Honesty:
+    /// - the returned address may have a full mailbox until `bootstrap` is
+    ///   delivered. Sending immediately after this call can see `Full`.
+    /// - bootstrap delivery is an ordinary trace-visible mailbox event.
+    /// - there is no special lifecycle callback.
+    #[allow(private_bounds, clippy::type_complexity)]
+    pub fn register_with_capacity_and_bootstrap<I, Outbound>(
+        &mut self,
+        isolate: I,
+        mailbox_capacity: usize,
+        bootstrap: I::Message,
+    ) -> Result<Address<I::Message, I::Reply>, RegisterBootstrapError<I::Message>>
+    where
+        I: Isolate<Shard = S, Send = TinaOutbound<Outbound>> + 'static,
+        I::Message: 'static,
+        I::Reply: 'static,
+        I::Spawn: IntoErasedSpawn<S, F> + 'static,
+        I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
+        I::Call: IntoErasedCall<I::Message> + 'static,
+        Outbound: 'static,
+    {
+        let mailbox = self
+            .mailbox_factory
+            .create::<Box<dyn Any>>(mailbox_capacity);
+        let adapter = AnyMailboxAdapter { mailbox };
+        let boxed: Box<dyn Any> = Box::new(bootstrap);
+        if let Err(err) = adapter.try_send_boxed(boxed) {
+            let recover = |b: Box<dyn Any>| {
+                *b.downcast::<I::Message>()
+                    .expect("bootstrap message type recovered from boxed Any")
+            };
+            return Err(match err {
+                TrySendError::Full(b) => RegisterBootstrapError::Full(recover(b)),
+                TrySendError::Closed(b) => RegisterBootstrapError::Closed(recover(b)),
+            });
+        }
+        let address = self.register_entry::<I, Outbound>(isolate, None, Box::new(adapter));
+        Ok(Address::new_with_generation(
+            address.shard,
+            address.isolate,
+            address.generation,
+        ))
     }
 
     /// Registers one isolate; constructor receives its own typed address.
@@ -3546,6 +3610,45 @@ where
         );
 
         Address::new_with_generation(address.shard, address.isolate, address.generation)
+    }
+
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn register_sendable_with_capacity_and_bootstrap<I, Outbound>(
+        &mut self,
+        isolate: I,
+        mailbox_capacity: usize,
+        bootstrap: I::Message,
+    ) -> Result<Address<I::Message, I::Reply>, RegisterBootstrapError<I::Message>>
+    where
+        I: Isolate<Shard = S, Send = TinaOutbound<Outbound>> + 'static,
+        I::Message: 'static,
+        I::Reply: Send + 'static,
+        I::Spawn: IntoErasedSpawn<S, F> + 'static,
+        I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
+        I::Call: IntoErasedCall<I::Message> + 'static,
+        Outbound: Send + 'static,
+    {
+        let mailbox = self
+            .mailbox_factory
+            .create::<Box<dyn Any>>(mailbox_capacity);
+        let adapter = AnyMailboxAdapter { mailbox };
+        let boxed: Box<dyn Any> = Box::new(bootstrap);
+        if let Err(err) = adapter.try_send_boxed(boxed) {
+            let recover = |b: Box<dyn Any>| {
+                *b.downcast::<I::Message>()
+                    .expect("bootstrap message type recovered from boxed Any")
+            };
+            return Err(match err {
+                TrySendError::Full(b) => RegisterBootstrapError::Full(recover(b)),
+                TrySendError::Closed(b) => RegisterBootstrapError::Closed(recover(b)),
+            });
+        }
+        let address = self.register_sendable_entry::<I, Outbound>(isolate, None, Box::new(adapter));
+        Ok(Address::new_with_generation(
+            address.shard,
+            address.isolate,
+            address.generation,
+        ))
     }
 
     fn register_sendable_entry<I, Outbound>(

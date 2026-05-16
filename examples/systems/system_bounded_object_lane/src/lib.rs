@@ -4,7 +4,8 @@ use std::time::Duration;
 
 use tina::prelude::*;
 use tina_runtime::{
-    CallError, CallOutcome, DefaultThreadedMailboxFactory, SleepReply, ThreadedRuntime, sleep,
+    CallError, CallOutcome, DefaultThreadedMailboxFactory, LocalPermitGate, LocalPermitName,
+    Permit, SleepReply, ThreadedRuntime, sleep,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -74,6 +75,7 @@ enum LaneMsg {
     PutFinished {
         request: RequestContext<LaneReply>,
         key: String,
+        permit: Permit,
         result: WorkResult,
     },
     Stats,
@@ -88,12 +90,14 @@ enum WorkBackend {
 }
 
 struct ObjectLane {
-    max_in_flight: usize,
+    /// Fixed-capacity admission gate for the lane. "Local" here means: not a
+    /// pool, no waiters queue, no auto-release; the permit travels with the
+    /// continuation and the release point is structural.
+    gate: LocalPermitGate,
     backend: WorkBackend,
     accepted: usize,
     busy: usize,
     completed: usize,
-    in_flight: usize,
 }
 
 #[tina_runtime::isolate(message = LaneMsg, reply = LaneReply)]
@@ -108,9 +112,13 @@ impl ObjectLane {
             LaneMsg::PutFinished {
                 request,
                 key,
+                permit,
                 result,
             } => {
-                self.in_flight = self.in_flight.saturating_sub(1);
+                let _ = self
+                    .gate
+                    .release(permit)
+                    .expect("permit released exactly once by PutFinished");
                 match result {
                     Ok(()) => {
                         self.completed += 1;
@@ -124,33 +132,38 @@ impl ObjectLane {
 
     fn handle_call(&mut self, msg: LaneMsg, call: CallContext<'_, Self>) -> Effect<Self> {
         match msg {
-            LaneMsg::Put { key } => {
-                if self.in_flight >= self.max_in_flight {
+            LaneMsg::Put { key } => match self.gate.try_admit() {
+                Err(full) => {
                     self.busy += 1;
-                    return call.reply(LaneReply::Busy {
-                        in_flight: self.in_flight,
-                        cap: self.max_in_flight,
-                    });
+                    let report = full.report();
+                    call.reply(LaneReply::Busy {
+                        in_flight: report.current,
+                        cap: report.capacity,
+                    })
                 }
-
-                self.in_flight += 1;
-                self.accepted += 1;
-                match &self.backend {
-                    WorkBackend::FakeSleep { work } => call.defer(sleep(*work)).reply(
-                        move |request, result| LaneMsg::PutFinished {
-                            request,
-                            key,
-                            result: sleep_to_work_result(result),
-                        },
-                    ),
+                Ok(permit) => {
+                    self.accepted += 1;
+                    match &self.backend {
+                        WorkBackend::FakeSleep { work } => call.defer(sleep(*work)).reply(
+                            move |request, result| LaneMsg::PutFinished {
+                                request,
+                                key,
+                                permit,
+                                result: sleep_to_work_result(result),
+                            },
+                        ),
+                    }
                 }
+            },
+            LaneMsg::Stats => {
+                let report = self.gate.report();
+                call.reply(LaneReply::Stats(LaneStats {
+                    accepted: self.accepted,
+                    busy: self.busy,
+                    completed: self.completed,
+                    in_flight: report.current,
+                }))
             }
-            LaneMsg::Stats => call.reply(LaneReply::Stats(LaneStats {
-                accepted: self.accepted,
-                busy: self.busy,
-                completed: self.completed,
-                in_flight: self.in_flight,
-            })),
             LaneMsg::PutFinished { .. } => call.reject(tina::CallRejectedReason::UnsupportedMessage),
         }
     }
@@ -164,14 +177,14 @@ pub fn run(config: RunConfig) -> anyhow::Result<RunReport> {
     let lane = runtime
         .register_with_capacity::<_, std::convert::Infallible>(
             ObjectLane {
-                max_in_flight: config.lane_in_flight,
+                gate: LocalPermitGate::with_capacity(config.lane_in_flight)
+                    .named(LocalPermitName("object_lane")),
                 backend: WorkBackend::FakeSleep {
                     work: Duration::from_millis(config.work_ms),
                 },
                 accepted: 0,
                 busy: 0,
                 completed: 0,
-                in_flight: 0,
             },
             config.lane_mailbox,
         )
@@ -197,7 +210,7 @@ fn drive_callers(
     let call_timeout = Duration::from_millis(config.call_timeout_ms);
 
     for n in 0..config.callers {
-        let rt = Arc::clone(&runtime);
+        let rt = Arc::clone(runtime);
         let gate = Arc::clone(&barrier);
         let out = Arc::clone(&outcomes);
         threads.push(thread::spawn(move || {
