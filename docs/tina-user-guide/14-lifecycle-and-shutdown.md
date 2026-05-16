@@ -131,23 +131,30 @@ self.pending_stop = Some(call.into_request_context());
 
 `DrainState` does not close resources, choose ordering, or hide messages.
 It is small state plus a report. Resource close still belongs to the
-service. `examples/systems/system_metrics_shipper` is the worked example.
+service. `examples/systems/system_metrics_shipper` is the worked example
+for an internal service that owns its own in-flight work;
+`examples/systems/mini_saas_api` is the worked example for a host-driven
+HTTP service where the controller publishes drain stage + admit counters in
+its `/debug/capacity` report and the host closes the surrounding resources.
 
 ## Service Shutdown Skeleton
 
 `examples/systems/mini_saas_api` has the current copyable local-service
 shutdown order:
 
-1. Mark public ingress closed in the controller so new service work is rejected.
+1. Begin the controller `DrainState` so admission flips to `Stopping`.
 2. Let an already-admitted notify request finish with a typed reply while
    later public work is rejected as `ingress_stopped`.
 3. Probe `/ready` and surface `ingress_stopped`.
-4. Close the SQLite bridge admission with its closer.
-5. Probe `/ready` and surface `db_closed`.
-6. Call `shutdown_keepalive_pool(..., CloseMode::Drain, ...)` for the outbound
+4. Send one post-drain POST and prove the typed `503 ingress_stopped`
+   response. Probe `/debug/capacity` and surface `drain.stage=draining`
+   plus a non-zero `drain.admits_after_drain` counter.
+5. Close the SQLite bridge admission with its closer.
+6. Probe `/ready` and surface `db_closed`.
+7. Call `shutdown_keepalive_pool(..., CloseMode::Drain, ...)` for the outbound
    pool.
-7. Stop the private notification listener.
-8. Stop the public listener, then shutdown the runtime and inspect
+8. Stop the private notification listener.
+9. Stop the public listener, then shutdown the runtime and inspect
    trace/capacity facts.
 
 The exact smoke command is:
