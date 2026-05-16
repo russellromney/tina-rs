@@ -15,14 +15,18 @@ Tina truth still stays visible:
 - a host call is still a normal Tina call;
 - shutdown order is still service policy;
 - `Full`, `Closed`, `Timeout`, stale address, and worker stopped stay typed;
+- host-control command admission cannot block forever behind a full worker
+  command queue;
 - no helper hides drain ordering, retries, cancellation, or resource close.
 
 ## Ship
 
-Ship two host-control surfaces:
+Ship two host-control surfaces and tighten one existing one:
 
 1. `ThreadedMultiShardRuntime::call_blocking(...)`.
 2. `ThreadedShutdownHandle` for threaded runtimes.
+3. Existing `ThreadedRuntime::call_blocking(...)` gets the same bounded
+   command-admission behavior as the multi-shard helper.
 
 Also migrate one sharded system/specimen and one shutdown-heavy system/specimen.
 
@@ -45,7 +49,8 @@ No `tina` trait-crate changes in this phase.
 
 ## Rock 1 - Multi-Shard Host Call
 
-Add a host call helper for threaded multi-shard runtimes.
+Add a host call helper for threaded multi-shard runtimes, and make the existing
+single-shard host call obey the same command-admission rule.
 
 Copied public shape:
 
@@ -62,9 +67,12 @@ Result<CallOutcome<R>, ThreadedRuntimeError>
 Behavior:
 
 - route the temporary host-call driver to `addr.shard()`;
+- admit the host-control command with a bounded/nonblocking command-queue path;
 - issue the normal Tina `call(addr, msg, timeout)` from that driver;
 - wait on the host thread for the same timeout;
 - return `CallOutcome::{Replied, Full, Closed, Timeout, Rejected}`;
+- return `ThreadedRuntimeError::CommandFull` if the worker command queue cannot
+  accept the host-control command immediately;
 - return `ThreadedRuntimeError::WorkerStopped` if the target shard worker is
   gone before the host call can be driven;
 - panic on unknown shard, matching current `ThreadedMultiShardRuntime`
@@ -88,9 +96,21 @@ Proof:
 - target stopped/stale generation returns `CallOutcome::Closed`;
 - target rejects unsupported call shape returns `CallOutcome::Rejected`;
 - callee holds caller past timeout and host returns `CallOutcome::Timeout`;
+- full worker command queue returns `ThreadedRuntimeError::CommandFull` instead
+  of blocking past the timeout;
 - failed/stopped shard returns `ThreadedRuntimeError::WorkerStopped`;
 - unknown address shard panics like `try_send` / `observe_result`;
+- existing single-shard `ThreadedRuntime::call_blocking` also returns
+  `ThreadedRuntimeError::CommandFull` when its worker command queue is full;
 - no one-off tracker isolate remains in the migrated sharded specimen.
+
+Compatibility:
+
+- add `ThreadedRuntimeError::CommandFull`;
+- this is a visible behavior improvement for existing single-shard
+  `call_blocking`: full command queue becomes a typed error instead of a
+  possible host hang;
+- do not rename existing `ThreadedTrySendError::IngressFull` in this phase.
 
 Migration:
 
