@@ -19,8 +19,15 @@ use tina::prelude::*;
 use tina_runtime::{MailboxFactory, RuntimeCall, ThreadedRuntime, sleep};
 use tokio::runtime::Handle;
 use tokio::sync::oneshot;
+#[cfg(feature = "tracing")]
+use tracing::{Level, event};
 
 use crate::sqs_metrics::{SqsMetricsHandle, SqsMetricsInner};
+
+#[cfg(feature = "tracing")]
+const TRACE_TARGET_CALL: &str = "tina_aws.bridge.call";
+#[cfg(feature = "tracing")]
+const TRACE_TARGET_BRIDGE: &str = "tina_aws.bridge";
 use crate::sqs_types::{
     SqsConfig, SqsConfigError, SqsDeletedMessage, SqsError, SqsMessage, SqsReceivedMessages,
     SqsRequest, SqsResponse, SqsSentMessage,
@@ -71,6 +78,14 @@ pub struct SqsCloser {
 impl SqsCloser {
     /// Mark the bridge closed. Idempotent.
     pub fn close(&self) {
+        #[cfg(feature = "tracing")]
+        {
+            let was_closed = self.closed.swap(true, Ordering::AcqRel);
+            if !was_closed {
+                event!(target: TRACE_TARGET_BRIDGE, Level::DEBUG, kind = "close");
+            }
+        }
+        #[cfg(not(feature = "tracing"))]
         self.closed.store(true, Ordering::Release);
     }
 
@@ -258,14 +273,39 @@ impl<S: Shard + 'static> SqsWorker<S> {
         let request_kind = request.kind();
         if self.closed.load(Ordering::Acquire) {
             self.metrics.closed.fetch_add(1, Ordering::Relaxed);
+            #[cfg(feature = "tracing")]
+            event!(
+                target: TRACE_TARGET_CALL,
+                Level::WARN,
+                kind = "admission_rejected",
+                reason = "Closed",
+                request_kind,
+            );
             return Self::complete_request(request_context, Err(SqsError::Closed));
         }
         if let Err(err) = validate_request(&request, &self.config) {
             tally_admission_error(&self.metrics, &err);
+            #[cfg(feature = "tracing")]
+            event!(
+                target: TRACE_TARGET_CALL,
+                Level::WARN,
+                kind = "admission_rejected",
+                reason = admission_reason(&err),
+                request_kind,
+                detail = %err,
+            );
             return Self::complete_request(request_context, Err(err));
         }
         if self.in_flight.len() >= self.config.max_in_flight {
             self.metrics.full.fetch_add(1, Ordering::Relaxed);
+            #[cfg(feature = "tracing")]
+            event!(
+                target: TRACE_TARGET_CALL,
+                Level::WARN,
+                kind = "admission_rejected",
+                reason = "Full",
+                request_kind,
+            );
             return Self::complete_request(request_context, Err(SqsError::Full));
         }
 
@@ -307,6 +347,14 @@ impl<S: Shard + 'static> SqsWorker<S> {
         self.metrics.note_admit_kind(request_kind);
         self.metrics.set_in_flight(in_flight);
         self.metrics.note_in_flight(in_flight);
+        #[cfg(feature = "tracing")]
+        event!(
+            target: TRACE_TARGET_CALL,
+            Level::DEBUG,
+            kind = "admitted",
+            request_kind,
+            in_flight,
+        );
         sleep(self.config.poll_interval).then(move |_| SqsMsg::Poll(id))
     }
 
@@ -325,6 +373,13 @@ impl<S: Shard + 'static> SqsWorker<S> {
                 {
                     in_flight.abandoned.store(true, Ordering::Release);
                     self.metrics.timeouts.fetch_add(1, Ordering::Relaxed);
+                    #[cfg(feature = "tracing")]
+                    event!(
+                        target: TRACE_TARGET_CALL,
+                        Level::WARN,
+                        kind = "timeout",
+                        request_kind = in_flight.request_kind,
+                    );
                     let request_context = in_flight.request_context.take();
                     self.in_flight.insert(id, in_flight);
                     return batch(vec![
@@ -646,6 +701,15 @@ fn tally_admission_error(metrics: &SqsMetricsInner, err: &SqsError) {
         SqsError::InvalidRequest(_) => metrics.invalid.fetch_add(1, Ordering::Relaxed),
         _ => metrics.invalid.fetch_add(1, Ordering::Relaxed),
     };
+}
+
+#[cfg(feature = "tracing")]
+fn admission_reason(err: &SqsError) -> &'static str {
+    match err {
+        SqsError::MessageTooLarge => "MessageTooLarge",
+        SqsError::InvalidRequest(_) => "InvalidRequest",
+        _ => "Invalid",
+    }
 }
 
 fn tally_terminal(metrics: &SqsMetricsInner, result: &SqsResult) {

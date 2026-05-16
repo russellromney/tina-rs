@@ -133,10 +133,25 @@
 //!
 //! # Close
 //!
-//! [`ReqwestCloser::close`] is a graceful drain: new sends reply
-//! [`ReqwestError::Closed`], in-flight requests run to natural
-//! completion (or hit their per-attempt timeout). To force-cancel
+//! [`ReqwestCloser::close`] flips the worker into the closed state:
+//! new sends reply [`ReqwestError::Closed`] at admission. Already
+//! spawned reqwest tasks continue to natural completion or their
+//! per-attempt timeout — `close` does **not** wait for them and the
+//! bridge does not ship a bounded drain helper. To force-cancel
 //! in-flight work, drop the hosting Tina runtime.
+//!
+//! # Supplied client
+//!
+//! [`ReqwestWorker::with_supplied_client`] wraps a caller-built
+//! `reqwest::Client` and Tokio runtime handle. The supplied client
+//! owns redirect policy, the reqwest `Client::timeout`, connection
+//! reuse, TLS config, and proxy settings; the bridge does **not**
+//! re-apply [`ReqwestConfig`]'s redirect or client-level fields to
+//! it. The bridge still enforces its own per-attempt deadline
+//! (`request.timeout.unwrap_or(config.default_timeout)`) via
+//! `tokio::time::timeout(...)` on every attempt, so set the supplied
+//! client's `Client::timeout` to a value at least as large. The
+//! caller's Tokio runtime is never shut down by the bridge.
 //!
 //! # Retry
 //!
