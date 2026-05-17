@@ -1,7 +1,7 @@
 [workspace]
 
 [package]
-name = "system-realtime-rooms"
+name = "system-live-replay-bugbox"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
@@ -10,12 +10,7 @@ publish = false
 
 [dependencies]
 anyhow = "1"
-http = { version = "1", default-features = false, features = ["std"] }
 tina = { path = "../../../tina" }
-tina-http = { path = "../../../tina-http" }
 tina-runtime = { path = "../../../tina-runtime" }
-# Used by the in-crate run scenarios as a real WebSocket smoke client.
-tungstenite = "0.29"
-
-[dev-dependencies]
+tina-sim = { path = "../../../tina-sim" }
 tina-proof-harness = { path = "../../../tina-proof-harness" }

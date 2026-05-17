@@ -91,6 +91,58 @@ pub fn run(mode: RunMode) -> anyhow::Result<RunReport> {
     tina_impl::run(mode)
 }
 
+/// Tunables for [`run_soak`].
+#[derive(Debug, Clone, Copy)]
+pub struct SoakConfig {
+    /// Concurrent client workers hitting the service.
+    pub workers: usize,
+    /// Total number of ops to drive across all workers.
+    pub op_count: u64,
+    /// Per-request connect timeout for the harness clients.
+    pub connect_timeout: std::time::Duration,
+}
+
+impl Default for SoakConfig {
+    fn default() -> Self {
+        Self {
+            workers: 4,
+            op_count: 200,
+            connect_timeout: std::time::Duration::from_secs(2),
+        }
+    }
+}
+
+/// Aggregate report from one [`run_soak`] invocation.
+#[derive(Debug, Clone)]
+pub struct SoakReport {
+    /// Typed load summary from the harness (latency, ok/err/timeout, leak).
+    pub load: tina_proof_harness::LoadReport,
+    /// `/debug/capacity` line captured after the load run, before shutdown.
+    pub capacity_after_load_line: String,
+    /// Terminal shutdown line (same shape as `RunReport::terminal_line`).
+    pub terminal_line: String,
+    /// `true` if the runtime drained cleanly (no in-flight leaks, no
+    /// outbound failures, capacity surfaces accounted for).
+    pub shutdown_clean: bool,
+}
+
+impl SoakReport {
+    pub fn summary_line(&self) -> String {
+        format!(
+            "soak {} shutdown_clean={} capacity={{{}}}",
+            self.load.summary_line(),
+            self.shutdown_clean,
+            self.capacity_after_load_line,
+        )
+    }
+}
+
+/// Drive a small load/soak workload against the service and report a
+/// typed [`SoakReport`].
+pub fn run_soak(config: SoakConfig) -> anyhow::Result<SoakReport> {
+    tina_impl::run_soak(config)
+}
+
 pub fn one_request(addr: SocketAddr, request: &[u8]) -> anyhow::Result<ResponseParts> {
     let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(2))?;
     stream.set_read_timeout(Some(Duration::from_secs(3)))?;

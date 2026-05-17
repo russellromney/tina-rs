@@ -1,0 +1,18 @@
+[package]
+name = "tina-proof-harness"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Small proof harnesses for Tina specimens: load/soak, bad-peer, live trace capture."
+repository = "https://github.com/russellromney/tina-rs"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+tina-runtime = { path = "../tina-runtime" }
+tina-sim = { path = "../tina-sim" }
+
+[dev-dependencies]
+tina = { path = "../tina" }

@@ -9,6 +9,7 @@ members = [
     "tina-reqwest-bridge",
     "tina-sqlite-bridge",
     "tina-sqlx-bridge",
+    "tina-proof-harness",
     "tina-rpc-tokio",
     "tina-runtime",
     "tina-sim",

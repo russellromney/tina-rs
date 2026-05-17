@@ -113,8 +113,39 @@ text.
 Run the system smoke from the repo root:
 
 ```sh
-cargo test --manifest-path examples/systems/mini_saas_api/Cargo.toml
+# Full system smoke (scripted scenarios + capacity assertions):
+cargo test --manifest-path examples/systems/mini_saas_api/Cargo.toml --test smoke
+
+# Load/soak proof (Phase 108) with typed capacity contract:
+cargo test --manifest-path examples/systems/mini_saas_api/Cargo.toml --test soak -- --nocapture
 ```
+
+The soak proof drives 4 workers × 200 mixed-read ops via
+`tina_proof_harness::load` and prints one summary line shaped like:
+
+```text
+soak load label=mini_saas_api_soak workers=4 ops=200 ok=158 err=42 \
+  timeout=0 p50_us=643 p99_us=2377 max_us=2957 elapsed_ms=43 \
+  leak_clean=true shutdown_clean=true capacity={ ... db.full=42 ... }
+```
+
+The contract: every harness 5xx must map to a typed `db.full` event on
+the controller's `/debug/capacity` line (`db.full >= ops_err`). If the
+two diverge, the test fails closed because pressure is escaping the
+typed surface — the central proof Phase 108 exists to make easy.
+
+What this exposes when it fails:
+
+- `ops_timeout > 0` → transport hung; the listener or connection
+  drain path stopped accepting work mid-load.
+- `leak_clean=false` → the load harness's leak hook returned false
+  (currently unused but reserved for future capacity-snapshot probes).
+- `db.full < ops_err` → some other pressure path (controller mailbox,
+  body parser, outbound pool) is returning 5xx without a matching
+  typed event. That is the hidden-pressure regression the soak is
+  designed to catch.
+- `shutdown_clean=false` → the keepalive pool drained dirty (leaked
+  in-flight, timed out, or hit `connection_failures`).
 
 Run the documented executable smoke:
 

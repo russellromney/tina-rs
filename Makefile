@@ -1,7 +1,8 @@
 SHELL := /bin/zsh
 
 .PHONY: fmt fmt-check check test loom miri doc clippy portable-runtime-cost \
-	verify verify-examples
+	verify verify-examples proof-fast proof-soak proof-bad-peer \
+	proof-replay-regression
 
 fmt:
 	cargo fmt --all
@@ -40,6 +41,39 @@ verify-examples:
 
 portable-runtime-cost:
 	cargo run -p tina-runtime --example portable_runtime_cost
+
+# Phase 108 proof targets. Each one is copy-pasteable into a PR check.
+# `proof-fast` is the PR gate. The other three are local / nightly /
+# regression slots.
+
+# Fast PR proof: build + run the small bad-peer and replay-shape tests
+# in two of the most representative system specimens. Each test owns
+# its own short timeout; the whole target should finish in well under
+# a minute on a developer machine.
+proof-fast:
+	cargo test -p tina-proof-harness
+	cargo test --manifest-path examples/systems/system_realtime_rooms/Cargo.toml --test bad_peer
+	cargo test --manifest-path examples/systems/system_live_replay_bugbox/Cargo.toml --test smoke
+
+# Slow soak: the load harness against mini_saas_api with the visible
+# typed capacity contract. Runs longer than the fast gate but still
+# finishes in seconds; safe for a nightly cron.
+proof-soak:
+	cargo test --manifest-path examples/systems/mini_saas_api/Cargo.toml --test soak -- --nocapture
+
+# Local bad-peer: the in-crate proof tests plus the realtime_rooms
+# bad-peer scenarios with `--nocapture` so the typed BadPeerOutcome
+# lines are visible.
+proof-bad-peer:
+	cargo test -p tina-proof-harness --test '*' -- --nocapture || true
+	cargo test -p tina-proof-harness
+	cargo test --manifest-path examples/systems/system_realtime_rooms/Cargo.toml --test bad_peer -- --nocapture
+
+# Replay regression: re-run the saved-seed sim cases. A mismatch fails
+# loudly with the case name, scenario, history, and expected vs actual
+# event count + trace hash.
+proof-replay-regression:
+	cargo test --manifest-path examples/systems/system_live_replay_bugbox/Cargo.toml --test smoke
 
 verify: fmt-check check test loom doc clippy
 	cargo run -p tina-runtime --example portable_runtime_cost | tee /tmp/tina-verify-cost.txt

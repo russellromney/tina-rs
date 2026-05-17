@@ -39,9 +39,42 @@ entry in `examples/systems/README.md` for `system_realtime_rooms`.
 ## Run
 
 ```
-cargo test --manifest-path examples/systems/system_realtime_rooms/Cargo.toml
+# Smoke (join + tick, overflow, shutdown):
+cargo test --manifest-path examples/systems/system_realtime_rooms/Cargo.toml --test smoke
+
+# Bad-peer + slow-reader proof (Phase 108):
+cargo test --manifest-path examples/systems/system_realtime_rooms/Cargo.toml --test bad_peer -- --nocapture
+
+# Lint:
 cargo clippy --manifest-path examples/systems/system_realtime_rooms/Cargo.toml --tests -- -D warnings
 ```
+
+The `bad_peer` proof drives four typed HTTP bad-peer scenarios from
+`tina_proof_harness` (`ResetImmediately`, `HalfClose`, `MalformedFrame`,
+`StalledReader`) against the listener, then runs one real WebSocket
+slow-reader scenario that proves the room evicts the silent peer via
+the typed `left_idle` counter, then proves a fresh good client can
+still join + see ticks. Expected output ends with one summary line:
+
+```text
+bad_peer label=reset       connected=true ... server_closed=false ...
+bad_peer label=half_close  connected=true ... server_closed=true  ...
+bad_peer label=malformed   connected=true ... server_closed=true  ...
+bad_peer label=stalled_reader_no_upgrade connected=true ... server_closed=true ...
+room.summary live=1 joined=2 left_idle=1 left_slow=0 left_peer=0 \
+  presence_ticks=13 shutdown_started=false
+```
+
+What this exposes when it fails:
+
+- The harness lines tell you which transport story broke. `connected=false`
+  → listener stopped accepting. `server_closed=false` on the half-close /
+  malformed cases → the server is treating bad input as an open session.
+- `left_idle=0` after the slow-reader window → the recurring tick is
+  not aging out silent peers, which means the bounded member table
+  leaks under realistic slow-client load.
+- `live=N` with N > 0 → the room kept the slow peer alive in its
+  member table, which would cap-block subsequent joiners.
 
 The smoke covers three scenarios end-to-end:
 
@@ -121,6 +154,13 @@ Suggested follow-up:
 - Consider an app-injectable typed variant on `WebSocketSessionMsg` so
   recurring app-level messages do not have to ride on `Text("__...")`
   prefixes.
+- The bad-peer proof tried to reach `OutboundQueueFull` via a real WS
+  slow reader and could not within the deterministic window — kernel
+  TCP send buffers are large on loopback. The proof falls back on the
+  room's own typed `left_idle` counter, which is deterministic. If a
+  later change makes the connection report `OutboundQueueFull` for
+  real slow peers, the proof should be widened to assert `left_slow`
+  too.
 
 Verdict:
 
