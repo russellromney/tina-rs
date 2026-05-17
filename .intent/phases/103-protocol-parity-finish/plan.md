@@ -98,6 +98,20 @@ Add simulator/runtime events for the protocol facts users debug:
 
 Stable trace hashes must not churn for unrelated effects.
 
+## User Proof
+
+Update these proof surfaces:
+
+- `specimen_grpc_counter`: unary, server stream, client stream, bidi stream,
+  with tonic/grpcurl interop commands.
+- `specimen_websocket_room`: extracted room helper, browser-style `ws` and
+  `wss`, slow peer, ping/pong, close.
+- `examples/systems/system_realtime_rooms`: production WebSocket shape with
+  smoke, slow-peer/load proof, and findings update.
+
+Every updated README must show the copied command, what external client was
+used, what Tina proves, and what still felt rough.
+
 ## Required Proof
 
 - `cargo fmt --all --check`
@@ -106,6 +120,7 @@ Stable trace hashes must not churn for unrelated effects.
 - gRPC interop tests against tonic/grpcurl for each claimed mode.
 - WebSocket browser or browser-like test for `ws` and `wss`.
 - WebSocket bad-peer tests: malformed frame, reset, idle, slow reader, close.
+- System smoke and load/bad-peer proof for `system_realtime_rooms`.
 - No hidden unbounded collection in protocol paths.
 - At least one DST replay case for a protocol pressure/lifecycle bug.
 

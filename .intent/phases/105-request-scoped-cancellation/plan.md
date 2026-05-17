@@ -106,6 +106,20 @@ call_ctx
 The helper first admits storage, then returns the child effect. Failed admission
 returns the authority/effect pair so the service can answer deliberately.
 
+## User Proof
+
+Update these proof surfaces:
+
+- `mini_saas_api`: client disconnect or request timeout cancels DB/outbound/timer
+  child work and returns visible late-result facts.
+- `system_media_ingest_pipeline`: streaming upload cancel stops Tina-owned
+  body/process work and cleans caps.
+- `system_job_queue`: request-scope cancel cancels queued/running waits and
+  proves fill-cancel-refill.
+
+Each README must show: request went away, these children were cancelled, these
+external tasks may still finish late.
+
 ## Required Proof
 
 - Fill-cancel-refill proves capacity is reclaimed.
@@ -116,6 +130,8 @@ returns the authority/effect pair so the service can answer deliberately.
 - HTTP disconnect cancels DB/outbound/timer children.
 - Owner stop cancels scopes and emits final report.
 - Cross-shard caller/callee keeps cancel cause.
+- System smoke proof for `mini_saas_api`, `system_media_ingest_pipeline`, and
+  `system_job_queue` cancel paths.
 - DST case for a scope with at least two child rails.
 
 ## Done Means

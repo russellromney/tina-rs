@@ -94,6 +94,19 @@ Add `#[diagnostic::on_unimplemented]` or equivalent friendly compile errors for:
 
 Trybuild tests must pin the good messages.
 
+## User Proof
+
+Add a compile-fail specimen suite:
+
+- wrong public request handled only in internal `handle`
+- internal continuation sent from outside
+- callable request sent through send-only handle
+- missing required config cap in typed builder
+- invalid WebSocket/gRPC/body state transition inside crate tests
+
+Update one real system to the new default authoring path and remove old
+escape-hatch imports. The README must say what the compiler now catches.
+
 ## Required Proof
 
 - User-style compile-fail tests for wrong `handle` vs `handle_call`.
@@ -101,6 +114,7 @@ Trybuild tests must pin the good messages.
 - Compile-fail tests for missing config caps.
 - Runtime tests proving public behavior did not regress.
 - Protocol tests proving impossible states are now unrepresentable internally.
+- One system specimen compiles using the new default public/internal split.
 - Docs show the default path and the escape hatch separately.
 
 ## Done Means
