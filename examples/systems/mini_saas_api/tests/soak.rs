@@ -89,16 +89,20 @@ fn small_steady_load_drains_cleanly_with_only_typed_pressure() {
     );
 
     // The visible number contract: every harness 503 must correspond
-    // to a typed pressure event on the controller (either db.full or
-    // outbound.full). If db.full + outbound.full < err count, the
-    // soak surfaced a 503 with no matching typed pressure event —
-    // i.e. pressure escaped the typed surface. Fail closed.
+    // to a typed pressure event (DB full, outbound-pool full, or the
+    // runtime rejecting a full mailbox/reply path). If the typed
+    // counters do not cover the HTTP errors, pressure escaped the
+    // visible surface. Fail closed.
     let db_full = cap_u64(&cap, "db.full");
     let outbound_full = cap_u64(&cap, "outbound.full");
+    let runtime_full = cap_u64(&cap, "runtime.send_full")
+        + cap_u64(&cap, "runtime.completion_full")
+        + cap_u64(&cap, "runtime.reply_path_full");
     assert!(
-        db_full + outbound_full >= load.ops_err,
+        db_full + outbound_full + runtime_full >= load.ops_err,
         "harness saw {} 5xx but typed pressure only db.full={db_full} \
-         outbound.full={outbound_full}; pressure escaping the typed surface: {}",
+         outbound.full={outbound_full} runtime_full={runtime_full}; \
+         pressure escaping the typed surface: {}",
         load.ops_err,
         report.capacity_after_load_line,
     );

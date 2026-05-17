@@ -128,13 +128,14 @@ The soak proof drives 4 workers × 240 ops across three lanes
 soak load label=mini_saas_api_soak workers=4 ops=240 ok=206 err=34 timeout=0 \
   min_us=422 p50_us=709 p99_us=3305 max_us=3756 elapsed_ms=59 leak_clean=true \
   pressure total=34 rate_per_mille=141 max_consecutive=2 first_err_op=0 by_kind=[http_503:34] \
-  shutdown_clean=true capacity={ ... db.full=34 outbound.full=0 ... }
+  shutdown_clean=true capacity={ ... db.full=34 outbound.full=0 runtime.send_full=0 ... }
 ```
 
 The contract: every harness 5xx must map to a typed pressure event on
-the controller's `/debug/capacity` line — either `db.full` or
-`outbound.full`. If `db.full + outbound.full < ops_err`, the test
-fails closed because pressure is escaping the typed surface. The
+the controller's `/debug/capacity` line or the live runtime pressure
+trace — `db.full`, `outbound.full`, or `runtime.*_full`. If those
+typed counters do not cover `ops_err`, the test fails closed because
+pressure is escaping the typed surface. The
 typed `pressure` summary on the load report (rate, burst length,
 first error position, per-kind breakdown) lets specimens assert
 "pressure stayed under N per mille" or "no burst longer than K
@@ -146,10 +147,9 @@ What this exposes when it fails:
   drain path stopped accepting work mid-load.
 - `leak_clean=false` → the load harness's leak hook returned false
   (currently unused but reserved for future capacity-snapshot probes).
-- `db.full < ops_err` → some other pressure path (controller mailbox,
-  body parser, outbound pool) is returning 5xx without a matching
-  typed event. That is the hidden-pressure regression the soak is
-  designed to catch.
+- `db.full + outbound.full + runtime.*_full < ops_err` → some pressure
+  path is returning 5xx without a matching typed event. That is the
+  hidden-pressure regression the soak is designed to catch.
 - `shutdown_clean=false` → the keepalive pool drained dirty (leaked
   in-flight, timed out, or hit `connection_failures`).
 

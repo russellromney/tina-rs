@@ -21,7 +21,7 @@ use tina_http::{
 use tina_runtime::pool::{WorkerPoolMsg, WorkerPoolReply};
 use tina_runtime::{
     CallOutcome, DefaultThreadedMailboxFactory, DrainStage, DrainState, RuntimeCall, RuntimeEvent,
-    RuntimeEventKind, ThreadedRuntime, call, sleep,
+    RuntimeEventKind, ThreadedRuntime, ThreadedRuntimeConfig, call, sleep,
 };
 use tina_sim::dst::{
     LiveReplayCapture, LiveReplayFact, LiveReplayReport, ReplayCase as DstReplayCase, ReplayConfig,
@@ -1089,7 +1089,16 @@ pub fn run_soak(config: crate::SoakConfig) -> anyhow::Result<crate::SoakReport> 
     let db_path = dir.path().join("mini-saas.sqlite");
     seed_db(&db_path)?;
 
-    let runtime = ThreadedRuntime::new(SingleShard, DefaultThreadedMailboxFactory);
+    let live_trace = tina_proof_harness::LiveTrace::new();
+    let runtime = ThreadedRuntime::with_config_and_trace_observer(
+        SingleShard,
+        DefaultThreadedMailboxFactory,
+        ThreadedRuntimeConfig {
+            idle_wait: Duration::from_millis(1),
+            ..Default::default()
+        },
+        live_trace.observer(),
+    );
     let sqlite = SqliteWorker::<SingleShard>::install(
         &runtime,
         SqliteConfig::path(&db_path)
@@ -1236,7 +1245,14 @@ pub fn run_soak(config: crate::SoakConfig) -> anyhow::Result<crate::SoakReport> 
 
     // Snapshot capacity while the runtime is still up.
     let capacity = crate::get(addr, "/debug/capacity")?;
-    let capacity_after_load_line = format!("capacity_after_load {}", capacity.body);
+    let pressure_after_load = live_trace.pressure_summary();
+    let capacity_after_load_line = format!(
+        "capacity_after_load {} runtime.send_full={} runtime.completion_full={} runtime.reply_path_full={}",
+        capacity.body.trim_end(),
+        pressure_after_load.send_rejected_full,
+        pressure_after_load.completion_rejected_mailbox_full,
+        pressure_after_load.reply_rejected_reply_path_full,
+    );
 
     // Same shutdown sequence as `run`, minus the scripted assertions.
     let db_pressure = sqlite.metrics.pressure_report();

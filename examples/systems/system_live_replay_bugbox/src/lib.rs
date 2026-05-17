@@ -55,7 +55,7 @@ const PRODUCER_ROLE: &str = "producer";
 const SINK_ROLE: &str = "sink";
 
 /// Aggregate output of one specimen run: the live snapshot, the saved
-/// sim case, the live-vs-sim comparison, the seed-sweep discovery, the
+/// sim case, the live pressure snapshot, the seed-sweep discovery, the
 /// shrunk failing history, and a one-line summary suitable for the
 /// system README.
 #[derive(Debug)]

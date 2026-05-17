@@ -9,18 +9,21 @@
 //!
 //! [`LiveTrace`] is that rung. It is a thin `TraceObserver` that
 //! collects [`RuntimeEvent`]s as the runtime emits them. After the
-//! workload, the caller calls [`LiveTrace::snapshot`] to get a
-//! [`TraceShape`] (event_count, `stable_trace_hash`) and can compare it
-//! against a saved case via [`LiveTrace::compare_to`].
+//! workload, the caller calls [`LiveTrace::snapshot`] to get a live
+//! [`TraceShape`] (event_count, `stable_trace_hash`). A live runtime trace
+//! is not the same thing as a simulator trace. To make a live finding
+//! replayable, materialize the important facts into a
+//! [`tina_sim::dst::LiveReplayCapture`] and check it with
+//! [`tina_sim::dst::check_captured_replay`].
 //!
 //! Two rules the rung enforces:
 //!
 //! 1. The observer never blocks. It pushes into a `Mutex<Vec<_>>` and
 //!    returns; if the user wants async drain, they pull events out.
 //! 2. The snapshot computes the trace hash using the same
-//!    [`tina_runtime::stable_trace_hash`] the sim side uses, so a
-//!    sim-vs-live trace shape comparison is a byte-for-byte equal of
-//!    the same hash function.
+//!    [`tina_runtime::stable_trace_hash`] the sim side uses. The hash is
+//!    a fingerprint of this live trace, not a claim that the live event
+//!    stream is byte-identical to a simulator run.
 
 use std::sync::{Arc, Mutex};
 
@@ -110,26 +113,28 @@ impl LiveTrace {
         PressureSummary::from_events(guard.iter())
     }
 
-    /// Compare the live shape to a saved [`tina_sim::dst::ReplayCase`]
-    /// without running the simulator side again. Returns `None` when
-    /// the saved expected shape matches the live shape, otherwise
-    /// returns a [`LiveReplayMismatch`] naming the diverging field(s).
-    pub fn compare_to<Op>(
+    /// Compare the current live trace shape to a previously saved live
+    /// shape. This is useful for same-runtime regression checks.
+    ///
+    /// Do not use this for live-to-simulator replay. Live replay needs a
+    /// materialized capture (`LiveReplayCapture`) because simulator traces
+    /// and live runtime traces are not expected to have the same full event
+    /// stream.
+    pub fn compare_live_shape(
         &self,
-        case: &tina_sim::dst::ReplayCase<Op>,
+        expected: TraceShape,
+        label: &'static str,
     ) -> Option<LiveReplayMismatch> {
-        let shape = self.snapshot();
-        if shape.event_count == case.expected_event_count
-            && shape.trace_hash == case.expected_trace_hash
-        {
+        let actual = self.snapshot();
+        if actual == expected {
             return None;
         }
         Some(LiveReplayMismatch {
-            case_name: case.name,
-            expected_event_count: case.expected_event_count,
-            actual_event_count: shape.event_count,
-            expected_trace_hash: case.expected_trace_hash,
-            actual_trace_hash: shape.trace_hash,
+            label,
+            expected_event_count: expected.event_count,
+            actual_event_count: actual.event_count,
+            expected_trace_hash: expected.trace_hash,
+            actual_trace_hash: actual.trace_hash,
         })
     }
 }
@@ -157,7 +162,7 @@ impl TraceObserver for LiveTraceObserver {
 /// Why a live shape did not match a saved case.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LiveReplayMismatch {
-    pub case_name: &'static str,
+    pub label: &'static str,
     pub expected_event_count: usize,
     pub actual_event_count: usize,
     pub expected_trace_hash: u64,
@@ -180,7 +185,7 @@ impl std::fmt::Display for LiveReplayMismatch {
             f,
             "live trace shape for `{}` diverged from saved case: \
              events expected {} got {}{}; hash expected 0x{:016x} got 0x{:016x}{}",
-            self.case_name,
+            self.label,
             self.expected_event_count,
             self.actual_event_count,
             if self.count_diverged() {
@@ -253,34 +258,19 @@ mod tests {
     }
 
     #[test]
-    fn compare_to_returns_none_on_match_and_mismatch_struct_on_drift() {
-        use tina_sim::dst::ReplayCase;
+    fn compare_live_shape_returns_none_on_match_and_mismatch_struct_on_drift() {
         let trace = LiveTrace::new();
         let observer = trace.observer();
         observer.on_event(&sample_event(1));
         observer.on_event(&sample_event(2));
         let shape = trace.snapshot();
-        let case = ReplayCase::<()>::new(
-            "stub",
-            7,
-            tina_sim::dst::ReplayConfig::default(),
-            "stub scenario",
-            Vec::new(),
-            "stub invariant",
-        )
-        .expecting(shape.event_count, shape.trace_hash);
-        assert!(trace.compare_to(&case).is_none());
+        assert!(trace.compare_live_shape(shape, "stub").is_none());
 
-        let drifted = ReplayCase::<()>::new(
-            "stub",
-            7,
-            tina_sim::dst::ReplayConfig::default(),
-            "stub scenario",
-            Vec::new(),
-            "stub invariant",
-        )
-        .expecting(shape.event_count + 1, shape.trace_hash);
-        let mismatch = trace.compare_to(&drifted).expect("mismatch");
+        let drifted = TraceShape {
+            event_count: shape.event_count + 1,
+            trace_hash: shape.trace_hash,
+        };
+        let mismatch = trace.compare_live_shape(drifted, "stub").expect("mismatch");
         assert!(mismatch.count_diverged());
         assert!(!mismatch.hash_diverged());
     }

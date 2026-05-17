@@ -182,10 +182,12 @@ pieces, each tiny on purpose:
   `connects_ok`/`bytes_sent`/`bytes_read`/`server_closed`/`peer_reset`.
   Used by `system_realtime_rooms/tests/bad_peer.rs`.
 - `tina_proof_harness::live_replay::LiveTrace` — thin
-  `TraceObserver` that captures live events and exposes both a
-  `tina_sim::dst::TraceShape` (for live-vs-sim comparison) and a
-  `tina_runtime::PressureSummary` (for visible pressure facts).
-  Used by `system_live_replay_bugbox`.
+  `TraceObserver` that captures live events and exposes a live
+  `tina_sim::dst::TraceShape` fingerprint plus a
+  `tina_runtime::PressureSummary` for visible pressure facts. For
+  live-to-sim replay, materialize the live facts into
+  `tina_sim::dst::LiveReplayCapture` before comparing. Used by
+  `system_live_replay_bugbox`.
 
 Copy-pasteable proof targets live in the top-level `Makefile`:
 

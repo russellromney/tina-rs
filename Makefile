@@ -65,8 +65,7 @@ proof-soak:
 # bad-peer scenarios with `--nocapture` so the typed BadPeerOutcome
 # lines are visible.
 proof-bad-peer:
-	cargo test -p tina-proof-harness --test '*' -- --nocapture || true
-	cargo test -p tina-proof-harness
+	cargo test -p tina-proof-harness -- --nocapture
 	cargo test --manifest-path examples/systems/system_realtime_rooms/Cargo.toml --test bad_peer -- --nocapture
 
 # Replay regression: re-run the saved-seed sim cases. A mismatch fails
