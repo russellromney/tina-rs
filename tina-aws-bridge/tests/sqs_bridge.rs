@@ -755,7 +755,11 @@ fn caps_reject_message_before_sdk_and_receive_body_after_sdk() {
 
 #[test]
 fn full_closed_and_close_drain_truth() {
-    let sqs = FakeSqs::spawn(Duration::from_millis(180));
+    // Keep the first receive in-flight long enough that the bridge can
+    // deterministically prove both Full admission and partial drain on
+    // slower CI runners. A shorter delay raced on macOS: the first
+    // receive sometimes completed before the drain snapshot.
+    let sqs = FakeSqs::spawn(Duration::from_secs(1));
     let runtime = make_runtime();
     let bridge = install_bridge(
         &runtime,
@@ -792,7 +796,7 @@ fn full_closed_and_close_drain_truth() {
         other => panic!("expected worker Full, got {other:?}"),
     }
     let report = bridge.closer.close_and_drain(Duration::from_millis(10));
-    assert!(!report.drained);
+    assert!(!report.drained, "{report:?}");
     assert_eq!(report.in_flight_kinds, vec![("sqs_receive_message", 1)]);
     match first_sink.wait(Duration::from_secs(5)) {
         tina_runtime::CallOutcome::Replied(Ok(SqsResponse::ReceivedMessages(_))) => {}
