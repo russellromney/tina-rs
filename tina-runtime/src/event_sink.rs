@@ -154,6 +154,10 @@ impl<T> BoundedEventSink<T> {
     /// With a cap of zero, every push drops.
     pub fn push(&self, event: T) -> bool {
         if self.inner.cap == 0 {
+            // Drop `event` *before* bumping counters so a slow Drop
+            // (or one that re-enters logging) does not appear to
+            // happen "inside" the sink's accounting.
+            drop(event);
             self.inner.dropped.fetch_add(1, Ordering::Relaxed);
             match self.inner.policy {
                 DropPolicy::DropOldest => {
@@ -165,33 +169,55 @@ impl<T> BoundedEventSink<T> {
             }
             return false;
         }
-        let mut guard = self.inner.queue.lock().expect("event sink poisoned");
-        let len = guard.len();
+        // Carrier for any T that must be dropped *outside* the lock.
+        // A slow `T::drop` (or one that re-enters logging / pushes
+        // back into a sink) must not hold the queue mutex, or the
+        // "never blocks" observability promise becomes a deadlock
+        // hazard for log handlers.
+        let to_drop: Option<T>;
+        let new_len: usize;
         let accepted;
-        if len < self.inner.cap {
-            guard.push_back(event);
-            accepted = true;
-        } else {
-            match self.inner.policy {
-                DropPolicy::DropOldest => {
-                    guard.pop_front();
-                    guard.push_back(event);
-                    self.inner.dropped.fetch_add(1, Ordering::Relaxed);
-                    self.inner.dropped_oldest.fetch_add(1, Ordering::Relaxed);
-                    accepted = true;
-                }
-                DropPolicy::DropNewest => {
-                    // event is dropped; counters bump.
-                    drop(event);
-                    self.inner.dropped.fetch_add(1, Ordering::Relaxed);
-                    self.inner.dropped_newest.fetch_add(1, Ordering::Relaxed);
-                    accepted = false;
+        let mut dropped_oldest = false;
+        let mut dropped_newest = false;
+        {
+            let mut guard = self.inner.queue.lock().expect("event sink poisoned");
+            let len = guard.len();
+            if len < self.inner.cap {
+                guard.push_back(event);
+                to_drop = None;
+                accepted = true;
+            } else {
+                match self.inner.policy {
+                    DropPolicy::DropOldest => {
+                        // pop_front returns the displaced element;
+                        // hand it to `to_drop` so it lives past the
+                        // lock release.
+                        to_drop = guard.pop_front();
+                        guard.push_back(event);
+                        dropped_oldest = true;
+                        accepted = true;
+                    }
+                    DropPolicy::DropNewest => {
+                        to_drop = Some(event);
+                        dropped_newest = true;
+                        accepted = false;
+                    }
                 }
             }
+            new_len = guard.len();
         }
-        let new_len = guard.len();
-        drop(guard);
+        // Lock released. Now drop the displaced/refused event and
+        // bump atomic counters. None of this re-enters the sink.
+        drop(to_drop);
         bump_high_water(&self.inner.high_water, new_len);
+        if dropped_oldest {
+            self.inner.dropped.fetch_add(1, Ordering::Relaxed);
+            self.inner.dropped_oldest.fetch_add(1, Ordering::Relaxed);
+        }
+        if dropped_newest {
+            self.inner.dropped.fetch_add(1, Ordering::Relaxed);
+            self.inner.dropped_newest.fetch_add(1, Ordering::Relaxed);
+        }
         if accepted {
             self.inner.accepted.fetch_add(1, Ordering::Relaxed);
         }
@@ -389,6 +415,39 @@ mod tests {
         let sink = BoundedEventSink::<u32>::new("ev with space", 2, DropPolicy::DropOldest);
         let line = sink.discovery_line();
         assert!(line.contains("sink=\"ev with space\""), "{line}");
+    }
+
+    #[test]
+    fn displaced_events_drop_outside_the_lock() {
+        // A `T` whose Drop re-enters the sink would deadlock if the
+        // sink's mutex were still held when the displaced T was
+        // dropped. Build a `T` whose Drop calls `sink.len()` (which
+        // takes the lock) and confirm it does not panic/deadlock.
+        struct Reentrant {
+            sink: BoundedEventSink<u32>,
+        }
+        impl Drop for Reentrant {
+            fn drop(&mut self) {
+                // Touching the sink during T::drop must not block.
+                let _ = self.sink.len();
+            }
+        }
+
+        let primary = BoundedEventSink::<u32>::new("primary", 1, DropPolicy::DropOldest);
+        let reentry_sink = primary.clone();
+
+        // Each push displaces the previous element. The displaced T's
+        // Drop re-locks the same sink. Pre-fix this would deadlock on
+        // the second push.
+        let observer = BoundedEventSink::<Reentrant>::new("observer", 1, DropPolicy::DropOldest);
+        observer.push(Reentrant {
+            sink: reentry_sink.clone(),
+        });
+        observer.push(Reentrant { sink: reentry_sink });
+        observer.push(Reentrant {
+            sink: primary.clone(),
+        });
+        assert_eq!(observer.snapshot().dropped, 2);
     }
 
     #[test]

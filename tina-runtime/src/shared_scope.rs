@@ -12,8 +12,8 @@
 //!
 //! Reports plug into [`CapacitySummary`](crate::capacity::CapacitySummary)
 //! via [`SharedCapacityScope::surface_report`] or
-//! [`SharedCapacityScope::shared_scope_for`], which decorates an
-//! existing weighted surface report.
+//! [`SharedCapacityScope::decorate`], which decorates an existing
+//! weighted surface report.
 //!
 //! The scope itself can be reported by name as its own count-style
 //! surface (`weight=` shows up under `weight_unit=...`).

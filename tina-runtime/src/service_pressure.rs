@@ -9,9 +9,8 @@
 //!
 //! The shape is convention, not a framework: each service decides
 //! which surfaces it can report. Reports plug into the discovery
-//! line format used by [`format_discovery_line`](crate::capacity::format_discovery_line)
-//! and into [`CapacitySummary`](crate::capacity::CapacitySummary) for
-//! assertions.
+//! line format used by [`crate::capacity::format_discovery_line`]
+//! and into [`crate::capacity::CapacitySummary`] for assertions.
 //!
 //! ```ignore
 //! use tina_runtime::{
@@ -114,14 +113,19 @@ impl ServicePressureSurface {
 
     /// Discovery line for one surface: capacity line for measured,
     /// `unavailable=reason` line for unavailable.
+    ///
+    /// User-supplied `name`, `kind`, and `reason` strings are quoted
+    /// when they contain whitespace or control characters so the
+    /// line stays a parseable `key=value` sequence even for sloppy
+    /// inputs.
     pub fn discovery_line(&self) -> String {
         match &self.state {
             ServiceSurfaceState::Measured(report) => format_discovery_line(report.as_ref()),
             ServiceSurfaceState::Unavailable { reason } => {
                 format!(
                     "capacity surface={name} kind={kind} state=unavailable reason={reason:?}",
-                    name = self.name,
-                    kind = self.kind,
+                    name = crate::capacity::discovery_value(&self.name),
+                    kind = crate::capacity::discovery_value(self.kind),
                     reason = reason,
                 )
             }
@@ -213,17 +217,27 @@ impl ServicePressureReport {
         }
         let mut line = format!(
             "service={service} surfaces={surfaces} measured={measured} unavailable={unavailable} full={full}",
-            service = self.service,
+            service = crate::capacity::discovery_value(&self.service),
             surfaces = self.surfaces.len(),
         );
         if !unavail_names.is_empty() {
+            // Surface names with whitespace/control chars would
+            // break the `key=value` shape if joined naked. The list
+            // form (comma-separated) goes through `discovery_value`
+            // per name, and the trailing per-surface tokens use the
+            // same helper.
             line.push_str(" unavailable_surfaces=");
-            line.push_str(&unavail_names.join(","));
+            let joined = unavail_names
+                .iter()
+                .map(|n| crate::capacity::discovery_value(n))
+                .collect::<Vec<_>>()
+                .join(",");
+            line.push_str(&joined);
         }
         for s in &self.surfaces {
             if let ServiceSurfaceState::Unavailable { .. } = s.state {
                 line.push(' ');
-                line.push_str(&s.name);
+                line.push_str(&crate::capacity::discovery_value(&s.name));
                 line.push_str("=unavailable");
             }
         }
@@ -338,5 +352,29 @@ mod tests {
         r.add_unavailable("svc.bridge", "bridge", "stub");
         let found: Vec<_> = r.unavailable_surfaces().collect();
         assert_eq!(found, vec![("svc.bridge", "bridge", "stub")]);
+    }
+
+    #[test]
+    fn discovery_line_for_unavailable_quotes_unsafe_name_and_kind() {
+        // A surface name with whitespace or an empty kind would
+        // otherwise produce `surface=name with space kind= state=…`
+        // which breaks key=value parsers. The fixed shape double
+        // quotes such values.
+        let surface = ServicePressureSurface::unavailable("a name", "an kind", "with a reason");
+        let line = surface.discovery_line();
+        assert!(line.contains("surface=\"a name\""), "{line}");
+        assert!(line.contains("kind=\"an kind\""), "{line}");
+        assert!(line.contains("state=unavailable"), "{line}");
+        assert!(line.contains("reason=\"with a reason\""), "{line}");
+    }
+
+    #[test]
+    fn summary_line_quotes_unsafe_service_and_surface_names() {
+        let mut r = ServicePressureReport::new("svc with space");
+        r.add_unavailable("a name", "bridge", "stub");
+        let line = r.summary_line();
+        assert!(line.contains("service=\"svc with space\""), "{line}");
+        assert!(line.contains("unavailable_surfaces=\"a name\""), "{line}");
+        assert!(line.contains("\"a name\"=unavailable"), "{line}");
     }
 }
