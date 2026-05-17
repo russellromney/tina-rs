@@ -697,11 +697,17 @@ where
 }
 
 fn tally_admission_error(metrics: &SqsMetricsInner, err: &SqsError) {
+    // `validate_request` only produces `MessageTooLarge` or
+    // `InvalidRequest`. Future validator additions land in `invalid`
+    // until they earn a typed counter.
     match err {
-        SqsError::MessageTooLarge => metrics.message_too_large.fetch_add(1, Ordering::Relaxed),
-        SqsError::InvalidRequest(_) => metrics.invalid.fetch_add(1, Ordering::Relaxed),
-        _ => metrics.invalid.fetch_add(1, Ordering::Relaxed),
-    };
+        SqsError::MessageTooLarge => {
+            metrics.message_too_large.fetch_add(1, Ordering::Relaxed);
+        }
+        _ => {
+            metrics.invalid.fetch_add(1, Ordering::Relaxed);
+        }
+    }
 }
 
 /// Maps an admission-class [`SqsError`] to the wire-stable tracing

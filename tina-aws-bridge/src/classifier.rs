@@ -276,7 +276,6 @@ fn classify_secrets_error(err: &SecretsError) -> BridgeOutcomeClass {
         SecretsError::InvalidParameter(_) => {
             BridgeOutcomeClass::Fatal(FatalReason::InvalidParameter)
         }
-        SecretsError::Rotating(_) => BridgeOutcomeClass::Transient(TransientReason::SdkError),
         SecretsError::Throttled(_) => {
             BridgeOutcomeClass::Transient(TransientReason::ServiceThrottled)
         }

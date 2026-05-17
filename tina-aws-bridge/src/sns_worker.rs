@@ -612,10 +612,10 @@ async fn run_request(client: Client, request: SnsRequest) -> SnsResult {
 
 fn classify_publish_error(error: SdkError<PublishError>) -> SnsError {
     if let Some(service) = error.as_service_error() {
-        if service.is_not_found_exception() {
+        if service.is_not_found_exception() || service.is_kms_not_found_exception() {
             return SnsError::NotFound(error_detail(&error));
         }
-        if service.is_authorization_error_exception() {
+        if service.is_authorization_error_exception() || service.is_kms_access_denied_exception() {
             return SnsError::AccessDenied(error_detail(&error));
         }
         if service.is_kms_throttling_exception() {
@@ -627,11 +627,14 @@ fn classify_publish_error(error: SdkError<PublishError>) -> SnsError {
             || service.is_invalid_security_exception()
             || service.is_validation_exception()
             || service.is_platform_application_disabled_exception()
+            || service.is_kms_disabled_exception()
+            || service.is_kms_invalid_state_exception()
+            || service.is_kms_opt_in_required()
         {
             return SnsError::InvalidParameter(error_detail(&error));
         }
-        if service.is_kms_access_denied_exception() {
-            return SnsError::AccessDenied(error_detail(&error));
+        if service.is_internal_error_exception() {
+            return SnsError::Sdk(error_detail(&error));
         }
     }
     SnsError::Sdk(error_detail(&error))
@@ -650,14 +653,20 @@ where
 }
 
 fn tally_admission_error(metrics: &SnsMetricsInner, err: &SnsError) {
+    // `validate_request` only produces `MessageTooLarge`,
+    // `AttributesTooLarge`, or `InvalidRequest`. Future validator
+    // additions land in `invalid` until they earn a typed counter.
     match err {
-        SnsError::MessageTooLarge => metrics.message_too_large.fetch_add(1, Ordering::Relaxed),
-        SnsError::AttributesTooLarge => {
-            metrics.attributes_too_large.fetch_add(1, Ordering::Relaxed)
+        SnsError::MessageTooLarge => {
+            metrics.message_too_large.fetch_add(1, Ordering::Relaxed);
         }
-        SnsError::InvalidRequest(_) => metrics.invalid.fetch_add(1, Ordering::Relaxed),
-        _ => metrics.invalid.fetch_add(1, Ordering::Relaxed),
-    };
+        SnsError::AttributesTooLarge => {
+            metrics.attributes_too_large.fetch_add(1, Ordering::Relaxed);
+        }
+        _ => {
+            metrics.invalid.fetch_add(1, Ordering::Relaxed);
+        }
+    }
 }
 
 #[cfg(feature = "tracing")]

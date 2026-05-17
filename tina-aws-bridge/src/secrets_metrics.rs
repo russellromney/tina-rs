@@ -27,8 +27,6 @@ pub struct SecretsMetrics {
     pub access_denied: u64,
     /// Service responses classified as invalid parameter.
     pub invalid_parameter: u64,
-    /// Service responses classified as rotating.
-    pub rotating: u64,
     /// Service responses classified as throttling.
     pub throttled: u64,
     /// Service responses classified as decryption failure.
@@ -59,7 +57,6 @@ pub(crate) struct SecretsMetricsInner {
     pub(crate) not_found: AtomicU64,
     pub(crate) access_denied: AtomicU64,
     pub(crate) invalid_parameter: AtomicU64,
-    pub(crate) rotating: AtomicU64,
     pub(crate) throttled: AtomicU64,
     pub(crate) decryption_failed: AtomicU64,
     pub(crate) sdk_errors: AtomicU64,
@@ -83,7 +80,6 @@ impl SecretsMetricsInner {
             not_found: self.not_found.load(Ordering::Relaxed),
             access_denied: self.access_denied.load(Ordering::Relaxed),
             invalid_parameter: self.invalid_parameter.load(Ordering::Relaxed),
-            rotating: self.rotating.load(Ordering::Relaxed),
             throttled: self.throttled.load(Ordering::Relaxed),
             decryption_failed: self.decryption_failed.load(Ordering::Relaxed),
             sdk_errors: self.sdk_errors.load(Ordering::Relaxed),

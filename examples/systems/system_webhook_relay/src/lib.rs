@@ -28,9 +28,7 @@ use tina_aws_bridge::{
     BridgeOutcomeClass, FatalReason, SqsAddress, SqsError, SqsRequest, SqsResponse, SqsSendMessage,
     TransientReason, send_sqs,
 };
-use tina_runtime::{
-    CallError, CallOutcome, DefaultThreadedMailboxFactory, RuntimeCall, ThreadedRuntime,
-};
+use tina_runtime::{CallOutcome, DefaultThreadedMailboxFactory, RuntimeCall, ThreadedRuntime};
 
 /// Outbound port the relay calls. Mirrors the bridge two-layer shape.
 pub type OutboundOutcome = CallOutcome<Result<OutboundReply, OutboundError>>;
@@ -115,6 +113,8 @@ pub enum RelayReply {
     Retry { reason: TransientReason },
     /// Will not succeed without input/setup change.
     DeadLetter { reason: DeadLetterReason },
+    /// Reply to a `RelayMsg::Stats` call: typed counter snapshot.
+    Stats(RelayStats),
 }
 
 /// Caller-visible counters.
@@ -133,13 +133,23 @@ pub struct RelayStats {
 pub enum RelayMsg {
     /// Caller asks the relay to deliver one event.
     Deliver(Event),
-    /// Internal: the outbound port replied.
+    /// Internal: the fake outbound replied.
     #[doc(hidden)]
-    Finished {
+    FakeFinished {
         /// Original caller request context.
         request: RequestContext<RelayReply>,
-        /// Outbound port's typed outcome.
+        /// Fake outbound's typed outcome (already shaped like
+        /// `OutboundOutcome`).
         outcome: OutboundOutcome,
+    },
+    /// Internal: the SQS bridge replied.
+    #[doc(hidden)]
+    SqsFinished {
+        /// Original caller request context.
+        request: RequestContext<RelayReply>,
+        /// Raw SQS bridge outcome — mapped to OutboundOutcome on
+        /// handler entry.
+        outcome: CallOutcome<Result<SqsResponse, SqsError>>,
     },
     /// Caller asks for relay-side counters.
     Stats,
@@ -155,24 +165,6 @@ pub struct SqsOutbound {
     pub queue_url: String,
     /// Per-call timeout.
     pub timeout: Duration,
-}
-
-impl SqsOutbound {
-    fn call_into_relay(
-        &self,
-        event: Event,
-    ) -> tina_runtime::IsolateCall<tina_aws_bridge::SqsMsg, Result<SqsResponse, SqsError>> {
-        send_sqs(
-            self.address,
-            SqsRequest::SendMessage(SqsSendMessage {
-                queue_url: self.queue_url.clone(),
-                body: event.body,
-                message_group_id: Some(event.event_id),
-                message_deduplication_id: None,
-            }),
-            self.timeout,
-        )
-    }
 }
 
 /// Map an SQS bridge outcome into the relay's outbound shape.
@@ -206,9 +198,13 @@ fn map_sqs_error(err: SqsError) -> OutboundError {
     }
 }
 
-#[allow(dead_code)]
-enum OutboundPort {
+/// Outbound port behind the relay. Use `OutboundPort::fake` for
+/// hermetic tests or `OutboundPort::sqs` to point the relay at a
+/// real `tina-aws-bridge` SQS worker.
+pub enum OutboundPort {
+    /// In-process fake outbound (the program is a `VecDeque` of replies).
     Fake(Address<FakeOutboundMsg, Result<OutboundReply, OutboundError>>),
+    /// AWS SQS bridge address + queue URL + per-call timeout.
     Sqs(SqsOutbound),
 }
 
@@ -221,42 +217,60 @@ pub struct Relay {
 }
 
 impl Relay {
+    /// Build a relay around an outbound port. Use this constructor when
+    /// you want to register the relay yourself; otherwise call
+    /// [`run`] (fake path) or [`run_against_sqs`] (real SQS path).
+    pub fn new(outbound: OutboundPort, timeout: Duration) -> Self {
+        Self {
+            outbound,
+            timeout,
+            stats: RelayStats::default(),
+        }
+    }
+}
+
+impl Relay {
     fn issue(&mut self, event: Event, call: CallContext<'_, Self>) -> Effect<Self> {
+        let timeout = self.timeout;
         match &self.outbound {
-            OutboundPort::Fake(addr) => {
-                let timeout = self.timeout;
-                call.defer(tina_runtime::call(
+            OutboundPort::Fake(addr) => call
+                .defer(tina_runtime::call(
                     *addr,
                     FakeOutboundMsg::Send(event),
                     timeout,
                 ))
-                .reply(|request, outcome| RelayMsg::Finished { request, outcome })
-            }
+                .reply(|request, outcome| RelayMsg::FakeFinished { request, outcome }),
             OutboundPort::Sqs(sqs) => {
-                let issued = sqs.call_into_relay(event);
+                let address = sqs.address;
+                let queue_url = sqs.queue_url.clone();
+                let bridge_timeout = sqs.timeout;
+                let issued = send_sqs(
+                    address,
+                    SqsRequest::SendMessage(SqsSendMessage {
+                        queue_url,
+                        body: event.body,
+                        message_group_id: Some(event.event_id),
+                        message_deduplication_id: None,
+                    }),
+                    bridge_timeout,
+                );
                 call.defer(issued)
-                    .reply(|request, outcome| RelayMsg::Finished {
-                        request,
-                        outcome: map_sqs_outcome(outcome),
-                    })
+                    .reply(|request, outcome| RelayMsg::SqsFinished { request, outcome })
             }
         }
     }
 }
 
-#[allow(dead_code)]
-fn map_call_error(err: CallError) -> OutboundError {
-    match err {
-        CallError::TargetClosed => OutboundError::Closed,
-        CallError::TargetFull => OutboundError::Full,
-        CallError::Timeout => OutboundError::Timeout,
-        CallError::Rejected(_) => OutboundError::InvalidRequest,
-        _ => OutboundError::Internal,
+impl Isolate for Relay {
+    tina::isolate_types! {
+        message: RelayMsg,
+        reply: RelayReply,
+        send: tina::Outbound<Infallible>,
+        spawn: Infallible,
+        call: RuntimeCall<RelayMsg>,
+        shard: SingleShard,
     }
-}
 
-#[tina_runtime::isolate(message = RelayMsg, reply = RelayReply)]
-impl Relay {
     fn handle(
         &mut self,
         msg: RelayMsg,
@@ -264,8 +278,12 @@ impl Relay {
     ) -> Effect<Self> {
         match msg {
             RelayMsg::Deliver(_) | RelayMsg::Stats => noop(),
-            RelayMsg::Finished { request, outcome } => {
+            RelayMsg::FakeFinished { request, outcome } => {
                 let reply = self.classify_and_tally(outcome);
+                reply_to_request(request, reply)
+            }
+            RelayMsg::SqsFinished { request, outcome } => {
+                let reply = self.classify_and_tally(map_sqs_outcome(outcome));
                 reply_to_request(request, reply)
             }
         }
@@ -274,13 +292,10 @@ impl Relay {
     fn handle_call(&mut self, msg: RelayMsg, call: CallContext<'_, Self>) -> Effect<Self> {
         match msg {
             RelayMsg::Deliver(event) => self.issue(event, call),
-            RelayMsg::Stats => call.reply(RelayReply::Delivered {
-                backend_id: format!(
-                    "stats(d={},t={},dl={})",
-                    self.stats.delivered, self.stats.transient, self.stats.dead_letter
-                ),
-            }),
-            RelayMsg::Finished { .. } => call.reject(tina::CallRejectedReason::UnsupportedMessage),
+            RelayMsg::Stats => call.reply(RelayReply::Stats(self.stats)),
+            RelayMsg::FakeFinished { .. } | RelayMsg::SqsFinished { .. } => {
+                call.reject(tina::CallRejectedReason::UnsupportedMessage)
+            }
         }
     }
 }
@@ -400,16 +415,22 @@ pub struct RunConfig {
     pub program: Vec<FakeOutboundProgram>,
 }
 
-/// Driver outcome surface — keeps `CallOutcome` and runtime errors
-/// visible to the host so failed test fixtures are debuggable.
+/// Driver outcome surface — structured `CallOutcome` and runtime
+/// error visibility so failed test fixtures are debuggable.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DriverReply {
     /// Relay returned a typed reply.
     Reply(RelayReply),
     /// `call_blocking` returned a runtime-level error.
     RuntimeError(String),
-    /// `call_blocking` returned a non-replied outer outcome.
-    CallOutcome(String),
+    /// Caller-side `CallOutcome::Full` — relay's mailbox was saturated.
+    OuterFull,
+    /// Caller-side `CallOutcome::Closed` — relay was closed.
+    OuterClosed,
+    /// Caller-side `CallOutcome::Timeout` — relay did not reply in time.
+    OuterTimeout,
+    /// Caller-side `CallOutcome::Rejected` — relay rejected the call.
+    OuterRejected(String),
 }
 
 /// Driver result.
@@ -448,12 +469,59 @@ pub fn run(config: RunConfig) -> anyhow::Result<RunReport> {
         )
         .map_err(|e| anyhow::anyhow!("register relay: {e:?}"))?;
 
+    drive_relay(&runtime, relay_addr, config.events, config.call_timeout_ms)
+}
+
+/// Run the relay against a `tina-aws-bridge` SQS worker. The caller
+/// supplies an already-installed bridge address, the queue URL, and
+/// the per-call timeout. The relay forwards `events` events
+/// sequentially through the bridge and returns each typed outcome
+/// plus the final stats.
+///
+/// Hermetic tests against a fake SQS HTTP server work the same way as
+/// `tina-aws-bridge`'s own integration tests; see
+/// `tina-aws-bridge/tests/sqs_bridge.rs` for the `FakeSqs` shape.
+pub fn run_against_sqs(
+    events: usize,
+    call_timeout_ms: u64,
+    sqs_address: tina_aws_bridge::SqsAddress,
+    queue_url: String,
+    bridge_timeout: Duration,
+) -> anyhow::Result<RunReport> {
+    let runtime = Arc::new(ThreadedRuntime::new(
+        SingleShard,
+        DefaultThreadedMailboxFactory,
+    ));
+
+    let relay_addr = runtime
+        .register_with_capacity::<_, Infallible>(
+            Relay::new(
+                OutboundPort::Sqs(SqsOutbound {
+                    address: sqs_address,
+                    queue_url,
+                    timeout: bridge_timeout,
+                }),
+                Duration::from_millis(call_timeout_ms),
+            ),
+            64,
+        )
+        .map_err(|e| anyhow::anyhow!("register relay: {e:?}"))?;
+
+    drive_relay(&runtime, relay_addr, events, call_timeout_ms)
+}
+
+fn drive_relay(
+    runtime: &Arc<ThreadedRuntime<SingleShard, DefaultThreadedMailboxFactory>>,
+    relay_addr: Address<RelayMsg, RelayReply>,
+    events: usize,
+    call_timeout_ms: u64,
+) -> anyhow::Result<RunReport> {
     // Submit events sequentially so each event lines up with one
-    // entry of the fake-outbound program. The classifier shape is
-    // independent of concurrency; serializing keeps the test deterministic.
-    let call_timeout = Duration::from_millis(config.call_timeout_ms);
-    let mut replies = Vec::with_capacity(config.events);
-    for n in 0..config.events {
+    // outbound reply. The classifier shape is independent of
+    // concurrency; serializing keeps the test deterministic.
+    let call_timeout = Duration::from_millis(call_timeout_ms);
+    let mut replies = Vec::with_capacity(events);
+    for n in 0..events {
         let outcome = runtime.call_blocking(
             relay_addr,
             RelayMsg::Deliver(Event {
@@ -464,7 +532,10 @@ pub fn run(config: RunConfig) -> anyhow::Result<RunReport> {
         );
         let reply = match outcome {
             Ok(CallOutcome::Replied(r)) => DriverReply::Reply(r),
-            Ok(other) => DriverReply::CallOutcome(format!("{other:?}")),
+            Ok(CallOutcome::Full) => DriverReply::OuterFull,
+            Ok(CallOutcome::Closed) => DriverReply::OuterClosed,
+            Ok(CallOutcome::Timeout) => DriverReply::OuterTimeout,
+            Ok(CallOutcome::Rejected(r)) => DriverReply::OuterRejected(format!("{r:?}")),
             Err(e) => DriverReply::RuntimeError(format!("{e:?}")),
         };
         replies.push(reply);
@@ -474,48 +545,11 @@ pub fn run(config: RunConfig) -> anyhow::Result<RunReport> {
         .call_blocking(relay_addr, RelayMsg::Stats, Duration::from_secs(1))
         .map_err(|e| anyhow::anyhow!("stats call: {e:?}"))?
     {
-        CallOutcome::Replied(RelayReply::Delivered { backend_id }) => {
-            parse_stats_from_id(&backend_id)?
-        }
-        other => anyhow::bail!("stats call failed: {other:?}"),
+        CallOutcome::Replied(RelayReply::Stats(stats)) => stats,
+        other => anyhow::bail!("stats call returned unexpected reply: {other:?}"),
     };
 
-    if let Ok(rt) = Arc::try_unwrap(runtime) {
-        let _ = rt.shutdown();
-    }
-
     Ok(RunReport { replies, stats })
-}
-
-fn parse_stats_from_id(s: &str) -> anyhow::Result<RelayStats> {
-    // Stats are encoded as "stats(d=N,t=N,dl=N)". This is purely a
-    // smoke-test transport: the system_webhook_relay's stats RPC is
-    // typed in real code; here we tunnel through the existing reply
-    // shape to keep the driver tiny.
-    let body = s
-        .strip_prefix("stats(")
-        .and_then(|s| s.strip_suffix(')'))
-        .ok_or_else(|| anyhow::anyhow!("bad stats id: {s}"))?;
-    let mut delivered = 0u64;
-    let mut transient = 0u64;
-    let mut dead_letter = 0u64;
-    for piece in body.split(',') {
-        let (k, v) = piece
-            .split_once('=')
-            .ok_or_else(|| anyhow::anyhow!("bad piece: {piece}"))?;
-        let n: u64 = v.parse()?;
-        match k {
-            "d" => delivered = n,
-            "t" => transient = n,
-            "dl" => dead_letter = n,
-            _ => {}
-        }
-    }
-    Ok(RelayStats {
-        delivered,
-        transient,
-        dead_letter,
-    })
 }
 
 // Wire `RuntimeCall<RelayMsg>` to the macro-generated isolate types.

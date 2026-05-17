@@ -307,8 +307,6 @@ pub enum SecretsError {
     AccessDenied(String),
     /// Service rejected parameters as invalid.
     InvalidParameter(String),
-    /// Secret value is currently being rotated and not retrievable.
-    Rotating(String),
     /// Service reported throttling.
     Throttled(String),
     /// KMS decryption failed.
@@ -330,7 +328,6 @@ impl std::fmt::Display for SecretsError {
             Self::NotFound(msg) => write!(f, "secrets bridge: not found: {msg}"),
             Self::AccessDenied(msg) => write!(f, "secrets bridge: access denied: {msg}"),
             Self::InvalidParameter(msg) => write!(f, "secrets bridge: invalid parameter: {msg}"),
-            Self::Rotating(msg) => write!(f, "secrets bridge: rotating: {msg}"),
             Self::Throttled(msg) => write!(f, "secrets bridge: throttled: {msg}"),
             Self::DecryptionFailed(msg) => write!(f, "secrets bridge: decryption failed: {msg}"),
             Self::Sdk(msg) => write!(f, "secrets bridge: sdk error: {msg}"),

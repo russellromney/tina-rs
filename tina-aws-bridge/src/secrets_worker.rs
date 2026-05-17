@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use aws_sdk_secretsmanager::Client;
 use aws_sdk_secretsmanager::config::retry::RetryConfig;
 use aws_sdk_secretsmanager::config::{BehaviorVersion, Credentials, Region};
-use aws_sdk_secretsmanager::error::SdkError;
+use aws_sdk_secretsmanager::error::{ProvideErrorMetadata, SdkError};
 use aws_sdk_secretsmanager::operation::get_secret_value::GetSecretValueError;
 use tina::CallContext;
 use tina::prelude::*;
@@ -587,25 +587,26 @@ fn classify_get_error(error: SdkError<GetSecretValueError>) -> SecretsError {
         if service.is_decryption_failure() {
             return SecretsError::DecryptionFailed(error_detail(&error));
         }
-    }
-    // Access-denied / throttling are HTTP-status / metadata-driven for
-    // Secrets Manager; classify by HTTP status when service variant did
-    // not match.
-    if let Some(status) = http_status(&error) {
-        match status {
-            403 => return SecretsError::AccessDenied(error_detail(&error)),
-            429 => return SecretsError::Throttled(error_detail(&error)),
-            _ => {}
+        // Secrets Manager folds access-denied and throttling into the
+        // unmodeled `GetSecretValueError::Unhandled` variant; their
+        // typed error code rides on the `ProvideErrorMetadata::code()`
+        // string ("AccessDeniedException", "ThrottlingException", or
+        // "TooManyRequestsException"). AWS sends throttling as HTTP
+        // 400 with that error code, so HTTP-status sniffing alone
+        // would miss it.
+        if let Some(code) = service.code() {
+            match code {
+                "AccessDeniedException" => {
+                    return SecretsError::AccessDenied(error_detail(&error));
+                }
+                "ThrottlingException" | "TooManyRequestsException" => {
+                    return SecretsError::Throttled(error_detail(&error));
+                }
+                _ => {}
+            }
         }
     }
     SecretsError::Sdk(error_detail(&error))
-}
-
-fn http_status(error: &SdkError<GetSecretValueError>) -> Option<u16> {
-    match error {
-        SdkError::ServiceError(svc) => Some(svc.raw().status().as_u16()),
-        _ => None,
-    }
 }
 
 fn error_detail<E, R>(error: &SdkError<E, R>) -> String
@@ -620,11 +621,11 @@ where
     }
 }
 
-fn tally_admission_error(metrics: &SecretsMetricsInner, err: &SecretsError) {
-    match err {
-        SecretsError::InvalidRequest(_) => metrics.invalid.fetch_add(1, Ordering::Relaxed),
-        _ => metrics.invalid.fetch_add(1, Ordering::Relaxed),
-    };
+fn tally_admission_error(metrics: &SecretsMetricsInner, _err: &SecretsError) {
+    // `validate_request` for the Secrets bridge only produces
+    // `InvalidRequest` today. Future validator additions land in this
+    // bucket until they earn a typed counter.
+    metrics.invalid.fetch_add(1, Ordering::Relaxed);
 }
 
 #[cfg(feature = "tracing")]
@@ -651,9 +652,6 @@ fn tally_terminal(metrics: &SecretsMetricsInner, result: &SecretsResult) {
         }
         Err(SecretsError::InvalidParameter(_)) => {
             metrics.invalid_parameter.fetch_add(1, Ordering::Relaxed);
-        }
-        Err(SecretsError::Rotating(_)) => {
-            metrics.rotating.fetch_add(1, Ordering::Relaxed);
         }
         Err(SecretsError::Throttled(_)) => {
             metrics.throttled.fetch_add(1, Ordering::Relaxed);

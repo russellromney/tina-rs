@@ -540,14 +540,27 @@ fn validate_request(request: &DynamoRequest, config: &DynamoConfig) -> Result<()
         DynamoRequest::GetItem(get) => {
             validate_table(&get.table_name)?;
             validate_key(&get.key)?;
-            check_item_size(&get.key, config.item_size_limit)?;
+            if approximate_size(&get.key) > config.item_size_limit {
+                return Err(DynamoError::ItemTooLarge);
+            }
         }
         DynamoRequest::PutItem(put) => {
             validate_table(&put.table_name)?;
             if put.item.is_empty() {
                 return Err(DynamoError::InvalidRequest("item must not be empty".into()));
             }
-            check_item_size(&put.item, config.item_size_limit)?;
+            let size = approximate_size(&put.item)
+                .saturating_add(
+                    put.condition_expression
+                        .as_deref()
+                        .map(str::len)
+                        .unwrap_or(0),
+                )
+                .saturating_add(map_string_size(&put.expression_attribute_names))
+                .saturating_add(approximate_size(&put.expression_attribute_values));
+            if size > config.item_size_limit {
+                return Err(DynamoError::ItemTooLarge);
+            }
         }
         DynamoRequest::UpdateItem(update) => {
             validate_table(&update.table_name)?;
@@ -557,12 +570,37 @@ fn validate_request(request: &DynamoRequest, config: &DynamoConfig) -> Result<()
                     "update_expression must not be empty".into(),
                 ));
             }
-            check_item_size(&update.key, config.item_size_limit)?;
+            let size = approximate_size(&update.key)
+                .saturating_add(update.update_expression.len())
+                .saturating_add(
+                    update
+                        .condition_expression
+                        .as_deref()
+                        .map(str::len)
+                        .unwrap_or(0),
+                )
+                .saturating_add(map_string_size(&update.expression_attribute_names))
+                .saturating_add(approximate_size(&update.expression_attribute_values));
+            if size > config.item_size_limit {
+                return Err(DynamoError::ItemTooLarge);
+            }
         }
         DynamoRequest::DeleteItem(delete) => {
             validate_table(&delete.table_name)?;
             validate_key(&delete.key)?;
-            check_item_size(&delete.key, config.item_size_limit)?;
+            let size = approximate_size(&delete.key)
+                .saturating_add(
+                    delete
+                        .condition_expression
+                        .as_deref()
+                        .map(str::len)
+                        .unwrap_or(0),
+                )
+                .saturating_add(map_string_size(&delete.expression_attribute_names))
+                .saturating_add(approximate_size(&delete.expression_attribute_values));
+            if size > config.item_size_limit {
+                return Err(DynamoError::ItemTooLarge);
+            }
         }
         DynamoRequest::Query(query) => {
             validate_table(&query.table_name)?;
@@ -581,6 +619,28 @@ fn validate_request(request: &DynamoRequest, config: &DynamoConfig) -> Result<()
                         config.query_item_limit
                     )));
                 }
+            }
+            let size = query
+                .key_condition_expression
+                .len()
+                .saturating_add(
+                    query
+                        .filter_expression
+                        .as_deref()
+                        .map(str::len)
+                        .unwrap_or(0),
+                )
+                .saturating_add(map_string_size(&query.expression_attribute_names))
+                .saturating_add(approximate_size(&query.expression_attribute_values))
+                .saturating_add(
+                    query
+                        .exclusive_start_key
+                        .as_ref()
+                        .map(approximate_size)
+                        .unwrap_or(0),
+                );
+            if size > config.item_size_limit {
+                return Err(DynamoError::ItemTooLarge);
             }
         }
     }
@@ -605,12 +665,12 @@ fn validate_key(key: &DynamoItem) -> Result<(), DynamoError> {
     }
 }
 
-fn check_item_size(item: &DynamoItem, limit: usize) -> Result<(), DynamoError> {
-    if approximate_size(item) > limit {
-        Err(DynamoError::ItemTooLarge)
-    } else {
-        Ok(())
-    }
+/// Sum of key + value string lengths in an attribute-name map (used for
+/// `expression_attribute_names` which is `HashMap<String, String>`).
+fn map_string_size(map: &HashMap<String, String>) -> usize {
+    map.iter()
+        .map(|(k, v)| k.len().saturating_add(v.len()))
+        .sum()
 }
 
 /// Cheap size estimate used by the bridge cap. Not byte-accurate to
@@ -1003,11 +1063,17 @@ where
 }
 
 fn tally_admission_error(metrics: &DynamoMetricsInner, err: &DynamoError) {
+    // `validate_request` only produces `ItemTooLarge` or
+    // `InvalidRequest`. Future validator additions land in `invalid`
+    // until they earn a typed counter.
     match err {
-        DynamoError::ItemTooLarge => metrics.item_too_large.fetch_add(1, Ordering::Relaxed),
-        DynamoError::InvalidRequest(_) => metrics.invalid.fetch_add(1, Ordering::Relaxed),
-        _ => metrics.invalid.fetch_add(1, Ordering::Relaxed),
-    };
+        DynamoError::ItemTooLarge => {
+            metrics.item_too_large.fetch_add(1, Ordering::Relaxed);
+        }
+        _ => {
+            metrics.invalid.fetch_add(1, Ordering::Relaxed);
+        }
+    }
 }
 
 #[cfg(feature = "tracing")]

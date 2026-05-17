@@ -653,11 +653,17 @@ async fn read_capped(mut stream: ByteStream, limit: usize) -> Result<Vec<u8>, S3
 }
 
 fn tally_admission_error(metrics: &MetricsInner, err: &S3Error) {
+    // `validate_request` only produces `RequestTooLarge` or
+    // `InvalidRequest`. Future validator additions land in `invalid`
+    // until they earn a typed counter.
     match err {
-        S3Error::RequestTooLarge => metrics.request_too_large.fetch_add(1, Ordering::Relaxed),
-        S3Error::InvalidRequest(_) => metrics.invalid.fetch_add(1, Ordering::Relaxed),
-        _ => metrics.invalid.fetch_add(1, Ordering::Relaxed),
-    };
+        S3Error::RequestTooLarge => {
+            metrics.request_too_large.fetch_add(1, Ordering::Relaxed);
+        }
+        _ => {
+            metrics.invalid.fetch_add(1, Ordering::Relaxed);
+        }
+    }
 }
 
 /// Maps an admission-class [`S3Error`] to the wire-stable tracing
