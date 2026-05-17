@@ -1113,14 +1113,27 @@ fn build_startup_summary(
         0,
         0,
     );
-    let db_pool = CapacitySurfaceReport::count("db.capacity", CapacityMode::Fixed, 1, 0, 0, 0);
+    let db_pool = CapacitySurfaceReport::count("db.pool", CapacityMode::Fixed, 1, 0, 0, 0);
     let outbound_pool =
-        CapacitySurfaceReport::count("outbound.capacity", CapacityMode::Fixed, 1, 0, 0, 0);
+        CapacitySurfaceReport::count("outbound.pool", CapacityMode::Fixed, 1, 0, 0, 0);
+    // Listener mailbox is bounded by the HTTP listener config; we
+    // declare its name here so on-call sees the surface exists even
+    // when live depth/accept counters live behind `LiveQueueReport`
+    // and aren't sampled from this scope.
+    let main_listener = CapacitySurfaceReport::count(
+        "http.main_listener.mailbox",
+        CapacityMode::Fixed,
+        listener_config(BODY_CAP_BYTES).listener_mailbox_capacity,
+        0,
+        0,
+        0,
+    );
     let mut report = ServicePressureReport::new("mini_saas_api");
     report.add_measured("body", body_cap);
     report.add_measured("mailbox", controller_mailbox);
-    report.add_measured("pool_leases", db_pool);
-    report.add_measured("pool_leases", outbound_pool);
+    report.add_measured("pool", db_pool);
+    report.add_measured("pool", outbound_pool);
+    report.add_measured("listener", main_listener);
     // The sqlite bridge measures its own pressure but the bridge is
     // sampled live; at startup the count cap is the only fact we own
     // here. The other live counters are reported via `/debug/capacity`

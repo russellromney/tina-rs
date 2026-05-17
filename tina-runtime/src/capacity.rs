@@ -464,7 +464,10 @@ fn suggest_next(report: &CapacitySurfaceReport) -> &'static str {
     }
 }
 
-fn discovery_value(value: &str) -> String {
+/// Format a value for inclusion after a `key=` token. Bare when safe
+/// (no whitespace/control), otherwise double-quoted with debug
+/// formatting so parsers do not split the line at the unsafe char.
+pub(crate) fn discovery_value(value: &str) -> String {
     if name_is_valid(value) {
         value.to_string()
     } else {
@@ -474,20 +477,33 @@ fn discovery_value(value: &str) -> String {
 
 /// Utilization in basis points (1/10000ths). `None` when there is
 /// no count cap *and* no weight cap to divide against. Saturates at
-/// 10000 (100%) for weighted high-water peaks above cap.
+/// 10000 (100%) for high-water peaks above cap.
+///
+/// `max == 0` is reported as 10000 *only* when the surface actually
+/// took traffic (`full_count > 0` or some high water observed); a
+/// zero-cap surface with no use returns 0, not "infinitely full,
+/// despite never being touched."
 fn utilization_bp(report: &CapacitySurfaceReport) -> Option<u64> {
     if let Some(max) = report.max_messages {
-        if max == 0 {
-            return Some(10_000);
-        }
         let high = report.high_water_messages as u64;
+        if max == 0 {
+            return Some(if high > 0 || report.full_count > 0 {
+                10_000
+            } else {
+                0
+            });
+        }
         return Some((high.saturating_mul(10_000)) / (max as u64));
     }
     if let Some(max) = report.max_weight {
-        if max == 0 {
-            return Some(10_000);
-        }
         let high = report.high_water_weight.unwrap_or(0) as u64;
+        if max == 0 {
+            return Some(if high > 0 || report.weight_full_count > 0 {
+                10_000
+            } else {
+                0
+            });
+        }
         return Some((high.saturating_mul(10_000)) / (max as u64));
     }
     None
@@ -797,6 +813,44 @@ mod tests {
         assert!(line.contains("surface=pool.1.waiters"), "{line}");
         assert!(line.contains("filled=count"), "{line}");
         assert!(line.contains("observed=2"), "{line}");
+    }
+
+    #[test]
+    fn format_assertion_failure_covers_every_variant() {
+        for err in [
+            CapacityAssertError::HighWaterAbove {
+                surface: "p".into(),
+                limit: 4,
+                observed: 9,
+            },
+            CapacityAssertError::FullCountMismatch {
+                surface: "p".into(),
+                expected: 0,
+                observed: 3,
+            },
+            CapacityAssertError::UnknownSurface("nope".into()),
+            CapacityAssertError::MissingWeight {
+                surface: "p".into(),
+            },
+        ] {
+            let line = format_assertion_failure(&err);
+            assert!(line.starts_with("FAIL "), "{line}");
+            assert!(line.contains("surface="), "{line}");
+        }
+    }
+
+    #[test]
+    fn util_bp_zero_when_zero_cap_never_touched() {
+        let r = report("p", 0, 0, 0, 0);
+        let line = format_discovery_line(&r);
+        assert!(line.contains("util_bp=0"), "{line}");
+    }
+
+    #[test]
+    fn util_bp_saturates_at_10000_when_zero_cap_was_filled() {
+        let r = report("p", 0, 0, 0, 3);
+        let line = format_discovery_line(&r);
+        assert!(line.contains("util_bp=10000"), "{line}");
     }
 
     #[test]

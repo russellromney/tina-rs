@@ -57,13 +57,19 @@ impl Default for RunConfig {
 pub struct RunReport {
     pub upload_admitted: usize,
     pub upload_full: usize,
+    pub upload_timeout: usize,
     pub list_admitted: usize,
     pub list_full: usize,
+    pub list_timeout: usize,
     pub scope_high_water: usize,
     pub scope_full_count: u64,
     pub scope_admitted: u64,
     pub scope_released: u64,
+    /// Scope `current` *after* the runtime has been shut down. Owner
+    /// stop must release every charge by the time this is read, so
+    /// any non-zero value here is a lease leak.
     pub scope_current_at_drain: usize,
+    pub scope_high_water_at_drain: usize,
     pub discovery_lines: Vec<String>,
     pub summary_line: String,
 }
@@ -310,19 +316,24 @@ pub fn run(config: RunConfig) -> anyhow::Result<RunReport> {
 
     let mut upload_admitted = 0usize;
     let mut upload_full = 0usize;
+    let mut upload_timeout = 0usize;
     let mut list_admitted = 0usize;
     let mut list_full = 0usize;
+    let mut list_timeout = 0usize;
     for (route, outcome) in outcomes.lock().expect("outcomes").iter() {
         match (route, outcome) {
             (&"upload", Ok(CallOutcome::Replied(GatewayReply::Ok { .. }))) => upload_admitted += 1,
             (&"upload", Ok(CallOutcome::Replied(GatewayReply::Full { .. }))) => upload_full += 1,
+            (&"upload", Ok(CallOutcome::Timeout)) => upload_timeout += 1,
             (&"list", Ok(CallOutcome::Replied(GatewayReply::Ok { .. }))) => list_admitted += 1,
             (&"list", Ok(CallOutcome::Replied(GatewayReply::Full { .. }))) => list_full += 1,
+            (&"list", Ok(CallOutcome::Timeout)) => list_timeout += 1,
             other => anyhow::bail!("unexpected outcome: {other:?}"),
         }
     }
 
-    let snap = scope.snapshot();
+    // Pre-shutdown snapshot for discovery output / capacity summary.
+    let snap_pre = scope.snapshot();
     let scope_line = scope.discovery_line();
     let surface_line =
         format_discovery_line(&scope.surface_report(tina::capacity::CapacityMode::Fixed));
@@ -338,23 +349,40 @@ pub fn run(config: RunConfig) -> anyhow::Result<RunReport> {
         }
     }
 
+    // Owner stop must release every held charge. Shutdown drops the
+    // gateway isolate, which drops its `HashMap<qid, SharedLease>`,
+    // which releases. The post-shutdown snapshot is the load-bearing
+    // proof: `current` must be 0 even if callers were still timing
+    // out at shutdown time.
     shutdown(runtime);
+    let snap = scope.snapshot();
 
     let summary_line = format!(
-        "system=system_api_gateway_limits upload_admitted={} upload_full={} list_admitted={} list_full={} scope_high_water={} scope_full_count={}",
-        upload_admitted, upload_full, list_admitted, list_full, snap.high_water, snap.full_count,
+        "system=system_api_gateway_limits upload_admitted={} upload_full={} upload_timeout={} list_admitted={} list_full={} list_timeout={} scope_high_water={} scope_full_count={} scope_current_at_drain={}",
+        upload_admitted,
+        upload_full,
+        upload_timeout,
+        list_admitted,
+        list_full,
+        list_timeout,
+        snap.high_water,
+        snap.full_count,
+        snap.current,
     );
 
     Ok(RunReport {
         upload_admitted,
         upload_full,
+        upload_timeout,
         list_admitted,
         list_full,
-        scope_high_water: snap.high_water,
+        list_timeout,
+        scope_high_water: snap_pre.high_water,
         scope_full_count: snap.full_count,
         scope_admitted: snap.admitted,
         scope_released: snap.released,
         scope_current_at_drain: snap.current,
+        scope_high_water_at_drain: snap.high_water,
         discovery_lines: vec![scope_line, surface_line],
         summary_line,
     })

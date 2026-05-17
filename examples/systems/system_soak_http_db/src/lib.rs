@@ -71,6 +71,7 @@ pub struct RunReport {
     pub ok: usize,
     pub http_full: usize,
     pub db_full: usize,
+    pub pending_full: usize,
     pub slow_events_accepted: u64,
     pub slow_events_dropped: u64,
     pub discovery_lines: Vec<String>,
@@ -110,8 +111,25 @@ pub enum SoakMsg {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SoakReply {
     Ok,
-    HttpFull { current: usize, max: usize },
-    DbFull { current: usize, max: usize },
+    HttpFull {
+        current: usize,
+        max: usize,
+    },
+    DbFull {
+        current: usize,
+        max: usize,
+    },
+    /// `PendingReplies` rejected the slot; the request never reached
+    /// the DB stage. Distinct from `HttpFull` so a debug operator
+    /// reading replies can find the right surface.
+    PendingFull {
+        current: usize,
+        max: usize,
+    },
+    /// `PendingReplies` rejected the slot for a duplicate qid. Should
+    /// not happen with monotone qids; reserved so the variant cannot
+    /// be silently swallowed.
+    PendingDuplicate,
 }
 
 struct Soak {
@@ -215,17 +233,21 @@ impl Soak {
         self.next_qid += 1;
         let slot = call.into_request_context().into_deferred();
         if let Err(err) = self.pending.try_insert(qid, slot) {
+            // PendingReplies refused; release the lease so the
+            // http scope does not leak. Reply names the *real*
+            // surface that filled.
             drop(http_lease);
+            let cap = self.pending.capacity();
             return match err {
                 tina_runtime::PendingRepliesInsertError::Full(_, slot) => reply_to(
                     slot,
-                    SoakReply::HttpFull {
-                        current: self.pending.capacity(),
-                        max: self.pending.capacity(),
+                    SoakReply::PendingFull {
+                        current: cap,
+                        max: cap,
                     },
                 ),
                 tina_runtime::PendingRepliesInsertError::DuplicateKey(_, slot) => {
-                    reply_to(slot, SoakReply::HttpFull { current: 0, max: 0 })
+                    reply_to(slot, SoakReply::PendingDuplicate)
                 }
             };
         }
@@ -342,11 +364,16 @@ pub fn run(config: RunConfig) -> anyhow::Result<RunReport> {
     let mut ok = 0usize;
     let mut http_full = 0usize;
     let mut db_full = 0usize;
+    let mut pending_full = 0usize;
     for outcome in outcomes.lock().expect("outcomes").iter() {
         match outcome {
             Ok(CallOutcome::Replied(SoakReply::Ok)) => ok += 1,
             Ok(CallOutcome::Replied(SoakReply::HttpFull { .. })) => http_full += 1,
             Ok(CallOutcome::Replied(SoakReply::DbFull { .. })) => db_full += 1,
+            Ok(CallOutcome::Replied(SoakReply::PendingFull { .. })) => pending_full += 1,
+            Ok(CallOutcome::Replied(SoakReply::PendingDuplicate)) => {
+                anyhow::bail!("pending duplicate qid — qid generator is broken");
+            }
             other => anyhow::bail!("unexpected outcome: {other:?}"),
         }
     }
@@ -402,6 +429,7 @@ pub fn run(config: RunConfig) -> anyhow::Result<RunReport> {
         ok,
         http_full,
         db_full,
+        pending_full,
         slow_events_accepted: event_snap.accepted,
         slow_events_dropped: event_snap.dropped,
         discovery_lines,

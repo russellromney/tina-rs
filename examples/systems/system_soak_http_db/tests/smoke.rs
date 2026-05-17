@@ -10,7 +10,7 @@ fn soak_emits_grep_friendly_discovery_lines() {
     let report = run(config).expect("soak ran");
 
     assert_eq!(
-        report.ok + report.http_full + report.db_full,
+        report.ok + report.http_full + report.db_full + report.pending_full,
         report.total_requests,
         "every request must produce one outcome (report={report:?})",
     );
@@ -92,6 +92,48 @@ fn soak_emits_grep_friendly_discovery_lines() {
             "assertion failure line should start with FAIL: {line:?}",
         );
     }
+}
+
+#[test]
+fn event_sink_drops_visibly_under_load() {
+    // Force the slow-event sink to overflow by setting its cap small
+    // and the slow threshold low enough that most requests exceed it.
+    // The smoke test then asserts the dropped counter advanced — this
+    // is the plan's required "bounded event sink drops visibly under
+    // load" proof.
+    let config = RunConfig {
+        workers: 8,
+        requests_per_worker: 16,
+        slow_threshold_ms: 1,
+        event_sink_cap: 2,
+        ..RunConfig::default()
+    };
+    let report = run(config).expect("soak ran");
+
+    assert!(
+        report.slow_events_dropped > 0,
+        "event sink should have dropped under load — report={report:?}",
+    );
+    // Discovery line surfaces the drop count for grep.
+    let line = report
+        .discovery_lines
+        .iter()
+        .find(|l| l.starts_with("events ") && l.contains("sink=soak.slow_requests"))
+        .expect("events line");
+    assert!(line.contains("dropped="), "{line}");
+    let dropped_field = line
+        .split_whitespace()
+        .find(|tok| tok.starts_with("dropped=") && !tok.starts_with("dropped_"))
+        .expect("dropped= token");
+    let dropped: u64 = dropped_field
+        .strip_prefix("dropped=")
+        .unwrap()
+        .parse()
+        .expect("dropped= parses");
+    assert_eq!(
+        dropped, report.slow_events_dropped,
+        "discovery line drop count must match report"
+    );
 }
 
 #[test]

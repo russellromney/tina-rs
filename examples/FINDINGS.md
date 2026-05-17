@@ -680,6 +680,25 @@ owned by the runtime, not by user code.
 register/get/snapshot. Reuse the existing `CapacitySummary` shape so
 the runtime can produce one merged discovery line per shard.
 
+### 30. DST adapter for `SharedCapacityScope` / `BoundedEventSink`
+
+**Surfaced by:** `system_api_gateway_limits`, `system_soak_http_db`,
+phase 107 findings.
+
+The new observability primitives live outside the `RuntimeEvent`
+trace, so DST replay does not currently carry their facts forward.
+Existing trace-based pressure (`PressureSummary::from_events`) still
+works; the new shared-scope full counts and event-sink drops do not.
+The `ServicePressureReport` shape already encodes
+`Unavailable { reason }` so a sim that does not have these primitives
+yet stays honest.
+
+**Build:** a small adapter in `tina-sim` that snapshots scope/sink
+counters into the trace at well-defined points (admit, release,
+drop, push, drain) so a replay can reconstruct `assert_no_full`
+semantics. Or expose the snapshots as `LiveReplayFact` entries so
+they ride alongside the existing fact stream.
+
 ### 29. Effect chaining over multiple runtime calls inside one logical request
 
 **Surfaced by:** `system_soak_http_db`.

@@ -12,7 +12,7 @@
 //! ```ignore
 //! use tina_runtime::{BoundedEventSink, DropPolicy};
 //!
-//! let sink = BoundedEventSink::<String>::new(2, DropPolicy::DropOldest);
+//! let sink = BoundedEventSink::<String>::new("svc.events", 2, DropPolicy::DropOldest);
 //! sink.push("a".into());
 //! sink.push("b".into());
 //! sink.push("c".into()); // drops "a"
@@ -245,7 +245,7 @@ impl<T> BoundedEventSink<T> {
         let s = self.snapshot();
         format!(
             "events sink={name} cap={cap} policy={policy} len={len} high={high} dropped={dropped} dropped_oldest={dropped_oldest} dropped_newest={dropped_newest} accepted={accepted}",
-            name = s.name,
+            name = crate::capacity::discovery_value(&s.name),
             cap = s.cap,
             policy = s.policy.label(),
             len = s.len,
@@ -382,6 +382,13 @@ mod tests {
         assert!(line.contains("cap=2"), "{line}");
         assert!(line.contains("policy=drop_oldest"), "{line}");
         assert!(line.contains("dropped=1"), "{line}");
+    }
+
+    #[test]
+    fn discovery_line_quotes_unsafe_names() {
+        let sink = BoundedEventSink::<u32>::new("ev with space", 2, DropPolicy::DropOldest);
+        let line = sink.discovery_line();
+        assert!(line.contains("sink=\"ev with space\""), "{line}");
     }
 
     #[test]

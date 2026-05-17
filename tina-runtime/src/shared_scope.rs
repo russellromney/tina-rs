@@ -161,15 +161,29 @@ impl SharedCapacityScope {
                 weight: 0,
             });
         }
+        // Two-phase admission. Phase 1 CAS-walks toward a successful
+        // admission. If a CAS fails with `cur + weight > max`, we
+        // *re-load* with Acquire ordering and only then declare Full;
+        // a concurrent release may have freed room since the stale
+        // observation, in which case we keep retrying. This keeps
+        // `full_count` honest under contention: every counted Full
+        // corresponds to a moment when the scope truly had no room.
         let mut cur = self.inner.current.load(Ordering::Relaxed);
         loop {
             let next = cur.saturating_add(weight);
             if next > self.inner.max {
+                // Re-observe with Acquire so a concurrent release is
+                // visible. If room appeared, retry without counting.
+                let fresh = self.inner.current.load(Ordering::Acquire);
+                if fresh.saturating_add(weight) <= self.inner.max {
+                    cur = fresh;
+                    continue;
+                }
                 self.inner.full_count.fetch_add(1, Ordering::Relaxed);
                 return Err(SharedScopeFull {
                     scope: self.inner.scope.clone(),
                     requested: weight,
-                    current: cur,
+                    current: fresh,
                     max: self.inner.max,
                 });
             }
@@ -198,7 +212,9 @@ impl SharedCapacityScope {
         if weight == 0 {
             return;
         }
-        saturating_sub(&self.inner.current, weight);
+        // Release ordering so the Acquire load in `try_admit`'s Full
+        // re-check observes this decrement and avoids phantom Full.
+        saturating_sub_release(&self.inner.current, weight);
         self.inner
             .released
             .fetch_add(weight as u64, Ordering::Relaxed);
@@ -259,8 +275,8 @@ impl SharedCapacityScope {
         let snap = self.snapshot();
         format!(
             "scope name={name} unit={unit} max={max} cur={cur} high={high} full={full} admitted={admitted} released={released}",
-            name = snap.scope,
-            unit = snap.unit,
+            name = crate::capacity::discovery_value(&snap.scope),
+            unit = crate::capacity::discovery_value(&snap.unit),
             max = snap.max,
             cur = snap.current,
             high = snap.high_water,
@@ -314,11 +330,13 @@ fn bump_high_water(target: &AtomicUsize, new: usize) {
     }
 }
 
-fn saturating_sub(target: &AtomicUsize, n: usize) {
+fn saturating_sub_release(target: &AtomicUsize, n: usize) {
     let mut cur = target.load(Ordering::Relaxed);
     loop {
         let next = cur.saturating_sub(n);
-        match target.compare_exchange_weak(cur, next, Ordering::Relaxed, Ordering::Relaxed) {
+        // Release on success so subsequent Acquire loads observe the
+        // decrement before the admitter declares Full.
+        match target.compare_exchange_weak(cur, next, Ordering::Release, Ordering::Relaxed) {
             Ok(_) => return,
             Err(observed) => cur = observed,
         }
@@ -328,6 +346,8 @@ fn saturating_sub(target: &AtomicUsize, n: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Barrier;
+    use std::thread;
 
     #[test]
     fn admission_fills_and_release_refills() {
@@ -427,5 +447,54 @@ mod tests {
         assert!(line.contains("max=4"), "{line}");
         assert!(line.contains("cur=3"), "{line}");
         assert!(line.contains("admitted=3"), "{line}");
+    }
+
+    #[test]
+    fn discovery_line_quotes_unsafe_names() {
+        let scope = SharedCapacityScope::new("gw bad name", "weird unit", 4);
+        let line = scope.discovery_line();
+        assert!(line.contains("name=\"gw bad name\""), "{line}");
+        assert!(line.contains("unit=\"weird unit\""), "{line}");
+    }
+
+    #[test]
+    fn full_count_is_honest_under_admit_release_contention() {
+        // Eight threads each do `try_admit(1)` then immediately drop.
+        // Cap is 4 so brief moments of contention may make the
+        // observed `cur` look full when it actually is not. The fix:
+        // re-load on the Full branch. Run enough iterations that a
+        // race would be very likely to spuriously inflate full_count
+        // without the re-load.
+        const THREADS: usize = 8;
+        const ITERS: usize = 5_000;
+        let scope = SharedCapacityScope::new("gw.race", "requests", 4);
+        let gate = std::sync::Arc::new(Barrier::new(THREADS));
+        let mut handles = Vec::with_capacity(THREADS);
+        for _ in 0..THREADS {
+            let s = scope.clone();
+            let b = std::sync::Arc::clone(&gate);
+            handles.push(thread::spawn(move || {
+                b.wait();
+                let mut local_fulls = 0u64;
+                for _ in 0..ITERS {
+                    match s.try_admit(1) {
+                        Ok(lease) => drop(lease),
+                        Err(_) => local_fulls += 1,
+                    }
+                }
+                local_fulls
+            }));
+        }
+        let observed_fulls: u64 = handles.into_iter().map(|h| h.join().unwrap()).sum();
+        let snap = scope.snapshot();
+        // Every Full observed by a thread must correspond to exactly
+        // one counted Full. The bug-before-fix would count *more*.
+        assert_eq!(
+            snap.full_count, observed_fulls,
+            "full_count drifted from observed Full results: snap={snap:?}",
+        );
+        // After all threads finish, the scope must drain cleanly.
+        assert_eq!(snap.current, 0);
+        assert_eq!(snap.admitted, snap.released);
     }
 }

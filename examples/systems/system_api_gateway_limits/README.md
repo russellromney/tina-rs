@@ -16,12 +16,14 @@ cargo test --manifest-path examples/systems/system_api_gateway_limits/Cargo.toml
 
 ## Output shape
 
-The smoke test asserts these grep-friendly lines:
+The smoke test asserts the *shape* of these lines, not the exact
+counts. Counts depend on caller-thread scheduling; the load-bearing
+invariants are listed under "What proves what".
 
 ```text
-scope name=gateway.in_flight unit=weight max=4 cur=0 high=4 full=2 admitted=14 released=14
-capacity surface=gateway.in_flight mode=fixed max=- cur=0 high=0 full=0 util_bp=10000 suggest="weighted fixed cap fits" weight_unit=weight max_weight=4 cur_weight=0 high_weight=4 weight_full=2
-system=system_api_gateway_limits upload_admitted=2 upload_full=2 list_admitted=6 list_full=0 scope_high_water=4 scope_full_count=2
+scope name=gateway.in_flight unit=weight max=4 cur=0 high=N full=N admitted=A released=A
+capacity surface=gateway.in_flight mode=fixed max=- cur=0 high=0 full=0 util_bp=BP suggest="..." weight_unit=weight max_weight=4 cur_weight=0 high_weight=N weight_full=N
+system=system_api_gateway_limits upload_admitted=A upload_full=F upload_timeout=T list_admitted=A list_full=F list_timeout=T scope_high_water=N scope_full_count=N scope_current_at_drain=0
 ```
 
 - `scope ...` — `SharedCapacityScope::discovery_line`. One line per
@@ -29,9 +31,11 @@ system=system_api_gateway_limits upload_admitted=2 upload_full=2 list_admitted=6
   totals.
 - `capacity surface=...` — `format_discovery_line` for the same scope
   exposed as a `CapacitySurfaceReport`. Same key=value shape used
-  everywhere else.
-- `system=system_api_gateway_limits ...` — one-line summary copy of
-  what each caller observed.
+  everywhere else. `util_bp` is high-water utilization in basis
+  points (0..=10000).
+- `system=system_api_gateway_limits ...` — one-line summary. The
+  smoke test grabs `scope_current_at_drain` after `runtime.shutdown()`
+  to prove owner-stop release.
 
 ## What proves what
 

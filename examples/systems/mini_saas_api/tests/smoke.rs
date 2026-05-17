@@ -107,8 +107,42 @@ fn smoke_covers_service_layers() {
         "startup_summary_line shape: {startup}"
     );
     assert!(startup.contains("service=mini_saas_api"), "{startup}");
-    assert!(startup.contains("measured=4"), "{startup}");
+    assert!(startup.contains("measured=5"), "{startup}");
     assert!(startup.contains("unavailable=2"), "{startup}");
+    // Plan: runtime summary must include at least one pool, bridge,
+    // listener, and body surface.
+    assert!(
+        report
+            .startup_discovery_lines
+            .iter()
+            .any(|l| l.contains("surface=http.main_listener.mailbox")),
+        "missing listener surface in startup discovery: {:?}",
+        report.startup_discovery_lines
+    );
+    assert!(
+        report
+            .startup_discovery_lines
+            .iter()
+            .any(|l| l.contains("surface=http.request_body")),
+        "missing body surface in startup discovery: {:?}",
+        report.startup_discovery_lines
+    );
+    assert!(
+        report
+            .startup_discovery_lines
+            .iter()
+            .any(|l| l.contains("surface=db.pool")),
+        "missing db pool surface in startup discovery: {:?}",
+        report.startup_discovery_lines
+    );
+    assert!(
+        report
+            .startup_discovery_lines
+            .iter()
+            .any(|l| l.contains("surface=db.bridge_in_flight") && l.contains("state=unavailable")),
+        "missing bridge unavailable surface in startup discovery: {:?}",
+        report.startup_discovery_lines
+    );
     assert!(
         startup.contains("db.bridge_in_flight=unavailable"),
         "{startup}"
