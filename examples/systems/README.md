@@ -172,17 +172,20 @@ when they want a typed proof instead of a hand-rolled driver. Three
 pieces, each tiny on purpose:
 
 - `tina_proof_harness::load` — concurrent op driver with typed
-  latency, err-kind tally, and a leak-check hook. Used by
-  `mini_saas_api/tests/soak.rs`.
+  latency, err-kind tally, leak-check hook, and a `PressureSummary`
+  (rate per mille, max consecutive errors, first error op index).
+  Used by `mini_saas_api/tests/soak.rs`.
 - `tina_proof_harness::bad_peer` — reusable bad TCP/HTTP clients
-  (`ResetImmediately`, `HalfClose`, `Slowloris`, `StalledReader`,
-  `StalledWriter`, `MalformedFrame`, `ReconnectStorm`). Each returns
-  a typed `BadPeerOutcome`. Used by
-  `system_realtime_rooms/tests/bad_peer.rs`.
+  (`HalfClose`, `ResetImmediately`, `Slowloris`, `StalledReader`,
+  `StalledWriter`, `MalformedFrame`, `TlsHandshakeFailure`,
+  `ReconnectStorm`). Each returns a typed `BadPeerOutcome` with
+  `connects_ok`/`bytes_sent`/`bytes_read`/`server_closed`/`peer_reset`.
+  Used by `system_realtime_rooms/tests/bad_peer.rs`.
 - `tina_proof_harness::live_replay::LiveTrace` — thin
-  `TraceObserver` that captures live events and exposes a
-  `tina_sim::dst::TraceShape` for live-vs-sim comparison. Used by
-  `system_live_replay_bugbox`.
+  `TraceObserver` that captures live events and exposes both a
+  `tina_sim::dst::TraceShape` (for live-vs-sim comparison) and a
+  `tina_runtime::PressureSummary` (for visible pressure facts).
+  Used by `system_live_replay_bugbox`.
 
 Copy-pasteable proof targets live in the top-level `Makefile`:
 

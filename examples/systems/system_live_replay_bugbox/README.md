@@ -33,7 +33,7 @@ The smoke prints one summary line on success, for example:
 ```text
 bugbox live_received=4 live_events=54 live_hash=0xc878d2a439129480 \
   sim_events=54 sim_hash=0xe0f7990dddf0fb49 \
-  shrunk_from=8 to=1 discovered_seeds=4
+  shrunk_from=8 to=1 discovered_seeds=4 live_pressure_nonzero=false
 ```
 
 The numbers mean:
@@ -45,6 +45,7 @@ The numbers mean:
 | `sim_events`, `sim_hash` | sim trace shape that the saved case pins |
 | `shrunk_from`, `to` | deletion shrink: original → minimal bug-preserving history |
 | `discovered_seeds` | rows printed by `discover_constants` for the seed sweep |
+| `live_pressure_nonzero` | `false` on a clean run; `true` if any `SendRejected`/`CallCompletionRejected`/`CallReplyRejected` event was captured. Pressure facts come from `tina_runtime::PressureSummary` via `LiveTrace::pressure_summary()`. |
 
 ## What finding the run exposes
 

@@ -45,44 +45,97 @@ fn bad_http_peers_and_slow_ws_peer_do_not_break_the_room() {
     let addr = server.addr();
 
     // 1) Sequence of HTTP-level bad peers. None of these should crash
-    //    the listener or cause the room to enter shutdown.
-    let scenarios: Vec<(&'static str, BadPeerScenario)> = vec![
-        ("reset", BadPeerScenario::ResetImmediately),
-        (
-            "half_close",
-            BadPeerScenario::HalfClose {
-                request: b"GET /ws HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n".to_vec(),
-                drain_for: Duration::from_millis(300),
-            },
-        ),
-        (
-            "malformed",
-            BadPeerScenario::MalformedFrame {
-                bytes: b"NOT A REAL HTTP REQUEST\r\n\r\n".to_vec(),
-                drain_for: Duration::from_millis(300),
-            },
-        ),
-        (
-            "stalled_reader_no_upgrade",
-            BadPeerScenario::StalledReader {
-                request: b"GET /health HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n".to_vec(),
-                stall_for: Duration::from_millis(150),
-            },
-        ),
+    //    the listener or cause the room to enter shutdown. Each
+    //    scenario also has a typed expectation on what the server did:
+    //    the room is a real HTTP server, so half_close + malformed
+    //    requests should produce a server-written reply (4xx) and a
+    //    graceful close.
+    let reset_outcome = bad_peer::run(
+        "reset",
+        addr,
+        CONNECT_TIMEOUT,
+        BadPeerScenario::ResetImmediately,
+    );
+    assert!(reset_outcome.connected, "{reset_outcome:?}");
+    assert_eq!(
+        reset_outcome.connects_ok, 1,
+        "reset must record one successful connect: {reset_outcome:?}",
+    );
+    assert_eq!(
+        reset_outcome.bytes_sent, 0,
+        "reset must not send any bytes: {reset_outcome:?}",
+    );
+
+    let half_close_outcome = bad_peer::run(
+        "half_close",
+        addr,
+        CONNECT_TIMEOUT,
+        BadPeerScenario::HalfClose {
+            request: b"GET /ws HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n".to_vec(),
+            drain_for: Duration::from_millis(300),
+        },
+    );
+    assert!(half_close_outcome.connected, "{half_close_outcome:?}");
+    // The /ws upgrade is rejected (no Upgrade headers) so the server
+    // sends a 4xx reply and closes the connection. Both halves of
+    // that handshake must be visible in the typed outcome.
+    assert!(
+        half_close_outcome.bytes_read > 0,
+        "half_close must observe a server reply: {half_close_outcome:?}",
+    );
+    assert!(
+        half_close_outcome.server_closed,
+        "half_close must observe server close after reply: {half_close_outcome:?}",
+    );
+
+    let malformed_outcome = bad_peer::run(
+        "malformed",
+        addr,
+        CONNECT_TIMEOUT,
+        BadPeerScenario::MalformedFrame {
+            bytes: b"NOT A REAL HTTP REQUEST\r\n\r\n".to_vec(),
+            drain_for: Duration::from_millis(300),
+        },
+    );
+    assert!(malformed_outcome.connected, "{malformed_outcome:?}");
+    assert!(
+        malformed_outcome.server_closed || malformed_outcome.bytes_read > 0,
+        "malformed must either get a reply or a server close: {malformed_outcome:?}",
+    );
+
+    let stalled_outcome = bad_peer::run(
+        "stalled_reader_no_upgrade",
+        addr,
+        CONNECT_TIMEOUT,
+        BadPeerScenario::StalledReader {
+            request: b"GET /health HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n".to_vec(),
+            stall_for: Duration::from_millis(150),
+        },
+    );
+    assert!(stalled_outcome.connected, "{stalled_outcome:?}");
+    // /health is a tiny response; the server writes it even while we
+    // stall, and after stall_for elapses we drain the bytes that were
+    // buffered.
+    assert!(
+        stalled_outcome.bytes_read > 0,
+        "stalled_reader must drain /health reply after stall: {stalled_outcome:?}",
+    );
+
+    let outcomes = [
+        reset_outcome,
+        half_close_outcome,
+        malformed_outcome,
+        stalled_outcome,
     ];
-    let mut outcomes = Vec::with_capacity(scenarios.len());
-    for (label, scenario) in scenarios {
-        let outcome = bad_peer::run(label, addr, CONNECT_TIMEOUT, scenario);
-        assert!(
-            outcome.connected,
-            "bad-peer scenario `{label}` must connect: {outcome:?}",
-        );
-        outcomes.push(outcome);
-    }
+
     let post_bad_http = server.snapshot();
     assert!(
         !post_bad_http.shutdown_started,
         "bad HTTP must not trigger room shutdown: {post_bad_http:?}",
+    );
+    assert_eq!(
+        post_bad_http.live_members, 0,
+        "bad HTTP must not enter the room (no upgrades succeeded): {post_bad_http:?}",
     );
 
     // 2) Slow-reader proof at the WebSocket layer. The slow client

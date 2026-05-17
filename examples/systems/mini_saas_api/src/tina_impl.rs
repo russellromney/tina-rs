@@ -1178,9 +1178,18 @@ pub fn run_soak(config: crate::SoakConfig) -> anyhow::Result<crate::SoakReport> 
         );
     }
 
-    // Mix of cheap path (/health) and DB read (/items/1). Op routing is
-    // deterministic by worker id so the report can blame either lane.
+    // Three lanes, deterministic by worker id, so the report can blame
+    // each path independently:
+    //
+    //   worker % 3 == 0 -> GET /health        (cheap; HTTP only)
+    //   worker % 3 == 1 -> GET /items/1       (HTTP + SQLite bridge)
+    //   worker % 3 == 2 -> POST /items/1/notify (HTTP + bridge + outbound pool)
+    //
+    // The third lane is what proves Rock 1's "bridge/pool path" line
+    // item — without it the keepalive outbound pool is never exercised
+    // and the soak only proves the HTTP+DB shape.
     let op_addr = addr;
+    let timeout = config.connect_timeout;
     let load_report = load::run(
         LoadRun {
             workers: config.workers,
@@ -1188,10 +1197,22 @@ pub fn run_soak(config: crate::SoakConfig) -> anyhow::Result<crate::SoakReport> 
             label: "mini_saas_api_soak",
         },
         move |worker| {
-            let result = if worker % 2 == 0 {
-                crate::get(op_addr, "/health")
-            } else {
-                crate::get(op_addr, "/items/1")
+            let result = match worker % 3 {
+                0 => crate::one_request_with_timeout(
+                    op_addr,
+                    b"GET /health HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+                    timeout,
+                ),
+                1 => crate::one_request_with_timeout(
+                    op_addr,
+                    b"GET /items/1 HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+                    timeout,
+                ),
+                _ => crate::one_request_with_timeout(
+                    op_addr,
+                    b"POST /items/1/notify HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    timeout,
+                ),
             };
             match result {
                 Ok(parts) if parts.status == 200 => OpOutcome::Ok,

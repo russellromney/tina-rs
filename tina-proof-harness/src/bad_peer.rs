@@ -55,8 +55,53 @@ pub enum BadPeerScenario {
     /// Open, write `bytes`, drain briefly. Use to send garbage HTTP
     /// frames, oversize bodies, or other malformed transport.
     MalformedFrame { bytes: Vec<u8>, drain_for: Duration },
+    /// Open a TLS port and write a deliberately invalid TLS record
+    /// (e.g., truncated `ClientHello`, wrong content type, or bytes
+    /// that decode as a plaintext request). A correctly-configured TLS
+    /// listener must close the connection without writing application
+    /// bytes back. The harness records `bytes_read`/`server_closed`
+    /// so a specimen can assert "server closed without replying".
+    TlsHandshakeFailure {
+        client_hello: Vec<u8>,
+        drain_for: Duration,
+    },
     /// Open and close `count` times back-to-back with no traffic.
     ReconnectStorm { count: usize },
+}
+
+impl BadPeerScenario {
+    /// Constructs a [`BadPeerScenario::TlsHandshakeFailure`] with a
+    /// canned malformed TLS record. The bytes are a real TLS record
+    /// header (type=Handshake, version=0x0303, length=10) followed by
+    /// ten garbage bytes that do not form a valid `ClientHello`. A
+    /// rustls/native TLS listener will close on `decoder error`.
+    ///
+    /// Use this for the default "TLS rejects bad client" proof. Pass
+    /// your own bytes via the `TlsHandshakeFailure` variant when you
+    /// want a specific failure mode (e.g., plain HTTP to a TLS port).
+    pub fn tls_handshake_garbage(drain_for: Duration) -> Self {
+        Self::TlsHandshakeFailure {
+            client_hello: vec![
+                // TLS record header: ContentType=Handshake(22),
+                // ProtocolVersion=0x0303 (TLS 1.2), length=10.
+                0x16, 0x03, 0x03, 0x00,
+                0x0a, // Body: 10 garbage bytes (not a real ClientHello).
+                0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+            ],
+            drain_for,
+        }
+    }
+
+    /// Constructs a [`BadPeerScenario::TlsHandshakeFailure`] that
+    /// sends a plain HTTP request to a TLS port. This catches the
+    /// common ops misconfiguration of pointing an HTTP client at the
+    /// TLS listener. A correctly-configured listener rejects.
+    pub fn tls_plaintext_request(drain_for: Duration) -> Self {
+        Self::TlsHandshakeFailure {
+            client_hello: b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n".to_vec(),
+            drain_for,
+        }
+    }
 }
 
 /// One observation of a bad-peer attempt.
@@ -88,14 +133,22 @@ pub struct BadPeerOutcome {
     /// First error we observed during the scenario, as text. Always
     /// pair with `peer_reset`/`server_closed` to interpret.
     pub error: Option<String>,
+    /// Per-scenario typed counter:
+    /// - `ReconnectStorm`: total successful connects (the first plus
+    ///   any retries).
+    /// - all other scenarios: 1 when `connected` else 0.
+    ///
+    /// Use this instead of overloading `bytes_sent` to count connects.
+    pub connects_ok: usize,
 }
 
 impl BadPeerOutcome {
     pub fn summary_line(&self) -> String {
         format!(
-            "bad_peer label={} connected={} bytes_sent={} bytes_read={} server_closed={} peer_reset={} elapsed_ms={} error={}",
+            "bad_peer label={} connected={} connects_ok={} bytes_sent={} bytes_read={} server_closed={} peer_reset={} elapsed_ms={} error={}",
             self.label,
             self.connected,
+            self.connects_ok,
             self.bytes_sent,
             self.bytes_read,
             self.server_closed,
@@ -127,6 +180,7 @@ pub fn run(
                 peer_reset: false,
                 elapsed_ms: started.elapsed().as_millis() as u64,
                 error: Some(format!("connect: {err}")),
+                connects_ok: 0,
             };
         }
     };
@@ -164,6 +218,14 @@ pub fn run(
         BadPeerScenario::MalformedFrame { bytes, drain_for } => {
             run_malformed(label, started, stream, bytes, drain_for)
         }
+        BadPeerScenario::TlsHandshakeFailure {
+            client_hello,
+            drain_for,
+        } => {
+            // Same wire-level shape as MalformedFrame; distinct label
+            // surface so the typed scenario name is "TLS failure".
+            run_malformed(label, started, stream, client_hello, drain_for)
+        }
         BadPeerScenario::ReconnectStorm { count } => {
             // The stream we already opened counts as one connection; spin
             // `count - 1` more.
@@ -182,6 +244,7 @@ fn run_half_close(
 ) -> BadPeerOutcome {
     let mut outcome = base_outcome(label, started);
     outcome.connected = true;
+    outcome.connects_ok = 1;
     match stream.write_all(&request) {
         Ok(()) => outcome.bytes_sent = request.len(),
         Err(err) => return finish_with_error(outcome, started, err),
@@ -201,6 +264,7 @@ fn run_half_close(
 fn run_reset(label: &'static str, started: Instant, stream: TcpStream) -> BadPeerOutcome {
     let mut outcome = base_outcome(label, started);
     outcome.connected = true;
+    outcome.connects_ok = 1;
     // Plain drop sends a FIN. We do not try SO_LINGER(0) because
     // `TcpStream::set_linger` is still unstable; raw socket access
     // would pull libc in for one bad-peer story. A graceful close is
@@ -221,6 +285,7 @@ fn run_slowloris(
 ) -> BadPeerOutcome {
     let mut outcome = base_outcome(label, started);
     outcome.connected = true;
+    outcome.connects_ok = 1;
     if let Err(err) = stream.write_all(&prelude) {
         return finish_with_error(outcome, started, err);
     }
@@ -255,6 +320,7 @@ fn run_stalled_reader(
 ) -> BadPeerOutcome {
     let mut outcome = base_outcome(label, started);
     outcome.connected = true;
+    outcome.connects_ok = 1;
     if let Err(err) = stream.write_all(&request) {
         return finish_with_error(outcome, started, err);
     }
@@ -278,6 +344,7 @@ fn run_stalled_writer(
 ) -> BadPeerOutcome {
     let mut outcome = base_outcome(label, started);
     outcome.connected = true;
+    outcome.connects_ok = 1;
     if let Err(err) = stream.write_all(&first_chunk) {
         return finish_with_error(outcome, started, err);
     }
@@ -305,6 +372,7 @@ fn run_malformed(
 ) -> BadPeerOutcome {
     let mut outcome = base_outcome(label, started);
     outcome.connected = true;
+    outcome.connects_ok = 1;
     match stream.write_all(&bytes) {
         Ok(()) => outcome.bytes_sent = bytes.len(),
         Err(err) => {
@@ -325,7 +393,7 @@ fn run_storm(
     count: usize,
 ) -> BadPeerOutcome {
     let mut outcome = base_outcome(label, started);
-    let mut connects_ok: usize = 0;
+    let mut connects_ok: usize = 1; // The dispatcher already opened one stream.
     let mut last_error: Option<String> = None;
     for _ in 0..count.saturating_sub(1) {
         match TcpStream::connect_timeout(&addr, connect_timeout) {
@@ -336,12 +404,8 @@ fn run_storm(
             Err(err) => last_error = Some(format!("connect: {err}")),
         }
     }
-    // We opened the first stream in the dispatcher; count it.
     outcome.connected = true;
-    // Reuse `bytes_sent` to store the total successful connects (= the
-    // first plus subsequent), so the caller has a typed number to assert
-    // on without parsing the label.
-    outcome.bytes_sent = connects_ok + 1;
+    outcome.connects_ok = connects_ok;
     outcome.error = last_error;
     finish(outcome, started)
 }
@@ -358,6 +422,7 @@ fn base_outcome(label: &'static str, started: Instant) -> BadPeerOutcome {
         peer_reset: false,
         elapsed_ms: 0,
         error: None,
+        connects_ok: 0,
     }
 }
 
@@ -429,7 +494,10 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
 
     /// Tiny single-thread accept loop, used to exercise the bad-peer
-    /// scenarios without pulling in `tina-http`.
+    /// scenarios without pulling in `tina-http`. Non-blocking accept
+    /// with a tight poll so the listener exits within ~50ms after the
+    /// last client; otherwise running 20+ tests would serialise to
+    /// many seconds per test.
     fn echo_listener() -> (
         SocketAddr,
         std::sync::Arc<AtomicUsize>,
@@ -437,15 +505,21 @@ mod tests {
     ) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
         let addr = listener.local_addr().expect("addr");
+        listener
+            .set_nonblocking(true)
+            .expect("non-blocking listener");
         let accepted = Arc::new(AtomicUsize::new(0));
         let counter = Arc::clone(&accepted);
         let handle = thread::spawn(move || {
-            listener.set_nonblocking(false).expect("blocking accept");
-            let deadline = Instant::now() + Duration::from_secs(5);
+            // Tight cap so a misbehaving test cannot wedge the suite.
+            let deadline = Instant::now() + Duration::from_secs(3);
+            let mut idle_polls_after_first_client: u32 = 0;
             while Instant::now() < deadline {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
                         counter.fetch_add(1, Ordering::Relaxed);
+                        idle_polls_after_first_client = 0;
+                        let _ = stream.set_nonblocking(false);
                         let _ = stream.set_read_timeout(Some(Duration::from_millis(200)));
                         let mut buf = [0u8; 1024];
                         // Drain whatever the client sent before half-close,
@@ -455,11 +529,18 @@ mod tests {
                         let _ = stream.flush();
                         drop(stream);
                     }
-                    Err(_) => {
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        // After we have served at least one client, exit
+                        // once a short idle window passes (no new arrivals).
                         if counter.load(Ordering::Relaxed) > 0 {
-                            break;
+                            idle_polls_after_first_client += 1;
+                            if idle_polls_after_first_client >= 10 {
+                                break;
+                            }
                         }
+                        thread::sleep(Duration::from_millis(5));
                     }
+                    Err(_) => break,
                 }
             }
         });
@@ -483,6 +564,7 @@ mod tests {
             },
         );
         assert!(outcome.connected, "{outcome:?}");
+        assert_eq!(outcome.connects_ok, 1, "{outcome:?}");
         assert!(outcome.bytes_sent > 0, "{outcome:?}");
         assert!(outcome.bytes_read > 0, "{outcome:?}");
         assert!(outcome.server_closed, "{outcome:?}");
@@ -499,10 +581,12 @@ mod tests {
             BadPeerScenario::ResetImmediately,
         );
         assert!(outcome.connected);
+        // Join the listener first so its non-blocking accept loop has a
+        // chance to observe the connect before we read the counter.
+        let _ = server.join();
         // We do not require server_closed/peer_reset because the kernel
         // may RST the connection silently. The connect must succeed.
         assert!(accepted.load(Ordering::Relaxed) >= 1, "{outcome:?}");
-        let _ = server.join();
     }
 
     #[test]
@@ -536,8 +620,99 @@ mod tests {
             Duration::from_secs(1),
             BadPeerScenario::ReconnectStorm { count: 3 },
         );
-        assert_eq!(outcome.bytes_sent, 3, "{outcome:?}");
-        assert!(accepted.load(Ordering::Relaxed) >= 3, "{outcome:?}");
+        assert_eq!(outcome.connects_ok, 3, "{outcome:?}");
+        assert_eq!(outcome.bytes_sent, 0, "storm sends no bytes: {outcome:?}");
         let _ = server.join();
+        assert!(accepted.load(Ordering::Relaxed) >= 3, "{outcome:?}");
+    }
+
+    #[test]
+    fn slowloris_writes_byte_by_byte_then_drains() {
+        let (addr, _accepted, server) = echo_listener();
+        let trailer = b"X-Slow: 1\r\n\r\n".to_vec();
+        let trailer_len = trailer.len();
+        let outcome = run(
+            "slowloris",
+            addr,
+            Duration::from_secs(1),
+            BadPeerScenario::Slowloris {
+                prelude: b"GET / HTTP/1.1\r\nHost: x\r\n".to_vec(),
+                trailer,
+                byte_delay: Duration::from_millis(1),
+                give_up_after: Duration::from_millis(500),
+            },
+        );
+        assert!(outcome.connected, "{outcome:?}");
+        assert_eq!(outcome.connects_ok, 1);
+        // The slowloris write loop should have completed before give_up:
+        // prelude + every trailer byte.
+        assert!(
+            outcome.bytes_sent >= trailer_len,
+            "expected slowloris to write at least the trailer; got {}: {outcome:?}",
+            outcome.bytes_sent,
+        );
+        let _ = server.join();
+    }
+
+    #[test]
+    fn stalled_writer_pauses_between_chunks() {
+        let (addr, _accepted, server) = echo_listener();
+        let outcome = run(
+            "stalled_writer",
+            addr,
+            Duration::from_secs(1),
+            BadPeerScenario::StalledWriter {
+                first_chunk: b"GET / HTTP/1.1\r\n".to_vec(),
+                rest: b"Host: x\r\nConnection: close\r\n\r\n".to_vec(),
+                stall_for: Duration::from_millis(50),
+            },
+        );
+        assert!(outcome.connected, "{outcome:?}");
+        assert_eq!(outcome.connects_ok, 1);
+        // The scenario should record at least the stall plus the writes.
+        assert!(
+            outcome.elapsed_ms >= 40,
+            "stall window should be observable: {outcome:?}"
+        );
+        let _ = server.join();
+    }
+
+    #[test]
+    fn tls_handshake_failure_helper_constructs_invalid_record() {
+        // The helper is purely constructive; we assert the canned bytes
+        // are non-empty and that the dispatcher accepts the scenario
+        // via the standard run() entrypoint against the echo listener
+        // (the echo listener replies plaintext; that is fine because
+        // the test only checks the wire path and outcome shape).
+        let (addr, _accepted, server) = echo_listener();
+        let scenario = BadPeerScenario::tls_handshake_garbage(Duration::from_millis(200));
+        match &scenario {
+            BadPeerScenario::TlsHandshakeFailure { client_hello, .. } => {
+                assert_eq!(client_hello[0], 0x16, "TLS Handshake content type");
+                assert!(client_hello.len() >= 5, "must include TLS record header");
+            }
+            _ => panic!("helper must produce TlsHandshakeFailure"),
+        }
+        let outcome = run("tls_garbage", addr, Duration::from_secs(1), scenario);
+        assert!(outcome.connected, "{outcome:?}");
+        assert_eq!(outcome.connects_ok, 1);
+        assert!(outcome.bytes_sent > 0, "{outcome:?}");
+        let _ = server.join();
+    }
+
+    #[test]
+    fn connect_failure_returns_typed_outcome() {
+        // 127.0.0.1 with a port we never bind: the connect must fail,
+        // and the outcome should report that without panic.
+        let addr: SocketAddr = "127.0.0.1:1".parse().expect("addr");
+        let outcome = run(
+            "connect_fail",
+            addr,
+            Duration::from_millis(200),
+            BadPeerScenario::ResetImmediately,
+        );
+        assert!(!outcome.connected, "{outcome:?}");
+        assert_eq!(outcome.connects_ok, 0);
+        assert!(outcome.error.is_some(), "{outcome:?}");
     }
 }

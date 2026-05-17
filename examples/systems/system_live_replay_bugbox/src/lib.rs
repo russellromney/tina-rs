@@ -62,6 +62,9 @@ const SINK_ROLE: &str = "sink";
 pub struct BugboxReport {
     pub live_received: usize,
     pub live_trace_shape: TraceShape,
+    /// Pressure summary from the live trace (Rock 3 "pressure facts
+    /// visible"). A clean run has `non_zero() == false`.
+    pub live_pressure: tina_runtime::PressureSummary,
     pub sim_pinned: SavedCase,
     pub sim_report: ReplayReport<Output>,
     pub discovered: Vec<DiscoveredConstants>,
@@ -331,11 +334,12 @@ pub fn run() -> anyhow::Result<BugboxReport> {
         std::thread::sleep(Duration::from_millis(5));
     }
 
-    let _trace = runtime
+    runtime
         .shutdown()
         .map_err(|e| anyhow::anyhow!("live runtime shutdown: {e:?}"))?;
     let live_received_count = live_received.lock().expect("live sink lock").len();
     let live_shape = live_trace.snapshot();
+    let live_pressure = live_trace.pressure_summary();
 
     // 2) Sim replay. assert_replay_case panics on drift; the saved
     //    constants must match.
@@ -407,7 +411,8 @@ pub fn run() -> anyhow::Result<BugboxReport> {
     let summary_line = format!(
         "bugbox live_received={live_received_count} live_events={live_count} \
          live_hash=0x{live_hash:016x} sim_events={sim_count} sim_hash=0x{sim_hash:016x} \
-         shrunk_from={from} to={to} discovered_seeds={ds}",
+         shrunk_from={from} to={to} discovered_seeds={ds} \
+         live_pressure_nonzero={pressure_nonzero}",
         live_count = live_shape.event_count,
         live_hash = live_shape.trace_hash,
         sim_count = sim_report.event_count,
@@ -415,11 +420,13 @@ pub fn run() -> anyhow::Result<BugboxReport> {
         from = shrunk.original().len(),
         to = shrunk.shrunk().len(),
         ds = discovered.len(),
+        pressure_nonzero = live_pressure.non_zero(),
     );
 
     Ok(BugboxReport {
         live_received: live_received_count,
         live_trace_shape: live_shape,
+        live_pressure,
         sim_pinned: SavedCase {
             case: live_case,
             live_event_count: live_shape.event_count,
@@ -431,4 +438,3 @@ pub fn run() -> anyhow::Result<BugboxReport> {
         summary_line,
     })
 }
-

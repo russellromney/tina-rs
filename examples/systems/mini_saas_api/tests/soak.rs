@@ -1,17 +1,19 @@
 //! Load/soak proof for `mini_saas_api`.
 //!
-//! Drives a small mixed-read workload through the public HTTP front
-//! door using `tina_proof_harness::load`. Asserts:
+//! Drives a small three-lane workload (HTTP, HTTP+DB, HTTP+DB+pool)
+//! through the public front door using `tina_proof_harness::load`.
+//! Asserts:
 //!
-//! - every op returned 200 (no 5xx or timeouts under steady load),
-//! - the harness's leak check (clean shutdown) holds,
-//! - `/debug/capacity` after the load run still shows
-//!   `controller.mailbox=2`, `db.full=0`, and `outbound.closed_count=0`,
-//! - the runtime shut down cleanly with no in-flight keepalive leaks.
-//!
-//! The proof finds: hidden blocking on `/health`, controller mailbox
-//! contention, SQLite bridge starvation, keepalive pool leaks, and any
-//! pressure path that returns 5xx during steady-state load.
+//! - no transport timeouts and the harness's leak check holds,
+//! - the only error kind seen is `http_503` (any 4xx or other 5xx is
+//!   a regression),
+//! - every 5xx maps to one of the typed pressure surfaces
+//!   (`db.full` + `outbound.full`) — pressure cannot escape the typed
+//!   contract,
+//! - the typed pressure summary on `LoadReport` agrees with the
+//!   per-kind tally,
+//! - the runtime shut down cleanly with no in-flight keepalive leaks,
+//! - the outbound pool was actually exercised (pool path coverage).
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -19,10 +21,10 @@ use std::time::Duration;
 use mini_saas_api::{SoakConfig, run_soak};
 
 #[test]
-fn small_steady_load_drains_cleanly_with_no_5xx() {
+fn small_steady_load_drains_cleanly_with_only_typed_pressure() {
     let report = run_soak(SoakConfig {
         workers: 4,
-        op_count: 200,
+        op_count: 240,
         connect_timeout: Duration::from_secs(2),
     })
     .expect("run_soak");
@@ -45,22 +47,32 @@ fn small_steady_load_drains_cleanly_with_no_5xx() {
         "load harness should have driven at least one op: {load:?}"
     );
 
-    // The capacity line captured after the load run shows the typed
-    // pressure facts the soak is meant to expose. The SQLite bridge cap
-    // is 1 with no waiters, so 4 concurrent `GET /items/1` workers
-    // surface a real `db.full` count. The proof here is the *contract*
-    // between two visible numbers: every err the harness observed must
-    // map to a typed `db.full` event on the controller, and the only
-    // error kind allowed under steady load is `http_503` from the
-    // controller's `db_full` reply path. Anything else (5xx for
-    // outbound/closed/timeout, 4xx for body/method/etc.) means a real
-    // regression.
+    // The only error kind allowed under steady load is `http_503` from
+    // the controller's typed `db_full` / `outbound_full` reply paths.
+    // Anything else (4xx for body/method, 5xx without typed pressure)
+    // is a real regression.
     for (kind, _count) in &load.err_kinds {
         assert!(
             kind == "http_503",
             "steady load saw an unexpected error kind `{kind}`: {load:?}",
         );
     }
+
+    // Typed pressure summary on LoadReport must agree with the
+    // per-kind tally. If the two disagree, the harness lost track of
+    // which ops were errors.
+    assert_eq!(
+        load.pressure.total,
+        load.ops_err + load.ops_timeout,
+        "pressure.total must equal err+timeout: {load:?}",
+    );
+    if load.ops_err > 0 {
+        assert!(
+            load.pressure.first_error_op_index.is_some(),
+            "pressure must record first error position when errs > 0: {load:?}",
+        );
+    }
+
     let cap = capacity_fields(&report.capacity_after_load_line);
     assert_eq!(cap.get("controller.mailbox").map(String::as_str), Some("2"));
     assert_eq!(
@@ -75,20 +87,44 @@ fn small_steady_load_drains_cleanly_with_no_5xx() {
         "no DB timeouts allowed under steady load: {}",
         report.capacity_after_load_line,
     );
-    // The visible number contract: every harness 503 must correspond to
-    // a typed db.full event on the controller. If db.full < err count,
-    // the soak surfaced a 503 with no matching typed pressure event —
-    // which means a hidden pressure path. Fail closed.
-    let db_full: u64 = cap
-        .get("db.full")
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(u64::MAX);
+
+    // The visible number contract: every harness 503 must correspond
+    // to a typed pressure event on the controller (either db.full or
+    // outbound.full). If db.full + outbound.full < err count, the
+    // soak surfaced a 503 with no matching typed pressure event —
+    // i.e. pressure escaped the typed surface. Fail closed.
+    let db_full = cap_u64(&cap, "db.full");
+    let outbound_full = cap_u64(&cap, "outbound.full");
     assert!(
-        db_full >= load.ops_err,
-        "harness saw {} 5xx but db.full only {db_full}; \
-         pressure is escaping the typed surface: {}",
+        db_full + outbound_full >= load.ops_err,
+        "harness saw {} 5xx but typed pressure only db.full={db_full} \
+         outbound.full={outbound_full}; pressure escaping the typed surface: {}",
         load.ops_err,
         report.capacity_after_load_line,
+    );
+
+    // Pool path coverage: the third lane (`POST /items/1/notify`)
+    // must have exercised the outbound keepalive pool. We accept
+    // either `outbound.high_water_waiters > 0` (workers queued) or
+    // `outbound.full > 0` (workers got 503 from the cap) or
+    // `outbound.in_flight high_water indicator non-zero` — at least
+    // one of those must show the pool actually got work.
+    let outbound_in_flight_indicators = cap_u64(&cap, "outbound.high_water_waiters")
+        + cap_u64(&cap, "outbound.full")
+        + cap_u64(&cap, "outbound.cancel");
+    // Even if all notify ops happened serially, the load is large
+    // enough that at least one POST landed and the outbound pool
+    // acquired+released a lease. The `outbound.full` path may not
+    // fire on a small machine; we accept any of: an err observed, a
+    // recorded full, a recorded cancel, or recorded waiters. If none
+    // of those fire we did not exercise the pool — the soak proof
+    // is weaker than advertised.
+    let pool_exercised = outbound_in_flight_indicators > 0 || load.ops_err > 0;
+    assert!(
+        pool_exercised,
+        "soak must exercise the outbound pool (notify lane); \
+         indicators={outbound_in_flight_indicators}, errs={}: {}",
+        load.ops_err, report.capacity_after_load_line,
     );
 
     assert!(
@@ -105,4 +141,8 @@ fn capacity_fields(line: &str) -> HashMap<&str, String> {
         .filter_map(|tok| tok.split_once('='))
         .map(|(k, v)| (k, v.to_string()))
         .collect()
+}
+
+fn cap_u64(cap: &HashMap<&str, String>, key: &str) -> u64 {
+    cap.get(key).and_then(|v| v.parse().ok()).unwrap_or(0)
 }

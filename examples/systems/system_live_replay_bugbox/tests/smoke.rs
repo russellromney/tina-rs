@@ -58,11 +58,14 @@ fn live_capture_then_sim_replay_then_shrink() {
         assert_ne!(d.trace_hash, 0, "discovered hash must be non-zero: {d:?}");
     }
 
-    // 5) Shrink result smaller than original, still has the bug.
+    // 5) Shrink result STRICTLY smaller than original, still has the
+    //    bug, and ideally minimal (one POISON Send is enough to drop
+    //    one message — any larger shrunk history means the shrinker
+    //    stopped early).
     let shrunk = report.shrunk.shrunk();
     assert!(
-        shrunk.len() <= original.len(),
-        "shrunk history must not grow: shrunk={} original={}",
+        shrunk.len() < original.len(),
+        "shrunk history must be strictly smaller than original: shrunk={} original={}",
         shrunk.len(),
         original.len(),
     );
@@ -72,6 +75,27 @@ fn live_capture_then_sim_replay_then_shrink() {
             .iter()
             .any(|op| matches!(op, Op::Send(v) if *v == POISON_VALUE)),
         "shrunk history must still trigger the bug (contain POISON): {report:#?}",
+    );
+    assert_eq!(
+        shrunk.len(),
+        1,
+        "the minimal bug history is one POISON send; \
+         shrinker returned {shrunk:?} from {original:?}",
+    );
+    let only = shrunk.operations().first().expect("shrunk has one op");
+    assert!(
+        matches!(only, Op::Send(v) if *v == POISON_VALUE),
+        "minimal shrunk op must be Send(POISON): got {only:?}",
+    );
+
+    // 6) Live pressure surface clean: this workload has no bounded
+    //    queue full / closed event. Catches future regressions where
+    //    the producer/sink wiring leaks pressure that the bug shape
+    //    is not supposed to involve.
+    assert!(
+        !report.live_pressure.non_zero(),
+        "live pressure must be empty for this workload; got {:?}",
+        report.live_pressure,
     );
 
     eprintln!("{}", report.summary_line);

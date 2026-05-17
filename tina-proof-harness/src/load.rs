@@ -75,6 +75,9 @@ pub struct LoadReport {
     pub ops_ok: u64,
     pub ops_err: u64,
     pub ops_timeout: u64,
+    /// Per-kind error tally (sorted). Kept on the report root so
+    /// existing call sites keep compiling; also surfaced via
+    /// [`PressureSummary::by_kind`].
     pub err_kinds: Vec<(String, u64)>,
     pub latency_min_us: u64,
     pub latency_p50_us: u64,
@@ -82,6 +85,61 @@ pub struct LoadReport {
     pub latency_max_us: u64,
     pub elapsed_ms: u64,
     pub leak_clean: bool,
+    /// Typed pressure summary: rate, burst length, first-error
+    /// position, per-kind breakdown. Lets a specimen assert
+    /// "pressure stayed under N per mille" or "no burst longer than
+    /// K consecutive errors" without parsing the summary line.
+    pub pressure: PressureSummary,
+}
+
+/// Pressure summary for one [`LoadReport`].
+///
+/// "Pressure" means any non-ok outcome (err or timeout). Counts are
+/// per-run; `max_consecutive` is per-worker (longest streak observed
+/// by any single worker) because workers run concurrently and there
+/// is no defensible global order across them.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PressureSummary {
+    /// Total non-ok outcomes (err + timeout).
+    pub total: u64,
+    /// Pressure rate per mille (out of 1000). `0` when `ops_attempted == 0`.
+    pub rate_per_mille: u64,
+    /// Longest streak of consecutive non-ok outcomes observed by any
+    /// single worker. Highlights bursts (e.g., a brief outage) the
+    /// rate alone would smear.
+    pub max_consecutive: u64,
+    /// Position of the first non-ok outcome within the run (op index,
+    /// 0-based, across all workers — the worker whose first error
+    /// had the lowest local index wins ties). `None` when there was
+    /// no pressure.
+    pub first_error_op_index: Option<u64>,
+    /// Per-kind tally, sorted. Same data as
+    /// [`LoadReport::err_kinds`], duplicated here so the pressure
+    /// summary is self-contained.
+    pub by_kind: Vec<(String, u64)>,
+}
+
+impl PressureSummary {
+    /// One-line summary, key=value, suitable for test output and grep.
+    pub fn summary_line(&self) -> String {
+        let mut by_kind = String::new();
+        for (i, (k, v)) in self.by_kind.iter().enumerate() {
+            if i > 0 {
+                by_kind.push(',');
+            }
+            by_kind.push_str(&format!("{k}:{v}"));
+        }
+        format!(
+            "pressure total={} rate_per_mille={} max_consecutive={} first_err_op={} by_kind=[{}]",
+            self.total,
+            self.rate_per_mille,
+            self.max_consecutive,
+            self.first_error_op_index
+                .map(|i| i.to_string())
+                .unwrap_or_else(|| "none".to_string()),
+            by_kind,
+        )
+    }
 }
 
 impl LoadReport {
@@ -89,18 +147,20 @@ impl LoadReport {
     pub fn summary_line(&self) -> String {
         format!(
             "load label={} workers={} ops={} ok={} err={} timeout={} \
-             p50_us={} p99_us={} max_us={} elapsed_ms={} leak_clean={}",
+             min_us={} p50_us={} p99_us={} max_us={} elapsed_ms={} leak_clean={} {}",
             self.label,
             self.workers,
             self.ops_attempted,
             self.ops_ok,
             self.ops_err,
             self.ops_timeout,
+            self.latency_min_us,
             self.latency_p50_us,
             self.latency_p99_us,
             self.latency_max_us,
             self.elapsed_ms,
             self.leak_clean,
+            self.pressure.summary_line(),
         )
     }
 }
@@ -135,6 +195,8 @@ where
         let halted = Arc::clone(&halted);
         let handle = thread::spawn(move || -> WorkerObs {
             let mut obs = WorkerObs::default();
+            let mut local_op_index: u64 = 0;
+            let mut current_streak: u64 = 0;
             loop {
                 if halted.load(Ordering::Acquire) {
                     break;
@@ -154,6 +216,7 @@ where
                 let outcome = op(worker_id);
                 let dt = t0.elapsed();
                 obs.latencies_us.push(duration_to_us(dt));
+                let pressure = !matches!(outcome, OpOutcome::Ok);
                 match outcome {
                     OpOutcome::Ok => obs.ok += 1,
                     OpOutcome::Err { kind } => {
@@ -162,6 +225,18 @@ where
                     }
                     OpOutcome::Timeout => obs.timeout += 1,
                 }
+                if pressure {
+                    if obs.first_error_local_index.is_none() {
+                        obs.first_error_local_index = Some(local_op_index);
+                    }
+                    current_streak += 1;
+                    if current_streak > obs.max_consecutive {
+                        obs.max_consecutive = current_streak;
+                    }
+                } else {
+                    current_streak = 0;
+                }
+                local_op_index += 1;
             }
             obs
         });
@@ -187,10 +262,25 @@ where
     let mut err_kinds: Vec<(String, u64)> = combined.err_kinds.into_iter().collect();
     err_kinds.sort();
 
+    let ops_attempted = combined.ok + combined.err + combined.timeout;
+    let pressure_total = combined.err + combined.timeout;
+    let rate_per_mille = pressure_total
+        .saturating_mul(1000)
+        .checked_div(ops_attempted)
+        .unwrap_or(0);
+
+    let pressure = PressureSummary {
+        total: pressure_total,
+        rate_per_mille,
+        max_consecutive: combined.max_consecutive,
+        first_error_op_index: combined.first_error_local_index,
+        by_kind: err_kinds.clone(),
+    };
+
     LoadReport {
         label: run.label,
         workers: run.workers,
-        ops_attempted: combined.ok + combined.err + combined.timeout,
+        ops_attempted,
         ops_ok: combined.ok,
         ops_err: combined.err,
         ops_timeout: combined.timeout,
@@ -201,6 +291,7 @@ where
         latency_max_us: max,
         elapsed_ms: elapsed.as_millis() as u64,
         leak_clean,
+        pressure,
     }
 }
 
@@ -211,6 +302,8 @@ struct WorkerObs {
     timeout: u64,
     err_kinds: std::collections::BTreeMap<String, u64>,
     latencies_us: Vec<u64>,
+    max_consecutive: u64,
+    first_error_local_index: Option<u64>,
 }
 
 impl WorkerObs {
@@ -222,6 +315,14 @@ impl WorkerObs {
             *self.err_kinds.entry(k).or_insert(0) += v;
         }
         self.latencies_us.extend(other.latencies_us);
+        if other.max_consecutive > self.max_consecutive {
+            self.max_consecutive = other.max_consecutive;
+        }
+        self.first_error_local_index =
+            match (self.first_error_local_index, other.first_error_local_index) {
+                (None, x) | (x, None) => x,
+                (Some(a), Some(b)) => Some(a.min(b)),
+            };
     }
 }
 
@@ -288,14 +389,20 @@ mod tests {
 
     #[test]
     fn err_kinds_are_collected() {
+        // Single worker so the per-op alternation is deterministic.
+        // Workers can race for early-exit; using one worker removes
+        // that race without weakening what the test proves.
+        let counter = Arc::new(AtomicU64::new(0));
+        let inner = Arc::clone(&counter);
         let report = run(
             LoadRun {
-                workers: 2,
+                workers: 1,
                 stop: LoadStop::ops(20),
                 label: "errs",
             },
-            |worker| {
-                if worker == 0 {
+            move |_worker| {
+                let n = inner.fetch_add(1, Ordering::Relaxed);
+                if n % 2 == 0 {
                     OpOutcome::Err { kind: "boom" }
                 } else {
                     OpOutcome::Timeout
@@ -304,10 +411,8 @@ mod tests {
             None::<fn() -> bool>,
         );
         assert_eq!(report.ops_attempted, 20);
-        // The harness can race on the early-exit check, but both kinds
-        // must appear (per worker assignment above).
-        assert!(report.ops_err > 0, "{report:?}");
-        assert!(report.ops_timeout > 0, "{report:?}");
+        assert_eq!(report.ops_err, 10, "{report:?}");
+        assert_eq!(report.ops_timeout, 10, "{report:?}");
         assert_eq!(
             report.err_kinds.first().map(|(k, _)| k.as_str()),
             Some("boom")
@@ -326,5 +431,110 @@ mod tests {
             Some(|| false),
         );
         assert!(!report.leak_clean);
+    }
+
+    #[test]
+    fn pressure_summary_tracks_rate_burst_and_first_error() {
+        // Single worker so the local op index is deterministic.
+        // First 2 ops Ok, then 3 errors, then 2 Ok, then 1 err — so
+        // first error at op index 2, max_consecutive = 3, total = 4.
+        let counter = Arc::new(AtomicU64::new(0));
+        let inner = Arc::clone(&counter);
+        let report = run(
+            LoadRun {
+                workers: 1,
+                stop: LoadStop::ops(8),
+                label: "pressure",
+            },
+            move |_| {
+                let n = inner.fetch_add(1, Ordering::Relaxed);
+                match n {
+                    0 | 1 | 5 | 6 => OpOutcome::Ok,
+                    7 => OpOutcome::Err { kind: "burst_b" },
+                    _ => OpOutcome::Err { kind: "burst_a" },
+                }
+            },
+            None::<fn() -> bool>,
+        );
+        assert_eq!(report.ops_attempted, 8, "{report:?}");
+        assert_eq!(report.pressure.total, 4, "{report:?}");
+        // rate = 4/8 = 500 per mille
+        assert_eq!(report.pressure.rate_per_mille, 500, "{report:?}");
+        assert_eq!(report.pressure.max_consecutive, 3, "{report:?}");
+        assert_eq!(report.pressure.first_error_op_index, Some(2), "{report:?}");
+        assert_eq!(report.pressure.by_kind.len(), 2);
+        assert!(
+            report.pressure.by_kind.iter().any(|(k, _)| k == "burst_a"),
+            "{report:?}"
+        );
+        assert!(
+            report.pressure.by_kind.iter().any(|(k, _)| k == "burst_b"),
+            "{report:?}"
+        );
+    }
+
+    #[test]
+    fn pressure_summary_is_empty_on_clean_run() {
+        let report = run(
+            LoadRun {
+                workers: 2,
+                stop: LoadStop::ops(20),
+                label: "clean",
+            },
+            |_| OpOutcome::Ok,
+            None::<fn() -> bool>,
+        );
+        assert_eq!(report.pressure.total, 0, "{report:?}");
+        assert_eq!(report.pressure.rate_per_mille, 0);
+        assert_eq!(report.pressure.max_consecutive, 0);
+        assert!(report.pressure.first_error_op_index.is_none());
+        assert!(report.pressure.by_kind.is_empty());
+    }
+
+    #[test]
+    #[should_panic(expected = "LoadRun.workers must be > 0")]
+    fn zero_workers_panics() {
+        let _ = run(
+            LoadRun {
+                workers: 0,
+                stop: LoadStop::ops(1),
+                label: "no_workers",
+            },
+            |_| OpOutcome::Ok,
+            None::<fn() -> bool>,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "LoadRun.stop needs op_count or duration")]
+    fn no_stop_condition_panics() {
+        let _ = run(
+            LoadRun {
+                workers: 1,
+                stop: LoadStop {
+                    op_count: None,
+                    duration: None,
+                },
+                label: "no_stop",
+            },
+            |_| OpOutcome::Ok,
+            None::<fn() -> bool>,
+        );
+    }
+
+    #[test]
+    fn summary_line_includes_min_us_and_pressure() {
+        let report = run(
+            LoadRun {
+                workers: 1,
+                stop: LoadStop::ops(3),
+                label: "summary",
+            },
+            |_| OpOutcome::Ok,
+            None::<fn() -> bool>,
+        );
+        let line = report.summary_line();
+        assert!(line.contains("min_us="), "{line}");
+        assert!(line.contains("pressure total="), "{line}");
     }
 }

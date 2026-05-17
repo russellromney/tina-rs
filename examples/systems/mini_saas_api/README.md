@@ -120,19 +120,25 @@ cargo test --manifest-path examples/systems/mini_saas_api/Cargo.toml --test smok
 cargo test --manifest-path examples/systems/mini_saas_api/Cargo.toml --test soak -- --nocapture
 ```
 
-The soak proof drives 4 workers × 200 mixed-read ops via
-`tina_proof_harness::load` and prints one summary line shaped like:
+The soak proof drives 4 workers × 240 ops across three lanes
+(`/health`, `/items/1`, `/items/1/notify`) via
+`tina_proof_harness::load`. Sample one-line output:
 
 ```text
-soak load label=mini_saas_api_soak workers=4 ops=200 ok=158 err=42 \
-  timeout=0 p50_us=643 p99_us=2377 max_us=2957 elapsed_ms=43 \
-  leak_clean=true shutdown_clean=true capacity={ ... db.full=42 ... }
+soak load label=mini_saas_api_soak workers=4 ops=240 ok=206 err=34 timeout=0 \
+  min_us=422 p50_us=709 p99_us=3305 max_us=3756 elapsed_ms=59 leak_clean=true \
+  pressure total=34 rate_per_mille=141 max_consecutive=2 first_err_op=0 by_kind=[http_503:34] \
+  shutdown_clean=true capacity={ ... db.full=34 outbound.full=0 ... }
 ```
 
-The contract: every harness 5xx must map to a typed `db.full` event on
-the controller's `/debug/capacity` line (`db.full >= ops_err`). If the
-two diverge, the test fails closed because pressure is escaping the
-typed surface — the central proof Phase 108 exists to make easy.
+The contract: every harness 5xx must map to a typed pressure event on
+the controller's `/debug/capacity` line — either `db.full` or
+`outbound.full`. If `db.full + outbound.full < ops_err`, the test
+fails closed because pressure is escaping the typed surface. The
+typed `pressure` summary on the load report (rate, burst length,
+first error position, per-kind breakdown) lets specimens assert
+"pressure stayed under N per mille" or "no burst longer than K
+consecutive errors" without parsing the summary line.
 
 What this exposes when it fails:
 

@@ -144,8 +144,20 @@ pub fn run_soak(config: SoakConfig) -> anyhow::Result<SoakReport> {
 }
 
 pub fn one_request(addr: SocketAddr, request: &[u8]) -> anyhow::Result<ResponseParts> {
-    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(2))?;
-    stream.set_read_timeout(Some(Duration::from_secs(3)))?;
+    one_request_with_timeout(addr, request, Duration::from_secs(2))
+}
+
+/// Like [`one_request`] but with an explicit connect/read timeout.
+/// Used by [`run_soak`] so the harness inherits `SoakConfig::connect_timeout`.
+pub fn one_request_with_timeout(
+    addr: SocketAddr,
+    request: &[u8],
+    timeout: Duration,
+) -> anyhow::Result<ResponseParts> {
+    let mut stream = TcpStream::connect_timeout(&addr, timeout)?;
+    // Read timeout is the same window; we never want a stuck server
+    // to wedge a soak worker.
+    stream.set_read_timeout(Some(timeout))?;
     stream.write_all(request)?;
     stream.flush()?;
     let mut response = Vec::new();

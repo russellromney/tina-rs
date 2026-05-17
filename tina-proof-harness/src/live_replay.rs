@@ -24,7 +24,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use tina_runtime::{RuntimeEvent, TraceObserver, stable_trace_hash};
+use tina_runtime::{PressureSummary, RuntimeEvent, TraceObserver, stable_trace_hash};
 use tina_sim::dst::TraceShape;
 
 /// Live trace collector.
@@ -94,6 +94,20 @@ impl LiveTrace {
             event_count: guard.len(),
             trace_hash: stable_trace_hash(guard.iter()),
         }
+    }
+
+    /// Pressure summary for the captured trace.
+    ///
+    /// Counts `SendRejected`, `CallCompletionRejected`, and
+    /// `CallReplyRejected` events by reason — the same vocabulary the
+    /// runtime uses, so the live-side pressure surface is the same
+    /// one a specimen reads after `runtime.shutdown()`. Use this to
+    /// fail a live test closed when pressure escaped the typed
+    /// surface (e.g., `summary.any_full()` should be `false` on a
+    /// clean soak).
+    pub fn pressure_summary(&self) -> PressureSummary {
+        let guard = self.events.lock().expect("live trace lock");
+        PressureSummary::from_events(guard.iter())
     }
 
     /// Compare the live shape to a saved [`tina_sim::dst::ReplayCase`]
@@ -188,8 +202,8 @@ impl std::fmt::Display for LiveReplayMismatch {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tina::{IsolateId, ShardId};
-    use tina_runtime::{EventId, RuntimeEventKind};
+    use tina::{AddressGeneration, IsolateId, ShardId};
+    use tina_runtime::{EventId, RuntimeEventKind, SendRejectedReason};
 
     fn sample_event(id: u64) -> RuntimeEvent {
         RuntimeEvent::new(
@@ -198,6 +212,21 @@ mod tests {
             ShardId::new(0),
             IsolateId::new(1),
             RuntimeEventKind::HandlerStarted,
+        )
+    }
+
+    fn send_rejected_full_event(id: u64) -> RuntimeEvent {
+        RuntimeEvent::new(
+            EventId::new(id),
+            None,
+            ShardId::new(0),
+            IsolateId::new(1),
+            RuntimeEventKind::SendRejected {
+                target_shard: ShardId::new(0),
+                target_isolate: IsolateId::new(2),
+                target_generation: AddressGeneration::new(0),
+                reason: SendRejectedReason::Full,
+            },
         )
     }
 
@@ -254,5 +283,31 @@ mod tests {
         let mismatch = trace.compare_to(&drifted).expect("mismatch");
         assert!(mismatch.count_diverged());
         assert!(!mismatch.hash_diverged());
+    }
+
+    #[test]
+    fn pressure_summary_counts_send_rejected_full() {
+        let trace = LiveTrace::new();
+        let observer = trace.observer();
+        observer.on_event(&sample_event(1));
+        observer.on_event(&send_rejected_full_event(2));
+        observer.on_event(&send_rejected_full_event(3));
+        observer.on_event(&sample_event(4));
+        let pressure = trace.pressure_summary();
+        assert_eq!(pressure.send_rejected_full, 2);
+        assert_eq!(pressure.send_rejected_closed, 0);
+        assert!(pressure.non_zero());
+        assert!(pressure.any_full());
+    }
+
+    #[test]
+    fn pressure_summary_clean_on_handler_only_trace() {
+        let trace = LiveTrace::new();
+        let observer = trace.observer();
+        observer.on_event(&sample_event(1));
+        observer.on_event(&sample_event(2));
+        let pressure = trace.pressure_summary();
+        assert!(!pressure.non_zero());
+        assert!(!pressure.any_full());
     }
 }
