@@ -376,6 +376,31 @@ New capabilities must preserve:
 | Whole-framework ergonomics | The local nouns are mostly good, but the whole-service copied path is still too fragmented: prelude choice, config manifest, request/event split, defer/cancel/drain/report/shutdown, and README guidance need one coherent path. | Rewrite selected systems with a blessed service skeleton, then extract only helpers that remove repeated ceremony while keeping all suspension/failure/capacity facts visible. |
 | Core ecosystem parity | Ordinary Tokio apps still reach for local IPC, file streaming, codec helpers, admission/rate limits, saga/compensation patterns, mature pools, and async-boundary clarity. | Close these as boring capability slices with user-proof systems: media ingest, API gateway limits, checkout saga, Redis-ish keyspace, local admin/sidecar IPC, and soak proof. |
 
+Ecosystem hooks phase seed:
+
+- **Batteries and sockets.** Blessed Tina crates remain the default batteries
+  (`tina-http`, bridges, test harnesses), but each battery should plug into
+  public sockets where replacement is useful. Users can adopt the battery,
+  replace one socket, or use an explicit escape hatch.
+- **Capacity surface hook.** Custom services expose validated surface names,
+  current/high-water/cap/full/released counts, mode, discovery lines, and test
+  assertions that join the normal capacity summary.
+- **Bounded event sink hook.** Custom log/metric/event sinks must have caps,
+  full/drop/closed outcomes, high-water/dropped counts, and drain/shutdown
+  reports. No hidden unbounded observability queue.
+- **Bridge author kit.** Standardize install result, closer, metrics/pressure
+  report, config validation, tracing fields, late-result vocabulary, supplied
+  client ownership, and worker-terminal vs caller-observed outcome language.
+- **Sync codec adapter pattern.** A codec socket feeds bounded bytes, emits
+  typed frames/messages, returns `NeedMore`/`Full`/`Malformed`, and keeps parser
+  state replayable. Tina owns I/O and pressure; codecs own bytes.
+- **Runtime capability reports.** Runtime/rail crates report supported,
+  unsupported, poll/completion backed, cancel semantics, drain semantics, and
+  simulator support before any pluggable-rail work.
+- **Extension smoke proof.** Future IDD work should add external-looking crates
+  that use only public hooks: fake bridge, custom codec, custom capacity
+  surface, and bounded event sink.
+
 Whole-framework ergonomics phase seed:
 
 - **Blessed service skeleton.** One copied app shape for config manifest,
