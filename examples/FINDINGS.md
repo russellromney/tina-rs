@@ -690,66 +690,28 @@ forbids a shared bridge crate, but the *classifier vocabulary* is
 plain data and could live alongside `CallOutcome` without coupling
 the bridges themselves.
 
-### 29. `call.defer(async_bridge).reply(...)` from `handle_call` panics on async bridges
-
-**Surfaced by:** trying to write hermetic end-to-end tests for
-`system_webhook_relay::run_against_sqs` and
-`system_bounded_object_lane::run_against_s3`. Both wire a real
-`tina-aws-bridge` worker (SQS / S3) behind a lane/relay isolate that
-issues the bridge call from its `handle_call` via
-`call.defer(bridge_call).reply(closure)`.
-
-Observed concrete behaviour: the runtime panics on a shard thread
-with `"runtime attempted to deliver a call handler message with the
-wrong type"` (at `tina-runtime/src/lib.rs:4214`, the
-`handle_call_boxed` downcast). The panic kills the shard before the
-caller sees a reply; subsequent `call_blocking` returns `Closed`.
-
-The same pattern works against:
-
-- `tina-sqlite-bridge` (mini_saas_api Controller does
-  `call.defer(send_request(self.db, ...)).reply(...)` — passing tests),
-- the in-process `FakeOutbound` isolate in `system_webhook_relay`
-  (synchronous `call.reply(...)` from `handle_call`).
-
-It breaks against:
-
-- `tina-aws-bridge::SqsWorker` (async tokio-spawn + `sleep().then(Poll)`
-  + `reply_to_request` from `handle(Poll)`),
-- `tina-aws-bridge::S3Worker` (same shape).
-
-Difference between working SQLite and broken S3/SQS: SQLite owns a
-blocking `std::thread` and an `mpsc::Receiver`; S3/SQS own a Tokio
-runtime and a `tokio::sync::oneshot::Receiver`. Both bridges follow
-the same admit → `sleep().then(Poll)` → `reply_to_request` shape, so
-the visible difference is the spawn / receiver primitives, not the
-isolate-level effect grammar.
-
-The `tina-aws-bridge` integration tests (`tests/sqs_bridge.rs`,
-`tests/bridge.rs`, plus the new `tests/dynamodb_bridge.rs`,
-`tests/sns_bridge.rs`, `tests/secrets_bridge.rs`) exercise these
-bridges from a caller isolate routed through `handle` (no
-`call_context` inheritance), and all pass — confirming the bridges
-themselves work and the bug is specific to the `handle_call → bridge
-call → typed reply through translator` chain.
-
-**Build:** investigate why `complete_isolate_call → translator →
-enqueue_entry_message` ends with a non-`Box<RelayMsg>` payload
-arriving at the relay's `handle_call`. Suspected: the runtime is
-re-routing the bridge's translated reply through the relay's
-`handle_call` adapter but the `Box<dyn Any>` does not contain the
-translator's output. Likely candidates are a typed-id mismatch in
-`erase_isolate_call_translator` or a routing race where the SQS
-worker's `Poll` continuation lands in the relay's mailbox.
-
-`run_against_sqs` and `run_against_s3` are public and compile, so
-once the runtime path is fixed, hermetic e2e tests can be added
-without API changes.
-
 ## Closed
 
 Findings shipped by recent phases. Numbers are kept stable so
 existing README references stay valid.
+
+### 29. `call.defer(async_bridge).reply(...)` from `handle_call` — Phase 104 proof
+
+The suspected runtime gap was re-tested before Phase 104 merged. The
+general runtime path already works (`handle_call` defers through a
+multi-turn callee and preserves the original caller). Phase 104 now
+pins the AWS-shaped version directly with hermetic S3 and SQS bridge
+tests:
+
+- `tina-aws-bridge/tests/bridge.rs::handle_call_defer_through_s3_bridge_replies_to_original_caller`
+- `tina-aws-bridge/tests/sqs_bridge.rs::handle_call_defer_through_sqs_bridge_replies_to_original_caller`
+
+Both tests put a relay/lane isolate in front of the AWS bridge, issue
+`call.defer(send_s3/send_sqs(...)).reply(...)` from `handle_call`, let
+the AWS bridge complete through its async SDK task + `sleep().then(Poll)`
+loop, and assert the original caller receives the final reply. The public
+`run_against_s3` / `run_against_sqs` paths remain available for larger
+system specimens, but the panic report is closed.
 
 ### 17. Host-thread `call_blocking` — Phase 068 follow-up
 
