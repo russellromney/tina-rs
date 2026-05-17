@@ -376,6 +376,26 @@ New capabilities must preserve:
 | Whole-framework ergonomics | The local nouns are mostly good, but the whole-service copied path is still too fragmented: prelude choice, config manifest, request/event split, defer/cancel/drain/report/shutdown, and README guidance need one coherent path. | Rewrite selected systems with a blessed service skeleton, then extract only helpers that remove repeated ceremony while keeping all suspension/failure/capacity facts visible. |
 | Core ecosystem parity | Ordinary Tokio apps still reach for local IPC, file streaming, codec helpers, admission/rate limits, saga/compensation patterns, mature pools, and async-boundary clarity. | Close these as boring capability slices with user-proof systems: media ingest, API gateway limits, checkout saga, Redis-ish keyspace, local admin/sidecar IPC, and soak proof. |
 
+Whole-framework ergonomics phase seed:
+
+- **Blessed service skeleton.** One copied app shape for config manifest,
+  runtime setup, listener, bridge/pool install, request-scoped cancellation,
+  health/readiness, shutdown, topology/capacity summary, and replay seed/facts.
+- **Prelude tiers.** Keep `tina::prelude::*` boring for app authors; move raw
+  escape hatches into explicit advanced imports.
+- **Noun guide.** One short map for `Effect`, request/event, `RequestContext`,
+  `CallOutcome`, pending helpers, pool leases, capacity reports, and trace
+  reports. The point is "which noun do I use right now?"
+- **Fluent but honest workflows.** Defer, defer-cancelable, race/join,
+  recurring tick, pressure policy, and shutdown helpers may compress ceremony
+  only when the suspension point, failure policy, capacity, and trace step stay
+  visible.
+- **Specimen rewrite.** Rewrite a small fixed set of systems on the blessed
+  path, then delete stale README guidance and move solved pain to history.
+- **Cheap-model proof.** Give the docs/skeleton to a fresh model, record what it
+  wires wrong, and either make the mistake a compile error or fix the copied
+  path.
+
 ### Event/request split proposal
 
 `system_cache_with_fill` exposed a general footgun in the current authoring
