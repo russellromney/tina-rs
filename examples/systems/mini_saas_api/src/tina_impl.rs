@@ -121,7 +121,16 @@ pub fn run(mode: RunMode) -> anyhow::Result<RunReport> {
         .wait(Duration::from_secs(2))
         .map_err(|e| anyhow::anyhow!("bind main listener: {e:?}"))?;
 
+    // Startup summary: one compact line naming every bounded surface
+    // we declared so far, plus surfaces we *know* exist but cannot
+    // measure yet from this scope (sqlite live pressure is sampled
+    // later via call). The line is grep-friendly and matches the
+    // shape used by ServicePressureReport::summary_line.
+    let startup = build_startup_summary(addr, notify_addr);
+
     let mut report = drive_script(addr, mode)?;
+    report.startup_summary_line = startup.summary_line;
+    report.startup_discovery_lines = startup.discovery_lines;
 
     let in_flight_addr = addr;
     let in_flight = std::thread::spawn(move || post(in_flight_addr, "/items/1/notify", "slow"));
@@ -276,9 +285,11 @@ fn drive_script(addr: std::net::SocketAddr, mode: RunMode) -> anyhow::Result<Run
         .push(observation("missing_item", missing.status, &missing.body));
     let method = put(addr, "/items/1")?;
     report.method_405 = method.status == 405;
-    report
-        .observations
-        .push(observation("method_not_allowed", method.status, &method.body));
+    report.observations.push(observation(
+        "method_not_allowed",
+        method.status,
+        &method.body,
+    ));
     let bad_request = post(addr, "/items", "bad")?;
     report.bad_request_400 = bad_request.status == 400;
     report.observations.push(observation(
@@ -322,12 +333,9 @@ fn drive_script(addr: std::net::SocketAddr, mode: RunMode) -> anyhow::Result<Run
         let r2 = t2
             .join()
             .map_err(|_| anyhow::anyhow!("second pressure request panicked"))??;
-        report.outbound_pressure_503 =
-            [(&r1, "pressure_first"), (&r2, "pressure_second")]
-                .into_iter()
-                .any(|(response, _)| {
-                    response.status == 503 && response.body.contains("outbound_full")
-                });
+        report.outbound_pressure_503 = [(&r1, "pressure_first"), (&r2, "pressure_second")]
+            .into_iter()
+            .any(|(response, _)| response.status == 503 && response.body.contains("outbound_full"));
         report
             .observations
             .push(observation("pressure_first", r1.status, &r1.body));
@@ -824,17 +832,17 @@ impl Controller {
                         SqliteRequest::query_rows("SELECT 1", 1),
                         REQUEST_TIMEOUT,
                     ))
-                    .reply(move |req, outcome| ControllerMsg::ReadyDb(req, ingress_stopped, outcome))
+                    .reply(move |req, outcome| {
+                        ControllerMsg::ReadyDb(req, ingress_stopped, outcome)
+                    })
             }
-            (http::Method::GET, "/debug/capacity") => {
-                call_ctx
-                    .defer(call(
-                        self.outbound_pool,
-                        WorkerPoolMsg::PressureReport,
-                        REQUEST_TIMEOUT,
-                    ))
-                    .reply(ControllerMsg::CapacityPool)
-            }
+            (http::Method::GET, "/debug/capacity") => call_ctx
+                .defer(call(
+                    self.outbound_pool,
+                    WorkerPoolMsg::PressureReport,
+                    REQUEST_TIMEOUT,
+                ))
+                .reply(ControllerMsg::CapacityPool),
             _ if !self.drain.is_open() => {
                 call_ctx.reply(text(StatusCode::SERVICE_UNAVAILABLE, "ingress_stopped\n"))
             }
@@ -882,15 +890,14 @@ impl Controller {
             return call.reply(text(StatusCode::BAD_REQUEST, "bad_id\n"));
         };
         match (&request.method, notify) {
-            (&http::Method::GET, false) => {
-                call.defer(send_request(
+            (&http::Method::GET, false) => call
+                .defer(send_request(
                     self.db,
                     SqliteRequest::query_rows("SELECT name FROM items WHERE id = ?", 1)
                         .params(vec![SqliteValue::Integer(id)]),
                     REQUEST_TIMEOUT,
                 ))
-                .reply(move |req, outcome| ControllerMsg::Loaded(req, id, outcome))
-            }
+                .reply(move |req, outcome| ControllerMsg::Loaded(req, id, outcome)),
             (&http::Method::POST, true) => {
                 let slow = body_text(&request).contains("slow");
                 call.defer(send_request(
@@ -1070,4 +1077,82 @@ fn text(status: StatusCode, body: impl Into<String>) -> HttpResponse {
         http::HeaderValue::from_static("text/plain"),
     );
     response
+}
+
+struct StartupSummary {
+    summary_line: String,
+    discovery_lines: Vec<String>,
+}
+
+fn build_startup_summary(
+    main_addr: std::net::SocketAddr,
+    notify_addr: std::net::SocketAddr,
+) -> StartupSummary {
+    use tina::capacity::{CapacityMode, CapacitySurfaceReport};
+    use tina_runtime::{ServicePressureReport, format_discovery_line};
+
+    // Surfaces declared at startup. We do not sample live counters
+    // here — that happens later via `/debug/capacity`. The startup
+    // line is a *topology* snapshot: names + caps, plus explicit
+    // Unavailable markers for surfaces we know exist but cannot
+    // measure from this scope.
+    let body_cap = CapacitySurfaceReport::weighted(
+        "http.request_body",
+        CapacityMode::Fixed,
+        BODY_CAP_BYTES,
+        0,
+        0,
+        0,
+        "bytes",
+    );
+    let controller_mailbox = CapacitySurfaceReport::count(
+        "controller.mailbox",
+        CapacityMode::Fixed,
+        CONTROLLER_MAILBOX_CAPACITY,
+        0,
+        0,
+        0,
+    );
+    let db_pool = CapacitySurfaceReport::count("db.capacity", CapacityMode::Fixed, 1, 0, 0, 0);
+    let outbound_pool =
+        CapacitySurfaceReport::count("outbound.capacity", CapacityMode::Fixed, 1, 0, 0, 0);
+    let mut report = ServicePressureReport::new("mini_saas_api");
+    report.add_measured("body", body_cap);
+    report.add_measured("mailbox", controller_mailbox);
+    report.add_measured("pool_leases", db_pool);
+    report.add_measured("pool_leases", outbound_pool);
+    // The sqlite bridge measures its own pressure but the bridge is
+    // sampled live; at startup the count cap is the only fact we own
+    // here. The other live counters are reported via `/debug/capacity`
+    // and `terminal_line`. Name them so on-call sees "we plan to
+    // measure this".
+    report.add_unavailable(
+        "db.bridge_in_flight",
+        "bridge",
+        "sampled live via SqliteMetricsHandle",
+    );
+    report.add_unavailable(
+        "outbound.bridge_in_flight",
+        "bridge",
+        "sampled live via WorkerPool reports",
+    );
+
+    let topology =
+        format!("topology service=mini_saas_api main_addr={main_addr} notify_addr={notify_addr}");
+    let summary_line = format!("startup {} | {}", topology, report.summary_line());
+    let mut discovery_lines = vec![topology];
+    for surface in &report.surfaces {
+        discovery_lines.push(match &surface.state {
+            tina_runtime::ServiceSurfaceState::Measured(r) => format_discovery_line(r.as_ref()),
+            tina_runtime::ServiceSurfaceState::Unavailable { reason } => format!(
+                "capacity surface={name} kind={kind} state=unavailable reason={reason:?}",
+                name = surface.name,
+                kind = surface.kind,
+            ),
+        });
+    }
+    StartupSummary {
+        summary_line,
+        discovery_lines,
+    }
 }

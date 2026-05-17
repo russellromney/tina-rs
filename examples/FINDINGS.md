@@ -650,6 +650,50 @@ them in `handle` and use `tina::send` from `handle_call`. The first form
 of `WebSocketSessionHandle::send_effect` should also probably gain a
 debug-only assertion if it is invoked from inside a `CallContext`.
 
+### 27. Lease handoff into a `PendingReplies` slot
+
+**Surfaced by:** `system_api_gateway_limits`, `system_soak_http_db`.
+
+A request that admits against a `SharedCapacityScope` and then parks
+its reply in `PendingReplies` has to carry the `SharedLease` in a
+sidecar `HashMap<qid, SharedLease>` so the lease outlives the
+post-sleep handler. Both new specimens do this manually. The mapping
+between "this qid" and "this lease" is invariant under the slot
+lifecycle and would compose cleanly into the slot itself.
+
+**Build:** a slot variant — `PendingReplies::try_insert_with_lease(qid,
+slot, lease)` — or a generic `SharedLease`-carrying wrapper that
+`reply_to` consumes. Either form removes the parallel map.
+
+### 28. Service-level scope registry mirroring `register_with_capacity`
+
+**Surfaced by:** `system_api_gateway_limits`.
+
+`SharedCapacityScope` is shard-local. A service today builds one with
+`SharedCapacityScope::new("gateway.in_flight", "weight", 4)` and clones
+the handle into every isolate that needs to admit. That works, but a
+service builder may want `register_scope("name", unit, max)` next to
+`register_with_capacity` so the discovery report and the lifecycle are
+owned by the runtime, not by user code.
+
+**Build:** a runtime-side `SharedScopeRegistry` keyed by name with
+register/get/snapshot. Reuse the existing `CapacitySummary` shape so
+the runtime can produce one merged discovery line per shard.
+
+### 29. Effect chaining over multiple runtime calls inside one logical request
+
+**Surfaced by:** `system_soak_http_db`.
+
+A request rail that admits HTTP, sleeps, releases, admits DB, sleeps,
+replies needs two custom message variants (`HttpReleased`, `DbReleased`)
+so the post-sleep state mutation can land in `handle`. The pattern is
+the same across systems: "after this timer wakes, do the next stage".
+Today every system rebuilds the variants by hand.
+
+**Build:** an effect combinator like `sleep(d).then_in_isolate(|this:
+&mut Self| this.start_db(...))` that wires the message envelope and
+the post-wake state mutation in one place.
+
 ## Closed
 
 Findings shipped by recent phases. Numbers are kept stable so

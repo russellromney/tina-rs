@@ -97,6 +97,46 @@ fn smoke_covers_service_layers() {
         report.live_replay_fact,
         "case=mini_saas_body_full ops=[post:/items:41bytes] fact=status_413 cap=32"
     );
+
+    // Startup summary line names every bounded surface, including
+    // the two we cannot measure from this scope (bridge in-flight is
+    // sampled live). The line is one greppable key=value sequence.
+    let startup = &report.startup_summary_line;
+    assert!(
+        startup.starts_with("startup topology service=mini_saas_api "),
+        "startup_summary_line shape: {startup}"
+    );
+    assert!(startup.contains("service=mini_saas_api"), "{startup}");
+    assert!(startup.contains("measured=4"), "{startup}");
+    assert!(startup.contains("unavailable=2"), "{startup}");
+    assert!(
+        startup.contains("db.bridge_in_flight=unavailable"),
+        "{startup}"
+    );
+    assert!(
+        startup.contains("outbound.bridge_in_flight=unavailable"),
+        "{startup}"
+    );
+
+    // Topology line (the head of the startup output) names both
+    // listen addresses.
+    let topology = report
+        .startup_discovery_lines
+        .first()
+        .expect("startup_discovery_lines has a topology line");
+    assert!(topology.starts_with("topology "), "{topology}");
+    assert!(topology.contains("service=mini_saas_api"), "{topology}");
+    assert!(topology.contains("main_addr="), "{topology}");
+    assert!(topology.contains("notify_addr="), "{topology}");
+
+    // Smoke must not see any unexpected full/drop. The smoke run
+    // intentionally produces ONE body_full (request bigger than
+    // BODY_CAP_BYTES); every other surface stays clean.
+    assert_eq!(capacity["http.body_full"], "1");
+    assert_eq!(capacity["outbound.full"], "0");
+    assert_eq!(capacity["db.full"], "0");
+    assert_eq!(capacity["http.body_timeout"], "0");
+    assert_eq!(capacity["http.body_io_error"], "0");
 }
 
 #[test]
