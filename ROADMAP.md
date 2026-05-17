@@ -353,6 +353,74 @@ framework before public release-story work.
 | **Alpaca rename** | Before public launch, rename the project/crates/docs away from Tina to Alpaca so the lineage is respectful and clear: independently maintained Rust framework, inspired by Peter Mbanugo's Tina/Odin and Seastar, not an official Tina port. |
 | **Barend Biesheuvel visible flow ergonomics** | Optional high-level ergonomics only after the local runtime core feels boring: a `flow!`-style authoring surface that preserves named suspension points, visible failure policy, trace step names, and ordinary Tina message/effect expansion. No fake async, no hidden retries, no hidden queues. |
 
+### Post-109 capability backlog
+
+These are not IDD phases yet. They are capability clusters to design from the
+evidence produced by phases 103-109 and the systems specimens. Future IDD plans
+should turn them into implementation slices only after the repeated shapes are
+clear.
+
+The north star is not merely "actor-style services." It is bounded services
+with deterministic simulation/replay as a design constraint all the way down.
+New capabilities must preserve:
+
+- bounded admission or explicit bounded-exception policy
+- typed `Full` / `Closed` / `Timeout` / cancel outcomes
+- trace and capacity facts that can be summarized
+- simulator/replay support, or an honest unsupported fact
+- user-proof through specimens/systems, not only unit tests
+
+| Cluster | Gap | Future IDD shape |
+|---|---|---|
+| Ecosystem extension hooks | Tina needs stable seams for third-party bridges, sync codecs, bounded event sinks, custom capacity surfaces, service policies, and runtime capability reports. | Build small author kits and extension smoke crates that use only public APIs. No dynamic plugin ABI, no unbounded extension queues, no hook that bypasses trace/cancel/capacity truth. |
+| Whole-framework ergonomics | The local nouns are mostly good, but the whole-service copied path is still too fragmented: prelude choice, config manifest, request/event split, defer/cancel/drain/report/shutdown, and README guidance need one coherent path. | Rewrite selected systems with a blessed service skeleton, then extract only helpers that remove repeated ceremony while keeping all suspension/failure/capacity facts visible. |
+| Core ecosystem parity | Ordinary Tokio apps still reach for local IPC, file streaming, codec helpers, admission/rate limits, saga/compensation patterns, mature pools, and async-boundary clarity. | Close these as boring capability slices with user-proof systems: media ingest, API gateway limits, checkout saga, Redis-ish keyspace, local admin/sidecar IPC, and soak proof. |
+
+Ecosystem hooks phase seed:
+
+- **Batteries and sockets.** Blessed Tina crates remain the default batteries
+  (`tina-http`, bridges, test harnesses), but each battery should plug into
+  public sockets where replacement is useful. Users can adopt the battery,
+  replace one socket, or use an explicit escape hatch.
+- **Capacity surface hook.** Custom services expose validated surface names,
+  current/high-water/cap/full/released counts, mode, discovery lines, and test
+  assertions that join the normal capacity summary.
+- **Bounded event sink hook.** Custom log/metric/event sinks must have caps,
+  full/drop/closed outcomes, high-water/dropped counts, and drain/shutdown
+  reports. No hidden unbounded observability queue.
+- **Bridge author kit.** Standardize install result, closer, metrics/pressure
+  report, config validation, tracing fields, late-result vocabulary, supplied
+  client ownership, and worker-terminal vs caller-observed outcome language.
+- **Sync codec adapter pattern.** A codec socket feeds bounded bytes, emits
+  typed frames/messages, returns `NeedMore`/`Full`/`Malformed`, and keeps parser
+  state replayable. Tina owns I/O and pressure; codecs own bytes.
+- **Runtime capability reports.** Runtime/rail crates report supported,
+  unsupported, poll/completion backed, cancel semantics, drain semantics, and
+  simulator support before any pluggable-rail work.
+- **Extension smoke proof.** Future IDD work should add external-looking crates
+  that use only public hooks: fake bridge, custom codec, custom capacity
+  surface, and bounded event sink.
+
+Whole-framework ergonomics phase seed:
+
+- **Blessed service skeleton.** One copied app shape for config manifest,
+  runtime setup, listener, bridge/pool install, request-scoped cancellation,
+  health/readiness, shutdown, topology/capacity summary, and replay seed/facts.
+- **Prelude tiers.** Keep `tina::prelude::*` boring for app authors; move raw
+  escape hatches into explicit advanced imports.
+- **Noun guide.** One short map for `Effect`, request/event, `RequestContext`,
+  `CallOutcome`, pending helpers, pool leases, capacity reports, and trace
+  reports. The point is "which noun do I use right now?"
+- **Fluent but honest workflows.** Defer, defer-cancelable, race/join,
+  recurring tick, pressure policy, and shutdown helpers may compress ceremony
+  only when the suspension point, failure policy, capacity, and trace step stay
+  visible.
+- **Specimen rewrite.** Rewrite a small fixed set of systems on the blessed
+  path, then delete stale README guidance and move solved pain to history.
+- **Cheap-model proof.** Give the docs/skeleton to a fresh model, record what it
+  wires wrong, and either make the mistake a compile error or fix the copied
+  path.
+
 ### Event/request split proposal
 
 `system_cache_with_fill` exposed a general footgun in the current authoring
@@ -686,7 +754,8 @@ hidden per-key unbounded queues.
 
 These are not planning phases. They are capability gaps to close as real
 implementation slices pull on them. Each entry should land as boring code,
-tests, and specimens when the adjacent work proves the shape.
+tests, specimens, and replay/unsupported truth when the adjacent work proves the
+shape.
 
 | Capability | Build | User outcome |
 |---|---|---|
@@ -722,6 +791,8 @@ tests, and specimens when the adjacent work proves the shape.
 | Pool maturity | Idle eviction, max lifetime, health checks, retire/reuse policy, pooled HTTP/2/gRPC clients, and DB pool consumers that reuse the same pressure vocabulary. | Pools become production resources, not just first-form acquire/release examples. |
 | Async ecosystem boundary | A clean answer for Future/Stream interop: which Tokio crates are bridge-only, which sync codecs Tina adopts, and whether a bounded Future/Stream bridge is worth building. | Users know which Tokio apps Tina can replace natively and where a bridge is the honest boundary. |
 | Benchmarks with humility | Focused comparisons against Tokio/hyper/tungstenite/tonic only after equivalent semantics exist, labeled as local-machine evidence, with capacity and failure behavior included. | Performance claims do not outrun Tina's boundedness and correctness story. |
+| Ecosystem extension hooks | Public extension seams for bridge authors, codec adapters, capacity surfaces, bounded event sinks, and service policies, with extension smoke crates that use no private APIs. | Tina can grow an ecosystem without every new capability landing in core or weakening bounded/DST truth. |
+| Whole-framework ergonomics | One coherent copied path for a real service: prelude, config/budget manifest, public requests/internal events, defer/cancel/drain/report/shutdown, and replay hooks. | A new developer or cheap model can build a correct bounded + replay-aware service without stitching ten specimens together. |
 
 Closed follow-ups from Phase 074 (HTTP body streaming, native HTTP/1):
 
