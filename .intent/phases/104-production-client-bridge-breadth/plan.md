@@ -97,6 +97,20 @@ Add tiny classifiers only where they are obvious:
 
 No broad policy object. The caller decides retry safety.
 
+## User Proof
+
+Update these proof surfaces:
+
+- `system_bounded_object_lane`: real AWS S3-shaped path plus hermetic fake
+  object path for default tests.
+- `system_webhook_relay`: SNS/SQS or outbound bridge classifier path for
+  retry/dead-letter policy.
+- One small bridge specimen per new AWS service with copied
+  install/request/close commands.
+
+Hermetic tests use fake/local clients. Real cloud tests are opt-in and skipped
+by default. The copied path must not require a real AWS account.
+
 ## Required Proof
 
 - Targeted tests for every new operation.
@@ -105,6 +119,9 @@ No broad policy object. The caller decides retry safety.
 - Supplied-client config ownership tests.
 - Tracing tests for operation/service fields.
 - Capacity reports cannot lie about installed capacity.
+- System smoke proof for `system_bounded_object_lane` and `system_webhook_relay`
+  using fake/local clients.
+- README findings capture where bridge ergonomics still hurt.
 - Docs show copied paths, not raw internal messages.
 
 ## Done Means

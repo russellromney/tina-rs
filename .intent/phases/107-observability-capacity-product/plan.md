@@ -91,6 +91,17 @@ simulator, the assertion must work there too. If it does not, the report says
 Update the production skeleton specimen plus two pressure-heavy specimens to
 print or assert capacity summaries. Leave tiny examples alone.
 
+## User Proof
+
+Update:
+
+- `mini_saas_api`: prints one compact startup/topology/capacity summary and
+  asserts no unexpected full/drop in smoke.
+- `system_api_gateway_limits`: proves shared weighted capacity.
+- `system_soak_http_db`: emits discovery lines usable in CI.
+
+Every report line must be grep-friendly and copyable into a test assertion.
+
 ## Required Proof
 
 - Shared scope fill/release/refill.
@@ -99,6 +110,7 @@ print or assert capacity summaries. Leave tiny examples alone.
 - Runtime summary includes at least one pool, bridge, listener, and body surface.
 - CI-style assertion failure has copyable message.
 - DST replay preserves relevant pressure facts.
+- At least three README examples show exact commands and output shape.
 - No report path allocates unbounded storage.
 
 ## Done Means

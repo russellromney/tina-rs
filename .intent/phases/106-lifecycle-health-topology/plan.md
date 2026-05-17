@@ -99,6 +99,22 @@ Update one system specimen into the copied skeleton:
 
 This is the "start here" shape for real apps.
 
+## User Proof
+
+Update `mini_saas_api` into the canonical skeleton:
+
+- `GET /health`
+- `GET /ready`
+- graceful shutdown trigger
+- in-flight request during shutdown
+- bridge/pool/listener close report
+- capacity summary
+- topology summary
+- README section showing what each lifecycle state means
+
+Add one smaller non-HTTP proof in `system_metrics_shipper` so the helper does
+not become HTTP-shaped by accident.
+
 ## Required Proof
 
 - Service starts NotReady, becomes Ready, enters Draining, then Stopped.
@@ -108,6 +124,8 @@ This is the "start here" shape for real apps.
 - Topology lists real started surfaces.
 - Shutdown with stuck child returns a timeout report.
 - Signal-driven shutdown works in live runtime.
+- `mini_saas_api` smoke covers health, ready, shutdown, and final report.
+- README findings say what lifecycle code became shorter or clearer.
 - DST case for shutdown ordering.
 
 ## Done Means

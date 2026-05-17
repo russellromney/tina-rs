@@ -92,6 +92,21 @@ Systems specimens must have:
 
 Make the harness easy enough for cheap model sessions to use.
 
+## User Proof
+
+Convert the harness into real system checks:
+
+- `system_realtime_rooms`: bad-peer or slow-reader proof.
+- `mini_saas_api`: load/soak proof with capacity summary.
+- `system_live_replay_bugbox`: live capture -> replay -> shrink path.
+
+Each system README must show:
+
+- smoke command
+- load/bad-peer/replay command
+- expected short output shape
+- what finding the run is meant to expose
+
 ## Required Proof
 
 - One load/soak test catches pressure without flaking.
@@ -99,6 +114,7 @@ Make the harness easy enough for cheap model sessions to use.
 - One live trace is saved and replayed in simulator.
 - Shrink helper returns refreshed count/hash.
 - CI commands documented.
+- At least three systems use the harness instead of private ad hoc drivers.
 - Harness failure output says what cap/event/lifecycle fact failed.
 
 ## Done Means
