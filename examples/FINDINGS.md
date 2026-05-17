@@ -650,6 +650,46 @@ them in `handle` and use `tina::send` from `handle_call`. The first form
 of `WebSocketSessionHandle::send_effect` should also probably gain a
 debug-only assertion if it is invoked from inside a `CallContext`.
 
+### 27. AWS bridge surface duplication across services
+
+**Surfaced by:** adding DynamoDB / SNS / Secrets Manager workers to
+`tina-aws-bridge`.
+
+Each AWS service worker repeats the same scaffolding: `OwnedRuntime`
+wrapper, `*MetricsInner` struct with the same eight counters plus
+service-specific ones, `note_admit_kind` / `note_terminal_kind` /
+`in_flight_kinds`, `*Closer::close_and_drain` polling loop, and the
+admit/poll/timeout state machine. Five services share roughly 80% of
+their lifecycle code. The phase plan explicitly forbade a shared bridge
+base crate to keep the per-service stories independent, so all five live
+side-by-side with copy-pasted plumbing.
+
+**Build:** when the bridge surface stops growing in shape, factor out
+the common state machine into an internal `bridge_core` module within
+`tina-aws-bridge` (still not a separate crate). The factoring needs to
+preserve each service's per-error tally semantics — counters like
+`DynamoMetrics::conditional_check_failed` or
+`SecretsMetrics::decryption_failed` are service-specific. A trait that
+the per-service module implements (validate, run_request, classify_sdk
+error, tally_terminal) is probably the right shape.
+
+### 28. Bridge classifier vocabulary lives in `tina-aws-bridge`
+
+**Surfaced by:** `system_webhook_relay`, classifier extension traits.
+
+`BridgeOutcomeClass` / `TransientReason` / `FatalReason` are useful
+outside AWS too — the reqwest bridge already has `ReqwestOutcomeClass`
+with its own per-bridge vocabulary. A relay or retry-driver needs
+*both* shapes to classify mixed outcomes (one outbound HTTP, one SQS)
+the same way, so callers re-classify into a private enum.
+
+**Build:** decide whether the bridge classifier should be in
+`tina-runtime` (shared by all bridges) or whether each bridge keeps
+its own private vocabulary and callers map at the boundary. The plan
+forbids a shared bridge crate, but the *classifier vocabulary* is
+plain data and could live alongside `CallOutcome` without coupling
+the bridges themselves.
+
 ## Closed
 
 Findings shipped by recent phases. Numbers are kept stable so

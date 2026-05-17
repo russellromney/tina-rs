@@ -63,7 +63,7 @@ ships a Tokio client.
 | `tina-reqwest-bridge` | Tina caller → outbound HTTP via `reqwest` | A Tina service needs outbound HTTP/2, redirects, cookies, system trust roots, or other mature web-client behaviour. Native HTTPS/1.1 from `tina-http::HttpClient` covers single-request DER-rooted calls; native HTTP/2 is server-side h2c first form only; reqwest covers everything else. |
 | `tina-sqlite-bridge` | Tina caller → SQLite via `rusqlite` | A Tina service needs an in-process SQL database. SQLite is sync C; the bridge owns one connection on a blocking std thread. Autocommit only; no pool, no transactions in first form. |
 | `tina-sqlx-bridge` | Tina caller → Postgres via `sqlx::PgPool` | A Tina service needs to reach a real Postgres without blocking shard threads. Two-runtime cost: the bridge spawns SQLx work on Tokio. Postgres-first. Ships `Execute`, `FetchOne`, bounded `FetchMany`, atomic-script `Transaction`, and opt-in DB-side cancel. Generic `sqlx::Database`, ORM, migrations, and user-struct row mapping stay non-goals. |
-| `tina-aws-bridge` | Tina caller → AWS SDK S3/SQS | A Tina service needs AWS SDK behavior without letting AWS/Hyper/Tokio pressure become invisible. Ships S3 (`PutObject`, bounded `GetObject`, `HeadObject`, `DeleteObject`) and SQS (`SendMessage`, `ReceiveMessage`, `DeleteMessage`). The SDK still owns SigV4, credentials, HTTP, TLS, endpoints, and service protocols. |
+| `tina-aws-bridge` | Tina caller → AWS SDK S3/SQS/DynamoDB/SNS/Secrets Manager | A Tina service needs AWS SDK behavior without letting AWS/Hyper/Tokio pressure become invisible. Ships S3 (`PutObject`, bounded `GetObject`, `HeadObject`, `DeleteObject`), SQS (`SendMessage`, `ReceiveMessage`, `DeleteMessage`), DynamoDB (`GetItem`, `PutItem`, `UpdateItem`, `DeleteItem`, `Query` with typed capacity facts), SNS (`Publish`), and Secrets Manager (`GetSecretValue`). The SDK still owns SigV4, credentials, HTTP, TLS, endpoints, and service protocols. |
 
 Each crate is small, opt-in, and bounded. Native Tina crates
 (`tina-http`, etc.) do not depend on any bridge; bridges do not leak
@@ -219,6 +219,9 @@ a missing column.
 | `tina-sqlx-bridge` | `PgWorker::install(&runtime, cfg)` builds a `PgPool` and a small Tokio runtime | `PgWorker::install_with_pool(&runtime, cfg, pool, handle)` (SQLx settings on the supplied pool stay caller-owned; the supplied Tokio runtime is never shut down by the bridge) | `PgCloser::close()` flags closed; does **not** close the SQLx pool. Owned pool drops with the bridge; supplied pool stays caller-owned. | no bounded drain helper; SQLx queries keep running until natural completion (or until DB-side cancel fires under `with_cancel_on_timeout`) | `PgMetrics::late_results` — spawned SQLx task completed after the bridge surfaced `PgError::Timeout`. Does **not** count Postgres-side execution that continues past the future drop, nor the caller-observed `CallOutcome::Timeout` path (that lives in the trace as `CallReplyRejected`). | `tina_sqlx.bridge.call`, `tina_sqlx.bridge` |
 | `tina-aws-bridge` (S3) | `install_s3(&runtime, cfg)` builds an SDK client and a small Tokio runtime | `S3Worker::with_supplied_client(cfg, client, handle)` then `runtime.register_with_capacity` (caller-owned client owns SigV4/credentials/HTTP/TLS/SDK retry; `sdk_max_attempts` reports `0`/unknown). Caller's Tokio runtime is never shut down by the bridge. | `S3Closer::close()` flags closed; new admissions reply `S3Error::Closed` | `S3Closer::close_and_drain(timeout)` waits up to `timeout` for already-admitted SDK work to leave the in-flight set; reports `in_flight_remaining` + per-operation `in_flight_kinds` on deadline. Spawned SDK futures are **not aborted**: a bridge timeout means Tina stopped waiting, not that AWS/Hyper cancelled bytes. | `S3Metrics::late_results` — SDK future terminal after the bridge already surfaced `S3Error::Timeout`. Until the SDK future finishes, it keeps occupying `max_in_flight` capacity. | `tina_aws.bridge.call`, `tina_aws.bridge` |
 | `tina-aws-bridge` (SQS) | `install_sqs(&runtime, cfg)` | `SqsWorker::with_supplied_client(cfg, client, handle)` (same ownership split as S3) | `SqsCloser::close()` flags closed | `SqsCloser::close_and_drain(timeout)` mirrors the S3 shape | `SqsMetrics::late_results` mirrors S3 — SDK terminal after bridge timeout. SQS state (sent, visibility extended, deleted) is **not** rolled back when the bridge stops waiting. | `tina_aws.bridge.call`, `tina_aws.bridge` |
+| `tina-aws-bridge` (DynamoDB) | `install_dynamodb(&runtime, cfg)` | `DynamoWorker::with_supplied_client(cfg, client, handle)` (same ownership split as S3) | `DynamoCloser::close()` flags closed | `DynamoCloser::close_and_drain(timeout)` mirrors the S3 shape | `DynamoMetrics::late_results` mirrors S3 — SDK terminal after bridge timeout. DynamoDB mutations (`PutItem`, `UpdateItem`, `DeleteItem`) are **not** rolled back when the bridge stops waiting. | `tina_aws.bridge.call`, `tina_aws.bridge` |
+| `tina-aws-bridge` (SNS) | `install_sns(&runtime, cfg)` | `SnsWorker::with_supplied_client(cfg, client, handle)` (same ownership split as S3) | `SnsCloser::close()` flags closed | `SnsCloser::close_and_drain(timeout)` mirrors the S3 shape | `SnsMetrics::late_results` mirrors S3 — SDK terminal after bridge timeout. A `Publish` already accepted by SNS is not undone when the bridge stops waiting. | `tina_aws.bridge.call`, `tina_aws.bridge` |
+| `tina-aws-bridge` (Secrets) | `install_secrets(&runtime, cfg)` | `SecretsWorker::with_supplied_client(cfg, client, handle)` (same ownership split as S3) | `SecretsCloser::close()` flags closed | `SecretsCloser::close_and_drain(timeout)` mirrors the S3 shape | `SecretsMetrics::late_results` mirrors S3 — SDK terminal after bridge timeout. `GetSecretValue` is read-only so no rollback applies; the bridge cap may still surface as `SecretsError::SecretTooLarge`. | `tina_aws.bridge.call`, `tina_aws.bridge` |
 
 > **Late-result vocabulary.** "Late" means three different things and
 > the bridge can only see two of them. Read the row that fits the
@@ -255,11 +258,11 @@ a missing column.
 >   timeout. `PgConfig::pool` and `PgConfig::cancel` are silently
 >   ignored on this path. The pool must be built inside an active
 >   Tokio context (SQLx 0.8 spawns maintenance tasks at construction).
-> - `tina-aws-bridge` S3 + SQS `with_supplied_client` — the supplied
->   `aws_sdk_s3::Client` / `aws_sdk_sqs::Client` owns credentials,
->   region, endpoint, HTTP connector, TLS, and the SDK retry policy.
->   The bridge reports `sdk_max_attempts = 0` (unknown) in metrics
->   when the SDK retry policy is caller-owned.
+> - `tina-aws-bridge` S3, SQS, DynamoDB, SNS, and Secrets Manager
+>   `with_supplied_client` — the supplied SDK client owns
+>   credentials, region, endpoint, HTTP connector, TLS, and the SDK
+>   retry policy. The bridge reports `sdk_max_attempts = 0` (unknown)
+>   in metrics when the SDK retry policy is caller-owned.
 >
 > When the bridge owns the client (the plain `install` path), it also
 > owns the Tokio runtime and drops it with the worker. The
