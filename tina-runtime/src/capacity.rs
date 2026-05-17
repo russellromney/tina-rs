@@ -199,6 +199,78 @@ impl CapacitySummary {
     pub fn any_full(&self) -> bool {
         self.reports.iter().any(|r| r.ever_full())
     }
+
+    /// Aggregate "no Full anywhere" assertion. Returns every surface
+    /// that filled, with one error per surface and counter. Use this
+    /// in CI to fail with copyable, grep-friendly output covering
+    /// every offender at once.
+    pub fn assert_no_full(&self) -> Result<(), Vec<CapacityAssertError>> {
+        let mut errors = Vec::new();
+        for r in &self.reports {
+            if r.full_count > 0 {
+                errors.push(CapacityAssertError::Full {
+                    surface: r.name.clone(),
+                    filled: "count",
+                    observed: r.full_count,
+                });
+            }
+            if r.weight_full_count > 0 {
+                errors.push(CapacityAssertError::Full {
+                    surface: r.name.clone(),
+                    filled: "weight",
+                    observed: r.weight_full_count,
+                });
+            }
+            if r.shared_weight_full_count > 0 {
+                errors.push(CapacityAssertError::Full {
+                    surface: r.name.clone(),
+                    filled: "shared_weight",
+                    observed: r.shared_weight_full_count,
+                });
+            }
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
+    }
+}
+
+/// One-line "what cap to tune" hint per failed surface. Use this to
+/// format `assert_no_full()` errors into a copyable CI report.
+///
+/// ```text
+/// FAIL surface=pool.1.waiters filled=count observed=2 — see capacity discovery for cap and high water
+/// ```
+pub fn format_assertion_failure(error: &CapacityAssertError) -> String {
+    match error {
+        CapacityAssertError::Full {
+            surface,
+            filled,
+            observed,
+        } => format!(
+            "FAIL surface={surface} filled={filled} observed={observed} — see capacity discovery for cap and high water",
+        ),
+        CapacityAssertError::HighWaterAbove {
+            surface,
+            limit,
+            observed,
+        } => format!(
+            "FAIL surface={surface} high_water={observed} limit={limit} — raise expected limit or shrink the system's true high water",
+        ),
+        CapacityAssertError::FullCountMismatch {
+            surface,
+            expected,
+            observed,
+        } => format!("FAIL surface={surface} full_count={observed} expected={expected}",),
+        CapacityAssertError::UnknownSurface(name) => format!(
+            "FAIL surface={name} unknown — the assertion targets a name not registered in this summary",
+        ),
+        CapacityAssertError::MissingWeight { surface } => format!(
+            "FAIL surface={surface} missing_weight — assertion needs weight fields but the surface is count-only",
+        ),
+    }
 }
 
 /// `Result` assertions for one surface. Keeps test code free of
@@ -392,12 +464,49 @@ fn suggest_next(report: &CapacitySurfaceReport) -> &'static str {
     }
 }
 
-fn discovery_value(value: &str) -> String {
+/// Format a value for inclusion after a `key=` token. Bare when safe
+/// (no whitespace/control), otherwise double-quoted with debug
+/// formatting so parsers do not split the line at the unsafe char.
+pub(crate) fn discovery_value(value: &str) -> String {
     if name_is_valid(value) {
         value.to_string()
     } else {
         format!("{value:?}")
     }
+}
+
+/// Utilization in basis points (1/10000ths). `None` when there is
+/// no count cap *and* no weight cap to divide against. Saturates at
+/// 10000 (100%) for high-water peaks above cap.
+///
+/// `max == 0` is reported as 10000 *only* when the surface actually
+/// took traffic (`full_count > 0` or some high water observed); a
+/// zero-cap surface with no use returns 0, not "infinitely full,
+/// despite never being touched."
+fn utilization_bp(report: &CapacitySurfaceReport) -> Option<u64> {
+    if let Some(max) = report.max_messages {
+        let high = report.high_water_messages as u64;
+        if max == 0 {
+            return Some(if high > 0 || report.full_count > 0 {
+                10_000
+            } else {
+                0
+            });
+        }
+        return Some((high.saturating_mul(10_000)) / (max as u64));
+    }
+    if let Some(max) = report.max_weight {
+        let high = report.high_water_weight.unwrap_or(0) as u64;
+        if max == 0 {
+            return Some(if high > 0 || report.weight_full_count > 0 {
+                10_000
+            } else {
+                0
+            });
+        }
+        return Some((high.saturating_mul(10_000)) / (max as u64));
+    }
+    None
 }
 
 /// One `key=value` line per surface. Matches
@@ -406,22 +515,32 @@ fn discovery_value(value: &str) -> String {
 /// are safe; values with whitespace or control characters are
 /// double-quoted.
 ///
+/// `util_bp` is high-water utilization in basis points (out of 10000).
+/// `100` = 1%, `8500` = 85%, `10000` = at or above cap. Use this for
+/// grep-friendly utilization assertions:
+/// `grep -E 'util_bp=([0-9]{4,5}|9[0-9]{3})' …`.
+///
 /// ```text
-/// capacity surface=pool.1.waiters mode=fixed max=4 cur=0 high=4 full=2 suggest="saw Full — raise cap or shed earlier"
+/// capacity surface=pool.1.waiters mode=fixed max=4 cur=0 high=4 full=2 util_bp=10000 suggest="saw Full — raise cap or shed earlier"
 /// ```
 pub fn format_discovery_line(report: &CapacitySurfaceReport) -> String {
     let max = match report.max_messages {
         Some(m) => m.to_string(),
         None => "-".to_string(),
     };
+    let util = match utilization_bp(report) {
+        Some(bp) => bp.to_string(),
+        None => "-".to_string(),
+    };
     let mut line = format!(
-        "capacity surface={name} mode={mode} max={max} cur={cur} high={high} full={full} suggest={hint:?}",
+        "capacity surface={name} mode={mode} max={max} cur={cur} high={high} full={full} util_bp={util} suggest={hint:?}",
         name = discovery_value(&report.name),
         mode = report.mode.label(),
         max = max,
         cur = report.current_messages,
         high = report.high_water_messages,
         full = report.full_count,
+        util = util,
         hint = suggest_next(report),
     );
     if let Some(max_weight) = report.max_weight {
@@ -655,7 +774,83 @@ mod tests {
         assert!(line.contains("cur=0"), "{line}");
         assert!(line.contains("high=4"), "{line}");
         assert!(line.contains("full=2"), "{line}");
+        assert!(line.contains("util_bp=10000"), "{line}");
         assert!(line.contains("raise cap"), "{line}");
+    }
+
+    #[test]
+    fn discovery_line_includes_util_bp_for_partial_fill() {
+        // high=1 / max=4 = 2500 bp
+        let r = report("p", 4, 0, 1, 0);
+        let line = format_discovery_line(&r);
+        assert!(line.contains("util_bp=2500"), "{line}");
+    }
+
+    #[test]
+    fn assert_no_full_aggregates_every_offender() {
+        let mut s = CapacitySummary::new();
+        s.push(report("a", 4, 0, 4, 0)).unwrap();
+        s.push(report("b", 4, 0, 4, 2)).unwrap();
+        s.push(
+            CapacitySurfaceReport::weighted("c", CapacityMode::Fixed, 100, 0, 100, 3, "bytes")
+                .with_shared_scope("scope", 1000, 0, 1000, 1),
+        )
+        .unwrap();
+        let errors = s.assert_no_full().unwrap_err();
+        // b contributes count, c contributes weight + shared_weight.
+        assert_eq!(errors.len(), 3);
+    }
+
+    #[test]
+    fn format_assertion_failure_starts_with_fail() {
+        let err = CapacityAssertError::Full {
+            surface: "pool.1.waiters".to_string(),
+            filled: "count",
+            observed: 2,
+        };
+        let line = format_assertion_failure(&err);
+        assert!(line.starts_with("FAIL "), "{line}");
+        assert!(line.contains("surface=pool.1.waiters"), "{line}");
+        assert!(line.contains("filled=count"), "{line}");
+        assert!(line.contains("observed=2"), "{line}");
+    }
+
+    #[test]
+    fn format_assertion_failure_covers_every_variant() {
+        for err in [
+            CapacityAssertError::HighWaterAbove {
+                surface: "p".into(),
+                limit: 4,
+                observed: 9,
+            },
+            CapacityAssertError::FullCountMismatch {
+                surface: "p".into(),
+                expected: 0,
+                observed: 3,
+            },
+            CapacityAssertError::UnknownSurface("nope".into()),
+            CapacityAssertError::MissingWeight {
+                surface: "p".into(),
+            },
+        ] {
+            let line = format_assertion_failure(&err);
+            assert!(line.starts_with("FAIL "), "{line}");
+            assert!(line.contains("surface="), "{line}");
+        }
+    }
+
+    #[test]
+    fn util_bp_zero_when_zero_cap_never_touched() {
+        let r = report("p", 0, 0, 0, 0);
+        let line = format_discovery_line(&r);
+        assert!(line.contains("util_bp=0"), "{line}");
+    }
+
+    #[test]
+    fn util_bp_saturates_at_10000_when_zero_cap_was_filled() {
+        let r = report("p", 0, 0, 0, 3);
+        let line = format_discovery_line(&r);
+        assert!(line.contains("util_bp=10000"), "{line}");
     }
 
     #[test]

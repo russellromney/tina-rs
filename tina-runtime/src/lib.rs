@@ -59,6 +59,7 @@ pub mod deferred;
 mod drain_state;
 mod driver;
 mod errors;
+pub mod event_sink;
 mod full_handling;
 mod host_burst;
 mod live_report;
@@ -72,7 +73,9 @@ pub mod persistence;
 #[allow(unsafe_code)]
 pub mod pool;
 pub mod pressure;
+pub mod service_pressure;
 pub mod sharded;
+pub mod shared_scope;
 mod shutdown;
 mod single_call_gate;
 pub mod tcp_loops;
@@ -220,19 +223,24 @@ pub use call_group::{
 };
 pub use capacity::{
     CapacityAssertError, CapacityNameError, CapacitySummary, SurfaceAssertion,
-    format_discovery_line, format_discovery_report,
+    format_assertion_failure, format_discovery_line, format_discovery_report,
 };
 pub use deferred::{
     InsertError as PendingRepliesInsertError, PendingReplies,
     TryCaptureError as PendingRepliesTryCaptureError,
 };
 use driver::DriverCompletion;
+pub use event_sink::{
+    BoundedEventSink, DropPolicy, EventSinkDrain, EventSinkReport, EventSinkSurface,
+};
 pub use observation::{
     BoundAddressWaiter, ChildRestarted, ChildRestartedWaiter, IsolateCompleteWaiter,
     IsolateResultWaiter, OperationDoneWaiter, ResultWaitError, WaitError,
 };
 pub use observer::TraceObserver;
 pub use pressure::{MailboxBudget, PressureReport, PressureSummary, format_pressure_line};
+pub use service_pressure::{ServicePressureReport, ServicePressureSurface, ServiceSurfaceState};
+pub use shared_scope::{SharedCapacityScope, SharedLease, SharedScopeFull, SharedScopeReport};
 pub use tcp_loops::{LoopStep, ReadExactStep, TcpReadExact, TcpReadToEof, TcpWriteAll};
 /// Declares a Tina isolate whose call channel defaults to [`RuntimeCall<Message>`](RuntimeCall).
 ///

@@ -650,7 +650,90 @@ them in `handle` and use `tina::send` from `handle_call`. The first form
 of `WebSocketSessionHandle::send_effect` should also probably gain a
 debug-only assertion if it is invoked from inside a `CallContext`.
 
-### 27. AWS bridge surface duplication across services
+### 27. Lease handoff into a `PendingReplies` slot
+
+**Surfaced by:** `system_api_gateway_limits`, `system_soak_http_db`.
+
+A request that admits against a `SharedCapacityScope` and then parks
+its reply in `PendingReplies` has to carry the `SharedLease` in a
+sidecar `HashMap<qid, SharedLease>` so the lease outlives the
+post-sleep handler. Both new specimens do this manually. The mapping
+between "this qid" and "this lease" is invariant under the slot
+lifecycle and would compose cleanly into the slot itself.
+
+**Build:** a slot variant — `PendingReplies::try_insert_with_lease(qid,
+slot, lease)` — or a generic `SharedLease`-carrying wrapper that
+`reply_to` consumes. Either form removes the parallel map.
+
+### 28. Service-level scope registry mirroring `register_with_capacity`
+
+**Surfaced by:** `system_api_gateway_limits`.
+
+`SharedCapacityScope` is shard-local. A service today builds one with
+`SharedCapacityScope::new("gateway.in_flight", "weight", 4)` and clones
+the handle into every isolate that needs to admit. That works, but a
+service builder may want `register_scope("name", unit, max)` next to
+`register_with_capacity` so the discovery report and the lifecycle are
+owned by the runtime, not by user code.
+
+**Build:** a runtime-side `SharedScopeRegistry` keyed by name with
+register/get/snapshot. Reuse the existing `CapacitySummary` shape so
+the runtime can produce one merged discovery line per shard.
+
+### 29. Effect chaining over multiple runtime calls inside one logical request
+
+**Surfaced by:** `system_soak_http_db`.
+
+A request rail that admits HTTP, sleeps, releases, admits DB, sleeps,
+replies needs two custom message variants (`HttpReleased`, `DbReleased`)
+so the post-sleep state mutation can land in `handle`. The pattern is
+the same across systems: "after this timer wakes, do the next stage".
+Today every system rebuilds the variants by hand.
+
+**Build:** an effect combinator like `sleep(d).then_in_isolate(|this:
+&mut Self| this.start_db(...))` that wires the message envelope and
+the post-wake state mutation in one place.
+
+### 30. DST adapter for `SharedCapacityScope` / `BoundedEventSink`
+
+**Surfaced by:** `system_api_gateway_limits`, `system_soak_http_db`,
+phase 107 findings.
+
+The new observability primitives live outside the `RuntimeEvent`
+trace, so DST replay does not currently carry their facts forward.
+Existing trace-based pressure (`PressureSummary::from_events`) still
+works; the new shared-scope full counts and event-sink drops do not.
+The `ServicePressureReport` shape already encodes
+`Unavailable { reason }` so a sim that does not have these primitives
+yet stays honest.
+
+**Build:** a small adapter in `tina-sim` that snapshots scope/sink
+counters into the trace at well-defined points (admit, release,
+drop, push, drain) so a replay can reconstruct `assert_no_full`
+semantics. Or expose the snapshots as `LiveReplayFact` entries so
+they ride alongside the existing fact stream.
+
+### 31. `SleepReply` leaks into user-defined message variants
+
+**Surfaced by:** `system_api_gateway_limits`, `system_soak_http_db`.
+
+Every variant a specimen builds for a post-sleep wake-up carries
+`result: SleepReply` even when the handler never inspects it. The
+gateway's `HoldDone { qid, route, result: SleepReply }` and the
+soak's `HttpReleased { qid, ..., result: SleepReply }` are both
+shaped this way. The field is dead weight in the user's message
+enum, but the `sleep(d).then(move |r| Msg { result: r, ... })`
+signature requires it.
+
+**Build:** either (a) accept `then(move |_| Msg { ... })` without
+the placeholder field as the blessed shape and add a `then_no_result`
+variant, or (b) drop the `Result` from `SleepReply` for the
+infallible-sleep case so the carrying variant is a unit. The wider
+form is right for cancellation-aware sleeps; for the typical "wake
+me up later, I don't care if you were nudged" the unit form would
+keep the user's enum clean.
+
+### 32. AWS bridge surface duplication across services
 
 **Surfaced by:** adding DynamoDB / SNS / Secrets Manager workers to
 `tina-aws-bridge`.
@@ -673,7 +756,7 @@ preserve each service's per-error tally semantics — counters like
 the per-service module implements (validate, run_request, classify_sdk
 error, tally_terminal) is probably the right shape.
 
-### 28. Bridge classifier vocabulary lives in `tina-aws-bridge`
+### 33. Bridge classifier vocabulary lives in `tina-aws-bridge`
 
 **Surfaced by:** `system_webhook_relay`, classifier extension traits.
 
@@ -695,7 +778,7 @@ the bridges themselves.
 Findings shipped by recent phases. Numbers are kept stable so
 existing README references stay valid.
 
-### 29. `call.defer(async_bridge).reply(...)` from `handle_call` — Phase 104 proof
+### 34. `call.defer(async_bridge).reply(...)` from `handle_call` — Phase 104 proof
 
 The suspected runtime gap was re-tested before Phase 104 merged. The
 general runtime path already works (`handle_call` defers through a
