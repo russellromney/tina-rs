@@ -14,14 +14,21 @@ stupid-high caps and hope.
 
 ## Goal
 
-Turn pressure/capacity facts into a product-quality runtime surface:
+Turn pressure/capacity facts into a product-quality **live** runtime surface:
 
 - service pressure summary
 - shard-local capacity scopes
 - bounded event/log sink
 - queue/full/high-water reports
-- CI-friendly capacity assertions for live runs and simulator runs with matching
-  report surfaces
+- CI-friendly capacity assertions for live runs
+
+The phase ships the live product. Trace-derived pressure facts
+(`PressureSummary::from_events`) continue to replay through DST as
+before. The new *out-of-trace* live surfaces — `SharedCapacityScope`
+and `BoundedEventSink` — intentionally report `Unavailable` in sim
+for this phase. A simulator adapter that carries those facts into
+replay is explicit follow-up (see [`examples/FINDINGS.md`](../../../examples/FINDINGS.md)
+entry #30) and not a 107 blocker.
 
 ## Non-Goals
 
@@ -30,6 +37,9 @@ Turn pressure/capacity facts into a product-quality runtime surface:
 - No memory magic.
 - No automatic capacity tuning.
 - No global cross-shard budget.
+- No simulator adapter for `SharedCapacityScope` / `BoundedEventSink`
+  in this phase. Sim runs surface them as `Unavailable { reason }`
+  via `ServicePressureReport`. The adapter ships in a follow-up.
 
 ## Rocks
 
@@ -82,9 +92,12 @@ Make test/CI assertions easy:
 - no drops
 - utilization line for discovery
 
-Each assertion helper must have a live path. If the same surface exists in the
-simulator, the assertion must work there too. If it does not, the report says
-`Unavailable`.
+Each assertion helper must have a live path. Simulator parity for
+the new out-of-trace primitives (`SharedCapacityScope`,
+`BoundedEventSink`) is *not* in this phase: sim runs report those
+surfaces as `Unavailable { reason }` through `ServicePressureReport`
+so the contract stays honest. Trace-derived pressure
+(`PressureSummary::from_events`) is unchanged and still replays.
 
 ### Rock 5: Docs And Specimen Sweep
 
@@ -109,9 +122,21 @@ Every report line must be grep-friendly and copyable into a test assertion.
 - Bounded event sink drops visibly under load.
 - Runtime summary includes at least one pool, bridge, listener, and body surface.
 - CI-style assertion failure has copyable message.
-- DST replay preserves relevant pressure facts.
+- DST replay preserves existing trace-derived pressure facts
+  (`PressureSummary::from_events` over `RuntimeEvent`). New
+  out-of-trace surfaces (`SharedCapacityScope`, `BoundedEventSink`)
+  surface as `Unavailable` in sim — the sim adapter is follow-up.
 - At least three README examples show exact commands and output shape.
 - No report path allocates unbounded storage.
+
+## Follow-Ups (Not In This Phase)
+
+- DST adapter that carries `SharedCapacityScope` /
+  `BoundedEventSink` snapshots through replay so sim runs can
+  reconstruct `assert_no_full` semantics for the new primitives. See
+  [`examples/FINDINGS.md`](../../../examples/FINDINGS.md) entry #30
+  for the rough shape (snapshot at admit/release/drop/push/drain, or
+  ride alongside `LiveReplayFact`).
 
 ## Done Means
 

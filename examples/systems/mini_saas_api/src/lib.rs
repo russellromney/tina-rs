@@ -40,6 +40,8 @@ pub struct RunReport {
     pub capacity_before_shutdown_line: String,
     pub capacity_during_shutdown_line: String,
     pub terminal_line: String,
+    pub startup_summary_line: String,
+    pub startup_discovery_lines: Vec<String>,
     pub live_replay_fact: String,
     pub observations: Vec<UserObservation>,
 }
