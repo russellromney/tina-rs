@@ -680,6 +680,26 @@ owned by the runtime, not by user code.
 register/get/snapshot. Reuse the existing `CapacitySummary` shape so
 the runtime can produce one merged discovery line per shard.
 
+### 31. `SleepReply` leaks into user-defined message variants
+
+**Surfaced by:** `system_api_gateway_limits`, `system_soak_http_db`.
+
+Every variant a specimen builds for a post-sleep wake-up carries
+`result: SleepReply` even when the handler never inspects it. The
+gateway's `HoldDone { qid, route, result: SleepReply }` and the
+soak's `HttpReleased { qid, ..., result: SleepReply }` are both
+shaped this way. The field is dead weight in the user's message
+enum, but the `sleep(d).then(move |r| Msg { result: r, ... })`
+signature requires it.
+
+**Build:** either (a) accept `then(move |_| Msg { ... })` without
+the placeholder field as the blessed shape and add a `then_no_result`
+variant, or (b) drop the `Result` from `SleepReply` for the
+infallible-sleep case so the carrying variant is a unit. The wider
+form is right for cancellation-aware sleeps; for the typical "wake
+me up later, I don't care if you were nudged" the unit form would
+keep the user's enum clean.
+
 ### 30. DST adapter for `SharedCapacityScope` / `BoundedEventSink`
 
 **Surfaced by:** `system_api_gateway_limits`, `system_soak_http_db`,
