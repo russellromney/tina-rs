@@ -12,11 +12,16 @@ LLMs write the code now.
 The best error is the one they cannot write. The second best error is a compiler
 message that says the actual mistake.
 
+This is core Tina, not polish. Bounded + DST tells users what happened.
+Compile-time rails stop users from writing code where the truth can disappear.
+
 ## Goal
 
 Move broad silent runtime mistakes into compile-time structure:
 
 - public request vs internal event split
+- caller authority must be replied, rejected, or carried
+- cancelable deferred work must be admitted before its effect can run
 - callable vs send-only handles by default
 - typed config/budget manifests
 - private protocol typestate for bug-prone state machines
@@ -42,7 +47,34 @@ Make the common authoring model separate:
 Wrong lane fails at compile time on the default path. Escape hatches are explicit
 and noisy.
 
-### Rock 2: Capability Handles By Default
+### Rock 2: Caller Authority Obligation
+
+Make request caller authority a must-consume type on the copied path:
+
+- reply now
+- reject now
+- defer into a request context
+- defer into bounded cancelable admission
+
+The default path must make "forgot to reply" a compile error. Any escape hatch
+that can abandon authority must be named, loud, traced, and absent from copied
+docs/specimens.
+
+### Rock 3: Cancelable Deferred Admission Gate
+
+Fix the token/effect footgun:
+
+- a cancelable pending token cannot silently be dropped
+- child effect is not returned for dispatch until bounded admission succeeds
+- failed admission returns caller authority and child effect for deliberate reply
+  or reject
+- duplicate/full errors are typed
+- ABA-safe ticket/key behavior remains explicit
+
+The copied path must not let a service strand a caller by starting child work
+without owning the pending token.
+
+### Rock 4: Capability Handles By Default
 
 Make capability handles the default copied path:
 
@@ -53,7 +85,7 @@ Make capability handles the default copied path:
 
 Raw `Address<M, R>` remains available only where needed.
 
-### Rock 3: Typed Config And Budget Manifests
+### Rock 5: Typed Config And Budget Manifests
 
 Build typed builders for copied service knobs:
 
@@ -70,7 +102,7 @@ Build typed builders for copied service knobs:
 Env/file config still validates at runtime. Normal Rust service config makes
 missing required caps hard to compile.
 
-### Rock 4: Protocol Typestate
+### Rock 6: Protocol Typestate
 
 Use private state tokens inside `tina-http` and friends for real bug zones:
 
@@ -82,7 +114,7 @@ Use private state tokens inside `tina-http` and friends for real bug zones:
 
 Keep protocol typestate private unless user code truly needs the state token.
 
-### Rock 5: Diagnostics
+### Rock 7: Diagnostics
 
 Add `#[diagnostic::on_unimplemented]` or equivalent friendly compile errors for:
 
@@ -90,6 +122,8 @@ Add `#[diagnostic::on_unimplemented]` or equivalent friendly compile errors for:
 - reply type mismatch
 - missing callable handler
 - wrong handle capability
+- unconsumed caller authority
+- cancelable effect requested before admission
 - non-`'static` captured state
 
 Trybuild tests must pin the good messages.
@@ -101,20 +135,29 @@ Add a compile-fail specimen suite:
 - wrong public request handled only in internal `handle`
 - internal continuation sent from outside
 - callable request sent through send-only handle
+- caller authority dropped without reply/reject/defer on the copied path
+- cancelable deferred child effect dispatched before bounded admission
 - missing required config cap in typed builder
 - invalid WebSocket/gRPC/body state transition inside crate tests
 
-Update one real system to the new default authoring path and remove old
-escape-hatch imports. The README must say what the compiler now catches.
+Update two real systems to the new default authoring path and remove old
+escape-hatch imports:
+
+- one request-heavy system, such as `mini_saas_api` or `system_cache_with_fill`
+- one cancelable-work system, such as `system_job_queue`
+
+Each README must say what the compiler now catches.
 
 ## Required Proof
 
 - User-style compile-fail tests for wrong `handle` vs `handle_call`.
 - Compile-fail tests for internal event sent from outside.
+- Compile-fail tests for unconsumed caller authority on the copied path.
+- Compile-fail tests for cancelable effect before bounded admission.
 - Compile-fail tests for missing config caps.
 - Runtime tests proving public behavior did not regress.
 - Protocol tests proving impossible states are now unrepresentable internally.
-- One system specimen compiles using the new default public/internal split.
+- Two system specimens compile using the new default safety rails.
 - Docs show the default path and the escape hatch separately.
 
 ## Done Means
