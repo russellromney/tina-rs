@@ -21,7 +21,7 @@ use tina_http::{
 use tina_runtime::pool::{WorkerPoolMsg, WorkerPoolReply};
 use tina_runtime::{
     CallOutcome, DefaultThreadedMailboxFactory, DrainStage, DrainState, RuntimeCall, RuntimeEvent,
-    RuntimeEventKind, ThreadedRuntime, call, sleep,
+    RuntimeEventKind, ThreadedRuntime, ThreadedRuntimeConfig, call, sleep,
 };
 use tina_sim::dst::{
     LiveReplayCapture, LiveReplayFact, LiveReplayReport, ReplayCase as DstReplayCase, ReplayConfig,
@@ -1077,6 +1077,240 @@ fn text(status: StatusCode, body: impl Into<String>) -> HttpResponse {
         http::HeaderValue::from_static("text/plain"),
     );
     response
+}
+
+/// Soak driver. Spins up the same service as [`run`] (controller +
+/// SQLite + notify + outbound keepalive pool), drives `config.workers`
+/// concurrent clients hitting `GET /health` and `GET /items/1`, then
+/// captures `/debug/capacity` and runs the same shutdown sequence as
+/// `run`. The proof artifact is the typed [`crate::SoakReport`]: load
+/// summary, capacity line, terminal line, and `shutdown_clean`.
+///
+/// This is intentionally narrow: `/health` is the cheapest path, and
+/// `GET /items/1` exercises the controller + SQLite bridge + pool
+/// shape without needing a write per op (the row is pre-seeded by the
+/// initial create). The point is "many requests, real shutdown, no
+/// leaks" — not throughput.
+pub fn run_soak(config: crate::SoakConfig) -> anyhow::Result<crate::SoakReport> {
+    use tina_proof_harness::load::{self, LoadRun, LoadStop, OpOutcome};
+
+    let dir = tempfile::tempdir()?;
+    let db_path = dir.path().join("mini-saas.sqlite");
+    seed_db(&db_path)?;
+
+    let live_trace = tina_proof_harness::LiveTrace::new();
+    let runtime = ThreadedRuntime::with_config_and_trace_observer(
+        SingleShard,
+        DefaultThreadedMailboxFactory,
+        ThreadedRuntimeConfig {
+            idle_wait: Duration::from_millis(1),
+            ..Default::default()
+        },
+        live_trace.observer(),
+    );
+    let sqlite = SqliteWorker::<SingleShard>::install(
+        &runtime,
+        SqliteConfig::path(&db_path)
+            .with_default_timeout(Duration::from_secs(2))
+            .with_busy_timeout(Duration::from_millis(250))
+            .with_poll_interval(Duration::from_millis(1))
+            .with_mailbox_capacity(2),
+    )
+    .map_err(|e| anyhow::anyhow!("install sqlite bridge: {e}"))?;
+
+    let notify_service = runtime
+        .register_with_capacity::<_, Infallible>(NotifySink::default(), 8)
+        .map_err(|e| anyhow::anyhow!("register notify sink: {e:?}"))?;
+    let notify_listener_config = listener_config(1024);
+    let notify_listener = runtime
+        .register_with_capacity::<_, Infallible>(
+            HttpListener::<SingleShard, NotifyMsg>::with_config(
+                "127.0.0.1:0".parse()?,
+                notify_service,
+                notify_listener_config,
+            ),
+            notify_listener_config.listener_mailbox_capacity,
+        )
+        .map_err(|e| anyhow::anyhow!("register notify listener: {e:?}"))?;
+    let notify_bound = runtime.observe_next_bound();
+    runtime
+        .try_send(notify_listener, HttpListenerMsg::Start)
+        .map_err(|e| anyhow::anyhow!("start notify listener: {e:?}"))?;
+    let notify_addr = notify_bound
+        .wait(Duration::from_secs(2))
+        .map_err(|e| anyhow::anyhow!("bind notify listener: {e:?}"))?;
+
+    let outbound = build_keepalive_pool(
+        &runtime,
+        HttpTarget::http_with_host(notify_addr, "notify.local"),
+        HttpClientConfig::pressure(),
+        PoolConfig::new(1, 0),
+        8,
+        8,
+    )
+    .map_err(|e| anyhow::anyhow!("build outbound keepalive pool: {e:?}"))?;
+
+    let public_body_metrics = BodyMetrics::default();
+    let controller = runtime
+        .register_with_capacity::<_, Infallible>(
+            Controller::new(
+                sqlite.address,
+                sqlite.metrics.clone(),
+                outbound.pool,
+                public_body_metrics.clone(),
+            ),
+            CONTROLLER_MAILBOX_CAPACITY,
+        )
+        .map_err(|e| anyhow::anyhow!("register controller: {e:?}"))?;
+
+    let main_listener_config = listener_config(BODY_CAP_BYTES);
+    let main_listener = runtime
+        .register_with_capacity::<_, Infallible>(
+            HttpListener::<SingleShard, ControllerMsg>::with_config(
+                "127.0.0.1:0".parse()?,
+                controller,
+                main_listener_config,
+            )
+            .with_metrics(public_body_metrics),
+            main_listener_config.listener_mailbox_capacity,
+        )
+        .map_err(|e| anyhow::anyhow!("register main listener: {e:?}"))?;
+    let main_bound = runtime.observe_next_bound();
+    runtime
+        .try_send(main_listener, HttpListenerMsg::Start)
+        .map_err(|e| anyhow::anyhow!("start main listener: {e:?}"))?;
+    let addr = main_bound
+        .wait(Duration::from_secs(2))
+        .map_err(|e| anyhow::anyhow!("bind main listener: {e:?}"))?;
+
+    // Pre-seed one row so `GET /items/1` is a hit, not a 404. We use the
+    // public POST so the body cap is exercised at least once even from
+    // the soak path.
+    let create = crate::post(addr, "/items", "name=alpha")
+        .map_err(|e| anyhow::anyhow!("seed POST /items failed: {e}"))?;
+    if create.status != 201 {
+        anyhow::bail!(
+            "soak seed POST /items must return 201, got {} ({})",
+            create.status,
+            create.body,
+        );
+    }
+
+    // Three lanes, deterministic by worker id, so the report can blame
+    // each path independently:
+    //
+    //   worker % 3 == 0 -> GET /health        (cheap; HTTP only)
+    //   worker % 3 == 1 -> GET /items/1       (HTTP + SQLite bridge)
+    //   worker % 3 == 2 -> POST /items/1/notify (HTTP + bridge + outbound pool)
+    //
+    // The third lane is what proves Rock 1's "bridge/pool path" line
+    // item — without it the keepalive outbound pool is never exercised
+    // and the soak only proves the HTTP+DB shape.
+    let op_addr = addr;
+    let timeout = config.connect_timeout;
+    let load_report = load::run(
+        LoadRun {
+            workers: config.workers,
+            stop: LoadStop::ops(config.op_count),
+            label: "mini_saas_api_soak",
+        },
+        move |worker| {
+            let result = match worker % 3 {
+                0 => crate::one_request_with_timeout(
+                    op_addr,
+                    b"GET /health HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+                    timeout,
+                ),
+                1 => crate::one_request_with_timeout(
+                    op_addr,
+                    b"GET /items/1 HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+                    timeout,
+                ),
+                _ => crate::one_request_with_timeout(
+                    op_addr,
+                    b"POST /items/1/notify HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    timeout,
+                ),
+            };
+            match result {
+                Ok(parts) if parts.status == 200 => OpOutcome::Ok,
+                Ok(parts) => {
+                    // Map a typed HTTP status into the err_kinds table so
+                    // a 503 burst is visible without log scraping.
+                    let kind = match parts.status {
+                        503 => "http_503",
+                        500..=599 => "http_5xx",
+                        429 => "http_429",
+                        400..=499 => "http_4xx",
+                        _ => "http_other",
+                    };
+                    OpOutcome::Err { kind }
+                }
+                Err(_) => OpOutcome::Timeout,
+            }
+        },
+        None::<fn() -> bool>,
+    );
+
+    // Snapshot capacity while the runtime is still up.
+    let capacity = crate::get(addr, "/debug/capacity")?;
+    let pressure_after_load = live_trace.pressure_summary();
+    let capacity_after_load_line = format!(
+        "capacity_after_load {} runtime.send_full={} runtime.completion_full={} runtime.reply_path_full={}",
+        capacity.body.trim_end(),
+        pressure_after_load.send_rejected_full,
+        pressure_after_load.completion_rejected_mailbox_full,
+        pressure_after_load.reply_rejected_reply_path_full,
+    );
+
+    // Same shutdown sequence as `run`, minus the scripted assertions.
+    let db_pressure = sqlite.metrics.pressure_report();
+    let outbound_shutdown = shutdown_keepalive_pool(
+        &runtime,
+        &outbound,
+        CloseMode::Drain,
+        Duration::from_secs(2),
+    )
+    .map_err(|e| anyhow::anyhow!("shutdown keepalive pool: {e:?}"))?;
+    runtime
+        .try_send(notify_listener, HttpListenerMsg::Stop)
+        .map_err(|e| anyhow::anyhow!("stop notify listener: {e:?}"))?;
+    runtime
+        .try_send(main_listener, HttpListenerMsg::Stop)
+        .map_err(|e| anyhow::anyhow!("stop main listener: {e:?}"))?;
+    sqlite.closer.close();
+    let trace = runtime
+        .shutdown()
+        .map_err(|e| anyhow::anyhow!("runtime shutdown: {e:?}"))?;
+    let pressure = tina_runtime::pressure::PressureSummary::from_events(&trace);
+    let shutdown_clean = matches!(outbound_shutdown.drain, KeepalivePoolDrainOutcome::Drained)
+        && outbound_shutdown.requested == outbound_shutdown.stopped
+        && outbound_shutdown.timed_out == 0
+        && outbound_shutdown.rejected == 0
+        && outbound_shutdown.already_closed == 0
+        && outbound_shutdown.connection_failures.is_empty();
+    let terminal_line = format!(
+        "terminal db.capacity={} db.closed={} outbound.drain={:?} outbound.stop_requested={} \
+         outbound.stop_stopped={} outbound.stop_timed_out={} outbound.stop_rejected={} \
+         outbound.stop_already_closed={} outbound.stop_failures={} trace_pressure={}",
+        db_pressure.capacity,
+        db_pressure.closed_count,
+        outbound_shutdown.drain,
+        outbound_shutdown.requested,
+        outbound_shutdown.stopped,
+        outbound_shutdown.timed_out,
+        outbound_shutdown.rejected,
+        outbound_shutdown.already_closed,
+        outbound_shutdown.connection_failures.len(),
+        pressure
+    );
+
+    Ok(crate::SoakReport {
+        load: load_report,
+        capacity_after_load_line,
+        terminal_line,
+        shutdown_clean,
+    })
 }
 
 struct StartupSummary {

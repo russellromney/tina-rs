@@ -98,7 +98,7 @@ Keep a separate system only when it finds a different class of pain.
 | `system_delivery_daemon` | Queue email/webhook deliveries, rate-limit by domain/tenant, retry with backoff, suppress duplicates, drain on shutdown. | Backoff, jitter, idempotency, worker pools, outbound pools, bounded event sink, graceful shutdown. |
 | `system_checkout_saga` | Reserve item, charge payment, write DB row, send webhook, compensate on failure. | Saga pattern, DB bridge, outbound HTTP, race/join, cancellation, typed partial failure. |
 | `system_webhook_relay` | Receive webhooks, verify, persist, fan out to subscribers, retry failed subscribers. | HTTP server/client, DB bridge, outbound pool, bounded fanout, retry policy, subscriber pressure. |
-| `system_live_replay_bugbox` | Run live-ish service, capture trace/input facts, replay or approximate in sim, shrink bad case. | DST, `ReplayCase`, trace observer, config manifest, topology/resource capture. |
+| `system_live_replay_bugbox` | Live runtime + observer captures a real trace; same isolate logic runs in the sim with a pinned `ReplayCase`; `delete_shrink` reduces an 8-op history down to its minimum bug-preserving subset. Run with `cargo test --manifest-path examples/systems/system_live_replay_bugbox/Cargo.toml`. | DST, `ReplayCase`, `assert_replay_case`, `observe_replay_case`, `discover_constants`, `delete_shrink`, `tina_proof_harness::LiveTrace`. |
 | `system_redisish_keyspace` | TCP key/value service with hot keys, sharded map, persistence, snapshot/journal. | TCP loops, sharded placement, owner validation, persistence, hot-key pressure, capacity scopes. |
 | `system_tenant_rate_limiter` | Multi-tenant API limiter with sliding windows, burst caps, cleanup, and hot tenants. | Sharded keyed state, timers, hot-key pressure, capacity policies, periodic cleanup. |
 | `system_cache_with_fill` | Read-through cache where one miss triggers one upstream fill, concurrent callers wait behind a bounded cap, and stale fills are ignored after invalidation. Run with `cargo test --manifest-path examples/systems/system_cache_with_fill/Cargo.toml`. | `PendingReplies`, `CallContext`, single-flight, timers, stale-result handling, capacity reclamation. |
@@ -164,3 +164,40 @@ Then pick based on pain:
 
 System specimens exist to make Tina complain loudly while the code is
 still cheap to change.
+
+## Proof Harness
+
+`tina-proof-harness` is the small reusable kit specimens reach for
+when they want a typed proof instead of a hand-rolled driver. Three
+pieces, each tiny on purpose:
+
+- `tina_proof_harness::load` — concurrent op driver with typed
+  latency, err-kind tally, leak-check hook, and a `PressureSummary`
+  (rate per mille, max consecutive errors, first error op index).
+  Used by `mini_saas_api/tests/soak.rs`.
+- `tina_proof_harness::bad_peer` — reusable bad TCP/HTTP clients
+  (`HalfClose`, `ResetImmediately`, `Slowloris`, `StalledReader`,
+  `StalledWriter`, `MalformedFrame`, `TlsHandshakeFailure`,
+  `ReconnectStorm`). Each returns a typed `BadPeerOutcome` with
+  `connects_ok`/`bytes_sent`/`bytes_read`/`server_closed`/`peer_reset`.
+  Used by `system_realtime_rooms/tests/bad_peer.rs`.
+- `tina_proof_harness::live_replay::LiveTrace` — thin
+  `TraceObserver` that captures live events and exposes a live
+  `tina_sim::dst::TraceShape` fingerprint plus a
+  `tina_runtime::PressureSummary` for visible pressure facts. For
+  live-to-sim replay, materialize the live facts into
+  `tina_sim::dst::LiveReplayCapture` before comparing. Used by
+  `system_live_replay_bugbox`.
+
+Copy-pasteable proof targets live in the top-level `Makefile`:
+
+```sh
+make proof-fast               # PR gate
+make proof-soak               # nightly load
+make proof-bad-peer           # local bad-peer
+make proof-replay-regression  # saved-seed sim regression
+```
+
+If a specimen would otherwise hand-roll a slow-reader / RST /
+malformed-HTTP driver, reach for `tina-proof-harness` instead. The
+typed outcome is part of what makes "the bug reproduces" cheap.

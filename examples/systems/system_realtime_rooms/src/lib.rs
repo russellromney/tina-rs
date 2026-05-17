@@ -909,7 +909,7 @@ pub fn run_shutdown(config: RunConfig) -> anyhow::Result<ShutdownReport> {
     })
 }
 
-mod test_client {
+pub mod test_client {
     use std::net::{SocketAddr, TcpStream};
     use std::time::Duration;
 
