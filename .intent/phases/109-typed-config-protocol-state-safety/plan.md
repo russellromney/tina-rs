@@ -3,7 +3,6 @@
 ## Status
 
 - IDD implementation phase.
-- Not started.
 - Follows the first compile-time safety rails pass.
 
 ## Grug Truth
@@ -15,7 +14,7 @@ message that says the actual mistake.
 
 ## Goal
 
-Move broad silent runtime mistakes into compile-time structure where it pays:
+Move broad silent runtime mistakes into compile-time structure:
 
 - public request vs internal event split
 - callable vs send-only handles by default
@@ -40,12 +39,12 @@ Make the common authoring model separate:
 - fire-and-forget public events
 - internal continuation events
 
-Wrong lane should fail at compile time or require an explicit escape hatch.
-`handle_call`/`handle` confusion should stop being easy to write.
+Wrong lane fails at compile time on the default path. Escape hatches are explicit
+and noisy.
 
 ### Rock 2: Capability Handles By Default
 
-Prefer handles that encode capability:
+Make capability handles the default copied path:
 
 - send-only
 - callable
@@ -68,8 +67,8 @@ Build typed builders for copied service knobs:
 - shared capacity scopes
 - startup config
 
-Env/file config still validates at runtime, but normal Rust service config
-should make missing required caps hard to compile.
+Env/file config still validates at runtime. Normal Rust service config makes
+missing required caps hard to compile.
 
 ### Rock 4: Protocol Typestate
 
@@ -81,7 +80,7 @@ Use private state tokens inside `tina-http` and friends for real bug zones:
 - WebSocket close handshake
 - body stream open/eof/closed states
 
-Do not expose fancy typestate unless users need it. Internal correctness first.
+Keep protocol typestate private unless user code truly needs the state token.
 
 ### Rock 5: Diagnostics
 

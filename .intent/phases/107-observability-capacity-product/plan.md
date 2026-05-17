@@ -3,7 +3,6 @@
 ## Status
 
 - IDD implementation phase.
-- Not started.
 - Builds on capacity reports, pressure reports, and tracing work.
 
 ## Grug Truth
@@ -15,7 +14,7 @@ stupid-high caps and hope.
 
 ## Goal
 
-Turn Tina's pressure/capacity facts into a product-quality runtime surface:
+Turn pressure/capacity facts into a product-quality runtime surface:
 
 - service pressure summary
 - shard-local capacity scopes
@@ -30,13 +29,13 @@ Turn Tina's pressure/capacity facts into a product-quality runtime surface:
 - No tracing backend.
 - No memory magic.
 - No automatic capacity tuning.
-- No global cross-shard budget unless a later phase proves it.
+- No global cross-shard budget.
 
 ## Rocks
 
 ### Rock 1: Runtime Pressure Summary
 
-Add a copied report shape that gathers:
+Add a copied report shape:
 
 - mailbox pressure
 - pending replies/calls
@@ -89,8 +88,8 @@ simulator, the assertion must work there too. If it does not, the report says
 
 ### Rock 5: Docs And Specimen Sweep
 
-Update service specimens to print or assert capacity summaries where it helps.
-Do not retrofit every old example if it adds only noise.
+Update the production skeleton specimen plus two pressure-heavy specimens to
+print or assert capacity summaries. Leave tiny examples alone.
 
 ## Required Proof
 
