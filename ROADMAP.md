@@ -347,14 +347,34 @@ framework before public release-story work.
 | **107 Observability and capacity product** | Turn pressure/capacity into a user product: runtime pressure summary, shard-local weighted capacity scopes, bounded event sink, and CI-friendly capacity assertions. Plan: `.intent/phases/107-observability-capacity-product/plan.md`. |
 | **108 Proof harnesses and replay ops** | Build the proof machinery: load/soak harness, bad-peer harness, live trace to sim replay, shrink workflow, and clear fast-vs-soak CI gate shape. Plan: `.intent/phases/108-proof-harnesses-and-replay-ops/plan.md`. |
 | **109 Typed config and protocol-state safety** | Push more common LLM/user mistakes into compile errors: public request/internal event split, capability handles, typed config/budget manifests, private protocol typestate, and friendly diagnostics. Plan: `.intent/phases/109-typed-config-protocol-state-safety/plan.md`. |
-| **110 Ecosystem extension hooks** | Give third-party crates stable Tina-shaped seams: bridge author kit, sync codec adapter pattern, bounded observability sink, custom capacity surfaces, and extension smoke systems that use only public APIs. Plan: `.intent/phases/110-ecosystem-extension-hooks/plan.md`. |
-| **111 Whole-framework ergonomics** | Do the broad ergonomics pass: one obvious prelude, one copied service skeleton, fluent-but-honest workflow helpers, better diagnostics, and a selected specimen rewrite using the blessed path. Plan: `.intent/phases/111-whole-framework-ergonomics/plan.md`. |
-| **112 Core ecosystem parity** | Close the next ordinary-service gaps after protocol/bridge work: local IPC, file streaming, codec helpers, admission/rate limits, saga/compensation, pool maturity, async-boundary clarity, and humble benchmarks. Plan: `.intent/phases/112-core-ecosystem-parity/plan.md`. |
 | **Natural-key and keyed-wait pending helpers** | Follow-up to 097 plus system specimens. Build the missing bounded pending vocabulary for natural keys: `PendingCancelableCallSlab<K, Q, R>` or equivalent for multiple cancelable entries per natural key, and likely `KeyedPendingReplies` / `WaitList<K, R>` for per-key FIFO waiters backed by one global cap. Must keep `(key, ticket)` ABA truth, typed `Full`/`BucketFull` admission errors, caller-authority recovery on failed admission, and skip-reclaimed-slot proof. No hidden dedup, no automatic key-versioning. |
 | **Join-all / stream-select helpers** | First-success `CallGroup` exists. Add join-all and stream-select only when a real specimen needs them, preserving branch identity, bounded pending/result storage, explicit cancellation, partial results, and late-reply trace truth. |
 | **Event/request split proposal** | Future IDD candidate pulled by `system_cache_with_fill`: split fire-and-forget mailbox events from caller-authority requests in the public authoring model so request/reply traffic cannot accidentally live only in `handle`. This follows Phase 100's first capability handles; see sketch below. |
 | **Alpaca rename** | Before public launch, rename the project/crates/docs away from Tina to Alpaca so the lineage is respectful and clear: independently maintained Rust framework, inspired by Peter Mbanugo's Tina/Odin and Seastar, not an official Tina port. |
 | **Barend Biesheuvel visible flow ergonomics** | Optional high-level ergonomics only after the local runtime core feels boring: a `flow!`-style authoring surface that preserves named suspension points, visible failure policy, trace step names, and ordinary Tina message/effect expansion. No fake async, no hidden retries, no hidden queues. |
+
+### Post-109 capability backlog
+
+These are not IDD phases yet. They are capability clusters to design from the
+evidence produced by phases 103-109 and the systems specimens. Future IDD plans
+should turn them into implementation slices only after the repeated shapes are
+clear.
+
+The north star is not merely "actor-style services." It is bounded services
+with deterministic simulation/replay as a design constraint all the way down.
+New capabilities must preserve:
+
+- bounded admission or explicit bounded-exception policy
+- typed `Full` / `Closed` / `Timeout` / cancel outcomes
+- trace and capacity facts that can be summarized
+- simulator/replay support, or an honest unsupported fact
+- user-proof through specimens/systems, not only unit tests
+
+| Cluster | Gap | Future IDD shape |
+|---|---|---|
+| Ecosystem extension hooks | Tina needs stable seams for third-party bridges, sync codecs, bounded event sinks, custom capacity surfaces, service policies, and runtime capability reports. | Build small author kits and extension smoke crates that use only public APIs. No dynamic plugin ABI, no unbounded extension queues, no hook that bypasses trace/cancel/capacity truth. |
+| Whole-framework ergonomics | The local nouns are mostly good, but the whole-service copied path is still too fragmented: prelude choice, config manifest, request/event split, defer/cancel/drain/report/shutdown, and README guidance need one coherent path. | Rewrite selected systems with a blessed service skeleton, then extract only helpers that remove repeated ceremony while keeping all suspension/failure/capacity facts visible. |
+| Core ecosystem parity | Ordinary Tokio apps still reach for local IPC, file streaming, codec helpers, admission/rate limits, saga/compensation patterns, mature pools, and async-boundary clarity. | Close these as boring capability slices with user-proof systems: media ingest, API gateway limits, checkout saga, Redis-ish keyspace, local admin/sidecar IPC, and soak proof. |
 
 ### Event/request split proposal
 
@@ -689,7 +709,8 @@ hidden per-key unbounded queues.
 
 These are not planning phases. They are capability gaps to close as real
 implementation slices pull on them. Each entry should land as boring code,
-tests, and specimens when the adjacent work proves the shape.
+tests, specimens, and replay/unsupported truth when the adjacent work proves the
+shape.
 
 | Capability | Build | User outcome |
 |---|---|---|
@@ -725,6 +746,8 @@ tests, and specimens when the adjacent work proves the shape.
 | Pool maturity | Idle eviction, max lifetime, health checks, retire/reuse policy, pooled HTTP/2/gRPC clients, and DB pool consumers that reuse the same pressure vocabulary. | Pools become production resources, not just first-form acquire/release examples. |
 | Async ecosystem boundary | A clean answer for Future/Stream interop: which Tokio crates are bridge-only, which sync codecs Tina adopts, and whether a bounded Future/Stream bridge is worth building. | Users know which Tokio apps Tina can replace natively and where a bridge is the honest boundary. |
 | Benchmarks with humility | Focused comparisons against Tokio/hyper/tungstenite/tonic only after equivalent semantics exist, labeled as local-machine evidence, with capacity and failure behavior included. | Performance claims do not outrun Tina's boundedness and correctness story. |
+| Ecosystem extension hooks | Public extension seams for bridge authors, codec adapters, capacity surfaces, bounded event sinks, and service policies, with extension smoke crates that use no private APIs. | Tina can grow an ecosystem without every new capability landing in core or weakening bounded/DST truth. |
+| Whole-framework ergonomics | One coherent copied path for a real service: prelude, config/budget manifest, public requests/internal events, defer/cancel/drain/report/shutdown, and replay hooks. | A new developer or cheap model can build a correct bounded + replay-aware service without stitching ten specimens together. |
 
 Closed follow-ups from Phase 074 (HTTP body streaming, native HTTP/1):
 
