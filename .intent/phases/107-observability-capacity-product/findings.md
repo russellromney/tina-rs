@@ -1,5 +1,12 @@
 # Phase 107 — Observability And Capacity Product: Findings
 
+Phase 107 ships the **live** observability/capacity product. Existing
+trace-derived pressure (`PressureSummary::from_events`) continues to
+replay through DST unchanged. The new out-of-trace surfaces
+(`SharedCapacityScope`, `BoundedEventSink`) report `Unavailable` in
+sim for this phase; the simulator adapter is explicit follow-up
+([`examples/FINDINGS.md`](../../../examples/FINDINGS.md) #30).
+
 ## What shipped
 
 - `tina_runtime::SharedCapacityScope` — shard-local weighted scope
@@ -71,21 +78,13 @@
       runs 8×5000 concurrent admit/release rounds and asserts the
       counter matches observed `Err` returns. (The pre-fix code
       could over-count from a stale-read on the Full branch.)
-
-### Partial / not-yet
-
-- [~] DST replay preserves *new* pressure facts. The existing trace
-      pressure (mailbox-full / send-rejected / call-reply-rejected)
-      remains preserved across replay because `RuntimeEvent` is
-      untouched; `PressureSummary::from_events` still walks the
-      trace. The new types (`SharedCapacityScope`,
-      `BoundedEventSink`) live outside the trace and are *not* yet
-      replayed in sim. See follow-up #30 below.
-- [~] Simulator parity for capacity assertions. Plan Rock 4 allows
-      a sim surface to be marked `Unavailable`. Today no `tina-sim`
-      path imports the new types. The `ServicePressureReport` shape
-      lets a future sim adapter emit `Unavailable` lines until the
-      live↔sim story is built. See follow-up #30 below.
+- [x] DST replay preserves existing trace-derived pressure facts.
+      `RuntimeEvent` and `PressureSummary::from_events` are untouched;
+      mailbox-full / send-rejected / call-reply-rejected counts still
+      replay. The new out-of-trace primitives (`SharedCapacityScope`,
+      `BoundedEventSink`) are intentionally `Unavailable` in sim for
+      this phase — the plan scopes simulator parity for those out of
+      107 (see *Follow-ups* below and FINDINGS.md #30).
 
 ## Non-goals preserved
 
@@ -109,12 +108,24 @@
 
 ## Suggested follow-ups
 
-See [`examples/FINDINGS.md`](../../../examples/FINDINGS.md) entries
-27–30:
+Not in this phase. Each entry maps to an item in
+[`examples/FINDINGS.md`](../../../examples/FINDINGS.md):
 
-- Lease handoff into a `PendingReplies` slot.
-- Runtime-side `SharedScopeRegistry`.
-- Effect combinator for multi-stage request rails.
-- DST/sim adapter that snapshots `SharedCapacityScope` /
-  `BoundedEventSink` facts into the replay trace, so the new
-  observability primitives carry through to simulator runs.
+- **#30 — DST/sim adapter for the new primitives.** The phase ships
+  the live product. A simulator adapter that snapshots
+  `SharedCapacityScope` / `BoundedEventSink` facts into the replay
+  trace (or rides alongside `LiveReplayFact`) is the next step so
+  sim runs can reconstruct `assert_no_full` semantics for the new
+  surfaces. Until then, `ServicePressureReport::add_unavailable`
+  keeps the sim story honest.
+- **#27 — Lease handoff into a `PendingReplies` slot.** Both new
+  specimens carry a parallel `HashMap<qid, SharedLease>`; a slot
+  variant would compose this away.
+- **#28 — Runtime-side `SharedScopeRegistry`.** Mirror
+  `register_with_capacity` so scope lifecycle and the merged
+  discovery line are runtime-owned instead of user-assembled.
+- **#29 — Effect combinator for multi-stage request rails.**
+  `sleep(d).then_in_isolate(|this, …| …)` would remove the custom
+  message-envelope ping-pong specimens rebuild by hand.
+- **#31 — Drop `SleepReply` from infallible post-sleep variants.**
+  Cleans up user message enums that carry an unused result field.
