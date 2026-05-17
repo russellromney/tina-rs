@@ -3,7 +3,6 @@
 ## Status
 
 - IDD implementation phase.
-- Not started.
 - Builds on owner cancellation and `PendingCancelableCallSet`.
 
 ## Grug Truth
@@ -15,8 +14,7 @@ release promptly. External work may still finish late, and Tina must say that.
 
 ## Goal
 
-Add request-scoped cancellation that a service can use without inventing a
-local cancellation registry every time.
+Add request-scoped cancellation without making every service invent a registry.
 
 ## Non-Goals
 
@@ -28,16 +26,16 @@ local cancellation registry every time.
 
 ## API Shape
 
-First form should be explicit and boring:
+Build this explicit first form:
 
 - `RequestScopeId`
-- `RequestCancelScope`
+- `RequestScope`
 - `ScopedCallHandle`
 - `ScopeCancelReport`
 - bounded `RequestScopeSet`
 
-The service creates/adopts a scope for a request, admits cancelable children into
-bounded storage, and cancels the scope on:
+The service creates/adopts a scope, admits cancelable children into bounded
+storage, and cancels the scope on:
 
 - client disconnect
 - caller cancel
@@ -105,8 +103,8 @@ call_ctx
     .reply(key, Msg::Done)
 ```
 
-but only if storage admission succeeds first. If admission fails, the helper must
-return the authority/effect pair so the service can answer deliberately.
+The helper first admits storage, then returns the child effect. Failed admission
+returns the authority/effect pair so the service can answer deliberately.
 
 ## Required Proof
 

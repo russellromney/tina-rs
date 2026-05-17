@@ -3,8 +3,7 @@
 ## Status
 
 - IDD implementation phase.
-- Not started.
-- This absorbs the old HTTP/2/gRPC finish row and the WebSocket replacement follow-up.
+- Absorbs the old HTTP/2/gRPC finish row and WebSocket replacement follow-up.
 
 ## Grug Truth
 
@@ -16,8 +15,7 @@ TLS, backpressure, and shutdown. First form is not enough now.
 
 ## Goal
 
-Make Tina's native protocol surface good enough for one serious replacement
-story:
+Make one honest native-protocol replacement story:
 
 - HTTP/2 server and client paths have bounded flow-control truth.
 - gRPC has unary plus streaming modes with final-status ownership.
@@ -37,7 +35,7 @@ story:
 
 ### Rock 1: HTTP/2 Flow-Control Truth
 
-Pin the HTTP/2 state machine:
+Implement and test:
 
 - inbound DATA cap
 - outbound DATA cap
@@ -45,22 +43,20 @@ Pin the HTTP/2 state machine:
 - connection window behavior
 - reset/cancel behavior
 - trailers/final status behavior
-
-Expose typed errors for peer reset, local cancel, flow-control full, malformed
-frame, timeout, and closed connection.
+- typed errors for peer reset, local cancel, flow-control full, malformed frame,
+  timeout, and closed connection
 
 ### Rock 2: gRPC Streaming Finish
 
-Build the remaining gRPC modes on top of the HTTP/2 truth:
+Build gRPC modes on top of HTTP/2 truth:
 
 - server streaming
-- client streaming, with a hostile review of any existing first form before
-  calling it done
+- client streaming
 - bidirectional streaming
 - final-status/trailers ownership
 - cancel/reset mapping
 
-Each mode must have a copied service example and an interop proof.
+Each mode gets a copied service example and tonic/grpcurl proof.
 
 ### Rock 3: WebSocket Production Replacement
 
@@ -77,12 +73,12 @@ Finish the WebSocket server replacement surface:
 - per-session state
 - graceful server shutdown
 
-Keep the room/session helper small if repeated specimens prove the shape. Do
-not build a framework before evidence.
+Extract one small room/session helper from existing specimens. It must preserve
+explicit admission, fanout pressure, slow-peer policy, and close reports.
 
 ### Rock 4: Client-Side Protocol Parity
 
-If a server mode is claimed, the client story must be named:
+For every claimed server mode, ship one client answer:
 
 - native Tina client exists, or
 - external client interop is the supported proof path, or

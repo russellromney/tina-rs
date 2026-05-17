@@ -3,18 +3,17 @@
 ## Status
 
 - IDD implementation phase.
-- Not started.
 
 ## Grug Truth
 
 Production Tokio apps talk to other systems.
 
-Tina does not need every SDK feature, but it needs boring, bounded first-real
-paths for the services people reach for every week.
+Tina does not need every SDK feature. It needs boring, bounded paths for common
+production calls.
 
 ## Goal
 
-Broaden the bridge/client surface without hiding external-system truth:
+Broaden bridge/client surface without hiding external-system truth:
 
 - AWS bridge grows beyond the first service.
 - DNS/connect policy is visible.
@@ -27,18 +26,19 @@ Broaden the bridge/client surface without hiding external-system truth:
 - No hidden retry.
 - No hidden idempotency.
 - No fake cancellation of external SDK work.
-- No shared bridge base crate unless three bridges prove the same code shape.
+- No shared bridge base crate in this phase. Fix bridge mismatches directly.
 
 ## Rocks
 
 ### Rock 1: AWS Service Breadth
 
-Add the next AWS operations by need, not ambition:
+Add these AWS operations:
 
 - DynamoDB: get/put/query/update/delete with typed capacity/error facts.
 - SNS: publish with typed terminal outcome.
 - Secrets Manager: get secret value with typed size/error caps.
-- SQS/S3 follow-ups only where the first AWS bridge left obvious gaps.
+- SQS: send/receive/delete visibility basics.
+- S3: get/put/head basics.
 
 Each operation has:
 
@@ -61,9 +61,9 @@ Make outbound connection policy visible:
 
 Do not bury connect behavior inside protocol clients.
 
-### Rock 3: Bridge Lifecycle Convention
+### Rock 3: Bridge Lifecycle Fixes
 
-Audit bridge install/close/drain/metrics/config validation across:
+Make install/close/drain/metrics/config validation consistent across:
 
 - reqwest
 - sqlite
@@ -71,7 +71,8 @@ Audit bridge install/close/drain/metrics/config validation across:
 - AWS
 - tokio/tower/rpc bridges
 
-Fix real mismatches. Document deliberate differences.
+Fix mismatches found while doing the pass. Deliberate differences get a doc
+line and a test.
 
 ### Rock 4: Supplied Client Ownership
 

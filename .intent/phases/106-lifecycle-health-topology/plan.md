@@ -3,7 +3,6 @@
 ## Status
 
 - IDD implementation phase.
-- Not started.
 
 ## Grug Truth
 
@@ -14,7 +13,7 @@ happened. Stop. If every app hand-rolls this, every app gets one edge wrong.
 
 ## Goal
 
-Make service lifecycle a copied Tina pattern with small runtime-owned helpers:
+Make service lifecycle a copied Tina pattern:
 
 - health/readiness/liveness
 - topology report
@@ -33,7 +32,7 @@ Make service lifecycle a copied Tina pattern with small runtime-owned helpers:
 
 ### Rock 1: Health Report
 
-Add a small service health vocabulary:
+Add service health vocabulary:
 
 - `Starting`
 - `Ready`
@@ -46,7 +45,7 @@ Include reasons and recent pressure facts. Health is data, not just a boolean.
 
 ### Rock 2: Topology Report
 
-Add a topology report shape for a local runtime/service:
+Add local runtime/service topology report:
 
 - isolates
 - bridges
@@ -61,7 +60,7 @@ No trace spelunking to know what the app started.
 
 ### Rock 3: Shutdown Choreography
 
-Build a small shutdown state helper that keeps the steps explicit:
+Build a shutdown state helper with explicit steps:
 
 1. stop ingress
 2. cancel or close sessions
