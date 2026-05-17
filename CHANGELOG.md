@@ -4,6 +4,41 @@ This file records completed work.
 
 ## Unreleased
 
+### Phase 102 Host Control Ergonomics
+
+- Added address-routed `ThreadedMultiShardRuntime::call_blocking(addr, msg,
+  timeout)` so host/test/control-plane code can call sharded services without
+  a driver isolate or explicit shard argument.
+- Tightened `ThreadedRuntime::call_blocking` and the multi-shard mirror so
+  host-control command admission is bounded and honest: full worker command
+  queues return `ThreadedRuntimeError::CommandFull` instead of waiting behind
+  worker scheduling before the caller timeout starts.
+- Added cloneable `ThreadedShutdownHandle` for single- and multi-shard threaded
+  runtimes. Host code can request shutdown, wait for the terminal report, and
+  share that control path across threads without `Arc::try_unwrap(runtime)`.
+- Added `tina-runtime/tests/host_control_ergonomics.rs` coverage for normal
+  replies, `Full`, `Closed`, `Timeout`, unsupported calls, unknown shard,
+  command-full admission, idempotent shutdown, multiple waiters, cached
+  terminal reports, and shutdown while command queues are saturated.
+- Migrated copied host-control docs and system/specimen call sites to the new
+  `call_blocking` / `shutdown_handle` shapes where they remove driver or
+  unwrap ceremony without hiding service shutdown policy.
+
+### Phase 101 Mailbox-First Service Ergonomics
+
+- Added service-local helper state for repeated mailbox-first patterns:
+  `tina::time::RecurringTick`, `tina_runtime::LocalPermitGate`,
+  `tina_runtime::DrainState`, and `tina_runtime::FullHandling`.
+- Added `register_with_capacity_and_bootstrap` and threaded/multi-shard mirrors
+  so startup remains an explicit mailbox message while registration can prefill
+  that first message before exposing the address. Failed prefill returns a typed
+  bootstrap error and leaks no registered address.
+- Kept the helpers Tina-shaped: they compute decisions, permits, drain state,
+  and reports. They do not mutate user state in callbacks, resend messages,
+  close resources, or run hidden retries.
+- Migrated system/specimen code including metrics shipping, bounded object
+  lanes, and service shutdown paths to the copied helper shapes.
+
 ### Phase 100 Compile-Time Safety Rails
 
 - Added capability-typed addresses `tina::SendAddress<M>` and
@@ -41,8 +76,46 @@ This file records completed work.
   `docs/tina-user-guide/21-compile-time-safety-rails.md`.
 - Deferred: the wire-enum split (separate `InternalMsg` and `PublicCall`
   types so calling an internal continuation by accident becomes a compile
-  error) and the cancelable-admission rail (owned by Phase 097's
-  `PendingCancelableCallSet`).
+  error). The cancelable-admission rail shipped separately in Phase 097.
+
+### Phase 099 Production Service Skeleton Refresh
+
+- Refreshed `examples/systems/mini_saas_api` as the copied production-shaped
+  service skeleton: native HTTP routes, controller isolate, SQLite bridge pool
+  shape, outbound keepalive webhook, health/readiness, capacity/pressure
+  report, live-replay fact, and graceful shutdown.
+- Migrated the skeleton to current service vocabulary: `call_ctx.defer(...)`,
+  current pressure/capacity reports, `DrainState`, capability-typed service
+  handles where applicable, and host-control helpers where they reduce ceremony.
+- Added smoke and pressure modes plus docs that name what is reusable Tina API
+  versus specimen-local service policy.
+
+### Phase 097 Cancelable Deferred Admission
+
+- Added `PendingCancelableCallSet<K, Q, R>` and `PendingCancelableTicket` for
+  bounded cancelable multi-turn calls that must store caller authority before
+  dispatching child work.
+- Added `DeferredCancelableCall::try_admit(...)` as the blessed copied path:
+  the child effect is returned only after bounded storage accepts the pending
+  token. `Full` and duplicate-key admission errors return the token so the
+  service can still answer or reject the original caller.
+- Kept removal keyed by `(key, ticket)` so stale completions cannot remove a
+  reused natural key, and added tests for full, duplicate, refill, cancel,
+  owner-stop drain, stale completion, and capacity cleanup.
+- Migrated `system_job_queue` to the new helper, proving cancel-while-running
+  and worker-failure paths with one bounded pending set.
+
+### Phase 081 Bridge Convention Audit
+
+- Audited `tina-tokio-bridge`, `tina-tower-bridge`, `tina-reqwest-bridge`,
+  `tina-sqlite-bridge`, `tina-sqlx-bridge`, `tina-rpc-tokio`, and
+  `tina-aws-bridge` for install/config/closer/metrics/tracing/late-result and
+  supplied-client vocabulary.
+- Added the bridge convention table to the user guide and tightened stale docs
+  where bridge metrics or traces overclaimed caller-terminal truth.
+- Kept the result as convention plus small fixes, not a new bridge framework:
+  bridge timeouts still mean Tina stopped waiting unless the backend proves
+  stronger cancellation, and worker-terminal metrics are named honestly.
 
 ### Phase 095 Call Context Defer Ergonomics
 
