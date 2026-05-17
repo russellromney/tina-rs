@@ -680,25 +680,19 @@ owned by the runtime, not by user code.
 register/get/snapshot. Reuse the existing `CapacitySummary` shape so
 the runtime can produce one merged discovery line per shard.
 
-### 31. `SleepReply` leaks into user-defined message variants
+### 29. Effect chaining over multiple runtime calls inside one logical request
 
-**Surfaced by:** `system_api_gateway_limits`, `system_soak_http_db`.
+**Surfaced by:** `system_soak_http_db`.
 
-Every variant a specimen builds for a post-sleep wake-up carries
-`result: SleepReply` even when the handler never inspects it. The
-gateway's `HoldDone { qid, route, result: SleepReply }` and the
-soak's `HttpReleased { qid, ..., result: SleepReply }` are both
-shaped this way. The field is dead weight in the user's message
-enum, but the `sleep(d).then(move |r| Msg { result: r, ... })`
-signature requires it.
+A request rail that admits HTTP, sleeps, releases, admits DB, sleeps,
+replies needs two custom message variants (`HttpReleased`, `DbReleased`)
+so the post-sleep state mutation can land in `handle`. The pattern is
+the same across systems: "after this timer wakes, do the next stage".
+Today every system rebuilds the variants by hand.
 
-**Build:** either (a) accept `then(move |_| Msg { ... })` without
-the placeholder field as the blessed shape and add a `then_no_result`
-variant, or (b) drop the `Result` from `SleepReply` for the
-infallible-sleep case so the carrying variant is a unit. The wider
-form is right for cancellation-aware sleeps; for the typical "wake
-me up later, I don't care if you were nudged" the unit form would
-keep the user's enum clean.
+**Build:** an effect combinator like `sleep(d).then_in_isolate(|this:
+&mut Self| this.start_db(...))` that wires the message envelope and
+the post-wake state mutation in one place.
 
 ### 30. DST adapter for `SharedCapacityScope` / `BoundedEventSink`
 
@@ -719,24 +713,88 @@ drop, push, drain) so a replay can reconstruct `assert_no_full`
 semantics. Or expose the snapshots as `LiveReplayFact` entries so
 they ride alongside the existing fact stream.
 
-### 29. Effect chaining over multiple runtime calls inside one logical request
+### 31. `SleepReply` leaks into user-defined message variants
 
-**Surfaced by:** `system_soak_http_db`.
+**Surfaced by:** `system_api_gateway_limits`, `system_soak_http_db`.
 
-A request rail that admits HTTP, sleeps, releases, admits DB, sleeps,
-replies needs two custom message variants (`HttpReleased`, `DbReleased`)
-so the post-sleep state mutation can land in `handle`. The pattern is
-the same across systems: "after this timer wakes, do the next stage".
-Today every system rebuilds the variants by hand.
+Every variant a specimen builds for a post-sleep wake-up carries
+`result: SleepReply` even when the handler never inspects it. The
+gateway's `HoldDone { qid, route, result: SleepReply }` and the
+soak's `HttpReleased { qid, ..., result: SleepReply }` are both
+shaped this way. The field is dead weight in the user's message
+enum, but the `sleep(d).then(move |r| Msg { result: r, ... })`
+signature requires it.
 
-**Build:** an effect combinator like `sleep(d).then_in_isolate(|this:
-&mut Self| this.start_db(...))` that wires the message envelope and
-the post-wake state mutation in one place.
+**Build:** either (a) accept `then(move |_| Msg { ... })` without
+the placeholder field as the blessed shape and add a `then_no_result`
+variant, or (b) drop the `Result` from `SleepReply` for the
+infallible-sleep case so the carrying variant is a unit. The wider
+form is right for cancellation-aware sleeps; for the typical "wake
+me up later, I don't care if you were nudged" the unit form would
+keep the user's enum clean.
+
+### 32. AWS bridge surface duplication across services
+
+**Surfaced by:** adding DynamoDB / SNS / Secrets Manager workers to
+`tina-aws-bridge`.
+
+Each AWS service worker repeats the same scaffolding: `OwnedRuntime`
+wrapper, `*MetricsInner` struct with the same eight counters plus
+service-specific ones, `note_admit_kind` / `note_terminal_kind` /
+`in_flight_kinds`, `*Closer::close_and_drain` polling loop, and the
+admit/poll/timeout state machine. Five services share roughly 80% of
+their lifecycle code. The phase plan explicitly forbade a shared bridge
+base crate to keep the per-service stories independent, so all five live
+side-by-side with copy-pasted plumbing.
+
+**Build:** when the bridge surface stops growing in shape, factor out
+the common state machine into an internal `bridge_core` module within
+`tina-aws-bridge` (still not a separate crate). The factoring needs to
+preserve each service's per-error tally semantics — counters like
+`DynamoMetrics::conditional_check_failed` or
+`SecretsMetrics::decryption_failed` are service-specific. A trait that
+the per-service module implements (validate, run_request, classify_sdk
+error, tally_terminal) is probably the right shape.
+
+### 33. Bridge classifier vocabulary lives in `tina-aws-bridge`
+
+**Surfaced by:** `system_webhook_relay`, classifier extension traits.
+
+`BridgeOutcomeClass` / `TransientReason` / `FatalReason` are useful
+outside AWS too — the reqwest bridge already has `ReqwestOutcomeClass`
+with its own per-bridge vocabulary. A relay or retry-driver needs
+*both* shapes to classify mixed outcomes (one outbound HTTP, one SQS)
+the same way, so callers re-classify into a private enum.
+
+**Build:** decide whether the bridge classifier should be in
+`tina-runtime` (shared by all bridges) or whether each bridge keeps
+its own private vocabulary and callers map at the boundary. The plan
+forbids a shared bridge crate, but the *classifier vocabulary* is
+plain data and could live alongside `CallOutcome` without coupling
+the bridges themselves.
 
 ## Closed
 
 Findings shipped by recent phases. Numbers are kept stable so
 existing README references stay valid.
+
+### 34. `call.defer(async_bridge).reply(...)` from `handle_call` — Phase 104 proof
+
+The suspected runtime gap was re-tested before Phase 104 merged. The
+general runtime path already works (`handle_call` defers through a
+multi-turn callee and preserves the original caller). Phase 104 now
+pins the AWS-shaped version directly with hermetic S3 and SQS bridge
+tests:
+
+- `tina-aws-bridge/tests/bridge.rs::handle_call_defer_through_s3_bridge_replies_to_original_caller`
+- `tina-aws-bridge/tests/sqs_bridge.rs::handle_call_defer_through_sqs_bridge_replies_to_original_caller`
+
+Both tests put a relay/lane isolate in front of the AWS bridge, issue
+`call.defer(send_s3/send_sqs(...)).reply(...)` from `handle_call`, let
+the AWS bridge complete through its async SDK task + `sleep().then(Poll)`
+loop, and assert the original caller receives the final reply. The public
+`run_against_s3` / `run_against_sqs` paths remain available for larger
+system specimens, but the panic report is closed.
 
 ### 17. Host-thread `call_blocking` — Phase 068 follow-up
 

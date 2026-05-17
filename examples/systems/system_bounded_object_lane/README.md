@@ -7,9 +7,12 @@ isolate admits only `lane_in_flight` operations at once. Admitted work is
 represented by runtime-owned `sleep(...)`; extra callers receive a typed
 `Busy` reply immediately.
 
-This is hermetic on purpose. A real S3 bridge needs observed completion
-delivery, cancellation, close/drain, terminal reporting, and late-result truth;
-that belongs in a real `tina-aws-bridge`, not hidden inside a specimen.
+By default the lane uses a `FakeSleep` backend so tests are hermetic and
+deterministic. The same lane shape also supports a real `tina-aws-bridge`
+S3 backend through [`run_against_s3`]. The bridge's two-layer outcome
+(`CallOutcome::Full/Closed/Timeout` outer, `S3Error::*` inner) is mapped
+into the lane's `Failed(String)` reply with the layer named in the
+message, so callers see one consistent shape regardless of backend.
 
 ## Run
 

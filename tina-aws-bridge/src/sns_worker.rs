@@ -1,4 +1,4 @@
-//! SQS worker isolate around the AWS Rust SDK.
+//! SNS worker isolate around the AWS Rust SDK.
 
 use std::collections::HashMap;
 use std::convert::Infallible;
@@ -7,13 +7,13 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use aws_sdk_sqs::Client;
-use aws_sdk_sqs::config::retry::RetryConfig;
-use aws_sdk_sqs::config::{BehaviorVersion, Credentials, Region};
-use aws_sdk_sqs::error::SdkError;
-use aws_sdk_sqs::operation::delete_message::DeleteMessageError;
-use aws_sdk_sqs::operation::receive_message::ReceiveMessageError;
-use aws_sdk_sqs::operation::send_message::SendMessageError;
+use aws_sdk_sns::Client;
+use aws_sdk_sns::config::retry::RetryConfig;
+use aws_sdk_sns::config::{BehaviorVersion, Credentials, Region};
+use aws_sdk_sns::error::SdkError;
+use aws_sdk_sns::operation::publish::PublishError;
+use aws_sdk_sns::primitives::Blob;
+use aws_sdk_sns::types::MessageAttributeValue;
 use tina::CallContext;
 use tina::prelude::*;
 use tina_runtime::{MailboxFactory, RuntimeCall, ThreadedRuntime, sleep};
@@ -22,10 +22,10 @@ use tokio::sync::oneshot;
 #[cfg(feature = "tracing")]
 use tracing::{Level, event};
 
-use crate::sqs_metrics::{SqsMetricsHandle, SqsMetricsInner};
-use crate::sqs_types::{
-    SqsConfig, SqsConfigError, SqsDeletedMessage, SqsError, SqsMessage, SqsReceivedMessages,
-    SqsRequest, SqsResponse, SqsSentMessage,
+use crate::sns_metrics::{SnsMetricsHandle, SnsMetricsInner};
+use crate::sns_types::{
+    SnsAttributeValue, SnsConfig, SnsConfigError, SnsDestination, SnsError, SnsPublished,
+    SnsRequest, SnsResponse,
 };
 use crate::types::SdkRetryPolicy;
 
@@ -35,47 +35,46 @@ const TRACE_TARGET_CALL: &str = "tina_aws.bridge.call";
 const TRACE_TARGET_BRIDGE: &str = "tina_aws.bridge";
 
 /// Worker reply type.
-pub type SqsResult = Result<SqsResponse, SqsError>;
+pub type SnsResult = Result<SnsResponse, SnsError>;
 
-/// Messages handled by [`SqsWorker`].
+/// Messages handled by [`SnsWorker`].
 #[derive(Debug)]
-pub enum SqsMsg {
-    /// Submit one SQS operation.
-    Send(SqsRequest),
+pub enum SnsMsg {
+    /// Submit one SNS operation.
+    Send(SnsRequest),
     /// Internal sleep wakeup.
     #[doc(hidden)]
     Poll(u64),
 }
 
-struct SqsInFlight {
+struct SnsInFlight {
     started_at: Instant,
-    receiver: oneshot::Receiver<SqsResult>,
+    receiver: oneshot::Receiver<SnsResult>,
     abandoned: Arc<AtomicBool>,
-    request_context: Option<RequestContext<SqsResult>>,
+    request_context: Option<RequestContext<SnsResult>>,
     reply_plain: bool,
     request_kind: &'static str,
 }
 
-/// Result of [`SqsWorker::install`].
-pub struct InstalledSqsBridge<S: Shard + 'static> {
+/// Result of [`SnsWorker::install`].
+pub struct InstalledSnsBridge<S: Shard + 'static> {
     /// Tina address callers use with `call(...)`.
-    pub address: Address<SqsMsg, SqsResult>,
+    pub address: Address<SnsMsg, SnsResult>,
     /// Closer for Tina-side admission.
-    pub closer: SqsCloser,
+    pub closer: SnsCloser,
     /// Metrics handle.
-    pub metrics: SqsMetricsHandle,
+    pub metrics: SnsMetricsHandle,
     _shard: PhantomData<S>,
 }
 
-/// Cloneable closer. Stops new Tina-side admission; already admitted
-/// SDK work runs to completion or bridge timeout.
+/// Cloneable closer.
 #[derive(Debug, Clone)]
-pub struct SqsCloser {
+pub struct SnsCloser {
     closed: Arc<AtomicBool>,
-    metrics: Arc<SqsMetricsInner>,
+    metrics: Arc<SnsMetricsInner>,
 }
 
-impl SqsCloser {
+impl SnsCloser {
     /// Mark the bridge closed. Idempotent.
     pub fn close(&self) {
         #[cfg(feature = "tracing")]
@@ -96,13 +95,13 @@ impl SqsCloser {
 
     /// Close admission and wait up to `timeout` for already accepted
     /// SDK work to leave the bridge's in-flight set.
-    pub fn close_and_drain(&self, timeout: Duration) -> SqsDrainReport {
+    pub fn close_and_drain(&self, timeout: Duration) -> SnsDrainReport {
         self.close();
         let deadline = Instant::now() + timeout;
         loop {
             let remaining = self.metrics.in_flight_current.load(Ordering::Relaxed);
             if remaining == 0 {
-                return SqsDrainReport {
+                return SnsDrainReport {
                     closed: true,
                     drained: true,
                     in_flight_remaining: 0,
@@ -110,7 +109,7 @@ impl SqsCloser {
                 };
             }
             if Instant::now() >= deadline {
-                return SqsDrainReport {
+                return SnsDrainReport {
                     closed: true,
                     drained: false,
                     in_flight_remaining: remaining,
@@ -122,9 +121,9 @@ impl SqsCloser {
     }
 }
 
-/// Report returned by [`SqsCloser::close_and_drain`].
+/// Report returned by [`SnsCloser::close_and_drain`].
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SqsDrainReport {
+pub struct SnsDrainReport {
     /// Admission was closed.
     pub closed: bool,
     /// All accepted bridge work left the in-flight set before the deadline.
@@ -135,31 +134,31 @@ pub struct SqsDrainReport {
     pub in_flight_kinds: Vec<(&'static str, u64)>,
 }
 
-/// SQS install/build failure.
+/// SNS install/build failure.
 #[derive(Debug)]
-pub enum SqsInstallError {
+pub enum SnsInstallError {
     /// Invalid config.
-    Config(SqsConfigError),
+    Config(SnsConfigError),
     /// Tokio runtime or AWS client construction failed.
     Build(String),
     /// Tina runtime registration failed.
     Register(String),
 }
 
-impl std::fmt::Display for SqsInstallError {
+impl std::fmt::Display for SnsInstallError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Config(e) => write!(f, "sqs bridge install: {e}"),
-            Self::Build(e) => write!(f, "sqs bridge install: {e}"),
-            Self::Register(e) => write!(f, "sqs bridge install: register: {e}"),
+            Self::Config(e) => write!(f, "sns bridge install: {e}"),
+            Self::Build(e) => write!(f, "sns bridge install: {e}"),
+            Self::Register(e) => write!(f, "sns bridge install: register: {e}"),
         }
     }
 }
 
-impl std::error::Error for SqsInstallError {}
+impl std::error::Error for SnsInstallError {}
 
-impl From<SqsConfigError> for SqsInstallError {
-    fn from(value: SqsConfigError) -> Self {
+impl From<SnsConfigError> for SnsInstallError {
+    fn from(value: SnsConfigError) -> Self {
         Self::Config(value)
     }
 }
@@ -174,33 +173,33 @@ impl Drop for OwnedRuntime {
     }
 }
 
-/// Bounded AWS SDK SQS worker isolate.
-pub struct SqsWorker<S: Shard + 'static> {
-    config: SqsConfig,
+/// Bounded SNS worker isolate.
+pub struct SnsWorker<S: Shard + 'static> {
+    config: SnsConfig,
     client: Client,
     runtime: Handle,
-    in_flight: HashMap<u64, SqsInFlight>,
+    in_flight: HashMap<u64, SnsInFlight>,
     next_id: u64,
     closed: Arc<AtomicBool>,
-    metrics: Arc<SqsMetricsInner>,
+    metrics: Arc<SnsMetricsInner>,
     _owned_runtime: Option<OwnedRuntime>,
     _shard: PhantomData<S>,
 }
 
-impl<S: Shard + 'static> SqsWorker<S> {
-    /// Build a worker that owns its own Tokio runtime and SQS client.
-    pub fn new(config: SqsConfig) -> Result<(Self, SqsMetricsHandle), SqsError> {
+impl<S: Shard + 'static> SnsWorker<S> {
+    /// Build a worker that owns its own Tokio runtime and SNS client.
+    pub fn new(config: SnsConfig) -> Result<(Self, SnsMetricsHandle), SnsError> {
         config
             .validate()
-            .map_err(|e| SqsError::InvalidRequest(format!("config: {e}")))?;
+            .map_err(|e| SnsError::InvalidRequest(format!("config: {e}")))?;
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .worker_threads(2)
-            .thread_name("tina-aws-sqs-bridge")
+            .thread_name("tina-aws-sns-bridge")
             .build()
-            .map_err(|e| SqsError::Internal(format!("tokio runtime build: {e}")))?;
+            .map_err(|e| SnsError::Internal(format!("tokio runtime build: {e}")))?;
         let handle = runtime.handle().clone();
-        let client = build_sqs_client(&config);
+        let client = build_sns_client(&config);
         let owned = OwnedRuntime(Some(runtime));
         let sdk_max_attempts = u64::from(config.retry_policy.max_attempts());
         Ok(Self::assemble(
@@ -212,29 +211,29 @@ impl<S: Shard + 'static> SqsWorker<S> {
         ))
     }
 
-    /// Build a worker around a caller-supplied SQS client and Tokio
+    /// Build a worker around a caller-supplied SNS client and Tokio
     /// runtime handle.
     pub fn with_supplied_client(
-        config: SqsConfig,
+        config: SnsConfig,
         client: Client,
         runtime: Handle,
-    ) -> Result<(Self, SqsMetricsHandle), SqsConfigError> {
+    ) -> Result<(Self, SnsMetricsHandle), SnsConfigError> {
         config.validate_bridge_fields()?;
         Ok(Self::assemble(config, client, runtime, None, 0))
     }
 
     fn assemble(
-        config: SqsConfig,
+        config: SnsConfig,
         client: Client,
         runtime: Handle,
         owned_runtime: Option<OwnedRuntime>,
         sdk_max_attempts: u64,
-    ) -> (Self, SqsMetricsHandle) {
-        let metrics = Arc::new(SqsMetricsInner::default());
+    ) -> (Self, SnsMetricsHandle) {
+        let metrics = Arc::new(SnsMetricsInner::default());
         metrics
             .sdk_max_attempts
             .store(sdk_max_attempts, Ordering::Relaxed);
-        let handle = SqsMetricsHandle {
+        let handle = SnsMetricsHandle {
             inner: Arc::clone(&metrics),
             capacity: config.max_in_flight,
         };
@@ -258,8 +257,8 @@ impl<S: Shard + 'static> SqsWorker<S> {
     }
 
     /// Cloneable closer.
-    pub fn closer(&self) -> SqsCloser {
-        SqsCloser {
+    pub fn closer(&self) -> SnsCloser {
+        SnsCloser {
             closed: Arc::clone(&self.closed),
             metrics: Arc::clone(&self.metrics),
         }
@@ -267,8 +266,8 @@ impl<S: Shard + 'static> SqsWorker<S> {
 
     fn admit(
         &mut self,
-        request: SqsRequest,
-        request_context: Option<RequestContext<SqsResult>>,
+        request: SnsRequest,
+        request_context: Option<RequestContext<SnsResult>>,
     ) -> Effect<Self> {
         let request_kind = request.kind();
         if self.closed.load(Ordering::Acquire) {
@@ -281,7 +280,7 @@ impl<S: Shard + 'static> SqsWorker<S> {
                 reason = "Closed",
                 request_kind,
             );
-            return Self::complete_request(request_context, Err(SqsError::Closed));
+            return Self::complete_request(request_context, Err(SnsError::Closed));
         }
         if let Err(err) = validate_request(&request, &self.config) {
             tally_admission_error(&self.metrics, &err);
@@ -306,7 +305,7 @@ impl<S: Shard + 'static> SqsWorker<S> {
                 reason = "Full",
                 request_kind,
             );
-            return Self::complete_request(request_context, Err(SqsError::Full));
+            return Self::complete_request(request_context, Err(SnsError::Full));
         }
 
         let id = self.next_id;
@@ -314,14 +313,11 @@ impl<S: Shard + 'static> SqsWorker<S> {
         let reply_plain = request_context.is_none();
         let (tx, rx) = oneshot::channel();
         let client = self.client.clone();
-        let message_body_limit = self.config.message_body_limit;
-        let max_receive_messages = self.config.max_receive_messages;
         let abandoned = Arc::new(AtomicBool::new(false));
         let abandoned_for_task = Arc::clone(&abandoned);
         let metrics_for_task = Arc::clone(&self.metrics);
         self.runtime.spawn(async move {
-            let result =
-                run_request(client, request, message_body_limit, max_receive_messages).await;
+            let result = run_request(client, request).await;
             tally_terminal(&metrics_for_task, &result);
             if abandoned_for_task.load(Ordering::Acquire) {
                 metrics_for_task
@@ -333,7 +329,7 @@ impl<S: Shard + 'static> SqsWorker<S> {
 
         self.in_flight.insert(
             id,
-            SqsInFlight {
+            SnsInFlight {
                 started_at: Instant::now(),
                 receiver: rx,
                 abandoned,
@@ -355,7 +351,7 @@ impl<S: Shard + 'static> SqsWorker<S> {
             request_kind,
             in_flight,
         );
-        sleep(self.config.poll_interval).then(move |_| SqsMsg::Poll(id))
+        sleep(self.config.poll_interval).then(move |_| SnsMsg::Poll(id))
     }
 
     fn poll(&mut self, id: u64) -> Effect<Self> {
@@ -384,27 +380,27 @@ impl<S: Shard + 'static> SqsWorker<S> {
                     let request_context = in_flight.request_context.take();
                     self.in_flight.insert(id, in_flight);
                     return batch(vec![
-                        Self::complete_request(request_context, Err(SqsError::Timeout)),
-                        sleep(self.config.poll_interval).then(move |_| SqsMsg::Poll(id)),
+                        Self::complete_request(request_context, Err(SnsError::Timeout)),
+                        sleep(self.config.poll_interval).then(move |_| SnsMsg::Poll(id)),
                     ]);
                 }
                 self.in_flight.insert(id, in_flight);
-                sleep(self.config.poll_interval).then(move |_| SqsMsg::Poll(id))
+                sleep(self.config.poll_interval).then(move |_| SnsMsg::Poll(id))
             }
             Err(oneshot::error::TryRecvError::Closed) => {
                 self.note_terminal(in_flight.request_kind);
                 Self::complete_terminal(
                     in_flight.request_context,
                     in_flight.reply_plain,
-                    Err(SqsError::Internal("sdk task ended without result".into())),
+                    Err(SnsError::Internal("sdk task ended without result".into())),
                 )
             }
         }
     }
 
     fn complete_request(
-        request_context: Option<RequestContext<SqsResult>>,
-        result: SqsResult,
+        request_context: Option<RequestContext<SnsResult>>,
+        result: SnsResult,
     ) -> Effect<Self> {
         match request_context {
             Some(request) => reply_to_request(request, result),
@@ -413,9 +409,9 @@ impl<S: Shard + 'static> SqsWorker<S> {
     }
 
     fn complete_terminal(
-        request_context: Option<RequestContext<SqsResult>>,
+        request_context: Option<RequestContext<SnsResult>>,
         reply_plain: bool,
-        result: SqsResult,
+        result: SnsResult,
     ) -> Effect<Self> {
         match request_context {
             Some(request) => reply_to_request(request, result),
@@ -431,25 +427,25 @@ impl<S: Shard + 'static> SqsWorker<S> {
     }
 }
 
-impl<S: Shard + Send + 'static> SqsWorker<S> {
+impl<S: Shard + Send + 'static> SnsWorker<S> {
     /// Validate config, build the worker, register it, and return the
     /// address, closer, and metrics handle.
     pub fn install<F>(
         runtime: &ThreadedRuntime<S, F>,
-        config: SqsConfig,
-    ) -> Result<InstalledSqsBridge<S>, SqsInstallError>
+        config: SnsConfig,
+    ) -> Result<InstalledSnsBridge<S>, SnsInstallError>
     where
         F: MailboxFactory + Send + 'static,
     {
         config.validate()?;
         let cap = config.mailbox_capacity;
         let (worker, metrics) =
-            Self::new(config).map_err(|e| SqsInstallError::Build(e.to_string()))?;
+            Self::new(config).map_err(|e| SnsInstallError::Build(e.to_string()))?;
         let closer = worker.closer();
         let address = runtime
             .register_with_capacity::<_, Infallible>(worker, cap)
-            .map_err(|e| SqsInstallError::Register(format!("{e:?}")))?;
-        Ok(InstalledSqsBridge {
+            .map_err(|e| SnsInstallError::Register(format!("{e:?}")))?;
+        Ok(InstalledSnsBridge {
             address,
             closer,
             metrics,
@@ -458,46 +454,46 @@ impl<S: Shard + Send + 'static> SqsWorker<S> {
     }
 }
 
-/// Validate config, build the SQS worker, register it, and return the
+/// Validate config, build the SNS worker, register it, and return the
 /// address, closer, and metrics handle.
-pub fn install_sqs<S, F>(
+pub fn install_sns<S, F>(
     runtime: &ThreadedRuntime<S, F>,
-    config: SqsConfig,
-) -> Result<InstalledSqsBridge<S>, SqsInstallError>
+    config: SnsConfig,
+) -> Result<InstalledSnsBridge<S>, SnsInstallError>
 where
     S: Shard + Send + 'static,
     F: MailboxFactory + Send + 'static,
 {
-    SqsWorker::<S>::install(runtime, config)
+    SnsWorker::<S>::install(runtime, config)
 }
 
-impl<S: Shard + 'static> Isolate for SqsWorker<S> {
+impl<S: Shard + 'static> Isolate for SnsWorker<S> {
     tina::isolate_types! {
-        message: SqsMsg,
-        reply: SqsResult,
+        message: SnsMsg,
+        reply: SnsResult,
         send: tina::Outbound<Infallible>,
         spawn: Infallible,
-        call: RuntimeCall<SqsMsg>,
+        call: RuntimeCall<SnsMsg>,
         shard: S,
     }
 
-    fn handle(&mut self, msg: SqsMsg, _ctx: &mut Context<'_, S, Self::Reply>) -> Effect<Self> {
+    fn handle(&mut self, msg: SnsMsg, _ctx: &mut Context<'_, S, Self::Reply>) -> Effect<Self> {
         match msg {
-            SqsMsg::Send(request) => self.admit(request, None),
-            SqsMsg::Poll(id) => self.poll(id),
+            SnsMsg::Send(request) => self.admit(request, None),
+            SnsMsg::Poll(id) => self.poll(id),
         }
     }
 
-    fn handle_call(&mut self, msg: SqsMsg, call: CallContext<'_, Self>) -> Effect<Self> {
+    fn handle_call(&mut self, msg: SnsMsg, call: CallContext<'_, Self>) -> Effect<Self> {
         match msg {
-            SqsMsg::Send(request) => self.admit(request, Some(call.into_request_context())),
-            SqsMsg::Poll(_) => call.reject(tina::CallRejectedReason::UnsupportedMessage),
+            SnsMsg::Send(request) => self.admit(request, Some(call.into_request_context())),
+            SnsMsg::Poll(_) => call.reject(tina::CallRejectedReason::UnsupportedMessage),
         }
     }
 }
 
-fn build_sqs_client(config: &SqsConfig) -> Client {
-    let mut builder = aws_sdk_sqs::Config::builder()
+fn build_sns_client(config: &SnsConfig) -> Client {
+    let mut builder = aws_sdk_sns::Config::builder()
         .behavior_version(BehaviorVersion::v2026_01_12())
         .region(Region::new(config.region.clone()))
         .retry_config(match config.retry_policy {
@@ -521,167 +517,127 @@ fn build_sqs_client(config: &SqsConfig) -> Client {
     Client::from_conf(builder.build())
 }
 
-fn validate_request(request: &SqsRequest, config: &SqsConfig) -> Result<(), SqsError> {
+fn validate_request(request: &SnsRequest, config: &SnsConfig) -> Result<(), SnsError> {
     match request {
-        SqsRequest::SendMessage(send) => {
-            validate_queue_url(&send.queue_url)?;
-            if send.body.len() > config.message_body_limit {
-                return Err(SqsError::MessageTooLarge);
-            }
-            Ok(())
-        }
-        SqsRequest::ReceiveMessage(receive) => {
-            validate_queue_url(&receive.queue_url)?;
-            if receive.max_messages == 0 || receive.max_messages > config.max_receive_messages {
-                return Err(SqsError::InvalidRequest(format!(
-                    "max_messages {} must be in 1..={}",
-                    receive.max_messages, config.max_receive_messages
-                )));
-            }
-            if !(0..=43_200).contains(&receive.visibility_timeout_seconds) {
-                return Err(SqsError::InvalidRequest(
-                    "visibility_timeout_seconds must be in 0..=43200".into(),
-                ));
-            }
-            if !(0..=20).contains(&receive.wait_time_seconds) {
-                return Err(SqsError::InvalidRequest(
-                    "wait_time_seconds must be in 0..=20".into(),
-                ));
-            }
-            Ok(())
-        }
-        SqsRequest::DeleteMessage(delete) => {
-            validate_queue_url(&delete.queue_url)?;
-            if delete.receipt_handle.is_empty() {
-                return Err(SqsError::InvalidRequest(
-                    "receipt_handle must not be empty".into(),
-                ));
-            }
-            Ok(())
-        }
-    }
-}
-
-fn validate_queue_url(queue_url: &str) -> Result<(), SqsError> {
-    if queue_url.trim().is_empty() {
-        Err(SqsError::InvalidRequest(
-            "queue_url must not be empty".into(),
-        ))
-    } else {
-        Ok(())
-    }
-}
-
-async fn run_request(
-    client: Client,
-    request: SqsRequest,
-    body_limit: usize,
-    max_receive_messages: usize,
-) -> SqsResult {
-    match request {
-        SqsRequest::SendMessage(send) => {
-            let mut req = client
-                .send_message()
-                .queue_url(send.queue_url)
-                .message_body(send.body);
-            if let Some(group_id) = send.message_group_id {
-                req = req.message_group_id(group_id);
-            }
-            if let Some(dedup_id) = send.message_deduplication_id {
-                req = req.message_deduplication_id(dedup_id);
-            }
-            req.send()
-                .await
-                .map(|out| {
-                    SqsResponse::SentMessage(SqsSentMessage {
-                        message_id: out.message_id,
-                        md5_of_body: out.md5_of_message_body,
-                        sequence_number: out.sequence_number,
-                    })
-                })
-                .map_err(classify_send_error)
-        }
-        SqsRequest::ReceiveMessage(receive) => {
-            let receive_cap = receive.max_messages.min(max_receive_messages);
-            let out = client
-                .receive_message()
-                .queue_url(receive.queue_url)
-                .max_number_of_messages(receive.max_messages as i32)
-                .visibility_timeout(receive.visibility_timeout_seconds)
-                .wait_time_seconds(receive.wait_time_seconds)
-                .send()
-                .await
-                .map_err(classify_receive_error)?;
-            let mut messages = Vec::new();
-            let raw_messages = out.messages.unwrap_or_default();
-            if raw_messages.len() > receive_cap {
-                return Err(SqsError::ResponseTooLarge);
-            }
-            for msg in raw_messages {
-                let body = msg.body.unwrap_or_default();
-                if body.len() > body_limit {
-                    return Err(SqsError::ResponseTooLarge);
+        SnsRequest::Publish(pub_) => {
+            match &pub_.destination {
+                SnsDestination::TopicArn(s)
+                | SnsDestination::TargetArn(s)
+                | SnsDestination::PhoneNumber(s) => {
+                    if s.trim().is_empty() {
+                        return Err(SnsError::InvalidRequest(
+                            "destination must not be empty".into(),
+                        ));
+                    }
                 }
-                let Some(receipt_handle) = msg.receipt_handle else {
-                    return Err(SqsError::Sdk(
-                        "received message without receipt handle".into(),
-                    ));
-                };
-                messages.push(SqsMessage {
-                    message_id: msg.message_id,
-                    receipt_handle,
-                    body,
-                });
             }
-            Ok(SqsResponse::ReceivedMessages(SqsReceivedMessages {
-                messages,
-            }))
+            if pub_.message.is_empty() {
+                return Err(SnsError::InvalidRequest("message must not be empty".into()));
+            }
+            if pub_.message.len() > config.message_body_limit {
+                return Err(SnsError::MessageTooLarge);
+            }
+            let attr_size: usize = pub_
+                .attributes
+                .iter()
+                .map(|(k, v)| {
+                    k.len()
+                        + match v {
+                            SnsAttributeValue::String(s) => s.len(),
+                            SnsAttributeValue::Binary(b) => b.len(),
+                        }
+                })
+                .sum();
+            if attr_size > config.attribute_body_limit {
+                return Err(SnsError::AttributesTooLarge);
+            }
+            Ok(())
         }
-        SqsRequest::DeleteMessage(delete) => client
-            .delete_message()
-            .queue_url(delete.queue_url)
-            .receipt_handle(delete.receipt_handle)
-            .send()
-            .await
-            .map(|_| SqsResponse::DeletedMessage(SqsDeletedMessage))
-            .map_err(classify_delete_error),
     }
 }
 
-fn classify_send_error(error: SdkError<SendMessageError>) -> SqsError {
-    if let Some(service) = error.as_service_error() {
-        if service.is_queue_does_not_exist() {
-            return SqsError::QueueDoesNotExist(error_detail(&error));
-        }
-        if service.is_request_throttled() || service.is_kms_throttled() {
-            return SqsError::Throttled(error_detail(&error));
+fn convert_attributes(
+    attrs: HashMap<String, SnsAttributeValue>,
+) -> HashMap<String, MessageAttributeValue> {
+    let mut out = HashMap::with_capacity(attrs.len());
+    for (k, v) in attrs {
+        let mav = match v {
+            SnsAttributeValue::String(s) => MessageAttributeValue::builder()
+                .data_type("String")
+                .string_value(s)
+                .build(),
+            SnsAttributeValue::Binary(b) => MessageAttributeValue::builder()
+                .data_type("Binary")
+                .binary_value(Blob::new(b))
+                .build(),
+        };
+        if let Ok(mav) = mav {
+            out.insert(k, mav);
         }
     }
-    SqsError::Sdk(error_detail(&error))
+    out
 }
 
-fn classify_receive_error(error: SdkError<ReceiveMessageError>) -> SqsError {
-    if let Some(service) = error.as_service_error() {
-        if service.is_queue_does_not_exist() {
-            return SqsError::QueueDoesNotExist(error_detail(&error));
-        }
-        if service.is_request_throttled() || service.is_kms_throttled() || service.is_over_limit() {
-            return SqsError::Throttled(error_detail(&error));
+async fn run_request(client: Client, request: SnsRequest) -> SnsResult {
+    match request {
+        SnsRequest::Publish(pub_) => {
+            let mut req = client.publish().message(pub_.message);
+            req = match pub_.destination {
+                SnsDestination::TopicArn(s) => req.topic_arn(s),
+                SnsDestination::TargetArn(s) => req.target_arn(s),
+                SnsDestination::PhoneNumber(s) => req.phone_number(s),
+            };
+            if let Some(subject) = pub_.subject {
+                req = req.subject(subject);
+            }
+            if let Some(group) = pub_.message_group_id {
+                req = req.message_group_id(group);
+            }
+            if let Some(dedup) = pub_.message_deduplication_id {
+                req = req.message_deduplication_id(dedup);
+            }
+            if !pub_.attributes.is_empty() {
+                req = req.set_message_attributes(Some(convert_attributes(pub_.attributes)));
+            }
+            match req.send().await {
+                Ok(out) => Ok(SnsResponse::Published(SnsPublished {
+                    message_id: out.message_id,
+                    sequence_number: out.sequence_number,
+                })),
+                Err(e) => Err(classify_publish_error(e)),
+            }
         }
     }
-    SqsError::Sdk(error_detail(&error))
 }
 
-fn classify_delete_error(error: SdkError<DeleteMessageError>) -> SqsError {
+fn classify_publish_error(error: SdkError<PublishError>) -> SnsError {
     if let Some(service) = error.as_service_error() {
-        if service.is_queue_does_not_exist() {
-            return SqsError::QueueDoesNotExist(error_detail(&error));
+        if service.is_not_found_exception() || service.is_kms_not_found_exception() {
+            return SnsError::NotFound(error_detail(&error));
         }
-        if service.is_request_throttled() {
-            return SqsError::Throttled(error_detail(&error));
+        if service.is_authorization_error_exception() || service.is_kms_access_denied_exception() {
+            return SnsError::AccessDenied(error_detail(&error));
+        }
+        if service.is_kms_throttling_exception() {
+            return SnsError::Throttled(error_detail(&error));
+        }
+        if service.is_invalid_parameter_exception()
+            || service.is_invalid_parameter_value_exception()
+            || service.is_endpoint_disabled_exception()
+            || service.is_invalid_security_exception()
+            || service.is_validation_exception()
+            || service.is_platform_application_disabled_exception()
+            || service.is_kms_disabled_exception()
+            || service.is_kms_invalid_state_exception()
+            || service.is_kms_opt_in_required()
+        {
+            return SnsError::InvalidParameter(error_detail(&error));
+        }
+        if service.is_internal_error_exception() {
+            return SnsError::Sdk(error_detail(&error));
         }
     }
-    SqsError::Sdk(error_detail(&error))
+    SnsError::Sdk(error_detail(&error))
 }
 
 fn error_detail<E, R>(error: &SdkError<E, R>) -> String
@@ -696,13 +652,16 @@ where
     }
 }
 
-fn tally_admission_error(metrics: &SqsMetricsInner, err: &SqsError) {
-    // `validate_request` only produces `MessageTooLarge` or
-    // `InvalidRequest`. Future validator additions land in `invalid`
-    // until they earn a typed counter.
+fn tally_admission_error(metrics: &SnsMetricsInner, err: &SnsError) {
+    // `validate_request` only produces `MessageTooLarge`,
+    // `AttributesTooLarge`, or `InvalidRequest`. Future validator
+    // additions land in `invalid` until they earn a typed counter.
     match err {
-        SqsError::MessageTooLarge => {
+        SnsError::MessageTooLarge => {
             metrics.message_too_large.fetch_add(1, Ordering::Relaxed);
+        }
+        SnsError::AttributesTooLarge => {
+            metrics.attributes_too_large.fetch_add(1, Ordering::Relaxed);
         }
         _ => {
             metrics.invalid.fetch_add(1, Ordering::Relaxed);
@@ -710,32 +669,34 @@ fn tally_admission_error(metrics: &SqsMetricsInner, err: &SqsError) {
     }
 }
 
-/// Maps an admission-class [`SqsError`] to the wire-stable tracing
-/// `reason` label. Only the two variants `validate_request` can
-/// produce are listed; other variants are not reachable on the
-/// admission tracing path.
 #[cfg(feature = "tracing")]
-fn admission_reason(err: &SqsError) -> &'static str {
+fn admission_reason(err: &SnsError) -> &'static str {
     match err {
-        SqsError::MessageTooLarge => "MessageTooLarge",
-        SqsError::InvalidRequest(_) => "InvalidRequest",
-        // Unreachable: validate_request only emits MessageTooLarge or
-        // InvalidRequest. Match arm is required for exhaustiveness;
-        // the label keeps the tracing schema stable if the error
-        // shape grows.
+        SnsError::MessageTooLarge => "MessageTooLarge",
+        SnsError::AttributesTooLarge => "AttributesTooLarge",
+        SnsError::InvalidRequest(_) => "InvalidRequest",
         _ => "Invalid",
     }
 }
 
-fn tally_terminal(metrics: &SqsMetricsInner, result: &SqsResult) {
+fn tally_terminal(metrics: &SnsMetricsInner, result: &SnsResult) {
     match result {
         Ok(_) => {
             metrics.responses.fetch_add(1, Ordering::Relaxed);
         }
-        Err(SqsError::ResponseTooLarge) => {
-            metrics.response_too_large.fetch_add(1, Ordering::Relaxed);
+        Err(SnsError::InvalidParameter(_)) => {
+            metrics.invalid_parameter.fetch_add(1, Ordering::Relaxed);
         }
-        Err(SqsError::Sdk(_) | SqsError::QueueDoesNotExist(_) | SqsError::Throttled(_)) => {
+        Err(SnsError::NotFound(_)) => {
+            metrics.not_found.fetch_add(1, Ordering::Relaxed);
+        }
+        Err(SnsError::AccessDenied(_)) => {
+            metrics.access_denied.fetch_add(1, Ordering::Relaxed);
+        }
+        Err(SnsError::Throttled(_)) => {
+            metrics.throttled.fetch_add(1, Ordering::Relaxed);
+        }
+        Err(SnsError::Sdk(_)) => {
             metrics.sdk_errors.fetch_add(1, Ordering::Relaxed);
         }
         Err(_) => {}

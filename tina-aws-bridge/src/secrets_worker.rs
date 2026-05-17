@@ -1,4 +1,4 @@
-//! SQS worker isolate around the AWS Rust SDK.
+//! Secrets Manager worker isolate around the AWS Rust SDK.
 
 use std::collections::HashMap;
 use std::convert::Infallible;
@@ -7,13 +7,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use aws_sdk_sqs::Client;
-use aws_sdk_sqs::config::retry::RetryConfig;
-use aws_sdk_sqs::config::{BehaviorVersion, Credentials, Region};
-use aws_sdk_sqs::error::SdkError;
-use aws_sdk_sqs::operation::delete_message::DeleteMessageError;
-use aws_sdk_sqs::operation::receive_message::ReceiveMessageError;
-use aws_sdk_sqs::operation::send_message::SendMessageError;
+use aws_sdk_secretsmanager::Client;
+use aws_sdk_secretsmanager::config::retry::RetryConfig;
+use aws_sdk_secretsmanager::config::{BehaviorVersion, Credentials, Region};
+use aws_sdk_secretsmanager::error::{ProvideErrorMetadata, SdkError};
+use aws_sdk_secretsmanager::operation::get_secret_value::GetSecretValueError;
 use tina::CallContext;
 use tina::prelude::*;
 use tina_runtime::{MailboxFactory, RuntimeCall, ThreadedRuntime, sleep};
@@ -22,10 +20,9 @@ use tokio::sync::oneshot;
 #[cfg(feature = "tracing")]
 use tracing::{Level, event};
 
-use crate::sqs_metrics::{SqsMetricsHandle, SqsMetricsInner};
-use crate::sqs_types::{
-    SqsConfig, SqsConfigError, SqsDeletedMessage, SqsError, SqsMessage, SqsReceivedMessages,
-    SqsRequest, SqsResponse, SqsSentMessage,
+use crate::secrets_metrics::{SecretsMetricsHandle, SecretsMetricsInner};
+use crate::secrets_types::{
+    SecretsConfig, SecretsConfigError, SecretsError, SecretsRequest, SecretsResponse, SecretsValue,
 };
 use crate::types::SdkRetryPolicy;
 
@@ -35,47 +32,46 @@ const TRACE_TARGET_CALL: &str = "tina_aws.bridge.call";
 const TRACE_TARGET_BRIDGE: &str = "tina_aws.bridge";
 
 /// Worker reply type.
-pub type SqsResult = Result<SqsResponse, SqsError>;
+pub type SecretsResult = Result<SecretsResponse, SecretsError>;
 
-/// Messages handled by [`SqsWorker`].
+/// Messages handled by [`SecretsWorker`].
 #[derive(Debug)]
-pub enum SqsMsg {
-    /// Submit one SQS operation.
-    Send(SqsRequest),
+pub enum SecretsMsg {
+    /// Submit one Secrets Manager operation.
+    Send(SecretsRequest),
     /// Internal sleep wakeup.
     #[doc(hidden)]
     Poll(u64),
 }
 
-struct SqsInFlight {
+struct SecretsInFlight {
     started_at: Instant,
-    receiver: oneshot::Receiver<SqsResult>,
+    receiver: oneshot::Receiver<SecretsResult>,
     abandoned: Arc<AtomicBool>,
-    request_context: Option<RequestContext<SqsResult>>,
+    request_context: Option<RequestContext<SecretsResult>>,
     reply_plain: bool,
     request_kind: &'static str,
 }
 
-/// Result of [`SqsWorker::install`].
-pub struct InstalledSqsBridge<S: Shard + 'static> {
+/// Result of [`SecretsWorker::install`].
+pub struct InstalledSecretsBridge<S: Shard + 'static> {
     /// Tina address callers use with `call(...)`.
-    pub address: Address<SqsMsg, SqsResult>,
+    pub address: Address<SecretsMsg, SecretsResult>,
     /// Closer for Tina-side admission.
-    pub closer: SqsCloser,
+    pub closer: SecretsCloser,
     /// Metrics handle.
-    pub metrics: SqsMetricsHandle,
+    pub metrics: SecretsMetricsHandle,
     _shard: PhantomData<S>,
 }
 
-/// Cloneable closer. Stops new Tina-side admission; already admitted
-/// SDK work runs to completion or bridge timeout.
+/// Cloneable closer.
 #[derive(Debug, Clone)]
-pub struct SqsCloser {
+pub struct SecretsCloser {
     closed: Arc<AtomicBool>,
-    metrics: Arc<SqsMetricsInner>,
+    metrics: Arc<SecretsMetricsInner>,
 }
 
-impl SqsCloser {
+impl SecretsCloser {
     /// Mark the bridge closed. Idempotent.
     pub fn close(&self) {
         #[cfg(feature = "tracing")]
@@ -96,13 +92,13 @@ impl SqsCloser {
 
     /// Close admission and wait up to `timeout` for already accepted
     /// SDK work to leave the bridge's in-flight set.
-    pub fn close_and_drain(&self, timeout: Duration) -> SqsDrainReport {
+    pub fn close_and_drain(&self, timeout: Duration) -> SecretsDrainReport {
         self.close();
         let deadline = Instant::now() + timeout;
         loop {
             let remaining = self.metrics.in_flight_current.load(Ordering::Relaxed);
             if remaining == 0 {
-                return SqsDrainReport {
+                return SecretsDrainReport {
                     closed: true,
                     drained: true,
                     in_flight_remaining: 0,
@@ -110,7 +106,7 @@ impl SqsCloser {
                 };
             }
             if Instant::now() >= deadline {
-                return SqsDrainReport {
+                return SecretsDrainReport {
                     closed: true,
                     drained: false,
                     in_flight_remaining: remaining,
@@ -122,9 +118,9 @@ impl SqsCloser {
     }
 }
 
-/// Report returned by [`SqsCloser::close_and_drain`].
+/// Report returned by [`SecretsCloser::close_and_drain`].
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SqsDrainReport {
+pub struct SecretsDrainReport {
     /// Admission was closed.
     pub closed: bool,
     /// All accepted bridge work left the in-flight set before the deadline.
@@ -135,31 +131,31 @@ pub struct SqsDrainReport {
     pub in_flight_kinds: Vec<(&'static str, u64)>,
 }
 
-/// SQS install/build failure.
+/// Secrets Manager install/build failure.
 #[derive(Debug)]
-pub enum SqsInstallError {
+pub enum SecretsInstallError {
     /// Invalid config.
-    Config(SqsConfigError),
+    Config(SecretsConfigError),
     /// Tokio runtime or AWS client construction failed.
     Build(String),
     /// Tina runtime registration failed.
     Register(String),
 }
 
-impl std::fmt::Display for SqsInstallError {
+impl std::fmt::Display for SecretsInstallError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Config(e) => write!(f, "sqs bridge install: {e}"),
-            Self::Build(e) => write!(f, "sqs bridge install: {e}"),
-            Self::Register(e) => write!(f, "sqs bridge install: register: {e}"),
+            Self::Config(e) => write!(f, "secrets bridge install: {e}"),
+            Self::Build(e) => write!(f, "secrets bridge install: {e}"),
+            Self::Register(e) => write!(f, "secrets bridge install: register: {e}"),
         }
     }
 }
 
-impl std::error::Error for SqsInstallError {}
+impl std::error::Error for SecretsInstallError {}
 
-impl From<SqsConfigError> for SqsInstallError {
-    fn from(value: SqsConfigError) -> Self {
+impl From<SecretsConfigError> for SecretsInstallError {
+    fn from(value: SecretsConfigError) -> Self {
         Self::Config(value)
     }
 }
@@ -174,33 +170,34 @@ impl Drop for OwnedRuntime {
     }
 }
 
-/// Bounded AWS SDK SQS worker isolate.
-pub struct SqsWorker<S: Shard + 'static> {
-    config: SqsConfig,
+/// Bounded Secrets Manager worker isolate.
+pub struct SecretsWorker<S: Shard + 'static> {
+    config: SecretsConfig,
     client: Client,
     runtime: Handle,
-    in_flight: HashMap<u64, SqsInFlight>,
+    in_flight: HashMap<u64, SecretsInFlight>,
     next_id: u64,
     closed: Arc<AtomicBool>,
-    metrics: Arc<SqsMetricsInner>,
+    metrics: Arc<SecretsMetricsInner>,
     _owned_runtime: Option<OwnedRuntime>,
     _shard: PhantomData<S>,
 }
 
-impl<S: Shard + 'static> SqsWorker<S> {
-    /// Build a worker that owns its own Tokio runtime and SQS client.
-    pub fn new(config: SqsConfig) -> Result<(Self, SqsMetricsHandle), SqsError> {
+impl<S: Shard + 'static> SecretsWorker<S> {
+    /// Build a worker that owns its own Tokio runtime and Secrets
+    /// Manager client.
+    pub fn new(config: SecretsConfig) -> Result<(Self, SecretsMetricsHandle), SecretsError> {
         config
             .validate()
-            .map_err(|e| SqsError::InvalidRequest(format!("config: {e}")))?;
+            .map_err(|e| SecretsError::InvalidRequest(format!("config: {e}")))?;
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .worker_threads(2)
-            .thread_name("tina-aws-sqs-bridge")
+            .thread_name("tina-aws-secrets-bridge")
             .build()
-            .map_err(|e| SqsError::Internal(format!("tokio runtime build: {e}")))?;
+            .map_err(|e| SecretsError::Internal(format!("tokio runtime build: {e}")))?;
         let handle = runtime.handle().clone();
-        let client = build_sqs_client(&config);
+        let client = build_secrets_client(&config);
         let owned = OwnedRuntime(Some(runtime));
         let sdk_max_attempts = u64::from(config.retry_policy.max_attempts());
         Ok(Self::assemble(
@@ -212,29 +209,29 @@ impl<S: Shard + 'static> SqsWorker<S> {
         ))
     }
 
-    /// Build a worker around a caller-supplied SQS client and Tokio
-    /// runtime handle.
+    /// Build a worker around a caller-supplied client and Tokio runtime
+    /// handle.
     pub fn with_supplied_client(
-        config: SqsConfig,
+        config: SecretsConfig,
         client: Client,
         runtime: Handle,
-    ) -> Result<(Self, SqsMetricsHandle), SqsConfigError> {
+    ) -> Result<(Self, SecretsMetricsHandle), SecretsConfigError> {
         config.validate_bridge_fields()?;
         Ok(Self::assemble(config, client, runtime, None, 0))
     }
 
     fn assemble(
-        config: SqsConfig,
+        config: SecretsConfig,
         client: Client,
         runtime: Handle,
         owned_runtime: Option<OwnedRuntime>,
         sdk_max_attempts: u64,
-    ) -> (Self, SqsMetricsHandle) {
-        let metrics = Arc::new(SqsMetricsInner::default());
+    ) -> (Self, SecretsMetricsHandle) {
+        let metrics = Arc::new(SecretsMetricsInner::default());
         metrics
             .sdk_max_attempts
             .store(sdk_max_attempts, Ordering::Relaxed);
-        let handle = SqsMetricsHandle {
+        let handle = SecretsMetricsHandle {
             inner: Arc::clone(&metrics),
             capacity: config.max_in_flight,
         };
@@ -258,8 +255,8 @@ impl<S: Shard + 'static> SqsWorker<S> {
     }
 
     /// Cloneable closer.
-    pub fn closer(&self) -> SqsCloser {
-        SqsCloser {
+    pub fn closer(&self) -> SecretsCloser {
+        SecretsCloser {
             closed: Arc::clone(&self.closed),
             metrics: Arc::clone(&self.metrics),
         }
@@ -267,8 +264,8 @@ impl<S: Shard + 'static> SqsWorker<S> {
 
     fn admit(
         &mut self,
-        request: SqsRequest,
-        request_context: Option<RequestContext<SqsResult>>,
+        request: SecretsRequest,
+        request_context: Option<RequestContext<SecretsResult>>,
     ) -> Effect<Self> {
         let request_kind = request.kind();
         if self.closed.load(Ordering::Acquire) {
@@ -281,9 +278,9 @@ impl<S: Shard + 'static> SqsWorker<S> {
                 reason = "Closed",
                 request_kind,
             );
-            return Self::complete_request(request_context, Err(SqsError::Closed));
+            return Self::complete_request(request_context, Err(SecretsError::Closed));
         }
-        if let Err(err) = validate_request(&request, &self.config) {
+        if let Err(err) = validate_request(&request) {
             tally_admission_error(&self.metrics, &err);
             #[cfg(feature = "tracing")]
             event!(
@@ -306,7 +303,7 @@ impl<S: Shard + 'static> SqsWorker<S> {
                 reason = "Full",
                 request_kind,
             );
-            return Self::complete_request(request_context, Err(SqsError::Full));
+            return Self::complete_request(request_context, Err(SecretsError::Full));
         }
 
         let id = self.next_id;
@@ -314,14 +311,12 @@ impl<S: Shard + 'static> SqsWorker<S> {
         let reply_plain = request_context.is_none();
         let (tx, rx) = oneshot::channel();
         let client = self.client.clone();
-        let message_body_limit = self.config.message_body_limit;
-        let max_receive_messages = self.config.max_receive_messages;
+        let secret_size_limit = self.config.secret_size_limit;
         let abandoned = Arc::new(AtomicBool::new(false));
         let abandoned_for_task = Arc::clone(&abandoned);
         let metrics_for_task = Arc::clone(&self.metrics);
         self.runtime.spawn(async move {
-            let result =
-                run_request(client, request, message_body_limit, max_receive_messages).await;
+            let result = run_request(client, request, secret_size_limit).await;
             tally_terminal(&metrics_for_task, &result);
             if abandoned_for_task.load(Ordering::Acquire) {
                 metrics_for_task
@@ -333,7 +328,7 @@ impl<S: Shard + 'static> SqsWorker<S> {
 
         self.in_flight.insert(
             id,
-            SqsInFlight {
+            SecretsInFlight {
                 started_at: Instant::now(),
                 receiver: rx,
                 abandoned,
@@ -355,7 +350,7 @@ impl<S: Shard + 'static> SqsWorker<S> {
             request_kind,
             in_flight,
         );
-        sleep(self.config.poll_interval).then(move |_| SqsMsg::Poll(id))
+        sleep(self.config.poll_interval).then(move |_| SecretsMsg::Poll(id))
     }
 
     fn poll(&mut self, id: u64) -> Effect<Self> {
@@ -384,27 +379,29 @@ impl<S: Shard + 'static> SqsWorker<S> {
                     let request_context = in_flight.request_context.take();
                     self.in_flight.insert(id, in_flight);
                     return batch(vec![
-                        Self::complete_request(request_context, Err(SqsError::Timeout)),
-                        sleep(self.config.poll_interval).then(move |_| SqsMsg::Poll(id)),
+                        Self::complete_request(request_context, Err(SecretsError::Timeout)),
+                        sleep(self.config.poll_interval).then(move |_| SecretsMsg::Poll(id)),
                     ]);
                 }
                 self.in_flight.insert(id, in_flight);
-                sleep(self.config.poll_interval).then(move |_| SqsMsg::Poll(id))
+                sleep(self.config.poll_interval).then(move |_| SecretsMsg::Poll(id))
             }
             Err(oneshot::error::TryRecvError::Closed) => {
                 self.note_terminal(in_flight.request_kind);
                 Self::complete_terminal(
                     in_flight.request_context,
                     in_flight.reply_plain,
-                    Err(SqsError::Internal("sdk task ended without result".into())),
+                    Err(SecretsError::Internal(
+                        "sdk task ended without result".into(),
+                    )),
                 )
             }
         }
     }
 
     fn complete_request(
-        request_context: Option<RequestContext<SqsResult>>,
-        result: SqsResult,
+        request_context: Option<RequestContext<SecretsResult>>,
+        result: SecretsResult,
     ) -> Effect<Self> {
         match request_context {
             Some(request) => reply_to_request(request, result),
@@ -413,9 +410,9 @@ impl<S: Shard + 'static> SqsWorker<S> {
     }
 
     fn complete_terminal(
-        request_context: Option<RequestContext<SqsResult>>,
+        request_context: Option<RequestContext<SecretsResult>>,
         reply_plain: bool,
-        result: SqsResult,
+        result: SecretsResult,
     ) -> Effect<Self> {
         match request_context {
             Some(request) => reply_to_request(request, result),
@@ -431,25 +428,25 @@ impl<S: Shard + 'static> SqsWorker<S> {
     }
 }
 
-impl<S: Shard + Send + 'static> SqsWorker<S> {
+impl<S: Shard + Send + 'static> SecretsWorker<S> {
     /// Validate config, build the worker, register it, and return the
     /// address, closer, and metrics handle.
     pub fn install<F>(
         runtime: &ThreadedRuntime<S, F>,
-        config: SqsConfig,
-    ) -> Result<InstalledSqsBridge<S>, SqsInstallError>
+        config: SecretsConfig,
+    ) -> Result<InstalledSecretsBridge<S>, SecretsInstallError>
     where
         F: MailboxFactory + Send + 'static,
     {
         config.validate()?;
         let cap = config.mailbox_capacity;
         let (worker, metrics) =
-            Self::new(config).map_err(|e| SqsInstallError::Build(e.to_string()))?;
+            Self::new(config).map_err(|e| SecretsInstallError::Build(e.to_string()))?;
         let closer = worker.closer();
         let address = runtime
             .register_with_capacity::<_, Infallible>(worker, cap)
-            .map_err(|e| SqsInstallError::Register(format!("{e:?}")))?;
-        Ok(InstalledSqsBridge {
+            .map_err(|e| SecretsInstallError::Register(format!("{e:?}")))?;
+        Ok(InstalledSecretsBridge {
             address,
             closer,
             metrics,
@@ -458,46 +455,46 @@ impl<S: Shard + Send + 'static> SqsWorker<S> {
     }
 }
 
-/// Validate config, build the SQS worker, register it, and return the
-/// address, closer, and metrics handle.
-pub fn install_sqs<S, F>(
+/// Validate config, build the Secrets Manager worker, register it,
+/// and return the address, closer, and metrics handle.
+pub fn install_secrets<S, F>(
     runtime: &ThreadedRuntime<S, F>,
-    config: SqsConfig,
-) -> Result<InstalledSqsBridge<S>, SqsInstallError>
+    config: SecretsConfig,
+) -> Result<InstalledSecretsBridge<S>, SecretsInstallError>
 where
     S: Shard + Send + 'static,
     F: MailboxFactory + Send + 'static,
 {
-    SqsWorker::<S>::install(runtime, config)
+    SecretsWorker::<S>::install(runtime, config)
 }
 
-impl<S: Shard + 'static> Isolate for SqsWorker<S> {
+impl<S: Shard + 'static> Isolate for SecretsWorker<S> {
     tina::isolate_types! {
-        message: SqsMsg,
-        reply: SqsResult,
+        message: SecretsMsg,
+        reply: SecretsResult,
         send: tina::Outbound<Infallible>,
         spawn: Infallible,
-        call: RuntimeCall<SqsMsg>,
+        call: RuntimeCall<SecretsMsg>,
         shard: S,
     }
 
-    fn handle(&mut self, msg: SqsMsg, _ctx: &mut Context<'_, S, Self::Reply>) -> Effect<Self> {
+    fn handle(&mut self, msg: SecretsMsg, _ctx: &mut Context<'_, S, Self::Reply>) -> Effect<Self> {
         match msg {
-            SqsMsg::Send(request) => self.admit(request, None),
-            SqsMsg::Poll(id) => self.poll(id),
+            SecretsMsg::Send(request) => self.admit(request, None),
+            SecretsMsg::Poll(id) => self.poll(id),
         }
     }
 
-    fn handle_call(&mut self, msg: SqsMsg, call: CallContext<'_, Self>) -> Effect<Self> {
+    fn handle_call(&mut self, msg: SecretsMsg, call: CallContext<'_, Self>) -> Effect<Self> {
         match msg {
-            SqsMsg::Send(request) => self.admit(request, Some(call.into_request_context())),
-            SqsMsg::Poll(_) => call.reject(tina::CallRejectedReason::UnsupportedMessage),
+            SecretsMsg::Send(request) => self.admit(request, Some(call.into_request_context())),
+            SecretsMsg::Poll(_) => call.reject(tina::CallRejectedReason::UnsupportedMessage),
         }
     }
 }
 
-fn build_sqs_client(config: &SqsConfig) -> Client {
-    let mut builder = aws_sdk_sqs::Config::builder()
+fn build_secrets_client(config: &SecretsConfig) -> Client {
+    let mut builder = aws_sdk_secretsmanager::Config::builder()
         .behavior_version(BehaviorVersion::v2026_01_12())
         .region(Region::new(config.region.clone()))
         .retry_config(match config.retry_policy {
@@ -521,167 +518,95 @@ fn build_sqs_client(config: &SqsConfig) -> Client {
     Client::from_conf(builder.build())
 }
 
-fn validate_request(request: &SqsRequest, config: &SqsConfig) -> Result<(), SqsError> {
+fn validate_request(request: &SecretsRequest) -> Result<(), SecretsError> {
     match request {
-        SqsRequest::SendMessage(send) => {
-            validate_queue_url(&send.queue_url)?;
-            if send.body.len() > config.message_body_limit {
-                return Err(SqsError::MessageTooLarge);
-            }
-            Ok(())
-        }
-        SqsRequest::ReceiveMessage(receive) => {
-            validate_queue_url(&receive.queue_url)?;
-            if receive.max_messages == 0 || receive.max_messages > config.max_receive_messages {
-                return Err(SqsError::InvalidRequest(format!(
-                    "max_messages {} must be in 1..={}",
-                    receive.max_messages, config.max_receive_messages
-                )));
-            }
-            if !(0..=43_200).contains(&receive.visibility_timeout_seconds) {
-                return Err(SqsError::InvalidRequest(
-                    "visibility_timeout_seconds must be in 0..=43200".into(),
+        SecretsRequest::GetSecretValue(get) => {
+            if get.secret_id.trim().is_empty() {
+                return Err(SecretsError::InvalidRequest(
+                    "secret_id must not be empty".into(),
                 ));
             }
-            if !(0..=20).contains(&receive.wait_time_seconds) {
-                return Err(SqsError::InvalidRequest(
-                    "wait_time_seconds must be in 0..=20".into(),
+            if get.version_id.is_some() && get.version_stage.is_some() {
+                return Err(SecretsError::InvalidRequest(
+                    "version_id and version_stage are mutually exclusive".into(),
                 ));
             }
             Ok(())
         }
-        SqsRequest::DeleteMessage(delete) => {
-            validate_queue_url(&delete.queue_url)?;
-            if delete.receipt_handle.is_empty() {
-                return Err(SqsError::InvalidRequest(
-                    "receipt_handle must not be empty".into(),
-                ));
-            }
-            Ok(())
-        }
-    }
-}
-
-fn validate_queue_url(queue_url: &str) -> Result<(), SqsError> {
-    if queue_url.trim().is_empty() {
-        Err(SqsError::InvalidRequest(
-            "queue_url must not be empty".into(),
-        ))
-    } else {
-        Ok(())
     }
 }
 
 async fn run_request(
     client: Client,
-    request: SqsRequest,
-    body_limit: usize,
-    max_receive_messages: usize,
-) -> SqsResult {
+    request: SecretsRequest,
+    secret_size_limit: usize,
+) -> SecretsResult {
     match request {
-        SqsRequest::SendMessage(send) => {
-            let mut req = client
-                .send_message()
-                .queue_url(send.queue_url)
-                .message_body(send.body);
-            if let Some(group_id) = send.message_group_id {
-                req = req.message_group_id(group_id);
+        SecretsRequest::GetSecretValue(get) => {
+            let mut req = client.get_secret_value().secret_id(get.secret_id);
+            if let Some(v) = get.version_id {
+                req = req.version_id(v);
             }
-            if let Some(dedup_id) = send.message_deduplication_id {
-                req = req.message_deduplication_id(dedup_id);
+            if let Some(s) = get.version_stage {
+                req = req.version_stage(s);
             }
-            req.send()
-                .await
-                .map(|out| {
-                    SqsResponse::SentMessage(SqsSentMessage {
-                        message_id: out.message_id,
-                        md5_of_body: out.md5_of_message_body,
-                        sequence_number: out.sequence_number,
-                    })
-                })
-                .map_err(classify_send_error)
-        }
-        SqsRequest::ReceiveMessage(receive) => {
-            let receive_cap = receive.max_messages.min(max_receive_messages);
-            let out = client
-                .receive_message()
-                .queue_url(receive.queue_url)
-                .max_number_of_messages(receive.max_messages as i32)
-                .visibility_timeout(receive.visibility_timeout_seconds)
-                .wait_time_seconds(receive.wait_time_seconds)
-                .send()
-                .await
-                .map_err(classify_receive_error)?;
-            let mut messages = Vec::new();
-            let raw_messages = out.messages.unwrap_or_default();
-            if raw_messages.len() > receive_cap {
-                return Err(SqsError::ResponseTooLarge);
-            }
-            for msg in raw_messages {
-                let body = msg.body.unwrap_or_default();
-                if body.len() > body_limit {
-                    return Err(SqsError::ResponseTooLarge);
+            match req.send().await {
+                Ok(out) => {
+                    let secret_string = out.secret_string;
+                    let secret_binary = out.secret_binary.map(|b| b.into_inner());
+
+                    let size = secret_string.as_ref().map(|s| s.len()).unwrap_or(0)
+                        + secret_binary.as_ref().map(|b| b.len()).unwrap_or(0);
+                    if size > secret_size_limit {
+                        return Err(SecretsError::SecretTooLarge);
+                    }
+
+                    Ok(SecretsResponse::SecretValue(SecretsValue {
+                        arn: out.arn,
+                        name: out.name,
+                        version_id: out.version_id,
+                        version_stages: out.version_stages.unwrap_or_default(),
+                        secret_string,
+                        secret_binary,
+                    }))
                 }
-                let Some(receipt_handle) = msg.receipt_handle else {
-                    return Err(SqsError::Sdk(
-                        "received message without receipt handle".into(),
-                    ));
-                };
-                messages.push(SqsMessage {
-                    message_id: msg.message_id,
-                    receipt_handle,
-                    body,
-                });
+                Err(e) => Err(classify_get_error(e)),
             }
-            Ok(SqsResponse::ReceivedMessages(SqsReceivedMessages {
-                messages,
-            }))
         }
-        SqsRequest::DeleteMessage(delete) => client
-            .delete_message()
-            .queue_url(delete.queue_url)
-            .receipt_handle(delete.receipt_handle)
-            .send()
-            .await
-            .map(|_| SqsResponse::DeletedMessage(SqsDeletedMessage))
-            .map_err(classify_delete_error),
     }
 }
 
-fn classify_send_error(error: SdkError<SendMessageError>) -> SqsError {
+fn classify_get_error(error: SdkError<GetSecretValueError>) -> SecretsError {
     if let Some(service) = error.as_service_error() {
-        if service.is_queue_does_not_exist() {
-            return SqsError::QueueDoesNotExist(error_detail(&error));
+        if service.is_resource_not_found_exception() {
+            return SecretsError::NotFound(error_detail(&error));
         }
-        if service.is_request_throttled() || service.is_kms_throttled() {
-            return SqsError::Throttled(error_detail(&error));
+        if service.is_invalid_request_exception() || service.is_invalid_parameter_exception() {
+            return SecretsError::InvalidParameter(error_detail(&error));
+        }
+        if service.is_decryption_failure() {
+            return SecretsError::DecryptionFailed(error_detail(&error));
+        }
+        // Secrets Manager folds access-denied and throttling into the
+        // unmodeled `GetSecretValueError::Unhandled` variant; their
+        // typed error code rides on the `ProvideErrorMetadata::code()`
+        // string ("AccessDeniedException", "ThrottlingException", or
+        // "TooManyRequestsException"). AWS sends throttling as HTTP
+        // 400 with that error code, so HTTP-status sniffing alone
+        // would miss it.
+        if let Some(code) = service.code() {
+            match code {
+                "AccessDeniedException" => {
+                    return SecretsError::AccessDenied(error_detail(&error));
+                }
+                "ThrottlingException" | "TooManyRequestsException" => {
+                    return SecretsError::Throttled(error_detail(&error));
+                }
+                _ => {}
+            }
         }
     }
-    SqsError::Sdk(error_detail(&error))
-}
-
-fn classify_receive_error(error: SdkError<ReceiveMessageError>) -> SqsError {
-    if let Some(service) = error.as_service_error() {
-        if service.is_queue_does_not_exist() {
-            return SqsError::QueueDoesNotExist(error_detail(&error));
-        }
-        if service.is_request_throttled() || service.is_kms_throttled() || service.is_over_limit() {
-            return SqsError::Throttled(error_detail(&error));
-        }
-    }
-    SqsError::Sdk(error_detail(&error))
-}
-
-fn classify_delete_error(error: SdkError<DeleteMessageError>) -> SqsError {
-    if let Some(service) = error.as_service_error() {
-        if service.is_queue_does_not_exist() {
-            return SqsError::QueueDoesNotExist(error_detail(&error));
-        }
-        if service.is_request_throttled() {
-            return SqsError::Throttled(error_detail(&error));
-        }
-    }
-    SqsError::Sdk(error_detail(&error))
+    SecretsError::Sdk(error_detail(&error))
 }
 
 fn error_detail<E, R>(error: &SdkError<E, R>) -> String
@@ -696,46 +621,45 @@ where
     }
 }
 
-fn tally_admission_error(metrics: &SqsMetricsInner, err: &SqsError) {
-    // `validate_request` only produces `MessageTooLarge` or
-    // `InvalidRequest`. Future validator additions land in `invalid`
-    // until they earn a typed counter.
-    match err {
-        SqsError::MessageTooLarge => {
-            metrics.message_too_large.fetch_add(1, Ordering::Relaxed);
-        }
-        _ => {
-            metrics.invalid.fetch_add(1, Ordering::Relaxed);
-        }
-    }
+fn tally_admission_error(metrics: &SecretsMetricsInner, _err: &SecretsError) {
+    // `validate_request` for the Secrets bridge only produces
+    // `InvalidRequest` today. Future validator additions land in this
+    // bucket until they earn a typed counter.
+    metrics.invalid.fetch_add(1, Ordering::Relaxed);
 }
 
-/// Maps an admission-class [`SqsError`] to the wire-stable tracing
-/// `reason` label. Only the two variants `validate_request` can
-/// produce are listed; other variants are not reachable on the
-/// admission tracing path.
 #[cfg(feature = "tracing")]
-fn admission_reason(err: &SqsError) -> &'static str {
+fn admission_reason(err: &SecretsError) -> &'static str {
     match err {
-        SqsError::MessageTooLarge => "MessageTooLarge",
-        SqsError::InvalidRequest(_) => "InvalidRequest",
-        // Unreachable: validate_request only emits MessageTooLarge or
-        // InvalidRequest. Match arm is required for exhaustiveness;
-        // the label keeps the tracing schema stable if the error
-        // shape grows.
+        SecretsError::InvalidRequest(_) => "InvalidRequest",
         _ => "Invalid",
     }
 }
 
-fn tally_terminal(metrics: &SqsMetricsInner, result: &SqsResult) {
+fn tally_terminal(metrics: &SecretsMetricsInner, result: &SecretsResult) {
     match result {
         Ok(_) => {
             metrics.responses.fetch_add(1, Ordering::Relaxed);
         }
-        Err(SqsError::ResponseTooLarge) => {
-            metrics.response_too_large.fetch_add(1, Ordering::Relaxed);
+        Err(SecretsError::SecretTooLarge) => {
+            metrics.secret_too_large.fetch_add(1, Ordering::Relaxed);
         }
-        Err(SqsError::Sdk(_) | SqsError::QueueDoesNotExist(_) | SqsError::Throttled(_)) => {
+        Err(SecretsError::NotFound(_)) => {
+            metrics.not_found.fetch_add(1, Ordering::Relaxed);
+        }
+        Err(SecretsError::AccessDenied(_)) => {
+            metrics.access_denied.fetch_add(1, Ordering::Relaxed);
+        }
+        Err(SecretsError::InvalidParameter(_)) => {
+            metrics.invalid_parameter.fetch_add(1, Ordering::Relaxed);
+        }
+        Err(SecretsError::Throttled(_)) => {
+            metrics.throttled.fetch_add(1, Ordering::Relaxed);
+        }
+        Err(SecretsError::DecryptionFailed(_)) => {
+            metrics.decryption_failed.fetch_add(1, Ordering::Relaxed);
+        }
+        Err(SecretsError::Sdk(_)) => {
             metrics.sdk_errors.fetch_add(1, Ordering::Relaxed);
         }
         Err(_) => {}

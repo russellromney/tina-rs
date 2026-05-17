@@ -15,6 +15,7 @@ use hyper::{Method, Request as HyperRequest, Response as HyperResponse, StatusCo
 use hyper_util::rt::TokioIo;
 use serde_json::{Value, json};
 use tina::prelude::*;
+use tina::{CallContext, RequestContext, reply_to_request};
 use tina_aws_bridge::{
     InstalledSqsBridge, SqsAddress, SqsCallOutcome, SqsConfig, SqsCredentials, SqsDeleteMessage,
     SqsDeletedMessage, SqsError, SqsMessage, SqsReceiveMessage, SqsReceivedMessages, SqsRequest,
@@ -69,6 +70,64 @@ struct CallerIsolate {
     worker: SqsAddress,
     timeout: Duration,
     sink: Arc<Sink>,
+}
+
+#[derive(Debug)]
+enum SqsRelayMsg {
+    Send { queue_url: String, body: String },
+    SendDone(RequestContext<&'static str>, SqsCallOutcome),
+}
+
+struct SqsRelay {
+    worker: SqsAddress,
+    timeout: Duration,
+}
+
+impl Isolate for SqsRelay {
+    tina::isolate_types! {
+        message: SqsRelayMsg,
+        reply: &'static str,
+        send: tina::Outbound<Infallible>,
+        spawn: Infallible,
+        call: RuntimeCall<SqsRelayMsg>,
+        shard: SingleShard,
+    }
+
+    fn handle(
+        &mut self,
+        msg: SqsRelayMsg,
+        _ctx: &mut Context<'_, SingleShard, Self::Reply>,
+    ) -> Effect<Self> {
+        match msg {
+            SqsRelayMsg::Send { .. } => noop(),
+            SqsRelayMsg::SendDone(req, outcome) => match outcome {
+                tina_runtime::CallOutcome::Replied(Ok(SqsResponse::SentMessage(_))) => {
+                    reply_to_request(req, "sent")
+                }
+                _ => reply_to_request(req, "failed"),
+            },
+        }
+    }
+
+    fn handle_call(&mut self, msg: SqsRelayMsg, call: CallContext<'_, Self>) -> Effect<Self> {
+        match msg {
+            SqsRelayMsg::Send { queue_url, body } => call
+                .defer(send_sqs(
+                    self.worker,
+                    SqsRequest::SendMessage(SqsSendMessage {
+                        queue_url,
+                        body,
+                        message_group_id: None,
+                        message_deduplication_id: None,
+                    }),
+                    self.timeout,
+                ))
+                .reply(SqsRelayMsg::SendDone),
+            SqsRelayMsg::SendDone(_, _) => {
+                call.reject(tina::CallRejectedReason::UnsupportedMessage)
+            }
+        }
+    }
 }
 
 impl Isolate for CallerIsolate {
@@ -584,6 +643,39 @@ fn happy_path_send_receive_delete_and_empty_receive() {
 }
 
 #[test]
+fn handle_call_defer_through_sqs_bridge_replies_to_original_caller() {
+    let sqs = FakeSqs::spawn(Duration::ZERO);
+    let runtime = make_runtime();
+    let bridge = install_bridge(&runtime, sqs_config(sqs.endpoint_url()));
+    let relay = runtime
+        .register_with_capacity::<_, Infallible>(
+            SqsRelay {
+                worker: bridge.address,
+                timeout: Duration::from_secs(2),
+            },
+            8,
+        )
+        .expect("register relay");
+
+    let outcome = runtime
+        .call_blocking(
+            relay,
+            SqsRelayMsg::Send {
+                queue_url: sqs.queue_url(),
+                body: "hello through relay".into(),
+            },
+            Duration::from_secs(5),
+        )
+        .expect("call relay");
+
+    assert_eq!(outcome, tina_runtime::CallOutcome::Replied("sent"));
+    if let Ok(rt) = Arc::try_unwrap(runtime) {
+        let _ = rt.shutdown();
+    }
+    sqs.stop();
+}
+
+#[test]
 fn caps_reject_message_before_sdk_and_receive_body_after_sdk() {
     let sqs = FakeSqs::spawn(Duration::ZERO);
     let runtime = make_runtime();
@@ -663,7 +755,11 @@ fn caps_reject_message_before_sdk_and_receive_body_after_sdk() {
 
 #[test]
 fn full_closed_and_close_drain_truth() {
-    let sqs = FakeSqs::spawn(Duration::from_millis(180));
+    // Keep the first receive in-flight long enough that the bridge can
+    // deterministically prove both Full admission and partial drain on
+    // slower CI runners. A shorter delay raced on macOS: the first
+    // receive sometimes completed before the drain snapshot.
+    let sqs = FakeSqs::spawn(Duration::from_secs(1));
     let runtime = make_runtime();
     let bridge = install_bridge(
         &runtime,
@@ -700,7 +796,7 @@ fn full_closed_and_close_drain_truth() {
         other => panic!("expected worker Full, got {other:?}"),
     }
     let report = bridge.closer.close_and_drain(Duration::from_millis(10));
-    assert!(!report.drained);
+    assert!(!report.drained, "{report:?}");
     assert_eq!(report.in_flight_kinds, vec![("sqs_receive_message", 1)]);
     match first_sink.wait(Duration::from_secs(5)) {
         tina_runtime::CallOutcome::Replied(Ok(SqsResponse::ReceivedMessages(_))) => {}

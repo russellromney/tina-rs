@@ -4,7 +4,7 @@ version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "Bounded AWS SDK worker around S3, for Tina services"
+description = "Bounded AWS SDK workers (S3, SQS, DynamoDB, SNS, Secrets Manager) for Tina services"
 repository = "https://github.com/russellromney/tina-rs"
 
 [lib]
@@ -15,6 +15,9 @@ tina = { path = "../tina" }
 tina-runtime = { path = "../tina-runtime" }
 aws-sdk-s3 = "1.96"
 aws-sdk-sqs = "1.85"
+aws-sdk-dynamodb = "1.96"
+aws-sdk-sns = "1.85"
+aws-sdk-secretsmanager = "1.85"
 tokio = { version = "1", default-features = false, features = ["rt", "rt-multi-thread", "sync", "time"] }
 tracing = { version = "0.1", default-features = false, features = ["std", "attributes"], optional = true }
 

@@ -14,6 +14,7 @@ use hyper::service::service_fn;
 use hyper::{Method, Request as HyperRequest, Response as HyperResponse, StatusCode};
 use hyper_util::rt::TokioIo;
 use tina::prelude::*;
+use tina::{CallContext, RequestContext, reply_to_request};
 use tina_aws_bridge::{
     InstalledS3Bridge, S3Address, S3CallOutcome, S3Config, S3Credentials, S3DeleteObject, S3Error,
     S3GetObject, S3HeadObject, S3Object, S3PutObject, S3Request, S3Response, S3Worker,
@@ -68,6 +69,66 @@ struct CallerIsolate {
     worker: S3Address,
     timeout: Duration,
     sink: Arc<Sink>,
+}
+
+#[derive(Debug)]
+enum S3RelayMsg {
+    Put {
+        bucket: String,
+        key: String,
+        body: Vec<u8>,
+    },
+    PutDone(RequestContext<&'static str>, S3CallOutcome),
+}
+
+struct S3Relay {
+    worker: S3Address,
+    timeout: Duration,
+}
+
+impl Isolate for S3Relay {
+    tina::isolate_types! {
+        message: S3RelayMsg,
+        reply: &'static str,
+        send: tina::Outbound<Infallible>,
+        spawn: Infallible,
+        call: RuntimeCall<S3RelayMsg>,
+        shard: SingleShard,
+    }
+
+    fn handle(
+        &mut self,
+        msg: S3RelayMsg,
+        _ctx: &mut Context<'_, SingleShard, Self::Reply>,
+    ) -> Effect<Self> {
+        match msg {
+            S3RelayMsg::Put { .. } => noop(),
+            S3RelayMsg::PutDone(req, outcome) => match outcome {
+                tina_runtime::CallOutcome::Replied(Ok(S3Response::PutObject(_))) => {
+                    reply_to_request(req, "stored")
+                }
+                _ => reply_to_request(req, "failed"),
+            },
+        }
+    }
+
+    fn handle_call(&mut self, msg: S3RelayMsg, call: CallContext<'_, Self>) -> Effect<Self> {
+        match msg {
+            S3RelayMsg::Put { bucket, key, body } => call
+                .defer(send_s3(
+                    self.worker,
+                    S3Request::PutObject(S3PutObject {
+                        bucket,
+                        key,
+                        body,
+                        content_type: None,
+                    }),
+                    self.timeout,
+                ))
+                .reply(S3RelayMsg::PutDone),
+            S3RelayMsg::PutDone(_, _) => call.reject(tina::CallRejectedReason::UnsupportedMessage),
+        }
+    }
 }
 
 impl Isolate for CallerIsolate {
@@ -401,6 +462,41 @@ fn happy_path_put_get_delete_against_local_s3_shape() {
     assert_eq!(snap.responses, 4);
     assert_eq!(snap.sdk_max_attempts, 1, "SDK retries disabled by default");
     assert_eq!(snap.in_flight_current, 0);
+    if let Ok(rt) = Arc::try_unwrap(runtime) {
+        let _ = rt.shutdown();
+    }
+    s3.stop();
+}
+
+#[test]
+fn handle_call_defer_through_s3_bridge_replies_to_original_caller() {
+    let s3 = FakeS3::spawn(Duration::ZERO);
+    let cfg = s3_config(s3.endpoint_url());
+    let runtime = make_runtime();
+    let bridge = install_bridge(&runtime, cfg);
+    let relay = runtime
+        .register_with_capacity::<_, Infallible>(
+            S3Relay {
+                worker: bridge.address,
+                timeout: Duration::from_secs(2),
+            },
+            8,
+        )
+        .expect("register relay");
+
+    let outcome = runtime
+        .call_blocking(
+            relay,
+            S3RelayMsg::Put {
+                bucket: "bucket".into(),
+                key: "via-relay".into(),
+                body: b"hello".to_vec(),
+            },
+            Duration::from_secs(5),
+        )
+        .expect("call relay");
+
+    assert_eq!(outcome, tina_runtime::CallOutcome::Replied("stored"));
     if let Ok(rt) = Arc::try_unwrap(runtime) {
         let _ = rt.shutdown();
     }
