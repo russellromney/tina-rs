@@ -128,17 +128,25 @@ Migration work:
 
 - update `tina::isolate_types!`
 - update `#[tina::isolate]` / `#[tina_runtime::isolate]`
+- add a macro arm for explicit `fact = ProtocolFact`
 - update manual `Isolate` impls with `type Fact = Infallible`
 - update runtime erasure/execution for `Effect::Fact`
 - update sim erasure/execution for `Effect::Fact`
 - update stable effect/event hash code without renumbering old tags
+- update runtime compile-fail diagnostics so a fact type that cannot convert
+  into `RuntimeFact` fails with a useful message
 
 Tests:
 
 - tiny live isolate emits a fact through `Effect::Fact`
 - tiny sim isolate emits the same fact
 - ordinary isolate using macros compiles without mentioning facts
+- isolate macro with `fact = ProtocolFact` compiles and emits a fact
 - manual ordinary isolate compiles with `type Fact = Infallible`
+- manual isolate missing `type Fact` fails with a clear compile error only in
+  tests that intentionally omit it; normal macro users never see this
+- fact type that lacks `IntoRuntimeFact` fails in a compile-fail test with a
+  useful error
 - stable hash test proves old event/effect tags did not move
 
 ### Rock 1: Protocol Fact Vocabulary
@@ -219,6 +227,8 @@ Rules:
 - emit at the point the fact becomes true, in the same batch as adjacent
   protocol effects when needed
 - do not emit from tests only
+- do not emit from blocking host helpers. `grpc_unary_call_h2c_blocking` is a
+  convenience client, not a Tina isolate path and not a replay fact source.
 - do not double-count report-only counters
 - existing report counters stay intact
 - trace pressure does not become an unbounded queue
@@ -230,6 +240,8 @@ Tests:
 - body pressure test sees high-water fact
 - WebSocket slow-peer test sees close fact
 - gRPC status test sees final status sent fact
+- blocking gRPC h2c helper docs/test stay honest that it does not emit runtime
+  protocol facts
 
 ### Rock 3: Simulator Replay Support
 
@@ -239,7 +251,7 @@ Rules:
 
 - if sim executes `Effect::Fact`, emit the same `FactObserved` event
 - if the live fact comes from a live-only path, replay reports
-  `UnsupportedProtocolFact`
+  `ProtocolReplayMismatch::UnsupportedProtocolFact`
 - no fake pass
 - no dropping facts to make hashes match
 
@@ -324,11 +336,13 @@ Run at least:
 
 ```text
 cargo fmt --all --check
+cargo test -p tina-runtime safety_rails -- --nocapture
 cargo test -p tina-runtime protocol_fact -- --nocapture
 cargo test -p tina-sim protocol_fact -- --nocapture
 cargo test -p tina-http http2 --tests
 cargo test -p tina-http websocket --tests
 cargo test -p tina-http grpc --tests
+cargo test -p tina-runtime --test compile_fail -- protocol_fact
 cargo clippy -p tina-runtime -p tina-sim -p tina-http --tests -- -D warnings
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
 ```

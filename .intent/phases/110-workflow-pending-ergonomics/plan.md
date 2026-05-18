@@ -90,6 +90,14 @@ sleep(delay).then_event(move || Msg::Wake { id })
 
 Rules:
 
+- `then_event` is a sleep/timer helper, not a blanket `TypedCall<()>`
+  helper. Do not let it hide errors from file, process, signal, TCP, TLS, or
+  bridge calls that also return `()`.
+- Introduce a small sleep-specific wrapper returned by `sleep(delay)`. It keeps
+  existing `.then(...)` behavior and adds `.then_event(...)`. Do not put
+  `.then_event(...)` on all `TypedCall<()>`.
+- Existing `sleep_then(after, message)` stays and delegates to the same path.
+  Docs prefer the fluent form when the message needs captured values.
 - Existing result-carrying timer continuation stays.
 - `then_event` is for the common "wake me later" path.
 - The continuation returns a normal mailbox event.
@@ -100,8 +108,10 @@ Tests:
 
 - A user enum can wake without a `SleepReply` field.
 - Existing `sleep(...).then(|reply| ...)` behavior still works.
-- Timer timeout/cancel/closed behavior, if any, is not hidden by
-  `then_event`.
+- A non-timer `TypedCall<()>` cannot use `then_event`.
+- `sleep_then` and `sleep(...).then_event(...)` produce the same timer
+  behavior.
+- Timer cancellation/closed behavior, if any, is not hidden by `then_event`.
 
 ### Rock 2: Park Caller Authority
 
@@ -150,6 +160,7 @@ Required API:
 
 ```rust
 CallContext::try_into_request_context(self) -> Result<RequestContext<I::Reply>, (Self, TakeReplySlotError)>
+RequestCall::try_capture(build) -> Result<RequestEffect<I>, (Self, TakeReplySlotError)>
 pending.park_request(key, RequestCall<'_, I>) -> Result<ParkTicket<K>, ParkError<K, I>>
 pending.park_call(key, CallContext<'_, I>) -> Result<ParkTicket<K>, ParkCallError<K, I>>
 pending.take_ticket(ticket) -> Result<DeferredReply<R>, TakeParkedError<K>>
@@ -178,8 +189,13 @@ Tests:
 - Success parks and later replies the original caller.
 - `Full` returns the caller authority; caller receives a typed reply/reject.
 - duplicate key returns the caller authority.
+- `RequestCall::try_capture` returns the original `RequestCall` on failure.
+- `CallContext::try_into_request_context` returns the original `CallContext`
+  on failure.
 - stale key-only completion cannot remove a newer parked caller when the copied
   ticket path is used.
+- `ParkTicket` fields are private; doctest/compile-fail proves user code
+  cannot forge one.
 - caller timeout/cancel is still visible and capacity is reclaimed.
 - fill -> close/cancel -> refill works.
 
@@ -232,6 +248,8 @@ Tests:
 - Drop counter proves caller-timeout sweep releases the guard.
 - Failed `Full` / duplicate admission returns the guard.
 - stale key-only completion cannot steal a newer guarded slot.
+- guarded ticket fields are private; doctest/compile-fail proves user code
+  cannot forge one.
 - No double drop.
 
 ### Rock 4: `WaitList<K, R>`
@@ -310,6 +328,8 @@ Tests:
 - close all by key.
 - drain all.
 - stale ticket cannot remove/reply a newer waiter.
+- `WaitTicket` fields are private; doctest/compile-fail proves user code
+  cannot forge one.
 - fill -> reply/drain -> refill.
 - caller timeout/cancel cleanup reclaims capacity.
 
@@ -397,6 +417,8 @@ Tests:
 - two live entries for the same natural key.
 - cancel one entry without touching its sibling.
 - stale completion cannot remove a newer ticket.
+- `WorkTicket` fields are private; doctest/compile-fail proves user code
+  cannot forge one.
 - global full returns pending token.
 - per-key full returns pending token when using `with_key_limit`.
 - drain replies/cancels every parked caller.
@@ -436,13 +458,9 @@ Migrate these systems where the new helpers remove real code:
 - `examples/systems/system_api_gateway_limits`
 - `examples/systems/system_soak_http_db`
 
-Optional if the changes are natural:
-
-- `examples/systems/system_metrics_shipper`
-- `examples/systems/mini_saas_api`
-
-Do not rewrite systems just for churn. Each migration must delete repeated glue
-or prevent a known mistake.
+Do not migrate `system_metrics_shipper` or `mini_saas_api` in this phase unless
+one of the required helper tests needs them. Each migration must delete repeated
+glue or prevent a known mistake.
 
 ## Documentation
 
@@ -487,6 +505,8 @@ Required:
 - migrated system smoke tests still pass.
 - at least one migrated system asserts the same pressure/reply facts as before,
   so the helper did not hide capacity truth.
+- one migrated system includes a regression where a parked caller would have
+  timed out before this phase, and now receives the intended reply.
 
 ## Hostile Review Checklist
 

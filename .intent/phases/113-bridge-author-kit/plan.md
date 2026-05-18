@@ -48,6 +48,8 @@ Comparison target:
 
 - `tina-sqlx-bridge` uses/adapts to the vocabulary enough to prove it is not
   AWS-only.
+- `tina-sqlite-bridge` uses/adapts pressure and classifier names enough to
+  prove the vocabulary fits the serial blocking bridge too.
 
 ## Names
 
@@ -115,22 +117,31 @@ Required shared concepts:
 - `BridgePressure`
 - `BridgeOutcomeClass`
 - `BridgeRetryable`
+- `BridgeUnavailable`
 - `BridgeFatal`
 
 Required exact categories:
 
 ```rust
-BridgeOutcomeClass::{Succeeded, Retryable(BridgeRetryable), Fatal(BridgeFatal)}
+BridgeOutcomeClass::{
+    Succeeded,
+    Retryable(BridgeRetryable),
+    Unavailable(BridgeUnavailable),
+    Fatal(BridgeFatal),
+}
 BridgeRetryable::{
     BridgeFull,
-    BridgeClosed,
     CallerTimeout,
     BridgeTimeout,
     ServiceThrottled,
     ProvisionedThroughputExceeded,
     TransactionConflict,
-    SdkError,
+    SdkRetryable,
     PoolAcquireTimeout,
+}
+BridgeUnavailable::{
+    BridgeClosed,
+    PoolClosed,
 }
 BridgeFatal::{
     InvalidRequest,
@@ -141,10 +152,18 @@ BridgeFatal::{
     AccessDenied,
     DecryptionFailed,
     Decode,
-    PoolClosed,
+    SdkUnknown,
     Internal,
 }
 ```
+
+Vocabulary meaning:
+
+- `Retryable` means the bridge can plausibly accept the same request again
+  after backoff, if the caller's idempotency rules permit it.
+- `Unavailable` means the bridge, pool, or resource is closed. The caller may
+  need a new bridge/pool/service, not a blind retry loop.
+- `Fatal` means changing input, permissions, schema, or code is required.
 
 Rules:
 
@@ -152,11 +171,15 @@ Rules:
 - caller timeout does not imply external work stopped
 - supplied-client docs say who owns config and who owns Tina deadlines
 - all bridge pressure surfaces have validated names
+- do not classify broad SDK errors as retryable unless SDK metadata says
+  retryable/throttled/conflict. Unknown SDK errors are `Fatal(SdkUnknown)`.
 
 Tests:
 
 - vocabulary Debug/display tokens are stable
 - classifier categories are exhaustive for migrated bridge errors
+- Closed/PoolClosed classify as `Unavailable`, not `Retryable`
+- unknown SDK errors classify as `Fatal(SdkUnknown)`, not retry fog
 - pressure adapter rejects bad names
 
 ### Rock 2: AWS Bridge Core Extraction
@@ -180,9 +203,8 @@ Extract only repeated code:
 - common classifier wrapper
 - common supplied-client/runtime ownership docs
 
-Replace AWS-local classifier enums with shared vocabulary or compatibility type
-aliases that point at the shared vocabulary. Keep service-specific operation
-types in the AWS crate.
+Replace AWS-local classifier enums with shared vocabulary. Keep service-specific
+operation types and extension traits in the AWS crate.
 
 Do not hide per-service operation types.
 
@@ -202,8 +224,9 @@ Tests:
 - one AWS service has timeout plus late-result truth
 - one AWS service has shutdown/drain while work is in flight
 - classifier tests cover `Succeeded`, `Retryable(ServiceThrottled)`,
-  `Retryable(BridgeTimeout)`, `Fatal(AccessDenied)`, `Fatal(NotFound)`,
-  `Fatal(InvalidRequest)`, and `Fatal(Internal)`
+  `Retryable(BridgeTimeout)`, `Unavailable(BridgeClosed)`,
+  `Fatal(AccessDenied)`, `Fatal(NotFound)`, `Fatal(InvalidRequest)`, and
+  `Fatal(Internal)`
 
 ### Rock 3: Bridge Pressure Adapter
 
@@ -232,6 +255,7 @@ Required methods:
 BridgePressure::capacity_surface(mode) -> CapacitySurfaceReport
 BridgePressure::unavailable(name, reason)
 impl From<PgPressureReport> for BridgePressure
+impl From<SqlitePressureReport> for BridgePressure
 impl From<S3PressureReport> for BridgePressure
 impl From<SqsPressureReport> for BridgePressure
 impl From<SnsPressureReport> for BridgePressure
@@ -257,6 +281,8 @@ Rules:
 - no caller-supplied config can lie about installed capacity
 - metrics handle stores effective installed capacity where needed
 - pressure report says worker-terminal when that is what it measures
+- serial bridges such as SQLite still report capacity truth. Their capacity is
+  small, not absent.
 
 Tests:
 
@@ -264,10 +290,12 @@ Tests:
 - late-result count appears when supported
 - unavailable field is explicit when unsupported
 - service pressure builder can consume the report
+- SQLite serial pressure maps to one bridge surface with capacity `1`
 
 ### Rock 4: One Non-AWS Bridge Alignment
 
-Update `tina-sqlx-bridge` to the shared vocabulary.
+Update `tina-sqlx-bridge` and the serial `tina-sqlite-bridge` pressure/classifier
+surface to the shared vocabulary.
 
 Required:
 
@@ -275,17 +303,20 @@ Required:
 - pressure adapter uses shared names
 - closer/drain docs use shared lifecycle words
 - classifier maps to shared category names where it already has categories
-- existing SQLx `PgOutcomeClass` may stay as a typed SQLx-facing API, but it
-  must expose `classify_bridge()` or `Into<BridgeOutcomeClass>` for shared
-  reports/docs
+- existing SQLx/SQLite typed outcome extension traits stay if they carry typed
+  success payloads, but classification names must delegate to the shared
+  `BridgeOutcomeClass`
 
 Do not rewrite the whole bridge.
 
 Tests:
 
 - existing bridge tests still pass
-- one pressure-report test proves installed capacity truth
+- SQLx pressure-report test proves installed capacity truth
+- SQLite pressure-report test proves serial capacity truth
 - docs no longer overclaim caller-observed outcome
+- SQLx and SQLite classifiers agree on `Full`, `Closed`, caller timeout,
+  worker timeout, and invalid request category names
 
 ### Rock 5: Bridge Author Docs
 
@@ -318,12 +349,14 @@ Run at least:
 cargo fmt --all --check
 cargo test -p tina-aws-bridge --tests
 cargo test -p tina-sqlx-bridge --tests
+cargo test -p tina-sqlite-bridge --tests
 cargo test -p tina-reqwest-bridge --tests
-cargo clippy -p tina-aws-bridge -p tina-sqlx-bridge -p tina-reqwest-bridge --tests -- -D warnings
+cargo clippy -p tina-aws-bridge -p tina-sqlx-bridge -p tina-sqlite-bridge -p tina-reqwest-bridge --tests -- -D warnings
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
 ```
 
-The non-AWS bridge for this phase is `tina-sqlx-bridge`.
+The non-AWS bridges for this phase are `tina-sqlx-bridge` and
+`tina-sqlite-bridge`.
 
 ## Hostile Review Checklist
 
@@ -335,7 +368,7 @@ Before merge, prove:
 - late external work is visible or explicitly unsupported
 - AWS extraction did not hide service-specific request/response truth
 - shared vocabulary did not become a framework blob
-- one non-AWS bridge uses the vocabulary
+- SQLx and SQLite use the vocabulary without losing typed success payloads
 
 ## Done Means
 
@@ -343,6 +376,6 @@ The next bridge author has a copied shape.
 
 AWS bridge code is less repetitive.
 
-At least one non-AWS bridge speaks the same lifecycle/pressure language.
+SQLx and SQLite speak the same lifecycle/pressure language.
 
 External work remains honestly external.

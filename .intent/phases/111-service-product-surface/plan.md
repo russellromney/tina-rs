@@ -144,6 +144,14 @@ builder.merge(ServicePressureReport)
 builder.finish() -> Result<ServicePressureReport, ServiceReportBuildError>
 ```
 
+Required build errors:
+
+```rust
+ServiceReportBuildError::BadServiceName
+ServiceReportBuildError::BadSurfaceName { name }
+ServiceReportBuildError::DuplicateSurface { name }
+```
+
 Rules:
 
 - surface names are validated once on insertion
@@ -202,6 +210,16 @@ builder.replay(ServiceReplayStatus)
 builder.finish() -> Result<ServiceReport, ServiceReportBuildError>
 ```
 
+Additional `ServiceReportBuilder` errors:
+
+```rust
+ServiceReportBuildError::MissingLifecycle
+ServiceReportBuildError::MissingReadiness
+ServiceReportBuildError::MissingHealth
+ServiceReportBuildError::MissingPressure
+ServiceReportBuildError::MissingTopology
+```
+
 Rules:
 
 - every component has a name
@@ -214,10 +232,14 @@ Rules:
 Tests:
 
 - report names every inserted component
-- readiness degrades when pressure surface is full
+- migrated system degrades readiness when its own pressure policy sees a live
+  full surface; the builder only preserves that verdict
+- readiness stays ready when a surface has pressure history but no current
+  pressure, so historical full counts do not poison the live readiness answer
 - shutdown report is preserved after service stops
 - topology lines include lifecycle and pressure name
 - a report with missing bridge metrics says unavailable
+- missing required report pieces reject with the exact typed error above
 
 ### Rock 3: Shutdown Summary
 
@@ -304,6 +326,8 @@ Tests:
 - one migrated system forces `Full` and proves the report names it
 - one migrated system proves unavailable bridge/surface is explicit
 - one migrated system proves shutdown report survives stop
+- one migrated system writes the copied report lines into its README and the
+  test asserts the live output still contains those key fields
 
 ### Rock 6: Docs
 
@@ -359,6 +383,7 @@ Before merge, prove:
 - unavailable is visible
 - shutdown order is visible
 - service report is service-local
+- readiness degradation is an explicit service choice, not automatic magic
 - no hidden global registry exists
 - no unbounded report storage exists beyond inserted surface count
 - systems are shorter or safer, not just rewritten
