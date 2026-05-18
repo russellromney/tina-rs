@@ -400,15 +400,54 @@ File paths are relative to the repo root. Line numbers reflect the
 - A7. WebSocket frame parsing should reject non-minimal extended payload
   lengths and use checked end-offset math. This is the same strictness
   family as M1.
+- A8. HTTP/2 unary buffered requests do not enforce `content-length`.
+  The only `request_content_length` assignment is in the gRPC streaming
+  path; ordinary buffered HTTP/2 requests can declare `content-length: 0`
+  and deliver DATA bytes, or declare one length and deliver another.
+  Downstream handlers receive a body/header pair that violates the HTTP
+  contract. Fix by parsing and validating every `content-length` value
+  during header validation, rejecting invalid/conflicting duplicates, and
+  enforcing exact length for buffered and streaming request paths.
+  `tina-http/src/http2.rs:1062-1084,1120-1127,1780-1788`.
+- A9. HTTP/2 known-length streaming responses emit `content-length` but do
+  not enforce it. `begin_streaming_response` writes the declared length,
+  while `handle_stream_chunk` / `flush_response_stream` track only response
+  caps and flow-control bytes. A source can under-produce and still send
+  END_STREAM, or over-produce past the declared length. Fix by storing a
+  per-stream remaining declared byte count, decrementing on DATA, and
+  resetting/cancelling on early EOF or overrun.
+  `tina-http/src/http2.rs:1274-1285,1392-1459,1490-1520`.
+- A10. HTTP/2 duplicate pseudo-headers overwrite instead of reject.
+  `add_header` assigns `:method`, `:path`, `:scheme`, `:authority`, and
+  `:status` into `Option` fields without checking whether a value was
+  already present. Last-value-wins creates routing/signature ambiguity and
+  violates the HTTP/2 malformed-request rules. Fix by rejecting any
+  repeated pseudo-header before assignment.
+  `tina-http/src/http2.rs:366-410,1780-1788`.
+- A11. HTTP/2 treats core `CONTINUATION` / standalone `PRIORITY` frame
+  validation like ignorable extension handling. `FRAME_PRIORITY` returns
+  `Ok(())` without checking stream id or 5-byte payload length, and
+  `CONTINUATION` is not defined so it falls through `_ => Ok(())`. Fix by
+  explicitly rejecting unsupported CONTINUATION state and validating
+  PRIORITY frame shape.
+  `tina-http/src/http2.rs:796-820`.
+- A12. Multi-shard remote inbound traffic can starve local control
+  commands, including shutdown. The worker only polls its local command
+  queue when `drain_remote_inbound` delivered zero envelopes; a steady
+  remote flood can keep `Run` and `Shutdown` commands unread. Fix with fair
+  scheduling: after each bounded remote drain pass, service at least one
+  local command, and prioritize shutdown over ordinary remote work.
+  `tina-runtime/src/threaded_multi_shard.rs:868-903,916-950`.
 
 ## Highest-risk modules reviewed
 
 1. `tina-http/` — HTTP/1 keepalive (C1), HTTP/2 protocol surface (C2,
-   C3, C5, H9, M1, M6, M7, M14), chunked decoder (H14, L13). Highest
-   density of exploitable findings.
+   C3, C5, H9, A8, A9, A10, A11, M1, M6, M7, M14), chunked decoder
+   (H14, L13). Highest density of exploitable findings.
 2. `tina-runtime/` — multi-shard relay (C4), shutdown (H6), supervisor
    (H7), TLS driver (H8), trace ring (H4, H5), call/lifecycle (M2, M3,
-   M16, M25), entries leak (H11), signals (M23).
+   M16, M25), entries leak (H11), signals (M23), multi-shard fairness
+   (A12).
 3. Bridges — sqlx/AWS in-flight semantics (H2), SQLx DB-side cancel
    identity (A1), reqwest retry classification (H13), shim cancel race
    (H1, M21), tower/tokio bridge surface (M17, M8, M4).
@@ -435,9 +474,13 @@ File paths are relative to the repo root. Line numbers reflect the
   Content-Length, chunked, leading whitespace, lone CR/LF; assert no
   smuggling reaches request 2.
 - HTTP/2: frame-shape fuzzer (length × flags × stream_id × payload
-  prefix). Targets: padded DATA/HEADERS, oversized stream IDs,
-  RST_STREAM storm, `:authority`-less request, illegal connection
-  headers.
+  prefix). Targets: padded DATA/HEADERS, standalone CONTINUATION,
+  malformed PRIORITY, duplicate pseudo-headers, `content-length`
+  overrun/underrun, oversized stream IDs, RST_STREAM storm,
+  `:authority`-less request, illegal connection headers.
+- HTTP/2 streaming responses: property test that `stream_known_length(N)`
+  emits exactly N bytes before END_STREAM; short sources and overlong
+  sources must fail visibly.
 - WebSocket: payload-length minimal-form property test; UTF-8 fragment
   property test; control-frame fragmentation; close-code validation.
 - Bridges: property test — for any sequence of (admit, timeout, retry,
@@ -476,17 +519,24 @@ File paths are relative to the repo root. Line numbers reflect the
   violated by H10.
 - HTTP/2 connection rejects HTTP/1 connection-control headers — false
   per H9.
+- HTTP/2 `content-length` is truthful for both request bodies and
+  known-length streaming responses — violated by A8 and A9.
+- HTTP/2 pseudo-header sets contain each pseudo-header at most once —
+  violated by A10.
+- Local control-plane commands eventually run under remote pressure —
+  violated by A12.
 
 ## Top 10 to fix first
 
 1. C1 — HTTP/1 chunked keepalive smuggling.
 2. C4 — Cross-shard reply drop on saturated reverse queue.
-3. C2 — HTTP/2 PADDED / PRIORITY flags ignored.
-4. C5 — HTTP/2 RST_STREAM flood (rapid reset).
-5. H1 — Bridge `CancelGuard::drop` double-release.
-6. H3 — `PoolLease` missing Drop hook.
-7. H2 — Bridge timeout capacity semantics split across sqlx / AWS.
-8. H6 — Drop hangs forever on wedged handler.
-9. C3 + H9 — HTTP/2 SETTINGS ignored + HTTP/1 headers accepted (pair:
+3. A8 + A9 — HTTP/2 `content-length` lies on requests and streaming
+   responses.
+4. C2 — HTTP/2 PADDED / PRIORITY flags ignored.
+5. C5 — HTTP/2 RST_STREAM flood (rapid reset).
+6. A12 — Multi-shard remote flood can starve local commands/shutdown.
+7. H1 — Bridge `CancelGuard::drop` double-release.
+8. H3 — `PoolLease` missing Drop hook.
+9. H6 — Drop hangs forever on wedged handler.
+10. C3 + H9 — HTTP/2 SETTINGS ignored + HTTP/1 headers accepted (pair:
    conformance and smuggling).
-10. H7 — Supervisor `RestartBudget` has no time window.

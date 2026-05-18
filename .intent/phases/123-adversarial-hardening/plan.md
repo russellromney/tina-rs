@@ -33,8 +33,8 @@ look small. Small silent lies become big Tina lies.
 
 - Rock 1: C1.
 - Rock 2: H14, M1, M6, L13, L14, A6, A7.
-- Rock 3: C2, C3, C5, H9, M7, M14.
-- Rock 4: C4, M13.
+- Rock 3: C2, C3, C5, H9, A8, A9, A10, A11, M7, M14.
+- Rock 4: C4, A12, M13.
 - Rock 5: H1, H2, H13, M8, A1.
 - Rock 6: H6, L10, L11, A2.
 - Rock 7: A3, A4, A5.
@@ -130,7 +130,7 @@ Required tests:
 
 ## Rock 3: HTTP/2 Protocol Hardening
 
-Fix C2, C3, C5, H9, M7, and M14.
+Fix C2, C3, C5, H9, A8, A9, A10, A11, M7, and M14.
 
 Implement real HTTP/2 handling for:
 
@@ -157,6 +157,29 @@ Implement real HTTP/2 handling for:
   - reject uppercase header names;
   - require `:authority` or a valid equivalent if the method/path requires
     authority;
+- `content-length` truth on HTTP/2 requests:
+  - parse every `content-length` value during header validation;
+  - reject invalid values and conflicting duplicates;
+  - enforce exact length for ordinary buffered requests and gRPC/streaming
+    request paths;
+  - reject END_STREAM when the declared length was not fully received;
+  - reject DATA beyond the declared length before dispatching to service code;
+- known-length HTTP/2 streaming responses:
+  - store the declared remaining byte count per stream when emitting
+    `content-length`;
+  - decrement it only as DATA is queued/sent;
+  - reset/cancel on source overrun instead of sending more bytes than
+    declared;
+  - reset/cancel on EOF before the remaining count reaches zero;
+- pseudo-header uniqueness:
+  - reject repeated `:method`, `:path`, `:scheme`, `:authority`, and `:status`
+    before assigning them into the decoded header block;
+- core frame validation:
+  - add explicit `CONTINUATION` handling. Until continuation blocks are fully
+    implemented, reject standalone or unexpected CONTINUATION as a protocol
+    error instead of ignoring it as an extension frame;
+  - validate standalone `PRIORITY` frames: nonzero stream id and exactly
+    five payload bytes;
 - rapid reset guard:
   - add config fields with conservative defaults for reset rate window/count;
   - count open+reset churn, not only concurrent streams;
@@ -174,6 +197,16 @@ Required tests:
 - SETTINGS max frame size affects outbound frame splitting;
 - invalid SETTINGS values reject;
 - HTTP/2 request with `connection` rejects;
+- HTTP/2 request with invalid `content-length` rejects;
+- HTTP/2 request with conflicting duplicate `content-length` rejects;
+- HTTP/2 buffered request with declared length shorter/longer than DATA rejects;
+- HTTP/2 streaming request with declared length shorter/longer than DATA rejects;
+- `stream_known_length(N)` over HTTP/2 emits exactly N bytes before END_STREAM;
+- known-length response source EOF before N resets/cancels visibly;
+- known-length response source over N resets/cancels visibly;
+- duplicate pseudo-header rejects for every pseudo-header field;
+- standalone CONTINUATION outside an active header block rejects;
+- malformed standalone PRIORITY rejects;
 - uppercase header rejects;
 - missing authority rejects where required;
 - rapid reset storm hits guard and closes/goaways before unbounded service
@@ -182,7 +215,7 @@ Required tests:
 
 ## Rock 4: Cross-Shard Reply Truth
 
-Fix C4 and M13.
+Fix C4, A12, and M13.
 
 Current bug: a remote reply envelope can be dropped when the reverse remote
 queue is full. Caller then sees timeout instead of the real `Full`/`Closed`/
@@ -207,6 +240,18 @@ Implement bounded terminal-reply reliability:
 - simulator and live multi-shard must share the same contract;
 - every remote call/send attempt must have exactly one visible terminal outcome.
 
+Implement remote/local fairness:
+
+- a worker must service local control commands even while remote inbound traffic
+  remains non-empty;
+- after each bounded remote-drain pass, poll and run at least one local command
+  before returning to remote traffic;
+- `Shutdown` must have priority over ordinary remote envelopes once observed;
+- fairness must apply to host `Run`, `call_blocking` setup commands, and
+  shutdown commands;
+- the remote drain budget must remain nonzero and must not be treated as a
+  substitute for local-command fairness.
+
 Required tests:
 
 - live two-shard call to saturated target returns `Full`, not timeout;
@@ -217,6 +262,10 @@ Required tests:
 - generated/property test: every cross-shard call attempt ends in one of
   `Replied`, `Full`, `Closed`, `Rejected`, or `Timeout` for an actual deadline,
   never because a terminal reply was dropped.
+- sustained remote inbound flood does not starve a local host `Run` command;
+- sustained remote inbound flood does not starve `call_blocking` setup;
+- shutdown under sustained remote inbound flood begins within a bounded number
+  of worker turns.
 
 ## Rock 5: Bridge Timeout And Capacity Truth
 
