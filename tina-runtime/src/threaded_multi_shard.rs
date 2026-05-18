@@ -63,7 +63,13 @@ where
 struct ThreadedRemoteWiring {
     senders:
         BTreeMap<(ShardId, ShardId), std::sync::mpsc::SyncSender<SendableQueuedRemoteEnvelope>>,
+    terminal_senders:
+        BTreeMap<(ShardId, ShardId), std::sync::mpsc::SyncSender<SendableQueuedRemoteEnvelope>>,
     receivers: Vec<(
+        ShardId,
+        std::sync::mpsc::Receiver<SendableQueuedRemoteEnvelope>,
+    )>,
+    terminal_receivers: Vec<(
         ShardId,
         std::sync::mpsc::Receiver<SendableQueuedRemoteEnvelope>,
     )>,
@@ -183,7 +189,15 @@ where
         }
         let mut remote_metrics = BTreeMap::new();
         let mut remote_senders = BTreeMap::new();
+        let mut terminal_remote_senders = BTreeMap::new();
         let mut remote_receivers: BTreeMap<
+            ShardId,
+            Vec<(
+                ShardId,
+                std::sync::mpsc::Receiver<SendableQueuedRemoteEnvelope>,
+            )>,
+        > = BTreeMap::new();
+        let mut terminal_remote_receivers: BTreeMap<
             ShardId,
             Vec<(
                 ShardId,
@@ -195,11 +209,18 @@ where
                 if source.id() != target.id() {
                     let (sender, receiver) =
                         std::sync::mpsc::sync_channel(config.shard_pair_capacity);
+                    let (terminal_sender, terminal_receiver) =
+                        std::sync::mpsc::sync_channel(config.shard_pair_capacity);
                     remote_senders.insert((source.id(), target.id()), sender);
+                    terminal_remote_senders.insert((source.id(), target.id()), terminal_sender);
                     remote_receivers
                         .entry(target.id())
                         .or_default()
                         .push((source.id(), receiver));
+                    terminal_remote_receivers
+                        .entry(target.id())
+                        .or_default()
+                        .push((source.id(), terminal_receiver));
                     remote_metrics.insert(
                         (source.id(), target.id()),
                         Arc::new(LiveQueueMetrics::new(config.shard_pair_capacity)),
@@ -222,7 +243,11 @@ where
             let shard_id = shard.id();
             let remote_wiring = ThreadedRemoteWiring {
                 senders: remote_senders.clone(),
+                terminal_senders: terminal_remote_senders.clone(),
                 receivers: remote_receivers.remove(&shard_id).unwrap_or_default(),
+                terminal_receivers: terminal_remote_receivers
+                    .remove(&shard_id)
+                    .unwrap_or_default(),
                 queue_metrics: remote_metrics.clone(),
                 shard_metrics: shard_metrics.clone(),
             };
@@ -824,6 +849,7 @@ where
         shard_metrics.set_resource_counts(runtime.resource_report());
         let route_remote = |envelope: QueuedRemoteEnvelope| -> Result<(), SendRejectedReason> {
             let target_shard = envelope.target_shard();
+            let terminal = matches!(envelope, QueuedRemoteEnvelope::CallReply(_));
             let metrics = remote_wiring
                 .queue_metrics
                 .get(&(source_shard, target_shard));
@@ -837,7 +863,12 @@ where
                 }
                 return Err(SendRejectedReason::Closed);
             }
-            let Some(sender) = remote_wiring.senders.get(&(source_shard, target_shard)) else {
+            let senders = if terminal {
+                &remote_wiring.terminal_senders
+            } else {
+                &remote_wiring.senders
+            };
+            let Some(sender) = senders.get(&(source_shard, target_shard)) else {
                 panic!(
                     "ThreadedMultiShardRuntime targeted unknown destination shard {}",
                     target_shard.get()
@@ -865,12 +896,22 @@ where
                 }
             }
         };
-        let remote_delivered = drain_remote_inbound(
+        let terminal_delivered = drain_remote_inbound(
             &mut runtime,
-            &remote_wiring.receivers,
+            &remote_wiring.terminal_receivers,
             &route_remote,
             config.remote_inbound_drain_budget,
         );
+        let ordinary_budget = config
+            .remote_inbound_drain_budget
+            .saturating_sub(terminal_delivered);
+        let remote_delivered = terminal_delivered
+            + drain_remote_inbound(
+                &mut runtime,
+                &remote_wiring.receivers,
+                &route_remote,
+                ordinary_budget,
+            );
         if remote_delivered == 0 {
             match receiver.try_recv() {
                 Ok(ThreadedCommand::Run(command)) => {
