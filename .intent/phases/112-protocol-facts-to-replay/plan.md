@@ -37,7 +37,6 @@ First set:
 - WebSocket slow-peer close
 - WebSocket session close reason
 - gRPC final status sent
-- gRPC final status received
 
 The user outcome:
 
@@ -49,10 +48,10 @@ live protocol weirdness -> captured fact -> sim replay / unsupported fact
 
 Use user-facing protocol fact names.
 
-Preferred shape:
+Preferred public trace shape:
 
 ```rust
-RuntimeEventKind::ProtocolFact(ProtocolFact)
+RuntimeEventKind::FactObserved(RuntimeFact::Protocol(ProtocolFact))
 ```
 
 with:
@@ -63,6 +62,14 @@ ProtocolFact::HttpBody(...)
 ProtocolFact::WebSocket(...)
 ProtocolFact::Grpc(...)
 ```
+
+Protocol code emits these through a real effect:
+
+```rust
+fact::<Self>(ProtocolFact::Http2(...))
+```
+
+Do not smuggle facts through test helpers or side-channel report readers.
 
 Names must describe the protocol event, not the internal counter.
 
@@ -86,6 +93,54 @@ Avoid:
 
 ## Build
 
+### Rock 0: Fact Effect Plumbing
+
+Add a replayable fact effect to Tina.
+
+Required public shape:
+
+- `tina::Effect::Fact(I::Fact)`
+- `tina::fact::<I>(fact: I::Fact) -> Effect<I>`
+- `Isolate::Fact` associated type
+- `tina_runtime::EffectKind::Fact`
+- ordinary isolate macros default `Fact = Infallible`
+- protocol isolates opt into `Fact = ProtocolFact`
+
+Required runtime shape:
+
+- `tina_runtime::RuntimeFact`
+- `tina_runtime::IntoRuntimeFact`
+- `RuntimeFact::Protocol(ProtocolFact)`
+- `RuntimeEventKind::FactObserved { fact: RuntimeFact }`
+- stable effect kind tag `13` for `EffectKind::Fact`; do not renumber existing
+  effect tags
+- stable runtime event tag `36` for `FactObserved`; do not renumber existing
+  event tags
+
+Required erasure rule:
+
+- runtime registration requires `I::Fact: IntoRuntimeFact`
+- ordinary `Infallible` facts compile and never emit
+- protocol facts convert losslessly
+- simulator executes `Effect::Fact` the same way as live runtime
+
+Migration work:
+
+- update `tina::isolate_types!`
+- update `#[tina::isolate]` / `#[tina_runtime::isolate]`
+- update manual `Isolate` impls with `type Fact = Infallible`
+- update runtime erasure/execution for `Effect::Fact`
+- update sim erasure/execution for `Effect::Fact`
+- update stable effect/event hash code without renumbering old tags
+
+Tests:
+
+- tiny live isolate emits a fact through `Effect::Fact`
+- tiny sim isolate emits the same fact
+- ordinary isolate using macros compiles without mentioning facts
+- manual ordinary isolate compiles with `type Fact = Infallible`
+- stable hash test proves old event/effect tags did not move
+
 ### Rock 1: Protocol Fact Vocabulary
 
 Add a small protocol fact vocabulary.
@@ -93,10 +148,13 @@ Add a small protocol fact vocabulary.
 Required fields:
 
 - protocol family
-- connection/session/stream id where available
-- direction where relevant
-- reason/outcome where relevant
-- pressure value where relevant
+- optional typed id fields:
+  - `connection_id`
+  - `session_id`
+  - `stream_id`
+- typed direction for send/receive facts
+- typed reason/outcome for close/reset/status facts
+- typed pressure value for pressure facts
 - stable debug/render token
 
 Required facts:
@@ -109,10 +167,32 @@ Required facts:
 - `WebSocketSlowPeerClosed`
 - `WebSocketSessionClosed`
 - `GrpcFinalStatusSent`
-- `GrpcFinalStatusReceived`
 
-If a crate does not have an id for a fact, add a monotonically allocated
-connection/session/stream-local id at the point the protocol state is created.
+Stable fact tags:
+
+- `RuntimeFact::Protocol` = 1
+- `ProtocolFact::Http2StreamOpened` = 1
+- `ProtocolFact::Http2StreamClosed` = 2
+- `ProtocolFact::Http2StreamReset` = 3
+- `ProtocolFact::Http2FlowControlFull` = 4
+- `ProtocolFact::HttpBodyHighWater` = 5
+- `ProtocolFact::WebSocketSlowPeerClosed` = 6
+- `ProtocolFact::WebSocketSessionClosed` = 7
+- `ProtocolFact::GrpcFinalStatusSent` = 8
+
+Do not add `GrpcFinalStatusReceived` in this phase. The current received-status
+path is a blocking h2c helper, not a Tina runtime/isolate path. Add that fact
+when Tina has a native gRPC client isolate that can emit `Effect::Fact`.
+
+If a crate does not have an id for a fact, add a monotonically allocated id at
+the point the protocol state is created:
+
+- HTTP/2 stream facts use HTTP/2 stream id when present.
+- HTTP body facts use connection-local body id.
+- WebSocket facts use session id.
+- gRPC facts use stream id when HTTP/2-backed, otherwise connection-local
+  request id.
+
 Do not invent random ids.
 
 Tests:
@@ -122,7 +202,7 @@ Tests:
 - adding the new variant does not renumber existing stable hash tags
 - unknown future fact is not silently ignored by projection code
 
-### Rock 2: Runtime Trace Emission
+### Rock 2: Protocol Code Emission
 
 Emit protocol facts from existing protocol code paths.
 
@@ -131,11 +211,13 @@ Required sources:
 - `tina-http` HTTP/2 stream lifecycle
 - `tina-http` body high-water / chunk pressure path
 - `tina-http` WebSocket slow peer/session close path
-- `tina-http` native gRPC final status send/receive path
+- `tina-http` native gRPC final status send path
 
 Rules:
 
-- emit at the point the fact becomes true
+- emit with `Effect::Fact` in the protocol isolate/effect path
+- emit at the point the fact becomes true, in the same batch as adjacent
+  protocol effects when needed
 - do not emit from tests only
 - do not double-count report-only counters
 - existing report counters stay intact
@@ -147,15 +229,15 @@ Tests:
 - HTTP/2 flow-control pressure test sees full fact
 - body pressure test sees high-water fact
 - WebSocket slow-peer test sees close fact
-- gRPC status test sees final status fact
+- gRPC status test sees final status sent fact
 
-### Rock 3: Simulator Support
+### Rock 3: Simulator Replay Support
 
 Add simulator trace support for the same facts.
 
 Rules:
 
-- if sim models the protocol path, emit the same fact
+- if sim executes `Effect::Fact`, emit the same `FactObserved` event
 - if the live fact comes from a live-only path, replay reports
   `UnsupportedProtocolFact`
 - no fake pass
@@ -222,7 +304,9 @@ Tests:
 Update:
 
 - `docs/tina-user-guide/08-simulation-and-dst.md`
-- protocol docs for HTTP/WebSocket/gRPC as applicable
+- create `docs/tina-user-guide/22-http-http2-grpc.md`
+- `docs/tina-user-guide/20-native-websocket-server.md`
+- `docs/tina-user-guide/README.md`
 - `examples/systems/system_live_replay_bugbox/README.md`
 - `examples/FINDINGS.md`
 - `CHANGELOG.md`

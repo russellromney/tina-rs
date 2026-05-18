@@ -43,13 +43,14 @@ No fake "everything is healthy" report.
 Make the copied production-shaped Tina service easy to assemble and easy to
 inspect.
 
-Ship a small service product surface:
+Ship a small service product surface in `tina-runtime`:
 
-- one service report builder
-- one pressure/capacity assembly path
-- one topology/lifecycle assembly path
-- one shutdown summary shape
-- one replay-fact handoff shape where facts are already available
+- `tina_runtime::service_report::ServiceReport`
+- `tina_runtime::service_report::ServiceReportBuilder`
+- `tina_runtime::service_pressure::ServicePressureBuilder`
+- one topology/lifecycle assembly path using existing lifecycle types
+- one shutdown summary shape using existing shutdown types
+- one replay-fact handoff shape
 - refreshed system specimens that use the shape
 
 The user should be able to ask:
@@ -72,10 +73,10 @@ Preferred names:
 
 - `ServiceReport`
 - `ServiceReportBuilder`
-- `ServicePressure`
+- `ServicePressureReport`
 - `ServicePressureBuilder`
-- `ServiceSurface`
-- `ServiceFact`
+- `ServicePressureSurface`
+- `ServiceReplayStatus`
 
 Avoid names like:
 
@@ -107,16 +108,23 @@ registry.
 
 Ship a builder that assembles existing pressure/capacity surfaces.
 
+Home:
+
+```rust
+tina_runtime::service_pressure::ServicePressureBuilder
+```
+
 Required inputs:
 
 - `CapacitySurfaceReport`
 - `CapacitySummary`
 - `ServicePressureReport`
-- `SharedCapacityScope` snapshot/report
-- `BoundedEventSink` snapshot/report
+- `SharedCapacityScope::surface_report(...)`
+- `BoundedEventSink::surface_report(...)`
 - pool pressure reports
-- bridge pressure/metrics reports where already exposed
-- HTTP body metrics where already exposed
+- bridge pressure reports that already return `CapacitySurfaceReport`
+- HTTP body metrics converted by new helpers on `BodyPressureReport`:
+  `capacity_surfaces(prefix, mode)` and `service_surfaces(prefix, kind, mode)`
 - unavailable surfaces with typed reason text
 
 Required output:
@@ -125,6 +133,16 @@ Required output:
 - discovery lines
 - `CapacitySummary`
 - assert helper result
+
+Required API:
+
+```rust
+ServicePressureBuilder::new(service_name)
+builder.surface(kind, CapacitySurfaceReport)
+builder.unavailable(name, kind, reason)
+builder.merge(ServicePressureReport)
+builder.finish() -> Result<ServicePressureReport, ServiceReportBuildError>
+```
 
 Rules:
 
@@ -148,12 +166,18 @@ Tests:
 
 Ship a service report builder that threads together:
 
+Home:
+
+```rust
+tina_runtime::service_report::{ServiceReport, ServiceReportBuilder}
+```
+
 - service name
 - lifecycle/readiness/health
 - topology components
 - pressure summary
-- shutdown choreography/report if present
-- replay/support facts if present
+- shutdown choreography/report
+- replay/support status
 
 Required output:
 
@@ -164,12 +188,27 @@ Required output:
 - `readiness()`
 - `capacity_summary()`
 
+Required API:
+
+```rust
+ServiceReportBuilder::new(service_name)
+builder.lifecycle(Lifecycle)
+builder.readiness(Readiness)
+builder.health(Health)
+builder.topology(ServiceTopology)
+builder.pressure(ServicePressureReport)
+builder.shutdown(ServiceShutdownReport)
+builder.replay(ServiceReplayStatus)
+builder.finish() -> Result<ServiceReport, ServiceReportBuildError>
+```
+
 Rules:
 
 - every component has a name
 - every component has a lifecycle state or explicit `Unavailable`
 - topology is service-local, not runtime-global
-- builder is plain data and clone/debug friendly where practical
+- builder and report implement `Debug`
+- `ServiceReport` implements `Clone`
 - missing optional data is explicit in the report
 
 Tests:
@@ -271,15 +310,21 @@ Tests:
 Update:
 
 - `docs/tina-user-guide/10-service-patterns.md`
-- `docs/tina-user-guide/13-lifecycle-and-shutdown.md`
-- `docs/tina-user-guide/14-service-client-worked-example.md` or the current
-  worked-example page
+- `docs/tina-user-guide/14-lifecycle-and-shutdown.md`
+- `docs/tina-user-guide/15-service-client-worked-example.md`
 - `docs/tina-user-guide/06-boundedness-and-overload.md`
+- `docs/tina-user-guide/README.md`
 - `examples/systems/README.md`
 - `examples/FINDINGS.md`
 - `CHANGELOG.md`
 
-Docs must show one copied service report path.
+Docs must show:
+
+- one service report builder example
+- one pressure builder example
+- one shutdown report example
+- one unavailable surface example
+- one copied command that runs a migrated system smoke test
 
 Docs must say:
 
@@ -294,17 +339,16 @@ Run at least:
 
 ```text
 cargo fmt --all --check
+cargo test -p tina-runtime service_report -- --nocapture
 cargo test -p tina-runtime service_pressure -- --nocapture
 cargo test -p tina-runtime lifecycle -- --nocapture
 cargo test --manifest-path examples/systems/mini_saas_api/Cargo.toml
 cargo test --manifest-path examples/systems/system_soak_http_db/Cargo.toml
 cargo test --manifest-path examples/systems/system_api_gateway_limits/Cargo.toml
+cargo test --manifest-path examples/systems/system_metrics_shipper/Cargo.toml
 cargo clippy -p tina-runtime --tests -- -D warnings
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
 ```
-
-If targeted test names differ, run the nearest exact package/specimen tests and
-record the commands in the phase status.
 
 ## Hostile Review Checklist
 

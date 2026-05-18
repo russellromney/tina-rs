@@ -112,20 +112,29 @@ let request = call.into_request_context().into_deferred();
 pending.try_insert(qid, request)?;
 ```
 
-Ship a copied path on `PendingReplies`:
+Ship copied paths on `PendingReplies`:
 
 ```rust
-match self.pending.park(qid, call) {
+match self.pending.park_request(qid, call) {
     Ok(ticket) => start_work(ticket),
     Err(ParkError::Full(call)) => call.reply(Reply::Full),
     Err(ParkError::DuplicateKey(call, qid)) => call.reject(...),
 }
 ```
 
+and, for the lower-level `CallContext` path:
+
+```rust
+self.pending.park_call(qid, call_context)
+```
+
 Rules:
 
-- `park` consumes `CallContext` only on success.
+- `park_request` consumes `RequestCall` only on success.
+- `park_call` consumes `CallContext` only on success.
 - On every failure, the original caller authority is returned.
+- `park_request` checks duplicate/capacity before capturing the caller, so
+  `Full` and `DuplicateKey` can return the original `RequestCall`.
 - Failure must not strand the caller.
 - No helper starts child work.
 - Duplicate key stays typed.
@@ -137,17 +146,32 @@ Rules:
 - Existing key-only `try_insert` / `take(&key)` may remain as lower-level
   escape hatches, but migrated copied paths should carry tickets.
 
-Likely API:
+Required API:
 
 ```rust
-pending.park(key, call) -> Result<ParkTicket<K>, ParkError<...>>
-pending.take(ticket) -> Result<DeferredReply<R>, TakeParkedError>
-pending.reply(ticket, reply) -> Effect<I>
+CallContext::try_into_request_context(self) -> Result<RequestContext<I::Reply>, (Self, TakeReplySlotError)>
+pending.park_request(key, RequestCall<'_, I>) -> Result<ParkTicket<K>, ParkError<K, I>>
+pending.park_call(key, CallContext<'_, I>) -> Result<ParkTicket<K>, ParkCallError<K, I>>
+pending.take_ticket(ticket) -> Result<DeferredReply<R>, TakeParkedError<K>>
+pending.reply_ticket(ticket, reply) -> Result<Effect<I>, ReplyParkedError<K, R>>
 ```
 
-If returning `Effect<I>` from `reply` makes the bounds ugly, keep
-`take(ticket) -> DeferredReply<R>` and let the caller use existing `reply_to`.
-Do not drop the ticket from the copied path.
+Required error variants:
+
+```rust
+ParkError::Full { key, call }
+ParkError::DuplicateKey { key, call }
+ParkCallError::NoCaller { key, call }
+ParkCallError::CrossShardUnsupported { key, call }
+ParkCallError::Full { key, call }
+ParkCallError::DuplicateKey { key, call }
+TakeParkedError::Missing
+TakeParkedError::StaleTicket
+```
+
+`reply_ticket` is public convenience over `take_ticket` plus existing
+`reply_to`. `take_ticket` is also public for services that need custom reply
+policy. Do not drop ticket identity from the public path.
 
 Tests:
 
@@ -168,16 +192,17 @@ pending: PendingReplies<Id, Reply>,
 leases: HashMap<Id, SharedLease>,
 ```
 
-Ship a guarded parked slot:
+Ship a guarded parked slot in a sibling type:
 
 ```rust
-let ticket = self.pending.park_guarded(qid, call, guard)?;
+let ticket = self.pending.park_request_guarded(qid, call, guard)?;
 ```
 
-and, if needed for lower-level deferred slots:
+and the lower-level call/deferred paths:
 
 ```rust
-self.pending.insert_guarded(qid, deferred_reply, guard)
+self.pending.park_call_guarded(qid, call_context, guard)
+self.pending.insert_deferred_guarded(qid, deferred_reply, guard)
 ```
 
 Use `guard`, not `lease`, in the public name. The guard is any RAII value that
@@ -185,12 +210,10 @@ must live while the caller is parked.
 
 Implementation shape:
 
-- Prefer extending `PendingReplies<K, R>` to `PendingReplies<K, R, G = ()>` if
-  that stays source-compatible for existing users.
-- If that makes bounds/docs ugly, add `GuardedPendingReplies<K, R, G>` as a
-  sibling type and keep `PendingReplies<K, R>` as the common unguarded path.
-- In either shape, storage stays a fixed-capacity slot table. No growing
-  `HashMap`.
+- Add `GuardedPendingReplies<K, R, G>`.
+- Keep `PendingReplies<K, R>` as the common unguarded path.
+- Storage is a fixed-capacity slot table. No growing `HashMap`.
+- `G` is any RAII guard value. The helper never calls methods on it.
 
 Rules:
 
@@ -232,6 +255,12 @@ Type name:
 WaitList<K, R>
 ```
 
+Home:
+
+```rust
+tina_runtime::wait_list::WaitList
+```
+
 Rules:
 
 - One global capacity.
@@ -244,7 +273,7 @@ Rules:
 - Internal ticket prevents stale completions from touching the wrong waiter.
 - No unbounded waiter growth.
 
-Likely API:
+Required API:
 
 ```rust
 WaitList::with_capacity(total)
@@ -259,9 +288,8 @@ waiters.drain_all_with(|| reply)
 waiters.snapshot()
 ```
 
-If the implementation can make `reply_all` work cleanly for `R: Clone`, it may
-add that alias. The docs must say when cloning is required. Do not silently
-force `R: Clone` on the whole type.
+Do not add a bare `reply_all` alias. The copied API says `reply_all_clone` or
+`reply_all_with`, so clone requirements stay visible.
 
 Implementation shape:
 
@@ -306,6 +334,12 @@ Type name:
 CancelableWork<K, Q, R>
 ```
 
+Home:
+
+```rust
+tina_runtime::call::CancelableWork
+```
+
 Do not expose `Slab` in the copied name. Internally, use whatever bounded table
 shape is right.
 
@@ -321,10 +355,11 @@ Rules:
   no per-key limit, and explicit per-key limit.
 - Child effect must still be gated by admission, like Phase 097.
 - Failed admission returns the pending token so the caller can be answered.
-- Cancel means Tina stops waiting / cancels Tina-owned work where possible.
+- Cancel path removes the token, calls `PendingCancelableCall::cancel(...)`,
+  and answers the original caller from the cancel continuation.
 - External work late completion remains visible as late/rejected truth.
 
-Likely API:
+Required API:
 
 ```rust
 CancelableWork::with_capacity(total)
@@ -339,11 +374,10 @@ work.snapshot()
 uses that key as the natural grouping key; do not require users to pass the same
 key twice.
 
-Keep exact generic bounds boring. The honest API is to return the removed
-`PendingCancelableCall` and let user code call `.cancel(...)` or
-`.into_request_context()` so the continuation/reply message is explicit. Add
-direct `cancel_with(...)` only if it makes the copied path clearer without trait
-soup.
+Keep exact generic bounds boring. The honest API returns the removed
+`PendingCancelableCall`. User code then calls `.cancel(...)` or
+`.into_request_context()`, so the continuation/reply message is explicit. Do
+not add `cancel_with(...)` in this phase.
 
 `take` and `drain` are storage verbs. They do not reply to the original caller
 by themselves. The service still answers through the returned pending token's
@@ -380,8 +414,10 @@ helper.full_rejects()
 helper.capacity_report()
 ```
 
-Use existing `CapacitySurfaceReport` where possible. Names must be user-settable
-with `.named("service.waiters")`.
+Use `CapacitySurfaceReport` for every helper snapshot. Count-based helpers use
+`CapacitySurfaceReport::count`. Any future weighted helper must use
+`CapacitySurfaceReport::weighted`. Names must be user-settable with
+`.named("service.waiters")`.
 
 Tests:
 
@@ -412,9 +448,9 @@ or prevent a known mistake.
 
 Update copied-path docs:
 
-- request/reply multi-turn section
-- service patterns
-- capacity/overload docs if guarded parking changes examples
+- `docs/tina-user-guide/04-request-reply.md`
+- `docs/tina-user-guide/10-service-patterns.md`
+- `docs/tina-user-guide/06-boundedness-and-overload.md`
 - systems README notes
 - `examples/FINDINGS.md`: close or update findings for `SleepReply`, caller
   parking, guarded pending replies, and natural-key waiters

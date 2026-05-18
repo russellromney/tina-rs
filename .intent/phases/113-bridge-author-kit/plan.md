@@ -104,16 +104,47 @@ AWS-specific helpers stay inside `tina-aws-bridge`.
 
 Required shared concepts:
 
-- install result
-- closer
-- close mode / close admission
-- drain report
-- late result count/report
-- worker-terminal outcome
-- caller-observed outcome warning
-- pressure report adapter
-- supplied-client ownership note
-- classifier category
+- `BridgeInstall`
+- `BridgeCloser`
+- `BridgeCloseMode`
+- `BridgeCloseAdmission`
+- `BridgeDrainReport`
+- `BridgeLateResultReport`
+- `BridgeTerminal`
+- `BridgeCallerWarning`
+- `BridgePressure`
+- `BridgeOutcomeClass`
+- `BridgeRetryable`
+- `BridgeFatal`
+
+Required exact categories:
+
+```rust
+BridgeOutcomeClass::{Succeeded, Retryable(BridgeRetryable), Fatal(BridgeFatal)}
+BridgeRetryable::{
+    BridgeFull,
+    BridgeClosed,
+    CallerTimeout,
+    BridgeTimeout,
+    ServiceThrottled,
+    ProvisionedThroughputExceeded,
+    TransactionConflict,
+    SdkError,
+    PoolAcquireTimeout,
+}
+BridgeFatal::{
+    InvalidRequest,
+    TooLarge,
+    ConditionalCheckFailed,
+    NotFound,
+    InvalidParameter,
+    AccessDenied,
+    DecryptionFailed,
+    Decode,
+    PoolClosed,
+    Internal,
+}
+```
 
 Rules:
 
@@ -149,6 +180,10 @@ Extract only repeated code:
 - common classifier wrapper
 - common supplied-client/runtime ownership docs
 
+Replace AWS-local classifier enums with shared vocabulary or compatibility type
+aliases that point at the shared vocabulary. Keep service-specific operation
+types in the AWS crate.
+
 Do not hide per-service operation types.
 
 Rules:
@@ -166,13 +201,43 @@ Tests:
 - every AWS service has Full/Closed or equivalent admission test
 - one AWS service has timeout plus late-result truth
 - one AWS service has shutdown/drain while work is in flight
-- classifier tests cover `Succeeded`, `Retryable`, `Throttled`, `Auth`,
-  `NotFound`, `InvalidRequest`, and `Fatal`
+- classifier tests cover `Succeeded`, `Retryable(ServiceThrottled)`,
+  `Retryable(BridgeTimeout)`, `Fatal(AccessDenied)`, `Fatal(NotFound)`,
+  `Fatal(InvalidRequest)`, and `Fatal(Internal)`
 
 ### Rock 3: Bridge Pressure Adapter
 
 Ship one copied adapter path from bridge metrics to `CapacitySurfaceReport` /
 `ServicePressureReport`.
+
+Required shared shape:
+
+```rust
+BridgePressure {
+    name,
+    capacity,
+    current,
+    high_water,
+    full_count,
+    timeout_count,
+    closed_count,
+    late_result_count,
+    worker_terminal_count,
+}
+```
+
+Required methods:
+
+```rust
+BridgePressure::capacity_surface(mode) -> CapacitySurfaceReport
+BridgePressure::unavailable(name, reason)
+impl From<PgPressureReport> for BridgePressure
+impl From<S3PressureReport> for BridgePressure
+impl From<SqsPressureReport> for BridgePressure
+impl From<SnsPressureReport> for BridgePressure
+impl From<DynamoPressureReport> for BridgePressure
+impl From<SecretsPressureReport> for BridgePressure
+```
 
 Required:
 
@@ -182,9 +247,10 @@ Required:
 - high-water
 - full count
 - timeout count
-- closed count where available
-- late-result count where available
-- unavailable when a bridge cannot measure a field
+- closed count; use `0` only when the bridge truly has no close path
+- late-result count; use `0` only when the bridge cannot observe late terminal
+  completion
+- unavailable report when a whole bridge pressure surface cannot be measured
 
 Rules:
 
@@ -209,6 +275,9 @@ Required:
 - pressure adapter uses shared names
 - closer/drain docs use shared lifecycle words
 - classifier maps to shared category names where it already has categories
+- existing SQLx `PgOutcomeClass` may stay as a typed SQLx-facing API, but it
+  must expose `classify_bridge()` or `Into<BridgeOutcomeClass>` for shared
+  reports/docs
 
 Do not rewrite the whole bridge.
 
@@ -220,7 +289,11 @@ Tests:
 
 ### Rock 5: Bridge Author Docs
 
-Add a bridge author page or section.
+Add a bridge author section to:
+
+```text
+docs/tina-user-guide/18-bridge-crates.md
+```
 
 Must include:
 
@@ -235,7 +308,7 @@ Must include:
 - classifier rule
 - hermetic test checklist
 
-Docs should be written for someone adding the next SDK bridge.
+Docs must be written for someone adding the next SDK bridge.
 
 ## Required Proof
 
