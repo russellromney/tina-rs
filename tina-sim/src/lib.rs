@@ -158,6 +158,7 @@ where
     /// `RuntimeStopped`) instead of the generic
     /// `NoPendingCall` / `CallerClosed`.
     cancelled_calls: std::collections::VecDeque<(CallId, tina::CancelCause)>,
+    cancelled_call_cause_evictions: u64,
     /// Live trace observer. Fires before in-memory push so DST replay
     /// sees the same stream a live operator does.
     trace_observer: Option<Arc<dyn tina_runtime::TraceObserver>>,
@@ -219,6 +220,7 @@ where
             cancelled_calls: std::collections::VecDeque::with_capacity(
                 tina_runtime::CANCELLED_CALL_RING_CAPACITY,
             ),
+            cancelled_call_cause_evictions: 0,
             trace_observer: None,
         }
     }
@@ -233,6 +235,16 @@ where
     /// [`tina_runtime::TraceObserver`].
     pub fn set_trace_observer(&mut self, observer: Option<Arc<dyn tina_runtime::TraceObserver>>) {
         self.trace_observer = observer;
+    }
+
+    /// Returns how many recently-cancelled call causes were evicted
+    /// from the bounded attribution ring.
+    ///
+    /// Late replies for evicted calls still reject honestly, but they
+    /// fall back to generic caller-closed/no-pending reasons because
+    /// the exact cancellation cause is no longer retained.
+    pub const fn cancelled_call_cause_evictions(&self) -> u64 {
+        self.cancelled_call_cause_evictions
     }
 
     /// Returns the current virtual monotonic time.
@@ -3993,6 +4005,8 @@ where
     fn record_cancelled_call(&mut self, call_id: CallId, cause: tina::CancelCause) {
         if self.cancelled_calls.len() == tina_runtime::CANCELLED_CALL_RING_CAPACITY {
             self.cancelled_calls.pop_front();
+            self.cancelled_call_cause_evictions =
+                self.cancelled_call_cause_evictions.saturating_add(1);
         }
         self.cancelled_calls.push_back((call_id, cause));
     }
@@ -5430,6 +5444,25 @@ mod tests {
         assert_ne!(
             first, other_tag,
             "different fault tags should not share a trivially correlated stream"
+        );
+    }
+
+    #[test]
+    fn cancelled_call_cause_ring_overflow_is_visible() {
+        let mut simulator = Simulator::new(NumberedShard(0), SimulatorConfig::default());
+
+        for raw_id in 0..(tina_runtime::CANCELLED_CALL_RING_CAPACITY as u64 + 3) {
+            simulator
+                .record_cancelled_call(CallId::new(raw_id), tina::CancelCause::CallerCancelled);
+        }
+
+        assert_eq!(simulator.cancelled_call_cause_evictions(), 3);
+        assert_eq!(simulator.recently_cancelled_cause(CallId::new(0)), None);
+        assert_eq!(
+            simulator.recently_cancelled_cause(CallId::new(
+                tina_runtime::CANCELLED_CALL_RING_CAPACITY as u64 + 2
+            )),
+            Some(tina::CancelCause::CallerCancelled)
         );
     }
 

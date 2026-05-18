@@ -74,6 +74,22 @@ fn runtime_preallocation_config_reserves_runtime_owned_metadata() {
 }
 
 #[test]
+fn cancelled_call_cause_ring_overflow_is_visible() {
+    let mut runtime = Runtime::new(TestShard, TestMailboxFactory);
+
+    for raw_id in 0..(CANCELLED_CALL_RING_CAPACITY as u64 + 3) {
+        runtime.record_cancelled_call(CallId::new(raw_id), tina::CancelCause::CallerCancelled);
+    }
+
+    assert_eq!(runtime.cancelled_call_cause_evictions(), 3);
+    assert_eq!(runtime.recently_cancelled_cause(CallId::new(0)), None);
+    assert_eq!(
+        runtime.recently_cancelled_cause(CallId::new(CANCELLED_CALL_RING_CAPACITY as u64 + 2)),
+        Some(tina::CancelCause::CallerCancelled)
+    );
+}
+
+#[test]
 fn bounded_trace_retention_does_not_move_the_tail_on_every_event() {
     let mut runtime = Runtime::with_clock_and_ids_and_driver(
         TestShard,

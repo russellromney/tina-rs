@@ -427,6 +427,7 @@ where
     ///
     /// Single-writer (this shard's runtime); no concurrent access.
     cancelled_calls: std::collections::VecDeque<(CallId, tina::CancelCause)>,
+    cancelled_call_cause_evictions: u64,
 }
 
 /// Capacity of the per-runtime recently-cancelled-calls ring. The sim
@@ -697,6 +698,7 @@ where
             cancelled_calls: std::collections::VecDeque::with_capacity(
                 CANCELLED_CALL_RING_CAPACITY,
             ),
+            cancelled_call_cause_evictions: 0,
         }
     }
 
@@ -731,6 +733,16 @@ where
     /// Returns the active trace retention policy.
     pub const fn trace_retention(&self) -> TraceRetention {
         self.trace_retention
+    }
+
+    /// Returns how many recently-cancelled call causes were evicted
+    /// from the bounded attribution ring.
+    ///
+    /// Late replies for evicted calls still reject honestly, but they
+    /// fall back to generic caller-closed/no-pending reasons because
+    /// the exact cancellation cause is no longer retained.
+    pub const fn cancelled_call_cause_evictions(&self) -> u64 {
+        self.cancelled_call_cause_evictions
     }
 
     /// Returns the number of trace events dropped by the retention policy.
@@ -923,11 +935,7 @@ where
             // Record the cause so any late callee reply that races
             // shutdown surfaces as `RuntimeStopped` rather than the
             // generic `NoPendingCall` / `CallerClosed`.
-            self.cancelled_calls
-                .push_back((call.call_id, tina::CancelCause::RuntimeStopped));
-            if self.cancelled_calls.len() > CANCELLED_CALL_RING_CAPACITY {
-                self.cancelled_calls.pop_front();
-            }
+            self.record_cancelled_call(call.call_id, tina::CancelCause::RuntimeStopped);
             self.push_event(
                 call.requester.isolate,
                 Some(call.cause),
@@ -2857,6 +2865,8 @@ where
     fn record_cancelled_call(&mut self, call_id: CallId, cause: tina::CancelCause) {
         if self.cancelled_calls.len() == CANCELLED_CALL_RING_CAPACITY {
             self.cancelled_calls.pop_front();
+            self.cancelled_call_cause_evictions =
+                self.cancelled_call_cause_evictions.saturating_add(1);
         }
         self.cancelled_calls.push_back((call_id, cause));
     }
