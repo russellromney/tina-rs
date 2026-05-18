@@ -4,6 +4,32 @@ This file records completed work.
 
 ## Unreleased
 
+### Phase 115 Core / Ecosystem Reorg (part 1: docs and layering)
+
+- New `docs/tina-user-guide/23-core-and-batteries.md` draws the line between
+  Tina core (model crates, runtime/simulator) and official batteries
+  (`tina-http`, bridge crates, proof harness). Lists the six "official
+  battery rules" — bounded admission, typed outcomes, close/drain report,
+  pressure/capacity report, replay support or honest unsupported truth, no
+  hidden Tokio/runtime queues — and names the three prelude tiers
+  (`tina::prelude`, `tina_runtime::prelude`, battery preludes).
+- New `docs/tina-user-guide/24-battery-authoring.md` gives a twelve-item
+  authoring checklist for first- and third-party batteries plus a "known
+  hook gaps" table that names where existing first-party batteries still
+  reach past clean public hooks (HTTP/TLS rails, bridge lifecycle, body
+  streaming/source lifecycle, AWS/sqlx/reqwest/Tokio-owned worker copy,
+  per-battery replay declarations).
+- Updated `docs/README.md` and `docs/tina-user-guide/README.md` so the
+  "learn core" and "choose batteries" reading orders are now distinct.
+- Added a "Layering" stanza to the Phase 116, 117, and 118 plan outlines so
+  Wave A work uses the new core-vs-batteries language and does not invent
+  private runtime hooks inside battery code.
+- File-split portion of Phase 115 (no-behavior module splits of
+  `tina/src/lib.rs`, `tina-runtime/src/lib.rs`, `tina-runtime/src/call.rs`,
+  `tina-sim/src/lib.rs`, `tina-sim/src/dst.rs`, and the three large test
+  homes) remains pending; it lands in a follow-up commit/PR inside this
+  phase before Wave A begins.
+
 ### Phase 123 Adversarial Hardening
 
 - Hardened HTTP/1 keepalive response handling for chunked replies: keepalive

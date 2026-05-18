@@ -8,6 +8,26 @@
 - Runs before Phase 119 resource maturity. HTTP/2/gRPC client pooling needs
   the real client connection shape first.
 
+## Layering
+
+Phase 115 separated core from batteries (see
+`docs/tina-user-guide/23-core-and-batteries.md`). This phase respects that
+line:
+
+- **Core** (`tina`, `tina-runtime`, `tina-sim`): publish the small public
+  hooks the HTTP/2 client needs — TLS ALPN on the TLS rail, received-status
+  protocol facts already added in Phase 112. No new runtime semantics.
+- **Official battery** (`tina-http`): all HTTP/2 / gRPC client code lives
+  here. New `Http2ClientConnection`, gRPC client wrappers, and pooled
+  client connection helpers are battery code on top of public core hooks.
+- **No bridge** is involved; the native client replaces the
+  `tina-reqwest-bridge`-style escape hatch for the protocols it covers.
+
+If the design needs a hook that does not yet exist as a public Tina core
+surface (for example, ALPN selection on the TLS rail), promote that hook in
+core first, then build the battery on top. Do not reach into runtime
+internals.
+
 ## Purpose
 
 Make Tina a native client, not only a native server.

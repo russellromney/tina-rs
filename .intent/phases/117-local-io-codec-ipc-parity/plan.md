@@ -6,6 +6,26 @@
 - Can run in parallel with phases 116 and 118 if ownership stays mostly in
   runtime rails, codec helpers, and local IPC specimens.
 
+## Layering
+
+Phase 115 separated core from batteries (see
+`docs/tina-user-guide/23-core-and-batteries.md`). This phase respects that
+line:
+
+- **Core** (`tina-runtime`, `tina-sim`): new public rails — file streaming
+  source, Unix-domain socket rail — land in `tina-runtime` and gain
+  scripted equivalents in `tina-sim`. These are runtime semantics, not
+  battery features.
+- **Codec battery** (new or in `tina-http`): codec helpers (line-delimited,
+  length-delimited, sync-codec adapter) sit on top of public rail bytes.
+  They never reach into runtime internals.
+- **Local IPC battery / specimens**: local sidecar/admin IPC specimens
+  consume the public rails and codec helpers as ordinary user code.
+
+Codec helpers may live in a small new battery crate or inside `tina-http`
+behind a feature flag; either way they obey the official battery rules in
+`docs/tina-user-guide/23-core-and-batteries.md`.
+
 ## Purpose
 
 Close common Tokio replacement gaps outside HTTP:

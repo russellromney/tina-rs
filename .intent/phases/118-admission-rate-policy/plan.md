@@ -9,6 +9,27 @@
   `FullHandling`, `Backoff`, `RecurringTick`, capacity summaries, and service
   pressure reports. Do not rebuild those primitives.
 
+## Layering
+
+Phase 115 separated core from batteries (see
+`docs/tina-user-guide/23-core-and-batteries.md`). This phase respects that
+line:
+
+- **Core** (`tina-runtime`): policy types that need first-class capacity /
+  fairness vocabulary live next to the existing `LocalPermitGate`,
+  `SharedCapacityScope`, `FullHandling`, and `Backoff` types. Public hooks
+  only; no battery may reach past them.
+- **Edge-service battery / specimens**: concurrency / per-key / per-user /
+  rate-limit policies are composed by ordinary user code on top of those
+  core primitives. Each policy is documented as a copied path, not a new
+  runtime semantic.
+- **No retry framework.** Retry remains caller-owned. Any helper added in
+  this phase keeps suspension points, capacity, and trace truth visible —
+  no hidden retry queues.
+
+If a copied path repeatedly needs a runtime hook that does not yet exist,
+promote that hook in core before adding it to user code.
+
 ## Spike Facts
 
 - `LocalPermitGate` already gives fixed-count local concurrency with move-only
