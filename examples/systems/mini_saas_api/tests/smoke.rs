@@ -435,6 +435,111 @@ fn smoke_service_report_lines_match_readme() {
     }
 }
 
+// Phase 111: two runs of the smoke harness must produce the same
+// `ServiceReport` fingerprint. The fingerprint deliberately strips
+// wall-clock fields (shutdown step elapsed times, total elapsed, bound
+// listener addresses) and absolute counters; the surviving subset is
+// the shape a user is asked to grep for. A regression that introduces a
+// hidden non-deterministic field — for instance, an embedded timestamp
+// in a topology component or a random id in a surface name — surfaces
+// here before it surfaces in CI dashboards.
+#[test]
+fn smoke_service_report_fingerprint_is_deterministic_across_runs() {
+    let first = run(RunMode::Smoke).expect("first smoke ran");
+    let second = run(RunMode::Smoke).expect("second smoke ran");
+
+    let fp_first = service_report_fingerprint(
+        first
+            .service_report
+            .as_ref()
+            .expect("first service_report populated"),
+    );
+    let fp_second = service_report_fingerprint(
+        second
+            .service_report
+            .as_ref()
+            .expect("second service_report populated"),
+    );
+    assert_eq!(
+        fp_first, fp_second,
+        "ServiceReport fingerprint must be deterministic across runs;\n\
+         first:\n{first}\nsecond:\n{second}",
+        first = fp_first.join("\n"),
+        second = fp_second.join("\n"),
+    );
+}
+
+/// Deterministic projection of a [`ServiceReport`] for cross-run
+/// equality. Drops wall-clock fields (shutdown elapsed, total elapsed,
+/// listener bind addresses) and absolute pressure counters, keeping the
+/// shape: service name, lifecycle, readiness, health state, component
+/// names+kinds, pressure surface names+kinds+state, replay variant +
+/// case name, shutdown clean / step-count / close-count.
+fn service_report_fingerprint(svc: &tina_runtime::service_report::ServiceReport) -> Vec<String> {
+    use tina_runtime::service_pressure::ServiceSurfaceState;
+    use tina_runtime::service_report::ServiceReplayStatus;
+    let mut out = vec![
+        format!("service={}", svc.service()),
+        format!("lifecycle={}", svc.lifecycle()),
+        format!("ready={}", svc.readiness().ready),
+        format!("health.state={}", svc.health().state),
+    ];
+    for component in &svc.topology().components {
+        out.push(format!(
+            "component name={} kind={}",
+            component.name, component.kind,
+        ));
+    }
+    for surface in &svc.pressure().surfaces {
+        let state = match surface.state {
+            ServiceSurfaceState::Measured(_) => "measured",
+            ServiceSurfaceState::Unavailable { .. } => "unavailable",
+        };
+        out.push(format!(
+            "surface name={} kind={} state={state}",
+            surface.name, surface.kind,
+        ));
+    }
+    match svc.replay() {
+        ServiceReplayStatus::Available { case_name, .. } => {
+            out.push(format!("replay=available case={case_name}"));
+        }
+        ServiceReplayStatus::Unsupported { facts } => {
+            out.push(format!("replay=unsupported count={}", facts.len()));
+        }
+        ServiceReplayStatus::NotCaptured { reason } => {
+            out.push(format!("replay=not_captured reason={reason}"));
+        }
+    }
+    if let Some(shutdown) = svc.shutdown() {
+        out.push(format!(
+            "shutdown clean={} steps={} closes={}",
+            shutdown.clean,
+            shutdown.steps.len(),
+            shutdown.closes.len(),
+        ));
+        // Step kinds in order (without elapsed durations).
+        for step in &shutdown.steps {
+            out.push(format!(
+                "step kind={} outcome={}",
+                step.step,
+                step.outcome.kind_str(),
+            ));
+        }
+        for close in &shutdown.closes {
+            out.push(format!(
+                "close name={} kind={} outcome={}",
+                close.name,
+                close.kind,
+                close.outcome.kind_str(),
+            ));
+        }
+    } else {
+        out.push("shutdown=not_recorded".to_owned());
+    }
+    out
+}
+
 // Phase 111: pressure under load must include a `Full` surface in the
 // service report. The pressure mode of the smoke harness forces one
 // `outbound.full` admission rejection.

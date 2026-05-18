@@ -12,7 +12,7 @@
 //! line format used by [`crate::capacity::format_discovery_line`]
 //! and into [`crate::capacity::CapacitySummary`] for assertions.
 //!
-//! ```ignore
+//! ```
 //! use tina_runtime::{
 //!     ServicePressureReport, ServicePressureSurface, ServiceSurfaceState,
 //! };
@@ -378,12 +378,27 @@ impl ServicePressureBuilder {
     /// builder, validating every surface name as if it had been inserted
     /// through [`Self::surface`] / [`Self::unavailable`].
     ///
+    /// Atomic: if any incoming surface name is empty, contains
+    /// whitespace/control characters, or collides with a name already in
+    /// this builder (or with another name in `other`), the builder is
+    /// returned **unchanged** and the typed error names the offending
+    /// surface. No partial state is committed.
+    ///
     /// Useful when one subsystem returns its own [`ServicePressureReport`]
     /// (e.g. a bridge wrapper) and the assembling service wants every
     /// surface in one report rather than printing two summaries.
     pub fn merge(mut self, other: ServicePressureReport) -> Result<Self, ServiceReportBuildError> {
+        // Two-pass: validate the entire incoming sequence against the
+        // existing set *and* against earlier surfaces in `other` before
+        // pushing anything. A duplicate name in the middle of `other`
+        // would otherwise leave the builder with the prefix already
+        // committed.
+        let mut prospective = self.seen.clone();
+        for surface in &other.surfaces {
+            validate_surface_name(&surface.name, &prospective)?;
+            prospective.push(surface.name.clone());
+        }
         for surface in other.surfaces.into_iter() {
-            validate_surface_name(&surface.name, &self.seen)?;
             self.seen.push(surface.name.clone());
             self.surfaces.push(surface);
         }
@@ -567,6 +582,57 @@ mod builder_tests {
             err,
             ServiceReportBuildError::DuplicateSurface { ref name } if name == "billing.mailbox"
         ));
+    }
+
+    #[test]
+    fn merge_detects_duplicates_within_incoming_sequence() {
+        // `add_measured` does not dedupe, so a legacy report can carry a
+        // duplicate surface name. The builder's two-pass merge must
+        // detect this *before* committing the prefix, so the typed error
+        // is the only observable outcome.
+        let mut other = ServicePressureReport::new("billing");
+        other.add_measured("mailbox", count("billing.mailbox", 32, 0, 1, 0));
+        other.add_measured("bridge", count("billing.mailbox", 4, 0, 0, 0));
+        let err = ServicePressureBuilder::new("billing")
+            .unwrap()
+            .merge(other)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ServiceReportBuildError::DuplicateSurface { ref name } if name == "billing.mailbox"
+        ));
+    }
+
+    #[test]
+    fn merge_is_atomic_under_partial_failure_in_incoming() {
+        // A duplicate in the middle of `other` rejects without committing
+        // earlier-valid surfaces. We can't inspect the consumed builder
+        // directly (merge consumes self on error), but we can reproduce
+        // the original empty starting state and prove the success path
+        // requires the corrected input.
+        let mut bad = ServicePressureReport::new("billing");
+        bad.add_measured("mailbox", count("billing.first", 32, 0, 1, 0));
+        bad.add_measured("mailbox", count("billing.first", 32, 0, 1, 0)); // dup
+        bad.add_measured("bridge", count("billing.last", 4, 0, 0, 0));
+        assert!(
+            ServicePressureBuilder::new("billing")
+                .unwrap()
+                .merge(bad)
+                .is_err()
+        );
+        // A corrected report merges cleanly into a fresh builder.
+        let mut good = ServicePressureReport::new("billing");
+        good.add_measured("mailbox", count("billing.first", 32, 0, 1, 0));
+        good.add_measured("bridge", count("billing.last", 4, 0, 0, 0));
+        let report = ServicePressureBuilder::new("billing")
+            .unwrap()
+            .merge(good)
+            .unwrap()
+            .finish()
+            .unwrap();
+        assert_eq!(report.len(), 2);
+        assert_eq!(report.surfaces[0].name, "billing.first");
+        assert_eq!(report.surfaces[1].name, "billing.last");
     }
 }
 

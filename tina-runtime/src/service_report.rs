@@ -16,7 +16,7 @@
 //! is no hidden registry; the service owns its builder and threads the
 //! resulting report into its own response surface.
 //!
-//! ```ignore
+//! ```
 //! use tina_runtime::service_pressure::ServicePressureBuilder;
 //! use tina_runtime::service_report::{
 //!     ServiceReplayStatus, ServiceReportBuilder,
@@ -385,7 +385,15 @@ pub struct ServiceReportBuilder {
     health: Option<Health>,
     topology: Option<ServiceTopology>,
     pressure: Option<ServicePressureReport>,
-    shutdown: Option<ServiceShutdownReport>,
+    /// Finished shutdown report set by [`Self::shutdown`] or
+    /// [`Self::shutdown_choreography`]. Mutually exclusive with
+    /// [`Self::shutdown_pending`]; the last setter call wins.
+    shutdown_finished: Option<ServiceShutdownReport>,
+    /// Choreography being accumulated by repeated
+    /// [`Self::resource_close_report`] calls. Mutually exclusive with
+    /// [`Self::shutdown_finished`]; the last setter call wins. Finalized
+    /// at [`Self::finish`] if no finished shutdown was provided.
+    shutdown_pending: Option<ShutdownChoreography>,
     replay: Option<ServiceReplayStatus>,
 }
 
@@ -402,7 +410,8 @@ impl ServiceReportBuilder {
             health: None,
             topology: None,
             pressure: None,
-            shutdown: None,
+            shutdown_finished: None,
+            shutdown_pending: None,
             replay: None,
         })
     }
@@ -439,45 +448,55 @@ impl ServiceReportBuilder {
     }
 
     /// Fold a finished shutdown report into the service report.
+    ///
+    /// Last-call-wins: a subsequent call to [`Self::shutdown`],
+    /// [`Self::shutdown_choreography`], or [`Self::resource_close_report`]
+    /// drops whatever this call set.
     pub fn shutdown(mut self, shutdown: ServiceShutdownReport) -> Self {
-        self.shutdown = Some(shutdown);
+        self.shutdown_finished = Some(shutdown);
+        self.shutdown_pending = None;
         self
     }
 
     /// Fold a shutdown choreography into the service report by finishing it
     /// here. Convenience over `.shutdown(choreo.finish())` for the common
     /// case where the builder is the next call after the last step is
-    /// recorded.
+    /// recorded. Same last-call-wins semantics as [`Self::shutdown`].
     pub fn shutdown_choreography(self, choreography: ShutdownChoreography) -> Self {
         self.shutdown(choreography.finish())
     }
 
-    /// Add a single resource close report to the shutdown summary.
+    /// Add a single resource close report to a pending shutdown summary.
     ///
-    /// If no shutdown has been folded in yet, this opens a fresh
-    /// [`ShutdownChoreography`] for the service and records the close. The
-    /// resulting report keeps the same step/close vocabulary as a manually
-    /// driven choreography so a service can build a terminal shutdown
-    /// without inventing its own resource-close glue.
+    /// Each call appends to an internal [`ShutdownChoreography`] dedicated
+    /// to `resource_close_report` accumulation. Repeated calls extend the
+    /// same pending choreography; on [`Self::finish`] it is finalized and
+    /// folded into the report.
+    ///
+    /// Last-call-wins: calling this method after [`Self::shutdown`] or
+    /// [`Self::shutdown_choreography`] discards the previously set
+    /// finished shutdown report and starts a fresh pending choreography
+    /// with this close. If you need to include both a pre-existing
+    /// shutdown report and additional closes, build the choreography
+    /// yourself and pass the finished report to [`Self::shutdown`] in one
+    /// call.
     pub fn resource_close_report(
         mut self,
         label: &'static str,
         close: ResourceCloseReport,
     ) -> Self {
-        let existing = self.shutdown.take();
-        let mut choreo = ShutdownChoreography::new(self.service.clone());
-        if let Some(prev) = &existing {
-            for step in &prev.steps {
-                choreo.record(step.step, step.label, step.elapsed, step.outcome.clone());
-            }
-            for prev_close in &prev.closes {
-                if !std::ptr::eq(prev_close, &close) {
-                    choreo.record_close(prev_close, "carry_forward");
-                }
-            }
-        }
+        // Setter conflict resolution: dropping the finished report is the
+        // load-bearing rule. Without it, callers who mixed adapters would
+        // get a silently-merged report whose step order or labels diverged
+        // from the original. "Last call wins" is honest; the doc above
+        // names the consequence.
+        self.shutdown_finished = None;
+        let mut choreo = self
+            .shutdown_pending
+            .take()
+            .unwrap_or_else(|| ShutdownChoreography::new(self.service.clone()));
         choreo.record_close(&close, label);
-        self.shutdown = Some(choreo.finish());
+        self.shutdown_pending = Some(choreo);
         self
     }
 
@@ -511,6 +530,13 @@ impl ServiceReportBuilder {
             .unwrap_or_else(|| ServiceReplayStatus::NotCaptured {
                 reason: "not configured".to_owned(),
             });
+        // shutdown_finished takes precedence — it is what `.shutdown()` /
+        // `.shutdown_choreography()` set explicitly. shutdown_pending is
+        // the accumulator from `.resource_close_report()` and is only
+        // finalized here when no finished report supersedes it.
+        let shutdown = self
+            .shutdown_finished
+            .or_else(|| self.shutdown_pending.map(ShutdownChoreography::finish));
         Ok(ServiceReport {
             service: self.service,
             lifecycle,
@@ -518,7 +544,7 @@ impl ServiceReportBuilder {
             health,
             topology,
             pressure,
-            shutdown: self.shutdown,
+            shutdown,
             replay,
         })
     }
@@ -824,5 +850,177 @@ mod tests {
             report.shutdown().expect("shutdown should be present");
         assert_eq!(shutdown.closes.len(), 1);
         assert_eq!(shutdown.closes[0].name, "outbound.pool");
+    }
+
+    fn build_close(name: &str) -> ResourceCloseReport {
+        ResourceCloseReport::clean(
+            name.to_owned(),
+            ResourceKind::Pool,
+            CloseAdmission::Drain,
+            Duration::from_micros(1),
+        )
+    }
+
+    fn stopped_builder() -> ServiceReportBuilder {
+        ServiceReportBuilder::new("billing")
+            .unwrap()
+            .lifecycle(Lifecycle::Stopped)
+            .readiness(Readiness::not_ready(
+                Lifecycle::Stopped,
+                vec![crate::lifecycle::ReadinessReason::IngressStopped],
+            ))
+            .health(Health::new("billing", Lifecycle::Stopped))
+            .topology(ready_topology())
+            .pressure(ready_pressure())
+    }
+
+    #[test]
+    fn resource_close_report_called_twice_accumulates_in_order() {
+        let report = stopped_builder()
+            .resource_close_report("close_db", build_close("db.bridge"))
+            .resource_close_report("close_outbound", build_close("outbound.pool"))
+            .finish()
+            .unwrap();
+        let shutdown = report.shutdown().expect("shutdown present");
+        let names: Vec<&str> = shutdown.closes.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, vec!["db.bridge", "outbound.pool"]);
+        // Each close becomes a CloseResource step; both are preserved.
+        let close_steps: usize = shutdown
+            .steps
+            .iter()
+            .filter(|s| s.step == crate::lifecycle::ShutdownStep::CloseResource)
+            .count();
+        assert_eq!(close_steps, 2);
+    }
+
+    #[test]
+    fn shutdown_then_resource_close_report_drops_prior_finished() {
+        // Last-call-wins: a fresh resource_close_report after `shutdown`
+        // discards the prior finished report and starts a fresh pending
+        // choreography with just the new close. This pins the documented
+        // setter precedence so a future "merge instead" change has to
+        // think about it.
+        let mut prior = ShutdownChoreography::new("billing");
+        prior.record(
+            crate::lifecycle::ShutdownStep::StopIngress,
+            "stop_ingress",
+            Duration::from_micros(1),
+            crate::lifecycle::StepOutcome::Clean,
+        );
+        let prior = prior.finish();
+
+        let report = stopped_builder()
+            .shutdown(prior)
+            .resource_close_report("close_db", build_close("db.bridge"))
+            .finish()
+            .unwrap();
+        let shutdown = report.shutdown().expect("shutdown present");
+        // Only the close survives. The original `StopIngress` step is gone.
+        assert_eq!(shutdown.closes.len(), 1);
+        assert_eq!(shutdown.closes[0].name, "db.bridge");
+        assert!(
+            shutdown
+                .steps
+                .iter()
+                .all(|s| s.step == crate::lifecycle::ShutdownStep::CloseResource),
+            "expected only CloseResource steps, got {:#?}",
+            shutdown.steps
+        );
+    }
+
+    #[test]
+    fn resource_close_report_then_shutdown_drops_pending() {
+        // Inverse of the test above: a subsequent `.shutdown(r)` drops
+        // the pending choreography that resource_close_report built.
+        let mut later = ShutdownChoreography::new("billing");
+        later.record(
+            crate::lifecycle::ShutdownStep::StopIngress,
+            "stop_ingress",
+            Duration::from_micros(1),
+            crate::lifecycle::StepOutcome::Clean,
+        );
+        let later = later.finish();
+
+        let report = stopped_builder()
+            .resource_close_report("close_db", build_close("db.bridge"))
+            .shutdown(later)
+            .finish()
+            .unwrap();
+        let shutdown = report.shutdown().expect("shutdown present");
+        // The pending close was discarded; only the explicit `later`
+        // report's StopIngress step remains.
+        assert!(
+            shutdown.closes.is_empty(),
+            "pending closes should be dropped: {:?}",
+            shutdown.closes,
+        );
+        assert_eq!(shutdown.steps.len(), 1);
+        assert_eq!(
+            shutdown.steps[0].step,
+            crate::lifecycle::ShutdownStep::StopIngress,
+        );
+    }
+
+    #[test]
+    fn empty_replay_strings_pass_through() {
+        // Pin current stance: empty case_name / reason are accepted as
+        // typed values. Tightening these into validation errors would be
+        // a behavior change; this test forces a future PR to make that
+        // change deliberately rather than by accident.
+        let report = ServiceReportBuilder::new("billing")
+            .unwrap()
+            .lifecycle(Lifecycle::Ready)
+            .readiness(Readiness::ready())
+            .health(Health::new("billing", Lifecycle::Ready))
+            .topology(ready_topology())
+            .pressure(ready_pressure())
+            .replay(ServiceReplayStatus::available("", 0))
+            .finish()
+            .unwrap();
+        match report.replay() {
+            ServiceReplayStatus::Available {
+                case_name,
+                projected_events,
+            } => {
+                assert!(case_name.is_empty());
+                assert_eq!(*projected_events, 0);
+            }
+            other => panic!("expected Available, got {other:?}"),
+        }
+
+        let report = ServiceReportBuilder::new("billing")
+            .unwrap()
+            .lifecycle(Lifecycle::Ready)
+            .readiness(Readiness::ready())
+            .health(Health::new("billing", Lifecycle::Ready))
+            .topology(ready_topology())
+            .pressure(ready_pressure())
+            .replay(ServiceReplayStatus::not_captured(""))
+            .finish()
+            .unwrap();
+        match report.replay() {
+            ServiceReplayStatus::NotCaptured { reason } => assert!(reason.is_empty()),
+            other => panic!("expected NotCaptured, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn inconsistent_lifecycle_and_readiness_pass_through() {
+        // The builder preserves whatever the service decided. A semantic
+        // mismatch (Stopped + ready) is the service's call to make; the
+        // builder does not invent its own readiness verdict from
+        // lifecycle. Pin this so a future "consistency check" PR has to
+        // change this test deliberately.
+        let report = ServiceReportBuilder::new("billing")
+            .unwrap()
+            .lifecycle(Lifecycle::Stopped)
+            .readiness(Readiness::ready())
+            .health(Health::new("billing", Lifecycle::Stopped))
+            .topology(ready_topology())
+            .pressure(ready_pressure())
+            .finish()
+            .unwrap();
+        assert_eq!(report.lifecycle(), Lifecycle::Stopped);
+        assert!(report.readiness().ready);
     }
 }

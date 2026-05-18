@@ -12,7 +12,8 @@ fn main() {
         health: None,
         topology: None,
         pressure: None,
-        shutdown: None,
+        shutdown_finished: None,
+        shutdown_pending: None,
         replay: None,
     };
 }

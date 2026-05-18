@@ -136,6 +136,33 @@ fn event_sink_drops_visibly_under_load() {
     );
 }
 
+// Phase 111: pin the canonical summary_line token shape. This catches
+// a regression that drops a key=value pair the docs / dashboards rely
+// on, without coupling to varying pressure numbers.
+#[test]
+fn soak_service_report_summary_line_pins_canonical_tokens() {
+    let config = RunConfig {
+        workers: 8,
+        requests_per_worker: 16,
+        ..RunConfig::default()
+    };
+    let report = run(config).expect("soak ran");
+    let summary = report.service_report.summary_line();
+    for fragment in [
+        "service=soak_http_db",
+        "lifecycle=stopped",
+        "ready=false",
+        "health=stopped",
+        "unavailable=1",
+        "replay=not_captured",
+    ] {
+        assert!(
+            summary.contains(fragment),
+            "summary_line missing pinned fragment {fragment:?}:\n{summary}",
+        );
+    }
+}
+
 // Phase 111: the typed ServiceReport must be present, name every
 // component, name the unavailable bridge surface, and produce a
 // readable summary line.

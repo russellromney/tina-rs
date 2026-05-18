@@ -1,4 +1,4 @@
-error[E0451]: fields `service`, `lifecycle`, `readiness`, `health`, `topology`, `pressure`, `shutdown` and `replay` of struct `ServiceReportBuilder` are private
+error[E0451]: fields `service`, `lifecycle`, `readiness`, `health`, `topology`, `pressure`, `shutdown_finished`, `shutdown_pending` and `replay` of struct `ServiceReportBuilder` are private
   --> tests/service_report_compile_fail/service_report_builder_struct_literal.rs:9:9
    |
  8 |     let _ = ServiceReportBuilder {
@@ -15,7 +15,9 @@ error[E0451]: fields `service`, `lifecycle`, `readiness`, `health`, `topology`, 
    |         ^^^^^^^^ private field
 14 |         pressure: None,
    |         ^^^^^^^^ private field
-15 |         shutdown: None,
-   |         ^^^^^^^^ private field
-16 |         replay: None,
+15 |         shutdown_finished: None,
+   |         ^^^^^^^^^^^^^^^^^ private field
+16 |         shutdown_pending: None,
+   |         ^^^^^^^^^^^^^^^^ private field
+17 |         replay: None,
    |         ^^^^^^ private field

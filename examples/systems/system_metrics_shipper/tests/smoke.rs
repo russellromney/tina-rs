@@ -170,6 +170,42 @@ fn metrics_shipper_tick_token_invalidates_stale_timers() {
     );
 }
 
+// Phase 111: pin the canonical summary_line token shape so a regression
+// that drops one of the documented key=value pairs surfaces here, not
+// only in production grep output.
+#[test]
+fn shipper_service_report_summary_line_pins_canonical_tokens() {
+    let config = RunConfig {
+        events: 32,
+        callers: 4,
+        buffer_capacity: 8,
+        batch_size: 4,
+        batch_window_ms: 20,
+        shipper_mailbox: 4,
+        sink_mailbox: 4,
+        call_timeout_ms: 2_000,
+        flush_timeout_ms: 1_000,
+        stop_timeout_ms: 2_000,
+        sink_fail_every: 0,
+        sink_flush_delay_ms: 0,
+    };
+    let report = run(config).expect("run succeeds");
+    let summary = report.shutdown.service_report.summary_line();
+    for fragment in [
+        "service=system_metrics_shipper",
+        "lifecycle=stopped",
+        "ready=false",
+        "health=stopped",
+        "shutdown=clean:true",
+        "replay=not_captured",
+    ] {
+        assert!(
+            summary.contains(fragment),
+            "summary_line missing pinned fragment {fragment:?}:\n{summary}",
+        );
+    }
+}
+
 // Phase 111: typed ServiceReport must thread lifecycle/health/topology/
 // pressure/shutdown into one validated report. Shutdown choreography
 // must survive in the typed report after stop, including the explicit

@@ -119,6 +119,32 @@ fn owner_stop_releases_charges_when_isolate_is_torn_down_mid_flight() {
     );
 }
 
+// Phase 111: pin the canonical summary_line token shape. Surfaces a
+// dropped key=value pair without coupling to varying scope counters.
+#[test]
+fn gateway_service_report_summary_line_pins_canonical_tokens() {
+    let config = RunConfig {
+        upload_callers: 5,
+        list_callers: 0,
+        ..RunConfig::default()
+    };
+    let report = run(config).expect("gateway run");
+    let summary = report.service_report.summary_line();
+    for fragment in [
+        "service=system_api_gateway_limits",
+        "lifecycle=stopped",
+        "ready=false",
+        "health=stopped",
+        "unavailable=1",
+        "replay=not_captured",
+    ] {
+        assert!(
+            summary.contains(fragment),
+            "summary_line missing pinned fragment {fragment:?}:\n{summary}",
+        );
+    }
+}
+
 // Phase 111: typed ServiceReport names every component, names the
 // unavailable outbound pool surface, and exposes the full surface.
 #[test]
