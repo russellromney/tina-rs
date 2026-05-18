@@ -21,6 +21,52 @@ This file records completed work.
 - Fixed `tina-rpc-tokio` bridge cancellation accounting so a stale
   cancellation guard cannot double-release a bounded admission slot.
 
+### Phase 112 Protocol Facts To Replay
+
+- New replayable fact effect. `Effect::Fact(I::Fact)` rides handler turns
+  the same way other effects do; the runtime and simulator translate it
+  into `RuntimeEventKind::FactObserved { fact: RuntimeFact }`. Stable
+  effect-kind tag `13`; stable runtime-event tag `36`. Existing tags
+  are unchanged.
+- `tina::Isolate::Fact` associated type. Ordinary isolates default to
+  `Fact = Infallible` (macros and `isolate_types!` set it automatically)
+  and pay nothing. Protocol isolates opt in with `fact = ProtocolFact`
+  in the `#[tina_runtime::isolate]` / `isolate_types!` form.
+- `tina_runtime::RuntimeFact` carries the canonical replay shape with
+  one family today (`Protocol(ProtocolFact)`) and a stable family tag
+  `1`. The `IntoRuntimeFact` trait is the registration boundary: an
+  isolate whose `Fact` type does not implement it will not register.
+- `tina_runtime::ProtocolFact` vocabulary: `Http2StreamOpened`,
+  `Http2StreamClosed`, `Http2StreamReset`, `Http2FlowControlFull`,
+  `HttpBodyHighWater`, `WebSocketSlowPeerClosed`,
+  `WebSocketSessionClosed`, `GrpcFinalStatusSent`. Each variant carries
+  typed connection / stream / session / direction / reason fields and
+  no stringly-typed substitutes.
+- Real emission points in `tina-http`:
+  - HTTP/2 connection isolate emits stream-open/close/reset and
+    flow-control facts at the point each protocol fact becomes true
+    (header dispatch, RST_STREAM, body-cap and flow-control rejects);
+  - HTTP/1 connection isolate emits slow-peer and session-close facts
+    on the WebSocket lane;
+  - the native gRPC trailer send emits `GrpcFinalStatusSent` and a
+    paired `Http2StreamClosed`.
+  Blocking host helpers (`grpc_unary_call_h2c_blocking`) intentionally
+  do not emit replay facts; the docs say so explicitly.
+- Simulator parity. `Effect::Fact` executes identically in
+  `tina_sim::Simulator`, so saved DST cases observe the same facts as
+  the live runtime in the same order. A typed
+  `ProtocolReplayMismatch::UnsupportedProtocolFact` arm names live-only
+  physics gaps without faking a pass.
+- Projection presets. `TraceProjection::protocol_facts()`,
+  `http2_streams()`, `websocket_sessions()`, and `grpc_status()`
+  produce fail-closed projections (every other event kind is named
+  `ignored`, and an unknown kind still errors). One saved replay proof
+  is locked in via `tina-sim/tests/protocol_fact.rs`.
+- Compile-time rails. Three new `trybuild` fixtures pin that wrong
+  fact wiring fails to compile: an ordinary isolate emitting a
+  `ProtocolFact`, a protocol isolate emitting the wrong fact enum, and
+  an isolate whose `Fact` type lacks `IntoRuntimeFact`.
+
 ### Phase 110 Workflow Pending Ergonomics
 
 - `tina_runtime::sleep(d)` now returns a `SleepCall` wrapper. It forwards

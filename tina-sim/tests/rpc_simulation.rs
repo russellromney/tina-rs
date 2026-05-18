@@ -53,6 +53,7 @@ impl Isolate for Observer {
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<ClientResultMsg>;
+    type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 
     fn handle(

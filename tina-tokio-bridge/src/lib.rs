@@ -407,6 +407,7 @@ where
     type Spawn = I::Spawn;
     type SpawnObserved = std::convert::Infallible;
     type Call = I::Call;
+    type Fact = I::Fact;
     type Shard = I::Shard;
 
     fn handle(
@@ -442,6 +443,7 @@ where
             tina::Effect::Batch(effects.into_iter().map(remap_effect).collect())
         }
         tina::Effect::ReplyTo(slot, reply) => tina::Effect::ReplyTo(slot, reply),
+        tina::Effect::Fact(fact) => tina::Effect::Fact(fact),
     }
 }
 
@@ -654,6 +656,7 @@ where
         I::Message: BridgeMessage + From<BridgeRequest<M, R>> + Send + 'static,
         I::Reply: Send + 'static,
         I::Call: IntoErasedCall<I::Message> + 'static,
+        I::Fact: tina_runtime::IntoRuntimeFact + 'static,
         M: Send + 'static,
         R: Send + 'static,
         Outbound: 'static,

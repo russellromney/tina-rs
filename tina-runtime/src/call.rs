@@ -2479,6 +2479,15 @@ pub struct PendingCancelableCall<K, Q, R> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct PendingCancelableTicket(u64);
 
+/// One active cancelable request per key.
+///
+/// Use this when the user's job is "this key has at most one in-flight
+/// request right now." A second attempt with the same key is a
+/// `DuplicateKey` rejection — caller authority is returned unchanged so
+/// the service can reply `Busy` or `AlreadyRunning` immediately. For the
+/// "many concurrent attempts per key" shape, reach for
+/// [`CancelableWork`] instead.
+///
 /// Bounded fixed-capacity storage for [`PendingCancelableCall`] tokens.
 ///
 /// This helper is deliberately only storage. It never dispatches the child
@@ -2487,6 +2496,14 @@ pub struct PendingCancelableTicket(u64);
 /// after this set accepts the token. If insertion fails, the error returns the
 /// token so the caller can recover authority with
 /// [`PendingCancelableCall::into_request_context`] and answer immediately.
+///
+/// Visible truth that stays on the surface:
+///
+/// - admission is `try_insert(token)` and returns `Full` or `DuplicateKey`
+///   typed errors; caller authority comes back inside the rejected token.
+/// - completion is `remove(key, ticket)` — the ticket is the exact instance,
+///   so a stale worker-return cannot remove a newer call that reused the key.
+/// - drain replies to every parked caller on stop; no implicit cancellation.
 #[derive(Debug)]
 pub struct PendingCancelableCallSet<K, Q, R> {
     entries: Vec<PendingCancelableEntry<K, Q, R>>,
@@ -3407,6 +3424,7 @@ impl SleepCall {
     /// #     type Spawn = Infallible;
     /// #     type SpawnObserved = Infallible;
     /// #     type Call = RuntimeCall<Msg>;
+    /// #     type Fact = Infallible;
     /// #     type Shard = tina::SingleShard;
     /// #     fn handle(&mut self, _m: Msg, _ctx: &mut Context<'_, Self::Shard, ()>) -> Effect<Self> {
     /// #         tina::noop()
@@ -4083,8 +4101,27 @@ struct CancelableWorkEntry<K, Q, R> {
     token: PendingCancelableCall<K, Q, R>,
 }
 
+/// Many cancelable requests grouped by key.
+///
+/// Use this when the user's job is "this key can have several in-flight
+/// requests at once" — for example, every retry attempt of the same job
+/// id, or several callers racing to fill the same cache key with
+/// caller-owned cancellation. For the "one active request per key"
+/// shape, reach for [`PendingCancelableCallSet`] instead.
+///
 /// Bounded fixed-capacity storage for [`PendingCancelableCall`] tokens
-/// grouped by natural key. Multiple live entries may share one key.
+/// grouped by natural key. Multiple live entries may share one key, up
+/// to the optional per-key cap configured at construction time.
+///
+/// Visible truth that stays on the surface:
+///
+/// - admission is `admit(token)` and returns `Full` / `KeyFull` typed
+///   errors; caller authority comes back inside the rejected token.
+/// - completion is `remove_by_ticket(WorkTicket)` — the ticket names this
+///   exact attempt, so an older worker-return cannot remove a newer
+///   admit that reused the same key.
+/// - drain replies to every parked caller on stop and reports closed
+///   capacity through the count surface.
 pub struct CancelableWork<K, Q, R> {
     capacity: usize,
     per_key_limit: Option<usize>,

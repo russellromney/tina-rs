@@ -1,0 +1,38 @@
+warning: unused import: `std::convert::Infallible`
+ --> tests/safety_rails_compile_fail/protocol_fact_ordinary_isolate.rs:6:5
+  |
+6 | use std::convert::Infallible;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `tina::prelude::*`
+ --> tests/safety_rails_compile_fail/protocol_fact_ordinary_isolate.rs:8:5
+  |
+8 | use tina::prelude::*;
+  |     ^^^^^^^^^^^^^^^^
+
+warning: unused import: `RuntimeCall`
+  --> tests/safety_rails_compile_fail/protocol_fact_ordinary_isolate.rs:10:75
+   |
+10 |     Http2StreamId, ProtocolConnectionId, ProtocolDirection, ProtocolFact, RuntimeCall,
+   |                                                                           ^^^^^^^^^^^
+
+error[E0308]: mismatched types
+  --> tests/safety_rails_compile_fail/protocol_fact_ordinary_isolate.rs:29:28
+   |
+29 |           tina::fact::<Self>(ProtocolFact::Http2StreamOpened {
+   |  _________------------------_^
+   | |         |
+   | |         arguments to this function are incorrect
+30 | |             connection: ProtocolConnectionId::new(0),
+31 | |             stream: Http2StreamId::new(1),
+32 | |             direction: ProtocolDirection::Inbound,
+33 | |         })
+   | |_________^ expected `Infallible`, found `ProtocolFact`
+   |
+note: function defined here
+  --> $WORKSPACE/tina/src/lib.rs
+   |
+   | pub fn fact<I>(value: I::Fact) -> Effect<I>
+   |        ^^^^

@@ -175,6 +175,7 @@ where
         I::Spawn: IntoErasedSpawn<S> + 'static,
         I::SpawnObserved: IntoErasedSpawnObserved<S, I::Message> + 'static,
         I::Reply: 'static,
+        I::Fact: tina_runtime::IntoRuntimeFact + 'static,
         Msg: 'static,
         Outbound: 'static,
     {
@@ -202,6 +203,7 @@ where
         I::Spawn: IntoErasedSpawn<S> + 'static,
         I::SpawnObserved: IntoErasedSpawnObserved<S, I::Message> + 'static,
         I::Reply: 'static,
+        I::Fact: tina_runtime::IntoRuntimeFact + 'static,
         Msg: 'static,
         Outbound: 'static,
     {

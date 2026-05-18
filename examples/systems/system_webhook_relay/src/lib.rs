@@ -25,8 +25,8 @@ use std::time::Duration;
 use tina::CallContext;
 use tina::prelude::*;
 use tina_aws_bridge::{
-    BridgeOutcomeClass, FatalReason, SqsAddress, SqsError, SqsRequest, SqsResponse, SqsSendMessage,
-    TransientReason, send_sqs,
+    BridgeFatal, BridgeOutcomeClass, BridgeRetryable, BridgeUnavailable, SqsAddress, SqsError,
+    SqsRequest, SqsResponse, SqsSendMessage, send_sqs,
 };
 use tina_runtime::{CallOutcome, DefaultThreadedMailboxFactory, RuntimeCall, ThreadedRuntime};
 
@@ -69,16 +69,22 @@ impl OutboundError {
     /// Classifier from the outbound layer's typed error.
     pub fn classify(&self) -> BridgeOutcomeClass {
         match self {
-            Self::Full => BridgeOutcomeClass::Transient(TransientReason::BridgeFull),
-            Self::Closed => BridgeOutcomeClass::Transient(TransientReason::BridgeClosed),
-            Self::Timeout => BridgeOutcomeClass::Transient(TransientReason::BridgeTimeout),
-            Self::Throttled => BridgeOutcomeClass::Transient(TransientReason::ServiceThrottled),
-            Self::SdkTransient => BridgeOutcomeClass::Transient(TransientReason::SdkError),
-            Self::NotFound => BridgeOutcomeClass::Fatal(FatalReason::NotFound),
-            Self::InvalidParameter => BridgeOutcomeClass::Fatal(FatalReason::InvalidParameter),
-            Self::AccessDenied => BridgeOutcomeClass::Fatal(FatalReason::AccessDenied),
-            Self::InvalidRequest => BridgeOutcomeClass::Fatal(FatalReason::InvalidRequest),
-            Self::Internal => BridgeOutcomeClass::Fatal(FatalReason::Internal),
+            Self::Full => BridgeOutcomeClass::Retryable(BridgeRetryable::BridgeFull),
+            Self::Closed => BridgeOutcomeClass::Unavailable(BridgeUnavailable::BridgeClosed),
+            Self::Timeout => BridgeOutcomeClass::Retryable(BridgeRetryable::BridgeTimeout),
+            Self::Throttled => {
+                BridgeOutcomeClass::Retryable(BridgeRetryable::ServiceThrottled)
+            }
+            Self::SdkTransient => {
+                BridgeOutcomeClass::Retryable(BridgeRetryable::SdkRetryable)
+            }
+            Self::NotFound => BridgeOutcomeClass::Fatal(BridgeFatal::NotFound),
+            Self::InvalidParameter => {
+                BridgeOutcomeClass::Fatal(BridgeFatal::InvalidParameter)
+            }
+            Self::AccessDenied => BridgeOutcomeClass::Fatal(BridgeFatal::AccessDenied),
+            Self::InvalidRequest => BridgeOutcomeClass::Fatal(BridgeFatal::InvalidRequest),
+            Self::Internal => BridgeOutcomeClass::Fatal(BridgeFatal::Internal),
         }
     }
 }
@@ -97,7 +103,10 @@ pub struct Event {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DeadLetterReason {
     /// Fatal classifier from the outbound layer.
-    Fatal(FatalReason),
+    Fatal(BridgeFatal),
+    /// Unavailable classifier — the bridge or resource is closed and a
+    /// new handle is required.
+    Unavailable(BridgeUnavailable),
     /// Tina-side `CallError`: target was unknown, full, or closed
     /// before the call left the relay.
     CallError(String),
@@ -108,9 +117,9 @@ pub enum DeadLetterReason {
 pub enum RelayReply {
     /// Outbound accepted the event.
     Delivered { backend_id: String },
-    /// Transient — caller should retry under their own idempotency
+    /// Retryable — caller should retry under their own idempotency
     /// story. The relay does **not** retry on its own.
-    Retry { reason: TransientReason },
+    Retry { reason: BridgeRetryable },
     /// Will not succeed without input/setup change.
     DeadLetter { reason: DeadLetterReason },
     /// Reply to a `RelayMsg::Stats` call: typed counter snapshot.
@@ -311,9 +320,15 @@ impl Relay {
             }
             CallOutcome::Replied(Err(err)) => match err.classify() {
                 BridgeOutcomeClass::Succeeded => unreachable!(),
-                BridgeOutcomeClass::Transient(reason) => {
+                BridgeOutcomeClass::Retryable(reason) => {
                     self.stats.transient += 1;
                     RelayReply::Retry { reason }
+                }
+                BridgeOutcomeClass::Unavailable(reason) => {
+                    self.stats.dead_letter += 1;
+                    RelayReply::DeadLetter {
+                        reason: DeadLetterReason::Unavailable(reason),
+                    }
                 }
                 BridgeOutcomeClass::Fatal(reason) => {
                     self.stats.dead_letter += 1;
@@ -325,25 +340,25 @@ impl Relay {
             CallOutcome::Full => {
                 self.stats.transient += 1;
                 RelayReply::Retry {
-                    reason: TransientReason::BridgeFull,
+                    reason: BridgeRetryable::BridgeFull,
                 }
             }
             CallOutcome::Closed => {
-                self.stats.transient += 1;
-                RelayReply::Retry {
-                    reason: TransientReason::BridgeClosed,
+                self.stats.dead_letter += 1;
+                RelayReply::DeadLetter {
+                    reason: DeadLetterReason::Unavailable(BridgeUnavailable::BridgeClosed),
                 }
             }
             CallOutcome::Timeout => {
                 self.stats.transient += 1;
                 RelayReply::Retry {
-                    reason: TransientReason::CallerTimeout,
+                    reason: BridgeRetryable::CallerTimeout,
                 }
             }
             CallOutcome::Rejected(_) => {
                 self.stats.dead_letter += 1;
                 RelayReply::DeadLetter {
-                    reason: DeadLetterReason::Fatal(FatalReason::InvalidRequest),
+                    reason: DeadLetterReason::Fatal(BridgeFatal::InvalidRequest),
                 }
             }
         }

@@ -118,6 +118,7 @@ impl Isolate for ClientStub {
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<ClientMsg>;
+    type Fact = Infallible;
     type Shard = SpecimenShard;
 
     fn handle(
