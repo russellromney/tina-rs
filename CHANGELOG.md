@@ -50,6 +50,49 @@ This file records completed work.
   `ProtocolFact`, a protocol isolate emitting the wrong fact enum, and
   an isolate whose `Fact` type lacks `IntoRuntimeFact`.
 
+### Phase 110 Workflow Pending Ergonomics
+
+- `tina_runtime::sleep(d)` now returns a `SleepCall` wrapper. It forwards
+  `.then(...)` and `.then_with_request(...)` unchanged and adds
+  `.then_event(|| Msg::Wake)` so the user enum no longer needs a
+  `SleepReply`-shaped field for plain "wake me later" timers.
+  `then_event` is sleep-only: a non-timer `TypedCall<()>` (TCP close,
+  file ops, etc.) must keep using `.then(...)` so its error path stays
+  visible. A compile-fail doctest pins that rule.
+- `PendingReplies::park_request(key, RequestCall<'_, I>)` and
+  `PendingReplies::park_call(key, CallContext<'_, I>)` replace the copied
+  `try_insert(qid, call.into_request_context().into_deferred())`
+  ceremony. Admission is checked before caller authority is consumed, so
+  `Full` / `DuplicateKey` (and for `park_call`, `NoCaller` /
+  `CrossShardUnsupported`) return the original caller unchanged. Success
+  returns a `ParkTicket<K>` whose private slot/generation identity makes
+  forged tickets a compile error and stale-key ABA a runtime error.
+- `RequestCall::try_capture` and `CallContext::try_into_request_context`
+  added so park helpers can hand caller authority back without a panic.
+- `GuardedPendingReplies<K, R, G>` is the new sibling type that pairs a
+  parked caller with one RAII `G` guard. It removes the `PendingReplies +
+  HashMap<K, Guard>` sidecar pattern and proves the guard is dropped
+  exactly once on normal reply, drain, caller-gone sweep, and failed
+  admission.
+- `WaitList<K, R>` is the new many-callers-per-key parking lot in
+  `tina_runtime::wait_list`. Hard global cap, optional per-key cap, FIFO
+  per key, ticketed `reply_one`, and `reply_all_clone` /
+  `reply_all_with` / `close_all_clone` / `close_all_with` /
+  `drain_all_with` for multi-waiter replies.
+- `CancelableWork<K, Q, R>` in `tina_runtime::call` is the natural-key
+  bounded store for `PendingCancelableCall` tokens. Unlike
+  `PendingCancelableCallSet`, multiple live entries may share one key.
+  Admission returns a `WorkTicket<K>` so a stale completion against a
+  reused slot cannot remove a newer entry.
+- Every new helper exposes the same capacity surface
+  (`capacity / len / high_water / full_rejects / capacity_report`) and
+  takes `.named("service.helper")` so dashboards stay grep-friendly.
+- System migrations: `ergonomics_playground`, `system_cache_with_fill`,
+  `system_api_gateway_limits` (deletes its `HashMap<qid, SharedLease>`
+  sidecar), and `system_soak_http_db` (deletes both HTTP and DB
+  sidecars) now use the new helpers. Their existing smoke tests still
+  pass.
+
 ### Phase 109 Typed Config And Protocol-State Safety
 
 - Added the first split event/request service rail. The

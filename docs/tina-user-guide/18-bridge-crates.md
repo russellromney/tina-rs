@@ -600,3 +600,217 @@ list is the source of truth.
   let a request disappear, smooth a typed error into a generic one,
   or grow an unbounded queue, that's a bug — file it as a paper cut
   in `examples/FINDINGS.md`.
+
+## Bridge author kit
+
+This section is for someone adding the next SDK bridge. It pins the
+shared vocabulary every bridge implements and the test checklist a
+review will look for.
+
+### Lifecycle
+
+```
+                     install
+                        │
+                        ▼
+                ┌──────────────┐
+                │   Ready /    │
+                │   Failed     │ ───── install failed: caller gets
+                └──────┬───────┘       Err(InstallError); no handle.
+                       │
+              admit?   │
+        ┌────yes──┐    │   ┌──no──────┐
+        ▼         │    │   ▼          │
+   in-flight    rejected           Full / Closed
+   SDK call    (typed err)        (caller sees
+        │                          Retryable / Unavailable)
+        ▼
+   worker terminal     ◀── close()
+        │                       └─── closes admission,
+        ▼                            in-flight SDK keeps running
+   reply to caller
+   (or late_result if              ┌── close_and_drain(timeout)
+    caller already gave up)        └── waits for in-flight to drain
+                                       up to deadline; reports kinds
+                                       still in flight
+```
+
+Every bridge says the same boring things:
+
+- `install` — build worker, register on a Tina runtime, return a
+  typed install handle.
+- `ready` / `failed` — `install_*` returns `Result<InstalledXxxBridge,
+  InstallError>`. Failure is typed, not a panic.
+- `admit` / `full` — admission is bounded by `max_in_flight`. When the
+  cap is reached, the bridge replies `Full` immediately. It does not
+  queue.
+- `close admission` — `XxxCloser::close()` sets the closed flag.
+  Already-admitted SDK work continues; new admissions are rejected
+  with `Closed`.
+- `drain` — `XxxCloser::close_and_drain(timeout)` waits for in-flight
+  count to reach zero, then reports a typed `XxxDrainReport`.
+- `shutdown` — drop the runtime/handle that owns the bridge. The
+  bridge's Tokio runtime (if it owns one) is shut down in background;
+  callers' Tokio runtimes are never shut down by the bridge.
+- `late result` — when a caller deadline fires but the SDK call
+  continues, the worker still observes terminal completion. The
+  bridge increments a `late_results` counter and emits the result to
+  a sink that no one is listening on. The slot is released only on
+  worker terminal.
+- `metrics` — every bridge exposes a `XxxMetricsHandle` with
+  `snapshot()` for the typed counters.
+- `pressure` — every bridge exposes `XxxMetricsHandle::pressure_report()`
+  with the shared shape (capacity, current, high water, full,
+  timeout, closed, late, plus per-bridge extensions). The handle
+  stores the installed capacity itself: a caller cannot lie about it
+  by passing a fresh config to the metrics handle.
+
+### Close vs drain vs shutdown
+
+| What you call             | What happens                                     | When to use                      |
+| ------------------------- | ------------------------------------------------ | -------------------------------- |
+| `closer.close()`          | Admission flips closed. In-flight keeps running. | Stop taking new work; cheap.     |
+| `closer.close_and_drain`  | Closes, then waits up to `timeout` for drain.    | Graceful shutdown with deadline. |
+| drop the install          | Tokio runtime (if owned) shuts down background.  | Test teardown, app exit.         |
+
+The closer is cloneable and `Send`. The drain report names the kinds
+of operations still in flight so you can decide whether to give them
+more time or move on.
+
+### External work cancellation honesty
+
+The bridge cannot stop the outside system. When a Tina caller's
+`IsolateCall` deadline fires or the bridge's per-operation deadline
+fires:
+
+- Tina stops waiting.
+- The SDK future is **not** aborted. Aborting a Tokio task does not
+  prove that bytes already accepted by the HTTP client were cancelled.
+- The SDK eventually finishes. Worker-terminal metrics are tallied,
+  `late_results` increments, and the operation leaves the bridge's
+  in-flight set.
+
+If the call mutated remote state (`PutObject`, `Publish`, `UPDATE`),
+the mutation may have already happened. The bridge cannot prove
+otherwise. The caller's idempotency story decides what to do.
+
+### Worker-terminal vs caller-observed
+
+The bridge has two truths:
+
+- **Worker terminal** — the SDK round-trip finished, success or
+  classified failure. Counts roll into worker-terminal metrics.
+- **Caller observed** — the Tina reply slot received the outcome.
+
+These coincide when the caller is still listening. They diverge when
+the caller has given up (deadline, cancellation, bridge timeout).
+Then `worker_terminal_count` reflects what the bridge measured but
+`late_result_count` is the count the caller did not see.
+
+Bridges must not claim the caller observed an outcome they cannot
+prove was observed. When in doubt, attach a
+`BridgeCallerWarning::ExternalWorkMayContinue` to the reply or surface
+the late result through metrics.
+
+### Late-result truth
+
+When a deadline fires while SDK work is in flight:
+
+- The reply slot the caller is holding gets `CallOutcome::Timeout`
+  (or `Replied(Err(BridgeTimeout))` if it was the bridge's deadline).
+- The SDK future is dropped onto the bridge's runtime. When it
+  finishes, the bridge:
+  - increments `late_results`,
+  - decrements `in_flight_current`,
+  - records the typed terminal classification in a sink (or just
+    logs it).
+
+If the bridge cannot observe late terminal completion (rare; mostly
+fire-and-forget shapes), it must say so in docs and report
+`late_result_count = 0`. Silently rolling late events into "success"
+is wrong.
+
+### Pressure report shape
+
+Use the shared `BridgePressure` type from `tina_runtime::bridge` when
+exposing pressure across bridge boundaries (dashboards,
+`ServicePressureReport`). Each bridge crate ships a
+`From<XxxPressureReport> for BridgePressure` impl:
+
+```rust
+use tina_runtime::bridge::BridgePressure;
+
+let pg: BridgePressure = pg_metrics.pressure_report().into();
+report.add_measured("bridge", pg.capacity_surface(CapacityMode::Fixed));
+```
+
+`BridgePressure`'s fields are private. The only ways to construct
+one are `BridgePressure::measured(...)`, `BridgePressure::unavailable(
+name, reason)`, and the per-bridge `From` impls. This is on purpose:
+a forged literal would let a buggy adapter lie about installed
+capacity or rename a dashboard surface by typo.
+
+### Supplied-client ownership rule
+
+Each bridge ships two install paths:
+
+- `install_xxx(runtime, cfg)` — bridge owns its Tokio runtime *and*
+  SDK client. Bridge applies credentials, region, endpoint, retry,
+  HTTP/TLS.
+- `XxxWorker::with_supplied_client(cfg, client, runtime_handle)` —
+  caller supplies an SDK client *and* a Tokio runtime handle. Bridge
+  uses them as given and never touches credentials, region, endpoint,
+  or retry on this path. Bridge does **not** shut down the supplied
+  runtime.
+
+When wrapping a supplied client, the bridge reports
+`sdk_max_attempts = 0` because the SDK retry policy is caller-owned.
+Tina-side caps (`mailbox_capacity`, `max_in_flight`,
+`per_request_timeout`, request/response size caps) remain bridge-owned
+on both paths — they are not negotiable.
+
+### Classifier rule
+
+Every bridge ships a `XxxOutcomeExt::classify(...)` (or a
+`bridge_class()` projection on the per-bridge richer enum) that returns
+[`BridgeOutcomeClass`](../../tina-runtime/src/bridge.rs):
+
+- `Succeeded` — worker reached terminal `Ok`.
+- `Retryable(BridgeRetryable)` — caller may retry under their own
+  idempotency rules.
+- `Unavailable(BridgeUnavailable)` — bridge / pool / resource is
+  closed. Retrying on the same handle reproduces. Caller needs a new
+  handle.
+- `Fatal(BridgeFatal)` — request will not succeed without changing
+  inputs, permissions, schema, or code.
+
+Two anti-fog rules the classifier must uphold:
+
+1. `Closed` and `PoolClosed` go in `Unavailable`, **not** `Retryable`.
+2. The generic SDK-error wrapper (`Sdk(_)`) carries no retryable
+   metadata at this layer; classify it as `Fatal(SdkUnknown)`, not
+   `Retryable(SdkRetryable)`. Reserve `SdkRetryable` for cases where
+   typed SDK metadata explicitly says throttled / retryable.
+
+### Hermetic test checklist
+
+Every bridge should have:
+
+- Happy-path test that the worker accepts the typed request, the SDK
+  is called, the typed response comes back.
+- `Full` / `Closed` test that the closer flips admission and new
+  callers see the right typed outcome.
+- Caller-timeout test that produces a `late_result` and asserts the
+  count exactly once (no double-tally).
+- Drain test that closes mid-flight and confirms the drain report
+  names the in-flight kinds.
+- Classifier coverage of every typed error variant against the shared
+  `BridgeOutcomeClass`.
+- Pressure-report test that asserts the installed capacity (cannot be
+  faked by passing a fresh config to the metrics handle).
+- Late-result count visible when the bridge can observe late
+  completions; explicit `0` documented when it cannot.
+
+Use `BridgePressure::unavailable(name, reason)` when a bridge surface
+genuinely cannot be measured. Do not silently omit; the discovery
+line should always show what was measured and what was not.

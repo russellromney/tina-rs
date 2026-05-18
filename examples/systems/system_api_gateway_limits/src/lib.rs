@@ -9,7 +9,6 @@
 //! The specimen returns its discovery lines and a one-line summary
 //! so the smoke test can be copied into CI without modification.
 
-use std::collections::HashMap;
 use std::convert::Infallible;
 use std::sync::{Arc, Barrier, Mutex};
 use std::thread;
@@ -17,8 +16,8 @@ use std::time::Duration;
 
 use tina::{CallContext, prelude::*};
 use tina_runtime::{
-    CallOutcome, CapacitySummary, DefaultThreadedMailboxFactory, PendingReplies, ServiceHandle,
-    SharedCapacityScope, SharedLease, SharedScopeFull, SleepReply, ThreadedRuntime,
+    CallOutcome, CapacitySummary, DefaultThreadedMailboxFactory, GuardedPendingReplies,
+    ServiceHandle, SharedCapacityScope, SharedLease, SharedScopeFull, SleepReply, ThreadedRuntime,
     format_assertion_failure, format_discovery_line, sleep,
 };
 
@@ -119,8 +118,7 @@ struct Gateway {
     scope: SharedCapacityScope,
     upload_weight: usize,
     list_weight: usize,
-    pending: PendingReplies<u64, GatewayReply>,
-    leases: HashMap<u64, SharedLease>,
+    pending: GuardedPendingReplies<u64, GatewayReply, SharedLease>,
     next_qid: u64,
 }
 
@@ -158,9 +156,8 @@ impl Gateway {
             scope,
             upload_weight,
             list_weight,
-            pending: PendingReplies::with_capacity(pending_capacity)
+            pending: GuardedPendingReplies::with_capacity(pending_capacity)
                 .named("system_api_gateway_limits.pending"),
-            leases: HashMap::new(),
             next_qid: 1,
         }
     }
@@ -179,68 +176,67 @@ impl Gateway {
         call: CallContext<'_, Self>,
     ) -> Effect<Self> {
         let weight = self.weight_for(route);
-        match self.scope.try_admit(weight) {
-            Ok(lease) => {
-                let qid = self.next_qid;
-                self.next_qid += 1;
-                let slot = call.into_request_context().into_deferred();
-                if let Err(error) = self.pending.try_insert(qid, slot) {
-                    // PendingReplies refused. Release the lease so
-                    // the scope does not leak, and reply Full pointing
-                    // at pending (not the shared scope).
-                    drop(lease);
-                    return match error {
-                        tina_runtime::PendingRepliesInsertError::Full(_, slot) => reply_to(
-                            slot,
-                            GatewayReply::Full {
-                                filled: "gateway.pending".into(),
-                                requested: 1,
-                                current: self.pending.capacity(),
-                                max: self.pending.capacity(),
-                            },
-                        ),
-                        tina_runtime::PendingRepliesInsertError::DuplicateKey(_, slot) => reply_to(
-                            slot,
-                            GatewayReply::Full {
-                                filled: "gateway.duplicate".into(),
-                                requested: 1,
-                                current: 0,
-                                max: 0,
-                            },
-                        ),
-                    };
-                }
-                self.leases.insert(qid, lease);
-                sleep(hold).then(move |result| GatewayMsg::HoldDone { qid, route, result })
-            }
+        let lease = match self.scope.try_admit(weight) {
+            Ok(lease) => lease,
             Err(SharedScopeFull {
                 scope,
                 requested,
                 current,
                 max,
-            }) => call.reply(GatewayReply::Full {
-                filled: scope,
-                requested,
-                current,
-                max,
-            }),
+            }) => {
+                return call.reply(GatewayReply::Full {
+                    filled: scope,
+                    requested,
+                    current,
+                    max,
+                });
+            }
+        };
+
+        let qid = self.next_qid;
+        let next_qid = qid + 1;
+        match self.pending.park_call_guarded(qid, call, lease) {
+            Ok(_ticket) => {
+                self.next_qid = next_qid;
+                sleep(hold).then(move |result| GatewayMsg::HoldDone { qid, route, result })
+            }
+            Err(tina_runtime::GuardedParkCallError::Full { call, .. }) => {
+                // Lease drops automatically when the error is consumed.
+                let cap = self.pending.capacity();
+                call.reply(GatewayReply::Full {
+                    filled: "gateway.pending".into(),
+                    requested: 1,
+                    current: cap,
+                    max: cap,
+                })
+            }
+            Err(tina_runtime::GuardedParkCallError::DuplicateKey { call, .. })
+            | Err(tina_runtime::GuardedParkCallError::NoCaller { call, .. })
+            | Err(tina_runtime::GuardedParkCallError::CrossShardUnsupported { call, .. }) => {
+                call.reply(GatewayReply::Full {
+                    filled: "gateway.duplicate".into(),
+                    requested: 1,
+                    current: 0,
+                    max: 0,
+                })
+            }
         }
     }
 
     fn hold_done(&mut self, qid: u64, route: Route, _result: SleepReply) -> Effect<Self> {
-        // Drop the lease first so the scope reflects "free" before
-        // the caller wakes up. The lease may be missing if the
-        // request was somehow cancelled — release returns silently.
-        self.leases.remove(&qid);
-        let Some(slot) = self.pending.take(&qid) else {
+        // take_by_key drops the lease as the returned guard falls out of
+        // scope after we move it; reply_to drives the slot to settled.
+        let Some((slot, lease)) = self.pending.take_by_key(&qid) else {
             return noop();
         };
-        reply_to(
+        let effect = reply_to(
             slot,
             GatewayReply::Ok {
                 route: route.label(),
             },
-        )
+        );
+        drop(lease);
+        effect
     }
 }
 

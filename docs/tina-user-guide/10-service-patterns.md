@@ -291,13 +291,39 @@ one handler turn. Some shapes need to answer later:
 - bridge worker, many external requests in flight
 - fanout, aggregate after N partial results
 
-Capture the caller as a typed `DeferredReply<R>`, store it, answer
-later:
+Capture the caller, store it, answer later. The short way is `park`:
+
+```rust
+// Split-service request handler:
+match self.pending.park_request(req_id, call) {
+    Ok(_ticket) => start_work(req_id),
+    Err(ParkError::Full { call, .. }) => call.reply(MyReply::Full),
+    Err(ParkError::DuplicateKey { call, .. }) => call.reject(...),
+}
+
+// Plain handle_call:
+match self.pending.park_call(req_id, call) {
+    Ok(_ticket) => start_work(req_id),
+    Err(ParkCallError::Full { call, .. }) => call.reply(MyReply::Full),
+    Err(_) => unreachable!("monotonic key + local-only call"),
+}
+
+// Settle later:
+return self.pending.reply_ticket::<Self>(ticket, MyReply::Ok(value));
+```
+
+`park_request` / `park_call` check duplicate and capacity *before*
+consuming caller authority, so a `Full` or `DuplicateKey` rejection
+returns the original `RequestCall` / `CallContext` for an immediate
+typed reply. `ParkTicket` is move-only with private fields; user code
+cannot forge or duplicate one, and a stale ticket against a reused slot
+is rejected as `TakeParkedError::StaleTicket`.
+
+The lower-level key-only form still works as an escape hatch:
 
 ```rust
 let slot: DeferredReply<MyReply> = ctx.take_reply_slot()?;
 self.pending.try_insert(req_id, slot)?;
-// later turn:
 let slot = self.pending.take(&req_id).expect("slot for id");
 return reply_to(slot, MyReply::Ok(value));
 ```
@@ -435,6 +461,41 @@ let outcome = runtime.call_blocking(addr, MyMsg::Ping, Duration::from_secs(2))?;
 
 See `examples/systems/system_session_auth` for a real sharded
 specimen using `ThreadedMultiShardRuntime::call_blocking`.
+
+## Park, Wait, Guard, Cancel
+
+Four shapes show up in nearly every multi-turn service. Each has a
+bounded, ticketed helper:
+
+- **One caller, one key** — park the caller and reply later.
+  `PendingReplies::park_request` / `park_call`. Returns a `ParkTicket`.
+- **One caller, one key, plus an RAII guard** — park the caller and
+  hold a lease while it waits. `GuardedPendingReplies::park_request_guarded`.
+  Drops the guard exactly once on reply, drain, or caller-gone sweep.
+- **Many callers, one key** — single-flight cache, room broadcast,
+  scatter/gather. `WaitList::park` plus `reply_all_clone` /
+  `close_all_clone`. Has a global cap and an optional per-key cap; FIFO
+  per key.
+- **Cancelable work** — the caller is already parked by
+  `call_ctx.defer_cancelable(...)`, but the natural key has multiple
+  live entries. `CancelableWork::admit` returns a `WorkTicket` so a
+  stale completion against a reused slot cannot cancel a newer call.
+
+All four expose the same capacity surface: `capacity / len / high_water /
+full_rejects / capacity_report.named(...)`.
+
+## Timer Continuation
+
+For "wake me later with this event", use `then_event`:
+
+```rust
+sleep(delay).then_event(move || Msg::Wake { id })
+```
+
+`then_event` lives only on the value returned by `tina_runtime::sleep`.
+A non-timer `TypedCall<()>` (TCP close, file ops, signal wait) keeps
+returning `Result<(), CallError>` and must be consumed with `.then(...)`
+so the error path stays visible.
 
 ## Macro Rule
 

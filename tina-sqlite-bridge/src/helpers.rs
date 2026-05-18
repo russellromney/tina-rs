@@ -37,6 +37,7 @@ use std::time::Duration;
 use tina::Address;
 use tina::Effect;
 use tina::Isolate;
+use tina_runtime::bridge::{BridgeFatal, BridgeOutcomeClass, BridgeRetryable, BridgeUnavailable};
 use tina_runtime::{CallOutcome, IsolateCall, RuntimeCall, call};
 
 use crate::SqliteError;
@@ -403,12 +404,20 @@ pub trait SqliteOutcomeExt {
     type Success;
     /// Classify the outcome into Succeeded / Transient / Fatal.
     fn classify(self) -> SqliteOutcomeClass<Self::Success>;
+    /// Project the outcome into the shared bridge classifier
+    /// vocabulary ([`BridgeOutcomeClass`]). The typed success payload
+    /// is dropped; use [`Self::classify`] when you want both the typed
+    /// payload and the verbose error info.
+    fn bridge_class(&self) -> BridgeOutcomeClass;
 }
 
 impl SqliteOutcomeExt for SqliteCallOutcome {
     type Success = SqliteResponse;
     fn classify(self) -> SqliteOutcomeClass<SqliteResponse> {
         classify_inner(self, |resp| resp)
+    }
+    fn bridge_class(&self) -> BridgeOutcomeClass {
+        sqlite_bridge_class(self)
     }
 }
 
@@ -417,12 +426,69 @@ impl SqliteOutcomeExt for SqliteExecutedOutcome {
     fn classify(self) -> SqliteOutcomeClass<u64> {
         classify_inner(self, |rows_changed| rows_changed)
     }
+    fn bridge_class(&self) -> BridgeOutcomeClass {
+        sqlite_bridge_class(self)
+    }
 }
 
 impl SqliteOutcomeExt for SqliteRowsOutcome {
     type Success = SqliteRows;
     fn classify(self) -> SqliteOutcomeClass<SqliteRows> {
         classify_inner(self, |rows| rows)
+    }
+    fn bridge_class(&self) -> BridgeOutcomeClass {
+        sqlite_bridge_class(self)
+    }
+}
+
+/// Bridge-vocabulary projection for SQLite call outcomes.
+///
+/// Rules upheld at this layer (same as every other bridge):
+///
+/// - `CallOutcome::Closed` and `SqliteError::Closed` are
+///   [`BridgeUnavailable::BridgeClosed`], not retry fog. A closed
+///   handle stays closed.
+/// - `SqliteError::Busy` is [`BridgeRetryable::ServiceThrottled`] —
+///   SQLite asked us to back off; the caller may retry under their
+///   own idempotency story.
+/// - Constraint violations are [`BridgeFatal::InvalidRequest`].
+/// - Generic SQLite/io errors carry no retryable metadata at this
+///   layer, so they are [`BridgeFatal::SdkUnknown`].
+pub fn sqlite_bridge_class<T>(outcome: &CallOutcome<Result<T, SqliteError>>) -> BridgeOutcomeClass {
+    match outcome {
+        CallOutcome::Replied(Ok(_)) => BridgeOutcomeClass::Succeeded,
+        CallOutcome::Replied(Err(SqliteError::Busy)) => {
+            BridgeOutcomeClass::Retryable(BridgeRetryable::ServiceThrottled)
+        }
+        CallOutcome::Replied(Err(SqliteError::Timeout)) => {
+            BridgeOutcomeClass::Retryable(BridgeRetryable::BridgeTimeout)
+        }
+        CallOutcome::Replied(Err(SqliteError::Full)) => {
+            BridgeOutcomeClass::Retryable(BridgeRetryable::BridgeFull)
+        }
+        CallOutcome::Replied(Err(SqliteError::Closed)) => {
+            BridgeOutcomeClass::Unavailable(BridgeUnavailable::BridgeClosed)
+        }
+        CallOutcome::Replied(Err(SqliteError::InvalidRequest(_))) => {
+            BridgeOutcomeClass::Fatal(BridgeFatal::InvalidRequest)
+        }
+        CallOutcome::Replied(Err(SqliteError::ResponseTooLarge)) => {
+            BridgeOutcomeClass::Fatal(BridgeFatal::TooLarge)
+        }
+        CallOutcome::Replied(Err(SqliteError::Constraint(_))) => {
+            BridgeOutcomeClass::Fatal(BridgeFatal::InvalidRequest)
+        }
+        CallOutcome::Replied(Err(SqliteError::Io(_)))
+        | CallOutcome::Replied(Err(SqliteError::Sqlite(_))) => {
+            BridgeOutcomeClass::Fatal(BridgeFatal::SdkUnknown)
+        }
+        CallOutcome::Replied(Err(SqliteError::Internal(_))) => {
+            BridgeOutcomeClass::Fatal(BridgeFatal::Internal)
+        }
+        CallOutcome::Timeout => BridgeOutcomeClass::Retryable(BridgeRetryable::CallerTimeout),
+        CallOutcome::Full => BridgeOutcomeClass::Retryable(BridgeRetryable::BridgeFull),
+        CallOutcome::Closed => BridgeOutcomeClass::Unavailable(BridgeUnavailable::BridgeClosed),
+        CallOutcome::Rejected(_) => BridgeOutcomeClass::Fatal(BridgeFatal::InvalidRequest),
     }
 }
 

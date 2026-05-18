@@ -8,8 +8,8 @@ use tina::{
 };
 use tina_runtime::{
     CallGroup, CallGroupToken, CallOutcome, CallReplyRejectedReason, DeferredReplyRejectedReason,
-    PendingReplies, RuntimeCall, RuntimeEventKind, SleepReply, call, call_cancelable, cancel_call,
-    sleep,
+    PendingReplies, RuntimeCall, RuntimeEventKind, SleepReply, WaitList, WaitListCallError, call,
+    call_cancelable, cancel_call, request_effect_after_wait_park, sleep,
 };
 use tina_sim::{Simulator, SimulatorConfig};
 
@@ -73,9 +73,7 @@ impl Isolate for Provider {
 
     fn handle_call(&mut self, msg: Self::Message, call: CallContext<'_, Self>) -> Effect<Self> {
         match msg {
-            ProviderMsg::Quote => call
-                .defer(sleep(self.delay))
-                .reply(|req, sleep_reply| ProviderMsg::Done(req, sleep_reply)),
+            ProviderMsg::Quote => call.defer(sleep(self.delay)).reply(ProviderMsg::Done),
             ProviderMsg::Done(_, _) => call.reject(tina::CallRejectedReason::UnsupportedMessage),
         }
     }
@@ -453,20 +451,30 @@ impl Isolate for Batcher {
                 if self.closed {
                     return call.reply(BatchReply::Closed);
                 }
-                if self.pending.len() >= self.pending.capacity() {
-                    return call.reply(BatchReply::Full);
-                }
                 let qid = self.next_qid;
-                self.next_qid += 1;
-                self.pending
-                    .try_insert(qid, call.into_request_context().into_deferred())
-                    .expect("unique qid and pre-checked capacity");
-                self.values.push((qid, value));
-                if self.timer_armed {
-                    noop()
-                } else {
-                    self.timer_armed = true;
-                    sleep(self.window).then(BatcherMsg::Flush)
+                let next_qid = qid + 1;
+                match self.pending.park_call(qid, call) {
+                    Ok(_ticket) => {
+                        self.next_qid = next_qid;
+                        self.values.push((qid, value));
+                        if self.timer_armed {
+                            noop()
+                        } else {
+                            self.timer_armed = true;
+                            sleep(self.window).then(BatcherMsg::Flush)
+                        }
+                    }
+                    Err(tina_runtime::ParkCallError::Full { call, .. }) => {
+                        call.reply(BatchReply::Full)
+                    }
+                    Err(tina_runtime::ParkCallError::DuplicateKey { call, .. }) => {
+                        // qid is monotonic so duplicate is unreachable.
+                        call.reject(tina::CallRejectedReason::UnsupportedMessage)
+                    }
+                    Err(tina_runtime::ParkCallError::NoCaller { call, .. })
+                    | Err(tina_runtime::ParkCallError::CrossShardUnsupported { call, .. }) => {
+                        call.reject(tina::CallRejectedReason::UnsupportedMessage)
+                    }
                 }
             }
             BatcherMsg::Drain | BatcherMsg::Flush(_) => {
@@ -685,8 +693,7 @@ impl Isolate for Upstream {
         match msg {
             UpstreamMsg::Fetch => {
                 *self.calls.borrow_mut() += 1;
-                call.defer(sleep(self.delay))
-                    .reply(|req, sleep_reply| UpstreamMsg::Done(req, sleep_reply))
+                call.defer(sleep(self.delay)).reply(UpstreamMsg::Done)
             }
             UpstreamMsg::Done(_, _) => call.reject(tina::CallRejectedReason::UnsupportedMessage),
         }
@@ -704,8 +711,7 @@ struct Cache {
     key: &'static str,
     cached: Option<u64>,
     filling: bool,
-    pending: PendingReplies<u64, CacheReply>,
-    next_qid: u64,
+    waiters: WaitList<&'static str, CacheReply>,
     upstream: Address<UpstreamMsg, FillReply>,
 }
 
@@ -728,12 +734,17 @@ impl Isolate for Cache {
             CacheMsg::FillReturned(CallOutcome::Replied(FillReply(value))) => {
                 self.filling = false;
                 self.cached = Some(value);
-                self.pending
-                    .drain_replies_with_into_effect(move |_| CacheReply::Hit(value))
+                Effect::Batch(
+                    self.waiters
+                        .reply_all_with::<Self, _>(&self.key, || CacheReply::Hit(value)),
+                )
             }
             CacheMsg::FillReturned(_) => {
                 self.filling = false;
-                self.pending.drain_replies_into_effect(CacheReply::Full)
+                Effect::Batch(
+                    self.waiters
+                        .close_all_clone::<Self>(&self.key, CacheReply::Full),
+                )
             }
         }
     }
@@ -745,21 +756,23 @@ impl Isolate for Cache {
                 if let Some(value) = self.cached {
                     return call_ctx.reply(CacheReply::Hit(value));
                 }
-                if self.pending.len() >= self.pending.capacity() {
-                    return call_ctx.reply(CacheReply::Full);
-                }
-
-                let qid = self.next_qid;
-                self.next_qid += 1;
-                self.pending
-                    .try_insert(qid, call_ctx.into_request_context().into_deferred())
-                    .expect("unique qid and pre-checked capacity");
-                if self.filling {
-                    noop()
-                } else {
-                    self.filling = true;
-                    call(self.upstream, UpstreamMsg::Fetch, CALL_TIMEOUT)
-                        .then(CacheMsg::FillReturned)
+                match self.waiters.park_call(self.key, call_ctx) {
+                    Ok(ticket) => {
+                        if self.filling {
+                            request_effect_after_wait_park(&ticket, noop()).into_effect()
+                        } else {
+                            self.filling = true;
+                            let effect = call(self.upstream, UpstreamMsg::Fetch, CALL_TIMEOUT)
+                                .then(CacheMsg::FillReturned);
+                            request_effect_after_wait_park(&ticket, effect).into_effect()
+                        }
+                    }
+                    Err(WaitListCallError::Full { call, .. })
+                    | Err(WaitListCallError::KeyFull { call, .. }) => call.reply(CacheReply::Full),
+                    Err(WaitListCallError::NoCaller { call, .. })
+                    | Err(WaitListCallError::CrossShardUnsupported { call, .. }) => {
+                        call.reject(tina::CallRejectedReason::UnsupportedMessage)
+                    }
                 }
             }
             CacheMsg::FillReturned(_) => {
@@ -826,8 +839,7 @@ pub fn run_single_flight_cache_probe() -> anyhow::Result<CacheFillReport> {
         key: "price:alpaca",
         cached: None,
         filling: false,
-        pending: PendingReplies::with_capacity(3).named("ergonomics.cache.pending"),
-        next_qid: 1,
+        waiters: WaitList::with_capacity(3).named("ergonomics.cache.waiters"),
         upstream,
     });
     let replies = Rc::new(RefCell::new(Vec::new()));
@@ -861,8 +873,8 @@ pub fn run_single_flight_cache_probe() -> anyhow::Result<CacheFillReport> {
         upstream_calls: *upstream_calls.borrow(),
         values,
         rough_edges: vec![
-            "single-flight is a natural Tina shape but wants a keyed waiter helper",
-            "manual handle_call capture repeats the same PendingReplies ceremony",
+            "single-flight is a natural Tina shape once WaitList owns the parked callers",
+            "the service still names the fill-in-flight state and late fill policy",
         ],
     })
 }
