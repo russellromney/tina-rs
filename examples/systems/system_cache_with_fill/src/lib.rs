@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use tina::{CallContext, prelude::*};
 use tina_runtime::{
-    CallOutcome, DefaultThreadedMailboxFactory, PendingReplies, ServiceHandle, SleepReply,
+    CallOutcome, DefaultThreadedMailboxFactory, PendingReplies, SleepReply, SplitServiceHandle,
     ThreadedRuntime, sleep,
 };
 
@@ -89,17 +89,21 @@ pub enum ValueSource {
 }
 
 #[derive(Debug)]
-enum CacheMsg {
+enum CacheEvent {
+    FillDone {
+        key: String,
+        generation: u64,
+        result: SleepReply,
+    },
+}
+
+#[derive(Debug)]
+enum CacheRequest {
     Get {
         key: String,
     },
     Invalidate {
         key: String,
-    },
-    FillDone {
-        key: String,
-        generation: u64,
-        result: SleepReply,
     },
     Stats,
 }
@@ -131,16 +135,15 @@ struct Cache {
     stale_replies: usize,
 }
 
-#[tina_runtime::isolate(message = CacheMsg, reply = CacheReply)]
+#[tina_runtime::isolate(event = CacheEvent, request = CacheRequest, reply = CacheReply)]
 impl Cache {
-    fn handle(
+    fn handle_event(
         &mut self,
-        msg: CacheMsg,
+        event: CacheEvent,
         _ctx: &mut Context<'_, SingleShard, Self::Reply>,
     ) -> Effect<Self> {
-        match msg {
-            CacheMsg::Get { .. } | CacheMsg::Invalidate { .. } | CacheMsg::Stats => noop(),
-            CacheMsg::FillDone {
+        match event {
+            CacheEvent::FillDone {
                 key,
                 generation,
                 result,
@@ -148,12 +151,11 @@ impl Cache {
         }
     }
 
-    fn handle_call(&mut self, msg: CacheMsg, call: CallContext<'_, Self>) -> Effect<Self> {
-        match msg {
-            CacheMsg::Get { key } => self.get(key, call),
-            CacheMsg::Invalidate { key } => self.invalidate(key, call),
-            CacheMsg::Stats => call.reply(CacheReply::Stats(self.stats())),
-            CacheMsg::FillDone { .. } => call.reject(tina::CallRejectedReason::UnsupportedMessage),
+    fn handle_request(&mut self, request: CacheRequest, call: CallContext<'_, Self>) -> Effect<Self> {
+        match request {
+            CacheRequest::Get { key } => self.get(key, call),
+            CacheRequest::Invalidate { key } => self.invalidate(key, call),
+            CacheRequest::Stats => call.reply(CacheReply::Stats(self.stats())),
         }
     }
 }
@@ -213,10 +215,12 @@ impl Cache {
             qids: vec![qid],
         });
         self.fills_started += 1;
-        sleep(self.fill_delay).then(move |result| CacheMsg::FillDone {
-            key,
-            generation,
-            result,
+        sleep(self.fill_delay).then(move |result| {
+            tina::ServiceMessage::Event(CacheEvent::FillDone {
+                key,
+                generation,
+                result,
+            })
         })
     }
 
@@ -337,9 +341,9 @@ pub fn run_single_flight(config: RunConfig) -> anyhow::Result<SingleFlightReport
         let out = Arc::clone(&outcomes);
         threads.push(thread::spawn(move || {
             gate.wait();
-            let outcome = rt.call_blocking_typed(
-                cache.call,
-                CacheMsg::Get {
+            let outcome = rt.call_blocking_request(
+                cache.requests,
+                CacheRequest::Get {
                     key: "shared".into(),
                 },
                 timeout,
@@ -368,9 +372,9 @@ pub fn run_single_flight(config: RunConfig) -> anyhow::Result<SingleFlightReport
     }
 
     let hit_after_fill = matches!(
-        runtime.call_blocking_typed(
-            cache.call,
-            CacheMsg::Get {
+        runtime.call_blocking_request(
+            cache.requests,
+            CacheRequest::Get {
                 key: "shared".into()
             },
             timeout
@@ -380,7 +384,7 @@ pub fn run_single_flight(config: RunConfig) -> anyhow::Result<SingleFlightReport
             ..
         })
     );
-    let stats = stats(&runtime, cache.call)?;
+    let stats = stats(&runtime, cache.requests)?;
     shutdown(runtime);
 
     Ok(SingleFlightReport {
@@ -402,11 +406,11 @@ pub fn run_stale_invalidation(config: RunConfig) -> anyhow::Result<StaleInvalida
     let timeout = Duration::from_millis(config.call_timeout_ms);
 
     let rt = Arc::clone(&runtime);
-    let cache_call = cache.call;
+    let cache_call = cache.requests;
     let first = thread::spawn(move || {
-        rt.call_blocking_typed(
+        rt.call_blocking_request(
             cache_call,
-            CacheMsg::Get {
+            CacheRequest::Get {
                 key: "invalidate-me".into(),
             },
             timeout,
@@ -414,9 +418,9 @@ pub fn run_stale_invalidation(config: RunConfig) -> anyhow::Result<StaleInvalida
     });
 
     thread::sleep(Duration::from_millis((config.fill_ms / 4).max(1)));
-    let _ = runtime.call_blocking_typed(
-        cache.call,
-        CacheMsg::Invalidate {
+    let _ = runtime.call_blocking_request(
+        cache.requests,
+        CacheRequest::Invalidate {
             key: "invalidate-me".into(),
         },
         timeout,
@@ -429,9 +433,9 @@ pub fn run_stale_invalidation(config: RunConfig) -> anyhow::Result<StaleInvalida
 
     thread::sleep(Duration::from_millis(config.fill_ms + 20));
     let replacement_filled = matches!(
-        runtime.call_blocking_typed(
-            cache.call,
-            CacheMsg::Get {
+        runtime.call_blocking_request(
+            cache.requests,
+            CacheRequest::Get {
                 key: "invalidate-me".into()
             },
             timeout
@@ -441,7 +445,7 @@ pub fn run_stale_invalidation(config: RunConfig) -> anyhow::Result<StaleInvalida
             ..
         })
     );
-    let stats = stats(&runtime, cache.call)?;
+    let stats = stats(&runtime, cache.requests)?;
     shutdown(runtime);
 
     Ok(StaleInvalidationReport {
@@ -454,9 +458,9 @@ pub fn run_stale_invalidation(config: RunConfig) -> anyhow::Result<StaleInvalida
 fn register_cache(
     runtime: &ThreadedRuntime<SingleShard, DefaultThreadedMailboxFactory>,
     config: RunConfig,
-) -> anyhow::Result<ServiceHandle<CacheMsg, CacheReply>> {
+) -> anyhow::Result<SplitServiceHandle<CacheEvent, CacheRequest, CacheReply>> {
     runtime
-        .register_service::<_, Infallible>(
+        .register_split_service::<Cache, CacheEvent, CacheRequest, Infallible>(
             Cache::new(
                 config.pending_capacity,
                 Duration::from_millis(config.fill_ms),
@@ -468,9 +472,9 @@ fn register_cache(
 
 fn stats(
     runtime: &ThreadedRuntime<SingleShard, DefaultThreadedMailboxFactory>,
-    cache: tina::CallAddress<CacheMsg, CacheReply>,
+    cache: tina::ServiceRequestAddress<CacheEvent, CacheRequest, CacheReply>,
 ) -> anyhow::Result<CacheStats> {
-    match runtime.call_blocking_typed(cache, CacheMsg::Stats, Duration::from_secs(1))? {
+    match runtime.call_blocking_request(cache, CacheRequest::Stats, Duration::from_secs(1))? {
         CallOutcome::Replied(CacheReply::Stats(stats)) => Ok(stats),
         other => anyhow::bail!("stats failed: {other:?}"),
     }

@@ -686,6 +686,27 @@ where
         }
     }
 
+    /// Attempts one public event send through a split-service event
+    /// capability.
+    ///
+    /// This is the threaded host companion to [`tina::send_event`]. It avoids
+    /// the raw `ServiceMessage<Event, Request>` escape hatch in copied tests
+    /// and setup code.
+    pub fn try_send_event<Event, Request>(
+        &self,
+        address: tina::ServiceEventAddress<Event, Request>,
+        event: Event,
+    ) -> Result<(), ThreadedTrySendError>
+    where
+        Event: Send + 'static,
+        Request: Send + 'static,
+    {
+        self.try_send(
+            address.address().address(),
+            tina::ServiceMessage::Event(event),
+        )
+    }
+
     /// Attempts one typed ingress send and waits for the worker to observe the
     /// target mailbox outcome.
     ///
@@ -1159,6 +1180,29 @@ where
         R: Send + 'static,
     {
         self.call_blocking(address.address(), message, timeout)
+    }
+
+    /// Blocking host call through a split-service request capability.
+    ///
+    /// This is the threaded host companion to [`crate::call_request`]. It
+    /// wraps the request in [`tina::ServiceMessage::Request`] and keeps host
+    /// code from reaching for the raw split envelope address.
+    pub fn call_blocking_request<Event, Request, Reply>(
+        &self,
+        address: tina::ServiceRequestAddress<Event, Request, Reply>,
+        request: Request,
+        timeout: Duration,
+    ) -> Result<CallOutcome<Reply>, ThreadedRuntimeError>
+    where
+        Event: Send + 'static,
+        Request: Send + 'static,
+        Reply: Send + 'static,
+    {
+        self.call_blocking(
+            address.address().address(),
+            tina::ServiceMessage::Request(request),
+            timeout,
+        )
     }
 
     /// Returns a cloneable handle that controls runtime-level shutdown

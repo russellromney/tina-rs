@@ -411,23 +411,14 @@ fn split_service_threaded_runtime_routes_request_lane() {
         )
         .expect("register split service");
 
-    // The current host-thread path still uses the raw address escape hatch for
-    // event injection. Service-to-service code uses `tina::send_event`, tested
-    // above. This keeps the threaded proof honest about what users can do
-    // today.
+    // Host code has the same capability-shaped lane helpers as isolate code:
+    // no raw `ServiceMessage` envelope is needed on the copied path.
     runtime
-        .try_send(
-            handle.events.address().address(),
-            tina::ServiceMessage::Event(SplitEvent::Filled(55)),
-        )
+        .try_send_event(handle.events, SplitEvent::Filled(55))
         .expect("send event");
 
     let outcome = runtime
-        .call_blocking(
-            handle.requests.address().address(),
-            tina::ServiceMessage::Request(SplitRequest::Read),
-            Duration::from_secs(1),
-        )
+        .call_blocking_request(handle.requests, SplitRequest::Read, Duration::from_secs(1))
         .expect("call request");
 
     assert_eq!(outcome, CallOutcome::Replied(SplitReply(55)));
@@ -435,7 +426,7 @@ fn split_service_threaded_runtime_routes_request_lane() {
 }
 
 #[test]
-fn split_service_raw_request_on_send_lane_is_noop_escape_hatch() {
+fn split_service_raw_request_on_send_lane_is_visible_reject_escape_hatch() {
     let mut runtime = Runtime::new(SingleShard, DefaultMailboxFactory);
     let handle: SplitServiceHandle<SplitEvent, SplitRequest, SplitReply> = runtime
         .register_split_service::<SplitService, SplitEvent, SplitRequest, Infallible>(
@@ -444,10 +435,7 @@ fn split_service_raw_request_on_send_lane_is_noop_escape_hatch() {
         );
 
     runtime
-        .try_send(
-            handle.events.address().address(),
-            tina::ServiceMessage::Event(SplitEvent::Filled(11)),
-        )
+        .try_send_event(handle.events, SplitEvent::Filled(11))
         .expect("event accepted");
     while runtime.step() > 0 {}
 
@@ -458,6 +446,18 @@ fn split_service_raw_request_on_send_lane_is_noop_escape_hatch() {
         )
         .expect("raw request accepted on erased send lane");
     while runtime.step() > 0 {}
+
+    assert!(
+        runtime.trace().iter().any(|event| {
+            matches!(
+                event.kind(),
+                tina_runtime::RuntimeEventKind::EffectObserved {
+                    effect: tina_runtime::EffectKind::Reject,
+                }
+            )
+        }),
+        "raw request sent through the event/send lane should leave visible reject trace",
+    );
 
     let client_addr = runtime.register_with_capacity::<SplitClient, Infallible>(SplitClient, 8);
     let waiter = runtime

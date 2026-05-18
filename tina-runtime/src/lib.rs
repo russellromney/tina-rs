@@ -1310,6 +1310,23 @@ where
         }
     }
 
+    /// Attempts to enqueue one public event through a split-service event
+    /// capability.
+    ///
+    /// This is the host/runtime companion to [`tina::send_event`]. It keeps
+    /// tests and setup code on the capability-typed path instead of unwrapping
+    /// the raw `ServiceMessage<Event, Request>` address.
+    pub fn try_send_event<Event: 'static, Request: 'static>(
+        &self,
+        address: tina::ServiceEventAddress<Event, Request>,
+        event: Event,
+    ) -> Result<(), TrySendError<tina::ServiceMessage<Event, Request>>> {
+        self.try_send(
+            address.address().address(),
+            tina::ServiceMessage::Event(event),
+        )
+    }
+
     /// Configures a registered isolate as supervisor for its direct children.
     ///
     /// This is a setup-time runtime API. Unknown, stale, or cross-shard parent

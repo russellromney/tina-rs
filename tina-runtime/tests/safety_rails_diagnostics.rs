@@ -23,6 +23,8 @@ fn diagnostic_phrases_are_pinned() {
     cases.compile_fail("tests/safety_rails_compile_fail/split_missing_handle_event.rs");
     cases.compile_fail("tests/safety_rails_compile_fail/split_missing_handle_request.rs");
     cases.compile_fail("tests/safety_rails_compile_fail/split_send_only.rs");
+    cases.compile_fail("tests/safety_rails_compile_fail/split_request_ignores_call.rs");
+    cases.compile_fail("tests/safety_rails_compile_fail/split_private_internal_event.rs");
     cases.compile_fail("tests/safety_rails_compile_fail/split_request_on_event_lane.rs");
     cases.compile_fail("tests/safety_rails_compile_fail/split_event_on_request_lane.rs");
 }

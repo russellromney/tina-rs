@@ -6,7 +6,7 @@
 //! behavior explicit in the handler body.
 
 use proc_macro::TokenStream;
-use quote::quote;
+use quote::{ToTokens, quote};
 use syn::parse::{Parse, ParseStream};
 use syn::{
     Error, FnArg, Ident, ImplItem, ImplItemFn, ItemImpl, Pat, Path, Result, ReturnType, Token,
@@ -256,10 +256,12 @@ fn build_isolate(
             validate_handler(&event_method, "handle_event", "event", "ctx")?;
         let (request_attrs, request_name, call_name, request_body) =
             validate_call_handler(&request_method, "handle_request", "request", "call")?;
+        require_call_authority_mentioned(&request_body, &call_name)?;
         let event_attrs = event_method.attrs.clone();
         let event_body = Box::new(event_method.block.clone());
         let handle_call_tokens = quote! {
             #(#request_attrs)*
+            #[deny(unused_variables)]
             fn handle_call(
                 &mut self,
                 msg: Self::Message,
@@ -276,7 +278,9 @@ fn build_isolate(
         let body = syn::parse_quote!({
             match #event_name {
                 ::tina::ServiceMessage::Event(#event_name) => #event_body,
-                ::tina::ServiceMessage::Request(_) => ::tina::noop(),
+                ::tina::ServiceMessage::Request(_) => {
+                    ::tina::reject(::tina::CallRejectedReason::UnsupportedMessage)
+                }
             }
         });
         (
@@ -524,6 +528,24 @@ fn validate_call_handler(
         msg_name,
         call_name,
         Box::new(handle_call.block.clone()),
+    ))
+}
+
+fn require_call_authority_mentioned(body: &syn::Block, call_name: &syn::Ident) -> Result<()> {
+    let needle = call_name.to_string();
+    let body_tokens = body.to_token_stream().to_string();
+    if body_tokens
+        .split(|ch: char| !(ch == '_' || ch.is_ascii_alphanumeric()))
+        .any(|token| token == needle)
+    {
+        return Ok(());
+    }
+
+    Err(Error::new_spanned(
+        body,
+        format!(
+            "split `handle_request` must use caller authority `{needle}`; reply, reject, or defer it"
+        ),
     ))
 }
 

@@ -21,8 +21,22 @@ This file records completed work.
 - Added `tina::send_event(...)` and `tina_runtime::call_request(...)`.
   The copied path now rejects the two common lane mistakes at compile time:
   requests cannot be sent as events, and events cannot be called as requests.
-- Added positive runtime proof in `tina-runtime/tests/safety_rails.rs` and
-  trybuild diagnostics for both split-lane mistakes.
+- Added host/runtime companions:
+  `Runtime::try_send_event`, `ThreadedRuntime::try_send_event`, and
+  `ThreadedRuntime::call_blocking_request`, so threaded tests and setup code
+  do not need to unwrap split handles into raw `ServiceMessage` addresses.
+- Changed split-service raw request-on-event handling from silent `Noop` to a
+  visible `Reject(UnsupportedMessage)` effect. The request handler is still
+  not run; the trace now records the wrong-lane escape hatch.
+- Added positive runtime/threaded proof in `tina-runtime/tests/safety_rails.rs`
+  and trybuild diagnostics for split-lane mistakes, invalid split macro
+  options, missing split handlers, private internal events, and a split request
+  handler that ignores caller authority.
+- Migrated `examples/systems/system_cache_with_fill` to split public requests
+  plus private internal fill events and `call_blocking_request`.
+- Confirmed `examples/systems/system_job_queue` as the cancelable deferred
+  admission proof: `defer_cancelable(...).try_admit(...)` only returns the
+  child effect after `PendingCancelableCallSet` accepts the token.
 - Documented the split event/request copied path in
   `docs/tina-user-guide/04-request-reply.md`.
 

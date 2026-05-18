@@ -151,6 +151,13 @@ tina::send_event(cache.events, CacheEvent::FillDone { key });
 tina_runtime::call_request(cache.requests, CacheRequest::Get { key }, timeout);
 ```
 
+From host-thread code:
+
+```rust
+runtime.try_send_event(cache.events, CacheEvent::FillDone { key })?;
+runtime.call_blocking_request(cache.requests, CacheRequest::Get { key }, timeout)?;
+```
+
 The compiler rejects the two common wrong shapes:
 
 ```text
@@ -164,12 +171,13 @@ using the escape hatch. The escape hatch has boring runtime truth:
 
 ```text
 raw Event sent on the call lane -> Rejected(UnsupportedMessage)
-raw Request sent on the send/event lane -> ignored by the event handler
+raw Request sent on the send/event lane -> visible Reject effect; request handler is not run
 ```
 
 That second case is why copied app code should keep the event/request
 capabilities instead of passing raw envelope addresses around. A send has no
-caller to reject, so the compiler rail is the safety feature.
+caller to reject, so the compiler rail is the safety feature. The runtime trace
+still records that the raw wrong-lane path returned `Reject`.
 
 ## Deferred Reply
 
