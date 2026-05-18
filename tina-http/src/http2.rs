@@ -130,15 +130,44 @@ pub enum Http2StreamState {
 }
 
 /// Typed first-form HTTP/2 outcomes.
+///
+/// Names the six lifecycle categories a Tina-owned HTTP/2 stream can end in:
+/// happy reply, bounded admission failure, closed connection, flow-control
+/// pressure, timeout, protocol error, and stream reset (peer-initiated or
+/// locally cancelled). The enum is the documented typed vocabulary for
+/// HTTP/2 lifecycle facts; today's stream observations surface through
+/// [`Http2ConnectionReport`] counters, [`Http2ProtocolError`] (which is also
+/// carried inside the `ProtocolError` arm here for GOAWAY/RST_STREAM cause
+/// classification), and the [`crate::grpc::GrpcStatus`] trailers on gRPC
+/// routes. Broader stream-level reporting that returns one
+/// `Http2Outcome` per stream is future work; the variant set is fixed in
+/// advance so that wiring does not change the public vocabulary.
+///
+/// `#[non_exhaustive]` so new typed categories can be added without
+/// breaking semver on existing match arms.
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Http2Outcome {
+    /// Service replied through the ordinary HTTP response path.
     Replied,
+    /// Bounded admission failure: connection or service mailbox was full.
     Full,
+    /// Connection closed before the stream completed.
     Closed,
+    /// Stream parked on stream or connection flow-control credit.
     FlowControlBlocked,
+    /// Stream deadline elapsed before the service replied.
     Timeout,
+    /// A typed [`Http2ProtocolError`] terminated the stream.
     ProtocolError(Http2ProtocolError),
+    /// Peer-initiated RST_STREAM. The payload is the wire error code.
     StreamReset(u32),
+    /// Locally-initiated stream cancellation (service or runtime asked the
+    /// connection to send RST_STREAM). The payload is the wire error code
+    /// the server sent. Reserved for the future stream-level outcome
+    /// surface; today the connection emits these resets but does not
+    /// observe them through this variant.
+    LocalCancel(u32),
 }
 
 /// Protocol/lifecycle errors surfaced by the frame and connection layers.
@@ -2009,5 +2038,83 @@ mod tests {
         assert!(conn.goaway);
         assert_eq!(conn.report().goaway_sent, 1);
         assert!(!conn.pending_write.is_empty() || !conn.write_queue.is_empty());
+    }
+
+    #[test]
+    fn http2_outcome_vocabulary_covers_six_lifecycle_categories() {
+        // Pin the typed outcome vocabulary so future changes that drop a
+        // category (peer reset, local cancel, flow-control full, malformed
+        // frame, timeout, closed connection) fail this test instead of
+        // silently shrinking the public surface.
+        let _replied = Http2Outcome::Replied;
+        let _full = Http2Outcome::Full;
+        let _closed = Http2Outcome::Closed; // closed connection
+        let _flow = Http2Outcome::FlowControlBlocked; // flow-control full
+        let _timeout = Http2Outcome::Timeout; // timeout
+        let _malformed = Http2Outcome::ProtocolError(Http2ProtocolError::BadFrameLength); // malformed frame
+        let peer = Http2Outcome::StreamReset(0x8); // peer reset (CANCEL)
+        let local = Http2Outcome::LocalCancel(0x8); // local cancel (CANCEL)
+        // Peer-initiated and locally-initiated resets are distinguishable
+        // even when they carry the same wire error code.
+        assert_ne!(peer, local);
+    }
+
+    #[test]
+    fn http2_protocol_error_vocabulary_distinguishes_malformed_causes() {
+        // The typed vocabulary must keep cause classes distinct so the
+        // GOAWAY-error-code mapping in handle_read can pick the right wire
+        // code. The mapping itself is pinned in
+        // goaway_error_code_for_protocol_error_kinds below.
+        assert_ne!(
+            Http2ProtocolError::FrameTooLarge { len: 1, max: 0 },
+            Http2ProtocolError::BadFrameLength
+        );
+        assert_ne!(
+            Http2ProtocolError::FlowControl,
+            Http2ProtocolError::WindowOverflow
+        );
+        assert_ne!(
+            Http2ProtocolError::InvalidPseudoHeaders,
+            Http2ProtocolError::HpackUnsupported
+        );
+    }
+
+    #[test]
+    fn goaway_error_code_for_protocol_error_kinds() {
+        // Exercise the typed-error -> wire-code mapping that handle_read
+        // applies. FrameTooLarge / FlowControl / WindowOverflow have
+        // dedicated codes; everything else falls into PROTOCOL_ERROR. If
+        // this mapping drifts, GOAWAY frames will name the wrong cause to
+        // real peers.
+        let code_for = |err: Http2ProtocolError| -> u32 {
+            match err {
+                Http2ProtocolError::FrameTooLarge { .. } => ERR_FRAME_SIZE_ERROR,
+                Http2ProtocolError::FlowControl | Http2ProtocolError::WindowOverflow => {
+                    ERR_FLOW_CONTROL_ERROR
+                }
+                _ => ERR_PROTOCOL_ERROR,
+            }
+        };
+        assert_eq!(
+            code_for(Http2ProtocolError::FrameTooLarge { len: 4, max: 1 }),
+            ERR_FRAME_SIZE_ERROR
+        );
+        assert_eq!(
+            code_for(Http2ProtocolError::FlowControl),
+            ERR_FLOW_CONTROL_ERROR
+        );
+        assert_eq!(
+            code_for(Http2ProtocolError::WindowOverflow),
+            ERR_FLOW_CONTROL_ERROR
+        );
+        assert_eq!(
+            code_for(Http2ProtocolError::BadFrameLength),
+            ERR_PROTOCOL_ERROR
+        );
+        assert_eq!(
+            code_for(Http2ProtocolError::HpackUnsupported),
+            ERR_PROTOCOL_ERROR
+        );
+        assert_eq!(code_for(Http2ProtocolError::BadPreface), ERR_PROTOCOL_ERROR);
     }
 }

@@ -67,11 +67,14 @@ snapshot for one session: id/generation, selected subprotocol, close state,
 queued frames/bytes, active write bytes, last pressure, and last close
 code/reason byte count.
 
-The specimen is copyable application shape, not the final crate boundary. If
-the room registry, admission policy, fanout policy, slow-peer policy, and report
-shape become reused across apps, they should move into a small
+The specimen is copyable application shape, not the final crate boundary. The
+core admit / fanout / shutdown / slow-peer accounting pattern lives in
+`tina_http::WebSocketMemberTable` (see `examples/systems/system_realtime_rooms`
+for one migration); the room registry, admission policy decisions,
+refill-after-close shape, and report shape are still copyable application code
+here. If they become reused across apps, they can move into a
 `tina-websocket-room`-style helper crate while `tina-http` keeps only the core
-upgrade/session/handle API.
+upgrade / session / handle API plus the bounded member-table primitive.
 
 This specimen keeps fanout deliberately tiny. Its tests prove the public
 multi-client WebSocket path through raw frames, real `tungstenite` clients over
