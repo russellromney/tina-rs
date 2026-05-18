@@ -3389,7 +3389,7 @@ where
         let config = self.supervisors[supervisor_index].config;
         let policy = config.policy();
         let budget_state = self.supervisors[supervisor_index].budget_state;
-        let budget_state = match budget_state.record_restart() {
+        let budget_state = match budget_state.record_restart_at(self.clock.now()) {
             Ok(next) => next,
             Err(error) => {
                 self.push_event(
