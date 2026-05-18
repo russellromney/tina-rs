@@ -396,6 +396,46 @@ fn service_macro_accepts_renamed_dependency_paths() {
 }
 
 #[test]
+fn service_macro_renamed_paths_build_client_request_with_alias_types() {
+    #[service(tina_crate = renamed_tina, rpc_crate = renamed_tina_rpc)]
+    #[allow(dead_code)]
+    pub trait RenamedClientOnly {
+        fn add(&self, a: u8, b: u8) -> u8;
+    }
+
+    let request: renamed_tina_rpc::ClientRequest = RenamedClientOnlyClient::add_request(
+        2,
+        5,
+        Duration::from_secs(1),
+        77,
+        fake_reply_to(),
+        1024,
+    )
+    .expect("encode request through renamed macro paths");
+
+    assert_eq!(request.service, "RenamedClientOnly");
+    assert_eq!(request.method, "add");
+    assert_eq!(request.correlator, 77);
+    assert_eq!(request.payload, b"[2,5]");
+}
+
+#[test]
+fn service_macro_renamed_paths_decode_errors_use_rpc_alias_type() {
+    #[service(tina_crate = renamed_tina, rpc_crate = renamed_tina_rpc)]
+    #[allow(dead_code)]
+    pub trait RenamedDecode {
+        fn get(&self) -> u8;
+    }
+
+    let decoded: Result<u8, renamed_tina_rpc::EncodingError> =
+        RenamedDecodeClient::get_decode_reply(b"not-json", 1024);
+    assert!(
+        decoded.is_err(),
+        "decoder error should type-check through the renamed rpc crate path"
+    );
+}
+
+#[test]
 fn multi_arg_method_works() {
     // A trait method with two args proves the tuple encoding works
     // for non-trivial arg counts. This is the shape macro authors

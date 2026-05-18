@@ -450,6 +450,45 @@ fn http2_padded_data_delivers_only_unpadded_body() {
 }
 
 #[test]
+fn http2_padded_post_does_not_poison_followup_stream() {
+    let harness = Http2Harness::start(Http2ServerConfig::default());
+    let mut stream = connect_h2(harness.addr);
+
+    write_frame(
+        &mut stream,
+        FRAME_HEADERS,
+        FLAG_END_HEADERS,
+        1,
+        &request_headers("POST", "/echo"),
+    );
+    let mut payload = vec![2];
+    payload.extend_from_slice(b"abc");
+    payload.extend_from_slice(b"zz");
+    write_frame(
+        &mut stream,
+        FRAME_DATA,
+        FLAG_PADDED | FLAG_END_STREAM,
+        1,
+        &payload,
+    );
+    assert_eq!(read_response_body(&mut stream, 1), b"abc");
+
+    write_frame(
+        &mut stream,
+        FRAME_HEADERS,
+        FLAG_END_HEADERS | FLAG_END_STREAM,
+        3,
+        &request_headers("GET", "/counter"),
+    );
+    assert_eq!(
+        read_response_body(&mut stream, 3),
+        b"0",
+        "padding bytes from stream 1 must not leak into the next user-visible stream"
+    );
+    harness.shutdown();
+}
+
+#[test]
 fn http2_bad_data_padding_sends_protocol_goaway() {
     let harness = Http2Harness::start(Http2ServerConfig::default());
     let mut stream = connect_h2(harness.addr);
@@ -638,6 +677,64 @@ fn http2_settings_max_frame_size_controls_outbound_splitting() {
     assert_eq!(
         data_frames, 1,
         "peer max frame size should allow one DATA frame"
+    );
+    harness.shutdown();
+}
+
+#[test]
+fn http2_peer_max_frame_size_splits_large_user_response() {
+    let config = Http2ServerConfig {
+        limits: Http2Limits {
+            max_body_bytes: 40_000,
+            max_response_body_bytes: 40_000,
+            initial_connection_window: 40_000,
+            initial_stream_window: 40_000,
+            ..Http2Limits::default()
+        },
+        ..Http2ServerConfig::default()
+    };
+    let harness = Http2Harness::start(config);
+    let mut stream = connect_h2(harness.addr);
+    write_settings(&mut stream, &[(SETTINGS_MAX_FRAME_SIZE, 16_384)]);
+    let ack = read_frame(&mut stream);
+    assert_eq!(ack.ty, FRAME_SETTINGS);
+    assert_ne!(ack.flags & FLAG_ACK, 0);
+
+    let body = vec![b'x'; 25_000];
+    write_frame(
+        &mut stream,
+        FRAME_HEADERS,
+        FLAG_END_HEADERS,
+        1,
+        &request_headers("POST", "/echo"),
+    );
+    write_data_chunks(&mut stream, 1, &body);
+
+    let mut data_frames = 0;
+    let mut received = Vec::new();
+    for _ in 0..8 {
+        let frame = read_frame(&mut stream);
+        match frame.ty {
+            FRAME_DATA if frame.stream_id == 1 => {
+                assert!(
+                    frame.payload.len() <= 16_384,
+                    "outbound DATA exceeded peer max frame size: {}",
+                    frame.payload.len()
+                );
+                data_frames += 1;
+                received.extend_from_slice(&frame.payload);
+                if frame.flags & FLAG_END_STREAM != 0 {
+                    break;
+                }
+            }
+            FRAME_HEADERS | FRAME_WINDOW_UPDATE => {}
+            other => panic!("unexpected frame {other}: {frame:?}"),
+        }
+    }
+    assert_eq!(received, body);
+    assert!(
+        data_frames >= 2,
+        "large response should be split by peer max frame size; got {data_frames}"
     );
     harness.shutdown();
 }

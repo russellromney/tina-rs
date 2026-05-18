@@ -301,6 +301,58 @@ fn single_shard_call_blocking_returns_command_full_when_queue_saturated() {
 }
 
 #[test]
+fn single_shard_command_full_does_not_poison_later_host_calls() {
+    let runtime = single_runtime(1);
+    let flag = Arc::new(AtomicBool::new(false));
+    let entered = Arc::new(AtomicBool::new(false));
+    let spinner = runtime
+        .register_with_capacity::<SpinnerSimple, Infallible>(
+            SpinnerSimple {
+                flag: Arc::clone(&flag),
+                entered: Arc::clone(&entered),
+            },
+            4,
+        )
+        .expect("register spinner");
+    let echo = runtime
+        .register_with_capacity::<EchoSimple, Infallible>(EchoSimple, 4)
+        .expect("register echo");
+
+    runtime
+        .try_send(spinner, SpinnerSimpleMsg::Tick)
+        .expect("kick spinner");
+    while !entered.load(Ordering::Relaxed) {
+        thread::yield_now();
+    }
+
+    let _ = runtime.call_blocking(spinner, SpinnerSimpleMsg::Tick, Duration::from_millis(20));
+    let saturated =
+        runtime.call_blocking(spinner, SpinnerSimpleMsg::Tick, Duration::from_millis(20));
+    assert!(
+        matches!(saturated, Err(ThreadedRuntimeError::CommandFull)),
+        "setup should prove the user-visible full path first; got {saturated:?}"
+    );
+
+    flag.store(true, Ordering::Relaxed);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let recovered = loop {
+        match runtime.call_blocking(echo, EchoSimpleMsg::AddOne(41), Duration::from_secs(1)) {
+            Ok(outcome) => break outcome,
+            Err(ThreadedRuntimeError::CommandFull) if Instant::now() < deadline => {
+                thread::sleep(Duration::from_millis(5));
+            }
+            Err(err) => panic!("host call after full path: {err:?}"),
+        }
+    };
+    assert_eq!(
+        recovered,
+        CallOutcome::Replied(42),
+        "CommandFull must be a terminal outcome for that admission attempt, not a poisoned runtime"
+    );
+    let _ = runtime.shutdown();
+}
+
+#[test]
 fn multi_shard_call_blocking_replies_on_target_shard() {
     let runtime = multi_runtime(64);
     let addr_a = runtime
