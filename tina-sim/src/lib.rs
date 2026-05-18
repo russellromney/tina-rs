@@ -3875,12 +3875,7 @@ where
                     end += 1;
                 }
 
-                let selector = self
-                    .config
-                    .seed
-                    .wrapping_add(0x5443_5052)
-                    .wrapping_add(batch_index)
-                    % one_in;
+                let selector = fault_selector(self.config.seed, 0x5443_5052, batch_index, one_in);
                 if selector == 0 && end - start > 1 {
                     ready[start..end].sort_by(|left, right| {
                         right
@@ -3903,12 +3898,8 @@ where
                 if one_in == 0 || steps == 0 {
                     return 0;
                 }
-                let selector = self
-                    .config
-                    .seed
-                    .wrapping_add(0x5443_5044)
-                    .wrapping_add(insertion_order)
-                    % one_in;
+                let selector =
+                    fault_selector(self.config.seed, 0x5443_5044, insertion_order, one_in);
                 if selector == 0 { steps } else { 0 }
             }
         }
@@ -4862,7 +4853,7 @@ where
                 if one_in == 0 {
                     return Duration::ZERO;
                 }
-                let selector = self.config.seed.wrapping_add(tag).wrapping_add(ordinal) % one_in;
+                let selector = fault_selector(self.config.seed, tag, ordinal, one_in);
                 if selector == 0 { by } else { Duration::ZERO }
             }
         }
@@ -4875,12 +4866,7 @@ where
                 if one_in == 0 || rounds == 0 {
                     return 0;
                 }
-                let selector = self
-                    .config
-                    .seed
-                    .wrapping_add(0x5345_4e44)
-                    .wrapping_add(ordinal)
-                    % one_in;
+                let selector = fault_selector(self.config.seed, 0x5345_4e44, ordinal, one_in);
                 if selector == 0 { rounds } else { 0 }
             }
         }
@@ -5385,6 +5371,21 @@ where
     }
 }
 
+fn fault_selector(seed: u64, tag: u64, ordinal: u64, modulus: u64) -> u64 {
+    debug_assert!(modulus > 0);
+    if ordinal == 0 {
+        return seed % modulus;
+    }
+    splitmix64(seed ^ tag.rotate_left(17) ^ ordinal.wrapping_mul(0x9E37_79B9_7F4A_7C15)) % modulus
+}
+
+fn splitmix64(mut value: u64) -> u64 {
+    value = value.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    value = (value ^ (value >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    value = (value ^ (value >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    value ^ (value >> 31)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5395,6 +5396,25 @@ mod tests {
         ChildDefinition, ChildRef, Outbound, SpawnObservedError, batch, noop, send, spawn,
         spawn_observed, stop,
     };
+
+    #[test]
+    fn fault_selector_is_deterministic_and_tag_separated() {
+        let first: Vec<_> = (0..32)
+            .map(|ordinal| fault_selector(7, 0xAA, ordinal, 17))
+            .collect();
+        let second: Vec<_> = (0..32)
+            .map(|ordinal| fault_selector(7, 0xAA, ordinal, 17))
+            .collect();
+        let other_tag: Vec<_> = (0..32)
+            .map(|ordinal| fault_selector(7, 0xBB, ordinal, 17))
+            .collect();
+
+        assert_eq!(first, second, "same seed/tag stream must replay exactly");
+        assert_ne!(
+            first, other_tag,
+            "different fault tags should not share a trivially correlated stream"
+        );
+    }
 
     #[test]
     fn round_message_scratch_reserve_covers_more_than_initial_capacity() {
