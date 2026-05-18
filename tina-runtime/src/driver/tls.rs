@@ -1,6 +1,7 @@
 //! TLS lane and stream wrappers: rustls-backed TLS over Tina's runtime
-//! TCP, plus the worker thread that performs handshake / read / write /
-//! close on the substrate.
+//! TCP, plus the per-shard worker thread that performs handshake / read /
+//! write / close on the substrate. `tls_lane_capacity` is queue depth, not
+//! concurrency; one worker drains the lane serially today.
 
 use super::*;
 

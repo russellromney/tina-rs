@@ -353,8 +353,9 @@ impl LiveShardReport {
         &self.dns_lane
     }
 
-    /// Configured TLS lane capacity. Live depth/accept/reject counters
-    /// are not measured for this lane today.
+    /// Configured TLS queue capacity. A shard has one TLS worker draining the
+    /// queue serially; live depth/accept/reject counters are not measured for
+    /// this lane today.
     pub const fn tls_lane(&self) -> &LiveQueueReport {
         &self.tls_lane
     }
