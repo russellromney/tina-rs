@@ -23,6 +23,10 @@ No fake exact replay.
 
 Unsupported facts are good honesty.
 
+Wrong fact wiring should fail at compile time. An isolate that did not opt into
+protocol facts should not be able to emit them by accident. A fact type that
+cannot become `RuntimeFact` should not register.
+
 ## Goal
 
 Move selected protocol lifecycle/pressure facts into runtime/sim replay truth.
@@ -123,6 +127,8 @@ Required erasure rule:
 - ordinary `Infallible` facts compile and never emit
 - protocol facts convert losslessly
 - simulator executes `Effect::Fact` the same way as live runtime
+- `fact::<I>(...)` requires exactly `I::Fact`. Emitting `ProtocolFact` from an
+  ordinary isolate whose `Fact = Infallible` is a compile error.
 
 Migration work:
 
@@ -147,6 +153,9 @@ Tests:
   tests that intentionally omit it; normal macro users never see this
 - fact type that lacks `IntoRuntimeFact` fails in a compile-fail test with a
   useful error
+- ordinary isolate emitting `ProtocolFact` without `fact = ProtocolFact` fails
+  in a compile-fail test
+- protocol isolate emitting the wrong fact enum fails in a compile-fail test
 - stable hash test proves old event/effect tags did not move
 
 ### Rock 1: Protocol Fact Vocabulary
@@ -164,6 +173,7 @@ Required fields:
 - typed reason/outcome for close/reset/status facts
 - typed pressure value for pressure facts
 - stable debug/render token
+- no raw stringly protocol family/status fields where a typed enum exists
 
 Required facts:
 
@@ -209,6 +219,8 @@ Tests:
 - each fact maps to a stable hash tag
 - adding the new variant does not renumber existing stable hash tags
 - unknown future fact is not silently ignored by projection code
+- compile-fail or exhaustive-match test proves new fact variants must be handled
+  by projection/tag code
 
 ### Rock 2: Protocol Code Emission
 

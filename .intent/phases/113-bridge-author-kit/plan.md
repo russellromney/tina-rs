@@ -32,6 +32,10 @@ Every bridge should say the same boring things:
 
 No bridge should invent its own vocabulary for the same shape.
 
+Wrong bridge wiring should fail at compile time where possible. Bad names and
+duplicate names are runtime/user data. Forged pressure reports, stringly outcome
+classes, and mismatched classifier return types are coding mistakes.
+
 ## Goal
 
 Build a small bridge author kit and migrate one real bridge family to prove it.
@@ -173,6 +177,8 @@ Rules:
 - all bridge pressure surfaces have validated names
 - do not classify broad SDK errors as retryable unless SDK metadata says
   retryable/throttled/conflict. Unknown SDK errors are `Fatal(SdkUnknown)`.
+- shared vocabulary structs with invariants have private fields and constructors.
+- outcome categories are typed enums, not strings.
 
 Tests:
 
@@ -181,6 +187,10 @@ Tests:
 - Closed/PoolClosed classify as `Unavailable`, not `Retryable`
 - unknown SDK errors classify as `Fatal(SdkUnknown)`, not retry fog
 - pressure adapter rejects bad names
+- compile-fail proves `BridgePressure { ... }` cannot be forged with raw fields
+  outside the module.
+- compile-fail proves a classifier cannot return a string instead of
+  `BridgeOutcomeClass`.
 
 ### Rock 2: AWS Bridge Core Extraction
 
@@ -249,6 +259,9 @@ BridgePressure {
 }
 ```
 
+This is the public debug shape, not a public struct literal. Fields are private;
+construct through validated constructors/adapters.
+
 Required methods:
 
 ```rust
@@ -275,6 +288,8 @@ Required:
 - late-result count; use `0` only when the bridge cannot observe late terminal
   completion
 - unavailable report when a whole bridge pressure surface cannot be measured
+- typed constructors for measured and unavailable pressure. No public raw-field
+  construction that bypasses name validation.
 
 Rules:
 
@@ -291,6 +306,8 @@ Tests:
 - unavailable field is explicit when unsupported
 - service pressure builder can consume the report
 - SQLite serial pressure maps to one bridge surface with capacity `1`
+- compile-fail proves pressure reports cannot be built with raw unvalidated
+  fields.
 
 ### Rock 4: One Non-AWS Bridge Alignment
 
@@ -351,6 +368,7 @@ cargo test -p tina-aws-bridge --tests
 cargo test -p tina-sqlx-bridge --tests
 cargo test -p tina-sqlite-bridge --tests
 cargo test -p tina-reqwest-bridge --tests
+cargo test -p tina-runtime --test compile_fail -- bridge
 cargo clippy -p tina-aws-bridge -p tina-sqlx-bridge -p tina-sqlite-bridge -p tina-reqwest-bridge --tests -- -D warnings
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
 ```
@@ -364,6 +382,7 @@ Before merge, prove:
 
 - no bridge claims caller saw an outcome it cannot observe
 - installed capacity cannot be faked by passing a fresh config to metrics
+- pressure/classifier invariants are private-field or compile-guarded
 - close/drain/shutdown words match the lifecycle docs
 - late external work is visible or explicitly unsupported
 - AWS extraction did not hide service-specific request/response truth

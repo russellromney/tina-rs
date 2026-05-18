@@ -38,6 +38,10 @@ No hidden global registry.
 
 No fake "everything is healthy" report.
 
+Prefer compile-time rails for report shape. Missing runtime data is an honest
+runtime state, but building a half-shaped `ServiceReport` by struct literal is a
+coding mistake.
+
 ## Goal
 
 Make the copied production-shaped Tina service easy to assemble and easy to
@@ -160,6 +164,8 @@ Rules:
 - no unbounded collection beyond number of inserted surfaces
 - no sampling hidden threads
 - no implied "healthy" when a surface is missing
+- new builder-owned types have private fields when public fields would bypass
+  validation. Users construct through builder methods, not struct literals.
 
 Tests:
 
@@ -169,6 +175,8 @@ Tests:
 - full surface appears in `assert_no_full`
 - builder output matches direct existing `ServicePressureReport` behavior
 - no surface disappears when one adapter returns unavailable
+- compile-fail proves a new builder-owned surface wrapper cannot be constructed
+  with raw fields that bypass name validation.
 
 ### Rock 2: `ServiceReportBuilder`
 
@@ -228,6 +236,9 @@ Rules:
 - builder and report implement `Debug`
 - `ServiceReport` implements `Clone`
 - missing optional data is explicit in the report
+- `ServiceReport` fields are private. Users can inspect through methods, but
+  cannot build a report that skipped lifecycle/readiness/health/pressure.
+- `ServiceReplayStatus` is a typed enum, not free text.
 
 Tests:
 
@@ -240,6 +251,9 @@ Tests:
 - topology lines include lifecycle and pressure name
 - a report with missing bridge metrics says unavailable
 - missing required report pieces reject with the exact typed error above
+- compile-fail proves `ServiceReport { ... }` construction outside the module
+  is impossible.
+- compile-fail proves replay status cannot be supplied as a plain string.
 
 ### Rock 3: Shutdown Summary
 
@@ -356,6 +370,7 @@ Docs must say:
 - missing surfaces must be declared unavailable
 - pressure is not health by itself, but readiness may use pressure
 - replay support is explicit
+- copied code uses builders, not direct struct literals
 
 ## Required Proof
 
@@ -366,6 +381,7 @@ cargo fmt --all --check
 cargo test -p tina-runtime service_report -- --nocapture
 cargo test -p tina-runtime service_pressure -- --nocapture
 cargo test -p tina-runtime lifecycle -- --nocapture
+cargo test -p tina-runtime --test compile_fail -- service_report
 cargo test --manifest-path examples/systems/mini_saas_api/Cargo.toml
 cargo test --manifest-path examples/systems/system_soak_http_db/Cargo.toml
 cargo test --manifest-path examples/systems/system_api_gateway_limits/Cargo.toml
@@ -384,6 +400,7 @@ Before merge, prove:
 - shutdown order is visible
 - service report is service-local
 - readiness degradation is an explicit service choice, not automatic magic
+- invariant-bearing report fields are private or otherwise compile-guarded
 - no hidden global registry exists
 - no unbounded report storage exists beyond inserted surface count
 - systems are shorter or safer, not just rewritten

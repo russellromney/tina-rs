@@ -41,6 +41,11 @@ Helpers must not hide:
 - late replies
 - trace and capacity facts
 
+When a helper can prevent bad wiring at compile time, it must. Runtime
+`Full`/`Duplicate`/`Closed` are real outcomes. Forged tickets, wrong reply
+types, starting child work before admission, or using timer sugar on non-timer
+work are coding mistakes and should fail to compile.
+
 ## Goal
 
 Make the copied multi-turn service path boring and hard to wire wrong.
@@ -112,6 +117,8 @@ Tests:
 - `sleep_then` and `sleep(...).then_event(...)` produce the same timer
   behavior.
 - Timer cancellation/closed behavior, if any, is not hidden by `then_event`.
+- compile-fail proves `tcp_close_stream(...).then_event(...)` and another
+  non-timer `TypedCall<()>` do not compile.
 
 ### Rock 2: Park Caller Authority
 
@@ -153,6 +160,8 @@ Rules:
   continuations cannot remove a newer parked caller after key reuse.
 - Tickets have private fields and carry a generation/slot identity. User code
   can carry a ticket but cannot forge one.
+- Ticket types are not `Copy`. Reusing one ticket twice is a compile error
+  before it can become a stale-runtime bug.
 - Existing key-only `try_insert` / `take(&key)` may remain as lower-level
   escape hatches, but migrated copied paths should carry tickets.
 
@@ -196,6 +205,9 @@ Tests:
   ticket path is used.
 - `ParkTicket` fields are private; doctest/compile-fail proves user code
   cannot forge one.
+- compile-fail proves a `PendingReplies<K, WrongReply>` cannot park or reply a
+  `RequestCall` whose isolate reply type is different.
+- compile-fail proves a moved `ParkTicket` cannot be used a second time.
 - caller timeout/cancel is still visible and capacity is reclaimed.
 - fill -> close/cancel -> refill works.
 
@@ -239,6 +251,8 @@ Rules:
 - Guard drops when the caller is gone and the slot is swept.
 - Failed admission returns both caller authority and guard.
 - Success returns a ticket; copied take/reply paths use the ticket.
+- Ticket and guard-bearing entry fields are private. User code cannot rebuild
+  a guarded slot without admission.
 - No sidecar map needed in migrated systems.
 
 Tests:
@@ -250,6 +264,7 @@ Tests:
 - stale key-only completion cannot steal a newer guarded slot.
 - guarded ticket fields are private; doctest/compile-fail proves user code
   cannot forge one.
+- compile-fail proves a moved guarded ticket cannot be used twice.
 - No double drop.
 
 ### Rock 4: `WaitList<K, R>`
@@ -289,6 +304,7 @@ Rules:
 - `WaitError::KeyFull(call, key)` for per-key full.
 - Natural key is user-facing grouping.
 - Internal ticket prevents stale completions from touching the wrong waiter.
+- `WaitTicket` is move-only and has private fields.
 - No unbounded waiter growth.
 
 Required API:
@@ -330,6 +346,7 @@ Tests:
 - stale ticket cannot remove/reply a newer waiter.
 - `WaitTicket` fields are private; doctest/compile-fail proves user code
   cannot forge one.
+- compile-fail proves a moved `WaitTicket` cannot be used twice.
 - fill -> reply/drain -> refill.
 - caller timeout/cancel cleanup reclaims capacity.
 
@@ -369,6 +386,8 @@ Rules:
 - `WorkTicket<K>` is identity.
 - Tickets have private fields and carry generation/slot identity. User code can
   carry a ticket but cannot forge one.
+- `WorkTicket` is move-only. Reusing a taken/cancelled work ticket is a
+  compile error.
 - Multiple live entries may share one key.
 - Admission is bounded globally.
 - Per-key capacity is optional at construction time. Both constructors ship:
@@ -419,6 +438,7 @@ Tests:
 - stale completion cannot remove a newer ticket.
 - `WorkTicket` fields are private; doctest/compile-fail proves user code
   cannot forge one.
+- compile-fail proves a moved `WorkTicket` cannot be used twice.
 - global full returns pending token.
 - per-key full returns pending token when using `with_key_limit`.
 - drain replies/cancels every parked caller.
@@ -492,6 +512,11 @@ Required:
 - helper unit tests for every success/failure path above.
 - at least one compile-check or doctest proving `then_event` does not require a
   `SleepReply` field in the user's enum.
+- compile-fail suite for:
+  - `then_event` on non-timer runtime work
+  - forged `ParkTicket` / `WaitTicket` / `WorkTicket`
+  - double use of moved tickets
+  - mismatched reply type when parking a caller
 - runtime test proving `park` full/duplicate returns caller authority and the
   caller does not time out.
 - runtime test proving copied `park` ticket removal prevents stale-key ABA.
