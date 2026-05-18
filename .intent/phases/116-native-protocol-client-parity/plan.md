@@ -2,7 +2,7 @@
 
 ## Status
 
-- Future IDD outline for Wave A.
+- Future implementation plan for Wave A.
 - Can run in parallel with phases 117 and 118 if ownership stays mostly in
   `tina-http`, `tina-runtime` protocol facts, and protocol specimens.
 - Runs before Phase 119 resource maturity. HTTP/2/gRPC client pooling needs
@@ -18,13 +18,31 @@ The user story:
 my Tina service calls another HTTP/2/gRPC service without Tokio
 ```
 
+## Spike Facts
+
+- Server-side HTTP/2 h2c already exists in `tina-http/src/http2.rs`.
+- Server-side gRPC already exists in `tina-http/src/grpc.rs` with unary,
+  server-streaming, client-streaming, bidi-shaped routes, and tonic h2c tests.
+- `grpc_unary_call_h2c_blocking` is only a blocking specimen/test helper. It
+  is not a Tina client isolate and emits no client runtime lifecycle truth.
+- HTTP/2 frame decode/encode and HPACK helpers are private inside server
+  `http2.rs`. Client work must split those into shared internal modules first.
+- TLS has no ALPN today. `tls_connect` / `tls_accept` return only stream ids.
+  This phase owns ALPN config and selected-protocol truth.
+
 ## Includes
 
 - split HTTP/2 frame/header helpers out of server-only `http2.rs` into shared
-  internal code used by server and client
+  internal code used by server and client:
+  - frame encode/decode
+  - SETTINGS / PING / GOAWAY / RST_STREAM / WINDOW_UPDATE builders
+  - HPACK header encode/decode helpers
+  - protocol error mapping to HTTP/2 wire error codes
 - native HTTP/2 client connection isolate
 - bounded HTTP/2 client stream-slot admission; do not model one request as one
   leased connection
+- one caller request owns one HTTP/2 stream slot until response trailers/EOF,
+  reset, timeout, or caller cancellation
 - native gRPC client surface over that HTTP/2 client connection
 - unary, server-streaming, client-streaming, and bidi client paths
 - TLS ALPN rail support for `h2`:
@@ -36,7 +54,12 @@ my Tina service calls another HTTP/2/gRPC service without Tokio
 - client connection reuse keyed by authority plus TLS/root config
 - received gRPC status as protocol fact after Phase 112
 - live interop tests against a real tonic/h2c or h2 server
-- simulator/replay support or explicit unsupported fact for live-only paths
+- simulator returns typed unsupported facts for live HTTP/2 client socket work
+  until a scripted HTTP/2 client simulator lands; protocol status facts still
+  use stable names for later replay plumbing
+- update docs that currently say native gRPC is server-first
+- replace the blocking helper docs so users copy the client isolate path, not
+  the test helper
 
 ## Does Not Include
 
@@ -47,13 +70,72 @@ my Tina service calls another HTTP/2/gRPC service without Tokio
 - no hidden Tokio client
 - no generic resource pool policy; Phase 119 owns idle/max-lifetime/health
 - no HTTP/2 server rewrite beyond sharing frame/header helpers
+- no client load balancing; one configured authority is one client target
+
+## Implementation Shape
+
+- `tina-http` gains shared internal HTTP/2 modules before behavior changes:
+  - `http2/frame.rs`
+  - `http2/headers.rs`
+  - `http2/errors.rs`
+- Existing server tests must stay green after the split before client behavior
+  lands.
+- `Http2ClientConnection` is an isolate over one TCP/TLS stream:
+  - sends client preface and SETTINGS;
+  - opens odd-numbered streams;
+  - enforces `max_concurrent_streams`;
+  - tracks per-stream request body, response body, trailers, reset, timeout,
+    and caller cancellation;
+  - reports pressure and lifecycle.
+- HTTP/2 client admission returns typed outcomes:
+  - `Admitted`
+  - `Full`
+  - `Closed`
+  - `Timeout`
+  - `Reset`
+  - `ProtocolError`
+  - `TlsAlpnMismatch`
+- gRPC client wrappers sit above `Http2ClientConnection`; they do not own a
+  hidden queue or hidden runtime.
+- TLS ALPN extends the existing TLS rail:
+  - no ambient default;
+  - h2 target asks for `["h2"]`;
+  - h2c target never touches TLS;
+  - selected ALPN is visible in typed connect/accept output.
 
 ## Proof Shape
 
-- live HTTP/2 client happy path
-- live HTTP/2 flow-control/timeout/reset paths
-- gRPC client unary and streaming interop
-- TLS ALPN success and failure truth
-- connection reuse/retire/close truth
-- protocol facts emitted for received statuses and stream lifecycle
-- compile-fail tests for wrong client config typestate where practical
+- server split proof:
+  - existing HTTP/2 and gRPC server tests pass unchanged after frame/header
+    helper extraction
+- live HTTP/2 client proof:
+  - h2c GET/POST happy path against Tina server
+  - response DATA arrives in bounded chunks
+  - request DATA streaming is bounded
+  - server RST_STREAM maps to typed reset
+  - GOAWAY closes new admission but lets admitted streams settle visibly
+  - flow-control blocked path is counted/reported
+  - timeout/cancel frees stream slot and rejects late response truth visibly
+- TLS ALPN proof:
+  - h2/TLS success selects `h2`
+  - no shared protocol / wrong ALPN returns typed mismatch
+  - cert/name failures remain distinct from ALPN failure
+- gRPC client proof:
+  - unary client against Tina server
+  - unary client against tonic h2c server
+  - server-streaming client receives all messages and final status
+  - client-streaming sends multiple messages and receives final status
+  - bidi client proves request and response streams progress independently
+  - non-OK gRPC status is the caller outcome, not an HTTP transport success
+- reuse/close proof:
+  - N unary calls reuse one HTTP/2 client connection when healthy
+  - closed/reset/protocol-bad connection rejects new admission visibly
+  - caller cancellation does not poison unrelated streams
+- replay/protocol fact proof:
+  - protocol facts emitted for received statuses and stream lifecycle
+  - simulator returns typed unsupported fact for live client socket work, not a
+    silent no-op or fake replay
+- compile-fail proof:
+  - h2c target cannot carry TLS roots/SNI
+  - h2/TLS target must carry server name/root policy
+  - unary helper cannot accept a streaming request body

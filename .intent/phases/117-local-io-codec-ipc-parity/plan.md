@@ -2,7 +2,7 @@
 
 ## Status
 
-- Future IDD outline for Wave A.
+- Future implementation plan for Wave A.
 - Can run in parallel with phases 116 and 118 if ownership stays mostly in
   runtime rails, codec helpers, and local IPC specimens.
 
@@ -16,24 +16,43 @@ files, framed bytes, and local sidecar/admin sockets
 
 Tina owns I/O, capacity, cancellation, and replay. Codecs own bytes.
 
+## Spike Facts
+
+- File rails already exist: open/read-at/write-at/fsync/size/close, live and
+  sim.
+- TCP loop helpers already exist: `TcpWriteAll`, `TcpReadExact`,
+  `TcpReadToEof`. They prove the helper shape: user-owned state machine, one
+  runtime call per progress step.
+- HTTP/1, chunked, WebSocket, HTTP/2, and gRPC all have private codec-ish
+  parsers. This phase should not expose those exact internals; it should ship a
+  generic sync codec pattern that matches their lessons.
+- Unix-domain sockets are not present as runtime rails. Lifecycle docs mention
+  Unix as a resource kind, but no `unix_bind` / `unix_connect` surface exists.
+
 ## Includes
 
 - bounded file streaming read helper
 - bounded file streaming write helper
 - file streaming helpers are state machines over existing file rails, not new
   backend file primitives
+- file helpers keep per-chunk trace truth; no hidden read-whole-file path
 - line-delimited codec helper
 - length-delimited codec helper
 - sync codec adapter pattern with `NeedMore` / `Frame` / `Malformed` / `Full`
 - codecs are pure data; runtime owns socket reads/writes and capacity
 - Unix-domain socket listener/client rails for local IPC
+- Unix rails mirror TCP semantics where possible:
+  - bind/listen/accept
+  - connect
+  - read/write/close
+  - typed `Full`, `Closed`, `InvalidResource`, `Unsupported`
 - typed non-Unix unsupported truth for Unix rails
-- simulator support for file streaming and Unix sockets, or typed unsupported
-  truth where a backend cannot support it
+- simulator support for file streaming and Unix socket pairs; non-Unix live
+  backends return typed unsupported for Unix rails
 - system specimens:
   - media/file ingest
   - local admin sidecar
-  - framed mini keyspace or echo protocol
+  - framed mini keyspace protocol
 
 ## Does Not Include
 
@@ -44,13 +63,51 @@ Tina owns I/O, capacity, cancellation, and replay. Codecs own bytes.
 - no mmap/zero-copy promise
 - no moving HTTP/WebSocket parsers into public API unless the generic codec
   shape is clean
+- no driver-level `file_read_to_end` that hides per-chunk progress
 
 ## Proof Shape
 
 - large file does not buffer whole file
+- file read helper reads in multiple chunks and reports high-water/cap truth
+- file write helper handles partial writes and fsync/close truth
 - slow reader/writer pressure is visible
 - malformed frame is typed
+- line codec rejects line too large without growing unbounded
+- length codec rejects frame too large before allocation
 - Unix socket close/cancel/drain truth is visible
+- Unix socket live echo/admin specimen works on Unix
 - live and sim tests cover the same protocol shape where possible
 - non-Unix tests assert typed unsupported capability, not cfg-silent omission
 - compile-fail tests keep codec adapter state typed, not stringly
+
+## Implementation Shape
+
+- Add `tina_runtime::file_loops` beside `tcp_loops`:
+  - `FileReadChunks`
+  - `FileWriteAll`
+  - explicit max chunk and max total
+  - no zero chunk
+  - no hidden allocation beyond configured buffer
+- Add `tina-codec` as an official small battery crate:
+  - `LineCodec`
+  - `LengthDelimitedCodec`
+  - `CodecDecision::{NeedMore, Frame, Malformed, Full}`
+  - parser state is owned by the isolate/specimen, not a background task
+- Add Unix rail calls in `tina-runtime` and `tina-sim`:
+  - live Unix platforms use OS Unix sockets
+  - live non-Unix platforms complete with typed unsupported
+  - simulator models Unix sockets as local byte-stream pairs with Unix-socket
+    resource names
+- Add specimens:
+  - `specimen_file_ingest`
+  - `specimen_local_admin_socket`
+  - `specimen_framed_keyspace`
+
+## Hostile Review Notes
+
+- Do not make codecs async. That would smuggle a second runtime into Tina.
+- Do not hide read/write loops inside the driver without per-step trace truth.
+- Do not let Unix socket support be cfg-silent. A non-Unix user must see a
+  typed unsupported capability.
+- Do not expose HTTP/WebSocket private parser types as the generic codec API
+  just because they are nearby.
