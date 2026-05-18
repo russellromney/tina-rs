@@ -515,12 +515,21 @@ so saved DST cases pin protocol behaviour (HTTP/2 stream reset, body
 high-water, WebSocket session close, gRPC final status) without
 reading service reports.
 
-Use `TraceProjection::protocol_facts()` to compare only fact events,
-or a named sibling (`http2_streams`, `websocket_sessions`,
-`grpc_status`) for call-site clarity. A protocol fact the simulator
-cannot produce surfaces through
-`ProtocolReplayMismatch::UnsupportedProtocolFact` — typed honesty, not
-a fake pass.
+Use `TraceProjection::protocol_facts()` to compare every fact event
+regardless of family, or one of the family-narrowing helpers:
+
+- `TraceProjection::http2_streams()` keeps only HTTP/2 facts;
+- `TraceProjection::websocket_sessions()` keeps only WebSocket facts;
+- `TraceProjection::grpc_status()` keeps only gRPC facts;
+- `TraceProjection::protocol_family(family)` is the underlying
+  builder.
+
+The family check reads `RuntimeFact::Protocol(fact).family()`; no
+debug-string parsing. Non-matching `FactObserved` events are dropped
+silently like `ignored` event kinds, but unknown runtime event kinds
+still fail closed. A protocol fact the simulator cannot produce
+surfaces through `ProtocolReplayMismatch::UnsupportedProtocolFact` —
+typed honesty, not a fake pass.
 
 Blocking host helpers like `grpc_unary_call_h2c_blocking` are not on
 this path: they are not Tina isolates and they do not emit facts.

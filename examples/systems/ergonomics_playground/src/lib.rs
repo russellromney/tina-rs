@@ -57,6 +57,7 @@ impl Isolate for Provider {
     type Spawn = std::convert::Infallible;
     type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<ProviderMsg>;
+    type Fact = std::convert::Infallible;
     type Shard = SingleShard;
 
     fn handle(
@@ -157,6 +158,7 @@ impl Isolate for QuoteGateway {
     type Send = tina::Outbound<std::convert::Infallible>;
     type Spawn = std::convert::Infallible;
     type SpawnObserved = std::convert::Infallible;
+    type Fact = std::convert::Infallible;
     type Call = RuntimeCall<QuoteGatewayMsg>;
     type Shard = SingleShard;
 
@@ -258,6 +260,7 @@ impl Isolate for QuoteClient {
     type Reply = ();
     type Send = tina::Outbound<std::convert::Infallible>;
     type Spawn = std::convert::Infallible;
+    type Fact = std::convert::Infallible;
     type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<QuoteClientMsg>;
     type Shard = SingleShard;
@@ -409,6 +412,7 @@ impl Isolate for Batcher {
     type Message = BatcherMsg;
     type Reply = BatchReply;
     type Send = tina::Outbound<std::convert::Infallible>;
+    type Fact = std::convert::Infallible;
     type Spawn = std::convert::Infallible;
     type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<BatcherMsg>;
@@ -500,6 +504,7 @@ struct BatchClient {
 impl Isolate for BatchClient {
     type Message = BatchClientMsg;
     type Reply = ();
+    type Fact = std::convert::Infallible;
     type Send = tina::Outbound<BatcherMsg>;
     type Spawn = std::convert::Infallible;
     type SpawnObserved = std::convert::Infallible;
@@ -670,6 +675,7 @@ struct Upstream {
 
 impl Isolate for Upstream {
     type Message = UpstreamMsg;
+    type Fact = std::convert::Infallible;
     type Reply = FillReply;
     type Send = tina::Outbound<std::convert::Infallible>;
     type Spawn = std::convert::Infallible;
@@ -716,6 +722,7 @@ struct Cache {
 }
 
 impl Isolate for Cache {
+    type Fact = std::convert::Infallible;
     type Message = CacheMsg;
     type Reply = CacheReply;
     type Send = tina::Outbound<std::convert::Infallible>;
@@ -803,6 +810,7 @@ impl Isolate for CacheClient {
     type Spawn = std::convert::Infallible;
     type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<CacheClientMsg>;
+    type Fact = std::convert::Infallible;
     type Shard = SingleShard;
 
     fn handle(

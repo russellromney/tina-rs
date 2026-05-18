@@ -13,8 +13,9 @@ use std::convert::Infallible;
 use tina::prelude::*;
 use tina::{Address, ShardId};
 use tina_runtime::{
-    Http2ResetReason, Http2StreamId, ProtocolConnectionId, ProtocolDirection, ProtocolFact,
-    RuntimeCall, RuntimeEvent, RuntimeEventKind, RuntimeFact,
+    GrpcStatusCode, GrpcStreamId, Http2ResetReason, Http2StreamId, ProtocolConnectionId,
+    ProtocolDirection, ProtocolFact, ProtocolFamily, RuntimeCall, RuntimeEvent, RuntimeEventKind,
+    RuntimeFact, WebSocketCloseReason, WebSocketSessionId,
 };
 use tina_sim::dst::{
     ProtocolReplayMismatch, RuntimeEventKindName, TraceProjection, project_trace_shape,
@@ -110,6 +111,7 @@ fn projection_fails_closed_on_unknown_kind_is_not_possible() {
     let too_narrow = TraceProjection::Projected {
         included: vec![RuntimeEventKindName::FactObserved],
         ignored: vec![RuntimeEventKindName::MailboxAccepted],
+        family_filter: None,
     };
     let err = project_trace_shape(&events, &too_narrow)
         .expect_err("must fail closed when an event kind is unlisted");
@@ -160,4 +162,152 @@ fn saved_replay_proof_http2_reset_under_flow_pressure() {
     let empty_events = sim.trace().to_vec();
     let empty_shape = project_trace_shape(&empty_events, &projection).expect("projection succeeds");
     assert_eq!(empty_shape.event_count, 0);
+}
+
+// A synthetic isolate that emits one HTTP/2, one WebSocket, and one gRPC
+// fact in a single turn. Phase 114 Rock 8 needs the named projection
+// helpers to keep only their family in a trace that mixes all three.
+#[derive(Debug, Clone, Copy)]
+enum MixedMsg {
+    EmitAll,
+}
+
+struct MixedProtocolIsolate;
+
+impl Isolate for MixedProtocolIsolate {
+    type Message = MixedMsg;
+    type Reply = ();
+    type Send = tina::Outbound<Infallible>;
+    type Spawn = Infallible;
+    type SpawnObserved = Infallible;
+    type Call = RuntimeCall<MixedMsg>;
+    type Fact = ProtocolFact;
+    type Shard = SimShard;
+
+    fn handle(
+        &mut self,
+        msg: MixedMsg,
+        _ctx: &mut tina::Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
+        match msg {
+            MixedMsg::EmitAll => tina::batch(vec![
+                tina::fact::<Self>(ProtocolFact::Http2StreamReset {
+                    connection: ProtocolConnectionId::new(7),
+                    stream: Http2StreamId::new(11),
+                    direction: ProtocolDirection::Outbound,
+                    reason: Http2ResetReason::FlowControlError,
+                }),
+                tina::fact::<Self>(ProtocolFact::WebSocketSessionClosed {
+                    session: WebSocketSessionId::new(99),
+                    reason: WebSocketCloseReason::Normal,
+                    code: Some(1000),
+                }),
+                tina::fact::<Self>(ProtocolFact::GrpcFinalStatusSent {
+                    connection: ProtocolConnectionId::new(7),
+                    stream: GrpcStreamId::new(11),
+                    status: GrpcStatusCode::Ok,
+                }),
+            ]),
+        }
+    }
+}
+
+fn run_mixed_protocol_trace() -> Vec<RuntimeEvent> {
+    let mut sim = Simulator::new(SimShard, SimulatorConfig::default());
+    let addr = sim.register(MixedProtocolIsolate);
+    sim.try_send(addr, MixedMsg::EmitAll)
+        .expect("admit one message");
+    sim.run_until_quiescent();
+    sim.trace().to_vec()
+}
+
+#[test]
+fn protocol_facts_keeps_every_fact_event_regardless_of_family() {
+    let events = run_mixed_protocol_trace();
+    let shape = project_trace_shape(&events, &TraceProjection::protocol_facts())
+        .expect("projection succeeds");
+    assert_eq!(
+        shape.event_count, 3,
+        "protocol_facts() keeps every FactObserved event, all three families",
+    );
+}
+
+#[test]
+fn http2_streams_keeps_only_http2_facts() {
+    let events = run_mixed_protocol_trace();
+    let shape = project_trace_shape(&events, &TraceProjection::http2_streams())
+        .expect("projection succeeds");
+    assert_eq!(
+        shape.event_count, 1,
+        "http2_streams() must filter by ProtocolFamily::Http2, dropping the WebSocket and gRPC facts",
+    );
+    // Sanity: the projection actually advertises the family.
+    assert_eq!(
+        TraceProjection::http2_streams().family_filter(),
+        Some(ProtocolFamily::Http2),
+    );
+}
+
+#[test]
+fn websocket_sessions_keeps_only_websocket_facts() {
+    let events = run_mixed_protocol_trace();
+    let shape = project_trace_shape(&events, &TraceProjection::websocket_sessions())
+        .expect("projection succeeds");
+    assert_eq!(
+        shape.event_count, 1,
+        "websocket_sessions() must filter by ProtocolFamily::WebSocket, dropping HTTP/2 and gRPC",
+    );
+    assert_eq!(
+        TraceProjection::websocket_sessions().family_filter(),
+        Some(ProtocolFamily::WebSocket),
+    );
+}
+
+#[test]
+fn grpc_status_keeps_only_grpc_facts() {
+    let events = run_mixed_protocol_trace();
+    let shape =
+        project_trace_shape(&events, &TraceProjection::grpc_status()).expect("projection succeeds");
+    assert_eq!(
+        shape.event_count, 1,
+        "grpc_status() must filter by ProtocolFamily::Grpc, dropping HTTP/2 and WebSocket",
+    );
+    assert_eq!(
+        TraceProjection::grpc_status().family_filter(),
+        Some(ProtocolFamily::Grpc),
+    );
+}
+
+#[test]
+fn family_filtered_projections_have_distinct_trace_hashes() {
+    // If the filter is wired correctly, the three named helpers must
+    // produce three different trace hashes for the same input — proving
+    // each one is actually keeping a different subset, not aliasing.
+    let events = run_mixed_protocol_trace();
+    let http2 = project_trace_shape(&events, &TraceProjection::http2_streams()).unwrap();
+    let ws = project_trace_shape(&events, &TraceProjection::websocket_sessions()).unwrap();
+    let grpc = project_trace_shape(&events, &TraceProjection::grpc_status()).unwrap();
+    let all = project_trace_shape(&events, &TraceProjection::protocol_facts()).unwrap();
+
+    assert_ne!(http2.trace_hash, ws.trace_hash);
+    assert_ne!(http2.trace_hash, grpc.trace_hash);
+    assert_ne!(ws.trace_hash, grpc.trace_hash);
+    assert_ne!(http2.trace_hash, all.trace_hash);
+}
+
+#[test]
+fn family_filter_still_fails_closed_on_unknown_event_kinds() {
+    // Family filter narrows FactObserved; it does not relax the
+    // fail-closed contract for unknown runtime event kinds.
+    let events = run_mixed_protocol_trace();
+    let too_narrow = TraceProjection::Projected {
+        included: vec![RuntimeEventKindName::FactObserved],
+        // Intentionally omit MailboxAccepted / HandlerStarted etc. so the
+        // mixed trace contains at least one unlisted kind.
+        ignored: vec![],
+        family_filter: Some(ProtocolFamily::Http2),
+    };
+    let err = project_trace_shape(&events, &too_narrow)
+        .expect_err("must fail closed when an event kind is unlisted");
+    assert!(err.reason.contains("not named"));
 }

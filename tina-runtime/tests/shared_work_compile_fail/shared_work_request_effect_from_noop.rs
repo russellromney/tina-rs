@@ -18,6 +18,7 @@ impl Isolate for NoTicket {
     type Spawn = Infallible;
     type SpawnObserved = Infallible;
     type Call = Infallible;
+    type Fact = Infallible;
     type Shard = SingleShard;
 
     fn handle(

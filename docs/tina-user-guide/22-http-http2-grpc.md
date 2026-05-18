@@ -77,20 +77,52 @@ or registration is a compile error.
 
 ## Replay projections
 
-`TraceProjection::protocol_facts()` keeps only `FactObserved` events.
-Three siblings (`http2_streams`, `websocket_sessions`, `grpc_status`)
-share the same shape today and exist for call-site clarity. Every
-unrelated event kind is explicitly listed in `ignored`, so the
-projection still fails closed on unknown event kinds.
+The projection helpers do what their names say. Each one is a thin
+constructor over the shared `TraceProjection::Projected` shape, so
+unknown runtime event kinds still fail closed.
+
+- `TraceProjection::protocol_facts()` keeps every `FactObserved`
+  event, regardless of protocol family. Use this when you want to
+  pin "the trace had exactly N protocol facts, in this stable order"
+  without narrowing to one family.
+- `TraceProjection::protocol_family(ProtocolFamily::Http2 |
+  ::WebSocket | ::Grpc | ::HttpBody)` keeps `FactObserved` events
+  whose `RuntimeFact::Protocol(fact).family()` matches. Non-matching
+  facts are dropped silently the way `ignored` event kinds are.
+- `TraceProjection::http2_streams()` /
+  `TraceProjection::websocket_sessions()` /
+  `TraceProjection::grpc_status()` are named shortcuts for the
+  matching `protocol_family(...)` call. They filter by family, they
+  are **not** aliases for `protocol_facts()`.
 
 ```rust
+use tina_runtime::ProtocolFamily;
 use tina_sim::dst::TraceProjection;
 
-let shape = tina_sim::dst::project_trace_shape(
+// Every protocol fact, regardless of family.
+let all_facts = tina_sim::dst::project_trace_shape(
     &trace,
     &TraceProjection::protocol_facts(),
 )?;
+
+// Only HTTP/2 stream-level facts.
+let http2_only = tina_sim::dst::project_trace_shape(
+    &trace,
+    &TraceProjection::http2_streams(),
+)?;
+
+// Equivalent and slightly more explicit.
+let http2_only_explicit = tina_sim::dst::project_trace_shape(
+    &trace,
+    &TraceProjection::protocol_family(ProtocolFamily::Http2),
+)?;
 ```
+
+The family check reads `RuntimeFact::Protocol(fact).family()`; no
+debug-string parsing happens. A trace that mixes HTTP/2, WebSocket,
+and gRPC facts in the same run produces three distinct trace hashes
+under the three named helpers — they each project onto a different
+subset of the same events.
 
 A live trace that contains a fact the simulator cannot produce is
 reported through the typed `ProtocolReplayMismatch::UnsupportedProtocolFact`

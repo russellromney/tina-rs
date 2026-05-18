@@ -12,8 +12,8 @@ use std::path::Path;
 use tina::capacity::{CapacityMode, CapacitySurfaceReport};
 use tina::{AddressGeneration, IsolateId, ShardId};
 use tina_runtime::{
-    CallError, CallId, CauseId, EventId, RuntimeEvent, RuntimeEventKind, SendRejectedReason,
-    stable_trace_hash,
+    CallError, CallId, CauseId, EventId, ProtocolFamily, RuntimeEvent, RuntimeEventKind,
+    RuntimeFact, SendRejectedReason, stable_trace_hash,
 };
 
 use crate::{DurableImage, FaultConfig, SimulatorConfig};
@@ -965,11 +965,21 @@ pub enum TraceProjection {
     ///
     /// Every event kind in the trace must appear in `included` or `ignored`.
     /// Anything unnamed fails closed as [`TraceProjectionError`].
+    ///
+    /// `family_filter` narrows `FactObserved` events further:
+    ///
+    /// - `None` keeps every `FactObserved` event (current behaviour);
+    /// - `Some(family)` keeps only `FactObserved` events whose
+    ///   `RuntimeFact::Protocol(fact).family()` matches; non-matching
+    ///   facts are dropped silently, the way `ignored` kinds are. Unknown
+    ///   runtime event kinds still fail closed.
     Projected {
         /// Event kinds that remain in the projected trace.
         included: Vec<RuntimeEventKindName>,
         /// Event kinds intentionally ignored by this projection.
         ignored: Vec<RuntimeEventKindName>,
+        /// Optional protocol-family narrowing for `FactObserved` events.
+        family_filter: Option<ProtocolFamily>,
     },
 }
 
@@ -982,8 +992,18 @@ impl TraceProjection {
         }
     }
 
-    /// Returns a projection that keeps only [`RuntimeEventKindName::FactObserved`]
-    /// events.
+    /// Returns the protocol-family narrowing applied to `FactObserved`
+    /// events, if any.
+    pub fn family_filter(&self) -> Option<ProtocolFamily> {
+        match self {
+            Self::Exact => None,
+            Self::Projected { family_filter, .. } => *family_filter,
+        }
+    }
+
+    /// Returns a projection that keeps every
+    /// [`RuntimeEventKindName::FactObserved`] event, regardless of
+    /// protocol family.
     ///
     /// All other event kinds are explicitly listed in `ignored` so unknown
     /// event kinds still fail closed.
@@ -991,27 +1011,51 @@ impl TraceProjection {
         Self::Projected {
             included: vec![RuntimeEventKindName::FactObserved],
             ignored: every_kind_except(&[RuntimeEventKindName::FactObserved]),
+            family_filter: None,
         }
     }
 
-    /// Returns a projection that keeps `FactObserved` events. Same shape as
-    /// [`Self::protocol_facts`] today; named separately so the call site
-    /// can express HTTP/2-specific intent and so future preset evolution can
-    /// narrow it without breaking callers.
+    /// Returns a projection that keeps only `FactObserved` events whose
+    /// fact belongs to the given protocol family.
+    ///
+    /// Non-matching `FactObserved` events are dropped silently the way
+    /// `ignored` event kinds are. Unknown runtime event kinds still fail
+    /// closed.
+    ///
+    /// The family is read from
+    /// `RuntimeFact::Protocol(fact).family()`; debug-string parsing is
+    /// not used.
+    pub fn protocol_family(family: ProtocolFamily) -> Self {
+        Self::Projected {
+            included: vec![RuntimeEventKindName::FactObserved],
+            ignored: every_kind_except(&[RuntimeEventKindName::FactObserved]),
+            family_filter: Some(family),
+        }
+    }
+
+    /// Returns a projection that keeps only HTTP/2 protocol facts.
+    ///
+    /// Equivalent to [`Self::protocol_family`] with
+    /// [`ProtocolFamily::Http2`]. Use this at call sites that want to
+    /// express HTTP/2-specific intent.
     pub fn http2_streams() -> Self {
-        Self::protocol_facts()
+        Self::protocol_family(ProtocolFamily::Http2)
     }
 
-    /// Returns a projection that keeps `FactObserved` events. Named separately
-    /// from [`Self::protocol_facts`] for WebSocket-specific call sites.
+    /// Returns a projection that keeps only WebSocket protocol facts.
+    ///
+    /// Equivalent to [`Self::protocol_family`] with
+    /// [`ProtocolFamily::WebSocket`].
     pub fn websocket_sessions() -> Self {
-        Self::protocol_facts()
+        Self::protocol_family(ProtocolFamily::WebSocket)
     }
 
-    /// Returns a projection that keeps `FactObserved` events. Named separately
-    /// from [`Self::protocol_facts`] for gRPC-specific call sites.
+    /// Returns a projection that keeps only gRPC protocol facts.
+    ///
+    /// Equivalent to [`Self::protocol_family`] with
+    /// [`ProtocolFamily::Grpc`].
     pub fn grpc_status() -> Self {
-        Self::protocol_facts()
+        Self::protocol_family(ProtocolFamily::Grpc)
     }
 }
 
@@ -1139,7 +1183,11 @@ pub fn project_trace_shape(
 ) -> Result<TraceShape, TraceProjectionError> {
     match projection {
         TraceProjection::Exact => Ok(TraceShape::from_events(events)),
-        TraceProjection::Projected { included, ignored } => {
+        TraceProjection::Projected {
+            included,
+            ignored,
+            family_filter,
+        } => {
             let mut projected = Vec::new();
             for event in events {
                 let Some(kind) = runtime_event_kind_name(event.kind()) else {
@@ -1153,6 +1201,30 @@ pub fn project_trace_shape(
                     continue;
                 }
                 if included.contains(&kind) {
+                    // Family narrowing: if the projection asked for one
+                    // protocol family, drop `FactObserved` events whose
+                    // fact does not match. Non-matching facts behave the
+                    // same as `ignored` kinds (silently skipped, no
+                    // fail-closed). Unknown event kinds still fail closed
+                    // through the check above.
+                    if kind == RuntimeEventKindName::FactObserved {
+                        if let Some(family) = family_filter {
+                            if let RuntimeEventKind::FactObserved { fact } = event.kind() {
+                                match fact {
+                                    RuntimeFact::Protocol(protocol_fact) => {
+                                        if protocol_fact.family() != *family {
+                                            continue;
+                                        }
+                                    }
+                                    // Future top-level RuntimeFact families
+                                    // are silently skipped by family filters;
+                                    // unknown event kinds still fail closed
+                                    // through the check above.
+                                    _ => continue,
+                                }
+                            }
+                        }
+                    }
                     projected.push(event);
                     continue;
                 }
