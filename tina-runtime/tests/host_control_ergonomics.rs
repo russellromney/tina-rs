@@ -332,6 +332,22 @@ fn multi_shard_call_blocking_returns_timeout_when_callee_holds_caller() {
 }
 
 #[test]
+fn multi_shard_call_blocking_host_budget_is_distinct_from_target_deadline() {
+    let runtime = multi_runtime(64);
+    let silent = runtime
+        .register_with_capacity_on::<SilentMS, Infallible>(ShardId::new(1), SilentMS, 4)
+        .expect("register silent");
+    let outcome = runtime.call_blocking_with_host_timeout(
+        silent,
+        SilentMsg::Hold,
+        Duration::from_secs(2),
+        Duration::from_millis(25),
+    );
+    assert_eq!(outcome, Err(ThreadedRuntimeError::HostWaitTimeout));
+    let _ = runtime.shutdown();
+}
+
+#[test]
 fn multi_shard_call_blocking_returns_closed_when_callee_stopped() {
     let runtime = multi_runtime(64);
     let stopper = runtime

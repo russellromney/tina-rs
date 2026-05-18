@@ -115,6 +115,11 @@ impl Default for ThreadedRuntimeConfig {
 /// Per-shard default budget for draining lane workers after cancellation.
 pub const DEFAULT_SHUTDOWN_LANE_DRAIN_TIMEOUT: Duration = Duration::from_millis(100);
 
+/// Extra host-side delivery grace used by the legacy one-timeout
+/// `call_blocking` wrapper so a target call timeout can be delivered as
+/// `CallOutcome::Timeout` instead of racing the host wait timer.
+pub const DEFAULT_HOST_CALL_DELIVERY_GRACE: Duration = Duration::from_millis(100);
+
 pub(crate) enum ThreadedCommand<S, F>
 where
     S: Shard,
@@ -475,7 +480,8 @@ where
                 Err(ThreadedRegisterBootstrapError::UnknownShard(shard))
             }
             Err(ThreadedRuntimeError::DriverShutdownFailed)
-            | Err(ThreadedRuntimeError::CommandFull) => {
+            | Err(ThreadedRuntimeError::CommandFull)
+            | Err(ThreadedRuntimeError::HostWaitTimeout) => {
                 // `call` is blocking-admission, so `CommandFull` is
                 // unreachable today. Map defensively in case the inner
                 // helper is ever migrated.
@@ -1148,14 +1154,40 @@ where
     /// ```
     ///
     /// The `timeout` argument is the *call* timeout (how long the target
-    /// isolate has to reply). The host-side wait uses the same timeout
-    /// value so the host thread does not block forever if the worker
-    /// stops mid-call.
+    /// isolate has to reply). The legacy host-side wait adds a short delivery
+    /// grace so target timeouts can arrive as `CallOutcome::Timeout`. Use
+    /// [`call_blocking_with_host_timeout`](Self::call_blocking_with_host_timeout)
+    /// when host wait budget and target deadline must be distinct.
     pub fn call_blocking<M, R>(
         &self,
         address: Address<M, R>,
         message: M,
         timeout: Duration,
+    ) -> Result<CallOutcome<R>, ThreadedRuntimeError>
+    where
+        M: Send + 'static,
+        R: Send + 'static,
+    {
+        let host_wait_timeout = timeout
+            .checked_add(DEFAULT_HOST_CALL_DELIVERY_GRACE)
+            .unwrap_or(timeout);
+        self.call_blocking_with_host_timeout(address, message, timeout, host_wait_timeout)
+    }
+
+    /// Like [`call_blocking`](Self::call_blocking), but gives the host wait its
+    /// own budget separate from the target call deadline.
+    ///
+    /// `target_timeout` is delivered into Tina and controls when the call
+    /// becomes `CallOutcome::Timeout`. `host_wait_timeout` controls how long
+    /// this OS thread waits for the driver result. If the host wait expires
+    /// first, the target call is still governed by `target_timeout` and this
+    /// method returns [`ThreadedRuntimeError::HostWaitTimeout`].
+    pub fn call_blocking_with_host_timeout<M, R>(
+        &self,
+        address: Address<M, R>,
+        message: M,
+        target_timeout: Duration,
+        host_wait_timeout: Duration,
     ) -> Result<CallOutcome<R>, ThreadedRuntimeError>
     where
         M: Send + 'static,
@@ -1174,7 +1206,7 @@ where
                 HostCallMsg::Begin {
                     target: address,
                     message,
-                    timeout,
+                    timeout: target_timeout,
                 },
             ) {
                 Ok(()) => {}
@@ -1197,9 +1229,9 @@ where
             }
         }
 
-        match reply_rx.recv_timeout(timeout) {
+        match reply_rx.recv_timeout(host_wait_timeout) {
             Ok(outcome) => Ok(outcome),
-            Err(mpsc::RecvTimeoutError::Timeout) => Ok(CallOutcome::Timeout),
+            Err(mpsc::RecvTimeoutError::Timeout) => Err(ThreadedRuntimeError::HostWaitTimeout),
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 self.metrics.set_state(LiveShardState::Failed);
                 Err(ThreadedRuntimeError::WorkerStopped)

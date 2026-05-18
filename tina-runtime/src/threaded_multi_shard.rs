@@ -388,7 +388,8 @@ where
                 Err(ThreadedRegisterBootstrapError::UnknownShard(s))
             }
             Err(ThreadedRuntimeError::DriverShutdownFailed)
-            | Err(ThreadedRuntimeError::CommandFull) => {
+            | Err(ThreadedRuntimeError::CommandFull)
+            | Err(ThreadedRuntimeError::HostWaitTimeout) => {
                 // `call_on` is blocking-admission, so `CommandFull` is
                 // unreachable today. Map defensively in case the inner
                 // helper is ever migrated.
@@ -691,6 +692,25 @@ where
         M: Send + 'static,
         R: Send + 'static,
     {
+        let host_wait_timeout = timeout
+            .checked_add(crate::threaded::DEFAULT_HOST_CALL_DELIVERY_GRACE)
+            .unwrap_or(timeout);
+        self.call_blocking_with_host_timeout(address, message, timeout, host_wait_timeout)
+    }
+
+    /// Like [`call_blocking`](Self::call_blocking), but separates the target
+    /// call deadline from the host-side wait budget.
+    pub fn call_blocking_with_host_timeout<M, R>(
+        &self,
+        address: Address<M, R>,
+        message: M,
+        target_timeout: Duration,
+        host_wait_timeout: Duration,
+    ) -> Result<CallOutcome<R>, ThreadedRuntimeError>
+    where
+        M: Send + 'static,
+        R: Send + 'static,
+    {
         let shard = address.shard();
         if !self.commands.contains_key(&shard) {
             panic!(
@@ -719,7 +739,7 @@ where
                 HostCallMsg::Begin {
                     target: address,
                     message,
-                    timeout,
+                    timeout: target_timeout,
                 },
             ) {
                 Ok(()) => {}
@@ -744,9 +764,9 @@ where
             }
         }
 
-        match reply_rx.recv_timeout(timeout) {
+        match reply_rx.recv_timeout(host_wait_timeout) {
             Ok(outcome) => Ok(outcome),
-            Err(mpsc::RecvTimeoutError::Timeout) => Ok(CallOutcome::Timeout),
+            Err(mpsc::RecvTimeoutError::Timeout) => Err(ThreadedRuntimeError::HostWaitTimeout),
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 if let Some(metrics) = self.shard_metrics.get(&shard) {
                     metrics.set_state(LiveShardState::Failed);

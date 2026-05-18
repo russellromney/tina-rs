@@ -2549,7 +2549,7 @@ where
                     call_id: context.call_id,
                     requester: context.requester,
                     cause: context.cause,
-                    deadline: self.clock.now() + timeout,
+                    deadline: tina::Deadline::from_instant(self.clock.now(), timeout).instant(),
                     insertion_order,
                     continuation_context: context.continuation_context,
                     translator: Some(translator),
@@ -2603,54 +2603,56 @@ where
             tina::CallHandleState::Settled => tina::CancelOutcome::AlreadyCompleted,
             tina::CallHandleState::Cancelled => tina::CancelOutcome::AlreadyCancelled,
             tina::CallHandleState::Pending => {
-                let raw_call_id = handle_shared.call_id().expect(
-                    "cancel_call dispatched before its call_cancelable effect ran. \
-                     Within one isolate handler, batched effects dispatch in order, so \
-                     this means cancel was emitted before the call effect — issue cancel \
-                     from a separate handler, or store the handle and cancel later.",
-                );
-                let stamped_shard = handle_shared.shard_id().expect(
-                    "shard_id is stamped together with call_id — call_id was Some but \
-                     shard_id was None, which violates set_call_id / set_shard_id pairing.",
-                );
-                if stamped_shard != self.shard.id().get() {
-                    // Cross-shard cancel: the pending-call entry lives
-                    // on the originating shard. Reject with a typed
-                    // outcome instead of silently no-op'ing into
-                    // `AlreadyCompleted`.
-                    tina::CancelOutcome::WrongShard
-                } else {
-                    let call_id = CallId::new(raw_call_id);
-                    match self
-                        .pending_isolate_calls
-                        .iter()
-                        .position(|entry| entry.call_id == call_id)
-                    {
-                        Some(index) => {
-                            let mut entry = self.pending_isolate_calls.remove(index);
-                            // CallCancelled's trace cause chains back
-                            // to the original CallDispatchAttempted so
-                            // every CallDispatchAttempted has exactly
-                            // one settlement event downstream of it.
-                            let original_cause = entry.cause;
-                            let _ = entry.translator.take();
-                            handle_shared.set_state(tina::CallHandleState::Cancelled);
-                            self.record_cancelled_call(call_id, tina::CancelCause::CallerCancelled);
-                            self.close_deferred_slot_for_call_with_reason(
-                                call_id,
-                                trace::DeferredReplyRejectedReason::CallerCancelled,
-                            );
-                            self.push_event(
-                                context.requester.isolate,
-                                Some(original_cause),
-                                RuntimeEventKind::CallCancelled {
-                                    call_id,
-                                    cause: tina::CancelCause::CallerCancelled,
-                                },
-                            );
-                            tina::CancelOutcome::Cancelled
+                match handle_shared.call_id() {
+                    None => tina::CancelOutcome::NotAdmitted,
+                    Some(raw_call_id) => {
+                        let stamped_shard = handle_shared.shard_id().expect(
+                            "shard_id is stamped together with call_id — call_id was Some but \
+                             shard_id was None, which violates set_call_id / set_shard_id pairing.",
+                        );
+                        if stamped_shard != self.shard.id().get() {
+                            // Cross-shard cancel: the pending-call entry lives
+                            // on the originating shard. Reject with a typed
+                            // outcome instead of silently no-op'ing into
+                            // `AlreadyCompleted`.
+                            tina::CancelOutcome::WrongShard
+                        } else {
+                            let call_id = CallId::new(raw_call_id);
+                            match self
+                                .pending_isolate_calls
+                                .iter()
+                                .position(|entry| entry.call_id == call_id)
+                            {
+                                Some(index) => {
+                                    let mut entry = self.pending_isolate_calls.remove(index);
+                                    // CallCancelled's trace cause chains back
+                                    // to the original CallDispatchAttempted so
+                                    // every CallDispatchAttempted has exactly
+                                    // one settlement event downstream of it.
+                                    let original_cause = entry.cause;
+                                    let _ = entry.translator.take();
+                                    handle_shared.set_state(tina::CallHandleState::Cancelled);
+                                    self.record_cancelled_call(
+                                        call_id,
+                                        tina::CancelCause::CallerCancelled,
+                                    );
+                                    self.close_deferred_slot_for_call_with_reason(
+                                        call_id,
+                                        trace::DeferredReplyRejectedReason::CallerCancelled,
+                                    );
+                                    self.push_event(
+                                        context.requester.isolate,
+                                        Some(original_cause),
+                                        RuntimeEventKind::CallCancelled {
+                                            call_id,
+                                            cause: tina::CancelCause::CallerCancelled,
+                                        },
+                                    );
+                                    tina::CancelOutcome::Cancelled
+                                }
+                                None => tina::CancelOutcome::AlreadyCompleted,
+                            }
                         }
-                        None => tina::CancelOutcome::AlreadyCompleted,
                     }
                 }
             }

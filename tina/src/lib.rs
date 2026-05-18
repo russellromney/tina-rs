@@ -2667,6 +2667,13 @@ pub enum CancelCause {
 pub enum CancelOutcome {
     /// Wait closed; capacity reclaimed; late replies become rejected facts.
     Cancelled,
+    /// The handle is still pending but has not been admitted by the runtime.
+    ///
+    /// This can happen when a handler emits `cancel_call(handle)` before the
+    /// matching `call_cancelable(...).then(...)` effect in the same batch. No
+    /// call slot exists yet, so there is nothing to reclaim and no pending
+    /// remote work to cancel.
+    NotAdmitted,
     /// Already replied, timed out, or otherwise settled.
     AlreadyCompleted,
     /// Already cancelled.
