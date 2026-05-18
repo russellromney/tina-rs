@@ -12,15 +12,20 @@ This file records completed work.
 - HTTP/2: confirmed typed `Http2ProtocolError` covers bad preface, oversized
   frame/headers/body, malformed pseudo-headers, flow-control, window
   overflow, bad stream id, unsupported frames, and request trailers, plus
-  `Http2Outcome::{Replied, Full, Closed, FlowControlBlocked, Timeout,
-  ProtocolError, StreamReset(u32)}` and `Http2ConnectionReport` counters for
-  opened/closed/reset streams, connection/stream full, flow-control blocked,
-  GOAWAY sent, and late replies after close. Live tests cover unary,
-  streaming response, oversized request/response/frame/headers, stream cap,
-  concurrent streams, peer GOAWAY, window-update unblocking, stream-window
-  blocked bystander streams, inbound chunks continuing while a response
-  stream is flow-control blocked, inbound stream-window enforcement, and
-  window-credit return on data consumption.
+  `Http2Outcome` (marked `#[non_exhaustive]`) names the six lifecycle
+  categories the plan called out: `Replied`, `Full`, `Closed`,
+  `FlowControlBlocked`, `Timeout`, `ProtocolError(Http2ProtocolError)`,
+  `StreamReset(u32)` (peer-initiated), and `LocalCancel(u32)` (locally
+  initiated). `Http2ConnectionReport` carries the per-connection counters
+  for opened/closed/reset streams, connection/stream full, flow-control
+  blocked, GOAWAY sent, and late replies after close.
+- HTTP/2 live tests now also assert the wire error code on every GOAWAY
+  and on each RST_STREAM the server emits: oversized frame ->
+  FRAME_SIZE_ERROR, oversized header block -> PROTOCOL_ERROR, inbound
+  flow-control violation -> FLOW_CONTROL_ERROR, stream cap exceeded ->
+  ENHANCE_YOUR_CALM, refused-after-peer-GOAWAY -> REFUSED_STREAM. Unit
+  tests pin the typed-error -> wire-code mapping and the Http2Outcome
+  vocabulary so future drift breaks compile or assertion, not silently.
 - gRPC: `GrpcRouter` ships unary, server-streaming, client-streaming, and
   bidirectional streaming routes with typed `GrpcStatus` trailers, declared
   message caps, deadline-to-`DeadlineExceeded` mapping, content-type
@@ -53,6 +58,17 @@ This file records completed work.
   client, HTTP/2 TLS ALPN/mTLS, gRPC reflection/interceptors/load
   balancing, native broad WebSocket client, `permessage-deflate`,
   web-framework ergonomics, and full WebSocket-bytes simulator replay).
+- Honest gap: per the plan's "Rock 5 Simulator Facts", the protocol
+  facts that the plan named (stream opened/closed/reset, flow-control
+  full, body high-water, WebSocket slow-peer close, gRPC final status
+  sent/received) surface today as bounded counters on
+  `Http2ConnectionReport`, `BodyMetrics`, `WebSocketMemberTableReport`,
+  and the typed `GrpcStatus` trailers — not as `RuntimeEventKind`
+  variants on the trace stream. Plumbing those facts through the
+  runtime trace stream so they ride alongside MailboxAccepted / Send /
+  Spawn events (and round-trip through `tina-sim` replay) is the next
+  protocol-observability slice. Until then, users debug protocol
+  behavior through the counter snapshots, not through trace.
 
 ### Phase 102 Host Control Ergonomics
 

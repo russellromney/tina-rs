@@ -269,6 +269,37 @@ fn read_until_goaway(stream: &mut TcpStream) -> TestFrame {
     panic!("did not see GOAWAY");
 }
 
+// Wire-level error codes from RFC 7540 §7.
+const ERR_PROTOCOL_ERROR: u32 = 0x1;
+const ERR_FLOW_CONTROL_ERROR: u32 = 0x3;
+const ERR_FRAME_SIZE_ERROR: u32 = 0x6;
+const ERR_REFUSED_STREAM: u32 = 0x7;
+const ERR_ENHANCE_YOUR_CALM: u32 = 0xb;
+
+fn goaway_error_code(frame: &TestFrame) -> u32 {
+    assert_eq!(frame.ty, FRAME_GOAWAY, "expected GOAWAY frame");
+    assert!(
+        frame.payload.len() >= 8,
+        "GOAWAY payload must carry last_stream_id (4B) + error_code (4B); got {} bytes",
+        frame.payload.len()
+    );
+    let mut buf = [0_u8; 4];
+    buf.copy_from_slice(&frame.payload[4..8]);
+    u32::from_be_bytes(buf)
+}
+
+fn rst_stream_error_code(frame: &TestFrame) -> u32 {
+    assert_eq!(frame.ty, FRAME_RST_STREAM, "expected RST_STREAM frame");
+    assert_eq!(
+        frame.payload.len(),
+        4,
+        "RST_STREAM payload must be exactly 4 bytes"
+    );
+    let mut buf = [0_u8; 4];
+    buf.copy_from_slice(&frame.payload[..4]);
+    u32::from_be_bytes(buf)
+}
+
 struct StreamingResponseService {
     source: Address<tina_http::ResponseChunkMsg, tina_http::ResponseChunkReply>,
 }
@@ -451,6 +482,10 @@ fn http2_stream_cap_full_resets_new_stream_without_growing_table() {
 
     let frame = read_until_rst(&mut stream, 3);
     assert_eq!(frame.stream_id, 3);
+    // RFC 7540 §7: stream cap exceeded is ENHANCE_YOUR_CALM, which lets
+    // the peer distinguish "you're sending too fast" from a generic
+    // protocol error.
+    assert_eq!(rst_stream_error_code(&frame), ERR_ENHANCE_YOUR_CALM);
 
     write_frame(&mut stream, FRAME_RST_STREAM, 0, 1, &0_u32.to_be_bytes());
     harness.shutdown();
@@ -548,6 +583,10 @@ fn http2_oversized_frame_sends_goaway() {
 
     let frame = read_until_goaway(&mut stream);
     assert_eq!(frame.stream_id, 0);
+    // RFC 7540 §6.5.2: oversized frame is FRAME_SIZE_ERROR, not the generic
+    // PROTOCOL_ERROR. The typed Http2ProtocolError::FrameTooLarge { .. }
+    // path must map to the FRAME_SIZE_ERROR wire code in handle_read.
+    assert_eq!(goaway_error_code(&frame), ERR_FRAME_SIZE_ERROR);
     harness.shutdown();
 }
 
@@ -573,6 +612,11 @@ fn http2_oversized_header_sends_goaway() {
 
     let frame = read_until_goaway(&mut stream);
     assert_eq!(frame.stream_id, 0);
+    // Oversized header block is a PROTOCOL_ERROR per RFC 7540, not the
+    // FRAME_SIZE_ERROR used for oversized DATA payloads. Pinning this
+    // mapping catches regressions where the typed error -> wire code path
+    // drifts.
+    assert_eq!(goaway_error_code(&frame), ERR_PROTOCOL_ERROR);
     harness.shutdown();
 }
 
@@ -772,6 +816,10 @@ fn http2_peer_goaway_stops_new_streams_visibly() {
 
     let frame = read_until_rst(&mut stream, 1);
     assert_eq!(frame.stream_id, 1);
+    // After a peer GOAWAY, the server refuses *new* streams with
+    // REFUSED_STREAM so the peer knows the work was never started, not
+    // partially-applied.
+    assert_eq!(rst_stream_error_code(&frame), ERR_REFUSED_STREAM);
     harness.shutdown();
 }
 
@@ -799,6 +847,11 @@ fn http2_inbound_data_obeys_stream_window() {
 
     let frame = read_frame(&mut stream);
     assert_eq!(frame.ty, FRAME_GOAWAY);
+    // Receiving more DATA than the advertised window allows is the
+    // canonical FLOW_CONTROL_ERROR, not a generic PROTOCOL_ERROR. Pin the
+    // wire code so the typed Http2ProtocolError::FlowControl -> GOAWAY
+    // mapping does not regress.
+    assert_eq!(goaway_error_code(&frame), ERR_FLOW_CONTROL_ERROR);
     harness.shutdown();
 }
 

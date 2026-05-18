@@ -26,7 +26,9 @@ use crate::websocket::{
 
 /// Bounded report counters captured by the table itself. Rooms can mirror
 /// these into their own report shape; the table never grows a counter without
-/// one.
+/// one. Marked `#[non_exhaustive]` so new typed outcomes can grow the report
+/// without breaking semver on existing fields.
+#[non_exhaustive]
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct WebSocketMemberTableReport {
     pub joined: u64,
@@ -438,6 +440,195 @@ mod tests {
             table.shutdown_close(Some(WebSocketCloseCode(1001)), b"bye".to_vec());
         let count_after = table.report().shutdown_close_requested;
         assert_eq!(count_after - count_before, 2);
+        // Members are deliberately left populated so subsequent SessionClose /
+        // SendOutcome deliveries can reconcile membership through the
+        // ordinary paths.
+        assert_eq!(table.len(), 2);
+    }
+
+    #[test]
+    fn record_send_outcome_closed_evicts_with_left_peer() {
+        let mut table = WebSocketMemberTable::new(2);
+        let h = dummy_handle(1);
+        let id = h.session_id();
+        table.admit(h);
+        let outcome = WebSocketSendOutcome {
+            session: id,
+            result: Err(WebSocketSendError::Closed),
+        };
+        assert_eq!(
+            table.record_send_outcome(&outcome),
+            SendOutcomeAction::RemovedClosed
+        );
+        assert_eq!(table.len(), 0);
+        assert_eq!(table.report().left_peer, 1);
+        assert_eq!(table.report().broadcast_closed, 1);
+    }
+
+    #[test]
+    fn record_send_outcome_closing_evicts_with_left_peer() {
+        let mut table = WebSocketMemberTable::new(2);
+        let h = dummy_handle(1);
+        let id = h.session_id();
+        table.admit(h);
+        let outcome = WebSocketSendOutcome {
+            session: id,
+            result: Err(WebSocketSendError::Closing),
+        };
+        assert_eq!(
+            table.record_send_outcome(&outcome),
+            SendOutcomeAction::RemovedClosed
+        );
+        assert_eq!(table.len(), 0);
+        assert_eq!(table.report().left_peer, 1);
+        assert_eq!(table.report().broadcast_closed, 1);
+    }
+
+    #[test]
+    fn record_send_outcome_timeout_evicts_with_left_timeout() {
+        let mut table = WebSocketMemberTable::new(2);
+        let h = dummy_handle(1);
+        let id = h.session_id();
+        table.admit(h);
+        let outcome = WebSocketSendOutcome {
+            session: id,
+            result: Err(WebSocketSendError::Timeout),
+        };
+        assert_eq!(
+            table.record_send_outcome(&outcome),
+            SendOutcomeAction::RemovedTimeout
+        );
+        assert_eq!(table.len(), 0);
+        assert_eq!(table.report().left_timeout, 1);
+        assert_eq!(table.report().broadcast_timeout, 1);
+    }
+
+    #[test]
+    fn record_send_outcome_bytes_full_is_slow_eviction() {
+        let mut table = WebSocketMemberTable::new(2);
+        let h = dummy_handle(1);
+        let id = h.session_id();
+        table.admit(h);
+        let outcome = WebSocketSendOutcome {
+            session: id,
+            result: Err(WebSocketSendError::OutboundBytesFull),
+        };
+        assert_eq!(
+            table.record_send_outcome(&outcome),
+            SendOutcomeAction::RemovedSlow
+        );
+        assert_eq!(table.report().left_slow, 1);
+        assert_eq!(table.report().broadcast_full, 1);
+    }
+
+    #[test]
+    fn broadcast_text_excludes_named_session() {
+        let mut table = WebSocketMemberTable::new(4);
+        let alpha = dummy_handle(1);
+        let bravo = dummy_handle(2);
+        let charlie = dummy_handle(3);
+        table.admit(alpha);
+        table.admit(bravo);
+        table.admit(charlie);
+
+        let effects: Vec<Effect<DummyRoomIsolate>> =
+            table.broadcast_text(Some(bravo.session_id()), "ping");
+        assert_eq!(
+            effects.len(),
+            2,
+            "exclude should drop bravo from the fanout"
+        );
+    }
+
+    #[test]
+    fn broadcast_text_with_no_exclude_targets_every_member() {
+        let mut table = WebSocketMemberTable::new(4);
+        table.admit(dummy_handle(1));
+        table.admit(dummy_handle(2));
+        table.admit(dummy_handle(3));
+        let effects: Vec<Effect<DummyRoomIsolate>> = table.broadcast_text(None, "ping");
+        assert_eq!(effects.len(), 3);
+    }
+
+    #[test]
+    fn broadcast_binary_routes_through_handle_binary() {
+        let mut table = WebSocketMemberTable::new(2);
+        table.admit(dummy_handle(1));
+        let effects: Vec<Effect<DummyRoomIsolate>> =
+            table.broadcast_binary(None, b"bytes".to_vec());
+        assert_eq!(effects.len(), 1);
+    }
+
+    #[test]
+    fn fill_close_refill_keeps_member_high_water_high() {
+        // Phase 094's "fill-close-refill" pattern: peak occupancy must be
+        // remembered across reset cycles so a later refill doesn't lower
+        // the high-water mark.
+        let mut table = WebSocketMemberTable::new(4);
+        for i in 0..4 {
+            table.admit(dummy_handle(i));
+        }
+        assert_eq!(table.report().member_high_water, 4);
+        // Evict everyone via the slow-peer path. The table should be empty
+        // but the high water should NOT drop.
+        for i in 0..4 {
+            let id = dummy_handle(i).session_id();
+            // Re-admit needs the same session id; the dummy_handle factory
+            // returns fresh ids on each call. Use remove_peer/admit cycle
+            // with the original handles instead.
+            let _ = id; // silence
+        }
+        // Direct removal preserves high water:
+        let snapshot_ids: Vec<WebSocketSessionId> = table.members().map(|(id, _)| id).collect();
+        for id in snapshot_ids {
+            assert!(table.remove(id).is_some());
+        }
+        assert_eq!(table.len(), 0);
+        assert_eq!(table.report().member_high_water, 4);
+        // Refill below the previous peak:
+        table.admit(dummy_handle(99));
+        table.admit(dummy_handle(100));
+        assert_eq!(table.len(), 2);
+        assert_eq!(table.report().member_high_water, 4);
+    }
+
+    #[test]
+    fn is_full_and_capacity_boundaries() {
+        let mut table = WebSocketMemberTable::new(2);
+        assert!(!table.is_full());
+        assert_eq!(table.capacity(), 2);
+        table.admit(dummy_handle(1));
+        assert!(!table.is_full());
+        table.admit(dummy_handle(2));
+        assert!(table.is_full());
+    }
+
+    #[test]
+    fn contains_get_and_iteration_round_trip() {
+        let mut table = WebSocketMemberTable::new(2);
+        let h = dummy_handle(7);
+        let id = h.session_id();
+        assert!(!table.contains(id));
+        assert!(table.get(id).is_none());
+        table.admit(h);
+        assert!(table.contains(id));
+        assert!(table.get(id).is_some());
+        let ids: Vec<WebSocketSessionId> = table.members().map(|(id, _)| id).collect();
+        assert_eq!(ids.len(), 1);
+        assert_eq!(ids[0], id);
+    }
+
+    #[test]
+    fn remove_without_report_change_does_not_bump_left_peer() {
+        let mut table = WebSocketMemberTable::new(2);
+        let h = dummy_handle(1);
+        let id = h.session_id();
+        table.admit(h);
+        let report_before = table.report();
+        assert!(table.remove(id).is_some());
+        let report_after = table.report();
+        assert_eq!(report_before.left_peer, report_after.left_peer);
+        assert!(table.is_empty());
     }
 
     struct DummyRoomIsolate;
