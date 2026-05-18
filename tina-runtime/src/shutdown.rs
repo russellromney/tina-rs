@@ -396,6 +396,16 @@ where
             }
         }
     }
+
+    /// Bounded owner/drop wait. Unlike [`Self::wait_report_blocking`],
+    /// this returns if a wedged worker prevents the joiner from
+    /// producing terminal truth within `timeout`.
+    pub(crate) fn wait_report_for_owner_with_timeout(
+        &self,
+        timeout: Duration,
+    ) -> Result<LocalSystemTerminalReport, ShutdownWaitError> {
+        self.wait_report_with_timeout(timeout)
+    }
 }
 
 // `SharedShutdownState` itself cannot implement `ShutdownInner` directly:

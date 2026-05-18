@@ -686,6 +686,7 @@ impl SignalUnsupportedService {
 enum ProcessMsg {
     Echo,
     Sleep,
+    GrandchildStdout,
     Done(Result<tina_runtime::ProcessRunResult, CallError>),
 }
 
@@ -714,6 +715,14 @@ impl ProcessService {
                 "/bin/sleep",
                 vec!["5".to_string()],
                 Duration::from_millis(10),
+                16,
+                16,
+            )
+            .then(ProcessMsg::Done),
+            ProcessMsg::GrandchildStdout => process_run(
+                "/bin/sh",
+                vec!["-c".to_string(), "sleep 5 & exit 0".to_string()],
+                Duration::from_secs(2),
                 16,
                 16,
             )
@@ -2572,6 +2581,16 @@ fn local_system_process_run_captures_truncates_and_times_out() {
             .expect("process observed lock")
             .iter()
             .any(|entry| entry == "err:Timeout")
+    });
+
+    app.try_send(address, ProcessMsg::GrandchildStdout)
+        .expect("start process grandchild stdout inheritance");
+    wait_until(|| {
+        observed
+            .lock()
+            .expect("process observed lock")
+            .iter()
+            .any(|entry| entry == "exit:Some(0)::true")
     });
 
     let terminal = app

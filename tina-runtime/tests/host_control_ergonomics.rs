@@ -473,6 +473,15 @@ fn shutdown_handle_wait_before_request_returns_timeout() {
 }
 
 #[test]
+fn shutdown_with_timeout_returns_terminal_report_on_cooperative_runtime() {
+    let runtime = single_runtime(64);
+    let report = runtime
+        .shutdown_with_timeout(Duration::from_secs(2))
+        .expect("bounded shutdown");
+    assert!(report.error().is_none(), "clean shutdown expected");
+}
+
+#[test]
 fn shutdown_handle_two_waiters_get_equal_terminal_reports() {
     let runtime = Arc::new(single_runtime(64));
     let handle_a = runtime.shutdown_handle();

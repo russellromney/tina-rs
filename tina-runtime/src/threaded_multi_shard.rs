@@ -25,7 +25,9 @@ use crate::call::{CallOutcome, IntoErasedCall, RuntimeCall, call};
 use crate::capabilities::RuntimeCapabilities;
 use crate::clock::MonotonicClock;
 use crate::driver::BetelgeuseDriver;
-use crate::errors::{ThreadedRegisterBootstrapError, ThreadedRuntimeError, ThreadedTrySendError};
+use crate::errors::{
+    ShutdownWaitError, ThreadedRegisterBootstrapError, ThreadedRuntimeError, ThreadedTrySendError,
+};
 use crate::live_report::{
     LiveQueueMetrics, LiveRemoteQueueReport, LiveShardMetrics, LiveShardState, LiveTopologyReport,
 };
@@ -623,6 +625,20 @@ where
         shared.wait_report_blocking()
     }
 
+    /// Requests shutdown and waits up to `timeout` for terminal truth.
+    ///
+    /// This is the explicit bounded form for hosts that cannot risk an
+    /// unbounded join. A timeout returns [`ShutdownWaitError::Timeout`]
+    /// while the background joiner may continue trying to finish.
+    pub fn shutdown_with_timeout(
+        self,
+        timeout: Duration,
+    ) -> Result<LocalSystemTerminalReport, ShutdownWaitError> {
+        let shared = Arc::clone(&self.shutdown);
+        drop(self);
+        shared.wait_report_for_owner_with_timeout(timeout)
+    }
+
     /// Returns a cloneable handle that controls runtime-level shutdown
     /// without consuming the runtime value.
     ///
@@ -775,7 +791,9 @@ where
 {
     fn drop(&mut self) {
         self.shutdown.shutdown_blocking();
-        let _ = self.shutdown.wait_report_blocking();
+        let _ = self.shutdown.wait_report_for_owner_with_timeout(
+            crate::threaded::DEFAULT_SHUTDOWN_LANE_DRAIN_TIMEOUT,
+        );
     }
 }
 
@@ -940,7 +958,7 @@ where
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
             }
         } else {
-            thread::yield_now();
+            thread::sleep(Duration::from_millis(1));
         }
     }
 

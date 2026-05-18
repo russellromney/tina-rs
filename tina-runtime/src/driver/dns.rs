@@ -237,7 +237,7 @@ impl DnsWorkerLane {
             if self.pending.is_empty() || Instant::now() >= deadline {
                 break;
             }
-            thread::yield_now();
+            thread::sleep(Duration::from_millis(1));
         }
         sink.clear();
         if self

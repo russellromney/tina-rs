@@ -3,6 +3,11 @@
 
 use super::*;
 
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
+
+const PROCESS_DRAIN_JOIN_TIMEOUT: Duration = Duration::from_millis(100);
+
 pub(super) enum ProcessLane {
     Worker(ProcessWorkerLane),
 }
@@ -202,7 +207,7 @@ impl ProcessWorkerLane {
             if self.pending.is_empty() || Instant::now() >= deadline {
                 break;
             }
-            thread::yield_now();
+            thread::sleep(Duration::from_millis(1));
         }
         sink.clear();
         if self.handle.as_ref().is_some_and(JoinHandle::is_finished) {
@@ -258,13 +263,7 @@ fn execute_process_command(command: ProcessCommand) -> CallOutput {
         return CallOutput::Failed(CallError::Timeout);
     }
 
-    let mut child = match Command::new(&command.command)
-        .args(&command.args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-    {
+    let mut child = match spawn_process(&command) {
         Ok(child) => child,
         Err(_) => return CallOutput::Failed(CallError::Io),
     };
@@ -302,7 +301,12 @@ fn kill_and_reap(
     stderr: Option<JoinHandle<(Vec<u8>, bool)>>,
     fallback: CallError,
 ) -> CallOutput {
-    if child.kill().is_err() {
+    #[cfg(unix)]
+    let killed_group = kill_process_group(child.id()).is_ok();
+    #[cfg(not(unix))]
+    let killed_group = false;
+
+    if !killed_group && child.kill().is_err() {
         return match child.try_wait() {
             Ok(Some(status)) => process_exited(status, stdout, stderr),
             Ok(None) | Err(_) => CallOutput::Failed(CallError::KillUncertain),
@@ -311,9 +315,41 @@ fn kill_and_reap(
     if child.wait().is_err() {
         return CallOutput::Failed(CallError::KillUncertain);
     }
-    let _ = join_drain(stdout);
-    let _ = join_drain(stderr);
+    let _ = join_drain_bounded(stdout, PROCESS_DRAIN_JOIN_TIMEOUT);
+    let _ = join_drain_bounded(stderr, PROCESS_DRAIN_JOIN_TIMEOUT);
     CallOutput::Failed(fallback)
+}
+
+fn spawn_process(command: &ProcessCommand) -> std::io::Result<std::process::Child> {
+    let mut builder = Command::new(&command.command);
+    builder
+        .args(&command.args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    {
+        // Put the child in its own process group so timeout/cancel can
+        // kill descendants that inherited stdout/stderr.
+        builder.process_group(0);
+    }
+    builder.spawn()
+}
+
+#[cfg(unix)]
+fn kill_process_group(pid: u32) -> std::io::Result<()> {
+    let status = Command::new("kill")
+        .arg("-KILL")
+        .arg(format!("-{pid}"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(std::io::Error::other("kill process group failed"))
+    }
 }
 
 fn process_exited(
@@ -321,8 +357,8 @@ fn process_exited(
     stdout: Option<JoinHandle<(Vec<u8>, bool)>>,
     stderr: Option<JoinHandle<(Vec<u8>, bool)>>,
 ) -> CallOutput {
-    let (stdout, stdout_truncated) = join_drain(stdout);
-    let (stderr, stderr_truncated) = join_drain(stderr);
+    let (stdout, stdout_truncated) = join_drain_bounded(stdout, PROCESS_DRAIN_JOIN_TIMEOUT);
+    let (stderr, stderr_truncated) = join_drain_bounded(stderr, PROCESS_DRAIN_JOIN_TIMEOUT);
     CallOutput::ProcessExited {
         status: ProcessStatus {
             code: status.code(),
@@ -363,8 +399,20 @@ where
     })
 }
 
-fn join_drain(handle: Option<JoinHandle<(Vec<u8>, bool)>>) -> (Vec<u8>, bool) {
-    handle
-        .and_then(|handle| handle.join().ok())
-        .unwrap_or_default()
+fn join_drain_bounded(
+    handle: Option<JoinHandle<(Vec<u8>, bool)>>,
+    timeout: Duration,
+) -> (Vec<u8>, bool) {
+    let Some(handle) = handle else {
+        return (Vec::new(), false);
+    };
+    let deadline = Instant::now() + timeout;
+    let mut handle = Some(handle);
+    while Instant::now() < deadline {
+        if handle.as_ref().is_some_and(JoinHandle::is_finished) {
+            return handle.take().unwrap().join().unwrap_or_default();
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
+    (Vec::new(), true)
 }
