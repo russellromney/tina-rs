@@ -19,6 +19,8 @@ Grug truth:
 - remote replies are never silently dropped;
 - process and persistence failure paths settle;
 - hot runtime paths do not hide O(n) work;
+- pool/resource ownership cannot leak quietly;
+- compile-time helpers do not depend on fragile crate names;
 - tests prove user-visible behavior, not just helper internals.
 
 Canonical review artifact: `docs/adversarial-review.md` from PR #135. PR
@@ -61,7 +63,7 @@ Required tests:
 
 ## Rock 2: HTTP Parser And WebSocket Strictness
 
-Fix H14, L13, A6, M1, A7, and L14. If any one is already fixed on current
+Fix H14, L13, A6, M1, M6, A7, and L14. If any one is already fixed on current
 main, add/keep the regression test that proves it and mark it fixed in the
 review doc.
 
@@ -80,6 +82,8 @@ WebSocket parser:
   - len <= 65535 must not use 127 form;
   - 127 form with high bit set is invalid;
 - use checked arithmetic for computed frame end;
+- validate fragmented text as UTF-8 across continuation frames before delivery,
+  and reject invalid sequences with a typed close/protocol outcome;
 - keep close-code and control-frame rules visible.
 
 HTTP/1 origin form:
@@ -97,6 +101,8 @@ Required tests:
 - WebSocket 127-form length 125 rejects;
 - WebSocket 127-form high bit rejects;
 - WebSocket huge frame end cannot overflow;
+- fragmented WebSocket text with invalid UTF-8 across frame boundaries rejects
+  before application delivery;
 - `GET //evil.test/path HTTP/1.1` rejects as bad target.
 
 ## Rock 3: HTTP/2 Protocol Hardening
@@ -383,7 +389,218 @@ Required tests:
 - repeated child restarts do not grow live entry table without bound;
 - cancel-cause overflow is visible.
 
-## Rock 9: Docs, Findings, And Follow-Up Split
+## Rock 9: Pool, RPC, And Resource Ownership Truth
+
+Fix H3, M5, M21, L1, L6, L8, and L15.
+
+Pool leases:
+
+- `PoolLease` must not silently leak a resource forever on panic, early return,
+  owner stop, or `OneForAll` stop.
+- Preferred user shape: add a closure/turn-scoped lease helper that makes the
+  safe path the copied path.
+- Also add visible leak/abandoned-lease accounting for stored leases that cannot
+  be auto-returned safely. Do not pretend Rust `Drop` can always send a Tina
+  effect from arbitrary context.
+- Pool close must still retire outstanding leases as already promised.
+
+RPC request identity:
+
+- server-side `Connection.in_flight` must become request-id aware, not only a
+  count;
+- duplicate request id while an old one is in flight must return a typed
+  protocol error or close the connection. It must not dispatch duplicate work.
+
+Bridge shim sizing:
+
+- bridge shim mailbox sizing must be safe across repeated cancel/retry waves,
+  not only one wave;
+- add pressure tests for two back-to-back cancellation waves.
+
+Deferred/pool internals:
+
+- `PendingReplies::take()` must update reclaim counters or docs must stop
+  promising it does;
+- `DeferredSlotShared` ordering must match the call-handle ordering discipline
+  unless a test proves `Relaxed` is enough;
+- replace public `unsafe fn` contract markers with sealed/private authority
+  types or clearly memory-safety-relevant unsafe. User-facing "do not call this"
+  should not be `unsafe` theater.
+
+SQLx fetch cap:
+
+- `FetchMany` cap+peek must not decode/buffer an extra full row beyond the
+  documented cap unless the docs and metrics name that one-row peek cost.
+
+Required tests:
+
+- panic or owner stop while holding a pool lease produces visible abandoned or
+  retired resource truth and pool report stays coherent;
+- safe scoped lease helper returns/retire resource on success and error paths;
+- duplicate RPC request id cannot run service code twice;
+- two cancel/retry waves cannot exceed shim mailbox budget;
+- `PendingReplies::take()` counter behavior is pinned;
+- loom/unit test pins deferred slot memory-ordering expectations;
+- public pool constructors cannot mint/forge leases without authority;
+- SQLx `FetchMany` cap test proves only the documented rows are decoded or that
+  the one-row peek is explicitly counted.
+
+## Rock 10: Runtime Call, Time, Lifecycle, And Shutdown Truth
+
+Fix M2, M3, M16, M23, M24, M25, L2, L3, L4, and L16.
+
+Call/cancel/time:
+
+- `cancel_call` before the call effect is admitted must return a typed outcome,
+  not panic the shard;
+- call deadline math must use checked/saturating add like Tina time helpers;
+- `call_blocking` must distinguish the host wait budget from the target call
+  deadline. User can choose same duration, but the API/report must not conflate
+  them.
+
+Lifecycle reports:
+
+- `ShutdownChoreography::record` must report the highest completed step, not
+  whichever step happened last;
+- trace/event projection must preserve `CallError::Rejected(reason)` inner
+  reason so dashboards do not lose the cause;
+- `AddressGeneration` should either become real generation truth or be removed
+  from public claims. Do not keep a dead field that suggests stale-address
+  detection exists.
+
+Signals and TLS close:
+
+- signal registration must be process-global and explicit. Do not silently
+  multiply SIGINT/SIGTERM handlers by shard count or demote an embedder's
+  existing handler without a typed setup error/report;
+- TLS close must not return `TlsFull` only because cancelled-but-still-pending
+  ops are counted as live close pressure.
+
+Timers:
+
+- `RecurringTick::Bounded(0)` missed-tick count must match the documented
+  policy;
+- `elapsed_periods` must not silently truncate `u128` to `u64`.
+
+Required tests:
+
+- cancel-before-admit returns typed failure and shard keeps running;
+- huge duration call deadline does not panic/wrap;
+- `call_blocking(host_budget < target_deadline)` reports host timeout
+  distinctly;
+- shutdown choreography out-of-order records highest step correctly;
+- trace projection includes rejected reason;
+- signal setup is one-per-process and reports conflict;
+- TLS close after cancellation pressure either admits close or returns a typed
+  truthful outcome;
+- recurring tick edge cases are pinned.
+
+## Rock 11: TLS Lane, SPSC Mailbox, And Macro Hygiene
+
+Fix H8, H12, M11, M12, M22, L7, L9, and L12.
+
+TLS lane:
+
+- the public TLS lane docs/config must stop implying queue capacity means
+  concurrency;
+- either add real bounded worker concurrency for TLS work or rename/report the
+  shape as one worker plus bounded queue;
+- blocking TLS read/write/flush under `Arc<Mutex<_>>` must remain owner-thread
+  only by type/API, or be refactored so future shared access cannot deadlock.
+
+SPSC mailbox:
+
+- require power-of-two capacity or use arithmetic that remains sound across
+  wraparound for all capacities;
+- add loom coverage for producer + consumer + closer interleavings.
+
+Macros:
+
+- proc macros must not hard-code `::tina`, `::tina_runtime`, or `::tina_rpc`
+  without an escape hatch;
+- use parent-crate `__private` re-exports or an explicit `*_crate = path`
+  attribute;
+- emitted `Infallible` should use `core` where possible;
+- the call-authority lint must not reject helper-macro-based handlers if they
+  still consume the authority correctly;
+- RPC macro positional tuple ABI must be documented or replaced with a stable
+  named encoding.
+
+Required tests:
+
+- renamed Cargo dependencies compile for `tina` and `tina-rpc` macros;
+- helper macro around call authority compiles when it really consumes the
+  authority and fails when it does not;
+- no-std-ish macro expansion uses `core::convert::Infallible` where possible;
+- SPSC loom test covers close racing producer/consumer;
+- non-power-of-two mailbox capacity is rejected or proven safe;
+- TLS lane pressure report names queued vs concurrent work truth.
+
+## Rock 12: Simulator And Proof-Harness Truth
+
+Fix M9, M10, M15, M18, M19, M20, L17, and L18.
+
+Simulator faults and time:
+
+- replace `(seed + tag + ordinal) % one_in` with a real deterministic PRNG per
+  simulator, with per-tag streams;
+- simulator virtual time must not leak wall-clock `Instant::now()` into replay
+  facts;
+- saved replay cases must verify projection/config facts structurally, not only
+  keep `Debug` strings that nobody checks.
+
+Proof harness:
+
+- `LiveTrace` poisoned mutex must fail loudly or preserve prior good truth; it
+  must not silently drop events and bless a bad hash;
+- `MultiShardSimulator` needs trace observer support or docs/tests must stop
+  implying live/sim observer parity;
+- `BadPeerScenario::ResetImmediately` must produce a real TCP RST or be renamed
+  to FIN;
+- `LoadReport::first_error_op_index` must be global if named global, or renamed
+  to local;
+- `run_storm` must report all connection errors or aggregate counts, not only
+  the last error while claiming `connected=true`.
+
+Required tests:
+
+- same seed produces same fault sequence; different tags do not correlate
+  trivially;
+- saved replay rejects mismatched structured config/projection;
+- poisoned live trace path is visible;
+- multi-shard sim observer sees events if the API exists;
+- reset scenario is verified with peer-visible RST behavior or renamed;
+- load/storm reports preserve aggregate error truth.
+
+## Rock 13: SQLx Transaction Outcome And Bridge Edge Truth
+
+Fix M4, M17, M18 where bridge/test harness surfaces overlap, and any
+bridge-specific doc drift left by earlier rocks.
+
+SQLx transaction ambiguity:
+
+- transaction commit ambiguous outcome must include completed step records;
+- users need to know which steps definitely ran and where ambiguity began.
+
+Tokio bridge drain:
+
+- `drain_and_shutdown` must not block a Tokio worker with a sleep polling loop;
+- provide async-friendly or thread-offloaded drain, or document a synchronous
+  blocking API with a non-Tokio caller test.
+
+Bad-peer harness:
+
+- if a bridge/specimen claims reset behavior, use the real reset helper fixed
+  in Rock 12.
+
+Required tests:
+
+- SQLx transaction commit ambiguity returns completed steps plus error;
+- Tokio bridge drain does not park the runtime worker under Axum-style shutdown;
+- bridge docs do not promise late-result/capacity facts that metrics cannot
+  prove.
+
+## Rock 14: Docs, Findings, And Follow-Up Split
 
 Update docs after fixes land:
 
@@ -392,7 +609,8 @@ Update docs after fixes land:
 - `CHANGELOG.md`: record user-visible hardening.
 - `ROADMAP.md`: move fixed items out of future work; leave only true future
   work.
-- Close/supersede #134 once #135 is canonical and this phase references it.
+- PR #134 and PR #135 are already superseded by commits on main. Keep the
+  review doc in git history even if a later cleanup removes or summarizes it.
 
 If a finding is proven false while implementing, update the review doc with the
 proof and test name. Do not silently ignore it.
@@ -416,11 +634,17 @@ cargo test -p tina-reqwest-bridge --tests -- --nocapture
 cargo test -p tina-runtime process --tests -- --nocapture
 cargo test -p tina-runtime persistence --tests -- --nocapture
 cargo test -p tina-runtime supervisor --tests -- --nocapture
+cargo test -p tina-runtime time --tests -- --nocapture
+cargo test -p tina-runtime lifecycle --tests -- --nocapture
+cargo test -p tina-mailbox-spsc --tests -- --nocapture
+cargo test -p tina-macros --tests -- --nocapture
+cargo test -p tina-rpc-macros --tests -- --nocapture
 cargo test -p tina-proof-harness --tests -- --nocapture
 cargo clippy -p tina-http --tests -- -D warnings
 cargo clippy -p tina-runtime --tests -- -D warnings
 cargo clippy -p tina-sqlx-bridge --tests -- -D warnings
 cargo clippy -p tina-aws-bridge --tests -- -D warnings
+cargo clippy -p tina-mailbox-spsc --tests -- -D warnings
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
 ```
 
@@ -434,8 +658,12 @@ merge gate and leave real-service tests ignored with clear env vars.
   honestly.
 - Cross-shard terminal replies do not disappear into timeout fog.
 - Bridge timeout/capacity semantics are shared and visible across bridge crates.
+- Pool/resource ownership leaks are either prevented by the safe path or loudly
+  reported.
 - Process timeout and runtime shutdown do not hang forever.
 - Persistence can repair truncated tails and append without replaying the whole
   journal every time.
 - Runtime trace/supervision hot paths no longer hide obvious production traps.
+- Macro, simulator, mailbox, and proof-harness findings from the review doc are
+  fixed or marked false with tests.
 - Tests prove the weird user-shaped failures that the reviews found.
