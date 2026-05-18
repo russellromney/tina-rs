@@ -9,6 +9,10 @@ The codebase is unusually disciplined for its size. The dangerous bugs are
 concentrated at three boundaries: HTTP keepalive / HTTP/2, cross-shard
 relay, and bridge backpressure.
 
+A second narrower review found additional persistence/process/bridge risks.
+Those are folded into the "Additional findings" section below so this file can
+be the canonical review artifact.
+
 File paths are relative to the repo root. Line numbers reflect the
 `worktree-adversarial-review` snapshot at the time of review.
 
@@ -96,20 +100,28 @@ File paths are relative to the repo root. Line numbers reflect the
 - Fix: guard the `add_permits(1)` on a `pending.remove(...).is_some()`
   like the observer path does.
 
-### H2. `max_in_flight` is not a real concurrency cap after timeouts (sqlx, dynamodb, sqs, sns, secrets)
+### H2. Bridge timeout capacity truth diverges after user-visible timeout
 
-- Confidence: High. `tina-sqlx-bridge/src/worker.rs:355-457` plus
-  parallels in `tina-aws-bridge/src/{dynamodb,sqs,sns,secrets}_worker.rs`.
-- On per-attempt timeout, the slot is removed from `in_flight`; the
-  spawned tokio future is not aborted (intentional). `note_terminal`
-  then frees the admission slot. Subsequent callers admit while the
-  original SDK work still holds connections. Real concurrent SDK work
-  grows up to `pool.max_connections * (real_latency / timeout)`.
-  Cascading `PoolAcquireTimeout` follows.
-- The doc claims "Bridge as pool, leased == in-flight." Violated after
-  the first timeout.
-- Fix: track real-in-flight via a separate semaphore the spawn holds
-  until completion regardless of abandonment. Cap admission on that.
+- Confidence: High. `tina-sqlx-bridge/src/worker.rs:355-457`;
+  `tina-aws-bridge/src/{worker,dynamodb_worker,sqs_worker,sns_worker,secrets_worker}.rs`
+  poll loops.
+- SQLx path: on per-attempt timeout, the worker removes the entry,
+  marks it abandoned, calls `note_terminal`, replies `PgError::Timeout`,
+  and does not abort the spawned SQLx future. Tina admission capacity is
+  freed while the database work may still be running. Real concurrent DB
+  work can exceed `max_in_flight` until late futures complete.
+- AWS path: on per-attempt timeout, the worker replies `Timeout` but
+  reinserts the abandoned in-flight entry and keeps polling until the
+  SDK future completes. A stuck SDK future can permanently consume
+  admission capacity and make later calls return `Full`.
+- Both violate the user expectation behind `max_in_flight`: after a
+  timeout, admission capacity and late physical work must be named
+  separately.
+- Fix: split user-visible admission capacity from physical late-work
+  tracking. Either bound both explicitly (`admitted_in_flight` and
+  `late_in_flight`) or keep admission occupied until physical completion
+  but name that as the contract. Do not let SQLx and AWS teach opposite
+  meanings for the same bridge vocabulary.
 
 ### H3. `PoolLease<H>` has no `Drop` — silent resource leak on panic / early return / `OneForAll`
 
@@ -357,6 +369,38 @@ File paths are relative to the repo root. Line numbers reflect the
   `config_debug` and the loader never verifies them; false-friend
   invariant. `tina-sim/src/dst.rs:1972-1976`.
 
+## Additional findings from narrow review
+
+- A1. Postgres DB-side cancel can target the wrong query. The SQLx
+  timeout path captures a backend PID and later fires
+  `SELECT pg_cancel_backend(pid)` from a sidecar task. If request A
+  finishes near the timeout boundary and the pool reuses that backend
+  for request B before the sidecar cancel lands, request B can be
+  cancelled. Fix by keeping cancellation on the connection-owner path,
+  quarantining/dropping the connection until cancel completes, or
+  disabling DB-side cancel unless it can be tied to a specific query
+  incarnation.
+- A2. Process timeout can hang when grandchildren inherit stdout/stderr.
+  The runtime kills the direct child and joins drain threads; a
+  grandchild holding inherited pipes can keep those drains open forever.
+  Fix with Unix process groups / Windows job objects, plus bounded drain
+  joins after kill.
+- A3. Crash-truncated journal tails recover for read but block future
+  appends. `replay_journal` can return a valid prefix with warning, but
+  append validation rejects warnings. Fix by exposing valid byte length
+  and truncating/repairing before the next append.
+- A4. Journal append validation is O(total journal size). Every append
+  replays the whole journal. Fix by tracking last committed index or
+  validating only the tail; keep full replay for startup/repair.
+- A5. Snapshot temp file cleanup is incomplete after rename failure.
+  Best-effort remove the temp path on any failure after temp creation.
+- A6. Chunked decoder length accounting needs checked arithmetic for
+  peer-controlled chunk sizes. This sits next to H14/L13 and should be
+  fixed in the same parser hardening pass.
+- A7. WebSocket frame parsing should reject non-minimal extended payload
+  lengths and use checked end-offset math. This is the same strictness
+  family as M1.
+
 ## Highest-risk modules reviewed
 
 1. `tina-http/` — HTTP/1 keepalive (C1), HTTP/2 protocol surface (C2,
@@ -365,9 +409,9 @@ File paths are relative to the repo root. Line numbers reflect the
 2. `tina-runtime/` — multi-shard relay (C4), shutdown (H6), supervisor
    (H7), TLS driver (H8), trace ring (H4, H5), call/lifecycle (M2, M3,
    M16, M25), entries leak (H11), signals (M23).
-3. Bridges — sqlx/AWS in-flight semantics (H2), reqwest retry
-   classification (H13), shim cancel race (H1, M21), tower/tokio bridge
-   surface (M17, M8, M4).
+3. Bridges — sqlx/AWS in-flight semantics (H2), SQLx DB-side cancel
+   identity (A1), reqwest retry classification (H13), shim cancel race
+   (H1, M21), tower/tokio bridge surface (M17, M8, M4).
 4. `tina-sim/` + proof-harness — determinism (H10, M9, M10, M13),
    bad-peer fidelity (M18, M20), load report (M19).
 5. Macros — hygiene (H12, M22), heuristic lint (L7).
@@ -397,8 +441,12 @@ File paths are relative to the repo root. Line numbers reflect the
 - WebSocket: payload-length minimal-form property test; UTF-8 fragment
   property test; control-frame fragmentation; close-code validation.
 - Bridges: property test — for any sequence of (admit, timeout, retry,
-  cancel) events, real concurrent SDK work ≤ `max_in_flight`. Fails
-  today.
+  cancel) events, admitted work and late physical work obey their named
+  budgets. Fails today.
+- Process timeout: child spawns a grandchild that inherits stdout/stderr;
+  timeout must settle and not hang the process lane.
+- Persistence: truncated journal tail repairs before append; append
+  latency must not scale with full journal size on the hot path.
 - SPSC mailbox: 3-thread loom model (producer + consumer + closer);
   `usize::MAX` wraparound test on 32-bit.
 - Cross-shard relay (C4): property test — every send produces exactly
@@ -418,8 +466,8 @@ File paths are relative to the repo root. Line numbers reflect the
   never silently dropped — violated by C4.
 - Pool `leased` count == handlers actually holding resources — violated
   by H3.
-- `max_in_flight` caps concurrent external work — violated by H2 after
-  first timeout.
+- Bridge timeout capacity has one named contract across crates —
+  violated by H2 after first timeout.
 - Server emits exactly one Reply per accepted request id at any time —
   not enforced by M5.
 - `RestartBudget` represents a finite-window failure rate — false claim
@@ -437,7 +485,7 @@ File paths are relative to the repo root. Line numbers reflect the
 4. C5 — HTTP/2 RST_STREAM flood (rapid reset).
 5. H1 — Bridge `CancelGuard::drop` double-release.
 6. H3 — `PoolLease` missing Drop hook.
-7. H2 — Bridge admission cap broken after timeout (sqlx / AWS family).
+7. H2 — Bridge timeout capacity semantics split across sqlx / AWS.
 8. H6 — Drop hangs forever on wedged handler.
 9. C3 + H9 — HTTP/2 SETTINGS ignored + HTTP/1 headers accepted (pair:
    conformance and smuggling).
