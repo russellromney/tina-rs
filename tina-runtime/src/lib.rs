@@ -74,6 +74,7 @@ pub mod persistence;
 #[allow(unsafe_code)]
 pub mod pool;
 pub mod pressure;
+pub mod scope;
 pub mod service_pressure;
 pub mod sharded;
 pub mod shared_scope;
@@ -246,6 +247,13 @@ pub use observation::{
 };
 pub use observer::TraceObserver;
 pub use pressure::{MailboxBudget, PressureReport, PressureSummary, format_pressure_line};
+pub use scope::{
+    CallContextScopeExt, DeferScopedThrough, DeferredScopedCall, RequestScope, RequestScopeId,
+    RequestScopeInsertError, RequestScopeRemoveError, RequestScopeSet,
+    RequestScopeSetCapacityReport, ScopeCancelCause, ScopeCancelReport, ScopeChildReport,
+    ScopeRegisterError, ScopeRegisterSharedError, ScopedAdmitError, ScopedCallHandle,
+    ScopedReplyError, scope_register,
+};
 pub use service_pressure::{ServicePressureReport, ServicePressureSurface, ServiceSurfaceState};
 pub use shared_scope::{SharedCapacityScope, SharedLease, SharedScopeFull, SharedScopeReport};
 pub use tcp_loops::{LoopStep, ReadExactStep, TcpReadExact, TcpReadToEof, TcpWriteAll};

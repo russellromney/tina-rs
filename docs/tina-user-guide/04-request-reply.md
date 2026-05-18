@@ -281,6 +281,35 @@ impl Worker {
 }
 ```
 
+## Request-Scoped Children
+
+A multi-turn request that fans out to several child rails (DB call,
+outbound HTTP, internal worker, …) wants one button: "the request
+went away; stop the children." The runtime primitive is
+`RequestScope` (in `tina-runtime::scope`). The blessed pattern:
+
+```text
+let scope = RequestScope::with_child_cap(RequestScopeId::alloc(), 3);
+self.scopes.try_insert(request_id, scope.clone())?;
+
+// One admission per child rail. The scope is registered first so a
+// scope-wide cancel that races with admission still closes the wait.
+let admit = call_ctx
+    .defer_scoped(&scope, "db_lookup", call_cancelable(db, q, t))
+    .try_admit(&mut self.pending, request_id, Msg::DbReturned)?;
+return admit; // child effect runs only after admission succeeded
+```
+
+When the request dies (client disconnect, per-request deadline, owner
+stop), call `scope.cancel_into_effects(cause, translator)`. It returns
+a synchronous [`ScopeCancelReport`] and a list of `Effect::Call`
+cancellations — return them from the handler. Any rail that does not
+expose a `CallHandle` (sleep, raw TCP read/write, body sources) is not
+yet scope-cancellable; wire an application `Cancel` message for those.
+
+See [lifecycle § Request-Scoped Cancellation](14-lifecycle-and-shutdown.md#request-scoped-cancellation)
+for the full truth table and bridge honesty rules.
+
 ## Grug Rule
 
 No request/reply without timeout.

@@ -2783,6 +2783,13 @@ where
         self.request
     }
 
+    /// Crate-private accessor for the typed call handle inside the token.
+    /// Used by [`crate::scope::DeferredScopedCall::try_admit`] to clone the
+    /// shared cell before registering the rail into a [`RequestScope`].
+    pub(crate) fn handle_ref(&self) -> &tina::CallHandle<R> {
+        &self.handle
+    }
+
     /// Cancels the child wait and carries the request context into the cancel
     /// continuation so the service can explicitly answer its caller.
     pub fn cancel<I, F, M>(self, translator: F) -> tina::Effect<I>
