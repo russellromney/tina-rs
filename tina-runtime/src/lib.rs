@@ -62,6 +62,7 @@ mod errors;
 pub mod event_sink;
 mod full_handling;
 mod host_burst;
+pub mod lifecycle;
 mod live_report;
 mod local_permit;
 mod local_system;
@@ -94,6 +95,12 @@ pub use full_handling::{
     FullPolicyMode,
 };
 pub use host_burst::{HostBurstOutcomes, HostBurstSnapshot, HostBurstWaitError};
+pub use lifecycle::{
+    CloseAdmission, CloseOutcome, ComponentKind, Health, Lifecycle, READINESS_UNKNOWN_REASON,
+    Readiness, ReadinessReason, ReadinessToken, ResourceCloseReport, ResourceKind,
+    ServiceShutdownReport, ServiceTopology, ShutdownChoreography, ShutdownStep, ShutdownStepReport,
+    StepOutcome, TopologyComponent,
+};
 pub use local_permit::{
     LocalPermitFull, LocalPermitGate, LocalPermitName, LocalPermitReleaseError, LocalPermitReport,
     Permit, dropped_permit_count,
