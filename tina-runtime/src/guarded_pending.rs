@@ -1,4 +1,4 @@
-//! Guarded sibling of [`PendingReplies`].
+//! Guarded sibling of [`crate::PendingReplies`].
 //!
 //! Some services need an RAII guard (a lease, a permit, a counter) to live
 //! while the caller is parked. Before this helper, services kept a sidecar
