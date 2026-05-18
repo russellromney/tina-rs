@@ -102,38 +102,40 @@ fn request_kind_names_are_stable() {
 
 #[test]
 fn classifier_sorts_outcomes_into_bridge_vocabulary() {
-    use tina_aws_bridge::{FatalReason, TransientReason};
+    use tina_aws_bridge::{BridgeFatal, BridgeRetryable, BridgeUnavailable};
 
     let timeout: CallOutcome<Result<DynamoResponse, DynamoError>> = CallOutcome::Timeout;
     assert_eq!(
         timeout.classify(),
-        BridgeOutcomeClass::Transient(TransientReason::CallerTimeout)
+        BridgeOutcomeClass::Retryable(BridgeRetryable::CallerTimeout)
     );
 
     let full: CallOutcome<Result<DynamoResponse, DynamoError>> = CallOutcome::Full;
     assert_eq!(
         full.classify(),
-        BridgeOutcomeClass::Transient(TransientReason::BridgeFull)
+        BridgeOutcomeClass::Retryable(BridgeRetryable::BridgeFull)
     );
 
+    // Closed is `Unavailable`, not retry fog. A closed handle stays
+    // closed; the caller needs a new bridge handle.
     let closed: CallOutcome<Result<DynamoResponse, DynamoError>> = CallOutcome::Closed;
     assert_eq!(
         closed.classify(),
-        BridgeOutcomeClass::Transient(TransientReason::BridgeClosed)
+        BridgeOutcomeClass::Unavailable(BridgeUnavailable::BridgeClosed)
     );
 
     let bridge_timeout: CallOutcome<Result<DynamoResponse, DynamoError>> =
         CallOutcome::Replied(Err(DynamoError::Timeout));
     assert_eq!(
         bridge_timeout.classify(),
-        BridgeOutcomeClass::Transient(TransientReason::BridgeTimeout)
+        BridgeOutcomeClass::Retryable(BridgeRetryable::BridgeTimeout)
     );
 
     let ccf: CallOutcome<Result<DynamoResponse, DynamoError>> =
         CallOutcome::Replied(Err(DynamoError::ConditionalCheckFailed("test".into())));
     assert_eq!(
         ccf.classify(),
-        BridgeOutcomeClass::Fatal(FatalReason::ConditionalCheckFailed)
+        BridgeOutcomeClass::Fatal(BridgeFatal::ConditionalCheckFailed)
     );
 
     let throughput: CallOutcome<Result<DynamoResponse, DynamoError>> = CallOutcome::Replied(Err(
@@ -141,41 +143,43 @@ fn classifier_sorts_outcomes_into_bridge_vocabulary() {
     ));
     assert_eq!(
         throughput.classify(),
-        BridgeOutcomeClass::Transient(TransientReason::ProvisionedThroughputExceeded)
+        BridgeOutcomeClass::Retryable(BridgeRetryable::ProvisionedThroughputExceeded)
     );
 
     let conflict: CallOutcome<Result<DynamoResponse, DynamoError>> =
         CallOutcome::Replied(Err(DynamoError::TransactionConflict("test".into())));
     assert_eq!(
         conflict.classify(),
-        BridgeOutcomeClass::Transient(TransientReason::TransactionConflict)
+        BridgeOutcomeClass::Retryable(BridgeRetryable::TransactionConflict)
     );
 
     let too_large: CallOutcome<Result<DynamoResponse, DynamoError>> =
         CallOutcome::Replied(Err(DynamoError::ItemTooLarge));
     assert_eq!(
         too_large.classify(),
-        BridgeOutcomeClass::Fatal(FatalReason::TooLarge)
+        BridgeOutcomeClass::Fatal(BridgeFatal::TooLarge)
     );
 
     let invalid: CallOutcome<Result<DynamoResponse, DynamoError>> =
         CallOutcome::Replied(Err(DynamoError::InvalidRequest("bad".into())));
     assert_eq!(
         invalid.classify(),
-        BridgeOutcomeClass::Fatal(FatalReason::InvalidRequest)
+        BridgeOutcomeClass::Fatal(BridgeFatal::InvalidRequest)
     );
 
     let not_found: CallOutcome<Result<DynamoResponse, DynamoError>> =
         CallOutcome::Replied(Err(DynamoError::ResourceNotFound("test".into())));
     assert_eq!(
         not_found.classify(),
-        BridgeOutcomeClass::Fatal(FatalReason::NotFound)
+        BridgeOutcomeClass::Fatal(BridgeFatal::NotFound)
     );
 
+    // Unknown SDK errors are `Fatal(SdkUnknown)`, not retry fog. The
+    // SDK wrapper does not carry retryable metadata.
     let sdk: CallOutcome<Result<DynamoResponse, DynamoError>> =
         CallOutcome::Replied(Err(DynamoError::Sdk("boom".into())));
     assert_eq!(
         sdk.classify(),
-        BridgeOutcomeClass::Transient(TransientReason::SdkError)
+        BridgeOutcomeClass::Fatal(BridgeFatal::SdkUnknown)
     );
 }

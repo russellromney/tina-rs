@@ -37,6 +37,7 @@ use std::time::Duration;
 use tina::Address;
 use tina::Effect;
 use tina::Isolate;
+use tina_runtime::bridge::{BridgeFatal, BridgeOutcomeClass, BridgeRetryable, BridgeUnavailable};
 use tina_runtime::{CallOutcome, IsolateCall, RuntimeCall, call};
 
 use crate::types::{PgError, PgRequest, PgResponse, PgRow, PgStep, PgTransactionOutcome};
@@ -488,12 +489,20 @@ pub trait PgOutcomeExt {
     type Success;
     /// Classify the outcome into Succeeded / Transient / Fatal.
     fn classify(self) -> PgOutcomeClass<Self::Success>;
+    /// Project the outcome into the shared bridge classifier
+    /// vocabulary ([`BridgeOutcomeClass`]). The typed success payload
+    /// is dropped; use [`Self::classify`] when you want both the typed
+    /// payload and the verbose error info.
+    fn bridge_class(&self) -> BridgeOutcomeClass;
 }
 
 impl PgOutcomeExt for PgCallOutcome {
     type Success = PgResponse;
     fn classify(self) -> PgOutcomeClass<PgResponse> {
         classify_inner(self, |resp| resp)
+    }
+    fn bridge_class(&self) -> BridgeOutcomeClass {
+        bridge_class(self)
     }
 }
 
@@ -502,12 +511,18 @@ impl PgOutcomeExt for PgExecutedOutcome {
     fn classify(self) -> PgOutcomeClass<u64> {
         classify_inner(self, |rows_affected| rows_affected)
     }
+    fn bridge_class(&self) -> BridgeOutcomeClass {
+        bridge_class(self)
+    }
 }
 
 impl PgOutcomeExt for PgFetchOneOutcome {
     type Success = Option<PgRow>;
     fn classify(self) -> PgOutcomeClass<Option<PgRow>> {
         classify_inner(self, |row| row)
+    }
+    fn bridge_class(&self) -> BridgeOutcomeClass {
+        bridge_class(self)
     }
 }
 
@@ -516,12 +531,18 @@ impl PgOutcomeExt for PgFetchManyOutcome {
     fn classify(self) -> PgOutcomeClass<PgRows> {
         classify_inner(self, |rows| rows)
     }
+    fn bridge_class(&self) -> BridgeOutcomeClass {
+        bridge_class(self)
+    }
 }
 
 impl PgOutcomeExt for PgTransactionCallOutcome {
     type Success = PgTransactionOutcome;
     fn classify(self) -> PgOutcomeClass<PgTransactionOutcome> {
         classify_inner(self, |tx| tx)
+    }
+    fn bridge_class(&self) -> BridgeOutcomeClass {
+        bridge_class(self)
     }
 }
 
@@ -563,5 +584,63 @@ fn classify_inner<R, T>(
         CallOutcome::Rejected(reason) => {
             PgOutcomeClass::Fatal(PgFatalReason::BridgeRejected(reason))
         }
+    }
+}
+
+/// Bridge-vocabulary projection: maps a Postgres call outcome into the
+/// shared [`BridgeOutcomeClass`] vocabulary so dashboards, retry
+/// helpers, and replay suites can grep one set of names across every
+/// bridge.
+///
+/// The Postgres bridge keeps its richer typed outcome via
+/// [`PgOutcomeClass`] for callers that want the typed success payload
+/// or the verbose error info. This projection drops the payload and
+/// returns the four-arm classification.
+///
+/// Rules upheld at this layer:
+///
+/// - `CallOutcome::Closed` and `PgError::PoolClosed` are
+///   [`BridgeUnavailable`], not retry fog. A closed bridge or pool
+///   needs a new handle.
+/// - The generic `PgError::Sqlx(_)` wrapper has no retryable metadata
+///   at this layer, so it is [`BridgeFatal::SdkUnknown`] — never
+///   blindly retryable.
+pub fn bridge_class<T>(outcome: &CallOutcome<Result<T, PgError>>) -> BridgeOutcomeClass {
+    match outcome {
+        CallOutcome::Replied(Ok(_)) => BridgeOutcomeClass::Succeeded,
+        CallOutcome::Replied(Err(PgError::Timeout)) => {
+            BridgeOutcomeClass::Retryable(BridgeRetryable::BridgeTimeout)
+        }
+        CallOutcome::Replied(Err(PgError::PoolAcquireTimeout)) => {
+            BridgeOutcomeClass::Retryable(BridgeRetryable::PoolAcquireTimeout)
+        }
+        CallOutcome::Replied(Err(PgError::Full)) => {
+            BridgeOutcomeClass::Retryable(BridgeRetryable::BridgeFull)
+        }
+        CallOutcome::Replied(Err(PgError::Closed)) => {
+            BridgeOutcomeClass::Unavailable(BridgeUnavailable::BridgeClosed)
+        }
+        CallOutcome::Replied(Err(PgError::PoolClosed)) => {
+            BridgeOutcomeClass::Unavailable(BridgeUnavailable::PoolClosed)
+        }
+        CallOutcome::Replied(Err(PgError::InvalidRequest(_))) => {
+            BridgeOutcomeClass::Fatal(BridgeFatal::InvalidRequest)
+        }
+        CallOutcome::Replied(Err(PgError::TooManyRows)) => {
+            BridgeOutcomeClass::Fatal(BridgeFatal::InvalidRequest)
+        }
+        CallOutcome::Replied(Err(PgError::Decode(_))) => {
+            BridgeOutcomeClass::Fatal(BridgeFatal::Decode)
+        }
+        CallOutcome::Replied(Err(PgError::Sqlx(_))) => {
+            BridgeOutcomeClass::Fatal(BridgeFatal::SdkUnknown)
+        }
+        CallOutcome::Replied(Err(PgError::Internal(_))) => {
+            BridgeOutcomeClass::Fatal(BridgeFatal::Internal)
+        }
+        CallOutcome::Timeout => BridgeOutcomeClass::Retryable(BridgeRetryable::CallerTimeout),
+        CallOutcome::Full => BridgeOutcomeClass::Retryable(BridgeRetryable::BridgeFull),
+        CallOutcome::Closed => BridgeOutcomeClass::Unavailable(BridgeUnavailable::BridgeClosed),
+        CallOutcome::Rejected(_) => BridgeOutcomeClass::Fatal(BridgeFatal::InvalidRequest),
     }
 }

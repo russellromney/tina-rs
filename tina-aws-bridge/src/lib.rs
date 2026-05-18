@@ -169,7 +169,9 @@
 //! include `kind = "admitted"` / `"timeout"` / `"admission_rejected"`
 //! at the call layer, plus `kind = "close"` at the bridge layer.
 
+mod bridge_adapter;
 mod classifier;
+mod core;
 mod dynamodb_metrics;
 mod dynamodb_types;
 mod dynamodb_worker;
@@ -187,10 +189,15 @@ mod sqs_worker;
 mod types;
 mod worker;
 
-pub use classifier::{
-    BridgeOutcomeClass, DynamoOutcomeExt, FatalReason, S3OutcomeExt, SecretsOutcomeExt,
-    SnsOutcomeExt, SqsOutcomeExt, TransientReason,
+pub use bridge_adapter::{
+    DYNAMODB_BRIDGE_SURFACE, S3_BRIDGE_SURFACE, SECRETS_BRIDGE_SURFACE, SNS_BRIDGE_SURFACE,
+    SQS_BRIDGE_SURFACE,
 };
+pub use classifier::{
+    DynamoOutcomeExt, S3OutcomeExt, SecretsOutcomeExt, SnsOutcomeExt, SqsOutcomeExt,
+};
+// Shared bridge vocabulary lives in `tina_runtime::bridge`. Re-exported
+// here so existing callers can keep their imports.
 pub use dynamodb_metrics::{DynamoMetrics, DynamoMetricsHandle, DynamoPressureReport};
 pub use dynamodb_types::{
     DynamoConfig, DynamoConfigError, DynamoConsistency, DynamoConsumedCapacity, DynamoCredentials,
@@ -233,6 +240,9 @@ pub use sqs_types::{
 };
 pub use sqs_worker::{
     InstalledSqsBridge, SqsCloser, SqsDrainReport, SqsInstallError, SqsMsg, SqsWorker, install_sqs,
+};
+pub use tina_runtime::bridge::{
+    BridgeFatal, BridgeOutcomeClass, BridgePressure, BridgeRetryable, BridgeUnavailable,
 };
 pub use types::{
     S3Config, S3ConfigError, S3Credentials, S3DeleteObject, S3DeletedObject, S3Error, S3GetObject,

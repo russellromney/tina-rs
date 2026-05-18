@@ -1,0 +1,23 @@
+error[E0451]: fields `name`, `capacity`, `current`, `high_water`, `full_count`, `timeout_count`, `closed_count`, `late_result_count` and `worker_terminal_count` of struct `BridgePressure` are private
+  --> tests/bridge_compile_fail/bridge_pressure_forged_literal.rs:12:9
+   |
+11 |     let _ = BridgePressure {
+   |             -------------- in this type
+12 |         name: String::from("aws.s3"),
+   |         ^^^^ private field
+13 |         capacity: 32,
+   |         ^^^^^^^^ private field
+14 |         current: 0,
+   |         ^^^^^^^ private field
+15 |         high_water: 0,
+   |         ^^^^^^^^^^ private field
+16 |         full_count: 0,
+   |         ^^^^^^^^^^ private field
+17 |         timeout_count: 0,
+   |         ^^^^^^^^^^^^^ private field
+18 |         closed_count: 0,
+   |         ^^^^^^^^^^^^ private field
+19 |         late_result_count: 0,
+   |         ^^^^^^^^^^^^^^^^^ private field
+20 |         worker_terminal_count: 0,
+   |         ^^^^^^^^^^^^^^^^^^^^^ private field
