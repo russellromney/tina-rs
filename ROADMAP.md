@@ -347,7 +347,7 @@ framework before public release-story work.
 | **107 Observability and capacity product** | Turn pressure/capacity into a user product: runtime pressure summary, shard-local weighted capacity scopes, bounded event sink, and CI-friendly capacity assertions. Plan: `.intent/phases/107-observability-capacity-product/plan.md`. |
 | **108 Proof harnesses and replay ops** | Build the proof machinery: load/soak harness, bad-peer harness, live trace to sim replay, shrink workflow, and clear fast-vs-soak CI gate shape. Plan: `.intent/phases/108-proof-harnesses-and-replay-ops/plan.md`. |
 | **109 Typed config and protocol-state safety** | Push more common LLM/user mistakes into compile errors: public request/internal event split, capability handles, typed config/budget manifests, private protocol typestate, and friendly diagnostics. Plan: `.intent/phases/109-typed-config-protocol-state-safety/plan.md`. |
-| **Natural-key and keyed-wait pending helpers** | Follow-up to 097 plus system specimens. Build the missing bounded pending vocabulary for natural keys: `PendingCancelableCallSlab<K, Q, R>` or equivalent for multiple cancelable entries per natural key, and likely `KeyedPendingReplies` / `WaitList<K, R>` for per-key FIFO waiters backed by one global cap. Must keep `(key, ticket)` ABA truth, typed `Full`/`BucketFull` admission errors, caller-authority recovery on failed admission, and skip-reclaimed-slot proof. No hidden dedup, no automatic key-versioning. |
+| **110 Workflow pending ergonomics** | Ship the specimen-proven pending workflow helpers: `then_event`, `PendingReplies::park`, guarded parking, `WaitList<K, R>`, and `CancelableWork<K, Q, R>`. Keep caller authority, capacity, tickets, late replies, and pressure visible. Plan: `.intent/phases/110-workflow-pending-ergonomics/plan.md`. |
 | **Join-all / stream-select helpers** | First-success `CallGroup` exists. Add join-all and stream-select only when a real specimen needs them, preserving branch identity, bounded pending/result storage, explicit cancellation, partial results, and late-reply trace truth. |
 | **Event/request split proposal** | Future IDD candidate pulled by `system_cache_with_fill`: split fire-and-forget mailbox events from caller-authority requests in the public authoring model so request/reply traffic cannot accidentally live only in `handle`. This follows Phase 100's first capability handles; see sketch below. |
 | **Alpaca rename** | Before public launch, rename the project/crates/docs away from Tina to Alpaca so the lineage is respectful and clear: independently maintained Rust framework, inspired by Peter Mbanugo's Tina/Odin and Seastar, not an official Tina port. |
@@ -693,14 +693,13 @@ type system, not by the user discovering it the hard way. The current
 shape teaches "keep your keys monotonic or fall off a cliff," which is
 exactly the kind of hidden contract Tina aims to remove.
 
-**Likely fix.** Add a third helper — call it
-`PendingCancelableCallSlab<K, Q, R>` for now — that admits the same
-caller-authority + cancel-handle bundle but allows multiple entries per
-natural key. Internal identity is by ticket; natural key is metadata
-attached to each entry. The shape:
+**Fix.** Phase 110 owns this as `CancelableWork<K, Q, R>`: a bounded helper
+that admits the same caller-authority + cancel-handle bundle but allows
+multiple entries per natural key. Internal identity is by `WorkTicket`; natural
+key is metadata attached to each entry. The shape:
 
 ```rust
-let ticket = self.pending.try_insert(natural_key, token)?;   // always Ok modulo capacity
+let ticket = self.work.admit(natural_key, token)?;
 ```
 
 Lookup returns an iterator (or "latest") for natural keys; removal is
@@ -710,17 +709,16 @@ that the user maintains the "natural-key → live tickets" mapping
 externally, but that mapping is what they were going to write anyway
 once they hit `DuplicateKey`.
 
-**Decision rule for users.** Ship both helpers and document the choice:
+**Decision rule for users.** Document the choice:
 
 - one outstanding op per key, key chosen by the service →
   `PendingCancelableCallSet`
 - one outstanding op per key, key chosen externally →
-  `PendingCancelableCallSlab` *(this proposal)*
+  `CancelableWork` with a per-key cap of 1
 - multiple parked callers per key, no cancel handle needed →
-  `PendingReplies`
+  `WaitList`
 - multiple parked callers per key WITH cancel handles → we need to
-  decide whether the slab covers this too or whether
-  `PendingReplies::try_capture_cancelable_call` is a separate motion
+  use `CancelableWork`
 
 **Non-goals.** No silent ABA dedup on insert. No "automatic
 key-versioning" that hides whether a stale completion replaced a fresh
@@ -731,8 +729,7 @@ discipline, not from removing it.
 `system_tenant_rate_limiter`, `system_webhook_relay`, `system_lock_manager`,
 and the worker-index variant of `system_job_queue` are all natural-key
 shaped and currently have to invent the workaround themselves. This is now
-strong enough to be a near-term follow-up after 100/101 if those phases do not
-already reshape the service handle enough to change the helper boundary.
+strong enough for Phase 110.
 
 ### Keyed wait lists over bounded pending replies
 
@@ -744,11 +741,10 @@ waiter shape:
 - handoff loops pop ids until one still has a live deferred reply;
 - per-key caps and global caps are reported separately by handwritten code.
 
-Build a small `KeyedPendingReplies<K, R>` / `WaitList<K, R>` helper once the
-third call site confirms the exact shape, or earlier if it blocks a system.
-The helper must own both caps, return typed `Full` vs `BucketFull`, recover the
-caller on failed admission, and make skip-reclaimed-slot behavior explicit. No
-hidden per-key unbounded queues.
+Phase 110 owns this as `WaitList<K, R>`. The helper must own both caps, return
+typed global `Full` vs per-key `KeyFull`, recover the caller on failed
+admission, and make skip-reclaimed-slot behavior explicit. No hidden per-key
+unbounded queues.
 
 ## Capability layers still needed
 
