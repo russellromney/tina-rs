@@ -74,7 +74,14 @@ fields, not log text:
   and routed.
 - **shutdown** — a partial batch (smaller than `batch_size`) plus `Stop`
   produces one drain flush; every drained event lands at the sink; a
-  late `Submit` returns `Stopping` and `stop_clean` is true.
+  late `Submit` returns `Stopping` and `stop_clean` is true. The same
+  scenario also exercises the typed lifecycle helpers: the report
+  carries a `ServiceTopology` (shipper / sink / flush_tick), a typed
+  `Health` snapshot in [`Lifecycle::Stopped`], and a
+  `ServiceShutdownReport` that records `DrainInFlight` →
+  `CloseResource sink.isolate` → `StopOwner` in order. This is the
+  worked non-HTTP example for [`tina_runtime::lifecycle`]; the helper
+  must not become HTTP-shaped by accident.
 
 ## Out Of Scope
 
@@ -128,6 +135,19 @@ What felt rough (with the planned roadmap row that already names the fix):
   continuations, the `Stop` handler stashes its `RequestContext`, and
   the next `FlushDone` calls `DrainState::finish()` and answers via
   `reply_to_request`. Ordering is visible, no hidden close.
+
+Closed by Phase 106 (lifecycle, health, topology):
+- The host shutdown sequence now runs through
+  `tina_runtime::lifecycle::ShutdownChoreography`. Each step (`DrainInFlight`
+  for the shipper's own Stop handshake, `CloseResource sink.isolate`,
+  `StopOwner` for the runtime) is typed, time-stamped, and visible in the
+  terminal `ServiceShutdownReport`. The choreography's ordering-violation
+  detection caught the first attempt to record a post-stop ingress
+  invariant as a `StopIngress` phase; that check is now an assertion
+  rather than a misplaced choreography step. `lifecycle_for_drain_stage`
+  maps `DrainStage::{Open,Draining,Stopped}` to
+  `Lifecycle::{Ready,Draining,Stopped}` so a non-HTTP service reports
+  state in the same words as `mini_saas_api`.
 
 Closed by Phase 102 (host-control ergonomics):
 - `Arc::try_unwrap(runtime)` is gone from this specimen. The host now

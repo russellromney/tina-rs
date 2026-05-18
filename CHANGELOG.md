@@ -4,6 +4,63 @@ This file records completed work.
 
 ## Unreleased
 
+### Phase 106 Lifecycle, Health, And Topology
+
+- Added `tina_runtime::lifecycle` with typed service lifecycle vocabulary:
+  `Lifecycle` (Starting / Ready / Degraded / Draining / NotReady / Stopped),
+  `ReadinessReason` with stable wire tokens via `as_token()` (Starting,
+  IngressStopped, DependencyClosed/Full/Timeout/Error("dep"), Custom),
+  `Readiness` with `legacy_body()` for the `ready\n` /
+  `not_ready reasons=<csv>\n` wire format, and `Health` pairing the typed
+  state with an optional `ServicePressureReport` snapshot.
+- Added `ServiceTopology` and `TopologyComponent` so services answer "what
+  is running" with one greppable report naming isolates, bridges, pools,
+  listeners, addresses, the shard label, and the current lifecycle state,
+  backed by the existing `ServicePressureReport` for bounded-surface
+  capacity facts. No global registry; each service constructs and threads
+  the report explicitly.
+- Added `ShutdownChoreography` plus typed step / outcome / close vocabulary
+  (`ShutdownStep`, `ShutdownStepReport`, `StepOutcome`,
+  `ServiceShutdownReport`, `ResourceCloseReport`, `ResourceKind`,
+  `CloseAdmission`, `CloseOutcome`). The helper records ordered shutdown
+  steps with elapsed and outcome; recordings whose ordinal precedes the
+  highest already-recorded step become `StepOutcome::OrderingViolation`
+  so bad sequences are visible, not hidden. `record_close` folds typed
+  resource-specific reports (keepalive pool, bridge, listener) into the
+  same step kind while preserving the resource details.
+- Refreshed `examples/systems/mini_saas_api` into the canonical lifecycle
+  skeleton: replaced the stringly-typed `ready_reasons(&[...])` helper
+  with `Readiness` + `ReadinessReason` (wire body unchanged), added a
+  typed `ServiceTopology` to `RunReport::topology` naming the main
+  listener, notify listener, controller isolate, SQLite bridge, and
+  outbound keepalive pool, wrapped the host shutdown sequence in a
+  `ShutdownChoreography` recording every step
+  (`StopIngress` → `DrainInFlight` → 4 × `CloseResource` → `StopOwner`)
+  with per-resource close reports, and exposed the typed report on
+  `RunReport::shutdown_report` and `RunReport::health_pre_shutdown`.
+  Smoke tests assert against the typed surfaces in addition to the
+  legacy wire strings.
+- Updated `examples/systems/system_metrics_shipper` as the worked
+  non-HTTP proof: the host shutdown drives `ShutdownChoreography` with
+  `DrainInFlight` (the shipper's `Stop` handshake) → `CloseResource
+  sink.isolate` → `StopOwner` (runtime shutdown), populates a typed
+  `ServiceTopology` (shipper / sink / flush_tick), and emits a typed
+  `Health` in `Lifecycle::Stopped`. Added `lifecycle_for_drain_stage`
+  mapping `DrainStage::{Open,Draining,Stopped}` to
+  `Lifecycle::{Ready,Draining,Stopped}` so a service-owned drain
+  handshake reports state in the same vocabulary as a host-driven
+  service. The smoke test pattern-matches on the typed report.
+- Added DST-style ordering proofs in `tina_runtime::lifecycle::tests`:
+  every backwards step pair produces a typed
+  `StepOutcome::OrderingViolation`, and identical step sequences produce
+  byte-identical `ServiceShutdownReport::summary_line` and
+  `discovery_lines` across runs.
+- Signal-driven shutdown composes through the new helper without
+  changes: the runtime continues to expose Unix `SIGINT`/`SIGTERM`
+  capture, the existing `specimen_graceful_shutdown` shows the trigger
+  pattern, and `ShutdownChoreography` is callable from a signal-handler
+  thread the same way it is callable from a control message.
+
 ### Phase 102 Host Control Ergonomics
 
 - Added address-routed `ThreadedMultiShardRuntime::call_blocking(addr, msg,
