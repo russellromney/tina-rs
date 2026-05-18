@@ -757,6 +757,39 @@ where
             drained_within_timeout: true,
         })
     }
+
+    /// Async drain + shutdown for callers already running on Tokio.
+    ///
+    /// This has the same contract as [`drain_and_shutdown`](Self::drain_and_shutdown)
+    /// but uses `tokio::time::sleep` between polls so an Axum/Tokio shutdown
+    /// task does not park a runtime worker thread while waiting for bridge
+    /// handles to drop.
+    pub async fn drain_and_shutdown_async(
+        &mut self,
+        drain_timeout: Duration,
+    ) -> Result<BridgeShutdownReport, BridgeShutdownError> {
+        let deadline = tokio::time::Instant::now() + drain_timeout;
+        loop {
+            if self.pending_handles() == 0 {
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                let pending = self.pending_handles();
+                return Ok(BridgeShutdownReport {
+                    trace: Vec::new(),
+                    outstanding_handles_at_shutdown: pending,
+                    drained_within_timeout: false,
+                });
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        let trace = self.try_shutdown()?;
+        Ok(BridgeShutdownReport {
+            trace,
+            outstanding_handles_at_shutdown: 0,
+            drained_within_timeout: true,
+        })
+    }
 }
 
 /// Outcome of [`BridgeHost::drain_and_shutdown`].

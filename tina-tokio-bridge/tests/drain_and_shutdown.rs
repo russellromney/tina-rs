@@ -121,6 +121,29 @@ fn drain_and_shutdown_reports_partial_drain_on_timeout() {
     assert_eq!(retry.outstanding_handles_at_shutdown, 0);
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn async_drain_and_shutdown_yields_to_handle_drop_task() {
+    let mut host = make_host();
+    let handle = host
+        .register_bridge::<EchoIsolate, u32, u32, Infallible>(
+            EchoIsolate,
+            8,
+            Duration::from_millis(100),
+        )
+        .expect("register bridge");
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        drop(handle);
+    });
+
+    let report = host
+        .drain_and_shutdown_async(Duration::from_secs(2))
+        .await
+        .expect("async drain completes within budget");
+    assert!(report.drained_within_timeout);
+    assert_eq!(report.outstanding_handles_at_shutdown, 0);
+}
+
 #[test]
 fn try_shutdown_with_outstanding_handle_returns_still_shared() {
     let mut host = make_host();
