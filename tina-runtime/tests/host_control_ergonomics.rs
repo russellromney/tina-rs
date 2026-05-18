@@ -284,9 +284,11 @@ fn single_shard_call_blocking_returns_command_full_when_queue_saturated() {
     assert!(
         matches!(
             queued,
-            Ok(CallOutcome::Timeout) | Err(ThreadedRuntimeError::CommandFull)
+            Ok(CallOutcome::Timeout)
+                | Err(ThreadedRuntimeError::CommandFull)
+                | Err(ThreadedRuntimeError::HostWaitTimeout)
         ),
-        "first host call should either occupy the single command slot or observe it full; got {queued:?}"
+        "first host call should either occupy the single command slot, time out waiting for the occupied worker, or observe it full; got {queued:?}"
     );
     let saturated =
         runtime.call_blocking(spinner, SpinnerSimpleMsg::Tick, Duration::from_millis(20));

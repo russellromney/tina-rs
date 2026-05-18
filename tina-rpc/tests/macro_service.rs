@@ -10,7 +10,9 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+use tina as renamed_tina;
 use tina::{Address, Context, Effect, Isolate, IsolateId, ShardId};
+use tina_rpc as renamed_tina_rpc;
 use tina_rpc::{
     ClientRequest, ClientResultMsg, PayloadLimits, ServiceCall, ServiceReply, SingleService,
     service,
@@ -357,6 +359,40 @@ fn handler_panic_maps_to_internal_via_dispatch_catch_unwind() {
         },
     );
     assert_eq!(reply2, ServiceReply::Internal);
+}
+
+#[test]
+fn service_macro_accepts_renamed_dependency_paths() {
+    #[service(name = "Renamed", tina_crate = renamed_tina, rpc_crate = renamed_tina_rpc)]
+    pub trait Renamed {
+        fn ping(&self) -> u8;
+    }
+
+    struct State;
+    impl Renamed for State {
+        fn ping(&self) -> u8 {
+            7
+        }
+    }
+
+    let mut svc = SingleService::new(RenamedService::dispatch::<State, TestShard>(
+        State,
+        renamed_tina_rpc::PayloadLimits::default(),
+    ));
+    let request =
+        RenamedClient::ping_request(Duration::from_secs(1), 1, fake_reply_to(), 1024).unwrap();
+    let reply = dispatch_through_single(
+        &mut svc,
+        ServiceCall {
+            method: request.method,
+            payload: request.payload,
+        },
+    );
+    let bytes = match reply {
+        ServiceReply::Ok(bytes) => bytes,
+        other => panic!("expected Ok, got {other:?}"),
+    };
+    assert_eq!(RenamedClient::ping_decode_reply(&bytes, 1024).unwrap(), 7);
 }
 
 #[test]

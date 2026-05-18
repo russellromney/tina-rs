@@ -130,7 +130,10 @@ impl PersistService {
                         self.last_journal_index = record.index;
                     }
                 }
-                if replay.warning == Some(JournalReplayWarning::TruncatedTail) {
+                if matches!(
+                    replay.warning,
+                    Some(JournalReplayWarning::TruncatedTail { .. })
+                ) {
                     self.observed
                         .lock()
                         .expect("observed mutex")

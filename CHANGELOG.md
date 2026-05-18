@@ -32,9 +32,10 @@ This file records completed work.
   budgets can be windowed, stopped restart entries are collected, cancelled
   call cause-ring overflow is visible, and `PendingReplies::take()` is counted.
 - Tightened simulator/proof/macro surfaces: deterministic per-tag simulator
-  fault streams, explicit macro crate path overrides, core `Infallible`
-  expansion, duplicate RPC request-id rejection, async Tokio bridge drain, and
-  SQLx ambiguous-commit outcomes with completed step records.
+  fault streams, explicit isolate and RPC service macro crate path overrides,
+  core `Infallible` expansion, duplicate RPC request-id rejection, async Tokio
+  bridge drain, and SQLx ambiguous-commit outcomes with completed step
+  records.
 
 ### Phase 112 Protocol Facts To Replay
 

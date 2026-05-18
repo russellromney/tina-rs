@@ -97,7 +97,7 @@ the implementation proof and regression test names.
 | L4 | Fixed. `elapsed_periods` avoids silent `u128` to `u64` truncation. Test: `recurring_tick` tests. |
 | L16 | Fixed. Trace projection preserves `CallError::Rejected(reason)` inner reason. Test: `call_failed_rejected_error_preserves_inner_reason`. |
 | H8 | Fixed first form. Public TLS lane docs/reports now state queue depth vs concurrency truth: one TLS worker per shard drains a bounded queue. Tests/docs: TLS lane pressure report coverage and `docs/tina-user-guide/12-io-model.md`. |
-| H12 | Fixed first form. `#[tina::isolate]` / `#[tina_runtime::isolate]` accept `tina_crate = ...` and `runtime_crate = ...` path overrides, and defaults use `core::convert::Infallible` where possible. Tests: `tina-macros` lib compile and runtime surface-alignment tests. |
+| H12 | Fixed first form. `#[tina::isolate]` / `#[tina_runtime::isolate]` accept `tina_crate = ...` and `runtime_crate = ...` path overrides, `#[tina_rpc::service]` accepts `tina_crate = ...` and `rpc_crate = ...`, and defaults use `core::convert::Infallible` where possible. Tests: `tina-macros` lib compile, runtime surface-alignment tests, and `service_macro_accepts_renamed_dependency_paths`. |
 | M11 | Fixed. SPSC requires power-of-two capacity and rejects non-power-of-two inputs. Test: `mailbox_rejects_non_power_of_two_capacity`. |
 | M12 | Fixed/proven. TLS blocking stream access remains owner-worker-thread only by API shape, and docs name the mutex scope. Tests: TLS local-system tests. |
 | M22 | Fixed. Macro-generated default `Infallible` paths use `core::convert::Infallible`. Tests: `tina-macros` lib compile and runtime surface-alignment tests. |
