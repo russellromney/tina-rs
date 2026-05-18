@@ -90,7 +90,7 @@ impl fmt::Display for Lifecycle {
 
 /// Why a service is not ready right now.
 ///
-/// Each variant carries a stable wire token via [`Self::as_str`]. The token
+/// Each variant carries a stable wire token via [`Self::as_token`]. The token
 /// is what HTTP bodies, RPC replies, and dashboards already use; the typed
 /// variants exist so services can pattern-match on the reason instead of
 /// comparing strings. Open via [`Self::Custom`] for service-specific reasons
@@ -871,11 +871,15 @@ impl ShutdownChoreography {
     /// Record one step with its outcome.
     ///
     /// If `step` has an ordinal strictly less than the highest previously
-    /// recorded ordinal, the recorded outcome becomes
-    /// [`StepOutcome::OrderingViolation`] with the previous step attached.
-    /// The service's chosen `outcome` is preserved on the step *kind* via
-    /// [`Self::raw_outcomes`] so failures during a misordered step still
-    /// surface separately.
+    /// recorded ordinal, the supplied `outcome` is **replaced** by
+    /// [`StepOutcome::OrderingViolation`] with the previous step
+    /// attached, so a backwards recording is visible in the terminal
+    /// report rather than silently accepted. The replacement is
+    /// destructive: the original `outcome` you passed in is dropped
+    /// and not retained anywhere on the choreography. If you need the
+    /// resource-specific truth to survive even when the step is
+    /// misordered, use [`Self::record_close`], which also retains the
+    /// full [`ResourceCloseReport`] in [`Self::closes`].
     pub fn record(
         &mut self,
         step: ShutdownStep,
