@@ -116,7 +116,7 @@ Ship a copied path on `PendingReplies`:
 
 ```rust
 match self.pending.park(qid, call) {
-    Ok(()) => start_work,
+    Ok(ticket) => start_work(ticket),
     Err(ParkError::Full(call)) => call.reply(Reply::Full),
     Err(ParkError::DuplicateKey(call, qid)) => call.reject(...),
 }
@@ -129,12 +129,33 @@ Rules:
 - Failure must not strand the caller.
 - No helper starts child work.
 - Duplicate key stays typed.
+- Success returns a `ParkTicket<K>`.
+- The copied reply/take path uses the ticket, not only the key, so stale
+  continuations cannot remove a newer parked caller after key reuse.
+- Tickets have private fields and carry a generation/slot identity. User code
+  can carry a ticket but cannot forge one.
+- Existing key-only `try_insert` / `take(&key)` may remain as lower-level
+  escape hatches, but migrated copied paths should carry tickets.
+
+Likely API:
+
+```rust
+pending.park(key, call) -> Result<ParkTicket<K>, ParkError<...>>
+pending.take(ticket) -> Result<DeferredReply<R>, TakeParkedError>
+pending.reply(ticket, reply) -> Effect<I>
+```
+
+If returning `Effect<I>` from `reply` makes the bounds ugly, keep
+`take(ticket) -> DeferredReply<R>` and let the caller use existing `reply_to`.
+Do not drop the ticket from the copied path.
 
 Tests:
 
 - Success parks and later replies the original caller.
 - `Full` returns the caller authority; caller receives a typed reply/reject.
 - duplicate key returns the caller authority.
+- stale key-only completion cannot remove a newer parked caller when the copied
+  ticket path is used.
 - caller timeout/cancel is still visible and capacity is reclaimed.
 - fill -> close/cancel -> refill works.
 
@@ -150,7 +171,7 @@ leases: HashMap<Id, SharedLease>,
 Ship a guarded parked slot:
 
 ```rust
-self.pending.park_guarded(qid, call, guard)
+let ticket = self.pending.park_guarded(qid, call, guard)?;
 ```
 
 and, if needed for lower-level deferred slots:
@@ -178,6 +199,7 @@ Rules:
 - Guard drops on drain/close.
 - Guard drops when the caller is gone and the slot is swept.
 - Failed admission returns both caller authority and guard.
+- Success returns a ticket; copied take/reply paths use the ticket.
 - No sidecar map needed in migrated systems.
 
 Tests:
@@ -186,6 +208,7 @@ Tests:
 - Drop counter proves drain releases all guards.
 - Drop counter proves caller-timeout sweep releases the guard.
 - Failed `Full` / duplicate admission returns the guard.
+- stale key-only completion cannot steal a newer guarded slot.
 - No double drop.
 
 ### Rock 4: `WaitList<K, R>`
@@ -272,8 +295,8 @@ Real services often have natural keys with multiple live calls per key.
 Ship:
 
 ```rust
-let ticket = self.work.admit(key, pending)?;
-let pending = self.work.finish(ticket)?;
+let ticket = self.work.admit(pending)?;
+let pending = self.work.take(ticket)?;
 for pending in self.work.drain() { ... }
 ```
 
@@ -290,9 +313,12 @@ Rules:
 
 - Natural key is grouping metadata.
 - `WorkTicket<K>` is identity.
+- Tickets have private fields and carry generation/slot identity. User code can
+  carry a ticket but cannot forge one.
 - Multiple live entries may share one key.
 - Admission is bounded globally.
-- Per-key cap ships in this phase.
+- Per-key capacity is optional at construction time. Both constructors ship:
+  no per-key limit, and explicit per-key limit.
 - Child effect must still be gated by admission, like Phase 097.
 - Failed admission returns the pending token so the caller can be answered.
 - Cancel means Tina stops waiting / cancels Tina-owned work where possible.
@@ -303,21 +329,25 @@ Likely API:
 ```rust
 CancelableWork::with_capacity(total)
 CancelableWork::with_key_limit(total, per_key)
-work.admit(key, pending) -> Result<WorkTicket<K>, AdmitWorkError<K, Q, R>>
-work.finish(ticket) -> Option<PendingCancelableCall<K, Q, R>>
-work.remove(ticket) -> Option<PendingCancelableCall<K, Q, R>>
+work.admit(pending) -> Result<WorkTicket<K>, AdmitWorkError<K, Q, R>>
+work.take(ticket) -> Option<PendingCancelableCall<K, Q, R>>
 work.drain() -> impl Iterator<Item = PendingCancelableCall<K, Q, R>>
 work.snapshot()
 ```
 
-Keep exact generic bounds boring. The easiest honest API is to return the
-removed `PendingCancelableCall` and let user code call `.cancel(...)` so the
-continuation message is explicit. Add direct `cancel_with(...)` only if it makes
-the copied path clearer without trait soup.
+`PendingCancelableCall` already carries its key. `CancelableWork::admit(...)`
+uses that key as the natural grouping key; do not require users to pass the same
+key twice.
 
-`finish` and `remove` are storage verbs. They do not reply to the original
-caller by themselves. The service still answers through the returned pending
-token's request context, so reply policy stays visible.
+Keep exact generic bounds boring. The honest API is to return the removed
+`PendingCancelableCall` and let user code call `.cancel(...)` or
+`.into_request_context()` so the continuation/reply message is explicit. Add
+direct `cancel_with(...)` only if it makes the copied path clearer without trait
+soup.
+
+`take` and `drain` are storage verbs. They do not reply to the original caller
+by themselves. The service still answers through the returned pending token's
+request context, so reply policy stays visible.
 
 Implementation shape:
 
@@ -334,7 +364,7 @@ Tests:
 - cancel one entry without touching its sibling.
 - stale completion cannot remove a newer ticket.
 - global full returns pending token.
-- per-key full returns pending token.
+- per-key full returns pending token when using `with_key_limit`.
 - drain replies/cancels every parked caller.
 - fill -> cancel/drain -> refill.
 
@@ -410,6 +440,7 @@ Required:
   `SleepReply` field in the user's enum.
 - runtime test proving `park` full/duplicate returns caller authority and the
   caller does not time out.
+- runtime test proving copied `park` ticket removal prevents stale-key ABA.
 - runtime test proving guarded park releases guards on normal reply, drain, and
   caller-gone sweep.
 - runtime test proving `WaitList` FIFO, global cap, per-key cap, stale ticket,
