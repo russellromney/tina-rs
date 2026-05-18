@@ -2,79 +2,23 @@
 
 ## Status
 
-- Ready for implementation after phases 110-113.
+- Ready.
 - One PR.
 
 ## Goal
 
-Make the copied Tina service path read like the user's job, not the
-runtime's plumbing.
+Make common Tina service code read like the user's job.
 
-Users think:
+User words first:
 
-- "let these callers wait for the same work";
-- "start this request and track it";
-- "close/drain this service";
-- "read pressure and trace facts";
-- "write a bridge the normal way".
+- shared work: many callers wait for one result;
+- request work: start work for this caller and answer later;
+- bridge: install, close, drain, metrics, pressure;
+- service stop: stop ingress, drain, close, report;
+- pressure: show caps, current use, high water, full count.
 
-They do not start with:
+Mechanism words stay, but should not be the first copied path:
 
-- deferred slot;
-- pending table;
-- ticket;
-- cancel handle;
-- bridge worker terminal outcome.
-
-This phase keeps the precise lower-level nouns. It adds and documents
-workflow front doors over the nouns that are already proven by systems.
-No hidden queues. No callbacks that mutate state off to the side. No fake
-async.
-
-## Inputs From Findings
-
-Roll in these current findings:
-
-- `examples/FINDINGS.md` 21: `WaitList` shipped; now give users the
-  front-door name for "many callers wait on one key".
-- `system_cache_with_fill` and `ergonomics_playground`: both prove the
-  same single-flight/cache-fill shape.
-- `system_job_queue`: cancelable request work is safe, but docs should
-  lead with "run request" and only then show `PendingCancelableCallSet`.
-- `system_metrics_shipper`: batching/drain helpers are good, but the
-  copied shutdown/workflow text needs to name the service job first.
-- `examples/FINDINGS.md` 26: runtime-call completions are now documented as
-  ordinary `handle` messages. Add the regression proof and move the finding
-  to Closed.
-- `examples/FINDINGS.md` 32/33: bridge author vocabulary exists; make the
-  docs show the bridge author's job before the shared traits.
-
-Do not roll in these larger future items:
-
-- scatter/gather builder;
-- paired registration;
-- shared scope registry;
-- DST adapters for scopes/sinks;
-- AWS bridge internal state-machine factoring;
-- cross-isolate request/event typestate beyond what already exists.
-
-Those are real, but not this cleanup pass.
-
-## User-Facing Naming Rule
-
-Application authors see workflow names first:
-
-- `SharedWork` for callers waiting on one key;
-- `CancelableWork` for cancelable request work;
-- existing lifecycle helpers for service stop;
-- `PressureReport` / `CapacitySummary` for cap facts;
-- `TraceQuery` / existing trace helpers for trace facts;
-- `BridgeInstall` / `BridgeCloser` only after "install a bridge" is
-  shown.
-
-Mechanism names stay available for advanced code:
-
-- `RequestContext`;
 - `DeferredReply`;
 - `PendingReplies`;
 - `PendingCancelableCallSet`;
@@ -82,146 +26,170 @@ Mechanism names stay available for advanced code:
 - `PoolLease`;
 - `RuntimeEventKind`.
 
-Docs must introduce the workflow name first, then say which mechanism it
-uses.
+No hidden queues. No hidden callbacks. No fake async. Ordinary Tina
+messages, bounded storage, typed outcomes, visible pressure.
+
+## Why Now
+
+Systems/specimens proved the same pain more than once:
+
+- `system_cache_with_fill` and `ergonomics_playground`: "many callers
+  wait on one key" is now real. `WaitList` works, but `SharedWork` is
+  the better user-facing name.
+- `system_job_queue`: cancelable request work is safe, but docs should
+  say "one active request" vs "many active requests for the same key"
+  before naming the tables.
+- `system_metrics_shipper`: drain/batch helpers are good; docs should
+  name the service workflow first.
+- `system_webhook_relay`: bridge classifier and bridge author terms need
+  one copied "write a bridge" path.
+- `examples/FINDINGS.md` finding 26: runtime-call completions from
+  `handle_call` must be pinned by a regression and then moved out of
+  Active.
+
+Do not do these here:
+
+- scatter/gather builder;
+- paired registration;
+- shared scope registry;
+- DST adapters for scopes/sinks;
+- AWS bridge state-machine factoring;
+- new protocol work;
+- new request/event typestate.
 
 ## Rock 1: `SharedWork`
 
-Add a small public `SharedWork<K, R>` front door in `tina-runtime`.
+Add `SharedWork<K, R>` in `tina-runtime`.
 
-It wraps `WaitList<K, R>` and keeps the same guarantees:
+It is a thin user-facing wrapper over `WaitList<K, R>`. Do not build a
+new storage engine.
 
-- fixed global capacity;
-- optional per-key capacity;
-- FIFO per key;
-- typed `Full` and `KeyFull`;
-- caller authority returned on rejection;
-- ticket cannot be forged;
-- capacity report and snapshot;
-- no hidden fill state;
-- no hidden upstream work.
-
-Preferred copied shape:
+Exact first-form API:
 
 ```rust
-match self.fills.wait(key.clone(), call) {
-    Ok(ticket) => {
-        if self.fill_in_flight.insert(key.clone()) {
-            request_effect_after_shared_wait(&ticket, self.start_fill(key))
-        } else {
-            request_effect_after_shared_wait(&ticket, noop())
-        }
-    }
-    Err(SharedWorkError::Full { call, .. }) => call.reply(Reply::Busy),
-    Err(SharedWorkError::KeyFull { call, .. }) => call.reply(Reply::Busy),
+pub struct SharedWork<K, R>;
+pub struct SharedWorkTicket<K>;
+pub enum SharedWorkError<'a, K, I: Isolate> {
+    Full { key: K, call: RequestCall<'a, I> },
+    KeyFull { key: K, call: RequestCall<'a, I> },
+}
+pub enum SharedWorkCallError<'a, K, I: Isolate> {
+    NoCaller { key: K, call: CallContext<'a, I> },
+    CrossShardUnsupported { key: K, call: CallContext<'a, I> },
+    Full { key: K, call: CallContext<'a, I> },
+    KeyFull { key: K, call: CallContext<'a, I> },
 }
 ```
 
-This is deliberately not a full `SingleFlight` scheduler. The service
-still owns:
+Required methods:
 
-- whether work is in flight;
-- fill generation;
-- stale fill policy;
-- upstream effect;
-- reply value.
+- `with_capacity(cap)`;
+- `with_key_limit(cap, per_key)`;
+- `named(name)`;
+- `with_capacity_mode(mode)`;
+- `wait(key, RequestCall) -> Result<SharedWorkTicket<K>, SharedWorkError>`;
+- `wait_call(key, CallContext) -> Result<SharedWorkTicket<K>, SharedWorkCallError>`;
+- `reply_one(ticket, reply)`;
+- `reply_all_clone(key, reply)`;
+- `reply_all_with(key, factory)`;
+- `close_all_clone(key, reply)`;
+- `close_all_with(key, factory)`;
+- `drain_all_with(factory)`;
+- `sweep()`;
+- `snapshot()`;
+- `capacity_report()`.
 
-`SharedWork` only owns "park callers for this key and reply them later".
+Add:
 
-Implementation:
+```rust
+request_effect_after_shared_wait(ticket, effect)
+```
 
-- `SharedWork` is a newtype over `WaitList`, not a separate storage engine.
-- Keep `WaitList` public.
-- Provide `request_effect_after_shared_wait(ticket, effect)` as the
-  workflow-named sibling of `request_effect_after_wait_park`.
-- Re-export from the same place as `WaitList`.
-- Add rustdoc that says when to use `SharedWork` vs raw `PendingReplies`.
+Same role as `request_effect_after_wait_park`: the ticket proves caller
+authority was consumed before a `RequestEffect` is returned.
 
-Proof:
+Keep `WaitList` public. Rustdoc should say:
 
-- unit tests mirror the important `WaitList` facts through the new name:
-  full, per-key full, FIFO, stale ticket, closed caller sweep, capacity
-  report live count;
-- compile-fail: user cannot forge a `SharedWorkTicket`;
-- `system_cache_with_fill` uses `SharedWork`;
-- `ergonomics_playground` uses `SharedWork` for its cache-fill probe.
+- use `SharedWork` for "many callers wait for one result";
+- use `PendingReplies` when you own unrelated reply slots by id;
+- use `WaitList` only when you need the lower-level name.
 
-## Rock 2: Request Work Copy Path
+Do not make `SharedWork` start the upstream fill. The service still owns:
 
-Make cancelable request work read as "start request" in docs and examples.
+- fill-in-flight flag/set;
+- stale fill generation;
+- upstream call/timer;
+- reply value;
+- retry policy.
 
-Do not rename or remove `PendingCancelableCallSet`.
+## Rock 2: Request Work Names
 
-Do:
+Document request work by user intent.
 
-- make `CancelableWork<K, Q, R>` the first documented path when many live
-  requests may share one natural key;
-- keep `PendingCancelableCallSet<K, Q, R>` as the stricter one-entry-per-key
-  table;
-- document the difference in user words:
-  - `PendingCancelableCallSet`: one active request for this key;
-  - `CancelableWork`: many active requests grouped by this key.
-- add a copied example that starts cancelable work, admits it, handles
-  `Full` / `KeyFull`, removes by ticket, and replies to the original
-  caller.
+Two shapes:
 
-If `system_job_queue` still uses the stricter set and that is correct,
-leave it. Add a README note: retry/new-attempt semantics require the
-many-entry form, not the one-entry set.
+- one active request per key: `PendingCancelableCallSet<K, Q, R>`;
+- many active requests grouped by key: `CancelableWork<K, Q, R>`.
 
-Proof:
+Do not rename or remove either type.
 
-- `CancelableWork` tests cover many entries under one key, per-key full,
-  global full, stale ticket does not remove a newer entry, drain returns all
-  tokens, and capacity report counts live entries;
-- one system README points to the right choice by user intent.
+Add docs/examples that show:
+
+- start cancelable work;
+- admit before dispatch;
+- `Full` / `KeyFull` replies immediately;
+- completion removes by ticket;
+- stale ticket does not remove newer work;
+- stop drains/cancels and replies to every caller.
+
+If `system_job_queue` correctly uses `PendingCancelableCallSet`, leave the
+code. Its README must say why: it wants one active job per id. It must also
+say retry/new-attempt semantics should use `CancelableWork`.
 
 ## Rock 3: Service Pattern Docs
-
-Refresh the user guide so the first copied path is a service workflow, not
-a noun glossary.
 
 Update:
 
 - `docs/tina-user-guide/10-service-patterns.md`;
 - `docs/tina-user-guide/11-ergonomics-checklist.md`;
 - `docs/tina-user-guide/12-outcome-glossary.md`;
-- any page that still leads a common workflow with raw `PendingReplies`
-  where `SharedWork`, `CancelableWork`, or `RequestContext::defer` is the
-  copied path.
+- any nearby page that still teaches a common workflow by leading with raw
+  `PendingReplies`.
 
-Required boxes:
+Add short copied boxes:
 
-- "Many callers wait for one result" -> `SharedWork`;
-- "One cancelable request is running" -> `PendingCancelableCallSet`;
-- "Many cancelable requests share a natural key" -> `CancelableWork`;
-- "Reply later to the current caller" -> `call.defer(...).reply(...)`;
-- "Close/drain on stop" -> existing drain/lifecycle helpers;
-- "Write a bridge" -> install, close, drain, metrics, pressure.
+- many callers wait for one result -> `SharedWork`;
+- one active cancelable request -> `PendingCancelableCallSet`;
+- many cancelable requests per natural key -> `CancelableWork`;
+- reply later to current caller -> `call.defer(...).reply(...)`;
+- close/drain on stop -> existing drain/lifecycle helpers;
+- write a bridge -> install, close, drain, metrics, pressure.
 
-Each box must have:
+Each box must say:
 
-- what user is trying to do;
-- preferred helper;
-- what stays visible;
-- one small copied snippet;
+- what the user is doing;
+- helper to use;
+- what stays explicit;
 - what not to use.
+
+Keep snippets small enough to copy.
 
 ## Rock 4: Bridge Author Copy Path
 
-Digest phase 113 into a bridge-author page section.
+Digest phase 113 into one "write a bridge" path.
 
 Show the job first:
 
-1. define config and validate caps;
-2. install worker and return handles;
-3. expose closer;
-4. expose metrics;
-5. expose pressure;
-6. classify outcomes;
-7. prove close/drain and late-result truth.
+1. config validates caps;
+2. install starts worker and returns handles;
+3. closer stops admission;
+4. drain waits or reports timeout;
+5. metrics count worker-terminal outcomes;
+6. pressure reports capacity/full/high-water;
+7. classifier names retry/fatal/success;
+8. late result truth is documented.
 
-Then map those jobs to:
+Then map to:
 
 - `BridgeInstall`;
 - `BridgeCloser`;
@@ -230,83 +198,110 @@ Then map those jobs to:
 - pressure report;
 - classifier.
 
-Do not invent a bridge framework. The bridge crates still own their real
-messages and worker state machines.
+No bridge framework blob. Bridge crates still own real messages and worker
+state machines.
 
-Proof:
+Docs to touch:
 
-- rustdoc for `BridgeInstall` / `BridgeCloser` matches the real trait
-  methods;
-- one non-AWS bridge README or crate docs links to the bridge-author
-  section;
-- one AWS bridge README or crate docs links to the same section.
+- bridge user guide page;
+- one non-AWS bridge README or crate doc;
+- one AWS bridge README or crate doc.
 
-## Rock 5: Runtime Completion Regression And Findings Cleanup
+## Rock 5: Runtime Completion Regression
 
-Add a regression for finding 26:
+Close `examples/FINDINGS.md` finding 26 with a real test.
 
-- an isolate receives a call in `handle_call`;
-- it returns a runtime call effect whose continuation message is an internal
-  event;
-- the continuation is delivered to `handle`, not `handle_call`;
-- the original caller receives the final reply.
-
-Use a tiny timer or observed-send call so the proof stays hermetic. Name the
-test:
+Test user truth:
 
 ```text
 runtime_call_returned_from_handle_call_completes_as_event
 ```
 
-Update findings so they tell the current truth.
+Shape:
 
-Required moves:
+- service receives a call in `handle_call`;
+- handler returns a runtime call effect;
+- runtime call completion produces an internal event message;
+- internal event is delivered to `handle`, not `handle_call`;
+- original caller receives final reply;
+- trace has no `UnsupportedMessage` rejection for the internal event.
 
-- Close or rewrite finding 21 around `SharedWork`.
-- Move finding 26 to Closed and cite the regression above.
-- Add a short "workflow front doors" note to the active list only if
-  something remains open after this phase.
-- Move stale solved pain to Closed or history.
+Use a hermetic timer or observed-send call. Do not use network.
 
-Do not leave "build X" in Active when this phase ships X.
+Run this on the live runtime path that would have caught
+`system_realtime_rooms`. Add simulator coverage only if the same path is
+cheap and clear.
+
+After the test lands, move finding 26 to Closed and cite the test.
 
 ## Rock 6: System Rewrites
 
-Migrate exactly these systems:
+Rewrite exactly:
 
-- `examples/systems/system_cache_with_fill`;
-- `examples/systems/ergonomics_playground`;
-- `examples/systems/system_webhook_relay` README only, as the bridge-heavy
-  pointer to the bridge-author copy path.
+- `examples/systems/system_cache_with_fill`: use `SharedWork`;
+- `examples/systems/ergonomics_playground`: use `SharedWork` for the
+  cache-fill probe;
+- `examples/systems/system_webhook_relay` README: point to the bridge
+  author path.
 
-Keep rewrites small. The goal is to prove the names make the copied path
-clearer, not to redesign the systems.
+Do not redesign those systems.
 
-Each rewritten README must include:
+Each touched README must say:
 
 - what got shorter or safer;
-- what stayed explicit;
-- which helper is now the blessed copied path;
-- any remaining rough bit.
+- what still stays explicit;
+- which helper is now the copied path;
+- remaining rough bits.
 
-## Rock 7: Compile-Fail / Agent-Proof Rails
+## Rock 7: Findings Cleanup
 
-Add compile-fail tests for the mistakes this phase is trying to prevent:
+Update `examples/FINDINGS.md`.
 
-- cannot forge a `SharedWorkTicket`;
-- cannot turn a plain `noop()` into a request effect with the shared-work
-  helper;
-- the preferred cancelable deferred helper returns the child effect only
-  from the `Ok` path after admission; keep the lower-level escape hatch
-  documented as advanced and not copied;
-- docs compile for the copied snippets.
+Required:
 
-If a mistake cannot be made impossible yet, docs must say that loudly and
-the finding must stay open.
+- finding 21: close or rewrite around `SharedWork`;
+- finding 26: move to Closed with the regression test;
+- findings 32/33: point to bridge-author docs if the docs now answer the
+  immediate copy-path issue;
+- do not leave solved pain in Active.
 
-## Required Verification
+If something is still real product work, keep it Active and make the
+remaining build specific.
 
-Run at least:
+## Tests
+
+Unit tests for `SharedWork`:
+
+- global full returns caller authority;
+- per-key full returns caller authority;
+- FIFO per key;
+- stale ticket cannot reply newer waiter;
+- closed caller sweep frees capacity;
+- `snapshot()` omits closed waiters;
+- `capacity_report()` reports live count, high-water, full count;
+- `drain_all_with` replies every open waiter and clears capacity;
+- zero capacity and zero per-key cap panic like `WaitList`.
+
+Compile-fail tests:
+
+- cannot forge `SharedWorkTicket`;
+- cannot build `RequestEffect` from `noop()` with
+  `request_effect_after_shared_wait` without a real ticket;
+- docs compile for copied snippets.
+
+End-to-end tests:
+
+- `system_cache_with_fill`: burst N callers for one missing key; exactly one
+  fill starts; every caller gets the same value; second fill generation
+  ignores stale old completion;
+- `system_cache_with_fill`: shared-work global full returns `Busy`;
+- `system_cache_with_fill`: per-key full returns `Busy` if configured;
+- `ergonomics_playground`: cache-fill probe still passes and uses no
+  `WaitList` in copied service code;
+- bridge docs/rustdoc pass with broken intra-doc links denied;
+- runtime completion regression from Rock 5.
+
+Run:
 
 ```sh
 cargo fmt --all --check
@@ -321,20 +316,15 @@ cargo clippy -p tina-runtime --lib -- -D warnings
 cargo clippy --manifest-path examples/systems/system_cache_with_fill/Cargo.toml --all-targets -- -D warnings
 cargo clippy --manifest-path examples/systems/ergonomics_playground/Cargo.toml --all-targets -- -D warnings
 cargo clippy --manifest-path examples/systems/system_webhook_relay/Cargo.toml --all-targets -- -D warnings
-```
-
-Run broader checks if public exports or docs move:
-
-```sh
 RUSTDOCFLAGS="-D warnings" cargo doc -p tina-runtime --no-deps
 ```
 
 ## Done Means
 
-- A new user sees "shared work" before `WaitList`.
-- A new user sees "start cancelable request work" before
-  `PendingCancelableCallSet`.
-- The systems prove the names in real code.
-- Findings do not describe shipped pain as current.
+- New code says `SharedWork` before `WaitList`.
+- Docs say "start request work" before table names.
+- Bridge authors see the normal job path before trait names.
+- Systems prove the names in real code.
+- Findings match reality.
 - No helper hides overload, cancellation, caller authority, timeout,
   pressure, or trace truth.
