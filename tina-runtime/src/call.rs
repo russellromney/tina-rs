@@ -323,8 +323,12 @@ pub struct JournalRecord {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum JournalReplayWarning {
     /// The journal ended with an incomplete final record. Valid prefix records
-    /// were returned.
-    TruncatedTail,
+    /// were returned. `valid_prefix_len` is the byte length that can be
+    /// safely retained before appending new records.
+    TruncatedTail {
+        /// Number of valid prefix bytes in the journal file.
+        valid_prefix_len: u64,
+    },
 }
 
 /// Journal replay output.

@@ -128,7 +128,10 @@ impl PersistService {
                         self.last_journal_index = record.index;
                     }
                 }
-                if replay.warning == Some(JournalReplayWarning::TruncatedTail) {
+                if matches!(
+                    replay.warning,
+                    Some(JournalReplayWarning::TruncatedTail { .. })
+                ) {
                     self.observed
                         .lock()
                         .expect("observed mutex")
@@ -425,7 +428,12 @@ fn journal_replay_reports_truncated_tail_but_rejects_bad_checksum() {
     truncated.extend_from_slice(&[1, 2, 3]);
     let replay = tina_runtime::persistence::replay_journal_bytes(&truncated).unwrap();
     assert_eq!(replay.records.len(), 1);
-    assert_eq!(replay.warning, Some(JournalReplayWarning::TruncatedTail));
+    assert_eq!(
+        replay.warning,
+        Some(JournalReplayWarning::TruncatedTail {
+            valid_prefix_len: good.len() as u64,
+        })
+    );
 
     let mut corrupt = good;
     let last = corrupt.len() - 1;
@@ -483,9 +491,16 @@ fn journal_append_rejects_unreplayable_index_order_before_appending() {
         .concat(),
     )
     .expect("write truncated journal");
+    tina_runtime::persistence::append_journal_record(&journal, 3, b"third".to_vec()).unwrap();
+    let repaired = tina_runtime::persistence::replay_journal(&journal).unwrap();
+    assert_eq!(repaired.warning, None);
     assert_eq!(
-        tina_runtime::persistence::append_journal_record(&journal, 3, b"third".to_vec()),
-        Err(CallError::CorruptRecord)
+        repaired
+            .records
+            .iter()
+            .map(|record| record.index)
+            .collect::<Vec<_>>(),
+        vec![1, 3]
     );
 }
 
