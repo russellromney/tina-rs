@@ -708,6 +708,12 @@ fn tally_worker_terminal(metrics: &MetricsInner, result: &PgResult) {
                     .fetch_add(1, Ordering::Relaxed);
                 tally_transaction_steps(metrics, completed);
             }
+            PgTransactionOutcome::CommitAmbiguous { completed, .. } => {
+                metrics
+                    .transactions_commit_ambiguous
+                    .fetch_add(1, Ordering::Relaxed);
+                tally_transaction_steps(metrics, completed);
+            }
         },
         Err(PgError::PoolAcquireTimeout) => {
             metrics
@@ -875,10 +881,15 @@ async fn run_on_conn(
             if let Err(e) = tx.commit().await {
                 // COMMIT itself failed (deadlock, serialization
                 // failure, connection loss). The transaction is in
-                // an indeterminate state from the caller's view;
-                // surface as a top-level Sqlx error rather than a
-                // RolledBack outcome we cannot honestly claim.
-                return Err(map_sqlx_error(e));
+                // an indeterminate state from the caller's view:
+                // the completed step records are true, but committed
+                // vs rolled back is not.
+                return Ok(PgResponse::Transaction(
+                    PgTransactionOutcome::CommitAmbiguous {
+                        completed,
+                        error: map_sqlx_error(e),
+                    },
+                ));
             }
             Ok(PgResponse::Transaction(PgTransactionOutcome::Committed {
                 steps: completed,

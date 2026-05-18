@@ -789,6 +789,16 @@ pub enum PgTransactionOutcome {
         /// Error returned by the failing step.
         error: PgError,
     },
+    /// Every step succeeded, then `COMMIT` returned an error. From
+    /// the caller's view the transaction outcome is ambiguous: the
+    /// listed steps definitely ran before the commit attempt, but the
+    /// bridge cannot honestly claim committed or rolled back.
+    CommitAmbiguous {
+        /// Per-step outcomes in input order before the commit attempt.
+        completed: Vec<PgStepOk>,
+        /// Error returned by `COMMIT`.
+        error: PgError,
+    },
 }
 
 /// Successful outcome of a single [`PgStep`].

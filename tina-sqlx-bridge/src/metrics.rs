@@ -56,9 +56,11 @@ pub struct PgMetrics {
     /// Transaction scripts that committed.
     pub transactions_committed: u64,
     /// Transaction scripts that rolled back because a step failed.
-    /// Does not count COMMITs that themselves failed (those land as
-    /// `sqlx_errors`).
+    /// Does not count COMMITs that themselves failed.
     pub transactions_rolled_back: u64,
+    /// Transaction scripts whose steps completed but whose COMMIT
+    /// result was ambiguous.
+    pub transactions_commit_ambiguous: u64,
     /// Number of `pg_cancel_backend(pid)` cancellations the bridge
     /// fired against the sidecar pool. Counts the *attempt*, not
     /// whether Postgres honored it.
@@ -103,6 +105,7 @@ pub(crate) struct MetricsInner {
     pub(crate) rows_returned: AtomicU64,
     pub(crate) transactions_committed: AtomicU64,
     pub(crate) transactions_rolled_back: AtomicU64,
+    pub(crate) transactions_commit_ambiguous: AtomicU64,
     pub(crate) db_cancels_sent: AtomicU64,
     pub(crate) decode_errors: AtomicU64,
     pub(crate) late_results: AtomicU64,
@@ -133,6 +136,9 @@ impl MetricsInner {
             rows_returned: self.rows_returned.load(Ordering::Relaxed),
             transactions_committed: self.transactions_committed.load(Ordering::Relaxed),
             transactions_rolled_back: self.transactions_rolled_back.load(Ordering::Relaxed),
+            transactions_commit_ambiguous: self
+                .transactions_commit_ambiguous
+                .load(Ordering::Relaxed),
             db_cancels_sent: self.db_cancels_sent.load(Ordering::Relaxed),
             decode_errors: self.decode_errors.load(Ordering::Relaxed),
             late_results: self.late_results.load(Ordering::Relaxed),

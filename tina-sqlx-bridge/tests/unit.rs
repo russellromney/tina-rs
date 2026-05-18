@@ -329,6 +329,24 @@ fn classify_committed_transaction_succeeds() {
 }
 
 #[test]
+fn commit_ambiguous_transaction_preserves_completed_steps_and_error() {
+    use tina_sqlx_bridge::PgTransactionCallOutcome;
+    let outcome: PgTransactionCallOutcome =
+        CallOutcome::Replied(Ok(PgTransactionOutcome::CommitAmbiguous {
+            completed: vec![PgStepOk::Executed { rows_affected: 7 }],
+            error: PgError::Sqlx("commit connection closed".into()),
+        }));
+
+    match outcome.classify() {
+        PgOutcomeClass::Succeeded(PgTransactionOutcome::CommitAmbiguous { completed, error }) => {
+            assert_eq!(completed, vec![PgStepOk::Executed { rows_affected: 7 }]);
+            assert_eq!(error, PgError::Sqlx("commit connection closed".into()));
+        }
+        other => panic!("expected Succeeded(CommitAmbiguous), got {other:?}"),
+    }
+}
+
+#[test]
 fn pg_request_fetch_many_carries_max_rows_and_params() {
     let req = PgRequest::fetch_many("SELECT * FROM t WHERE k > $1", 100).param(7_i64);
     match req {
