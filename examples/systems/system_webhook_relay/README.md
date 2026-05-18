@@ -45,7 +45,8 @@ cargo test --manifest-path examples/systems/system_webhook_relay/Cargo.toml
 
 - multi-turn request/reply (relay defers its call's reply through the
   outbound port);
-- bridge classifier (`BridgeOutcomeClass`, `TransientReason`, `FatalReason`);
+- bridge classifier (`BridgeOutcomeClass`, `BridgeRetryable`,
+  `BridgeUnavailable`, `BridgeFatal`);
 - typed-error mapping out of `tina-aws-bridge::SqsError`.
 
 ## Suggested follow-up
@@ -54,6 +55,16 @@ cargo test --manifest-path examples/systems/system_webhook_relay/Cargo.toml
   rather than just metric-visible;
 - a backoff-budget isolate could ride alongside the relay to suggest delays
   for `Retry` outcomes without growing a hidden retry loop inside the relay.
+
+## Authoring a bridge — copied path
+
+The relay reuses an outbound bridge but does not author one. For the
+copied "write a bridge" path — install, close, drain, metrics, pressure,
+classifier, late-result truth — see
+[`docs/tina-user-guide/30-bridge-author-kit.md`](../../../docs/tina-user-guide/30-bridge-author-kit.md).
+The user-facing checklist starts from the bridge author's job, then maps
+to `BridgeInstall`, `BridgeCloser`, `close_and_drain`, the metrics handle,
+the pressure report, and the classifier vocabulary used by this relay.
 
 ## Verdict
 

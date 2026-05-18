@@ -81,6 +81,7 @@ pub mod scope;
 pub mod service_pressure;
 pub mod sharded;
 pub mod shared_scope;
+pub mod shared_work;
 mod shutdown;
 mod single_call_gate;
 pub mod tcp_loops;
@@ -310,6 +311,10 @@ pub use scope::{
 };
 pub use service_pressure::{ServicePressureReport, ServicePressureSurface, ServiceSurfaceState};
 pub use shared_scope::{SharedCapacityScope, SharedLease, SharedScopeFull, SharedScopeReport};
+pub use shared_work::{
+    SharedWork, SharedWorkCallError, SharedWorkError, SharedWorkReplyError, SharedWorkSnapshot,
+    SharedWorkTicket, request_effect_after_shared_wait,
+};
 pub use tcp_loops::{LoopStep, ReadExactStep, TcpReadExact, TcpReadToEof, TcpWriteAll};
 /// Declares a Tina isolate whose call channel defaults to [`RuntimeCall<Message>`](RuntimeCall).
 ///

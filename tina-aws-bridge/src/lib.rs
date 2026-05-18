@@ -9,6 +9,17 @@
 //! Tina owns bounded admission, per-operation deadline truth, visible
 //! pressure, typed request/response enums, and lifecycle handles.
 //!
+//! For the bridge-author copy path — install, close, drain, metrics,
+//! pressure, classifier, late-result truth — see
+//! `docs/tina-user-guide/30-bridge-author-kit.md`. Each of the five
+//! services in this crate is one specimen of that path: the
+//! per-service `install_xxx`/`with_supplied_client` returns a
+//! `BridgeInstall` handle, the closer flips admission, `close_and_drain`
+//! reports remaining in-flight kinds, the metrics handle exposes a
+//! typed `BridgePressure` and worker-terminal counts, and
+//! `XxxOutcomeExt::classify` projects each outcome onto the shared
+//! `BridgeOutcomeClass` vocabulary.
+//!
 //! Each service worker has the same shape:
 //!
 //! - `XxxConfig` + `XxxConfigError` validated up front;
