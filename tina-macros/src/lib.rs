@@ -206,17 +206,17 @@ fn build_isolate(
     let reply = args.reply.unwrap_or_else(|| syn::parse_quote!(()));
     let send = args
         .send
-        .unwrap_or_else(|| syn::parse_quote!(::tina::Outbound<::std::convert::Infallible>));
+        .unwrap_or_else(|| syn::parse_quote!(::tina::Outbound<::core::convert::Infallible>));
     let spawn = args
         .spawn
-        .unwrap_or_else(|| syn::parse_quote!(::std::convert::Infallible));
+        .unwrap_or_else(|| syn::parse_quote!(::core::convert::Infallible));
     let spawn_observed = args
         .spawn_observed
-        .unwrap_or_else(|| syn::parse_quote!(::std::convert::Infallible));
+        .unwrap_or_else(|| syn::parse_quote!(::core::convert::Infallible));
     let call = match args.call {
         Some(call) => call,
         None => match call_default {
-            CallDefault::Infallible => syn::parse_quote!(::std::convert::Infallible),
+            CallDefault::Infallible => syn::parse_quote!(::core::convert::Infallible),
             CallDefault::RuntimeCall => syn::parse_quote!(::tina_runtime::RuntimeCall<#message>),
         },
     };

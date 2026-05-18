@@ -246,7 +246,7 @@ macro_rules! isolate_types {
             reply: $reply,
             send: $send,
             spawn: $spawn,
-            spawn_observed: ::std::convert::Infallible,
+            spawn_observed: ::core::convert::Infallible,
             call: $call,
             shard: $shard,
         }
@@ -2079,8 +2079,8 @@ pub trait SpawnAddress {
     type Reply;
 }
 
-impl SpawnAddress for std::convert::Infallible {
-    type Message = std::convert::Infallible;
+impl SpawnAddress for core::convert::Infallible {
+    type Message = core::convert::Infallible;
     type Reply = ();
 }
 
