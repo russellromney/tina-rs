@@ -537,12 +537,12 @@ impl BridgeCallerWarning {
 
 /// Vocabulary marker for a bridge install handle.
 ///
-/// A bridge install exposes the address that callers use to send
-/// requests, the closer for graceful shutdown, and the metrics handle
-/// for pressure reporting. The trait does **not** force a single type
-/// signature on bridges (their addresses and metrics shapes differ).
-/// It is the documented vocabulary so reviewers can ask "does this
-/// bridge produce an install, a closer, and a metrics handle?" without
+/// A bridge install owns a typed bridge address in its concrete type,
+/// plus a closer for admission shutdown and a metrics handle for
+/// pressure reporting. The shared trait only standardizes the closer
+/// and metrics accessors because bridge address shapes differ. It is
+/// the documented vocabulary so reviewers can ask "does this bridge
+/// produce an install, a closer, and a metrics handle?" without
 /// re-reading each crate's docs.
 pub trait BridgeInstall {
     /// The closer companion type.
@@ -557,10 +557,11 @@ pub trait BridgeInstall {
 
 /// Vocabulary marker for a bridge closer.
 ///
-/// Closers implement two things every bridge needs: idempotent
-/// `close()` and `close_and_drain(timeout)`. The drain report is
-/// per-bridge but should convert into [`BridgeDrainReport`] via
-/// [`From`] for cross-bridge tooling.
+/// Closers implement the common admission-shutdown shape every bridge
+/// needs: idempotent `close()` plus visible `is_closed()`. Drain
+/// remains per-bridge typed because each bridge reports different
+/// operation kinds, but a drain report should convert into
+/// [`BridgeDrainReport`] for cross-bridge tooling.
 pub trait BridgeCloser {
     /// Close admission without waiting for drain.
     fn close(&self);
