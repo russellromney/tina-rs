@@ -22,9 +22,10 @@ use std::marker::PhantomData;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use tina::{
-    capacity::{CapacityMode, CapacitySurfaceReport},
-    reply_to, CallContext, DeferredReply, DeferredSlotState, Effect, Isolate, RequestCall,
+    CallContext, DeferredReply, DeferredSlotState, Effect, Isolate, RequestCall,
     TakeReplySlotError,
+    capacity::{CapacityMode, CapacitySurfaceReport},
+    reply_to,
 };
 
 fn mint_wait_list_seq() -> u64 {
@@ -68,6 +69,22 @@ impl<K> std::fmt::Debug for WaitTicket<K> {
             .field("generation", &self.generation)
             .finish()
     }
+}
+
+/// Build a request-lane effect after caller authority has been consumed
+/// by [`WaitList::park`] or [`WaitList::park_call`].
+///
+/// The ticket is a proof that admission happened. Its fields are
+/// private, so copied app code cannot manufacture a `RequestEffect` from
+/// plain `noop()` without first parking the caller.
+pub fn request_effect_after_wait_park<I, K>(
+    _ticket: &WaitTicket<K>,
+    effect: tina::Effect<I>,
+) -> tina::RequestEffect<I>
+where
+    I: tina::Isolate,
+{
+    tina::runtime_internal::request_effect_from_consumed_effect(effect)
 }
 
 struct WaitEntry<K, R> {
@@ -413,9 +430,7 @@ where
 
         match call.try_into_request_context() {
             Ok(req) => Ok(self.store_entry(key, req.into_deferred())),
-            Err((call, TakeReplySlotError::NoCaller)) => {
-                Err(WaitCallError::NoCaller { key, call })
-            }
+            Err((call, TakeReplySlotError::NoCaller)) => Err(WaitCallError::NoCaller { key, call }),
             Err((call, TakeReplySlotError::CrossShardUnsupported)) => {
                 Err(WaitCallError::CrossShardUnsupported { key, call })
             }
@@ -457,9 +472,7 @@ where
         I: Isolate<Reply = R>,
         R: 'static,
     {
-        if ticket.slot >= self.slots.len()
-            || self.generations[ticket.slot] != ticket.generation
-        {
+        if ticket.slot >= self.slots.len() || self.generations[ticket.slot] != ticket.generation {
             return Err(WaitReplyError::StaleTicket {
                 reply,
                 _key: PhantomData,
@@ -483,16 +496,9 @@ where
     {
         let drained = self.drain_for_key(key);
         let mut out = Vec::with_capacity(drained.len());
-        let count = drained.len();
-        for (i, entry) in drained.into_iter().enumerate() {
-            let value = if i + 1 == count {
-                reply.clone()
-            } else {
-                reply.clone()
-            };
-            out.push(reply_to::<I>(entry.reply, value));
+        for entry in drained {
+            out.push(reply_to::<I>(entry.reply, reply.clone()));
         }
-        let _ = reply;
         out
     }
 
@@ -570,7 +576,10 @@ where
     pub fn snapshot(&self) -> Vec<WaitSnapshot<K>> {
         let mut out: Vec<WaitSnapshot<K>> = Vec::new();
         for slot in self.slots.iter() {
-            if let Some(entry) = slot.as_ref() {
+            if let Some(entry) = slot
+                .as_ref()
+                .filter(|entry| entry.reply.state() == DeferredSlotState::Open)
+            {
                 if let Some(row) = out.iter_mut().find(|row| row.key == entry.key) {
                     row.waiters += 1;
                 } else {
@@ -588,8 +597,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tina::runtime_internal::{deferred_from_handle, handle_from_shared};
     use tina::DeferredSlotShared;
+    use tina::runtime_internal::{deferred_from_handle, handle_from_shared};
 
     fn fake_slot(id: u64) -> DeferredReply<u32> {
         let shared =
@@ -599,6 +608,13 @@ mod tests {
 
     fn fake_request(id: u64) -> tina::RequestContext<u32> {
         tina::runtime_internal::request_context_from_deferred(fake_slot(id))
+    }
+
+    fn fake_slot_closed(id: u64) -> DeferredReply<u32> {
+        let shared =
+            std::sync::Arc::new(DeferredSlotShared::new(id, std::any::TypeId::of::<u32>()));
+        shared.set_state(DeferredSlotState::Closed);
+        deferred_from_handle(handle_from_shared(shared))
     }
 
     // Test-only constructor on WaitList to push pre-built request
@@ -748,6 +764,22 @@ mod tests {
         let mut counts: Vec<(u32, usize)> = snap.iter().map(|s| (s.key, s.waiters)).collect();
         counts.sort();
         assert_eq!(counts, vec![(1, 2), (2, 1)]);
+    }
+
+    #[test]
+    fn snapshot_omits_closed_slots_before_sweep() {
+        let mut list = WaitList::<u32, u32>::with_capacity(4);
+        list.store_entry(1, fake_slot_closed(10));
+        list.store_entry(2, fake_slot(20));
+
+        let snap = list.snapshot();
+        let counts: Vec<(u32, usize)> = snap.iter().map(|s| (s.key, s.waiters)).collect();
+        assert_eq!(counts, vec![(2, 1)]);
+        assert_eq!(
+            list.len(),
+            2,
+            "snapshot must not need to mutate/sweep the table"
+        );
     }
 
     #[test]

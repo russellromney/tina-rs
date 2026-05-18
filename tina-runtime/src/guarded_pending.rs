@@ -20,9 +20,10 @@
 use std::marker::PhantomData;
 
 use tina::{
-    capacity::{CapacityMode, CapacitySurfaceReport},
-    reply_to, CallContext, DeferredReply, DeferredSlotState, Effect, Isolate, RequestCall,
+    CallContext, DeferredReply, DeferredSlotState, Effect, Isolate, RequestCall,
     TakeReplySlotError,
+    capacity::{CapacityMode, CapacitySurfaceReport},
+    reply_to,
 };
 
 use std::sync::atomic::{AtomicU64, Ordering};

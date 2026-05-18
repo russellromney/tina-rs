@@ -56,13 +56,12 @@ mod capabilities;
 pub mod capacity;
 mod clock;
 pub mod deferred;
-pub mod guarded_pending;
-pub mod wait_list;
 mod drain_state;
 mod driver;
 mod errors;
 pub mod event_sink;
 mod full_handling;
+pub mod guarded_pending;
 mod host_burst;
 pub mod lifecycle;
 mod live_report;
@@ -86,6 +85,7 @@ pub mod tcp_loops;
 mod threaded;
 mod threaded_multi_shard;
 mod trace;
+pub mod wait_list;
 
 pub use drain_state::{AdmitDecision, DrainReport, DrainStage, DrainState};
 pub use errors::{
@@ -242,29 +242,29 @@ pub use crate::persistence::{
 pub use call::{
     AdmitWorkError, CallError, CallId, CallInput, CallOutcome, CallOutput, CallReply,
     CancelableCall, CancelableWork, CancelableWorkSnapshot, DeferredCancelableCall,
-    DeferredIsolateCall, DeferredObservedSend, DeferredTypedCall, SleepCall, WorkTicket,
-    DnsLookupReply, ErasedCall, FileCloseReply, FileFsyncReply, FileId, FileOpenOptions,
-    FileOpenReply, FileReadReply, FileSizeReply, FileWriteReply, IntoErasedCall, IsolateCall,
-    IsolateCallWithHandle, JournalAppendReply, JournalRecord, JournalReplay, JournalReplayReply,
-    JournalReplayWarning, ListenerId, MkdirReply, PathKind, PathMetadata, PathMetadataReply,
-    PendingCancelableCall, PendingCancelableCallSet, PendingCancelableInsertError,
-    PendingCancelableRemoveError, PendingCancelableTicket, PersistenceTraceInfo, ProcessRunReply,
-    ProcessRunResult, ProcessStatus, ReadDirReply, RemoveFileReply, RenameReplaceReply,
+    DeferredIsolateCall, DeferredObservedSend, DeferredTypedCall, DnsLookupReply, ErasedCall,
+    FileCloseReply, FileFsyncReply, FileId, FileOpenOptions, FileOpenReply, FileReadReply,
+    FileSizeReply, FileWriteReply, IntoErasedCall, IsolateCall, IsolateCallWithHandle,
+    JournalAppendReply, JournalRecord, JournalReplay, JournalReplayReply, JournalReplayWarning,
+    ListenerId, MkdirReply, PathKind, PathMetadata, PathMetadataReply, PendingCancelableCall,
+    PendingCancelableCallSet, PendingCancelableInsertError, PendingCancelableRemoveError,
+    PendingCancelableTicket, PersistenceTraceInfo, ProcessRunReply, ProcessRunResult,
+    ProcessStatus, ReadDirReply, RemoveFileReply, RenameReplaceReply,
     RequestDeferredCancelableCall, RequestDeferredIsolateCall, RequestDeferredObservedSend,
     RequestDeferredTypedCall, RuntimeCall, RuntimeCallParts, RuntimeCallable, SendOutcome,
-    SignalWaitReply, SleepReply, SnapshotCommitReply, SnapshotImage, SnapshotLoadReply, StreamId,
-    SyncParentReply, TcpAcceptReply, TcpBindReply, TcpConnectReply, TcpListenerCloseReply,
-    TcpReadReply, TcpStreamCloseReply, TcpWriteReply, TlsAcceptReply, TlsBindReply, TlsCloseReply,
-    TlsConnectReply, TlsListenerCloseReply, TlsListenerId, TlsReadReply, TlsStreamId,
-    TlsWriteReply, TypedCall, UdpBindReply, UdpCloseSocketReply, UdpRecvFromReply, UdpSendToReply,
-    UdpSocketId, call, call_cancelable, call_handle_call_id, call_request, call_typed,
-    call_with_handle, cancel_call, dns_lookup, file_close, file_create, file_fsync, file_open,
-    file_read, file_read_at, file_size, file_write, file_write_at, journal_append, journal_replay,
-    mkdir, path_metadata, process_run, read_dir, remove_file, rename_replace, send_observed,
-    signal_wait, sleep, sleep_then, snapshot_commit, snapshot_load, sync_parent, tcp_accept,
-    tcp_bind, tcp_close_listener, tcp_close_stream, tcp_connect, tcp_read, tcp_write, tls_accept,
-    tls_bind, tls_close, tls_close_listener, tls_connect, tls_read, tls_write, udp_bind,
-    udp_close_socket, udp_recv_from, udp_send_to,
+    SignalWaitReply, SleepCall, SleepReply, SnapshotCommitReply, SnapshotImage, SnapshotLoadReply,
+    StreamId, SyncParentReply, TcpAcceptReply, TcpBindReply, TcpConnectReply,
+    TcpListenerCloseReply, TcpReadReply, TcpStreamCloseReply, TcpWriteReply, TlsAcceptReply,
+    TlsBindReply, TlsCloseReply, TlsConnectReply, TlsListenerCloseReply, TlsListenerId,
+    TlsReadReply, TlsStreamId, TlsWriteReply, TypedCall, UdpBindReply, UdpCloseSocketReply,
+    UdpRecvFromReply, UdpSendToReply, UdpSocketId, WorkTicket, call, call_cancelable,
+    call_handle_call_id, call_request, call_typed, call_with_handle, cancel_call, dns_lookup,
+    file_close, file_create, file_fsync, file_open, file_read, file_read_at, file_size, file_write,
+    file_write_at, journal_append, journal_replay, mkdir, path_metadata, process_run, read_dir,
+    remove_file, rename_replace, send_observed, signal_wait, sleep, sleep_then, snapshot_commit,
+    snapshot_load, sync_parent, tcp_accept, tcp_bind, tcp_close_listener, tcp_close_stream,
+    tcp_connect, tcp_read, tcp_write, tls_accept, tls_bind, tls_close, tls_close_listener,
+    tls_connect, tls_read, tls_write, udp_bind, udp_close_socket, udp_recv_from, udp_send_to,
 };
 pub use call_group::{
     CallGroup, CallGroupBranchOutcome, CallGroupCancelOutcome, CallGroupCancelRequest,
@@ -276,21 +276,17 @@ pub use capacity::{
     format_assertion_failure, format_discovery_line, format_discovery_report,
 };
 pub use deferred::{
-    request_effect_after_park, InsertError as PendingRepliesInsertError, ParkCallError, ParkError,
-    ParkTicket, PendingReplies, ReplyParkedError, TakeParkedError,
-    TryCaptureError as PendingRepliesTryCaptureError,
-};
-pub use guarded_pending::{
-    GuardedInsertError, GuardedParkCallError, GuardedParkError, GuardedParkTicket,
-    GuardedPendingReplies, GuardedReplyError, GuardedTakeError,
-};
-pub use wait_list::{
-    WaitCallError as WaitListCallError, WaitError as WaitListError, WaitList,
-    WaitReplyError as WaitListReplyError, WaitSnapshot as WaitListSnapshot, WaitTicket,
+    InsertError as PendingRepliesInsertError, ParkCallError, ParkError, ParkTicket, PendingReplies,
+    ReplyParkedError, TakeParkedError, TryCaptureError as PendingRepliesTryCaptureError,
+    request_effect_after_park,
 };
 use driver::DriverCompletion;
 pub use event_sink::{
     BoundedEventSink, DropPolicy, EventSinkDrain, EventSinkReport, EventSinkSurface,
+};
+pub use guarded_pending::{
+    GuardedInsertError, GuardedParkCallError, GuardedParkError, GuardedParkTicket,
+    GuardedPendingReplies, GuardedReplyError, GuardedTakeError,
 };
 pub use observation::{
     BoundAddressWaiter, ChildRestarted, ChildRestartedWaiter, IsolateCompleteWaiter,
@@ -318,6 +314,11 @@ pub use trace::{
     DeferredReplyRejectedReason, DeferredSlotId, EffectKind, EventId, RestartSkippedReason,
     RuntimeEvent, RuntimeEventKind, RuntimeTraceExt, SendRejectedReason, SupervisionRejectedReason,
     stable_trace_hash,
+};
+pub use wait_list::{
+    WaitCallError as WaitListCallError, WaitError as WaitListError, WaitList,
+    WaitReplyError as WaitListReplyError, WaitSnapshot as WaitListSnapshot, WaitTicket,
+    request_effect_after_wait_park,
 };
 
 pub use driver::os_signal_capture_supported;

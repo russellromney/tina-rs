@@ -1001,9 +1001,7 @@ where
 
         match call.try_into_request_context() {
             Ok(req) => Ok(self.store_request_context(key, req)),
-            Err((call, TakeReplySlotError::NoCaller)) => {
-                Err(ParkCallError::NoCaller { key, call })
-            }
+            Err((call, TakeReplySlotError::NoCaller)) => Err(ParkCallError::NoCaller { key, call }),
             Err((call, TakeReplySlotError::CrossShardUnsupported)) => {
                 Err(ParkCallError::CrossShardUnsupported { key, call })
             }
