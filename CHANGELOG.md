@@ -18,6 +18,8 @@ This file records completed work.
   are parsed correctly, SETTINGS now applies peer flow-control/frame-size
   facts before ACK, forbidden HTTP/1 connection-control headers and missing
   authority reject, and rapid reset churn produces `ENHANCE_YOUR_CALM`.
+- Fixed `tina-rpc-tokio` bridge cancellation accounting so a stale
+  cancellation guard cannot double-release a bounded admission slot.
 
 ### Phase 110 Workflow Pending Ergonomics
 

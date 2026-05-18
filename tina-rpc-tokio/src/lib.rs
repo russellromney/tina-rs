@@ -583,10 +583,14 @@ struct CancelGuard {
 
 impl Drop for CancelGuard {
     fn drop(&mut self) {
-        if let Ok(mut pending) = self.pending.lock() {
-            pending.remove(&self.correlator);
+        let removed = if let Ok(mut pending) = self.pending.lock() {
+            pending.remove(&self.correlator).is_some()
+        } else {
+            false
+        };
+        if removed {
+            self.slots.add_permits(1);
         }
-        self.slots.add_permits(1);
     }
 }
 
@@ -1007,6 +1011,37 @@ mod tests {
             slots.available_permits(),
             1,
             "stale observer Err released a slot the CancelGuard had already returned",
+        );
+    }
+
+    #[test]
+    fn cancel_guard_drop_releases_only_when_it_removed_pending_entry() {
+        let pending: Arc<Mutex<PendingMap>> = Arc::new(Mutex::new(HashMap::new()));
+        let slots = Arc::new(Semaphore::new(1));
+        Arc::clone(&slots)
+            .try_acquire_owned()
+            .expect("admission")
+            .forget();
+        assert_eq!(slots.available_permits(), 0);
+
+        let (tx, _rx) = oneshot::channel::<ClientResult>();
+        pending.lock().unwrap().insert(42, tx);
+        drop(CancelGuard {
+            pending: Arc::clone(&pending),
+            slots: Arc::clone(&slots),
+            correlator: 42,
+        });
+        assert_eq!(slots.available_permits(), 1);
+
+        drop(CancelGuard {
+            pending,
+            slots: Arc::clone(&slots),
+            correlator: 42,
+        });
+        assert_eq!(
+            slots.available_permits(),
+            1,
+            "stale CancelGuard must not inflate permits above max"
         );
     }
 

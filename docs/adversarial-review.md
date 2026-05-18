@@ -37,6 +37,7 @@ the implementation proof and regression test names.
 | H9 | Fixed. HTTP/2 request headers reject HTTP/1 connection-control names. Test: `http2_forbidden_connection_header_rejects`. |
 | M7 | Fixed in DATA/window hot paths by converting frame body lengths through checked `i32::try_from` before window arithmetic. Covered by `http2_padded_data_delivers_only_unpadded_body`, `http2_inbound_data_obeys_stream_window`, and `http2_settings_initial_window_shrink_blocks_until_window_update`. |
 | M14 | Fixed. HTTP/2 requests require `:authority` or a non-empty host equivalent. Test: `http2_missing_authority_rejects`. |
+| H1 | Fixed. `tina-rpc-tokio` `CancelGuard::drop` now returns a permit only when it actually removed the pending entry, matching the observer path. Test: `cancel_guard_drop_releases_only_when_it_removed_pending_entry`. |
 
 ## Critical
 
