@@ -1,9 +1,11 @@
-# Phase 120: Fairness And Load Behavior
+# Phase 121: Fairness And Load Behavior
 
 ## Status
 
 - Future IDD outline for Wave B.
-- Can run in parallel with phases 121 and 122 if ownership stays in scheduler
+- Runs after Phase 116 so protocol-session fairness can use real HTTP/2/gRPC
+  client/server surfaces.
+- Can run in parallel with Phase 122 if ownership stays in scheduler
   proof/reporting, soak harnesses, and systems.
 
 ## Purpose
@@ -26,6 +28,8 @@ one hot actor/session/client should not quietly starve the rest of my service
 - load/soak harness that records high-water, full counts, late replies, leaks,
   and trace fingerprints
 - CPU and memory constrained system runs
+- use existing cooperative fairness tests and hot-key specimen as the seed, but
+  expand to protocol sessions and live soak
 
 ## Does Not Include
 
@@ -33,6 +37,7 @@ one hot actor/session/client should not quietly starve the rest of my service
 - no global priority scheduler
 - no benchmark bragging
 - no hidden buffering to improve fairness numbers
+- no admission/rate policy objects; Phase 118 owns pressure policy
 
 ## Proof Shape
 
@@ -42,4 +47,3 @@ one hot actor/session/client should not quietly starve the rest of my service
 - timers still fire under hot send/call traffic
 - reports expose unfairness/lag when it happens
 - soak runs show bounded surfaces plateau or fail visibly
-

@@ -1,10 +1,12 @@
-# Phase 118: Production Resource And Data Maturity
+# Phase 119: Production Resource And Data Maturity
 
 ## Status
 
 - Future IDD outline for Wave A.
-- Can run in parallel with phases 116 and 117 if ownership stays mostly in pool
-  resources, local persistence, and data specimens.
+- Runs after Phase 116. HTTP/2/gRPC client resource maturity needs the real
+  client connection and stream-slot shape first.
+- Can run in parallel with later non-pool work if ownership stays mostly in
+  pool resources, local persistence, and data specimens.
 
 ## Purpose
 
@@ -23,7 +25,8 @@ local state after restart
 - pool max lifetime
 - pool health check / retire rules
 - pool shutdown/drain reports aligned with bridge/resource vocabulary
-- DB and HTTP/gRPC client pools using the same pressure language
+- DB, HTTP/1 keepalive, and HTTP/2/gRPC client resources using the same
+  pressure language without pretending every resource is one lease per request
 - snapshot/journal restore service pattern
 - torn-write and corrupt-tail recovery specimens
 - append-before-apply guard improvements where the type system can help
@@ -36,6 +39,7 @@ local state after restart
 - no exactly-once claim
 - no remote clustering
 - no hiding database-specific pool truth
+- no redesign of HTTP/2/gRPC client protocol state; Phase 116 owns that
 
 ## Proof Shape
 
@@ -43,7 +47,8 @@ local state after restart
 - max-lifetime retire does not hand stale resource to new caller
 - health check retires bad resource
 - shutdown drains or force-closes with report
+- HTTP/2/gRPC client connection retire does not kill unrelated healthy
+  connection state silently
 - crash/restart restores expected state
 - corrupt/torn journal tail is typed and recoverable
 - compile-fail tests prevent apply-before-append helper misuse where practical
-

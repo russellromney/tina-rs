@@ -20,11 +20,14 @@ Tina owns I/O, capacity, cancellation, and replay. Codecs own bytes.
 
 - bounded file streaming read helper
 - bounded file streaming write helper
+- file streaming helpers are state machines over existing file rails, not new
+  backend file primitives
 - line-delimited codec helper
 - length-delimited codec helper
-- sync codec adapter pattern with `NeedMore` / `Frame` / `Malformed` /
-  `Full`
+- sync codec adapter pattern with `NeedMore` / `Frame` / `Malformed` / `Full`
+- codecs are pure data; runtime owns socket reads/writes and capacity
 - Unix-domain socket listener/client rails for local IPC
+- typed non-Unix unsupported truth for Unix rails
 - simulator support for file streaming and Unix sockets, or typed unsupported
   truth where a backend cannot support it
 - system specimens:
@@ -39,6 +42,8 @@ Tina owns I/O, capacity, cancellation, and replay. Codecs own bytes.
 - no unbounded file buffering
 - no production database wire protocol
 - no mmap/zero-copy promise
+- no moving HTTP/WebSocket parsers into public API unless the generic codec
+  shape is clean
 
 ## Proof Shape
 
@@ -47,5 +52,5 @@ Tina owns I/O, capacity, cancellation, and replay. Codecs own bytes.
 - malformed frame is typed
 - Unix socket close/cancel/drain truth is visible
 - live and sim tests cover the same protocol shape where possible
+- non-Unix tests assert typed unsupported capability, not cfg-silent omission
 - compile-fail tests keep codec adapter state typed, not stringly
-

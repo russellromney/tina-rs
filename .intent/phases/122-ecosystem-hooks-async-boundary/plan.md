@@ -3,8 +3,10 @@
 ## Status
 
 - Future IDD outline for Wave B.
-- Can run in parallel with phases 120 and 121 if ownership stays in public hook
+- Can run in parallel with Phase 121 if ownership stays in public hook
   traits, extension smoke crates, capability reports, and docs.
+- Runs after Phase 115 so hooks respect the core/battery boundary. Can absorb
+  lessons from Phase 117 codecs and Phase 118 service policies.
 
 ## Purpose
 
@@ -49,4 +51,3 @@ private runtime access and without weakening bounded/DST truth
 - capability report says supported/unsupported/cancel/drain/sim truth
 - compile-fail tests prevent hooks from constructing invalid private runtime
   state
-
