@@ -14,6 +14,9 @@
   internal fill events.
 - `system_job_queue` now proves `PendingCancelableCallSet` admission for
   cancelable deferred work.
+- Hardening pass in progress: make split request handlers return a
+  request-only effect so the copied path cannot return ordinary `noop()`;
+  expand compile-fail proof to hostile agent mistakes; migrate more systems.
 
 ## Grug Truth
 
@@ -76,11 +79,23 @@ Make request caller authority a must-consume type on the copied path:
 - defer into a request context
 - defer into bounded cancelable admission
 
-The split-service copied path rejects the most common "forgot to reply" shape
-at macro expansion: a `handle_request` body that never mentions caller
-authority fails with a Tina diagnostic. This is not linear-type magic; a user
-can still deliberately discard authority with an escape hatch. That escape
-hatch is runtime-rejected/traced and absent from copied docs/specimens.
+The split-service copied path should use a request-only authority/effect pair:
+
+```rust
+fn handle_request(&mut self, request: Request, call: RequestCall<Self>)
+    -> RequestEffect<Self>
+```
+
+`RequestEffect` is only produced by consuming `RequestCall`:
+
+- `call.reply(...)`
+- `call.reject(...)`
+- `call.defer(work).reply(...)`
+- `call.defer_cancelable(work).try_admit(...)`
+
+Ordinary `noop()` must not type-check in `handle_request`. A raw
+`CallContext` path may remain as an explicit escape hatch, but copied split
+services should not use it.
 
 Public authority/token types must use `#[must_use]` where Rust can help:
 
@@ -117,6 +132,13 @@ Make capability handles the default copied path:
 
 Raw `Address<M, R>` remains available only where needed. Host split helpers keep
 ordinary threaded setup/tests off the raw envelope path.
+
+Host helpers should cover the copied threaded path:
+
+- `try_send_event`
+- `send_event_and_observe`
+- `call_blocking_request`
+- `call_request_until` if the existing retry/until vocabulary supports it
 
 The phase must leave an escape-hatch inventory in docs:
 
@@ -193,7 +215,11 @@ Add a compile-fail specimen suite:
 - wrong public request sent on event lane
 - internal continuation event constructed from outside
 - callable request sent through send-only/event handle
-- split request handler ignores caller authority on the copied path
+- split request handler returns `noop()`
+- split request handler does `let _ = call; noop()`
+- split request handler does `drop(call); noop()`
+- split request handler replies on one branch but not another
+- split request handler tries to reply and reject with the same authority
 - cancelable deferred child effect dispatched before bounded admission
 - missing required config cap in typed builder
 - replay case missing visible config
@@ -203,14 +229,26 @@ Updated real systems to the new default authoring paths:
 
 - `system_cache_with_fill` for split request/private internal event authority
 - `system_job_queue` for cancelable deferred admission
+- `system_lock_manager` for private internal lifecycle events
+- one HTTP/WebSocket/AWS-ish system when the migration is low-risk
 
 Each README must say what the compiler now catches.
+
+Add an escape-hatch inventory test/doc that names every remaining raw path and
+proves its failure is visible, not silent:
+
+- raw `Address`
+- raw `ServiceMessage`
+- raw `CallContext`
+- deprecated cancelable reply-with-request
+- untyped config path
 
 ## Required Proof
 
 - User-style compile-fail tests for wrong `handle` vs `handle_call`.
 - Compile-fail tests for internal event sent from outside.
 - Compile-fail tests for unconsumed caller authority on the copied path.
+- Compile-fail tests for fake consumption (`let _`, `drop`, partial branch).
 - Compile-fail tests for cancelable effect before bounded admission.
 - Compile-fail tests for missing config caps.
 - Compile-fail or constructor-fail tests for replay cases missing visible config.
@@ -221,6 +259,8 @@ Each README must say what the compiler now catches.
 - Runtime tests proving public behavior did not regress.
 - Protocol tests proving impossible states are now unrepresentable internally.
 - Two system specimens compile using the new default safety rails.
+- At least three systems compile using the new default safety rails if they
+  already exercise the relevant pattern.
 - Docs show the default path and the escape hatch separately.
 
 ## Done Means
