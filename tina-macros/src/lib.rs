@@ -267,10 +267,15 @@ fn build_isolate(
                 msg: Self::Message,
                 #call_name: ::tina::CallContext<'_, Self>,
             ) -> ::tina::Effect<Self> {
+                let #call_name = ::tina::RequestCall::new(#call_name);
                 match msg {
-                    ::tina::ServiceMessage::Request(#request_name) => #request_body,
+                    ::tina::ServiceMessage::Request(#request_name) => {
+                        let request_effect: ::tina::RequestEffect<Self> = #request_body;
+                        request_effect.into_effect()
+                    }
                     ::tina::ServiceMessage::Event(_) => {
                         #call_name.reject(::tina::CallRejectedReason::UnsupportedMessage)
+                            .into_effect()
                     }
                 }
             }

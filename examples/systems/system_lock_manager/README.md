@@ -61,13 +61,14 @@ What felt good:
   `holder_id` is monotonic and never reused.
 - Hand-off as a single helper used by both release and expiry paths
   kept the FIFO invariant in one place.
-- The split between `handle` (internal events) and `handle_call`
-  (caller authority) made stale-handle detection trivial: the slot
-  is either in the pending box or it isn't. No "does this caller
-  still have a reply token?" check.
+- The split-service shape made the public surface much cleaner:
+  `LockRequest` is callable, private `LockEvent::LeaseExpired` is an
+  internal continuation, and host code uses `call_blocking_request`.
+  Stale-handle detection stays trivial: the slot is either in the
+  pending box or it isn't.
 - The compiler caught mistakes fast. `Effect<I>` typing meant pasting
-  the wrong reply variant or forgetting to consume `CallContext`
-  failed loudly.
+  the wrong reply variant failed loudly; `RequestEffect<I>` now means
+  forgetting to consume `RequestCall` fails before runtime.
 
 What felt rough:
 - Per-key wait queue length is a hand-rolled `VecDeque<u64>` next to a
@@ -80,14 +81,9 @@ What felt rough:
   change forgets to bump one. A typed `Lease` newtype with one
   `bump()` would make this a compile-time invariant instead of a
   discipline thing. Local to this specimen for now.
-- `LockMsg::LeaseExpired` is an internal event but still needs a
-  `handle_call` arm that returns `call.reject(UnsupportedMessage)`.
-  Same ceremony as `system_cache_with_fill::CacheMsg::FillDone`.
-  Promoted to `examples/FINDINGS.md`.
-- `CallContext::into_request_context().into_deferred()` is two hops
-  to get a slot to stash. Worked, but felt like one hop too many for
-  the common "park this caller" case. A
-  `CallContext::into_deferred()` shortcut would name the intent.
+- Parking a waiter now goes through `RequestCall::capture(...)`, which
+  is safer than raw `CallContext::into_request_context()`, but still
+  makes the `PendingReplies` insertion ceremony visible.
 - Whether a single global `PendingReplies` cap is the right shape for
   a lock manager is genuinely unclear. One noisy key can starve
   waiters on every other key. A real lock manager probably wants the

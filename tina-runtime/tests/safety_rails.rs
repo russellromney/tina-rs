@@ -15,7 +15,7 @@
 use std::convert::Infallible;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tina::prelude::*;
 use tina_runtime::{
@@ -299,7 +299,11 @@ impl SplitService {
         }
     }
 
-    fn handle_request(&mut self, req: SplitRequest, caller: CallContext<'_, Self>) -> Effect<Self> {
+    fn handle_request(
+        &mut self,
+        req: SplitRequest,
+        caller: RequestCall<'_, Self>,
+    ) -> RequestEffect<Self> {
         match req {
             SplitRequest::Read => caller.reply(SplitReply(self.value)),
         }
@@ -414,14 +418,41 @@ fn split_service_threaded_runtime_routes_request_lane() {
     // Host code has the same capability-shaped lane helpers as isolate code:
     // no raw `ServiceMessage` envelope is needed on the copied path.
     runtime
-        .try_send_event(handle.events, SplitEvent::Filled(55))
-        .expect("send event");
+        .send_event_and_observe(handle.events, SplitEvent::Filled(55))
+        .expect("send event and observe target mailbox");
 
     let outcome = runtime
         .call_blocking_request(handle.requests, SplitRequest::Read, Duration::from_secs(1))
         .expect("call request");
 
     assert_eq!(outcome, CallOutcome::Replied(SplitReply(55)));
+    runtime.shutdown().expect("shutdown");
+}
+
+#[test]
+fn split_service_threaded_runtime_retries_event_until_observed() {
+    let runtime = ThreadedRuntime::new(SingleShard, DefaultThreadedMailboxFactory);
+    let handle: SplitServiceHandle<SplitEvent, SplitRequest, SplitReply> = runtime
+        .register_split_service::<SplitService, SplitEvent, SplitRequest, Infallible>(
+            SplitService { value: 0 },
+            8,
+        )
+        .expect("register split service");
+
+    runtime
+        .send_event_observed_until(
+            handle.events,
+            Instant::now() + Duration::from_secs(1),
+            Duration::from_millis(1),
+            || SplitEvent::Filled(77),
+        )
+        .expect("event observed");
+
+    let outcome = runtime
+        .call_blocking_request(handle.requests, SplitRequest::Read, Duration::from_secs(1))
+        .expect("call request");
+
+    assert_eq!(outcome, CallOutcome::Replied(SplitReply(77)));
     runtime.shutdown().expect("shutdown");
 }
 

@@ -131,12 +131,20 @@ impl Cache {
     fn handle_request(
         &mut self,
         request: CacheRequest,
-        call: CallContext<'_, Self>,
-    ) -> Effect<Self> {
+        call: RequestCall<'_, Self>,
+    ) -> RequestEffect<Self> {
         // caller-authority requests land here
     }
 }
 ```
+
+`handle_request` returns `RequestEffect<Self>`, not ordinary `Effect<Self>`.
+That is intentional: `noop()` does not type-check on the copied request path.
+Use `call.reply(...)`, `call.reject(...)`, `call.capture(...)`, or
+`call.defer(...).reply(...)`.
+Copied app code cannot manufacture a `RequestEffect` from `noop()`; the raw
+constructor lives under the hidden runtime-internal escape hatch for adapter
+crates that have already consumed caller authority.
 
 Register it through `register_split_service`. The returned handle has two
 lanes:
@@ -155,6 +163,7 @@ From host-thread code:
 
 ```rust
 runtime.try_send_event(cache.events, CacheEvent::FillDone { key })?;
+runtime.send_event_and_observe(cache.events, CacheEvent::FillDone { key })?;
 runtime.call_blocking_request(cache.requests, CacheRequest::Get { key }, timeout)?;
 ```
 

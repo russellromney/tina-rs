@@ -707,6 +707,49 @@ where
         )
     }
 
+    /// Sends one public event through a split-service event capability and
+    /// waits for the worker to observe the target mailbox outcome.
+    ///
+    /// This is the split-service companion to
+    /// [`send_and_observe`](Self::send_and_observe). Use it in host-driven
+    /// setup/tests when `Full` / `Closed` must stay visible.
+    pub fn send_event_and_observe<Event, Request>(
+        &self,
+        address: tina::ServiceEventAddress<Event, Request>,
+        event: Event,
+    ) -> Result<(), ThreadedSendObservedError>
+    where
+        Event: Send + 'static,
+        Request: Send + 'static,
+    {
+        self.send_and_observe(
+            address.address().address(),
+            tina::ServiceMessage::Event(event),
+        )
+    }
+
+    /// Retries public event admission through a split-service event capability
+    /// until the event lands or the deadline elapses.
+    ///
+    /// This is the split-service companion to
+    /// [`send_observed_until`](Self::send_observed_until).
+    pub fn send_event_observed_until<Event, Request, MakeEvent>(
+        &self,
+        address: tina::ServiceEventAddress<Event, Request>,
+        deadline: Instant,
+        backoff: Duration,
+        mut make_event: MakeEvent,
+    ) -> Result<(), SendObservedUntilError>
+    where
+        Event: Send + 'static,
+        Request: Send + 'static,
+        MakeEvent: FnMut() -> Event,
+    {
+        self.send_observed_until(address.address().address(), deadline, backoff, move || {
+            tina::ServiceMessage::Event(make_event())
+        })
+    }
+
     /// Attempts one typed ingress send and waits for the worker to observe the
     /// target mailbox outcome.
     ///

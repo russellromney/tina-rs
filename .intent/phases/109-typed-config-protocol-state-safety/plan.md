@@ -10,13 +10,19 @@
   `ThreadedRuntime::try_send_event`, `call_request`,
   `ThreadedRuntime::call_blocking_request`, positive runtime/threaded proof,
   and trybuild lane diagnostics.
+- Split request handlers now use `RequestCall` and return `RequestEffect` on
+  the copied path. The raw constructor for `RequestEffect` is hidden under
+  `runtime_internal`.
+- Host split setup now has observed event helpers:
+  `send_event_and_observe` and `send_event_observed_until`.
 - `system_cache_with_fill` now uses split public requests plus private
   internal fill events.
+- `system_lock_manager` now uses split public requests plus private internal
+  lease-expiry events.
 - `system_job_queue` now proves `PendingCancelableCallSet` admission for
   cancelable deferred work.
-- Hardening pass in progress: make split request handlers return a
-  request-only effect so the copied path cannot return ordinary `noop()`;
-  expand compile-fail proof to hostile agent mistakes; migrate more systems.
+- Hardening pass complete on this PR: request-only effects, hostile
+  compile-fail cases, and system migrations are in place.
 
 ## Grug Truth
 
@@ -137,8 +143,12 @@ Host helpers should cover the copied threaded path:
 
 - `try_send_event`
 - `send_event_and_observe`
+- `send_event_observed_until`
 - `call_blocking_request`
-- `call_request_until` if the existing retry/until vocabulary supports it
+
+No request `until` helper ships in this phase because the current host call
+surface is timeout-shaped, not deadline-shaped. Do not invent a second timing
+story here.
 
 The phase must leave an escape-hatch inventory in docs:
 
@@ -220,6 +230,7 @@ Add a compile-fail specimen suite:
 - split request handler does `drop(call); noop()`
 - split request handler replies on one branch but not another
 - split request handler tries to reply and reject with the same authority
+- split request handler tries to forge `RequestEffect` from `noop()`
 - cancelable deferred child effect dispatched before bounded admission
 - missing required config cap in typed builder
 - replay case missing visible config

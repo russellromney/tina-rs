@@ -4,7 +4,7 @@ use std::sync::{Arc, Barrier, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use tina::{CallContext, prelude::*};
+use tina::prelude::*;
 use tina_runtime::{
     CallOutcome, DefaultThreadedMailboxFactory, PendingReplies, SleepReply, SplitServiceHandle,
     ThreadedRuntime, sleep,
@@ -151,7 +151,11 @@ impl Cache {
         }
     }
 
-    fn handle_request(&mut self, request: CacheRequest, call: CallContext<'_, Self>) -> Effect<Self> {
+    fn handle_request(
+        &mut self,
+        request: CacheRequest,
+        call: RequestCall<'_, Self>,
+    ) -> RequestEffect<Self> {
         match request {
             CacheRequest::Get { key } => self.get(key, call),
             CacheRequest::Invalidate { key } => self.invalidate(key, call),
@@ -178,7 +182,7 @@ impl Cache {
         }
     }
 
-    fn get(&mut self, key: String, call: CallContext<'_, Self>) -> Effect<Self> {
+    fn get(&mut self, key: String, call: RequestCall<'_, Self>) -> RequestEffect<Self> {
         if let Some(value) = self.entries.get(&key).and_then(|entry| entry.value.clone()) {
             self.hits += 1;
             return call.reply(CacheReply::Value {
@@ -190,41 +194,43 @@ impl Cache {
 
         let qid = self.next_qid;
         self.next_qid += 1;
-        let slot = call.into_request_context().into_deferred();
-        if let Err(error) = self.pending.try_insert(qid, slot) {
-            return match error {
-                tina_runtime::PendingRepliesInsertError::Full(_, slot) => {
-                    self.busy_replies += 1;
-                    reply_to(slot, CacheReply::Busy)
-                }
-                tina_runtime::PendingRepliesInsertError::DuplicateKey(_, slot) => {
-                    reply_to(slot, CacheReply::Failed("duplicate waiter qid".into()))
-                }
-            };
-        }
+        call.capture(|request| {
+            let slot = request.into_deferred();
+            if let Err(error) = self.pending.try_insert(qid, slot) {
+                return match error {
+                    tina_runtime::PendingRepliesInsertError::Full(_, slot) => {
+                        self.busy_replies += 1;
+                        reply_to(slot, CacheReply::Busy)
+                    }
+                    tina_runtime::PendingRepliesInsertError::DuplicateKey(_, slot) => {
+                        reply_to(slot, CacheReply::Failed("duplicate waiter qid".into()))
+                    }
+                };
+            }
 
-        let entry = self.entries.entry(key.clone()).or_default();
-        if let Some(fill) = &mut entry.filling {
-            fill.qids.push(qid);
-            return noop();
-        }
+            let entry = self.entries.entry(key.clone()).or_default();
+            if let Some(fill) = &mut entry.filling {
+                fill.qids.push(qid);
+                return noop();
+            }
 
-        let generation = entry.generation;
-        entry.filling = Some(FillState {
-            generation,
-            qids: vec![qid],
-        });
-        self.fills_started += 1;
-        sleep(self.fill_delay).then(move |result| {
-            tina::ServiceMessage::Event(CacheEvent::FillDone {
-                key,
+            let generation = entry.generation;
+            entry.filling = Some(FillState {
                 generation,
-                result,
+                qids: vec![qid],
+            });
+            self.fills_started += 1;
+            sleep(self.fill_delay).then(move |result| {
+                tina::ServiceMessage::Event(CacheEvent::FillDone {
+                    key,
+                    generation,
+                    result,
+                })
             })
         })
     }
 
-    fn invalidate(&mut self, key: String, call: CallContext<'_, Self>) -> Effect<Self> {
+    fn invalidate(&mut self, key: String, call: RequestCall<'_, Self>) -> RequestEffect<Self> {
         self.invalidations += 1;
         let entry = self.entries.entry(key).or_default();
         entry.generation += 1;
@@ -234,15 +240,17 @@ impl Cache {
             return call.reply(CacheReply::Invalidated);
         };
 
-        self.stale_replies += fill.qids.len();
-        let mut effects = Vec::with_capacity(fill.qids.len() + 1);
-        for qid in fill.qids {
-            if let Some(slot) = self.pending.take(&qid) {
-                effects.push(reply_to::<Self>(slot, CacheReply::Stale));
+        call.capture(|request| {
+            self.stale_replies += fill.qids.len();
+            let mut effects = Vec::with_capacity(fill.qids.len() + 1);
+            for qid in fill.qids {
+                if let Some(slot) = self.pending.take(&qid) {
+                    effects.push(reply_to::<Self>(slot, CacheReply::Stale));
+                }
             }
-        }
-        effects.push(call.reply(CacheReply::Invalidated));
-        Effect::Batch(effects)
+            effects.push(reply_to_request::<Self>(request, CacheReply::Invalidated));
+            Effect::Batch(effects)
+        })
     }
 
     fn fill_done(&mut self, key: String, generation: u64, result: SleepReply) -> Effect<Self> {
