@@ -96,9 +96,10 @@ pub use full_handling::{
 };
 pub use host_burst::{HostBurstOutcomes, HostBurstSnapshot, HostBurstWaitError};
 pub use lifecycle::{
-    CloseAdmission, CloseOutcome, ComponentKind, Health, Lifecycle, Readiness, ReadinessReason,
-    ReadinessToken, ResourceCloseReport, ResourceKind, ServiceShutdownReport, ServiceTopology,
-    ShutdownChoreography, ShutdownStep, ShutdownStepReport, StepOutcome, TopologyComponent,
+    CloseAdmission, CloseOutcome, ComponentKind, Health, Lifecycle, READINESS_UNKNOWN_REASON,
+    Readiness, ReadinessReason, ReadinessToken, ResourceCloseReport, ResourceKind,
+    ServiceShutdownReport, ServiceTopology, ShutdownChoreography, ShutdownStep, ShutdownStepReport,
+    StepOutcome, TopologyComponent,
 };
 pub use local_permit::{
     LocalPermitFull, LocalPermitGate, LocalPermitName, LocalPermitReleaseError, LocalPermitReport,

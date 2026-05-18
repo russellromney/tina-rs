@@ -69,20 +69,35 @@ fn metrics_shipper_steady_overload_and_drain_are_typed() {
     let topology = &shutdown.topology;
     assert_eq!(topology.service, "system_metrics_shipper");
     assert_eq!(topology.state, Lifecycle::Ready);
-    let component_names: Vec<&str> = topology
+    let component_kinds: std::collections::HashMap<&str, &str> = topology
         .components
         .iter()
-        .map(|c| c.name.as_str())
+        .map(|c| (c.name.as_str(), c.kind))
         .collect();
-    assert!(component_names.contains(&"shipper"), "{component_names:?}");
-    assert!(component_names.contains(&"sink"), "{component_names:?}");
-    assert!(
-        component_names.contains(&"flush_tick"),
-        "{component_names:?}"
-    );
+    assert_eq!(component_kinds.get("shipper"), Some(&"isolate"));
+    assert_eq!(component_kinds.get("sink"), Some(&"isolate"));
+    assert_eq!(component_kinds.get("flush_tick"), Some(&"timer"));
 
     assert_eq!(shutdown.health.service, "system_metrics_shipper");
     assert_eq!(shutdown.health.state, Lifecycle::Stopped);
+    let health_line = shutdown.health.summary_line();
+    assert!(health_line.contains("state=stopped"), "{health_line}");
+    assert!(
+        health_line.contains("service=system_metrics_shipper"),
+        "{health_line}",
+    );
+
+    // Typed lifecycle transition: same shape as `mini_saas_api`, even
+    // though the shipper drains itself rather than being host-driven.
+    assert_eq!(
+        shutdown.lifecycle_transitions,
+        vec![
+            Lifecycle::Starting,
+            Lifecycle::Ready,
+            Lifecycle::Draining,
+            Lifecycle::Stopped,
+        ],
+    );
 
     let choreo = &shutdown.shutdown_choreography;
     assert!(choreo.clean, "shutdown choreography unclean: {choreo:#?}");

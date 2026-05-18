@@ -175,6 +175,23 @@ fn smoke_covers_service_layers() {
     assert_eq!(capacity["http.body_timeout"], "0");
     assert_eq!(capacity["http.body_io_error"], "0");
 
+    // Typed lifecycle transitions: the plan's "service starts NotReady,
+    // becomes Ready, enters Draining, then Stopped" assertion. The
+    // canonical sequence is recorded explicitly by the host so a
+    // regression that skips a state is caught here, not implied by
+    // separate field equality.
+    assert_eq!(
+        report.lifecycle_transitions,
+        vec![
+            Lifecycle::Starting,
+            Lifecycle::Ready,
+            Lifecycle::Draining,
+            Lifecycle::Stopped,
+        ],
+        "lifecycle transition sequence regressed: {:?}",
+        report.lifecycle_transitions,
+    );
+
     // Typed topology: every named started component is reachable via
     // typed report, not just substring matching in the legacy line.
     let topology = report
@@ -183,30 +200,44 @@ fn smoke_covers_service_layers() {
         .expect("typed ServiceTopology must be populated");
     assert_eq!(topology.service, "mini_saas_api");
     assert_eq!(topology.state, Lifecycle::Ready);
-    let component_names: Vec<&str> = topology
+    let component_by_name: HashMap<&str, &str> = topology
         .components
         .iter()
-        .map(|c| c.name.as_str())
+        .map(|c| (c.name.as_str(), c.kind))
         .collect();
+    // Each component must be the typed kind we expect; a regression
+    // that registers `outbound.pool` as a "bridge" would be caught
+    // here, not just by reading the legacy line.
+    assert_eq!(component_by_name.get("main.listener"), Some(&"listener"));
+    assert_eq!(component_by_name.get("notify.listener"), Some(&"listener"));
+    assert_eq!(component_by_name.get("controller"), Some(&"isolate"));
+    assert_eq!(component_by_name.get("db.bridge"), Some(&"bridge"));
+    assert_eq!(component_by_name.get("outbound.pool"), Some(&"pool"));
+    // Listener components carry the bound socket address.
+    let main_listener = topology
+        .components
+        .iter()
+        .find(|c| c.name == "main.listener")
+        .unwrap();
     assert!(
-        component_names.contains(&"main.listener"),
-        "{component_names:?}"
+        main_listener.address.contains(':'),
+        "main.listener should carry a bound socket address: {:?}",
+        main_listener.address,
     );
+
+    // Typed health snapshot is in Stopped state with a non-empty
+    // summary line that mentions the service and the typed state.
+    let health = report
+        .health_pre_shutdown
+        .as_ref()
+        .expect("health snapshot populated");
+    assert_eq!(health.service, "mini_saas_api");
+    assert_eq!(health.state, Lifecycle::Stopped);
+    let health_line = health.summary_line();
+    assert!(health_line.contains("state=stopped"), "{health_line}");
     assert!(
-        component_names.contains(&"notify.listener"),
-        "{component_names:?}"
-    );
-    assert!(
-        component_names.contains(&"controller"),
-        "{component_names:?}"
-    );
-    assert!(
-        component_names.contains(&"db.bridge"),
-        "{component_names:?}"
-    );
-    assert!(
-        component_names.contains(&"outbound.pool"),
-        "{component_names:?}"
+        health_line.contains("service=mini_saas_api"),
+        "{health_line}",
     );
 
     // Typed shutdown report: every step the host drove is named, in

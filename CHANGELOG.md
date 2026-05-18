@@ -55,11 +55,56 @@ This file records completed work.
   `StepOutcome::OrderingViolation`, and identical step sequences produce
   byte-identical `ServiceShutdownReport::summary_line` and
   `discovery_lines` across runs.
-- Signal-driven shutdown composes through the new helper without
-  changes: the runtime continues to expose Unix `SIGINT`/`SIGTERM`
-  capture, the existing `specimen_graceful_shutdown` shows the trigger
-  pattern, and `ShutdownChoreography` is callable from a signal-handler
-  thread the same way it is callable from a control message.
+- Signal-driven shutdown composes through the new helper. Added
+  `tina-runtime/tests/lifecycle_signal_driven_shutdown.rs` proving the
+  pattern end-to-end: a spawned "signal handler" thread fires
+  `ThreadedShutdownHandle::request_shutdown` and the main thread wraps
+  the cross-thread teardown in `ShutdownChoreography` producing a clean
+  typed report. A second test proves a late "signal" landing after
+  `StopOwner` is recorded as a typed `OrderingViolation` rather than
+  starting a second shutdown.
+
+Hostile-review fixes:
+
+- Bug: `Readiness::not_ready` / `Readiness::degraded` with an empty
+  reasons list could emit the ambiguous `not_ready reasons=` body in
+  release mode (the previous `debug_assert!` did not fire). Added a
+  public `READINESS_UNKNOWN_REASON` (`Custom("unknown")`) constant and
+  routed both constructors through an `ensure_some_reason` fold so the
+  wire body is always parseable. Tightened `Readiness::legacy_body` so
+  the HTTP shape keys off `self.ready` alone: a degraded service still
+  answers `ready\n` so existing clients keep sending traffic while the
+  typed report carries the degradation detail.
+- Proof: added a typed
+  `Vec<Lifecycle>` `lifecycle_transitions` field on both
+  `mini_saas_api::RunReport` and `system_metrics_shipper::ShutdownReport`
+  and assert the canonical
+  `[Starting, Ready, Draining, Stopped]` sequence. Closes the plan's
+  "service starts NotReady, becomes Ready, enters Draining, then
+  Stopped" required proof which was only implied across separate fields.
+- Proof: added `stuck_child_close_produces_typed_timeout_in_terminal_report`
+  covering the plan's "shutdown with stuck child returns a timeout
+  report" requirement at the full-sequence level (clean step + stuck
+  step + remaining clean steps; asserts `clean=false`, exactly one
+  `Timeout`, retained close report, summary line, discovery lines).
+  Added four `pool_shutdown_to_close_report` unit tests in
+  `mini_saas_api` covering clean drain, timed-out drain, connection
+  failures, and already-closed pool — the production conversion path.
+- Coverage: smoke tests now assert each `TopologyComponent::kind`
+  (`listener`, `bridge`, `pool`, `isolate`, `timer`) per-name instead
+  of substring matching, and assert `Health::summary_line()` carries
+  the typed state and service label. Added unit coverage for
+  same-ordinal step repetition (the multi-`CloseResource` case),
+  every non-`Clean` `CloseOutcome` propagating through `record_close`,
+  and an `unknown` fallback test for the empty-reasons fix.
+- Cleanup: `mini_saas_api::build_startup_summary` now calls
+  `ServicePressureSurface::discovery_line()` instead of duplicating the
+  measured/unavailable format inline. Tightened the DST ordering test
+  to walk every distinct-ordinal pair (clean + violation) without
+  confusing variable scaffolding. Added a doc note that
+  `ServiceShutdownReport: PartialEq` includes wall-clock durations so
+  equality-based DST tests should zero them and use
+  `ShutdownChoreography::with_started_at`.
 
 ### Phase 102 Host Control Ergonomics
 

@@ -120,6 +120,12 @@ pub struct ShutdownReport {
     /// `StopOwner` (runtime shutdown). Proof that the lifecycle helper
     /// is not HTTP-shaped: nothing here touches `tina-http`.
     pub shutdown_choreography: ServiceShutdownReport,
+    /// Lifecycle states the host observed the shipper passing through,
+    /// in order. Canonical sequence is
+    /// `[Starting, Ready, Draining, Stopped]`. Built explicitly so the
+    /// non-HTTP service reports the same typed transition as
+    /// `mini_saas_api`.
+    pub lifecycle_transitions: Vec<Lifecycle>,
 }
 
 /// Snapshot of every shipper-side cap and pressure counter.
@@ -644,7 +650,9 @@ pub fn run_overload(config: &RunConfig) -> anyhow::Result<OverloadReport> {
 }
 
 pub fn run_shutdown(config: &RunConfig) -> anyhow::Result<ShutdownReport> {
+    let mut lifecycle_transitions: Vec<Lifecycle> = vec![Lifecycle::Starting];
     let world = World::start(config)?;
+    lifecycle_transitions.push(Lifecycle::Ready);
     let topology = build_topology(config);
 
     // Submit a partial batch (smaller than batch_size) so Stop must flush
@@ -675,7 +683,11 @@ pub fn run_shutdown(config: &RunConfig) -> anyhow::Result<ShutdownReport> {
         CallOutcome::Replied(ShipperReply::Stopped {
             flushed_on_drain,
             drained_batches,
-        }) => (flushed_on_drain, drained_batches, true),
+        }) => {
+            // Shipper has flipped its own DrainState through Stopped.
+            lifecycle_transitions.push(Lifecycle::Draining);
+            (flushed_on_drain, drained_batches, true)
+        }
         other => {
             choreo.record(
                 ShutdownStep::DrainInFlight,
@@ -766,6 +778,7 @@ pub fn run_shutdown(config: &RunConfig) -> anyhow::Result<ShutdownReport> {
     );
 
     let shutdown_choreography = choreo.finish();
+    lifecycle_transitions.push(Lifecycle::Stopped);
 
     Ok(ShutdownReport {
         stop_clean,
@@ -776,6 +789,7 @@ pub fn run_shutdown(config: &RunConfig) -> anyhow::Result<ShutdownReport> {
         health,
         topology,
         shutdown_choreography,
+        lifecycle_transitions,
     })
 }
 

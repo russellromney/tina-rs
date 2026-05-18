@@ -177,6 +177,18 @@ pub struct Readiness {
     pub reasons: Vec<ReadinessReason>,
 }
 
+/// Fallback wire token used when a caller builds a `not_ready` /
+/// `degraded` `Readiness` with an empty reasons list. Keeps the wire body
+/// parseable instead of emitting `not_ready reasons=`.
+pub const READINESS_UNKNOWN_REASON: ReadinessReason = ReadinessReason::Custom("unknown");
+
+fn ensure_some_reason(mut reasons: Vec<ReadinessReason>) -> Vec<ReadinessReason> {
+    if reasons.is_empty() {
+        reasons.push(READINESS_UNKNOWN_REASON);
+    }
+    reasons
+}
+
 impl Readiness {
     /// Build a `Ready` verdict for a service in [`Lifecycle::Ready`].
     pub fn ready() -> Self {
@@ -189,25 +201,32 @@ impl Readiness {
 
     /// Build a `Ready` verdict but in [`Lifecycle::Degraded`] for a service
     /// that can still admit work despite a dependency being unhappy.
+    ///
+    /// An empty `reasons` list is folded to a single
+    /// [`READINESS_UNKNOWN_REASON`] so the wire body stays parseable. A
+    /// service that has no named reason should usually call
+    /// [`Self::ready`] instead.
     pub fn degraded(reasons: Vec<ReadinessReason>) -> Self {
         Self {
             ready: true,
             state: Lifecycle::Degraded,
-            reasons,
+            reasons: ensure_some_reason(reasons),
         }
     }
 
     /// Build a not-ready verdict with reasons and the lifecycle state that
     /// caused it.
+    ///
+    /// An empty `reasons` list is folded to a single
+    /// [`READINESS_UNKNOWN_REASON`] so the wire body never emits the
+    /// ambiguous `not_ready reasons=` shape. Callers should usually
+    /// supply at least one typed reason; the fallback exists so a
+    /// misuse cannot poison downstream parsers.
     pub fn not_ready(state: Lifecycle, reasons: Vec<ReadinessReason>) -> Self {
-        debug_assert!(
-            !reasons.is_empty(),
-            "not_ready requires at least one reason; use Readiness::ready() for ready services",
-        );
         Self {
             ready: false,
             state,
-            reasons,
+            reasons: ensure_some_reason(reasons),
         }
     }
 
@@ -225,14 +244,18 @@ impl Readiness {
     }
 
     /// Body line for the legacy HTTP `/ready` shape used across Tina
-    /// specimens. `ready\n` when ready, `not_ready reasons=<csv>\n` otherwise.
+    /// specimens.
+    ///
+    /// - `self.ready == true`  → `"ready\n"`. Degraded services still
+    ///   answer ready on the wire because the HTTP/RPC semantics ask
+    ///   "may I send traffic?" — the typed `Lifecycle` and `reasons` on
+    ///   this report carry the degradation detail for dashboards.
+    /// - `self.ready == false` → `"not_ready reasons=<csv>\n"`. The
+    ///   constructors fold an empty reasons list into
+    ///   [`READINESS_UNKNOWN_REASON`] so the ambiguous `not_ready
+    ///   reasons=` shape is impossible.
     pub fn legacy_body(&self) -> String {
-        if self.ready && self.reasons.is_empty() {
-            "ready\n".to_owned()
-        } else if self.reasons.is_empty() {
-            // Degraded without a named reason still says ready on the wire,
-            // since clients can keep sending traffic; the typed report
-            // surfaces the state separately.
+        if self.ready {
             "ready\n".to_owned()
         } else {
             format!("not_ready reasons={}\n", self.reasons_token_csv())
@@ -927,6 +950,12 @@ impl ShutdownChoreography {
 /// elapsed time, and a cheap `clean` flag. The clean flag is true iff every
 /// step's outcome is `Clean` or `AlreadyDone`. Out-of-order steps,
 /// timeouts, and failures all flip `clean` to false.
+///
+/// `PartialEq` includes [`Self::total_elapsed`] and per-step `elapsed`
+/// durations. Two reports built from real wall-clock measurements will
+/// never compare equal even with the same step sequence; tests that need
+/// equality-based DST should construct steps with explicit zero durations
+/// and use [`ShutdownChoreography::with_started_at`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServiceShutdownReport {
     /// Service label.
@@ -1017,6 +1046,40 @@ mod tests {
             r.legacy_body(),
             "not_ready reasons=ingress_stopped,db_closed\n"
         );
+    }
+
+    #[test]
+    fn readiness_not_ready_with_empty_reasons_falls_back_to_unknown_token() {
+        // Release-mode safety: an empty reasons list MUST NOT produce
+        // the ambiguous `not_ready reasons=` wire body. The fallback
+        // token keeps downstream parsers honest.
+        let r = Readiness::not_ready(Lifecycle::NotReady, vec![]);
+        assert!(!r.ready);
+        assert_eq!(r.reasons.len(), 1);
+        assert_eq!(r.reasons[0], READINESS_UNKNOWN_REASON);
+        assert_eq!(r.legacy_body(), "not_ready reasons=unknown\n");
+    }
+
+    #[test]
+    fn readiness_degraded_with_empty_reasons_still_says_ready_on_wire() {
+        // Degraded HTTP semantics: clients may still send traffic; the
+        // typed report carries the state. An empty reasons list folds
+        // to `unknown` so the typed report stays parseable, but the
+        // wire body remains `ready\n` so existing HTTP clients do not
+        // start rejecting a perfectly serviceable upstream.
+        let r = Readiness::degraded(vec![]);
+        assert!(r.ready);
+        assert_eq!(r.state, Lifecycle::Degraded);
+        assert_eq!(r.reasons, vec![READINESS_UNKNOWN_REASON]);
+        assert_eq!(r.legacy_body(), "ready\n");
+    }
+
+    #[test]
+    fn readiness_degraded_with_reasons_still_says_ready_on_wire() {
+        let r = Readiness::degraded(vec![ReadinessReason::DependencyFull("cache")]);
+        assert!(r.ready);
+        assert_eq!(r.legacy_body(), "ready\n");
+        assert_eq!(r.reasons_token_csv(), "cache_full");
     }
 
     #[test]
@@ -1139,13 +1202,260 @@ mod tests {
     }
 
     #[test]
+    fn recording_same_step_kind_repeatedly_is_not_an_ordering_violation() {
+        // Real services close multiple resources back-to-back (db,
+        // pool, listeners, ...). Each lands as a `CloseResource` step.
+        // Same-ordinal repetition must not trigger
+        // `OrderingViolation`; the helper uses `max(prev, current)` so
+        // equal ordinals are accepted.
+        let mut choreo = ShutdownChoreography::new("svc");
+        for label in ["close_a", "close_b", "close_c", "close_d"] {
+            choreo.record(
+                ShutdownStep::CloseResource,
+                label,
+                Duration::from_millis(0),
+                StepOutcome::Clean,
+            );
+        }
+        // Adding a higher-ordinal step after a chain of equal-ordinal
+        // CloseResource records is still clean.
+        choreo.record(
+            ShutdownStep::StopOwner,
+            "stop_runtime",
+            Duration::from_millis(0),
+            StepOutcome::Clean,
+        );
+        let report = choreo.finish();
+        assert!(report.clean, "{report:#?}");
+        assert_eq!(report.steps.len(), 5);
+        assert!(
+            report
+                .steps
+                .iter()
+                .all(|s| matches!(s.outcome, StepOutcome::Clean))
+        );
+        // Now a backwards step still violates.
+        let mut choreo = ShutdownChoreography::new("svc");
+        choreo.record(
+            ShutdownStep::CloseResource,
+            "a",
+            Duration::from_millis(0),
+            StepOutcome::Clean,
+        );
+        choreo.record(
+            ShutdownStep::CloseResource,
+            "b",
+            Duration::from_millis(0),
+            StepOutcome::Clean,
+        );
+        choreo.record(
+            ShutdownStep::StopIngress,
+            "backwards",
+            Duration::from_millis(0),
+            StepOutcome::Clean,
+        );
+        let report = choreo.finish();
+        assert!(!report.clean);
+        match &report.steps[2].outcome {
+            StepOutcome::OrderingViolation { previous_step } => {
+                assert_eq!(*previous_step, ShutdownStep::CloseResource);
+            }
+            other => panic!("expected OrderingViolation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn record_close_propagates_already_closed_and_failed_outcomes() {
+        // Coverage for the close-outcome → step-outcome translation
+        // table: AlreadyClosed → AlreadyDone (clean), Failed → Failed
+        // (unclean), TimedOut → Timeout (unclean). Together these
+        // cover every non-Clean variant of CloseOutcome.
+        let mut choreo = ShutdownChoreography::new("svc");
+        choreo.record_close(
+            &ResourceCloseReport::clean(
+                "x",
+                ResourceKind::Bridge,
+                CloseAdmission::NotApplicable,
+                Duration::from_millis(0),
+            )
+            .with_outcome(CloseOutcome::AlreadyClosed),
+            "close_already_closed",
+        );
+        choreo.record_close(
+            &ResourceCloseReport::clean(
+                "y",
+                ResourceKind::Pool,
+                CloseAdmission::Force,
+                Duration::from_millis(0),
+            )
+            .with_outcome(CloseOutcome::Failed {
+                reason: "unexpected reply".to_owned(),
+            }),
+            "close_failed",
+        );
+        choreo.record_close(
+            &ResourceCloseReport::clean(
+                "z",
+                ResourceKind::Listener,
+                CloseAdmission::Drain,
+                Duration::from_millis(5),
+            )
+            .with_outcome(CloseOutcome::TimedOut {
+                waited: Duration::from_millis(5),
+            }),
+            "close_timed_out",
+        );
+        let report = choreo.finish();
+        assert!(!report.clean, "Failed + TimedOut must flip clean to false");
+        assert!(matches!(report.steps[0].outcome, StepOutcome::AlreadyDone));
+        match &report.steps[1].outcome {
+            StepOutcome::Failed { reason } => assert!(reason.contains("unexpected reply")),
+            other => panic!("expected Failed, got {other:?}"),
+        }
+        match report.steps[2].outcome {
+            StepOutcome::Timeout { waited } => {
+                assert_eq!(waited, Duration::from_millis(5));
+            }
+            ref other => panic!("expected Timeout, got {other:?}"),
+        }
+        // Summary line correctness for mixed outcomes.
+        let summary = report.summary_line();
+        assert!(summary.contains("clean=false"));
+        assert!(summary.contains("timeouts=1"));
+        assert!(summary.contains("failures=1"));
+        assert!(summary.contains("closes=3"));
+    }
+
+    #[test]
+    fn stuck_child_close_produces_typed_timeout_in_terminal_report() {
+        // Integration-shaped scenario: a service drives the canonical
+        // shutdown sequence and one resource (the outbound pool here)
+        // is stuck. The plan's "shutdown with stuck child returns a
+        // timeout report" requirement is met by:
+        //
+        //   * `ServiceShutdownReport::clean` is `false`
+        //   * exactly one step has `StepOutcome::Timeout`
+        //   * the corresponding `ResourceCloseReport` is retained in
+        //     `closes` with `CloseOutcome::TimedOut`
+        //   * the summary line surfaces `timeouts=1`
+        //   * the discovery lines name the stuck resource and its
+        //     `waited_us` so on-call can act without log scraping.
+        let mut choreo = ShutdownChoreography::new("stuck-svc");
+        choreo.record(
+            ShutdownStep::StopIngress,
+            "close_ingress",
+            Duration::from_millis(0),
+            StepOutcome::Clean,
+        );
+        choreo.record(
+            ShutdownStep::DrainInFlight,
+            "wait_in_flight",
+            Duration::from_millis(0),
+            StepOutcome::Clean,
+        );
+        choreo.record_close(
+            &ResourceCloseReport::clean(
+                "db.bridge",
+                ResourceKind::Bridge,
+                CloseAdmission::Drain,
+                Duration::from_millis(0),
+            ),
+            "close_db_bridge",
+        );
+        let waited = Duration::from_millis(2_000);
+        let stuck = ResourceCloseReport::clean(
+            "outbound.pool",
+            ResourceKind::Pool,
+            CloseAdmission::Drain,
+            waited,
+        )
+        .with_outcome(CloseOutcome::TimedOut { waited })
+        .with_details("drain=TimedOut requested=1 stopped=0");
+        choreo.record_close(&stuck, "close_outbound_pool");
+        choreo.record_close(
+            &ResourceCloseReport::clean(
+                "main.listener",
+                ResourceKind::Listener,
+                CloseAdmission::Drain,
+                Duration::from_millis(0),
+            ),
+            "stop_main_listener",
+        );
+        choreo.record(
+            ShutdownStep::StopOwner,
+            "shutdown_runtime",
+            Duration::from_millis(0),
+            StepOutcome::Clean,
+        );
+
+        let report = choreo.finish();
+        assert!(
+            !report.clean,
+            "a stuck-child timeout must flip the terminal clean flag",
+        );
+
+        let timeouts: Vec<&ShutdownStepReport> = report
+            .steps
+            .iter()
+            .filter(|s| matches!(s.outcome, StepOutcome::Timeout { .. }))
+            .collect();
+        assert_eq!(
+            timeouts.len(),
+            1,
+            "expected exactly one Timeout step, got {timeouts:#?}",
+        );
+        let timeout_step = timeouts[0];
+        assert_eq!(timeout_step.step, ShutdownStep::CloseResource);
+        assert_eq!(timeout_step.label, "close_outbound_pool");
+        match timeout_step.outcome {
+            StepOutcome::Timeout { waited: w } => assert_eq!(w, waited),
+            ref other => panic!("expected Timeout, got {other:?}"),
+        }
+
+        let stuck_close = report
+            .closes
+            .iter()
+            .find(|c| c.name == "outbound.pool")
+            .expect("stuck close report retained");
+        assert!(matches!(stuck_close.outcome, CloseOutcome::TimedOut { .. }));
+        assert!(stuck_close.details.contains("drain=TimedOut"));
+
+        let summary = report.summary_line();
+        assert!(summary.contains("clean=false"), "{summary}");
+        assert!(summary.contains("timeouts=1"), "{summary}");
+
+        let lines = report.discovery_lines();
+        assert!(
+            lines.iter().any(|l| l.contains("label=close_outbound_pool")
+                && l.contains("outcome=timeout")
+                && l.contains("waited_us=")),
+            "stuck step missing from discovery: {lines:#?}",
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("name=outbound.pool") && l.contains("outcome=timeout")),
+            "stuck close missing from discovery: {lines:#?}",
+        );
+    }
+
+    #[test]
     fn dst_shutdown_ordering_every_backwards_pair_is_visible() {
-        // Deterministic ordering proof. For every pair (a, b) of distinct
-        // shutdown steps with a.ordinal > b.ordinal, recording a then b
-        // must produce an OrderingViolation on the second step. The proof
-        // exercises every backward pair instead of relying on a single
-        // example so a future variant added to ShutdownStep cannot quietly
-        // skip the check.
+        // Deterministic ordering proof. For every ordered pair
+        // (first, second) of distinct-ordinal shutdown step kinds,
+        // recording first then second must:
+        //
+        //   - be `Clean` when first.ordinal < second.ordinal
+        //   - be `OrderingViolation { previous_step: first }` when
+        //     first.ordinal > second.ordinal
+        //
+        // Equal-ordinal pairs are excluded; same-kind repeats are
+        // covered by `recording_same_step_kind_repeatedly_*`.
+        //
+        // Exhausting every distinct-ordinal pair keeps the helper
+        // honest: a future variant added with a misset ordinal would
+        // flip exactly one pair from one bucket to the other and fail
+        // this test.
         let all = [
             ShutdownStep::StopIngress,
             ShutdownStep::CancelSessions,
@@ -1155,14 +1465,11 @@ mod tests {
             ShutdownStep::EmitReport,
             ShutdownStep::StopOwner,
         ];
-        for &earlier in &all {
-            for &later in &all {
-                if later.as_str() == earlier.as_str() {
+        for &first in &all {
+            for &second in &all {
+                if first.ordinal() == second.ordinal() {
                     continue;
                 }
-                // Walk forward and backward independently so the test
-                // covers both correct and incorrect orderings.
-                let (first, second, expect_violation) = (later, earlier, true);
                 let mut choreo = ShutdownChoreography::new("dst-svc");
                 choreo.record(first, "first", Duration::from_millis(1), StepOutcome::Clean);
                 choreo.record(
@@ -1172,13 +1479,15 @@ mod tests {
                     StepOutcome::Clean,
                 );
                 let report = choreo.finish();
-                let second_report = &report.steps[1];
-                if first.ordinal() > second.ordinal() {
+                let second_outcome = &report.steps[1].outcome;
+                if first.ordinal() < second.ordinal() {
                     assert!(
-                        expect_violation,
-                        "logic bug in test scaffolding for {first:?}->{second:?}",
+                        matches!(second_outcome, StepOutcome::Clean),
+                        "expected Clean for {first:?}->{second:?}, got {second_outcome:?}",
                     );
-                    match &second_report.outcome {
+                    assert!(report.clean);
+                } else {
+                    match second_outcome {
                         StepOutcome::OrderingViolation { previous_step } => {
                             assert_eq!(*previous_step, first);
                         }
@@ -1187,9 +1496,6 @@ mod tests {
                         ),
                     }
                     assert!(!report.clean);
-                } else if first.ordinal() < second.ordinal() {
-                    assert!(matches!(second_report.outcome, StepOutcome::Clean));
-                    assert!(report.clean);
                 }
             }
         }

@@ -50,6 +50,12 @@ pub fn run(mode: RunMode) -> anyhow::Result<RunReport> {
     let db_path = dir.path().join("mini-saas.sqlite");
     seed_db(&db_path)?;
 
+    // Typed lifecycle witness. The host records every state the service
+    // passes through so the plan's "Starting → Ready → Draining →
+    // Stopped" assertion is one Vec<Lifecycle> instead of being implied
+    // across the topology/health/shutdown fields.
+    let mut lifecycle_transitions: Vec<Lifecycle> = vec![Lifecycle::Starting];
+
     let runtime = ThreadedRuntime::new(SingleShard, DefaultThreadedMailboxFactory);
     let sqlite = SqliteWorker::<SingleShard>::install(
         &runtime,
@@ -135,6 +141,10 @@ pub fn run(mode: RunMode) -> anyhow::Result<RunReport> {
     // can pattern-match instead of grepping.
     let startup = build_startup_summary(addr, notify_addr);
 
+    // Both listeners bound, controller registered, bridges installed.
+    // The service is now in Ready.
+    lifecycle_transitions.push(Lifecycle::Ready);
+
     let mut report = drive_script(addr, mode)?;
     report.startup_summary_line = startup.summary_line;
     report.startup_discovery_lines = startup.discovery_lines;
@@ -153,6 +163,8 @@ pub fn run(mode: RunMode) -> anyhow::Result<RunReport> {
     let t_close = Instant::now();
     match runtime.call_blocking(controller, ControllerMsg::CloseIngress, REQUEST_TIMEOUT)? {
         CallOutcome::Replied(response) if response.status == StatusCode::OK => {
+            // Ingress closed; the controller's DrainState is now Draining.
+            lifecycle_transitions.push(Lifecycle::Draining);
             choreo.record(
                 ShutdownStep::StopIngress,
                 "close_ingress",
@@ -304,6 +316,8 @@ pub fn run(mode: RunMode) -> anyhow::Result<RunReport> {
         Health::new("mini_saas_api", Lifecycle::Stopped)
             .with_pressure(build_pressure_snapshot(&db_pressure)),
     );
+    lifecycle_transitions.push(Lifecycle::Stopped);
+    report.lifecycle_transitions = lifecycle_transitions;
     report.multi_turn_notify = report.notified_item && deferred_replies >= 3;
     report.terminal_line = format!(
         "terminal db.capacity={} db.closed={} outbound.drain={:?} outbound.stop_requested={} \
@@ -1499,7 +1513,7 @@ fn build_startup_summary(
     notify_addr: std::net::SocketAddr,
 ) -> StartupSummary {
     use tina::capacity::{CapacityMode, CapacitySurfaceReport};
-    use tina_runtime::{ServicePressureReport, format_discovery_line};
+    use tina_runtime::ServicePressureReport;
 
     // Surfaces declared at startup. We do not sample live counters
     // here — that happens later via `/debug/capacity`. The startup
@@ -1563,16 +1577,15 @@ fn build_startup_summary(
     let topology_line =
         format!("topology service=mini_saas_api main_addr={main_addr} notify_addr={notify_addr}");
     let summary_line = format!("startup {} | {}", topology_line, report.summary_line());
+    // Reuse `ServicePressureSurface::discovery_line()` instead of
+    // duplicating the measured/unavailable format. The previous inline
+    // copy used `reason:?` instead of the surface helper's quoting,
+    // which would silently drift if the helper's escape rules
+    // tightened. The smoke test asserts the resulting `state=unavailable`
+    // / `reason="..."` shape.
     let mut discovery_lines = vec![topology_line];
     for surface in &report.surfaces {
-        discovery_lines.push(match &surface.state {
-            tina_runtime::ServiceSurfaceState::Measured(r) => format_discovery_line(r.as_ref()),
-            tina_runtime::ServiceSurfaceState::Unavailable { reason } => format!(
-                "capacity surface={name} kind={kind} state=unavailable reason={reason:?}",
-                name = surface.name,
-                kind = surface.kind,
-            ),
-        });
+        discovery_lines.push(surface.discovery_line());
     }
 
     // Build the typed `ServiceTopology` covering every started component
@@ -1607,5 +1620,106 @@ fn build_startup_summary(
         summary_line,
         discovery_lines,
         topology,
+    }
+}
+
+#[cfg(test)]
+mod conversion_tests {
+    use super::*;
+    use tina_http::{
+        KeepaliveConnectionStopFailure, KeepaliveConnectionStopOutcome, KeepalivePoolCloseOutcome,
+        KeepalivePoolShutdownReport,
+    };
+
+    #[test]
+    fn pool_shutdown_clean_drain_becomes_clean_close_outcome() {
+        let pool = KeepalivePoolShutdownReport {
+            pool_close: KeepalivePoolCloseOutcome::Closed,
+            drain: KeepalivePoolDrainOutcome::Drained,
+            requested: 1,
+            stopped: 1,
+            timed_out: 0,
+            rejected: 0,
+            already_closed: 0,
+            connection_failures: Vec::new(),
+        };
+        let report =
+            pool_shutdown_to_close_report("outbound.pool", &pool, Duration::from_millis(2));
+        assert_eq!(report.name, "outbound.pool");
+        assert_eq!(report.kind, ResourceKind::Pool);
+        assert_eq!(report.admission, CloseAdmission::Drain);
+        assert!(matches!(report.outcome, CloseOutcome::Clean));
+        assert!(report.details.contains("requested=1 stopped=1"));
+    }
+
+    #[test]
+    fn pool_shutdown_timed_out_drain_propagates_as_timed_out() {
+        // Production-shape stuck-child scenario: the keepalive pool's
+        // drain deadline fired while leases remained. The conversion
+        // must surface this as `CloseOutcome::TimedOut`, which the
+        // choreography then records as `StepOutcome::Timeout`.
+        let pool = KeepalivePoolShutdownReport {
+            pool_close: KeepalivePoolCloseOutcome::Closed,
+            drain: KeepalivePoolDrainOutcome::TimedOut { leased: 1 },
+            requested: 0,
+            stopped: 0,
+            timed_out: 0,
+            rejected: 0,
+            already_closed: 0,
+            connection_failures: Vec::new(),
+        };
+        let elapsed = Duration::from_millis(2_000);
+        let report = pool_shutdown_to_close_report("outbound.pool", &pool, elapsed);
+        match report.outcome {
+            CloseOutcome::TimedOut { waited } => assert_eq!(waited, elapsed),
+            other => panic!("expected TimedOut, got {other:?}"),
+        }
+        assert!(report.details.contains("drain=TimedOut"));
+    }
+
+    #[test]
+    fn pool_shutdown_with_connection_failures_becomes_failed_close() {
+        // The pool admission closed cleanly but one of the connection
+        // isolates did not stop on request. The conversion must
+        // surface this as `CloseOutcome::Failed` so the choreography
+        // flags `clean=false` and the failure reason is searchable.
+        let pool = KeepalivePoolShutdownReport {
+            pool_close: KeepalivePoolCloseOutcome::Closed,
+            drain: KeepalivePoolDrainOutcome::Drained,
+            requested: 2,
+            stopped: 1,
+            timed_out: 0,
+            rejected: 1,
+            already_closed: 0,
+            connection_failures: vec![KeepaliveConnectionStopFailure {
+                index: 1,
+                outcome: KeepaliveConnectionStopOutcome::UnexpectedReply,
+            }],
+        };
+        let report =
+            pool_shutdown_to_close_report("outbound.pool", &pool, Duration::from_millis(1));
+        match &report.outcome {
+            CloseOutcome::Failed { reason } => {
+                assert!(reason.contains("failures=1"), "{reason}");
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pool_shutdown_already_closed_becomes_already_closed() {
+        let pool = KeepalivePoolShutdownReport {
+            pool_close: KeepalivePoolCloseOutcome::AlreadyClosed,
+            drain: KeepalivePoolDrainOutcome::PoolAlreadyClosed,
+            requested: 0,
+            stopped: 0,
+            timed_out: 0,
+            rejected: 0,
+            already_closed: 0,
+            connection_failures: Vec::new(),
+        };
+        let report =
+            pool_shutdown_to_close_report("outbound.pool", &pool, Duration::from_millis(0));
+        assert!(matches!(report.outcome, CloseOutcome::AlreadyClosed));
     }
 }
