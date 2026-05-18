@@ -152,6 +152,33 @@ impl SqlitePressureReport {
     }
 }
 
+/// Stable surface name for the SQLite bridge pressure surface.
+pub const SQLITE_BRIDGE_SURFACE: &str = "sqlite.bridge";
+
+impl From<SqlitePressureReport> for tina_runtime::bridge::BridgePressure {
+    fn from(r: SqlitePressureReport) -> Self {
+        // SQLite admission is serial: capacity is always 1. This still
+        // surfaces honestly through the shared `BridgePressure` shape;
+        // dashboards see `capacity=1, current=0|1` instead of
+        // "unavailable" or "absent".
+        //
+        // worker_terminal_count reuses late_result_count — the bridge
+        // does not separately expose total worker terminations.
+        tina_runtime::bridge::BridgePressure::measured(
+            SQLITE_BRIDGE_SURFACE,
+            r.capacity,
+            r.leased,
+            r.high_water,
+            r.full_count,
+            r.timeout_count,
+            r.closed_count,
+            r.late_result_count,
+            r.late_result_count,
+        )
+        .expect("sqlite bridge surface name is a valid bridge name")
+    }
+}
+
 /// Cloneable handle for inspecting bridge metrics from outside the
 /// hosting Tina runtime.
 #[derive(Debug, Clone)]

@@ -149,8 +149,15 @@ pub use helpers::{
     ExecuteCall, QueryCall, Row, SqliteAddress, SqliteCallOutcome, SqliteExecutedOutcome,
     SqliteFatalReason, SqliteOutcomeClass, SqliteOutcomeExt, SqliteResult, SqliteRows,
     SqliteRowsOutcome, SqliteTransientReason, execute_call, query_call, send_request,
+    sqlite_bridge_class,
 };
-pub use metrics::{SqliteMetrics, SqliteMetricsHandle, SqlitePressureReport};
+pub use metrics::{
+    SQLITE_BRIDGE_SURFACE, SqliteMetrics, SqliteMetricsHandle, SqlitePressureReport,
+};
+// Shared bridge vocabulary lives in `tina_runtime::bridge`.
+pub use tina_runtime::bridge::{
+    BridgeFatal, BridgeOutcomeClass, BridgePressure, BridgeRetryable, BridgeUnavailable,
+};
 pub use types::{
     InstallError, SqliteConfig, SqliteConfigError, SqliteError, SqlitePath, SqliteRequest,
     SqliteResponse, SqliteValue, U64TooLarge,

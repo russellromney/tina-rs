@@ -3,9 +3,9 @@
 use std::time::Duration;
 
 use tina_aws_bridge::{
-    BridgeOutcomeClass, FatalReason, SecretsConfig, SecretsConfigError, SecretsCredentials,
-    SecretsError, SecretsGetSecretValue, SecretsOutcomeExt, SecretsRequest, SecretsResponse,
-    SecretsValue, TransientReason,
+    BridgeFatal, BridgeOutcomeClass, BridgeRetryable, SecretsConfig, SecretsConfigError,
+    SecretsCredentials, SecretsError, SecretsGetSecretValue, SecretsOutcomeExt, SecretsRequest,
+    SecretsResponse, SecretsValue,
 };
 use tina_runtime::CallOutcome;
 
@@ -54,35 +54,35 @@ fn classifier_sorts_outcomes_into_bridge_vocabulary() {
         CallOutcome::Replied(Err(SecretsError::NotFound("gone".into())));
     assert_eq!(
         not_found.classify(),
-        BridgeOutcomeClass::Fatal(FatalReason::NotFound)
+        BridgeOutcomeClass::Fatal(BridgeFatal::NotFound)
     );
 
     let denied: CallOutcome<Result<SecretsResponse, SecretsError>> =
         CallOutcome::Replied(Err(SecretsError::AccessDenied("no".into())));
     assert_eq!(
         denied.classify(),
-        BridgeOutcomeClass::Fatal(FatalReason::AccessDenied)
+        BridgeOutcomeClass::Fatal(BridgeFatal::AccessDenied)
     );
 
     let too_large: CallOutcome<Result<SecretsResponse, SecretsError>> =
         CallOutcome::Replied(Err(SecretsError::SecretTooLarge));
     assert_eq!(
         too_large.classify(),
-        BridgeOutcomeClass::Fatal(FatalReason::TooLarge)
+        BridgeOutcomeClass::Fatal(BridgeFatal::TooLarge)
     );
 
     let throttled: CallOutcome<Result<SecretsResponse, SecretsError>> =
         CallOutcome::Replied(Err(SecretsError::Throttled("slow".into())));
     assert_eq!(
         throttled.classify(),
-        BridgeOutcomeClass::Transient(TransientReason::ServiceThrottled)
+        BridgeOutcomeClass::Retryable(BridgeRetryable::ServiceThrottled)
     );
 
     let decrypt: CallOutcome<Result<SecretsResponse, SecretsError>> =
         CallOutcome::Replied(Err(SecretsError::DecryptionFailed("kms".into())));
     assert_eq!(
         decrypt.classify(),
-        BridgeOutcomeClass::Fatal(FatalReason::DecryptionFailed)
+        BridgeOutcomeClass::Fatal(BridgeFatal::DecryptionFailed)
     );
 }
 

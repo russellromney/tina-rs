@@ -4,8 +4,8 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use tina_aws_bridge::{
-    BridgeOutcomeClass, FatalReason, SnsAttributeValue, SnsConfig, SnsConfigError, SnsCredentials,
-    SnsDestination, SnsError, SnsOutcomeExt, SnsPublish, SnsRequest, SnsResponse, TransientReason,
+    BridgeFatal, BridgeOutcomeClass, BridgeRetryable, SnsAttributeValue, SnsConfig, SnsConfigError,
+    SnsCredentials, SnsDestination, SnsError, SnsOutcomeExt, SnsPublish, SnsRequest, SnsResponse,
 };
 use tina_runtime::CallOutcome;
 
@@ -68,28 +68,28 @@ fn classifier_sorts_outcomes_into_bridge_vocabulary() {
         CallOutcome::Replied(Err(SnsError::MessageTooLarge));
     assert_eq!(
         too_large.classify(),
-        BridgeOutcomeClass::Fatal(FatalReason::TooLarge)
+        BridgeOutcomeClass::Fatal(BridgeFatal::TooLarge)
     );
 
     let not_found: CallOutcome<Result<SnsResponse, SnsError>> =
         CallOutcome::Replied(Err(SnsError::NotFound("topic gone".into())));
     assert_eq!(
         not_found.classify(),
-        BridgeOutcomeClass::Fatal(FatalReason::NotFound)
+        BridgeOutcomeClass::Fatal(BridgeFatal::NotFound)
     );
 
     let access_denied: CallOutcome<Result<SnsResponse, SnsError>> =
         CallOutcome::Replied(Err(SnsError::AccessDenied("no perm".into())));
     assert_eq!(
         access_denied.classify(),
-        BridgeOutcomeClass::Fatal(FatalReason::AccessDenied)
+        BridgeOutcomeClass::Fatal(BridgeFatal::AccessDenied)
     );
 
     let throttled: CallOutcome<Result<SnsResponse, SnsError>> =
         CallOutcome::Replied(Err(SnsError::Throttled("slow".into())));
     assert_eq!(
         throttled.classify(),
-        BridgeOutcomeClass::Transient(TransientReason::ServiceThrottled)
+        BridgeOutcomeClass::Retryable(BridgeRetryable::ServiceThrottled)
     );
 }
 
