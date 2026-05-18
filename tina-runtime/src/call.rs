@@ -2963,6 +2963,28 @@ where
     IsolateCall::new(destination.address(), message, timeout)
 }
 
+/// Capability-typed call for split service requests.
+///
+/// This is the request-lane companion to [`tina::send_event`]. Passing an
+/// event address here is a compile error, and request payloads are wrapped
+/// into [`tina::ServiceMessage::Request`] before dispatch.
+pub fn call_request<E, Q, R>(
+    destination: tina::ServiceRequestAddress<E, Q, R>,
+    request: Q,
+    timeout: Duration,
+) -> IsolateCall<tina::ServiceMessage<E, Q>, R>
+where
+    E: Send + 'static,
+    Q: Send + 'static,
+    R: 'static,
+{
+    IsolateCall::new(
+        destination.address().address(),
+        tina::ServiceMessage::Request(request),
+        timeout,
+    )
+}
+
 /// Returns a sleep effect that ignores the infallible timer payload and
 /// delivers `message` back later.
 ///

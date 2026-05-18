@@ -476,6 +476,23 @@ where
     Effect::Send(Outbound::new(destination.address(), message))
 }
 
+/// Returns an effect that sends one public service event.
+///
+/// This is the split-service spelling of [`send_to`]. A
+/// [`ServiceEventAddress`] cannot be passed to request helpers, and a
+/// [`ServiceRequestAddress`] cannot be passed here, so the common
+/// "request went down the event lane" mistake fails at compile time on the
+/// copied path.
+pub fn send_event<I, E, Q>(destination: ServiceEventAddress<E, Q>, event: E) -> Effect<I>
+where
+    I: Isolate<Send = Outbound<ServiceMessage<E, Q>>>,
+{
+    Effect::Send(Outbound::new(
+        destination.address().address(),
+        ServiceMessage::Event(event),
+    ))
+}
+
 /// Returns an effect that asks the runtime to spawn one child.
 pub fn spawn<I>(child: I::Spawn) -> Effect<I>
 where
@@ -1573,6 +1590,75 @@ impl<M, R> Address<M, R> {
     /// Returns a callable capability for this address.
     pub const fn callable(self) -> CallAddress<M, R> {
         CallAddress::from_address(self)
+    }
+}
+
+/// Message envelope used by the split-service authoring path.
+///
+/// `Event` values are mailbox facts. `Request` values carry caller authority.
+/// User code normally does not construct this enum directly; it uses
+/// [`send_event`] and `tina_runtime::call_request`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServiceMessage<Event, Request> {
+    /// Fire-and-forget mailbox event.
+    Event(Event),
+    /// Callable request with caller authority.
+    Request(Request),
+}
+
+/// Send capability for split-service events.
+#[derive(Debug)]
+#[repr(transparent)]
+pub struct ServiceEventAddress<Event, Request> {
+    address: SendAddress<ServiceMessage<Event, Request>>,
+}
+
+impl<Event, Request> Copy for ServiceEventAddress<Event, Request> {}
+
+impl<Event, Request> Clone for ServiceEventAddress<Event, Request> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<Event, Request> ServiceEventAddress<Event, Request> {
+    /// Wraps a send address for the split service envelope.
+    pub const fn from_send_address(address: SendAddress<ServiceMessage<Event, Request>>) -> Self {
+        Self { address }
+    }
+
+    /// Returns the underlying send capability.
+    pub const fn address(self) -> SendAddress<ServiceMessage<Event, Request>> {
+        self.address
+    }
+}
+
+/// Call capability for split-service requests.
+#[derive(Debug)]
+#[repr(transparent)]
+pub struct ServiceRequestAddress<Event, Request, Reply> {
+    address: CallAddress<ServiceMessage<Event, Request>, Reply>,
+}
+
+impl<Event, Request, Reply> Copy for ServiceRequestAddress<Event, Request, Reply> {}
+
+impl<Event, Request, Reply> Clone for ServiceRequestAddress<Event, Request, Reply> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<Event, Request, Reply> ServiceRequestAddress<Event, Request, Reply> {
+    /// Wraps a call address for the split service envelope.
+    pub const fn from_call_address(
+        address: CallAddress<ServiceMessage<Event, Request>, Reply>,
+    ) -> Self {
+        Self { address }
+    }
+
+    /// Returns the underlying call capability.
+    pub const fn address(self) -> CallAddress<ServiceMessage<Event, Request>, Reply> {
+        self.address
     }
 }
 

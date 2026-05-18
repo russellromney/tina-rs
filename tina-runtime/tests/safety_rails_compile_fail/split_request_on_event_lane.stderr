@@ -1,0 +1,13 @@
+error[E0308]: mismatched types
+  --> tests/safety_rails_compile_fail/split_request_on_event_lane.rs:25:39
+   |
+25 |         tina::send_event(self.events, Request::Read)
+   |         ----------------              ^^^^^^^^^^^^^ expected `Event`, found `Request`
+   |         |
+   |         arguments to this function are incorrect
+   |
+note: function defined here
+  --> $WORKSPACE/tina/src/lib.rs
+   |
+   | pub fn send_event<I, E, Q>(destination: ServiceEventAddress<E, Q>, event: E) -> Effect<I>
+   |        ^^^^^^^^^^

@@ -175,6 +175,44 @@ impl<M> Clone for SendOnlyServiceHandle<M> {
         *self
     }
 }
+
+/// Capability-typed handles for one split event/request service.
+///
+/// Returned by [`Runtime::register_split_service`]. The `events` lane accepts
+/// only public fire-and-forget events through [`tina::send_event`]. The
+/// `requests` lane accepts only callable requests through [`call_request`].
+#[derive(Debug)]
+pub struct SplitServiceHandle<Event, Request, Reply> {
+    /// Send capability for service events.
+    pub events: tina::ServiceEventAddress<Event, Request>,
+    /// Call capability for service requests.
+    pub requests: tina::ServiceRequestAddress<Event, Request, Reply>,
+}
+
+impl<Event, Request, Reply> Copy for SplitServiceHandle<Event, Request, Reply> {}
+
+impl<Event, Request, Reply> Clone for SplitServiceHandle<Event, Request, Reply> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<Event, Request, Reply> SplitServiceHandle<Event, Request, Reply> {
+    /// Wraps the raw service envelope address as split capabilities.
+    pub const fn from_address(
+        address: tina::Address<tina::ServiceMessage<Event, Request>, Reply>,
+    ) -> Self {
+        Self {
+            events: tina::ServiceEventAddress::from_send_address(address.send_only()),
+            requests: tina::ServiceRequestAddress::from_call_address(address.callable()),
+        }
+    }
+
+    /// Returns the underlying raw envelope address.
+    pub const fn address(self) -> tina::Address<tina::ServiceMessage<Event, Request>, Reply> {
+        self.requests.address().address()
+    }
+}
 pub use shutdown::ThreadedShutdownHandle;
 pub use single_call_gate::SingleCallGate;
 pub use threaded::{DEFAULT_SHUTDOWN_LANE_DRAIN_TIMEOUT, ThreadedRuntime, ThreadedRuntimeConfig};
@@ -215,14 +253,14 @@ pub use call::{
     TcpStreamCloseReply, TcpWriteReply, TlsAcceptReply, TlsBindReply, TlsCloseReply,
     TlsConnectReply, TlsListenerCloseReply, TlsListenerId, TlsReadReply, TlsStreamId,
     TlsWriteReply, TypedCall, UdpBindReply, UdpCloseSocketReply, UdpRecvFromReply, UdpSendToReply,
-    UdpSocketId, call, call_cancelable, call_handle_call_id, call_typed, call_with_handle,
-    cancel_call, dns_lookup, file_close, file_create, file_fsync, file_open, file_read,
-    file_read_at, file_size, file_write, file_write_at, journal_append, journal_replay, mkdir,
-    path_metadata, process_run, read_dir, remove_file, rename_replace, send_observed, signal_wait,
-    sleep, sleep_then, snapshot_commit, snapshot_load, sync_parent, tcp_accept, tcp_bind,
-    tcp_close_listener, tcp_close_stream, tcp_connect, tcp_read, tcp_write, tls_accept, tls_bind,
-    tls_close, tls_close_listener, tls_connect, tls_read, tls_write, udp_bind, udp_close_socket,
-    udp_recv_from, udp_send_to,
+    UdpSocketId, call, call_cancelable, call_handle_call_id, call_request, call_typed,
+    call_with_handle, cancel_call, dns_lookup, file_close, file_create, file_fsync, file_open,
+    file_read, file_read_at, file_size, file_write, file_write_at, journal_append, journal_replay,
+    mkdir, path_metadata, process_run, read_dir, remove_file, rename_replace, send_observed,
+    signal_wait, sleep, sleep_then, snapshot_commit, snapshot_load, sync_parent, tcp_accept,
+    tcp_bind, tcp_close_listener, tcp_close_stream, tcp_connect, tcp_read, tcp_write, tls_accept,
+    tls_bind, tls_close, tls_close_listener, tls_connect, tls_read, tls_write, udp_bind,
+    udp_close_socket, udp_recv_from, udp_send_to,
 };
 pub use call_group::{
     CallGroup, CallGroupBranchOutcome, CallGroupCancelOutcome, CallGroupCancelRequest,
@@ -1060,6 +1098,38 @@ where
         SendOnlyServiceHandle {
             send: address.send_only(),
         }
+    }
+
+    /// Registers one split event/request service.
+    ///
+    /// The isolate's message type must be [`tina::ServiceMessage<Event,
+    /// Request>`], which the `#[tina_runtime::isolate(event = ..., request =
+    /// ..., reply = ...)]` macro emits. The returned handle exposes separate
+    /// event and request capabilities so ordinary code cannot send requests as
+    /// events or call events as requests.
+    #[allow(private_bounds)]
+    pub fn register_split_service<I, Event, Request, Outbound>(
+        &mut self,
+        isolate: I,
+        mailbox_capacity: usize,
+    ) -> SplitServiceHandle<Event, Request, I::Reply>
+    where
+        I: Isolate<
+                Shard = S,
+                Message = tina::ServiceMessage<Event, Request>,
+                Send = TinaOutbound<Outbound>,
+            > + tina::CallableIsolate
+            + 'static,
+        Event: 'static,
+        Request: 'static,
+        I::Reply: 'static,
+        I::Spawn: IntoErasedSpawn<S, F> + 'static,
+        I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
+        I::Call: IntoErasedCall<I::Message> + 'static,
+        Outbound: 'static,
+    {
+        let address = self.register_with_capacity::<I, Outbound>(isolate, mailbox_capacity);
+        SplitServiceHandle::from_address(address)
     }
 
     /// Registers one isolate and prefills its mailbox with `bootstrap` so the

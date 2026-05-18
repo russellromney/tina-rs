@@ -408,6 +408,34 @@ where
             })
     }
 
+    /// Threaded mirror of
+    /// [`Runtime::register_split_service`](crate::Runtime::register_split_service).
+    #[allow(private_bounds)]
+    pub fn register_split_service<I, Event, Request, Outbound>(
+        &self,
+        isolate: I,
+        mailbox_capacity: usize,
+    ) -> Result<crate::SplitServiceHandle<Event, Request, I::Reply>, ThreadedRuntimeError>
+    where
+        I: Isolate<
+                Shard = S,
+                Message = tina::ServiceMessage<Event, Request>,
+                Send = TinaOutbound<Outbound>,
+            > + tina::CallableIsolate
+            + Send
+            + 'static,
+        Event: 'static,
+        Request: 'static,
+        I::Reply: 'static,
+        I::Spawn: IntoErasedSpawn<S, F> + 'static,
+        I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
+        I::Call: IntoErasedCall<I::Message> + 'static,
+        Outbound: 'static,
+    {
+        self.register_with_capacity::<I, Outbound>(isolate, mailbox_capacity)
+            .map(crate::SplitServiceHandle::from_address)
+    }
+
     /// Threaded mirror of [`Runtime::register_with_capacity_and_bootstrap`].
     ///
     /// The mailbox is allocated and the bootstrap message is prefilled before

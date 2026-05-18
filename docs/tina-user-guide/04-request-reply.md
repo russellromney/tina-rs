@@ -102,6 +102,66 @@ caller handles timeout
 > The handler's returned effect still runs; it just no longer has caller
 > authority.
 
+## Split Events And Requests
+
+For new services, prefer separate domain types for mailbox events and callable
+requests:
+
+```rust
+#[derive(Debug)]
+enum CacheEvent {
+    FillDone { key: String },
+}
+
+#[derive(Debug)]
+enum CacheRequest {
+    Get { key: String },
+}
+
+#[tina_runtime::isolate(event = CacheEvent, request = CacheRequest, reply = CacheReply)]
+impl Cache {
+    fn handle_event(
+        &mut self,
+        event: CacheEvent,
+        ctx: &mut Context<'_, SingleShard, Self::Reply>,
+    ) -> Effect<Self> {
+        // fire-and-forget continuations land here
+    }
+
+    fn handle_request(
+        &mut self,
+        request: CacheRequest,
+        call: CallContext<'_, Self>,
+    ) -> Effect<Self> {
+        // caller-authority requests land here
+    }
+}
+```
+
+Register it through `register_split_service`. The returned handle has two
+lanes:
+
+```rust
+let cache = runtime.register_split_service::<Cache, CacheEvent, CacheRequest, Infallible>(
+    Cache::new(),
+    64,
+);
+
+tina::send_event(cache.events, CacheEvent::FillDone { key });
+tina_runtime::call_request(cache.requests, CacheRequest::Get { key }, timeout);
+```
+
+The compiler rejects the two common wrong shapes:
+
+```text
+send_event(cache.events, CacheRequest::Get { ... })   // expected CacheEvent
+call_request(cache.requests, CacheEvent::FillDone { ... }, timeout) // expected CacheRequest
+```
+
+The raw `ServiceMessage<Event, Request>` envelope still exists for runtime and
+interop code. Keep it out of copied service code unless you are deliberately
+using the escape hatch.
+
 ## Deferred Reply
 
 A service can reply after more than one handler turn.

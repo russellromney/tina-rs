@@ -4,6 +4,10 @@
 
 - IDD implementation phase.
 - Follows the first compile-time safety rails pass.
+- First PR slice shipped the split event/request service rail:
+  `event = ...`, `request = ...`, `ServiceMessage`, split service handles,
+  `send_event`, `call_request`, positive runtime proof, and trybuild lane
+  diagnostics.
 
 ## Grug Truth
 
@@ -52,6 +56,10 @@ Internal continuation events must be unconstructable or unsendable from outside
 the service module on the copied path. Use private constructors, sealed traits,
 capability handles, or macro-generated visibility. The user-facing result is
 simple: outside code cannot send internal events.
+
+First shipped slice: public events and public requests are separate types and
+separate capability handles. Fully private internal continuation constructors
+remain the next part of this rock.
 
 ### Rock 2: Caller Authority Obligation
 
