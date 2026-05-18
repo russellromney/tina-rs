@@ -1331,11 +1331,7 @@ where
             .iter()
             .find(|entry| entry.id == address.isolate())
         else {
-            panic!(
-                "runtime ingress targeted unknown isolate {} on shard {}",
-                address.isolate().get(),
-                address.shard().get(),
-            );
+            return Err(TrySendError::Closed(message));
         };
 
         if entry.generation != address.generation() {
@@ -3752,11 +3748,7 @@ where
             .iter()
             .position(|entry| entry.id == send.target_isolate)
         else {
-            panic!(
-                "send targeted unknown isolate {} on shard {}",
-                send.target_isolate.get(),
-                send.target_shard.get(),
-            );
+            return Err(SendRejectedReason::Closed);
         };
         let entry = &self.entries[entry_index];
 

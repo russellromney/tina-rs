@@ -1,7 +1,6 @@
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::convert::Infallible;
-use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::rc::Rc;
 
 use tina::{
@@ -565,7 +564,7 @@ fn sends_after_panic_still_become_closed() {
 }
 
 #[test]
-fn unknown_target_send_still_panics_instead_of_becoming_handler_panicked() {
+fn unknown_target_send_rejects_closed_without_becoming_handler_panicked() {
     let mut runtime = Runtime::new(TestShard, TestMailboxFactory);
     let sender_mailbox = TestMailbox::new(8);
     let sender_address = runtime.register(
@@ -577,8 +576,7 @@ fn unknown_target_send_still_panics_instead_of_becoming_handler_panicked() {
 
     assert_eq!(sender_mailbox.try_send(DriverMsg::Kick(1)), Ok(()));
 
-    let result = catch_unwind(AssertUnwindSafe(|| runtime.step()));
-    assert!(result.is_err());
+    assert_eq!(runtime.step(), 1);
     assert!(
         !runtime
             .trace()
@@ -620,6 +618,18 @@ fn unknown_target_send_still_panics_instead_of_becoming_handler_panicked() {
                     target_shard: ShardId::new(3),
                     target_isolate: IsolateId::new(99),
                     target_generation: AddressGeneration::new(0),
+                },
+            ),
+            RuntimeEvent::new(
+                EventId::new(5),
+                Some(CauseId::new(EventId::new(4))),
+                ShardId::new(3),
+                sender_address.isolate(),
+                RuntimeEventKind::SendRejected {
+                    target_shard: ShardId::new(3),
+                    target_isolate: IsolateId::new(99),
+                    target_generation: AddressGeneration::new(0),
+                    reason: SendRejectedReason::Closed,
                 },
             ),
         ]
