@@ -26,6 +26,85 @@ This file records completed work.
 - Documented the split event/request copied path in
   `docs/tina-user-guide/04-request-reply.md`.
 
+### Phase 103 Protocol Parity Finish
+
+- Audited the native HTTP/2, gRPC, and WebSocket stacks for the
+  "Tina replaces the protocol, not the runtime" claim and aligned the docs
+  with what `tina-http` actually proves today.
+- HTTP/2: confirmed typed `Http2ProtocolError` covers bad preface, oversized
+  frame/headers/body, malformed pseudo-headers, flow-control, window
+  overflow, bad stream id, unsupported frames, and request trailers, plus
+  `Http2Outcome` (marked `#[non_exhaustive]`) names the six lifecycle
+  categories the plan called out: `Replied`, `Full`, `Closed`,
+  `FlowControlBlocked`, `Timeout`, `ProtocolError(Http2ProtocolError)`,
+  `StreamReset(u32)` (peer-initiated), and `LocalCancel(u32)` (locally
+  initiated). `Http2ConnectionReport` carries the per-connection counters
+  for opened/closed/reset streams, connection/stream full, flow-control
+  blocked, GOAWAY sent, and late replies after close.
+- HTTP/2 live tests now also assert the wire error code on every GOAWAY
+  and on each RST_STREAM the server emits: oversized frame ->
+  FRAME_SIZE_ERROR, oversized header block -> PROTOCOL_ERROR, inbound
+  flow-control violation -> FLOW_CONTROL_ERROR, stream cap exceeded ->
+  ENHANCE_YOUR_CALM, refused-after-peer-GOAWAY -> REFUSED_STREAM. Unit
+  tests pin the typed-error -> wire-code mapping and the Http2Outcome
+  vocabulary so future drift breaks compile or assertion, not silently.
+- gRPC: `GrpcRouter` ships unary, server-streaming, client-streaming, and
+  bidirectional streaming routes with typed `GrpcStatus` trailers, declared
+  message caps, deadline-to-`DeadlineExceeded` mapping, content-type
+  rejection, identity-encoding-only handling, and h2c tonic interop. Live
+  tests cover the full peer-reset cancellation path through both response
+  source and accepted service call sides, malformed frame final status,
+  declared message cap rejection, and concurrent gRPC streaming modes
+  sharing one HTTP/2 connection without cross-talk.
+- WebSocket: extracted `tina_http::WebSocketMemberTable` with `admit`,
+  `broadcast_text`/`broadcast_binary`, `fanout`, `shutdown_close`,
+  `remove_peer`, and `record_send_outcome`, plus the typed
+  `AdmitOutcome::{Admitted, AlreadyMember, Full}` and
+  `SendOutcomeAction::{Ok, RemovedSlow, RemovedClosed, RemovedProtocol,
+  RemovedTimeout, Stale}` enums. Counters live on
+  `WebSocketMemberTableReport`. The table preserves explicit admission,
+  fanout pressure, slow-peer eviction, and close reports; idle eviction,
+  the recurring liveness tick, and shutdown sequencing remain in the room
+  isolate that owns the table.
+- Migrated `examples/systems/system_realtime_rooms` to the new helper. The
+  smoke and bad-peer proofs still pass; the room's typed counters
+  (joined, left_idle/peer/slow/shutdown, presence ticks, shutdown_close_*)
+  now mirror the table's bookkeeping rather than reaching into a private
+  `BTreeMap`.
+- Documented the WebSocket helper in `tina-http`'s module docs, in
+  `examples/specimen_websocket_room/README.md`, and in
+  `examples/systems/system_realtime_rooms/README.md`.
+- ROADMAP "Native service protocols" row now names the typed HTTP/2 errors,
+  the four gRPC modes, the WebSocket browser proof, and the WebSocket
+  member-table helper, and lists what stays future work (native HTTP/2
+  client, HTTP/2 TLS ALPN/mTLS, gRPC reflection/interceptors/load
+  balancing, native broad WebSocket client, `permessage-deflate`,
+  web-framework ergonomics, and full WebSocket-bytes simulator replay).
+- **Deferred from this phase, named follow-up.** Rock 5 ("Simulator
+  Facts") did not ship. The protocol facts the plan named — stream
+  opened/closed/reset, flow-control full, body high-water, WebSocket
+  slow-peer close, gRPC final status sent/received — surface as bounded
+  counters on `Http2ConnectionReport`, `BodyMetrics`,
+  `WebSocketMemberTableReport`, and the typed `GrpcStatus` trailers, not
+  as `RuntimeEventKind` variants on the trace stream. They do not
+  round-trip through `tina-sim` replay yet, which means a protocol bug
+  cannot be replayed from a trace today.
+- **Deferred from this phase, named follow-up.** The plan's Required
+  Proof line "At least one DST replay case for a protocol
+  pressure/lifecycle bug" is satisfied by pre-existing
+  `tina-http/tests/dst_simulator.rs` cases
+  (`slow_body_multichunk_inbound_replays_deterministically`,
+  `service_full_with_concurrent_peers_replays_deterministically`,
+  `shutdown_mid_request_replays_deterministically`), so the phase 103
+  minimum is met; no new DST replay case was added in this phase. A
+  protocol-fact-driven DST replay rides with the Rock 5 follow-up.
+- Both deferrals are tracked in `ROADMAP.md` under "Protocol facts as
+  runtime/simulator trace events" and in
+  `.intent/phases/103-protocol-parity-finish/plan.md` under "Deferred
+  to follow-up". Phase 103 is marked shipped on the strength of Rocks
+  1–4 (protocol parity, helper extraction, client-side parity docs)
+  and the pre-existing DST coverage; Rock 5 is not silently dropped.
+
 ### Phase 106 Lifecycle, Health, And Topology
 
 - Added `tina_runtime::lifecycle` with typed service lifecycle vocabulary:

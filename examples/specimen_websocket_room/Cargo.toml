@@ -17,3 +17,5 @@ tungstenite = "0.29"
 
 [lib]
 path = "src/lib.rs"
+
+[workspace]

@@ -4,6 +4,15 @@
 
 - IDD implementation phase.
 - Absorbs the old HTTP/2/gRPC finish row and WebSocket replacement follow-up.
+- Shipped (PR #129): Rocks 1–4 in full. Rock 5 is deferred — see
+  [Deferred](#deferred-to-follow-up) below — and a follow-up phase is named in
+  `ROADMAP.md` under "Protocol facts as runtime/simulator trace events". The
+  "At least one DST replay case for a protocol pressure/lifecycle bug" line in
+  [Required Proof](#required-proof) is satisfied by the pre-existing
+  `tina-http/tests/dst_simulator.rs` cases for `slow_body_multichunk_inbound`,
+  `service_full_with_concurrent_peers`, and `shutdown_mid_request`; no new DST
+  replay case was added in this phase, and adding a protocol-fact-driven
+  replay rides with the Rock 5 follow-up.
 
 ## Grug Truth
 
@@ -129,3 +138,31 @@ used, what Tina proves, and what still felt rough.
 A user can look at the docs and know exactly which protocol modes Tina can
 replace today, which modes are server-only, and which modes are still out of
 scope.
+
+## Deferred to follow-up
+
+Rock 5 ("Simulator Facts") did not ship in this phase. The protocol facts the
+plan named — stream opened/closed/reset, flow-control full, body high-water,
+WebSocket slow-peer close, gRPC final status sent/received — surface today as
+bounded counters on `Http2ConnectionReport`, `BodyMetrics`,
+`WebSocketMemberTableReport`, and the typed `GrpcStatus` trailers. They are
+**not** plumbed through `RuntimeEventKind` on the trace stream and they do
+**not** round-trip through `tina-sim` replay. A user who wants protocol
+behavior in a deterministic "bug in a box" still has to wire one of the
+existing DST cases (TCP-script-driven listener/connection lifecycle in
+`tina-http/tests/dst_simulator.rs`) rather than asking the trace for "show me
+the stream-reset events for this run."
+
+This is a named follow-up in `ROADMAP.md` ("Protocol facts as
+runtime/simulator trace events"), not a forgotten requirement. It is the next
+protocol-observability slice and should ride with the proof harnesses /
+replay-ops capability cluster, since the user-visible payoff is "this protocol
+bug now replays from a trace" — the same shape as Phase 108's replay ops.
+
+The new DST case the plan required ("at least one DST replay case for a
+protocol pressure/lifecycle bug") rides with this follow-up. The existing DST
+cases (`slow_body_multichunk_inbound`, `service_full_with_concurrent_peers`,
+`shutdown_mid_request`) already satisfy the "protocol pressure/lifecycle"
+shape via the TCP-script path, so the phase 103 minimum is met; the new case
+that exercises protocol-fact trace events is gated on the trace-event work
+above.

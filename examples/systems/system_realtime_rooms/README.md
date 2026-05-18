@@ -9,7 +9,11 @@ entry in `examples/systems/README.md` for `system_realtime_rooms`.
 
 - Native server-side WebSocket from `tina-http`: `WebSocketSessionHandle`,
   `WebSocketSessionMsg`, `websocket_upgrade`, `HttpResponse::websocket`.
-- A bounded member table (one room, fixed capacity, fill-close-refill safe).
+- The bounded member table helper `tina_http::WebSocketMemberTable` for
+  admit / fanout / shutdown / slow-peer eviction. The room isolate keeps
+  the idle-eviction policy, the recurring liveness tick, and the bootstrap
+  message; the table owns the `BTreeMap<WebSocketSessionId, ...>` and the
+  per-outcome counters via [`SendOutcomeAction`].
 - A recurring liveness tick — one `sleep_then` self-reschedules the room
   every `presence_tick`, broadcasts a heartbeat to every live member, and
   evicts members whose last activity was older than `idle_evict`.
