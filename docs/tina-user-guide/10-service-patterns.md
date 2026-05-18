@@ -453,3 +453,107 @@ Generated service code must still make these visible:
 - internal error
 
 Convenience may remove ceremony. Convenience must not remove truth.
+
+## Service product surface
+
+A real service has more than one handler. It has routes, bridges, pools,
+pending work, capacity, health, shutdown, and replay facts. Tina ships
+one boring shape that threads them together: the **service product
+surface** in `tina_runtime::service_report`.
+
+Three rules:
+
+- The surface is **service-local**. There is no global registry. Each
+  service constructs its own `ServiceReportBuilder`.
+- Missing surfaces must be declared **Unavailable** with a typed reason.
+  Silently omitting a known bridge surface is the bug the rail prevents.
+- Pressure is not health by itself. Readiness may use pressure as input,
+  but the report **preserves the readiness verdict the service made**.
+
+### One copied pressure path
+
+Use `ServicePressureBuilder` for every pressure aggregation. The builder
+validates the service name once, validates each surface name on
+insertion, and rejects duplicates loudly with a typed
+`ServiceReportBuildError`.
+
+```rust
+use tina::capacity::{CapacityMode, CapacitySurfaceReport};
+use tina_runtime::service_pressure::ServicePressureBuilder;
+
+let pressure = ServicePressureBuilder::new("billing")?
+    .surface(
+        "mailbox",
+        CapacitySurfaceReport::count(
+            "billing.mailbox",
+            CapacityMode::Fixed,
+            32, 0, 1, 0,
+        ),
+    )?
+    .unavailable("billing.bridge", "bridge", "not registered yet")?
+    .finish()?;
+```
+
+### One copied report path
+
+Use `ServiceReportBuilder` to thread lifecycle, readiness, health,
+topology, pressure, optional shutdown, and replay status into one
+`ServiceReport`. Fields are private — only the builder can construct
+one. Skipping a required field returns a typed `Missing*` error.
+
+```rust
+use tina_runtime::lifecycle::{Health, Lifecycle, Readiness, ServiceTopology};
+use tina_runtime::service_report::{ServiceReplayStatus, ServiceReportBuilder};
+
+let report = ServiceReportBuilder::new("billing")?
+    .lifecycle(Lifecycle::Ready)
+    .readiness(Readiness::ready())
+    .health(Health::new("billing", Lifecycle::Ready))
+    .topology(ServiceTopology::new("billing", Lifecycle::Ready))
+    .pressure(pressure)
+    .replay(ServiceReplayStatus::not_captured("not configured"))
+    .finish()?;
+
+// One-line summary, grep-friendly key=value:
+// "service=billing lifecycle=ready ready=true health=ready
+//  pressure=2 surfaces_full=false unavailable=1 replay=not_captured"
+println!("{}", report.summary_line());
+```
+
+### Shutdown summary belongs in the report
+
+When a service has finished its shutdown, fold the typed
+`ServiceShutdownReport` (or `ShutdownChoreography`) into the report so
+the shutdown summary is part of the same product surface. The report
+returns `shutdown_summary_line()` even when no shutdown has been
+recorded — it prints `state=not_recorded` so a missing shutdown is
+explicit instead of implied.
+
+### Replay status is typed
+
+`ServiceReplayStatus` is an enum, not free text. Variants:
+
+- `Available { case_name, projected_events }` — the service captured
+  facts and a replayer can load the named case.
+- `Unsupported { facts }` — capture saw facts the simulator does not
+  yet replay; the names appear in the report.
+- `NotCaptured { reason }` — replay was not captured this run, and the
+  reason is part of the report.
+
+A caller cannot supply `"available"` or `"unsupported"` as a string —
+the compile-time rail rejects that path.
+
+### Copy a migrated system
+
+`examples/systems/mini_saas_api` is the canonical worked example.
+Its `RunReport::service_report` is built through this surface and
+threaded into the smoke test:
+
+```text
+cargo test --manifest-path examples/systems/mini_saas_api/Cargo.toml \
+    --test smoke smoke_service_report_threads_every_component
+```
+
+`system_soak_http_db`, `system_api_gateway_limits`, and
+`system_metrics_shipper` all use the same surface — even the non-HTTP
+shipper service prints the same vocabulary.

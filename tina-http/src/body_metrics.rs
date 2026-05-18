@@ -423,6 +423,71 @@ impl BodyPressureReport {
     pub fn drained(&self) -> bool {
         self.request_body_current == 0 && self.response_body_current == 0
     }
+
+    /// Convert both request and response body pressure into a vector of
+    /// [`CapacitySurfaceReport`]s for direct feeding into
+    /// [`tina_runtime::CapacitySummary`].
+    ///
+    /// Names are `"<prefix>.body.request"` and `"<prefix>.body.response"`.
+    /// When the underlying [`BodyMetrics`] was built without a body weight
+    /// cap the vector is empty: there are no weighted bytes to surface.
+    /// Use [`Self::service_surfaces`] for the
+    /// [`tina_runtime::ServicePressureBuilder`] path that names missing
+    /// surfaces explicitly.
+    pub fn capacity_surfaces(
+        &self,
+        prefix: &str,
+        mode: CapacityMode,
+    ) -> Vec<CapacitySurfaceReport> {
+        let mut out = Vec::with_capacity(2);
+        if let Some(req) =
+            self.request_capacity_report(format!("{prefix}.body.request"), mode.clone())
+        {
+            out.push(req);
+        }
+        if let Some(resp) = self.response_capacity_report(format!("{prefix}.body.response"), mode) {
+            out.push(resp);
+        }
+        out
+    }
+
+    /// Same as [`Self::capacity_surfaces`] but wrapped as
+    /// [`tina_runtime::ServicePressureSurface`] entries so they slot into a
+    /// service pressure report with one builder call.
+    ///
+    /// When the underlying [`BodyMetrics`] was built without a body weight
+    /// cap both surfaces are emitted as
+    /// [`tina_runtime::ServiceSurfaceState::Unavailable`] with a typed
+    /// reason rather than silently omitted, matching the rule that missing
+    /// surfaces must be declared explicitly.
+    pub fn service_surfaces(
+        &self,
+        prefix: &str,
+        kind: tina_runtime::service_pressure::SurfaceKind,
+        mode: CapacityMode,
+    ) -> Vec<tina_runtime::ServicePressureSurface> {
+        use tina_runtime::ServicePressureSurface;
+        let mut out = Vec::with_capacity(2);
+        let req_name = format!("{prefix}.body.request");
+        match self.request_capacity_report(req_name.clone(), mode.clone()) {
+            Some(report) => out.push(ServicePressureSurface::measured(req_name, kind, report)),
+            None => out.push(ServicePressureSurface::unavailable(
+                req_name,
+                kind,
+                "no body weight cap configured",
+            )),
+        }
+        let resp_name = format!("{prefix}.body.response");
+        match self.response_capacity_report(resp_name.clone(), mode) {
+            Some(report) => out.push(ServicePressureSurface::measured(resp_name, kind, report)),
+            None => out.push(ServicePressureSurface::unavailable(
+                resp_name,
+                kind,
+                "no body weight cap configured",
+            )),
+        }
+        out
+    }
 }
 
 #[cfg(test)]

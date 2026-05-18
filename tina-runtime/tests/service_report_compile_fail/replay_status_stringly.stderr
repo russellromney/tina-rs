@@ -1,0 +1,13 @@
+error[E0308]: mismatched types
+  --> tests/service_report_compile_fail/replay_status_stringly.rs:10:66
+   |
+10 |     let _ = ServiceReportBuilder::new("billing").unwrap().replay("available");
+   |                                                           ------ ^^^^^^^^^^^ expected `ServiceReplayStatus`, found `&str`
+   |                                                           |
+   |                                                           arguments to this method are incorrect
+   |
+note: method defined here
+  --> src/service_report.rs
+   |
+   |     pub fn replay(mut self, replay: ServiceReplayStatus) -> Self {
+   |            ^^^^^^

@@ -4,6 +4,44 @@ This file records completed work.
 
 ## Unreleased
 
+### Phase 111 Service Product Surface
+
+- Added `tina_runtime::service_report::ServiceReport`, built only
+  through `tina_runtime::service_report::ServiceReportBuilder`. The
+  report threads lifecycle, readiness, health, topology, pressure,
+  optional shutdown, and replay status into one validated product
+  surface. `ServiceReport` fields are private; struct-literal
+  construction outside the module is a compile-time rail rejection.
+- Added `tina_runtime::service_pressure::ServicePressureBuilder` for
+  one copied pressure aggregation path. The builder validates the
+  service name once and every surface name on insertion. Duplicates,
+  empty names, and names with whitespace/control characters return
+  typed `ServiceReportBuildError` variants.
+- Added `ServiceReplayStatus`: a typed enum (`Available { case_name,
+  projected_events }`, `Unsupported { facts }`, `NotCaptured
+  { reason }`). Replay status cannot be supplied as a free-text label;
+  the compile-time rail rejects that path.
+- Added shutdown summary adapters on the report builder:
+  `ServiceReportBuilder::shutdown_choreography(choreography)` and
+  `ServiceReportBuilder::resource_close_report(label, close)`. The
+  report exposes `shutdown_summary_line()`; missing shutdown is named
+  explicitly as `state=not_recorded` rather than implied.
+- Added `BodyPressureReport::capacity_surfaces(prefix, mode)` and
+  `BodyPressureReport::service_surfaces(prefix, kind, mode)` on
+  `tina-http`. Body surfaces without a configured weight cap appear as
+  explicit `Unavailable` entries rather than silent omissions.
+- Added the `compile_fail` integration test in `tina-runtime/tests/`
+  with four pinned negative fixtures: struct-literal construction of
+  `ServiceReport`, `ServiceReportBuilder`, and `ServicePressureBuilder`,
+  plus a stringly-typed `replay(&str)` call.
+- Migrated the four canonical system specimens to the new surface:
+  `mini_saas_api`, `system_soak_http_db`, `system_api_gateway_limits`,
+  and `system_metrics_shipper`. Each system builds its `service_report`
+  through `ServiceReportBuilder`, asserts at least one report line in
+  its smoke test, and names explicit `Unavailable` surfaces for the
+  bridges it samples live. The non-HTTP shipper prints the same
+  vocabulary as the HTTP services.
+
 ### Phase 109 Typed Config And Protocol-State Safety
 
 - Added the first split event/request service rail. The

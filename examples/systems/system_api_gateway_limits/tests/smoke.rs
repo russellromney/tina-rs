@@ -119,6 +119,32 @@ fn owner_stop_releases_charges_when_isolate_is_torn_down_mid_flight() {
     );
 }
 
+// Phase 111: typed ServiceReport names every component, names the
+// unavailable outbound pool surface, and exposes the full surface.
+#[test]
+fn gateway_service_report_names_full_and_unavailable() {
+    let config = RunConfig {
+        upload_callers: 5,
+        list_callers: 0,
+        ..RunConfig::default()
+    };
+    let report = run(config).expect("gateway run");
+    let svc = &report.service_report;
+    let summary = svc.summary_line();
+    assert!(summary.contains("service=system_api_gateway_limits"), "{summary}");
+    assert!(summary.contains("unavailable=1"), "{summary}");
+    let lines = svc.discovery_lines();
+    assert!(
+        lines.iter().any(|l| l.contains("gateway.outbound.pool")
+            && l.contains("state=unavailable")),
+        "discovery_lines should explicitly name unavailable pool: {lines:#?}"
+    );
+    // The pressure builder picked up the shared scope. Any-full
+    // must reflect the post-run scope full_count.
+    let pressure = svc.pressure();
+    assert!(pressure.any_full(), "scope should record at least one Full");
+}
+
 #[test]
 fn pure_upload_burst_fills_only_upload_lane_then_drains() {
     // No list callers; uploads alone should fill the shared scope

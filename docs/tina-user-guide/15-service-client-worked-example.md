@@ -190,3 +190,23 @@ cargo run --manifest-path examples/systems/mini_saas_api/Cargo.toml -- pressure
 
 The system README contains the route table, capacity table, readiness meanings,
 shutdown order, and out-of-scope list.
+
+## The service product surface
+
+After Phase 111, `RunReport::service_report` is a typed
+[`ServiceReport`](../tina_runtime/service_report/struct.ServiceReport.html)
+built through the validating `ServiceReportBuilder`. The same report
+shape works for HTTP services like `mini_saas_api`, non-HTTP services
+like `system_metrics_shipper`, and shared-scope services like
+`system_api_gateway_limits`.
+
+To see the report from a smoke run:
+
+```sh
+cargo test --manifest-path examples/systems/mini_saas_api/Cargo.toml \
+    --test smoke smoke_service_report_threads_every_component -- --nocapture
+```
+
+Copied code uses **builders** for the report, not direct struct
+literals — the fields are private and the rail will not let a caller
+skip lifecycle/readiness/health/topology/pressure.

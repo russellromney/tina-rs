@@ -33,7 +33,9 @@ Read in order if new:
 7. [Supervision](07-supervision.md)
 8. [Simulation And DST](08-simulation-and-dst.md)
 9. [Tokio To Tina Porting](09-tokio-to-tina-porting.md)
-10. [Service Patterns](10-service-patterns.md)
+10. [Service Patterns](10-service-patterns.md) — includes the Phase 111
+    service product surface (`ServiceReport`, `ServicePressureBuilder`,
+    replay status, service-local, no global registry).
 11. [Ergonomics Checklist](11-ergonomics-checklist.md)
 12. [I/O Model](12-io-model.md)
 13. [Outcome Glossary](13-outcome-glossary.md)

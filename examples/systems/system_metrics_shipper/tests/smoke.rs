@@ -169,3 +169,58 @@ fn metrics_shipper_tick_token_invalidates_stale_timers() {
         "every batch on the wire must be counted by exactly one trigger",
     );
 }
+
+// Phase 111: typed ServiceReport must thread lifecycle/health/topology/
+// pressure/shutdown into one validated report. Shutdown choreography
+// must survive in the typed report after stop, including the explicit
+// `Unavailable` line for the flush gate that is sampled live.
+#[test]
+fn shipper_service_report_threads_every_component_and_shutdown() {
+    let config = RunConfig {
+        events: 32,
+        callers: 4,
+        buffer_capacity: 8,
+        batch_size: 4,
+        batch_window_ms: 20,
+        shipper_mailbox: 4,
+        sink_mailbox: 4,
+        call_timeout_ms: 2_000,
+        flush_timeout_ms: 1_000,
+        stop_timeout_ms: 2_000,
+        sink_fail_every: 0,
+        sink_flush_delay_ms: 0,
+    };
+    let report = run(config).expect("run succeeds");
+    let svc = &report.shutdown.service_report;
+
+    let summary = svc.summary_line();
+    assert!(summary.contains("service=system_metrics_shipper"), "{summary}");
+    assert!(summary.contains("lifecycle=stopped"), "{summary}");
+    assert!(summary.contains("shutdown=clean:true"), "{summary}");
+
+    let lines = svc.discovery_lines();
+    assert!(
+        lines.iter().any(|l| l.contains("shipper") && l.contains("kind=isolate")),
+        "discovery_lines missing shipper isolate: {lines:#?}"
+    );
+    assert!(
+        lines.iter().any(|l| l.contains("sink") && l.contains("kind=isolate")),
+        "discovery_lines missing sink isolate: {lines:#?}"
+    );
+    assert!(
+        lines.iter().any(|l| l.contains("flush_tick") && l.contains("kind=timer")),
+        "discovery_lines missing flush_tick timer: {lines:#?}"
+    );
+
+    // Shutdown summary survives: the typed ServiceShutdownReport in
+    // ShutdownReport::shutdown_choreography and the one folded into
+    // service_report carry the same step count.
+    let shutdown_line = svc.shutdown_summary_line();
+    assert!(shutdown_line.contains("clean=true"), "{shutdown_line}");
+    let steps_in_typed = report.shutdown.shutdown_choreography.steps.len();
+    let fragment = format!("steps={steps_in_typed}");
+    assert!(
+        shutdown_line.contains(&fragment),
+        "shutdown step count {steps_in_typed} should appear in service report: {shutdown_line}"
+    );
+}

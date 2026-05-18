@@ -1,0 +1,11 @@
+error[E0451]: fields `service`, `surfaces` and `seen` of struct `ServicePressureBuilder` are private
+  --> tests/service_report_compile_fail/service_pressure_builder_struct_literal.rs:13:9
+   |
+12 |     let _ = ServicePressureBuilder {
+   |             ---------------------- in this type
+13 |         service: "bad name".into(),
+   |         ^^^^^^^ private field
+14 |         surfaces: Vec::new(),
+   |         ^^^^^^^^ private field
+15 |         seen: Vec::new(),
+   |         ^^^^ private field

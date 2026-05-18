@@ -270,3 +270,37 @@ Suggested follow-up:
 
 Verdict:
 - keep
+
+## Service product surface (Phase 111)
+
+`RunReport::service_report` is the typed
+[`ServiceReport`](../../../tina-runtime/src/service_report.rs) built
+through `ServiceReportBuilder`. It threads lifecycle, readiness, health,
+topology, pressure, the typed `ServiceShutdownReport`, and the replay
+status into one validated report.
+
+The summary line shape (pinned by `smoke_service_report_lines_match_readme`):
+
+```text
+service=mini_saas_api lifecycle=stopped ready=false health=stopped
+ pressure=1 surfaces_full=false unavailable=0
+ shutdown=clean:true replay=available
+```
+
+The shutdown summary line (pinned by `smoke_service_report_threads_every_component`):
+
+```text
+shutdown service=mini_saas_api clean=true steps=7 closes=4
+ elapsed_us=<n> violations=0 timeouts=0 failures=0
+```
+
+Run it:
+
+```sh
+cargo test --manifest-path examples/systems/mini_saas_api/Cargo.toml \
+    --test smoke smoke_service_report_threads_every_component -- --nocapture
+```
+
+Pressure surfaces sampled live (the sqlite bridge in-flight, the
+outbound bridge in-flight) appear as **explicit `Unavailable` lines**
+in the startup pressure surface set, not silent omissions.

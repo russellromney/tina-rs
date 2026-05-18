@@ -311,11 +311,59 @@ pub fn run(mode: RunMode) -> anyhow::Result<RunReport> {
         && outbound_shutdown.already_closed == 0
         && outbound_shutdown.connection_failures.is_empty()
         && shutdown_report.clean;
-    report.shutdown_report = Some(shutdown_report);
-    report.health_pre_shutdown = Some(
-        Health::new("mini_saas_api", Lifecycle::Stopped)
-            .with_pressure(build_pressure_snapshot(&db_pressure)),
+    report.shutdown_report = Some(shutdown_report.clone());
+    let health_at_shutdown = Health::new("mini_saas_api", Lifecycle::Stopped)
+        .with_pressure(build_pressure_snapshot(&db_pressure));
+    report.health_pre_shutdown = Some(health_at_shutdown.clone());
+
+    // Phase 111 service product surface. Threads the typed pieces above
+    // into one validated report via `ServiceReportBuilder`. The pressure
+    // surfaces are the post-run live pressure for the bridge plus the
+    // startup-time topology surfaces (controller mailbox, listeners,
+    // pools, body cap, outbound bridge sampled-live unavailable line).
+    // Readiness reflects the terminal state: ingress is stopped, the
+    // wire body for /ready would say `not_ready reasons=ingress_stopped`.
+    let live_pressure = build_pressure_snapshot(&db_pressure);
+    let readiness_at_stop = tina_runtime::lifecycle::Readiness::not_ready(
+        Lifecycle::Stopped,
+        vec![tina_runtime::lifecycle::ReadinessReason::IngressStopped],
     );
+    // Use the startup topology if we have one; otherwise fall back to a
+    // small Lifecycle::Stopped topology so the report still names the
+    // service. The startup topology was attached earlier by `run`.
+    let topology_for_report = report
+        .topology
+        .clone()
+        .unwrap_or_else(|| ServiceTopology::new("mini_saas_api", Lifecycle::Stopped));
+    // Replay status: this system's live-replay fact is the
+    // `report.live_replay_fact` line. When present (a session captured a
+    // typed live fact) say `Available`; otherwise mark `NotCaptured` so
+    // the report explicitly names the absence rather than implying
+    // replay support.
+    let replay_status = if report.live_replay_fact.is_empty() {
+        tina_runtime::service_report::ServiceReplayStatus::not_captured(
+            "no live-replay session this run",
+        )
+    } else {
+        tina_runtime::service_report::ServiceReplayStatus::available(
+            "mini_saas_api.live_replay",
+            1,
+        )
+    };
+    let service_report = tina_runtime::service_report::ServiceReportBuilder::new(
+        "mini_saas_api",
+    )
+    .expect("validated service name")
+    .lifecycle(Lifecycle::Stopped)
+    .readiness(readiness_at_stop)
+    .health(health_at_shutdown)
+    .topology(topology_for_report)
+    .pressure(live_pressure)
+    .shutdown(shutdown_report)
+    .replay(replay_status)
+    .finish()
+    .expect("service report builder finish");
+    report.service_report = Some(service_report);
     lifecycle_transitions.push(Lifecycle::Stopped);
     report.lifecycle_transitions = lifecycle_transitions;
     report.multi_turn_notify = report.notified_item && deferred_replies >= 3;
@@ -1486,26 +1534,35 @@ fn pool_shutdown_to_close_report(
 }
 
 /// Build a small pressure snapshot for the typed [`Health`] report.
+///
 /// The wire format used by `/debug/capacity` and the terminal line stays
 /// the source of truth for live numbers; the typed pressure snapshot is
 /// the structured copy for callers that want to match on fields.
+///
+/// Uses the Phase 111
+/// [`tina_runtime::service_pressure::ServicePressureBuilder`] so the
+/// service name is validated once and duplicate/invalid surface names
+/// cannot enter the report.
 fn build_pressure_snapshot(db: &SqlitePressureReport) -> tina_runtime::ServicePressureReport {
     use tina::capacity::{CapacityMode, CapacitySurfaceReport};
-    use tina_runtime::ServicePressureReport;
+    use tina_runtime::service_pressure::ServicePressureBuilder;
 
-    let mut report = ServicePressureReport::new("mini_saas_api");
-    report.add_measured(
-        "bridge",
-        CapacitySurfaceReport::count(
-            "db.bridge.capacity",
-            CapacityMode::Fixed,
-            db.capacity,
-            db.leased,
-            db.high_water as usize,
-            db.full_count,
-        ),
-    );
-    report
+    ServicePressureBuilder::new("mini_saas_api")
+        .expect("validated service name")
+        .surface(
+            "bridge",
+            CapacitySurfaceReport::count(
+                "db.bridge.capacity",
+                CapacityMode::Fixed,
+                db.capacity,
+                db.leased,
+                db.high_water as usize,
+                db.full_count,
+            ),
+        )
+        .expect("validated surface name")
+        .finish()
+        .expect("builder produces a valid report")
 }
 
 fn build_startup_summary(
@@ -1513,7 +1570,6 @@ fn build_startup_summary(
     notify_addr: std::net::SocketAddr,
 ) -> StartupSummary {
     use tina::capacity::{CapacityMode, CapacitySurfaceReport};
-    use tina_runtime::ServicePressureReport;
 
     // Surfaces declared at startup. We do not sample live counters
     // here — that happens later via `/debug/capacity`. The startup
@@ -1552,27 +1608,41 @@ fn build_startup_summary(
         0,
         0,
     );
-    let mut report = ServicePressureReport::new("mini_saas_api");
-    report.add_measured("body", body_cap);
-    report.add_measured("mailbox", controller_mailbox);
-    report.add_measured("pool", db_pool);
-    report.add_measured("pool", outbound_pool);
-    report.add_measured("listener", main_listener);
-    // The sqlite bridge measures its own pressure but the bridge is
-    // sampled live; at startup the count cap is the only fact we own
-    // here. The other live counters are reported via `/debug/capacity`
-    // and `terminal_line`. Name them so on-call sees "we plan to
-    // measure this".
-    report.add_unavailable(
-        "db.bridge_in_flight",
-        "bridge",
-        "sampled live via SqliteMetricsHandle",
-    );
-    report.add_unavailable(
-        "outbound.bridge_in_flight",
-        "bridge",
-        "sampled live via WorkerPool reports",
-    );
+    // Phase 111 builder path. Each surface name is validated and
+    // duplicates are rejected loudly; "missing surface" is an explicit
+    // `Unavailable` entry, never silently omitted.
+    use tina_runtime::service_pressure::ServicePressureBuilder;
+    let report = ServicePressureBuilder::new("mini_saas_api")
+        .expect("validated service name")
+        .surface("body", body_cap)
+        .expect("body surface inserts")
+        .surface("mailbox", controller_mailbox)
+        .expect("mailbox surface inserts")
+        .surface("pool", db_pool)
+        .expect("db pool surface inserts")
+        .surface("pool", outbound_pool)
+        .expect("outbound pool surface inserts")
+        .surface("listener", main_listener)
+        .expect("listener surface inserts")
+        // The sqlite bridge measures its own pressure but the bridge is
+        // sampled live; at startup the count cap is the only fact we own
+        // here. The other live counters are reported via `/debug/capacity`
+        // and `terminal_line`. Name them so on-call sees "we plan to
+        // measure this" rather than silent omission.
+        .unavailable(
+            "db.bridge_in_flight",
+            "bridge",
+            "sampled live via SqliteMetricsHandle",
+        )
+        .expect("db bridge unavailable inserts")
+        .unavailable(
+            "outbound.bridge_in_flight",
+            "bridge",
+            "sampled live via WorkerPool reports",
+        )
+        .expect("outbound bridge unavailable inserts")
+        .finish()
+        .expect("builder finish");
 
     let topology_line =
         format!("topology service=mini_saas_api main_addr={main_addr} notify_addr={notify_addr}");

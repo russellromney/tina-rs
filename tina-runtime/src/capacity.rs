@@ -54,7 +54,7 @@ impl std::error::Error for CapacityNameError {}
 /// whitespace/control characters. Surface names appear unquoted
 /// after `surface=` in the discovery line, so anything that breaks
 /// `key=value` parsing is rejected at the boundary.
-fn name_is_valid(name: &str) -> bool {
+pub(crate) fn name_is_valid(name: &str) -> bool {
     !name.is_empty() && !name.chars().any(|c| c.is_whitespace() || c.is_control())
 }
 

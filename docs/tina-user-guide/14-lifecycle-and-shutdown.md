@@ -382,3 +382,39 @@ preempted?
 Answer honestly. Today Betelgeuse provides the portable live I/O substrate.
 Some backend work may be started and later complete; Tina owns the visible
 timeout, cancellation, tombstone, and shutdown accounting around it.
+
+## Folding shutdown into the service product surface
+
+The typed `ServiceShutdownReport` produced by `ShutdownChoreography`
+folds directly into the Phase 111
+[`ServiceReportBuilder`](../tina_runtime/service_report). After your
+service stops, hand the report to the builder so the terminal product
+surface includes the shutdown summary line:
+
+```rust
+let shutdown_report = choreo.finish();
+let report = ServiceReportBuilder::new("mini_saas_api")?
+    .lifecycle(Lifecycle::Stopped)
+    .readiness(Readiness::not_ready(
+        Lifecycle::Stopped,
+        vec![ReadinessReason::IngressStopped],
+    ))
+    .health(Health::new("mini_saas_api", Lifecycle::Stopped))
+    .topology(startup_topology)
+    .pressure(live_pressure)
+    .shutdown(shutdown_report)
+    .replay(replay_status)
+    .finish()?;
+
+assert!(report.shutdown_summary_line().contains("clean=true"));
+```
+
+If you have not folded a shutdown in yet, `shutdown_summary_line()`
+returns `shutdown service=<svc> state=not_recorded`. The "not recorded"
+state is explicit, not implied — a missing shutdown is visible the same
+way a missing surface is.
+
+The builder also exposes `resource_close_report(label, close)` for the
+service that wants to fold a single `ResourceCloseReport` without
+constructing the full choreography up front. It opens a fresh
+choreography for the service, records the close, and finishes it.

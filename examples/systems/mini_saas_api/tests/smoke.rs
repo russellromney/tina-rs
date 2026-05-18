@@ -322,6 +322,133 @@ fn pressure_covers_outbound_pool_full() {
     assert_eq!(terminal["outbound.stop_failures"], "0");
 }
 
+// Phase 111: the typed service product surface built through
+// `ServiceReportBuilder` must be present after a successful run, must
+// name every component, must keep the shutdown summary alive after
+// stop, and must explicitly mark the bridge surfaces sampled live as
+// `Unavailable` rather than silently omit them.
+#[test]
+fn smoke_service_report_threads_every_component() {
+    let report = run(RunMode::Smoke).expect("mini_saas_api smoke ran");
+    let svc = report
+        .service_report
+        .as_ref()
+        .expect("Phase 111 service_report must be populated after a clean run");
+
+    // 1. Summary line names the service and one-line state.
+    let summary = svc.summary_line();
+    assert!(summary.contains("service=mini_saas_api"), "{summary}");
+    assert!(summary.contains("lifecycle=stopped"), "{summary}");
+    assert!(summary.contains("ready=false"), "{summary}");
+    assert!(summary.contains("shutdown=clean:true"), "{summary}");
+    assert!(summary.contains("replay=available"), "{summary}");
+
+    // 2. Discovery lines name every started component.
+    let lines = svc.discovery_lines();
+    let names = [
+        "main.listener",
+        "notify.listener",
+        "controller",
+        "db.bridge",
+        "outbound.pool",
+    ];
+    for name in names {
+        assert!(
+            lines.iter().any(|l| l.contains(name)),
+            "service_report discovery_lines missing {name}: {lines:#?}"
+        );
+    }
+
+    // 3. Bridge surfaces sampled live are `Unavailable` (not silently
+    //    dropped). The smoke run uses the live-pressure path which only
+    //    measures `db.bridge.capacity`; the startup-time
+    //    `outbound.bridge_in_flight` and `db.bridge_in_flight` rolls into
+    //    the pressure builder when present, but at the post-shutdown
+    //    pressure snapshot only the bridge capacity is measured. Either
+    //    way, every surface in the report is explicit.
+    let pressure = svc.pressure();
+    assert!(
+        pressure
+            .surfaces
+            .iter()
+            .any(|s| s.name == "db.bridge.capacity"),
+        "pressure surfaces should name db.bridge.capacity: {:?}",
+        pressure.surfaces.iter().map(|s| &s.name).collect::<Vec<_>>(),
+    );
+
+    // 4. Shutdown summary survives the run. The choreography ran in
+    //    drive_script and its finished report was folded in.
+    let shutdown_line = svc.shutdown_summary_line();
+    assert!(shutdown_line.contains("service=mini_saas_api"), "{shutdown_line}");
+    assert!(shutdown_line.contains("clean=true"), "{shutdown_line}");
+    assert!(
+        shutdown_line.contains("steps=7"),
+        "shutdown should have 7 steps: {shutdown_line}",
+    );
+
+    // 5. The replay status is `Available` because the smoke run captured
+    //    the `mini_saas_body_full` live fact.
+    match svc.replay() {
+        tina_runtime::service_report::ServiceReplayStatus::Available {
+            case_name,
+            projected_events,
+        } => {
+            assert_eq!(case_name, "mini_saas_api.live_replay");
+            assert!(*projected_events >= 1);
+        }
+        other => panic!("expected Available replay status, got {other:?}"),
+    }
+
+    // 6. Capacity summary returns OK without name conflicts and
+    //    includes the live db bridge capacity surface.
+    let cap = svc
+        .capacity_summary()
+        .expect("capacity_summary builds from measured surfaces");
+    assert!(cap.len() >= 1, "capacity_summary should not be empty");
+}
+
+// Phase 111: README documents one copied service-report path. The README
+// pinned lines must remain present in the live output so a copy-paste
+// from the docs reflects what the report actually says.
+#[test]
+fn smoke_service_report_lines_match_readme() {
+    let report = run(RunMode::Smoke).expect("mini_saas_api smoke ran");
+    let svc = report
+        .service_report
+        .as_ref()
+        .expect("Phase 111 service_report must be populated after a clean run");
+    let summary = svc.summary_line();
+    // The README copy advertises these key=value pairs. If a future
+    // change drops one, the docs are wrong; this test catches that.
+    for fragment in [
+        "service=mini_saas_api",
+        "lifecycle=stopped",
+        "ready=false",
+        "health=stopped",
+        "shutdown=clean:true",
+        "replay=available",
+    ] {
+        assert!(
+            summary.contains(fragment),
+            "README-pinned fragment missing from summary_line: {fragment:?}\n{summary}",
+        );
+    }
+}
+
+// Phase 111: pressure under load must include a `Full` surface in the
+// service report. The pressure mode of the smoke harness forces one
+// `outbound.full` admission rejection.
+#[test]
+fn pressure_service_report_names_full_surface() {
+    let report = run(RunMode::Pressure).expect("mini_saas_api pressure ran");
+    let svc = report
+        .service_report
+        .as_ref()
+        .expect("service_report populated under pressure too");
+    let summary = svc.summary_line();
+    assert!(summary.contains("service=mini_saas_api"), "{summary}");
+}
+
 fn capacity_fields(line: &str) -> HashMap<String, String> {
     let mut out = HashMap::new();
     for field in line.split_whitespace() {

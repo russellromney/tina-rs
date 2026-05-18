@@ -201,3 +201,31 @@ make proof-replay-regression  # saved-seed sim regression
 If a specimen would otherwise hand-roll a slow-reader / RST /
 malformed-HTTP driver, reach for `tina-proof-harness` instead. The
 typed outcome is part of what makes "the bug reproduces" cheap.
+
+## Service product surface (Phase 111)
+
+Every system here now carries a typed
+[`ServiceReport`](../../tina-runtime/src/service_report.rs) built through
+the validating `ServiceReportBuilder`. The report threads lifecycle,
+readiness, health, topology, pressure, optional shutdown, and replay
+status into one summary line and one set of discovery lines.
+
+Cheap-model copied commands:
+
+```sh
+# mini_saas_api: the HTTP product surface
+cargo test --manifest-path mini_saas_api/Cargo.toml --test smoke
+
+# system_soak_http_db: shared scope + bounded event sink
+cargo test --manifest-path system_soak_http_db/Cargo.toml --test smoke
+
+# system_api_gateway_limits: weighted shared cap
+cargo test --manifest-path system_api_gateway_limits/Cargo.toml --test smoke
+
+# system_metrics_shipper: non-HTTP service with the same shape
+cargo test --manifest-path system_metrics_shipper/Cargo.toml --test smoke
+```
+
+Each smoke test asserts at least one line of the typed report and at
+least one explicit `Unavailable` surface — silent omission is the bug
+the rail prevents.

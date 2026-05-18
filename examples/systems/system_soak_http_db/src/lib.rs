@@ -25,11 +25,13 @@ use std::time::{Duration, Instant};
 
 use tina::capacity::CapacityMode;
 use tina::{CallContext, prelude::*};
+use tina_runtime::lifecycle::{Health, Lifecycle, Readiness, ServiceTopology, TopologyComponent};
+use tina_runtime::service_pressure::ServicePressureBuilder;
+use tina_runtime::service_report::{ServiceReplayStatus, ServiceReport, ServiceReportBuilder};
 use tina_runtime::{
     BoundedEventSink, CallOutcome, CapacitySummary, DefaultThreadedMailboxFactory, DropPolicy,
-    PendingReplies, ServiceHandle, ServicePressureReport, ServicePressureSurface,
-    SharedCapacityScope, SharedLease, SharedScopeFull, SleepReply, ThreadedRuntime,
-    format_assertion_failure, sleep,
+    PendingReplies, ServiceHandle, SharedCapacityScope, SharedLease, SharedScopeFull, SleepReply,
+    ThreadedRuntime, format_assertion_failure, sleep,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -77,6 +79,11 @@ pub struct RunReport {
     pub discovery_lines: Vec<String>,
     pub service_summary_line: String,
     pub copyable_assertion_failures: Vec<String>,
+    /// Phase 111 service product surface built through
+    /// [`tina_runtime::service_report::ServiceReportBuilder`]. Threads the
+    /// soak's pressure surfaces, lifecycle (`Stopped` at run end), and the
+    /// "no outbound pool installed" unavailable line through one report.
+    pub service_report: ServiceReport,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -378,28 +385,26 @@ pub fn run(config: RunConfig) -> anyhow::Result<RunReport> {
         }
     }
 
-    // Aggregate everything into a ServicePressureReport (Rock 1).
-    let mut summary = ServicePressureReport::new("soak_http_db");
-    summary.add_surface(ServicePressureSurface::measured(
-        "soak.http.in_flight",
-        "scope",
-        http_scope.surface_report(CapacityMode::Fixed),
-    ));
-    summary.add_surface(ServicePressureSurface::measured(
-        "soak.db.in_flight",
-        "scope",
-        db_scope.surface_report(CapacityMode::Fixed),
-    ));
-    summary.add_surface(ServicePressureSurface::measured(
-        "soak.slow_requests",
-        "events",
-        events.surface_report(CapacityMode::Fixed),
-    ));
-    summary.add_unavailable(
-        "soak.outbound.pool",
-        "pool_waiters",
-        "no outbound pool installed in this soak",
-    );
+    // Aggregate everything into a ServicePressureReport through the
+    // Phase 111 builder. Surface names validate at insertion; the
+    // "no outbound pool installed" surface stays explicit instead of
+    // silently omitted.
+    let summary = ServicePressureBuilder::new("soak_http_db")
+        .expect("validated service name")
+        .surface("scope", http_scope.surface_report(CapacityMode::Fixed))
+        .expect("http scope surface")
+        .surface("scope", db_scope.surface_report(CapacityMode::Fixed))
+        .expect("db scope surface")
+        .surface("events", events.surface_report(CapacityMode::Fixed))
+        .expect("events surface")
+        .unavailable(
+            "soak.outbound.pool",
+            "pool_waiters",
+            "no outbound pool installed in this soak",
+        )
+        .expect("unavailable surface")
+        .finish()
+        .expect("builder finish");
 
     let mut discovery_lines: Vec<String> = Vec::new();
     discovery_lines.push(http_scope.discovery_line());
@@ -422,6 +427,41 @@ pub fn run(config: RunConfig) -> anyhow::Result<RunReport> {
     let event_snap = events.snapshot();
     let service_summary_line = summary.summary_line();
 
+    // Phase 111 service product surface. The soak runs once and then
+    // tears down; the lifecycle at the time the report is built is
+    // `Stopped`. Readiness reflects the stopped state. Topology names
+    // the soak controller and the pending-replies registry. Replay
+    // status is `NotCaptured` — this soak does not enable live
+    // capture.
+    let mut topology = ServiceTopology::new("soak_http_db", Lifecycle::Stopped);
+    topology
+        .push_component(TopologyComponent::new(
+            "soak.controller",
+            "isolate",
+            "",
+        ))
+        .push_component(TopologyComponent::new(
+            "soak.pending_replies",
+            "pending_replies",
+            "",
+        ));
+    let health = Health::new("soak_http_db", Lifecycle::Stopped).with_pressure(summary.clone());
+    let service_report = ServiceReportBuilder::new("soak_http_db")
+        .expect("validated service name")
+        .lifecycle(Lifecycle::Stopped)
+        .readiness(Readiness::not_ready(
+            Lifecycle::Stopped,
+            vec![tina_runtime::lifecycle::ReadinessReason::IngressStopped],
+        ))
+        .health(health)
+        .topology(topology)
+        .pressure(summary)
+        .replay(ServiceReplayStatus::not_captured(
+            "soak does not enable live capture",
+        ))
+        .finish()
+        .expect("service report builder finish");
+
     shutdown(runtime);
 
     let report = RunReport {
@@ -435,6 +475,7 @@ pub fn run(config: RunConfig) -> anyhow::Result<RunReport> {
         discovery_lines,
         service_summary_line,
         copyable_assertion_failures,
+        service_report,
     };
 
     // Echo lines to stdout so CI consumers see them.

@@ -76,6 +76,7 @@ pub mod pool;
 pub mod pressure;
 pub mod scope;
 pub mod service_pressure;
+pub mod service_report;
 pub mod sharded;
 pub mod shared_scope;
 mod shutdown;
@@ -293,7 +294,12 @@ pub use scope::{
     ScopeRegisterError, ScopeRegisterSharedError, ScopedAdmitError, ScopedCallHandle,
     ScopedReplyError, scope_register,
 };
-pub use service_pressure::{ServicePressureReport, ServicePressureSurface, ServiceSurfaceState};
+pub use service_pressure::{
+    ServicePressureBuilder, ServicePressureReport, ServicePressureSurface, ServiceSurfaceState,
+};
+pub use service_report::{
+    ServiceReplayStatus, ServiceReport, ServiceReportBuildError, ServiceReportBuilder,
+};
 pub use shared_scope::{SharedCapacityScope, SharedLease, SharedScopeFull, SharedScopeReport};
 pub use tcp_loops::{LoopStep, ReadExactStep, TcpReadExact, TcpReadToEof, TcpWriteAll};
 /// Declares a Tina isolate whose call channel defaults to [`RuntimeCall<Message>`](RuntimeCall).

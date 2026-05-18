@@ -10,6 +10,7 @@ use std::net::{SocketAddr, TcpStream};
 use std::time::Duration;
 
 use tina_runtime::lifecycle::{Health, Lifecycle, ServiceShutdownReport, ServiceTopology};
+use tina_runtime::service_report::ServiceReport;
 
 pub mod tina_impl;
 
@@ -35,6 +36,14 @@ pub struct RunReport {
     /// [`tina_runtime::lifecycle::ServiceShutdownReport::clean`] flag is
     /// the typed counterpart to the existing `shutdown_clean` boolean.
     pub shutdown_report: Option<ServiceShutdownReport>,
+    /// Service product surface built through the Phase 111
+    /// [`tina_runtime::service_report::ServiceReportBuilder`]. Threads
+    /// lifecycle, readiness, health, topology, pressure, shutdown, and the
+    /// replay-fact status into one report. `None` only if the run never
+    /// reached the assembly point (a startup-time anyhow error before
+    /// shutdown). Smoke tests assert the typed report names every
+    /// component, the pressure surfaces, and the shutdown summary.
+    pub service_report: Option<ServiceReport>,
     /// Lifecycle states the service was observed in, in order. The
     /// canonical sequence is
     /// `[Starting, Ready, Draining, Stopped]`. Built explicitly by the

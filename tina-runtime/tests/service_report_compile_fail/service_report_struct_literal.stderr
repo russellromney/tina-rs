@@ -1,0 +1,21 @@
+error[E0451]: fields `service`, `lifecycle`, `readiness`, `health`, `topology`, `pressure`, `shutdown` and `replay` of struct `ServiceReport` are private
+  --> tests/service_report_compile_fail/service_report_struct_literal.rs:15:9
+   |
+14 |     let _ = ServiceReport {
+   |             ------------- in this type
+15 |         service: "billing".into(),
+   |         ^^^^^^^ private field
+16 |         lifecycle: Lifecycle::Ready,
+   |         ^^^^^^^^^ private field
+17 |         readiness: Readiness::ready(),
+   |         ^^^^^^^^^ private field
+18 |         health: Health::new("billing", Lifecycle::Ready),
+   |         ^^^^^^ private field
+19 |         topology: ServiceTopology::new("billing", Lifecycle::Ready),
+   |         ^^^^^^^^ private field
+20 |         pressure: ServicePressureBuilder::new("billing").unwrap().finish().unwrap(),
+   |         ^^^^^^^^ private field
+21 |         shutdown: None,
+   |         ^^^^^^^^ private field
+22 |         replay: ServiceReplayStatus::not_captured("nope"),
+   |         ^^^^^^ private field

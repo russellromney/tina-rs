@@ -348,3 +348,27 @@ metrics lie
 ```
 
 When Tina fails badly, write it down. That is the work.
+
+## Reporting the truth: the service product surface
+
+Bounded surfaces only matter if a human (or an LLM) can find them.
+Phase 111 ships one boring shape:
+[`tina_runtime::service_report::ServiceReport`](../tina_runtime/service_report/struct.ServiceReport.html),
+built through `ServicePressureBuilder` and `ServiceReportBuilder`.
+
+The rules that protect honesty:
+
+- **Missing surfaces are declared, not omitted.** Use
+  `unavailable(name, kind, reason)` on the pressure builder when the
+  service knows a surface exists but cannot measure it from this scope.
+- **Pressure is not health.** The builder preserves whatever readiness
+  verdict the service decided. A historical `Full` does not poison
+  current readiness; a current `Full` does not silently flip ready to
+  false.
+- **Names are validated once.** Empty names, names with whitespace, or
+  duplicates return a typed `ServiceReportBuildError` at insertion. The
+  discovery output stays a parseable `key=value` sequence.
+
+If you are tempted to skip the builder and build a `ServiceReport` by
+struct literal, the compile-time rail rejects that path — the fields
+are private. That is the point.

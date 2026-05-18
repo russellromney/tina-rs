@@ -42,6 +42,9 @@
 use tina::capacity::CapacitySurfaceReport;
 
 use crate::capacity::{CapacityNameError, CapacitySummary, format_discovery_line};
+use crate::service_report::{
+    ServiceReportBuildError, validate_service_name, validate_surface_name,
+};
 
 /// Kind of bounded surface a service may report. Kinds are open
 /// strings rather than an enum so user code can add surfaces this
@@ -285,6 +288,285 @@ impl ServicePressureReport {
             ServiceSurfaceState::Measured(r) => r.ever_full(),
             _ => false,
         })
+    }
+}
+
+/// Builder for a [`ServicePressureReport`] that validates every surface name
+/// at insertion and rejects duplicates, bad names, and bad service names
+/// with typed [`ServiceReportBuildError`] variants.
+///
+/// The builder is the only validated path. The raw `ServicePressureReport`
+/// `add_*` constructors still exist for legacy specimens, but new code must
+/// go through this builder so the discovery output stays grep-friendly and
+/// CI tests cannot silently pick the wrong surface.
+///
+/// Fields are private. The builder cannot be constructed by struct literal;
+/// the only path is [`Self::new`], which validates the service name.
+///
+/// ```
+/// use tina_runtime::service_pressure::ServicePressureBuilder;
+/// use tina::capacity::{CapacityMode, CapacitySurfaceReport};
+///
+/// let report = ServicePressureBuilder::new("billing").unwrap()
+///     .surface(
+///         "mailbox",
+///         CapacitySurfaceReport::count(
+///             "billing.mailbox",
+///             CapacityMode::Fixed,
+///             32, 0, 1, 0,
+///         ),
+///     ).unwrap()
+///     .unavailable("billing.bridge", "bridge", "not registered").unwrap()
+///     .finish()
+///     .unwrap();
+///
+/// assert_eq!(report.len(), 2);
+/// assert!(report.summary_line().contains("service=billing"));
+/// ```
+#[derive(Debug, Clone)]
+pub struct ServicePressureBuilder {
+    service: String,
+    surfaces: Vec<ServicePressureSurface>,
+    seen: Vec<String>,
+}
+
+impl ServicePressureBuilder {
+    /// Begin a pressure builder for `service`. Rejects empty service names
+    /// or names with whitespace/control characters.
+    pub fn new(service: impl Into<String>) -> Result<Self, ServiceReportBuildError> {
+        let service = service.into();
+        validate_service_name(&service)?;
+        Ok(Self {
+            service,
+            surfaces: Vec::new(),
+            seen: Vec::new(),
+        })
+    }
+
+    /// Insert one measured surface from an existing [`CapacitySurfaceReport`].
+    /// The report's `name` is taken as the surface name and validated.
+    pub fn surface(
+        mut self,
+        kind: SurfaceKind,
+        report: CapacitySurfaceReport,
+    ) -> Result<Self, ServiceReportBuildError> {
+        validate_surface_name(&report.name, &self.seen)?;
+        let name = report.name.clone();
+        self.seen.push(name.clone());
+        self.surfaces
+            .push(ServicePressureSurface::measured(name, kind, report));
+        Ok(self)
+    }
+
+    /// Insert an explicit `Unavailable` surface with a typed reason. Missing
+    /// surfaces must be declared, never silently omitted.
+    pub fn unavailable(
+        mut self,
+        name: impl Into<String>,
+        kind: SurfaceKind,
+        reason: impl Into<String>,
+    ) -> Result<Self, ServiceReportBuildError> {
+        let name = name.into();
+        validate_surface_name(&name, &self.seen)?;
+        self.seen.push(name.clone());
+        self.surfaces
+            .push(ServicePressureSurface::unavailable(name, kind, reason));
+        Ok(self)
+    }
+
+    /// Fold every surface from another [`ServicePressureReport`] into this
+    /// builder, validating every surface name as if it had been inserted
+    /// through [`Self::surface`] / [`Self::unavailable`].
+    ///
+    /// Useful when one subsystem returns its own [`ServicePressureReport`]
+    /// (e.g. a bridge wrapper) and the assembling service wants every
+    /// surface in one report rather than printing two summaries.
+    pub fn merge(mut self, other: ServicePressureReport) -> Result<Self, ServiceReportBuildError> {
+        for surface in other.surfaces.into_iter() {
+            validate_surface_name(&surface.name, &self.seen)?;
+            self.seen.push(surface.name.clone());
+            self.surfaces.push(surface);
+        }
+        Ok(self)
+    }
+
+    /// Number of inserted surfaces so far.
+    pub fn len(&self) -> usize {
+        self.surfaces.len()
+    }
+
+    /// True iff no surfaces have been inserted.
+    pub fn is_empty(&self) -> bool {
+        self.surfaces.is_empty()
+    }
+
+    /// Service name this builder is assembling.
+    pub fn service(&self) -> &str {
+        &self.service
+    }
+
+    /// Finalize into a validated [`ServicePressureReport`].
+    pub fn finish(self) -> Result<ServicePressureReport, ServiceReportBuildError> {
+        Ok(ServicePressureReport {
+            service: self.service,
+            surfaces: self.surfaces,
+        })
+    }
+}
+
+#[cfg(test)]
+mod builder_tests {
+    use super::*;
+    use crate::service_report::ServiceReportBuildError;
+    use tina::capacity::{CapacityMode, CapacitySurfaceReport};
+
+    fn count(name: &str, max: usize, cur: usize, high: usize, full: u64) -> CapacitySurfaceReport {
+        CapacitySurfaceReport::count(name, CapacityMode::Fixed, max, cur, high, full)
+    }
+
+    #[test]
+    fn bad_service_name_rejected() {
+        let err = ServicePressureBuilder::new("svc with space").unwrap_err();
+        assert_eq!(err, ServiceReportBuildError::BadServiceName);
+        let err = ServicePressureBuilder::new("").unwrap_err();
+        assert_eq!(err, ServiceReportBuildError::BadServiceName);
+    }
+
+    #[test]
+    fn bad_surface_name_rejected() {
+        let b = ServicePressureBuilder::new("billing").unwrap();
+        let err = b
+            .surface("mailbox", count("bad name", 32, 0, 1, 0))
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ServiceReportBuildError::BadSurfaceName { ref name } if name == "bad name"
+        ));
+        let b = ServicePressureBuilder::new("billing").unwrap();
+        let err = b.unavailable("", "bridge", "stub").unwrap_err();
+        assert!(matches!(
+            err,
+            ServiceReportBuildError::BadSurfaceName { ref name } if name.is_empty()
+        ));
+    }
+
+    #[test]
+    fn duplicate_surface_rejected_loudly() {
+        let b = ServicePressureBuilder::new("billing")
+            .unwrap()
+            .surface("mailbox", count("billing.mailbox", 32, 0, 1, 0))
+            .unwrap();
+        let err = b
+            .surface("mailbox", count("billing.mailbox", 32, 0, 1, 0))
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ServiceReportBuildError::DuplicateSurface { ref name } if name == "billing.mailbox"
+        ));
+
+        // unavailable also rejects duplicates against measured surfaces
+        let b = ServicePressureBuilder::new("billing")
+            .unwrap()
+            .surface("mailbox", count("billing.mailbox", 32, 0, 1, 0))
+            .unwrap();
+        let err = b
+            .unavailable("billing.mailbox", "mailbox", "stub")
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ServiceReportBuildError::DuplicateSurface { ref name } if name == "billing.mailbox"
+        ));
+    }
+
+    #[test]
+    fn unavailable_surface_appears_in_summary_and_discovery() {
+        let report = ServicePressureBuilder::new("billing")
+            .unwrap()
+            .unavailable("billing.bridge", "bridge", "stub")
+            .unwrap()
+            .finish()
+            .unwrap();
+        assert!(report.summary_line().contains("billing.bridge=unavailable"));
+        let dr = report.discovery_report();
+        assert!(dr.contains("state=unavailable"));
+        assert!(dr.contains("reason=\"stub\""));
+    }
+
+    #[test]
+    fn full_surface_appears_in_assert_no_full() {
+        let report = ServicePressureBuilder::new("billing")
+            .unwrap()
+            .surface("mailbox", count("billing.mailbox", 4, 4, 4, 2))
+            .unwrap()
+            .finish()
+            .unwrap();
+        let summary = report.capacity_summary().unwrap();
+        let err = summary.surface("billing.mailbox").no_full().unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("billing.mailbox"), "{msg}");
+        assert!(msg.contains("Full"), "{msg}");
+    }
+
+    #[test]
+    fn builder_output_matches_direct_report_behavior() {
+        // Build the same report via legacy direct path and via the builder.
+        // The discovery output and summary line must match.
+        let measured = count("billing.mailbox", 32, 0, 1, 0);
+
+        let mut legacy = ServicePressureReport::new("billing");
+        legacy.add_measured("mailbox", measured.clone());
+        legacy.add_unavailable("billing.bridge", "bridge", "stub");
+
+        let built = ServicePressureBuilder::new("billing")
+            .unwrap()
+            .surface("mailbox", measured)
+            .unwrap()
+            .unavailable("billing.bridge", "bridge", "stub")
+            .unwrap()
+            .finish()
+            .unwrap();
+
+        assert_eq!(built.summary_line(), legacy.summary_line());
+        assert_eq!(built.discovery_report(), legacy.discovery_report());
+    }
+
+    #[test]
+    fn no_surface_disappears_when_one_is_unavailable() {
+        let report = ServicePressureBuilder::new("billing")
+            .unwrap()
+            .surface("mailbox", count("billing.mailbox", 32, 0, 1, 0))
+            .unwrap()
+            .unavailable("billing.bridge", "bridge", "stub")
+            .unwrap()
+            .surface("pool_waiters", count("billing.pool.waiters", 4, 0, 1, 0))
+            .unwrap()
+            .finish()
+            .unwrap();
+        assert_eq!(report.len(), 3);
+        let dr = report.discovery_report();
+        assert!(dr.contains("billing.mailbox"));
+        assert!(dr.contains("billing.bridge"));
+        assert!(dr.contains("billing.pool.waiters"));
+    }
+
+    #[test]
+    fn merge_validates_every_incoming_surface() {
+        let mut other = ServicePressureReport::new("billing");
+        other.add_measured("mailbox", count("billing.mailbox", 32, 0, 1, 0));
+        let b = ServicePressureBuilder::new("billing")
+            .unwrap()
+            .merge(other)
+            .unwrap();
+        assert_eq!(b.len(), 1);
+
+        // Merging a second report with a colliding name is rejected.
+        let mut dup = ServicePressureReport::new("billing");
+        dup.add_measured("mailbox", count("billing.mailbox", 32, 0, 1, 0));
+        let err = b.merge(dup).unwrap_err();
+        assert!(matches!(
+            err,
+            ServiceReportBuildError::DuplicateSurface { ref name } if name == "billing.mailbox"
+        ));
     }
 }
 

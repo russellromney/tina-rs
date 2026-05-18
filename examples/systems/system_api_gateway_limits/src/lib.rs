@@ -16,6 +16,11 @@ use std::thread;
 use std::time::Duration;
 
 use tina::{CallContext, prelude::*};
+use tina_runtime::lifecycle::{
+    Health, Lifecycle, Readiness, ReadinessReason, ServiceTopology, TopologyComponent,
+};
+use tina_runtime::service_pressure::ServicePressureBuilder;
+use tina_runtime::service_report::{ServiceReplayStatus, ServiceReport, ServiceReportBuilder};
 use tina_runtime::{
     CallOutcome, CapacitySummary, DefaultThreadedMailboxFactory, PendingReplies, ServiceHandle,
     SharedCapacityScope, SharedLease, SharedScopeFull, SleepReply, ThreadedRuntime,
@@ -72,6 +77,11 @@ pub struct RunReport {
     pub scope_high_water_at_drain: usize,
     pub discovery_lines: Vec<String>,
     pub summary_line: String,
+    /// Phase 111 service product surface. Threads the gateway's shared
+    /// capacity scope into a typed [`ServiceReport`] with lifecycle
+    /// `Stopped` (the run is one-shot), explicit pressure surfaces, and
+    /// an explicit `NotCaptured` replay status.
+    pub service_report: ServiceReport,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -370,6 +380,52 @@ pub fn run(config: RunConfig) -> anyhow::Result<RunReport> {
         snap.current,
     );
 
+    // Phase 111 service product surface.
+    let pressure = ServicePressureBuilder::new("system_api_gateway_limits")
+        .expect("validated service name")
+        .surface(
+            "scope",
+            scope.surface_report(tina::capacity::CapacityMode::Fixed),
+        )
+        .expect("scope surface")
+        .unavailable(
+            "gateway.outbound.pool",
+            "pool",
+            "no outbound pool in this gateway specimen",
+        )
+        .expect("unavailable surface")
+        .finish()
+        .expect("builder finish");
+    let mut topology = ServiceTopology::new("system_api_gateway_limits", Lifecycle::Stopped);
+    topology
+        .push_component(TopologyComponent::new(
+            "gateway",
+            "isolate",
+            "",
+        ))
+        .push_component(TopologyComponent::new(
+            "gateway.scope",
+            "scope",
+            "shard-local",
+        ));
+    let health = Health::new("system_api_gateway_limits", Lifecycle::Stopped)
+        .with_pressure(pressure.clone());
+    let service_report = ServiceReportBuilder::new("system_api_gateway_limits")
+        .expect("validated service name")
+        .lifecycle(Lifecycle::Stopped)
+        .readiness(Readiness::not_ready(
+            Lifecycle::Stopped,
+            vec![ReadinessReason::IngressStopped],
+        ))
+        .health(health)
+        .topology(topology)
+        .pressure(pressure)
+        .replay(ServiceReplayStatus::not_captured(
+            "gateway specimen does not enable live capture",
+        ))
+        .finish()
+        .expect("service report builder finish");
+
     Ok(RunReport {
         upload_admitted,
         upload_full,
@@ -385,6 +441,7 @@ pub fn run(config: RunConfig) -> anyhow::Result<RunReport> {
         scope_high_water_at_drain: snap.high_water,
         discovery_lines: vec![scope_line, surface_line],
         summary_line,
+        service_report,
     })
 }
 

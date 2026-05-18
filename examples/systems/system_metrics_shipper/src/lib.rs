@@ -126,6 +126,10 @@ pub struct ShutdownReport {
     /// non-HTTP service reports the same typed transition as
     /// `mini_saas_api`.
     pub lifecycle_transitions: Vec<Lifecycle>,
+    /// Phase 111 service product surface. Threads lifecycle, readiness,
+    /// health, topology, pressure, shutdown choreography, and replay
+    /// status through one validated builder.
+    pub service_report: tina_runtime::service_report::ServiceReport,
 }
 
 /// Snapshot of every shipper-side cap and pressure counter.
@@ -780,6 +784,35 @@ pub fn run_shutdown(config: &RunConfig) -> anyhow::Result<ShutdownReport> {
     let shutdown_choreography = choreo.finish();
     lifecycle_transitions.push(Lifecycle::Stopped);
 
+    // Phase 111 service product surface. Threads the typed pieces above
+    // into one validated `ServiceReport`. The pressure carried by
+    // `health.pressure` is also passed in as the report's pressure
+    // because the typed health snapshot is the source of truth for live
+    // numbers post-stop.
+    let pressure_for_report = health
+        .pressure
+        .clone()
+        .unwrap_or_else(|| build_pressure_snapshot(&stats, &sink, config));
+    let topology_for_report = topology.clone();
+    let service_report = tina_runtime::service_report::ServiceReportBuilder::new(
+        "system_metrics_shipper",
+    )
+    .expect("validated service name")
+    .lifecycle(Lifecycle::Stopped)
+    .readiness(tina_runtime::lifecycle::Readiness::not_ready(
+        Lifecycle::Stopped,
+        vec![tina_runtime::lifecycle::ReadinessReason::IngressStopped],
+    ))
+    .health(health.clone())
+    .topology(topology_for_report)
+    .pressure(pressure_for_report)
+    .shutdown(shutdown_choreography.clone())
+    .replay(tina_runtime::service_report::ServiceReplayStatus::not_captured(
+        "shipper specimen does not enable live capture",
+    ))
+    .finish()
+    .expect("service report builder finish");
+
     Ok(ShutdownReport {
         stop_clean,
         flushed_on_drain,
@@ -790,6 +823,7 @@ pub fn run_shutdown(config: &RunConfig) -> anyhow::Result<ShutdownReport> {
         topology,
         shutdown_choreography,
         lifecycle_transitions,
+        service_report,
     })
 }
 
@@ -799,47 +833,57 @@ pub fn run_shutdown(config: &RunConfig) -> anyhow::Result<ShutdownReport> {
 /// mailbox) in one greppable report.
 fn build_topology(config: &RunConfig) -> ServiceTopology {
     use tina::capacity::{CapacityMode, CapacitySurfaceReport};
-    use tina_runtime::ServicePressureReport;
+    use tina_runtime::service_pressure::ServicePressureBuilder;
 
-    let mut pressure = ServicePressureReport::new("system_metrics_shipper");
-    pressure.add_measured(
-        "mailbox",
-        CapacitySurfaceReport::count(
-            "shipper.mailbox",
-            CapacityMode::Fixed,
-            config.shipper_mailbox,
-            0,
-            0,
-            0,
-        ),
-    );
-    pressure.add_measured(
-        "buffer",
-        CapacitySurfaceReport::count(
-            "shipper.buffer",
-            CapacityMode::Fixed,
-            config.buffer_capacity,
-            0,
-            0,
-            0,
-        ),
-    );
-    pressure.add_measured(
-        "mailbox",
-        CapacitySurfaceReport::count(
-            "sink.mailbox",
-            CapacityMode::Fixed,
-            config.sink_mailbox,
-            0,
-            0,
-            0,
-        ),
-    );
-    pressure.add_unavailable(
-        "shipper.flush_gate",
-        "scope",
-        "sampled live via LocalPermitGate inside the shipper",
-    );
+    // Phase 111 builder path: every surface name is validated, duplicates
+    // would be rejected loudly, and the missing flush gate is named as
+    // `Unavailable` rather than silently dropped.
+    let pressure = ServicePressureBuilder::new("system_metrics_shipper")
+        .expect("validated service name")
+        .surface(
+            "mailbox",
+            CapacitySurfaceReport::count(
+                "shipper.mailbox",
+                CapacityMode::Fixed,
+                config.shipper_mailbox,
+                0,
+                0,
+                0,
+            ),
+        )
+        .expect("shipper mailbox")
+        .surface(
+            "buffer",
+            CapacitySurfaceReport::count(
+                "shipper.buffer",
+                CapacityMode::Fixed,
+                config.buffer_capacity,
+                0,
+                0,
+                0,
+            ),
+        )
+        .expect("shipper buffer")
+        .surface(
+            "mailbox",
+            CapacitySurfaceReport::count(
+                "sink.mailbox",
+                CapacityMode::Fixed,
+                config.sink_mailbox,
+                0,
+                0,
+                0,
+            ),
+        )
+        .expect("sink mailbox")
+        .unavailable(
+            "shipper.flush_gate",
+            "scope",
+            "sampled live via LocalPermitGate inside the shipper",
+        )
+        .expect("flush gate unavailable")
+        .finish()
+        .expect("builder finish");
 
     let mut topology = ServiceTopology::new("system_metrics_shipper", Lifecycle::Ready);
     topology
@@ -870,43 +914,48 @@ fn build_pressure_snapshot(
     config: &RunConfig,
 ) -> tina_runtime::ServicePressureReport {
     use tina::capacity::{CapacityMode, CapacitySurfaceReport};
-    use tina_runtime::ServicePressureReport;
+    use tina_runtime::service_pressure::ServicePressureBuilder;
 
-    let mut p = ServicePressureReport::new("system_metrics_shipper");
-    p.add_measured(
-        "buffer",
-        CapacitySurfaceReport::count(
-            "shipper.buffer",
-            CapacityMode::Fixed,
-            stats.buffer_capacity,
-            0,
-            stats.buffer_high_water,
-            stats.buffer_full_rejects,
-        ),
-    );
-    p.add_measured(
-        "mailbox",
-        CapacitySurfaceReport::count(
-            "sink.mailbox",
-            CapacityMode::Fixed,
-            sink.mailbox_capacity,
-            0,
-            0,
-            0,
-        ),
-    );
-    p.add_measured(
-        "mailbox",
-        CapacitySurfaceReport::count(
-            "shipper.mailbox",
-            CapacityMode::Fixed,
-            config.shipper_mailbox,
-            0,
-            0,
-            0,
-        ),
-    );
-    p
+    ServicePressureBuilder::new("system_metrics_shipper")
+        .expect("validated service name")
+        .surface(
+            "buffer",
+            CapacitySurfaceReport::count(
+                "shipper.buffer",
+                CapacityMode::Fixed,
+                stats.buffer_capacity,
+                0,
+                stats.buffer_high_water,
+                stats.buffer_full_rejects,
+            ),
+        )
+        .expect("shipper buffer surface")
+        .surface(
+            "mailbox",
+            CapacitySurfaceReport::count(
+                "sink.mailbox",
+                CapacityMode::Fixed,
+                sink.mailbox_capacity,
+                0,
+                0,
+                0,
+            ),
+        )
+        .expect("sink mailbox surface")
+        .surface(
+            "mailbox",
+            CapacitySurfaceReport::count(
+                "shipper.mailbox",
+                CapacityMode::Fixed,
+                config.shipper_mailbox,
+                0,
+                0,
+                0,
+            ),
+        )
+        .expect("shipper mailbox surface")
+        .finish()
+        .expect("builder finish")
 }
 
 /// Map a `DrainState` stage to the typed [`Lifecycle`] vocabulary so a

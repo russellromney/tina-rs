@@ -916,3 +916,32 @@ Short summary of patterns no new code should copy:
 - per-comparison shard types: use `SingleShard` for one-shard programs and
   `tina_runtime::sharded::ShardPlacement` / `ShardServiceTable` for
   multi-shard placement.
+
+### Service product surface (closed; Phase 111)
+
+Before Phase 111 each system had its own `ServicePressureReport`
+assembly, its own `ShutdownChoreography` thread-through, and its own
+shape for "is the bridge present or sampled live?". Copies drifted on
+duplicate names, on whether `Unavailable` was rendered explicitly, and
+on whether replay support was a string or a typed shape.
+
+The Phase 111 surface in `tina_runtime::service_report` collapses the
+copies:
+
+- One `ServicePressureBuilder` validates the service name once and every
+  surface name on insertion. Duplicates and bad names are typed errors.
+- One `ServiceReportBuilder` requires lifecycle, readiness, health,
+  topology, and pressure. Missing fields are typed `Missing*` errors at
+  `finish()`. Optional `shutdown(ServiceShutdownReport)` and
+  `shutdown_choreography(ShutdownChoreography)` adapters fold a service
+  shutdown into the report.
+- `ServiceReplayStatus` is a typed enum: `Available { case_name,
+  projected_events }`, `Unsupported { facts }`, or `NotCaptured
+  { reason }`. Free-text replay status is a compile-time rail rejection.
+- `ServiceReport` fields are private. Construction outside the module
+  through a struct literal is a compile-time rail rejection. Compile-fail
+  fixtures live in `tina-runtime/tests/service_report_compile_fail/`.
+
+All four migrated systems (`mini_saas_api`, `system_soak_http_db`,
+`system_api_gateway_limits`, `system_metrics_shipper`) now use the
+surface and print the same vocabulary.

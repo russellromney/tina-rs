@@ -136,6 +136,44 @@ fn event_sink_drops_visibly_under_load() {
     );
 }
 
+// Phase 111: the typed ServiceReport must be present, name every
+// component, name the unavailable bridge surface, and produce a
+// readable summary line.
+#[test]
+fn soak_service_report_names_components_and_unavailable() {
+    let config = RunConfig {
+        workers: 8,
+        requests_per_worker: 16,
+        ..RunConfig::default()
+    };
+    let report = run(config).expect("soak ran");
+
+    let svc = &report.service_report;
+    let summary = svc.summary_line();
+    assert!(summary.contains("service=soak_http_db"), "{summary}");
+    assert!(summary.contains("lifecycle=stopped"), "{summary}");
+    assert!(summary.contains("unavailable=1"), "{summary}");
+
+    let lines = svc.discovery_lines();
+    assert!(
+        lines.iter().any(|l| l.contains("soak.controller")),
+        "discovery_lines missing soak.controller: {lines:#?}",
+    );
+    assert!(
+        lines.iter().any(|l| l.contains("soak.outbound.pool")
+            && l.contains("state=unavailable")),
+        "discovery_lines missing soak.outbound.pool unavailable: {lines:#?}",
+    );
+
+    // Replay status is NotCaptured — the soak does not enable capture.
+    match svc.replay() {
+        tina_runtime::service_report::ServiceReplayStatus::NotCaptured { reason } => {
+            assert!(reason.contains("not enable") || reason.contains("not configured"));
+        }
+        other => panic!("expected NotCaptured replay status, got {other:?}"),
+    }
+}
+
 #[test]
 fn soak_with_no_pressure_passes_assert_no_full() {
     // Cap large enough that nothing fills. Slow threshold raised
