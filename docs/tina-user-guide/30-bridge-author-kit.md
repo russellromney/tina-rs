@@ -53,17 +53,21 @@ the handle is real." The install handle implements
 
 ```rust
 pub trait BridgeInstall {
-    type Address;
     type Closer: BridgeCloser;
-    fn address(&self) -> Self::Address;
+    type Metrics;
     fn closer(&self) -> &Self::Closer;
     fn metrics(&self) -> &Self::Metrics;
 }
 ```
 
-Callers send typed requests to `bridge.address()` — never to a raw
-worker. The bridge never registers itself on the user's runtime
-implicitly; the user passes the runtime explicitly, exactly once.
+Callers send typed requests to the bridge-specific typed address
+(`install.address()`, `install.s3()`, `install.sqs()`, etc.) — never
+to a raw worker. Address access stays bridge-specific because bridge
+address shapes differ. The shared trait standardizes the closer and
+metrics handles.
+
+The bridge never registers itself on the user's runtime implicitly;
+the user passes the runtime explicitly, exactly once.
 
 ## Step 3 — Closer stops admission
 

@@ -352,9 +352,9 @@ Run:
 cargo fmt --all --check
 cargo test -p tina-runtime shared_work --lib -- --nocapture
 cargo test -p tina-runtime --test workflow_pending_ergonomics -- --nocapture
-cargo test -p tina-runtime --test compile_fail -- shared_work
-cargo test -p tina-runtime runtime_call_returned_from_handle_call_completes_as_event --lib -- --nocapture
-cargo test -p tina-sim --test protocol_fact -- projection --nocapture
+cargo test -p tina-runtime --test shared_work_compile_fail -- --nocapture
+cargo test -p tina-runtime --test runtime_call_completion_from_handle_call -- --nocapture
+cargo test -p tina-sim --test protocol_fact -- --nocapture
 cargo test --manifest-path examples/systems/system_cache_with_fill/Cargo.toml
 cargo test --manifest-path examples/systems/ergonomics_playground/Cargo.toml
 cargo test --manifest-path examples/systems/system_webhook_relay/Cargo.toml

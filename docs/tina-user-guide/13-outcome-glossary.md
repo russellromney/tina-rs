@@ -47,6 +47,7 @@ Replied(T)
 Full
 Closed
 Timeout
+Rejected(reason)
 ```
 
 Use this when one isolate calls another isolate.
