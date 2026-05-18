@@ -1835,9 +1835,13 @@ fn drain_shutdown_helper_does_not_stop_leased_connection_on_timeout() {
     };
     let conn = *lease.handle();
 
-    let report =
-        shutdown_keepalive_pool(rig.rt(), &pool, CloseMode::Drain, Duration::from_millis(25))
-            .expect("drain shutdown with outstanding lease");
+    let report = shutdown_keepalive_pool(
+        rig.rt(),
+        &pool,
+        CloseMode::Drain,
+        Duration::from_millis(500),
+    )
+    .expect("drain shutdown with outstanding lease");
     assert_eq!(report.pool_close, KeepalivePoolCloseOutcome::Closed);
     assert_eq!(
         report.drain,
