@@ -386,6 +386,7 @@ where
     next_isolate_id: u64,
     ids: IdSource,
     trace: Vec<RuntimeEvent>,
+    trace_start: usize,
     trace_retention: TraceRetention,
     trace_dropped: u64,
     driver: Box<dyn RuntimeDriver>,
@@ -667,6 +668,7 @@ where
             next_isolate_id: 1,
             ids,
             trace: Vec::with_capacity(preallocation.trace_capacity),
+            trace_start: 0,
             trace_retention: TraceRetention::Full,
             trace_dropped: 0,
             driver,
@@ -712,7 +714,7 @@ where
 
     /// Returns the accumulated runtime trace.
     pub fn trace(&self) -> &[RuntimeEvent] {
-        &self.trace
+        &self.trace[self.trace_start..]
     }
 
     /// Returns the active trace retention policy.
@@ -723,6 +725,11 @@ where
     /// Returns the number of trace events dropped by the retention policy.
     pub const fn trace_dropped(&self) -> u64 {
         self.trace_dropped
+    }
+
+    #[cfg(test)]
+    fn trace_storage_len(&self) -> usize {
+        self.trace.len()
     }
 
     /// Walks the current trace and returns a counted summary of
@@ -3535,12 +3542,16 @@ where
         }
         match self.trace_retention {
             TraceRetention::Full => {
+                self.compact_trace_prefix();
                 self.trace.push(event);
             }
             TraceRetention::Bounded(capacity) if capacity > 0 => {
-                if self.trace.len() == capacity {
-                    self.trace.remove(0);
+                if self.active_trace_len() == capacity {
+                    self.trace_start += 1;
                     self.trace_dropped += 1;
+                    if self.trace_start >= capacity {
+                        self.compact_trace_prefix();
+                    }
                 }
                 self.trace.push(event);
             }
@@ -3553,18 +3564,44 @@ where
 
     fn enforce_trace_retention(&mut self) {
         match self.trace_retention {
-            TraceRetention::Full => {}
+            TraceRetention::Full => {
+                self.compact_trace_prefix();
+            }
             TraceRetention::Bounded(capacity) => {
-                if self.trace.len() > capacity {
-                    let excess = self.trace.len() - capacity;
-                    self.trace.drain(0..excess);
+                let active = self.active_trace_len();
+                if active > capacity {
+                    let excess = active - capacity;
+                    self.trace_start += excess;
                     self.trace_dropped += excess as u64;
                 }
+                self.compact_trace_prefix_if_empty_or_large(capacity.max(1));
             }
             TraceRetention::Off => {
-                self.trace_dropped += self.trace.len() as u64;
+                self.trace_dropped += self.active_trace_len() as u64;
                 self.trace.clear();
+                self.trace_start = 0;
             }
+        }
+    }
+
+    fn active_trace_len(&self) -> usize {
+        self.trace.len().saturating_sub(self.trace_start)
+    }
+
+    fn compact_trace_prefix(&mut self) {
+        if self.trace_start == 0 {
+            return;
+        }
+        self.trace.drain(0..self.trace_start);
+        self.trace_start = 0;
+    }
+
+    fn compact_trace_prefix_if_empty_or_large(&mut self, threshold: usize) {
+        if self.trace_start == 0 {
+            return;
+        }
+        if self.trace_start >= self.trace.len() || self.trace_start >= threshold {
+            self.compact_trace_prefix();
         }
     }
 

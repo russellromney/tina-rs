@@ -73,6 +73,40 @@ fn runtime_preallocation_config_reserves_runtime_owned_metadata() {
     assert!(runtime.round_messages.capacity() >= preallocation.round_scratch_capacity);
 }
 
+#[test]
+fn bounded_trace_retention_does_not_move_the_tail_on_every_event() {
+    let mut runtime = Runtime::with_clock_and_ids_and_driver(
+        TestShard,
+        TestMailboxFactory,
+        Box::new(MonotonicClock),
+        IdSource::new(),
+        Box::new(FakeDriver::new(Rc::new(RefCell::new(Vec::new())))),
+    );
+    runtime.set_trace_retention(TraceRetention::Bounded(3));
+
+    for _ in 0..100 {
+        runtime.push_event(
+            IsolateId::new(1),
+            None,
+            RuntimeEventKind::EffectObserved {
+                effect: EffectKind::Noop,
+            },
+        );
+    }
+
+    let retained_ids: Vec<_> = runtime
+        .trace()
+        .iter()
+        .map(|event| event.id().get())
+        .collect();
+    assert_eq!(retained_ids, vec![98, 99, 100]);
+    assert_eq!(runtime.trace_dropped(), 97);
+    assert!(
+        runtime.trace_storage_len() <= 6,
+        "bounded trace should compact in chunks, not retain an unbounded stale prefix"
+    );
+}
+
 #[derive(Debug, Default)]
 struct TestShard;
 
