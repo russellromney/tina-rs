@@ -22,6 +22,7 @@ struct IsolateArgs {
     spawn: Option<Type>,
     spawn_observed: Option<Type>,
     call: Option<Type>,
+    fact: Option<Type>,
     shard: Option<Type>,
     send_only: Option<Ident>,
 }
@@ -37,6 +38,7 @@ impl Parse for IsolateArgs {
             spawn: None,
             spawn_observed: None,
             call: None,
+            fact: None,
             shard: None,
             send_only: None,
         };
@@ -75,11 +77,12 @@ impl Parse for IsolateArgs {
                         set_once(&mut args.spawn_observed, value, "spawn_observed")?
                     }
                     "call" => set_once(&mut args.call, value, "call")?,
+                    "fact" => set_once(&mut args.fact, value, "fact")?,
                     "shard" => set_once(&mut args.shard, value, "shard")?,
                     _ => {
                         return Err(Error::new_spanned(
                             key,
-                            "expected one of: message, event, request, reply, send, spawn, spawn_observed, call, shard, send_only",
+                            "expected one of: message, event, request, reply, send, spawn, spawn_observed, call, fact, shard, send_only",
                         ));
                     }
                 }
@@ -220,6 +223,9 @@ fn build_isolate(
             CallDefault::RuntimeCall => syn::parse_quote!(::tina_runtime::RuntimeCall<#message>),
         },
     };
+    let fact = args
+        .fact
+        .unwrap_or_else(|| syn::parse_quote!(::std::convert::Infallible));
 
     let isolate = item.self_ty.clone();
     let generics = item.generics.clone();
@@ -377,6 +383,7 @@ fn build_isolate(
             type Spawn = #spawn;
             type SpawnObserved = #spawn_observed;
             type Call = #call;
+            type Fact = #fact;
             type Shard = #shard;
 
             #(#attrs)*

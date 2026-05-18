@@ -276,27 +276,40 @@ remaining build specific.
 
 Make the projection helpers do what their names say.
 
-Add:
+Added:
 
 ```rust
 TraceProjection::protocol_family(ProtocolFamily)
 ```
 
-Rules:
+Rules (now enforced):
 
 - `protocol_facts()` keeps every `FactObserved` event;
 - `http2_streams()` keeps only `ProtocolFamily::Http2`;
 - `websocket_sessions()` keeps only `ProtocolFamily::WebSocket`;
 - `grpc_status()` keeps only `ProtocolFamily::Grpc`;
-- non-matching `FactObserved` events are ignored by that projection;
+- non-matching `FactObserved` events are dropped silently the way
+  `ignored` event kinds are;
 - unknown runtime event kinds still fail closed.
 
-Do not parse `Debug` strings. Use `RuntimeFact::Protocol(fact).family()`.
+The family check reads `RuntimeFact::Protocol(fact).family()`. No
+debug-string parsing.
 
-Update docs that mention these helpers so the copied path is honest:
+`TraceProjection::Projected` gains a `family_filter: Option<ProtocolFamily>`
+field. Three existing call sites updated (two in
+`tina-sim/tests/saved_replay_cases.rs`, one in
+`tina-sim/tests/protocol_fact.rs`).
+
+Docs updated:
 
 - `docs/tina-user-guide/08-simulation-and-dst.md`;
 - `docs/tina-user-guide/22-http-http2-grpc.md`.
+
+Mixed-protocol projection test
+`tina-sim/tests/protocol_fact.rs::http2_streams_keeps_only_http2_facts`
+(plus four siblings) proves a single trace with HTTP/2 + WebSocket +
+gRPC facts produces three distinct trace hashes under the three named
+helpers and one fact-count per family.
 
 ## Tests
 
@@ -339,9 +352,9 @@ Run:
 cargo fmt --all --check
 cargo test -p tina-runtime shared_work --lib -- --nocapture
 cargo test -p tina-runtime --test workflow_pending_ergonomics -- --nocapture
-cargo test -p tina-runtime --test compile_fail -- shared_work
-cargo test -p tina-runtime runtime_call_returned_from_handle_call_completes_as_event --lib -- --nocapture
-cargo test -p tina-sim --test protocol_fact -- projection --nocapture
+cargo test -p tina-runtime --test shared_work_compile_fail -- --nocapture
+cargo test -p tina-runtime --test runtime_call_completion_from_handle_call -- --nocapture
+cargo test -p tina-sim --test protocol_fact -- --nocapture
 cargo test --manifest-path examples/systems/system_cache_with_fill/Cargo.toml
 cargo test --manifest-path examples/systems/ergonomics_playground/Cargo.toml
 cargo test --manifest-path examples/systems/system_webhook_relay/Cargo.toml

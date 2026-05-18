@@ -6,8 +6,8 @@ use std::time::Duration;
 
 use tina::prelude::*;
 use tina_runtime::{
-    CallOutcome, DefaultThreadedMailboxFactory, SleepReply, SplitServiceHandle, ThreadedRuntime,
-    WaitList, WaitListError, request_effect_after_wait_park, sleep,
+    CallOutcome, DefaultThreadedMailboxFactory, SharedWork, SharedWorkError, SleepReply,
+    SplitServiceHandle, ThreadedRuntime, request_effect_after_shared_wait, sleep,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -122,7 +122,7 @@ struct FillState {
 
 struct Cache {
     fill_delay: Duration,
-    waiters: WaitList<String, CacheReply>,
+    waiters: SharedWork<String, CacheReply>,
     entries: HashMap<String, CacheEntry>,
     fills_started: usize,
     fills_completed: usize,
@@ -166,7 +166,7 @@ impl Cache {
     fn new(pending_capacity: usize, fill_delay: Duration) -> Self {
         Self {
             fill_delay,
-            waiters: WaitList::with_capacity(pending_capacity)
+            waiters: SharedWork::with_capacity(pending_capacity)
                 .named("system_cache_with_fill.waiters"),
             entries: HashMap::new(),
             fills_started: 0,
@@ -189,11 +189,11 @@ impl Cache {
             });
         }
 
-        match self.waiters.park(key.clone(), call) {
+        match self.waiters.wait(key.clone(), call) {
             Ok(ticket) => {
                 let entry = self.entries.entry(key.clone()).or_default();
                 if entry.filling.is_some() {
-                    return request_effect_after_wait_park(&ticket, noop());
+                    return request_effect_after_shared_wait(&ticket, noop());
                 }
                 let generation = entry.generation;
                 entry.filling = Some(FillState { generation });
@@ -205,13 +205,13 @@ impl Cache {
                         result,
                     })
                 });
-                request_effect_after_wait_park(&ticket, fill_effect)
+                request_effect_after_shared_wait(&ticket, fill_effect)
             }
-            Err(WaitListError::Full { call, .. }) => {
+            Err(SharedWorkError::Full { call, .. }) => {
                 self.busy_replies += 1;
                 call.reply(CacheReply::Busy)
             }
-            Err(WaitListError::KeyFull { call, .. }) => {
+            Err(SharedWorkError::KeyFull { call, .. }) => {
                 self.busy_replies += 1;
                 call.reply(CacheReply::Busy)
             }

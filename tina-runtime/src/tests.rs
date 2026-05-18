@@ -204,6 +204,7 @@ impl Isolate for RootIsolate {
     type Spawn = tina::ChildDefinition<ChildIsolate>;
     type SpawnObserved = std::convert::Infallible;
     type Call = std::convert::Infallible;
+    type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 
     fn handle(
@@ -233,6 +234,7 @@ impl Isolate for RestartableRootIsolate {
     type Spawn = tina::RestartableChildDefinition<ChildIsolate>;
     type SpawnObserved = std::convert::Infallible;
     type Call = std::convert::Infallible;
+    type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 
     fn handle(
@@ -269,6 +271,7 @@ impl Isolate for ChildIsolate {
     type Spawn = tina::ChildDefinition<LeafIsolate>;
     type SpawnObserved = std::convert::Infallible;
     type Call = std::convert::Infallible;
+    type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 
     fn handle(
@@ -295,6 +298,7 @@ impl Isolate for LeafIsolate {
     type Spawn = std::convert::Infallible;
     type SpawnObserved = std::convert::Infallible;
     type Call = std::convert::Infallible;
+    type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 
     fn handle(
@@ -989,6 +993,7 @@ impl Isolate for OverlapAcceptor {
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<OverlapAcceptorMsg>;
+    type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 
     fn handle(
@@ -1071,6 +1076,7 @@ impl Isolate for Reader {
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<ReaderMsg>;
+    type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 
     fn handle(
@@ -1198,6 +1204,7 @@ impl Isolate for CooperativeFairness {
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
     type Call = Infallible;
+    type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 
     fn handle(
@@ -1227,6 +1234,7 @@ impl Isolate for Sleeper {
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<TimerMsg>;
+    type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 
     fn handle(
@@ -1410,6 +1418,7 @@ where
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
     type Call = Infallible;
+    type Fact = ::std::convert::Infallible;
     type Shard = S;
 
     fn handle(
@@ -1433,6 +1442,7 @@ where
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
     type Call = Infallible;
+    type Fact = ::std::convert::Infallible;
     type Shard = S;
 
     fn handle(
@@ -1467,6 +1477,7 @@ where
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
     type Call = Infallible;
+    type Fact = ::std::convert::Infallible;
     type Shard = S;
 
     fn handle(
@@ -1494,6 +1505,7 @@ where
     type Spawn = tina::RestartableChildDefinition<ShardLocalChild<S>>;
     type SpawnObserved = std::convert::Infallible;
     type Call = Infallible;
+    type Fact = ::std::convert::Infallible;
     type Shard = S;
 
     fn handle(
@@ -1524,6 +1536,7 @@ where
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
     type Call = Infallible;
+    type Fact = ::std::convert::Infallible;
     type Shard = S;
 
     fn handle(
@@ -1548,6 +1561,7 @@ where
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<TimerMsg>;
+    type Fact = ::std::convert::Infallible;
     type Shard = S;
 
     fn handle(
@@ -2736,6 +2750,7 @@ impl Isolate for ManualCallTarget {
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
     type Call = Infallible;
+    type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 
     fn handle(
@@ -2789,6 +2804,7 @@ impl Isolate for ManualCallCaller {
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<ManualCallCallerMsg>;
+    type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 
     fn handle(
@@ -2896,6 +2912,7 @@ impl Isolate for RetryWorker {
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<RetryMsg>;
+    type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 
     fn handle(

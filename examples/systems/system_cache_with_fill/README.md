@@ -2,13 +2,14 @@
 
 This system is a tiny read-through cache with single-flight fills.
 
-Many callers request the same cold key at once. The cache isolate starts one
-upstream fill, parks admitted callers in a bounded `WaitList` table, and
-replies `Busy` to overflow instead of creating a hidden wait queue.
+Many callers request the same cold key at once. The cache isolate starts
+one upstream fill, parks admitted callers in a bounded `SharedWork` table
+keyed by the cache key, and replies `Busy` to overflow instead of
+creating a hidden wait queue.
 
 It also tests stale fill handling: an invalidation during a fill replies
-`Stale` to the original caller, ignores the late fill completion, and requires a
-fresh fill before the key is cached.
+`Stale` to the original caller, ignores the late fill completion, and
+requires a fresh fill before the key is cached.
 
 ## Run
 
@@ -17,42 +18,52 @@ cargo run --manifest-path examples/systems/system_cache_with_fill/Cargo.toml
 cargo test --manifest-path examples/systems/system_cache_with_fill/Cargo.toml
 ```
 
-## Findings
+## What this specimen says about Tina
 
-What felt good:
-- The single-flight state machine is very natural Tina: one key-owned fill,
-  one bounded waiter list, one completion message.
-- Split service authoring now matches the domain: `CacheRequest` is the public
-  callable surface, while private `CacheEvent::FillDone` is only an internal
-  continuation. Host code uses `call_blocking_request`, not raw
-  `ServiceMessage`.
-- `WaitList::park` is the right primitive for bounded callers waiting on one
-  downstream fill keyed by the cache key.
-- Stale completion handling is readable when the fill carries a generation.
+The copied path is now `SharedWork`: many callers wait for one result
+keyed by a cache key. `SharedWork::wait(key, call)` consumes the caller's
+authority and returns a move-only ticket; `request_effect_after_shared_wait(&ticket, fill_effect)`
+proves admission happened before the upstream fill is scheduled.
+`SharedWork::reply_all_with(&key, ...)` settles every parked caller when
+the fill returns. The lower-level name `WaitList` is still public; copied
+service code should reach for `SharedWork` first.
 
-What felt rough:
-- The stale-completion path requires discipline: every fill must carry a
-  generation, and every invalidation must reply to or reclaim every waiter.
-- `CallContext` is the right contract. The split-service macro now removes the
-  old "put request variants in `handle`" trap for this specimen.
-- The host-side concurrent-call script is still boilerplate-heavy for system
-  specimens.
+What got shorter or safer:
 
-Tina capability pulled:
-- Bounded deferred replies.
-- Explicit call authority via `CallContext`.
-- Keyed waiter lists.
-- Split public requests from private internal events.
-- Single-flight fill state.
-- Runtime-owned time.
-- Stale-result handling.
-- Host-side concurrent calls.
+- The service no longer hand-rolls a `HashMap<key, VecDeque<id>>` next
+  to `PendingReplies` to coalesce callers.
+- Caller authority is consumed exactly once; the ticket is move-only and
+  cannot be forged, so the request-lane effect cannot escape admission.
 
-Suggested follow-up:
-- Consider a tiny `SingleFlight` helper only if more systems repeat the same
-  `WaitList` plus fill-generation shape.
-- Add host scenario helpers for "burst N call_blocking threads through a
-  barrier and classify outcomes."
+What still stays explicit:
+
+- Fill-in-flight flag and stale fill generation. `SharedWork` owns the
+  parked callers only.
+- The upstream call/timer (here, `sleep(fill_delay)`).
+- The retry/invalidation policy.
+
+Copied helpers this specimen uses:
+
+- `SharedWork::with_capacity(N).named(...)` for bounded waiters;
+- `SharedWork::wait(...)` for admission with caller authority returned
+  on overload;
+- `request_effect_after_shared_wait(&ticket, fill_effect)` for the
+  request-lane effect that schedules the upstream work;
+- `SharedWork::reply_all_with(&key, ...)` for fanout on fill;
+- `SharedWork::close_all_clone(&key, ...)` for invalidation reply.
+
+What not to use:
+
+- Hand-rolled `HashMap<key, VecDeque<id>>` plus `PendingReplies` for
+  multi-caller coalescing — that is what `SharedWork` exists to replace.
+
+Remaining rough bits:
+
+- The host-side concurrent-call script is still boilerplate-heavy for
+  system specimens.
+- Fill generations are still per-service truth; `SharedWork` cannot own
+  staleness because the service is the one calling the upstream.
 
 Verdict:
-- keep
+
+- keep.

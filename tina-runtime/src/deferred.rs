@@ -1305,6 +1305,7 @@ mod pending_replies_tests {
         type Spawn = std::convert::Infallible;
         type SpawnObserved = std::convert::Infallible;
         type Call = std::convert::Infallible;
+        type Fact = ::std::convert::Infallible;
         type Shard = tina::SingleShard;
 
         fn handle(

@@ -607,6 +607,12 @@ This section is for someone adding the next SDK bridge. It pins the
 shared vocabulary every bridge implements and the test checklist a
 review will look for.
 
+If you want the user-shaped *copied path* — eight numbered steps that
+map to `BridgeInstall`, `BridgeCloser`, `close_and_drain`, the metrics
+handle, the pressure report, and the classifier — start from
+[30-bridge-author-kit.md](30-bridge-author-kit.md). This section names
+the deeper vocabulary the copied path uses.
+
 ### Lifecycle
 
 ```

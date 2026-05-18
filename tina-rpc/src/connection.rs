@@ -838,6 +838,7 @@ where
     type Spawn = std::convert::Infallible;
     type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<ConnectionMsg>;
+    type Fact = ::std::convert::Infallible;
     type Shard = S;
 
     fn handle(
@@ -940,6 +941,7 @@ mod tests {
                 }
             }
             Effect::ReplyTo(_, _) => shape.reply_to += 1,
+            Effect::Fact(_) => shape.fact += 1,
         }
     }
 
@@ -955,6 +957,7 @@ mod tests {
         restart: usize,
         call: usize,
         reply_to: usize,
+        fact: usize,
     }
 
     fn build_request(request_id: u64, service: &str, method: &str, payload: &[u8]) -> Vec<u8> {

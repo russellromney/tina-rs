@@ -453,6 +453,7 @@ fn live_replay_unknown_event_kind_fails_closed_when_not_named_by_projection() {
     let projection = TraceProjection::Projected {
         included: vec![RuntimeEventKindName::SendRejected],
         ignored: Vec::new(),
+        family_filter: None,
     };
 
     let err = LiveReplayCapture::from_events_with_options(
@@ -489,6 +490,7 @@ fn live_replay_projected_comparison_names_ignored_event_kinds() {
     let projection = TraceProjection::Projected {
         included: vec![RuntimeEventKindName::SendRejected],
         ignored: vec![RuntimeEventKindName::HandlerStarted],
+        family_filter: None,
     };
     let capture = LiveReplayCapture::from_events_with_options(
         case.name,

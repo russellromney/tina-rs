@@ -14,6 +14,33 @@ valid; the long-form history lives in
 Finding numbers are stable across phases — when a finding closes it
 moves to the [Closed](#closed) section below with the same number.
 
+### Protocol facts to replay (Phase 112)
+
+What felt good:
+
+- Adding `Fact = ProtocolFact` to a protocol isolate is one line on the
+  macro form. The `IntoRuntimeFact` bound at registration catches a
+  typoed fact type as a compile error instead of a runtime mystery.
+- `TraceProjection::protocol_facts()` and the named siblings let test
+  code compare only protocol behaviour without touching the broader
+  trace shape.
+- The compile-fail fixtures pin the diagnostic shape: an ordinary
+  isolate emitting a `ProtocolFact` shows "expected `Infallible`,
+  found `ProtocolFact`" right at the call site, which is the shape a
+  future reader will recognise.
+
+What felt rough:
+
+- Threading a mutable `effects: &mut Vec<Effect<Self>>` through five
+  layers of response helpers (`enqueue_response`,
+  `queue_or_send_response`, `send_pending_response`,
+  `flush_pending_responses`, `handle_window_update`) is the price of
+  emitting facts at the point each truth happens. The alternative
+  shape — buffering facts on the isolate and draining at handler
+  return — was tried and reverted: it added a hidden `pending_facts`
+  field, separated emission from truth, and was a worse spelling. The
+  thread-through version is verbose but makes the call sites honest.
+
 ### 2. ScatterCoord setup is heavy for the happy path
 
 **Surfaced by:** `specimen_sharded_fanout_read`.
@@ -471,14 +498,22 @@ What still needs work but is deferred:
 loud-API constructors, `body_io_error_count` proves mid-stream
 client close).
 
-### 21. Per-bucket FIFO wait list next to a global `PendingReplies` — Phase 110 shipped
+### 21. Per-bucket FIFO wait list next to a global `PendingReplies` — shipped
 
-`tina_runtime::WaitList<K, R>` is the bounded helper: one global cap,
-optional per-key cap (`with_key_limit`), FIFO per key, ticketed
-`reply_one`, and `reply_all_clone` / `reply_all_with` /
-`close_all_clone` / `close_all_with` / `drain_all_with` for multi-waiter
-replies. Stale tickets are rejected; tickets are move-only with private
-fields.
+`tina_runtime::SharedWork<K, R>` is now the user-facing copy path:
+"many callers wait for one result", one global cap, optional per-key
+cap (`with_key_limit`), FIFO per key, ticketed `reply_one`, and
+`reply_all_clone` / `reply_all_with` / `close_all_clone` /
+`close_all_with` / `drain_all_with` for multi-waiter replies. Stale
+tickets are rejected; tickets are move-only with crate-private fields.
+`request_effect_after_shared_wait(&ticket, effect)` is the only path
+that produces a `RequestEffect` after admission.
+
+`SharedWork` is a thin wrapper over `WaitList`; the lower-level
+`WaitList` name remains public for call sites that read better under
+the mechanism name. `system_cache_with_fill` and the
+`ergonomics_playground` single-flight cache probe both copy from
+`SharedWork` now.
 
 *(Historical finding kept below for context.)*
 
@@ -630,37 +665,6 @@ the compiler refuses if a request variant is matched in the event handler
 or vice versa. Closing this finding probably means landing some form of
 that proposal.
 
-### 26. Call-shaped sends from `handle_call` deliver completions back as calls
-
-**Surfaced by:** `system_realtime_rooms`.
-
-A request/reply isolate received `WebSocketSessionMsg::SessionText` via
-`handle_call` and returned a batch that included
-`handle.text_effect::<Self>(text, timeout)` for each room member.
-`text_effect` expands to `call(handle.target(), handle.send(text), timeout).then(|outcome| SendOutcome(...))`.
-Observed concrete behaviour: the FIRST `tcp_write` triggered downstream
-of that call delivered its `Wrote(Ok)` completion back to the
-`HttpConnection` isolate via `handle_call` (with
-`HttpConnectionMsg::Wrote(_)` as the inbound message). `HttpConnection::handle_call`
-has no arm for `Wrote(_)` and routes the default branch to
-`call.reject(CallRejectedReason::UnsupportedMessage)`. The connection
-never drained its outbound queue; subsequent admits succeeded into the
-queue and the room (correctly) evicted the peer after the queue filled.
-Switching the room to `tina::send(handle.target(), handle.send(...))`
-(plain `Effect::Send`, try_send semantics) made the connection take the
-`handle_websocket_send` path and routed the `Wrote` completion back via
-`handle` as expected. Both code paths are publicly supported, so callers
-have to know that "`.then`-style outcome chains emitted from `handle_call`
-return values" carry hidden routing.
-
-**Build:** either (a) guarantee that an `Effect`'s downstream `.then`
-completions always route through the isolate's `handle`, regardless of
-which entry point produced the effect, or (b) document the asymmetry on
-`text_effect` / `send_effect` / `report_effect` so callers know to keep
-them in `handle` and use `tina::send` from `handle_call`. The first form
-of `WebSocketSessionHandle::send_effect` should also probably gain a
-debug-only assertion if it is invoked from inside a `CallContext`.
-
 ### 27. Lease handoff into a `PendingReplies` slot — Phase 110 shipped
 
 `tina_runtime::GuardedPendingReplies<K, R, G>` pairs the parked caller
@@ -787,11 +791,31 @@ preserve each service's per-error tally semantics — counters like
 the per-service module implements (validate, run_request, classify_sdk
 error, tally_terminal) is probably the right shape.
 
-### 33. Bridge classifier vocabulary lives in `tina-aws-bridge`
+Reference: the canonical bridge shape now lives in
+[`docs/tina-user-guide/30-bridge-author-kit.md`](../docs/tina-user-guide/30-bridge-author-kit.md).
+Any internal AWS refactor must keep those eight steps user-visible —
+no hidden queues, no hidden classifier collapse, no late-result
+silent rollup.
+
+### 33. Bridge classifier vocabulary lives in `tina-aws-bridge` — shipped
+
+`tina_runtime::bridge::BridgeOutcomeClass` (with
+`BridgeRetryable` / `BridgeUnavailable` / `BridgeFatal`) is the shared
+shape every bridge classifier projects onto. Each per-bridge
+classifier (reqwest, AWS workers) is still free to expose richer
+per-bridge reasons, but the shared `bridge_class()` projection makes
+mixed-bridge classification a typed fold instead of caller-private
+re-mapping. The bridge-author copy path in
+[`docs/tina-user-guide/30-bridge-author-kit.md`](../docs/tina-user-guide/30-bridge-author-kit.md)
+step 7 names this contract.
+
+*(Historical finding kept below for context.)*
+
+### 33-historical. Bridge classifier vocabulary lives in `tina-aws-bridge`
 
 **Surfaced by:** `system_webhook_relay`, classifier extension traits.
 
-`BridgeOutcomeClass` / `TransientReason` / `FatalReason` are useful
+`BridgeOutcomeClass` / `TransientReason` / `FatalReason` were useful
 outside AWS too — the reqwest bridge already has `ReqwestOutcomeClass`
 with its own per-bridge vocabulary. A relay or retry-driver needs
 *both* shapes to classify mixed outcomes (one outbound HTTP, one SQS)
@@ -808,6 +832,26 @@ the bridges themselves.
 
 Findings shipped by recent phases. Numbers are kept stable so
 existing README references stay valid.
+
+### 26. Call-shaped sends from `handle_call` deliver completions back as calls — closed by phase 114
+
+Closed by the live-runtime regression
+`tina-runtime/tests/runtime_call_completion_from_handle_call.rs::runtime_call_returned_from_handle_call_completes_as_event`.
+
+The test pins the user-truth resolution chosen in option (a) of the
+original finding: when an isolate's `handle_call` returns a
+runtime-owned call effect (`sleep(...).then_with_request(req, ...)` in
+the regression, but applies to any `.then` continuation), the
+completion arrives as an ordinary internal-event message at `handle`,
+not back at `handle_call`. The original caller receives the deferred
+reply through `reply_to_request`, and the trace records no
+`CallRejected { UnsupportedMessage }` event for the continuation.
+
+This is the path `system_realtime_rooms` would have wanted: send-shaped
+effects emitted from `handle_call` no longer carry hidden routing back
+into `handle_call`. If a future change reintroduces the hidden routing,
+this regression test catches it on the live threaded runtime path
+(non-split isolate, no fixtures, hermetic timer).
 
 ### 34. `call.defer(async_bridge).reply(...)` from `handle_call` — Phase 104 proof
 

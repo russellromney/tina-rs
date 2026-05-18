@@ -223,6 +223,7 @@ macro_rules! isolate_types {
         spawn: $spawn:ty,
         spawn_observed: $spawn_observed:ty,
         call: $call:ty,
+        fact: $fact:ty,
         shard: $shard:ty $(,)?
     ) => {
         type Message = $message;
@@ -231,7 +232,48 @@ macro_rules! isolate_types {
         type Spawn = $spawn;
         type SpawnObserved = $spawn_observed;
         type Call = $call;
+        type Fact = $fact;
         type Shard = $shard;
+    };
+    (
+        message: $message:ty,
+        reply: $reply:ty,
+        send: $send:ty,
+        spawn: $spawn:ty,
+        spawn_observed: $spawn_observed:ty,
+        call: $call:ty,
+        shard: $shard:ty $(,)?
+    ) => {
+        $crate::isolate_types! {
+            message: $message,
+            reply: $reply,
+            send: $send,
+            spawn: $spawn,
+            spawn_observed: $spawn_observed,
+            call: $call,
+            fact: ::std::convert::Infallible,
+            shard: $shard,
+        }
+    };
+    (
+        message: $message:ty,
+        reply: $reply:ty,
+        send: $send:ty,
+        spawn: $spawn:ty,
+        call: $call:ty,
+        fact: $fact:ty,
+        shard: $shard:ty $(,)?
+    ) => {
+        $crate::isolate_types! {
+            message: $message,
+            reply: $reply,
+            send: $send,
+            spawn: $spawn,
+            spawn_observed: ::std::convert::Infallible,
+            call: $call,
+            fact: $fact,
+            shard: $shard,
+        }
     };
     (
         message: $message:ty,
@@ -248,6 +290,7 @@ macro_rules! isolate_types {
             spawn: $spawn,
             spawn_observed: ::core::convert::Infallible,
             call: $call,
+            fact: ::std::convert::Infallible,
             shard: $shard,
         }
     };
@@ -295,6 +338,20 @@ pub trait Isolate: Sized {
     /// Use [`std::convert::Infallible`] when an isolate never issues call
     /// effects.
     type Call;
+
+    /// The payload produced by [`Effect::Fact`].
+    ///
+    /// A *fact* is one named, replayable observation the isolate may emit
+    /// alongside ordinary effects. Ordinary isolates declare
+    /// `Fact = std::convert::Infallible` and never call [`crate::fact`].
+    /// Protocol isolates that need to feed replay-visible protocol events
+    /// declare `Fact = tina_runtime::ProtocolFact` (or another type that
+    /// implements `tina_runtime::IntoRuntimeFact`).
+    ///
+    /// The conversion bound lives at the runtime registration boundary, not on
+    /// this trait, so the substrate-neutral `tina` crate does not depend on
+    /// `tina-runtime`.
+    type Fact;
 
     /// The shard abstraction available through [`Context`].
     type Shard: Shard + ?Sized;
@@ -429,6 +486,15 @@ where
     /// named slot instead of the current message's caller. The slot is
     /// one-shot: the runtime consumes it on delivery.
     ReplyTo(DeferredReply<I::Reply>, I::Reply),
+
+    /// Emit one replayable [`Isolate::Fact`].
+    ///
+    /// The runtime converts the fact through `tina_runtime::IntoRuntimeFact`
+    /// and records a `RuntimeEventKind::FactObserved` event. Isolates whose
+    /// `Fact = std::convert::Infallible` cannot construct this variant: the
+    /// type system enforces that ordinary isolates never emit a fact by
+    /// accident.
+    Fact(I::Fact),
 }
 
 /// Returns an effect that asks the runtime to do nothing else this turn.
@@ -437,6 +503,23 @@ where
     I: Isolate,
 {
     Effect::Noop
+}
+
+/// Returns an effect that emits one replayable [`Isolate::Fact`].
+///
+/// The compiler enforces that the value's type is exactly `I::Fact`. An
+/// ordinary isolate whose `Fact = std::convert::Infallible` cannot call
+/// `fact::<Self>(...)` with anything but an uninhabited value — there is no
+/// such value, so the call site fails to type-check.
+///
+/// Protocol isolates declare `Fact = tina_runtime::ProtocolFact` (or another
+/// type that implements `tina_runtime::IntoRuntimeFact`) and emit facts at the
+/// point the protocol fact becomes true.
+pub fn fact<I>(value: I::Fact) -> Effect<I>
+where
+    I: Isolate,
+{
+    Effect::Fact(value)
 }
 
 /// Returns an effect that replies to the current caller.
