@@ -293,7 +293,7 @@ pub use observation::{
     BoundAddressWaiter, ChildRestarted, ChildRestartedWaiter, IsolateCompleteWaiter,
     IsolateResultWaiter, OperationDoneWaiter, ResultWaitError, WaitError,
 };
-pub use observer::TraceObserver;
+pub use observer::{BufferedTraceObserver, TraceObserver};
 pub use pressure::{MailboxBudget, PressureReport, PressureSummary, format_pressure_line};
 pub use scope::{
     CallContextScopeExt, DeferScopedThrough, DeferredScopedCall, RequestScope, RequestScopeId,
