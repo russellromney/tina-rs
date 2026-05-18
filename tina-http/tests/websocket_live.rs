@@ -15,7 +15,8 @@ use tina_http::{
     websocket_upgrade,
 };
 use tina_runtime::{
-    CallOutcome, DefaultThreadedMailboxFactory, ThreadedRuntime, ThreadedRuntimeConfig,
+    CallOutcome, DefaultThreadedMailboxFactory, ProtocolFact, RuntimeEventKind, ThreadedRuntime,
+    ThreadedRuntimeConfig, WebSocketCloseReason,
 };
 
 const TEST_IO_TIMEOUT: Duration = Duration::from_secs(10);
@@ -259,6 +260,23 @@ impl Harness {
 fn websocket_live_test_lock() -> &'static Mutex<()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| Mutex::new(()))
+}
+
+fn protocol_facts(
+    runtime: &ThreadedRuntime<TestShard, DefaultThreadedMailboxFactory>,
+) -> Vec<ProtocolFact> {
+    runtime
+        .complete_trace()
+        .expect("complete trace")
+        .into_iter()
+        .filter_map(|event| match event.kind() {
+            RuntimeEventKind::FactObserved {
+                fact: tina_runtime::RuntimeFact::Protocol(protocol),
+            } => Some(protocol),
+            RuntimeEventKind::FactObserved { .. } => None,
+            _ => None,
+        })
+        .collect()
 }
 
 impl Drop for Harness {
@@ -656,6 +674,19 @@ fn websocket_peer_close_gets_close_reply() {
     let (opcode, body) = read_server_frame(&mut stream);
     assert_eq!(opcode, 0x8);
     assert_eq!(body, payload);
+
+    let facts = protocol_facts(harness.runtime.as_ref().expect("runtime"));
+    assert!(
+        facts.iter().any(|fact| matches!(
+            fact,
+            ProtocolFact::WebSocketSessionClosed {
+                reason: WebSocketCloseReason::Normal,
+                code: Some(1000),
+                ..
+            }
+        )),
+        "expected normal WebSocket close fact, got {facts:?}",
+    );
 }
 
 #[test]
@@ -720,6 +751,19 @@ fn websocket_peer_fin_closes_resource() {
     let mut rest = Vec::new();
     stream.read_to_end(&mut rest).unwrap();
     assert!(rest.is_empty());
+
+    let facts = protocol_facts(harness.runtime.as_ref().expect("runtime"));
+    assert!(
+        facts.iter().any(|fact| matches!(
+            fact,
+            ProtocolFact::WebSocketSessionClosed {
+                reason: WebSocketCloseReason::GoingAway,
+                code: None,
+                ..
+            }
+        )),
+        "expected peer-FIN WebSocket close fact, got {facts:?}",
+    );
 }
 
 #[test]

@@ -227,6 +227,7 @@ where
     type Spawn = Infallible;
     type SpawnObserved = Infallible;
     type Call = RuntimeCall<ServiceCall>;
+    type Fact = ::std::convert::Infallible;
     type Shard = S;
 
     fn handle(&mut self, msg: ServiceCall, _ctx: &mut Context<'_, S, Self::Reply>) -> Effect<Self> {

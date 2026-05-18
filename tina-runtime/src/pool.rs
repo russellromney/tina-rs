@@ -851,6 +851,7 @@ where
     type Spawn = Infallible;
     type SpawnObserved = Infallible;
     type Call = RuntimeCall<WorkerPoolMsg<H>>;
+    type Fact = Infallible;
     type Shard = S;
 
     fn handle(

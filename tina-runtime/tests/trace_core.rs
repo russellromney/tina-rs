@@ -40,6 +40,7 @@ impl Isolate for Worker {
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
     type Call = Infallible;
+    type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 
     fn handle(
@@ -64,6 +65,7 @@ impl Isolate for Session {
     type Spawn = ChildDefinition<Worker>;
     type SpawnObserved = std::convert::Infallible;
     type Call = Infallible;
+    type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 
     fn handle(

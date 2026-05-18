@@ -456,6 +456,7 @@ where
     I::Spawn: IntoErasedSpawn<S> + 'static,
     I::SpawnObserved: IntoErasedSpawnObserved<S, I::Message> + 'static,
     I::Reply: 'static,
+    I::Fact: tina_runtime::IntoRuntimeFact + 'static,
     Msg: 'static,
     Outbound: 'static,
     S: Shard,
@@ -513,6 +514,8 @@ where
     I::Spawn: IntoErasedSpawn<S> + 'static,
     I::SpawnObserved: IntoErasedSpawnObserved<S, I::Message> + 'static,
     I::Reply: 'static,
+    I::Fact: tina_runtime::IntoRuntimeFact + 'static,
+    I::Fact: tina_runtime::IntoRuntimeFact + 'static,
     Msg: 'static,
     Outbound: 'static,
     S: Shard,
@@ -620,6 +623,9 @@ where
             handle: tina::runtime_internal::deferred_into_handle(slot),
             message: Box::new(reply),
         },
+        Effect::Fact(fact) => {
+            ErasedEffect::Fact(tina_runtime::IntoRuntimeFact::into_runtime_fact(fact))
+        }
     }
 }
 
@@ -671,6 +677,7 @@ where
         handle: DeferredReplyHandle,
         message: Box<dyn Any>,
     },
+    Fact(tina_runtime::RuntimeFact),
 }
 
 impl<S> ErasedEffect<S>
@@ -691,6 +698,7 @@ where
             Self::Call(_) => EffectKind::Call,
             Self::Batch(_) => EffectKind::Batch,
             Self::ReplyTo { .. } => EffectKind::ReplyTo,
+            Self::Fact(_) => EffectKind::Fact,
         }
     }
 

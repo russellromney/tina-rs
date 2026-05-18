@@ -75,6 +75,18 @@ The numbers mean:
 `discover_constants` does the same thing for a batch of cases — handy
 when you want a small seed sweep all at once.
 
+## Protocol facts in this workflow
+
+This bugbox uses application-level `Op` history; it does not exercise
+protocol facts. The protocol-fact form of the same workflow lives in
+`tina-sim/tests/protocol_fact.rs` and in the `tina-http` HTTP/2 path:
+the connection isolate emits `ProtocolFact::Http2StreamOpened` /
+`Http2StreamClosed` / `Http2StreamReset` / `Http2FlowControlFull`
+through `Effect::Fact`, and the sim re-emits the same events via
+`RuntimeEventKind::FactObserved`. Use
+`TraceProjection::protocol_facts()` (or the named siblings) when you
+want to compare only protocol behaviour rather than full trace shape.
+
 ## Findings
 
 What felt good:

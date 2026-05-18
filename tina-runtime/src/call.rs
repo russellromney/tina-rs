@@ -3407,6 +3407,7 @@ impl SleepCall {
     /// #     type Spawn = Infallible;
     /// #     type SpawnObserved = Infallible;
     /// #     type Call = RuntimeCall<Msg>;
+    /// #     type Fact = Infallible;
     /// #     type Shard = tina::SingleShard;
     /// #     fn handle(&mut self, _m: Msg, _ctx: &mut Context<'_, Self::Shard, ()>) -> Effect<Self> {
     /// #         tina::noop()

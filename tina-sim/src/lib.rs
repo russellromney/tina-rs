@@ -274,6 +274,7 @@ where
         I::Spawn: IntoErasedSpawn<S> + 'static,
         I::SpawnObserved: IntoErasedSpawnObserved<S, I::Message> + 'static,
         I::Reply: 'static,
+        I::Fact: tina_runtime::IntoRuntimeFact + 'static,
         Msg: 'static,
         Outbound: 'static,
     {
@@ -308,6 +309,7 @@ where
         I::Spawn: IntoErasedSpawn<S> + 'static,
         I::SpawnObserved: IntoErasedSpawnObserved<S, I::Message> + 'static,
         I::Reply: 'static,
+        I::Fact: tina_runtime::IntoRuntimeFact + 'static,
         Msg: 'static,
         Outbound: 'static,
     {
@@ -973,6 +975,14 @@ where
                 self.execute_reply_to(isolate_id, cause, handle, message, route_remote);
                 false
             }
+            ErasedEffect::Fact(fact) => {
+                self.push_event(
+                    isolate_id,
+                    Some(cause),
+                    RuntimeEventKind::FactObserved { fact },
+                );
+                false
+            }
         }
     }
 
@@ -1172,6 +1182,7 @@ where
         I::Spawn: IntoErasedSpawn<S> + 'static,
         I::SpawnObserved: IntoErasedSpawnObserved<S, I::Message> + 'static,
         I::Reply: 'static,
+        I::Fact: tina_runtime::IntoRuntimeFact + 'static,
         Msg: 'static,
         Outbound: 'static,
     {
@@ -1215,6 +1226,7 @@ where
         I::Spawn: IntoErasedSpawn<S> + 'static,
         I::SpawnObserved: IntoErasedSpawnObserved<S, I::Message> + 'static,
         I::Reply: 'static,
+        I::Fact: tina_runtime::IntoRuntimeFact + 'static,
         Msg: 'static,
         Outbound: 'static,
     {
@@ -5243,6 +5255,7 @@ where
     I::Spawn: IntoErasedSpawn<S> + 'static,
     I::SpawnObserved: IntoErasedSpawnObserved<S, I::Message> + 'static,
     I::Reply: 'static,
+    I::Fact: tina_runtime::IntoRuntimeFact + 'static,
     Msg: 'static,
     Outbound: 'static,
     S: Shard,
@@ -5275,6 +5288,7 @@ where
     I::Spawn: IntoErasedSpawn<S> + 'static,
     I::SpawnObserved: IntoErasedSpawnObserved<S, I::Message> + 'static,
     I::Reply: 'static,
+    I::Fact: tina_runtime::IntoRuntimeFact + 'static,
     Msg: 'static,
     Outbound: 'static,
     S: Shard,
@@ -5307,6 +5321,7 @@ where
     I::Spawn: IntoErasedSpawn<S> + 'static,
     I::SpawnObserved: IntoErasedSpawnObserved<S, I::Message> + 'static,
     I::Reply: 'static,
+    I::Fact: tina_runtime::IntoRuntimeFact + 'static,
     Msg: 'static,
     Outbound: 'static,
     S: Shard,
@@ -5345,6 +5360,7 @@ where
     I::Spawn: IntoErasedSpawn<S> + 'static,
     I::SpawnObserved: IntoErasedSpawnObserved<S, I::Message> + 'static,
     I::Reply: 'static,
+    I::Fact: tina_runtime::IntoRuntimeFact + 'static,
     Msg: 'static,
     Outbound: 'static,
     S: Shard,
@@ -5368,6 +5384,7 @@ where
     I::Spawn: IntoErasedSpawn<S> + 'static,
     I::SpawnObserved: IntoErasedSpawnObserved<S, I::Message> + 'static,
     I::Reply: 'static,
+    I::Fact: tina_runtime::IntoRuntimeFact + 'static,
     Msg: 'static,
     Outbound: 'static,
     S: Shard,
@@ -5568,6 +5585,7 @@ mod tests {
         type Spawn = Infallible;
         type SpawnObserved = Infallible;
         type Call = RuntimeCall<Self::Message>;
+        type Fact = ::std::convert::Infallible;
         type Shard = NumberedShard;
 
         fn handle(
@@ -5599,6 +5617,7 @@ mod tests {
         type SpawnObserved =
             tina::SpawnObserved<Self::Spawn, Self::Message, SimObservedChildMsg, ()>;
         type Call = RuntimeCall<Self::Message>;
+        type Fact = ::std::convert::Infallible;
         type Shard = NumberedShard;
 
         fn handle(
@@ -5643,6 +5662,7 @@ mod tests {
         type Spawn = Infallible;
         type SpawnObserved = std::convert::Infallible;
         type Call = RuntimeCall<SimTimerMsg>;
+        type Fact = ::std::convert::Infallible;
         type Shard = S;
 
         fn handle(
@@ -5673,6 +5693,7 @@ mod tests {
         type Spawn = Infallible;
         type SpawnObserved = std::convert::Infallible;
         type Call = RuntimeCall<SimStepEvent>;
+        type Fact = ::std::convert::Infallible;
         type Shard = S;
 
         fn handle(
@@ -5696,6 +5717,7 @@ mod tests {
         type Spawn = Infallible;
         type SpawnObserved = std::convert::Infallible;
         type Call = RuntimeCall<SimRemoteEvent>;
+        type Fact = ::std::convert::Infallible;
         type Shard = S;
 
         fn handle(
@@ -5730,6 +5752,7 @@ mod tests {
         type Spawn = Infallible;
         type SpawnObserved = std::convert::Infallible;
         type Call = RuntimeCall<SimRemoteEvent>;
+        type Fact = ::std::convert::Infallible;
         type Shard = S;
 
         fn handle(
@@ -5757,6 +5780,7 @@ mod tests {
         type Spawn = tina::RestartableChildDefinition<SimShardLocalChild<S>>;
         type SpawnObserved = std::convert::Infallible;
         type Call = RuntimeCall<SimShardLocalSupervisionEvent>;
+        type Fact = ::std::convert::Infallible;
         type Shard = S;
 
         fn handle(
@@ -5791,6 +5815,7 @@ mod tests {
         type Spawn = Infallible;
         type SpawnObserved = std::convert::Infallible;
         type Call = RuntimeCall<SimShardLocalSupervisionEvent>;
+        type Fact = ::std::convert::Infallible;
         type Shard = S;
 
         fn handle(

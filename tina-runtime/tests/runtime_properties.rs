@@ -110,6 +110,7 @@ impl Isolate for Target {
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
     type Call = Infallible;
+    type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 
     fn handle(
@@ -143,6 +144,7 @@ impl Isolate for Driver {
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
     type Call = Infallible;
+    type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 
     fn handle(
@@ -165,6 +167,7 @@ impl Isolate for RestartParent {
     type Spawn = tina::RestartableChildDefinition<RestartChild>;
     type SpawnObserved = std::convert::Infallible;
     type Call = Infallible;
+    type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 
     fn handle(
@@ -188,6 +191,7 @@ impl Isolate for RestartChild {
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
     type Call = Infallible;
+    type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 
     fn handle(
@@ -519,6 +523,7 @@ impl Isolate for DispatcherWorker {
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
     type Call = Infallible;
+    type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 
     fn handle(
@@ -543,6 +548,7 @@ impl Isolate for DispatcherParent {
     type Spawn = tina::RestartableChildDefinition<DispatcherWorker>;
     type SpawnObserved = std::convert::Infallible;
     type Call = Infallible;
+    type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 
     fn handle(
@@ -575,6 +581,7 @@ impl Isolate for DispatcherRegistry {
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
     type Call = Infallible;
+    type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 
     fn handle(
