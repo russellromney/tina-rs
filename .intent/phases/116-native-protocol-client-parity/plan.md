@@ -1,9 +1,9 @@
-# Phase 115: Native Protocol Client Parity
+# Phase 116: Native Protocol Client Parity
 
 ## Status
 
 - Future IDD outline for Wave A.
-- Can run in parallel with phases 116 and 117 if ownership stays mostly in
+- Can run in parallel with phases 117 and 118 if ownership stays mostly in
   `tina-http`, `tina-runtime` protocol facts, and protocol specimens.
 
 ## Purpose

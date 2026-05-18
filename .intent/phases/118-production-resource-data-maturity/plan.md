@@ -1,9 +1,9 @@
-# Phase 117: Production Resource And Data Maturity
+# Phase 118: Production Resource And Data Maturity
 
 ## Status
 
 - Future IDD outline for Wave A.
-- Can run in parallel with phases 115 and 116 if ownership stays mostly in pool
+- Can run in parallel with phases 116 and 117 if ownership stays mostly in pool
   resources, local persistence, and data specimens.
 
 ## Purpose

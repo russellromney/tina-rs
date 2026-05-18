@@ -1,9 +1,9 @@
-# Phase 119: Fairness And Load Behavior
+# Phase 120: Fairness And Load Behavior
 
 ## Status
 
 - Future IDD outline for Wave B.
-- Can run in parallel with phases 120 and 121 if ownership stays in scheduler
+- Can run in parallel with phases 121 and 122 if ownership stays in scheduler
   proof/reporting, soak harnesses, and systems.
 
 ## Purpose

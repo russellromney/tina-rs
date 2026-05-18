@@ -1,9 +1,9 @@
-# Phase 116: Local I/O, Codec, And IPC Parity
+# Phase 117: Local I/O, Codec, And IPC Parity
 
 ## Status
 
 - Future IDD outline for Wave A.
-- Can run in parallel with phases 115 and 117 if ownership stays mostly in
+- Can run in parallel with phases 116 and 118 if ownership stays mostly in
   runtime rails, codec helpers, and local IPC specimens.
 
 ## Purpose

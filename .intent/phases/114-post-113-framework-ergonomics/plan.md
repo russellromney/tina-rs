@@ -31,6 +31,7 @@ exists.
 
 ## Does Not Include
 
+- no ecosystem reorg
 - no new protocol feature
 - no new bridge feature
 - no flow macro

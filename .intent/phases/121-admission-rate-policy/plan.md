@@ -1,9 +1,9 @@
-# Phase 120: Admission And Rate Policy
+# Phase 121: Admission And Rate Policy
 
 ## Status
 
 - Future IDD outline for Wave B.
-- Can run in parallel with phases 119 and 121 if ownership stays in policy
+- Can run in parallel with phases 120 and 122 if ownership stays in policy
   types, edge-service specimens, and docs.
 
 ## Purpose

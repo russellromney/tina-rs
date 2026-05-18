@@ -1,9 +1,9 @@
-# Phase 121: Ecosystem Hooks And Async Boundary
+# Phase 122: Ecosystem Hooks And Async Boundary
 
 ## Status
 
 - Future IDD outline for Wave B.
-- Can run in parallel with phases 119 and 120 if ownership stays in public hook
+- Can run in parallel with phases 120 and 121 if ownership stays in public hook
   traits, extension smoke crates, capability reports, and docs.
 
 ## Purpose
