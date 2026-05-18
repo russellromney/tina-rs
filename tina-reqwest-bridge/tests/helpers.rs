@@ -227,6 +227,18 @@ fn classify_reqwest_transport_error_preserves_underlying_message() {
 }
 
 #[test]
+fn classify_worker_internal_is_fatal() {
+    let outcome: ReqwestCallOutcome =
+        CallOutcome::Replied(Err(ReqwestError::Internal("task vanished".into())));
+    match outcome.classify() {
+        ReqwestOutcomeClass::Fatal(ReqwestFatalReason::WorkerInternal(msg)) => {
+            assert_eq!(msg, "task vanished");
+        }
+        other => panic!("expected Fatal(WorkerInternal(..)), got {other:?}"),
+    }
+}
+
+#[test]
 fn classify_bridge_full_and_closed_are_fatal() {
     assert!(matches!(
         CallOutcome::<Result<ReqwestResponse, ReqwestError>>::Full.classify(),

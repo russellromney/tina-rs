@@ -1050,16 +1050,11 @@ impl std::error::Error for PgConfigError {}
 
 /// Sidecar cancel-pool settings.
 ///
-/// When set, the bridge builds a small `sqlx::PgPool` from the same
-/// URL as the main pool and uses it to fire `pg_cancel_backend(pid)`
-/// when the per-attempt timeout fires on a request whose backend PID
-/// has been captured. Only available on the [`crate::PgWorker::install`]
-/// path (config-built pool); the supplied-pool path leaves DB
-/// cancellation to the caller.
-///
-/// Cost: one extra round trip per admitted request to capture
-/// `pg_backend_pid()` before running the user's query. Default off
-/// keeps that opt-in.
+/// Compatibility-only in Phase 123. The old sidecar path fired
+/// `pg_cancel_backend(pid)` by captured backend PID; that can race
+/// connection reuse unless the exact connection is quarantined. The
+/// bridge still accepts and validates this shape so existing config
+/// files parse, but it does not build a sidecar or send DB cancels.
 #[derive(Debug, Clone)]
 pub struct PgCancelConfig {
     /// Sidecar pool size. Tiny by default — cancel calls are short
@@ -1175,9 +1170,9 @@ pub struct PgConfig {
     /// request.
     pub max_in_flight: usize,
     /// Per-attempt deadline at the bridge layer. Past this, the
-    /// bridge surfaces [`PgError::Timeout`] and aborts the spawned
-    /// task; if Postgres had already accepted the work, late
-    /// completion counts in `late_results`.
+    /// bridge surfaces [`PgError::Timeout`] to the caller but keeps
+    /// the external SQLx slot leased until the spawned task reaches
+    /// terminal; late completion counts in `late_results`.
     pub default_timeout: Duration,
     /// Poll interval for the worker-result wakeup loop. Smaller =
     /// lower latency, more trace chatter.
@@ -1190,11 +1185,11 @@ pub struct PgConfig {
     /// further capped to this value, so a caller cannot ask for
     /// `usize::MAX` and force unbounded buffering.
     pub max_response_rows: usize,
-    /// Optional DB-side cancel sidecar. When `Some`, the bridge fires
-    /// `pg_cancel_backend(pid)` from a small dedicated pool when the
-    /// per-attempt timeout elapses on a request whose backend PID
-    /// was captured. Default `None` — opt in via
-    /// [`Self::with_cancel_on_timeout`].
+    /// Compatibility field for the disabled DB-side cancel sidecar.
+    /// Phase 123 stopped firing `pg_cancel_backend(pid)` because the
+    /// old implementation could race PID reuse and cancel a later
+    /// query. Default `None`; `Some` validates but is not honored
+    /// until a future quarantine-based cancel path exists.
     ///
     /// **Only honored on [`crate::PgWorker::install`].** The
     /// supplied-pool path ([`crate::PgWorker::install_with_pool`])
@@ -1202,10 +1197,8 @@ pub struct PgConfig {
     /// sidecar pool without an owned URL, and the caller already
     /// owns connection lifetimes.
     ///
-    /// **Sidecar URL** is the same as `pool.url`. There is no knob
-    /// to point the sidecar at a different host. The sidecar exists
-    /// to fire one-shot `pg_cancel_backend` calls; co-locating it
-    /// with the main pool is the boring choice.
+    /// `db_cancels_sent` remains zero in Phase 123. Tina-side timeout
+    /// means "stop waiting"; Postgres may keep running.
     pub cancel: Option<PgCancelConfig>,
 }
 
@@ -1280,17 +1273,14 @@ impl PgConfig {
         self
     }
 
-    /// Enables DB-side cancellation with a sidecar pool of `pool_size`
-    /// and a default `acquire_timeout`. Use [`Self::with_cancel`] to
-    /// set both knobs explicitly.
+    /// Records a future DB-side cancellation preference. In Phase
+    /// 123 this is a compatibility no-op: the bridge validates the
+    /// config but does not fire `pg_cancel_backend(pid)` because the
+    /// old sidecar path could cancel a later query on a reused
+    /// backend PID.
     ///
-    /// When the bridge per-attempt timeout fires, the bridge runs
-    /// `pg_cancel_backend($1)` against the captured backend PID via
-    /// the sidecar pool. Adds one round trip per admitted request to
-    /// capture `pg_backend_pid()` before running the user's query.
-    ///
-    /// Only honored on [`crate::PgWorker::install`]; the
-    /// supplied-pool path ignores it.
+    /// Tina-side timeout still settles the caller promptly, while
+    /// the SQLx slot remains occupied until physical terminal.
     pub fn with_cancel_on_timeout(mut self, pool_size: u32) -> Self {
         self.cancel = Some(PgCancelConfig::new().with_pool_size(pool_size));
         self

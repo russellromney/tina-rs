@@ -1039,15 +1039,16 @@ fn transaction_typed_helper_returns_outcome() {
 
 #[test]
 #[ignore = "needs DATABASE_URL pointing at a real Postgres"]
-fn cancel_on_timeout_actually_shortens_late_completion() {
+fn cancel_on_timeout_config_is_noop_until_connection_quarantine_exists() {
     let url = match database_url() {
         Some(u) => u,
         None => return,
     };
     let runtime = make_runtime();
-    // 100ms bridge timeout, query sleeps 5s. With cancel on, the
-    // detached SQLx future should return well under 5s once Postgres
-    // processes the pg_cancel_backend.
+    // Phase 123 deliberately disables DB-side pg_cancel_backend(pid):
+    // the old sidecar could race connection reuse and cancel a later
+    // query on the same backend. The config remains accepted for
+    // compatibility, but timeout means "Tina stopped waiting."
     let cfg = PgConfig::new()
         .with_pool(
             PgPoolConfig::new(&url)
@@ -1064,7 +1065,7 @@ fn cancel_on_timeout_actually_shortens_late_completion() {
     let outcome = one(
         &runtime,
         &bridge,
-        PgRequest::execute("SELECT pg_sleep(5)"),
+        PgRequest::execute("SELECT pg_sleep(0.5)"),
         Duration::from_secs(15),
         Duration::from_secs(20),
     );
@@ -1073,11 +1074,10 @@ fn cancel_on_timeout_actually_shortens_late_completion() {
         "outcome: {outcome:?}",
     );
 
-    // Wait for the late tally to fire (sqlx_errors should bump
-    // because pg_cancel_backend turns the running query into an
-    // error). Without cancel this would take ~5s; with cancel it
-    // should land within a couple hundred ms of the timeout.
-    let late_deadline = Instant::now() + Duration::from_secs(4);
+    // Wait for the natural late tally. A sidecar cancel would usually
+    // produce an earlier Sqlx error; the fixed behavior is a late
+    // success and zero cancel attempts.
+    let late_deadline = Instant::now() + Duration::from_secs(2);
     while bridge.metrics.snapshot().late_results == 0 {
         if Instant::now() >= late_deadline {
             panic!(
@@ -1092,22 +1092,17 @@ fn cancel_on_timeout_actually_shortens_late_completion() {
 
     assert!(snap.timeouts >= 1, "{snap:?}");
     assert!(snap.late_results >= 1, "{snap:?}");
-    assert!(
-        snap.db_cancels_sent >= 1,
-        "expected cancel to fire: {snap:?}",
+    assert_eq!(
+        snap.db_cancels_sent, 0,
+        "cancel config must not fire unsafe pid-sidecar cancel: {snap:?}",
     );
-    // Generous bound: even with cancel, the wall-clock end-to-end is
-    // dominated by the sleep + poll overhead; 4s is well below the
-    // uncancelled 5s and well above the cancelled latency on a slow
-    // CI box.
     assert!(
-        total < Duration::from_secs(4),
-        "cancel should have shortened the wall clock; got {total:?}",
+        total >= Duration::from_millis(400),
+        "query should finish naturally instead of sidecar-canceling; got {total:?}",
     );
-    // Cancelled queries surface as Sqlx errors on the spawn side.
     assert!(
-        snap.sqlx_errors >= 1,
-        "cancelled query should tally as sqlx_error: {snap:?}",
+        snap.responses_executed >= 1,
+        "late natural completion should tally worker success: {snap:?}",
     );
     shutdown(runtime);
 }

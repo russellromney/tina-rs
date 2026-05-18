@@ -35,7 +35,16 @@ pub struct SnsMetrics {
     pub sdk_errors: u64,
     /// SDK future terminal after the bridge already returned timeout.
     pub late_results: u64,
-    /// Current in-flight SDK futures.
+    /// Current callers still waiting for a bridge reply.
+    pub caller_waiting_current: u64,
+    /// Current SDK futures still physically in flight. This is the
+    /// value enforced by `max_in_flight`.
+    pub external_in_flight_current: u64,
+    /// Current SDK futures still running after the bridge already
+    /// surfaced `SnsError::Timeout` to the caller.
+    pub late_in_flight_current: u64,
+    /// Current in-flight SDK futures. Deprecated alias for
+    /// `external_in_flight_current`.
     pub in_flight_current: u64,
     /// Highest `in_flight_current` observed.
     pub in_flight_high_water: u64,
@@ -59,6 +68,9 @@ pub(crate) struct SnsMetricsInner {
     pub(crate) throttled: AtomicU64,
     pub(crate) sdk_errors: AtomicU64,
     pub(crate) late_results: AtomicU64,
+    pub(crate) caller_waiting_current: AtomicU64,
+    pub(crate) external_in_flight_current: AtomicU64,
+    pub(crate) late_in_flight_current: AtomicU64,
     pub(crate) in_flight_current: AtomicU64,
     pub(crate) in_flight_high_water: AtomicU64,
     pub(crate) sdk_max_attempts: AtomicU64,
@@ -82,6 +94,9 @@ impl SnsMetricsInner {
             throttled: self.throttled.load(Ordering::Relaxed),
             sdk_errors: self.sdk_errors.load(Ordering::Relaxed),
             late_results: self.late_results.load(Ordering::Relaxed),
+            caller_waiting_current: self.caller_waiting_current.load(Ordering::Relaxed),
+            external_in_flight_current: self.external_in_flight_current.load(Ordering::Relaxed),
+            late_in_flight_current: self.late_in_flight_current.load(Ordering::Relaxed),
             in_flight_current: self.in_flight_current.load(Ordering::Relaxed),
             in_flight_high_water: self.in_flight_high_water.load(Ordering::Relaxed),
             sdk_max_attempts: self.sdk_max_attempts.load(Ordering::Relaxed),
@@ -89,6 +104,8 @@ impl SnsMetricsInner {
     }
 
     pub(crate) fn set_in_flight(&self, current: u64) {
+        self.external_in_flight_current
+            .store(current, Ordering::Relaxed);
         self.in_flight_current.store(current, Ordering::Relaxed);
     }
 
@@ -110,6 +127,23 @@ impl SnsMetricsInner {
     pub(crate) fn note_admit_kind(&self, kind: &'static str) {
         let mut kinds = self.in_flight_by_kind.lock().expect("sns metrics lock");
         *kinds.entry(kind).or_insert(0) += 1;
+    }
+
+    pub(crate) fn note_caller_waiting_admitted(&self) {
+        self.caller_waiting_current.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn note_caller_waiting_terminal(&self) {
+        self.caller_waiting_current.fetch_sub(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn note_caller_timed_out_but_external_running(&self) {
+        self.caller_waiting_current.fetch_sub(1, Ordering::Relaxed);
+        self.late_in_flight_current.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn note_late_external_terminal(&self) {
+        self.late_in_flight_current.fetch_sub(1, Ordering::Relaxed);
     }
 
     pub(crate) fn note_terminal_kind(&self, kind: &'static str) {
@@ -144,7 +178,7 @@ pub struct SnsPressureReport {
     pub available: usize,
     /// Currently leased slots.
     pub leased: usize,
-    /// Waiters accepted by the bridge. Always `0`.
+    /// Admitted callers currently waiting for a bridge reply.
     pub waiters: usize,
     /// Max waiters. Always `0`.
     pub max_waiters: usize,
@@ -176,12 +210,12 @@ impl SnsMetricsHandle {
     /// Returns pressure mapped to bounded-pool vocabulary.
     pub fn pressure_report(&self) -> SnsPressureReport {
         let m = self.inner.snapshot();
-        let leased = m.in_flight_current.min(self.capacity as u64) as usize;
+        let leased = m.external_in_flight_current.min(self.capacity as u64) as usize;
         SnsPressureReport {
             capacity: self.capacity,
             available: self.capacity.saturating_sub(leased),
             leased,
-            waiters: 0,
+            waiters: m.caller_waiting_current.min(usize::MAX as u64) as usize,
             max_waiters: 0,
             full_count: m.full,
             closed_count: m.closed,

@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use std::convert::Infallible;
 use std::marker::PhantomData;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use futures_util::TryStreamExt;
@@ -84,13 +84,7 @@ struct InFlight {
     started_at: Instant,
     receiver: oneshot::Receiver<PgResult>,
     abandoned: Arc<AtomicBool>,
-    reply_to: tina::RequestContext<PgResult>,
-    /// `Some` when DB-side cancel is enabled. The spawned task
-    /// stores `pg_backend_pid()` here right after it acquires a
-    /// connection and clears it back to 0 after the user's query
-    /// returns. The bridge's timeout path reads this; non-zero means
-    /// "fire `pg_cancel_backend` against this PID."
-    pid_slot: Option<Arc<AtomicI32>>,
+    reply_to: Option<tina::RequestContext<PgResult>>,
     request_kind: &'static str,
 }
 
@@ -190,10 +184,6 @@ impl Drop for PoolHolder {
 pub struct PgWorker<S: Shard + 'static> {
     config: PgConfig,
     pool: PoolHolder,
-    /// Sidecar pool for `pg_cancel_backend(pid)`. Built only when
-    /// `config.cancel` is `Some` *and* the bridge built its own pool
-    /// (the `install` path).
-    cancel_pool: Option<PoolHolder>,
     runtime: Handle,
     in_flight: HashMap<u64, InFlight>,
     next_id: u64,
@@ -219,7 +209,6 @@ impl<S: Shard + 'static> PgWorker<S> {
     fn assemble(
         config: PgConfig,
         pool: PgPool,
-        cancel_pool: Option<PgPool>,
         runtime: Handle,
         owned_runtime: Option<OwnedRuntime>,
     ) -> (Self, PgMetricsHandle) {
@@ -229,11 +218,9 @@ impl<S: Shard + 'static> PgWorker<S> {
             capacity: config.max_in_flight,
         };
         let pool = PoolHolder::new(pool, runtime.clone());
-        let cancel_pool = cancel_pool.map(|p| PoolHolder::new(p, runtime.clone()));
         let worker = Self {
             config,
             pool,
-            cancel_pool,
             runtime,
             in_flight: HashMap::new(),
             next_id: 1,
@@ -301,19 +288,8 @@ impl<S: Shard + 'static> PgWorker<S> {
         let abandoned_for_task = Arc::clone(&abandoned);
         let metrics_for_task = Arc::clone(&self.metrics);
         let max_response_rows = self.config.max_response_rows;
-        let pid_slot = self
-            .cancel_pool
-            .as_ref()
-            .map(|_| Arc::new(AtomicI32::new(0)));
-        let pid_slot_for_task = pid_slot.clone();
         self.runtime.spawn(async move {
-            let result = run_request(
-                &pool,
-                request,
-                max_response_rows,
-                pid_slot_for_task.as_deref(),
-            )
-            .await;
+            let result = run_request(&pool, request, max_response_rows).await;
             tally_worker_terminal(&metrics_for_task, &result);
             if abandoned_for_task.load(Ordering::Acquire) {
                 metrics_for_task
@@ -330,13 +306,13 @@ impl<S: Shard + 'static> PgWorker<S> {
                 started_at: Instant::now(),
                 receiver: rx,
                 abandoned,
-                reply_to,
-                pid_slot,
+                reply_to: Some(reply_to),
                 request_kind,
             },
         );
         let in_flight = self.in_flight.len() as u64;
         self.metrics.admitted.fetch_add(1, Ordering::Relaxed);
+        self.metrics.note_caller_waiting_admitted();
         self.metrics.set_in_flight(in_flight);
         self.metrics.note_in_flight(in_flight);
 
@@ -360,68 +336,35 @@ impl<S: Shard + 'static> PgWorker<S> {
 
         match in_flight.receiver.try_recv() {
             Ok(result) => {
+                let reply_to = in_flight.reply_to.take();
+                if in_flight.abandoned.load(Ordering::Acquire) {
+                    self.metrics.note_late_external_terminal();
+                } else if reply_to.is_some() {
+                    self.metrics.note_caller_waiting_terminal();
+                }
                 self.note_terminal();
                 #[cfg(feature = "tracing")]
                 emit_replied(&result, request_kind);
                 #[cfg(not(feature = "tracing"))]
                 let _ = request_kind;
-                tina::reply_to_request(in_flight.reply_to, result)
+                match reply_to {
+                    Some(reply_to) => tina::reply_to_request(reply_to, result),
+                    None => noop(),
+                }
             }
             Err(oneshot::error::TryRecvError::Empty) => {
+                if in_flight.abandoned.load(Ordering::Acquire) {
+                    self.in_flight.insert(id, in_flight);
+                    return sleep(self.config.poll_interval).then(move |_| PgMsg::Poll(id));
+                }
                 if in_flight.started_at.elapsed() >= self.config.default_timeout {
-                    // Mark abandoned and drop the receiver; the
-                    // spawned task continues until its SQLx future
-                    // completes naturally. When it does, tally records
-                    // the actual outcome and `late_results`
-                    // increments. We do not abort the task — abort
-                    // would cancel SQLx at the next .await point and
-                    // skip the tally entirely.
+                    // Mark abandoned but keep the receiver and slot:
+                    // the caller authority settles now, while external
+                    // capacity remains leased until SQLx reaches
+                    // worker-terminal truth.
                     in_flight.abandoned.store(true, Ordering::Release);
                     self.metrics.timeouts.fetch_add(1, Ordering::Relaxed);
-
-                    // If cancel-on-timeout is enabled and the spawn
-                    // captured a backend PID, fire-and-forget a
-                    // sidecar query that asks Postgres to cancel
-                    // whatever is currently running on that backend.
-                    // Atomic swap-to-zero so a later `tx.send`-side
-                    // clear does not race; also so a duplicate poll
-                    // cannot fire a second cancel for the same id.
-                    if let (Some(pid_slot), Some(cancel_pool)) =
-                        (in_flight.pid_slot.as_ref(), self.cancel_pool.as_ref())
-                    {
-                        let pid = pid_slot.swap(0, Ordering::AcqRel);
-                        if pid != 0 {
-                            let pool = cancel_pool.pool().clone();
-                            self.metrics.db_cancels_sent.fetch_add(1, Ordering::Relaxed);
-                            #[cfg(feature = "tracing")]
-                            event!(
-                                target: TRACE_TARGET_CALL,
-                                Level::DEBUG,
-                                kind = "cancel_fired",
-                                pid,
-                                request_kind,
-                            );
-                            self.runtime.spawn(async move {
-                                #[allow(unused_variables)]
-                                let r = sqlx::query("SELECT pg_cancel_backend($1)")
-                                    .bind(pid)
-                                    .execute(&pool)
-                                    .await;
-                                #[cfg(feature = "tracing")]
-                                if let Err(err) = r {
-                                    event!(
-                                        target: TRACE_TARGET_CALL,
-                                        Level::WARN,
-                                        kind = "cancel_failed",
-                                        pid,
-                                        detail = %err,
-                                    );
-                                }
-                            });
-                        }
-                    }
-
-                    self.note_terminal();
+                    self.metrics.note_caller_timed_out_but_external_running();
                     #[cfg(feature = "tracing")]
                     event!(
                         target: TRACE_TARGET_CALL,
@@ -431,12 +374,26 @@ impl<S: Shard + 'static> PgWorker<S> {
                         request_kind,
                         elapsed_ms = in_flight.started_at.elapsed().as_millis() as u64,
                     );
-                    return tina::reply_to_request(in_flight.reply_to, Err(PgError::Timeout));
+                    let reply_to = in_flight
+                        .reply_to
+                        .take()
+                        .expect("timeout only while caller authority is present");
+                    self.in_flight.insert(id, in_flight);
+                    return tina::batch([
+                        tina::reply_to_request(reply_to, Err(PgError::Timeout)),
+                        sleep(self.config.poll_interval).then(move |_| PgMsg::Poll(id)),
+                    ]);
                 }
                 self.in_flight.insert(id, in_flight);
                 sleep(self.config.poll_interval).then(move |_| PgMsg::Poll(id))
             }
             Err(oneshot::error::TryRecvError::Closed) => {
+                let reply_to = in_flight.reply_to.take();
+                if in_flight.abandoned.load(Ordering::Acquire) {
+                    self.metrics.note_late_external_terminal();
+                } else if reply_to.is_some() {
+                    self.metrics.note_caller_waiting_terminal();
+                }
                 self.note_terminal();
                 #[cfg(feature = "tracing")]
                 event!(
@@ -447,12 +404,15 @@ impl<S: Shard + 'static> PgWorker<S> {
                     request_kind,
                     detail = "spawned task ended without result",
                 );
-                tina::reply_to_request(
-                    in_flight.reply_to,
-                    Err(PgError::Internal(
-                        "spawned task ended without result".into(),
-                    )),
-                )
+                match reply_to {
+                    Some(reply_to) => tina::reply_to_request(
+                        reply_to,
+                        Err(PgError::Internal(
+                            "spawned task ended without result".into(),
+                        )),
+                    ),
+                    None => noop(),
+                }
             }
         }
     }
@@ -564,7 +524,6 @@ impl<S: Shard + Send + 'static> PgWorker<S> {
     {
         config.validate()?;
         let pool_cfg = config.pool.clone().ok_or(InstallError::MissingPoolConfig)?;
-        let cancel_cfg = config.cancel.clone();
         let tokio_rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .worker_threads(2)
@@ -572,29 +531,19 @@ impl<S: Shard + Send + 'static> PgWorker<S> {
             .build()
             .map_err(|e| InstallError::Runtime(format!("{e}")))?;
         let handle = tokio_rt.handle().clone();
-        let (pool, cancel_pool) = handle
+        let pool = handle
             .block_on(async {
                 let main = PgPoolOptions::new()
                     .max_connections(pool_cfg.max_connections)
                     .acquire_timeout(pool_cfg.acquire_timeout)
                     .connect(&pool_cfg.url)
                     .await?;
-                let sidecar = match cancel_cfg {
-                    Some(cc) => Some(
-                        PgPoolOptions::new()
-                            .max_connections(cc.pool_size)
-                            .acquire_timeout(cc.acquire_timeout)
-                            .connect(&pool_cfg.url)
-                            .await?,
-                    ),
-                    None => None,
-                };
-                Ok::<_, sqlx::Error>((main, sidecar))
+                Ok::<_, sqlx::Error>(main)
             })
             .map_err(|e| InstallError::Pool(format!("{e}")))?;
         let owned = OwnedRuntime(Some(tokio_rt));
         let cap = config.mailbox_capacity;
-        let (worker, metrics) = Self::assemble(config, pool, cancel_pool, handle, Some(owned));
+        let (worker, metrics) = Self::assemble(config, pool, handle, Some(owned));
         let closer = worker.closer();
         let address = runtime
             .register_with_capacity::<_, Infallible>(worker, cap)
@@ -650,7 +599,7 @@ impl<S: Shard + Send + 'static> PgWorker<S> {
         // config-built path.
         config.validate_tina()?;
         let cap = config.mailbox_capacity;
-        let (worker, metrics) = Self::assemble(config, pool, None, tokio_handle, None);
+        let (worker, metrics) = Self::assemble(config, pool, tokio_handle, None);
         let closer = worker.closer();
         let address = runtime
             .register_with_capacity::<_, Infallible>(worker, cap)
@@ -809,38 +758,15 @@ fn tally_transaction_steps(metrics: &MetricsInner, steps: &[PgStepOk]) {
     }
 }
 
-async fn run_request(
-    pool: &PgPool,
-    request: PgRequest,
-    max_response_rows: usize,
-    pid_slot: Option<&AtomicI32>,
-) -> PgResult {
+async fn run_request(pool: &PgPool, request: PgRequest, max_response_rows: usize) -> PgResult {
     // Always acquire explicitly so we control the connection
-    // identity. When DB-side cancel is enabled we capture the
-    // backend PID on this exact connection; when it is not, the
-    // explicit acquire still costs the same as the implicit one
-    // `q.execute(pool)` would do internally.
+    // identity for one request and keep the external slot leased
+    // until physical terminal.
     let mut conn = match pool.acquire().await {
         Ok(c) => c,
         Err(e) => return Err(map_sqlx_error(e)),
     };
-    if let Some(slot) = pid_slot {
-        match sqlx::query_scalar::<_, i32>("SELECT pg_backend_pid()")
-            .fetch_one(&mut *conn)
-            .await
-        {
-            Ok(pid) => slot.store(pid, Ordering::Release),
-            Err(e) => return Err(map_sqlx_error(e)),
-        }
-    }
-    let result = run_on_conn(&mut conn, request, max_response_rows).await;
-    if let Some(slot) = pid_slot {
-        // Clear so a late timeout poll cannot fire a cancel against
-        // a connection that has already been released to the pool
-        // and reused by another query.
-        slot.store(0, Ordering::Release);
-    }
-    result
+    run_on_conn(&mut conn, request, max_response_rows).await
 }
 
 async fn run_on_conn(
