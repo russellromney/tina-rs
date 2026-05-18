@@ -1229,7 +1229,12 @@ fn protocol_fact_write(fact: ProtocolFact, hasher: &mut StableHasher) {
                 }
             }
         }
-        ProtocolFact::GrpcFinalStatusSent { stream, status } => {
+        ProtocolFact::GrpcFinalStatusSent {
+            connection,
+            stream,
+            status,
+        } => {
+            hasher.write_u64(connection.get());
             hasher.write_u64(stream.get());
             hasher.write_u8(grpc_status_code_tag(status));
         }
@@ -1910,6 +1915,7 @@ mod stable_hash_tests {
             code: None,
         };
         let dummy_grpc = ProtocolFact::GrpcFinalStatusSent {
+            connection: ProtocolConnectionId::new(0),
             stream: GrpcStreamId::new(0),
             status: GrpcStatusCode::Ok,
         };
@@ -1985,6 +1991,7 @@ mod stable_hash_tests {
             IsolateId::new(0),
             RuntimeEventKind::FactObserved {
                 fact: RuntimeFact::Protocol(ProtocolFact::GrpcFinalStatusSent {
+                    connection: ProtocolConnectionId::new(0),
                     stream: GrpcStreamId::new(0),
                     status: GrpcStatusCode::Ok,
                 }),

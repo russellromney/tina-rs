@@ -1602,9 +1602,22 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Http2Connection<
                     .unwrap_or(usize::MAX);
                 if projected > self.limits.max_response_body_bytes {
                     self.report.stream_full += 1;
+                    let high_water_fact = tina::fact::<Self>(ProtocolFact::HttpBodyHighWater {
+                        connection: self.connection_fact_id(),
+                        body_id: stream_id as u64,
+                        direction: ProtocolDirection::Outbound,
+                        buffered_bytes: projected as u64,
+                        threshold_bytes: self.limits.max_response_body_bytes as u64,
+                    });
+                    let reset_fact = tina::fact::<Self>(ProtocolFact::Http2StreamReset {
+                        connection: self.connection_fact_id(),
+                        stream: Http2StreamId::new(stream_id),
+                        direction: ProtocolDirection::Outbound,
+                        reason: Http2ResetReason::EnhanceYourCalm,
+                    });
                     let _ = self.enqueue_frame(rst_stream_frame(stream_id, ERR_ENHANCE_YOUR_CALM));
                     self.remove_stream(stream_id);
-                    return self.maybe_write_effect();
+                    return batch(vec![high_water_fact, reset_fact, self.maybe_write_effect()]);
                 }
                 if let Some(idx) = self.find_stream(stream_id) {
                     self.streams[idx]
@@ -1663,6 +1676,7 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Http2Connection<
                 self.remove_stream(stream_id);
                 self.report.closed_streams += 1;
                 let status_fact = tina::fact::<Self>(ProtocolFact::GrpcFinalStatusSent {
+                    connection: self.connection_fact_id(),
                     stream: tina_runtime::GrpcStreamId::new(stream_id as u64),
                     status: grpc_status_code,
                 });
@@ -2422,14 +2436,33 @@ mod tests {
     // true. They complement the runtime+sim end-to-end tests by proving
     // the http2 path actually feeds Effect::Fact through.
 
+    fn collect_facts_from_effect<'a>(
+        effect: &'a Effect<Http2Connection<UnitShard>>,
+        out: &mut Vec<&'a ProtocolFact>,
+    ) {
+        match effect {
+            Effect::Fact(fact) => out.push(fact),
+            Effect::Batch(items) => {
+                for item in items {
+                    collect_facts_from_effect(item, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn collect_facts(effects: &[Effect<Http2Connection<UnitShard>>]) -> Vec<&ProtocolFact> {
-        effects
-            .iter()
-            .filter_map(|effect| match effect {
-                Effect::Fact(fact) => Some(fact),
-                _ => None,
-            })
-            .collect()
+        let mut out = Vec::new();
+        for effect in effects {
+            collect_facts_from_effect(effect, &mut out);
+        }
+        out
+    }
+
+    fn collect_facts_from_one(effect: &Effect<Http2Connection<UnitShard>>) -> Vec<&ProtocolFact> {
+        let mut out = Vec::new();
+        collect_facts_from_effect(effect, &mut out);
+        out
     }
 
     #[test]
@@ -2519,6 +2552,51 @@ mod tests {
                 }
             )),
             "expected EnhanceYourCalm outbound reset fact, got {facts:?}",
+        );
+    }
+
+    #[test]
+    fn streaming_response_body_cap_emits_high_water_and_reset_facts() {
+        let mut conn = unit_connection();
+        conn.limits.max_response_body_bytes = 2;
+        conn.streams.push(ActiveStream::new(
+            1,
+            HeaderBlock::default(),
+            DEFAULT_WINDOW,
+            DEFAULT_WINDOW,
+            false,
+        ));
+
+        let effect = conn.handle_stream_chunk(
+            1,
+            CallOutcome::Replied(ResponseChunkReply::Chunk(b"abc".to_vec())),
+        );
+
+        assert_eq!(conn.report().stream_full, 1);
+        assert!(conn.find_stream(1).is_none());
+        let facts = collect_facts_from_one(&effect);
+        assert!(
+            facts.iter().any(|f| matches!(
+                f,
+                ProtocolFact::HttpBodyHighWater {
+                    direction: ProtocolDirection::Outbound,
+                    buffered_bytes: 3,
+                    threshold_bytes: 2,
+                    ..
+                }
+            )),
+            "expected outbound response high-water fact, got {facts:?}",
+        );
+        assert!(
+            facts.iter().any(|f| matches!(
+                f,
+                ProtocolFact::Http2StreamReset {
+                    reason: Http2ResetReason::EnhanceYourCalm,
+                    direction: ProtocolDirection::Outbound,
+                    ..
+                }
+            )),
+            "expected outbound EnhanceYourCalm reset fact, got {facts:?}",
         );
     }
 
@@ -2628,6 +2706,7 @@ mod tests {
         // are the live-only facts that a future native gRPC client
         // isolate will mirror for the received-status side.
         let mut conn = unit_connection();
+        conn.self_isolate_id = Some(IsolateId::new(77));
         conn.streams.push(ActiveStream::new(
             5,
             HeaderBlock::default(),
@@ -2641,29 +2720,14 @@ mod tests {
                 crate::grpc::GrpcStatus::new(crate::grpc::GrpcStatusCode::Unauthenticated),
             )),
         );
-        // Collect the facts from the returned Effect.
-        fn walk<'a>(
-            effect: &'a Effect<Http2Connection<UnitShard>>,
-            out: &mut Vec<&'a ProtocolFact>,
-        ) {
-            match effect {
-                Effect::Fact(fact) => out.push(fact),
-                Effect::Batch(items) => {
-                    for item in items {
-                        walk(item, out);
-                    }
-                }
-                _ => {}
-            }
-        }
-        let mut facts: Vec<&ProtocolFact> = Vec::new();
-        walk(&effect, &mut facts);
+        let facts = collect_facts_from_one(&effect);
         assert!(facts.iter().any(|f| matches!(
             f,
             ProtocolFact::GrpcFinalStatusSent {
+                connection,
                 status: tina_runtime::GrpcStatusCode::Unauthenticated,
                 ..
-            }
+            } if connection.get() == 77
         )));
         assert!(
             facts

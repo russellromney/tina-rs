@@ -355,6 +355,8 @@ pub enum ProtocolFact {
 
     /// Native gRPC server sent a final status frame to the client.
     GrpcFinalStatusSent {
+        /// Local HTTP/2 connection id carrying this gRPC stream.
+        connection: ProtocolConnectionId,
         /// gRPC stream id.
         stream: GrpcStreamId,
         /// Final status code.

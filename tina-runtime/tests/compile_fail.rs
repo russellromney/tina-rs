@@ -15,7 +15,8 @@ fn protocol_fact_wiring_failures_fail_to_compile() {
     let cases = trybuild::TestCases::new();
     cases.compile_fail("tests/safety_rails_compile_fail/protocol_fact_ordinary_isolate.rs");
     cases.compile_fail("tests/safety_rails_compile_fail/protocol_fact_wrong_enum.rs");
-    cases.compile_fail("tests/safety_rails_compile_fail/protocol_fact_missing_into_runtime_fact.rs");
+    cases
+        .compile_fail("tests/safety_rails_compile_fail/protocol_fact_missing_into_runtime_fact.rs");
 }
 
 #[test]
