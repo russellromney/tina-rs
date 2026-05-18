@@ -4,6 +4,56 @@ This file records completed work.
 
 ## Unreleased
 
+### Phase 103 Protocol Parity Finish
+
+- Audited the native HTTP/2, gRPC, and WebSocket stacks for the
+  "Tina replaces the protocol, not the runtime" claim and aligned the docs
+  with what `tina-http` actually proves today.
+- HTTP/2: confirmed typed `Http2ProtocolError` covers bad preface, oversized
+  frame/headers/body, malformed pseudo-headers, flow-control, window
+  overflow, bad stream id, unsupported frames, and request trailers, plus
+  `Http2Outcome::{Replied, Full, Closed, FlowControlBlocked, Timeout,
+  ProtocolError, StreamReset(u32)}` and `Http2ConnectionReport` counters for
+  opened/closed/reset streams, connection/stream full, flow-control blocked,
+  GOAWAY sent, and late replies after close. Live tests cover unary,
+  streaming response, oversized request/response/frame/headers, stream cap,
+  concurrent streams, peer GOAWAY, window-update unblocking, stream-window
+  blocked bystander streams, inbound chunks continuing while a response
+  stream is flow-control blocked, inbound stream-window enforcement, and
+  window-credit return on data consumption.
+- gRPC: `GrpcRouter` ships unary, server-streaming, client-streaming, and
+  bidirectional streaming routes with typed `GrpcStatus` trailers, declared
+  message caps, deadline-to-`DeadlineExceeded` mapping, content-type
+  rejection, identity-encoding-only handling, and h2c tonic interop. Live
+  tests cover the full peer-reset cancellation path through both response
+  source and accepted service call sides, malformed frame final status,
+  declared message cap rejection, and concurrent gRPC streaming modes
+  sharing one HTTP/2 connection without cross-talk.
+- WebSocket: extracted `tina_http::WebSocketMemberTable` with `admit`,
+  `broadcast_text`/`broadcast_binary`, `fanout`, `shutdown_close`,
+  `remove_peer`, and `record_send_outcome`, plus the typed
+  `AdmitOutcome::{Admitted, AlreadyMember, Full}` and
+  `SendOutcomeAction::{Ok, RemovedSlow, RemovedClosed, RemovedProtocol,
+  RemovedTimeout, Stale}` enums. Counters live on
+  `WebSocketMemberTableReport`. The table preserves explicit admission,
+  fanout pressure, slow-peer eviction, and close reports; idle eviction,
+  the recurring liveness tick, and shutdown sequencing remain in the room
+  isolate that owns the table.
+- Migrated `examples/systems/system_realtime_rooms` to the new helper. The
+  smoke and bad-peer proofs still pass; the room's typed counters
+  (joined, left_idle/peer/slow/shutdown, presence ticks, shutdown_close_*)
+  now mirror the table's bookkeeping rather than reaching into a private
+  `BTreeMap`.
+- Documented the WebSocket helper in `tina-http`'s module docs, in
+  `examples/specimen_websocket_room/README.md`, and in
+  `examples/systems/system_realtime_rooms/README.md`.
+- ROADMAP "Native service protocols" row now names the typed HTTP/2 errors,
+  the four gRPC modes, the WebSocket browser proof, and the WebSocket
+  member-table helper, and lists what stays future work (native HTTP/2
+  client, HTTP/2 TLS ALPN/mTLS, gRPC reflection/interceptors/load
+  balancing, native broad WebSocket client, `permessage-deflate`,
+  web-framework ergonomics, and full WebSocket-bytes simulator replay).
+
 ### Phase 102 Host Control Ergonomics
 
 - Added address-routed `ThreadedMultiShardRuntime::call_blocking(addr, msg,
