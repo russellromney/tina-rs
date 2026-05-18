@@ -1,7 +1,7 @@
 use system_webhook_relay::{
     DeadLetterReason, DriverReply, FakeOutboundProgram, OutboundError, RelayReply, RunConfig, run,
 };
-use tina_aws_bridge::{FatalReason, TransientReason};
+use tina_aws_bridge::{BridgeFatal, BridgeRetryable, BridgeUnavailable};
 
 fn reply(d: &DriverReply) -> &RelayReply {
     match d {
@@ -32,13 +32,13 @@ fn delivered_throttled_and_dead_letter_are_classified_correctly() {
     assert!(matches!(
         reply(&report.replies[1]),
         RelayReply::Retry {
-            reason: TransientReason::ServiceThrottled
+            reason: BridgeRetryable::ServiceThrottled
         }
     ));
     assert!(matches!(
         reply(&report.replies[2]),
         RelayReply::DeadLetter {
-            reason: DeadLetterReason::Fatal(FatalReason::NotFound)
+            reason: DeadLetterReason::Fatal(BridgeFatal::NotFound)
         }
     ));
     assert!(matches!(
@@ -52,7 +52,7 @@ fn delivered_throttled_and_dead_letter_are_classified_correctly() {
 }
 
 #[test]
-fn full_and_closed_outcomes_are_transient_not_dead_letter() {
+fn full_is_retryable_and_closed_is_unavailable() {
     let report = run(RunConfig {
         events: 2,
         call_timeout_ms: 2_000,
@@ -66,17 +66,20 @@ fn full_and_closed_outcomes_are_transient_not_dead_letter() {
     assert!(matches!(
         reply(&report.replies[0]),
         RelayReply::Retry {
-            reason: TransientReason::BridgeFull
+            reason: BridgeRetryable::BridgeFull
         }
     ));
+    // `Closed` is `Unavailable` per the bridge classifier rules: retrying
+    // on the same handle reproduces the failure, so the relay dead-letters
+    // and the caller must rebuild the bridge.
     assert!(matches!(
         reply(&report.replies[1]),
-        RelayReply::Retry {
-            reason: TransientReason::BridgeClosed
+        RelayReply::DeadLetter {
+            reason: DeadLetterReason::Unavailable(BridgeUnavailable::BridgeClosed)
         }
     ));
-    assert_eq!(report.stats.transient, 2);
-    assert_eq!(report.stats.dead_letter, 0);
+    assert_eq!(report.stats.transient, 1);
+    assert_eq!(report.stats.dead_letter, 1);
 }
 
 #[test]
@@ -94,13 +97,13 @@ fn invalid_parameter_and_access_denied_are_dead_letter() {
     assert!(matches!(
         reply(&report.replies[0]),
         RelayReply::DeadLetter {
-            reason: DeadLetterReason::Fatal(FatalReason::InvalidParameter)
+            reason: DeadLetterReason::Fatal(BridgeFatal::InvalidParameter)
         }
     ));
     assert!(matches!(
         reply(&report.replies[1]),
         RelayReply::DeadLetter {
-            reason: DeadLetterReason::Fatal(FatalReason::AccessDenied)
+            reason: DeadLetterReason::Fatal(BridgeFatal::AccessDenied)
         }
     ));
     assert_eq!(report.stats.dead_letter, 2);

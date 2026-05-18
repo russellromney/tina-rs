@@ -46,6 +46,7 @@ Read in order if new:
 20. [Native WebSocket Server](20-native-websocket-server.md)
 21. [Compile-Time Safety Rails](21-compile-time-safety-rails.md)
 22. [HTTP/HTTP2/gRPC Protocol Facts](22-http-http2-grpc.md)
+23. [Bridge Author Kit (copied path)](30-bridge-author-kit.md)
 
 For runnable specimens, see repo-root `examples/`.
 

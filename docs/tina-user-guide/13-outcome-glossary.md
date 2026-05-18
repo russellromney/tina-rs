@@ -125,6 +125,10 @@ and shutdown rails. It is not the same as `CallOutcome`.
 | target/resource is gone | `Closed` |
 | acquire from a `WorkerPool` | `AcquireOutcome<H>` (or `try_acquired`) |
 | release a pool lease | `ReleaseOutcome` (or `try_released`) |
+| many callers wait on one key | `SharedWork<K, R>` (`Full` / `KeyFull`) |
+| one active cancelable request per key | `PendingCancelableCallSet<K, Q, R>` (`Full` / `DuplicateKey`) |
+| many cancelable attempts grouped by key | `CancelableWork<K, Q, R>` (`Full` / `KeyFull`) |
+| reply later to current caller | `call.defer(effect).reply(...)` |
 
 ## Rule
 

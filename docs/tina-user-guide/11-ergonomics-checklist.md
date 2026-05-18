@@ -780,6 +780,38 @@ waiter capacity and identity-checked leases. `PendingReplies` is
 still right for the *sharded-frontend* shape (one slot per inbound
 caller while a downstream call is in flight) — see below.
 
+### Many callers wait for one result — `SharedWork`
+
+> *Several callers asked for the same key. Start the upstream work once,
+> reply every parked caller with one value.*
+
+Use `tina_runtime::SharedWork::<K, R>::with_capacity(n)` (or
+`with_key_limit(n, per_key)`) for "many callers, one key" coalescing.
+The wrapper owns the parked callers only — the service still owns the
+fill-in-flight flag, the stale fill generation, the upstream call, and
+the retry policy.
+
+```rust
+let mut shared: SharedWork<CacheKey, CacheReply> =
+    SharedWork::with_capacity(64).named("cache.shared");
+
+match shared.wait(key.clone(), call) {
+    Ok(ticket) => {
+        if entry.filling.is_some() {
+            return request_effect_after_shared_wait(&ticket, noop());
+        }
+        request_effect_after_shared_wait(&ticket, start_fill(key))
+    }
+    Err(SharedWorkError::Full { call, .. })
+    | Err(SharedWorkError::KeyFull { call, .. }) => call.reply(CacheReply::Busy),
+}
+```
+
+`request_effect_after_shared_wait(&ticket, effect)` is the only path
+that produces a `RequestEffect` after the caller is parked. The ticket
+is move-only and its fields are crate-private, so a `RequestEffect` from
+`noop()` cannot escape admission. Lower-level name: `WaitList`.
+
 ### Bounded pending replies
 
 Use `tina_runtime::PendingReplies::<K, R>::with_capacity(n)` as the
@@ -854,6 +886,12 @@ build effects itself — that would force `tina` to depend on
 behind one helper call. Long explicit code is okay, short
 dishonest code is not.
 
+### One active cancelable request per key — `PendingCancelableCallSet`
+
+> *This key has at most one in-flight request at a time. A second attempt
+> with the same key is a `DuplicateKey` rejection so the service can reply
+> `Busy` or `AlreadyRunning` immediately.*
+
 For *cancelable deferred replies* started from `handle_call`, store the whole
 pending token in `tina_runtime::PendingCancelableCallSet<K, Q, R>`. The token
 owns both the original caller authority and the child cancel handle, so
@@ -882,6 +920,17 @@ On owner stop or local shutdown, drain the set and settle every token. If child
 work may still be pending, cancel the token and reply from that cancel
 continuation. Dropping the token leaks caller authority; replying without
 canceling drops the child handle and leaves the runtime doing work nobody owns.
+
+### Many cancelable requests grouped by key — `CancelableWork`
+
+> *This key can have several in-flight attempts at once — retries, racers,
+> per-key fanout — and each attempt is independently cancelable.*
+
+Use `tina_runtime::CancelableWork::<K, Q, R>::with_key_limit(n, per_key)`
+when a key may hold more than one live attempt. Admission returns a
+move-only `WorkTicket`; an older worker-return cannot remove a newer
+admit that reused the same key. Use `PendingCancelableCallSet` when only
+one live attempt per key is correct.
 
 ### Deadlines
 

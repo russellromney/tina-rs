@@ -272,7 +272,7 @@ Required:
 If something is still real product work, keep it Active and make the
 remaining build specific.
 
-## Rock 8: Protocol Fact Projection Names
+## Rock 8: Protocol Fact Projection Names — deferred (blocked by phase 112)
 
 Make the projection helpers do what their names say.
 
@@ -297,6 +297,29 @@ Update docs that mention these helpers so the copied path is honest:
 
 - `docs/tina-user-guide/08-simulation-and-dst.md`;
 - `docs/tina-user-guide/22-http-http2-grpc.md`.
+
+### Status (2026-05-18)
+
+Deferred until phase 112 (Protocol Facts To Replay) lands on `main`.
+The underlying infrastructure this rock requires —
+`RuntimeFact::Protocol(fact)`, `ProtocolFamily`,
+`RuntimeEventKind::FactObserved`, the named projection helpers
+themselves, and the `IntoRuntimeFact` registration bound — was drafted
+on a phase 112 branch but has not been merged. Verified by
+`grep -rn "RuntimeFact\|ProtocolFamily\|FactObserved" --include="*.rs" .`
+returning nothing on `main` at the start of phase 114.
+
+Two paths to unblock:
+
+1. land phase 112 first, then come back to this rock as the small
+   one-PR ergonomics fix the title promises; or
+2. fold phase 112's infrastructure into a follow-up phase 114-B PR
+   alongside the helper rename.
+
+This PR ships rocks 1–7 only. Both `docs/tina-user-guide/08-simulation-and-dst.md`
+and the not-yet-existing `22-http-http2-grpc.md` continue to describe
+only `TraceProjection::Exact` and `TraceProjection::Projected { ... }`,
+which is honest until the protocol-fact event kinds land.
 
 ## Tests
 
