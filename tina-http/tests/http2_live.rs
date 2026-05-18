@@ -25,6 +25,7 @@ const FLAG_END_STREAM: u8 = 0x1;
 const FLAG_END_HEADERS: u8 = 0x4;
 const FLAG_PADDED: u8 = 0x8;
 const FLAG_PRIORITY: u8 = 0x20;
+const SETTINGS_ENABLE_PUSH: u16 = 0x2;
 const SETTINGS_INITIAL_WINDOW_SIZE: u16 = 0x4;
 const SETTINGS_MAX_FRAME_SIZE: u16 = 0x5;
 
@@ -682,6 +683,18 @@ fn http2_invalid_settings_value_sends_goaway() {
 
     let frame = read_until_goaway(&mut stream);
     assert_eq!(goaway_error_code(&frame), ERR_FLOW_CONTROL_ERROR);
+    harness.shutdown();
+}
+
+#[test]
+fn http2_invalid_enable_push_value_sends_protocol_error() {
+    let harness = Http2Harness::start(Http2ServerConfig::default());
+    let mut stream = connect_h2(harness.addr);
+
+    write_settings(&mut stream, &[(SETTINGS_ENABLE_PUSH, 2)]);
+
+    let frame = read_until_goaway(&mut stream);
+    assert_eq!(goaway_error_code(&frame), ERR_PROTOCOL_ERROR);
     harness.shutdown();
 }
 

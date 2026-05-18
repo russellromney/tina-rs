@@ -16,7 +16,29 @@ be the canonical review artifact.
 File paths are relative to the repo root. Line numbers reflect the
 `worktree-adversarial-review` snapshot at the time of review.
 
-## Phase 123 Fix Status
+## Phase 123 First-Pass Coverage Status
+
+Phase 123's first PR currently fixes Rocks 1-3 plus H1 from Rock 5. The
+remaining first-pass rocks are still open and must not be treated as complete
+until fixed or proven false with tests.
+
+| Rock | Findings | Status |
+|---|---|---|
+| 1 | C1 | Fixed in this PR. |
+| 2 | H14, M1, M6, L13, L14, A6, A7 | Fixed in this PR. |
+| 3 | C2, C3, C5, H9, M7, M14 | Fixed in this PR. |
+| 4 | C4, M13 | Open. Not addressed by this PR. |
+| 5 | H1, H2, H13, M8, A1 | H1 fixed in this PR. H2, H13, M8, and A1 remain open. |
+| 6 | H6, L10, L11, A2 | Open. Not addressed by this PR. |
+| 7 | A3, A4, A5 | Open. Not addressed by this PR. |
+| 8 | H4, H5, H7, H10, H11, L5 | Open. Not addressed by this PR. |
+| 9 | H3, M5, M21, L1, L6, L8, L15 | Open. Not addressed by this PR. |
+| 10 | M2, M3, M16, M23, M24, M25, L2, L3, L4, L16 | Open. Not addressed by this PR. |
+| 11 | H8, H12, M11, M12, M22, L7, L9, L12 | Open. Not addressed by this PR. |
+| 12 | M9, M10, M15, M18, M19, M20, L17, L18 | Open. Not addressed by this PR. |
+| 13 | M4, M17 | Open. Not addressed by this PR. |
+
+## Phase 123 Fixed Finding Details
 
 The original findings below are preserved for history. Fixed items record
 the implementation proof and regression test names.
@@ -32,7 +54,7 @@ the implementation proof and regression test names.
 | M6 | Already fixed in the connection delivery path; Phase 123 added a live regression proving invalid fragmented text is closed before app echo/delivery. Test: `websocket_fragmented_text_invalid_utf8_rejects_before_app_delivery`. |
 | L14 | Fixed. HTTP/1 origin-form parsing rejects protocol-relative targets (`//host/path`). Test: `protocol_relative_target_is_not_origin_form`. |
 | C2 | Fixed. HTTP/2 DATA strips PADDED bytes before body accounting, and HEADERS strips PADDED plus PRIORITY bytes before HPACK. Tests: `http2_padded_data_delivers_only_unpadded_body`, `http2_bad_data_padding_sends_protocol_goaway`, `http2_priority_headers_with_valid_hpack_succeeds`, `http2_padded_priority_headers_with_valid_hpack_succeeds`, `http2_malformed_padded_priority_headers_rejects`. |
-| C3 | Fixed. SETTINGS frames are parsed and applied before ACK: peer `INITIAL_WINDOW_SIZE` updates open/new stream send windows, peer `MAX_FRAME_SIZE` controls outbound DATA splitting, invalid values reject, and unsupported non-default `HEADER_TABLE_SIZE` sends SETTINGS_ERROR. Tests: `http2_settings_initial_window_shrink_blocks_until_window_update`, `http2_settings_max_frame_size_controls_outbound_splitting`, `http2_invalid_settings_value_sends_goaway`, `http2_non_default_header_table_size_sends_settings_error`. |
+| C3 | Fixed. SETTINGS frames are parsed and applied before ACK: peer `INITIAL_WINDOW_SIZE` updates open/new stream send windows, peer `MAX_FRAME_SIZE` controls outbound DATA splitting, invalid values reject, and unsupported non-default `HEADER_TABLE_SIZE` sends SETTINGS_ERROR. Tests: `http2_settings_initial_window_shrink_blocks_until_window_update`, `http2_settings_max_frame_size_controls_outbound_splitting`, `http2_invalid_settings_value_sends_goaway`, `http2_invalid_enable_push_value_sends_protocol_error`, `http2_non_default_header_table_size_sends_settings_error`. |
 | C5 | Fixed with a conservative reset-churn guard that sends `ENHANCE_YOUR_CALM` once peer reset count exceeds the configured limit. Tests: `http2_rapid_reset_storm_sends_enhance_your_calm_goaway`, `http2_normal_reset_rate_allows_later_request`. |
 | H9 | Fixed. HTTP/2 request headers reject HTTP/1 connection-control names. Test: `http2_forbidden_connection_header_rejects`. |
 | M7 | Fixed in DATA/window hot paths by converting frame body lengths through checked `i32::try_from` before window arithmetic. Covered by `http2_padded_data_delivers_only_unpadded_body`, `http2_inbound_data_obeys_stream_window`, and `http2_settings_initial_window_shrink_blocks_until_window_update`. |

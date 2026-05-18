@@ -204,6 +204,7 @@ pub enum Http2ProtocolError {
     FlowControl,
     RequestTrailersUnsupported,
     SettingsUnsupported,
+    InvalidSettingsValue,
     UnsupportedFrame(u8),
 }
 
@@ -934,7 +935,7 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Http2Connection<
             }
             SETTINGS_ENABLE_PUSH => {
                 if value > 1 {
-                    return Err(Http2ProtocolError::SettingsUnsupported);
+                    return Err(Http2ProtocolError::InvalidSettingsValue);
                 }
             }
             SETTINGS_MAX_CONCURRENT_STREAMS => {}
