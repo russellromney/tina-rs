@@ -245,7 +245,7 @@ pub use scope::{
     RequestScopeInsertError, RequestScopeRemoveError, RequestScopeSet,
     RequestScopeSetCapacityReport, ScopeCancelCause, ScopeCancelReport, ScopeChildReport,
     ScopeRegisterError, ScopeRegisterSharedError, ScopedAdmitError, ScopedCallHandle,
-    scope_register,
+    ScopedReplyError, scope_register,
 };
 pub use service_pressure::{ServicePressureReport, ServicePressureSurface, ServiceSurfaceState};
 pub use shared_scope::{SharedCapacityScope, SharedLease, SharedScopeFull, SharedScopeReport};

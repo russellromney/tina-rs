@@ -57,6 +57,7 @@ exclude = [
     "examples/specimen_two_stage_pipeline",
     "examples/specimen_graceful_pool_shutdown",
     "examples/specimen_pool_cancel_reclaim",
+    "examples/specimen_request_scope_fanout",
     "examples/specimen_websocket_room",
 ]
 resolver = "2"

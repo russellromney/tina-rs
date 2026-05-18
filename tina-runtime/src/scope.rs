@@ -25,10 +25,23 @@
 //!
 //! ## Single-shard
 //!
-//! Scopes are owned by the isolate that runs the request. Cross-shard
-//! cancel is rejected by the underlying cancel rail
-//! ([`CancelOutcome::WrongShard`](tina::CancelOutcome)); the scope itself
-//! never tries to span shards.
+//! Scopes are owned by the isolate that runs the request. A scope is
+//! `Clone + Send`, so the same scope can be handed to a sibling
+//! isolate, but cross-shard *cancel* is rejected by the underlying
+//! cancel rail ([`CancelOutcome::WrongShard`](tina::CancelOutcome)).
+//! Per-child `WrongShard` rows surface in [`ScopeCancelReport`] when
+//! they happen — the scope does not silently swallow them.
+//!
+//! ## Two `CallerCancelled` causes
+//!
+//! `tina::CancelCause::CallerCancelled` is the *rail-level* fact that
+//! ends up in the runtime trace ("this call's wait was closed by an
+//! explicit cancel"). [`ScopeCancelCause::CallerCancelled`] is the
+//! *request-level* fact that ends up in the [`ScopeCancelReport`]
+//! ("the user told us to abort this request"). The names are the same
+//! because they describe the same event at two different layers; if a
+//! single fact in trace is enough to disambiguate, prefer the
+//! `tina::CancelCause` form there.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -252,18 +265,27 @@ impl RequestScope {
         self.inner.state.lock().unwrap().cancelled
     }
 
-    /// Registers a child rail for scope-wide cancellation.
+    /// Registers a child rail for scope-wide cancellation and **consumes
+    /// the typed handle**.
     ///
-    /// The scope keeps a clone of the handle's shared cell so a later
-    /// [`Self::cancel_into_effects`] can close the wait without taking
-    /// ownership of the typed handle. The typed handle stays with the
-    /// service (usually stored in a [`PendingCancelableCallSet`] via the
-    /// returned token from `defer_cancelable`), so worker-return paths
-    /// still answer the caller through the existing rail.
+    /// After this call, the scope is the sole owner of the cancellation
+    /// capability for this rail. The worker-return path (the
+    /// `.then(translator)` continuation set up by `call_cancelable`)
+    /// still delivers reply messages normally — the typed handle was
+    /// only needed to *cancel* the call, and the scope now does that.
+    ///
+    /// This is the right API for "fire-and-forget" rails where the
+    /// service only needs the worker-return continuation and never
+    /// wants to cancel one rail individually.
+    ///
+    /// For "I want the typed handle to stay available *and* scope
+    /// coverage" use [`scope_register`] (free function). For "I want to
+    /// admit into a [`PendingCancelableCallSet`] and a scope in one
+    /// atomic step" use [`DeferredScopedCall::try_admit`].
     ///
     /// On `Cancelled` or `Full`, the typed handle is returned in the
-    /// error so the service can recover authority without stranding the
-    /// caller.
+    /// error so the service can recover authority without stranding
+    /// the caller.
     pub fn register<R: 'static>(
         &self,
         label: &'static str,
@@ -290,13 +312,25 @@ impl RequestScope {
         Ok(())
     }
 
-    /// Registers an already-erased shared cell. Used by helpers that
-    /// already cloned the shared cell from a typed handle and want to
-    /// keep the typed handle on a [`PendingCancelableCall`] token.
+    /// Registers an already-erased shared cell.
     ///
-    /// Service code usually wires this through
-    /// [`crate::DeferredCancelableCall::reply_into_scope`] instead of
-    /// calling this directly.
+    /// This is the low-level primitive that
+    /// [`DeferredScopedCall::try_admit`] and [`scope_register`] both
+    /// use under the hood. Direct callers usually clone the shared cell
+    /// from a typed handle they want to keep alive
+    /// (`tina::runtime_internal::call_handle_shared(&handle).clone()`)
+    /// and pass it here.
+    ///
+    /// Most service code prefers one of the higher-level entries:
+    ///
+    /// - [`DeferredScopedCall::try_admit`] — admit into a
+    ///   [`PendingCancelableCallSet`] and scope in one atomic step.
+    /// - [`DeferredScopedCall::reply`] — register into the scope and
+    ///   hand back the pending token without admitting it to a set.
+    /// - [`Self::register`] — consume a typed handle into the scope
+    ///   (fire-and-forget cancel ownership).
+    /// - [`scope_register`] — keep the typed handle *and* register
+    ///   into the scope; receive a [`ScopedCallHandle`] wrapper.
     pub fn register_shared(
         &self,
         label: &'static str,
@@ -369,6 +403,32 @@ impl RequestScope {
             },
             effects,
         )
+    }
+
+    /// Marks the scope cancelled and returns one batched cancel effect
+    /// for the handler to return.
+    ///
+    /// Same semantics as [`Self::cancel_into_effects`]; this variant
+    /// pre-wraps the cancel effects in an [`Effect::Batch`] (or
+    /// [`Effect::Noop`] if the scope had no registered children) so the
+    /// caller's handler can simply `return scope.cancel_into_effect(...)`.
+    pub fn cancel_into_effect<I, F, M>(
+        &self,
+        cause: ScopeCancelCause,
+        translator: F,
+    ) -> (ScopeCancelReport, Effect<I>)
+    where
+        I: Isolate<Message = M, Call = RuntimeCall<M>>,
+        F: Fn(RequestScopeId, &'static str, CancelOutcome) -> M + Clone + Send + 'static,
+        M: 'static,
+    {
+        let (report, effects) = self.cancel_into_effects::<I, F, M>(cause, translator);
+        let effect = match effects.len() {
+            0 => Effect::Noop,
+            1 => effects.into_iter().next().expect("len() == 1"),
+            _ => Effect::Batch(effects),
+        };
+        (report, effect)
     }
 
     /// Marks the scope cancelled without producing cancel effects.
@@ -458,13 +518,22 @@ impl<R: 'static> ScopedCallHandle<R> {
     }
 }
 
-/// Registers `handle` into `scope` and returns the typed wrapper that
-/// preserves worker-return ownership.
+/// Registers `handle` into `scope` and returns a [`ScopedCallHandle`]
+/// that preserves typed cancel capability.
 ///
-/// Most service code uses
-/// [`DeferredCancelableCall::reply_into_scope`](crate::DeferredCancelableCall::reply_into_scope)
-/// instead, which combines admission into the scope with the
-/// `PendingCancelableCall` plumbing.
+/// The scope keeps a clone of the shared cell so it can cancel later;
+/// the returned [`ScopedCallHandle`] still owns the typed handle so the
+/// service can also cancel directly with `cancel_call(...)` or store it
+/// in a [`PendingCancelableCall`] for the worker-return path.
+///
+/// Use this when the service wants *both* fine-grained per-call cancel
+/// AND scope-wide cancel coverage. For "scope is sole canceller" use
+/// [`RequestScope::register`] (no `ScopedCallHandle` wrapper). For "one
+/// atomic admit into a bounded pending set + scope" use
+/// [`DeferredScopedCall::try_admit`].
+///
+/// On `Cancelled` or `Full`, the typed handle is returned in the error
+/// so the service can recover authority deliberately.
 pub fn scope_register<R: 'static>(
     scope: &RequestScope,
     label: &'static str,
@@ -674,6 +743,10 @@ pub struct DeferredScopedCall<T, R, Q> {
 }
 
 /// Failure modes for [`DeferredScopedCall::try_admit`].
+///
+/// Every variant carries enough information to recover caller authority
+/// and answer the original caller deliberately. No variant strands
+/// authority.
 #[derive(Debug)]
 pub enum ScopedAdmitError<K, Q, R> {
     /// The scope is already cancelled. The rejected pending token is
@@ -696,25 +769,87 @@ pub enum ScopedAdmitError<K, Q, R> {
     Pending(PendingCancelableInsertError<K, Q, R>),
 }
 
+impl<K, Q, R> ScopedAdmitError<K, Q, R>
+where
+    K: 'static,
+    Q: 'static,
+    R: 'static,
+{
+    /// Recovers the pending token from any failure variant, consuming
+    /// the error. Useful for the common "answer the caller Busy and
+    /// move on" branch that does not care which storage rejected.
+    pub fn into_token(self) -> PendingCancelableCall<K, Q, R> {
+        match self {
+            Self::ScopeCancelled { token, .. } => token,
+            Self::ScopeFull { token, .. } => token,
+            Self::Pending(PendingCancelableInsertError::Full { token }) => token,
+            Self::Pending(PendingCancelableInsertError::DuplicateKey { token }) => token,
+        }
+    }
+}
+
+/// Failure modes for [`DeferredScopedCall::reply`].
+///
+/// The lower-level scope-only path. There is no pending-set involvement,
+/// so the only failure is "the scope refused this registration."
+#[derive(Debug)]
+pub enum ScopedReplyError<K, Q, R> {
+    /// The scope is already cancelled.
+    ScopeCancelled {
+        /// Reason the scope was cancelled.
+        cause: ScopeCancelCause,
+        /// Pending token. Recover authority via
+        /// [`PendingCancelableCall::into_request_context`].
+        token: PendingCancelableCall<K, Q, R>,
+    },
+    /// The scope's child cap is full.
+    ScopeFull {
+        /// Configured child cap.
+        cap: usize,
+        /// Pending token.
+        token: PendingCancelableCall<K, Q, R>,
+    },
+}
+
+impl<K, Q, R> ScopedReplyError<K, Q, R>
+where
+    K: 'static,
+    Q: 'static,
+    R: 'static,
+{
+    /// Recovers the pending token from any failure variant.
+    pub fn into_token(self) -> PendingCancelableCall<K, Q, R> {
+        match self {
+            Self::ScopeCancelled { token, .. } => token,
+            Self::ScopeFull { token, .. } => token,
+        }
+    }
+}
+
 impl<T, R, Q> DeferredScopedCall<T, R, Q>
 where
     T: Send + 'static,
     R: 'static,
     Q: 'static,
 {
-    /// Builds the worker-return pending token and registers the rail
-    /// into the scope so a scope-wide cancel will close the wait.
+    /// Builds the worker-return token, admits it into `pending`, and
+    /// registers the rail into the scope so a scope-wide cancel will
+    /// close the wait.
     ///
-    /// Order of operations: register the rail's shared cell into the
-    /// scope first, then build the pending token. Admission into
-    /// [`PendingCancelableCallSet`] is the *gate* — only on success is
-    /// the child effect returned. On gate failure, the pending token is
-    /// returned in the error so the service can recover authority.
+    /// Order of operations is load-bearing:
     ///
-    /// The scope-side registration is best-effort: if the scope is
-    /// already cancelled or full, the caller still owns the typed
-    /// handle through the pending token and can settle the request on
-    /// its own.
+    /// 1. Build the pending token (consumes the caller authority).
+    /// 2. Admit the token into `pending`. On failure, return the token
+    ///    in the error and touch nothing else. The scope is unchanged.
+    /// 3. Register the rail's shared cell into the scope. On failure,
+    ///    *roll back* the pending insertion and return the recovered
+    ///    token in the error. The scope is again unchanged.
+    ///
+    /// Only when both storages commit is the child effect returned.
+    /// This guarantees that admission is all-or-nothing: a scope leak
+    /// (cancel coverage without caller authority) is impossible, and a
+    /// scope-coverage gap (caller authority without cancel coverage) is
+    /// also impossible.
     pub fn try_admit<I, F, M, K>(
         self,
         pending: &mut PendingCancelableCallSet<K, Q, R>,
@@ -727,35 +862,97 @@ where
         K: Clone + PartialEq + 'static,
         M: 'static,
     {
+        // Keep a copy of the key for the rollback path. `K: Clone` is
+        // already required by `reply_with_ticket`, so this is free.
+        let rollback_key = key.clone();
         let (token, effect) = self.inner.reply_with_ticket(key, translator);
+        // Clone the shared cell *before* the token leaves our hands, so
+        // we can register it into the scope after admission succeeds.
+        let shared = tina::runtime_internal::call_handle_shared(token.handle_ref()).clone();
 
-        // Register the shared cell into the scope using a borrow of the
-        // typed handle held by the token. The token still owns the typed
-        // handle for the worker-return path.
-        let shared = tina::runtime_internal::call_handle_shared(token_handle(&token)).clone();
+        // Step 1: admit into pending. On failure, scope is untouched.
+        let ticket = match pending.try_insert(token) {
+            Ok(ticket) => ticket,
+            Err(err) => return Err(ScopedAdmitError::Pending(err)),
+        };
+
+        // Step 2: register into scope. On failure, roll back step 1 so
+        // the caller can recover authority.
         match self.scope.register_shared(self.label, shared) {
-            Ok(()) => {}
-            Err(ScopeRegisterSharedError::Cancelled { cause }) => {
-                return Err(ScopedAdmitError::ScopeCancelled { cause, token });
+            Ok(()) => Ok(effect),
+            Err(scope_err) => {
+                // Recover the just-inserted token. Single-shard mailbox
+                // means nothing else can have touched the pending set
+                // since the insert returned the ticket, so the remove
+                // is infallible.
+                let token = pending.remove(&rollback_key, ticket).expect(
+                    "PendingCancelableCallSet::remove failed for an entry we just inserted; \
+                     scope rollback invariant violated",
+                );
+                match scope_err {
+                    ScopeRegisterSharedError::Cancelled { cause } => {
+                        Err(ScopedAdmitError::ScopeCancelled { cause, token })
+                    }
+                    ScopeRegisterSharedError::Full { cap } => {
+                        Err(ScopedAdmitError::ScopeFull { cap, token })
+                    }
+                }
             }
-            Err(ScopeRegisterSharedError::Full { cap }) => {
-                return Err(ScopedAdmitError::ScopeFull { cap, token });
-            }
-        }
-
-        match pending.try_insert(token) {
-            Ok(_ticket) => Ok(effect),
-            Err(err) => Err(ScopedAdmitError::Pending(err)),
         }
     }
-}
 
-// Borrow the typed handle field of a PendingCancelableCall via the
-// crate-private accessor (the field is private to `call.rs`).
-fn token_handle<K: 'static, Q: 'static, R: 'static>(
-    token: &PendingCancelableCall<K, Q, R>,
-) -> &CallHandle<R> {
-    token.handle_ref()
+    /// Lower-level form: register the rail into the scope and produce
+    /// the worker-return pending token *without* admitting it into a
+    /// [`PendingCancelableCallSet`]. The caller stores the token
+    /// wherever it wants (a single `Option`, a `HashMap`, a different
+    /// bounded set, …).
+    ///
+    /// Order of operations:
+    ///
+    /// 1. Build the pending token.
+    /// 2. Register the rail's shared cell into the scope.
+    ///    On failure, return the token in the error; the caller can
+    ///    recover authority via
+    ///    [`PendingCancelableCall::into_request_context`].
+    ///
+    /// Only on scope-register success is the `(token, effect)` pair
+    /// returned. Storage discipline for the token is the caller's
+    /// responsibility — losing it would strand caller authority.
+    ///
+    /// Most service code prefers [`Self::try_admit`], which composes
+    /// scope registration with a bounded [`PendingCancelableCallSet`]
+    /// in one atomic step. This lower-level form exists for services
+    /// that already have their own pending-token storage.
+    #[allow(clippy::type_complexity)]
+    pub fn reply<I, F, M, K>(
+        self,
+        key: K,
+        translator: F,
+    ) -> Result<(PendingCancelableCall<K, Q, R>, Effect<I>), ScopedReplyError<K, Q, R>>
+    where
+        I: Isolate<Message = M, Reply = Q, Call = RuntimeCall<M>>,
+        F: FnOnce(K, PendingCancelableTicket, CallOutcome<R>) -> M + 'static,
+        K: Clone + 'static,
+        M: 'static,
+    {
+        let (token, effect) = self.inner.reply_with_ticket(key, translator);
+        let shared = tina::runtime_internal::call_handle_shared(token.handle_ref()).clone();
+        match self.scope.register_shared(self.label, shared) {
+            Ok(()) => Ok((token, effect)),
+            Err(ScopeRegisterSharedError::Cancelled { cause }) => {
+                Err(ScopedReplyError::ScopeCancelled { cause, token })
+            }
+            Err(ScopeRegisterSharedError::Full { cap }) => {
+                Err(ScopedReplyError::ScopeFull { cap, token })
+            }
+        }
+    }
+
+    /// Returns the scope this builder will register into. Useful for
+    /// pre-checks (`scope.is_cancelled()`, capacity logging).
+    pub fn scope(&self) -> &RequestScope {
+        &self.scope
+    }
 }
 
 /// Trait helper so `CallContext::defer_scoped(scope, work)` reads naturally.
