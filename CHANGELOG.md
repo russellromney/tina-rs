@@ -20,6 +20,21 @@ This file records completed work.
   authority reject, and rapid reset churn produces `ENHANCE_YOUR_CALM`.
 - Fixed `tina-rpc-tokio` bridge cancellation accounting so a stale
   cancellation guard cannot double-release a bounded admission slot.
+- Added reserved cross-shard terminal reply lanes so remote `Full`/`Closed`
+  replies are not silently dropped behind ordinary remote traffic.
+- Unified bridge timeout/capacity truth across SQLx, AWS, reqwest, and Tokio
+  bridge paths with separate caller/external/late-work accounting.
+- Bounded runtime/process shutdown and journal repair paths: process cleanup,
+  snapshot temp cleanup, truncated journal append repair, and append-side tail
+  validation now settle with visible outcomes.
+- Hardened runtime hot paths and ownership truth: bounded trace retention is
+  amortized constant-time, buffered trace observers count drops, restart
+  budgets can be windowed, stopped restart entries are collected, cancelled
+  call cause-ring overflow is visible, and `PendingReplies::take()` is counted.
+- Tightened simulator/proof/macro surfaces: deterministic per-tag simulator
+  fault streams, explicit macro crate path overrides, core `Infallible`
+  expansion, duplicate RPC request-id rejection, async Tokio bridge drain, and
+  SQLx ambiguous-commit outcomes with completed step records.
 
 ### Phase 112 Protocol Facts To Replay
 
