@@ -33,7 +33,7 @@ What felt good:
 - `PendingReplies::drain_replies_with_into_effect` is exactly the helper a batch
   service wants at flush time.
 - Single-flight cache fill is a natural Tina shape: one explicit fill call, one
-  bounded waiter box, one flush of replies.
+  bounded `WaitList`, one flush of replies.
 
 What felt rough:
 
@@ -44,13 +44,13 @@ What felt rough:
 - `PendingReplies` is smooth from `handle(...)` via `try_capture`; from
   `handle_call(...)`, you currently pre-check capacity and insert
   `call.into_request_context().into_deferred()` manually.
-- The single-flight cache repeats that same manual call-capture ceremony,
-  making the proposed helper feel less speculative.
+- `WaitList` removes the old qid side table for single-flight cache waiters;
+  the remaining ceremony is the honest fill-in-flight state.
 
 Verdict:
 
 - Keep the explicit model.
 - Consider a tiny "race two/all" builder later if more services repeat the
   token/insert/cancel plumbing without needing custom branch state.
-- Consider a `PendingReplies::try_capture_call(call_ctx, key, full_reply)` style
-  helper only if `handle_call(...)` pending boxes become common.
+- Keep `WaitList` as the keyed-waiter helper until another system proves it
+  needs a higher-level `SingleFlight` wrapper.

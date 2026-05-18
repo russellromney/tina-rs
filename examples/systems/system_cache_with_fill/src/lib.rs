@@ -6,8 +6,8 @@ use std::time::Duration;
 
 use tina::prelude::*;
 use tina_runtime::{
-    CallOutcome, DefaultThreadedMailboxFactory, PendingReplies, SleepReply, SplitServiceHandle,
-    ThreadedRuntime, sleep,
+    CallOutcome, DefaultThreadedMailboxFactory, SleepReply, SplitServiceHandle, ThreadedRuntime,
+    WaitList, WaitListError, request_effect_after_wait_park, sleep,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -118,14 +118,12 @@ struct CacheEntry {
 #[derive(Debug)]
 struct FillState {
     generation: u64,
-    qids: Vec<u64>,
 }
 
 struct Cache {
     fill_delay: Duration,
-    pending: PendingReplies<u64, CacheReply>,
+    waiters: WaitList<String, CacheReply>,
     entries: HashMap<String, CacheEntry>,
-    next_qid: u64,
     fills_started: usize,
     fills_completed: usize,
     stale_completions: usize,
@@ -168,10 +166,9 @@ impl Cache {
     fn new(pending_capacity: usize, fill_delay: Duration) -> Self {
         Self {
             fill_delay,
-            pending: PendingReplies::with_capacity(pending_capacity)
-                .named("system_cache_with_fill.pending"),
+            waiters: WaitList::with_capacity(pending_capacity)
+                .named("system_cache_with_fill.waiters"),
             entries: HashMap::new(),
-            next_qid: 1,
             fills_started: 0,
             fills_completed: 0,
             stale_completions: 0,
@@ -192,62 +189,48 @@ impl Cache {
             });
         }
 
-        let qid = self.next_qid;
-        self.next_qid += 1;
-        call.capture(|request| {
-            let slot = request.into_deferred();
-            if let Err(error) = self.pending.try_insert(qid, slot) {
-                return match error {
-                    tina_runtime::PendingRepliesInsertError::Full(_, slot) => {
-                        self.busy_replies += 1;
-                        reply_to(slot, CacheReply::Busy)
-                    }
-                    tina_runtime::PendingRepliesInsertError::DuplicateKey(_, slot) => {
-                        reply_to(slot, CacheReply::Failed("duplicate waiter qid".into()))
-                    }
-                };
+        match self.waiters.park(key.clone(), call) {
+            Ok(ticket) => {
+                let entry = self.entries.entry(key.clone()).or_default();
+                if entry.filling.is_some() {
+                    return request_effect_after_wait_park(&ticket, noop());
+                }
+                let generation = entry.generation;
+                entry.filling = Some(FillState { generation });
+                self.fills_started += 1;
+                let fill_effect = sleep(self.fill_delay).then(move |result| {
+                    tina::ServiceMessage::Event(CacheEvent::FillDone {
+                        key,
+                        generation,
+                        result,
+                    })
+                });
+                request_effect_after_wait_park(&ticket, fill_effect)
             }
-
-            let entry = self.entries.entry(key.clone()).or_default();
-            if let Some(fill) = &mut entry.filling {
-                fill.qids.push(qid);
-                return noop();
+            Err(WaitListError::Full { call, .. }) => {
+                self.busy_replies += 1;
+                call.reply(CacheReply::Busy)
             }
-
-            let generation = entry.generation;
-            entry.filling = Some(FillState {
-                generation,
-                qids: vec![qid],
-            });
-            self.fills_started += 1;
-            sleep(self.fill_delay).then(move |result| {
-                tina::ServiceMessage::Event(CacheEvent::FillDone {
-                    key,
-                    generation,
-                    result,
-                })
-            })
-        })
+            Err(WaitListError::KeyFull { call, .. }) => {
+                self.busy_replies += 1;
+                call.reply(CacheReply::Busy)
+            }
+        }
     }
 
     fn invalidate(&mut self, key: String, call: RequestCall<'_, Self>) -> RequestEffect<Self> {
         self.invalidations += 1;
-        let entry = self.entries.entry(key).or_default();
+        let entry = self.entries.entry(key.clone()).or_default();
         entry.generation += 1;
         entry.value = None;
 
-        let Some(fill) = entry.filling.take() else {
+        let Some(_fill) = entry.filling.take() else {
             return call.reply(CacheReply::Invalidated);
         };
 
         call.capture(|request| {
-            self.stale_replies += fill.qids.len();
-            let mut effects = Vec::with_capacity(fill.qids.len() + 1);
-            for qid in fill.qids {
-                if let Some(slot) = self.pending.take(&qid) {
-                    effects.push(reply_to::<Self>(slot, CacheReply::Stale));
-                }
-            }
+            let mut effects = self.waiters.close_all_clone::<Self>(&key, CacheReply::Stale);
+            self.stale_replies += effects.len();
             effects.push(reply_to_request::<Self>(request, CacheReply::Invalidated));
             Effect::Batch(effects)
         })
@@ -274,32 +257,20 @@ impl Cache {
                 let value = format!("value:{key}:g{generation}");
                 entry.value = Some(value.clone());
                 self.fills_completed += 1;
-                let mut effects = Vec::with_capacity(fill.qids.len());
-                for qid in fill.qids {
-                    if let Some(slot) = self.pending.take(&qid) {
-                        effects.push(reply_to::<Self>(
-                            slot,
-                            CacheReply::Value {
-                                key: key.clone(),
-                                value: value.clone(),
-                                source: ValueSource::Fill,
-                            },
-                        ));
+                Effect::Batch(self.waiters.reply_all_with::<Self, _>(&key, || {
+                    CacheReply::Value {
+                        key: key.clone(),
+                        value: value.clone(),
+                        source: ValueSource::Fill,
                     }
-                }
-                Effect::Batch(effects)
+                }))
             }
             Err(error) => {
-                let mut effects = Vec::with_capacity(fill.qids.len());
-                for qid in fill.qids {
-                    if let Some(slot) = self.pending.take(&qid) {
-                        effects.push(reply_to::<Self>(
-                            slot,
-                            CacheReply::Failed(format!("{error:?}")),
-                        ));
-                    }
-                }
-                Effect::Batch(effects)
+                let message = format!("{error:?}");
+                Effect::Batch(
+                    self.waiters
+                        .reply_all_with::<Self, _>(&key, || CacheReply::Failed(message.clone())),
+                )
             }
         }
     }
@@ -318,8 +289,8 @@ impl Cache {
             hits: self.hits,
             busy_replies: self.busy_replies,
             stale_replies: self.stale_replies,
-            pending_high_water: self.pending.high_water(),
-            pending_full_rejects: self.pending.full_rejects(),
+            pending_high_water: self.waiters.high_water(),
+            pending_full_rejects: self.waiters.full_rejects(),
         }
     }
 }
