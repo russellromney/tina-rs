@@ -15,8 +15,8 @@ use std::time::Duration;
 use tina::prelude::*;
 use tina::{CallRejectedReason, reply_to};
 use tina_runtime::{
-    CallOutcome, CancelableWork, DefaultThreadedMailboxFactory, GuardedPendingReplies,
-    GuardedParkCallError, ParkCallError, PendingReplies, ThreadedRuntime, WaitList, sleep,
+    CallOutcome, CancelableWork, DefaultThreadedMailboxFactory, GuardedParkCallError,
+    GuardedPendingReplies, ParkCallError, PendingReplies, ThreadedRuntime, WaitList, sleep,
 };
 
 // ---------------------------------------------------------------------------
@@ -63,8 +63,7 @@ impl ParkSvc {
                             noop()
                         } else {
                             self.armed = true;
-                            sleep(Duration::from_millis(10))
-                                .then_event(|| ParkSvcMsg::Flush)
+                            sleep(Duration::from_millis(10)).then_event(|| ParkSvcMsg::Flush)
                         }
                     }
                     Err(ParkCallError::Full { call, .. }) => call.reply(99u32),
@@ -286,8 +285,7 @@ impl GuardSvc {
                             noop()
                         } else {
                             self.armed = true;
-                            sleep(Duration::from_millis(10))
-                                .then_event(|| GuardSvcMsg::Flush)
+                            sleep(Duration::from_millis(10)).then_event(|| GuardSvcMsg::Flush)
                         }
                     }
                     Err(GuardedParkCallError::Full { call, .. }) => call.reply(99),
@@ -452,20 +450,16 @@ impl WaitSvc {
                         noop()
                     } else {
                         self.armed = true;
-                        sleep(Duration::from_millis(20))
-                            .then_event(|| WaitSvcMsg::Resolve)
+                        sleep(Duration::from_millis(20)).then_event(|| WaitSvcMsg::Resolve)
                     }
                 }
                 Err(tina_runtime::wait_list::WaitCallError::Full { call, .. }) => call.reply(0),
-                Err(tina_runtime::wait_list::WaitCallError::KeyFull { call, .. }) => {
-                    call.reply(0)
-                }
+                Err(tina_runtime::wait_list::WaitCallError::KeyFull { call, .. }) => call.reply(0),
                 Err(tina_runtime::wait_list::WaitCallError::NoCaller { call, .. }) => {
                     call.reject(CallRejectedReason::UnsupportedMessage)
                 }
                 Err(tina_runtime::wait_list::WaitCallError::CrossShardUnsupported {
-                    call,
-                    ..
+                    call, ..
                 }) => call.reject(CallRejectedReason::UnsupportedMessage),
             },
             WaitSvcMsg::Resolve => call.reject(CallRejectedReason::UnsupportedMessage),
@@ -546,9 +540,9 @@ impl WaitFullSvc {
             Err(tina_runtime::wait_list::WaitCallError::NoCaller { call, .. }) => {
                 call.reject(CallRejectedReason::UnsupportedMessage)
             }
-            Err(tina_runtime::wait_list::WaitCallError::CrossShardUnsupported {
-                call, ..
-            }) => call.reject(CallRejectedReason::UnsupportedMessage),
+            Err(tina_runtime::wait_list::WaitCallError::CrossShardUnsupported { call, .. }) => {
+                call.reject(CallRejectedReason::UnsupportedMessage)
+            }
         }
     }
 }
@@ -580,7 +574,8 @@ fn waitlist_per_key_full_returns_typed_keyfull_reply() {
             gate_h.wait();
             // Short timeout; the two parked callers will time out, the
             // rejected caller returns quickly with 11.
-            let r = rt.call_blocking_typed(svc.call, WaitFullMsg::GetOne, Duration::from_millis(300));
+            let r =
+                rt.call_blocking_typed(svc.call, WaitFullMsg::GetOne, Duration::from_millis(300));
             if let Ok(CallOutcome::Replied(v)) = r {
                 out.lock().expect("out").push(v);
             }
@@ -636,8 +631,7 @@ fn park_call_timed_out_caller_does_not_block_a_fresh_admission() {
         // ParkSvc's flush fires 10ms after admission. We deliberately
         // park here and let the runtime hold the slot; the goal is that
         // even a long-held slot does not strand a *future* caller.
-        let _ =
-            rt.call_blocking_typed(svc_call, ParkSvcMsg::Hold, Duration::from_millis(5));
+        let _ = rt.call_blocking_typed(svc_call, ParkSvcMsg::Hold, Duration::from_millis(5));
     });
     first.join().expect("first");
 
