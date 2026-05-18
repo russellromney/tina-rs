@@ -732,6 +732,11 @@ where
         self.trace.len()
     }
 
+    #[cfg(test)]
+    fn entry_count(&self) -> usize {
+        self.entries.len()
+    }
+
     /// Walks the current trace and returns a counted summary of
     /// pressure-shaped events (mailbox-full, reply-path-full,
     /// send-full, lifecycle-closed). See [`PressureSummary`].
@@ -1592,6 +1597,7 @@ where
         self.round_messages = round_messages;
 
         self.sweep_dropped_deferred_slots();
+        self.gc_stopped_entries();
 
         delivered
     }
@@ -3603,6 +3609,58 @@ where
         if self.trace_start >= self.trace.len() || self.trace_start >= threshold {
             self.compact_trace_prefix();
         }
+    }
+
+    fn gc_stopped_entries(&mut self) {
+        let mut index = 0;
+        while index < self.entries.len() {
+            if self.can_gc_stopped_entry(index) {
+                self.entries.remove(index);
+            } else {
+                index += 1;
+            }
+        }
+    }
+
+    fn can_gc_stopped_entry(&self, index: usize) -> bool {
+        let entry = &self.entries[index];
+        if !entry.stopped.get() {
+            return false;
+        }
+        let address = RegisteredAddress {
+            shard: self.shard.id(),
+            isolate: entry.id,
+            generation: entry.generation,
+        };
+        if self
+            .child_records
+            .iter()
+            .any(|record| record.parent == entry.id || record.child == address)
+        {
+            return false;
+        }
+        if self
+            .supervisors
+            .iter()
+            .any(|record| record.parent == address)
+        {
+            return false;
+        }
+        if self
+            .in_flight_calls
+            .iter()
+            .any(|call| call.requester == address)
+        {
+            return false;
+        }
+        if self
+            .pending_isolate_calls
+            .iter()
+            .any(|call| call.requester == address)
+        {
+            return false;
+        }
+        true
     }
 
     fn enqueue_entry_message(

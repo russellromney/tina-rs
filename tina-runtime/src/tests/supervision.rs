@@ -274,6 +274,11 @@ fn windowed_restart_budget_resets_after_period() {
     let second_replacement = runtime.child_record_snapshot()[0].child_isolate;
 
     assert_ne!(first_replacement, second_replacement);
+    assert_eq!(
+        runtime.entry_count(),
+        2,
+        "old stopped child entries should be collected after restart work settles"
+    );
     assert_eq!(factory_calls.get(), 3);
     assert!(
         !supervisor_events(runtime.trace())
