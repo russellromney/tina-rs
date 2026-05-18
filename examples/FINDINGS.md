@@ -31,11 +31,15 @@ What felt good:
 
 What felt rough:
 
-- `pending_facts` queue in the HTTP/2 connection isolate exists
-  because many helpers there return `Result` without an `effects`
-  vector. Refactoring those signatures to thread effects through
-  cleanly would let us emit facts at the point they become true
-  instead of draining at handler return; deferred.
+- Threading a mutable `effects: &mut Vec<Effect<Self>>` through five
+  layers of response helpers (`enqueue_response`,
+  `queue_or_send_response`, `send_pending_response`,
+  `flush_pending_responses`, `handle_window_update`) is the price of
+  emitting facts at the point each truth happens. The alternative
+  shape — buffering facts on the isolate and draining at handler
+  return — was tried and reverted: it added a hidden `pending_facts`
+  field, separated emission from truth, and was a worse spelling. The
+  thread-through version is verbose but makes the call sites honest.
 
 ### 2. ScatterCoord setup is heavy for the happy path
 

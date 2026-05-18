@@ -1951,6 +1951,31 @@ mod stable_hash_tests {
     }
 
     #[test]
+    fn non_fact_event_stable_hash_did_not_change_in_phase_112() {
+        // Golden hash for a fixed non-fact event. Phase 112 added a new
+        // RuntimeEventKind variant and a new EffectKind variant; this
+        // test pins that those additions did NOT change the hash of an
+        // event that does not use them. If a future change accidentally
+        // shifts the tag mixing for old variants, this number changes.
+        let event = RuntimeEvent::new(
+            EventId::new(7),
+            Some(CauseId::new(EventId::new(3))),
+            ShardId::new(0),
+            IsolateId::new(42),
+            RuntimeEventKind::SendAccepted {
+                target_shard: ShardId::new(0),
+                target_isolate: IsolateId::new(99),
+                target_generation: AddressGeneration::new(1),
+            },
+        );
+        // Pinned at the Phase 112 commit. If this assertion fires, either
+        // we shifted a tag for an existing variant (regression) or we
+        // intentionally rebased the trace contract (in which case the
+        // user-facing replay docs must call it out).
+        assert_eq!(event.stable_hash(), 0x7ebc64a1613463c7);
+    }
+
+    #[test]
     fn fact_observed_event_tag_is_thirty_six() {
         // The kind body of `FactObserved` starts with the literal tag byte 36.
         let event = RuntimeEvent::new(

@@ -606,10 +606,6 @@ pub struct Http2Connection<S: Shard, M: From<HttpRequest> + Send + 'static = Htt
     pending_write: Vec<u8>,
     write_queue: VecDeque<Vec<u8>>,
     report: Http2ConnectionReport,
-    /// Facts produced by code paths that do not have a borrowable effects
-    /// vector. Drained by the handler before returning so they ride the same
-    /// `Effect::Batch` as other effects.
-    pending_facts: Vec<ProtocolFact>,
     self_shard_id: Option<tina::ShardId>,
     self_isolate_id: Option<tina::IsolateId>,
     _shard: PhantomData<S>,
@@ -640,7 +636,6 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Http2Connection<
             pending_write: Vec::new(),
             write_queue: VecDeque::new(),
             report: Http2ConnectionReport::default(),
-            pending_facts: Vec::new(),
             self_shard_id: None,
             self_isolate_id: None,
             _shard: PhantomData,
@@ -660,20 +655,6 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Http2Connection<
 
     fn emit_protocol_fact(&self, effects: &mut Vec<Effect<Self>>, fact: ProtocolFact) {
         effects.push(tina::fact::<Self>(fact));
-    }
-
-    /// Queues a protocol fact for emission at the next effect-collection
-    /// point. Use when the surrounding helper has no `effects` vector in
-    /// scope; the next `drain_pending_facts` call will push them.
-    fn queue_protocol_fact(&mut self, fact: ProtocolFact) {
-        self.pending_facts.push(fact);
-    }
-
-    /// Drains any queued protocol facts into `effects` in arrival order.
-    fn drain_pending_facts(&mut self, effects: &mut Vec<Effect<Self>>) {
-        for fact in self.pending_facts.drain(..) {
-            effects.push(tina::fact::<Self>(fact));
-        }
     }
 }
 
@@ -718,7 +699,7 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Isolate for Http
             self.self_shard_id = Some(ctx.shard_id());
             self.self_isolate_id = Some(ctx.isolate_id());
         }
-        let primary = match msg {
+        match msg {
             Http2ConnectionMsg::Begin => self.read_more(),
             Http2ConnectionMsg::Read(Ok(bytes)) => self.handle_read(bytes),
             Http2ConnectionMsg::Read(Err(_)) => self.close_now(),
@@ -736,14 +717,7 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Isolate for Http
             Http2ConnectionMsg::RequestBodyNext { .. } => noop(),
             Http2ConnectionMsg::Stop => self.begin_goaway_shutdown(),
             Http2ConnectionMsg::Report => noop(),
-        };
-        if self.pending_facts.is_empty() {
-            return primary;
         }
-        let mut combined = Vec::with_capacity(self.pending_facts.len() + 1);
-        combined.push(primary);
-        self.drain_pending_facts(&mut combined);
-        batch(combined)
     }
 
     fn handle_call(
@@ -864,7 +838,7 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Http2Connection<
             FRAME_HEADERS => self.handle_headers(frame, effects),
             FRAME_DATA => self.handle_data(frame, effects),
             FRAME_WINDOW_UPDATE => {
-                self.handle_window_update(frame)?;
+                self.handle_window_update(frame, effects)?;
                 self.push_ready_response_pulls(effects);
                 Ok(())
             }
@@ -1147,7 +1121,11 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Http2Connection<
         Ok(())
     }
 
-    fn handle_window_update(&mut self, frame: Frame) -> Result<(), Http2ProtocolError> {
+    fn handle_window_update(
+        &mut self,
+        frame: Frame,
+        effects: &mut Vec<Effect<Self>>,
+    ) -> Result<(), Http2ProtocolError> {
         if frame.payload.len() != 4 {
             return Err(Http2ProtocolError::BadFrameLength);
         }
@@ -1162,7 +1140,7 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Http2Connection<
         } else if let Some(idx) = self.find_stream(frame.stream_id) {
             self.streams[idx].send_window = add_window(self.streams[idx].send_window, increment)?;
         }
-        self.flush_pending_responses()?;
+        self.flush_pending_responses(effects)?;
         Ok(())
     }
 
@@ -1340,9 +1318,10 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Http2Connection<
         if let Some(idx) = self.find_stream(stream_id) {
             let _ = self.streams[idx].pending_call.take();
         }
+        let mut effects = Vec::new();
         match outcome {
             CallOutcome::Replied(response) => {
-                if let Err(error) = self.enqueue_response(stream_id, &response) {
+                if let Err(error) = self.enqueue_response(stream_id, &response, &mut effects) {
                     self.report.protocol_errors += 1;
                     let code = match error {
                         Http2ProtocolError::FlowControl => ERR_FLOW_CONTROL_ERROR,
@@ -1360,7 +1339,7 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Http2Connection<
                 } else {
                     HttpResponse::service_unavailable()
                 };
-                let _ = self.enqueue_response(stream_id, &response);
+                let _ = self.enqueue_response(stream_id, &response, &mut effects);
             }
             CallOutcome::Closed | CallOutcome::Rejected(_) => {
                 let response = if grpc {
@@ -1370,7 +1349,7 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Http2Connection<
                 } else {
                     HttpResponse::internal_error()
                 };
-                let _ = self.enqueue_response(stream_id, &response);
+                let _ = self.enqueue_response(stream_id, &response, &mut effects);
             }
             CallOutcome::Timeout => {
                 let response = if grpc {
@@ -1380,10 +1359,9 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Http2Connection<
                 } else {
                     HttpResponse::gateway_timeout()
                 };
-                let _ = self.enqueue_response(stream_id, &response);
+                let _ = self.enqueue_response(stream_id, &response, &mut effects);
             }
         }
-        let mut effects = Vec::new();
         if self.pending_write.is_empty() && !self.write_queue.is_empty() {
             effects.push(self.write_more());
         }
@@ -1401,6 +1379,7 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Http2Connection<
         &mut self,
         stream_id: u32,
         response: &HttpResponse,
+        effects: &mut Vec<Effect<Self>>,
     ) -> Result<(), Http2ProtocolError> {
         let body = match &response.body {
             HttpResponseBody::Buffered(bytes) => {
@@ -1409,6 +1388,15 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Http2Connection<
                     self.enqueue_frame(rst_stream_frame(stream_id, ERR_ENHANCE_YOUR_CALM))?;
                     self.remove_stream(stream_id);
                     self.report.closed_streams += 1;
+                    self.emit_protocol_fact(
+                        effects,
+                        ProtocolFact::Http2StreamReset {
+                            connection: self.connection_fact_id(),
+                            stream: Http2StreamId::new(stream_id),
+                            direction: ProtocolDirection::Outbound,
+                            reason: Http2ResetReason::EnhanceYourCalm,
+                        },
+                    );
                     return Ok(());
                 }
                 bytes.clone()
@@ -1437,6 +1425,7 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Http2Connection<
                 body,
                 trailers,
             },
+            effects,
         )
     }
 
@@ -1463,6 +1452,7 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Http2Connection<
         &mut self,
         stream_id: u32,
         pending: PendingResponse,
+        effects: &mut Vec<Effect<Self>>,
     ) -> Result<(), Http2ProtocolError> {
         let idx = self
             .find_stream(stream_id)
@@ -1471,16 +1461,29 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Http2Connection<
             || pending.body.len() as i32 > self.streams[idx].send_window
         {
             self.report.flow_control_blocked += 1;
+            self.emit_protocol_fact(
+                effects,
+                ProtocolFact::Http2FlowControlFull {
+                    connection: self.connection_fact_id(),
+                    stream: Http2StreamId::new(stream_id),
+                    side: if (pending.body.len() as i32) > self.send_window {
+                        Http2FlowControlSide::ConnectionSend
+                    } else {
+                        Http2FlowControlSide::StreamSend
+                    },
+                },
+            );
             self.streams[idx].pending_response = Some(pending);
             return Ok(());
         }
-        self.send_pending_response(stream_id, pending)
+        self.send_pending_response(stream_id, pending, effects)
     }
 
     fn send_pending_response(
         &mut self,
         stream_id: u32,
         pending: PendingResponse,
+        effects: &mut Vec<Effect<Self>>,
     ) -> Result<(), Http2ProtocolError> {
         let idx = self
             .find_stream(stream_id)
@@ -1513,11 +1516,14 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Http2Connection<
         self.streams[idx].state = Http2StreamState::Closed;
         self.remove_stream(stream_id);
         self.report.closed_streams += 1;
-        self.queue_protocol_fact(ProtocolFact::Http2StreamClosed {
-            connection: self.connection_fact_id(),
-            stream: Http2StreamId::new(stream_id),
-            reason: Http2CloseReason::EndStream,
-        });
+        self.emit_protocol_fact(
+            effects,
+            ProtocolFact::Http2StreamClosed {
+                connection: self.connection_fact_id(),
+                stream: Http2StreamId::new(stream_id),
+                reason: Http2CloseReason::EndStream,
+            },
+        );
         Ok(())
     }
 
@@ -1540,7 +1546,10 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Http2Connection<
         .then(move |outcome| Http2ConnectionMsg::StreamChunk { stream_id, outcome })
     }
 
-    fn flush_pending_responses(&mut self) -> Result<(), Http2ProtocolError> {
+    fn flush_pending_responses(
+        &mut self,
+        effects: &mut Vec<Effect<Self>>,
+    ) -> Result<(), Http2ProtocolError> {
         let ids: Vec<u32> = self.streams.iter().map(|s| s.id).collect();
         for stream_id in ids {
             let Some(idx) = self.find_stream(stream_id) else {
@@ -1556,7 +1565,7 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Http2Connection<
                     .pending_response
                     .take()
                     .expect("checked pending response");
-                self.send_pending_response(stream_id, pending)?;
+                self.send_pending_response(stream_id, pending, effects)?;
             }
             self.flush_response_stream(stream_id)?;
         }
@@ -1636,12 +1645,12 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Http2Connection<
                 }
                 self.remove_stream(stream_id);
                 self.report.closed_streams += 1;
-                self.queue_protocol_fact(ProtocolFact::Http2StreamClosed {
+                let close_fact = tina::fact::<Self>(ProtocolFact::Http2StreamClosed {
                     connection: self.connection_fact_id(),
                     stream: Http2StreamId::new(stream_id),
                     reason: Http2CloseReason::EndStream,
                 });
-                self.maybe_write_effect()
+                batch(vec![close_fact, self.maybe_write_effect()])
             }
             CallOutcome::Replied(ResponseChunkReply::GrpcStatus(status)) => {
                 let grpc_status_code = crate::grpc::classify_grpc_status_code(&status);
@@ -1653,16 +1662,16 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Http2Connection<
                 }
                 self.remove_stream(stream_id);
                 self.report.closed_streams += 1;
-                self.queue_protocol_fact(ProtocolFact::GrpcFinalStatusSent {
+                let status_fact = tina::fact::<Self>(ProtocolFact::GrpcFinalStatusSent {
                     stream: tina_runtime::GrpcStreamId::new(stream_id as u64),
                     status: grpc_status_code,
                 });
-                self.queue_protocol_fact(ProtocolFact::Http2StreamClosed {
+                let close_fact = tina::fact::<Self>(ProtocolFact::Http2StreamClosed {
                     connection: self.connection_fact_id(),
                     stream: Http2StreamId::new(stream_id),
                     reason: Http2CloseReason::EndStream,
                 });
-                self.maybe_write_effect()
+                batch(vec![status_fact, close_fact, self.maybe_write_effect()])
             }
             CallOutcome::Full
             | CallOutcome::Closed
@@ -2177,8 +2186,9 @@ mod tests {
     fn zero_window_update_is_protocol_error() {
         let mut conn = unit_connection();
         let frame = Frame::new(FRAME_WINDOW_UPDATE, 0, 0, 0_u32.to_be_bytes().to_vec());
+        let mut effects: Vec<Effect<Http2Connection<UnitShard>>> = Vec::new();
         assert_eq!(
-            conn.handle_window_update(frame),
+            conn.handle_window_update(frame, &mut effects),
             Err(Http2ProtocolError::WindowOverflow)
         );
     }
@@ -2212,11 +2222,28 @@ mod tests {
             DEFAULT_WINDOW,
             false,
         ));
-        conn.enqueue_response(1, &HttpResponse::with_body(StatusCode::OK, b"abc".to_vec()))
-            .expect("response cap maps to rst, not connection error");
+        let mut effects: Vec<Effect<Http2Connection<UnitShard>>> = Vec::new();
+        conn.enqueue_response(
+            1,
+            &HttpResponse::with_body(StatusCode::OK, b"abc".to_vec()),
+            &mut effects,
+        )
+        .expect("response cap maps to rst, not connection error");
         assert_eq!(conn.report().stream_full, 1);
         assert!(conn.find_stream(1).is_none());
         assert_eq!(conn.write_queue.len(), 1);
+        // The body-cap reset path emits a typed reset fact in the same turn.
+        assert!(
+            effects.iter().any(|effect| matches!(
+                effect,
+                Effect::Fact(ProtocolFact::Http2StreamReset {
+                    reason: Http2ResetReason::EnhanceYourCalm,
+                    direction: ProtocolDirection::Outbound,
+                    ..
+                })
+            )),
+            "expected an outbound EnhanceYourCalm reset fact",
+        );
     }
 
     #[test]
@@ -2385,5 +2412,263 @@ mod tests {
             ERR_PROTOCOL_ERROR
         );
         assert_eq!(code_for(Http2ProtocolError::BadPreface), ERR_PROTOCOL_ERROR);
+    }
+
+    // ------------------------------------------------------------------
+    // Phase 112 protocol-fact emission coverage.
+    //
+    // These tests pin the *emission points*: each named protocol fact
+    // must show up in the effects vector at the moment its truth becomes
+    // true. They complement the runtime+sim end-to-end tests by proving
+    // the http2 path actually feeds Effect::Fact through.
+
+    fn collect_facts(effects: &[Effect<Http2Connection<UnitShard>>]) -> Vec<&ProtocolFact> {
+        effects
+            .iter()
+            .filter_map(|effect| match effect {
+                Effect::Fact(fact) => Some(fact),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn open_then_clean_send_emits_open_and_close_facts_in_order() {
+        // Two-step proof that the open->close lifecycle produces the two
+        // matching protocol facts in the correct order across two
+        // handler turns.
+        let mut conn = unit_connection();
+        let mut open_effects: Vec<Effect<Http2Connection<UnitShard>>> = Vec::new();
+        let mut block = Vec::new();
+        encode_literal_header(":method", "GET", &mut block);
+        encode_literal_header(":scheme", "http", &mut block);
+        encode_literal_header(":path", "/", &mut block);
+        encode_literal_header(":authority", "x", &mut block);
+        conn.handle_headers(
+            Frame::new(FRAME_HEADERS, FLAG_END_HEADERS | FLAG_END_STREAM, 1, block),
+            &mut open_effects,
+        )
+        .expect("open accepted");
+        let open_facts = collect_facts(&open_effects);
+        assert!(
+            open_facts
+                .iter()
+                .any(|f| matches!(f, ProtocolFact::Http2StreamOpened { .. }))
+        );
+
+        // Now feed a buffered reply through the same isolate; the
+        // send_pending_response path is responsible for the
+        // Http2StreamClosed fact.
+        let mut close_effects: Vec<Effect<Http2Connection<UnitShard>>> = Vec::new();
+        let response = HttpResponse::text("ok");
+        conn.enqueue_response(1, &response, &mut close_effects)
+            .expect("reply accepted");
+        let close_facts = collect_facts(&close_effects);
+        assert!(
+            close_facts.iter().any(
+                |f| matches!(f, ProtocolFact::Http2StreamClosed { stream, .. } if stream.get() == 1)
+            ),
+            "expected stream-closed fact, got {close_facts:?}",
+        );
+    }
+
+    #[test]
+    fn body_cap_exceeded_emits_high_water_and_reset_facts() {
+        // DATA past max_body_bytes triggers the high-water and the
+        // outbound RST fact, in that order, on the same handler turn.
+        let mut conn = unit_connection();
+        conn.limits.max_body_bytes = 4;
+        conn.preface_seen = true;
+        // Open the stream first.
+        let mut effects: Vec<Effect<Http2Connection<UnitShard>>> = Vec::new();
+        let mut block = Vec::new();
+        encode_literal_header(":method", "POST", &mut block);
+        encode_literal_header(":scheme", "http", &mut block);
+        encode_literal_header(":path", "/upload", &mut block);
+        encode_literal_header(":authority", "x", &mut block);
+        encode_literal_header("content-length", "8", &mut block);
+        conn.handle_headers(
+            Frame::new(FRAME_HEADERS, FLAG_END_HEADERS, 1, block),
+            &mut effects,
+        )
+        .expect("open");
+        effects.clear();
+
+        // Send 5 bytes of body; cap is 4, so the high-water fact and
+        // a reset fact must both show up.
+        let data = Frame::new(FRAME_DATA, 0, 1, b"hello".to_vec());
+        conn.handle_data(data, &mut effects).expect("data accepted");
+        let facts = collect_facts(&effects);
+        assert!(
+            facts.iter().any(|f| matches!(
+                f,
+                ProtocolFact::HttpBodyHighWater {
+                    threshold_bytes: 4,
+                    ..
+                }
+            )),
+            "expected HttpBodyHighWater fact, got {facts:?}",
+        );
+        assert!(
+            facts.iter().any(|f| matches!(
+                f,
+                ProtocolFact::Http2StreamReset {
+                    reason: Http2ResetReason::EnhanceYourCalm,
+                    direction: ProtocolDirection::Outbound,
+                    ..
+                }
+            )),
+            "expected EnhanceYourCalm outbound reset fact, got {facts:?}",
+        );
+    }
+
+    #[test]
+    fn connection_receive_window_full_emits_typed_flow_control_fact() {
+        // DATA that exceeds the connection-level receive window emits
+        // an `Http2FlowControlFull { side: ConnectionReceive }` fact.
+        let mut conn = unit_connection();
+        conn.recv_window = 1;
+        conn.preface_seen = true;
+        let mut effects: Vec<Effect<Http2Connection<UnitShard>>> = Vec::new();
+        let data = Frame::new(FRAME_DATA, 0, 1, b"toobig".to_vec());
+        let err = conn
+            .handle_data(data, &mut effects)
+            .expect_err("expected FlowControl error");
+        assert_eq!(err, Http2ProtocolError::FlowControl);
+        let facts = collect_facts(&effects);
+        assert!(
+            facts.iter().any(|f| matches!(
+                f,
+                ProtocolFact::Http2FlowControlFull {
+                    side: Http2FlowControlSide::ConnectionReceive,
+                    ..
+                }
+            )),
+            "expected ConnectionReceive flow-control fact, got {facts:?}",
+        );
+    }
+
+    #[test]
+    fn rst_with_unknown_wire_code_uses_other_code_variant() {
+        // Unknown wire codes round-trip into Http2ResetReason::OtherCode
+        // so replay can pin a precise error code rather than silently
+        // collapsing into a generic catch-all.
+        let mut conn = unit_connection();
+        conn.streams.push(ActiveStream::new(
+            3,
+            HeaderBlock::default(),
+            DEFAULT_WINDOW,
+            DEFAULT_WINDOW,
+            false,
+        ));
+        let mut effects: Vec<Effect<Http2Connection<UnitShard>>> = Vec::new();
+        let frame = Frame::new(FRAME_RST_STREAM, 0, 3, 0xff_u32.to_be_bytes().to_vec());
+        conn.handle_rst_stream(frame, &mut effects)
+            .expect("handle_rst_stream accepts");
+        let facts = collect_facts(&effects);
+        assert!(
+            facts.iter().any(|f| matches!(
+                f,
+                ProtocolFact::Http2StreamReset {
+                    reason: Http2ResetReason::OtherCode(0xff),
+                    ..
+                }
+            )),
+            "expected OtherCode(0xff) reset fact, got {facts:?}",
+        );
+    }
+
+    #[test]
+    fn multiple_facts_in_one_turn_are_preserved_in_order() {
+        // Two facts in the same effects vec must appear in arrival
+        // order: open via headers, then high-water via an oversized
+        // body that exceeds max_body_bytes. The body-cap path also
+        // emits a paired EnhanceYourCalm reset fact.
+        let mut conn = unit_connection();
+        conn.limits.max_body_bytes = 2;
+        conn.preface_seen = true;
+        let mut effects: Vec<Effect<Http2Connection<UnitShard>>> = Vec::new();
+        let mut block = Vec::new();
+        encode_literal_header(":method", "POST", &mut block);
+        encode_literal_header(":scheme", "http", &mut block);
+        encode_literal_header(":path", "/upload", &mut block);
+        encode_literal_header(":authority", "x", &mut block);
+        conn.handle_headers(
+            Frame::new(FRAME_HEADERS, FLAG_END_HEADERS, 1, block),
+            &mut effects,
+        )
+        .expect("open");
+        // 3-byte body exceeds the 2-byte cap.
+        let oversize = Frame::new(FRAME_DATA, 0, 1, b"abc".to_vec());
+        conn.handle_data(oversize, &mut effects)
+            .expect("oversize body handled without bubbling error");
+        let facts = collect_facts(&effects);
+        let mut iter = facts.into_iter();
+        assert!(matches!(
+            iter.next(),
+            Some(ProtocolFact::Http2StreamOpened { .. })
+        ));
+        assert!(matches!(
+            iter.next(),
+            Some(ProtocolFact::HttpBodyHighWater { .. })
+        ));
+        assert!(matches!(
+            iter.next(),
+            Some(ProtocolFact::Http2StreamReset {
+                reason: Http2ResetReason::EnhanceYourCalm,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn grpc_status_arm_emits_grpc_status_then_close() {
+        // The handle_stream_chunk GrpcStatus arm must emit both the gRPC
+        // final-status fact and the matching stream-close fact. These
+        // are the live-only facts that a future native gRPC client
+        // isolate will mirror for the received-status side.
+        let mut conn = unit_connection();
+        conn.streams.push(ActiveStream::new(
+            5,
+            HeaderBlock::default(),
+            DEFAULT_WINDOW,
+            DEFAULT_WINDOW,
+            true,
+        ));
+        let effect = conn.handle_stream_chunk(
+            5,
+            CallOutcome::Replied(ResponseChunkReply::GrpcStatus(
+                crate::grpc::GrpcStatus::new(crate::grpc::GrpcStatusCode::Unauthenticated),
+            )),
+        );
+        // Collect the facts from the returned Effect.
+        fn walk<'a>(
+            effect: &'a Effect<Http2Connection<UnitShard>>,
+            out: &mut Vec<&'a ProtocolFact>,
+        ) {
+            match effect {
+                Effect::Fact(fact) => out.push(fact),
+                Effect::Batch(items) => {
+                    for item in items {
+                        walk(item, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut facts: Vec<&ProtocolFact> = Vec::new();
+        walk(&effect, &mut facts);
+        assert!(facts.iter().any(|f| matches!(
+            f,
+            ProtocolFact::GrpcFinalStatusSent {
+                status: tina_runtime::GrpcStatusCode::Unauthenticated,
+                ..
+            }
+        )));
+        assert!(
+            facts
+                .iter()
+                .any(|f| matches!(f, ProtocolFact::Http2StreamClosed { .. }))
+        );
     }
 }
