@@ -578,6 +578,7 @@ struct ActiveStream {
     response_pending_data: Vec<u8>,
     response_bytes_sent: usize,
     response_pull_in_flight: bool,
+    response_pull_handle: Option<tina::CallHandle<ResponseChunkReply>>,
     request_dispatched_streaming: bool,
     request_eof: bool,
     request_content_length: Option<usize>,
@@ -612,6 +613,7 @@ impl ActiveStream {
             response_pending_data: Vec::new(),
             response_bytes_sent: 0,
             response_pull_in_flight: false,
+            response_pull_handle: None,
             request_dispatched_streaming: false,
             request_eof: false,
             request_content_length: None,
@@ -644,6 +646,10 @@ pub enum Http2ConnectionMsg {
     StreamSourceCancelDone {
         stream_id: u32,
         outcome: CallOutcome<ResponseChunkReply>,
+    },
+    StreamSourcePullCancelled {
+        stream_id: u32,
+        outcome: tina::CancelOutcome,
     },
     Wrote(Result<usize, CallError>),
     Closed(Result<(), CallError>),
@@ -796,6 +802,7 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Isolate for Http
                 self.handle_stream_chunk(stream_id, outcome)
             }
             Http2ConnectionMsg::StreamSourceCancelDone { .. } => noop(),
+            Http2ConnectionMsg::StreamSourcePullCancelled { .. } => noop(),
             Http2ConnectionMsg::Wrote(Ok(n)) => self.handle_wrote(n),
             Http2ConnectionMsg::Wrote(Err(_)) => self.close_now(),
             Http2ConnectionMsg::Closed(_) => stop(),
@@ -1335,19 +1342,7 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Http2Connection<
                     Http2ConnectionMsg::ServiceCancelled { stream_id, outcome }
                 }));
             }
-            if let Some(source) = stream.response_source.take() {
-                let stream_id = frame.stream_id;
-                effects.push(
-                    call(
-                        source,
-                        ResponseChunkMsg::Cancel,
-                        self.limits.response_stream_call_timeout,
-                    )
-                    .then(move |outcome| {
-                        Http2ConnectionMsg::StreamSourceCancelDone { stream_id, outcome }
-                    }),
-                );
-            }
+            self.cancel_response_source(frame.stream_id, &mut stream, effects);
         }
         Ok(())
     }
@@ -1692,12 +1687,14 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Http2Connection<
             return noop();
         }
         self.streams[idx].response_pull_in_flight = true;
-        call(
+        let (effect, handle) = call_cancelable(
             source,
             ResponseChunkMsg::Next,
             self.limits.response_stream_call_timeout,
         )
-        .then(move |outcome| Http2ConnectionMsg::StreamChunk { stream_id, outcome })
+        .then(move |outcome| Http2ConnectionMsg::StreamChunk { stream_id, outcome });
+        self.streams[idx].response_pull_handle = Some(handle);
+        effect
     }
 
     fn flush_pending_responses(
@@ -1737,6 +1734,7 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Http2Connection<
         }
         if let Some(idx) = self.find_stream(stream_id) {
             self.streams[idx].response_pull_in_flight = false;
+            self.streams[idx].response_pull_handle = None;
         }
         match outcome {
             CallOutcome::Replied(ResponseChunkReply::Chunk(bytes)) => {
@@ -1937,18 +1935,33 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Http2Connection<
                     Http2ConnectionMsg::ServiceCancelled { stream_id, outcome }
                 }));
             }
-            if let Some(source) = stream.response_source.take() {
-                effects.push(
-                    call(
-                        source,
-                        ResponseChunkMsg::Cancel,
-                        self.limits.response_stream_call_timeout,
-                    )
-                    .then(move |outcome| {
-                        Http2ConnectionMsg::StreamSourceCancelDone { stream_id, outcome }
-                    }),
-                );
-            }
+            self.cancel_response_source(stream_id, &mut stream, effects);
+        }
+    }
+
+    fn cancel_response_source(
+        &mut self,
+        stream_id: u32,
+        stream: &mut ActiveStream,
+        effects: &mut Vec<Effect<Self>>,
+    ) {
+        if let Some(handle) = stream.response_pull_handle.take() {
+            effects.push(cancel_call(handle).then(move |outcome| {
+                Http2ConnectionMsg::StreamSourcePullCancelled { stream_id, outcome }
+            }));
+        }
+        if let Some(source) = stream.response_source.take() {
+            effects.push(
+                call(
+                    source,
+                    ResponseChunkMsg::Cancel,
+                    self.limits.response_stream_call_timeout,
+                )
+                .then(move |outcome| Http2ConnectionMsg::StreamSourceCancelDone {
+                    stream_id,
+                    outcome,
+                }),
+            );
         }
     }
 
