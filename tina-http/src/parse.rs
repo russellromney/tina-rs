@@ -246,7 +246,7 @@ fn is_origin_form(target: &str) -> bool {
     // Origin-form is `/...` or `*` (asterisk-form for OPTIONS — we reject
     // it for first form). Authority-form (`example.com:80`) and
     // absolute-form (`http://example.com/`) are both rejected.
-    target.starts_with('/')
+    target.starts_with('/') && !target.starts_with("//")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

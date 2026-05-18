@@ -4,6 +4,17 @@ This file records completed work.
 
 ## Unreleased
 
+### Phase 123 Adversarial Hardening
+
+- Hardened HTTP/1 keepalive response handling for chunked replies: keepalive
+  clients now decode chunked response bodies, surface malformed or over-cap
+  chunked bodies as typed parse failures, and retire the connection after
+  chunked delivery so stale bytes cannot contaminate a later request.
+- Tightened HTTP parser/WebSocket strictness: chunked size lines reject
+  forbidden leading whitespace, chunked length accounting uses checked
+  arithmetic, protocol-relative HTTP/1 targets are rejected, and WebSocket
+  frames reject non-minimal extended lengths plus 127-form high-bit lengths.
+
 ### Phase 110 Workflow Pending Ergonomics
 
 - `tina_runtime::sleep(d)` now returns a `SleepCall` wrapper. It forwards

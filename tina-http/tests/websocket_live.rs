@@ -483,6 +483,23 @@ fn websocket_fragmented_text_reassembles_with_interleaved_ping() {
 }
 
 #[test]
+fn websocket_fragmented_text_invalid_utf8_rejects_before_app_delivery() {
+    let harness = Harness::start(WebSocketLimits::default());
+    let mut stream = connect_ws(harness.addr);
+    stream
+        .write_all(&masked_fragment(false, 0x1, &[0xc3]))
+        .unwrap();
+    stream
+        .write_all(&masked_fragment(true, 0x0, &[0x28]))
+        .unwrap();
+    assert_eq!(
+        read_server_frame(&mut stream).0,
+        0x8,
+        "invalid UTF-8 across text fragments must close, not echo"
+    );
+}
+
+#[test]
 fn websocket_fragmented_binary_reassembles() {
     let harness = Harness::start(WebSocketLimits::default());
     let mut stream = connect_ws(harness.addr);

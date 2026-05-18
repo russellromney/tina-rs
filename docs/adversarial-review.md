@@ -16,6 +16,22 @@ be the canonical review artifact.
 File paths are relative to the repo root. Line numbers reflect the
 `worktree-adversarial-review` snapshot at the time of review.
 
+## Phase 123 Fix Status
+
+The original findings below are preserved for history. Fixed items record
+the implementation proof and regression test names.
+
+| Finding | Phase 123 status |
+|---|---|
+| C1 | Fixed. `KeepaliveConnection` now decodes `Transfer-Encoding: chunked` response bodies with `ChunkedDecoder`, returns the decoded buffered body, and retires the connection after every chunked response. Tests: `keepalive_decodes_chunked_response_and_retires_connection`, `chunked_then_content_length_requests_do_not_cross_contaminate`, `malformed_chunked_response_errors_and_retires`, `over_cap_chunked_response_errors_and_retires`, `chunked_connection_close_decodes_and_retires`, `chunked_smuggling_shape_is_retired_before_next_request`. |
+| H14 | Fixed. The chunked decoder rejects SP/HT before the chunk-size digits. Test: `rejects_leading_whitespace_before_chunk_size`. |
+| L13 | Fixed. `DataCrlf` checks the current remaining buffer, not the original feed input. Tests: `split_crlf_after_data`, `rejects_missing_data_crlf`. |
+| A6 | Fixed. Chunk-size/body accounting uses checked arithmetic around decoded totals and overflow-shaped size lines. Tests: `rejects_body_too_large_after_prior_decoded_bytes`, `rejects_chunk_size_that_overflows_usize`. |
+| M1 | Fixed. WebSocket client frames reject non-minimal 126/127 length encodings and 127-form high-bit lengths. Tests: `client_frame_rejects_non_minimal_126_length`, `client_frame_rejects_non_minimal_127_length`, `client_frame_rejects_127_length_high_bit`. |
+| A7 | Fixed. WebSocket frame-end calculations use checked offsets and reject huge frame lengths before drain/decode. Test: `client_frame_rejects_huge_frame_before_end_offset_overflow`. |
+| M6 | Already fixed in the connection delivery path; Phase 123 added a live regression proving invalid fragmented text is closed before app echo/delivery. Test: `websocket_fragmented_text_invalid_utf8_rejects_before_app_delivery`. |
+| L14 | Fixed. HTTP/1 origin-form parsing rejects protocol-relative targets (`//host/path`). Test: `protocol_relative_target_is_not_origin_form`. |
+
 ## Critical
 
 ### C1. HTTP/1 keepalive client smuggles chunked response bytes into the next request
