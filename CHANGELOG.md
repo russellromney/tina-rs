@@ -58,17 +58,30 @@ This file records completed work.
   client, HTTP/2 TLS ALPN/mTLS, gRPC reflection/interceptors/load
   balancing, native broad WebSocket client, `permessage-deflate`,
   web-framework ergonomics, and full WebSocket-bytes simulator replay).
-- Honest gap: per the plan's "Rock 5 Simulator Facts", the protocol
-  facts that the plan named (stream opened/closed/reset, flow-control
-  full, body high-water, WebSocket slow-peer close, gRPC final status
-  sent/received) surface today as bounded counters on
-  `Http2ConnectionReport`, `BodyMetrics`, `WebSocketMemberTableReport`,
-  and the typed `GrpcStatus` trailers — not as `RuntimeEventKind`
-  variants on the trace stream. Plumbing those facts through the
-  runtime trace stream so they ride alongside MailboxAccepted / Send /
-  Spawn events (and round-trip through `tina-sim` replay) is the next
-  protocol-observability slice. Until then, users debug protocol
-  behavior through the counter snapshots, not through trace.
+- **Deferred from this phase, named follow-up.** Rock 5 ("Simulator
+  Facts") did not ship. The protocol facts the plan named — stream
+  opened/closed/reset, flow-control full, body high-water, WebSocket
+  slow-peer close, gRPC final status sent/received — surface as bounded
+  counters on `Http2ConnectionReport`, `BodyMetrics`,
+  `WebSocketMemberTableReport`, and the typed `GrpcStatus` trailers, not
+  as `RuntimeEventKind` variants on the trace stream. They do not
+  round-trip through `tina-sim` replay yet, which means a protocol bug
+  cannot be replayed from a trace today.
+- **Deferred from this phase, named follow-up.** The plan's Required
+  Proof line "At least one DST replay case for a protocol
+  pressure/lifecycle bug" is satisfied by pre-existing
+  `tina-http/tests/dst_simulator.rs` cases
+  (`slow_body_multichunk_inbound_replays_deterministically`,
+  `service_full_with_concurrent_peers_replays_deterministically`,
+  `shutdown_mid_request_replays_deterministically`), so the phase 103
+  minimum is met; no new DST replay case was added in this phase. A
+  protocol-fact-driven DST replay rides with the Rock 5 follow-up.
+- Both deferrals are tracked in `ROADMAP.md` under "Protocol facts as
+  runtime/simulator trace events" and in
+  `.intent/phases/103-protocol-parity-finish/plan.md` under "Deferred
+  to follow-up". Phase 103 is marked shipped on the strength of Rocks
+  1–4 (protocol parity, helper extraction, client-side parity docs)
+  and the pre-existing DST coverage; Rock 5 is not silently dropped.
 
 ### Phase 102 Host Control Ergonomics
 
