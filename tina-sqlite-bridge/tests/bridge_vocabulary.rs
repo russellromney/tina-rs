@@ -124,3 +124,91 @@ fn pressure_round_trip_preserves_late_result_count() {
     assert_eq!(bp.closed_count(), 1);
     assert_eq!(bp.full_count(), 3);
 }
+
+// ---------------------------------------------------------------------
+// Plan-required exhaustive coverage of remaining categories + typed
+// outcome projections.
+// ---------------------------------------------------------------------
+
+#[test]
+fn internal_error_is_fatal_internal() {
+    let i: CallOutcome<Result<(), SqliteError>> =
+        CallOutcome::Replied(Err(SqliteError::Internal("bug".into())));
+    assert_eq!(
+        sqlite_bridge_class(&i),
+        BridgeOutcomeClass::Fatal(BridgeFatal::Internal)
+    );
+}
+
+#[test]
+fn io_error_is_fatal_sdk_unknown() {
+    let io: CallOutcome<Result<(), SqliteError>> =
+        CallOutcome::Replied(Err(SqliteError::Io("disk".into())));
+    assert_eq!(
+        sqlite_bridge_class(&io),
+        BridgeOutcomeClass::Fatal(BridgeFatal::SdkUnknown)
+    );
+}
+
+#[test]
+fn invalid_request_is_fatal_invalid_request() {
+    let bad: CallOutcome<Result<(), SqliteError>> =
+        CallOutcome::Replied(Err(SqliteError::InvalidRequest("empty sql".into())));
+    assert_eq!(
+        sqlite_bridge_class(&bad),
+        BridgeOutcomeClass::Fatal(BridgeFatal::InvalidRequest)
+    );
+}
+
+#[test]
+fn response_too_large_is_fatal_too_large() {
+    let rtl: CallOutcome<Result<(), SqliteError>> =
+        CallOutcome::Replied(Err(SqliteError::ResponseTooLarge));
+    assert_eq!(
+        sqlite_bridge_class(&rtl),
+        BridgeOutcomeClass::Fatal(BridgeFatal::TooLarge)
+    );
+}
+
+#[test]
+fn worker_timeout_is_retryable_bridge_timeout() {
+    let wt: CallOutcome<Result<(), SqliteError>> = CallOutcome::Replied(Err(SqliteError::Timeout));
+    assert_eq!(
+        sqlite_bridge_class(&wt),
+        BridgeOutcomeClass::Retryable(BridgeRetryable::BridgeTimeout)
+    );
+}
+
+#[test]
+fn rejected_is_fatal_invalid_request() {
+    use tina::CallRejectedReason;
+    let r: CallOutcome<Result<(), SqliteError>> =
+        CallOutcome::Rejected(CallRejectedReason::UnsupportedMessage);
+    assert_eq!(
+        sqlite_bridge_class(&r),
+        BridgeOutcomeClass::Fatal(BridgeFatal::InvalidRequest)
+    );
+}
+
+#[test]
+fn succeeded_is_succeeded_for_each_typed_payload_outcome() {
+    // sqlite_bridge_class is generic over the Ok payload. Verify
+    // each typed reply-projection (SqliteExecutedOutcome → u64,
+    // SqliteRowsOutcome → SqliteRows) lands at Succeeded.
+    let executed: CallOutcome<Result<u64, SqliteError>> = CallOutcome::Replied(Ok(7));
+    assert_eq!(
+        sqlite_bridge_class(&executed),
+        BridgeOutcomeClass::Succeeded
+    );
+    // Use an arbitrary stand-in for the rows payload.
+    let rows: CallOutcome<Result<Vec<u8>, SqliteError>> = CallOutcome::Replied(Ok(Vec::new()));
+    assert_eq!(sqlite_bridge_class(&rows), BridgeOutcomeClass::Succeeded);
+}
+
+#[test]
+fn ext_trait_bridge_class_matches_free_function() {
+    use tina_sqlite_bridge::SqliteOutcomeExt;
+    let outcome: CallOutcome<Result<(), SqliteError>> = CallOutcome::Closed;
+    let executed: CallOutcome<Result<u64, SqliteError>> = CallOutcome::Closed;
+    assert_eq!(sqlite_bridge_class(&outcome), executed.bridge_class());
+}

@@ -119,3 +119,95 @@ fn pressure_unavailable_carries_explicit_reason() {
     assert!(line.contains("state=unavailable"));
     assert!(line.contains("reason=\"no client supplied\""));
 }
+
+// ---------------------------------------------------------------------
+// Plan-required exhaustive coverage of remaining categories.
+// ---------------------------------------------------------------------
+
+#[test]
+fn invalid_request_is_fatal_invalid_request() {
+    let bad: CallOutcome<Result<(), PgError>> =
+        CallOutcome::Replied(Err(PgError::InvalidRequest("empty sql".into())));
+    assert_eq!(
+        bridge_class(&bad),
+        BridgeOutcomeClass::Fatal(BridgeFatal::InvalidRequest)
+    );
+}
+
+#[test]
+fn too_many_rows_is_fatal_invalid_request() {
+    // FetchOne with multiple rows is a caller mistake; same shared
+    // category as InvalidRequest.
+    let tmr: CallOutcome<Result<(), PgError>> = CallOutcome::Replied(Err(PgError::TooManyRows));
+    assert_eq!(
+        bridge_class(&tmr),
+        BridgeOutcomeClass::Fatal(BridgeFatal::InvalidRequest)
+    );
+}
+
+#[test]
+fn internal_error_is_fatal_internal() {
+    let i: CallOutcome<Result<(), PgError>> =
+        CallOutcome::Replied(Err(PgError::Internal("worker bug".into())));
+    assert_eq!(
+        bridge_class(&i),
+        BridgeOutcomeClass::Fatal(BridgeFatal::Internal)
+    );
+}
+
+#[test]
+fn caller_timeout_is_retryable_caller_timeout() {
+    let t: CallOutcome<Result<(), PgError>> = CallOutcome::Timeout;
+    assert_eq!(
+        bridge_class(&t),
+        BridgeOutcomeClass::Retryable(BridgeRetryable::CallerTimeout)
+    );
+}
+
+#[test]
+fn worker_timeout_is_retryable_bridge_timeout() {
+    let wt: CallOutcome<Result<(), PgError>> = CallOutcome::Replied(Err(PgError::Timeout));
+    assert_eq!(
+        bridge_class(&wt),
+        BridgeOutcomeClass::Retryable(BridgeRetryable::BridgeTimeout)
+    );
+}
+
+#[test]
+fn rejected_is_fatal_invalid_request() {
+    use tina::CallRejectedReason;
+    let r: CallOutcome<Result<(), PgError>> =
+        CallOutcome::Rejected(CallRejectedReason::UnsupportedMessage);
+    assert_eq!(
+        bridge_class(&r),
+        BridgeOutcomeClass::Fatal(BridgeFatal::InvalidRequest)
+    );
+}
+
+#[test]
+fn succeeded_is_succeeded_for_each_typed_payload_outcome() {
+    // bridge_class is generic over the inner Ok payload. Verify that
+    // each typed reply-projection (PgExecutedOutcome → u64,
+    // PgFetchOneOutcome → Option<PgRow>, etc.) lands at Succeeded.
+    let executed: CallOutcome<Result<u64, PgError>> = CallOutcome::Replied(Ok(42));
+    assert_eq!(bridge_class(&executed), BridgeOutcomeClass::Succeeded);
+
+    let fetched_some: CallOutcome<Result<Option<()>, PgError>> = CallOutcome::Replied(Ok(Some(())));
+    assert_eq!(bridge_class(&fetched_some), BridgeOutcomeClass::Succeeded);
+
+    let fetched_none: CallOutcome<Result<Option<()>, PgError>> = CallOutcome::Replied(Ok(None));
+    assert_eq!(bridge_class(&fetched_none), BridgeOutcomeClass::Succeeded);
+}
+
+#[test]
+fn ext_trait_bridge_class_matches_free_function() {
+    // The PgOutcomeExt::bridge_class() method must agree with the
+    // free function; both go through `bridge_class()` under the hood.
+    use tina_sqlx_bridge::PgOutcomeExt;
+    let outcome: CallOutcome<Result<(), PgError>> = CallOutcome::Replied(Err(PgError::PoolClosed));
+    // Trait method on PgExecutedOutcome shape — proves the projection
+    // works through the typed extension trait too.
+    let executed_pc: CallOutcome<Result<u64, PgError>> =
+        CallOutcome::Replied(Err(PgError::PoolClosed));
+    assert_eq!(bridge_class(&outcome), executed_pc.bridge_class());
+}

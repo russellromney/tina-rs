@@ -815,6 +815,35 @@ fn full_closed_and_close_drain_truth() {
     }
     assert_eq!(bridge.metrics.pressure_report().full_count, 1);
     assert_eq!(bridge.metrics.pressure_report().closed_count, 1);
+
+    // Live-bridge proof for the shared-vocabulary adapter: the
+    // BridgePressure conversion preserves the counters this hermetic
+    // run actually generated, and uses the stable surface name. This
+    // closes the loop between the synthetic struct-literal round-trip
+    // tests in bridge_adapter.rs and what a real bridge sees.
+    let bp: tina_aws_bridge::BridgePressure = bridge.metrics.pressure_report().into();
+    assert_eq!(
+        bp.full_count(),
+        1,
+        "BridgePressure must preserve full_count"
+    );
+    assert_eq!(
+        bp.closed_count(),
+        1,
+        "BridgePressure must preserve closed_count"
+    );
+    assert_eq!(bp.name(), tina_aws_bridge::SQS_BRIDGE_SURFACE);
+    assert_eq!(bp.capacity(), bridge.metrics.pressure_report().capacity);
+
+    // BridgeInstall trait shape works on a live install handle: the
+    // closer is reachable through the vocabulary trait, and calling
+    // close() through it is the same as calling it directly.
+    use tina_runtime::bridge::{BridgeCloser, BridgeInstall};
+    let closer_via_trait = BridgeInstall::closer(&bridge);
+    assert!(closer_via_trait.is_closed());
+    BridgeCloser::close(closer_via_trait); // idempotent
+    assert!(closer_via_trait.is_closed());
+
     if let Ok(rt) = Arc::try_unwrap(runtime) {
         let _ = rt.shutdown();
     }
@@ -858,6 +887,16 @@ fn timeout_after_admission_counts_late_result_when_sdk_finishes() {
         );
         std::thread::sleep(Duration::from_millis(10));
     }
+
+    // Live-bridge proof: when a late result lands, the BridgePressure
+    // adapter surfaces late_result_count honestly.
+    let bp: tina_aws_bridge::BridgePressure = bridge.metrics.pressure_report().into();
+    assert_eq!(
+        bp.late_result_count(),
+        1,
+        "BridgePressure must surface late_results from real bridge"
+    );
+
     if let Ok(rt) = Arc::try_unwrap(runtime) {
         let _ = rt.shutdown();
     }

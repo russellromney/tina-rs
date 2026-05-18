@@ -508,6 +508,29 @@ pub enum BridgeCallerWarning {
     ExternalWorkMayContinue,
 }
 
+impl BridgeCallerWarning {
+    /// Project a shared-vocabulary outcome into the honest warning the
+    /// caller should attach to a reply or surface in a log line.
+    ///
+    /// - [`BridgeOutcomeClass::Succeeded`] and
+    ///   [`BridgeOutcomeClass::Fatal`] are caller-observed truths;
+    ///   neither implies external work may continue.
+    /// - [`BridgeRetryable::CallerTimeout`] and
+    ///   [`BridgeRetryable::BridgeTimeout`] are the load-bearing case:
+    ///   Tina stopped waiting, but the outside system may still finish.
+    /// - Other retryable / unavailable categories happened before the
+    ///   bridge dispatched work, so external work is *not* in flight.
+    pub fn from_outcome(class: &BridgeOutcomeClass) -> Self {
+        match class {
+            BridgeOutcomeClass::Retryable(BridgeRetryable::CallerTimeout)
+            | BridgeOutcomeClass::Retryable(BridgeRetryable::BridgeTimeout) => {
+                BridgeCallerWarning::ExternalWorkMayContinue
+            }
+            _ => BridgeCallerWarning::None,
+        }
+    }
+}
+
 // -------------------------------------------------------------------
 // Install / closer traits — vocabulary marker traits, not framework
 // -------------------------------------------------------------------
@@ -721,5 +744,193 @@ mod tests {
     fn caller_warning_distinguishes_external_continuation() {
         let warn = BridgeCallerWarning::ExternalWorkMayContinue;
         assert_ne!(warn, BridgeCallerWarning::None);
+    }
+
+    #[test]
+    fn caller_warning_from_outcome_flags_only_timeout_arms() {
+        // Timeouts are the load-bearing case: bridge stopped waiting,
+        // outside system may still finish. Everything else is
+        // caller-observed truth — no warning to attach.
+        assert_eq!(
+            BridgeCallerWarning::from_outcome(&BridgeOutcomeClass::Retryable(
+                BridgeRetryable::CallerTimeout
+            )),
+            BridgeCallerWarning::ExternalWorkMayContinue
+        );
+        assert_eq!(
+            BridgeCallerWarning::from_outcome(&BridgeOutcomeClass::Retryable(
+                BridgeRetryable::BridgeTimeout
+            )),
+            BridgeCallerWarning::ExternalWorkMayContinue
+        );
+        // Succeeded / Fatal / Full / Closed are caller-observed; no
+        // external work was admitted, or it terminated cleanly.
+        assert_eq!(
+            BridgeCallerWarning::from_outcome(&BridgeOutcomeClass::Succeeded),
+            BridgeCallerWarning::None
+        );
+        assert_eq!(
+            BridgeCallerWarning::from_outcome(&BridgeOutcomeClass::Retryable(
+                BridgeRetryable::BridgeFull
+            )),
+            BridgeCallerWarning::None
+        );
+        assert_eq!(
+            BridgeCallerWarning::from_outcome(&BridgeOutcomeClass::Unavailable(
+                BridgeUnavailable::BridgeClosed
+            )),
+            BridgeCallerWarning::None
+        );
+        assert_eq!(
+            BridgeCallerWarning::from_outcome(&BridgeOutcomeClass::Fatal(
+                BridgeFatal::AccessDenied
+            )),
+            BridgeCallerWarning::None
+        );
+    }
+
+    #[test]
+    fn name_validation_rejects_newline_tab_and_null() {
+        assert!(matches!(
+            validate_bridge_name("aws\ns3"),
+            Err(BridgeNameError::InvalidChar('\n'))
+        ));
+        assert!(matches!(
+            validate_bridge_name("aws\r\ns3"),
+            Err(BridgeNameError::InvalidChar('\r'))
+        ));
+        assert!(matches!(
+            validate_bridge_name("aws\0s3"),
+            Err(BridgeNameError::InvalidChar('\0'))
+        ));
+        // Inner unicode whitespace (NBSP).
+        assert!(matches!(
+            validate_bridge_name("aws\u{00A0}s3"),
+            Err(BridgeNameError::InvalidChar('\u{00A0}'))
+        ));
+    }
+
+    #[test]
+    fn name_validation_accepts_dots_underscores_hyphens_digits() {
+        validate_bridge_name("aws.s3.pressure_v2").unwrap();
+        validate_bridge_name("pg-bridge").unwrap();
+        validate_bridge_name("shard_0").unwrap();
+        validate_bridge_name("svc:rpc/1").unwrap();
+    }
+
+    #[test]
+    fn measured_allows_zero_capacity_for_degenerate_bridges() {
+        // A bridge that has not yet installed any capacity (or one
+        // that intentionally exposes only the unavailable surface)
+        // should still be expressible. The dashboard will see
+        // capacity=0 and act accordingly.
+        let p = BridgePressure::measured("test.empty", 0, 0, 0, 0, 0, 0, 0, 0).unwrap();
+        assert_eq!(p.capacity(), 0);
+        let surface = p.capacity_surface(CapacityMode::Fixed);
+        assert_eq!(surface.max_messages, Some(0));
+    }
+
+    #[test]
+    fn capacity_surface_respects_caller_chosen_mode() {
+        let p = BridgePressure::measured("aws.s3", 32, 5, 17, 3, 2, 1, 4, 4).unwrap();
+        // Bridge author may use Tuning during discovery work; the
+        // rendered surface should carry exactly the mode they chose.
+        let tuning = p.capacity_surface(CapacityMode::Tuning);
+        assert!(matches!(tuning.mode, CapacityMode::Tuning));
+        let fixed = p.capacity_surface(CapacityMode::Fixed);
+        assert!(matches!(fixed.mode, CapacityMode::Fixed));
+    }
+
+    #[test]
+    fn service_pressure_report_consumes_bridge_pressure_end_to_end() {
+        use crate::service_pressure::ServicePressureReport;
+        // The plan-required proof: the service pressure builder can
+        // consume a BridgePressure via service_pressure_surface and
+        // produce a meaningful discovery line plus capacity_summary.
+        let s3 = BridgePressure::measured("aws.s3", 32, 5, 17, 3, 0, 0, 4, 4).unwrap();
+        let pg = BridgePressure::measured("pg.bridge", 8, 2, 6, 1, 0, 0, 0, 0).unwrap();
+        let absent = BridgePressure::unavailable("aws.sqs", "no client supplied").unwrap();
+
+        let mut report = ServicePressureReport::new("checkout");
+        report.add_surface(s3.service_pressure_surface("bridge"));
+        report.add_surface(pg.service_pressure_surface("bridge"));
+        report.add_surface(absent);
+
+        let summary = report.summary_line();
+        assert!(summary.contains("service=checkout"), "{summary}");
+        assert!(summary.contains("surfaces=3"), "{summary}");
+        assert!(summary.contains("measured=2"), "{summary}");
+        assert!(summary.contains("unavailable=1"), "{summary}");
+        // s3 has full_count=3, pg has full_count=1 → 4 across measured.
+        assert!(summary.contains("full=4"), "{summary}");
+        assert!(summary.contains("aws.sqs=unavailable"), "{summary}");
+
+        let cap = report.capacity_summary().unwrap();
+        assert_eq!(cap.len(), 2);
+        assert_eq!(
+            cap.surface("aws.s3").report().unwrap().max_messages,
+            Some(32)
+        );
+        assert_eq!(
+            cap.surface("pg.bridge").report().unwrap().max_messages,
+            Some(8)
+        );
+        assert!(report.any_full(), "{summary}");
+
+        let discovery = report.discovery_report();
+        let lines: Vec<&str> = discovery.lines().collect();
+        assert_eq!(lines.len(), 3);
+        assert!(lines.iter().any(|l| l.contains("aws.s3")));
+        assert!(lines.iter().any(|l| l.contains("pg.bridge")));
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("aws.sqs") && l.contains("state=unavailable"))
+        );
+    }
+
+    #[test]
+    fn bridge_install_trait_implementations_are_callable() {
+        // Tiny test types — prove the trait shape is implementable
+        // outside the runtime crate (i.e. that downstream bridges can
+        // opt in to the vocabulary).
+        struct TestCloser {
+            closed: std::sync::atomic::AtomicBool,
+        }
+        impl BridgeCloser for TestCloser {
+            fn close(&self) {
+                self.closed
+                    .store(true, std::sync::atomic::Ordering::Release);
+            }
+            fn is_closed(&self) -> bool {
+                self.closed.load(std::sync::atomic::Ordering::Acquire)
+            }
+        }
+        struct TestMetrics;
+        struct TestInstall {
+            closer: TestCloser,
+            metrics: TestMetrics,
+        }
+        impl BridgeInstall for TestInstall {
+            type Closer = TestCloser;
+            type Metrics = TestMetrics;
+            fn closer(&self) -> &TestCloser {
+                &self.closer
+            }
+            fn metrics(&self) -> &TestMetrics {
+                &self.metrics
+            }
+        }
+        let install = TestInstall {
+            closer: TestCloser {
+                closed: std::sync::atomic::AtomicBool::new(false),
+            },
+            metrics: TestMetrics,
+        };
+        assert!(!install.closer().is_closed());
+        install.closer().close();
+        assert!(install.closer().is_closed());
+        // Suppress unused-binding warning on the metrics accessor.
+        let _ = install.metrics();
     }
 }

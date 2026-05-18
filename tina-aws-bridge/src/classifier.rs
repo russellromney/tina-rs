@@ -418,4 +418,138 @@ mod tests {
             BridgeOutcomeClass::Fatal(BridgeFatal::NotFound)
         ));
     }
+
+    // -----------------------------------------------------------------
+    // Plan-required exhaustive classifier coverage:
+    // - Succeeded                              (covered above per service)
+    // - Retryable(ServiceThrottled)            (covered above per service)
+    // - Retryable(BridgeTimeout)               (covered above per service)
+    // - Unavailable(BridgeClosed)              (covered above per service)
+    // - Fatal(AccessDenied)                    (covered above per service)
+    // - Fatal(NotFound)                        (covered above per service)
+    // - Fatal(InvalidRequest)                  (filled below)
+    // - Fatal(Internal)                        (filled below)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn s3_internal_classifies_as_fatal_internal() {
+        let outcome: CallOutcome<Result<S3Response, S3Error>> =
+            CallOutcome::Replied(Err(S3Error::Internal("worker bug".into())));
+        assert!(matches!(
+            outcome.classify(),
+            BridgeOutcomeClass::Fatal(BridgeFatal::Internal)
+        ));
+    }
+
+    #[test]
+    fn sqs_internal_classifies_as_fatal_internal() {
+        let outcome: CallOutcome<Result<SqsResponse, SqsError>> =
+            CallOutcome::Replied(Err(SqsError::Internal("worker bug".into())));
+        assert!(matches!(
+            outcome.classify(),
+            BridgeOutcomeClass::Fatal(BridgeFatal::Internal)
+        ));
+    }
+
+    #[test]
+    fn dynamo_internal_classifies_as_fatal_internal() {
+        let outcome: CallOutcome<Result<DynamoResponse, DynamoError>> =
+            CallOutcome::Replied(Err(DynamoError::Internal("worker bug".into())));
+        assert!(matches!(
+            outcome.classify(),
+            BridgeOutcomeClass::Fatal(BridgeFatal::Internal)
+        ));
+    }
+
+    #[test]
+    fn sns_internal_classifies_as_fatal_internal() {
+        let outcome: CallOutcome<Result<SnsResponse, SnsError>> =
+            CallOutcome::Replied(Err(SnsError::Internal("worker bug".into())));
+        assert!(matches!(
+            outcome.classify(),
+            BridgeOutcomeClass::Fatal(BridgeFatal::Internal)
+        ));
+    }
+
+    #[test]
+    fn secrets_internal_classifies_as_fatal_internal() {
+        let outcome: CallOutcome<Result<SecretsResponse, SecretsError>> =
+            CallOutcome::Replied(Err(SecretsError::Internal("worker bug".into())));
+        assert!(matches!(
+            outcome.classify(),
+            BridgeOutcomeClass::Fatal(BridgeFatal::Internal)
+        ));
+    }
+
+    #[test]
+    fn s3_invalid_request_classifies_as_fatal_invalid_request() {
+        let outcome: CallOutcome<Result<S3Response, S3Error>> =
+            CallOutcome::Replied(Err(S3Error::InvalidRequest("empty bucket".into())));
+        assert!(matches!(
+            outcome.classify(),
+            BridgeOutcomeClass::Fatal(BridgeFatal::InvalidRequest)
+        ));
+    }
+
+    #[test]
+    fn sqs_invalid_request_classifies_as_fatal_invalid_request() {
+        let outcome: CallOutcome<Result<SqsResponse, SqsError>> =
+            CallOutcome::Replied(Err(SqsError::InvalidRequest("bad queue url".into())));
+        assert!(matches!(
+            outcome.classify(),
+            BridgeOutcomeClass::Fatal(BridgeFatal::InvalidRequest)
+        ));
+    }
+
+    // -----------------------------------------------------------------
+    // Cross-AWS-bridge consistency: the load-bearing claim of the
+    // shared vocabulary is that every bridge agrees on the
+    // categorization of the boring shapes. If S3 says `Closed` is
+    // `Unavailable` but SQS says it's something else, dashboards drift.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn every_aws_bridge_classifies_closed_as_unavailable_bridge_closed() {
+        let expected = BridgeOutcomeClass::Unavailable(BridgeUnavailable::BridgeClosed);
+        let s3: CallOutcome<Result<S3Response, S3Error>> = CallOutcome::Closed;
+        let sqs: CallOutcome<Result<SqsResponse, SqsError>> = CallOutcome::Closed;
+        let dynamo: CallOutcome<Result<DynamoResponse, DynamoError>> = CallOutcome::Closed;
+        let sns: CallOutcome<Result<SnsResponse, SnsError>> = CallOutcome::Closed;
+        let secrets: CallOutcome<Result<SecretsResponse, SecretsError>> = CallOutcome::Closed;
+        assert_eq!(s3.classify(), expected);
+        assert_eq!(sqs.classify(), expected);
+        assert_eq!(dynamo.classify(), expected);
+        assert_eq!(sns.classify(), expected);
+        assert_eq!(secrets.classify(), expected);
+    }
+
+    #[test]
+    fn every_aws_bridge_classifies_full_as_retryable_bridge_full() {
+        let expected = BridgeOutcomeClass::Retryable(BridgeRetryable::BridgeFull);
+        let s3: CallOutcome<Result<S3Response, S3Error>> = CallOutcome::Full;
+        let sqs: CallOutcome<Result<SqsResponse, SqsError>> = CallOutcome::Full;
+        let dynamo: CallOutcome<Result<DynamoResponse, DynamoError>> = CallOutcome::Full;
+        let sns: CallOutcome<Result<SnsResponse, SnsError>> = CallOutcome::Full;
+        let secrets: CallOutcome<Result<SecretsResponse, SecretsError>> = CallOutcome::Full;
+        assert_eq!(s3.classify(), expected);
+        assert_eq!(sqs.classify(), expected);
+        assert_eq!(dynamo.classify(), expected);
+        assert_eq!(sns.classify(), expected);
+        assert_eq!(secrets.classify(), expected);
+    }
+
+    #[test]
+    fn every_aws_bridge_classifies_timeout_as_retryable_caller_timeout() {
+        let expected = BridgeOutcomeClass::Retryable(BridgeRetryable::CallerTimeout);
+        let s3: CallOutcome<Result<S3Response, S3Error>> = CallOutcome::Timeout;
+        let sqs: CallOutcome<Result<SqsResponse, SqsError>> = CallOutcome::Timeout;
+        let dynamo: CallOutcome<Result<DynamoResponse, DynamoError>> = CallOutcome::Timeout;
+        let sns: CallOutcome<Result<SnsResponse, SnsError>> = CallOutcome::Timeout;
+        let secrets: CallOutcome<Result<SecretsResponse, SecretsError>> = CallOutcome::Timeout;
+        assert_eq!(s3.classify(), expected);
+        assert_eq!(sqs.classify(), expected);
+        assert_eq!(dynamo.classify(), expected);
+        assert_eq!(sns.classify(), expected);
+        assert_eq!(secrets.classify(), expected);
+    }
 }
