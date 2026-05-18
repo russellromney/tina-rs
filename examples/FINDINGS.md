@@ -471,7 +471,18 @@ What still needs work but is deferred:
 loud-API constructors, `body_io_error_count` proves mid-stream
 client close).
 
-### 21. Per-bucket FIFO wait list next to a global `PendingReplies`
+### 21. Per-bucket FIFO wait list next to a global `PendingReplies` — Phase 110 shipped
+
+`tina_runtime::WaitList<K, R>` is the bounded helper: one global cap,
+optional per-key cap (`with_key_limit`), FIFO per key, ticketed
+`reply_one`, and `reply_all_clone` / `reply_all_with` /
+`close_all_clone` / `close_all_with` / `drain_all_with` for multi-waiter
+replies. Stale tickets are rejected; tickets are move-only with private
+fields.
+
+*(Historical finding kept below for context.)*
+
+### 21-historical. Per-bucket FIFO wait list next to a global `PendingReplies`
 
 **Surfaced by:** `system_cache_with_fill`, `system_lock_manager`.
 
@@ -650,7 +661,17 @@ them in `handle` and use `tina::send` from `handle_call`. The first form
 of `WebSocketSessionHandle::send_effect` should also probably gain a
 debug-only assertion if it is invoked from inside a `CallContext`.
 
-### 27. Lease handoff into a `PendingReplies` slot
+### 27. Lease handoff into a `PendingReplies` slot — Phase 110 shipped
+
+`tina_runtime::GuardedPendingReplies<K, R, G>` pairs the parked caller
+with one RAII `G` guard, drops it exactly once on reply / drain /
+caller-gone sweep, and returns it back to the caller on failed
+admission. `system_api_gateway_limits` and `system_soak_http_db` both
+delete their `HashMap<qid, SharedLease>` sidecars in this phase.
+
+*(Historical finding kept below for context.)*
+
+### 27-historical. Lease handoff into a `PendingReplies` slot
 
 **Surfaced by:** `system_api_gateway_limits`, `system_soak_http_db`.
 
@@ -713,7 +734,17 @@ drop, push, drain) so a replay can reconstruct `assert_no_full`
 semantics. Or expose the snapshots as `LiveReplayFact` entries so
 they ride alongside the existing fact stream.
 
-### 31. `SleepReply` leaks into user-defined message variants
+### 31. `SleepReply` leaks into user-defined message variants — Phase 110 shipped
+
+`tina_runtime::sleep(d).then_event(move || Msg::Wake { id })` is the
+sleep-only sugar: the user enum has no `SleepReply` field, and the
+helper does not exist on non-timer `TypedCall<()>` so file/process/TCP
+close errors stay visible. The phase still ships `sleep_then(d, m)` and
+`sleep(d).then(...)` for the cases that *do* want the timer reply.
+
+*(Historical finding kept below for context.)*
+
+### 31-historical. `SleepReply` leaks into user-defined message variants
 
 **Surfaced by:** `system_api_gateway_limits`, `system_soak_http_db`.
 

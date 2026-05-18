@@ -1248,6 +1248,23 @@ where
         RequestEffect::from_consumed_effect(build(self.inner.into_request_context()))
     }
 
+    /// Fallible variant of [`capture`](Self::capture).
+    ///
+    /// Returns the original [`RequestCall`] alongside a typed error when the
+    /// caller cannot be captured. Lets bounded helpers like `park_request`
+    /// check admission first and surface caller authority back on failure
+    /// instead of stranding it inside the helper.
+    pub fn try_capture<F>(self, build: F) -> Result<RequestEffect<I>, (Self, TakeReplySlotError)>
+    where
+        I::Reply: 'static,
+        F: FnOnce(RequestContext<I::Reply>) -> Effect<I>,
+    {
+        match self.inner.try_into_request_context() {
+            Ok(req) => Ok(RequestEffect::from_consumed_effect(build(req))),
+            Err((ctx, err)) => Err((RequestCall { inner: ctx }, err)),
+        }
+    }
+
     /// Defers this caller reply through one visible runtime-owned work item.
     pub fn defer<W>(self, work: W) -> W::RequestDeferred
     where
@@ -1348,6 +1365,23 @@ where
         self.ctx
             .take_request_context()
             .expect("CallContext always carries a caller authority")
+    }
+
+    /// Fallible promotion to [`RequestContext`].
+    ///
+    /// Returns the original [`CallContext`] alongside a typed error so
+    /// helpers like `park_call` can return caller authority unchanged when
+    /// the slot cannot be captured (cross-shard, missing caller).
+    pub fn try_into_request_context(
+        mut self,
+    ) -> Result<RequestContext<I::Reply>, (Self, TakeReplySlotError)>
+    where
+        I::Reply: 'static,
+    {
+        match self.ctx.take_request_context() {
+            Ok(req) => Ok(req),
+            Err(err) => Err((self, err)),
+        }
     }
 
     /// Returns the identifier of the shard currently executing the handler.

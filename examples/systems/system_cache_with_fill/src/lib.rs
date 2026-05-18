@@ -193,41 +193,39 @@ impl Cache {
         }
 
         let qid = self.next_qid;
-        self.next_qid += 1;
-        call.capture(|request| {
-            let slot = request.into_deferred();
-            if let Err(error) = self.pending.try_insert(qid, slot) {
-                return match error {
-                    tina_runtime::PendingRepliesInsertError::Full(_, slot) => {
-                        self.busy_replies += 1;
-                        reply_to(slot, CacheReply::Busy)
-                    }
-                    tina_runtime::PendingRepliesInsertError::DuplicateKey(_, slot) => {
-                        reply_to(slot, CacheReply::Failed("duplicate waiter qid".into()))
-                    }
-                };
-            }
-
-            let entry = self.entries.entry(key.clone()).or_default();
-            if let Some(fill) = &mut entry.filling {
-                fill.qids.push(qid);
-                return noop();
-            }
-
-            let generation = entry.generation;
-            entry.filling = Some(FillState {
-                generation,
-                qids: vec![qid],
-            });
-            self.fills_started += 1;
-            sleep(self.fill_delay).then(move |result| {
-                tina::ServiceMessage::Event(CacheEvent::FillDone {
-                    key,
+        let next_qid = qid + 1;
+        match self.pending.park_request(qid, call) {
+            Ok(ticket) => {
+                self.next_qid = next_qid;
+                let entry = self.entries.entry(key.clone()).or_default();
+                if let Some(fill) = &mut entry.filling {
+                    fill.qids.push(qid);
+                    return tina_runtime::request_effect_after_park(&ticket, noop());
+                }
+                let generation = entry.generation;
+                entry.filling = Some(FillState {
                     generation,
-                    result,
-                })
-            })
-        })
+                    qids: vec![qid],
+                });
+                self.fills_started += 1;
+                let fill_effect = sleep(self.fill_delay).then(move |result| {
+                    tina::ServiceMessage::Event(CacheEvent::FillDone {
+                        key,
+                        generation,
+                        result,
+                    })
+                });
+                tina_runtime::request_effect_after_park(&ticket, fill_effect)
+            }
+            Err(tina_runtime::ParkError::Full { call, .. }) => {
+                self.busy_replies += 1;
+                call.reply(CacheReply::Busy)
+            }
+            Err(tina_runtime::ParkError::DuplicateKey { call, .. }) => {
+                // qid is monotonic; this is unreachable on the happy path.
+                call.reply(CacheReply::Failed("duplicate waiter qid".into()))
+            }
+        }
     }
 
     fn invalidate(&mut self, key: String, call: RequestCall<'_, Self>) -> RequestEffect<Self> {

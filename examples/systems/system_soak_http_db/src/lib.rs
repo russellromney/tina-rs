@@ -17,7 +17,6 @@
 //! Every line is the same `key=value` shape the rest of Tina uses, so
 //! the same grep + parser works.
 
-use std::collections::HashMap;
 use std::convert::Infallible;
 use std::sync::{Arc, Barrier, Mutex};
 use std::thread;
@@ -27,7 +26,7 @@ use tina::capacity::CapacityMode;
 use tina::{CallContext, prelude::*};
 use tina_runtime::{
     BoundedEventSink, CallOutcome, CapacitySummary, DefaultThreadedMailboxFactory, DropPolicy,
-    PendingReplies, ServiceHandle, ServicePressureReport, ServicePressureSurface,
+    GuardedPendingReplies, ServiceHandle, ServicePressureReport, ServicePressureSurface,
     SharedCapacityScope, SharedLease, SharedScopeFull, SleepReply, ThreadedRuntime,
     format_assertion_failure, sleep,
 };
@@ -136,9 +135,7 @@ struct Soak {
     http_scope: SharedCapacityScope,
     db_scope: SharedCapacityScope,
     events: BoundedEventSink<SlowEvent>,
-    pending: PendingReplies<u64, SoakReply>,
-    http_leases: HashMap<u64, SharedLease>,
-    db_leases: HashMap<u64, SharedLease>,
+    pending: GuardedPendingReplies<u64, SoakReply, SharedLease>,
     fake_http: Duration,
     fake_db: Duration,
     slow_threshold: Duration,
@@ -201,10 +198,8 @@ impl Soak {
                 config.event_sink_cap,
                 DropPolicy::DropOldest,
             ),
-            pending: PendingReplies::with_capacity(config.pending_capacity)
+            pending: GuardedPendingReplies::with_capacity(config.pending_capacity)
                 .named("system_soak_http_db.pending"),
-            http_leases: HashMap::new(),
-            db_leases: HashMap::new(),
             fake_http: Duration::from_millis(config.fake_http_ms),
             fake_db: Duration::from_millis(config.fake_db_ms),
             slow_threshold: Duration::from_millis(config.slow_threshold_ms),
@@ -230,37 +225,33 @@ impl Soak {
             }
         };
         let qid = self.next_qid;
-        self.next_qid += 1;
-        let slot = call.into_request_context().into_deferred();
-        if let Err(err) = self.pending.try_insert(qid, slot) {
-            // PendingReplies refused; release the lease so the
-            // http scope does not leak. Reply names the *real*
-            // surface that filled.
-            drop(http_lease);
-            let cap = self.pending.capacity();
-            return match err {
-                tina_runtime::PendingRepliesInsertError::Full(_, slot) => reply_to(
-                    slot,
-                    SoakReply::PendingFull {
-                        current: cap,
-                        max: cap,
-                    },
-                ),
-                tina_runtime::PendingRepliesInsertError::DuplicateKey(_, slot) => {
-                    reply_to(slot, SoakReply::PendingDuplicate)
-                }
-            };
+        let next_qid = qid + 1;
+        match self.pending.park_call_guarded(qid, call, http_lease) {
+            Ok(_ticket) => {
+                self.next_qid = next_qid;
+                let started_ms = self.now_ms();
+                let fake = self.fake_http;
+                sleep(fake).then(move |result| SoakMsg::HttpReleased {
+                    qid,
+                    worker_id,
+                    request_id,
+                    started_ms,
+                    result,
+                })
+            }
+            Err(tina_runtime::GuardedParkCallError::Full { call, .. }) => {
+                let cap = self.pending.capacity();
+                call.reply(SoakReply::PendingFull {
+                    current: cap,
+                    max: cap,
+                })
+            }
+            Err(tina_runtime::GuardedParkCallError::DuplicateKey { call, .. })
+            | Err(tina_runtime::GuardedParkCallError::NoCaller { call, .. })
+            | Err(tina_runtime::GuardedParkCallError::CrossShardUnsupported { call, .. }) => {
+                call.reply(SoakReply::PendingDuplicate)
+            }
         }
-        self.http_leases.insert(qid, http_lease);
-        let started_ms = self.now_ms();
-        let fake = self.fake_http;
-        sleep(fake).then(move |result| SoakMsg::HttpReleased {
-            qid,
-            worker_id,
-            request_id,
-            started_ms,
-            result,
-        })
     }
 
     fn http_released(
@@ -270,19 +261,25 @@ impl Soak {
         request_id: usize,
         started_ms: u64,
     ) -> Effect<Self> {
-        // Release the HTTP lease, then admit against the DB scope. If
-        // DB is full, reply DbFull and free the pending slot.
-        self.http_leases.remove(&qid);
+        // Take the slot+http_lease out so we can swap the guard.
+        let Some((slot, http_lease)) = self.pending.take_by_key(&qid) else {
+            return noop();
+        };
         let db_lease = match self.db_scope.try_admit(1) {
             Ok(lease) => lease,
             Err(SharedScopeFull { current, max, .. }) => {
-                let Some(slot) = self.pending.take(&qid) else {
-                    return noop();
-                };
+                drop(http_lease);
                 return reply_to(slot, SoakReply::DbFull { current, max });
             }
         };
-        self.db_leases.insert(qid, db_lease);
+        drop(http_lease);
+        // Re-admit the same caller under the same key, this time with
+        // the DB lease as the guard. Admission cannot fail: we just
+        // freed slot qid.
+        self.pending
+            .insert_deferred_guarded(qid, slot, db_lease)
+            .map_err(|_| ())
+            .expect("re-admission after take cannot fail");
         let fake = self.fake_db;
         sleep(fake).then(move |result| SoakMsg::DbReleased {
             qid,
@@ -300,7 +297,6 @@ impl Soak {
         request_id: usize,
         started_ms: u64,
     ) -> Effect<Self> {
-        self.db_leases.remove(&qid);
         let took = self.now_ms().saturating_sub(started_ms);
         if Duration::from_millis(took) >= self.slow_threshold {
             self.events.push(SlowEvent {
@@ -309,10 +305,12 @@ impl Soak {
                 took_ms: took,
             });
         }
-        let Some(slot) = self.pending.take(&qid) else {
+        let Some((slot, db_lease)) = self.pending.take_by_key(&qid) else {
             return noop();
         };
-        reply_to(slot, SoakReply::Ok)
+        let effect = reply_to(slot, SoakReply::Ok);
+        drop(db_lease);
+        effect
     }
 }
 

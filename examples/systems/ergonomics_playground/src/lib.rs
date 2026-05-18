@@ -453,20 +453,30 @@ impl Isolate for Batcher {
                 if self.closed {
                     return call.reply(BatchReply::Closed);
                 }
-                if self.pending.len() >= self.pending.capacity() {
-                    return call.reply(BatchReply::Full);
-                }
                 let qid = self.next_qid;
-                self.next_qid += 1;
-                self.pending
-                    .try_insert(qid, call.into_request_context().into_deferred())
-                    .expect("unique qid and pre-checked capacity");
-                self.values.push((qid, value));
-                if self.timer_armed {
-                    noop()
-                } else {
-                    self.timer_armed = true;
-                    sleep(self.window).then(BatcherMsg::Flush)
+                let next_qid = qid + 1;
+                match self.pending.park_call(qid, call) {
+                    Ok(_ticket) => {
+                        self.next_qid = next_qid;
+                        self.values.push((qid, value));
+                        if self.timer_armed {
+                            noop()
+                        } else {
+                            self.timer_armed = true;
+                            sleep(self.window).then(BatcherMsg::Flush)
+                        }
+                    }
+                    Err(tina_runtime::ParkCallError::Full { call, .. }) => {
+                        call.reply(BatchReply::Full)
+                    }
+                    Err(tina_runtime::ParkCallError::DuplicateKey { call, .. }) => {
+                        // qid is monotonic so duplicate is unreachable.
+                        call.reject(tina::CallRejectedReason::UnsupportedMessage)
+                    }
+                    Err(tina_runtime::ParkCallError::NoCaller { call, .. })
+                    | Err(tina_runtime::ParkCallError::CrossShardUnsupported { call, .. }) => {
+                        call.reject(tina::CallRejectedReason::UnsupportedMessage)
+                    }
                 }
             }
             BatcherMsg::Drain | BatcherMsg::Flush(_) => {
@@ -745,21 +755,27 @@ impl Isolate for Cache {
                 if let Some(value) = self.cached {
                     return call_ctx.reply(CacheReply::Hit(value));
                 }
-                if self.pending.len() >= self.pending.capacity() {
-                    return call_ctx.reply(CacheReply::Full);
-                }
-
                 let qid = self.next_qid;
-                self.next_qid += 1;
-                self.pending
-                    .try_insert(qid, call_ctx.into_request_context().into_deferred())
-                    .expect("unique qid and pre-checked capacity");
-                if self.filling {
-                    noop()
-                } else {
-                    self.filling = true;
-                    call(self.upstream, UpstreamMsg::Fetch, CALL_TIMEOUT)
-                        .then(CacheMsg::FillReturned)
+                let next_qid = qid + 1;
+                match self.pending.park_call(qid, call_ctx) {
+                    Ok(_ticket) => {
+                        self.next_qid = next_qid;
+                        if self.filling {
+                            noop()
+                        } else {
+                            self.filling = true;
+                            call(self.upstream, UpstreamMsg::Fetch, CALL_TIMEOUT)
+                                .then(CacheMsg::FillReturned)
+                        }
+                    }
+                    Err(tina_runtime::ParkCallError::Full { call, .. }) => {
+                        call.reply(CacheReply::Full)
+                    }
+                    Err(tina_runtime::ParkCallError::DuplicateKey { call, .. })
+                    | Err(tina_runtime::ParkCallError::NoCaller { call, .. })
+                    | Err(tina_runtime::ParkCallError::CrossShardUnsupported { call, .. }) => {
+                        call.reject(tina::CallRejectedReason::UnsupportedMessage)
+                    }
                 }
             }
             CacheMsg::FillReturned(_) => {

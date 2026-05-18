@@ -56,6 +56,8 @@ mod capabilities;
 pub mod capacity;
 mod clock;
 pub mod deferred;
+pub mod guarded_pending;
+pub mod wait_list;
 mod drain_state;
 mod driver;
 mod errors;
@@ -238,8 +240,9 @@ pub use crate::persistence::{
 };
 #[allow(deprecated)]
 pub use call::{
-    CallError, CallId, CallInput, CallOutcome, CallOutput, CallReply, CancelableCall,
-    DeferredCancelableCall, DeferredIsolateCall, DeferredObservedSend, DeferredTypedCall,
+    AdmitWorkError, CallError, CallId, CallInput, CallOutcome, CallOutput, CallReply,
+    CancelableCall, CancelableWork, CancelableWorkSnapshot, DeferredCancelableCall,
+    DeferredIsolateCall, DeferredObservedSend, DeferredTypedCall, SleepCall, WorkTicket,
     DnsLookupReply, ErasedCall, FileCloseReply, FileFsyncReply, FileId, FileOpenOptions,
     FileOpenReply, FileReadReply, FileSizeReply, FileWriteReply, IntoErasedCall, IsolateCall,
     IsolateCallWithHandle, JournalAppendReply, JournalRecord, JournalReplay, JournalReplayReply,
@@ -273,8 +276,17 @@ pub use capacity::{
     format_assertion_failure, format_discovery_line, format_discovery_report,
 };
 pub use deferred::{
-    InsertError as PendingRepliesInsertError, PendingReplies,
+    request_effect_after_park, InsertError as PendingRepliesInsertError, ParkCallError, ParkError,
+    ParkTicket, PendingReplies, ReplyParkedError, TakeParkedError,
     TryCaptureError as PendingRepliesTryCaptureError,
+};
+pub use guarded_pending::{
+    GuardedInsertError, GuardedParkCallError, GuardedParkError, GuardedParkTicket,
+    GuardedPendingReplies, GuardedReplyError, GuardedTakeError,
+};
+pub use wait_list::{
+    WaitCallError as WaitListCallError, WaitError as WaitListError, WaitList,
+    WaitReplyError as WaitListReplyError, WaitSnapshot as WaitListSnapshot, WaitTicket,
 };
 use driver::DriverCompletion;
 pub use event_sink::{
