@@ -160,7 +160,16 @@ call_request(cache.requests, CacheEvent::FillDone { ... }, timeout) // expected 
 
 The raw `ServiceMessage<Event, Request>` envelope still exists for runtime and
 interop code. Keep it out of copied service code unless you are deliberately
-using the escape hatch.
+using the escape hatch. The escape hatch has boring runtime truth:
+
+```text
+raw Event sent on the call lane -> Rejected(UnsupportedMessage)
+raw Request sent on the send/event lane -> ignored by the event handler
+```
+
+That second case is why copied app code should keep the event/request
+capabilities instead of passing raw envelope addresses around. A send has no
+caller to reject, so the compiler rail is the safety feature.
 
 ## Deferred Reply
 

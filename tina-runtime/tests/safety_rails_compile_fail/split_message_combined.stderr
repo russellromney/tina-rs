@@ -1,0 +1,5 @@
+error: `message = ...` cannot be combined with `event = ...` / `request = ...`
+  --> tests/safety_rails_compile_fail/split_message_combined.rs:21:6
+   |
+21 | impl Service {
+   |      ^^^^^^^

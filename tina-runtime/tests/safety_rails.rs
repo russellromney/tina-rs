@@ -19,8 +19,9 @@ use std::time::Duration;
 
 use tina::prelude::*;
 use tina_runtime::{
-    CallOutcome, DefaultMailboxFactory, Runtime, SendOnlyServiceHandle, ServiceHandle,
-    SplitServiceHandle, call_request, call_typed,
+    CallOutcome, DefaultMailboxFactory, DefaultThreadedMailboxFactory, Runtime,
+    SendOnlyServiceHandle, ServiceHandle, SplitServiceHandle, ThreadedRuntime, call_request,
+    call_typed,
 };
 
 // ---------------------------------------------------------------------------
@@ -287,10 +288,10 @@ struct SplitService {
 impl SplitService {
     fn handle_event(
         &mut self,
-        event: SplitEvent,
-        _ctx: &mut Context<'_, SingleShard, Self::Reply>,
+        ev: SplitEvent,
+        _cx: &mut Context<'_, SingleShard, Self::Reply>,
     ) -> Effect<Self> {
-        match event {
+        match ev {
             SplitEvent::Filled(value) => {
                 self.value = value;
                 noop()
@@ -298,13 +299,9 @@ impl SplitService {
         }
     }
 
-    fn handle_request(
-        &mut self,
-        request: SplitRequest,
-        call: CallContext<'_, Self>,
-    ) -> Effect<Self> {
-        match request {
-            SplitRequest::Read => call.reply(SplitReply(self.value)),
+    fn handle_request(&mut self, req: SplitRequest, caller: CallContext<'_, Self>) -> Effect<Self> {
+        match req {
+            SplitRequest::Read => caller.reply(SplitReply(self.value)),
         }
     }
 }
@@ -402,4 +399,106 @@ fn split_service_routes_events_and_requests_on_separate_capabilities() {
             .expect("request replied"),
         SplitReply(42),
     );
+}
+
+#[test]
+fn split_service_threaded_runtime_routes_request_lane() {
+    let runtime = ThreadedRuntime::new(SingleShard, DefaultThreadedMailboxFactory);
+    let handle: SplitServiceHandle<SplitEvent, SplitRequest, SplitReply> = runtime
+        .register_split_service::<SplitService, SplitEvent, SplitRequest, Infallible>(
+            SplitService { value: 37 },
+            8,
+        )
+        .expect("register split service");
+
+    // The current host-thread path still uses the raw address escape hatch for
+    // event injection. Service-to-service code uses `tina::send_event`, tested
+    // above. This keeps the threaded proof honest about what users can do
+    // today.
+    runtime
+        .try_send(
+            handle.events.address().address(),
+            tina::ServiceMessage::Event(SplitEvent::Filled(55)),
+        )
+        .expect("send event");
+
+    let outcome = runtime
+        .call_blocking(
+            handle.requests.address().address(),
+            tina::ServiceMessage::Request(SplitRequest::Read),
+            Duration::from_secs(1),
+        )
+        .expect("call request");
+
+    assert_eq!(outcome, CallOutcome::Replied(SplitReply(55)));
+    runtime.shutdown().expect("shutdown");
+}
+
+#[test]
+fn split_service_raw_request_on_send_lane_is_noop_escape_hatch() {
+    let mut runtime = Runtime::new(SingleShard, DefaultMailboxFactory);
+    let handle: SplitServiceHandle<SplitEvent, SplitRequest, SplitReply> = runtime
+        .register_split_service::<SplitService, SplitEvent, SplitRequest, Infallible>(
+            SplitService { value: 0 },
+            8,
+        );
+
+    runtime
+        .try_send(
+            handle.events.address().address(),
+            tina::ServiceMessage::Event(SplitEvent::Filled(11)),
+        )
+        .expect("event accepted");
+    while runtime.step() > 0 {}
+
+    runtime
+        .try_send(
+            handle.events.address().address(),
+            tina::ServiceMessage::Request(SplitRequest::Read),
+        )
+        .expect("raw request accepted on erased send lane");
+    while runtime.step() > 0 {}
+
+    let client_addr = runtime.register_with_capacity::<SplitClient, Infallible>(SplitClient, 8);
+    let waiter = runtime
+        .observe_result::<Result<SplitReply, tina_runtime::CallError>, _, _>(client_addr)
+        .expect("observe_result registers");
+    runtime
+        .try_send(client_addr, SplitClientMsg::Start(handle.requests))
+        .expect("client accepts start");
+    while runtime.step() > 0 {}
+
+    assert_eq!(
+        waiter
+            .wait(Duration::from_millis(100))
+            .expect("client stopped")
+            .expect("request replied"),
+        SplitReply(11),
+        "raw request sent through the event/send lane must not run the request handler",
+    );
+}
+
+#[test]
+fn split_service_raw_event_on_call_lane_is_rejected() {
+    let runtime = ThreadedRuntime::new(SingleShard, DefaultThreadedMailboxFactory);
+    let handle: SplitServiceHandle<SplitEvent, SplitRequest, SplitReply> = runtime
+        .register_split_service::<SplitService, SplitEvent, SplitRequest, Infallible>(
+            SplitService { value: 0 },
+            8,
+        )
+        .expect("register split service");
+
+    let outcome = runtime
+        .call_blocking(
+            handle.requests.address().address(),
+            tina::ServiceMessage::Event(SplitEvent::Filled(99)),
+            Duration::from_secs(1),
+        )
+        .expect("raw call");
+
+    assert_eq!(
+        outcome,
+        CallOutcome::Rejected(tina::CallRejectedReason::UnsupportedMessage)
+    );
+    runtime.shutdown().expect("shutdown");
 }
