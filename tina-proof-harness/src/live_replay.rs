@@ -46,7 +46,7 @@ pub struct LiveTrace {
 
 impl std::fmt::Debug for LiveTrace {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let len = self.events.lock().map(|v| v.len()).unwrap_or(0);
+        let len = self.events.lock().expect("live trace lock poisoned").len();
         f.debug_struct("LiveTrace").field("len", &len).finish()
     }
 }
@@ -93,9 +93,11 @@ impl LiveTrace {
     /// Snapshot the current shape: (event_count, stable_trace_hash).
     pub fn snapshot(&self) -> TraceShape {
         let guard = self.events.lock().expect("live trace lock");
+        let mut events = guard.clone();
+        events.sort_by_key(|event| event.id());
         TraceShape {
-            event_count: guard.len(),
-            trace_hash: stable_trace_hash(guard.iter()),
+            event_count: events.len(),
+            trace_hash: stable_trace_hash(events.iter()),
         }
     }
 
@@ -153,9 +155,10 @@ struct LiveTraceObserver {
 
 impl TraceObserver for LiveTraceObserver {
     fn on_event(&self, event: &RuntimeEvent) {
-        if let Ok(mut guard) = self.events.lock() {
-            guard.push(*event);
-        }
+        self.events
+            .lock()
+            .expect("live trace lock poisoned")
+            .push(*event);
     }
 }
 
@@ -245,6 +248,23 @@ mod tests {
         let shape = trace.snapshot();
         assert_eq!(shape.event_count, 3);
         assert_ne!(shape.trace_hash, 0);
+    }
+
+    #[test]
+    fn snapshot_hash_sorts_by_event_id_for_multishard_arrival_order() {
+        let ordered = LiveTrace::new();
+        let ordered_observer = ordered.observer();
+        ordered_observer.on_event(&sample_event(1));
+        ordered_observer.on_event(&sample_event(2));
+        ordered_observer.on_event(&sample_event(3));
+
+        let arrival_scrambled = LiveTrace::new();
+        let scrambled_observer = arrival_scrambled.observer();
+        scrambled_observer.on_event(&sample_event(3));
+        scrambled_observer.on_event(&sample_event(1));
+        scrambled_observer.on_event(&sample_event(2));
+
+        assert_eq!(ordered.snapshot(), arrival_scrambled.snapshot());
     }
 
     #[test]

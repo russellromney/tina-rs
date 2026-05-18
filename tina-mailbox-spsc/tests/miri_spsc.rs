@@ -58,7 +58,7 @@ fn full_and_closed_errors_return_message_ownership() {
 #[test]
 fn unread_buffered_messages_drop_exactly_once() {
     let drops = Rc::new(Cell::new(0));
-    let mailbox = SpscMailbox::new(3);
+    let mailbox = SpscMailbox::new(4);
 
     assert!(mailbox.try_send(DropToken::new(Rc::clone(&drops))).is_ok());
     assert!(mailbox.try_send(DropToken::new(Rc::clone(&drops))).is_ok());
