@@ -26,6 +26,29 @@ Grug truth:
 Canonical review artifact: `docs/adversarial-review.md` from PR #135. PR
 #134 is superseded once its unique findings are folded into #135.
 
+## Finding Coverage Map
+
+Every review finding has a rock. Do not skip medium/low findings because they
+look small. Small silent lies become big Tina lies.
+
+- Rock 1: C1.
+- Rock 2: H14, M1, M6, L13, L14, A6, A7.
+- Rock 3: C2, C3, C5, H9, M7, M14.
+- Rock 4: C4, M13.
+- Rock 5: H1, H2, H13, M8, A1.
+- Rock 6: H6, L10, L11, A2.
+- Rock 7: A3, A4, A5.
+- Rock 8: H4, H5, H7, H10, H11, L5.
+- Rock 9: H3, M5, M21, L1, L6, L8, L15.
+- Rock 10: M2, M3, M16, M23, M24, M25, L2, L3, L4, L16.
+- Rock 11: H8, H12, M11, M12, M22, L7, L9, L12.
+- Rock 12: M9, M10, M15, M18, M19, M20, L17, L18.
+- Rock 13: M4, M17, plus bridge/doc cleanup that falls out of Rocks 5 and
+  12.
+
+If implementation proves a finding false or already fixed, add the proof and
+test name to `docs/adversarial-review.md`. Do not delete it quietly.
+
 ## Rock 1: HTTP/1 Keepalive Chunked Safety
 
 Fix C1.
