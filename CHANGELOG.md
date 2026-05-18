@@ -47,6 +47,85 @@ This file records completed work.
 - Documented the split event/request copied path in
   `docs/tina-user-guide/04-request-reply.md`.
 
+### Phase 108 Proof Harnesses And Replay Ops
+
+- Added the `tina-proof-harness` crate with reusable load/soak,
+  bad-peer, and live-replay helper modules. The harness reports typed
+  pressure/failure facts instead of forcing tests to scrape logs.
+- Added `examples/systems/mini_saas_api/tests/soak.rs` and wired the
+  Mini SaaS system through the load/soak harness with capacity and
+  lifecycle summaries.
+- Added `examples/systems/system_realtime_rooms/tests/bad_peer.rs` so
+  the WebSocket/realtime-room path proves a real bad-peer/slow-peer
+  close shape through the shared harness.
+- Added `examples/systems/system_live_replay_bugbox`, a small system
+  that demonstrates the live-capture -> saved replay -> simulator
+  workflow and records the expected user-facing command/output shape.
+- Added Makefile proof targets for the fast/slow harness split so
+  cheap model sessions and humans can run the same smoke/soak/replay
+  commands without inventing private drivers.
+
+### Phase 107 Observability And Capacity Product
+
+- Added `tina_runtime::service_pressure` and `ServicePressureReport`
+  shapes for copied service-level pressure summaries, including
+  measured and explicitly unavailable surfaces.
+- Added `SharedCapacityScope` for shard-local user-defined weighted
+  budgets. Reports expose current/high-water/full/released counts and
+  owner-stop release behavior; weights remain user-defined and honest
+  rather than pretending to be memory accounting.
+- Added `BoundedEventSink`, a capped log/metric/event sink with drop
+  policy, high-water, dropped counts, and drain snapshots, so
+  observability does not become a hidden unbounded queue.
+- Expanded capacity assertion/discovery helpers in `tina-runtime` and
+  updated `mini_saas_api` to emit/assert compact topology and capacity
+  summaries.
+- Added `examples/systems/system_api_gateway_limits` and
+  `examples/systems/system_soak_http_db` as user-shaped proofs for
+  shared weighted capacity and CI-friendly pressure discovery lines.
+- Recorded the simulator honesty boundary: the new out-of-trace live
+  surfaces report `Unavailable` in simulator paths until a future
+  adapter carries those facts into replay.
+
+### Phase 105 Request-Scoped Cancellation
+
+- Added `tina_runtime::scope` with `RequestScopeId`, bounded request
+  scope storage, scoped call handles, and typed scope cancellation
+  reports.
+- Wired request-scope cancellation through Tina-owned waits so a
+  request can cancel child calls/timers/rails it owns, reclaim bounded
+  storage, and keep late completions visible instead of mysterious.
+- Kept the external-work boundary honest: bridges may stop waiting and
+  reclaim caller capacity, but Tina does not claim a database/AWS/HTTP
+  SDK operation stopped unless the bridge can prove that terminal fact.
+- Added runtime and simulator tests for scope admission, fill/cancel/refill,
+  owner-stop cleanup, late completion truth, and admission-failure paths.
+- Added `examples/specimen_request_scope_fanout`, showing one request
+  fanning cancellation through multiple child operations with typed
+  results and visible cleanup.
+- Updated request/reply and lifecycle/shutdown docs with the request-scope
+  cancellation model and its "cancel wait vs cancel external work" boundary.
+
+### Phase 104 Production Client / Bridge Breadth
+
+- Extended `tina-aws-bridge` beyond the S3 first form with DynamoDB,
+  SNS, Secrets Manager, and broader SQS surfaces, each with typed
+  request/response/error shapes, explicit caps, timeouts, metrics, and
+  operation/service tracing fields.
+- Added AWS classifiers for success/transient/fatal/caller-timeout style
+  outcomes without hiding retry/idempotency policy inside the bridge.
+- Added hermetic bridge tests and request-shape examples for DynamoDB,
+  SNS, Secrets Manager, and SQS so copied use does not require a real AWS
+  account.
+- Tightened supplied-client/bridge ownership docs and bridge convention
+  language around timeout ownership, close behavior, worker-terminal
+  metrics, and caller-observed late-result truth.
+- Added `examples/systems/system_webhook_relay` as a production-shaped
+  bridge consumer with retry/dead-letter-style policy and typed capacity
+  facts.
+- Updated `system_bounded_object_lane` to record the real bridge-backed
+  object-lane lessons while keeping default tests hermetic.
+
 ### Phase 103 Protocol Parity Finish
 
 - Audited the native HTTP/2, gRPC, and WebSocket stacks for the
