@@ -295,10 +295,14 @@ mod worker;
 pub use helpers::{
     ExecuteCall, FetchManyCall, FetchOneCall, PgAddress, PgCallOutcome, PgExecutedOutcome,
     PgFatalReason, PgFetchManyOutcome, PgFetchOneOutcome, PgOutcomeClass, PgOutcomeExt, PgResult,
-    PgRows, PgTransactionCallOutcome, PgTransientReason, TransactionCall, execute_call,
-    fetch_many_call, fetch_one_call, send_request, transaction_call,
+    PgRows, PgTransactionCallOutcome, PgTransientReason, TransactionCall, bridge_class,
+    execute_call, fetch_many_call, fetch_one_call, send_request, transaction_call,
 };
-pub use metrics::{PgMetrics, PgMetricsHandle, PgPressureReport};
+pub use metrics::{PG_BRIDGE_SURFACE, PgMetrics, PgMetricsHandle, PgPressureReport};
+// Shared bridge vocabulary lives in `tina_runtime::bridge`.
+pub use tina_runtime::bridge::{
+    BridgeFatal, BridgeOutcomeClass, BridgePressure, BridgeRetryable, BridgeUnavailable,
+};
 pub use types::{
     InstallError, PgCancelConfig, PgConfig, PgConfigError, PgError, PgPoolConfig, PgRequest,
     PgResponse, PgRow, PgStep, PgStepOk, PgTransactionOutcome, PgType, PgValue, U64TooLarge,

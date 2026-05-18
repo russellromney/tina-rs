@@ -104,26 +104,16 @@ impl DynamoCloser {
     /// SDK work to leave the bridge's in-flight set.
     pub fn close_and_drain(&self, timeout: Duration) -> DynamoDrainReport {
         self.close();
-        let deadline = Instant::now() + timeout;
-        loop {
-            let remaining = self.metrics.in_flight_current.load(Ordering::Relaxed);
-            if remaining == 0 {
-                return DynamoDrainReport {
-                    closed: true,
-                    drained: true,
-                    in_flight_remaining: 0,
-                    in_flight_kinds: Vec::new(),
-                };
-            }
-            if Instant::now() >= deadline {
-                return DynamoDrainReport {
-                    closed: true,
-                    drained: false,
-                    in_flight_remaining: remaining,
-                    in_flight_kinds: self.metrics.in_flight_kinds(),
-                };
-            }
-            std::thread::sleep(Duration::from_millis(1));
+        let result = crate::core::await_drain(
+            &self.metrics.in_flight_current,
+            || self.metrics.in_flight_kinds(),
+            timeout,
+        );
+        DynamoDrainReport {
+            closed: true,
+            drained: result.drained,
+            in_flight_remaining: result.in_flight_remaining,
+            in_flight_kinds: result.in_flight_kinds,
         }
     }
 }

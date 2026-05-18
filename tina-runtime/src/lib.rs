@@ -50,6 +50,7 @@ use tina_supervisor::SupervisorConfig;
 
 use betelgeuse::IOLoopHandle;
 
+pub mod bridge;
 mod call;
 mod call_group;
 mod capabilities;
