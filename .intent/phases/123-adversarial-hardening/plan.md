@@ -24,12 +24,14 @@ Grug truth:
 - tests prove user-visible behavior, not just helper internals.
 
 Canonical review artifact: `docs/adversarial-review.md` from PR #135. PR
-#134 is superseded once its unique findings are folded into #135.
+#134 is superseded once its unique findings are folded into #135. The later
+A8-A12 second-pass findings are preserved in that same doc and implemented by
+Phase 124.
 
-## Finding Coverage Map
+## First-Pass Finding Coverage Map
 
-Every review finding has a rock. Do not skip medium/low findings because they
-look small. Small silent lies become big Tina lies.
+Every first-pass review finding has a rock. Do not skip medium/low findings
+because they look small. Small silent lies become big Tina lies.
 
 - Rock 1: C1.
 - Rock 2: H14, M1, M6, L13, L14, A6, A7.
