@@ -1149,12 +1149,16 @@ fn percent_encode_grpc_message(message: &str) -> String {
     out
 }
 
-/// Tiny prior-knowledge h2c unary client helper.
+/// Tiny blocking prior-knowledge h2c unary client helper.
 ///
 /// This is a blocking specimen/test helper, not a pooled Tina client
 /// service. It exists to prove the native bytes/status path without
 /// introducing hyper, tonic, or Tokio.
-pub fn grpc_unary_call_h2c<Req, Resp>(
+///
+/// It does not run inside a Tina isolate, does not emit runtime trace facts,
+/// and is not part of deterministic replay. A future native Tina gRPC client
+/// service should own received-status facts.
+pub fn grpc_unary_call_h2c_blocking<Req, Resp>(
     target: SocketAddr,
     path: &str,
     request: &Req,
@@ -1212,6 +1216,28 @@ where
         return Err(GrpcError::BadFrame);
     }
     Ok(response)
+}
+
+/// Compatibility spelling for [`grpc_unary_call_h2c_blocking`].
+///
+/// Prefer the `_blocking` name so copied code does not mistake this helper for
+/// a native Tina client service.
+#[deprecated(
+    since = "0.1.0",
+    note = "use grpc_unary_call_h2c_blocking; this is a blocking specimen/test helper, not a Tina client service"
+)]
+pub fn grpc_unary_call_h2c<Req, Resp>(
+    target: SocketAddr,
+    path: &str,
+    request: &Req,
+    timeout: Duration,
+    limits: GrpcLimits,
+) -> Result<Resp, GrpcError>
+where
+    Req: Message,
+    Resp: Message + Default,
+{
+    grpc_unary_call_h2c_blocking(target, path, request, timeout, limits)
 }
 
 #[derive(Debug)]

@@ -17,8 +17,9 @@
 - Do not run beside 087 WebSocket unless `tina-http` file ownership is
   coordinated.
 - First PR is server-first. Client support is intentionally tiny and honest:
-  `grpc_unary_call_h2c` proves the native HTTP/2/protobuf/status path without
-  Tokio, hyper, tonic, pooling, or hidden runtime ownership.
+  `grpc_unary_call_h2c_blocking` proves the native HTTP/2/protobuf/status path
+  without Tokio, hyper, tonic, pooling, runtime trace facts, or hidden runtime
+  ownership.
 
 ## Grug Truth
 

@@ -15,7 +15,7 @@ use tina_http::{
     GrpcRequest, GrpcRequestStream, GrpcResponse, GrpcRouter, GrpcServerStreamingResponse,
     GrpcStatus, GrpcStatusCode, GrpcStreamReply, GrpcStreamingCall, GrpcStreamingResponse,
     Http2Limits, Http2Listener, Http2ListenerMsg, Http2ServerConfig, HttpRequest, HttpResponse,
-    grpc_stream_finish, grpc_stream_message, grpc_unary_call_h2c,
+    grpc_stream_finish, grpc_stream_message, grpc_unary_call_h2c_blocking,
 };
 use tina_runtime::{
     DefaultThreadedMailboxFactory, RuntimeEvent, RuntimeEventKind, ThreadedRuntime,
@@ -770,7 +770,7 @@ fn read_statuses(stream: &mut TcpStream, stream_ids: &[u32]) -> Vec<(u32, GrpcSt
 #[test]
 fn grpc_happy_unary_request_response() {
     let harness = GrpcHarness::start_router(Http2ServerConfig::default(), GrpcLimits::default());
-    let reply: CounterReply = grpc_unary_call_h2c(
+    let reply: CounterReply = grpc_unary_call_h2c_blocking(
         harness.addr,
         "/specimen.Counter/Increment",
         &CounterRequest { delta: 41 },
@@ -1466,7 +1466,7 @@ fn grpc_streaming_request_total_body_cap_counts_consumed_chunks() {
 #[test]
 fn grpc_large_unary_request_splits_http2_data_frames() {
     let harness = GrpcHarness::start_router(Http2ServerConfig::default(), GrpcLimits::default());
-    let reply: CounterReply = grpc_unary_call_h2c(
+    let reply: CounterReply = grpc_unary_call_h2c_blocking(
         harness.addr,
         "/specimen.Counter/BlobLen",
         &BlobRequest {
@@ -1483,7 +1483,7 @@ fn grpc_large_unary_request_splits_http2_data_frames() {
 #[test]
 fn grpc_typed_status_propagates_in_trailers() {
     let harness = GrpcHarness::start_router(Http2ServerConfig::default(), GrpcLimits::default());
-    let error = grpc_unary_call_h2c::<_, CounterReply>(
+    let error = grpc_unary_call_h2c_blocking::<_, CounterReply>(
         harness.addr,
         "/specimen.Counter/Status",
         &CounterRequest { delta: 1 },
@@ -1619,7 +1619,7 @@ fn grpc_response_message_cap_is_resource_exhausted() {
             max_message_bytes: 2,
         },
     );
-    let error = grpc_unary_call_h2c::<_, CounterReply>(
+    let error = grpc_unary_call_h2c_blocking::<_, CounterReply>(
         harness.addr,
         "/specimen.Counter/Big",
         &CounterRequest { delta: 1 },

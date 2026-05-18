@@ -10,7 +10,7 @@ use tina_http::{
     GrpcRouter, GrpcRouterMsg, GrpcServerStreamingResponse, GrpcStatus, GrpcStatusCode,
     GrpcStreamReply, GrpcStreamingCall, GrpcStreamingResponse, Http2Listener, Http2ListenerMsg,
     Http2ServerConfig, ResponseChunkMsg, ResponseChunkReply, grpc_stream_finish,
-    grpc_stream_message, grpc_unary_call_h2c,
+    grpc_stream_message, grpc_unary_call_h2c_blocking,
 };
 use tina_runtime::{DefaultThreadedMailboxFactory, ThreadedRuntime, ThreadedRuntimeConfig};
 
@@ -351,7 +351,7 @@ pub fn start_server() -> Result<SpecimenServer, String> {
 
 pub fn run_smoke() -> Result<u64, String> {
     let server = start_server()?;
-    let reply: CounterReply = grpc_unary_call_h2c(
+    let reply: CounterReply = grpc_unary_call_h2c_blocking(
         server.addr,
         "/specimen.Counter/Increment",
         &CounterRequest { delta: 7 },

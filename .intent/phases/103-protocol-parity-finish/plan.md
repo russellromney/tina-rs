@@ -103,7 +103,7 @@ Add simulator/runtime events for the protocol facts users debug:
 - flow-control full
 - body high-water
 - websocket slow-peer close
-- grpc final status sent/received
+- server-side grpc final status sent
 
 Stable trace hashes must not churn for unrelated effects.
 
@@ -143,11 +143,13 @@ scope.
 
 Rock 5 ("Simulator Facts") did not ship in this phase. The protocol facts the
 plan named — stream opened/closed/reset, flow-control full, body high-water,
-WebSocket slow-peer close, gRPC final status sent/received — surface today as
-bounded counters on `Http2ConnectionReport`, `BodyMetrics`,
-`WebSocketMemberTableReport`, and the typed `GrpcStatus` trailers. They are
-**not** plumbed through `RuntimeEventKind` on the trace stream and they do
-**not** round-trip through `tina-sim` replay. A user who wants protocol
+WebSocket slow-peer close, and server-side gRPC final status sent — surface
+today as bounded counters on `Http2ConnectionReport`, `BodyMetrics`,
+`WebSocketMemberTableReport`, and the typed `GrpcStatus` trailers. The
+blocking `grpc_unary_call_h2c_blocking` helper can observe received trailers,
+but it is not a Tina client service and must not be treated as a runtime fact
+source. These facts are **not** plumbed through `RuntimeEventKind` on the trace
+stream and they do **not** round-trip through `tina-sim` replay. A user who wants protocol
 behavior in a deterministic "bug in a box" still has to wire one of the
 existing DST cases (TCP-script-driven listener/connection lifecycle in
 `tina-http/tests/dst_simulator.rs`) rather than asking the trace for "show me

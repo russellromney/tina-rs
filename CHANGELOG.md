@@ -183,12 +183,14 @@ This file records completed work.
 - **Deferred from this phase, named follow-up.** Rock 5 ("Simulator
   Facts") did not ship. The protocol facts the plan named — stream
   opened/closed/reset, flow-control full, body high-water, WebSocket
-  slow-peer close, gRPC final status sent/received — surface as bounded
-  counters on `Http2ConnectionReport`, `BodyMetrics`,
-  `WebSocketMemberTableReport`, and the typed `GrpcStatus` trailers, not
-  as `RuntimeEventKind` variants on the trace stream. They do not
-  round-trip through `tina-sim` replay yet, which means a protocol bug
-  cannot be replayed from a trace today.
+  slow-peer close, and server-side gRPC final status sent — surface as
+  bounded counters on `Http2ConnectionReport`, `BodyMetrics`,
+  `WebSocketMemberTableReport`, and typed `GrpcStatus` trailers, not as
+  `RuntimeEventKind` variants on the trace stream. The blocking
+  `grpc_unary_call_h2c_blocking` helper observes received trailers, but it
+  is not a Tina client service and does not emit replayable runtime facts.
+  Protocol facts do not round-trip through `tina-sim` replay yet, which
+  means a protocol bug cannot be replayed from a trace today.
 - **Deferred from this phase, named follow-up.** The plan's Required
   Proof line "At least one DST replay case for a protocol
   pressure/lifecycle bug" is satisfied by pre-existing
