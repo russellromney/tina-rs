@@ -5,8 +5,9 @@
 //!
 //! - [`PendingReplies`] for parked acquire-callers, keyed by waiter id.
 //!   Caps total parked waiters across every key in one bounded table.
-//! - [`CallContext`] for `Acquire` / `Release` / `Renew` / `Stats` caller
-//!   authority, with internal `LeaseExpired` rejected from `handle_call`.
+//! - [`RequestCall`] for `Acquire` / `Release` / `Renew` / `Stats` caller
+//!   authority, with private internal `LeaseExpired` events outside the public
+//!   request lane.
 //! - `sleep(d).then(...)` for runtime-owned lease expiry. Each scheduled
 //!   wake carries an `expiry_token` so a renewed lease silently ignores
 //!   the stale wake without needing cancellation.
@@ -32,7 +33,7 @@ use std::sync::{Arc, Barrier, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use tina::{CallContext, prelude::*};
+use tina::prelude::*;
 use tina_runtime::{
     CallOutcome, DefaultThreadedMailboxFactory, PendingReplies, ThreadedRuntime, sleep,
 };
@@ -107,15 +108,18 @@ pub struct LockStats {
 }
 
 #[derive(Debug)]
-pub enum LockMsg {
-    Acquire { key: String },
-    Release { handle: LockHandle },
-    Renew { handle: LockHandle },
+enum LockEvent {
     LeaseExpired {
         key: String,
         holder_id: u64,
         expiry_token: u64,
     },
+}
+
+enum LockRequest {
+    Acquire { key: String },
+    Release { handle: LockHandle },
+    Renew { handle: LockHandle },
     Stats,
 }
 
@@ -126,7 +130,7 @@ struct LockState {
     waiters: VecDeque<u64>,
 }
 
-pub struct LockManager {
+struct LockManager {
     lease: Duration,
     max_waiters_per_key: usize,
     max_keys: usize,
@@ -137,35 +141,32 @@ pub struct LockManager {
     stats: LockStats,
 }
 
-#[tina_runtime::isolate(message = LockMsg, reply = LockReply)]
+#[tina_runtime::isolate(event = LockEvent, request = LockRequest, reply = LockReply)]
 impl LockManager {
-    fn handle(
+    fn handle_event(
         &mut self,
-        msg: LockMsg,
+        event: LockEvent,
         _ctx: &mut Context<'_, SingleShard, Self::Reply>,
     ) -> Effect<Self> {
-        match msg {
-            LockMsg::LeaseExpired {
+        match event {
+            LockEvent::LeaseExpired {
                 key,
                 holder_id,
                 expiry_token,
             } => self.lease_expired(key, holder_id, expiry_token),
-            LockMsg::Acquire { .. }
-            | LockMsg::Release { .. }
-            | LockMsg::Renew { .. }
-            | LockMsg::Stats => noop(),
         }
     }
 
-    fn handle_call(&mut self, msg: LockMsg, call: CallContext<'_, Self>) -> Effect<Self> {
-        match msg {
-            LockMsg::Acquire { key } => self.acquire(key, call),
-            LockMsg::Release { handle } => self.release(handle, call),
-            LockMsg::Renew { handle } => self.renew(handle, call),
-            LockMsg::Stats => call.reply(LockReply::Stats(self.snapshot())),
-            LockMsg::LeaseExpired { .. } => {
-                call.reject(tina::CallRejectedReason::UnsupportedMessage)
-            }
+    fn handle_request(
+        &mut self,
+        request: LockRequest,
+        call: RequestCall<'_, Self>,
+    ) -> RequestEffect<Self> {
+        match request {
+            LockRequest::Acquire { key } => self.acquire(key, call),
+            LockRequest::Release { handle } => self.release(handle, call),
+            LockRequest::Renew { handle } => self.renew(handle, call),
+            LockRequest::Stats => call.reply(LockReply::Stats(self.snapshot())),
         }
     }
 }
@@ -185,7 +186,7 @@ impl LockManager {
         }
     }
 
-    fn acquire(&mut self, key: String, call: CallContext<'_, Self>) -> Effect<Self> {
+    fn acquire(&mut self, key: String, call: RequestCall<'_, Self>) -> RequestEffect<Self> {
         if !self.locks.contains_key(&key) {
             if self.locks.len() >= self.max_keys {
                 self.stats.keyspace_full_rejects += 1;
@@ -202,31 +203,33 @@ impl LockManager {
 
         let waiter_id = self.next_waiter_id;
         self.next_waiter_id += 1;
-        let slot = call.into_request_context().into_deferred();
-        if let Err(error) = self.pending.try_insert(waiter_id, slot) {
-            return match error {
-                tina_runtime::PendingRepliesInsertError::Full(_, slot) => {
-                    reply_to::<Self>(slot, LockReply::Busy)
-                }
-                tina_runtime::PendingRepliesInsertError::DuplicateKey(_, slot) => {
-                    // waiter ids are minted monotonically, so this branch
-                    // is unreachable in practice; surface it loudly if it
-                    // ever fires.
-                    reply_to::<Self>(slot, LockReply::Busy)
-                }
-            };
-        }
+        call.capture(|request| {
+            let slot = request.into_deferred();
+            if let Err(error) = self.pending.try_insert(waiter_id, slot) {
+                return match error {
+                    tina_runtime::PendingRepliesInsertError::Full(_, slot) => {
+                        reply_to::<Self>(slot, LockReply::Busy)
+                    }
+                    tina_runtime::PendingRepliesInsertError::DuplicateKey(_, slot) => {
+                        // waiter ids are minted monotonically, so this branch
+                        // is unreachable in practice; surface it loudly if it
+                        // ever fires.
+                        reply_to::<Self>(slot, LockReply::Busy)
+                    }
+                };
+            }
 
-        self.locks
-            .get_mut(&key)
-            .expect("key present")
-            .waiters
-            .push_back(waiter_id);
-        self.update_waiters_high_water();
-        noop()
+            self.locks
+                .get_mut(&key)
+                .expect("key present")
+                .waiters
+                .push_back(waiter_id);
+            self.update_waiters_high_water();
+            noop()
+        })
     }
 
-    fn release(&mut self, handle: LockHandle, call: CallContext<'_, Self>) -> Effect<Self> {
+    fn release(&mut self, handle: LockHandle, call: RequestCall<'_, Self>) -> RequestEffect<Self> {
         let holder_matches = self
             .locks
             .get(&handle.key)
@@ -237,12 +240,11 @@ impl LockManager {
             return call.reply(LockReply::StaleHandle);
         }
         self.stats.releases += 1;
-        let mut effects = self.hand_off(handle.key);
-        effects.push(call.reply(LockReply::Released));
-        Effect::Batch(effects)
+        let effects = self.hand_off(handle.key);
+        call.reply_and(LockReply::Released, effects)
     }
 
-    fn renew(&mut self, handle: LockHandle, call: CallContext<'_, Self>) -> Effect<Self> {
+    fn renew(&mut self, handle: LockHandle, call: RequestCall<'_, Self>) -> RequestEffect<Self> {
         let Some(entry) = self.locks.get_mut(&handle.key) else {
             self.stats.stale_renew_rejects += 1;
             return call.reply(LockReply::StaleHandle);
@@ -257,14 +259,16 @@ impl LockManager {
         self.stats.renewals += 1;
         let key_for_msg = handle.key.clone();
         let lease = self.lease;
-        Effect::Batch(vec![
-            call.reply(LockReply::Renewed { holder_id }),
-            sleep(lease).then(move |_| LockMsg::LeaseExpired {
-                key: key_for_msg,
-                holder_id,
-                expiry_token: token,
-            }),
-        ])
+        call.reply_and(
+            LockReply::Renewed { holder_id },
+            vec![sleep(lease).then(move |_| {
+                tina::ServiceMessage::Event(LockEvent::LeaseExpired {
+                    key: key_for_msg,
+                    holder_id,
+                    expiry_token: token,
+                })
+            })],
+        )
     }
 
     fn lease_expired(
@@ -324,16 +328,18 @@ impl LockManager {
                         },
                     },
                 ),
-                sleep(lease).then(move |_| LockMsg::LeaseExpired {
-                    key: key_for_msg,
-                    holder_id: new_holder_id,
-                    expiry_token: token,
+                sleep(lease).then(move |_| {
+                    tina::ServiceMessage::Event(LockEvent::LeaseExpired {
+                        key: key_for_msg,
+                        holder_id: new_holder_id,
+                        expiry_token: token,
+                    })
                 }),
             ];
         }
     }
 
-    fn grant_new(&mut self, key: String, call: CallContext<'_, Self>) -> Effect<Self> {
+    fn grant_new(&mut self, key: String, call: RequestCall<'_, Self>) -> RequestEffect<Self> {
         self.next_holder_id += 1;
         let holder_id = self.next_holder_id;
         self.locks.insert(
@@ -347,16 +353,18 @@ impl LockManager {
         self.stats.acquires_granted += 1;
         let key_for_msg = key.clone();
         let lease = self.lease;
-        Effect::Batch(vec![
-            call.reply(LockReply::Granted {
+        call.reply_and(
+            LockReply::Granted {
                 handle: LockHandle { key, holder_id },
-            }),
-            sleep(lease).then(move |_| LockMsg::LeaseExpired {
-                key: key_for_msg,
-                holder_id,
-                expiry_token: 1,
-            }),
-        ])
+            },
+            vec![sleep(lease).then(move |_| {
+                tina::ServiceMessage::Event(LockEvent::LeaseExpired {
+                    key: key_for_msg,
+                    holder_id,
+                    expiry_token: 1,
+                })
+            })],
+        )
     }
 
     fn update_waiters_high_water(&mut self) {
@@ -452,9 +460,9 @@ pub fn run_fifo(config: RunConfig) -> anyhow::Result<FifoReport> {
 
     // Hold the lock from the host first so every contender parks before
     // any of them can be granted.
-    let CallOutcome::Replied(LockReply::Granted { handle: holder }) = runtime.call_blocking(
+    let CallOutcome::Replied(LockReply::Granted { handle: holder }) = runtime.call_blocking_request(
         lockmgr,
-        LockMsg::Acquire { key: key.clone() },
+        LockRequest::Acquire { key: key.clone() },
         timeout,
     )?
     else {
@@ -491,18 +499,18 @@ pub fn run_fifo(config: RunConfig) -> anyhow::Result<FifoReport> {
             thread::sleep(Duration::from_millis(20));
             *gate.lock().expect("gate") = id + 1;
 
-            match rt.call_blocking(
+            match rt.call_blocking_request(
                 lockmgr,
-                LockMsg::Acquire {
+                LockRequest::Acquire {
                     key: key_for_thread.clone(),
                 },
                 timeout,
             )? {
                 CallOutcome::Replied(LockReply::Granted { handle }) => {
                     granted.lock().expect("granted").push(id);
-                    let _ = rt.call_blocking(
+                    let _ = rt.call_blocking_request(
                         lockmgr,
-                        LockMsg::Release { handle },
+                        LockRequest::Release { handle },
                         timeout,
                     )?;
                     Ok(())
@@ -516,9 +524,9 @@ pub fn run_fifo(config: RunConfig) -> anyhow::Result<FifoReport> {
     // primary holder. Otherwise the first releaser's grant could race
     // the slowest contender's Acquire.
     wait_for_waiters(&runtime, lockmgr, contenders as usize, timeout)?;
-    let _ = runtime.call_blocking(
+    let _ = runtime.call_blocking_request(
         lockmgr,
-        LockMsg::Release { handle: holder },
+        LockRequest::Release { handle: holder },
         timeout,
     )?;
 
@@ -551,9 +559,9 @@ pub fn run_expiry_handoff(config: RunConfig) -> anyhow::Result<ExpiryHandoffRepo
     let timeout = Duration::from_millis(cfg.call_timeout_ms);
     let key = "expire-key".to_string();
 
-    let CallOutcome::Replied(LockReply::Granted { handle: original }) = runtime.call_blocking(
+    let CallOutcome::Replied(LockReply::Granted { handle: original }) = runtime.call_blocking_request(
         lockmgr,
-        LockMsg::Acquire { key: key.clone() },
+        LockRequest::Acquire { key: key.clone() },
         timeout,
     )?
     else {
@@ -563,9 +571,9 @@ pub fn run_expiry_handoff(config: RunConfig) -> anyhow::Result<ExpiryHandoffRepo
     let rt2 = Arc::clone(&runtime);
     let key_for_waiter = key.clone();
     let waiter = thread::spawn(move || {
-        rt2.call_blocking(
+        rt2.call_blocking_request(
             lockmgr,
-            LockMsg::Acquire {
+            LockRequest::Acquire {
                 key: key_for_waiter,
             },
             timeout,
@@ -585,9 +593,9 @@ pub fn run_expiry_handoff(config: RunConfig) -> anyhow::Result<ExpiryHandoffRepo
     let waiter_received_grant = waiter_handle.key == key;
 
     // Original release should now be stale.
-    let stale_outcome = runtime.call_blocking(
+    let stale_outcome = runtime.call_blocking_request(
         lockmgr,
-        LockMsg::Release { handle: original },
+        LockRequest::Release { handle: original },
         timeout,
     )?;
     let original_release_was_stale = matches!(
@@ -597,9 +605,9 @@ pub fn run_expiry_handoff(config: RunConfig) -> anyhow::Result<ExpiryHandoffRepo
 
     // Tidy up: release the new holder. We still want to confirm normal
     // release works after a hand-off chain.
-    let _ = runtime.call_blocking(
+    let _ = runtime.call_blocking_request(
         lockmgr,
-        LockMsg::Release {
+        LockRequest::Release {
             handle: waiter_handle,
         },
         timeout,
@@ -629,9 +637,9 @@ pub fn run_renewal(config: RunConfig) -> anyhow::Result<RenewalReport> {
     let timeout = Duration::from_millis(cfg.call_timeout_ms);
     let key = "renew-key".to_string();
 
-    let CallOutcome::Replied(LockReply::Granted { handle }) = runtime.call_blocking(
+    let CallOutcome::Replied(LockReply::Granted { handle }) = runtime.call_blocking_request(
         lockmgr,
-        LockMsg::Acquire { key: key.clone() },
+        LockRequest::Acquire { key: key.clone() },
         timeout,
     )?
     else {
@@ -643,9 +651,9 @@ pub fn run_renewal(config: RunConfig) -> anyhow::Result<RenewalReport> {
     let rt2 = Arc::clone(&runtime);
     let key_for_waiter = key.clone();
     let waiter = thread::spawn(move || {
-        let outcome = rt2.call_blocking(
+        let outcome = rt2.call_blocking_request(
             lockmgr,
-            LockMsg::Acquire {
+            LockRequest::Acquire {
                 key: key_for_waiter,
             },
             timeout,
@@ -658,9 +666,9 @@ pub fn run_renewal(config: RunConfig) -> anyhow::Result<RenewalReport> {
 
     // Renew at half-lease; waiter must remain parked.
     thread::sleep(Duration::from_millis(cfg.lease_ms / 2));
-    match runtime.call_blocking(
+    match runtime.call_blocking_request(
         lockmgr,
-        LockMsg::Renew {
+        LockRequest::Renew {
             handle: handle.clone(),
         },
         timeout,
@@ -675,7 +683,7 @@ pub fn run_renewal(config: RunConfig) -> anyhow::Result<RenewalReport> {
 
     // Final release should drain the waiter.
     let final_release_ok = matches!(
-        runtime.call_blocking(lockmgr, LockMsg::Release { handle }, timeout)?,
+        runtime.call_blocking_request(lockmgr, LockRequest::Release { handle }, timeout)?,
         CallOutcome::Replied(LockReply::Released)
     );
 
@@ -683,9 +691,9 @@ pub fn run_renewal(config: RunConfig) -> anyhow::Result<RenewalReport> {
         CallOutcome::Replied(LockReply::Granted { handle }) => handle,
         other => anyhow::bail!("waiter did not get Granted after release: {other:?}"),
     };
-    let _ = runtime.call_blocking(
+    let _ = runtime.call_blocking_request(
         lockmgr,
-        LockMsg::Release {
+        LockRequest::Release {
             handle: waiter_handle,
         },
         timeout,
@@ -715,23 +723,23 @@ pub fn run_stale_release(config: RunConfig) -> anyhow::Result<StaleReleaseReport
     let timeout = Duration::from_millis(cfg.call_timeout_ms);
     let key = "stale-key".to_string();
 
-    let CallOutcome::Replied(LockReply::Granted { handle }) = runtime.call_blocking(
+    let CallOutcome::Replied(LockReply::Granted { handle }) = runtime.call_blocking_request(
         lockmgr,
-        LockMsg::Acquire { key: key.clone() },
+        LockRequest::Acquire { key: key.clone() },
         timeout,
     )?
     else {
         anyhow::bail!("acquire did not return Granted");
     };
     let saved = handle.clone();
-    let _ = runtime.call_blocking(
+    let _ = runtime.call_blocking_request(
         lockmgr,
-        LockMsg::Release { handle },
+        LockRequest::Release { handle },
         timeout,
     )?;
-    let second = runtime.call_blocking(
+    let second = runtime.call_blocking_request(
         lockmgr,
-        LockMsg::Release { handle: saved },
+        LockRequest::Release { handle: saved },
         timeout,
     )?;
     let second_release_was_stale = matches!(
@@ -763,9 +771,9 @@ pub fn run_busy_overflow(config: RunConfig) -> anyhow::Result<BusyOverflowReport
     let timeout = Duration::from_millis(cfg.call_timeout_ms);
     let key = "busy-key".to_string();
 
-    let CallOutcome::Replied(LockReply::Granted { handle: holder }) = runtime.call_blocking(
+    let CallOutcome::Replied(LockReply::Granted { handle: holder }) = runtime.call_blocking_request(
         lockmgr,
-        LockMsg::Acquire { key: key.clone() },
+        LockRequest::Acquire { key: key.clone() },
         timeout,
     )?
     else {
@@ -785,9 +793,9 @@ pub fn run_busy_overflow(config: RunConfig) -> anyhow::Result<BusyOverflowReport
         let key_for_thread = key.clone();
         threads.push(thread::spawn(move || {
             gate.wait();
-            let outcome = rt.call_blocking(
+            let outcome = rt.call_blocking_request(
                 lockmgr,
-                LockMsg::Acquire {
+                LockRequest::Acquire {
                     key: key_for_thread,
                 },
                 timeout,
@@ -795,9 +803,9 @@ pub fn run_busy_overflow(config: RunConfig) -> anyhow::Result<BusyOverflowReport
             // Granted callers release immediately so the per-key
             // hand-off chain drains within the call timeout.
             if let Ok(CallOutcome::Replied(LockReply::Granted { handle })) = &outcome {
-                let _ = rt.call_blocking(
+                let _ = rt.call_blocking_request(
                     lockmgr,
-                    LockMsg::Release {
+                    LockRequest::Release {
                         handle: handle.clone(),
                     },
                     timeout,
@@ -821,9 +829,9 @@ pub fn run_busy_overflow(config: RunConfig) -> anyhow::Result<BusyOverflowReport
     )?;
 
     // Release the holder so admitted waiters can drain.
-    let _ = runtime.call_blocking(
+    let _ = runtime.call_blocking_request(
         lockmgr,
-        LockMsg::Release { handle: holder },
+        LockRequest::Release { handle: holder },
         timeout,
     )?;
 
@@ -852,18 +860,22 @@ pub fn run_busy_overflow(config: RunConfig) -> anyhow::Result<BusyOverflowReport
 fn register(
     runtime: &ThreadedRuntime<SingleShard, DefaultThreadedMailboxFactory>,
     config: RunConfig,
-) -> anyhow::Result<Address<LockMsg, LockReply>> {
+) -> anyhow::Result<tina::ServiceRequestAddress<LockEvent, LockRequest, LockReply>> {
     runtime
-        .register_with_capacity::<_, Infallible>(LockManager::new(config), config.mailbox)
+        .register_split_service::<LockManager, LockEvent, LockRequest, Infallible>(
+            LockManager::new(config),
+            config.mailbox,
+        )
+        .map(|handle| handle.requests)
         .map_err(|e| anyhow::anyhow!("register lock manager: {e:?}"))
 }
 
 fn stats(
     runtime: &ThreadedRuntime<SingleShard, DefaultThreadedMailboxFactory>,
-    lockmgr: Address<LockMsg, LockReply>,
+    lockmgr: tina::ServiceRequestAddress<LockEvent, LockRequest, LockReply>,
     timeout: Duration,
 ) -> anyhow::Result<LockStats> {
-    match runtime.call_blocking(lockmgr, LockMsg::Stats, timeout)? {
+    match runtime.call_blocking_request(lockmgr, LockRequest::Stats, timeout)? {
         CallOutcome::Replied(LockReply::Stats(s)) => Ok(s),
         other => anyhow::bail!("stats call failed: {other:?}"),
     }
@@ -871,7 +883,7 @@ fn stats(
 
 fn wait_for_waiters(
     runtime: &ThreadedRuntime<SingleShard, DefaultThreadedMailboxFactory>,
-    lockmgr: Address<LockMsg, LockReply>,
+    lockmgr: tina::ServiceRequestAddress<LockEvent, LockRequest, LockReply>,
     target: usize,
     timeout: Duration,
 ) -> anyhow::Result<()> {
@@ -893,7 +905,7 @@ fn wait_for_waiters(
 
 fn wait_for_busy_settlement(
     runtime: &ThreadedRuntime<SingleShard, DefaultThreadedMailboxFactory>,
-    lockmgr: Address<LockMsg, LockReply>,
+    lockmgr: tina::ServiceRequestAddress<LockEvent, LockRequest, LockReply>,
     waiters_target: usize,
     busy_target: u64,
     timeout: Duration,

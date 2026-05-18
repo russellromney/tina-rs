@@ -1,0 +1,16 @@
+error[E0382]: use of moved value: `call`
+  --> tests/safety_rails_compile_fail/split_request_double_consume.rs:31:23
+   |
+28 |         call: tina::RequestCall<'_, Self>,
+   |         ---- move occurs because `call` has type `RequestCall<'_, Service>`, which does not implement the `Copy` trait
+29 |     ) -> tina::RequestEffect<Self> {
+30 |         let first = call.reply(());
+   |                          --------- `call` moved due to this method call
+31 |         let _second = call.reject(tina::CallRejectedReason::UnsupportedMessage);
+   |                       ^^^^ value used here after move
+   |
+note: `RequestCall::<'a, I>::reply` takes ownership of the receiver `self`, which moves `call`
+  --> $WORKSPACE/tina/src/lib.rs
+   |
+   |     pub fn reply(self, value: I::Reply) -> RequestEffect<I> {
+   |                  ^^^^

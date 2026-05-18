@@ -4,6 +4,25 @@
 
 - IDD implementation phase.
 - Follows the first compile-time safety rails pass.
+- Split event/request service rail shipped:
+  `event = ...`, `request = ...`, `ServiceMessage`, split service handles,
+  `send_event`, `Runtime::try_send_event`,
+  `ThreadedRuntime::try_send_event`, `call_request`,
+  `ThreadedRuntime::call_blocking_request`, positive runtime/threaded proof,
+  and trybuild lane diagnostics.
+- Split request handlers now use `RequestCall` and return `RequestEffect` on
+  the copied path. The raw constructor for `RequestEffect` is hidden under
+  `runtime_internal`.
+- Host split setup now has observed event helpers:
+  `send_event_and_observe` and `send_event_observed_until`.
+- `system_cache_with_fill` now uses split public requests plus private
+  internal fill events.
+- `system_lock_manager` now uses split public requests plus private internal
+  lease-expiry events.
+- `system_job_queue` now proves `PendingCancelableCallSet` admission for
+  cancelable deferred work.
+- Hardening pass complete on this PR: request-only effects, hostile
+  compile-fail cases, and system migrations are in place.
 
 ## Grug Truth
 
@@ -53,6 +72,10 @@ the service module on the copied path. Use private constructors, sealed traits,
 capability handles, or macro-generated visibility. The user-facing result is
 simple: outside code cannot send internal events.
 
+Public events and public requests are separate types and separate capability
+handles. Internal continuation events are private Rust types in copied systems
+when they are not meant to be public. Trybuild pins the private-event shape.
+
 ### Rock 2: Caller Authority Obligation
 
 Make request caller authority a must-consume type on the copied path:
@@ -62,9 +85,23 @@ Make request caller authority a must-consume type on the copied path:
 - defer into a request context
 - defer into bounded cancelable admission
 
-The default path must make "forgot to reply" a compile error. Any escape hatch
-that can abandon authority must be named, loud, traced, and absent from copied
-docs/specimens.
+The split-service copied path should use a request-only authority/effect pair:
+
+```rust
+fn handle_request(&mut self, request: Request, call: RequestCall<Self>)
+    -> RequestEffect<Self>
+```
+
+`RequestEffect` is only produced by consuming `RequestCall`:
+
+- `call.reply(...)`
+- `call.reject(...)`
+- `call.defer(work).reply(...)`
+- `call.defer_cancelable(work).try_admit(...)`
+
+Ordinary `noop()` must not type-check in `handle_request`. A raw
+`CallContext` path may remain as an explicit escape hatch, but copied split
+services should not use it.
 
 Public authority/token types must use `#[must_use]` where Rust can help:
 
@@ -78,7 +115,7 @@ Public authority/token types must use `#[must_use]` where Rust can help:
 
 ### Rock 3: Cancelable Deferred Admission Gate
 
-Fix the token/effect footgun:
+Fixed the token/effect footgun for cancelable deferred calls:
 
 - a cancelable pending token cannot silently be dropped
 - child effect is not returned for dispatch until bounded admission succeeds
@@ -87,8 +124,8 @@ Fix the token/effect footgun:
 - duplicate/full errors are typed
 - ABA-safe ticket/key behavior remains explicit
 
-The copied path must not let a service strand a caller by starting child work
-without owning the pending token.
+The copied path does not return the child effect until bounded pending storage
+accepts the token. `system_job_queue` is the system proof.
 
 ### Rock 4: Capability Handles By Default
 
@@ -99,7 +136,19 @@ Make capability handles the default copied path:
 - spawn-observed-capable
 - internal-only for continuation/event messages in the new split model
 
-Raw `Address<M, R>` remains available only where needed.
+Raw `Address<M, R>` remains available only where needed. Host split helpers keep
+ordinary threaded setup/tests off the raw envelope path.
+
+Host helpers should cover the copied threaded path:
+
+- `try_send_event`
+- `send_event_and_observe`
+- `send_event_observed_until`
+- `call_blocking_request`
+
+No request `until` helper ships in this phase because the current host call
+surface is timeout-shaped, not deadline-shaped. Do not invent a second timing
+story here.
 
 The phase must leave an escape-hatch inventory in docs:
 
@@ -173,28 +222,44 @@ Trybuild tests must pin the good messages.
 
 Add a compile-fail specimen suite:
 
-- wrong public request handled only in internal `handle`
-- internal continuation sent from outside
-- callable request sent through send-only handle
-- caller authority dropped without reply/reject/defer on the copied path
+- wrong public request sent on event lane
+- internal continuation event constructed from outside
+- callable request sent through send-only/event handle
+- split request handler returns `noop()`
+- split request handler does `let _ = call; noop()`
+- split request handler does `drop(call); noop()`
+- split request handler replies on one branch but not another
+- split request handler tries to reply and reject with the same authority
+- split request handler tries to forge `RequestEffect` from `noop()`
 - cancelable deferred child effect dispatched before bounded admission
 - missing required config cap in typed builder
 - replay case missing visible config
 - invalid WebSocket/gRPC/body state transition inside crate tests
 
-Update two real systems to the new default authoring path and remove old
-escape-hatch imports:
+Updated real systems to the new default authoring paths:
 
-- `system_cache_with_fill` for request/internal/defer authority
+- `system_cache_with_fill` for split request/private internal event authority
 - `system_job_queue` for cancelable deferred admission
+- `system_lock_manager` for private internal lifecycle events
+- one HTTP/WebSocket/AWS-ish system when the migration is low-risk
 
 Each README must say what the compiler now catches.
+
+Add an escape-hatch inventory test/doc that names every remaining raw path and
+proves its failure is visible, not silent:
+
+- raw `Address`
+- raw `ServiceMessage`
+- raw `CallContext`
+- deprecated cancelable reply-with-request
+- untyped config path
 
 ## Required Proof
 
 - User-style compile-fail tests for wrong `handle` vs `handle_call`.
 - Compile-fail tests for internal event sent from outside.
 - Compile-fail tests for unconsumed caller authority on the copied path.
+- Compile-fail tests for fake consumption (`let _`, `drop`, partial branch).
 - Compile-fail tests for cancelable effect before bounded admission.
 - Compile-fail tests for missing config caps.
 - Compile-fail or constructor-fail tests for replay cases missing visible config.
@@ -205,6 +270,8 @@ Each README must say what the compiler now catches.
 - Runtime tests proving public behavior did not regress.
 - Protocol tests proving impossible states are now unrepresentable internally.
 - Two system specimens compile using the new default safety rails.
+- At least three systems compile using the new default safety rails if they
+  already exercise the relevant pattern.
 - Docs show the default path and the escape hatch separately.
 
 ## Done Means

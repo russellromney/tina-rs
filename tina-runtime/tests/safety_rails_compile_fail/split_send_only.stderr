@@ -1,0 +1,5 @@
+error: `send_only` cannot be combined with split `event` / `request` services
+  --> tests/safety_rails_compile_fail/split_send_only.rs:16:6
+   |
+16 | impl Service {
+   |      ^^^^^^^

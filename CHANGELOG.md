@@ -4,6 +4,49 @@ This file records completed work.
 
 ## Unreleased
 
+### Phase 109 Typed Config And Protocol-State Safety
+
+- Added the first split event/request service rail. The
+  `#[tina::isolate]` / `#[tina_runtime::isolate]` macros now accept
+  `event = Event, request = Request, reply = Reply` and generate an isolate
+  whose mailbox envelope is `tina::ServiceMessage<Event, Request>`.
+  `handle_event` receives fire-and-forget mailbox facts; `handle_request`
+  receives caller authority through `RequestCall` and returns
+  `RequestEffect`, so ordinary `noop()` no longer type-checks on the copied
+  request path.
+- Added capability handles for the split surface:
+  `tina::ServiceEventAddress<Event, Request>`,
+  `tina::ServiceRequestAddress<Event, Request, Reply>`, and
+  `tina_runtime::SplitServiceHandle<Event, Request, Reply>`, returned by
+  `Runtime::register_split_service` and
+  `ThreadedRuntime::register_split_service`.
+- Added `tina::send_event(...)` and `tina_runtime::call_request(...)`.
+  The copied path now rejects the two common lane mistakes at compile time:
+  requests cannot be sent as events, and events cannot be called as requests.
+- Added host/runtime companions:
+  `Runtime::try_send_event`, `ThreadedRuntime::try_send_event`,
+  `ThreadedRuntime::send_event_and_observe`,
+  `ThreadedRuntime::send_event_observed_until`, and
+  `ThreadedRuntime::call_blocking_request`, so threaded tests and setup code
+  do not need to unwrap split handles into raw `ServiceMessage` addresses.
+- Changed split-service raw request-on-event handling from silent `Noop` to a
+  visible `Reject(UnsupportedMessage)` effect. The request handler is still
+  not run; the trace now records the wrong-lane escape hatch.
+- Added positive runtime/threaded proof in `tina-runtime/tests/safety_rails.rs`
+  and trybuild diagnostics for split-lane mistakes, invalid split macro
+  options, missing split handlers, private internal events, and a split request
+  handler that ignores/fakes caller authority (`noop`, `let _`, `drop`,
+  partial branch, double consume, forged `RequestEffect`).
+- Migrated `examples/systems/system_cache_with_fill` to split public requests
+  plus private internal fill events and `call_blocking_request`.
+- Migrated `examples/systems/system_lock_manager` to split public requests plus
+  private internal lease-expiry events and `call_blocking_request`.
+- Confirmed `examples/systems/system_job_queue` as the cancelable deferred
+  admission proof: `defer_cancelable(...).try_admit(...)` only returns the
+  child effect after `PendingCancelableCallSet` accepts the token.
+- Documented the split event/request copied path in
+  `docs/tina-user-guide/04-request-reply.md`.
+
 ### Phase 103 Protocol Parity Finish
 
 - Audited the native HTTP/2, gRPC, and WebSocket stacks for the

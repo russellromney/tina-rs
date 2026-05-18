@@ -22,6 +22,10 @@ cargo test --manifest-path examples/systems/system_cache_with_fill/Cargo.toml
 What felt good:
 - The single-flight state machine is very natural Tina: one key-owned fill,
   explicit waiter qids, one completion message.
+- Split service authoring now matches the domain: `CacheRequest` is the public
+  callable surface, while private `CacheEvent::FillDone` is only an internal
+  continuation. Host code uses `call_blocking_request`, not raw
+  `ServiceMessage`.
 - `PendingReplies::try_capture` is the right primitive for bounded callers
   waiting on one downstream fill.
 - Stale completion handling is readable when the fill carries a generation.
@@ -32,16 +36,15 @@ What felt rough:
   might reduce duplication across cache/fanout/pool frontends.
 - The stale-completion path requires discipline: every fill must carry a
   generation, and every invalidation must reply to or reclaim every waiter.
-- `CallContext` is the right contract, but it means examples that use
-  `call_blocking` must remember to put request/reply variants in `handle_call`;
-  putting them in `handle` compiles but gets rejected at runtime as
-  `UnsupportedMessage`.
+- `CallContext` is the right contract. The split-service macro now removes the
+  old "put request variants in `handle`" trap for this specimen.
 - The host-side concurrent-call script is still boilerplate-heavy for system
   specimens.
 
 Tina capability pulled:
 - Bounded deferred replies.
 - Explicit call authority via `CallContext`.
+- Split public requests from private internal events.
 - Single-flight fill state.
 - Runtime-owned time.
 - Stale-result handling.

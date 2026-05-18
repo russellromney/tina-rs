@@ -1,0 +1,8 @@
+error[E0308]: mismatched types
+  --> tests/safety_rails_compile_fail/split_request_drop_call.rs:31:9
+   |
+31 |         tina::noop()
+   |         ^^^^^^^^^^^^ expected `RequestEffect<Service>`, found `Effect<_>`
+   |
+   = note: expected struct `RequestEffect<Service>`
+                found enum `Effect<_>`

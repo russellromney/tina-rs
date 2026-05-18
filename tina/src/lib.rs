@@ -455,6 +455,35 @@ where
     Effect::Reject(reason)
 }
 
+/// Request-lane effect returned by split-service request handlers.
+///
+/// This is deliberately narrower than [`Effect`]. The copied split-service
+/// path produces a `RequestEffect` by consuming [`RequestCall`] through
+/// `reply`, `reject`, `capture`, `defer`, or `defer_cancelable`. Ordinary
+/// `noop()` is not a `RequestEffect`, so "forgot to answer caller" becomes a
+/// compile error on the copied path.
+#[must_use = "request handlers communicate with the runtime by returning a RequestEffect"]
+pub struct RequestEffect<I>
+where
+    I: Isolate,
+{
+    effect: Effect<I>,
+}
+
+impl<I> RequestEffect<I>
+where
+    I: Isolate,
+{
+    fn from_consumed_effect(effect: Effect<I>) -> Self {
+        Self { effect }
+    }
+
+    /// Converts this request effect into the ordinary runtime effect.
+    pub fn into_effect(self) -> Effect<I> {
+        self.effect
+    }
+}
+
 /// Returns an effect that sends one typed message to another isolate.
 pub fn send<I, M, R>(destination: Address<M, R>, message: M) -> Effect<I>
 where
@@ -474,6 +503,23 @@ where
     I: Isolate<Send = Outbound<M>>,
 {
     Effect::Send(Outbound::new(destination.address(), message))
+}
+
+/// Returns an effect that sends one public service event.
+///
+/// This is the split-service spelling of [`send_to`]. A
+/// [`ServiceEventAddress`] cannot be passed to request helpers, and a
+/// [`ServiceRequestAddress`] cannot be passed here, so the common
+/// "request went down the event lane" mistake fails at compile time on the
+/// copied path.
+pub fn send_event<I, E, Q>(destination: ServiceEventAddress<E, Q>, event: E) -> Effect<I>
+where
+    I: Isolate<Send = Outbound<ServiceMessage<E, Q>>>,
+{
+    Effect::Send(Outbound::new(
+        destination.address().address(),
+        ServiceMessage::Event(event),
+    ))
 }
 
 /// Returns an effect that asks the runtime to spawn one child.
@@ -1147,6 +1193,88 @@ where
     _isolate: PhantomData<fn(I) -> I>,
 }
 
+/// Caller authority for split-service request handlers.
+///
+/// This is the copied-path wrapper around [`CallContext`]. It exposes
+/// authority-consuming operations that return [`RequestEffect`], so a split
+/// request handler cannot accidentally return ordinary `noop()`.
+#[must_use = "a RequestCall must be replied, rejected, captured, or deferred"]
+pub struct RequestCall<'a, I>
+where
+    I: Isolate,
+{
+    inner: CallContext<'a, I>,
+}
+
+impl<'a, I> RequestCall<'a, I>
+where
+    I: Isolate,
+{
+    /// Wraps a raw [`CallContext`] as split-service request authority.
+    pub fn new(inner: CallContext<'a, I>) -> Self {
+        Self { inner }
+    }
+
+    /// Replies to the caller now.
+    pub fn reply(self, value: I::Reply) -> RequestEffect<I> {
+        RequestEffect::from_consumed_effect(self.inner.reply(value))
+    }
+
+    /// Replies to the caller now and executes additional explicit effects
+    /// afterwards.
+    pub fn reply_and(self, value: I::Reply, mut effects: Vec<Effect<I>>) -> RequestEffect<I> {
+        let mut batch = Vec::with_capacity(effects.len() + 1);
+        batch.push(self.inner.reply(value));
+        batch.append(&mut effects);
+        RequestEffect::from_consumed_effect(Effect::Batch(batch))
+    }
+
+    /// Rejects the caller now.
+    pub fn reject(self, reason: CallRejectedReason) -> RequestEffect<I> {
+        RequestEffect::from_consumed_effect(self.inner.reject(reason))
+    }
+
+    /// Captures caller authority into a [`RequestContext`] and lets the
+    /// handler return explicit runtime work.
+    ///
+    /// Use this when the service parks the caller in bounded local state, such
+    /// as `PendingReplies`, or carries the context through a hand-written
+    /// continuation.
+    pub fn capture<F>(self, build: F) -> RequestEffect<I>
+    where
+        I::Reply: 'static,
+        F: FnOnce(RequestContext<I::Reply>) -> Effect<I>,
+    {
+        RequestEffect::from_consumed_effect(build(self.inner.into_request_context()))
+    }
+
+    /// Defers this caller reply through one visible runtime-owned work item.
+    pub fn defer<W>(self, work: W) -> W::RequestDeferred
+    where
+        W: RequestDeferThrough<I>,
+        I::Reply: 'static,
+    {
+        work.defer_request_through(self)
+    }
+
+    /// Defers this caller reply through cancelable runtime-owned work.
+    pub fn defer_cancelable<W>(self, work: W) -> W::RequestDeferredCancelable
+    where
+        W: RequestDeferCancelableThrough<I>,
+        I::Reply: 'static,
+    {
+        work.defer_cancelable_request_through(self)
+    }
+
+    /// Explicit escape hatch back to raw [`CallContext`].
+    ///
+    /// Prefer the narrower methods above. If this is used, the normal runtime
+    /// abandoned-authority guard is the remaining safety rail.
+    pub fn into_call_context(self) -> CallContext<'a, I> {
+        self.inner
+    }
+}
+
 impl<'a, I> CallContext<'a, I>
 where
     I: Isolate,
@@ -1273,6 +1401,18 @@ where
     fn defer_through(self, call: CallContext<'_, I>) -> Self::Deferred;
 }
 
+/// Runtime-provided support for [`RequestCall::defer`].
+pub trait RequestDeferThrough<I>
+where
+    I: Isolate,
+{
+    /// Builder returned after request authority has been captured.
+    type RequestDeferred;
+
+    /// Consumes request authority and prepares deferred work.
+    fn defer_request_through(self, call: RequestCall<'_, I>) -> Self::RequestDeferred;
+}
+
 /// Runtime-provided support for [`CallContext::defer_cancelable`].
 ///
 /// Implementations must consume the caller authority into a visible pending
@@ -1292,6 +1432,21 @@ where
 
     /// Consumes caller authority and prepares the cancelable deferred work.
     fn defer_cancelable_through(self, call: CallContext<'_, I>) -> Self::DeferredCancelable;
+}
+
+/// Runtime-provided support for [`RequestCall::defer_cancelable`].
+pub trait RequestDeferCancelableThrough<I>
+where
+    I: Isolate,
+{
+    /// Builder returned after request authority has been captured.
+    type RequestDeferredCancelable;
+
+    /// Consumes request authority and prepares cancelable deferred work.
+    fn defer_cancelable_request_through(
+        self,
+        call: RequestCall<'_, I>,
+    ) -> Self::RequestDeferredCancelable;
 }
 
 /// Runtime-level reason a call was rejected without an application reply.
@@ -1573,6 +1728,75 @@ impl<M, R> Address<M, R> {
     /// Returns a callable capability for this address.
     pub const fn callable(self) -> CallAddress<M, R> {
         CallAddress::from_address(self)
+    }
+}
+
+/// Message envelope used by the split-service authoring path.
+///
+/// `Event` values are mailbox facts. `Request` values carry caller authority.
+/// User code normally does not construct this enum directly; it uses
+/// [`send_event`] and `tina_runtime::call_request`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServiceMessage<Event, Request> {
+    /// Fire-and-forget mailbox event.
+    Event(Event),
+    /// Callable request with caller authority.
+    Request(Request),
+}
+
+/// Send capability for split-service events.
+#[derive(Debug)]
+#[repr(transparent)]
+pub struct ServiceEventAddress<Event, Request> {
+    address: SendAddress<ServiceMessage<Event, Request>>,
+}
+
+impl<Event, Request> Copy for ServiceEventAddress<Event, Request> {}
+
+impl<Event, Request> Clone for ServiceEventAddress<Event, Request> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<Event, Request> ServiceEventAddress<Event, Request> {
+    /// Wraps a send address for the split service envelope.
+    pub const fn from_send_address(address: SendAddress<ServiceMessage<Event, Request>>) -> Self {
+        Self { address }
+    }
+
+    /// Returns the underlying send capability.
+    pub const fn address(self) -> SendAddress<ServiceMessage<Event, Request>> {
+        self.address
+    }
+}
+
+/// Call capability for split-service requests.
+#[derive(Debug)]
+#[repr(transparent)]
+pub struct ServiceRequestAddress<Event, Request, Reply> {
+    address: CallAddress<ServiceMessage<Event, Request>, Reply>,
+}
+
+impl<Event, Request, Reply> Copy for ServiceRequestAddress<Event, Request, Reply> {}
+
+impl<Event, Request, Reply> Clone for ServiceRequestAddress<Event, Request, Reply> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<Event, Request, Reply> ServiceRequestAddress<Event, Request, Reply> {
+    /// Wraps a call address for the split service envelope.
+    pub const fn from_call_address(
+        address: CallAddress<ServiceMessage<Event, Request>, Reply>,
+    ) -> Self {
+        Self { address }
+    }
+
+    /// Returns the underlying call capability.
+    pub const fn address(self) -> CallAddress<ServiceMessage<Event, Request>, Reply> {
+        self.address
     }
 }
 
@@ -2800,6 +3024,22 @@ pub mod runtime_internal {
     pub fn call_handle_inner_into_shared(inner: CallHandleInner) -> Arc<CallHandleShared> {
         inner.shared
     }
+
+    /// Build a request-lane effect after caller authority has already been
+    /// consumed.
+    ///
+    /// This is intentionally hidden under `runtime_internal` so copied app code
+    /// cannot casually manufacture a request effect from `noop()`. Runtime-side
+    /// adapters use it after they have consumed a `RequestCall` into a
+    /// `RequestContext`.
+    pub fn request_effect_from_consumed_effect<I>(
+        effect: crate::Effect<I>,
+    ) -> crate::RequestEffect<I>
+    where
+        I: crate::Isolate,
+    {
+        crate::RequestEffect::from_consumed_effect(effect)
+    }
 }
 
 /// Common imports for ordinary Tina application code.
@@ -2807,7 +3047,8 @@ pub mod prelude {
     pub use crate::{
         Address, CallHandle, CallHandleState, CancelCause, CancelOutcome, ChildDefinition,
         ChildRef, Context, Deadline, DeferCancelableThrough, DeferThrough, DeferredReply, Effect,
-        Isolate, IsolateId, Outbound, PendingCallSet, PendingCallSetInsertError, RequestContext,
+        Isolate, IsolateId, Outbound, PendingCallSet, PendingCallSetInsertError, RequestCall,
+        RequestContext, RequestDeferCancelableThrough, RequestDeferThrough, RequestEffect,
         RestartableChildDefinition, Shard, ShardId, SingleShard, SpawnObservedError, batch,
         isolate, isolate_types, noop, reply, reply_to, reply_to_request, restart_children, send,
         sequence, spawn, spawn_observed, stop, stop_with,

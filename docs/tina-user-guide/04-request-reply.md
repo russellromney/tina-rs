@@ -102,6 +102,92 @@ caller handles timeout
 > The handler's returned effect still runs; it just no longer has caller
 > authority.
 
+## Split Events And Requests
+
+For new services, prefer separate domain types for mailbox events and callable
+requests:
+
+```rust
+#[derive(Debug)]
+enum CacheEvent {
+    FillDone { key: String },
+}
+
+#[derive(Debug)]
+enum CacheRequest {
+    Get { key: String },
+}
+
+#[tina_runtime::isolate(event = CacheEvent, request = CacheRequest, reply = CacheReply)]
+impl Cache {
+    fn handle_event(
+        &mut self,
+        event: CacheEvent,
+        ctx: &mut Context<'_, SingleShard, Self::Reply>,
+    ) -> Effect<Self> {
+        // fire-and-forget continuations land here
+    }
+
+    fn handle_request(
+        &mut self,
+        request: CacheRequest,
+        call: RequestCall<'_, Self>,
+    ) -> RequestEffect<Self> {
+        // caller-authority requests land here
+    }
+}
+```
+
+`handle_request` returns `RequestEffect<Self>`, not ordinary `Effect<Self>`.
+That is intentional: `noop()` does not type-check on the copied request path.
+Use `call.reply(...)`, `call.reject(...)`, `call.capture(...)`, or
+`call.defer(...).reply(...)`.
+Copied app code cannot manufacture a `RequestEffect` from `noop()`; the raw
+constructor lives under the hidden runtime-internal escape hatch for adapter
+crates that have already consumed caller authority.
+
+Register it through `register_split_service`. The returned handle has two
+lanes:
+
+```rust
+let cache = runtime.register_split_service::<Cache, CacheEvent, CacheRequest, Infallible>(
+    Cache::new(),
+    64,
+);
+
+tina::send_event(cache.events, CacheEvent::FillDone { key });
+tina_runtime::call_request(cache.requests, CacheRequest::Get { key }, timeout);
+```
+
+From host-thread code:
+
+```rust
+runtime.try_send_event(cache.events, CacheEvent::FillDone { key })?;
+runtime.send_event_and_observe(cache.events, CacheEvent::FillDone { key })?;
+runtime.call_blocking_request(cache.requests, CacheRequest::Get { key }, timeout)?;
+```
+
+The compiler rejects the two common wrong shapes:
+
+```text
+send_event(cache.events, CacheRequest::Get { ... })   // expected CacheEvent
+call_request(cache.requests, CacheEvent::FillDone { ... }, timeout) // expected CacheRequest
+```
+
+The raw `ServiceMessage<Event, Request>` envelope still exists for runtime and
+interop code. Keep it out of copied service code unless you are deliberately
+using the escape hatch. The escape hatch has boring runtime truth:
+
+```text
+raw Event sent on the call lane -> Rejected(UnsupportedMessage)
+raw Request sent on the send/event lane -> visible Reject effect; request handler is not run
+```
+
+That second case is why copied app code should keep the event/request
+capabilities instead of passing raw envelope addresses around. A send has no
+caller to reject, so the compiler rail is the safety feature. The runtime trace
+still records that the raw wrong-lane path returned `Reject`.
+
 ## Deferred Reply
 
 A service can reply after more than one handler turn.

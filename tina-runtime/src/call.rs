@@ -2065,6 +2065,12 @@ pub struct DeferredObservedSend<T, Q> {
     request: tina::RequestContext<Q>,
 }
 
+/// Request-effect wrapper for [`DeferredObservedSend`].
+#[doc(hidden)]
+pub struct RequestDeferredObservedSend<T, Q> {
+    inner: DeferredObservedSend<T, Q>,
+}
+
 /// Prepared isolate-call helper returned by [`call`].
 #[doc(hidden)]
 pub struct IsolateCall<T, R> {
@@ -2081,12 +2087,24 @@ pub struct DeferredIsolateCall<T, R, Q> {
     request: tina::RequestContext<Q>,
 }
 
+/// Request-effect wrapper for [`DeferredIsolateCall`].
+#[doc(hidden)]
+pub struct RequestDeferredIsolateCall<T, R, Q> {
+    inner: DeferredIsolateCall<T, R, Q>,
+}
+
 /// Prepared typed runtime-call continuation after caller authority was
 /// captured.
 #[doc(hidden)]
 pub struct DeferredTypedCall<T, Q> {
     inner: TypedCall<T>,
     request: tina::RequestContext<Q>,
+}
+
+/// Request-effect wrapper for [`DeferredTypedCall`].
+#[doc(hidden)]
+pub struct RequestDeferredTypedCall<T, Q> {
+    inner: DeferredTypedCall<T, Q>,
 }
 
 impl<T> ObservedSend<T>
@@ -2191,6 +2209,22 @@ where
     }
 }
 
+impl<T, Q> RequestDeferredObservedSend<T, Q>
+where
+    T: Send + 'static,
+    Q: 'static,
+{
+    /// Builds a request effect whose continuation carries caller authority.
+    pub fn reply<I, F, M>(self, translator: F) -> tina::RequestEffect<I>
+    where
+        I: tina::Isolate<Message = M, Reply = Q, Call = RuntimeCall<M>>,
+        F: FnOnce(tina::RequestContext<Q>, SendOutcome) -> M + 'static,
+        M: 'static,
+    {
+        tina::runtime_internal::request_effect_from_consumed_effect(self.inner.reply(translator))
+    }
+}
+
 impl<T, I> tina::DeferThrough<I> for ObservedSend<T>
 where
     T: Send + 'static,
@@ -2203,6 +2237,21 @@ where
         DeferredObservedSend {
             inner: self,
             request: call.into_request_context(),
+        }
+    }
+}
+
+impl<T, I> tina::RequestDeferThrough<I> for ObservedSend<T>
+where
+    T: Send + 'static,
+    I: tina::Isolate,
+    I::Reply: 'static,
+{
+    type RequestDeferred = RequestDeferredObservedSend<T, I::Reply>;
+
+    fn defer_request_through(self, call: tina::RequestCall<'_, I>) -> Self::RequestDeferred {
+        RequestDeferredObservedSend {
+            inner: <Self as tina::DeferThrough<I>>::defer_through(self, call.into_call_context()),
         }
     }
 }
@@ -2329,6 +2378,23 @@ where
     }
 }
 
+impl<T, R, Q> RequestDeferredIsolateCall<T, R, Q>
+where
+    T: Send + 'static,
+    R: 'static,
+    Q: 'static,
+{
+    /// Builds a request effect whose continuation carries caller authority.
+    pub fn reply<I, F, M>(self, translator: F) -> tina::RequestEffect<I>
+    where
+        I: tina::Isolate<Message = M, Reply = Q, Call = RuntimeCall<M>>,
+        F: FnOnce(tina::RequestContext<Q>, CallOutcome<R>) -> M + 'static,
+        M: 'static,
+    {
+        tina::runtime_internal::request_effect_from_consumed_effect(self.inner.reply(translator))
+    }
+}
+
 impl<T, R, I> tina::DeferThrough<I> for IsolateCall<T, R>
 where
     T: Send + 'static,
@@ -2342,6 +2408,22 @@ where
         DeferredIsolateCall {
             inner: self,
             request: call.into_request_context(),
+        }
+    }
+}
+
+impl<T, R, I> tina::RequestDeferThrough<I> for IsolateCall<T, R>
+where
+    T: Send + 'static,
+    R: 'static,
+    I: tina::Isolate,
+    I::Reply: 'static,
+{
+    type RequestDeferred = RequestDeferredIsolateCall<T, R, I::Reply>;
+
+    fn defer_request_through(self, call: tina::RequestCall<'_, I>) -> Self::RequestDeferred {
+        RequestDeferredIsolateCall {
+            inner: <Self as tina::DeferThrough<I>>::defer_through(self, call.into_call_context()),
         }
     }
 }
@@ -2365,6 +2447,12 @@ pub type IsolateCallWithHandle<T, R> = CancelableCall<T, R>;
 pub struct DeferredCancelableCall<T, R, Q> {
     inner: CancelableCall<T, R>,
     request: tina::RequestContext<Q>,
+}
+
+/// Request-effect wrapper for [`DeferredCancelableCall`].
+#[doc(hidden)]
+pub struct RequestDeferredCancelableCall<T, R, Q> {
+    inner: DeferredCancelableCall<T, R, Q>,
 }
 
 /// Visible pending caller obligation for cancelable deferred work.
@@ -2745,6 +2833,54 @@ where
     }
 }
 
+impl<T, R, Q> RequestDeferredCancelableCall<T, R, Q>
+where
+    T: Send + 'static,
+    R: 'static,
+    Q: 'static,
+{
+    /// Builds the worker-return continuation and the pending token.
+    ///
+    /// Prefer [`Self::try_admit`] so the child effect is returned only after
+    /// bounded pending storage accepts the token.
+    pub fn reply<I, F, M, K>(
+        self,
+        key: K,
+        translator: F,
+    ) -> (PendingCancelableCall<K, Q, R>, tina::RequestEffect<I>)
+    where
+        I: tina::Isolate<Message = M, Reply = Q, Call = RuntimeCall<M>>,
+        F: FnOnce(K, PendingCancelableTicket, CallOutcome<R>) -> M + 'static,
+        K: Clone + 'static,
+        M: 'static,
+    {
+        let (token, effect) = self.inner.reply(key, translator);
+        (
+            token,
+            tina::runtime_internal::request_effect_from_consumed_effect(effect),
+        )
+    }
+
+    /// Admits the pending token into bounded storage and returns the child
+    /// request effect only after admission succeeds.
+    pub fn try_admit<I, F, M, K>(
+        self,
+        pending: &mut PendingCancelableCallSet<K, Q, R>,
+        key: K,
+        translator: F,
+    ) -> Result<tina::RequestEffect<I>, PendingCancelableInsertError<K, Q, R>>
+    where
+        I: tina::Isolate<Message = M, Reply = Q, Call = RuntimeCall<M>>,
+        F: FnOnce(K, PendingCancelableTicket, CallOutcome<R>) -> M + 'static,
+        K: Clone + PartialEq + 'static,
+        M: 'static,
+    {
+        self.inner
+            .try_admit(pending, key, translator)
+            .map(tina::runtime_internal::request_effect_from_consumed_effect)
+    }
+}
+
 impl<T, R, I> tina::DeferCancelableThrough<I> for CancelableCall<T, R>
 where
     T: Send + 'static,
@@ -2758,6 +2894,28 @@ where
         DeferredCancelableCall {
             inner: self,
             request: call.into_request_context(),
+        }
+    }
+}
+
+impl<T, R, I> tina::RequestDeferCancelableThrough<I> for CancelableCall<T, R>
+where
+    T: Send + 'static,
+    R: 'static,
+    I: tina::Isolate,
+    I::Reply: 'static,
+{
+    type RequestDeferredCancelable = RequestDeferredCancelableCall<T, R, I::Reply>;
+
+    fn defer_cancelable_request_through(
+        self,
+        call: tina::RequestCall<'_, I>,
+    ) -> Self::RequestDeferredCancelable {
+        RequestDeferredCancelableCall {
+            inner: <Self as tina::DeferCancelableThrough<I>>::defer_cancelable_through(
+                self,
+                call.into_call_context(),
+            ),
         }
     }
 }
@@ -2963,6 +3121,28 @@ where
     IsolateCall::new(destination.address(), message, timeout)
 }
 
+/// Capability-typed call for split service requests.
+///
+/// This is the request-lane companion to [`tina::send_event`]. Passing an
+/// event address here is a compile error, and request payloads are wrapped
+/// into [`tina::ServiceMessage::Request`] before dispatch.
+pub fn call_request<E, Q, R>(
+    destination: tina::ServiceRequestAddress<E, Q, R>,
+    request: Q,
+    timeout: Duration,
+) -> IsolateCall<tina::ServiceMessage<E, Q>, R>
+where
+    E: Send + 'static,
+    Q: Send + 'static,
+    R: 'static,
+{
+    IsolateCall::new(
+        destination.address().address(),
+        tina::ServiceMessage::Request(request),
+        timeout,
+    )
+}
+
 /// Returns a sleep effect that ignores the infallible timer payload and
 /// delivers `message` back later.
 ///
@@ -3099,6 +3279,22 @@ where
     }
 }
 
+impl<T, Q> RequestDeferredTypedCall<T, Q>
+where
+    T: 'static,
+    Q: 'static,
+{
+    /// Builds a request effect whose continuation carries caller authority.
+    pub fn reply<I, F, M>(self, translator: F) -> tina::RequestEffect<I>
+    where
+        I: tina::Isolate<Message = M, Reply = Q, Call = RuntimeCall<M>>,
+        F: FnOnce(tina::RequestContext<Q>, Result<T, CallError>) -> M + 'static,
+        M: 'static,
+    {
+        tina::runtime_internal::request_effect_from_consumed_effect(self.inner.reply(translator))
+    }
+}
+
 impl<T, I> tina::DeferThrough<I> for TypedCall<T>
 where
     T: 'static,
@@ -3111,6 +3307,21 @@ where
         DeferredTypedCall {
             inner: self,
             request: call.into_request_context(),
+        }
+    }
+}
+
+impl<T, I> tina::RequestDeferThrough<I> for TypedCall<T>
+where
+    T: 'static,
+    I: tina::Isolate,
+    I::Reply: 'static,
+{
+    type RequestDeferred = RequestDeferredTypedCall<T, I::Reply>;
+
+    fn defer_request_through(self, call: tina::RequestCall<'_, I>) -> Self::RequestDeferred {
+        RequestDeferredTypedCall {
+            inner: <Self as tina::DeferThrough<I>>::defer_through(self, call.into_call_context()),
         }
     }
 }

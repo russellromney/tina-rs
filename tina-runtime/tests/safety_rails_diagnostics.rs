@@ -18,4 +18,18 @@
 fn diagnostic_phrases_are_pinned() {
     let cases = trybuild::TestCases::new();
     cases.compile_fail("tests/safety_rails_compile_fail/missing_handle_call.rs");
+    cases.compile_fail("tests/safety_rails_compile_fail/split_event_without_request.rs");
+    cases.compile_fail("tests/safety_rails_compile_fail/split_message_combined.rs");
+    cases.compile_fail("tests/safety_rails_compile_fail/split_missing_handle_event.rs");
+    cases.compile_fail("tests/safety_rails_compile_fail/split_missing_handle_request.rs");
+    cases.compile_fail("tests/safety_rails_compile_fail/split_send_only.rs");
+    cases.compile_fail("tests/safety_rails_compile_fail/split_request_ignores_call.rs");
+    cases.compile_fail("tests/safety_rails_compile_fail/split_request_let_underscore.rs");
+    cases.compile_fail("tests/safety_rails_compile_fail/split_request_drop_call.rs");
+    cases.compile_fail("tests/safety_rails_compile_fail/split_request_partial_branch.rs");
+    cases.compile_fail("tests/safety_rails_compile_fail/split_request_double_consume.rs");
+    cases.compile_fail("tests/safety_rails_compile_fail/split_request_forged_effect.rs");
+    cases.compile_fail("tests/safety_rails_compile_fail/split_private_internal_event.rs");
+    cases.compile_fail("tests/safety_rails_compile_fail/split_request_on_event_lane.rs");
+    cases.compile_fail("tests/safety_rails_compile_fail/split_event_on_request_lane.rs");
 }

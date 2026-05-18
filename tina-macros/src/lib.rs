@@ -6,7 +6,7 @@
 //! behavior explicit in the handler body.
 
 use proc_macro::TokenStream;
-use quote::quote;
+use quote::{ToTokens, quote};
 use syn::parse::{Parse, ParseStream};
 use syn::{
     Error, FnArg, Ident, ImplItem, ImplItemFn, ItemImpl, Pat, Path, Result, ReturnType, Token,
@@ -15,6 +15,8 @@ use syn::{
 
 struct IsolateArgs {
     message: Option<Type>,
+    event: Option<Type>,
+    request: Option<Type>,
     reply: Option<Type>,
     send: Option<Type>,
     spawn: Option<Type>,
@@ -28,6 +30,8 @@ impl Parse for IsolateArgs {
     fn parse(input: ParseStream<'_>) -> Result<Self> {
         let mut args = Self {
             message: None,
+            event: None,
+            request: None,
             reply: None,
             send: None,
             spawn: None,
@@ -62,6 +66,8 @@ impl Parse for IsolateArgs {
 
                 match name.as_str() {
                     "message" => set_once(&mut args.message, value, "message")?,
+                    "event" => set_once(&mut args.event, value, "event")?,
+                    "request" => set_once(&mut args.request, value, "request")?,
                     "reply" => set_once(&mut args.reply, value, "reply")?,
                     "send" => set_once(&mut args.send, value, "send")?,
                     "spawn" => set_once(&mut args.spawn, value, "spawn")?,
@@ -73,7 +79,7 @@ impl Parse for IsolateArgs {
                     _ => {
                         return Err(Error::new_spanned(
                             key,
-                            "expected one of: message, reply, send, spawn, spawn_observed, call, shard, send_only",
+                            "expected one of: message, event, request, reply, send, spawn, spawn_observed, call, shard, send_only",
                         ));
                     }
                 }
@@ -137,11 +143,34 @@ fn build_isolate(
         ));
     }
 
-    let Some(message) = args.message else {
-        return Err(Error::new_spanned(
-            &item.self_ty,
-            "missing required isolate option `message = ...`",
-        ));
+    let split_service = match (&args.event, &args.request, &args.message) {
+        (Some(_), Some(_), None) => true,
+        (None, None, Some(_)) => false,
+        (Some(_), None, _) | (None, Some(_), _) => {
+            return Err(Error::new_spanned(
+                &item.self_ty,
+                "`event = ...` and `request = ...` must be supplied together",
+            ));
+        }
+        (Some(_), Some(_), Some(_)) => {
+            return Err(Error::new_spanned(
+                &item.self_ty,
+                "`message = ...` cannot be combined with `event = ...` / `request = ...`",
+            ));
+        }
+        (None, None, None) => {
+            return Err(Error::new_spanned(
+                &item.self_ty,
+                "missing required isolate option `message = ...` or `event = ... , request = ...`",
+            ));
+        }
+    };
+    let message = if split_service {
+        let event = args.event.clone().expect("checked above");
+        let request = args.request.clone().expect("checked above");
+        syn::parse_quote!(::tina::ServiceMessage<#event, #request>)
+    } else {
+        args.message.expect("checked above")
     };
     // `shard = ...` is optional. Single-shard
     // programs default to `tina::SingleShard`; multi-shard programs
@@ -196,53 +225,134 @@ fn build_isolate(
     let generics = item.generics.clone();
     let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
 
-    let handle_index = item
-        .items
-        .iter()
-        .position(
-            |candidate| matches!(candidate, ImplItem::Fn(method) if method.sig.ident == "handle"),
-        )
-        .ok_or_else(|| Error::new_spanned(&item.self_ty, "expected a `fn handle(...)` method"))?;
-
-    let ImplItem::Fn(handle) = item.items.remove(handle_index) else {
-        unreachable!("handle_index only matches functions")
-    };
-
-    let (msg_name, ctx_name) = validate_handle(&handle)?;
-    let handle_call_index = item.items.iter().position(
-        |candidate| matches!(candidate, ImplItem::Fn(method) if method.sig.ident == "handle_call"),
-    );
-    let handle_call = if let Some(index) = handle_call_index {
-        let ImplItem::Fn(method) = item.items.remove(index) else {
-            unreachable!("handle_call_index only matches functions")
-        };
-        if let Some(send_only) = &args.send_only {
+    let (attrs, msg_name, ctx_name, body, handle_call_tokens, has_handle_call) = if split_service {
+        if args.send_only.is_some() {
             return Err(Error::new_spanned(
-                send_only,
-                "`send_only` isolates must not define `handle_call`; remove the flag or remove `handle_call`",
+                &item.self_ty,
+                "`send_only` cannot be combined with split `event` / `request` services",
             ));
         }
-        Some(validate_handle_call(&method)?)
-    } else {
-        None
-    };
-
-    let attrs = &handle.attrs;
-    let body = &handle.block;
-    let has_handle_call = handle_call.is_some();
-    let handle_call_tokens = if let Some((attrs, msg_name, call_name, body)) = handle_call {
-        quote! {
-            #(#attrs)*
+        let event_index = item
+            .items
+            .iter()
+            .position(|candidate| {
+                matches!(candidate, ImplItem::Fn(method) if method.sig.ident == "handle_event")
+            })
+            .ok_or_else(|| Error::new_spanned(&item.self_ty, "expected a `fn handle_event(...)` method"))?;
+        let ImplItem::Fn(event_method) = item.items.remove(event_index) else {
+            unreachable!("event_index only matches functions")
+        };
+        let request_index = item
+            .items
+            .iter()
+            .position(|candidate| {
+                matches!(candidate, ImplItem::Fn(method) if method.sig.ident == "handle_request")
+            })
+            .ok_or_else(|| Error::new_spanned(&item.self_ty, "expected a `fn handle_request(...)` method"))?;
+        let ImplItem::Fn(request_method) = item.items.remove(request_index) else {
+            unreachable!("request_index only matches functions")
+        };
+        let (event_name, event_ctx_name) =
+            validate_handler(&event_method, "handle_event", "event", "ctx")?;
+        let (request_attrs, request_name, call_name, request_body) =
+            validate_call_handler(&request_method, "handle_request", "request", "call")?;
+        require_call_authority_mentioned(&request_body, &call_name)?;
+        let event_attrs = event_method.attrs.clone();
+        let event_body = Box::new(event_method.block.clone());
+        let handle_call_tokens = quote! {
+            #(#request_attrs)*
+            #[deny(unused_variables)]
             fn handle_call(
                 &mut self,
-                #msg_name: Self::Message,
+                msg: Self::Message,
                 #call_name: ::tina::CallContext<'_, Self>,
             ) -> ::tina::Effect<Self> {
-                #body
+                let #call_name = ::tina::RequestCall::new(#call_name);
+                match msg {
+                    ::tina::ServiceMessage::Request(#request_name) => {
+                        let request_effect: ::tina::RequestEffect<Self> = #request_body;
+                        request_effect.into_effect()
+                    }
+                    ::tina::ServiceMessage::Event(_) => {
+                        #call_name.reject(::tina::CallRejectedReason::UnsupportedMessage)
+                            .into_effect()
+                    }
+                }
             }
-        }
+        };
+        let body = syn::parse_quote!({
+            match #event_name {
+                ::tina::ServiceMessage::Event(#event_name) => #event_body,
+                ::tina::ServiceMessage::Request(_) => {
+                    ::tina::reject(::tina::CallRejectedReason::UnsupportedMessage)
+                }
+            }
+        });
+        (
+            event_attrs,
+            event_name,
+            event_ctx_name,
+            body,
+            handle_call_tokens,
+            true,
+        )
     } else {
-        quote! {}
+        let handle_index = item
+            .items
+            .iter()
+            .position(
+                |candidate| matches!(candidate, ImplItem::Fn(method) if method.sig.ident == "handle"),
+            )
+            .ok_or_else(|| Error::new_spanned(&item.self_ty, "expected a `fn handle(...)` method"))?;
+
+        let ImplItem::Fn(handle) = item.items.remove(handle_index) else {
+            unreachable!("handle_index only matches functions")
+        };
+
+        let (msg_name, ctx_name) = validate_handle(&handle)?;
+        let handle_call_index = item.items.iter().position(
+            |candidate| matches!(candidate, ImplItem::Fn(method) if method.sig.ident == "handle_call"),
+        );
+        let handle_call = if let Some(index) = handle_call_index {
+            let ImplItem::Fn(method) = item.items.remove(index) else {
+                unreachable!("handle_call_index only matches functions")
+            };
+            if let Some(send_only) = &args.send_only {
+                return Err(Error::new_spanned(
+                    send_only,
+                    "`send_only` isolates must not define `handle_call`; remove the flag or remove `handle_call`",
+                ));
+            }
+            Some(validate_handle_call(&method)?)
+        } else {
+            None
+        };
+
+        let attrs = handle.attrs.clone();
+        let body = Box::new(handle.block.clone());
+        let has_handle_call = handle_call.is_some();
+        let handle_call_tokens = if let Some((attrs, msg_name, call_name, body)) = handle_call {
+            quote! {
+                #(#attrs)*
+                fn handle_call(
+                    &mut self,
+                    #msg_name: Self::Message,
+                    #call_name: ::tina::CallContext<'_, Self>,
+                ) -> ::tina::Effect<Self> {
+                    #body
+                }
+            }
+        } else {
+            quote! {}
+        };
+        (
+            attrs,
+            msg_name,
+            ctx_name,
+            body,
+            handle_call_tokens,
+            has_handle_call,
+        )
     };
     let callable_marker_impl = if has_handle_call {
         quote! {
@@ -286,17 +396,28 @@ fn build_isolate(
 }
 
 fn validate_handle(handle: &ImplItemFn) -> Result<(syn::Ident, syn::Ident)> {
+    validate_handler(handle, "handle", "msg", "ctx")
+}
+
+fn validate_handler(
+    handle: &ImplItemFn,
+    method_name: &str,
+    message_arg: &str,
+    context_arg: &str,
+) -> Result<(syn::Ident, syn::Ident)> {
     if handle.sig.asyncness.is_some() {
         return Err(Error::new_spanned(
             handle.sig.asyncness,
-            "Tina handlers are synchronous; return an Effect instead of `async fn`",
+            format!(
+                "Tina {method_name} handlers are synchronous; return an Effect instead of `async fn`"
+            ),
         ));
     }
 
     if handle.sig.constness.is_some() {
         return Err(Error::new_spanned(
             handle.sig.constness,
-            "Tina handlers cannot be const",
+            format!("Tina {method_name} handlers cannot be const"),
         ));
     }
 
@@ -304,7 +425,9 @@ fn validate_handle(handle: &ImplItemFn) -> Result<(syn::Ident, syn::Ident)> {
     if inputs.len() != 3 {
         return Err(Error::new_spanned(
             &handle.sig,
-            "expected `fn handle(&mut self, msg, ctx) -> Effect<Self>`",
+            format!(
+                "expected `fn {method_name}(&mut self, {message_arg}, {context_arg}) -> Effect<Self>`"
+            ),
         ));
     }
 
@@ -314,18 +437,18 @@ fn validate_handle(handle: &ImplItemFn) -> Result<(syn::Ident, syn::Ident)> {
         _ => {
             return Err(Error::new_spanned(
                 &handle.sig,
-                "first handle argument must be `&mut self`",
+                format!("first {method_name} argument must be `&mut self`"),
             ));
         }
     }
 
-    let msg_name = simple_argument_name(handle, 1, "msg")?;
-    let ctx_name = simple_argument_name(handle, 2, "ctx")?;
+    let msg_name = simple_argument_name(handle, 1, message_arg)?;
+    let ctx_name = simple_argument_name(handle, 2, context_arg)?;
 
     if handle.sig.generics.lt_token.is_some() {
         return Err(Error::new_spanned(
             &handle.sig.generics,
-            "handle cannot have its own generic parameters",
+            format!("{method_name} cannot have its own generic parameters"),
         ));
     }
 
@@ -335,24 +458,35 @@ fn validate_handle(handle: &ImplItemFn) -> Result<(syn::Ident, syn::Ident)> {
 
     Err(Error::new_spanned(
         &handle.sig,
-        "handle must return `tina::Effect<Self>`",
+        format!("{method_name} must return `tina::Effect<Self>`"),
     ))
 }
 
 fn validate_handle_call(
     handle_call: &ImplItemFn,
 ) -> Result<(Vec<syn::Attribute>, syn::Ident, syn::Ident, Box<syn::Block>)> {
+    validate_call_handler(handle_call, "handle_call", "msg", "call")
+}
+
+fn validate_call_handler(
+    handle_call: &ImplItemFn,
+    method_name: &str,
+    message_arg: &str,
+    call_arg: &str,
+) -> Result<(Vec<syn::Attribute>, syn::Ident, syn::Ident, Box<syn::Block>)> {
     if handle_call.sig.asyncness.is_some() {
         return Err(Error::new_spanned(
             handle_call.sig.asyncness,
-            "Tina call handlers are synchronous; return an Effect instead of `async fn`",
+            format!(
+                "Tina {method_name} handlers are synchronous; return an Effect instead of `async fn`"
+            ),
         ));
     }
 
     if handle_call.sig.constness.is_some() {
         return Err(Error::new_spanned(
             handle_call.sig.constness,
-            "Tina call handlers cannot be const",
+            format!("Tina {method_name} handlers cannot be const"),
         ));
     }
 
@@ -360,7 +494,9 @@ fn validate_handle_call(
     if inputs.len() != 3 {
         return Err(Error::new_spanned(
             &handle_call.sig,
-            "expected `fn handle_call(&mut self, msg, call) -> Effect<Self>`",
+            format!(
+                "expected `fn {method_name}(&mut self, {message_arg}, {call_arg}) -> Effect<Self>`"
+            ),
         ));
     }
 
@@ -370,25 +506,25 @@ fn validate_handle_call(
         _ => {
             return Err(Error::new_spanned(
                 &handle_call.sig,
-                "first handle_call argument must be `&mut self`",
+                format!("first {method_name} argument must be `&mut self`"),
             ));
         }
     }
 
-    let msg_name = simple_argument_name(handle_call, 1, "msg")?;
-    let call_name = simple_argument_name(handle_call, 2, "call")?;
+    let msg_name = simple_argument_name(handle_call, 1, message_arg)?;
+    let call_name = simple_argument_name(handle_call, 2, call_arg)?;
 
     if handle_call.sig.generics.lt_token.is_some() {
         return Err(Error::new_spanned(
             &handle_call.sig.generics,
-            "handle_call cannot have its own generic parameters",
+            format!("{method_name} cannot have its own generic parameters"),
         ));
     }
 
     if matches!(handle_call.sig.output, ReturnType::Default) {
         return Err(Error::new_spanned(
             &handle_call.sig,
-            "handle_call must return `tina::Effect<Self>`",
+            format!("{method_name} must return `tina::Effect<Self>`"),
         ));
     }
 
@@ -397,6 +533,24 @@ fn validate_handle_call(
         msg_name,
         call_name,
         Box::new(handle_call.block.clone()),
+    ))
+}
+
+fn require_call_authority_mentioned(body: &syn::Block, call_name: &syn::Ident) -> Result<()> {
+    let needle = call_name.to_string();
+    let body_tokens = body.to_token_stream().to_string();
+    if body_tokens
+        .split(|ch: char| !(ch == '_' || ch.is_ascii_alphanumeric()))
+        .any(|token| token == needle)
+    {
+        return Ok(());
+    }
+
+    Err(Error::new_spanned(
+        body,
+        format!(
+            "split `handle_request` must use caller authority `{needle}`; reply, reject, or defer it"
+        ),
     ))
 }
 
