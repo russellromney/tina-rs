@@ -144,14 +144,13 @@ pub mod websocket_room;
 pub use body_metrics::{BodyCapacityFull, BodyMetrics, BodyPressureReport};
 pub use client::{HttpClient, HttpClientMsg, OutboundCall};
 pub use connection::{HttpConnection, HttpConnectionMsg, response_for_call_outcome};
-#[allow(deprecated)]
 pub use grpc::{
     GrpcClientStreamingRequest, GrpcError, GrpcLimits, GrpcRawStreamingRequest,
     GrpcRawStreamingResponse, GrpcRequest, GrpcRequestStream, GrpcResponse, GrpcRouter,
     GrpcRouterMsg, GrpcServerStreamingResponse, GrpcStatus, GrpcStatusCode, GrpcStreamReply,
     GrpcStreamingCall, GrpcStreamingResponse, decode_streaming_request, decode_unary_request,
     encode_grpc_message, grpc_status_trailers, grpc_stream_finish, grpc_stream_message,
-    grpc_unary_call_h2c, grpc_unary_call_h2c_blocking,
+    grpc_unary_call_h2c_blocking,
 };
 pub use http2::{
     Http2Connection, Http2ConnectionMsg, Http2ConnectionReply, Http2ConnectionReport, Http2Limits,
