@@ -46,6 +46,10 @@ Systems/specimens proved the same pain more than once:
 - `examples/FINDINGS.md` finding 26: runtime-call completions from
   `handle_call` must be pinned by a regression and then moved out of
   Active.
+- Phase 112 review: `TraceProjection::http2_streams()`,
+  `websocket_sessions()`, and `grpc_status()` read like fact-family
+  filters. They must actually filter by family, not just alias "all
+  protocol facts."
 
 Do not do these here:
 
@@ -268,6 +272,32 @@ Required:
 If something is still real product work, keep it Active and make the
 remaining build specific.
 
+## Rock 8: Protocol Fact Projection Names
+
+Make the projection helpers do what their names say.
+
+Add:
+
+```rust
+TraceProjection::protocol_family(ProtocolFamily)
+```
+
+Rules:
+
+- `protocol_facts()` keeps every `FactObserved` event;
+- `http2_streams()` keeps only `ProtocolFamily::Http2`;
+- `websocket_sessions()` keeps only `ProtocolFamily::WebSocket`;
+- `grpc_status()` keeps only `ProtocolFamily::Grpc`;
+- non-matching `FactObserved` events are ignored by that projection;
+- unknown runtime event kinds still fail closed.
+
+Do not parse `Debug` strings. Use `RuntimeFact::Protocol(fact).family()`.
+
+Update docs that mention these helpers so the copied path is honest:
+
+- `docs/tina-user-guide/08-simulation-and-dst.md`;
+- `docs/tina-user-guide/22-http-http2-grpc.md`.
+
 ## Tests
 
 Unit tests for `SharedWork`:
@@ -300,6 +330,8 @@ End-to-end tests:
   `WaitList` in copied service code;
 - bridge docs/rustdoc pass with broken intra-doc links denied;
 - runtime completion regression from Rock 5.
+- protocol projection mixed trace: HTTP/2 + WebSocket + gRPC facts in one
+  trace, and each named helper keeps only its family.
 
 Run:
 
@@ -309,6 +341,7 @@ cargo test -p tina-runtime shared_work --lib -- --nocapture
 cargo test -p tina-runtime --test workflow_pending_ergonomics -- --nocapture
 cargo test -p tina-runtime --test compile_fail -- shared_work
 cargo test -p tina-runtime runtime_call_returned_from_handle_call_completes_as_event --lib -- --nocapture
+cargo test -p tina-sim --test protocol_fact -- projection --nocapture
 cargo test --manifest-path examples/systems/system_cache_with_fill/Cargo.toml
 cargo test --manifest-path examples/systems/ergonomics_playground/Cargo.toml
 cargo test --manifest-path examples/systems/system_webhook_relay/Cargo.toml
@@ -324,6 +357,7 @@ RUSTDOCFLAGS="-D warnings" cargo doc -p tina-runtime --no-deps
 - New code says `SharedWork` before `WaitList`.
 - Docs say "start request work" before table names.
 - Bridge authors see the normal job path before trait names.
+- Protocol fact projection names match what they keep.
 - Systems prove the names in real code.
 - Findings match reality.
 - No helper hides overload, cancellation, caller authority, timeout,
