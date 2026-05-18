@@ -14,6 +14,10 @@ This file records completed work.
   forbidden leading whitespace, chunked length accounting uses checked
   arithmetic, protocol-relative HTTP/1 targets are rejected, and WebSocket
   frames reject non-minimal extended lengths plus 127-form high-bit lengths.
+- Hardened the native HTTP/2 server: DATA/HEADERS PADDED and PRIORITY flags
+  are parsed correctly, SETTINGS now applies peer flow-control/frame-size
+  facts before ACK, forbidden HTTP/1 connection-control headers and missing
+  authority reject, and rapid reset churn produces `ENHANCE_YOUR_CALM`.
 
 ### Phase 110 Workflow Pending Ergonomics
 

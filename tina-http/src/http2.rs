@@ -32,6 +32,8 @@ const WINDOW_CREDIT_FLUSH_THRESHOLD: u32 = 16 * 1024;
 const FLAG_ACK: u8 = 0x1;
 const FLAG_END_STREAM: u8 = 0x1;
 const FLAG_END_HEADERS: u8 = 0x4;
+const FLAG_PADDED: u8 = 0x8;
+const FLAG_PRIORITY: u8 = 0x20;
 
 const FRAME_DATA: u8 = 0x0;
 const FRAME_HEADERS: u8 = 0x1;
@@ -46,10 +48,21 @@ const FRAME_WINDOW_UPDATE: u8 = 0x8;
 const ERR_NO_ERROR: u32 = 0x0;
 const ERR_PROTOCOL_ERROR: u32 = 0x1;
 const ERR_FLOW_CONTROL_ERROR: u32 = 0x3;
+const ERR_SETTINGS_ERROR: u32 = 0x4;
 const ERR_STREAM_CLOSED: u32 = 0x5;
 const ERR_FRAME_SIZE_ERROR: u32 = 0x6;
 const ERR_REFUSED_STREAM: u32 = 0x7;
 const ERR_ENHANCE_YOUR_CALM: u32 = 0xb;
+
+const SETTINGS_HEADER_TABLE_SIZE: u16 = 0x1;
+const SETTINGS_ENABLE_PUSH: u16 = 0x2;
+const SETTINGS_MAX_CONCURRENT_STREAMS: u16 = 0x3;
+const SETTINGS_INITIAL_WINDOW_SIZE: u16 = 0x4;
+const SETTINGS_MAX_FRAME_SIZE: u16 = 0x5;
+const SETTINGS_MAX_HEADER_LIST_SIZE: u16 = 0x6;
+const DEFAULT_HEADER_TABLE_SIZE: u32 = 4096;
+const MIN_MAX_FRAME_SIZE: u32 = 16_384;
+const MAX_MAX_FRAME_SIZE: u32 = 16_777_215;
 
 /// Configurable limits for the HTTP/2 first form.
 #[derive(Debug, Clone, Copy)]
@@ -74,6 +87,9 @@ pub struct Http2Limits {
     pub initial_connection_window: i32,
     /// Initial stream receive window.
     pub initial_stream_window: i32,
+    /// Maximum peer reset churn before this connection sends GOAWAY
+    /// with `ENHANCE_YOUR_CALM`.
+    pub rapid_reset_max_resets: u32,
 }
 
 impl Default for Http2Limits {
@@ -89,6 +105,7 @@ impl Default for Http2Limits {
             response_stream_call_timeout: Duration::from_secs(10),
             initial_connection_window: DEFAULT_WINDOW,
             initial_stream_window: DEFAULT_WINDOW,
+            rapid_reset_max_resets: 128,
         }
     }
 }
@@ -186,6 +203,7 @@ pub enum Http2ProtocolError {
     WindowOverflow,
     FlowControl,
     RequestTrailersUnsupported,
+    SettingsUnsupported,
     UnsupportedFrame(u8),
 }
 
@@ -201,6 +219,7 @@ pub struct Http2ConnectionReport {
     pub protocol_errors: u64,
     pub goaway_sent: u64,
     pub late_replies_after_close: u64,
+    pub rapid_reset_goaway: u64,
 }
 
 /// Per-stream report snapshot.
@@ -260,7 +279,12 @@ fn try_decode_frame(
             max: limits.max_frame_size,
         });
     }
-    let total = FRAME_HEADER_LEN + len;
+    let total = FRAME_HEADER_LEN
+        .checked_add(len)
+        .ok_or(Http2ProtocolError::FrameTooLarge {
+            len,
+            max: limits.max_frame_size,
+        })?;
     if buffer.len() < total {
         return Ok(None);
     }
@@ -322,6 +346,51 @@ fn data_frame(stream_id: u32, end_stream: bool, data: Vec<u8>) -> Frame {
         stream_id,
         data,
     )
+}
+
+fn data_payload(frame: &Frame) -> Result<Vec<u8>, Http2ProtocolError> {
+    if frame.flags & FLAG_PADDED == 0 {
+        return Ok(frame.payload.clone());
+    }
+    let Some((&pad_len, rest)) = frame.payload.split_first() else {
+        return Err(Http2ProtocolError::BadFrameLength);
+    };
+    let pad_len = usize::from(pad_len);
+    if pad_len > rest.len() {
+        return Err(Http2ProtocolError::BadFrameLength);
+    }
+    Ok(rest[..rest.len() - pad_len].to_vec())
+}
+
+fn headers_payload(frame: &Frame) -> Result<&[u8], Http2ProtocolError> {
+    let mut offset = 0usize;
+    let mut pad_len = 0usize;
+    if frame.flags & FLAG_PADDED != 0 {
+        let Some((&pad, _)) = frame.payload.split_first() else {
+            return Err(Http2ProtocolError::BadFrameLength);
+        };
+        pad_len = usize::from(pad);
+        offset = 1;
+    }
+    if frame.flags & FLAG_PRIORITY != 0 {
+        let next = offset
+            .checked_add(5)
+            .ok_or(Http2ProtocolError::BadFrameLength)?;
+        if frame.payload.len() < next {
+            return Err(Http2ProtocolError::BadFrameLength);
+        }
+        offset = next;
+    }
+    let available = frame
+        .payload
+        .len()
+        .checked_sub(offset)
+        .ok_or(Http2ProtocolError::BadFrameLength)?;
+    if pad_len > available {
+        return Err(Http2ProtocolError::BadFrameLength);
+    }
+    let end = frame.payload.len() - pad_len;
+    Ok(&frame.payload[offset..end])
 }
 
 #[derive(Debug, Default)]
@@ -399,6 +468,15 @@ fn add_header(
             _ => return Err(Http2ProtocolError::InvalidPseudoHeaders),
         }
         return Ok(());
+    }
+    if name.bytes().any(|b| b.is_ascii_uppercase()) {
+        return Err(Http2ProtocolError::InvalidPseudoHeaders);
+    }
+    if matches!(
+        name,
+        "connection" | "keep-alive" | "proxy-connection" | "transfer-encoding" | "upgrade"
+    ) {
+        return Err(Http2ProtocolError::InvalidPseudoHeaders);
     }
     out.saw_regular = true;
     let header_name = HeaderName::from_bytes(name.as_bytes())
@@ -599,6 +677,9 @@ pub struct Http2Connection<S: Shard, M: From<HttpRequest> + Send + 'static = Htt
     recv_window: i32,
     pending_recv_window_credit: u32,
     send_window: i32,
+    peer_initial_stream_window: i32,
+    peer_max_frame_size: usize,
+    reset_churn: u32,
     goaway: bool,
     closing_after_write: bool,
     pending_write: Vec<u8>,
@@ -629,6 +710,9 @@ impl<S: Shard, M: From<HttpRequest> + Send + 'static> Http2Connection<S, M> {
             recv_window: limits.initial_connection_window,
             pending_recv_window_credit: 0,
             send_window: DEFAULT_WINDOW,
+            peer_initial_stream_window: DEFAULT_WINDOW,
+            peer_max_frame_size: limits.max_frame_size,
+            reset_churn: 0,
             goaway: false,
             closing_after_write: false,
             pending_write: Vec::new(),
@@ -753,6 +837,7 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Http2Connection<
                 Http2ProtocolError::FlowControl | Http2ProtocolError::WindowOverflow => {
                     ERR_FLOW_CONTROL_ERROR
                 }
+                Http2ProtocolError::SettingsUnsupported => ERR_SETTINGS_ERROR,
                 _ => ERR_PROTOCOL_ERROR,
             };
             let _ = self.enqueue_frame(goaway_frame(self.highest_client_stream_id, code));
@@ -832,7 +917,52 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Http2Connection<
         if frame.payload.len() % 6 != 0 {
             return Err(Http2ProtocolError::BadFrameLength);
         }
+        for setting in frame.payload.chunks_exact(6) {
+            let id = u16::from_be_bytes([setting[0], setting[1]]);
+            let value = u32::from_be_bytes([setting[2], setting[3], setting[4], setting[5]]);
+            self.apply_setting(id, value)?;
+        }
         self.enqueue_frame(settings_frame(true))
+    }
+
+    fn apply_setting(&mut self, id: u16, value: u32) -> Result<(), Http2ProtocolError> {
+        match id {
+            SETTINGS_HEADER_TABLE_SIZE => {
+                if value != DEFAULT_HEADER_TABLE_SIZE {
+                    return Err(Http2ProtocolError::SettingsUnsupported);
+                }
+            }
+            SETTINGS_ENABLE_PUSH => {
+                if value > 1 {
+                    return Err(Http2ProtocolError::SettingsUnsupported);
+                }
+            }
+            SETTINGS_MAX_CONCURRENT_STREAMS => {}
+            SETTINGS_INITIAL_WINDOW_SIZE => {
+                if value > i32::MAX as u32 {
+                    return Err(Http2ProtocolError::FlowControl);
+                }
+                let new_window = value as i32;
+                let delta = i64::from(new_window) - i64::from(self.peer_initial_stream_window);
+                for stream in &mut self.streams {
+                    let next = i64::from(stream.send_window) + delta;
+                    if next < i64::from(i32::MIN) || next > i64::from(i32::MAX) {
+                        return Err(Http2ProtocolError::FlowControl);
+                    }
+                    stream.send_window = next as i32;
+                }
+                self.peer_initial_stream_window = new_window;
+            }
+            SETTINGS_MAX_FRAME_SIZE => {
+                if !(MIN_MAX_FRAME_SIZE..=MAX_MAX_FRAME_SIZE).contains(&value) {
+                    return Err(Http2ProtocolError::BadFrameLength);
+                }
+                self.peer_max_frame_size = value as usize;
+            }
+            SETTINGS_MAX_HEADER_LIST_SIZE => {}
+            _ => {}
+        }
+        Ok(())
     }
 
     fn handle_ping(&mut self, frame: Frame) -> Result<(), Http2ProtocolError> {
@@ -875,9 +1005,10 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Http2Connection<
             self.enqueue_frame(rst_stream_frame(frame.stream_id, ERR_ENHANCE_YOUR_CALM))?;
             return Ok(());
         }
+        let header_payload = headers_payload(&frame)?;
         let headers = decode_headers_block_with(
             &mut self.hpack_decoder,
-            &frame.payload,
+            header_payload,
             self.limits.max_header_bytes,
         )?;
         validate_request_headers(&headers)?;
@@ -891,7 +1022,7 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Http2Connection<
             frame.stream_id,
             headers,
             self.limits.initial_stream_window,
-            DEFAULT_WINDOW,
+            self.peer_initial_stream_window,
             grpc,
         );
         self.report.opened_streams += 1;
@@ -917,8 +1048,10 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Http2Connection<
         if frame.stream_id == 0 {
             return Err(Http2ProtocolError::BadStreamId);
         }
-        let len = frame.payload.len();
-        if self.recv_window < len as i32 {
+        let payload = data_payload(&frame)?;
+        let len = payload.len();
+        let len_i32 = i32::try_from(len).map_err(|_| Http2ProtocolError::FlowControl)?;
+        if self.recv_window < len_i32 {
             self.report.flow_control_blocked += 1;
             return Err(Http2ProtocolError::FlowControl);
         }
@@ -933,7 +1066,7 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Http2Connection<
             self.enqueue_frame(rst_stream_frame(frame.stream_id, ERR_STREAM_CLOSED))?;
             return Ok(());
         }
-        if self.streams[idx].recv_window < len as i32 {
+        if self.streams[idx].recv_window < len_i32 {
             self.report.flow_control_blocked += 1;
             return Err(Http2ProtocolError::FlowControl);
         }
@@ -963,15 +1096,15 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Http2Connection<
             self.remove_stream(frame.stream_id);
             return Ok(());
         }
-        self.recv_window -= len as i32;
-        self.streams[idx].recv_window -= len as i32;
+        self.recv_window -= len_i32;
+        self.streams[idx].recv_window -= len_i32;
         self.streams[idx].request_bytes_received += len;
         if self.streams[idx].request_dispatched_streaming {
-            if !frame.payload.is_empty() {
-                self.streams[idx].request_chunks.push_back(frame.payload);
+            if !payload.is_empty() {
+                self.streams[idx].request_chunks.push_back(payload);
             }
         } else {
-            self.streams[idx].body.extend_from_slice(&frame.payload);
+            self.streams[idx].body.extend_from_slice(&payload);
         }
         if frame.flags & FLAG_END_STREAM != 0 {
             if self.streams[idx]
@@ -1024,6 +1157,18 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Http2Connection<
     ) -> Result<(), Http2ProtocolError> {
         if frame.stream_id == 0 || frame.payload.len() != 4 {
             return Err(Http2ProtocolError::BadFrameLength);
+        }
+        self.reset_churn = self.reset_churn.saturating_add(1);
+        if self.reset_churn > self.limits.rapid_reset_max_resets {
+            self.report.rapid_reset_goaway += 1;
+            self.enqueue_frame(goaway_frame(
+                self.highest_client_stream_id,
+                ERR_ENHANCE_YOUR_CALM,
+            ))?;
+            self.report.goaway_sent += 1;
+            self.goaway = true;
+            self.closing_after_write = true;
+            return Ok(());
         }
         if let Some(mut stream) = self.remove_stream(frame.stream_id) {
             self.report.reset_streams += 1;
@@ -1298,9 +1443,15 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Http2Connection<
         let idx = self
             .find_stream(stream_id)
             .ok_or(Http2ProtocolError::StreamClosed)?;
-        if pending.body.len() as i32 > self.send_window
-            || pending.body.len() as i32 > self.streams[idx].send_window
-        {
+        let body_len_i32 = match i32::try_from(pending.body.len()) {
+            Ok(len) => len,
+            Err(_) => {
+                self.report.flow_control_blocked += 1;
+                self.streams[idx].pending_response = Some(pending);
+                return Ok(());
+            }
+        };
+        if body_len_i32 > self.send_window || body_len_i32 > self.streams[idx].send_window {
             self.report.flow_control_blocked += 1;
             self.streams[idx].pending_response = Some(pending);
             return Ok(());
@@ -1316,7 +1467,7 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Http2Connection<
         let idx = self
             .find_stream(stream_id)
             .ok_or(Http2ProtocolError::StreamClosed)?;
-        let frame_cap = self.limits.max_frame_size.max(1);
+        let frame_cap = self.peer_max_frame_size.max(1);
         let data_frames = if pending.body.is_empty() {
             0
         } else {
@@ -1331,8 +1482,10 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Http2Connection<
             pending.header_block,
         ))?;
         if !pending.body.is_empty() {
-            self.send_window -= pending.body.len() as i32;
-            self.streams[idx].send_window -= pending.body.len() as i32;
+            let body_len_i32 =
+                i32::try_from(pending.body.len()).map_err(|_| Http2ProtocolError::FlowControl)?;
+            self.send_window -= body_len_i32;
+            self.streams[idx].send_window -= body_len_i32;
             for (chunk_index, chunk) in pending.body.chunks(frame_cap).enumerate() {
                 let end_stream = chunk_index + 1 == data_frames && pending.trailers.is_none();
                 self.enqueue_frame(data_frame(stream_id, end_stream, chunk.to_vec()))?;
@@ -1500,8 +1653,7 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Http2Connection<
                 return Ok(());
             }
             let allowed = self
-                .limits
-                .max_frame_size
+                .peer_max_frame_size
                 .min(self.send_window as usize)
                 .min(self.streams[idx].send_window as usize)
                 .min(self.streams[idx].response_pending_data.len());
@@ -1779,6 +1931,15 @@ fn add_window(current: i32, increment: u32) -> Result<i32, Http2ProtocolError> {
 
 fn validate_request_headers(headers: &HeaderBlock) -> Result<(), Http2ProtocolError> {
     if headers.method.is_none() || headers.path.is_none() || headers.scheme.is_none() {
+        return Err(Http2ProtocolError::InvalidPseudoHeaders);
+    }
+    let has_authority = headers.authority.as_deref().is_some_and(|v| !v.is_empty())
+        || headers
+            .headers
+            .get(http::header::HOST)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| !v.is_empty());
+    if !has_authority {
         return Err(Http2ProtocolError::InvalidPseudoHeaders);
     }
     if headers.status.is_some() {

@@ -31,6 +31,12 @@ the implementation proof and regression test names.
 | A7 | Fixed. WebSocket frame-end calculations use checked offsets and reject huge frame lengths before drain/decode. Test: `client_frame_rejects_huge_frame_before_end_offset_overflow`. |
 | M6 | Already fixed in the connection delivery path; Phase 123 added a live regression proving invalid fragmented text is closed before app echo/delivery. Test: `websocket_fragmented_text_invalid_utf8_rejects_before_app_delivery`. |
 | L14 | Fixed. HTTP/1 origin-form parsing rejects protocol-relative targets (`//host/path`). Test: `protocol_relative_target_is_not_origin_form`. |
+| C2 | Fixed. HTTP/2 DATA strips PADDED bytes before body accounting, and HEADERS strips PADDED plus PRIORITY bytes before HPACK. Tests: `http2_padded_data_delivers_only_unpadded_body`, `http2_bad_data_padding_sends_protocol_goaway`, `http2_priority_headers_with_valid_hpack_succeeds`, `http2_padded_priority_headers_with_valid_hpack_succeeds`, `http2_malformed_padded_priority_headers_rejects`. |
+| C3 | Fixed. SETTINGS frames are parsed and applied before ACK: peer `INITIAL_WINDOW_SIZE` updates open/new stream send windows, peer `MAX_FRAME_SIZE` controls outbound DATA splitting, invalid values reject, and unsupported non-default `HEADER_TABLE_SIZE` sends SETTINGS_ERROR. Tests: `http2_settings_initial_window_shrink_blocks_until_window_update`, `http2_settings_max_frame_size_controls_outbound_splitting`, `http2_invalid_settings_value_sends_goaway`, `http2_non_default_header_table_size_sends_settings_error`. |
+| C5 | Fixed with a conservative reset-churn guard that sends `ENHANCE_YOUR_CALM` once peer reset count exceeds the configured limit. Tests: `http2_rapid_reset_storm_sends_enhance_your_calm_goaway`, `http2_normal_reset_rate_allows_later_request`. |
+| H9 | Fixed. HTTP/2 request headers reject HTTP/1 connection-control names. Test: `http2_forbidden_connection_header_rejects`. |
+| M7 | Fixed in DATA/window hot paths by converting frame body lengths through checked `i32::try_from` before window arithmetic. Covered by `http2_padded_data_delivers_only_unpadded_body`, `http2_inbound_data_obeys_stream_window`, and `http2_settings_initial_window_shrink_blocks_until_window_update`. |
+| M14 | Fixed. HTTP/2 requests require `:authority` or a non-empty host equivalent. Test: `http2_missing_authority_rejects`. |
 
 ## Critical
 
