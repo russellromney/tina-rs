@@ -1000,8 +1000,9 @@ where
 /// Extension trait on [`tina::CallContext`] adding the blessed pattern
 /// `call_ctx.defer_scoped(scope, work).try_admit(...)`.
 ///
-/// Lives here (not on [`CallContext`] itself) because `tina` is the
-/// trait crate and the scope vocabulary belongs to the runtime crate.
+/// Lives here (not on [`tina::CallContext`] itself) because `tina` is
+/// the trait crate and the scope vocabulary belongs to the runtime
+/// crate.
 pub trait CallContextScopeExt<I>
 where
     I: Isolate,
