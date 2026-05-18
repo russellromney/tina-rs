@@ -68,6 +68,7 @@ impl Isolate for Probe {
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
     type Call = Infallible;
+    type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 
     fn handle(
@@ -115,6 +116,7 @@ impl Isolate for Svc {
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<SvcMsg>;
+    type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 
     fn handle(
@@ -165,6 +167,7 @@ impl Isolate for Client {
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<ClientMsg>;
+    type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 
     fn handle(
@@ -291,6 +294,7 @@ impl Isolate for ClosedProbe {
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
     type Call = Infallible;
+    type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 
     fn handle(
@@ -330,6 +334,7 @@ impl Isolate for ClosedSvc {
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<ClosedSvcMsg>;
+    type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 
     fn handle(
@@ -390,6 +395,7 @@ fn current_request_defer_preserves_caller_on_child_call_closed() {
         type Spawn = Infallible;
         type SpawnObserved = std::convert::Infallible;
         type Call = RuntimeCall<ClosedClientMsg>;
+        type Fact = ::std::convert::Infallible;
         type Shard = TestShard;
 
         fn handle(
@@ -445,6 +451,7 @@ impl Isolate for HoldingProbe {
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
     type Call = Infallible;
+    type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 
     fn handle(
@@ -479,6 +486,7 @@ impl Isolate for TimeoutSvc {
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<TimeoutSvcMsg>;
+    type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 
     fn handle(
@@ -538,6 +546,7 @@ fn current_request_defer_preserves_caller_on_child_call_timeout() {
         type Spawn = Infallible;
         type SpawnObserved = std::convert::Infallible;
         type Call = RuntimeCall<TimeoutClientMsg>;
+        type Fact = ::std::convert::Infallible;
         type Shard = TestShard;
 
         fn handle(
@@ -622,6 +631,7 @@ fn current_request_defer_respects_original_caller_timeout() {
         type Spawn = Infallible;
         type SpawnObserved = std::convert::Infallible;
         type Call = RuntimeCall<OuterTimeoutClientMsg>;
+        type Fact = ::std::convert::Infallible;
         type Shard = TestShard;
 
         fn handle(
@@ -757,6 +767,7 @@ impl Isolate for PlainSvc {
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<PlainSvcMsg>;
+    type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 
     fn handle(
@@ -807,6 +818,7 @@ impl Isolate for PlainClient {
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<PlainClientMsg>;
+    type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 
     fn handle(
@@ -916,6 +928,7 @@ impl Isolate for HandleSvc {
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<HandleSvcMsg>;
+    type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 
     fn handle(
@@ -1039,6 +1052,7 @@ fn isolate_call_cancelable_defer_replies_to_original_caller() {
         type Spawn = Infallible;
         type SpawnObserved = std::convert::Infallible;
         type Call = RuntimeCall<HClientMsg>;
+        type Fact = ::std::convert::Infallible;
         type Shard = TestShard;
 
         fn handle(
@@ -1090,6 +1104,7 @@ impl Isolate for CancelHoldingProbe {
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
     type Call = Infallible;
+    type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 
     fn handle(
@@ -1138,6 +1153,7 @@ fn isolate_call_cancelable_defer_cancel_path_answers_original_caller() {
         type Spawn = Infallible;
         type SpawnObserved = std::convert::Infallible;
         type Call = RuntimeCall<HClientMsg>;
+        type Fact = ::std::convert::Infallible;
         type Shard = TestShard;
 
         fn handle(
@@ -1238,6 +1254,7 @@ fn isolate_call_cancelable_defer_admits_before_dispatch_and_drains_on_owner_stop
         type Spawn = Infallible;
         type SpawnObserved = std::convert::Infallible;
         type Call = RuntimeCall<HClientMsg>;
+        type Fact = ::std::convert::Infallible;
         type Shard = TestShard;
 
         fn handle(
@@ -1428,6 +1445,7 @@ impl Isolate for AbandonSvc {
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
     type Call = Infallible;
+    type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 
     fn handle(
@@ -1461,6 +1479,7 @@ impl Isolate for AbandonClient {
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<AbandonClientMsg>;
+    type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 
     fn handle(
@@ -1548,6 +1567,7 @@ impl Isolate for ImmediateSvc {
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
     type Call = Infallible;
+    type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 
     fn handle(
@@ -1581,6 +1601,7 @@ impl Isolate for ImmClient {
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<ImmClientMsg>;
+    type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 
     fn handle(
@@ -1650,6 +1671,7 @@ impl Isolate for Audit {
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
     type Call = Infallible;
+    type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 
     fn handle(
@@ -1687,6 +1709,7 @@ impl Isolate for BatchSvc {
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
     type Call = Infallible;
+    type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 
     fn handle(
@@ -1731,6 +1754,7 @@ impl Isolate for BatchClient {
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<BatchClientMsg>;
+    type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 
     fn handle(
@@ -1940,6 +1964,7 @@ impl Isolate for Sink {
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
     type Call = Infallible;
+    type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 
     fn handle(
@@ -1969,6 +1994,7 @@ impl Isolate for ObsSvc {
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<ObsSvcMsg>;
+    type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 
     fn handle(
@@ -2022,6 +2048,7 @@ fn observed_send_defer_carries_request_context() {
         type Spawn = Infallible;
         type SpawnObserved = std::convert::Infallible;
         type Call = RuntimeCall<OClientMsg>;
+        type Fact = ::std::convert::Infallible;
         type Shard = TestShard;
 
         fn handle(
@@ -2085,6 +2112,7 @@ fn observed_send_defer_carries_request_context_on_full() {
         type Spawn = Infallible;
         type SpawnObserved = std::convert::Infallible;
         type Call = RuntimeCall<OClientMsg>;
+        type Fact = ::std::convert::Infallible;
         type Shard = TestShard;
 
         fn handle(
@@ -2151,6 +2179,7 @@ impl Isolate for TimerSvc {
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<TimerSvcMsg>;
+    type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 
     fn handle(
@@ -2199,6 +2228,7 @@ fn typed_runtime_call_defer_carries_request_context() {
         type Spawn = Infallible;
         type SpawnObserved = std::convert::Infallible;
         type Call = RuntimeCall<TClientMsg>;
+        type Fact = ::std::convert::Infallible;
         type Shard = TestShard;
 
         fn handle(

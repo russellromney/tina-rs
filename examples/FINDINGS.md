@@ -14,6 +14,29 @@ valid; the long-form history lives in
 Finding numbers are stable across phases — when a finding closes it
 moves to the [Closed](#closed) section below with the same number.
 
+### Protocol facts to replay (Phase 112)
+
+What felt good:
+
+- Adding `Fact = ProtocolFact` to a protocol isolate is one line on the
+  macro form. The `IntoRuntimeFact` bound at registration catches a
+  typoed fact type as a compile error instead of a runtime mystery.
+- `TraceProjection::protocol_facts()` and the named siblings let test
+  code compare only protocol behaviour without touching the broader
+  trace shape.
+- The compile-fail fixtures pin the diagnostic shape: an ordinary
+  isolate emitting a `ProtocolFact` shows "expected `Infallible`,
+  found `ProtocolFact`" right at the call site, which is the shape a
+  future reader will recognise.
+
+What felt rough:
+
+- `pending_facts` queue in the HTTP/2 connection isolate exists
+  because many helpers there return `Result` without an `effects`
+  vector. Refactoring those signatures to thread effects through
+  cleanly would let us emit facts at the point they become true
+  instead of draining at handler return; deferred.
+
 ### 2. ScatterCoord setup is heavy for the happy path
 
 **Surfaced by:** `specimen_sharded_fanout_read`.

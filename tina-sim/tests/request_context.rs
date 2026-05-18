@@ -49,6 +49,7 @@ impl Isolate for Probe {
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<ProbeMsg>;
+    type Fact = ::std::convert::Infallible;
     type Shard = DefShard;
 
     fn handle(
@@ -88,6 +89,7 @@ impl Isolate for Svc {
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<SvcMsg>;
+    type Fact = ::std::convert::Infallible;
     type Shard = DefShard;
 
     fn handle(
@@ -138,6 +140,7 @@ impl Isolate for Client {
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<ClientMsg>;
+    type Fact = ::std::convert::Infallible;
     type Shard = DefShard;
 
     fn handle(
@@ -223,6 +226,7 @@ impl Isolate for AbandonSvc {
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<AbandonMsg>;
+    type Fact = ::std::convert::Infallible;
     type Shard = DefShard;
 
     fn handle(
@@ -256,6 +260,7 @@ impl Isolate for AbandonClient {
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<AbandonClientMsg>;
+    type Fact = ::std::convert::Infallible;
     type Shard = DefShard;
 
     fn handle(
@@ -330,6 +335,7 @@ impl Isolate for ImmSvc {
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<ImmMsg>;
+    type Fact = ::std::convert::Infallible;
     type Shard = DefShard;
 
     fn handle(
@@ -363,6 +369,7 @@ impl Isolate for ImmClient {
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<ImmClientMsg>;
+    type Fact = ::std::convert::Infallible;
     type Shard = DefShard;
 
     fn handle(
@@ -430,6 +437,7 @@ impl Isolate for Audit {
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<AuditMsg>;
+    type Fact = ::std::convert::Infallible;
     type Shard = DefShard;
 
     fn handle(
@@ -467,6 +475,7 @@ impl Isolate for BatchSvc {
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<BatchMsg>;
+    type Fact = ::std::convert::Infallible;
     type Shard = DefShard;
 
     fn handle(
@@ -511,6 +520,7 @@ impl Isolate for BatchClient {
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<BatchClientMsg>;
+    type Fact = ::std::convert::Infallible;
     type Shard = DefShard;
 
     fn handle(
@@ -694,6 +704,7 @@ impl Isolate for CrossProbe {
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<CrossProbeMsg>;
+    type Fact = ::std::convert::Infallible;
     type Shard = NumberedShard;
 
     fn handle(
@@ -733,6 +744,7 @@ impl Isolate for CrossSvc {
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<CrossSvcMsg>;
+    type Fact = ::std::convert::Infallible;
     type Shard = NumberedShard;
 
     fn handle(
@@ -784,6 +796,7 @@ impl Isolate for CrossClient {
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<CrossClientMsg>;
+    type Fact = ::std::convert::Infallible;
     type Shard = NumberedShard;
 
     fn handle(

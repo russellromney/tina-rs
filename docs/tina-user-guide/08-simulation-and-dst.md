@@ -507,6 +507,24 @@ Replay case:
 This is what `SweepFailure::Display` and `ShrinkReport::Display`
 already print, so you can paste their output directly.
 
+## Protocol Facts In Replay
+
+`Effect::Fact(I::Fact)` rides the trace the same way other effects do.
+The simulator executes `Effect::Fact` identically to the live runtime,
+so saved DST cases pin protocol behaviour (HTTP/2 stream reset, body
+high-water, WebSocket session close, gRPC final status) without
+reading service reports.
+
+Use `TraceProjection::protocol_facts()` to compare only fact events,
+or a named sibling (`http2_streams`, `websocket_sessions`,
+`grpc_status`) for call-site clarity. A protocol fact the simulator
+cannot produce surfaces through
+`ProtocolReplayMismatch::UnsupportedProtocolFact` — typed honesty, not
+a fake pass.
+
+Blocking host helpers like `grpc_unary_call_h2c_blocking` are not on
+this path: they are not Tina isolates and they do not emit facts.
+
 ## What To Simulate
 
 Good Tina simulation targets:

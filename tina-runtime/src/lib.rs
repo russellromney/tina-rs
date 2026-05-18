@@ -60,6 +60,7 @@ mod drain_state;
 mod driver;
 mod errors;
 pub mod event_sink;
+mod fact;
 mod full_handling;
 mod host_burst;
 pub mod lifecycle;
@@ -279,6 +280,11 @@ pub use deferred::{
 use driver::DriverCompletion;
 pub use event_sink::{
     BoundedEventSink, DropPolicy, EventSinkDrain, EventSinkReport, EventSinkSurface,
+};
+pub use fact::{
+    GrpcStatusCode, GrpcStreamId, Http2CloseReason, Http2FlowControlSide, Http2ResetReason,
+    Http2StreamId, IntoRuntimeFact, ProtocolConnectionId, ProtocolDirection, ProtocolFact,
+    ProtocolFamily, RuntimeFact, WebSocketCloseReason, WebSocketSessionId,
 };
 pub use observation::{
     BoundAddressWaiter, ChildRestarted, ChildRestartedWaiter, IsolateCompleteWaiter,
@@ -961,6 +967,7 @@ where
         I::Spawn: IntoErasedSpawn<S, F> + 'static,
         I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
         I::Call: IntoErasedCall<I::Message> + 'static,
+        I::Fact: IntoRuntimeFact + 'static,
         Outbound: 'static,
         M: Mailbox<I::Message> + 'static,
     {
@@ -990,6 +997,7 @@ where
         I::Spawn: IntoErasedSpawn<S, F> + 'static,
         I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
         I::Call: IntoErasedCall<I::Message> + 'static,
+        I::Fact: IntoRuntimeFact + 'static,
         Outbound: 'static,
     {
         let address = self.register_entry::<I, Outbound>(
@@ -1069,6 +1077,7 @@ where
         I::Spawn: IntoErasedSpawn<S, F> + 'static,
         I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
         I::Call: IntoErasedCall<I::Message> + 'static,
+        I::Fact: IntoRuntimeFact + 'static,
         Outbound: 'static,
     {
         let address = self.register_with_capacity::<I, Outbound>(isolate, mailbox_capacity);
@@ -1093,6 +1102,7 @@ where
         I::Spawn: IntoErasedSpawn<S, F> + 'static,
         I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
         I::Call: IntoErasedCall<I::Message> + 'static,
+        I::Fact: IntoRuntimeFact + 'static,
         Outbound: 'static,
     {
         let address = self.register_with_capacity::<I, Outbound>(isolate, mailbox_capacity);
@@ -1127,6 +1137,7 @@ where
         I::Spawn: IntoErasedSpawn<S, F> + 'static,
         I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
         I::Call: IntoErasedCall<I::Message> + 'static,
+        I::Fact: IntoRuntimeFact + 'static,
         Outbound: 'static,
     {
         let address = self.register_with_capacity::<I, Outbound>(isolate, mailbox_capacity);
@@ -1160,6 +1171,7 @@ where
         I::Spawn: IntoErasedSpawn<S, F> + 'static,
         I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
         I::Call: IntoErasedCall<I::Message> + 'static,
+        I::Fact: IntoRuntimeFact + 'static,
         Outbound: 'static,
     {
         let mailbox = self
@@ -1219,6 +1231,7 @@ where
         I::Spawn: IntoErasedSpawn<S, F> + 'static,
         I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
         I::Call: IntoErasedCall<I::Message> + 'static,
+        I::Fact: IntoRuntimeFact + 'static,
         Outbound: 'static,
         Ctor: FnOnce(Address<I::Message, I::Reply>) -> I,
     {
@@ -1983,6 +1996,14 @@ where
             }
             ErasedEffect::ReplyTo { handle, message } => {
                 self.execute_reply_to(isolate_id, cause, handle, message, route_remote);
+                false
+            }
+            ErasedEffect::Fact(fact) => {
+                self.push_event(
+                    isolate_id,
+                    Some(cause),
+                    RuntimeEventKind::FactObserved { fact },
+                );
                 false
             }
         }
@@ -3830,6 +3851,7 @@ where
         I::Spawn: IntoErasedSpawn<S, F> + 'static,
         I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
         I::Call: IntoErasedCall<I::Message> + 'static,
+        I::Fact: IntoRuntimeFact + 'static,
         Outbound: 'static,
     {
         let isolate_id = IsolateId::new(self.next_isolate_id);
@@ -3869,6 +3891,7 @@ where
         I::Spawn: IntoErasedSpawn<S, F> + 'static,
         I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
         I::Call: IntoErasedCall<I::Message> + 'static,
+        I::Fact: IntoRuntimeFact + 'static,
         Outbound: Send + 'static,
     {
         let address = self.register_sendable_entry::<I, Outbound>(
@@ -3898,6 +3921,7 @@ where
         I::Spawn: IntoErasedSpawn<S, F> + 'static,
         I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
         I::Call: IntoErasedCall<I::Message> + 'static,
+        I::Fact: IntoRuntimeFact + 'static,
         Outbound: Send + 'static,
     {
         let mailbox = self
@@ -3936,6 +3960,7 @@ where
         I::Spawn: IntoErasedSpawn<S, F> + 'static,
         I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
         I::Call: IntoErasedCall<I::Message> + 'static,
+        I::Fact: IntoRuntimeFact + 'static,
         Outbound: Send + 'static,
     {
         let isolate_id = IsolateId::new(self.next_isolate_id);
@@ -3977,6 +4002,7 @@ where
         I::Spawn: IntoErasedSpawn<S, F> + 'static,
         I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
         I::Call: IntoErasedCall<I::Message> + 'static,
+        I::Fact: IntoRuntimeFact + 'static,
         Outbound: 'static,
     {
         if mailbox_capacity == 0 {
@@ -4282,6 +4308,7 @@ where
     I::Spawn: IntoErasedSpawn<S, F> + 'static,
     I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
     I::Call: IntoErasedCall<I::Message> + 'static,
+    I::Fact: IntoRuntimeFact + 'static,
     Outbound: 'static,
     S: Shard,
     F: MailboxFactory,
@@ -4353,6 +4380,7 @@ where
     I::Spawn: IntoErasedSpawn<S, F> + 'static,
     I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
     I::Call: IntoErasedCall<I::Message> + 'static,
+    I::Fact: IntoRuntimeFact + 'static,
     Outbound: Send + 'static,
     S: Shard,
     F: MailboxFactory,
@@ -4416,6 +4444,7 @@ where
     I::Spawn: IntoErasedSpawn<S, F> + 'static,
     I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
     I::Call: IntoErasedCall<I::Message> + 'static,
+    I::Fact: IntoRuntimeFact + 'static,
     Outbound: 'static,
     S: Shard,
     F: MailboxFactory,
@@ -4451,6 +4480,7 @@ where
             handle: tina::runtime_internal::deferred_into_handle(slot),
             message: ErasedMessage::Local(Box::new(reply)),
         },
+        Effect::Fact(fact) => ErasedEffect::Fact(fact.into_runtime_fact()),
     }
 }
 
@@ -4462,6 +4492,7 @@ where
     I::Spawn: IntoErasedSpawn<S, F> + 'static,
     I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
     I::Call: IntoErasedCall<I::Message> + 'static,
+    I::Fact: IntoRuntimeFact + 'static,
     Outbound: Send + 'static,
     S: Shard,
     F: MailboxFactory,
@@ -4497,6 +4528,7 @@ where
             handle: tina::runtime_internal::deferred_into_handle(slot),
             message: ErasedMessage::Sendable(Box::new(reply)),
         },
+        Effect::Fact(fact) => ErasedEffect::Fact(fact.into_runtime_fact()),
     }
 }
 
@@ -4536,6 +4568,7 @@ where
         handle: DeferredReplyHandle,
         message: ErasedMessage,
     },
+    Fact(RuntimeFact),
 }
 
 impl<S, F> ErasedEffect<S, F>
@@ -4557,6 +4590,7 @@ where
             Self::Call(_) => EffectKind::Call,
             Self::Batch(_) => EffectKind::Batch,
             Self::ReplyTo { .. } => EffectKind::ReplyTo,
+            Self::Fact(_) => EffectKind::Fact,
         }
     }
 
@@ -4918,6 +4952,7 @@ where
     I::Spawn: IntoErasedSpawn<S, F> + 'static,
     I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
     I::Call: IntoErasedCall<I::Message> + 'static,
+    I::Fact: IntoRuntimeFact + 'static,
     Outbound: 'static,
     S: Shard,
     F: MailboxFactory,
@@ -4955,6 +4990,7 @@ where
     I::Spawn: IntoErasedSpawn<S, F> + 'static,
     I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
     I::Call: IntoErasedCall<I::Message> + 'static,
+    I::Fact: IntoRuntimeFact + 'static,
     OutboundMsg: 'static,
     S: Shard,
     F: MailboxFactory,
@@ -4988,6 +5024,7 @@ where
     I::Spawn: IntoErasedSpawn<S, F> + 'static,
     I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
     I::Call: IntoErasedCall<I::Message> + 'static,
+    I::Fact: IntoRuntimeFact + 'static,
     Outbound: 'static,
     S: Shard,
     F: MailboxFactory,
@@ -5031,6 +5068,7 @@ where
     I::Spawn: IntoErasedSpawn<S, F> + 'static,
     I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
     I::Call: IntoErasedCall<I::Message> + 'static,
+    I::Fact: IntoRuntimeFact + 'static,
     Outbound: 'static,
     S: Shard,
     F: MailboxFactory,
@@ -5055,6 +5093,7 @@ where
     I::Spawn: IntoErasedSpawn<S, F> + 'static,
     I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
     I::Call: IntoErasedCall<I::Message> + 'static,
+    I::Fact: IntoRuntimeFact + 'static,
     OutboundMsg: 'static,
     S: Shard,
     F: MailboxFactory,

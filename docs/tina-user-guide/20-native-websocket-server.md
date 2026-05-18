@@ -207,6 +207,22 @@ The room specimen tests the path users are likely to copy:
 - `GET /health` and `GET /ready` expose simple liveness/readiness;
 - shutdown closes existing clients and rejects new room upgrades.
 
+## Replayable Protocol Facts
+
+The WebSocket connection isolate emits two replay-visible facts:
+
+- `ProtocolFact::WebSocketSlowPeerClosed` — the outbound queue exceeded
+  its byte or frame budget and the slow-peer guard initiated the
+  close. The fact carries the queued-frame and queued-byte counts at
+  the moment the guard fired so replay can see the pressure shape.
+- `ProtocolFact::WebSocketSessionClosed` — the session closed cleanly.
+  Carries the session id, a typed reason (`LocalInitiated`,
+  `SlowPeer`, etc.), and the optional wire close code.
+
+These ride the same `RuntimeEventKind::FactObserved` trace path that
+HTTP/2 uses. They are separate from per-session report counters:
+reports describe live operator state, facts describe replay truth.
+
 ## What This Is Not
 
 This is a usable bounded server surface, not the final WebSocket product

@@ -427,6 +427,7 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Isolate for Http
         send: tina::Outbound<std::convert::Infallible>,
         spawn: std::convert::Infallible,
         call: tina_runtime::RuntimeCall<HttpConnectionMsg>,
+        fact: tina_runtime::ProtocolFact,
         shard: S,
     }
 
@@ -1980,17 +1981,43 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
         if let Some(ws) = self.websocket.as_mut() {
             ws.last_pressure = Some(error.clone());
         }
-        let notify = match self.websocket.as_ref().map(|ws| ws.session_id) {
+        let session_snapshot = self
+            .websocket
+            .as_ref()
+            .map(|ws| (ws.session_id, ws.outbound.len(), ws.outbound.queued_bytes()));
+        let notify = match session_snapshot.as_ref().map(|s| s.0) {
             Some(session_id) => self.call_websocket_app_many(vec![
                 WebSocketSessionMsg::SessionPressure {
                     session_id,
                     error: error.clone(),
                 },
-                WebSocketSessionMsg::Pressure(error),
+                WebSocketSessionMsg::Pressure(error.clone()),
             ]),
-            None => self.call_websocket_app(WebSocketSessionMsg::Pressure(error)),
+            None => self.call_websocket_app(WebSocketSessionMsg::Pressure(error.clone())),
         };
-        batch(vec![notify, self.begin_close()])
+        let mut effects = vec![notify, self.begin_close()];
+        if let Some((session_id, queued_frames, queued_bytes)) = session_snapshot
+            && matches!(
+                error,
+                WebSocketError::OutboundQueueFull | WebSocketError::OutboundBytesFull
+            )
+        {
+            effects.push(tina::fact::<Self>(
+                tina_runtime::ProtocolFact::WebSocketSlowPeerClosed {
+                    session: tina_runtime::WebSocketSessionId::new(session_id.generation()),
+                    queued_frames: queued_frames as u32,
+                    queued_bytes: queued_bytes as u64,
+                },
+            ));
+            effects.push(tina::fact::<Self>(
+                tina_runtime::ProtocolFact::WebSocketSessionClosed {
+                    session: tina_runtime::WebSocketSessionId::new(session_id.generation()),
+                    reason: tina_runtime::WebSocketCloseReason::SlowPeer,
+                    code: None,
+                },
+            ));
+        }
+        batch(effects)
     }
 
     fn arm_websocket_close_deadline(&mut self) -> Effect<Self> {
@@ -2020,7 +2047,16 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
             return noop();
         };
         if ws.close_sent && !ws.close_received && ws.close_generation == generation {
-            return self.begin_close();
+            let session = tina_runtime::WebSocketSessionId::new(ws.session_id.generation());
+            let code = ws.last_close_code.map(|c| c.0);
+            return batch(vec![
+                tina::fact::<Self>(tina_runtime::ProtocolFact::WebSocketSessionClosed {
+                    session,
+                    reason: tina_runtime::WebSocketCloseReason::LocalInitiated,
+                    code,
+                }),
+                self.begin_close(),
+            ]);
         }
         noop()
     }

@@ -134,6 +134,7 @@ impl Isolate for PanicIsolate {
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
     type Call = Infallible;
+    type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 
     fn handle(
@@ -167,6 +168,7 @@ impl Isolate for PanicSender {
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
     type Call = Infallible;
+    type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 
     fn handle(
@@ -195,6 +197,7 @@ impl Isolate for OrderIsolate {
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
     type Call = Infallible;
+    type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 
     fn handle(

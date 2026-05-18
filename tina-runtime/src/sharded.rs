@@ -977,6 +977,7 @@ where
     // adapter never actually issues a runtime call; the channel exists to
     // satisfy the simulator's `RuntimeCallable` bound.
     type Call = RuntimeCall<M>;
+    type Fact = Infallible;
     type Shard = S;
 
     fn handle(&mut self, msg: M, _ctx: &mut Context<'_, S, Self::Reply>) -> Effect<Self> {

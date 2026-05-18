@@ -21,6 +21,7 @@ impl Isolate for Sink {
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
     type Call = Infallible;
+    type Fact = Infallible;
     type Shard = SingleShard;
 
     fn handle(

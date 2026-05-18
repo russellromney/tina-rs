@@ -120,6 +120,30 @@ impl GrpcStatusCode {
     }
 }
 
+/// Maps the local [`GrpcStatusCode`] to the trace-stable
+/// [`tina_runtime::GrpcStatusCode`] used by replayable facts.
+pub fn classify_grpc_status_code(status: &GrpcStatus) -> tina_runtime::GrpcStatusCode {
+    match status.code {
+        GrpcStatusCode::Ok => tina_runtime::GrpcStatusCode::Ok,
+        GrpcStatusCode::Cancelled => tina_runtime::GrpcStatusCode::Cancelled,
+        GrpcStatusCode::Unknown => tina_runtime::GrpcStatusCode::Unknown,
+        GrpcStatusCode::InvalidArgument => tina_runtime::GrpcStatusCode::InvalidArgument,
+        GrpcStatusCode::DeadlineExceeded => tina_runtime::GrpcStatusCode::DeadlineExceeded,
+        GrpcStatusCode::NotFound => tina_runtime::GrpcStatusCode::NotFound,
+        GrpcStatusCode::AlreadyExists => tina_runtime::GrpcStatusCode::AlreadyExists,
+        GrpcStatusCode::PermissionDenied => tina_runtime::GrpcStatusCode::PermissionDenied,
+        GrpcStatusCode::ResourceExhausted => tina_runtime::GrpcStatusCode::ResourceExhausted,
+        GrpcStatusCode::FailedPrecondition => tina_runtime::GrpcStatusCode::FailedPrecondition,
+        GrpcStatusCode::Aborted => tina_runtime::GrpcStatusCode::Aborted,
+        GrpcStatusCode::OutOfRange => tina_runtime::GrpcStatusCode::OutOfRange,
+        GrpcStatusCode::Unimplemented => tina_runtime::GrpcStatusCode::Unimplemented,
+        GrpcStatusCode::Internal => tina_runtime::GrpcStatusCode::Internal,
+        GrpcStatusCode::Unavailable => tina_runtime::GrpcStatusCode::Unavailable,
+        GrpcStatusCode::DataLoss => tina_runtime::GrpcStatusCode::DataLoss,
+        GrpcStatusCode::Unauthenticated => tina_runtime::GrpcStatusCode::Unauthenticated,
+    }
+}
+
 /// A gRPC status plus optional message.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GrpcStatus {
