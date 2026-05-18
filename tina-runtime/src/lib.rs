@@ -62,6 +62,7 @@ mod errors;
 pub mod event_sink;
 mod full_handling;
 mod host_burst;
+pub mod lifecycle;
 mod live_report;
 mod local_permit;
 mod local_system;
@@ -73,6 +74,7 @@ pub mod persistence;
 #[allow(unsafe_code)]
 pub mod pool;
 pub mod pressure;
+pub mod scope;
 pub mod service_pressure;
 pub mod sharded;
 pub mod shared_scope;
@@ -94,6 +96,12 @@ pub use full_handling::{
     FullPolicyMode,
 };
 pub use host_burst::{HostBurstOutcomes, HostBurstSnapshot, HostBurstWaitError};
+pub use lifecycle::{
+    CloseAdmission, CloseOutcome, ComponentKind, Health, Lifecycle, READINESS_UNKNOWN_REASON,
+    Readiness, ReadinessReason, ReadinessToken, ResourceCloseReport, ResourceKind,
+    ServiceShutdownReport, ServiceTopology, ShutdownChoreography, ShutdownStep, ShutdownStepReport,
+    StepOutcome, TopologyComponent,
+};
 pub use local_permit::{
     LocalPermitFull, LocalPermitGate, LocalPermitName, LocalPermitReleaseError, LocalPermitReport,
     Permit, dropped_permit_count,
@@ -239,6 +247,13 @@ pub use observation::{
 };
 pub use observer::TraceObserver;
 pub use pressure::{MailboxBudget, PressureReport, PressureSummary, format_pressure_line};
+pub use scope::{
+    CallContextScopeExt, DeferScopedThrough, DeferredScopedCall, RequestScope, RequestScopeId,
+    RequestScopeInsertError, RequestScopeRemoveError, RequestScopeSet,
+    RequestScopeSetCapacityReport, ScopeCancelCause, ScopeCancelReport, ScopeChildReport,
+    ScopeRegisterError, ScopeRegisterSharedError, ScopedAdmitError, ScopedCallHandle,
+    ScopedReplyError, scope_register,
+};
 pub use service_pressure::{ServicePressureReport, ServicePressureSurface, ServiceSurfaceState};
 pub use shared_scope::{SharedCapacityScope, SharedLease, SharedScopeFull, SharedScopeReport};
 pub use tcp_loops::{LoopStep, ReadExactStep, TcpReadExact, TcpReadToEof, TcpWriteAll};

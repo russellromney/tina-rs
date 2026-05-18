@@ -1,4 +1,6 @@
-use system_metrics_shipper::{RunConfig, run};
+use system_metrics_shipper::{RunConfig, lifecycle_for_drain_stage, run};
+use tina_runtime::DrainStage;
+use tina_runtime::lifecycle::{Lifecycle, ResourceKind, ShutdownStep};
 
 #[test]
 fn metrics_shipper_steady_overload_and_drain_are_typed() {
@@ -60,6 +62,75 @@ fn metrics_shipper_steady_overload_and_drain_are_typed() {
     assert!(
         shutdown.stats.batches_flushed_on_drain >= 1,
         "shipper stats must count the drain batch",
+    );
+
+    // Typed lifecycle surfaces. The shipper is non-HTTP so the same
+    // helper proves it does not become HTTP-shaped by accident.
+    let topology = &shutdown.topology;
+    assert_eq!(topology.service, "system_metrics_shipper");
+    assert_eq!(topology.state, Lifecycle::Ready);
+    let component_kinds: std::collections::HashMap<&str, &str> = topology
+        .components
+        .iter()
+        .map(|c| (c.name.as_str(), c.kind))
+        .collect();
+    assert_eq!(component_kinds.get("shipper"), Some(&"isolate"));
+    assert_eq!(component_kinds.get("sink"), Some(&"isolate"));
+    assert_eq!(component_kinds.get("flush_tick"), Some(&"timer"));
+
+    assert_eq!(shutdown.health.service, "system_metrics_shipper");
+    assert_eq!(shutdown.health.state, Lifecycle::Stopped);
+    let health_line = shutdown.health.summary_line();
+    assert!(health_line.contains("state=stopped"), "{health_line}");
+    assert!(
+        health_line.contains("service=system_metrics_shipper"),
+        "{health_line}",
+    );
+
+    // Typed lifecycle transition: same shape as `mini_saas_api`, even
+    // though the shipper drains itself rather than being host-driven.
+    assert_eq!(
+        shutdown.lifecycle_transitions,
+        vec![
+            Lifecycle::Starting,
+            Lifecycle::Ready,
+            Lifecycle::Draining,
+            Lifecycle::Stopped,
+        ],
+    );
+
+    let choreo = &shutdown.shutdown_choreography;
+    assert!(choreo.clean, "shutdown choreography unclean: {choreo:#?}");
+    let step_kinds: Vec<ShutdownStep> = choreo.steps.iter().map(|s| s.step).collect();
+    assert_eq!(
+        step_kinds,
+        vec![
+            ShutdownStep::DrainInFlight,
+            ShutdownStep::CloseResource,
+            ShutdownStep::StopOwner,
+        ],
+        "non-HTTP shutdown step order: {:#?}",
+        choreo.steps,
+    );
+    let close = &choreo.closes[0];
+    assert_eq!(close.name, "sink.isolate");
+    assert_eq!(close.kind, ResourceKind::Child);
+
+    // The drain stage → Lifecycle mapping is the bridge between the
+    // existing `DrainState` helper and the new typed `Lifecycle`
+    // vocabulary. Keep them aligned so future shipper-shaped specimens
+    // can derive Lifecycle from drain state in one call.
+    assert_eq!(
+        lifecycle_for_drain_stage(DrainStage::Open),
+        Lifecycle::Ready
+    );
+    assert_eq!(
+        lifecycle_for_drain_stage(DrainStage::Draining),
+        Lifecycle::Draining,
+    );
+    assert_eq!(
+        lifecycle_for_drain_stage(DrainStage::Stopped),
+        Lifecycle::Stopped,
     );
 }
 

@@ -9,6 +9,8 @@ use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::time::Duration;
 
+use tina_runtime::lifecycle::{Health, Lifecycle, ServiceShutdownReport, ServiceTopology};
+
 pub mod tina_impl;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -19,6 +21,27 @@ pub enum RunMode {
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct RunReport {
+    /// Typed startup topology built by the service. Names every isolate,
+    /// bridge, pool, and listener the service registered, plus the
+    /// pressure surfaces those resources expose.
+    pub topology: Option<ServiceTopology>,
+    /// Health snapshot taken right before the host begins the shutdown
+    /// choreography. Pairs the typed [`tina_runtime::lifecycle::Lifecycle`]
+    /// the controller is in with the live pressure report.
+    pub health_pre_shutdown: Option<Health>,
+    /// Typed shutdown choreography report. Records every step the host
+    /// drove (close ingress, drain in-flight, close DB, close pool, stop
+    /// listeners, stop runtime), plus per-resource close reports. The
+    /// [`tina_runtime::lifecycle::ServiceShutdownReport::clean`] flag is
+    /// the typed counterpart to the existing `shutdown_clean` boolean.
+    pub shutdown_report: Option<ServiceShutdownReport>,
+    /// Lifecycle states the service was observed in, in order. The
+    /// canonical sequence is
+    /// `[Starting, Ready, Draining, Stopped]`. Built explicitly by the
+    /// host so the plan's "service starts NotReady, becomes Ready,
+    /// enters Draining, then Stopped" assertion is a typed witness
+    /// rather than implied by separate fields.
+    pub lifecycle_transitions: Vec<Lifecycle>,
     pub health_ok: bool,
     pub ready_ok: bool,
     pub created_item: bool,

@@ -1,6 +1,9 @@
 use std::collections::HashMap;
 
 use mini_saas_api::{RunMode, UserObservation, run};
+use tina_runtime::lifecycle::{
+    CloseAdmission, CloseOutcome, Lifecycle, ResourceKind, ShutdownStep,
+};
 
 #[test]
 fn smoke_covers_service_layers() {
@@ -171,6 +174,121 @@ fn smoke_covers_service_layers() {
     assert_eq!(capacity["db.full"], "0");
     assert_eq!(capacity["http.body_timeout"], "0");
     assert_eq!(capacity["http.body_io_error"], "0");
+
+    // Typed lifecycle transitions: the plan's "service starts NotReady,
+    // becomes Ready, enters Draining, then Stopped" assertion. The
+    // canonical sequence is recorded explicitly by the host so a
+    // regression that skips a state is caught here, not implied by
+    // separate field equality.
+    assert_eq!(
+        report.lifecycle_transitions,
+        vec![
+            Lifecycle::Starting,
+            Lifecycle::Ready,
+            Lifecycle::Draining,
+            Lifecycle::Stopped,
+        ],
+        "lifecycle transition sequence regressed: {:?}",
+        report.lifecycle_transitions,
+    );
+
+    // Typed topology: every named started component is reachable via
+    // typed report, not just substring matching in the legacy line.
+    let topology = report
+        .topology
+        .as_ref()
+        .expect("typed ServiceTopology must be populated");
+    assert_eq!(topology.service, "mini_saas_api");
+    assert_eq!(topology.state, Lifecycle::Ready);
+    let component_by_name: HashMap<&str, &str> = topology
+        .components
+        .iter()
+        .map(|c| (c.name.as_str(), c.kind))
+        .collect();
+    // Each component must be the typed kind we expect; a regression
+    // that registers `outbound.pool` as a "bridge" would be caught
+    // here, not just by reading the legacy line.
+    assert_eq!(component_by_name.get("main.listener"), Some(&"listener"));
+    assert_eq!(component_by_name.get("notify.listener"), Some(&"listener"));
+    assert_eq!(component_by_name.get("controller"), Some(&"isolate"));
+    assert_eq!(component_by_name.get("db.bridge"), Some(&"bridge"));
+    assert_eq!(component_by_name.get("outbound.pool"), Some(&"pool"));
+    // Listener components carry the bound socket address.
+    let main_listener = topology
+        .components
+        .iter()
+        .find(|c| c.name == "main.listener")
+        .unwrap();
+    assert!(
+        main_listener.address.contains(':'),
+        "main.listener should carry a bound socket address: {:?}",
+        main_listener.address,
+    );
+
+    // Typed health snapshot is in Stopped state with a non-empty
+    // summary line that mentions the service and the typed state.
+    let health = report
+        .health_pre_shutdown
+        .as_ref()
+        .expect("health snapshot populated");
+    assert_eq!(health.service, "mini_saas_api");
+    assert_eq!(health.state, Lifecycle::Stopped);
+    let health_line = health.summary_line();
+    assert!(health_line.contains("state=stopped"), "{health_line}");
+    assert!(
+        health_line.contains("service=mini_saas_api"),
+        "{health_line}",
+    );
+
+    // Typed shutdown report: every step the host drove is named, in
+    // order, with its outcome. The drain step recorded the in-flight
+    // notify finishing; the outbound pool drained cleanly; runtime
+    // stopped cleanly.
+    let shutdown = report
+        .shutdown_report
+        .as_ref()
+        .expect("typed ServiceShutdownReport must be populated");
+    assert!(shutdown.clean, "{shutdown:#?}");
+    let step_kinds: Vec<ShutdownStep> = shutdown.steps.iter().map(|s| s.step).collect();
+    assert_eq!(
+        step_kinds,
+        vec![
+            ShutdownStep::StopIngress,
+            ShutdownStep::DrainInFlight,
+            ShutdownStep::CloseResource, // db bridge
+            ShutdownStep::CloseResource, // outbound pool
+            ShutdownStep::CloseResource, // notify listener
+            ShutdownStep::CloseResource, // main listener
+            ShutdownStep::StopOwner,
+        ],
+        "shutdown step order: {:?}",
+        shutdown.steps,
+    );
+    assert!(
+        shutdown.steps.iter().all(|s| s.outcome.is_clean()),
+        "unclean step outcomes: {:#?}",
+        shutdown.steps,
+    );
+    let close_names: Vec<&str> = shutdown.closes.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(
+        close_names,
+        vec![
+            "db.bridge",
+            "outbound.pool",
+            "notify.listener",
+            "main.listener",
+        ],
+    );
+    let outbound_close = &shutdown.closes[1];
+    assert_eq!(outbound_close.name, "outbound.pool");
+    assert_eq!(outbound_close.kind, ResourceKind::Pool);
+    assert_eq!(outbound_close.admission, CloseAdmission::Drain);
+    assert!(matches!(outbound_close.outcome, CloseOutcome::Clean));
+    assert!(
+        outbound_close.details.contains("requested=1"),
+        "{:?}",
+        outbound_close.details,
+    );
 }
 
 #[test]
