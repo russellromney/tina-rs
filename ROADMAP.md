@@ -331,11 +331,12 @@ and reviews live under `.intent/phases/`.
   `ws`/`wss`, slow-peer eviction, per-session report, and the
   `WebSocketMemberTable` helper), cancelable deferred admission, bridge
   convention audit, production service skeleton refresh, compile-time rails,
-  mailbox-first service helpers, and host-control ergonomics. These are
-  recorded in `CHANGELOG.md`; the next work is production client/bridge
-  breadth, request-scoped cancellation, lifecycle/health/topology,
-  observability and capacity product, proof harnesses and replay ops, and
-  typed config/protocol state safety.
+  mailbox-first service helpers, host-control ergonomics, production
+  client/bridge breadth, request-scoped cancellation, lifecycle/health/topology,
+  observability and capacity product, proof harnesses and replay ops, and the
+  typed config/protocol state safety split event/request rail. These are
+  recorded in `CHANGELOG.md`; the remaining near-term roadmap starts from the
+  workflow-pending ergonomics and protocol-fact replay follow-ups below.
 
 ## Near-term roadmap
 
@@ -344,16 +345,9 @@ framework before public release-story work.
 
 | Phase | Purpose |
 |---|---|
-| **104 Production client / bridge breadth** | Broaden real client/bridge coverage: AWS DynamoDB/SNS/Secrets Manager, DNS/connect policy, supplied-client ownership, bridge lifecycle conventions, and honest late-result/cancel metrics. Plan: `.intent/phases/104-production-client-bridge-breadth/plan.md`. |
-| **105 Request-scoped cancellation** | Make "this request is gone; stop its children" a first-class Tina pattern. Scope cancellation covers Tina-owned rails strongly and external bridges honestly, with bounded storage and visible late results. Plan: `.intent/phases/105-request-scoped-cancellation/plan.md`. |
-| **106 Lifecycle, health, and topology** | Shipped. Typed `Lifecycle` / `Readiness` / `Health` / `ServiceTopology` / `ShutdownChoreography` / `ResourceCloseReport` vocabulary in `tina_runtime::lifecycle`; `mini_saas_api` and `system_metrics_shipper` updated to use the helpers (HTTP and non-HTTP shapes). Plan: `.intent/phases/106-lifecycle-health-topology/plan.md`. |
-| **107 Observability and capacity product** | Turn pressure/capacity into a user product: runtime pressure summary, shard-local weighted capacity scopes, bounded event sink, and CI-friendly capacity assertions. Plan: `.intent/phases/107-observability-capacity-product/plan.md`. |
-| **108 Proof harnesses and replay ops** | Build the proof machinery: load/soak harness, bad-peer harness, live trace to sim replay, shrink workflow, and clear fast-vs-soak CI gate shape. Plan: `.intent/phases/108-proof-harnesses-and-replay-ops/plan.md`. |
-| **109 Typed config and protocol-state safety** | Push more common LLM/user mistakes into compile errors: public request/internal event split, capability handles, typed config/budget manifests, private protocol typestate, and friendly diagnostics. Plan: `.intent/phases/109-typed-config-protocol-state-safety/plan.md`. |
 | **110 Workflow pending ergonomics** | Ship the specimen-proven pending workflow helpers: `then_event`, `PendingReplies::park`, guarded parking, `WaitList<K, R>`, and `CancelableWork<K, Q, R>`. Keep caller authority, capacity, tickets, late replies, and pressure visible. Plan: `.intent/phases/110-workflow-pending-ergonomics/plan.md`. |
 | **Protocol facts as runtime/simulator trace events** | Phase 103 follow-up. Plumb the protocol facts that today live as bounded counters on `Http2ConnectionReport`, `BodyMetrics`, `WebSocketMemberTableReport`, and `GrpcStatus` (stream opened/closed/reset, flow-control full, body high-water, WebSocket slow-peer close, gRPC final status sent/received) through `RuntimeEventKind` on the trace stream so they round-trip through `tina-sim` replay. Required: stable trace hashes that don't churn for unrelated effects, one DST replay case driven by a protocol-fact trace event, and a copied specimen migration showing the user-debug shape. Rides with the proof-harness / replay-ops capability cluster — Phase 108 already proves the replay shape for runtime events. |
 | **Join-all / stream-select helpers** | First-success `CallGroup` exists. Add join-all and stream-select only when a real specimen needs them, preserving branch identity, bounded pending/result storage, explicit cancellation, partial results, and late-reply trace truth. |
-| **Event/request split proposal** | Future IDD candidate pulled by `system_cache_with_fill`: split fire-and-forget mailbox events from caller-authority requests in the public authoring model so request/reply traffic cannot accidentally live only in `handle`. This follows Phase 100's first capability handles; see sketch below. |
 | **Alpaca rename** | Before public launch, rename the project/crates/docs away from Tina to Alpaca so the lineage is respectful and clear: independently maintained Rust framework, inspired by Peter Mbanugo's Tina/Odin and Seastar, not an official Tina port. |
 | **Barend Biesheuvel visible flow ergonomics** | Optional high-level ergonomics only after the local runtime core feels boring: a `flow!`-style authoring surface that preserves named suspension points, visible failure policy, trace step names, and ordinary Tina message/effect expansion. No fake async, no hidden retries, no hidden queues. |
 
@@ -424,69 +418,6 @@ Whole-framework ergonomics phase seed:
 - **Cheap-model proof.** Give the docs/skeleton to a fresh model, record what it
   wires wrong, and either make the mistake a compile error or fix the copied
   path.
-
-### Event/request split proposal
-
-`system_cache_with_fill` exposed a general footgun in the current authoring
-surface: a request/reply variant can be handled in `handle`, compile cleanly,
-and still be rejected at runtime as `UnsupportedMessage` when the caller uses
-`call(...)` / `call_blocking(...)`, because caller authority enters
-`handle_call`. That behavior is honest, but the safer Tina move is to make the
-wrong shape unrepresentable.
-
-Target model:
-
-```rust
-trait Isolate {
-    type Event;
-    type Request;
-    type Reply;
-
-    fn handle_event(&mut self, event: Self::Event, ctx: &mut Context<...>) -> Effect<Self>;
-
-    fn handle_request(
-        &mut self,
-        request: Self::Request,
-        call: CallContext<'_, Self>,
-    ) -> Effect<Self>;
-}
-```
-
-Authoring should make the domain split visible:
-
-```rust
-enum CacheEvent {
-    FillDone { key: String, generation: u64, result: SleepReply },
-}
-
-enum CacheRequest {
-    Get { key: String },
-    Invalidate { key: String },
-    Stats,
-}
-```
-
-Runtime work returns as events; external callers enter through requests. A
-request is not "just a message with a timeout" because it carries reply
-authority. The type system should teach that distinction to humans and LLMs.
-
-Likely implementation path:
-
-- add an opt-in macro form first, for example
-  `#[tina_runtime::isolate(event = CacheEvent, request = CacheRequest, reply = CacheReply)]`;
-- preserve the existing single-`message` form during migration;
-- have registration return or expose typed event and request addresses, or an
-  isolate handle with `.events()` and `.requests()` views, while both still
-  point at the same isolate id/generation/mailbox internally;
-- update `send(...)` to accept only event addresses and `call(...)` to accept
-  only request addresses in the new surface;
-- migrate the cache specimen, service skeleton, pools, bridges, and selected
-  protocol examples before considering a core trait-breaking cutover.
-
-Non-goals: no doc-only warning, no heuristic "maybe this `handle` arm should
-have been callable" lint as the final answer, and no fake async surface. The
-point is to sharpen Tina's model: events are mailbox facts; requests are
-caller-authority facts; runtime work returns as events.
 
 ### Mailbox-first devex polish sketch
 
