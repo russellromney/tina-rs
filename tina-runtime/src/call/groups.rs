@@ -7,8 +7,6 @@
 //! (job id, room name, customer id) and each request gets its own
 //! admission.
 
-
-
 use super::pending::{PendingCancelableCall, PendingCancelableTicket};
 
 /// Move-only witness for one admitted [`PendingCancelableCall`]. Carries
