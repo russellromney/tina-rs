@@ -1,4 +1,4 @@
-use super::driver::{DriverCompletion, DriverShutdownError, RuntimeDriver};
+use super::driver::{DriverCompletion, DriverResourceReport, DriverShutdownError, RuntimeDriver};
 use super::*;
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;

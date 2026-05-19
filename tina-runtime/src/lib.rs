@@ -119,6 +119,7 @@ pub use local_system::{
 };
 pub use multi_shard::{MultiShardRuntime, MultiShardRuntimeConfig};
 
+mod host_call;
 mod service_handle;
 pub use service_handle::{SendOnlyServiceHandle, ServiceHandle, SplitServiceHandle};
 
@@ -238,7 +239,7 @@ pub use wait_list::{
 };
 
 pub use driver::os_signal_capture_supported;
-use driver::{BetelgeuseDriver, DriverResourceReport, DriverShutdownError, RuntimeDriver};
+use driver::{BetelgeuseDriver, DriverShutdownError, RuntimeDriver};
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum MessageCallContext {
@@ -607,32 +608,9 @@ where
         }
     }
 
-    /// Returns whether the runtime has any in-flight calls that have not
-    /// yet been delivered. Tests use this to know when stepping further
-    /// can produce more I/O completions.
-    pub fn has_in_flight_calls(&self) -> bool {
-        !self.in_flight_calls.is_empty()
-            || self.driver.has_pending()
-            || !self.pending_isolate_calls.is_empty()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn io_pending_count(&self) -> usize {
-        self.driver.io_pending_count()
-    }
-
-    pub(crate) fn resource_report(&self) -> DriverResourceReport {
-        self.driver.resource_report()
-    }
-
     /// Returns a shared reference to the shard.
     pub const fn shard(&self) -> &S {
         &self.shard
-    }
-
-    /// Returns the accumulated runtime trace.
-    pub fn trace(&self) -> &[RuntimeEvent] {
-        &self.trace[self.trace_start..]
     }
 
     /// Returns the active trace retention policy.
@@ -653,139 +631,6 @@ where
     /// Returns the number of trace events dropped by the retention policy.
     pub const fn trace_dropped(&self) -> u64 {
         self.trace_dropped
-    }
-
-    #[cfg(test)]
-    pub(crate) fn trace_storage_len(&self) -> usize {
-        self.trace.len()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn entry_count(&self) -> usize {
-        self.entries.len()
-    }
-
-    /// Walks the current trace and returns a counted summary of
-    /// pressure-shaped events (mailbox-full, reply-path-full,
-    /// send-full, lifecycle-closed). See [`PressureSummary`].
-    pub fn pressure_summary(&self) -> pressure::PressureSummary {
-        pressure::PressureSummary::from_events(self.trace.iter())
-    }
-
-    /// Registers a typed waiter for the next `tcp_bind` completion.
-    ///
-    /// Returns a [`BoundAddressWaiter`] that the host can `wait` on to
-    /// receive the bound `SocketAddr` (or a typed error). Each call returns
-    /// a fresh waiter; multiple registrations are served in registration
-    /// order as `tcp_bind` calls complete. The waiter is bounded one-slot:
-    /// no hidden queue is created.
-    ///
-    /// The trace remains the source of audit truth: this method does not
-    /// add a new event class, it only surfaces the bound address that
-    /// [`CallOutput::TcpBound`] already carries inside the runtime.
-    pub fn observe_next_bound(&mut self) -> BoundAddressWaiter {
-        self.observation.register_bound()
-    }
-
-    /// Registers a typed waiter for the next `tls_bind` completion.
-    /// Mirrors [`Self::observe_next_bound`] for the TLS rail. The
-    /// waiter resolves with the bound `SocketAddr` carried by
-    /// [`CallOutput::TlsBound`], or with the typed runtime error.
-    pub fn observe_next_tls_bound(&mut self) -> BoundAddressWaiter {
-        self.observation.register_tls_bound()
-    }
-
-    /// Registers a typed waiter for the targeted isolate's `IsolateStopped`.
-    ///
-    /// The waiter resolves the next time the isolate identified by `address`
-    /// (matched by isolate id and generation) emits
-    /// [`RuntimeEventKind::IsolateStopped`]. Replaces `Arc<AtomicBool>` done
-    /// flags in user code. Bounded one-slot.
-    pub fn observe_isolate_complete<M, R>(
-        &mut self,
-        address: Address<M, R>,
-    ) -> observation::IsolateCompleteWaiter {
-        self.observation
-            .register_isolate_complete(address.isolate(), address.generation())
-    }
-
-    /// Registers a typed waiter for the next runtime call of `call_kind`
-    /// issued by the isolate identified by `address` that completes (success
-    /// or failure).
-    ///
-    /// Replaces `complete_trace()` polling for a specific
-    /// `CallKind::TcpStreamClose` / `CallKind::Sleep` / etc. event in user
-    /// code. Bounded one-slot; the runtime drops the slot once a matching
-    /// completion lands.
-    pub fn observe_operation_done<M, R>(
-        &mut self,
-        address: Address<M, R>,
-        call_kind: CallKind,
-    ) -> observation::OperationDoneWaiter {
-        self.observation
-            .register_operation_done(address.isolate(), call_kind)
-    }
-
-    /// Registers a typed waiter for the next supervised restart of any
-    /// direct child of the parent identified by `parent_address`.
-    ///
-    /// The resolved [`observation::ChildRestarted`] carries the new child
-    /// incarnation's isolate id and generation. Bounded one-slot.
-    pub fn observe_child_restarted<M, R>(
-        &mut self,
-        parent_address: Address<M, R>,
-    ) -> observation::ChildRestartedWaiter {
-        self.observation
-            .register_child_restarted(parent_address.isolate())
-    }
-
-    /// Registers a typed result waiter for the isolate at `address`.
-    ///
-    /// Resolves when the isolate stops via [`tina::stop_with`] with a value
-    /// of type `T`. Single-claim per `(IsolateId, AddressGeneration)`.
-    /// Eager errors:
-    ///
-    /// - `AlreadyStopped` — isolate is no longer alive at this generation
-    ///   (no replay cache);
-    /// - `AlreadyClaimed` — another waiter holds the slot;
-    /// - `ObservationFull` — observation cap reached.
-    ///
-    /// `wait` outcomes: `Timeout`, `RuntimeStopped`, `StoppedWithoutResult`
-    /// (isolate used `stop()` not `stop_with(_)`), `TypeMismatch`.
-    pub fn observe_result<T, M, R>(
-        &mut self,
-        address: Address<M, R>,
-    ) -> Result<observation::IsolateResultWaiter<T>, observation::ResultWaitError>
-    where
-        T: Send + 'static,
-    {
-        let isolate = address.isolate();
-        let generation = address.generation();
-        let alive = self.entries.iter().any(|entry| {
-            entry.id == isolate && entry.generation == generation && !entry.stopped.get()
-        });
-        if !alive {
-            return Err(observation::ResultWaitError::AlreadyStopped);
-        }
-        self.observation
-            .register_isolate_result::<T>(isolate, generation)
-    }
-
-    /// Sets the trace retention policy for future events.
-    ///
-    /// Lowering retention trims the current trace immediately so callers can
-    /// rely on the memory bound after this returns.
-    pub fn set_trace_retention(&mut self, retention: TraceRetention) {
-        self.trace_retention = retention;
-        self.enforce_trace_retention();
-    }
-
-    /// Sets the live trace observer. `None` detaches. See
-    /// [`crate::TraceObserver`] for hook rules. On `ThreadedRuntime` /
-    /// `LocalSystem`, prefer the build-time wiring so no events fire
-    /// before the hook is in place.
-    pub fn set_trace_observer(&mut self, observer: Option<Arc<dyn TraceObserver>>) {
-        self.trace_observer = observer;
     }
 
     /// Cancels every in-flight runtime-owned call ahead of shutdown.
@@ -1215,72 +1060,6 @@ where
 
     /// Attempts to enqueue a typed message into one registered isolate.
     ///
-    /// This is the runtime-side ingress surface for tests and later drivers.
-    /// It preserves the mailbox's typed `Full` and `Closed` outcomes, while
-    /// still treating unknown isolate IDs as programmer error.
-    pub fn try_send<M: 'static, R>(
-        &self,
-        address: Address<M, R>,
-        message: M,
-    ) -> Result<(), TrySendError<M>> {
-        if address.shard() != self.shard.id() {
-            panic!(
-                "cross-shard runtime ingress is out of scope in this slice: target shard {} != runtime shard {}",
-                address.shard().get(),
-                self.shard.id().get(),
-            );
-        }
-
-        let Some(entry) = self
-            .entries
-            .iter()
-            .find(|entry| entry.id == address.isolate())
-        else {
-            return Err(TrySendError::Closed(message));
-        };
-
-        if entry.generation != address.generation() {
-            return Err(TrySendError::Closed(message));
-        }
-
-        let entry_index = self
-            .entries
-            .iter()
-            .position(|entry| entry.id == address.isolate())
-            .unwrap_or_else(|| panic!("runtime ingress found entry then lost it"));
-
-        match self.enqueue_entry_message(entry_index, Box::new(message), None) {
-            Ok(()) => Ok(()),
-            Err(TrySendError::Full(message)) => Err(TrySendError::Full(
-                *message.downcast::<M>().unwrap_or_else(|_| {
-                    panic!("runtime ingress attempted to deliver a message to a mailbox with the wrong type")
-                }),
-            )),
-            Err(TrySendError::Closed(message)) => Err(TrySendError::Closed(
-                *message.downcast::<M>().unwrap_or_else(|_| {
-                    panic!("runtime ingress attempted to deliver a message to a mailbox with the wrong type")
-                }),
-            )),
-        }
-    }
-
-    /// Attempts to enqueue one public event through a split-service event
-    /// capability.
-    ///
-    /// This is the host/runtime companion to [`tina::send_event`]. It keeps
-    /// tests and setup code on the capability-typed path instead of unwrapping
-    /// the raw `ServiceMessage<Event, Request>` address.
-    pub fn try_send_event<Event: 'static, Request: 'static>(
-        &self,
-        address: tina::ServiceEventAddress<Event, Request>,
-        event: Event,
-    ) -> Result<(), TrySendError<tina::ServiceMessage<Event, Request>>> {
-        self.try_send(
-            address.address().address(),
-            tina::ServiceMessage::Event(event),
-        )
-    }
-
     /// Configures a registered isolate as supervisor for its direct children.
     ///
     /// This is a setup-time runtime API. Unknown, stale, or cross-shard parent
@@ -4072,45 +3851,6 @@ where
             mailbox_capacity: outcome.mailbox_capacity,
             restart_recipe: outcome.restart_recipe,
         });
-    }
-
-    /// Returns the stored direct-parent lineage in registration order.
-    #[cfg(test)]
-    pub(crate) fn lineage_snapshot(&self) -> Vec<(IsolateId, Option<IsolateId>)> {
-        self.entries
-            .iter()
-            .map(|entry| (entry.id, entry.parent))
-            .collect()
-    }
-
-    /// Returns the stored child records in spawn order.
-    #[cfg(test)]
-    pub(crate) fn child_record_snapshot(&self) -> Vec<ChildRecordSnapshot> {
-        self.child_records
-            .iter()
-            .map(|record| ChildRecordSnapshot {
-                parent: record.parent,
-                child_shard: record.child.shard,
-                child_isolate: record.child.isolate,
-                child_generation: record.child.generation,
-                child_ordinal: record.child_ordinal,
-                mailbox_capacity: record.mailbox_capacity,
-                restartable: record.restart_recipe.is_some(),
-            })
-            .collect()
-    }
-
-    /// Returns the stored supervisor records in configuration order.
-    #[cfg(test)]
-    pub(crate) fn supervisor_snapshot(&self) -> Vec<SupervisorRecordSnapshot> {
-        self.supervisors
-            .iter()
-            .map(|record| SupervisorRecordSnapshot {
-                parent: record.parent,
-                config: record.config,
-                budget_state: record.budget_state,
-            })
-            .collect()
     }
 }
 
