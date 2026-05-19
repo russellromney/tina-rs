@@ -4,7 +4,12 @@ This file records completed work.
 
 ## Unreleased
 
-### Phase 115 Core / Ecosystem Reorg (part 1: docs and layering)
+### Phase 115 Core / Ecosystem Reorg
+
+Architecture cleanup before Wave A: docs draw the core-vs-batteries
+line; oversized core files split along real module boundaries.
+
+Docs and layering:
 
 - New `docs/tina-user-guide/23-core-and-batteries.md` draws the line between
   Tina core (model crates, runtime/simulator) and official batteries
@@ -24,11 +29,48 @@ This file records completed work.
 - Added a "Layering" stanza to the Phase 116, 117, and 118 plan outlines so
   Wave A work uses the new core-vs-batteries language and does not invent
   private runtime hooks inside battery code.
-- File-split portion of Phase 115 (no-behavior module splits of
-  `tina/src/lib.rs`, `tina-runtime/src/lib.rs`, `tina-runtime/src/call.rs`,
-  `tina-sim/src/lib.rs`, `tina-sim/src/dst.rs`, and the three large test
-  homes) remains pending; it lands in a follow-up commit/PR inside this
-  phase before Wave A begins.
+
+No-behavior module splits:
+
+- `tina/src/lib.rs` (3287 → 454 lines) split into `mod address`
+  (address/id/generation types, `Outbound`, service-shaped addresses),
+  `mod context` (`Context`, `CallContext`, `RequestCall`,
+  `RequestContext`, defer-through traits, deferred-reply slots,
+  `CallHandle`/cancellation/`Deadline`, `MessageCaller`, `CallRouting`,
+  `DeferredSlotRegistry`), `mod effect` (closed `Effect` enum and every
+  constructor: `noop`, `fact`, `reply`, `reject`, `send`,
+  `send_to`/`send_event`, `spawn`/`spawn_observed`, `stop`/`stop_with`,
+  `restart_children`, `batch`/`sequence`, `reply_to`/`reply_to_request`),
+  and `mod isolate` (`Isolate`/`CallableIsolate`, `Mailbox`/`TrySendError`,
+  `RestartPolicy`/`ChildRelation`/`RestartDecision`/`RestartBudget` family,
+  `Shard`/`SingleShard`, `ChildDefinition`/`ChildRef`, `SpawnObserved`
+  family, `RestartableChildDefinition`).
+- `tina-sim/src/dst.rs` (4261 lines) split into `dst/mod.rs` (1529
+  lines) plus five submodules: `discovery` (`DiscoveredConstants`,
+  `discover_constants`), `projection` (`TraceShape`,
+  `RuntimeEventKindName`, `TraceProjection`, `TraceProjectionError`,
+  `ProtocolReplayMismatch`, `project_trace_shape`,
+  `replay_config_hash`/`encode_*` family), `replay_case`
+  (`UnsupportedLiveFact`, `LiveReplayFact`, `CapacityReplayFact`,
+  `LiveReplayCapture`, `SavedReplayCase` and on-disk format,
+  `CapturedReplayChange`, `LiveReplayReport`, `CapturedReplayMismatch`,
+  `ReplayMismatch`, `check_replay_case`/`check_captured_replay`/
+  `observe_replay_case`), `shrink` (`ShrinkConfig`, `ShrunkFailure`,
+  `delete_shrink`, `ShrinkReport`, `shrink_replay_case`), and `sweep`
+  (`SweepFailure`, `SweepSuccess`, `sweep_seeds`).
+
+All moves are `pub use submodule::*` re-exports at the crate root, so
+the public API is unchanged. A small number of private fields and
+constructors became `pub(crate)` so the kept `runtime_internal` / test
+modules can still construct them; nothing newly public.
+
+Remaining splits in this phase (still pending, future commit):
+`tina-runtime/src/lib.rs` (5231 lines) → `registration` / `dispatch` /
+`remote` / `host_call` submodules; `tina-runtime/src/call.rs` (4656
+lines) → `call/{time,tcp,tls,dns,files,process,signals,persistence,
+cancel,pending,groups}`; `tina-sim/src/lib.rs` (6787 lines) →
+`simulator` / `resources` / `calls` / `projection`; and the three
+large test homes.
 
 ### Phase 123 Adversarial Hardening
 
