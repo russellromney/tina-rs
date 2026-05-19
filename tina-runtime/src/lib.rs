@@ -241,7 +241,7 @@ pub use driver::os_signal_capture_supported;
 use driver::{BetelgeuseDriver, DriverResourceReport, DriverShutdownError, RuntimeDriver};
 
 #[derive(Debug, Clone, Copy)]
-enum MessageCallContext {
+pub(crate) enum MessageCallContext {
     Local {
         call_id: CallId,
     },
@@ -253,31 +253,31 @@ enum MessageCallContext {
     },
 }
 
-struct DeliveredMessage {
-    message: Box<dyn Any>,
-    call_context: Option<MessageCallContext>,
+pub(crate) struct DeliveredMessage {
+    pub(crate) message: Box<dyn Any>,
+    pub(crate) call_context: Option<MessageCallContext>,
 }
 
 #[derive(Debug, Clone)]
-struct IdSource {
-    next_event_id: Arc<AtomicU64>,
-    next_call_id: Arc<AtomicU64>,
+pub(crate) struct IdSource {
+    pub(crate) next_event_id: Arc<AtomicU64>,
+    pub(crate) next_call_id: Arc<AtomicU64>,
 }
 
 impl IdSource {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             next_event_id: Arc::new(AtomicU64::new(1)),
             next_call_id: Arc::new(AtomicU64::new(1)),
         }
     }
 
-    fn next_event_id(&self) -> EventId {
+    pub(crate) fn next_event_id(&self) -> EventId {
         let raw = self.next_event_id.fetch_add(1, Ordering::Relaxed);
         EventId::new(raw)
     }
 
-    fn next_call_id(&self) -> CallId {
+    pub(crate) fn next_call_id(&self) -> CallId {
         let raw = self.next_call_id.fetch_add(1, Ordering::Relaxed);
         CallId::new(raw)
     }
@@ -293,34 +293,34 @@ where
     S: Shard,
     F: MailboxFactory,
 {
-    shard: S,
-    mailbox_factory: F,
-    entries: Vec<RegisteredEntry<S, F>>,
-    child_records: Vec<ChildRecord<S, F>>,
-    supervisors: Vec<SupervisorRecord>,
-    next_isolate_id: u64,
-    ids: IdSource,
-    trace: Vec<RuntimeEvent>,
-    trace_start: usize,
-    trace_retention: TraceRetention,
-    trace_dropped: u64,
-    driver: Box<dyn RuntimeDriver>,
-    in_flight_calls: Vec<InFlightCall>,
-    translators: Vec<StoredTranslator>,
-    clock: Box<dyn Clock>,
-    pending_isolate_calls: Vec<PendingIsolateCall>,
-    round_messages: Vec<Option<DeliveredMessage>>,
-    driver_completions: Vec<DriverCompletion>,
-    next_isolate_call_ordinal: u64,
-    observation: observation::ObservationRegistry,
+    pub(crate) shard: S,
+    pub(crate) mailbox_factory: F,
+    pub(crate) entries: Vec<RegisteredEntry<S, F>>,
+    pub(crate) child_records: Vec<ChildRecord<S, F>>,
+    pub(crate) supervisors: Vec<SupervisorRecord>,
+    pub(crate) next_isolate_id: u64,
+    pub(crate) ids: IdSource,
+    pub(crate) trace: Vec<RuntimeEvent>,
+    pub(crate) trace_start: usize,
+    pub(crate) trace_retention: TraceRetention,
+    pub(crate) trace_dropped: u64,
+    pub(crate) driver: Box<dyn RuntimeDriver>,
+    pub(crate) in_flight_calls: Vec<InFlightCall>,
+    pub(crate) translators: Vec<StoredTranslator>,
+    pub(crate) clock: Box<dyn Clock>,
+    pub(crate) pending_isolate_calls: Vec<PendingIsolateCall>,
+    pub(crate) round_messages: Vec<Option<DeliveredMessage>>,
+    pub(crate) driver_completions: Vec<DriverCompletion>,
+    pub(crate) next_isolate_call_ordinal: u64,
+    pub(crate) observation: observation::ObservationRegistry,
     /// Live trace observer. Fires before retention. See [`crate::TraceObserver`].
-    trace_observer: observer::StoredObserver,
+    pub(crate) trace_observer: observer::StoredObserver,
     /// Tina-owned slot-id source and pending-capture queue. Cloned
     /// (refcount bump, no allocation) into each per-message
     /// [`MessageCaller`].
-    deferred_registry: Rc<DeferredSlotRegistry>,
+    pub(crate) deferred_registry: Rc<DeferredSlotRegistry>,
     /// Promoted-slot table. Owned solely by the runtime.
-    promoted_slots: deferred::PromotedSlots,
+    pub(crate) promoted_slots: deferred::PromotedSlots,
     /// Bounded ring of recently-cancelled calls plus the cause that
     /// closed each one. Late callee replies for these settle as a
     /// reason that matches the cause (`CallerCancelled`,
@@ -330,8 +330,8 @@ where
     /// at which point fall-through to the generic reason is honest.
     ///
     /// Single-writer (this shard's runtime); no concurrent access.
-    cancelled_calls: std::collections::VecDeque<(CallId, tina::CancelCause)>,
-    cancelled_call_cause_evictions: u64,
+    pub(crate) cancelled_calls: std::collections::VecDeque<(CallId, tina::CancelCause)>,
+    pub(crate) cancelled_call_cause_evictions: u64,
 }
 
 /// Capacity of the per-runtime recently-cancelled-calls ring. The sim
@@ -365,25 +365,26 @@ pub fn deferred_reply_reason_for_cause(
 }
 
 #[derive(Debug)]
-struct InFlightCall {
-    call_id: CallId,
-    call_kind: CallKind,
-    requester: RegisteredAddress,
-    cause: CauseId,
-    persistence: Option<call::PersistenceTraceInfo>,
-    continuation_context: Option<MessageCallContext>,
+pub(crate) struct InFlightCall {
+    pub(crate) call_id: CallId,
+    pub(crate) call_kind: CallKind,
+    pub(crate) requester: RegisteredAddress,
+    pub(crate) cause: CauseId,
+    pub(crate) persistence: Option<call::PersistenceTraceInfo>,
+    pub(crate) continuation_context: Option<MessageCallContext>,
 }
 
 #[derive(Debug, Clone, Copy)]
-struct CallDispatchContext {
-    call_id: CallId,
-    requester: RegisteredAddress,
-    cause: CauseId,
-    continuation_context: Option<MessageCallContext>,
+pub(crate) struct CallDispatchContext {
+    pub(crate) call_id: CallId,
+    pub(crate) requester: RegisteredAddress,
+    pub(crate) cause: CauseId,
+    pub(crate) continuation_context: Option<MessageCallContext>,
 }
 
-type ErasedTranslator = Box<dyn FnOnce(CallOutput) -> Box<dyn Any>>;
-type ErasedIsolateCallTranslator = Box<dyn FnOnce(CallOutcome<Box<dyn Any>>) -> Box<dyn Any>>;
+pub(crate) type ErasedTranslator = Box<dyn FnOnce(CallOutput) -> Box<dyn Any>>;
+pub(crate) type ErasedIsolateCallTranslator =
+    Box<dyn FnOnce(CallOutcome<Box<dyn Any>>) -> Box<dyn Any>>;
 
 const INITIAL_ENTRY_CAPACITY: usize = 8;
 const INITIAL_CHILD_RECORD_CAPACITY: usize = 8;
@@ -440,7 +441,7 @@ pub enum TraceRetention {
     Off,
 }
 
-fn reserve_round_message_scratch(
+pub(crate) fn reserve_round_message_scratch(
     round_messages: &mut Vec<Option<DeliveredMessage>>,
     entry_count: usize,
 ) {
@@ -450,9 +451,9 @@ fn reserve_round_message_scratch(
     }
 }
 
-struct StoredTranslator {
-    call_id: CallId,
-    translator: Option<ErasedTranslator>,
+pub(crate) struct StoredTranslator {
+    pub(crate) call_id: CallId,
+    pub(crate) translator: Option<ErasedTranslator>,
 }
 
 impl std::fmt::Debug for StoredTranslator {
@@ -464,22 +465,22 @@ impl std::fmt::Debug for StoredTranslator {
     }
 }
 
-struct PendingIsolateCall {
-    call_id: CallId,
-    requester: RegisteredAddress,
-    cause: CauseId,
-    deadline: Instant,
-    insertion_order: u64,
-    continuation_context: Option<MessageCallContext>,
-    translator: Option<ErasedIsolateCallTranslator>,
+pub(crate) struct PendingIsolateCall {
+    pub(crate) call_id: CallId,
+    pub(crate) requester: RegisteredAddress,
+    pub(crate) cause: CauseId,
+    pub(crate) deadline: Instant,
+    pub(crate) insertion_order: u64,
+    pub(crate) continuation_context: Option<MessageCallContext>,
+    pub(crate) translator: Option<ErasedIsolateCallTranslator>,
     /// `TypeId::of::<R>()` for the dispatching `Address<_, R>`. Used
     /// to typecheck deferred-reply payloads before they reach the
     /// translator's downcast.
-    expected_reply_type_id: std::any::TypeId,
+    pub(crate) expected_reply_type_id: std::any::TypeId,
     /// Optional caller-owned cancellation cell. The runtime updates
     /// `state` to `Settled` on completion/timeout/closed, or
     /// `Cancelled` on explicit `cancel_call`.
-    handle_shared: Option<std::sync::Arc<tina::CallHandleShared>>,
+    pub(crate) handle_shared: Option<std::sync::Arc<tina::CallHandleShared>>,
 }
 
 impl std::fmt::Debug for PendingIsolateCall {
@@ -4105,18 +4106,18 @@ where
     }
 }
 
-trait ErasedMailbox {
+pub(crate) trait ErasedMailbox {
     fn recv_boxed(&self) -> Option<Box<dyn Any>>;
     fn try_send_boxed(&self, message: Box<dyn Any>) -> Result<(), TrySendError<Box<dyn Any>>>;
     fn close(&self);
 }
 
-struct MailboxAdapter<M, Msg>
+pub(crate) struct MailboxAdapter<M, Msg>
 where
     M: Mailbox<Msg>,
 {
-    mailbox: M,
-    marker: PhantomData<fn(Msg) -> Msg>,
+    pub(crate) mailbox: M,
+    pub(crate) marker: PhantomData<fn(Msg) -> Msg>,
 }
 
 impl<M, Msg> ErasedMailbox for MailboxAdapter<M, Msg>
@@ -4151,8 +4152,8 @@ where
     }
 }
 
-struct AnyMailboxAdapter {
-    mailbox: Box<dyn Mailbox<Box<dyn Any>>>,
+pub(crate) struct AnyMailboxAdapter {
+    pub(crate) mailbox: Box<dyn Mailbox<Box<dyn Any>>>,
 }
 
 impl ErasedMailbox for AnyMailboxAdapter {
@@ -4170,72 +4171,72 @@ impl ErasedMailbox for AnyMailboxAdapter {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct RegisteredAddress {
-    shard: ShardId,
-    isolate: IsolateId,
-    generation: AddressGeneration,
+pub(crate) struct RegisteredAddress {
+    pub(crate) shard: ShardId,
+    pub(crate) isolate: IsolateId,
+    pub(crate) generation: AddressGeneration,
 }
 
-struct SpawnOutcome<S, F>
+pub(crate) struct SpawnOutcome<S, F>
 where
     S: Shard,
     F: MailboxFactory,
 {
-    child: RegisteredAddress,
-    mailbox_capacity: usize,
-    restart_recipe: Option<Rc<dyn ErasedRestartRecipe<S, F>>>,
-    bootstrap_message: Option<Box<dyn Any>>,
+    pub(crate) child: RegisteredAddress,
+    pub(crate) mailbox_capacity: usize,
+    pub(crate) restart_recipe: Option<Rc<dyn ErasedRestartRecipe<S, F>>>,
+    pub(crate) bootstrap_message: Option<Box<dyn Any>>,
 }
 
-struct SpawnObservedOutcome<S, F>
+pub(crate) struct SpawnObservedOutcome<S, F>
 where
     S: Shard,
     F: MailboxFactory,
 {
-    spawn: Option<SpawnOutcome<S, F>>,
-    continuation: Option<ErasedMessage>,
+    pub(crate) spawn: Option<SpawnOutcome<S, F>>,
+    pub(crate) continuation: Option<ErasedMessage>,
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
-struct ChildRecord<S, F>
+pub(crate) struct ChildRecord<S, F>
 where
     S: Shard,
     F: MailboxFactory,
 {
-    parent: IsolateId,
-    child: RegisteredAddress,
-    child_ordinal: usize,
-    mailbox_capacity: usize,
-    restart_recipe: Option<Rc<dyn ErasedRestartRecipe<S, F>>>,
+    pub(crate) parent: IsolateId,
+    pub(crate) child: RegisteredAddress,
+    pub(crate) child_ordinal: usize,
+    pub(crate) mailbox_capacity: usize,
+    pub(crate) restart_recipe: Option<Rc<dyn ErasedRestartRecipe<S, F>>>,
 }
 
-struct SupervisorRecord {
-    parent: RegisteredAddress,
-    config: SupervisorConfig,
-    budget_state: RestartBudgetState,
+pub(crate) struct SupervisorRecord {
+    pub(crate) parent: RegisteredAddress,
+    pub(crate) config: SupervisorConfig,
+    pub(crate) budget_state: RestartBudgetState,
 }
 
 #[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ChildRecordSnapshot {
-    parent: IsolateId,
-    child_shard: ShardId,
-    child_isolate: IsolateId,
-    child_generation: AddressGeneration,
-    child_ordinal: usize,
-    mailbox_capacity: usize,
-    restartable: bool,
+    pub(crate) parent: IsolateId,
+    pub(crate) child_shard: ShardId,
+    pub(crate) child_isolate: IsolateId,
+    pub(crate) child_generation: AddressGeneration,
+    pub(crate) child_ordinal: usize,
+    pub(crate) mailbox_capacity: usize,
+    pub(crate) restartable: bool,
 }
 
 #[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SupervisorRecordSnapshot {
-    parent: RegisteredAddress,
-    config: SupervisorConfig,
-    budget_state: RestartBudgetState,
+    pub(crate) parent: RegisteredAddress,
+    pub(crate) config: SupervisorConfig,
+    pub(crate) budget_state: RestartBudgetState,
 }
 
-trait ErasedHandler<S, F>
+pub(crate) trait ErasedHandler<S, F>
 where
     S: Shard,
     F: MailboxFactory,
@@ -4261,7 +4262,7 @@ where
     ) -> ErasedEffect<S, F>;
 }
 
-trait ErasedSpawn<S, F>
+pub(crate) trait ErasedSpawn<S, F>
 where
     S: Shard,
     F: MailboxFactory,
@@ -4278,7 +4279,7 @@ where
     }
 }
 
-trait ErasedRestartRecipe<S, F>
+pub(crate) trait ErasedRestartRecipe<S, F>
 where
     S: Shard,
     F: MailboxFactory,
@@ -4286,7 +4287,7 @@ where
     fn create(&self, runtime: &mut Runtime<S, F>, parent: IsolateId) -> SpawnOutcome<S, F>;
 }
 
-trait IntoErasedSpawn<S, F>
+pub(crate) trait IntoErasedSpawn<S, F>
 where
     S: Shard,
     F: MailboxFactory,
@@ -4294,7 +4295,7 @@ where
     fn into_erased_spawn(self) -> Box<dyn ErasedSpawn<S, F>>;
 }
 
-trait ErasedSpawnObserved<S, F>
+pub(crate) trait ErasedSpawnObserved<S, F>
 where
     S: Shard,
     F: MailboxFactory,
@@ -4306,7 +4307,7 @@ where
     ) -> SpawnObservedOutcome<S, F>;
 }
 
-trait IntoErasedSpawnObserved<S, F, ParentMessage>
+pub(crate) trait IntoErasedSpawnObserved<S, F, ParentMessage>
 where
     S: Shard,
     F: MailboxFactory,
@@ -4314,12 +4315,12 @@ where
     fn into_erased_spawn_observed(self) -> Box<dyn ErasedSpawnObserved<S, F>>;
 }
 
-struct HandlerAdapter<I, Outbound>
+pub(crate) struct HandlerAdapter<I, Outbound>
 where
     I: Isolate,
 {
-    isolate: I,
-    marker: PhantomData<fn(Outbound) -> Outbound>,
+    pub(crate) isolate: I,
+    pub(crate) marker: PhantomData<fn(Outbound) -> Outbound>,
 }
 
 impl<I, S, F, Outbound> ErasedHandler<S, F> for HandlerAdapter<I, Outbound>
@@ -4386,12 +4387,12 @@ where
     }
 }
 
-struct SendableHandlerAdapter<I, Outbound>
+pub(crate) struct SendableHandlerAdapter<I, Outbound>
 where
     I: Isolate,
 {
-    isolate: I,
-    marker: PhantomData<fn(Outbound) -> Outbound>,
+    pub(crate) isolate: I,
+    pub(crate) marker: PhantomData<fn(Outbound) -> Outbound>,
 }
 
 impl<I, S, F, Outbound> ErasedHandler<S, F> for SendableHandlerAdapter<I, Outbound>
@@ -4458,7 +4459,7 @@ where
     }
 }
 
-fn erase_effect<I, S, F, Outbound>(effect: Effect<I>) -> ErasedEffect<S, F>
+pub(crate) fn erase_effect<I, S, F, Outbound>(effect: Effect<I>) -> ErasedEffect<S, F>
 where
     I: Isolate<Shard = S, Send = TinaOutbound<Outbound>> + 'static,
     I::Message: 'static,
@@ -4506,7 +4507,7 @@ where
     }
 }
 
-fn erase_effect_sendable<I, S, F, Outbound>(effect: Effect<I>) -> ErasedEffect<S, F>
+pub(crate) fn erase_effect_sendable<I, S, F, Outbound>(effect: Effect<I>) -> ErasedEffect<S, F>
 where
     I: Isolate<Shard = S, Send = TinaOutbound<Outbound>> + 'static,
     I::Message: 'static,
@@ -4554,23 +4555,23 @@ where
     }
 }
 
-struct RegisteredEntry<S, F>
+pub(crate) struct RegisteredEntry<S, F>
 where
     S: Shard,
     F: MailboxFactory,
 {
-    id: IsolateId,
-    generation: AddressGeneration,
+    pub(crate) id: IsolateId,
+    pub(crate) generation: AddressGeneration,
     #[cfg_attr(not(test), allow(dead_code))]
-    parent: Option<IsolateId>,
-    stopped: Cell<bool>,
-    stopped_event: Cell<Option<EventId>>,
-    mailbox: Box<dyn ErasedMailbox>,
-    call_contexts: RefCell<VecDeque<Option<MessageCallContext>>>,
-    handler: RefCell<Box<dyn ErasedHandler<S, F>>>,
+    pub(crate) parent: Option<IsolateId>,
+    pub(crate) stopped: Cell<bool>,
+    pub(crate) stopped_event: Cell<Option<EventId>>,
+    pub(crate) mailbox: Box<dyn ErasedMailbox>,
+    pub(crate) call_contexts: RefCell<VecDeque<Option<MessageCallContext>>>,
+    pub(crate) handler: RefCell<Box<dyn ErasedHandler<S, F>>>,
 }
 
-enum ErasedEffect<S, F>
+pub(crate) enum ErasedEffect<S, F>
 where
     S: Shard,
     F: MailboxFactory,
@@ -4598,7 +4599,7 @@ where
     S: Shard,
     F: MailboxFactory,
 {
-    fn kind(&self) -> EffectKind {
+    pub(crate) fn kind(&self) -> EffectKind {
         match self {
             Self::Noop => EffectKind::Noop,
             Self::Reply(_) => EffectKind::Reply,
@@ -4616,7 +4617,7 @@ where
         }
     }
 
-    fn consumes_call_context(&self) -> bool {
+    pub(crate) fn consumes_call_context(&self) -> bool {
         match self {
             Self::Reply(_) | Self::Reject(_) => true,
             Self::Batch(effects) => {
@@ -4634,7 +4635,7 @@ where
         }
     }
 
-    fn stops_before_consuming_call_context(&self) -> bool {
+    pub(crate) fn stops_before_consuming_call_context(&self) -> bool {
         match self {
             Self::Stop | Self::StopWith(_) => true,
             Self::Reply(_) | Self::Reject(_) => false,
@@ -4661,13 +4662,13 @@ pub(crate) struct ErasedSend {
     pub(crate) message: ErasedMessage,
 }
 
-enum QueuedRemoteEnvelope {
+pub(crate) enum QueuedRemoteEnvelope {
     Send(QueuedRemoteSend),
     CallReply(RemoteCallReply),
 }
 
 impl QueuedRemoteEnvelope {
-    fn target_shard(&self) -> ShardId {
+    pub(crate) fn target_shard(&self) -> ShardId {
         match self {
             Self::Send(send) => send.send.target_shard,
             Self::CallReply(reply) => reply.requester.shard,
@@ -4675,7 +4676,7 @@ impl QueuedRemoteEnvelope {
     }
 }
 
-fn remote_call_outcome_envelope(
+pub(crate) fn remote_call_outcome_envelope(
     context: Option<MessageCallContext>,
     outcome: RemoteCallOutcome,
 ) -> Option<QueuedRemoteEnvelope> {
@@ -4696,23 +4697,27 @@ fn remote_call_outcome_envelope(
     }))
 }
 
-struct QueuedRemoteSend {
-    send: ErasedSend,
-    call_context: Option<MessageCallContext>,
-    cause: CauseId,
+pub(crate) struct QueuedRemoteSend {
+    pub(crate) send: ErasedSend,
+    pub(crate) call_context: Option<MessageCallContext>,
+    pub(crate) cause: CauseId,
 }
 
-struct SendableQueuedRemoteSend {
-    target_shard: ShardId,
-    target_isolate: IsolateId,
-    target_generation: AddressGeneration,
-    message: Box<dyn Any + Send>,
-    call_context: Option<MessageCallContext>,
-    cause: CauseId,
+pub(crate) struct SendableQueuedRemoteSend {
+    pub(crate) target_shard: ShardId,
+    pub(crate) target_isolate: IsolateId,
+    pub(crate) target_generation: AddressGeneration,
+    pub(crate) message: Box<dyn Any + Send>,
+    pub(crate) call_context: Option<MessageCallContext>,
+    pub(crate) cause: CauseId,
 }
 
 impl SendableQueuedRemoteSend {
-    fn new(send: ErasedSend, call_context: Option<MessageCallContext>, cause: CauseId) -> Self {
+    pub(crate) fn new(
+        send: ErasedSend,
+        call_context: Option<MessageCallContext>,
+        cause: CauseId,
+    ) -> Self {
         Self {
             target_shard: send.target_shard,
             target_isolate: send.target_isolate,
@@ -4723,7 +4728,7 @@ impl SendableQueuedRemoteSend {
         }
     }
 
-    fn into_queued_remote_send(self) -> QueuedRemoteSend {
+    pub(crate) fn into_queued_remote_send(self) -> QueuedRemoteSend {
         QueuedRemoteSend {
             send: ErasedSend {
                 target_shard: self.target_shard,
@@ -4737,13 +4742,13 @@ impl SendableQueuedRemoteSend {
     }
 }
 
-enum SendableQueuedRemoteEnvelope {
+pub(crate) enum SendableQueuedRemoteEnvelope {
     Send(SendableQueuedRemoteSend),
     CallReply(SendableRemoteCallReply),
 }
 
 impl SendableQueuedRemoteEnvelope {
-    fn new(envelope: QueuedRemoteEnvelope) -> Self {
+    pub(crate) fn new(envelope: QueuedRemoteEnvelope) -> Self {
         match envelope {
             QueuedRemoteEnvelope::Send(send) => Self::Send(SendableQueuedRemoteSend::new(
                 send.send,
@@ -4756,7 +4761,7 @@ impl SendableQueuedRemoteEnvelope {
         }
     }
 
-    fn into_queued_remote_envelope(self) -> QueuedRemoteEnvelope {
+    pub(crate) fn into_queued_remote_envelope(self) -> QueuedRemoteEnvelope {
         match self {
             Self::Send(send) => QueuedRemoteEnvelope::Send(send.into_queued_remote_send()),
             Self::CallReply(reply) => {
@@ -4766,29 +4771,29 @@ impl SendableQueuedRemoteEnvelope {
     }
 }
 
-struct RemoteCallReply {
-    call_id: CallId,
-    requester: RegisteredAddress,
-    cause: CauseId,
-    outcome: RemoteCallOutcome,
+pub(crate) struct RemoteCallReply {
+    pub(crate) call_id: CallId,
+    pub(crate) requester: RegisteredAddress,
+    pub(crate) cause: CauseId,
+    pub(crate) outcome: RemoteCallOutcome,
 }
 
-enum RemoteCallOutcome {
+pub(crate) enum RemoteCallOutcome {
     Replied(ErasedMessage),
     Full,
     Closed,
     Rejected(CallRejectedReason),
 }
 
-struct SendableRemoteCallReply {
-    call_id: CallId,
-    requester: RegisteredAddress,
-    cause: CauseId,
-    outcome: SendableRemoteCallOutcome,
+pub(crate) struct SendableRemoteCallReply {
+    pub(crate) call_id: CallId,
+    pub(crate) requester: RegisteredAddress,
+    pub(crate) cause: CauseId,
+    pub(crate) outcome: SendableRemoteCallOutcome,
 }
 
 impl SendableRemoteCallReply {
-    fn new(reply: RemoteCallReply) -> Self {
+    pub(crate) fn new(reply: RemoteCallReply) -> Self {
         match reply.outcome {
             RemoteCallOutcome::Replied(message) => Self {
                 call_id: reply.call_id,
@@ -4817,7 +4822,7 @@ impl SendableRemoteCallReply {
         }
     }
 
-    fn into_remote_call_reply(self) -> RemoteCallReply {
+    pub(crate) fn into_remote_call_reply(self) -> RemoteCallReply {
         let outcome = match self.outcome {
             SendableRemoteCallOutcome::Replied(reply) => {
                 RemoteCallOutcome::Replied(ErasedMessage::Sendable(reply))
@@ -4835,7 +4840,7 @@ impl SendableRemoteCallReply {
     }
 }
 
-enum SendableRemoteCallOutcome {
+pub(crate) enum SendableRemoteCallOutcome {
     Replied(Box<dyn Any + Send>),
     Full,
     Closed,
@@ -4848,21 +4853,21 @@ pub(crate) enum ErasedMessage {
 }
 
 impl ErasedMessage {
-    fn into_any(self) -> Box<dyn Any> {
+    pub(crate) fn into_any(self) -> Box<dyn Any> {
         match self {
             Self::Local(message) => message,
             Self::Sendable(message) => message,
         }
     }
 
-    fn payload_type_id(&self) -> std::any::TypeId {
+    pub(crate) fn payload_type_id(&self) -> std::any::TypeId {
         match self {
             Self::Local(message) => (**message).type_id(),
             Self::Sendable(message) => (**message).type_id(),
         }
     }
 
-    fn into_sendable(self) -> Box<dyn Any + Send> {
+    pub(crate) fn into_sendable(self) -> Box<dyn Any + Send> {
         match self {
             Self::Local(_) => {
                 panic!("live cross-shard send attempted to move a non-Send message")
@@ -4892,8 +4897,8 @@ where
     }
 }
 
-struct SpawnObservedAdapter<Spawn, ParentMessage, ChildMessage, ChildReply> {
-    inner: tina::SpawnObserved<Spawn, ParentMessage, ChildMessage, ChildReply>,
+pub(crate) struct SpawnObservedAdapter<Spawn, ParentMessage, ChildMessage, ChildReply> {
+    pub(crate) inner: tina::SpawnObserved<Spawn, ParentMessage, ChildMessage, ChildReply>,
 }
 
 impl<Spawn, ParentMessage, ChildMessage, ChildReply, S, F> ErasedSpawnObserved<S, F>
@@ -4956,14 +4961,14 @@ where
     }
 }
 
-struct SpawnAdapter<I, Outbound>
+pub(crate) struct SpawnAdapter<I, Outbound>
 where
     I: Isolate,
 {
-    isolate: I,
-    mailbox_capacity: usize,
-    bootstrap_message: Option<I::Message>,
-    marker: PhantomData<fn(Outbound) -> Outbound>,
+    pub(crate) isolate: I,
+    pub(crate) mailbox_capacity: usize,
+    pub(crate) bootstrap_message: Option<I::Message>,
+    pub(crate) marker: PhantomData<fn(Outbound) -> Outbound>,
 }
 
 impl<I, S, F, Outbound> ErasedSpawn<S, F> for SpawnAdapter<I, Outbound>
@@ -5028,14 +5033,14 @@ where
     }
 }
 
-struct RestartableSpawnAdapter<I, Outbound>
+pub(crate) struct RestartableSpawnAdapter<I, Outbound>
 where
     I: Isolate,
 {
-    factory: Box<dyn Fn() -> I>,
-    mailbox_capacity: usize,
-    bootstrap_factory: Option<Box<dyn Fn() -> I::Message>>,
-    marker: PhantomData<fn(Outbound) -> Outbound>,
+    pub(crate) factory: Box<dyn Fn() -> I>,
+    pub(crate) mailbox_capacity: usize,
+    pub(crate) bootstrap_factory: Option<Box<dyn Fn() -> I::Message>>,
+    pub(crate) marker: PhantomData<fn(Outbound) -> Outbound>,
 }
 
 impl<I, S, F, Outbound> ErasedSpawn<S, F> for RestartableSpawnAdapter<I, Outbound>
