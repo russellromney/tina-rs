@@ -162,9 +162,17 @@ be silently dropped):
   resources` / `mod calls` follows the runtime pattern: visibility
   audit recorded; sub-bins are mechanical method moves once a
   reviewer wants smaller files.
-- `tina-runtime/src/call/mod.rs` still at 2,562 lines; the
-  `CallInput`/`CallOutput`/`CallError` family is the next obvious
-  split when their decoders can be shipped alongside.
+- `tina-runtime/src/call/mod.rs` (2,562 → 1,779 lines) — extracted
+  `mod io` carrying the closed-set runtime call vocabulary
+  (`CallInput`, `PersistenceTraceInfo`, `CallOutput`, `CallError`,
+  `SendOutcome`, `CallOutcome<T>` plus the `SendOutcome::from_rejected`
+  helper). The remaining `mod.rs` keeps the type-erasure machinery
+  (`RuntimeCall<M>`, `RuntimeCallKind<M>`, `RuntimeCallable`,
+  `RuntimeCallParts<M>`, `ErasedCall`, `IntoErasedCall<M>`) and the
+  typed-future family (`TypedCall<T>`, `ObservedSend<T>`,
+  `IsolateCall<T, R>`, the deferred / request variants, and the
+  builder constructors). Public API unchanged: `mod.rs` re-exports
+  via `pub use io::*;` like the other call submodules.
 - The oversized test homes (`tina-runtime/src/tests.rs`,
   `tina-runtime/tests/local_system.rs`,
   `tina-sim/tests/io_simulation.rs`) — splittable by test name
