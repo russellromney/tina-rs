@@ -5,6 +5,8 @@
 - Future implementation plan for Wave A.
 - Runs after Phase 116. HTTP/2/gRPC client resource maturity needs the real
   client connection and stream-slot shape first.
+- Also builds on Phase 118 admission policy. Resource health/retire reports
+  should compose with service pressure, not invent another report dialect.
 - Can run in parallel with later non-pool work if ownership stays mostly in
   pool resources, local persistence, and data specimens.
 
@@ -41,6 +43,11 @@ local state after restart
 - pool shutdown/drain reports aligned with bridge/resource vocabulary
 - DB, HTTP/1 keepalive, and HTTP/2/gRPC client resources using shared pressure
   language without pretending every resource is one lease per request
+- connection resources and stream slots are different things:
+  - HTTP/1 keepalive leases a connection for one request
+  - HTTP/2/gRPC leases/admites streams on a connection
+  - DB bridges may expose outer Tina pressure while DB internals remain
+    database-specific
 - snapshot/journal restore service pattern
 - torn-write and corrupt-tail recovery specimens
 - append-before-apply helper with type-state where it helps
@@ -83,6 +90,9 @@ Resource rules:
 - If the pool owns a close path, retirement closes and reports it.
 - If the pool does not own a close path, retirement is a typed report and the
   owner must close.
+- "Close" must mean no new admission. "Drain" waits for owned in-flight work.
+  "Force" marks outstanding work stale/retired and reports it. Use the existing
+  lifecycle words.
 - `ReleaseDisposition::Reuse` may be overridden to retire when the pool knows a
   resource is stale/closed. The caller sees the override.
 - Shutdown reports use existing lifecycle words: drain, force, closed, timed
@@ -94,6 +104,7 @@ Data rules:
   a `CommittedMutation<T>`.
 - Failed append returns the original mutation, so the caller can reject/retry
   without losing it.
+- Applying a mutation consumes `CommittedMutation<T>` exactly once.
 - Recovery returns snapshot index, replayed count, truncated-tail warning, and
   corrupt-tail error separately.
 - Snapshot commit keeps the existing temp-write/rename/fsync truth.
@@ -105,6 +116,8 @@ Data rules:
   and clean shutdown report.
 - HTTP/2/gRPC client connection pool after Phase 116: stream slots are not pool
   leases; connection retirement does not strand active streams silently.
+- Shutdown while a streamed gRPC call is active drains or force-retires with a
+  visible report; no hidden source leak.
 - SQLx/SQLite pressure reports share vocabulary but preserve their different
   DB truth.
 - `system_redisish_keyspace`: restart after snapshot + journal; corrupt
@@ -120,12 +133,15 @@ Data rules:
 - max-lifetime retire does not hand stale resource to new caller
 - health check retires bad resource
 - shutdown drains or force-closes with report
+- late release/late stream completion after retirement is typed stale, not
+  accepted as healthy reuse
 - HTTP/2/gRPC client connection retire does not kill unrelated healthy
   connection state silently
 - crash/restart restores expected state
 - corrupt/torn journal tail is typed and recoverable
 - trybuild tests prove the type-state helper cannot expose the mutation payload
   for apply until append success creates `CommittedMutation<T>`
+- trybuild tests prove `CommittedMutation<T>` cannot be applied twice
 - fill-retire-refill proves retired/stale resources do not consume admission
   forever
 - live and sim persistence tests show the same recovery facts where supported
@@ -137,3 +153,5 @@ Data rules:
 - Do not hide DB-specific truth behind one fake pool abstraction.
 - Do not mutate state before the durable append success message arrives.
 - Do not call truncated tail "success" without a visible warning.
+- Do not make "pool" mean the same shape for HTTP/1, HTTP/2 streams, and DB
+  internals. Use one vocabulary, not one fake mechanism.

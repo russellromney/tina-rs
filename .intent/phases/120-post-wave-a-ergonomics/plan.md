@@ -4,6 +4,8 @@
 
 - Future implementation plan.
 - Runs after phases 116-119 land.
+- Runs before Wave B if Wave A changes the copied service shape enough that
+  fairness/load tests would otherwise copy stale patterns.
 - One PR when executed.
 
 ## Spike Facts
@@ -30,6 +32,7 @@ the copied service path.
   - file/codec/local IPC examples
   - mature pools
   - durable restore path
+  - admission/rate policy copied path
 - one "whole service" specimen that uses the new Wave A primitives together
 - update prelude/import tiers
 - simplify repeated setup only after repetition is proven
@@ -51,6 +54,10 @@ Touch only copied paths and examples/docs around newly landed Wave A features:
 - Refresh `examples/systems/mini_saas_api` into the production-shaped service
   skeleton. It must use gRPC outbound, local file/codec/IPC, admission policy,
   resource policy, and durable restore in one small service.
+- If `mini_saas_api` becomes too dense, split one copied service into:
+  - `system_production_edge_service`
+  - `system_local_data_service`
+  Both must run; do not leave one as prose.
 - Add a short "which noun do I use?" guide for the new primitives. Keep it
   grouped by task, not by type list:
   - "limit work"
@@ -66,6 +73,13 @@ Touch only copied paths and examples/docs around newly landed Wave A features:
   command and names which Wave A primitive it exercises.
 - Add cheap-model instructions: build one tiny feature using only the skeleton
   README, then record any new rough edge in findings.
+- Keep names task-shaped:
+  - "call another service"
+  - "limit work"
+  - "read local bytes"
+  - "recover state"
+  - "shut down"
+  Avoid type-index docs as the first learning path.
 
 ## Proof Shape
 
@@ -76,6 +90,8 @@ Touch only copied paths and examples/docs around newly landed Wave A features:
   the copied path
 - the refreshed skeleton has a smoke test, a load-ish test, a shutdown test, and
   one bad-config/bad-input test
+- the skeleton proves at least one compile-time guardrail from recent phases by
+  linking to or adding a trybuild case for the copied mistake
 - every changed snippet compiles or is marked `ignore` with a reason
 - findings diff proves no stale "Eiffel" or pre-helper wording returned
 

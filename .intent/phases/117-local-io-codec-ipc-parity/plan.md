@@ -3,6 +3,8 @@
 ## Status
 
 - Future implementation plan for Wave A.
+- Runs after Phase 115 lands so crate/module homes follow the core/battery
+  boundary.
 - Can run in parallel with phases 116 and 118 if ownership stays mostly in
   runtime rails, codec helpers, and local IPC specimens.
 
@@ -28,6 +30,8 @@ Tina owns I/O, capacity, cancellation, and replay. Codecs own bytes.
   generic sync codec pattern that matches their lessons.
 - Unix-domain sockets are not present as runtime rails. Lifecycle docs mention
   Unix as a resource kind, but no `unix_bind` / `unix_connect` surface exists.
+- `tina-codec` does not exist yet. If Phase 115 chooses a different official
+  battery home, use that home. Do not put codecs in `tina` core.
 
 ## Includes
 
@@ -40,6 +44,10 @@ Tina owns I/O, capacity, cancellation, and replay. Codecs own bytes.
 - length-delimited codec helper
 - sync codec adapter pattern with `NeedMore` / `Frame` / `Malformed` / `Full`
 - codecs are pure data; runtime owns socket reads/writes and capacity
+- public codec names should be task names, not storage names:
+  - `LineFramer`
+  - `LengthDelimitedFramer`
+  - `FrameDecision::{NeedMore, Frame, Malformed, Full}`
 - Unix-domain socket listener/client rails for local IPC
 - Unix rails mirror TCP semantics where possible:
   - bind/listen/accept
@@ -49,6 +57,8 @@ Tina owns I/O, capacity, cancellation, and replay. Codecs own bytes.
 - typed non-Unix unsupported truth for Unix rails
 - simulator support for file streaming and Unix socket pairs; non-Unix live
   backends return typed unsupported for Unix rails
+- Windows/non-Unix must compile. Unix-specific live tests are cfg-gated, but
+  unsupported rails still report typed unsupported instead of disappearing.
 - system specimens:
   - media/file ingest
   - local admin sidecar
@@ -68,36 +78,47 @@ Tina owns I/O, capacity, cancellation, and replay. Codecs own bytes.
 ## Proof Shape
 
 - large file does not buffer whole file
+- empty file, exact chunk boundary, max-total-overrun, and zero-chunk config are
+  pinned
 - file read helper reads in multiple chunks and reports high-water/cap truth
 - file write helper handles partial writes and fsync/close truth
+- cancellation/shutdown of an in-flight file stream reports what completed and
+  what did not; no fake all-or-nothing story
 - slow reader/writer pressure is visible
 - malformed frame is typed
 - line codec rejects line too large without growing unbounded
 - length codec rejects frame too large before allocation
 - Unix socket close/cancel/drain truth is visible
+- Unix socket wrong-resource operations return typed errors, not TCP-shaped
+  accidental success
 - Unix socket live echo/admin specimen works on Unix
 - live and sim tests cover the same protocol shape where possible
 - non-Unix tests assert typed unsupported capability, not cfg-silent omission
 - compile-fail tests keep codec adapter state typed, not stringly
+- doctests show codec state living on an isolate and one runtime read per
+  progress step
 
 ## Implementation Shape
 
 - Add `tina_runtime::file_loops` beside `tcp_loops`:
   - `FileReadChunks`
   - `FileWriteAll`
+  - `FileCopyBounded` only if two specimens need read+write together
   - explicit max chunk and max total
   - no zero chunk
   - no hidden allocation beyond configured buffer
 - Add `tina-codec` as an official small battery crate:
-  - `LineCodec`
-  - `LengthDelimitedCodec`
-  - `CodecDecision::{NeedMore, Frame, Malformed, Full}`
+  - `LineFramer`
+  - `LengthDelimitedFramer`
+  - `FrameDecision::{NeedMore, Frame, Malformed, Full}`
   - parser state is owned by the isolate/specimen, not a background task
 - Add Unix rail calls in `tina-runtime` and `tina-sim`:
   - live Unix platforms use OS Unix sockets
   - live non-Unix platforms complete with typed unsupported
   - simulator models Unix sockets as local byte-stream pairs with Unix-socket
     resource names
+  - keep Unix resource ids distinct from TCP ids unless tests prove shared
+    `StreamId` cannot cross resources silently
 - Add specimens:
   - `specimen_file_ingest`
   - `specimen_local_admin_socket`

@@ -18,6 +18,10 @@
 - Phase 113 is the bridge author kit seed. This phase should expose public
   hooks that make third-party bridge/codecs/policy crates possible without
   private runtime access.
+- `BoundedEventSink`, capacity reports/summaries, service pressure reports,
+  shared scopes, local permits, bridge reports, and protocol facts already
+  exist. This phase aligns and proves those as extension hooks; it must not
+  rebuild them under new names.
 - Rust ecosystem convention is traits + feature-gated crates + examples, not a
   dynamic plugin ABI.
 
@@ -35,7 +39,8 @@ private runtime access and without weakening bounded/DST truth
 ## Includes
 
 - public capacity surface hook
-- bounded event sink hook
+- bounded event sink hook polish if existing `BoundedEventSink` lacks an
+  extension-facing shape
 - sync codec adapter hook
 - service policy hook
 - bridge author smoke crate using the Phase 113 vocabulary
@@ -43,6 +48,8 @@ private runtime access and without weakening bounded/DST truth
 - custom codec smoke crate using only public APIs
 - custom admission/policy smoke crate using only public APIs
 - runtime capability report for rails/cancel/drain/sim support
+- extension contract docs: what belongs in `tina`, `tina-runtime`, official
+  batteries, bridge crates, and workspace-excluded extension examples
 - clear async boundary docs:
   - native Tina path
   - bridge path
@@ -72,6 +79,8 @@ RuntimeCapabilityReport
 
 Rules:
 
+- Prefer existing names if they already carry the truth. Add traits only when an
+  extension smoke crate cannot work through current public data shapes.
 - Hooks use owned reports and typed outcomes, not callbacks into private runtime
   internals.
 - Extension crates may observe and report capacity; they may not mutate runtime
@@ -103,6 +112,8 @@ APIs only and run by manifest path:
   `ctx.now()` and reports replayable state.
 
 No smoke crate may import `tina_runtime::runtime_internal` or private modules.
+Add one compile-fail or lint-style proof that an extension crate cannot mint
+runtime-owned tokens/handles by importing hidden internals.
 
 ## Proof Shape
 
@@ -111,6 +122,8 @@ No smoke crate may import `tina_runtime::runtime_internal` or private modules.
 - event sink is bounded and reports drops/full/closed
 - codec hook keeps parser state replayable
 - capability report says supported/unsupported/cancel/drain/sim truth
+- extension docs classify every official bridge/protocol as core, official
+  battery, bridge, or external crate
 - compile-fail tests prevent hooks from constructing invalid private runtime
   state
 - docs list at least five common Tokio ecosystem cases and put each in native,
@@ -123,6 +136,7 @@ No smoke crate may import `tina_runtime::runtime_internal` or private modules.
 - Do not build a plugin system. Rust crates are the plugin system.
 - Do not make a generic async bridge unless it proves bounded queueing,
   cancellation, pressure, and replay/unsupported truth.
+- Do not rename working public vocabulary just to make a hook table pretty.
 - Do not expose internals just because a smoke crate wants an easy path.
 - Do not let custom codecs own sockets. Tina owns sockets.
 - Do not let custom policies hide retries or waiters.
