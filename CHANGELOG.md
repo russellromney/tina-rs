@@ -32,45 +32,84 @@ Docs and layering:
 
 No-behavior module splits:
 
-- `tina/src/lib.rs` (3287 → 454 lines) split into `mod address`
-  (address/id/generation types, `Outbound`, service-shaped addresses),
-  `mod context` (`Context`, `CallContext`, `RequestCall`,
-  `RequestContext`, defer-through traits, deferred-reply slots,
-  `CallHandle`/cancellation/`Deadline`, `MessageCaller`, `CallRouting`,
-  `DeferredSlotRegistry`), `mod effect` (closed `Effect` enum and every
-  constructor: `noop`, `fact`, `reply`, `reject`, `send`,
-  `send_to`/`send_event`, `spawn`/`spawn_observed`, `stop`/`stop_with`,
-  `restart_children`, `batch`/`sequence`, `reply_to`/`reply_to_request`),
-  and `mod isolate` (`Isolate`/`CallableIsolate`, `Mailbox`/`TrySendError`,
-  `RestartPolicy`/`ChildRelation`/`RestartDecision`/`RestartBudget` family,
-  `Shard`/`SingleShard`, `ChildDefinition`/`ChildRef`, `SpawnObserved`
-  family, `RestartableChildDefinition`).
-- `tina-sim/src/dst.rs` (4261 lines) split into `dst/mod.rs` (1529
-  lines) plus five submodules: `discovery` (`DiscoveredConstants`,
-  `discover_constants`), `projection` (`TraceShape`,
-  `RuntimeEventKindName`, `TraceProjection`, `TraceProjectionError`,
-  `ProtocolReplayMismatch`, `project_trace_shape`,
-  `replay_config_hash`/`encode_*` family), `replay_case`
-  (`UnsupportedLiveFact`, `LiveReplayFact`, `CapacityReplayFact`,
-  `LiveReplayCapture`, `SavedReplayCase` and on-disk format,
-  `CapturedReplayChange`, `LiveReplayReport`, `CapturedReplayMismatch`,
-  `ReplayMismatch`, `check_replay_case`/`check_captured_replay`/
-  `observe_replay_case`), `shrink` (`ShrinkConfig`, `ShrunkFailure`,
-  `delete_shrink`, `ShrinkReport`, `shrink_replay_case`), and `sweep`
-  (`SweepFailure`, `SweepSuccess`, `sweep_seeds`).
+- `tina/src/lib.rs` (3287 → 454 lines, target <1,200 ✅) split into
+  `mod address` (address/id/generation types, `Outbound`,
+  service-shaped addresses), `mod context` (`Context`, `CallContext`,
+  `RequestCall`, `RequestContext`, defer-through traits,
+  deferred-reply slots, `CallHandle`/cancellation/`Deadline`,
+  `MessageCaller`, `CallRouting`, `DeferredSlotRegistry`),
+  `mod effect` (closed `Effect` enum and every constructor: `noop`,
+  `fact`, `reply`, `reject`, `send`, `send_to`/`send_event`,
+  `spawn`/`spawn_observed`, `stop`/`stop_with`, `restart_children`,
+  `batch`/`sequence`, `reply_to`/`reply_to_request`), and
+  `mod isolate` (`Isolate`/`CallableIsolate`,
+  `Mailbox`/`TrySendError`, `RestartPolicy`/`ChildRelation`/
+  `RestartDecision`/`RestartBudget` family, `Shard`/`SingleShard`,
+  `ChildDefinition`/`ChildRef`, `SpawnObserved` family,
+  `RestartableChildDefinition`).
+- `tina-sim/src/dst.rs` (4261 → 1180 lines in `dst/mod.rs`,
+  target <1,200 ✅) split into six submodules: `discovery`
+  (`DiscoveredConstants`, `discover_constants`), `invariants`
+  (`InvariantViolation`/`InvariantSuite` and the per-invariant check
+  functions, `contains_visible_pressure`, `assert_projection_eq`),
+  `projection` (`TraceShape`, `RuntimeEventKindName`,
+  `TraceProjection`, `TraceProjectionError`, `ProtocolReplayMismatch`,
+  `project_trace_shape`, `replay_config_hash`/`encode_*` family),
+  `replay_case` (`UnsupportedLiveFact`, `LiveReplayFact`,
+  `CapacityReplayFact`, `LiveReplayCapture`, `SavedReplayCase` and
+  on-disk format, `CapturedReplayChange`, `LiveReplayReport`,
+  `CapturedReplayMismatch`, `ReplayMismatch`,
+  `check_replay_case`/`check_captured_replay`/`observe_replay_case`),
+  `shrink` (`ShrinkConfig`, `ShrunkFailure`, `delete_shrink`,
+  `ShrinkReport`, `shrink_replay_case`), and `sweep` (`SweepFailure`,
+  `SweepSuccess`, `sweep_seeds`).
+- `tina-runtime/src/call.rs` (4656 → 2562 lines in `call/mod.rs`,
+  target <1,200 partial) converted to `call/mod.rs` with per-rail
+  submodules: `tcp` (`tcp_bind`/`accept`/`connect`/`read`/`write`/
+  close), `udp`, `tls`, `dns`, `signals`, `process`, `files`
+  (file + filesystem-path), `persistence` (snapshot/journal), plus
+  shared `types` (newtype IDs, file/process/path/persistence data
+  shapes), `time` (`sleep`, `sleep_then`, `SleepCall` plus all its
+  defer-through impls), `pending` (`CancelableCall`,
+  `PendingCancelableCall`/`Ticket`/`Set` family), `cancel`
+  (`CancelCallBuilder`, `cancel_call`, `call_cancelable`,
+  `call_with_handle`, `call_handle_call_id`), and `groups`
+  (`WorkTicket`, `CancelableWork`, `CancelableWorkSnapshot`,
+  `AdmitWorkError`). The `call/mod.rs` core still holds the
+  closely-coupled `CallInput`/`CallOutput`/`CallError` enums and the
+  `RuntimeCall`/`TypedCall` family.
+- `tina-runtime/src/lib.rs` (5231 → 5135 lines, target <1,500
+  partial) — extracted `mod service_handle` with `ServiceHandle`,
+  `SendOnlyServiceHandle`, `SplitServiceHandle` and their
+  `Copy`/`Clone`/`from_address`/`address` impls. The very large
+  `impl<S, F> Runtime<S, F>` block plus the `Erased*` dispatch/spawn
+  machinery still lives in `lib.rs`; splitting those requires
+  threading `pub(crate)` visibility through generic dispatch adapters
+  and is the next refactor.
 
-All moves are `pub use submodule::*` re-exports at the crate root, so
-the public API is unchanged. A small number of private fields and
-constructors became `pub(crate)` so the kept `runtime_internal` / test
-modules can still construct them; nothing newly public.
+All moves are `pub use submodule::*` re-exports, so the public API is
+unchanged. A small number of private fields, constructors, and
+helper functions became `pub(crate)` / `pub(super)` so existing
+runtime_internal / dispatch / construction code in parent modules
+keeps working; nothing newly public.
 
-Remaining splits in this phase (still pending, future commit):
-`tina-runtime/src/lib.rs` (5231 lines) → `registration` / `dispatch` /
-`remote` / `host_call` submodules; `tina-runtime/src/call.rs` (4656
-lines) → `call/{time,tcp,tls,dns,files,process,signals,persistence,
-cancel,pending,groups}`; `tina-sim/src/lib.rs` (6787 lines) →
-`simulator` / `resources` / `calls` / `projection`; and the three
-large test homes.
+Remaining splits in this phase (named so they can't be silently
+dropped):
+
+- `tina-runtime/src/lib.rs` still at 5,135 lines (target <1,500); the
+  giant `impl<S, F> Runtime<S, F>` block and the `Erased*` adapter
+  family need to be split into `mod registration` / `mod dispatch` /
+  `mod remote` / `mod host_call` once their `pub(crate)` plumbing is
+  ready.
+- `tina-runtime/src/call/mod.rs` still at 2,562 lines (target
+  <1,200); the `CallInput`/`CallOutput`/`CallError` family is the
+  next obvious split when their decoders can be shipped alongside.
+- `tina-sim/src/lib.rs` still at 6,787 lines (target <1,500); the
+  giant `impl<S> Simulator<S>` block has the same shape as the
+  runtime and waits on the same split pattern.
+- The oversized test homes (`tina-runtime/src/tests.rs`,
+  `tina-runtime/tests/local_system.rs`,
+  `tina-sim/tests/io_simulation.rs`) — splittable by test name only.
 
 ### Phase 123 Adversarial Hardening
 
