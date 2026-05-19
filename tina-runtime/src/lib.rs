@@ -1311,8 +1311,9 @@ where
     /// Attempts to enqueue a typed message into one registered isolate.
     ///
     /// This is the runtime-side ingress surface for tests and later drivers.
-    /// It preserves the mailbox's typed `Full` and `Closed` outcomes, while
-    /// still treating unknown isolate IDs as programmer error.
+    /// It preserves the mailbox's typed `Full` and `Closed` outcomes. Unknown,
+    /// stale, or stopped destinations all return `Closed`: direct ingress has
+    /// no caller/cause to attach a trace event to.
     pub fn try_send<M: 'static, R>(
         &self,
         address: Address<M, R>,

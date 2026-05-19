@@ -1,7 +1,6 @@
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::convert::Infallible;
-use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::rc::Rc;
 
 use tina::{
@@ -257,15 +256,14 @@ fn dispatched_send_trace_includes_target_generation() {
 }
 
 #[test]
-fn unknown_isolate_id_still_panics_without_trace_event() {
+fn runtime_ingress_to_unknown_isolate_returns_closed_without_trace_event() {
     let runtime = runtime();
     let synthetic = Address::new(ShardId::new(3), tina::IsolateId::new(99));
 
-    let result = catch_unwind(AssertUnwindSafe(|| {
-        let _ = runtime.try_send(synthetic, TargetMsg::Data(1));
-    }));
-
-    assert!(result.is_err());
+    assert_eq!(
+        runtime.try_send(synthetic, TargetMsg::Data(1)),
+        Err(TrySendError::Closed(TargetMsg::Data(1)))
+    );
     assert!(runtime.trace().is_empty());
 }
 
