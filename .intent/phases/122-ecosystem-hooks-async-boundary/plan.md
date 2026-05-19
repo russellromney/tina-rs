@@ -8,7 +8,7 @@
 - Runs after Phase 115 so hooks respect the core/battery boundary. Can absorb
   lessons from Phase 117 codecs and Phase 118 service policies.
 
-## Spike Facts
+## Starting Facts
 
 - Tina already has native TCP/TLS/HTTP/1/HTTP2/gRPC/WebSocket/timers/files/
   process/DNS/pools/codecs work in flight or shipped. Async interop is not the
@@ -18,6 +18,10 @@
 - Phase 113 is the bridge author kit seed. This phase should expose public
   hooks that make third-party bridge/codecs/policy crates possible without
   private runtime access.
+- `BoundedEventSink`, capacity reports/summaries, service pressure reports,
+  shared scopes, local permits, bridge reports, and protocol facts already
+  exist. This phase aligns and proves those as extension hooks; it must not
+  rebuild them under new names.
 - Rust ecosystem convention is traits + feature-gated crates + examples, not a
   dynamic plugin ABI.
 
@@ -34,8 +38,11 @@ private runtime access and without weakening bounded/DST truth
 
 ## Includes
 
-- public capacity surface hook
-- bounded event sink hook
+- public capacity surface hook through existing `CapacitySurfaceReport` /
+  `CapacitySummary` data; add a trait only if an extension smoke crate cannot
+  work with owned reports
+- bounded event sink hook polish if existing `BoundedEventSink` lacks an
+  extension-facing shape
 - sync codec adapter hook
 - service policy hook
 - bridge author smoke crate using the Phase 113 vocabulary
@@ -43,6 +50,8 @@ private runtime access and without weakening bounded/DST truth
 - custom codec smoke crate using only public APIs
 - custom admission/policy smoke crate using only public APIs
 - runtime capability report for rails/cancel/drain/sim support
+- extension contract docs: what belongs in `tina`, `tina-runtime`, official
+  batteries, bridge crates, and workspace-excluded extension examples
 - clear async boundary docs:
   - native Tina path
   - bridge path
@@ -51,18 +60,30 @@ private runtime access and without weakening bounded/DST truth
 ## Does Not Include
 
 - no dynamic plugin ABI
-- no broad `Future`/`Stream` bridge unless a smoke crate proves the bounded
-  shape
+- no broad `Future`/`Stream` bridge in this phase
 - no hidden Tokio under native Tina services
 - no hook that bypasses trace/capacity/cancel truth
 - no semver promise for internal runtime modules
+
+## Blast Radius
+
+Medium blast radius.
+
+- Allowed: public hook traits/data shapes, extension examples, docs,
+  capability reports, compile-fail tests.
+- Allowed: small public adapters around existing capacity/event/bridge/codecs/
+  policy data when required by the extension smoke crates.
+- Not allowed: moving internals public wholesale, dynamic plugin ABI, generic
+  async bridge, native protocol rewrites, or new runtime backdoors.
+- If new trace/fact/capability events are added, append stable tags only; never
+  renumber existing trace hash tags.
 
 ## Implementation Shape
 
 Expose small stable seams:
 
 ```text
-CapacitySurface
+CapacitySurfaceReport
 BoundedEventSink
 SyncCodec
 ServicePolicy
@@ -72,12 +93,17 @@ RuntimeCapabilityReport
 
 Rules:
 
+- Prefer existing names if they already carry the truth. `CapacitySurfaceReport`
+  is the default capacity hook; do not add a `CapacitySurface` trait unless a
+  public extension crate proves owned reports are insufficient.
 - Hooks use owned reports and typed outcomes, not callbacks into private runtime
   internals.
 - Extension crates may observe and report capacity; they may not mutate runtime
   queues directly.
 - Codecs are synchronous parser/encoder state. Tina owns I/O and backpressure.
-- Event sinks are bounded and choose `drop_oldest`, `drop_newest`, or `reject`.
+- Event sinks are bounded and choose the existing `drop_oldest` or
+  `drop_newest` policy. `drop_newest` is the reject-new-event shape; do not add
+  a third synonym.
 - Service policies return decisions; they do not send messages or retry work.
 - Bridge author parts name install result, address, closer, metrics, pressure,
   shutdown, worker-terminal outcome, and caller-observed outcome.
@@ -103,14 +129,30 @@ APIs only and run by manifest path:
   `ctx.now()` and reports replayable state.
 
 No smoke crate may import `tina_runtime::runtime_internal` or private modules.
+Add one compile-fail or lint-style proof that an extension crate cannot mint
+runtime-owned tokens/handles by importing hidden internals.
+Every smoke crate must have a README command and a smoke test.
+
+The compile-fail proof should be concrete. Use `trybuild` or a
+workspace-excluded fixture that attempts at least:
+
+- import/use `tina_runtime::runtime_internal`;
+- mint a runtime-owned token/handle/lease;
+- construct a private capability/report field directly.
+
+Pin the failure so extension authors learn: use public hooks, not private
+runtime state.
 
 ## Proof Shape
 
 - extension smoke crates compile and run using only public APIs
+- extension smoke crates fail if they import hidden/private runtime internals
 - custom surface joins normal capacity summary
 - event sink is bounded and reports drops/full/closed
 - codec hook keeps parser state replayable
 - capability report says supported/unsupported/cancel/drain/sim truth
+- extension docs classify every official bridge/protocol as core, official
+  battery, bridge, or external crate
 - compile-fail tests prevent hooks from constructing invalid private runtime
   state
 - docs list at least five common Tokio ecosystem cases and put each in native,
@@ -121,8 +163,8 @@ No smoke crate may import `tina_runtime::runtime_internal` or private modules.
 ## Hostile Review Notes
 
 - Do not build a plugin system. Rust crates are the plugin system.
-- Do not make a generic async bridge unless it proves bounded queueing,
-  cancellation, pressure, and replay/unsupported truth.
+- Do not make a generic async bridge in this phase.
+- Do not rename working public vocabulary just to make a hook table pretty.
 - Do not expose internals just because a smoke crate wants an easy path.
 - Do not let custom codecs own sockets. Tina owns sockets.
 - Do not let custom policies hide retries or waiters.

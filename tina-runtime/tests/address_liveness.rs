@@ -256,7 +256,7 @@ fn dispatched_send_trace_includes_target_generation() {
 }
 
 #[test]
-fn unknown_isolate_id_returns_closed_without_trace_event() {
+fn runtime_ingress_to_unknown_isolate_returns_closed_without_trace_event() {
     let runtime = runtime();
     let synthetic = Address::new(ShardId::new(3), tina::IsolateId::new(99));
 
