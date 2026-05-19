@@ -153,9 +153,11 @@ pub use grpc::{
     grpc_unary_call_h2c_blocking,
 };
 pub use http2::{
-    Http2Connection, Http2ConnectionMsg, Http2ConnectionReply, Http2ConnectionReport, Http2Limits,
-    Http2Listener, Http2ListenerMsg, Http2Outcome, Http2ProtocolError, Http2ServerConfig,
-    Http2StreamReport, Http2StreamState,
+    AlpnProtocols, Http2ClientConnection, Http2ClientLimits, Http2ClientMsg, Http2ClientOutcome,
+    Http2ClientReply, Http2ClientReport, Http2ClientRequest, Http2ClientResponse, Http2Connection,
+    Http2ConnectionMsg, Http2ConnectionReply, Http2ConnectionReport, Http2Limits, Http2Listener,
+    Http2ListenerMsg, Http2Outcome, Http2ProtocolError, Http2ServerConfig, Http2StreamReport,
+    Http2StreamState, Http2Target,
 };
 pub use keepalive::{
     KeepaliveConnAddr, KeepaliveConnection, KeepaliveConnectionMsg, KeepaliveConnectionStopFailure,

@@ -4,6 +4,164 @@ This file records completed work.
 
 ## Unreleased
 
+### Native HTTP/2 Client — First Form
+
+Builds on the module split below. Adds the native HTTP/2 client
+isolate the plan called for, plus the typed
+`Http2Target` / `AlpnProtocols` surface so authority, SNI, trust
+roots, and ALPN protocol selection are typed inputs, not
+string/byte bags.
+
+- `Http2ClientConnection<S>` is a Tina isolate over one TCP stream.
+  It sends the client preface and SETTINGS, opens odd-numbered
+  streams, enforces `max_concurrent_streams`, applies peer SETTINGS
+  (initial window, max frame size, max concurrent streams,
+  `ENABLE_PUSH`), tracks connection/stream flow-control windows
+  with `WINDOW_UPDATE` credit flushing, and reports lifecycle
+  through `ProtocolFact::Http2StreamOpened` / `Http2StreamClosed` /
+  `Http2StreamReset` with `direction: Outbound` for client-initiated
+  streams. Each request is one `Http2ClientMsg::Submit` call; the
+  connection captures the caller's `RequestContext` and replies
+  later with one typed `Http2ClientOutcome`.
+- `Http2ClientOutcome` covers every reason a Tina-owned client
+  stream can end in: `Replied(Http2ClientResponse)`, `Full`,
+  `Closed`, `FlowControlBlocked`, `Timeout`, `Reset(Http2ResetReason)`,
+  `LocalCancel`, `ProtocolError(Http2ProtocolError)`, and
+  `TlsAlpnMismatch`. The enum is `#[non_exhaustive]` so streaming
+  bodies and the live TLS ALPN path land as new arms without
+  breaking match sites.
+- `Http2Target::H2c { authority, addr }` and
+  `Http2Target::Tls { authority, addr, server_name, trust_roots, alpn }`
+  are typed shapes. `H2c` cannot carry SNI or trust roots; `Tls`
+  must carry both. `Http2Target::route_key()` folds authority,
+  TLS/root/ALPN policy into a stable key the pool work in Phase 119
+  will read.
+- `AlpnProtocols::h2()` / `AlpnProtocols::none()` is the named ALPN
+  config; no raw `Vec<Vec<u8>>` ALPN bag. This is the API the
+  runtime TLS rail will accept once the ALPN extension lands. Today
+  the runtime TLS rail does not yet plumb ALPN bytes, so the client
+  surfaces a typed `Http2ClientOutcome::TlsAlpnMismatch` for any
+  `Http2Target::Tls` target — no silent h2c fallback, no generic
+  IO error. Live HTTPS/2 with `h2` selection is a follow-up that
+  lands the ALPN bytes through `CallInput::TlsConnect` and reads
+  `selected_alpn` out of `CallOutput::TlsConnected`.
+- Live proofs in `tina-http/tests/http2_client_live.rs`:
+  - `h2c_get_round_trip_returns_typed_replied_outcome` — Tina HTTP/2
+    client GETs the existing Tina HTTP/2 server's Counter service
+    and receives `Http2ClientOutcome::Replied` with a 200 status
+    and a non-empty body.
+  - `h2c_post_body_is_round_tripped_through_data_frame` — POST with
+    a buffered body crosses one HEADERS + one DATA frame and the
+    server replies with 200.
+  - `tls_target_returns_typed_alpn_mismatch_without_touching_tls_rails`
+    — `Http2Target::Tls { .. }` resolves to the typed
+    `TlsAlpnMismatch` outcome without ever calling `tls_connect`.
+  - `tls_target_route_key_distinguishes_from_h2c_route_key` and
+    `request_method_and_path_round_trip_through_targets` pin the
+    target/request shapes for the future pool layer and gRPC client.
+- `tina-http`'s full test suite passes (libs + every integration
+  binary); no `cargo fmt` / `cargo clippy` warnings.
+
+### Honest Deferrals After This Checkpoint
+
+These items are named in the Phase 116 plan and are still future
+work after this slice. Each is a real gap, not a label.
+
+- TLS ALPN rail: `CallInput::TlsConnect` / `TlsBind` do not yet
+  accept `AlpnProtocols`, and `CallOutput::TlsConnected` /
+  `TlsAccepted` do not yet carry a `selected_alpn`. The client
+  surface already takes the named `AlpnProtocols::h2()` config, but
+  the bytes are not plumbed through rustls yet. Live HTTPS/2 with
+  `h2` selection unblocks once that lands.
+- Native gRPC client (`GrpcClient::unary` / `server_streaming` /
+  `client_streaming` / `bidi`): not implemented in this slice. The
+  HTTP/2 client now carries response trailers visibly so a later
+  `GrpcClient` wrapper can pull `grpc-status` out of
+  `Http2ClientResponse::trailers` and emit a paired
+  `ProtocolFact::GrpcFinalStatusReceived`. `grpc_unary_call_h2c_blocking`
+  remains the test-only blocking helper; production users still
+  copy the existing bridge path for now.
+- HTTP/2 client streaming request and response bodies. Today's
+  client buffers both under explicit caps. The typed outcome enum
+  pins where streaming variants land.
+- `Http2ClientMsg::Cancel { stream_id }` and a paired
+  `cancel_call`-shaped cancellation that emits outbound
+  RST_STREAM(CANCEL). The connection already maps a peer RST_STREAM
+  into `Http2ClientOutcome::Reset(reason)`.
+- DST replay coverage: the simulator does not yet return a typed
+  unsupported fact for live HTTP/2 client socket work, and no
+  saved replay case exercises the client. The lifecycle facts the
+  client emits reuse existing names so future replay plumbing is
+  mechanical.
+- Connection reuse beyond "one isolate carries many admitted
+  streams": idle eviction, max lifetime, and health policy are
+  Phase 119, the resource maturity slice the plan names. The
+  `Http2Target::route_key()` shape is in place so pool work can
+  consume it without re-keying.
+- HTTPS/2 client compile-fail proofs. The typed `Http2Target`
+  variants already make a roots-less TLS target structurally
+  impossible at the type level, but no `compile_fail` doctest pins
+  the gates explicitly.
+
+### Native Protocol Client Parity — Server-Only Module Split
+
+Checkpoint 1 of the native HTTP/2 / gRPC client work
+(`.intent/phases/116-native-protocol-client-parity`). The single-file
+`tina-http/src/http2.rs` is split into a module tree so the upcoming
+native HTTP/2 client can share frame/header/error helpers with the
+server without copy-paste.
+
+- `tina-http/src/http2/` becomes the module root, with
+  `mod.rs` re-exporting the previous public surface
+  (`Http2Listener`, `Http2Connection`, `Http2ConnectionMsg`,
+  `Http2ConnectionReply`, `Http2ConnectionReport`, `Http2Limits`,
+  `Http2ListenerMsg`, `Http2Outcome`, `Http2ProtocolError`,
+  `Http2ServerConfig`, `Http2StreamReport`, `Http2StreamState`)
+  under their existing paths.
+- `http2/frame.rs` owns frame encode/decode, the standard frame
+  builders (`settings_frame`, `rst_stream_frame`, `goaway_frame`,
+  `window_update_frame`, `headers_frame`, `data_frame`), padded /
+  PRIORITY payload extractors, the wire-level constants
+  (`CLIENT_PREFACE`, `FLAG_*`, `FRAME_*`, `PRIORITY_PAYLOAD_LEN`,
+  `DEFAULT_WINDOW`, `READ_CHUNK`, `WINDOW_CREDIT_FLUSH_THRESHOLD`),
+  and `add_window`.
+- `http2/headers.rs` owns HPACK encode/decode and pseudo-header
+  validation (`HeaderBlock`, `decode_headers_block_with`,
+  `encode_response_headers`, `encode_response_trailers`,
+  `validate_request_headers`, `SETTINGS_*`,
+  `DEFAULT_HEADER_TABLE_SIZE`, `MIN_/MAX_MAX_FRAME_SIZE`).
+- `http2/errors.rs` owns `Http2ProtocolError`, the wire error-code
+  constants (`ERR_*`), and `classify_h2_reset`.
+- `http2/server.rs` keeps the connection/listener isolates plus the
+  in-source server tests. It compiles only against the shared
+  helpers through `super::frame::*`, `super::headers::*`,
+  `super::errors::*`; no duplicate definitions remain.
+- The frame/header/error modules are internal (`pub(super)` items,
+  not re-exported from `mod.rs`). The public HTTP/2 surface is
+  unchanged — no new client types, no ALPN edits, no behavior
+  change. The existing HTTP/2 server tests pass after the move:
+  `cargo test -p tina-http --lib` (139 cases),
+  `cargo test -p tina-http --test http2_live` (32 cases), and
+  `cargo test -p tina-http --test grpc_live` (34 cases). The only
+  call-site change is `try_decode_frame`, which now takes
+  `max_frame_size: usize` instead of `&Http2Limits` so the frame
+  module does not depend on the server config struct.
+
+Honest deferrals — remaining slices of phase 116 (named in
+`.intent/phases/116-native-protocol-client-parity/plan.md`):
+
+- Native HTTP/2 client connection isolate (`Http2ClientConnection`)
+  with bounded stream-slot admission and typed admit/reset/timeout
+  outcomes; pooled-by-authority reuse.
+- Native gRPC client (unary, server-streaming, client-streaming,
+  bidi) over the client connection, with received `GrpcStatus` as a
+  protocol fact.
+- Typed `AlpnProtocols::h2()` / `none()` on the TLS rail and
+  selected-ALPN truth in TLS connect/accept output. The current
+  TLS rail has no ALPN; the deferral is named, not hidden.
+- Specimen updates that replace `grpc_unary_call_h2c_blocking` with
+  the copied client-isolate path.
+
 ### HTTP/2 And Multi-Shard Fairness Hardening (second pass)
 
 - HTTP/2 request `content-length` is now truthful for buffered,

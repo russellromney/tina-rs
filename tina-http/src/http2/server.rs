@@ -34,12 +34,12 @@ use super::errors::{
     Http2ProtocolError, classify_h2_reset,
 };
 use super::frame::{
-    CLIENT_PREFACE, DEFAULT_WINDOW, FLAG_ACK, FLAG_END_HEADERS, FLAG_END_STREAM, FRAME_CONTINUATION,
-    FRAME_DATA, FRAME_GOAWAY, FRAME_HEADERS, FRAME_PING, FRAME_PRIORITY, FRAME_PUSH_PROMISE,
-    FRAME_RST_STREAM, FRAME_SETTINGS, FRAME_WINDOW_UPDATE, Frame, PRIORITY_PAYLOAD_LEN, READ_CHUNK,
-    WINDOW_CREDIT_FLUSH_THRESHOLD, add_window, data_frame, data_payload, goaway_frame,
-    headers_frame, headers_payload, rst_stream_frame, settings_frame, try_decode_frame,
-    window_update_frame,
+    CLIENT_PREFACE, DEFAULT_WINDOW, FLAG_ACK, FLAG_END_HEADERS, FLAG_END_STREAM,
+    FRAME_CONTINUATION, FRAME_DATA, FRAME_GOAWAY, FRAME_HEADERS, FRAME_PING, FRAME_PRIORITY,
+    FRAME_PUSH_PROMISE, FRAME_RST_STREAM, FRAME_SETTINGS, FRAME_WINDOW_UPDATE, Frame,
+    PRIORITY_PAYLOAD_LEN, READ_CHUNK, WINDOW_CREDIT_FLUSH_THRESHOLD, add_window, data_frame,
+    data_payload, goaway_frame, headers_frame, headers_payload, rst_stream_frame, settings_frame,
+    try_decode_frame, window_update_frame,
 };
 use super::headers::{
     DEFAULT_HEADER_TABLE_SIZE, HeaderBlock, MAX_MAX_FRAME_SIZE, MIN_MAX_FRAME_SIZE,
@@ -537,7 +537,9 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Http2Connection<
             self.enqueue_frame(settings_frame(false))?;
         }
 
-        while let Some((frame, used)) = try_decode_frame(&self.read_buf, self.limits.max_frame_size)? {
+        while let Some((frame, used)) =
+            try_decode_frame(&self.read_buf, self.limits.max_frame_size)?
+        {
             self.read_buf.drain(..used);
             self.handle_frame(frame, effects)?;
         }
@@ -1827,7 +1829,6 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Http2Connection<
     }
 }
 
-
 /// Inbound messages for [`Http2Listener`].
 #[derive(Debug, Clone)]
 pub enum Http2ListenerMsg {
@@ -1979,7 +1980,9 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
-        let (decoded, used) = try_decode_frame(&frame, limits.max_frame_size).unwrap().unwrap();
+        let (decoded, used) = try_decode_frame(&frame, limits.max_frame_size)
+            .unwrap()
+            .unwrap();
         assert_eq!(used, frame.len());
         assert_eq!(decoded.ty, FRAME_DATA);
         assert_eq!(decoded.flags, FLAG_END_STREAM);

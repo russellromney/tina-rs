@@ -252,3 +252,19 @@ pub(super) fn validate_request_headers(headers: &HeaderBlock) -> Result<(), Http
     }
     Ok(())
 }
+
+/// Validate the required pseudo-headers for an inbound HTTP/2 response.
+/// `:status` must appear; request pseudo-headers must not.
+pub(super) fn validate_response_headers(headers: &HeaderBlock) -> Result<(), Http2ProtocolError> {
+    if headers.status.is_none() {
+        return Err(Http2ProtocolError::InvalidPseudoHeaders);
+    }
+    if headers.method.is_some()
+        || headers.path.is_some()
+        || headers.scheme.is_some()
+        || headers.authority.is_some()
+    {
+        return Err(Http2ProtocolError::InvalidPseudoHeaders);
+    }
+    Ok(())
+}
