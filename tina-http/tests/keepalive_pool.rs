@@ -25,10 +25,10 @@ use tina::pool::{
 };
 use tina::prelude::*;
 use tina_http::{
-    HttpClientConfig, HttpRequest, HttpTarget, KeepaliveConnAddr, KeepaliveConnectionMsg,
-    KeepaliveConnectionStopFailure, KeepaliveConnectionStopOutcome, KeepaliveOutcome,
-    KeepalivePoolCloseOutcome, KeepalivePoolDrainOutcome, KeepalivePoolHandles, OriginKey,
-    TlsTrustRoots, build_keepalive_pool, shutdown_keepalive_pool,
+    HttpClientConfig, HttpLimits, HttpRequest, HttpTarget, KeepaliveConnAddr,
+    KeepaliveConnectionMsg, KeepaliveConnectionStopFailure, KeepaliveConnectionStopOutcome,
+    KeepaliveOutcome, KeepalivePoolCloseOutcome, KeepalivePoolDrainOutcome, KeepalivePoolHandles,
+    OriginKey, TlsTrustRoots, build_keepalive_pool, shutdown_keepalive_pool,
 };
 use tina_runtime::pool::{WorkerPoolMsg, WorkerPoolReply};
 use tina_runtime::{
@@ -54,6 +54,21 @@ enum ServerPolicy {
     /// socket without writing `Connection: close`. Mimics a server
     /// that decided to close mid-keepalive.
     SilentlyCloseAfterFirst,
+    /// Always return one valid chunked body.
+    Chunked,
+    /// First request returns chunked, later requests return a
+    /// content-length response. The client should reconnect after the
+    /// chunked response.
+    ChunkedThenContentLength,
+    /// Return a malformed chunked body.
+    MalformedChunked,
+    /// Return a chunked body larger than the client body cap.
+    LargeChunked,
+    /// Return a valid chunked body plus `Connection: close`.
+    ChunkedConnectionClose,
+    /// Return a valid chunked body followed by bytes shaped like a
+    /// second response that no Tina request issued.
+    ChunkedSmugglingShape,
 }
 
 struct ScriptedServer {
@@ -200,19 +215,49 @@ fn handle_connection(
             };
             buf.extend_from_slice(&chunk[..n]);
         }
-        requests.fetch_add(1, Ordering::Relaxed);
+        let request_no = requests.fetch_add(1, Ordering::Relaxed) + 1;
 
         // Build response.
         let close_after = matches!(policy, ServerPolicy::CloseAfterFirst);
-        let body = b"ok";
         let mut response = Vec::with_capacity(128);
         response.extend_from_slice(b"HTTP/1.1 200 OK\r\n");
-        response.extend_from_slice(b"Content-Length: 2\r\n");
-        if close_after {
-            response.extend_from_slice(b"Connection: close\r\n");
+        match policy {
+            ServerPolicy::ChunkedThenContentLength if request_no > 1 => {
+                response.extend_from_slice(b"Content-Length: 2\r\n\r\nok");
+            }
+            ServerPolicy::Chunked | ServerPolicy::ChunkedThenContentLength => {
+                response.extend_from_slice(b"Transfer-Encoding: chunked\r\n\r\n");
+                response.extend_from_slice(b"5\r\nhello\r\n0\r\n\r\n");
+            }
+            ServerPolicy::MalformedChunked => {
+                response.extend_from_slice(b"Transfer-Encoding: chunked\r\n\r\n");
+                response.extend_from_slice(b"5\r\nhelloX\r\n0\r\n\r\n");
+            }
+            ServerPolicy::LargeChunked => {
+                response.extend_from_slice(b"Transfer-Encoding: chunked\r\n\r\n");
+                response.extend_from_slice(b"20\r\n01234567890123456789012345678901\r\n0\r\n\r\n");
+            }
+            ServerPolicy::ChunkedConnectionClose => {
+                response
+                    .extend_from_slice(b"Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n");
+                response.extend_from_slice(b"5\r\nhello\r\n0\r\n\r\n");
+            }
+            ServerPolicy::ChunkedSmugglingShape => {
+                response.extend_from_slice(b"Transfer-Encoding: chunked\r\n\r\n");
+                response.extend_from_slice(
+                    b"5\r\nhello\r\n0\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\nstale!",
+                );
+            }
+            _ => {
+                let body = b"ok";
+                response.extend_from_slice(b"Content-Length: 2\r\n");
+                if close_after {
+                    response.extend_from_slice(b"Connection: close\r\n");
+                }
+                response.extend_from_slice(b"\r\n");
+                response.extend_from_slice(body);
+            }
         }
-        response.extend_from_slice(b"\r\n");
-        response.extend_from_slice(body);
         if stream.write_all(&response).is_err() {
             return;
         }
@@ -223,7 +268,14 @@ fn handle_connection(
 
         match policy {
             ServerPolicy::Keepalive => {}
-            ServerPolicy::CloseAfterFirst | ServerPolicy::SilentlyCloseAfterFirst => return,
+            ServerPolicy::CloseAfterFirst
+            | ServerPolicy::SilentlyCloseAfterFirst
+            | ServerPolicy::ChunkedConnectionClose
+            | ServerPolicy::ChunkedSmugglingShape => return,
+            ServerPolicy::Chunked
+            | ServerPolicy::ChunkedThenContentLength
+            | ServerPolicy::MalformedChunked
+            | ServerPolicy::LargeChunked => {}
         }
     }
 }
@@ -274,6 +326,7 @@ enum DriverEvent {
     Request {
         id: u32,
         status: u16,
+        body: Vec<u8>,
         must_retire: bool,
     },
     RequestErr {
@@ -547,6 +600,7 @@ impl Isolate for Driver {
                         Ok(response) => DriverEvent::Request {
                             id,
                             status: response.status.as_u16(),
+                            body: response.body.as_buffered().unwrap_or(&[]).to_vec(),
                             must_retire,
                         },
                         Err(err) => DriverEvent::RequestErr {
@@ -672,10 +726,20 @@ impl TestRig {
         capacity: usize,
         max_waiters: usize,
     ) -> KeepalivePoolHandles {
+        self.build_pool_with_config(target, HttpClientConfig::dev(), capacity, max_waiters)
+    }
+
+    fn build_pool_with_config(
+        &self,
+        target: HttpTarget,
+        config: HttpClientConfig,
+        capacity: usize,
+        max_waiters: usize,
+    ) -> KeepalivePoolHandles {
         build_keepalive_pool(
             self.rt(),
             target,
-            HttpClientConfig::dev(),
+            config,
             PoolConfig::new(capacity, max_waiters),
             16,
             32,
@@ -813,6 +877,305 @@ fn sequential_requests_reuse_one_connection() {
         server.accepts(),
         1,
         "all three requests should ride one TCP connection"
+    );
+
+    rig.shutdown();
+    server.stop();
+}
+
+#[test]
+fn keepalive_decodes_chunked_response_and_retires_connection() {
+    let server = ScriptedServer::start(ServerPolicy::Chunked);
+    let rig = TestRig::start();
+    let pool = rig.build_pool(HttpTarget::http(server.addr), 1, 4);
+    let (driver, _state, rx) = rig.driver(&pool);
+
+    let _ = rig.rt().try_send(
+        driver,
+        DriverMsg::Acquire {
+            id: 1,
+            timeout: Duration::from_secs(2),
+        },
+    );
+    wait_for_event(&rx, |e| matches!(e, DriverEvent::Acquired { id: 1, .. }));
+    let _ = rig.rt().try_send(
+        driver,
+        DriverMsg::Request {
+            id: 1,
+            request: req(),
+            request_timeout: Duration::from_secs(2),
+            call_timeout: Duration::from_secs(2),
+        },
+    );
+    let event = wait_for_event(&rx, |e| matches!(e, DriverEvent::Request { id: 1, .. }));
+    match event {
+        DriverEvent::Request {
+            status,
+            body,
+            must_retire,
+            ..
+        } => {
+            assert_eq!(status, 200);
+            assert_eq!(&body, b"hello");
+            assert!(must_retire, "chunked first form retires after decoding");
+        }
+        other => panic!("unexpected event {other:?}"),
+    }
+
+    rig.shutdown();
+    server.stop();
+}
+
+#[test]
+fn chunked_then_content_length_requests_do_not_cross_contaminate() {
+    let server = ScriptedServer::start(ServerPolicy::ChunkedThenContentLength);
+    let rig = TestRig::start();
+    let pool = rig.build_pool(HttpTarget::http(server.addr), 1, 4);
+    let (driver, _state, rx) = rig.driver(&pool);
+
+    for id in 1..=2 {
+        let _ = rig.rt().try_send(
+            driver,
+            DriverMsg::Acquire {
+                id,
+                timeout: Duration::from_secs(2),
+            },
+        );
+        wait_for_event(
+            &rx,
+            |e| matches!(e, DriverEvent::Acquired { id: i, .. } if *i == id),
+        );
+        let _ = rig.rt().try_send(
+            driver,
+            DriverMsg::Request {
+                id,
+                request: req(),
+                request_timeout: Duration::from_secs(2),
+                call_timeout: Duration::from_secs(2),
+            },
+        );
+        let event = wait_for_event(
+            &rx,
+            |e| matches!(e, DriverEvent::Request { id: i, .. } if *i == id),
+        );
+        match event {
+            DriverEvent::Request {
+                body, must_retire, ..
+            } if id == 1 => {
+                assert_eq!(&body, b"hello");
+                assert!(must_retire);
+            }
+            DriverEvent::Request {
+                body, must_retire, ..
+            } => {
+                assert_eq!(&body, b"ok");
+                assert!(!must_retire);
+            }
+            other => panic!("unexpected event {other:?}"),
+        }
+        let _ = rig.rt().try_send(
+            driver,
+            DriverMsg::Release {
+                id,
+                disposition: ReleaseDisposition::Reuse,
+            },
+        );
+        wait_for_event(
+            &rx,
+            |e| matches!(e, DriverEvent::Released { id: i, .. } if *i == id),
+        );
+    }
+
+    assert_eq!(server.requests(), 2);
+    assert_eq!(
+        server.accepts(),
+        2,
+        "chunked response retires so request 2 cannot parse stale bytes on socket 1"
+    );
+
+    rig.shutdown();
+    server.stop();
+}
+
+#[test]
+fn malformed_chunked_response_errors_and_retires() {
+    let server = ScriptedServer::start(ServerPolicy::MalformedChunked);
+    let rig = TestRig::start();
+    let pool = rig.build_pool(HttpTarget::http(server.addr), 1, 4);
+    let (driver, _state, rx) = rig.driver(&pool);
+
+    let _ = rig.rt().try_send(
+        driver,
+        DriverMsg::Acquire {
+            id: 1,
+            timeout: Duration::from_secs(2),
+        },
+    );
+    wait_for_event(&rx, |e| matches!(e, DriverEvent::Acquired { id: 1, .. }));
+    let _ = rig.rt().try_send(
+        driver,
+        DriverMsg::Request {
+            id: 1,
+            request: req(),
+            request_timeout: Duration::from_secs(2),
+            call_timeout: Duration::from_secs(2),
+        },
+    );
+    let event = wait_for_event(&rx, |e| matches!(e, DriverEvent::RequestErr { id: 1, .. }));
+    match event {
+        DriverEvent::RequestErr { message, .. } => {
+            assert!(message.contains("MalformedChunkedBody"), "{message}");
+            assert!(message.contains("must_retire=true"), "{message}");
+        }
+        other => panic!("unexpected event {other:?}"),
+    }
+
+    rig.shutdown();
+    server.stop();
+}
+
+#[test]
+fn over_cap_chunked_response_errors_and_retires() {
+    let server = ScriptedServer::start(ServerPolicy::LargeChunked);
+    let rig = TestRig::start();
+    let config = HttpClientConfig {
+        limits: HttpLimits {
+            max_body_bytes: 4,
+            ..HttpLimits::default()
+        },
+        ..HttpClientConfig::dev()
+    };
+    let pool = rig.build_pool_with_config(HttpTarget::http(server.addr), config, 1, 4);
+    let (driver, _state, rx) = rig.driver(&pool);
+
+    let _ = rig.rt().try_send(
+        driver,
+        DriverMsg::Acquire {
+            id: 1,
+            timeout: Duration::from_secs(2),
+        },
+    );
+    wait_for_event(&rx, |e| matches!(e, DriverEvent::Acquired { id: 1, .. }));
+    let _ = rig.rt().try_send(
+        driver,
+        DriverMsg::Request {
+            id: 1,
+            request: req(),
+            request_timeout: Duration::from_secs(2),
+            call_timeout: Duration::from_secs(2),
+        },
+    );
+    let event = wait_for_event(&rx, |e| matches!(e, DriverEvent::RequestErr { id: 1, .. }));
+    match event {
+        DriverEvent::RequestErr { message, .. } => {
+            assert!(message.contains("BodyTooLarge"), "{message}");
+            assert!(message.contains("must_retire=true"), "{message}");
+        }
+        other => panic!("unexpected event {other:?}"),
+    }
+
+    rig.shutdown();
+    server.stop();
+}
+
+#[test]
+fn chunked_connection_close_decodes_and_retires() {
+    let server = ScriptedServer::start(ServerPolicy::ChunkedConnectionClose);
+    let rig = TestRig::start();
+    let pool = rig.build_pool(HttpTarget::http(server.addr), 1, 4);
+    let (driver, _state, rx) = rig.driver(&pool);
+
+    let _ = rig.rt().try_send(
+        driver,
+        DriverMsg::Acquire {
+            id: 1,
+            timeout: Duration::from_secs(2),
+        },
+    );
+    wait_for_event(&rx, |e| matches!(e, DriverEvent::Acquired { id: 1, .. }));
+    let _ = rig.rt().try_send(
+        driver,
+        DriverMsg::Request {
+            id: 1,
+            request: req(),
+            request_timeout: Duration::from_secs(2),
+            call_timeout: Duration::from_secs(2),
+        },
+    );
+    let event = wait_for_event(&rx, |e| matches!(e, DriverEvent::Request { id: 1, .. }));
+    match event {
+        DriverEvent::Request {
+            body, must_retire, ..
+        } => {
+            assert_eq!(&body, b"hello");
+            assert!(must_retire);
+        }
+        other => panic!("unexpected event {other:?}"),
+    }
+
+    rig.shutdown();
+    server.stop();
+}
+
+#[test]
+fn chunked_smuggling_shape_is_retired_before_next_request() {
+    let server = ScriptedServer::start(ServerPolicy::ChunkedSmugglingShape);
+    let rig = TestRig::start();
+    let pool = rig.build_pool(HttpTarget::http(server.addr), 1, 4);
+    let (driver, _state, rx) = rig.driver(&pool);
+
+    for id in 1..=2 {
+        let _ = rig.rt().try_send(
+            driver,
+            DriverMsg::Acquire {
+                id,
+                timeout: Duration::from_secs(2),
+            },
+        );
+        wait_for_event(
+            &rx,
+            |e| matches!(e, DriverEvent::Acquired { id: i, .. } if *i == id),
+        );
+        let _ = rig.rt().try_send(
+            driver,
+            DriverMsg::Request {
+                id,
+                request: req(),
+                request_timeout: Duration::from_secs(2),
+                call_timeout: Duration::from_secs(2),
+            },
+        );
+        let event = wait_for_event(
+            &rx,
+            |e| matches!(e, DriverEvent::Request { id: i, .. } if *i == id),
+        );
+        match event {
+            DriverEvent::Request {
+                body, must_retire, ..
+            } => {
+                assert_eq!(&body, b"hello");
+                assert!(must_retire);
+            }
+            other => panic!("unexpected event {other:?}"),
+        }
+        let _ = rig.rt().try_send(
+            driver,
+            DriverMsg::Release {
+                id,
+                disposition: ReleaseDisposition::Reuse,
+            },
+        );
+        wait_for_event(
+            &rx,
+            |e| matches!(e, DriverEvent::Released { id: i, .. } if *i == id),
+        );
+    }
+
+    assert_eq!(server.requests(), 2);
+    assert_eq!(
+        server.accepts(),
+        2,
+        "stale fake response bytes after chunk terminator must die with socket 1"
     );
 
     rig.shutdown();

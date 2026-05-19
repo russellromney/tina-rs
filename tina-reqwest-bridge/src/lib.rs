@@ -111,6 +111,7 @@
 //! per-request   -> ReqwestError::Timeout
 //! body too big  -> ReqwestError::RequestTooLarge / ResponseTooLarge
 //! reqwest fail  -> ReqwestError::Reqwest(reason)
+//! worker bug    -> ReqwestError::Internal(reason)
 //! worker closed -> ReqwestError::Closed
 //! ```
 //!
@@ -184,7 +185,9 @@
 //! ([`ReqwestError::Timeout`] and [`ReqwestError::Reqwest`]), and each
 //! attempt resets its own per-attempt clock. [`ReqwestError::Full`] is
 //! never retried by the worker — it is the explicit pressure signal
-//! and the caller decides what to do.
+//! and the caller decides what to do. [`ReqwestError::Internal`] is
+//! also never retried; it means the bridge lost worker-terminal truth,
+//! not that the upstream network was flaky.
 
 mod helpers;
 mod metrics;

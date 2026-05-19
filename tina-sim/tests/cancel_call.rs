@@ -99,6 +99,7 @@ impl Worker {
 #[derive(Debug)]
 enum DriverMsg {
     Begin,
+    BeginCancelBeforeAdmit,
     DoCancel,
     Returned(CallOutcome<WorkerReply>),
     Cancelled(CancelOutcome),
@@ -140,6 +141,11 @@ impl Driver {
                 }
                 self.pending = Some(handle);
                 effect
+            }
+            DriverMsg::BeginCancelBeforeAdmit => {
+                let (effect, handle) = call_cancelable(self.worker, WorkerMsg::Hold, CALL_TIMEOUT)
+                    .then(DriverMsg::Returned);
+                batch([cancel_call(handle).then(DriverMsg::Cancelled), effect])
             }
             DriverMsg::DoCancel => {
                 let mut effects = Vec::new();
@@ -218,6 +224,36 @@ fn build_with_aux(
         16,
     );
     (sim, driver, worker, observations)
+}
+
+#[test]
+fn cancel_before_call_admit_returns_not_admitted_and_keeps_sim_running() {
+    let (mut sim, driver, _worker, observations) = build();
+    sim.try_send(driver, DriverMsg::BeginCancelBeforeAdmit)
+        .expect("begin cancel-before-admit");
+    drain(&mut sim);
+
+    sim.try_send(driver, DriverMsg::Begin)
+        .expect("second begin after not-admitted cancel");
+    drain(&mut sim);
+
+    let obs = observations.lock().expect("obs").clone();
+    assert!(
+        obs.cancels.contains(&CancelOutcome::NotAdmitted),
+        "cancel before call admission must be typed, not a simulator panic; got {obs:?}"
+    );
+    assert!(
+        sim.trace().iter().any(|event| {
+            matches!(
+                event.kind(),
+                RuntimeEventKind::CallDispatchAttempted {
+                    call_kind: CallKind::IsolateCall,
+                    ..
+                }
+            )
+        }),
+        "simulator should keep dispatching later work after a not-admitted cancel"
+    );
 }
 
 #[test]

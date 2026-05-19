@@ -284,9 +284,11 @@ fn single_shard_call_blocking_returns_command_full_when_queue_saturated() {
     assert!(
         matches!(
             queued,
-            Ok(CallOutcome::Timeout) | Err(ThreadedRuntimeError::CommandFull)
+            Ok(CallOutcome::Timeout)
+                | Err(ThreadedRuntimeError::CommandFull)
+                | Err(ThreadedRuntimeError::HostWaitTimeout)
         ),
-        "first host call should either occupy the single command slot or observe it full; got {queued:?}"
+        "first host call should either occupy the single command slot, time out waiting for the occupied worker, or observe it full; got {queued:?}"
     );
     let saturated =
         runtime.call_blocking(spinner, SpinnerSimpleMsg::Tick, Duration::from_millis(20));
@@ -294,6 +296,58 @@ fn single_shard_call_blocking_returns_command_full_when_queue_saturated() {
     assert!(
         matches!(saturated, Err(ThreadedRuntimeError::CommandFull)),
         "call_blocking against a full command queue must surface CommandFull; got {saturated:?}"
+    );
+    let _ = runtime.shutdown();
+}
+
+#[test]
+fn single_shard_command_full_does_not_poison_later_host_calls() {
+    let runtime = single_runtime(1);
+    let flag = Arc::new(AtomicBool::new(false));
+    let entered = Arc::new(AtomicBool::new(false));
+    let spinner = runtime
+        .register_with_capacity::<SpinnerSimple, Infallible>(
+            SpinnerSimple {
+                flag: Arc::clone(&flag),
+                entered: Arc::clone(&entered),
+            },
+            4,
+        )
+        .expect("register spinner");
+    let echo = runtime
+        .register_with_capacity::<EchoSimple, Infallible>(EchoSimple, 4)
+        .expect("register echo");
+
+    runtime
+        .try_send(spinner, SpinnerSimpleMsg::Tick)
+        .expect("kick spinner");
+    while !entered.load(Ordering::Relaxed) {
+        thread::yield_now();
+    }
+
+    let _ = runtime.call_blocking(spinner, SpinnerSimpleMsg::Tick, Duration::from_millis(20));
+    let saturated =
+        runtime.call_blocking(spinner, SpinnerSimpleMsg::Tick, Duration::from_millis(20));
+    assert!(
+        matches!(saturated, Err(ThreadedRuntimeError::CommandFull)),
+        "setup should prove the user-visible full path first; got {saturated:?}"
+    );
+
+    flag.store(true, Ordering::Relaxed);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let recovered = loop {
+        match runtime.call_blocking(echo, EchoSimpleMsg::AddOne(41), Duration::from_secs(1)) {
+            Ok(outcome) => break outcome,
+            Err(ThreadedRuntimeError::CommandFull) if Instant::now() < deadline => {
+                thread::sleep(Duration::from_millis(5));
+            }
+            Err(err) => panic!("host call after full path: {err:?}"),
+        }
+    };
+    assert_eq!(
+        recovered,
+        CallOutcome::Replied(42),
+        "CommandFull must be a terminal outcome for that admission attempt, not a poisoned runtime"
     );
     let _ = runtime.shutdown();
 }
@@ -328,6 +382,22 @@ fn multi_shard_call_blocking_returns_timeout_when_callee_holds_caller() {
         .call_blocking(silent, SilentMsg::Hold, Duration::from_millis(25))
         .expect("call_blocking");
     assert_eq!(outcome, CallOutcome::Timeout);
+    let _ = runtime.shutdown();
+}
+
+#[test]
+fn multi_shard_call_blocking_host_budget_is_distinct_from_target_deadline() {
+    let runtime = multi_runtime(64);
+    let silent = runtime
+        .register_with_capacity_on::<SilentMS, Infallible>(ShardId::new(1), SilentMS, 4)
+        .expect("register silent");
+    let outcome = runtime.call_blocking_with_host_timeout(
+        silent,
+        SilentMsg::Hold,
+        Duration::from_secs(2),
+        Duration::from_millis(25),
+    );
+    assert_eq!(outcome, Err(ThreadedRuntimeError::HostWaitTimeout));
     let _ = runtime.shutdown();
 }
 
@@ -470,6 +540,15 @@ fn shutdown_handle_wait_before_request_returns_timeout() {
         "wait_report must honor the timeout"
     );
     drop(runtime);
+}
+
+#[test]
+fn shutdown_with_timeout_returns_terminal_report_on_cooperative_runtime() {
+    let runtime = single_runtime(64);
+    let report = runtime
+        .shutdown_with_timeout(Duration::from_secs(2))
+        .expect("bounded shutdown");
+    assert!(report.error().is_none(), "clean shutdown expected");
 }
 
 #[test]

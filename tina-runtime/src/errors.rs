@@ -20,6 +20,10 @@ pub enum ThreadedRuntimeError {
     /// command immediately. The host call did not block and no work was
     /// admitted; the caller can retry once the queue has drained.
     CommandFull,
+    /// The host-side wait budget elapsed before the target call's terminal
+    /// outcome arrived. The target call remains governed by its own call
+    /// deadline.
+    HostWaitTimeout,
 }
 
 impl fmt::Display for ThreadedRuntimeError {
@@ -48,6 +52,12 @@ impl fmt::Display for ThreadedRuntimeError {
                 write!(
                     f,
                     "worker command queue is full; host-control command not admitted"
+                )
+            }
+            Self::HostWaitTimeout => {
+                write!(
+                    f,
+                    "host wait budget elapsed before target call outcome was delivered"
                 )
             }
         }
@@ -353,6 +363,7 @@ mod tests {
             "driver shutdown",
         );
         assert_error(ThreadedRuntimeError::CommandFull, "command queue is full");
+        assert_error(ThreadedRuntimeError::HostWaitTimeout, "host wait budget");
     }
 
     #[test]

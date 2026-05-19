@@ -738,13 +738,22 @@ pub(crate) fn parse_client_frame(buf: &mut Vec<u8>, limits: WebSocketLimits) -> 
     let mut offset = 2usize;
     let mut len = usize::from(b1 & 0x7f);
     if len == 126 {
-        if buf.len() < offset + 2 {
+        let Some(need) = offset.checked_add(2) else {
+            return FrameParse::Error(WebSocketError::FrameTooLarge);
+        };
+        if buf.len() < need {
             return FrameParse::NeedMore;
         }
         len = usize::from(u16::from_be_bytes([buf[offset], buf[offset + 1]]));
+        if len < 126 {
+            return FrameParse::Error(WebSocketError::ProtocolError);
+        }
         offset += 2;
     } else if len == 127 {
-        if buf.len() < offset + 8 {
+        let Some(need) = offset.checked_add(8) else {
+            return FrameParse::Error(WebSocketError::FrameTooLarge);
+        };
+        if buf.len() < need {
             return FrameParse::NeedMore;
         }
         let wide = u64::from_be_bytes([
@@ -757,10 +766,16 @@ pub(crate) fn parse_client_frame(buf: &mut Vec<u8>, limits: WebSocketLimits) -> 
             buf[offset + 6],
             buf[offset + 7],
         ]);
+        if wide & (1u64 << 63) != 0 {
+            return FrameParse::Error(WebSocketError::ProtocolError);
+        }
         len = match usize::try_from(wide) {
             Ok(v) => v,
             Err(_) => return FrameParse::Error(WebSocketError::FrameTooLarge),
         };
+        if len <= usize::from(u16::MAX) {
+            return FrameParse::Error(WebSocketError::ProtocolError);
+        }
         offset += 8;
     }
     let is_control = opcode >= 0x8;
@@ -776,7 +791,13 @@ pub(crate) fn parse_client_frame(buf: &mut Vec<u8>, limits: WebSocketLimits) -> 
     if len > limits.max_message_bytes {
         return FrameParse::Error(WebSocketError::MessageTooLarge);
     }
-    if buf.len() < offset + 4 + len {
+    let Some(mask_end) = offset.checked_add(4) else {
+        return FrameParse::Error(WebSocketError::FrameTooLarge);
+    };
+    let Some(frame_end) = mask_end.checked_add(len) else {
+        return FrameParse::Error(WebSocketError::FrameTooLarge);
+    };
+    if buf.len() < frame_end {
         return FrameParse::NeedMore;
     }
     let mask = [
@@ -785,12 +806,12 @@ pub(crate) fn parse_client_frame(buf: &mut Vec<u8>, limits: WebSocketLimits) -> 
         buf[offset + 2],
         buf[offset + 3],
     ];
-    offset += 4;
-    let mut payload = buf[offset..offset + len].to_vec();
+    offset = mask_end;
+    let mut payload = buf[offset..frame_end].to_vec();
     for (i, byte) in payload.iter_mut().enumerate() {
         *byte ^= mask[i % 4];
     }
-    buf.drain(..offset + len);
+    buf.drain(..frame_end);
     match opcode {
         0x0 => FrameParse::Frame(WebSocketFrame {
             fin,
@@ -877,6 +898,17 @@ fn valid_close_code(code: u16) -> bool {
 mod tests {
     use super::*;
 
+    fn masked_text_frame_with_len_marker(marker: u8, extended: &[u8], payload: &[u8]) -> Vec<u8> {
+        let mask = [0x11, 0x22, 0x33, 0x44];
+        let mut frame = vec![0x81, 0x80 | marker];
+        frame.extend_from_slice(extended);
+        frame.extend_from_slice(&mask);
+        for (i, byte) in payload.iter().enumerate() {
+            frame.push(*byte ^ mask[i % 4]);
+        }
+        frame
+    }
+
     #[test]
     fn accept_key_matches_rfc_example() {
         assert_eq!(
@@ -931,5 +963,48 @@ mod tests {
             generation: 0,
         };
         assert_ne!(stale, refill);
+    }
+
+    #[test]
+    fn client_frame_rejects_non_minimal_126_length() {
+        let mut buf = masked_text_frame_with_len_marker(126, &1u16.to_be_bytes(), b"x");
+        let parsed = parse_client_frame(&mut buf, WebSocketLimits::default());
+        assert!(matches!(
+            parsed,
+            FrameParse::Error(WebSocketError::ProtocolError)
+        ));
+    }
+
+    #[test]
+    fn client_frame_rejects_non_minimal_127_length() {
+        let mut buf = masked_text_frame_with_len_marker(127, &125u64.to_be_bytes(), b"x");
+        let parsed = parse_client_frame(&mut buf, WebSocketLimits::default());
+        assert!(matches!(
+            parsed,
+            FrameParse::Error(WebSocketError::ProtocolError)
+        ));
+    }
+
+    #[test]
+    fn client_frame_rejects_127_length_high_bit() {
+        let mut buf = masked_text_frame_with_len_marker(127, &(1u64 << 63).to_be_bytes(), b"");
+        let parsed = parse_client_frame(&mut buf, WebSocketLimits::default());
+        assert!(matches!(
+            parsed,
+            FrameParse::Error(WebSocketError::ProtocolError)
+        ));
+    }
+
+    #[test]
+    fn client_frame_rejects_huge_frame_before_end_offset_overflow() {
+        let mut buf = masked_text_frame_with_len_marker(127, &(u64::MAX >> 1).to_be_bytes(), b"");
+        let parsed = parse_client_frame(&mut buf, WebSocketLimits::default());
+        assert!(
+            matches!(
+                parsed,
+                FrameParse::Error(WebSocketError::FrameTooLarge | WebSocketError::ProtocolError)
+            ),
+            "huge frame must reject before computing a wrapped end offset"
+        );
     }
 }

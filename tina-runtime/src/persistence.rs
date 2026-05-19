@@ -16,6 +16,8 @@ const JOURNAL_MAGIC: &[u8; 8] = b"TNJRNL01";
 const U64_BYTES: usize = 8;
 const SNAPSHOT_HEADER_BYTES: usize = 8 + U64_BYTES + U64_BYTES + U64_BYTES;
 const JOURNAL_HEADER_BYTES: usize = 8 + U64_BYTES + U64_BYTES + U64_BYTES;
+const JOURNAL_INDEX_MAGIC: &[u8; 8] = b"TNJIDX01";
+const JOURNAL_INDEX_BYTES: usize = 8 + U64_BYTES + U64_BYTES;
 static SNAPSHOT_TEMP_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 /// Support level for one local persistence safety step.
@@ -93,7 +95,7 @@ fn commit_snapshot_with_parent_sync(
     let parent = parent_directory(path);
     fs::create_dir_all(parent).map_err(|_| CallError::Io)?;
     let temp_path = temp_snapshot_path(path);
-    {
+    let write_result = (|| {
         let mut file = OpenOptions::new()
             .create(true)
             .truncate(true)
@@ -102,9 +104,19 @@ fn commit_snapshot_with_parent_sync(
             .map_err(|_| CallError::Io)?;
         file.write_all(&encoded).map_err(|_| CallError::Io)?;
         file.sync_all().map_err(|_| CallError::Io)?;
+        Ok(())
+    })();
+    if let Err(error) = write_result {
+        let _ = fs::remove_file(&temp_path);
+        return Err(error);
     }
-    fs::rename(&temp_path, path).map_err(|_| CallError::Io)?;
-    sync_parent(parent).map_err(|_| CallError::CommitUncertain)?;
+    if fs::rename(&temp_path, path).is_err() {
+        let _ = fs::remove_file(&temp_path);
+        return Err(CallError::Io);
+    }
+    if sync_parent(parent).is_err() {
+        return Err(CallError::CommitUncertain);
+    }
     Ok(())
 }
 
@@ -140,6 +152,8 @@ pub fn append_journal_record(
         .map_err(|_| CallError::Io)?;
     file.write_all(&encoded).map_err(|_| CallError::Io)?;
     file.sync_all().map_err(|_| CallError::Io)?;
+    let file_len = file.metadata().map_err(|_| CallError::Io)?.len();
+    store_journal_last_index(path, record_index, file_len)?;
     Ok(())
 }
 
@@ -161,9 +175,15 @@ pub fn replay_journal(path: &Path) -> Result<JournalReplay, CallError> {
 }
 
 fn validate_next_journal_index(path: &Path, record_index: u64) -> Result<(), CallError> {
+    if let Some(last) = load_journal_last_index(path)? {
+        if record_index <= last {
+            return Err(CallError::CorruptRecord);
+        }
+        return Ok(());
+    }
     let replay = replay_journal(path)?;
-    if replay.warning.is_some() {
-        return Err(CallError::CorruptRecord);
+    if let Some(JournalReplayWarning::TruncatedTail { valid_prefix_len }) = replay.warning {
+        repair_journal_tail(path, valid_prefix_len)?;
     }
     if let Some(last) = replay.records.last()
         && record_index <= last.index
@@ -171,6 +191,67 @@ fn validate_next_journal_index(path: &Path, record_index: u64) -> Result<(), Cal
         return Err(CallError::CorruptRecord);
     }
     Ok(())
+}
+
+fn journal_index_path(path: &Path) -> PathBuf {
+    path.with_extension(format!(
+        "{}idx",
+        path.extension()
+            .and_then(std::ffi::OsStr::to_str)
+            .map(|ext| format!("{ext}."))
+            .unwrap_or_default()
+    ))
+}
+
+fn load_journal_last_index(path: &Path) -> Result<Option<u64>, CallError> {
+    let index_path = journal_index_path(path);
+    let mut file = match OpenOptions::new().read(true).open(index_path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err(CallError::Io),
+    };
+    let mut bytes = [0_u8; JOURNAL_INDEX_BYTES];
+    file.read_exact(&mut bytes)
+        .map_err(|_| CallError::CorruptRecord)?;
+    if &bytes[..8] != JOURNAL_INDEX_MAGIC {
+        return Err(CallError::CorruptRecord);
+    }
+    let last_index = read_u64(&bytes, 8).ok_or(CallError::CorruptRecord)?;
+    let expected_len = read_u64(&bytes, 16).ok_or(CallError::CorruptRecord)?;
+    let actual_len = match fs::metadata(path) {
+        Ok(metadata) => metadata.len(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err(CallError::Io),
+    };
+    if actual_len != expected_len {
+        return Ok(None);
+    }
+    Ok(Some(last_index))
+}
+
+fn store_journal_last_index(path: &Path, last_index: u64, file_len: u64) -> Result<(), CallError> {
+    let index_path = journal_index_path(path);
+    let mut file = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(index_path)
+        .map_err(|_| CallError::Io)?;
+    file.write_all(JOURNAL_INDEX_MAGIC)
+        .map_err(|_| CallError::Io)?;
+    file.write_all(&last_index.to_le_bytes())
+        .map_err(|_| CallError::Io)?;
+    file.write_all(&file_len.to_le_bytes())
+        .map_err(|_| CallError::Io)?;
+    file.sync_all().map_err(|_| CallError::Io)
+}
+
+fn repair_journal_tail(path: &Path, valid_prefix_len: u64) -> Result<(), CallError> {
+    let file = OpenOptions::new()
+        .write(true)
+        .open(path)
+        .map_err(|_| CallError::Io)?;
+    file.set_len(valid_prefix_len).map_err(|_| CallError::Io)
 }
 
 /// Encodes one snapshot image.
@@ -228,7 +309,9 @@ pub fn replay_journal_bytes(bytes: &[u8]) -> Result<JournalReplay, CallError> {
 
     while cursor < bytes.len() {
         if bytes.len() - cursor < JOURNAL_HEADER_BYTES {
-            warning = Some(JournalReplayWarning::TruncatedTail);
+            warning = Some(JournalReplayWarning::TruncatedTail {
+                valid_prefix_len: cursor as u64,
+            });
             break;
         }
         let header = &bytes[cursor..cursor + JOURNAL_HEADER_BYTES];
@@ -243,7 +326,9 @@ pub fn replay_journal_bytes(bytes: &[u8]) -> Result<JournalReplay, CallError> {
             return Err(CallError::CorruptRecord);
         };
         if payload_end > bytes.len() {
-            warning = Some(JournalReplayWarning::TruncatedTail);
+            warning = Some(JournalReplayWarning::TruncatedTail {
+                valid_prefix_len: cursor as u64,
+            });
             break;
         }
         let payload = bytes[payload_start..payload_end].to_vec();
@@ -386,5 +471,25 @@ mod tests {
         let installed = load_snapshot(&path).unwrap().expect("installed snapshot");
         assert_eq!(installed.bytes, b"installed");
         assert_eq!(installed.last_journal_index, 9);
+    }
+
+    #[test]
+    fn snapshot_rename_failure_removes_temp_file() {
+        let dir = unique_dir("rename-cleanup");
+        let path = dir.join("state.snapshot");
+        fs::create_dir(&path).expect("directory blocks file rename");
+        let result = commit_snapshot(&path, b"not-installed".to_vec(), 1);
+
+        assert_eq!(result, Err(CallError::Io));
+        let leftovers: Vec<_> = fs::read_dir(&dir)
+            .expect("read dir")
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains(".tmp"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "temp files should be cleaned after rename failure: {leftovers:?}"
+        );
     }
 }

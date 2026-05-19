@@ -264,8 +264,8 @@ fn different_seed_changes_fingerprint() {
         ..Default::default()
     };
 
-    let (hash_a, _) = run_pass(bind, make_config(7), 1);
-    let (hash_b, _) = run_pass(bind, make_config(9001), 1);
+    let (hash_a, _) = run_pass(bind, make_config(0), 1);
+    let (hash_b, _) = run_pass(bind, make_config(2), 1);
 
     assert_ne!(hash_a, hash_b, "different seed → different fingerprint");
 }

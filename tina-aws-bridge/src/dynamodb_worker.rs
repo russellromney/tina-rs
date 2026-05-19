@@ -347,6 +347,9 @@ impl<S: Shard + 'static> DynamoWorker<S> {
         let in_flight = self.in_flight.len() as u64;
         self.metrics.admitted.fetch_add(1, Ordering::Relaxed);
         self.metrics.note_admit_kind(request_kind);
+        if !reply_plain {
+            self.metrics.note_caller_waiting_admitted();
+        }
         self.metrics.set_in_flight(in_flight);
         self.metrics.note_in_flight(in_flight);
         #[cfg(feature = "tracing")]
@@ -366,6 +369,11 @@ impl<S: Shard + 'static> DynamoWorker<S> {
         };
         match in_flight.receiver.try_recv() {
             Ok(result) => {
+                if in_flight.abandoned.load(Ordering::Acquire) {
+                    self.metrics.note_late_external_terminal();
+                } else if in_flight.request_context.is_some() {
+                    self.metrics.note_caller_waiting_terminal();
+                }
                 self.note_terminal(in_flight.request_kind);
                 Self::complete_terminal(in_flight.request_context, in_flight.reply_plain, result)
             }
@@ -375,6 +383,7 @@ impl<S: Shard + 'static> DynamoWorker<S> {
                 {
                     in_flight.abandoned.store(true, Ordering::Release);
                     self.metrics.timeouts.fetch_add(1, Ordering::Relaxed);
+                    self.metrics.note_caller_timed_out_but_external_running();
                     #[cfg(feature = "tracing")]
                     event!(
                         target: TRACE_TARGET_CALL,
@@ -394,6 +403,11 @@ impl<S: Shard + 'static> DynamoWorker<S> {
                 sleep(self.config.poll_interval).then(move |_| DynamoMsg::Poll(id))
             }
             Err(oneshot::error::TryRecvError::Closed) => {
+                if in_flight.abandoned.load(Ordering::Acquire) {
+                    self.metrics.note_late_external_terminal();
+                } else if in_flight.request_context.is_some() {
+                    self.metrics.note_caller_waiting_terminal();
+                }
                 self.note_terminal(in_flight.request_kind);
                 Self::complete_terminal(
                     in_flight.request_context,

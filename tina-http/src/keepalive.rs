@@ -89,6 +89,7 @@ use tina_runtime::{
     tcp_connect, tcp_read, tcp_write, tls_close, tls_connect, tls_read, tls_write,
 };
 
+use crate::chunked_decoder::{ChunkedDecoder, FeedAllResult};
 use crate::parse::{
     HttpResponseHead, ResponseParseProgress, encode_keepalive_request, parse_response_head,
 };
@@ -271,6 +272,9 @@ struct InFlight {
     generation: u64,
     pending_write: Vec<u8>,
     read_buf: Vec<u8>,
+    decoded_chunked_body: Vec<u8>,
+    chunked_decoder: Option<ChunkedDecoder>,
+    chunked_raw_consumed: usize,
     parsed_head: Option<HttpResponseHead>,
     head_len: usize,
     reply_to: Option<RequestContext<KeepaliveOutcome>>,
@@ -475,6 +479,9 @@ impl<S: Shard + 'static> KeepaliveConnection<S> {
             generation,
             pending_write: Vec::new(),
             read_buf: Vec::new(),
+            decoded_chunked_body: Vec::new(),
+            chunked_decoder: None,
+            chunked_raw_consumed: 0,
             parsed_head: None,
             head_len: 0,
             reply_to,
@@ -606,6 +613,10 @@ impl<S: Shard + 'static> KeepaliveConnection<S> {
             match parse_response_head(&in_flight.read_buf, &self.config.limits) {
                 ResponseParseProgress::NeedMore => return self.read_more(),
                 ResponseParseProgress::Complete { head, head_len } => {
+                    if head.chunked {
+                        in_flight.chunked_decoder =
+                            Some(ChunkedDecoder::new(self.config.limits.max_body_bytes));
+                    }
                     in_flight.parsed_head = Some(head);
                     in_flight.head_len = head_len;
                 }
@@ -615,7 +626,49 @@ impl<S: Shard + 'static> KeepaliveConnection<S> {
             }
         }
 
-        if body_complete(in_flight) {
+        if in_flight
+            .parsed_head
+            .as_ref()
+            .is_some_and(|head| head.chunked)
+        {
+            let decode_start = in_flight
+                .head_len
+                .saturating_add(in_flight.chunked_raw_consumed);
+            let raw = if decode_start <= in_flight.read_buf.len() {
+                &in_flight.read_buf[decode_start..]
+            } else {
+                &[]
+            };
+            let decoder = in_flight
+                .chunked_decoder
+                .as_mut()
+                .expect("chunked decoder initialized with chunked head");
+            match decoder.feed_all(raw, &mut in_flight.decoded_chunked_body) {
+                (FeedAllResult::Complete, consumed) => {
+                    in_flight.chunked_raw_consumed =
+                        in_flight.chunked_raw_consumed.saturating_add(consumed);
+                    self.deliver_success(true)
+                }
+                (FeedAllResult::Failed(error), consumed) => {
+                    in_flight.chunked_raw_consumed =
+                        in_flight.chunked_raw_consumed.saturating_add(consumed);
+                    let client_error = match error {
+                        crate::types::ChunkedError::BodyTooLarge => {
+                            HttpClientError::Parse(crate::types::ResponseParseError::BodyTooLarge)
+                        }
+                        _ => HttpClientError::Parse(
+                            crate::types::ResponseParseError::MalformedChunkedBody,
+                        ),
+                    };
+                    self.fail_request(client_error, true)
+                }
+                (FeedAllResult::NeedMore, consumed) => {
+                    in_flight.chunked_raw_consumed =
+                        in_flight.chunked_raw_consumed.saturating_add(consumed);
+                    self.read_more()
+                }
+            }
+        } else if body_complete(in_flight) {
             // Honor the server's Connection header on the response.
             // `close` token anywhere in the value forbids reuse.
             let must_retire = response_says_close(in_flight);
@@ -631,8 +684,12 @@ impl<S: Shard + 'static> KeepaliveConnection<S> {
             .take()
             .expect("in_flight present at delivery");
         let head = in_flight.parsed_head.expect("head parsed before delivery");
-        let body_end = in_flight.head_len + head.content_length;
-        let body = in_flight.read_buf[in_flight.head_len..body_end].to_vec();
+        let body = if head.chunked {
+            in_flight.decoded_chunked_body
+        } else {
+            let body_end = in_flight.head_len + head.content_length;
+            in_flight.read_buf[in_flight.head_len..body_end].to_vec()
+        };
         let response = HttpResponse {
             status: head.status,
             version: head.version,

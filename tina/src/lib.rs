@@ -288,7 +288,7 @@ macro_rules! isolate_types {
             reply: $reply,
             send: $send,
             spawn: $spawn,
-            spawn_observed: ::std::convert::Infallible,
+            spawn_observed: ::core::convert::Infallible,
             call: $call,
             fact: ::std::convert::Infallible,
             shard: $shard,
@@ -878,12 +878,38 @@ pub enum RestartDecision {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct RestartBudget {
     max_restarts: u32,
+    window: Option<Duration>,
 }
 
 impl RestartBudget {
-    /// Creates a restart budget with a fixed number of allowed restarts.
+    /// Creates a lifetime restart budget with a fixed number of allowed
+    /// restarts.
+    ///
+    /// This keeps the pre-windowed API compatible. New code that wants the
+    /// counter to reset should use [`within`](Self::within); code that wants
+    /// permanent exhaustion can spell it explicitly with
+    /// [`lifetime`](Self::lifetime).
     pub const fn new(max_restarts: u32) -> Self {
-        Self { max_restarts }
+        Self::lifetime(max_restarts)
+    }
+
+    /// Creates a restart budget that never resets.
+    pub const fn lifetime(max_restarts: u32) -> Self {
+        Self {
+            max_restarts,
+            window: None,
+        }
+    }
+
+    /// Creates a restart budget that allows `max_restarts` per `period`.
+    ///
+    /// The first restart opens the window. A later restart at or after
+    /// `period` from that first restart starts a fresh window.
+    pub const fn within(max_restarts: u32, period: Duration) -> Self {
+        Self {
+            max_restarts,
+            window: Some(period),
+        }
     }
 
     /// Returns the maximum number of restarts allowed in this budget window.
@@ -891,11 +917,18 @@ impl RestartBudget {
         self.max_restarts
     }
 
+    /// Returns the reset period for a windowed budget, or `None` for a
+    /// lifetime budget.
+    pub const fn window(self) -> Option<Duration> {
+        self.window
+    }
+
     /// Starts restart accounting at zero consumed restarts.
     pub const fn tracker(self) -> RestartBudgetState {
         RestartBudgetState {
             budget: self,
             restarts_used: 0,
+            window_started: None,
         }
     }
 }
@@ -905,6 +938,7 @@ impl RestartBudget {
 pub struct RestartBudgetState {
     budget: RestartBudget,
     restarts_used: u32,
+    window_started: Option<Instant>,
 }
 
 impl RestartBudgetState {
@@ -933,16 +967,43 @@ impl RestartBudgetState {
     /// Returns the updated accounting state when the restart is still allowed,
     /// or [`RestartBudgetExceeded`] once the budget has been exhausted.
     pub fn record_restart(self) -> Result<Self, RestartBudgetExceeded> {
-        if self.is_exhausted() {
+        self.record_restart_at(Instant::now())
+    }
+
+    /// Records one restart attempt at a runtime-owned monotonic instant.
+    ///
+    /// Lifetime budgets never reset. Windowed budgets reset once `now` is at
+    /// least one configured period after the first restart in the current
+    /// window.
+    pub fn record_restart_at(self, now: Instant) -> Result<Self, RestartBudgetExceeded> {
+        let mut state = self;
+        if let Some(period) = state.budget.window {
+            state = match state.window_started {
+                Some(started) if now.duration_since(started) >= period => Self {
+                    budget: state.budget,
+                    restarts_used: 0,
+                    window_started: Some(now),
+                },
+                Some(_) => state,
+                None => Self {
+                    budget: state.budget,
+                    restarts_used: state.restarts_used,
+                    window_started: Some(now),
+                },
+            };
+        }
+
+        if state.is_exhausted() {
             return Err(RestartBudgetExceeded {
-                attempted_restart: self.restarts_used.saturating_add(1),
-                max_restarts: self.budget.max_restarts,
+                attempted_restart: state.restarts_used.saturating_add(1),
+                max_restarts: state.budget.max_restarts,
             });
         }
 
         Ok(Self {
-            budget: self.budget,
-            restarts_used: self.restarts_used + 1,
+            budget: state.budget,
+            restarts_used: state.restarts_used + 1,
+            window_started: state.window_started,
         })
     }
 
@@ -951,6 +1012,7 @@ impl RestartBudgetState {
         Self {
             budget: self.budget,
             restarts_used: 0,
+            window_started: None,
         }
     }
 }
@@ -971,6 +1033,40 @@ impl RestartBudgetExceeded {
     /// Returns the configured maximum number of allowed restarts.
     pub const fn max_restarts(self) -> u32 {
         self.max_restarts
+    }
+}
+
+#[cfg(test)]
+mod restart_budget_tests {
+    use super::*;
+
+    #[test]
+    fn lifetime_restart_budget_exhausts_permanently() {
+        let now = Instant::now();
+        let state = RestartBudget::lifetime(1).tracker();
+        let state = state.record_restart_at(now).expect("first restart");
+        assert!(
+            state
+                .record_restart_at(now + Duration::from_secs(3600))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn windowed_restart_budget_resets_after_period() {
+        let now = Instant::now();
+        let state = RestartBudget::within(1, Duration::from_secs(10)).tracker();
+        let state = state.record_restart_at(now).expect("first restart");
+        assert!(
+            state
+                .record_restart_at(now + Duration::from_secs(1))
+                .is_err()
+        );
+        let state = state
+            .record_restart_at(now + Duration::from_secs(10))
+            .expect("new window restart");
+        assert_eq!(state.restarts_used(), 1);
+        assert_eq!(state.restarts_remaining(), 0);
     }
 }
 
@@ -2066,8 +2162,8 @@ pub trait SpawnAddress {
     type Reply;
 }
 
-impl SpawnAddress for std::convert::Infallible {
-    type Message = std::convert::Infallible;
+impl SpawnAddress for core::convert::Infallible {
+    type Message = core::convert::Infallible;
     type Reply = ();
 }
 
@@ -2750,6 +2846,13 @@ pub enum CancelCause {
 pub enum CancelOutcome {
     /// Wait closed; capacity reclaimed; late replies become rejected facts.
     Cancelled,
+    /// The handle is still pending but has not been admitted by the runtime.
+    ///
+    /// This can happen when a handler emits `cancel_call(handle)` before the
+    /// matching `call_cancelable(...).then(...)` effect in the same batch. No
+    /// call slot exists yet, so there is nothing to reclaim and no pending
+    /// remote work to cancel.
+    NotAdmitted,
     /// Already replied, timed out, or otherwise settled.
     AlreadyCompleted,
     /// Already cancelled.

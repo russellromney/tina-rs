@@ -122,7 +122,7 @@ fn install_lazy(
         let _entered = tokio_rt.handle().enter();
         PgPoolOptions::new()
             .max_connections(2)
-            .acquire_timeout(Duration::from_millis(50))
+            .acquire_timeout(Duration::from_millis(500))
             .connect_lazy("postgres://test:test@127.0.0.1:1/test")
             .expect("lazy pool URL parse")
     };
@@ -152,6 +152,22 @@ fn register_caller(
             8,
         )
         .expect("register caller")
+}
+
+fn wait_for_external_idle(metrics: &tina_sqlx_bridge::PgMetricsHandle, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if metrics.snapshot().external_in_flight_current == 0 {
+            return;
+        }
+        if Instant::now() >= deadline {
+            panic!(
+                "external work did not settle before {timeout:?}: {:?}",
+                metrics.snapshot()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
 }
 
 fn config_for_admission_tests() -> PgConfig {
@@ -265,7 +281,7 @@ fn full_is_distinct_from_pool_acquire_timeout() {
 }
 
 #[test]
-fn timeout_frees_capacity() {
+fn timeout_settles_caller_but_keeps_external_capacity_until_terminal() {
     let runtime = make_runtime();
     let cfg = PgConfig::bridge_only()
         .with_default_timeout(Duration::from_millis(30))
@@ -303,22 +319,27 @@ fn timeout_frees_capacity() {
 
     let out2 = sink2.wait_one(Duration::from_secs(3));
     assert!(
-        matches!(
-            out2,
-            CallOutcome::Replied(Err(PgError::Timeout | PgError::PoolAcquireTimeout))
-        ),
-        "expected Timeout or PoolAcquireTimeout, got {out2:?}"
+        matches!(out2, CallOutcome::Replied(Err(PgError::Full))),
+        "expected Full while late external work still owns capacity, got {out2:?}"
     );
 
     let m = bridge.metrics.snapshot();
-    assert!(
-        m.timeouts >= 1,
-        "at least one timeout; bridge timeout fires before pool acquire"
-    );
-    assert_eq!(
-        m.admitted, 2,
-        "second request was admitted after timeout freed capacity"
-    );
+    assert_eq!(m.timeouts, 1);
+    assert_eq!(m.admitted, 1, "timeout must not free external capacity");
+    assert_eq!(m.full, 1);
+    assert_eq!(m.caller_waiting_current, 0);
+    assert_eq!(m.external_in_flight_current, 1);
+    assert_eq!(m.late_in_flight_current, 1);
+    let pressure = bridge.metrics.pressure_report();
+    assert_eq!(pressure.leased, 1);
+    assert_eq!(pressure.available, 0);
+    assert_eq!(pressure.waiters, 0);
+
+    wait_for_external_idle(&bridge.metrics, Duration::from_secs(2));
+    let settled = bridge.metrics.snapshot();
+    assert_eq!(settled.external_in_flight_current, 0);
+    assert_eq!(settled.late_in_flight_current, 0);
+    assert_eq!(settled.late_results, 1);
     shutdown(runtime);
 }
 

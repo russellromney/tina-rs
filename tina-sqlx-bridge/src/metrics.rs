@@ -7,10 +7,10 @@
 //! drops the eventual reply as `CallReplyRejected` and that truth lives
 //! in the trace, not here.
 //!
-//! `late_results` is a related but distinct signal: the *bridge*
-//! per-attempt timeout fired ([`crate::PgError::Timeout`]) and the
-//! spawned task later completed anyway. That counter says "Postgres
-//! did the work even though we stopped waiting."
+//! `caller_waiting_current`, `external_in_flight_current`, and
+//! `late_in_flight_current` split the timeout truth: Tina can stop
+//! waiting while SQLx/Postgres is still physically running.
+//! `late_results` counts those late physical terminals.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -56,9 +56,11 @@ pub struct PgMetrics {
     /// Transaction scripts that committed.
     pub transactions_committed: u64,
     /// Transaction scripts that rolled back because a step failed.
-    /// Does not count COMMITs that themselves failed (those land as
-    /// `sqlx_errors`).
+    /// Does not count COMMITs that themselves failed.
     pub transactions_rolled_back: u64,
+    /// Transaction scripts whose steps completed but whose COMMIT
+    /// result was ambiguous.
+    pub transactions_commit_ambiguous: u64,
     /// Number of `pg_cancel_backend(pid)` cancellations the bridge
     /// fired against the sidecar pool. Counts the *attempt*, not
     /// whether Postgres honored it.
@@ -69,7 +71,16 @@ pub struct PgMetrics {
     /// `Timeout`. Worker-side truth; not the same as caller-observed
     /// `CallOutcome::Timeout`.
     pub late_results: u64,
-    /// Current in-flight count.
+    /// Current callers still waiting for a bridge reply.
+    pub caller_waiting_current: u64,
+    /// Current SQLx work still physically in flight. This is the
+    /// value enforced by `max_in_flight`.
+    pub external_in_flight_current: u64,
+    /// Current SQLx work still running after the bridge already
+    /// surfaced [`crate::PgError::Timeout`] to the caller.
+    pub late_in_flight_current: u64,
+    /// Current in-flight count. Deprecated alias for
+    /// `external_in_flight_current`.
     pub in_flight_current: u64,
     /// Highest `in_flight_current` ever observed.
     pub in_flight_high_water: u64,
@@ -94,9 +105,13 @@ pub(crate) struct MetricsInner {
     pub(crate) rows_returned: AtomicU64,
     pub(crate) transactions_committed: AtomicU64,
     pub(crate) transactions_rolled_back: AtomicU64,
+    pub(crate) transactions_commit_ambiguous: AtomicU64,
     pub(crate) db_cancels_sent: AtomicU64,
     pub(crate) decode_errors: AtomicU64,
     pub(crate) late_results: AtomicU64,
+    pub(crate) caller_waiting_current: AtomicU64,
+    pub(crate) external_in_flight_current: AtomicU64,
+    pub(crate) late_in_flight_current: AtomicU64,
     pub(crate) in_flight_current: AtomicU64,
     pub(crate) in_flight_high_water: AtomicU64,
 }
@@ -121,15 +136,23 @@ impl MetricsInner {
             rows_returned: self.rows_returned.load(Ordering::Relaxed),
             transactions_committed: self.transactions_committed.load(Ordering::Relaxed),
             transactions_rolled_back: self.transactions_rolled_back.load(Ordering::Relaxed),
+            transactions_commit_ambiguous: self
+                .transactions_commit_ambiguous
+                .load(Ordering::Relaxed),
             db_cancels_sent: self.db_cancels_sent.load(Ordering::Relaxed),
             decode_errors: self.decode_errors.load(Ordering::Relaxed),
             late_results: self.late_results.load(Ordering::Relaxed),
+            caller_waiting_current: self.caller_waiting_current.load(Ordering::Relaxed),
+            external_in_flight_current: self.external_in_flight_current.load(Ordering::Relaxed),
+            late_in_flight_current: self.late_in_flight_current.load(Ordering::Relaxed),
             in_flight_current: self.in_flight_current.load(Ordering::Relaxed),
             in_flight_high_water: self.in_flight_high_water.load(Ordering::Relaxed),
         }
     }
 
     pub(crate) fn set_in_flight(&self, current: u64) {
+        self.external_in_flight_current
+            .store(current, Ordering::Relaxed);
         self.in_flight_current.store(current, Ordering::Relaxed);
     }
 
@@ -147,6 +170,23 @@ impl MetricsInner {
             }
         }
     }
+
+    pub(crate) fn note_caller_waiting_admitted(&self) {
+        self.caller_waiting_current.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn note_caller_waiting_terminal(&self) {
+        self.caller_waiting_current.fetch_sub(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn note_caller_timed_out_but_external_running(&self) {
+        self.caller_waiting_current.fetch_sub(1, Ordering::Relaxed);
+        self.late_in_flight_current.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn note_late_external_terminal(&self) {
+        self.late_in_flight_current.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 /// Pressure report in pool vocabulary.
@@ -158,9 +198,9 @@ impl MetricsInner {
 /// observe capacity, current load, and high-water mark through one
 /// typed surface.
 ///
-/// `waiters` is always `0` because the bridge does not queue
-/// callers — it replies `PgError::Full` immediately when
-/// `max_in_flight` is saturated.
+/// `waiters` is the number of admitted callers still waiting for a
+/// bridge reply. Late external work after a bridge timeout remains in
+/// `leased` until SQLx reaches terminal.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PgPressureReport {
     /// Configured `max_in_flight` — the bridge's pool capacity.
@@ -169,8 +209,7 @@ pub struct PgPressureReport {
     pub available: usize,
     /// Operations currently in flight.
     pub leased: usize,
-    /// Callers parked waiting for a slot. Always `0` for the bridge;
-    /// present so the shape matches [`tina::pool::PoolPressureReport`].
+    /// Admitted callers currently waiting for a reply.
     pub waiters: usize,
     /// Max waiters the bridge accepts. Always `0`; present for shape
     /// parity.
@@ -246,12 +285,12 @@ impl PgMetricsHandle {
     pub fn pressure_report(&self) -> PgPressureReport {
         let m = self.inner.snapshot();
         let capacity = self.capacity;
-        let leased = m.in_flight_current.min(capacity as u64) as usize;
+        let leased = m.external_in_flight_current.min(capacity as u64) as usize;
         PgPressureReport {
             capacity,
             available: capacity.saturating_sub(leased),
             leased,
-            waiters: 0,
+            waiters: m.caller_waiting_current.min(usize::MAX as u64) as usize,
             max_waiters: 0,
             full_count: m.full,
             closed_count: m.closed,

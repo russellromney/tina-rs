@@ -11,6 +11,7 @@ repository = "https://github.com/russellromney/tina-rs"
 path = "src/lib.rs"
 
 [dependencies]
+socket2 = "0.6"
 tina-runtime = { path = "../tina-runtime" }
 tina-sim = { path = "../tina-sim" }
 

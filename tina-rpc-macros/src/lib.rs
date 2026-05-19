@@ -11,8 +11,8 @@ use proc_macro2::TokenStream as TokenStream2;
 use quote::{format_ident, quote};
 use syn::parse::{Parse, ParseStream};
 use syn::{
-    Error, FnArg, Ident, ItemTrait, Pat, Result, ReturnType, Token, TraitItem, TraitItemFn, Type,
-    parse_macro_input,
+    Error, FnArg, Ident, ItemTrait, Pat, Path, Result, ReturnType, Token, TraitItem, TraitItemFn,
+    Type, parse_macro_input,
 };
 
 /// `#[tina_rpc::service]` — turns a Rust trait into a typed RPC
@@ -36,6 +36,9 @@ use syn::{
 /// `tina_rpc::Encoding` (the only one shipped today); other
 /// encodings can be requested via
 /// `#[tina_rpc::service(encoding = SomeOther)]`.
+///
+/// Renamed dependencies can be passed explicitly:
+/// `#[tina_rpc::service(tina_crate = my_tina, rpc_crate = my_rpc)]`.
 #[proc_macro_attribute]
 pub fn service(args: TokenStream, input: TokenStream) -> TokenStream {
     let args = parse_macro_input!(args as ServiceArgs);
@@ -53,6 +56,8 @@ pub fn service(args: TokenStream, input: TokenStream) -> TokenStream {
 struct ServiceArgs {
     encoding: Option<Type>,
     name: Option<String>,
+    tina_crate: Option<Path>,
+    rpc_crate: Option<Path>,
 }
 
 impl Parse for ServiceArgs {
@@ -60,6 +65,8 @@ impl Parse for ServiceArgs {
         let mut args = Self {
             encoding: None,
             name: None,
+            tina_crate: None,
+            rpc_crate: None,
         };
         while !input.is_empty() {
             let key: Ident = input.parse()?;
@@ -79,10 +86,26 @@ impl Parse for ServiceArgs {
                     }
                     args.name = Some(lit.value());
                 }
+                "tina_crate" => {
+                    let path: Path = input.parse()?;
+                    if args.tina_crate.is_some() {
+                        return Err(Error::new_spanned(path, "duplicate `tina_crate`"));
+                    }
+                    args.tina_crate = Some(path);
+                }
+                "rpc_crate" => {
+                    let path: Path = input.parse()?;
+                    if args.rpc_crate.is_some() {
+                        return Err(Error::new_spanned(path, "duplicate `rpc_crate`"));
+                    }
+                    args.rpc_crate = Some(path);
+                }
                 other => {
                     return Err(Error::new_spanned(
                         key,
-                        format!("unknown service option `{other}`; expected `encoding` or `name`"),
+                        format!(
+                            "unknown service option `{other}`; expected `encoding`, `name`, `tina_crate`, or `rpc_crate`"
+                        ),
                     ));
                 }
             }
@@ -101,6 +124,10 @@ impl Parse for ServiceArgs {
 fn expand(args: ServiceArgs, item: ItemTrait) -> Result<TokenStream2> {
     let trait_ident = item.ident.clone();
     let service_name_lit = args.name.unwrap_or_else(|| trait_ident.to_string());
+    let tina_crate = args.tina_crate.unwrap_or_else(|| syn::parse_quote!(::tina));
+    let rpc_crate = args
+        .rpc_crate
+        .unwrap_or_else(|| syn::parse_quote!(::tina_rpc));
     // Validate the service name against the wire frame's
     // MAX_SERVICE_LEN (255 bytes) and reject the empty string. A
     // zero-byte service name encodes successfully but no registry
@@ -123,7 +150,7 @@ fn expand(args: ServiceArgs, item: ItemTrait) -> Result<TokenStream2> {
     }
     let encoding_ty: Type = match args.encoding {
         Some(ty) => ty,
-        None => syn::parse_quote!(::tina_rpc::Json),
+        None => syn::parse_quote!(#rpc_crate::Json),
     };
 
     let mut methods = Vec::new();
@@ -147,8 +174,17 @@ fn expand(args: ServiceArgs, item: ItemTrait) -> Result<TokenStream2> {
         &service_name_lit,
         &encoding_ty,
         &methods,
+        &tina_crate,
+        &rpc_crate,
     );
-    let client_impl = build_client_impl(&client_struct, &service_name_lit, &encoding_ty, &methods);
+    let client_impl = build_client_impl(
+        &client_struct,
+        &service_name_lit,
+        &encoding_ty,
+        &methods,
+        &tina_crate,
+        &rpc_crate,
+    );
 
     Ok(quote! {
         #item
@@ -296,8 +332,12 @@ fn build_dispatch_impl(
     service_name_lit: &str,
     encoding_ty: &Type,
     methods: &[MethodSig],
+    tina_crate: &Path,
+    rpc_crate: &Path,
 ) -> TokenStream2 {
-    let method_inserts = methods.iter().map(|m| emit_method_entry(trait_ident, m));
+    let method_inserts = methods
+        .iter()
+        .map(|m| emit_method_entry(trait_ident, m, rpc_crate));
 
     let doc_dispatch = format!(
         "Builds a [`tina_rpc::Dispatch`] from a user `H: {trait_ident}` impl. \
@@ -354,17 +394,17 @@ fn build_dispatch_impl(
             #[doc = #doc_dispatch]
             pub fn dispatch<H, Sh>(
                 state: H,
-                limits: ::tina_rpc::PayloadLimits,
-            ) -> ::tina_rpc::Dispatch<H, #encoding_ty, Sh>
+                limits: #rpc_crate::PayloadLimits,
+            ) -> #rpc_crate::Dispatch<H, #encoding_ty, Sh>
             where
                 H: #trait_ident + 'static,
-                Sh: ::tina::Shard + 'static,
-                #encoding_ty: ::tina_rpc::Encoding + ::core::default::Default + 'static,
+                Sh: #tina_crate::Shard + 'static,
+                #encoding_ty: #rpc_crate::Encoding + ::core::default::Default + 'static,
             {
-                let table: ::tina_rpc::MethodTable<H, #encoding_ty> =
-                    ::tina_rpc::MethodTable::new()
+                let table: #rpc_crate::MethodTable<H, #encoding_ty> =
+                    #rpc_crate::MethodTable::new()
                         #(#method_inserts)*;
-                ::tina_rpc::Dispatch::new(
+                #rpc_crate::Dispatch::new(
                     state,
                     table,
                     <#encoding_ty as ::core::default::Default>::default(),
@@ -375,7 +415,7 @@ fn build_dispatch_impl(
     }
 }
 
-fn emit_method_entry(trait_ident: &Ident, m: &MethodSig) -> TokenStream2 {
+fn emit_method_entry(trait_ident: &Ident, m: &MethodSig, rpc_crate: &Path) -> TokenStream2 {
     let method_name_lit = &m.name_str;
     let method_name_ident = &m.name;
 
@@ -405,7 +445,7 @@ fn emit_method_entry(trait_ident: &Ident, m: &MethodSig) -> TokenStream2 {
     let return_ty = &m.return_ty;
 
     quote! {
-        .method(::tina_rpc::Method::new(
+        .method(#rpc_crate::Method::new(
             #method_name_lit,
             move |state: &mut H, args: #tuple_ty| -> #return_ty {
                 #call
@@ -419,8 +459,12 @@ fn build_client_impl(
     service_name_lit: &str,
     encoding_ty: &Type,
     methods: &[MethodSig],
+    tina_crate: &Path,
+    rpc_crate: &Path,
 ) -> TokenStream2 {
-    let per_method = methods.iter().map(|m| build_client_method(encoding_ty, m));
+    let per_method = methods
+        .iter()
+        .map(|m| build_client_method(encoding_ty, m, tina_crate, rpc_crate));
 
     let doc_struct = "Client-side companion: typed request builders \
                      and reply decoders for each trait method. The \
@@ -445,7 +489,12 @@ fn build_client_impl(
     }
 }
 
-fn build_client_method(encoding_ty: &Type, m: &MethodSig) -> TokenStream2 {
+fn build_client_method(
+    encoding_ty: &Type,
+    m: &MethodSig,
+    tina_crate: &Path,
+    rpc_crate: &Path,
+) -> TokenStream2 {
     let method_name_lit = &m.name_str;
     let request_fn = &m.request_fn;
     let decode_fn = &m.decode_reply_fn;
@@ -513,22 +562,22 @@ fn build_client_method(encoding_ty: &Type, m: &MethodSig) -> TokenStream2 {
             #(#arg_decls,)*
             deadline: ::core::time::Duration,
             correlator: u64,
-            reply_to: ::tina::Address<::tina_rpc::ClientResultMsg>,
+            reply_to: #tina_crate::Address<#rpc_crate::ClientResultMsg>,
             max_payload: usize,
         ) -> ::core::result::Result<
-            ::tina_rpc::ClientRequest,
-            ::tina_rpc::EncodingError,
+            #rpc_crate::ClientRequest,
+            #rpc_crate::EncodingError,
         >
         where
-            #encoding_ty: ::tina_rpc::Encoding + ::core::default::Default,
+            #encoding_ty: #rpc_crate::Encoding + ::core::default::Default,
         {
             let encoding = <#encoding_ty as ::core::default::Default>::default();
-            let payload = <#encoding_ty as ::tina_rpc::Encoding>::encode(
+            let payload = <#encoding_ty as #rpc_crate::Encoding>::encode(
                 &encoding,
                 &#tuple_expr,
                 max_payload,
             )?;
-            ::core::result::Result::Ok(::tina_rpc::ClientRequest {
+            ::core::result::Result::Ok(#rpc_crate::ClientRequest {
                 service: ::std::string::String::from(Self::SERVICE_NAME),
                 method: ::std::string::String::from(#method_name_lit),
                 payload,
@@ -542,12 +591,12 @@ fn build_client_method(encoding_ty: &Type, m: &MethodSig) -> TokenStream2 {
         pub fn #decode_fn(
             bytes: &[u8],
             max_payload: usize,
-        ) -> ::core::result::Result<#return_ty, ::tina_rpc::EncodingError>
+        ) -> ::core::result::Result<#return_ty, #rpc_crate::EncodingError>
         where
-            #encoding_ty: ::tina_rpc::Encoding + ::core::default::Default,
+            #encoding_ty: #rpc_crate::Encoding + ::core::default::Default,
         {
             let encoding = <#encoding_ty as ::core::default::Default>::default();
-            <#encoding_ty as ::tina_rpc::Encoding>::decode(&encoding, bytes, max_payload)
+            <#encoding_ty as #rpc_crate::Encoding>::decode(&encoding, bytes, max_payload)
         }
     }
 }

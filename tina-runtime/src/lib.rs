@@ -300,7 +300,7 @@ pub use observation::{
     BoundAddressWaiter, ChildRestarted, ChildRestartedWaiter, IsolateCompleteWaiter,
     IsolateResultWaiter, OperationDoneWaiter, ResultWaitError, WaitError,
 };
-pub use observer::TraceObserver;
+pub use observer::{BufferedTraceObserver, TraceObserver};
 pub use pressure::{MailboxBudget, PressureReport, PressureSummary, format_pressure_line};
 pub use scope::{
     CallContextScopeExt, DeferScopedThrough, DeferredScopedCall, RequestScope, RequestScopeId,
@@ -397,6 +397,7 @@ where
     next_isolate_id: u64,
     ids: IdSource,
     trace: Vec<RuntimeEvent>,
+    trace_start: usize,
     trace_retention: TraceRetention,
     trace_dropped: u64,
     driver: Box<dyn RuntimeDriver>,
@@ -426,6 +427,7 @@ where
     ///
     /// Single-writer (this shard's runtime); no concurrent access.
     cancelled_calls: std::collections::VecDeque<(CallId, tina::CancelCause)>,
+    cancelled_call_cause_evictions: u64,
 }
 
 /// Capacity of the per-runtime recently-cancelled-calls ring. The sim
@@ -678,6 +680,7 @@ where
             next_isolate_id: 1,
             ids,
             trace: Vec::with_capacity(preallocation.trace_capacity),
+            trace_start: 0,
             trace_retention: TraceRetention::Full,
             trace_dropped: 0,
             driver,
@@ -695,6 +698,7 @@ where
             cancelled_calls: std::collections::VecDeque::with_capacity(
                 CANCELLED_CALL_RING_CAPACITY,
             ),
+            cancelled_call_cause_evictions: 0,
         }
     }
 
@@ -723,7 +727,7 @@ where
 
     /// Returns the accumulated runtime trace.
     pub fn trace(&self) -> &[RuntimeEvent] {
-        &self.trace
+        &self.trace[self.trace_start..]
     }
 
     /// Returns the active trace retention policy.
@@ -731,9 +735,29 @@ where
         self.trace_retention
     }
 
+    /// Returns how many recently-cancelled call causes were evicted
+    /// from the bounded attribution ring.
+    ///
+    /// Late replies for evicted calls still reject honestly, but they
+    /// fall back to generic caller-closed/no-pending reasons because
+    /// the exact cancellation cause is no longer retained.
+    pub const fn cancelled_call_cause_evictions(&self) -> u64 {
+        self.cancelled_call_cause_evictions
+    }
+
     /// Returns the number of trace events dropped by the retention policy.
     pub const fn trace_dropped(&self) -> u64 {
         self.trace_dropped
+    }
+
+    #[cfg(test)]
+    fn trace_storage_len(&self) -> usize {
+        self.trace.len()
+    }
+
+    #[cfg(test)]
+    fn entry_count(&self) -> usize {
+        self.entries.len()
     }
 
     /// Walks the current trace and returns a counted summary of
@@ -911,11 +935,7 @@ where
             // Record the cause so any late callee reply that races
             // shutdown surfaces as `RuntimeStopped` rather than the
             // generic `NoPendingCall` / `CallerClosed`.
-            self.cancelled_calls
-                .push_back((call.call_id, tina::CancelCause::RuntimeStopped));
-            if self.cancelled_calls.len() > CANCELLED_CALL_RING_CAPACITY {
-                self.cancelled_calls.pop_front();
-            }
+            self.record_cancelled_call(call.call_id, tina::CancelCause::RuntimeStopped);
             self.push_event(
                 call.requester.isolate,
                 Some(call.cause),
@@ -1291,8 +1311,9 @@ where
     /// Attempts to enqueue a typed message into one registered isolate.
     ///
     /// This is the runtime-side ingress surface for tests and later drivers.
-    /// It preserves the mailbox's typed `Full` and `Closed` outcomes, while
-    /// still treating unknown isolate IDs as programmer error.
+    /// It preserves the mailbox's typed `Full` and `Closed` outcomes. Unknown,
+    /// stale, or stopped destinations all return `Closed`: direct ingress has
+    /// no caller/cause to attach a trace event to.
     pub fn try_send<M: 'static, R>(
         &self,
         address: Address<M, R>,
@@ -1311,11 +1332,7 @@ where
             .iter()
             .find(|entry| entry.id == address.isolate())
         else {
-            panic!(
-                "runtime ingress targeted unknown isolate {} on shard {}",
-                address.isolate().get(),
-                address.shard().get(),
-            );
+            return Err(TrySendError::Closed(message));
         };
 
         if entry.generation != address.generation() {
@@ -1603,6 +1620,7 @@ where
         self.round_messages = round_messages;
 
         self.sweep_dropped_deferred_slots();
+        self.gc_stopped_entries();
 
         delivered
     }
@@ -2575,7 +2593,7 @@ where
                     call_id: context.call_id,
                     requester: context.requester,
                     cause: context.cause,
-                    deadline: self.clock.now() + timeout,
+                    deadline: tina::Deadline::from_instant(self.clock.now(), timeout).instant(),
                     insertion_order,
                     continuation_context: context.continuation_context,
                     translator: Some(translator),
@@ -2629,54 +2647,56 @@ where
             tina::CallHandleState::Settled => tina::CancelOutcome::AlreadyCompleted,
             tina::CallHandleState::Cancelled => tina::CancelOutcome::AlreadyCancelled,
             tina::CallHandleState::Pending => {
-                let raw_call_id = handle_shared.call_id().expect(
-                    "cancel_call dispatched before its call_cancelable effect ran. \
-                     Within one isolate handler, batched effects dispatch in order, so \
-                     this means cancel was emitted before the call effect — issue cancel \
-                     from a separate handler, or store the handle and cancel later.",
-                );
-                let stamped_shard = handle_shared.shard_id().expect(
-                    "shard_id is stamped together with call_id — call_id was Some but \
-                     shard_id was None, which violates set_call_id / set_shard_id pairing.",
-                );
-                if stamped_shard != self.shard.id().get() {
-                    // Cross-shard cancel: the pending-call entry lives
-                    // on the originating shard. Reject with a typed
-                    // outcome instead of silently no-op'ing into
-                    // `AlreadyCompleted`.
-                    tina::CancelOutcome::WrongShard
-                } else {
-                    let call_id = CallId::new(raw_call_id);
-                    match self
-                        .pending_isolate_calls
-                        .iter()
-                        .position(|entry| entry.call_id == call_id)
-                    {
-                        Some(index) => {
-                            let mut entry = self.pending_isolate_calls.remove(index);
-                            // CallCancelled's trace cause chains back
-                            // to the original CallDispatchAttempted so
-                            // every CallDispatchAttempted has exactly
-                            // one settlement event downstream of it.
-                            let original_cause = entry.cause;
-                            let _ = entry.translator.take();
-                            handle_shared.set_state(tina::CallHandleState::Cancelled);
-                            self.record_cancelled_call(call_id, tina::CancelCause::CallerCancelled);
-                            self.close_deferred_slot_for_call_with_reason(
-                                call_id,
-                                trace::DeferredReplyRejectedReason::CallerCancelled,
-                            );
-                            self.push_event(
-                                context.requester.isolate,
-                                Some(original_cause),
-                                RuntimeEventKind::CallCancelled {
-                                    call_id,
-                                    cause: tina::CancelCause::CallerCancelled,
-                                },
-                            );
-                            tina::CancelOutcome::Cancelled
+                match handle_shared.call_id() {
+                    None => tina::CancelOutcome::NotAdmitted,
+                    Some(raw_call_id) => {
+                        let stamped_shard = handle_shared.shard_id().expect(
+                            "shard_id is stamped together with call_id — call_id was Some but \
+                             shard_id was None, which violates set_call_id / set_shard_id pairing.",
+                        );
+                        if stamped_shard != self.shard.id().get() {
+                            // Cross-shard cancel: the pending-call entry lives
+                            // on the originating shard. Reject with a typed
+                            // outcome instead of silently no-op'ing into
+                            // `AlreadyCompleted`.
+                            tina::CancelOutcome::WrongShard
+                        } else {
+                            let call_id = CallId::new(raw_call_id);
+                            match self
+                                .pending_isolate_calls
+                                .iter()
+                                .position(|entry| entry.call_id == call_id)
+                            {
+                                Some(index) => {
+                                    let mut entry = self.pending_isolate_calls.remove(index);
+                                    // CallCancelled's trace cause chains back
+                                    // to the original CallDispatchAttempted so
+                                    // every CallDispatchAttempted has exactly
+                                    // one settlement event downstream of it.
+                                    let original_cause = entry.cause;
+                                    let _ = entry.translator.take();
+                                    handle_shared.set_state(tina::CallHandleState::Cancelled);
+                                    self.record_cancelled_call(
+                                        call_id,
+                                        tina::CancelCause::CallerCancelled,
+                                    );
+                                    self.close_deferred_slot_for_call_with_reason(
+                                        call_id,
+                                        trace::DeferredReplyRejectedReason::CallerCancelled,
+                                    );
+                                    self.push_event(
+                                        context.requester.isolate,
+                                        Some(original_cause),
+                                        RuntimeEventKind::CallCancelled {
+                                            call_id,
+                                            cause: tina::CancelCause::CallerCancelled,
+                                        },
+                                    );
+                                    tina::CancelOutcome::Cancelled
+                                }
+                                None => tina::CancelOutcome::AlreadyCompleted,
+                            }
                         }
-                        None => tina::CancelOutcome::AlreadyCompleted,
                     }
                 }
             }
@@ -2842,6 +2862,8 @@ where
     fn record_cancelled_call(&mut self, call_id: CallId, cause: tina::CancelCause) {
         if self.cancelled_calls.len() == CANCELLED_CALL_RING_CAPACITY {
             self.cancelled_calls.pop_front();
+            self.cancelled_call_cause_evictions =
+                self.cancelled_call_cause_evictions.saturating_add(1);
         }
         self.cancelled_calls.push_back((call_id, cause));
     }
@@ -3406,7 +3428,7 @@ where
         let config = self.supervisors[supervisor_index].config;
         let policy = config.policy();
         let budget_state = self.supervisors[supervisor_index].budget_state;
-        let budget_state = match budget_state.record_restart() {
+        let budget_state = match budget_state.record_restart_at(self.clock.now()) {
             Ok(next) => next,
             Err(error) => {
                 self.push_event(
@@ -3559,12 +3581,16 @@ where
         }
         match self.trace_retention {
             TraceRetention::Full => {
+                self.compact_trace_prefix();
                 self.trace.push(event);
             }
             TraceRetention::Bounded(capacity) if capacity > 0 => {
-                if self.trace.len() == capacity {
-                    self.trace.remove(0);
+                if self.active_trace_len() == capacity {
+                    self.trace_start += 1;
                     self.trace_dropped += 1;
+                    if self.trace_start >= capacity {
+                        self.compact_trace_prefix();
+                    }
                 }
                 self.trace.push(event);
             }
@@ -3577,19 +3603,97 @@ where
 
     fn enforce_trace_retention(&mut self) {
         match self.trace_retention {
-            TraceRetention::Full => {}
+            TraceRetention::Full => {
+                self.compact_trace_prefix();
+            }
             TraceRetention::Bounded(capacity) => {
-                if self.trace.len() > capacity {
-                    let excess = self.trace.len() - capacity;
-                    self.trace.drain(0..excess);
+                let active = self.active_trace_len();
+                if active > capacity {
+                    let excess = active - capacity;
+                    self.trace_start += excess;
                     self.trace_dropped += excess as u64;
                 }
+                self.compact_trace_prefix_if_empty_or_large(capacity.max(1));
             }
             TraceRetention::Off => {
-                self.trace_dropped += self.trace.len() as u64;
+                self.trace_dropped += self.active_trace_len() as u64;
                 self.trace.clear();
+                self.trace_start = 0;
             }
         }
+    }
+
+    fn active_trace_len(&self) -> usize {
+        self.trace.len().saturating_sub(self.trace_start)
+    }
+
+    fn compact_trace_prefix(&mut self) {
+        if self.trace_start == 0 {
+            return;
+        }
+        self.trace.drain(0..self.trace_start);
+        self.trace_start = 0;
+    }
+
+    fn compact_trace_prefix_if_empty_or_large(&mut self, threshold: usize) {
+        if self.trace_start == 0 {
+            return;
+        }
+        if self.trace_start >= self.trace.len() || self.trace_start >= threshold {
+            self.compact_trace_prefix();
+        }
+    }
+
+    fn gc_stopped_entries(&mut self) {
+        let mut index = 0;
+        while index < self.entries.len() {
+            if self.can_gc_stopped_entry(index) {
+                self.entries.remove(index);
+            } else {
+                index += 1;
+            }
+        }
+    }
+
+    fn can_gc_stopped_entry(&self, index: usize) -> bool {
+        let entry = &self.entries[index];
+        if !entry.stopped.get() {
+            return false;
+        }
+        let address = RegisteredAddress {
+            shard: self.shard.id(),
+            isolate: entry.id,
+            generation: entry.generation,
+        };
+        if self
+            .child_records
+            .iter()
+            .any(|record| record.parent == entry.id || record.child == address)
+        {
+            return false;
+        }
+        if self
+            .supervisors
+            .iter()
+            .any(|record| record.parent == address)
+        {
+            return false;
+        }
+        if self
+            .in_flight_calls
+            .iter()
+            .any(|call| call.requester == address)
+        {
+            return false;
+        }
+        if self
+            .pending_isolate_calls
+            .iter()
+            .any(|call| call.requester == address)
+        {
+            return false;
+        }
+        true
     }
 
     fn enqueue_entry_message(
@@ -3645,11 +3749,7 @@ where
             .iter()
             .position(|entry| entry.id == send.target_isolate)
         else {
-            panic!(
-                "send targeted unknown isolate {} on shard {}",
-                send.target_isolate.get(),
-                send.target_shard.get(),
-            );
+            return Err(SendRejectedReason::Closed);
         };
         let entry = &self.entries[entry_index];
 

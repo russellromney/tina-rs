@@ -89,7 +89,8 @@ For protocols, prefer boring sync codec crates:
   trailers, explicit message caps, service-call timeout mapping, and no
   compression
 - HTTP types with `http`
-- TLS state machine with `rustls` — driven by the runtime's TLS lane
+- TLS state machine with `rustls` — driven by the runtime's per-shard TLS
+  worker and bounded TLS queue
   (`tls_bind` / `tls_accept` / `tls_connect` / `tls_read` / `tls_write`
   / `tls_close`). `tina-http`'s `HttpsListener` and `HttpClient` use
   these directly: HTTP/1.1 over a real `rustls` handshake, no Tokio

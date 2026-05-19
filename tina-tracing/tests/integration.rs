@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::{Arc, Mutex};
 
-use tina::{AddressGeneration, IsolateId, RestartPolicy, ShardId};
+use tina::{AddressGeneration, CallRejectedReason, IsolateId, RestartPolicy, ShardId};
 use tina_runtime::{
     AffinityStatus, CallCompletionRejectedReason, CallError, CallId, CallKind,
     CallReplyRejectedReason, CauseId, DeferredReplyRejectedReason, DeferredSlotId, EffectKind,
@@ -602,6 +602,25 @@ fn snapshot_commit_failed_carries_typed_error() {
     });
     assert_eq!(captured.len(), 1);
     assert_eq!(captured[0].field("error"), Some("CommitUncertain"));
+}
+
+#[test]
+fn call_failed_rejected_error_preserves_inner_reason() {
+    let captured = with_capture(|cap| {
+        emit_event(&evt(
+            1,
+            None,
+            RuntimeEventKind::CallFailed {
+                call_id: CallId::new(7),
+                call_kind: CallKind::IsolateCall,
+                reason: CallError::Rejected(CallRejectedReason::ReplyAbandoned),
+            },
+        ));
+        cap.events()
+    });
+    assert_eq!(captured.len(), 1);
+    assert_eq!(captured[0].kind(), Some("call_failed"));
+    assert_eq!(captured[0].field("error"), Some("Rejected.ReplyAbandoned"));
 }
 
 #[test]

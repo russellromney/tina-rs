@@ -46,7 +46,7 @@
 //! - When in-flight is at capacity, additional request frames are answered
 //!   with `Error(Full)` immediately rather than queued.
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::time::Duration;
 
 use tina::prelude::*;
@@ -355,6 +355,7 @@ where
     config: ConnectionConfig,
     inbound: Vec<u8>,
     in_flight: usize,
+    in_flight_ids: HashSet<u64>,
     write_queue: VecDeque<Vec<u8>>,
     /// Bytes currently inside an in-flight `tcp_write`. `None` means no write
     /// is pending; partial-write recovery prepends the unwritten tail back to
@@ -419,6 +420,7 @@ where
             config: init.config,
             inbound: Vec::new(),
             in_flight: 0,
+            in_flight_ids: HashSet::new(),
             write_queue: VecDeque::new(),
             write_in_flight: None,
             activity_seq: 0,
@@ -477,6 +479,7 @@ where
         self.close_dispatched = true;
         self.reads_done = true;
         self.in_flight = 0;
+        self.in_flight_ids.clear();
         self.write_queue.clear();
         self.write_in_flight = None;
         tcp_close_stream(self.stream).then(ConnectionMsg::StreamClosed)
@@ -546,6 +549,7 @@ where
             payload: frame.payload,
         };
         self.in_flight += 1;
+        self.in_flight_ids.insert(request_id);
         call(
             self.router,
             crate::registry::RegistryMsg::Route(request),
@@ -586,7 +590,19 @@ where
                 decode_body(&body).map_err(|e| DrainError::BadPeer(BadPeerReason::Decode(e)))?;
             match frame.kind {
                 FrameKind::Request => {
-                    if self.in_flight >= self.config.max_in_flight {
+                    if self.in_flight_ids.contains(&frame.request_id) {
+                        let duplicate = Frame::error(
+                            frame.request_id,
+                            frame.service,
+                            frame.method,
+                            FrameError::Protocol,
+                            b"duplicate request_id".to_vec(),
+                        );
+                        let bytes = self
+                            .encode_frame(&duplicate)
+                            .ok_or(DrainError::LocalEncode)?;
+                        self.enqueue_write(bytes).map_err(DrainError::BadPeer)?;
+                    } else if self.in_flight >= self.config.max_in_flight {
                         let full = Frame::error(
                             frame.request_id,
                             frame.service,
@@ -690,6 +706,7 @@ where
         // The slot is freed regardless of outcome. We cap saturating_sub even
         // though in_flight should always be >= 1 here.
         self.in_flight = self.in_flight.saturating_sub(1);
+        self.in_flight_ids.remove(&request_id);
         let frame_to_send: Option<Frame> = match outcome {
             CallOutcome::Replied(RouterReply::Ok(payload)) => {
                 Some(Frame::reply(request_id, service, method, payload))
@@ -1081,6 +1098,35 @@ mod tests {
         assert_eq!(conn.in_flight, 1);
         // Either the write started (write_in_flight set, queue empty) or it's queued.
         assert!(conn.write_in_flight.is_some() || !conn.write_queue.is_empty());
+    }
+
+    #[test]
+    fn duplicate_request_id_while_in_flight_returns_protocol_error_without_dispatch() {
+        let mut conn = make_connection(small_config());
+        let _ = dispatch(&mut conn, ConnectionMsg::Begin);
+        let first = build_request(11, "svc", "m", b"first");
+        let effect = dispatch(&mut conn, ConnectionMsg::Read(Ok(first)));
+        assert_eq!(count_effect_leaves(&effect).call, 2, "route + next read");
+        assert_eq!(conn.in_flight, 1);
+        assert!(conn.in_flight_ids.contains(&11));
+
+        let duplicate = build_request(11, "svc", "m", b"second");
+        let effect = dispatch(&mut conn, ConnectionMsg::Read(Ok(duplicate)));
+        assert_eq!(
+            count_effect_leaves(&effect).call,
+            2,
+            "duplicate should write protocol error + continue read, not route service again"
+        );
+        assert_eq!(conn.in_flight, 1);
+        let pending = conn
+            .write_in_flight
+            .as_ref()
+            .or_else(|| conn.write_queue.front())
+            .expect("protocol error frame should be queued or writing");
+        let frame = crate::frame::decode(pending, &FrameLimits::new(1024)).unwrap();
+        assert_eq!(frame.kind, FrameKind::Error);
+        assert_eq!(frame.error, Some(FrameError::Protocol));
+        assert_eq!(frame.request_id, 11);
     }
 
     #[test]

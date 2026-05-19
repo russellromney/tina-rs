@@ -4,6 +4,39 @@ This file records completed work.
 
 ## Unreleased
 
+### Phase 123 Adversarial Hardening
+
+- Hardened HTTP/1 keepalive response handling for chunked replies: keepalive
+  clients now decode chunked response bodies, surface malformed or over-cap
+  chunked bodies as typed parse failures, and retire the connection after
+  chunked delivery so stale bytes cannot contaminate a later request.
+- Tightened HTTP parser/WebSocket strictness: chunked size lines reject
+  forbidden leading whitespace, chunked length accounting uses checked
+  arithmetic, protocol-relative HTTP/1 targets are rejected, and WebSocket
+  frames reject non-minimal extended lengths plus 127-form high-bit lengths.
+- Hardened the native HTTP/2 server: DATA/HEADERS PADDED and PRIORITY flags
+  are parsed correctly, SETTINGS now applies peer flow-control/frame-size
+  facts before ACK, forbidden HTTP/1 connection-control headers and missing
+  authority reject, and rapid reset churn produces `ENHANCE_YOUR_CALM`.
+- Fixed `tina-rpc-tokio` bridge cancellation accounting so a stale
+  cancellation guard cannot double-release a bounded admission slot.
+- Added reserved cross-shard terminal reply lanes so remote `Full`/`Closed`
+  replies are not silently dropped behind ordinary remote traffic.
+- Unified bridge timeout/capacity truth across SQLx, AWS, reqwest, and Tokio
+  bridge paths with separate caller/external/late-work accounting.
+- Bounded runtime/process shutdown and journal repair paths: process cleanup,
+  snapshot temp cleanup, truncated journal append repair, and append-side tail
+  validation now settle with visible outcomes.
+- Hardened runtime hot paths and ownership truth: bounded trace retention is
+  amortized constant-time, buffered trace observers count drops, restart
+  budgets can be windowed, stopped restart entries are collected, cancelled
+  call cause-ring overflow is visible, and `PendingReplies::take()` is counted.
+- Tightened simulator/proof/macro surfaces: deterministic per-tag simulator
+  fault streams, explicit isolate and RPC service macro crate path overrides,
+  core `Infallible` expansion, duplicate RPC request-id rejection, async Tokio
+  bridge drain, and SQLx ambiguous-commit outcomes with completed step
+  records.
+
 ### Phase 112 Protocol Facts To Replay
 
 - New replayable fact effect. `Effect::Fact(I::Fact)` rides handler turns

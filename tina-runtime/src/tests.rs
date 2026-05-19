@@ -73,6 +73,56 @@ fn runtime_preallocation_config_reserves_runtime_owned_metadata() {
     assert!(runtime.round_messages.capacity() >= preallocation.round_scratch_capacity);
 }
 
+#[test]
+fn cancelled_call_cause_ring_overflow_is_visible() {
+    let mut runtime = Runtime::new(TestShard, TestMailboxFactory);
+
+    for raw_id in 0..(CANCELLED_CALL_RING_CAPACITY as u64 + 3) {
+        runtime.record_cancelled_call(CallId::new(raw_id), tina::CancelCause::CallerCancelled);
+    }
+
+    assert_eq!(runtime.cancelled_call_cause_evictions(), 3);
+    assert_eq!(runtime.recently_cancelled_cause(CallId::new(0)), None);
+    assert_eq!(
+        runtime.recently_cancelled_cause(CallId::new(CANCELLED_CALL_RING_CAPACITY as u64 + 2)),
+        Some(tina::CancelCause::CallerCancelled)
+    );
+}
+
+#[test]
+fn bounded_trace_retention_does_not_move_the_tail_on_every_event() {
+    let mut runtime = Runtime::with_clock_and_ids_and_driver(
+        TestShard,
+        TestMailboxFactory,
+        Box::new(MonotonicClock),
+        IdSource::new(),
+        Box::new(FakeDriver::new(Rc::new(RefCell::new(Vec::new())))),
+    );
+    runtime.set_trace_retention(TraceRetention::Bounded(3));
+
+    for _ in 0..100 {
+        runtime.push_event(
+            IsolateId::new(1),
+            None,
+            RuntimeEventKind::EffectObserved {
+                effect: EffectKind::Noop,
+            },
+        );
+    }
+
+    let retained_ids: Vec<_> = runtime
+        .trace()
+        .iter()
+        .map(|event| event.id().get())
+        .collect();
+    assert_eq!(retained_ids, vec![98, 99, 100]);
+    assert_eq!(runtime.trace_dropped(), 97);
+    assert!(
+        runtime.trace_storage_len() <= 6,
+        "bounded trace should compact in chunks, not retain an unbounded stale prefix"
+    );
+}
+
 #[derive(Debug, Default)]
 struct TestShard;
 

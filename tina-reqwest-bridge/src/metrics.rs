@@ -39,8 +39,12 @@ pub struct ReqwestMetrics {
     /// [`crate::ReqwestError::ResponseTooLarge`].
     pub response_too_large: u64,
     /// Reqwest tasks the worker terminated with
-    /// [`crate::ReqwestError::Reqwest`] (any other reqwest-side error).
+    /// [`crate::ReqwestError::Reqwest`] (reqwest-side transport/body
+    /// errors).
     pub reqwest_error: u64,
+    /// Reqwest tasks the worker terminated with
+    /// [`crate::ReqwestError::Internal`].
+    pub internal_error: u64,
     /// Retry attempts scheduled (the count of *retries*, not the first
     /// attempt). Always `0` when [`crate::RetryPolicy::None`].
     pub retries: u64,
@@ -62,6 +66,7 @@ pub(crate) struct MetricsInner {
     pub(crate) timeout: AtomicU64,
     pub(crate) response_too_large: AtomicU64,
     pub(crate) reqwest_error: AtomicU64,
+    pub(crate) internal_error: AtomicU64,
     pub(crate) retries: AtomicU64,
     pub(crate) current_in_flight: AtomicU64,
     pub(crate) in_flight_high_water: AtomicU64,
@@ -79,6 +84,7 @@ impl MetricsInner {
             timeout: self.timeout.load(Ordering::Relaxed),
             response_too_large: self.response_too_large.load(Ordering::Relaxed),
             reqwest_error: self.reqwest_error.load(Ordering::Relaxed),
+            internal_error: self.internal_error.load(Ordering::Relaxed),
             retries: self.retries.load(Ordering::Relaxed),
             current_in_flight: self.current_in_flight.load(Ordering::Relaxed),
             in_flight_high_water: self.in_flight_high_water.load(Ordering::Relaxed),

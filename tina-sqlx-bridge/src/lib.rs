@@ -18,11 +18,10 @@
 //!   a `truncated` flag, never grows the bridge buffer past the cap;
 //! - [`PgRequest::Transaction`] — atomic script of [`PgStep`]s, all
 //!   committed or first-failure rolled back (no nesting);
-//! - opt-in DB-side cancel via
-//!   [`PgConfig::with_cancel_on_timeout`] — when the bridge
-//!   per-attempt timeout fires, a sidecar pool fires
-//!   `pg_cancel_backend(pid)` against the captured backend so
-//!   Postgres stops actually executing the query.
+//! - Tina-side timeout truth: when the bridge per-attempt timeout
+//!   fires, the caller gets [`PgError::Timeout`] promptly, while the
+//!   external SQLx slot remains leased until SQLx/Postgres reaches
+//!   terminal.
 //!
 //! # Cargo features (value types)
 //!
@@ -179,15 +178,16 @@
 //! ```ignore
 //! let report = bridge.metrics.pressure_report();
 //! // report.capacity      == config.max_in_flight
-//! // report.leased        == current in-flight count
+//! // report.leased        == current external SQLx work
 //! // report.available     == free slots
+//! // report.waiters       == callers still awaiting a bridge reply
 //! // report.full_count    == cumulative PgError::Full
 //! // report.timeout_count == bridge deadlines fired
 //! // report.high_water    == peak in-flight observed
 //! ```
 //!
-//! `waiters` is always `0` because the bridge does not queue callers;
-//! it replies [`PgError::Full`] immediately. SQL errors (including
+//! The bridge does not queue unadmitted callers; it replies
+//! [`PgError::Full`] immediately. SQL errors (including
 //! [`PgError::PoolAcquireTimeout`]) do **not** retire the lane.
 //!
 //! # Cancellation rule
@@ -197,30 +197,21 @@
 //!
 //! - Before admission: no SQLx work starts.
 //! - After admission, the spawned task runs on Tokio. The bridge's
-//!   per-attempt deadline detaches the result receiver and surfaces
-//!   `PgError::Timeout` to the caller. The spawned future is
+//!   per-attempt deadline surfaces `PgError::Timeout` to the caller
+//!   and keeps polling the result receiver. The spawned future is
 //!   **not** aborted — abort would cancel SQLx at the next `.await`
-//!   and skip the tally entirely.
+//!   and skip the tally entirely. The external slot remains occupied
+//!   until SQLx reaches terminal.
 //! - **Default**: Postgres keeps executing the query until it
 //!   completes. The connection stays held until then. Treat
 //!   `PgError::Timeout` as "Tina stopped waiting," not "the database
 //!   stopped working."
-//! - **Opt-in via [`PgConfig::with_cancel_on_timeout`]**: the bridge
-//!   builds a sidecar pool from the same URL and fires
-//!   `pg_cancel_backend(pid)` when the per-attempt timeout fires.
-//!   Postgres still does not guarantee mid-flight cancellation, but
-//!   most cancellable statements (sleeps, long-running queries)
-//!   abort and the connection returns to the pool sooner. Cost: one
-//!   extra round trip per admitted request to capture
-//!   `pg_backend_pid()` before running the user's query.
-//! - Cancel is best-effort. There is a small race window between
-//!   "bridge fires cancel against PID 5" and "spawn finishes, conn
-//!   returns to pool, conn is reused for another query." A cancel
-//!   that arrives in that window targets a different query on the
-//!   same backend. Mitigations: keep the bridge per-attempt deadline
-//!   well above normal latency, and accept that
-//!   `db_cancels_sent` is an attempt counter, not a "we killed your
-//!   exact query" counter.
+//! - [`PgConfig::with_cancel_on_timeout`] is a compatibility no-op in
+//!   Phase 123. The previous sidecar `pg_cancel_backend(pid)` path
+//!   could race connection reuse and cancel a later query. Until the
+//!   bridge can quarantine the exact connection being cancelled,
+//!   `db_cancels_sent` remains zero and Tina-side timeout means
+//!   "Tina stopped waiting," not "Postgres stopped working."
 //! - Caller `CallOutcome::Timeout` is **not** the same as bridge
 //!   `PgError::Timeout`. The first means the caller stopped
 //!   waiting; the second means the bridge stopped waiting.
@@ -228,12 +219,12 @@
 //! # Late results
 //!
 //! When the bridge's per-attempt timeout fires, the abandoned flag
-//! is set and the receiver is dropped. The spawned task continues;
+//! is set and the caller authority is settled. The spawned task continues;
 //! when it finishes, `tally_worker_terminal` records the actual
 //! outcome (success / SQLx error / decode / pool variant) and the
-//! abandoned flag triggers `late_results`. The eventual `tx.send` is
-//! a no-op against a dropped receiver. So `late_results` is reliable
-//! for cases where SQLx returned a value after the bridge gave up.
+//! abandoned flag triggers `late_results`. The bridge keeps the
+//! receiver and slot until that result arrives, so `max_in_flight`
+//! caps physical SQLx work, not only callers still waiting.
 //!
 //! `late_results` does **not** count Postgres-side execution that
 //! continues past the future drop, nor does it count the
@@ -267,13 +258,9 @@
 //! - Deterministic replay: SQLx network IO is not deterministic and
 //!   is not observed by `tina-sim`. Replay parity is best-effort at
 //!   the bridge boundary only.
-//! - Cancellation precision: cancel-on-timeout is best-effort.
-//!   Default is no cancel — Postgres keeps executing past the
-//!   bridge's deadline. With cancel enabled, the sidecar fires
-//!   `pg_cancel_backend(pid)`; Postgres may or may not honor it,
-//!   and a small race window exists between cancel firing and the
-//!   target connection being released to the pool. Late completions
-//!   are tallied in `late_results` regardless.
+//! - Cancellation precision: DB-side cancel-on-timeout is disabled in
+//!   Phase 123. Postgres keeps executing past the bridge's deadline,
+//!   and late completions are tallied in `late_results`.
 //! - Polling latency: the bridge wakes via Tina's `sleep` to
 //!   re-check the result channel each `poll_interval`. That is
 //!   visible chatter in the trace and adds bounded latency to

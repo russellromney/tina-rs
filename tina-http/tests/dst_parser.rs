@@ -46,6 +46,7 @@ fn parser_corpus_fingerprint_is_stable() {
         b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close, keep-alive\r\n\r\n",
         b"BAD-REQUEST-LINE\r\n\r\n",
         b"GET http://example.com/path HTTP/1.1\r\nHost: x\r\n\r\n",
+        b"GET //evil.test/path HTTP/1.1\r\nHost: x\r\n\r\n",
         b"POST /x HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n",
         b"POST /x HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\nContent-Length: 6\r\n\r\nhello",
     ];
@@ -60,6 +61,19 @@ fn parser_corpus_fingerprint_is_stable() {
             "corpus fingerprint must be stable across repeated runs"
         );
     }
+}
+
+#[test]
+fn protocol_relative_target_is_not_origin_form() {
+    let buf = b"GET //evil.test/path HTTP/1.1\r\nHost: x\r\n\r\n";
+    let outcome = parse_request_head(buf, &HttpLimits::default());
+    assert!(
+        matches!(
+            outcome,
+            tina_http::ParseProgress::Failed(RequestParseError::UnsupportedRequestTarget)
+        ),
+        "protocol-relative target must reject as unsupported request-target; got {outcome:?}"
+    );
 }
 
 #[test]

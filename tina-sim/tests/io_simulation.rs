@@ -4651,7 +4651,7 @@ fn tcp_replay_preserves_peer_output() {
 #[test]
 fn different_seeds_diverge_under_tcp_delay_faults() {
     let delayed = SimulatorConfig {
-        seed: 0,
+        seed: 2,
         faults: FaultConfig {
             tcp_completion: TcpCompletionFaultMode::DelayBySteps {
                 one_in: 2,
@@ -4662,7 +4662,7 @@ fn different_seeds_diverge_under_tcp_delay_faults() {
         ..Default::default()
     };
     let preserved = SimulatorConfig {
-        seed: 1,
+        seed: 0,
         faults: delayed.faults,
         ..Default::default()
     };
@@ -4676,12 +4676,12 @@ fn different_seeds_diverge_under_tcp_delay_faults() {
     assert_eq!(
         delayed_accept_order,
         vec![delayed_second_waiter, delayed_first_waiter],
-        "seed 0 should delay the first queued accept and let the second waiter complete first"
+        "seed 2 should delay the first queued accept and let the second waiter complete first"
     );
     assert_eq!(
         preserved_accept_order,
         vec![preserved_first_waiter, preserved_second_waiter],
-        "seed 1 should preserve first-in-first-out accept visibility under DelayBySteps"
+        "seed 0 should preserve first-in-first-out accept visibility under DelayBySteps"
     );
     assert_ne!(
         delayed_accept_order, preserved_accept_order,

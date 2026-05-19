@@ -158,6 +158,7 @@ where
     /// `RuntimeStopped`) instead of the generic
     /// `NoPendingCall` / `CallerClosed`.
     cancelled_calls: std::collections::VecDeque<(CallId, tina::CancelCause)>,
+    cancelled_call_cause_evictions: u64,
     /// Live trace observer. Fires before in-memory push so DST replay
     /// sees the same stream a live operator does.
     trace_observer: Option<Arc<dyn tina_runtime::TraceObserver>>,
@@ -219,6 +220,7 @@ where
             cancelled_calls: std::collections::VecDeque::with_capacity(
                 tina_runtime::CANCELLED_CALL_RING_CAPACITY,
             ),
+            cancelled_call_cause_evictions: 0,
             trace_observer: None,
         }
     }
@@ -233,6 +235,16 @@ where
     /// [`tina_runtime::TraceObserver`].
     pub fn set_trace_observer(&mut self, observer: Option<Arc<dyn tina_runtime::TraceObserver>>) {
         self.trace_observer = observer;
+    }
+
+    /// Returns how many recently-cancelled call causes were evicted
+    /// from the bounded attribution ring.
+    ///
+    /// Late replies for evicted calls still reject honestly, but they
+    /// fall back to generic caller-closed/no-pending reasons because
+    /// the exact cancellation cause is no longer retained.
+    pub const fn cancelled_call_cause_evictions(&self) -> u64 {
+        self.cancelled_call_cause_evictions
     }
 
     /// Returns the current virtual monotonic time.
@@ -1336,24 +1348,25 @@ where
         let config = self.supervisors[supervisor_index].config;
         let policy = config.policy();
         let budget_state = self.supervisors[supervisor_index].budget_state;
-        let budget_state = match budget_state.record_restart() {
-            Ok(next) => next,
-            Err(error) => {
-                self.push_event(
-                    parent,
-                    Some(cause),
-                    RuntimeEventKind::SupervisorRestartRejected {
-                        failed_child: failed_child.isolate,
-                        failed_ordinal,
-                        reason: SupervisionRejectedReason::BudgetExceeded {
-                            attempted_restart: error.attempted_restart(),
-                            max_restarts: error.max_restarts(),
+        let budget_state =
+            match budget_state.record_restart_at(self.virtual_anchor + self.virtual_now) {
+                Ok(next) => next,
+                Err(error) => {
+                    self.push_event(
+                        parent,
+                        Some(cause),
+                        RuntimeEventKind::SupervisorRestartRejected {
+                            failed_child: failed_child.isolate,
+                            failed_ordinal,
+                            reason: SupervisionRejectedReason::BudgetExceeded {
+                                attempted_restart: error.attempted_restart(),
+                                max_restarts: error.max_restarts(),
+                            },
                         },
-                    },
-                );
-                return;
-            }
-        };
+                    );
+                    return;
+                }
+            };
         self.supervisors[supervisor_index].budget_state = budget_state;
 
         let triggered = self.push_event(
@@ -3886,12 +3899,7 @@ where
                     end += 1;
                 }
 
-                let selector = self
-                    .config
-                    .seed
-                    .wrapping_add(0x5443_5052)
-                    .wrapping_add(batch_index)
-                    % one_in;
+                let selector = fault_selector(self.config.seed, 0x5443_5052, batch_index, one_in);
                 if selector == 0 && end - start > 1 {
                     ready[start..end].sort_by(|left, right| {
                         right
@@ -3914,12 +3922,8 @@ where
                 if one_in == 0 || steps == 0 {
                     return 0;
                 }
-                let selector = self
-                    .config
-                    .seed
-                    .wrapping_add(0x5443_5044)
-                    .wrapping_add(insertion_order)
-                    % one_in;
+                let selector =
+                    fault_selector(self.config.seed, 0x5443_5044, insertion_order, one_in);
                 if selector == 0 { steps } else { 0 }
             }
         }
@@ -4001,6 +4005,8 @@ where
     fn record_cancelled_call(&mut self, call_id: CallId, cause: tina::CancelCause) {
         if self.cancelled_calls.len() == tina_runtime::CANCELLED_CALL_RING_CAPACITY {
             self.cancelled_calls.pop_front();
+            self.cancelled_call_cause_evictions =
+                self.cancelled_call_cause_evictions.saturating_add(1);
         }
         self.cancelled_calls.push_back((call_id, cause));
     }
@@ -4078,49 +4084,50 @@ where
         let outcome = match handle_shared.state() {
             tina::CallHandleState::Settled => tina::CancelOutcome::AlreadyCompleted,
             tina::CallHandleState::Cancelled => tina::CancelOutcome::AlreadyCancelled,
-            tina::CallHandleState::Pending => {
-                let raw_call_id = handle_shared.call_id().expect(
-                    "cancel_call dispatched before its call_cancelable's effect ran. \
-                     Issue cancel from a separate handler, or store the handle and \
-                     cancel later.",
-                );
-                let stamped_shard = handle_shared.shard_id().expect(
-                    "shard_id is stamped together with call_id — call_id was Some but \
-                     shard_id was None.",
-                );
-                if stamped_shard != self.shard.id().get() {
-                    tina::CancelOutcome::WrongShard
-                } else {
-                    let call_id = CallId::new(raw_call_id);
-                    match self
-                        .pending_isolate_calls
-                        .iter()
-                        .position(|entry| entry.call_id == call_id)
-                    {
-                        Some(index) => {
-                            let mut entry = self.pending_isolate_calls.remove(index);
-                            let original_cause = entry.cause;
-                            let _ = entry.translator.take();
-                            handle_shared.set_state(tina::CallHandleState::Cancelled);
-                            self.record_cancelled_call(call_id, tina::CancelCause::CallerCancelled);
-                            self.close_deferred_slot_for_call_with_reason(
-                                call_id,
-                                tina_runtime::DeferredReplyRejectedReason::CallerCancelled,
-                            );
-                            self.push_event(
-                                context.requester.isolate,
-                                Some(original_cause),
-                                RuntimeEventKind::CallCancelled {
+            tina::CallHandleState::Pending => match handle_shared.call_id() {
+                None => tina::CancelOutcome::NotAdmitted,
+                Some(raw_call_id) => {
+                    let stamped_shard = handle_shared.shard_id().expect(
+                        "shard_id is stamped together with call_id — call_id was Some but \
+                             shard_id was None.",
+                    );
+                    if stamped_shard != self.shard.id().get() {
+                        tina::CancelOutcome::WrongShard
+                    } else {
+                        let call_id = CallId::new(raw_call_id);
+                        match self
+                            .pending_isolate_calls
+                            .iter()
+                            .position(|entry| entry.call_id == call_id)
+                        {
+                            Some(index) => {
+                                let mut entry = self.pending_isolate_calls.remove(index);
+                                let original_cause = entry.cause;
+                                let _ = entry.translator.take();
+                                handle_shared.set_state(tina::CallHandleState::Cancelled);
+                                self.record_cancelled_call(
                                     call_id,
-                                    cause: tina::CancelCause::CallerCancelled,
-                                },
-                            );
-                            tina::CancelOutcome::Cancelled
+                                    tina::CancelCause::CallerCancelled,
+                                );
+                                self.close_deferred_slot_for_call_with_reason(
+                                    call_id,
+                                    tina_runtime::DeferredReplyRejectedReason::CallerCancelled,
+                                );
+                                self.push_event(
+                                    context.requester.isolate,
+                                    Some(original_cause),
+                                    RuntimeEventKind::CallCancelled {
+                                        call_id,
+                                        cause: tina::CancelCause::CallerCancelled,
+                                    },
+                                );
+                                tina::CancelOutcome::Cancelled
+                            }
+                            None => tina::CancelOutcome::AlreadyCompleted,
                         }
-                        None => tina::CancelOutcome::AlreadyCompleted,
                     }
                 }
-            }
+            },
         };
 
         let message_any = translator(outcome);
@@ -4872,7 +4879,7 @@ where
                 if one_in == 0 {
                     return Duration::ZERO;
                 }
-                let selector = self.config.seed.wrapping_add(tag).wrapping_add(ordinal) % one_in;
+                let selector = fault_selector(self.config.seed, tag, ordinal, one_in);
                 if selector == 0 { by } else { Duration::ZERO }
             }
         }
@@ -4885,12 +4892,7 @@ where
                 if one_in == 0 || rounds == 0 {
                     return 0;
                 }
-                let selector = self
-                    .config
-                    .seed
-                    .wrapping_add(0x5345_4e44)
-                    .wrapping_add(ordinal)
-                    % one_in;
+                let selector = fault_selector(self.config.seed, 0x5345_4e44, ordinal, one_in);
                 if selector == 0 { rounds } else { 0 }
             }
         }
@@ -5400,6 +5402,21 @@ where
     }
 }
 
+fn fault_selector(seed: u64, tag: u64, ordinal: u64, modulus: u64) -> u64 {
+    debug_assert!(modulus > 0);
+    if ordinal == 0 {
+        return seed % modulus;
+    }
+    splitmix64(seed ^ tag.rotate_left(17) ^ ordinal.wrapping_mul(0x9E37_79B9_7F4A_7C15)) % modulus
+}
+
+fn splitmix64(mut value: u64) -> u64 {
+    value = value.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    value = (value ^ (value >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    value = (value ^ (value >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    value ^ (value >> 31)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5410,6 +5427,44 @@ mod tests {
         ChildDefinition, ChildRef, Outbound, SpawnObservedError, batch, noop, send, spawn,
         spawn_observed, stop,
     };
+
+    #[test]
+    fn fault_selector_is_deterministic_and_tag_separated() {
+        let first: Vec<_> = (0..32)
+            .map(|ordinal| fault_selector(7, 0xAA, ordinal, 17))
+            .collect();
+        let second: Vec<_> = (0..32)
+            .map(|ordinal| fault_selector(7, 0xAA, ordinal, 17))
+            .collect();
+        let other_tag: Vec<_> = (0..32)
+            .map(|ordinal| fault_selector(7, 0xBB, ordinal, 17))
+            .collect();
+
+        assert_eq!(first, second, "same seed/tag stream must replay exactly");
+        assert_ne!(
+            first, other_tag,
+            "different fault tags should not share a trivially correlated stream"
+        );
+    }
+
+    #[test]
+    fn cancelled_call_cause_ring_overflow_is_visible() {
+        let mut simulator = Simulator::new(NumberedShard(0), SimulatorConfig::default());
+
+        for raw_id in 0..(tina_runtime::CANCELLED_CALL_RING_CAPACITY as u64 + 3) {
+            simulator
+                .record_cancelled_call(CallId::new(raw_id), tina::CancelCause::CallerCancelled);
+        }
+
+        assert_eq!(simulator.cancelled_call_cause_evictions(), 3);
+        assert_eq!(simulator.recently_cancelled_cause(CallId::new(0)), None);
+        assert_eq!(
+            simulator.recently_cancelled_cause(CallId::new(
+                tina_runtime::CANCELLED_CALL_RING_CAPACITY as u64 + 2
+            )),
+            Some(tina::CancelCause::CallerCancelled)
+        );
+    }
 
     #[test]
     fn round_message_scratch_reserve_covers_more_than_initial_capacity() {

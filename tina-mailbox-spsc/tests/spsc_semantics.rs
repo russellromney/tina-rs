@@ -6,9 +6,9 @@ use tina_mailbox_spsc::SpscMailbox;
 
 #[test]
 fn mailbox_preserves_fifo_order() {
-    let mailbox = SpscMailbox::new(3);
+    let mailbox = SpscMailbox::new(4);
 
-    assert_eq!(mailbox.capacity(), 3);
+    assert_eq!(mailbox.capacity(), 4);
     assert_eq!(mailbox.try_send("first"), Ok(()));
     assert_eq!(mailbox.try_send("second"), Ok(()));
     assert_eq!(mailbox.try_send("third"), Ok(()));
@@ -17,6 +17,12 @@ fn mailbox_preserves_fifo_order() {
     assert_eq!(mailbox.recv(), Some("second"));
     assert_eq!(mailbox.recv(), Some("third"));
     assert_eq!(mailbox.recv(), None);
+}
+
+#[test]
+#[should_panic(expected = "SpscMailbox capacity must be a power of two")]
+fn mailbox_rejects_non_power_of_two_capacity() {
+    let _mailbox = SpscMailbox::<usize>::new(3);
 }
 
 #[test]

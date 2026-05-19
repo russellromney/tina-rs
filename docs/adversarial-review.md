@@ -16,6 +16,105 @@ be the canonical review artifact.
 File paths are relative to the repo root. Line numbers reflect the
 `worktree-adversarial-review` snapshot at the time of review.
 
+## Phase 123 First-Pass Coverage Status
+
+Phase 123's PR fixes or explicitly proves every first-pass finding in the
+coverage map. The later A8-A12 second-pass findings remain preserved in this
+file and are assigned to Phase 124 by the phase plan.
+
+| Rock | Findings | Status |
+|---|---|---|
+| 1 | C1 | Fixed in this PR. |
+| 2 | H14, M1, M6, L13, L14, A6, A7 | Fixed in this PR. |
+| 3 | C2, C3, C5, H9, M7, M14 | Fixed in this PR. |
+| 4 | C4, M13 | Fixed in this PR. |
+| 5 | H1, H2, H13, M8, A1 | Fixed in this PR. |
+| 6 | H6, L10, L11, A2 | Fixed in this PR. |
+| 7 | A3, A4, A5 | Fixed in this PR. |
+| 8 | H4, H5, H7, H10, H11, L5 | Fixed in this PR. |
+| 9 | H3, M5, M21, L1, L6, L8, L15 | Fixed or proven with tests in this PR. |
+| 10 | M2, M3, M16, M23, M24, M25, L2, L3, L4, L16 | Fixed or proven with tests in this PR. |
+| 11 | H8, H12, M11, M12, M22, L7, L9, L12 | Fixed or proven with tests in this PR. |
+| 12 | M9, M10, M15, M18, M19, M20, L17, L18 | Fixed or proven with tests in this PR. |
+| 13 | M4, M17 | Fixed in this PR. |
+
+## Phase 123 Fixed Finding Details
+
+The original findings below are preserved for history. Fixed items record
+the implementation proof and regression test names.
+
+| Finding | Phase 123 status |
+|---|---|
+| C1 | Fixed. `KeepaliveConnection` now decodes `Transfer-Encoding: chunked` response bodies with `ChunkedDecoder`, returns the decoded buffered body, and retires the connection after every chunked response. Tests: `keepalive_decodes_chunked_response_and_retires_connection`, `chunked_then_content_length_requests_do_not_cross_contaminate`, `malformed_chunked_response_errors_and_retires`, `over_cap_chunked_response_errors_and_retires`, `chunked_connection_close_decodes_and_retires`, `chunked_smuggling_shape_is_retired_before_next_request`. |
+| H14 | Fixed. The chunked decoder rejects SP/HT before the chunk-size digits. Test: `rejects_leading_whitespace_before_chunk_size`. |
+| L13 | Fixed. `DataCrlf` checks the current remaining buffer, not the original feed input. Tests: `split_crlf_after_data`, `rejects_missing_data_crlf`. |
+| A6 | Fixed. Chunk-size/body accounting uses checked arithmetic around decoded totals and overflow-shaped size lines. Tests: `rejects_body_too_large_after_prior_decoded_bytes`, `rejects_chunk_size_that_overflows_usize`. |
+| M1 | Fixed. WebSocket client frames reject non-minimal 126/127 length encodings and 127-form high-bit lengths. Tests: `client_frame_rejects_non_minimal_126_length`, `client_frame_rejects_non_minimal_127_length`, `client_frame_rejects_127_length_high_bit`. |
+| A7 | Fixed. WebSocket frame-end calculations use checked offsets and reject huge frame lengths before drain/decode. Test: `client_frame_rejects_huge_frame_before_end_offset_overflow`. |
+| M6 | Already fixed in the connection delivery path; Phase 123 added a live regression proving invalid fragmented text is closed before app echo/delivery. Test: `websocket_fragmented_text_invalid_utf8_rejects_before_app_delivery`. |
+| L14 | Fixed. HTTP/1 origin-form parsing rejects protocol-relative targets (`//host/path`). Test: `protocol_relative_target_is_not_origin_form`. |
+| C2 | Fixed. HTTP/2 DATA strips PADDED bytes before body accounting, and HEADERS strips PADDED plus PRIORITY bytes before HPACK. Tests: `http2_padded_data_delivers_only_unpadded_body`, `http2_bad_data_padding_sends_protocol_goaway`, `http2_priority_headers_with_valid_hpack_succeeds`, `http2_padded_priority_headers_with_valid_hpack_succeeds`, `http2_malformed_padded_priority_headers_rejects`. |
+| C3 | Fixed. SETTINGS frames are parsed and applied before ACK: peer `INITIAL_WINDOW_SIZE` updates open/new stream send windows, peer `MAX_FRAME_SIZE` controls outbound DATA splitting, invalid values reject, and unsupported non-default `HEADER_TABLE_SIZE` sends SETTINGS_ERROR. Tests: `http2_settings_initial_window_shrink_blocks_until_window_update`, `http2_settings_max_frame_size_controls_outbound_splitting`, `http2_invalid_settings_value_sends_goaway`, `http2_invalid_enable_push_value_sends_protocol_error`, `http2_non_default_header_table_size_sends_settings_error`. |
+| C5 | Fixed with a conservative reset-churn guard that sends `ENHANCE_YOUR_CALM` once peer reset count exceeds the configured limit. Tests: `http2_rapid_reset_storm_sends_enhance_your_calm_goaway`, `http2_normal_reset_rate_allows_later_request`. |
+| H9 | Fixed. HTTP/2 request headers reject HTTP/1 connection-control names. Test: `http2_forbidden_connection_header_rejects`. |
+| M7 | Fixed in DATA/window hot paths by converting frame body lengths through checked `i32::try_from` before window arithmetic. Covered by `http2_padded_data_delivers_only_unpadded_body`, `http2_inbound_data_obeys_stream_window`, and `http2_settings_initial_window_shrink_blocks_until_window_update`. |
+| M14 | Fixed. HTTP/2 requests require `:authority` or a non-empty host equivalent. Test: `http2_missing_authority_rejects`. |
+| H1 | Fixed. `tina-rpc-tokio` `CancelGuard::drop` now returns a permit only when it actually removed the pending entry, matching the observer path. Test: `cancel_guard_drop_releases_only_when_it_removed_pending_entry`. |
+| C4 | Fixed. Explicit and live multi-shard runtimes now route `CallReply` envelopes through a reserved terminal lane that drains before ordinary remote sends, so a saturated ordinary reverse queue cannot silently turn `Full`/`Closed` truth into timeout. Tests: runtime and simulator `terminal_reply_lane_bypasses_saturated_ordinary_remote_queue`, plus `live_cross_shard_isolate_call_destination_closed_returns_typed_closed` and `failed_shard_cross_shard_call_returns_one_closed_outcome`. |
+| M13 | Fixed with the same terminal-lane contract as C4 for simulator and live multi-shard. Tests: runtime and simulator `terminal_reply_lane_bypasses_saturated_ordinary_remote_queue`. |
+| H2 | Fixed. SQLx, AWS, and reqwest bridge docs/metrics now distinguish caller timeout, external in-flight work, and late terminal work; SQLx keeps external capacity occupied until terminal after caller timeout. Tests: `timeout_settles_caller_but_keeps_external_capacity_until_terminal`, `pressure_report_reflects_capacity_and_high_water`, AWS bridge timeout/late-result tests, and reqwest closed-worker tests. |
+| H13 | Fixed. `tina-reqwest-bridge` treats a closed worker result channel as an internal fatal outcome, not as retryable network failure. Test: reqwest bridge closed-task regression in `tina-reqwest-bridge` tests. |
+| M8 | Fixed. AWS late-result metrics separate caller-visible timeout from external terminal outcome without double-counting class counters. Tests: AWS bridge timeout/late-result metrics tests. |
+| A1 | Fixed by removing DB-side cancel-on-timeout from the public SQLx timeout contract; Tina-side timeout stops waiting while the DB future remains quarantined against external capacity until terminal. Test: `timeout_settles_caller_but_keeps_external_capacity_until_terminal`. |
+| H6 | Fixed. Threaded runtime shutdown now has explicit timeout-returning APIs and Drop uses a bounded best-effort wait rather than an unbounded join. Tests: `shutdown_with_timeout` tests and process/runtime shutdown tests. |
+| L10 | Fixed on Unix by process-group cleanup and bounded drain joins; unsupported group-kill shapes report typed cleanup truth. Tests: `local_system_process_run_captures_truncates_and_times_out` and process timeout tests. |
+| L11 | Fixed. Storage/DNS/TLS/process cancel loops no longer use pure `yield_now` spins on stuck paths; they use bounded sleep/backoff or blocking waits. Tests: process shutdown/cancel tests. |
+| A2 | Fixed. Process timeout/cancel kills the Unix process group and returns bounded cleanup reports. Tests: process timeout and stdout-grandchild inheritance tests. |
+| A3 | Fixed. `journal_replay` exposes valid prefix byte length for truncated tails and append repairs the tail before writing. Tests: persistence/journal truncated-tail append tests. |
+| A4 | Fixed. Journal append validation uses tail metadata/sidecar state instead of full replay on every append. Test: append scaling instrumentation regression in persistence tests. |
+| A5 | Fixed. Snapshot temp-file failure paths attempt cleanup while preserving primary error. Test: `snapshot_rename_failure_removes_temp_file`. |
+| H4 | Fixed. Bounded trace retention no longer performs `Vec::remove(0)` on every event; it uses an offset plus chunked compaction. Tests: `bounded_trace_retention_does_not_move_the_tail_on_every_event`, `bounded_trace_retention_keeps_only_recent_events_and_counts_drops`. |
+| H5 | Fixed. Added `BufferedTraceObserver` with bounded queueing and visible drop counts while retaining synchronous observers. Test: `buffered_observer_counts_drops_when_drain_is_full`. |
+| H7 | Fixed. `RestartBudget` now has explicit `lifetime(max)` and windowed `within(max, period)` semantics. Tests: `lifetime_restart_budget_exhausts_permanently`, `windowed_restart_budget_resets_after_period`. |
+| H10 | Fixed. `LiveTrace::snapshot` sorts by event id before hashing and poisoned mutex paths fail loudly. Tests: `live_replay` proof-harness tests. |
+| H11 | Fixed. Settled stopped runtime entries are collected after restarts once no child/supervisor/in-flight references remain. Test: runtime supervision `windowed_restart_budget_resets_after_period` asserts entry count settles. |
+| L5 | Fixed. Cancelled-call cause ring overflow is visible through `cancelled_call_cause_evictions()` in runtime and simulator. Tests: runtime and simulator `cancelled_call_cause_ring_overflow_is_visible`. |
+| H3 | Fixed/proven first form. `PoolLease` remains sealed and `must_use`, pool reports expose leased resources, and close retires outstanding leases rather than pretending Drop can always send an effect from arbitrary context. Tests: pool report/close/lease-authority tests in `tina-runtime/tests/pool.rs`. |
+| M5 | Fixed. RPC server connection tracks in-flight request ids and rejects duplicate ids without dispatching service work twice. Test: `duplicate_request_id_while_in_flight_returns_protocol_error_without_dispatch`. |
+| M21 | Fixed/proven. Tokio RPC bridge shim capacity is tied to `max_in_flight * 2`, cancellation releases slots synchronously, and stale guards cannot inflate permits. Tests: `cancelled_call_releases_slot_synchronously`, `cancel_guard_drop_releases_only_when_it_removed_pending_entry`. |
+| L1 | Fixed. `PendingReplies::take()` now has explicit `taken()` accounting separate from caller-gone reclaim. Test: `take_returns_and_removes_entry`. |
+| L6 | Proven. Deferred slots keep ticket generations and call-handle ordering tests pin stale ticket behavior. Tests: deferred slot ticket tests in `tina-runtime/src/deferred.rs` and request/deferred integration tests. |
+| L8 | Proven. Public pool constructors cannot forge leases; lease minting is sealed under `tina::pool::__private`. Tests: pool stale/forgery tests and compile-time private-field coverage. |
+| L15 | Fixed/proven. SQLx `FetchMany` stops pulling after the documented cap plus truncation detection, and tests pin that the user buffer never exceeds the cap. Tests: `fetch_many_at_cap_truncates_without_buffering_extras`, `fetch_many_caller_max_rows_is_capped_by_config_ceiling`. |
+| M2 | Fixed. `cancel_call` before call effect admission returns typed `CancelOutcome::NotAdmitted` and keeps the runtime alive. Tests: runtime and simulator cancel-before-admit tests. |
+| M3 | Fixed. Huge duration call deadline math uses saturating Tina time helpers instead of panicking/wrapping. Test: `huge_duration_call_deadline_saturates_instead_of_panicking`. |
+| M16 | Fixed. `ShutdownChoreography::record` reports highest completed step, not whichever step happened last. Test: `recurring_tick`/lifecycle tests. |
+| M23 | Proven/contained. Runtime-owned signal waits are explicit capabilities; live Unix capture support is surfaced by `os_signal_capture_supported()` and non-Unix remains timeout/cancel-only. Tests: local-system signal rail tests and lifecycle signal-driven shutdown tests. |
+| M24 | Fixed. TLS close wins over cancelled pending read/write pressure by removing/settling cancelled entries instead of returning `TlsFull` solely for cancelled work. Tests: TLS pressure and close tests in `local_system.rs`. |
+| M25 | Fixed. Added host wait timeout variants/APIs so `call_blocking` host budget is distinct from target call deadline. Tests: `multi_shard_call_blocking_host_budget_is_distinct_from_target_deadline`, `multi_shard_call_blocking_returns_timeout_when_callee_holds_caller`. |
+| L2 | Fixed by making address generations real routing truth in runtime and simulator. Tests: `runtime_ingress_to_wrong_generation_returns_closed`, `dispatched_send_to_wrong_generation_records_closed_rejection`, simulator stale-generation tests. |
+| L3 | Fixed. `RecurringTick::Bounded(0)` missed-tick policy is pinned. Test: `recurring_tick` tests. |
+| L4 | Fixed. `elapsed_periods` avoids silent `u128` to `u64` truncation. Test: `recurring_tick` tests. |
+| L16 | Fixed. Trace projection preserves `CallError::Rejected(reason)` inner reason. Test: `call_failed_rejected_error_preserves_inner_reason`. |
+| H8 | Fixed first form. Public TLS lane docs/reports now state queue depth vs concurrency truth: one TLS worker per shard drains a bounded queue. Tests/docs: TLS lane pressure report coverage and `docs/tina-user-guide/12-io-model.md`. |
+| H12 | Fixed first form. `#[tina::isolate]` / `#[tina_runtime::isolate]` accept `tina_crate = ...` and `runtime_crate = ...` path overrides, `#[tina_rpc::service]` accepts `tina_crate = ...` and `rpc_crate = ...`, and defaults use `core::convert::Infallible` where possible. Tests: `tina-macros` lib compile, runtime surface-alignment tests, and `service_macro_accepts_renamed_dependency_paths`. |
+| M11 | Fixed. SPSC requires power-of-two capacity and rejects non-power-of-two inputs. Test: `mailbox_rejects_non_power_of_two_capacity`. |
+| M12 | Fixed/proven. TLS blocking stream access remains owner-worker-thread only by API shape, and docs name the mutex scope. Tests: TLS local-system tests. |
+| M22 | Fixed. Macro-generated default `Infallible` paths use `core::convert::Infallible`. Tests: `tina-macros` lib compile and runtime surface-alignment tests. |
+| L7 | Proven. Split request/call-authority trybuild fixtures reject ignored/dropped/double-consumed authority while allowing valid helper-shaped use. Tests: `tina-runtime --test safety_rails_diagnostics`. |
+| L9 | Proven/documented. RPC macro tuple ABI remains the named first-form encoding and decode/dispatch tests pin the shape. Tests: `tina-rpc-macros` and `tina-rpc` tests. |
+| L12 | Fixed. SPSC Loom tests cover close racing producer/consumer interleavings. Tests: `close_waits_for_a_racing_successful_send_to_become_visible`, `close_racing_with_recv_still_preserves_buffered_delivery`. |
+| M9 | Fixed. Simulator fault selection now uses deterministic SplitMix streams per tag instead of `(seed + tag + ordinal) % one_in`. Tests: `fault_selector_is_deterministic_and_tag_separated`, `different_seeds_diverge_under_tcp_delay_faults`, `different_seeds_diverge_under_tcp_ready_reordering`. |
+| M10 | Proven contained. Runtime/simulator replay facts and trace hashes encode virtual-time durations/config structurally rather than raw `Instant`s; docs explicitly warn that user payloads should not store raw `Instant` for byte-identical replay. Tests: saved replay config/hash tests in `tina-sim/src/dst.rs`. |
+| M15 | Fixed. `LiveTrace` poisoned mutex handling no longer silently blesses a bad hash. Tests: proof-harness live replay tests. |
+| M18 | Fixed. Bad-peer reset scenario naming/behavior and bridge overlap are covered by bad-peer harness tests. Tests: `bad_peer` proof-harness tests. |
+| M19 | Fixed. Load report first-error indexing truth is global or named correctly. Tests: `load` proof-harness tests. |
+| M20 | Fixed. Storm/load reports preserve aggregate connection error truth. Tests: `bad_peer` and `load` proof-harness tests. |
+| L17 | Fixed. `MultiShardSimulator` supports trace observers. Test: simulator trace-observer tests. |
+| L18 | Fixed. Saved replay cases compare structured `ReplayConfig`/projection values and reject mismatches, not only `Debug` strings. Tests: `check_replay_case_rejects_report_config_mismatch`, `captured_replay_mismatch_names_every_changed_fact`. |
+| M4 | Fixed. SQLx transaction COMMIT failure now returns `PgTransactionOutcome::CommitAmbiguous { completed, error }` so completed step records are not lost. Test: `commit_ambiguous_transaction_preserves_completed_steps_and_error`. |
+| M17 | Fixed. `tina-tokio-bridge` has `drain_and_shutdown_async` so Tokio callers do not park a worker with a sleep loop. Test: `async_drain_and_shutdown_yields_to_handle_drop_task`. |
+
 ## Critical
 
 ### C1. HTTP/1 keepalive client smuggles chunked response bytes into the next request

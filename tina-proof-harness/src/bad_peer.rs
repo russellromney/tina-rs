@@ -25,9 +25,9 @@ pub enum BadPeerScenario {
         request: Vec<u8>,
         drain_for: Duration,
     },
-    /// Open and immediately drop the stream. No bytes sent. Most
-    /// kernels send a FIN here; servers must treat this as a normal
-    /// peer close and not as a request.
+    /// Open and immediately reset the stream with `SO_LINGER(0)`. No bytes
+    /// sent. Servers must treat this as an abrupt peer reset, not as a normal
+    /// request.
     ResetImmediately,
     /// Open, write `request` (often partial headers), then send the
     /// remaining bytes one at a time with `byte_delay` between bytes.
@@ -133,6 +133,13 @@ pub struct BadPeerOutcome {
     /// First error we observed during the scenario, as text. Always
     /// pair with `peer_reset`/`server_closed` to interpret.
     pub error: Option<String>,
+    /// Number of connection attempts that failed during this scenario.
+    ///
+    /// Mostly useful for [`BadPeerScenario::ReconnectStorm`], where aggregate
+    /// connection truth matters more than the final error.
+    pub connects_failed: usize,
+    /// First few connection errors observed during this scenario.
+    pub connection_errors: Vec<String>,
     /// Per-scenario typed counter:
     /// - `ReconnectStorm`: total successful connects (the first plus
     ///   any retries).
@@ -145,10 +152,11 @@ pub struct BadPeerOutcome {
 impl BadPeerOutcome {
     pub fn summary_line(&self) -> String {
         format!(
-            "bad_peer label={} connected={} connects_ok={} bytes_sent={} bytes_read={} server_closed={} peer_reset={} elapsed_ms={} error={}",
+            "bad_peer label={} connected={} connects_ok={} connects_failed={} bytes_sent={} bytes_read={} server_closed={} peer_reset={} elapsed_ms={} error={}",
             self.label,
             self.connected,
             self.connects_ok,
+            self.connects_failed,
             self.bytes_sent,
             self.bytes_read,
             self.server_closed,
@@ -180,6 +188,8 @@ pub fn run(
                 peer_reset: false,
                 elapsed_ms: started.elapsed().as_millis() as u64,
                 error: Some(format!("connect: {err}")),
+                connects_failed: 1,
+                connection_errors: vec![format!("connect: {err}")],
                 connects_ok: 0,
             };
         }
@@ -265,12 +275,11 @@ fn run_reset(label: &'static str, started: Instant, stream: TcpStream) -> BadPee
     let mut outcome = base_outcome(label, started);
     outcome.connected = true;
     outcome.connects_ok = 1;
-    // Plain drop sends a FIN. We do not try SO_LINGER(0) because
-    // `TcpStream::set_linger` is still unstable; raw socket access
-    // would pull libc in for one bad-peer story. A graceful close is
-    // enough to prove the server does not treat empty traffic as a
-    // request — the typed scenario name is the contract.
-    drop(stream);
+    let socket = socket2::Socket::from(stream);
+    if let Err(err) = socket.set_linger(Some(Duration::ZERO)) {
+        outcome.error = Some(format!("set_linger_zero: {err}"));
+    }
+    drop(socket);
     finish(outcome, started)
 }
 
@@ -394,19 +403,29 @@ fn run_storm(
 ) -> BadPeerOutcome {
     let mut outcome = base_outcome(label, started);
     let mut connects_ok: usize = 1; // The dispatcher already opened one stream.
-    let mut last_error: Option<String> = None;
+    let mut connects_failed: usize = 0;
+    let mut connection_errors = Vec::new();
     for _ in 0..count.saturating_sub(1) {
         match TcpStream::connect_timeout(&addr, connect_timeout) {
             Ok(stream) => {
                 connects_ok += 1;
                 drop(stream);
             }
-            Err(err) => last_error = Some(format!("connect: {err}")),
+            Err(err) => {
+                connects_failed += 1;
+                if connection_errors.len() < 8 {
+                    connection_errors.push(format!("connect: {err}"));
+                }
+            }
         }
     }
     outcome.connected = true;
     outcome.connects_ok = connects_ok;
-    outcome.error = last_error;
+    outcome.connects_failed = connects_failed;
+    outcome.connection_errors = connection_errors;
+    if connects_failed > 0 {
+        outcome.error = Some(format!("{connects_failed} connect attempts failed"));
+    }
     finish(outcome, started)
 }
 
@@ -422,6 +441,8 @@ fn base_outcome(label: &'static str, started: Instant) -> BadPeerOutcome {
         peer_reset: false,
         elapsed_ms: 0,
         error: None,
+        connects_failed: 0,
+        connection_errors: Vec::new(),
         connects_ok: 0,
     }
 }
@@ -490,8 +511,8 @@ fn would_block_or_timeout(err: &std::io::Error) -> bool {
 mod tests {
     use super::*;
     use std::net::TcpListener;
-    use std::sync::Arc;
     use std::sync::atomic::AtomicUsize;
+    use std::sync::{Arc, mpsc};
 
     /// Tiny single-thread accept loop, used to exercise the bad-peer
     /// scenarios without pulling in `tina-http`. Non-blocking accept
@@ -587,6 +608,67 @@ mod tests {
         // We do not require server_closed/peer_reset because the kernel
         // may RST the connection silently. The connect must succeed.
         assert!(accepted.load(Ordering::Relaxed) >= 1, "{outcome:?}");
+    }
+
+    #[test]
+    fn reset_immediately_uses_linger_zero_reset_shape() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let (tx, rx) = mpsc::channel();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut buf = [0u8; 1];
+            let reset = match stream.read(&mut buf) {
+                Err(err) => is_reset_error(&err),
+                Ok(_) => false,
+            };
+            tx.send(reset).expect("send reset observation");
+        });
+
+        let outcome = run(
+            "reset",
+            addr,
+            Duration::from_secs(1),
+            BadPeerScenario::ResetImmediately,
+        );
+        assert!(outcome.connected, "{outcome:?}");
+        let reset_seen = rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("server observation");
+        let _ = server.join();
+        assert!(
+            reset_seen || outcome.error.is_some(),
+            "server should see RST unless the platform rejected linger-zero setup: {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn reconnect_storm_preserves_aggregate_connection_errors() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let server = thread::spawn(move || {
+            let (_stream, _) = listener.accept().expect("accept first");
+            drop(listener);
+            thread::sleep(Duration::from_millis(100));
+        });
+
+        let outcome = run(
+            "storm",
+            addr,
+            Duration::from_millis(100),
+            BadPeerScenario::ReconnectStorm { count: 4 },
+        );
+        let _ = server.join();
+        assert!(outcome.connected, "{outcome:?}");
+        assert_eq!(outcome.connects_ok, 1, "{outcome:?}");
+        assert!(outcome.connects_failed > 0, "{outcome:?}");
+        assert!(!outcome.connection_errors.is_empty(), "{outcome:?}");
+        assert!(
+            outcome
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("failed"))
+        );
     }
 
     #[test]
