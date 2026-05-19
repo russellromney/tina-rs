@@ -7,7 +7,7 @@
 
 /// Capability-typed handles for one registered callable service.
 ///
-/// Returned by [`Runtime::register_service`]. The `send` lane is a
+/// Returned by [`crate::Runtime::register_service`]. The `send` lane is a
 /// [`SendAddress<M>`](tina::SendAddress) for ordinary send/continuation
 /// traffic; the `call` lane is a [`CallAddress<M, R>`](tina::CallAddress) for
 /// callable traffic. Splitting the address into capabilities at the boundary
@@ -51,7 +51,7 @@ impl<M, R> ServiceHandle<M, R> {
 
 /// Capability-typed handle for one registered send-only service.
 ///
-/// Returned by [`Runtime::register_service_send_only`]. Exposes only a
+/// Returned by [`crate::Runtime::register_service_send_only`]. Exposes only a
 /// [`SendAddress`](tina::SendAddress): no callable lane is constructed.
 #[derive(Debug)]
 pub struct SendOnlyServiceHandle<M> {
@@ -69,9 +69,9 @@ impl<M> Clone for SendOnlyServiceHandle<M> {
 
 /// Capability-typed handles for one split event/request service.
 ///
-/// Returned by [`Runtime::register_split_service`]. The `events` lane accepts
+/// Returned by [`crate::Runtime::register_split_service`]. The `events` lane accepts
 /// only public fire-and-forget events through [`tina::send_event`]. The
-/// `requests` lane accepts only callable requests through [`call_request`].
+/// `requests` lane accepts only callable requests through [`crate::call_request`].
 #[derive(Debug)]
 pub struct SplitServiceHandle<Event, Request, Reply> {
     /// Send capability for service events.

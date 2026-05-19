@@ -388,7 +388,7 @@ where
     /// The panicking [`supervise`](Self::supervise) variant remains
     /// available for setup code that wants the unknown-parent case to
     /// be a hard programmer error. `try_supervise` is the fallible
-    /// variant that [`ThreadedRuntime`] uses internally so an
+    /// variant that [`crate::ThreadedRuntime`] uses internally so an
     /// unknown-parent registration does not crash the worker thread.
     pub fn try_supervise<M: 'static, R>(
         &mut self,

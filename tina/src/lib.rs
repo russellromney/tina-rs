@@ -176,15 +176,17 @@ pub use tina_macros::isolate;
 // ---------------------------------------------------------------------------
 //
 // The `tina` trait crate is being split into module homes so future agents
-// can find where new code belongs without scanning a 3000-line file. Each
+// can find where new code belongs without scanning the old oversized file. Each
 // split is a pure move: every public item stays reachable through the crate
 // root via `pub use`.
 //
 //   - `mod address` — address/id/generation types, the `Outbound` wrapper,
 //     and the service-shaped event/request addresses.
-//
-// More modules (`context`, `effect`, `isolate`) will land in follow-up
-// commits of the same phase.
+//   - `mod context` — handler context, request/call authority, deferred
+//     replies, deadlines, call handles, and caller routing.
+//   - `mod effect` — the closed effect language and effect constructors.
+//   - `mod isolate` — isolate traits, mailboxes, shard traits, restart policy,
+//     child definitions/refs, and observed-spawn builders.
 mod address;
 mod context;
 mod effect;

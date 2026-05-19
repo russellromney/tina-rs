@@ -46,9 +46,13 @@
 //   - `mod files`       — file + filesystem-path operations.
 //   - `mod persistence` — snapshot / journal helpers.
 //
-// Shared types (`CallId`, `CallInput`, `CallOutput`, `CallError`,
-// `RuntimeCall*`, the `TypedCall*` family, cancellation / pending /
-// group authority helpers) stay in this file.
+//   - `mod io`          — `CallInput`, `CallOutput`, `CallError`,
+//     `CallOutcome`, and `SendOutcome`.
+//
+// This file keeps the type-erased runtime-call machinery (`RuntimeCall*`,
+// `ErasedCall`, `IntoErasedCall`) and the `TypedCall*` family because those
+// generic builders reference each other heavily. Decoder impls for
+// `CallOutput` also stay here next to `TypedCall`.
 
 mod cancel;
 mod dns;

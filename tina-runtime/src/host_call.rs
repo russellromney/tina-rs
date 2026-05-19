@@ -73,7 +73,7 @@ where
 
     /// Walks the current trace and returns a counted summary of
     /// pressure-shaped events (mailbox-full, reply-path-full,
-    /// send-full, lifecycle-closed). See [`PressureSummary`].
+    /// send-full, lifecycle-closed). See [`crate::PressureSummary`].
     pub fn pressure_summary(&self) -> pressure::PressureSummary {
         pressure::PressureSummary::from_events(self.trace.iter())
     }
@@ -88,7 +88,7 @@ where
     ///
     /// The trace remains the source of audit truth: this method does not
     /// add a new event class, it only surfaces the bound address that
-    /// [`CallOutput::TcpBound`] already carries inside the runtime.
+    /// [`crate::CallOutput::TcpBound`] already carries inside the runtime.
     pub fn observe_next_bound(&mut self) -> BoundAddressWaiter {
         self.observation.register_bound()
     }
@@ -96,7 +96,7 @@ where
     /// Registers a typed waiter for the next `tls_bind` completion.
     /// Mirrors [`Self::observe_next_bound`] for the TLS rail. The
     /// waiter resolves with the bound `SocketAddr` carried by
-    /// [`CallOutput::TlsBound`], or with the typed runtime error.
+    /// [`crate::CallOutput::TlsBound`], or with the typed runtime error.
     pub fn observe_next_tls_bound(&mut self) -> BoundAddressWaiter {
         self.observation.register_tls_bound()
     }
@@ -105,7 +105,7 @@ where
     ///
     /// The waiter resolves the next time the isolate identified by `address`
     /// (matched by isolate id and generation) emits
-    /// [`RuntimeEventKind::IsolateStopped`]. Replaces `Arc<AtomicBool>` done
+    /// [`crate::RuntimeEventKind::IsolateStopped`]. Replaces `Arc<AtomicBool>` done
     /// flags in user code. Bounded one-slot.
     pub fn observe_isolate_complete<M, R>(
         &mut self,
@@ -135,7 +135,7 @@ where
     /// Registers a typed waiter for the next supervised restart of any
     /// direct child of the parent identified by `parent_address`.
     ///
-    /// The resolved [`observation::ChildRestarted`] carries the new child
+    /// The resolved [`crate::ChildRestarted`] carries the new child
     /// incarnation's isolate id and generation. Bounded one-slot.
     pub fn observe_child_restarted<M, R>(
         &mut self,
@@ -197,8 +197,10 @@ where
     /// Attempts to deliver `message` to a registered isolate.
     ///
     /// This is the runtime-side ingress surface for tests and later drivers.
-    /// It preserves the mailbox's typed `Full` and `Closed` outcomes, while
-    /// still treating unknown isolate IDs as programmer error.
+    /// It preserves the mailbox's typed `Full` and `Closed` outcomes. Stopped,
+    /// stale, and unknown isolate IDs all return `Closed` with the original
+    /// message so host-side tests and drivers can handle the miss without a
+    /// panic.
     pub fn try_send<M: 'static, R>(
         &self,
         address: Address<M, R>,

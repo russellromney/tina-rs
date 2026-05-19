@@ -154,7 +154,7 @@ where
 /// Request-lane effect returned by split-service request handlers.
 ///
 /// This is deliberately narrower than [`Effect`]. The copied split-service
-/// path produces a `RequestEffect` by consuming [`RequestCall`] through
+/// path produces a `RequestEffect` by consuming [`crate::RequestCall`] through
 /// `reply`, `reject`, `capture`, `defer`, or `defer_cancelable`. Ordinary
 /// `noop()` is not a `RequestEffect`, so "forgot to answer caller" becomes a
 /// compile error on the copied path.
@@ -205,7 +205,7 @@ where
 ///
 /// This is the split-service spelling of [`send_to`]. A
 /// [`ServiceEventAddress`] cannot be passed to request helpers, and a
-/// [`ServiceRequestAddress`] cannot be passed here, so the common
+/// [`crate::ServiceRequestAddress`] cannot be passed here, so the common
 /// "request went down the event lane" mistake fails at compile time on the
 /// copied path.
 pub fn send_event<I, E, Q>(destination: ServiceEventAddress<E, Q>, event: E) -> Effect<I>
@@ -230,7 +230,7 @@ where
 /// reference back to the spawning parent as an ordinary later message.
 ///
 /// Spawn construction rejections that can be known before a child exists are
-/// delivered through the continuation as [`SpawnObservedError`]. Delivery
+/// delivered through the continuation as [`crate::SpawnObservedError`]. Delivery
 /// rejection for the continuation itself is traced like any other send
 /// rejection; the runtime does not create a hidden queue or bypass the
 /// parent's bounded mailbox to force that message through.

@@ -1,6 +1,7 @@
 //! Diagnostic-phrase pinning for the Phase 100 safety rails.
 //!
-//! Compile-fail doctests (see `tina-runtime/src/lib.rs` and `src/call.rs`)
+//! Compile-fail doctests (see `tina-runtime/src/registration.rs` and
+//! `src/call/`)
 //! prove that the wrong path fails to compile. They do **not** prove which
 //! diagnostic phrase appeared: a fixture that broke for any other reason
 //! would still pass the doctest. This test uses `trybuild` to compare full

@@ -281,7 +281,7 @@ impl<M, R> Address<M, R> {
 ///
 /// `Event` values are mailbox facts. `Request` values carry caller authority.
 /// User code normally does not construct this enum directly; it uses
-/// [`send_event`] and `tina_runtime::call_request`.
+/// [`crate::send_event`] and `tina_runtime::call_request`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ServiceMessage<Event, Request> {
     /// Fire-and-forget mailbox event.

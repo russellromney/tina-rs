@@ -574,14 +574,14 @@ fn runtime_ingress_returns_typed_full_and_closed_for_spawned_child() {
 }
 
 #[test]
-fn runtime_ingress_to_unknown_isolate_still_panics() {
+fn runtime_ingress_to_unknown_isolate_returns_closed() {
     let runtime = Runtime::new(TestShard, TestMailboxFactory);
 
-    let result = catch_unwind(AssertUnwindSafe(|| {
-        let _ = runtime.try_send(child_address(IsolateId::new(99)), ChildEvent::Data(1));
-    }));
-
-    assert!(result.is_err());
+    assert_eq!(
+        runtime.try_send(child_address(IsolateId::new(99)), ChildEvent::Data(1)),
+        Err(TrySendError::Closed(ChildEvent::Data(1)))
+    );
+    assert!(runtime.trace().is_empty());
 }
 
 #[test]

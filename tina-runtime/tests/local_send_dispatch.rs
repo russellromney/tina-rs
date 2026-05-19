@@ -1,7 +1,6 @@
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::convert::Infallible;
-use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::rc::Rc;
 
 use tina::{
@@ -437,13 +436,14 @@ fn rejected_local_send_is_traced_and_not_silently_buffered() {
 }
 
 #[test]
-fn send_to_unknown_isolate_panics() {
+fn send_to_unknown_isolate_records_closed_rejection() {
     let mut runtime = Runtime::new(TestShard, TestMailboxFactory);
     let driver_mailbox = TestMailbox::new(8);
+    let target = Address::new(ShardId::new(3), IsolateId::new(99));
 
-    runtime.register(
+    let driver = runtime.register(
         Driver {
-            target: Address::new(ShardId::new(3), IsolateId::new(99)),
+            target,
             handled: Rc::new(RefCell::new(Vec::new())),
         },
         driver_mailbox.clone(),
@@ -451,8 +451,17 @@ fn send_to_unknown_isolate_panics() {
 
     assert_eq!(driver_mailbox.try_send(DriverEvent::Kick(1)), Ok(()));
 
-    let result = catch_unwind(AssertUnwindSafe(|| runtime.step()));
-    assert!(result.is_err());
+    assert_eq!(runtime.step(), 1);
+    assert!(runtime.trace().iter().any(|event| {
+        event.isolate() == driver.isolate()
+            && event.kind()
+                == RuntimeEventKind::SendRejected {
+                    target_shard: target.shard(),
+                    target_isolate: target.isolate(),
+                    target_generation: target.generation(),
+                    reason: SendRejectedReason::Closed,
+                }
+    }));
 }
 
 #[test]

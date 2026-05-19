@@ -593,7 +593,7 @@ fn waitlist_per_key_full_returns_typed_keyfull_reply() {
 }
 
 // CancelableWork e2e (real worker round-trip + cancel continuation) is
-// covered by the unit tests in `tina-runtime/src/call.rs` and the
+// covered by the unit tests in `tina-runtime/src/call/` and the
 // `system_job_queue` migration. Here we only re-assert the cross-helper
 // capacity-report and zero-capacity invariants.
 

@@ -85,7 +85,7 @@ pub struct SweepSuccess {
 /// `ReplayCase.history` before the simulator runs. There is no hidden
 /// random generator in this helper.
 ///
-/// `run_case` is the same runner used with [`assert_replay_case`].
+/// `run_case` is the same runner used with [`crate::dst::assert_replay_case`].
 ///
 /// `check` is the caller's pass/fail predicate over the report. Return
 /// `Err(reason)` to declare the seed a failure; the sweep stops and

@@ -756,7 +756,7 @@ pub enum CallError {
 /// User-visible outcome for an observed send.
 ///
 /// Ordinary [`tina::send`] stays fire-and-forget. This outcome is only
-/// produced by [`send_observed`], for code that needs explicit overload
+/// produced by [`crate::send_observed`], for code that needs explicit overload
 /// policy in normal isolate message flow.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SendOutcome {

@@ -105,7 +105,7 @@ the implementation proof and regression test names.
 | L9 | Proven/documented. RPC macro tuple ABI remains the named first-form encoding and decode/dispatch tests pin the shape. Tests: `tina-rpc-macros` and `tina-rpc` tests. |
 | L12 | Fixed. SPSC Loom tests cover close racing producer/consumer interleavings. Tests: `close_waits_for_a_racing_successful_send_to_become_visible`, `close_racing_with_recv_still_preserves_buffered_delivery`. |
 | M9 | Fixed. Simulator fault selection now uses deterministic SplitMix streams per tag instead of `(seed + tag + ordinal) % one_in`. Tests: `fault_selector_is_deterministic_and_tag_separated`, `different_seeds_diverge_under_tcp_delay_faults`, `different_seeds_diverge_under_tcp_ready_reordering`. |
-| M10 | Proven contained. Runtime/simulator replay facts and trace hashes encode virtual-time durations/config structurally rather than raw `Instant`s; docs explicitly warn that user payloads should not store raw `Instant` for byte-identical replay. Tests: saved replay config/hash tests in `tina-sim/src/dst.rs`. |
+| M10 | Proven contained. Runtime/simulator replay facts and trace hashes encode virtual-time durations/config structurally rather than raw `Instant`s; docs explicitly warn that user payloads should not store raw `Instant` for byte-identical replay. Tests: saved replay config/hash tests in `tina-sim/src/dst/mod.rs` and `tina-sim/src/dst/replay_case.rs`. |
 | M15 | Fixed. `LiveTrace` poisoned mutex handling no longer silently blesses a bad hash. Tests: proof-harness live replay tests. |
 | M18 | Fixed. Bad-peer reset scenario naming/behavior and bridge overlap are covered by bad-peer harness tests. Tests: `bad_peer` proof-harness tests. |
 | M19 | Fixed. Load report first-error indexing truth is global or named correctly. Tests: `load` proof-harness tests. |
@@ -466,7 +466,8 @@ the implementation proof and regression test names.
   wire `LiveTrace` to multi-shard sim.
 - L18. SavedReplayCase persists `Debug`-formatted `projection_debug` /
   `config_debug` and the loader never verifies them; false-friend
-  invariant. `tina-sim/src/dst.rs:1972-1976`.
+  invariant. See the replay-case checks in `tina-sim/src/dst/mod.rs` and
+  `tina-sim/src/dst/replay_case.rs`.
 
 ## Additional findings from narrow review
 

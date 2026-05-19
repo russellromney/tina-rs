@@ -17,7 +17,7 @@
 //!
 //! The multi-isolate runtime still stays narrow on purpose. It can register
 //! isolates, step them in deterministic order, execute local same-shard
-//! [`Effect::Send`] requests that use [`tina::Outbound`], spawn local
+//! [`tina::Effect::Send`] requests that use [`tina::Outbound`], spawn local
 //! children, and restart direct restartable children. Reply effects are still
 //! traced without execution until a later slice gives them runtime semantics.
 //!

@@ -36,7 +36,7 @@ pub trait Isolate: Sized {
 
     /// The payload produced by [`Effect::Send`].
     ///
-    /// A common choice is [`Outbound`] when an isolate needs to address a
+    /// A common choice is [`crate::Outbound`] when an isolate needs to address a
     /// single typed mailbox.
     type Send;
 
@@ -91,7 +91,7 @@ pub trait Isolate: Sized {
     ///
     /// Plain sends enter [`handle`](Self::handle). Calls enter this method
     /// with an explicit [`CallContext`], which must be consumed by replying,
-    /// rejecting, or promoting it into a [`RequestContext`]. The default
+    /// rejecting, or promoting it into a [`crate::RequestContext`]. The default
     /// rejects callable traffic so a missing implementation never leaves the
     /// caller waiting for a timeout.
     fn handle_call(&mut self, _msg: Self::Message, call: CallContext<'_, Self>) -> Effect<Self>
@@ -586,7 +586,7 @@ impl<M, R> ChildRef<M, R> {
 pub enum SpawnObservedError {
     /// The child requested a zero-capacity mailbox.
     ///
-    /// Plain [`spawn`] keeps its existing panic-on-zero behavior. The observed
+    /// Plain [`crate::spawn`] keeps its existing panic-on-zero behavior. The observed
     /// form can report the rejection through its continuation before any child
     /// is recorded.
     ZeroMailboxCapacity,
@@ -624,7 +624,7 @@ pub type SpawnObservedParts<S, P, M, R = ()> = (S, SpawnObservedContinuation<P, 
 
 type SpawnObservedMarker<M, R> = PhantomData<fn() -> (M, R)>;
 
-/// Builder returned by [`spawn_observed`].
+/// Builder returned by [`crate::spawn_observed`].
 #[must_use = "a spawn_observed request has no effect until returned as an Effect"]
 #[derive(Debug)]
 pub struct SpawnObservedBuilder<S, M, R = ()> {

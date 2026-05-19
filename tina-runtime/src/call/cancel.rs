@@ -43,7 +43,7 @@ impl CancelCallBuilder {
     }
 }
 
-/// Like [`call`], but `.then(...)` also produces a caller-owned
+/// Like [`crate::call`], but `.then(...)` also produces a caller-owned
 /// [`tina::CallHandle`]. Pair with [`cancel_call`] to close the wait
 /// later. Move-only handle: one cancel per call.
 pub fn call_cancelable<T, R>(

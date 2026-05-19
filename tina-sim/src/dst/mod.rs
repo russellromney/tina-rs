@@ -7,26 +7,26 @@
 //! ## Module map (Phase 115 reorg)
 //!
 //! The `dst` module is split into submodules so future agents can find
-//! where new code belongs without scanning a 4000-line file. Submodule
+//! where new code belongs without scanning the old oversized file. Submodule
 //! items are re-exported from `dst::*` so the public API is unchanged.
 //!
-//! - [`discovery`] — `DiscoveredConstants` and `discover_constants` for
+//! - `discovery` — `DiscoveredConstants` and `discover_constants` for
 //!   reporting observed `(event_count, trace_hash)` rows.
-//! - [`invariants`] — `InvariantViolation`, `InvariantSuite`, the
+//! - `invariants` — `InvariantViolation`, `InvariantSuite`, the
 //!   per-invariant check functions, `contains_visible_pressure`, and
 //!   `assert_projection_eq`.
-//! - [`projection`] — `TraceShape`, `RuntimeEventKindName`,
+//! - `projection` — `TraceShape`, `RuntimeEventKindName`,
 //!   `TraceProjection`, `TraceProjectionError`, `ProtocolReplayMismatch`,
 //!   `project_trace_shape`, `replay_config_hash`, and the `encode_*`
 //!   family.
-//! - [`replay_case`] — `LiveReplayFact`, `CapacityReplayFact`,
+//! - `replay_case` — `LiveReplayFact`, `CapacityReplayFact`,
 //!   `LiveReplayCapture`, `SavedReplayCase` and on-disk format,
 //!   `CapturedReplayChange`, `LiveReplayReport`,
 //!   `CapturedReplayMismatch`, `ReplayMismatch`,
 //!   `check_replay_case`/`check_captured_replay`/`observe_replay_case`.
-//! - [`shrink`] — `ShrinkConfig`, `ShrunkFailure`, `delete_shrink`,
+//! - `shrink` — `ShrinkConfig`, `ShrunkFailure`, `delete_shrink`,
 //!   `ShrinkReport`, `shrink_replay_case`.
-//! - [`sweep`] — `sweep_seeds`, `SweepFailure`, `SweepSuccess`.
+//! - `sweep` — `sweep_seeds`, `SweepFailure`, `SweepSuccess`.
 //!
 //! Core types (`History`, `DstRun`, `ReplayConfig`, `ReplayCase`,
 //! `ReplayReport`) stay in this file.

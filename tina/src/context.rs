@@ -111,7 +111,7 @@ where
     ///
     /// On success, returns a typed [`DeferredReply<R>`] that the handler
     /// (or a later handler turn on the same isolate) may pass to
-    /// [`reply_to`] to answer the original caller.
+    /// [`crate::reply_to`] to answer the original caller.
     ///
     /// Errors:
     ///
@@ -597,7 +597,7 @@ impl CallRejectedReason {
 ///
 /// A `DeferredReply<R>` is created by
 /// [`Context::take_reply_slot`]. The handler may store it in isolate
-/// state and use [`reply_to`] from a later turn to answer the original
+/// state and use [`crate::reply_to`] from a later turn to answer the original
 /// caller. The slot is one-shot: each `reply_to` consumes the slot.
 ///
 /// The slot type is derived from the current isolate's [`Isolate::Reply`]
@@ -647,7 +647,7 @@ impl<R> DeferredReply<R> {
 /// request/reply workflows. It is a thin newtype over
 /// [`DeferredReply<R>`] so the type system teaches the pattern: a
 /// handler that must reply later takes `RequestContext`, stores it in
-/// isolate state, and eventually passes it to [`reply_to_request`] or
+/// isolate state, and eventually passes it to [`crate::reply_to_request`] or
 /// carries it into a continuation message.
 ///
 /// Like [`DeferredReply`], it is move-only (`!Clone`). It does not
@@ -686,12 +686,12 @@ impl<R> RequestContext<R> {
 ///
 /// Application code does not construct or unwrap this directly; it lives
 /// inside [`DeferredReply<R>`]. Runtime crates allocate it through
-/// [`runtime_internal`].
+/// `runtime_internal`.
 ///
 /// `DeferredReplyHandle` is intentionally not `Clone`. The user-facing
 /// API exposes only [`slot_id`](Self::slot_id) and
 /// [`state`](Self::state); reconstruction or duplication of slots is
-/// reserved for runtime crates via the [`runtime_internal`] module.
+/// reserved for runtime crates via the `runtime_internal` module.
 #[derive(Debug)]
 pub struct DeferredReplyHandle {
     pub(crate) shared: Arc<DeferredSlotShared>,
@@ -876,7 +876,7 @@ impl<R> CallHandle<R> {
     }
 }
 
-/// Type-erased inner handle. Runtime-only; mint via [`runtime_internal`].
+/// Type-erased inner handle. Runtime-only; mint via `runtime_internal`.
 #[doc(hidden)]
 #[derive(Debug)]
 pub struct CallHandleInner {

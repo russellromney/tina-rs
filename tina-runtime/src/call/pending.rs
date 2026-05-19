@@ -70,7 +70,7 @@ pub struct PendingCancelableTicket(pub(super) u64);
 /// `DuplicateKey` rejection — caller authority is returned unchanged so
 /// the service can reply `Busy` or `AlreadyRunning` immediately. For the
 /// "many concurrent attempts per key" shape, reach for
-/// [`CancelableWork`] instead.
+/// [`crate::CancelableWork`] instead.
 ///
 /// Bounded fixed-capacity storage for [`PendingCancelableCall`] tokens.
 ///

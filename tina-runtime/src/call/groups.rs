@@ -68,7 +68,7 @@ struct CancelableWorkEntry<K, Q, R> {
 /// requests at once" — for example, every retry attempt of the same job
 /// id, or several callers racing to fill the same cache key with
 /// caller-owned cancellation. For the "one active request per key"
-/// shape, reach for [`PendingCancelableCallSet`] instead.
+/// shape, reach for [`crate::PendingCancelableCallSet`] instead.
 ///
 /// Bounded fixed-capacity storage for [`PendingCancelableCall`] tokens
 /// grouped by natural key. Multiple live entries may share one key, up

@@ -10,7 +10,7 @@ error[E0382]: use of moved value: `call`
    |                       ^^^^ value used here after move
    |
 note: `RequestCall::<'a, I>::reply` takes ownership of the receiver `self`, which moves `call`
-  --> $WORKSPACE/tina/src/lib.rs
+  --> $WORKSPACE/tina/src/context.rs
    |
    |     pub fn reply(self, value: I::Reply) -> RequestEffect<I> {
    |                  ^^^^
