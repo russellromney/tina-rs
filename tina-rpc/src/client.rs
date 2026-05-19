@@ -821,6 +821,7 @@ where
     type Spawn = std::convert::Infallible;
     type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<ClientMsg>;
+    type Fact = ::std::convert::Infallible;
     type Shard = S;
 
     fn handle(&mut self, msg: ClientMsg, _ctx: &mut Context<'_, S, Self::Reply>) -> Effect<Self> {

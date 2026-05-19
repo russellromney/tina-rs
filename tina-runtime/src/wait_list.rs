@@ -1,4 +1,15 @@
-//! Many-callers-wait-for-one-key helper.
+//! Many-callers-wait-for-one-key helper (mechanism name).
+//!
+//! New code should reach for [`crate::SharedWork`] first: it is the
+//! user-facing wrapper for "many callers wait for one result" and reads
+//! the way the user describes the job. `WaitList` stays public for call
+//! sites that read better under the lower-level name.
+//!
+//! Quick map:
+//!
+//! - many callers wait for one result → [`crate::SharedWork`];
+//! - one caller owns one reply slot by id → [`crate::PendingReplies`];
+//! - lower-level "wait list" name → [`WaitList`].
 //!
 //! A `WaitList<K, R>` parks multiple callers keyed by some natural value
 //! (a cache key, a job id, a room name). When the key resolves, the
@@ -653,6 +664,7 @@ mod tests {
         type Spawn = std::convert::Infallible;
         type SpawnObserved = std::convert::Infallible;
         type Call = std::convert::Infallible;
+        type Fact = std::convert::Infallible;
         type Shard = tina::SingleShard;
 
         fn handle(

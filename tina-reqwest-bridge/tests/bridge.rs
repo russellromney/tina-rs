@@ -206,6 +206,66 @@ fn response_cap_surfaces_typed_error() {
 }
 
 #[test]
+fn response_cap_error_reclaims_capacity_for_next_user_request() {
+    let big = FakeServer::spawn(delayed_ok(
+        b"too-large-for-this-config",
+        Duration::from_millis(0),
+    ));
+    let small = FakeServer::spawn(delayed_ok(b"ok", Duration::from_millis(0)));
+    let runtime = make_runtime();
+    let bridge = install_bridge(
+        &runtime,
+        ReqwestConfig::default()
+            .with_max_in_flight(1)
+            .with_response_body_limit(4),
+    );
+
+    let first_sink = Arc::new(Sink::default());
+    let first = register_caller(
+        &runtime,
+        bridge.address,
+        Arc::clone(&first_sink),
+        Duration::from_secs(2),
+    );
+    runtime
+        .try_send(first, CallerMsg::Run(ReqwestRequest::get(big.url("/big"))))
+        .expect("kick big request");
+    assert!(matches!(
+        first_sink.wait(Duration::from_secs(5)),
+        CallOutcome::Replied(Err(ReqwestError::ResponseTooLarge))
+    ));
+
+    let second_sink = Arc::new(Sink::default());
+    let second = register_caller(
+        &runtime,
+        bridge.address,
+        Arc::clone(&second_sink),
+        Duration::from_secs(2),
+    );
+    runtime
+        .try_send(
+            second,
+            CallerMsg::Run(ReqwestRequest::get(small.url("/small"))),
+        )
+        .expect("kick small request");
+    match second_sink.wait(Duration::from_secs(5)) {
+        CallOutcome::Replied(Ok(response)) => assert_eq!(response.body.as_slice(), b"ok"),
+        other => panic!("response-cap failure leaked bridge capacity: {other:?}"),
+    }
+
+    let snap = bridge.metrics.snapshot();
+    assert_eq!(snap.response_too_large, 1);
+    assert_eq!(snap.responses, 1);
+    assert_eq!(snap.current_in_flight, 0);
+
+    if let Ok(rt) = Arc::try_unwrap(runtime) {
+        let _ = rt.shutdown();
+    }
+    big.stop();
+    small.stop();
+}
+
+#[test]
 fn request_body_limit_rejects_before_reqwest() {
     let beacon = Beacon::default();
     let beacon_clone = beacon.clone();
@@ -250,6 +310,65 @@ fn timeout_surfaces_typed_error_and_aborts_task() {
     }
     assert_eq!(metrics.snapshot().timeout, 1);
     server.stop();
+}
+
+#[test]
+fn timeout_reclaims_user_visible_capacity_for_next_request() {
+    let slow = FakeServer::spawn(delayed_ok(b"slow", Duration::from_millis(800)));
+    let fast = FakeServer::spawn(delayed_ok(b"fast", Duration::from_millis(0)));
+    let runtime = make_runtime();
+    let config = ReqwestConfig::default()
+        .with_max_in_flight(1)
+        .with_default_timeout(Duration::from_millis(80))
+        .with_poll_interval(Duration::from_millis(2));
+    let bridge = install_bridge(&runtime, config);
+
+    let timeout_sink = Arc::new(Sink::default());
+    let timeout_caller = register_caller(
+        &runtime,
+        bridge.address,
+        Arc::clone(&timeout_sink),
+        Duration::from_secs(2),
+    );
+    runtime
+        .try_send(
+            timeout_caller,
+            CallerMsg::Run(ReqwestRequest::get(slow.url("/slow"))),
+        )
+        .expect("kick timeout request");
+    assert!(matches!(
+        timeout_sink.wait(Duration::from_secs(5)),
+        CallOutcome::Replied(Err(ReqwestError::Timeout))
+    ));
+
+    let success_sink = Arc::new(Sink::default());
+    let success_caller = register_caller(
+        &runtime,
+        bridge.address,
+        Arc::clone(&success_sink),
+        Duration::from_secs(2),
+    );
+    runtime
+        .try_send(
+            success_caller,
+            CallerMsg::Run(ReqwestRequest::get(fast.url("/fast"))),
+        )
+        .expect("kick success request");
+    match success_sink.wait(Duration::from_secs(5)) {
+        CallOutcome::Replied(Ok(response)) => assert_eq!(response.body.as_slice(), b"fast"),
+        other => panic!("capacity was not reclaimed for next user request: {other:?}"),
+    }
+
+    let snap = bridge.metrics.snapshot();
+    assert_eq!(snap.timeout, 1);
+    assert_eq!(snap.responses, 1);
+    assert_eq!(snap.current_in_flight, 0);
+
+    if let Ok(rt) = Arc::try_unwrap(runtime) {
+        let _ = rt.shutdown();
+    }
+    slow.stop();
+    fast.stop();
 }
 
 #[test]

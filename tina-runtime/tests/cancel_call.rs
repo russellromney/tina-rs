@@ -121,6 +121,8 @@ impl Worker {
 #[derive(Debug)]
 enum DriverMsg {
     Begin,
+    BeginCancelBeforeAdmit,
+    BeginHugeTimeout,
     DoCancel,
     Returned(CallOutcome<WorkerReply>),
     Cancelled(CancelOutcome),
@@ -152,6 +154,17 @@ impl Driver {
                 self.pending = Some(handle);
                 effect
             }
+            DriverMsg::BeginHugeTimeout => {
+                let (effect, handle) = call_cancelable(self.worker, WorkerMsg::Hold, Duration::MAX)
+                    .then(DriverMsg::Returned);
+                self.pending = Some(handle);
+                effect
+            }
+            DriverMsg::BeginCancelBeforeAdmit => {
+                let (effect, handle) = call_cancelable(self.worker, WorkerMsg::Hold, CALL_TIMEOUT)
+                    .then(DriverMsg::Returned);
+                batch([cancel_call(handle).then(DriverMsg::Cancelled), effect])
+            }
             DriverMsg::DoCancel => {
                 if let Some(handle) = self.pending.take() {
                     cancel_call(handle).then(DriverMsg::Cancelled)
@@ -177,6 +190,93 @@ impl Driver {
             }
         }
     }
+}
+
+#[test]
+fn huge_duration_call_deadline_saturates_instead_of_panicking() {
+    let runtime = Arc::new(ThreadedRuntime::new(
+        SingleShard,
+        DefaultThreadedMailboxFactory,
+    ));
+    let worker = runtime
+        .register_with_capacity::<_, Infallible>(Worker::default(), 8)
+        .expect("worker");
+    let observations = Arc::new(Mutex::new(Observations::default()));
+    let driver = runtime
+        .register_with_capacity::<_, Infallible>(
+            Driver {
+                worker,
+                observations,
+                pending: None,
+            },
+            16,
+        )
+        .expect("driver");
+
+    runtime
+        .try_send(driver, DriverMsg::BeginHugeTimeout)
+        .expect("begin huge timeout");
+    assert!(
+        wait_for_isolate_call_dispatched(&runtime),
+        "huge timeout call never dispatched; deadline arithmetic may have panicked"
+    );
+
+    runtime
+        .try_send(driver, DriverMsg::DoCancel)
+        .expect("cancel");
+    if let Ok(rt) = Arc::try_unwrap(runtime) {
+        let _ = rt.shutdown();
+    }
+}
+
+#[test]
+fn cancel_before_call_admit_returns_typed_outcome_and_runtime_continues() {
+    let runtime = Arc::new(ThreadedRuntime::new(
+        SingleShard,
+        DefaultThreadedMailboxFactory,
+    ));
+    let worker = runtime
+        .register_with_capacity::<_, Infallible>(Worker::default(), 8)
+        .expect("worker");
+    let observations = Arc::new(Mutex::new(Observations::default()));
+    let driver = runtime
+        .register_with_capacity::<_, Infallible>(
+            Driver {
+                worker,
+                observations: observations.clone(),
+                pending: None,
+            },
+            16,
+        )
+        .expect("driver");
+
+    runtime
+        .try_send(driver, DriverMsg::BeginCancelBeforeAdmit)
+        .expect("begin cancel-before-admit");
+
+    let obs_for_wait = observations.clone();
+    assert!(
+        wait_for(POLL_BUDGET, || {
+            !obs_for_wait.lock().expect("obs lock").cancels.is_empty()
+        }),
+        "driver never observed the not-admitted cancel outcome"
+    );
+
+    runtime.try_send(driver, DriverMsg::Begin).expect("begin");
+    assert!(
+        wait_for_isolate_call_dispatched(&runtime),
+        "runtime stopped after cancel-before-admit instead of dispatching later work"
+    );
+
+    let obs = observations.lock().expect("obs lock").clone();
+    if let Ok(rt) = Arc::try_unwrap(runtime) {
+        let _ = rt.shutdown();
+    }
+
+    assert!(
+        obs.cancels.contains(&CancelOutcome::NotAdmitted),
+        "cancel before call admission must be typed, not a shard panic; got {obs:?}"
+    );
 }
 
 #[test]

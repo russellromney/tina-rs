@@ -895,11 +895,16 @@ impl ShutdownChoreography {
             },
             _ => outcome,
         };
-        self.last_ordinal = Some(
-            self.last_ordinal
-                .map_or(step.ordinal(), |prev| prev.max(step.ordinal())),
-        );
-        self.last_step = Some(step);
+        match self.last_ordinal {
+            Some(last) if step.ordinal() < last => {}
+            _ => {
+                self.last_ordinal = Some(
+                    self.last_ordinal
+                        .map_or(step.ordinal(), |prev| prev.max(step.ordinal())),
+                );
+                self.last_step = Some(step);
+            }
+        }
         self.steps.push(ShutdownStepReport {
             step,
             label,
@@ -1149,6 +1154,37 @@ mod tests {
         let summary = report.summary_line();
         assert!(summary.contains("violations=1"), "{summary}");
         assert!(summary.contains("clean=false"), "{summary}");
+    }
+
+    #[test]
+    fn choreography_ordering_violation_reports_highest_completed_step() {
+        let mut choreo = ShutdownChoreography::new("svc");
+        choreo.record(
+            ShutdownStep::DrainInFlight,
+            "drain",
+            Duration::from_millis(1),
+            StepOutcome::Clean,
+        );
+        choreo.record(
+            ShutdownStep::StopIngress,
+            "stop_late",
+            Duration::from_millis(1),
+            StepOutcome::Clean,
+        );
+        choreo.record(
+            ShutdownStep::CancelSessions,
+            "cancel_late",
+            Duration::from_millis(1),
+            StepOutcome::Clean,
+        );
+
+        let report = choreo.finish();
+        match &report.steps[2].outcome {
+            StepOutcome::OrderingViolation { previous_step } => {
+                assert_eq!(*previous_step, ShutdownStep::DrainInFlight);
+            }
+            other => panic!("expected OrderingViolation, got {other:?}"),
+        }
     }
 
     #[test]

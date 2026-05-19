@@ -44,6 +44,7 @@ fn reqwest_error_reason(err: &ReqwestError) -> &'static str {
         ReqwestError::ResponseTooLarge => "ResponseTooLarge",
         ReqwestError::InvalidRequest(_) => "InvalidRequest",
         ReqwestError::Reqwest(_) => "Reqwest",
+        ReqwestError::Internal(_) => "Internal",
     }
 }
 
@@ -556,28 +557,11 @@ impl<S: Shard + 'static> ReqwestWorker<S> {
                     sleep(self.config.poll_interval).then(move |_| ReqwestMsg::Poll(id))
                 }
                 Err(oneshot::error::TryRecvError::Closed) => {
-                    let err = ReqwestError::Reqwest("reqwest task ended without result".into());
-                    if let (Some(saved), true) = (
-                        saved_request,
-                        attempts_remaining > 0 && retry_on_reqwest_io(&self.config.retry),
-                    ) {
-                        self.metrics.retries.fetch_add(1, Ordering::Relaxed);
-                        #[cfg(feature = "tracing")]
-                        event!(
-                            target: TRACE_TARGET_CALL,
-                            Level::DEBUG,
-                            kind = "retry",
-                            reason = "Reqwest",
-                            method = method.as_str(),
-                        );
-                        return self.schedule_retry(
-                            saved,
-                            request_context,
-                            attempts_remaining - 1,
-                            retry_delay,
-                            per_attempt_timeout,
-                        );
-                    }
+                    let err = closed_task_error();
+                    let _ = saved_request;
+                    let _ = attempts_remaining;
+                    let _ = retry_delay;
+                    let _ = per_attempt_timeout;
                     self.tally_error(&err);
                     self.note_terminal();
                     #[cfg(feature = "tracing")]
@@ -585,7 +569,7 @@ impl<S: Shard + 'static> ReqwestWorker<S> {
                         target: TRACE_TARGET_CALL,
                         Level::WARN,
                         kind = "replied",
-                        reason = "Reqwest",
+                        reason = "Internal",
                         method = method.as_str(),
                         detail = %err,
                     );
@@ -727,6 +711,7 @@ impl<S: Shard + 'static> ReqwestWorker<S> {
             ReqwestError::Timeout => &self.metrics.timeout,
             ReqwestError::ResponseTooLarge => &self.metrics.response_too_large,
             ReqwestError::Reqwest(_) => &self.metrics.reqwest_error,
+            ReqwestError::Internal(_) => &self.metrics.internal_error,
             ReqwestError::RequestTooLarge => &self.metrics.request_too_large,
             ReqwestError::InvalidRequest(_) => &self.metrics.invalid,
             ReqwestError::Full => &self.metrics.full,
@@ -742,6 +727,10 @@ fn is_retryable(err: &ReqwestError, policy: &RetryPolicy) -> bool {
         ReqwestError::Reqwest(_) => retry_on_reqwest_io(policy),
         _ => false,
     }
+}
+
+fn closed_task_error() -> ReqwestError {
+    ReqwestError::Internal("reqwest task ended without result".into())
 }
 
 fn retry_on_timeout(policy: &RetryPolicy) -> bool {
@@ -954,5 +943,82 @@ fn reqwest_to_error(url: &reqwest::Url, e: reqwest::Error) -> ReqwestError {
         ReqwestError::Timeout
     } else {
         ReqwestError::Reqwest(format!("{} {e}", url.as_str()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::Ordering;
+
+    use tina::SingleShard;
+
+    use super::*;
+
+    #[test]
+    fn closed_result_channel_is_internal_and_never_retried() {
+        let tokio_runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        let config = ReqwestConfig::default()
+            .with_poll_interval(Duration::from_millis(1))
+            .with_retry(RetryPolicy::Bounded {
+                max_attempts: 3,
+                delay: Duration::ZERO,
+                on_timeout: false,
+                on_reqwest_io: true,
+            });
+        let client = Client::builder().build().expect("client");
+        let (mut worker, metrics) = ReqwestWorker::<SingleShard>::with_supplied_client(
+            config,
+            client,
+            tokio_runtime.handle().clone(),
+        )
+        .expect("worker");
+        let task = tokio_runtime.spawn(async {});
+        let abort = task.abort_handle();
+        let (tx, rx) = oneshot::channel();
+        drop(tx);
+
+        worker.in_flight.insert(
+            7,
+            Slot {
+                kind: SlotKind::InFlight {
+                    attempt_started_at: Instant::now(),
+                    receiver: rx,
+                    abort,
+                },
+                request_context: None,
+                per_attempt_timeout: Duration::from_secs(1),
+                attempts_remaining: 2,
+                retry_delay: Duration::ZERO,
+                saved_request: Some(ReqwestRequest::post(
+                    "http://127.0.0.1:1/non-idempotent",
+                    b"charge-card".to_vec(),
+                )),
+                method: "POST".to_string(),
+            },
+        );
+        worker.metrics.set_in_flight(1);
+
+        let _effect = worker.poll(7);
+        let snap = metrics.snapshot();
+        assert_eq!(snap.retries, 0, "vanished tasks must not retry");
+        assert_eq!(snap.internal_error, 1);
+        assert_eq!(snap.reqwest_error, 0);
+        assert_eq!(snap.current_in_flight, 0);
+        assert!(worker.in_flight.is_empty());
+        assert_eq!(worker.metrics.retries.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn internal_error_is_not_retryable_even_when_io_retry_is_enabled() {
+        let policy = RetryPolicy::Bounded {
+            max_attempts: 2,
+            delay: Duration::ZERO,
+            on_timeout: true,
+            on_reqwest_io: true,
+        };
+        assert!(!is_retryable(&closed_task_error(), &policy));
     }
 }

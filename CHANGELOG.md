@@ -15,25 +15,276 @@ This file records completed work.
   `END_STREAM` on `HEADERS` with a non-zero declared length is
   rejected before dispatch.
 - HTTP/2 known-length streaming responses (`HttpResponseBody::Stream`)
-  track `response_remaining_content_length` per stream. A source that
-  over-produces resets visibly before the extra byte is queued for
-  outbound; a source that EOFs early resets rather than sending
-  `END_STREAM` with a short body. Chunked (unknown-length) responses
-  are unaffected.
+  track remaining `content-length` per stream. A source that over-produces
+  resets visibly before the extra byte is queued for outbound; a source
+  that EOFs early resets rather than sending `END_STREAM` with a short
+  body. Chunked unknown-length responses are unaffected.
 - HTTP/2 duplicate pseudo-headers (`:method`, `:path`, `:scheme`,
   `:authority`, `:status`) reject with `InvalidPseudoHeaders` before
   assignment instead of silently overwriting the prior value.
 - HTTP/2 `CONTINUATION` is now named (`FRAME_CONTINUATION = 0x9`) and
   any occurrence is rejected as `UnexpectedContinuation`. `PRIORITY`
-  validates stream id (must be nonzero) and payload length (must be
-  5) before accepting. Unknown extension frames still follow the
-  ignore-unknown rule, so core strictness does not turn unknowns
-  fatal.
-- `ThreadedMultiShardRuntime` worker loop services local commands
-  after every bounded `drain_remote_inbound` pass, not only when the
-  drain delivered zero envelopes. `Run` and `Shutdown` commands no
-  longer wait behind a sustained remote inbound flood. Ordinary
-  cross-shard throughput is unchanged.
+  validates stream id (must be nonzero) and payload length (must be 5)
+  before accepting. Unknown extension frames still follow the
+  ignore-unknown rule, so core strictness does not turn unknowns fatal.
+- `ThreadedMultiShardRuntime` worker loop services local commands after
+  every bounded remote-inbound drain pass, not only when the drain
+  delivered zero envelopes. `Run` and `Shutdown` commands no longer wait
+  behind a sustained remote inbound flood. Ordinary cross-shard throughput
+  is unchanged.
+
+### Phase 115 Core / Ecosystem Reorg
+
+Architecture cleanup before Wave A: docs draw the core-vs-batteries
+line; oversized core files split along real module boundaries.
+
+Docs and layering:
+
+- New `docs/tina-user-guide/23-core-and-batteries.md` draws the line between
+  Tina core (model crates, runtime/simulator) and official batteries
+  (`tina-http`, bridge crates, proof harness). Lists the six "official
+  battery rules" — bounded admission, typed outcomes, close/drain report,
+  pressure/capacity report, replay support or honest unsupported truth, no
+  hidden Tokio/runtime queues — and names the three prelude tiers
+  (`tina::prelude`, `tina_runtime::prelude`, battery preludes).
+- New `docs/tina-user-guide/24-battery-authoring.md` gives a twelve-item
+  authoring checklist for first- and third-party batteries plus a "known
+  hook gaps" table that names where existing first-party batteries still
+  reach past clean public hooks (HTTP/TLS rails, bridge lifecycle, body
+  streaming/source lifecycle, AWS/sqlx/reqwest/Tokio-owned worker copy,
+  per-battery replay declarations).
+- Updated `docs/README.md` and `docs/tina-user-guide/README.md` so the
+  "learn core" and "choose batteries" reading orders are now distinct.
+- Added a "Layering" stanza to the Phase 116, 117, and 118 plan outlines so
+  Wave A work uses the new core-vs-batteries language and does not invent
+  private runtime hooks inside battery code.
+
+No-behavior module splits:
+
+- `tina/src/lib.rs` (3287 → 454 lines, target <1,200 ✅) split into
+  `mod address` (address/id/generation types, `Outbound`,
+  service-shaped addresses), `mod context` (`Context`, `CallContext`,
+  `RequestCall`, `RequestContext`, defer-through traits,
+  deferred-reply slots, `CallHandle`/cancellation/`Deadline`,
+  `MessageCaller`, `CallRouting`, `DeferredSlotRegistry`),
+  `mod effect` (closed `Effect` enum and every constructor: `noop`,
+  `fact`, `reply`, `reject`, `send`, `send_to`/`send_event`,
+  `spawn`/`spawn_observed`, `stop`/`stop_with`, `restart_children`,
+  `batch`/`sequence`, `reply_to`/`reply_to_request`), and
+  `mod isolate` (`Isolate`/`CallableIsolate`,
+  `Mailbox`/`TrySendError`, `RestartPolicy`/`ChildRelation`/
+  `RestartDecision`/`RestartBudget` family, `Shard`/`SingleShard`,
+  `ChildDefinition`/`ChildRef`, `SpawnObserved` family,
+  `RestartableChildDefinition`).
+- `tina-sim/src/dst.rs` (4261 → 1180 lines in `dst/mod.rs`,
+  target <1,200 ✅) split into six submodules: `discovery`
+  (`DiscoveredConstants`, `discover_constants`), `invariants`
+  (`InvariantViolation`/`InvariantSuite` and the per-invariant check
+  functions, `contains_visible_pressure`, `assert_projection_eq`),
+  `projection` (`TraceShape`, `RuntimeEventKindName`,
+  `TraceProjection`, `TraceProjectionError`, `ProtocolReplayMismatch`,
+  `project_trace_shape`, `replay_config_hash`/`encode_*` family),
+  `replay_case` (`UnsupportedLiveFact`, `LiveReplayFact`,
+  `CapacityReplayFact`, `LiveReplayCapture`, `SavedReplayCase` and
+  on-disk format, `CapturedReplayChange`, `LiveReplayReport`,
+  `CapturedReplayMismatch`, `ReplayMismatch`,
+  `check_replay_case`/`check_captured_replay`/`observe_replay_case`),
+  `shrink` (`ShrinkConfig`, `ShrunkFailure`, `delete_shrink`,
+  `ShrinkReport`, `shrink_replay_case`), and `sweep` (`SweepFailure`,
+  `SweepSuccess`, `sweep_seeds`).
+- `tina-runtime/src/call.rs` (4656 → 2562 lines in `call/mod.rs`,
+  target <1,200 partial) converted to `call/mod.rs` with per-rail
+  submodules: `tcp` (`tcp_bind`/`accept`/`connect`/`read`/`write`/
+  close), `udp`, `tls`, `dns`, `signals`, `process`, `files`
+  (file + filesystem-path), `persistence` (snapshot/journal), plus
+  shared `types` (newtype IDs, file/process/path/persistence data
+  shapes), `time` (`sleep`, `sleep_then`, `SleepCall` plus all its
+  defer-through impls), `pending` (`CancelableCall`,
+  `PendingCancelableCall`/`Ticket`/`Set` family), `cancel`
+  (`CancelCallBuilder`, `cancel_call`, `call_cancelable`,
+  `call_with_handle`, `call_handle_call_id`), and `groups`
+  (`WorkTicket`, `CancelableWork`, `CancelableWorkSnapshot`,
+  `AdmitWorkError`). The `call/mod.rs` core still holds the
+  closely-coupled `CallInput`/`CallOutput`/`CallError` enums and the
+  `RuntimeCall`/`TypedCall` family.
+- `tina-runtime/src/lib.rs` (5231 → 641 lines ✅) — extracted four
+  submodules from the giant `impl<S, F> Runtime<S, F>` block: `mod
+  host_call` (`try_send`/`try_send_event`, `observe_*`,
+  `set_trace_retention`/`set_trace_observer`, `has_in_flight_calls`,
+  `trace`, `pressure_summary`, plus the test-only lineage / child /
+  supervisor snapshots), `mod remote` (cross-shard transport types
+  `QueuedRemoteEnvelope` / `QueuedRemoteSend` / `RemoteCallReply`
+  family plus `dispatch_local_send_with_context` /
+  `harvest_remote_*` / `complete_remote_isolate_call`), `mod
+  registration` (every `register_*` / `supervise` / `try_supervise`
+  API plus the registered-address bookkeeping and the
+  `spawn_isolate` / `record_child` /
+  `enqueue_bootstrap_message` / `enqueue_entry_message` /
+  `recv_entry_message` family), and `mod dispatch` (the biggest
+  bin: `step`, `step_with_remote`, `execute_effect` and friends,
+  `dispatch_call` / `dispatch_driver_call` /
+  `dispatch_observed_send` / `dispatch_isolate_call` /
+  `dispatch_cancel_call`, `harvest_isolate_call_timeouts`,
+  `record_cancelled_call` / `recently_cancelled_cause` /
+  `close_deferred_slot_for_call_with_reason` /
+  `complete_isolate_call` / `deliver_isolate_call_outcome`,
+  `advance_driver` / `deliver_completion`, the `stop_entry*` and
+  restart family, `push_event` / `enforce_trace_retention` /
+  `compact_trace_prefix*`, plus every `Erased*` adapter type
+  (`ErasedMailbox` / `MailboxAdapter` / `AnyMailboxAdapter`,
+  `ErasedHandler` / `HandlerAdapter` / `SendableHandlerAdapter`,
+  `ErasedSpawn` / `SpawnAdapter` / `RestartableSpawnAdapter`,
+  `ErasedSpawnObserved` / `SpawnObservedAdapter`, `ErasedEffect`,
+  `ErasedSend`, `ErasedMessage`, `RegisteredEntry`,
+  `RegisteredAddress`, `SpawnOutcome` / `SpawnObservedOutcome`,
+  `ChildRecord` / `SupervisorRecord`, `ChildRecordSnapshot` /
+  `SupervisorRecordSnapshot`, and the `erase_effect{,_sendable}`
+  helpers). Constructors (`new`, `with_betelgeuse_io_loop`,
+  `with_clock*`) and the const accessors (`shard`,
+  `trace_retention`, `trace_dropped`,
+  `cancelled_call_cause_evictions`) stay in `lib.rs`. Crate-internal
+  references continue to resolve through narrow `pub(crate) use
+  dispatch::{...}` re-exports.
+- `tina-sim/src/lib.rs` (6,787 → 1,644 lines ✅ <2,000) — extracted
+  `mod sim_impl` carrying every non-constructor method on
+  `Simulator<S>` (`register`, `register_with_mailbox_capacity`,
+  `supervise`, `try_send`, `advance_time`,
+  `advance_to_next_timer`, `step`, `step_with_remote`,
+  `run_until_quiescent[_checked]`, `replay_artifact`,
+  `durable_image` / `load_durable_image`, `observe_new_events`,
+  `execute_effect` plus reject/reply/push_event family,
+  `register_entry` / `spawn_isolate` / `record_child` /
+  `enqueue_bootstrap_message`, restart/supervise lineage handling,
+  `checked_registered_address` and the address-book lookups, the
+  full `dispatch_call` / `dispatch_backend_call` /
+  `dispatch_observed_send` / `dispatch_isolate_call` family, and
+  every TCP / UDP / TLS / file / process / persistence /
+  `TimerEntry` resource-state helper). The free `call_kind` /
+  `fault_selector` helpers and the spawn-adapter types
+  (`SpawnObservedAdapter`, `SpawnAdapter`,
+  `RestartableSpawnAdapter` plus their `ErasedSpawn` /
+  `IntoErasedSpawn` / `ErasedRestartRecipe` /
+  `IntoErasedSpawnObserved` impls) moved alongside them. The
+  Simulator struct, constructors, and immutable accessors stay in
+  `lib.rs`. Phase audit doc
+  (`.intent/phases/115-core-ecosystem-reorg/audit.md`) recorded
+  the visibility decisions.
+
+All moves are private re-exports, so the public API is unchanged.
+The Runtime/Simulator fields and the private support types (the
+full `Erased*` adapter family, the registered-address /
+spawn-outcome / child-record / supervisor-record family, the
+remote-envelope vocabulary, the resource-state structs, the
+`Pending*` and `InFlightCall` / `StoredTranslator` /
+`PendingIsolateCall` families) all became `pub(crate)` per the
+audit so the submodules can name them; nothing newly public.
+
+Deferred to a follow-on cleanup (intentionally named so they can't
+be silently dropped):
+
+- `tina-runtime/src/dispatch.rs` is ~3,250 lines and
+  `tina-sim/src/sim_impl.rs` is ~5,270 lines. Both are above the
+  comfortable per-file ceiling and are the next obvious targets for
+  a sub-bin split (the runtime audit's `mod dispatch` was one
+  conceptual bin; we kept it together so this PR stays an honest
+  move-only refactor). The sim split into `mod simulator` / `mod
+  resources` / `mod calls` follows the runtime pattern: visibility
+  audit recorded; sub-bins are mechanical method moves once a
+  reviewer wants smaller files.
+- `tina-runtime/src/call/mod.rs` (2,562 → 1,779 lines) — extracted
+  `mod io` carrying the closed-set runtime call vocabulary
+  (`CallInput`, `PersistenceTraceInfo`, `CallOutput`, `CallError`,
+  `SendOutcome`, `CallOutcome<T>` plus the `SendOutcome::from_rejected`
+  helper). The remaining `mod.rs` keeps the type-erasure machinery
+  (`RuntimeCall<M>`, `RuntimeCallKind<M>`, `RuntimeCallable`,
+  `RuntimeCallParts<M>`, `ErasedCall`, `IntoErasedCall<M>`) and the
+  typed-future family (`TypedCall<T>`, `ObservedSend<T>`,
+  `IsolateCall<T, R>`, the deferred / request variants, and the
+  builder constructors). Public API unchanged: `mod.rs` re-exports
+  via `pub use io::*;` like the other call submodules.
+- The oversized test homes (`tina-runtime/src/tests.rs`,
+  `tina-runtime/tests/local_system.rs`,
+  `tina-sim/tests/io_simulation.rs`) — splittable by test name
+  only.
+
+### Phase 123 Adversarial Hardening
+
+- Hardened HTTP/1 keepalive response handling for chunked replies: keepalive
+  clients now decode chunked response bodies, surface malformed or over-cap
+  chunked bodies as typed parse failures, and retire the connection after
+  chunked delivery so stale bytes cannot contaminate a later request.
+- Tightened HTTP parser/WebSocket strictness: chunked size lines reject
+  forbidden leading whitespace, chunked length accounting uses checked
+  arithmetic, protocol-relative HTTP/1 targets are rejected, and WebSocket
+  frames reject non-minimal extended lengths plus 127-form high-bit lengths.
+- Hardened the native HTTP/2 server: DATA/HEADERS PADDED and PRIORITY flags
+  are parsed correctly, SETTINGS now applies peer flow-control/frame-size
+  facts before ACK, forbidden HTTP/1 connection-control headers and missing
+  authority reject, and rapid reset churn produces `ENHANCE_YOUR_CALM`.
+- Fixed `tina-rpc-tokio` bridge cancellation accounting so a stale
+  cancellation guard cannot double-release a bounded admission slot.
+- Added reserved cross-shard terminal reply lanes so remote `Full`/`Closed`
+  replies are not silently dropped behind ordinary remote traffic.
+- Unified bridge timeout/capacity truth across SQLx, AWS, reqwest, and Tokio
+  bridge paths with separate caller/external/late-work accounting.
+- Bounded runtime/process shutdown and journal repair paths: process cleanup,
+  snapshot temp cleanup, truncated journal append repair, and append-side tail
+  validation now settle with visible outcomes.
+- Hardened runtime hot paths and ownership truth: bounded trace retention is
+  amortized constant-time, buffered trace observers count drops, restart
+  budgets can be windowed, stopped restart entries are collected, cancelled
+  call cause-ring overflow is visible, and `PendingReplies::take()` is counted.
+- Tightened simulator/proof/macro surfaces: deterministic per-tag simulator
+  fault streams, explicit isolate and RPC service macro crate path overrides,
+  core `Infallible` expansion, duplicate RPC request-id rejection, async Tokio
+  bridge drain, and SQLx ambiguous-commit outcomes with completed step
+  records.
+
+### Phase 112 Protocol Facts To Replay
+
+- New replayable fact effect. `Effect::Fact(I::Fact)` rides handler turns
+  the same way other effects do; the runtime and simulator translate it
+  into `RuntimeEventKind::FactObserved { fact: RuntimeFact }`. Stable
+  effect-kind tag `13`; stable runtime-event tag `36`. Existing tags
+  are unchanged.
+- `tina::Isolate::Fact` associated type. Ordinary isolates default to
+  `Fact = Infallible` (macros and `isolate_types!` set it automatically)
+  and pay nothing. Protocol isolates opt in with `fact = ProtocolFact`
+  in the `#[tina_runtime::isolate]` / `isolate_types!` form.
+- `tina_runtime::RuntimeFact` carries the canonical replay shape with
+  one family today (`Protocol(ProtocolFact)`) and a stable family tag
+  `1`. The `IntoRuntimeFact` trait is the registration boundary: an
+  isolate whose `Fact` type does not implement it will not register.
+- `tina_runtime::ProtocolFact` vocabulary: `Http2StreamOpened`,
+  `Http2StreamClosed`, `Http2StreamReset`, `Http2FlowControlFull`,
+  `HttpBodyHighWater`, `WebSocketSlowPeerClosed`,
+  `WebSocketSessionClosed`, `GrpcFinalStatusSent`. Each variant carries
+  typed connection / stream / session / direction / reason fields and
+  no stringly-typed substitutes.
+- Real emission points in `tina-http`:
+  - HTTP/2 connection isolate emits stream-open/close/reset and
+    flow-control facts at the point each protocol fact becomes true
+    (header dispatch, RST_STREAM, body-cap and flow-control rejects);
+  - HTTP/1 connection isolate emits slow-peer and session-close facts
+    on the WebSocket lane;
+  - the native gRPC trailer send emits `GrpcFinalStatusSent` and a
+    paired `Http2StreamClosed`.
+  Blocking host helpers (`grpc_unary_call_h2c_blocking`) intentionally
+  do not emit replay facts; the docs say so explicitly.
+- Simulator parity. `Effect::Fact` executes identically in
+  `tina_sim::Simulator`, so saved DST cases observe the same facts as
+  the live runtime in the same order. A typed
+  `ProtocolReplayMismatch::UnsupportedProtocolFact` arm names live-only
+  physics gaps without faking a pass.
+- Projection presets. `TraceProjection::protocol_facts()`,
+  `http2_streams()`, `websocket_sessions()`, and `grpc_status()`
+  produce fail-closed projections (every other event kind is named
+  `ignored`, and an unknown kind still errors). One saved replay proof
+  is locked in via `tina-sim/tests/protocol_fact.rs`.
+- Compile-time rails. Three new `trybuild` fixtures pin that wrong
+  fact wiring fails to compile: an ordinary isolate emitting a
+  `ProtocolFact`, a protocol isolate emitting the wrong fact enum, and
+  an isolate whose `Fact` type lacks `IntoRuntimeFact`.
 
 ### Phase 110 Workflow Pending Ergonomics
 

@@ -454,6 +454,15 @@ fn checked_add_or_max(now: Instant, after: Duration) -> Instant {
         .unwrap_or_else(|| now.checked_add(TIMER_SATURATION_CEILING).unwrap_or(now))
 }
 
+fn elapsed_periods_saturating(overdue: Duration, period: Duration) -> u64 {
+    overdue
+        .as_nanos()
+        .checked_div(period.as_nanos())
+        .and_then(|periods| periods.checked_add(1))
+        .and_then(|periods| u64::try_from(periods).ok())
+        .unwrap_or(u64::MAX)
+}
+
 /// What [`RecurringTick`] does when the caller is overdue.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RecurringCatchUp {
@@ -688,7 +697,7 @@ impl RecurringTick {
 
         // Overdue: compute how many periods have elapsed since scheduled_at.
         let overdue = now.saturating_duration_since(scheduled_at);
-        let elapsed_periods = (overdue.as_nanos() / self.period.as_nanos()) as u64 + 1;
+        let elapsed_periods = elapsed_periods_saturating(overdue, self.period);
 
         match self.catch_up {
             RecurringCatchUp::Delay => {
@@ -736,6 +745,7 @@ impl RecurringTick {
                 // visibly on the first Sleep(0) via `missed_ticks`. Subsequent
                 // queued catch-ups report `missed_ticks = 0`.
                 if budget == 0 {
+                    let missed = elapsed_periods.saturating_sub(1);
                     let advance = duration_mul_saturating(self.period, u128::from(elapsed_periods));
                     let new_scheduled_at = scheduled_at
                         .checked_add(advance)
@@ -743,13 +753,13 @@ impl RecurringTick {
                         .unwrap_or_else(|| checked_add_or_max(now, self.period));
                     self.next_due = Some(new_scheduled_at);
                     self.armed_ordinal = None;
-                    let tick_number = self.next_tick_number.saturating_add(elapsed_periods);
+                    let tick_number = self.next_tick_number.saturating_add(missed);
                     self.next_tick_number = tick_number.saturating_add(1);
                     return RecurringTickDecision::Skip(RecurringTickReport {
                         tick_number,
                         scheduled_at,
                         observed_at: now,
-                        missed_ticks: elapsed_periods,
+                        missed_ticks: missed,
                         catch_up_remaining: 0,
                     });
                 }
@@ -1130,8 +1140,8 @@ mod tests {
         match tick.next(late) {
             RecurringTickDecision::Skip(report) => {
                 assert!(
-                    report.missed_ticks >= 3,
-                    "all overdue ticks should be reported as skipped"
+                    report.missed_ticks >= 2,
+                    "zero-budget bounded catch-up should report missed ticks like Skip"
                 );
                 assert_eq!(report.catch_up_remaining, 0);
             }
@@ -1145,6 +1155,14 @@ mod tests {
             }
             other => panic!("expected future Sleep after zero-budget Skip, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn recurring_tick_elapsed_periods_saturates_instead_of_truncating() {
+        assert_eq!(
+            elapsed_periods_saturating(Duration::MAX, Duration::from_nanos(1)),
+            u64::MAX
+        );
     }
 
     #[test]

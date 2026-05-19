@@ -45,6 +45,15 @@ Read in order if new:
 19. [Tracing](19-tracing.md)
 20. [Native WebSocket Server](20-native-websocket-server.md)
 21. [Compile-Time Safety Rails](21-compile-time-safety-rails.md)
+22. [HTTP/HTTP2/gRPC Protocol Facts](22-http-http2-grpc.md)
+23. [Core And Batteries](23-core-and-batteries.md)
+24. [Battery Authoring Checklist](24-battery-authoring.md)
+25. [Bridge Author Kit (copied path)](30-bridge-author-kit.md)
+
+The reading order separates **learn core** (pages 0–17, 19, 21) from
+**choose batteries** (pages 18, 20, 22, 25, plus 23–24 which explain the
+boundary itself). New users should not need to read battery docs to
+understand Tina core.
 
 For runnable specimens, see repo-root `examples/`.
 

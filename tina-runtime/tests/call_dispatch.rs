@@ -165,6 +165,7 @@ impl Isolate for Probe {
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<ProbeMsg>;
+    type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 
     fn handle(
@@ -216,6 +217,7 @@ impl Isolate for Binder {
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<BinderMsg>;
+    type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 
     fn handle(
@@ -286,6 +288,7 @@ impl Isolate for Waiter {
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<WaiterMsg>;
+    type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 
     fn handle(
@@ -329,6 +332,7 @@ impl Isolate for StreamAcceptor {
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<AcceptStreamMsg>;
+    type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 
     fn handle(
@@ -363,6 +367,7 @@ impl Isolate for Reader {
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<ReaderMsg>;
+    type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 
     fn handle(
@@ -402,6 +407,7 @@ impl Isolate for Writer {
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<WriterMsg>;
+    type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 
     fn handle(
@@ -441,6 +447,7 @@ impl Isolate for Closer {
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<CloserMsg>;
+    type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 
     fn handle(
@@ -1620,6 +1627,7 @@ fn isolate_without_call_effects_compiles_with_infallible() {
         type Spawn = Infallible;
         type SpawnObserved = std::convert::Infallible;
         type Call = Infallible;
+        type Fact = ::std::convert::Infallible;
         type Shard = TestShard;
 
         fn handle(

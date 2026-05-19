@@ -559,6 +559,19 @@ fn read_frame(stream: &mut TcpStream) -> Frame {
     }
 }
 
+fn wait_for_atomic_flag(flag: &AtomicBool, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if flag.load(Ordering::Acquire) {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
 fn request_headers(path: &str, content_type: &str) -> Vec<u8> {
     request_headers_with_encoding(path, content_type, None)
 }
@@ -878,9 +891,8 @@ fn grpc_server_streaming_peer_reset_cancels_response_source() {
         }
     }
     write_frame(&mut stream, FRAME_RST_STREAM, 0, 1, &0_u32.to_be_bytes());
-    std::thread::sleep(Duration::from_millis(20));
     assert!(
-        received_cancel.load(Ordering::Acquire),
+        wait_for_atomic_flag(&received_cancel, Duration::from_secs(1)),
         "server-streaming peer reset must cancel response source"
     );
     harness.shutdown();
@@ -924,9 +936,8 @@ fn grpc_server_streaming_non_reading_peer_reset_cancels_blocked_source() {
     std::thread::sleep(Duration::from_millis(50));
 
     write_frame(&mut stream, FRAME_RST_STREAM, 0, 1, &0_u32.to_be_bytes());
-    std::thread::sleep(Duration::from_millis(50));
     assert!(
-        received_cancel.load(Ordering::Acquire),
+        wait_for_atomic_flag(&received_cancel, Duration::from_secs(1)),
         "peer reset must cancel a response source even when the client never drains DATA"
     );
     harness.shutdown();
@@ -1177,9 +1188,8 @@ fn grpc_streaming_peer_reset_cancels_response_source() {
     );
     write_frame(&mut stream, FRAME_RST_STREAM, 0, 1, &0_u32.to_be_bytes());
 
-    std::thread::sleep(Duration::from_millis(20));
     assert!(
-        received_cancel.load(Ordering::Acquire),
+        wait_for_atomic_flag(&received_cancel, Duration::from_secs(1)),
         "peer reset must cancel streaming response source"
     );
     harness.shutdown();

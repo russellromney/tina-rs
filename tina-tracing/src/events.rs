@@ -488,6 +488,16 @@ pub fn emit_event(event: &RuntimeEvent) {
             call_id = call_id.get(),
             cancel_cause = cancel_cause_name(cause),
         ),
+        RuntimeEventKind::FactObserved { fact } => event!(
+            target: RUNTIME_TRACE_TARGET,
+            Level::TRACE,
+            kind = "fact_observed",
+            event_id,
+            cause_id = ?cause_id,
+            shard,
+            isolate,
+            fact = ?fact,
+        ),
     }
 }
 
@@ -556,6 +566,7 @@ pub fn effect_kind_name(kind: EffectKind) -> &'static str {
         EffectKind::Batch => "batch",
         EffectKind::ReplyTo => "reply_to",
         EffectKind::Reject => "reject",
+        EffectKind::Fact => "fact",
     }
 }
 
@@ -693,6 +704,10 @@ pub fn call_error_name(error: CallError) -> &'static str {
         CallError::ProcessFull => "ProcessFull",
         CallError::ProcessClosed => "ProcessClosed",
         CallError::KillUncertain => "KillUncertain",
-        CallError::Rejected(_) => "Rejected",
+        CallError::Rejected(CallRejectedReason::ReplyAbandoned) => "Rejected.ReplyAbandoned",
+        CallError::Rejected(CallRejectedReason::HandlerPanicked) => "Rejected.HandlerPanicked",
+        CallError::Rejected(CallRejectedReason::UnsupportedMessage) => {
+            "Rejected.UnsupportedMessage"
+        }
     }
 }

@@ -7,7 +7,7 @@ error[E0308]: mismatched types
    |         arguments to this function are incorrect
    |
 note: function defined here
-  --> $WORKSPACE/tina/src/lib.rs
+  --> $WORKSPACE/tina/src/effect.rs
    |
    | pub fn send_event<I, E, Q>(destination: ServiceEventAddress<E, Q>, event: E) -> Effect<I>
    |        ^^^^^^^^^^

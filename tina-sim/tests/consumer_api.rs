@@ -48,6 +48,7 @@ impl Isolate for EchoConnection {
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<ConnectionMsg>;
+    type Fact = ::std::convert::Infallible;
     type Shard = ConsumerShard;
 
     fn handle(
@@ -148,6 +149,7 @@ impl Isolate for EchoListener {
     type Spawn = RestartableChildDefinition<EchoConnection>;
     type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<ListenerMsg>;
+    type Fact = ::std::convert::Infallible;
     type Shard = ConsumerShard;
 
     fn handle(
@@ -332,6 +334,7 @@ impl Isolate for ObservedTarget {
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<ObservedTargetMsg>;
+    type Fact = ::std::convert::Infallible;
     type Shard = ConsumerShard;
 
     fn handle(
@@ -364,6 +367,7 @@ impl Isolate for ObservedSender {
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<ObservedSenderMsg>;
+    type Fact = ::std::convert::Infallible;
     type Shard = ConsumerShard;
 
     fn handle(
@@ -458,6 +462,7 @@ impl Isolate for ReplyWorker {
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<WorkerRequest>;
+    type Fact = ::std::convert::Infallible;
     type Shard = ConsumerShard;
 
     fn handle_call(
@@ -515,6 +520,7 @@ impl Isolate for CallerWorker {
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<CallerMsg>;
+    type Fact = ::std::convert::Infallible;
     type Shard = ConsumerShard;
 
     fn handle(

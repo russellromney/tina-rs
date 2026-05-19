@@ -128,7 +128,10 @@ impl PersistService {
                         self.last_journal_index = record.index;
                     }
                 }
-                if replay.warning == Some(JournalReplayWarning::TruncatedTail) {
+                if matches!(
+                    replay.warning,
+                    Some(JournalReplayWarning::TruncatedTail { .. })
+                ) {
                     self.observed
                         .lock()
                         .expect("observed mutex")
@@ -425,7 +428,12 @@ fn journal_replay_reports_truncated_tail_but_rejects_bad_checksum() {
     truncated.extend_from_slice(&[1, 2, 3]);
     let replay = tina_runtime::persistence::replay_journal_bytes(&truncated).unwrap();
     assert_eq!(replay.records.len(), 1);
-    assert_eq!(replay.warning, Some(JournalReplayWarning::TruncatedTail));
+    assert_eq!(
+        replay.warning,
+        Some(JournalReplayWarning::TruncatedTail {
+            valid_prefix_len: good.len() as u64,
+        })
+    );
 
     let mut corrupt = good;
     let last = corrupt.len() - 1;
@@ -483,9 +491,65 @@ fn journal_append_rejects_unreplayable_index_order_before_appending() {
         .concat(),
     )
     .expect("write truncated journal");
+    tina_runtime::persistence::append_journal_record(&journal, 3, b"third".to_vec()).unwrap();
+    let repaired = tina_runtime::persistence::replay_journal(&journal).unwrap();
+    assert_eq!(repaired.warning, None);
     assert_eq!(
-        tina_runtime::persistence::append_journal_record(&journal, 3, b"third".to_vec()),
-        Err(CallError::CorruptRecord)
+        repaired
+            .records
+            .iter()
+            .map(|record| record.index)
+            .collect::<Vec<_>>(),
+        vec![1, 3]
+    );
+}
+
+#[test]
+fn local_runtime_recovers_truncated_journal_then_repairs_on_next_append() {
+    let dir = unique_dir("runtime-truncated-repair");
+    let snapshot = dir.join("state.snapshot");
+    let journal = dir.join("state.journal");
+    let good = tina_runtime::persistence::encode_journal_record(&tina_runtime::JournalRecord {
+        index: 1,
+        bytes: b"hay".to_vec(),
+    });
+    fs::write(&journal, [good, vec![0, 1, 2]].concat()).expect("write truncated journal");
+
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let mut runtime = Runtime::new(PersistShard, TestMailboxFactory);
+    let address = runtime.register_with_capacity::<PersistService, Infallible>(
+        PersistService::new(snapshot, journal.clone(), Arc::clone(&observed)),
+        16,
+    );
+
+    runtime.try_send(address, PersistMsg::Recover).unwrap();
+    run_until_idle(&mut runtime);
+    runtime
+        .try_send(address, PersistMsg::Mutate("oats".to_owned()))
+        .unwrap();
+    run_until_idle(&mut runtime);
+
+    let events = observed.lock().expect("observed mutex").clone();
+    assert!(
+        events.windows(3).any(|window| {
+            window
+                == [
+                    "truncated-tail".to_owned(),
+                    "hay".to_owned(),
+                    "hay,oats".to_owned(),
+                ]
+        }),
+        "user-visible recovery/append sequence was not observed: {events:?}"
+    );
+    let repaired = tina_runtime::persistence::replay_journal(&journal).unwrap();
+    assert_eq!(repaired.warning, None);
+    assert_eq!(
+        repaired
+            .records
+            .iter()
+            .map(|record| String::from_utf8(record.bytes.clone()).expect("utf8"))
+            .collect::<Vec<_>>(),
+        vec!["hay", "oats"]
     );
 }
 

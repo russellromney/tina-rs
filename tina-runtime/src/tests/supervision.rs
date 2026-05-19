@@ -240,6 +240,61 @@ fn supervised_restart_budget_exhaustion_is_visible_and_creates_no_replacement() 
 }
 
 #[test]
+fn windowed_restart_budget_resets_after_period() {
+    let factory_calls = Rc::new(Cell::new(0));
+    let (mut runtime, clock) = new_manual_runtime();
+    let root = runtime.register(
+        new_restartable_root(Rc::clone(&factory_calls)),
+        root_mailbox(),
+    );
+    runtime.supervise(
+        root,
+        SupervisorConfig::new(
+            RestartPolicy::OneForOne,
+            tina::RestartBudget::within(1, Duration::from_secs(10)),
+        ),
+    );
+
+    assert_eq!(runtime.try_send(root, LineageMsg::SpawnChild), Ok(()));
+    assert_eq!(runtime.step(), 1);
+    let first_child = last_spawned_child(runtime.trace());
+    assert_eq!(
+        runtime.try_send(lineage_address(first_child), LineageMsg::Panic),
+        Ok(())
+    );
+    assert_eq!(runtime.step(), 1);
+    let first_replacement = runtime.child_record_snapshot()[0].child_isolate;
+
+    clock.advance(Duration::from_secs(10));
+    assert_eq!(
+        runtime.try_send(lineage_address(first_replacement), LineageMsg::Panic),
+        Ok(())
+    );
+    assert_eq!(runtime.step(), 1);
+    let second_replacement = runtime.child_record_snapshot()[0].child_isolate;
+
+    assert_ne!(first_replacement, second_replacement);
+    assert_eq!(
+        runtime.entry_count(),
+        2,
+        "old stopped child entries should be collected after restart work settles"
+    );
+    assert_eq!(factory_calls.get(), 3);
+    assert!(
+        !supervisor_events(runtime.trace())
+            .iter()
+            .any(|kind| matches!(
+                kind,
+                RuntimeEventKind::SupervisorRestartRejected {
+                    reason: SupervisionRejectedReason::BudgetExceeded { .. },
+                    ..
+                }
+            )),
+        "windowed budget should reset after the configured period"
+    );
+}
+
+#[test]
 fn stopped_supervisor_rejects_later_child_failure_without_replacement() {
     let factory_calls = Rc::new(Cell::new(0));
     let mut runtime = Runtime::new(TestShard, TestMailboxFactory);

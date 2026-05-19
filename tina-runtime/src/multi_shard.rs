@@ -37,6 +37,8 @@ where
     config: MultiShardRuntimeConfig,
     remote_queues: RemoteQueues,
     next_remote_queues: RemoteQueues,
+    terminal_remote_queues: RemoteQueues,
+    next_terminal_remote_queues: RemoteQueues,
 }
 
 /// Bounded coordinator config for additive multi-shard runtime shells.
@@ -113,6 +115,10 @@ where
         let (remote_queue_indexes, remote_queues) =
             build_remote_queues(&shard_ids, config.shard_pair_capacity);
         let next_remote_queues = build_remote_queue_storage(&shard_ids, config.shard_pair_capacity);
+        let terminal_remote_queues =
+            build_remote_queue_storage(&shard_ids, config.shard_pair_capacity);
+        let next_terminal_remote_queues =
+            build_remote_queue_storage(&shard_ids, config.shard_pair_capacity);
 
         Self {
             runtimes,
@@ -122,6 +128,8 @@ where
             config,
             remote_queues,
             next_remote_queues,
+            terminal_remote_queues,
+            next_terminal_remote_queues,
         }
     }
 
@@ -161,6 +169,7 @@ where
         I::Spawn: IntoErasedSpawn<S, F> + 'static,
         I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
         I::Call: IntoErasedCall<I::Message> + 'static,
+        I::Fact: crate::fact::IntoRuntimeFact + 'static,
         Outbound: 'static,
         M: Mailbox<I::Message> + 'static,
     {
@@ -184,6 +193,7 @@ where
         I::Spawn: IntoErasedSpawn<S, F> + 'static,
         I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
         I::Call: IntoErasedCall<I::Message> + 'static,
+        I::Fact: crate::fact::IntoRuntimeFact + 'static,
         Outbound: 'static,
     {
         self.runtime_mut(shard)
@@ -206,6 +216,7 @@ where
         I::Spawn: IntoErasedSpawn<S, F> + 'static,
         I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
         I::Call: IntoErasedCall<I::Message> + 'static,
+        I::Fact: crate::fact::IntoRuntimeFact + 'static,
         Outbound: 'static,
     {
         self.runtime_mut(shard)
@@ -276,6 +287,10 @@ where
     /// Runs one global deterministic round in ascending shard-id order.
     pub fn step(&mut self) -> usize {
         std::mem::swap(&mut self.remote_queues, &mut self.next_remote_queues);
+        std::mem::swap(
+            &mut self.terminal_remote_queues,
+            &mut self.next_terminal_remote_queues,
+        );
         let mut delivered = 0;
         let config = self.config;
         let shard_ids = &self.shard_ids;
@@ -283,6 +298,8 @@ where
         let remote_queue_indexes = &self.remote_queue_indexes;
         let remote_queues = &mut self.remote_queues;
         let next_remote_queues = &mut self.next_remote_queues;
+        let terminal_remote_queues = &mut self.terminal_remote_queues;
+        let next_terminal_remote_queues = &mut self.next_terminal_remote_queues;
         let runtimes = &mut self.runtimes;
 
         for destination in shard_ids.iter().copied() {
@@ -304,22 +321,30 @@ where
                         destination.get()
                     )
                 });
+                while let Some(queued) = terminal_remote_queues[queue_index].pop_front() {
+                    if let Some(outbound) = runtimes[index].harvest_remote_envelope(queued) {
+                        let _ = enqueue_remote_envelope(
+                            destination,
+                            outbound,
+                            remote_queue_indexes,
+                            next_remote_queues,
+                            next_terminal_remote_queues,
+                            config.shard_pair_capacity,
+                            "multi-shard runtime",
+                        );
+                    }
+                }
                 while let Some(queued) = remote_queues[queue_index].pop_front() {
                     if let Some(outbound) = runtimes[index].harvest_remote_envelope(queued) {
-                        let target_shard = outbound.target_shard();
-                        let key = (destination, target_shard);
-                        let queue_index =
-                            remote_queue_indexes.get(&key).copied().unwrap_or_else(|| {
-                                panic!(
-                                    "multi-shard runtime missing queue from shard {} to shard {}",
-                                    destination.get(),
-                                    target_shard.get()
-                                )
-                            });
-                        let queue = &mut next_remote_queues[queue_index];
-                        if queue.len() < config.shard_pair_capacity {
-                            queue.push_back(outbound);
-                        }
+                        let _ = enqueue_remote_envelope(
+                            destination,
+                            outbound,
+                            remote_queue_indexes,
+                            next_remote_queues,
+                            next_terminal_remote_queues,
+                            config.shard_pair_capacity,
+                            "multi-shard runtime",
+                        );
                     }
                 }
             }
@@ -332,20 +357,15 @@ where
                     );
                 }
 
-                let key = (source_shard, target_shard);
-                let queue_index = remote_queue_indexes.get(&key).copied().unwrap_or_else(|| {
-                    panic!(
-                        "multi-shard runtime missing queue from shard {} to shard {}",
-                        source_shard.get(),
-                        target_shard.get()
-                    )
-                });
-                let queue = &mut next_remote_queues[queue_index];
-                if queue.len() >= config.shard_pair_capacity {
-                    return Err(SendRejectedReason::Full);
-                }
-                queue.push_back(envelope);
-                Ok(())
+                enqueue_remote_envelope(
+                    source_shard,
+                    envelope,
+                    remote_queue_indexes,
+                    next_remote_queues,
+                    next_terminal_remote_queues,
+                    config.shard_pair_capacity,
+                    "multi-shard runtime",
+                )
             });
         }
 
@@ -367,6 +387,35 @@ where
             .copied()
             .unwrap_or_else(|| panic!("multi-shard runtime targeted unknown shard {}", shard.get()))
     }
+}
+
+fn enqueue_remote_envelope(
+    source_shard: ShardId,
+    envelope: QueuedRemoteEnvelope,
+    remote_queue_indexes: &RemoteQueueIndexes,
+    next_remote_queues: &mut RemoteQueues,
+    next_terminal_remote_queues: &mut RemoteQueues,
+    shard_pair_capacity: usize,
+    label: &'static str,
+) -> Result<(), SendRejectedReason> {
+    let target_shard = envelope.target_shard();
+    let key = (source_shard, target_shard);
+    let queue_index = remote_queue_indexes.get(&key).copied().unwrap_or_else(|| {
+        panic!(
+            "{label} missing queue from shard {} to shard {}",
+            source_shard.get(),
+            target_shard.get()
+        )
+    });
+    let queue = match envelope {
+        QueuedRemoteEnvelope::CallReply(_) => &mut next_terminal_remote_queues[queue_index],
+        QueuedRemoteEnvelope::Send(_) => &mut next_remote_queues[queue_index],
+    };
+    if queue.len() >= shard_pair_capacity {
+        return Err(SendRejectedReason::Full);
+    }
+    queue.push_back(envelope);
+    Ok(())
 }
 
 fn build_remote_queues(

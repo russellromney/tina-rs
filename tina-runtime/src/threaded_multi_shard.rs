@@ -25,7 +25,9 @@ use crate::call::{CallOutcome, IntoErasedCall, RuntimeCall, call};
 use crate::capabilities::RuntimeCapabilities;
 use crate::clock::MonotonicClock;
 use crate::driver::BetelgeuseDriver;
-use crate::errors::{ThreadedRegisterBootstrapError, ThreadedRuntimeError, ThreadedTrySendError};
+use crate::errors::{
+    ShutdownWaitError, ThreadedRegisterBootstrapError, ThreadedRuntimeError, ThreadedTrySendError,
+};
 use crate::live_report::{
     LiveQueueMetrics, LiveRemoteQueueReport, LiveShardMetrics, LiveShardState, LiveTopologyReport,
 };
@@ -63,7 +65,13 @@ where
 struct ThreadedRemoteWiring {
     senders:
         BTreeMap<(ShardId, ShardId), std::sync::mpsc::SyncSender<SendableQueuedRemoteEnvelope>>,
+    terminal_senders:
+        BTreeMap<(ShardId, ShardId), std::sync::mpsc::SyncSender<SendableQueuedRemoteEnvelope>>,
     receivers: Vec<(
+        ShardId,
+        std::sync::mpsc::Receiver<SendableQueuedRemoteEnvelope>,
+    )>,
+    terminal_receivers: Vec<(
         ShardId,
         std::sync::mpsc::Receiver<SendableQueuedRemoteEnvelope>,
     )>,
@@ -183,7 +191,15 @@ where
         }
         let mut remote_metrics = BTreeMap::new();
         let mut remote_senders = BTreeMap::new();
+        let mut terminal_remote_senders = BTreeMap::new();
         let mut remote_receivers: BTreeMap<
+            ShardId,
+            Vec<(
+                ShardId,
+                std::sync::mpsc::Receiver<SendableQueuedRemoteEnvelope>,
+            )>,
+        > = BTreeMap::new();
+        let mut terminal_remote_receivers: BTreeMap<
             ShardId,
             Vec<(
                 ShardId,
@@ -195,11 +211,18 @@ where
                 if source.id() != target.id() {
                     let (sender, receiver) =
                         std::sync::mpsc::sync_channel(config.shard_pair_capacity);
+                    let (terminal_sender, terminal_receiver) =
+                        std::sync::mpsc::sync_channel(config.shard_pair_capacity);
                     remote_senders.insert((source.id(), target.id()), sender);
+                    terminal_remote_senders.insert((source.id(), target.id()), terminal_sender);
                     remote_receivers
                         .entry(target.id())
                         .or_default()
                         .push((source.id(), receiver));
+                    terminal_remote_receivers
+                        .entry(target.id())
+                        .or_default()
+                        .push((source.id(), terminal_receiver));
                     remote_metrics.insert(
                         (source.id(), target.id()),
                         Arc::new(LiveQueueMetrics::new(config.shard_pair_capacity)),
@@ -222,7 +245,11 @@ where
             let shard_id = shard.id();
             let remote_wiring = ThreadedRemoteWiring {
                 senders: remote_senders.clone(),
+                terminal_senders: terminal_remote_senders.clone(),
                 receivers: remote_receivers.remove(&shard_id).unwrap_or_default(),
+                terminal_receivers: terminal_remote_receivers
+                    .remove(&shard_id)
+                    .unwrap_or_default(),
                 queue_metrics: remote_metrics.clone(),
                 shard_metrics: shard_metrics.clone(),
             };
@@ -319,6 +346,7 @@ where
         I::Spawn: IntoErasedSpawn<S, F> + 'static,
         I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
         I::Call: IntoErasedCall<I::Message> + 'static,
+        I::Fact: crate::fact::IntoRuntimeFact + 'static,
         Outbound: Send + 'static,
     {
         self.call_on(shard, move |runtime| {
@@ -343,6 +371,7 @@ where
         I::Spawn: IntoErasedSpawn<S, F> + 'static,
         I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
         I::Call: IntoErasedCall<I::Message> + 'static,
+        I::Fact: crate::fact::IntoRuntimeFact + 'static,
         Outbound: Send + 'static,
     {
         match self.call_on(shard, move |runtime| {
@@ -361,7 +390,8 @@ where
                 Err(ThreadedRegisterBootstrapError::UnknownShard(s))
             }
             Err(ThreadedRuntimeError::DriverShutdownFailed)
-            | Err(ThreadedRuntimeError::CommandFull) => {
+            | Err(ThreadedRuntimeError::CommandFull)
+            | Err(ThreadedRuntimeError::HostWaitTimeout) => {
                 // `call_on` is blocking-admission, so `CommandFull` is
                 // unreachable today. Map defensively in case the inner
                 // helper is ever migrated.
@@ -598,6 +628,20 @@ where
         shared.wait_report_blocking()
     }
 
+    /// Requests shutdown and waits up to `timeout` for terminal truth.
+    ///
+    /// This is the explicit bounded form for hosts that cannot risk an
+    /// unbounded join. A timeout returns [`ShutdownWaitError::Timeout`]
+    /// while the background joiner may continue trying to finish.
+    pub fn shutdown_with_timeout(
+        self,
+        timeout: Duration,
+    ) -> Result<LocalSystemTerminalReport, ShutdownWaitError> {
+        let shared = Arc::clone(&self.shutdown);
+        drop(self);
+        shared.wait_report_for_owner_with_timeout(timeout)
+    }
+
     /// Returns a cloneable handle that controls runtime-level shutdown
     /// without consuming the runtime value.
     ///
@@ -650,6 +694,25 @@ where
         M: Send + 'static,
         R: Send + 'static,
     {
+        let host_wait_timeout = timeout
+            .checked_add(crate::threaded::DEFAULT_HOST_CALL_DELIVERY_GRACE)
+            .unwrap_or(timeout);
+        self.call_blocking_with_host_timeout(address, message, timeout, host_wait_timeout)
+    }
+
+    /// Like [`call_blocking`](Self::call_blocking), but separates the target
+    /// call deadline from the host-side wait budget.
+    pub fn call_blocking_with_host_timeout<M, R>(
+        &self,
+        address: Address<M, R>,
+        message: M,
+        target_timeout: Duration,
+        host_wait_timeout: Duration,
+    ) -> Result<CallOutcome<R>, ThreadedRuntimeError>
+    where
+        M: Send + 'static,
+        R: Send + 'static,
+    {
         let shard = address.shard();
         if !self.commands.contains_key(&shard) {
             panic!(
@@ -678,7 +741,7 @@ where
                 HostCallMsg::Begin {
                     target: address,
                     message,
-                    timeout,
+                    timeout: target_timeout,
                 },
             ) {
                 Ok(()) => {}
@@ -703,9 +766,9 @@ where
             }
         }
 
-        match reply_rx.recv_timeout(timeout) {
+        match reply_rx.recv_timeout(host_wait_timeout) {
             Ok(outcome) => Ok(outcome),
-            Err(mpsc::RecvTimeoutError::Timeout) => Ok(CallOutcome::Timeout),
+            Err(mpsc::RecvTimeoutError::Timeout) => Err(ThreadedRuntimeError::HostWaitTimeout),
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 if let Some(metrics) = self.shard_metrics.get(&shard) {
                     metrics.set_state(LiveShardState::Failed);
@@ -750,7 +813,9 @@ where
 {
     fn drop(&mut self) {
         self.shutdown.shutdown_blocking();
-        let _ = self.shutdown.wait_report_blocking();
+        let _ = self.shutdown.wait_report_for_owner_with_timeout(
+            crate::threaded::DEFAULT_SHUTDOWN_LANE_DRAIN_TIMEOUT,
+        );
     }
 }
 
@@ -824,6 +889,7 @@ where
         shard_metrics.set_resource_counts(runtime.resource_report());
         let route_remote = |envelope: QueuedRemoteEnvelope| -> Result<(), SendRejectedReason> {
             let target_shard = envelope.target_shard();
+            let terminal = matches!(envelope, QueuedRemoteEnvelope::CallReply(_));
             let metrics = remote_wiring
                 .queue_metrics
                 .get(&(source_shard, target_shard));
@@ -837,7 +903,12 @@ where
                 }
                 return Err(SendRejectedReason::Closed);
             }
-            let Some(sender) = remote_wiring.senders.get(&(source_shard, target_shard)) else {
+            let senders = if terminal {
+                &remote_wiring.terminal_senders
+            } else {
+                &remote_wiring.senders
+            };
+            let Some(sender) = senders.get(&(source_shard, target_shard)) else {
                 panic!(
                     "ThreadedMultiShardRuntime targeted unknown destination shard {}",
                     target_shard.get()
@@ -865,12 +936,22 @@ where
                 }
             }
         };
-        let remote_delivered = drain_remote_inbound(
+        let terminal_delivered = drain_remote_inbound(
             &mut runtime,
-            &remote_wiring.receivers,
+            &remote_wiring.terminal_receivers,
             &route_remote,
             config.remote_inbound_drain_budget,
         );
+        let ordinary_budget = config
+            .remote_inbound_drain_budget
+            .saturating_sub(terminal_delivered);
+        let remote_delivered = terminal_delivered
+            + drain_remote_inbound(
+                &mut runtime,
+                &remote_wiring.receivers,
+                &route_remote,
+                ordinary_budget,
+            );
         // Fairness: poll the local command queue after every bounded
         // remote-drain pass, not only when the drain delivered zero
         // envelopes. A sustained remote inbound flood keeps
@@ -902,7 +983,7 @@ where
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
             }
         } else {
-            thread::yield_now();
+            thread::sleep(Duration::from_millis(1));
         }
     }
 

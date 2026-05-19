@@ -7,6 +7,15 @@
 //! outbound sockets and TLS; Tina owns bounded ingress, visible
 //! pressure, and per-request timeout/cap policy.
 //!
+//! For the bridge-author copy path — install, close, drain, metrics,
+//! pressure, classifier, late-result truth — see
+//! `docs/tina-user-guide/30-bridge-author-kit.md`. This crate is the
+//! smallest end-to-end specimen of that path: the reqwest worker
+//! installs, returns a `BridgeInstall` handle, closes through
+//! `ReqwestCloser`, drains with `close_and_drain`, exposes a metrics
+//! snapshot and a typed `BridgePressure`, and classifies outcomes
+//! through `ReqwestOutcomeExt::classify`.
+//!
 //! # Use
 //!
 //! Build a worker, register it on a Tina runtime, then `send_request`
@@ -102,6 +111,7 @@
 //! per-request   -> ReqwestError::Timeout
 //! body too big  -> ReqwestError::RequestTooLarge / ResponseTooLarge
 //! reqwest fail  -> ReqwestError::Reqwest(reason)
+//! worker bug    -> ReqwestError::Internal(reason)
 //! worker closed -> ReqwestError::Closed
 //! ```
 //!
@@ -175,7 +185,9 @@
 //! ([`ReqwestError::Timeout`] and [`ReqwestError::Reqwest`]), and each
 //! attempt resets its own per-attempt clock. [`ReqwestError::Full`] is
 //! never retried by the worker — it is the explicit pressure signal
-//! and the caller decides what to do.
+//! and the caller decides what to do. [`ReqwestError::Internal`] is
+//! also never retried; it means the bridge lost worker-terminal truth,
+//! not that the upstream network was flaky.
 
 mod helpers;
 mod metrics;

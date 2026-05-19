@@ -22,7 +22,10 @@ struct IsolateArgs {
     spawn: Option<Type>,
     spawn_observed: Option<Type>,
     call: Option<Type>,
+    fact: Option<Type>,
     shard: Option<Type>,
+    tina_crate: Option<Path>,
+    runtime_crate: Option<Path>,
     send_only: Option<Ident>,
 }
 
@@ -37,7 +40,10 @@ impl Parse for IsolateArgs {
             spawn: None,
             spawn_observed: None,
             call: None,
+            fact: None,
             shard: None,
+            tina_crate: None,
+            runtime_crate: None,
             send_only: None,
         };
 
@@ -62,6 +68,21 @@ impl Parse for IsolateArgs {
                 args.send_only = Some(ident_owned);
             } else {
                 input.parse::<Token![=]>()?;
+                if name == "tina_crate" || name == "runtime_crate" {
+                    let value: Path = input.parse()?;
+                    match name.as_str() {
+                        "tina_crate" => set_once_path(&mut args.tina_crate, value, "tina_crate")?,
+                        "runtime_crate" => {
+                            set_once_path(&mut args.runtime_crate, value, "runtime_crate")?
+                        }
+                        _ => unreachable!("checked above"),
+                    }
+
+                    if input.peek(Token![,]) {
+                        input.parse::<Token![,]>()?;
+                    }
+                    continue;
+                }
                 let value: Type = input.parse()?;
 
                 match name.as_str() {
@@ -75,11 +96,12 @@ impl Parse for IsolateArgs {
                         set_once(&mut args.spawn_observed, value, "spawn_observed")?
                     }
                     "call" => set_once(&mut args.call, value, "call")?,
+                    "fact" => set_once(&mut args.fact, value, "fact")?,
                     "shard" => set_once(&mut args.shard, value, "shard")?,
                     _ => {
                         return Err(Error::new_spanned(
                             key,
-                            "expected one of: message, event, request, reply, send, spawn, spawn_observed, call, shard, send_only",
+                            "expected one of: message, event, request, reply, send, spawn, spawn_observed, call, fact, shard, tina_crate, runtime_crate, send_only",
                         ));
                     }
                 }
@@ -95,6 +117,18 @@ impl Parse for IsolateArgs {
 }
 
 fn set_once(slot: &mut Option<Type>, value: Type, name: &str) -> Result<()> {
+    if slot.is_some() {
+        return Err(Error::new_spanned(
+            value,
+            format!("duplicate isolate option `{name}`"),
+        ));
+    }
+
+    *slot = Some(value);
+    Ok(())
+}
+
+fn set_once_path(slot: &mut Option<Path>, value: Path, name: &str) -> Result<()> {
     if slot.is_some() {
         return Err(Error::new_spanned(
             value,
@@ -165,10 +199,18 @@ fn build_isolate(
             ));
         }
     };
+    let tina_crate = args
+        .tina_crate
+        .clone()
+        .unwrap_or_else(|| syn::parse_quote!(::tina));
+    let runtime_crate = args
+        .runtime_crate
+        .clone()
+        .unwrap_or_else(|| syn::parse_quote!(::tina_runtime));
     let message = if split_service {
         let event = args.event.clone().expect("checked above");
         let request = args.request.clone().expect("checked above");
-        syn::parse_quote!(::tina::ServiceMessage<#event, #request>)
+        syn::parse_quote!(#tina_crate::ServiceMessage<#event, #request>)
     } else {
         args.message.expect("checked above")
     };
@@ -179,7 +221,7 @@ fn build_isolate(
     // requires the user to construct the shard at runtime startup.
     let shard = args
         .shard
-        .unwrap_or_else(|| syn::parse_quote!(::tina::SingleShard));
+        .unwrap_or_else(|| syn::parse_quote!(#tina_crate::SingleShard));
 
     // `send_only` declares the isolate has no public callable surface. The
     // reply type defaults to `()` so it can be registered through
@@ -206,20 +248,23 @@ fn build_isolate(
     let reply = args.reply.unwrap_or_else(|| syn::parse_quote!(()));
     let send = args
         .send
-        .unwrap_or_else(|| syn::parse_quote!(::tina::Outbound<::std::convert::Infallible>));
+        .unwrap_or_else(|| syn::parse_quote!(#tina_crate::Outbound<::core::convert::Infallible>));
     let spawn = args
         .spawn
-        .unwrap_or_else(|| syn::parse_quote!(::std::convert::Infallible));
+        .unwrap_or_else(|| syn::parse_quote!(::core::convert::Infallible));
     let spawn_observed = args
         .spawn_observed
-        .unwrap_or_else(|| syn::parse_quote!(::std::convert::Infallible));
+        .unwrap_or_else(|| syn::parse_quote!(::core::convert::Infallible));
     let call = match args.call {
         Some(call) => call,
         None => match call_default {
-            CallDefault::Infallible => syn::parse_quote!(::std::convert::Infallible),
-            CallDefault::RuntimeCall => syn::parse_quote!(::tina_runtime::RuntimeCall<#message>),
+            CallDefault::Infallible => syn::parse_quote!(::core::convert::Infallible),
+            CallDefault::RuntimeCall => syn::parse_quote!(#runtime_crate::RuntimeCall<#message>),
         },
     };
+    let fact = args
+        .fact
+        .unwrap_or_else(|| syn::parse_quote!(::core::convert::Infallible));
 
     let isolate = item.self_ty.clone();
     let generics = item.generics.clone();
@@ -265,16 +310,16 @@ fn build_isolate(
             fn handle_call(
                 &mut self,
                 msg: Self::Message,
-                #call_name: ::tina::CallContext<'_, Self>,
-            ) -> ::tina::Effect<Self> {
-                let #call_name = ::tina::RequestCall::new(#call_name);
+                #call_name: #tina_crate::CallContext<'_, Self>,
+            ) -> #tina_crate::Effect<Self> {
+                let #call_name = #tina_crate::RequestCall::new(#call_name);
                 match msg {
-                    ::tina::ServiceMessage::Request(#request_name) => {
-                        let request_effect: ::tina::RequestEffect<Self> = #request_body;
+                    #tina_crate::ServiceMessage::Request(#request_name) => {
+                        let request_effect: #tina_crate::RequestEffect<Self> = #request_body;
                         request_effect.into_effect()
                     }
-                    ::tina::ServiceMessage::Event(_) => {
-                        #call_name.reject(::tina::CallRejectedReason::UnsupportedMessage)
+                    #tina_crate::ServiceMessage::Event(_) => {
+                        #call_name.reject(#tina_crate::CallRejectedReason::UnsupportedMessage)
                             .into_effect()
                     }
                 }
@@ -282,9 +327,9 @@ fn build_isolate(
         };
         let body = syn::parse_quote!({
             match #event_name {
-                ::tina::ServiceMessage::Event(#event_name) => #event_body,
-                ::tina::ServiceMessage::Request(_) => {
-                    ::tina::reject(::tina::CallRejectedReason::UnsupportedMessage)
+                #tina_crate::ServiceMessage::Event(#event_name) => #event_body,
+                #tina_crate::ServiceMessage::Request(_) => {
+                    #tina_crate::reject(#tina_crate::CallRejectedReason::UnsupportedMessage)
                 }
             }
         });
@@ -337,8 +382,8 @@ fn build_isolate(
                 fn handle_call(
                     &mut self,
                     #msg_name: Self::Message,
-                    #call_name: ::tina::CallContext<'_, Self>,
-                ) -> ::tina::Effect<Self> {
+                    #call_name: #tina_crate::CallContext<'_, Self>,
+                ) -> #tina_crate::Effect<Self> {
                     #body
                 }
             }
@@ -356,7 +401,7 @@ fn build_isolate(
     };
     let callable_marker_impl = if has_handle_call {
         quote! {
-            impl #impl_generics ::tina::CallableIsolate for #isolate #ty_generics #where_clause {}
+            impl #impl_generics #tina_crate::CallableIsolate for #isolate #ty_generics #where_clause {}
         }
     } else {
         quote! {}
@@ -370,21 +415,22 @@ fn build_isolate(
     Ok(quote! {
         #remaining_impl
 
-        impl #impl_generics ::tina::Isolate for #isolate #ty_generics #where_clause {
+        impl #impl_generics #tina_crate::Isolate for #isolate #ty_generics #where_clause {
             type Message = #message;
             type Reply = #reply;
             type Send = #send;
             type Spawn = #spawn;
             type SpawnObserved = #spawn_observed;
             type Call = #call;
+            type Fact = #fact;
             type Shard = #shard;
 
             #(#attrs)*
             fn handle(
                 &mut self,
                 #msg_name: Self::Message,
-                #ctx_name: &mut ::tina::Context<'_, Self::Shard, Self::Reply>,
-            ) -> ::tina::Effect<Self> {
+                #ctx_name: &mut #tina_crate::Context<'_, Self::Shard, Self::Reply>,
+            ) -> #tina_crate::Effect<Self> {
                 #body
             }
 

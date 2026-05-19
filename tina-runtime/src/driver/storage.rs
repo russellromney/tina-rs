@@ -244,7 +244,7 @@ impl StorageWorkerLane {
             if self.pending.is_empty() || Instant::now() >= deadline {
                 break;
             }
-            thread::yield_now();
+            thread::sleep(Duration::from_millis(1));
         }
         sink.clear();
         if self.handle.as_ref().is_some_and(JoinHandle::is_finished) {

@@ -231,9 +231,9 @@ pub fn flatten_outcome(outcome: ReqwestCallOutcome) -> Result<ReqwestResponse, R
 /// - **worker `Reqwest`:** `Transient(WorkerTransport)`. Connect / IO
 ///   class errors are typically retryable.
 /// - **bridge `Full` / `Closed`, worker `Full` / `Closed`,
-///   `RequestTooLarge`, `ResponseTooLarge`, `InvalidRequest`:**
-///   fatal — retrying without changing pressure or the request itself
-///   will reproduce them.
+///   `RequestTooLarge`, `ResponseTooLarge`, `InvalidRequest`,
+///   `Internal`:** fatal — retrying without changing pressure, the
+///   request, or the bridge itself will reproduce them.
 #[derive(Debug, Clone)]
 pub enum ReqwestOutcomeClass {
     /// Upstream returned a 2xx success.
@@ -296,6 +296,9 @@ pub enum ReqwestFatalReason {
     /// Request validation failed (bad URL, invalid method, etc.).
     /// Carries the underlying validation message.
     InvalidRequest(String),
+    /// Bridge worker invariant failed internally. Carries an opaque
+    /// diagnostic message.
+    WorkerInternal(String),
 }
 
 /// Extension trait that adds [`Self::classify`] to
@@ -338,6 +341,9 @@ impl ReqwestOutcomeExt for ReqwestCallOutcome {
             }
             CallOutcome::Replied(Err(ReqwestError::Reqwest(msg))) => {
                 ReqwestOutcomeClass::Transient(ReqwestTransientReason::WorkerTransport(msg))
+            }
+            CallOutcome::Replied(Err(ReqwestError::Internal(msg))) => {
+                ReqwestOutcomeClass::Fatal(ReqwestFatalReason::WorkerInternal(msg))
             }
             CallOutcome::Replied(Err(ReqwestError::Full)) => {
                 ReqwestOutcomeClass::Fatal(ReqwestFatalReason::WorkerFull)

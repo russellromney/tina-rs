@@ -93,7 +93,13 @@ impl ChunkedDecoder {
                             self.state = State::Trailers;
                             continue;
                         }
-                        if self.decoded_total + size > self.max_body_bytes {
+                        let Some(next_total) = self.decoded_total.checked_add(size) else {
+                            return (
+                                ChunkedProgress::Failed(ChunkedError::BodyTooLarge),
+                                consumed,
+                            );
+                        };
+                        if next_total > self.max_body_bytes {
                             return (
                                 ChunkedProgress::Failed(ChunkedError::BodyTooLarge),
                                 consumed,
@@ -116,7 +122,15 @@ impl ChunkedDecoder {
                     if take == 0 {
                         return (ChunkedProgress::NeedMore, consumed);
                     }
-                    self.decoded_total += take;
+                    self.decoded_total = match self.decoded_total.checked_add(take) {
+                        Some(total) => total,
+                        None => {
+                            return (
+                                ChunkedProgress::Failed(ChunkedError::BodyTooLarge),
+                                consumed,
+                            );
+                        }
+                    };
                     let chunk = &remaining[..take];
                     let new_remaining = data_remaining - take;
                     consumed += take;
@@ -130,7 +144,7 @@ impl ChunkedDecoder {
                     return (ChunkedProgress::Chunk(chunk), consumed);
                 }
                 State::DataCrlf => {
-                    if input.len() < 2 {
+                    if remaining.len() < 2 {
                         return (ChunkedProgress::NeedMore, consumed);
                     }
                     if &remaining[..2] != b"\r\n" {
@@ -269,7 +283,14 @@ impl ChunkedDecoder {
         }
 
         // No \r\n found. Save what fits.
-        let save_len = input.len().min(self.size_buf.len() - self.size_len);
+        let Some(space_left) = self.size_buf.len().checked_sub(self.size_len) else {
+            self.size_len = 0;
+            return SizeResult::Error {
+                error: ChunkedError::BadChunkSize,
+                consumed: 0,
+            };
+        };
+        let save_len = input.len().min(space_left);
         self.size_buf[self.size_len..self.size_len + save_len].copy_from_slice(&input[..save_len]);
         self.size_len += save_len;
 
@@ -291,20 +312,19 @@ fn parse_chunk_size_line(line: &[u8]) -> Result<usize, ChunkedError> {
     if line.is_empty() {
         return Err(ChunkedError::BadChunkSize);
     }
+    if matches!(line.first(), Some(b' ' | b'\t')) {
+        return Err(ChunkedError::BadChunkSize);
+    }
     let size_part = line
         .iter()
         .position(|&b| b == b';')
         .map_or(line, |pos| &line[..pos]);
     let trimmed = {
-        let start = size_part
-            .iter()
-            .position(|&b| b != b' ' && b != b'\t')
-            .unwrap_or(size_part.len());
         let end = size_part
             .iter()
             .rposition(|&b| b != b' ' && b != b'\t')
             .map_or(size_part.len(), |i| i + 1);
-        &size_part[start..end]
+        &size_part[..end]
     };
     if trimmed.is_empty() {
         return Err(ChunkedError::BadChunkSize);
@@ -377,6 +397,24 @@ mod tests {
     }
 
     #[test]
+    fn rejects_leading_whitespace_before_chunk_size() {
+        for input in [
+            b" 5\r\nhello\r\n0\r\n\r\n".as_slice(),
+            b"\t5\r\nhello\r\n0\r\n\r\n",
+        ] {
+            let mut dec = ChunkedDecoder::new(1024);
+            let (progress, _) = dec.feed(input);
+            assert!(
+                matches!(
+                    progress,
+                    ChunkedProgress::Failed(ChunkedError::BadChunkSize)
+                ),
+                "input with leading whitespace must reject: {input:?}"
+            );
+        }
+    }
+
+    #[test]
     fn rejects_missing_data_crlf() {
         let mut dec = ChunkedDecoder::new(1024);
         let mut out = Vec::new();
@@ -391,6 +429,36 @@ mod tests {
         assert!(matches!(
             p2,
             ChunkedProgress::Failed(ChunkedError::MissingCrlf)
+        ));
+    }
+
+    #[test]
+    fn rejects_body_too_large_after_prior_decoded_bytes() {
+        let mut dec = ChunkedDecoder::new(5);
+        let mut out = Vec::new();
+        let (p1, c1) = dec.feed(b"3\r\nabc\r\n");
+        assert!(matches!(p1, ChunkedProgress::Chunk(b"abc")));
+        assert_eq!(c1, 6);
+        out.extend_from_slice(match p1 {
+            ChunkedProgress::Chunk(d) => d,
+            _ => panic!(),
+        });
+        let (p2, _) = dec.feed(b"\r\n3\r\ndef\r\n0\r\n\r\n");
+        assert!(matches!(
+            p2,
+            ChunkedProgress::Failed(ChunkedError::BodyTooLarge)
+        ));
+        assert_eq!(&out, b"abc");
+    }
+
+    #[test]
+    fn rejects_chunk_size_that_overflows_usize() {
+        let mut dec = ChunkedDecoder::new(usize::MAX);
+        let huge = format!("{:x}0\r\n", usize::MAX);
+        let (progress, _) = dec.feed(huge.as_bytes());
+        assert!(matches!(
+            progress,
+            ChunkedProgress::Failed(ChunkedError::BadChunkSize)
         ));
     }
 

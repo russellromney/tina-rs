@@ -78,12 +78,16 @@ pub struct ReqwestResponse {
 /// Every error path the bridge can produce maps to exactly one variant.
 /// Reqwest-internal errors collapse to [`ReqwestError::Reqwest`] with
 /// the underlying message preserved; the bridge does not swallow.
+/// Bridge-internal invariant breaks use [`ReqwestError::Internal`] so
+/// retry policy cannot mistake them for transient upstream IO.
 ///
 /// `PartialEq`/`Eq` compare string-bearing variants
-/// ([`ReqwestError::InvalidRequest`], [`ReqwestError::Reqwest`])
+/// ([`ReqwestError::InvalidRequest`], [`ReqwestError::Reqwest`],
+/// [`ReqwestError::Internal`])
 /// byte-for-byte. Treat those strings as opaque — the underlying
 /// reqwest message text can change between releases. Use
-/// `matches!(err, ReqwestError::Reqwest(_))` for variant-only tests.
+/// `matches!(err, ReqwestError::Reqwest(_))` or
+/// `matches!(err, ReqwestError::Internal(_))` for variant-only tests.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReqwestError {
     /// Worker mailbox or `max_in_flight` cap rejected admission.
@@ -102,6 +106,9 @@ pub enum ReqwestError {
     InvalidRequest(String),
     /// Underlying reqwest reported an error.
     Reqwest(String),
+    /// The bridge observed an internal worker invariant break, such as
+    /// a spawned task ending without sending its result.
+    Internal(String),
 }
 
 impl std::fmt::Display for ReqwestError {
@@ -118,6 +125,7 @@ impl std::fmt::Display for ReqwestError {
             }
             Self::InvalidRequest(msg) => write!(f, "reqwest worker: invalid request: {msg}"),
             Self::Reqwest(msg) => write!(f, "reqwest worker: reqwest error: {msg}"),
+            Self::Internal(msg) => write!(f, "reqwest worker: internal error: {msg}"),
         }
     }
 }
@@ -167,10 +175,10 @@ impl Default for RedirectPolicy {
 ///
 /// # Not retried
 ///
-/// `Full`, `Closed`, `RequestTooLarge`, `ResponseTooLarge`, and
-/// `InvalidRequest` are never retried by the worker. They are
-/// caller-visible decisions. In particular `Full` is the explicit
-/// pressure signal — the caller decides what to do.
+/// `Full`, `Closed`, `RequestTooLarge`, `ResponseTooLarge`,
+/// `InvalidRequest`, and `Internal` are never retried by the worker.
+/// They are caller-visible decisions. In particular `Full` is the
+/// explicit pressure signal — the caller decides what to do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RetryPolicy {
     /// No retry. One attempt, surface the outcome.

@@ -26,6 +26,7 @@
 //! `SpscMailbox` relies on a small set of invariants that the tests and Loom
 //! models are meant to defend:
 //!
+//! - `capacity` is non-zero and a power of two
 //! - `tail - head <= capacity`
 //! - slots in the logical range `[head, tail)` are initialized
 //! - slots outside `[head, tail)` are uninitialized and must not be read
@@ -72,6 +73,7 @@ mod sync {
 /// allocation.
 pub struct SpscMailbox<T> {
     capacity: usize,
+    slot_mask: usize,
     slots: Box<[Slot<T>]>,
     head: AtomicUsize,
     tail: AtomicUsize,
@@ -90,11 +92,15 @@ impl<T> SpscMailbox<T> {
     ///
     /// # Panics
     ///
-    /// Panics when `capacity` is zero.
+    /// Panics when `capacity` is zero or not a power of two.
     pub fn new(capacity: usize) -> Self {
         assert!(
             capacity > 0,
             "SpscMailbox capacity must be greater than zero"
+        );
+        assert!(
+            capacity.is_power_of_two(),
+            "SpscMailbox capacity must be a power of two"
         );
 
         let mut slots = Vec::with_capacity(capacity);
@@ -104,6 +110,7 @@ impl<T> SpscMailbox<T> {
 
         Self {
             capacity,
+            slot_mask: capacity - 1,
             slots: slots.into_boxed_slice(),
             head: AtomicUsize::new(0),
             tail: AtomicUsize::new(0),
@@ -113,7 +120,7 @@ impl<T> SpscMailbox<T> {
     }
 
     fn slot(&self, cursor: usize) -> &Slot<T> {
-        &self.slots[cursor % self.capacity]
+        &self.slots[cursor & self.slot_mask]
     }
 
     fn claim<'a>(claimed: &'a AtomicBool, role: &'static str) -> ActiveGuard<'a> {
@@ -254,7 +261,7 @@ impl<T> Drop for SpscMailbox<T> {
         let tail = self.tail.load(Relaxed);
 
         while cursor != tail {
-            let index = cursor % self.capacity;
+            let index = cursor & self.slot_mask;
 
             // Safety: drop runs with exclusive access to the mailbox, and the
             // range `[head, tail)` contains only initialized elements that have

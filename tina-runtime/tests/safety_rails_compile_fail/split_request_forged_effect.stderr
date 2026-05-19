@@ -4,7 +4,7 @@ error[E0624]: associated function `from_consumed_effect` is private
 31 |         tina::RequestEffect::from_consumed_effect(tina::noop())
    |                              ^^^^^^^^^^^^^^^^^^^^ private associated function
    |
-  ::: $WORKSPACE/tina/src/lib.rs
+  ::: $WORKSPACE/tina/src/effect.rs
    |
-   |     fn from_consumed_effect(effect: Effect<I>) -> Self {
-   |     -------------------------------------------------- private associated function defined here
+   |     pub(crate) fn from_consumed_effect(effect: Effect<I>) -> Self {
+   |     ------------------------------------------------------------- private associated function defined here

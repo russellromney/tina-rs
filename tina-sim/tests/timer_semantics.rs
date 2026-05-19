@@ -44,6 +44,7 @@ impl Isolate for Sleeper {
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<TimerMsg>;
+    type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 
     fn handle(
@@ -97,6 +98,7 @@ impl Isolate for OrderingSleeper {
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<OrderingMsg>;
+    type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 
     fn handle(
@@ -377,6 +379,7 @@ impl Isolate for HelperIntervalSleeper {
     type Spawn = Infallible;
     type SpawnObserved = Infallible;
     type Call = RuntimeCall<HelperIntervalMsg>;
+    type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 
     fn handle(

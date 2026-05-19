@@ -1,0 +1,33 @@
+warning: unused import: `std::convert::Infallible`
+ --> tests/safety_rails_compile_fail/protocol_fact_wrong_enum.rs:5:5
+  |
+5 | use std::convert::Infallible;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `tina::prelude::*`
+ --> tests/safety_rails_compile_fail/protocol_fact_wrong_enum.rs:7:5
+  |
+7 | use tina::prelude::*;
+  |     ^^^^^^^^^^^^^^^^
+
+warning: unused import: `RuntimeCall`
+ --> tests/safety_rails_compile_fail/protocol_fact_wrong_enum.rs:8:34
+  |
+8 | use tina_runtime::{ProtocolFact, RuntimeCall};
+  |                                  ^^^^^^^^^^^
+
+error[E0308]: mismatched types
+  --> tests/safety_rails_compile_fail/protocol_fact_wrong_enum.rs:31:28
+   |
+31 |         tina::fact::<Self>(WrongFact::Bogus)
+   |         ------------------ ^^^^^^^^^^^^^^^^ expected `ProtocolFact`, found `WrongFact`
+   |         |
+   |         arguments to this function are incorrect
+   |
+note: function defined here
+  --> $WORKSPACE/tina/src/effect.rs
+   |
+   | pub fn fact<I>(value: I::Fact) -> Effect<I>
+   |        ^^^^

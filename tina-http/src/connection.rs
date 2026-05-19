@@ -427,6 +427,7 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Isolate for Http
         send: tina::Outbound<std::convert::Infallible>,
         spawn: std::convert::Infallible,
         call: tina_runtime::RuntimeCall<HttpConnectionMsg>,
+        fact: tina_runtime::ProtocolFact,
         shard: S,
     }
 
@@ -1500,6 +1501,11 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
                 return self.begin_close();
             };
             return batch(vec![
+                tina::fact::<Self>(tina_runtime::ProtocolFact::WebSocketSessionClosed {
+                    session: self.websocket_fact_session_id(session_id),
+                    reason: tina_runtime::WebSocketCloseReason::GoingAway,
+                    code: None,
+                }),
                 self.call_websocket_app_many(vec![
                     WebSocketSessionMsg::SessionClosed {
                         session_id,
@@ -1538,6 +1544,8 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
                         else {
                             return self.begin_close();
                         };
+                        let was_close_sent =
+                            self.websocket.as_ref().is_some_and(|ws| ws.close_sent);
                         let close = WebSocketMessage::Close(code, reason.clone());
                         let bytes = match encode_server_message(close) {
                             Ok(bytes) => bytes,
@@ -1549,7 +1557,23 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
                             ws.last_close_code = code;
                             ws.last_close_reason_bytes = reason.len();
                         }
+                        let close_reason = if was_close_sent {
+                            tina_runtime::WebSocketCloseReason::LocalInitiated
+                        } else if code == Some(WebSocketCloseCode(1001)) {
+                            tina_runtime::WebSocketCloseReason::GoingAway
+                        } else if code == Some(WebSocketCloseCode(1002)) {
+                            tina_runtime::WebSocketCloseReason::ProtocolError
+                        } else {
+                            tina_runtime::WebSocketCloseReason::Normal
+                        };
                         batch(vec![
+                            tina::fact::<Self>(
+                                tina_runtime::ProtocolFact::WebSocketSessionClosed {
+                                    session: self.websocket_fact_session_id(session_id),
+                                    reason: close_reason,
+                                    code: code.map(|code| code.0),
+                                },
+                            ),
                             self.call_websocket_app_many(vec![
                                 WebSocketSessionMsg::SessionClose {
                                     session_id,
@@ -1702,6 +1726,17 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
             shard, isolate, generation,
         );
         Some(WebSocketSessionHandle::new(ws.session_id, target))
+    }
+
+    fn websocket_fact_session_id(
+        &self,
+        session_id: WebSocketSessionId,
+    ) -> tina_runtime::WebSocketSessionId {
+        tina_runtime::WebSocketSessionId::new(
+            self.self_isolate_id
+                .map(|id| id.get())
+                .unwrap_or_else(|| session_id.generation()),
+        )
     }
 
     fn handle_websocket_app_outcome(
@@ -1980,17 +2015,43 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
         if let Some(ws) = self.websocket.as_mut() {
             ws.last_pressure = Some(error.clone());
         }
-        let notify = match self.websocket.as_ref().map(|ws| ws.session_id) {
+        let session_snapshot = self
+            .websocket
+            .as_ref()
+            .map(|ws| (ws.session_id, ws.outbound.len(), ws.outbound.queued_bytes()));
+        let notify = match session_snapshot.as_ref().map(|s| s.0) {
             Some(session_id) => self.call_websocket_app_many(vec![
                 WebSocketSessionMsg::SessionPressure {
                     session_id,
                     error: error.clone(),
                 },
-                WebSocketSessionMsg::Pressure(error),
+                WebSocketSessionMsg::Pressure(error.clone()),
             ]),
-            None => self.call_websocket_app(WebSocketSessionMsg::Pressure(error)),
+            None => self.call_websocket_app(WebSocketSessionMsg::Pressure(error.clone())),
         };
-        batch(vec![notify, self.begin_close()])
+        let mut effects = vec![notify, self.begin_close()];
+        if let Some((session_id, queued_frames, queued_bytes)) = session_snapshot
+            && matches!(
+                error,
+                WebSocketError::OutboundQueueFull | WebSocketError::OutboundBytesFull
+            )
+        {
+            effects.push(tina::fact::<Self>(
+                tina_runtime::ProtocolFact::WebSocketSlowPeerClosed {
+                    session: self.websocket_fact_session_id(session_id),
+                    queued_frames: queued_frames as u32,
+                    queued_bytes: queued_bytes as u64,
+                },
+            ));
+            effects.push(tina::fact::<Self>(
+                tina_runtime::ProtocolFact::WebSocketSessionClosed {
+                    session: self.websocket_fact_session_id(session_id),
+                    reason: tina_runtime::WebSocketCloseReason::SlowPeer,
+                    code: None,
+                },
+            ));
+        }
+        batch(effects)
     }
 
     fn arm_websocket_close_deadline(&mut self) -> Effect<Self> {
@@ -2020,7 +2081,16 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
             return noop();
         };
         if ws.close_sent && !ws.close_received && ws.close_generation == generation {
-            return self.begin_close();
+            let session = self.websocket_fact_session_id(ws.session_id);
+            let code = ws.last_close_code.map(|c| c.0);
+            return batch(vec![
+                tina::fact::<Self>(tina_runtime::ProtocolFact::WebSocketSessionClosed {
+                    session,
+                    reason: tina_runtime::WebSocketCloseReason::LocalInitiated,
+                    code,
+                }),
+                self.begin_close(),
+            ]);
         }
         noop()
     }

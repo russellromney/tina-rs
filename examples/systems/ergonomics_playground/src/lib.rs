@@ -8,8 +8,8 @@ use tina::{
 };
 use tina_runtime::{
     CallGroup, CallGroupToken, CallOutcome, CallReplyRejectedReason, DeferredReplyRejectedReason,
-    PendingReplies, RuntimeCall, RuntimeEventKind, SleepReply, WaitList, WaitListCallError, call,
-    call_cancelable, cancel_call, request_effect_after_wait_park, sleep,
+    PendingReplies, RuntimeCall, RuntimeEventKind, SharedWork, SharedWorkCallError, SleepReply,
+    call, call_cancelable, cancel_call, request_effect_after_shared_wait, sleep,
 };
 use tina_sim::{Simulator, SimulatorConfig};
 
@@ -57,6 +57,7 @@ impl Isolate for Provider {
     type Spawn = std::convert::Infallible;
     type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<ProviderMsg>;
+    type Fact = std::convert::Infallible;
     type Shard = SingleShard;
 
     fn handle(
@@ -157,6 +158,7 @@ impl Isolate for QuoteGateway {
     type Send = tina::Outbound<std::convert::Infallible>;
     type Spawn = std::convert::Infallible;
     type SpawnObserved = std::convert::Infallible;
+    type Fact = std::convert::Infallible;
     type Call = RuntimeCall<QuoteGatewayMsg>;
     type Shard = SingleShard;
 
@@ -258,6 +260,7 @@ impl Isolate for QuoteClient {
     type Reply = ();
     type Send = tina::Outbound<std::convert::Infallible>;
     type Spawn = std::convert::Infallible;
+    type Fact = std::convert::Infallible;
     type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<QuoteClientMsg>;
     type Shard = SingleShard;
@@ -409,6 +412,7 @@ impl Isolate for Batcher {
     type Message = BatcherMsg;
     type Reply = BatchReply;
     type Send = tina::Outbound<std::convert::Infallible>;
+    type Fact = std::convert::Infallible;
     type Spawn = std::convert::Infallible;
     type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<BatcherMsg>;
@@ -500,6 +504,7 @@ struct BatchClient {
 impl Isolate for BatchClient {
     type Message = BatchClientMsg;
     type Reply = ();
+    type Fact = std::convert::Infallible;
     type Send = tina::Outbound<BatcherMsg>;
     type Spawn = std::convert::Infallible;
     type SpawnObserved = std::convert::Infallible;
@@ -670,6 +675,7 @@ struct Upstream {
 
 impl Isolate for Upstream {
     type Message = UpstreamMsg;
+    type Fact = std::convert::Infallible;
     type Reply = FillReply;
     type Send = tina::Outbound<std::convert::Infallible>;
     type Spawn = std::convert::Infallible;
@@ -711,11 +717,12 @@ struct Cache {
     key: &'static str,
     cached: Option<u64>,
     filling: bool,
-    waiters: WaitList<&'static str, CacheReply>,
+    waiters: SharedWork<&'static str, CacheReply>,
     upstream: Address<UpstreamMsg, FillReply>,
 }
 
 impl Isolate for Cache {
+    type Fact = std::convert::Infallible;
     type Message = CacheMsg;
     type Reply = CacheReply;
     type Send = tina::Outbound<std::convert::Infallible>;
@@ -756,21 +763,23 @@ impl Isolate for Cache {
                 if let Some(value) = self.cached {
                     return call_ctx.reply(CacheReply::Hit(value));
                 }
-                match self.waiters.park_call(self.key, call_ctx) {
+                match self.waiters.wait_call(self.key, call_ctx) {
                     Ok(ticket) => {
                         if self.filling {
-                            request_effect_after_wait_park(&ticket, noop()).into_effect()
+                            request_effect_after_shared_wait(&ticket, noop()).into_effect()
                         } else {
                             self.filling = true;
                             let effect = call(self.upstream, UpstreamMsg::Fetch, CALL_TIMEOUT)
                                 .then(CacheMsg::FillReturned);
-                            request_effect_after_wait_park(&ticket, effect).into_effect()
+                            request_effect_after_shared_wait(&ticket, effect).into_effect()
                         }
                     }
-                    Err(WaitListCallError::Full { call, .. })
-                    | Err(WaitListCallError::KeyFull { call, .. }) => call.reply(CacheReply::Full),
-                    Err(WaitListCallError::NoCaller { call, .. })
-                    | Err(WaitListCallError::CrossShardUnsupported { call, .. }) => {
+                    Err(SharedWorkCallError::Full { call, .. })
+                    | Err(SharedWorkCallError::KeyFull { call, .. }) => {
+                        call.reply(CacheReply::Full)
+                    }
+                    Err(SharedWorkCallError::NoCaller { call, .. })
+                    | Err(SharedWorkCallError::CrossShardUnsupported { call, .. }) => {
                         call.reject(tina::CallRejectedReason::UnsupportedMessage)
                     }
                 }
@@ -801,6 +810,7 @@ impl Isolate for CacheClient {
     type Spawn = std::convert::Infallible;
     type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<CacheClientMsg>;
+    type Fact = std::convert::Infallible;
     type Shard = SingleShard;
 
     fn handle(
@@ -839,7 +849,7 @@ pub fn run_single_flight_cache_probe() -> anyhow::Result<CacheFillReport> {
         key: "price:alpaca",
         cached: None,
         filling: false,
-        waiters: WaitList::with_capacity(3).named("ergonomics.cache.waiters"),
+        waiters: SharedWork::with_capacity(3).named("ergonomics.cache.waiters"),
         upstream,
     });
     let replies = Rc::new(RefCell::new(Vec::new()));
@@ -873,7 +883,7 @@ pub fn run_single_flight_cache_probe() -> anyhow::Result<CacheFillReport> {
         upstream_calls: *upstream_calls.borrow(),
         values,
         rough_edges: vec![
-            "single-flight is a natural Tina shape once WaitList owns the parked callers",
+            "single-flight is a natural Tina shape once SharedWork owns the parked callers",
             "the service still names the fill-in-flight state and late fill policy",
         ],
     })

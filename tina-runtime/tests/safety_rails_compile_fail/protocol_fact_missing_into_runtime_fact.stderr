@@ -1,0 +1,32 @@
+error[E0277]: the trait bound `UnregisterableFact: IntoRuntimeFact` is not satisfied
+  --> tests/safety_rails_compile_fail/protocol_fact_missing_into_runtime_fact.rs:47:74
+   |
+47 |     let _ = runtime.register_with_capacity::<BadFactIsolate, Infallible>(BadFactIsolate, 4);
+   |                     ----------------------                               ^^^^^^^^^^^^^^ unsatisfied trait bound
+   |                     |
+   |                     required by a bound introduced by this call
+   |
+help: the trait `IntoRuntimeFact` is not implemented for `UnregisterableFact`
+  --> tests/safety_rails_compile_fail/protocol_fact_missing_into_runtime_fact.rs:13:1
+   |
+13 | struct UnregisterableFact;
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^
+help: the following other types implement trait `IntoRuntimeFact`
+  --> src/fact.rs
+   |
+   | impl IntoRuntimeFact for Infallible {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `Infallible`
+...
+   | impl IntoRuntimeFact for RuntimeFact {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `RuntimeFact`
+...
+   | impl IntoRuntimeFact for ProtocolFact {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `ProtocolFact`
+note: required by a bound in `tina_runtime::registration::<impl Runtime<S, F>>::register_with_capacity`
+  --> src/registration.rs
+   |
+   |     pub fn register_with_capacity<I, Outbound>(
+   |            ---------------------- required by a bound in this associated function
+...
+   |         I::Fact: IntoRuntimeFact + 'static,
+   |                  ^^^^^^^^^^^^^^^ required by this bound in `tina_runtime::registration::<impl Runtime<S, F>>::register_with_capacity`

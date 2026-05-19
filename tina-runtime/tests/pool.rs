@@ -218,6 +218,7 @@ impl Driver {
             DriverMsg::CancelReturned(outcome) => {
                 let ack = match outcome {
                     tina::CancelOutcome::Cancelled => CancelAck::Ok,
+                    tina::CancelOutcome::NotAdmitted => CancelAck::AlreadyCompleted,
                     tina::CancelOutcome::AlreadyCompleted => CancelAck::AlreadyCompleted,
                     tina::CancelOutcome::AlreadyCancelled => CancelAck::AlreadyCancelled,
                     tina::CancelOutcome::WrongShard => CancelAck::WrongShard,

@@ -7,8 +7,8 @@ use std::time::Duration;
 
 use tina::{Address, AddressGeneration, RestartBudget, RestartPolicy, prelude::*};
 use tina_runtime::{
-    CallError, CallInput, CallKind, CallOutput, ListenerId, RuntimeCall, RuntimeEvent,
-    RuntimeEventKind, SendRejectedReason, StreamId, journal_append, sleep,
+    CallError, CallInput, CallKind, CallOutcome, CallOutput, ListenerId, RuntimeCall, RuntimeEvent,
+    RuntimeEventKind, SendRejectedReason, StreamId, call, journal_append, sleep,
 };
 use tina_sim::{
     Checker, CheckerDecision, FaultConfig, FaultMode, MultiShardReplayArtifact,
@@ -172,6 +172,95 @@ impl Isolate for Worker {
                     doubled: value * 2,
                 },
             ),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TerminalLaneCallerMsg {
+    Start,
+    Noise,
+    Returned(CallOutcome<TerminalLaneReply>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TerminalLaneReply(u64);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TerminalLaneWorkerMsg {
+    Work {
+        reply_to: Address<TerminalLaneCallerMsg>,
+    },
+}
+
+#[derive(Debug)]
+struct TerminalLaneCaller {
+    worker: Address<TerminalLaneWorkerMsg, TerminalLaneReply>,
+    outcomes: Rc<RefCell<Vec<CallOutcome<TerminalLaneReply>>>>,
+    noise: Rc<RefCell<usize>>,
+    order: Rc<RefCell<Vec<&'static str>>>,
+}
+
+#[tina_runtime::isolate(
+    message = TerminalLaneCallerMsg,
+    send = Outbound<TerminalLaneWorkerMsg>,
+    shard = WorkShard
+)]
+impl TerminalLaneCaller {
+    fn handle(
+        &mut self,
+        msg: TerminalLaneCallerMsg,
+        ctx: &mut Context<'_, WorkShard, Self::Reply>,
+    ) -> Effect<Self> {
+        match msg {
+            TerminalLaneCallerMsg::Start => call(
+                self.worker,
+                TerminalLaneWorkerMsg::Work { reply_to: ctx.me() },
+                Duration::from_secs(1),
+            )
+            .then(TerminalLaneCallerMsg::Returned),
+            TerminalLaneCallerMsg::Noise => {
+                *self.noise.borrow_mut() += 1;
+                self.order.borrow_mut().push("ordinary-noise");
+                noop()
+            }
+            TerminalLaneCallerMsg::Returned(outcome) => {
+                self.order.borrow_mut().push("terminal-reply");
+                self.outcomes.borrow_mut().push(outcome);
+                noop()
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+struct TerminalLaneWorker;
+
+#[tina_runtime::isolate(
+    message = TerminalLaneWorkerMsg,
+    reply = TerminalLaneReply,
+    send = Outbound<TerminalLaneCallerMsg>,
+    shard = WorkShard
+)]
+impl TerminalLaneWorker {
+    fn handle(
+        &mut self,
+        _msg: TerminalLaneWorkerMsg,
+        _ctx: &mut Context<'_, WorkShard, Self::Reply>,
+    ) -> Effect<Self> {
+        noop()
+    }
+
+    fn handle_call(
+        &mut self,
+        msg: TerminalLaneWorkerMsg,
+        call: tina::CallContext<'_, Self>,
+    ) -> Effect<Self> {
+        match msg {
+            TerminalLaneWorkerMsg::Work { reply_to } => batch([
+                send(reply_to, TerminalLaneCallerMsg::Noise),
+                call.reply(TerminalLaneReply(42)),
+            ]),
         }
     }
 }
@@ -1575,6 +1664,142 @@ fn multishard_dispatcher_workload_surfaces_source_time_full_rejection() {
         })
         .count();
     assert_eq!(full_rejections, 1);
+}
+
+#[test]
+fn terminal_reply_lane_bypasses_saturated_ordinary_remote_queue() {
+    let mut sim = MultiShardSimulator::with_config(
+        [WorkShard(11), WorkShard(22)],
+        SimulatorConfig::default(),
+        MultiShardSimulatorConfig {
+            shard_pair_capacity: 1,
+        },
+    );
+    let outcomes = Rc::new(RefCell::new(Vec::new()));
+    let noise = Rc::new(RefCell::new(0usize));
+    let order = Rc::new(RefCell::new(Vec::new()));
+    let worker = sim.register_with_capacity_on::<
+        TerminalLaneWorker,
+        TerminalLaneWorkerMsg,
+        TerminalLaneCallerMsg,
+    >(ShardId::new(22), TerminalLaneWorker, 4);
+    let caller = sim.register_with_capacity_on::<
+        TerminalLaneCaller,
+        TerminalLaneCallerMsg,
+        TerminalLaneWorkerMsg,
+    >(
+        ShardId::new(11),
+        TerminalLaneCaller {
+            worker,
+            outcomes: Rc::clone(&outcomes),
+            noise: Rc::clone(&noise),
+            order: Rc::clone(&order),
+        },
+        4,
+    );
+
+    sim.try_send(caller, TerminalLaneCallerMsg::Start).unwrap();
+    assert!(sim.run_until_quiescent() > 0);
+
+    assert_eq!(*noise.borrow(), 1);
+    assert_eq!(
+        &*outcomes.borrow(),
+        &[CallOutcome::Replied(TerminalLaneReply(42))]
+    );
+    assert_eq!(
+        &*order.borrow(),
+        &["terminal-reply", "ordinary-noise"],
+        "simulator terminal replies must drain before ordinary remote traffic visible to the same caller"
+    );
+    assert!(
+        sim.trace().iter().any(|event| {
+            matches!(
+                event.kind(),
+                RuntimeEventKind::CallCompleted {
+                    call_kind: CallKind::IsolateCall,
+                    ..
+                }
+            )
+        }),
+        "simulator must record the user-visible reply as a real call completion"
+    );
+    assert!(
+        !sim.trace().iter().any(|event| {
+            matches!(
+                event.kind(),
+                RuntimeEventKind::CallReplyRejected { .. }
+                    | RuntimeEventKind::CallReplyAbandoned { .. }
+            )
+        }),
+        "simulator terminal lane should not convert a deliverable reply into a rejected or abandoned trace"
+    );
+}
+
+#[test]
+fn terminal_reply_lane_records_one_terminal_call_fact_for_user_call() {
+    let mut sim = MultiShardSimulator::with_config(
+        [WorkShard(11), WorkShard(22)],
+        SimulatorConfig::default(),
+        MultiShardSimulatorConfig {
+            shard_pair_capacity: 1,
+        },
+    );
+    let outcomes = Rc::new(RefCell::new(Vec::new()));
+    let noise = Rc::new(RefCell::new(0usize));
+    let order = Rc::new(RefCell::new(Vec::new()));
+    let worker = sim.register_with_capacity_on::<
+        TerminalLaneWorker,
+        TerminalLaneWorkerMsg,
+        TerminalLaneCallerMsg,
+    >(ShardId::new(22), TerminalLaneWorker, 4);
+    let caller = sim.register_with_capacity_on::<
+        TerminalLaneCaller,
+        TerminalLaneCallerMsg,
+        TerminalLaneWorkerMsg,
+    >(
+        ShardId::new(11),
+        TerminalLaneCaller {
+            worker,
+            outcomes: Rc::clone(&outcomes),
+            noise: Rc::clone(&noise),
+            order,
+        },
+        4,
+    );
+
+    sim.try_send(caller, TerminalLaneCallerMsg::Start).unwrap();
+    assert!(sim.run_until_quiescent() > 0);
+
+    assert_eq!(
+        &*outcomes.borrow(),
+        &[CallOutcome::Replied(TerminalLaneReply(42))]
+    );
+    let call_completed = sim
+        .trace()
+        .iter()
+        .filter(|event| {
+            matches!(
+                event.kind(),
+                RuntimeEventKind::CallCompleted {
+                    call_kind: CallKind::IsolateCall,
+                    ..
+                }
+            )
+        })
+        .count();
+    let reply_terminal_failures = sim
+        .trace()
+        .iter()
+        .filter(|event| {
+            matches!(
+                event.kind(),
+                RuntimeEventKind::CallReplyRejected { .. }
+                    | RuntimeEventKind::CallReplyAbandoned { .. }
+            )
+        })
+        .count();
+    assert_eq!(call_completed, 1);
+    assert_eq!(reply_terminal_failures, 0);
 }
 
 #[test]

@@ -161,6 +161,7 @@ pub struct PendingReplies<K, R> {
     high_water: usize,
     full_rejects: u64,
     reclaimed: u64,
+    taken: u64,
     duplicate_keys: u64,
     capacity_name: String,
     capacity_mode: tina::capacity::CapacityMode,
@@ -175,6 +176,7 @@ impl<K, R> std::fmt::Debug for PendingReplies<K, R> {
             .field("high_water", &self.high_water)
             .field("full_rejects", &self.full_rejects)
             .field("reclaimed", &self.reclaimed)
+            .field("taken", &self.taken)
             .field("duplicate_keys", &self.duplicate_keys)
             .finish()
     }
@@ -236,6 +238,7 @@ where
             high_water: 0,
             full_rejects: 0,
             reclaimed: 0,
+            taken: 0,
             duplicate_keys: 0,
             capacity_name: format!("pending_replies.{seq}"),
             capacity_mode: tina::capacity::CapacityMode::Fixed,
@@ -326,6 +329,12 @@ where
     /// away before the service replied.
     pub fn reclaimed(&self) -> u64 {
         self.reclaimed
+    }
+
+    /// Cumulative number of slots explicitly removed by
+    /// [`take`](Self::take).
+    pub fn taken(&self) -> u64 {
+        self.taken
     }
 
     /// Cumulative number of duplicate-key admission rejections.
@@ -452,7 +461,11 @@ where
         for slot in self.slots.iter_mut() {
             let matches = slot.as_ref().is_some_and(|e| &e.key == key);
             if matches {
-                return slot.take().map(|e| e.reply);
+                let taken = slot.take().map(|e| e.reply);
+                if taken.is_some() {
+                    self.taken += 1;
+                }
+                return taken;
             }
         }
         None
@@ -1177,7 +1190,9 @@ mod pending_replies_tests {
         box_.try_insert(1, fake_slot(10)).unwrap();
         let slot = box_.take(&1).expect("slot present");
         assert_eq!(slot.slot_id(), 10);
+        assert_eq!(box_.taken(), 1);
         assert!(box_.take(&1).is_none());
+        assert_eq!(box_.taken(), 1);
         assert_eq!(box_.len(), 0);
     }
 
@@ -1305,6 +1320,7 @@ mod pending_replies_tests {
         type Spawn = std::convert::Infallible;
         type SpawnObserved = std::convert::Infallible;
         type Call = std::convert::Infallible;
+        type Fact = ::std::convert::Infallible;
         type Shard = tina::SingleShard;
 
         fn handle(

@@ -108,10 +108,9 @@ pub struct PressureSummary {
     /// single worker. Highlights bursts (e.g., a brief outage) the
     /// rate alone would smear.
     pub max_consecutive: u64,
-    /// Position of the first non-ok outcome within the run (op index,
-    /// 0-based, across all workers — the worker whose first error
-    /// had the lowest local index wins ties). `None` when there was
-    /// no pressure.
+    /// Position of the first non-ok outcome within the run's global dispatch
+    /// order (op index, 0-based, across all workers). `None` when there was no
+    /// pressure.
     pub first_error_op_index: Option<u64>,
     /// Per-kind tally, sorted. Same data as
     /// [`LoadReport::err_kinds`], duplicated here so the pressure
@@ -195,7 +194,6 @@ where
         let halted = Arc::clone(&halted);
         let handle = thread::spawn(move || -> WorkerObs {
             let mut obs = WorkerObs::default();
-            let mut local_op_index: u64 = 0;
             let mut current_streak: u64 = 0;
             loop {
                 if halted.load(Ordering::Acquire) {
@@ -226,8 +224,8 @@ where
                     OpOutcome::Timeout => obs.timeout += 1,
                 }
                 if pressure {
-                    if obs.first_error_local_index.is_none() {
-                        obs.first_error_local_index = Some(local_op_index);
+                    if obs.first_error_global_index.is_none() {
+                        obs.first_error_global_index = Some(prior);
                     }
                     current_streak += 1;
                     if current_streak > obs.max_consecutive {
@@ -236,7 +234,6 @@ where
                 } else {
                     current_streak = 0;
                 }
-                local_op_index += 1;
             }
             obs
         });
@@ -273,7 +270,7 @@ where
         total: pressure_total,
         rate_per_mille,
         max_consecutive: combined.max_consecutive,
-        first_error_op_index: combined.first_error_local_index,
+        first_error_op_index: combined.first_error_global_index,
         by_kind: err_kinds.clone(),
     };
 
@@ -303,7 +300,7 @@ struct WorkerObs {
     err_kinds: std::collections::BTreeMap<String, u64>,
     latencies_us: Vec<u64>,
     max_consecutive: u64,
-    first_error_local_index: Option<u64>,
+    first_error_global_index: Option<u64>,
 }
 
 impl WorkerObs {
@@ -318,11 +315,13 @@ impl WorkerObs {
         if other.max_consecutive > self.max_consecutive {
             self.max_consecutive = other.max_consecutive;
         }
-        self.first_error_local_index =
-            match (self.first_error_local_index, other.first_error_local_index) {
-                (None, x) | (x, None) => x,
-                (Some(a), Some(b)) => Some(a.min(b)),
-            };
+        self.first_error_global_index = match (
+            self.first_error_global_index,
+            other.first_error_global_index,
+        ) {
+            (None, x) | (x, None) => x,
+            (Some(a), Some(b)) => Some(a.min(b)),
+        };
     }
 }
 
@@ -471,6 +470,29 @@ mod tests {
             report.pressure.by_kind.iter().any(|(k, _)| k == "burst_b"),
             "{report:?}"
         );
+    }
+
+    #[test]
+    fn pressure_summary_first_error_index_is_global_dispatch_order() {
+        let counter = Arc::new(AtomicU64::new(0));
+        let inner = Arc::clone(&counter);
+        let report = run(
+            LoadRun {
+                workers: 2,
+                stop: LoadStop::ops(2),
+                label: "global_first_error",
+            },
+            move |_| {
+                if inner.fetch_add(1, Ordering::Relaxed) == 0 {
+                    OpOutcome::Err { kind: "first" }
+                } else {
+                    OpOutcome::Ok
+                }
+            },
+            None::<fn() -> bool>,
+        );
+        assert_eq!(report.ops_attempted, 2, "{report:?}");
+        assert_eq!(report.pressure.first_error_op_index, Some(0));
     }
 
     #[test]

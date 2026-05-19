@@ -1,10 +1,12 @@
-use super::driver::{DriverCompletion, DriverShutdownError, RuntimeDriver};
+use super::driver::{DriverCompletion, DriverResourceReport, DriverShutdownError, RuntimeDriver};
 use super::*;
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::convert::Infallible;
 use std::io::Write;
+use std::marker::PhantomData;
 use std::net::{SocketAddr, TcpStream};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::rc::Rc;
 use std::sync::{
     Arc, Mutex,
@@ -12,7 +14,11 @@ use std::sync::{
 };
 use std::thread;
 use std::time::{Duration, Instant};
-use tina::{CallContext, DeferredReply, Outbound, batch, noop, send, spawn, stop};
+use tina::{
+    Address, AddressGeneration, CallContext, Context, DeferredReply, Effect, Isolate, IsolateId,
+    Mailbox, Outbound, ShardId, TrySendError, batch, noop, send, spawn, stop,
+};
+use tina_supervisor::SupervisorConfig;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum NeverOutbound {}
@@ -71,6 +77,56 @@ fn runtime_preallocation_config_reserves_runtime_owned_metadata() {
     assert!(runtime.pending_isolate_calls.capacity() >= preallocation.call_capacity);
     assert!(runtime.driver_completions.capacity() >= preallocation.call_capacity);
     assert!(runtime.round_messages.capacity() >= preallocation.round_scratch_capacity);
+}
+
+#[test]
+fn cancelled_call_cause_ring_overflow_is_visible() {
+    let mut runtime = Runtime::new(TestShard, TestMailboxFactory);
+
+    for raw_id in 0..(CANCELLED_CALL_RING_CAPACITY as u64 + 3) {
+        runtime.record_cancelled_call(CallId::new(raw_id), tina::CancelCause::CallerCancelled);
+    }
+
+    assert_eq!(runtime.cancelled_call_cause_evictions(), 3);
+    assert_eq!(runtime.recently_cancelled_cause(CallId::new(0)), None);
+    assert_eq!(
+        runtime.recently_cancelled_cause(CallId::new(CANCELLED_CALL_RING_CAPACITY as u64 + 2)),
+        Some(tina::CancelCause::CallerCancelled)
+    );
+}
+
+#[test]
+fn bounded_trace_retention_does_not_move_the_tail_on_every_event() {
+    let mut runtime = Runtime::with_clock_and_ids_and_driver(
+        TestShard,
+        TestMailboxFactory,
+        Box::new(MonotonicClock),
+        IdSource::new(),
+        Box::new(FakeDriver::new(Rc::new(RefCell::new(Vec::new())))),
+    );
+    runtime.set_trace_retention(TraceRetention::Bounded(3));
+
+    for _ in 0..100 {
+        runtime.push_event(
+            IsolateId::new(1),
+            None,
+            RuntimeEventKind::EffectObserved {
+                effect: EffectKind::Noop,
+            },
+        );
+    }
+
+    let retained_ids: Vec<_> = runtime
+        .trace()
+        .iter()
+        .map(|event| event.id().get())
+        .collect();
+    assert_eq!(retained_ids, vec![98, 99, 100]);
+    assert_eq!(runtime.trace_dropped(), 97);
+    assert!(
+        runtime.trace_storage_len() <= 6,
+        "bounded trace should compact in chunks, not retain an unbounded stale prefix"
+    );
 }
 
 #[derive(Debug, Default)]
@@ -170,6 +226,7 @@ impl Isolate for RootIsolate {
     type Spawn = tina::ChildDefinition<ChildIsolate>;
     type SpawnObserved = std::convert::Infallible;
     type Call = std::convert::Infallible;
+    type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 
     fn handle(
@@ -199,6 +256,7 @@ impl Isolate for RestartableRootIsolate {
     type Spawn = tina::RestartableChildDefinition<ChildIsolate>;
     type SpawnObserved = std::convert::Infallible;
     type Call = std::convert::Infallible;
+    type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 
     fn handle(
@@ -235,6 +293,7 @@ impl Isolate for ChildIsolate {
     type Spawn = tina::ChildDefinition<LeafIsolate>;
     type SpawnObserved = std::convert::Infallible;
     type Call = std::convert::Infallible;
+    type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 
     fn handle(
@@ -261,6 +320,7 @@ impl Isolate for LeafIsolate {
     type Spawn = std::convert::Infallible;
     type SpawnObserved = std::convert::Infallible;
     type Call = std::convert::Infallible;
+    type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 
     fn handle(
@@ -955,6 +1015,7 @@ impl Isolate for OverlapAcceptor {
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<OverlapAcceptorMsg>;
+    type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 
     fn handle(
@@ -1037,6 +1098,7 @@ impl Isolate for Reader {
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<ReaderMsg>;
+    type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 
     fn handle(
@@ -1164,6 +1226,7 @@ impl Isolate for CooperativeFairness {
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
     type Call = Infallible;
+    type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 
     fn handle(
@@ -1193,6 +1256,7 @@ impl Isolate for Sleeper {
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<TimerMsg>;
+    type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 
     fn handle(
@@ -1376,6 +1440,7 @@ where
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
     type Call = Infallible;
+    type Fact = ::std::convert::Infallible;
     type Shard = S;
 
     fn handle(
@@ -1399,6 +1464,7 @@ where
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
     type Call = Infallible;
+    type Fact = ::std::convert::Infallible;
     type Shard = S;
 
     fn handle(
@@ -1433,6 +1499,7 @@ where
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
     type Call = Infallible;
+    type Fact = ::std::convert::Infallible;
     type Shard = S;
 
     fn handle(
@@ -1460,6 +1527,7 @@ where
     type Spawn = tina::RestartableChildDefinition<ShardLocalChild<S>>;
     type SpawnObserved = std::convert::Infallible;
     type Call = Infallible;
+    type Fact = ::std::convert::Infallible;
     type Shard = S;
 
     fn handle(
@@ -1490,6 +1558,7 @@ where
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
     type Call = Infallible;
+    type Fact = ::std::convert::Infallible;
     type Shard = S;
 
     fn handle(
@@ -1514,6 +1583,7 @@ where
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<TimerMsg>;
+    type Fact = ::std::convert::Infallible;
     type Shard = S;
 
     fn handle(
@@ -2702,6 +2772,7 @@ impl Isolate for ManualCallTarget {
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
     type Call = Infallible;
+    type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 
     fn handle(
@@ -2755,6 +2826,7 @@ impl Isolate for ManualCallCaller {
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<ManualCallCallerMsg>;
+    type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 
     fn handle(
@@ -2862,6 +2934,7 @@ impl Isolate for RetryWorker {
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<RetryMsg>;
+    type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 
     fn handle(

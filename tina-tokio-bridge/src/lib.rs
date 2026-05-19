@@ -407,6 +407,7 @@ where
     type Spawn = I::Spawn;
     type SpawnObserved = std::convert::Infallible;
     type Call = I::Call;
+    type Fact = I::Fact;
     type Shard = I::Shard;
 
     fn handle(
@@ -442,6 +443,7 @@ where
             tina::Effect::Batch(effects.into_iter().map(remap_effect).collect())
         }
         tina::Effect::ReplyTo(slot, reply) => tina::Effect::ReplyTo(slot, reply),
+        tina::Effect::Fact(fact) => tina::Effect::Fact(fact),
     }
 }
 
@@ -654,6 +656,7 @@ where
         I::Message: BridgeMessage + From<BridgeRequest<M, R>> + Send + 'static,
         I::Reply: Send + 'static,
         I::Call: IntoErasedCall<I::Message> + 'static,
+        I::Fact: tina_runtime::IntoRuntimeFact + 'static,
         M: Send + 'static,
         R: Send + 'static,
         Outbound: 'static,
@@ -749,6 +752,39 @@ where
                 });
             }
             std::thread::sleep(Duration::from_millis(1));
+        }
+        let trace = self.try_shutdown()?;
+        Ok(BridgeShutdownReport {
+            trace,
+            outstanding_handles_at_shutdown: 0,
+            drained_within_timeout: true,
+        })
+    }
+
+    /// Async drain + shutdown for callers already running on Tokio.
+    ///
+    /// This has the same contract as [`drain_and_shutdown`](Self::drain_and_shutdown)
+    /// but uses `tokio::time::sleep` between polls so an Axum/Tokio shutdown
+    /// task does not park a runtime worker thread while waiting for bridge
+    /// handles to drop.
+    pub async fn drain_and_shutdown_async(
+        &mut self,
+        drain_timeout: Duration,
+    ) -> Result<BridgeShutdownReport, BridgeShutdownError> {
+        let deadline = tokio::time::Instant::now() + drain_timeout;
+        loop {
+            if self.pending_handles() == 0 {
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                let pending = self.pending_handles();
+                return Ok(BridgeShutdownReport {
+                    trace: Vec::new(),
+                    outstanding_handles_at_shutdown: pending,
+                    drained_within_timeout: false,
+                });
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
         }
         let trace = self.try_shutdown()?;
         Ok(BridgeShutdownReport {

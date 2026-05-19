@@ -22,8 +22,8 @@ use crate::capabilities::RuntimeCapabilities;
 use crate::clock::MonotonicClock;
 use crate::driver::{self, BetelgeuseDriver};
 use crate::errors::{
-    SendObservedUntilError, SuperviseError, ThreadedRegisterBootstrapError, ThreadedRuntimeError,
-    ThreadedSendObservedError, ThreadedTrySendError,
+    SendObservedUntilError, ShutdownWaitError, SuperviseError, ThreadedRegisterBootstrapError,
+    ThreadedRuntimeError, ThreadedSendObservedError, ThreadedTrySendError,
 };
 use crate::host_burst::HostBurstOutcomes;
 use crate::live_report::{LiveShardMetrics, LiveShardState, LiveTopologyReport};
@@ -60,7 +60,8 @@ pub struct ThreadedRuntimeConfig {
     /// Capacity of the bounded DNS lane.
     pub dns_lane_capacity: usize,
 
-    /// Capacity of the bounded TLS lane.
+    /// Queue capacity of the bounded TLS lane. This is not TLS concurrency:
+    /// each shard owns one TLS worker that drains this queue serially.
     pub tls_lane_capacity: usize,
 
     /// Capacity of the bounded process lane.
@@ -114,6 +115,11 @@ impl Default for ThreadedRuntimeConfig {
 
 /// Per-shard default budget for draining lane workers after cancellation.
 pub const DEFAULT_SHUTDOWN_LANE_DRAIN_TIMEOUT: Duration = Duration::from_millis(100);
+
+/// Extra host-side delivery grace used by the legacy one-timeout
+/// `call_blocking` wrapper so a target call timeout can be delivered as
+/// `CallOutcome::Timeout` instead of racing the host wait timer.
+pub const DEFAULT_HOST_CALL_DELIVERY_GRACE: Duration = Duration::from_millis(100);
 
 pub(crate) enum ThreadedCommand<S, F>
 where
@@ -346,6 +352,7 @@ where
         I::Spawn: IntoErasedSpawn<S, F> + 'static,
         I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
         I::Call: IntoErasedCall<I::Message> + 'static,
+        I::Fact: crate::fact::IntoRuntimeFact + 'static,
         Outbound: 'static,
     {
         self.call(move |runtime| {
@@ -376,6 +383,7 @@ where
         I::Spawn: IntoErasedSpawn<S, F> + 'static,
         I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
         I::Call: IntoErasedCall<I::Message> + 'static,
+        I::Fact: crate::fact::IntoRuntimeFact + 'static,
         Outbound: 'static,
     {
         self.register_with_capacity::<I, Outbound>(isolate, mailbox_capacity)
@@ -400,6 +408,7 @@ where
         I::Spawn: IntoErasedSpawn<S, F> + 'static,
         I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
         I::Call: IntoErasedCall<I::Message> + 'static,
+        I::Fact: crate::fact::IntoRuntimeFact + 'static,
         Outbound: 'static,
     {
         self.register_with_capacity::<I, Outbound>(isolate, mailbox_capacity)
@@ -430,6 +439,7 @@ where
         I::Spawn: IntoErasedSpawn<S, F> + 'static,
         I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
         I::Call: IntoErasedCall<I::Message> + 'static,
+        I::Fact: crate::fact::IntoRuntimeFact + 'static,
         Outbound: 'static,
     {
         self.register_with_capacity::<I, Outbound>(isolate, mailbox_capacity)
@@ -457,6 +467,7 @@ where
         I::Spawn: IntoErasedSpawn<S, F> + 'static,
         I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
         I::Call: IntoErasedCall<I::Message> + 'static,
+        I::Fact: crate::fact::IntoRuntimeFact + 'static,
         Outbound: 'static,
     {
         match self.call(move |runtime| {
@@ -475,7 +486,8 @@ where
                 Err(ThreadedRegisterBootstrapError::UnknownShard(shard))
             }
             Err(ThreadedRuntimeError::DriverShutdownFailed)
-            | Err(ThreadedRuntimeError::CommandFull) => {
+            | Err(ThreadedRuntimeError::CommandFull)
+            | Err(ThreadedRuntimeError::HostWaitTimeout) => {
                 // `call` is blocking-admission, so `CommandFull` is
                 // unreachable today. Map defensively in case the inner
                 // helper is ever migrated.
@@ -504,6 +516,7 @@ where
         I::Spawn: IntoErasedSpawn<S, F> + 'static,
         I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
         I::Call: IntoErasedCall<I::Message> + 'static,
+        I::Fact: crate::fact::IntoRuntimeFact + 'static,
         Outbound: 'static,
         Ctor: FnOnce(Address<I::Message, I::Reply>) -> I + Send + 'static,
     {
@@ -1148,14 +1161,40 @@ where
     /// ```
     ///
     /// The `timeout` argument is the *call* timeout (how long the target
-    /// isolate has to reply). The host-side wait uses the same timeout
-    /// value so the host thread does not block forever if the worker
-    /// stops mid-call.
+    /// isolate has to reply). The legacy host-side wait adds a short delivery
+    /// grace so target timeouts can arrive as `CallOutcome::Timeout`. Use
+    /// [`call_blocking_with_host_timeout`](Self::call_blocking_with_host_timeout)
+    /// when host wait budget and target deadline must be distinct.
     pub fn call_blocking<M, R>(
         &self,
         address: Address<M, R>,
         message: M,
         timeout: Duration,
+    ) -> Result<CallOutcome<R>, ThreadedRuntimeError>
+    where
+        M: Send + 'static,
+        R: Send + 'static,
+    {
+        let host_wait_timeout = timeout
+            .checked_add(DEFAULT_HOST_CALL_DELIVERY_GRACE)
+            .unwrap_or(timeout);
+        self.call_blocking_with_host_timeout(address, message, timeout, host_wait_timeout)
+    }
+
+    /// Like [`call_blocking`](Self::call_blocking), but gives the host wait its
+    /// own budget separate from the target call deadline.
+    ///
+    /// `target_timeout` is delivered into Tina and controls when the call
+    /// becomes `CallOutcome::Timeout`. `host_wait_timeout` controls how long
+    /// this OS thread waits for the driver result. If the host wait expires
+    /// first, the target call is still governed by `target_timeout` and this
+    /// method returns [`ThreadedRuntimeError::HostWaitTimeout`].
+    pub fn call_blocking_with_host_timeout<M, R>(
+        &self,
+        address: Address<M, R>,
+        message: M,
+        target_timeout: Duration,
+        host_wait_timeout: Duration,
     ) -> Result<CallOutcome<R>, ThreadedRuntimeError>
     where
         M: Send + 'static,
@@ -1174,7 +1213,7 @@ where
                 HostCallMsg::Begin {
                     target: address,
                     message,
-                    timeout,
+                    timeout: target_timeout,
                 },
             ) {
                 Ok(()) => {}
@@ -1197,9 +1236,9 @@ where
             }
         }
 
-        match reply_rx.recv_timeout(timeout) {
+        match reply_rx.recv_timeout(host_wait_timeout) {
             Ok(outcome) => Ok(outcome),
-            Err(mpsc::RecvTimeoutError::Timeout) => Ok(CallOutcome::Timeout),
+            Err(mpsc::RecvTimeoutError::Timeout) => Err(ThreadedRuntimeError::HostWaitTimeout),
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 self.metrics.set_state(LiveShardState::Failed);
                 Err(ThreadedRuntimeError::WorkerStopped)
@@ -1299,6 +1338,20 @@ where
         shared.wait_report_blocking()
     }
 
+    /// Requests shutdown and waits up to `timeout` for terminal truth.
+    ///
+    /// This is the explicit bounded form for hosts that cannot risk an
+    /// unbounded join. A timeout returns [`ShutdownWaitError::Timeout`]
+    /// while the background joiner may continue trying to finish.
+    pub fn shutdown_with_timeout(
+        self,
+        timeout: Duration,
+    ) -> Result<LocalSystemTerminalReport, ShutdownWaitError> {
+        let shared = Arc::clone(&self.shutdown);
+        drop(self);
+        shared.wait_report_for_owner_with_timeout(timeout)
+    }
+
     fn call<R, C>(&self, command: C) -> Result<R, ThreadedRuntimeError>
     where
         R: Send + 'static,
@@ -1327,7 +1380,9 @@ where
 {
     fn drop(&mut self) {
         self.shutdown.shutdown_blocking();
-        let _ = self.shutdown.wait_report_blocking();
+        let _ = self
+            .shutdown
+            .wait_report_for_owner_with_timeout(DEFAULT_SHUTDOWN_LANE_DRAIN_TIMEOUT);
     }
 }
 
@@ -1391,7 +1446,7 @@ where
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
             }
         } else {
-            thread::yield_now();
+            thread::sleep(Duration::from_millis(1));
         }
     }
 
