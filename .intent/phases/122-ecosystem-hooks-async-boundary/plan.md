@@ -75,6 +75,8 @@ Medium blast radius.
   policy data when required by the extension smoke crates.
 - Not allowed: moving internals public wholesale, dynamic plugin ABI, generic
   async bridge, native protocol rewrites, or new runtime backdoors.
+- If new trace/fact/capability events are added, append stable tags only; never
+  renumber existing trace hash tags.
 
 ## Implementation Shape
 
@@ -130,6 +132,16 @@ No smoke crate may import `tina_runtime::runtime_internal` or private modules.
 Add one compile-fail or lint-style proof that an extension crate cannot mint
 runtime-owned tokens/handles by importing hidden internals.
 Every smoke crate must have a README command and a smoke test.
+
+The compile-fail proof should be concrete. Use `trybuild` or a
+workspace-excluded fixture that attempts at least:
+
+- import/use `tina_runtime::runtime_internal`;
+- mint a runtime-owned token/handle/lease;
+- construct a private capability/report field directly.
+
+Pin the failure so extension authors learn: use public hooks, not private
+runtime state.
 
 ## Proof Shape
 

@@ -47,8 +47,10 @@ close, and the outcome is typed
 - rate limiting policy is deterministic: same config + same visible time + same
   key history produces same decisions
 - bounded-wait decision shape; caller still owns the waiting message/request
-- if a bounded wait stores caller authority, use `SharedWork` or an equivalent
-  fixed-capacity helper that returns the request/context on rejection
+- bounded wait is strict: do not add a new waiter product in this phase unless
+  a user proof specimen forces it
+- if bounded wait is needed, make it a small wrapper over `SharedWork` and
+  return the request/context on rejection
 - shed/degrade/close policy outcomes with one shared report shape
 - retry-with-backoff policy that is explicit, bounded, and caller-owned
 - service report/capacity integration
@@ -119,8 +121,9 @@ Rules:
 - Bounded wait returns a decision. It does not hide a queue unless the queue is
   fixed-capacity, ticketed, and returns the caller/request on rejection.
 - Bounded wait uses `SharedWork`/`RequestContext`/pending-token patterns from
-  the current runtime. No parked caller authority without a stored token and a
-  fill-cancel-refill proof.
+  the current runtime. Do not create a fresh wait table for this phase.
+- No parked caller authority without a stored token and a fill-cancel-refill
+  proof.
 - Retry returns a sleep duration/token. It does not resend the request.
 - Shared-budget use returns a `SharedCapacityCharge` or a typed full report.
 - Reports convert into existing `CapacitySummary` / discovery lines.

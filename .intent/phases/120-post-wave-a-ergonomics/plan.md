@@ -84,6 +84,12 @@ Touch only copied paths and examples/docs around newly landed Wave A features:
   command and names which Wave A primitive it exercises.
 - Add cheap-model instructions: build one tiny feature using only the skeleton
   README, then record any new rough edge in findings.
+- Add cheap-model proof, not just instructions:
+  - create one tiny completed system/specimen that follows only the refreshed
+    skeleton README;
+  - it must compile and run by a documented command;
+  - if the author needed unstated lore, record that as a finding and fix the
+    copied path or docs.
 - Keep names task-shaped:
   - "call another service"
   - "limit work"
@@ -97,6 +103,7 @@ Touch only copied paths and examples/docs around newly landed Wave A features:
 - systems still pass
 - every edited specimen/system README command runs
 - docs show one production-shaped client/server/stateful service
+- cheap-model copied-path proof runs as a real smoke test
 - solved pain moved out of current findings
 - at least one common wrong setup becomes compile-fail or impossible through
   the copied path

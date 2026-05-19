@@ -58,6 +58,8 @@ my Tina service calls another HTTP/2/gRPC service without Tokio
 - native gRPC client surface over that HTTP/2 client connection
 - unary, server-streaming, client-streaming, and bidi client paths
 - TLS ALPN rail support for `h2`:
+  - named `AlpnProtocols` config, not raw byte bags:
+    `AlpnProtocols::h2()` and `AlpnProtocols::none()`
   - ALPN protocols on TLS bind/connect config
   - selected protocol in TLS connect/accept output
   - typed ALPN mismatch/failure truth
@@ -98,6 +100,9 @@ Big blast radius. Keep it fenced.
   bridge, or public HTTP/2 frame API.
 - Do the internal HTTP/2 module split first and prove server behavior is
   unchanged before adding client behavior.
+- The PR/commit sequence must leave a clean review checkpoint after the
+  server-only split: moved files, shared helpers, tests green, and no client
+  behavior or ALPN behavior yet.
 
 ## Implementation Shape
 
@@ -114,6 +119,14 @@ Big blast radius. Keep it fenced.
   exists.
 - Existing server tests must stay green after the split before client behavior
   lands.
+- Commit/checkpoint 1 is server unchanged:
+  - `http2.rs` is split into the module tree;
+  - shared frame/header/error helpers are internal;
+  - no new client structs;
+  - no ALPN edits;
+  - server behavior and public exports are unchanged.
+  Run the existing HTTP/2/gRPC server tests at this checkpoint so reviewers can
+  diff the move apart from the new client.
 - Do not expose these frame/header modules as public API. They are internal
   shared code for server/client.
 - `Http2ClientConnection` is an isolate over one TCP/TLS stream:
@@ -146,7 +159,8 @@ Big blast radius. Keep it fenced.
   each returns one Tina call/effect shape with explicit status outcome.
 - TLS ALPN extends the existing TLS rail:
   - no ambient default;
-  - h2 target asks for `["h2"]`;
+  - h2 target asks through `AlpnProtocols::h2()`;
+  - explicit non-ALPN TCP/TLS paths use `AlpnProtocols::none()`;
   - h2c target never touches TLS;
   - selected ALPN is visible in typed connect/accept output;
   - simulator TLS config/history includes offered/selected ALPN so saved cases

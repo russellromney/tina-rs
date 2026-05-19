@@ -92,6 +92,23 @@ CommittedMutation<T>
 RecoveryReport
 ```
 
+Add one checked-in resource owner matrix, near the lifecycle docs or resource
+policy docs. It is implementation evidence, not an audit task. Columns:
+
+```text
+resource kind | owner | close path | drain path | force path | report
+```
+
+It must cover at least:
+
+- HTTP/1 keepalive connection
+- HTTP/2/gRPC client connection
+- HTTP/2 stream slot
+- SQLite bridge
+- SQLx bridge
+- WorkerPool generic handle
+- local file/journal rail
+
 Resource rules:
 
 - Idle retirement applies only to idle resources.

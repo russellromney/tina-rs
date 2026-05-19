@@ -67,6 +67,8 @@ Medium blast radius, but tests can be expensive.
   benchmark marketing, or retry policy hidden inside the harness.
 - CI tests must stay small. Put long soak/load profiles behind ignored tests or
   explicit commands.
+- Prefer reports over new runtime events. If this phase adds trace/fact tags,
+  append stable tags only; never renumber existing trace hash tags.
 
 ## Implementation Shape
 
