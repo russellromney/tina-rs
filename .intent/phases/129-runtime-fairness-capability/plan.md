@@ -3,8 +3,9 @@
 ## Status
 
 - Future implementation plan for the first post-122 core wave.
-- Builds on Phase 121 but turns fairness reports into runtime/service
-  capability where the code can honestly observe it.
+- Builds on Phase 121. Phase 121 proves fairness/load behavior; this phase adds
+  runtime/service capability surfaces where those proofs expose real starvation
+  or lag.
 
 ## Purpose
 
@@ -35,6 +36,13 @@ rest of my service
 - no hidden buffering to improve fairness numbers
 - no OS scheduling promise
 
+## Must Not Change
+
+- Existing scheduler order and trace determinism stay stable unless a specific
+  unfairness bug requires a semantic change and the trace/hash impact is pinned.
+- Existing capacity/pressure reports keep their fields and meanings.
+- Existing protocol/session behavior must not gain hidden retry or buffering.
+
 ## Implementation Shape
 
 Use honest observable names:
@@ -57,6 +65,8 @@ Rules:
 - Do not retry, buffer, or reprioritize invisibly.
 - Reports must compose with existing pressure/capacity summaries.
 - Stable trace/fact tags append only; never renumber.
+- If runtime scheduling semantics change, update saved replay expectations
+  intentionally and prove unaffected traces do not churn.
 
 ## User Proof Specimens
 
@@ -76,6 +86,9 @@ Rules:
 - final reports prove no leaked leases/permits/body charges/pending calls
 - long soak profile is ignored/opt-in with documented command; CI profile is
   small and deterministic
+- blast-radius proof: existing dispatcher, multi-shard fairness, timer, and
+  protocol tests still pass; saved replay hashes only change for scenarios whose
+  event shape intentionally changed
 
 ## Hostile Review Notes
 

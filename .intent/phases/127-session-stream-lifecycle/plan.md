@@ -37,6 +37,15 @@ and report in the same way
 - no per-protocol lifecycle dialect unless the protocol truly needs it
 - no hidden retry or reconnect
 
+## Must Not Change
+
+- Existing HTTP/1, HTTP/2, gRPC, and WebSocket success paths keep their current
+  wire behavior.
+- Existing protocol error mappings stay stable unless this phase explicitly
+  adds a more precise typed outcome and updates tests.
+- Existing request-scoped cancellation truth remains: Tina stops waiting and
+  Tina-owned rails close only where the rail contract supports it.
+
 ## Implementation Shape
 
 Use common nouns:
@@ -60,6 +69,8 @@ Rules:
 - Idle timeout closes or reports why close could not run.
 - Reports include accepted, completed, cancelled, reset, timed out, full,
   high-water, final-current.
+- Request-scoped cancellation feeds session close/cancel through the same report
+  vocabulary. No orphan body/source/session work after caller disconnect.
 
 ## User Proof Specimens
 
@@ -79,6 +90,8 @@ Rules:
 - idle timeout does not leave a live owned stream with no owner
 - simulator or protocol-fact replay records supported lifecycle facts; unsupported
   byte-level replay is declared explicitly
+- blast-radius proof: existing HTTP/1 keepalive, HTTP/2 strictness, gRPC
+  streaming, and WebSocket browser tests still pass
 
 ## Hostile Review Notes
 

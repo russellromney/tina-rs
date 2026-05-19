@@ -34,6 +34,14 @@ IPC without falling back to Tokio
 - no unbounded file buffering
 - no async runtime interop bridge
 
+## Must Not Change
+
+- Existing file/path/persistence rail outcomes keep their current names and
+  meanings.
+- Existing simulator unsupported facts remain honest; no platform support is
+  faked to satisfy a specimen.
+- Existing TCP lifecycle vocabulary remains the model for Unix sockets.
+
 ## Implementation Shape
 
 Use OS-user names:
@@ -57,6 +65,8 @@ Rules:
 - Codecs are sync state machines; Tina owns I/O and pressure.
 - Unix sockets use the same lifecycle/capacity/report words as TCP where
   possible.
+- If a platform lacks a requested storage guarantee, return typed unsupported
+  with capability report evidence.
 
 ## User Proof Specimens
 
@@ -75,6 +85,8 @@ Rules:
 - shutdown closes file/IPC rails and reports final current counts
 - simulator support is either implemented or declared unsupported with replay
   facts
+- blast-radius proof: existing file/path/persistence tests and Phase-117
+  first-form file/codec/IPC tests still pass
 
 ## Hostile Review Notes
 

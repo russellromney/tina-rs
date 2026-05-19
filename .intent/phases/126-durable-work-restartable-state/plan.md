@@ -19,7 +19,7 @@ truth without double-applying hidden work
 
 ## Includes
 
-- durable work queue or outbox first form
+- `DurableOutbox` first form with bounded capacity and stable `WorkId`
 - append-before-apply service helper
 - restart recovery report
 - corrupt-tail, truncated-tail, and uncertain-commit outcomes
@@ -34,6 +34,15 @@ truth without double-applying hidden work
 - no database replacement
 - no durable mailbox
 - no cross-process locking unless a platform backend already proves it
+- no generic durable queue abstraction without the outbox proof below
+
+## Must Not Change
+
+- Existing snapshot/journal APIs and recovery outcomes keep their current
+  meaning.
+- Existing persistence trace facts and durable simulator image behavior keep
+  replay compatibility.
+- Persistence remains local. This phase does not make a distributed guarantee.
 
 ## Implementation Shape
 
@@ -41,7 +50,7 @@ Use names from user workflow:
 
 ```text
 DurableWork
-DurableWorkQueue
+DurableOutbox
 Outbox
 RecordedWork
 CommittedWork
@@ -54,9 +63,11 @@ Rules:
 
 - Record before apply. The helper must make apply-before-record impossible or
   loudly rejected.
+- First form is at-least-once outbox semantics: after recovery, pending work may
+  run again unless it was marked complete. The report names replayed work ids.
 - A failed append returns the original work item.
-- Applying completed work is idempotent by work id, or duplicate apply is a
-  typed rejection. Pick one per helper and prove it.
+- Mark-complete is idempotent by `WorkId`; duplicate apply/completion is a typed
+  `AlreadyCompleted` / `DuplicateWork` outcome, not silent success.
 - Replay is bounded by configured queue/log limits.
 - Recovery separates: clean, truncated tail repaired, corrupt tail rejected,
   uncertain commit.
@@ -83,6 +94,8 @@ Rules:
 - shutdown report names pending, completed, failed, and abandoned durable work
 - trybuild test proves apply-before-record cannot compile if type-state helper
   exists
+- blast-radius proof: existing snapshot/journal corruption, truncation, and
+  replay tests still pass; no existing recovery outcome is renamed silently
 
 ## Hostile Review Notes
 

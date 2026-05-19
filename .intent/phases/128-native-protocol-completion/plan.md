@@ -37,6 +37,17 @@ normal production-shaped services
 - no unbounded client pool
 - no HTTP/3/QUIC
 - no gRPC reflection unless it stays bounded and useful
+- no redo of Phase 116 first-form clients. This phase finishes production
+  client gaps: security, pooling, interop, and protocol facts.
+
+## Must Not Change
+
+- Native server protocol behavior from HTTP/1, HTTP/2, gRPC, and WebSocket stays
+  compatible with current tests.
+- Existing client APIs from Phase 116 remain source-compatible unless this
+  phase adds a compile-time safety improvement with migration tests.
+- Authority/SNI/Host truth stays explicit; no convenience default may hide a
+  mismatch.
 
 ## Implementation Shape
 
@@ -82,6 +93,8 @@ Rules:
 - pooled HTTP/2 client proves one connection handles N requests where allowed
 - dead pooled connection retires and next request reconnects or reports typed
   failure
+- blast-radius proof: existing native HTTP/2/gRPC/WebSocket server tests and
+  Phase-116 client tests still pass
 
 ## Hostile Review Notes
 

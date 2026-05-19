@@ -19,7 +19,8 @@ them on owner stop, and refresh replacement addresses without scraping traces
 
 ## Includes
 
-- cross-shard child ownership, or a typed explicit rejection if not supported
+- cross-shard child ownership for the existing local live/sim multi-shard
+  runtime
 - parent-stop child cleanup across shards
 - shard restart propagation for owned children in live and sim; if one path
   cannot support it, return the same typed unsupported truth everywhere
@@ -38,6 +39,16 @@ them on owner stop, and refresh replacement addresses without scraping traces
 - no hidden global child registry
 - no restart that reuses a stale address generation
 - no automatic retry policy hidden inside supervision
+- no "cross-shard unsupported" as the whole deliverable. Typed unsupported is
+  only for remoting/cluster edges outside the local multi-shard runtime.
+
+## Must Not Change
+
+- Existing same-shard spawn, `spawn_observed`, child ref, restart budget, and
+  panic-restart behavior keep their current public outcomes.
+- Stale address generation rejection stays loud.
+- Parent/child lineage remains runtime-owned; no app-side registry becomes the
+  blessed path.
 
 ## Implementation Shape
 
@@ -62,8 +73,9 @@ Rules:
 - Replacement address refresh is a typed message/report, not trace spelunking.
 - Parent stop first stops admission, then stops or drains owned children, then
   emits a report.
-- Cross-shard ownership must be either implemented with typed remote truth or
-  rejected at registration/spawn time. No half-support.
+- Cross-shard ownership in the existing local multi-shard runtime is part of
+  this phase: start, stop, restart report, and stale replacement address truth.
+  Network remoting/clustering remains typed unsupported.
 - Non-panic child failure is a normal typed outcome. Panic failure remains
   visible separately.
 
@@ -73,14 +85,14 @@ Rules:
   parent learns new address
 - supervised session service: parent stop closes children and reports all
   terminal child outcomes
-- cross-shard child attempt: either works with typed propagation or rejects with
-  the documented unsupported outcome
+- cross-shard child service: parent owns a child on another shard, receives
+  start/fail/restart/address-change truth, then stops it cleanly
 
 ## Required Proof
 
 - live single-shard child restart yields new generation and stale address
   rejection
-- live multi-shard parent-stop child cleanup or typed unsupported rejection
+- live multi-shard parent-stop child cleanup
 - simulator replay of child start/fail/restart/stop sequence
 - failure-before-start reports no hidden child
 - failure-after-start reports child id/generation and owner id
@@ -88,6 +100,9 @@ Rules:
 - restart budget exhaustion stops restarting and reports final state
 - compile-fail or macro test for illegal hidden/shared child ownership if the
   API adds an ownership type
+- blast-radius proof: existing same-shard supervision tests, existing
+  `spawn_observed` tests, and existing restart-budget tests still pass through
+  the public path
 
 ## Hostile Review Notes
 
