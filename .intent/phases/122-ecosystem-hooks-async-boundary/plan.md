@@ -38,7 +38,9 @@ private runtime access and without weakening bounded/DST truth
 
 ## Includes
 
-- public capacity surface hook
+- public capacity surface hook through existing `CapacitySurfaceReport` /
+  `CapacitySummary` data; add a trait only if an extension smoke crate cannot
+  work with owned reports
 - bounded event sink hook polish if existing `BoundedEventSink` lacks an
   extension-facing shape
 - sync codec adapter hook
@@ -79,7 +81,7 @@ Medium blast radius.
 Expose small stable seams:
 
 ```text
-CapacitySurface
+CapacitySurfaceReport
 BoundedEventSink
 SyncCodec
 ServicePolicy
@@ -89,14 +91,17 @@ RuntimeCapabilityReport
 
 Rules:
 
-- Prefer existing names if they already carry the truth. Add traits only when an
-  extension smoke crate cannot work through current public data shapes.
+- Prefer existing names if they already carry the truth. `CapacitySurfaceReport`
+  is the default capacity hook; do not add a `CapacitySurface` trait unless a
+  public extension crate proves owned reports are insufficient.
 - Hooks use owned reports and typed outcomes, not callbacks into private runtime
   internals.
 - Extension crates may observe and report capacity; they may not mutate runtime
   queues directly.
 - Codecs are synchronous parser/encoder state. Tina owns I/O and backpressure.
-- Event sinks are bounded and choose `drop_oldest`, `drop_newest`, or `reject`.
+- Event sinks are bounded and choose the existing `drop_oldest` or
+  `drop_newest` policy. `drop_newest` is the reject-new-event shape; do not add
+  a third synonym.
 - Service policies return decisions; they do not send messages or retry work.
 - Bridge author parts name install result, address, closer, metrics, pressure,
   shutdown, worker-terminal outcome, and caller-observed outcome.

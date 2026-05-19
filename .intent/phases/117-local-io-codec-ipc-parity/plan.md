@@ -25,6 +25,9 @@ Tina owns I/O, capacity, cancellation, and replay. Codecs own bytes.
 - TCP loop helpers already exist: `TcpWriteAll`, `TcpReadExact`,
   `TcpReadToEof`. They prove the helper shape: user-owned state machine, one
   runtime call per progress step.
+- File rails are offset-shaped. File loop helpers must own explicit offset
+  progress and return partial-progress reports on cancel/failure; they must not
+  pretend a file stream is the same thing as a TCP stream.
 - HTTP/1, chunked, WebSocket, HTTP/2, and gRPC all have private codec-ish
   parsers. This phase should not expose those exact internals; it should ship a
   generic sync codec pattern that matches their lessons.
@@ -32,6 +35,8 @@ Tina owns I/O, capacity, cancellation, and replay. Codecs own bytes.
   Unix as a resource kind, but no `unix_bind` / `unix_connect` surface exists.
 - Add `tina-codec` as the official codec battery crate. Do not put codecs in
   `tina` core.
+- New runtime call kinds / trace tags for Unix rails must be appended to stable
+  hash mappings. Do not renumber existing call/effect/protocol tags.
 
 ## Includes
 
@@ -123,6 +128,9 @@ Medium blast radius.
   - explicit max chunk and max total
   - no zero chunk
   - no hidden allocation beyond configured buffer
+  - explicit offset progress in every continuation
+  - terminal report includes bytes read/written, final offset, and whether the
+    helper ended by done, EOF, cancel, cap, or error
 - Add `tina-codec` as an official small battery crate:
   - `LineFramer`
   - `LengthDelimitedFramer`

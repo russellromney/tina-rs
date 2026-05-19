@@ -74,9 +74,8 @@ Big blast radius. Keep resource and durability work honest.
   persistence service helpers/specimens.
 - Not allowed: generic distributed durability, durable mailbox, DB-internal pool
   rewrites, HTTP/2/gRPC protocol redesign, or stealing leased resources.
-- If HTTP/2/gRPC client from Phase 116 is not landed, skip those resource
-  proofs and keep this phase on HTTP/1/DB/persistence. Do not invent a fake
-  client pool to satisfy the plan.
+- Do not start the HTTP/2/gRPC resource rocks until Phase 116 is on main. Do
+  not invent a fake client pool to satisfy this plan.
 
 ## Implementation Shape
 
@@ -98,6 +97,9 @@ Resource rules:
 - Idle retirement applies only to idle resources.
 - Max lifetime prevents handoff of stale idle resources. A leased resource is
   reported old, not stolen.
+- Resource kinds that own a real close path must expose a small owner hook
+  rather than relying on generic `WorkerPool<H>` magic. Generic pools can mark
+  stale/report; owner-specific pools close.
 - Health checks happen at explicit points: before handoff, after release, or on
   scheduled maintenance. The report names which point found the bad resource.
 - If the pool owns a close path, retirement closes and reports it.

@@ -24,6 +24,9 @@
 - `BoundedEventSink` now exists. Use it for policy/audit events only when the
   user explicitly asks for event retention; do not make it part of admission
   itself.
+- `SharedWork` already owns "many callers wait for one key." Do not build a
+  second waiter product. Bounded wait policy should compose with `SharedWork`
+  or return a decision that the service handles explicitly.
 
 ## Purpose
 
@@ -44,8 +47,8 @@ close, and the outcome is typed
 - rate limiting policy is deterministic: same config + same visible time + same
   key history produces same decisions
 - bounded-wait decision shape; caller still owns the waiting message/request
-- if a bounded wait stores caller authority, storage must be fixed-capacity and
-  return the request/context on rejection
+- if a bounded wait stores caller authority, use `SharedWork` or an equivalent
+  fixed-capacity helper that returns the request/context on rejection
 - shed/degrade/close policy outcomes with one shared report shape
 - retry-with-backoff policy that is explicit, bounded, and caller-owned
 - service report/capacity integration
@@ -89,7 +92,8 @@ AdmissionReport
 PressureAction
 ```
 
-`AdmissionDecision<T>` is the copied match shape:
+`AdmissionDecision<T>` is the copied match shape. `T` is usually a
+move-only permit/charge or a user value that proves admission succeeded:
 
 ```text
 Admitted(T)
@@ -105,17 +109,17 @@ Rules:
 
 - A successful decision returns a move-only permit/charge when capacity must be
   released later.
-- Per-key storage is fixed-capacity. No growing `HashMap` as the user-visible
-  storage truth.
+- Per-key storage is fixed-capacity. No growing `HashMap`/`BTreeMap` as the
+  user-visible storage truth.
 - Duplicate-key and full-key-table paths are typed and include the report.
 - Key eviction, if implemented, is explicit policy. Default first form does not
   evict a key silently to make room for a new key.
 - Rate decisions take `now` from `ctx.now()` or simulator-supplied time. No
   `Instant::now()` inside the policy.
 - Bounded wait returns a decision. It does not hide a queue unless the queue is
-  fixed-capacity and returns the caller/request on rejection.
-- Bounded wait uses the RequestContext / PendingCancelable patterns from the
-  current runtime. No parked caller authority without a stored token and a
+  fixed-capacity, ticketed, and returns the caller/request on rejection.
+- Bounded wait uses `SharedWork`/`RequestContext`/pending-token patterns from
+  the current runtime. No parked caller authority without a stored token and a
   fill-cancel-refill proof.
 - Retry returns a sleep duration/token. It does not resend the request.
 - Shared-budget use returns a `SharedCapacityCharge` or a typed full report.

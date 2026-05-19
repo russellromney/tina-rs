@@ -29,15 +29,23 @@ my Tina service calls another HTTP/2/gRPC service without Tokio
   is not a Tina client isolate and emits no client runtime lifecycle truth.
 - HTTP/2 frame decode/encode and HPACK helpers are private inside server
   `http2.rs`. Client work must split those into shared internal modules first.
+- `http2.rs` is one flat file today. The split is a real module-tree move,
+  not just adding sibling files.
+- HTTP/2 flow/window state is woven through `ActiveStream`,
+  `Http2Connection`, pending response bodies, request-body credit, and
+  outbound writes. Share frame/header/error code first; keep flow logic local
+  until client duplication proves the right extraction.
 - TLS has no ALPN today. `tls_connect` / `tls_accept` return only stream ids.
   This phase owns ALPN config and selected-protocol truth.
+- The TLS worker command and pending table share one cancellation flag via
+  `submit_command`. ALPN edits must preserve that exact contract.
 - Protocol facts now exist as runtime/sim facts. Client-received gRPC status
   and HTTP/2 lifecycle facts should use that path, not private counters only.
 
 ## Includes
 
-- split HTTP/2 frame/header helpers out of server-only `http2.rs` into shared
-  internal code used by server and client:
+- move HTTP/2 into a module tree and split frame/header helpers out of the
+  current server-only file into shared internal code used by server and client:
   - frame encode/decode
   - SETTINGS / PING / GOAWAY / RST_STREAM / WINDOW_UPDATE builders
   - HPACK header encode/decode helpers
@@ -94,12 +102,16 @@ Big blast radius. Keep it fenced.
 ## Implementation Shape
 
 - `tina-http` gains shared internal HTTP/2 modules before behavior changes:
+  - move today's `http2.rs` server implementation to `http2/server.rs`
+  - add `http2/mod.rs` that preserves the existing public exports
   - `http2/frame.rs`
   - `http2/headers.rs`
   - `http2/errors.rs`
 - Keep flow/window accounting in the server/client modules for this phase. Do
-  not add `http2/flow.rs`; split it later only if both sides duplicate enough
-  code after the client exists.
+  not add `http2/flow.rs`; today flow is tied to connection state, response
+  pulls, request-body credit, write queues, and protocol facts. Split it later
+  only if both sides duplicate the same small state machine after the client
+  exists.
 - Existing server tests must stay green after the split before client behavior
   lands.
 - Do not expose these frame/header modules as public API. They are internal
@@ -136,7 +148,10 @@ Big blast radius. Keep it fenced.
   - no ambient default;
   - h2 target asks for `["h2"]`;
   - h2c target never touches TLS;
-  - selected ALPN is visible in typed connect/accept output.
+  - selected ALPN is visible in typed connect/accept output;
+  - simulator TLS config/history includes offered/selected ALPN so saved cases
+    do not replay under ambient defaults;
+  - stable trace tags are appended, never renumbered.
 
 ## Proof Shape
 

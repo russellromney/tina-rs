@@ -3,11 +3,9 @@
 ## Status
 
 - Future implementation plan for Wave B.
-- Runs after Phase 116 and Phase 124. Protocol-session fairness needs real
-  HTTP/2/gRPC client/server surfaces and the second-pass HTTP/2
-  strictness/fairness fixes.
-- Can also benefit from Phase 118 admission reports and Phase 119 resource
-  reports, but must not require them if the first fairness proof is ready.
+- Runs after phases 116-120 and Phase 124. Protocol-session fairness needs real
+  HTTP/2/gRPC client/server surfaces, admission/resource reports, the
+  Wave-A copied path, and the second-pass HTTP/2 strictness/fairness fixes.
 - Can run in parallel with Phase 122 if ownership stays in scheduler
   proof/reporting, soak harnesses, and systems.
 
@@ -43,8 +41,8 @@ one hot actor/session/client should not quietly starve the rest of my service
 - remote inbound drain fairness where live multi-shard paths exist
 - bridge/pool fairness under one slow external rail and one healthy rail
 - starvation-ish lag counters where Tina can observe them honestly
-- load/soak harness that records high-water, full counts, late replies, leaks,
-  and trace fingerprints
+- extend `tina-proof-harness` load/bad-peer/live-replay helpers so they record
+  high-water, full counts, late replies, leaks, and trace fingerprints
 - CPU and memory constrained system runs
 - use existing cooperative fairness tests and hot-key specimen as the seed, but
   expand to protocol sessions and live soak
@@ -72,7 +70,7 @@ Medium blast radius, but tests can be expensive.
 
 ## Implementation Shape
 
-Add a small proof harness, not a benchmark framework:
+Extend the existing `tina-proof-harness`, not a benchmark framework:
 
 ```text
 LoadProfile
