@@ -88,9 +88,9 @@ gap and add the smallest public hook needed by a real crate.
 - split the worst long files into boring modules, with public re-exports kept
   stable:
   - `tina-runtime/src/lib.rs`
-  - `tina-runtime/src/call.rs`
+  - `tina-runtime/src/call.rs` into `tina-runtime/src/call/`
   - `tina-sim/src/lib.rs`
-  - `tina-sim/src/dst.rs`
+  - `tina-sim/src/dst.rs` into `tina-sim/src/dst/`
   - `tina/src/lib.rs`
 - add module maps at the top of split files so future agents know where to edit
 - split these large test homes only along existing test names:
@@ -151,7 +151,7 @@ Preferred first module targets:
   - move cross-shard/remote reply helpers to `tina-runtime/src/remote.rs`
   - move host call/blocking helpers to `tina-runtime/src/host_call.rs`
   - keep public `pub use` paths stable from `lib.rs`
-- `tina-runtime/src/call.rs`:
+- `tina-runtime/src/call.rs` into `tina-runtime/src/call/`:
   - move the file to `tina-runtime/src/call/mod.rs`
   - split common call types into `call/types.rs`
   - split runtime-owned rail builders into:
@@ -172,7 +172,7 @@ Preferred first module targets:
   - move trace/event projection helpers to `tina-sim/src/projection.rs`
   - keep `dst`, config, deferred, internals, and multi-shard module paths
     stable
-- `tina-sim/src/dst.rs`:
+- `tina-sim/src/dst.rs` into `tina-sim/src/dst/`:
   - move the file to `tina-sim/src/dst/mod.rs`
   - split saved replay case helpers into `dst/replay_case.rs`
   - split seed sweep helpers into `dst/sweep.rs`

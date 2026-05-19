@@ -4,6 +4,180 @@ This file records completed work.
 
 ## Unreleased
 
+### Phase 115 Core / Ecosystem Reorg
+
+Architecture cleanup before Wave A: docs draw the core-vs-batteries
+line; oversized core files split along real module boundaries.
+
+Docs and layering:
+
+- New `docs/tina-user-guide/23-core-and-batteries.md` draws the line between
+  Tina core (model crates, runtime/simulator) and official batteries
+  (`tina-http`, bridge crates, proof harness). Lists the six "official
+  battery rules" — bounded admission, typed outcomes, close/drain report,
+  pressure/capacity report, replay support or honest unsupported truth, no
+  hidden Tokio/runtime queues — and names the three prelude tiers
+  (`tina::prelude`, `tina_runtime::prelude`, battery preludes).
+- New `docs/tina-user-guide/24-battery-authoring.md` gives a twelve-item
+  authoring checklist for first- and third-party batteries plus a "known
+  hook gaps" table that names where existing first-party batteries still
+  reach past clean public hooks (HTTP/TLS rails, bridge lifecycle, body
+  streaming/source lifecycle, AWS/sqlx/reqwest/Tokio-owned worker copy,
+  per-battery replay declarations).
+- Updated `docs/README.md` and `docs/tina-user-guide/README.md` so the
+  "learn core" and "choose batteries" reading orders are now distinct.
+- Added a "Layering" stanza to the Phase 116, 117, and 118 plan outlines so
+  Wave A work uses the new core-vs-batteries language and does not invent
+  private runtime hooks inside battery code.
+
+No-behavior module splits:
+
+- `tina/src/lib.rs` (3287 → 454 lines, target <1,200 ✅) split into
+  `mod address` (address/id/generation types, `Outbound`,
+  service-shaped addresses), `mod context` (`Context`, `CallContext`,
+  `RequestCall`, `RequestContext`, defer-through traits,
+  deferred-reply slots, `CallHandle`/cancellation/`Deadline`,
+  `MessageCaller`, `CallRouting`, `DeferredSlotRegistry`),
+  `mod effect` (closed `Effect` enum and every constructor: `noop`,
+  `fact`, `reply`, `reject`, `send`, `send_to`/`send_event`,
+  `spawn`/`spawn_observed`, `stop`/`stop_with`, `restart_children`,
+  `batch`/`sequence`, `reply_to`/`reply_to_request`), and
+  `mod isolate` (`Isolate`/`CallableIsolate`,
+  `Mailbox`/`TrySendError`, `RestartPolicy`/`ChildRelation`/
+  `RestartDecision`/`RestartBudget` family, `Shard`/`SingleShard`,
+  `ChildDefinition`/`ChildRef`, `SpawnObserved` family,
+  `RestartableChildDefinition`).
+- `tina-sim/src/dst.rs` (4261 → 1180 lines in `dst/mod.rs`,
+  target <1,200 ✅) split into six submodules: `discovery`
+  (`DiscoveredConstants`, `discover_constants`), `invariants`
+  (`InvariantViolation`/`InvariantSuite` and the per-invariant check
+  functions, `contains_visible_pressure`, `assert_projection_eq`),
+  `projection` (`TraceShape`, `RuntimeEventKindName`,
+  `TraceProjection`, `TraceProjectionError`, `ProtocolReplayMismatch`,
+  `project_trace_shape`, `replay_config_hash`/`encode_*` family),
+  `replay_case` (`UnsupportedLiveFact`, `LiveReplayFact`,
+  `CapacityReplayFact`, `LiveReplayCapture`, `SavedReplayCase` and
+  on-disk format, `CapturedReplayChange`, `LiveReplayReport`,
+  `CapturedReplayMismatch`, `ReplayMismatch`,
+  `check_replay_case`/`check_captured_replay`/`observe_replay_case`),
+  `shrink` (`ShrinkConfig`, `ShrunkFailure`, `delete_shrink`,
+  `ShrinkReport`, `shrink_replay_case`), and `sweep` (`SweepFailure`,
+  `SweepSuccess`, `sweep_seeds`).
+- `tina-runtime/src/call.rs` (4656 → 2562 lines in `call/mod.rs`,
+  target <1,200 partial) converted to `call/mod.rs` with per-rail
+  submodules: `tcp` (`tcp_bind`/`accept`/`connect`/`read`/`write`/
+  close), `udp`, `tls`, `dns`, `signals`, `process`, `files`
+  (file + filesystem-path), `persistence` (snapshot/journal), plus
+  shared `types` (newtype IDs, file/process/path/persistence data
+  shapes), `time` (`sleep`, `sleep_then`, `SleepCall` plus all its
+  defer-through impls), `pending` (`CancelableCall`,
+  `PendingCancelableCall`/`Ticket`/`Set` family), `cancel`
+  (`CancelCallBuilder`, `cancel_call`, `call_cancelable`,
+  `call_with_handle`, `call_handle_call_id`), and `groups`
+  (`WorkTicket`, `CancelableWork`, `CancelableWorkSnapshot`,
+  `AdmitWorkError`). The `call/mod.rs` core still holds the
+  closely-coupled `CallInput`/`CallOutput`/`CallError` enums and the
+  `RuntimeCall`/`TypedCall` family.
+- `tina-runtime/src/lib.rs` (5231 → 641 lines ✅) — extracted four
+  submodules from the giant `impl<S, F> Runtime<S, F>` block: `mod
+  host_call` (`try_send`/`try_send_event`, `observe_*`,
+  `set_trace_retention`/`set_trace_observer`, `has_in_flight_calls`,
+  `trace`, `pressure_summary`, plus the test-only lineage / child /
+  supervisor snapshots), `mod remote` (cross-shard transport types
+  `QueuedRemoteEnvelope` / `QueuedRemoteSend` / `RemoteCallReply`
+  family plus `dispatch_local_send_with_context` /
+  `harvest_remote_*` / `complete_remote_isolate_call`), `mod
+  registration` (every `register_*` / `supervise` / `try_supervise`
+  API plus the registered-address bookkeeping and the
+  `spawn_isolate` / `record_child` /
+  `enqueue_bootstrap_message` / `enqueue_entry_message` /
+  `recv_entry_message` family), and `mod dispatch` (the biggest
+  bin: `step`, `step_with_remote`, `execute_effect` and friends,
+  `dispatch_call` / `dispatch_driver_call` /
+  `dispatch_observed_send` / `dispatch_isolate_call` /
+  `dispatch_cancel_call`, `harvest_isolate_call_timeouts`,
+  `record_cancelled_call` / `recently_cancelled_cause` /
+  `close_deferred_slot_for_call_with_reason` /
+  `complete_isolate_call` / `deliver_isolate_call_outcome`,
+  `advance_driver` / `deliver_completion`, the `stop_entry*` and
+  restart family, `push_event` / `enforce_trace_retention` /
+  `compact_trace_prefix*`, plus every `Erased*` adapter type
+  (`ErasedMailbox` / `MailboxAdapter` / `AnyMailboxAdapter`,
+  `ErasedHandler` / `HandlerAdapter` / `SendableHandlerAdapter`,
+  `ErasedSpawn` / `SpawnAdapter` / `RestartableSpawnAdapter`,
+  `ErasedSpawnObserved` / `SpawnObservedAdapter`, `ErasedEffect`,
+  `ErasedSend`, `ErasedMessage`, `RegisteredEntry`,
+  `RegisteredAddress`, `SpawnOutcome` / `SpawnObservedOutcome`,
+  `ChildRecord` / `SupervisorRecord`, `ChildRecordSnapshot` /
+  `SupervisorRecordSnapshot`, and the `erase_effect{,_sendable}`
+  helpers). Constructors (`new`, `with_betelgeuse_io_loop`,
+  `with_clock*`) and the const accessors (`shard`,
+  `trace_retention`, `trace_dropped`,
+  `cancelled_call_cause_evictions`) stay in `lib.rs`. Crate-internal
+  references continue to resolve through narrow `pub(crate) use
+  dispatch::{...}` re-exports.
+- `tina-sim/src/lib.rs` (6,787 → 1,644 lines ✅ <2,000) — extracted
+  `mod sim_impl` carrying every non-constructor method on
+  `Simulator<S>` (`register`, `register_with_mailbox_capacity`,
+  `supervise`, `try_send`, `advance_time`,
+  `advance_to_next_timer`, `step`, `step_with_remote`,
+  `run_until_quiescent[_checked]`, `replay_artifact`,
+  `durable_image` / `load_durable_image`, `observe_new_events`,
+  `execute_effect` plus reject/reply/push_event family,
+  `register_entry` / `spawn_isolate` / `record_child` /
+  `enqueue_bootstrap_message`, restart/supervise lineage handling,
+  `checked_registered_address` and the address-book lookups, the
+  full `dispatch_call` / `dispatch_backend_call` /
+  `dispatch_observed_send` / `dispatch_isolate_call` family, and
+  every TCP / UDP / TLS / file / process / persistence /
+  `TimerEntry` resource-state helper). The free `call_kind` /
+  `fault_selector` helpers and the spawn-adapter types
+  (`SpawnObservedAdapter`, `SpawnAdapter`,
+  `RestartableSpawnAdapter` plus their `ErasedSpawn` /
+  `IntoErasedSpawn` / `ErasedRestartRecipe` /
+  `IntoErasedSpawnObserved` impls) moved alongside them. The
+  Simulator struct, constructors, and immutable accessors stay in
+  `lib.rs`. Phase audit doc
+  (`.intent/phases/115-core-ecosystem-reorg/audit.md`) recorded
+  the visibility decisions.
+
+All moves are private re-exports, so the public API is unchanged.
+The Runtime/Simulator fields and the private support types (the
+full `Erased*` adapter family, the registered-address /
+spawn-outcome / child-record / supervisor-record family, the
+remote-envelope vocabulary, the resource-state structs, the
+`Pending*` and `InFlightCall` / `StoredTranslator` /
+`PendingIsolateCall` families) all became `pub(crate)` per the
+audit so the submodules can name them; nothing newly public.
+
+Deferred to a follow-on cleanup (intentionally named so they can't
+be silently dropped):
+
+- `tina-runtime/src/dispatch.rs` is ~3,250 lines and
+  `tina-sim/src/sim_impl.rs` is ~5,270 lines. Both are above the
+  comfortable per-file ceiling and are the next obvious targets for
+  a sub-bin split (the runtime audit's `mod dispatch` was one
+  conceptual bin; we kept it together so this PR stays an honest
+  move-only refactor). The sim split into `mod simulator` / `mod
+  resources` / `mod calls` follows the runtime pattern: visibility
+  audit recorded; sub-bins are mechanical method moves once a
+  reviewer wants smaller files.
+- `tina-runtime/src/call/mod.rs` (2,562 → 1,779 lines) — extracted
+  `mod io` carrying the closed-set runtime call vocabulary
+  (`CallInput`, `PersistenceTraceInfo`, `CallOutput`, `CallError`,
+  `SendOutcome`, `CallOutcome<T>` plus the `SendOutcome::from_rejected`
+  helper). The remaining `mod.rs` keeps the type-erasure machinery
+  (`RuntimeCall<M>`, `RuntimeCallKind<M>`, `RuntimeCallable`,
+  `RuntimeCallParts<M>`, `ErasedCall`, `IntoErasedCall<M>`) and the
+  typed-future family (`TypedCall<T>`, `ObservedSend<T>`,
+  `IsolateCall<T, R>`, the deferred / request variants, and the
+  builder constructors). Public API unchanged: `mod.rs` re-exports
+  via `pub use io::*;` like the other call submodules.
+- The oversized test homes (`tina-runtime/src/tests.rs`,
+  `tina-runtime/tests/local_system.rs`,
+  `tina-sim/tests/io_simulation.rs`) — splittable by test name
+  only.
+
 ### Phase 123 Adversarial Hardening
 
 - Hardened HTTP/1 keepalive response handling for chunked replies: keepalive

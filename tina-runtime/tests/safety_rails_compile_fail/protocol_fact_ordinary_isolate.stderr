@@ -32,7 +32,7 @@ error[E0308]: mismatched types
    | |_________^ expected `Infallible`, found `ProtocolFact`
    |
 note: function defined here
-  --> $WORKSPACE/tina/src/lib.rs
+  --> $WORKSPACE/tina/src/effect.rs
    |
    | pub fn fact<I>(value: I::Fact) -> Effect<I>
    |        ^^^^

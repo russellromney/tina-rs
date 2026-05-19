@@ -574,7 +574,7 @@ fn runtime_ingress_returns_typed_full_and_closed_for_spawned_child() {
 }
 
 #[test]
-fn runtime_ingress_to_unknown_isolate_reports_closed() {
+fn runtime_ingress_to_unknown_isolate_returns_closed() {
     let runtime = Runtime::new(TestShard, TestMailboxFactory);
 
     assert_eq!(
