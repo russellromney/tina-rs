@@ -532,11 +532,11 @@ where
     }
 
     #[cfg(test)]
-    fn with_clock(shard: S, mailbox_factory: F, clock: Box<dyn Clock>) -> Self {
+    pub(crate) fn with_clock(shard: S, mailbox_factory: F, clock: Box<dyn Clock>) -> Self {
         Self::with_clock_and_ids(shard, mailbox_factory, clock, IdSource::new())
     }
 
-    fn with_clock_and_ids(
+    pub(crate) fn with_clock_and_ids(
         shard: S,
         mailbox_factory: F,
         clock: Box<dyn Clock>,
@@ -551,7 +551,7 @@ where
         )
     }
 
-    fn with_clock_and_ids_and_driver(
+    pub(crate) fn with_clock_and_ids_and_driver(
         shard: S,
         mailbox_factory: F,
         clock: Box<dyn Clock>,
@@ -568,7 +568,7 @@ where
         )
     }
 
-    fn with_clock_and_ids_and_driver_and_preallocation(
+    pub(crate) fn with_clock_and_ids_and_driver_and_preallocation(
         shard: S,
         mailbox_factory: F,
         clock: Box<dyn Clock>,
@@ -617,11 +617,11 @@ where
     }
 
     #[cfg(test)]
-    fn io_pending_count(&self) -> usize {
+    pub(crate) fn io_pending_count(&self) -> usize {
         self.driver.io_pending_count()
     }
 
-    fn resource_report(&self) -> DriverResourceReport {
+    pub(crate) fn resource_report(&self) -> DriverResourceReport {
         self.driver.resource_report()
     }
 
@@ -656,12 +656,12 @@ where
     }
 
     #[cfg(test)]
-    fn trace_storage_len(&self) -> usize {
+    pub(crate) fn trace_storage_len(&self) -> usize {
         self.trace.len()
     }
 
     #[cfg(test)]
-    fn entry_count(&self) -> usize {
+    pub(crate) fn entry_count(&self) -> usize {
         self.entries.len()
     }
 
@@ -809,7 +809,7 @@ where
     /// event removes the entry; subsequent attempts hit a missing
     /// call_id and tombstone (or get dropped at the lane's
     /// `finish_completion` when the user-cancelled flag is set).
-    fn cancel_in_flight_calls_for_shutdown(
+    pub(crate) fn cancel_in_flight_calls_for_shutdown(
         &mut self,
         deadline: Instant,
     ) -> Result<(), DriverShutdownError> {
@@ -853,7 +853,7 @@ where
         driver_result
     }
 
-    fn notify_signal(&mut self, name: &str) {
+    pub(crate) fn notify_signal(&mut self, name: &str) {
         let mut completed = std::mem::take(&mut self.driver_completions);
         completed.clear();
         self.driver.notify_signal(name, &mut completed);
@@ -863,7 +863,7 @@ where
         self.driver_completions = completed;
     }
 
-    fn cancel_driver_calls_for_requester(&mut self, requester: RegisteredAddress) {
+    pub(crate) fn cancel_driver_calls_for_requester(&mut self, requester: RegisteredAddress) {
         let mut index = 0;
         while index < self.in_flight_calls.len() {
             if self.in_flight_calls[index].requester != requester {
@@ -886,7 +886,7 @@ where
         }
     }
 
-    fn remove_translator(&mut self, call_id: CallId) {
+    pub(crate) fn remove_translator(&mut self, call_id: CallId) {
         let translator_index = self
             .translators
             .iter()
@@ -1364,7 +1364,7 @@ where
         })
     }
 
-    fn step_with_remote<FR>(&mut self, route_remote: &mut FR) -> usize
+    pub(crate) fn step_with_remote<FR>(&mut self, route_remote: &mut FR) -> usize
     where
         FR: FnMut(ShardId, QueuedRemoteEnvelope) -> Result<(), SendRejectedReason>,
     {
@@ -1529,7 +1529,7 @@ where
         delivered
     }
 
-    fn build_message_caller(
+    pub(crate) fn build_message_caller(
         &self,
         call_context: Option<MessageCallContext>,
         isolate_id: IsolateId,
@@ -1572,7 +1572,7 @@ where
         ))
     }
 
-    fn promote_captures(&mut self, isolate_id: IsolateId, cause: CauseId) -> bool {
+    pub(crate) fn promote_captures(&mut self, isolate_id: IsolateId, cause: CauseId) -> bool {
         let captures = self.deferred_registry.drain_pending();
         if captures.is_empty() {
             return false;
@@ -1612,7 +1612,7 @@ where
         true
     }
 
-    fn sweep_dropped_deferred_slots(&mut self) {
+    pub(crate) fn sweep_dropped_deferred_slots(&mut self) {
         // Single pass: independent Rcs cannot cascade.
         let dropped = self.promoted_slots.sweep_dropped();
         for record in dropped {
@@ -1620,7 +1620,7 @@ where
         }
     }
 
-    fn drop_pending_deferred_captures(&mut self, cause: CauseId) -> bool {
+    pub(crate) fn drop_pending_deferred_captures(&mut self, cause: CauseId) -> bool {
         let captures = self.deferred_registry.drain_pending();
         let captured_any = !captures.is_empty();
         for capture in captures {
@@ -1642,7 +1642,7 @@ where
         captured_any
     }
 
-    fn drop_promoted_deferred_slot(
+    pub(crate) fn drop_promoted_deferred_slot(
         &mut self,
         record: deferred::DeferredSlotRecord,
         cause: Option<CauseId>,
@@ -1662,7 +1662,7 @@ where
         self.complete_isolate_call(record.call_id, dropped.into(), CallOutcome::Closed);
     }
 
-    fn execute_effect(
+    pub(crate) fn execute_effect(
         &mut self,
         index: usize,
         cause: CauseId,
@@ -1950,7 +1950,7 @@ where
         }
     }
 
-    fn reject_call_context(
+    pub(crate) fn reject_call_context(
         &mut self,
         isolate_id: IsolateId,
         cause: CauseId,
@@ -2003,7 +2003,7 @@ where
         }
     }
 
-    fn push_call_rejected_event(
+    pub(crate) fn push_call_rejected_event(
         &mut self,
         isolate_id: IsolateId,
         cause: CauseId,
@@ -2019,7 +2019,7 @@ where
         self.push_event(isolate_id, Some(cause), kind);
     }
 
-    fn execute_reply_to(
+    pub(crate) fn execute_reply_to(
         &mut self,
         isolate_id: IsolateId,
         cause: CauseId,
@@ -2139,7 +2139,7 @@ where
         }
     }
 
-    fn dispatch_call(
+    pub(crate) fn dispatch_call(
         &mut self,
         call: ErasedCall,
         requester: RegisteredAddress,
@@ -2203,7 +2203,7 @@ where
         }
     }
 
-    fn dispatch_driver_call(
+    pub(crate) fn dispatch_driver_call(
         &mut self,
         context: CallDispatchContext,
         call_kind: CallKind,
@@ -2252,7 +2252,7 @@ where
     /// Drops runtime state for a call cancelled by resource close.
     /// Translator is not run; caller's continuation does not fire.
     /// Trace records `ResourceClosed`.
-    fn cancel_in_flight_call_for_resource_close(&mut self, call_id: CallId) {
+    pub(crate) fn cancel_in_flight_call_for_resource_close(&mut self, call_id: CallId) {
         let Some(in_flight_index) = self
             .in_flight_calls
             .iter()
@@ -2281,7 +2281,7 @@ where
         );
     }
 
-    fn dispatch_observed_send(
+    pub(crate) fn dispatch_observed_send(
         &mut self,
         context: CallDispatchContext,
         send: ErasedSend,
@@ -2352,7 +2352,7 @@ where
         );
     }
 
-    fn deliver_observed_send_outcome(
+    pub(crate) fn deliver_observed_send_outcome(
         &mut self,
         call_id: CallId,
         requester: RegisteredAddress,
@@ -2427,7 +2427,7 @@ where
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn dispatch_isolate_call(
+    pub(crate) fn dispatch_isolate_call(
         &mut self,
         context: CallDispatchContext,
         send: ErasedSend,
@@ -2537,7 +2537,7 @@ where
         }
     }
 
-    fn dispatch_cancel_call(
+    pub(crate) fn dispatch_cancel_call(
         &mut self,
         context: CallDispatchContext,
         handle_shared: std::sync::Arc<tina::CallHandleShared>,
@@ -2670,7 +2670,7 @@ where
         }
     }
 
-    fn harvest_isolate_call_timeouts(&mut self, now: Instant) {
+    pub(crate) fn harvest_isolate_call_timeouts(&mut self, now: Instant) {
         while let Some(index) = self
             .pending_isolate_calls
             .iter()
@@ -2717,7 +2717,7 @@ where
     /// shared cell `Cancelled`, and closes any captured deferred slot
     /// with `CallerCancelled`. The callee may still finish; its later
     /// reply hits the same rejection path as explicit cancel.
-    fn cancel_pending_isolate_calls_for_owner(
+    pub(crate) fn cancel_pending_isolate_calls_for_owner(
         &mut self,
         owner_isolate: IsolateId,
         owner_generation: AddressGeneration,
@@ -2763,7 +2763,7 @@ where
     /// the cause that closed it. Late replies for these surface as a
     /// rejection reason that mirrors the cause, instead of the
     /// generic `NoPendingCall` / `CallerClosed`.
-    fn record_cancelled_call(&mut self, call_id: CallId, cause: tina::CancelCause) {
+    pub(crate) fn record_cancelled_call(&mut self, call_id: CallId, cause: tina::CancelCause) {
         if self.cancelled_calls.len() == CANCELLED_CALL_RING_CAPACITY {
             self.cancelled_calls.pop_front();
             self.cancelled_call_cause_evictions =
@@ -2772,13 +2772,13 @@ where
         self.cancelled_calls.push_back((call_id, cause));
     }
 
-    fn recently_cancelled_cause(&self, call_id: CallId) -> Option<tina::CancelCause> {
+    pub(crate) fn recently_cancelled_cause(&self, call_id: CallId) -> Option<tina::CancelCause> {
         self.cancelled_calls
             .iter()
             .find_map(|(id, cause)| (*id == call_id).then_some(*cause))
     }
 
-    fn close_deferred_slot_for_call_with_reason(
+    pub(crate) fn close_deferred_slot_for_call_with_reason(
         &mut self,
         call_id: CallId,
         reason: DeferredReplyRejectedReason,
@@ -2801,7 +2801,7 @@ where
         }
     }
 
-    fn complete_isolate_call(
+    pub(crate) fn complete_isolate_call(
         &mut self,
         call_id: CallId,
         cause: CauseId,
@@ -2833,7 +2833,7 @@ where
         true
     }
 
-    fn deliver_isolate_call_outcome(
+    pub(crate) fn deliver_isolate_call_outcome(
         &mut self,
         call_id: CallId,
         requester: RegisteredAddress,
@@ -2929,7 +2929,7 @@ where
         }
     }
 
-    fn advance_driver(&mut self, now: Instant) {
+    pub(crate) fn advance_driver(&mut self, now: Instant) {
         let mut completed = std::mem::take(&mut self.driver_completions);
         completed.clear();
         self.driver.advance(now, &mut completed);
@@ -2939,7 +2939,7 @@ where
         self.driver_completions = completed;
     }
 
-    fn deliver_completion(&mut self, call_id: CallId, result: CallOutput) {
+    pub(crate) fn deliver_completion(&mut self, call_id: CallId, result: CallOutput) {
         let in_flight_index = self
             .in_flight_calls
             .iter()
@@ -3099,7 +3099,7 @@ where
         }
     }
 
-    fn push_persistence_completion_events(
+    pub(crate) fn push_persistence_completion_events(
         &mut self,
         in_flight: &InFlightCall,
         result: &CallOutput,
@@ -3157,7 +3157,7 @@ where
         }
     }
 
-    fn enqueue_bootstrap_message(
+    pub(crate) fn enqueue_bootstrap_message(
         &mut self,
         child: RegisteredAddress,
         message: Box<dyn Any>,
@@ -3182,11 +3182,16 @@ where
         );
     }
 
-    fn stop_entry(&mut self, index: usize, isolate_id: IsolateId, cause: CauseId) -> EventId {
+    pub(crate) fn stop_entry(
+        &mut self,
+        index: usize,
+        isolate_id: IsolateId,
+        cause: CauseId,
+    ) -> EventId {
         self.stop_entry_full(index, isolate_id, cause, None, None)
     }
 
-    fn stop_entry_with_precollected(
+    pub(crate) fn stop_entry_with_precollected(
         &mut self,
         index: usize,
         isolate_id: IsolateId,
@@ -3196,7 +3201,7 @@ where
         self.stop_entry_full(index, isolate_id, cause, precollected, None)
     }
 
-    fn stop_entry_with_result(
+    pub(crate) fn stop_entry_with_result(
         &mut self,
         index: usize,
         isolate_id: IsolateId,
@@ -3206,7 +3211,7 @@ where
         self.stop_entry_full(index, isolate_id, cause, None, Some(result))
     }
 
-    fn stop_entry_full(
+    pub(crate) fn stop_entry_full(
         &mut self,
         index: usize,
         isolate_id: IsolateId,
@@ -3284,7 +3289,7 @@ where
         stopped
     }
 
-    fn restart_children(
+    pub(crate) fn restart_children(
         &mut self,
         parent: IsolateId,
         cause: CauseId,
@@ -3297,7 +3302,7 @@ where
         }
     }
 
-    fn supervise_panic(
+    pub(crate) fn supervise_panic(
         &mut self,
         failed_child: RegisteredAddress,
         cause: CauseId,
@@ -3382,7 +3387,7 @@ where
         }
     }
 
-    fn restart_child_record(
+    pub(crate) fn restart_child_record(
         &mut self,
         parent: IsolateId,
         child_record_index: usize,
@@ -3470,7 +3475,7 @@ where
         );
     }
 
-    fn push_event(
+    pub(crate) fn push_event(
         &mut self,
         isolate: IsolateId,
         cause: Option<CauseId>,
@@ -3505,7 +3510,7 @@ where
         id
     }
 
-    fn enforce_trace_retention(&mut self) {
+    pub(crate) fn enforce_trace_retention(&mut self) {
         match self.trace_retention {
             TraceRetention::Full => {
                 self.compact_trace_prefix();
@@ -3527,11 +3532,11 @@ where
         }
     }
 
-    fn active_trace_len(&self) -> usize {
+    pub(crate) fn active_trace_len(&self) -> usize {
         self.trace.len().saturating_sub(self.trace_start)
     }
 
-    fn compact_trace_prefix(&mut self) {
+    pub(crate) fn compact_trace_prefix(&mut self) {
         if self.trace_start == 0 {
             return;
         }
@@ -3539,7 +3544,7 @@ where
         self.trace_start = 0;
     }
 
-    fn compact_trace_prefix_if_empty_or_large(&mut self, threshold: usize) {
+    pub(crate) fn compact_trace_prefix_if_empty_or_large(&mut self, threshold: usize) {
         if self.trace_start == 0 {
             return;
         }
@@ -3548,7 +3553,7 @@ where
         }
     }
 
-    fn gc_stopped_entries(&mut self) {
+    pub(crate) fn gc_stopped_entries(&mut self) {
         let mut index = 0;
         while index < self.entries.len() {
             if self.can_gc_stopped_entry(index) {
@@ -3559,7 +3564,7 @@ where
         }
     }
 
-    fn can_gc_stopped_entry(&self, index: usize) -> bool {
+    pub(crate) fn can_gc_stopped_entry(&self, index: usize) -> bool {
         let entry = &self.entries[index];
         if !entry.stopped.get() {
             return false;
@@ -3600,7 +3605,7 @@ where
         true
     }
 
-    fn enqueue_entry_message(
+    pub(crate) fn enqueue_entry_message(
         &self,
         entry_index: usize,
         message: Box<dyn Any>,
@@ -3618,7 +3623,7 @@ where
         }
     }
 
-    fn recv_entry_message(&self, entry_index: usize) -> Option<DeliveredMessage> {
+    pub(crate) fn recv_entry_message(&self, entry_index: usize) -> Option<DeliveredMessage> {
         let message = self.entries[entry_index].mailbox.recv_boxed()?;
         let call_context = self.entries[entry_index]
             .call_contexts
@@ -3631,11 +3636,11 @@ where
         })
     }
 
-    fn dispatch_local_send(&self, send: ErasedSend) -> Result<(), SendRejectedReason> {
+    pub(crate) fn dispatch_local_send(&self, send: ErasedSend) -> Result<(), SendRejectedReason> {
         self.dispatch_local_send_with_context(send, None)
     }
 
-    fn dispatch_local_send_with_context(
+    pub(crate) fn dispatch_local_send_with_context(
         &self,
         send: ErasedSend,
         call_context: Option<MessageCallContext>,
@@ -3668,7 +3673,7 @@ where
             })
     }
 
-    fn harvest_remote_envelope(
+    pub(crate) fn harvest_remote_envelope(
         &mut self,
         queued: QueuedRemoteEnvelope,
     ) -> Option<QueuedRemoteEnvelope> {
@@ -3681,7 +3686,10 @@ where
         }
     }
 
-    fn harvest_remote_send(&mut self, queued: QueuedRemoteSend) -> Option<QueuedRemoteEnvelope> {
+    pub(crate) fn harvest_remote_send(
+        &mut self,
+        queued: QueuedRemoteSend,
+    ) -> Option<QueuedRemoteEnvelope> {
         // Cross-shard transport admission already happened on the source shard.
         // What we record here is destination-local harvest outcome, not a
         // retroactive change to the source-side send result.
@@ -3758,7 +3766,7 @@ where
         }
     }
 
-    fn harvest_remote_call_reply(&mut self, reply: RemoteCallReply) {
+    pub(crate) fn harvest_remote_call_reply(&mut self, reply: RemoteCallReply) {
         match reply.outcome {
             RemoteCallOutcome::Replied(message) => {
                 if !self.complete_isolate_call(
@@ -3798,7 +3806,7 @@ where
         }
     }
 
-    fn complete_remote_isolate_call(
+    pub(crate) fn complete_remote_isolate_call(
         &mut self,
         reply: RemoteCallReply,
         outcome: CallOutcome<Box<dyn Any>>,
@@ -3815,29 +3823,29 @@ where
         }
     }
 
-    fn entry_index(&self, address: RegisteredAddress) -> Option<usize> {
+    pub(crate) fn entry_index(&self, address: RegisteredAddress) -> Option<usize> {
         self.entries
             .iter()
             .position(|entry| entry.id == address.isolate && entry.generation == address.generation)
     }
 
-    fn entry_by_isolate(&self, isolate: IsolateId) -> Option<&RegisteredEntry<S, F>> {
+    pub(crate) fn entry_by_isolate(&self, isolate: IsolateId) -> Option<&RegisteredEntry<S, F>> {
         self.entries.iter().find(|entry| entry.id == isolate)
     }
 
-    fn child_record_index_by_child(&self, child: RegisteredAddress) -> Option<usize> {
+    pub(crate) fn child_record_index_by_child(&self, child: RegisteredAddress) -> Option<usize> {
         self.child_records
             .iter()
             .position(|record| record.child == child)
     }
 
-    fn supervisor_index(&self, parent: IsolateId) -> Option<usize> {
+    pub(crate) fn supervisor_index(&self, parent: IsolateId) -> Option<usize> {
         self.supervisors
             .iter()
             .position(|record| record.parent.isolate == parent)
     }
 
-    fn try_registered_address<M: 'static, R>(
+    pub(crate) fn try_registered_address<M: 'static, R>(
         &self,
         address: Address<M, R>,
     ) -> Option<RegisteredAddress> {
@@ -3861,7 +3869,7 @@ where
         })
     }
 
-    fn register_entry<I, Outbound>(
+    pub(crate) fn register_entry<I, Outbound>(
         &mut self,
         isolate: I,
         parent: Option<IsolateId>,
@@ -3902,7 +3910,7 @@ where
         }
     }
 
-    fn register_sendable_with_capacity<I, Outbound>(
+    pub(crate) fn register_sendable_with_capacity<I, Outbound>(
         &mut self,
         isolate: I,
         mailbox_capacity: usize,
@@ -3970,7 +3978,7 @@ where
         ))
     }
 
-    fn register_sendable_entry<I, Outbound>(
+    pub(crate) fn register_sendable_entry<I, Outbound>(
         &mut self,
         isolate: I,
         parent: Option<IsolateId>,
@@ -4011,7 +4019,7 @@ where
         }
     }
 
-    fn spawn_isolate<I, Outbound>(
+    pub(crate) fn spawn_isolate<I, Outbound>(
         &mut self,
         parent: IsolateId,
         isolate: I,
@@ -4050,7 +4058,7 @@ where
         }
     }
 
-    fn record_child(&mut self, parent: IsolateId, outcome: SpawnOutcome<S, F>) {
+    pub(crate) fn record_child(&mut self, parent: IsolateId, outcome: SpawnOutcome<S, F>) {
         let child_ordinal = self
             .child_records
             .iter()
