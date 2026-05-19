@@ -2622,7 +2622,7 @@ fn local_system_process_run_captures_truncates_and_times_out() {
                 .lock()
                 .expect("process observed lock")
                 .iter()
-                .any(|entry| entry == "exit:Some(0)::false")
+                .any(|entry| entry == "exit:Some(0)::true")
         },
         || {
             format!(

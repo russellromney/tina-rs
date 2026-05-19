@@ -359,16 +359,18 @@ fn process_exited(
     stderr: Option<JoinHandle<(Vec<u8>, bool)>>,
     process_group: u32,
 ) -> CallOutput {
-    #[cfg(unix)]
-    {
-        // The process we spawned has exited, but descendants may still
-        // hold stdout/stderr pipes open. `process_run` owns the whole
-        // process group; do not let a background grandchild keep the
-        // drain threads alive or escape the runtime rail.
-        let _ = kill_process_group(process_group);
-    }
     let (stdout, stdout_truncated) = join_drain_bounded(stdout, PROCESS_DRAIN_JOIN_TIMEOUT);
     let (stderr, stderr_truncated) = join_drain_bounded(stderr, PROCESS_DRAIN_JOIN_TIMEOUT);
+    #[cfg(unix)]
+    {
+        if stdout_truncated || stderr_truncated {
+            // The process we spawned has exited, but descendants may still
+            // hold stdout/stderr pipes open. `process_run` owns the whole
+            // process group; do not let a background grandchild escape the
+            // runtime rail after the bounded drain budget is spent.
+            let _ = kill_process_group(process_group);
+        }
+    }
     CallOutput::ProcessExited {
         status: ProcessStatus {
             code: status.code(),
