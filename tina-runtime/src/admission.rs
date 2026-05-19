@@ -35,13 +35,6 @@ use tina::capacity::{CapacityMode, CapacitySurfaceReport};
 
 use crate::local_permit::{LocalPermitGate, LocalPermitName, Permit};
 
-/// Surface name attached to an admission policy.
-///
-/// Static lifetime so reports are cheap to copy and discovery lines do not
-/// allocate.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct AdmissionName(pub &'static str);
-
 /// What the caller wants to happen when the policy is full.
 ///
 /// This is configuration, not runtime behavior. Each policy maps the
@@ -196,6 +189,13 @@ impl<T> AdmissionDecision<T> {
     }
 
     /// Take the carried admission proof or convert into an [`AdmissionFailure`].
+    ///
+    /// `AdmissionFailure` carries a full `AdmissionReport` (including a
+    /// cloned [`CapacityMode`]), so the `Err` arm is comparable in size to
+    /// the original decision. Callers in hot paths can avoid the move by
+    /// `match`-ing on the decision directly; `into_admitted` is provided
+    /// for `?`-style flows where ergonomics beats stack layout.
+    #[allow(clippy::result_large_err)]
     pub fn into_admitted(self) -> Result<T, AdmissionFailure> {
         match self {
             Self::Admitted(t) => Ok(t),
@@ -299,6 +299,11 @@ pub struct ConcurrencyLimit {
     degrade_count: u64,
     wait_count: u64,
     timed_out_count: u64,
+    /// Count of `AdmissionDecision::Full(_)` decisions returned. Distinct
+    /// from `gate.full_count`, which counts every cap-reached try_admit
+    /// regardless of the action (under `PressureAction::Degrade`/`Close`/
+    /// `Wait` those events do not surface as `Full`).
+    full_decision_count: u64,
 }
 
 impl ConcurrencyLimit {
@@ -315,6 +320,7 @@ impl ConcurrencyLimit {
             degrade_count: 0,
             wait_count: 0,
             timed_out_count: 0,
+            full_decision_count: 0,
         }
     }
 
@@ -346,7 +352,10 @@ impl ConcurrencyLimit {
         match self.gate.try_admit() {
             Ok(permit) => AdmissionDecision::Admitted(permit),
             Err(_) => match self.action {
-                PressureAction::Shed => AdmissionDecision::Full(self.report()),
+                PressureAction::Shed => {
+                    self.full_decision_count = self.full_decision_count.saturating_add(1);
+                    AdmissionDecision::Full(self.report())
+                }
                 PressureAction::Degrade => {
                     self.degrade_count = self.degrade_count.saturating_add(1);
                     AdmissionDecision::Degrade {
@@ -392,6 +401,12 @@ impl ConcurrencyLimit {
     }
 
     /// Build the current report.
+    ///
+    /// `full_count` is the count of `AdmissionDecision::Full(_)` returns —
+    /// not the underlying gate's cap-reached count. Under non-`Shed`
+    /// actions, gate-full events surface as `Degrade`/`Closed`/`Wait`
+    /// and are recorded under those counters instead, so the capacity-
+    /// surface projection does not double-count.
     pub fn report(&self) -> AdmissionReport {
         let snap = self.gate.report();
         AdmissionReport {
@@ -400,13 +415,21 @@ impl ConcurrencyLimit {
             capacity: snap.capacity,
             current: snap.current,
             high_water: snap.high_water,
-            full_count: snap.full_count,
+            full_count: self.full_decision_count,
             rate_limited_count: 0,
             wait_count: self.wait_count,
             degrade_count: self.degrade_count,
             closed_count: self.closed_count,
             timed_out_count: self.timed_out_count,
         }
+    }
+
+    /// Underlying gate-cap-reached count. Distinct from
+    /// [`AdmissionReport::full_count`], which only counts decisions that
+    /// surfaced as `Full(...)`. Use this for "how often was the local
+    /// concurrency cap saturated" telemetry.
+    pub fn gate_full_count(&self) -> u64 {
+        self.gate.report().full_count
     }
 
     /// Capacity surface projection.
@@ -693,6 +716,14 @@ pub struct KeyedSlotReport {
 }
 
 /// Move-only proof that one keyed admission succeeded.
+///
+/// **Permits are not tagged with the gate that issued them.** A `KeyedPermit`
+/// from limit A released against limit B can decrement B's counters if B
+/// happens to have a slot with matching `(slot_idx, generation)`. The
+/// type system cannot distinguish two `KeyedLimit<K>` instances over the
+/// same `K`. Treat permits like file descriptors: only release them on
+/// the limit that issued them. The same caveat applies to
+/// [`Permit`](crate::Permit) and [`LocalPermitGate`](crate::LocalPermitGate).
 #[must_use = "a KeyedPermit must be released or retired; do not drop it silently"]
 #[derive(Debug)]
 pub struct KeyedPermit<K> {
@@ -1371,6 +1402,79 @@ mod tests {
         }
         let report = failure.report();
         assert_eq!(report.full_count, 1);
+    }
+
+    #[test]
+    fn non_shed_actions_do_not_double_count_in_capacity_surface() {
+        // Regression: under PressureAction::Degrade the underlying gate
+        // increments its cap-reached counter on every refused try_admit.
+        // If the AdmissionReport surfaced that gate count as `full_count`,
+        // the capacity-surface projection would sum it with `degrade_count`
+        // and double-count each event. The fix is to count only decisions
+        // that returned `Full(_)` toward `full_count`; the gate's view is
+        // exposed separately as `gate_full_count()`.
+        let mut limit = ConcurrencyLimit::with_capacity("conc.no_double_count", 1)
+            .on_pressure(PressureAction::Degrade);
+        let _held = limit.try_admit().into_admitted().unwrap();
+        // Three Degrade rejections.
+        for _ in 0..3 {
+            match limit.try_admit() {
+                AdmissionDecision::Degrade { .. } => {}
+                other => panic!("expected Degrade, got {other:?}"),
+            }
+        }
+        let report = limit.report();
+        // The decision-level full_count must be 0 — every rejection was
+        // a Degrade.
+        assert_eq!(
+            report.full_count, 0,
+            "Degrade actions must not register as Full decisions: {report:?}"
+        );
+        assert_eq!(report.degrade_count, 3);
+        // Underlying gate still tracks cap-reached separately.
+        assert_eq!(limit.gate_full_count(), 3);
+        // Capacity-surface projection sums rejection categories — degrade
+        // counts once each, not twice.
+        let surface = limit.capacity_surface();
+        assert_eq!(
+            surface.full_count, 3,
+            "projection must count 3 rejections, not 6: {surface:?}"
+        );
+
+        // Same regression test for Close.
+        let mut closing = ConcurrencyLimit::with_capacity("conc.close_no_dup", 1)
+            .on_pressure(PressureAction::Close);
+        let _h = closing.try_admit().into_admitted().unwrap();
+        let _ = closing.try_admit();
+        let _ = closing.try_admit();
+        let report = closing.report();
+        assert_eq!(report.full_count, 0);
+        assert_eq!(report.closed_count, 2);
+        assert_eq!(closing.capacity_surface().full_count, 2);
+
+        // Wait too.
+        let mut waiting = ConcurrencyLimit::with_capacity("conc.wait_no_dup", 1)
+            .on_pressure(PressureAction::Wait)
+            .wait_hint(Duration::from_millis(1));
+        let _h = waiting.try_admit().into_admitted().unwrap();
+        let _ = waiting.try_admit();
+        let _ = waiting.try_admit();
+        let report = waiting.report();
+        assert_eq!(report.full_count, 0);
+        assert_eq!(report.wait_count, 2);
+        assert_eq!(waiting.capacity_surface().full_count, 2);
+    }
+
+    #[test]
+    fn shed_full_count_matches_returned_decisions() {
+        let mut limit = ConcurrencyLimit::with_capacity("conc.shed_count", 1);
+        let _h = limit.try_admit().into_admitted().unwrap();
+        let _ = limit.try_admit();
+        let _ = limit.try_admit();
+        let report = limit.report();
+        assert_eq!(report.full_count, 2, "Shed should count returned Fulls");
+        assert_eq!(limit.gate_full_count(), 2, "gate matches under Shed");
+        assert_eq!(limit.capacity_surface().full_count, 2);
     }
 
     #[test]
