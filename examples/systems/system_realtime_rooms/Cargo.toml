@@ -16,3 +16,6 @@ tina-http = { path = "../../../tina-http" }
 tina-runtime = { path = "../../../tina-runtime" }
 # Used by the in-crate run scenarios as a real WebSocket smoke client.
 tungstenite = "0.29"
+
+[dev-dependencies]
+tina-proof-harness = { path = "../../../tina-proof-harness" }

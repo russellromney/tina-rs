@@ -4,6 +4,400 @@ This file records completed work.
 
 ## Unreleased
 
+### Phase 112 Protocol Facts To Replay
+
+- New replayable fact effect. `Effect::Fact(I::Fact)` rides handler turns
+  the same way other effects do; the runtime and simulator translate it
+  into `RuntimeEventKind::FactObserved { fact: RuntimeFact }`. Stable
+  effect-kind tag `13`; stable runtime-event tag `36`. Existing tags
+  are unchanged.
+- `tina::Isolate::Fact` associated type. Ordinary isolates default to
+  `Fact = Infallible` (macros and `isolate_types!` set it automatically)
+  and pay nothing. Protocol isolates opt in with `fact = ProtocolFact`
+  in the `#[tina_runtime::isolate]` / `isolate_types!` form.
+- `tina_runtime::RuntimeFact` carries the canonical replay shape with
+  one family today (`Protocol(ProtocolFact)`) and a stable family tag
+  `1`. The `IntoRuntimeFact` trait is the registration boundary: an
+  isolate whose `Fact` type does not implement it will not register.
+- `tina_runtime::ProtocolFact` vocabulary: `Http2StreamOpened`,
+  `Http2StreamClosed`, `Http2StreamReset`, `Http2FlowControlFull`,
+  `HttpBodyHighWater`, `WebSocketSlowPeerClosed`,
+  `WebSocketSessionClosed`, `GrpcFinalStatusSent`. Each variant carries
+  typed connection / stream / session / direction / reason fields and
+  no stringly-typed substitutes.
+- Real emission points in `tina-http`:
+  - HTTP/2 connection isolate emits stream-open/close/reset and
+    flow-control facts at the point each protocol fact becomes true
+    (header dispatch, RST_STREAM, body-cap and flow-control rejects);
+  - HTTP/1 connection isolate emits slow-peer and session-close facts
+    on the WebSocket lane;
+  - the native gRPC trailer send emits `GrpcFinalStatusSent` and a
+    paired `Http2StreamClosed`.
+  Blocking host helpers (`grpc_unary_call_h2c_blocking`) intentionally
+  do not emit replay facts; the docs say so explicitly.
+- Simulator parity. `Effect::Fact` executes identically in
+  `tina_sim::Simulator`, so saved DST cases observe the same facts as
+  the live runtime in the same order. A typed
+  `ProtocolReplayMismatch::UnsupportedProtocolFact` arm names live-only
+  physics gaps without faking a pass.
+- Projection presets. `TraceProjection::protocol_facts()`,
+  `http2_streams()`, `websocket_sessions()`, and `grpc_status()`
+  produce fail-closed projections (every other event kind is named
+  `ignored`, and an unknown kind still errors). One saved replay proof
+  is locked in via `tina-sim/tests/protocol_fact.rs`.
+- Compile-time rails. Three new `trybuild` fixtures pin that wrong
+  fact wiring fails to compile: an ordinary isolate emitting a
+  `ProtocolFact`, a protocol isolate emitting the wrong fact enum, and
+  an isolate whose `Fact` type lacks `IntoRuntimeFact`.
+
+### Phase 110 Workflow Pending Ergonomics
+
+- `tina_runtime::sleep(d)` now returns a `SleepCall` wrapper. It forwards
+  `.then(...)` and `.then_with_request(...)` unchanged and adds
+  `.then_event(|| Msg::Wake)` so the user enum no longer needs a
+  `SleepReply`-shaped field for plain "wake me later" timers.
+  `then_event` is sleep-only: a non-timer `TypedCall<()>` (TCP close,
+  file ops, etc.) must keep using `.then(...)` so its error path stays
+  visible. A compile-fail doctest pins that rule.
+- `PendingReplies::park_request(key, RequestCall<'_, I>)` and
+  `PendingReplies::park_call(key, CallContext<'_, I>)` replace the copied
+  `try_insert(qid, call.into_request_context().into_deferred())`
+  ceremony. Admission is checked before caller authority is consumed, so
+  `Full` / `DuplicateKey` (and for `park_call`, `NoCaller` /
+  `CrossShardUnsupported`) return the original caller unchanged. Success
+  returns a `ParkTicket<K>` whose private slot/generation identity makes
+  forged tickets a compile error and stale-key ABA a runtime error.
+- `RequestCall::try_capture` and `CallContext::try_into_request_context`
+  added so park helpers can hand caller authority back without a panic.
+- `GuardedPendingReplies<K, R, G>` is the new sibling type that pairs a
+  parked caller with one RAII `G` guard. It removes the `PendingReplies +
+  HashMap<K, Guard>` sidecar pattern and proves the guard is dropped
+  exactly once on normal reply, drain, caller-gone sweep, and failed
+  admission.
+- `WaitList<K, R>` is the new many-callers-per-key parking lot in
+  `tina_runtime::wait_list`. Hard global cap, optional per-key cap, FIFO
+  per key, ticketed `reply_one`, and `reply_all_clone` /
+  `reply_all_with` / `close_all_clone` / `close_all_with` /
+  `drain_all_with` for multi-waiter replies.
+- `CancelableWork<K, Q, R>` in `tina_runtime::call` is the natural-key
+  bounded store for `PendingCancelableCall` tokens. Unlike
+  `PendingCancelableCallSet`, multiple live entries may share one key.
+  Admission returns a `WorkTicket<K>` so a stale completion against a
+  reused slot cannot remove a newer entry.
+- Every new helper exposes the same capacity surface
+  (`capacity / len / high_water / full_rejects / capacity_report`) and
+  takes `.named("service.helper")` so dashboards stay grep-friendly.
+- System migrations: `ergonomics_playground`, `system_cache_with_fill`,
+  `system_api_gateway_limits` (deletes its `HashMap<qid, SharedLease>`
+  sidecar), and `system_soak_http_db` (deletes both HTTP and DB
+  sidecars) now use the new helpers. Their existing smoke tests still
+  pass.
+
+### Phase 109 Typed Config And Protocol-State Safety
+
+- Added the first split event/request service rail. The
+  `#[tina::isolate]` / `#[tina_runtime::isolate]` macros now accept
+  `event = Event, request = Request, reply = Reply` and generate an isolate
+  whose mailbox envelope is `tina::ServiceMessage<Event, Request>`.
+  `handle_event` receives fire-and-forget mailbox facts; `handle_request`
+  receives caller authority through `RequestCall` and returns
+  `RequestEffect`, so ordinary `noop()` no longer type-checks on the copied
+  request path.
+- Added capability handles for the split surface:
+  `tina::ServiceEventAddress<Event, Request>`,
+  `tina::ServiceRequestAddress<Event, Request, Reply>`, and
+  `tina_runtime::SplitServiceHandle<Event, Request, Reply>`, returned by
+  `Runtime::register_split_service` and
+  `ThreadedRuntime::register_split_service`.
+- Added `tina::send_event(...)` and `tina_runtime::call_request(...)`.
+  The copied path now rejects the two common lane mistakes at compile time:
+  requests cannot be sent as events, and events cannot be called as requests.
+- Added host/runtime companions:
+  `Runtime::try_send_event`, `ThreadedRuntime::try_send_event`,
+  `ThreadedRuntime::send_event_and_observe`,
+  `ThreadedRuntime::send_event_observed_until`, and
+  `ThreadedRuntime::call_blocking_request`, so threaded tests and setup code
+  do not need to unwrap split handles into raw `ServiceMessage` addresses.
+- Changed split-service raw request-on-event handling from silent `Noop` to a
+  visible `Reject(UnsupportedMessage)` effect. The request handler is still
+  not run; the trace now records the wrong-lane escape hatch.
+- Added positive runtime/threaded proof in `tina-runtime/tests/safety_rails.rs`
+  and trybuild diagnostics for split-lane mistakes, invalid split macro
+  options, missing split handlers, private internal events, and a split request
+  handler that ignores/fakes caller authority (`noop`, `let _`, `drop`,
+  partial branch, double consume, forged `RequestEffect`).
+- Migrated `examples/systems/system_cache_with_fill` to split public requests
+  plus private internal fill events and `call_blocking_request`.
+- Migrated `examples/systems/system_lock_manager` to split public requests plus
+  private internal lease-expiry events and `call_blocking_request`.
+- Confirmed `examples/systems/system_job_queue` as the cancelable deferred
+  admission proof: `defer_cancelable(...).try_admit(...)` only returns the
+  child effect after `PendingCancelableCallSet` accepts the token.
+- Documented the split event/request copied path in
+  `docs/tina-user-guide/04-request-reply.md`.
+
+### Phase 108 Proof Harnesses And Replay Ops
+
+- Added the `tina-proof-harness` crate with reusable load/soak,
+  bad-peer, and live-replay helper modules. The harness reports typed
+  pressure/failure facts instead of forcing tests to scrape logs.
+- Added `examples/systems/mini_saas_api/tests/soak.rs` and wired the
+  Mini SaaS system through the load/soak harness with capacity and
+  lifecycle summaries.
+- Added `examples/systems/system_realtime_rooms/tests/bad_peer.rs` so
+  the WebSocket/realtime-room path proves a real bad-peer/slow-peer
+  close shape through the shared harness.
+- Added `examples/systems/system_live_replay_bugbox`, a small system
+  that demonstrates the live-capture -> saved replay -> simulator
+  workflow and records the expected user-facing command/output shape.
+- Added Makefile proof targets for the fast/slow harness split so
+  cheap model sessions and humans can run the same smoke/soak/replay
+  commands without inventing private drivers.
+
+### Phase 107 Observability And Capacity Product
+
+- Added `tina_runtime::service_pressure` and `ServicePressureReport`
+  shapes for copied service-level pressure summaries, including
+  measured and explicitly unavailable surfaces.
+- Added `SharedCapacityScope` for shard-local user-defined weighted
+  budgets. Reports expose current/high-water/full/released counts and
+  owner-stop release behavior; weights remain user-defined and honest
+  rather than pretending to be memory accounting.
+- Added `BoundedEventSink`, a capped log/metric/event sink with drop
+  policy, high-water, dropped counts, and drain snapshots, so
+  observability does not become a hidden unbounded queue.
+- Expanded capacity assertion/discovery helpers in `tina-runtime` and
+  updated `mini_saas_api` to emit/assert compact topology and capacity
+  summaries.
+- Added `examples/systems/system_api_gateway_limits` and
+  `examples/systems/system_soak_http_db` as user-shaped proofs for
+  shared weighted capacity and CI-friendly pressure discovery lines.
+- Recorded the simulator honesty boundary: the new out-of-trace live
+  surfaces report `Unavailable` in simulator paths until a future
+  adapter carries those facts into replay.
+
+### Phase 105 Request-Scoped Cancellation
+
+- Added `tina_runtime::scope` with `RequestScopeId`, bounded request
+  scope storage, scoped call handles, and typed scope cancellation
+  reports.
+- Wired request-scope cancellation through Tina-owned waits so a
+  request can cancel child calls/timers/rails it owns, reclaim bounded
+  storage, and keep late completions visible instead of mysterious.
+- Kept the external-work boundary honest: bridges may stop waiting and
+  reclaim caller capacity, but Tina does not claim a database/AWS/HTTP
+  SDK operation stopped unless the bridge can prove that terminal fact.
+- Added runtime and simulator tests for scope admission, fill/cancel/refill,
+  owner-stop cleanup, late completion truth, and admission-failure paths.
+- Added `examples/specimen_request_scope_fanout`, showing one request
+  fanning cancellation through multiple child operations with typed
+  results and visible cleanup.
+- Updated request/reply and lifecycle/shutdown docs with the request-scope
+  cancellation model and its "cancel wait vs cancel external work" boundary.
+
+### Phase 104 Production Client / Bridge Breadth
+
+- Extended `tina-aws-bridge` beyond the S3 first form with DynamoDB,
+  SNS, Secrets Manager, and broader SQS surfaces, each with typed
+  request/response/error shapes, explicit caps, timeouts, metrics, and
+  operation/service tracing fields.
+- Added AWS classifiers for success/transient/fatal/caller-timeout style
+  outcomes without hiding retry/idempotency policy inside the bridge.
+- Added hermetic bridge tests and request-shape examples for DynamoDB,
+  SNS, Secrets Manager, and SQS so copied use does not require a real AWS
+  account.
+- Tightened supplied-client/bridge ownership docs and bridge convention
+  language around timeout ownership, close behavior, worker-terminal
+  metrics, and caller-observed late-result truth.
+- Added `examples/systems/system_webhook_relay` as a production-shaped
+  bridge consumer with retry/dead-letter-style policy and typed capacity
+  facts.
+- Updated `system_bounded_object_lane` to record the real bridge-backed
+  object-lane lessons while keeping default tests hermetic.
+
+### Phase 103 Protocol Parity Finish
+
+- Audited the native HTTP/2, gRPC, and WebSocket stacks for the
+  "Tina replaces the protocol, not the runtime" claim and aligned the docs
+  with what `tina-http` actually proves today.
+- HTTP/2: confirmed typed `Http2ProtocolError` covers bad preface, oversized
+  frame/headers/body, malformed pseudo-headers, flow-control, window
+  overflow, bad stream id, unsupported frames, and request trailers, plus
+  `Http2Outcome` (marked `#[non_exhaustive]`) names the six lifecycle
+  categories the plan called out: `Replied`, `Full`, `Closed`,
+  `FlowControlBlocked`, `Timeout`, `ProtocolError(Http2ProtocolError)`,
+  `StreamReset(u32)` (peer-initiated), and `LocalCancel(u32)` (locally
+  initiated). `Http2ConnectionReport` carries the per-connection counters
+  for opened/closed/reset streams, connection/stream full, flow-control
+  blocked, GOAWAY sent, and late replies after close.
+- HTTP/2 live tests now also assert the wire error code on every GOAWAY
+  and on each RST_STREAM the server emits: oversized frame ->
+  FRAME_SIZE_ERROR, oversized header block -> PROTOCOL_ERROR, inbound
+  flow-control violation -> FLOW_CONTROL_ERROR, stream cap exceeded ->
+  ENHANCE_YOUR_CALM, refused-after-peer-GOAWAY -> REFUSED_STREAM. Unit
+  tests pin the typed-error -> wire-code mapping and the Http2Outcome
+  vocabulary so future drift breaks compile or assertion, not silently.
+- gRPC: `GrpcRouter` ships unary, server-streaming, client-streaming, and
+  bidirectional streaming routes with typed `GrpcStatus` trailers, declared
+  message caps, deadline-to-`DeadlineExceeded` mapping, content-type
+  rejection, identity-encoding-only handling, and h2c tonic interop. Live
+  tests cover the full peer-reset cancellation path through both response
+  source and accepted service call sides, malformed frame final status,
+  declared message cap rejection, and concurrent gRPC streaming modes
+  sharing one HTTP/2 connection without cross-talk.
+- WebSocket: extracted `tina_http::WebSocketMemberTable` with `admit`,
+  `broadcast_text`/`broadcast_binary`, `fanout`, `shutdown_close`,
+  `remove_peer`, and `record_send_outcome`, plus the typed
+  `AdmitOutcome::{Admitted, AlreadyMember, Full}` and
+  `SendOutcomeAction::{Ok, RemovedSlow, RemovedClosed, RemovedProtocol,
+  RemovedTimeout, Stale}` enums. Counters live on
+  `WebSocketMemberTableReport`. The table preserves explicit admission,
+  fanout pressure, slow-peer eviction, and close reports; idle eviction,
+  the recurring liveness tick, and shutdown sequencing remain in the room
+  isolate that owns the table.
+- Migrated `examples/systems/system_realtime_rooms` to the new helper. The
+  smoke and bad-peer proofs still pass; the room's typed counters
+  (joined, left_idle/peer/slow/shutdown, presence ticks, shutdown_close_*)
+  now mirror the table's bookkeeping rather than reaching into a private
+  `BTreeMap`.
+- Documented the WebSocket helper in `tina-http`'s module docs, in
+  `examples/specimen_websocket_room/README.md`, and in
+  `examples/systems/system_realtime_rooms/README.md`.
+- ROADMAP "Native service protocols" row now names the typed HTTP/2 errors,
+  the four gRPC modes, the WebSocket browser proof, and the WebSocket
+  member-table helper, and lists what stays future work (native HTTP/2
+  client, HTTP/2 TLS ALPN/mTLS, gRPC reflection/interceptors/load
+  balancing, native broad WebSocket client, `permessage-deflate`,
+  web-framework ergonomics, and full WebSocket-bytes simulator replay).
+- **Deferred from this phase, named follow-up.** Rock 5 ("Simulator
+  Facts") did not ship. The protocol facts the plan named — stream
+  opened/closed/reset, flow-control full, body high-water, WebSocket
+  slow-peer close, and server-side gRPC final status sent — surface as
+  bounded counters on `Http2ConnectionReport`, `BodyMetrics`,
+  `WebSocketMemberTableReport`, and typed `GrpcStatus` trailers, not as
+  `RuntimeEventKind` variants on the trace stream. The blocking
+  `grpc_unary_call_h2c_blocking` helper observes received trailers, but it
+  is not a Tina client service and does not emit replayable runtime facts.
+  Protocol facts do not round-trip through `tina-sim` replay yet, which
+  means a protocol bug cannot be replayed from a trace today.
+- **Deferred from this phase, named follow-up.** The plan's Required
+  Proof line "At least one DST replay case for a protocol
+  pressure/lifecycle bug" is satisfied by pre-existing
+  `tina-http/tests/dst_simulator.rs` cases
+  (`slow_body_multichunk_inbound_replays_deterministically`,
+  `service_full_with_concurrent_peers_replays_deterministically`,
+  `shutdown_mid_request_replays_deterministically`), so the phase 103
+  minimum is met; no new DST replay case was added in this phase. A
+  protocol-fact-driven DST replay rides with the Rock 5 follow-up.
+- Both deferrals are tracked in `ROADMAP.md` under "Protocol facts as
+  runtime/simulator trace events" and in
+  `.intent/phases/103-protocol-parity-finish/plan.md` under "Deferred
+  to follow-up". Phase 103 is marked shipped on the strength of Rocks
+  1–4 (protocol parity, helper extraction, client-side parity docs)
+  and the pre-existing DST coverage; Rock 5 is not silently dropped.
+
+### Phase 106 Lifecycle, Health, And Topology
+
+- Added `tina_runtime::lifecycle` with typed service lifecycle vocabulary:
+  `Lifecycle` (Starting / Ready / Degraded / Draining / NotReady / Stopped),
+  `ReadinessReason` with stable wire tokens via `as_token()` (Starting,
+  IngressStopped, DependencyClosed/Full/Timeout/Error("dep"), Custom),
+  `Readiness` with `legacy_body()` for the `ready\n` /
+  `not_ready reasons=<csv>\n` wire format, and `Health` pairing the typed
+  state with an optional `ServicePressureReport` snapshot.
+- Added `ServiceTopology` and `TopologyComponent` so services answer "what
+  is running" with one greppable report naming isolates, bridges, pools,
+  listeners, addresses, the shard label, and the current lifecycle state,
+  backed by the existing `ServicePressureReport` for bounded-surface
+  capacity facts. No global registry; each service constructs and threads
+  the report explicitly.
+- Added `ShutdownChoreography` plus typed step / outcome / close vocabulary
+  (`ShutdownStep`, `ShutdownStepReport`, `StepOutcome`,
+  `ServiceShutdownReport`, `ResourceCloseReport`, `ResourceKind`,
+  `CloseAdmission`, `CloseOutcome`). The helper records ordered shutdown
+  steps with elapsed and outcome; recordings whose ordinal precedes the
+  highest already-recorded step become `StepOutcome::OrderingViolation`
+  so bad sequences are visible, not hidden. `record_close` folds typed
+  resource-specific reports (keepalive pool, bridge, listener) into the
+  same step kind while preserving the resource details.
+- Refreshed `examples/systems/mini_saas_api` into the canonical lifecycle
+  skeleton: replaced the stringly-typed `ready_reasons(&[...])` helper
+  with `Readiness` + `ReadinessReason` (wire body unchanged), added a
+  typed `ServiceTopology` to `RunReport::topology` naming the main
+  listener, notify listener, controller isolate, SQLite bridge, and
+  outbound keepalive pool, wrapped the host shutdown sequence in a
+  `ShutdownChoreography` recording every step
+  (`StopIngress` → `DrainInFlight` → 4 × `CloseResource` → `StopOwner`)
+  with per-resource close reports, and exposed the typed report on
+  `RunReport::shutdown_report` and `RunReport::health_pre_shutdown`.
+  Smoke tests assert against the typed surfaces in addition to the
+  legacy wire strings.
+- Updated `examples/systems/system_metrics_shipper` as the worked
+  non-HTTP proof: the host shutdown drives `ShutdownChoreography` with
+  `DrainInFlight` (the shipper's `Stop` handshake) → `CloseResource
+  sink.isolate` → `StopOwner` (runtime shutdown), populates a typed
+  `ServiceTopology` (shipper / sink / flush_tick), and emits a typed
+  `Health` in `Lifecycle::Stopped`. Added `lifecycle_for_drain_stage`
+  mapping `DrainStage::{Open,Draining,Stopped}` to
+  `Lifecycle::{Ready,Draining,Stopped}` so a service-owned drain
+  handshake reports state in the same vocabulary as a host-driven
+  service. The smoke test pattern-matches on the typed report.
+- Added DST-style ordering proofs in `tina_runtime::lifecycle::tests`:
+  every backwards step pair produces a typed
+  `StepOutcome::OrderingViolation`, and identical step sequences produce
+  byte-identical `ServiceShutdownReport::summary_line` and
+  `discovery_lines` across runs.
+- Signal-driven shutdown composes through the new helper. Added
+  `tina-runtime/tests/lifecycle_signal_driven_shutdown.rs` proving the
+  pattern end-to-end: a spawned "signal handler" thread fires
+  `ThreadedShutdownHandle::request_shutdown` and the main thread wraps
+  the cross-thread teardown in `ShutdownChoreography` producing a clean
+  typed report. A second test proves a late "signal" landing after
+  `StopOwner` is recorded as a typed `OrderingViolation` rather than
+  starting a second shutdown.
+
+Hostile-review fixes:
+
+- Bug: `Readiness::not_ready` / `Readiness::degraded` with an empty
+  reasons list could emit the ambiguous `not_ready reasons=` body in
+  release mode (the previous `debug_assert!` did not fire). Added a
+  public `READINESS_UNKNOWN_REASON` (`Custom("unknown")`) constant and
+  routed both constructors through an `ensure_some_reason` fold so the
+  wire body is always parseable. Tightened `Readiness::legacy_body` so
+  the HTTP shape keys off `self.ready` alone: a degraded service still
+  answers `ready\n` so existing clients keep sending traffic while the
+  typed report carries the degradation detail.
+- Proof: added a typed
+  `Vec<Lifecycle>` `lifecycle_transitions` field on both
+  `mini_saas_api::RunReport` and `system_metrics_shipper::ShutdownReport`
+  and assert the canonical
+  `[Starting, Ready, Draining, Stopped]` sequence. Closes the plan's
+  "service starts NotReady, becomes Ready, enters Draining, then
+  Stopped" required proof which was only implied across separate fields.
+- Proof: added `stuck_child_close_produces_typed_timeout_in_terminal_report`
+  covering the plan's "shutdown with stuck child returns a timeout
+  report" requirement at the full-sequence level (clean step + stuck
+  step + remaining clean steps; asserts `clean=false`, exactly one
+  `Timeout`, retained close report, summary line, discovery lines).
+  Added four `pool_shutdown_to_close_report` unit tests in
+  `mini_saas_api` covering clean drain, timed-out drain, connection
+  failures, and already-closed pool — the production conversion path.
+- Coverage: smoke tests now assert each `TopologyComponent::kind`
+  (`listener`, `bridge`, `pool`, `isolate`, `timer`) per-name instead
+  of substring matching, and assert `Health::summary_line()` carries
+  the typed state and service label. Added unit coverage for
+  same-ordinal step repetition (the multi-`CloseResource` case),
+  every non-`Clean` `CloseOutcome` propagating through `record_close`,
+  and an `unknown` fallback test for the empty-reasons fix.
+- Cleanup: `mini_saas_api::build_startup_summary` now calls
+  `ServicePressureSurface::discovery_line()` instead of duplicating the
+  measured/unavailable format inline. Tightened the DST ordering test
+  to walk every distinct-ordinal pair (clean + violation) without
+  confusing variable scaffolding. Added a doc note that
+  `ServiceShutdownReport: PartialEq` includes wall-clock durations so
+  equality-based DST tests should zero them and use
+  `ShutdownChoreography::with_started_at`.
+
 ### Phase 102 Host Control Ergonomics
 
 - Added address-routed `ThreadedMultiShardRuntime::call_blocking(addr, msg,

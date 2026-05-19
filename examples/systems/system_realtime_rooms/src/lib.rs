@@ -27,10 +27,10 @@ use http::Method;
 use tina::CallContext;
 use tina::prelude::*;
 use tina_http::{
-    HttpConnectionMsg, HttpLimits, HttpListener, HttpListenerMsg, HttpRequest, HttpResponse,
-    WebSocketCloseCode, WebSocketError, WebSocketLimits, WebSocketSendError,
-    WebSocketSessionHandle, WebSocketSessionId, WebSocketSessionMsg, WebSocketSessionOutcome,
-    websocket_upgrade,
+    AdmitOutcome, HttpConnectionMsg, HttpLimits, HttpListener, HttpListenerMsg, HttpRequest,
+    HttpResponse, SendOutcomeAction, WebSocketCloseCode, WebSocketError, WebSocketLimits,
+    WebSocketMemberTable, WebSocketSessionHandle, WebSocketSessionId, WebSocketSessionMsg,
+    WebSocketSessionOutcome, websocket_upgrade,
 };
 use tina_runtime::{
     DefaultThreadedMailboxFactory, RuntimeCall, ThreadedRuntime, ThreadedRuntimeConfig, sleep_then,
@@ -175,10 +175,15 @@ impl Shard for RoomShard {
 
 /// Room isolate. Owns the bounded member table, the recurring liveness tick,
 /// and the slow/idle eviction policy.
+///
+/// The bounded member set, broadcast/admit bookkeeping, slow-peer eviction
+/// on `SendOutcome`, and the shutdown close fanout all delegate to
+/// `tina_http::WebSocketMemberTable`. Policy that does not belong on the
+/// shared table — idle eviction with `last_seen`, the recurring presence
+/// tick, the bootstrap message, and the shutdown sequencing — stays here.
 struct Room {
-    members: BTreeMap<WebSocketSessionId, WebSocketSessionHandle>,
+    members: WebSocketMemberTable,
     last_seen: BTreeMap<WebSocketSessionId, Instant>,
-    capacity: usize,
     presence_tick: Duration,
     idle_evict: Duration,
     report: Arc<SharedReport>,
@@ -313,7 +318,8 @@ impl Room {
         self.report.update(|s| s.presence_ticks += 1);
 
         // Evict members not seen recently. "Seen" advances when an inbound
-        // SessionText arrives. A slow / silent peer ages out.
+        // SessionText arrives. A slow / silent peer ages out. The table
+        // helper does not track `last_seen`; this is room policy.
         let stale: Vec<WebSocketSessionId> = self
             .last_seen
             .iter()
@@ -322,7 +328,7 @@ impl Room {
             .collect();
         let mut effects: Vec<Effect<Self>> = Vec::new();
         for id in stale {
-            if let Some(handle) = self.members.remove(&id) {
+            if let Some(handle) = self.members.remove(id) {
                 self.last_seen.remove(&id);
                 self.report.update(|s| {
                     s.left_idle += 1;
@@ -335,22 +341,14 @@ impl Room {
             }
         }
 
-        // Broadcast a heartbeat. The text counts the live members so a
-        // client can see the room shape change deterministically.
-        //
-        // Note: we deliberately use `send(handle.target(), handle.text(...))`
-        // (try_send semantics) rather than `handle.text_effect::<Self>(...)`
-        // (call → .then chain). The call-shaped path emitted from this room's
-        // `handle_call` reentered the connection isolate's `handle_call` with
-        // `HttpConnectionMsg::Wrote(_)`, which the connection rejected as
-        // unsupported; the bytes never finished writing and the queue stalled.
-        // See `examples/FINDINGS.md` for the full trace.
+        // Broadcast a heartbeat through the bounded table fanout. Uses
+        // try_send semantics through each member's connection owner so the
+        // followup `WebSocketSessionMsg::SendOutcome` reaches our `handle`
+        // path. The `call → .then` form would deliver the connection's
+        // `Wrote(_)` completion back via `handle_call` and stall the queue
+        // (see `examples/FINDINGS.md` Finding 26).
         let payload = format!("tick:{}:{}", generation, self.members.len());
-        let fanout = self.members.values().copied().collect::<Vec<_>>();
-        for handle in fanout {
-            effects.push(tina::send(handle.target(), handle.text(payload.clone())));
-        }
-
+        effects.extend(self.members.broadcast_text::<Self>(None, payload));
         effects.push(self.schedule_tick());
         batch(effects)
     }
@@ -364,26 +362,38 @@ impl Room {
                 b"shutdown".to_vec(),
             ));
         }
-        if self.members.len() >= self.capacity {
-            self.report.update(|s| s.rejected_full += 1);
-            return reply(WebSocketSessionOutcome::Close(
-                Some(WebSocketCloseCode(1013)),
-                b"room full".to_vec(),
-            ));
-        }
-        self.members.insert(session_id, session);
-        self.last_seen.insert(session_id, now);
-        self.report.update(|s| {
-            s.joined += 1;
-            s.live_members = self.members.len();
-            if s.live_members > s.member_high_water {
-                s.member_high_water = s.live_members;
+        match self.members.admit(session) {
+            AdmitOutcome::Admitted => {
+                self.last_seen.insert(session_id, now);
+                self.report.update(|s| {
+                    s.joined += 1;
+                    s.live_members = self.members.len();
+                    if s.live_members > s.member_high_water {
+                        s.member_high_water = s.live_members;
+                    }
+                });
+                reply(WebSocketSessionOutcome::Text(format!(
+                    "join:{}",
+                    session_id.raw()
+                )))
             }
-        });
-        reply(WebSocketSessionOutcome::Text(format!(
-            "join:{}",
-            session_id.raw()
-        )))
+            AdmitOutcome::Full => {
+                self.report.update(|s| s.rejected_full += 1);
+                reply(WebSocketSessionOutcome::Close(
+                    Some(WebSocketCloseCode(1013)),
+                    b"room full".to_vec(),
+                ))
+            }
+            AdmitOutcome::AlreadyMember => {
+                // The connection owner reuses session ids per upgrade only;
+                // a duplicate here is a Tina bug, not a peer event. Reply
+                // with a Close so the peer is not silently kept.
+                reply(WebSocketSessionOutcome::Close(
+                    Some(WebSocketCloseCode(1011)),
+                    b"duplicate session".to_vec(),
+                ))
+            }
+        }
     }
 
     fn on_session_text(
@@ -392,7 +402,7 @@ impl Room {
         text: String,
         now: Instant,
     ) -> Effect<Self> {
-        if !self.members.contains_key(&session_id) {
+        if !self.members.contains(session_id) {
             // A stray text after we already evicted the member. The
             // connection owner will close it shortly via lifecycle msgs;
             // nothing to do.
@@ -402,12 +412,7 @@ impl Room {
         self.report.update(|s| s.messages_in += 1);
 
         let body = format!("room:{text}");
-        let mut effects: Vec<Effect<Self>> = Vec::new();
-        for (target_id, handle) in self.members.iter() {
-            if *target_id != session_id {
-                effects.push(tina::send(handle.target(), handle.text(body.clone())));
-            }
-        }
+        let mut effects = self.members.broadcast_text::<Self>(Some(session_id), body);
         if effects.is_empty() {
             reply(WebSocketSessionOutcome::None)
         } else {
@@ -421,7 +426,7 @@ impl Room {
         session_id: WebSocketSessionId,
         reason: GoneReason,
     ) -> Effect<Self> {
-        let removed = self.members.remove(&session_id).is_some();
+        let removed = self.members.remove(session_id).is_some();
         self.last_seen.remove(&session_id);
         if removed {
             let shutting_down = self.shutting_down;
@@ -441,71 +446,87 @@ impl Room {
     }
 
     fn on_send_outcome(&mut self, outcome: tina_http::WebSocketSendOutcome) -> Effect<Self> {
+        // The table updates its own typed counters (joined/left_slow/etc.)
+        // and removes terminal-failure members. The room mirrors the
+        // outcome into its own report shape so existing assertions keep
+        // working.
         let session_id = outcome.session;
-        match outcome.result {
-            Ok(()) => {
-                self.report.update(|s| {
-                    if self.shutting_down {
-                        s.shutdown_close_ok += 1;
-                    } else {
-                        s.presence_broadcasts_ok += 1;
-                        s.messages_out_ok += 1;
-                    }
-                });
+        let action = self.members.record_send_outcome(&outcome);
+        let shutting_down = self.shutting_down;
+        self.report.update(|s| match (shutting_down, action) {
+            (true, SendOutcomeAction::Ok) => {
+                s.shutdown_close_ok += 1;
+            }
+            (true, _) => {
+                // Match the pre-helper shutdown bookkeeping: every non-Ok
+                // outcome during shutdown — including Stale — counts as a
+                // shutdown_close_failed entry. The smoke proof relies on
+                // requested == ok + failed.
+                s.shutdown_close_failed += 1;
+            }
+            (false, SendOutcomeAction::Ok) => {
+                s.presence_broadcasts_ok += 1;
+                s.messages_out_ok += 1;
+            }
+            (false, SendOutcomeAction::Stale) => {
+                s.presence_broadcasts_stale += 1;
+            }
+            (false, SendOutcomeAction::RemovedSlow) => {
+                s.presence_broadcasts_full += 1;
+            }
+            (false, _) => {}
+        });
+        match action {
+            SendOutcomeAction::Ok | SendOutcomeAction::Stale => {
                 reply(WebSocketSessionOutcome::None)
             }
-            Err(err) => {
-                let (slow, stale, terminal) = match err {
-                    WebSocketSendError::OutboundQueueFull
-                    | WebSocketSendError::OutboundBytesFull => (true, false, true),
-                    WebSocketSendError::Stale => (false, true, false),
-                    WebSocketSendError::Closed
-                    | WebSocketSendError::Closing
-                    | WebSocketSendError::Timeout
-                    | WebSocketSendError::Protocol => (false, false, true),
-                };
-                self.report.update(|s| {
-                    if self.shutting_down {
-                        s.shutdown_close_failed += 1;
-                    } else if stale {
-                        s.presence_broadcasts_stale += 1;
-                    } else if slow {
-                        s.presence_broadcasts_full += 1;
-                    }
-                });
-                if terminal && !stale {
-                    self.on_session_gone(
-                        session_id,
-                        if slow {
-                            GoneReason::Slow
-                        } else {
-                            GoneReason::Peer
-                        },
-                    )
-                } else {
-                    reply(WebSocketSessionOutcome::None)
-                }
+            SendOutcomeAction::RemovedSlow => {
+                self.after_table_removed(session_id, GoneReason::Slow)
+            }
+            SendOutcomeAction::RemovedClosed
+            | SendOutcomeAction::RemovedProtocol
+            | SendOutcomeAction::RemovedTimeout => {
+                self.after_table_removed(session_id, GoneReason::Peer)
             }
         }
+    }
+
+    fn after_table_removed(
+        &mut self,
+        session_id: WebSocketSessionId,
+        reason: GoneReason,
+    ) -> Effect<Self> {
+        // The table has already evicted the member and updated its own
+        // counters. Sync `last_seen` and the room's typed totals here so
+        // the existing report assertions still see the per-reason counter
+        // tick over.
+        self.last_seen.remove(&session_id);
+        let shutting_down = self.shutting_down;
+        self.report.update(|s| {
+            s.live_members = self.members.len();
+            if shutting_down {
+                s.left_shutdown += 1;
+            } else {
+                match reason {
+                    GoneReason::Peer => s.left_peer += 1,
+                    GoneReason::Slow => s.left_slow += 1,
+                }
+            }
+        });
+        reply(WebSocketSessionOutcome::None)
     }
 
     fn on_shutdown(&mut self, code: Option<WebSocketCloseCode>, reason: Vec<u8>) -> Effect<Self> {
         self.shutting_down = true;
         self.report.update(|s| s.shutdown_started = true);
-        let handles: Vec<WebSocketSessionHandle> = self.members.values().copied().collect();
-        let mut effects: Vec<Effect<Self>> = Vec::new();
-        for handle in &handles {
-            effects.push(tina::send(
-                handle.target(),
-                handle.close(code, reason.clone()),
-            ));
-        }
+        // `shutdown_close` leaves the table populated; subsequent
+        // SessionClosed / SendOutcome deliveries reconcile membership
+        // through the ordinary paths.
+        let effects: Vec<Effect<Self>> = self.members.shutdown_close::<Self>(code, reason);
+        let count = effects.len() as u64;
         self.report.update(|s| {
-            s.shutdown_close_requested += handles.len() as u64;
+            s.shutdown_close_requested += count;
         });
-        // Note: we leave the member table populated until SessionClosed /
-        // SendOutcome lands. That preserves stale-handle send semantics
-        // and lets every typed outcome be reported.
         if effects.is_empty() {
             reply(WebSocketSessionOutcome::None)
         } else {
@@ -656,9 +677,8 @@ impl RoomServer {
         let room = runtime
             .register_service::<Room, HttpConnectionMsg>(
                 Room {
-                    members: BTreeMap::new(),
+                    members: WebSocketMemberTable::new(config.member_capacity),
                     last_seen: BTreeMap::new(),
-                    capacity: config.member_capacity,
                     presence_tick: Duration::from_millis(config.presence_tick_ms),
                     idle_evict: Duration::from_millis(config.idle_evict_after_ms),
                     report: report.clone(),
@@ -909,7 +929,7 @@ pub fn run_shutdown(config: RunConfig) -> anyhow::Result<ShutdownReport> {
     })
 }
 
-mod test_client {
+pub mod test_client {
     use std::net::{SocketAddr, TcpStream};
     use std::time::Duration;
 

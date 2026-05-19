@@ -264,6 +264,67 @@ Owner-stop already cancels every caller-owned pending call with cause
 right shape when the owner needs the cancels acked back through its own
 mailbox before stopping.
 
+### Request-Scoped Cancellation
+
+A request is a tree. When the request dies, its children should stop
+waiting. The runtime primitive is [`RequestScope`]: a bounded child
+registry plus a cancellation flag. Wire it into a service like this:
+
+```text
+let scope = RequestScope::with_child_cap(RequestScopeId::alloc(), 4);
+self.scopes.try_insert(request_id, scope.clone())?;
+
+let admission = call_ctx
+    .defer_scoped(&scope, "db_lookup", call_cancelable(db, query, t))
+    .try_admit(&mut self.pending, request_id, Msg::DbReturned);
+
+// Later, when the client disconnects or a per-request deadline fires:
+let (report, cancel_effects) = scope.cancel_into_effects(
+    ScopeCancelCause::ClientDisconnect,
+    |id, label, outcome| Msg::ScopeChildCancelled { id, label, outcome },
+);
+return batch(cancel_effects);
+```
+
+What the scope can honestly do:
+
+- Close Tina-owned waits (isolate calls, pool acquire, anything issued
+  through `call_cancelable`).
+- Reclaim caller-side capacity for those rails immediately.
+- Provide a synchronous [`ScopeCancelReport`] listing every registered
+  rail and its state at cancel time.
+
+What the scope cannot do:
+
+- Stop external work a bridge already accepted. A SQLx query that
+  reached the database server, an HTTP request the reqwest pool has
+  already sent, a SQLite blocking call mid-flight — these run to their
+  own conclusion. Their replies become typed `late_results` /
+  `CallReplyRejected` trace facts the same as for a plain cancel.
+- Stop sleep or raw TCP/TLS today. Scope cancellation rides the same
+  rail as `cancel_call`, so anything that does not expose a
+  `CallHandle` (`sleep`, `tcp_read`, body sources outside the streaming
+  helper) is not scope-cancellable yet. Wire `Cancel`-style application
+  messages for those rails until first-form cancel reaches them.
+
+The bounded [`RequestScopeSet`] holds one scope per concurrent request:
+
+```text
+RequestScopeSet::with_capacity(max_requests)
+  ├── try_insert(key, scope)        → Full / DuplicateKey returns the
+  │                                    scope so you can answer Busy
+  ├── remove(key)                   → free one slot after request done
+  └── drain()                       → on owner stop, cancel each
+                                      scope with ScopeCancelCause::OwnerStopped
+```
+
+Late completions from already-accepted bridge work flow through normal
+trace facts. The service's contract to its caller is still honest: "we
+stopped waiting; this child rail may still finish under the hood." See
+[bridge crates § What ships today](18-bridge-crates.md#what-ships-today)
+for the per-bridge late-result columns; scope cancellation does not
+change any of those answers.
+
 ## What To Test
 
 For any service with real I/O, test:

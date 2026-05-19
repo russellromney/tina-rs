@@ -18,3 +18,4 @@ tina-http = { path = "../../../tina-http" }
 tina-runtime = { path = "../../../tina-runtime" }
 tina-sim = { path = "../../../tina-sim" }
 tina-sqlite-bridge = { path = "../../../tina-sqlite-bridge" }
+tina-proof-harness = { path = "../../../tina-proof-harness" }

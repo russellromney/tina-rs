@@ -89,7 +89,7 @@ Keep a separate system only when it finds a different class of pain.
 | System | Build | Pulls On |
 |---|---|---|
 | `mini_saas_api` | Native HTTP API with routes, SQLite bridge pool shape, outbound keepalive webhook, graceful shutdown with in-flight work, health/readiness, asserted capacity/pressure report, and live-replay fact. Run with `cargo test --manifest-path examples/systems/mini_saas_api/Cargo.toml`. | `tina-http`, `tina-sqlite-bridge`, keepalive pool, tracing, capacity reports, service shutdown. |
-| `ergonomics_playground` | Tiny service probes: first-success/no-winner quote races, debounced batching with drain, and single-flight cache fill. Run with `cargo test --manifest-path examples/systems/ergonomics_playground/Cargo.toml`. | `CallGroup`, `RequestContext`, cancelable calls, `PendingReplies`, timers, single-flight fill, visible helper candidates. |
+| `ergonomics_playground` | Tiny service probes: first-success/no-winner quote races, debounced batching with drain, and single-flight cache fill. Run with `cargo test --manifest-path examples/systems/ergonomics_playground/Cargo.toml`. | `CallGroup`, `RequestContext`, cancelable calls, `PendingReplies`, `WaitList`, timers, single-flight fill, visible helper candidates. |
 | `system_bounded_object_lane` | Tiny S3-shaped object lane with concurrent callers, bounded in-flight work, typed busy replies, and hermetic fake object writes. Run with `cargo test --manifest-path examples/systems/system_bounded_object_lane/Cargo.toml`. | Request contexts, runtime-owned time, bounded in-flight admission, pressure vocabulary, future AWS bridge shape. |
 | `system_realtime_rooms` | Bounded WebSocket room with join/leave, a recurring liveness tick, slow/idle eviction, and graceful shutdown. Run with `cargo test --manifest-path examples/systems/system_realtime_rooms/Cargo.toml`. | Native WebSocket (`WebSocketSessionHandle`, `WebSocketSessionMsg`), recurring `sleep_then`, bounded fan-out, slow-peer pressure, bootstrap-message pattern. |
 | `system_job_queue` | N worker children with sync `Submit` parked in one `PendingCancelableCallSet`. Total admission cap is `workers`. Cancel-while-running uses `PendingCancelableCall::cancel(...)` to atomically close the wait and answer the parked caller. Worker panic respawns the slot and replies `Failed`. Run with `cargo test --manifest-path examples/systems/system_job_queue/Cargo.toml`. | `defer_cancelable(...).try_admit(...)`, `PendingCancelableCallSet`, `spawn_observed`, child lifecycle, `register_with_capacity_using`, runtime-owned timers. |
@@ -98,17 +98,17 @@ Keep a separate system only when it finds a different class of pain.
 | `system_delivery_daemon` | Queue email/webhook deliveries, rate-limit by domain/tenant, retry with backoff, suppress duplicates, drain on shutdown. | Backoff, jitter, idempotency, worker pools, outbound pools, bounded event sink, graceful shutdown. |
 | `system_checkout_saga` | Reserve item, charge payment, write DB row, send webhook, compensate on failure. | Saga pattern, DB bridge, outbound HTTP, race/join, cancellation, typed partial failure. |
 | `system_webhook_relay` | Receive webhooks, verify, persist, fan out to subscribers, retry failed subscribers. | HTTP server/client, DB bridge, outbound pool, bounded fanout, retry policy, subscriber pressure. |
-| `system_live_replay_bugbox` | Run live-ish service, capture trace/input facts, replay or approximate in sim, shrink bad case. | DST, `ReplayCase`, trace observer, config manifest, topology/resource capture. |
+| `system_live_replay_bugbox` | Live runtime + observer captures a real trace; same isolate logic runs in the sim with a pinned `ReplayCase`; `delete_shrink` reduces an 8-op history down to its minimum bug-preserving subset. Run with `cargo test --manifest-path examples/systems/system_live_replay_bugbox/Cargo.toml`. | DST, `ReplayCase`, `assert_replay_case`, `observe_replay_case`, `discover_constants`, `delete_shrink`, `tina_proof_harness::LiveTrace`. |
 | `system_redisish_keyspace` | TCP key/value service with hot keys, sharded map, persistence, snapshot/journal. | TCP loops, sharded placement, owner validation, persistence, hot-key pressure, capacity scopes. |
 | `system_tenant_rate_limiter` | Multi-tenant API limiter with sliding windows, burst caps, cleanup, and hot tenants. | Sharded keyed state, timers, hot-key pressure, capacity policies, periodic cleanup. |
-| `system_cache_with_fill` | Read-through cache where one miss triggers one upstream fill, concurrent callers wait behind a bounded cap, and stale fills are ignored after invalidation. Run with `cargo test --manifest-path examples/systems/system_cache_with_fill/Cargo.toml`. | `PendingReplies`, `CallContext`, single-flight, timers, stale-result handling, capacity reclamation. |
+| `system_cache_with_fill` | Read-through cache where one miss triggers one upstream fill, concurrent callers wait behind a bounded cap, and stale fills are ignored after invalidation. Run with `cargo test --manifest-path examples/systems/system_cache_with_fill/Cargo.toml`. | `WaitList`, `CallContext`, single-flight, timers, stale-result handling, capacity reclamation. |
 | `system_media_ingest_pipeline` | Streaming upload, parse/process file, make thumbnail, store object, write DB row, emit event, cancel on client drop. | Body streaming/chunked, process rail, AWS bridge or file stand-in, DB bridge, response-source cancel, saga cleanup. |
 | `system_audit_log` | Append audit events, batch fsync, serve queries, recover from torn writes in tests. | Persistence correctness, append-before-apply, shutdown flush, DST crash/replay shape. |
 | `system_rpc_gateway` | HTTP gateway to internal RPC services with deadlines, retries, and partial failure. | `tina-rpc`, HTTP routing, deadline propagation, race/join helpers, bridge conventions. |
-| `system_api_gateway_limits` | Proxy-ish gateway with per-route and per-tenant caps, upstream pools, overload policy. | Capacity scopes, outbound pools, backpressure policy, health/readiness, pressure reports. |
+| `system_api_gateway_limits` | Two routes share one shard-local weighted `SharedCapacityScope`. Proves shared caps fill across routes and Owner-Stop releases held charges. Run with `cargo test --manifest-path examples/systems/system_api_gateway_limits/Cargo.toml`. | `SharedCapacityScope`, `PendingReplies`, `CapacitySummary::assert_no_full`, `format_assertion_failure`. |
 | `system_lock_manager` | Local lock manager with leases, renewals, lease-expiry hand-off, FIFO per-key wait queues, and stale-handle detection. Run with `cargo test --manifest-path examples/systems/system_lock_manager/Cargo.toml`. | `PendingReplies`, `CallContext`, runtime-owned `sleep`, FIFO fairness, stale handle detection, bounded waiters. |
 | `system_order_book` | Sharded in-memory order books for hot symbols with matching, snapshots, and streaming readers. | Hot-key pressure, sharded state, deterministic replay, slow streaming readers, capacity scopes. |
-| `system_soak_http_db` | One-hour-ish load script over HTTP + DB + outbound calls, report high-water/full/leaks. | Load/soak harness, capacity summaries, tracing, health/readiness, shutdown, CI-friendly reports. |
+| `system_soak_http_db` | Fast in-process soak that emits the discovery lines a real HTTP+DB service would print: `scope name=…`, `events sink=…`, `capacity surface=…`, `service=… full=N …`, and copyable `FAIL surface=…` lines. Run with `cargo test --manifest-path examples/systems/system_soak_http_db/Cargo.toml`. | `SharedCapacityScope`, `BoundedEventSink`, `ServicePressureReport`, `CapacitySummary::assert_no_full`, `format_assertion_failure`. |
 
 ## Folded Ideas
 
@@ -164,3 +164,40 @@ Then pick based on pain:
 
 System specimens exist to make Tina complain loudly while the code is
 still cheap to change.
+
+## Proof Harness
+
+`tina-proof-harness` is the small reusable kit specimens reach for
+when they want a typed proof instead of a hand-rolled driver. Three
+pieces, each tiny on purpose:
+
+- `tina_proof_harness::load` — concurrent op driver with typed
+  latency, err-kind tally, leak-check hook, and a `PressureSummary`
+  (rate per mille, max consecutive errors, first error op index).
+  Used by `mini_saas_api/tests/soak.rs`.
+- `tina_proof_harness::bad_peer` — reusable bad TCP/HTTP clients
+  (`HalfClose`, `ResetImmediately`, `Slowloris`, `StalledReader`,
+  `StalledWriter`, `MalformedFrame`, `TlsHandshakeFailure`,
+  `ReconnectStorm`). Each returns a typed `BadPeerOutcome` with
+  `connects_ok`/`bytes_sent`/`bytes_read`/`server_closed`/`peer_reset`.
+  Used by `system_realtime_rooms/tests/bad_peer.rs`.
+- `tina_proof_harness::live_replay::LiveTrace` — thin
+  `TraceObserver` that captures live events and exposes a live
+  `tina_sim::dst::TraceShape` fingerprint plus a
+  `tina_runtime::PressureSummary` for visible pressure facts. For
+  live-to-sim replay, materialize the live facts into
+  `tina_sim::dst::LiveReplayCapture` before comparing. Used by
+  `system_live_replay_bugbox`.
+
+Copy-pasteable proof targets live in the top-level `Makefile`:
+
+```sh
+make proof-fast               # PR gate
+make proof-soak               # nightly load
+make proof-bad-peer           # local bad-peer
+make proof-replay-regression  # saved-seed sim regression
+```
+
+If a specimen would otherwise hand-roll a slow-reader / RST /
+malformed-HTTP driver, reach for `tina-proof-harness` instead. The
+typed outcome is part of what makes "the bug reproduces" cheap.

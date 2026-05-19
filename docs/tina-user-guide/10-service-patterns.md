@@ -291,13 +291,39 @@ one handler turn. Some shapes need to answer later:
 - bridge worker, many external requests in flight
 - fanout, aggregate after N partial results
 
-Capture the caller as a typed `DeferredReply<R>`, store it, answer
-later:
+Capture the caller, store it, answer later. The short way is `park`:
+
+```rust
+// Split-service request handler:
+match self.pending.park_request(req_id, call) {
+    Ok(_ticket) => start_work(req_id),
+    Err(ParkError::Full { call, .. }) => call.reply(MyReply::Full),
+    Err(ParkError::DuplicateKey { call, .. }) => call.reject(...),
+}
+
+// Plain handle_call:
+match self.pending.park_call(req_id, call) {
+    Ok(_ticket) => start_work(req_id),
+    Err(ParkCallError::Full { call, .. }) => call.reply(MyReply::Full),
+    Err(_) => unreachable!("monotonic key + local-only call"),
+}
+
+// Settle later:
+return self.pending.reply_ticket::<Self>(ticket, MyReply::Ok(value));
+```
+
+`park_request` / `park_call` check duplicate and capacity *before*
+consuming caller authority, so a `Full` or `DuplicateKey` rejection
+returns the original `RequestCall` / `CallContext` for an immediate
+typed reply. `ParkTicket` is move-only with private fields; user code
+cannot forge or duplicate one, and a stale ticket against a reused slot
+is rejected as `TakeParkedError::StaleTicket`.
+
+The lower-level key-only form still works as an escape hatch:
 
 ```rust
 let slot: DeferredReply<MyReply> = ctx.take_reply_slot()?;
 self.pending.try_insert(req_id, slot)?;
-// later turn:
 let slot = self.pending.take(&req_id).expect("slot for id");
 return reply_to(slot, MyReply::Ok(value));
 ```
@@ -435,6 +461,167 @@ let outcome = runtime.call_blocking(addr, MyMsg::Ping, Duration::from_secs(2))?;
 
 See `examples/systems/system_session_auth` for a real sharded
 specimen using `ThreadedMultiShardRuntime::call_blocking`.
+
+## Park, Wait, Guard, Cancel
+
+Four shapes show up in nearly every multi-turn service. Each is named
+by the user's job, then by the helper that owns it. Copied paths start
+from the user-intent name. Lower-level names stay public for code that
+already reads better under the mechanism name.
+
+### Many callers wait for one result → `SharedWork`
+
+> *Several callers asked for the same key. The service starts the
+> upstream work once and replies every parked caller with one value.*
+
+```rust
+let mut shared: SharedWork<CacheKey, CacheReply> =
+    SharedWork::with_capacity(64).named("cache.shared");
+
+// On Get(key) from handle_request:
+match shared.wait(key.clone(), call) {
+    Ok(ticket) => {
+        if entry.filling.is_some() {
+            return request_effect_after_shared_wait(&ticket, noop());
+        }
+        let fill = sleep(self.fill_delay).then(move |result| {
+            ServiceMessage::Event(CacheEvent::FillDone { key, result })
+        });
+        entry.filling = Some(FillState::default());
+        request_effect_after_shared_wait(&ticket, fill)
+    }
+    Err(SharedWorkError::Full { call, .. })
+    | Err(SharedWorkError::KeyFull { call, .. }) => call.reply(CacheReply::Busy),
+}
+```
+
+- What the user is doing: coalesce many callers behind one upstream fill.
+- Helper to use: `SharedWork::wait` (or `wait_call` for `CallContext`).
+- What stays explicit: the fill-in-flight flag, stale fill generation,
+  the upstream call/timer, retry policy.
+- What not to use: hand-rolled `HashMap<key, VecDeque<id>>` next to
+  `PendingReplies`. That is exactly what `SharedWork` exists to replace.
+  `WaitList` is still public for code that reads better under the
+  mechanism name.
+
+### One active cancelable request per key → `PendingCancelableCallSet`
+
+> *This key has at most one in-flight request at a time. A second attempt
+> with the same key is rejected immediately so the caller can answer
+> `Busy` or `AlreadyRunning`.*
+
+```rust
+let mut pending: PendingCancelableCallSet<JobId, Q, R> =
+    PendingCancelableCallSet::with_capacity(64);
+
+match pending.try_insert(token) {
+    Ok(ticket) => admit_effect,
+    Err(PendingCancelableInsertError::Full { token })
+    | Err(PendingCancelableInsertError::DuplicateKey { token }) => {
+        let request = token.into_request_context();
+        reply_to_request(request, JobReply::Busy)
+    }
+}
+```
+
+- What the user is doing: enforce "one job per id" with caller-owned
+  cancel.
+- Helper to use: `PendingCancelableCallSet::try_insert`.
+- What stays explicit: dispatching the child effect, classifying
+  worker-return outcomes, cancel translation.
+- What not to use: storing pending tokens in a plain `HashMap`. That
+  loses the `Full` / `DuplicateKey` distinction and the move-only
+  ticket.
+
+### Many cancelable requests grouped by key → `CancelableWork`
+
+> *This key can have several in-flight attempts at once — retry attempts,
+> concurrent racers, multi-tenant per-key fanout. Every attempt gets its
+> own move-only `WorkTicket` so a stale completion cannot remove a newer
+> admit that reused the key.*
+
+```rust
+let mut work: CancelableWork<JobId, Q, R> =
+    CancelableWork::with_key_limit(64, 4).named("job.attempts");
+
+match work.admit(token) {
+    Ok((ticket, request_effect)) => request_effect,
+    Err(AdmitWorkError::Full { token }) | Err(AdmitWorkError::KeyFull { token }) => {
+        let request = token.into_request_context();
+        reply_to_request(request, JobReply::Busy)
+    }
+}
+```
+
+- What the user is doing: allow more than one live attempt per natural
+  key, with caller-owned cancellation per attempt.
+- Helper to use: `CancelableWork::admit` (returns a `WorkTicket`).
+- What stays explicit: dispatch of the child effect, completion
+  removal by ticket, drain on stop.
+- What not to use: `PendingCancelableCallSet` when more than one live
+  attempt per key is allowed; `Full` becomes the wrong story.
+
+### One caller waits for one key → `PendingReplies`
+
+> *Reply slots are owned by id, unrelated to each other. No coalescing,
+> no per-key cap.*
+
+`PendingReplies::park_request` / `park_call` returns a `ParkTicket`.
+Use this when slots are independent — the table does not know that two
+ids both refer to the "same cache key."
+
+### One caller, one key, plus an RAII guard → `GuardedPendingReplies`
+
+`GuardedPendingReplies::park_request_guarded` pairs a parked caller with
+one RAII guard. The guard drops exactly once on reply, drain, or
+caller-gone sweep.
+
+### Reply later to the current caller → `call.defer(...).reply(...)`
+
+> *The handler has caller authority right now but needs to do some work
+> first. Capture the request, return an effect that ends with replying
+> to that captured request.*
+
+```rust
+call.defer(sleep(delay)).reply(move |request, result| {
+    Msg::Finished { request, result }
+})
+```
+
+The continuation arrives at `handle`, not `handle_call`. The original
+caller receives the final reply.
+
+### Close / drain on stop
+
+`SharedWork::drain_all_with(factory)`, `CancelableWork::drain(factory)`,
+and `PendingReplies::drain(...)` reply every open caller with a
+terminal value before the service stops. No silent drop. See
+[14-lifecycle-and-shutdown.md](14-lifecycle-and-shutdown.md) for the
+broader resource-close story.
+
+### Write a bridge
+
+For the bridge-author copy path (install, close, drain, metrics,
+pressure, classifier, late-result truth), see
+[30-bridge-author-kit.md](30-bridge-author-kit.md).
+
+### Capacity surface
+
+All four helpers expose the same surface: `capacity / len / high_water /
+full_rejects / capacity_report().named(...)`.
+
+## Timer Continuation
+
+For "wake me later with this event", use `then_event`:
+
+```rust
+sleep(delay).then_event(move || Msg::Wake { id })
+```
+
+`then_event` lives only on the value returned by `tina_runtime::sleep`.
+A non-timer `TypedCall<()>` (TCP close, file ops, signal wait) keeps
+returning `Result<(), CallError>` and must be consumed with `.then(...)`
+so the error path stays visible.
 
 ## Macro Rule
 

@@ -142,7 +142,8 @@ What does not ship yet:
 - tonic compatibility, interceptors, reflection, health, or load balancing;
 - a pooled Tina gRPC client service.
 
-The tiny `grpc_unary_call_h2c` helper exists to prove the native wire path in
-tests and specimens without pulling in Tokio, hyper, or tonic. Production
-client topology should become a normal Tina client service once HTTP/2 client
-plumbing grows beyond this first form.
+The tiny `grpc_unary_call_h2c_blocking` helper exists to prove the native wire
+path in tests and specimens without pulling in Tokio, hyper, or tonic. It is a
+blocking helper, not a Tina client service, and it does not emit runtime trace
+facts. Production client topology should become a normal Tina client service
+once HTTP/2 client plumbing grows beyond this first form.

@@ -1,0 +1,5 @@
+error: expected a `fn handle_event(...)` method
+  --> tests/safety_rails_compile_fail/split_missing_handle_event.rs:16:6
+   |
+16 | impl Service {
+   |      ^^^^^^^

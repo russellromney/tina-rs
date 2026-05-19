@@ -1,0 +1,15 @@
+error[E0308]: mismatched types
+  --> tests/shared_work_compile_fail/shared_work_request_effect_from_noop.rs:35:63
+   |
+35 |     let _ = request_effect_after_shared_wait::<NoTicket, u32>(&not_a_ticket, tina::noop());
+   |             ------------------------------------------------- ^^^^^^^^^^^^^ expected `&SharedWorkTicket<u32>`, found `&u32`
+   |             |
+   |             arguments to this function are incorrect
+   |
+   = note: expected reference `&SharedWorkTicket<u32>`
+              found reference `&u32`
+note: function defined here
+  --> src/shared_work.rs
+   |
+   | pub fn request_effect_after_shared_wait<I, K>(
+   |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

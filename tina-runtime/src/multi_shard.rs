@@ -161,6 +161,7 @@ where
         I::Spawn: IntoErasedSpawn<S, F> + 'static,
         I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
         I::Call: IntoErasedCall<I::Message> + 'static,
+        I::Fact: crate::fact::IntoRuntimeFact + 'static,
         Outbound: 'static,
         M: Mailbox<I::Message> + 'static,
     {
@@ -184,6 +185,7 @@ where
         I::Spawn: IntoErasedSpawn<S, F> + 'static,
         I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
         I::Call: IntoErasedCall<I::Message> + 'static,
+        I::Fact: crate::fact::IntoRuntimeFact + 'static,
         Outbound: 'static,
     {
         self.runtime_mut(shard)
@@ -206,6 +208,7 @@ where
         I::Spawn: IntoErasedSpawn<S, F> + 'static,
         I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
         I::Call: IntoErasedCall<I::Message> + 'static,
+        I::Fact: crate::fact::IntoRuntimeFact + 'static,
         Outbound: 'static,
     {
         self.runtime_mut(shard)

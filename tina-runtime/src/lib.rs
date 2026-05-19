@@ -50,6 +50,7 @@ use tina_supervisor::SupervisorConfig;
 
 use betelgeuse::IOLoopHandle;
 
+pub mod bridge;
 mod call;
 mod call_group;
 mod capabilities;
@@ -59,8 +60,12 @@ pub mod deferred;
 mod drain_state;
 mod driver;
 mod errors;
+pub mod event_sink;
+mod fact;
 mod full_handling;
+pub mod guarded_pending;
 mod host_burst;
+pub mod lifecycle;
 mod live_report;
 mod local_permit;
 mod local_system;
@@ -72,13 +77,18 @@ pub mod persistence;
 #[allow(unsafe_code)]
 pub mod pool;
 pub mod pressure;
+pub mod scope;
+pub mod service_pressure;
 pub mod sharded;
+pub mod shared_scope;
+pub mod shared_work;
 mod shutdown;
 mod single_call_gate;
 pub mod tcp_loops;
 mod threaded;
 mod threaded_multi_shard;
 mod trace;
+pub mod wait_list;
 
 pub use drain_state::{AdmitDecision, DrainReport, DrainStage, DrainState};
 pub use errors::{
@@ -91,6 +101,12 @@ pub use full_handling::{
     FullPolicyMode,
 };
 pub use host_burst::{HostBurstOutcomes, HostBurstSnapshot, HostBurstWaitError};
+pub use lifecycle::{
+    CloseAdmission, CloseOutcome, ComponentKind, Health, Lifecycle, READINESS_UNKNOWN_REASON,
+    Readiness, ReadinessReason, ReadinessToken, ResourceCloseReport, ResourceKind,
+    ServiceShutdownReport, ServiceTopology, ShutdownChoreography, ShutdownStep, ShutdownStepReport,
+    StepOutcome, TopologyComponent,
+};
 pub use local_permit::{
     LocalPermitFull, LocalPermitGate, LocalPermitName, LocalPermitReleaseError, LocalPermitReport,
     Permit, dropped_permit_count,
@@ -164,6 +180,44 @@ impl<M> Clone for SendOnlyServiceHandle<M> {
         *self
     }
 }
+
+/// Capability-typed handles for one split event/request service.
+///
+/// Returned by [`Runtime::register_split_service`]. The `events` lane accepts
+/// only public fire-and-forget events through [`tina::send_event`]. The
+/// `requests` lane accepts only callable requests through [`call_request`].
+#[derive(Debug)]
+pub struct SplitServiceHandle<Event, Request, Reply> {
+    /// Send capability for service events.
+    pub events: tina::ServiceEventAddress<Event, Request>,
+    /// Call capability for service requests.
+    pub requests: tina::ServiceRequestAddress<Event, Request, Reply>,
+}
+
+impl<Event, Request, Reply> Copy for SplitServiceHandle<Event, Request, Reply> {}
+
+impl<Event, Request, Reply> Clone for SplitServiceHandle<Event, Request, Reply> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<Event, Request, Reply> SplitServiceHandle<Event, Request, Reply> {
+    /// Wraps the raw service envelope address as split capabilities.
+    pub const fn from_address(
+        address: tina::Address<tina::ServiceMessage<Event, Request>, Reply>,
+    ) -> Self {
+        Self {
+            events: tina::ServiceEventAddress::from_send_address(address.send_only()),
+            requests: tina::ServiceRequestAddress::from_call_address(address.callable()),
+        }
+    }
+
+    /// Returns the underlying raw envelope address.
+    pub const fn address(self) -> tina::Address<tina::ServiceMessage<Event, Request>, Reply> {
+        self.requests.address().address()
+    }
+}
 pub use shutdown::ThreadedShutdownHandle;
 pub use single_call_gate::SingleCallGate;
 pub use threaded::{DEFAULT_SHUTDOWN_LANE_DRAIN_TIMEOUT, ThreadedRuntime, ThreadedRuntimeConfig};
@@ -189,29 +243,31 @@ pub use crate::persistence::{
 };
 #[allow(deprecated)]
 pub use call::{
-    CallError, CallId, CallInput, CallOutcome, CallOutput, CallReply, CancelableCall,
-    DeferredCancelableCall, DeferredIsolateCall, DeferredObservedSend, DeferredTypedCall,
-    DnsLookupReply, ErasedCall, FileCloseReply, FileFsyncReply, FileId, FileOpenOptions,
-    FileOpenReply, FileReadReply, FileSizeReply, FileWriteReply, IntoErasedCall, IsolateCall,
-    IsolateCallWithHandle, JournalAppendReply, JournalRecord, JournalReplay, JournalReplayReply,
-    JournalReplayWarning, ListenerId, MkdirReply, PathKind, PathMetadata, PathMetadataReply,
-    PendingCancelableCall, PendingCancelableCallSet, PendingCancelableInsertError,
-    PendingCancelableRemoveError, PendingCancelableTicket, PersistenceTraceInfo, ProcessRunReply,
-    ProcessRunResult, ProcessStatus, ReadDirReply, RemoveFileReply, RenameReplaceReply,
-    RuntimeCall, RuntimeCallParts, RuntimeCallable, SendOutcome, SignalWaitReply, SleepReply,
-    SnapshotCommitReply, SnapshotImage, SnapshotLoadReply, StreamId, SyncParentReply,
-    TcpAcceptReply, TcpBindReply, TcpConnectReply, TcpListenerCloseReply, TcpReadReply,
-    TcpStreamCloseReply, TcpWriteReply, TlsAcceptReply, TlsBindReply, TlsCloseReply,
-    TlsConnectReply, TlsListenerCloseReply, TlsListenerId, TlsReadReply, TlsStreamId,
-    TlsWriteReply, TypedCall, UdpBindReply, UdpCloseSocketReply, UdpRecvFromReply, UdpSendToReply,
-    UdpSocketId, call, call_cancelable, call_handle_call_id, call_typed, call_with_handle,
-    cancel_call, dns_lookup, file_close, file_create, file_fsync, file_open, file_read,
-    file_read_at, file_size, file_write, file_write_at, journal_append, journal_replay, mkdir,
-    path_metadata, process_run, read_dir, remove_file, rename_replace, send_observed, signal_wait,
-    sleep, sleep_then, snapshot_commit, snapshot_load, sync_parent, tcp_accept, tcp_bind,
-    tcp_close_listener, tcp_close_stream, tcp_connect, tcp_read, tcp_write, tls_accept, tls_bind,
-    tls_close, tls_close_listener, tls_connect, tls_read, tls_write, udp_bind, udp_close_socket,
-    udp_recv_from, udp_send_to,
+    AdmitWorkError, CallError, CallId, CallInput, CallOutcome, CallOutput, CallReply,
+    CancelableCall, CancelableWork, CancelableWorkSnapshot, DeferredCancelableCall,
+    DeferredIsolateCall, DeferredObservedSend, DeferredTypedCall, DnsLookupReply, ErasedCall,
+    FileCloseReply, FileFsyncReply, FileId, FileOpenOptions, FileOpenReply, FileReadReply,
+    FileSizeReply, FileWriteReply, IntoErasedCall, IsolateCall, IsolateCallWithHandle,
+    JournalAppendReply, JournalRecord, JournalReplay, JournalReplayReply, JournalReplayWarning,
+    ListenerId, MkdirReply, PathKind, PathMetadata, PathMetadataReply, PendingCancelableCall,
+    PendingCancelableCallSet, PendingCancelableInsertError, PendingCancelableRemoveError,
+    PendingCancelableTicket, PersistenceTraceInfo, ProcessRunReply, ProcessRunResult,
+    ProcessStatus, ReadDirReply, RemoveFileReply, RenameReplaceReply,
+    RequestDeferredCancelableCall, RequestDeferredIsolateCall, RequestDeferredObservedSend,
+    RequestDeferredTypedCall, RuntimeCall, RuntimeCallParts, RuntimeCallable, SendOutcome,
+    SignalWaitReply, SleepCall, SleepReply, SnapshotCommitReply, SnapshotImage, SnapshotLoadReply,
+    StreamId, SyncParentReply, TcpAcceptReply, TcpBindReply, TcpConnectReply,
+    TcpListenerCloseReply, TcpReadReply, TcpStreamCloseReply, TcpWriteReply, TlsAcceptReply,
+    TlsBindReply, TlsCloseReply, TlsConnectReply, TlsListenerCloseReply, TlsListenerId,
+    TlsReadReply, TlsStreamId, TlsWriteReply, TypedCall, UdpBindReply, UdpCloseSocketReply,
+    UdpRecvFromReply, UdpSendToReply, UdpSocketId, WorkTicket, call, call_cancelable,
+    call_handle_call_id, call_request, call_typed, call_with_handle, cancel_call, dns_lookup,
+    file_close, file_create, file_fsync, file_open, file_read, file_read_at, file_size, file_write,
+    file_write_at, journal_append, journal_replay, mkdir, path_metadata, process_run, read_dir,
+    remove_file, rename_replace, send_observed, signal_wait, sleep, sleep_then, snapshot_commit,
+    snapshot_load, sync_parent, tcp_accept, tcp_bind, tcp_close_listener, tcp_close_stream,
+    tcp_connect, tcp_read, tcp_write, tls_accept, tls_bind, tls_close, tls_close_listener,
+    tls_connect, tls_read, tls_write, udp_bind, udp_close_socket, udp_recv_from, udp_send_to,
 };
 pub use call_group::{
     CallGroup, CallGroupBranchOutcome, CallGroupCancelOutcome, CallGroupCancelRequest,
@@ -220,19 +276,45 @@ pub use call_group::{
 };
 pub use capacity::{
     CapacityAssertError, CapacityNameError, CapacitySummary, SurfaceAssertion,
-    format_discovery_line, format_discovery_report,
+    format_assertion_failure, format_discovery_line, format_discovery_report,
 };
 pub use deferred::{
-    InsertError as PendingRepliesInsertError, PendingReplies,
-    TryCaptureError as PendingRepliesTryCaptureError,
+    InsertError as PendingRepliesInsertError, ParkCallError, ParkError, ParkTicket, PendingReplies,
+    ReplyParkedError, TakeParkedError, TryCaptureError as PendingRepliesTryCaptureError,
+    request_effect_after_park,
 };
 use driver::DriverCompletion;
+pub use event_sink::{
+    BoundedEventSink, DropPolicy, EventSinkDrain, EventSinkReport, EventSinkSurface,
+};
+pub use fact::{
+    GrpcStatusCode, GrpcStreamId, Http2CloseReason, Http2FlowControlSide, Http2ResetReason,
+    Http2StreamId, IntoRuntimeFact, ProtocolConnectionId, ProtocolDirection, ProtocolFact,
+    ProtocolFamily, RuntimeFact, WebSocketCloseReason, WebSocketSessionId,
+};
+pub use guarded_pending::{
+    GuardedInsertError, GuardedParkCallError, GuardedParkError, GuardedParkTicket,
+    GuardedPendingReplies, GuardedReplyError, GuardedTakeError,
+};
 pub use observation::{
     BoundAddressWaiter, ChildRestarted, ChildRestartedWaiter, IsolateCompleteWaiter,
     IsolateResultWaiter, OperationDoneWaiter, ResultWaitError, WaitError,
 };
 pub use observer::TraceObserver;
 pub use pressure::{MailboxBudget, PressureReport, PressureSummary, format_pressure_line};
+pub use scope::{
+    CallContextScopeExt, DeferScopedThrough, DeferredScopedCall, RequestScope, RequestScopeId,
+    RequestScopeInsertError, RequestScopeRemoveError, RequestScopeSet,
+    RequestScopeSetCapacityReport, ScopeCancelCause, ScopeCancelReport, ScopeChildReport,
+    ScopeRegisterError, ScopeRegisterSharedError, ScopedAdmitError, ScopedCallHandle,
+    ScopedReplyError, scope_register,
+};
+pub use service_pressure::{ServicePressureReport, ServicePressureSurface, ServiceSurfaceState};
+pub use shared_scope::{SharedCapacityScope, SharedLease, SharedScopeFull, SharedScopeReport};
+pub use shared_work::{
+    SharedWork, SharedWorkCallError, SharedWorkError, SharedWorkReplyError, SharedWorkSnapshot,
+    SharedWorkTicket, request_effect_after_shared_wait,
+};
 pub use tcp_loops::{LoopStep, ReadExactStep, TcpReadExact, TcpReadToEof, TcpWriteAll};
 /// Declares a Tina isolate whose call channel defaults to [`RuntimeCall<Message>`](RuntimeCall).
 ///
@@ -244,6 +326,11 @@ pub use trace::{
     DeferredReplyRejectedReason, DeferredSlotId, EffectKind, EventId, RestartSkippedReason,
     RuntimeEvent, RuntimeEventKind, RuntimeTraceExt, SendRejectedReason, SupervisionRejectedReason,
     stable_trace_hash,
+};
+pub use wait_list::{
+    WaitCallError as WaitListCallError, WaitError as WaitListError, WaitList,
+    WaitReplyError as WaitListReplyError, WaitSnapshot as WaitListSnapshot, WaitTicket,
+    request_effect_after_wait_park,
 };
 
 pub use driver::os_signal_capture_supported;
@@ -899,6 +986,7 @@ where
         I::Spawn: IntoErasedSpawn<S, F> + 'static,
         I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
         I::Call: IntoErasedCall<I::Message> + 'static,
+        I::Fact: IntoRuntimeFact + 'static,
         Outbound: 'static,
         M: Mailbox<I::Message> + 'static,
     {
@@ -928,6 +1016,7 @@ where
         I::Spawn: IntoErasedSpawn<S, F> + 'static,
         I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
         I::Call: IntoErasedCall<I::Message> + 'static,
+        I::Fact: IntoRuntimeFact + 'static,
         Outbound: 'static,
     {
         let address = self.register_entry::<I, Outbound>(
@@ -1007,6 +1096,7 @@ where
         I::Spawn: IntoErasedSpawn<S, F> + 'static,
         I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
         I::Call: IntoErasedCall<I::Message> + 'static,
+        I::Fact: IntoRuntimeFact + 'static,
         Outbound: 'static,
     {
         let address = self.register_with_capacity::<I, Outbound>(isolate, mailbox_capacity);
@@ -1031,12 +1121,46 @@ where
         I::Spawn: IntoErasedSpawn<S, F> + 'static,
         I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
         I::Call: IntoErasedCall<I::Message> + 'static,
+        I::Fact: IntoRuntimeFact + 'static,
         Outbound: 'static,
     {
         let address = self.register_with_capacity::<I, Outbound>(isolate, mailbox_capacity);
         SendOnlyServiceHandle {
             send: address.send_only(),
         }
+    }
+
+    /// Registers one split event/request service.
+    ///
+    /// The isolate's message type must be [`tina::ServiceMessage<Event,
+    /// Request>`], which the `#[tina_runtime::isolate(event = ..., request =
+    /// ..., reply = ...)]` macro emits. The returned handle exposes separate
+    /// event and request capabilities so ordinary code cannot send requests as
+    /// events or call events as requests.
+    #[allow(private_bounds)]
+    pub fn register_split_service<I, Event, Request, Outbound>(
+        &mut self,
+        isolate: I,
+        mailbox_capacity: usize,
+    ) -> SplitServiceHandle<Event, Request, I::Reply>
+    where
+        I: Isolate<
+                Shard = S,
+                Message = tina::ServiceMessage<Event, Request>,
+                Send = TinaOutbound<Outbound>,
+            > + tina::CallableIsolate
+            + 'static,
+        Event: 'static,
+        Request: 'static,
+        I::Reply: 'static,
+        I::Spawn: IntoErasedSpawn<S, F> + 'static,
+        I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
+        I::Call: IntoErasedCall<I::Message> + 'static,
+        I::Fact: IntoRuntimeFact + 'static,
+        Outbound: 'static,
+    {
+        let address = self.register_with_capacity::<I, Outbound>(isolate, mailbox_capacity);
+        SplitServiceHandle::from_address(address)
     }
 
     /// Registers one isolate and prefills its mailbox with `bootstrap` so the
@@ -1066,6 +1190,7 @@ where
         I::Spawn: IntoErasedSpawn<S, F> + 'static,
         I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
         I::Call: IntoErasedCall<I::Message> + 'static,
+        I::Fact: IntoRuntimeFact + 'static,
         Outbound: 'static,
     {
         let mailbox = self
@@ -1125,6 +1250,7 @@ where
         I::Spawn: IntoErasedSpawn<S, F> + 'static,
         I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
         I::Call: IntoErasedCall<I::Message> + 'static,
+        I::Fact: IntoRuntimeFact + 'static,
         Outbound: 'static,
         Ctor: FnOnce(Address<I::Message, I::Reply>) -> I,
     {
@@ -1215,6 +1341,23 @@ where
                 }),
             )),
         }
+    }
+
+    /// Attempts to enqueue one public event through a split-service event
+    /// capability.
+    ///
+    /// This is the host/runtime companion to [`tina::send_event`]. It keeps
+    /// tests and setup code on the capability-typed path instead of unwrapping
+    /// the raw `ServiceMessage<Event, Request>` address.
+    pub fn try_send_event<Event: 'static, Request: 'static>(
+        &self,
+        address: tina::ServiceEventAddress<Event, Request>,
+        event: Event,
+    ) -> Result<(), TrySendError<tina::ServiceMessage<Event, Request>>> {
+        self.try_send(
+            address.address().address(),
+            tina::ServiceMessage::Event(event),
+        )
     }
 
     /// Configures a registered isolate as supervisor for its direct children.
@@ -1872,6 +2015,14 @@ where
             }
             ErasedEffect::ReplyTo { handle, message } => {
                 self.execute_reply_to(isolate_id, cause, handle, message, route_remote);
+                false
+            }
+            ErasedEffect::Fact(fact) => {
+                self.push_event(
+                    isolate_id,
+                    Some(cause),
+                    RuntimeEventKind::FactObserved { fact },
+                );
                 false
             }
         }
@@ -3719,6 +3870,7 @@ where
         I::Spawn: IntoErasedSpawn<S, F> + 'static,
         I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
         I::Call: IntoErasedCall<I::Message> + 'static,
+        I::Fact: IntoRuntimeFact + 'static,
         Outbound: 'static,
     {
         let isolate_id = IsolateId::new(self.next_isolate_id);
@@ -3758,6 +3910,7 @@ where
         I::Spawn: IntoErasedSpawn<S, F> + 'static,
         I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
         I::Call: IntoErasedCall<I::Message> + 'static,
+        I::Fact: IntoRuntimeFact + 'static,
         Outbound: Send + 'static,
     {
         let address = self.register_sendable_entry::<I, Outbound>(
@@ -3787,6 +3940,7 @@ where
         I::Spawn: IntoErasedSpawn<S, F> + 'static,
         I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
         I::Call: IntoErasedCall<I::Message> + 'static,
+        I::Fact: IntoRuntimeFact + 'static,
         Outbound: Send + 'static,
     {
         let mailbox = self
@@ -3825,6 +3979,7 @@ where
         I::Spawn: IntoErasedSpawn<S, F> + 'static,
         I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
         I::Call: IntoErasedCall<I::Message> + 'static,
+        I::Fact: IntoRuntimeFact + 'static,
         Outbound: Send + 'static,
     {
         let isolate_id = IsolateId::new(self.next_isolate_id);
@@ -3866,6 +4021,7 @@ where
         I::Spawn: IntoErasedSpawn<S, F> + 'static,
         I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
         I::Call: IntoErasedCall<I::Message> + 'static,
+        I::Fact: IntoRuntimeFact + 'static,
         Outbound: 'static,
     {
         if mailbox_capacity == 0 {
@@ -4171,6 +4327,7 @@ where
     I::Spawn: IntoErasedSpawn<S, F> + 'static,
     I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
     I::Call: IntoErasedCall<I::Message> + 'static,
+    I::Fact: IntoRuntimeFact + 'static,
     Outbound: 'static,
     S: Shard,
     F: MailboxFactory,
@@ -4242,6 +4399,7 @@ where
     I::Spawn: IntoErasedSpawn<S, F> + 'static,
     I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
     I::Call: IntoErasedCall<I::Message> + 'static,
+    I::Fact: IntoRuntimeFact + 'static,
     Outbound: Send + 'static,
     S: Shard,
     F: MailboxFactory,
@@ -4305,6 +4463,7 @@ where
     I::Spawn: IntoErasedSpawn<S, F> + 'static,
     I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
     I::Call: IntoErasedCall<I::Message> + 'static,
+    I::Fact: IntoRuntimeFact + 'static,
     Outbound: 'static,
     S: Shard,
     F: MailboxFactory,
@@ -4340,6 +4499,7 @@ where
             handle: tina::runtime_internal::deferred_into_handle(slot),
             message: ErasedMessage::Local(Box::new(reply)),
         },
+        Effect::Fact(fact) => ErasedEffect::Fact(fact.into_runtime_fact()),
     }
 }
 
@@ -4351,6 +4511,7 @@ where
     I::Spawn: IntoErasedSpawn<S, F> + 'static,
     I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
     I::Call: IntoErasedCall<I::Message> + 'static,
+    I::Fact: IntoRuntimeFact + 'static,
     Outbound: Send + 'static,
     S: Shard,
     F: MailboxFactory,
@@ -4386,6 +4547,7 @@ where
             handle: tina::runtime_internal::deferred_into_handle(slot),
             message: ErasedMessage::Sendable(Box::new(reply)),
         },
+        Effect::Fact(fact) => ErasedEffect::Fact(fact.into_runtime_fact()),
     }
 }
 
@@ -4425,6 +4587,7 @@ where
         handle: DeferredReplyHandle,
         message: ErasedMessage,
     },
+    Fact(RuntimeFact),
 }
 
 impl<S, F> ErasedEffect<S, F>
@@ -4446,6 +4609,7 @@ where
             Self::Call(_) => EffectKind::Call,
             Self::Batch(_) => EffectKind::Batch,
             Self::ReplyTo { .. } => EffectKind::ReplyTo,
+            Self::Fact(_) => EffectKind::Fact,
         }
     }
 
@@ -4807,6 +4971,7 @@ where
     I::Spawn: IntoErasedSpawn<S, F> + 'static,
     I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
     I::Call: IntoErasedCall<I::Message> + 'static,
+    I::Fact: IntoRuntimeFact + 'static,
     Outbound: 'static,
     S: Shard,
     F: MailboxFactory,
@@ -4844,6 +5009,7 @@ where
     I::Spawn: IntoErasedSpawn<S, F> + 'static,
     I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
     I::Call: IntoErasedCall<I::Message> + 'static,
+    I::Fact: IntoRuntimeFact + 'static,
     OutboundMsg: 'static,
     S: Shard,
     F: MailboxFactory,
@@ -4877,6 +5043,7 @@ where
     I::Spawn: IntoErasedSpawn<S, F> + 'static,
     I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
     I::Call: IntoErasedCall<I::Message> + 'static,
+    I::Fact: IntoRuntimeFact + 'static,
     Outbound: 'static,
     S: Shard,
     F: MailboxFactory,
@@ -4920,6 +5087,7 @@ where
     I::Spawn: IntoErasedSpawn<S, F> + 'static,
     I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
     I::Call: IntoErasedCall<I::Message> + 'static,
+    I::Fact: IntoRuntimeFact + 'static,
     Outbound: 'static,
     S: Shard,
     F: MailboxFactory,
@@ -4944,6 +5112,7 @@ where
     I::Spawn: IntoErasedSpawn<S, F> + 'static,
     I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
     I::Call: IntoErasedCall<I::Message> + 'static,
+    I::Fact: IntoRuntimeFact + 'static,
     OutboundMsg: 'static,
     S: Shard,
     F: MailboxFactory,

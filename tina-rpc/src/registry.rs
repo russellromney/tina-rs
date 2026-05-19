@@ -352,6 +352,7 @@ where
     type Spawn = std::convert::Infallible;
     type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<RegistryMsg>;
+    type Fact = ::std::convert::Infallible;
     type Shard = S;
 
     fn handle(&mut self, msg: RegistryMsg, _ctx: &mut Context<'_, S, Self::Reply>) -> Effect<Self> {

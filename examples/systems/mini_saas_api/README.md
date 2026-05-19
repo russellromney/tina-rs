@@ -48,32 +48,70 @@ capacity/waiters/leased/full/closed/cancel counts. The stage field comes from
 the `tina_runtime::DrainState` helper, so the same typed vocabulary appears
 here as in any other Tina service that drains.
 
-## Readiness
+## Lifecycle
 
-`/health` is liveness. `/ready` is useful-work readiness. It returns `503` with
-typed reasons such as `db_closed`, `db_full`, `db_timeout`, `outbound_full`,
-`outbound_closed`, or `ingress_stopped`.
+The typed `tina_runtime::lifecycle::Lifecycle` enum names every state the
+service moves through. Each state means something specific:
+
+| State | Meaning |
+| --- | --- |
+| `Starting` | Listeners not yet bound, bridges not yet installed. The service rejects traffic. |
+| `Ready` | All bounded surfaces (DB pool, outbound pool, listener, body cap) accept useful work. |
+| `Degraded` | A dependency is unhappy but new work can still land. `/ready` answers 200 with a typed reason for monitoring. |
+| `Draining` | The controller has called `DrainState::begin`; ingress is closed; in-flight work is finishing. |
+| `NotReady` | A dependency closed and the service cannot serve useful work. `/ready` returns 503 with `<dep>_closed`. |
+| `Stopped` | Final state emitted in the terminal `ServiceShutdownReport`. The runtime has shut down. |
+
+`Lifecycle::admits_new_work()` is `true` only for `Ready` and `Degraded`. The
+helper is plain data; the controller decides which state it is in.
+
+`/health` answers process liveness ("alive\n"). The typed
+`RunReport::health_pre_shutdown` snapshot pairs the controller's current
+[`Lifecycle`](https://docs.rs/tina_runtime/lifecycle::Lifecycle) with the
+last live pressure report so dashboards can show "state + bounded surfaces"
+in one place.
+
+`/ready` answers useful-work readiness. The handler builds a typed
+`Readiness` from `ReadinessReason` variants (`IngressStopped`,
+`DependencyClosed("db")`, `DependencyFull("outbound")`, etc.) and renders
+the legacy wire body (`ready\n` or `not_ready reasons=<csv>\n`) so existing
+clients keep working.
 
 ## Shutdown Order
 
-1. Begin the controller drain (`DrainState::begin`) so the next public
-   request reads `drain.is_open() == false` and replies `ingress_stopped`.
-2. Let one already-admitted slow notify request finish with a typed reply.
-3. Probe readiness over HTTP so `ingress_stopped` is visible.
-4. Probe `/debug/capacity` so `drain.stage=draining` is visible in the report.
-5. Send one new POST and prove the typed `503 ingress_stopped` reply.
-6. Close the SQLite bridge.
-7. Probe readiness so `db_closed` is visible.
-8. Drain and stop the outbound keepalive pool with `shutdown_keepalive_pool`.
-9. Stop the notification listener and public listener.
-10. Shutdown the runtime and assert the terminal report/trace facts.
+The host wraps the sequence in a `ShutdownChoreography`. Each step records
+its kind, label, elapsed time, and outcome; the terminal
+`ServiceShutdownReport` is in `RunReport::shutdown_report`. Per-resource
+close reports use the shared `ResourceCloseReport` vocabulary (name, kind,
+admission, outcome) so a dashboard reads the same shape no matter which
+resource closed.
 
-The controller stays in `Draining` for the rest of its life. `Stopped` is the
-`DrainState` terminal arm that fires when a service owns its own drain
-handshake; here the host owns terminal proof through the runtime trace and the
-keepalive pool shutdown report, so `drain.finish()` is never called from
-inside the controller. `examples/systems/system_metrics_shipper` is the
-worked example for the service-owned drain shape, where `Stopped` is reached.
+1. `StopIngress` — `ControllerMsg::CloseIngress` flips
+   `DrainState::begin`, so the next public request reads
+   `drain.is_open() == false` and replies `ingress_stopped`.
+2. `DrainInFlight` — wait for one already-admitted slow notify request to
+   finish with a typed reply.
+3. Probe readiness over HTTP so `ingress_stopped` is visible.
+4. Probe `/debug/capacity` so `drain.stage=draining` is visible.
+5. Send one new POST and prove the typed `503 ingress_stopped` reply.
+6. `CloseResource db.bridge` — close the SQLite bridge. The choreography
+   records the `ResourceCloseReport` (kind=`bridge`, admission=`drain`).
+7. Probe readiness so `db_closed` is visible.
+8. `CloseResource outbound.pool` — drain and stop the outbound keepalive
+   pool with `shutdown_keepalive_pool`. The `KeepalivePoolShutdownReport`
+   numbers are folded into the `ResourceCloseReport` details string.
+9. `CloseResource notify.listener` and `CloseResource main.listener` —
+   stop both HTTP listeners.
+10. `StopOwner` — shutdown the runtime. Assert the terminal trace facts.
+
+`ShutdownChoreography` flags out-of-order recordings with
+`StepOutcome::OrderingViolation`; the terminal report's `clean` flag goes
+false if any step is misordered or times out. The controller stays in
+`Draining` while the host owns terminal proof; the typed `Stopped` state is
+the one written into the terminal `ServiceShutdownReport` /
+`Health::state`. `examples/systems/system_metrics_shipper` shows the
+service-owned drain shape where `DrainState::finish` is reached inside the
+isolate.
 
 ## Multi-Turn Replies
 
@@ -113,8 +151,45 @@ text.
 Run the system smoke from the repo root:
 
 ```sh
-cargo test --manifest-path examples/systems/mini_saas_api/Cargo.toml
+# Full system smoke (scripted scenarios + capacity assertions):
+cargo test --manifest-path examples/systems/mini_saas_api/Cargo.toml --test smoke
+
+# Load/soak proof (Phase 108) with typed capacity contract:
+cargo test --manifest-path examples/systems/mini_saas_api/Cargo.toml --test soak -- --nocapture
 ```
+
+The soak proof drives 4 workers × 240 ops across three lanes
+(`/health`, `/items/1`, `/items/1/notify`) via
+`tina_proof_harness::load`. Sample one-line output:
+
+```text
+soak load label=mini_saas_api_soak workers=4 ops=240 ok=206 err=34 timeout=0 \
+  min_us=422 p50_us=709 p99_us=3305 max_us=3756 elapsed_ms=59 leak_clean=true \
+  pressure total=34 rate_per_mille=141 max_consecutive=2 first_err_op=0 by_kind=[http_503:34] \
+  shutdown_clean=true capacity={ ... db.full=34 outbound.full=0 runtime.send_full=0 ... }
+```
+
+The contract: every harness 5xx must map to a typed pressure event on
+the controller's `/debug/capacity` line or the live runtime pressure
+trace — `db.full`, `outbound.full`, or `runtime.*_full`. If those
+typed counters do not cover `ops_err`, the test fails closed because
+pressure is escaping the typed surface. The
+typed `pressure` summary on the load report (rate, burst length,
+first error position, per-kind breakdown) lets specimens assert
+"pressure stayed under N per mille" or "no burst longer than K
+consecutive errors" without parsing the summary line.
+
+What this exposes when it fails:
+
+- `ops_timeout > 0` → transport hung; the listener or connection
+  drain path stopped accepting work mid-load.
+- `leak_clean=false` → the load harness's leak hook returned false
+  (currently unused but reserved for future capacity-snapshot probes).
+- `db.full + outbound.full + runtime.*_full < ops_err` → some pressure
+  path is returning 5xx without a matching typed event. That is the
+  hidden-pressure regression the soak is designed to catch.
+- `shutdown_clean=false` → the keepalive pool drained dirty (leaked
+  in-flight, timed out, or hit `connection_failures`).
 
 Run the documented executable smoke:
 
@@ -163,10 +238,21 @@ What felt good:
   easy to copy without hidden context.
 - `DrainState` names the host-driven `Open` → `Draining` transition with
   one typed stage field in `/debug/capacity`, instead of hiding it behind a
-  service-local `bool`. The terminal `Stopped` arm exists in the helper but
-  is reached by services that own their own drain handshake, not by a
-  host-driven HTTP service like this one.
+  service-local `bool`.
 - SQLite and keepalive pool pressure reports already had the right vocabulary.
+- `tina_runtime::lifecycle::ShutdownChoreography` collapses the host
+  shutdown sequence into one builder that records typed step kinds,
+  per-resource close reports, and ordering violations. The shutdown loop
+  in `tina_impl.rs` reads top-to-bottom instead of being a string of
+  unrelated `try_send`/`shutdown_keepalive_pool` calls with a hand-built
+  terminal line at the end. The typed `ServiceShutdownReport` lives on
+  `RunReport::shutdown_report` and the smoke test pattern-matches on it
+  instead of grepping `terminal_line`.
+- `Readiness` + `ReadinessReason` replace the stringly-typed
+  `ready_reasons(&[...])` helper. The legacy HTTP body (`not_ready
+  reasons=<csv>`) is now generated by `Readiness::legacy_body()` so the
+  wire format stays identical while the call sites traffic in typed
+  variants.
 
 What felt rough:
 - The route body parsing is deliberately local and boring.
@@ -175,11 +261,12 @@ What felt rough:
 
 Tina capability pulled:
 - Native HTTP, SQLite bridge, keepalive pool, readiness, shutdown, capacity,
-  `DrainState`, and trace-derived multi-turn proof.
+  `DrainState`, typed `Lifecycle` / `ServiceTopology` / `ShutdownChoreography`,
+  and trace-derived multi-turn proof.
 
 Suggested follow-up:
-- Keep shutdown/report formatting local until another system repeats the same
-  exact shape.
+- Move the `pool_shutdown_to_close_report` adapter into `tina-http` if a
+  second service repeats the exact same conversion.
 
 Verdict:
 - keep

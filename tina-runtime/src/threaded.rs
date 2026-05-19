@@ -346,6 +346,7 @@ where
         I::Spawn: IntoErasedSpawn<S, F> + 'static,
         I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
         I::Call: IntoErasedCall<I::Message> + 'static,
+        I::Fact: crate::fact::IntoRuntimeFact + 'static,
         Outbound: 'static,
     {
         self.call(move |runtime| {
@@ -376,6 +377,7 @@ where
         I::Spawn: IntoErasedSpawn<S, F> + 'static,
         I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
         I::Call: IntoErasedCall<I::Message> + 'static,
+        I::Fact: crate::fact::IntoRuntimeFact + 'static,
         Outbound: 'static,
     {
         self.register_with_capacity::<I, Outbound>(isolate, mailbox_capacity)
@@ -400,12 +402,42 @@ where
         I::Spawn: IntoErasedSpawn<S, F> + 'static,
         I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
         I::Call: IntoErasedCall<I::Message> + 'static,
+        I::Fact: crate::fact::IntoRuntimeFact + 'static,
         Outbound: 'static,
     {
         self.register_with_capacity::<I, Outbound>(isolate, mailbox_capacity)
             .map(|address| crate::SendOnlyServiceHandle {
                 send: address.send_only(),
             })
+    }
+
+    /// Threaded mirror of
+    /// [`Runtime::register_split_service`](crate::Runtime::register_split_service).
+    #[allow(private_bounds)]
+    pub fn register_split_service<I, Event, Request, Outbound>(
+        &self,
+        isolate: I,
+        mailbox_capacity: usize,
+    ) -> Result<crate::SplitServiceHandle<Event, Request, I::Reply>, ThreadedRuntimeError>
+    where
+        I: Isolate<
+                Shard = S,
+                Message = tina::ServiceMessage<Event, Request>,
+                Send = TinaOutbound<Outbound>,
+            > + tina::CallableIsolate
+            + Send
+            + 'static,
+        Event: 'static,
+        Request: 'static,
+        I::Reply: 'static,
+        I::Spawn: IntoErasedSpawn<S, F> + 'static,
+        I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
+        I::Call: IntoErasedCall<I::Message> + 'static,
+        I::Fact: crate::fact::IntoRuntimeFact + 'static,
+        Outbound: 'static,
+    {
+        self.register_with_capacity::<I, Outbound>(isolate, mailbox_capacity)
+            .map(crate::SplitServiceHandle::from_address)
     }
 
     /// Threaded mirror of [`Runtime::register_with_capacity_and_bootstrap`].
@@ -429,6 +461,7 @@ where
         I::Spawn: IntoErasedSpawn<S, F> + 'static,
         I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
         I::Call: IntoErasedCall<I::Message> + 'static,
+        I::Fact: crate::fact::IntoRuntimeFact + 'static,
         Outbound: 'static,
     {
         match self.call(move |runtime| {
@@ -476,6 +509,7 @@ where
         I::Spawn: IntoErasedSpawn<S, F> + 'static,
         I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
         I::Call: IntoErasedCall<I::Message> + 'static,
+        I::Fact: crate::fact::IntoRuntimeFact + 'static,
         Outbound: 'static,
         Ctor: FnOnce(Address<I::Message, I::Reply>) -> I + Send + 'static,
     {
@@ -656,6 +690,70 @@ where
                 Err(ThreadedTrySendError::WorkerStopped)
             }
         }
+    }
+
+    /// Attempts one public event send through a split-service event
+    /// capability.
+    ///
+    /// This is the threaded host companion to [`tina::send_event`]. It avoids
+    /// the raw `ServiceMessage<Event, Request>` escape hatch in copied tests
+    /// and setup code.
+    pub fn try_send_event<Event, Request>(
+        &self,
+        address: tina::ServiceEventAddress<Event, Request>,
+        event: Event,
+    ) -> Result<(), ThreadedTrySendError>
+    where
+        Event: Send + 'static,
+        Request: Send + 'static,
+    {
+        self.try_send(
+            address.address().address(),
+            tina::ServiceMessage::Event(event),
+        )
+    }
+
+    /// Sends one public event through a split-service event capability and
+    /// waits for the worker to observe the target mailbox outcome.
+    ///
+    /// This is the split-service companion to
+    /// [`send_and_observe`](Self::send_and_observe). Use it in host-driven
+    /// setup/tests when `Full` / `Closed` must stay visible.
+    pub fn send_event_and_observe<Event, Request>(
+        &self,
+        address: tina::ServiceEventAddress<Event, Request>,
+        event: Event,
+    ) -> Result<(), ThreadedSendObservedError>
+    where
+        Event: Send + 'static,
+        Request: Send + 'static,
+    {
+        self.send_and_observe(
+            address.address().address(),
+            tina::ServiceMessage::Event(event),
+        )
+    }
+
+    /// Retries public event admission through a split-service event capability
+    /// until the event lands or the deadline elapses.
+    ///
+    /// This is the split-service companion to
+    /// [`send_observed_until`](Self::send_observed_until).
+    pub fn send_event_observed_until<Event, Request, MakeEvent>(
+        &self,
+        address: tina::ServiceEventAddress<Event, Request>,
+        deadline: Instant,
+        backoff: Duration,
+        mut make_event: MakeEvent,
+    ) -> Result<(), SendObservedUntilError>
+    where
+        Event: Send + 'static,
+        Request: Send + 'static,
+        MakeEvent: FnMut() -> Event,
+    {
+        self.send_observed_until(address.address().address(), deadline, backoff, move || {
+            tina::ServiceMessage::Event(make_event())
+        })
     }
 
     /// Attempts one typed ingress send and waits for the worker to observe the
@@ -1131,6 +1229,29 @@ where
         R: Send + 'static,
     {
         self.call_blocking(address.address(), message, timeout)
+    }
+
+    /// Blocking host call through a split-service request capability.
+    ///
+    /// This is the threaded host companion to [`crate::call_request`]. It
+    /// wraps the request in [`tina::ServiceMessage::Request`] and keeps host
+    /// code from reaching for the raw split envelope address.
+    pub fn call_blocking_request<Event, Request, Reply>(
+        &self,
+        address: tina::ServiceRequestAddress<Event, Request, Reply>,
+        request: Request,
+        timeout: Duration,
+    ) -> Result<CallOutcome<Reply>, ThreadedRuntimeError>
+    where
+        Event: Send + 'static,
+        Request: Send + 'static,
+        Reply: Send + 'static,
+    {
+        self.call_blocking(
+            address.address().address(),
+            tina::ServiceMessage::Request(request),
+            timeout,
+        )
     }
 
     /// Returns a cloneable handle that controls runtime-level shutdown

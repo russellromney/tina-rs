@@ -176,6 +176,7 @@ where
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<ClientResultMsg>;
+    type Fact = Infallible;
     type Shard = S;
 
     fn handle(

@@ -4,10 +4,10 @@ use std::sync::{Arc, Barrier, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use tina::{CallContext, prelude::*};
+use tina::prelude::*;
 use tina_runtime::{
-    CallOutcome, DefaultThreadedMailboxFactory, PendingReplies, ServiceHandle, SleepReply,
-    ThreadedRuntime, sleep,
+    CallOutcome, DefaultThreadedMailboxFactory, SharedWork, SharedWorkError, SleepReply,
+    SplitServiceHandle, ThreadedRuntime, request_effect_after_shared_wait, sleep,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -89,17 +89,21 @@ pub enum ValueSource {
 }
 
 #[derive(Debug)]
-enum CacheMsg {
+enum CacheEvent {
+    FillDone {
+        key: String,
+        generation: u64,
+        result: SleepReply,
+    },
+}
+
+#[derive(Debug)]
+enum CacheRequest {
     Get {
         key: String,
     },
     Invalidate {
         key: String,
-    },
-    FillDone {
-        key: String,
-        generation: u64,
-        result: SleepReply,
     },
     Stats,
 }
@@ -114,14 +118,12 @@ struct CacheEntry {
 #[derive(Debug)]
 struct FillState {
     generation: u64,
-    qids: Vec<u64>,
 }
 
 struct Cache {
     fill_delay: Duration,
-    pending: PendingReplies<u64, CacheReply>,
+    waiters: SharedWork<String, CacheReply>,
     entries: HashMap<String, CacheEntry>,
-    next_qid: u64,
     fills_started: usize,
     fills_completed: usize,
     stale_completions: usize,
@@ -131,16 +133,15 @@ struct Cache {
     stale_replies: usize,
 }
 
-#[tina_runtime::isolate(message = CacheMsg, reply = CacheReply)]
+#[tina_runtime::isolate(event = CacheEvent, request = CacheRequest, reply = CacheReply)]
 impl Cache {
-    fn handle(
+    fn handle_event(
         &mut self,
-        msg: CacheMsg,
+        event: CacheEvent,
         _ctx: &mut Context<'_, SingleShard, Self::Reply>,
     ) -> Effect<Self> {
-        match msg {
-            CacheMsg::Get { .. } | CacheMsg::Invalidate { .. } | CacheMsg::Stats => noop(),
-            CacheMsg::FillDone {
+        match event {
+            CacheEvent::FillDone {
                 key,
                 generation,
                 result,
@@ -148,12 +149,15 @@ impl Cache {
         }
     }
 
-    fn handle_call(&mut self, msg: CacheMsg, call: CallContext<'_, Self>) -> Effect<Self> {
-        match msg {
-            CacheMsg::Get { key } => self.get(key, call),
-            CacheMsg::Invalidate { key } => self.invalidate(key, call),
-            CacheMsg::Stats => call.reply(CacheReply::Stats(self.stats())),
-            CacheMsg::FillDone { .. } => call.reject(tina::CallRejectedReason::UnsupportedMessage),
+    fn handle_request(
+        &mut self,
+        request: CacheRequest,
+        call: RequestCall<'_, Self>,
+    ) -> RequestEffect<Self> {
+        match request {
+            CacheRequest::Get { key } => self.get(key, call),
+            CacheRequest::Invalidate { key } => self.invalidate(key, call),
+            CacheRequest::Stats => call.reply(CacheReply::Stats(self.stats())),
         }
     }
 }
@@ -162,10 +166,9 @@ impl Cache {
     fn new(pending_capacity: usize, fill_delay: Duration) -> Self {
         Self {
             fill_delay,
-            pending: PendingReplies::with_capacity(pending_capacity)
-                .named("system_cache_with_fill.pending"),
+            waiters: SharedWork::with_capacity(pending_capacity)
+                .named("system_cache_with_fill.waiters"),
             entries: HashMap::new(),
-            next_qid: 1,
             fills_started: 0,
             fills_completed: 0,
             stale_completions: 0,
@@ -176,7 +179,7 @@ impl Cache {
         }
     }
 
-    fn get(&mut self, key: String, call: CallContext<'_, Self>) -> Effect<Self> {
+    fn get(&mut self, key: String, call: RequestCall<'_, Self>) -> RequestEffect<Self> {
         if let Some(value) = self.entries.get(&key).and_then(|entry| entry.value.clone()) {
             self.hits += 1;
             return call.reply(CacheReply::Value {
@@ -186,59 +189,51 @@ impl Cache {
             });
         }
 
-        let qid = self.next_qid;
-        self.next_qid += 1;
-        let slot = call.into_request_context().into_deferred();
-        if let Err(error) = self.pending.try_insert(qid, slot) {
-            return match error {
-                tina_runtime::PendingRepliesInsertError::Full(_, slot) => {
-                    self.busy_replies += 1;
-                    reply_to(slot, CacheReply::Busy)
+        match self.waiters.wait(key.clone(), call) {
+            Ok(ticket) => {
+                let entry = self.entries.entry(key.clone()).or_default();
+                if entry.filling.is_some() {
+                    return request_effect_after_shared_wait(&ticket, noop());
                 }
-                tina_runtime::PendingRepliesInsertError::DuplicateKey(_, slot) => {
-                    reply_to(slot, CacheReply::Failed("duplicate waiter qid".into()))
-                }
-            };
+                let generation = entry.generation;
+                entry.filling = Some(FillState { generation });
+                self.fills_started += 1;
+                let fill_effect = sleep(self.fill_delay).then(move |result| {
+                    tina::ServiceMessage::Event(CacheEvent::FillDone {
+                        key,
+                        generation,
+                        result,
+                    })
+                });
+                request_effect_after_shared_wait(&ticket, fill_effect)
+            }
+            Err(SharedWorkError::Full { call, .. }) => {
+                self.busy_replies += 1;
+                call.reply(CacheReply::Busy)
+            }
+            Err(SharedWorkError::KeyFull { call, .. }) => {
+                self.busy_replies += 1;
+                call.reply(CacheReply::Busy)
+            }
         }
-
-        let entry = self.entries.entry(key.clone()).or_default();
-        if let Some(fill) = &mut entry.filling {
-            fill.qids.push(qid);
-            return noop();
-        }
-
-        let generation = entry.generation;
-        entry.filling = Some(FillState {
-            generation,
-            qids: vec![qid],
-        });
-        self.fills_started += 1;
-        sleep(self.fill_delay).then(move |result| CacheMsg::FillDone {
-            key,
-            generation,
-            result,
-        })
     }
 
-    fn invalidate(&mut self, key: String, call: CallContext<'_, Self>) -> Effect<Self> {
+    fn invalidate(&mut self, key: String, call: RequestCall<'_, Self>) -> RequestEffect<Self> {
         self.invalidations += 1;
-        let entry = self.entries.entry(key).or_default();
+        let entry = self.entries.entry(key.clone()).or_default();
         entry.generation += 1;
         entry.value = None;
 
-        let Some(fill) = entry.filling.take() else {
+        let Some(_fill) = entry.filling.take() else {
             return call.reply(CacheReply::Invalidated);
         };
 
-        self.stale_replies += fill.qids.len();
-        let mut effects = Vec::with_capacity(fill.qids.len() + 1);
-        for qid in fill.qids {
-            if let Some(slot) = self.pending.take(&qid) {
-                effects.push(reply_to::<Self>(slot, CacheReply::Stale));
-            }
-        }
-        effects.push(call.reply(CacheReply::Invalidated));
-        Effect::Batch(effects)
+        call.capture(|request| {
+            let mut effects = self.waiters.close_all_clone::<Self>(&key, CacheReply::Stale);
+            self.stale_replies += effects.len();
+            effects.push(reply_to_request::<Self>(request, CacheReply::Invalidated));
+            Effect::Batch(effects)
+        })
     }
 
     fn fill_done(&mut self, key: String, generation: u64, result: SleepReply) -> Effect<Self> {
@@ -262,32 +257,20 @@ impl Cache {
                 let value = format!("value:{key}:g{generation}");
                 entry.value = Some(value.clone());
                 self.fills_completed += 1;
-                let mut effects = Vec::with_capacity(fill.qids.len());
-                for qid in fill.qids {
-                    if let Some(slot) = self.pending.take(&qid) {
-                        effects.push(reply_to::<Self>(
-                            slot,
-                            CacheReply::Value {
-                                key: key.clone(),
-                                value: value.clone(),
-                                source: ValueSource::Fill,
-                            },
-                        ));
+                Effect::Batch(self.waiters.reply_all_with::<Self, _>(&key, || {
+                    CacheReply::Value {
+                        key: key.clone(),
+                        value: value.clone(),
+                        source: ValueSource::Fill,
                     }
-                }
-                Effect::Batch(effects)
+                }))
             }
             Err(error) => {
-                let mut effects = Vec::with_capacity(fill.qids.len());
-                for qid in fill.qids {
-                    if let Some(slot) = self.pending.take(&qid) {
-                        effects.push(reply_to::<Self>(
-                            slot,
-                            CacheReply::Failed(format!("{error:?}")),
-                        ));
-                    }
-                }
-                Effect::Batch(effects)
+                let message = format!("{error:?}");
+                Effect::Batch(
+                    self.waiters
+                        .reply_all_with::<Self, _>(&key, || CacheReply::Failed(message.clone())),
+                )
             }
         }
     }
@@ -306,8 +289,8 @@ impl Cache {
             hits: self.hits,
             busy_replies: self.busy_replies,
             stale_replies: self.stale_replies,
-            pending_high_water: self.pending.high_water(),
-            pending_full_rejects: self.pending.full_rejects(),
+            pending_high_water: self.waiters.high_water(),
+            pending_full_rejects: self.waiters.full_rejects(),
         }
     }
 }
@@ -337,9 +320,9 @@ pub fn run_single_flight(config: RunConfig) -> anyhow::Result<SingleFlightReport
         let out = Arc::clone(&outcomes);
         threads.push(thread::spawn(move || {
             gate.wait();
-            let outcome = rt.call_blocking_typed(
-                cache.call,
-                CacheMsg::Get {
+            let outcome = rt.call_blocking_request(
+                cache.requests,
+                CacheRequest::Get {
                     key: "shared".into(),
                 },
                 timeout,
@@ -368,9 +351,9 @@ pub fn run_single_flight(config: RunConfig) -> anyhow::Result<SingleFlightReport
     }
 
     let hit_after_fill = matches!(
-        runtime.call_blocking_typed(
-            cache.call,
-            CacheMsg::Get {
+        runtime.call_blocking_request(
+            cache.requests,
+            CacheRequest::Get {
                 key: "shared".into()
             },
             timeout
@@ -380,7 +363,7 @@ pub fn run_single_flight(config: RunConfig) -> anyhow::Result<SingleFlightReport
             ..
         })
     );
-    let stats = stats(&runtime, cache.call)?;
+    let stats = stats(&runtime, cache.requests)?;
     shutdown(runtime);
 
     Ok(SingleFlightReport {
@@ -402,11 +385,11 @@ pub fn run_stale_invalidation(config: RunConfig) -> anyhow::Result<StaleInvalida
     let timeout = Duration::from_millis(config.call_timeout_ms);
 
     let rt = Arc::clone(&runtime);
-    let cache_call = cache.call;
+    let cache_call = cache.requests;
     let first = thread::spawn(move || {
-        rt.call_blocking_typed(
+        rt.call_blocking_request(
             cache_call,
-            CacheMsg::Get {
+            CacheRequest::Get {
                 key: "invalidate-me".into(),
             },
             timeout,
@@ -414,9 +397,9 @@ pub fn run_stale_invalidation(config: RunConfig) -> anyhow::Result<StaleInvalida
     });
 
     thread::sleep(Duration::from_millis((config.fill_ms / 4).max(1)));
-    let _ = runtime.call_blocking_typed(
-        cache.call,
-        CacheMsg::Invalidate {
+    let _ = runtime.call_blocking_request(
+        cache.requests,
+        CacheRequest::Invalidate {
             key: "invalidate-me".into(),
         },
         timeout,
@@ -429,9 +412,9 @@ pub fn run_stale_invalidation(config: RunConfig) -> anyhow::Result<StaleInvalida
 
     thread::sleep(Duration::from_millis(config.fill_ms + 20));
     let replacement_filled = matches!(
-        runtime.call_blocking_typed(
-            cache.call,
-            CacheMsg::Get {
+        runtime.call_blocking_request(
+            cache.requests,
+            CacheRequest::Get {
                 key: "invalidate-me".into()
             },
             timeout
@@ -441,7 +424,7 @@ pub fn run_stale_invalidation(config: RunConfig) -> anyhow::Result<StaleInvalida
             ..
         })
     );
-    let stats = stats(&runtime, cache.call)?;
+    let stats = stats(&runtime, cache.requests)?;
     shutdown(runtime);
 
     Ok(StaleInvalidationReport {
@@ -454,9 +437,9 @@ pub fn run_stale_invalidation(config: RunConfig) -> anyhow::Result<StaleInvalida
 fn register_cache(
     runtime: &ThreadedRuntime<SingleShard, DefaultThreadedMailboxFactory>,
     config: RunConfig,
-) -> anyhow::Result<ServiceHandle<CacheMsg, CacheReply>> {
+) -> anyhow::Result<SplitServiceHandle<CacheEvent, CacheRequest, CacheReply>> {
     runtime
-        .register_service::<_, Infallible>(
+        .register_split_service::<Cache, CacheEvent, CacheRequest, Infallible>(
             Cache::new(
                 config.pending_capacity,
                 Duration::from_millis(config.fill_ms),
@@ -468,9 +451,9 @@ fn register_cache(
 
 fn stats(
     runtime: &ThreadedRuntime<SingleShard, DefaultThreadedMailboxFactory>,
-    cache: tina::CallAddress<CacheMsg, CacheReply>,
+    cache: tina::ServiceRequestAddress<CacheEvent, CacheRequest, CacheReply>,
 ) -> anyhow::Result<CacheStats> {
-    match runtime.call_blocking_typed(cache, CacheMsg::Stats, Duration::from_secs(1))? {
+    match runtime.call_blocking_request(cache, CacheRequest::Stats, Duration::from_secs(1))? {
         CallOutcome::Replied(CacheReply::Stats(stats)) => Ok(stats),
         other => anyhow::bail!("stats failed: {other:?}"),
     }

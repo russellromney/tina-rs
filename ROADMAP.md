@@ -82,7 +82,7 @@ start from an honest baseline rather than from stale roadmap wording.
 | Reference examples | A Rust task-dispatcher proof package and a TCP echo proof package both exist with matching runnable examples, backed by assertions rather than logs alone. The echo proof now keeps the listener alive across a one-client smoke run, a sequential multi-client run, and a bounded-overlap run, then closes the listener cleanly and exits. | These are still proof workloads, not a broad production-server claim or benchmark story. |
 | Runtime-owned I/O | `tina` names a runtime-owned call effect family (`Effect::Call(I::Call)` plus `Isolate::Call`) and an ordered batch effect (`Effect::Batch(Vec<Effect<I>>)`) for closed-set sequencing of existing effects. `tina-runtime` executes time, TCP server/client operations, local file/path operations, local persistence, UDP, bounded DNS, native TLS client and server lanes, bounded process runs, runtime shutdown notification, and Unix `SIGINT`/`SIGTERM` capture through Tina-owned driver rails with cancellation, shutdown, trace, and same-resource lane ownership. `tina-sim` scripts TCP, file/path, persistence, UDP, DNS, TLS, process, and signal rails for deterministic replay/DST. Capability reports name lane-backed, poll-backed, completion-backed, tombstoned, drained, and unsupported shapes. | Live-substrate liveness faults, remoting, clustering, native database clients, and production-grade streaming remain future work. |
 | Local persistence | `tina-runtime` exposes local snapshot/journal helpers with explicit append-before-apply semantics, snapshot `last_journal_index`, journal `record_index`, visible truncated/corrupt/commit-uncertain recovery outcomes, persistence trace events, and bounded live storage-lane admission for snapshot/journal work. `tina-sim` captures `DurableImage` path-to-bytes state for replay. | This is not a database, durable mailbox, durable work queue, or exactly-once system. Directory fsync and rename-commit support remain platform/backend scoped. Already-started local filesystem work cannot be preempted; a full nonblocking storage reactor remains future work. |
-| Native service protocols | `tina-http` now gives Tina a native HTTP stack: HTTP/1.1 parser/framing, connection/listener isolates, request/response types, routing helpers, bounded limits, visible overload, graceful close paths, native client, native HTTPS, response streaming, response-side and request-side chunked transfer, chunked client decode, keepalive client pool, server-side keepalive, HTTP/2 first form, WebSocket usable-server first form, native gRPC unary plus first streaming modes, and parser/DST coverage. | Production WebSocket replacement proof, advanced HTTP/2 parity, true gRPC bidi/client/TLS-ALPN polish, richer web-framework ergonomics, and full listener/connection simulator replay remain future work. |
+| Native service protocols | `tina-http` now gives Tina a native HTTP stack: HTTP/1.1 parser/framing, connection/listener isolates, request/response types, routing helpers, bounded limits, visible overload, graceful close paths, native client, native HTTPS, response streaming, response-side and request-side chunked transfer, chunked client decode, keepalive client pool, server-side keepalive, HTTP/2 with `#[non_exhaustive]` `Http2Outcome` naming the six lifecycle categories (`Replied`/`Full`/`Closed`/`FlowControlBlocked`/`Timeout`/`ProtocolError`/`StreamReset`/`LocalCancel`), typed `Http2ProtocolError` (peer-reset, flow-control, malformed-frame, oversized frame/headers/body, GOAWAY), and live tests that assert the wire error codes on every GOAWAY/RST_STREAM (FRAME_SIZE_ERROR, PROTOCOL_ERROR, FLOW_CONTROL_ERROR, REFUSED_STREAM, ENHANCE_YOUR_CALM) plus inbound/outbound DATA caps, stream and connection windows, peer reset, and window-update unblocking; native gRPC over h2c covering unary, server-streaming, client-streaming, and bidirectional modes with typed `GrpcStatus` trailers, deadline mapping, message caps, and tonic h2c interop; WebSocket server with browser `ws`/`wss` proof, ping/pong, close handshake, subprotocol selection, bounded outbound queue, slow-peer eviction, per-session report, and the `WebSocketMemberTable` admit/broadcast/shutdown helper; runtime/simulator protocol facts for HTTP/2, WebSocket, and gRPC status replay. DST replay covers parse-good/bad, slow body, service-full, shutdown-mid-request lifecycle, and protocol fact projections. | Native HTTP/2 client, HTTP/2 TLS ALPN/mTLS, gRPC reflection/interceptors/load balancing, native broad WebSocket client, `permessage-deflate`, web-framework ergonomics, full WebSocket-bytes simulator replay, and a production native Tina HTTP/2/gRPC client service whose received gRPC status can become a real runtime fact remain future work. |
 | Ecosystem bridges | `tina-tokio-bridge`, `tina-rpc-tokio`, `tina-tower-bridge`, `tina-reqwest-bridge`, `tina-sqlite-bridge`, `tina-sqlx-bridge`, and `tina-aws-bridge` exist as bounded bridge shapes. The docs name runtime cost, weakened replay boundary, explicit caps, shutdown truth, caller-owned retry, typed DB/S3/SQS outcomes, bridge tracing, and the shared bridge convention table. | DynamoDB/SNS/Secrets Manager, smol, common bridge setup extraction, and bridge crate/folder layout remain future work. |
 | App/service ergonomics | Specimen work has turned repeated example pain into typed result waiters, bounded observation handles, reply aliases, TCP loop helpers, pressure summaries, HTTP router sugar, sharded placement/table helpers, deferred replies, `CallContext` reply obligation, `RequestContext` multi-turn replies, typed child refs via `spawn_observed`, cancellation handles, deadlines, pending-call sets, bounded pools, host-burst helpers, single-call gates, reqwest/DB classifiers, capacity reports, weighted/shared body capacity, timer helper state, `RecurringTick`, `LocalPermitGate`, `DrainState`, `FullHandling`, register-and-bootstrap helpers, `PendingCancelableCallSet`, bounded first-success `CallGroup`, threaded shutdown handles, and host `call_blocking` scripts where appropriate. | Cross-isolate paired registration, generic scatter/gather happy-path helpers, host-side scenario/test ergonomics, join-all/stream-select helpers, natural-key keyed-wait helpers, and more real-world specimens remain future work. |
 
@@ -325,13 +325,18 @@ and reviews live under `.intent/phases/`.
 - Recent core capability tranche: capacity modeling round 2, bounded
   first-success `CallGroup`, live trace-to-sim replay capture, resource
   lifecycle shutdown matrix/keepalive shutdown helper, AWS S3/SQS bridge
-  surfaces, timer helper vocabulary, native HTTP/2 first form, usable
-  WebSocket server, native gRPC unary plus first streaming modes, cancelable
-  deferred admission, bridge convention audit, production service skeleton
-  refresh, compile-time rails, mailbox-first service helpers, and host-control
-  ergonomics. These are recorded in `CHANGELOG.md`; the next work is HTTP/2/
-  gRPC streaming finish, typed config/protocol state safety, natural-key
-  pending helpers, and the broader WebSocket replacement follow-up.
+  surfaces, timer helper vocabulary, native HTTP/2 with typed flow-control
+  errors and live tests, native gRPC unary/server/client/bidi streaming with
+  tonic h2c interop, the WebSocket production replacement story (browser
+  `ws`/`wss`, slow-peer eviction, per-session report, and the
+  `WebSocketMemberTable` helper), cancelable deferred admission, bridge
+  convention audit, production service skeleton refresh, compile-time rails,
+  mailbox-first service helpers, host-control ergonomics, production
+  client/bridge breadth, request-scoped cancellation, lifecycle/health/topology,
+  observability and capacity product, proof harnesses and replay ops, and the
+  typed config/protocol state safety split event/request rail. These are
+  recorded in `CHANGELOG.md`; the remaining near-term roadmap starts from the
+  core/ecosystem reorg and Wave A client/I/O/admission work below.
 
 ## Near-term roadmap
 
@@ -340,79 +345,85 @@ framework before public release-story work.
 
 | Phase | Purpose |
 |---|---|
-| **098 HTTP/2 and gRPC streaming finish** | Close the remaining server-side streaming gap: HTTP/2 full-duplex pressure proof, bidirectional gRPC, final-status ownership, peer-reset cancellation, and tonic/grpcurl interop for claimed modes. Production pooled Tina gRPC client and TLS ALPN stay separate unless deliberately shipped. Plan: `.intent/phases/098-http2-grpc-streaming-finish/plan.md`. |
-| **Natural-key and keyed-wait pending helpers** | Follow-up to 097 plus system specimens. Build the missing bounded pending vocabulary for natural keys: `PendingCancelableCallSlab<K, Q, R>` or equivalent for multiple cancelable entries per natural key, and likely `KeyedPendingReplies` / `WaitList<K, R>` for per-key FIFO waiters backed by one global cap. Must keep `(key, ticket)` ABA truth, typed `Full`/`BucketFull` admission errors, caller-authority recovery on failed admission, and skip-reclaimed-slot proof. No hidden dedup, no automatic key-versioning. |
+| **115 Core / ecosystem reorg** | Draw the core-vs-batteries boundary before Wave A adds more official batteries, and split the worst long core files along real module boundaries. Define learn-core vs choose-batteries docs, official battery rules, prelude/import tiers, public-hook gaps, dependency-layer rules, and no-behavior module homes. Plan outline: `.intent/phases/115-core-ecosystem-reorg/plan.md`. |
+| **116 Native protocol client parity** | Wave A. Native HTTP/2 and gRPC client isolates, streaming client modes, TLS ALPN, authority/SNI/Host truth, pooled client connections, received-status protocol facts, and interop tests. Plan outline: `.intent/phases/116-native-protocol-client-parity/plan.md`. |
+| **117 Local I/O, codec, and IPC parity** | Wave A. Bounded file streaming, line/length-delimited codecs, sync codec adapter pattern, Unix-domain socket rails, local IPC specimens, and sim/unsupported truth. Plan outline: `.intent/phases/117-local-io-codec-ipc-parity/plan.md`. |
+| **118 Admission and rate policy** | Wave A. Explicit service pressure policies built on existing capacity/timer primitives: concurrency/per-key/per-user/rate limits, bounded wait, shed/degrade/close, retry budget, typed outcomes, capacity/service-report integration, and edge-service specimens. Plan outline: `.intent/phases/118-admission-rate-policy/plan.md`. |
+| **119 Production resource and data maturity** | Wave A, after native protocol clients. Pool idle eviction/max lifetime/health/retire rules, pool shutdown reports, DB/HTTP/HTTP2/gRPC resource maturity, snapshot/journal restore patterns, and crash/corrupt-tail recovery specimens. Plan outline: `.intent/phases/119-production-resource-data-maturity/plan.md`. |
+| **120 Post-Wave-A ergonomics** | Digest Wave A into the copied service skeleton: outbound protocol clients, file/codec/local IPC, mature pools, durable restore, updated docs/findings, and cheap-model proof. Plan outline: `.intent/phases/120-post-wave-a-ergonomics/plan.md`. |
+| **121 Fairness and load behavior** | Wave B, after native protocol clients. Scheduler/session fairness proofs, timer fairness under hot load, protocol session fairness, remote inbound drain fairness, lag-ish reports, soak/load harnesses, and CPU/memory constrained runs. Plan outline: `.intent/phases/121-fairness-load-behavior/plan.md`. |
+| **122 Ecosystem hooks and async boundary** | Wave B. Public hooks for capacity surfaces, bounded event sinks, sync codecs, service policies, bridge authors, extension smoke crates, runtime capability reports, and explicit native/bridge/unsupported async boundary docs. Plan outline: `.intent/phases/122-ecosystem-hooks-async-boundary/plan.md`. |
 | **Join-all / stream-select helpers** | First-success `CallGroup` exists. Add join-all and stream-select only when a real specimen needs them, preserving branch identity, bounded pending/result storage, explicit cancellation, partial results, and late-reply trace truth. |
-| **Compile-time safety rails follow-up** | Phase 100 shipped callable/send-only capability handles. The broader model change remains: split public requests from internal continuation events, improve macro diagnostics, and add typed config/protocol typestate where it prevents real bugs. Runtime still owns `Full`/`Closed`/`Timeout`; compile time should prevent wrong lanes and impossible protocol states. |
-| **Typed config and protocol state safety phase** | Later broad safety phase after the service-model split. Combine typed config/budget manifests with private protocol typestate because the goal is the same: make impossible states hard to write. Build typed builders/manifests for copied service knobs like mailbox caps, pool caps, body caps, bridge in-flight caps, deadlines, retry budgets, shared capacity scopes, and startup config. Use private state-token/typestate shapes in `tina-http` where they eliminate real protocol bugs: HTTP/2 stream lifecycle, DATA/trailers ordering, WebSocket close handshake, gRPC final-status ownership, and body stream states. Runtime validation still owns env/file config; user service code must stay simple. No phase number until this is ready to execute. |
-| **096 WebSocket production replacement start** | Started on PR #83 as the post-094 production push: subprotocol offer inspection/selection, extension-offer visibility, browser-selected protocol proof, and a hostile review of the remaining replacement surface. Plan: `.intent/phases/096-websocket-production-replacement/plan.md`. |
-| **WebSocket replacement follow-up** | Close the broader replacement claims that are harness-heavy or product-choice-heavy: Autobahn classification, live trace to simulator replay for WebSocket facts, Tina-native WebSocket client if external clients are not enough, extracting a small `tina-websocket-room`-style helper crate if repeated apps need the specimen's room registry/admission/fanout/slow-peer policies, and bounded `permessage-deflate` only if compression becomes a real requirement. |
-| **Event/request split proposal** | Future IDD candidate pulled by `system_cache_with_fill`: split fire-and-forget mailbox events from caller-authority requests in the public authoring model so request/reply traffic cannot accidentally live only in `handle`. This follows Phase 100's first capability handles; see sketch below. |
 | **Alpaca rename** | Before public launch, rename the project/crates/docs away from Tina to Alpaca so the lineage is respectful and clear: independently maintained Rust framework, inspired by Peter Mbanugo's Tina/Odin and Seastar, not an official Tina port. |
 | **Barend Biesheuvel visible flow ergonomics** | Optional high-level ergonomics only after the local runtime core feels boring: a `flow!`-style authoring surface that preserves named suspension points, visible failure policy, trace step names, and ordinary Tina message/effect expansion. No fake async, no hidden retries, no hidden queues. |
 
-### Event/request split proposal
+### Post-109 capability backlog
 
-`system_cache_with_fill` exposed a general footgun in the current authoring
-surface: a request/reply variant can be handled in `handle`, compile cleanly,
-and still be rejected at runtime as `UnsupportedMessage` when the caller uses
-`call(...)` / `call_blocking(...)`, because caller authority enters
-`handle_call`. That behavior is honest, but the safer Tina move is to make the
-wrong shape unrepresentable.
+These are not IDD phases yet. They are capability clusters to design from the
+evidence produced by phases 103-109 and the systems specimens. Future IDD plans
+should turn them into implementation slices only after the repeated shapes are
+clear.
 
-Target model:
+The north star is not merely "actor-style services." It is bounded services
+with deterministic simulation/replay as a design constraint all the way down.
+New capabilities must preserve:
 
-```rust
-trait Isolate {
-    type Event;
-    type Request;
-    type Reply;
+- bounded admission or explicit bounded-exception policy
+- typed `Full` / `Closed` / `Timeout` / cancel outcomes
+- trace and capacity facts that can be summarized
+- simulator/replay support, or an honest unsupported fact
+- user-proof through specimens/systems, not only unit tests
 
-    fn handle_event(&mut self, event: Self::Event, ctx: &mut Context<...>) -> Effect<Self>;
+| Cluster | Gap | Future IDD shape |
+|---|---|---|
+| Ecosystem extension hooks | Tina needs stable seams for third-party bridges, sync codecs, bounded event sinks, custom capacity surfaces, service policies, and runtime capability reports. | Build small author kits and extension smoke crates that use only public APIs. No dynamic plugin ABI, no unbounded extension queues, no hook that bypasses trace/cancel/capacity truth. |
+| Whole-framework ergonomics | The local nouns are mostly good, but the whole-service copied path is still too fragmented: prelude choice, config manifest, request/event split, defer/cancel/drain/report/shutdown, and README guidance need one coherent path. | Rewrite selected systems with a blessed service skeleton, then extract only helpers that remove repeated ceremony while keeping all suspension/failure/capacity facts visible. |
+| Core ecosystem parity | Ordinary Tokio apps still reach for local IPC, file streaming, codec helpers, admission/rate limits, saga/compensation patterns, mature pools, and async-boundary clarity. | Close these as boring capability slices with user-proof systems: media ingest, API gateway limits, checkout saga, Redis-ish keyspace, local admin/sidecar IPC, and soak proof. |
 
-    fn handle_request(
-        &mut self,
-        request: Self::Request,
-        call: CallContext<'_, Self>,
-    ) -> Effect<Self>;
-}
-```
+Ecosystem hooks phase seed:
 
-Authoring should make the domain split visible:
+- **Batteries and sockets.** Blessed Tina crates remain the default batteries
+  (`tina-http`, bridges, test harnesses), but each battery should plug into
+  public sockets where replacement is useful. Users can adopt the battery,
+  replace one socket, or use an explicit escape hatch.
+- **Capacity surface hook.** Custom services expose validated surface names,
+  current/high-water/cap/full/released counts, mode, discovery lines, and test
+  assertions that join the normal capacity summary.
+- **Bounded event sink hook.** Custom log/metric/event sinks must have caps,
+  full/drop/closed outcomes, high-water/dropped counts, and drain/shutdown
+  reports. No hidden unbounded observability queue.
+- **Bridge author kit.** Standardize install result, closer, metrics/pressure
+  report, config validation, tracing fields, late-result vocabulary, supplied
+  client ownership, and worker-terminal vs caller-observed outcome language.
+- **Sync codec adapter pattern.** A codec socket feeds bounded bytes, emits
+  typed frames/messages, returns `NeedMore`/`Full`/`Malformed`, and keeps parser
+  state replayable. Tina owns I/O and pressure; codecs own bytes.
+- **Runtime capability reports.** Runtime/rail crates report supported,
+  unsupported, poll/completion backed, cancel semantics, drain semantics, and
+  simulator support before any pluggable-rail work.
+- **Extension smoke proof.** Future IDD work should add external-looking crates
+  that use only public hooks: fake bridge, custom codec, custom capacity
+  surface, and bounded event sink.
 
-```rust
-enum CacheEvent {
-    FillDone { key: String, generation: u64, result: SleepReply },
-}
+Whole-framework ergonomics phase seed:
 
-enum CacheRequest {
-    Get { key: String },
-    Invalidate { key: String },
-    Stats,
-}
-```
-
-Runtime work returns as events; external callers enter through requests. A
-request is not "just a message with a timeout" because it carries reply
-authority. The type system should teach that distinction to humans and LLMs.
-
-Likely implementation path:
-
-- add an opt-in macro form first, for example
-  `#[tina_runtime::isolate(event = CacheEvent, request = CacheRequest, reply = CacheReply)]`;
-- preserve the existing single-`message` form during migration;
-- have registration return or expose typed event and request addresses, or an
-  isolate handle with `.events()` and `.requests()` views, while both still
-  point at the same isolate id/generation/mailbox internally;
-- update `send(...)` to accept only event addresses and `call(...)` to accept
-  only request addresses in the new surface;
-- migrate the cache specimen, service skeleton, pools, bridges, and selected
-  protocol examples before considering a core trait-breaking cutover.
-
-Non-goals: no doc-only warning, no heuristic "maybe this `handle` arm should
-have been callable" lint as the final answer, and no fake async surface. The
-point is to sharpen Tina's model: events are mailbox facts; requests are
-caller-authority facts; runtime work returns as events.
+- **Blessed service skeleton.** One copied app shape for config manifest,
+  runtime setup, listener, bridge/pool install, request-scoped cancellation,
+  health/readiness, shutdown, topology/capacity summary, and replay seed/facts.
+- **Prelude tiers.** Keep `tina::prelude::*` boring for app authors; move raw
+  escape hatches into explicit advanced imports.
+- **Noun guide.** One short map for `Effect`, request/event, `RequestContext`,
+  `CallOutcome`, pending helpers, pool leases, capacity reports, and trace
+  reports. The point is "which noun do I use right now?"
+- **Fluent but honest workflows.** Defer, defer-cancelable, race/join,
+  recurring tick, pressure policy, and shutdown helpers may compress ceremony
+  only when the suspension point, failure policy, capacity, and trace step stay
+  visible.
+- **Specimen rewrite.** Rewrite a small fixed set of systems on the blessed
+  path, then delete stale README guidance and move solved pain to history.
+- **Cheap-model proof.** Give the docs/skeleton to a fresh model, record what it
+  wires wrong, and either make the mistake a compile error or fix the copied
+  path.
 
 ### Mailbox-first devex polish sketch
 
@@ -623,14 +634,13 @@ type system, not by the user discovering it the hard way. The current
 shape teaches "keep your keys monotonic or fall off a cliff," which is
 exactly the kind of hidden contract Tina aims to remove.
 
-**Likely fix.** Add a third helper — call it
-`PendingCancelableCallSlab<K, Q, R>` for now — that admits the same
-caller-authority + cancel-handle bundle but allows multiple entries per
-natural key. Internal identity is by ticket; natural key is metadata
-attached to each entry. The shape:
+**Fix.** Phase 110 owns this as `CancelableWork<K, Q, R>`: a bounded helper
+that admits the same caller-authority + cancel-handle bundle but allows
+multiple entries per natural key. Internal identity is by `WorkTicket`; natural
+key is metadata attached to each entry. The shape:
 
 ```rust
-let ticket = self.pending.try_insert(natural_key, token)?;   // always Ok modulo capacity
+let ticket = self.work.admit(natural_key, token)?;
 ```
 
 Lookup returns an iterator (or "latest") for natural keys; removal is
@@ -640,17 +650,16 @@ that the user maintains the "natural-key → live tickets" mapping
 externally, but that mapping is what they were going to write anyway
 once they hit `DuplicateKey`.
 
-**Decision rule for users.** Ship both helpers and document the choice:
+**Decision rule for users.** Document the choice:
 
 - one outstanding op per key, key chosen by the service →
   `PendingCancelableCallSet`
 - one outstanding op per key, key chosen externally →
-  `PendingCancelableCallSlab` *(this proposal)*
+  `CancelableWork` with a per-key cap of 1
 - multiple parked callers per key, no cancel handle needed →
-  `PendingReplies`
+  `WaitList`
 - multiple parked callers per key WITH cancel handles → we need to
-  decide whether the slab covers this too or whether
-  `PendingReplies::try_capture_cancelable_call` is a separate motion
+  use `CancelableWork`
 
 **Non-goals.** No silent ABA dedup on insert. No "automatic
 key-versioning" that hides whether a stale completion replaced a fresh
@@ -661,8 +670,7 @@ discipline, not from removing it.
 `system_tenant_rate_limiter`, `system_webhook_relay`, `system_lock_manager`,
 and the worker-index variant of `system_job_queue` are all natural-key
 shaped and currently have to invent the workaround themselves. This is now
-strong enough to be a near-term follow-up after 100/101 if those phases do not
-already reshape the service handle enough to change the helper boundary.
+strong enough for Phase 110.
 
 ### Keyed wait lists over bounded pending replies
 
@@ -674,17 +682,17 @@ waiter shape:
 - handoff loops pop ids until one still has a live deferred reply;
 - per-key caps and global caps are reported separately by handwritten code.
 
-Build a small `KeyedPendingReplies<K, R>` / `WaitList<K, R>` helper once the
-third call site confirms the exact shape, or earlier if it blocks a system.
-The helper must own both caps, return typed `Full` vs `BucketFull`, recover the
-caller on failed admission, and make skip-reclaimed-slot behavior explicit. No
-hidden per-key unbounded queues.
+Phase 110 owns this as `WaitList<K, R>`. The helper must own both caps, return
+typed global `Full` vs per-key `KeyFull`, recover the caller on failed
+admission, and make skip-reclaimed-slot behavior explicit. No hidden per-key
+unbounded queues.
 
 ## Capability layers still needed
 
 These are not planning phases. They are capability gaps to close as real
 implementation slices pull on them. Each entry should land as boring code,
-tests, and specimens when the adjacent work proves the shape.
+tests, specimens, and replay/unsupported truth when the adjacent work proves the
+shape.
 
 | Capability | Build | User outcome |
 |---|---|---|
@@ -700,12 +708,12 @@ tests, and specimens when the adjacent work proves the shape.
 | Resource lifecycle unification | One boring vocabulary across runtime resources and bridges: open/start, ready, use, close, cancel, drain, terminal report, pressure report. | No stream/file/process/bridge worker can be stranded invisibly; every resource has the same mental model. |
 | Fairness under load | Prove and expose fairness for actor/session scheduling under hot keys, slow sessions, remote inbound drain, timers, and protocol sessions. Add reports for starvation-ish lag where a bounded runtime can observe it honestly. | One hot actor or WebSocket session should not quietly starve unrelated work; when it can, the report says so. |
 | Runtime/service observability | Queue depth, lag-ish counters, drops/full counts, shutdown state, task/session counts, pool state, bridge in-flight state, and per-surface pressure reports in one copied reporting shape. | Operators can see why a service is unhealthy without decoding raw traces first. |
-| Health and readiness | Runtime/service-level readiness and liveness surfaces, distinct from process alive, with typed reasons and optional HTTP/RPC exposure. | Deployments can stop sending traffic before shutdown and can report "not ready because DB pool closed" honestly. |
-| Shutdown orchestration graph | Ordered shutdown helpers: stop ingress, cancel/close pools, drain in-flight work, flush batchers, close bridges/resources, emit final report. | Graceful shutdown becomes a copied Tina program instead of bespoke stop-message choreography. |
+| Health and readiness | Shipped (Phase 106). `tina_runtime::lifecycle` names `Lifecycle` (Starting/Ready/Degraded/Draining/NotReady/Stopped), typed `ReadinessReason` variants with stable wire tokens, a `Readiness` verdict with legacy HTTP body rendering, and a `Health` snapshot that pairs the lifecycle state with a `ServicePressureReport`. `mini_saas_api` uses them on `/ready`; `system_metrics_shipper` uses the same vocabulary for a non-HTTP shape. | Deployments can stop sending traffic before shutdown and can report "not ready because DB pool closed" honestly. |
+| Shutdown orchestration graph | Shipped (Phase 106). `ShutdownChoreography` records ordered steps (`StopIngress`, `CancelSessions`, `DrainInFlight`, `FlushBatchers`, `CloseResource`, `EmitReport`, `StopOwner`) with elapsed and outcome, folds resource-specific reports into a shared `ResourceCloseReport` vocabulary, and flags backwards recordings as `StepOutcome::OrderingViolation`. Used by `mini_saas_api` (HTTP) and `system_metrics_shipper` (non-HTTP). | Graceful shutdown becomes a copied Tina program instead of bespoke stop-message choreography. |
 | Backpressure policies | Small explicit policy objects for shed, bounded wait, retry with backoff, degrade, and close, all returning typed outcomes. | Services choose pressure behavior at call sites without losing `Full`/`Closed`/`Timeout` truth. |
 | Runtime-owned recurring work | Local cron/periodic task patterns for compaction, health checks, token refresh, session expiry, and metric flush, with missed-tick policy. | Long-lived services get boring recurring work that is bounded and replayable. |
 | Config and budget manifest | A structured service config manifest for mailbox caps, pool caps, body caps, deadlines, retry budgets, and capacity policies; printable and diffable. | Operators and coding agents can see all knobs before the service runs and can include them in replay cases. |
-| Service topology report | A service-shaped topology report naming isolates, shards, addresses, mailboxes, pools, bridges, resources, capacities, and lifecycle states. | Users can ask "what is running?" and get a useful answer without scraping raw traces. |
+| Service topology report | Shipped (Phase 106). `ServiceTopology` plus `TopologyComponent` build one greppable report naming every started isolate, bridge, pool, listener, address, the shard label, the current `Lifecycle`, and the backing `ServicePressureReport`. No global registry; services thread it explicitly. | Users can ask "what is running?" and get a useful answer without scraping raw traces. |
 | Bounded event/log sink | Runtime-owned or specimen-proven bounded log/metric/event sinks with visible overflow/drop policy. | Observability does not become the first hidden unbounded queue in an otherwise bounded Tina service. |
 | State snapshot and restore | Blessed snapshot/journal/restore patterns for shard-owned state, including append-before-apply proofs and torn-write recovery specimens. | Ordinary services can restart with state safely, not only demos with in-memory maps. |
 | Saga / compensation pattern | Typed multi-step workflow pattern over DB, HTTP, pools, and services, with explicit compensation, timeout, cancellation, and partial-failure reports. | Multi-resource business workflows become readable Tina state machines instead of ad hoc async control flow. |
@@ -720,6 +728,8 @@ tests, and specimens when the adjacent work proves the shape.
 | Pool maturity | Idle eviction, max lifetime, health checks, retire/reuse policy, pooled HTTP/2/gRPC clients, and DB pool consumers that reuse the same pressure vocabulary. | Pools become production resources, not just first-form acquire/release examples. |
 | Async ecosystem boundary | A clean answer for Future/Stream interop: which Tokio crates are bridge-only, which sync codecs Tina adopts, and whether a bounded Future/Stream bridge is worth building. | Users know which Tokio apps Tina can replace natively and where a bridge is the honest boundary. |
 | Benchmarks with humility | Focused comparisons against Tokio/hyper/tungstenite/tonic only after equivalent semantics exist, labeled as local-machine evidence, with capacity and failure behavior included. | Performance claims do not outrun Tina's boundedness and correctness story. |
+| Ecosystem extension hooks | Public extension seams for bridge authors, codec adapters, capacity surfaces, bounded event sinks, and service policies, with extension smoke crates that use no private APIs. | Tina can grow an ecosystem without every new capability landing in core or weakening bounded/DST truth. |
+| Whole-framework ergonomics | One coherent copied path for a real service: prelude, config/budget manifest, public requests/internal events, defer/cancel/drain/report/shutdown, and replay hooks. | A new developer or cheap model can build a correct bounded + replay-aware service without stitching ten specimens together. |
 
 Closed follow-ups from Phase 074 (HTTP body streaming, native HTTP/1):
 

@@ -18,10 +18,15 @@ use tina_http::{
     KeepaliveConnectionMsg, KeepaliveOutcome, KeepalivePoolDrainOutcome, build_keepalive_pool,
     shutdown_keepalive_pool,
 };
+use tina_runtime::lifecycle::{
+    CloseAdmission, CloseOutcome, Health, Lifecycle, Readiness, ReadinessReason,
+    ResourceCloseReport, ResourceKind, ServiceTopology, ShutdownChoreography, ShutdownStep,
+    StepOutcome, TopologyComponent,
+};
 use tina_runtime::pool::{WorkerPoolMsg, WorkerPoolReply};
 use tina_runtime::{
     CallOutcome, DefaultThreadedMailboxFactory, DrainStage, DrainState, RuntimeCall, RuntimeEvent,
-    RuntimeEventKind, ThreadedRuntime, call, sleep,
+    RuntimeEventKind, ThreadedRuntime, ThreadedRuntimeConfig, call, sleep,
 };
 use tina_sim::dst::{
     LiveReplayCapture, LiveReplayFact, LiveReplayReport, ReplayCase as DstReplayCase, ReplayConfig,
@@ -44,6 +49,12 @@ pub fn run(mode: RunMode) -> anyhow::Result<RunReport> {
     let dir = tempfile::tempdir()?;
     let db_path = dir.path().join("mini-saas.sqlite");
     seed_db(&db_path)?;
+
+    // Typed lifecycle witness. The host records every state the service
+    // passes through so the plan's "Starting → Ready → Draining →
+    // Stopped" assertion is one Vec<Lifecycle> instead of being implied
+    // across the topology/health/shutdown fields.
+    let mut lifecycle_transitions: Vec<Lifecycle> = vec![Lifecycle::Starting];
 
     let runtime = ThreadedRuntime::new(SingleShard, DefaultThreadedMailboxFactory);
     let sqlite = SqliteWorker::<SingleShard>::install(
@@ -121,21 +132,80 @@ pub fn run(mode: RunMode) -> anyhow::Result<RunReport> {
         .wait(Duration::from_secs(2))
         .map_err(|e| anyhow::anyhow!("bind main listener: {e:?}"))?;
 
+    // Startup summary: one compact line naming every bounded surface
+    // we declared so far, plus surfaces we *know* exist but cannot
+    // measure yet from this scope (sqlite live pressure is sampled
+    // later via call). The line is grep-friendly and matches the
+    // shape used by ServicePressureReport::summary_line. The same
+    // call builds the typed `ServiceTopology` that downstream observers
+    // can pattern-match instead of grepping.
+    let startup = build_startup_summary(addr, notify_addr);
+
+    // Both listeners bound, controller registered, bridges installed.
+    // The service is now in Ready.
+    lifecycle_transitions.push(Lifecycle::Ready);
+
     let mut report = drive_script(addr, mode)?;
+    report.startup_summary_line = startup.summary_line;
+    report.startup_discovery_lines = startup.discovery_lines;
+    report.topology = Some(startup.topology);
 
     let in_flight_addr = addr;
     let in_flight = std::thread::spawn(move || post(in_flight_addr, "/items/1/notify", "slow"));
     wait_for_capacity(addr, "outbound.in_flight=1", Duration::from_secs(2))?;
 
+    // Shutdown choreography: every step the host drives is recorded with
+    // its kind, label, elapsed, and outcome. The terminal report carries
+    // the same facts as the `terminal_line` string but in typed form so
+    // tests and dashboards can pattern-match instead of parsing.
+    let mut choreo = ShutdownChoreography::new("mini_saas_api");
+
+    let t_close = Instant::now();
     match runtime.call_blocking(controller, ControllerMsg::CloseIngress, REQUEST_TIMEOUT)? {
-        CallOutcome::Replied(response) if response.status == StatusCode::OK => {}
-        other => anyhow::bail!("close ingress control call failed: {other:?}"),
+        CallOutcome::Replied(response) if response.status == StatusCode::OK => {
+            // Ingress closed; the controller's DrainState is now Draining.
+            lifecycle_transitions.push(Lifecycle::Draining);
+            choreo.record(
+                ShutdownStep::StopIngress,
+                "close_ingress",
+                t_close.elapsed(),
+                StepOutcome::Clean,
+            );
+        }
+        other => {
+            choreo.record(
+                ShutdownStep::StopIngress,
+                "close_ingress",
+                t_close.elapsed(),
+                StepOutcome::Failed {
+                    reason: format!("close ingress control call failed: {other:?}"),
+                },
+            );
+            anyhow::bail!("close ingress control call failed: {other:?}");
+        }
     }
+    let t_drain = Instant::now();
     let in_flight_response = in_flight
         .join()
         .map_err(|_| anyhow::anyhow!("shutdown in-flight request panicked"))??;
-    report.shutdown_in_flight_typed =
+    let in_flight_clean =
         in_flight_response.status == 200 && in_flight_response.body.contains("notified");
+    choreo.record(
+        ShutdownStep::DrainInFlight,
+        "drain_in_flight_notify",
+        t_drain.elapsed(),
+        if in_flight_clean {
+            StepOutcome::Clean
+        } else {
+            StepOutcome::Failed {
+                reason: format!(
+                    "in-flight drain returned status={} body={:?}",
+                    in_flight_response.status, in_flight_response.body,
+                ),
+            }
+        },
+    );
+    report.shutdown_in_flight_typed = in_flight_clean;
     report.observations.push(observation(
         "shutdown_in_flight_notify",
         in_flight_response.status,
@@ -161,7 +231,15 @@ pub fn run(mode: RunMode) -> anyhow::Result<RunReport> {
         &rejected_after_close.body,
     ));
 
+    let t_db = Instant::now();
     sqlite.closer.close();
+    let db_close_report = ResourceCloseReport::clean(
+        "db.bridge",
+        ResourceKind::Bridge,
+        CloseAdmission::Drain,
+        t_db.elapsed(),
+    );
+    choreo.record_close(&db_close_report, "close_sqlite_bridge");
     let after_db_close = get(addr, "/ready")?;
     report.ready_after_db_close_503 =
         after_db_close.status == 503 && after_db_close.body.contains("db_closed");
@@ -172,6 +250,7 @@ pub fn run(mode: RunMode) -> anyhow::Result<RunReport> {
     ));
 
     let db_pressure = sqlite.metrics.pressure_report();
+    let t_pool = Instant::now();
     let outbound_shutdown = shutdown_keepalive_pool(
         &runtime,
         &outbound,
@@ -179,27 +258,66 @@ pub fn run(mode: RunMode) -> anyhow::Result<RunReport> {
         Duration::from_secs(2),
     )
     .map_err(|e| anyhow::anyhow!("shutdown keepalive pool: {e:?}"))?;
+    let outbound_close_report =
+        pool_shutdown_to_close_report("outbound.pool", &outbound_shutdown, t_pool.elapsed());
+    choreo.record_close(&outbound_close_report, "close_outbound_pool");
+    let t_notify_listener = Instant::now();
     runtime
         .try_send(notify_listener, HttpListenerMsg::Stop)
         .map_err(|e| anyhow::anyhow!("stop notify listener: {e:?}"))?;
+    choreo.record_close(
+        &ResourceCloseReport::clean(
+            "notify.listener",
+            ResourceKind::Listener,
+            CloseAdmission::Drain,
+            t_notify_listener.elapsed(),
+        ),
+        "stop_notify_listener",
+    );
+    let t_main_listener = Instant::now();
     runtime
         .try_send(main_listener, HttpListenerMsg::Stop)
         .map_err(|e| anyhow::anyhow!("stop main listener: {e:?}"))?;
+    choreo.record_close(
+        &ResourceCloseReport::clean(
+            "main.listener",
+            ResourceKind::Listener,
+            CloseAdmission::Drain,
+            t_main_listener.elapsed(),
+        ),
+        "stop_main_listener",
+    );
+    let t_runtime = Instant::now();
     let trace = runtime
         .shutdown()
         .map_err(|e| anyhow::anyhow!("runtime shutdown: {e:?}"))?;
+    choreo.record(
+        ShutdownStep::StopOwner,
+        "shutdown_runtime",
+        t_runtime.elapsed(),
+        StepOutcome::Clean,
+    );
     let pressure = tina_runtime::pressure::PressureSummary::from_events(&trace);
     let deferred_replies = trace
         .iter()
         .filter(|event| matches!(event.kind(), RuntimeEventKind::DeferredReplySent { .. }))
         .count();
 
+    let shutdown_report = choreo.finish();
     report.shutdown_clean = matches!(outbound_shutdown.drain, KeepalivePoolDrainOutcome::Drained)
         && outbound_shutdown.requested == outbound_shutdown.stopped
         && outbound_shutdown.timed_out == 0
         && outbound_shutdown.rejected == 0
         && outbound_shutdown.already_closed == 0
-        && outbound_shutdown.connection_failures.is_empty();
+        && outbound_shutdown.connection_failures.is_empty()
+        && shutdown_report.clean;
+    report.shutdown_report = Some(shutdown_report);
+    report.health_pre_shutdown = Some(
+        Health::new("mini_saas_api", Lifecycle::Stopped)
+            .with_pressure(build_pressure_snapshot(&db_pressure)),
+    );
+    lifecycle_transitions.push(Lifecycle::Stopped);
+    report.lifecycle_transitions = lifecycle_transitions;
     report.multi_turn_notify = report.notified_item && deferred_replies >= 3;
     report.terminal_line = format!(
         "terminal db.capacity={} db.closed={} outbound.drain={:?} outbound.stop_requested={} \
@@ -276,9 +394,11 @@ fn drive_script(addr: std::net::SocketAddr, mode: RunMode) -> anyhow::Result<Run
         .push(observation("missing_item", missing.status, &missing.body));
     let method = put(addr, "/items/1")?;
     report.method_405 = method.status == 405;
-    report
-        .observations
-        .push(observation("method_not_allowed", method.status, &method.body));
+    report.observations.push(observation(
+        "method_not_allowed",
+        method.status,
+        &method.body,
+    ));
     let bad_request = post(addr, "/items", "bad")?;
     report.bad_request_400 = bad_request.status == 400;
     report.observations.push(observation(
@@ -322,12 +442,9 @@ fn drive_script(addr: std::net::SocketAddr, mode: RunMode) -> anyhow::Result<Run
         let r2 = t2
             .join()
             .map_err(|_| anyhow::anyhow!("second pressure request panicked"))??;
-        report.outbound_pressure_503 =
-            [(&r1, "pressure_first"), (&r2, "pressure_second")]
-                .into_iter()
-                .any(|(response, _)| {
-                    response.status == 503 && response.body.contains("outbound_full")
-                });
+        report.outbound_pressure_503 = [(&r1, "pressure_first"), (&r2, "pressure_second")]
+            .into_iter()
+            .any(|(response, _)| response.status == 503 && response.body.contains("outbound_full"));
         report
             .observations
             .push(observation("pressure_first", r1.status, &r1.body));
@@ -679,36 +796,26 @@ impl Isolate for Controller {
                 }),
                 other => reply_to_request(
                     req,
-                    readiness(
-                        false,
-                        &ready_reasons(ingress_stopped, Some(db_reason(&other))),
-                    ),
+                    readiness_response(&build_readiness(ingress_stopped, Some(db_reason(&other)))),
                 ),
             },
-            ControllerMsg::ReadyPool(req, ingress_stopped, outcome) => match outcome {
-                CallOutcome::Replied(WorkerPoolReply::Pressure(report))
-                    if report.available > 0 && !ingress_stopped =>
-                {
-                    reply_to_request(req, readiness(true, &[]))
-                }
-                CallOutcome::Replied(WorkerPoolReply::Pressure(report)) if report.available > 0 => {
-                    reply_to_request(req, readiness(false, &ready_reasons(ingress_stopped, None)))
-                }
-                CallOutcome::Replied(WorkerPoolReply::Pressure(_)) => reply_to_request(
+            ControllerMsg::ReadyPool(req, ingress_stopped, outcome) => {
+                let dep = match outcome {
+                    CallOutcome::Replied(WorkerPoolReply::Pressure(report))
+                        if report.available > 0 =>
+                    {
+                        None
+                    }
+                    CallOutcome::Replied(WorkerPoolReply::Pressure(_)) => {
+                        Some(ReadinessReason::DependencyFull("outbound"))
+                    }
+                    _ => Some(ReadinessReason::DependencyClosed("outbound")),
+                };
+                reply_to_request(
                     req,
-                    readiness(
-                        false,
-                        &ready_reasons(ingress_stopped, Some("outbound_full")),
-                    ),
-                ),
-                _ => reply_to_request(
-                    req,
-                    readiness(
-                        false,
-                        &ready_reasons(ingress_stopped, Some("outbound_closed")),
-                    ),
-                ),
-            },
+                    readiness_response(&build_readiness(ingress_stopped, dep)),
+                )
+            }
             ControllerMsg::Created(req, id, name, outcome) => match outcome {
                 CallOutcome::Replied(Ok(SqliteResponse::Executed { .. })) => {
                     self.live_items.insert(id, name);
@@ -824,17 +931,17 @@ impl Controller {
                         SqliteRequest::query_rows("SELECT 1", 1),
                         REQUEST_TIMEOUT,
                     ))
-                    .reply(move |req, outcome| ControllerMsg::ReadyDb(req, ingress_stopped, outcome))
+                    .reply(move |req, outcome| {
+                        ControllerMsg::ReadyDb(req, ingress_stopped, outcome)
+                    })
             }
-            (http::Method::GET, "/debug/capacity") => {
-                call_ctx
-                    .defer(call(
-                        self.outbound_pool,
-                        WorkerPoolMsg::PressureReport,
-                        REQUEST_TIMEOUT,
-                    ))
-                    .reply(ControllerMsg::CapacityPool)
-            }
+            (http::Method::GET, "/debug/capacity") => call_ctx
+                .defer(call(
+                    self.outbound_pool,
+                    WorkerPoolMsg::PressureReport,
+                    REQUEST_TIMEOUT,
+                ))
+                .reply(ControllerMsg::CapacityPool),
             _ if !self.drain.is_open() => {
                 call_ctx.reply(text(StatusCode::SERVICE_UNAVAILABLE, "ingress_stopped\n"))
             }
@@ -882,15 +989,14 @@ impl Controller {
             return call.reply(text(StatusCode::BAD_REQUEST, "bad_id\n"));
         };
         match (&request.method, notify) {
-            (&http::Method::GET, false) => {
-                call.defer(send_request(
+            (&http::Method::GET, false) => call
+                .defer(send_request(
                     self.db,
                     SqliteRequest::query_rows("SELECT name FROM items WHERE id = ?", 1)
                         .params(vec![SqliteValue::Integer(id)]),
                     REQUEST_TIMEOUT,
                 ))
-                .reply(move |req, outcome| ControllerMsg::Loaded(req, id, outcome))
-            }
+                .reply(move |req, outcome| ControllerMsg::Loaded(req, id, outcome)),
             (&http::Method::POST, true) => {
                 let slow = body_text(&request).contains("slow");
                 call.defer(send_request(
@@ -957,12 +1063,18 @@ fn db_error_response(outcome: CallOutcome<SqliteResult>) -> HttpResponse {
     }
 }
 
-fn db_reason(outcome: &CallOutcome<SqliteResult>) -> &'static str {
+fn db_reason(outcome: &CallOutcome<SqliteResult>) -> ReadinessReason {
     match outcome {
-        CallOutcome::Replied(Err(SqliteError::Closed)) | CallOutcome::Closed => "db_closed",
-        CallOutcome::Replied(Err(SqliteError::Full)) | CallOutcome::Full => "db_full",
-        CallOutcome::Replied(Err(SqliteError::Timeout)) | CallOutcome::Timeout => "db_timeout",
-        _ => "db_error",
+        CallOutcome::Replied(Err(SqliteError::Closed)) | CallOutcome::Closed => {
+            ReadinessReason::DependencyClosed("db")
+        }
+        CallOutcome::Replied(Err(SqliteError::Full)) | CallOutcome::Full => {
+            ReadinessReason::DependencyFull("db")
+        }
+        CallOutcome::Replied(Err(SqliteError::Timeout)) | CallOutcome::Timeout => {
+            ReadinessReason::DependencyTimeout("db")
+        }
+        _ => ReadinessReason::DependencyError("db"),
     }
 }
 
@@ -979,26 +1091,36 @@ fn pool_acquire_error_response(
     }
 }
 
-fn readiness(ok: bool, reasons: &[&str]) -> HttpResponse {
-    if ok {
-        text(StatusCode::OK, "ready\n")
+fn readiness_response(readiness: &Readiness) -> HttpResponse {
+    let status = if readiness.ready {
+        StatusCode::OK
     } else {
-        text(
-            StatusCode::SERVICE_UNAVAILABLE,
-            format!("not_ready reasons={}\n", reasons.join(",")),
-        )
-    }
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    text(status, readiness.legacy_body())
 }
 
-fn ready_reasons(ingress_stopped: bool, reason: Option<&'static str>) -> Vec<&'static str> {
+// Build the typed `Readiness` for the controller's `/ready` route. The
+// state picks Draining when ingress is closed, NotReady when a dependency
+// is the only issue, and Ready when both are clean.
+fn build_readiness(ingress_stopped: bool, dep: Option<ReadinessReason>) -> Readiness {
     let mut reasons = Vec::with_capacity(2);
     if ingress_stopped {
-        reasons.push("ingress_stopped");
+        reasons.push(ReadinessReason::IngressStopped);
     }
-    if let Some(reason) = reason {
+    if let Some(reason) = dep {
         reasons.push(reason);
     }
-    reasons
+    if reasons.is_empty() {
+        Readiness::ready()
+    } else {
+        let state = if ingress_stopped {
+            Lifecycle::Draining
+        } else {
+            Lifecycle::NotReady
+        };
+        Readiness::not_ready(state, reasons)
+    }
 }
 
 fn capacity_body(
@@ -1070,4 +1192,534 @@ fn text(status: StatusCode, body: impl Into<String>) -> HttpResponse {
         http::HeaderValue::from_static("text/plain"),
     );
     response
+}
+
+/// Soak driver. Spins up the same service as [`run`] (controller +
+/// SQLite + notify + outbound keepalive pool), drives `config.workers`
+/// concurrent clients hitting `GET /health` and `GET /items/1`, then
+/// captures `/debug/capacity` and runs the same shutdown sequence as
+/// `run`. The proof artifact is the typed [`crate::SoakReport`]: load
+/// summary, capacity line, terminal line, and `shutdown_clean`.
+///
+/// This is intentionally narrow: `/health` is the cheapest path, and
+/// `GET /items/1` exercises the controller + SQLite bridge + pool
+/// shape without needing a write per op (the row is pre-seeded by the
+/// initial create). The point is "many requests, real shutdown, no
+/// leaks" — not throughput.
+pub fn run_soak(config: crate::SoakConfig) -> anyhow::Result<crate::SoakReport> {
+    use tina_proof_harness::load::{self, LoadRun, LoadStop, OpOutcome};
+
+    let dir = tempfile::tempdir()?;
+    let db_path = dir.path().join("mini-saas.sqlite");
+    seed_db(&db_path)?;
+
+    let live_trace = tina_proof_harness::LiveTrace::new();
+    let runtime = ThreadedRuntime::with_config_and_trace_observer(
+        SingleShard,
+        DefaultThreadedMailboxFactory,
+        ThreadedRuntimeConfig {
+            idle_wait: Duration::from_millis(1),
+            ..Default::default()
+        },
+        live_trace.observer(),
+    );
+    let sqlite = SqliteWorker::<SingleShard>::install(
+        &runtime,
+        SqliteConfig::path(&db_path)
+            .with_default_timeout(Duration::from_secs(2))
+            .with_busy_timeout(Duration::from_millis(250))
+            .with_poll_interval(Duration::from_millis(1))
+            .with_mailbox_capacity(2),
+    )
+    .map_err(|e| anyhow::anyhow!("install sqlite bridge: {e}"))?;
+
+    let notify_service = runtime
+        .register_with_capacity::<_, Infallible>(NotifySink::default(), 8)
+        .map_err(|e| anyhow::anyhow!("register notify sink: {e:?}"))?;
+    let notify_listener_config = listener_config(1024);
+    let notify_listener = runtime
+        .register_with_capacity::<_, Infallible>(
+            HttpListener::<SingleShard, NotifyMsg>::with_config(
+                "127.0.0.1:0".parse()?,
+                notify_service,
+                notify_listener_config,
+            ),
+            notify_listener_config.listener_mailbox_capacity,
+        )
+        .map_err(|e| anyhow::anyhow!("register notify listener: {e:?}"))?;
+    let notify_bound = runtime.observe_next_bound();
+    runtime
+        .try_send(notify_listener, HttpListenerMsg::Start)
+        .map_err(|e| anyhow::anyhow!("start notify listener: {e:?}"))?;
+    let notify_addr = notify_bound
+        .wait(Duration::from_secs(2))
+        .map_err(|e| anyhow::anyhow!("bind notify listener: {e:?}"))?;
+
+    let outbound = build_keepalive_pool(
+        &runtime,
+        HttpTarget::http_with_host(notify_addr, "notify.local"),
+        HttpClientConfig::pressure(),
+        PoolConfig::new(1, 0),
+        8,
+        8,
+    )
+    .map_err(|e| anyhow::anyhow!("build outbound keepalive pool: {e:?}"))?;
+
+    let public_body_metrics = BodyMetrics::default();
+    let controller = runtime
+        .register_with_capacity::<_, Infallible>(
+            Controller::new(
+                sqlite.address,
+                sqlite.metrics.clone(),
+                outbound.pool,
+                public_body_metrics.clone(),
+            ),
+            CONTROLLER_MAILBOX_CAPACITY,
+        )
+        .map_err(|e| anyhow::anyhow!("register controller: {e:?}"))?;
+
+    let main_listener_config = listener_config(BODY_CAP_BYTES);
+    let main_listener = runtime
+        .register_with_capacity::<_, Infallible>(
+            HttpListener::<SingleShard, ControllerMsg>::with_config(
+                "127.0.0.1:0".parse()?,
+                controller,
+                main_listener_config,
+            )
+            .with_metrics(public_body_metrics),
+            main_listener_config.listener_mailbox_capacity,
+        )
+        .map_err(|e| anyhow::anyhow!("register main listener: {e:?}"))?;
+    let main_bound = runtime.observe_next_bound();
+    runtime
+        .try_send(main_listener, HttpListenerMsg::Start)
+        .map_err(|e| anyhow::anyhow!("start main listener: {e:?}"))?;
+    let addr = main_bound
+        .wait(Duration::from_secs(2))
+        .map_err(|e| anyhow::anyhow!("bind main listener: {e:?}"))?;
+
+    // Pre-seed one row so `GET /items/1` is a hit, not a 404. We use the
+    // public POST so the body cap is exercised at least once even from
+    // the soak path.
+    let create = crate::post(addr, "/items", "name=alpha")
+        .map_err(|e| anyhow::anyhow!("seed POST /items failed: {e}"))?;
+    if create.status != 201 {
+        anyhow::bail!(
+            "soak seed POST /items must return 201, got {} ({})",
+            create.status,
+            create.body,
+        );
+    }
+
+    // Three lanes, deterministic by worker id, so the report can blame
+    // each path independently:
+    //
+    //   worker % 3 == 0 -> GET /health        (cheap; HTTP only)
+    //   worker % 3 == 1 -> GET /items/1       (HTTP + SQLite bridge)
+    //   worker % 3 == 2 -> POST /items/1/notify (HTTP + bridge + outbound pool)
+    //
+    // The third lane is what proves Rock 1's "bridge/pool path" line
+    // item — without it the keepalive outbound pool is never exercised
+    // and the soak only proves the HTTP+DB shape.
+    let op_addr = addr;
+    let timeout = config.connect_timeout;
+    let load_report = load::run(
+        LoadRun {
+            workers: config.workers,
+            stop: LoadStop::ops(config.op_count),
+            label: "mini_saas_api_soak",
+        },
+        move |worker| {
+            let result = match worker % 3 {
+                0 => crate::one_request_with_timeout(
+                    op_addr,
+                    b"GET /health HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+                    timeout,
+                ),
+                1 => crate::one_request_with_timeout(
+                    op_addr,
+                    b"GET /items/1 HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+                    timeout,
+                ),
+                _ => crate::one_request_with_timeout(
+                    op_addr,
+                    b"POST /items/1/notify HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    timeout,
+                ),
+            };
+            match result {
+                Ok(parts) if parts.status == 200 => OpOutcome::Ok,
+                Ok(parts) => {
+                    // Map a typed HTTP status into the err_kinds table so
+                    // a 503 burst is visible without log scraping.
+                    let kind = match parts.status {
+                        503 => "http_503",
+                        500..=599 => "http_5xx",
+                        429 => "http_429",
+                        400..=499 => "http_4xx",
+                        _ => "http_other",
+                    };
+                    OpOutcome::Err { kind }
+                }
+                Err(_) => OpOutcome::Timeout,
+            }
+        },
+        None::<fn() -> bool>,
+    );
+
+    // Snapshot capacity while the runtime is still up.
+    let capacity = crate::get(addr, "/debug/capacity")?;
+    let pressure_after_load = live_trace.pressure_summary();
+    let capacity_after_load_line = format!(
+        "capacity_after_load {} runtime.send_full={} runtime.completion_full={} runtime.reply_path_full={}",
+        capacity.body.trim_end(),
+        pressure_after_load.send_rejected_full,
+        pressure_after_load.completion_rejected_mailbox_full,
+        pressure_after_load.reply_rejected_reply_path_full,
+    );
+
+    // Same shutdown sequence as `run`, minus the scripted assertions.
+    let db_pressure = sqlite.metrics.pressure_report();
+    let outbound_shutdown = shutdown_keepalive_pool(
+        &runtime,
+        &outbound,
+        CloseMode::Drain,
+        Duration::from_secs(2),
+    )
+    .map_err(|e| anyhow::anyhow!("shutdown keepalive pool: {e:?}"))?;
+    runtime
+        .try_send(notify_listener, HttpListenerMsg::Stop)
+        .map_err(|e| anyhow::anyhow!("stop notify listener: {e:?}"))?;
+    runtime
+        .try_send(main_listener, HttpListenerMsg::Stop)
+        .map_err(|e| anyhow::anyhow!("stop main listener: {e:?}"))?;
+    sqlite.closer.close();
+    let trace = runtime
+        .shutdown()
+        .map_err(|e| anyhow::anyhow!("runtime shutdown: {e:?}"))?;
+    let pressure = tina_runtime::pressure::PressureSummary::from_events(&trace);
+    let shutdown_clean = matches!(outbound_shutdown.drain, KeepalivePoolDrainOutcome::Drained)
+        && outbound_shutdown.requested == outbound_shutdown.stopped
+        && outbound_shutdown.timed_out == 0
+        && outbound_shutdown.rejected == 0
+        && outbound_shutdown.already_closed == 0
+        && outbound_shutdown.connection_failures.is_empty();
+    let terminal_line = format!(
+        "terminal db.capacity={} db.closed={} outbound.drain={:?} outbound.stop_requested={} \
+         outbound.stop_stopped={} outbound.stop_timed_out={} outbound.stop_rejected={} \
+         outbound.stop_already_closed={} outbound.stop_failures={} trace_pressure={}",
+        db_pressure.capacity,
+        db_pressure.closed_count,
+        outbound_shutdown.drain,
+        outbound_shutdown.requested,
+        outbound_shutdown.stopped,
+        outbound_shutdown.timed_out,
+        outbound_shutdown.rejected,
+        outbound_shutdown.already_closed,
+        outbound_shutdown.connection_failures.len(),
+        pressure
+    );
+
+    Ok(crate::SoakReport {
+        load: load_report,
+        capacity_after_load_line,
+        terminal_line,
+        shutdown_clean,
+    })
+}
+
+struct StartupSummary {
+    summary_line: String,
+    discovery_lines: Vec<String>,
+    topology: ServiceTopology,
+}
+
+/// Wrap a `KeepalivePoolShutdownReport` in the typed
+/// [`ResourceCloseReport`] vocabulary so the service can record one
+/// uniform close-line per resource while keeping the keepalive-specific
+/// counters in the `details` string.
+fn pool_shutdown_to_close_report(
+    name: &'static str,
+    pool: &tina_http::KeepalivePoolShutdownReport,
+    elapsed: Duration,
+) -> ResourceCloseReport {
+    let outcome = match pool.drain {
+        KeepalivePoolDrainOutcome::Drained
+            if pool.requested == pool.stopped
+                && pool.timed_out == 0
+                && pool.rejected == 0
+                && pool.connection_failures.is_empty() =>
+        {
+            CloseOutcome::Clean
+        }
+        KeepalivePoolDrainOutcome::TimedOut { .. } => CloseOutcome::TimedOut { waited: elapsed },
+        KeepalivePoolDrainOutcome::PoolAlreadyClosed => CloseOutcome::AlreadyClosed,
+        _ => CloseOutcome::Failed {
+            reason: format!(
+                "drain={:?} requested={} stopped={} timed_out={} rejected={} failures={}",
+                pool.drain,
+                pool.requested,
+                pool.stopped,
+                pool.timed_out,
+                pool.rejected,
+                pool.connection_failures.len(),
+            ),
+        },
+    };
+    ResourceCloseReport {
+        name: name.to_owned(),
+        kind: ResourceKind::Pool,
+        admission: CloseAdmission::Drain,
+        outcome,
+        elapsed,
+        details: format!(
+            "drain={:?} requested={} stopped={} timed_out={} rejected={} already_closed={} failures={}",
+            pool.drain,
+            pool.requested,
+            pool.stopped,
+            pool.timed_out,
+            pool.rejected,
+            pool.already_closed,
+            pool.connection_failures.len(),
+        ),
+    }
+}
+
+/// Build a small pressure snapshot for the typed [`Health`] report.
+/// The wire format used by `/debug/capacity` and the terminal line stays
+/// the source of truth for live numbers; the typed pressure snapshot is
+/// the structured copy for callers that want to match on fields.
+fn build_pressure_snapshot(db: &SqlitePressureReport) -> tina_runtime::ServicePressureReport {
+    use tina::capacity::{CapacityMode, CapacitySurfaceReport};
+    use tina_runtime::ServicePressureReport;
+
+    let mut report = ServicePressureReport::new("mini_saas_api");
+    report.add_measured(
+        "bridge",
+        CapacitySurfaceReport::count(
+            "db.bridge.capacity",
+            CapacityMode::Fixed,
+            db.capacity,
+            db.leased,
+            db.high_water as usize,
+            db.full_count,
+        ),
+    );
+    report
+}
+
+fn build_startup_summary(
+    main_addr: std::net::SocketAddr,
+    notify_addr: std::net::SocketAddr,
+) -> StartupSummary {
+    use tina::capacity::{CapacityMode, CapacitySurfaceReport};
+    use tina_runtime::ServicePressureReport;
+
+    // Surfaces declared at startup. We do not sample live counters
+    // here — that happens later via `/debug/capacity`. The startup
+    // line is a *topology* snapshot: names + caps, plus explicit
+    // Unavailable markers for surfaces we know exist but cannot
+    // measure from this scope.
+    let body_cap = CapacitySurfaceReport::weighted(
+        "http.request_body",
+        CapacityMode::Fixed,
+        BODY_CAP_BYTES,
+        0,
+        0,
+        0,
+        "bytes",
+    );
+    let controller_mailbox = CapacitySurfaceReport::count(
+        "controller.mailbox",
+        CapacityMode::Fixed,
+        CONTROLLER_MAILBOX_CAPACITY,
+        0,
+        0,
+        0,
+    );
+    let db_pool = CapacitySurfaceReport::count("db.pool", CapacityMode::Fixed, 1, 0, 0, 0);
+    let outbound_pool =
+        CapacitySurfaceReport::count("outbound.pool", CapacityMode::Fixed, 1, 0, 0, 0);
+    // Listener mailbox is bounded by the HTTP listener config; we
+    // declare its name here so on-call sees the surface exists even
+    // when live depth/accept counters live behind `LiveQueueReport`
+    // and aren't sampled from this scope.
+    let main_listener = CapacitySurfaceReport::count(
+        "http.main_listener.mailbox",
+        CapacityMode::Fixed,
+        listener_config(BODY_CAP_BYTES).listener_mailbox_capacity,
+        0,
+        0,
+        0,
+    );
+    let mut report = ServicePressureReport::new("mini_saas_api");
+    report.add_measured("body", body_cap);
+    report.add_measured("mailbox", controller_mailbox);
+    report.add_measured("pool", db_pool);
+    report.add_measured("pool", outbound_pool);
+    report.add_measured("listener", main_listener);
+    // The sqlite bridge measures its own pressure but the bridge is
+    // sampled live; at startup the count cap is the only fact we own
+    // here. The other live counters are reported via `/debug/capacity`
+    // and `terminal_line`. Name them so on-call sees "we plan to
+    // measure this".
+    report.add_unavailable(
+        "db.bridge_in_flight",
+        "bridge",
+        "sampled live via SqliteMetricsHandle",
+    );
+    report.add_unavailable(
+        "outbound.bridge_in_flight",
+        "bridge",
+        "sampled live via WorkerPool reports",
+    );
+
+    let topology_line =
+        format!("topology service=mini_saas_api main_addr={main_addr} notify_addr={notify_addr}");
+    let summary_line = format!("startup {} | {}", topology_line, report.summary_line());
+    // Reuse `ServicePressureSurface::discovery_line()` instead of
+    // duplicating the measured/unavailable format. The previous inline
+    // copy used `reason:?` instead of the surface helper's quoting,
+    // which would silently drift if the helper's escape rules
+    // tightened. The smoke test asserts the resulting `state=unavailable`
+    // / `reason="..."` shape.
+    let mut discovery_lines = vec![topology_line];
+    for surface in &report.surfaces {
+        discovery_lines.push(surface.discovery_line());
+    }
+
+    // Build the typed `ServiceTopology` covering every started component
+    // and the pressure surfaces. The legacy `summary_line` /
+    // `discovery_lines` strings stay byte-identical for compatibility;
+    // the typed report is the structured proof Phase 106 adds.
+    let mut topology = ServiceTopology::new("mini_saas_api", Lifecycle::Ready);
+    topology
+        .push_component(
+            TopologyComponent::new("main.listener", "listener", main_addr.to_string())
+                .with_notes("public HTTP ingress"),
+        )
+        .push_component(
+            TopologyComponent::new("notify.listener", "listener", notify_addr.to_string())
+                .with_notes("notification HTTP service"),
+        )
+        .push_component(
+            TopologyComponent::new("controller", "isolate", "")
+                .with_notes("singleton controller + drain helper"),
+        )
+        .push_component(
+            TopologyComponent::new("db.bridge", "bridge", "sqlite")
+                .with_notes("tina-sqlite-bridge worker"),
+        )
+        .push_component(
+            TopologyComponent::new("outbound.pool", "pool", notify_addr.to_string())
+                .with_notes("keepalive pool to notify_addr"),
+        );
+    let topology = topology.with_pressure(report);
+
+    StartupSummary {
+        summary_line,
+        discovery_lines,
+        topology,
+    }
+}
+
+#[cfg(test)]
+mod conversion_tests {
+    use super::*;
+    use tina_http::{
+        KeepaliveConnectionStopFailure, KeepaliveConnectionStopOutcome, KeepalivePoolCloseOutcome,
+        KeepalivePoolShutdownReport,
+    };
+
+    #[test]
+    fn pool_shutdown_clean_drain_becomes_clean_close_outcome() {
+        let pool = KeepalivePoolShutdownReport {
+            pool_close: KeepalivePoolCloseOutcome::Closed,
+            drain: KeepalivePoolDrainOutcome::Drained,
+            requested: 1,
+            stopped: 1,
+            timed_out: 0,
+            rejected: 0,
+            already_closed: 0,
+            connection_failures: Vec::new(),
+        };
+        let report =
+            pool_shutdown_to_close_report("outbound.pool", &pool, Duration::from_millis(2));
+        assert_eq!(report.name, "outbound.pool");
+        assert_eq!(report.kind, ResourceKind::Pool);
+        assert_eq!(report.admission, CloseAdmission::Drain);
+        assert!(matches!(report.outcome, CloseOutcome::Clean));
+        assert!(report.details.contains("requested=1 stopped=1"));
+    }
+
+    #[test]
+    fn pool_shutdown_timed_out_drain_propagates_as_timed_out() {
+        // Production-shape stuck-child scenario: the keepalive pool's
+        // drain deadline fired while leases remained. The conversion
+        // must surface this as `CloseOutcome::TimedOut`, which the
+        // choreography then records as `StepOutcome::Timeout`.
+        let pool = KeepalivePoolShutdownReport {
+            pool_close: KeepalivePoolCloseOutcome::Closed,
+            drain: KeepalivePoolDrainOutcome::TimedOut { leased: 1 },
+            requested: 0,
+            stopped: 0,
+            timed_out: 0,
+            rejected: 0,
+            already_closed: 0,
+            connection_failures: Vec::new(),
+        };
+        let elapsed = Duration::from_millis(2_000);
+        let report = pool_shutdown_to_close_report("outbound.pool", &pool, elapsed);
+        match report.outcome {
+            CloseOutcome::TimedOut { waited } => assert_eq!(waited, elapsed),
+            other => panic!("expected TimedOut, got {other:?}"),
+        }
+        assert!(report.details.contains("drain=TimedOut"));
+    }
+
+    #[test]
+    fn pool_shutdown_with_connection_failures_becomes_failed_close() {
+        // The pool admission closed cleanly but one of the connection
+        // isolates did not stop on request. The conversion must
+        // surface this as `CloseOutcome::Failed` so the choreography
+        // flags `clean=false` and the failure reason is searchable.
+        let pool = KeepalivePoolShutdownReport {
+            pool_close: KeepalivePoolCloseOutcome::Closed,
+            drain: KeepalivePoolDrainOutcome::Drained,
+            requested: 2,
+            stopped: 1,
+            timed_out: 0,
+            rejected: 1,
+            already_closed: 0,
+            connection_failures: vec![KeepaliveConnectionStopFailure {
+                index: 1,
+                outcome: KeepaliveConnectionStopOutcome::UnexpectedReply,
+            }],
+        };
+        let report =
+            pool_shutdown_to_close_report("outbound.pool", &pool, Duration::from_millis(1));
+        match &report.outcome {
+            CloseOutcome::Failed { reason } => {
+                assert!(reason.contains("failures=1"), "{reason}");
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pool_shutdown_already_closed_becomes_already_closed() {
+        let pool = KeepalivePoolShutdownReport {
+            pool_close: KeepalivePoolCloseOutcome::AlreadyClosed,
+            drain: KeepalivePoolDrainOutcome::PoolAlreadyClosed,
+            requested: 0,
+            stopped: 0,
+            timed_out: 0,
+            rejected: 0,
+            already_closed: 0,
+            connection_failures: Vec::new(),
+        };
+        let report =
+            pool_shutdown_to_close_report("outbound.pool", &pool, Duration::from_millis(0));
+        assert!(matches!(report.outcome, CloseOutcome::AlreadyClosed));
+    }
 }

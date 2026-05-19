@@ -201,6 +201,31 @@ impl PgPressureReport {
     }
 }
 
+/// Stable surface name for the Postgres bridge pressure surface.
+pub const PG_BRIDGE_SURFACE: &str = "pg.bridge";
+
+impl From<PgPressureReport> for tina_runtime::bridge::BridgePressure {
+    fn from(r: PgPressureReport) -> Self {
+        // worker_terminal_count: bridge measures `late_results`
+        // (worker reached terminal after the caller gave up). Use that
+        // conservative value; total worker terminations (including
+        // ones the caller did observe) are not exposed separately at
+        // this layer.
+        tina_runtime::bridge::BridgePressure::measured(
+            PG_BRIDGE_SURFACE,
+            r.capacity,
+            r.leased,
+            r.high_water,
+            r.full_count,
+            r.timeout_count.saturating_add(r.pool_acquire_timeout_count),
+            r.closed_count,
+            r.late_result_count,
+            r.late_result_count,
+        )
+        .expect("pg bridge surface name is a valid bridge name")
+    }
+}
+
 /// Cloneable handle for inspecting bridge metrics from outside the
 /// hosting Tina runtime.
 #[derive(Debug, Clone)]

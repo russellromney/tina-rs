@@ -1,0 +1,5 @@
+error: expected a `fn handle_request(...)` method
+  --> tests/safety_rails_compile_fail/split_missing_handle_request.rs:16:6
+   |
+16 | impl Service {
+   |      ^^^^^^^

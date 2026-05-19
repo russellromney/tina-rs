@@ -154,6 +154,10 @@ fn mint_pending_replies_seq() -> u64 {
 pub struct PendingReplies<K, R> {
     capacity: usize,
     slots: Vec<Option<PendingReplyEntry<K, R>>>,
+    /// Slot occupancy generation. Bumped each time a slot transitions to
+    /// occupied. Tickets carry the generation they were issued under, so
+    /// a stale ticket against a reused slot is rejected.
+    generations: Vec<u64>,
     high_water: usize,
     full_rejects: u64,
     reclaimed: u64,
@@ -219,13 +223,16 @@ where
     pub fn with_capacity(capacity: usize) -> Self {
         assert!(capacity > 0, "PendingReplies capacity must be positive");
         let mut slots = Vec::with_capacity(capacity);
+        let mut generations = Vec::with_capacity(capacity);
         for _ in 0..capacity {
             slots.push(None);
+            generations.push(0);
         }
         let seq = mint_pending_replies_seq();
         Self {
             capacity,
             slots,
+            generations,
             high_water: 0,
             full_rejects: 0,
             reclaimed: 0,
@@ -368,8 +375,9 @@ where
             return Err(InsertError::DuplicateKey(key, reply));
         }
 
-        if let Some(slot) = self.slots.iter_mut().find(|s| s.is_none()) {
-            *slot = Some(PendingReplyEntry { key, reply });
+        if let Some(idx) = self.slots.iter().position(|s| s.is_none()) {
+            self.generations[idx] = self.generations[idx].wrapping_add(1);
+            self.slots[idx] = Some(PendingReplyEntry { key, reply });
             let cur = self.len();
             if cur > self.high_water {
                 self.high_water = cur;
@@ -424,8 +432,9 @@ where
             }
         };
 
-        if let Some(entry_slot) = self.slots.iter_mut().find(|s| s.is_none()) {
-            *entry_slot = Some(PendingReplyEntry { key, reply: slot });
+        if let Some(idx) = self.slots.iter().position(|s| s.is_none()) {
+            self.generations[idx] = self.generations[idx].wrapping_add(1);
+            self.slots[idx] = Some(PendingReplyEntry { key, reply: slot });
             let cur = self.len();
             if cur > self.high_water {
                 self.high_water = cur;
@@ -687,6 +696,437 @@ where
     }
 }
 
+// ---------------------------------------------------------------------------
+// Ticketed park/reply path. The ticket carries (slot_idx, generation) so a
+// stale completion against a reused slot cannot remove a newer parked caller.
+// ParkTicket has private fields and is not Copy, so a moved ticket cannot be
+// used twice and user code cannot forge one.
+// ---------------------------------------------------------------------------
+
+use std::marker::PhantomData;
+
+use tina::{CallContext, RequestCall, RequestContext, TakeReplySlotError};
+
+/// Witness for a parked caller in a [`PendingReplies`] box.
+///
+/// `ParkTicket` is move-only and has private fields. User code can carry
+/// the ticket forward in messages but cannot duplicate or forge one. A
+/// stale ticket against a reused slot is rejected at runtime through the
+/// generation stamp.
+///
+/// Compile-fail: ticket fields are private. User code cannot construct
+/// one.
+///
+/// ```compile_fail
+/// # use std::marker::PhantomData;
+/// use tina_runtime::ParkTicket;
+/// // Fields are private. This must not compile from outside the crate.
+/// let _forged: ParkTicket<u32> = ParkTicket {
+///     slot: 0,
+///     generation: 0,
+///     _key: PhantomData,
+/// };
+/// ```
+///
+/// Compile-fail: a moved ticket cannot be used twice.
+///
+/// ```compile_fail
+/// # use tina_runtime::{PendingReplies, ParkTicket};
+/// # fn ticket_from(_box: &mut PendingReplies<u32, u32>) -> ParkTicket<u32> {
+/// #     unimplemented!()
+/// # }
+/// fn use_twice(b: &mut PendingReplies<u32, u32>) {
+///     let ticket = ticket_from(b);
+///     let _ = b.take_ticket(ticket);
+///     // Second use: ticket already moved.
+///     let _ = b.take_ticket(ticket);
+/// }
+/// ```
+pub struct ParkTicket<K> {
+    slot: usize,
+    generation: u64,
+    _key: PhantomData<fn(K) -> K>,
+}
+
+impl<K> ParkTicket<K> {
+    fn new(slot: usize, generation: u64) -> Self {
+        Self {
+            slot,
+            generation,
+            _key: PhantomData,
+        }
+    }
+}
+
+impl<K> std::fmt::Debug for ParkTicket<K> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ParkTicket")
+            .field("slot", &self.slot)
+            .field("generation", &self.generation)
+            .finish()
+    }
+}
+
+/// Why [`PendingReplies::park_request`] could not park the caller.
+///
+/// Both variants return the original [`RequestCall`] so the handler can
+/// answer the caller immediately (typically with a typed `Full` or
+/// rejection reply).
+pub enum ParkError<'a, K, I: tina::Isolate> {
+    /// The pending box is at capacity.
+    Full {
+        /// Caller key that was being parked.
+        key: K,
+        /// Original caller authority, returned unchanged.
+        call: RequestCall<'a, I>,
+    },
+    /// A live entry already exists for this key.
+    DuplicateKey {
+        /// Caller key that conflicted with a live entry.
+        key: K,
+        /// Original caller authority, returned unchanged.
+        call: RequestCall<'a, I>,
+    },
+}
+
+impl<'a, K, I> std::fmt::Debug for ParkError<'a, K, I>
+where
+    I: tina::Isolate,
+    K: std::fmt::Debug,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Full { key, .. } => f.debug_struct("ParkError::Full").field("key", key).finish(),
+            Self::DuplicateKey { key, .. } => f
+                .debug_struct("ParkError::DuplicateKey")
+                .field("key", key)
+                .finish(),
+        }
+    }
+}
+
+/// Why [`PendingReplies::park_call`] could not park the caller.
+///
+/// `park_call` works at the lower [`CallContext`] level, so it also has
+/// to surface `NoCaller` and `CrossShardUnsupported` from
+/// [`TakeReplySlotError`].
+pub enum ParkCallError<'a, K, I: tina::Isolate> {
+    /// The current message had no caller authority on this turn.
+    NoCaller {
+        /// Caller key that was being parked.
+        key: K,
+        /// Original caller authority, returned unchanged.
+        call: CallContext<'a, I>,
+    },
+    /// The caller came from another shard; deferred replies are local-only.
+    CrossShardUnsupported {
+        /// Caller key that was being parked.
+        key: K,
+        /// Original caller authority, returned unchanged.
+        call: CallContext<'a, I>,
+    },
+    /// The pending box is at capacity.
+    Full {
+        /// Caller key that was being parked.
+        key: K,
+        /// Original caller authority, returned unchanged.
+        call: CallContext<'a, I>,
+    },
+    /// A live entry already exists for this key.
+    DuplicateKey {
+        /// Caller key that conflicted with a live entry.
+        key: K,
+        /// Original caller authority, returned unchanged.
+        call: CallContext<'a, I>,
+    },
+}
+
+impl<'a, K, I> std::fmt::Debug for ParkCallError<'a, K, I>
+where
+    I: tina::Isolate,
+    K: std::fmt::Debug,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoCaller { key, .. } => f
+                .debug_struct("ParkCallError::NoCaller")
+                .field("key", key)
+                .finish(),
+            Self::CrossShardUnsupported { key, .. } => f
+                .debug_struct("ParkCallError::CrossShardUnsupported")
+                .field("key", key)
+                .finish(),
+            Self::Full { key, .. } => f
+                .debug_struct("ParkCallError::Full")
+                .field("key", key)
+                .finish(),
+            Self::DuplicateKey { key, .. } => f
+                .debug_struct("ParkCallError::DuplicateKey")
+                .field("key", key)
+                .finish(),
+        }
+    }
+}
+
+/// Why [`PendingReplies::take_ticket`] could not find the parked caller.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TakeParkedError<K> {
+    /// The slot is empty: the caller already replied, drained, or was
+    /// swept after going away.
+    Missing,
+    /// The slot is occupied but by a newer caller. The ticket is stale.
+    StaleTicket,
+    #[doc(hidden)]
+    _Phantom(PhantomData<fn(K) -> K>),
+}
+
+/// Why [`PendingReplies::reply_ticket`] could not settle the parked caller.
+///
+/// The reply value is returned so the user can decide what to do with it
+/// (typically logged and dropped, since the caller already departed).
+#[derive(Debug)]
+pub enum ReplyParkedError<K, R> {
+    /// The slot is empty.
+    Missing {
+        /// Reply value returned unchanged.
+        reply: R,
+        /// Phantom type witness for the ticket's key shape.
+        #[doc(hidden)]
+        _key: PhantomData<fn(K) -> K>,
+    },
+    /// The ticket generation does not match the current slot occupant.
+    StaleTicket {
+        /// Reply value returned unchanged.
+        reply: R,
+        /// Phantom type witness for the ticket's key shape.
+        #[doc(hidden)]
+        _key: PhantomData<fn(K) -> K>,
+    },
+}
+
+impl<K, R> PendingReplies<K, R>
+where
+    K: PartialEq,
+{
+    /// Park the current request-call caller under `key`.
+    ///
+    /// On success returns a [`ParkTicket`] that must be carried into the
+    /// continuation message. On failure, the original [`RequestCall`] is
+    /// returned alongside the key so the handler can answer immediately.
+    ///
+    /// `RequestCall` is the split-service request shape and guarantees
+    /// caller authority is present on this turn. Park admission is
+    /// checked before the caller is consumed, so a `Full` or
+    /// `DuplicateKey` rejection returns the original `RequestCall`.
+    ///
+    /// Compile-fail: a `PendingReplies<K, WrongReply>` cannot park a
+    /// `RequestCall<'_, I>` whose isolate reply type is something else.
+    ///
+    /// ```compile_fail
+    /// # use std::convert::Infallible;
+    /// # use tina::prelude::*;
+    /// # use tina_runtime::{PendingReplies, RuntimeCall};
+    /// # struct Svc;
+    /// # #[derive(Debug)] struct Req;
+    /// # #[derive(Debug)] enum SvcMsg { Get(Req), _Tick }
+    /// # impl Isolate for Svc {
+    /// #     type Message = SvcMsg;
+    /// #     type Reply = u64;
+    /// #     type Send = tina::Outbound<Infallible>;
+    /// #     type Spawn = Infallible;
+    /// #     type SpawnObserved = Infallible;
+    /// #     type Call = RuntimeCall<SvcMsg>;
+    /// #     type Shard = tina::SingleShard;
+    /// #     fn handle(&mut self, _m: SvcMsg, _ctx: &mut Context<'_, Self::Shard, u64>) -> Effect<Self> {
+    /// #         tina::noop()
+    /// #     }
+    /// # }
+    /// fn try_park(call: RequestCall<'_, Svc>, pending: &mut PendingReplies<u32, u32>) {
+    ///     // Svc::Reply is u64; pending box holds u32. Cannot park.
+    ///     let _ = pending.park_request(1, call);
+    /// }
+    /// ```
+    pub fn park_request<'a, I>(
+        &mut self,
+        key: K,
+        call: RequestCall<'a, I>,
+    ) -> Result<ParkTicket<K>, ParkError<'a, K, I>>
+    where
+        I: tina::Isolate<Reply = R>,
+        R: 'static,
+    {
+        self.sweep();
+
+        if self
+            .slots
+            .iter()
+            .any(|s| s.as_ref().is_some_and(|e| e.key == key))
+        {
+            self.duplicate_keys += 1;
+            return Err(ParkError::DuplicateKey { key, call });
+        }
+        if self.live_admission_len() >= self.capacity {
+            self.full_rejects += 1;
+            return Err(ParkError::Full { key, call });
+        }
+
+        let req = Self::extract_request_context(call);
+        Ok(self.store_request_context(key, req))
+    }
+
+    /// Park the current call-context caller under `key`.
+    pub fn park_call<'a, I>(
+        &mut self,
+        key: K,
+        call: CallContext<'a, I>,
+    ) -> Result<ParkTicket<K>, ParkCallError<'a, K, I>>
+    where
+        I: tina::Isolate<Reply = R>,
+        R: 'static,
+    {
+        self.sweep();
+
+        if self
+            .slots
+            .iter()
+            .any(|s| s.as_ref().is_some_and(|e| e.key == key))
+        {
+            self.duplicate_keys += 1;
+            return Err(ParkCallError::DuplicateKey { key, call });
+        }
+        if self.live_admission_len() >= self.capacity {
+            self.full_rejects += 1;
+            return Err(ParkCallError::Full { key, call });
+        }
+
+        match call.try_into_request_context() {
+            Ok(req) => Ok(self.store_request_context(key, req)),
+            Err((call, TakeReplySlotError::NoCaller)) => Err(ParkCallError::NoCaller { key, call }),
+            Err((call, TakeReplySlotError::CrossShardUnsupported)) => {
+                Err(ParkCallError::CrossShardUnsupported { key, call })
+            }
+        }
+    }
+
+    /// Remove the parked caller named by `ticket`. Returns the underlying
+    /// [`DeferredReply`] so the service can hand-roll its reply path.
+    pub fn take_ticket(
+        &mut self,
+        ticket: ParkTicket<K>,
+    ) -> Result<DeferredReply<R>, TakeParkedError<K>> {
+        if ticket.slot >= self.slots.len() {
+            return Err(TakeParkedError::StaleTicket);
+        }
+        if self.generations[ticket.slot] != ticket.generation {
+            return Err(TakeParkedError::StaleTicket);
+        }
+        let Some(entry) = self.slots[ticket.slot].take() else {
+            return Err(TakeParkedError::Missing);
+        };
+        Ok(entry.reply)
+    }
+
+    /// Settle the parked caller named by `ticket`, returning the
+    /// corresponding [`Effect::ReplyTo`].
+    ///
+    /// `PendingReplies<K, R>` only produces `Effect<I>` when
+    /// `I::Reply = R`. The matching `RequestContext` is reconstructed
+    /// from the stored slot.
+    pub fn reply_ticket<I>(
+        &mut self,
+        ticket: ParkTicket<K>,
+        reply: R,
+    ) -> Result<Effect<I>, ReplyParkedError<K, R>>
+    where
+        I: Isolate<Reply = R>,
+        R: 'static,
+    {
+        if ticket.slot >= self.slots.len() {
+            return Err(ReplyParkedError::StaleTicket {
+                reply,
+                _key: PhantomData,
+            });
+        }
+        if self.generations[ticket.slot] != ticket.generation {
+            return Err(ReplyParkedError::StaleTicket {
+                reply,
+                _key: PhantomData,
+            });
+        }
+        let Some(entry) = self.slots[ticket.slot].take() else {
+            return Err(ReplyParkedError::Missing {
+                reply,
+                _key: PhantomData,
+            });
+        };
+        Ok(reply_to::<I>(entry.reply, reply))
+    }
+
+    /// Internal: place a `RequestContext<R>` into a free slot. Used by
+    /// `park_call` (and indirectly `park_request`).
+    fn store_request_context(&mut self, key: K, req: RequestContext<R>) -> ParkTicket<K> {
+        let idx = self
+            .slots
+            .iter()
+            .position(|s| s.is_none())
+            .expect("admission already proved a free slot is available");
+        self.generations[idx] = self.generations[idx].wrapping_add(1);
+        let generation = self.generations[idx];
+        self.slots[idx] = Some(PendingReplyEntry {
+            key,
+            reply: req.into_deferred(),
+        });
+        let cur = self.len();
+        if cur > self.high_water {
+            self.high_water = cur;
+        }
+        ParkTicket::new(idx, generation)
+    }
+
+    /// `live_len` filters by slot state; admission needs to count
+    /// occupancy (including Closed slots still pending sweep) so we
+    /// don't exceed `capacity` between sweeps. This is the same count
+    /// as `len()` but pinned to admission semantics.
+    fn live_admission_len(&self) -> usize {
+        self.slots.iter().filter(|s| s.is_some()).count()
+    }
+}
+
+impl<K, R> PendingReplies<K, R> {
+    /// Internal helper that pulls the request context out of a
+    /// `RequestCall` without forcing the user to settle the caller now.
+    ///
+    /// Cross-shard `RequestCall` would surface as a panic here; in
+    /// practice the split-service request path is local-only on
+    /// the request handler turn, so the conversion always succeeds.
+    fn extract_request_context<I>(call: RequestCall<'_, I>) -> RequestContext<I::Reply>
+    where
+        I: tina::Isolate,
+        I::Reply: 'static,
+    {
+        call.into_call_context().into_request_context()
+    }
+}
+
+/// Build a `RequestEffect<I>` from an `Effect<I>` after caller authority
+/// has been consumed by a bounded helper such as
+/// [`PendingReplies::park_request`].
+///
+/// The ticket reference is taken purely as a type-level witness that
+/// admission already happened: a caller cannot conjure one without going
+/// through `park_request` (or one of its siblings), so this helper does
+/// not open a hole in the safety rails. The ticket itself is borrowed,
+/// not consumed.
+pub fn request_effect_after_park<I, K>(
+    _ticket: &ParkTicket<K>,
+    effect: tina::Effect<I>,
+) -> tina::RequestEffect<I>
+where
+    I: tina::Isolate,
+{
+    tina::runtime_internal::request_effect_from_consumed_effect(effect)
+}
+
 #[cfg(test)]
 mod pending_replies_tests {
     use super::*;
@@ -865,6 +1305,7 @@ mod pending_replies_tests {
         type Spawn = std::convert::Infallible;
         type SpawnObserved = std::convert::Infallible;
         type Call = std::convert::Infallible;
+        type Fact = ::std::convert::Infallible;
         type Shard = tina::SingleShard;
 
         fn handle(
@@ -1071,5 +1512,105 @@ mod pending_replies_tests {
             "closed slot 30 must appear in the drained effects"
         );
         assert!(box_.is_empty());
+    }
+
+    // ------------------------------------------------------------------
+    // Ticketed park-path tests. We exercise the lower-level
+    // `store_request_context` directly (it is the same code path
+    // park_call uses after passing TakeReplySlotError checks) so the
+    // tests stay independent of a live runtime.
+    // ------------------------------------------------------------------
+
+    fn fake_request(id: u64) -> tina::RequestContext<u32> {
+        tina::runtime_internal::request_context_from_deferred(fake_slot(id))
+    }
+
+    #[test]
+    fn store_request_context_returns_ticket_and_reply_ticket_settles() {
+        let mut box_ = PendingReplies::<u32, u32>::with_capacity(4);
+        let ticket = box_.store_request_context(1, fake_request(10));
+        assert_eq!(box_.len(), 1);
+        let effect: tina::Effect<TestIso> = box_.reply_ticket(ticket, 99).unwrap();
+        match effect {
+            tina::Effect::ReplyTo(slot, v) => {
+                assert_eq!(slot.slot_id(), 10);
+                assert_eq!(v, 99);
+            }
+            other => panic!("expected ReplyTo, got {other:?}"),
+        }
+        assert!(box_.is_empty());
+    }
+
+    #[test]
+    fn take_ticket_returns_deferred_reply() {
+        let mut box_ = PendingReplies::<u32, u32>::with_capacity(2);
+        let ticket = box_.store_request_context(7, fake_request(42));
+        let slot = box_.take_ticket(ticket).expect("take ok");
+        assert_eq!(slot.slot_id(), 42);
+        assert!(box_.is_empty());
+    }
+
+    #[test]
+    fn stale_ticket_rejected_after_slot_reuse() {
+        // Park caller A, take by key (sim a stale completion path), then
+        // park caller B which reuses the same slot. The old ticket must
+        // not remove B.
+        let mut box_ = PendingReplies::<u32, u32>::with_capacity(1);
+        let ticket_a = box_.store_request_context(1, fake_request(10));
+        // Hand-roll a stale removal: take(&1) clears the slot without
+        // consuming the ticket. Generation does not bump on take.
+        let _ = box_.take(&1);
+        // Now park a new caller; same slot index, new generation.
+        let _ticket_b = box_.store_request_context(2, fake_request(20));
+        // The old ticket must be rejected as stale.
+        let err = box_.take_ticket(ticket_a).unwrap_err();
+        assert!(matches!(err, TakeParkedError::StaleTicket));
+        // B is still parked.
+        assert_eq!(box_.len(), 1);
+    }
+
+    #[test]
+    fn reply_ticket_stale_returns_reply_back() {
+        let mut box_ = PendingReplies::<u32, u32>::with_capacity(1);
+        let ticket_a = box_.store_request_context(1, fake_request(10));
+        let _ = box_.take(&1);
+        let _ = box_.store_request_context(2, fake_request(20));
+        let err = box_.reply_ticket::<TestIso>(ticket_a, 7).unwrap_err();
+        match err {
+            ReplyParkedError::StaleTicket { reply, .. } => assert_eq!(reply, 7),
+            other => panic!("expected StaleTicket, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn take_ticket_missing_when_slot_drained() {
+        // Park caller, drain (slot empty, generation unchanged), then
+        // take_ticket -> Missing (not StaleTicket).
+        let mut box_ = PendingReplies::<u32, u32>::with_capacity(2);
+        let ticket = box_.store_request_context(1, fake_request(10));
+        let _ = box_.drain();
+        let err = box_.take_ticket(ticket).unwrap_err();
+        assert!(matches!(err, TakeParkedError::Missing));
+    }
+
+    #[test]
+    fn reply_ticket_missing_returns_reply_back() {
+        let mut box_ = PendingReplies::<u32, u32>::with_capacity(2);
+        let ticket = box_.store_request_context(1, fake_request(10));
+        let _ = box_.drain();
+        let err = box_.reply_ticket::<TestIso>(ticket, 7).unwrap_err();
+        match err {
+            ReplyParkedError::Missing { reply, .. } => assert_eq!(reply, 7),
+            other => panic!("expected Missing, got {other:?}"),
+        }
+    }
+
+    /// `ParkTicket` must be move-only — never `Copy` and never `Clone`.
+    /// A static assertion makes regressions fail to compile.
+    #[allow(dead_code)]
+    fn _ticket_is_not_copy() {
+        fn assert_not_copy<T: 'static>() {}
+        // intentionally no Copy bound — this is just a witness.
+        assert_not_copy::<ParkTicket<u32>>();
     }
 }

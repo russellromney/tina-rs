@@ -66,6 +66,7 @@ impl Isolate for DeferredSvc {
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
     type Call = Infallible;
+    type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 
     fn handle(
@@ -135,6 +136,7 @@ impl Isolate for DeferredCaller {
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<CallerMsg>;
+    type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 
     fn handle(
@@ -292,6 +294,7 @@ fn panic_after_capture_drops_slot_and_closes_caller() {
         type Spawn = Infallible;
         type SpawnObserved = std::convert::Infallible;
         type Call = Infallible;
+        type Fact = ::std::convert::Infallible;
         type Shard = TestShard;
 
         fn handle(
@@ -418,6 +421,7 @@ fn capture_supersedes_subsequent_effect_reply_in_same_handler_turn() {
         type Spawn = Infallible;
         type SpawnObserved = std::convert::Infallible;
         type Call = Infallible;
+        type Fact = ::std::convert::Infallible;
         type Shard = TestShard;
 
         fn handle(
@@ -463,6 +467,7 @@ fn capture_supersedes_subsequent_effect_reply_in_same_handler_turn() {
         type Spawn = Infallible;
         type SpawnObserved = std::convert::Infallible;
         type Call = RuntimeCall<LocalCallerMsg>;
+        type Fact = ::std::convert::Infallible;
         type Shard = TestShard;
 
         fn handle(
@@ -543,6 +548,7 @@ fn pending_box_reclaims_slots_after_caller_timeouts_and_admits_new_callers() {
         type Spawn = Infallible;
         type SpawnObserved = std::convert::Infallible;
         type Call = Infallible;
+        type Fact = ::std::convert::Infallible;
         type Shard = TestShard;
 
         fn handle(
@@ -606,6 +612,7 @@ fn pending_box_reclaims_slots_after_caller_timeouts_and_admits_new_callers() {
         type Spawn = Infallible;
         type SpawnObserved = std::convert::Infallible;
         type Call = RuntimeCall<FCallerMsg>;
+        type Fact = ::std::convert::Infallible;
         type Shard = TestShard;
 
         fn handle(
@@ -717,6 +724,7 @@ fn lifo_drain_routes_each_reply_to_its_original_caller_by_call_id() {
         type Spawn = Infallible;
         type SpawnObserved = std::convert::Infallible;
         type Call = Infallible;
+        type Fact = ::std::convert::Infallible;
         type Shard = TestShard;
 
         fn handle(
@@ -785,6 +793,7 @@ fn lifo_drain_routes_each_reply_to_its_original_caller_by_call_id() {
         type Spawn = Infallible;
         type SpawnObserved = std::convert::Infallible;
         type Call = RuntimeCall<FanCallerMsg>;
+        type Fact = ::std::convert::Infallible;
         type Shard = TestShard;
 
         fn handle(
@@ -884,6 +893,7 @@ impl Isolate for Worker {
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
     type Call = Infallible;
+    type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 
     fn handle(
@@ -933,6 +943,7 @@ impl Isolate for PoolFrontend {
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<FrontendMsg>;
+    type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 
     fn handle(
@@ -1027,6 +1038,7 @@ impl Isolate for PoolCaller {
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<PoolCallerMsg>;
+    type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 
     fn handle(
@@ -1147,6 +1159,7 @@ impl Isolate for FanoutTarget {
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
     type Call = Infallible;
+    type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 
     fn handle(
@@ -1202,6 +1215,7 @@ impl Isolate for Coordinator {
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<CoordMsg>;
+    type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 
     fn handle(
@@ -1295,6 +1309,7 @@ impl Isolate for FanoutCaller {
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
     type Call = RuntimeCall<FanoutCallerMsg>;
+    type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 
     fn handle(
@@ -1382,6 +1397,7 @@ fn pooled_frontend_returns_full_when_pending_box_is_at_cap() {
         type Spawn = Infallible;
         type SpawnObserved = std::convert::Infallible;
         type Call = Infallible;
+        type Fact = ::std::convert::Infallible;
         type Shard = TestShard;
         fn handle(
             &mut self,
@@ -1488,6 +1504,7 @@ fn service_stop_drops_pending_promises_visibly() {
         type Spawn = Infallible;
         type SpawnObserved = std::convert::Infallible;
         type Call = Infallible;
+        type Fact = ::std::convert::Infallible;
         type Shard = TestShard;
 
         fn handle(
@@ -1536,6 +1553,7 @@ fn service_stop_drops_pending_promises_visibly() {
         type Spawn = Infallible;
         type SpawnObserved = std::convert::Infallible;
         type Call = RuntimeCall<CallerStopMsg>;
+        type Fact = ::std::convert::Infallible;
         type Shard = TestShard;
 
         fn handle(
@@ -1685,6 +1703,7 @@ fn try_capture_helper_succeeds_admits_and_rejects_full() {
         type Spawn = Infallible;
         type SpawnObserved = std::convert::Infallible;
         type Call = Infallible;
+        type Fact = ::std::convert::Infallible;
         type Shard = TestShard;
 
         fn handle(
@@ -1751,6 +1770,7 @@ fn try_capture_helper_succeeds_admits_and_rejects_full() {
         type Spawn = Infallible;
         type SpawnObserved = std::convert::Infallible;
         type Call = RuntimeCall<HelpCallerMsg>;
+        type Fact = ::std::convert::Infallible;
         type Shard = TestShard;
 
         fn handle(
@@ -1825,6 +1845,7 @@ impl Isolate for BridgeWorker {
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
     type Call = Infallible;
+    type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 
     fn handle(
@@ -1900,6 +1921,7 @@ fn bridge_worker_routes_out_of_order_external_completions_to_callers() {
         type Spawn = Infallible;
         type SpawnObserved = std::convert::Infallible;
         type Call = RuntimeCall<BCallerMsg>;
+        type Fact = ::std::convert::Infallible;
         type Shard = TestShard;
         fn handle(
             &mut self,
@@ -1987,6 +2009,7 @@ fn bridge_worker_cancelled_caller_does_not_leak_slot() {
         type Spawn = Infallible;
         type SpawnObserved = std::convert::Infallible;
         type Call = RuntimeCall<BCallerMsg2>;
+        type Fact = ::std::convert::Infallible;
         type Shard = TestShard;
         fn handle(
             &mut self,
@@ -2083,6 +2106,7 @@ fn wrong_reply_type_via_runtime_internal_surfaces_typemismatch() {
         type Spawn = Infallible;
         type SpawnObserved = std::convert::Infallible;
         type Call = Infallible;
+        type Fact = ::std::convert::Infallible;
         type Shard = TestShard;
 
         fn handle(
@@ -2162,6 +2186,7 @@ fn wrong_reply_type_via_runtime_internal_surfaces_typemismatch() {
         type Spawn = Infallible;
         type SpawnObserved = std::convert::Infallible;
         type Call = RuntimeCall<WrongCallerMsg>;
+        type Fact = ::std::convert::Infallible;
         type Shard = TestShard;
         fn handle(
             &mut self,

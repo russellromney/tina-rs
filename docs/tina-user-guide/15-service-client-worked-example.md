@@ -14,10 +14,11 @@ outbound services.
 
 Native gRPC is currently server-first. `tina-http::GrpcRouter` serves unary
 `prost` messages over the native HTTP/2 h2c listener, and
-`grpc_unary_call_h2c` is only a tiny specimen/test helper to prove the wire
-path without Tokio. A production gRPC client should follow the service-client
-state-machine shape below once the native HTTP/2 client grows into a real Tina
-client service.
+`grpc_unary_call_h2c_blocking` is only a tiny blocking specimen/test helper to
+prove the wire path without Tokio. It is not a Tina client service and does not
+emit runtime trace facts. A production gRPC client should follow the
+service-client state-machine shape below once the native HTTP/2 client grows
+into a real Tina client service.
 
 ## Public Call Shape
 

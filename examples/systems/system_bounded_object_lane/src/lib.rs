@@ -87,6 +87,18 @@ enum WorkBackend {
     FakeSleep {
         work: Duration,
     },
+    /// Real AWS S3 path via `tina-aws-bridge`. The lane uses a real
+    /// `S3Address` for `PutObject` calls. Bridge-level pressure shows
+    /// up as a typed `Failed`; lane-level admission still flows through
+    /// the same `LocalPermitGate` so the user sees one consistent
+    /// `Busy` shape.
+    #[allow(dead_code)]
+    AwsS3 {
+        address: tina_aws_bridge::S3Address,
+        bucket: String,
+        key_prefix: String,
+        timeout: Duration,
+    },
 }
 
 struct ObjectLane {
@@ -124,7 +136,9 @@ impl ObjectLane {
                         self.completed += 1;
                         reply_to_request(request, LaneReply::Stored(key))
                     }
-                    Err(error) => reply_to_request(request, LaneReply::Failed(format!("{error:?}"))),
+                    Err(error) => {
+                        reply_to_request(request, LaneReply::Failed(format!("{error:?}")))
+                    }
                 }
             }
         }
@@ -144,14 +158,43 @@ impl ObjectLane {
                 Ok(permit) => {
                     self.accepted += 1;
                     match &self.backend {
-                        WorkBackend::FakeSleep { work } => call.defer(sleep(*work)).reply(
-                            move |request, result| LaneMsg::PutFinished {
-                                request,
-                                key,
-                                permit,
-                                result: sleep_to_work_result(result),
-                            },
-                        ),
+                        WorkBackend::FakeSleep { work } => {
+                            call.defer(sleep(*work)).reply(move |request, result| {
+                                LaneMsg::PutFinished {
+                                    request,
+                                    key,
+                                    permit,
+                                    result: sleep_to_work_result(result),
+                                }
+                            })
+                        }
+                        WorkBackend::AwsS3 {
+                            address,
+                            bucket,
+                            key_prefix,
+                            timeout,
+                        } => {
+                            let full_key = format!("{key_prefix}{key}");
+                            let issued = tina_aws_bridge::send_s3(
+                                *address,
+                                tina_aws_bridge::S3Request::PutObject(
+                                    tina_aws_bridge::S3PutObject {
+                                        bucket: bucket.clone(),
+                                        key: full_key,
+                                        body: key.clone().into_bytes(),
+                                        content_type: Some("application/octet-stream".into()),
+                                    },
+                                ),
+                                *timeout,
+                            );
+                            call.defer(issued)
+                                .reply(move |request, outcome| LaneMsg::PutFinished {
+                                    request,
+                                    key,
+                                    permit,
+                                    result: s3_outcome_to_work_result(outcome),
+                                })
+                        }
                     }
                 }
             },
@@ -164,9 +207,62 @@ impl ObjectLane {
                     in_flight: report.current,
                 }))
             }
-            LaneMsg::PutFinished { .. } => call.reject(tina::CallRejectedReason::UnsupportedMessage),
+            LaneMsg::PutFinished { .. } => {
+                call.reject(tina::CallRejectedReason::UnsupportedMessage)
+            }
         }
     }
+}
+
+/// Run the lane against a real `tina-aws-bridge` S3 worker.
+///
+/// The caller is responsible for installing the bridge and shutting it
+/// down. The lane uses `tina_aws_bridge::send_s3(...).then(...)` for
+/// each admitted call. Bridge-level pressure (`max_in_flight`,
+/// `RequestTooLarge`, SDK errors) becomes a typed `Failed` reply with
+/// the layer named in the message; lane-level admission still uses the
+/// existing `LocalPermitGate`.
+///
+/// Hermetic tests should still use [`run`] (the FakeSleep backend); the
+/// AWS-S3-shaped backend is exercised against a fake S3 HTTP server in
+/// `tina-aws-bridge`'s integration tests.
+pub fn run_against_s3(
+    config: RunConfig,
+    s3_address: tina_aws_bridge::S3Address,
+    bucket: String,
+    key_prefix: String,
+    bridge_timeout: Duration,
+) -> anyhow::Result<RunReport> {
+    let runtime = Arc::new(ThreadedRuntime::new(
+        SingleShard,
+        DefaultThreadedMailboxFactory,
+    ));
+    let lane = runtime
+        .register_with_capacity::<_, std::convert::Infallible>(
+            ObjectLane {
+                gate: LocalPermitGate::with_capacity(config.lane_in_flight)
+                    .named(LocalPermitName("object_lane")),
+                backend: WorkBackend::AwsS3 {
+                    address: s3_address,
+                    bucket,
+                    key_prefix,
+                    timeout: bridge_timeout,
+                },
+                accepted: 0,
+                busy: 0,
+                completed: 0,
+            },
+            config.lane_mailbox,
+        )
+        .map_err(|e| anyhow::anyhow!("register lane: {e:?}"))?;
+
+    let report = drive_callers(&runtime, lane, config)?;
+
+    if let Ok(rt) = Arc::try_unwrap(runtime) {
+        let _ = rt.shutdown();
+    }
+
+    Ok(report)
 }
 
 pub fn run(config: RunConfig) -> anyhow::Result<RunReport> {
@@ -261,6 +357,30 @@ fn _call_error_is_part_of_the_public_story(_: CallError) {}
 
 fn sleep_to_work_result(result: SleepReply) -> WorkResult {
     result.map_err(|error| format!("{error:?}"))
+}
+
+/// Maps the AWS S3 bridge's two-layer outcome into the lane's flat
+/// `Result<(), String>`. The lane treats bridge-level `Full/Closed/Timeout`
+/// and worker-level `S3Error` as failures with the typed name visible
+/// in the error string.
+fn s3_outcome_to_work_result(
+    outcome: tina_runtime::CallOutcome<
+        Result<tina_aws_bridge::S3Response, tina_aws_bridge::S3Error>,
+    >,
+) -> WorkResult {
+    use tina_aws_bridge::S3Error;
+    use tina_runtime::CallOutcome;
+    match outcome {
+        CallOutcome::Replied(Ok(_)) => Ok(()),
+        CallOutcome::Replied(Err(S3Error::Closed)) => Err("s3:closed".into()),
+        CallOutcome::Replied(Err(S3Error::Full)) => Err("s3:full".into()),
+        CallOutcome::Replied(Err(S3Error::Timeout)) => Err("s3:timeout".into()),
+        CallOutcome::Replied(Err(other)) => Err(format!("s3:{other}")),
+        CallOutcome::Full => Err("bridge:full".into()),
+        CallOutcome::Closed => Err("bridge:closed".into()),
+        CallOutcome::Timeout => Err("bridge:timeout".into()),
+        CallOutcome::Rejected(r) => Err(format!("bridge:rejected:{r:?}")),
+    }
 }
 
 fn env_usize(name: &str) -> Option<usize> {

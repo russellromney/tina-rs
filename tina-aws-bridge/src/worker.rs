@@ -95,26 +95,16 @@ impl S3Closer {
     /// SDK work to leave the bridge's in-flight set.
     pub fn close_and_drain(&self, timeout: Duration) -> S3DrainReport {
         self.close();
-        let deadline = Instant::now() + timeout;
-        loop {
-            let remaining = self.metrics.in_flight_current.load(Ordering::Relaxed);
-            if remaining == 0 {
-                return S3DrainReport {
-                    closed: true,
-                    drained: true,
-                    in_flight_remaining: 0,
-                    in_flight_kinds: Vec::new(),
-                };
-            }
-            if Instant::now() >= deadline {
-                return S3DrainReport {
-                    closed: true,
-                    drained: false,
-                    in_flight_remaining: remaining,
-                    in_flight_kinds: self.metrics.in_flight_kinds(),
-                };
-            }
-            std::thread::sleep(Duration::from_millis(1));
+        let result = crate::core::await_drain(
+            &self.metrics.in_flight_current,
+            || self.metrics.in_flight_kinds(),
+            timeout,
+        );
+        S3DrainReport {
+            closed: true,
+            drained: result.drained,
+            in_flight_remaining: result.in_flight_remaining,
+            in_flight_kinds: result.in_flight_kinds,
         }
     }
 }
@@ -653,11 +643,17 @@ async fn read_capped(mut stream: ByteStream, limit: usize) -> Result<Vec<u8>, S3
 }
 
 fn tally_admission_error(metrics: &MetricsInner, err: &S3Error) {
+    // `validate_request` only produces `RequestTooLarge` or
+    // `InvalidRequest`. Future validator additions land in `invalid`
+    // until they earn a typed counter.
     match err {
-        S3Error::RequestTooLarge => metrics.request_too_large.fetch_add(1, Ordering::Relaxed),
-        S3Error::InvalidRequest(_) => metrics.invalid.fetch_add(1, Ordering::Relaxed),
-        _ => metrics.invalid.fetch_add(1, Ordering::Relaxed),
-    };
+        S3Error::RequestTooLarge => {
+            metrics.request_too_large.fetch_add(1, Ordering::Relaxed);
+        }
+        _ => {
+            metrics.invalid.fetch_add(1, Ordering::Relaxed);
+        }
+    }
 }
 
 /// Maps an admission-class [`S3Error`] to the wire-stable tracing

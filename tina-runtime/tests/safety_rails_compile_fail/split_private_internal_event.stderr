@@ -1,0 +1,13 @@
+error[E0603]: enum `Event` is private
+  --> tests/safety_rails_compile_fail/split_private_internal_event.rs:44:25
+   |
+44 |     let _event = cache::Event::FillDone;
+   |                         ^^^^^  -------- unit variant `FillDone` is not publicly re-exported
+   |                         |
+   |                         private enum
+   |
+note: the enum `Event` is defined here
+  --> tests/safety_rails_compile_fail/split_private_internal_event.rs:6:5
+   |
+ 6 |     enum Event {
+   |     ^^^^^^^^^^

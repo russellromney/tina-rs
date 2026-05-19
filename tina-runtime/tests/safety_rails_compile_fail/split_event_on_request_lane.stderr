@@ -1,0 +1,20 @@
+error[E0308]: mismatched types
+  --> tests/safety_rails_compile_fail/split_event_on_request_lane.rs:25:50
+   |
+25 |     let _ = tina_runtime::call_request(requests, Event::Filled, Duration::from_millis(1));
+   |             --------------------------           ^^^^^^^^^^^^^ expected `Request`, found `Event`
+   |             |
+   |             arguments to this function are incorrect
+   |
+help: the return type of this call is `Event` due to the type of the argument passed
+  --> tests/safety_rails_compile_fail/split_event_on_request_lane.rs:25:13
+   |
+25 |     let _ = tina_runtime::call_request(requests, Event::Filled, Duration::from_millis(1));
+   |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^-------------^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |                                                  |
+   |                                                  this argument influences the return type of `call_request`
+note: function defined here
+  --> src/call.rs
+   |
+   | pub fn call_request<E, Q, R>(
+   |        ^^^^^^^^^^^^

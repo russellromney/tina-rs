@@ -107,6 +107,14 @@
 //! extension offers are visible and ignored unless a future slice explicitly
 //! negotiates one.
 //!
+//! Rooms that fan out to a bounded member set can use
+//! [`WebSocketMemberTable`] for admit/broadcast/shutdown bookkeeping. The
+//! table owns a capacity-bounded `BTreeMap<WebSocketSessionId,
+//! WebSocketSessionHandle>` and folds `WebSocketSessionMsg::SendOutcome`
+//! into slow-peer / closed / protocol / timeout eviction with a typed
+//! [`SendOutcomeAction`]. Idle-eviction policy, the close timer, and any
+//! recurring tick stay in the room isolate.
+//!
 //! Still out of scope: HTTP/2 TLS ALPN, ACME, mTLS, SNI routing,
 //! system roots, certificate reload, redirects, cookies. For mature
 //! outbound web-client behaviour use the `tina-reqwest-bridge` crate.
@@ -131,6 +139,7 @@ pub mod target;
 pub mod transport;
 pub mod types;
 pub mod websocket;
+pub mod websocket_room;
 
 pub use body_metrics::{BodyCapacityFull, BodyMetrics, BodyPressureReport};
 pub use client::{HttpClient, HttpClientMsg, OutboundCall};
@@ -141,7 +150,7 @@ pub use grpc::{
     GrpcRouterMsg, GrpcServerStreamingResponse, GrpcStatus, GrpcStatusCode, GrpcStreamReply,
     GrpcStreamingCall, GrpcStreamingResponse, decode_streaming_request, decode_unary_request,
     encode_grpc_message, grpc_status_trailers, grpc_stream_finish, grpc_stream_message,
-    grpc_unary_call_h2c,
+    grpc_unary_call_h2c_blocking,
 };
 pub use http2::{
     Http2Connection, Http2ConnectionMsg, Http2ConnectionReply, Http2ConnectionReport, Http2Limits,
@@ -192,6 +201,9 @@ pub use websocket::{
     WebSocketSendOutcome, WebSocketSessionHandle, WebSocketSessionId, WebSocketSessionMsg,
     WebSocketSessionOutcome, WebSocketSessionReport, WebSocketSessionReportOutcome,
     WebSocketUpgradeRequest, websocket_upgrade,
+};
+pub use websocket_room::{
+    AdmitOutcome, SendOutcomeAction, WebSocketMemberTable, WebSocketMemberTableReport,
 };
 
 // Re-exports from the `http` crate for convenient `tina_http::Method`,
