@@ -4,6 +4,35 @@ This file records completed work.
 
 ## Unreleased
 
+### HTTP/2 And Multi-Shard Fairness Hardening (second pass)
+
+- HTTP/2 request `content-length` is now truthful for buffered,
+  streaming, and gRPC paths. The header is parsed once during HPACK
+  decode; invalid decimal values, empty values, equal duplicates, and
+  conflicting duplicates are rejected. Inbound DATA that overruns or
+  underruns the declared length resets the stream with
+  `RST_STREAM(PROTOCOL_ERROR)` before extra bytes reach service code.
+  `END_STREAM` on `HEADERS` with a non-zero declared length is
+  rejected before dispatch.
+- HTTP/2 known-length streaming responses (`HttpResponseBody::Stream`)
+  track remaining `content-length` per stream. A source that over-produces
+  resets visibly before the extra byte is queued for outbound; a source
+  that EOFs early resets rather than sending `END_STREAM` with a short
+  body. Chunked unknown-length responses are unaffected.
+- HTTP/2 duplicate pseudo-headers (`:method`, `:path`, `:scheme`,
+  `:authority`, `:status`) reject with `InvalidPseudoHeaders` before
+  assignment instead of silently overwriting the prior value.
+- HTTP/2 `CONTINUATION` is now named (`FRAME_CONTINUATION = 0x9`) and
+  any occurrence is rejected as `UnexpectedContinuation`. `PRIORITY`
+  validates stream id (must be nonzero) and payload length (must be 5)
+  before accepting. Unknown extension frames still follow the
+  ignore-unknown rule, so core strictness does not turn unknowns fatal.
+- `ThreadedMultiShardRuntime` worker loop services local commands after
+  every bounded remote-inbound drain pass, not only when the drain
+  delivered zero envelopes. `Run` and `Shutdown` commands no longer wait
+  behind a sustained remote inbound flood. Ordinary cross-shard throughput
+  is unchanged.
+
 ### Phase 115 Core / Ecosystem Reorg
 
 Architecture cleanup before Wave A: docs draw the core-vs-batteries

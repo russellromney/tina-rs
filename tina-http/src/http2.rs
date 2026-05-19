@@ -46,6 +46,9 @@ const FRAME_PUSH_PROMISE: u8 = 0x5;
 const FRAME_PING: u8 = 0x6;
 const FRAME_GOAWAY: u8 = 0x7;
 const FRAME_WINDOW_UPDATE: u8 = 0x8;
+const FRAME_CONTINUATION: u8 = 0x9;
+
+const PRIORITY_PAYLOAD_LEN: usize = 5;
 
 const ERR_NO_ERROR: u32 = 0x0;
 const ERR_PROTOCOL_ERROR: u32 = 0x1;
@@ -193,7 +196,10 @@ pub enum Http2Outcome {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Http2ProtocolError {
     BadPreface,
-    FrameTooLarge { len: usize, max: usize },
+    FrameTooLarge {
+        len: usize,
+        max: usize,
+    },
     TruncatedFrame,
     BadFrameLength,
     BadStreamId,
@@ -208,6 +214,13 @@ pub enum Http2ProtocolError {
     SettingsUnsupported,
     InvalidSettingsValue,
     UnsupportedFrame(u8),
+    /// Standalone or otherwise-unexpected `CONTINUATION` frame; full
+    /// continuation support is not implemented, so any such frame is a
+    /// connection-level protocol error.
+    UnexpectedContinuation,
+    /// HTTP/2 `content-length` header was malformed, conflicted across
+    /// duplicates, or DATA bytes did not match the declared length.
+    ContentLengthMismatch,
 }
 
 /// Per-connection report counters.
@@ -406,6 +419,12 @@ struct HeaderBlock {
     headers: HeaderMap,
     bytes: usize,
     saw_regular: bool,
+    /// Declared request body length, parsed once during header validation.
+    /// `None` when no `content-length` header was sent.
+    content_length: Option<usize>,
+    /// Set when any `content-length` header was observed during decoding,
+    /// so duplicate occurrences fail closed even if the value parses.
+    saw_content_length: bool,
 }
 
 #[cfg(test)]
@@ -454,15 +473,36 @@ fn add_header(
         }
         match name {
             ":method" => {
+                if out.method.is_some() {
+                    return Err(Http2ProtocolError::InvalidPseudoHeaders);
+                }
                 out.method = Some(
                     Method::from_bytes(value.as_bytes())
                         .map_err(|_| Http2ProtocolError::InvalidPseudoHeaders)?,
                 );
             }
-            ":path" => out.path = Some(value.to_owned()),
-            ":scheme" => out.scheme = Some(value.to_owned()),
-            ":authority" => out.authority = Some(value.to_owned()),
+            ":path" => {
+                if out.path.is_some() {
+                    return Err(Http2ProtocolError::InvalidPseudoHeaders);
+                }
+                out.path = Some(value.to_owned());
+            }
+            ":scheme" => {
+                if out.scheme.is_some() {
+                    return Err(Http2ProtocolError::InvalidPseudoHeaders);
+                }
+                out.scheme = Some(value.to_owned());
+            }
+            ":authority" => {
+                if out.authority.is_some() {
+                    return Err(Http2ProtocolError::InvalidPseudoHeaders);
+                }
+                out.authority = Some(value.to_owned());
+            }
             ":status" => {
+                if out.status.is_some() {
+                    return Err(Http2ProtocolError::InvalidPseudoHeaders);
+                }
                 out.status = Some(
                     StatusCode::from_bytes(value.as_bytes())
                         .map_err(|_| Http2ProtocolError::InvalidPseudoHeaders)?,
@@ -486,8 +526,26 @@ fn add_header(
         .map_err(|_| Http2ProtocolError::InvalidPseudoHeaders)?;
     let header_value =
         HeaderValue::from_str(value).map_err(|_| Http2ProtocolError::InvalidPseudoHeaders)?;
+    if header_name == http::header::CONTENT_LENGTH {
+        if out.saw_content_length {
+            return Err(Http2ProtocolError::ContentLengthMismatch);
+        }
+        let parsed = parse_content_length(value)?;
+        out.content_length = Some(parsed);
+        out.saw_content_length = true;
+    }
     out.headers.append(header_name, header_value);
     Ok(())
+}
+
+fn parse_content_length(value: &str) -> Result<usize, Http2ProtocolError> {
+    // RFC 9110 §8.6: content-length is a single nonnegative decimal integer.
+    if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(Http2ProtocolError::ContentLengthMismatch);
+    }
+    value
+        .parse::<usize>()
+        .map_err(|_| Http2ProtocolError::ContentLengthMismatch)
 }
 
 fn encode_literal_header(name: &str, value: &str, out: &mut Vec<u8>) {
@@ -579,6 +637,10 @@ struct ActiveStream {
     response_bytes_sent: usize,
     response_pull_in_flight: bool,
     response_pull_handle: Option<tina::CallHandle<ResponseChunkReply>>,
+    /// `Some` only when this response was begun with a declared
+    /// `content-length`. Counts down as DATA is accepted for outbound; if
+    /// the source overshoots or EOFs early we reset the stream visibly.
+    response_remaining_content_length: Option<usize>,
     request_dispatched_streaming: bool,
     request_eof: bool,
     request_content_length: Option<usize>,
@@ -614,6 +676,7 @@ impl ActiveStream {
             response_bytes_sent: 0,
             response_pull_in_flight: false,
             response_pull_handle: None,
+            response_remaining_content_length: None,
             request_dispatched_streaming: false,
             request_eof: false,
             request_content_length: None,
@@ -941,10 +1004,21 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Http2Connection<
                 self.goaway = true;
                 Ok(())
             }
-            FRAME_PRIORITY => Ok(()),
+            FRAME_PRIORITY => self.handle_priority(frame),
             FRAME_PUSH_PROMISE => Err(Http2ProtocolError::UnsupportedFrame(FRAME_PUSH_PROMISE)),
+            FRAME_CONTINUATION => Err(Http2ProtocolError::UnexpectedContinuation),
             _ => Ok(()),
         }
+    }
+
+    fn handle_priority(&mut self, frame: Frame) -> Result<(), Http2ProtocolError> {
+        if frame.stream_id == 0 {
+            return Err(Http2ProtocolError::BadStreamId);
+        }
+        if frame.payload.len() != PRIORITY_PAYLOAD_LEN {
+            return Err(Http2ProtocolError::BadFrameLength);
+        }
+        Ok(())
     }
 
     fn handle_settings(&mut self, frame: Frame) -> Result<(), Http2ProtocolError> {
@@ -1070,6 +1144,15 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Http2Connection<
             .and_then(|value| value.to_str().ok())
             .is_some_and(crate::grpc::is_grpc_content_type);
         let end_stream = frame.flags & FLAG_END_STREAM != 0;
+        let declared_len = headers.content_length;
+        // END_STREAM on HEADERS means zero DATA bytes will follow.
+        // A declared non-zero content-length is a lie before any handler
+        // sees the request.
+        if end_stream && declared_len.is_some_and(|n| n != 0) {
+            self.report.protocol_errors += 1;
+            self.enqueue_frame(rst_stream_frame(frame.stream_id, ERR_PROTOCOL_ERROR))?;
+            return Ok(());
+        }
         let mut stream = ActiveStream::new(
             frame.stream_id,
             headers,
@@ -1077,6 +1160,7 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Http2Connection<
             self.peer_initial_stream_window,
             grpc,
         );
+        stream.request_content_length = declared_len;
         self.report.opened_streams += 1;
         self.emit_protocol_fact(
             effects,
@@ -1407,12 +1491,10 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Http2Connection<
             .take()
             .ok_or(Http2ProtocolError::InvalidPseudoHeaders)?;
         self.streams[idx].request_dispatched_streaming = true;
-        let content_length = headers
-            .headers
-            .get(http::header::CONTENT_LENGTH)
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.parse::<usize>().ok());
-        self.streams[idx].request_content_length = content_length;
+        // Declared length was parsed and stored during header validation;
+        // keep that value (which already accounts for invalid/duplicate
+        // rejection) rather than re-parsing the headers here.
+        let content_length = self.streams[idx].request_content_length;
         let source = tina::Address::new_with_generation(
             self.self_shard_id.expect("shard id captured"),
             self.self_isolate_id.expect("isolate id captured"),
@@ -1586,6 +1668,9 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Http2Connection<
         self.enqueue_frame(headers_frame(stream_id, false, block))?;
         self.streams[idx].response_source = Some(source);
         self.streams[idx].response_trailers = trailers;
+        // Known-length streaming responses must send exactly `content_length`
+        // bytes. `None` here means a chunked/unknown-length source.
+        self.streams[idx].response_remaining_content_length = content_length;
         Ok(())
     }
 
@@ -1744,6 +1829,21 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Http2Connection<
                         CallOutcome::Replied(ResponseChunkReply::Eof),
                     );
                 }
+                // Known-length responses must not overrun the declared
+                // `content-length`. Detect and reset before the extra
+                // bytes are queued for outbound delivery so the client
+                // never sees an inflated success.
+                let overrun = self
+                    .find_stream(stream_id)
+                    .and_then(|idx| self.streams[idx].response_remaining_content_length)
+                    .is_some_and(|remaining| bytes.len() > remaining);
+                if overrun {
+                    self.report.protocol_errors += 1;
+                    let _ = self.enqueue_frame(rst_stream_frame(stream_id, ERR_PROTOCOL_ERROR));
+                    self.remove_stream(stream_id);
+                    self.report.closed_streams += 1;
+                    return self.maybe_write_effect();
+                }
                 let projected = self
                     .find_stream(stream_id)
                     .map(|idx| {
@@ -1775,6 +1875,11 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Http2Connection<
                     self.streams[idx]
                         .response_pending_data
                         .extend_from_slice(&bytes);
+                    if let Some(remaining) =
+                        self.streams[idx].response_remaining_content_length.as_mut()
+                    {
+                        *remaining -= bytes.len();
+                    }
                 }
                 if let Err(error) = self.flush_response_stream(stream_id) {
                     self.report.protocol_errors += 1;
@@ -1797,6 +1902,21 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Http2Connection<
                 batch(effects)
             }
             CallOutcome::Replied(ResponseChunkReply::Eof) => {
+                // Known-length responses must have delivered exactly
+                // `content-length` bytes before EOF. A short source
+                // (remaining > 0) is a contract violation; reset rather
+                // than send END_STREAM that would imply success.
+                let short_source = self
+                    .find_stream(stream_id)
+                    .and_then(|idx| self.streams[idx].response_remaining_content_length)
+                    .is_some_and(|remaining| remaining > 0);
+                if short_source {
+                    self.report.protocol_errors += 1;
+                    let _ = self.enqueue_frame(rst_stream_frame(stream_id, ERR_PROTOCOL_ERROR));
+                    self.remove_stream(stream_id);
+                    self.report.closed_streams += 1;
+                    return self.maybe_write_effect();
+                }
                 let trailers = self
                     .find_stream(stream_id)
                     .and_then(|idx| self.streams[idx].response_trailers.take());

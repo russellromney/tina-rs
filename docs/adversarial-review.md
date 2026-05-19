@@ -509,6 +509,26 @@ the implementation proof and regression test names.
   during header validation, rejecting invalid/conflicting duplicates, and
   enforcing exact length for buffered and streaming request paths.
   `tina-http/src/http2.rs:1062-1084,1120-1127,1780-1788`.
+  Fixed (Phase 124). Content-length is parsed once during HPACK header
+  decode (`add_header` → `parse_content_length`), stored on the
+  `HeaderBlock` and propagated onto the stream before dispatch. Any
+  duplicate `content-length` (equal or conflicting), non-decimal value,
+  empty value, declared length mismatched by inbound DATA, or
+  `END_STREAM` on `HEADERS` with non-zero declared length is rejected
+  with `Http2ProtocolError::ContentLengthMismatch` and a per-stream
+  `RST_STREAM(PROTOCOL_ERROR)`. Buffered, streaming, and gRPC request
+  paths all use the single validated value. Tests:
+  `http2_invalid_content_length_rejects`,
+  `http2_negative_content_length_rejects`,
+  `http2_empty_content_length_value_rejects`,
+  `http2_equal_duplicate_content_length_rejects`,
+  `http2_conflicting_duplicate_content_length_rejects`,
+  `http2_valid_content_length_records_declared_length`,
+  `http2_buffered_request_content_length_zero_with_data_rejects`,
+  `http2_buffered_request_declared_shorter_than_data_rejects`,
+  `http2_buffered_request_declared_longer_than_data_rejects_on_end_stream`,
+  `http2_request_headers_end_stream_with_nonzero_content_length_rejects`,
+  `http2_grpc_request_obeys_declared_length`.
 - A9. HTTP/2 known-length streaming responses emit `content-length` but do
   not enforce it. `begin_streaming_response` writes the declared length,
   while `handle_stream_chunk` / `flush_response_stream` track only response
@@ -517,6 +537,20 @@ the implementation proof and regression test names.
   per-stream remaining declared byte count, decrementing on DATA, and
   resetting/cancelling on early EOF or overrun.
   `tina-http/src/http2.rs:1274-1285,1392-1459,1490-1520`.
+  Fixed (Phase 124). `ActiveStream` now carries
+  `response_remaining_content_length: Option<usize>`, set when
+  `begin_streaming_response` records a declared length and `None` for
+  chunked/unknown-length sources. Each `Chunk` outcome decrements the
+  remaining count; an overrun resets with `RST_STREAM(PROTOCOL_ERROR)`
+  before the extra byte is queued for outbound, and an `Eof` while
+  remaining > 0 resets visibly rather than sending `END_STREAM` with a
+  short body. Tests:
+  `http2_known_length_response_overrun_resets_before_extra_byte`,
+  `http2_known_length_response_short_source_eof_resets_visibly`,
+  `http2_known_length_response_exact_n_then_eof_succeeds`,
+  `http2_known_length_response_split_chunks_decrement_correctly`,
+  `http2_known_length_response_zero_length_eof_succeeds`,
+  `http2_chunked_unknown_length_response_does_not_track_remaining`.
 - A10. HTTP/2 duplicate pseudo-headers overwrite instead of reject.
   `add_header` assigns `:method`, `:path`, `:scheme`, `:authority`, and
   `:status` into `Option` fields without checking whether a value was
@@ -524,6 +558,13 @@ the implementation proof and regression test names.
   violates the HTTP/2 malformed-request rules. Fix by rejecting any
   repeated pseudo-header before assignment.
   `tina-http/src/http2.rs:366-410,1780-1788`.
+  Fixed (Phase 124). Each pseudo-header arm in `add_header` checks the
+  destination `Option` is `None` before assignment and returns
+  `InvalidPseudoHeaders` otherwise. Tests:
+  `http2_duplicate_method_rejects_before_assignment`,
+  `http2_duplicate_path_rejects`, `http2_duplicate_scheme_rejects`,
+  `http2_duplicate_authority_rejects`, `http2_duplicate_status_rejects`,
+  `http2_duplicate_pseudo_after_regular_still_rejects`.
 - A11. HTTP/2 treats core `CONTINUATION` / standalone `PRIORITY` frame
   validation like ignorable extension handling. `FRAME_PRIORITY` returns
   `Ok(())` without checking stream id or 5-byte payload length, and
@@ -531,6 +572,20 @@ the implementation proof and regression test names.
   explicitly rejecting unsupported CONTINUATION state and validating
   PRIORITY frame shape.
   `tina-http/src/http2.rs:796-820`.
+  Fixed (Phase 124). `FRAME_CONTINUATION` (`0x9`) is named and any
+  occurrence returns `UnexpectedContinuation` (full continuation support
+  is not implemented; any `CONTINUATION` is therefore a connection-level
+  protocol error). `FRAME_PRIORITY` now routes through `handle_priority`
+  which rejects stream id 0 (`BadStreamId`) and any payload length not
+  equal to 5 (`BadFrameLength`); a well-formed `PRIORITY` is accepted as
+  a no-op. Unknown extension frames still fall through the catch-all so
+  core strictness does not turn unknowns into fatal errors. Tests:
+  `http2_standalone_continuation_is_protocol_error`,
+  `http2_continuation_after_completed_header_block_is_protocol_error`,
+  `http2_priority_stream_id_zero_is_protocol_error`,
+  `http2_priority_with_wrong_payload_length_is_frame_size_error`,
+  `http2_valid_priority_frame_is_accepted_after_shape_validation`,
+  `http2_unknown_extension_frame_still_ignored_after_core_strictness`.
 - A12. Multi-shard remote inbound traffic can starve local control
   commands, including shutdown. The worker only polls its local command
   queue when `drain_remote_inbound` delivered zero envelopes; a steady
@@ -538,6 +593,17 @@ the implementation proof and regression test names.
   scheduling: after each bounded remote drain pass, service at least one
   local command, and prioritize shutdown over ordinary remote work.
   `tina-runtime/src/threaded_multi_shard.rs:868-903,916-950`.
+  Fixed (Phase 124). `threaded_worker_loop_with_remote` polls
+  `receiver.try_recv()` after every bounded `drain_remote_inbound` pass,
+  not only when `remote_delivered == 0`. `Run` runs the command and
+  continues; `Shutdown` is honored immediately. The idle `recv_timeout`
+  path now additionally guards on `remote_delivered == 0`, so a worker
+  that just drained cross-shard traffic always loops back through the
+  fairness check rather than parking. Tests (in
+  `tina-runtime/tests/multishard_fairness.rs`):
+  `remote_flood_does_not_starve_local_run_command`,
+  `shutdown_under_remote_flood_completes_bounded`,
+  `ordinary_remote_throughput_still_progresses`.
 
 ## Highest-risk modules reviewed
 

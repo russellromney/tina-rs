@@ -952,24 +952,27 @@ where
                 &route_remote,
                 ordinary_budget,
             );
-        if remote_delivered == 0 {
-            match receiver.try_recv() {
-                Ok(ThreadedCommand::Run(command)) => {
-                    command(&mut runtime);
-                    continue;
-                }
-                Ok(ThreadedCommand::Shutdown) => {
-                    deliver_shutdown_signal_and_drain(&mut runtime);
-                    break;
-                }
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
-                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+        // Fairness: poll the local command queue after every bounded
+        // remote-drain pass, not only when the drain delivered zero
+        // envelopes. A sustained remote inbound flood keeps
+        // `remote_delivered > 0` indefinitely; without this check,
+        // `Run` and `Shutdown` never get read.
+        match receiver.try_recv() {
+            Ok(ThreadedCommand::Run(command)) => {
+                command(&mut runtime);
+                continue;
             }
+            Ok(ThreadedCommand::Shutdown) => {
+                deliver_shutdown_signal_and_drain(&mut runtime);
+                break;
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
         }
 
         let delivered = runtime.step_with_remote(&mut |_, envelope| route_remote(envelope));
 
-        if delivered == 0 && !runtime.has_in_flight_calls() {
+        if delivered == 0 && remote_delivered == 0 && !runtime.has_in_flight_calls() {
             match receiver.recv_timeout(config.idle_wait) {
                 Ok(ThreadedCommand::Run(command)) => command(&mut runtime),
                 Ok(ThreadedCommand::Shutdown) => {
