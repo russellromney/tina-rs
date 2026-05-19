@@ -38,33 +38,20 @@
 //! `Sleep`, single-shard spawn/supervision, and scripted single-shard TCP
 //! simulation.
 
-use std::any::Any;
-use std::cell::{Cell, RefCell};
-use std::collections::{BTreeMap, VecDeque};
-use std::convert::Infallible;
-use std::marker::PhantomData;
-use std::net::SocketAddr;
-use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
-use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tina::{
-    Address, AddressGeneration, CallRejectedReason, CallRouting, ChildDefinition, ChildRef,
-    ChildRelation, DeferredReplyHandle, DeferredSlotRegistry, Isolate, IsolateId, MessageCaller,
-    Outbound as TinaOutbound, RestartableChildDefinition, Shard, ShardId, SpawnObservedError,
-    TrySendError,
-};
 #[cfg(test)]
-use tina::{Context, Effect};
-use tina_runtime::{
-    CallCompletionRejectedReason, CallError, CallId, CallInput, CallKind, CallOutcome, CallOutput,
-    CallReplyRejectedReason, EffectKind, ListenerId, PathKind, PathMetadata, PersistenceTraceInfo,
-    ProcessStatus, RestartSkippedReason, RuntimeCall, RuntimeCallable, RuntimeEvent,
-    RuntimeEventKind, SendOutcome, SendRejectedReason, SupervisionRejectedReason, TlsListenerId,
-    TlsStreamId, UdpSocketId,
-};
+use std::marker::PhantomData;
+#[cfg(test)]
+use tina::{Address, AddressGeneration, Context, Effect, Isolate, IsolateId, ShardId};
+use tina::{DeferredSlotRegistry, Shard};
+use tina_runtime::{CallId, RuntimeEvent};
+#[cfg(test)]
+use tina_runtime::{CallInput, CallOutput, RuntimeCall, RuntimeEventKind, SendRejectedReason};
+#[cfg(test)]
 use tina_supervisor::SupervisorConfig;
 
 mod config;

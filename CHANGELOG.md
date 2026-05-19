@@ -78,38 +78,97 @@ No-behavior module splits:
   `AdmitWorkError`). The `call/mod.rs` core still holds the
   closely-coupled `CallInput`/`CallOutput`/`CallError` enums and the
   `RuntimeCall`/`TypedCall` family.
-- `tina-runtime/src/lib.rs` (5231 → 5135 lines, target <1,500
-  partial) — extracted `mod service_handle` with `ServiceHandle`,
-  `SendOnlyServiceHandle`, `SplitServiceHandle` and their
-  `Copy`/`Clone`/`from_address`/`address` impls. The very large
-  `impl<S, F> Runtime<S, F>` block plus the `Erased*` dispatch/spawn
-  machinery still lives in `lib.rs`; splitting those requires
-  threading `pub(crate)` visibility through generic dispatch adapters
-  and is the next refactor.
+- `tina-runtime/src/lib.rs` (5231 → 641 lines ✅) — extracted four
+  submodules from the giant `impl<S, F> Runtime<S, F>` block: `mod
+  host_call` (`try_send`/`try_send_event`, `observe_*`,
+  `set_trace_retention`/`set_trace_observer`, `has_in_flight_calls`,
+  `trace`, `pressure_summary`, plus the test-only lineage / child /
+  supervisor snapshots), `mod remote` (cross-shard transport types
+  `QueuedRemoteEnvelope` / `QueuedRemoteSend` / `RemoteCallReply`
+  family plus `dispatch_local_send_with_context` /
+  `harvest_remote_*` / `complete_remote_isolate_call`), `mod
+  registration` (every `register_*` / `supervise` / `try_supervise`
+  API plus the registered-address bookkeeping and the
+  `spawn_isolate` / `record_child` /
+  `enqueue_bootstrap_message` / `enqueue_entry_message` /
+  `recv_entry_message` family), and `mod dispatch` (the biggest
+  bin: `step`, `step_with_remote`, `execute_effect` and friends,
+  `dispatch_call` / `dispatch_driver_call` /
+  `dispatch_observed_send` / `dispatch_isolate_call` /
+  `dispatch_cancel_call`, `harvest_isolate_call_timeouts`,
+  `record_cancelled_call` / `recently_cancelled_cause` /
+  `close_deferred_slot_for_call_with_reason` /
+  `complete_isolate_call` / `deliver_isolate_call_outcome`,
+  `advance_driver` / `deliver_completion`, the `stop_entry*` and
+  restart family, `push_event` / `enforce_trace_retention` /
+  `compact_trace_prefix*`, plus every `Erased*` adapter type
+  (`ErasedMailbox` / `MailboxAdapter` / `AnyMailboxAdapter`,
+  `ErasedHandler` / `HandlerAdapter` / `SendableHandlerAdapter`,
+  `ErasedSpawn` / `SpawnAdapter` / `RestartableSpawnAdapter`,
+  `ErasedSpawnObserved` / `SpawnObservedAdapter`, `ErasedEffect`,
+  `ErasedSend`, `ErasedMessage`, `RegisteredEntry`,
+  `RegisteredAddress`, `SpawnOutcome` / `SpawnObservedOutcome`,
+  `ChildRecord` / `SupervisorRecord`, `ChildRecordSnapshot` /
+  `SupervisorRecordSnapshot`, and the `erase_effect{,_sendable}`
+  helpers). Constructors (`new`, `with_betelgeuse_io_loop`,
+  `with_clock*`) and the const accessors (`shard`,
+  `trace_retention`, `trace_dropped`,
+  `cancelled_call_cause_evictions`) stay in `lib.rs`. Crate-internal
+  references continue to resolve through narrow `pub(crate) use
+  dispatch::{...}` re-exports.
+- `tina-sim/src/lib.rs` (6,787 → 1,644 lines ✅ <2,000) — extracted
+  `mod sim_impl` carrying every non-constructor method on
+  `Simulator<S>` (`register`, `register_with_mailbox_capacity`,
+  `supervise`, `try_send`, `advance_time`,
+  `advance_to_next_timer`, `step`, `step_with_remote`,
+  `run_until_quiescent[_checked]`, `replay_artifact`,
+  `durable_image` / `load_durable_image`, `observe_new_events`,
+  `execute_effect` plus reject/reply/push_event family,
+  `register_entry` / `spawn_isolate` / `record_child` /
+  `enqueue_bootstrap_message`, restart/supervise lineage handling,
+  `checked_registered_address` and the address-book lookups, the
+  full `dispatch_call` / `dispatch_backend_call` /
+  `dispatch_observed_send` / `dispatch_isolate_call` family, and
+  every TCP / UDP / TLS / file / process / persistence /
+  `TimerEntry` resource-state helper). The free `call_kind` /
+  `fault_selector` helpers and the spawn-adapter types
+  (`SpawnObservedAdapter`, `SpawnAdapter`,
+  `RestartableSpawnAdapter` plus their `ErasedSpawn` /
+  `IntoErasedSpawn` / `ErasedRestartRecipe` /
+  `IntoErasedSpawnObserved` impls) moved alongside them. The
+  Simulator struct, constructors, and immutable accessors stay in
+  `lib.rs`. Phase audit doc
+  (`.intent/phases/115-core-ecosystem-reorg/audit.md`) recorded
+  the visibility decisions.
 
-All moves are `pub use submodule::*` re-exports, so the public API is
-unchanged. A small number of private fields, constructors, and
-helper functions became `pub(crate)` / `pub(super)` so existing
-runtime_internal / dispatch / construction code in parent modules
-keeps working; nothing newly public.
+All moves are private re-exports, so the public API is unchanged.
+The Runtime/Simulator fields and the private support types (the
+full `Erased*` adapter family, the registered-address /
+spawn-outcome / child-record / supervisor-record family, the
+remote-envelope vocabulary, the resource-state structs, the
+`Pending*` and `InFlightCall` / `StoredTranslator` /
+`PendingIsolateCall` families) all became `pub(crate)` per the
+audit so the submodules can name them; nothing newly public.
 
-Remaining splits in this phase (named so they can't be silently
-dropped):
+Deferred to a follow-on cleanup (intentionally named so they can't
+be silently dropped):
 
-- `tina-runtime/src/lib.rs` still at 5,135 lines (target <1,500); the
-  giant `impl<S, F> Runtime<S, F>` block and the `Erased*` adapter
-  family need to be split into `mod registration` / `mod dispatch` /
-  `mod remote` / `mod host_call` once their `pub(crate)` plumbing is
-  ready.
-- `tina-runtime/src/call/mod.rs` still at 2,562 lines (target
-  <1,200); the `CallInput`/`CallOutput`/`CallError` family is the
-  next obvious split when their decoders can be shipped alongside.
-- `tina-sim/src/lib.rs` still at 6,787 lines (target <1,500); the
-  giant `impl<S> Simulator<S>` block has the same shape as the
-  runtime and waits on the same split pattern.
+- `tina-runtime/src/dispatch.rs` is ~3,250 lines and
+  `tina-sim/src/sim_impl.rs` is ~5,270 lines. Both are above the
+  comfortable per-file ceiling and are the next obvious targets for
+  a sub-bin split (the runtime audit's `mod dispatch` was one
+  conceptual bin; we kept it together so this PR stays an honest
+  move-only refactor). The sim split into `mod simulator` / `mod
+  resources` / `mod calls` follows the runtime pattern: visibility
+  audit recorded; sub-bins are mechanical method moves once a
+  reviewer wants smaller files.
+- `tina-runtime/src/call/mod.rs` still at 2,562 lines; the
+  `CallInput`/`CallOutput`/`CallError` family is the next obvious
+  split when their decoders can be shipped alongside.
 - The oversized test homes (`tina-runtime/src/tests.rs`,
   `tina-runtime/tests/local_system.rs`,
-  `tina-sim/tests/io_simulation.rs`) — splittable by test name only.
+  `tina-sim/tests/io_simulation.rs`) — splittable by test name
+  only.
 
 ### Phase 123 Adversarial Hardening
 

@@ -7,7 +7,9 @@
 //! (job id, room name, customer id) and each request gets its own
 //! admission.
 
-use super::pending::{PendingCancelableCall, PendingCancelableTicket};
+use super::pending::PendingCancelableCall;
+#[cfg(test)]
+use super::pending::PendingCancelableTicket;
 
 /// Move-only witness for one admitted [`PendingCancelableCall`]. Carries
 /// the slot index and a generation so a stale completion against a reused
