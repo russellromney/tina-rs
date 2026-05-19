@@ -335,8 +335,24 @@ and reviews live under `.intent/phases/`.
   client/bridge breadth, request-scoped cancellation, lifecycle/health/topology,
   observability and capacity product, proof harnesses and replay ops, and the
   typed config/protocol state safety split event/request rail. These are
-  recorded in `CHANGELOG.md`; the remaining near-term roadmap starts from the
-  core/ecosystem reorg and Wave A client/I/O/admission work below.
+  recorded in `CHANGELOG.md`.
+- Core/ecosystem reorg: docs now separate Tina core from official batteries,
+  battery-authoring rules are written down, Wave A plans carry the new layering
+  language, and the largest core files were split along behavior-preserving
+  module boundaries.
+- Adversarial hardening: recent broad review fixed HTTP/1 keepalive chunked
+  safety, HTTP/WebSocket parser strictness, HTTP/2 peer-setting and rapid-reset
+  handling, RPC cancellation accounting, reserved cross-shard terminal reply
+  lanes, bridge timeout/capacity truth, process/persistence cleanup, runtime
+  trace/restart/cancel hot paths, simulator fault streams, macro crate-path
+  overrides, and SQLx ambiguous-commit outcome reporting.
+- HTTP/2 and multi-shard fairness hardening: HTTP/2 content-length, known-length
+  streaming, duplicate pseudo-header, continuation/priority, and flow-control
+  edge cases are pinned with visible wire outcomes, and live multi-shard remote
+  inbound drain no longer starves local runtime commands.
+
+These are recorded in `CHANGELOG.md`; the remaining near-term roadmap now
+starts with Wave A client/I/O/admission work below.
 
 ## Near-term roadmap
 
@@ -345,7 +361,6 @@ framework before public release-story work.
 
 | Phase | Purpose |
 |---|---|
-| **115 Core / ecosystem reorg** | Draw the core-vs-batteries boundary before Wave A adds more official batteries, and split the worst long core files along real module boundaries. Define learn-core vs choose-batteries docs, official battery rules, prelude/import tiers, public-hook gaps, dependency-layer rules, and no-behavior module homes. Plan outline: `.intent/phases/115-core-ecosystem-reorg/plan.md`. |
 | **116 Native protocol client parity** | Wave A. Native HTTP/2 and gRPC client isolates, streaming client modes, TLS ALPN, authority/SNI/Host truth, pooled client connections, received-status protocol facts, and interop tests. Plan outline: `.intent/phases/116-native-protocol-client-parity/plan.md`. |
 | **117 Local I/O, codec, and IPC parity** | Wave A. Bounded file streaming, line/length-delimited codecs, sync codec adapter pattern, Unix-domain socket rails, local IPC specimens, and sim/unsupported truth. Plan outline: `.intent/phases/117-local-io-codec-ipc-parity/plan.md`. |
 | **118 Admission and rate policy** | Wave A. Explicit service pressure policies built on existing capacity/timer primitives: concurrency/per-key/per-user/rate limits, bounded wait, shed/degrade/close, retry budget, typed outcomes, capacity/service-report integration, and edge-service specimens. Plan outline: `.intent/phases/118-admission-rate-policy/plan.md`. |
