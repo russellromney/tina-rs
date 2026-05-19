@@ -1,0 +1,782 @@
+//! Isolate-shape vocabulary for the tina core.
+//!
+//! Owns the [`Isolate`] / [`CallableIsolate`] traits, the mailbox
+//! vocabulary, restart policy/budget types, the `Shard` trait,
+//! child-spawn types (`ChildDefinition`, `ChildRef`, the
+//! `SpawnObserved` family, `RestartableChildDefinition`), and the
+//! `StopResult` envelope. Re-exported from the crate root.
+//!
+//! ## Module map (Phase 115 reorg)
+//!
+//! New isolate-shape vocabulary belongs here. The closed [`Effect`]
+//! enum and effect constructors live in `mod effect`; address types
+//! live in `mod address`.
+
+use std::marker::PhantomData;
+use std::time::{Duration, Instant};
+
+use crate::{
+    Address, AddressGeneration, CallContext, CallRejectedReason, Context, Effect, IsolateId,
+    ShardId,
+};
+
+/// A typed state machine that consumes one message at a time and returns an
+/// [`Effect`] for the runtime to execute.
+///
+/// Handlers are synchronous on purpose. They mutate local state, inspect the
+/// inbound message, and describe the next action as data.
+pub trait Isolate: Sized {
+    /// The inbox message type accepted by this isolate.
+    type Message;
+
+    /// The payload produced by [`Effect::Reply`].
+    ///
+    /// Use `()` when the isolate does not reply to the current caller.
+    type Reply;
+
+    /// The payload produced by [`Effect::Send`].
+    ///
+    /// A common choice is [`Outbound`] when an isolate needs to address a
+    /// single typed mailbox.
+    type Send;
+
+    /// The payload produced by [`Effect::Spawn`].
+    ///
+    /// [`ChildDefinition`] is the simplest one-shot spawn payload.
+    /// [`RestartableChildDefinition`] adds a repeatable factory for children
+    /// that a runtime may restart later.
+    type Spawn;
+
+    /// The payload produced by [`Effect::SpawnObserved`].
+    type SpawnObserved;
+
+    /// The payload produced by [`Effect::Call`].
+    ///
+    /// A call describes one runtime-owned external operation (TCP I/O,
+    /// timers, future file I/O, child-process spawn, etc.) plus the
+    /// information needed to turn the runtime's later result back into one
+    /// ordinary [`Self::Message`] for this isolate. The trait crate stays
+    /// substrate-neutral here: concrete request and result vocabularies
+    /// belong to runtime crates, not to `tina`.
+    ///
+    /// Use [`std::convert::Infallible`] when an isolate never issues call
+    /// effects.
+    type Call;
+
+    /// The payload produced by [`Effect::Fact`].
+    ///
+    /// A *fact* is one named, replayable observation the isolate may emit
+    /// alongside ordinary effects. Ordinary isolates declare
+    /// `Fact = std::convert::Infallible` and never call [`crate::fact`].
+    /// Protocol isolates that need to feed replay-visible protocol events
+    /// declare `Fact = tina_runtime::ProtocolFact` (or another type that
+    /// implements `tina_runtime::IntoRuntimeFact`).
+    ///
+    /// The conversion bound lives at the runtime registration boundary, not on
+    /// this trait, so the substrate-neutral `tina` crate does not depend on
+    /// `tina-runtime`.
+    type Fact;
+
+    /// The shard abstraction available through [`Context`].
+    type Shard: Shard + ?Sized;
+
+    /// Handles one inbound message and returns the next runtime effect.
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self>;
+
+    /// Handles one inbound call message and returns the next runtime effect.
+    ///
+    /// Plain sends enter [`handle`](Self::handle). Calls enter this method
+    /// with an explicit [`CallContext`], which must be consumed by replying,
+    /// rejecting, or promoting it into a [`RequestContext`]. The default
+    /// rejects callable traffic so a missing implementation never leaves the
+    /// caller waiting for a timeout.
+    fn handle_call(&mut self, _msg: Self::Message, call: CallContext<'_, Self>) -> Effect<Self>
+    where
+        Self::Reply: 'static,
+    {
+        call.reject(CallRejectedReason::UnsupportedMessage)
+    }
+}
+
+/// Marker that an [`Isolate`] exposes a meaningful `handle_call` and is
+/// therefore safe to register through `tina_runtime::Runtime::register_service`.
+///
+/// The default `handle_call` on [`Isolate`] always rejects with
+/// `CallRejectedReason::UnsupportedMessage`. Registering such an isolate
+/// through the callable lane would create a service whose every call returns
+/// a runtime rejection — exactly the silent failure Phase 100 moves to the
+/// compile boundary. `CallableIsolate` is the type-level "this isolate's
+/// `handle_call` is intentional" stamp.
+///
+/// The `#[tina::isolate]` and `#[tina_runtime::isolate]` macros emit
+/// `impl CallableIsolate for ...` automatically when the impl block defines
+/// `fn handle_call(...)`. Hand-rolled isolates may implement this trait
+/// manually after defining their own `handle_call`.
+///
+/// Send-only services intentionally do not implement `CallableIsolate` and
+/// must be registered through `register_service_send_only`.
+#[diagnostic::on_unimplemented(
+    message = "`{Self}` is not a callable service",
+    label = "missing `fn handle_call`",
+    note = "callable services must define `handle_call(&mut self, msg, call)` on the isolate impl",
+    note = "send-only services must register through `register_service_send_only` instead"
+)]
+pub trait CallableIsolate: Isolate {}
+
+/// `recv` takes `&self` because real SPSC implementations rely on interior
+/// mutability (atomics over a ring buffer). Phase Pioneer may revisit this
+/// with a `Sender`/`Receiver` split — see ROADMAP "Open questions".
+///
+/// Concrete implementations may enforce concurrency contracts at runtime rather
+/// than in the type system. For example, an SPSC mailbox may panic if more than
+/// one producer or more than one consumer enters concurrently even though the
+/// trait surface uses shared references.
+pub trait Mailbox<T> {
+    /// Returns the maximum number of messages the mailbox can hold without
+    /// applying backpressure or shedding load.
+    fn capacity(&self) -> usize;
+
+    /// Attempts to enqueue a message without blocking.
+    fn try_send(&self, message: T) -> Result<(), TrySendError<T>>;
+
+    /// Attempts to dequeue the next message without blocking.
+    fn recv(&self) -> Option<T>;
+
+    /// Closes the mailbox so subsequent `try_send` calls return
+    /// [`TrySendError::Closed`]. Idempotent. Already-buffered messages
+    /// remain visible to `recv` until drained.
+    fn close(&self);
+}
+
+impl<T> Mailbox<T> for Box<dyn Mailbox<T>> {
+    fn capacity(&self) -> usize {
+        (**self).capacity()
+    }
+
+    fn try_send(&self, message: T) -> Result<(), TrySendError<T>> {
+        (**self).try_send(message)
+    }
+
+    fn recv(&self) -> Option<T> {
+        (**self).recv()
+    }
+
+    fn close(&self) {
+        (**self).close()
+    }
+}
+
+/// Error returned by [`Mailbox::try_send`] when a bounded mailbox cannot accept
+/// a message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TrySendError<T> {
+    /// The mailbox is currently at capacity.
+    Full(T),
+
+    /// The mailbox has been closed and can never accept more messages.
+    Closed(T),
+}
+
+/// Supervision restart policy for a parent isolate's children.
+///
+/// These policies describe *which* children participate in a restart once the
+/// runtime detects a failure. They do not imply how failures are detected or
+/// how restarts are executed; that mechanism belongs to later runtime crates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RestartPolicy {
+    /// Restart only the child that failed.
+    OneForOne,
+
+    /// Restart the failed child and every sibling in the group.
+    OneForAll,
+
+    /// Restart the failed child plus any children started after it.
+    RestForOne,
+}
+
+impl RestartPolicy {
+    /// Returns the restart decision for a child with the given relation to the
+    /// child that failed.
+    pub const fn decision(self, relation: ChildRelation) -> RestartDecision {
+        match (self, relation) {
+            (Self::OneForOne, ChildRelation::Failed) => RestartDecision::Restart,
+            (Self::OneForOne, ChildRelation::BeforeFailed) => RestartDecision::KeepRunning,
+            (Self::OneForOne, ChildRelation::AfterFailed) => RestartDecision::KeepRunning,
+            (Self::OneForAll, _) => RestartDecision::Restart,
+            (Self::RestForOne, ChildRelation::BeforeFailed) => RestartDecision::KeepRunning,
+            (Self::RestForOne, ChildRelation::Failed) => RestartDecision::Restart,
+            (Self::RestForOne, ChildRelation::AfterFailed) => RestartDecision::Restart,
+        }
+    }
+
+    /// Returns whether this policy restarts a child with the given relation to
+    /// the child that failed.
+    pub const fn restarts(self, relation: ChildRelation) -> bool {
+        matches!(self.decision(relation), RestartDecision::Restart)
+    }
+}
+
+/// Relative position of a child with respect to the child that failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ChildRelation {
+    /// The child was started before the child that failed.
+    BeforeFailed,
+
+    /// The child is the one that failed.
+    Failed,
+
+    /// The child was started after the child that failed.
+    AfterFailed,
+}
+
+impl ChildRelation {
+    /// Classifies a child by ordinal position relative to the child that
+    /// failed.
+    pub const fn from_ordinals(child_ordinal: usize, failed_ordinal: usize) -> Self {
+        if child_ordinal < failed_ordinal {
+            Self::BeforeFailed
+        } else if child_ordinal == failed_ordinal {
+            Self::Failed
+        } else {
+            Self::AfterFailed
+        }
+    }
+}
+
+/// Whether a child should be restarted under a [`RestartPolicy`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RestartDecision {
+    /// The runtime should restart the child.
+    Restart,
+
+    /// The runtime should leave the child running.
+    KeepRunning,
+}
+
+/// Fixed restart allowance for one contiguous budget window.
+///
+/// `tina` only models the accounting boundary. Later runtime crates decide
+/// what starts or resets a window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct RestartBudget {
+    max_restarts: u32,
+    window: Option<Duration>,
+}
+
+impl RestartBudget {
+    /// Creates a lifetime restart budget with a fixed number of allowed
+    /// restarts.
+    ///
+    /// This keeps the pre-windowed API compatible. New code that wants the
+    /// counter to reset should use [`within`](Self::within); code that wants
+    /// permanent exhaustion can spell it explicitly with
+    /// [`lifetime`](Self::lifetime).
+    pub const fn new(max_restarts: u32) -> Self {
+        Self::lifetime(max_restarts)
+    }
+
+    /// Creates a restart budget that never resets.
+    pub const fn lifetime(max_restarts: u32) -> Self {
+        Self {
+            max_restarts,
+            window: None,
+        }
+    }
+
+    /// Creates a restart budget that allows `max_restarts` per `period`.
+    ///
+    /// The first restart opens the window. A later restart at or after
+    /// `period` from that first restart starts a fresh window.
+    pub const fn within(max_restarts: u32, period: Duration) -> Self {
+        Self {
+            max_restarts,
+            window: Some(period),
+        }
+    }
+
+    /// Returns the maximum number of restarts allowed in this budget window.
+    pub const fn max_restarts(self) -> u32 {
+        self.max_restarts
+    }
+
+    /// Returns the reset period for a windowed budget, or `None` for a
+    /// lifetime budget.
+    pub const fn window(self) -> Option<Duration> {
+        self.window
+    }
+
+    /// Starts restart accounting at zero consumed restarts.
+    pub const fn tracker(self) -> RestartBudgetState {
+        RestartBudgetState {
+            budget: self,
+            restarts_used: 0,
+            window_started: None,
+        }
+    }
+}
+
+/// Restart accounting state for a specific [`RestartBudget`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct RestartBudgetState {
+    budget: RestartBudget,
+    restarts_used: u32,
+    window_started: Option<Instant>,
+}
+
+impl RestartBudgetState {
+    /// Returns the configured restart budget.
+    pub const fn budget(self) -> RestartBudget {
+        self.budget
+    }
+
+    /// Returns the number of restarts already consumed.
+    pub const fn restarts_used(self) -> u32 {
+        self.restarts_used
+    }
+
+    /// Returns how many restarts remain before the budget is exhausted.
+    pub const fn restarts_remaining(self) -> u32 {
+        self.budget.max_restarts.saturating_sub(self.restarts_used)
+    }
+
+    /// Returns whether the budget is exhausted.
+    pub const fn is_exhausted(self) -> bool {
+        self.restarts_used >= self.budget.max_restarts
+    }
+
+    /// Records one restart attempt.
+    ///
+    /// Returns the updated accounting state when the restart is still allowed,
+    /// or [`RestartBudgetExceeded`] once the budget has been exhausted.
+    pub fn record_restart(self) -> Result<Self, RestartBudgetExceeded> {
+        self.record_restart_at(Instant::now())
+    }
+
+    /// Records one restart attempt at a runtime-owned monotonic instant.
+    ///
+    /// Lifetime budgets never reset. Windowed budgets reset once `now` is at
+    /// least one configured period after the first restart in the current
+    /// window.
+    pub fn record_restart_at(self, now: Instant) -> Result<Self, RestartBudgetExceeded> {
+        let mut state = self;
+        if let Some(period) = state.budget.window {
+            state = match state.window_started {
+                Some(started) if now.duration_since(started) >= period => Self {
+                    budget: state.budget,
+                    restarts_used: 0,
+                    window_started: Some(now),
+                },
+                Some(_) => state,
+                None => Self {
+                    budget: state.budget,
+                    restarts_used: state.restarts_used,
+                    window_started: Some(now),
+                },
+            };
+        }
+
+        if state.is_exhausted() {
+            return Err(RestartBudgetExceeded {
+                attempted_restart: state.restarts_used.saturating_add(1),
+                max_restarts: state.budget.max_restarts,
+            });
+        }
+
+        Ok(Self {
+            budget: state.budget,
+            restarts_used: state.restarts_used + 1,
+            window_started: state.window_started,
+        })
+    }
+
+    /// Resets the consumed restart count to zero.
+    pub const fn reset(self) -> Self {
+        Self {
+            budget: self.budget,
+            restarts_used: 0,
+            window_started: None,
+        }
+    }
+}
+
+/// Error returned when a restart would exceed the configured budget.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct RestartBudgetExceeded {
+    attempted_restart: u32,
+    max_restarts: u32,
+}
+
+impl RestartBudgetExceeded {
+    /// Returns the restart ordinal that was rejected.
+    pub const fn attempted_restart(self) -> u32 {
+        self.attempted_restart
+    }
+
+    /// Returns the configured maximum number of allowed restarts.
+    pub const fn max_restarts(self) -> u32 {
+        self.max_restarts
+    }
+}
+
+#[cfg(test)]
+mod restart_budget_tests {
+    use super::*;
+
+    #[test]
+    fn lifetime_restart_budget_exhausts_permanently() {
+        let now = Instant::now();
+        let state = RestartBudget::lifetime(1).tracker();
+        let state = state.record_restart_at(now).expect("first restart");
+        assert!(
+            state
+                .record_restart_at(now + Duration::from_secs(3600))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn windowed_restart_budget_resets_after_period() {
+        let now = Instant::now();
+        let state = RestartBudget::within(1, Duration::from_secs(10)).tracker();
+        let state = state.record_restart_at(now).expect("first restart");
+        assert!(
+            state
+                .record_restart_at(now + Duration::from_secs(1))
+                .is_err()
+        );
+        let state = state
+            .record_restart_at(now + Duration::from_secs(10))
+            .expect("new window restart");
+        assert_eq!(state.restarts_used(), 1);
+        assert_eq!(state.restarts_remaining(), 0);
+    }
+}
+
+/// Executor-per-core abstraction.
+///
+/// Runtime crates will implement this trait for their shard type. Sputnik keeps
+/// the surface deliberately small: a shard knows its identifier and can mint
+/// typed addresses on that shard.
+pub trait Shard {
+    /// Returns the logical shard identifier.
+    fn id(&self) -> ShardId;
+
+    /// Constructs an [`Address`] for an isolate that lives on this shard.
+    fn address<M>(&self, isolate: IsolateId) -> Address<M> {
+        Address::new(self.id(), isolate)
+    }
+}
+
+/// Built-in single-shard type for programs that have only one shard.
+///
+/// When `#[tina::isolate]` (or `#[tina_runtime::isolate]`) is invoked
+/// without a `shard = ...` argument, the macro defaults to this type so
+/// single-shard examples and small services do not need to define a
+/// one-off shard struct just to satisfy the macro. Programs that run
+/// across more than one shard continue to declare their own shard types
+/// explicitly.
+///
+/// `SingleShard` is a real value the user constructs at runtime startup;
+/// it is **not** a global mutable singleton, and registering an isolate on
+/// it still goes through the runtime's normal registration path.
+///
+/// The shard id is fixed at `ShardId::new(0)`. If a program mixes
+/// `SingleShard` with another shard at id `0`, that is a configuration
+/// error and the runtime will reject the registrations as it does today
+/// for any duplicate shard id.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct SingleShard;
+
+impl SingleShard {
+    /// The shard id `SingleShard` always reports.
+    pub const ID: ShardId = ShardId::new(0);
+}
+
+impl Shard for SingleShard {
+    fn id(&self) -> ShardId {
+        Self::ID
+    }
+}
+
+/// A minimal spawn request for Sputnik.
+///
+/// The runtime owns what "spawn" means operationally. This type only carries
+/// the state machine to construct and the requested mailbox capacity.
+#[must_use = "a spawn request has no effect until a runtime executes it"]
+#[derive(Debug)]
+pub struct ChildDefinition<I>
+where
+    I: Isolate,
+{
+    isolate: I,
+    mailbox_capacity: usize,
+    bootstrap_message: Option<I::Message>,
+}
+
+impl<I> ChildDefinition<I>
+where
+    I: Isolate,
+{
+    /// Creates a new spawn request.
+    ///
+    /// TODO: Phase Pioneer adds supervision metadata once the supervisor layer
+    /// exists. Sputnik intentionally keeps spawn requests minimal.
+    pub fn new(isolate: I, mailbox_capacity: usize) -> Self {
+        Self {
+            isolate,
+            mailbox_capacity,
+            bootstrap_message: None,
+        }
+    }
+
+    /// Adds one initial child message that the runtime should enqueue after
+    /// the child is created.
+    pub fn with_initial_message(mut self, message: I::Message) -> Self {
+        self.bootstrap_message = Some(message);
+        self
+    }
+
+    /// Returns the requested mailbox capacity for the spawned isolate.
+    pub const fn mailbox_capacity(&self) -> usize {
+        self.mailbox_capacity
+    }
+
+    /// Returns a shared reference to the isolate state that will be spawned.
+    pub const fn isolate(&self) -> &I {
+        &self.isolate
+    }
+
+    /// Consumes the request and returns its parts.
+    pub fn into_parts(self) -> (I, usize, Option<I::Message>) {
+        (self.isolate, self.mailbox_capacity, self.bootstrap_message)
+    }
+}
+
+/// Typed reference to one child incarnation.
+///
+/// A `ChildRef` is not a liveness promise. It names the address and generation
+/// the runtime created for one child spawn. If the child restarts, this value is
+/// stale and sends through the old address close/reject like any stale address.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ChildRef<M, R = ()> {
+    /// Typed address for this child incarnation.
+    pub address: Address<M, R>,
+    /// Address generation for this child incarnation.
+    pub generation: AddressGeneration,
+}
+
+impl<M, R> ChildRef<M, R> {
+    /// Creates a child reference from a runtime-issued address.
+    pub const fn new(address: Address<M, R>) -> Self {
+        Self {
+            address,
+            generation: address.generation(),
+        }
+    }
+}
+
+/// Spawn-construction error delivered to a
+/// `spawn_observed(...).then(...)` continuation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum SpawnObservedError {
+    /// The child requested a zero-capacity mailbox.
+    ///
+    /// Plain [`spawn`] keeps its existing panic-on-zero behavior. The observed
+    /// form can report the rejection through its continuation before any child
+    /// is recorded.
+    ZeroMailboxCapacity,
+}
+
+/// Type-level child address information carried by supported spawn requests.
+pub trait SpawnAddress {
+    /// Child message type accepted by the spawned isolate.
+    type Message;
+    /// Child reply type produced by the spawned isolate.
+    type Reply;
+}
+
+impl SpawnAddress for core::convert::Infallible {
+    type Message = core::convert::Infallible;
+    type Reply = ();
+}
+
+impl<I> SpawnAddress for ChildDefinition<I>
+where
+    I: Isolate,
+{
+    type Message = I::Message;
+    type Reply = I::Reply;
+}
+
+/// Result delivered by `spawn_observed(...).then(...)`.
+pub type SpawnObservedResult<M, R = ()> = Result<ChildRef<M, R>, SpawnObservedError>;
+
+/// Continuation invoked by the runtime after an observed spawn is processed.
+pub type SpawnObservedContinuation<P, M, R = ()> = Box<dyn FnOnce(SpawnObservedResult<M, R>) -> P>;
+
+/// Parts consumed by runtime adapters that understand observed spawn.
+pub type SpawnObservedParts<S, P, M, R = ()> = (S, SpawnObservedContinuation<P, M, R>);
+
+type SpawnObservedMarker<M, R> = PhantomData<fn() -> (M, R)>;
+
+/// Builder returned by [`spawn_observed`].
+#[must_use = "a spawn_observed request has no effect until returned as an Effect"]
+#[derive(Debug)]
+pub struct SpawnObservedBuilder<S, M, R = ()> {
+    spawn: S,
+    marker: SpawnObservedMarker<M, R>,
+}
+
+impl<S, M, R> SpawnObservedBuilder<S, M, R> {
+    pub(crate) const fn new(spawn: S) -> Self {
+        Self {
+            spawn,
+            marker: PhantomData,
+        }
+    }
+
+    /// Maps the runtime's later child-start result into a parent message.
+    #[deprecated(
+        since = "0.1.0",
+        note = "use `.then(...)` for ordinary continuations; use `call_ctx.defer(work).reply(...)` in handle_call when preserving caller authority"
+    )]
+    pub fn reply<I, P, F>(self, continuation: F) -> Effect<I>
+    where
+        I: Isolate<Message = P, SpawnObserved = SpawnObserved<S, P, M, R>>,
+        F: FnOnce(SpawnObservedResult<M, R>) -> P + 'static,
+    {
+        self.then(continuation)
+    }
+
+    /// Maps the runtime's later child-start result into an ordinary parent
+    /// continuation message.
+    pub fn then<I, P, F>(self, continuation: F) -> Effect<I>
+    where
+        I: Isolate<Message = P, SpawnObserved = SpawnObserved<S, P, M, R>>,
+        F: FnOnce(SpawnObservedResult<M, R>) -> P + 'static,
+    {
+        Effect::SpawnObserved(SpawnObserved {
+            spawn: self.spawn,
+            continuation: Box::new(continuation),
+            marker: PhantomData,
+        })
+    }
+}
+
+/// Spawn request plus continuation for delivering a typed child reference.
+#[must_use = "a spawn_observed request has no effect until returned as an Effect"]
+pub struct SpawnObserved<S, P, M, R = ()> {
+    spawn: S,
+    continuation: SpawnObservedContinuation<P, M, R>,
+    marker: SpawnObservedMarker<M, R>,
+}
+
+impl<S, P, M, R> std::fmt::Debug for SpawnObserved<S, P, M, R>
+where
+    S: std::fmt::Debug,
+{
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SpawnObserved")
+            .field("spawn", &self.spawn)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<S, P, M, R> SpawnObserved<S, P, M, R> {
+    /// Consumes this request into its spawn payload and continuation.
+    pub fn into_parts(self) -> SpawnObservedParts<S, P, M, R> {
+        (self.spawn, self.continuation)
+    }
+}
+
+/// A restartable spawn request backed by a repeatable isolate factory.
+///
+/// Use [`ChildDefinition`] when a child only needs to be created once. Use
+/// `RestartableChildDefinition` when the runtime must keep a recipe for creating
+/// fresh replacement isolate state later. The factory may capture immutable
+/// configuration with normal Rust closure captures, for example
+/// `move || Worker::new(tenant_id)`. The factory is `Fn`, not `FnMut`; mutable
+/// state shared across restarts must use interior mutability.
+#[must_use = "a spawn request has no effect until a runtime executes it"]
+pub struct RestartableChildDefinition<I>
+where
+    I: Isolate,
+{
+    factory: Box<dyn Fn() -> I>,
+    mailbox_capacity: usize,
+    bootstrap_factory: Option<Box<dyn Fn() -> I::Message>>,
+}
+
+impl<I> std::fmt::Debug for RestartableChildDefinition<I>
+where
+    I: Isolate,
+{
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RestartableChildDefinition")
+            .field("mailbox_capacity", &self.mailbox_capacity)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<I> RestartableChildDefinition<I>
+where
+    I: Isolate,
+{
+    /// Creates a new restartable spawn request.
+    pub fn new<F>(factory: F, mailbox_capacity: usize) -> Self
+    where
+        F: Fn() -> I + 'static,
+    {
+        Self {
+            factory: Box::new(factory),
+            mailbox_capacity,
+            bootstrap_factory: None,
+        }
+    }
+
+    /// Adds one initial child message that the runtime should enqueue after
+    /// each child incarnation is created, including restarts.
+    pub fn with_initial_message<F>(mut self, bootstrap: F) -> Self
+    where
+        F: Fn() -> I::Message + 'static,
+    {
+        self.bootstrap_factory = Some(Box::new(bootstrap));
+        self
+    }
+
+    /// Returns the requested mailbox capacity for the spawned isolate.
+    pub const fn mailbox_capacity(&self) -> usize {
+        self.mailbox_capacity
+    }
+
+    /// Consumes the request and returns its repeatable factory plus mailbox
+    /// capacity.
+    pub fn into_parts(self) -> RestartableChildParts<I> {
+        (self.factory, self.mailbox_capacity, self.bootstrap_factory)
+    }
+}
+
+/// Tuple shape returned by [`RestartableChildDefinition::into_parts`].
+///
+/// Spelled out as a type alias purely so the runtime crate can name it
+/// without tripping clippy's `type_complexity` lint.
+pub type RestartableChildParts<I> = (
+    Box<dyn Fn() -> I>,
+    usize,
+    Option<Box<dyn Fn() -> <I as Isolate>::Message>>,
+);
+
+impl<I> SpawnAddress for RestartableChildDefinition<I>
+where
+    I: Isolate,
+{
+    type Message = I::Message;
+    type Reply = I::Reply;
+}
