@@ -2,13 +2,21 @@
 
 ## Status
 
-- Future implementation plan for Wave A.
-- Runs after Phase 115 lands so public policy names live in the right layer.
-- Can run in parallel with phases 116 and 117 if ownership stays in policy
-  types, edge-service specimens, and docs.
-- Builds on existing `SharedCapacityScope`, `LocalPermitGate`,
-  `FullHandling`, `Backoff`, `RecurringTick`, capacity summaries, and service
-  pressure reports. Do not rebuild those primitives.
+- Implementation landed: `tina_runtime::admission` ships
+  `ConcurrencyLimit`, `KeyedLimit<K>`, `RateLimit<K>`,
+  `AdmissionDecision<T>`, `AdmissionFailure`, `AdmissionReport`, and
+  `PressureAction`. `examples/systems/system_tenant_rate_limiter`
+  exercises the cold/hot tenant fairness and replay-determinism proofs.
+- Wave A. Built on existing `SharedCapacityScope`, `LocalPermitGate`,
+  `FullHandling`, `Backoff`, `RecurringTick`, capacity summaries, and
+  service pressure reports without rebuilding those primitives. The
+  shared `AdmissionDecision` shape projects onto `CapacitySurfaceReport`
+  so existing discovery and `CapacitySummary` assertions keep working.
+- Deferred to future phases: bounded-wait wrapper over `SharedWork` was
+  intentionally not built — the `AdmissionDecision::Wait { delay,
+  report }` variant is the shape, and callers compose with the existing
+  `SharedWork` helper. If a future proof specimen forces it, the
+  wrapper can land then.
 
 ## Layering
 

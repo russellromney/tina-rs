@@ -462,6 +462,15 @@ let outcome = runtime.call_blocking(addr, MyMsg::Ping, Duration::from_secs(2))?;
 See `examples/systems/system_session_auth` for a real sharded
 specimen using `ThreadedMultiShardRuntime::call_blocking`.
 
+## Admission Policy
+
+For edge services that need explicit shed/rate-limit/per-tenant caps on
+top of the mailbox, see
+[`06-boundedness-and-overload.md`](./06-boundedness-and-overload.md#admission-and-rate-policy).
+The vocabulary is small and composes with the patterns below — every
+admission decision returns a typed outcome the caller matches and a
+move-only proof when admission succeeded.
+
 ## Park, Wait, Guard, Cancel
 
 Four shapes show up in nearly every multi-turn service. Each is named

@@ -40,6 +40,7 @@ use tina::{DeferredSlotRegistry, Shard};
 
 use betelgeuse::IOLoopHandle;
 
+pub mod admission;
 pub mod bridge;
 mod call;
 mod call_group;
@@ -80,6 +81,11 @@ mod threaded_multi_shard;
 mod trace;
 pub mod wait_list;
 
+pub use admission::{
+    AdmissionDecision, AdmissionFailure, AdmissionName, AdmissionReport, ConcurrencyLimit,
+    KeyedLimit, KeyedPermit, KeyedReleaseError, KeyedSlotReport, PressureAction, RateGrant,
+    RateKeyState, RateLimit,
+};
 pub use drain_state::{AdmitDecision, DrainReport, DrainStage, DrainState};
 pub use errors::{
     RegisterBootstrapError, SendObservedUntilError, ShutdownRequestError, ShutdownWaitError,

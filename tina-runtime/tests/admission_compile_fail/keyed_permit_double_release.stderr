@@ -1,0 +1,9 @@
+error[E0382]: use of moved value: `permit`
+  --> tests/admission_compile_fail/keyed_permit_double_release.rs:12:27
+   |
+10 |     let permit = limit.try_admit("alpha").into_admitted().unwrap();
+   |         ------ move occurs because `permit` has type `KeyedPermit<&str>`, which does not implement the `Copy` trait
+11 |     let _ = limit.release(permit);
+   |                           ------ value moved here
+12 |     let _ = limit.release(permit);
+   |                           ^^^^^^ value used here after move

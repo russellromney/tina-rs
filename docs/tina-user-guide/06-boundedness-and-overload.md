@@ -135,6 +135,65 @@ operator dashboards. Don't open-code a worker frontend with a
 lifecycle. See the [ergonomics
 checklist](./11-ergonomics-checklist.md#bounded-worker-pool).
 
+## Admission And Rate Policy
+
+When the bounded mailbox is the *only* overload signal, every overload
+story collapses to the same shape: a `Full` reply somewhere. Real edge
+services need more vocabulary — "shed", "wait", "rate-limit", "degrade",
+"close" — and a typed outcome for each. `tina_runtime::admission` ships
+three small policy types that compose with everything above.
+
+```rust
+use tina_runtime::{
+    AdmissionDecision, ConcurrencyLimit, KeyedLimit, PressureAction, RateLimit,
+};
+```
+
+Three policies, one decision shape:
+
+- `ConcurrencyLimit` — fixed-cap local concurrency. Thin wrapper over
+  `LocalPermitGate`. Returns a move-only `Permit`.
+- `KeyedLimit<K>` — fixed-cap per-key concurrency. Move-only
+  `KeyedPermit<K>`. Per-key storage is a `Vec<Option<...>>`; nothing
+  grows.
+- `RateLimit<K>` — replayable per-key token bucket. Decisions are pure
+  functions of `(rate, burst, now, key history)`. The caller supplies
+  `now` from `ctx.now()` or sim-supplied time.
+
+Every `try_admit(...)` returns the same `AdmissionDecision<T>`:
+
+```rust
+match limit.try_admit(tenant, ctx.now()) {
+    AdmissionDecision::Admitted(grant) => /* charge held */,
+    AdmissionDecision::RateLimited { retry_after, .. } => reply_limited(retry_after),
+    AdmissionDecision::Full(_) => reply_full(),
+    AdmissionDecision::Closed(_) => reply_closed(),
+    AdmissionDecision::Wait { delay, .. } => /* compose with SharedWork */,
+    AdmissionDecision::Degrade { .. } => reply_degraded(),
+    AdmissionDecision::TimedOut(_) => reply_timeout(),
+}
+```
+
+Rules the layer keeps:
+
+- **No hidden retry.** `RateLimit` returns a deterministic `retry_after`;
+  the caller decides whether to sleep and try again. Pair with
+  `FullHandling::retry_backoff(...)` if you want a retry budget — the
+  budget is explicit, exhaustion is typed.
+- **No invisible queue.** Bounded wait is a *decision shape*, not a new
+  waiter product. Use `SharedWork` for the actual wait.
+- **Capacity report integration.** Every policy projects onto
+  `CapacitySurfaceReport`; rejection counts roll into `full_count` so
+  `summary.any_full()` stays honest for admission surfaces.
+- **Fixed-capacity per-key storage.** No growing `HashMap`. A new key
+  finds a free slot or sees `Full(report)` — never silent eviction.
+- **Move-only proofs.** `Permit` / `KeyedPermit` cannot be released
+  twice. The compile-fail tests prove it.
+
+`examples/systems/system_tenant_rate_limiter` is the copied path: one
+gateway, one `RateLimit<TenantId>`, hot/cold tenants, and a
+`retry_after` that is byte-identical across runs.
+
 ## Timeout Is Load Control
 
 Request/reply uses timeout:

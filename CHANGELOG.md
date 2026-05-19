@@ -4,6 +4,34 @@ This file records completed work.
 
 ## Unreleased
 
+### Admission And Rate Policy
+
+- `tina_runtime::admission` ships three policy types over the existing
+  capacity primitives. `ConcurrencyLimit` wraps `LocalPermitGate` with a
+  typed `AdmissionDecision`; `KeyedLimit<K>` bounds per-key concurrency
+  with fixed-capacity slot storage and a move-only `KeyedPermit<K>`;
+  `RateLimit<K>` is a per-key token bucket whose decisions are pure
+  functions of `(rate, burst, now, key history)`. None of them invent a
+  second capacity product — every report projects onto
+  `CapacitySurfaceReport` so existing discovery/`CapacitySummary`
+  assertions keep working.
+- The shared decision shape (`AdmissionDecision::{Admitted, Full,
+  RateLimited, Wait, Degrade, Closed, TimedOut}`) makes every overload
+  path typed. `PressureAction` lets a `ConcurrencyLimit` declare what
+  happens on full — shed, degrade, close, or hint a bounded wait. The
+  policies never retry on their own; pair with the existing
+  `FullHandling` if retry-with-backoff is the right answer.
+- Rate-limit math is integer-only (nano-tokens); identical
+  `(config, now, key history)` inputs produce identical decision
+  sequences across runs. Per-key storage is a fixed-capacity `Vec<Option<...>>`;
+  the first form does not silently evict a key to make room for a new
+  one. The `examples/systems/system_tenant_rate_limiter` specimen drives
+  the cold-tenant-progresses-while-hot-tenant-is-limited proof and
+  asserts byte-identical `retry_after` across two runs.
+- Compile-fail proofs cover `KeyedPermit` move-only release (no double
+  release) and the private-field invariant that user code cannot forge a
+  permit via a struct literal.
+
 ### HTTP/2 And Multi-Shard Fairness Hardening (second pass)
 
 - HTTP/2 request `content-length` is now truthful for buffered,

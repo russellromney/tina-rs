@@ -317,6 +317,14 @@ pub fn dropped_permit_count() -> u64 {
     DROPPED_PERMIT_COUNT.load(Ordering::Relaxed)
 }
 
+/// Records one dropped move-only permit against the process-wide counter.
+///
+/// Used by sibling admission-policy permits (e.g. `KeyedPermit`) so leaked
+/// permits stay visible in the same global counter the gate uses.
+pub(crate) fn record_dropped_permit() {
+    DROPPED_PERMIT_COUNT.fetch_add(1, Ordering::Relaxed);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

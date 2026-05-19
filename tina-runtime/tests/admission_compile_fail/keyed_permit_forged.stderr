@@ -1,0 +1,15 @@
+error[E0451]: fields `inner` and `_key` of struct `KeyedPermit` are private
+  --> tests/admission_compile_fail/keyed_permit_forged.rs:12:9
+   |
+11 |     let _forged: KeyedPermit<u32> = KeyedPermit {
+   |                                     ----------- in this type
+12 |         inner: None,
+   |         ^^^^^ private field
+13 |         _key: PhantomData,
+   |         ^^^^ private field
+
+error: type `admission::KeyedPermitInner` is private
+  --> tests/admission_compile_fail/keyed_permit_forged.rs:12:16
+   |
+12 |         inner: None,
+   |                ^^^^ private type
