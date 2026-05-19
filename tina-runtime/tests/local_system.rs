@@ -1449,6 +1449,21 @@ fn wait_until(mut predicate: impl FnMut() -> bool) {
     assert!(predicate(), "condition did not become true before timeout");
 }
 
+fn wait_until_debug(mut predicate: impl FnMut() -> bool, debug: impl Fn() -> String) {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline {
+        if predicate() {
+            return;
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+    assert!(
+        predicate(),
+        "condition did not become true before timeout; {}",
+        debug()
+    );
+}
+
 fn wait_for_addr(published: &Arc<Mutex<Option<SocketAddr>>>) -> SocketAddr {
     let deadline = Instant::now() + Duration::from_secs(2);
     while Instant::now() < deadline {
@@ -2565,33 +2580,57 @@ fn local_system_process_run_captures_truncates_and_times_out() {
 
     app.try_send(address, ProcessMsg::Echo)
         .expect("start process echo");
-    wait_until(|| {
-        observed
-            .lock()
-            .expect("process observed lock")
-            .iter()
-            .any(|entry| entry == "exit:Some(0):llam:true")
-    });
+    wait_until_debug(
+        || {
+            observed
+                .lock()
+                .expect("process observed lock")
+                .iter()
+                .any(|entry| entry == "exit:Some(0):llam:true")
+        },
+        || {
+            format!(
+                "observed={:?}",
+                observed.lock().expect("process observed lock")
+            )
+        },
+    );
 
     app.try_send(address, ProcessMsg::Sleep)
         .expect("start process sleep");
-    wait_until(|| {
-        observed
-            .lock()
-            .expect("process observed lock")
-            .iter()
-            .any(|entry| entry == "err:Timeout")
-    });
+    wait_until_debug(
+        || {
+            observed
+                .lock()
+                .expect("process observed lock")
+                .iter()
+                .any(|entry| entry == "err:Timeout")
+        },
+        || {
+            format!(
+                "observed={:?}",
+                observed.lock().expect("process observed lock")
+            )
+        },
+    );
 
     app.try_send(address, ProcessMsg::GrandchildStdout)
         .expect("start process grandchild stdout inheritance");
-    wait_until(|| {
-        observed
-            .lock()
-            .expect("process observed lock")
-            .iter()
-            .any(|entry| entry == "exit:Some(0)::true")
-    });
+    wait_until_debug(
+        || {
+            observed
+                .lock()
+                .expect("process observed lock")
+                .iter()
+                .any(|entry| entry == "exit:Some(0)::true")
+        },
+        || {
+            format!(
+                "observed={:?}",
+                observed.lock().expect("process observed lock")
+            )
+        },
+    );
 
     let terminal = app
         .shutdown()
