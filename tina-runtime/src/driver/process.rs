@@ -276,6 +276,7 @@ fn execute_process_command(command: ProcessCommand) -> CallOutput {
         .stderr
         .take()
         .map(|pipe| spawn_drain_limited(pipe, command.stderr_limit));
+    let process_group = child.id();
     let started = Instant::now();
 
     let status = loop {
@@ -292,7 +293,7 @@ fn execute_process_command(command: ProcessCommand) -> CallOutput {
         }
     };
 
-    process_exited(status, stdout, stderr)
+    process_exited(status, stdout, stderr, process_group)
 }
 
 fn kill_and_reap(
@@ -308,7 +309,7 @@ fn kill_and_reap(
 
     if !killed_group && child.kill().is_err() {
         return match child.try_wait() {
-            Ok(Some(status)) => process_exited(status, stdout, stderr),
+            Ok(Some(status)) => process_exited(status, stdout, stderr, child.id()),
             Ok(None) | Err(_) => CallOutput::Failed(CallError::KillUncertain),
         };
     }
@@ -356,7 +357,16 @@ fn process_exited(
     status: std::process::ExitStatus,
     stdout: Option<JoinHandle<(Vec<u8>, bool)>>,
     stderr: Option<JoinHandle<(Vec<u8>, bool)>>,
+    process_group: u32,
 ) -> CallOutput {
+    #[cfg(unix)]
+    {
+        // The process we spawned has exited, but descendants may still
+        // hold stdout/stderr pipes open. `process_run` owns the whole
+        // process group; do not let a background grandchild keep the
+        // drain threads alive or escape the runtime rail.
+        let _ = kill_process_group(process_group);
+    }
     let (stdout, stdout_truncated) = join_drain_bounded(stdout, PROCESS_DRAIN_JOIN_TIMEOUT);
     let (stderr, stderr_truncated) = join_drain_bounded(stderr, PROCESS_DRAIN_JOIN_TIMEOUT);
     CallOutput::ProcessExited {

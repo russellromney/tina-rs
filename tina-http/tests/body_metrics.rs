@@ -10,6 +10,7 @@ mod common;
 use std::convert::Infallible;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 use http::StatusCode;
@@ -424,6 +425,18 @@ struct StreamingConsumer {
     chunk_call_timeout: Duration,
     pending_source: Option<Address<HttpConnectionMsg, RequestChunkReply>>,
     total: usize,
+    stream_started: Option<Arc<(Mutex<bool>, Condvar)>>,
+}
+
+impl StreamingConsumer {
+    fn mark_stream_started(&self) {
+        let Some(flag) = &self.stream_started else {
+            return;
+        };
+        let (lock, cv) = &**flag;
+        *lock.lock().expect("stream started lock") = true;
+        cv.notify_all();
+    }
 }
 
 impl Isolate for StreamingConsumer {
@@ -446,6 +459,7 @@ impl Isolate for StreamingConsumer {
                 HttpRequestBody::Stream(stream) => {
                     self.total = 0;
                     self.pending_source = Some(stream.source);
+                    self.mark_stream_started();
                     reply(HttpResponse::internal_error())
                 }
                 HttpRequestBody::Http2Stream(_) => reply(HttpResponse::internal_error()),
@@ -491,6 +505,7 @@ impl Isolate for StreamingConsumer {
                 HttpRequestBody::Stream(stream) => {
                     self.total = 0;
                     self.pending_source = Some(stream.source);
+                    self.mark_stream_started();
                     let request = call_ctx.into_request_context();
                     call(
                         stream.source,
@@ -537,6 +552,7 @@ fn streaming_request_charges_per_chunk_and_releases_per_pull() {
                 chunk_call_timeout: Duration::from_secs(2),
                 pending_source: None,
                 total: 0,
+                stream_started: None,
             },
             32,
         )
@@ -613,6 +629,7 @@ fn streaming_request_caps_resident_bytes_at_chunk_size_when_head_and_body_split(
     let metrics = BodyMetrics::new();
     let chunk_size = 256;
     let body: Vec<u8> = (0..8192u32).map(|i| (i % 251) as u8).collect();
+    let stream_started = Arc::new((Mutex::new(false), Condvar::new()));
 
     let runtime = ThreadedRuntime::with_config(
         TestShard,
@@ -630,6 +647,7 @@ fn streaming_request_caps_resident_bytes_at_chunk_size_when_head_and_body_split(
                 chunk_call_timeout: Duration::from_secs(2),
                 pending_source: None,
                 total: 0,
+                stream_started: Some(Arc::clone(&stream_started)),
             },
             32,
         )
@@ -667,10 +685,11 @@ fn streaming_request_caps_resident_bytes_at_chunk_size_when_head_and_body_split(
         .unwrap();
     stream.write_all(head.as_bytes()).unwrap();
     stream.flush().unwrap();
-    // Pause so the head-read returns just head bytes. With this
-    // separation, subsequent reads (driven by service body_next
-    // pulls) are all chunk_size-capped.
-    std::thread::sleep(Duration::from_millis(20));
+    // Wait until the service has received the streaming request. That proves
+    // the connection parsed and dispatched the head before any body bytes are
+    // written, so subsequent reads are driven by service body_next pulls and
+    // are chunk_size-capped.
+    wait_for_stream_started(&stream_started);
 
     // Phase 2: dribble the body bytes. Every socket read on the
     // server side is capped by chunk_size, so the buffer never
@@ -699,6 +718,19 @@ fn streaming_request_caps_resident_bytes_at_chunk_size_when_head_and_body_split(
         chunk_size,
         snap.request_body_high_water
     );
+}
+
+fn wait_for_stream_started(flag: &Arc<(Mutex<bool>, Condvar)>) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    let (lock, cv) = &**flag;
+    let mut guard = lock.lock().expect("stream started lock");
+    while !*guard {
+        let now = std::time::Instant::now();
+        assert!(now < deadline, "streaming request was not dispatched");
+        let remaining = deadline.saturating_duration_since(now);
+        let (next, _) = cv.wait_timeout(guard, remaining).expect("stream wait");
+        guard = next;
+    }
 }
 
 /// Source that yields a fixed number of chunks; reused across the
@@ -905,6 +937,7 @@ fn chunked_request_charges_decoded_bytes_and_drains() {
                 chunk_call_timeout: Duration::from_secs(2),
                 pending_source: None,
                 total: 0,
+                stream_started: None,
             },
             32,
         )
