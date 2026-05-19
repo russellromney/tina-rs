@@ -10,7 +10,7 @@
 - Can run in parallel with later non-pool work if ownership stays mostly in
   pool resources, local persistence, and data specimens.
 
-## Spike Facts
+## Starting Facts
 
 - Generic `WorkerPool<H>` cannot close an arbitrary `H`. It can mark/reject/
   report. The resource owner must do cleanup.
@@ -64,6 +64,19 @@ local state after restart
 - no redesign of HTTP/2/gRPC client protocol state; Phase 116 owns that
 - no generic `WorkerPool` magic close for handles it does not own
 - no auto-reclaim of leased resources behind the user's back
+
+## Blast Radius
+
+Big blast radius. Keep resource and durability work honest.
+
+- Allowed: pool/resource policy helpers, HTTP/1 keepalive resource maturity,
+  Phase-116 HTTP/2/gRPC resource maturity, DB pressure/report adapters, local
+  persistence service helpers/specimens.
+- Not allowed: generic distributed durability, durable mailbox, DB-internal pool
+  rewrites, HTTP/2/gRPC protocol redesign, or stealing leased resources.
+- If HTTP/2/gRPC client from Phase 116 is not landed, skip those resource
+  proofs and keep this phase on HTTP/1/DB/persistence. Do not invent a fake
+  client pool to satisfy the plan.
 
 ## Implementation Shape
 
@@ -132,6 +145,8 @@ Data rules:
 - idle resource retires and reports why
 - max-lifetime retire does not hand stale resource to new caller
 - health check retires bad resource
+- idle/max-lifetime timers are Tina timers or explicit maintenance messages,
+  not `Instant::now()` hidden in resource code
 - shutdown drains or force-closes with report
 - late release/late stream completion after retirement is typed stale, not
   accepted as healthy reuse
@@ -139,6 +154,8 @@ Data rules:
   connection state silently
 - crash/restart restores expected state
 - corrupt/torn journal tail is typed and recoverable
+- append failure returns the original mutation and leaves in-memory state
+  unchanged
 - trybuild tests prove the type-state helper cannot expose the mutation payload
   for apply until append success creates `CommittedMutation<T>`
 - trybuild tests prove `CommittedMutation<T>` cannot be applied twice

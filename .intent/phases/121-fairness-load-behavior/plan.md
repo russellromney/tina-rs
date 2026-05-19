@@ -11,7 +11,7 @@
 - Can run in parallel with Phase 122 if ownership stays in scheduler
   proof/reporting, soak harnesses, and systems.
 
-## Spike Facts
+## Starting Facts
 
 - Existing cooperative fairness and hot-load tests are narrow. They prove some
   runtime behavior, not whole-service fairness.
@@ -59,6 +59,17 @@ one hot actor/session/client should not quietly starve the rest of my service
 - no admission/rate policy objects; Phase 118 owns pressure policy
 - no promise that every client gets equal latency under OS scheduling
 
+## Blast Radius
+
+Medium blast radius, but tests can be expensive.
+
+- Allowed: proof harnesses, reports, small runtime/protocol counters when they
+  expose already-real scheduling/pressure facts, systems/specimens.
+- Not allowed: hidden queues, scheduler rewrite, priority scheduler, throughput
+  benchmark marketing, or retry policy hidden inside the harness.
+- CI tests must stay small. Put long soak/load profiles behind ignored tests or
+  explicit commands.
+
 ## Implementation Shape
 
 Add a small proof harness, not a benchmark framework:
@@ -91,7 +102,7 @@ Rules:
 ## User Proof Workloads
 
 - Hot isolate vs quiet isolate: one self-sending actor cannot starve an
-  unrelated actor beyond the documented bound/report.
+  unrelated actor beyond a named profile bound/report.
 - Timer under hot mailbox: recurring tick still records progress and missed
   ticks under send/call pressure.
 - WebSocket slow peer plus active peer: slow peer is evicted or backpressured;
@@ -114,6 +125,8 @@ Rules:
 - slow WebSocket/session does not starve unrelated session work
 - timers still fire under hot send/call traffic
 - reports expose unfairness/lag when it happens
+- if a fairness bound cannot be met, the test must assert the report exposes
+  the bad condition instead of weakening the scenario silently
 - soak runs show bounded surfaces plateau or fail visibly
 - final reports prove no leaked leases/permits/body charges/pending calls after
   shutdown

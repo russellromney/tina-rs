@@ -8,7 +8,7 @@
   fairness/load tests would otherwise copy stale patterns.
 - One PR when executed.
 
-## Spike Facts
+## Starting Facts
 
 - `examples/FINDINGS.md` is useful but noisy. After big waves it must separate
   current pain from solved pain.
@@ -47,6 +47,17 @@ the copied service path.
 - no release rename
 - no semantic changes to protocol/pool/persistence primitives
 
+## Blast Radius
+
+Small-to-medium blast radius.
+
+- Allowed: docs, examples, specimens, prelude/import guidance, copied snippets,
+  findings cleanup, tiny wrappers only when two copied examples prove the need.
+- Not allowed: core runtime semantics, protocol behavior, resource policy
+  behavior, durability semantics, or new major nouns.
+- If a helper needs behavior changes in a core crate, stop and make a separate
+  implementation phase.
+
 ## Implementation Shape
 
 Touch only copied paths and examples/docs around newly landed Wave A features:
@@ -84,12 +95,15 @@ Touch only copied paths and examples/docs around newly landed Wave A features:
 ## Proof Shape
 
 - systems still pass
+- every edited specimen/system README command runs
 - docs show one production-shaped client/server/stateful service
 - solved pain moved out of current findings
 - at least one common wrong setup becomes compile-fail or impossible through
   the copied path
 - the refreshed skeleton has a smoke test, a load-ish test, a shutdown test, and
   one bad-config/bad-input test
+- the skeleton includes one overload path and one recovery/shutdown path,
+  because those are where copied examples usually lie
 - the skeleton proves at least one compile-time guardrail from recent phases by
   linking to or adding a trybuild case for the copied mistake
 - every changed snippet compiles or is marked `ignore` with a reason

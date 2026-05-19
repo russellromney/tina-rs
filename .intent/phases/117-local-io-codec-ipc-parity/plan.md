@@ -18,7 +18,7 @@ files, framed bytes, and local sidecar/admin sockets
 
 Tina owns I/O, capacity, cancellation, and replay. Codecs own bytes.
 
-## Spike Facts
+## Starting Facts
 
 - File rails already exist: open/read-at/write-at/fsync/size/close, live and
   sim.
@@ -75,6 +75,18 @@ Tina owns I/O, capacity, cancellation, and replay. Codecs own bytes.
   shape is clean
 - no driver-level `file_read_to_end` that hides per-chunk progress
 
+## Blast Radius
+
+Medium blast radius.
+
+- Allowed: `tina-runtime` file loop helpers, Unix socket rails, `tina-sim`
+  scripted Unix/file behavior, new codec battery crate, local IPC/file
+  specimens.
+- Not allowed: HTTP/WebSocket parser rewrites, database protocol work, hidden
+  async codec traits, broad driver refactor beyond new Unix rail plumbing.
+- Unix sockets must be additive. Existing TCP/TLS/file tests should not need
+  behavior changes.
+
 ## Proof Shape
 
 - large file does not buffer whole file
@@ -82,6 +94,8 @@ Tina owns I/O, capacity, cancellation, and replay. Codecs own bytes.
   pinned
 - file read helper reads in multiple chunks and reports high-water/cap truth
 - file write helper handles partial writes and fsync/close truth
+- file helper cancel after partial progress returns a partial-progress report or
+  typed cancel; it must not claim full success
 - cancellation/shutdown of an in-flight file stream reports what completed and
   what did not; no fake all-or-nothing story
 - slow reader/writer pressure is visible
@@ -91,12 +105,14 @@ Tina owns I/O, capacity, cancellation, and replay. Codecs own bytes.
 - Unix socket close/cancel/drain truth is visible
 - Unix socket wrong-resource operations return typed errors, not TCP-shaped
   accidental success
+- Unix peer close while read/write is pending settles visibly
 - Unix socket live echo/admin specimen works on Unix
 - live and sim tests cover the same protocol shape where possible
 - non-Unix tests assert typed unsupported capability, not cfg-silent omission
 - compile-fail tests keep codec adapter state typed, not stringly
 - doctests show codec state living on an isolate and one runtime read per
   progress step
+- every new specimen has a smoke command and one bad-input proof
 
 ## Implementation Shape
 

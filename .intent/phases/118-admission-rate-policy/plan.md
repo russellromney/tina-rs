@@ -10,7 +10,7 @@
   `FullHandling`, `Backoff`, `RecurringTick`, capacity summaries, and service
   pressure reports. Do not rebuild those primitives.
 
-## Spike Facts
+## Starting Facts
 
 - `LocalPermitGate` already gives fixed-count local concurrency with move-only
   permits and pressure reports.
@@ -41,6 +41,8 @@ close, and the outcome is typed
 - copied-path `ConcurrencyLimit` wrapper over `LocalPermitGate`
 - `KeyedLimit<K>` for per-key/per-user caps with fixed-capacity storage
 - `RateLimit<K>` with replayable time source using `Context::now`
+- rate limiting policy is deterministic: same config + same visible time + same
+  key history produces same decisions
 - bounded-wait decision shape; caller still owns the waiting message/request
 - if a bounded wait stores caller authority, storage must be fixed-capacity and
   return the request/context on rejection
@@ -60,6 +62,16 @@ close, and the outcome is typed
 - no duplicate pressure vocabulary beside existing capacity/service reports
 - no generic scheduler fairness work; Phase 121 owns fairness/load behavior
 - no automatic idempotency decision; caller decides if retry is safe
+
+## Blast Radius
+
+Medium blast radius.
+
+- Allowed: new policy types, docs, specimens, capacity/service-report adapters.
+- Allowed only if needed: tiny helper methods on existing `LocalPermitGate`,
+  `SharedCapacityScope`, `FullHandling`, `Backoff`, or `RecurringTick`.
+- Not allowed: runtime scheduler changes, hidden queues inside runtime, new
+  global registry, or rewriting existing capacity vocabulary.
 
 ## Implementation Shape
 
@@ -95,6 +107,8 @@ Rules:
 - Per-key storage is fixed-capacity. No growing `HashMap` as the user-visible
   storage truth.
 - Duplicate-key and full-key-table paths are typed and include the report.
+- Key eviction, if implemented, is explicit policy. Default first form does not
+  evict a key silently to make room for a new key.
 - Rate decisions take `now` from `ctx.now()` or simulator-supplied time. No
   `Instant::now()` inside the policy.
 - Bounded wait returns a decision. It does not hide a queue unless the queue is
@@ -132,12 +146,15 @@ Rules:
 - retry budget exhaustion is visible
 - sim replay proves time-based policy determinism
 - system specimens show edge/API-gateway and tenant limiting under pressure
+- cold tenant/key progress is proved while hot tenant/key is limited
 - compile-fail tests prove move-only permits cannot be released twice or reused
   after move
 - compile-fail or API-shape tests prove a retry helper cannot run without an
   explicit idempotency/retry policy value
 - reports show current/high/full/retry/degrade/closed counts and can be asserted
   through `CapacitySummary`
+- shutdown while waiters/retry timers exist returns caller authority or typed
+  terminal outcomes and leaves current counts at zero
 
 ## Hostile Review Notes
 

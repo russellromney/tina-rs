@@ -20,7 +20,7 @@ The user story:
 my Tina service calls another HTTP/2/gRPC service without Tokio
 ```
 
-## Spike Facts
+## Starting Facts
 
 - Server-side HTTP/2 h2c already exists in `tina-http/src/http2.rs`.
 - Server-side gRPC already exists in `tina-http/src/grpc.rs` with unary,
@@ -79,6 +79,19 @@ my Tina service calls another HTTP/2/gRPC service without Tokio
 - no HTTP/2 server rewrite beyond sharing frame/header helpers
 - no client load balancing; one configured authority is one client target
 
+## Blast Radius
+
+Big blast radius. Keep it fenced.
+
+- Allowed: `tina-http` HTTP/2/gRPC internals, TLS ALPN call inputs/outputs,
+  protocol facts, focused docs/specimens.
+- Allowed only as needed: `tina-runtime` and `tina-sim` TLS call shapes for
+  selected ALPN.
+- Not allowed: broad HTTP/1 rewrites, WebSocket rewrites, pool policy, new async
+  bridge, or public HTTP/2 frame API.
+- Do the internal HTTP/2 module split first and prove server behavior is
+  unchanged before adding client behavior.
+
 ## Implementation Shape
 
 - `tina-http` gains shared internal HTTP/2 modules before behavior changes:
@@ -133,10 +146,13 @@ my Tina service calls another HTTP/2/gRPC service without Tokio
   - h2c GET/POST happy path against Tina server
   - response DATA arrives in bounded chunks
   - request DATA streaming is bounded
+  - concurrent streams on one client connection do not cross replies
   - server RST_STREAM maps to typed reset
   - GOAWAY closes new admission but lets admitted streams settle visibly
   - flow-control blocked path is counted/reported
   - timeout/cancel frees stream slot and rejects late response truth visibly
+  - malformed response frame closes the affected stream/connection with typed
+    protocol truth, not a panic
 - interop proof:
   - Tina HTTP/2 client talks to Tina HTTP/2 server
   - Tina gRPC client talks to Tina gRPC server
@@ -146,6 +162,7 @@ my Tina service calls another HTTP/2/gRPC service without Tokio
   - h2/TLS success selects `h2`
   - no shared protocol / wrong ALPN returns typed mismatch
   - cert/name failures remain distinct from ALPN failure
+  - h2c target does not touch TLS rails
 - gRPC client proof:
   - unary client against Tina server
   - unary client against tonic h2c server
@@ -153,6 +170,8 @@ my Tina service calls another HTTP/2/gRPC service without Tokio
   - client-streaming sends multiple messages and receives final status
   - bidi client proves request and response streams progress independently
   - non-OK gRPC status is the caller outcome, not an HTTP transport success
+  - oversized received message is `ResourceExhausted`/typed cap failure before
+    unbounded allocation
 - reuse/close proof:
   - N unary calls reuse one HTTP/2 client connection when healthy
   - closed/reset/protocol-bad connection rejects new admission visibly
@@ -175,6 +194,7 @@ my Tina service calls another HTTP/2/gRPC service without Tokio
 - Add/update one system specimen that uses outbound gRPC client calls from a
   service handler and shuts down cleanly.
 - README must show copied path, not `grpc_unary_call_h2c_blocking`.
+- Specimen must include one non-OK gRPC status and one client cancellation.
 
 ## Hostile Review Notes
 

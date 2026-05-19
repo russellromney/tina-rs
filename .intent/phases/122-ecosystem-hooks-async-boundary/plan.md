@@ -8,7 +8,7 @@
 - Runs after Phase 115 so hooks respect the core/battery boundary. Can absorb
   lessons from Phase 117 codecs and Phase 118 service policies.
 
-## Spike Facts
+## Starting Facts
 
 - Tina already has native TCP/TLS/HTTP/1/HTTP2/gRPC/WebSocket/timers/files/
   process/DNS/pools/codecs work in flight or shipped. Async interop is not the
@@ -64,6 +64,17 @@ private runtime access and without weakening bounded/DST truth
 - no hook that bypasses trace/capacity/cancel truth
 - no semver promise for internal runtime modules
 
+## Blast Radius
+
+Medium blast radius.
+
+- Allowed: public hook traits/data shapes, extension examples, docs,
+  capability reports, compile-fail tests.
+- Allowed only if an extension smoke crate proves the need: small public
+  adapters around existing capacity/event/bridge/codecs/policy data.
+- Not allowed: moving internals public wholesale, dynamic plugin ABI, generic
+  async bridge, native protocol rewrites, or new runtime backdoors.
+
 ## Implementation Shape
 
 Expose small stable seams:
@@ -114,10 +125,12 @@ APIs only and run by manifest path:
 No smoke crate may import `tina_runtime::runtime_internal` or private modules.
 Add one compile-fail or lint-style proof that an extension crate cannot mint
 runtime-owned tokens/handles by importing hidden internals.
+Every smoke crate must have a README command and a smoke test.
 
 ## Proof Shape
 
 - extension smoke crates compile and run using only public APIs
+- extension smoke crates fail if they import hidden/private runtime internals
 - custom surface joins normal capacity summary
 - event sink is bounded and reports drops/full/closed
 - codec hook keeps parser state replayable
