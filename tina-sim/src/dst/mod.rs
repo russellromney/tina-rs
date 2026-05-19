@@ -3,6 +3,29 @@
 //! This module is intentionally small. It gives Tina tests a common shape for
 //! history-as-data runs, replay checks, deletion shrinking, and trace
 //! invariants without becoming a general property-testing framework.
+//!
+//! ## Module map (Phase 115 reorg)
+//!
+//! The `dst` module is split into submodules so future agents can find
+//! where new code belongs without scanning a 4000-line file. Submodule
+//! items are re-exported from `dst::*` so the public API is unchanged.
+//!
+//! - [`discovery`] — `DiscoveredConstants` and `discover_constants` for
+//!   reporting observed `(event_count, trace_hash)` rows.
+//! - [`sweep`] — `sweep_seeds`, `SweepFailure`, `SweepSuccess` for
+//!   bounded-seed regression hunts.
+//!
+//! The remaining replay-case / projection / shrink / invariant helpers
+//! still live in this file. Future commits inside Phase 115 may split
+//! more of them into submodules along the same shape.
+
+mod discovery;
+mod shrink;
+mod sweep;
+
+pub use discovery::*;
+pub use shrink::*;
+pub use sweep::*;
 
 use std::collections::BTreeMap;
 use std::fmt::{Debug, Write};
@@ -138,86 +161,6 @@ where
         history.operations()
     );
     first
-}
-
-/// Deletion-only shrinker settings.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ShrinkConfig {
-    /// Maximum candidate deletions attempted before returning the current
-    /// shrunk history.
-    pub max_attempts: usize,
-}
-
-impl Default for ShrinkConfig {
-    fn default() -> Self {
-        Self { max_attempts: 1024 }
-    }
-}
-
-/// One deletion-shrunk failing history.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ShrunkFailure<Op> {
-    original: History<Op>,
-    shrunk: History<Op>,
-    reason: String,
-    attempts: usize,
-}
-
-impl<Op> ShrunkFailure<Op> {
-    /// Returns the original failing history.
-    pub const fn original(&self) -> &History<Op> {
-        &self.original
-    }
-
-    /// Returns the shrunk failing history.
-    pub const fn shrunk(&self) -> &History<Op> {
-        &self.shrunk
-    }
-
-    /// Returns the failure reason supplied by the caller.
-    pub fn reason(&self) -> &str {
-        &self.reason
-    }
-
-    /// Returns how many candidate deletions were tried.
-    pub const fn attempts(&self) -> usize {
-        self.attempts
-    }
-}
-
-/// Deletion-shrinks a history while `still_fails` remains true.
-pub fn delete_shrink<Op, F>(
-    history: &History<Op>,
-    config: ShrinkConfig,
-    reason: impl Into<String>,
-    mut still_fails: F,
-) -> ShrunkFailure<Op>
-where
-    Op: Clone,
-    F: FnMut(&History<Op>) -> bool,
-{
-    let mut current = history.clone();
-    let mut index = 0;
-    let mut attempts = 0;
-    while index < current.operations.len() && attempts < config.max_attempts {
-        let mut candidate_ops = current.operations.clone();
-        candidate_ops.remove(index);
-        let candidate = current.with_operations(candidate_ops);
-        attempts += 1;
-        if still_fails(&candidate) {
-            current = candidate;
-            index = 0;
-        } else {
-            index += 1;
-        }
-    }
-
-    ShrunkFailure {
-        original: history.clone(),
-        shrunk: current,
-        reason: reason.into(),
-        attempts,
-    }
 }
 
 /// One reusable invariant failure.
@@ -2940,73 +2883,6 @@ where
     report
 }
 
-/// One labelled `(event_count, trace_hash)` pair from a
-/// [`discover_constants`] sweep. The `Display` impl prints a
-/// commented block ready to paste into a `.expecting(...)` chain.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DiscoveredConstants {
-    /// Caller-supplied label naming which case this row is for.
-    pub label: &'static str,
-    /// Observed event count.
-    pub event_count: usize,
-    /// Observed `stable_trace_hash`.
-    pub trace_hash: u64,
-}
-
-impl std::fmt::Display for DiscoveredConstants {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        writeln!(f, "// {}", self.label)?;
-        writeln!(f, "expected_event_count: {}", self.event_count)?;
-        write!(f, "expected_trace_hash: 0x{:016x}", self.trace_hash)
-    }
-}
-
-/// Bulk discovery: runs each `(label, case)` pair through `runner` once
-/// without comparing to pinned constants, and returns one
-/// [`DiscoveredConstants`] per case. Use when first pinning a batch of
-/// related cases that share the same `Op` type and runner — typical for
-/// a single test file with three or four saved-seed regressions.
-///
-/// ```ignore
-/// #[test]
-/// #[ignore] // local discovery, run with --ignored after adding a case
-/// fn discover_constants_for_service_cases() {
-///     let cases = [
-///         ("portable_service_case", portable_service_case()),
-///         ("audit_full_case", audit_full_case()),
-///         ("requester_stop_case", requester_stop_case()),
-///         ("shard_failure_case", shard_failure_case()),
-///     ];
-///     for d in discover_constants(cases, run_service_case) {
-///         eprintln!("{d}\n");
-///     }
-/// }
-/// ```
-///
-/// Each call passes through [`observe_replay_case`], so the same
-/// case/runner identity guards apply.
-pub fn discover_constants<Op, Output, Runner, Cases>(
-    cases: Cases,
-    mut runner: Runner,
-) -> Vec<DiscoveredConstants>
-where
-    Op: Clone,
-    Cases: IntoIterator<Item = (&'static str, ReplayCase<Op>)>,
-    Runner: FnMut(&ReplayCase<Op>) -> ReplayReport<Output>,
-{
-    cases
-        .into_iter()
-        .map(|(label, case)| {
-            let report = observe_replay_case(&case, &mut runner);
-            DiscoveredConstants {
-                label,
-                event_count: report.event_count,
-                trace_hash: report.trace_hash,
-            }
-        })
-        .collect()
-}
-
 /// Why a [`ReplayCase`] did not match what was pinned.
 ///
 /// Returned by [`check_replay_case`] when the observed event count or
@@ -3202,263 +3078,6 @@ where
         Ok(report) => report,
         Err(mismatch) => panic!("{mismatch}"),
     }
-}
-
-/// One shrunk replay case with refreshed expected count/hash.
-///
-/// Returned by [`shrink_replay_case`]. The `shrunk_case` is ready for
-/// `assert_replay_case` — its `expected_event_count` and
-/// `expected_trace_hash` reflect the smaller history's observed shape,
-/// not the original case's pinned values.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ShrinkReport<Op, Output> {
-    /// Original history length.
-    pub original_len: usize,
-    /// Shrunk history length.
-    pub shrunk_len: usize,
-    /// How many candidate deletions were attempted.
-    pub attempts: usize,
-    /// Caller-supplied reason describing the bug being preserved.
-    pub reason: String,
-    /// Shrunk case with refreshed `expected_*` constants.
-    pub shrunk_case: ReplayCase<Op>,
-    /// Runner's report for the shrunk case.
-    pub shrunk_report: ReplayReport<Output>,
-}
-
-impl<Op, Output> std::fmt::Display for ShrinkReport<Op, Output>
-where
-    Op: Debug,
-{
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        writeln!(
-            f,
-            "shrunk `{}` from {} ops to {} ops in {} attempts",
-            self.shrunk_case.name, self.original_len, self.shrunk_len, self.attempts
-        )?;
-        writeln!(f, "reason: {}", self.reason)?;
-        writeln!(f, "case:")?;
-        writeln!(f, "    name:      {}", self.shrunk_case.name)?;
-        writeln!(f, "    seed:      {}", self.shrunk_case.seed)?;
-        writeln!(f, "    config:    {:?}", self.shrunk_case.config)?;
-        writeln!(f, "    scenario:  {}", self.shrunk_case.scenario)?;
-        writeln!(f, "    invariant: {}", self.shrunk_case.invariant)?;
-        writeln!(f, "    history ({} ops):", self.shrunk_case.history.len())?;
-        for op in self.shrunk_case.history.operations() {
-            writeln!(f, "        - {op:?}")?;
-        }
-        writeln!(
-            f,
-            "    expected_event_count: {}",
-            self.shrunk_case.expected_event_count
-        )?;
-        writeln!(
-            f,
-            "    expected_trace_hash:  0x{:016x}",
-            self.shrunk_case.expected_trace_hash
-        )?;
-        write!(
-            f,
-            "review step: paste these constants only after confirming the smaller \
-             case still proves the same bug/invariant the larger case did."
-        )
-    }
-}
-
-/// Deletion-shrinks a [`ReplayCase`] while the bug still reproduces.
-///
-/// For every candidate (one operation removed), a new `ReplayCase` is
-/// built that preserves `name`, `seed`, `config`, `scenario`, and
-/// `invariant`. The runner produces a fresh report; `still_fails`
-/// decides whether the candidate still exhibits the bug. Accepted
-/// candidates seed further deletion attempts.
-///
-/// On return, `shrunk_case.expected_event_count` and
-/// `shrunk_case.expected_trace_hash` are refreshed to match the smaller
-/// case's observed shape — the larger case's pinned constants do not
-/// carry over.
-///
-/// The shrinker honors `config.max_attempts`. The operation list stays
-/// visible Rust data throughout.
-pub fn shrink_replay_case<Op, Output, Runner, StillFails>(
-    case: &ReplayCase<Op>,
-    config: ShrinkConfig,
-    reason: impl Into<String>,
-    mut runner: Runner,
-    mut still_fails: StillFails,
-) -> ShrinkReport<Op, Output>
-where
-    Op: Clone,
-    Runner: FnMut(&ReplayCase<Op>) -> ReplayReport<Output>,
-    StillFails: FnMut(&ReplayReport<Output>) -> bool,
-{
-    let original_len = case.history.len();
-    let mut current_case = case.clone();
-    let mut current_report = runner(&current_case);
-    let mut index = 0;
-    let mut attempts = 0;
-    while index < current_case.history.len() && attempts < config.max_attempts {
-        let mut candidate_ops = current_case.history.operations().to_vec();
-        candidate_ops.remove(index);
-        let candidate_history = current_case.history.with_operations(candidate_ops);
-        let candidate = ReplayCase {
-            name: current_case.name,
-            seed: current_case.seed,
-            config: current_case.config.clone(),
-            scenario: current_case.scenario,
-            history: candidate_history,
-            expected_event_count: current_case.expected_event_count,
-            expected_trace_hash: current_case.expected_trace_hash,
-            invariant: current_case.invariant,
-        };
-        attempts += 1;
-        let candidate_report = runner(&candidate);
-        if still_fails(&candidate_report) {
-            current_case = candidate;
-            current_report = candidate_report;
-            index = 0;
-        } else {
-            index += 1;
-        }
-    }
-
-    current_case.expected_event_count = current_report.event_count;
-    current_case.expected_trace_hash = current_report.trace_hash;
-
-    ShrinkReport {
-        original_len,
-        shrunk_len: current_case.history.len(),
-        attempts,
-        reason: reason.into(),
-        shrunk_case: current_case,
-        shrunk_report: current_report,
-    }
-}
-
-/// One pasteable failing case from a [`sweep_seeds`] run.
-///
-/// The `failing_case` is ready for `assert_replay_case`: its
-/// `expected_event_count` and `expected_trace_hash` are refreshed to
-/// the observed values so the bug is pinned.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SweepFailure<Op, Output> {
-    /// Sweep name.
-    pub name: &'static str,
-    /// How many seeds the sweep examined before stopping.
-    pub seeds_examined: usize,
-    /// The failing seed.
-    pub failing_seed: u64,
-    /// The failing case with refreshed `expected_*` constants.
-    pub failing_case: ReplayCase<Op>,
-    /// The runner's report for the failing case.
-    pub failing_report: ReplayReport<Output>,
-    /// Why the caller's `check` rejected the report.
-    pub reason: String,
-}
-
-impl<Op, Output> std::fmt::Display for SweepFailure<Op, Output>
-where
-    Op: Debug,
-{
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        writeln!(
-            f,
-            "sweep `{}` failed at seed {} after {} seeds examined",
-            self.name, self.failing_seed, self.seeds_examined
-        )?;
-        writeln!(f, "reason: {}", self.reason)?;
-        writeln!(f, "case:")?;
-        writeln!(f, "    name:      {}", self.failing_case.name)?;
-        writeln!(f, "    seed:      {}", self.failing_case.seed)?;
-        writeln!(f, "    config:    {:?}", self.failing_case.config)?;
-        writeln!(f, "    scenario:  {}", self.failing_case.scenario)?;
-        writeln!(f, "    invariant: {}", self.failing_case.invariant)?;
-        writeln!(f, "    history ({} ops):", self.failing_case.history.len())?;
-        for op in self.failing_case.history.operations() {
-            writeln!(f, "        - {op:?}")?;
-        }
-        writeln!(
-            f,
-            "    expected_event_count: {}",
-            self.failing_case.expected_event_count
-        )?;
-        writeln!(
-            f,
-            "    expected_trace_hash:  0x{:016x}",
-            self.failing_case.expected_trace_hash
-        )?;
-        write!(
-            f,
-            "paste this case into a `#[test]` and call \
-             `assert_replay_case(&CASE, run_case)`."
-        )
-    }
-}
-
-/// One successful [`sweep_seeds`] run.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SweepSuccess {
-    /// Sweep name.
-    pub name: &'static str,
-    /// How many seeds the sweep examined.
-    pub seeds_examined: usize,
-}
-
-/// Sweeps a list of seeds, materializing one [`ReplayCase`] per seed and
-/// returning the first failing case as a pasteable [`SweepFailure`].
-///
-/// `make_case` must be pure and deterministic in `seed` — every
-/// generated operation must be materialized into the returned
-/// `ReplayCase.history` before the simulator runs. There is no hidden
-/// random generator in this helper.
-///
-/// `run_case` is the same runner used with [`assert_replay_case`].
-///
-/// `check` is the caller's pass/fail predicate over the report. Return
-/// `Err(reason)` to declare the seed a failure; the sweep stops and
-/// returns the case + report so the caller can paste them into a
-/// regression test.
-///
-/// The returned `SweepFailure.failing_case` has its
-/// `expected_event_count` and `expected_trace_hash` refreshed to the
-/// observed values, so it can be replayed by `assert_replay_case`
-/// directly — pinning the bug as a saved seed.
-pub fn sweep_seeds<Op, Output, Seeds, MakeCase, Runner, Check>(
-    name: &'static str,
-    seeds: Seeds,
-    mut make_case: MakeCase,
-    mut runner: Runner,
-    mut check: Check,
-) -> Result<SweepSuccess, Box<SweepFailure<Op, Output>>>
-where
-    Seeds: IntoIterator<Item = u64>,
-    MakeCase: FnMut(u64) -> ReplayCase<Op>,
-    Runner: FnMut(&ReplayCase<Op>) -> ReplayReport<Output>,
-    Check: FnMut(&ReplayReport<Output>) -> Result<(), String>,
-{
-    let mut seeds_examined = 0;
-    for seed in seeds {
-        let case = make_case(seed);
-        seeds_examined += 1;
-        let report = runner(&case);
-        if let Err(reason) = check(&report) {
-            let mut failing_case = case;
-            failing_case.expected_event_count = report.event_count;
-            failing_case.expected_trace_hash = report.trace_hash;
-            return Err(Box::new(SweepFailure {
-                name,
-                seeds_examined,
-                failing_seed: seed,
-                failing_case,
-                failing_report: report,
-                reason,
-            }));
-        }
-    }
-    Ok(SweepSuccess {
-        name,
-        seeds_examined,
-    })
 }
 
 #[cfg(test)]
