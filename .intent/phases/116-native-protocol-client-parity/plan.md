@@ -3,8 +3,8 @@
 ## Status
 
 - Future implementation plan for Wave A.
-- Runs after Phase 115 lands. Also prefer Phase 123/124 HTTP/2 hardening on
-  main first, because this phase reuses the same frame/header code.
+- Runs after Phase 115 and Phase 124 land, because this phase reuses the
+  reorganized core/battery boundary and hardened HTTP/2 frame/header code.
 - Can run in parallel with phases 117 and 118 if ownership stays in `tina-http`,
   TLS ALPN rail data, protocol facts, docs, and protocol specimens.
 - Runs before Phase 119 resource maturity. HTTP/2/gRPC client pooling needs
@@ -85,8 +85,7 @@ Big blast radius. Keep it fenced.
 
 - Allowed: `tina-http` HTTP/2/gRPC internals, TLS ALPN call inputs/outputs,
   protocol facts, focused docs/specimens.
-- Allowed only as needed: `tina-runtime` and `tina-sim` TLS call shapes for
-  selected ALPN.
+- Allowed: `tina-runtime` and `tina-sim` TLS call shapes for selected ALPN.
 - Not allowed: broad HTTP/1 rewrites, WebSocket rewrites, pool policy, new async
   bridge, or public HTTP/2 frame API.
 - Do the internal HTTP/2 module split first and prove server behavior is
@@ -98,7 +97,9 @@ Big blast radius. Keep it fenced.
   - `http2/frame.rs`
   - `http2/headers.rs`
   - `http2/errors.rs`
-  - `http2/flow.rs` only if moving window/accounting code avoids duplication
+- Keep flow/window accounting in the server/client modules for this phase. Do
+  not add `http2/flow.rs`; split it later only if both sides duplicate enough
+  code after the client exists.
 - Existing server tests must stay green after the split before client behavior
   lands.
 - Do not expose these frame/header modules as public API. They are internal

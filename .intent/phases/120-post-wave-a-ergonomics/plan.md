@@ -114,5 +114,6 @@ Touch only copied paths and examples/docs around newly landed Wave A features:
 - Do not make this a docs-only victory lap. The service skeleton must run.
 - Do not hide Tina truth behind a giant facade. Helpers can reduce ceremony, not
   remove named pressure/cancel/reply outcomes.
-- Do not add another noun unless two examples prove the need.
+- Do not add new major nouns in this phase. This phase teaches and composes the
+  nouns created by Wave A.
 - Do not leave stale current findings that describe already-solved pain.

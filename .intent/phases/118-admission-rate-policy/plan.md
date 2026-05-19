@@ -68,8 +68,9 @@ close, and the outcome is typed
 Medium blast radius.
 
 - Allowed: new policy types, docs, specimens, capacity/service-report adapters.
-- Allowed only if needed: tiny helper methods on existing `LocalPermitGate`,
-  `SharedCapacityScope`, `FullHandling`, `Backoff`, or `RecurringTick`.
+- Allowed: tiny helper methods on existing `LocalPermitGate`,
+  `SharedCapacityScope`, `FullHandling`, `Backoff`, or `RecurringTick` when the
+  new policy types need a missing report/snapshot conversion.
 - Not allowed: runtime scheduler changes, hidden queues inside runtime, new
   global registry, or rewriting existing capacity vocabulary.
 

@@ -58,8 +58,7 @@ private runtime access and without weakening bounded/DST truth
 ## Does Not Include
 
 - no dynamic plugin ABI
-- no broad `Future`/`Stream` bridge unless a smoke crate proves the bounded
-  shape
+- no broad `Future`/`Stream` bridge in this phase
 - no hidden Tokio under native Tina services
 - no hook that bypasses trace/capacity/cancel truth
 - no semver promise for internal runtime modules
@@ -70,8 +69,8 @@ Medium blast radius.
 
 - Allowed: public hook traits/data shapes, extension examples, docs,
   capability reports, compile-fail tests.
-- Allowed only if an extension smoke crate proves the need: small public
-  adapters around existing capacity/event/bridge/codecs/policy data.
+- Allowed: small public adapters around existing capacity/event/bridge/codecs/
+  policy data when required by the extension smoke crates.
 - Not allowed: moving internals public wholesale, dynamic plugin ABI, generic
   async bridge, native protocol rewrites, or new runtime backdoors.
 
@@ -147,8 +146,7 @@ Every smoke crate must have a README command and a smoke test.
 ## Hostile Review Notes
 
 - Do not build a plugin system. Rust crates are the plugin system.
-- Do not make a generic async bridge unless it proves bounded queueing,
-  cancellation, pressure, and replay/unsupported truth.
+- Do not make a generic async bridge in this phase.
 - Do not rename working public vocabulary just to make a hook table pretty.
 - Do not expose internals just because a smoke crate wants an easy path.
 - Do not let custom codecs own sockets. Tina owns sockets.

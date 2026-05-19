@@ -30,8 +30,8 @@ Tina owns I/O, capacity, cancellation, and replay. Codecs own bytes.
   generic sync codec pattern that matches their lessons.
 - Unix-domain sockets are not present as runtime rails. Lifecycle docs mention
   Unix as a resource kind, but no `unix_bind` / `unix_connect` surface exists.
-- `tina-codec` does not exist yet. If Phase 115 chooses a different official
-  battery home, use that home. Do not put codecs in `tina` core.
+- Add `tina-codec` as the official codec battery crate. Do not put codecs in
+  `tina` core.
 
 ## Includes
 
@@ -49,7 +49,7 @@ Tina owns I/O, capacity, cancellation, and replay. Codecs own bytes.
   - `LengthDelimitedFramer`
   - `FrameDecision::{NeedMore, Frame, Malformed, Full}`
 - Unix-domain socket listener/client rails for local IPC
-- Unix rails mirror TCP semantics where possible:
+- Unix rails mirror TCP semantics for these first-form calls:
   - bind/listen/accept
   - connect
   - read/write/close
@@ -71,8 +71,7 @@ Tina owns I/O, capacity, cancellation, and replay. Codecs own bytes.
 - no unbounded file buffering
 - no production database wire protocol
 - no mmap/zero-copy promise
-- no moving HTTP/WebSocket parsers into public API unless the generic codec
-  shape is clean
+- no moving HTTP/WebSocket parsers into public API
 - no driver-level `file_read_to_end` that hides per-chunk progress
 
 ## Blast Radius
@@ -107,7 +106,8 @@ Medium blast radius.
   accidental success
 - Unix peer close while read/write is pending settles visibly
 - Unix socket live echo/admin specimen works on Unix
-- live and sim tests cover the same protocol shape where possible
+- live Unix and sim tests cover the same framed protocol shape; non-Unix live
+  tests assert typed unsupported
 - non-Unix tests assert typed unsupported capability, not cfg-silent omission
 - compile-fail tests keep codec adapter state typed, not stringly
 - doctests show codec state living on an isolate and one runtime read per
@@ -119,7 +119,7 @@ Medium blast radius.
 - Add `tina_runtime::file_loops` beside `tcp_loops`:
   - `FileReadChunks`
   - `FileWriteAll`
-  - `FileCopyBounded` only if two specimens need read+write together
+  - `FileCopyBounded`
   - explicit max chunk and max total
   - no zero chunk
   - no hidden allocation beyond configured buffer
@@ -133,8 +133,7 @@ Medium blast radius.
   - live non-Unix platforms complete with typed unsupported
   - simulator models Unix sockets as local byte-stream pairs with Unix-socket
     resource names
-  - keep Unix resource ids distinct from TCP ids unless tests prove shared
-    `StreamId` cannot cross resources silently
+  - use distinct `UnixListenerId` and `UnixStreamId`; do not reuse TCP ids
 - Add specimens:
   - `specimen_file_ingest`
   - `specimen_local_admin_socket`

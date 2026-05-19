@@ -3,9 +3,9 @@
 ## Status
 
 - Future implementation plan for Wave B.
-- Runs after Phase 116 and preferably after Phase 124. Protocol-session
-  fairness needs real HTTP/2/gRPC client/server surfaces and the second-pass
-  HTTP/2 strictness/fairness fixes.
+- Runs after Phase 116 and Phase 124. Protocol-session fairness needs real
+  HTTP/2/gRPC client/server surfaces and the second-pass HTTP/2
+  strictness/fairness fixes.
 - Can also benefit from Phase 118 admission reports and Phase 119 resource
   reports, but must not require them if the first fairness proof is ready.
 - Can run in parallel with Phase 122 if ownership stays in scheduler
