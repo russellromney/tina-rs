@@ -1,0 +1,20 @@
+//! Native HTTP/2 for Tina: prior-knowledge cleartext h2c, a bounded
+//! server isolate, and the typed protocol vocabulary shared with the
+//! native client.
+//!
+//! The frame, HPACK, and protocol-error helpers (`frame`, `headers`,
+//! `errors`) are internal to this module tree and are not re-exported
+//! on the crate's public API — they are shared between the server and
+//! client implementations only.
+
+mod errors;
+mod frame;
+mod headers;
+mod server;
+
+pub use errors::Http2ProtocolError;
+pub use server::{
+    Http2Connection, Http2ConnectionMsg, Http2ConnectionReply, Http2ConnectionReport, Http2Limits,
+    Http2Listener, Http2ListenerMsg, Http2Outcome, Http2ServerConfig, Http2StreamReport,
+    Http2StreamState,
+};
