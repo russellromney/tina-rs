@@ -11,3 +11,17 @@
 
 Remaining risk: exactly-once wording can creep in during docs/specimens. Review
 must reject any "once" claim stronger than the outbox semantics prove.
+
+# Plan Review 2
+
+- [fixed] Storage/file/IPC completion was too small and conditional alone. It is
+  now folded into durable local state because the user outcome is one thing:
+  restartable local services that own local OS rails.
+- [fixed] Platform support truth now belongs beside recovery truth. Directory
+  sync and rename commit must return typed unsupported with capability evidence
+  where the backend cannot prove them.
+- [fixed] Local IPC and codecs now have e2e proof requirements, not only local
+  parser tests.
+
+Remaining risk: local OS semantics are platform sharp. Implementation review
+must check macOS/Linux wording and tests independently.
