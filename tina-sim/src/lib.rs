@@ -93,21 +93,21 @@ pub struct Simulator<S>
 where
     S: Shard,
 {
-    shard: S,
-    config: SimulatorConfig,
-    entries: Vec<RegisteredEntry<S>>,
-    child_records: Vec<ChildRecord<S>>,
-    supervisors: Vec<SupervisorRecord>,
-    next_isolate_id: u64,
-    next_listener_id: u64,
-    next_stream_id: u64,
-    next_udp_socket_id: u64,
-    next_tls_listener_id: u64,
-    next_tls_stream_id: u64,
-    next_file_id: u64,
-    ids: IdSource,
-    trace: Vec<RuntimeEvent>,
-    virtual_now: Duration,
+    pub(crate) shard: S,
+    pub(crate) config: SimulatorConfig,
+    pub(crate) entries: Vec<RegisteredEntry<S>>,
+    pub(crate) child_records: Vec<ChildRecord<S>>,
+    pub(crate) supervisors: Vec<SupervisorRecord>,
+    pub(crate) next_isolate_id: u64,
+    pub(crate) next_listener_id: u64,
+    pub(crate) next_stream_id: u64,
+    pub(crate) next_udp_socket_id: u64,
+    pub(crate) next_tls_listener_id: u64,
+    pub(crate) next_tls_stream_id: u64,
+    pub(crate) next_file_id: u64,
+    pub(crate) ids: IdSource,
+    pub(crate) trace: Vec<RuntimeEvent>,
+    pub(crate) virtual_now: Duration,
     /// `Instant` anchor that pairs with `virtual_now` to give the
     /// simulator a same-shape "now" as the live runtime's `Clock`.
     /// Stamped once at construction (from `Instant::now()`) and never
@@ -124,44 +124,44 @@ where
     /// `stop_with` payloads or other observed values; user code that
     /// wants byte-identical replay should compare `virtual_now`
     /// `Duration`s, not `Instant`s.
-    virtual_anchor: std::time::Instant,
-    step_ordinal: u64,
-    timers: Vec<TimerEntry>,
-    next_timer_ordinal: u64,
-    next_send_ordinal: u64,
-    next_tcp_completion_ordinal: u64,
-    next_storage_ordinal: u64,
-    listeners: Vec<ListenerState>,
-    streams: Vec<StreamState>,
-    udp_sockets: Vec<UdpSocketState>,
-    tls_listeners: Vec<TlsListenerState>,
-    tls_streams: Vec<TlsStreamState>,
-    files: Vec<FileState>,
-    file_storage: BTreeMap<PathBuf, Vec<u8>>,
-    directories: Vec<PathBuf>,
-    pending_accepts: Vec<PendingAccept>,
-    pending_connects: Vec<PendingConnect>,
-    pending_udp_recvs: Vec<PendingUdpRecv>,
-    pending_tcp_completions: Vec<PendingTcpCompletion>,
-    in_flight_calls: Vec<InFlightCall>,
-    translators: Vec<StoredTranslator>,
-    pending_isolate_calls: Vec<PendingIsolateCall>,
-    round_messages: Vec<Option<DeliveredMessage>>,
-    next_isolate_call_ordinal: u64,
-    last_checker_failure: Option<CheckerFailure>,
-    deferred_registry: std::rc::Rc<DeferredSlotRegistry>,
-    promoted_slots: deferred::PromotedSlots,
+    pub(crate) virtual_anchor: std::time::Instant,
+    pub(crate) step_ordinal: u64,
+    pub(crate) timers: Vec<TimerEntry>,
+    pub(crate) next_timer_ordinal: u64,
+    pub(crate) next_send_ordinal: u64,
+    pub(crate) next_tcp_completion_ordinal: u64,
+    pub(crate) next_storage_ordinal: u64,
+    pub(crate) listeners: Vec<ListenerState>,
+    pub(crate) streams: Vec<StreamState>,
+    pub(crate) udp_sockets: Vec<UdpSocketState>,
+    pub(crate) tls_listeners: Vec<TlsListenerState>,
+    pub(crate) tls_streams: Vec<TlsStreamState>,
+    pub(crate) files: Vec<FileState>,
+    pub(crate) file_storage: BTreeMap<PathBuf, Vec<u8>>,
+    pub(crate) directories: Vec<PathBuf>,
+    pub(crate) pending_accepts: Vec<PendingAccept>,
+    pub(crate) pending_connects: Vec<PendingConnect>,
+    pub(crate) pending_udp_recvs: Vec<PendingUdpRecv>,
+    pub(crate) pending_tcp_completions: Vec<PendingTcpCompletion>,
+    pub(crate) in_flight_calls: Vec<InFlightCall>,
+    pub(crate) translators: Vec<StoredTranslator>,
+    pub(crate) pending_isolate_calls: Vec<PendingIsolateCall>,
+    pub(crate) round_messages: Vec<Option<DeliveredMessage>>,
+    pub(crate) next_isolate_call_ordinal: u64,
+    pub(crate) last_checker_failure: Option<CheckerFailure>,
+    pub(crate) deferred_registry: std::rc::Rc<DeferredSlotRegistry>,
+    pub(crate) promoted_slots: deferred::PromotedSlots,
     /// Bounded ring of recently-cancelled calls plus the cause that
     /// closed each one. Mirrors the runtime so late callee replies
     /// surface as the matching cause-specific rejection reason
     /// (`CallerCancelled` / `CallerTimedOut` / `OwnerStopped` /
     /// `RuntimeStopped`) instead of the generic
     /// `NoPendingCall` / `CallerClosed`.
-    cancelled_calls: std::collections::VecDeque<(CallId, tina::CancelCause)>,
-    cancelled_call_cause_evictions: u64,
+    pub(crate) cancelled_calls: std::collections::VecDeque<(CallId, tina::CancelCause)>,
+    pub(crate) cancelled_call_cause_evictions: u64,
     /// Live trace observer. Fires before in-memory push so DST replay
     /// sees the same stream a live operator does.
-    trace_observer: Option<Arc<dyn tina_runtime::TraceObserver>>,
+    pub(crate) trace_observer: Option<Arc<dyn tina_runtime::TraceObserver>>,
 }
 
 impl<S> Simulator<S>
@@ -173,7 +173,7 @@ where
         Self::with_ids(shard, config, IdSource::new())
     }
 
-    fn with_ids(shard: S, config: SimulatorConfig, ids: IdSource) -> Self {
+    pub(crate) fn with_ids(shard: S, config: SimulatorConfig, ids: IdSource) -> Self {
         Self {
             shard,
             config,
@@ -454,7 +454,7 @@ where
         })
     }
 
-    fn step_with_remote<FR>(&mut self, route_remote: &mut FR) -> usize
+    pub(crate) fn step_with_remote<FR>(&mut self, route_remote: &mut FR) -> usize
     where
         FR: FnMut(ShardId, QueuedRemoteEnvelope) -> Result<(), SendRejectedReason>,
     {
@@ -693,7 +693,7 @@ where
         }
     }
 
-    fn observe_new_events<C: Checker>(
+    pub(crate) fn observe_new_events<C: Checker>(
         &self,
         checker: &mut C,
         observed_len: &mut usize,
@@ -715,7 +715,7 @@ where
         None
     }
 
-    fn execute_effect(
+    pub(crate) fn execute_effect(
         &mut self,
         index: usize,
         cause: tina_runtime::CauseId,
@@ -998,7 +998,7 @@ where
         }
     }
 
-    fn reject_call_context(
+    pub(crate) fn reject_call_context(
         &mut self,
         isolate_id: IsolateId,
         cause: tina_runtime::CauseId,
@@ -1052,7 +1052,7 @@ where
         }
     }
 
-    fn push_call_rejected_event(
+    pub(crate) fn push_call_rejected_event(
         &mut self,
         isolate_id: IsolateId,
         cause: tina_runtime::CauseId,
@@ -1068,7 +1068,7 @@ where
         self.push_event(isolate_id, Some(cause), kind);
     }
 
-    fn execute_reply_to(
+    pub(crate) fn execute_reply_to(
         &mut self,
         isolate_id: IsolateId,
         cause: tina_runtime::CauseId,
@@ -1178,7 +1178,7 @@ where
         }
     }
 
-    fn register_entry<I, Msg, Outbound>(
+    pub(crate) fn register_entry<I, Msg, Outbound>(
         &mut self,
         isolate: I,
         parent: Option<IsolateId>,
@@ -1221,7 +1221,7 @@ where
         }
     }
 
-    fn spawn_isolate<I, Msg, Outbound>(
+    pub(crate) fn spawn_isolate<I, Msg, Outbound>(
         &mut self,
         parent: IsolateId,
         isolate: I,
@@ -1257,7 +1257,7 @@ where
         }
     }
 
-    fn record_child(&mut self, parent: IsolateId, outcome: SpawnOutcome<S>) {
+    pub(crate) fn record_child(&mut self, parent: IsolateId, outcome: SpawnOutcome<S>) {
         let child_ordinal = self
             .child_records
             .iter()
@@ -1273,7 +1273,7 @@ where
         });
     }
 
-    fn enqueue_bootstrap_message(
+    pub(crate) fn enqueue_bootstrap_message(
         &mut self,
         child: RegisteredAddress,
         message: Box<dyn Any>,
@@ -1300,7 +1300,7 @@ where
         );
     }
 
-    fn restart_children(
+    pub(crate) fn restart_children(
         &mut self,
         parent: IsolateId,
         cause: tina_runtime::CauseId,
@@ -1313,7 +1313,7 @@ where
         }
     }
 
-    fn supervise_panic(
+    pub(crate) fn supervise_panic(
         &mut self,
         failed_child: RegisteredAddress,
         cause: tina_runtime::CauseId,
@@ -1399,7 +1399,7 @@ where
         }
     }
 
-    fn restart_child_record(
+    pub(crate) fn restart_child_record(
         &mut self,
         parent: IsolateId,
         child_record_index: usize,
@@ -1472,7 +1472,7 @@ where
         }
     }
 
-    fn checked_registered_address<M: 'static, R>(
+    pub(crate) fn checked_registered_address<M: 'static, R>(
         &self,
         address: Address<M, R>,
         operation: &str,
@@ -1513,29 +1513,29 @@ where
         }
     }
 
-    fn entry_index(&self, address: RegisteredAddress) -> Option<usize> {
+    pub(crate) fn entry_index(&self, address: RegisteredAddress) -> Option<usize> {
         self.entries
             .iter()
             .position(|entry| entry.id == address.isolate && entry.generation == address.generation)
     }
 
-    fn entry_by_isolate(&self, isolate: IsolateId) -> Option<&RegisteredEntry<S>> {
+    pub(crate) fn entry_by_isolate(&self, isolate: IsolateId) -> Option<&RegisteredEntry<S>> {
         self.entries.iter().find(|entry| entry.id == isolate)
     }
 
-    fn child_record_index_by_child(&self, child: RegisteredAddress) -> Option<usize> {
+    pub(crate) fn child_record_index_by_child(&self, child: RegisteredAddress) -> Option<usize> {
         self.child_records
             .iter()
             .position(|record| record.child == child)
     }
 
-    fn supervisor_index(&self, parent: IsolateId) -> Option<usize> {
+    pub(crate) fn supervisor_index(&self, parent: IsolateId) -> Option<usize> {
         self.supervisors
             .iter()
             .position(|record| record.parent.isolate == parent)
     }
 
-    fn dispatch_call(
+    pub(crate) fn dispatch_call(
         &mut self,
         call: ErasedCall,
         requester: RegisteredAddress,
@@ -1592,7 +1592,7 @@ where
         }
     }
 
-    fn dispatch_backend_call(
+    pub(crate) fn dispatch_backend_call(
         &mut self,
         context: CallDispatchContext,
         call_kind: CallKind,
@@ -1731,7 +1731,7 @@ where
         }
     }
 
-    fn dispatch_observed_send(
+    pub(crate) fn dispatch_observed_send(
         &mut self,
         context: CallDispatchContext,
         send: ErasedSend,
@@ -1806,7 +1806,7 @@ where
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn dispatch_isolate_call(
+    pub(crate) fn dispatch_isolate_call(
         &mut self,
         context: CallDispatchContext,
         send: ErasedSend,
@@ -1979,7 +1979,7 @@ where
         }
     }
 
-    fn handle_tcp_bind(&mut self, call_id: CallId, addr: SocketAddr) {
+    pub(crate) fn handle_tcp_bind(&mut self, call_id: CallId, addr: SocketAddr) {
         if self
             .listeners
             .iter()
@@ -2047,7 +2047,7 @@ where
         );
     }
 
-    fn handle_tcp_connect(&mut self, call_id: CallId, addr: SocketAddr) {
+    pub(crate) fn handle_tcp_connect(&mut self, call_id: CallId, addr: SocketAddr) {
         let Some(listener_index) = self.ensure_connect_listener(addr) else {
             self.deliver_completion(call_id, CallOutput::Failed(CallError::Io));
             return;
@@ -2087,7 +2087,7 @@ where
         });
     }
 
-    fn handle_tcp_accept(&mut self, call_id: CallId, listener: ListenerId) {
+    pub(crate) fn handle_tcp_accept(&mut self, call_id: CallId, listener: ListenerId) {
         let Some(listener_index) = self.listener_index(listener) else {
             self.deliver_completion(call_id, CallOutput::Failed(CallError::InvalidResource));
             return;
@@ -2124,7 +2124,12 @@ where
         });
     }
 
-    fn handle_tcp_read(&mut self, call_id: CallId, stream: tina_runtime::StreamId, max_len: usize) {
+    pub(crate) fn handle_tcp_read(
+        &mut self,
+        call_id: CallId,
+        stream: tina_runtime::StreamId,
+        max_len: usize,
+    ) {
         let Some(stream_index) = self.stream_index(stream) else {
             self.deliver_completion(call_id, CallOutput::Failed(CallError::InvalidResource));
             return;
@@ -2144,7 +2149,7 @@ where
         self.schedule_tcp_completion(call_id, resource, result);
     }
 
-    fn handle_tcp_write(
+    pub(crate) fn handle_tcp_write(
         &mut self,
         call_id: CallId,
         stream: tina_runtime::StreamId,
@@ -2169,7 +2174,7 @@ where
         self.schedule_tcp_completion(call_id, resource, result);
     }
 
-    fn handle_tcp_listener_close(&mut self, call_id: CallId, listener: ListenerId) {
+    pub(crate) fn handle_tcp_listener_close(&mut self, call_id: CallId, listener: ListenerId) {
         let Some(listener_index) = self.listener_index(listener) else {
             self.deliver_completion(call_id, CallOutput::Failed(CallError::InvalidResource));
             return;
@@ -2187,7 +2192,11 @@ where
         self.deliver_completion(call_id, CallOutput::TcpListenerClosed);
     }
 
-    fn handle_tcp_stream_close(&mut self, call_id: CallId, stream: tina_runtime::StreamId) {
+    pub(crate) fn handle_tcp_stream_close(
+        &mut self,
+        call_id: CallId,
+        stream: tina_runtime::StreamId,
+    ) {
         let Some(stream_index) = self.stream_index(stream) else {
             self.deliver_completion(call_id, CallOutput::Failed(CallError::InvalidResource));
             return;
@@ -2206,7 +2215,7 @@ where
         self.deliver_completion(call_id, CallOutput::TcpStreamClosed);
     }
 
-    fn handle_udp_bind(&mut self, call_id: CallId, addr: SocketAddr) {
+    pub(crate) fn handle_udp_bind(&mut self, call_id: CallId, addr: SocketAddr) {
         if self
             .udp_sockets
             .iter()
@@ -2270,7 +2279,7 @@ where
         );
     }
 
-    fn handle_udp_send_to(
+    pub(crate) fn handle_udp_send_to(
         &mut self,
         call_id: CallId,
         socket: UdpSocketId,
@@ -2316,7 +2325,12 @@ where
         );
     }
 
-    fn handle_udp_recv_from(&mut self, call_id: CallId, socket: UdpSocketId, max_len: usize) {
+    pub(crate) fn handle_udp_recv_from(
+        &mut self,
+        call_id: CallId,
+        socket: UdpSocketId,
+        max_len: usize,
+    ) {
         let Some(socket_index) = self.udp_socket_index(socket) else {
             self.deliver_completion(call_id, CallOutput::Failed(CallError::InvalidResource));
             return;
@@ -2348,7 +2362,7 @@ where
         });
     }
 
-    fn handle_udp_socket_close(&mut self, call_id: CallId, socket: UdpSocketId) {
+    pub(crate) fn handle_udp_socket_close(&mut self, call_id: CallId, socket: UdpSocketId) {
         let Some(socket_index) = self.udp_socket_index(socket) else {
             self.deliver_completion(call_id, CallOutput::Failed(CallError::InvalidResource));
             return;
@@ -2363,7 +2377,13 @@ where
         self.deliver_completion(call_id, CallOutput::UdpSocketClosed);
     }
 
-    fn handle_dns_lookup(&mut self, call_id: CallId, host: String, port: u16, timeout: Duration) {
+    pub(crate) fn handle_dns_lookup(
+        &mut self,
+        call_id: CallId,
+        host: String,
+        port: u16,
+        timeout: Duration,
+    ) {
         if timeout.is_zero() {
             self.deliver_completion_at(
                 call_id,
@@ -2402,7 +2422,7 @@ where
         );
     }
 
-    fn handle_tls_connect(
+    pub(crate) fn handle_tls_connect(
         &mut self,
         call_id: CallId,
         addr: SocketAddr,
@@ -2477,7 +2497,7 @@ where
         );
     }
 
-    fn handle_tls_bind(&mut self, call_id: CallId, addr: SocketAddr) {
+    pub(crate) fn handle_tls_bind(&mut self, call_id: CallId, addr: SocketAddr) {
         if self
             .tls_listeners
             .iter()
@@ -2507,7 +2527,12 @@ where
         );
     }
 
-    fn handle_tls_accept(&mut self, call_id: CallId, listener: TlsListenerId, timeout: Duration) {
+    pub(crate) fn handle_tls_accept(
+        &mut self,
+        call_id: CallId,
+        listener: TlsListenerId,
+        timeout: Duration,
+    ) {
         if timeout.is_zero() {
             self.deliver_completion_at(
                 call_id,
@@ -2564,7 +2589,7 @@ where
         );
     }
 
-    fn handle_tls_listener_close(&mut self, call_id: CallId, listener: TlsListenerId) {
+    pub(crate) fn handle_tls_listener_close(&mut self, call_id: CallId, listener: TlsListenerId) {
         let Some(listener_index) = self.tls_listener_index(listener) else {
             self.deliver_completion(call_id, CallOutput::Failed(CallError::InvalidResource));
             return;
@@ -2581,7 +2606,7 @@ where
         self.deliver_completion(call_id, CallOutput::TlsListenerClosed);
     }
 
-    fn handle_tls_read(
+    pub(crate) fn handle_tls_read(
         &mut self,
         call_id: CallId,
         stream: TlsStreamId,
@@ -2630,7 +2655,7 @@ where
         self.schedule_tls_completion(call_id, resource, self.step_ordinal + 1, result);
     }
 
-    fn handle_tls_write(
+    pub(crate) fn handle_tls_write(
         &mut self,
         call_id: CallId,
         stream: TlsStreamId,
@@ -2678,7 +2703,12 @@ where
         self.schedule_tls_completion(call_id, resource, self.step_ordinal + 1, result);
     }
 
-    fn handle_tls_close(&mut self, call_id: CallId, stream: TlsStreamId, timeout: Duration) {
+    pub(crate) fn handle_tls_close(
+        &mut self,
+        call_id: CallId,
+        stream: TlsStreamId,
+        timeout: Duration,
+    ) {
         if timeout.is_zero() {
             self.deliver_completion_at(
                 call_id,
@@ -2718,7 +2748,7 @@ where
         );
     }
 
-    fn handle_signal_wait(&mut self, call_id: CallId, name: String, timeout: Duration) {
+    pub(crate) fn handle_signal_wait(&mut self, call_id: CallId, name: String, timeout: Duration) {
         if timeout.is_zero() {
             self.deliver_completion_at(
                 call_id,
@@ -2757,7 +2787,7 @@ where
         );
     }
 
-    fn handle_process_run(
+    pub(crate) fn handle_process_run(
         &mut self,
         call_id: CallId,
         command: String,
@@ -2819,7 +2849,7 @@ where
         );
     }
 
-    fn handle_file_open(
+    pub(crate) fn handle_file_open(
         &mut self,
         call_id: CallId,
         path: PathBuf,
@@ -2856,7 +2886,7 @@ where
         self.deliver_completion(call_id, CallOutput::FileOpened { file: id });
     }
 
-    fn handle_file_read_at(
+    pub(crate) fn handle_file_read_at(
         &mut self,
         call_id: CallId,
         file: tina_runtime::FileId,
@@ -2893,7 +2923,7 @@ where
         );
     }
 
-    fn handle_file_write_at(
+    pub(crate) fn handle_file_write_at(
         &mut self,
         call_id: CallId,
         file: tina_runtime::FileId,
@@ -2930,7 +2960,7 @@ where
         );
     }
 
-    fn handle_file_fsync(&mut self, call_id: CallId, file: tina_runtime::FileId) {
+    pub(crate) fn handle_file_fsync(&mut self, call_id: CallId, file: tina_runtime::FileId) {
         if self.file_index(file).is_none() {
             self.deliver_completion(call_id, CallOutput::Failed(CallError::InvalidResource));
             return;
@@ -2951,7 +2981,7 @@ where
         );
     }
 
-    fn handle_file_size(&mut self, call_id: CallId, file: tina_runtime::FileId) {
+    pub(crate) fn handle_file_size(&mut self, call_id: CallId, file: tina_runtime::FileId) {
         let Some(index) = self.file_index(file) else {
             self.deliver_completion(call_id, CallOutput::Failed(CallError::InvalidResource));
             return;
@@ -2972,7 +3002,7 @@ where
         );
     }
 
-    fn handle_file_close(&mut self, call_id: CallId, file: tina_runtime::FileId) {
+    pub(crate) fn handle_file_close(&mut self, call_id: CallId, file: tina_runtime::FileId) {
         if self.file_has_active_pending(file) {
             self.deliver_completion(call_id, CallOutput::Failed(CallError::ResourceBusy));
             return;
@@ -2985,7 +3015,7 @@ where
         self.deliver_completion(call_id, CallOutput::FileClosed);
     }
 
-    fn handle_mkdir(&mut self, call_id: CallId, path: PathBuf) {
+    pub(crate) fn handle_mkdir(&mut self, call_id: CallId, path: PathBuf) {
         if self.directories.iter().any(|existing| existing == &path) {
             self.deliver_completion(call_id, CallOutput::Failed(CallError::Io));
             return;
@@ -3002,7 +3032,7 @@ where
         );
     }
 
-    fn handle_path_metadata(&mut self, call_id: CallId, path: PathBuf) {
+    pub(crate) fn handle_path_metadata(&mut self, call_id: CallId, path: PathBuf) {
         let metadata = if let Some(bytes) = self.file_storage.get(&path) {
             PathMetadata {
                 kind: PathKind::File,
@@ -3023,7 +3053,7 @@ where
         );
     }
 
-    fn handle_rename_replace(&mut self, call_id: CallId, from: PathBuf, to: PathBuf) {
+    pub(crate) fn handle_rename_replace(&mut self, call_id: CallId, from: PathBuf, to: PathBuf) {
         if !self.parent_directory_exists(&to) {
             self.deliver_completion(call_id, CallOutput::Failed(CallError::Io));
             return;
@@ -3059,7 +3089,7 @@ where
         self.deliver_completion(call_id, CallOutput::Failed(CallError::NotFound));
     }
 
-    fn handle_remove_file(&mut self, call_id: CallId, path: PathBuf) {
+    pub(crate) fn handle_remove_file(&mut self, call_id: CallId, path: PathBuf) {
         if self.file_storage.remove(&path).is_some() {
             self.schedule_tcp_completion(
                 call_id,
@@ -3071,7 +3101,7 @@ where
         }
     }
 
-    fn handle_read_dir(&mut self, call_id: CallId, path: PathBuf) {
+    pub(crate) fn handle_read_dir(&mut self, call_id: CallId, path: PathBuf) {
         if !self.directories.iter().any(|directory| directory == &path)
             && path != std::path::Path::new("/")
             && path != std::path::Path::new("/tmp")
@@ -3099,7 +3129,7 @@ where
         );
     }
 
-    fn handle_sync_parent(&mut self, call_id: CallId, path: PathBuf) {
+    pub(crate) fn handle_sync_parent(&mut self, call_id: CallId, path: PathBuf) {
         if self.parent_directory_exists(&path) {
             self.schedule_tcp_completion(
                 call_id,
@@ -3111,7 +3141,7 @@ where
         }
     }
 
-    fn handle_snapshot_commit(
+    pub(crate) fn handle_snapshot_commit(
         &mut self,
         call_id: CallId,
         path: PathBuf,
@@ -3140,7 +3170,7 @@ where
         self.deliver_completion(call_id, CallOutput::SnapshotCommitted);
     }
 
-    fn handle_snapshot_load(&mut self, call_id: CallId, path: PathBuf) {
+    pub(crate) fn handle_snapshot_load(&mut self, call_id: CallId, path: PathBuf) {
         let result = match self.file_storage.get(&path) {
             Some(bytes) => tina_runtime::persistence::decode_snapshot(bytes).map(Some),
             None => Ok(None),
@@ -3154,7 +3184,7 @@ where
         );
     }
 
-    fn handle_journal_append(
+    pub(crate) fn handle_journal_append(
         &mut self,
         call_id: CallId,
         path: PathBuf,
@@ -3210,13 +3240,13 @@ where
         self.deliver_completion(call_id, CallOutput::JournalAppended { record_index });
     }
 
-    fn next_storage_ordinal(&mut self) -> u64 {
+    pub(crate) fn next_storage_ordinal(&mut self) -> u64 {
         let ordinal = self.next_storage_ordinal;
         self.next_storage_ordinal += 1;
         ordinal
     }
 
-    fn handle_journal_replay(&mut self, call_id: CallId, path: PathBuf) {
+    pub(crate) fn handle_journal_replay(&mut self, call_id: CallId, path: PathBuf) {
         let result = match self.file_storage.get(&path) {
             Some(bytes) => tina_runtime::persistence::replay_journal_bytes(bytes),
             None => Ok(tina_runtime::JournalReplay {
@@ -3233,7 +3263,7 @@ where
         );
     }
 
-    fn parent_directory_exists(&self, path: &std::path::Path) -> bool {
+    pub(crate) fn parent_directory_exists(&self, path: &std::path::Path) -> bool {
         let Some(parent) = path.parent() else {
             return true;
         };
@@ -3248,7 +3278,7 @@ where
             .any(|directory| directory.as_path() == parent)
     }
 
-    fn resource_has_active_pending(&self, resource: TcpResourceKey) -> bool {
+    pub(crate) fn resource_has_active_pending(&self, resource: TcpResourceKey) -> bool {
         let queued_accept = match resource {
             TcpResourceKey::ListenerAccept(listener) => self
                 .pending_accepts
@@ -3282,34 +3312,34 @@ where
                 .any(|pending| pending.resource == resource)
     }
 
-    fn udp_socket_index(&self, socket: UdpSocketId) -> Option<usize> {
+    pub(crate) fn udp_socket_index(&self, socket: UdpSocketId) -> Option<usize> {
         self.udp_sockets.iter().position(|state| state.id == socket)
     }
 
-    fn file_index(&self, file: tina_runtime::FileId) -> Option<usize> {
+    pub(crate) fn file_index(&self, file: tina_runtime::FileId) -> Option<usize> {
         self.files
             .iter()
             .position(|state| state.id == file && !state.closed)
     }
 
-    fn tls_stream_index(&self, stream: TlsStreamId) -> Option<usize> {
+    pub(crate) fn tls_stream_index(&self, stream: TlsStreamId) -> Option<usize> {
         self.tls_streams.iter().position(|state| state.id == stream)
     }
 
-    fn tls_listener_index(&self, listener: TlsListenerId) -> Option<usize> {
+    pub(crate) fn tls_listener_index(&self, listener: TlsListenerId) -> Option<usize> {
         self.tls_listeners
             .iter()
             .position(|state| state.id == listener)
     }
 
-    fn file_has_active_pending(&self, file: tina_runtime::FileId) -> bool {
+    pub(crate) fn file_has_active_pending(&self, file: tina_runtime::FileId) -> bool {
         self.resource_has_active_pending(TcpResourceKey::FileRead(file))
             || self.resource_has_active_pending(TcpResourceKey::FileWrite(file))
             || self.resource_has_active_pending(TcpResourceKey::FileFsync(file))
             || self.resource_has_active_pending(TcpResourceKey::FileSize(file))
     }
 
-    fn schedule_tcp_completion(
+    pub(crate) fn schedule_tcp_completion(
         &mut self,
         call_id: CallId,
         resource: TcpResourceKey,
@@ -3352,7 +3382,7 @@ where
         });
     }
 
-    fn schedule_udp_completion(
+    pub(crate) fn schedule_udp_completion(
         &mut self,
         call_id: CallId,
         resource: TcpResourceKey,
@@ -3379,7 +3409,7 @@ where
         });
     }
 
-    fn schedule_dns_completion(
+    pub(crate) fn schedule_dns_completion(
         &mut self,
         call_id: CallId,
         resource: TcpResourceKey,
@@ -3415,7 +3445,7 @@ where
         });
     }
 
-    fn schedule_tls_completion(
+    pub(crate) fn schedule_tls_completion(
         &mut self,
         call_id: CallId,
         resource: TcpResourceKey,
@@ -3451,7 +3481,7 @@ where
         });
     }
 
-    fn schedule_signal_completion(
+    pub(crate) fn schedule_signal_completion(
         &mut self,
         call_id: CallId,
         resource: TcpResourceKey,
@@ -3487,7 +3517,7 @@ where
         });
     }
 
-    fn schedule_process_completion(
+    pub(crate) fn schedule_process_completion(
         &mut self,
         call_id: CallId,
         resource: TcpResourceKey,
@@ -3523,17 +3553,17 @@ where
         });
     }
 
-    fn listener_index(&self, listener: ListenerId) -> Option<usize> {
+    pub(crate) fn listener_index(&self, listener: ListenerId) -> Option<usize> {
         self.listeners.iter().position(|state| state.id == listener)
     }
 
-    fn connect_listener_index(&self, addr: SocketAddr) -> Option<usize> {
+    pub(crate) fn connect_listener_index(&self, addr: SocketAddr) -> Option<usize> {
         self.listeners.iter().position(|state| {
             !state.closed && (state.bind_addr == addr || state.local_addr == addr)
         })
     }
 
-    fn ensure_connect_listener(&mut self, addr: SocketAddr) -> Option<usize> {
+    pub(crate) fn ensure_connect_listener(&mut self, addr: SocketAddr) -> Option<usize> {
         if let Some(index) = self.connect_listener_index(addr) {
             return Some(index);
         }
@@ -3551,11 +3581,11 @@ where
         Some(index)
     }
 
-    fn stream_index(&self, stream: tina_runtime::StreamId) -> Option<usize> {
+    pub(crate) fn stream_index(&self, stream: tina_runtime::StreamId) -> Option<usize> {
         self.streams.iter().position(|state| state.id == stream)
     }
 
-    fn listener_from_script(&mut self, script: ScriptedListenerConfig) -> ListenerState {
+    pub(crate) fn listener_from_script(&mut self, script: ScriptedListenerConfig) -> ListenerState {
         let listener = ListenerState {
             id: ListenerId::new(self.next_listener_id),
             bind_addr: script.bind_addr,
@@ -3593,7 +3623,7 @@ where
         listener
     }
 
-    fn promote_ready_peers(&mut self, listener_index: usize) {
+    pub(crate) fn promote_ready_peers(&mut self, listener_index: usize) {
         let current_step = self.step_ordinal;
         while self.listeners[listener_index]
             .future_peers
@@ -3610,7 +3640,7 @@ where
         }
     }
 
-    fn open_stream_from_peer(
+    pub(crate) fn open_stream_from_peer(
         &mut self,
         peer: ScriptedPeerState,
     ) -> (tina_runtime::StreamId, SocketAddr) {
@@ -3630,7 +3660,7 @@ where
         (stream, peer_addr)
     }
 
-    fn open_connected_stream_from_peer(
+    pub(crate) fn open_connected_stream_from_peer(
         &mut self,
         peer: ScriptedPeerState,
         remote_addr: SocketAddr,
@@ -3651,7 +3681,11 @@ where
         (stream, local_addr, remote_addr)
     }
 
-    fn stream_read_result(&mut self, stream_index: usize, max_len: usize) -> Option<CallOutput> {
+    pub(crate) fn stream_read_result(
+        &mut self,
+        stream_index: usize,
+        max_len: usize,
+    ) -> Option<CallOutput> {
         let stream = self.streams.get_mut(stream_index)?;
         if stream.closed {
             return None;
@@ -3681,7 +3715,11 @@ where
         Some(CallOutput::TcpRead { bytes })
     }
 
-    fn stream_write_result(&mut self, stream_index: usize, bytes: &[u8]) -> Option<CallOutput> {
+    pub(crate) fn stream_write_result(
+        &mut self,
+        stream_index: usize,
+        bytes: &[u8],
+    ) -> Option<CallOutput> {
         let stream = self.streams.get_mut(stream_index)?;
         if stream.closed {
             return None;
@@ -3693,7 +3731,7 @@ where
         Some(CallOutput::TcpWrote { count })
     }
 
-    fn promote_ready_udp_datagrams(&mut self, socket_index: usize) {
+    pub(crate) fn promote_ready_udp_datagrams(&mut self, socket_index: usize) {
         let current_step = self.step_ordinal;
         while self.udp_sockets[socket_index]
             .future_datagrams
@@ -3712,7 +3750,11 @@ where
         }
     }
 
-    fn udp_recv_result(&mut self, socket_index: usize, max_len: usize) -> Option<CallOutput> {
+    pub(crate) fn udp_recv_result(
+        &mut self,
+        socket_index: usize,
+        max_len: usize,
+    ) -> Option<CallOutput> {
         let datagram = self.udp_sockets[socket_index].ready_datagrams.pop_front()?;
         let truncated = datagram.bytes.len() > max_len;
         let bytes = datagram.bytes.into_iter().take(max_len).collect();
@@ -3723,7 +3765,7 @@ where
         })
     }
 
-    fn harvest_tcp(&mut self) {
+    pub(crate) fn harvest_tcp(&mut self) {
         self.activate_pending_connects();
         self.activate_pending_accepts();
         self.activate_pending_udp_recvs();
@@ -3773,7 +3815,7 @@ where
         }
     }
 
-    fn activate_pending_accepts(&mut self) {
+    pub(crate) fn activate_pending_accepts(&mut self) {
         let mut survivors = Vec::new();
         let mut pending = std::mem::take(&mut self.pending_accepts);
         pending.sort_by_key(|entry| entry.insertion_order);
@@ -3808,7 +3850,7 @@ where
         self.pending_accepts = survivors;
     }
 
-    fn activate_pending_connects(&mut self) {
+    pub(crate) fn activate_pending_connects(&mut self) {
         let mut survivors = Vec::new();
         let mut pending = std::mem::take(&mut self.pending_connects);
         pending.sort_by_key(|entry| entry.insertion_order);
@@ -3845,7 +3887,7 @@ where
         self.pending_connects = survivors;
     }
 
-    fn activate_pending_udp_recvs(&mut self) {
+    pub(crate) fn activate_pending_udp_recvs(&mut self) {
         let mut survivors = Vec::new();
         let mut pending = std::mem::take(&mut self.pending_udp_recvs);
         pending.sort_by_key(|entry| entry.insertion_order);
@@ -3878,7 +3920,7 @@ where
         self.pending_udp_recvs = survivors;
     }
 
-    fn order_ready_tcp_completions(&self, ready: &mut [PendingTcpCompletion]) {
+    pub(crate) fn order_ready_tcp_completions(&self, ready: &mut [PendingTcpCompletion]) {
         ready.sort_by(|left, right| {
             left.ready_at_step
                 .cmp(&right.ready_at_step)
@@ -3915,7 +3957,7 @@ where
         }
     }
 
-    fn tcp_delay_steps(&self, insertion_order: u64) -> u64 {
+    pub(crate) fn tcp_delay_steps(&self, insertion_order: u64) -> u64 {
         match self.config.faults.tcp_completion {
             TcpCompletionFaultMode::None | TcpCompletionFaultMode::ReorderReady { .. } => 0,
             TcpCompletionFaultMode::DelayBySteps { one_in, steps } => {
@@ -3929,7 +3971,7 @@ where
         }
     }
 
-    fn harvest_timers(&mut self, now: Duration) {
+    pub(crate) fn harvest_timers(&mut self, now: Duration) {
         let mut batch_offset = 0;
         let mut last_registration_index = None;
         while let Some(index) = self
@@ -3960,7 +4002,7 @@ where
         }
     }
 
-    fn harvest_isolate_call_timeouts(&mut self, now: Duration) {
+    pub(crate) fn harvest_isolate_call_timeouts(&mut self, now: Duration) {
         while let Some(index) = self
             .pending_isolate_calls
             .iter()
@@ -4002,7 +4044,7 @@ where
         }
     }
 
-    fn record_cancelled_call(&mut self, call_id: CallId, cause: tina::CancelCause) {
+    pub(crate) fn record_cancelled_call(&mut self, call_id: CallId, cause: tina::CancelCause) {
         if self.cancelled_calls.len() == tina_runtime::CANCELLED_CALL_RING_CAPACITY {
             self.cancelled_calls.pop_front();
             self.cancelled_call_cause_evictions =
@@ -4011,7 +4053,7 @@ where
         self.cancelled_calls.push_back((call_id, cause));
     }
 
-    fn recently_cancelled_cause(&self, call_id: CallId) -> Option<tina::CancelCause> {
+    pub(crate) fn recently_cancelled_cause(&self, call_id: CallId) -> Option<tina::CancelCause> {
         self.cancelled_calls
             .iter()
             .find_map(|(id, cause)| (*id == call_id).then_some(*cause))
@@ -4019,7 +4061,7 @@ where
 
     /// Cancels every pending isolate call whose caller is the stopping
     /// isolate. Same shape as the runtime helper.
-    fn cancel_pending_isolate_calls_for_owner(
+    pub(crate) fn cancel_pending_isolate_calls_for_owner(
         &mut self,
         owner_isolate: IsolateId,
         owner_generation: AddressGeneration,
@@ -4056,7 +4098,7 @@ where
         }
     }
 
-    fn close_deferred_slot_for_call_with_reason(
+    pub(crate) fn close_deferred_slot_for_call_with_reason(
         &mut self,
         call_id: CallId,
         reason: tina_runtime::DeferredReplyRejectedReason,
@@ -4075,7 +4117,7 @@ where
         }
     }
 
-    fn dispatch_cancel_call(
+    pub(crate) fn dispatch_cancel_call(
         &mut self,
         context: CallDispatchContext,
         handle_shared: std::sync::Arc<tina::CallHandleShared>,
@@ -4198,7 +4240,7 @@ where
         }
     }
 
-    fn build_message_caller(
+    pub(crate) fn build_message_caller(
         &self,
         call_context: Option<MessageCallContext>,
         isolate_id: IsolateId,
@@ -4241,7 +4283,11 @@ where
         ))
     }
 
-    fn promote_captures(&mut self, isolate_id: IsolateId, cause: tina_runtime::CauseId) -> bool {
+    pub(crate) fn promote_captures(
+        &mut self,
+        isolate_id: IsolateId,
+        cause: tina_runtime::CauseId,
+    ) -> bool {
         let captures = self.deferred_registry.drain_pending();
         if captures.is_empty() {
             return false;
@@ -4281,14 +4327,14 @@ where
         true
     }
 
-    fn sweep_dropped_deferred_slots(&mut self) {
+    pub(crate) fn sweep_dropped_deferred_slots(&mut self) {
         let dropped = self.promoted_slots.sweep_dropped();
         for record in dropped {
             self.drop_promoted_deferred_slot(record, None);
         }
     }
 
-    fn drop_pending_deferred_captures(&mut self, cause: tina_runtime::CauseId) -> bool {
+    pub(crate) fn drop_pending_deferred_captures(&mut self, cause: tina_runtime::CauseId) -> bool {
         let captures = self.deferred_registry.drain_pending();
         let captured_any = !captures.is_empty();
         for capture in captures {
@@ -4310,7 +4356,7 @@ where
         captured_any
     }
 
-    fn drop_promoted_deferred_slot(
+    pub(crate) fn drop_promoted_deferred_slot(
         &mut self,
         record: deferred::DeferredSlotRecord,
         cause: Option<tina_runtime::CauseId>,
@@ -4330,11 +4376,11 @@ where
         self.complete_isolate_call(record.call_id, dropped.into(), CallOutcome::Closed);
     }
 
-    fn deliver_completion(&mut self, call_id: CallId, result: CallOutput) {
+    pub(crate) fn deliver_completion(&mut self, call_id: CallId, result: CallOutput) {
         self.deliver_completion_at(call_id, result, self.step_ordinal);
     }
 
-    fn deliver_observed_send_outcome(
+    pub(crate) fn deliver_observed_send_outcome(
         &mut self,
         call_id: CallId,
         requester: RegisteredAddress,
@@ -4411,7 +4457,7 @@ where
         }
     }
 
-    fn complete_isolate_call(
+    pub(crate) fn complete_isolate_call(
         &mut self,
         call_id: CallId,
         cause: tina_runtime::CauseId,
@@ -4446,7 +4492,7 @@ where
         true
     }
 
-    fn deliver_isolate_call_outcome(
+    pub(crate) fn deliver_isolate_call_outcome(
         &mut self,
         context: IsolateCallDeliveryContext,
         outcome: CallOutcome<Box<dyn Any>>,
@@ -4544,7 +4590,12 @@ where
         }
     }
 
-    fn deliver_completion_at(&mut self, call_id: CallId, result: CallOutput, visible_at_step: u64) {
+    pub(crate) fn deliver_completion_at(
+        &mut self,
+        call_id: CallId,
+        result: CallOutput,
+        visible_at_step: u64,
+    ) {
         let in_flight_index = self
             .in_flight_calls
             .iter()
@@ -4656,7 +4707,7 @@ where
         }
     }
 
-    fn push_persistence_completion_events(
+    pub(crate) fn push_persistence_completion_events(
         &mut self,
         in_flight: &InFlightCall,
         result: &CallOutput,
@@ -4714,11 +4765,14 @@ where
         }
     }
 
-    fn dispatch_local_send(&mut self, send: ErasedSend) -> Result<(), SendRejectedReason> {
+    pub(crate) fn dispatch_local_send(
+        &mut self,
+        send: ErasedSend,
+    ) -> Result<(), SendRejectedReason> {
         self.dispatch_local_send_with_context(send, None)
     }
 
-    fn dispatch_local_send_with_context(
+    pub(crate) fn dispatch_local_send_with_context(
         &mut self,
         send: ErasedSend,
         call_context: Option<MessageCallContext>,
@@ -4758,7 +4812,7 @@ where
             })
     }
 
-    fn harvest_remote_envelope(
+    pub(crate) fn harvest_remote_envelope(
         &mut self,
         queued: QueuedRemoteEnvelope,
     ) -> Option<QueuedRemoteEnvelope> {
@@ -4771,7 +4825,10 @@ where
         }
     }
 
-    fn harvest_remote_send(&mut self, queued: QueuedRemoteSend) -> Option<QueuedRemoteEnvelope> {
+    pub(crate) fn harvest_remote_send(
+        &mut self,
+        queued: QueuedRemoteSend,
+    ) -> Option<QueuedRemoteEnvelope> {
         // Cross-shard transport admission already happened on the source shard.
         // What we record here is destination-local harvest outcome, not a
         // retroactive change to the source-side send result.
@@ -4849,7 +4906,7 @@ where
         }
     }
 
-    fn harvest_remote_call_reply(&mut self, reply: RemoteCallReply) {
+    pub(crate) fn harvest_remote_call_reply(&mut self, reply: RemoteCallReply) {
         let outcome = match reply.reply {
             RemoteCallOutcome::Replied(reply) => CallOutcome::Replied(reply),
             RemoteCallOutcome::Full => CallOutcome::Full,
@@ -4872,7 +4929,7 @@ where
         }
     }
 
-    fn fault_delay(&self, mode: FaultMode, ordinal: u64, tag: u64) -> Duration {
+    pub(crate) fn fault_delay(&self, mode: FaultMode, ordinal: u64, tag: u64) -> Duration {
         match mode {
             FaultMode::None => Duration::ZERO,
             FaultMode::DelayBy { one_in, by } => {
@@ -4885,7 +4942,7 @@ where
         }
     }
 
-    fn local_send_delay_rounds(&self, mode: LocalSendFaultMode, ordinal: u64) -> u64 {
+    pub(crate) fn local_send_delay_rounds(&self, mode: LocalSendFaultMode, ordinal: u64) -> u64 {
         match mode {
             LocalSendFaultMode::None => 0,
             LocalSendFaultMode::DelayByRounds { one_in, rounds } => {
@@ -4898,7 +4955,7 @@ where
         }
     }
 
-    fn stop_entry(
+    pub(crate) fn stop_entry(
         &mut self,
         index: usize,
         isolate_id: IsolateId,
@@ -4907,7 +4964,7 @@ where
         self.stop_entry_with_precollected(index, isolate_id, cause, None)
     }
 
-    fn stop_entry_with_precollected(
+    pub(crate) fn stop_entry_with_precollected(
         &mut self,
         index: usize,
         isolate_id: IsolateId,
@@ -4968,7 +5025,7 @@ where
     /// Drops simulator state for calls cancelled by resource close.
     /// Translator is not run; caller's continuation does not fire.
     /// Trace records `ResourceClosed`.
-    fn cancel_backend_calls_for_resource(&mut self, resource: TcpResourceKey) {
+    pub(crate) fn cancel_backend_calls_for_resource(&mut self, resource: TcpResourceKey) {
         let cancelled_call_ids: Vec<CallId> = self
             .pending_tcp_completions
             .iter()
@@ -5028,7 +5085,7 @@ where
         }
     }
 
-    fn cancel_backend_calls_for_requester(&mut self, requester: RegisteredAddress) {
+    pub(crate) fn cancel_backend_calls_for_requester(&mut self, requester: RegisteredAddress) {
         let mut index = 0;
         while index < self.in_flight_calls.len() {
             if self.in_flight_calls[index].requester != requester {
@@ -5051,7 +5108,7 @@ where
         }
     }
 
-    fn cancel_pending_backend_work(&mut self, call_id: CallId) {
+    pub(crate) fn cancel_pending_backend_work(&mut self, call_id: CallId) {
         self.timers.retain(|timer| timer.call_id != call_id);
         self.pending_accepts
             .retain(|pending| pending.call_id != call_id);
@@ -5065,7 +5122,7 @@ where
             .retain(|completion| completion.call_id != call_id);
     }
 
-    fn remove_backend_translator(&mut self, call_id: CallId) {
+    pub(crate) fn remove_backend_translator(&mut self, call_id: CallId) {
         let translator_index = self
             .translators
             .iter()
@@ -5074,7 +5131,7 @@ where
         self.translators.remove(translator_index);
     }
 
-    fn push_event(
+    pub(crate) fn push_event(
         &mut self,
         isolate: IsolateId,
         cause: Option<tina_runtime::CauseId>,
@@ -5090,13 +5147,13 @@ where
         id
     }
 
-    fn has_pending_messages(&self) -> bool {
+    pub(crate) fn has_pending_messages(&self) -> bool {
         self.entries
             .iter()
             .any(|entry| !entry.stopped.get() && entry.inbox.has_pending())
     }
 
-    fn observed_peer_output(&self) -> Vec<ObservedPeerOutput> {
+    pub(crate) fn observed_peer_output(&self) -> Vec<ObservedPeerOutput> {
         self.streams
             .iter()
             .map(|stream| ObservedPeerOutput {
@@ -5106,7 +5163,7 @@ where
             .collect()
     }
 
-    fn requester_registration_index(&self, call_id: CallId) -> usize {
+    pub(crate) fn requester_registration_index(&self, call_id: CallId) -> usize {
         let requester = self
             .in_flight_calls
             .iter()
@@ -5183,8 +5240,8 @@ where
     }
 }
 
-struct SpawnObservedAdapter<Spawn, ParentMessage, ChildMessage, ChildReply> {
-    inner: tina::SpawnObserved<Spawn, ParentMessage, ChildMessage, ChildReply>,
+pub(crate) struct SpawnObservedAdapter<Spawn, ParentMessage, ChildMessage, ChildReply> {
+    pub(crate) inner: tina::SpawnObserved<Spawn, ParentMessage, ChildMessage, ChildReply>,
 }
 
 impl<Spawn, ParentMessage, ChildMessage, ChildReply, S> ErasedSpawnObserved<S>
@@ -5240,14 +5297,14 @@ where
     }
 }
 
-struct SpawnAdapter<I, Outbound>
+pub(crate) struct SpawnAdapter<I, Outbound>
 where
     I: Isolate,
 {
-    isolate: I,
-    mailbox_capacity: usize,
-    bootstrap_message: Option<I::Message>,
-    marker: PhantomData<fn(Outbound) -> Outbound>,
+    pub(crate) isolate: I,
+    pub(crate) mailbox_capacity: usize,
+    pub(crate) bootstrap_message: Option<I::Message>,
+    pub(crate) marker: PhantomData<fn(Outbound) -> Outbound>,
 }
 
 impl<I, S, Msg, Outbound> ErasedSpawn<S> for SpawnAdapter<I, Outbound>
@@ -5306,14 +5363,14 @@ where
     }
 }
 
-struct RestartableSpawnAdapter<I, Outbound>
+pub(crate) struct RestartableSpawnAdapter<I, Outbound>
 where
     I: Isolate,
 {
-    factory: Box<dyn Fn() -> I>,
-    mailbox_capacity: usize,
-    bootstrap_factory: Option<Box<dyn Fn() -> I::Message>>,
-    marker: PhantomData<fn(Outbound) -> Outbound>,
+    pub(crate) factory: Box<dyn Fn() -> I>,
+    pub(crate) mailbox_capacity: usize,
+    pub(crate) bootstrap_factory: Option<Box<dyn Fn() -> I::Message>>,
+    pub(crate) marker: PhantomData<fn(Outbound) -> Outbound>,
 }
 
 impl<I, S, Msg, Outbound> ErasedSpawn<S> for RestartableSpawnAdapter<I, Outbound>
