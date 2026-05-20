@@ -6,8 +6,9 @@ This file records completed work.
 
 ### Phase 117 Local I/O, Codec, And IPC Parity
 
-First slice of the Wave A local I/O / codec / IPC parity work
-(`.intent/phases/117-local-io-codec-ipc-parity`).
+Wave A local I/O / codec / IPC parity
+(`.intent/phases/117-local-io-codec-ipc-parity`). Supported targets are
+Linux and macOS; Windows waits on a `betelgeuse` Windows backend.
 
 **Core**
 
@@ -17,45 +18,67 @@ First slice of the Wave A local I/O / codec / IPC parity work
   preserved (no hidden read-whole-file path), the helpers refuse a
   zero per-call budget at construction, and terminal reports name
   whether the loop ended by `Done`, `Eof`, `CapReached`, `Error`, or
-  `StuckWrite` along with bytes transferred and final offset.
+  `StuckWrite` along with bytes transferred, final offset, and the
+  total requested (stable across partial-write drains). `FileCopyBounded`
+  dispatches read/write legs via `next_leg`; calling the wrong leg is a
+  caught programmer error.
 - Unix-domain socket rails added to `tina-runtime` and `tina-sim`:
   `unix_bind` / `unix_accept` / `unix_connect` / `unix_read` /
   `unix_write` / `unix_close_listener` / `unix_close_stream`. New
   distinct `UnixListenerId` / `UnixStreamId` resource types, new
   `CallKind` variants `UnixBind`…`UnixStreamClose` appended to the
-  stable trace-hash mapping (tags 42..=48; existing tags preserved).
-- Simulator implements the full Unix-domain byte-stream pair model:
-  `unix_bind` opens a listener, the next `unix_connect` at the same
-  path allocates a paired client/server stream and resolves any
-  parked accept. Reads block until peer writes; writes append to peer
-  inbound with a configurable cap, modelling kernel-style short
-  writes. Stream close cancels in-flight peer reads/writes and wakes
-  the peer with EOF.
-- The live driver returns typed `CallError::Unsupported` for every
-  Unix-rail variant on every platform in this slice. An honest
-  deferral, not a cfg-silent omission — non-Unix callers see the same
-  typed answer. Live OS-Unix-domain support is named as future work.
+  stable trace-hash mapping (tags 42..=48; existing tags preserved and
+  pinned by a golden test).
+- **Live OS-backed Unix lane** (`tina-runtime/src/driver/unix.rs`): on
+  Unix platforms a single worker thread owns every `UnixListener` /
+  `UnixStream` as a non-blocking socket and drives a bounded poll loop;
+  the runtime assigns ids and enforces accept/read/write lane
+  discipline (`ResourceBusy`) and `InvalidResource` synchronously.
+  Closing a listener removes its socket file and refuses parked
+  connects; closing a stream cancels its pending ops and wakes the
+  peer with EOF. On non-Unix platforms the lane reports typed
+  `CallError::Unsupported`, and the runtime capability table names
+  `unix` accordingly — no cfg-silent omission.
+- Simulator implements the full Unix-domain byte-stream pair model with
+  symmetric accept/connect parking: a connect to a bound-but-not-yet-
+  accepting listener parks and resolves against the arriving accept (and
+  vice versa); a connect to an unbound path is typed `NotFound`. Reads
+  block until the peer writes; writes append to peer inbound under a
+  configurable cap (kernel-style short writes); stream close wakes the
+  peer with EOF; listener close refuses parked connects with a typed
+  error.
 
 **Codec battery**
 
-- New `tina-codec` crate with `LineFramer`, `LengthDelimitedFramer`,
-  and `FrameDecision::{NeedMore, Frame, Malformed, Full}`. Both
-  framers are pure sync state machines living on the caller's
-  isolate. Bounded buffers: lines and frames over the configured cap
-  are rejected before allocation (`Full`); embedded NUL bytes in the
-  line framer are typed as `Malformed` when opted in; the
-  length-delimited framer rejects oversized declared bodies before
-  any body byte enters the buffer.
+- New `tina-codec` crate with `LineFramer`, `LengthDelimitedFramer`, a
+  sealed `Framer` trait, and `FrameDecision::{NeedMore, Frame,
+  Malformed, Full}`. Both framers are pure sync state machines living
+  on the caller's isolate. Bounded buffers: lines and frames over the
+  configured cap are rejected before allocation (`Full`); embedded NUL
+  bytes in the line framer are typed as `Malformed` when opted in; the
+  length-delimited framer rejects oversized declared bodies before any
+  body byte enters the buffer. `LengthPrefix::decode_length` peeks an
+  announced length without owning a parser. The crate is pure-`std` and
+  portable. Compile-fail fixtures pin that `Framer` stays sealed and the
+  decoded frame stays typed bytes, not stringly.
 
 **Specimen**
 
-- `examples/specimen_local_io_codec_ipc` ships three flows in one
-  binary: file-ingest (bounded streaming via `FileReadChunks`),
-  admin-socket (line-framed local IPC over the simulator Unix
-  pair), and framed-keyspace (length-prefixed mini-keyspace
-  protocol). Each has a smoke command and a bad-input proof
-  (`CapReached`, oversized line, oversized declared frame). The
-  bundled tests pin live-driver `Unsupported` as the honest deferral.
+- `examples/specimen_local_io_codec_ipc` ships flows in one binary:
+  file-ingest and bounded file-copy (via `FileReadChunks` /
+  `FileCopyBounded`), admin-socket (line-framed local IPC over the
+  simulator Unix pair, with bounded write back-off), framed-keyspace
+  (length-prefixed mini-keyspace), and a live-unix smoke that drives the
+  real runtime (binding a true socket on Unix). Each flow has a smoke
+  command and a bad-input proof (`CapReached`, oversized line, oversized
+  declared frame).
+
+**Tests**
+
+- Live `LocalSystem` Unix echo round-trip; focused simulator tests for
+  connect/accept parking, wrong-resource typed errors, peer-close-while-
+  read EOF settling, and listener-close refusing a parked connect; a
+  golden `CallKind` tag-stability test; codec compile-fail fixtures.
 
 ### HTTP/2 And Multi-Shard Fairness Hardening (second pass)
 

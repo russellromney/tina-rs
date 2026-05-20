@@ -9,3 +9,8 @@ repository = "https://github.com/russellromney/tina-rs"
 
 [lib]
 path = "src/lib.rs"
+
+[dev-dependencies]
+# Compile-fail fixtures pin that the `Framer` trait stays sealed and the
+# codec adapter state stays typed (not stringly).
+trybuild = "1"

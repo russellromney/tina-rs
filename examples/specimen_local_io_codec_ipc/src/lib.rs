@@ -9,16 +9,16 @@
 //!   Unix-domain sockets in the simulator using
 //!   `tina_codec::LengthDelimitedFramer`.
 //!
-//! The simulator backs the IPC specimens because the live Unix-domain
-//! driver returns typed `Unsupported` in this slice (see Phase 117
-//! plan: "honest deferrals"). Live Unix support is named explicitly
-//! in [crate::live_unix_unsupported_smoke] so non-Unix CI sees the
-//! same typed result.
+//! The IPC specimens run on the deterministic simulator so the framed
+//! protocol logic is replayable. The live OS-backed Unix-domain rail is
+//! exercised separately by [crate::live_unix_smoke], which drives the
+//! real runtime — binding a true socket on Unix, typed `Unsupported`
+//! off Unix.
 
 pub mod admin_socket;
 pub mod file_ingest;
 pub mod framed_keyspace;
-pub mod live_unix_unsupported_smoke;
+pub mod live_unix_smoke;
 
 /// What a specimen run accomplished.
 #[derive(Debug, Clone, PartialEq, Eq)]

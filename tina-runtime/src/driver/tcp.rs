@@ -421,21 +421,18 @@ impl BetelgeuseTcp {
                 call_id,
                 result: CallOutput::Failed(CallError::Unsupported),
             }),
-            // Phase 117 local-IPC parity: Unix-domain rails ship a typed
-            // `Unsupported` from the live driver. The simulator implements
-            // the full byte-stream semantics; live OS Unix sockets are an
-            // honest deferral. Non-Unix platforms see the same typed answer
-            // — no cfg-silent omission.
+            // Unix-domain rails are routed to the dedicated `UnixLane` in
+            // the driver dispatcher before reaching the TCP lane, so they
+            // never arrive here. The arm keeps the match total.
             CallInput::UnixBind { .. }
             | CallInput::UnixAccept { .. }
             | CallInput::UnixConnect { .. }
             | CallInput::UnixRead { .. }
             | CallInput::UnixWrite { .. }
             | CallInput::UnixListenerClose { .. }
-            | CallInput::UnixStreamClose { .. } => Some(DriverCompletion {
-                call_id,
-                result: CallOutput::Failed(CallError::Unsupported),
-            }),
+            | CallInput::UnixStreamClose { .. } => {
+                unreachable!("Unix-domain calls are routed to the dedicated unix lane")
+            }
         }
     }
 

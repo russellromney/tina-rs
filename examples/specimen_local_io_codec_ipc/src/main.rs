@@ -1,11 +1,15 @@
 use specimen_local_io_codec_ipc::{
-    SpecimenReport, admin_socket, file_ingest, framed_keyspace, live_unix_unsupported_smoke,
+    SpecimenReport, admin_socket, file_ingest, framed_keyspace, live_unix_smoke,
 };
 
 fn main() -> anyhow::Result<()> {
     let mode = std::env::args().nth(1).unwrap_or_else(|| "all".to_string());
     let reports: Vec<SpecimenReport> = match mode.as_str() {
-        "file-ingest" => vec![file_ingest::smoke(), file_ingest::bad_input_cap_reached()],
+        "file-ingest" => vec![
+            file_ingest::smoke(),
+            file_ingest::bad_input_cap_reached(),
+            file_ingest::copy_smoke(),
+        ],
         "admin-socket" => vec![
             admin_socket::smoke(),
             admin_socket::bad_input_line_too_long(),
@@ -14,15 +18,16 @@ fn main() -> anyhow::Result<()> {
             framed_keyspace::smoke(),
             framed_keyspace::bad_input_frame_too_large(),
         ],
-        "live-unix" => vec![live_unix_unsupported_smoke::smoke()],
+        "live-unix" => vec![live_unix_smoke::smoke()],
         "all" => vec![
             file_ingest::smoke(),
             file_ingest::bad_input_cap_reached(),
+            file_ingest::copy_smoke(),
             admin_socket::smoke(),
             admin_socket::bad_input_line_too_long(),
             framed_keyspace::smoke(),
             framed_keyspace::bad_input_frame_too_large(),
-            live_unix_unsupported_smoke::smoke(),
+            live_unix_smoke::smoke(),
         ],
         other => anyhow::bail!(
             "unknown mode {other:?}; expected one of file-ingest | admin-socket | framed-keyspace | live-unix | all"

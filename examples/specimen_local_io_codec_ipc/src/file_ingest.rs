@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 use tina::{Context, Effect, Isolate, Outbound, Shard, ShardId};
 use tina_runtime::{
     CallError, FileId, FileLoopEnd, FileLoopReport, FileLoopStep, FileOpenOptions, FileReadChunks,
-    FileReadReply, RuntimeCall, file_close, file_open,
+    FileReadReply, FileWriteReply, RuntimeCall, file_close, file_open,
 };
 use tina_sim::{Simulator, SimulatorConfig};
 
@@ -271,5 +271,197 @@ pub fn bad_input_cap_reached() -> SpecimenReport {
         // CapReached without lying about completion.
         ok: matches!(result.helper.end, FileLoopEnd::CapReached) && result.bytes.len() == 8,
         note: format!("end={:?} bytes={}", result.helper.end, result.bytes.len()),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// FileCopyBounded: pump bytes src -> dst, bounded, with explicit
+// read/write leg dispatch via `next_leg`.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug)]
+enum CopyMsg {
+    Start,
+    SrcOpened(Result<FileId, CallError>),
+    DstOpened(Result<FileId, CallError>),
+    Read(FileReadReply),
+    Wrote(FileWriteReply),
+    DstReadBack(FileReadReply),
+    Closed,
+}
+
+type CopyFinishedSlot = Arc<Mutex<Option<FileLoopReport>>>;
+type CopyContentsSlot = Arc<Mutex<Vec<u8>>>;
+
+struct CopyPump {
+    src_path: PathBuf,
+    dst_path: PathBuf,
+    chunk: usize,
+    cap: u64,
+    src: Option<FileId>,
+    dst: Option<FileId>,
+    pump: Option<tina_runtime::FileCopyBounded>,
+    finished: CopyFinishedSlot,
+    dst_contents: CopyContentsSlot,
+}
+
+impl CopyPump {
+    fn drive(&mut self) -> Effect<Self> {
+        use tina_runtime::CopyLeg;
+        let pump = self.pump.as_ref().expect("pump armed");
+        match pump.next_leg() {
+            CopyLeg::Read => pump
+                .next_effect_read(CopyMsg::Read)
+                .unwrap_or_else(tina::noop),
+            CopyLeg::Write => pump
+                .next_effect_write(CopyMsg::Wrote)
+                .unwrap_or_else(tina::noop),
+            CopyLeg::Done => {
+                self.finish(self.pump.as_ref().unwrap().report(FileLoopEnd::CapReached))
+            }
+        }
+    }
+
+    fn finish(&mut self, report: FileLoopReport) -> Effect<Self> {
+        *self.finished.lock().unwrap() = Some(report);
+        self.pump = None;
+        // Read the destination back to prove the bytes actually landed.
+        let dst = self.dst.expect("dst open");
+        tina_runtime::file_read_at(dst, 4096, 0).then(CopyMsg::DstReadBack)
+    }
+}
+
+impl Isolate for CopyPump {
+    type Message = CopyMsg;
+    type Reply = ();
+    type Send = Outbound<Infallible>;
+    type Spawn = Infallible;
+    type SpawnObserved = Infallible;
+    type Call = RuntimeCall<CopyMsg>;
+    type Fact = Infallible;
+    type Shard = IngestShard;
+
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
+        match msg {
+            CopyMsg::Start => file_open(self.src_path.clone(), FileOpenOptions::read_only())
+                .then(CopyMsg::SrcOpened),
+            CopyMsg::SrcOpened(Ok(src)) => {
+                self.src = Some(src);
+                file_open(
+                    self.dst_path.clone(),
+                    FileOpenOptions::read_write_create_truncate(),
+                )
+                .then(CopyMsg::DstOpened)
+            }
+            CopyMsg::SrcOpened(Err(_)) => Effect::Stop,
+            CopyMsg::DstOpened(Ok(dst)) => {
+                self.dst = Some(dst);
+                self.pump = Some(tina_runtime::FileCopyBounded::new(
+                    self.src.expect("src"),
+                    dst,
+                    0,
+                    0,
+                    self.chunk,
+                    self.cap,
+                ));
+                self.drive()
+            }
+            CopyMsg::DstOpened(Err(_)) => Effect::Stop,
+            CopyMsg::Read(reply) => {
+                let pump = self.pump.as_mut().expect("pump armed");
+                match pump.record_read(reply) {
+                    Ok(_leg) => self.drive(),
+                    Err(report) => self.finish(report),
+                }
+            }
+            CopyMsg::Wrote(reply) => {
+                let pump = self.pump.as_mut().expect("pump armed");
+                match pump.record_write(reply) {
+                    Ok(_leg) => self.drive(),
+                    Err(report) => self.finish(report),
+                }
+            }
+            CopyMsg::DstReadBack(Ok(bytes)) => {
+                *self.dst_contents.lock().unwrap() = bytes;
+                let mut effects = Vec::new();
+                if let Some(src) = self.src.take() {
+                    effects.push(file_close(src).then(|_| CopyMsg::Closed));
+                }
+                if let Some(dst) = self.dst.take() {
+                    effects.push(file_close(dst).then(|_| CopyMsg::Closed));
+                }
+                match effects.len() {
+                    0 => Effect::Stop,
+                    _ => tina::batch(effects),
+                }
+            }
+            CopyMsg::DstReadBack(Err(_)) => Effect::Stop,
+            CopyMsg::Closed => Effect::Stop,
+        }
+    }
+}
+
+/// Result of a bounded copy run.
+#[derive(Debug, Clone)]
+pub struct CopyRun {
+    /// The destination file contents after the copy.
+    pub dst_contents: Vec<u8>,
+    /// The terminal copy report.
+    pub report: FileLoopReport,
+}
+
+/// Seed `payload` at a source path, then bounded-copy it to a
+/// destination path via [`tina_runtime::FileCopyBounded`].
+pub fn run_copy(payload: Vec<u8>, chunk: usize, cap: u64) -> CopyRun {
+    let src_path = PathBuf::from("/tmp/specimen_file_copy_src.dat");
+    let dst_path = PathBuf::from("/tmp/specimen_file_copy_dst.dat");
+    let mut config = SimulatorConfig::default();
+    config.tcp.pending_completion_capacity = 64;
+    let mut sim = Simulator::new(IngestShard, config);
+    seed_file(&mut sim, &src_path, payload);
+
+    let finished: CopyFinishedSlot = Arc::new(Mutex::new(None));
+    let dst_contents: CopyContentsSlot = Arc::new(Mutex::new(Vec::new()));
+    let pump = CopyPump {
+        src_path,
+        dst_path,
+        chunk,
+        cap,
+        src: None,
+        dst: None,
+        pump: None,
+        finished: Arc::clone(&finished),
+        dst_contents: Arc::clone(&dst_contents),
+    };
+    let addr = sim.register(pump);
+    sim.try_send(addr, CopyMsg::Start).unwrap();
+    sim.run_until_quiescent();
+
+    CopyRun {
+        dst_contents: dst_contents.lock().unwrap().clone(),
+        report: finished.lock().unwrap().clone().expect("copy finished"),
+    }
+}
+
+/// Smoke for the bounded copy pump: copy a payload smaller than the cap
+/// end to end and confirm the destination matches.
+pub fn copy_smoke() -> SpecimenReport {
+    let payload = b"copy me through a bounded two-FD pump".to_vec();
+    let result = run_copy(payload.clone(), 8, 1024);
+    SpecimenReport {
+        name: "file_copy",
+        bytes: result.report.bytes_transferred,
+        frames: 1,
+        ok: matches!(result.report.end, FileLoopEnd::Eof) && result.dst_contents == payload,
+        note: format!(
+            "end={:?} transferred={} dst_len={}",
+            result.report.end,
+            result.report.bytes_transferred,
+            result.dst_contents.len(),
+        ),
     }
 }

@@ -1,9 +1,7 @@
 //! Specimen acceptance tests: each smoke path and each bad-input proof
 //! must pass.
 
-use specimen_local_io_codec_ipc::{
-    admin_socket, file_ingest, framed_keyspace, live_unix_unsupported_smoke,
-};
+use specimen_local_io_codec_ipc::{admin_socket, file_ingest, framed_keyspace, live_unix_smoke};
 
 #[test]
 fn file_ingest_smoke() {
@@ -19,6 +17,13 @@ fn file_ingest_cap_reached_is_reported() {
         report.ok,
         "file_ingest must surface CapReached honestly, not silently succeed: {report:?}"
     );
+}
+
+#[test]
+fn file_copy_round_trips_through_bounded_pump() {
+    let report = file_ingest::copy_smoke();
+    assert!(report.ok, "bounded file copy failed: {report:?}");
+    assert!(report.bytes > 0);
 }
 
 #[test]
@@ -53,15 +58,12 @@ fn framed_keyspace_rejects_oversize_frame() {
     );
 }
 
-/// Live Unix-domain rails return typed `Unsupported` from the live
-/// driver this slice. This is an honest deferral. The smoke drives the
-/// real `LocalSystem` runtime and asserts the typed answer, so a
-/// regression that silently changes the live deferral fails here.
+/// Drives the live runtime through a `unix_bind` / `unix_close_listener`
+/// cycle. On Unix the OS-backed lane must bind+close cleanly; off Unix
+/// the contract is typed `Unsupported`. Either is a pass for its
+/// platform, so this fails closed if the live rail regresses.
 #[test]
-fn live_unix_unsupported_pin() {
-    let report = live_unix_unsupported_smoke::smoke();
-    assert!(
-        report.ok,
-        "live unix_bind must report typed Unsupported: {report:?}"
-    );
+fn live_unix_smoke_runs_on_this_platform() {
+    let report = live_unix_smoke::smoke();
+    assert!(report.ok, "live unix smoke failed: {report:?}");
 }

@@ -1,9 +1,13 @@
-//! Live Unix-domain rail deferral smoke. This slice ships typed
-//! `CallError::Unsupported` from the live driver for the new Unix rails
-//! on every platform. Future work will swap that for a real OS-backed
-//! implementation; until then this smoke drives the **live** runtime
-//! (not the simulator) and asserts the typed answer, so a regression
-//! that silently changes the deferral is caught.
+//! Live Unix-domain rail smoke. Drives the **live** runtime (not the
+//! simulator) through one `unix_bind` / `unix_close_listener` cycle and
+//! reports what the live driver does:
+//!
+//! - On Unix platforms the live OS-backed lane binds a real socket and
+//!   the smoke reports success.
+//! - On non-Unix platforms there is no backend; `unix_bind` completes
+//!   with typed `CallError::Unsupported`, and the smoke reports that the
+//!   capability is honestly named (still `ok`, because the typed answer
+//!   is the contract on that platform).
 
 use std::collections::VecDeque;
 use std::convert::Infallible;
@@ -13,6 +17,7 @@ use std::time::{Duration, Instant};
 use tina::{Context, Effect, Isolate, Mailbox, Outbound, Shard, ShardId, TrySendError, noop};
 use tina_runtime::{
     CallError, LocalSystem, MailboxFactory, RuntimeCall, UnixBindReply, UnixListenerId, unix_bind,
+    unix_close_listener,
 };
 
 use crate::SpecimenReport;
@@ -75,12 +80,17 @@ impl MailboxFactory for ProbeMailboxFactory {
 enum Msg {
     Start,
     Bound(UnixBindReply),
+    Closed(Result<(), CallError>),
 }
 
+/// Outcome the probe records: the bind result mapped to keep just the
+/// success/error shape, and whether close succeeded (Unix only).
+type Observed = Arc<Mutex<Option<Result<(), CallError>>>>;
+
 struct Probe {
-    /// `Some(result)` once `unix_bind` resolves, mapping the success
-    /// payload away so the slot is `Result<(), CallError>`.
-    observed: Arc<Mutex<Option<Result<UnixListenerId, CallError>>>>,
+    path: std::path::PathBuf,
+    listener: Option<UnixListenerId>,
+    observed: Observed,
 }
 
 impl Isolate for Probe {
@@ -99,24 +109,34 @@ impl Isolate for Probe {
         _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
     ) -> Effect<Self> {
         match msg {
-            Msg::Start => unix_bind("/tmp/specimen_live_unsupported.sock").then(Msg::Bound),
-            Msg::Bound(reply) => {
-                *self.observed.lock().expect("observed lock") =
-                    Some(reply.map(|(listener, _path)| listener));
+            Msg::Start => unix_bind(self.path.clone()).then(Msg::Bound),
+            Msg::Bound(Ok((listener, _path))) => {
+                self.listener = Some(listener);
+                unix_close_listener(listener).then(Msg::Closed)
+            }
+            Msg::Bound(Err(error)) => {
+                *self.observed.lock().expect("observed lock") = Some(Err(error));
+                noop()
+            }
+            Msg::Closed(result) => {
+                *self.observed.lock().expect("observed lock") = Some(result);
                 noop()
             }
         }
     }
 }
 
-/// Drives the live runtime, issues one `unix_bind`, and reports whether
-/// it observed the typed `Unsupported` deferral.
+/// Drives the live runtime and reports the live Unix rail behavior.
 pub fn smoke() -> SpecimenReport {
-    let observed = Arc::new(Mutex::new(None));
+    let path = std::env::temp_dir().join(format!("specimen-live-unix-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let observed: Observed = Arc::new(Mutex::new(None));
     let app = LocalSystem::single_shard(ProbeShard, ProbeMailboxFactory).build();
     let address = app
         .register_root::<Probe, Infallible>(
             Probe {
+                path: path.clone(),
+                listener: None,
                 observed: Arc::clone(&observed),
             },
             8,
@@ -124,7 +144,6 @@ pub fn smoke() -> SpecimenReport {
         .expect("register probe");
     app.try_send(address, Msg::Start).expect("start probe");
 
-    // Bounded wait for the live completion to land.
     let deadline = Instant::now() + Duration::from_secs(5);
     while observed.lock().expect("observed lock").is_none() {
         if Instant::now() > deadline {
@@ -134,13 +153,27 @@ pub fn smoke() -> SpecimenReport {
     }
     let result = *observed.lock().expect("observed lock");
     let _ = app.shutdown().drain().join();
+    let _ = std::fs::remove_file(&path);
 
-    let saw_unsupported = matches!(result, Some(Err(CallError::Unsupported)));
+    // On Unix the live lane must bind+close cleanly. On non-Unix the
+    // contract is typed `Unsupported`. Either is a passing smoke for
+    // the platform it runs on.
+    let (ok, note) = if cfg!(unix) {
+        (
+            result == Some(Ok(())),
+            format!("live unix bind+close returned {result:?} (expected Ok on Unix)"),
+        )
+    } else {
+        (
+            result == Some(Err(CallError::Unsupported)),
+            format!("live unix_bind returned {result:?} (expected Unsupported off Unix)"),
+        )
+    };
     SpecimenReport {
-        name: "live_unix_unsupported_smoke",
+        name: "live_unix_smoke",
         bytes: 0,
         frames: 0,
-        ok: saw_unsupported,
-        note: format!("live unix_bind returned {result:?} (expected Unsupported)"),
+        ok,
+        note,
     }
 }

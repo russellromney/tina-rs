@@ -2,12 +2,14 @@
 
 Specimen for Phase 117 (Local I/O, Codec, and IPC Parity).
 
-Three flows, one binary:
+Flows, one binary:
 
 - `file-ingest` — bounded file streaming via
-  `tina_runtime::FileReadChunks`. Smoke run reads a small payload; the
-  bad-input proof exercises a cap shorter than the file and asserts
-  `FileLoopEnd::CapReached` instead of a silent truncation.
+  `tina_runtime::FileReadChunks`, plus a bounded `FileCopyBounded`
+  pump that copies src→dst and reads the destination back. The smoke
+  reads a small payload and copies one; the bad-input proof exercises
+  a cap shorter than the file and asserts `FileLoopEnd::CapReached`
+  instead of a silent truncation.
 - `admin-socket` — local admin sidecar over a simulator Unix-domain
   socket pair with line-delimited commands from
   `tina_codec::LineFramer`. Smoke run sends three commands; the
@@ -18,12 +20,14 @@ Three flows, one binary:
   `set`/`get`; the bad-input proof feeds a frame whose declared
   length exceeds the configured cap and asserts the framer rejects
   before allocation.
+- `live-unix` — drives the **live** runtime through one
+  `unix_bind` / `unix_close_listener` cycle. On Unix the live
+  OS-backed lane binds a real socket; off Unix the call returns typed
+  `CallError::Unsupported`. Either is a pass for its platform.
 
-A fourth subcommand `live-unix` runs the simulator-side smoke and
-points at the matching live-driver "typed `Unsupported`" deferral.
-Live Unix-domain rails ship typed `Unsupported` from the live driver
-in this slice; the simulator implements the full byte-stream
-semantics.
+The IPC flows run on the deterministic simulator so the framed
+protocol logic is replayable; `live-unix` exercises the real
+OS-backed rail.
 
 ## Run
 
@@ -31,6 +35,7 @@ semantics.
 cargo run -p specimen-local-io-codec-ipc -- file-ingest
 cargo run -p specimen-local-io-codec-ipc -- admin-socket
 cargo run -p specimen-local-io-codec-ipc -- framed-keyspace
+cargo run -p specimen-local-io-codec-ipc -- live-unix
 cargo run -p specimen-local-io-codec-ipc -- all
 ```
 
