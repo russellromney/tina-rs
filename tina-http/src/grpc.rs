@@ -1051,7 +1051,7 @@ pub fn encode_grpc_message<T: Message>(
     Ok(out)
 }
 
-fn decode_one_grpc_message<T: Message + Default>(
+pub(crate) fn decode_one_grpc_message<T: Message + Default>(
     body: &[u8],
     cursor: &mut usize,
     limits: GrpcLimits,
@@ -1350,6 +1350,21 @@ fn grpc_request_headers(path: &str) -> Vec<u8> {
     literal("content-type", "application/grpc+proto", &mut block);
     literal("te", "trailers", &mut block);
     block
+}
+
+/// Read a [`GrpcStatus`] from an already-decoded header/trailer map (the
+/// shape the native HTTP/2 client hands back), checking `grpc-status` and
+/// optional `grpc-message`. Returns `None` when there is no `grpc-status`
+/// at all, so the caller can tell "not a gRPC response" apart from a
+/// malformed one.
+pub(crate) fn grpc_status_from_header_map(headers: &http::HeaderMap) -> Option<GrpcStatus> {
+    let raw = headers.get("grpc-status")?.to_str().ok()?;
+    let code = GrpcStatusCode::from_u16(raw.trim().parse::<u16>().ok()?);
+    let message = headers
+        .get("grpc-message")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| percent_decode_grpc_message(v).ok());
+    Some(GrpcStatus { code, message })
 }
 
 fn decode_grpc_status_trailers(block: &[u8]) -> Result<GrpcStatus, GrpcError> {

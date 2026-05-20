@@ -79,15 +79,25 @@
 //! buffered under explicit byte caps for ordinary unary services.
 //! gRPC requests can be exposed through an HTTP/2 pull source, and
 //! responses can stream from Tina chunk sources with DATA flow-control
-//! and real trailers. It is not an HTTPS/2 or ALPN claim, not a full
-//! client, and not a full RFC feature clone.
+//! and real trailers. It is not an HTTPS/2 or ALPN claim and not a full
+//! RFC feature clone.
 //!
-//! gRPC: [`GrpcRouter`] layers unary, server-streaming, client-streaming,
-//! and first bidirectional streaming `prost` messages with typed
-//! [`GrpcStatus`] trailers on that HTTP/2 h2c server. It rejects
-//! compression, caps message bytes before protobuf decode, maps service call
-//! timeout to `DeadlineExceeded`, and keeps interceptors, reflection,
-//! production pooled clients, and TLS ALPN out of this first form.
+//! HTTP/2 client: [`Http2ClientConnection`] is a native client isolate
+//! over one TCP stream (h2c first form) with bounded stream-slot
+//! admission, typed [`Http2ClientOutcome`], outbound flow-control
+//! pacing, and outbound-direction protocol facts. A TLS target resolves
+//! to [`Http2ClientOutcome::TlsAlpnMismatch`] until the ALPN rail lands.
+//!
+//! gRPC: [`GrpcRouter`] is the server. [`GrpcClient`] is the native
+//! client — Tina is a native gRPC client, not only a server. The server
+//! layers unary, server-streaming, client-streaming, and bidirectional
+//! streaming `prost` messages with typed [`GrpcStatus`] trailers; the
+//! client today covers the **unary** path over h2c, decoding into a
+//! typed [`GrpcUnaryOutcome`] where a non-OK status is the caller
+//! outcome (never hidden in a success) and the received status is a
+//! `GrpcFinalStatusReceived` protocol fact. Both reject compression and
+//! cap message bytes. Streaming gRPC clients, interceptors, reflection,
+//! production pooled clients, and TLS ALPN are later slices.
 //!
 //! WebSocket: [`websocket_upgrade`] validates server-side HTTP/1.1
 //! upgrades for [`HttpListener`] and [`HttpsListener`]. After the
@@ -126,6 +136,7 @@ pub mod chunked_decoder;
 pub mod client;
 pub mod connection;
 pub mod grpc;
+pub mod grpc_client;
 pub mod http2;
 pub mod keepalive;
 pub mod listener;
@@ -152,6 +163,7 @@ pub use grpc::{
     encode_grpc_message, grpc_status_trailers, grpc_stream_finish, grpc_stream_message,
     grpc_unary_call_h2c_blocking,
 };
+pub use grpc_client::{GrpcClient, GrpcTarget, GrpcUnaryOutcome};
 pub use http2::{
     AlpnProtocols, Http2ClientConnection, Http2ClientLimits, Http2ClientMsg, Http2ClientOutcome,
     Http2ClientReply, Http2ClientReport, Http2ClientRequest, Http2ClientResponse, Http2Connection,

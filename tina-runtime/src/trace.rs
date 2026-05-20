@@ -1148,6 +1148,7 @@ pub(crate) fn protocol_fact_tag(fact: ProtocolFact) -> u8 {
         ProtocolFact::WebSocketSlowPeerClosed { .. } => 6,
         ProtocolFact::WebSocketSessionClosed { .. } => 7,
         ProtocolFact::GrpcFinalStatusSent { .. } => 8,
+        ProtocolFact::GrpcFinalStatusReceived { .. } => 9,
     }
 }
 
@@ -1230,6 +1231,11 @@ fn protocol_fact_write(fact: ProtocolFact, hasher: &mut StableHasher) {
             }
         }
         ProtocolFact::GrpcFinalStatusSent {
+            connection,
+            stream,
+            status,
+        }
+        | ProtocolFact::GrpcFinalStatusReceived {
             connection,
             stream,
             status,
@@ -1919,6 +1925,11 @@ mod stable_hash_tests {
             stream: GrpcStreamId::new(0),
             status: GrpcStatusCode::Ok,
         };
+        let dummy_grpc_recv = ProtocolFact::GrpcFinalStatusReceived {
+            connection: ProtocolConnectionId::new(0),
+            stream: GrpcStreamId::new(0),
+            status: GrpcStatusCode::Ok,
+        };
 
         assert_eq!(protocol_fact_tag(dummy_http2), 1);
         assert_eq!(protocol_fact_tag(dummy_close), 2);
@@ -1928,6 +1939,7 @@ mod stable_hash_tests {
         assert_eq!(protocol_fact_tag(dummy_ws_slow), 6);
         assert_eq!(protocol_fact_tag(dummy_ws_close), 7);
         assert_eq!(protocol_fact_tag(dummy_grpc), 8);
+        assert_eq!(protocol_fact_tag(dummy_grpc_recv), 9);
     }
 
     #[test]

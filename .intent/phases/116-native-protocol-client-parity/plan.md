@@ -19,28 +19,37 @@
   outbound client-stream protocol facts. Live tests in
   `tina-http/tests/http2_client_live.rs` prove h2c GET, h2c POST,
   typed TlsAlpnMismatch, route-key shape, and method/path round-trip.
+- **Native gRPC unary client landed.** `GrpcClient` over
+  `Http2ClientConnection` with `GrpcTarget` and a typed
+  `GrpcUnaryOutcome` (Ok / Status / Transport / Malformed); a non-OK
+  status is the caller outcome, never a hidden success. Received status
+  is emitted as `ProtocolFact::GrpcFinalStatusReceived` (trace tag 9,
+  paired with `GrpcFinalStatusSent`). Live tests, two compile-fail
+  proofs, specimen rewritten onto the native client (OK + non-OK +
+  cancel), and docs updated off `grpc_unary_call_h2c_blocking`.
+- **`Http2ClientMsg::Cancel { stream_id }` landed** with outbound
+  RST_STREAM(CANCEL), `LocalCancel` outcome, and an outbound reset fact
+  (parts 3/5).
 - **Remaining work in this phase** (still future slices, named in
   *Includes* and *Proof Shape* below):
-  - Native gRPC client (`GrpcClient::unary` / `server_streaming` /
-    `client_streaming` / `bidi`) over the client connection, with
-    received `GrpcStatus` as a `ProtocolFact::GrpcFinalStatusReceived`.
+  - Streaming gRPC client (`server_streaming` / `client_streaming` /
+    `bidi`), gated on HTTP/2 client streaming bodies below.
+  - HTTP/2 client streaming request and response bodies (today's
+    client buffers both under explicit caps).
   - TLS ALPN on the runtime: thread `AlpnProtocols` through
     `CallInput::TlsConnect` / `TlsBind`, return `selected_alpn` in
     `CallOutput::TlsConnected` / `TlsAccepted`, plumb the bytes
     through rustls. The client surface already takes
     `AlpnProtocols::h2()`; today's TLS rail does not carry the bytes.
-  - HTTP/2 client streaming request and response bodies (today's
-    client buffers both under explicit caps).
-  - `Http2ClientMsg::Cancel { stream_id }` and outbound
-    RST_STREAM(CANCEL); peer reset is already typed.
   - DST replay for live client socket work (typed unsupported fact
     + saved replay case once the typed-ALPN rail lands).
   - Connection-reuse pool (idle eviction, max lifetime, health
     policy) — Phase 119, using the new
     `Http2Target::route_key()` shape.
-  - Specimen/doc updates that replace `grpc_unary_call_h2c_blocking`
-    with the copied client-isolate path (gated on the gRPC client).
-  - HTTPS/2 client compile-fail proofs for the typed gates.
+  - Tina-client → tonic-server interop (needs tonic as a `tina-http`
+    dep; deferred). Tina-client ↔ Tina-server gRPC is proven.
+  - HTTPS/2 client compile-fail proofs for the typed gates, and the
+    gRPC streaming compile-fail proofs (gated on streaming).
 - Can run in parallel with phases 117 and 118 if ownership stays in `tina-http`,
   TLS ALPN rail data, protocol facts, docs, and protocol specimens.
 - Runs before Phase 119 resource maturity. HTTP/2/gRPC client pooling needs

@@ -4,6 +4,63 @@ This file records completed work.
 
 ## Unreleased
 
+### Native gRPC Client — Unary First Form
+
+The plan's second-half keystone: Tina is now a native gRPC *client*, not
+only a server. `GrpcClient` is a thin, stateless wrapper over an
+`Http2ClientConnection` isolate — no Tokio, no hidden queue or runtime.
+
+- **`GrpcClient` + `GrpcTarget` + `GrpcUnaryOutcome`.** The unary path
+  encodes one `prost` message, submits it as one HTTP/2 stream, and
+  decodes the reply into a typed outcome where the gRPC status is
+  first-class:
+  - `Ok(Resp)` — OK status *and* a decoded response message.
+  - `Status(GrpcStatus)` — a non-OK gRPC status. A normal caller
+    outcome, never collapsed into a successful response.
+  - `Transport(Http2ClientOutcome)` — HTTP/2 transport failure before a
+    status was seen (closed, reset, protocol error, ALPN mismatch).
+  - `Malformed(GrpcError)` — reached the gRPC layer but not well-formed
+    (non-200 HTTP status, missing `grpc-status`, undecodable/oversized
+    message). `#[non_exhaustive]`.
+  Request size is capped on encode (`EncodeTooLarge`) before anything
+  reaches the wire; the response message is capped on decode.
+- **`ProtocolFact::GrpcFinalStatusReceived`.** Paired with the server's
+  `GrpcFinalStatusSent` (trace tag 9, appended). The HTTP/2 client
+  connection emits it when a stream completes carrying a `grpc-status`
+  (in trailers, or headers for a trailers-only response) — gRPC status
+  is runtime truth, not a private counter.
+- **Live proofs** (`tina-http/tests/grpc_client_live.rs`): unary OK
+  returns the decoded message; a non-OK status is `Status(NotFound)`,
+  not a success; the received status is emitted as a
+  `GrpcFinalStatusReceived` fact; an oversized request is rejected
+  before the wire.
+- **Compile-fail proofs** (doc-tests on `GrpcClient`): the unary helper
+  cannot accept a stream of messages (only a single `prost::Message`);
+  a `GrpcUnaryOutcome` cannot be treated as the response message,
+  forcing the caller to handle the status arm.
+- **Specimen updated.** `examples/specimen_grpc_counter` now drives its
+  own server with the native `GrpcClient` (the copied path), exercising
+  an OK call, a non-OK `PermissionDenied` status, and a client
+  cancellation — and proving the connection survives the cancel.
+  `run_smoke()` no longer uses `grpc_unary_call_h2c_blocking`.
+- **Docs updated.** The HTTP/gRPC user guide and the `tina-http` crate
+  doc now describe the native client path and demote
+  `grpc_unary_call_h2c_blocking` to a test-only convenience. The "native
+  gRPC is server-first" framing is gone.
+
+Deferred (named honestly, dependency-ordered):
+
+- **Streaming gRPC** (server-streaming / client-streaming / bidi)
+  depends on HTTP/2 client *streaming bodies*, which the client does not
+  have yet (it buffers). That is the next slice.
+- **h2/TLS gRPC** depends on the TLS ALPN runtime rail (also a later
+  slice); a TLS target resolves to `TlsAlpnMismatch` today.
+- **Tina-client → tonic-server interop** would need tonic as a
+  `tina-http` dependency (it is only a specimen dev-dependency today);
+  deferred rather than pulling tonic into the battery. Tina-client ↔
+  Tina-server gRPC is proven, and the existing tonic-client ↔
+  Tina-server test still passes after the shared-code split.
+
 ### Native HTTP/2 Client — Plan Audit Follow-ups
 
 A re-read of the Phase 116 plan against the shipped code surfaced three

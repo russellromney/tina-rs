@@ -1069,13 +1069,14 @@ impl<S: Shard + 'static> Http2ClientConnection<S> {
         Ok(())
     }
 
-    // NOTE for the future gRPC client: a "trailers-only" response
-    // (HEADERS with END_STREAM and no DATA — gRPC uses this to carry a
-    // non-OK status with no message frame) arrives here with
-    // `response_headers_seen` set on the first HEADERS and an empty
-    // body. The `grpc-status` value lands in `response_headers`, not
-    // `response_trailers`. That is correct HTTP/2 framing; the gRPC
-    // wrapper must check both `headers` and `trailers` for `grpc-status`.
+    // A "trailers-only" gRPC response (HEADERS with END_STREAM and no
+    // DATA — used to carry a non-OK status with no message frame)
+    // arrives here with `response_headers_seen` set on the first HEADERS
+    // and an empty body; its `grpc-status` lands in `response_headers`.
+    // A normal gRPC response carries `grpc-status` in `response_trailers`.
+    // We check both so the `GrpcFinalStatusReceived` protocol fact fires
+    // either way — the receive-side mirror of the server's
+    // `GrpcFinalStatusSent`.
     fn complete_stream(&mut self, idx: usize, effects: &mut Vec<Effect<Self>>) {
         let mut stream = self.streams.swap_remove(idx);
         let stream_id = stream.id;
@@ -1085,6 +1086,15 @@ impl<S: Shard + 'static> Http2ClientConnection<S> {
             stream: Http2StreamId::new(stream_id),
             reason: Http2CloseReason::EndStream,
         }));
+        if let Some(status) = grpc_status_from_headers(&stream.response_trailers)
+            .or_else(|| grpc_status_from_headers(&stream.response_headers))
+        {
+            effects.push(emit_fact(ProtocolFact::GrpcFinalStatusReceived {
+                connection: self.connection_fact_id(),
+                stream: tina_runtime::GrpcStreamId::new(stream_id as u64),
+                status,
+            }));
+        }
         let outcome = match stream.response_status {
             Some(status) => Http2ClientOutcome::Replied(Http2ClientResponse {
                 status,
@@ -1378,6 +1388,43 @@ fn apply_response_headers(stream: &mut ActiveClientStream, header_block: HeaderB
 
 fn emit_fact<S: Shard + 'static>(fact: ProtocolFact) -> Effect<Http2ClientConnection<S>> {
     tina::fact::<Http2ClientConnection<S>>(fact)
+}
+
+/// Read the trace-stable `grpc-status` code from a header/trailer map,
+/// if present. Returns `None` when there is no `grpc-status` (i.e. this
+/// is not a gRPC response), so the HTTP/2 layer only emits a gRPC fact
+/// for actual gRPC traffic.
+fn grpc_status_from_headers(headers: &HeaderMap) -> Option<tina_runtime::GrpcStatusCode> {
+    let value = headers.get("grpc-status")?;
+    let code: u16 = value.to_str().ok()?.trim().parse().ok()?;
+    Some(grpc_status_code_from_wire(code))
+}
+
+/// Maps a numeric gRPC status code to the trace-stable runtime enum.
+/// Unknown codes fold to `Unknown`, matching the gRPC spec's guidance
+/// for unrecognized status values.
+fn grpc_status_code_from_wire(code: u16) -> tina_runtime::GrpcStatusCode {
+    use tina_runtime::GrpcStatusCode as C;
+    match code {
+        0 => C::Ok,
+        1 => C::Cancelled,
+        2 => C::Unknown,
+        3 => C::InvalidArgument,
+        4 => C::DeadlineExceeded,
+        5 => C::NotFound,
+        6 => C::AlreadyExists,
+        7 => C::PermissionDenied,
+        8 => C::ResourceExhausted,
+        9 => C::FailedPrecondition,
+        10 => C::Aborted,
+        11 => C::OutOfRange,
+        12 => C::Unimplemented,
+        13 => C::Internal,
+        14 => C::Unavailable,
+        15 => C::DataLoss,
+        16 => C::Unauthenticated,
+        _ => C::Unknown,
+    }
 }
 
 #[cfg(test)]
