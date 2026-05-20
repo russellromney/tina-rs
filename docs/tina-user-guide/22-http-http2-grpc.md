@@ -65,13 +65,58 @@ requires `I::Fact: IntoRuntimeFact`; the bundled `ProtocolFact` impl
 covers this. Any user-defined fact type must implement `IntoRuntimeFact`
 or registration is a compile error.
 
+## Native gRPC client (unary)
+
+Tina is a native gRPC client, not only a server. `GrpcClient` sits over
+an `Http2ClientConnection` isolate — no Tokio, no hidden queue. The
+unary path encodes one `prost` message, submits it as one HTTP/2 stream,
+and decodes the reply into a typed `GrpcUnaryOutcome` where the gRPC
+status is first-class:
+
+```rust,ignore
+use tina_http::{GrpcClient, GrpcLimits, GrpcUnaryOutcome,
+    Http2ClientConnection, Http2ClientMsg, Http2Target};
+
+// 1. Register a connection isolate to the target authority and Begin it.
+let target = Http2Target::H2c { authority: "svc".into(), addr };
+let conn = runtime.register_with_capacity::<Http2ClientConnection<S>, _>(
+    Http2ClientConnection::new(target, Default::default()), 32)?;
+runtime.try_send(conn, Http2ClientMsg::Begin)?;
+
+// 2. A GrpcClient is a thin wrapper over that connection.
+let client = GrpcClient::new(conn, GrpcLimits::default());
+
+// 3. Build the submit, call the connection, decode the outcome.
+let submit = client.unary_request("/pkg.Service/Method", &request_msg)?;
+let CallOutcome::Replied(reply) =
+    runtime.call_blocking(client.connection(), submit, timeout)?
+else { /* host call timed out / target gone */ return; };
+match client.unary_outcome_from_reply::<ReplyMsg>(reply) {
+    GrpcUnaryOutcome::Ok(msg) => { /* OK status + decoded message */ }
+    GrpcUnaryOutcome::Status(status) => { /* non-OK gRPC status */ }
+    GrpcUnaryOutcome::Transport(t) => { /* HTTP/2 transport failure */ }
+    GrpcUnaryOutcome::Malformed(e) => { /* not well-formed gRPC */ }
+}
+```
+
+A non-OK status is `GrpcUnaryOutcome::Status`, never hidden inside a
+successful response. The received status is emitted as a
+`ProtocolFact::GrpcFinalStatusReceived` fact — the receive-side mirror
+of the server's `GrpcFinalStatusSent`.
+
+Server-streaming, client-streaming, and bidi clients need the HTTP/2
+client's streaming-body support and are a later slice. h2/TLS gRPC
+clients need the TLS ALPN rail (also a later slice); a TLS target today
+resolves to `Http2ClientOutcome::TlsAlpnMismatch`.
+
 ## What does NOT emit facts
 
-- Blocking host helpers. `grpc_unary_call_h2c_blocking` is a
-  convenience client that hits an HTTP/2 listener directly. It is not
-  a Tina isolate. It does not emit replay facts. Reports still count
-  outbound traffic; replay is silent on this path until Tina has a
-  native gRPC client isolate.
+- Blocking host helpers. `grpc_unary_call_h2c_blocking` is a test-only
+  convenience that hits an HTTP/2 listener directly with synchronous
+  socket code. It is not a Tina isolate and emits no replay facts.
+  **Prefer the native `GrpcClient` path above** — it runs on the
+  runtime's TCP rail and emits `GrpcFinalStatusReceived`. The blocking
+  helper remains only for quick host scripts and tests.
 - Test-only helpers. Facts only ride real protocol code, never test
   shims.
 

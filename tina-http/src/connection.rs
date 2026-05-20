@@ -2267,6 +2267,7 @@ fn response_for_call_error(error: &CallError) -> HttpResponse {
         | CallError::TlsCertificate
         | CallError::TlsName
         | CallError::TlsHandshake
+        | CallError::TlsAlpnMismatch
         | CallError::SignalFull
         | CallError::SignalClosed
         | CallError::ProcessFull

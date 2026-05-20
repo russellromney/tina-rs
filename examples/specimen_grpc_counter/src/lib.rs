@@ -6,13 +6,16 @@ use std::time::Duration;
 use prost::Message;
 use tina::prelude::*;
 use tina_http::{
-    GrpcClientStreamingRequest, GrpcLimits, GrpcRequest, GrpcRequestStream, GrpcResponse,
-    GrpcRouter, GrpcRouterMsg, GrpcServerStreamingResponse, GrpcStatus, GrpcStatusCode,
-    GrpcStreamReply, GrpcStreamingCall, GrpcStreamingResponse, Http2Listener, Http2ListenerMsg,
-    Http2ServerConfig, ResponseChunkMsg, ResponseChunkReply, grpc_stream_finish,
-    grpc_stream_message, grpc_unary_call_h2c_blocking,
+    GrpcClient, GrpcClientStreamingRequest, GrpcLimits, GrpcRequest, GrpcRequestStream,
+    GrpcResponse, GrpcRouter, GrpcRouterMsg, GrpcServerStreamingResponse, GrpcStatus,
+    GrpcStatusCode, GrpcStreamReply, GrpcStreamingCall, GrpcStreamingResponse, GrpcUnaryOutcome,
+    Http2ClientConnection, Http2ClientLimits, Http2ClientMsg, Http2Listener, Http2ListenerMsg,
+    Http2ServerConfig, Http2Target, ResponseChunkMsg, ResponseChunkReply, grpc_stream_finish,
+    grpc_stream_message,
 };
-use tina_runtime::{DefaultThreadedMailboxFactory, ThreadedRuntime, ThreadedRuntimeConfig};
+use tina_runtime::{
+    CallOutcome, DefaultThreadedMailboxFactory, ThreadedRuntime, ThreadedRuntimeConfig,
+};
 
 const STREAMING_SOURCE_CAPACITY: usize = 16;
 
@@ -58,6 +61,100 @@ impl SpecimenServer {
             .map(|_| ())
             .map_err(|error| format!("shutdown: {error:?}"))
     }
+
+    /// Exercise the native gRPC client (no Tokio, no blocking helper):
+    /// one unary OK call, one non-OK status call, and one client
+    /// cancellation, all over a single `Http2ClientConnection` isolate.
+    /// This is the copied path users should follow.
+    pub fn native_grpc_smoke(&self) -> Result<NativeGrpcSmoke, String> {
+        let runtime = self
+            .runtime
+            .as_ref()
+            .ok_or_else(|| "server already shut down".to_owned())?;
+
+        // One connection isolate carries every call below.
+        let target = Http2Target::H2c {
+            authority: "specimen".into(),
+            addr: self.addr,
+        };
+        let conn = runtime
+            .register_with_capacity::<Http2ClientConnection<SpecimenShard>, _>(
+                Http2ClientConnection::<SpecimenShard>::new(target, Http2ClientLimits::default()),
+                32,
+            )
+            .map_err(|error| format!("register connection: {error:?}"))?;
+        runtime
+            .try_send(conn, Http2ClientMsg::Begin)
+            .map_err(|error| format!("begin connection: {error:?}"))?;
+        let client = GrpcClient::new(
+            conn,
+            GrpcLimits {
+                max_message_bytes: 1024,
+            },
+        );
+
+        // 1. Unary OK — the response message is decoded only because the
+        //    status was OK.
+        let increment_value = match unary_call::<CounterReply>(
+            runtime,
+            &client,
+            "/specimen.Counter/Increment",
+            &CounterRequest { delta: 7 },
+        )? {
+            GrpcUnaryOutcome::Ok(reply) => reply.value,
+            other => return Err(format!("Increment: expected Ok, got {other:?}")),
+        };
+
+        // 2. Non-OK gRPC status is the caller outcome, not a success.
+        let forbidden_status = match unary_call::<CounterReply>(
+            runtime,
+            &client,
+            "/specimen.Counter/Forbidden",
+            &CounterRequest { delta: 0 },
+        )? {
+            GrpcUnaryOutcome::Status(status) => status.code,
+            other => return Err(format!("Forbidden: expected Status, got {other:?}")),
+        };
+
+        // 3. Client cancellation: a second thread cancels the in-flight
+        //    stream. The server here is fast, so the call may complete
+        //    before the cancel lands — we tolerate either outcome and
+        //    only require that the connection survives (proven by the
+        //    follow-up call below).
+        let cancel_outcome = std::thread::scope(|scope| {
+            let canceller = scope.spawn(move || {
+                std::thread::sleep(Duration::from_millis(5));
+                // Streams 1 and 3 were used above; this call is stream 5.
+                let _ = runtime.try_send(conn, Http2ClientMsg::Cancel { stream_id: 5 });
+            });
+            let submit = client
+                .unary_request("/specimen.Counter/Forbidden", &CounterRequest { delta: 0 })
+                .map_err(|error| format!("encode cancel request: {error:?}"))?;
+            let reply = runtime
+                .call_blocking(client.connection(), submit, Duration::from_secs(2))
+                .map_err(|error| format!("cancel call: {error:?}"))?;
+            canceller.join().ok();
+            Ok::<String, String>(format!("{reply:?}"))
+        })?;
+
+        // Connection survives cancellation: a final call still completes.
+        match unary_call::<CounterReply>(
+            runtime,
+            &client,
+            "/specimen.Counter/Forbidden",
+            &CounterRequest { delta: 0 },
+        )? {
+            GrpcUnaryOutcome::Status(_) => {}
+            other => return Err(format!("post-cancel call: expected Status, got {other:?}")),
+        }
+
+        let _ = runtime.try_send(conn, Http2ClientMsg::Stop);
+        Ok(NativeGrpcSmoke {
+            increment_value,
+            forbidden_status,
+            cancel_outcome,
+        })
+    }
 }
 
 impl Drop for SpecimenServer {
@@ -86,7 +183,9 @@ impl StreamingEchoSource {
             },
             self.limits,
         )
-        .unwrap_or_else(|_| self.finish_with_status(GrpcStatus::new(GrpcStatusCode::ResourceExhausted)))
+        .unwrap_or_else(|_| {
+            self.finish_with_status(GrpcStatus::new(GrpcStatusCode::ResourceExhausted))
+        })
     }
 
     fn pull_request(&self) -> Effect<Self> {
@@ -119,7 +218,9 @@ impl StreamingEchoSource {
         reply: GrpcStreamReply<CounterRequest>,
     ) -> Effect<Self> {
         match reply {
-            GrpcStreamReply::Message(request) => reply_to_request(pending, self.reply_for_message(request)),
+            GrpcStreamReply::Message(request) => {
+                reply_to_request(pending, self.reply_for_message(request))
+            }
             GrpcStreamReply::NeedMore => {
                 self.pending = Some(pending);
                 self.pull_request()
@@ -128,9 +229,17 @@ impl StreamingEchoSource {
                 self.eof = true;
                 reply_to_request(pending, ResponseChunkReply::Eof)
             }
-            GrpcStreamReply::Status(status) => reply_to_request(pending, self.finish_with_status(status)),
-            GrpcStreamReply::Cancelled => reply_to_request(pending, self.finish_with_status(GrpcStatus::new(GrpcStatusCode::Cancelled))),
-            GrpcStreamReply::DeadlineExceeded => reply_to_request(pending, self.finish_with_status(GrpcStatus::new(GrpcStatusCode::DeadlineExceeded))),
+            GrpcStreamReply::Status(status) => {
+                reply_to_request(pending, self.finish_with_status(status))
+            }
+            GrpcStreamReply::Cancelled => reply_to_request(
+                pending,
+                self.finish_with_status(GrpcStatus::new(GrpcStatusCode::Cancelled)),
+            ),
+            GrpcStreamReply::DeadlineExceeded => reply_to_request(
+                pending,
+                self.finish_with_status(GrpcStatus::new(GrpcStatusCode::DeadlineExceeded)),
+            ),
         }
     }
 }
@@ -153,7 +262,9 @@ impl Isolate for StreamingEchoSource {
         match msg {
             ResponseChunkMsg::Cancel => stop(),
             ResponseChunkMsg::Next => reply(ResponseChunkReply::Eof),
-            ResponseChunkMsg::Http2RequestChunk(outcome) => self.handle_request_chunk_outcome(outcome),
+            ResponseChunkMsg::Http2RequestChunk(outcome) => {
+                self.handle_request_chunk_outcome(outcome)
+            }
         }
     }
 
@@ -181,7 +292,9 @@ impl Isolate for StreamingEchoSource {
                 self.pending = Some(call.into_request_context());
                 self.pull_request()
             }
-            ResponseChunkMsg::Http2RequestChunk(outcome) => self.handle_request_chunk_outcome(outcome),
+            ResponseChunkMsg::Http2RequestChunk(outcome) => {
+                self.handle_request_chunk_outcome(outcome)
+            }
         }
     }
 }
@@ -292,6 +405,17 @@ pub fn start_server() -> Result<SpecimenServer, String> {
             Ok(GrpcResponse::new(CounterReply { value: *value }))
         },
     )
+    .unary(
+        "/specimen.Counter/Forbidden",
+        |_request: GrpcRequest<CounterRequest>| {
+            // Always a non-OK gRPC status, so the native client demo can
+            // show that a status is the caller outcome, not a success.
+            Err::<GrpcResponse<CounterReply>, _>(GrpcStatus::with_message(
+                GrpcStatusCode::PermissionDenied,
+                "counter is read-only",
+            ))
+        },
+    )
     .server_streaming(
         "/specimen.Counter/Watch",
         move |_request: GrpcRequest<CounterRequest>| {
@@ -349,19 +473,52 @@ pub fn start_server() -> Result<SpecimenServer, String> {
     })
 }
 
+/// Summary of one native gRPC client run.
+#[derive(Debug, Clone)]
+pub struct NativeGrpcSmoke {
+    /// Value returned by the OK unary `Increment` call.
+    pub increment_value: u64,
+    /// Status code returned by the non-OK `Forbidden` call.
+    pub forbidden_status: GrpcStatusCode,
+    /// Debug rendering of the cancelled call's outcome (Replied or
+    /// LocalCancel, depending on the race).
+    pub cancel_outcome: String,
+}
+
+/// Issue one unary gRPC call through the native client and decode the
+/// typed outcome. The copied path: build the submit, call the
+/// connection, fold the reply.
+fn unary_call<Resp: prost::Message + Default>(
+    runtime: &ThreadedRuntime<SpecimenShard, DefaultThreadedMailboxFactory>,
+    client: &GrpcClient,
+    path: &str,
+    request: &CounterRequest,
+) -> Result<GrpcUnaryOutcome<Resp>, String> {
+    let submit = client
+        .unary_request(path, request)
+        .map_err(|error| format!("encode {path}: {error:?}"))?;
+    let CallOutcome::Replied(reply) = runtime
+        .call_blocking(client.connection(), submit, Duration::from_secs(2))
+        .map_err(|error| format!("call {path}: {error:?}"))?
+    else {
+        return Err(format!("call {path}: host timed out or target gone"));
+    };
+    Ok(client.unary_outcome_from_reply::<Resp>(reply))
+}
+
+/// Smoke entry point. Uses the **native gRPC client** (the copied path),
+/// not `grpc_unary_call_h2c_blocking`. Returns the OK increment value so
+/// the smoke test can pin it; the non-OK status and client cancellation
+/// are exercised inside [`SpecimenServer::native_grpc_smoke`].
 pub fn run_smoke() -> Result<u64, String> {
     let server = start_server()?;
-    let reply: CounterReply = grpc_unary_call_h2c_blocking(
-        server.addr,
-        "/specimen.Counter/Increment",
-        &CounterRequest { delta: 7 },
-        Duration::from_secs(2),
-        GrpcLimits {
-            max_message_bytes: 1024,
-        },
-    )
-    .map_err(|error| format!("grpc call: {error:?}"))?;
-
+    let smoke = server.native_grpc_smoke()?;
+    if smoke.forbidden_status != GrpcStatusCode::PermissionDenied {
+        return Err(format!(
+            "expected PermissionDenied from Forbidden, got {:?}",
+            smoke.forbidden_status
+        ));
+    }
     server.shutdown()?;
-    Ok(reply.value)
+    Ok(smoke.increment_value)
 }

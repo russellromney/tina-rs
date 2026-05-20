@@ -25,7 +25,7 @@ use crate::{
 };
 use crate::{IterBodySource, ResponseChunkMsg, ResponseChunkReply};
 
-const GRPC_FRAME_HEADER_LEN: usize = 5;
+pub(crate) const GRPC_FRAME_HEADER_LEN: usize = 5;
 const CLIENT_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 const FRAME_DATA: u8 = 0x0;
 const FRAME_HEADERS: u8 = 0x1;
@@ -175,6 +175,7 @@ impl GrpcStatus {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GrpcError {
     Status(GrpcStatus),
+    InvalidPath(String),
     BadContentType,
     BadFrame,
     CompressedUnsupported,
@@ -1051,7 +1052,7 @@ pub fn encode_grpc_message<T: Message>(
     Ok(out)
 }
 
-fn decode_one_grpc_message<T: Message + Default>(
+pub(crate) fn decode_one_grpc_message<T: Message + Default>(
     body: &[u8],
     cursor: &mut usize,
     limits: GrpcLimits,
@@ -1145,7 +1146,9 @@ fn grpc_streaming_http_response(
 
 fn status_for_error(error: GrpcError) -> GrpcStatus {
     match error {
-        GrpcError::BadContentType => GrpcStatus::new(GrpcStatusCode::InvalidArgument),
+        GrpcError::InvalidPath(_) | GrpcError::BadContentType => {
+            GrpcStatus::new(GrpcStatusCode::InvalidArgument)
+        }
         GrpcError::CompressedUnsupported => {
             GrpcStatus::with_message(GrpcStatusCode::Unimplemented, "compression unsupported")
         }
@@ -1350,6 +1353,21 @@ fn grpc_request_headers(path: &str) -> Vec<u8> {
     literal("content-type", "application/grpc+proto", &mut block);
     literal("te", "trailers", &mut block);
     block
+}
+
+/// Read a [`GrpcStatus`] from an already-decoded header/trailer map (the
+/// shape the native HTTP/2 client hands back), checking `grpc-status` and
+/// optional `grpc-message`. Returns `None` when there is no `grpc-status`
+/// at all, so the caller can tell "not a gRPC response" apart from a
+/// malformed one.
+pub(crate) fn grpc_status_from_header_map(headers: &http::HeaderMap) -> Option<GrpcStatus> {
+    let raw = headers.get("grpc-status")?.to_str().ok()?;
+    let code = GrpcStatusCode::from_u16(raw.trim().parse::<u16>().ok()?);
+    let message = headers
+        .get("grpc-message")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| percent_decode_grpc_message(v).ok());
+    Some(GrpcStatus { code, message })
 }
 
 fn decode_grpc_status_trailers(block: &[u8]) -> Result<GrpcStatus, GrpcError> {

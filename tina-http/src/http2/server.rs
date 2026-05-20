@@ -1,8 +1,9 @@
-//! Native HTTP/2 first form.
+//! Native HTTP/2 server: prior-knowledge cleartext h2c, unary buffered
+//! request/response, bounded stream table, visible frame/header/window
+//! errors, and no async runtime ownership.
 //!
-//! This module is deliberately small: prior-knowledge cleartext h2c,
-//! unary buffered request/response, bounded stream table, visible
-//! frame/header/window errors, and no async runtime ownership.
+//! Frame, HPACK, and protocol-error helpers live in sibling modules
+//! (`frame`, `headers`, `errors`) and are shared with the native client.
 
 use std::collections::VecDeque;
 use std::convert::Infallible;
@@ -10,7 +11,9 @@ use std::marker::PhantomData;
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Version};
+use http::Version;
+#[cfg(test)]
+use http::{Method, StatusCode};
 use tina::prelude::*;
 use tina::reply_to_request;
 use tina_runtime::{
@@ -25,49 +28,31 @@ use crate::streaming::{
 };
 use crate::{HttpRequest, HttpRequestBody, HttpResponse, HttpResponseBody};
 
-const CLIENT_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
-const FRAME_HEADER_LEN: usize = 9;
-const DEFAULT_WINDOW: i32 = 65_535;
-const READ_CHUNK: usize = 16 * 1024;
-const WINDOW_CREDIT_FLUSH_THRESHOLD: u32 = 16 * 1024;
+use super::errors::{
+    ERR_ENHANCE_YOUR_CALM, ERR_FLOW_CONTROL_ERROR, ERR_FRAME_SIZE_ERROR, ERR_NO_ERROR,
+    ERR_PROTOCOL_ERROR, ERR_REFUSED_STREAM, ERR_SETTINGS_ERROR, ERR_STREAM_CLOSED,
+    Http2ProtocolError, classify_h2_reset,
+};
+use super::frame::{
+    CLIENT_PREFACE, DEFAULT_WINDOW, FLAG_ACK, FLAG_END_HEADERS, FLAG_END_STREAM,
+    FRAME_CONTINUATION, FRAME_DATA, FRAME_GOAWAY, FRAME_HEADERS, FRAME_PING, FRAME_PRIORITY,
+    FRAME_PUSH_PROMISE, FRAME_RST_STREAM, FRAME_SETTINGS, FRAME_WINDOW_UPDATE, Frame,
+    PRIORITY_PAYLOAD_LEN, READ_CHUNK, WINDOW_CREDIT_FLUSH_THRESHOLD, add_window, data_frame,
+    data_payload, goaway_frame, headers_frame, headers_payload, rst_stream_frame, settings_frame,
+    try_decode_frame, window_update_frame,
+};
+use super::headers::{
+    DEFAULT_HEADER_TABLE_SIZE, HeaderBlock, MAX_MAX_FRAME_SIZE, MIN_MAX_FRAME_SIZE,
+    SETTINGS_ENABLE_PUSH, SETTINGS_HEADER_TABLE_SIZE, SETTINGS_INITIAL_WINDOW_SIZE,
+    SETTINGS_MAX_CONCURRENT_STREAMS, SETTINGS_MAX_FRAME_SIZE, SETTINGS_MAX_HEADER_LIST_SIZE,
+    decode_headers_block_with, encode_response_headers, encode_response_headers_with_len,
+    encode_response_trailers, encode_trailers, validate_request_headers,
+};
 
-const FLAG_ACK: u8 = 0x1;
-const FLAG_END_STREAM: u8 = 0x1;
-const FLAG_END_HEADERS: u8 = 0x4;
-const FLAG_PADDED: u8 = 0x8;
-const FLAG_PRIORITY: u8 = 0x20;
-
-const FRAME_DATA: u8 = 0x0;
-const FRAME_HEADERS: u8 = 0x1;
-const FRAME_PRIORITY: u8 = 0x2;
-const FRAME_RST_STREAM: u8 = 0x3;
-const FRAME_SETTINGS: u8 = 0x4;
-const FRAME_PUSH_PROMISE: u8 = 0x5;
-const FRAME_PING: u8 = 0x6;
-const FRAME_GOAWAY: u8 = 0x7;
-const FRAME_WINDOW_UPDATE: u8 = 0x8;
-const FRAME_CONTINUATION: u8 = 0x9;
-
-const PRIORITY_PAYLOAD_LEN: usize = 5;
-
-const ERR_NO_ERROR: u32 = 0x0;
-const ERR_PROTOCOL_ERROR: u32 = 0x1;
-const ERR_FLOW_CONTROL_ERROR: u32 = 0x3;
-const ERR_SETTINGS_ERROR: u32 = 0x4;
-const ERR_STREAM_CLOSED: u32 = 0x5;
-const ERR_FRAME_SIZE_ERROR: u32 = 0x6;
-const ERR_REFUSED_STREAM: u32 = 0x7;
-const ERR_ENHANCE_YOUR_CALM: u32 = 0xb;
-
-const SETTINGS_HEADER_TABLE_SIZE: u16 = 0x1;
-const SETTINGS_ENABLE_PUSH: u16 = 0x2;
-const SETTINGS_MAX_CONCURRENT_STREAMS: u16 = 0x3;
-const SETTINGS_INITIAL_WINDOW_SIZE: u16 = 0x4;
-const SETTINGS_MAX_FRAME_SIZE: u16 = 0x5;
-const SETTINGS_MAX_HEADER_LIST_SIZE: u16 = 0x6;
-const DEFAULT_HEADER_TABLE_SIZE: u32 = 4096;
-const MIN_MAX_FRAME_SIZE: u32 = 16_384;
-const MAX_MAX_FRAME_SIZE: u32 = 16_777_215;
+#[cfg(test)]
+use super::frame::FRAME_HEADER_LEN;
+#[cfg(test)]
+use super::headers::{decode_headers_block, encode_literal_header};
 
 /// Configurable limits for the HTTP/2 first form.
 #[derive(Debug, Clone, Copy)]
@@ -192,37 +177,6 @@ pub enum Http2Outcome {
     LocalCancel(u32),
 }
 
-/// Protocol/lifecycle errors surfaced by the frame and connection layers.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Http2ProtocolError {
-    BadPreface,
-    FrameTooLarge {
-        len: usize,
-        max: usize,
-    },
-    TruncatedFrame,
-    BadFrameLength,
-    BadStreamId,
-    HeadersTooLarge,
-    HpackUnsupported,
-    InvalidPseudoHeaders,
-    StreamClosed,
-    StreamLimitFull,
-    WindowOverflow,
-    FlowControl,
-    RequestTrailersUnsupported,
-    SettingsUnsupported,
-    InvalidSettingsValue,
-    UnsupportedFrame(u8),
-    /// Standalone or otherwise-unexpected `CONTINUATION` frame; full
-    /// continuation support is not implemented, so any such frame is a
-    /// connection-level protocol error.
-    UnexpectedContinuation,
-    /// HTTP/2 `content-length` header was malformed, conflicted across
-    /// duplicates, or DATA bytes did not match the declared length.
-    ContentLengthMismatch,
-}
-
 /// Per-connection report counters.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Http2ConnectionReport {
@@ -245,379 +199,6 @@ pub struct Http2StreamReport {
     pub state: Http2StreamState,
     pub buffered_body_bytes: usize,
     pub recv_window: i32,
-}
-
-#[derive(Debug, Clone)]
-struct Frame {
-    ty: u8,
-    flags: u8,
-    stream_id: u32,
-    payload: Vec<u8>,
-}
-
-impl Frame {
-    fn new(ty: u8, flags: u8, stream_id: u32, payload: Vec<u8>) -> Self {
-        Self {
-            ty,
-            flags,
-            stream_id,
-            payload,
-        }
-    }
-
-    fn encode(&self) -> Vec<u8> {
-        let len = self.payload.len();
-        assert!(len <= 0x00ff_ffff, "HTTP/2 frame payload too large");
-        let mut out = Vec::with_capacity(FRAME_HEADER_LEN + len);
-        out.push(((len >> 16) & 0xff) as u8);
-        out.push(((len >> 8) & 0xff) as u8);
-        out.push((len & 0xff) as u8);
-        out.push(self.ty);
-        out.push(self.flags);
-        let sid = self.stream_id & 0x7fff_ffff;
-        out.extend_from_slice(&sid.to_be_bytes());
-        out.extend_from_slice(&self.payload);
-        out
-    }
-}
-
-fn try_decode_frame(
-    buffer: &[u8],
-    limits: &Http2Limits,
-) -> Result<Option<(Frame, usize)>, Http2ProtocolError> {
-    if buffer.len() < FRAME_HEADER_LEN {
-        return Ok(None);
-    }
-    let len = ((buffer[0] as usize) << 16) | ((buffer[1] as usize) << 8) | buffer[2] as usize;
-    if len > limits.max_frame_size {
-        return Err(Http2ProtocolError::FrameTooLarge {
-            len,
-            max: limits.max_frame_size,
-        });
-    }
-    let total = FRAME_HEADER_LEN
-        .checked_add(len)
-        .ok_or(Http2ProtocolError::FrameTooLarge {
-            len,
-            max: limits.max_frame_size,
-        })?;
-    if buffer.len() < total {
-        return Ok(None);
-    }
-    let ty = buffer[3];
-    let flags = buffer[4];
-    let mut sid_bytes = [0_u8; 4];
-    sid_bytes.copy_from_slice(&buffer[5..9]);
-    let stream_id = u32::from_be_bytes(sid_bytes) & 0x7fff_ffff;
-    let payload = buffer[9..total].to_vec();
-    Ok(Some((
-        Frame {
-            ty,
-            flags,
-            stream_id,
-            payload,
-        },
-        total,
-    )))
-}
-
-fn settings_frame(ack: bool) -> Frame {
-    Frame::new(
-        FRAME_SETTINGS,
-        if ack { FLAG_ACK } else { 0 },
-        0,
-        Vec::new(),
-    )
-}
-
-fn rst_stream_frame(stream_id: u32, error: u32) -> Frame {
-    Frame::new(FRAME_RST_STREAM, 0, stream_id, error.to_be_bytes().to_vec())
-}
-
-fn goaway_frame(last_stream_id: u32, error: u32) -> Frame {
-    let mut payload = Vec::with_capacity(8);
-    payload.extend_from_slice(&(last_stream_id & 0x7fff_ffff).to_be_bytes());
-    payload.extend_from_slice(&error.to_be_bytes());
-    Frame::new(FRAME_GOAWAY, 0, 0, payload)
-}
-
-fn window_update_frame(stream_id: u32, increment: u32) -> Frame {
-    Frame::new(
-        FRAME_WINDOW_UPDATE,
-        0,
-        stream_id,
-        (increment & 0x7fff_ffff).to_be_bytes().to_vec(),
-    )
-}
-
-fn headers_frame(stream_id: u32, end_stream: bool, block: Vec<u8>) -> Frame {
-    let flags = FLAG_END_HEADERS | if end_stream { FLAG_END_STREAM } else { 0 };
-    Frame::new(FRAME_HEADERS, flags, stream_id, block)
-}
-
-fn data_frame(stream_id: u32, end_stream: bool, data: Vec<u8>) -> Frame {
-    Frame::new(
-        FRAME_DATA,
-        if end_stream { FLAG_END_STREAM } else { 0 },
-        stream_id,
-        data,
-    )
-}
-
-fn data_payload(frame: &Frame) -> Result<Vec<u8>, Http2ProtocolError> {
-    if frame.flags & FLAG_PADDED == 0 {
-        return Ok(frame.payload.clone());
-    }
-    let Some((&pad_len, rest)) = frame.payload.split_first() else {
-        return Err(Http2ProtocolError::BadFrameLength);
-    };
-    let pad_len = usize::from(pad_len);
-    if pad_len > rest.len() {
-        return Err(Http2ProtocolError::BadFrameLength);
-    }
-    Ok(rest[..rest.len() - pad_len].to_vec())
-}
-
-fn headers_payload(frame: &Frame) -> Result<&[u8], Http2ProtocolError> {
-    let mut offset = 0usize;
-    let mut pad_len = 0usize;
-    if frame.flags & FLAG_PADDED != 0 {
-        let Some((&pad, _)) = frame.payload.split_first() else {
-            return Err(Http2ProtocolError::BadFrameLength);
-        };
-        pad_len = usize::from(pad);
-        offset = 1;
-    }
-    if frame.flags & FLAG_PRIORITY != 0 {
-        let next = offset
-            .checked_add(5)
-            .ok_or(Http2ProtocolError::BadFrameLength)?;
-        if frame.payload.len() < next {
-            return Err(Http2ProtocolError::BadFrameLength);
-        }
-        offset = next;
-    }
-    let available = frame
-        .payload
-        .len()
-        .checked_sub(offset)
-        .ok_or(Http2ProtocolError::BadFrameLength)?;
-    if pad_len > available {
-        return Err(Http2ProtocolError::BadFrameLength);
-    }
-    let end = frame.payload.len() - pad_len;
-    Ok(&frame.payload[offset..end])
-}
-
-#[derive(Debug, Default)]
-struct HeaderBlock {
-    method: Option<Method>,
-    path: Option<String>,
-    scheme: Option<String>,
-    authority: Option<String>,
-    status: Option<StatusCode>,
-    headers: HeaderMap,
-    bytes: usize,
-    saw_regular: bool,
-    /// Declared request body length, parsed once during header validation.
-    /// `None` when no `content-length` header was sent.
-    content_length: Option<usize>,
-    /// Set when any `content-length` header was observed during decoding,
-    /// so duplicate occurrences fail closed even if the value parses.
-    saw_content_length: bool,
-}
-
-#[cfg(test)]
-fn decode_headers_block(
-    block: &[u8],
-    max_header_bytes: usize,
-) -> Result<HeaderBlock, Http2ProtocolError> {
-    let mut decoder = hpack::Decoder::new();
-    decode_headers_block_with(&mut decoder, block, max_header_bytes)
-}
-
-fn decode_headers_block_with(
-    decoder: &mut hpack::Decoder<'static>,
-    block: &[u8],
-    max_header_bytes: usize,
-) -> Result<HeaderBlock, Http2ProtocolError> {
-    let mut out = HeaderBlock::default();
-    for (name, value) in decoder
-        .decode(block)
-        .map_err(|_| Http2ProtocolError::HpackUnsupported)?
-    {
-        let name = std::str::from_utf8(&name).map_err(|_| Http2ProtocolError::HpackUnsupported)?;
-        let value =
-            std::str::from_utf8(&value).map_err(|_| Http2ProtocolError::HpackUnsupported)?;
-        add_header(&mut out, name, value, max_header_bytes)?;
-    }
-    Ok(out)
-}
-
-fn add_header(
-    out: &mut HeaderBlock,
-    name: &str,
-    value: &str,
-    max_header_bytes: usize,
-) -> Result<(), Http2ProtocolError> {
-    out.bytes = out
-        .bytes
-        .checked_add(name.len() + value.len())
-        .ok_or(Http2ProtocolError::HeadersTooLarge)?;
-    if out.bytes > max_header_bytes {
-        return Err(Http2ProtocolError::HeadersTooLarge);
-    }
-    if name.starts_with(':') {
-        if out.saw_regular {
-            return Err(Http2ProtocolError::InvalidPseudoHeaders);
-        }
-        match name {
-            ":method" => {
-                if out.method.is_some() {
-                    return Err(Http2ProtocolError::InvalidPseudoHeaders);
-                }
-                out.method = Some(
-                    Method::from_bytes(value.as_bytes())
-                        .map_err(|_| Http2ProtocolError::InvalidPseudoHeaders)?,
-                );
-            }
-            ":path" => {
-                if out.path.is_some() {
-                    return Err(Http2ProtocolError::InvalidPseudoHeaders);
-                }
-                out.path = Some(value.to_owned());
-            }
-            ":scheme" => {
-                if out.scheme.is_some() {
-                    return Err(Http2ProtocolError::InvalidPseudoHeaders);
-                }
-                out.scheme = Some(value.to_owned());
-            }
-            ":authority" => {
-                if out.authority.is_some() {
-                    return Err(Http2ProtocolError::InvalidPseudoHeaders);
-                }
-                out.authority = Some(value.to_owned());
-            }
-            ":status" => {
-                if out.status.is_some() {
-                    return Err(Http2ProtocolError::InvalidPseudoHeaders);
-                }
-                out.status = Some(
-                    StatusCode::from_bytes(value.as_bytes())
-                        .map_err(|_| Http2ProtocolError::InvalidPseudoHeaders)?,
-                );
-            }
-            _ => return Err(Http2ProtocolError::InvalidPseudoHeaders),
-        }
-        return Ok(());
-    }
-    if name.bytes().any(|b| b.is_ascii_uppercase()) {
-        return Err(Http2ProtocolError::InvalidPseudoHeaders);
-    }
-    if matches!(
-        name,
-        "connection" | "keep-alive" | "proxy-connection" | "transfer-encoding" | "upgrade"
-    ) {
-        return Err(Http2ProtocolError::InvalidPseudoHeaders);
-    }
-    out.saw_regular = true;
-    let header_name = HeaderName::from_bytes(name.as_bytes())
-        .map_err(|_| Http2ProtocolError::InvalidPseudoHeaders)?;
-    let header_value =
-        HeaderValue::from_str(value).map_err(|_| Http2ProtocolError::InvalidPseudoHeaders)?;
-    if header_name == http::header::CONTENT_LENGTH {
-        if out.saw_content_length {
-            return Err(Http2ProtocolError::ContentLengthMismatch);
-        }
-        let parsed = parse_content_length(value)?;
-        out.content_length = Some(parsed);
-        out.saw_content_length = true;
-    }
-    out.headers.append(header_name, header_value);
-    Ok(())
-}
-
-fn parse_content_length(value: &str) -> Result<usize, Http2ProtocolError> {
-    // RFC 9110 §8.6: content-length is a single nonnegative decimal integer.
-    if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
-        return Err(Http2ProtocolError::ContentLengthMismatch);
-    }
-    value
-        .parse::<usize>()
-        .map_err(|_| Http2ProtocolError::ContentLengthMismatch)
-}
-
-fn encode_literal_header(name: &str, value: &str, out: &mut Vec<u8>) {
-    out.push(0);
-    encode_string(name, out);
-    encode_string(value, out);
-}
-
-fn encode_string(value: &str, out: &mut Vec<u8>) {
-    encode_integer(value.len(), 7, 0, out);
-    out.extend_from_slice(value.as_bytes());
-}
-
-fn encode_integer(mut value: usize, prefix_bits: u8, pattern: u8, out: &mut Vec<u8>) {
-    let max = (1_usize << prefix_bits) - 1;
-    if value < max {
-        out.push(pattern | value as u8);
-        return;
-    }
-    out.push(pattern | max as u8);
-    value -= max;
-    while value >= 128 {
-        out.push((value as u8 & 0x7f) | 0x80);
-        value >>= 7;
-    }
-    out.push(value as u8);
-}
-
-fn encode_response_headers(response: &HttpResponse, body_len: usize) -> Vec<u8> {
-    encode_response_headers_with_len(response, Some(body_len))
-}
-
-fn encode_response_headers_with_len(response: &HttpResponse, body_len: Option<usize>) -> Vec<u8> {
-    let mut block = Vec::new();
-    encode_literal_header(":status", response.status.as_str(), &mut block);
-    if let Some(body_len) = body_len {
-        encode_literal_header("content-length", &body_len.to_string(), &mut block);
-    }
-    for (name, value) in response.headers.iter() {
-        if name.as_str().starts_with(':') {
-            continue;
-        }
-        if name.as_str() == "grpc-status"
-            || name.as_str() == "grpc-message"
-            || name.as_str() == "content-length"
-            || name.as_str() == "transfer-encoding"
-        {
-            continue;
-        }
-        if let Ok(value) = value.to_str() {
-            encode_literal_header(name.as_str(), value, &mut block);
-        }
-    }
-    block
-}
-
-fn encode_trailers(headers: &HeaderMap) -> Option<Vec<u8>> {
-    let status = headers.get("grpc-status")?;
-    let mut block = Vec::new();
-    if let Ok(value) = status.to_str() {
-        encode_literal_header("grpc-status", value, &mut block);
-    }
-    if let Some(message) = headers.get("grpc-message") {
-        if let Ok(value) = message.to_str() {
-            encode_literal_header("grpc-message", value, &mut block);
-        }
-    }
-    Some(block)
-}
-
-fn encode_response_trailers(response: &HttpResponse) -> Option<Vec<u8>> {
-    encode_trailers(&response.headers)
 }
 
 #[derive(Debug)]
@@ -812,27 +393,6 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Http2Connection<
     }
 }
 
-/// Maps an HTTP/2 wire error code to the typed [`Http2ResetReason`].
-fn classify_h2_reset(code: u32) -> Http2ResetReason {
-    match code {
-        0x0 => Http2ResetReason::NoError,
-        0x1 => Http2ResetReason::ProtocolError,
-        0x2 => Http2ResetReason::InternalError,
-        0x3 => Http2ResetReason::FlowControlError,
-        0x4 => Http2ResetReason::SettingsTimeout,
-        0x5 => Http2ResetReason::StreamClosed,
-        0x6 => Http2ResetReason::FrameSizeError,
-        0x7 => Http2ResetReason::RefusedStream,
-        0x8 => Http2ResetReason::Cancel,
-        0x9 => Http2ResetReason::CompressionError,
-        0xa => Http2ResetReason::ConnectError,
-        0xb => Http2ResetReason::EnhanceYourCalm,
-        0xc => Http2ResetReason::InadequateSecurity,
-        0xd => Http2ResetReason::Http11Required,
-        other => Http2ResetReason::OtherCode(other),
-    }
-}
-
 impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Isolate for Http2Connection<S, M> {
     tina::isolate_types! {
         message: Http2ConnectionMsg,
@@ -977,7 +537,9 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Http2Connection<
             self.enqueue_frame(settings_frame(false))?;
         }
 
-        while let Some((frame, used)) = try_decode_frame(&self.read_buf, &self.limits)? {
+        while let Some((frame, used)) =
+            try_decode_frame(&self.read_buf, self.limits.max_frame_size)?
+        {
             self.read_buf.drain(..used);
             self.handle_frame(frame, effects)?;
         }
@@ -1674,6 +1236,19 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Http2Connection<
         Ok(())
     }
 
+    // KNOWN LIMITATION (tracked for a future "server response streaming"
+    // slice): a buffered response is sent only when the *entire* body
+    // fits both the stream and connection send-windows. A response larger
+    // than the peer's window is parked whole until a WINDOW_UPDATE opens
+    // enough credit. A strict HTTP/2 peer that does not pre-credit its
+    // receive window (it has no reason to before it sees any DATA) will
+    // therefore deadlock on responses larger than ~64 KB: the server
+    // waits for window, the peer waits for bytes. Browsers paper over
+    // this by sending a large connection WINDOW_UPDATE on connect; the
+    // native Tina client (Phase 116) does not. The fix is to slice the
+    // response across DATA frames as windows open — the mirror of the
+    // client's `flush_outbound_data` pacer — and is deliberately out of
+    // scope for the client slice.
     fn queue_or_send_response(
         &mut self,
         stream_id: u32,
@@ -2267,33 +1842,6 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Http2Connection<
     }
 }
 
-fn add_window(current: i32, increment: u32) -> Result<i32, Http2ProtocolError> {
-    let next = current as i64 + increment as i64;
-    if next > i32::MAX as i64 {
-        return Err(Http2ProtocolError::WindowOverflow);
-    }
-    Ok(next as i32)
-}
-
-fn validate_request_headers(headers: &HeaderBlock) -> Result<(), Http2ProtocolError> {
-    if headers.method.is_none() || headers.path.is_none() || headers.scheme.is_none() {
-        return Err(Http2ProtocolError::InvalidPseudoHeaders);
-    }
-    let has_authority = headers.authority.as_deref().is_some_and(|v| !v.is_empty())
-        || headers
-            .headers
-            .get(http::header::HOST)
-            .and_then(|v| v.to_str().ok())
-            .is_some_and(|v| !v.is_empty());
-    if !has_authority {
-        return Err(Http2ProtocolError::InvalidPseudoHeaders);
-    }
-    if headers.status.is_some() {
-        return Err(Http2ProtocolError::InvalidPseudoHeaders);
-    }
-    Ok(())
-}
-
 /// Inbound messages for [`Http2Listener`].
 #[derive(Debug, Clone)]
 pub enum Http2ListenerMsg {
@@ -2441,11 +1989,13 @@ mod tests {
         let limits = Http2Limits::default();
         let frame = Frame::new(FRAME_DATA, FLAG_END_STREAM, 1, b"abc".to_vec()).encode();
         assert!(
-            try_decode_frame(&frame[..frame.len() - 1], &limits)
+            try_decode_frame(&frame[..frame.len() - 1], limits.max_frame_size)
                 .unwrap()
                 .is_none()
         );
-        let (decoded, used) = try_decode_frame(&frame, &limits).unwrap().unwrap();
+        let (decoded, used) = try_decode_frame(&frame, limits.max_frame_size)
+            .unwrap()
+            .unwrap();
         assert_eq!(used, frame.len());
         assert_eq!(decoded.ty, FRAME_DATA);
         assert_eq!(decoded.flags, FLAG_END_STREAM);
@@ -2461,7 +2011,7 @@ mod tests {
         };
         let frame = Frame::new(FRAME_DATA, 0, 1, b"abc".to_vec()).encode();
         assert!(matches!(
-            try_decode_frame(&frame[..FRAME_HEADER_LEN], &limits),
+            try_decode_frame(&frame[..FRAME_HEADER_LEN], limits.max_frame_size),
             Err(Http2ProtocolError::FrameTooLarge { len: 3, max: 1 })
         ));
     }
