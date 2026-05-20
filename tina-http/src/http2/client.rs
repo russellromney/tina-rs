@@ -113,19 +113,27 @@ pub struct Http2ClientReport {
 
 /// Typed first-form HTTP/2 client outcomes.
 ///
-/// `Timeout` is intentionally absent from this slice — paired
-/// caller-cancel that emits outbound RST_STREAM(CANCEL) lands together
-/// with a real stream-level deadline. Today callers enforce their own
-/// timeout through `call_blocking_with_host_timeout`, which surfaces as
-/// `CallOutcome::TimedOut` at the host level, not as a connection-side
-/// `Http2ClientOutcome`.
+/// Two variants the model will eventually grow are intentionally absent
+/// because no code path constructs them yet — advertising an outcome the
+/// implementation never produces is a lying API:
+///
+/// - `Timeout` lands with a real stream-level deadline. Today callers
+///   enforce their own timeout through `call_blocking_with_host_timeout`,
+///   which surfaces as `CallOutcome::TimedOut` at the host level.
+/// - `FlowControlBlocked` lands with the same deadline mechanism: a
+///   stream parked on send-window credit past its deadline will give up
+///   the slot and report this. Today parked streams wait indefinitely
+///   for `WINDOW_UPDATE` (visible via `Http2ClientReport.flow_control_parks`),
+///   and never surface a per-stream `FlowControlBlocked` outcome.
+///
+/// The enum is `#[non_exhaustive]`, so adding either back is not a
+/// breaking change.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Http2ClientOutcome {
     Replied(Http2ClientResponse),
     Full,
     Closed,
-    FlowControlBlocked,
     Reset(Http2ResetReason),
     LocalCancel,
     ProtocolError(Http2ProtocolError),
@@ -172,6 +180,12 @@ impl Http2ClientRequest {
 }
 
 /// Messages handled by [`Http2ClientConnection`].
+///
+/// `Submit` and `Report` are **call-only**: they must be delivered with
+/// `call` / `call_blocking`, which provide the reply channel the
+/// connection answers on. Delivering them with `try_send` has no reply
+/// channel — `Submit` would silently drop the request body — so the
+/// connection `debug_assert!`s on the misuse and otherwise ignores it.
 #[non_exhaustive]
 #[derive(Debug, Clone)]
 pub enum Http2ClientMsg {
@@ -180,8 +194,7 @@ pub enum Http2ClientMsg {
     Begin,
     /// Submit a buffered request as a new client stream. The connection
     /// captures the caller's request slot and replies later with one
-    /// [`Http2ClientReply::Outcome`]. Must be sent via `call`, not
-    /// `try_send`; `try_send` of `Submit` is rejected as a protocol error.
+    /// [`Http2ClientReply::Outcome`]. **Call-only** (see the type doc).
     Submit(Http2ClientRequest),
     /// Locally cancel an admitted stream by id. The connection emits
     /// RST_STREAM(CANCEL) on the wire and replies to the original
@@ -368,7 +381,21 @@ impl<S: Shard + 'static> Isolate for Http2ClientConnection<S> {
             Http2ClientMsg::Closed(_) => stop(),
             Http2ClientMsg::Cancel { stream_id } => self.handle_cancel(stream_id),
             Http2ClientMsg::Stop => self.begin_goaway_shutdown(),
-            Http2ClientMsg::Report | Http2ClientMsg::Submit(_) => noop(),
+            // `Report` and `Submit` are call-only: they carry no reply
+            // channel when delivered via `try_send`, so the caller would
+            // never learn the outcome. `Submit` in particular would
+            // silently drop the request body. Catch the misuse in
+            // dev/test; a stray `try_send` must not kill the connection
+            // (and its in-flight streams) in production, so release
+            // builds drop it. See the doc comment on `Http2ClientMsg`.
+            Http2ClientMsg::Report | Http2ClientMsg::Submit(_) => {
+                debug_assert!(
+                    false,
+                    "Http2ClientMsg::Submit / ::Report are call-only; use \
+                     `call` / `call_blocking`, not `try_send`",
+                );
+                noop()
+            }
         }
     }
 
@@ -691,13 +718,63 @@ impl<S: Shard + 'static> Http2ClientConnection<S> {
             FRAME_WINDOW_UPDATE => self.handle_window_update(frame),
             FRAME_RST_STREAM => self.handle_rst_stream(frame, effects),
             FRAME_PING => self.handle_ping(frame),
-            FRAME_GOAWAY => {
-                self.goaway_received = true;
-                self.report.goaway_received += 1;
-                Ok(())
-            }
+            FRAME_GOAWAY => self.handle_goaway(frame, effects),
             _ => Ok(()),
         }
+    }
+
+    /// Handle an inbound GOAWAY. RFC 9113 §6.8: GOAWAY is sent on stream
+    /// 0x0 and carries the last stream id the peer processed plus an
+    /// error code. Streams we opened with an id *greater* than
+    /// `last_stream_id` were not processed and must be failed so the
+    /// caller can retry them on a fresh connection. A non-`NO_ERROR`
+    /// code is surfaced as a typed reset reason on those streams; a
+    /// clean `NO_ERROR` GOAWAY just stops new admission and lets the
+    /// already-processed streams settle.
+    fn handle_goaway(
+        &mut self,
+        frame: Frame,
+        effects: &mut Vec<Effect<Self>>,
+    ) -> Result<(), Http2ProtocolError> {
+        if frame.stream_id != 0 {
+            return Err(Http2ProtocolError::BadStreamId);
+        }
+        // last_stream_id (4) + error code (4); additional debug data is
+        // allowed and ignored.
+        if frame.payload.len() < 8 {
+            return Err(Http2ProtocolError::BadFrameLength);
+        }
+        let last_stream_id = u32::from_be_bytes([
+            frame.payload[0] & 0x7f,
+            frame.payload[1],
+            frame.payload[2],
+            frame.payload[3],
+        ]);
+        let error_code = u32::from_be_bytes([
+            frame.payload[4],
+            frame.payload[5],
+            frame.payload[6],
+            frame.payload[7],
+        ]);
+        self.goaway_received = true;
+        self.report.goaway_received += 1;
+        // Fail every stream the peer did not process (id > last_stream_id).
+        // Those are safe to retry on a new connection.
+        let refused_outcome = if error_code == ERR_NO_ERROR {
+            Http2ClientOutcome::Closed
+        } else {
+            Http2ClientOutcome::Reset(classify_h2_reset(error_code))
+        };
+        let mut idx = 0;
+        while idx < self.streams.len() {
+            if self.streams[idx].id > last_stream_id {
+                self.fail_stream(idx, refused_outcome.clone(), effects);
+                // fail_stream swap_removes, so do not advance idx.
+            } else {
+                idx += 1;
+            }
+        }
+        Ok(())
     }
 
     fn handle_settings(&mut self, frame: Frame) -> Result<(), Http2ProtocolError> {
@@ -912,6 +989,11 @@ impl<S: Shard + 'static> Http2ClientConnection<S> {
         frame: Frame,
         effects: &mut Vec<Effect<Self>>,
     ) -> Result<(), Http2ProtocolError> {
+        // RFC 9113 §6.4: RST_STREAM MUST be associated with a stream; a
+        // RST_STREAM on stream 0x0 is a connection-level PROTOCOL_ERROR.
+        if frame.stream_id == 0 {
+            return Err(Http2ProtocolError::BadStreamId);
+        }
         if frame.payload.len() != 4 {
             return Err(Http2ProtocolError::BadFrameLength);
         }
@@ -922,6 +1004,7 @@ impl<S: Shard + 'static> Http2ClientConnection<S> {
             frame.payload[3],
         ]);
         let Some(idx) = self.streams.iter().position(|s| s.id == frame.stream_id) else {
+            // RST_STREAM for an already-closed stream is allowed; ignore.
             return Ok(());
         };
         self.report.reset_streams += 1;
@@ -938,7 +1021,15 @@ impl<S: Shard + 'static> Http2ClientConnection<S> {
     }
 
     fn handle_ping(&mut self, frame: Frame) -> Result<(), Http2ProtocolError> {
-        if frame.stream_id != 0 || frame.payload.len() != 8 {
+        // RFC 9113 §6.7: PING is sent on stream 0x0 (a non-zero stream id
+        // is a connection-level PROTOCOL_ERROR) and carries exactly 8
+        // octets of opaque data (any other length is FRAME_SIZE_ERROR).
+        // Distinguish the two so replay/observability sees the right
+        // cause rather than collapsing both into BadFrameLength.
+        if frame.stream_id != 0 {
+            return Err(Http2ProtocolError::BadStreamId);
+        }
+        if frame.payload.len() != 8 {
             return Err(Http2ProtocolError::BadFrameLength);
         }
         if frame.flags & FLAG_ACK == 0 {
@@ -1312,28 +1403,33 @@ mod tests {
     }
 
     #[test]
-    fn outcome_does_not_include_timeout_variant() {
-        // Compile-shape proof that we removed the unreachable
-        // `Http2ClientOutcome::Timeout` variant. If someone re-adds it
-        // without wiring a real stream-level deadline, this test stops
+    fn outcome_surface_excludes_unimplemented_variants() {
+        // Compile-shape proof that the outcome surface lists exactly the
+        // variants the implementation can actually produce. `Timeout`
+        // and `FlowControlBlocked` are deliberately absent until a real
+        // stream-level deadline lands. If someone re-adds either without
+        // wiring a construction site, this exhaustive match stops
         // compiling and forces the conversation.
-        fn assert_no_timeout(o: &Http2ClientOutcome) -> bool {
-            !matches!(
-                o,
-                Http2ClientOutcome::Replied(_)
-                    | Http2ClientOutcome::Full
-                    | Http2ClientOutcome::Closed
-                    | Http2ClientOutcome::FlowControlBlocked
-                    | Http2ClientOutcome::Reset(_)
-                    | Http2ClientOutcome::LocalCancel
-                    | Http2ClientOutcome::ProtocolError(_)
-                    | Http2ClientOutcome::TlsAlpnMismatch
-            )
+        // Exhaustive match *within the crate* (where `#[non_exhaustive]`
+        // does not relax exhaustiveness). Adding a variant breaks this
+        // match's compilation and forces the author to decide whether the
+        // implementation actually produces it.
+        fn classify(o: &Http2ClientOutcome) -> &'static str {
+            match o {
+                Http2ClientOutcome::Replied(_) => "replied",
+                Http2ClientOutcome::Full => "full",
+                Http2ClientOutcome::Closed => "closed",
+                Http2ClientOutcome::Reset(_) => "reset",
+                Http2ClientOutcome::LocalCancel => "local-cancel",
+                Http2ClientOutcome::ProtocolError(_) => "protocol-error",
+                Http2ClientOutcome::TlsAlpnMismatch => "tls-alpn-mismatch",
+            }
         }
-        // None of the named variants should test as "no timeout";
-        // assert this just to keep the helper used.
-        assert!(!assert_no_timeout(&Http2ClientOutcome::Full));
-        assert!(!assert_no_timeout(&Http2ClientOutcome::Closed));
-        assert!(!assert_no_timeout(&Http2ClientOutcome::TlsAlpnMismatch));
+        assert_eq!(classify(&Http2ClientOutcome::Full), "full");
+        assert_eq!(classify(&Http2ClientOutcome::Closed), "closed");
+        assert_eq!(
+            classify(&Http2ClientOutcome::TlsAlpnMismatch),
+            "tls-alpn-mismatch"
+        );
     }
 }

@@ -1236,6 +1236,19 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Http2Connection<
         Ok(())
     }
 
+    // KNOWN LIMITATION (tracked for a future "server response streaming"
+    // slice): a buffered response is sent only when the *entire* body
+    // fits both the stream and connection send-windows. A response larger
+    // than the peer's window is parked whole until a WINDOW_UPDATE opens
+    // enough credit. A strict HTTP/2 peer that does not pre-credit its
+    // receive window (it has no reason to before it sees any DATA) will
+    // therefore deadlock on responses larger than ~64 KB: the server
+    // waits for window, the peer waits for bytes. Browsers paper over
+    // this by sending a large connection WINDOW_UPDATE on connect; the
+    // native Tina client (Phase 116) does not. The fix is to slice the
+    // response across DATA frames as windows open — the mirror of the
+    // client's `flush_outbound_data` pacer — and is deliberately out of
+    // scope for the client slice.
     fn queue_or_send_response(
         &mut self,
         stream_id: u32,

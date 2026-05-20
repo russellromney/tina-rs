@@ -4,6 +4,59 @@ This file records completed work.
 
 ## Unreleased
 
+### Native HTTP/2 Client — Spec-Compliance Round 2
+
+Closes the bugs a second hostile pass found in the previously-untested
+inbound-misbehavior paths, plus two more the review surfaced. Each fix
+is pinned by an adversarial live test against a hand-rolled,
+deliberately-misbehaving HTTP/2 peer
+(`tina-http/tests/http2_client_adversarial.rs`).
+
+- **RST_STREAM on stream 0 is now a connection-level protocol error.**
+  `handle_rst_stream` rejected the illegal frame as a silent no-op
+  before (the stream-id-0 lookup just missed). RFC 9113 §6.4 requires
+  a connection-level PROTOCOL_ERROR; the client now fails the in-flight
+  stream with `Http2ProtocolError::BadStreamId` and tears the
+  connection down.
+- **GOAWAY payload is parsed and acted on.** The branch was six lines
+  that set a flag and ignored `last_stream_id` / error code. The client
+  now refuses every stream it opened with id `> last_stream_id` (those
+  were not processed by the peer, so the caller can safely retry):
+  `Closed` for a clean `GOAWAY(NO_ERROR)`, `Reset(reason)` for an
+  error-coded GOAWAY. Previously those streams hung until the socket
+  dropped.
+- **Removed `Http2ClientOutcome::FlowControlBlocked`.** Same lying-API
+  problem as `Timeout`: the variant was advertised but no code path
+  constructed it. Both land back when a real stream-level deadline
+  mechanism does. The exhaustive `outcome_surface_excludes_unimplemented_variants`
+  test now guards the whole outcome surface.
+- **`try_send` of a call-only message no longer drops silently.**
+  `Http2ClientMsg::Submit` / `::Report` delivered via `try_send` have
+  no reply channel; `Submit` would silently drop the request body. The
+  connection now `debug_assert!`s on the misuse (catches it in
+  dev/test) and the type doc states the call-only contract. Release
+  builds still no-op rather than killing the connection over a stray
+  send.
+- **PING frame errors are now correctly classified.** A PING on a
+  non-zero stream id is `BadStreamId` (PROTOCOL_ERROR); a wrong-length
+  PING is `BadFrameLength` (FRAME_SIZE_ERROR). They were collapsed into
+  `BadFrameLength` before.
+- **Server-side KNOWN LIMITATION noted.** `http2/server.rs`'s
+  `queue_or_send_response` parks a buffered response whole until the
+  full body fits the send window — a response larger than ~64 KB
+  deadlocks a strict peer (including the native client) that does not
+  pre-credit its receive window. This is a pre-existing server bug, not
+  a client regression; it is now documented in-source and queued for a
+  future "server response streaming" slice (the mirror of the client's
+  `flush_outbound_data` pacer).
+
+New adversarial tests, all passing:
+
+- `server_rst_stream_maps_to_typed_reset`
+- `server_rst_stream_on_stream_zero_is_connection_protocol_error`
+- `server_goaway_below_stream_id_refuses_unprocessed_stream`
+- `malformed_inbound_frame_does_not_panic_and_fails_stream_typed`
+
 ### Native HTTP/2 Client — Hostile-Review Fixes
 
 Follow-up to the first-form client below. Addresses the issues a
@@ -100,21 +153,26 @@ New / extended tests:
 
 ### Honest gaps still standing
 
-- **GOAWAY-mid-stream / server-RST live tests.** The plan calls for
-  proofs that an inbound RST_STREAM lands as `Reset(reason)` and
-  that a peer GOAWAY closes new admission while letting admitted
-  streams settle visibly. Both code paths are implemented and unit-
-  shape testable, but neither has a live test against a misbehaving
-  HTTP/2 peer in this slice. They land with the gRPC client slice
-  where an adversarial peer is already in scope.
-- **`Http2ClientOutcome::FlowControlBlocked`** is reachable code-wise
-  (parked outbound DATA) but no live test forces a deadline expiry
-  while parked. It will land when stream-level deadlines do.
-- **Live flow-control proof loops back through the response.** The
-  current test paces a 32 KB POST; a 128 KB end-to-end echo proof
-  would need the *server*'s response path to also stream rather
-  than buffer-and-send-when-window-fits. That is a server-side
-  enhancement, separate from this client slice.
+These are genuine future work, not unproven behavior. (The
+GOAWAY/RST/malformed-frame paths that were listed here are now fixed
+and pinned by adversarial live tests — see "Spec-Compliance Round 2"
+above.)
+
+- **Stream-level deadlines.** Until they land, the client has no
+  per-stream timeout: a caller enforces its own deadline via
+  `call_blocking_with_host_timeout` (surfacing as `CallOutcome::TimedOut`
+  at the host) and the connection keeps the stream slot until the
+  response, a reset, or connection close. The `Timeout` and
+  `FlowControlBlocked` outcome variants are deliberately absent until
+  this mechanism exists.
+- **Server response streaming.** `http2/server.rs` parks a buffered
+  response whole until it fits the send window (see the in-source
+  KNOWN LIMITATION). A response over ~64 KB deadlocks a strict peer.
+  This is a server-side fix — the mirror of the client's
+  `flow_control_parks` pacer — and is its own slice. The client's
+  outbound flow control is proven by `h2c_post_large_body_paces_through_flow_control_window`.
+- **Native gRPC client.** Not in this slice; the HTTP/2 client carries
+  response trailers visibly so the gRPC wrapper can read `grpc-status`.
 
 ### Native HTTP/2 Client — First Form
 
