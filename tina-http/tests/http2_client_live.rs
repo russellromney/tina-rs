@@ -1,16 +1,23 @@
-//! Live interop proofs for the native HTTP/2 client.
+//! Live interop proofs for the native HTTP/2 client against the
+//! in-tree Tina HTTP/2 server (Counter service). This file covers the
+//! happy paths a well-behaved server exercises:
+//! - h2c GET round-trip → typed `Replied` with status + body
+//! - h2c POST round-trip → body echoed byte-for-byte via `/echo`
+//! - multiple sequential streams share one connection isolate (report
+//!   confirms `opened == closed`, zero protocol errors)
+//! - response body over the client cap → typed `BodyTooLarge`
+//! - in-window POST through the outbound flow-control pacer
+//! - `Http2Target::Tls` returns typed `TlsAlpnMismatch` (ALPN rail
+//!   deferred), without touching the TLS rail
 //!
-//! This file spins up the existing Tina HTTP/2 server (Counter service)
-//! and dials it from the new native HTTP/2 client isolate, asserting:
-//! - h2c GET/POST round-trip happy path
-//! - typed `Http2ClientOutcome::Replied` carries status + body + trailers
-//! - bounded admission: a connection capped at `max_concurrent_streams = 1`
-//!   returns `Http2ClientOutcome::Full` for the second submit
-//! - typed `Http2ClientOutcome::TlsAlpnMismatch` on a `Http2Target::Tls`
-//!   target until the ALPN rail lands (honest deferred behavior)
+//! Adversarial / concurrency / flow-control-under-window coverage —
+//! server RST_STREAM, GOAWAY, malformed frames, *concurrent* streams
+//! not crossing replies, `Full` admission under a peer concurrency
+//! cap, caller cancel, and a 128 KB upload paced through real
+//! WINDOW_UPDATE round trips — lives in `http2_client_adversarial.rs`,
+//! which dials a hand-rolled misbehaving/foreign HTTP/2 peer.
 //!
-//! Streaming bodies, GOAWAY-mid-stream, and DST replay coverage are
-//! separate slices.
+//! DST replay coverage and the native gRPC client are separate slices.
 
 mod common;
 
@@ -256,15 +263,19 @@ fn response_body_above_cap_returns_typed_body_too_large() {
 }
 
 #[test]
-fn h2c_post_large_body_paces_through_flow_control_window() {
-    // Outbound flow-control proof. The HTTP/2 default initial stream
-    // and connection windows are 65535. A 128 KB POST therefore *must*
-    // pace through at least one window-update round trip: send 65535
-    // bytes → block on the connection window → server WINDOW_UPDATE →
-    // continue. If the client just blasted DATA past the window the
-    // server would GOAWAY with FLOW_CONTROL_ERROR and the body would
-    // never echo back. With server `max_body_bytes` widened to fit the
-    // 128 KB body, the full echo proves the pacing is correct.
+fn h2c_post_in_window_body_round_trips_against_real_server() {
+    // In-window outbound proof against the real Tina server: a 32 KB
+    // POST fits inside the 65535-byte default window, so it round-trips
+    // without needing WINDOW_UPDATE. This guards against the
+    // outbound-flow-control pacer regressing the common in-window case.
+    //
+    // The "actually park and resume on WINDOW_UPDATE" proof (a 128 KB
+    // upload through real window-update round trips) lives in
+    // `http2_client_adversarial.rs::large_upload_paces_through_real_window_updates`,
+    // which uses a hand-rolled peer that drains and credits
+    // incrementally — the in-tree server cannot host that proof because
+    // its *response* path parks the whole body until it fits the window
+    // (see the KNOWN LIMITATION in `http2/server.rs`).
     let runtime = ThreadedRuntime::with_config(
         TestShard,
         DefaultThreadedMailboxFactory,
@@ -313,12 +324,7 @@ fn h2c_post_large_body_paces_through_flow_control_window() {
     let client = make_client(&runtime, target, client_limits);
 
     // 32 KB body — half the 65535-byte default window, so the upload
-    // fits in one window without needing WINDOW_UPDATE. Proves the
-    // outbound-flow-control path does not regress the in-window case.
-    // (The "actually pace through the window" proof is harder to wire
-    // here because the server-side response path also has flow-control
-    // pacing, and getting both sides to drain in one test is brittle.
-    // The flush_outbound_data unit logic is exercised either way.)
+    // fits in one window without needing WINDOW_UPDATE.
     let body = vec![b'a'; 32 * 1024];
     let mut req = Http2ClientRequest::post("/counter", body.clone());
     req.headers.insert(

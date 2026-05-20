@@ -57,6 +57,29 @@ impl AlpnProtocols {
 /// the authority used on the wire (`:authority` and routing) is the
 /// `authority` field; `addr` is the resolved socket address used for the
 /// raw TCP connect.
+///
+/// The split is enforced by the type system, not by a runtime check. An
+/// `H2c` target cannot name a `server_name` or `trust_roots` field:
+///
+/// ```compile_fail
+/// use tina_http::Http2Target;
+/// let _ = Http2Target::H2c {
+///     authority: "x".into(),
+///     addr: "127.0.0.1:80".parse().unwrap(),
+///     server_name: "x".into(), // no such field on H2c — does not compile
+/// };
+/// ```
+///
+/// A `Tls` target must carry `server_name`, `trust_roots`, and `alpn`:
+///
+/// ```compile_fail
+/// use tina_http::Http2Target;
+/// let _ = Http2Target::Tls {
+///     authority: "x".into(),
+///     addr: "127.0.0.1:443".parse().unwrap(),
+///     // missing server_name / trust_roots / alpn — does not compile
+/// };
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Http2Target {
     /// Prior-knowledge cleartext h2c. No TLS rail is consulted.

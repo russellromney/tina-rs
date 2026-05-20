@@ -4,6 +4,71 @@ This file records completed work.
 
 ## Unreleased
 
+### Native HTTP/2 Client — Testing Gaps Closed
+
+Closes the testing gaps a third pass identified — claims that were
+true structurally but unproven, plus a stale comment and a few
+low-risk hardening items. No behavior change to the client beyond two
+dev-only `debug_assert`s; everything here is proof and polish.
+
+- **Concurrency / no-crossing proof.** New
+  `concurrent_streams_do_not_cross_replies` submits two requests from
+  separate host threads (via `std::thread::scope` sharing `&runtime`).
+  The hand-rolled peer replies in reverse order with stream-id-tagged
+  bodies; each caller asserts the body matches the stream id in its
+  own outcome. This is the first test where two streams are genuinely
+  in flight at once — the earlier "multiple streams" test was
+  sequential.
+- **`Full` admission + peer concurrency cap proof.** New
+  `peer_max_concurrent_streams_one_yields_full_for_the_excess_submit`:
+  the peer advertises `SETTINGS_MAX_CONCURRENT_STREAMS = 1` and holds
+  the first stream; of two concurrent submits, exactly one is admitted
+  and `Replied`, the other is rejected `Full`. Proves both the `Full`
+  outcome (previously unexercised live) and that the client honors the
+  peer's advertised cap.
+- **Caller-cancel proof.** New
+  `caller_cancel_returns_local_cancel_and_keeps_connection_alive`:
+  `Http2ClientMsg::Cancel { stream_id }` on a held stream returns
+  `LocalCancel` and a follow-up GET on the same connection still
+  succeeds. The `LocalCancel` path and the `Cancel` message were
+  wired in round 1 but had no live test.
+- **Real end-to-end flow-control proof.** New
+  `large_upload_paces_through_real_window_updates`: a 128 KB POST
+  against a peer that drains DATA and credits `WINDOW_UPDATE`
+  incrementally. Forces the outbound pacer to park on the 65535-byte
+  window and resume on credit, asserting `flow_control_parks > 0`.
+  (The in-tree server test stays at 32 KB because the server's
+  response path parks whole — the documented KNOWN LIMITATION.)
+- **Foreign-server interop proof.** New
+  `foreign_server_happy_path_get_returns_replied`: the client GETs a
+  hand-rolled, non-Tina HTTP/2 server (independent framing code) and
+  receives the body unchanged. Proves the client does not depend on
+  Tina-server framing quirks.
+- **Compile-fail proofs.** Two `compile_fail` doc-tests on
+  `Http2Target` pin that an `H2c` target cannot name `server_name` /
+  `trust_roots` and a `Tls` target cannot omit them. (The unary-vs-
+  streaming and gRPC-status-handling compile-fail proofs the plan also
+  names are gated on the gRPC client slice.)
+- **Stale test comment removed.** `http2_client_live.rs`'s header
+  claimed a `max_concurrent_streams = 1 → Full` test that did not
+  exist. The header now accurately lists what each test file covers
+  and points at the adversarial file for the rest.
+
+Low-risk hardening:
+
+- `Http2ClientConnection::new` `debug_assert`s `max_concurrent_streams
+  >= 1` (a zero cap silently rejects everything).
+- `connection_fact_id()` `debug_assert`s `self_isolate_id` is set, so a
+  fact emitted before the first handler turn (which would tag it with
+  connection id 0 and break replay correlation) is caught in dev/test.
+- In-source note on `complete_stream` documenting that a gRPC
+  trailers-only response lands `grpc-status` in `headers`, not
+  `trailers`, so the future gRPC wrapper checks both.
+
+The adversarial test binary now has 9 cases; the live binary 8; two
+new compile-fail doc-tests. Full `tina-http` suite green;
+`cargo fmt --check` and `cargo clippy -- -D warnings` clean.
+
 ### Native HTTP/2 Client — Spec-Compliance Round 2
 
 Closes the bugs a second hostile pass found in the previously-untested

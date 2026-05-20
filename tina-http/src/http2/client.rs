@@ -314,6 +314,14 @@ pub struct Http2ClientConnection<S: Shard + 'static> {
 
 impl<S: Shard + 'static> Http2ClientConnection<S> {
     pub fn new(target: Http2Target, limits: Http2ClientLimits) -> Self {
+        // A zero concurrency cap rejects every request with `Full` — a
+        // valid but almost certainly mistaken config. Catch it in
+        // dev/test rather than silently accept-then-reject everything.
+        debug_assert!(
+            limits.max_concurrent_streams >= 1,
+            "Http2ClientLimits::max_concurrent_streams must be >= 1 (got {})",
+            limits.max_concurrent_streams,
+        );
         Self {
             target,
             limits,
@@ -347,6 +355,15 @@ impl<S: Shard + 'static> Http2ClientConnection<S> {
     }
 
     fn connection_fact_id(&self) -> ProtocolConnectionId {
+        // Every fact-emitting path runs inside `handle` / `handle_call`,
+        // which set `self_isolate_id` on first entry. A `None` here means
+        // a fact was emitted before the first handler turn — a bug that
+        // would silently tag the fact with connection id 0 and break
+        // replay correlation. Catch it in dev/test.
+        debug_assert!(
+            self.self_isolate_id.is_some(),
+            "connection_fact_id() called before self_isolate_id was set",
+        );
         ProtocolConnectionId::new(self.self_isolate_id.map(|id| id.get()).unwrap_or_default())
     }
 }
@@ -1038,6 +1055,13 @@ impl<S: Shard + 'static> Http2ClientConnection<S> {
         Ok(())
     }
 
+    // NOTE for the future gRPC client: a "trailers-only" response
+    // (HEADERS with END_STREAM and no DATA — gRPC uses this to carry a
+    // non-OK status with no message frame) arrives here with
+    // `response_headers_seen` set on the first HEADERS and an empty
+    // body. The `grpc-status` value lands in `response_headers`, not
+    // `response_trailers`. That is correct HTTP/2 framing; the gRPC
+    // wrapper must check both `headers` and `trailers` for `grpc-status`.
     fn complete_stream(&mut self, idx: usize, effects: &mut Vec<Effect<Self>>) {
         let mut stream = self.streams.swap_remove(idx);
         let stream_id = stream.id;
