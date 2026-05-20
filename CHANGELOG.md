@@ -4,6 +4,26 @@ This file records completed work.
 
 ## Unreleased
 
+### DST Replay Honesty for the Native HTTP/2 Client
+
+The native HTTP/2 client does real outbound socket I/O
+(`tcp_connect`/`read`/`write`/`close`). The deterministic simulator's
+replay op-alphabet models *app* operations, not a remote peer's live
+socket completions, so a captured live client run cannot be silently
+re-driven from the op history. Rather than a silent no-op or a fake
+replay, a live capture carries a typed
+`tina_sim::dst::UnsupportedLiveFact` naming the client socket work, and
+`check_captured_replay` fails closed on it.
+
+- **`dst_http2_client.rs`** runs the native client live (h2c connect +
+  one GET), captures the run as a `LiveReplayCapture` whose
+  `unsupported_facts` name the client socket I/O, and asserts
+  `check_captured_replay` reports a `CapturedReplayChange::UnsupportedFact`
+  — proving the simulator does not fake the replay. The saved replay case
+  round-trips through `write_saved_replay_case` /
+  `read_saved_replay_case`, preserving the unsupported fact and the
+  explicit op history.
+
 ### Streaming gRPC Client
 
 `GrpcClient` now covers server-streaming, client-streaming, and bidi on

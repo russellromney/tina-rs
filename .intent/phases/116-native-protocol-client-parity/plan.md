@@ -73,10 +73,15 @@
   messages + status, client-streaming sends many + gets the summed reply,
   bidi echoes a streamed request back as a streamed response; plus a
   `GrpcStreamItem`-not-the-message compile-fail.
+- **DST replay honesty landed.** `dst_http2_client.rs` captures a live
+  native HTTP/2 client run and marks the client socket I/O
+  (`tcp_connect`/`read`/`write`/`close`) as a typed
+  `UnsupportedLiveFact`; `check_captured_replay` fails closed with
+  `CapturedReplayChange::UnsupportedFact` (no silent no-op, no fake
+  replay), and the saved replay case round-trips preserving the
+  unsupported fact + op history.
 - **Remaining work in this phase** (still future slices, named in
   *Includes* and *Proof Shape* below):
-  - DST replay for live client socket work (typed unsupported fact
-    + saved replay case).
   - **Full-duplex h2/TLS** (concurrent bidi over TLS): needs a
     non-blocking TLS reactor in the runtime (split TLS read/write
     lanes + sans-IO rustls in the poll loop). Out of Phase 116 scope;
@@ -86,8 +91,6 @@
     `Http2Target::route_key()` shape.
   - Tina-client → tonic-server interop (needs tonic as a `tina-http`
     dep; deferred). Tina-client ↔ Tina-server gRPC is proven.
-  - HTTPS/2 client compile-fail proofs for the typed gates, and the
-    gRPC streaming compile-fail proofs (gated on streaming).
 - Can run in parallel with phases 117 and 118 if ownership stays in `tina-http`,
   TLS ALPN rail data, protocol facts, docs, and protocol specimens.
 - Runs before Phase 119 resource maturity. HTTP/2/gRPC client pooling needs
