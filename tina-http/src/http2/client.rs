@@ -785,7 +785,7 @@ impl<S: Shard + 'static> Http2ClientConnection<S> {
         let mut idx = 0;
         while idx < self.streams.len() {
             if self.streams[idx].id > last_stream_id {
-                self.fail_stream(idx, refused_outcome.clone(), effects);
+                self.fail_stream(idx, refused_outcome.clone(), Http2CloseReason::GoAway, effects);
                 // fail_stream swap_removes, so do not advance idx.
             } else {
                 idx += 1;
@@ -949,9 +949,11 @@ impl<S: Shard + 'static> Http2ClientConnection<S> {
         {
             let cap_bytes = self.limits.max_response_body_bytes;
             self.enqueue_frame(rst_stream_frame(stream_id, ERR_PROTOCOL_ERROR));
+            // We sent the RST_STREAM, so this is a local close.
             self.fail_stream(
                 idx,
                 Http2ClientOutcome::ProtocolError(Http2ProtocolError::BodyTooLarge { cap_bytes }),
+                Http2CloseReason::LocalCloseOnly,
                 effects,
             );
             return Ok(());
@@ -1033,7 +1035,13 @@ impl<S: Shard + 'static> Http2ClientConnection<S> {
             direction: ProtocolDirection::Inbound,
             reason,
         }));
-        self.fail_stream(idx, Http2ClientOutcome::Reset(reason), effects);
+        // Peer-initiated RST_STREAM: the remote closed this stream.
+        self.fail_stream(
+            idx,
+            Http2ClientOutcome::Reset(reason),
+            Http2CloseReason::RemoteCloseOnly,
+            effects,
+        );
         Ok(())
     }
 
@@ -1088,22 +1096,22 @@ impl<S: Shard + 'static> Http2ClientConnection<S> {
         }
     }
 
+    /// Fail one stream with a typed outcome and an explicit close
+    /// reason. The close reason is supplied by the caller rather than
+    /// derived from the outcome, because the same outcome can come from
+    /// different causes (e.g. `Reset(reason)` is produced both by a peer
+    /// RST_STREAM — a `RemoteCloseOnly` — and by an error-coded GOAWAY —
+    /// a `GoAway`), and replay correlation needs the precise cause.
     fn fail_stream(
         &mut self,
         idx: usize,
         outcome: Http2ClientOutcome,
+        close_reason: Http2CloseReason,
         effects: &mut Vec<Effect<Self>>,
     ) {
         let mut stream = self.streams.swap_remove(idx);
         let stream_id = stream.id;
         self.report.closed_streams += 1;
-        let close_reason = match &outcome {
-            Http2ClientOutcome::Reset(_) | Http2ClientOutcome::LocalCancel => {
-                Http2CloseReason::LocalCloseOnly
-            }
-            Http2ClientOutcome::Closed => Http2CloseReason::GoAway,
-            _ => Http2CloseReason::LocalCloseOnly,
-        };
         effects.push(emit_fact(ProtocolFact::Http2StreamClosed {
             connection: self.connection_fact_id(),
             stream: Http2StreamId::new(stream_id),
