@@ -30,19 +30,31 @@
 - **`Http2ClientMsg::Cancel { stream_id }` landed** with outbound
   RST_STREAM(CANCEL), `LocalCancel` outcome, and an outbound reset fact
   (parts 3/5).
+- **TLS ALPN rail landed (runtime + sim).** `CallInput::TlsConnect`/
+  `TlsBind` carry `alpn_protocols`; `CallOutput::TlsConnected`/
+  `TlsAccepted` carry `selected_alpn`; `CallError::TlsAlpnMismatch`.
+  New `tls_connect_alpn`/`tls_bind_alpn`/`tls_accept_alpn`. Real rustls
+  ALPN negotiation; runtime tests prove h2 selection + mismatch.
+- **HTTP/2 client over TLS landed.** `ClientStream` {Tcp, Tls};
+  `Http2Target::Tls` does `tls_connect_alpn` and runs HTTP/2 over the
+  encrypted stream. Real ALPN: offered-but-none → `TlsAlpnMismatch`
+  outcome. `pump_io` runs full-duplex on TCP and half-duplex on TLS.
+  Live h2/TLS tests prove round-trip + mismatch + untrusted-cert.
 - **Remaining work in this phase** (still future slices, named in
   *Includes* and *Proof Shape* below):
-  - Streaming gRPC client (`server_streaming` / `client_streaming` /
-    `bidi`), gated on HTTP/2 client streaming bodies below.
   - HTTP/2 client streaming request and response bodies (today's
-    client buffers both under explicit caps).
-  - TLS ALPN on the runtime: thread `AlpnProtocols` through
-    `CallInput::TlsConnect` / `TlsBind`, return `selected_alpn` in
-    `CallOutput::TlsConnected` / `TlsAccepted`, plumb the bytes
-    through rustls. The client surface already takes
-    `AlpnProtocols::h2()`; today's TLS rail does not carry the bytes.
+    client buffers both under explicit caps). Design: a request
+    chunk-source pull (mirror of the server's `IterBodySource`) and
+    incremental response chunk delivery to a caller sink with
+    backpressure. Blocker for streaming gRPC.
+  - Streaming gRPC client (`server_streaming` / `client_streaming` /
+    `bidi`), gated on the streaming bodies above.
   - DST replay for live client socket work (typed unsupported fact
-    + saved replay case once the typed-ALPN rail lands).
+    + saved replay case).
+  - **Full-duplex h2/TLS** (concurrent bidi over TLS): needs a
+    non-blocking TLS reactor in the runtime (split TLS read/write
+    lanes + sans-IO rustls in the poll loop). Out of Phase 116 scope;
+    a runtime-maturity phase. Unary/request-response h2/TLS works now.
   - Connection-reuse pool (idle eviction, max lifetime, health
     policy) — Phase 119, using the new
     `Http2Target::route_key()` shape.
