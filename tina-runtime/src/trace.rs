@@ -273,6 +273,27 @@ pub enum CallKind {
     /// The runtime delivers a [`tina::CancelOutcome`] back to the
     /// requester as an ordinary later message.
     CancelCall,
+
+    /// A Unix-domain listener bind.
+    UnixBind,
+
+    /// A Unix-domain listener accept.
+    UnixAccept,
+
+    /// An outbound Unix-domain connect.
+    UnixConnect,
+
+    /// A Unix-domain stream read.
+    UnixRead,
+
+    /// A Unix-domain stream write.
+    UnixWrite,
+
+    /// A Unix-domain listener close.
+    UnixListenerClose,
+
+    /// A Unix-domain stream close.
+    UnixStreamClose,
 }
 
 /// Why a runtime-owned call's completion could not be delivered to the
@@ -1298,6 +1319,13 @@ fn call_kind_tag(kind: CallKind) -> u8 {
         CallKind::ObservedSend => 39,
         CallKind::IsolateCall => 40,
         CallKind::CancelCall => 41,
+        CallKind::UnixBind => 42,
+        CallKind::UnixAccept => 43,
+        CallKind::UnixConnect => 44,
+        CallKind::UnixRead => 45,
+        CallKind::UnixWrite => 46,
+        CallKind::UnixListenerClose => 47,
+        CallKind::UnixStreamClose => 48,
     }
 }
 
@@ -2004,5 +2032,72 @@ mod stable_hash_tests {
         // with payload — adding/removing the prefix would change the value.
         // A guarded duplicate run is the simplest fail-closed check.
         assert_eq!(event.stable_hash(), event.stable_hash());
+    }
+
+    // Golden pin for the stable `CallKind` -> tag mapping. These tags are
+    // load-bearing for replay trace hashing: renumbering any of them
+    // silently invalidates every saved replay case. New call kinds must
+    // *append* (the existing 1..=41 values must never move); this test
+    // fails closed if a refactor reorders or renumbers them.
+    #[test]
+    fn call_kind_tags_are_stable_golden() {
+        let cases = [
+            (CallKind::TcpBind, 1u8),
+            (CallKind::TcpAccept, 2),
+            (CallKind::TcpConnect, 3),
+            (CallKind::TcpRead, 4),
+            (CallKind::TcpWrite, 5),
+            (CallKind::TcpListenerClose, 6),
+            (CallKind::TcpStreamClose, 7),
+            (CallKind::UdpBind, 8),
+            (CallKind::UdpSendTo, 9),
+            (CallKind::UdpRecvFrom, 10),
+            (CallKind::UdpSocketClose, 11),
+            (CallKind::TlsConnect, 12),
+            (CallKind::TlsBind, 13),
+            (CallKind::TlsAccept, 14),
+            (CallKind::TlsListenerClose, 15),
+            (CallKind::TlsRead, 16),
+            (CallKind::TlsWrite, 17),
+            (CallKind::TlsClose, 18),
+            (CallKind::DnsLookup, 19),
+            (CallKind::SignalWait, 20),
+            (CallKind::ProcessRun, 21),
+            (CallKind::FileOpen, 22),
+            (CallKind::FileReadAt, 23),
+            (CallKind::FileWriteAt, 24),
+            (CallKind::FileFsync, 25),
+            (CallKind::FileSize, 26),
+            (CallKind::FileClose, 27),
+            (CallKind::Mkdir, 28),
+            (CallKind::PathMetadata, 29),
+            (CallKind::RenameReplace, 30),
+            (CallKind::RemoveFile, 31),
+            (CallKind::ReadDir, 32),
+            (CallKind::SyncParent, 33),
+            (CallKind::SnapshotCommit, 34),
+            (CallKind::SnapshotLoad, 35),
+            (CallKind::JournalAppend, 36),
+            (CallKind::JournalReplay, 37),
+            (CallKind::Sleep, 38),
+            (CallKind::ObservedSend, 39),
+            (CallKind::IsolateCall, 40),
+            (CallKind::CancelCall, 41),
+            // Phase 117 Unix-domain rails, appended.
+            (CallKind::UnixBind, 42),
+            (CallKind::UnixAccept, 43),
+            (CallKind::UnixConnect, 44),
+            (CallKind::UnixRead, 45),
+            (CallKind::UnixWrite, 46),
+            (CallKind::UnixListenerClose, 47),
+            (CallKind::UnixStreamClose, 48),
+        ];
+        for (kind, expected) in cases {
+            assert_eq!(
+                call_kind_tag(kind),
+                expected,
+                "stable tag for {kind:?} changed; renumbering breaks saved replay hashes",
+            );
+        }
     }
 }

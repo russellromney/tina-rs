@@ -68,6 +68,7 @@ mod time;
 mod tls;
 mod types;
 mod udp;
+mod unix;
 
 pub use cancel::*;
 pub use dns::*;
@@ -83,6 +84,7 @@ pub use time::*;
 pub use tls::*;
 pub use types::*;
 pub use udp::*;
+pub use unix::*;
 
 use std::any::Any;
 use std::net::SocketAddr;
@@ -1006,6 +1008,69 @@ impl CallOutput {
         }
     }
 
+    /// Extracts the successful Unix bind result.
+    pub fn into_unix_bound(self) -> Result<(UnixListenerId, std::path::PathBuf), CallError> {
+        match self {
+            Self::UnixBound { listener, path } => Ok((listener, path)),
+            Self::Failed(error) => Err(error),
+            other => Self::panic_wrong_shape("UnixBound", &other),
+        }
+    }
+
+    /// Extracts the successful Unix accept result.
+    pub fn into_unix_accepted(self) -> Result<UnixStreamId, CallError> {
+        match self {
+            Self::UnixAccepted { stream } => Ok(stream),
+            Self::Failed(error) => Err(error),
+            other => Self::panic_wrong_shape("UnixAccepted", &other),
+        }
+    }
+
+    /// Extracts the successful Unix connect result.
+    pub fn into_unix_connected(self) -> Result<UnixStreamId, CallError> {
+        match self {
+            Self::UnixConnected { stream } => Ok(stream),
+            Self::Failed(error) => Err(error),
+            other => Self::panic_wrong_shape("UnixConnected", &other),
+        }
+    }
+
+    /// Extracts the successful Unix read payload.
+    pub fn into_unix_read(self) -> Result<Vec<u8>, CallError> {
+        match self {
+            Self::UnixRead { bytes } => Ok(bytes),
+            Self::Failed(error) => Err(error),
+            other => Self::panic_wrong_shape("UnixRead", &other),
+        }
+    }
+
+    /// Extracts the successful Unix write count.
+    pub fn into_unix_wrote(self) -> Result<usize, CallError> {
+        match self {
+            Self::UnixWrote { count } => Ok(count),
+            Self::Failed(error) => Err(error),
+            other => Self::panic_wrong_shape("UnixWrote", &other),
+        }
+    }
+
+    /// Extracts the successful Unix listener close completion.
+    pub fn into_unix_listener_closed(self) -> Result<(), CallError> {
+        match self {
+            Self::UnixListenerClosed => Ok(()),
+            Self::Failed(error) => Err(error),
+            other => Self::panic_wrong_shape("UnixListenerClosed", &other),
+        }
+    }
+
+    /// Extracts the successful Unix stream close completion.
+    pub fn into_unix_stream_closed(self) -> Result<(), CallError> {
+        match self {
+            Self::UnixStreamClosed => Ok(()),
+            Self::Failed(error) => Err(error),
+            other => Self::panic_wrong_shape("UnixStreamClosed", &other),
+        }
+    }
+
     /// Extracts the successful snapshot commit result.
     pub fn into_snapshot_committed(self) -> Result<(), CallError> {
         match self {
@@ -1646,6 +1711,27 @@ pub type ReadDirReply = CallReply<Vec<PathBuf>>;
 
 /// Reply delivered by [`sync_parent`].
 pub type SyncParentReply = CallReply<()>;
+
+/// Reply delivered by [`unix_bind`].
+pub type UnixBindReply = CallReply<(UnixListenerId, std::path::PathBuf)>;
+
+/// Reply delivered by [`unix_accept`].
+pub type UnixAcceptReply = CallReply<UnixStreamId>;
+
+/// Reply delivered by [`unix_connect`].
+pub type UnixConnectReply = CallReply<UnixStreamId>;
+
+/// Reply delivered by [`unix_read`].
+pub type UnixReadReply = CallReply<Vec<u8>>;
+
+/// Reply delivered by [`unix_write`].
+pub type UnixWriteReply = CallReply<usize>;
+
+/// Reply delivered by [`unix_close_listener`].
+pub type UnixListenerCloseReply = CallReply<()>;
+
+/// Reply delivered by [`unix_close_stream`].
+pub type UnixStreamCloseReply = CallReply<()>;
 
 #[cfg(test)]
 mod pending_cancelable_call_set_tests {

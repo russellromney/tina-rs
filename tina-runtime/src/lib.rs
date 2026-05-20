@@ -53,6 +53,7 @@ mod driver;
 mod errors;
 pub mod event_sink;
 mod fact;
+pub mod file_loops;
 mod full_handling;
 pub mod guarded_pending;
 mod host_burst;
@@ -174,14 +175,17 @@ pub use call::{
     TcpListenerCloseReply, TcpReadReply, TcpStreamCloseReply, TcpWriteReply, TlsAcceptReply,
     TlsBindReply, TlsCloseReply, TlsConnectReply, TlsListenerCloseReply, TlsListenerId,
     TlsReadReply, TlsStreamId, TlsWriteReply, TypedCall, UdpBindReply, UdpCloseSocketReply,
-    UdpRecvFromReply, UdpSendToReply, UdpSocketId, WorkTicket, call, call_cancelable,
-    call_handle_call_id, call_request, call_typed, call_with_handle, cancel_call, dns_lookup,
-    file_close, file_create, file_fsync, file_open, file_read, file_read_at, file_size, file_write,
-    file_write_at, journal_append, journal_replay, mkdir, path_metadata, process_run, read_dir,
-    remove_file, rename_replace, send_observed, signal_wait, sleep, sleep_then, snapshot_commit,
-    snapshot_load, sync_parent, tcp_accept, tcp_bind, tcp_close_listener, tcp_close_stream,
-    tcp_connect, tcp_read, tcp_write, tls_accept, tls_bind, tls_close, tls_close_listener,
-    tls_connect, tls_read, tls_write, udp_bind, udp_close_socket, udp_recv_from, udp_send_to,
+    UdpRecvFromReply, UdpSendToReply, UdpSocketId, UnixAcceptReply, UnixBindReply,
+    UnixConnectReply, UnixListenerCloseReply, UnixListenerId, UnixReadReply, UnixStreamCloseReply,
+    UnixStreamId, UnixWriteReply, WorkTicket, call, call_cancelable, call_handle_call_id,
+    call_request, call_typed, call_with_handle, cancel_call, dns_lookup, file_close, file_create,
+    file_fsync, file_open, file_read, file_read_at, file_size, file_write, file_write_at,
+    journal_append, journal_replay, mkdir, path_metadata, process_run, read_dir, remove_file,
+    rename_replace, send_observed, signal_wait, sleep, sleep_then, snapshot_commit, snapshot_load,
+    sync_parent, tcp_accept, tcp_bind, tcp_close_listener, tcp_close_stream, tcp_connect, tcp_read,
+    tcp_write, tls_accept, tls_bind, tls_close, tls_close_listener, tls_connect, tls_read,
+    tls_write, udp_bind, udp_close_socket, udp_recv_from, udp_send_to, unix_accept, unix_bind,
+    unix_close_listener, unix_close_stream, unix_connect, unix_read, unix_write,
 };
 pub use call_group::{
     CallGroup, CallGroupBranchOutcome, CallGroupCancelOutcome, CallGroupCancelRequest,
@@ -205,6 +209,10 @@ pub use fact::{
     GrpcStatusCode, GrpcStreamId, Http2CloseReason, Http2FlowControlSide, Http2ResetReason,
     Http2StreamId, IntoRuntimeFact, ProtocolConnectionId, ProtocolDirection, ProtocolFact,
     ProtocolFamily, RuntimeFact, WebSocketCloseReason, WebSocketSessionId,
+};
+pub use file_loops::{
+    CopyLeg, FileCopyBounded, FileLoopEnd, FileLoopReport, FileLoopStep, FileReadChunks,
+    FileWriteAll,
 };
 pub use guarded_pending::{
     GuardedInsertError, GuardedParkCallError, GuardedParkError, GuardedParkTicket,

@@ -3167,6 +3167,7 @@ fn scripted_udp_completion_capacity_is_separate_from_tcp_completion_capacity() {
             signal: Default::default(),
             process: Default::default(),
             storage: Default::default(),
+            ..Default::default()
         },
     );
 
@@ -3602,6 +3603,7 @@ fn accept_reports_peer_addr_and_read_write_use_live_result_shapes() {
             tls: Default::default(),
             signal: Default::default(),
             process: Default::default(),
+            ..Default::default()
         },
     );
 
@@ -3729,6 +3731,7 @@ fn closed_stream_id_surfaces_invalid_resource() {
             tls: Default::default(),
             signal: Default::default(),
             process: Default::default(),
+            ..Default::default()
         },
     );
 
@@ -3791,6 +3794,7 @@ fn pending_completion_capacity_exhaustion_surfaces_io_failure() {
             tls: Default::default(),
             signal: Default::default(),
             process: Default::default(),
+            ..Default::default()
         },
     );
 
@@ -3867,6 +3871,7 @@ fn listener_close_while_accept_pending_cancels_accept_and_closes() {
             tls: Default::default(),
             signal: Default::default(),
             process: Default::default(),
+            ..Default::default()
         },
     );
 
@@ -4449,6 +4454,7 @@ fn run_seeded_cancellation_case(history: &History<CancellationOp>) -> DstRun<(),
             tls: Default::default(),
             signal: Default::default(),
             process: Default::default(),
+            ..Default::default()
         },
     );
 
@@ -4770,6 +4776,7 @@ fn tcp_checker_failure_replays_under_ready_reordering() {
         tls: Default::default(),
         signal: Default::default(),
         process: Default::default(),
+        ..Default::default()
     };
 
     let mut sim = Simulator::new(TestShard, config);

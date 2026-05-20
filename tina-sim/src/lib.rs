@@ -70,6 +70,7 @@ pub use config::{
     ScriptedStorageFaultConfig, ScriptedTcpConfig, ScriptedTlsConfig, ScriptedTlsConnectConfig,
     ScriptedTlsConnectResult, ScriptedTlsReadResult, ScriptedTlsWriteResult, ScriptedUdpConfig,
     ScriptedUdpDatagramConfig, ScriptedUdpSocketConfig, SimulatorConfig, TcpCompletionFaultMode,
+    UnixSimConfig,
 };
 pub use multi_shard::{MultiShardSimulator, MultiShardSimulatorConfig};
 
@@ -96,6 +97,8 @@ where
     pub(crate) next_tls_listener_id: u64,
     pub(crate) next_tls_stream_id: u64,
     pub(crate) next_file_id: u64,
+    pub(crate) next_unix_listener_id: u64,
+    pub(crate) next_unix_stream_id: u64,
     pub(crate) ids: IdSource,
     pub(crate) trace: Vec<RuntimeEvent>,
     pub(crate) virtual_now: Duration,
@@ -128,6 +131,11 @@ where
     pub(crate) tls_listeners: Vec<TlsListenerState>,
     pub(crate) tls_streams: Vec<TlsStreamState>,
     pub(crate) files: Vec<FileState>,
+    pub(crate) unix_listeners: Vec<UnixListenerState>,
+    pub(crate) unix_streams: Vec<UnixStreamState>,
+    pub(crate) pending_unix_accepts: Vec<PendingUnixAccept>,
+    pub(crate) pending_unix_connects: Vec<PendingUnixConnect>,
+    pub(crate) pending_unix_reads: Vec<PendingUnixRead>,
     pub(crate) file_storage: BTreeMap<PathBuf, Vec<u8>>,
     pub(crate) directories: Vec<PathBuf>,
     pub(crate) pending_accepts: Vec<PendingAccept>,
@@ -178,6 +186,8 @@ where
             next_tls_listener_id: 1,
             next_tls_stream_id: 1,
             next_file_id: 1,
+            next_unix_listener_id: 1,
+            next_unix_stream_id: 1,
             ids,
             trace: Vec::with_capacity(INITIAL_TRACE_CAPACITY),
             virtual_now: Duration::ZERO,
@@ -194,6 +204,11 @@ where
             tls_listeners: Vec::with_capacity(INITIAL_TCP_RESOURCE_CAPACITY),
             tls_streams: Vec::with_capacity(INITIAL_TCP_RESOURCE_CAPACITY),
             files: Vec::with_capacity(INITIAL_TCP_RESOURCE_CAPACITY),
+            unix_listeners: Vec::with_capacity(INITIAL_TCP_RESOURCE_CAPACITY),
+            unix_streams: Vec::with_capacity(INITIAL_TCP_RESOURCE_CAPACITY),
+            pending_unix_accepts: Vec::with_capacity(INITIAL_CALL_CAPACITY),
+            pending_unix_connects: Vec::with_capacity(INITIAL_CALL_CAPACITY),
+            pending_unix_reads: Vec::with_capacity(INITIAL_CALL_CAPACITY),
             file_storage: BTreeMap::new(),
             directories: Vec::with_capacity(INITIAL_TCP_RESOURCE_CAPACITY),
             pending_accepts: Vec::with_capacity(INITIAL_CALL_CAPACITY),
@@ -258,6 +273,9 @@ where
             || !self.pending_connects.is_empty()
             || !self.pending_udp_recvs.is_empty()
             || !self.pending_isolate_calls.is_empty()
+            || !self.pending_unix_accepts.is_empty()
+            || !self.pending_unix_connects.is_empty()
+            || !self.pending_unix_reads.is_empty()
     }
 }
 

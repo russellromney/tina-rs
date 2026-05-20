@@ -614,6 +614,13 @@ pub fn call_kind_name(kind: CallKind) -> &'static str {
         CallKind::ObservedSend => "observed_send",
         CallKind::IsolateCall => "isolate_call",
         CallKind::CancelCall => "cancel_call",
+        CallKind::UnixBind => "unix_bind",
+        CallKind::UnixAccept => "unix_accept",
+        CallKind::UnixConnect => "unix_connect",
+        CallKind::UnixRead => "unix_read",
+        CallKind::UnixWrite => "unix_write",
+        CallKind::UnixListenerClose => "unix_listener_close",
+        CallKind::UnixStreamClose => "unix_stream_close",
     }
 }
 

@@ -1,0 +1,11 @@
+error[E0308]: mismatched types
+  --> tests/compile_fail/stringly_frame.rs:12:30
+   |
+10 |     match framer.next_frame() {
+   |           ------------------- this expression has type `FrameDecision<Vec<u8>, MalformedLineReason>`
+11 |         // `Frame` carries `Vec<u8>`, not `&str`: this arm is a type error.
+12 |         FrameDecision::Frame("hello") => {}
+   |                              ^^^^^^^ expected `Vec<u8>`, found `&str`
+   |
+   = note: expected struct `Vec<u8>`
+           found reference `&'static str`

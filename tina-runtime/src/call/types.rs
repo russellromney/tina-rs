@@ -104,6 +104,47 @@ impl TlsListenerId {
     }
 }
 
+/// Runtime-owned identifier for a Unix-domain listener resource.
+///
+/// Distinct from [`ListenerId`]: a TCP listener id cannot be passed to a
+/// Unix accept call, and a Unix listener id cannot be passed to a TCP
+/// accept call. Wrong-rail use is a typed runtime error, not accidental
+/// success.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct UnixListenerId(u64);
+
+impl UnixListenerId {
+    /// Creates a Unix listener identifier from a raw integer.
+    pub const fn new(raw: u64) -> Self {
+        Self(raw)
+    }
+
+    /// Returns the raw Unix listener identifier.
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+/// Runtime-owned identifier for a Unix-domain stream resource.
+///
+/// Distinct from [`StreamId`]: a TCP stream id cannot be passed to a
+/// Unix read/write call, and a Unix stream id cannot be passed to a TCP
+/// read/write call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct UnixStreamId(u64);
+
+impl UnixStreamId {
+    /// Creates a Unix stream identifier from a raw integer.
+    pub const fn new(raw: u64) -> Self {
+        Self(raw)
+    }
+
+    /// Returns the raw Unix stream identifier.
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
 /// Runtime-owned identifier for an opened file resource.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct FileId(u64);

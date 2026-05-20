@@ -46,7 +46,9 @@ use tina_runtime::{
     TcpReadReply, TcpStreamCloseReply, TcpWriteReply, TlsAcceptReply, TlsBindReply, TlsCloseReply,
     TlsConnectReply, TlsListenerCloseReply, TlsListenerId, TlsReadReply, TlsStreamId,
     TlsWriteReply, UdpBindReply, UdpCloseSocketReply, UdpRecvFromReply, UdpSendToReply,
-    UdpSocketId, call_reply_reason_for_cause, deferred_reply_reason_for_cause,
+    UdpSocketId, UnixAcceptReply, UnixBindReply, UnixConnectReply, UnixListenerCloseReply,
+    UnixListenerId, UnixReadReply, UnixStreamCloseReply, UnixStreamId, UnixWriteReply,
+    call_reply_reason_for_cause, deferred_reply_reason_for_cause,
 };
 use tina_supervisor::SupervisorConfig;
 
@@ -1519,6 +1521,19 @@ where
                 bytes,
             } => self.handle_journal_append(call_id, path, record_index, bytes),
             CallInput::JournalReplay { path } => self.handle_journal_replay(call_id, path),
+            CallInput::UnixBind { path } => self.handle_unix_bind(call_id, path),
+            CallInput::UnixAccept { listener } => self.handle_unix_accept(call_id, listener),
+            CallInput::UnixConnect { path } => self.handle_unix_connect(call_id, path),
+            CallInput::UnixRead { stream, max_len } => {
+                self.handle_unix_read(call_id, stream, max_len)
+            }
+            CallInput::UnixWrite { stream, bytes } => {
+                self.handle_unix_write(call_id, stream, bytes)
+            }
+            CallInput::UnixListenerClose { listener } => {
+                self.handle_unix_listener_close(call_id, listener)
+            }
+            CallInput::UnixStreamClose { stream } => self.handle_unix_stream_close(call_id, stream),
         }
     }
 
@@ -3054,6 +3069,318 @@ where
         );
     }
 
+    // -- Unix-domain rails ---------------------------------------------------
+    //
+    // The simulator pairs Unix streams dynamically: `unix_bind(path)` creates
+    // a listener, and the next `unix_connect(path)` allocates a paired
+    // (server, client) stream and resolves both calls. Per-stream caps come
+    // from `SimulatorConfig::unix` so behavior under partial-write and
+    // bounded inbound buffers stays explicit instead of accidental.
+
+    pub(crate) fn unix_listener_index(&self, listener: UnixListenerId) -> Option<usize> {
+        self.unix_listeners
+            .iter()
+            .position(|state| state.id == listener && !state.closed)
+    }
+
+    pub(crate) fn unix_listener_index_at_path(&self, path: &std::path::Path) -> Option<usize> {
+        self.unix_listeners
+            .iter()
+            .position(|state| state.path == path && !state.closed)
+    }
+
+    pub(crate) fn unix_stream_index(&self, stream: UnixStreamId) -> Option<usize> {
+        self.unix_streams
+            .iter()
+            .position(|state| state.id == stream && !state.closed)
+    }
+
+    pub(crate) fn unix_stream_index_any(&self, stream: UnixStreamId) -> Option<usize> {
+        self.unix_streams
+            .iter()
+            .position(|state| state.id == stream)
+    }
+
+    fn allocate_unix_stream_pair(&mut self) -> (UnixStreamId, UnixStreamId) {
+        let server = UnixStreamId::new(self.next_unix_stream_id);
+        self.next_unix_stream_id += 1;
+        let client = UnixStreamId::new(self.next_unix_stream_id);
+        self.next_unix_stream_id += 1;
+        let inbound_capacity = self.config.unix.default_inbound_capacity;
+        let write_cap = self.config.unix.default_write_cap;
+        self.unix_streams.push(UnixStreamState {
+            id: server,
+            peer: Some(client),
+            inbound: std::collections::VecDeque::new(),
+            inbound_capacity,
+            write_cap,
+            closed: false,
+            peer_closed: false,
+        });
+        self.unix_streams.push(UnixStreamState {
+            id: client,
+            peer: Some(server),
+            inbound: std::collections::VecDeque::new(),
+            inbound_capacity,
+            write_cap,
+            closed: false,
+            peer_closed: false,
+        });
+        (server, client)
+    }
+
+    pub(crate) fn handle_unix_bind(&mut self, call_id: CallId, path: PathBuf) {
+        if self.unix_listener_index_at_path(&path).is_some() {
+            self.deliver_completion(call_id, CallOutput::Failed(CallError::Io));
+            return;
+        }
+        // Reuse a closed listener slot at this path so a bind/close/bind
+        // loop does not grow `unix_listeners` without bound.
+        self.unix_listeners
+            .retain(|state| !(state.closed && state.path == path));
+        let listener = UnixListenerId::new(self.next_unix_listener_id);
+        self.next_unix_listener_id += 1;
+        self.unix_listeners.push(UnixListenerState {
+            id: listener,
+            path: path.clone(),
+            closed: false,
+        });
+        self.deliver_completion(call_id, CallOutput::UnixBound { listener, path });
+    }
+
+    pub(crate) fn handle_unix_accept(&mut self, call_id: CallId, listener: UnixListenerId) {
+        if self.unix_listener_index(listener).is_none() {
+            self.deliver_completion(call_id, CallOutput::Failed(CallError::InvalidResource));
+            return;
+        }
+        let resource = TcpResourceKey::UnixListenerAccept(listener);
+        if self.resource_has_active_pending(resource) {
+            self.deliver_completion(call_id, CallOutput::Failed(CallError::ResourceBusy));
+            return;
+        }
+        // If a connect is already parked on this listener, pair them now.
+        if let Some(connect_index) = self
+            .pending_unix_connects
+            .iter()
+            .position(|pending| pending.listener == listener)
+        {
+            let connect = self.pending_unix_connects.remove(connect_index);
+            self.pair_unix_accept_connect(call_id, connect.call_id, listener);
+            return;
+        }
+        self.pending_unix_accepts
+            .push(PendingUnixAccept { call_id, listener });
+    }
+
+    pub(crate) fn handle_unix_connect(&mut self, call_id: CallId, path: PathBuf) {
+        let Some(listener_index) = self.unix_listener_index_at_path(&path) else {
+            // No live listener bound at this path: connection refused.
+            self.deliver_completion(call_id, CallOutput::Failed(CallError::NotFound));
+            return;
+        };
+        let listener = self.unix_listeners[listener_index].id;
+        // Pair with a parked accept if one is waiting; otherwise park the
+        // connect until an accept arrives (symmetric with TCP).
+        if let Some(accept_index) = self
+            .pending_unix_accepts
+            .iter()
+            .position(|pending| pending.listener == listener)
+        {
+            let accept = self.pending_unix_accepts.remove(accept_index);
+            self.pair_unix_accept_connect(accept.call_id, call_id, listener);
+        } else {
+            self.pending_unix_connects
+                .push(PendingUnixConnect { call_id, listener });
+        }
+    }
+
+    /// Allocate a paired stream and resolve both the accept-side and
+    /// connect-side calls. The server end is delivered to `accept_call`,
+    /// the client end to `connect_call`.
+    fn pair_unix_accept_connect(
+        &mut self,
+        accept_call: CallId,
+        connect_call: CallId,
+        listener: UnixListenerId,
+    ) {
+        let (server, client) = self.allocate_unix_stream_pair();
+        self.schedule_tcp_completion(
+            accept_call,
+            TcpResourceKey::UnixListenerAccept(listener),
+            CallOutput::UnixAccepted { stream: server },
+        );
+        self.schedule_tcp_completion(
+            connect_call,
+            TcpResourceKey::UnixConnect(connect_call),
+            CallOutput::UnixConnected { stream: client },
+        );
+    }
+
+    pub(crate) fn handle_unix_read(
+        &mut self,
+        call_id: CallId,
+        stream: UnixStreamId,
+        max_len: usize,
+    ) {
+        let Some(stream_index) = self.unix_stream_index(stream) else {
+            self.deliver_completion(call_id, CallOutput::Failed(CallError::InvalidResource));
+            return;
+        };
+        let resource = TcpResourceKey::UnixStreamRead(stream);
+        if self.resource_has_active_pending(resource) {
+            self.deliver_completion(call_id, CallOutput::Failed(CallError::ResourceBusy));
+            return;
+        }
+        // If bytes are available now, satisfy immediately. If the peer is
+        // closed and inbound is empty, return EOF. Otherwise park.
+        let state = &mut self.unix_streams[stream_index];
+        if !state.inbound.is_empty() {
+            let take = state.inbound.len().min(max_len);
+            let bytes: Vec<u8> = state.inbound.drain(..take).collect();
+            self.schedule_tcp_completion(call_id, resource, CallOutput::UnixRead { bytes });
+            return;
+        }
+        if state.peer_closed {
+            self.schedule_tcp_completion(
+                call_id,
+                resource,
+                CallOutput::UnixRead { bytes: Vec::new() },
+            );
+            return;
+        }
+        self.pending_unix_reads.push(PendingUnixRead {
+            call_id,
+            stream,
+            max_len,
+        });
+    }
+
+    pub(crate) fn handle_unix_write(
+        &mut self,
+        call_id: CallId,
+        stream: UnixStreamId,
+        bytes: Vec<u8>,
+    ) {
+        let Some(stream_index) = self.unix_stream_index(stream) else {
+            self.deliver_completion(call_id, CallOutput::Failed(CallError::InvalidResource));
+            return;
+        };
+        let resource = TcpResourceKey::UnixStreamWrite(stream);
+        if self.resource_has_active_pending(resource) {
+            self.deliver_completion(call_id, CallOutput::Failed(CallError::ResourceBusy));
+            return;
+        }
+        let peer_id = match self.unix_streams[stream_index].peer {
+            Some(id) => id,
+            None => {
+                self.schedule_tcp_completion(call_id, resource, CallOutput::Failed(CallError::Io));
+                return;
+            }
+        };
+        let write_cap = self.unix_streams[stream_index].write_cap;
+        let Some(peer_index) = self.unix_stream_index_any(peer_id) else {
+            self.schedule_tcp_completion(call_id, resource, CallOutput::Failed(CallError::Io));
+            return;
+        };
+        let peer = &mut self.unix_streams[peer_index];
+        if peer.closed {
+            self.schedule_tcp_completion(call_id, resource, CallOutput::Failed(CallError::Io));
+            return;
+        }
+        let room = peer.inbound_capacity.saturating_sub(peer.inbound.len());
+        let allowed = room.min(write_cap).min(bytes.len());
+        if allowed == 0 && !bytes.is_empty() {
+            // Peer inbound buffer is full. Surface zero-progress so the
+            // user state machine sees pressure instead of dropping bytes.
+            self.schedule_tcp_completion(call_id, resource, CallOutput::UnixWrote { count: 0 });
+            return;
+        }
+        peer.inbound.extend(bytes[..allowed].iter().copied());
+        // Wake any pending read on the peer.
+        if let Some(idx) = self
+            .pending_unix_reads
+            .iter()
+            .position(|pending| pending.stream == peer_id)
+        {
+            let pending = self.pending_unix_reads.remove(idx);
+            let peer = &mut self.unix_streams[peer_index];
+            let take = peer.inbound.len().min(pending.max_len);
+            let read_bytes: Vec<u8> = peer.inbound.drain(..take).collect();
+            self.schedule_tcp_completion(
+                pending.call_id,
+                TcpResourceKey::UnixStreamRead(peer_id),
+                CallOutput::UnixRead { bytes: read_bytes },
+            );
+        }
+        self.schedule_tcp_completion(call_id, resource, CallOutput::UnixWrote { count: allowed });
+    }
+
+    pub(crate) fn handle_unix_listener_close(&mut self, call_id: CallId, listener: UnixListenerId) {
+        let Some(index) = self.unix_listener_index(listener) else {
+            self.deliver_completion(call_id, CallOutput::Failed(CallError::InvalidResource));
+            return;
+        };
+        // Close wins. Parked accepts are cancelled and traced; parked
+        // connects on this listener settle as connection-refused (`Io`)
+        // rather than waiting on a listener that will never accept.
+        self.cancel_backend_calls_for_resource(TcpResourceKey::UnixListenerAccept(listener));
+        let refused: Vec<CallId> = self
+            .pending_unix_connects
+            .iter()
+            .filter(|pending| pending.listener == listener)
+            .map(|pending| pending.call_id)
+            .collect();
+        self.pending_unix_connects
+            .retain(|pending| pending.listener != listener);
+        for connect_call in refused {
+            self.deliver_completion(connect_call, CallOutput::Failed(CallError::Io));
+        }
+        self.unix_listeners[index].closed = true;
+        self.deliver_completion(call_id, CallOutput::UnixListenerClosed);
+    }
+
+    pub(crate) fn handle_unix_stream_close(&mut self, call_id: CallId, stream: UnixStreamId) {
+        let Some(index) = self.unix_stream_index(stream) else {
+            self.deliver_completion(call_id, CallOutput::Failed(CallError::InvalidResource));
+            return;
+        };
+        // Cancel pending reads/writes on this stream.
+        self.cancel_backend_calls_for_resource(TcpResourceKey::UnixStreamRead(stream));
+        self.cancel_backend_calls_for_resource(TcpResourceKey::UnixStreamWrite(stream));
+        let peer_id = self.unix_streams[index].peer;
+        self.unix_streams[index].closed = true;
+        if let Some(peer_id) = peer_id {
+            if let Some(peer_index) = self.unix_stream_index_any(peer_id) {
+                self.unix_streams[peer_index].peer_closed = true;
+                // Wake pending reads on the peer so they see EOF.
+                if let Some(pending_idx) = self
+                    .pending_unix_reads
+                    .iter()
+                    .position(|pending| pending.stream == peer_id)
+                {
+                    let pending = self.pending_unix_reads.remove(pending_idx);
+                    let peer = &mut self.unix_streams[peer_index];
+                    if !peer.inbound.is_empty() {
+                        let take = peer.inbound.len().min(pending.max_len);
+                        let bytes: Vec<u8> = peer.inbound.drain(..take).collect();
+                        self.schedule_tcp_completion(
+                            pending.call_id,
+                            TcpResourceKey::UnixStreamRead(peer_id),
+                            CallOutput::UnixRead { bytes },
+                        );
+                    } else {
+                        self.schedule_tcp_completion(
+                            pending.call_id,
+                            TcpResourceKey::UnixStreamRead(peer_id),
+                            CallOutput::UnixRead { bytes: Vec::new() },
+                        );
+                    }
+                }
+            }
+        }
+        self.deliver_completion(call_id, CallOutput::UnixStreamClosed);
+    }
+
     pub(crate) fn parent_directory_exists(&self, path: &std::path::Path) -> bool {
         let Some(parent) = path.parent() else {
             return true;
@@ -3095,6 +3422,15 @@ where
             | TcpResourceKey::FileSize(_)
             | TcpResourceKey::Mkdir(_)
             | TcpResourceKey::PathOp(_) => false,
+            TcpResourceKey::UnixListenerAccept(listener) => self
+                .pending_unix_accepts
+                .iter()
+                .any(|pending| pending.listener == listener),
+            TcpResourceKey::UnixStreamRead(stream) => self
+                .pending_unix_reads
+                .iter()
+                .any(|pending| pending.stream == stream),
+            TcpResourceKey::UnixConnect(_) | TcpResourceKey::UnixStreamWrite(_) => false,
         };
         queued_accept
             || self
@@ -4816,6 +5152,11 @@ where
     /// Drops simulator state for calls cancelled by resource close.
     /// Translator is not run; caller's continuation does not fire.
     /// Trace records `ResourceClosed`.
+    ///
+    /// Cost is O(pending) across the bounded pending queues. The queues
+    /// are capped per the simulator's completion capacity, so this stays
+    /// bounded; it is not optimized for large pending fan-out because the
+    /// deterministic model keeps pending counts small.
     pub(crate) fn cancel_backend_calls_for_resource(&mut self, resource: TcpResourceKey) {
         let cancelled_call_ids: Vec<CallId> = self
             .pending_tcp_completions
@@ -4844,6 +5185,28 @@ where
                     })
                     .map(|pending| pending.call_id),
             )
+            .chain(
+                self.pending_unix_accepts
+                    .iter()
+                    .filter(|pending| {
+                        matches!(
+                            resource,
+                            TcpResourceKey::UnixListenerAccept(l) if l == pending.listener
+                        )
+                    })
+                    .map(|pending| pending.call_id),
+            )
+            .chain(
+                self.pending_unix_reads
+                    .iter()
+                    .filter(|pending| {
+                        matches!(
+                            resource,
+                            TcpResourceKey::UnixStreamRead(s) if s == pending.stream
+                        )
+                    })
+                    .map(|pending| pending.call_id),
+            )
             .collect();
 
         for call_id in cancelled_call_ids {
@@ -4853,6 +5216,10 @@ where
             self.pending_accepts
                 .retain(|pending| pending.call_id != call_id);
             self.pending_udp_recvs
+                .retain(|pending| pending.call_id != call_id);
+            self.pending_unix_accepts
+                .retain(|pending| pending.call_id != call_id);
+            self.pending_unix_reads
                 .retain(|pending| pending.call_id != call_id);
 
             // Drop simulator call state too, or quiescence never arrives.
@@ -4906,6 +5273,12 @@ where
         self.pending_connects
             .retain(|pending| pending.call_id != call_id);
         self.pending_udp_recvs
+            .retain(|pending| pending.call_id != call_id);
+        self.pending_unix_accepts
+            .retain(|pending| pending.call_id != call_id);
+        self.pending_unix_connects
+            .retain(|pending| pending.call_id != call_id);
+        self.pending_unix_reads
             .retain(|pending| pending.call_id != call_id);
         self.tls_streams
             .retain(|stream| stream.pending_connect_call != Some(call_id));
@@ -5010,6 +5383,13 @@ pub(crate) fn call_kind(request: &CallInput) -> CallKind {
         CallInput::JournalAppend { .. } => CallKind::JournalAppend,
         CallInput::JournalReplay { .. } => CallKind::JournalReplay,
         CallInput::Sleep { .. } => CallKind::Sleep,
+        CallInput::UnixBind { .. } => CallKind::UnixBind,
+        CallInput::UnixAccept { .. } => CallKind::UnixAccept,
+        CallInput::UnixConnect { .. } => CallKind::UnixConnect,
+        CallInput::UnixRead { .. } => CallKind::UnixRead,
+        CallInput::UnixWrite { .. } => CallKind::UnixWrite,
+        CallInput::UnixListenerClose { .. } => CallKind::UnixListenerClose,
+        CallInput::UnixStreamClose { .. } => CallKind::UnixStreamClose,
     }
 }
 

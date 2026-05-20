@@ -885,6 +885,72 @@ forbids a shared bridge crate, but the *classifier vocabulary* is
 plain data and could live alongside `CallOutcome` without coupling
 the bridges themselves.
 
+### 35. Local I/O / codec / IPC rails feel low-level next to the file loops (Phase 117)
+
+**Surfaced by:** `specimen_local_io_codec_ipc` (file-ingest, file-copy,
+admin-socket, framed-keyspace, live-unix), plus the live Unix echo and
+`unix_simulation` tests.
+
+What felt good:
+
+- The `.then(Msg::Variant)` continuation model reads top-to-bottom as a
+  pure state machine; every resume point is a named enum variant. The
+  whole admin server fits in your head.
+- The simulator carries the IPC story end-to-end: the admin and keyspace
+  protocols were written and run deterministically with no real socket,
+  then the *same* `unix_*` calls run live. That live/sim parity is the
+  payoff.
+- Typed outcomes (`Ok(bytes)` / empty-is-EOF / `Err(CallError)`) are
+  uniform across TCP/Unix/file rails — one `CallError`, no per-rail
+  relearning.
+- The codec *decode* side is the right shape: `feed(bytes)` then loop
+  `next_frame()`, with `FrameDecision::{Full, Malformed}` forcing the bad
+  cases. `FileReadChunks`' `Eof` vs `CapReached` report is honest and
+  genuinely useful.
+
+What felt rough — each is a `Build`:
+
+- **Unix loop helpers are missing.** The new Unix rails shipped with no
+  `UnixWriteAll` / `UnixReadToEof`, so the partial-write loop
+  (`Wrote(Ok(count)) => drain; re-issue or advance`) was hand-rolled in
+  the admin server, the keyspace server, and the live echo test. Worse,
+  `Ok(0)` = backpressure is invisible in the types: the naive re-issue
+  loop hot-spins (this was review finding B7; the specimen now bounds it
+  by hand). This is the **third sighting** of the historical
+  `tcp_read_to_eof` / `tcp_write_all` companions finding
+  ([`FINDINGS_HISTORY.md`](FINDINGS_HISTORY.md), Round-era item 5, after
+  `specimen_outbound_fetch` and `specimen_mux_client`) — now on a freshly
+  added rail family with *zero* companions. **Build:** `UnixWriteAll`
+  (with `Ok(0)`/stuck-write detection) and `UnixReadToEof`, mirroring the
+  `file_loops` and `tcp_loops` helpers.
+
+- **The codec owns decode but not encode+write.** `LineFramer` /
+  `LengthDelimitedFramer` parse beautifully, but to *send* a framed reply
+  the specimens manually `encode_into` and then drive the write loop.
+  There is no framed *writer* that turns frames into the write state
+  machine, so the codec is half a round-trip. **Build:** a framed-writer
+  companion (e.g. a `LengthDelimitedWriter` / line writer that produces
+  the bounded write effect), so encode+write reads like decode.
+
+- **`FileCopyBounded`'s two-method API is clunky.** Driving the copy pump
+  needs `match next_leg()` then the right `record_read` / `record_write`,
+  more ceremony than the single `advance()` on `FileReadChunks` /
+  `FileWriteAll`. **Build:** a unified `advance`-shaped step that names
+  which leg fired (e.g. `CopyStep::{PendingRead, PendingWrite, Done}`),
+  so callers stop branching on `next_leg` by hand.
+
+- **No blessed way to observe an isolate mid-run.** Every IPC specimen
+  smuggles results out through `Arc<Mutex<Vec<...>>>` because the isolate
+  owns its state and `stop_with` + `observe_result` only cover the
+  *final* value, not the running observations a protocol test wants. This
+  reintroduces the retired Round-1 `Arc<Mutex<...>>` side-channel pattern
+  and produced a real bug: `Arc::try_unwrap` returned `Default` while the
+  isolate still held a reference, making a test pass on empty data. This
+  echoes active finding 6 (bless an observation handle). **Build:** a
+  sim/runtime helper for "observe an isolate's accumulated facts" that is
+  not a shared-mutable side channel — or document the trace-projection
+  path as the sanctioned alternative for protocol assertions.
+
 ## Closed
 
 Findings shipped by recent phases. Numbers are kept stable so
