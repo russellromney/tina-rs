@@ -1613,7 +1613,16 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
         frame: crate::websocket::WebSocketFrame,
     ) -> Effect<Self> {
         match frame.opcode {
-            0x1 | 0x2 if frame.fin => self.deliver_websocket_message(frame.opcode, frame.payload),
+            0x1 | 0x2 if frame.fin => {
+                if self
+                    .websocket
+                    .as_ref()
+                    .is_some_and(|ws| ws.fragmented_message.is_some())
+                {
+                    return self.websocket_protocol_close(WebSocketError::ProtocolError);
+                }
+                self.deliver_websocket_message(frame.opcode, frame.payload)
+            }
             0x1 | 0x2 => {
                 let Some(ws) = self.websocket.as_mut() else {
                     return self.begin_close();
