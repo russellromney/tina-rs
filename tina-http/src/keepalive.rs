@@ -91,7 +91,8 @@ use tina_runtime::{
 
 use crate::chunked_decoder::{ChunkedDecoder, FeedAllResult};
 use crate::parse::{
-    HttpResponseHead, ResponseParseProgress, encode_keepalive_request, parse_response_head,
+    HttpResponseHead, ResponseParseProgress, encode_keepalive_request,
+    is_valid_origin_form_request_target, parse_response_head,
 };
 use crate::target::{HttpHostPolicy, HttpTarget};
 use crate::transport::HttpTransport;
@@ -815,6 +816,9 @@ fn apply_host_policy(
     mut request: HttpRequest,
     target: &HttpTarget,
 ) -> Result<HttpRequest, HttpClientError> {
+    if !is_valid_origin_form_request_target(&request.path) {
+        return Err(HttpClientError::InvalidRequestTarget);
+    }
     let policy_value: Option<&str> = match target {
         HttpTarget::Http { host: None, .. } => None,
         HttpTarget::Http { host: Some(v), .. } => Some(v.as_str()),

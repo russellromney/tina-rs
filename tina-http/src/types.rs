@@ -780,4 +780,8 @@ pub enum HttpClientError {
     /// [`crate::HttpHostPolicy`] resolved to a string with bytes
     /// that are not a valid `HeaderValue`.
     InvalidHostHeaderValue,
+    /// Outbound request path is not a valid HTTP/1 origin-form
+    /// request target, or contains whitespace/control bytes that
+    /// would make the request-line ambiguous on the wire.
+    InvalidRequestTarget,
 }
