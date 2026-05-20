@@ -1704,8 +1704,12 @@ impl<S: Shard + 'static> Http2ClientConnection<S> {
         // Streamed response: hold the per-stream credit (the backpressure
         // lever) and buffer the chunk for the caller to pull. There is no
         // total-body cap — the stream window bounds resident bytes, and
-        // credit is only returned as the caller consumes (see
-        // `deliver_to_parked_pull`).
+        // per-stream credit is only returned as the caller consumes (see
+        // `deliver_to_parked_pull`). The connection window credited above
+        // (batched at `WINDOW_CREDIT_FLUSH_THRESHOLD` in `handle_read`) is
+        // deliberately not the backpressure lever: it is shared across
+        // streams, so holding it would stall every other stream. A slow
+        // consumer is bounded purely by this stream's window.
         if self.streams[idx].response_streamed {
             if !payload.is_empty() {
                 self.streams[idx].response_chunks.push_back(payload);

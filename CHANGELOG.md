@@ -81,8 +81,9 @@ and the remaining blocker for server-streaming / bidi gRPC.
   per-stream flow-control window and only `WINDOW_UPDATE`-credited as the
   caller consumes each chunk. A slow consumer therefore closes the stream
   window and backpressures the peer — there is no unbounded buffer. The
-  connection window is still credited eagerly so one slow stream does not
-  stall the others.
+  shared connection window is credited as DATA is received (batched), not
+  held until consume, so one slow stream does not stall the others;
+  per-stream backpressure is the only lever.
 - **Terminal truth reaches the live channel.** A reset / GOAWAY /
   connection-close settles whichever caller channel is live: the
   `OpenStream` waiter (if the head was never delivered) gets the terminal

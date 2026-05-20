@@ -381,8 +381,12 @@ impl GrpcClient {
                 Err(error) => vec![GrpcStreamItem::Malformed(error)],
             },
             Http2ResponseChunk::End { trailers } => {
-                // A partial frame still buffered at END_STREAM is a
-                // truncated message, not a clean end.
+                // `End` carries no body bytes: the HTTP/2 client delivers a
+                // final DATA frame's payload as a separate `Data` chunk
+                // (already fed to the decoder above) *before* surfacing
+                // `End`. So there is nothing to `push` here — only the
+                // final status. A partial frame still buffered at END_STREAM
+                // is therefore a truncated message, not a clean end.
                 if let Err(error) = decoder.finish() {
                     return vec![GrpcStreamItem::Malformed(error)];
                 }
