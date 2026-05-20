@@ -40,6 +40,7 @@ where
     next_remote_queues: RemoteQueues,
     terminal_remote_queues: RemoteQueues,
     next_terminal_remote_queues: RemoteQueues,
+    terminal_overflow_queues: RemoteQueues,
     last_checker_failure: Option<CheckerFailure>,
 }
 
@@ -120,6 +121,8 @@ where
             build_remote_queue_storage(&shard_ids, multishard.shard_pair_capacity);
         let next_terminal_remote_queues =
             build_remote_queue_storage(&shard_ids, multishard.shard_pair_capacity);
+        let terminal_overflow_queues =
+            build_remote_queue_storage(&shard_ids, multishard.shard_pair_capacity);
 
         Self {
             simulators,
@@ -131,6 +134,7 @@ where
             next_remote_queues,
             terminal_remote_queues,
             next_terminal_remote_queues,
+            terminal_overflow_queues,
             last_checker_failure: None,
         }
     }
@@ -315,7 +319,22 @@ where
         let next_remote_queues = &mut self.next_remote_queues;
         let terminal_remote_queues = &mut self.terminal_remote_queues;
         let next_terminal_remote_queues = &mut self.next_terminal_remote_queues;
+        let terminal_overflow_queues = &mut self.terminal_overflow_queues;
         let simulators = &mut self.simulators;
+
+        flush_terminal_overflow_queues(
+            terminal_overflow_queues,
+            next_terminal_remote_queues,
+            config.shard_pair_capacity,
+        );
+        let mut remote_buffers = RemoteQueueBuffers {
+            indexes: remote_queue_indexes,
+            next_remote: next_remote_queues,
+            next_terminal: next_terminal_remote_queues,
+            terminal_overflow: terminal_overflow_queues,
+            shard_pair_capacity: config.shard_pair_capacity,
+            label: "multi-shard simulator",
+        };
 
         for destination in shard_ids.iter().copied() {
             let index = shard_indexes.get(&destination).copied().unwrap_or_else(|| {
@@ -338,27 +357,19 @@ where
                 });
                 while let Some(queued) = terminal_remote_queues[queue_index].pop_front() {
                     if let Some(outbound) = simulators[index].harvest_remote_envelope(queued) {
-                        let _ = enqueue_remote_envelope(
+                        let _ = enqueue_remote_envelope_preserving_terminal(
                             destination,
                             outbound,
-                            remote_queue_indexes,
-                            next_remote_queues,
-                            next_terminal_remote_queues,
-                            config.shard_pair_capacity,
-                            "multi-shard simulator",
+                            &mut remote_buffers,
                         );
                     }
                 }
                 while let Some(queued) = remote_queues[queue_index].pop_front() {
                     if let Some(outbound) = simulators[index].harvest_remote_envelope(queued) {
-                        let _ = enqueue_remote_envelope(
+                        let _ = enqueue_remote_envelope_preserving_terminal(
                             destination,
                             outbound,
-                            remote_queue_indexes,
-                            next_remote_queues,
-                            next_terminal_remote_queues,
-                            config.shard_pair_capacity,
-                            "multi-shard simulator",
+                            &mut remote_buffers,
                         );
                     }
                 }
@@ -372,14 +383,10 @@ where
                     );
                 }
 
-                enqueue_remote_envelope(
+                enqueue_remote_envelope_preserving_terminal(
                     source_shard,
                     envelope,
-                    remote_queue_indexes,
-                    next_remote_queues,
-                    next_terminal_remote_queues,
-                    config.shard_pair_capacity,
-                    "multi-shard simulator",
+                    &mut remote_buffers,
                 )
             });
         }
@@ -542,33 +549,64 @@ where
     }
 }
 
-fn enqueue_remote_envelope(
-    source_shard: ShardId,
-    envelope: QueuedRemoteEnvelope,
-    remote_queue_indexes: &RemoteQueueIndexes,
-    next_remote_queues: &mut RemoteQueues,
-    next_terminal_remote_queues: &mut RemoteQueues,
+struct RemoteQueueBuffers<'a> {
+    indexes: &'a RemoteQueueIndexes,
+    next_remote: &'a mut RemoteQueues,
+    next_terminal: &'a mut RemoteQueues,
+    terminal_overflow: &'a mut RemoteQueues,
     shard_pair_capacity: usize,
     label: &'static str,
+}
+
+fn enqueue_remote_envelope_preserving_terminal(
+    source_shard: ShardId,
+    envelope: QueuedRemoteEnvelope,
+    buffers: &mut RemoteQueueBuffers<'_>,
 ) -> Result<(), SendRejectedReason> {
     let target_shard = envelope.target_shard();
     let key = (source_shard, target_shard);
-    let queue_index = remote_queue_indexes.get(&key).copied().unwrap_or_else(|| {
+    let queue_index = buffers.indexes.get(&key).copied().unwrap_or_else(|| {
         panic!(
-            "{label} missing queue from shard {} to shard {}",
+            "{} missing queue from shard {} to shard {}",
+            buffers.label,
             source_shard.get(),
             target_shard.get()
         )
     });
-    let queue = match envelope {
-        QueuedRemoteEnvelope::CallReply(_) => &mut next_terminal_remote_queues[queue_index],
-        QueuedRemoteEnvelope::Send(_) => &mut next_remote_queues[queue_index],
+    let terminal = matches!(envelope, QueuedRemoteEnvelope::CallReply(_));
+    let queue = if terminal {
+        &mut buffers.next_terminal[queue_index]
+    } else {
+        &mut buffers.next_remote[queue_index]
     };
-    if queue.len() >= shard_pair_capacity {
-        return Err(SendRejectedReason::Full);
+    if queue.len() < buffers.shard_pair_capacity {
+        queue.push_back(envelope);
+        return Ok(());
     }
-    queue.push_back(envelope);
-    Ok(())
+    if terminal {
+        buffers.terminal_overflow[queue_index].push_back(envelope);
+        Ok(())
+    } else {
+        Err(SendRejectedReason::Full)
+    }
+}
+
+fn flush_terminal_overflow_queues(
+    terminal_overflow_queues: &mut RemoteQueues,
+    next_terminal_remote_queues: &mut RemoteQueues,
+    shard_pair_capacity: usize,
+) {
+    for (overflow, next_terminal) in terminal_overflow_queues
+        .iter_mut()
+        .zip(next_terminal_remote_queues.iter_mut())
+    {
+        while next_terminal.len() < shard_pair_capacity {
+            let Some(envelope) = overflow.pop_front() else {
+                break;
+            };
+            next_terminal.push_back(envelope);
+        }
+    }
 }
 
 fn build_remote_queues(

@@ -7,7 +7,7 @@
 //! the set.
 
 use std::alloc::Global;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::convert::Infallible;
 use std::marker::PhantomData;
 use std::sync::{Arc, mpsc};
@@ -885,63 +885,84 @@ where
 {
     shard_metrics.set_worker_thread_id(format!("{:?}", thread::current().id()));
     let source_shard = runtime.shard().id();
+    let mut terminal_overflow = VecDeque::new();
     loop {
         shard_metrics.set_resource_counts(runtime.resource_report());
-        let route_remote = |envelope: QueuedRemoteEnvelope| -> Result<(), SendRejectedReason> {
-            let target_shard = envelope.target_shard();
-            let terminal = matches!(envelope, QueuedRemoteEnvelope::CallReply(_));
-            let metrics = remote_wiring
-                .queue_metrics
-                .get(&(source_shard, target_shard));
-            if remote_wiring
-                .shard_metrics
-                .get(&target_shard)
-                .is_some_and(|metrics| metrics.state() == LiveShardState::Failed)
-            {
-                if let Some(metrics) = metrics {
-                    metrics.rejected_closed();
-                }
-                return Err(SendRejectedReason::Closed);
-            }
-            let senders = if terminal {
-                &remote_wiring.terminal_senders
-            } else {
-                &remote_wiring.senders
-            };
-            let Some(sender) = senders.get(&(source_shard, target_shard)) else {
-                panic!(
-                    "ThreadedMultiShardRuntime targeted unknown destination shard {}",
-                    target_shard.get()
-                );
-            };
-            let envelope = SendableQueuedRemoteEnvelope::new(envelope);
-            match sender.try_send(envelope) {
-                Ok(()) => {
-                    if let Some(metrics) = metrics {
-                        metrics.accepted();
-                    }
-                    Ok(())
-                }
-                Err(std::sync::mpsc::TrySendError::Full(_)) => {
-                    if let Some(metrics) = metrics {
-                        metrics.rejected_full();
-                    }
-                    Err(SendRejectedReason::Full)
-                }
-                Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+        let route_remote_lossless =
+            |envelope: QueuedRemoteEnvelope| -> Result<(), Box<RemoteRouteFailure>> {
+                let target_shard = envelope.target_shard();
+                let terminal = matches!(envelope, QueuedRemoteEnvelope::CallReply(_));
+                let metrics = remote_wiring
+                    .queue_metrics
+                    .get(&(source_shard, target_shard));
+                if remote_wiring
+                    .shard_metrics
+                    .get(&target_shard)
+                    .is_some_and(|metrics| metrics.state() == LiveShardState::Failed)
+                {
                     if let Some(metrics) = metrics {
                         metrics.rejected_closed();
                     }
-                    Err(SendRejectedReason::Closed)
+                    return Err(Box::new(RemoteRouteFailure {
+                        reason: SendRejectedReason::Closed,
+                        envelope,
+                    }));
                 }
-            }
+                let senders = if terminal {
+                    &remote_wiring.terminal_senders
+                } else {
+                    &remote_wiring.senders
+                };
+                let Some(sender) = senders.get(&(source_shard, target_shard)) else {
+                    panic!(
+                        "ThreadedMultiShardRuntime targeted unknown destination shard {}",
+                        target_shard.get()
+                    );
+                };
+                let envelope = SendableQueuedRemoteEnvelope::new(envelope);
+                match sender.try_send(envelope) {
+                    Ok(()) => {
+                        if let Some(metrics) = metrics {
+                            metrics.accepted();
+                        }
+                        Ok(())
+                    }
+                    Err(std::sync::mpsc::TrySendError::Full(envelope)) => {
+                        if let Some(metrics) = metrics {
+                            metrics.rejected_full();
+                        }
+                        Err(Box::new(RemoteRouteFailure {
+                            reason: SendRejectedReason::Full,
+                            envelope: envelope.into_queued_remote_envelope(),
+                        }))
+                    }
+                    Err(std::sync::mpsc::TrySendError::Disconnected(envelope)) => {
+                        if let Some(metrics) = metrics {
+                            metrics.rejected_closed();
+                        }
+                        Err(Box::new(RemoteRouteFailure {
+                            reason: SendRejectedReason::Closed,
+                            envelope: envelope.into_queued_remote_envelope(),
+                        }))
+                    }
+                }
+            };
+        let overflow_delivered =
+            drain_terminal_overflow(&mut terminal_overflow, &route_remote_lossless);
+        let mut route_remote = |envelope: QueuedRemoteEnvelope| -> Result<(), SendRejectedReason> {
+            route_remote_preserving_terminal(
+                envelope,
+                &mut terminal_overflow,
+                &route_remote_lossless,
+            )
         };
-        let terminal_delivered = drain_remote_inbound(
-            &mut runtime,
-            &remote_wiring.terminal_receivers,
-            &route_remote,
-            config.remote_inbound_drain_budget,
-        );
+        let terminal_delivered = overflow_delivered
+            + drain_remote_inbound(
+                &mut runtime,
+                &remote_wiring.terminal_receivers,
+                &mut route_remote,
+                config.remote_inbound_drain_budget,
+            );
         let ordinary_budget = config
             .remote_inbound_drain_budget
             .saturating_sub(terminal_delivered);
@@ -949,7 +970,7 @@ where
             + drain_remote_inbound(
                 &mut runtime,
                 &remote_wiring.receivers,
-                &route_remote,
+                &mut route_remote,
                 ordinary_budget,
             );
         // Fairness: poll the local command queue after every bounded
@@ -972,7 +993,11 @@ where
 
         let delivered = runtime.step_with_remote(&mut |_, envelope| route_remote(envelope));
 
-        if delivered == 0 && remote_delivered == 0 && !runtime.has_in_flight_calls() {
+        if delivered == 0
+            && remote_delivered == 0
+            && terminal_overflow.is_empty()
+            && !runtime.has_in_flight_calls()
+        {
             match receiver.recv_timeout(config.idle_wait) {
                 Ok(ThreadedCommand::Run(command)) => command(&mut runtime),
                 Ok(ThreadedCommand::Shutdown) => {
@@ -997,13 +1022,59 @@ where
     ThreadedWorkerExit::clean(trace)
 }
 
+struct RemoteRouteFailure {
+    reason: SendRejectedReason,
+    envelope: QueuedRemoteEnvelope,
+}
+
+fn route_remote_preserving_terminal(
+    envelope: QueuedRemoteEnvelope,
+    terminal_overflow: &mut VecDeque<QueuedRemoteEnvelope>,
+    route_remote: &impl Fn(QueuedRemoteEnvelope) -> Result<(), Box<RemoteRouteFailure>>,
+) -> Result<(), SendRejectedReason> {
+    match route_remote(envelope) {
+        Ok(()) => Ok(()),
+        Err(failure)
+            if failure.reason == SendRejectedReason::Full
+                && matches!(failure.envelope, QueuedRemoteEnvelope::CallReply(_)) =>
+        {
+            terminal_overflow.push_back(failure.envelope);
+            Ok(())
+        }
+        Err(failure) => Err(failure.reason),
+    }
+}
+
+fn drain_terminal_overflow(
+    terminal_overflow: &mut VecDeque<QueuedRemoteEnvelope>,
+    route_remote: &impl Fn(QueuedRemoteEnvelope) -> Result<(), Box<RemoteRouteFailure>>,
+) -> usize {
+    let mut delivered = 0;
+    while let Some(envelope) = terminal_overflow.pop_front() {
+        match route_remote(envelope) {
+            Ok(()) => delivered += 1,
+            Err(failure)
+                if failure.reason == SendRejectedReason::Full
+                    && matches!(failure.envelope, QueuedRemoteEnvelope::CallReply(_)) =>
+            {
+                terminal_overflow.push_front(failure.envelope);
+                break;
+            }
+            Err(_) => {
+                delivered += 1;
+            }
+        }
+    }
+    delivered
+}
+
 fn drain_remote_inbound<S, F>(
     runtime: &mut Runtime<S, F>,
     remote_receivers: &[(
         ShardId,
         std::sync::mpsc::Receiver<SendableQueuedRemoteEnvelope>,
     )],
-    route_remote: &impl Fn(QueuedRemoteEnvelope) -> Result<(), SendRejectedReason>,
+    route_remote: &mut impl FnMut(QueuedRemoteEnvelope) -> Result<(), SendRejectedReason>,
     budget: usize,
 ) -> usize
 where

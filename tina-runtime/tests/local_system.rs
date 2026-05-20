@@ -138,6 +138,8 @@ impl LlamaService {
 enum CrossShardCallWorkerMsg {
     Echo(Vec<u8>),
     NoReply,
+    NoReplyId(u8),
+    ReleaseHeld,
     Stop,
 }
 
@@ -146,7 +148,8 @@ struct CrossShardCallReply(Vec<u8>);
 
 #[derive(Debug, Default)]
 struct CrossShardCallWorker {
-    held: Vec<tina::RequestContext<CrossShardCallReply>>,
+    held: Vec<(tina::RequestContext<CrossShardCallReply>, Vec<u8>)>,
+    held_count: Option<Arc<Mutex<usize>>>,
 }
 
 #[tina_runtime::isolate(
@@ -163,6 +166,17 @@ impl CrossShardCallWorker {
         match msg {
             CrossShardCallWorkerMsg::Echo(bytes) => reply(CrossShardCallReply(bytes)),
             CrossShardCallWorkerMsg::NoReply => noop(),
+            CrossShardCallWorkerMsg::NoReplyId(_) => noop(),
+            CrossShardCallWorkerMsg::ReleaseHeld => {
+                let effects = self
+                    .held
+                    .drain(..)
+                    .map(|(reply_to, bytes)| {
+                        tina::reply_to_request(reply_to, CrossShardCallReply(bytes))
+                    })
+                    .collect::<Vec<_>>();
+                batch(effects)
+            }
             CrossShardCallWorkerMsg::Stop => stop(),
         }
     }
@@ -175,8 +189,19 @@ impl CrossShardCallWorker {
         match msg {
             CrossShardCallWorkerMsg::Echo(bytes) => call.reply(CrossShardCallReply(bytes)),
             CrossShardCallWorkerMsg::NoReply => {
-                self.held.push(call.into_request_context());
+                self.held
+                    .push((call.into_request_context(), b"held".to_vec()));
                 noop()
+            }
+            CrossShardCallWorkerMsg::NoReplyId(id) => {
+                self.held.push((call.into_request_context(), vec![id]));
+                if let Some(count) = &self.held_count {
+                    *count.lock().expect("held count") += 1;
+                }
+                noop()
+            }
+            CrossShardCallWorkerMsg::ReleaseHeld => {
+                call.reject(tina::CallRejectedReason::UnsupportedMessage)
             }
             CrossShardCallWorkerMsg::Stop => {
                 call.reject(tina::CallRejectedReason::UnsupportedMessage)
@@ -189,6 +214,7 @@ impl CrossShardCallWorker {
 enum CrossShardCallClientMsg {
     Start(Address<CrossShardCallWorkerMsg, CrossShardCallReply>),
     StartTimeout(Address<CrossShardCallWorkerMsg, CrossShardCallReply>),
+    StartHeldOne(Address<CrossShardCallWorkerMsg, CrossShardCallReply>, u8),
     Returned(CallOutcome<CrossShardCallReply>),
 }
 
@@ -215,6 +241,12 @@ impl CrossShardCallClient {
                 worker,
                 CrossShardCallWorkerMsg::NoReply,
                 Duration::from_millis(20),
+            )
+            .then(CrossShardCallClientMsg::Returned),
+            CrossShardCallClientMsg::StartHeldOne(worker, id) => call(
+                worker,
+                CrossShardCallWorkerMsg::NoReplyId(id),
+                Duration::from_millis(500),
             )
             .then(CrossShardCallClientMsg::Returned),
             CrossShardCallClientMsg::Returned(outcome) => {
@@ -1892,6 +1924,80 @@ fn blue_whale_combined_e2e_core_preallocation_and_cross_shard_call() {
 
     let terminal = app.shutdown().drain().join().expect("clean shutdown");
     assert!(terminal.shutdown_report().clean());
+}
+
+#[test]
+fn live_cross_shard_terminal_replies_do_not_degrade_to_timeout_under_reply_queue_pressure() {
+    let outcomes = Arc::new(Mutex::new(Vec::new()));
+    let held_count = Arc::new(Mutex::new(0_usize));
+    let app = LocalSystem::<AppShard, AppMailboxFactory>::multi_shard(AppMailboxFactory)
+        .shard(AppShard(145))
+        .shard(AppShard(146))
+        .ingress_capacity(16)
+        .shard_pair_capacity(1)
+        .trace_retention(TraceRetention::Bounded(512))
+        .build();
+
+    let worker = app
+        .register_root_on::<CrossShardCallWorker, Infallible>(
+            ShardId::new(146),
+            CrossShardCallWorker {
+                held: Vec::new(),
+                held_count: Some(Arc::clone(&held_count)),
+            },
+            16,
+        )
+        .expect("register pressure worker");
+    let client = app
+        .register_root_on::<CrossShardCallClient, Infallible>(
+            ShardId::new(145),
+            CrossShardCallClient {
+                outcomes: Arc::clone(&outcomes),
+            },
+            16,
+        )
+        .expect("register pressure client");
+
+    for id in 0..3 {
+        app.try_send(client, CrossShardCallClientMsg::StartHeldOne(worker, id))
+            .expect("start held call");
+        wait_until_debug(
+            || *held_count.lock().expect("held count") == usize::from(id) + 1,
+            || format!("held={}", *held_count.lock().expect("held count")),
+        );
+    }
+
+    app.try_send(worker, CrossShardCallWorkerMsg::ReleaseHeld)
+        .expect("release held calls");
+
+    wait_until_debug(
+        || outcomes.lock().expect("outcomes").len() == 3,
+        || format!("outcomes={:?}", outcomes.lock().expect("outcomes")),
+    );
+    let got = outcomes.lock().expect("outcomes").clone();
+    assert_eq!(
+        got,
+        vec![
+            CallOutcome::Replied(CrossShardCallReply(vec![0])),
+            CallOutcome::Replied(CrossShardCallReply(vec![1])),
+            CallOutcome::Replied(CrossShardCallReply(vec![2])),
+        ]
+    );
+
+    let terminal = app
+        .shutdown()
+        .drain()
+        .join()
+        .expect("shutdown pressure app");
+    assert!(!terminal.trace().iter().any(|event| {
+        matches!(
+            event.kind(),
+            RuntimeEventKind::CallReplyRejected {
+                reason: tina_runtime::CallReplyRejectedReason::ReplyPathFull,
+                ..
+            }
+        )
+    }));
 }
 
 #[test]
