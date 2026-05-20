@@ -61,10 +61,20 @@
   (head waiter or parked pull). Live proofs: head-then-pull to `End`,
   32 KB multi-frame reassembly, peer-RST → terminal `Reset` on the
   parked pull. Both streaming halves are the gate for streaming gRPC.
+- **Streaming gRPC client landed.** `GrpcClient::server_streaming_request`
+  (OpenStream, buffered request, pulled response),
+  `client_streaming_request` (SubmitStreaming, streamed request, buffered
+  response via `decode_unary`), and `bidi_request` (OpenStream, streamed
+  request + pulled response). `GrpcStreamDecoder` reassembles
+  length-prefixed messages across response DATA chunks; `decode_stream_chunk`
+  folds chunks into `GrpcStreamItem`s ending in one first-class `Status`.
+  `frame(&msg)` length-prefixes a request message for the source. Live
+  proofs against an in-tree `GrpcRouter`: server-streaming receives all
+  messages + status, client-streaming sends many + gets the summed reply,
+  bidi echoes a streamed request back as a streamed response; plus a
+  `GrpcStreamItem`-not-the-message compile-fail.
 - **Remaining work in this phase** (still future slices, named in
   *Includes* and *Proof Shape* below):
-  - Streaming gRPC client (`server_streaming` / `client_streaming` /
-    `bidi`), gated on the streaming bodies above.
   - DST replay for live client socket work (typed unsupported fact
     + saved replay case).
   - **Full-duplex h2/TLS** (concurrent bidi over TLS): needs a

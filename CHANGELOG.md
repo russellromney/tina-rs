@@ -4,6 +4,41 @@ This file records completed work.
 
 ## Unreleased
 
+### Streaming gRPC Client
+
+`GrpcClient` now covers server-streaming, client-streaming, and bidi on
+top of the HTTP/2 client's streaming bodies — Tina is a native streaming
+gRPC client, not only a server. The gRPC status stays first-class on
+every shape.
+
+- **`GrpcClient::server_streaming_request(path, &req)`** builds an
+  `OpenStream` (one buffered request message, a pulled response). Feed
+  each pulled `Http2ResponseChunk` to a `GrpcStreamDecoder` and fold it
+  with `decode_stream_chunk` into `GrpcStreamItem`s — `Message(..)` for
+  each decoded response message, then exactly one terminal `Status` /
+  `Transport` / `Malformed`.
+- **`GrpcClient::client_streaming_request(path, source)`** builds a
+  `SubmitStreaming` (a streamed request body of gRPC-framed messages, one
+  buffered response). The response decodes with the existing
+  `decode_unary`. `GrpcClient::frame(&msg)` length-prefixes a message for
+  the request `source` (e.g. an `IterBodySource`).
+- **`GrpcClient::bidi_request(path, source)`** builds an `OpenStream`
+  with a streamed request body and a pulled response, so the two
+  directions progress independently.
+- **`GrpcStreamDecoder`** reassembles length-prefixed gRPC messages
+  across response DATA chunks — a chunk may carry several messages, one,
+  or a fragment that spans chunks. It rejects compression and over-cap
+  lengths before allocating, and `finish()` flags a truncated trailing
+  frame. **`GrpcStreamItem<Resp>`** is the typed fold result;
+  `stream_head_status(headers)` reads a trailers-only status from the
+  response head.
+- **Live proofs** (`grpc_client_live.rs`, dialing an in-tree
+  `GrpcRouter`): server-streaming receives all messages then a status;
+  client-streaming sends several messages and gets the summed reply +
+  status; bidi echoes each streamed request back as a streamed response.
+  A compile-fail proof pins that a `GrpcStreamItem` cannot be coerced to
+  the response message (the status arm cannot be silently dropped).
+
 ### HTTP/2 Client Streaming Response Bodies
 
 The HTTP/2 client can now deliver a response incrementally instead of

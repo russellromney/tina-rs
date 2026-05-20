@@ -25,7 +25,7 @@ use crate::{
 };
 use crate::{IterBodySource, ResponseChunkMsg, ResponseChunkReply};
 
-const GRPC_FRAME_HEADER_LEN: usize = 5;
+pub(crate) const GRPC_FRAME_HEADER_LEN: usize = 5;
 const CLIENT_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 const FRAME_DATA: u8 = 0x0;
 const FRAME_HEADERS: u8 = 0x1;

@@ -100,15 +100,18 @@
 //! today; full-duplex needs a runtime TLS reactor.
 //!
 //! gRPC: [`GrpcRouter`] is the server. [`GrpcClient`] is the native
-//! client — Tina is a native gRPC client, not only a server. The server
-//! layers unary, server-streaming, client-streaming, and bidirectional
-//! streaming `prost` messages with typed [`GrpcStatus`] trailers; the
-//! client today covers the **unary** path over h2c, decoding into a
-//! typed [`GrpcUnaryOutcome`] where a non-OK status is the caller
+//! client — Tina is a native gRPC client, not only a server. Both sides
+//! cover unary, server-streaming, client-streaming, and bidirectional
+//! streaming `prost` messages with typed [`GrpcStatus`] trailers. The
+//! unary client decodes into a typed [`GrpcUnaryOutcome`]; the streaming
+//! client builds a request ([`GrpcClient::server_streaming_request`] /
+//! [`GrpcClient::client_streaming_request`] / [`GrpcClient::bidi_request`])
+//! and folds pulled response chunks through a [`GrpcStreamDecoder`] into
+//! [`GrpcStreamItem`]s. On every shape a non-OK status is the caller
 //! outcome (never hidden in a success) and the received status is a
 //! `GrpcFinalStatusReceived` protocol fact. Both reject compression and
-//! cap message bytes. Streaming gRPC clients, interceptors, reflection,
-//! production pooled clients, and TLS ALPN are later slices.
+//! cap message bytes. Interceptors, reflection, production pooled
+//! clients, and tonic interop are later slices.
 //!
 //! WebSocket: [`websocket_upgrade`] validates server-side HTTP/1.1
 //! upgrades for [`HttpListener`] and [`HttpsListener`]. After the
@@ -174,7 +177,9 @@ pub use grpc::{
     encode_grpc_message, grpc_status_trailers, grpc_stream_finish, grpc_stream_message,
     grpc_unary_call_h2c_blocking,
 };
-pub use grpc_client::{GrpcClient, GrpcTarget, GrpcUnaryOutcome};
+pub use grpc_client::{
+    GrpcClient, GrpcStreamDecoder, GrpcStreamItem, GrpcTarget, GrpcUnaryOutcome,
+};
 pub use http2::{
     AlpnProtocols, Http2ClientConnection, Http2ClientLimits, Http2ClientMsg, Http2ClientOutcome,
     Http2ClientReply, Http2ClientReport, Http2ClientRequest, Http2ClientRequestBody,

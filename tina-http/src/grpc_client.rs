@@ -8,22 +8,62 @@
 //! normal [`GrpcUnaryOutcome::Status`], never hidden inside a successful
 //! HTTP response.
 //!
-//! This first form covers the **unary** path on cleartext h2c. The
-//! request and response are each a single length-prefixed gRPC message
-//! buffered under [`GrpcLimits`]. Server-streaming, client-streaming,
-//! and bidi need the HTTP/2 client's streaming-body support (a separate
-//! slice) and are not implemented here.
+//! Beyond **unary** (one buffered request and response message), this
+//! covers the streaming call shapes on top of the HTTP/2 client's
+//! streaming bodies:
+//!
+//! - **server-streaming** ([`server_streaming_request`]): one buffered
+//!   request, a pulled response. Feed each response chunk to a
+//!   [`GrpcStreamDecoder`] and fold it with
+//!   [`decode_stream_chunk`] into [`GrpcStreamItem`]s ending in one
+//!   `Status`.
+//! - **client-streaming** ([`client_streaming_request`]): a streamed
+//!   request body (a `source` of gRPC-framed messages, built with
+//!   [`frame`]) and a single buffered response — decode with
+//!   [`decode_unary`] like a unary call.
+//! - **bidi** ([`bidi_request`]): a streamed request body and a pulled
+//!   response, so the two directions progress independently.
+//!
+//! The gRPC status stays first-class on every shape: a non-OK status is
+//! a `Status` item / outcome, never hidden in a successful HTTP response.
+//!
+//! [`server_streaming_request`]: GrpcClient::server_streaming_request
+//! [`client_streaming_request`]: GrpcClient::client_streaming_request
+//! [`bidi_request`]: GrpcClient::bidi_request
+//! [`decode_stream_chunk`]: GrpcClient::decode_stream_chunk
+//! [`decode_unary`]: GrpcClient::decode_unary
+//! [`frame`]: GrpcClient::frame
 
 use http::{HeaderMap, HeaderValue, Method, StatusCode};
 use prost::Message;
 use tina::{Address, Shard};
 
-use crate::grpc::{GrpcError, GrpcLimits, GrpcStatus, GrpcStatusCode, decode_one_grpc_message};
+use crate::grpc::{
+    GRPC_FRAME_HEADER_LEN, GrpcError, GrpcLimits, GrpcStatus, GrpcStatusCode,
+    decode_one_grpc_message,
+};
 use crate::grpc::{encode_grpc_message, grpc_status_from_header_map};
 use crate::http2::{
     Http2ClientConnection, Http2ClientLimits, Http2ClientMsg, Http2ClientOutcome, Http2ClientReply,
-    Http2ClientRequest, Http2Target,
+    Http2ClientRequest, Http2ClientRequestBody, Http2ClientStreamCall, Http2ResponseChunk,
+    Http2Target,
 };
+use crate::streaming::{ResponseChunkMsg, ResponseChunkReply};
+
+/// The gRPC request/response content-type and the mandatory `te:
+/// trailers` advertisement, shared by every gRPC call shape.
+fn grpc_headers() -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        http::header::CONTENT_TYPE,
+        HeaderValue::from_static("application/grpc+proto"),
+    );
+    headers.insert(
+        http::HeaderName::from_static("te"),
+        HeaderValue::from_static("trailers"),
+    );
+    headers
+}
 
 /// Maps a non-200 HTTP status with no `grpc-status` into a synthesized
 /// gRPC status, per `grpc/doc/http-grpc-status-mapping.md`. Used only
@@ -177,20 +217,10 @@ impl GrpcClient {
             "gRPC method path must be absolute (start with '/'), got {full_method_path:?}",
         );
         let body = encode_grpc_message(message, self.limits)?;
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            http::header::CONTENT_TYPE,
-            HeaderValue::from_static("application/grpc+proto"),
-        );
-        // gRPC requires the client to advertise trailer support.
-        headers.insert(
-            http::HeaderName::from_static("te"),
-            HeaderValue::from_static("trailers"),
-        );
         Ok(Http2ClientMsg::Submit(Http2ClientRequest {
             method: Method::POST,
             path: full_method_path.to_owned(),
-            headers,
+            headers: grpc_headers(),
             body,
         }))
     }
@@ -258,6 +288,223 @@ impl GrpcClient {
             }
         }
     }
+
+    /// Build the [`Http2ClientMsg::OpenStream`] for a **server-streaming**
+    /// call: one buffered request message, a pulled response. Issue it as
+    /// a Tina call; the reply is an
+    /// [`Http2ClientOutcome::ResponseStreaming`] head (check
+    /// [`stream_head_status`](Self::stream_head_status) on its headers for
+    /// a trailers-only error), then pull the body with
+    /// [`Http2ClientMsg::ResponseNext`] and feed each chunk to
+    /// [`decode_stream_chunk`](Self::decode_stream_chunk).
+    pub fn server_streaming_request<Req: Message>(
+        &self,
+        full_method_path: &str,
+        message: &Req,
+    ) -> Result<Http2ClientMsg, GrpcError> {
+        assert_grpc_path(full_method_path);
+        let body = encode_grpc_message(message, self.limits)?;
+        Ok(Http2ClientMsg::OpenStream(Http2ClientStreamCall {
+            method: Method::POST,
+            path: full_method_path.to_owned(),
+            headers: grpc_headers(),
+            body: Http2ClientRequestBody::Buffered(body),
+        }))
+    }
+
+    /// Build the [`Http2ClientMsg::SubmitStreaming`] for a
+    /// **client-streaming** call: a streamed request body (the `source`
+    /// yields gRPC-framed messages — see [`frame`](Self::frame)) and a
+    /// single buffered response message + status. Decode the reply with
+    /// [`decode_unary`](Self::decode_unary), exactly like a unary call.
+    pub fn client_streaming_request(
+        &self,
+        full_method_path: &str,
+        source: Address<ResponseChunkMsg, ResponseChunkReply>,
+    ) -> Http2ClientMsg {
+        assert_grpc_path(full_method_path);
+        Http2ClientMsg::SubmitStreaming(crate::http2::Http2ClientStreamingRequest {
+            method: Method::POST,
+            path: full_method_path.to_owned(),
+            headers: grpc_headers(),
+            source,
+        })
+    }
+
+    /// Build the [`Http2ClientMsg::OpenStream`] for a **bidi** call: a
+    /// streamed request body and a pulled response. The request `source`
+    /// yields gRPC-framed messages; the response is pulled and decoded
+    /// just like server-streaming, so the two directions progress
+    /// independently.
+    pub fn bidi_request(
+        &self,
+        full_method_path: &str,
+        source: Address<ResponseChunkMsg, ResponseChunkReply>,
+    ) -> Http2ClientMsg {
+        assert_grpc_path(full_method_path);
+        Http2ClientMsg::OpenStream(Http2ClientStreamCall {
+            method: Method::POST,
+            path: full_method_path.to_owned(),
+            headers: grpc_headers(),
+            body: Http2ClientRequestBody::Stream(source),
+        })
+    }
+
+    /// Encode one message as a length-prefixed gRPC frame, for building a
+    /// streaming request `source` (e.g. an `IterBodySource` over pre-framed
+    /// messages). Honours the configured message cap.
+    pub fn frame<Req: Message>(&self, message: &Req) -> Result<Vec<u8>, GrpcError> {
+        encode_grpc_message(message, self.limits)
+    }
+
+    /// Read a final gRPC status from a streamed response **head's** header
+    /// block. A trailers-only error response (END_STREAM on the HEADERS
+    /// frame) carries `grpc-status` here, not in the `End` trailers.
+    pub fn stream_head_status(&self, headers: &HeaderMap) -> Option<GrpcStatus> {
+        grpc_status_from_header_map(headers)
+    }
+
+    /// Fold one streamed-response [`Http2ResponseChunk`] into typed gRPC
+    /// stream items, draining any newly complete messages from `decoder`.
+    /// `Data` yields zero or more [`GrpcStreamItem::Message`]s; `End`
+    /// yields a [`GrpcStreamItem::Status`] (from the trailers, defaulting
+    /// to `Ok` when END_STREAM carries none — the head may have carried
+    /// it); a transport teardown yields [`GrpcStreamItem::Transport`].
+    pub fn decode_stream_chunk<Resp: Message + Default>(
+        &self,
+        decoder: &mut GrpcStreamDecoder,
+        chunk: Http2ResponseChunk,
+    ) -> Vec<GrpcStreamItem<Resp>> {
+        match chunk {
+            Http2ResponseChunk::Data(bytes) => match decoder.push::<Resp>(&bytes) {
+                Ok(messages) => messages.into_iter().map(GrpcStreamItem::Message).collect(),
+                Err(error) => vec![GrpcStreamItem::Malformed(error)],
+            },
+            Http2ResponseChunk::End { trailers } => {
+                // A partial frame still buffered at END_STREAM is a
+                // truncated message, not a clean end.
+                if let Err(error) = decoder.finish() {
+                    return vec![GrpcStreamItem::Malformed(error)];
+                }
+                let status = grpc_status_from_header_map(&trailers)
+                    .unwrap_or_else(|| GrpcStatus::new(GrpcStatusCode::Ok));
+                vec![GrpcStreamItem::Status(status)]
+            }
+            // Reset / Closed / ProtocolError — the stream died before a
+            // gRPC status. Surface it as a transport item, not a status.
+            other => vec![GrpcStreamItem::Transport(other)],
+        }
+    }
+}
+
+/// gRPC method paths are absolute (`/package.Service/Method`); a relative
+/// path produces an invalid `:path` pseudo-header on the wire.
+fn assert_grpc_path(full_method_path: &str) {
+    debug_assert!(
+        full_method_path.starts_with('/'),
+        "gRPC method path must be absolute (start with '/'), got {full_method_path:?}",
+    );
+}
+
+/// Reassembles length-prefixed gRPC messages from a streamed HTTP/2
+/// response body. A single response DATA chunk may carry several
+/// messages, one message, or a fragment that spans chunks — this decoder
+/// buffers across [`push`](Self::push) calls and yields only the messages
+/// that are now complete.
+#[derive(Debug, Clone)]
+pub struct GrpcStreamDecoder {
+    buf: Vec<u8>,
+    limits: GrpcLimits,
+}
+
+impl GrpcStreamDecoder {
+    /// New decoder honouring `limits.max_message_bytes` per message.
+    pub fn new(limits: GrpcLimits) -> Self {
+        Self {
+            buf: Vec::new(),
+            limits,
+        }
+    }
+
+    /// Feed received body bytes, draining every complete length-prefixed
+    /// message. A partial trailing frame stays buffered for the next
+    /// `push`. Rejects compression and over-cap message lengths before
+    /// allocating the message.
+    pub fn push<Resp: Message + Default>(&mut self, bytes: &[u8]) -> Result<Vec<Resp>, GrpcError> {
+        self.buf.extend_from_slice(bytes);
+        let mut out = Vec::new();
+        let mut cursor = 0;
+        loop {
+            let remaining = self.buf.len() - cursor;
+            if remaining < GRPC_FRAME_HEADER_LEN {
+                break;
+            }
+            if self.buf[cursor] != 0 {
+                return Err(GrpcError::CompressedUnsupported);
+            }
+            let len = u32::from_be_bytes([
+                self.buf[cursor + 1],
+                self.buf[cursor + 2],
+                self.buf[cursor + 3],
+                self.buf[cursor + 4],
+            ]) as usize;
+            if len > self.limits.max_message_bytes {
+                return Err(GrpcError::MessageTooLarge {
+                    len,
+                    max: self.limits.max_message_bytes,
+                });
+            }
+            if remaining < GRPC_FRAME_HEADER_LEN + len {
+                // The frame is not all here yet — wait for more bytes.
+                break;
+            }
+            let mut frame_cursor = cursor;
+            let message =
+                decode_one_grpc_message::<Resp>(&self.buf, &mut frame_cursor, self.limits)?;
+            cursor = frame_cursor;
+            out.push(message);
+        }
+        self.buf.drain(..cursor);
+        Ok(out)
+    }
+
+    /// Assert the stream ended on a frame boundary. Leftover buffered
+    /// bytes mean the final message was truncated.
+    pub fn finish(&self) -> Result<(), GrpcError> {
+        if self.buf.is_empty() {
+            Ok(())
+        } else {
+            Err(GrpcError::BadFrame)
+        }
+    }
+}
+
+/// One typed item produced by folding a streamed-response chunk through
+/// [`GrpcClient::decode_stream_chunk`]. The gRPC status is first-class:
+/// a server-streaming response ends with exactly one
+/// [`GrpcStreamItem::Status`], never a silent stop.
+///
+/// A stream item is not the response message — you cannot treat it as the
+/// decoded `Resp` and silently drop the terminal `Status`/`Transport`
+/// arms. Extracting a message requires matching `Message(..)`:
+///
+/// ```compile_fail
+/// let item: tina_http::GrpcStreamItem<u64> = unimplemented!();
+/// let _message: u64 = item; // does not compile: status is a separate arm
+/// ```
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GrpcStreamItem<Resp> {
+    /// One decoded response message.
+    Message(Resp),
+    /// The final gRPC status (from `End` trailers). Terminal.
+    Status(GrpcStatus),
+    /// The stream died before a gRPC status (reset / closed / protocol
+    /// error). Terminal; not a gRPC status.
+    Transport(Http2ResponseChunk),
+    /// A response frame was not well-formed gRPC (compression, oversize,
+    /// truncated, or undecodable). Terminal.
+    Malformed(GrpcError),
 }
 
 #[cfg(test)]
