@@ -425,3 +425,60 @@ Cleared (not bugs): SPSC mailbox (bounded ring, correct close-vs-producer race),
 A → A1–A4 · B → B1–B6 · C → C1–C5 · D → D1–D5 · E → E1–E2 · F → F1–F5 ·
 G → G1–G3 · H → H1–H6 · I → I1–I7. Every track produced findings; E was the
 cleanest (most primitives verified sound).
+
+## Verification
+
+Verification target: current `main` @ `a0c2003` after PR #144 landed. This is an
+append-only check of the findings above against the current tree, not a fix pass.
+
+| Finding | Status | Current severity | Verification note |
+|---|---|---|---|
+| A1 | CONFIRMED | Medium | `tina-http/src/connection.rs:1616` still delivers `0x1 \| 0x2 if frame.fin` without checking `ws.fragmented_message`; continuation handling at `:1630-1655` still appends to the old fragment. |
+| A2 | CONFIRMED | Low | `tina-http/src/parse.rs:258-274` still treats empty / `identity` transfer-encoding tokens as ignored, so TE present without final `chunked` can become a 0-body parse. |
+| A3 | CONFIRMED | Low | `tina-http/src/parse.rs:410-415` still writes `request.path.as_bytes()` directly into the request line. Path construction is still plain string based. |
+| A4 | CONFIRMED | Low | `tina-http/src/chunked_decoder.rs:255-264` still caps copied size-line bytes with `i.min(space)` and then consumes `i + 2`, so excess extension bytes can be dropped. |
+| B1 | CONFIRMED | High | HTTP/2 moved into modules, but `tina-http/src/http2/server.rs:757-759` still uses `data_payload(&frame)?.len()` for flow-control length; WINDOW_UPDATE credit at `:1023-1031` still uses delivered body bytes. |
+| B2 | CONFIRMED | Medium-High | `tina-http/src/http2/server.rs:600-604` ACKs SETTINGS after `apply_setting`; `SETTINGS_INITIAL_WINDOW_SIZE` updates stream windows at `:620-633`, but no response flush runs there. |
+| B3 | CONFIRMED | Medium | `tina-http/src/http2/headers.rs:127-132` still omits `te` from the forbidden-header rule and has no value check for `te: trailers`. |
+| B4 | CONFIRMED | Low-Medium | `tina-http/src/http2/headers.rs:237-253` checks `path.is_none()` but not empty path; `add_header` stores `:path` as-is at `:93-98`. |
+| B5 | CONFIRMED | Low | Stream receive-window overrun in `tina-http/src/http2/server.rs:801-811` still returns `Err(Http2ProtocolError::FlowControl)`, which the caller maps to connection-level teardown. |
+| B6 | CONFIRMED | Low | `tina-http/src/http2/server.rs:921-924` still treats any zero WINDOW_UPDATE increment as `WindowOverflow` before branching on stream id. |
+| C1 | CONFIRMED | High | `tina-runtime/src/threaded_multi_shard.rs:1022-1025` and `tina-sim/src/multi_shard.rs:339-349` still drop failed terminal reroutes with `let _ = ...`; `pending_isolate_calls` remains an uncapped Vec. |
+| C2 | CONFIRMED | Medium | `tina-runtime/src/deferred.rs:65-77` still says the assertion is load-bearing but contains no assertion; it filters Local slots only. |
+| C3 | CONFIRMED | Medium | `tina-runtime/src/threaded_multi_shard.rs:939-954` still subtracts terminal delivery from the entire ordinary budget, allowing ordinary remote sends to get zero budget. |
+| C4 | NEEDS-DISCUSSION | Low | Code still removes pending before requester-mailbox enqueue in `tina-runtime/src/dispatch.rs:1632-1650` then can reject completion later. This is traced, but the caller-visible terminal story is still weaker than `Full/Closed/Timeout`. |
+| C5 | NEEDS-DISCUSSION | Low | Bounded cause ring remains best-effort; late cause degrades after eviction. Current code around `dispatch.rs:1588-1601` still uses the bounded recent-cancel ring. Decide whether doc-only is enough. |
+| D1 | CONFIRMED | High | `tina-rpc-tokio/src/lib.rs:351-356` still sizes the shim mailbox as `bridge.max_in_flight * 2`, and `:502-516` still awaits `rx` without a deadline backstop. |
+| D2 | CONFIRMED | Medium | S3 still maps SDK failures to stringly `S3Error::Sdk` at `tina-aws-bridge/src/worker.rs:592,605,627,640`; per-variant retry classification is not present. |
+| D3 | NEEDS-DISCUSSION | Medium | Reqwest still aborts on timeout at `tina-reqwest-bridge/src/worker.rs:505-539` and frees the slot; this may be intended as true cancel, but the cross-bridge timeout vocabulary still differs. |
+| D4 | CONFIRMED | Low | SQLite timeout still sets `metrics.set_in_flight(0)` and drops `self.in_flight` at `tina-sqlite-bridge/src/worker.rs:415-431` while the blocking worker may still be running. |
+| D5 | NEEDS-DISCUSSION | Low | Reqwest retry policy still treats request IO as retryable by configured policy; because idempotency is documented caller responsibility, fix may be docs/classifier tightening rather than code. |
+| E1 | CONFIRMED | Medium | `tina-runtime/src/shutdown.rs:261-290` still takes worker handles before `thread::Builder::spawn`; if spawn fails, the moved closure is dropped and the fallback re-takes empty handles. |
+| E2 | CONFIRMED | Medium-High | `tina-runtime/src/dispatch.rs:2239` still calls `recipe.create(self, parent)` without `catch_unwind`; handler-turn panic containment does not cover restart factory creation. |
+| F1 | CONFIRMED | High | `tina-runtime/src/persistence.rs:206-218` still maps short read or bad magic in the `.idx` sidecar to `CorruptRecord`, bricking later appends instead of replay fallback. |
+| F2 | CONFIRMED | Medium | `vendor-betelgeuse/io/darwin.rs:867-878` still implements the user `Fsync` rail with `libc::fsync`, not `F_FULLFSYNC` fallback. |
+| F3 | CONFIRMED | Medium | Process-driver group kill/reap ordering still allows post-reap group signalling in `tina-runtime/src/driver/process.rs`; needs a focused fix/proof. |
+| F4 | CONFIRMED | Medium-High | TLS lane is still a single serial worker and read/write/accept calls can block for the configured timeout; needs nonblocking/pool work, not a doc tweak. |
+| F5 | CONFIRMED | Low-Medium | `kill_and_reap` still has an unbounded blocking `child.wait()` path after kill in `tina-runtime/src/driver/process.rs`. |
+| G1 | CONFIRMED | Medium | `tina-sim/src/dst/sweep.rs:113-125` still records loop `seed` separately from `case.seed` and does not assert the materialized case matches the swept seed. |
+| G2 | CONFIRMED | Low | `tina-sim/src/sim_impl.rs:5653-5658` still returns `seed % modulus` for `ordinal == 0`, bypassing tag mixing for first decisions. |
+| G3 | NEEDS-DISCUSSION | Low-Medium | `tina-runtime/src/observer.rs:82-89` still drops buffered events on full; `tina-proof-harness/src/live_replay.rs:93-101` can hash a captured subset unless callers check drops. Decide API guard vs stronger docs. |
+| H1 | CONFIRMED | Medium | `tina-macros/src/lib.rs:310-315` still synthesizes a hardcoded `msg` parameter in split-service `handle_call`. |
+| H2 | CONFIRMED | Medium | `tina-macros/src/lib.rs:307-318` still applies `#[deny(unused_variables)]` around generated split `handle_call`, including user request bindings. |
+| H3 | CONFIRMED | Medium | `tina-rpc-macros/src/lib.rs:561-566` still appends reserved parameter names (`deadline`, `correlator`, `reply_to`, `max_payload`) without visible collision diagnostics. |
+| H4 | CONFIRMED | Medium | `tina/src/lib.rs:332-425` still exposes `pub mod runtime_internal` and `request_effect_from_consumed_effect` publicly, so foreign crates can bypass the must-answer rail. |
+| H5 | CONFIRMED | Low | The proc macro still defaults `tina_crate` to `::tina` at `tina-macros/src/lib.rs:202-205`; runtime-only consumers need an explicit answer. |
+| H6 | CONFIRMED | Low | `tina/src/lib.rs:272,290,309,311` still mixes `::std::convert::Infallible` and `::core::convert::Infallible` in `isolate_types!`. |
+| I1 | CONFIRMED | High | `tina-runtime/src/dispatch.rs:1189,1432,1688,1852` still uses `entries.iter().position(...)` on completion delivery paths. |
+| I2 | CONFIRMED | High | `tina-runtime/src/dispatch.rs:1764-1777` still does two linear `position` scans and `Vec::remove` for driver completions. |
+| I3 | CONFIRMED | High | `tina-runtime/src/dispatch.rs:1495-1508` still scans all pending calls, finds min expired deadline, and `remove`s in a loop. |
+| I4 | CONFIRMED | Medium-High | `tina-runtime/src/threaded_multi_shard.rs:1000-1033` still drains source receivers in fixed order under one shared budget. |
+| I5 | CONFIRMED | Medium | `tina-runtime/src/threaded_multi_shard.rs:975-987` still sleeps 1 ms after productive work when any local/remote/in-flight activity exists. |
+| I6 | CONFIRMED | Medium | `tina-runtime/src/wait_list.rs:390-410` still performs sweep/count/len/store scans per park; `guarded_pending.rs` mirrors the same shape. |
+| I7 | CONFIRMED | Low-Medium | `tina-runtime/src/pool.rs:280-282,342-348,865-881` still scans waiter slabs for live count/free slots on acquire/report paths. |
+
+Verification conclusion: most findings remain live on current main. The
+`NEEDS-DISCUSSION` entries are not disproven; they are design-policy choices where
+the current code is real but the fix may be vocabulary/docs/API rather than a
+straight bug patch. The first implementation wave should still start with C1/F1
+and the I1-I3 runtime table work.
