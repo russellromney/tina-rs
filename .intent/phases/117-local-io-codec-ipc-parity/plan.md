@@ -2,11 +2,30 @@
 
 ## Status
 
-- Future implementation plan for Wave A.
-- Runs after Phase 115 lands so crate/module homes follow the core/battery
-  boundary.
-- Can run in parallel with phases 116 and 118 if ownership stays mostly in
-  runtime rails, codec helpers, and local IPC specimens.
+- Landed.
+- Shipped: `tina_runtime::file_loops` helpers (`FileReadChunks`,
+  `FileWriteAll`, `FileCopyBounded`), `tina-codec` battery crate
+  (`LineFramer`, `LengthDelimitedFramer`, sealed `Framer` trait,
+  `FrameDecision::{NeedMore,Frame,Malformed,Full}`), Unix-domain rails on
+  the public surface (`unix_bind`/`unix_accept`/`unix_connect`/
+  `unix_read`/`unix_write`/`unix_close_listener`/`unix_close_stream`),
+  full simulator support for Unix sockets, and
+  `examples/specimen_local_io_codec_ipc` (file ingest, bounded copy,
+  admin sidecar, framed mini-keyspace).
+- Live Unix-domain rail: a real OS-backed worker-thread lane
+  (`tina-runtime/src/driver/unix.rs`) drives non-blocking
+  `UnixListener`/`UnixStream` on Unix platforms; a live `LocalSystem`
+  echo round-trip proves the same framed shape the simulator covers.
+  On non-Unix platforms the lane reports typed `CallError::Unsupported`
+  and the capability table names `unix` as `Unsupported` (not
+  cfg-silent).
+- Platform scope: Linux and macOS are the supported targets. Windows is
+  out of scope until the `betelgeuse` I/O substrate (Unix-only today)
+  grows a Windows backend. The Unix lane is still written cleanly: the
+  `#[cfg(not(unix))]` paths report typed `Unsupported` with no
+  platform-only imports outside the `#[cfg(unix)]` worker module, so it
+  is ready when a non-Unix target arrives. `tina-codec` is pure-`std`
+  and already cross-compiles to Windows.
 
 ## Layering
 

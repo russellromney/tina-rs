@@ -228,6 +228,10 @@ pub struct RuntimeCapabilities {
     pub process: ResourceCapability,
     /// Runtime-owned signal support.
     pub signal: ResourceCapability,
+    /// Runtime-owned Unix-domain socket support. `Supported` on Unix
+    /// platforms (live OS-backed lane); `Unsupported` elsewhere — the
+    /// capability stays named rather than cfg-silently dropped.
+    pub unix: ResourceCapability,
     /// Platform durability support details.
     pub durability: DurabilityCapability,
 }
@@ -323,7 +327,32 @@ impl RuntimeCapabilities {
                 ShutdownSupport::Drained,
                 Some(signal_capacity),
             ),
+            unix: UNIX_RAIL_CAPABILITY,
             durability: DurabilityCapability::local(),
         }
     }
 }
+
+/// Live Unix-domain rail capability for the current platform.
+///
+/// On Unix, the live driver runs an OS-backed lane that polls
+/// non-blocking sockets. On non-Unix there is no backend, so the
+/// capability is reported `Unsupported` with `NotApplicable` shapes —
+/// callers see a typed capability, not a cfg-silent gap.
+#[cfg(unix)]
+const UNIX_RAIL_CAPABILITY: ResourceCapability = ResourceCapability::new(
+    ResourceSupport::Supported,
+    ResourceExecutionShape::PollBacked,
+    CancellationSupport::ResourceCloseOnly,
+    ShutdownSupport::Canceled,
+    None,
+);
+
+#[cfg(not(unix))]
+const UNIX_RAIL_CAPABILITY: ResourceCapability = ResourceCapability::new(
+    ResourceSupport::Unsupported,
+    ResourceExecutionShape::NotApplicable,
+    CancellationSupport::NotApplicable,
+    ShutdownSupport::NotApplicable,
+    None,
+);

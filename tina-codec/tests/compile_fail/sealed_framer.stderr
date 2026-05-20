@@ -1,0 +1,55 @@
+error[E0277]: the trait bound `MyFramer: tina_codec::sealed::Sealed` is not satisfied
+  --> tests/compile_fail/sealed_framer.rs:15:5
+   |
+15 |     fn next_frame(&mut self) -> FrameDecision<Self::Frame, Self::Malformed> {
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ unsatisfied trait bound
+   |
+help: the trait `tina_codec::sealed::Sealed` is not implemented for `MyFramer`
+  --> tests/compile_fail/sealed_framer.rs:7:1
+   |
+ 7 | struct MyFramer;
+   | ^^^^^^^^^^^^^^^
+help: the following other types implement trait `tina_codec::sealed::Sealed`
+  --> src/lib.rs
+   |
+   |     impl Sealed for super::LineFramer {}
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `LineFramer`
+   |     impl Sealed for super::LengthDelimitedFramer {}
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `LengthDelimitedFramer`
+note: required by a bound in `Framer`
+  --> src/lib.rs
+   |
+   | pub trait Framer: sealed::Sealed {
+   |                   ^^^^^^^^^^^^^^ required by this bound in `Framer`
+   = note: `Framer` is a "sealed trait", because to implement it you also need to implement `tina_codec::sealed::Sealed`, which is not accessible; this is usually done to force you to use one of the provided types that already implement it
+   = help: the following types implement the trait:
+             tina_codec::LineFramer
+             tina_codec::LengthDelimitedFramer
+
+error[E0277]: the trait bound `MyFramer: tina_codec::sealed::Sealed` is not satisfied
+ --> tests/compile_fail/sealed_framer.rs:9:17
+  |
+9 | impl Framer for MyFramer {
+  |                 ^^^^^^^^ unsatisfied trait bound
+  |
+help: the trait `tina_codec::sealed::Sealed` is not implemented for `MyFramer`
+ --> tests/compile_fail/sealed_framer.rs:7:1
+  |
+7 | struct MyFramer;
+  | ^^^^^^^^^^^^^^^
+help: the following other types implement trait `tina_codec::sealed::Sealed`
+ --> src/lib.rs
+  |
+  |     impl Sealed for super::LineFramer {}
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `LineFramer`
+  |     impl Sealed for super::LengthDelimitedFramer {}
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `LengthDelimitedFramer`
+note: required by a bound in `Framer`
+ --> src/lib.rs
+  |
+  | pub trait Framer: sealed::Sealed {
+  |                   ^^^^^^^^^^^^^^ required by this bound in `Framer`
+  = note: `Framer` is a "sealed trait", because to implement it you also need to implement `tina_codec::sealed::Sealed`, which is not accessible; this is usually done to force you to use one of the provided types that already implement it
+  = help: the following types implement the trait:
+            tina_codec::LineFramer
+            tina_codec::LengthDelimitedFramer

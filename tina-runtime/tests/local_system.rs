@@ -1995,6 +1995,25 @@ fn local_system_capabilities_name_supported_and_unsupported_resource_families() 
         PersistenceSupportLevel::NotClaimed
     );
 
+    // Unix-domain rail: live OS-backed lane on Unix, typed unsupported
+    // (not cfg-silent) elsewhere.
+    #[cfg(unix)]
+    {
+        assert_eq!(capabilities.unix.support(), ResourceSupport::Supported);
+        assert_eq!(
+            capabilities.unix.execution(),
+            ResourceExecutionShape::PollBacked
+        );
+    }
+    #[cfg(not(unix))]
+    {
+        assert_eq!(capabilities.unix.support(), ResourceSupport::Unsupported);
+        assert_eq!(
+            capabilities.unix.execution(),
+            ResourceExecutionShape::NotApplicable
+        );
+    }
+
     app.shutdown()
         .drain()
         .join()
@@ -2506,6 +2525,404 @@ fn local_system_tls_lane_full_is_visible_with_configured_capacity() {
             }
         )
     }));
+}
+
+// On non-Unix platforms the live driver has no Unix-domain backend and
+// every Unix call completes with typed `CallError::Unsupported`. This
+// pins that typed answer so the capability stays named, not cfg-silent.
+#[cfg(not(unix))]
+mod unix_unsupported_pin {
+    use super::*;
+    use tina_runtime::unix_bind;
+
+    #[derive(Debug)]
+    enum UnixProbeMsg {
+        Start,
+        Bound(Result<(tina_runtime::UnixListenerId, PathBuf), CallError>),
+    }
+
+    #[derive(Debug)]
+    struct UnixProbeService {
+        observed: Arc<Mutex<Option<Result<(), CallError>>>>,
+    }
+
+    #[tina_runtime::isolate(message = UnixProbeMsg, shard = AppShard)]
+    impl UnixProbeService {
+        fn handle(
+            &mut self,
+            msg: UnixProbeMsg,
+            _ctx: &mut Context<'_, AppShard, Self::Reply>,
+        ) -> Effect<Self> {
+            match msg {
+                UnixProbeMsg::Start => {
+                    unix_bind("/tmp/tina-unix-unsupported-pin.sock").then(UnixProbeMsg::Bound)
+                }
+                UnixProbeMsg::Bound(result) => {
+                    *self.observed.lock().expect("observed lock") =
+                        Some(result.map(|(_listener, _path)| ()));
+                    noop()
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn local_system_unix_rails_report_typed_unsupported_on_non_unix() {
+        let observed = Arc::new(Mutex::new(None));
+        let app = LocalSystem::single_shard(AppShard(43), AppMailboxFactory)
+            .trace_retention(TraceRetention::Bounded(64))
+            .build();
+        let address = app
+            .register_root::<UnixProbeService, Infallible>(
+                UnixProbeService {
+                    observed: Arc::clone(&observed),
+                },
+                8,
+            )
+            .expect("register unix probe");
+
+        app.try_send(address, UnixProbeMsg::Start)
+            .expect("start unix probe");
+        wait_until(|| observed.lock().expect("observed lock").is_some());
+
+        let result = *observed.lock().expect("observed lock");
+        assert_eq!(result, Some(Err(CallError::Unsupported)));
+
+        let _ = app.shutdown().drain().join().expect("shutdown");
+    }
+}
+
+// On Unix platforms the live driver runs a real OS-backed Unix-domain
+// lane. This drives a full bind/accept/connect/write/read/close echo
+// round-trip — the same framed-protocol shape the simulator covers — to
+// prove the live rail works, not just compiles.
+#[cfg(unix)]
+mod unix_live_echo {
+    use super::*;
+    use tina_runtime::{
+        UnixAcceptReply, UnixBindReply, UnixConnectReply, UnixReadReply, UnixStreamId,
+        UnixWriteReply, unix_accept, unix_bind, unix_close_listener, unix_close_stream,
+        unix_connect, unix_read, unix_write,
+    };
+
+    fn unique_sock(label: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!("tina-{label}-{}-{unique}.sock", std::process::id()))
+    }
+
+    #[derive(Debug)]
+    enum ServerMsg {
+        Start,
+        Bound(UnixBindReply),
+        Accepted(UnixAcceptReply),
+        Read(UnixReadReply),
+        Wrote(UnixWriteReply),
+        Done,
+    }
+
+    struct EchoServer {
+        path: PathBuf,
+        stream: Option<UnixStreamId>,
+        pending: Vec<u8>,
+        bound: Arc<Mutex<bool>>,
+    }
+
+    #[tina_runtime::isolate(message = ServerMsg, shard = AppShard)]
+    impl EchoServer {
+        fn handle(
+            &mut self,
+            msg: ServerMsg,
+            _ctx: &mut Context<'_, AppShard, Self::Reply>,
+        ) -> Effect<Self> {
+            match msg {
+                ServerMsg::Start => unix_bind(self.path.clone()).then(ServerMsg::Bound),
+                ServerMsg::Bound(Ok((listener, _))) => {
+                    *self.bound.lock().expect("bound lock") = true;
+                    unix_accept(listener).then(ServerMsg::Accepted)
+                }
+                ServerMsg::Bound(Err(_)) => Effect::Stop,
+                ServerMsg::Accepted(Ok(stream)) => {
+                    self.stream = Some(stream);
+                    unix_read(stream, 64).then(ServerMsg::Read)
+                }
+                ServerMsg::Accepted(Err(_)) => Effect::Stop,
+                ServerMsg::Read(Ok(bytes)) => {
+                    if bytes.is_empty() {
+                        match self.stream.take() {
+                            Some(stream) => unix_close_stream(stream).then(|_| ServerMsg::Done),
+                            None => Effect::Stop,
+                        }
+                    } else {
+                        self.pending = bytes;
+                        let stream = self.stream.expect("stream");
+                        unix_write(stream, self.pending.clone()).then(ServerMsg::Wrote)
+                    }
+                }
+                ServerMsg::Read(Err(_)) => Effect::Stop,
+                ServerMsg::Wrote(Ok(count)) => {
+                    let drained = count.min(self.pending.len());
+                    self.pending.drain(..drained);
+                    let stream = self.stream.expect("stream");
+                    if self.pending.is_empty() {
+                        unix_read(stream, 64).then(ServerMsg::Read)
+                    } else {
+                        unix_write(stream, self.pending.clone()).then(ServerMsg::Wrote)
+                    }
+                }
+                ServerMsg::Wrote(Err(_)) => Effect::Stop,
+                ServerMsg::Done => Effect::Stop,
+            }
+        }
+    }
+
+    #[derive(Debug)]
+    enum ClientMsg {
+        Start,
+        Connected(UnixConnectReply),
+        Wrote(UnixWriteReply),
+        Read(UnixReadReply),
+        Done,
+    }
+
+    struct EchoClient {
+        path: PathBuf,
+        stream: Option<UnixStreamId>,
+        pending: Vec<u8>,
+        received: Arc<Mutex<Vec<u8>>>,
+    }
+
+    #[tina_runtime::isolate(message = ClientMsg, shard = AppShard)]
+    impl EchoClient {
+        fn handle(
+            &mut self,
+            msg: ClientMsg,
+            _ctx: &mut Context<'_, AppShard, Self::Reply>,
+        ) -> Effect<Self> {
+            match msg {
+                ClientMsg::Start => unix_connect(self.path.clone()).then(ClientMsg::Connected),
+                ClientMsg::Connected(Ok(stream)) => {
+                    self.stream = Some(stream);
+                    self.pending = b"ping".to_vec();
+                    unix_write(stream, self.pending.clone()).then(ClientMsg::Wrote)
+                }
+                ClientMsg::Connected(Err(_)) => Effect::Stop,
+                ClientMsg::Wrote(Ok(count)) => {
+                    let drained = count.min(self.pending.len());
+                    self.pending.drain(..drained);
+                    let stream = self.stream.expect("stream");
+                    if self.pending.is_empty() {
+                        unix_read(stream, 64).then(ClientMsg::Read)
+                    } else {
+                        unix_write(stream, self.pending.clone()).then(ClientMsg::Wrote)
+                    }
+                }
+                ClientMsg::Wrote(Err(_)) => Effect::Stop,
+                ClientMsg::Read(Ok(bytes)) => {
+                    if !bytes.is_empty() {
+                        self.received
+                            .lock()
+                            .expect("received lock")
+                            .extend_from_slice(&bytes);
+                    }
+                    match self.stream.take() {
+                        Some(stream) => unix_close_stream(stream).then(|_| ClientMsg::Done),
+                        None => Effect::Stop,
+                    }
+                }
+                ClientMsg::Read(Err(_)) => Effect::Stop,
+                ClientMsg::Done => Effect::Stop,
+            }
+        }
+    }
+
+    #[test]
+    fn local_system_unix_live_echo_round_trip() {
+        let path = unique_sock("unix-echo");
+        let _ = std::fs::remove_file(&path);
+        let bound = Arc::new(Mutex::new(false));
+        let received = Arc::new(Mutex::new(Vec::new()));
+
+        let app = LocalSystem::single_shard(AppShard(44), AppMailboxFactory).build();
+        let server = app
+            .register_root::<EchoServer, Infallible>(
+                EchoServer {
+                    path: path.clone(),
+                    stream: None,
+                    pending: Vec::new(),
+                    bound: Arc::clone(&bound),
+                },
+                8,
+            )
+            .expect("register echo server");
+        app.try_send(server, ServerMsg::Start)
+            .expect("start server");
+
+        // Wait for the listener to be bound before connecting so the
+        // client does not race ahead of bind (live connect to an unbound
+        // path is ENOENT).
+        wait_until(|| *bound.lock().expect("bound lock"));
+
+        let client = app
+            .register_root::<EchoClient, Infallible>(
+                EchoClient {
+                    path: path.clone(),
+                    stream: None,
+                    pending: Vec::new(),
+                    received: Arc::clone(&received),
+                },
+                8,
+            )
+            .expect("register echo client");
+        app.try_send(client, ClientMsg::Start)
+            .expect("start client");
+
+        wait_until(|| received.lock().expect("received lock").as_slice() == b"ping");
+
+        let _ = app.shutdown().drain().join().expect("shutdown");
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(received.lock().expect("received lock").as_slice(), b"ping");
+    }
+
+    #[derive(Debug)]
+    enum BindProbeMsg {
+        Start,
+        Bound(UnixBindReply),
+    }
+
+    struct BindProbe {
+        path: PathBuf,
+        observed: Arc<Mutex<Option<UnixBindReply>>>,
+    }
+
+    #[tina_runtime::isolate(message = BindProbeMsg, shard = AppShard)]
+    impl BindProbe {
+        fn handle(
+            &mut self,
+            msg: BindProbeMsg,
+            _ctx: &mut Context<'_, AppShard, Self::Reply>,
+        ) -> Effect<Self> {
+            match msg {
+                BindProbeMsg::Start => unix_bind(self.path.clone()).then(BindProbeMsg::Bound),
+                BindProbeMsg::Bound(result) => {
+                    *self.observed.lock().expect("observed lock") = Some(result);
+                    Effect::Stop
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn local_system_unix_bind_does_not_remove_regular_file() {
+        let path = unique_sock("ur");
+        let _ = std::fs::remove_file(&path);
+        std::fs::write(&path, b"keep me").expect("write regular file");
+        let observed = Arc::new(Mutex::new(None));
+
+        let app = LocalSystem::single_shard(AppShard(45), AppMailboxFactory).build();
+        let address = app
+            .register_root::<BindProbe, Infallible>(
+                BindProbe {
+                    path: path.clone(),
+                    observed: Arc::clone(&observed),
+                },
+                8,
+            )
+            .expect("register bind probe");
+        app.try_send(address, BindProbeMsg::Start)
+            .expect("start bind probe");
+
+        wait_until(|| observed.lock().expect("observed lock").is_some());
+        let result = observed.lock().expect("observed lock").take().unwrap();
+        assert!(matches!(result, Err(CallError::Io)), "{result:?}");
+        assert_eq!(
+            std::fs::read(&path).expect("regular file still exists"),
+            b"keep me"
+        );
+        let _ = app.shutdown().drain().join().expect("shutdown");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[derive(Debug)]
+    enum CloseProbeMsg {
+        Start,
+        Bound(UnixBindReply),
+        Close,
+        Closed,
+    }
+
+    struct CloseProbe {
+        path: PathBuf,
+        listener: Option<tina_runtime::UnixListenerId>,
+        bound: Arc<Mutex<bool>>,
+        closed: Arc<Mutex<bool>>,
+    }
+
+    #[tina_runtime::isolate(message = CloseProbeMsg, shard = AppShard)]
+    impl CloseProbe {
+        fn handle(
+            &mut self,
+            msg: CloseProbeMsg,
+            _ctx: &mut Context<'_, AppShard, Self::Reply>,
+        ) -> Effect<Self> {
+            match msg {
+                CloseProbeMsg::Start => unix_bind(self.path.clone()).then(CloseProbeMsg::Bound),
+                CloseProbeMsg::Bound(Ok((listener, _))) => {
+                    self.listener = Some(listener);
+                    *self.bound.lock().expect("bound lock") = true;
+                    noop()
+                }
+                CloseProbeMsg::Bound(Err(_)) => Effect::Stop,
+                CloseProbeMsg::Close => match self.listener.take() {
+                    Some(listener) => unix_close_listener(listener).then(|_| CloseProbeMsg::Closed),
+                    None => Effect::Stop,
+                },
+                CloseProbeMsg::Closed => {
+                    *self.closed.lock().expect("closed lock") = true;
+                    Effect::Stop
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn local_system_unix_close_does_not_remove_replaced_regular_file() {
+        let path = unique_sock("ucr");
+        let _ = std::fs::remove_file(&path);
+        let bound = Arc::new(Mutex::new(false));
+        let closed = Arc::new(Mutex::new(false));
+
+        let app = LocalSystem::single_shard(AppShard(46), AppMailboxFactory).build();
+        let address = app
+            .register_root::<CloseProbe, Infallible>(
+                CloseProbe {
+                    path: path.clone(),
+                    listener: None,
+                    bound: Arc::clone(&bound),
+                    closed: Arc::clone(&closed),
+                },
+                8,
+            )
+            .expect("register close probe");
+        app.try_send(address, CloseProbeMsg::Start)
+            .expect("start close probe");
+        wait_until(|| *bound.lock().expect("bound lock"));
+
+        std::fs::remove_file(&path).expect("remove socket path");
+        std::fs::write(&path, b"replacement").expect("write replacement file");
+        app.try_send(address, CloseProbeMsg::Close)
+            .expect("close listener");
+        wait_until(|| *closed.lock().expect("closed lock"));
+
+        assert_eq!(
+            std::fs::read(&path).expect("replacement file still exists"),
+            b"replacement"
+        );
+        let _ = app.shutdown().drain().join().expect("shutdown");
+        let _ = std::fs::remove_file(&path);
+    }
 }
 
 #[test]

@@ -59,6 +59,7 @@ mod signals;
 mod storage;
 mod tcp;
 mod tls;
+mod unix;
 
 use dns::DnsLane;
 #[cfg(test)]
@@ -71,6 +72,7 @@ use tcp::BetelgeuseTcp;
 use tls::TlsLane;
 #[cfg(test)]
 use tls::{TlsCompletion, TlsCompletionResult, TlsPending, TlsPendingLane, TlsWorkerLane};
+use unix::UnixLane;
 
 const INITIAL_DRIVER_TIMER_CAPACITY: usize = 8;
 const INITIAL_DRIVER_RESOURCE_CAPACITY: usize = 4;
@@ -212,6 +214,7 @@ pub(crate) struct BetelgeuseDriver {
     dns: DnsLane,
     tls: TlsLane,
     process: ProcessLane,
+    unix: UnixLane,
     signals: Vec<SignalWaitEntry>,
     signal_capacity: usize,
     timers: Vec<TimerEntry>,
@@ -248,6 +251,7 @@ impl BetelgeuseDriver {
             dns: DnsLane::new(DEFAULT_DNS_LANE_CAPACITY),
             tls: TlsLane::new(DEFAULT_TLS_LANE_CAPACITY),
             process: ProcessLane::new(DEFAULT_PROCESS_LANE_CAPACITY),
+            unix: UnixLane::new(),
             signals: Vec::with_capacity(
                 DEFAULT_SIGNAL_CAPACITY.min(INITIAL_DRIVER_PENDING_CAPACITY),
             ),
@@ -272,6 +276,7 @@ impl BetelgeuseDriver {
             dns: DnsLane::new(dns_lane_capacity),
             tls: TlsLane::new(tls_lane_capacity),
             process: ProcessLane::new(process_lane_capacity),
+            unix: UnixLane::new(),
             signals: Vec::with_capacity(signal_capacity.min(INITIAL_DRIVER_PENDING_CAPACITY)),
             signal_capacity,
             timers: Vec::with_capacity(INITIAL_DRIVER_TIMER_CAPACITY),
@@ -405,6 +410,13 @@ impl RuntimeDriver for BetelgeuseDriver {
                     cancelled: Arc::new(AtomicBool::new(false)),
                 },
             ),
+            CallInput::UnixBind { .. }
+            | CallInput::UnixAccept { .. }
+            | CallInput::UnixConnect { .. }
+            | CallInput::UnixRead { .. }
+            | CallInput::UnixWrite { .. }
+            | CallInput::UnixListenerClose { .. }
+            | CallInput::UnixStreamClose { .. } => self.unix.submit(call_id, request),
             other => self.tcp.submit(call_id, other),
         }
     }
@@ -415,13 +427,16 @@ impl RuntimeDriver for BetelgeuseDriver {
         self.dns.advance(now, completed);
         self.tls.advance(now, completed);
         self.process.advance(completed);
+        self.unix.advance(completed);
         self.poll_os_signals(completed);
         self.harvest_signals(now, completed);
         self.harvest_timers(now, completed);
     }
 
     fn take_cancelled_by_close(&mut self) -> Vec<CallId> {
-        self.tcp.take_cancelled_by_close()
+        let mut cancelled = self.tcp.take_cancelled_by_close();
+        cancelled.extend(self.unix.take_cancelled_by_close());
+        cancelled
     }
 
     fn has_pending(&self) -> bool {
@@ -430,6 +445,7 @@ impl RuntimeDriver for BetelgeuseDriver {
             || self.dns.has_pending()
             || self.tls.has_pending()
             || self.process.has_pending()
+            || self.unix.has_pending()
             || self.signals.iter().any(|entry| !entry.cancelled)
             || !self.timers.is_empty()
     }
@@ -441,6 +457,7 @@ impl RuntimeDriver for BetelgeuseDriver {
         self.dns.cancel_pending(deadline);
         self.tls.cancel_pending(deadline);
         self.process.cancel_pending(deadline);
+        self.unix.cancel_pending(deadline);
         self.tcp.cancel_pending(deadline)
     }
 
@@ -455,6 +472,7 @@ impl RuntimeDriver for BetelgeuseDriver {
             || self.dns.cancel(call_id)
             || self.tls.cancel(call_id)
             || self.process.cancel(call_id)
+            || self.unix.cancel(call_id)
             || self.tcp.cancel(call_id)
     }
 
@@ -487,15 +505,16 @@ impl RuntimeDriver for BetelgeuseDriver {
         let tls = self.tls.resource_report();
         let process_pending = self.process.physical_pending_count();
         DriverResourceReport {
-            listeners: tcp.listeners + tls.listeners,
-            streams: tcp.streams,
+            listeners: tcp.listeners + tls.listeners + self.unix.listener_count(),
+            streams: tcp.streams + self.unix.stream_count(),
             tls_streams: tls.tls_streams,
             udp_sockets: tcp.udp_sockets,
             files: tcp.files,
             // Worker-held: TLS in-flight ops parking cloned listener/stream
-            // arcs, plus process calls owning a live Child. DNS/storage
-            // workers do not hold a runtime-visible OS handle, so they
-            // contribute zero here per the plan's count rules.
+            // arcs, plus process calls owning a live Child. DNS/storage/Unix
+            // workers do not hold a runtime-visible OS handle beyond the
+            // table-owned listener/stream ids, so they contribute zero here
+            // per the plan's count rules.
             worker_held: tls.worker_held + process_pending,
             // Pending counts use physical entries (not filtered on the
             // user-cancel flag) so that work the runtime asked to cancel
@@ -506,6 +525,7 @@ impl RuntimeDriver for BetelgeuseDriver {
                 + self.dns.physical_pending_count()
                 + tls.pending_calls
                 + process_pending
+                + self.unix.pending_call_count()
                 + self.signals.iter().filter(|entry| !entry.cancelled).count()
                 + self.timers.len(),
         }

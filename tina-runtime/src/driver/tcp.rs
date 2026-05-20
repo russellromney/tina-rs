@@ -421,6 +421,18 @@ impl BetelgeuseTcp {
                 call_id,
                 result: CallOutput::Failed(CallError::Unsupported),
             }),
+            // Unix-domain rails are routed to the dedicated `UnixLane` in
+            // the driver dispatcher before reaching the TCP lane, so they
+            // never arrive here. The arm keeps the match total.
+            CallInput::UnixBind { .. }
+            | CallInput::UnixAccept { .. }
+            | CallInput::UnixConnect { .. }
+            | CallInput::UnixRead { .. }
+            | CallInput::UnixWrite { .. }
+            | CallInput::UnixListenerClose { .. }
+            | CallInput::UnixStreamClose { .. } => {
+                unreachable!("Unix-domain calls are routed to the dedicated unix lane")
+            }
         }
     }
 

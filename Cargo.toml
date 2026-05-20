@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "tina",
+    "tina-codec",
     "tina-http",
     "tina-macros",
     "tina-mailbox-spsc",
@@ -59,6 +60,7 @@ exclude = [
     "examples/specimen_pool_cancel_reclaim",
     "examples/specimen_request_scope_fanout",
     "examples/specimen_websocket_room",
+    "examples/specimen_local_io_codec_ipc",
 ]
 resolver = "2"
 

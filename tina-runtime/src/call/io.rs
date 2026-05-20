@@ -15,7 +15,9 @@ use std::time::Duration;
 use super::types::{
     FileId, FileOpenOptions, JournalReplay, PathMetadata, ProcessStatus, SnapshotImage,
 };
-use super::{ListenerId, StreamId, TlsListenerId, TlsStreamId, UdpSocketId};
+use super::{
+    ListenerId, StreamId, TlsListenerId, TlsStreamId, UdpSocketId, UnixListenerId, UnixStreamId,
+};
 
 /// One concrete call shape understood by `tina-runtime`.
 ///
@@ -336,6 +338,54 @@ pub enum CallInput {
         path: PathBuf,
     },
 
+    /// Bind a Unix-domain listener at `path`.
+    UnixBind {
+        /// Filesystem path the listener should bind to.
+        path: PathBuf,
+    },
+
+    /// Accept one inbound Unix stream on a previously-bound listener.
+    UnixAccept {
+        /// The Unix listener to accept on.
+        listener: UnixListenerId,
+    },
+
+    /// Connect one outbound Unix stream to `path`.
+    UnixConnect {
+        /// The peer path to connect to.
+        path: PathBuf,
+    },
+
+    /// Read up to `max_len` bytes from a Unix stream.
+    UnixRead {
+        /// The Unix stream to read from.
+        stream: UnixStreamId,
+        /// The maximum number of bytes the runtime may deliver.
+        max_len: usize,
+    },
+
+    /// Write `bytes` to a Unix stream. Partial writes are surfaced
+    /// through [`CallOutput::UnixWrote`].
+    UnixWrite {
+        /// The Unix stream to write to.
+        stream: UnixStreamId,
+        /// The payload to write.
+        bytes: Vec<u8>,
+    },
+
+    /// Close a Unix listener and release its resources. The runtime
+    /// removes the underlying socket file when the listener is closed.
+    UnixListenerClose {
+        /// The Unix listener to close.
+        listener: UnixListenerId,
+    },
+
+    /// Close a Unix stream and release its resources.
+    UnixStreamClose {
+        /// The Unix stream to close.
+        stream: UnixStreamId,
+    },
+
     /// Sleep for a relative duration.
     ///
     /// Completion fires no earlier than `armed_at + after` on a future
@@ -390,6 +440,13 @@ impl CallInput {
             Self::JournalAppend { .. } => crate::trace::CallKind::JournalAppend,
             Self::JournalReplay { .. } => crate::trace::CallKind::JournalReplay,
             Self::Sleep { .. } => crate::trace::CallKind::Sleep,
+            Self::UnixBind { .. } => crate::trace::CallKind::UnixBind,
+            Self::UnixAccept { .. } => crate::trace::CallKind::UnixAccept,
+            Self::UnixConnect { .. } => crate::trace::CallKind::UnixConnect,
+            Self::UnixRead { .. } => crate::trace::CallKind::UnixRead,
+            Self::UnixWrite { .. } => crate::trace::CallKind::UnixWrite,
+            Self::UnixListenerClose { .. } => crate::trace::CallKind::UnixListenerClose,
+            Self::UnixStreamClose { .. } => crate::trace::CallKind::UnixStreamClose,
         }
     }
 
@@ -645,6 +702,45 @@ pub enum CallOutput {
 
     /// A timer sleep completed and the isolate should wake.
     TimerFired,
+
+    /// A Unix listener was bound and is ready to accept.
+    UnixBound {
+        /// Runtime-assigned Unix listener id.
+        listener: UnixListenerId,
+        /// Bound socket path.
+        path: PathBuf,
+    },
+
+    /// A Unix stream was accepted.
+    UnixAccepted {
+        /// Runtime-assigned Unix stream id.
+        stream: UnixStreamId,
+    },
+
+    /// A Unix stream connect completed.
+    UnixConnected {
+        /// Runtime-assigned Unix stream id.
+        stream: UnixStreamId,
+    },
+
+    /// A Unix stream read returned bytes. An empty `bytes` vector means
+    /// end of stream.
+    UnixRead {
+        /// The bytes the runtime read from the stream.
+        bytes: Vec<u8>,
+    },
+
+    /// A Unix stream write moved `count` bytes onto the stream.
+    UnixWrote {
+        /// Bytes accepted by the runtime.
+        count: usize,
+    },
+
+    /// A Unix listener was closed and its resources released.
+    UnixListenerClosed,
+
+    /// A Unix stream was closed and its resources released.
+    UnixStreamClosed,
 
     /// The runtime could not complete the call. The trace already records
     /// the failure with a richer reason; this variant is what the issuing
