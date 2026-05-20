@@ -31,6 +31,7 @@
 
 use std::alloc::Global;
 use std::any::Any;
+use std::collections::{BTreeMap, HashMap};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -328,6 +329,8 @@ where
     pub(crate) translators: Vec<StoredTranslator>,
     pub(crate) clock: Box<dyn Clock>,
     pub(crate) pending_isolate_calls: Vec<PendingIsolateCall>,
+    pub(crate) pending_isolate_call_indexes: HashMap<CallId, usize>,
+    pub(crate) pending_isolate_call_deadlines: BTreeMap<(Instant, u64), CallId>,
     pub(crate) round_messages: Vec<Option<DeliveredMessage>>,
     pub(crate) driver_completions: Vec<DriverCompletion>,
     pub(crate) next_isolate_call_ordinal: u64,
@@ -612,6 +615,8 @@ where
             translators: Vec::with_capacity(preallocation.call_capacity),
             clock,
             pending_isolate_calls: Vec::with_capacity(preallocation.call_capacity),
+            pending_isolate_call_indexes: HashMap::with_capacity(preallocation.call_capacity),
+            pending_isolate_call_deadlines: BTreeMap::new(),
             round_messages: Vec::with_capacity(preallocation.round_scratch_capacity),
             driver_completions: Vec::with_capacity(preallocation.call_capacity),
             next_isolate_call_ordinal: 0,

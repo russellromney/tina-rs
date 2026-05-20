@@ -90,6 +90,8 @@ where
         }
 
         let pending_isolate_calls = std::mem::take(&mut self.pending_isolate_calls);
+        self.pending_isolate_call_indexes.clear();
+        self.pending_isolate_call_deadlines.clear();
         for call in pending_isolate_calls {
             // Mark any caller-held CallHandle as Cancelled so a late
             // poll of `handle.state()` reflects the truth instead of
@@ -1315,7 +1317,7 @@ where
                     shared.set_call_id(context.call_id.get());
                     shared.set_shard_id(self.shard.id().get());
                 }
-                self.pending_isolate_calls.push(PendingIsolateCall {
+                self.push_pending_isolate_call(PendingIsolateCall {
                     call_id: context.call_id,
                     requester: context.requester,
                     cause: context.cause,
@@ -1359,6 +1361,48 @@ where
         }
     }
 
+    pub(crate) fn push_pending_isolate_call(&mut self, entry: PendingIsolateCall) {
+        let index = self.pending_isolate_calls.len();
+        let previous = self
+            .pending_isolate_call_indexes
+            .insert(entry.call_id, index);
+        assert!(
+            previous.is_none(),
+            "duplicate pending isolate call {:?}",
+            entry.call_id
+        );
+        self.pending_isolate_call_deadlines
+            .insert((entry.deadline, entry.insertion_order), entry.call_id);
+        self.pending_isolate_calls.push(entry);
+    }
+
+    pub(crate) fn remove_pending_isolate_call(
+        &mut self,
+        call_id: CallId,
+    ) -> Option<PendingIsolateCall> {
+        let index = self.pending_isolate_call_indexes.remove(&call_id)?;
+        let removed = self.pending_isolate_calls.swap_remove(index);
+        self.pending_isolate_call_deadlines
+            .remove(&(removed.deadline, removed.insertion_order));
+        if index < self.pending_isolate_calls.len() {
+            let moved = &self.pending_isolate_calls[index];
+            self.pending_isolate_call_indexes
+                .insert(moved.call_id, index);
+        }
+        Some(removed)
+    }
+
+    pub(crate) fn rebuild_pending_isolate_call_indexes(&mut self) {
+        self.pending_isolate_call_indexes.clear();
+        self.pending_isolate_call_deadlines.clear();
+        for (index, entry) in self.pending_isolate_calls.iter().enumerate() {
+            self.pending_isolate_call_indexes
+                .insert(entry.call_id, index);
+            self.pending_isolate_call_deadlines
+                .insert((entry.deadline, entry.insertion_order), entry.call_id);
+        }
+    }
+
     pub(crate) fn dispatch_cancel_call(
         &mut self,
         context: CallDispatchContext,
@@ -1388,13 +1432,8 @@ where
                             tina::CancelOutcome::WrongShard
                         } else {
                             let call_id = CallId::new(raw_call_id);
-                            match self
-                                .pending_isolate_calls
-                                .iter()
-                                .position(|entry| entry.call_id == call_id)
-                            {
-                                Some(index) => {
-                                    let mut entry = self.pending_isolate_calls.remove(index);
+                            match self.remove_pending_isolate_call(call_id) {
+                                Some(mut entry) => {
                                     // CallCancelled's trace cause chains back
                                     // to the original CallDispatchAttempted so
                                     // every CallDispatchAttempted has exactly
@@ -1493,19 +1532,17 @@ where
     }
 
     pub(crate) fn harvest_isolate_call_timeouts(&mut self, now: Instant) {
-        while let Some(index) = self
-            .pending_isolate_calls
-            .iter()
-            .enumerate()
-            .filter(|(_, entry)| entry.deadline <= now)
-            .min_by(|(_, left), (_, right)| {
-                left.deadline
-                    .cmp(&right.deadline)
-                    .then_with(|| left.insertion_order.cmp(&right.insertion_order))
-            })
-            .map(|(index, _)| index)
+        while let Some((&(deadline, insertion_order), &call_id)) =
+            self.pending_isolate_call_deadlines.first_key_value()
         {
-            let mut entry = self.pending_isolate_calls.remove(index);
+            if deadline > now {
+                break;
+            }
+            self.pending_isolate_call_deadlines
+                .remove(&(deadline, insertion_order));
+            let Some(mut entry) = self.remove_pending_isolate_call(call_id) else {
+                continue;
+            };
             let translator = entry.translator.take().unwrap_or_else(|| {
                 panic!("translator for call {:?} already consumed", entry.call_id)
             });
@@ -1554,6 +1591,7 @@ where
                 && entry.requester.generation == owner_generation
         });
         self.pending_isolate_calls = kept;
+        self.rebuild_pending_isolate_call_indexes();
         for entry in owned.iter_mut() {
             self.record_cancelled_call(entry.call_id, tina::CancelCause::OwnerStopped);
         }
@@ -1629,14 +1667,9 @@ where
         cause: CauseId,
         outcome: CallOutcome<Box<dyn Any>>,
     ) -> bool {
-        let Some(index) = self
-            .pending_isolate_calls
-            .iter()
-            .position(|entry| entry.call_id == call_id)
-        else {
+        let Some(mut pending) = self.remove_pending_isolate_call(call_id) else {
             return false;
         };
-        let mut pending = self.pending_isolate_calls.remove(index);
         let translator = pending
             .translator
             .take()
