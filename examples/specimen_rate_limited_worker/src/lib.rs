@@ -19,14 +19,16 @@
 //! rather than exact counts: every burst job is accounted for,
 //! overload was visible, and every admitted job was processed.
 //!
-//! Note on naming: the "rate" here is *throughput pacing* — the worker
-//! drains one job per [`RATE_WINDOW_MS`] — not *admission rate limiting*
-//! (accept/reject at the door). The overload signal is the bounded
-//! mailbox, mirrored exactly on the Tokio side so the two implementations
-//! produce structurally identical numbers. For the token-bucket
-//! admission policy (`tina_runtime::RateLimit` / `AdmissionDecision`),
-//! see `examples/systems/system_tenant_rate_limiter`, which accepts or
-//! rejects per tenant with a deterministic `retry_after`.
+//! Note on naming: the "rate" here is *throughput pacing*, not *admission
+//! rate limiting* (accept/reject at the door). The Tina side paces with a
+//! `tina_runtime::RateLimit<()>` token bucket — `try_admit((), ctx.now())`
+//! returns `Admitted` (process one) or `RateLimited { retry_after }` (sleep
+//! that long, then ask again) — so the rate window falls out of the
+//! limiter's deterministic `retry_after` instead of a hand-rolled sleep.
+//! The overload signal is still the bounded mailbox, mirrored on the Tokio
+//! side so the two implementations report structurally identical numbers.
+//! For the *reject-at-the-door* use of the same primitive — admit or refuse
+//! per tenant — see `examples/systems/system_tenant_rate_limiter`.
 
 pub mod tina_impl;
 pub mod tokio_impl;

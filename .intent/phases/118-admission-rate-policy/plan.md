@@ -12,11 +12,19 @@
   service pressure reports without rebuilding those primitives. The
   shared `AdmissionDecision` shape projects onto `CapacitySurfaceReport`
   so existing discovery and `CapacitySummary` assertions keep working.
+- All User Proof Specimens and Proof Shape items are covered:
+  `system_api_gateway_limits` charges two shared weighted budgets
+  (`gateway.in_flight` + `gateway.body_bytes`); `system_tenant_rate_limiter`
+  proves hot/cold fairness and deterministic `retry_after`;
+  `specimen_rate_limited_worker` paces via `RateLimit`/`AdmissionDecision`;
+  `specimen_idempotent_retry` shows `FullHandling` bounded retry with the
+  idempotency key named on the message; `tina-sim/tests/admission_replay.rs`
+  proves time-based determinism under the simulator's virtual clock.
 - Deferred to future phases: bounded-wait wrapper over `SharedWork` was
-  intentionally not built — the `AdmissionDecision::Wait { delay,
-  report }` variant is the shape, and callers compose with the existing
-  `SharedWork` helper. If a future proof specimen forces it, the
-  wrapper can land then.
+  intentionally not built — the plan gates it ("do not add a new waiter
+  product unless a proof specimen forces it"). The
+  `AdmissionDecision::Wait { delay, report }` variant is the shape, and
+  callers compose with the existing `SharedWork` helper.
 
 ## Layering
 

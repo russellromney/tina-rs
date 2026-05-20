@@ -6,8 +6,38 @@ This file records completed work.
 
 ### Admission And Rate Policy
 
-(Pre-merge tightening — see the two "fixes" sections below for the
-deltas against the original landing.)
+(Pre-merge tightening — see the "fixes" sections below for the deltas
+against the original landing.)
+
+#### Plan-completion pass (round 3)
+
+Closed the remaining gaps against the phase plan's proof/specimen list:
+
+- **`specimen_rate_limited_worker` now paces with `RateLimit`.** The Tina
+  side's pacing is a `RateLimit<()>` token bucket driven by `ctx.now()`
+  (`Admitted` → process one; `RateLimited { retry_after }` → sleep, then
+  ask again) instead of a hand-rolled `sleep(RATE_WINDOW)` + `SingleCallGate`.
+  The bounded mailbox is still the backpressure surface and the Tokio-side
+  parity holds.
+- **New `examples/specimen_idempotent_retry`.** A runnable outbound-edge
+  relay that uses `FullHandling::retry_backoff` for bounded, caller-owned
+  retry against a flaky downstream, with the idempotency key named on the
+  `Deliver { idempotency_key }` message. Proves: exactly-once charge across
+  retries, visible budget exhaustion, no charge on exhaustion.
+- **tina-sim replay proof.** `tina-sim/tests/admission_replay.rs` drives a
+  `RateLimit` isolate off the simulator's virtual `ctx.now()` and shows the
+  decision trace is byte-identical across runs and *independent of seed*,
+  with `retry_after` equal to the exact token window under sim time.
+- **API-shape proof for explicit retry.** A test pins that
+  `FullHandling::shed()` never schedules a retry and that the only path to
+  `RetryAfter` is an explicitly-constructed `retry_backoff(Backoff)`; the
+  admission policies themselves expose no retry method.
+- **`system_api_gateway_limits` gains the body-bytes dimension.** Each
+  request now charges two shared weighted budgets — `gateway.in_flight`
+  (request weight) and `gateway.body_bytes` (body size) — admitted only if
+  both have room, with the in-flight charge rolled back if the body budget
+  is full. A new smoke test drives the body-bytes-bound case and asserts the
+  typed `Full` names `gateway.body_bytes`.
 
 #### Pre-merge hardening (round 2)
 

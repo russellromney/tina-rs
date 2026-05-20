@@ -1,12 +1,22 @@
 # system_api_gateway_limits
 
-Two routes, one cap. Proves [`SharedCapacityScope`].
+Two routes, two shared weighted budgets. Proves [`SharedCapacityScope`].
 
 A gateway isolate exposes "upload" and "list" requests. Both routes
-charge one shared, shard-local weighted scope (`gateway.in_flight`,
-cap `4`). Uploads weigh `2`, lists weigh `1`. Callers race; one
-route can drain the scope on its own; the other still gets
-`Full { filled: "gateway.in_flight", … }` because the cap is shared.
+charge **two** shared, shard-local weighted scopes on every request:
+
+- `gateway.in_flight` (cap `4`) — in-flight-request weight; uploads
+  weigh `2`, lists weigh `1`.
+- `gateway.body_bytes` (cap `4096`) — request body size; uploads are
+  `1024` bytes, lists `128`.
+
+A request is admitted only if **both** budgets have room: the gateway
+charges in-flight first, then body bytes, and rolls back the in-flight
+charge if the body budget is full. Callers race; whichever budget fills
+first surfaces `Full { filled: "<scope>", … }` naming the exact shared
+surface that was exhausted. The smoke tests drive both the in-flight-bound
+case (default config) and the body-bytes-bound case (loose in-flight cap,
+tight body cap).
 
 ## Run
 
@@ -41,10 +51,11 @@ system=system_api_gateway_limits upload_admitted=A upload_full=F upload_timeout=
 
 | Claim | Evidence |
 |---|---|
-| Two routes share one cap | `upload_admitted * 2 + list_admitted * 1 <= shared_cap` at peak; both routes can see `Full` from the same scope name. |
-| Owner stop releases held charges | `scope_admitted == scope_released` and `scope_current_at_drain == 0` after the runtime shuts down. |
-| Full counter is honest | `scope_full_count == upload_full + list_full`. |
-| Discovery line is CI-friendly | smoke test greps `scope `, `capacity surface=`, and `util_bp=`. |
+| Two routes share one in-flight cap | `upload_admitted * 2 + list_admitted * 1 <= shared_cap` at peak; both routes can see `Full` from the same scope name. |
+| Two routes share one body-bytes cap | `body_bytes_budget_fills_independently_of_in_flight`: with a loose in-flight cap and a tight body cap, `body_full_count > 0` while `scope_full_count == 0`, and every `Full` came from `gateway.body_bytes`. |
+| Owner stop releases both budgets | `scope_admitted == scope_released`, `scope_current_at_drain == 0`, `body_admitted == body_released`, `body_current_at_drain == 0` after shutdown. |
+| Full counter is honest | `scope_full_count == upload_full + list_full` when in-flight is the binding constraint. |
+| Discovery line is CI-friendly | smoke test greps `scope `, `capacity surface=`, `util_bp=`, and the `gateway.body_bytes` line. |
 
 ## Findings
 

@@ -235,6 +235,52 @@ fn rate_limit_with_caller_owned_retry_budget_is_visible() {
 }
 
 #[test]
+fn retry_requires_an_explicit_budget_value() {
+    // Plan proof: "a retry helper cannot run without an explicit
+    // idempotency/retry policy value." The admission policies themselves
+    // have NO retry method — a rejection is terminal unless the caller
+    // opts into retry by constructing a FullHandling with an explicit
+    // Backoff. This test pins that API shape:
+    //
+    // 1. `FullHandling::shed()` (the no-budget constructor) NEVER schedules
+    //    a retry, no matter how many Fulls it sees.
+    // 2. Only `FullHandling::retry_backoff(Backoff)` — which cannot be
+    //    called without naming a Backoff — yields `RetryAfter`.
+    let now = Instant::now();
+
+    let mut shed = FullHandling::shed();
+    for _ in 0..5 {
+        match shed.on_full(now, None::<Deadline>) {
+            FullDecision::Shed(_) => {}
+            other => panic!("shed mode must never retry, got {other:?}"),
+        }
+    }
+
+    // The retrying form requires an explicit Backoff value at construction;
+    // there is no `FullHandling::retry()` with an implicit/default budget.
+    let mut budget =
+        FullHandling::retry_backoff(Backoff::constant(Duration::from_millis(10), 1).unwrap());
+    assert!(
+        matches!(
+            budget.on_full(now, None::<Deadline>),
+            FullDecision::RetryAfter { .. }
+        ),
+        "an explicit budget is the only path to RetryAfter",
+    );
+
+    // And a rate-limit rejection is itself terminal: try_admit returns a
+    // typed outcome, never a retried admission. (Compile-time proof that
+    // there is no `try_admit_with_retry` lives in the absence of such a
+    // method on the policy types.)
+    let mut rate = RateLimit::<&'static str>::new("rate.no_auto_retry", 2, 5, 1);
+    let _ = rate.try_admit(&"k", now).into_admitted().unwrap();
+    assert!(matches!(
+        rate.try_admit(&"k", now),
+        AdmissionDecision::RateLimited { .. }
+    ));
+}
+
+#[test]
 fn concurrency_close_emits_typed_outcome_after_admission_stops() {
     let mut limit =
         ConcurrencyLimit::with_capacity("svc.shutdown", 2).on_pressure(PressureAction::Close);
