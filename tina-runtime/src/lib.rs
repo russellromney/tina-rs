@@ -31,12 +31,13 @@
 
 use std::alloc::Global;
 use std::any::Any;
+use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
-use tina::{DeferredSlotRegistry, Shard};
+use tina::{DeferredSlotRegistry, IsolateId, Shard};
 
 use betelgeuse::IOLoopHandle;
 
@@ -315,6 +316,7 @@ where
     pub(crate) shard: S,
     pub(crate) mailbox_factory: F,
     pub(crate) entries: Vec<RegisteredEntry<S, F>>,
+    pub(crate) entry_indexes: HashMap<IsolateId, usize>,
     pub(crate) child_records: Vec<ChildRecord<S, F>>,
     pub(crate) supervisors: Vec<SupervisorRecord>,
     pub(crate) next_isolate_id: u64,
@@ -599,6 +601,7 @@ where
             shard,
             mailbox_factory,
             entries: Vec::with_capacity(preallocation.entry_capacity),
+            entry_indexes: HashMap::with_capacity(preallocation.entry_capacity),
             child_records: Vec::with_capacity(preallocation.child_record_capacity),
             supervisors: Vec::with_capacity(preallocation.supervisor_capacity),
             next_isolate_id: 1,
