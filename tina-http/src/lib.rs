@@ -83,10 +83,17 @@
 //! RFC feature clone.
 //!
 //! HTTP/2 client: [`Http2ClientConnection`] is a native client isolate
-//! over one TCP stream (h2c first form) with bounded stream-slot
-//! admission, typed [`Http2ClientOutcome`], outbound flow-control
-//! pacing, and outbound-direction protocol facts. A TLS target resolves
-//! to [`Http2ClientOutcome::TlsAlpnMismatch`] until the ALPN rail lands.
+//! over one stream — cleartext h2c or h2 over TLS — with bounded
+//! stream-slot admission, typed [`Http2ClientOutcome`], outbound
+//! flow-control pacing, and outbound-direction protocol facts. A
+//! [`Http2Target::Tls`] target dials the TLS rail with `h2` ALPN; a
+//! server that declines `h2` returns
+//! [`Http2ClientOutcome::TlsAlpnMismatch`], distinct from cert/name
+//! failures. Request bodies are buffered ([`Http2ClientRequest`]) or
+//! streamed from a chunk source ([`Http2ClientStreamingRequest`], the
+//! same `IterBodySource` pull protocol the server uses). h2/TLS is
+//! request-response (half-duplex) today; full-duplex needs a runtime TLS
+//! reactor.
 //!
 //! gRPC: [`GrpcRouter`] is the server. [`GrpcClient`] is the native
 //! client — Tina is a native gRPC client, not only a server. The server
@@ -166,10 +173,10 @@ pub use grpc::{
 pub use grpc_client::{GrpcClient, GrpcTarget, GrpcUnaryOutcome};
 pub use http2::{
     AlpnProtocols, Http2ClientConnection, Http2ClientLimits, Http2ClientMsg, Http2ClientOutcome,
-    Http2ClientReply, Http2ClientReport, Http2ClientRequest, Http2ClientResponse, Http2Connection,
-    Http2ConnectionMsg, Http2ConnectionReply, Http2ConnectionReport, Http2Limits, Http2Listener,
-    Http2ListenerMsg, Http2Outcome, Http2ProtocolError, Http2ServerConfig, Http2StreamReport,
-    Http2StreamState, Http2Target,
+    Http2ClientReply, Http2ClientReport, Http2ClientRequest, Http2ClientResponse,
+    Http2ClientStreamingRequest, Http2Connection, Http2ConnectionMsg, Http2ConnectionReply,
+    Http2ConnectionReport, Http2Limits, Http2Listener, Http2ListenerMsg, Http2Outcome,
+    Http2ProtocolError, Http2ServerConfig, Http2StreamReport, Http2StreamState, Http2Target,
 };
 pub use keepalive::{
     KeepaliveConnAddr, KeepaliveConnection, KeepaliveConnectionMsg, KeepaliveConnectionStopFailure,

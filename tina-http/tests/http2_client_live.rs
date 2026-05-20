@@ -7,10 +7,14 @@
 //!   confirms `opened == closed`, zero protocol errors)
 //! - response body over the client cap → typed `BodyTooLarge`
 //! - in-window POST through the outbound flow-control pacer
-//! - `Http2Target::Tls` returns typed `TlsAlpnMismatch` (ALPN rail
-//!   deferred), without touching the TLS rail
+//! - streaming request body: multi-chunk source round-trips to `/echo`;
+//!   empty source still closes with an empty DATA(END_STREAM); the
+//!   source is `Cancel`led (released, not orphaned) on completion
+//! - route-key shape distinguishes a TLS target from an h2c one
 //!
-//! Adversarial / concurrency / flow-control-under-window coverage —
+//! Real h2/TLS (round-trip with `h2` selected, ALPN mismatch, untrusted
+//! cert) lives in `http2_client_tls_live.rs`. Adversarial / concurrency
+//! / flow-control-under-window coverage —
 //! server RST_STREAM, GOAWAY, malformed frames, *concurrent* streams
 //! not crossing replies, `Full` admission under a peer concurrency
 //! cap, caller cancel, and a 128 KB upload paced through real
@@ -23,15 +27,19 @@ mod common;
 
 use std::convert::Infallible;
 use std::net::SocketAddr;
-use std::time::Duration;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
 use common::{Counter, TestShard};
-use http::Method;
+use http::{HeaderMap, Method};
+use tina::CallContext;
 use tina::prelude::*;
 use tina_http::{
     AlpnProtocols, Http2ClientConnection, Http2ClientLimits, Http2ClientMsg, Http2ClientOutcome,
-    Http2ClientReply, Http2ClientRequest, Http2Limits, Http2Listener, Http2ListenerMsg,
-    Http2ServerConfig, Http2Target,
+    Http2ClientReply, Http2ClientRequest, Http2ClientStreamingRequest, Http2Limits, Http2Listener,
+    Http2ListenerMsg, Http2ServerConfig, Http2Target, IterBodySource, ResponseChunkMsg,
+    ResponseChunkReply,
 };
 use tina_runtime::{
     CallOutcome, DefaultThreadedMailboxFactory, ThreadedRuntime, ThreadedRuntimeConfig,
@@ -343,6 +351,238 @@ fn h2c_post_in_window_body_round_trips_against_real_server() {
         }
         other => panic!("expected Replied, got {other:?}"),
     }
+
+    let _ = runtime.try_send(listener, Http2ListenerMsg::Stop);
+    let _ = runtime.try_send(client, Http2ClientMsg::Stop);
+    let _ = runtime.shutdown();
+}
+
+#[test]
+fn h2c_streaming_request_body_round_trips_chunks_to_echo() {
+    // Streaming request bodies: the client sends HEADERS *without*
+    // END_STREAM, then pulls body chunks from a source isolate and ships
+    // them as DATA frames, ending the request with END_STREAM once the
+    // source replies `Eof`. The in-tree server reassembles the DATA frames
+    // into a buffered body before dispatching to `/echo`, so a correct
+    // round-trip proves every chunk arrived in order and the final
+    // END_STREAM closed the request half.
+    let (runtime, listener, addr) = start_server();
+    let target = Http2Target::H2c {
+        authority: "test".into(),
+        addr,
+    };
+    let client = make_client(&runtime, target, Http2ClientLimits::default());
+
+    let chunks = vec![
+        b"chunk-one-".to_vec(),
+        b"chunk-two-".to_vec(),
+        b"chunk-three".to_vec(),
+    ];
+    let expected: Vec<u8> = chunks.iter().flatten().copied().collect();
+    let source = IterBodySource::<TestShard>::register(&runtime, chunks.into_iter(), 16)
+        .expect("register body source");
+
+    let req = Http2ClientStreamingRequest {
+        method: Method::POST,
+        path: "/echo".into(),
+        headers: http::HeaderMap::new(),
+        source,
+    };
+    let outcome = runtime
+        .call_blocking(
+            client,
+            Http2ClientMsg::SubmitStreaming(req),
+            Duration::from_secs(5),
+        )
+        .expect("call returns outcome");
+    match outcome {
+        CallOutcome::Replied(Http2ClientReply::Outcome {
+            outcome: Http2ClientOutcome::Replied(response),
+            ..
+        }) => {
+            assert_eq!(response.status.as_u16(), 200);
+            assert_eq!(
+                response.body, expected,
+                "/echo must echo the concatenated streamed chunks byte-for-byte"
+            );
+        }
+        other => panic!("expected Replied, got {other:?}"),
+    }
+
+    let report = runtime
+        .call_blocking(client, Http2ClientMsg::Report, Duration::from_secs(2))
+        .expect("report returns");
+    match report {
+        CallOutcome::Replied(Http2ClientReply::Report(report)) => {
+            assert_eq!(report.opened_streams, 1, "one streaming stream admitted");
+            assert_eq!(report.closed_streams, 1, "stream closed cleanly");
+            assert_eq!(report.protocol_errors, 0, "no protocol errors");
+        }
+        other => panic!("expected Report, got {other:?}"),
+    }
+
+    let _ = runtime.try_send(listener, Http2ListenerMsg::Stop);
+    let _ = runtime.try_send(client, Http2ClientMsg::Stop);
+    let _ = runtime.shutdown();
+}
+
+#[test]
+fn h2c_streaming_request_with_empty_source_sends_empty_body() {
+    // A streaming source that yields no chunks (immediate `Eof`) must
+    // still close the request half: HEADERS without END_STREAM, then a
+    // lone empty DATA(END_STREAM). `/echo` sees a buffered empty body and
+    // returns 200 with an empty body — proving the empty-body END_STREAM
+    // path fires rather than hanging the stream open.
+    let (runtime, listener, addr) = start_server();
+    let target = Http2Target::H2c {
+        authority: "test".into(),
+        addr,
+    };
+    let client = make_client(&runtime, target, Http2ClientLimits::default());
+
+    let source = IterBodySource::<TestShard>::register(&runtime, std::iter::empty(), 16)
+        .expect("register empty body source");
+    let req = Http2ClientStreamingRequest {
+        method: Method::POST,
+        path: "/echo".into(),
+        headers: http::HeaderMap::new(),
+        source,
+    };
+    let outcome = runtime
+        .call_blocking(
+            client,
+            Http2ClientMsg::SubmitStreaming(req),
+            Duration::from_secs(5),
+        )
+        .expect("call returns outcome");
+    match outcome {
+        CallOutcome::Replied(Http2ClientReply::Outcome {
+            outcome: Http2ClientOutcome::Replied(response),
+            ..
+        }) => {
+            assert_eq!(response.status.as_u16(), 200);
+            assert!(response.body.is_empty(), "empty source yields empty body");
+        }
+        other => panic!("expected Replied, got {other:?}"),
+    }
+
+    let _ = runtime.try_send(listener, Http2ListenerMsg::Stop);
+    let _ = runtime.try_send(client, Http2ClientMsg::Stop);
+    let _ = runtime.shutdown();
+}
+
+/// A streaming request body source that records how many
+/// `ResponseChunkMsg::Cancel`s it received before stopping. Proves the
+/// connection releases the source instead of orphaning it.
+struct RecordingSource {
+    chunks: std::vec::IntoIter<Vec<u8>>,
+    cancels: Arc<AtomicUsize>,
+}
+
+impl Isolate for RecordingSource {
+    tina::isolate_types! {
+        message: ResponseChunkMsg,
+        reply: ResponseChunkReply,
+        send: tina::Outbound<Infallible>,
+        spawn: Infallible,
+        call: tina_runtime::RuntimeCall<ResponseChunkMsg>,
+        shard: TestShard,
+    }
+
+    fn handle(
+        &mut self,
+        msg: ResponseChunkMsg,
+        _ctx: &mut Context<'_, TestShard, Self::Reply>,
+    ) -> Effect<Self> {
+        match msg {
+            ResponseChunkMsg::Cancel => {
+                self.cancels.fetch_add(1, Ordering::SeqCst);
+                stop()
+            }
+            _ => reply(self.next_chunk()),
+        }
+    }
+
+    fn handle_call(&mut self, msg: ResponseChunkMsg, call: CallContext<'_, Self>) -> Effect<Self> {
+        match msg {
+            ResponseChunkMsg::Cancel => {
+                self.cancels.fetch_add(1, Ordering::SeqCst);
+                stop()
+            }
+            _ => call.reply(self.next_chunk()),
+        }
+    }
+}
+
+impl RecordingSource {
+    fn next_chunk(&mut self) -> ResponseChunkReply {
+        match self.chunks.next() {
+            Some(bytes) if !bytes.is_empty() => ResponseChunkReply::Chunk(bytes),
+            _ => ResponseChunkReply::Eof,
+        }
+    }
+}
+
+#[test]
+fn h2c_streaming_request_source_is_cancelled_on_completion() {
+    // No-leak proof: a chunk source only releases its resources on
+    // `ResponseChunkMsg::Cancel` (a clean `Eof` reply leaves it alive),
+    // so the connection must `Cancel` the source when it is done pulling.
+    // After a complete streamed round-trip the source records exactly one
+    // Cancel — not zero (orphaned) and not many (cancel storm).
+    let (runtime, listener, addr) = start_server();
+    let target = Http2Target::H2c {
+        authority: "test".into(),
+        addr,
+    };
+    let client = make_client(&runtime, target, Http2ClientLimits::default());
+
+    let cancels = Arc::new(AtomicUsize::new(0));
+    let source = runtime
+        .register_with_capacity::<RecordingSource, Infallible>(
+            RecordingSource {
+                chunks: vec![b"alpha".to_vec(), b"beta".to_vec()].into_iter(),
+                cancels: cancels.clone(),
+            },
+            16,
+        )
+        .expect("register recording source");
+
+    let req = Http2ClientStreamingRequest {
+        method: Method::POST,
+        path: "/echo".into(),
+        headers: HeaderMap::new(),
+        source,
+    };
+    let outcome = runtime
+        .call_blocking(
+            client,
+            Http2ClientMsg::SubmitStreaming(req),
+            Duration::from_secs(5),
+        )
+        .expect("call returns outcome");
+    match outcome {
+        CallOutcome::Replied(Http2ClientReply::Outcome {
+            outcome: Http2ClientOutcome::Replied(response),
+            ..
+        }) => {
+            assert_eq!(response.status.as_u16(), 200);
+            assert_eq!(response.body, b"alphabeta");
+        }
+        other => panic!("expected Replied, got {other:?}"),
+    }
+
+    // The Cancel rides out asynchronously after the response completes;
+    // poll briefly for it rather than racing.
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while cancels.load(Ordering::SeqCst) == 0 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(
+        cancels.load(Ordering::SeqCst),
+        1,
+        "source must receive exactly one Cancel when the stream completes"
+    );
 
     let _ = runtime.try_send(listener, Http2ListenerMsg::Stop);
     let _ = runtime.try_send(client, Http2ClientMsg::Stop);

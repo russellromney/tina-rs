@@ -40,13 +40,24 @@
   encrypted stream. Real ALPN: offered-but-none → `TlsAlpnMismatch`
   outcome. `pump_io` runs full-duplex on TCP and half-duplex on TLS.
   Live h2/TLS tests prove round-trip + mismatch + untrusted-cert.
+- **HTTP/2 client streaming request bodies landed.**
+  `Http2ClientStreamingRequest { method, path, headers, source }` +
+  `Http2ClientMsg::SubmitStreaming(..)`. The client sends HEADERS
+  without END_STREAM, pulls one chunk at a time from the source (a
+  mirror of the server's `IterBodySource` `ResponseChunkMsg::Next`
+  pull), ships them as DATA under the existing flow-control pacer, and
+  closes the request half with the final/empty DATA(END_STREAM). Source
+  failure RST_STREAM(CANCEL)s only that stream (`LocalCancel`). Live
+  proofs: multi-chunk streamed POST to `/echo` round-trips, empty source
+  closes with a lone empty DATA(END_STREAM).
 - **Remaining work in this phase** (still future slices, named in
   *Includes* and *Proof Shape* below):
-  - HTTP/2 client streaming request and response bodies (today's
-    client buffers both under explicit caps). Design: a request
-    chunk-source pull (mirror of the server's `IterBodySource`) and
-    incremental response chunk delivery to a caller sink with
-    backpressure. Blocker for streaming gRPC.
+  - HTTP/2 client streaming *response* bodies (today's client buffers
+    the response under an explicit cap). Design: incremental response
+    chunk delivery so the caller pulls response DATA from the client
+    connection (mirror of the request-source pull, roles inverted), with
+    WINDOW_UPDATE credited as the caller consumes — backpressure.
+    Remaining blocker for streaming gRPC.
   - Streaming gRPC client (`server_streaming` / `client_streaming` /
     `bidi`), gated on the streaming bodies above.
   - DST replay for live client socket work (typed unsupported fact

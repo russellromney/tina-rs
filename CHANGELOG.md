@@ -4,6 +4,40 @@ This file records completed work.
 
 ## Unreleased
 
+### HTTP/2 Client Streaming Request Bodies
+
+The HTTP/2 client can now stream a request body from a chunk source
+instead of buffering the whole `Vec<u8>` up front. This is the request
+half of streaming bodies and the first half of the blocker for streaming
+gRPC.
+
+- **`Http2ClientStreamingRequest`** carries `method`, `path`, `headers`,
+  and a `source: Address<ResponseChunkMsg, ResponseChunkReply>` — the
+  same pull protocol the server uses, so [`IterBodySource`] is a request
+  source unchanged. Submit it with the call-only
+  `Http2ClientMsg::SubmitStreaming(..)`; it replies with one
+  `Http2ClientOutcome` like a buffered submit.
+- **Pull with backpressure.** The client sends HEADERS without
+  END_STREAM, then pulls one chunk at a time (`ResponseChunkMsg::Next`)
+  — never more than one pull in flight per stream, and only when the
+  stream's outbound buffer has drained. Body bytes ride out as DATA under
+  the existing stream + connection flow-control pacer, so a streamed
+  upload backpressures against a slow peer the same way a buffered one
+  does. The source ends the body with `Eof` (or `GrpcStatus`, treated as
+  end-of-body for a request); the final/empty DATA carries END_STREAM.
+  An empty DATA(END_STREAM) carries no payload, so a completed stream
+  closes its request half even when the connection send window is
+  exhausted.
+- **Failure is local.** If the source call fails (`Full`/`Closed`/
+  `Timeout`/`Rejected`), the client RST_STREAM(CANCEL)s that stream and
+  reports `LocalCancel` — it does not poison other streams. Pre-connect
+  streaming submits queue like buffered ones and drain with the typed
+  connect-failure outcome.
+- **Live proofs** (`http2_client_live.rs`): a multi-chunk streamed POST
+  to `/echo` round-trips byte-for-byte (server reassembles the DATA
+  frames), and an empty source still closes the request half with a lone
+  empty DATA(END_STREAM).
+
 ### Native HTTP/2 Client over TLS (h2/TLS)
 
 Wires the HTTP/2 client to the TLS rail, turning the `TlsAlpnMismatch`
