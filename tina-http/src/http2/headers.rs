@@ -130,6 +130,9 @@ pub(super) fn add_header(
     ) {
         return Err(Http2ProtocolError::InvalidPseudoHeaders);
     }
+    if name == "te" && !value.trim().eq_ignore_ascii_case("trailers") {
+        return Err(Http2ProtocolError::InvalidPseudoHeaders);
+    }
     out.saw_regular = true;
     let header_name = HeaderName::from_bytes(name.as_bytes())
         .map_err(|_| Http2ProtocolError::InvalidPseudoHeaders)?;

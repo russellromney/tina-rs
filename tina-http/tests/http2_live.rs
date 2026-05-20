@@ -591,6 +591,45 @@ fn http2_forbidden_connection_header_rejects() {
 }
 
 #[test]
+fn http2_te_header_must_be_trailers() {
+    let harness = Http2Harness::start(Http2ServerConfig::default());
+    let mut stream = connect_h2(harness.addr);
+    let mut block = request_headers("GET", "/counter");
+    literal("te", "gzip", &mut block);
+
+    write_frame(
+        &mut stream,
+        FRAME_HEADERS,
+        FLAG_END_HEADERS | FLAG_END_STREAM,
+        1,
+        &block,
+    );
+
+    let frame = read_until_goaway(&mut stream);
+    assert_eq!(goaway_error_code(&frame), ERR_PROTOCOL_ERROR);
+    harness.shutdown();
+}
+
+#[test]
+fn http2_te_trailers_header_is_allowed() {
+    let harness = Http2Harness::start(Http2ServerConfig::default());
+    let mut stream = connect_h2(harness.addr);
+    let mut block = request_headers("GET", "/counter");
+    literal("te", "trailers", &mut block);
+
+    write_frame(
+        &mut stream,
+        FRAME_HEADERS,
+        FLAG_END_HEADERS | FLAG_END_STREAM,
+        1,
+        &block,
+    );
+
+    assert_eq!(read_response_body(&mut stream, 1), b"0");
+    harness.shutdown();
+}
+
+#[test]
 fn http2_uppercase_header_rejects() {
     let harness = Http2Harness::start(Http2ServerConfig::default());
     let mut stream = connect_h2(harness.addr);
