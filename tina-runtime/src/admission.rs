@@ -569,6 +569,7 @@ impl ConcurrencyLimit {
                 }
             }
             PressureAction::Close => {
+                self.closed = true;
                 self.closed_count = self.closed_count.saturating_add(1);
                 AdmissionDecision::Closed(self.report())
             }
@@ -920,6 +921,7 @@ impl<K: Eq + Clone> KeyedLimit<K> {
                 }
             }
             PressureAction::Close => {
+                self.closed = true;
                 self.closed_count = self.closed_count.saturating_add(1);
                 AdmissionDecision::Closed(self.report())
             }
@@ -1344,6 +1346,7 @@ impl<K: Eq + Clone> RateLimit<K> {
                 }
             }
             PressureAction::Close => {
+                self.closed = true;
                 self.closed_count = self.closed_count.saturating_add(1);
                 AdmissionDecision::Closed(self.report())
             }
@@ -1575,12 +1578,21 @@ mod tests {
 
         let mut close =
             ConcurrencyLimit::with_capacity("conc.close", 1).on_pressure(PressureAction::Close);
-        let _p = close.try_admit().into_admitted().unwrap();
+        let p = close.try_admit().into_admitted().unwrap();
         match close.try_admit() {
             AdmissionDecision::Closed(r) => {
                 assert_eq!(r.closed_count, 1);
             }
             other => panic!("Close expected, got {other:?}"),
+        }
+        assert!(close.is_closed(), "Close action must stick");
+        close.release(p).expect("release after close");
+        match close.try_admit() {
+            AdmissionDecision::Closed(r) => {
+                assert_eq!(r.current, 0);
+                assert_eq!(r.closed_count, 2);
+            }
+            other => panic!("closed policy must stay closed, got {other:?}"),
         }
 
         let mut wait = ConcurrencyLimit::with_capacity("conc.wait", 1)
@@ -2099,6 +2111,27 @@ mod tests {
             }
             other => panic!("expected Wait, got {other:?}"),
         }
+
+        // Close on pressure is sticky, not a one-request label.
+        let mut closing =
+            KeyedLimit::<&'static str>::new("keyed.close", 2, 1).on_pressure(PressureAction::Close);
+        let p = closing.try_admit(&"k").into_admitted().unwrap();
+        match closing.try_admit(&"k") {
+            AdmissionDecision::Closed(report) => assert_eq!(report.closed_count, 1),
+            other => panic!("expected Closed, got {other:?}"),
+        }
+        assert!(
+            closing.is_closed(),
+            "Close action must stop future admission"
+        );
+        closing.release(p).expect("release after close");
+        match closing.try_admit(&"other") {
+            AdmissionDecision::Closed(report) => {
+                assert_eq!(report.current, 0);
+                assert_eq!(report.closed_count, 2);
+            }
+            other => panic!("closed keyed policy must stay closed, got {other:?}"),
+        }
     }
 
     #[test]
@@ -2118,6 +2151,22 @@ mod tests {
         match limit.try_admit(&2, now) {
             AdmissionDecision::Degrade { report } => assert_eq!(report.degrade_count, 1),
             other => panic!("expected Degrade for table-full, got {other:?}"),
+        }
+
+        let mut closing = RateLimit::<u32>::new("rate.close_table", 1, 5, 1)
+            .on_table_pressure(PressureAction::Close);
+        let _ = closing.try_admit(&1, now).into_admitted().unwrap();
+        match closing.try_admit(&2, now) {
+            AdmissionDecision::Closed(report) => assert_eq!(report.closed_count, 1),
+            other => panic!("expected Closed for table-full, got {other:?}"),
+        }
+        assert!(
+            closing.is_closed(),
+            "Close action must stop future admission"
+        );
+        match closing.try_admit(&1, now + Duration::from_secs(1)) {
+            AdmissionDecision::Closed(report) => assert_eq!(report.closed_count, 2),
+            other => panic!("closed rate policy must stay closed, got {other:?}"),
         }
     }
 
