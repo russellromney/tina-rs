@@ -11,8 +11,9 @@
 //! - SETTINGS / PING / HEADERS / DATA / WINDOW_UPDATE / RST_STREAM /
 //!   GOAWAY frame handling, sharing the helpers in `super::frame` /
 //!   `super::headers` / `super::errors` with the server
-//! - typed `Http2ClientOutcome` covers replied, full, closed, timeout,
-//!   reset, protocol error, local cancel, and `TlsAlpnMismatch`
+//! - typed `Http2ClientOutcome` covers replied, full, closed, reset,
+//!   protocol error, local cancel, and `TlsAlpnMismatch` (timeout and
+//!   flow-control-blocked land with a future stream-level deadline)
 //!
 //! `Http2Target::Tls { .. }` is recognized but resolves to
 //! [`Http2ClientOutcome::TlsAlpnMismatch`] until the typed ALPN rail
@@ -785,7 +786,12 @@ impl<S: Shard + 'static> Http2ClientConnection<S> {
         let mut idx = 0;
         while idx < self.streams.len() {
             if self.streams[idx].id > last_stream_id {
-                self.fail_stream(idx, refused_outcome.clone(), Http2CloseReason::GoAway, effects);
+                self.fail_stream(
+                    idx,
+                    refused_outcome.clone(),
+                    Http2CloseReason::GoAway,
+                    effects,
+                );
                 // fail_stream swap_removes, so do not advance idx.
             } else {
                 idx += 1;

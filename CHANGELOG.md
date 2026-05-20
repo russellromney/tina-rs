@@ -4,6 +4,53 @@ This file records completed work.
 
 ## Unreleased
 
+### Native HTTP/2 Client — Plan Audit Follow-ups
+
+A re-read of the Phase 116 plan against the shipped code surfaced three
+proof items that were required but unproven, plus two intentional
+design divergences worth recording.
+
+- **Protocol-fact emission is now proven** (the plan's "protocol facts
+  emitted for stream lifecycle" item). The client emitted
+  `Http2StreamOpened` / `Http2StreamClosed` / `Http2StreamReset` facts,
+  but no test asserted it. New live tests capture facts from the
+  runtime trace (`complete_trace` →
+  `RuntimeEventKind::FactObserved`):
+  - `client_emits_outbound_open_and_close_lifecycle_facts` — a
+    happy-path GET emits an outbound `Http2StreamOpened` and a matching
+    `Http2StreamClosed`.
+  - `client_emits_inbound_reset_fact_on_peer_rst` — a peer RST_STREAM
+    emits an inbound `Http2StreamReset(RefusedStream)`.
+- **GOAWAY "lets admitted streams settle" half is now proven.** The
+  earlier test only covered the refusal half (`last_stream_id = 0`). New
+  `goaway_above_stream_id_lets_admitted_stream_settle_then_blocks_new_admission`:
+  a GOAWAY whose `last_stream_id` covers the in-flight stream lets that
+  stream complete normally, while a *subsequent* submit is refused
+  `Closed` — proving both the settle path and the post-GOAWAY admission
+  gate.
+
+Two intentional divergences from the plan's literal sketch, recorded so
+they are decisions and not oversights:
+
+- **No `Admitted` outcome variant.** The plan's outcome list included
+  `Admitted` alongside `Full` / `Closed` / etc., implying a two-phase
+  admit-then-await API. This slice uses a single-reply model instead:
+  one `Submit` call yields exactly one terminal `Http2ClientOutcome`
+  when the stream finishes. This is Tina-idiomatic (one reply per call)
+  and still supports concurrency — a calling isolate issues `Submit` as
+  a non-blocking call effect and gets the outcome later, so many
+  requests can be in flight at once (proven by
+  `concurrent_streams_do_not_cross_replies`). The two-phase
+  `Admitted { stream_id }` shape is not needed for that and is not
+  implemented.
+- **Response/request bodies are buffered, not chunk-delivered.** The
+  plan's "response DATA arrives in bounded chunks" / "request DATA
+  streaming is bounded" proof items are met on the *bounded* axis
+  (response cap + inbound window credit; outbound flow-control pacing)
+  but the caller still sees one buffered `Vec<u8>` per body, not a
+  chunk stream. Streaming chunk-source bodies (mirroring the server's
+  `IterBodySource`) are deferred with the rest of the streaming work.
+
 ### Native HTTP/2 Client — Testing Gaps Closed
 
 Closes the testing gaps a third pass identified — claims that were

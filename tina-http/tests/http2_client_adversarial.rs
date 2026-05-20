@@ -1,16 +1,22 @@
-//! Adversarial live proofs for the native HTTP/2 client.
+//! Adversarial / concurrency / interop live proofs for the native
+//! HTTP/2 client. These tests stand up a *hand-rolled* HTTP/2 server
+//! peer on a raw `TcpStream` (independent of the client's framing code)
+//! and dial it from the real `Http2ClientConnection`. They pin the
+//! paths a well-behaved in-tree Tina server never exercises:
 //!
-//! These tests stand up a *hand-rolled, deliberately misbehaving*
-//! HTTP/2 server peer on a raw `TcpStream` and dial it from the real
-//! `Http2ClientConnection`. They pin the spec-compliance paths a
-//! well-behaved Tina server never exercises:
-//!
-//! - server `RST_STREAM` mid-stream → client `Reset(reason)`
+//! - server `RST_STREAM` mid-stream → client `Reset(reason)` + an
+//!   inbound `Http2StreamReset` protocol fact
 //! - server `RST_STREAM` on stream 0 → connection-level protocol error
-//!   (client GOAWAYs and fails the in-flight stream, connection dies
-//!   cleanly rather than silently ignoring the illegal frame)
-//! - server `GOAWAY(last_stream_id = 0)` → client refuses the
-//!   unprocessed stream with `Closed` and the caller can retry
+//! - `GOAWAY(last_stream_id = 0)` → refuse the unprocessed stream
+//!   (`Closed`, retryable); `GOAWAY(last_stream_id >= in-flight)` →
+//!   let the admitted stream settle but block new admission
+//! - malformed inbound frame → typed error, never a panic
+//! - foreign-server happy path → `Replied` (interop, independent framing)
+//! - concurrent streams do not cross replies
+//! - peer `MAX_CONCURRENT_STREAMS` cap → excess submit is `Full`
+//! - caller `Cancel` → `LocalCancel`, connection survives
+//! - 128 KB upload paces through real `WINDOW_UPDATE` round trips
+//! - outbound open/close lifecycle protocol facts are emitted
 //!
 //! The peer runs on its own thread. The client runs in a Tina runtime.
 
@@ -29,9 +35,27 @@ use tina_http::{
     Http2ClientRequest, Http2ProtocolError, Http2Target,
 };
 use tina_runtime::{
-    CallOutcome, DefaultThreadedMailboxFactory, Http2ResetReason, ThreadedRuntime,
-    ThreadedRuntimeConfig,
+    CallOutcome, DefaultThreadedMailboxFactory, Http2ResetReason, ProtocolDirection, ProtocolFact,
+    RuntimeEventKind, RuntimeFact, ThreadedRuntime, ThreadedRuntimeConfig,
 };
+
+/// Drain the runtime trace and return the protocol facts the client
+/// emitted. Mirrors the websocket live-test helper.
+fn protocol_facts(
+    runtime: &ThreadedRuntime<TestShard, DefaultThreadedMailboxFactory>,
+) -> Vec<ProtocolFact> {
+    runtime
+        .complete_trace()
+        .expect("complete trace")
+        .into_iter()
+        .filter_map(|event| match event.kind() {
+            RuntimeEventKind::FactObserved {
+                fact: RuntimeFact::Protocol(protocol),
+            } => Some(protocol),
+            _ => None,
+        })
+        .collect()
+}
 
 const CLIENT_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 const FRAME_HEADERS: u8 = 0x1;
@@ -708,6 +732,158 @@ fn caller_cancel_returns_local_cancel_and_keeps_connection_alive() {
             ..
         }) => assert_eq!(response.body, b"after-cancel"),
         other => panic!("expected Replied after cancel, got {other:?}"),
+    }
+
+    let _ = runtime.try_send(client, Http2ClientMsg::Stop);
+    let _ = runtime.shutdown();
+    peer.join().expect("peer thread joins");
+}
+
+#[test]
+fn client_emits_outbound_open_and_close_lifecycle_facts() {
+    // The plan requires the client to emit stream-lifecycle protocol
+    // facts (not just private counters). A happy-path GET against the
+    // foreign peer must produce an `Http2StreamOpened { direction:
+    // Outbound }` and a matching `Http2StreamClosed` fact, captured from
+    // the runtime trace.
+    let (addr, peer) = spawn_peer(|sock, stream_id| {
+        send_response(sock, stream_id, "200", b"ok");
+    });
+    let (runtime, client) = run_client(addr);
+
+    let outcome = runtime
+        .call_blocking(
+            client,
+            Http2ClientMsg::Submit(Http2ClientRequest::get("/x")),
+            Duration::from_secs(5),
+        )
+        .expect("call returns outcome");
+    assert!(matches!(
+        outcome,
+        CallOutcome::Replied(Http2ClientReply::Outcome {
+            outcome: Http2ClientOutcome::Replied(_),
+            ..
+        })
+    ));
+
+    let facts = protocol_facts(&runtime);
+    assert!(
+        facts.iter().any(|f| matches!(
+            f,
+            ProtocolFact::Http2StreamOpened {
+                direction: ProtocolDirection::Outbound,
+                ..
+            }
+        )),
+        "expected an outbound Http2StreamOpened fact, got {facts:?}",
+    );
+    assert!(
+        facts
+            .iter()
+            .any(|f| matches!(f, ProtocolFact::Http2StreamClosed { .. })),
+        "expected an Http2StreamClosed fact, got {facts:?}",
+    );
+
+    let _ = runtime.try_send(client, Http2ClientMsg::Stop);
+    let _ = runtime.shutdown();
+    peer.join().expect("peer thread joins");
+}
+
+#[test]
+fn client_emits_inbound_reset_fact_on_peer_rst() {
+    // A peer RST_STREAM must surface as an inbound-direction
+    // `Http2StreamReset` protocol fact (in addition to the typed
+    // caller outcome), so replay/observability sees the reset cause.
+    let (addr, peer) = spawn_peer(|sock, stream_id| {
+        write_frame(
+            sock,
+            FRAME_RST_STREAM,
+            0,
+            stream_id,
+            &ERR_REFUSED_STREAM.to_be_bytes(),
+        );
+    });
+    let (runtime, client) = run_client(addr);
+
+    let _ = runtime
+        .call_blocking(
+            client,
+            Http2ClientMsg::Submit(Http2ClientRequest::get("/x")),
+            Duration::from_secs(5),
+        )
+        .expect("call returns outcome");
+
+    let facts = protocol_facts(&runtime);
+    assert!(
+        facts.iter().any(|f| matches!(
+            f,
+            ProtocolFact::Http2StreamReset {
+                direction: ProtocolDirection::Inbound,
+                reason: Http2ResetReason::RefusedStream,
+                ..
+            }
+        )),
+        "expected an inbound Http2StreamReset(RefusedStream) fact, got {facts:?}",
+    );
+
+    let _ = runtime.try_send(client, Http2ClientMsg::Stop);
+    let _ = runtime.shutdown();
+    peer.join().expect("peer thread joins");
+}
+
+#[test]
+fn goaway_above_stream_id_lets_admitted_stream_settle_then_blocks_new_admission() {
+    // The other half of the GOAWAY contract: a GOAWAY whose
+    // `last_stream_id` covers the in-flight stream (>= its id) must let
+    // that stream settle normally, while a *subsequent* submit is
+    // refused (`Closed`) because admission is closed after GOAWAY.
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind peer");
+    let addr = listener.local_addr().expect("peer addr");
+    let peer = std::thread::spawn(move || {
+        let (mut sock, _) = listener.accept().expect("accept");
+        complete_handshake_with(&mut sock, &[]);
+        let first = next_headers(&mut sock);
+        // GOAWAY(last_stream_id = first, NO_ERROR): "I am going away, but
+        // I did process stream `first`." Then actually answer it.
+        let mut payload = Vec::with_capacity(8);
+        payload.extend_from_slice(&(first & 0x7fff_ffff).to_be_bytes());
+        payload.extend_from_slice(&ERR_NO_ERROR.to_be_bytes());
+        write_frame(&mut sock, FRAME_GOAWAY, 0, 0, &payload);
+        send_response(&mut sock, first, "200", b"settled");
+        std::thread::sleep(Duration::from_millis(80));
+    });
+    let (runtime, client) = run_client(addr);
+
+    // First request: admitted before/at GOAWAY's last_stream_id, settles.
+    let first = runtime
+        .call_blocking(
+            client,
+            Http2ClientMsg::Submit(Http2ClientRequest::get("/first")),
+            Duration::from_secs(5),
+        )
+        .expect("first call returns");
+    match first {
+        CallOutcome::Replied(Http2ClientReply::Outcome {
+            outcome: Http2ClientOutcome::Replied(response),
+            ..
+        }) => assert_eq!(response.body, b"settled"),
+        other => panic!("expected admitted stream to settle Replied, got {other:?}"),
+    }
+
+    // Second request after GOAWAY: admission is closed.
+    let second = runtime
+        .call_blocking(
+            client,
+            Http2ClientMsg::Submit(Http2ClientRequest::get("/second")),
+            Duration::from_secs(5),
+        )
+        .expect("second call returns");
+    match second {
+        CallOutcome::Replied(Http2ClientReply::Outcome {
+            outcome: Http2ClientOutcome::Closed,
+            ..
+        }) => {}
+        other => panic!("expected new admission after GOAWAY to be Closed, got {other:?}"),
     }
 
     let _ = runtime.try_send(client, Http2ClientMsg::Stop);
