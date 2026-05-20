@@ -20,7 +20,7 @@ use tina_runtime::{
     path_metadata, process_run, read_dir, remove_file, rename_replace, signal_wait, sleep,
     snapshot_load, sync_parent, tcp_accept, tcp_bind, tcp_close_listener, tcp_close_stream,
     tcp_read, tcp_write, tls_accept, tls_bind, tls_close, tls_close_listener, tls_connect,
-    tls_read, tls_write, udp_bind, udp_close_socket, udp_recv_from, udp_send_to,
+    tls_read, tls_write, udp_bind, udp_close_socket, udp_recv_from, udp_send_to, unix_bind,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -2502,6 +2502,84 @@ fn local_system_tls_lane_full_is_visible_with_configured_capacity() {
             RuntimeEventKind::CallFailed {
                 call_kind: CallKind::TlsBind,
                 reason: CallError::TlsFull,
+                ..
+            }
+        )
+    }));
+}
+
+#[derive(Debug)]
+enum UnixProbeMsg {
+    Start,
+    Bound(Result<(tina_runtime::UnixListenerId, PathBuf), CallError>),
+}
+
+#[derive(Debug)]
+struct UnixProbeService {
+    observed: Arc<Mutex<Option<Result<(), CallError>>>>,
+}
+
+#[tina_runtime::isolate(message = UnixProbeMsg, shard = AppShard)]
+impl UnixProbeService {
+    fn handle(
+        &mut self,
+        msg: UnixProbeMsg,
+        _ctx: &mut Context<'_, AppShard, Self::Reply>,
+    ) -> Effect<Self> {
+        match msg {
+            UnixProbeMsg::Start => {
+                unix_bind("/tmp/tina-unix-unsupported-pin.sock").then(UnixProbeMsg::Bound)
+            }
+            UnixProbeMsg::Bound(result) => {
+                *self.observed.lock().expect("observed lock") =
+                    Some(result.map(|(_listener, _path)| ()));
+                noop()
+            }
+        }
+    }
+}
+
+// Phase 117 honest deferral: the live driver returns typed
+// `CallError::Unsupported` for Unix-domain rails on every platform in
+// this slice. This pins that typed answer so a regression that silently
+// changes the live deferral (or cfg-gates it away) fails closed.
+#[test]
+fn local_system_unix_rails_report_typed_unsupported_on_live_driver() {
+    let observed = Arc::new(Mutex::new(None));
+    let app = LocalSystem::single_shard(AppShard(43), AppMailboxFactory)
+        .trace_retention(TraceRetention::Bounded(64))
+        .build();
+    let address = app
+        .register_root::<UnixProbeService, Infallible>(
+            UnixProbeService {
+                observed: Arc::clone(&observed),
+            },
+            8,
+        )
+        .expect("register unix probe");
+
+    app.try_send(address, UnixProbeMsg::Start)
+        .expect("start unix probe");
+    wait_until(|| observed.lock().expect("observed lock").is_some());
+
+    let result = *observed.lock().expect("observed lock");
+    assert_eq!(
+        result,
+        Some(Err(CallError::Unsupported)),
+        "live unix_bind must report typed Unsupported in this slice"
+    );
+
+    let terminal = app
+        .shutdown()
+        .drain()
+        .join()
+        .expect("local system shutdown");
+    assert!(terminal.trace().iter().any(|event| {
+        matches!(
+            event.kind(),
+            RuntimeEventKind::CallFailed {
+                call_kind: CallKind::UnixBind,
+                reason: CallError::Unsupported,
                 ..
             }
         )

@@ -17,6 +17,11 @@ use tina_runtime::RuntimeEvent;
 use crate::MultiShardSimulatorConfig;
 
 /// Deterministic simulator configuration for one run.
+///
+/// Construct with functional-update syntax over [`Default`]
+/// (`SimulatorConfig { seed, ..Default::default() }`) so that adding a
+/// new rail config field stays a non-breaking change for callers. New
+/// fields here must carry a `Default`.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct SimulatorConfig {
     /// Replay seed that drives the simulator's narrow seeded perturbation
@@ -46,6 +51,35 @@ pub struct SimulatorConfig {
 
     /// Scripted simulator-only storage faults for persistence recovery tests.
     pub storage: ScriptedStorageFaultConfig,
+
+    /// Default per-stream caps for Unix-domain rails in the simulator.
+    pub unix: UnixSimConfig,
+}
+
+/// Per-stream caps applied to simulator Unix-domain rails.
+///
+/// The simulator pairs Unix streams dynamically (no scripted-peer
+/// configuration): `unix_bind(path)` opens a listener and the next
+/// `unix_connect(path)` builds a paired stream. These caps tell the
+/// simulator how much inbound data a stream may buffer and how many
+/// bytes one write call may accept.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct UnixSimConfig {
+    /// Inbound buffer cap per stream (bytes).
+    pub default_inbound_capacity: usize,
+    /// Maximum bytes accepted by a single `unix_write` call. Models
+    /// kernel-side short-writes so user state machines see partial
+    /// progress identical to live behavior.
+    pub default_write_cap: usize,
+}
+
+impl Default for UnixSimConfig {
+    fn default() -> Self {
+        Self {
+            default_inbound_capacity: 64 * 1024,
+            default_write_cap: 64 * 1024,
+        }
+    }
 }
 
 /// Deterministic durable file image captured by simulator replay.

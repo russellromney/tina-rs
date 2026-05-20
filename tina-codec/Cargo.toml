@@ -1,0 +1,11 @@
+[package]
+name = "tina-codec"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Sync byte-codec helpers (line and length framing) for Tina isolates"
+repository = "https://github.com/russellromney/tina-rs"
+
+[lib]
+path = "src/lib.rs"

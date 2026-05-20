@@ -2,11 +2,22 @@
 
 ## Status
 
-- Future implementation plan for Wave A.
-- Runs after Phase 115 lands so crate/module homes follow the core/battery
-  boundary.
-- Can run in parallel with phases 116 and 118 if ownership stays mostly in
-  runtime rails, codec helpers, and local IPC specimens.
+- First slice landed.
+- Shipped: `tina_runtime::file_loops` helpers (`FileReadChunks`,
+  `FileWriteAll`, `FileCopyBounded`), `tina-codec` battery crate
+  (`LineFramer`, `LengthDelimitedFramer`,
+  `FrameDecision::{NeedMore,Frame,Malformed,Full}`), Unix-domain rails on
+  the public surface (`unix_bind`/`unix_accept`/`unix_connect`/
+  `unix_read`/`unix_write`/`unix_close_listener`/`unix_close_stream`),
+  full simulator support for Unix sockets, and
+  `examples/specimen_local_io_codec_ipc` (file ingest, admin sidecar,
+  framed mini-keyspace).
+- Honest deferral: live OS-backed Unix-domain support is **not** in this
+  slice. The live driver returns typed `CallError::Unsupported` on every
+  platform for Unix rails. The simulator implements the full
+  byte-stream pair semantics. Future work: implement the live Unix
+  worker lane (likely along the existing `process_run` / `storage`
+  worker-thread pattern).
 
 ## Layering
 

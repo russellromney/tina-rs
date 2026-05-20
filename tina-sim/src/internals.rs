@@ -159,6 +159,10 @@ pub(crate) enum TcpResourceKey {
     FileSize(tina_runtime::FileId),
     Mkdir(CallId),
     PathOp(CallId),
+    UnixConnect(CallId),
+    UnixListenerAccept(tina_runtime::UnixListenerId),
+    UnixStreamRead(tina_runtime::UnixStreamId),
+    UnixStreamWrite(tina_runtime::UnixStreamId),
 }
 
 impl TcpResourceKey {
@@ -283,6 +287,61 @@ pub(crate) struct PendingUdpRecv {
     pub(crate) socket: UdpSocketId,
     pub(crate) max_len: usize,
     pub(crate) insertion_order: u64,
+}
+
+#[derive(Debug)]
+pub(crate) struct UnixListenerState {
+    pub(crate) id: tina_runtime::UnixListenerId,
+    pub(crate) path: PathBuf,
+    pub(crate) closed: bool,
+}
+
+#[derive(Debug)]
+pub(crate) struct UnixStreamState {
+    pub(crate) id: tina_runtime::UnixStreamId,
+    /// Index into the peer's `UnixStreamState`. `None` once the peer
+    /// has been closed and drained.
+    pub(crate) peer: Option<tina_runtime::UnixStreamId>,
+    /// Bytes the peer wrote into us, awaiting our reads.
+    pub(crate) inbound: std::collections::VecDeque<u8>,
+    /// Caller-configured cap on this side's inbound buffer. Defaults
+    /// from `SimulatorConfig::unix.default_inbound_capacity`.
+    pub(crate) inbound_capacity: usize,
+    /// Caller-configured max bytes accepted per write call (kernel-like
+    /// partial-write modeling). Defaults from
+    /// `SimulatorConfig::unix.default_write_cap`.
+    pub(crate) write_cap: usize,
+    pub(crate) closed: bool,
+    /// Whether our peer has been closed. Reads return EOF once
+    /// `inbound` is empty.
+    pub(crate) peer_closed: bool,
+}
+
+/// Park record for an unmatched `unix_accept`. Resolution happens in
+/// FIFO order (Vec push/remove) — Unix's matching is symmetric, so
+/// there is no scripted-arrival schedule to sort against.
+#[derive(Debug)]
+pub(crate) struct PendingUnixAccept {
+    pub(crate) call_id: CallId,
+    pub(crate) listener: tina_runtime::UnixListenerId,
+}
+
+/// Park record for an unmatched `unix_connect`. The simulator parks
+/// connects whose listener is bound but has no pending accept yet,
+/// and resolves them in FIFO order against arriving accepts.
+#[derive(Debug)]
+pub(crate) struct PendingUnixConnect {
+    pub(crate) call_id: CallId,
+    pub(crate) listener: tina_runtime::UnixListenerId,
+}
+
+/// Park record for a `unix_read` that arrived before its peer wrote
+/// any bytes.
+#[derive(Debug)]
+pub(crate) struct PendingUnixRead {
+    pub(crate) call_id: CallId,
+    pub(crate) stream: tina_runtime::UnixStreamId,
+    pub(crate) max_len: usize,
 }
 
 #[derive(Debug)]

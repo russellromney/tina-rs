@@ -4,6 +4,59 @@ This file records completed work.
 
 ## Unreleased
 
+### Phase 117 Local I/O, Codec, And IPC Parity
+
+First slice of the Wave A local I/O / codec / IPC parity work
+(`.intent/phases/117-local-io-codec-ipc-parity`).
+
+**Core**
+
+- `tina_runtime::file_loops` adds `FileReadChunks`, `FileWriteAll`, and
+  `FileCopyBounded` — bounded state-machine helpers over the existing
+  `file_read_at` / `file_write_at` rails. Per-step trace truth is
+  preserved (no hidden read-whole-file path), the helpers refuse a
+  zero per-call budget at construction, and terminal reports name
+  whether the loop ended by `Done`, `Eof`, `CapReached`, `Error`, or
+  `StuckWrite` along with bytes transferred and final offset.
+- Unix-domain socket rails added to `tina-runtime` and `tina-sim`:
+  `unix_bind` / `unix_accept` / `unix_connect` / `unix_read` /
+  `unix_write` / `unix_close_listener` / `unix_close_stream`. New
+  distinct `UnixListenerId` / `UnixStreamId` resource types, new
+  `CallKind` variants `UnixBind`…`UnixStreamClose` appended to the
+  stable trace-hash mapping (tags 42..=48; existing tags preserved).
+- Simulator implements the full Unix-domain byte-stream pair model:
+  `unix_bind` opens a listener, the next `unix_connect` at the same
+  path allocates a paired client/server stream and resolves any
+  parked accept. Reads block until peer writes; writes append to peer
+  inbound with a configurable cap, modelling kernel-style short
+  writes. Stream close cancels in-flight peer reads/writes and wakes
+  the peer with EOF.
+- The live driver returns typed `CallError::Unsupported` for every
+  Unix-rail variant on every platform in this slice. An honest
+  deferral, not a cfg-silent omission — non-Unix callers see the same
+  typed answer. Live OS-Unix-domain support is named as future work.
+
+**Codec battery**
+
+- New `tina-codec` crate with `LineFramer`, `LengthDelimitedFramer`,
+  and `FrameDecision::{NeedMore, Frame, Malformed, Full}`. Both
+  framers are pure sync state machines living on the caller's
+  isolate. Bounded buffers: lines and frames over the configured cap
+  are rejected before allocation (`Full`); embedded NUL bytes in the
+  line framer are typed as `Malformed` when opted in; the
+  length-delimited framer rejects oversized declared bodies before
+  any body byte enters the buffer.
+
+**Specimen**
+
+- `examples/specimen_local_io_codec_ipc` ships three flows in one
+  binary: file-ingest (bounded streaming via `FileReadChunks`),
+  admin-socket (line-framed local IPC over the simulator Unix
+  pair), and framed-keyspace (length-prefixed mini-keyspace
+  protocol). Each has a smoke command and a bad-input proof
+  (`CapReached`, oversized line, oversized declared frame). The
+  bundled tests pin live-driver `Unsupported` as the honest deferral.
+
 ### HTTP/2 And Multi-Shard Fairness Hardening (second pass)
 
 - HTTP/2 request `content-length` is now truthful for buffered,
