@@ -25,3 +25,16 @@ Run it:
 cargo test --manifest-path examples/specimen_idempotent_retry/Cargo.toml
 cargo run --manifest-path examples/specimen_idempotent_retry/Cargo.toml
 ```
+
+## Findings
+
+What felt good: composing `FullHandling::on_full(ctx.now(), …)` with a
+hand-written downstream kept retry visibly caller-owned —
+`RetryAfter | Exhausted | Shed` is the whole decision, and the idempotency
+key sits on the message where the safety claim belongs.
+
+What felt rough: the retry budget needs `ctx.now()` at every attempt, so
+`ctx` threads through `attempt(ctx)` across turns — a reminder that time is
+a carried parameter, not ambient. See the cross-specimen "Admission and
+rate policy ergonomics" entry in
+[`examples/FINDINGS.md`](../FINDINGS.md).

@@ -69,9 +69,17 @@ What felt good:
 
 What felt rough:
 
-- Routing dispatch holds a `HashMap<qid, SharedLease>` so the lease
-  outlives the timer wake-up. A future ergonomic affordance could
-  attach the lease to the deferred reply slot directly.
+- Charging **two** shared budgets per request is manual two-phase with
+  rollback: charge in-flight, then body bytes, and `drop(in_flight)` on
+  body-full or the first charge leaks. `ConcurrencyLimit::with_shared_scope`
+  takes only one scope, so the second dimension is hand-rolled. A
+  multi-scope all-or-nothing charge would remove the rollback footgun.
+- This specimen stays on raw `SharedCapacityScope` + `SharedLease` rather
+  than `ConcurrencyLimit` precisely because the charge is parked across a
+  multi-turn hold: `GuardedPendingReplies` releases its guard by *dropping*
+  it, and `SharedLease` drops clean while a `ConcurrencyPermit` would leak
+  its inner permit on drop. See the cross-specimen "Admission and rate
+  policy ergonomics" entry in [`../../FINDINGS.md`](../../FINDINGS.md).
 - `tina-runtime` does not yet ship a runtime-wide registry of
   scopes, so each isolate carries its own clone. That is fine for a
   shard but a service builder may want a `register_scope("name")`

@@ -25,3 +25,15 @@ Run it:
 ```sh
 cargo test --manifest-path examples/systems/system_tenant_rate_limiter/Cargo.toml
 ```
+
+## Findings
+
+What felt good: `try_admit(&tenant, ctx.now())` borrows the key (alloc-free
+hot path) and threads time explicitly, so the same code is deterministic
+under sim replay; `RateLimited { retry_after }` is exact, not approximate.
+
+What felt rough: a policy that only ever yields `Ok` / `RateLimited` /
+`TenantTableFull` still forces an exhaustive match over all
+`AdmissionDecision` variants (the rest are `unreachable!()`). See the
+cross-specimen "Admission and rate policy ergonomics" entry in
+[`examples/FINDINGS.md`](../../FINDINGS.md).
