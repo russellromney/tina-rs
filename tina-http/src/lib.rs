@@ -79,15 +79,39 @@
 //! buffered under explicit byte caps for ordinary unary services.
 //! gRPC requests can be exposed through an HTTP/2 pull source, and
 //! responses can stream from Tina chunk sources with DATA flow-control
-//! and real trailers. It is not an HTTPS/2 or ALPN claim, not a full
-//! client, and not a full RFC feature clone.
+//! and real trailers. It is not an HTTPS/2 or ALPN claim and not a full
+//! RFC feature clone.
 //!
-//! gRPC: [`GrpcRouter`] layers unary, server-streaming, client-streaming,
-//! and first bidirectional streaming `prost` messages with typed
-//! [`GrpcStatus`] trailers on that HTTP/2 h2c server. It rejects
-//! compression, caps message bytes before protobuf decode, maps service call
-//! timeout to `DeadlineExceeded`, and keeps interceptors, reflection,
-//! production pooled clients, and TLS ALPN out of this first form.
+//! HTTP/2 client: [`Http2ClientConnection`] is a native client isolate
+//! over one stream — cleartext h2c or h2 over TLS — with bounded
+//! stream-slot admission, typed [`Http2ClientOutcome`], outbound
+//! flow-control pacing, and outbound-direction protocol facts. A
+//! [`Http2Target::Tls`] target dials the TLS rail with `h2` ALPN; a
+//! server that declines `h2` returns
+//! [`Http2ClientOutcome::TlsAlpnMismatch`], distinct from cert/name
+//! failures. Request bodies are buffered ([`Http2ClientRequest`]) or
+//! streamed from a chunk source ([`Http2ClientStreamingRequest`], the
+//! same `IterBodySource` pull protocol the server uses). Responses are
+//! buffered ([`Http2ClientResponse`] under a cap) or, via
+//! [`Http2ClientMsg::OpenStream`], delivered incrementally: the caller
+//! pulls one [`Http2ResponseChunk`] at a time and received DATA is only
+//! `WINDOW_UPDATE`-credited as it is consumed, so a slow consumer
+//! backpressures the peer. h2/TLS is request-response (half-duplex)
+//! today; full-duplex needs a runtime TLS reactor.
+//!
+//! gRPC: [`GrpcRouter`] is the server. [`GrpcClient`] is the native
+//! client — Tina is a native gRPC client, not only a server. Both sides
+//! cover unary, server-streaming, client-streaming, and bidirectional
+//! streaming `prost` messages with typed [`GrpcStatus`] trailers. The
+//! unary client decodes into a typed [`GrpcUnaryOutcome`]; the streaming
+//! client builds a request ([`GrpcClient::server_streaming_request`] /
+//! [`GrpcClient::client_streaming_request`] / [`GrpcClient::bidi_request`])
+//! and folds pulled response chunks through a [`GrpcStreamDecoder`] into
+//! [`GrpcStreamItem`]s. On every shape a non-OK status is the caller
+//! outcome (never hidden in a success) and the received status is a
+//! `GrpcFinalStatusReceived` protocol fact. Both reject compression and
+//! cap message bytes. Interceptors, reflection, production pooled
+//! clients, and tonic interop are later slices.
 //!
 //! WebSocket: [`websocket_upgrade`] validates server-side HTTP/1.1
 //! upgrades for [`HttpListener`] and [`HttpsListener`]. After the
@@ -126,6 +150,7 @@ pub mod chunked_decoder;
 pub mod client;
 pub mod connection;
 pub mod grpc;
+pub mod grpc_client;
 pub mod http2;
 pub mod keepalive;
 pub mod listener;
@@ -152,10 +177,16 @@ pub use grpc::{
     encode_grpc_message, grpc_status_trailers, grpc_stream_finish, grpc_stream_message,
     grpc_unary_call_h2c_blocking,
 };
+pub use grpc_client::{
+    GrpcClient, GrpcStreamDecoder, GrpcStreamItem, GrpcTarget, GrpcUnaryOutcome,
+};
 pub use http2::{
-    Http2Connection, Http2ConnectionMsg, Http2ConnectionReply, Http2ConnectionReport, Http2Limits,
-    Http2Listener, Http2ListenerMsg, Http2Outcome, Http2ProtocolError, Http2ServerConfig,
-    Http2StreamReport, Http2StreamState,
+    AlpnProtocols, Http2ClientConnection, Http2ClientLimits, Http2ClientMsg, Http2ClientOutcome,
+    Http2ClientReply, Http2ClientReport, Http2ClientRequest, Http2ClientRequestBody,
+    Http2ClientResponse, Http2ClientStreamCall, Http2ClientStreamingRequest, Http2Connection,
+    Http2ConnectionMsg, Http2ConnectionReply, Http2ConnectionReport, Http2Limits, Http2Listener,
+    Http2ListenerMsg, Http2Outcome, Http2ProtocolError, Http2ResponseChunk, Http2ServerConfig,
+    Http2StreamReport, Http2StreamState, Http2Target,
 };
 pub use keepalive::{
     KeepaliveConnAddr, KeepaliveConnection, KeepaliveConnectionMsg, KeepaliveConnectionStopFailure,

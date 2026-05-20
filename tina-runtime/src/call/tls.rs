@@ -5,7 +5,8 @@ use std::time::Duration;
 
 use super::{CallInput, CallOutput, TlsListenerId, TlsStreamId, TypedCall};
 
-/// Returns a typed TLS connect helper with explicit DER root certificates.
+/// Returns a typed TLS connect helper with explicit DER root certificates
+/// and no ALPN. Existing (HTTP/1) callers stay on this signature.
 pub fn tls_connect(
     addr: SocketAddr,
     server_name: impl Into<String>,
@@ -17,13 +18,39 @@ pub fn tls_connect(
             addr,
             server_name: server_name.into(),
             root_certificates,
+            alpn_protocols: Vec::new(),
             timeout,
         },
         CallOutput::into_tls_connected,
     )
 }
 
-/// Returns a typed TLS server bind helper with explicit DER cert/key.
+/// Returns a typed TLS connect helper that offers ALPN protocols and
+/// reports the negotiated protocol. `alpn_protocols` are raw wire bytes
+/// in preference order (e.g. `vec![b"h2".to_vec()]`); an empty list is
+/// equivalent to [`tls_connect`]. When ALPN is offered and the peer
+/// negotiates none, the connect fails with [`CallError::TlsAlpnMismatch`].
+pub fn tls_connect_alpn(
+    addr: SocketAddr,
+    server_name: impl Into<String>,
+    root_certificates: Vec<Vec<u8>>,
+    alpn_protocols: Vec<Vec<u8>>,
+    timeout: Duration,
+) -> TypedCall<(TlsStreamId, Option<Vec<u8>>)> {
+    TypedCall::new(
+        CallInput::TlsConnect {
+            addr,
+            server_name: server_name.into(),
+            root_certificates,
+            alpn_protocols,
+            timeout,
+        },
+        CallOutput::into_tls_connected_alpn,
+    )
+}
+
+/// Returns a typed TLS server bind helper with explicit DER cert/key and
+/// no ALPN.
 pub fn tls_bind(
     addr: SocketAddr,
     certificate_chain: Vec<Vec<u8>>,
@@ -34,12 +61,31 @@ pub fn tls_bind(
             addr,
             certificate_chain,
             private_key,
+            alpn_protocols: Vec::new(),
         },
         CallOutput::into_tls_bound,
     )
 }
 
-/// Returns a typed TLS server accept helper.
+/// Returns a typed TLS server bind helper that advertises ALPN protocols.
+pub fn tls_bind_alpn(
+    addr: SocketAddr,
+    certificate_chain: Vec<Vec<u8>>,
+    private_key: Vec<u8>,
+    alpn_protocols: Vec<Vec<u8>>,
+) -> TypedCall<(TlsListenerId, SocketAddr)> {
+    TypedCall::new(
+        CallInput::TlsBind {
+            addr,
+            certificate_chain,
+            private_key,
+            alpn_protocols,
+        },
+        CallOutput::into_tls_bound,
+    )
+}
+
+/// Returns a typed TLS server accept helper (stream + peer address).
 pub fn tls_accept(
     listener: TlsListenerId,
     timeout: Duration,
@@ -47,6 +93,18 @@ pub fn tls_accept(
     TypedCall::new(
         CallInput::TlsAccept { listener, timeout },
         CallOutput::into_tls_accepted,
+    )
+}
+
+/// Returns a typed TLS server accept helper that also reports the ALPN
+/// protocol negotiated with the client.
+pub fn tls_accept_alpn(
+    listener: TlsListenerId,
+    timeout: Duration,
+) -> TypedCall<(TlsStreamId, SocketAddr, Option<Vec<u8>>)> {
+    TypedCall::new(
+        CallInput::TlsAccept { listener, timeout },
+        CallOutput::into_tls_accepted_alpn,
     )
 }
 

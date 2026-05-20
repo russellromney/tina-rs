@@ -795,10 +795,24 @@ impl CallOutput {
         }
     }
 
-    /// Extracts the successful TLS connect result.
+    /// Extracts the successful TLS connect result (stream id only,
+    /// discarding any negotiated ALPN). Used by non-ALPN callers.
     pub fn into_tls_connected(self) -> Result<TlsStreamId, CallError> {
         match self {
-            Self::TlsConnected { stream } => Ok(stream),
+            Self::TlsConnected { stream, .. } => Ok(stream),
+            Self::Failed(error) => Err(error),
+            other => Self::panic_wrong_shape("TlsConnected", &other),
+        }
+    }
+
+    /// Extracts the TLS connect result plus the negotiated ALPN protocol
+    /// (raw wire bytes), or `None` when no ALPN was negotiated.
+    pub fn into_tls_connected_alpn(self) -> Result<(TlsStreamId, Option<Vec<u8>>), CallError> {
+        match self {
+            Self::TlsConnected {
+                stream,
+                selected_alpn,
+            } => Ok((stream, selected_alpn)),
             Self::Failed(error) => Err(error),
             other => Self::panic_wrong_shape("TlsConnected", &other),
         }
@@ -816,10 +830,28 @@ impl CallOutput {
         }
     }
 
-    /// Extracts the successful TLS accept result.
+    /// Extracts the successful TLS accept result (stream + peer address,
+    /// discarding any negotiated ALPN).
     pub fn into_tls_accepted(self) -> Result<(TlsStreamId, SocketAddr), CallError> {
         match self {
-            Self::TlsAccepted { stream, peer_addr } => Ok((stream, peer_addr)),
+            Self::TlsAccepted {
+                stream, peer_addr, ..
+            } => Ok((stream, peer_addr)),
+            Self::Failed(error) => Err(error),
+            other => Self::panic_wrong_shape("TlsAccepted", &other),
+        }
+    }
+
+    /// Extracts the TLS accept result plus the negotiated ALPN protocol.
+    pub fn into_tls_accepted_alpn(
+        self,
+    ) -> Result<(TlsStreamId, SocketAddr, Option<Vec<u8>>), CallError> {
+        match self {
+            Self::TlsAccepted {
+                stream,
+                peer_addr,
+                selected_alpn,
+            } => Ok((stream, peer_addr, selected_alpn)),
             Self::Failed(error) => Err(error),
             other => Self::panic_wrong_shape("TlsAccepted", &other),
         }

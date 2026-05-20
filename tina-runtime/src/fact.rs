@@ -362,6 +362,17 @@ pub enum ProtocolFact {
         /// Final status code.
         status: GrpcStatusCode,
     },
+
+    /// Native gRPC client received a final status from the server. Paired
+    /// with [`ProtocolFact::GrpcFinalStatusSent`] for the receive side.
+    GrpcFinalStatusReceived {
+        /// Local HTTP/2 connection id carrying this gRPC stream.
+        connection: ProtocolConnectionId,
+        /// gRPC stream id.
+        stream: GrpcStreamId,
+        /// Final status code received from the server.
+        status: GrpcStatusCode,
+    },
 }
 
 impl ProtocolFact {
@@ -376,7 +387,9 @@ impl ProtocolFact {
             Self::WebSocketSlowPeerClosed { .. } | Self::WebSocketSessionClosed { .. } => {
                 ProtocolFamily::WebSocket
             }
-            Self::GrpcFinalStatusSent { .. } => ProtocolFamily::Grpc,
+            Self::GrpcFinalStatusSent { .. } | Self::GrpcFinalStatusReceived { .. } => {
+                ProtocolFamily::Grpc
+            }
         }
     }
 }
