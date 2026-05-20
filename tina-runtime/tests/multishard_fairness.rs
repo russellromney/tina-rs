@@ -307,6 +307,7 @@ fn shutdown_under_remote_flood_completes_bounded() {
 fn ordinary_remote_throughput_still_progresses() {
     let runtime = make_runtime();
     let hits = Arc::new(AtomicUsize::new(0));
+    const N: usize = 500;
 
     let sink = runtime
         .register_with_capacity_on::<Sink, _>(
@@ -314,7 +315,7 @@ fn ordinary_remote_throughput_still_progresses() {
             Sink {
                 hits: Arc::clone(&hits),
             },
-            128,
+            N + 16,
         )
         .expect("register sink");
 
@@ -335,12 +336,12 @@ fn ordinary_remote_throughput_still_progresses() {
         )
         .expect("register source");
 
-    const N: usize = 500;
     runtime
         .try_send(source, FloodMsg::Tick { remaining: N })
         .expect("kick burst");
     let expected = N;
 
+    let start = Instant::now();
     // Every cross-shard message produced by the bounded burst should
     // land at the sink. With the fairness change, the worker still
     // drains its remote inbound budget on every pass, so ordinary
@@ -353,6 +354,12 @@ fn ordinary_remote_throughput_still_progresses() {
         hits.load(Ordering::Relaxed),
         expected,
         "fairness change must not regress finite cross-shard throughput"
+    );
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed < Duration::from_millis(300),
+        "productive cross-shard backlog paid a fixed sleep per round (took {:?})",
+        elapsed
     );
 
     running.store(false, Ordering::Relaxed);
