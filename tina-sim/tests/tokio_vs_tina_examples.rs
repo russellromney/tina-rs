@@ -313,6 +313,7 @@ impl Client {
                         | CallError::TlsCertificate
                         | CallError::TlsName
                         | CallError::TlsHandshake
+                        | CallError::TlsAlpnMismatch
                         | CallError::ProcessFull
                         | CallError::ProcessClosed
                         | CallError::KillUncertain

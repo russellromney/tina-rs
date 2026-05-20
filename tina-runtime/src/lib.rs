@@ -174,8 +174,9 @@ pub use call::{
     file_write_at, journal_append, journal_replay, mkdir, path_metadata, process_run, read_dir,
     remove_file, rename_replace, send_observed, signal_wait, sleep, sleep_then, snapshot_commit,
     snapshot_load, sync_parent, tcp_accept, tcp_bind, tcp_close_listener, tcp_close_stream,
-    tcp_connect, tcp_read, tcp_write, tls_accept, tls_bind, tls_close, tls_close_listener,
-    tls_connect, tls_read, tls_write, udp_bind, udp_close_socket, udp_recv_from, udp_send_to,
+    tcp_connect, tcp_read, tcp_write, tls_accept, tls_accept_alpn, tls_bind, tls_bind_alpn,
+    tls_close, tls_close_listener, tls_connect, tls_connect_alpn, tls_read, tls_write, udp_bind,
+    udp_close_socket, udp_recv_from, udp_send_to,
 };
 pub use call_group::{
     CallGroup, CallGroupBranchOutcome, CallGroupCancelOutcome, CallGroupCancelRequest,

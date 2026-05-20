@@ -52,6 +52,16 @@ impl TlsRuntimeStream {
             Self::Server(stream) => stream.conn.send_close_notify(),
         }
     }
+
+    /// The ALPN protocol negotiated during the handshake, as raw wire
+    /// bytes, or `None` when no ALPN was negotiated.
+    pub(super) fn alpn_protocol(&self) -> Option<Vec<u8>> {
+        let raw = match self {
+            Self::Client(stream) => stream.conn.alpn_protocol(),
+            Self::Server(stream) => stream.conn.alpn_protocol(),
+        };
+        raw.map(|bytes| bytes.to_vec())
+    }
 }
 
 pub(super) enum TlsLane {
@@ -106,6 +116,7 @@ pub(super) enum TlsCommand {
         addr: SocketAddr,
         certificate_chain: Vec<Vec<u8>>,
         private_key: Vec<u8>,
+        alpn_protocols: Vec<Vec<u8>>,
         cancelled: Arc<AtomicBool>,
     },
     Accept {
@@ -120,6 +131,7 @@ pub(super) enum TlsCommand {
         addr: SocketAddr,
         server_name: String,
         root_certificates: Vec<Vec<u8>>,
+        alpn_protocols: Vec<Vec<u8>>,
         timeout: Duration,
         cancelled: Arc<AtomicBool>,
     },
@@ -162,19 +174,27 @@ impl TlsLane {
         Self::Worker(TlsWorkerLane::new(capacity))
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn submit_connect(
         &mut self,
         call_id: CallId,
         addr: SocketAddr,
         server_name: String,
         root_certificates: Vec<Vec<u8>>,
+        alpn_protocols: Vec<Vec<u8>>,
         timeout: Duration,
         now: Instant,
     ) -> Option<DriverCompletion> {
         match self {
-            Self::Worker(lane) => {
-                lane.submit_connect(call_id, addr, server_name, root_certificates, timeout, now)
-            }
+            Self::Worker(lane) => lane.submit_connect(
+                call_id,
+                addr,
+                server_name,
+                root_certificates,
+                alpn_protocols,
+                timeout,
+                now,
+            ),
         }
     }
 
@@ -184,12 +204,18 @@ impl TlsLane {
         addr: SocketAddr,
         certificate_chain: Vec<Vec<u8>>,
         private_key: Vec<u8>,
+        alpn_protocols: Vec<Vec<u8>>,
         now: Instant,
     ) -> Option<DriverCompletion> {
         match self {
-            Self::Worker(lane) => {
-                lane.submit_bind(call_id, addr, certificate_chain, private_key, now)
-            }
+            Self::Worker(lane) => lane.submit_bind(
+                call_id,
+                addr,
+                certificate_chain,
+                private_key,
+                alpn_protocols,
+                now,
+            ),
         }
     }
 
@@ -315,6 +341,7 @@ impl TlsWorkerLane {
         addr: SocketAddr,
         certificate_chain: Vec<Vec<u8>>,
         private_key: Vec<u8>,
+        alpn_protocols: Vec<Vec<u8>>,
         now: Instant,
     ) -> Option<DriverCompletion> {
         let cancelled = Arc::new(AtomicBool::new(false));
@@ -328,6 +355,7 @@ impl TlsWorkerLane {
                 addr,
                 certificate_chain,
                 private_key,
+                alpn_protocols,
                 cancelled,
             },
         )
@@ -398,12 +426,14 @@ impl TlsWorkerLane {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn submit_connect(
         &mut self,
         call_id: CallId,
         addr: SocketAddr,
         server_name: String,
         root_certificates: Vec<Vec<u8>>,
+        alpn_protocols: Vec<Vec<u8>>,
         timeout: Duration,
         now: Instant,
     ) -> Option<DriverCompletion> {
@@ -418,6 +448,7 @@ impl TlsWorkerLane {
                 addr,
                 server_name,
                 root_certificates,
+                alpn_protocols,
                 timeout,
                 cancelled: Arc::new(AtomicBool::new(false)),
             },
@@ -668,6 +699,7 @@ impl TlsWorkerLane {
             },
             TlsCompletionResult::Accepted(result) => match *result {
                 Ok((stream, peer_addr)) => {
+                    let selected_alpn = stream.alpn_protocol();
                     let id = TlsStreamId::new(self.next_stream_id);
                     self.next_stream_id += 1;
                     self.streams.push(TlsStreamEntry {
@@ -677,19 +709,24 @@ impl TlsWorkerLane {
                     CallOutput::TlsAccepted {
                         stream: id,
                         peer_addr,
+                        selected_alpn,
                     }
                 }
                 Err(error) => CallOutput::Failed(error),
             },
             TlsCompletionResult::Connected(result) => match *result {
                 Ok(stream) => {
+                    let selected_alpn = stream.alpn_protocol();
                     let id = TlsStreamId::new(self.next_stream_id);
                     self.next_stream_id += 1;
                     self.streams.push(TlsStreamEntry {
                         id,
                         stream: Arc::new(Mutex::new(stream)),
                     });
-                    CallOutput::TlsConnected { stream: id }
+                    CallOutput::TlsConnected {
+                        stream: id,
+                        selected_alpn,
+                    }
                 }
                 Err(error) => CallOutput::Failed(error),
             },
@@ -820,12 +857,14 @@ pub(super) fn execute_tls_command(command: TlsCommand) -> TlsCompletionResult {
             addr,
             certificate_chain,
             private_key,
+            alpn_protocols,
             cancelled,
             ..
         } => TlsCompletionResult::Bound(Box::new(bind_tls_listener(
             addr,
             certificate_chain,
             private_key,
+            alpn_protocols,
             &cancelled,
         ))),
         TlsCommand::Accept {
@@ -841,6 +880,7 @@ pub(super) fn execute_tls_command(command: TlsCommand) -> TlsCompletionResult {
             addr,
             server_name,
             root_certificates,
+            alpn_protocols,
             timeout,
             cancelled,
             ..
@@ -848,6 +888,7 @@ pub(super) fn execute_tls_command(command: TlsCommand) -> TlsCompletionResult {
             addr,
             &server_name,
             root_certificates,
+            alpn_protocols,
             timeout,
             &cancelled,
         ))),
@@ -878,6 +919,7 @@ pub(super) fn connect_tls(
     addr: SocketAddr,
     server_name: &str,
     root_certificates: Vec<Vec<u8>>,
+    alpn_protocols: Vec<Vec<u8>>,
     timeout: Duration,
     cancelled: &AtomicBool,
 ) -> Result<TlsRuntimeStream, CallError> {
@@ -899,9 +941,11 @@ pub(super) fn connect_tls(
             .add(rustls::pki_types::CertificateDer::from(certificate))
             .map_err(|_| CallError::TlsCertificate)?;
     }
-    let config = rustls::ClientConfig::builder()
+    let mut config = rustls::ClientConfig::builder()
         .with_root_certificates(roots)
         .with_no_client_auth();
+    let alpn_offered = !alpn_protocols.is_empty();
+    config.alpn_protocols = alpn_protocols;
     let server_name = rustls::pki_types::ServerName::try_from(server_name.to_string())
         .map_err(|_| CallError::TlsName)?;
     let connection = rustls::ClientConnection::new(Arc::new(config), server_name)
@@ -916,6 +960,12 @@ pub(super) fn connect_tls(
             .complete_io(&mut stream.sock)
             .map_err(|_| CallError::TlsHandshake)?;
     }
+    // If we offered ALPN but the peer negotiated none, fail closed with a
+    // typed mismatch rather than silently proceeding on a protocol the
+    // caller did not ask for.
+    if alpn_offered && stream.conn.alpn_protocol().is_none() {
+        return Err(CallError::TlsAlpnMismatch);
+    }
     Ok(TlsRuntimeStream::Client(stream))
 }
 
@@ -923,6 +973,7 @@ pub(super) fn bind_tls_listener(
     addr: SocketAddr,
     certificate_chain: Vec<Vec<u8>>,
     private_key: Vec<u8>,
+    alpn_protocols: Vec<Vec<u8>>,
     cancelled: &AtomicBool,
 ) -> Result<(TcpListener, rustls::ServerConfig), CallError> {
     let _ = rustls::crypto::ring::default_provider().install_default();
@@ -934,10 +985,11 @@ pub(super) fn bind_tls_listener(
         .map(rustls::pki_types::CertificateDer::from)
         .collect();
     let private_key = rustls::pki_types::PrivateKeyDer::Pkcs8(private_key.into());
-    let config = rustls::ServerConfig::builder()
+    let mut config = rustls::ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(certificates, private_key)
         .map_err(|_| CallError::TlsCertificate)?;
+    config.alpn_protocols = alpn_protocols;
     let listener = TcpListener::bind(addr).map_err(|_| CallError::Io)?;
     Ok((listener, config))
 }

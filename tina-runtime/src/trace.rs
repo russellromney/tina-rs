@@ -1339,6 +1339,8 @@ fn call_error_tag(error: CallError) -> u8 {
             tina::CallRejectedReason::HandlerPanicked => 26,
             tina::CallRejectedReason::UnsupportedMessage => 27,
         },
+        // Appended after the existing tags; never renumber.
+        CallError::TlsAlpnMismatch => 28,
     }
 }
 

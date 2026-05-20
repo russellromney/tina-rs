@@ -4,6 +4,42 @@ This file records completed work.
 
 ## Unreleased
 
+### TLS ALPN Rail (runtime + simulator)
+
+Promotes ALPN to a real core hook so "selected protocol is typed runtime
+truth" (the plan's Hostile Review Note), not a battery-only placeholder.
+
+- **`tina-runtime` TLS rail carries ALPN.** `CallInput::TlsConnect` and
+  `TlsBind` gain `alpn_protocols: Vec<Vec<u8>>` (raw wire bytes, empty =
+  no ALPN). `CallOutput::TlsConnected` and `TlsAccepted` gain
+  `selected_alpn: Option<Vec<u8>>`. New `CallError::TlsAlpnMismatch`
+  (trace tag 28, appended) fires when ALPN was offered but the peer
+  negotiated none — distinct from cert/name/handshake failures.
+- **Existing helpers unchanged; ALPN-aware variants added.**
+  `tls_connect` / `tls_bind` / `tls_accept` keep their signatures (offer
+  no ALPN, ignore selected), so the HTTP/1 TLS client and HTTPS listener
+  are untouched (no HTTP/1 rewrite). New `tls_connect_alpn`,
+  `tls_bind_alpn`, and `tls_accept_alpn` offer ALPN and report the
+  negotiated protocol; `into_tls_connected_alpn` / `into_tls_accepted_alpn`
+  extract `(stream, selected)`.
+- **rustls wiring.** The TLS worker sets `config.alpn_protocols` on
+  connect and bind, reads `conn.alpn_protocol()` after the handshake,
+  and fails a connect with `TlsAlpnMismatch` when ALPN was offered but
+  none negotiated.
+- **Simulator mirror.** `handle_tls_connect` threads the offered ALPN
+  and reports `selected_alpn` deterministically (the scripted server
+  accepts the client's top preference — a pure function of the offered
+  list, so saved cases do not replay under an ambient default).
+  Server-side ALPN negotiation and scripted ALPN-mismatch are noted as
+  future sim work.
+- **Runtime proofs** (`driver` tests): a real rustls handshake with
+  `h2` offered selects `h2`; a server advertising no ALPN with `h2`
+  offered yields `CallError::TlsAlpnMismatch`; no ALPN offered
+  negotiates `None` without a mismatch.
+
+Next: wire the HTTP/2 client to use the TLS rail for `Http2Target::Tls`
+(turning the client's `TlsAlpnMismatch` placeholder into real h2/TLS).
+
 ### Native gRPC Client — Hostile-Review Fixes
 
 A hostile pass on the unary client found three issues, now fixed:
