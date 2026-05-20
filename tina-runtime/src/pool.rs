@@ -187,6 +187,8 @@ where
     states: Vec<ResourceState>,
     idle: std::collections::VecDeque<u32>,
     waiter_slab: Vec<Option<Waiter<H>>>,
+    free_waiter_slots: Vec<u32>,
+    live_waiters: usize,
     waiter_queue: std::collections::VecDeque<u32>,
     in_flight: Vec<InFlightDispatch>,
     counters: PoolCounters,
@@ -224,8 +226,12 @@ where
             states.push(ResourceState::Idle { next_generation: 1 });
         }
         let mut waiter_slab = Vec::with_capacity(max_waiters);
+        let mut free_waiter_slots = Vec::with_capacity(max_waiters);
         for _ in 0..max_waiters {
             waiter_slab.push(None);
+        }
+        for idx in (0..max_waiters).rev() {
+            free_waiter_slots.push(idx as u32);
         }
         let resources_opt: Vec<Option<H>> = resources.into_iter().map(Some).collect();
         Self {
@@ -235,6 +241,8 @@ where
             states,
             idle,
             waiter_slab,
+            free_waiter_slots,
+            live_waiters: 0,
             waiter_queue: std::collections::VecDeque::with_capacity(max_waiters),
             in_flight: Vec::new(),
             counters: PoolCounters::default(),
@@ -278,7 +286,7 @@ where
     }
 
     fn live_waiter_count(&self) -> usize {
-        self.waiter_slab.iter().filter(|s| s.is_some()).count()
+        self.live_waiters
     }
 
     // Reclaim waiter slots whose deferred reply slot is no longer
@@ -287,12 +295,11 @@ where
     // both increment `cancel_count` here.
     fn sweep_waiters(&mut self) {
         let mut reclaimed_any = false;
-        for slot in self.waiter_slab.iter_mut() {
-            let drop_it = slot
+        for idx in 0..self.waiter_slab.len() {
+            let drop_it = self.waiter_slab[idx]
                 .as_ref()
                 .is_some_and(|w| w.reply.state() != DeferredSlotState::Open);
-            if drop_it {
-                *slot = None;
+            if drop_it && self.remove_waiter_slot(idx as u32).is_some() {
                 self.counters.cancel += 1;
                 reclaimed_any = true;
             }
@@ -340,12 +347,27 @@ where
     }
 
     fn alloc_waiter_slot(&mut self) -> u32 {
-        for (i, slot) in self.waiter_slab.iter().enumerate() {
-            if slot.is_none() {
-                return i as u32;
-            }
+        self.free_waiter_slots
+            .pop()
+            .expect("alloc_waiter_slot called when slab is full")
+    }
+
+    fn store_waiter_slot(&mut self, slab_idx: u32, waiter: Waiter<H>) {
+        debug_assert!(self.waiter_slab[slab_idx as usize].is_none());
+        self.waiter_slab[slab_idx as usize] = Some(waiter);
+        self.live_waiters += 1;
+    }
+
+    fn remove_waiter_slot(&mut self, slab_idx: u32) -> Option<Waiter<H>> {
+        let waiter = self.waiter_slab[slab_idx as usize].take();
+        if waiter.is_some() {
+            self.live_waiters = self
+                .live_waiters
+                .checked_sub(1)
+                .expect("WorkerPool live waiter count underflow");
+            self.free_waiter_slots.push(slab_idx);
         }
-        unreachable!("alloc_waiter_slot called when slab is full");
+        waiter
     }
 
     fn mint_lease(&mut self, resource_id: u32) -> PoolLease<H> {
@@ -402,7 +424,7 @@ where
     fn dispatch_to_next_waiter(&mut self, resource_id: u32) -> Option<Effect<Self>> {
         self.sweep_waiters();
         while let Some(slab_idx) = self.waiter_queue.pop_front() {
-            let waiter = match self.waiter_slab[slab_idx as usize].take() {
+            let waiter = match self.remove_waiter_slot(slab_idx) {
                 Some(w) => w,
                 None => continue,
             };
@@ -459,22 +481,21 @@ where
             );
         }
 
-        if self.live_waiter_count() >= self.config.max_waiters {
+        if self.free_waiter_slots.is_empty() {
             self.counters.full += 1;
             return reply_to::<Self>(slot, WorkerPoolReply::Acquire(AcquireOutcome::Full));
         }
 
         let slab_idx = self.alloc_waiter_slot();
-        self.waiter_slab[slab_idx as usize] = Some(Waiter { reply: slot });
+        self.store_waiter_slot(slab_idx, Waiter { reply: slot });
         self.waiter_queue.push_back(slab_idx);
         self.bump_waiter_high_water();
         noop()
     }
 
     fn bump_waiter_high_water(&mut self) {
-        let live = self.live_waiter_count();
-        if live > self.counters.high_water_waiters {
-            self.counters.high_water_waiters = live;
+        if self.live_waiters > self.counters.high_water_waiters {
+            self.counters.high_water_waiters = self.live_waiters;
         }
     }
 
@@ -594,8 +615,8 @@ where
             // prevents that).
         }
 
-        for slot in self.waiter_slab.iter_mut() {
-            if let Some(waiter) = slot.take() {
+        for idx in 0..self.waiter_slab.len() {
+            if let Some(waiter) = self.remove_waiter_slot(idx as u32) {
                 self.counters.closed += 1;
                 effects.push(reply_to::<Self>(
                     waiter.reply,
@@ -836,6 +857,91 @@ where
     M: 'static,
 {
     crate::call::call(pool, WorkerPoolMsg::Close(mode), timeout).then(translator)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tina::DeferredSlotShared;
+    use tina::runtime_internal::{deferred_from_handle, handle_from_shared};
+
+    fn fake_slot(id: u64) -> DeferredReply<WorkerPoolReply<u32>> {
+        let shared = Arc::new(DeferredSlotShared::new(
+            id,
+            std::any::TypeId::of::<WorkerPoolReply<u32>>(),
+        ));
+        deferred_from_handle(handle_from_shared(shared))
+    }
+
+    fn fake_closed_slot(id: u64) -> DeferredReply<WorkerPoolReply<u32>> {
+        let shared = Arc::new(DeferredSlotShared::new(
+            id,
+            std::any::TypeId::of::<WorkerPoolReply<u32>>(),
+        ));
+        shared.set_state(DeferredSlotState::Closed);
+        deferred_from_handle(handle_from_shared(shared))
+    }
+
+    fn pool_with_waiters(max_waiters: usize) -> WorkerPool<u32, tina::SingleShard> {
+        WorkerPool::new(
+            PoolConfig {
+                capacity: 1,
+                max_waiters,
+            },
+            vec![7],
+        )
+    }
+
+    #[test]
+    fn waiter_free_stack_reuses_reclaimed_slot_and_tracks_live_count() {
+        let mut pool = pool_with_waiters(2);
+        let a = pool.alloc_waiter_slot();
+        pool.store_waiter_slot(
+            a,
+            Waiter {
+                reply: fake_slot(10),
+            },
+        );
+        let b = pool.alloc_waiter_slot();
+        pool.store_waiter_slot(
+            b,
+            Waiter {
+                reply: fake_slot(11),
+            },
+        );
+        assert_eq!(pool.live_waiter_count(), 2);
+        assert!(pool.free_waiter_slots.is_empty());
+
+        let removed = pool.remove_waiter_slot(a).expect("slot a occupied");
+        drop(removed);
+        assert_eq!(pool.live_waiter_count(), 1);
+        let reused = pool.alloc_waiter_slot();
+        assert_eq!(reused, a, "reclaimed slot should be reused directly");
+        assert_eq!(pool.live_waiter_count(), 1);
+        assert_eq!(
+            b, 1,
+            "initial free stack should still allocate stable slots"
+        );
+    }
+
+    #[test]
+    fn waiter_sweep_reclaims_closed_slot_and_prunes_fifo_queue() {
+        let mut pool = pool_with_waiters(3);
+        for reply in [fake_slot(10), fake_closed_slot(11), fake_slot(12)] {
+            let idx = pool.alloc_waiter_slot();
+            pool.store_waiter_slot(idx, Waiter { reply });
+            pool.waiter_queue.push_back(idx);
+        }
+        assert_eq!(pool.live_waiter_count(), 3);
+
+        pool.sweep_waiters();
+
+        assert_eq!(pool.live_waiter_count(), 2);
+        assert_eq!(pool.counters.cancel, 1);
+        let remaining: Vec<u32> = pool.waiter_queue.iter().copied().collect();
+        assert_eq!(remaining, vec![0, 2]);
+        assert!(pool.free_waiter_slots.contains(&1));
+    }
 }
 
 // Manual Isolate impl: message and reply types are generic over H,
