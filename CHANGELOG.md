@@ -4,6 +4,40 @@ This file records completed work.
 
 ## Unreleased
 
+### Native HTTP/2 Client over TLS (h2/TLS)
+
+Wires the HTTP/2 client to the TLS rail, turning the `TlsAlpnMismatch`
+placeholder into real h2/TLS. `Http2Target::Tls` now actually connects.
+
+- **Dual-rail connection.** A `ClientStream` enum {`Tcp`, `Tls`} backs
+  every IO site. `Http2Target::H2c` uses `tcp_connect` + `tcp_*`;
+  `Http2Target::Tls` uses `tls_connect_alpn` (offering the target's
+  `AlpnProtocols`) + `tls_read`/`tls_write`/`tls_close`. The HTTP/2
+  framing code above is rail-agnostic.
+- **Real ALPN negotiation.** A TLS connect that offers `h2` and gets
+  `h2` proceeds; the client also defends against a non-`h2` selection.
+  An offered-but-unnegotiated ALPN fails the connect with
+  `CallError::TlsAlpnMismatch`, surfaced as
+  `Http2ClientOutcome::TlsAlpnMismatch`. The `noop()` placeholder and
+  the `handle_submit` TLS short-circuit are gone; TLS submits queue
+  pre-connect like h2c.
+- **Half-duplex IO on TLS.** The runtime TLS lane is single-lane per
+  stream (read and write share one lane, one blocking worker), unlike
+  TCP's split read/write lanes. A new `pump_io` runs the connection
+  full-duplex on TCP (read always armed) and half-duplex on TLS (drain
+  writes, then arm a read) so the two directions never collide with a
+  `ResourceBusy`. This is correct for request/response (unary); a
+  concurrent full-duplex h2/TLS *stream* would need a non-blocking TLS
+  reactor in the runtime (split TLS lanes + sans-IO rustls in the poll
+  loop) — a future runtime-maturity phase, out of Phase 116 scope.
+- **`Http2ClientLimits::tls_io_timeout`** (default 30s) bounds the TLS
+  connect/handshake and per-call TLS read/write/close.
+- **Live proofs** (`http2_client_tls_live.rs`, hand-rolled rustls +
+  HTTP/2 server peer): h2/TLS GET round-trips with `h2` selected; a
+  server without `h2` ALPN yields `TlsAlpnMismatch`; an untrusted cert
+  fails with a typed non-`Replied` outcome and never panics. The h2c
+  suite is unchanged and still green.
+
 ### TLS ALPN Rail (runtime + simulator)
 
 Promotes ALPN to a real core hook so "selected protocol is typed runtime

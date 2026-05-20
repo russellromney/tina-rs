@@ -349,47 +349,9 @@ fn h2c_post_in_window_body_round_trips_against_real_server() {
     let _ = runtime.shutdown();
 }
 
-#[test]
-fn tls_target_returns_typed_alpn_mismatch_without_touching_tls_rails() {
-    // The ALPN rail is not yet on the runtime. A TLS-shaped target must
-    // resolve to a typed `TlsAlpnMismatch` outcome, not a silent h2c
-    // fallback and not a generic IO error.
-    let runtime = ThreadedRuntime::with_config(
-        TestShard,
-        DefaultThreadedMailboxFactory,
-        ThreadedRuntimeConfig {
-            command_capacity: 64,
-            idle_wait: Duration::from_millis(1),
-            ..Default::default()
-        },
-    );
-    let target = Http2Target::Tls {
-        authority: "test".into(),
-        addr: "127.0.0.1:1".parse().unwrap(),
-        server_name: "test".into(),
-        trust_roots: vec![vec![0_u8; 32]],
-        alpn: AlpnProtocols::h2(),
-    };
-    let client = make_client(&runtime, target, Http2ClientLimits::default());
-
-    let outcome = runtime
-        .call_blocking(
-            client,
-            Http2ClientMsg::Submit(Http2ClientRequest::get("/x")),
-            Duration::from_secs(2),
-        )
-        .expect("call returns outcome");
-    match outcome {
-        CallOutcome::Replied(Http2ClientReply::Outcome {
-            outcome: Http2ClientOutcome::TlsAlpnMismatch,
-            ..
-        }) => {}
-        other => panic!("expected TlsAlpnMismatch, got {other:?}"),
-    }
-
-    let _ = runtime.try_send(client, Http2ClientMsg::Stop);
-    let _ = runtime.shutdown();
-}
+// Real h2/TLS coverage (happy path with `h2` selected, plus ALPN
+// mismatch) lives in `http2_client_tls_live.rs`, which stands up a
+// rustls + HTTP/2 server peer. This file is the h2c suite.
 
 #[test]
 fn tls_target_route_key_distinguishes_from_h2c_route_key() {

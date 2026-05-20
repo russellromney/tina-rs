@@ -22,13 +22,15 @@
 use std::collections::VecDeque;
 use std::convert::Infallible;
 use std::marker::PhantomData;
+use std::time::Duration;
 
 use http::{HeaderMap, Method, StatusCode};
 use tina::prelude::*;
 use tina::reply_to_request;
 use tina_runtime::{
     CallError, Http2CloseReason, Http2ResetReason, Http2StreamId, ProtocolConnectionId,
-    ProtocolDirection, ProtocolFact, StreamId, tcp_close_stream, tcp_connect, tcp_read, tcp_write,
+    ProtocolDirection, ProtocolFact, StreamId, TlsStreamId, tcp_close_stream, tcp_connect,
+    tcp_read, tcp_write, tls_close, tls_connect_alpn, tls_read, tls_write,
 };
 
 use super::errors::{
@@ -51,6 +53,16 @@ use super::headers::{
 };
 use super::target::Http2Target;
 
+/// The transport stream this connection owns: cleartext TCP for an
+/// `Http2Target::H2c`, or a TLS stream for `Http2Target::Tls`. All of the
+/// connection's IO (read / write / close) branches on this so the
+/// HTTP/2 framing code above is rail-agnostic.
+#[derive(Debug, Clone, Copy)]
+enum ClientStream {
+    Tcp(StreamId),
+    Tls(TlsStreamId),
+}
+
 /// Client connection limits. Mirrors the server's [`super::Http2Limits`]
 /// shape but is typed separately so the client picks its own defaults.
 ///
@@ -72,6 +84,11 @@ pub struct Http2ClientLimits {
     pub pre_connect_submit_capacity: usize,
     pub initial_connection_window: i32,
     pub initial_stream_window: i32,
+    /// Per-call timeout for TLS rail read/write/close on an
+    /// `Http2Target::Tls` connection. (The TCP rail's read/write are
+    /// deadline-less in this runtime.) Also bounds the TLS connect +
+    /// handshake.
+    pub tls_io_timeout: Duration,
 }
 
 impl Default for Http2ClientLimits {
@@ -85,6 +102,7 @@ impl Default for Http2ClientLimits {
             pre_connect_submit_capacity: 64,
             initial_connection_window: DEFAULT_WINDOW,
             initial_stream_window: DEFAULT_WINDOW,
+            tls_io_timeout: Duration::from_secs(30),
         }
     }
 }
@@ -205,13 +223,16 @@ pub enum Http2ClientMsg {
     Report,
     /// Begin graceful shutdown (GOAWAY) and stop the isolate.
     Stop,
-    /// Internal: TCP connect completion.
+    /// Internal: TCP connect completion (h2c targets).
     Connected(Result<(StreamId, std::net::SocketAddr, std::net::SocketAddr), CallError>),
-    /// Internal: TCP read completion.
+    /// Internal: TLS connect completion (h2/TLS targets), carrying the
+    /// negotiated ALPN protocol.
+    TlsConnected(Result<(TlsStreamId, Option<Vec<u8>>), CallError>),
+    /// Internal: read completion (either rail).
     Read(Result<Vec<u8>, CallError>),
-    /// Internal: TCP write completion.
+    /// Internal: write completion (either rail).
     Wrote(Result<usize, CallError>),
-    /// Internal: TCP close completion.
+    /// Internal: close completion (either rail).
     Closed(Result<(), CallError>),
 }
 
@@ -281,8 +302,11 @@ impl ActiveClientStream {
 pub struct Http2ClientConnection<S: Shard + 'static> {
     target: Http2Target,
     limits: Http2ClientLimits,
-    stream: Option<StreamId>,
-    /// Submits waiting for the TCP connect + preface to flush.
+    stream: Option<ClientStream>,
+    /// ALPN protocol negotiated on a TLS connection (raw wire bytes),
+    /// `None` for h2c or when no ALPN was negotiated.
+    negotiated_alpn: Option<Vec<u8>>,
+    /// Submits waiting for the connect + preface to flush.
     queued_submits: VecDeque<(Http2ClientRequest, tina::RequestContext<Http2ClientReply>)>,
     streams: Vec<ActiveClientStream>,
     next_stream_id: u32,
@@ -303,6 +327,12 @@ pub struct Http2ClientConnection<S: Shard + 'static> {
     /// return `CallError::ResourceBusy` from the driver and kill the
     /// connection.
     write_in_flight: bool,
+    /// True from when a read is dispatched until its `Read` completion.
+    /// On the TCP rail read and write are independent lanes, so this is
+    /// just bookkeeping; on the TLS rail read and write share one lane
+    /// (and one blocking worker), so the connection runs half-duplex —
+    /// at most one of read/write may be in flight at a time.
+    read_in_flight: bool,
     /// Stream-id space is exhausted; no further `admit_stream` calls
     /// will succeed. The connection still drains existing streams.
     stream_id_exhausted: bool,
@@ -327,6 +357,7 @@ impl<S: Shard + 'static> Http2ClientConnection<S> {
             target,
             limits,
             stream: None,
+            negotiated_alpn: None,
             queued_submits: VecDeque::new(),
             streams: Vec::with_capacity(limits.max_concurrent_streams),
             next_stream_id: 1,
@@ -342,6 +373,7 @@ impl<S: Shard + 'static> Http2ClientConnection<S> {
             goaway_received: false,
             closing_after_write: false,
             write_in_flight: false,
+            read_in_flight: false,
             stream_id_exhausted: false,
             pending_write: Vec::new(),
             write_queue: VecDeque::new(),
@@ -390,8 +422,17 @@ impl<S: Shard + 'static> Isolate for Http2ClientConnection<S> {
         }
         match msg {
             Http2ClientMsg::Begin => self.begin_connect(),
-            Http2ClientMsg::Connected(Ok((stream, _, _))) => self.handle_connected(stream),
+            Http2ClientMsg::Connected(Ok((stream, _, _))) => {
+                self.handle_connected(ClientStream::Tcp(stream), None)
+            }
             Http2ClientMsg::Connected(Err(_)) => self.close_with(Http2ClientOutcome::Closed),
+            Http2ClientMsg::TlsConnected(Ok((stream, selected_alpn))) => {
+                self.handle_tls_connected(stream, selected_alpn)
+            }
+            Http2ClientMsg::TlsConnected(Err(CallError::TlsAlpnMismatch)) => {
+                self.close_with(Http2ClientOutcome::TlsAlpnMismatch)
+            }
+            Http2ClientMsg::TlsConnected(Err(_)) => self.close_with(Http2ClientOutcome::Closed),
             Http2ClientMsg::Read(Ok(bytes)) => self.handle_read(bytes),
             Http2ClientMsg::Read(Err(_)) => self.close_with(Http2ClientOutcome::Closed),
             Http2ClientMsg::Wrote(Ok(n)) => self.handle_wrote(n),
@@ -436,13 +477,20 @@ impl<S: Shard + 'static> Http2ClientConnection<S> {
             return noop();
         }
         match &self.target {
-            Http2Target::Tls { .. } => {
-                // TLS ALPN rail is not yet on the runtime. Stay alive so
-                // each later `Submit` call returns the typed
-                // `TlsAlpnMismatch` outcome through `handle_submit`. No
-                // silent h2c fallback, no TCP rail consulted.
-                noop()
-            }
+            Http2Target::Tls {
+                addr,
+                server_name,
+                trust_roots,
+                alpn,
+                ..
+            } => tls_connect_alpn(
+                *addr,
+                server_name.clone(),
+                trust_roots.clone(),
+                alpn.wire(),
+                self.limits.tls_io_timeout,
+            )
+            .then(Http2ClientMsg::TlsConnected),
             Http2Target::H2c { addr, .. } => {
                 let addr = *addr;
                 tcp_connect(addr).then(Http2ClientMsg::Connected)
@@ -450,7 +498,30 @@ impl<S: Shard + 'static> Http2ClientConnection<S> {
         }
     }
 
-    fn handle_connected(&mut self, stream: StreamId) -> Effect<Self> {
+    /// TLS connect completed. If the target asked for `h2` ALPN, require
+    /// the server to have selected `h2` — otherwise fail closed with the
+    /// typed mismatch rather than speaking h2 on an unnegotiated protocol.
+    fn handle_tls_connected(
+        &mut self,
+        stream: TlsStreamId,
+        selected_alpn: Option<Vec<u8>>,
+    ) -> Effect<Self> {
+        let wants_h2 = matches!(&self.target, Http2Target::Tls { alpn, .. } if alpn.is_h2());
+        if wants_h2 && selected_alpn.as_deref() != Some(b"h2") {
+            // The rail already maps offered-but-none to TlsAlpnMismatch;
+            // this guards the (rustls-impossible but defensive) case of a
+            // different selection.
+            return self.close_with(Http2ClientOutcome::TlsAlpnMismatch);
+        }
+        self.negotiated_alpn = selected_alpn.clone();
+        self.handle_connected(ClientStream::Tls(stream), selected_alpn)
+    }
+
+    fn handle_connected(
+        &mut self,
+        stream: ClientStream,
+        _selected_alpn: Option<Vec<u8>>,
+    ) -> Effect<Self> {
         self.stream = Some(stream);
         let mut preface = Vec::with_capacity(CLIENT_PREFACE.len() + 64);
         preface.extend_from_slice(CLIENT_PREFACE);
@@ -483,8 +554,7 @@ impl<S: Shard + 'static> Http2ClientConnection<S> {
         for (req, waiter) in queued {
             self.admit_stream(req, waiter, &mut effects);
         }
-        self.maybe_write_more(&mut effects);
-        effects.push(self.read_more());
+        self.pump_io(&mut effects);
         batch(effects)
     }
 
@@ -496,8 +566,12 @@ impl<S: Shard + 'static> Http2ClientConnection<S> {
         // Promote the call into a request context so we can reply later
         // from a different handler turn.
         let waiter = call.into_request_context();
-        if self.stream.is_none() && !matches!(self.target, Http2Target::Tls { .. }) {
-            if self.queued_submits.len() >= self.limits.max_concurrent_streams {
+        // Until the connect (TCP or TLS) + preface flush, queue the
+        // submit. Once `Connected`/`TlsConnected` resolves, the queued
+        // submits flush in order. A failed TLS connect (incl. ALPN
+        // mismatch) drains the queue with the typed outcome.
+        if self.stream.is_none() {
+            if self.queued_submits.len() >= self.limits.pre_connect_submit_capacity {
                 self.report.admission_full += 1;
                 return reply_to_request::<Self>(
                     waiter,
@@ -510,18 +584,9 @@ impl<S: Shard + 'static> Http2ClientConnection<S> {
             self.queued_submits.push_back((req, waiter));
             return noop();
         }
-        if matches!(self.target, Http2Target::Tls { .. }) {
-            return reply_to_request::<Self>(
-                waiter,
-                Http2ClientReply::Outcome {
-                    stream_id: 0,
-                    outcome: Http2ClientOutcome::TlsAlpnMismatch,
-                },
-            );
-        }
         let mut effects: Vec<Effect<Self>> = Vec::new();
         self.admit_stream(req, waiter, &mut effects);
-        self.maybe_write_more(&mut effects);
+        self.pump_io(&mut effects);
         batch(effects)
     }
 
@@ -688,11 +753,13 @@ impl<S: Shard + 'static> Http2ClientConnection<S> {
                 },
             ));
         }
-        self.maybe_write_more(&mut effects);
+        self.pump_io(&mut effects);
         batch(effects)
     }
 
     fn handle_read(&mut self, bytes: Vec<u8>) -> Effect<Self> {
+        // This read completed; free the read lane before pumping.
+        self.read_in_flight = false;
         if bytes.is_empty() {
             return self.close_with(Http2ClientOutcome::Closed);
         }
@@ -717,10 +784,7 @@ impl<S: Shard + 'static> Http2ClientConnection<S> {
             self.recv_window = self.recv_window.saturating_add(credit as i32);
             self.enqueue_frame(window_update_frame(0, credit));
         }
-        self.maybe_write_more(&mut effects);
-        if !self.closing_after_write {
-            effects.push(self.read_more());
-        }
+        self.pump_io(&mut effects);
         batch(effects)
     }
 
@@ -1199,13 +1263,15 @@ impl<S: Shard + 'static> Http2ClientConnection<S> {
             }
         }
         self.closing_after_write = true;
-        self.maybe_write_more(&mut effects);
+        self.pump_io(&mut effects);
         batch(effects)
     }
 
     fn handle_wrote(&mut self, n: usize) -> Effect<Self> {
         // Wrote completion: drain the bytes we know flushed, clear the
-        // in-flight flag, then schedule the next write if there is one.
+        // in-flight flag, then let `pump_io` schedule the next write — or,
+        // on the half-duplex TLS rail, arm the response read now that the
+        // write lane is free.
         self.write_in_flight = false;
         if n > 0 && self.pending_write.len() >= n {
             self.pending_write.drain(..n);
@@ -1215,13 +1281,9 @@ impl<S: Shard + 'static> Http2ClientConnection<S> {
                 self.pending_write = next;
             }
         }
-        if !self.pending_write.is_empty() {
-            self.write_more()
-        } else if self.closing_after_write {
-            self.close_now()
-        } else {
-            noop()
-        }
+        let mut effects: Vec<Effect<Self>> = Vec::new();
+        self.pump_io(&mut effects);
+        batch(effects)
     }
 
     fn enqueue_frame(&mut self, frame: Frame) {
@@ -1236,21 +1298,43 @@ impl<S: Shard + 'static> Http2ClientConnection<S> {
         }
     }
 
-    /// Idempotent "kick the writer if it is idle and there is work".
-    /// Mirrors the server's `pending_write.is_empty() && !write_queue.is_empty()`
-    /// guard so callers from many sites never double-arm `tcp_write` and
-    /// trip the driver's per-stream `ResourceBusy` lane check.
-    fn maybe_write_more(&mut self, effects: &mut Vec<Effect<Self>>) {
-        if self.write_in_flight {
+    fn full_duplex(&self) -> bool {
+        matches!(self.stream, Some(ClientStream::Tcp(_)))
+    }
+
+    /// Single entry point that advances connection IO. The TCP rail is
+    /// full duplex (separate read/write lanes, poll-based driver): keep a
+    /// read armed and write whenever there is outbound work. The TLS rail
+    /// shares one lane per stream and is driven by one blocking worker, so
+    /// it runs half-duplex — drain outbound writes first, and only arm a
+    /// read once nothing is queued to write. This matches every caller's
+    /// "I changed the write/read state, now make progress" need without
+    /// double-arming a lane (which would be `ResourceBusy`).
+    fn pump_io(&mut self, effects: &mut Vec<Effect<Self>>) {
+        if self.stream.is_none() {
             return;
         }
-        if self.pending_write.is_empty() && self.write_queue.is_empty() {
-            if self.closing_after_write {
-                effects.push(self.close_now());
+        let full_duplex = self.full_duplex();
+        let has_outbound = !self.pending_write.is_empty() || !self.write_queue.is_empty();
+
+        if has_outbound && !self.write_in_flight && (full_duplex || !self.read_in_flight) {
+            effects.push(self.write_more());
+            // On TLS, a write and a read cannot coexist on the shared
+            // lane; defer the read until the write drains.
+            if !full_duplex {
+                return;
             }
+        } else if self.closing_after_write && !has_outbound && !self.write_in_flight {
+            effects.push(self.close_now());
             return;
         }
-        effects.push(self.write_more());
+
+        if !self.closing_after_write
+            && !self.read_in_flight
+            && (full_duplex || (!self.write_in_flight && !has_outbound))
+        {
+            effects.push(self.read_more());
+        }
     }
 
     fn write_more(&mut self) -> Effect<Self> {
@@ -1274,14 +1358,26 @@ impl<S: Shard + 'static> Http2ClientConnection<S> {
             return noop();
         }
         self.write_in_flight = true;
-        tcp_write(stream, self.pending_write.clone()).then(Http2ClientMsg::Wrote)
+        let bytes = self.pending_write.clone();
+        match stream {
+            ClientStream::Tcp(s) => tcp_write(s, bytes).then(Http2ClientMsg::Wrote),
+            ClientStream::Tls(s) => {
+                tls_write(s, bytes, self.limits.tls_io_timeout).then(Http2ClientMsg::Wrote)
+            }
+        }
     }
 
     fn read_more(&mut self) -> Effect<Self> {
         let Some(stream) = self.stream else {
             return noop();
         };
-        tcp_read(stream, READ_CHUNK).then(Http2ClientMsg::Read)
+        self.read_in_flight = true;
+        match stream {
+            ClientStream::Tcp(s) => tcp_read(s, READ_CHUNK).then(Http2ClientMsg::Read),
+            ClientStream::Tls(s) => {
+                tls_read(s, READ_CHUNK, self.limits.tls_io_timeout).then(Http2ClientMsg::Read)
+            }
+        }
     }
 
     fn close_with(&mut self, outcome: Http2ClientOutcome) -> Effect<Self> {
@@ -1321,7 +1417,12 @@ impl<S: Shard + 'static> Http2ClientConnection<S> {
         let Some(stream) = self.stream else {
             return stop();
         };
-        tcp_close_stream(stream).then(Http2ClientMsg::Closed)
+        match stream {
+            ClientStream::Tcp(s) => tcp_close_stream(s).then(Http2ClientMsg::Closed),
+            ClientStream::Tls(s) => {
+                tls_close(s, self.limits.tls_io_timeout).then(Http2ClientMsg::Closed)
+            }
+        }
     }
 
     fn begin_goaway_shutdown(&mut self) -> Effect<Self> {
@@ -1331,7 +1432,7 @@ impl<S: Shard + 'static> Http2ClientConnection<S> {
         self.enqueue_frame(goaway_frame(self.next_stream_id, ERR_NO_ERROR));
         self.closing_after_write = true;
         let mut effects: Vec<Effect<Self>> = Vec::new();
-        self.maybe_write_more(&mut effects);
+        self.pump_io(&mut effects);
         batch(effects)
     }
 }

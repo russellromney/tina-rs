@@ -36,10 +36,10 @@ impl AlpnProtocols {
         Self(AlpnProtocolsRepr::None)
     }
 
-    /// Offer only `h2`. A server that does not negotiate `h2` causes the
-    /// runtime to surface [`tina_runtime::CallError::TlsHandshake`] today;
-    /// once the typed ALPN rail lands, the failure becomes a distinct
-    /// `TlsAlpnMismatch` variant carried back through `Http2ClientOutcome`.
+    /// Offer only `h2`. If the server does not negotiate `h2`, the TLS
+    /// rail fails the connect with `tina_runtime::CallError::TlsAlpnMismatch`,
+    /// which the native HTTP/2 client surfaces as
+    /// `Http2ClientOutcome::TlsAlpnMismatch`.
     pub fn h2() -> Self {
         Self(AlpnProtocolsRepr::H2)
     }
@@ -47,6 +47,15 @@ impl AlpnProtocols {
     /// Returns true if the ALPN list is `h2`.
     pub fn is_h2(&self) -> bool {
         matches!(self.0, AlpnProtocolsRepr::H2)
+    }
+
+    /// Wire-byte ALPN protocol list for the TLS rail (`tls_connect_alpn`
+    /// / `tls_bind_alpn`). Empty means "offer no ALPN".
+    pub(crate) fn wire(&self) -> Vec<Vec<u8>> {
+        match self.0 {
+            AlpnProtocolsRepr::None => Vec::new(),
+            AlpnProtocolsRepr::H2 => vec![b"h2".to_vec()],
+        }
     }
 }
 
