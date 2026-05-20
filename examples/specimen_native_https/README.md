@@ -9,10 +9,7 @@ identically: `GET /counter → POST × 3 → GET /counter → GET /missing`.
 The complement of [`specimen_native_http`](../specimen_native_http/README.md);
 this is the *server* comparison for HTTPS specifically. The Tina HTTPS
 **client** (`HttpClient` over `HttpTarget::Https`) is exercised by the
-integration tests in `tina-http/tests/client_tls_smoke.rs` — it cannot
-share a runtime with `HttpsListener` in first form because the
-runtime's TLS lane has one worker thread and both sides of a
-handshake would deadlock.
+integration tests in `tina-http/tests/client_tls_smoke.rs`.
 
 ## Run
 
@@ -73,11 +70,11 @@ no atomics — the isolate owns it).
   `TlsName`, `TlsCertificate`, `TlsHandshake`, `TlsFull`,
   `TlsClosed`, or `Timeout`. They do *not* collapse into a generic
   `Connect`/`Read`/`Write`.
-- **The HTTPS client side is in tests, not the example.** Tina's
-  TLS lane is single-worker; running an HTTPS server *and* an HTTPS
-  client on the same shard deadlocks the handshake. The integration
-  tests prove the client side end-to-end against a thread-spawned
-  rustls server. A multi-worker TLS lane is deferred.
+- **The HTTPS client side is in tests, not the example.** The
+  integration tests prove the client side end-to-end against a
+  thread-spawned rustls server. The runtime TLS lane is bounded:
+  each in-flight TLS operation occupies one worker slot up to
+  `tls_lane_capacity`.
 
 ## Where the boring deferred work lives
 

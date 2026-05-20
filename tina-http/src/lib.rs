@@ -66,10 +66,9 @@
 //! `TlsFull`, `TlsClosed`, `Timeout`, `Io`). Plain TCP keeps the flat
 //! `Connect`/`Read`/`Write`/`Closed`/`Timeout` variants.
 //!
-//! TLS state machine is `rustls`, driven by the runtime's
-//! single-worker TLS lane. First form does not target high HTTPS
-//! concurrency — see [`HttpsServerConfig`] for the lane-yield
-//! trade-off.
+//! TLS state machine is `rustls`, driven by the runtime's bounded TLS
+//! lane. Each in-flight TLS operation occupies one worker slot up to
+//! the configured lane capacity.
 //!
 //! HTTP/2: [`Http2Listener`] is a prior-knowledge cleartext h2c
 //! server first form. It owns the TCP stream, frame parsing, bounded

@@ -37,14 +37,13 @@ impl TlsServerIdentity {
     }
 }
 
-/// HTTPS listener config. Two distinct TLS deadlines because the
-/// runtime's TLS lane has one worker thread per shard: a long
-/// in-flight `tls_accept` blocks live connections' reads/writes.
+/// HTTPS listener config. Two distinct TLS deadlines keep accept polling
+/// and per-stream I/O honest under bounded TLS lane capacity.
 ///
 /// `tls_accept_timeout` is short (default 250ms) so the listener
-/// re-polls and the worker yields between accepts. `tls_io_timeout`
-/// bounds individual `tls_read`/`tls_write`/`tls_close` ops. First
-/// form is not designed for high HTTPS concurrency.
+/// re-polls instead of parking one lane slot forever on an idle
+/// listener. `tls_io_timeout` bounds individual
+/// `tls_read`/`tls_write`/`tls_close` ops.
 #[derive(Debug, Clone)]
 pub struct HttpsServerConfig {
     pub http: HttpServerConfig,

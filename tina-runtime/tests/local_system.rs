@@ -4,7 +4,7 @@ use std::fs;
 use std::io::{Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::path::PathBuf;
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -635,6 +635,102 @@ impl TlsServerService {
                 self.observed
                     .lock()
                     .expect("tls server observed lock")
+                    .push("failed:unexpected-shape".to_string());
+                noop()
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum MultiTlsServerMsg {
+    Start,
+    Bound(Result<(TlsListenerId, SocketAddr), CallError>),
+    Accepted(Result<(TlsStreamId, SocketAddr), CallError>, TlsListenerId),
+    Read(Result<Vec<u8>, CallError>, TlsStreamId),
+    Wrote(Result<usize, CallError>, TlsStreamId),
+    Closed(Result<(), CallError>),
+}
+
+#[derive(Debug)]
+struct MultiTlsServerService {
+    observed: Arc<Mutex<Vec<String>>>,
+    cert_der: Vec<u8>,
+    key_der: Vec<u8>,
+    accepts: usize,
+}
+
+#[tina_runtime::isolate(message = MultiTlsServerMsg, shard = AppShard)]
+impl MultiTlsServerService {
+    fn handle(
+        &mut self,
+        msg: MultiTlsServerMsg,
+        _ctx: &mut Context<'_, AppShard, Self::Reply>,
+    ) -> Effect<Self> {
+        match msg {
+            MultiTlsServerMsg::Start => tls_bind(
+                "127.0.0.1:0".parse().expect("loopback"),
+                vec![self.cert_der.clone()],
+                self.key_der.clone(),
+            )
+            .then(MultiTlsServerMsg::Bound),
+            MultiTlsServerMsg::Bound(Ok((listener, local_addr))) => {
+                self.observed
+                    .lock()
+                    .expect("multi tls observed lock")
+                    .push(format!("bound:{local_addr}"));
+                tls_accept(listener, Duration::from_secs(5))
+                    .then(move |result| MultiTlsServerMsg::Accepted(result, listener))
+            }
+            MultiTlsServerMsg::Accepted(Ok((stream, peer)), listener) => {
+                self.accepts += 1;
+                self.observed
+                    .lock()
+                    .expect("multi tls observed lock")
+                    .push(format!("accepted:{}:{peer}", self.accepts));
+                let read = tls_read(stream, 4, Duration::from_secs(5))
+                    .then(move |result| MultiTlsServerMsg::Read(result, stream));
+                if self.accepts == 1 {
+                    // The first stream intentionally goes quiet after TLS
+                    // handshake. Put its read before the next accept so the
+                    // old serial TLS worker head-of-line-blocks the second
+                    // connection.
+                    batch(vec![
+                        read,
+                        tls_accept(listener, Duration::from_secs(5))
+                            .then(move |result| MultiTlsServerMsg::Accepted(result, listener)),
+                    ])
+                } else {
+                    read
+                }
+            }
+            MultiTlsServerMsg::Read(Ok(bytes), stream) if bytes == b"ping" => {
+                tls_write(stream, b"pong".to_vec(), Duration::from_secs(5))
+                    .then(move |result| MultiTlsServerMsg::Wrote(result, stream))
+            }
+            MultiTlsServerMsg::Wrote(Ok(4), stream) => {
+                self.observed
+                    .lock()
+                    .expect("multi tls observed lock")
+                    .push("wrote:4".to_string());
+                tls_close(stream, Duration::from_secs(5)).then(MultiTlsServerMsg::Closed)
+            }
+            MultiTlsServerMsg::Closed(Ok(())) => noop(),
+            MultiTlsServerMsg::Bound(Err(error))
+            | MultiTlsServerMsg::Accepted(Err(error), _)
+            | MultiTlsServerMsg::Read(Err(error), _)
+            | MultiTlsServerMsg::Wrote(Err(error), _)
+            | MultiTlsServerMsg::Closed(Err(error)) => {
+                self.observed
+                    .lock()
+                    .expect("multi tls observed lock")
+                    .push(format!("failed:{error:?}"));
+                noop()
+            }
+            MultiTlsServerMsg::Read(Ok(_), _) | MultiTlsServerMsg::Wrote(Ok(_), _) => {
+                self.observed
+                    .lock()
+                    .expect("multi tls observed lock")
                     .push("failed:unexpected-shape".to_string());
                 noop()
             }
@@ -1478,6 +1574,31 @@ fn wait_for_addr(published: &Arc<Mutex<Option<SocketAddr>>>) -> SocketAddr {
         .expect("service did not publish address before timeout")
 }
 
+fn connect_rustls_client(
+    addr: SocketAddr,
+    cert_der: Vec<u8>,
+) -> rustls::StreamOwned<rustls::ClientConnection, TcpStream> {
+    let tcp = TcpStream::connect(addr).expect("connect tls server");
+    let mut roots = rustls::RootCertStore::empty();
+    roots
+        .add(rustls::pki_types::CertificateDer::from(cert_der))
+        .expect("add root cert");
+    let config = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    let server_name = rustls::pki_types::ServerName::try_from("localhost").expect("server name");
+    let connection =
+        rustls::ClientConnection::new(Arc::new(config), server_name).expect("client connection");
+    let mut stream = rustls::StreamOwned::new(connection, tcp);
+    while stream.conn.is_handshaking() {
+        stream
+            .conn
+            .complete_io(&mut stream.sock)
+            .expect("client handshake");
+    }
+    stream
+}
+
 fn wait_for_flag(flag: &Arc<(Mutex<bool>, Condvar)>) {
     let deadline = Instant::now() + Duration::from_secs(2);
     let (lock, cv) = &**flag;
@@ -2245,6 +2366,122 @@ fn local_system_tls_server_accepts_reads_writes_and_closes() {
             terminal.trace()
         );
     }
+}
+
+#[test]
+fn local_system_tls_quiet_stream_does_not_block_second_connection() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
+        .expect("generate local cert");
+    let cert_der = certified.cert.der().to_vec();
+    let key_der = certified.key_pair.serialize_der();
+
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let config = LocalSystemConfig {
+        tls_lane_capacity: 4,
+        ..LocalSystemConfig::default()
+    };
+    let app = LocalSystem::single_shard(AppShard(430), AppMailboxFactory)
+        .config(config)
+        .trace_retention(TraceRetention::Bounded(256))
+        .build();
+    let address = app
+        .register_root::<MultiTlsServerService, Infallible>(
+            MultiTlsServerService {
+                observed: Arc::clone(&observed),
+                cert_der: cert_der.clone(),
+                key_der,
+                accepts: 0,
+            },
+            16,
+        )
+        .expect("register multi tls server service");
+
+    app.try_send(address, MultiTlsServerMsg::Start)
+        .expect("start multi tls server");
+    wait_until(|| {
+        observed
+            .lock()
+            .expect("multi tls observed lock")
+            .iter()
+            .any(|entry| entry.starts_with("bound:"))
+    });
+    let addr: SocketAddr = observed
+        .lock()
+        .expect("multi tls observed lock")
+        .iter()
+        .find_map(|entry| entry.strip_prefix("bound:").map(str::to_string))
+        .expect("bound addr")
+        .parse()
+        .expect("parse bound addr");
+
+    let (release_slow, slow_release) = mpsc::channel();
+    let slow_cert = cert_der.clone();
+    let slow = thread::spawn(move || {
+        let _stream = connect_rustls_client(addr, slow_cert);
+        let _ = slow_release.recv_timeout(Duration::from_secs(5));
+    });
+    wait_until(|| {
+        observed
+            .lock()
+            .expect("multi tls observed lock")
+            .iter()
+            .any(|entry| entry.starts_with("accepted:1:"))
+    });
+
+    let (done, finished) = mpsc::channel();
+    let fast = thread::spawn(move || {
+        let mut stream = connect_rustls_client(addr, cert_der);
+        stream.write_all(b"ping").expect("write fast ping");
+        stream.flush().expect("flush fast ping");
+        let mut response = [0_u8; 4];
+        stream.read_exact(&mut response).expect("read fast pong");
+        done.send(response).expect("send fast result");
+    });
+    let response = finished
+        .recv_timeout(Duration::from_millis(750))
+        .expect("second TLS client must not wait behind quiet first stream");
+    assert_eq!(&response, b"pong");
+
+    release_slow.send(()).expect("release slow client");
+    slow.join().expect("slow tls client");
+    fast.join().expect("fast tls client");
+    let terminal = app
+        .shutdown()
+        .drain()
+        .join()
+        .expect("local system shutdown");
+    assert!(
+        terminal
+            .trace()
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event.kind(),
+                    RuntimeEventKind::CallCompleted {
+                        call_kind: CallKind::TlsAccept,
+                        ..
+                    }
+                )
+            })
+            .count()
+            >= 2,
+        "second TLS accept must complete; trace: {:?}",
+        terminal.trace()
+    );
+    assert!(
+        terminal.trace().iter().any(|event| {
+            matches!(
+                event.kind(),
+                RuntimeEventKind::CallCompleted {
+                    call_kind: CallKind::TlsRead,
+                    ..
+                }
+            )
+        }),
+        "fast TLS read must complete; trace: {:?}",
+        terminal.trace()
+    );
 }
 
 #[test]
