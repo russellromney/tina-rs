@@ -1,15 +1,11 @@
-error[E0451]: fields `inner` and `_key` of struct `KeyedPermit` are private
-  --> tests/admission_compile_fail/keyed_permit_forged.rs:12:9
+error: cannot construct `KeyedPermit<_>` with struct literal syntax due to private fields
+  --> tests/admission_compile_fail/keyed_permit_forged.rs:11:37
    |
 11 |     let _forged: KeyedPermit<u32> = KeyedPermit {
-   |                                     ----------- in this type
+   |                                     ^^^^^^^^^^^
 12 |         inner: None,
-   |         ^^^^^ private field
+   |         ----------- private field
 13 |         _key: PhantomData,
-   |         ^^^^ private field
-
-error: type `admission::KeyedPermitInner` is private
-  --> tests/admission_compile_fail/keyed_permit_forged.rs:12:16
+   |         ----------------- private field
    |
-12 |         inner: None,
-   |                ^^^^ private type
+   = note: ...and other private field `gate_id` that was not provided

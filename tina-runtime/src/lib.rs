@@ -82,9 +82,9 @@ mod trace;
 pub mod wait_list;
 
 pub use admission::{
-    AdmissionDecision, AdmissionFailure, AdmissionReport, ConcurrencyLimit, KeyedLimit,
-    KeyedPermit, KeyedReleaseError, KeyedSlotReport, PressureAction, RateGrant, RateKeyState,
-    RateLimit,
+    AdmissionDecision, AdmissionFailure, AdmissionReport, ConcurrencyLimit, ConcurrencyPermit,
+    ConcurrencyReleaseError, KeyedLimit, KeyedPermit, KeyedReleaseError, KeyedSlotReport,
+    PressureAction, RateGrant, RateKeyState, RateLimit, SurfaceName,
 };
 pub use drain_state::{AdmitDecision, DrainReport, DrainStage, DrainState};
 pub use errors::{

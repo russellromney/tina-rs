@@ -23,7 +23,7 @@ use tina::capacity::{CapacityMode, CapacitySurfaceReport};
 use tina::time::Backoff;
 use tina_runtime::{
     AdmissionDecision, AdmissionFailure, CapacitySummary, ConcurrencyLimit, FullDecision,
-    FullExhaustionReason, FullHandling, KeyedLimit, PressureAction, RateLimit,
+    FullExhaustionReason, FullHandling, KeyedLimit, PressureAction, RateLimit, SharedCapacityScope,
     format_discovery_line,
 };
 
@@ -261,4 +261,108 @@ fn capacity_surface_round_trips_for_tuning_mode() {
     assert_eq!(surface.mode, CapacityMode::Tuning);
     let line = format_discovery_line(&surface);
     assert!(line.contains("mode=tuning"), "expected tuning mode: {line}");
+}
+
+#[test]
+fn two_routes_share_one_weighted_budget_via_concurrency_limit() {
+    // The composition the api-gateway specimen does by hand, now first-class:
+    // two ConcurrencyLimits, each with its own local cap, sharing one
+    // weighted SharedCapacityScope. One route fills the shared budget; the
+    // other sees a typed Full whose surface names the shared scope.
+    let scope = SharedCapacityScope::new("gateway.in_flight", "weight", 4);
+    let mut upload =
+        ConcurrencyLimit::with_capacity("route.upload", 8).with_shared_scope(scope.clone(), 2);
+    let mut list =
+        ConcurrencyLimit::with_capacity("route.list", 8).with_shared_scope(scope.clone(), 1);
+
+    // Two uploads fill the shared budget (2 * 2 = 4 of 4).
+    let u1 = upload.try_admit().into_admitted().expect("upload 1");
+    let u2 = upload.try_admit().into_admitted().expect("upload 2");
+    assert_eq!(scope.snapshot().current, 4);
+
+    // A list request needs weight 1 but the shared budget is full → Full.
+    // The list route's local gate (cap 8) had room, so the rejection is the
+    // shared surface, and the local permit was rolled back.
+    match list.try_admit() {
+        AdmissionDecision::Full(_) => {}
+        other => panic!("expected shared-budget Full, got {other:?}"),
+    }
+    assert_eq!(list.report().current, 0, "local permit rolled back");
+
+    // Capacity summary shows both routes decorated with the shared scope.
+    let mut summary = CapacitySummary::new();
+    summary.push(upload.capacity_surface()).unwrap();
+    summary.push(list.capacity_surface()).unwrap();
+    let upload_surface = summary.surface("route.upload").report().unwrap();
+    assert_eq!(
+        upload_surface.shared_scope.as_deref(),
+        Some("gateway.in_flight")
+    );
+    assert_eq!(upload_surface.shared_current_weight, Some(4));
+
+    // Release one upload; the freed weight lets a list request through.
+    upload.release(u1).unwrap();
+    assert_eq!(scope.snapshot().current, 2);
+    let l1 = list.try_admit().into_admitted().expect("list after free");
+    upload.release(u2).unwrap();
+    list.release(l1).unwrap();
+    assert_eq!(scope.snapshot().current, 0, "all shared weight released");
+}
+
+#[test]
+fn rate_limit_replay_is_deterministic_across_refill_and_eviction() {
+    // Stronger replay proof than the unit test: the script mixes multiple
+    // keys, time advances, an explicit eviction, a table-full rejection,
+    // and refills. `now` is supplied by the caller exactly as a simulator
+    // would supply `ctx.now()`. Two independent runs over the identical
+    // (key, now, eviction) script must produce identical decision strings.
+    let base = Instant::now();
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum Step {
+        Admit(&'static str, u64),
+        Evict(&'static str),
+    }
+    let script = [
+        Step::Admit("a", 0),
+        Step::Admit("a", 0),
+        Step::Admit("b", 0),
+        Step::Admit("c", 0), // table full (max_keys = 2) after a, b
+        Step::Evict("a"),
+        Step::Admit("c", 0), // now fits
+        Step::Admit("b", 100),
+        Step::Admit("c", 250),
+    ];
+
+    let run = || -> Vec<String> {
+        // max_keys 2, 10 tokens/sec, burst 1.
+        let mut limit = RateLimit::<&'static str>::new("rate.replay.strong", 2, 10, 1);
+        script
+            .iter()
+            .map(|step| match step {
+                Step::Admit(key, ms) => {
+                    let now = base + Duration::from_millis(*ms);
+                    match limit.try_admit(key, now) {
+                        AdmissionDecision::Admitted(_) => format!("{key}@{ms}=ok"),
+                        AdmissionDecision::RateLimited { retry_after, .. } => {
+                            format!("{key}@{ms}=rate({}ms)", retry_after.as_millis())
+                        }
+                        AdmissionDecision::Full(_) => format!("{key}@{ms}=full"),
+                        other => format!("{key}@{ms}=other({other:?})"),
+                    }
+                }
+                Step::Evict(key) => {
+                    format!("evict({key})={}", limit.evict_key_for_capacity(key))
+                }
+            })
+            .collect()
+    };
+
+    let first = run();
+    let second = run();
+    assert_eq!(first, second, "replay must be byte-identical: {first:?}");
+    // Sanity: the script must exercise full, rate, and eviction paths.
+    assert!(first.iter().any(|s| s.contains("=full")), "{first:?}");
+    assert!(first.iter().any(|s| s.contains("=rate(")), "{first:?}");
+    assert!(first.iter().any(|s| s.starts_with("evict")), "{first:?}");
 }

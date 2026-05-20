@@ -6,24 +6,54 @@ This file records completed work.
 
 ### Admission And Rate Policy
 
-(Pre-merge tightening — see "Pre-merge fixes" below for the deltas
-against the original landing.)
+(Pre-merge tightening — see the two "fixes" sections below for the
+deltas against the original landing.)
 
-#### Pre-merge fixes
+#### Pre-merge hardening (round 2)
 
-- `KeyedLimit` and `RateLimit` now track `live_keys` as an `O(1)`
-  field instead of scanning all slots on every `report()`. The field
-  is incremented when a fresh slot is allocated and decremented when
-  a slot is freed (final permit release for `KeyedLimit`, explicit
-  eviction for `RateLimit`).
-- `KeyedLimit::try_admit` and `RateLimit::try_admit` now take `&K`
-  instead of `K`. The hot path (existing key) is allocation-free even
-  for `K = String`; the key is only cloned on the new-slot
-  allocation path.
+- **Gate-tagged permits.** Every `ConcurrencyLimit` / `KeyedLimit` gets
+  a process-unique gate id; permits carry it. Releasing a permit on a
+  *different* limit instance returns `WrongGate` (with the permit handed
+  back) instead of silently decrementing the wrong slot. Closes the
+  cross-instance soundness gap (`ConcurrencyLimit` now issues a
+  `ConcurrencyPermit` wrapper for this; `KeyedReleaseError` is generic
+  over `K`).
+- **Shared-scope composition.** `ConcurrencyLimit::with_shared_scope`
+  charges a `SharedCapacityScope` alongside the local gate (two-phase,
+  with rollback on shared-budget full). The `ConcurrencyPermit` owns the
+  `SharedLease`; releasing or dropping it releases both. The capacity
+  surface is decorated with the scope columns.
+- **`PressureAction` on all three policies.** `KeyedLimit` and
+  `RateLimit` now honor shed/degrade/close/wait on their hard-full path
+  (`RateLimit`'s per-key rate decision still always returns
+  `RateLimited { retry_after }`, which is more useful than a generic
+  degrade).
+- **Report polish.** `AdmissionReport` gains an `evicted_count` field
+  (telemetry, *not* counted as a rejection), `Display` for
+  `AdmissionReport` and `AdmissionFailure` (grep-friendly lines;
+  `AdmissionFailure: std::error::Error`), and `surface` is now
+  `Cow<'static, str>` so per-route/per-tenant names built at runtime
+  work without leaking.
+- **Tests.** Cross-instance release rejection (both limits), shared-scope
+  composition + permit-drop release, `PressureAction` on keyed/rate,
+  `close()` with live state for both keyed and rate, mode round-trip,
+  evict-during-grant, and high-N churn/stress correctness for the
+  `live_keys` field. Lib admission tests: 36 (was 20); integration
+  proofs: 10 (was 8).
+
+#### Pre-merge fixes (round 1)
+
+- `KeyedLimit` and `RateLimit` track `live_keys` as an `O(1)` field
+  instead of scanning all slots on every `report()`.
+- `KeyedLimit::try_admit` and `RateLimit::try_admit` take `&K` instead
+  of `K`. The hot path (existing key) is allocation-free even for
+  `K = String`; the key is only cloned on the new-slot allocation path.
 - `RateLimit::forget_key` renamed to `evict_key_for_capacity` with an
   explicit doc that it is a policy-owned lever, not a request-path
-  helper, plus an `evicted_count` telemetry counter and a test that
-  asserts eviction resets bucket state and bumps the counter.
+  helper, plus an `evicted_count` telemetry counter.
+- Fixed a double-count: `ConcurrencyLimit.report().full_count` now
+  counts only decisions that surfaced as `Full(_)`; the underlying gate
+  view is exposed separately as `gate_full_count()`.
 
 #### What landed originally
 

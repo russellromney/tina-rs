@@ -27,13 +27,70 @@
 //! Retry remains caller-owned. Pair these policies with [`FullHandling`]
 //! when retry-with-backoff is the right answer, or treat each rejection as
 //! terminal.
+//!
+//! # Design notes and deliberate non-features
+//!
+//! These are choices, not gaps. They are documented here so the boundaries
+//! are explicit:
+//!
+//! - **No retry inside admission.** None of these types retry. The only
+//!   retry path is the separate [`FullHandling`], whose
+//!   `retry_backoff(Backoff)` constructor *requires* an explicit
+//!   [`tina::time::Backoff`] value — there is no way to get retry behavior
+//!   without naming a budget, and the caller still owns idempotency.
+//! - **Eviction cannot be type-state-locked to policy code.** A handler
+//!   that owns `&mut self` (and therefore `&mut limit`) inside an isolate
+//!   can call any method. True request-vs-admin separation would require
+//!   splitting ownership across isolates, which is disproportionate here.
+//!   [`RateLimit::evict_key_for_capacity`] is therefore enforced by
+//!   convention + the `evicted_count` telemetry counter, not by the type
+//!   system.
+//! - **[`KeyedLimit`] has no eviction.** Its slots hold live, move-only
+//!   permits; evicting a key with outstanding permits would orphan them.
+//!   Slots free themselves when the last permit is released. There is no
+//!   meaningful eviction to expose.
+//! - **Per-key storage owns `K`.** Lookups borrow (`try_admit(&K)`), so the
+//!   hot path of an existing key is allocation-free. A new key is cloned
+//!   once when its slot is allocated, and the stored `K` is dropped when the
+//!   slot frees. For `K = String` that is one alloc per *slot allocation*,
+//!   not per request.
+//! - **[`AdmissionDecision`] is sized at its largest variant** (it carries an
+//!   [`AdmissionReport`]). It is meant to be matched and discarded at the
+//!   admission site, not stored. [`AdmissionDecision::into_admitted`] keeps
+//!   the failure arm by value for `?`-style flows.
+//! - **Dropped permits feed a process-wide counter.** Permits are
+//!   leak-detected through [`crate::dropped_permit_count`], a global; this is
+//!   intentional, since a permit's `Drop` has no back-reference to its gate.
 
+use std::borrow::Cow;
+use std::fmt;
 use std::marker::PhantomData;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use tina::capacity::{CapacityMode, CapacitySurfaceReport};
 
 use crate::local_permit::{LocalPermitGate, LocalPermitName, Permit};
+use crate::shared_scope::{SharedCapacityScope, SharedLease};
+
+/// Process-wide source of unique gate identifiers.
+///
+/// Every admission policy that issues move-only permits stamps each permit
+/// with its gate's id. Release checks the id so a permit cannot be released
+/// against a *different* policy instance (which could otherwise decrement
+/// the wrong slot when two gates share the same generation/slot layout).
+static NEXT_GATE_ID: AtomicU64 = AtomicU64::new(1);
+
+fn next_gate_id() -> u64 {
+    NEXT_GATE_ID.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Surface name carried by an admission policy and its reports.
+///
+/// `Cow<'static, str>` so the common case (a string literal known at compile
+/// time) stays allocation-free, while services that name surfaces per route
+/// or per tenant at runtime can pass an owned `String`.
+pub type SurfaceName = Cow<'static, str>;
 
 /// What the caller wants to happen when the policy is full.
 ///
@@ -62,7 +119,7 @@ pub enum PressureAction {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AdmissionReport {
     /// Surface name, mirroring [`CapacitySurfaceReport::name`].
-    pub surface: &'static str,
+    pub surface: SurfaceName,
     /// How the cap was chosen (Fixed/Tuning/Unbounded-for-now).
     pub mode: CapacityMode,
     /// Configured concurrency cap. For [`RateLimit`] this reflects the
@@ -85,10 +142,18 @@ pub struct AdmissionReport {
     /// Times the policy returned `TimedOut`. Set by callers that drive a
     /// caller-owned deadline (see [`AdmissionDecision::timed_out`]).
     pub timed_out_count: u64,
+    /// Times an explicit policy eviction freed a key
+    /// ([`RateLimit::evict_key_for_capacity`]). This is **not** a rejection
+    /// and does not contribute to [`Self::any_rejection`] or the
+    /// capacity-surface `full_count`; it is admin-action telemetry so a
+    /// runaway counter (a request-path bypass) stays visible.
+    pub evicted_count: u64,
 }
 
 impl AdmissionReport {
     /// `true` if any rejection category has been observed.
+    ///
+    /// Eviction is excluded — it is an admin action, not a rejection.
     pub const fn any_rejection(&self) -> bool {
         self.full_count > 0
             || self.rate_limited_count > 0
@@ -98,25 +163,54 @@ impl AdmissionReport {
             || self.timed_out_count > 0
     }
 
+    /// Sum of every rejection category.
+    pub const fn total_rejections(&self) -> u64 {
+        self.full_count
+            .saturating_add(self.rate_limited_count)
+            .saturating_add(self.wait_count)
+            .saturating_add(self.degrade_count)
+            .saturating_add(self.closed_count)
+            .saturating_add(self.timed_out_count)
+    }
+
     /// Project this report onto a [`CapacitySurfaceReport`].
     ///
     /// Count fields map directly. `full_count` aggregates every rejection
     /// category that means "we did not admit": full + rate-limited + wait +
     /// degrade + closed + timed-out. This keeps `summary.any_full()` honest
     /// for admission surfaces — any rejection counts as overload truth.
+    /// `evicted_count` is intentionally excluded; eviction is not overload.
     pub fn capacity_surface(&self) -> CapacitySurfaceReport {
         CapacitySurfaceReport::count(
-            self.surface,
+            self.surface.clone().into_owned(),
             self.mode.clone(),
             self.capacity,
             self.current,
             self.high_water,
-            self.full_count
-                .saturating_add(self.rate_limited_count)
-                .saturating_add(self.wait_count)
-                .saturating_add(self.degrade_count)
-                .saturating_add(self.closed_count)
-                .saturating_add(self.timed_out_count),
+            self.total_rejections(),
+        )
+    }
+}
+
+impl fmt::Display for AdmissionReport {
+    /// One grep-friendly `key=value` line, mirroring the capacity
+    /// discovery shape.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "admission surface={} mode={} cap={} cur={} high={} full={} rate_limited={} wait={} degrade={} closed={} timed_out={} evicted={}",
+            self.surface,
+            self.mode.label(),
+            self.capacity,
+            self.current,
+            self.high_water,
+            self.full_count,
+            self.rate_limited_count,
+            self.wait_count,
+            self.degrade_count,
+            self.closed_count,
+            self.timed_out_count,
+            self.evicted_count,
         )
     }
 }
@@ -274,7 +368,44 @@ impl AdmissionFailure {
             | Self::Wait { report: r, .. } => r,
         }
     }
+
+    /// Short kind label for logs.
+    pub const fn kind(&self) -> &'static str {
+        match self {
+            Self::Full(_) => "full",
+            Self::RateLimited { .. } => "rate_limited",
+            Self::Wait { .. } => "wait",
+            Self::Degrade { .. } => "degrade",
+            Self::Closed(_) => "closed",
+            Self::TimedOut(_) => "timed_out",
+        }
+    }
 }
+
+impl fmt::Display for AdmissionFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::RateLimited {
+                retry_after,
+                report,
+            } => write!(
+                f,
+                "admission_rejected={} retry_after_ms={} ({report})",
+                self.kind(),
+                retry_after.as_millis()
+            ),
+            Self::Wait { delay, report } => write!(
+                f,
+                "admission_rejected={} wait_ms={} ({report})",
+                self.kind(),
+                delay.as_millis()
+            ),
+            other => write!(f, "admission_rejected={} ({})", self.kind(), other.report()),
+        }
+    }
+}
+
+impl std::error::Error for AdmissionFailure {}
 
 // -----------------------------------------------------------------------------
 // ConcurrencyLimit
@@ -282,16 +413,28 @@ impl AdmissionFailure {
 
 /// Fixed-capacity local concurrency policy.
 ///
-/// Thin wrapper over [`LocalPermitGate`] that returns [`AdmissionDecision`]
+/// Wrapper over [`LocalPermitGate`] that returns [`AdmissionDecision`]
 /// instead of `Result<Permit, LocalPermitFull>` so it composes with the rest
 /// of the admission vocabulary. The action on full is configurable: shed,
 /// degrade, close, or hint a wait.
+///
+/// Optionally charges a shared [`SharedCapacityScope`] alongside the local
+/// gate (see [`with_shared_scope`](Self::with_shared_scope)) so several
+/// routes can share one weighted budget while each keeps its own local cap.
+///
+/// Admission returns a [`ConcurrencyPermit`], which is stamped with this
+/// limit's process-unique gate id. Releasing a permit on a *different*
+/// `ConcurrencyLimit` is rejected with [`ConcurrencyReleaseError::WrongGate`]
+/// (and the permit is handed back) instead of silently decrementing the
+/// wrong gate.
 #[derive(Debug)]
 #[must_use = "ConcurrencyLimit is state; store it on the isolate"]
 pub struct ConcurrencyLimit {
-    surface: &'static str,
+    surface: SurfaceName,
+    gate_id: u64,
     mode: CapacityMode,
     gate: LocalPermitGate,
+    shared: Option<SharedScopeBinding>,
     action: PressureAction,
     wait_hint: Duration,
     closed: bool,
@@ -306,13 +449,31 @@ pub struct ConcurrencyLimit {
     full_decision_count: u64,
 }
 
+#[derive(Debug)]
+struct SharedScopeBinding {
+    scope: SharedCapacityScope,
+    weight: usize,
+}
+
 impl ConcurrencyLimit {
     /// Build a shed-on-full concurrency limit.
-    pub fn with_capacity(surface: &'static str, capacity: usize) -> Self {
+    pub fn with_capacity(surface: impl Into<SurfaceName>, capacity: usize) -> Self {
+        let surface = surface.into();
+        // LocalPermitName needs a `&'static str`; only static surfaces get a
+        // gate name. The admission report always carries the full surface
+        // (static or owned), so dynamic names are not lost.
+        let gate = match &surface {
+            Cow::Borrowed(name) => {
+                LocalPermitGate::with_capacity(capacity).named(LocalPermitName(name))
+            }
+            Cow::Owned(_) => LocalPermitGate::with_capacity(capacity),
+        };
         Self {
             surface,
+            gate_id: next_gate_id(),
             mode: CapacityMode::Fixed,
-            gate: LocalPermitGate::with_capacity(capacity).named(LocalPermitName(surface)),
+            gate,
+            shared: None,
             action: PressureAction::Shed,
             wait_hint: Duration::ZERO,
             closed: false,
@@ -331,63 +492,128 @@ impl ConcurrencyLimit {
     }
 
     /// Choose what to return on full.
-    pub const fn on_pressure(mut self, action: PressureAction) -> Self {
+    pub fn on_pressure(mut self, action: PressureAction) -> Self {
         self.action = action;
         self
     }
 
     /// Set the wait hint returned when `PressureAction::Wait` is selected.
     /// Ignored for other actions.
-    pub const fn wait_hint(mut self, delay: Duration) -> Self {
+    pub fn wait_hint(mut self, delay: Duration) -> Self {
         self.wait_hint = delay;
         self
     }
 
+    /// Also charge a shared weighted budget on each admission.
+    ///
+    /// On `try_admit`, the local gate is charged first; if it admits, the
+    /// shared scope is charged `weight`. If the scope is full, the local
+    /// permit is released immediately and the decision is the configured
+    /// pressure outcome (default `Full`) with the report decorated by the
+    /// shared scope's columns. The returned [`ConcurrencyPermit`] owns the
+    /// [`SharedLease`]; releasing or dropping it releases both.
+    pub fn with_shared_scope(mut self, scope: SharedCapacityScope, weight: usize) -> Self {
+        self.shared = Some(SharedScopeBinding { scope, weight });
+        self
+    }
+
+    /// This limit's process-unique gate id.
+    pub const fn gate_id(&self) -> u64 {
+        self.gate_id
+    }
+
     /// Try to admit one new permit.
-    pub fn try_admit(&mut self) -> AdmissionDecision<Permit> {
+    pub fn try_admit(&mut self) -> AdmissionDecision<ConcurrencyPermit> {
         if self.closed {
             self.closed_count = self.closed_count.saturating_add(1);
             return AdmissionDecision::Closed(self.report());
         }
-        match self.gate.try_admit() {
-            Ok(permit) => AdmissionDecision::Admitted(permit),
-            Err(_) => match self.action {
-                PressureAction::Shed => {
-                    self.full_decision_count = self.full_decision_count.saturating_add(1);
-                    AdmissionDecision::Full(self.report())
-                }
-                PressureAction::Degrade => {
-                    self.degrade_count = self.degrade_count.saturating_add(1);
-                    AdmissionDecision::Degrade {
-                        report: self.report(),
-                    }
-                }
-                PressureAction::Close => {
-                    self.closed_count = self.closed_count.saturating_add(1);
-                    AdmissionDecision::Closed(self.report())
-                }
-                PressureAction::Wait => {
-                    self.wait_count = self.wait_count.saturating_add(1);
-                    AdmissionDecision::Wait {
-                        delay: self.wait_hint,
-                        report: self.report(),
-                    }
+        let permit = match self.gate.try_admit() {
+            Ok(permit) => permit,
+            Err(_) => return self.refuse(),
+        };
+        // Local gate admitted. Charge the shared scope if bound.
+        // Two-phase: the local permit is retired (not completed) if the
+        // shared scope is full, so `current` returns to its pre-admit
+        // value. The gate's `high_water` may briefly reflect the rolled-
+        // back attempt — that is accurate (a slot *was* momentarily taken)
+        // and never affects `current` or the rejection counters.
+        let lease = match &self.shared {
+            Some(binding) => match binding.scope.try_admit(binding.weight) {
+                Ok(lease) => Some(lease),
+                Err(_) => {
+                    let _ = self.gate.retire(permit);
+                    return self.refuse();
                 }
             },
+            None => None,
+        };
+        AdmissionDecision::Admitted(ConcurrencyPermit {
+            inner: Some(permit),
+            lease,
+            gate_id: self.gate_id,
+        })
+    }
+
+    /// Build the configured pressure outcome for a refused admission.
+    fn refuse(&mut self) -> AdmissionDecision<ConcurrencyPermit> {
+        match self.action {
+            PressureAction::Shed => {
+                self.full_decision_count = self.full_decision_count.saturating_add(1);
+                AdmissionDecision::Full(self.report())
+            }
+            PressureAction::Degrade => {
+                self.degrade_count = self.degrade_count.saturating_add(1);
+                AdmissionDecision::Degrade {
+                    report: self.report(),
+                }
+            }
+            PressureAction::Close => {
+                self.closed_count = self.closed_count.saturating_add(1);
+                AdmissionDecision::Closed(self.report())
+            }
+            PressureAction::Wait => {
+                self.wait_count = self.wait_count.saturating_add(1);
+                AdmissionDecision::Wait {
+                    delay: self.wait_hint,
+                    report: self.report(),
+                }
+            }
         }
     }
 
-    /// Release a permit and record a completion.
-    ///
-    /// Errors are forwarded from [`LocalPermitGate::release`] so stale or
-    /// post-reset permits surface as typed truth.
-    pub fn release(&mut self, permit: Permit) -> Result<(), crate::LocalPermitReleaseError> {
-        self.gate.release(permit).map(|_| ())
+    /// Release a permit and record a completion. Drops any shared lease.
+    pub fn release(&mut self, permit: ConcurrencyPermit) -> Result<(), ConcurrencyReleaseError> {
+        self.consume(permit, true)
     }
 
-    /// Retire a permit without recording a completion.
-    pub fn retire(&mut self, permit: Permit) -> Result<(), crate::LocalPermitReleaseError> {
-        self.gate.retire(permit).map(|_| ())
+    /// Retire a permit without recording a completion. Drops any shared lease.
+    pub fn retire(&mut self, permit: ConcurrencyPermit) -> Result<(), ConcurrencyReleaseError> {
+        self.consume(permit, false)
+    }
+
+    fn consume(
+        &mut self,
+        mut permit: ConcurrencyPermit,
+        record_completion: bool,
+    ) -> Result<(), ConcurrencyReleaseError> {
+        if permit.gate_id != self.gate_id {
+            // Not ours. Hand it back so the caller can release it on the
+            // gate that issued it; do not touch our counters.
+            return Err(ConcurrencyReleaseError::WrongGate { permit });
+        }
+        // Drop the shared lease first (auto-releases the scope charge).
+        permit.lease.take();
+        let inner = permit
+            .inner
+            .take()
+            .expect("ConcurrencyPermit::inner cleared by an earlier consume");
+        let result = if record_completion {
+            self.gate.release(inner)
+        } else {
+            self.gate.retire(inner)
+        };
+        result.map(|_| ()).map_err(ConcurrencyReleaseError::Gate)
     }
 
     /// Mark this policy closed. Subsequent admissions return `Closed(...)`.
@@ -406,11 +632,12 @@ impl ConcurrencyLimit {
     /// not the underlying gate's cap-reached count. Under non-`Shed`
     /// actions, gate-full events surface as `Degrade`/`Closed`/`Wait`
     /// and are recorded under those counters instead, so the capacity-
-    /// surface projection does not double-count.
+    /// surface projection does not double-count. If a shared scope is
+    /// bound, the capacity surface is decorated with the scope's columns.
     pub fn report(&self) -> AdmissionReport {
         let snap = self.gate.report();
         AdmissionReport {
-            surface: self.surface,
+            surface: self.surface.clone(),
             mode: self.mode.clone(),
             capacity: snap.capacity,
             current: snap.current,
@@ -421,6 +648,7 @@ impl ConcurrencyLimit {
             degrade_count: self.degrade_count,
             closed_count: self.closed_count,
             timed_out_count: self.timed_out_count,
+            evicted_count: 0,
         }
     }
 
@@ -432,10 +660,69 @@ impl ConcurrencyLimit {
         self.gate.report().full_count
     }
 
-    /// Capacity surface projection.
+    /// Capacity surface projection, decorated with the shared scope's
+    /// columns if one is bound.
     pub fn capacity_surface(&self) -> CapacitySurfaceReport {
-        self.report().capacity_surface()
+        let surface = self.report().capacity_surface();
+        match &self.shared {
+            Some(binding) => binding.scope.decorate(surface),
+            None => surface,
+        }
     }
+}
+
+/// Move-only proof of one successful [`ConcurrencyLimit`] admission.
+///
+/// Carries the underlying [`Permit`], an optional shared-scope
+/// [`SharedLease`], and the issuing limit's gate id. Must be released or
+/// retired on the limit that issued it.
+#[must_use = "a ConcurrencyPermit must be released or retired; do not drop it silently"]
+#[derive(Debug)]
+pub struct ConcurrencyPermit {
+    inner: Option<Permit>,
+    lease: Option<SharedLease>,
+    gate_id: u64,
+}
+
+impl ConcurrencyPermit {
+    /// Gate id of the limit that issued this permit.
+    pub const fn gate_id(&self) -> u64 {
+        self.gate_id
+    }
+
+    /// Borrow the underlying local permit, for tracing.
+    pub fn permit(&self) -> Option<&Permit> {
+        self.inner.as_ref()
+    }
+
+    /// `true` if this permit also holds a shared-scope lease.
+    pub const fn holds_shared_lease(&self) -> bool {
+        self.lease.is_some()
+    }
+}
+
+impl Drop for ConcurrencyPermit {
+    fn drop(&mut self) {
+        // Dropping the lease auto-releases the shared scope charge. The
+        // inner Permit, if still present, was not handed back to its gate;
+        // its own Drop increments the process-wide dropped-permit counter
+        // so the leak is loud. (This only happens if the user drops the
+        // ConcurrencyPermit instead of releasing it.)
+        self.lease.take();
+    }
+}
+
+/// Why a [`ConcurrencyLimit::release`] / `retire` failed.
+#[derive(Debug)]
+pub enum ConcurrencyReleaseError {
+    /// The permit was issued by a different `ConcurrencyLimit`. The permit
+    /// is returned so the caller can release it on the right limit.
+    WrongGate {
+        /// The permit, handed back intact.
+        permit: ConcurrencyPermit,
+    },
+    /// The underlying gate rejected the release (stale generation, etc.).
+    Gate(crate::LocalPermitReleaseError),
 }
 
 // -----------------------------------------------------------------------------
@@ -453,14 +740,19 @@ impl ConcurrencyLimit {
 #[derive(Debug)]
 #[must_use = "KeyedLimit is state; store it on the isolate"]
 pub struct KeyedLimit<K> {
-    surface: &'static str,
+    surface: SurfaceName,
+    gate_id: u64,
     mode: CapacityMode,
     per_key_capacity: usize,
     slots: Vec<Option<KeyedSlot<K>>>,
     live_keys: usize,
     high_water_keys: usize,
+    action: PressureAction,
+    wait_hint: Duration,
     full_count: u64,
     per_key_full_count: u64,
+    degrade_count: u64,
+    wait_count: u64,
     closed: bool,
     closed_count: u64,
     next_permit_id: u64,
@@ -483,7 +775,7 @@ impl<K: Eq + Clone> KeyedLimit<K> {
     /// # Panics
     ///
     /// Panics if `max_keys == 0` or `per_key == 0`.
-    pub fn new(surface: &'static str, max_keys: usize, per_key: usize) -> Self {
+    pub fn new(surface: impl Into<SurfaceName>, max_keys: usize, per_key: usize) -> Self {
         assert!(max_keys > 0, "KeyedLimit max_keys must be > 0");
         assert!(per_key > 0, "KeyedLimit per_key capacity must be > 0");
         let mut slots = Vec::with_capacity(max_keys);
@@ -491,14 +783,19 @@ impl<K: Eq + Clone> KeyedLimit<K> {
             slots.push(None);
         }
         Self {
-            surface,
+            surface: surface.into(),
+            gate_id: next_gate_id(),
             mode: CapacityMode::Fixed,
             per_key_capacity: per_key,
             slots,
             live_keys: 0,
             high_water_keys: 0,
+            action: PressureAction::Shed,
+            wait_hint: Duration::ZERO,
             full_count: 0,
             per_key_full_count: 0,
+            degrade_count: 0,
+            wait_count: 0,
             closed: false,
             closed_count: 0,
             next_permit_id: 0,
@@ -511,6 +808,25 @@ impl<K: Eq + Clone> KeyedLimit<K> {
     pub fn with_mode(mut self, mode: CapacityMode) -> Self {
         self.mode = mode;
         self
+    }
+
+    /// Choose what to return when a key cannot be admitted (per-key cap
+    /// reached or key table full). Default is [`PressureAction::Shed`]
+    /// (`Full`).
+    pub fn on_pressure(mut self, action: PressureAction) -> Self {
+        self.action = action;
+        self
+    }
+
+    /// Wait hint returned under [`PressureAction::Wait`]. Ignored otherwise.
+    pub fn wait_hint(mut self, delay: Duration) -> Self {
+        self.wait_hint = delay;
+        self
+    }
+
+    /// This limit's process-unique gate id.
+    pub const fn gate_id(&self) -> u64 {
+        self.gate_id
     }
 
     /// Configured key-table capacity.
@@ -557,8 +873,7 @@ impl<K: Eq + Clone> KeyedLimit<K> {
                 .expect("find_slot returned a live index");
             if slot.current >= self.per_key_capacity {
                 self.per_key_full_count = self.per_key_full_count.saturating_add(1);
-                self.full_count = self.full_count.saturating_add(1);
-                return AdmissionDecision::Full(self.report());
+                return self.refuse();
             }
             slot.current += 1;
             if slot.current > slot.high_water {
@@ -585,8 +900,37 @@ impl<K: Eq + Clone> KeyedLimit<K> {
             return AdmissionDecision::Admitted(self.issue_permit(idx, generation));
         }
         // 3) Table full.
-        self.full_count = self.full_count.saturating_add(1);
-        AdmissionDecision::Full(self.report())
+        self.refuse()
+    }
+
+    /// Map a refused admission (per-key cap or table full) onto the
+    /// configured [`PressureAction`]. `full_count` is bumped only when the
+    /// decision actually surfaces as `Full` so the capacity projection does
+    /// not double-count (mirrors `ConcurrencyLimit`).
+    fn refuse(&mut self) -> AdmissionDecision<KeyedPermit<K>> {
+        match self.action {
+            PressureAction::Shed => {
+                self.full_count = self.full_count.saturating_add(1);
+                AdmissionDecision::Full(self.report())
+            }
+            PressureAction::Degrade => {
+                self.degrade_count = self.degrade_count.saturating_add(1);
+                AdmissionDecision::Degrade {
+                    report: self.report(),
+                }
+            }
+            PressureAction::Close => {
+                self.closed_count = self.closed_count.saturating_add(1);
+                AdmissionDecision::Closed(self.report())
+            }
+            PressureAction::Wait => {
+                self.wait_count = self.wait_count.saturating_add(1);
+                AdmissionDecision::Wait {
+                    delay: self.wait_hint,
+                    report: self.report(),
+                }
+            }
+        }
     }
 
     fn find_slot(&self, key: &K) -> Option<usize> {
@@ -608,16 +952,22 @@ impl<K: Eq + Clone> KeyedLimit<K> {
                 slot_idx,
                 generation,
             }),
+            gate_id: self.gate_id,
             _key: PhantomData,
         }
     }
 
     /// Release a permit; the slot is freed when its count reaches zero.
     ///
-    /// On generation mismatch (e.g., the slot was already freed and reused
-    /// for a different key) the gate counts the invalid release and leaves
+    /// On gate mismatch (a permit from a different `KeyedLimit`) the permit
+    /// is handed back via [`KeyedReleaseError::WrongGate`] and no counter is
+    /// touched. On generation mismatch (the slot was freed and reused for a
+    /// different key) the gate counts the invalid release and leaves
     /// `current` unchanged.
-    pub fn release(&mut self, mut permit: KeyedPermit<K>) -> Result<(), KeyedReleaseError> {
+    pub fn release(&mut self, mut permit: KeyedPermit<K>) -> Result<(), KeyedReleaseError<K>> {
+        if permit.gate_id != self.gate_id {
+            return Err(KeyedReleaseError::WrongGate { permit });
+        }
         let inner = permit
             .inner
             .take()
@@ -649,7 +999,7 @@ impl<K: Eq + Clone> KeyedLimit<K> {
 
     /// Drop a permit explicitly, treating its slot the same as `release` —
     /// the slot is freed when its count reaches zero.
-    pub fn retire(&mut self, permit: KeyedPermit<K>) -> Result<(), KeyedReleaseError> {
+    pub fn retire(&mut self, permit: KeyedPermit<K>) -> Result<(), KeyedReleaseError<K>> {
         self.release(permit)
     }
 
@@ -667,17 +1017,18 @@ impl<K: Eq + Clone> KeyedLimit<K> {
     /// `max_keys`.
     pub fn report(&self) -> AdmissionReport {
         AdmissionReport {
-            surface: self.surface,
+            surface: self.surface.clone(),
             mode: self.mode.clone(),
             capacity: self.slots.len(),
             current: self.live_keys,
             high_water: self.high_water_keys,
             full_count: self.full_count,
             rate_limited_count: 0,
-            wait_count: 0,
-            degrade_count: 0,
+            wait_count: self.wait_count,
+            degrade_count: self.degrade_count,
             closed_count: self.closed_count,
             timed_out_count: 0,
+            evicted_count: 0,
         }
     }
 
@@ -727,17 +1078,15 @@ pub struct KeyedSlotReport {
 
 /// Move-only proof that one keyed admission succeeded.
 ///
-/// **Permits are not tagged with the gate that issued them.** A `KeyedPermit`
-/// from limit A released against limit B can decrement B's counters if B
-/// happens to have a slot with matching `(slot_idx, generation)`. The
-/// type system cannot distinguish two `KeyedLimit<K>` instances over the
-/// same `K`. Treat permits like file descriptors: only release them on
-/// the limit that issued them. The same caveat applies to
-/// [`Permit`](crate::Permit) and [`LocalPermitGate`](crate::LocalPermitGate).
+/// Stamped with the issuing limit's process-unique gate id. Releasing a
+/// permit on a *different* `KeyedLimit` returns
+/// [`KeyedReleaseError::WrongGate`] (with the permit handed back) instead of
+/// touching the wrong gate's slots.
 #[must_use = "a KeyedPermit must be released or retired; do not drop it silently"]
 #[derive(Debug)]
 pub struct KeyedPermit<K> {
     inner: Option<KeyedPermitInner>,
+    gate_id: u64,
     _key: PhantomData<K>,
 }
 
@@ -758,6 +1107,11 @@ impl<K> KeyedPermit<K> {
     pub fn generation(&self) -> Option<u64> {
         self.inner.as_ref().map(|i| i.generation)
     }
+
+    /// Gate id of the limit that issued this permit.
+    pub const fn gate_id(&self) -> u64 {
+        self.gate_id
+    }
 }
 
 impl<K> Drop for KeyedPermit<K> {
@@ -769,8 +1123,14 @@ impl<K> Drop for KeyedPermit<K> {
 }
 
 /// Why a [`KeyedLimit::release`] failed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum KeyedReleaseError {
+#[derive(Debug)]
+pub enum KeyedReleaseError<K> {
+    /// The permit was issued by a different `KeyedLimit`. The permit is
+    /// returned so the caller can release it on the right limit.
+    WrongGate {
+        /// The permit, handed back intact.
+        permit: KeyedPermit<K>,
+    },
     /// Slot index out of range. Should not happen for permits issued by this
     /// gate; treated as an internal bug.
     OutOfRange {
@@ -804,7 +1164,7 @@ pub enum KeyedReleaseError {
 #[derive(Debug)]
 #[must_use = "RateLimit is state; store it on the isolate"]
 pub struct RateLimit<K> {
-    surface: &'static str,
+    surface: SurfaceName,
     mode: CapacityMode,
     rate_per_sec: u64,
     burst: u32,
@@ -812,8 +1172,12 @@ pub struct RateLimit<K> {
     slots: Vec<Option<RateSlot<K>>>,
     live_keys: usize,
     high_water_keys: usize,
+    action: PressureAction,
+    wait_hint: Duration,
     full_count: u64,
     rate_limited_count: u64,
+    degrade_count: u64,
+    wait_count: u64,
     evicted_count: u64,
     closed: bool,
     closed_count: u64,
@@ -836,7 +1200,12 @@ impl<K: Eq + Clone> RateLimit<K> {
     /// # Panics
     ///
     /// Panics if `rate_per_sec == 0`, `burst == 0`, or `max_keys == 0`.
-    pub fn new(surface: &'static str, max_keys: usize, rate_per_sec: u64, burst: u32) -> Self {
+    pub fn new(
+        surface: impl Into<SurfaceName>,
+        max_keys: usize,
+        rate_per_sec: u64,
+        burst: u32,
+    ) -> Self {
         assert!(rate_per_sec > 0, "RateLimit rate_per_sec must be > 0");
         assert!(burst > 0, "RateLimit burst must be > 0");
         assert!(max_keys > 0, "RateLimit max_keys must be > 0");
@@ -845,7 +1214,7 @@ impl<K: Eq + Clone> RateLimit<K> {
             slots.push(None);
         }
         Self {
-            surface,
+            surface: surface.into(),
             mode: CapacityMode::Fixed,
             rate_per_sec,
             burst,
@@ -853,8 +1222,12 @@ impl<K: Eq + Clone> RateLimit<K> {
             slots,
             live_keys: 0,
             high_water_keys: 0,
+            action: PressureAction::Shed,
+            wait_hint: Duration::ZERO,
             full_count: 0,
             rate_limited_count: 0,
+            degrade_count: 0,
+            wait_count: 0,
             evicted_count: 0,
             closed: false,
             closed_count: 0,
@@ -864,6 +1237,25 @@ impl<K: Eq + Clone> RateLimit<K> {
     /// Set the configured capacity mode.
     pub fn with_mode(mut self, mode: CapacityMode) -> Self {
         self.mode = mode;
+        self
+    }
+
+    /// Choose what to return when the key *table* is full (no slot for a
+    /// new key). Default is [`PressureAction::Shed`] (`Full`).
+    ///
+    /// This does **not** change the per-key rate decision: a key whose
+    /// bucket is empty always returns `RateLimited { retry_after }`, which
+    /// is more useful than a generic `Degrade`. The action only governs the
+    /// hard table-capacity rejection.
+    pub fn on_table_pressure(mut self, action: PressureAction) -> Self {
+        self.action = action;
+        self
+    }
+
+    /// Wait hint returned under [`PressureAction::Wait`] for the table-full
+    /// path. Ignored otherwise.
+    pub fn wait_hint(mut self, delay: Duration) -> Self {
+        self.wait_hint = delay;
         self
     }
 
@@ -933,9 +1325,36 @@ impl<K: Eq + Clone> RateLimit<K> {
             // burst >= 1 (we panic in `new`), so first admit always succeeds.
             return AdmissionDecision::Admitted(RateGrant { _key: PhantomData });
         }
-        // Table full of other keys.
-        self.full_count = self.full_count.saturating_add(1);
-        AdmissionDecision::Full(self.report())
+        // Table full of other keys — map onto the configured table action.
+        self.refuse_table()
+    }
+
+    /// Map a table-full rejection onto the configured [`PressureAction`].
+    /// `full_count` is bumped only when the decision surfaces as `Full`.
+    fn refuse_table(&mut self) -> AdmissionDecision<RateGrant<K>> {
+        match self.action {
+            PressureAction::Shed => {
+                self.full_count = self.full_count.saturating_add(1);
+                AdmissionDecision::Full(self.report())
+            }
+            PressureAction::Degrade => {
+                self.degrade_count = self.degrade_count.saturating_add(1);
+                AdmissionDecision::Degrade {
+                    report: self.report(),
+                }
+            }
+            PressureAction::Close => {
+                self.closed_count = self.closed_count.saturating_add(1);
+                AdmissionDecision::Closed(self.report())
+            }
+            PressureAction::Wait => {
+                self.wait_count = self.wait_count.saturating_add(1);
+                AdmissionDecision::Wait {
+                    delay: self.wait_hint,
+                    report: self.report(),
+                }
+            }
+        }
     }
 
     fn admit_existing(&mut self, idx: usize, now: Instant) -> AdmissionDecision<RateGrant<K>> {
@@ -1035,17 +1454,18 @@ impl<K: Eq + Clone> RateLimit<K> {
 
     fn report_const(&self) -> AdmissionReport {
         AdmissionReport {
-            surface: self.surface,
+            surface: self.surface.clone(),
             mode: self.mode.clone(),
             capacity: self.slots.len(),
             current: self.live_keys,
             high_water: self.high_water_keys,
             full_count: self.full_count,
             rate_limited_count: self.rate_limited_count,
-            wait_count: 0,
-            degrade_count: 0,
+            wait_count: self.wait_count,
+            degrade_count: self.degrade_count,
             closed_count: self.closed_count,
             timed_out_count: 0,
+            evicted_count: self.evicted_count,
         }
     }
 
@@ -1483,7 +1903,7 @@ mod tests {
     #[test]
     fn timed_out_decision_increments_counter() {
         let report = AdmissionReport {
-            surface: "fake",
+            surface: Cow::Borrowed("fake"),
             mode: CapacityMode::Fixed,
             capacity: 1,
             current: 1,
@@ -1494,6 +1914,7 @@ mod tests {
             degrade_count: 0,
             closed_count: 0,
             timed_out_count: 0,
+            evicted_count: 0,
         };
         let decision: AdmissionDecision<()> = AdmissionDecision::timed_out(report);
         match decision {
@@ -1594,8 +2015,8 @@ mod tests {
     #[test]
     fn capacity_surface_projection_round_trips_counts() {
         let mut limit = ConcurrencyLimit::with_capacity("conc.surface", 2);
-        let _ = limit.try_admit().into_admitted().unwrap();
-        let _ = limit.try_admit().into_admitted().unwrap();
+        let a = limit.try_admit().into_admitted().unwrap();
+        let b = limit.try_admit().into_admitted().unwrap();
         // Force a Full.
         let _ = limit.try_admit();
         let surface = limit.capacity_surface();
@@ -1603,5 +2024,329 @@ mod tests {
         assert_eq!(surface.max_messages, Some(2));
         assert_eq!(surface.current_messages, 2);
         assert!(surface.full_count >= 1);
+        limit.release(a).unwrap();
+        limit.release(b).unwrap();
+    }
+
+    // ---- Gate-tagging (#8, #12) -------------------------------------------
+
+    #[test]
+    fn concurrency_permit_released_on_wrong_gate_is_rejected_and_handed_back() {
+        let mut a = ConcurrencyLimit::with_capacity("conc.a", 2);
+        let mut b = ConcurrencyLimit::with_capacity("conc.b", 2);
+        assert_ne!(a.gate_id(), b.gate_id());
+        let permit_a = a.try_admit().into_admitted().unwrap();
+        // Releasing A's permit on B must not touch B's counters.
+        let err = b.release(permit_a).expect_err("wrong gate must reject");
+        let permit_a = match err {
+            ConcurrencyReleaseError::WrongGate { permit } => permit,
+            other => panic!("expected WrongGate, got {other:?}"),
+        };
+        // B's gate is untouched: still empty.
+        assert_eq!(b.report().current, 0);
+        // A still shows the permit outstanding.
+        assert_eq!(a.report().current, 1);
+        // The handed-back permit releases correctly on A.
+        a.release(permit_a).expect("release on issuing gate");
+        assert_eq!(a.report().current, 0);
+    }
+
+    #[test]
+    fn keyed_permit_released_on_wrong_gate_is_rejected_and_handed_back() {
+        let mut a = KeyedLimit::<&'static str>::new("keyed.a", 2, 2);
+        let mut b = KeyedLimit::<&'static str>::new("keyed.b", 2, 2);
+        assert_ne!(a.gate_id(), b.gate_id());
+        // Both occupy slot 0 with generation 1 — the exact collision that
+        // would silently corrupt B without gate tagging.
+        let pa = a.try_admit(&"x").into_admitted().unwrap();
+        let _pb = b.try_admit(&"y").into_admitted().unwrap();
+        let err = b.release(pa).expect_err("wrong gate must reject");
+        let pa = match err {
+            KeyedReleaseError::WrongGate { permit } => permit,
+            other => panic!("expected WrongGate, got {other:?}"),
+        };
+        // B's slot for "y" is intact (current still 1).
+        assert_eq!(b.key_report(&"y").unwrap().current, 1);
+        // A's slot for "x" is intact.
+        assert_eq!(a.key_report(&"x").unwrap().current, 1);
+        a.release(pa).expect("release on issuing gate");
+        assert_eq!(a.live_keys(), 0);
+    }
+
+    // ---- PressureAction on KeyedLimit / RateLimit (#1, #18) ---------------
+
+    #[test]
+    fn keyed_limit_honors_pressure_action() {
+        // Degrade on per-key full.
+        let mut degrade = KeyedLimit::<&'static str>::new("keyed.degrade", 4, 1)
+            .on_pressure(PressureAction::Degrade);
+        let _p = degrade.try_admit(&"k").into_admitted().unwrap();
+        match degrade.try_admit(&"k") {
+            AdmissionDecision::Degrade { report } => assert_eq!(report.degrade_count, 1),
+            other => panic!("expected Degrade, got {other:?}"),
+        }
+        assert_eq!(degrade.report().full_count, 0, "degrade is not a Full");
+
+        // Wait on table full.
+        let mut waiting = KeyedLimit::<u32>::new("keyed.wait", 1, 1)
+            .on_pressure(PressureAction::Wait)
+            .wait_hint(Duration::from_millis(9));
+        let _p = waiting.try_admit(&1).into_admitted().unwrap();
+        match waiting.try_admit(&2) {
+            AdmissionDecision::Wait { delay, report } => {
+                assert_eq!(delay, Duration::from_millis(9));
+                assert_eq!(report.wait_count, 1);
+            }
+            other => panic!("expected Wait, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rate_limit_table_pressure_action_applies_only_to_table_full() {
+        let mut limit = RateLimit::<u32>::new("rate.degrade_table", 1, 5, 1)
+            .on_table_pressure(PressureAction::Degrade);
+        let now = fixed_now();
+        // First key admits.
+        let _ = limit.try_admit(&1, now).into_admitted().unwrap();
+        // Same key, bucket empty → RateLimited (NOT Degrade — per-key rate
+        // decision is unaffected by the table action).
+        match limit.try_admit(&1, now) {
+            AdmissionDecision::RateLimited { .. } => {}
+            other => panic!("expected RateLimited, got {other:?}"),
+        }
+        // New key, table full → Degrade (the table action).
+        match limit.try_admit(&2, now) {
+            AdmissionDecision::Degrade { report } => assert_eq!(report.degrade_count, 1),
+            other => panic!("expected Degrade for table-full, got {other:?}"),
+        }
+    }
+
+    // ---- Shared scope composition (#3) ------------------------------------
+
+    #[test]
+    fn concurrency_limit_charges_shared_scope_and_releases_both() {
+        let scope = SharedCapacityScope::new("shared.budget", "weight", 3);
+        let mut route_a =
+            ConcurrencyLimit::with_capacity("route.a", 10).with_shared_scope(scope.clone(), 2);
+        let mut route_b =
+            ConcurrencyLimit::with_capacity("route.b", 10).with_shared_scope(scope.clone(), 2);
+        // route_a takes weight 2 (scope now 2/3).
+        let pa = route_a.try_admit().into_admitted().unwrap();
+        assert!(pa.holds_shared_lease());
+        assert_eq!(scope.snapshot().current, 2);
+        // route_b wants 2 more but only 1 weight remains → shared full.
+        // Local gate for route_b has room (cap 10), so the rejection is the
+        // shared budget, and the local permit must be rolled back.
+        match route_b.try_admit() {
+            AdmissionDecision::Full(_) => {}
+            other => panic!("expected Full from shared scope, got {other:?}"),
+        }
+        // route_b's local gate must show zero outstanding (rolled back).
+        assert_eq!(route_b.report().current, 0);
+        // Scope still at 2 (route_b's charge was rolled back).
+        assert_eq!(scope.snapshot().current, 2);
+        // The capacity surface is decorated with the shared scope columns.
+        let surface = route_a.capacity_surface();
+        assert_eq!(surface.shared_scope.as_deref(), Some("shared.budget"));
+        // Releasing route_a frees both local and shared.
+        route_a.release(pa).unwrap();
+        assert_eq!(scope.snapshot().current, 0);
+        assert_eq!(route_a.report().current, 0);
+    }
+
+    #[test]
+    fn concurrency_permit_drop_releases_shared_lease() {
+        let scope = SharedCapacityScope::new("shared.drop", "weight", 4);
+        let mut limit =
+            ConcurrencyLimit::with_capacity("route.drop", 10).with_shared_scope(scope.clone(), 2);
+        let permit = limit.try_admit().into_admitted().unwrap();
+        assert_eq!(scope.snapshot().current, 2);
+        // Dropping the permit (instead of releasing) still frees the shared
+        // lease (the local gate stays charged + the global dropped counter
+        // bumps — that's the loud-leak contract).
+        drop(permit);
+        assert_eq!(scope.snapshot().current, 0, "shared lease freed on drop");
+    }
+
+    // ---- close() with live state (#6) -------------------------------------
+
+    #[test]
+    fn rate_limit_close_with_live_tenants_returns_closed_and_keeps_counts() {
+        let mut limit = RateLimit::<&'static str>::new("rate.close", 4, 10, 2);
+        let now = fixed_now();
+        let _ = limit.try_admit(&"alpha", now).into_admitted().unwrap();
+        let _ = limit.try_admit(&"beta", now).into_admitted().unwrap();
+        assert_eq!(limit.live_keys(), 2);
+        limit.close();
+        match limit.try_admit(&"gamma", now) {
+            AdmissionDecision::Closed(r) => {
+                assert!(r.closed_count >= 1);
+                // Live tenant state is preserved through close — close is
+                // admission-only, not a state reset.
+                assert_eq!(r.current, 2);
+            }
+            other => panic!("expected Closed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn keyed_limit_close_with_outstanding_permits_allows_release() {
+        let mut limit = KeyedLimit::<&'static str>::new("keyed.close", 4, 2);
+        let p = limit.try_admit(&"alpha").into_admitted().unwrap();
+        limit.close();
+        match limit.try_admit(&"beta") {
+            AdmissionDecision::Closed(r) => {
+                assert!(r.closed_count >= 1);
+                assert_eq!(r.current, 1, "outstanding permit still counted");
+            }
+            other => panic!("expected Closed, got {other:?}"),
+        }
+        // Release after close still works (close is admission-only).
+        limit.release(p).expect("release after close");
+        assert_eq!(limit.live_keys(), 0);
+    }
+
+    // ---- mode round-trip (#7) ---------------------------------------------
+
+    #[test]
+    fn keyed_and_rate_modes_round_trip_into_surface() {
+        let keyed = KeyedLimit::<u32>::new("keyed.mode", 4, 2).with_mode(CapacityMode::Tuning);
+        assert_eq!(keyed.capacity_surface().mode, CapacityMode::Tuning);
+
+        let rate = RateLimit::<u32>::new("rate.mode", 4, 5, 2).with_mode(CapacityMode::Tuning);
+        assert_eq!(rate.capacity_surface().mode, CapacityMode::Tuning);
+    }
+
+    // ---- evict during outstanding grant (#9) ------------------------------
+
+    #[test]
+    fn rate_limit_evict_does_not_affect_already_issued_grant() {
+        // RateGrant carries no slot reference, so an eviction between admit
+        // and grant-consumption cannot corrupt anything. Pin that.
+        let mut limit = RateLimit::<&'static str>::new("rate.evict_race", 4, 10, 2);
+        let now = fixed_now();
+        let grant = limit.try_admit(&"alpha", now).into_admitted().unwrap();
+        // Evict alpha while the grant is still in hand.
+        assert!(limit.evict_key_for_capacity(&"alpha"));
+        assert_eq!(limit.live_keys(), 0);
+        // The grant is still a valid proof; consuming it is a no-op for the
+        // policy (no slot to free). No panic, no underflow.
+        drop(grant);
+        assert_eq!(limit.live_keys(), 0);
+        // A fresh admit for alpha starts a new bucket.
+        let _ = limit.try_admit(&"alpha", now).into_admitted().unwrap();
+        assert_eq!(limit.live_keys(), 1);
+    }
+
+    // ---- stress / correctness at scale (#10) ------------------------------
+
+    #[test]
+    fn keyed_limit_stress_churn_keeps_live_keys_exact() {
+        // Drive many distinct keys through admit/release churn and verify
+        // the O(1) live_keys field never drifts from the true Some-count.
+        let max_keys = 512;
+        let mut limit = KeyedLimit::<u32>::new("keyed.stress", max_keys, 1);
+        let mut held: Vec<KeyedPermit<u32>> = Vec::new();
+        // Fill the table.
+        for k in 0..max_keys as u32 {
+            held.push(limit.try_admit(&k).into_admitted().unwrap());
+        }
+        assert_eq!(limit.live_keys(), max_keys);
+        // Table full: a new key is refused.
+        assert!(matches!(limit.try_admit(&9999), AdmissionDecision::Full(_)));
+        // Release every other permit, then re-admit fresh keys into the gaps.
+        let mut released = 0usize;
+        let mut remaining = Vec::new();
+        for (i, p) in held.into_iter().enumerate() {
+            if i % 2 == 0 {
+                limit.release(p).unwrap();
+                released += 1;
+            } else {
+                remaining.push(p);
+            }
+        }
+        assert_eq!(limit.live_keys(), max_keys - released);
+        for k in 0..released as u32 {
+            remaining.push(limit.try_admit(&(10_000 + k)).into_admitted().unwrap());
+        }
+        assert_eq!(limit.live_keys(), max_keys);
+        // Drain everything.
+        for p in remaining {
+            limit.release(p).unwrap();
+        }
+        assert_eq!(limit.live_keys(), 0);
+    }
+
+    #[test]
+    fn rate_limit_stress_many_keys_independent_buckets() {
+        let max_keys = 256;
+        let mut limit = RateLimit::<u32>::new("rate.stress", max_keys, 1, 1);
+        let now = fixed_now();
+        // Each key admits exactly once (burst 1), then is rate-limited.
+        for k in 0..max_keys as u32 {
+            let _ = limit.try_admit(&k, now).into_admitted().unwrap();
+        }
+        assert_eq!(limit.live_keys(), max_keys);
+        for k in 0..max_keys as u32 {
+            assert!(matches!(
+                limit.try_admit(&k, now),
+                AdmissionDecision::RateLimited { .. }
+            ));
+        }
+        // Table full for a brand-new key.
+        assert!(matches!(
+            limit.try_admit(&99_999, now),
+            AdmissionDecision::Full(_)
+        ));
+    }
+
+    // ---- Display / dynamic surface (#16, #17) -----------------------------
+
+    #[test]
+    fn report_display_is_grep_friendly() {
+        let mut limit = ConcurrencyLimit::with_capacity("conc.display", 1);
+        let _h = limit.try_admit().into_admitted().unwrap();
+        let _ = limit.try_admit();
+        let line = format!("{}", limit.report());
+        assert!(line.contains("admission surface=conc.display"), "{line}");
+        assert!(line.contains("full=1"), "{line}");
+        assert!(line.contains("evicted=0"), "{line}");
+    }
+
+    #[test]
+    fn admission_failure_display_includes_retry_after() {
+        let mut limit = RateLimit::<&'static str>::new("rate.display", 4, 10, 1);
+        let now = fixed_now();
+        let _ = limit.try_admit(&"alpha", now).into_admitted().unwrap();
+        let failure = limit.try_admit(&"alpha", now).into_admitted().unwrap_err();
+        let line = format!("{failure}");
+        assert!(line.contains("admission_rejected=rate_limited"), "{line}");
+        assert!(line.contains("retry_after_ms=100"), "{line}");
+    }
+
+    #[test]
+    fn dynamic_owned_surface_name_round_trips() {
+        // A runtime-built surface name (per-route / per-tenant) works.
+        let name = format!("route.{}", "items");
+        let mut limit = RateLimit::<&'static str>::new(name.clone(), 4, 5, 1);
+        let now = fixed_now();
+        let _ = limit.try_admit(&"t", now).into_admitted().unwrap();
+        assert_eq!(limit.report().surface, name);
+        assert_eq!(limit.capacity_surface().name, name);
+    }
+
+    #[test]
+    fn evicted_count_in_report_but_not_in_rejection_sum() {
+        let mut limit = RateLimit::<u32>::new("rate.evict_report", 2, 5, 1);
+        let now = fixed_now();
+        let _ = limit.try_admit(&1, now).into_admitted().unwrap();
+        assert!(limit.evict_key_for_capacity(&1));
+        let report = limit.report();
+        assert_eq!(report.evicted_count, 1);
+        // Eviction is not a rejection.
+        assert!(!report.any_rejection());
+        assert_eq!(report.total_rejections(), 0);
+        // And it does not inflate the capacity-surface full_count.
+        assert_eq!(limit.capacity_surface().full_count, 0);
     }
 }

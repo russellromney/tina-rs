@@ -26,10 +26,6 @@ fn print_side(side: &str, report: Report) {
     println!(
         "comparison=specimen_rate_limited_worker side={} jobs_admitted={} \
          jobs_full={} jobs_processed={} exit_clean={}",
-        side,
-        report.jobs_admitted,
-        report.jobs_full,
-        report.jobs_processed,
-        report.exit_clean,
+        side, report.jobs_admitted, report.jobs_full, report.jobs_processed, report.exit_clean,
     );
 }

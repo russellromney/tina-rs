@@ -77,7 +77,11 @@ struct Worker {
 
 #[tina_runtime::isolate(message = WorkerMsg)]
 impl Worker {
-    fn handle(&mut self, msg: WorkerMsg, _ctx: &mut Context<'_, SingleShard, Self::Reply>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: WorkerMsg,
+        _ctx: &mut Context<'_, SingleShard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             WorkerMsg::Submit(index) => {
                 self.report.jobs_admitted += 1;
