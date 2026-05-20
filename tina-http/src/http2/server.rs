@@ -552,7 +552,7 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Http2Connection<
         effects: &mut Vec<Effect<Self>>,
     ) -> Result<(), Http2ProtocolError> {
         match frame.ty {
-            FRAME_SETTINGS => self.handle_settings(frame),
+            FRAME_SETTINGS => self.handle_settings(frame, effects),
             FRAME_HEADERS => self.handle_headers(frame, effects),
             FRAME_DATA => self.handle_data(frame, effects),
             FRAME_WINDOW_UPDATE => {
@@ -583,7 +583,11 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Http2Connection<
         Ok(())
     }
 
-    fn handle_settings(&mut self, frame: Frame) -> Result<(), Http2ProtocolError> {
+    fn handle_settings(
+        &mut self,
+        frame: Frame,
+        effects: &mut Vec<Effect<Self>>,
+    ) -> Result<(), Http2ProtocolError> {
         if frame.stream_id != 0 {
             return Err(Http2ProtocolError::BadStreamId);
         }
@@ -601,7 +605,10 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Http2Connection<
             let value = u32::from_be_bytes([setting[2], setting[3], setting[4], setting[5]]);
             self.apply_setting(id, value)?;
         }
-        self.enqueue_frame(settings_frame(true))
+        self.enqueue_frame(settings_frame(true))?;
+        self.flush_pending_responses(effects)?;
+        self.push_ready_response_pulls(effects);
+        Ok(())
     }
 
     fn apply_setting(&mut self, id: u16, value: u32) -> Result<(), Http2ProtocolError> {

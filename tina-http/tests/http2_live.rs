@@ -772,6 +772,39 @@ fn http2_settings_initial_window_shrink_blocks_until_window_update() {
 }
 
 #[test]
+fn http2_settings_initial_window_increase_unblocks_pending_response() {
+    let harness = Http2Harness::start(Http2ServerConfig::default());
+    let mut stream = connect_h2(harness.addr);
+    write_settings(&mut stream, &[(SETTINGS_INITIAL_WINDOW_SIZE, 0)]);
+    let ack = read_frame(&mut stream);
+    assert_eq!(ack.ty, FRAME_SETTINGS);
+    assert_ne!(ack.flags & FLAG_ACK, 0);
+
+    write_frame(
+        &mut stream,
+        FRAME_HEADERS,
+        FLAG_END_HEADERS | FLAG_END_STREAM,
+        1,
+        &request_headers("GET", "/counter"),
+    );
+
+    stream
+        .set_read_timeout(Some(Duration::from_millis(150)))
+        .expect("short read timeout");
+    assert!(
+        read_frame_result(&mut stream).is_err(),
+        "zero peer stream window should park outbound response DATA"
+    );
+
+    write_settings(&mut stream, &[(SETTINGS_INITIAL_WINDOW_SIZE, 1)]);
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .expect("restore read timeout");
+    assert_eq!(read_response_body(&mut stream, 1), b"0");
+    harness.shutdown();
+}
+
+#[test]
 fn http2_invalid_settings_value_sends_goaway() {
     let harness = Http2Harness::start(Http2ServerConfig::default());
     let mut stream = connect_h2(harness.addr);
