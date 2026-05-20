@@ -29,7 +29,8 @@ pub fn tls_connect(
 /// reports the negotiated protocol. `alpn_protocols` are raw wire bytes
 /// in preference order (e.g. `vec![b"h2".to_vec()]`); an empty list is
 /// equivalent to [`tls_connect`]. When ALPN is offered and the peer
-/// negotiates none, the connect fails with [`CallError::TlsAlpnMismatch`].
+/// negotiates none, the connect fails with
+/// [`crate::CallError::TlsAlpnMismatch`].
 pub fn tls_connect_alpn(
     addr: SocketAddr,
     server_name: impl Into<String>,
