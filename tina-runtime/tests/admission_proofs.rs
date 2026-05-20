@@ -50,18 +50,16 @@ fn rate_limit_replay_byte_identical_under_same_inputs() {
         let mut limit = RateLimit::<&'static str>::new("rate.replay.proof", 4, 5, 2);
         inputs
             .iter()
-            .map(
-                |(key, offset)| match limit.try_admit(*key, base + *offset) {
-                    AdmissionDecision::Admitted(_) => format!("{key}@{}ms=ok", offset.as_millis()),
-                    AdmissionDecision::RateLimited { retry_after, .. } => format!(
-                        "{key}@{}ms=rate({}ms)",
-                        offset.as_millis(),
-                        retry_after.as_millis()
-                    ),
-                    AdmissionDecision::Full(_) => format!("{key}@{}ms=full", offset.as_millis()),
-                    other => format!("{key}@{}ms=other({other:?})", offset.as_millis()),
-                },
-            )
+            .map(|(key, offset)| match limit.try_admit(key, base + *offset) {
+                AdmissionDecision::Admitted(_) => format!("{key}@{}ms=ok", offset.as_millis()),
+                AdmissionDecision::RateLimited { retry_after, .. } => format!(
+                    "{key}@{}ms=rate({}ms)",
+                    offset.as_millis(),
+                    retry_after.as_millis()
+                ),
+                AdmissionDecision::Full(_) => format!("{key}@{}ms=full", offset.as_millis()),
+                other => format!("{key}@{}ms=other({other:?})", offset.as_millis()),
+            })
             .collect()
     };
 
@@ -84,19 +82,19 @@ fn cold_tenant_progresses_while_hot_tenant_is_limited() {
     // Hot tenant exhausts the bucket.
     for _ in 0..2 {
         let _g = limit
-            .try_admit("hot", now)
+            .try_admit(&"hot", now)
             .into_admitted()
             .expect("hot burst");
     }
     // Hot is rate-limited.
-    match limit.try_admit("hot", now) {
+    match limit.try_admit(&"hot", now) {
         AdmissionDecision::RateLimited { .. } => {}
         other => panic!("hot must be rate-limited, got {other:?}"),
     }
     // Cold tenant still succeeds many times within its own bucket.
     for _ in 0..2 {
         let _g = limit
-            .try_admit("cold", now)
+            .try_admit(&"cold", now)
             .into_admitted()
             .expect("cold success despite hot pressure");
     }
@@ -104,7 +102,7 @@ fn cold_tenant_progresses_while_hot_tenant_is_limited() {
     let later = now + Duration::from_secs(1);
     for _ in 0..2 {
         let _g = limit
-            .try_admit("cold", later)
+            .try_admit(&"cold", later)
             .into_admitted()
             .expect("cold refilled");
     }
@@ -143,20 +141,20 @@ fn concurrency_fill_cancel_refill_admits_new_work() {
 #[test]
 fn keyed_limit_fill_cancel_refill_per_key_and_table() {
     let mut limit = KeyedLimit::<&'static str>::new("keyed.refill", 2, 2);
-    let p_a1 = limit.try_admit("alpha").into_admitted().unwrap();
-    let p_a2 = limit.try_admit("alpha").into_admitted().unwrap();
+    let p_a1 = limit.try_admit(&"alpha").into_admitted().unwrap();
+    let p_a2 = limit.try_admit(&"alpha").into_admitted().unwrap();
     // alpha at cap.
-    let alpha_full = limit.try_admit("alpha").into_admitted().unwrap_err();
+    let alpha_full = limit.try_admit(&"alpha").into_admitted().unwrap_err();
     assert!(matches!(alpha_full, AdmissionFailure::Full(_)));
     // beta occupies the second slot.
-    let p_b1 = limit.try_admit("beta").into_admitted().unwrap();
+    let p_b1 = limit.try_admit(&"beta").into_admitted().unwrap();
     // gamma cannot find a slot.
-    let gamma_full = limit.try_admit("gamma").into_admitted().unwrap_err();
+    let gamma_full = limit.try_admit(&"gamma").into_admitted().unwrap_err();
     assert!(matches!(gamma_full, AdmissionFailure::Full(_)));
     // Release every alpha; slot frees; gamma now admits.
     limit.release(p_a1).expect("release a1");
     limit.release(p_a2).expect("release a2");
-    let p_g1 = limit.try_admit("gamma").into_admitted().unwrap();
+    let p_g1 = limit.try_admit(&"gamma").into_admitted().unwrap();
     limit.release(p_b1).expect("release b1");
     limit.release(p_g1).expect("release g1");
     assert_eq!(limit.report().current, 0);
@@ -171,8 +169,8 @@ fn admission_report_projects_into_capacity_summary() {
 
     let mut rate = RateLimit::<&'static str>::new("svc.rate", 4, 5, 1);
     let now = Instant::now();
-    let _ = rate.try_admit("alpha", now).into_admitted().unwrap();
-    let _ = rate.try_admit("alpha", now); // force RateLimited
+    let _ = rate.try_admit(&"alpha", now).into_admitted().unwrap();
+    let _ = rate.try_admit(&"alpha", now); // force RateLimited
 
     let mut summary = CapacitySummary::new();
     summary.push(conc.capacity_surface()).unwrap();
@@ -205,9 +203,9 @@ fn rate_limit_with_caller_owned_retry_budget_is_visible() {
 
     let now = Instant::now();
     // First admit succeeds.
-    let _grant = rate.try_admit("tenant.a", now).into_admitted().unwrap();
+    let _grant = rate.try_admit(&"tenant.a", now).into_admitted().unwrap();
     // Second is rate-limited.
-    let outcome = rate.try_admit("tenant.a", now);
+    let outcome = rate.try_admit(&"tenant.a", now);
     let failure = outcome.into_admitted().unwrap_err();
     assert!(matches!(failure, AdmissionFailure::RateLimited { .. }));
 

@@ -457,6 +457,7 @@ pub struct KeyedLimit<K> {
     mode: CapacityMode,
     per_key_capacity: usize,
     slots: Vec<Option<KeyedSlot<K>>>,
+    live_keys: usize,
     high_water_keys: usize,
     full_count: u64,
     per_key_full_count: u64,
@@ -494,6 +495,7 @@ impl<K: Eq + Clone> KeyedLimit<K> {
             mode: CapacityMode::Fixed,
             per_key_capacity: per_key,
             slots,
+            live_keys: 0,
             high_water_keys: 0,
             full_count: 0,
             per_key_full_count: 0,
@@ -522,26 +524,32 @@ impl<K: Eq + Clone> KeyedLimit<K> {
     }
 
     /// Number of distinct keys currently holding at least one permit.
-    pub fn live_keys(&self) -> usize {
-        self.slots.iter().filter(|slot| slot.is_some()).count()
+    pub const fn live_keys(&self) -> usize {
+        self.live_keys
     }
 
     /// Try to admit one permit for `key`.
+    ///
+    /// `key` is borrowed for the lookup. The implementation only clones it
+    /// when allocating a new slot, so passing an already-owned `K` (e.g.,
+    /// `&String`) avoids per-call allocation on the hot path of existing
+    /// keys.
     ///
     /// Three paths:
     /// 1. Key already has a slot below `per_key`: admit, increment.
     /// 2. Key already has a slot at `per_key`: refuse with `Full(report)`.
     ///    The per-key cap is the bottleneck, not the table.
-    /// 3. Key is new and a free slot exists: claim the slot, admit.
+    /// 3. Key is new and a free slot exists: claim the slot (cloning
+    ///    `key`), admit.
     /// 4. Key is new and the table is full of other keys: refuse with
     ///    `Full(report)`. No silent eviction.
-    pub fn try_admit(&mut self, key: K) -> AdmissionDecision<KeyedPermit<K>> {
+    pub fn try_admit(&mut self, key: &K) -> AdmissionDecision<KeyedPermit<K>> {
         if self.closed {
             self.closed_count = self.closed_count.saturating_add(1);
             return AdmissionDecision::Closed(self.report());
         }
         // 1) Find an existing slot for this key.
-        if let Some(idx) = self.find_slot(&key) {
+        if let Some(idx) = self.find_slot(key) {
             let slot = self
                 .slots
                 .get_mut(idx)
@@ -559,19 +567,20 @@ impl<K: Eq + Clone> KeyedLimit<K> {
             let generation = slot.generation;
             return AdmissionDecision::Admitted(self.issue_permit(idx, generation));
         }
-        // 2) Allocate a fresh slot if room exists.
+        // 2) Allocate a fresh slot if room exists. This is the only path
+        //    that clones the key.
         if let Some(idx) = self.slots.iter().position(Option::is_none) {
             let generation = self.next_generation;
             self.next_generation = self.next_generation.saturating_add(1);
             self.slots[idx] = Some(KeyedSlot {
-                key,
+                key: key.clone(),
                 current: 1,
                 high_water: 1,
                 generation,
             });
-            let live = self.live_keys();
-            if live > self.high_water_keys {
-                self.high_water_keys = live;
+            self.live_keys = self.live_keys.saturating_add(1);
+            if self.live_keys > self.high_water_keys {
+                self.high_water_keys = self.live_keys;
             }
             return AdmissionDecision::Admitted(self.issue_permit(idx, generation));
         }
@@ -633,6 +642,7 @@ impl<K: Eq + Clone> KeyedLimit<K> {
         entry.current = entry.current.saturating_sub(1);
         if entry.current == 0 {
             *slot = None;
+            self.live_keys = self.live_keys.saturating_sub(1);
         }
         Ok(())
     }
@@ -660,7 +670,7 @@ impl<K: Eq + Clone> KeyedLimit<K> {
             surface: self.surface,
             mode: self.mode.clone(),
             capacity: self.slots.len(),
-            current: self.live_keys(),
+            current: self.live_keys,
             high_water: self.high_water_keys,
             full_count: self.full_count,
             rate_limited_count: 0,
@@ -790,7 +800,7 @@ pub enum KeyedReleaseError {
 /// tracked in nano-tokens so partial gain is preserved across calls.
 ///
 /// Per-key storage is fixed-capacity. The default first form does not evict
-/// keys silently. Use [`RateLimit::forget_key`] to make room explicitly.
+/// keys silently. Use [`RateLimit::evict_key_for_capacity`] to make room explicitly.
 #[derive(Debug)]
 #[must_use = "RateLimit is state; store it on the isolate"]
 pub struct RateLimit<K> {
@@ -800,9 +810,11 @@ pub struct RateLimit<K> {
     burst: u32,
     burst_nano_tokens: u128,
     slots: Vec<Option<RateSlot<K>>>,
+    live_keys: usize,
     high_water_keys: usize,
     full_count: u64,
     rate_limited_count: u64,
+    evicted_count: u64,
     closed: bool,
     closed_count: u64,
 }
@@ -839,9 +851,11 @@ impl<K: Eq + Clone> RateLimit<K> {
             burst,
             burst_nano_tokens: u128::from(burst) * ONE_TOKEN_NT,
             slots,
+            live_keys: 0,
             high_water_keys: 0,
             full_count: 0,
             rate_limited_count: 0,
+            evicted_count: 0,
             closed: false,
             closed_count: 0,
         }
@@ -869,25 +883,36 @@ impl<K: Eq + Clone> RateLimit<K> {
     }
 
     /// Number of live key slots.
-    pub fn live_keys(&self) -> usize {
-        self.slots.iter().filter(|slot| slot.is_some()).count()
+    pub const fn live_keys(&self) -> usize {
+        self.live_keys
+    }
+
+    /// Cumulative count of explicit evictions via
+    /// [`RateLimit::evict_key_for_capacity`].
+    pub const fn evicted_count(&self) -> u64 {
+        self.evicted_count
     }
 
     /// Try to admit one request for `key` at `now`.
     ///
+    /// `key` is borrowed for the lookup. The implementation only clones it
+    /// when allocating a new slot, so the hot path of an existing tenant
+    /// is allocation-free even for `K = String`.
+    ///
     /// `now` must be monotonic across calls for the same policy. Going
     /// backwards is treated as "no new credit since last call" — the
     /// previous `last_seen` is preserved.
-    pub fn try_admit(&mut self, key: K, now: Instant) -> AdmissionDecision<RateGrant<K>> {
+    pub fn try_admit(&mut self, key: &K, now: Instant) -> AdmissionDecision<RateGrant<K>> {
         if self.closed {
             self.closed_count = self.closed_count.saturating_add(1);
             return AdmissionDecision::Closed(self.report());
         }
         // Find existing slot.
-        if let Some(idx) = self.find_slot(&key) {
+        if let Some(idx) = self.find_slot(key) {
             return self.admit_existing(idx, now);
         }
-        // Allocate a slot for the new key.
+        // Allocate a slot for the new key. This is the only path that
+        // clones the key.
         if let Some(idx) = self.slots.iter().position(Option::is_none) {
             // New key starts with a full burst minus one for the admit.
             let admitted = self.burst_nano_tokens >= ONE_TOKEN_NT;
@@ -897,13 +922,13 @@ impl<K: Eq + Clone> RateLimit<K> {
                 self.burst_nano_tokens
             };
             self.slots[idx] = Some(RateSlot {
-                key,
+                key: key.clone(),
                 available_nt,
                 last_seen: now,
             });
-            let live = self.live_keys();
-            if live > self.high_water_keys {
-                self.high_water_keys = live;
+            self.live_keys = self.live_keys.saturating_add(1);
+            if self.live_keys > self.high_water_keys {
+                self.high_water_keys = self.live_keys;
             }
             // burst >= 1 (we panic in `new`), so first admit always succeeds.
             return AdmissionDecision::Admitted(RateGrant { _key: PhantomData });
@@ -964,11 +989,29 @@ impl<K: Eq + Clone> RateLimit<K> {
         None
     }
 
-    /// Forget a key's bucket state. Frees the slot so a new key can use it.
+    /// Explicit policy-driven eviction of one key's bucket state.
+    ///
+    /// **This is an admin/policy lever, not a request-path helper.**
+    /// Calling it on the request path turns the rate-limiter into a
+    /// no-op for that key — the next admit re-initialises a full
+    /// burst as if the tenant were brand new. The type system cannot
+    /// prevent that misuse, so:
+    ///
+    /// - Use this from supervisor/policy code that has its own
+    ///   admission decision about *whether* a key deserves eviction
+    ///   (idle TTL, fairness round-robin, tenant deactivation, etc.).
+    /// - Do not call it from the same code path that calls
+    ///   [`try_admit`](Self::try_admit) for that key.
+    ///
+    /// Every eviction increments [`evicted_count`](Self::evicted_count)
+    /// so audit/telemetry can watch for runaway calls.
+    ///
     /// Returns `true` if the key was present.
-    pub fn forget_key(&mut self, key: &K) -> bool {
+    pub fn evict_key_for_capacity(&mut self, key: &K) -> bool {
         if let Some(idx) = self.find_slot(key) {
             self.slots[idx] = None;
+            self.live_keys = self.live_keys.saturating_sub(1);
+            self.evicted_count = self.evicted_count.saturating_add(1);
             true
         } else {
             false
@@ -995,7 +1038,7 @@ impl<K: Eq + Clone> RateLimit<K> {
             surface: self.surface,
             mode: self.mode.clone(),
             capacity: self.slots.len(),
-            current: self.live_keys(),
+            current: self.live_keys,
             high_water: self.high_water_keys,
             full_count: self.full_count,
             rate_limited_count: self.rate_limited_count,
@@ -1154,15 +1197,15 @@ mod tests {
     #[test]
     fn keyed_limit_isolates_keys() {
         let mut limit = KeyedLimit::<&'static str>::new("keyed.test", 4, 2);
-        let a1 = limit.try_admit("alpha").into_admitted().unwrap();
-        let a2 = limit.try_admit("alpha").into_admitted().unwrap();
+        let a1 = limit.try_admit(&"alpha").into_admitted().unwrap();
+        let a2 = limit.try_admit(&"alpha").into_admitted().unwrap();
         // alpha at cap.
-        match limit.try_admit("alpha") {
+        match limit.try_admit(&"alpha") {
             AdmissionDecision::Full(_) => {}
             other => panic!("alpha per-key full expected, got {other:?}"),
         }
         // beta still admits.
-        let b1 = limit.try_admit("beta").into_admitted().unwrap();
+        let b1 = limit.try_admit(&"beta").into_admitted().unwrap();
         let key_a = limit.key_report(&"alpha").unwrap();
         assert_eq!(key_a.current, 2);
         let key_b = limit.key_report(&"beta").unwrap();
@@ -1171,16 +1214,16 @@ mod tests {
         limit.release(a1).unwrap();
         limit.release(a2).unwrap();
         // After both alphas release, the slot is free; a fresh key can use it.
-        let _c = limit.try_admit("gamma").into_admitted().unwrap();
+        let _c = limit.try_admit(&"gamma").into_admitted().unwrap();
         limit.release(b1).unwrap();
     }
 
     #[test]
     fn keyed_limit_table_full_when_all_distinct() {
         let mut limit = KeyedLimit::<u32>::new("keyed.full", 2, 1);
-        let p0 = limit.try_admit(0).into_admitted().unwrap();
-        let p1 = limit.try_admit(1).into_admitted().unwrap();
-        match limit.try_admit(2) {
+        let p0 = limit.try_admit(&0).into_admitted().unwrap();
+        let p1 = limit.try_admit(&1).into_admitted().unwrap();
+        match limit.try_admit(&2) {
             AdmissionDecision::Full(report) => {
                 assert_eq!(report.capacity, 2);
                 assert_eq!(report.current, 2);
@@ -1190,20 +1233,20 @@ mod tests {
         }
         limit.release(p0).unwrap();
         // Slot freed; 2 may now claim it.
-        let _p2 = limit.try_admit(2).into_admitted().unwrap();
+        let _p2 = limit.try_admit(&2).into_admitted().unwrap();
         limit.release(p1).unwrap();
     }
 
     #[test]
     fn keyed_stale_permit_after_slot_reuse_is_rejected() {
         let mut limit = KeyedLimit::<&'static str>::new("keyed.stale", 1, 1);
-        let p_alpha = limit.try_admit("alpha").into_admitted().unwrap();
+        let p_alpha = limit.try_admit(&"alpha").into_admitted().unwrap();
         // alpha occupies the only slot; record its generation.
         let gen_a = limit.key_report(&"alpha").unwrap().generation;
         // Release alpha — slot freed.
         limit.release(p_alpha).unwrap();
         // beta claims the same slot with a new generation.
-        let p_beta = limit.try_admit("beta").into_admitted().unwrap();
+        let p_beta = limit.try_admit(&"beta").into_admitted().unwrap();
         let gen_b = limit.key_report(&"beta").unwrap().generation;
         assert_ne!(gen_a, gen_b);
         // A stale permit from alpha (synthesized via the public id) cannot
@@ -1217,7 +1260,7 @@ mod tests {
     fn rate_limit_first_admit_consumes_one_token() {
         let mut limit = RateLimit::<&'static str>::new("rate.first", 4, 10, 5);
         let now = fixed_now();
-        let _ = limit.try_admit("alpha", now).into_admitted().unwrap();
+        let _ = limit.try_admit(&"alpha", now).into_admitted().unwrap();
         let state = limit.key_state(&"alpha").unwrap();
         assert_eq!(state.available_tokens, 4);
     }
@@ -1229,9 +1272,9 @@ mod tests {
         let now = fixed_now();
         // First 3 admits succeed (burst).
         for _ in 0..3 {
-            let _ = limit.try_admit("alpha", now).into_admitted().unwrap();
+            let _ = limit.try_admit(&"alpha", now).into_admitted().unwrap();
         }
-        match limit.try_admit("alpha", now) {
+        match limit.try_admit(&"alpha", now) {
             AdmissionDecision::RateLimited {
                 retry_after,
                 report,
@@ -1248,9 +1291,9 @@ mod tests {
     fn rate_limit_refills_over_time_deterministically() {
         let mut limit = RateLimit::<u32>::new("rate.refill", 4, 10, 2);
         let t0 = fixed_now();
-        let _ = limit.try_admit(1, t0).into_admitted().unwrap();
-        let _ = limit.try_admit(1, t0).into_admitted().unwrap();
-        match limit.try_admit(1, t0) {
+        let _ = limit.try_admit(&1, t0).into_admitted().unwrap();
+        let _ = limit.try_admit(&1, t0).into_admitted().unwrap();
+        match limit.try_admit(&1, t0) {
             AdmissionDecision::RateLimited { retry_after, .. } => {
                 assert_eq!(retry_after, Duration::from_millis(100));
             }
@@ -1258,9 +1301,9 @@ mod tests {
         }
         // After 100ms, one token has refilled.
         let t1 = t0 + Duration::from_millis(100);
-        let _ = limit.try_admit(1, t1).into_admitted().unwrap();
+        let _ = limit.try_admit(&1, t1).into_admitted().unwrap();
         // The next admit is rate-limited again.
-        match limit.try_admit(1, t1) {
+        match limit.try_admit(&1, t1) {
             AdmissionDecision::RateLimited { retry_after, .. } => {
                 assert_eq!(retry_after, Duration::from_millis(100));
             }
@@ -1274,14 +1317,14 @@ mod tests {
         let now = fixed_now();
         // Hot key exhausts its bucket.
         for _ in 0..2 {
-            let _ = limit.try_admit("hot", now).into_admitted().unwrap();
+            let _ = limit.try_admit(&"hot", now).into_admitted().unwrap();
         }
-        match limit.try_admit("hot", now) {
+        match limit.try_admit(&"hot", now) {
             AdmissionDecision::RateLimited { .. } => {}
             other => panic!("hot must be limited, got {other:?}"),
         }
         // Cold key still succeeds with its own bucket.
-        let _ = limit.try_admit("cold", now).into_admitted().unwrap();
+        let _ = limit.try_admit(&"cold", now).into_admitted().unwrap();
     }
 
     #[test]
@@ -1303,7 +1346,7 @@ mod tests {
                 ("alpha", Duration::from_millis(160)),
             ];
             for (key, offset) in inputs {
-                let outcome = match limit.try_admit(*key, now0 + *offset) {
+                let outcome = match limit.try_admit(key, now0 + *offset) {
                     AdmissionDecision::Admitted(_) => "ok".to_string(),
                     AdmissionDecision::RateLimited { retry_after, .. } => {
                         format!("rate:{}ms", retry_after.as_millis())
@@ -1328,13 +1371,16 @@ mod tests {
         let mut limit = RateLimit::<&'static str>::new("rate.skew", 2, 10, 1);
         let t0 = fixed_now();
         // First admit at t0 consumes the only burst token.
-        let _ = limit.try_admit("alpha", t0).into_admitted().unwrap();
+        let _ = limit.try_admit(&"alpha", t0).into_admitted().unwrap();
         // At t0 + 200ms the bucket would have refilled 2 tokens but caps
         // at burst=1, so the next admit succeeds.
         let t_forward = t0 + Duration::from_millis(200);
-        let _ = limit.try_admit("alpha", t_forward).into_admitted().unwrap();
+        let _ = limit
+            .try_admit(&"alpha", t_forward)
+            .into_admitted()
+            .unwrap();
         // Now go backwards.
-        match limit.try_admit("alpha", t0) {
+        match limit.try_admit(&"alpha", t0) {
             AdmissionDecision::RateLimited { .. } => {}
             other => panic!("expected RateLimited on backward clock, got {other:?}"),
         }
@@ -1342,7 +1388,7 @@ mod tests {
         // bucket has at most ~100ms × rate ≈ 1 token of credit since the
         // last admit at t_forward. At t_forward + 50ms there should not
         // yet be enough credit for an admit.
-        match limit.try_admit("alpha", t_forward + Duration::from_millis(50)) {
+        match limit.try_admit(&"alpha", t_forward + Duration::from_millis(50)) {
             AdmissionDecision::RateLimited { .. } => {}
             other => panic!("backwards clock must not let bucket over-refill — got {other:?}"),
         }
@@ -1352,18 +1398,86 @@ mod tests {
     fn rate_limit_table_full_does_not_evict() {
         let mut limit = RateLimit::<u32>::new("rate.cap", 2, 5, 1);
         let now = fixed_now();
-        let _ = limit.try_admit(1, now).into_admitted().unwrap();
-        let _ = limit.try_admit(2, now).into_admitted().unwrap();
-        // Third key — table full, no eviction.
-        match limit.try_admit(3, now) {
+        let _ = limit.try_admit(&1, now).into_admitted().unwrap();
+        let _ = limit.try_admit(&2, now).into_admitted().unwrap();
+        // Third key — table full, no automatic eviction.
+        match limit.try_admit(&3, now) {
             AdmissionDecision::Full(r) => {
                 assert_eq!(r.capacity, 2);
                 assert_eq!(r.current, 2);
             }
             other => panic!("expected Full, got {other:?}"),
         }
-        assert!(limit.forget_key(&1));
-        let _ = limit.try_admit(3, now).into_admitted().unwrap();
+        // Explicit policy eviction is the only path that frees a slot for
+        // a new key. evicted_count goes up; live_keys goes down; the next
+        // admit for the evicted key starts a fresh bucket.
+        assert_eq!(limit.evicted_count(), 0);
+        assert!(limit.evict_key_for_capacity(&1));
+        assert_eq!(limit.evicted_count(), 1);
+        assert_eq!(limit.live_keys(), 1);
+        let _ = limit.try_admit(&3, now).into_admitted().unwrap();
+        // A second eviction of an absent key is a no-op for telemetry.
+        assert!(!limit.evict_key_for_capacity(&99));
+        assert_eq!(limit.evicted_count(), 1);
+    }
+
+    #[test]
+    fn rate_limit_eviction_resets_bucket_state() {
+        // Eviction is policy-owned: the next admit for the evicted key
+        // gets a fresh full burst as if the tenant were brand new. This
+        // is the documented behavior — callers must not use eviction
+        // as a request-path "reset" because it bypasses rate-limiting.
+        let mut limit = RateLimit::<&'static str>::new("rate.reset", 2, 10, 1);
+        let t0 = fixed_now();
+        let _ = limit.try_admit(&"alpha", t0).into_admitted().unwrap();
+        // Bucket exhausted — next admit at the same instant is rate-limited.
+        match limit.try_admit(&"alpha", t0) {
+            AdmissionDecision::RateLimited { .. } => {}
+            other => panic!("expected RateLimited, got {other:?}"),
+        }
+        // Evict and re-admit. The evicted key admits immediately, with
+        // a fresh burst, even though no time has passed.
+        assert!(limit.evict_key_for_capacity(&"alpha"));
+        let _ = limit
+            .try_admit(&"alpha", t0)
+            .into_admitted()
+            .expect("evicted key starts fresh");
+        // Telemetry records the eviction; CI can alarm on a runaway
+        // counter that would mean a request-path bypass.
+        assert_eq!(limit.evicted_count(), 1);
+    }
+
+    #[test]
+    fn keyed_limit_live_keys_field_is_correct_after_churn() {
+        // live_keys is now a field; this test pins the increment/decrement
+        // accounting against a churn pattern: alloc, hit per-key cap,
+        // release, allocate a different key on the freed slot, release.
+        let mut limit = KeyedLimit::<&'static str>::new("keyed.live_field", 3, 2);
+        assert_eq!(limit.live_keys(), 0);
+        let a1 = limit.try_admit(&"alpha").into_admitted().unwrap();
+        assert_eq!(limit.live_keys(), 1);
+        let a2 = limit.try_admit(&"alpha").into_admitted().unwrap();
+        assert_eq!(
+            limit.live_keys(),
+            1,
+            "per-key admit must not change live count"
+        );
+        let _full = limit.try_admit(&"alpha");
+        assert_eq!(
+            limit.live_keys(),
+            1,
+            "per-key Full must not change live count"
+        );
+        let b1 = limit.try_admit(&"beta").into_admitted().unwrap();
+        assert_eq!(limit.live_keys(), 2);
+        limit.release(a1).unwrap();
+        assert_eq!(limit.live_keys(), 2, "partial alpha release keeps slot");
+        limit.release(a2).unwrap();
+        assert_eq!(limit.live_keys(), 1, "final alpha release frees slot");
+        let _g = limit.try_admit(&"gamma").into_admitted().unwrap();
+        assert_eq!(limit.live_keys(), 2);
+        limit.release(b1).unwrap();
+        assert_eq!(limit.live_keys(), 1);
     }
 
     #[test]

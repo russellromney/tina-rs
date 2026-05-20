@@ -111,7 +111,7 @@ impl Gateway {
 
     fn handle_call(&mut self, msg: GatewayMsg, call: tina::CallContext<'_, Self>) -> Effect<Self> {
         match msg {
-            GatewayMsg::Request { tenant, now } => match self.rate.try_admit(tenant, now) {
+            GatewayMsg::Request { tenant, now } => match self.rate.try_admit(&tenant, now) {
                 AdmissionDecision::Admitted(_grant) => call.reply(GatewayReply::Ok { tenant }),
                 AdmissionDecision::RateLimited { retry_after, .. } => {
                     call.reply(GatewayReply::Limited {

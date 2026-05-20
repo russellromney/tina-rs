@@ -6,6 +6,27 @@ This file records completed work.
 
 ### Admission And Rate Policy
 
+(Pre-merge tightening — see "Pre-merge fixes" below for the deltas
+against the original landing.)
+
+#### Pre-merge fixes
+
+- `KeyedLimit` and `RateLimit` now track `live_keys` as an `O(1)`
+  field instead of scanning all slots on every `report()`. The field
+  is incremented when a fresh slot is allocated and decremented when
+  a slot is freed (final permit release for `KeyedLimit`, explicit
+  eviction for `RateLimit`).
+- `KeyedLimit::try_admit` and `RateLimit::try_admit` now take `&K`
+  instead of `K`. The hot path (existing key) is allocation-free even
+  for `K = String`; the key is only cloned on the new-slot
+  allocation path.
+- `RateLimit::forget_key` renamed to `evict_key_for_capacity` with an
+  explicit doc that it is a policy-owned lever, not a request-path
+  helper, plus an `evicted_count` telemetry counter and a test that
+  asserts eviction resets bucket state and bumps the counter.
+
+#### What landed originally
+
 - `tina_runtime::admission` ships three policy types over the existing
   capacity primitives. `ConcurrencyLimit` wraps `LocalPermitGate` with a
   typed `AdmissionDecision`; `KeyedLimit<K>` bounds per-key concurrency
