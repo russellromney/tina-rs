@@ -699,6 +699,7 @@ pub fn call_error_name(error: CallError) -> &'static str {
         CallError::TlsCertificate => "TlsCertificate",
         CallError::TlsName => "TlsName",
         CallError::TlsHandshake => "TlsHandshake",
+        CallError::TlsAlpnMismatch => "TlsAlpnMismatch",
         CallError::SignalFull => "SignalFull",
         CallError::SignalClosed => "SignalClosed",
         CallError::ProcessFull => "ProcessFull",
