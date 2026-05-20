@@ -31,6 +31,7 @@
 
 use std::alloc::Global;
 use std::any::Any;
+use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -325,7 +326,9 @@ where
     pub(crate) trace_dropped: u64,
     pub(crate) driver: Box<dyn RuntimeDriver>,
     pub(crate) in_flight_calls: Vec<InFlightCall>,
+    pub(crate) in_flight_call_indexes: HashMap<CallId, usize>,
     pub(crate) translators: Vec<StoredTranslator>,
+    pub(crate) translator_indexes: HashMap<CallId, usize>,
     pub(crate) clock: Box<dyn Clock>,
     pub(crate) pending_isolate_calls: Vec<PendingIsolateCall>,
     pub(crate) round_messages: Vec<Option<DeliveredMessage>>,
@@ -609,7 +612,9 @@ where
             trace_dropped: 0,
             driver,
             in_flight_calls: Vec::with_capacity(preallocation.call_capacity),
+            in_flight_call_indexes: HashMap::with_capacity(preallocation.call_capacity),
             translators: Vec::with_capacity(preallocation.call_capacity),
+            translator_indexes: HashMap::with_capacity(preallocation.call_capacity),
             clock,
             pending_isolate_calls: Vec::with_capacity(preallocation.call_capacity),
             round_messages: Vec::with_capacity(preallocation.round_scratch_capacity),
