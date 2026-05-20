@@ -607,13 +607,21 @@ fn peer_max_concurrent_streams_one_yields_full_for_the_excess_submit() {
     // outcome and that the client honors the peer's concurrency cap.
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind peer");
     let addr = listener.local_addr().expect("peer addr");
+    let (first_seen_tx, first_seen_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
     let peer = std::thread::spawn(move || {
         let (mut sock, _) = listener.accept().expect("accept");
         complete_handshake_with(&mut sock, &[(SETTINGS_MAX_CONCURRENT_STREAMS, 1)]);
-        // Only one stream will ever reach the wire (the other is refused
-        // client-side as Full). Read it, hold briefly, then answer.
+        // Only one stream should ever reach the wire (the other is
+        // refused client-side as Full). Read it, then hold it open until
+        // the test has driven the second submit. This is deliberately
+        // channel-driven instead of sleep-driven: CI runners vary enough
+        // that a fixed sleep can turn this proof into "peer closed first".
         let only = next_headers(&mut sock);
-        std::thread::sleep(Duration::from_millis(150));
+        first_seen_tx.send(()).expect("signal first stream seen");
+        release_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("test releases first stream");
         send_response(&mut sock, only, "200", b"ok");
         std::thread::sleep(Duration::from_millis(50));
     });
@@ -630,9 +638,9 @@ fn peer_max_concurrent_streams_one_yields_full_for_the_excess_submit() {
                 )
                 .expect("call a")
         });
-        // Stagger the second submit slightly so the first is admitted
-        // and occupies the single slot before the second arrives.
-        std::thread::sleep(Duration::from_millis(40));
+        first_seen_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("first stream reaches peer and occupies the cap");
         let b = scope.spawn(move || {
             runtime
                 .call_blocking(
@@ -642,7 +650,9 @@ fn peer_max_concurrent_streams_one_yields_full_for_the_excess_submit() {
                 )
                 .expect("call b")
         });
-        (a.join().unwrap(), b.join().unwrap())
+        let second = b.join().unwrap();
+        release_tx.send(()).expect("release first stream");
+        (a.join().unwrap(), second)
     });
 
     let mut saw_full = 0;
