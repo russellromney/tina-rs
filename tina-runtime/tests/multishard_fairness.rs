@@ -21,7 +21,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use tina::{Address, Mailbox, TrySendError, prelude::*};
-use tina_runtime::{MailboxFactory, RuntimeCall, ThreadedMultiShardRuntime};
+use tina_runtime::{MailboxFactory, RuntimeCall, ThreadedMultiShardRuntime, ThreadedRuntimeConfig};
 
 #[derive(Debug, Clone, Copy)]
 struct AppShard(u32);
@@ -88,6 +88,10 @@ enum FloodMsg {
     Tick { remaining: usize },
     /// Cross-shard delivery counted by the sink.
     Hit,
+    /// Cross-shard probe from a different source shard. This is separate
+    /// from `Hit` so the test can prove a higher-id source got a turn
+    /// while a lower-id source was flooding.
+    Probe,
 }
 
 struct FloodSource {
@@ -141,13 +145,14 @@ impl Isolate for FloodSource {
                 ));
                 batch(effects)
             }
-            FloodMsg::Hit => noop(),
+            FloodMsg::Hit | FloodMsg::Probe => noop(),
         }
     }
 }
 
 struct Sink {
     hits: Arc<AtomicUsize>,
+    probes: Arc<AtomicUsize>,
 }
 
 impl Isolate for Sink {
@@ -170,13 +175,50 @@ impl Isolate for Sink {
                 self.hits.fetch_add(1, Ordering::Relaxed);
                 noop()
             }
+            FloodMsg::Probe => {
+                self.probes.fetch_add(1, Ordering::Relaxed);
+                noop()
+            }
             FloodMsg::Tick { .. } => noop(),
+        }
+    }
+}
+
+struct ProbeSource {
+    target: Address<FloodMsg>,
+}
+
+impl Isolate for ProbeSource {
+    tina::isolate_types! {
+        message: FloodMsg,
+        reply: (),
+        send: Outbound<FloodMsg>,
+        spawn: Infallible,
+        call: RuntimeCall<FloodMsg>,
+        shard: AppShard,
+    }
+
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
+        match msg {
+            FloodMsg::Tick { .. } => send(self.target, FloodMsg::Probe),
+            FloodMsg::Hit | FloodMsg::Probe => noop(),
         }
     }
 }
 
 fn make_runtime() -> ThreadedMultiShardRuntime<AppShard, WorkerMailboxFactory> {
     ThreadedMultiShardRuntime::new([AppShard(11), AppShard(22)], WorkerMailboxFactory)
+}
+
+fn make_runtime_with_config<const N: usize>(
+    shards: [AppShard; N],
+    config: ThreadedRuntimeConfig,
+) -> ThreadedMultiShardRuntime<AppShard, WorkerMailboxFactory> {
+    ThreadedMultiShardRuntime::with_config(shards, WorkerMailboxFactory, config)
 }
 
 const FLOOD_TICKS: usize = 100_000;
@@ -220,12 +262,14 @@ fn register_flood(
 fn remote_flood_does_not_starve_local_run_command() {
     let runtime = make_runtime();
     let hits = Arc::new(AtomicUsize::new(0));
+    let probes = Arc::new(AtomicUsize::new(0));
 
     let sink = runtime
         .register_with_capacity_on::<Sink, _>(
             ShardId::new(22),
             Sink {
                 hits: Arc::clone(&hits),
+                probes: Arc::clone(&probes),
             },
             128,
         )
@@ -268,12 +312,14 @@ fn remote_flood_does_not_starve_local_run_command() {
 fn shutdown_under_remote_flood_completes_bounded() {
     let runtime = make_runtime();
     let hits = Arc::new(AtomicUsize::new(0));
+    let probes = Arc::new(AtomicUsize::new(0));
 
     let sink = runtime
         .register_with_capacity_on::<Sink, _>(
             ShardId::new(22),
             Sink {
                 hits: Arc::clone(&hits),
+                probes: Arc::clone(&probes),
             },
             128,
         )
@@ -307,12 +353,14 @@ fn shutdown_under_remote_flood_completes_bounded() {
 fn ordinary_remote_throughput_still_progresses() {
     let runtime = make_runtime();
     let hits = Arc::new(AtomicUsize::new(0));
+    let probes = Arc::new(AtomicUsize::new(0));
 
     let sink = runtime
         .register_with_capacity_on::<Sink, _>(
             ShardId::new(22),
             Sink {
                 hits: Arc::clone(&hits),
+                probes: Arc::clone(&probes),
             },
             128,
         )
@@ -357,4 +405,63 @@ fn ordinary_remote_throughput_still_progresses() {
 
     running.store(false, Ordering::Relaxed);
     let _ = runtime.shutdown();
+}
+
+/// Adversarial review I4: remote inbound draining used a single shared
+/// budget in fixed source order. A lower-id source could consume the
+/// whole target-shard drain budget forever while a higher-id source's
+/// already-queued envelope waited behind it.
+#[test]
+fn remote_inbound_drain_rotates_between_sources_under_flood() {
+    let config = ThreadedRuntimeConfig {
+        remote_inbound_drain_budget: 1,
+        shard_pair_capacity: 64,
+        command_capacity: 256,
+        ..ThreadedRuntimeConfig::default()
+    };
+    let runtime = make_runtime_with_config([AppShard(11), AppShard(22), AppShard(33)], config);
+    let hits = Arc::new(AtomicUsize::new(0));
+    let probes = Arc::new(AtomicUsize::new(0));
+
+    let sink = runtime
+        .register_with_capacity_on::<Sink, _>(
+            ShardId::new(33),
+            Sink {
+                hits: Arc::clone(&hits),
+                probes: Arc::clone(&probes),
+            },
+            4096,
+        )
+        .expect("register target sink");
+
+    let running = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    register_flood(&runtime, sink, &running, FLOOD_SOURCES, FLOOD_TICKS);
+    std::thread::sleep(Duration::from_millis(50));
+    assert!(
+        hits.load(Ordering::Relaxed) > 0,
+        "lower-id flood must be in flight"
+    );
+
+    let probe = runtime
+        .register_with_capacity_on::<ProbeSource, _>(
+            ShardId::new(22),
+            ProbeSource { target: sink },
+            8,
+        )
+        .expect("register probe source");
+    runtime
+        .try_send(probe, FloodMsg::Tick { remaining: 1 })
+        .expect("kick probe");
+
+    let deadline = Instant::now() + Duration::from_millis(750);
+    while Instant::now() < deadline && probes.load(Ordering::Relaxed) == 0 {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let observed_probes = probes.load(Ordering::Relaxed);
+    running.store(false, Ordering::Relaxed);
+    let _ = runtime.shutdown();
+    assert_eq!(
+        observed_probes, 1,
+        "source 22 probe starved behind source 11 remote flood"
+    );
 }
