@@ -4,6 +4,118 @@ This file records completed work.
 
 ## Unreleased
 
+### Admission And Rate Policy
+
+(Pre-merge tightening — see the "fixes" sections below for the deltas
+against the original landing.)
+
+#### Plan-completion pass (round 3)
+
+Closed the remaining gaps against the phase plan's proof/specimen list:
+
+- **`specimen_rate_limited_worker` now paces with `RateLimit`.** The Tina
+  side's pacing is a `RateLimit<()>` token bucket driven by `ctx.now()`
+  (`Admitted` → process one; `RateLimited { retry_after }` → sleep, then
+  ask again) instead of a hand-rolled `sleep(RATE_WINDOW)` + `SingleCallGate`.
+  The bounded mailbox is still the backpressure surface and the Tokio-side
+  parity holds.
+- **New `examples/specimen_idempotent_retry`.** A runnable outbound-edge
+  relay that uses `FullHandling::retry_backoff` for bounded, caller-owned
+  retry against a flaky downstream, with the idempotency key named on the
+  `Deliver { idempotency_key }` message. Proves: exactly-once charge across
+  retries, visible budget exhaustion, no charge on exhaustion.
+- **tina-sim replay proof.** `tina-sim/tests/admission_replay.rs` drives a
+  `RateLimit` isolate off the simulator's virtual `ctx.now()` and shows the
+  decision trace is byte-identical across runs and *independent of seed*,
+  with `retry_after` equal to the exact token window under sim time.
+- **API-shape proof for explicit retry.** A test pins that
+  `FullHandling::shed()` never schedules a retry and that the only path to
+  `RetryAfter` is an explicitly-constructed `retry_backoff(Backoff)`; the
+  admission policies themselves expose no retry method.
+- **`system_api_gateway_limits` gains the body-bytes dimension.** Each
+  request now charges two shared weighted budgets — `gateway.in_flight`
+  (request weight) and `gateway.body_bytes` (body size) — admitted only if
+  both have room, with the in-flight charge rolled back if the body budget
+  is full. A new smoke test drives the body-bytes-bound case and asserts the
+  typed `Full` names `gateway.body_bytes`.
+
+#### Pre-merge hardening (round 2)
+
+- **Gate-tagged permits.** Every `ConcurrencyLimit` / `KeyedLimit` gets
+  a process-unique gate id; permits carry it. Releasing a permit on a
+  *different* limit instance returns `WrongGate` (with the permit handed
+  back) instead of silently decrementing the wrong slot. Closes the
+  cross-instance soundness gap (`ConcurrencyLimit` now issues a
+  `ConcurrencyPermit` wrapper for this; `KeyedReleaseError` is generic
+  over `K`).
+- **Shared-scope composition.** `ConcurrencyLimit::with_shared_scope`
+  charges a `SharedCapacityScope` alongside the local gate (two-phase,
+  with rollback on shared-budget full). The `ConcurrencyPermit` owns the
+  `SharedLease`; releasing or dropping it releases both. The capacity
+  surface is decorated with the scope columns.
+- **`PressureAction` on all three policies.** `KeyedLimit` and
+  `RateLimit` now honor shed/degrade/close/wait on their hard-full path
+  (`RateLimit`'s per-key rate decision still always returns
+  `RateLimited { retry_after }`, which is more useful than a generic
+  degrade).
+- **Report polish.** `AdmissionReport` gains an `evicted_count` field
+  (telemetry, *not* counted as a rejection), `Display` for
+  `AdmissionReport` and `AdmissionFailure` (grep-friendly lines;
+  `AdmissionFailure: std::error::Error`), and `surface` is now
+  `Cow<'static, str>` so per-route/per-tenant names built at runtime
+  work without leaking.
+- **Tests.** Cross-instance release rejection (both limits), shared-scope
+  composition + permit-drop release, `PressureAction` on keyed/rate,
+  `close()` with live state for both keyed and rate, mode round-trip,
+  evict-during-grant, and high-N churn/stress correctness for the
+  `live_keys` field. Lib admission tests: 36 (was 20); integration
+  proofs: 10 (was 8).
+
+#### Pre-merge fixes (round 1)
+
+- `KeyedLimit` and `RateLimit` track `live_keys` as an `O(1)` field
+  instead of scanning all slots on every `report()`.
+- `KeyedLimit::try_admit` and `RateLimit::try_admit` take `&K` instead
+  of `K`. The hot path (existing key) is allocation-free even for
+  `K = String`; the key is only cloned on the new-slot allocation path.
+- `RateLimit::forget_key` renamed to `evict_key_for_capacity` with an
+  explicit doc that it is a policy-owned lever, not a request-path
+  helper, plus an `evicted_count` telemetry counter.
+- Fixed a double-count: `ConcurrencyLimit.report().full_count` now
+  counts only decisions that surfaced as `Full(_)`; the underlying gate
+  view is exposed separately as `gate_full_count()`.
+- Fixed `PressureAction::Close` to be sticky for concurrency, keyed, and
+  rate-table pressure. Once a pressure decision returns `Closed`, the
+  policy stops admitting future work until it is rebuilt.
+
+#### What landed originally
+
+- `tina_runtime::admission` ships three policy types over the existing
+  capacity primitives. `ConcurrencyLimit` wraps `LocalPermitGate` with a
+  typed `AdmissionDecision`; `KeyedLimit<K>` bounds per-key concurrency
+  with fixed-capacity slot storage and a move-only `KeyedPermit<K>`;
+  `RateLimit<K>` is a per-key token bucket whose decisions are pure
+  functions of `(rate, burst, now, key history)`. None of them invent a
+  second capacity product — every report projects onto
+  `CapacitySurfaceReport` so existing discovery/`CapacitySummary`
+  assertions keep working.
+- The shared decision shape (`AdmissionDecision::{Admitted, Full,
+  RateLimited, Wait, Degrade, Closed, TimedOut}`) makes every overload
+  path typed. `PressureAction` lets a `ConcurrencyLimit` declare what
+  happens on full — shed, degrade, close, or hint a bounded wait. The
+  policies never retry on their own; pair with the existing
+  `FullHandling` if retry-with-backoff is the right answer.
+- Rate-limit math is integer-only (nano-tokens); identical
+  `(config, now, key history)` inputs produce identical decision
+  sequences across runs. Per-key storage is a fixed-capacity `Vec<Option<...>>`;
+  the first form does not silently evict a key to make room for a new
+  one. The `examples/systems/system_tenant_rate_limiter` specimen drives
+  the cold-tenant-progresses-while-hot-tenant-is-limited proof and
+  asserts byte-identical `retry_after` across two runs.
+- Compile-fail proofs cover `KeyedPermit` move-only release (no double
+  release) and the private-field invariant that user code cannot forge a
+  permit via a struct literal.
+
 ### Phase 117 Local I/O, Codec, And IPC Parity
 
 Wave A local I/O / codec / IPC parity

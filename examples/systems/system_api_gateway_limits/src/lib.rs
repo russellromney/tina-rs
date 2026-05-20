@@ -25,9 +25,15 @@ use tina_runtime::{
 pub struct RunConfig {
     pub gateway_mailbox: usize,
     pub pending_capacity: usize,
+    /// Shared in-flight-request budget (weighted by route).
     pub shared_cap: usize,
+    /// Shared body-bytes budget across both routes.
+    pub body_cap: usize,
     pub upload_weight: usize,
     pub list_weight: usize,
+    /// Per-request body size charged against the body-bytes budget.
+    pub upload_body: usize,
+    pub list_body: usize,
     pub upload_hold_ms: u64,
     pub list_hold_ms: u64,
     pub upload_callers: usize,
@@ -41,8 +47,11 @@ impl Default for RunConfig {
             gateway_mailbox: 64,
             pending_capacity: 32,
             shared_cap: 4,
+            body_cap: 4_096,
             upload_weight: 2,
             list_weight: 1,
+            upload_body: 1_024,
+            list_body: 128,
             upload_hold_ms: 80,
             list_hold_ms: 40,
             upload_callers: 4,
@@ -69,6 +78,12 @@ pub struct RunReport {
     /// any non-zero value here is a lease leak.
     pub scope_current_at_drain: usize,
     pub scope_high_water_at_drain: usize,
+    /// Body-bytes shared budget facts (second weighted dimension).
+    pub body_high_water: usize,
+    pub body_full_count: u64,
+    pub body_admitted: u64,
+    pub body_released: u64,
+    pub body_current_at_drain: usize,
     pub discovery_lines: Vec<String>,
     pub summary_line: String,
 }
@@ -114,11 +129,24 @@ pub enum GatewayReply {
     },
 }
 
+/// Both shared leases a request holds while in flight: one weight unit
+/// against the in-flight-request budget, one against the body-bytes
+/// budget. Dropping this releases both (each `SharedLease` releases on
+/// drop), so parking it as the guard keeps the two budgets honest across
+/// the multi-turn hold.
+struct RequestCharge {
+    _in_flight: SharedLease,
+    _body: SharedLease,
+}
+
 struct Gateway {
     scope: SharedCapacityScope,
+    body_scope: SharedCapacityScope,
     upload_weight: usize,
     list_weight: usize,
-    pending: GuardedPendingReplies<u64, GatewayReply, SharedLease>,
+    upload_body: usize,
+    list_body: usize,
+    pending: GuardedPendingReplies<u64, GatewayReply, RequestCharge>,
     next_qid: u64,
 }
 
@@ -146,16 +174,23 @@ impl Gateway {
 }
 
 impl Gateway {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         scope: SharedCapacityScope,
+        body_scope: SharedCapacityScope,
         upload_weight: usize,
         list_weight: usize,
+        upload_body: usize,
+        list_body: usize,
         pending_capacity: usize,
     ) -> Self {
         Self {
             scope,
+            body_scope,
             upload_weight,
             list_weight,
+            upload_body,
+            list_body,
             pending: GuardedPendingReplies::with_capacity(pending_capacity)
                 .named("system_api_gateway_limits.pending"),
             next_qid: 1,
@@ -169,14 +204,22 @@ impl Gateway {
         }
     }
 
+    fn body_for(&self, route: Route) -> usize {
+        match route {
+            Route::Upload => self.upload_body,
+            Route::List => self.list_body,
+        }
+    }
+
     fn dispatch(
         &mut self,
         route: Route,
         hold: Duration,
         call: CallContext<'_, Self>,
     ) -> Effect<Self> {
+        // Charge the in-flight-request budget first.
         let weight = self.weight_for(route);
-        let lease = match self.scope.try_admit(weight) {
+        let in_flight = match self.scope.try_admit(weight) {
             Ok(lease) => lease,
             Err(SharedScopeFull {
                 scope,
@@ -193,9 +236,34 @@ impl Gateway {
             }
         };
 
+        // Then the body-bytes budget. If it is full, drop the in-flight
+        // lease (rolls back the first charge) and report the body surface.
+        let body_bytes = self.body_for(route);
+        let body = match self.body_scope.try_admit(body_bytes) {
+            Ok(lease) => lease,
+            Err(SharedScopeFull {
+                scope,
+                requested,
+                current,
+                max,
+            }) => {
+                drop(in_flight);
+                return call.reply(GatewayReply::Full {
+                    filled: scope,
+                    requested,
+                    current,
+                    max,
+                });
+            }
+        };
+
+        let charge = RequestCharge {
+            _in_flight: in_flight,
+            _body: body,
+        };
         let qid = self.next_qid;
         let next_qid = qid + 1;
-        match self.pending.park_call_guarded(qid, call, lease) {
+        match self.pending.park_call_guarded(qid, call, charge) {
             Ok(_ticket) => {
                 self.next_qid = next_qid;
                 sleep(hold).then(move |result| GatewayMsg::HoldDone { qid, route, result })
@@ -212,21 +280,21 @@ impl Gateway {
             }
             Err(tina_runtime::GuardedParkCallError::DuplicateKey { call, .. })
             | Err(tina_runtime::GuardedParkCallError::NoCaller { call, .. })
-            | Err(tina_runtime::GuardedParkCallError::CrossShardUnsupported { call, .. }) => {
-                call.reply(GatewayReply::Full {
+            | Err(tina_runtime::GuardedParkCallError::CrossShardUnsupported { call, .. }) => call
+                .reply(GatewayReply::Full {
                     filled: "gateway.duplicate".into(),
                     requested: 1,
                     current: 0,
                     max: 0,
-                })
-            }
+                }),
         }
     }
 
     fn hold_done(&mut self, qid: u64, route: Route, _result: SleepReply) -> Effect<Self> {
-        // take_by_key drops the lease as the returned guard falls out of
-        // scope after we move it; reply_to drives the slot to settled.
-        let Some((slot, lease)) = self.pending.take_by_key(&qid) else {
+        // take_by_key returns the parked caller and the RequestCharge;
+        // dropping the charge releases both shared leases (in-flight and
+        // body bytes). reply_to drives the slot to settled.
+        let Some((slot, charge)) = self.pending.take_by_key(&qid) else {
             return noop();
         };
         let effect = reply_to(
@@ -235,7 +303,7 @@ impl Gateway {
                 route: route.label(),
             },
         );
-        drop(lease);
+        drop(charge);
         effect
     }
 }
@@ -246,12 +314,16 @@ pub fn run(config: RunConfig) -> anyhow::Result<RunReport> {
         DefaultThreadedMailboxFactory,
     ));
     let scope = SharedCapacityScope::new("gateway.in_flight", "weight", config.shared_cap);
+    let body_scope = SharedCapacityScope::new("gateway.body_bytes", "bytes", config.body_cap);
     let gateway: ServiceHandle<GatewayMsg, GatewayReply> = runtime
         .register_service::<_, Infallible>(
             Gateway::new(
                 scope.clone(),
+                body_scope.clone(),
                 config.upload_weight,
                 config.list_weight,
+                config.upload_body,
+                config.list_body,
                 config.pending_capacity,
             ),
             config.gateway_mailbox,
@@ -330,13 +402,18 @@ pub fn run(config: RunConfig) -> anyhow::Result<RunReport> {
 
     // Pre-shutdown snapshot for discovery output / capacity summary.
     let snap_pre = scope.snapshot();
+    let body_pre = body_scope.snapshot();
     let scope_line = scope.discovery_line();
+    let body_line = body_scope.discovery_line();
     let surface_line =
         format_discovery_line(&scope.surface_report(tina::capacity::CapacityMode::Fixed));
     let mut capacity_summary = CapacitySummary::new();
     capacity_summary
         .push(scope.surface_report(tina::capacity::CapacityMode::Fixed))
         .map_err(|e| anyhow::anyhow!("push surface: {e:?}"))?;
+    capacity_summary
+        .push(body_scope.surface_report(tina::capacity::CapacityMode::Fixed))
+        .map_err(|e| anyhow::anyhow!("push body surface: {e:?}"))?;
     if let Err(errors) = capacity_summary.assert_no_full() {
         // Failing is expected for this specimen; surface the
         // copyable FAIL line for CI consumers but do not error.
@@ -352,9 +429,10 @@ pub fn run(config: RunConfig) -> anyhow::Result<RunReport> {
     // out at shutdown time.
     shutdown(runtime);
     let snap = scope.snapshot();
+    let body_snap = body_scope.snapshot();
 
     let summary_line = format!(
-        "system=system_api_gateway_limits upload_admitted={} upload_full={} upload_timeout={} list_admitted={} list_full={} list_timeout={} scope_high_water={} scope_full_count={} scope_current_at_drain={}",
+        "system=system_api_gateway_limits upload_admitted={} upload_full={} upload_timeout={} list_admitted={} list_full={} list_timeout={} scope_high_water={} scope_full_count={} scope_current_at_drain={} body_high_water={} body_full_count={} body_current_at_drain={}",
         upload_admitted,
         upload_full,
         upload_timeout,
@@ -364,6 +442,9 @@ pub fn run(config: RunConfig) -> anyhow::Result<RunReport> {
         snap.high_water,
         snap.full_count,
         snap.current,
+        body_snap.high_water,
+        body_snap.full_count,
+        body_snap.current,
     );
 
     Ok(RunReport {
@@ -379,7 +460,12 @@ pub fn run(config: RunConfig) -> anyhow::Result<RunReport> {
         scope_released: snap.released,
         scope_current_at_drain: snap.current,
         scope_high_water_at_drain: snap.high_water,
-        discovery_lines: vec![scope_line, surface_line],
+        body_high_water: body_pre.high_water,
+        body_full_count: body_snap.full_count,
+        body_admitted: body_snap.admitted,
+        body_released: body_snap.released,
+        body_current_at_drain: body_snap.current,
+        discovery_lines: vec![scope_line, body_line, surface_line],
         summary_line,
     })
 }

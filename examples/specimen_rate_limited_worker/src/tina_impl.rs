@@ -1,7 +1,10 @@
 //! Tina side. The worker is a single isolate with a bounded mailbox.
-//! Rate limiting is the worker's own state machine: each `Submit`
-//! either kicks off `sleep(RATE_WINDOW)` or buffers as `pending` until
-//! the in-flight Tick lands.
+//! Pacing is a `tina_runtime::RateLimit` token bucket: on each "ready to
+//! work" moment the worker asks `try_admit((), ctx.now())`. `Admitted`
+//! means process one job now; `RateLimited { retry_after }` means sleep
+//! exactly that long and ask again. The rate window is no longer a
+//! hand-rolled `sleep(RATE_WINDOW)` constant — it falls out of the
+//! limiter's deterministic `retry_after`.
 //!
 //! The producer fires non-blocking `try_send_outcome(...)` against a
 //! shared `HostBurstOutcomes` (Phase 062 Rocks 3 & 4). The worker
@@ -13,12 +16,14 @@
 //!
 //! - **Bounded mailbox is the data plane.** No internal `VecDeque`
 //!   for queued submits; the runtime mailbox holds them.
-//! - **Rate window via timer continuation.** `sleep(...).then(Tick)`
-//!   is one trace event per processed job. No hidden interval timer.
-//! - **One in-flight Tick at a time.** A `pending` counter inside
-//!   the isolate serializes submits over the rate window — without
-//!   it, multiple `sleep` continuations would fire in parallel and
-//!   the rate limit would not exist.
+//! - **Pacing is a real admission policy.** `RateLimit<()>` with burst 1
+//!   admits one job, then returns `RateLimited { retry_after }` until a
+//!   token refills. The worker owns the wait (`sleep(retry_after)`); the
+//!   limiter never sleeps for it. `ctx.now()` drives the bucket, so the
+//!   path is replayable.
+//! - **One in-flight pace timer at a time.** A `pacing` flag plus an
+//!   explicit `pending` count serialize work over the rate window —
+//!   without them, multiple `sleep` continuations would fire in parallel.
 //! - **End-of-burst as a Tina message.** The host signals "no more
 //!   submits" via [`WorkerMsg::BurstClosed`] (sent through the same
 //!   bounded mailbox) so the worker stops the moment its `processed`
@@ -32,8 +37,8 @@ use std::time::{Duration, Instant};
 
 use tina::prelude::*;
 use tina_runtime::{
-    DefaultThreadedMailboxFactory, HostBurstOutcomes, SingleCallGate, SleepReply, ThreadedRuntime,
-    sleep,
+    AdmissionDecision, DefaultThreadedMailboxFactory, HostBurstOutcomes, RateLimit, SleepReply,
+    ThreadedRuntime, sleep,
 };
 
 use crate::{BURST_JOBS, QUEUE_CAPACITY, RATE_WINDOW_MS, Report};
@@ -44,9 +49,9 @@ enum WorkerMsg {
     /// the worker only logs it (and we deliberately bind it in the
     /// handler so the payload stays a real lesson, not a unit hole).
     Submit(u32),
-    /// Sleep continuation marking "this job is done." Carries
-    /// `SleepReply` so the canonical reply alias is visible at the
-    /// reply site; the handler pattern-matches it.
+    /// Backoff continuation marking "the rate window elapsed, try the next
+    /// job." Carries `SleepReply` so a cancelled timer (shutdown) is
+    /// visible at the reply site.
     Tick(SleepReply),
     /// Host has finished bursting; the value names the final admitted
     /// count so the worker can stop the moment its `processed` count
@@ -56,19 +61,18 @@ enum WorkerMsg {
 }
 
 struct Worker {
-    rate_window: Duration,
+    /// Pacing policy. `try_admit((), now)` is the rate gate; its
+    /// `retry_after` is the worker's sleep budget. Single global key `()`.
+    limiter: RateLimit<()>,
     report: Report,
     processed: u32,
-    /// Single-in-flight timer guard. Bounded by the mailbox cap — the
-    /// host stops sending past [`QUEUE_CAPACITY`].
-    ///
-    /// Phase-062 Rock 5: the `pending` / `was_idle` invariant is named
-    /// by [`tina_runtime::SingleCallGate`] instead of being repeated
-    /// inline.
-    gate: SingleCallGate,
+    /// Jobs admitted into the worker but not yet processed.
+    pending: u32,
+    /// `true` while a backoff `Tick` timer is in flight. Serializes the
+    /// pace loop to one outstanding timer.
+    pacing: bool,
     /// `Some(n)` after [`WorkerMsg::BurstClosed`] arrives, naming the
-    /// final admitted count the worker should stop at. `None` while
-    /// the host is still bursting.
+    /// final admitted count the worker should stop at.
     expected: Option<u32>,
     /// Last job index the worker processed. Tracked so `Submit(u32)`
     /// is bound and read deliberately rather than ignored.
@@ -77,40 +81,28 @@ struct Worker {
 
 #[tina_runtime::isolate(message = WorkerMsg)]
 impl Worker {
-    fn handle(&mut self, msg: WorkerMsg, _ctx: &mut Context<'_, SingleShard, Self::Reply>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: WorkerMsg,
+        ctx: &mut Context<'_, SingleShard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             WorkerMsg::Submit(index) => {
                 self.report.jobs_admitted += 1;
                 self.last_index = Some(index);
-                // SingleCallGate names the "one in-flight Tick at a
-                // time" invariant. `submit()` returns true on the
-                // very first piece of work and false while a Tick is
-                // still racing the rate window.
-                if self.gate.submit() {
-                    sleep(self.rate_window).then(WorkerMsg::Tick)
-                } else {
-                    noop()
-                }
+                self.pending += 1;
+                // Kick the pace loop only if no timer is already in flight.
+                if self.pacing { noop() } else { self.drive(ctx) }
             }
             WorkerMsg::Tick(reply) => {
-                // The sleep is plain time. If it was cancelled (e.g.,
-                // runtime shutdown), bail out cleanly rather than
-                // pretend a job finished.
+                // The backoff sleep is plain time. If it was cancelled
+                // (e.g., runtime shutdown), bail out cleanly.
                 if reply.is_err() {
                     self.report.exit_clean = false;
                     return stop_with(self.report);
                 }
-                self.processed += 1;
-                self.report.jobs_processed = self.processed;
-                let more_work = self.gate.complete();
-                if self.is_done() {
-                    self.report.exit_clean = true;
-                    stop_with(self.report)
-                } else if more_work {
-                    sleep(self.rate_window).then(WorkerMsg::Tick)
-                } else {
-                    noop()
-                }
+                self.pacing = false;
+                self.drive(ctx)
             }
             WorkerMsg::BurstClosed(admitted) => {
                 self.expected = Some(admitted);
@@ -126,12 +118,65 @@ impl Worker {
 }
 
 impl Worker {
+    /// Process as many pending jobs as the limiter currently allows, then
+    /// either stop (done), schedule a backoff `Tick` (rate-limited), or go
+    /// idle (no pending). With burst 1 the loop processes exactly one job
+    /// per turn, so this paces one job per refill window.
+    fn drive(&mut self, ctx: &mut Context<'_, SingleShard, ()>) -> Effect<Self> {
+        loop {
+            if self.pending == 0 {
+                // Nothing to do right now. Stop if the burst is closed and
+                // we've caught up; otherwise wait for the next Submit.
+                return if self.is_done() {
+                    self.report.exit_clean = true;
+                    stop_with(self.report)
+                } else {
+                    noop()
+                };
+            }
+            match self.limiter.try_admit(&(), ctx.now()) {
+                AdmissionDecision::Admitted(_grant) => {
+                    self.processed += 1;
+                    self.pending -= 1;
+                    self.report.jobs_processed = self.processed;
+                    if self.is_done() {
+                        self.report.exit_clean = true;
+                        return stop_with(self.report);
+                    }
+                    // Loop: try the next job. Within one turn `ctx.now()` is
+                    // fixed, so burst 1 means the next iteration is
+                    // RateLimited and we fall through to the sleep.
+                }
+                AdmissionDecision::RateLimited { retry_after, .. } => {
+                    self.pacing = true;
+                    return sleep(retry_after).then(WorkerMsg::Tick);
+                }
+                // Single global key `()` in a 1-key table that is always
+                // present, never closed — these arms are unreachable.
+                AdmissionDecision::Full(_)
+                | AdmissionDecision::Closed(_)
+                | AdmissionDecision::Wait { .. }
+                | AdmissionDecision::Degrade { .. }
+                | AdmissionDecision::TimedOut(_) => {
+                    self.report.exit_clean = false;
+                    return stop_with(self.report);
+                }
+            }
+        }
+    }
+
     fn is_done(&self) -> bool {
         match self.expected {
-            Some(expected) => self.gate.is_idle() && self.processed >= expected,
+            Some(expected) => self.pending == 0 && !self.pacing && self.processed >= expected,
             None => false,
         }
     }
+}
+
+/// Tokens per second that reproduce one job per [`RATE_WINDOW_MS`].
+fn rate_per_sec() -> u64 {
+    // 1 token per RATE_WINDOW_MS = 1000 / RATE_WINDOW_MS tokens/sec.
+    (1_000 / RATE_WINDOW_MS).max(1)
 }
 
 pub fn run() -> anyhow::Result<Report> {
@@ -141,10 +186,12 @@ pub fn run() -> anyhow::Result<Report> {
     ));
 
     let worker = Worker {
-        rate_window: Duration::from_millis(RATE_WINDOW_MS),
+        // burst 1 → one job, then pace at one per refill window.
+        limiter: RateLimit::new("rate_limited_worker.pace", 1, rate_per_sec(), 1),
         report: Report::default(),
         processed: 0,
-        gate: SingleCallGate::new(),
+        pending: 0,
+        pacing: false,
         expected: None,
         last_index: None,
     };

@@ -14,6 +14,63 @@ valid; the long-form history lives in
 Finding numbers are stable across phases — when a finding closes it
 moves to the [Closed](#closed) section below with the same number.
 
+### Admission and rate policy ergonomics
+
+**Surfaced by:** `system_tenant_rate_limiter`, `system_api_gateway_limits`,
+`specimen_rate_limited_worker`, `specimen_idempotent_retry`.
+
+What felt good:
+
+- One decision shape (`AdmissionDecision`) reads identically across every
+  limiter — gateway, tenant rate limiter, pacing worker, retry relay all
+  match the same `Admitted | Full | RateLimited { retry_after } | Wait |
+  Degrade | Closed | TimedOut`. Learn it once, use it everywhere.
+- Passing `now` in explicitly (`try_admit(&key, ctx.now())`) feels like
+  boilerplate until replay. The sim test runs the exact same line under
+  virtual time and gets byte-identical decisions across runs *and across
+  seeds*. The boilerplate buys determinism nothing else can.
+- `retry_after` is exact, not approximate — time-based tests assert
+  `== 100ms` and `== ["k=ok", "k=rate(100ms)"]` with no jitter tolerance.
+- Move-only permits + RAII release: parking a `SharedLease` as a
+  `GuardedPendingReplies` guard makes owner-stop release fall out for free
+  (`current == 0` after shutdown is the proof).
+- `FullHandling` composition keeps retry visibly caller-owned, and
+  "idempotency key named on the message" is the right home for the safety
+  claim.
+
+What felt rough:
+
+- **`ConcurrencyPermit` is not drop-to-release, but `SharedLease` is**, and
+  the mismatch fights the deferred-reply pattern. `GuardedPendingReplies`
+  releases its guard by *dropping* it; a dropped `ConcurrencyPermit` leaks
+  the inner `LocalPermitGate` permit (loudly, but still a leak), while a
+  dropped `SharedLease` releases clean. This is why
+  `system_api_gateway_limits` stayed on raw `SharedCapacityScope` +
+  `SharedLease` instead of migrating to `ConcurrencyLimit`. **Build:** a
+  park-friendly concurrency charge that releases on drop (or a guarded
+  pending box that calls an explicit releaser), so the local-gate path
+  composes with multi-turn parking the way shared leases already do.
+- **Charging two shared budgets per request is manual two-phase with
+  rollback.** The gateway charges in-flight, then body bytes, and must
+  `drop(in_flight)` on body-full or it leaks; forgetting the rollback is
+  silent. `ConcurrencyLimit::with_shared_scope` takes only one scope.
+  **Build:** a multi-scope charge that admits all-or-nothing and rolls back
+  atomically.
+- **The exhaustive 7-variant match is honest but verbose.** A policy that
+  can only produce 2–3 variants (`RateLimit<()>` in the pacing worker)
+  still forces a pile of `_ => unreachable!()`. `into_admitted()` saves the
+  tests; handlers usually want a per-variant reply and eat the match.
+  **Build (maybe):** a decision→reply mapping helper, or narrower decision
+  subsets per policy.
+- `PressureAction` on `RateLimit` governs only the *table-full* path, not
+  the per-key rate decision (which always returns `RateLimited`). Correct,
+  but `on_table_pressure` needs a comment so a reader doesn't expect it to
+  reshape rate-limit rejections.
+- `evict_key_for_capacity` is a footgun the type system can't guard —
+  convention + the `evicted_count()` counter only. And the
+  `KeyedLimit`-has-no-eviction / `RateLimit`-does asymmetry (live permits
+  would dangle) takes a beat to internalize.
+
 ### Protocol facts to replay (Phase 112)
 
 What felt good:

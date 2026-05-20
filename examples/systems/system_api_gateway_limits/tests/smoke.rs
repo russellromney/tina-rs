@@ -120,6 +120,64 @@ fn owner_stop_releases_charges_when_isolate_is_torn_down_mid_flight() {
 }
 
 #[test]
+fn body_bytes_budget_fills_independently_of_in_flight() {
+    // Make the in-flight budget loose (cap 100) and the body-bytes budget
+    // the binding constraint: cap 1500 with 1024-byte uploads means a
+    // second concurrent upload (2048 > 1500) is refused by the body
+    // surface, not the in-flight surface.
+    let config = RunConfig {
+        shared_cap: 100,
+        upload_weight: 1,
+        list_weight: 1,
+        body_cap: 1_500,
+        upload_body: 1_024,
+        list_body: 128,
+        upload_callers: 4,
+        list_callers: 0,
+        upload_hold_ms: 120,
+        call_timeout_ms: 4_000,
+        ..RunConfig::default()
+    };
+    let report = run(config).expect("gateway run");
+
+    assert_eq!(
+        report.upload_admitted + report.upload_full,
+        4,
+        "every upload caller saw a reply: {report:?}",
+    );
+    // The in-flight budget never binds (cap 100 vs peak weight 4).
+    assert_eq!(
+        report.scope_full_count, 0,
+        "in-flight budget should not be the constraint here: {report:?}",
+    );
+    // The body-bytes budget IS the constraint.
+    assert!(
+        report.body_full_count > 0,
+        "body-bytes cap 1500 with 1024-byte uploads must refuse some: {report:?}",
+    );
+    assert_eq!(
+        report.body_full_count as usize, report.upload_full,
+        "every Full here came from the body surface: {report:?}",
+    );
+    // Both budgets drain to zero on owner stop.
+    assert_eq!(report.scope_current_at_drain, 0, "{report:?}");
+    assert_eq!(report.body_current_at_drain, 0, "{report:?}");
+    assert_eq!(
+        report.body_admitted, report.body_released,
+        "every charged byte must be released: {report:?}",
+    );
+    // The body surface has its own grep-friendly discovery line.
+    assert!(
+        report
+            .discovery_lines
+            .iter()
+            .any(|l| l.starts_with("scope ") && l.contains("name=gateway.body_bytes")),
+        "missing body-bytes discovery line: {:?}",
+        report.discovery_lines,
+    );
+}
+
+#[test]
 fn pure_upload_burst_fills_only_upload_lane_then_drains() {
     // No list callers; uploads alone should fill the shared scope
     // because shared_cap=4 / weight=2 = 2 concurrent uploads.

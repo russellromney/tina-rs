@@ -1,0 +1,11 @@
+error: cannot construct `KeyedPermit<_>` with struct literal syntax due to private fields
+  --> tests/admission_compile_fail/keyed_permit_forged.rs:11:37
+   |
+11 |     let _forged: KeyedPermit<u32> = KeyedPermit {
+   |                                     ^^^^^^^^^^^
+12 |         inner: None,
+   |         ----------- private field
+13 |         _key: PhantomData,
+   |         ----------------- private field
+   |
+   = note: ...and other private field `gate_id` that was not provided

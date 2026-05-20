@@ -18,6 +18,17 @@
 //! pushes the Nth job). The smoke tests assert structural properties
 //! rather than exact counts: every burst job is accounted for,
 //! overload was visible, and every admitted job was processed.
+//!
+//! Note on naming: the "rate" here is *throughput pacing*, not *admission
+//! rate limiting* (accept/reject at the door). The Tina side paces with a
+//! `tina_runtime::RateLimit<()>` token bucket — `try_admit((), ctx.now())`
+//! returns `Admitted` (process one) or `RateLimited { retry_after }` (sleep
+//! that long, then ask again) — so the rate window falls out of the
+//! limiter's deterministic `retry_after` instead of a hand-rolled sleep.
+//! The overload signal is still the bounded mailbox, mirrored on the Tokio
+//! side so the two implementations report structurally identical numbers.
+//! For the *reject-at-the-door* use of the same primitive — admit or refuse
+//! per tenant — see `examples/systems/system_tenant_rate_limiter`.
 
 pub mod tina_impl;
 pub mod tokio_impl;
@@ -63,5 +74,8 @@ pub fn assert_report_invariants(side: &str, report: &Report) {
         report.jobs_processed, report.jobs_admitted,
         "{side}: every admitted job should have been processed, got {report:?}",
     );
-    assert!(report.exit_clean, "{side}: expected exit_clean, got {report:?}");
+    assert!(
+        report.exit_clean,
+        "{side}: expected exit_clean, got {report:?}"
+    );
 }
