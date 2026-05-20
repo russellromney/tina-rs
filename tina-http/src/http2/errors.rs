@@ -19,6 +19,7 @@ pub(super) const ERR_CANCEL: u32 = 0x8;
 pub(super) const ERR_ENHANCE_YOUR_CALM: u32 = 0xb;
 
 /// Protocol/lifecycle errors surfaced by the frame and connection layers.
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Http2ProtocolError {
     BadPreface,
@@ -32,6 +33,12 @@ pub enum Http2ProtocolError {
     HeadersTooLarge,
     HpackUnsupported,
     InvalidPseudoHeaders,
+    /// HEADERS / trailers carried a pseudo-header forbidden in that
+    /// position (e.g., `:status` in trailers).
+    InvalidTrailerPseudoHeader,
+    /// DATA arrived before any HEADERS were received on the stream.
+    /// Connection-level protocol error per RFC 9113 §8.1.
+    DataBeforeHeaders,
     StreamClosed,
     StreamLimitFull,
     WindowOverflow,
@@ -47,6 +54,18 @@ pub enum Http2ProtocolError {
     /// HTTP/2 `content-length` header was malformed, conflicted across
     /// duplicates, or DATA bytes did not match the declared length.
     ContentLengthMismatch,
+    /// Response body bytes exceeded the client cap. Distinct from
+    /// `HeadersTooLarge` so callers can tell apart a too-large head from
+    /// a too-large body.
+    BodyTooLarge {
+        cap_bytes: usize,
+    },
+    /// Outbound HEADERS block does not fit in one frame and CONTINUATION
+    /// is not supported by this first form. Stream id was not consumed.
+    OutboundHeadersTooLarge,
+    /// Stream id space exhausted (2^31 client streams). The connection
+    /// must be retired; a new one needs to be opened for further work.
+    StreamIdExhausted,
 }
 
 /// Maps an HTTP/2 wire error code to the typed [`Http2ResetReason`].

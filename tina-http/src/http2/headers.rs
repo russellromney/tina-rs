@@ -268,3 +268,24 @@ pub(super) fn validate_response_headers(headers: &HeaderBlock) -> Result<(), Htt
     }
     Ok(())
 }
+
+/// Validate an inbound trailer block (the second HEADERS on a response
+/// stream). RFC 9113 §8.1 forbids pseudo-headers, `content-length`, and
+/// connection-control headers in trailers. Returns
+/// [`Http2ProtocolError::InvalidTrailerPseudoHeader`] when a pseudo-header
+/// is present, [`Http2ProtocolError::ContentLengthMismatch`] when a
+/// `content-length` trailer is observed.
+pub(super) fn validate_trailer_block(headers: &HeaderBlock) -> Result<(), Http2ProtocolError> {
+    if headers.method.is_some()
+        || headers.path.is_some()
+        || headers.scheme.is_some()
+        || headers.authority.is_some()
+        || headers.status.is_some()
+    {
+        return Err(Http2ProtocolError::InvalidTrailerPseudoHeader);
+    }
+    if headers.saw_content_length {
+        return Err(Http2ProtocolError::ContentLengthMismatch);
+    }
+    Ok(())
+}

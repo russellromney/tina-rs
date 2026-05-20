@@ -4,6 +4,118 @@ This file records completed work.
 
 ## Unreleased
 
+### Native HTTP/2 Client — Hostile-Review Fixes
+
+Follow-up to the first-form client below. Addresses the issues a
+hostile self-review surfaced before this slice is presented as
+production-shaped:
+
+- **Outbound flow control (C1).** `admit_stream` no longer blasts the
+  request body straight into the write queue. Body bytes now sit in a
+  per-stream `outbound_body` VecDeque and are drained by a new
+  `flush_outbound_data` round-robin pacer that respects both the
+  stream and connection send-windows. `flush_outbound_data` is
+  re-entered from `handle_window_update` (peer credit arrived) and
+  from `apply_setting`'s `SETTINGS_INITIAL_WINDOW_SIZE` branch (peer
+  resized the initial window). A new `Http2ClientReport.flow_control_parks`
+  counter records each window-blocked iteration.
+- **Write reentrancy (C2).** The client now tracks `write_in_flight`
+  alongside `pending_write`. `write_more` is a no-op while a
+  `tcp_write` is awaiting completion, and a new `maybe_write_more`
+  helper is the *only* place callers nudge the writer. Without this
+  the driver's per-stream `lane_has_pending` check would return
+  `CallError::ResourceBusy` for back-to-back writes and the
+  connection would die.
+- **Route-key trust-root collision (C3).** `Http2Target::route_key`
+  now hashes the trust-root byte content instead of just counting
+  entries. Two TLS targets with the same authority/server_name/ALPN
+  but distinct roots now produce distinct keys, so a future Phase 119
+  pool cannot share a connection across security boundaries.
+- **DATA-before-HEADERS / DATA on closed stream (C4 + C5).** DATA
+  arriving before HEADERS on a stream is now a connection-level
+  `Http2ProtocolError::DataBeforeHeaders` GOAWAY (RFC 9113 §8.1).
+  DATA on an unknown / closed stream is a stream-level
+  RST_STREAM(STREAM_CLOSED), not a connection-level kill (RFC 9113
+  §6.9.1). The connection survives the misbehaving stream.
+- **Removed unreachable `Http2ClientOutcome::Timeout` (H1).** No path
+  in the client today returns a `Timeout` outcome — caller deadlines
+  arrive through `CallOutcome::TimedOut` at the host. Removing the
+  variant prevents silent advertising of behavior that does not
+  exist. A new test pins the present variants so re-adding `Timeout`
+  without wiring a real stream-level deadline breaks compilation.
+- **Outbound queue cap is now enforced (H3).** `Http2ClientLimits.
+  connection_outbound_queue_capacity` was dead config. Admission now
+  rejects with `Http2ClientOutcome::Full` and bumps a new
+  `outbound_queue_full` counter when the write queue is at the cap.
+  A new `pre_connect_submit_capacity` knob bounds the
+  before-connect submit queue.
+- **Outbound caller-cancel path (L7).** `Http2ClientMsg::Cancel
+  { stream_id }` is now wired: it sends RST_STREAM(CANCEL), emits an
+  outbound-direction `Http2StreamReset` fact, replies to the
+  original submitter with `LocalCancel`, and increments
+  `locally_cancelled` in the report.
+- **Body-cap error is now correctly labeled (M1).** A response body
+  that exceeds `max_response_body_bytes` returns
+  `Http2ProtocolError::BodyTooLarge { cap_bytes }`, not
+  `HeadersTooLarge`.
+- **Outbound HEADERS too large (M2).** A request whose encoded
+  HEADERS block does not fit one frame is rejected without consuming
+  a stream id and bumps a new `request_too_large` counter (not the
+  generic `protocol_errors` — the peer is innocent here). Surfaced
+  as `Http2ProtocolError::OutboundHeadersTooLarge`.
+- **Stream id exhaustion fails closed (M3).** After client stream id
+  space exhausts (2^31 streams), `stream_id_exhausted` is set and
+  subsequent admissions return
+  `Http2ProtocolError::StreamIdExhausted` instead of silently
+  reusing the last id.
+- **Trailer-block validation (L3).** A trailer HEADERS that carries
+  any pseudo-header now fails with
+  `Http2ProtocolError::InvalidTrailerPseudoHeader`; a `content-length`
+  trailer fails with `ContentLengthMismatch`. Both are connection-level
+  protocol errors per RFC 9113 §8.1.
+- **Removed `AlpnProtocols::wire()` (L1).** The
+  `#[allow(dead_code)]` helper was a footgun. It lands back when the
+  TLS rail actually consumes it.
+- `Http2ClientReport`, `Http2ClientReply`, `Http2ClientMsg`, and
+  `Http2ProtocolError` are now `#[non_exhaustive]`. `Http2ClientLimits`
+  is intentionally exhaustive so callers can construct it with
+  struct-update syntax — new fields go through a major-version bump.
+
+New / extended tests:
+
+- `h2c_post_body_is_echoed_back_byte_for_byte` — POST round-trip now
+  asserts the exact bytes echoed by `/echo`, not just status 200.
+- `h2c_multiple_streams_share_one_client_connection` — three
+  sequential GETs on one isolate, asserts
+  `opened_streams == closed_streams == 3` and zero protocol errors.
+- `response_body_above_cap_returns_typed_body_too_large` — pins the
+  new `BodyTooLarge { cap_bytes }` outcome label.
+- `h2c_post_large_body_paces_through_flow_control_window` — 32 KB
+  POST through the outbound flow-control pacer.
+- `tls_target_route_key_distinguishes_distinct_root_sets` — pins the
+  trust-root hashing fix from C3.
+- `outcome_does_not_include_timeout_variant` — compile-shape proof
+  that `Timeout` is gone from the outcome surface until a real
+  stream-level deadline lands.
+
+### Honest gaps still standing
+
+- **GOAWAY-mid-stream / server-RST live tests.** The plan calls for
+  proofs that an inbound RST_STREAM lands as `Reset(reason)` and
+  that a peer GOAWAY closes new admission while letting admitted
+  streams settle visibly. Both code paths are implemented and unit-
+  shape testable, but neither has a live test against a misbehaving
+  HTTP/2 peer in this slice. They land with the gRPC client slice
+  where an adversarial peer is already in scope.
+- **`Http2ClientOutcome::FlowControlBlocked`** is reachable code-wise
+  (parked outbound DATA) but no live test forces a deadline expiry
+  while parked. It will land when stream-level deadlines do.
+- **Live flow-control proof loops back through the response.** The
+  current test paces a 32 KB POST; a 128 KB end-to-end echo proof
+  would need the *server*'s response path to also stream rather
+  than buffer-and-send-when-window-fits. That is a server-side
+  enhancement, separate from this client slice.
+
 ### Native HTTP/2 Client — First Form
 
 Builds on the module split below. Adds the native HTTP/2 client

@@ -8,6 +8,8 @@
 //! caller wants a non-ALPN TLS connection. The h2c target never touches
 //! TLS rails.
 
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::net::SocketAddr;
 
 /// ALPN protocol list offered by a TLS-shaped Tina connect/accept.
@@ -40,16 +42,6 @@ impl AlpnProtocols {
     /// `TlsAlpnMismatch` variant carried back through `Http2ClientOutcome`.
     pub fn h2() -> Self {
         Self(AlpnProtocolsRepr::H2)
-    }
-
-    /// Wire bytes for rustls `alpn_protocols`. `None` means "do not set"
-    /// (no ALPN extension offered).
-    #[allow(dead_code)] // consumed when ALPN rail lands in tina-runtime
-    pub(crate) fn wire(&self) -> Option<Vec<Vec<u8>>> {
-        match &self.0 {
-            AlpnProtocolsRepr::None => None,
-            AlpnProtocolsRepr::H2 => Some(vec![b"h2".to_vec()]),
-        }
     }
 
     /// Returns true if the ALPN list is `h2`.
@@ -115,8 +107,14 @@ impl Http2Target {
     /// Reuse is "one connection isolate carries many admitted streams"
     /// (Phase 116 first form). Idle eviction, max lifetime, and health
     /// policy are Phase 119. The route key folds authority and the
-    /// TLS/root/ALPN policy so two configurations that differ in
-    /// trust roots do not share a connection.
+    /// TLS/root/ALPN policy so two configurations that differ in trust
+    /// roots do not share a connection.
+    ///
+    /// `trust_roots` is hashed (DefaultHasher is sufficient for sharding;
+    /// the key is never used as a security boundary on its own — the TLS
+    /// rail still validates against the actual roots — so collision
+    /// resistance only needs to keep two distinct sets in distinct
+    /// pool slots).
     pub fn route_key(&self) -> String {
         match self {
             Self::H2c { authority, .. } => format!("h2c::{authority}"),
@@ -128,8 +126,12 @@ impl Http2Target {
                 ..
             } => {
                 let alpn_tag = if alpn.is_h2() { "h2" } else { "none" };
-                let roots_tag = trust_roots.len();
-                format!("tls::{authority}@{server_name}:{alpn_tag}:{roots_tag}")
+                let mut hasher = DefaultHasher::new();
+                for root in trust_roots {
+                    root.hash(&mut hasher);
+                }
+                let roots_hash = hasher.finish();
+                format!("tls::{authority}@{server_name}:{alpn_tag}:{roots_hash:016x}")
             }
         }
     }
