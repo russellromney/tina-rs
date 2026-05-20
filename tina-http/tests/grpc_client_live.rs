@@ -20,8 +20,8 @@ use prost::Message;
 use tina::prelude::*;
 use tina_http::{
     GrpcClient, GrpcError, GrpcLimits, GrpcRequest, GrpcResponse, GrpcRouter, GrpcStatus,
-    GrpcStatusCode, GrpcUnaryOutcome, Http2ClientConnection, Http2ClientLimits, Http2ClientMsg,
-    Http2Listener, Http2ListenerMsg, Http2ServerConfig, Http2Target,
+    GrpcStatusCode, GrpcTarget, GrpcUnaryOutcome, Http2ClientConnection, Http2ClientLimits,
+    Http2ClientMsg, Http2Listener, Http2ListenerMsg, Http2ServerConfig, Http2Target,
 };
 use tina_runtime::{
     CallOutcome, DefaultThreadedMailboxFactory, ProtocolFact, RuntimeEventKind, RuntimeFact,
@@ -101,20 +101,19 @@ fn make_grpc_client(
     runtime: &ThreadedRuntime<TestShard, DefaultThreadedMailboxFactory>,
     addr: SocketAddr,
 ) -> GrpcClient {
-    let target = Http2Target::H2c {
-        authority: "grpc-test".into(),
-        addr,
-    };
+    // Drive construction through the typed GrpcTarget so it stays
+    // load-bearing (not just an exported shape).
+    let target = GrpcTarget::h2c("grpc-test", addr);
     let conn = runtime
         .register_with_capacity::<Http2ClientConnection<TestShard>, _>(
-            Http2ClientConnection::<TestShard>::new(target, Http2ClientLimits::default()),
+            target.http2_connection::<TestShard>(),
             32,
         )
         .expect("register client connection");
     runtime
         .try_send(conn, Http2ClientMsg::Begin)
         .expect("begin client");
-    GrpcClient::new(conn, GrpcLimits::default())
+    GrpcClient::new(conn, target.limits())
 }
 
 fn call_unary<Req: Message, Resp: Message + Default>(
@@ -189,6 +188,34 @@ fn unary_non_ok_status_is_the_caller_outcome_not_a_success() {
             assert_eq!(status.message.as_deref(), Some("no such counter"));
         }
         other => panic!("expected Status(NotFound), got {other:?}"),
+    }
+
+    let _ = runtime.try_send(listener, Http2ListenerMsg::Stop);
+    let _ = runtime.try_send(client.connection(), Http2ClientMsg::Stop);
+    let _ = runtime.shutdown();
+}
+
+#[test]
+fn unknown_method_returns_unimplemented_status() {
+    // The Tina gRPC server answers an unrouted path with HTTP 200 +
+    // grpc-status Unimplemented (a trailers-only response). The client
+    // must surface that as a typed Status, reading grpc-status from the
+    // header block.
+    let runtime = runtime();
+    let (listener, addr) = start_server(&runtime);
+    let client = make_grpc_client(&runtime, addr);
+
+    let outcome: GrpcUnaryOutcome<CounterReply> = call_unary(
+        &runtime,
+        &client,
+        "/specimen.Counter/DoesNotExist",
+        &CounterRequest { delta: 0 },
+    );
+    match outcome {
+        GrpcUnaryOutcome::Status(status) => {
+            assert_eq!(status.code, GrpcStatusCode::Unimplemented);
+        }
+        other => panic!("expected Status(Unimplemented), got {other:?}"),
     }
 
     let _ = runtime.try_send(listener, Http2ListenerMsg::Stop);

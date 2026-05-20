@@ -4,6 +4,31 @@ This file records completed work.
 
 ## Unreleased
 
+### Native gRPC Client — Hostile-Review Fixes
+
+A hostile pass on the unary client found three issues, now fixed:
+
+- **Non-200 HTTP status was mislabeled `Malformed(BadFrame)`**, discarding
+  the gRPC HTTP-status mapping. `decode_unary` now treats an explicit
+  `grpc-status` as authoritative (regardless of HTTP status), and a
+  non-200 response *without* a `grpc-status` is synthesized into a typed
+  gRPC status per `grpc/doc/http-grpc-status-mapping.md` (404 →
+  `Unimplemented`, 401 → `Unauthenticated`, 403 → `PermissionDenied`,
+  429/502/503/504 → `Unavailable`, else `Unknown`). A 200 with no
+  `grpc-status` stays `Malformed(MissingTrailers)`. Six unit tests pin
+  the branches plus the mapping table.
+- **`GrpcTarget` was exported but never consumed.** It is now
+  load-bearing: `GrpcTarget::http2_connection::<S>()` builds the
+  connection isolate and `GrpcTarget::limits()` feeds `GrpcClient::new`.
+  The live test and the next caller construct through it.
+- **`unary_request` did not validate the method path.** It now
+  `debug_assert!`s an absolute (`/`-prefixed) path, catching a relative
+  path that would produce an invalid `:path` pseudo-header.
+
+New live test `unknown_method_returns_unimplemented_status` proves an
+unrouted method surfaces as `Status(Unimplemented)` (the server answers
+trailers-only).
+
 ### Native gRPC Client — Unary First Form
 
 The plan's second-half keystone: Tina is now a native gRPC *client*, not
