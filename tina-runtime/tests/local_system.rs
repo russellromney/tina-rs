@@ -2601,8 +2601,8 @@ mod unix_live_echo {
     use super::*;
     use tina_runtime::{
         UnixAcceptReply, UnixBindReply, UnixConnectReply, UnixReadReply, UnixStreamId,
-        UnixWriteReply, unix_accept, unix_bind, unix_close_stream, unix_connect, unix_read,
-        unix_write,
+        UnixWriteReply, unix_accept, unix_bind, unix_close_listener, unix_close_stream,
+        unix_connect, unix_read, unix_write,
     };
 
     fn unique_sock(label: &str) -> PathBuf {
@@ -2784,6 +2784,144 @@ mod unix_live_echo {
         let _ = app.shutdown().drain().join().expect("shutdown");
         let _ = std::fs::remove_file(&path);
         assert_eq!(received.lock().expect("received lock").as_slice(), b"ping");
+    }
+
+    #[derive(Debug)]
+    enum BindProbeMsg {
+        Start,
+        Bound(UnixBindReply),
+    }
+
+    struct BindProbe {
+        path: PathBuf,
+        observed: Arc<Mutex<Option<UnixBindReply>>>,
+    }
+
+    #[tina_runtime::isolate(message = BindProbeMsg, shard = AppShard)]
+    impl BindProbe {
+        fn handle(
+            &mut self,
+            msg: BindProbeMsg,
+            _ctx: &mut Context<'_, AppShard, Self::Reply>,
+        ) -> Effect<Self> {
+            match msg {
+                BindProbeMsg::Start => unix_bind(self.path.clone()).then(BindProbeMsg::Bound),
+                BindProbeMsg::Bound(result) => {
+                    *self.observed.lock().expect("observed lock") = Some(result);
+                    Effect::Stop
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn local_system_unix_bind_does_not_remove_regular_file() {
+        let path = unique_sock("ur");
+        let _ = std::fs::remove_file(&path);
+        std::fs::write(&path, b"keep me").expect("write regular file");
+        let observed = Arc::new(Mutex::new(None));
+
+        let app = LocalSystem::single_shard(AppShard(45), AppMailboxFactory).build();
+        let address = app
+            .register_root::<BindProbe, Infallible>(
+                BindProbe {
+                    path: path.clone(),
+                    observed: Arc::clone(&observed),
+                },
+                8,
+            )
+            .expect("register bind probe");
+        app.try_send(address, BindProbeMsg::Start)
+            .expect("start bind probe");
+
+        wait_until(|| observed.lock().expect("observed lock").is_some());
+        let result = observed.lock().expect("observed lock").take().unwrap();
+        assert!(matches!(result, Err(CallError::Io)), "{result:?}");
+        assert_eq!(
+            std::fs::read(&path).expect("regular file still exists"),
+            b"keep me"
+        );
+        let _ = app.shutdown().drain().join().expect("shutdown");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[derive(Debug)]
+    enum CloseProbeMsg {
+        Start,
+        Bound(UnixBindReply),
+        Close,
+        Closed,
+    }
+
+    struct CloseProbe {
+        path: PathBuf,
+        listener: Option<tina_runtime::UnixListenerId>,
+        bound: Arc<Mutex<bool>>,
+        closed: Arc<Mutex<bool>>,
+    }
+
+    #[tina_runtime::isolate(message = CloseProbeMsg, shard = AppShard)]
+    impl CloseProbe {
+        fn handle(
+            &mut self,
+            msg: CloseProbeMsg,
+            _ctx: &mut Context<'_, AppShard, Self::Reply>,
+        ) -> Effect<Self> {
+            match msg {
+                CloseProbeMsg::Start => unix_bind(self.path.clone()).then(CloseProbeMsg::Bound),
+                CloseProbeMsg::Bound(Ok((listener, _))) => {
+                    self.listener = Some(listener);
+                    *self.bound.lock().expect("bound lock") = true;
+                    noop()
+                }
+                CloseProbeMsg::Bound(Err(_)) => Effect::Stop,
+                CloseProbeMsg::Close => match self.listener.take() {
+                    Some(listener) => unix_close_listener(listener).then(|_| CloseProbeMsg::Closed),
+                    None => Effect::Stop,
+                },
+                CloseProbeMsg::Closed => {
+                    *self.closed.lock().expect("closed lock") = true;
+                    Effect::Stop
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn local_system_unix_close_does_not_remove_replaced_regular_file() {
+        let path = unique_sock("ucr");
+        let _ = std::fs::remove_file(&path);
+        let bound = Arc::new(Mutex::new(false));
+        let closed = Arc::new(Mutex::new(false));
+
+        let app = LocalSystem::single_shard(AppShard(46), AppMailboxFactory).build();
+        let address = app
+            .register_root::<CloseProbe, Infallible>(
+                CloseProbe {
+                    path: path.clone(),
+                    listener: None,
+                    bound: Arc::clone(&bound),
+                    closed: Arc::clone(&closed),
+                },
+                8,
+            )
+            .expect("register close probe");
+        app.try_send(address, CloseProbeMsg::Start)
+            .expect("start close probe");
+        wait_until(|| *bound.lock().expect("bound lock"));
+
+        std::fs::remove_file(&path).expect("remove socket path");
+        std::fs::write(&path, b"replacement").expect("write replacement file");
+        app.try_send(address, CloseProbeMsg::Close)
+            .expect("close listener");
+        wait_until(|| *closed.lock().expect("closed lock"));
+
+        assert_eq!(
+            std::fs::read(&path).expect("replacement file still exists"),
+            b"replacement"
+        );
+        let _ = app.shutdown().drain().join().expect("shutdown");
+        let _ = std::fs::remove_file(&path);
     }
 }
 

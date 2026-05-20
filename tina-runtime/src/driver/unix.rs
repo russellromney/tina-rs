@@ -178,6 +178,7 @@ impl UnixLane {
 mod imp {
     use std::collections::HashSet;
     use std::io::{ErrorKind, Read, Write};
+    use std::os::unix::fs::FileTypeExt;
     use std::os::unix::net::{UnixListener, UnixStream};
     use std::path::PathBuf;
     use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TryRecvError, sync_channel};
@@ -289,8 +290,15 @@ mod imp {
             self.pending.iter().any(|pending| pending.lane == lane)
         }
 
-        fn send(&mut self, call_id: CallId, command: WorkerCommand) -> Option<DriverCompletion> {
+        fn send_pending(
+            &mut self,
+            pending: DriverPending,
+            command: WorkerCommand,
+        ) -> Option<DriverCompletion> {
+            let call_id = pending.call_id;
+            self.pending.push(pending);
             let Some(sender) = &self.commands else {
+                self.pending.retain(|pending| pending.call_id != call_id);
                 return Some(DriverCompletion {
                     call_id,
                     result: CallOutput::Failed(CallError::Io),
@@ -298,10 +306,13 @@ mod imp {
             };
             match sender.try_send(command) {
                 Ok(()) => None,
-                Err(_) => Some(DriverCompletion {
-                    call_id,
-                    result: CallOutput::Failed(CallError::Io),
-                }),
+                Err(_) => {
+                    self.pending.retain(|pending| pending.call_id != call_id);
+                    Some(DriverCompletion {
+                        call_id,
+                        result: CallOutput::Failed(CallError::Io),
+                    })
+                }
             }
         }
 
@@ -314,12 +325,11 @@ mod imp {
                 CallInput::UnixBind { path } => {
                     let listener_id = self.next_listener_id;
                     self.next_listener_id += 1;
-                    self.pending.push(DriverPending {
-                        call_id,
-                        lane: LaneKey::OneShot,
-                    });
-                    self.send(
-                        call_id,
+                    self.send_pending(
+                        DriverPending {
+                            call_id,
+                            lane: LaneKey::OneShot,
+                        },
                         WorkerCommand::Bind {
                             call_id,
                             listener_id,
@@ -330,12 +340,11 @@ mod imp {
                 CallInput::UnixConnect { path } => {
                     let stream_id = self.next_stream_id;
                     self.next_stream_id += 1;
-                    self.pending.push(DriverPending {
-                        call_id,
-                        lane: LaneKey::OneShot,
-                    });
-                    self.send(
-                        call_id,
+                    self.send_pending(
+                        DriverPending {
+                            call_id,
+                            lane: LaneKey::OneShot,
+                        },
                         WorkerCommand::Connect {
                             call_id,
                             stream_id,
@@ -353,9 +362,8 @@ mod imp {
                     }
                     let new_stream_id = self.next_stream_id;
                     self.next_stream_id += 1;
-                    self.pending.push(DriverPending { call_id, lane });
-                    self.send(
-                        call_id,
+                    self.send_pending(
+                        DriverPending { call_id, lane },
                         WorkerCommand::Accept {
                             call_id,
                             listener_id: listener.get(),
@@ -371,9 +379,8 @@ mod imp {
                     if self.lane_busy(lane) {
                         return self.fail(call_id, CallError::ResourceBusy);
                     }
-                    self.pending.push(DriverPending { call_id, lane });
-                    self.send(
-                        call_id,
+                    self.send_pending(
+                        DriverPending { call_id, lane },
                         WorkerCommand::Read {
                             call_id,
                             stream_id: stream.get(),
@@ -389,9 +396,8 @@ mod imp {
                     if self.lane_busy(lane) {
                         return self.fail(call_id, CallError::ResourceBusy);
                     }
-                    self.pending.push(DriverPending { call_id, lane });
-                    self.send(
-                        call_id,
+                    self.send_pending(
+                        DriverPending { call_id, lane },
                         WorkerCommand::Write {
                             call_id,
                             stream_id: stream.get(),
@@ -400,39 +406,45 @@ mod imp {
                     )
                 }
                 CallInput::UnixListenerClose { listener } => {
-                    if !self.open_listeners.remove(&listener.get()) {
+                    if !self.open_listeners.contains(&listener.get()) {
                         return self.fail(call_id, CallError::InvalidResource);
                     }
-                    self.cancel_lane_ops(LaneKey::Accept(listener.get()));
-                    self.pending.push(DriverPending {
-                        call_id,
-                        lane: LaneKey::OneShot,
-                    });
-                    self.send(
-                        call_id,
+                    let result = self.send_pending(
+                        DriverPending {
+                            call_id,
+                            lane: LaneKey::OneShot,
+                        },
                         WorkerCommand::CloseListener {
                             call_id,
                             listener_id: listener.get(),
                         },
-                    )
+                    );
+                    if result.is_none() {
+                        self.open_listeners.remove(&listener.get());
+                        self.cancel_lane_ops(LaneKey::Accept(listener.get()));
+                    }
+                    result
                 }
                 CallInput::UnixStreamClose { stream } => {
-                    if !self.open_streams.remove(&stream.get()) {
+                    if !self.open_streams.contains(&stream.get()) {
                         return self.fail(call_id, CallError::InvalidResource);
                     }
-                    self.cancel_lane_ops(LaneKey::Read(stream.get()));
-                    self.cancel_lane_ops(LaneKey::Write(stream.get()));
-                    self.pending.push(DriverPending {
-                        call_id,
-                        lane: LaneKey::OneShot,
-                    });
-                    self.send(
-                        call_id,
+                    let result = self.send_pending(
+                        DriverPending {
+                            call_id,
+                            lane: LaneKey::OneShot,
+                        },
                         WorkerCommand::CloseStream {
                             call_id,
                             stream_id: stream.get(),
                         },
-                    )
+                    );
+                    if result.is_none() {
+                        self.open_streams.remove(&stream.get());
+                        self.cancel_lane_ops(LaneKey::Read(stream.get()));
+                        self.cancel_lane_ops(LaneKey::Write(stream.get()));
+                    }
+                    result
                 }
                 other => {
                     // The dispatcher only routes Unix variants here.
@@ -732,8 +744,9 @@ mod imp {
                     {
                         let (_, listener, path) = self.listeners.remove(index);
                         drop(listener);
-                        // Remove the socket file the listener owned.
-                        let _ = std::fs::remove_file(&path);
+                        // Remove the socket file the listener owned, unless
+                        // user code replaced the path while it was open.
+                        let _ = remove_socket_file(&path);
                     }
                     self.complete(call_id, CallOutput::UnixListenerClosed)
                 }
@@ -752,8 +765,9 @@ mod imp {
 
         fn do_bind(&mut self, listener_id: u64, path: PathBuf) -> CallOutput {
             // Best-effort: clear a stale socket file so a re-bind at the
-            // same path after an unclean exit succeeds.
-            let _ = std::fs::remove_file(&path);
+            // same path after an unclean exit succeeds. Never remove a
+            // regular file or symlink at a user-supplied path.
+            let _ = remove_socket_file(&path);
             match UnixListener::bind(&path) {
                 Ok(listener) => {
                     if listener.set_nonblocking(true).is_err() {
@@ -902,5 +916,14 @@ mod imp {
     enum OpOutcome {
         Pending,
         Done(CallOutput),
+    }
+
+    fn remove_socket_file(path: &PathBuf) -> std::io::Result<()> {
+        match std::fs::symlink_metadata(path) {
+            Ok(metadata) if metadata.file_type().is_socket() => std::fs::remove_file(path),
+            Ok(_) => Ok(()),
+            Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+        }
     }
 }
