@@ -10,7 +10,9 @@
 //!   half-duplex; full-duplex h2/TLS needs a runtime TLS reactor)
 //! - request body buffered (`Http2ClientRequest`) or streamed from a
 //!   chunk source (`Http2ClientStreamingRequest`); response body
-//!   buffered under an explicit cap
+//!   buffered under an explicit cap, or pulled chunk-by-chunk with
+//!   credit-on-consume backpressure (`Http2ClientMsg::OpenStream` +
+//!   `ResponseNext`)
 //! - SETTINGS / PING / HEADERS / DATA / WINDOW_UPDATE / RST_STREAM /
 //!   GOAWAY frame handling, sharing the helpers in `super::frame` /
 //!   `super::headers` / `super::errors` with the server
@@ -158,6 +160,13 @@ pub struct Http2ClientReport {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Http2ClientOutcome {
     Replied(Http2ClientResponse),
+    /// The response head of an [`Http2ClientMsg::OpenStream`] call: the
+    /// stream opened and the response status + headers arrived. Pull the
+    /// body with [`Http2ClientMsg::ResponseNext`] using `stream_id`.
+    ResponseStreaming {
+        status: StatusCode,
+        headers: HeaderMap,
+    },
     Full,
     Closed,
     Reset(Http2ResetReason),
@@ -222,6 +231,62 @@ pub struct Http2ClientStreamingRequest {
     pub source: tina::Address<ResponseChunkMsg, ResponseChunkReply>,
 }
 
+/// The request body of an [`Http2ClientStreamCall`]: either buffered up
+/// front or streamed from a chunk source. Lets one streaming-response
+/// call shape serve both server-streaming (buffered request) and bidi
+/// (streamed request) gRPC.
+#[derive(Debug, Clone)]
+pub enum Http2ClientRequestBody {
+    /// Whole body known up front. Empty `Vec` = no body (END_STREAM on
+    /// the HEADERS frame).
+    Buffered(Vec<u8>),
+    /// Body pulled chunk-by-chunk from a source, same protocol as
+    /// [`Http2ClientStreamingRequest`].
+    Stream(tina::Address<ResponseChunkMsg, ResponseChunkReply>),
+}
+
+/// A request whose **response** body is delivered incrementally: the
+/// caller pulls response chunks from the connection rather than getting
+/// one buffered [`Http2ClientResponse`]. The request body itself is
+/// either buffered or streamed ([`Http2ClientRequestBody`]).
+///
+/// Submit with the call-only [`Http2ClientMsg::OpenStream`]. The first
+/// reply is an [`Http2ClientOutcome::ResponseStreaming`] carrying the
+/// response head (status + headers) — or a terminal error outcome if the
+/// stream never opened. The caller then pulls the body with
+/// [`Http2ClientMsg::ResponseNext`], one [`Http2ResponseChunk`] per pull,
+/// until `End`/`Reset`/`Closed`. Received DATA is held under the stream
+/// flow-control window and only `WINDOW_UPDATE`-credited as the caller
+/// consumes it, so a slow consumer backpressures the peer.
+#[derive(Debug, Clone)]
+pub struct Http2ClientStreamCall {
+    pub method: Method,
+    pub path: String,
+    pub headers: HeaderMap,
+    pub body: Http2ClientRequestBody,
+}
+
+/// One piece of a streamed response body, returned in
+/// [`Http2ClientReply::ResponseChunk`] per [`Http2ClientMsg::ResponseNext`]
+/// pull.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Http2ResponseChunk {
+    /// A chunk of response body bytes. Pull again for more.
+    Data(Vec<u8>),
+    /// Clean end of the response (END_STREAM). Carries any trailing
+    /// HEADERS block; gRPC reads `grpc-status` from here. The stream is
+    /// now closed — do not pull again.
+    End { trailers: HeaderMap },
+    /// The peer reset the stream (RST_STREAM) before END_STREAM.
+    Reset(Http2ResetReason),
+    /// The connection closed (or GOAWAY refused the stream) before
+    /// END_STREAM.
+    Closed,
+    /// A protocol error closed the stream/connection.
+    ProtocolError(Http2ProtocolError),
+}
+
 /// Messages handled by [`Http2ClientConnection`].
 ///
 /// `Submit` and `Report` are **call-only**: they must be delivered with
@@ -243,6 +308,16 @@ pub enum Http2ClientMsg {
     /// `Submit`, replies once with an [`Http2ClientReply::Outcome`] when
     /// the response completes. **Call-only**.
     SubmitStreaming(Http2ClientStreamingRequest),
+    /// Open a stream whose **response** is delivered incrementally. The
+    /// first reply is an [`Http2ClientOutcome::ResponseStreaming`] head
+    /// (or a terminal error outcome); the caller then pulls the body with
+    /// [`ResponseNext`](Http2ClientMsg::ResponseNext). **Call-only**.
+    OpenStream(Http2ClientStreamCall),
+    /// Pull the next [`Http2ResponseChunk`] of a streamed response,
+    /// identified by `stream_id` (from the `ResponseStreaming` head). One
+    /// pull outstanding per stream; a second concurrent pull is rejected.
+    /// **Call-only**; replies with [`Http2ClientReply::ResponseChunk`].
+    ResponseNext { stream_id: u32 },
     /// Locally cancel an admitted stream by id. The connection emits
     /// RST_STREAM(CANCEL) on the wire and replies to the original
     /// submitter with [`Http2ClientOutcome::LocalCancel`].
@@ -284,6 +359,12 @@ pub enum Http2ClientReply {
         stream_id: u32,
         outcome: Http2ClientOutcome,
     },
+    /// One chunk of a streamed response body, replying to
+    /// [`Http2ClientMsg::ResponseNext`].
+    ResponseChunk {
+        stream_id: u32,
+        chunk: Http2ResponseChunk,
+    },
     /// Report snapshot.
     Report(Http2ClientReport),
 }
@@ -323,6 +404,23 @@ struct ActiveClientStream {
     request_end_sent: bool,
     /// A `ResponseChunkMsg::Next` pull is awaiting its reply.
     request_pull_in_flight: bool,
+    /// True when the caller asked for the response body to be delivered
+    /// incrementally (`OpenStream`). The buffered path leaves this false.
+    response_streamed: bool,
+    /// True once the `ResponseStreaming` head has been replied to the
+    /// `OpenStream` waiter. Guards against re-sending it.
+    response_head_sent: bool,
+    /// Received response DATA payloads not yet pulled by the caller. Only
+    /// used for a streamed response. Bounded by the stream recv window
+    /// because credit is held until the caller consumes.
+    response_chunks: VecDeque<Vec<u8>>,
+    /// A caller `ResponseNext` pull parked because no chunk is buffered
+    /// yet and END_STREAM has not arrived. Satisfied by the next DATA /
+    /// trailers / teardown.
+    response_pull: Option<tina::RequestContext<Http2ClientReply>>,
+    /// END_STREAM has been seen for the response. Once the buffered
+    /// chunks drain, the next pull gets `End`.
+    response_eof: bool,
 }
 
 impl ActiveClientStream {
@@ -351,6 +449,11 @@ impl ActiveClientStream {
             request_complete: true,
             request_end_sent: false,
             request_pull_in_flight: false,
+            response_streamed: false,
+            response_head_sent: false,
+            response_chunks: VecDeque::new(),
+            response_pull: None,
+            response_eof: false,
         }
     }
 
@@ -381,6 +484,11 @@ pub struct Http2ClientConnection<S: Shard + 'static> {
     /// Streaming submits waiting for the connect + preface to flush.
     queued_streaming: VecDeque<(
         Http2ClientStreamingRequest,
+        tina::RequestContext<Http2ClientReply>,
+    )>,
+    /// Streaming-response opens waiting for the connect + preface to flush.
+    queued_open: VecDeque<(
+        Http2ClientStreamCall,
         tina::RequestContext<Http2ClientReply>,
     )>,
     streams: Vec<ActiveClientStream>,
@@ -435,6 +543,7 @@ impl<S: Shard + 'static> Http2ClientConnection<S> {
             negotiated_alpn: None,
             queued_submits: VecDeque::new(),
             queued_streaming: VecDeque::new(),
+            queued_open: VecDeque::new(),
             streams: Vec::with_capacity(limits.max_concurrent_streams),
             next_stream_id: 1,
             read_buf: Vec::new(),
@@ -528,11 +637,14 @@ impl<S: Shard + 'static> Isolate for Http2ClientConnection<S> {
             // release builds drop it. See the doc comment on `Http2ClientMsg`.
             Http2ClientMsg::Report
             | Http2ClientMsg::Submit(_)
-            | Http2ClientMsg::SubmitStreaming(_) => {
+            | Http2ClientMsg::SubmitStreaming(_)
+            | Http2ClientMsg::OpenStream(_)
+            | Http2ClientMsg::ResponseNext { .. } => {
                 debug_assert!(
                     false,
-                    "Http2ClientMsg::Submit / ::SubmitStreaming / ::Report are call-only; \
-                     use `call` / `call_blocking`, not `try_send`",
+                    "Http2ClientMsg::Submit / ::SubmitStreaming / ::OpenStream / \
+                     ::ResponseNext / ::Report are call-only; use `call` / \
+                     `call_blocking`, not `try_send`",
                 );
                 noop()
             }
@@ -547,6 +659,10 @@ impl<S: Shard + 'static> Isolate for Http2ClientConnection<S> {
         match msg {
             Http2ClientMsg::Submit(req) => self.handle_submit(req, call),
             Http2ClientMsg::SubmitStreaming(req) => self.handle_submit_streaming(req, call),
+            Http2ClientMsg::OpenStream(req) => self.handle_open_stream(req, call),
+            Http2ClientMsg::ResponseNext { stream_id } => {
+                self.handle_response_next(stream_id, call)
+            }
             Http2ClientMsg::Report => call.reply(Http2ClientReply::Report(self.report.clone())),
             _ => call.reject(tina::CallRejectedReason::UnsupportedMessage),
         }
@@ -639,6 +755,10 @@ impl<S: Shard + 'static> Http2ClientConnection<S> {
         let queued_streaming = std::mem::take(&mut self.queued_streaming);
         for (req, waiter) in queued_streaming {
             self.admit_streaming_stream(req, waiter, &mut effects);
+        }
+        let queued_open = std::mem::take(&mut self.queued_open);
+        for (req, waiter) in queued_open {
+            self.admit_open_stream(req, waiter, &mut effects);
         }
         self.pump_io(&mut effects);
         batch(effects)
@@ -902,6 +1022,254 @@ impl<S: Shard + 'static> Http2ClientConnection<S> {
         self.pump_request_pulls(effects);
     }
 
+    fn handle_open_stream(
+        &mut self,
+        req: Http2ClientStreamCall,
+        call: tina::CallContext<'_, Self>,
+    ) -> Effect<Self> {
+        let waiter = call.into_request_context();
+        if self.stream.is_none() {
+            if self.queued_open.len() >= self.limits.pre_connect_submit_capacity {
+                self.report.admission_full += 1;
+                return reply_to_request::<Self>(
+                    waiter,
+                    Http2ClientReply::Outcome {
+                        stream_id: 0,
+                        outcome: Http2ClientOutcome::Full,
+                    },
+                );
+            }
+            self.queued_open.push_back((req, waiter));
+            return noop();
+        }
+        let mut effects: Vec<Effect<Self>> = Vec::new();
+        self.admit_open_stream(req, waiter, &mut effects);
+        self.pump_io(&mut effects);
+        batch(effects)
+    }
+
+    /// Admit a streaming-response stream. Sends HEADERS (END_STREAM only
+    /// for an empty buffered body), starts the request body (buffered
+    /// flush or source pull), and marks the stream so its response head
+    /// is delivered as [`Http2ClientOutcome::ResponseStreaming`] and its
+    /// body is pulled chunk-by-chunk.
+    fn admit_open_stream(
+        &mut self,
+        req: Http2ClientStreamCall,
+        waiter: tina::RequestContext<Http2ClientReply>,
+        effects: &mut Vec<Effect<Self>>,
+    ) {
+        if self.goaway_received || self.closing_after_write {
+            self.report.admission_full += 1;
+            effects.push(reject_outcome(waiter, 0, Http2ClientOutcome::Closed));
+            return;
+        }
+        if self.stream_id_exhausted {
+            self.report.admission_full += 1;
+            effects.push(reject_outcome(
+                waiter,
+                0,
+                Http2ClientOutcome::ProtocolError(Http2ProtocolError::StreamIdExhausted),
+            ));
+            return;
+        }
+        if self.streams.len() >= self.limits.max_concurrent_streams
+            || self
+                .peer_max_concurrent_streams
+                .is_some_and(|cap| self.streams.len() as u32 >= cap)
+            || self.write_queue.len() >= self.limits.connection_outbound_queue_capacity
+        {
+            self.report.admission_full += 1;
+            effects.push(reject_outcome(waiter, 0, Http2ClientOutcome::Full));
+            return;
+        }
+        let Http2ClientStreamCall {
+            method,
+            path,
+            headers,
+            body,
+        } = req;
+        let header_block = encode_request_header_block(&self.target, &method, &path, &headers);
+        if header_block.len() > self.peer_max_frame_size {
+            self.report.request_too_large += 1;
+            effects.push(reject_outcome(
+                waiter,
+                0,
+                Http2ClientOutcome::ProtocolError(Http2ProtocolError::OutboundHeadersTooLarge),
+            ));
+            return;
+        }
+        let stream_id = self.next_stream_id;
+        match self.next_stream_id.checked_add(2) {
+            Some(next) => self.next_stream_id = next,
+            None => self.stream_id_exhausted = true,
+        }
+        let end_on_headers = matches!(&body, Http2ClientRequestBody::Buffered(b) if b.is_empty());
+        self.enqueue_frame(headers_frame(stream_id, end_on_headers, header_block));
+        let mut stream = match body {
+            Http2ClientRequestBody::Buffered(b) => ActiveClientStream::new(
+                stream_id,
+                self.limits.initial_stream_window,
+                self.peer_initial_stream_window,
+                waiter,
+                b,
+            ),
+            Http2ClientRequestBody::Stream(source) => ActiveClientStream::new_streaming(
+                stream_id,
+                self.limits.initial_stream_window,
+                self.peer_initial_stream_window,
+                waiter,
+                source,
+            ),
+        };
+        stream.response_streamed = true;
+        stream.request_end_sent = end_on_headers;
+        self.report.opened_streams += 1;
+        effects.push(emit_fact(ProtocolFact::Http2StreamOpened {
+            connection: self.connection_fact_id(),
+            stream: Http2StreamId::new(stream_id),
+            direction: ProtocolDirection::Outbound,
+        }));
+        self.streams.push(stream);
+        // Buffered body rides out under flow control; a streamed body is
+        // pulled. Exactly one of these does work for a given stream.
+        self.flush_outbound_data();
+        self.pump_request_pulls(effects);
+    }
+
+    /// A caller pulled the next chunk of a streamed response. One pull is
+    /// outstanding per stream; a second concurrent pull is rejected.
+    fn handle_response_next(
+        &mut self,
+        stream_id: u32,
+        call: tina::CallContext<'_, Self>,
+    ) -> Effect<Self> {
+        let Some(idx) = self.streams.iter().position(|s| s.id == stream_id) else {
+            // Stream gone (completed, reset, or connection closed). The
+            // terminal chunk was delivered to an earlier pull if one was
+            // parked; a fresh pull gets `Closed`.
+            return call.reply(Http2ClientReply::ResponseChunk {
+                stream_id,
+                chunk: Http2ResponseChunk::Closed,
+            });
+        };
+        if !self.streams[idx].response_streamed {
+            return call.reject(tina::CallRejectedReason::UnsupportedMessage);
+        }
+        if self.streams[idx].response_pull.is_some() {
+            // One pull at a time. The caller broke the contract; reject
+            // the new pull rather than dropping the parked one.
+            return call.reject(tina::CallRejectedReason::UnsupportedMessage);
+        }
+        self.streams[idx].response_pull = Some(call.into_request_context());
+        let mut effects: Vec<Effect<Self>> = Vec::new();
+        self.deliver_to_parked_pull(idx, &mut effects);
+        self.pump_io(&mut effects);
+        batch(effects)
+    }
+
+    /// If a `ResponseNext` pull is parked on stream `idx`, satisfy it with
+    /// the next available chunk: a buffered DATA payload (crediting its
+    /// bytes back to the peer as the caller consumes — the backpressure
+    /// lever), or `End` once the body has drained and END_STREAM arrived.
+    /// Leaves the pull parked when neither is ready.
+    fn deliver_to_parked_pull(&mut self, idx: usize, effects: &mut Vec<Effect<Self>>) {
+        if self.streams[idx].response_pull.is_none() {
+            return;
+        }
+        if let Some(bytes) = self.streams[idx].response_chunks.pop_front() {
+            // Consume credit for the bytes handed to the caller, reopening
+            // the stream window so the peer may send more.
+            let n = bytes.len() as i32;
+            self.streams[idx].recv_window = self.streams[idx].recv_window.saturating_add(n);
+            let stream_id = self.streams[idx].id;
+            self.enqueue_frame(window_update_frame(stream_id, bytes.len() as u32));
+            let pull = self.streams[idx]
+                .response_pull
+                .take()
+                .expect("pull present");
+            effects.push(reply_to_request::<Self>(
+                pull,
+                Http2ClientReply::ResponseChunk {
+                    stream_id,
+                    chunk: Http2ResponseChunk::Data(bytes),
+                },
+            ));
+            return;
+        }
+        if self.streams[idx].response_eof {
+            self.complete_streaming_stream(idx, effects);
+        }
+    }
+
+    /// Deliver the terminal `End` chunk of a streamed response and close
+    /// the stream: emit the gRPC final-status fact (if `grpc-status` is in
+    /// the trailers/headers) and the stream-closed fact, then remove the
+    /// slot. Called once the buffered body has drained and END_STREAM has
+    /// been seen, with a pull parked.
+    fn complete_streaming_stream(&mut self, idx: usize, effects: &mut Vec<Effect<Self>>) {
+        let mut stream = self.streams.swap_remove(idx);
+        let stream_id = stream.id;
+        self.report.closed_streams += 1;
+        if let Some(status) = grpc_status_from_headers(&stream.response_trailers)
+            .or_else(|| grpc_status_from_headers(&stream.response_headers))
+        {
+            effects.push(emit_fact(ProtocolFact::GrpcFinalStatusReceived {
+                connection: self.connection_fact_id(),
+                stream: tina_runtime::GrpcStreamId::new(stream_id as u64),
+                status,
+            }));
+        }
+        effects.push(emit_fact(ProtocolFact::Http2StreamClosed {
+            connection: self.connection_fact_id(),
+            stream: Http2StreamId::new(stream_id),
+            reason: Http2CloseReason::EndStream,
+        }));
+        if let Some(pull) = stream.response_pull.take() {
+            effects.push(reply_to_request::<Self>(
+                pull,
+                Http2ClientReply::ResponseChunk {
+                    stream_id,
+                    chunk: Http2ResponseChunk::End {
+                        trailers: std::mem::take(&mut stream.response_trailers),
+                    },
+                },
+            ));
+        }
+    }
+
+    /// Reply a terminal outcome to whichever caller channel a torn-down
+    /// stream still holds. A buffered stream — or a streamed-response
+    /// stream whose `ResponseStreaming` head was never delivered — replies
+    /// on its `waiter` as an `Outcome`. A streamed-response stream that
+    /// already delivered its head and has a caller parked on
+    /// `ResponseNext` replies on `response_pull` as a terminal
+    /// `ResponseChunk`. A stream with neither live channel has nothing to
+    /// notify; the caller's next `ResponseNext` finds the slot gone and
+    /// gets `Closed`.
+    fn settle_stream_terminal(
+        &self,
+        stream: &mut ActiveClientStream,
+        outcome: Http2ClientOutcome,
+        effects: &mut Vec<Effect<Self>>,
+    ) {
+        let stream_id = stream.id;
+        if let Some(waiter) = stream.waiter.take() {
+            effects.push(reply_to_request::<Self>(
+                waiter,
+                Http2ClientReply::Outcome { stream_id, outcome },
+            ));
+        } else if let Some(pull) = stream.response_pull.take() {
+            effects.push(reply_to_request::<Self>(
+                pull,
+                Http2ClientReply::ResponseChunk {
+                    stream_id,
+                    chunk: response_chunk_from_outcome(outcome),
+                },
+            ));
+        }
+    }
+
     /// Issue a `ResponseChunkMsg::Next` pull for any streaming stream that
     /// needs more body and has none buffered (one chunk in flight at a
     /// time — natural backpressure). Buffered streams are skipped.
@@ -1038,15 +1406,7 @@ impl<S: Shard + 'static> Http2ClientConnection<S> {
             direction: ProtocolDirection::Outbound,
             reason: Http2ResetReason::Cancel,
         }));
-        if let Some(waiter) = stream.waiter.take() {
-            effects.push(reply_to_request::<Self>(
-                waiter,
-                Http2ClientReply::Outcome {
-                    stream_id,
-                    outcome: Http2ClientOutcome::LocalCancel,
-                },
-            ));
-        }
+        self.settle_stream_terminal(&mut stream, Http2ClientOutcome::LocalCancel, &mut effects);
         self.pump_io(&mut effects);
         batch(effects)
     }
@@ -1253,6 +1613,11 @@ impl<S: Shard + 'static> Http2ClientConnection<S> {
             validate_response_headers(&header_block)?;
             apply_response_headers(&mut self.streams[idx], header_block);
             self.streams[idx].response_headers_seen = true;
+            // For a streamed response, deliver the head to the OpenStream
+            // waiter now; the body is pulled afterwards.
+            if self.streams[idx].response_streamed && !self.streams[idx].response_head_sent {
+                self.send_response_head(idx, effects);
+            }
         } else {
             // RFC 9113 §8.1: trailers must arrive with END_STREAM and
             // must not contain pseudo-headers, `content-length`, or
@@ -1268,9 +1633,32 @@ impl<S: Shard + 'static> Http2ClientConnection<S> {
             }
         }
         if end_stream {
-            self.complete_stream(idx, effects);
+            if self.streams[idx].response_streamed {
+                self.streams[idx].response_eof = true;
+                self.deliver_to_parked_pull(idx, effects);
+            } else {
+                self.complete_stream(idx, effects);
+            }
         }
         Ok(())
+    }
+
+    /// Reply the `ResponseStreaming` head (status + headers) to the
+    /// `OpenStream` waiter and mark it sent.
+    fn send_response_head(&mut self, idx: usize, effects: &mut Vec<Effect<Self>>) {
+        let stream_id = self.streams[idx].id;
+        let status = self.streams[idx].response_status.unwrap_or(StatusCode::OK);
+        let headers = self.streams[idx].response_headers.clone();
+        self.streams[idx].response_head_sent = true;
+        if let Some(waiter) = self.streams[idx].waiter.take() {
+            effects.push(reply_to_request::<Self>(
+                waiter,
+                Http2ClientReply::Outcome {
+                    stream_id,
+                    outcome: Http2ClientOutcome::ResponseStreaming { status, headers },
+                },
+            ));
+        }
     }
 
     fn handle_data(
@@ -1313,6 +1701,21 @@ impl<S: Shard + 'static> Http2ClientConnection<S> {
             return Err(Http2ProtocolError::FlowControl);
         }
         self.streams[idx].recv_window -= len_i32;
+        // Streamed response: hold the per-stream credit (the backpressure
+        // lever) and buffer the chunk for the caller to pull. There is no
+        // total-body cap — the stream window bounds resident bytes, and
+        // credit is only returned as the caller consumes (see
+        // `deliver_to_parked_pull`).
+        if self.streams[idx].response_streamed {
+            if !payload.is_empty() {
+                self.streams[idx].response_chunks.push_back(payload);
+            }
+            if frame.flags & FLAG_END_STREAM != 0 {
+                self.streams[idx].response_eof = true;
+            }
+            self.deliver_to_parked_pull(idx, effects);
+            return Ok(());
+        }
         if self.streams[idx].response_body.len() + payload_len > self.limits.max_response_body_bytes
         {
             let cap_bytes = self.limits.max_response_body_bytes;
@@ -1500,12 +1903,7 @@ impl<S: Shard + 'static> Http2ClientConnection<S> {
             stream: Http2StreamId::new(stream_id),
             reason: close_reason,
         }));
-        if let Some(waiter) = stream.waiter.take() {
-            effects.push(reply_to_request::<Self>(
-                waiter,
-                Http2ClientReply::Outcome { stream_id, outcome },
-            ));
-        }
+        self.settle_stream_terminal(&mut stream, outcome, effects);
     }
 
     fn fail_all(&mut self, outcome: Http2ClientOutcome) -> Effect<Self> {
@@ -1530,19 +1928,20 @@ impl<S: Shard + 'static> Http2ClientConnection<S> {
                 },
             ));
         }
+        let queued_open = std::mem::take(&mut self.queued_open);
+        for (_, waiter) in queued_open {
+            effects.push(reply_to_request::<Self>(
+                waiter,
+                Http2ClientReply::Outcome {
+                    stream_id: 0,
+                    outcome: outcome.clone(),
+                },
+            ));
+        }
         let streams: Vec<_> = self.streams.drain(..).collect();
         for mut stream in streams {
-            let stream_id = stream.id;
             self.cancel_request_source(&stream, &mut effects);
-            if let Some(waiter) = stream.waiter.take() {
-                effects.push(reply_to_request::<Self>(
-                    waiter,
-                    Http2ClientReply::Outcome {
-                        stream_id,
-                        outcome: outcome.clone(),
-                    },
-                ));
-            }
+            self.settle_stream_terminal(&mut stream, outcome.clone(), &mut effects);
         }
         effects.push(stop());
         batch(effects)
@@ -1565,17 +1964,12 @@ impl<S: Shard + 'static> Http2ClientConnection<S> {
         self.enqueue_frame(goaway_frame(self.next_stream_id, code));
         let streams: Vec<_> = self.streams.drain(..).collect();
         for mut stream in streams {
-            let stream_id = stream.id;
             self.cancel_request_source(&stream, &mut effects);
-            if let Some(waiter) = stream.waiter.take() {
-                effects.push(reply_to_request::<Self>(
-                    waiter,
-                    Http2ClientReply::Outcome {
-                        stream_id,
-                        outcome: Http2ClientOutcome::ProtocolError(err.clone()),
-                    },
-                ));
-            }
+            self.settle_stream_terminal(
+                &mut stream,
+                Http2ClientOutcome::ProtocolError(err.clone()),
+                &mut effects,
+            );
         }
         self.closing_after_write = true;
         self.pump_io(&mut effects);
@@ -1699,17 +2093,8 @@ impl<S: Shard + 'static> Http2ClientConnection<S> {
         let mut effects: Vec<Effect<Self>> = Vec::new();
         let streams: Vec<_> = self.streams.drain(..).collect();
         for mut stream in streams {
-            let stream_id = stream.id;
             self.cancel_request_source(&stream, &mut effects);
-            if let Some(waiter) = stream.waiter.take() {
-                effects.push(reply_to_request::<Self>(
-                    waiter,
-                    Http2ClientReply::Outcome {
-                        stream_id,
-                        outcome: outcome.clone(),
-                    },
-                ));
-            }
+            self.settle_stream_terminal(&mut stream, outcome.clone(), &mut effects);
         }
         let queued = std::mem::take(&mut self.queued_submits);
         for (_, waiter) in queued {
@@ -1723,6 +2108,16 @@ impl<S: Shard + 'static> Http2ClientConnection<S> {
         }
         let queued_streaming = std::mem::take(&mut self.queued_streaming);
         for (_, waiter) in queued_streaming {
+            effects.push(reply_to_request::<Self>(
+                waiter,
+                Http2ClientReply::Outcome {
+                    stream_id: 0,
+                    outcome: outcome.clone(),
+                },
+            ));
+        }
+        let queued_open = std::mem::take(&mut self.queued_open);
+        for (_, waiter) in queued_open {
             effects.push(reply_to_request::<Self>(
                 waiter,
                 Http2ClientReply::Outcome {
@@ -1824,6 +2219,18 @@ fn apply_response_headers(stream: &mut ActiveClientStream, header_block: HeaderB
 
 fn emit_fact<S: Shard + 'static>(fact: ProtocolFact) -> Effect<Http2ClientConnection<S>> {
     tina::fact::<Http2ClientConnection<S>>(fact)
+}
+
+/// Map a teardown `Http2ClientOutcome` to the terminal `Http2ResponseChunk`
+/// delivered to a parked `ResponseNext` pull. `Reset`/`ProtocolError`
+/// carry their reason; everything else (a closed connection, local
+/// cancel, …) collapses to `Closed` — the stream is gone either way.
+fn response_chunk_from_outcome(outcome: Http2ClientOutcome) -> Http2ResponseChunk {
+    match outcome {
+        Http2ClientOutcome::Reset(reason) => Http2ResponseChunk::Reset(reason),
+        Http2ClientOutcome::ProtocolError(err) => Http2ResponseChunk::ProtocolError(err),
+        _ => Http2ResponseChunk::Closed,
+    }
 }
 
 /// Read the trace-stable `grpc-status` code from a header/trailer map,
@@ -1938,6 +2345,7 @@ mod tests {
         fn classify(o: &Http2ClientOutcome) -> &'static str {
             match o {
                 Http2ClientOutcome::Replied(_) => "replied",
+                Http2ClientOutcome::ResponseStreaming { .. } => "response-streaming",
                 Http2ClientOutcome::Full => "full",
                 Http2ClientOutcome::Closed => "closed",
                 Http2ClientOutcome::Reset(_) => "reset",

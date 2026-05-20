@@ -16,7 +16,8 @@ mod target;
 
 pub use client::{
     Http2ClientConnection, Http2ClientLimits, Http2ClientMsg, Http2ClientOutcome, Http2ClientReply,
-    Http2ClientReport, Http2ClientRequest, Http2ClientResponse, Http2ClientStreamingRequest,
+    Http2ClientReport, Http2ClientRequest, Http2ClientRequestBody, Http2ClientResponse,
+    Http2ClientStreamCall, Http2ClientStreamingRequest, Http2ResponseChunk,
 };
 pub use errors::Http2ProtocolError;
 pub use server::{

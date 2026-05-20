@@ -4,6 +4,43 @@ This file records completed work.
 
 ## Unreleased
 
+### HTTP/2 Client Streaming Response Bodies
+
+The HTTP/2 client can now deliver a response incrementally instead of
+buffering the whole body. This is the response half of streaming bodies
+and the remaining blocker for server-streaming / bidi gRPC.
+
+- **`Http2ClientMsg::OpenStream(Http2ClientStreamCall)`** opens a stream
+  whose response is pulled. The request body is buffered or streamed
+  (`Http2ClientRequestBody::{Buffered, Stream}`), so one call shape
+  serves both server-streaming (buffered request) and bidi (streamed
+  request). The first reply is an
+  `Http2ClientOutcome::ResponseStreaming { status, headers }` head — or a
+  terminal error outcome if the stream never opened.
+- **`Http2ClientMsg::ResponseNext { stream_id }`** pulls the body, one
+  `Http2ResponseChunk` per call: `Data(bytes)`, then `End { trailers }`
+  on clean END_STREAM, or a terminal `Reset(reason)` / `Closed` /
+  `ProtocolError`. One pull outstanding per stream; a second concurrent
+  pull is rejected.
+- **Credit-on-consume backpressure.** Received DATA is held under the
+  per-stream flow-control window and only `WINDOW_UPDATE`-credited as the
+  caller consumes each chunk. A slow consumer therefore closes the stream
+  window and backpressures the peer — there is no unbounded buffer. The
+  connection window is still credited eagerly so one slow stream does not
+  stall the others.
+- **Terminal truth reaches the live channel.** A reset / GOAWAY /
+  connection-close settles whichever caller channel is live: the
+  `OpenStream` waiter (if the head was never delivered) gets the terminal
+  `Outcome`; a parked `ResponseNext` pull gets the terminal
+  `ResponseChunk`. The `GrpcFinalStatusReceived` and `Http2StreamClosed`
+  facts fire on clean streamed completion exactly as on the buffered
+  path.
+- **Live proofs**: `OpenStream` GET delivers a head then a pulled body to
+  `End` (`http2_client_live.rs`); a 32 KB echo response reassembles
+  byte-for-byte across multiple pulled DATA frames; and a peer
+  RST_STREAM mid-stream delivers a terminal `Reset` chunk to the parked
+  pull (`http2_client_adversarial.rs`).
+
 ### HTTP/2 Client Streaming Request Bodies
 
 The HTTP/2 client can now stream a request body from a chunk source

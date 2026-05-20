@@ -37,9 +37,9 @@ use tina::CallContext;
 use tina::prelude::*;
 use tina_http::{
     AlpnProtocols, Http2ClientConnection, Http2ClientLimits, Http2ClientMsg, Http2ClientOutcome,
-    Http2ClientReply, Http2ClientRequest, Http2ClientStreamingRequest, Http2Limits, Http2Listener,
-    Http2ListenerMsg, Http2ServerConfig, Http2Target, IterBodySource, ResponseChunkMsg,
-    ResponseChunkReply,
+    Http2ClientReply, Http2ClientRequest, Http2ClientRequestBody, Http2ClientStreamCall,
+    Http2ClientStreamingRequest, Http2Limits, Http2Listener, Http2ListenerMsg, Http2ResponseChunk,
+    Http2ServerConfig, Http2Target, IterBodySource, ResponseChunkMsg, ResponseChunkReply,
 };
 use tina_runtime::{
     CallOutcome, DefaultThreadedMailboxFactory, ThreadedRuntime, ThreadedRuntimeConfig,
@@ -465,6 +465,169 @@ fn h2c_streaming_request_with_empty_source_sends_empty_body() {
         }
         other => panic!("expected Replied, got {other:?}"),
     }
+
+    let _ = runtime.try_send(listener, Http2ListenerMsg::Stop);
+    let _ = runtime.try_send(client, Http2ClientMsg::Stop);
+    let _ = runtime.shutdown();
+}
+
+/// Drive `ResponseNext` pulls to completion, returning the reassembled
+/// body and the trailing HEADERS block. Panics on any non-`Data`/`End`
+/// chunk so a `Reset`/`Closed`/`ProtocolError` fails the test loudly.
+fn collect_streamed_response(
+    runtime: &ThreadedRuntime<TestShard, DefaultThreadedMailboxFactory>,
+    client: Address<Http2ClientMsg, Http2ClientReply>,
+    stream_id: u32,
+) -> (Vec<u8>, HeaderMap) {
+    let mut body = Vec::new();
+    loop {
+        let reply = runtime
+            .call_blocking(
+                client,
+                Http2ClientMsg::ResponseNext { stream_id },
+                Duration::from_secs(5),
+            )
+            .expect("response pull returns");
+        match reply {
+            CallOutcome::Replied(Http2ClientReply::ResponseChunk { chunk, .. }) => match chunk {
+                Http2ResponseChunk::Data(bytes) => body.extend_from_slice(&bytes),
+                Http2ResponseChunk::End { trailers } => return (body, trailers),
+                other => panic!("unexpected terminal chunk: {other:?}"),
+            },
+            other => panic!("expected ResponseChunk, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn h2c_open_stream_delivers_head_then_pulled_body() {
+    // Streaming response: OpenStream a GET, get the response head as
+    // `ResponseStreaming`, then pull the body chunk-by-chunk to `End`.
+    // Proves the head/pull protocol end-to-end against the real server.
+    let (runtime, listener, addr) = start_server();
+    let target = Http2Target::H2c {
+        authority: "test".into(),
+        addr,
+    };
+    let client = make_client(&runtime, target, Http2ClientLimits::default());
+
+    let call = Http2ClientStreamCall {
+        method: Method::GET,
+        path: "/counter".into(),
+        headers: HeaderMap::new(),
+        body: Http2ClientRequestBody::Buffered(Vec::new()),
+    };
+    let outcome = runtime
+        .call_blocking(
+            client,
+            Http2ClientMsg::OpenStream(call),
+            Duration::from_secs(5),
+        )
+        .expect("open stream returns");
+    let stream_id = match outcome {
+        CallOutcome::Replied(Http2ClientReply::Outcome {
+            stream_id,
+            outcome: Http2ClientOutcome::ResponseStreaming { status, .. },
+        }) => {
+            assert_eq!(status.as_u16(), 200, "streamed response head status");
+            stream_id
+        }
+        other => panic!("expected ResponseStreaming head, got {other:?}"),
+    };
+
+    let (body, _trailers) = collect_streamed_response(&runtime, client, stream_id);
+    assert!(!body.is_empty(), "pulled body must be non-empty");
+
+    let _ = runtime.try_send(listener, Http2ListenerMsg::Stop);
+    let _ = runtime.try_send(client, Http2ClientMsg::Stop);
+    let _ = runtime.shutdown();
+}
+
+#[test]
+fn h2c_open_stream_reassembles_multi_frame_response_body() {
+    // A 32 KB echo response arrives as several DATA frames; the client
+    // hands them out one pull at a time and the caller reassembles the
+    // exact bytes. Proves multi-chunk streamed delivery + the
+    // credit-on-consume window accounting does not corrupt the body.
+    let runtime = ThreadedRuntime::with_config(
+        TestShard,
+        DefaultThreadedMailboxFactory,
+        ThreadedRuntimeConfig {
+            command_capacity: 64,
+            idle_wait: Duration::from_millis(1),
+            ..Default::default()
+        },
+    );
+    let counter = runtime
+        .register_with_capacity::<Counter, Infallible>(Counter::default(), 16)
+        .expect("register counter");
+    let limits = Http2Limits {
+        max_body_bytes: 256 * 1024,
+        max_response_body_bytes: 256 * 1024,
+        ..Http2Limits::default()
+    };
+    let config = Http2ServerConfig {
+        limits,
+        service_call_timeout: Duration::from_secs(5),
+        connection_mailbox_capacity: 16,
+        listener_mailbox_capacity: 8,
+    };
+    let listener = runtime
+        .register_with_capacity::<Http2Listener<TestShard>, _>(
+            Http2Listener::<TestShard>::new("127.0.0.1:0".parse().unwrap(), counter, config),
+            config.listener_mailbox_capacity,
+        )
+        .expect("register http2 listener");
+    let bound = runtime.observe_next_bound();
+    runtime
+        .try_send(listener, Http2ListenerMsg::Start)
+        .expect("start listener");
+    let addr = bound
+        .wait(Duration::from_secs(2))
+        .expect("listener publishes bound address");
+
+    let target = Http2Target::H2c {
+        authority: "test".into(),
+        addr,
+    };
+    let client_limits = Http2ClientLimits {
+        max_response_body_bytes: 256 * 1024,
+        ..Http2ClientLimits::default()
+    };
+    let client = make_client(&runtime, target, client_limits);
+
+    let payload = vec![b'z'; 32 * 1024];
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        "content-length",
+        http::HeaderValue::from_str(&payload.len().to_string()).unwrap(),
+    );
+    let call = Http2ClientStreamCall {
+        method: Method::POST,
+        path: "/echo".into(),
+        headers,
+        body: Http2ClientRequestBody::Buffered(payload.clone()),
+    };
+    let outcome = runtime
+        .call_blocking(
+            client,
+            Http2ClientMsg::OpenStream(call),
+            Duration::from_secs(15),
+        )
+        .expect("open stream returns");
+    let stream_id = match outcome {
+        CallOutcome::Replied(Http2ClientReply::Outcome {
+            stream_id,
+            outcome: Http2ClientOutcome::ResponseStreaming { status, .. },
+        }) => {
+            assert_eq!(status.as_u16(), 200);
+            stream_id
+        }
+        other => panic!("expected ResponseStreaming head, got {other:?}"),
+    };
+
+    let (body, _trailers) = collect_streamed_response(&runtime, client, stream_id);
+    assert_eq!(body, payload, "reassembled streamed body must match echo");
 
     let _ = runtime.try_send(listener, Http2ListenerMsg::Stop);
     let _ = runtime.try_send(client, Http2ClientMsg::Stop);

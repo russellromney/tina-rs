@@ -91,9 +91,13 @@
 //! [`Http2ClientOutcome::TlsAlpnMismatch`], distinct from cert/name
 //! failures. Request bodies are buffered ([`Http2ClientRequest`]) or
 //! streamed from a chunk source ([`Http2ClientStreamingRequest`], the
-//! same `IterBodySource` pull protocol the server uses). h2/TLS is
-//! request-response (half-duplex) today; full-duplex needs a runtime TLS
-//! reactor.
+//! same `IterBodySource` pull protocol the server uses). Responses are
+//! buffered ([`Http2ClientResponse`] under a cap) or, via
+//! [`Http2ClientMsg::OpenStream`], delivered incrementally: the caller
+//! pulls one [`Http2ResponseChunk`] at a time and received DATA is only
+//! `WINDOW_UPDATE`-credited as it is consumed, so a slow consumer
+//! backpressures the peer. h2/TLS is request-response (half-duplex)
+//! today; full-duplex needs a runtime TLS reactor.
 //!
 //! gRPC: [`GrpcRouter`] is the server. [`GrpcClient`] is the native
 //! client — Tina is a native gRPC client, not only a server. The server
@@ -173,10 +177,11 @@ pub use grpc::{
 pub use grpc_client::{GrpcClient, GrpcTarget, GrpcUnaryOutcome};
 pub use http2::{
     AlpnProtocols, Http2ClientConnection, Http2ClientLimits, Http2ClientMsg, Http2ClientOutcome,
-    Http2ClientReply, Http2ClientReport, Http2ClientRequest, Http2ClientResponse,
-    Http2ClientStreamingRequest, Http2Connection, Http2ConnectionMsg, Http2ConnectionReply,
-    Http2ConnectionReport, Http2Limits, Http2Listener, Http2ListenerMsg, Http2Outcome,
-    Http2ProtocolError, Http2ServerConfig, Http2StreamReport, Http2StreamState, Http2Target,
+    Http2ClientReply, Http2ClientReport, Http2ClientRequest, Http2ClientRequestBody,
+    Http2ClientResponse, Http2ClientStreamCall, Http2ClientStreamingRequest, Http2Connection,
+    Http2ConnectionMsg, Http2ConnectionReply, Http2ConnectionReport, Http2Limits, Http2Listener,
+    Http2ListenerMsg, Http2Outcome, Http2ProtocolError, Http2ResponseChunk, Http2ServerConfig,
+    Http2StreamReport, Http2StreamState, Http2Target,
 };
 pub use keepalive::{
     KeepaliveConnAddr, KeepaliveConnection, KeepaliveConnectionMsg, KeepaliveConnectionStopFailure,

@@ -253,7 +253,9 @@ impl GrpcClient {
     ) -> GrpcUnaryOutcome<Resp> {
         match reply {
             Http2ClientReply::Outcome { outcome, .. } => self.decode_unary::<Resp>(outcome),
-            Http2ClientReply::Report(_) => GrpcUnaryOutcome::Malformed(GrpcError::BadFrame),
+            Http2ClientReply::Report(_) | Http2ClientReply::ResponseChunk { .. } => {
+                GrpcUnaryOutcome::Malformed(GrpcError::BadFrame)
+            }
         }
     }
 }

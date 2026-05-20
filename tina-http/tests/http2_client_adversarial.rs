@@ -29,10 +29,12 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 use common::TestShard;
+use http::{HeaderMap, Method};
 use tina::prelude::*;
 use tina_http::{
     Http2ClientConnection, Http2ClientLimits, Http2ClientMsg, Http2ClientOutcome, Http2ClientReply,
-    Http2ClientRequest, Http2ProtocolError, Http2Target,
+    Http2ClientRequest, Http2ClientRequestBody, Http2ClientStreamCall, Http2ProtocolError,
+    Http2ResponseChunk, Http2Target,
 };
 use tina_runtime::{
     CallOutcome, DefaultThreadedMailboxFactory, Http2ResetReason, ProtocolDirection, ProtocolFact,
@@ -308,6 +310,73 @@ fn server_rst_stream_maps_to_typed_reset() {
             ..
         }) => {}
         other => panic!("expected Reset(RefusedStream), got {other:?}"),
+    }
+
+    let _ = runtime.try_send(client, Http2ClientMsg::Stop);
+    let _ = runtime.shutdown();
+    peer.join().expect("peer thread joins");
+}
+
+#[test]
+fn streamed_response_peer_rst_delivers_reset_to_parked_pull() {
+    // OpenStream → response head (no END_STREAM) → the caller pulls and
+    // parks (no body buffered yet). The peer then RST_STREAMs. The
+    // terminal `Reset` must reach the *parked pull* as a
+    // `ResponseChunk::Reset`, not just the (already-consumed) head waiter.
+    let (addr, peer) = spawn_peer(|sock, stream_id| {
+        // Response head only — the body is "streaming".
+        let mut block = Vec::new();
+        literal_header(":status", "200", &mut block);
+        write_frame(sock, FRAME_HEADERS, FLAG_END_HEADERS, stream_id, &block);
+        // Give the client time to deliver the head and park its first
+        // pull before we reset, so the reset lands on the parked pull.
+        std::thread::sleep(Duration::from_millis(150));
+        write_frame(
+            sock,
+            FRAME_RST_STREAM,
+            0,
+            stream_id,
+            &ERR_REFUSED_STREAM.to_be_bytes(),
+        );
+    });
+    let (runtime, client) = run_client(addr);
+
+    let head = runtime
+        .call_blocking(
+            client,
+            Http2ClientMsg::OpenStream(Http2ClientStreamCall {
+                method: Method::GET,
+                path: "/x".into(),
+                headers: HeaderMap::new(),
+                body: Http2ClientRequestBody::Buffered(Vec::new()),
+            }),
+            Duration::from_secs(5),
+        )
+        .expect("open returns");
+    let stream_id = match head {
+        CallOutcome::Replied(Http2ClientReply::Outcome {
+            stream_id,
+            outcome: Http2ClientOutcome::ResponseStreaming { status, .. },
+        }) => {
+            assert_eq!(status.as_u16(), 200);
+            stream_id
+        }
+        other => panic!("expected ResponseStreaming head, got {other:?}"),
+    };
+
+    let chunk = runtime
+        .call_blocking(
+            client,
+            Http2ClientMsg::ResponseNext { stream_id },
+            Duration::from_secs(5),
+        )
+        .expect("pull returns");
+    match chunk {
+        CallOutcome::Replied(Http2ClientReply::ResponseChunk {
+            chunk: Http2ResponseChunk::Reset(Http2ResetReason::RefusedStream),
+            ..
+        }) => {}
+        other => panic!("expected ResponseChunk::Reset(RefusedStream), got {other:?}"),
     }
 
     let _ = runtime.try_send(client, Http2ClientMsg::Stop);

@@ -50,14 +50,19 @@
   failure RST_STREAM(CANCEL)s only that stream (`LocalCancel`). Live
   proofs: multi-chunk streamed POST to `/echo` round-trips, empty source
   closes with a lone empty DATA(END_STREAM).
+- **HTTP/2 client streaming response bodies landed.**
+  `Http2ClientMsg::OpenStream(Http2ClientStreamCall)` (request body
+  buffered or streamed) replies a `ResponseStreaming { status, headers }`
+  head; the caller then pulls `Http2ResponseChunk`s with
+  `ResponseNext { stream_id }` — `Data` / `End { trailers }` / terminal
+  `Reset`/`Closed`/`ProtocolError`. Received DATA is held under the
+  stream window and only `WINDOW_UPDATE`-credited on consume, so a slow
+  caller backpressures the peer. Reset/close settles the live channel
+  (head waiter or parked pull). Live proofs: head-then-pull to `End`,
+  32 KB multi-frame reassembly, peer-RST → terminal `Reset` on the
+  parked pull. Both streaming halves are the gate for streaming gRPC.
 - **Remaining work in this phase** (still future slices, named in
   *Includes* and *Proof Shape* below):
-  - HTTP/2 client streaming *response* bodies (today's client buffers
-    the response under an explicit cap). Design: incremental response
-    chunk delivery so the caller pulls response DATA from the client
-    connection (mirror of the request-source pull, roles inverted), with
-    WINDOW_UPDATE credited as the caller consumes — backpressure.
-    Remaining blocker for streaming gRPC.
   - Streaming gRPC client (`server_streaming` / `client_streaming` /
     `bidi`), gated on the streaming bodies above.
   - DST replay for live client socket work (typed unsupported fact
