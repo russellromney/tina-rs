@@ -364,6 +364,10 @@ pub enum RestartSkippedReason {
     /// The child was spawned from a one-shot [`tina::ChildDefinition`] and has no
     /// restart recipe.
     NotRestartable,
+
+    /// The restartable child factory panicked while constructing the
+    /// replacement child.
+    FactoryPanicked,
 }
 
 /// Why a supervised restart response did not run.
@@ -1382,6 +1386,7 @@ fn send_rejected_tag(reason: SendRejectedReason) -> u8 {
 fn restart_skipped_tag(reason: RestartSkippedReason) -> u8 {
     match reason {
         RestartSkippedReason::NotRestartable => 1,
+        RestartSkippedReason::FactoryPanicked => 2,
     }
 }
 
