@@ -1,7 +1,7 @@
 //! Admission and rate policy types (Phase 118).
 //!
 //! User-facing pressure policies built on top of the existing
-//! [`LocalPermitGate`], [`SharedCapacityScope`], [`FullHandling`], and
+//! [`LocalPermitGate`], [`SharedCapacityScope`], [`crate::FullHandling`], and
 //! [`tina::time::Backoff`] primitives. These types do not invent a second
 //! capacity product; they teach services a boring vocabulary for shedding,
 //! waiting, rate-limiting, degrading, or closing under pressure.
@@ -24,7 +24,7 @@
 //! move-only proof object the caller must release explicitly. There is no
 //! hidden retry, no hidden queue, no growing per-key map.
 //!
-//! Retry remains caller-owned. Pair these policies with [`FullHandling`]
+//! Retry remains caller-owned. Pair these policies with [`crate::FullHandling`]
 //! when retry-with-backoff is the right answer, or treat each rejection as
 //! terminal.
 //!
@@ -34,7 +34,7 @@
 //! are explicit:
 //!
 //! - **No retry inside admission.** None of these types retry. The only
-//!   retry path is the separate [`FullHandling`], whose
+//!   retry path is the separate [`crate::FullHandling`], whose
 //!   `retry_backoff(Backoff)` constructor *requires* an explicit
 //!   [`tina::time::Backoff`] value — there is no way to get retry behavior
 //!   without naming a budget, and the caller still owns idempotency.

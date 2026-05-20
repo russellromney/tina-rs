@@ -66,9 +66,9 @@ impl Gate {
 const SCRIPT: &[(&str, u64)] = &[
     ("a", 0),
     ("a", 0),
-    ("a", 0), // burst 2 → third at t=0 is rate-limited
-    ("b", 0), // a different key still admits at t=0
-    ("a", 50), // 50ms < refill window → still limited
+    ("a", 0),   // burst 2 → third at t=0 is rate-limited
+    ("b", 0),   // a different key still admits at t=0
+    ("a", 50),  // 50ms < refill window → still limited
     ("a", 120), // enough time for one token → ok
     ("b", 200),
     ("c", 200), // a third distinct key (max_keys = 4) → ok
@@ -167,5 +167,8 @@ fn retry_after_under_sim_is_the_exact_token_window() {
     sim.try_send(gate, GateMsg::Admit("k")).unwrap();
     sim.step();
     let decisions = log.borrow().clone();
-    assert_eq!(decisions, vec!["k=ok".to_string(), "k=rate(100ms)".to_string()]);
+    assert_eq!(
+        decisions,
+        vec!["k=ok".to_string(), "k=rate(100ms)".to_string()]
+    );
 }
