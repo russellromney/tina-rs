@@ -482,3 +482,87 @@ Verification conclusion: most findings remain live on current main. The
 the current code is real but the fix may be vocabulary/docs/API rather than a
 straight bug patch. The first implementation wave should still start with C1/F1
 and the I1-I3 runtime table work.
+
+## Fix wave — 2026-05-21 (append-only)
+
+Each finding below either has a fix PR open against `main` or an explicit
+deferral with the exact reason. PR numbers are the fix branches, not the
+original review PR.
+
+Earlier wave (pre-existing PRs, ranges confirmed): A1 #161, A2 #162, A3 #163,
+A4 #164, B1 #151, B2 #159, B3 #160, B4 #165, B5 #166, B6 #167, C1 #145, C2 #173,
+C3 #158, D1 #150, D2 #168, D3 #174, D4 #169, D5 #175, E2 #152, F1 #146, F2 #176,
+F4 #153, G1 #170, H1 #177, I1 #147, I2 #148, I3 #149, I4 #154, I5 #155, I6 #156,
+I7 #157.
+
+This wave (red-PR repairs + remaining uncovered):
+
+- **D1 #150** — was red on Ubuntu+macOS (`E0433 cannot find select in tokio`):
+  enabled the tokio `macros` feature for the bridge backstop `select!`.
+- **E2 #152** — was red (`E0004` non-exhaustive match): added the
+  `RestartSkippedReason::FactoryPanicked` arm in `tina-tracing`.
+- **I5 #155** — was red (`ordinary_remote_throughput_still_progresses` 396 vs
+  500): the unthrottled producer overran the default 64-deep cross-shard pair
+  queue into typed `SendRejected{Full}`. Sized the test's `shard_pair_capacity`
+  to the finite burst; product Full semantics unchanged.
+- **I7 #157** — was red (`clippy::items_after_test_module`): moved the new
+  tests module after the trailing `Isolate` impl.
+- **G2 #171** — was red (pinned-seed determinism): re-pinned the seeds in
+  `faulted_replay.rs`, `io_simulation.rs`, and `multishard_dispatcher.rs` to
+  exercise the same property under the splitmix64-mixed selector. `make verify`
+  green on the branch.
+- **H2 #180** — dropped `#[deny(unused_variables)]` on the generated
+  split-service `handle_call`; the `RequestEffect` linear type already enforces
+  answering. Regression fixture added.
+- **H3 #181** — reject reserved arg names (`deadline`/`correlator`/`reply_to`/
+  `max_payload`) in service trait methods with a spanned diagnostic; trybuild
+  fixture pins it.
+- **H4 #182** — made `runtime_internal::request_effect_from_consumed_effect`
+  an `unsafe fn` (the only stable cross-crate barrier; not memory safety),
+  routed the runtime's 8 callers through one `pub(crate)` safe wrapper, added a
+  foreign-crate compile-fail fixture. Flagged as a design tradeoff in the PR.
+- **H5 #179** — documented that `tina_runtime::isolate` roots at `::tina`
+  (needs the `tina` dep / `tina_crate = ...`). The re-export-and-reroot
+  alternative was deferred as a public-API decision.
+- **H6 #178** — `isolate_types!` now uses `::core::convert::Infallible`
+  everywhere.
+- **E1 #183** — shutdown joiner no longer pre-takes worker handles before the
+  joiner spawn, so a failed spawn cannot drop+leak them and lie with an empty
+  `Closed` report. Handle-taking moved into `run_joiner`; unit test with a
+  forced-spawn-failure seam.
+- **F5 #184** — bounded the post-kill `child.wait()` in `kill_and_reap` with a
+  `try_wait` deadline loop (`KillUncertain` on expiry).
+
+### Deferred to maintainer design decision (exact reasons)
+
+- **C4 (Low) — DEFER, accept-as-traced.** Caller-mailbox-full at completion
+  delivery already emits the distinct typed terminal
+  `CallCompletionRejected{MailboxFull}` (`dispatch.rs:1226-1235`); the pending
+  call is removed, so the caller does not observe it as a reply. The finding's
+  two options are (a) document this distinct terminal class — already true in
+  code — or (b) hold the outcome for redelivery next step. (b) is a real
+  behavior change: it re-buffers settled outcomes and reopens the
+  "bounded handle ≠ bounded work" question the wave otherwise closed. Recommend
+  accepting (a) as the contract; not patched here because there is no bug to
+  fix, only a policy to ratify.
+- **C5 (Low) — DEFER, accept-as-documented.** The recently-cancelled cause ring
+  is already documented and bounded with a visible eviction counter
+  (`cancelled_call_cause_evictions`, `dispatch.rs:1584-1595`). Past capacity a
+  late cause degrades to `NoPendingCall` — best-effort by design. The only
+  "fix" is to grow the ring relative to the pending population, which
+  reintroduces unbounded growth and contradicts the bounded-capacity
+  discipline. Recommend documenting the degradation (done in code) and keeping
+  the bound.
+- **F3 (Medium) — DEFER, needs platform-specific design.** The post-reap
+  process-group kill in `process_exited` (`driver/process.rs:371`) signals
+  `-pgid` where `pgid` equals the already-reaped leader's pid, which the OS may
+  have recycled. A correct fix must keep the pid reserved across the group
+  kill, which needs either `waitpid(WNOWAIT)` + raw `libc` (Unix-only,
+  `unsafe`, and it must not double-reap `std::process::Child`) or a pidfd
+  (Linux-only — and `pidfd_send_signal` targets a single pid, not a group, so
+  it does not directly solve group kill). `tina-runtime` is `deny(unsafe_code)`
+  outside `pool`. The timeout/cancel path (`kill_and_reap`) is already
+  kill-before-reap and unaffected; the race is confined to the truncation
+  cleanup branch after a natural exit. Not patched here because a correct fix
+  is a deliberate platform/unsafe design decision, not a minimal change, and a
+  half-fix risks double-reap. Recommend a focused Linux `WNOWAIT` design pass.
