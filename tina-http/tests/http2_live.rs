@@ -683,6 +683,24 @@ fn http2_missing_authority_rejects() {
 }
 
 #[test]
+fn http2_empty_path_rejects_before_service_dispatch() {
+    let harness = Http2Harness::start(Http2ServerConfig::default());
+    let mut stream = connect_h2(harness.addr);
+
+    write_frame(
+        &mut stream,
+        FRAME_HEADERS,
+        FLAG_END_HEADERS | FLAG_END_STREAM,
+        1,
+        &request_headers("GET", ""),
+    );
+
+    let frame = read_until_goaway(&mut stream);
+    assert_eq!(goaway_error_code(&frame), ERR_PROTOCOL_ERROR);
+    harness.shutdown();
+}
+
+#[test]
 fn http2_settings_max_frame_size_controls_outbound_splitting() {
     let config = Http2ServerConfig {
         limits: Http2Limits {
