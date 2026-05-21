@@ -94,6 +94,25 @@ use std::time::Duration;
 
 use tina::{Address, AddressGeneration, CallHandleShared, CancelOutcome, IsolateId, ShardId};
 
+/// Safe in-runtime wrapper over tina's `unsafe` must-answer-rail escape hatch.
+///
+/// Every runtime adapter that re-wraps a finished effect into a
+/// `RequestEffect` routes through here so the `unsafe` is discharged once,
+/// centrally. The hole stays `unsafe` to foreign app crates (which cannot name
+/// this `pub(crate)` wrapper); they would have to call the `unsafe`
+/// `tina::runtime_internal` form, which the must-answer rail forbids outside an
+/// explicit `unsafe` block.
+#[allow(unsafe_code)]
+pub(crate) fn request_effect_from_consumed_effect<I: tina::Isolate>(
+    effect: tina::Effect<I>,
+) -> tina::RequestEffect<I> {
+    // SAFETY: every caller that reaches this wrapper has already consumed the
+    // matching `RequestCall` authority (via `RequestContext`) before producing
+    // `effect`, so the manufactured `RequestEffect` settles exactly that one
+    // caller — the precondition tina's escape hatch documents.
+    unsafe { tina::runtime_internal::request_effect_from_consumed_effect(effect) }
+}
+
 type ErasedReply = Box<dyn Any>;
 type ErasedCallOutcome = CallOutcome<ErasedReply>;
 type IsolateCallTranslator<M> = Box<dyn FnOnce(ErasedCallOutcome) -> M>;
@@ -1318,7 +1337,7 @@ where
         F: FnOnce(tina::RequestContext<Q>, SendOutcome) -> M + 'static,
         M: 'static,
     {
-        tina::runtime_internal::request_effect_from_consumed_effect(self.inner.reply(translator))
+        crate::call::request_effect_from_consumed_effect(self.inner.reply(translator))
     }
 }
 
@@ -1488,7 +1507,7 @@ where
         F: FnOnce(tina::RequestContext<Q>, CallOutcome<R>) -> M + 'static,
         M: 'static,
     {
-        tina::runtime_internal::request_effect_from_consumed_effect(self.inner.reply(translator))
+        crate::call::request_effect_from_consumed_effect(self.inner.reply(translator))
     }
 }
 
