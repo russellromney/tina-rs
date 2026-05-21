@@ -159,7 +159,7 @@ where
         F: FnOnce(tina::RequestContext<Q>, Result<T, CallError>) -> M + 'static,
         M: 'static,
     {
-        tina::runtime_internal::request_effect_from_consumed_effect(self.inner.reply(translator))
+        crate::call::request_effect_from_consumed_effect(self.inner.reply(translator))
     }
 }
 

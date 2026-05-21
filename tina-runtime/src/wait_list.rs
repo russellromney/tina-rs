@@ -95,7 +95,7 @@ pub fn request_effect_after_wait_park<I, K>(
 where
     I: tina::Isolate,
 {
-    tina::runtime_internal::request_effect_from_consumed_effect(effect)
+    crate::call::request_effect_from_consumed_effect(effect)
 }
 
 struct WaitEntry<K, R> {

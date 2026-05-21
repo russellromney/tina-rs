@@ -458,7 +458,7 @@ where
         let (token, effect) = self.inner.reply(key, translator);
         (
             token,
-            tina::runtime_internal::request_effect_from_consumed_effect(effect),
+            crate::call::request_effect_from_consumed_effect(effect),
         )
     }
 
@@ -478,7 +478,7 @@ where
     {
         self.inner
             .try_admit(pending, key, translator)
-            .map(tina::runtime_internal::request_effect_from_consumed_effect)
+            .map(crate::call::request_effect_from_consumed_effect)
     }
 }
 
