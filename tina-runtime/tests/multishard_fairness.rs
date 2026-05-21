@@ -21,7 +21,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use tina::{Address, Mailbox, TrySendError, prelude::*};
-use tina_runtime::{MailboxFactory, RuntimeCall, ThreadedMultiShardRuntime};
+use tina_runtime::{MailboxFactory, RuntimeCall, ThreadedMultiShardRuntime, ThreadedRuntimeConfig};
 
 #[derive(Debug, Clone, Copy)]
 struct AppShard(u32);
@@ -305,9 +305,24 @@ fn shutdown_under_remote_flood_completes_bounded() {
 /// drains and reaches the target.
 #[test]
 fn ordinary_remote_throughput_still_progresses() {
-    let runtime = make_runtime();
-    let hits = Arc::new(AtomicUsize::new(0));
     const N: usize = 500;
+    // The producer fires N fire-and-forget cross-shard sends with no
+    // per-round sleep, so it can race ahead of the consumer. Size the
+    // cross-shard pair queue to hold the whole finite burst; otherwise
+    // the unthrottled producer overruns the steady-state default (64)
+    // and the overflow lands as typed SendRejected{Full}, not at the
+    // sink. The default only sufficed while the removed 1ms sleep
+    // happened to pace the producer (also why this test was macOS-flaky).
+    let config = ThreadedRuntimeConfig {
+        shard_pair_capacity: N + 16,
+        ..ThreadedRuntimeConfig::default()
+    };
+    let runtime = ThreadedMultiShardRuntime::with_config(
+        [AppShard(11), AppShard(22)],
+        WorkerMailboxFactory,
+        config,
+    );
+    let hits = Arc::new(AtomicUsize::new(0));
 
     let sink = runtime
         .register_with_capacity_on::<Sink, _>(
