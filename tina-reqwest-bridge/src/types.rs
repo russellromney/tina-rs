@@ -168,10 +168,15 @@ impl Default for RedirectPolicy {
 /// # Idempotency
 ///
 /// Configuring retry is the user's promise that the configured
-/// requests are safe to repeat. The bridge does not inspect method,
-/// path, or headers to decide. If a request must not retry, set
-/// [`RetryPolicy::None`] for that worker or run it through a separate
-/// worker.
+/// retry-safe requests are safe to repeat. The bridge also applies a
+/// conservative method gate: only HTTP methods that are retry-safe by
+/// default (`GET`, `HEAD`, `OPTIONS`, `TRACE`, `PUT`, `DELETE`) are
+/// retried. `POST` and `PATCH` surface the first terminal error even
+/// when this policy enables timeout or IO retry, because a response
+/// body read error can happen after the upstream committed the request.
+/// If a non-idempotent operation is safe in your application, encode
+/// idempotency at the application layer and use a retry-safe method or
+/// a dedicated bridge worker/API that makes that promise explicit.
 ///
 /// # Not retried
 ///

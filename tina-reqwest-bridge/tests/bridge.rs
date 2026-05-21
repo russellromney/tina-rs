@@ -21,8 +21,8 @@ use tina_runtime::{
 };
 
 use common::{
-    Beacon, FakeServer, FlakyServer, delayed_ok, echo_body, echo_body_len, echo_header,
-    fixed_status,
+    Beacon, FakeServer, FlakyServer, TruncatedBodyServer, delayed_ok, echo_body, echo_body_len,
+    echo_header, fixed_status,
 };
 
 type Outcome = CallOutcome<Result<ReqwestResponse, ReqwestError>>;
@@ -919,6 +919,38 @@ fn retry_exhaustion_surfaces_last_error() {
     assert_eq!(snap.admitted, 2);
     assert_eq!(snap.responses, 0);
     flaky.stop();
+}
+
+#[test]
+fn retry_on_io_does_not_repeat_post_after_response_body_error() {
+    let server = TruncatedBodyServer::spawn();
+    let config = ReqwestConfig::default()
+        .with_poll_interval(Duration::from_millis(2))
+        .with_retry(RetryPolicy::Bounded {
+            max_attempts: 3,
+            delay: Duration::from_millis(1),
+            on_timeout: false,
+            on_reqwest_io: true,
+        });
+    let request = ReqwestRequest::post(server.url("/commit"), b"create-item".to_vec());
+    let (outcome, metrics) = run_one_call(
+        config,
+        request,
+        Duration::from_secs(2),
+        Duration::from_secs(5),
+    );
+
+    assert!(
+        matches!(outcome, CallOutcome::Replied(Err(ReqwestError::Reqwest(_)))),
+        "body read failure should surface as Reqwest, got {outcome:?}"
+    );
+    assert_eq!(
+        server.accepted.read(),
+        1,
+        "POST must not be retried after the upstream started a response"
+    );
+    assert_eq!(metrics.snapshot().retries, 0);
+    server.stop();
 }
 
 #[test]
