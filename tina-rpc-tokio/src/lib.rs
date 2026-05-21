@@ -144,7 +144,12 @@ fn map_client_result(result: ClientResult) -> Result<Vec<u8>, BridgeError> {
 // Shim isolate: receives ClientResultMsg and forwards via oneshot
 // ---------------------------------------------------------------------------
 
-type PendingMap = HashMap<u64, oneshot::Sender<ClientResult>>;
+struct PendingCall {
+    tx: oneshot::Sender<ClientResult>,
+    deadline_cancel: oneshot::Sender<()>,
+}
+
+type PendingMap = HashMap<u64, PendingCall>;
 
 /// Shim isolate registered with the runtime once per [`BridgeClient`].
 /// Receives [`ClientResultMsg`] from the `tina_rpc::Client`, routes
@@ -153,10 +158,9 @@ type PendingMap = HashMap<u64, oneshot::Sender<ClientResult>>;
 /// completed.
 ///
 /// A `correlator` not present in `pending` is dropped silently —
-/// either the awaiter cancelled (the [`CancelGuard`] already
-/// removed the entry and released the slot) or the message is a
-/// stray (no slot was ever reserved for it). Either way, no slot is
-/// released here.
+/// either the bridge deadline backstop already settled it or the
+/// message is a stray (no slot was ever reserved for it). Either
+/// way, no slot is released here.
 struct ReplyShim<S>
 where
     S: tina::Shard,
@@ -184,19 +188,10 @@ where
         msg: ClientResultMsg,
         _ctx: &mut Context<'_, S, Self::Reply>,
     ) -> Effect<Self> {
-        let entry = {
-            let mut pending = self
-                .pending
-                .lock()
-                .expect("BridgeClient pending map mutex poisoned");
-            pending.remove(&msg.correlator)
-        };
-        if let Some(tx) = entry {
-            // The receiver may already be dropped; a send error is a
-            // noop.
-            let _ = tx.send(msg.result);
-            self.slots.add_permits(1);
-        }
+        // The receiver may already be dropped; settle_pending treats
+        // a send error as terminal and still releases the reserved
+        // bridge slot.
+        settle_pending(&self.pending, &self.slots, msg.correlator, msg.result);
         Effect::Noop
     }
 }
@@ -208,9 +203,8 @@ where
 /// arrive for this correlator.
 ///
 /// Only `add_permits(1)` when this call *actually* removed the
-/// pending entry. If the awaiting future was already cancelled,
-/// [`CancelGuard::drop`] removed the entry and released the slot;
-/// a second release here would inflate capacity above
+/// pending entry. If another terminal path already removed the
+/// entry, a second release here would inflate capacity above
 /// `max_in_flight`.
 fn fire_observer_err(
     pending: &Mutex<PendingMap>,
@@ -225,13 +219,42 @@ fn fire_observer_err(
             ClientResult::IoError(tina_runtime::CallError::Io)
         }
     };
+    settle_pending(pending, slots, correlator, mapped);
+    // Entry already gone → shim or deadline backstop settled it
+    // first. Do not double-release.
+}
+
+fn settle_pending(
+    pending: &Mutex<PendingMap>,
+    slots: &Semaphore,
+    correlator: u64,
+    result: ClientResult,
+) -> bool {
     let entry = pending.lock().ok().and_then(|mut p| p.remove(&correlator));
-    if let Some(tx) = entry {
-        let _ = tx.send(mapped);
+    if let Some(entry) = entry {
+        let _ = entry.deadline_cancel.send(());
+        let _ = entry.tx.send(result);
         slots.add_permits(1);
+        true
+    } else {
+        false
     }
-    // Entry already gone → CancelGuard released the slot. Do not
-    // double-release.
+}
+
+fn release_pending(pending: &Mutex<PendingMap>, slots: &Semaphore, correlator: u64) -> bool {
+    let removed = pending
+        .lock()
+        .ok()
+        .and_then(|mut p| p.remove(&correlator))
+        .map(|entry| {
+            let _ = entry.deadline_cancel.send(());
+        });
+    if removed.is_some() {
+        slots.add_permits(1);
+        true
+    } else {
+        false
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -291,8 +314,8 @@ where
     pending: Arc<Mutex<PendingMap>>,
     /// Bounded admission counter. One permit = one guaranteed reply
     /// slot in the shim's mailbox. Acquired synchronously in `call`;
-    /// released by the shim when the reply lands or by the observer
-    /// when ingress fails.
+    /// released by the shim when the reply lands, by the observer
+    /// when ingress fails, or by the bridge deadline backstop.
     slots: Arc<Semaphore>,
     next_correlator: AtomicU64,
     send_and_observe: SendAndObserve,
@@ -312,17 +335,16 @@ where
     /// in-flight calls. Past it, [`BridgeClient::call`] returns
     /// [`BridgeError::Full`] **synchronously**, before any
     /// `ClientMsg::Request` hits the runtime. Cancelling an awaiting
-    /// future releases its admission slot **immediately** via the
-    /// cancellation guard — the underlying request continues at the
-    /// `Client` until its deadline elapses, and the late reply is
-    /// discarded by the shim. Must be `> 0`.
+    /// future does **not** release its admission slot immediately:
+    /// the underlying request continues at the `Client`, so the slot
+    /// stays reserved until the client replies or the bridge deadline
+    /// backstop fires. Must be `> 0`.
     ///
     /// The shim's mailbox is sized to `max_in_flight * 2` so a burst
-    /// of cancellations followed by re-admission cannot overflow it
-    /// (cancelled-but-still-in-flight replies plus the freshly-
-    /// admitted batch's replies fit together). Past that the runtime
-    /// would silently drop a `ClientResultMsg` and an awaiter would
-    /// hang on a lost reply.
+    /// of ordinary late replies plus freshly-admitted replies fits
+    /// together in the common case. If a reply is still lost, the
+    /// bridge deadline backstop settles the awaiter with
+    /// [`BridgeError::Timeout`] instead of hanging forever.
     ///
     /// `runtime` is taken as `Arc<ThreadedRuntime<...>>` because
     /// the bridge's reply demux closure must outlive any single
@@ -416,7 +438,16 @@ where
         permit.forget();
 
         let correlator = self.inner.next_correlator.fetch_add(1, Ordering::Relaxed);
+        let request = match request_fn(correlator, self.inner.shim_addr) {
+            Ok(req) => req,
+            Err(err) => {
+                self.inner.slots.add_permits(1);
+                return Err(BridgeError::Encoding(err));
+            }
+        };
+        let deadline = request.deadline;
         let (tx, rx) = oneshot::channel::<ClientResult>();
+        let (deadline_cancel, deadline_cancel_rx) = oneshot::channel::<()>();
 
         // Insert into the pending map BEFORE sending, so a fast
         // reply path can find the slot.
@@ -426,16 +457,30 @@ where
                 .pending
                 .lock()
                 .expect("BridgeClient pending map mutex poisoned");
-            pending.insert(correlator, tx);
+            pending.insert(
+                correlator,
+                PendingCall {
+                    tx,
+                    deadline_cancel,
+                },
+            );
         }
 
-        let request = match request_fn(correlator, self.inner.shim_addr) {
-            Ok(req) => req,
-            Err(err) => {
-                self.abort_admitted(correlator);
-                return Err(BridgeError::Encoding(err));
+        let pending_for_deadline = Arc::clone(&self.inner.pending);
+        let slots_for_deadline = Arc::clone(&self.inner.slots);
+        tokio::spawn(async move {
+            tokio::select! {
+                _ = tokio::time::sleep(deadline) => {
+                    settle_pending(
+                        &pending_for_deadline,
+                        &slots_for_deadline,
+                        correlator,
+                        ClientResult::Timeout,
+                    );
+                }
+                _ = deadline_cancel_rx => {}
             }
-        };
+        });
 
         #[cfg(feature = "tracing")]
         let span = debug_span!(
@@ -486,27 +531,7 @@ where
             return Err(BridgeError::ClientUnavailable);
         }
 
-        // Drop guard for cancellation: if the awaiting future is
-        // dropped, remove the pending entry **and** release the
-        // admission slot synchronously. The underlying request
-        // continues at the `Client`; its eventual reply finds no
-        // pending entry and is discarded by the shim. The shim
-        // mailbox is oversized in `new` to absorb that overshoot
-        // without overflow.
-        let guard = CancelGuard {
-            pending: Arc::clone(&self.inner.pending),
-            slots: Arc::clone(&self.inner.slots),
-            correlator,
-        };
-
-        let await_fut = async move {
-            let result = rx.await;
-            // Disarm — on success the entry was already taken by the
-            // shim or observer; the explicit `Err` arm below handles
-            // its own cleanup.
-            std::mem::forget(guard);
-            result
-        };
+        let await_fut = rx;
         // `Instrument` keeps the span attached across yield points;
         // a bare `let _enter = span.enter()` would leak the span
         // into other tasks when the await yields.
@@ -558,40 +583,7 @@ where
     /// failure, shim death) where no shim notification will ever
     /// arrive to release the slot for us.
     fn abort_admitted(&self, correlator: u64) {
-        {
-            let mut pending = self
-                .inner
-                .pending
-                .lock()
-                .expect("BridgeClient pending map mutex poisoned");
-            pending.remove(&correlator);
-        }
-        self.inner.slots.add_permits(1);
-    }
-}
-
-/// Removes the pending entry and releases the admission slot when
-/// the awaiting future is dropped. The underlying `Client` request
-/// continues; its eventual reply lands at the shim, finds no
-/// matching correlator, and is discarded. The shim mailbox is
-/// oversized at construction so the cancelled-but-still-in-flight
-/// reply does not displace replies for newly-admitted calls.
-struct CancelGuard {
-    pending: Arc<Mutex<PendingMap>>,
-    slots: Arc<Semaphore>,
-    correlator: u64,
-}
-
-impl Drop for CancelGuard {
-    fn drop(&mut self) {
-        let removed = if let Ok(mut pending) = self.pending.lock() {
-            pending.remove(&self.correlator).is_some()
-        } else {
-            false
-        };
-        if removed {
-            self.slots.add_permits(1);
-        }
+        release_pending(&self.inner.pending, &self.inner.slots, correlator);
     }
 }
 
@@ -966,7 +958,14 @@ mod tests {
 
         // Insert pending entry as if `BridgeClient::call` did.
         let (tx, mut rx) = oneshot::channel::<ClientResult>();
-        pending.lock().unwrap().insert(7, tx);
+        let (deadline_cancel, _deadline_cancel_rx) = oneshot::channel::<()>();
+        pending.lock().unwrap().insert(
+            7,
+            PendingCall {
+                tx,
+                deadline_cancel,
+            },
+        );
 
         fire_observer_err(&pending, &slots, 7, ThreadedSendObservedError::MailboxFull);
 
@@ -981,12 +980,12 @@ mod tests {
 
     #[test]
     fn observer_err_with_stale_entry_does_not_release_slot() {
-        // Race we're pinning: `CancelGuard::drop` already removed the
-        // pending entry and released the slot. The observer then
-        // fires `Err` for the same correlator. Without the
-        // "only release if I actually took the entry" rule, this
-        // path would `add_permits(1)` again and inflate capacity
-        // above `max_in_flight`.
+        // Race we're pinning: another terminal path already removed
+        // the pending entry and released the slot. The observer then
+        // fires `Err` for the same correlator. Without the "only
+        // release if I actually took the entry" rule, this path
+        // would `add_permits(1)` again and inflate capacity above
+        // `max_in_flight`.
         let pending: Arc<Mutex<PendingMap>> = Arc::new(Mutex::new(HashMap::new()));
         let slots = Arc::new(Semaphore::new(1));
 
@@ -995,7 +994,7 @@ mod tests {
             .try_acquire_owned()
             .expect("admission")
             .forget();
-        // Simulate `CancelGuard::drop`: pending entry was never
+        // Simulate a deadline backstop: pending entry was never
         // inserted (or was removed) and slot was returned.
         slots.add_permits(1);
         assert_eq!(slots.available_permits(), 1);
@@ -1011,12 +1010,12 @@ mod tests {
         assert_eq!(
             slots.available_permits(),
             1,
-            "stale observer Err released a slot the CancelGuard had already returned",
+            "stale observer Err released a slot another terminal path had already returned",
         );
     }
 
     #[test]
-    fn cancel_guard_drop_releases_only_when_it_removed_pending_entry() {
+    fn release_pending_releases_only_when_it_removed_pending_entry() {
         let pending: Arc<Mutex<PendingMap>> = Arc::new(Mutex::new(HashMap::new()));
         let slots = Arc::new(Semaphore::new(1));
         Arc::clone(&slots)
@@ -1026,23 +1025,22 @@ mod tests {
         assert_eq!(slots.available_permits(), 0);
 
         let (tx, _rx) = oneshot::channel::<ClientResult>();
-        pending.lock().unwrap().insert(42, tx);
-        drop(CancelGuard {
-            pending: Arc::clone(&pending),
-            slots: Arc::clone(&slots),
-            correlator: 42,
-        });
+        let (deadline_cancel, _deadline_cancel_rx) = oneshot::channel::<()>();
+        pending.lock().unwrap().insert(
+            42,
+            PendingCall {
+                tx,
+                deadline_cancel,
+            },
+        );
+        assert!(release_pending(&pending, &slots, 42));
         assert_eq!(slots.available_permits(), 1);
 
-        drop(CancelGuard {
-            pending,
-            slots: Arc::clone(&slots),
-            correlator: 42,
-        });
+        assert!(!release_pending(&pending, &slots, 42));
         assert_eq!(
             slots.available_permits(),
             1,
-            "stale CancelGuard must not inflate permits above max"
+            "stale release must not inflate permits above max"
         );
     }
 

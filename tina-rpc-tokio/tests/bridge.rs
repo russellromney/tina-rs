@@ -106,9 +106,14 @@ enum StubBehavior {
     AlwaysFull,
     /// Hold every request without replying. Used to pin the bridge's
     /// admission limit: in-flight slots stay reserved until the
-    /// awaiter is cancelled, so subsequent calls must surface
+    /// bridge capacity is full, so subsequent calls must surface
     /// `BridgeError::Full` synchronously instead of hanging.
     NeverReply,
+    /// Fill the reply shim mailbox with stray replies, then try to
+    /// send the real reply. With bridge max_in_flight = 1 the shim
+    /// mailbox has capacity 2, so the real reply is dropped unless
+    /// the bridge has an independent terminal backstop.
+    FloodShimThenReply,
 }
 
 impl Isolate for ClientStub {
@@ -132,6 +137,31 @@ impl Isolate for ClientStub {
                     StubBehavior::Echo => ClientResult::Ok(req.payload.clone()),
                     StubBehavior::AlwaysFull => ClientResult::Full,
                     StubBehavior::NeverReply => return Effect::Noop,
+                    StubBehavior::FloodShimThenReply => {
+                        return Effect::Batch(vec![
+                            Effect::Send(Outbound::new(
+                                req.reply_to,
+                                ClientResultMsg {
+                                    correlator: req.correlator + 1000,
+                                    result: ClientResult::ConnectionClosed,
+                                },
+                            )),
+                            Effect::Send(Outbound::new(
+                                req.reply_to,
+                                ClientResultMsg {
+                                    correlator: req.correlator + 2000,
+                                    result: ClientResult::ConnectionClosed,
+                                },
+                            )),
+                            Effect::Send(Outbound::new(
+                                req.reply_to,
+                                ClientResultMsg {
+                                    correlator: req.correlator,
+                                    result: ClientResult::Ok(req.payload.clone()),
+                                },
+                            )),
+                        ]);
+                    }
                 };
                 Effect::Send(Outbound::new(
                     req.reply_to,
@@ -318,25 +348,20 @@ async fn admission_full_returns_synchronously_no_hang() {
 }
 
 #[tokio::test]
-async fn cancelled_call_releases_slot_synchronously() {
-    // The bridge's `CancelGuard` must release the admission slot
-    // synchronously when the awaiting future is dropped — without
-    // waiting for the underlying request to time out at the
-    // `Client`. A late reply for the cancelled correlator is
-    // discarded by the shim.
+async fn cancelled_call_releases_slot_after_terminal_backstop() {
+    // Dropping the awaiting future is not a terminal result for the
+    // underlying RPC. The slot remains charged until the bridge
+    // deadline backstop fires.
     let runtime = build_runtime();
     let stub = register_stub(&runtime, StubBehavior::NeverReply);
     let bridge = BridgeClient::<SpecimenShard>::new(Arc::clone(&runtime), stub, 1).unwrap();
 
-    // Hold the only slot with a NeverReply call. If admission did
-    // not release on cancel, the next call would be `Full` for the
-    // entire request deadline (60s) — we'd see it instantly.
     let bridge_a = bridge.clone();
     let abandoned = tokio::spawn(async move {
         bridge_a
             .call(
                 |corr, rt| {
-                    EchoClient::say_request("a".into(), Duration::from_secs(60), corr, rt, 1024)
+                    EchoClient::say_request("a".into(), Duration::from_millis(80), corr, rt, 1024)
                 },
                 |bytes| EchoClient::say_decode_reply(bytes, 1024),
             )
@@ -348,32 +373,102 @@ async fn cancelled_call_releases_slot_synchronously() {
     abandoned.abort();
     let _ = abandoned.await;
 
-    // After cancel, the slot is free. A fresh call must be
-    // *admitted* — i.e., it must reach `rx.await` and hang there
-    // (because `NeverReply` never replies). A short timeout proves
-    // admission happened: we expect `Elapsed`, not
-    // `Ok(Err(BridgeError::Full))`.
-    let bridge_b = bridge.clone();
-    let outcome = tokio::time::timeout(
-        Duration::from_millis(250),
-        bridge_b.call(
+    let before_backstop = tokio::time::timeout(
+        Duration::from_millis(100),
+        bridge.call(
             |corr, rt| EchoClient::say_request("b".into(), Duration::from_secs(60), corr, rt, 1024),
             |bytes| EchoClient::say_decode_reply(bytes, 1024),
         ),
     )
-    .await;
+    .await
+    .expect("capacity check should be immediate");
+    assert_eq!(before_backstop, Err(BridgeError::Full));
 
-    match outcome {
-        Err(_elapsed) => {
-            // Admitted; hung on rx.await. ✓
-        }
-        Ok(Err(BridgeError::Full)) => {
-            panic!("post-cancel call returned Full — slot was not released by CancelGuard");
-        }
-        Ok(other) => {
-            panic!("unexpected post-cancel outcome: {other:?}");
-        }
+    tokio::time::sleep(Duration::from_millis(120)).await;
+    assert_eq!(bridge.available_slots(), 1);
+}
+
+#[tokio::test]
+async fn dropped_awaiter_holds_capacity_until_terminal_backstop() {
+    // Dropping the awaiting future must not release admission while
+    // the underlying RPC is still live. Otherwise a hot cancel/retry
+    // loop can create unbounded outstanding work behind a bounded
+    // bridge handle.
+    let runtime = build_runtime();
+    let stub = register_stub(&runtime, StubBehavior::NeverReply);
+    let bridge = BridgeClient::<SpecimenShard>::new(Arc::clone(&runtime), stub, 1).unwrap();
+
+    let bridge_a = bridge.clone();
+    let abandoned = tokio::spawn(async move {
+        bridge_a
+            .call(
+                |corr, rt| {
+                    EchoClient::say_request("a".into(), Duration::from_millis(80), corr, rt, 1024)
+                },
+                |bytes| EchoClient::say_decode_reply(bytes, 1024),
+            )
+            .await
+    });
+    for _ in 0..50 {
+        tokio::task::yield_now().await;
     }
+    abandoned.abort();
+    let _ = abandoned.await;
+
+    let immediate = tokio::time::timeout(
+        Duration::from_millis(100),
+        bridge.call(
+            |corr, rt| EchoClient::say_request("b".into(), Duration::from_secs(1), corr, rt, 1024),
+            |bytes| EchoClient::say_decode_reply(bytes, 1024),
+        ),
+    )
+    .await
+    .expect("capacity check should be immediate");
+    assert_eq!(
+        immediate,
+        Err(BridgeError::Full),
+        "cancelled awaiter must not free capacity before the admitted RPC settles"
+    );
+
+    tokio::time::sleep(Duration::from_millis(120)).await;
+
+    let admitted_after_backstop = tokio::time::timeout(
+        Duration::from_millis(100),
+        bridge.call(
+            |corr, rt| EchoClient::say_request("c".into(), Duration::from_secs(1), corr, rt, 1024),
+            |bytes| EchoClient::say_decode_reply(bytes, 1024),
+        ),
+    )
+    .await;
+    assert!(
+        admitted_after_backstop.is_err(),
+        "after the bridge backstop releases capacity, the NeverReply call should be admitted and wait"
+    );
+}
+
+#[tokio::test]
+async fn dropped_shim_reply_times_out_instead_of_hanging() {
+    // The client can attempt to notify the shim, but if the shim
+    // mailbox is full the real reply may be dropped by the runtime.
+    // The bridge still owes the awaiter a terminal result.
+    let runtime = build_runtime();
+    let stub = register_stub(&runtime, StubBehavior::FloodShimThenReply);
+    let bridge = BridgeClient::<SpecimenShard>::new(Arc::clone(&runtime), stub, 1).unwrap();
+
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(1),
+        bridge.call(
+            |corr, rt| {
+                EchoClient::say_request("lost".into(), Duration::from_millis(50), corr, rt, 1024)
+            },
+            |bytes| EchoClient::say_decode_reply(bytes, 1024),
+        ),
+    )
+    .await
+    .expect("bridge must settle a dropped shim reply via its own backstop");
+
+    assert_eq!(outcome, Err(BridgeError::Timeout));
+    assert_eq!(bridge.available_slots(), 1, "backstop released admission");
 }
 
 #[tokio::test]
