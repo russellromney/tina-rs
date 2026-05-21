@@ -5652,9 +5652,6 @@ where
 
 pub(crate) fn fault_selector(seed: u64, tag: u64, ordinal: u64, modulus: u64) -> u64 {
     debug_assert!(modulus > 0);
-    if ordinal == 0 {
-        return seed % modulus;
-    }
     splitmix64(seed ^ tag.rotate_left(17) ^ ordinal.wrapping_mul(0x9E37_79B9_7F4A_7C15)) % modulus
 }
 

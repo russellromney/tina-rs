@@ -310,6 +310,15 @@ mod tests {
     }
 
     #[test]
+    fn fault_selector_mixes_tag_into_first_ordinal() {
+        assert_ne!(
+            fault_selector(7, 0xAA, 0, 17),
+            fault_selector(7, 0xBB, 0, 17),
+            "first fault decision must not collapse every tag to seed % modulus"
+        );
+    }
+
+    #[test]
     fn cancelled_call_cause_ring_overflow_is_visible() {
         let mut simulator = Simulator::new(NumberedShard(0), SimulatorConfig::default());
 
