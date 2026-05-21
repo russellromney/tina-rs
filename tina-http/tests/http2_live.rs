@@ -1434,6 +1434,42 @@ fn http2_inbound_data_obeys_stream_window() {
 }
 
 #[test]
+fn http2_stream_flow_control_error_resets_only_bad_stream() {
+    let config = Http2ServerConfig {
+        limits: Http2Limits {
+            initial_connection_window: 100,
+            initial_stream_window: 2,
+            ..Http2Limits::default()
+        },
+        ..Http2ServerConfig::default()
+    };
+    let harness = Http2Harness::start(config);
+    let mut stream = connect_h2(harness.addr);
+
+    write_frame(
+        &mut stream,
+        FRAME_HEADERS,
+        FLAG_END_HEADERS,
+        1,
+        &request_headers("POST", "/echo"),
+    );
+    write_frame(&mut stream, FRAME_DATA, FLAG_END_STREAM, 1, b"abc");
+
+    let frame = read_until_rst(&mut stream, 1);
+    assert_eq!(rst_stream_error_code(&frame), ERR_FLOW_CONTROL_ERROR);
+
+    write_frame(
+        &mut stream,
+        FRAME_HEADERS,
+        FLAG_END_HEADERS | FLAG_END_STREAM,
+        3,
+        &request_headers("GET", "/counter"),
+    );
+    assert_eq!(read_response_body(&mut stream, 3), b"0");
+    harness.shutdown();
+}
+
+#[test]
 fn http2_zero_stream_window_update_resets_only_bad_stream() {
     let harness = Http2Harness::start(Http2ServerConfig::default());
     let mut stream = connect_h2(harness.addr);

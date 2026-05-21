@@ -824,7 +824,18 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Http2Connection<
                     side: Http2FlowControlSide::StreamReceive,
                 },
             );
-            return Err(Http2ProtocolError::FlowControl);
+            self.enqueue_frame(rst_stream_frame(frame.stream_id, ERR_FLOW_CONTROL_ERROR))?;
+            self.emit_protocol_fact(
+                effects,
+                ProtocolFact::Http2StreamReset {
+                    connection: self.connection_fact_id(),
+                    stream: Http2StreamId::new(frame.stream_id),
+                    direction: ProtocolDirection::Outbound,
+                    reason: Http2ResetReason::FlowControlError,
+                },
+            );
+            self.reset_active_stream_for_protocol(frame.stream_id, effects);
+            return Ok(());
         }
         if let Some(content_length) = self.streams[idx].request_content_length {
             let received = self.streams[idx]
@@ -2563,6 +2574,46 @@ mod tests {
                 }
             )),
             "expected ConnectionReceive flow-control fact, got {facts:?}",
+        );
+    }
+
+    #[test]
+    fn stream_receive_window_full_resets_only_that_stream() {
+        let mut conn = unit_connection();
+        conn.recv_window = 100;
+        conn.streams.push(ActiveStream::new(
+            1,
+            HeaderBlock::default(),
+            1,
+            DEFAULT_WINDOW,
+            false,
+        ));
+        let mut effects: Vec<Effect<Http2Connection<UnitShard>>> = Vec::new();
+        let data = Frame::new(FRAME_DATA, 0, 1, b"abc".to_vec());
+
+        conn.handle_data(data, &mut effects)
+            .expect("stream receive overrun should not GOAWAY connection");
+
+        assert!(conn.find_stream(1).is_none(), "bad stream is removed");
+        assert_eq!(conn.write_queue.len(), 1);
+        let (queued, _) = try_decode_frame(&conn.write_queue[0], conn.limits.max_frame_size)
+            .expect("complete queued frame")
+            .expect("queued RST decodes");
+        assert_eq!(queued.ty, FRAME_RST_STREAM);
+        assert_eq!(queued.stream_id, 1);
+        let mut code = [0_u8; 4];
+        code.copy_from_slice(&queued.payload);
+        assert_eq!(u32::from_be_bytes(code), ERR_FLOW_CONTROL_ERROR);
+        let facts = collect_facts(&effects);
+        assert!(
+            facts.iter().any(|f| matches!(
+                f,
+                ProtocolFact::Http2FlowControlFull {
+                    side: Http2FlowControlSide::StreamReceive,
+                    ..
+                }
+            )),
+            "expected StreamReceive flow-control fact, got {facts:?}",
         );
     }
 
