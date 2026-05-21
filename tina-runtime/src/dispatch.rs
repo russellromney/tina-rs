@@ -2262,7 +2262,23 @@ where
             }
         }
 
-        let outcome = recipe.create(self, parent);
+        let outcome = match catch_unwind(AssertUnwindSafe(|| recipe.create(self, parent))) {
+            Ok(outcome) => outcome,
+            Err(_) => {
+                self.child_records[child_record_index].restart_recipe = Some(recipe);
+                self.push_event(
+                    parent,
+                    Some(attempted.into()),
+                    RuntimeEventKind::RestartChildSkipped {
+                        child_ordinal,
+                        old_isolate: old_child.isolate,
+                        old_generation: old_child.generation,
+                        reason: RestartSkippedReason::FactoryPanicked,
+                    },
+                );
+                return;
+            }
+        };
         let new_child = outcome.child;
         let bootstrap_message = outcome.bootstrap_message;
         self.child_records[child_record_index].child = new_child;
