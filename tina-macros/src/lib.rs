@@ -302,6 +302,8 @@ fn build_isolate(
         let (request_attrs, request_name, call_name, request_body) =
             validate_call_handler(&request_method, "handle_request", "request", "call")?;
         require_call_authority_mentioned(&request_body, &call_name)?;
+        let service_message_name =
+            Ident::new("__tina_service_message", proc_macro2::Span::mixed_site());
         let event_attrs = event_method.attrs.clone();
         let event_body = Box::new(event_method.block.clone());
         let handle_call_tokens = quote! {
@@ -309,11 +311,11 @@ fn build_isolate(
             #[deny(unused_variables)]
             fn handle_call(
                 &mut self,
-                msg: Self::Message,
+                #service_message_name: Self::Message,
                 #call_name: #tina_crate::CallContext<'_, Self>,
             ) -> #tina_crate::Effect<Self> {
                 let #call_name = #tina_crate::RequestCall::new(#call_name);
-                match msg {
+                match #service_message_name {
                     #tina_crate::ServiceMessage::Request(#request_name) => {
                         let request_effect: #tina_crate::RequestEffect<Self> = #request_body;
                         request_effect.into_effect()
