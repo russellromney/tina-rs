@@ -945,7 +945,22 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Http2Connection<
         bytes.copy_from_slice(&frame.payload);
         let increment = u32::from_be_bytes(bytes) & 0x7fff_ffff;
         if increment == 0 {
-            return Err(Http2ProtocolError::WindowOverflow);
+            if frame.stream_id == 0 {
+                return Err(Http2ProtocolError::WindowOverflow);
+            }
+            self.report.protocol_errors += 1;
+            self.enqueue_frame(rst_stream_frame(frame.stream_id, ERR_PROTOCOL_ERROR))?;
+            self.emit_protocol_fact(
+                effects,
+                ProtocolFact::Http2StreamReset {
+                    connection: self.connection_fact_id(),
+                    stream: Http2StreamId::new(frame.stream_id),
+                    direction: ProtocolDirection::Outbound,
+                    reason: Http2ResetReason::ProtocolError,
+                },
+            );
+            self.reset_active_stream_for_protocol(frame.stream_id, effects);
+            return Ok(());
         }
         if frame.stream_id == 0 {
             self.send_window = add_window(self.send_window, increment)?;
@@ -2089,6 +2104,46 @@ mod tests {
         assert_eq!(
             conn.handle_window_update(frame, &mut effects),
             Err(Http2ProtocolError::WindowOverflow)
+        );
+    }
+
+    #[test]
+    fn zero_stream_window_update_resets_only_that_stream() {
+        let mut conn = unit_connection();
+        conn.streams.push(ActiveStream::new(
+            1,
+            HeaderBlock::default(),
+            DEFAULT_WINDOW,
+            DEFAULT_WINDOW,
+            false,
+        ));
+        let frame = Frame::new(FRAME_WINDOW_UPDATE, 0, 1, 0_u32.to_be_bytes().to_vec());
+        let mut effects: Vec<Effect<Http2Connection<UnitShard>>> = Vec::new();
+
+        conn.handle_window_update(frame, &mut effects)
+            .expect("stream zero WINDOW_UPDATE should not GOAWAY connection");
+
+        assert!(conn.find_stream(1).is_none(), "bad stream is removed");
+        assert_eq!(conn.write_queue.len(), 1);
+        let (queued, _) = try_decode_frame(&conn.write_queue[0], conn.limits.max_frame_size)
+            .expect("complete queued frame")
+            .expect("queued RST decodes");
+        assert_eq!(queued.ty, FRAME_RST_STREAM);
+        assert_eq!(queued.stream_id, 1);
+        let mut code = [0_u8; 4];
+        code.copy_from_slice(&queued.payload);
+        assert_eq!(u32::from_be_bytes(code), ERR_PROTOCOL_ERROR);
+        let facts = collect_facts(&effects);
+        assert!(
+            facts.iter().any(|f| matches!(
+                f,
+                ProtocolFact::Http2StreamReset {
+                    reason: Http2ResetReason::ProtocolError,
+                    direction: ProtocolDirection::Outbound,
+                    ..
+                }
+            )),
+            "expected outbound protocol reset fact, got {facts:?}",
         );
     }
 
