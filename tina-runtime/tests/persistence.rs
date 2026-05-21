@@ -505,6 +505,50 @@ fn journal_append_rejects_unreplayable_index_order_before_appending() {
 }
 
 #[test]
+fn journal_append_recovers_from_torn_index_sidecar() {
+    let dir = unique_dir("append-torn-index");
+    let journal = dir.join("state.journal");
+    let index = journal.with_extension("journal.idx");
+
+    tina_runtime::persistence::append_journal_record(&journal, 1, b"first".to_vec()).unwrap();
+    fs::write(&index, b"TNJI").expect("write torn index sidecar");
+
+    tina_runtime::persistence::append_journal_record(&journal, 2, b"second".to_vec()).unwrap();
+    let replay = tina_runtime::persistence::replay_journal(&journal).unwrap();
+    assert_eq!(replay.warning, None);
+    assert_eq!(
+        replay
+            .records
+            .iter()
+            .map(|record| (record.index, record.bytes.as_slice()))
+            .collect::<Vec<_>>(),
+        vec![(1, b"first".as_slice()), (2, b"second".as_slice())]
+    );
+}
+
+#[test]
+fn journal_append_recovers_from_garbage_index_sidecar() {
+    let dir = unique_dir("append-garbage-index");
+    let journal = dir.join("state.journal");
+    let index = journal.with_extension("journal.idx");
+
+    tina_runtime::persistence::append_journal_record(&journal, 7, b"first".to_vec()).unwrap();
+    fs::write(&index, [0x42; 24]).expect("write garbage index sidecar");
+
+    tina_runtime::persistence::append_journal_record(&journal, 8, b"second".to_vec()).unwrap();
+    let replay = tina_runtime::persistence::replay_journal(&journal).unwrap();
+    assert_eq!(replay.warning, None);
+    assert_eq!(
+        replay
+            .records
+            .iter()
+            .map(|record| (record.index, record.bytes.as_slice()))
+            .collect::<Vec<_>>(),
+        vec![(7, b"first".as_slice()), (8, b"second".as_slice())]
+    );
+}
+
+#[test]
 fn local_runtime_recovers_truncated_journal_then_repairs_on_next_append() {
     let dir = unique_dir("runtime-truncated-repair");
     let snapshot = dir.join("state.snapshot");
