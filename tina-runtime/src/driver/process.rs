@@ -318,20 +318,24 @@ fn kill_and_reap(
             Ok(None) | Err(_) => CallOutput::Failed(CallError::KillUncertain),
         };
     }
-    // Bound the post-kill reap. `child.wait()` blocks with no deadline, so a
+    // Bound the post-kill reap. A blocking `child.wait()` has no deadline, so a
     // wedged reap (D-state child, or a SIGKILL that did not land) would pin the
     // process worker thread forever; on Drop that thread is detached and leaks.
     let reap_deadline = Instant::now() + PROCESS_KILL_REAP_TIMEOUT;
     loop {
         match child.try_wait() {
-            Ok(Some(_)) => break,
+            // We reaped it, or it is simply gone. `Err` here is the
+            // runtime's own child reaper winning the race after we issued
+            // the kill — `try_wait` then has no child to wait on. A vanished
+            // child after a kill is a completed kill, not an uncertain one,
+            // so both cases fall through to the caller's typed `fallback`.
+            Ok(Some(_)) | Err(_) => break,
             Ok(None) => {
                 if Instant::now() >= reap_deadline {
                     return CallOutput::Failed(CallError::KillUncertain);
                 }
                 thread::sleep(Duration::from_millis(1));
             }
-            Err(_) => return CallOutput::Failed(CallError::KillUncertain),
         }
     }
     let _ = join_drain_bounded(stdout, PROCESS_DRAIN_JOIN_TIMEOUT);
