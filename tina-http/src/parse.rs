@@ -260,16 +260,26 @@ fn parse_transfer_encoding(value: &str) -> TransferEncodingFlags {
         chunked: false,
         unsupported: false,
     };
+    let mut saw_token = false;
+    let mut final_token_chunked = false;
     for token in value.split(',') {
         let token = token.trim();
-        if token.is_empty() || token.eq_ignore_ascii_case("identity") {
+        if token.is_empty() {
+            flags.unsupported = true;
             continue;
         }
+        saw_token = true;
         if token.eq_ignore_ascii_case("chunked") {
-            flags.chunked = true;
+            final_token_chunked = true;
         } else {
+            final_token_chunked = false;
             flags.unsupported = true;
         }
+    }
+    if saw_token && final_token_chunked {
+        flags.chunked = true;
+    } else {
+        flags.unsupported = true;
     }
     flags
 }
@@ -691,7 +701,8 @@ mod tests {
 
     #[test]
     fn accepts_chunked_request_transfer_encoding_tokens() {
-        let buf = b"POST /upload HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: identity, chunked \r\n\r\n";
+        let buf =
+            b"POST /upload HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: CHUNKED \r\n\r\n";
         let limits = HttpLimits {
             inbound_stream_chunk_size: Some(1024),
             ..HttpLimits::default()
@@ -706,6 +717,33 @@ mod tests {
     fn rejects_unsupported_request_transfer_encoding_token() {
         let buf =
             b"POST /upload HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: gzip, chunked\r\n\r\n";
+        let limits = HttpLimits {
+            inbound_stream_chunk_size: Some(1024),
+            ..HttpLimits::default()
+        };
+        match parse_request_head(buf, &limits) {
+            ParseProgress::Failed(RequestParseError::UnsupportedTransferEncoding) => {}
+            other => panic!("expected UnsupportedTransferEncoding, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_identity_request_transfer_encoding() {
+        let buf =
+            b"POST /upload HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: identity\r\n\r\nhello";
+        let limits = HttpLimits {
+            inbound_stream_chunk_size: Some(1024),
+            ..HttpLimits::default()
+        };
+        match parse_request_head(buf, &limits) {
+            ParseProgress::Failed(RequestParseError::UnsupportedTransferEncoding) => {}
+            other => panic!("expected UnsupportedTransferEncoding, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_empty_request_transfer_encoding() {
+        let buf = b"POST /upload HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: \r\n\r\nhello";
         let limits = HttpLimits {
             inbound_stream_chunk_size: Some(1024),
             ..HttpLimits::default()
@@ -1063,7 +1101,7 @@ mod tests {
 
     #[test]
     fn response_chunked_transfer_encoding_accepts_token_list() {
-        let buf = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: identity, chunked \r\n\r\n";
+        let buf = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: CHUNKED \r\n\r\n";
         match parse_response_head(buf, &limits()) {
             ResponseParseProgress::Complete { head, .. } => assert!(head.chunked),
             other => panic!("expected complete, got {other:?}"),
@@ -1073,6 +1111,15 @@ mod tests {
     #[test]
     fn response_unsupported_transfer_encoding_token_rejected() {
         let buf = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip, chunked\r\n\r\n";
+        match parse_response_head(buf, &limits()) {
+            ResponseParseProgress::Failed(ResponseParseError::UnsupportedTransferEncoding) => {}
+            other => panic!("expected UnsupportedTransferEncoding, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn response_identity_transfer_encoding_rejected() {
+        let buf = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: identity\r\n\r\nhello";
         match parse_response_head(buf, &limits()) {
             ResponseParseProgress::Failed(ResponseParseError::UnsupportedTransferEncoding) => {}
             other => panic!("expected UnsupportedTransferEncoding, got {other:?}"),
