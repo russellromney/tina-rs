@@ -885,6 +885,8 @@ where
 {
     shard_metrics.set_worker_thread_id(format!("{:?}", thread::current().id()));
     let source_shard = runtime.shard().id();
+    let mut terminal_remote_drain_start = 0;
+    let mut ordinary_remote_drain_start = 0;
     loop {
         shard_metrics.set_resource_counts(runtime.resource_report());
         let route_remote = |envelope: QueuedRemoteEnvelope| -> Result<(), SendRejectedReason> {
@@ -941,6 +943,7 @@ where
             &remote_wiring.terminal_receivers,
             &route_remote,
             config.remote_inbound_drain_budget,
+            &mut terminal_remote_drain_start,
         );
         let ordinary_budget = config
             .remote_inbound_drain_budget
@@ -951,6 +954,7 @@ where
                 &remote_wiring.receivers,
                 &route_remote,
                 ordinary_budget,
+                &mut ordinary_remote_drain_start,
             );
         // Fairness: poll the local command queue after every bounded
         // remote-drain pass, not only when the drain delivered zero
@@ -1005,20 +1009,30 @@ fn drain_remote_inbound<S, F>(
     )],
     route_remote: &impl Fn(QueuedRemoteEnvelope) -> Result<(), SendRejectedReason>,
     budget: usize,
+    next_start: &mut usize,
 ) -> usize
 where
     S: Shard,
     F: MailboxFactory,
 {
+    if budget == 0 || remote_receivers.is_empty() {
+        return 0;
+    }
+    *next_start %= remote_receivers.len();
     let mut delivered = 0;
-    for (_, receiver) in remote_receivers {
+    let mut last_delivered_index = None;
+    for offset in 0..remote_receivers.len() {
+        let index = (*next_start + offset) % remote_receivers.len();
+        let (_, receiver) = &remote_receivers[index];
         loop {
             if delivered >= budget {
+                *next_start = (index + 1) % remote_receivers.len();
                 return delivered;
             }
             match receiver.try_recv() {
                 Ok(envelope) => {
                     delivered += 1;
+                    last_delivered_index = Some(index);
                     if let Some(outbound) =
                         runtime.harvest_remote_envelope(envelope.into_queued_remote_envelope())
                     {
@@ -1030,5 +1044,8 @@ where
             }
         }
     }
+    *next_start = last_delivered_index
+        .map(|index| (index + 1) % remote_receivers.len())
+        .unwrap_or((*next_start + 1) % remote_receivers.len());
     delivered
 }
