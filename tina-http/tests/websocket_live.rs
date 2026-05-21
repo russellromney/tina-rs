@@ -641,6 +641,20 @@ fn websocket_malformed_fragmentation_rejects() {
             .unwrap();
         assert_eq!(read_server_frame(&mut stream).0, 0x8);
     }
+
+    {
+        let harness = Harness::start(WebSocketLimits::default());
+        let mut stream = connect_ws(harness.addr);
+        stream
+            .write_all(&masked_fragment(false, 0x1, b"hel"))
+            .unwrap();
+        stream.write_all(&masked_frame(0x1, b"new")).unwrap();
+        assert_eq!(
+            read_server_frame(&mut stream).0,
+            0x8,
+            "new data frame during an open fragmented message must protocol-close"
+        );
+    }
 }
 
 #[test]
