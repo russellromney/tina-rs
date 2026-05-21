@@ -304,9 +304,13 @@ fn build_isolate(
         require_call_authority_mentioned(&request_body, &call_name)?;
         let event_attrs = event_method.attrs.clone();
         let event_body = Box::new(event_method.block.clone());
+        // No `#[deny(unused_variables)]` here: it would override the caller's
+        // own lint level on the spliced request body and hard-error a handler
+        // that answers the caller without reading a unit/marker request. The
+        // `RequestEffect<Self>` linear type below already enforces the real
+        // invariant (the caller is answered); reading the payload is optional.
         let handle_call_tokens = quote! {
             #(#request_attrs)*
-            #[deny(unused_variables)]
             fn handle_call(
                 &mut self,
                 msg: Self::Message,
