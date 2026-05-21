@@ -64,16 +64,17 @@ impl PromotedSlots {
 
     /// Pop the slot tracking a given local call id.
     ///
-    /// Only safe for slots whose routing is [`DeferredRouting::Local`]:
-    /// remote-routed slots use a `call_id` minted on the requester's
-    /// shard and could shadow a local id. The first form refuses
-    /// remote captures, so every promoted slot is currently `Local`;
-    /// the assertion makes that invariant load-bearing.
+    /// Only takes slots whose routing is [`DeferredRouting::Local`].
+    /// Remote-routed slots can carry a `call_id` minted on another
+    /// shard, so a local caller-liveness sweep must ignore them. Remote
+    /// deferred slots are closed by their own routing path or isolate-stop
+    /// cleanup, not by local pending-call lookup.
     pub fn take_by_local_call_id(&mut self, call_id: CallId) -> Option<DeferredSlotRecord> {
         let pos = self
             .slots
             .iter()
             .position(|s| matches!(s.routing, DeferredRouting::Local) && s.call_id == call_id)?;
+        debug_assert!(matches!(self.slots[pos].routing, DeferredRouting::Local));
         Some(self.slots.remove(pos))
     }
 
@@ -1143,8 +1144,10 @@ where
 #[cfg(test)]
 mod pending_replies_tests {
     use super::*;
+    use crate::RegisteredAddress;
+    use crate::trace::{CauseId, EventId};
     use tina::runtime_internal::{deferred_from_handle, handle_from_shared};
-    use tina::{DeferredSlotShared, DeferredSlotState};
+    use tina::{AddressGeneration, DeferredSlotShared, DeferredSlotState, ShardId};
 
     fn fake_slot(id: u64) -> DeferredReply<u32> {
         let shared =
@@ -1159,6 +1162,24 @@ mod pending_replies_tests {
         deferred_from_handle(handle_from_shared(shared))
     }
 
+    fn fake_shared(id: u64) -> std::sync::Arc<DeferredSlotShared> {
+        std::sync::Arc::new(DeferredSlotShared::new(id, std::any::TypeId::of::<u32>()))
+    }
+
+    fn fake_promoted_record(
+        slot_id: u64,
+        call_id: u64,
+        routing: DeferredRouting,
+    ) -> DeferredSlotRecord {
+        DeferredSlotRecord {
+            slot_id: DeferredSlotId::new(slot_id),
+            call_id: CallId::new(call_id),
+            capturing_isolate: IsolateId::new(9),
+            shared: fake_shared(slot_id),
+            routing,
+        }
+    }
+
     #[test]
     fn try_insert_succeeds_until_full_then_returns_full() {
         let mut box_ = PendingReplies::<u32, u32>::with_capacity(2);
@@ -1171,6 +1192,34 @@ mod pending_replies_tests {
         assert_eq!(box_.full_rejects(), 1);
         assert_eq!(box_.high_water(), 2);
         assert_eq!(box_.len(), 2);
+    }
+
+    #[test]
+    fn take_by_local_call_id_ignores_remote_routed_slots() {
+        let mut slots = PromotedSlots::default();
+        let remote = fake_promoted_record(
+            1,
+            42,
+            DeferredRouting::Remote {
+                requester: RegisteredAddress {
+                    shard: ShardId::new(2),
+                    isolate: IsolateId::new(3),
+                    generation: AddressGeneration::new(4),
+                },
+                cause: CauseId::new(EventId::new(5)),
+            },
+        );
+        let remote_shared = std::sync::Arc::clone(&remote.shared);
+        slots.push(remote);
+
+        assert!(
+            slots.take_by_local_call_id(CallId::new(42)).is_none(),
+            "local caller cleanup must not consume a remote-routed deferred slot"
+        );
+        let remaining = slots
+            .take_by_handle(&remote_shared)
+            .expect("remote-routed slot remains tracked");
+        assert!(matches!(remaining.routing, DeferredRouting::Remote { .. }));
     }
 
     #[test]
