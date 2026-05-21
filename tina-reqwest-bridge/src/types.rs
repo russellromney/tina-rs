@@ -30,9 +30,12 @@ pub struct ReqwestRequest {
     /// Optional per-request timeout that overrides
     /// [`ReqwestConfig::default_timeout`].
     ///
-    /// The timeout applies to the reqwest call itself (connect + send +
-    /// receive). Once a request exceeds this duration the bridge
-    /// surfaces [`ReqwestError::Timeout`] and counts the outcome.
+    /// The timeout applies to the reqwest attempt itself (connect +
+    /// send + receive). Once an attempt exceeds this duration the
+    /// bridge aborts the spawned Tokio task, surfaces
+    /// [`ReqwestError::Timeout`], and counts the outcome. Bytes already
+    /// on the wire may still be observed by the upstream peer; timeout
+    /// is not a proof that the server saw no request.
     pub timeout: Option<Duration>,
 }
 
@@ -94,8 +97,14 @@ pub enum ReqwestError {
     Full,
     /// Worker has been closed and rejects new work.
     Closed,
-    /// Request did not complete within its timeout (per-request override
-    /// or [`ReqwestConfig::default_timeout`]).
+    /// The bridge's per-attempt deadline elapsed and the spawned
+    /// reqwest task was aborted.
+    ///
+    /// This is different from bridges that keep external work leased
+    /// until a physical terminal result. Reqwest timeout is a local
+    /// abort/cancel outcome: bytes already written to the upstream may
+    /// still have effects, but the bridge will not observe or count a
+    /// later reqwest terminal result for this attempt.
     Timeout,
     /// Request body exceeded [`ReqwestConfig::request_body_limit`].
     RequestTooLarge,

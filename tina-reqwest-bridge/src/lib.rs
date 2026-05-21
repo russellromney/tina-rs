@@ -108,7 +108,7 @@
 //! ```text
 //! mailbox full  -> CallError::TargetFull (Tina ingress)
 //! max_in_flight -> ReqwestError::Full
-//! per-request   -> ReqwestError::Timeout
+//! per-attempt   -> ReqwestError::Timeout (task aborted; bytes may be on wire)
 //! body too big  -> ReqwestError::RequestTooLarge / ResponseTooLarge
 //! reqwest fail  -> ReqwestError::Reqwest(reason)
 //! worker bug    -> ReqwestError::Internal(reason)
