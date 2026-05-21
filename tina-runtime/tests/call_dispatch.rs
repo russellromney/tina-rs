@@ -1302,7 +1302,8 @@ fn cancelling_pending_read_does_not_close_stream_for_later_write() {
     assert_eq!(
         *second_reader_log.borrow(),
         vec![ReaderMsg::FailedObserved],
-        "canceled tombstone keeps the read lane reserved until substrate completion drains"
+        "canceled tombstone keeps the read lane reserved until substrate completion drains: {:#?}",
+        runtime.trace()
     );
 
     runtime

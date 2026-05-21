@@ -1218,9 +1218,7 @@ where
         let call_kind = CallKind::ObservedSend;
         let message = translator(outcome);
 
-        let entry_index = self.entries.iter().position(|entry| {
-            entry.id == requester.isolate && entry.generation == requester.generation
-        });
+        let entry_index = self.entry_index(requester);
         let Some(entry_index) = entry_index else {
             self.push_event(
                 requester.isolate,
@@ -1461,10 +1459,7 @@ where
         };
 
         let message_any = translator(outcome);
-        let Some(entry_index) = self.entries.iter().position(|entry| {
-            entry.id == context.requester.isolate
-                && entry.generation == context.requester.generation
-        }) else {
+        let Some(entry_index) = self.entry_index(context.requester) else {
             self.push_event(
                 context.requester.isolate,
                 Some(context.cause),
@@ -1717,9 +1712,7 @@ where
         }
 
         let message = translator(outcome);
-        let Some(entry_index) = self.entries.iter().position(|entry| {
-            entry.id == requester.isolate && entry.generation == requester.generation
-        }) else {
+        let Some(entry_index) = self.entry_index(requester) else {
             self.push_event(
                 requester.isolate,
                 Some(cause),
@@ -1875,10 +1868,7 @@ where
 
         let message = translator(result);
 
-        let entry_index = self.entries.iter().position(|entry| {
-            entry.id == in_flight.requester.isolate
-                && entry.generation == in_flight.requester.generation
-        });
+        let entry_index = self.entry_index(in_flight.requester);
         let Some(entry_index) = entry_index else {
             self.push_event(
                 in_flight.requester.isolate,
@@ -2394,12 +2384,18 @@ where
 
     pub(crate) fn gc_stopped_entries(&mut self) {
         let mut index = 0;
+        let mut removed_any = false;
         while index < self.entries.len() {
             if self.can_gc_stopped_entry(index) {
-                self.entries.remove(index);
+                let removed = self.entries.remove(index);
+                self.entry_indexes.remove(&removed.id);
+                removed_any = true;
             } else {
                 index += 1;
             }
+        }
+        if removed_any {
+            self.rebuild_entry_indexes();
         }
     }
 
