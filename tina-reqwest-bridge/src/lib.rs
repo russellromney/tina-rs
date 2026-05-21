@@ -181,13 +181,14 @@
 //! # Retry
 //!
 //! See [`RetryPolicy`]. Default is no retry. When configured, retries
-//! are bounded, fire only on transport-level failures
-//! ([`ReqwestError::Timeout`] and [`ReqwestError::Reqwest`]), and each
-//! attempt resets its own per-attempt clock. [`ReqwestError::Full`] is
-//! never retried by the worker — it is the explicit pressure signal
-//! and the caller decides what to do. [`ReqwestError::Internal`] is
-//! also never retried; it means the bridge lost worker-terminal truth,
-//! not that the upstream network was flaky.
+//! are bounded, fire only on retry-safe HTTP methods for
+//! transport-level failures ([`ReqwestError::Timeout`] and
+//! [`ReqwestError::Reqwest`]), and each attempt resets its own
+//! per-attempt clock. [`ReqwestError::Full`] is never retried by the
+//! worker — it is the explicit pressure signal and the caller decides
+//! what to do. [`ReqwestError::Internal`] is also never retried; it
+//! means the bridge lost worker-terminal truth, not that the upstream
+//! network was flaky.
 
 mod helpers;
 mod metrics;

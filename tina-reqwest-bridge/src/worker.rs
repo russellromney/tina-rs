@@ -91,6 +91,8 @@ struct Slot {
     /// Always populated, regardless of whether the `tracing` feature
     /// is on, so the type does not branch on cfg.
     method: String,
+    /// Whether retry policy may repeat this method by default.
+    retry_safe: bool,
 }
 
 struct Delivery {
@@ -100,6 +102,7 @@ struct Delivery {
     retry_delay: Duration,
     saved_request: Option<ReqwestRequest>,
     method: String,
+    retry_safe: bool,
 }
 
 /// Bounded outbound HTTP worker around reqwest.
@@ -350,6 +353,7 @@ impl<S: Shard + 'static> ReqwestWorker<S> {
         per_attempt_timeout: Duration,
         saved_request: Option<ReqwestRequest>,
     ) -> Effect<Self> {
+        let retry_safe = method_is_retry_safe_by_default(&request.method);
         let method = request.method.as_str().to_string();
         let request_for_reqwest = match build_reqwest_request(&self.client, &request) {
             Ok(req) => req,
@@ -400,6 +404,7 @@ impl<S: Shard + 'static> ReqwestWorker<S> {
                 retry_delay,
                 saved_request,
                 method: method.clone(),
+                retry_safe,
             },
         );
         let in_flight = self.in_flight.len() as u64;
@@ -446,6 +451,7 @@ impl<S: Shard + 'static> ReqwestWorker<S> {
         let id = self.next_id;
         self.next_id = self.next_id.wrapping_add(1);
         let attempt_due_at = Instant::now() + retry_delay;
+        let retry_safe = method_is_retry_safe_by_default(&request.method);
         let method = request.method.as_str().to_string();
         self.in_flight.insert(
             id,
@@ -460,6 +466,7 @@ impl<S: Shard + 'static> ReqwestWorker<S> {
                 retry_delay,
                 saved_request: None,
                 method,
+                retry_safe,
             },
         );
         let in_flight = self.in_flight.len() as u64;
@@ -482,6 +489,7 @@ impl<S: Shard + 'static> ReqwestWorker<S> {
             retry_delay,
             saved_request,
             method,
+            retry_safe,
         } = slot;
 
         match kind {
@@ -498,6 +506,7 @@ impl<S: Shard + 'static> ReqwestWorker<S> {
                         retry_delay,
                         saved_request,
                         method,
+                        retry_safe,
                     },
                     result,
                 ),
@@ -506,7 +515,9 @@ impl<S: Shard + 'static> ReqwestWorker<S> {
                         abort.abort();
                         if let (Some(saved), true) = (
                             saved_request,
-                            attempts_remaining > 0 && retry_on_timeout(&self.config.retry),
+                            attempts_remaining > 0
+                                && retry_on_timeout(&self.config.retry)
+                                && retry_safe,
                         ) {
                             self.metrics.retries.fetch_add(1, Ordering::Relaxed);
                             #[cfg(feature = "tracing")]
@@ -552,6 +563,7 @@ impl<S: Shard + 'static> ReqwestWorker<S> {
                             retry_delay,
                             saved_request,
                             method,
+                            retry_safe,
                         },
                     );
                     sleep(self.config.poll_interval).then(move |_| ReqwestMsg::Poll(id))
@@ -608,6 +620,7 @@ impl<S: Shard + 'static> ReqwestWorker<S> {
                             retry_delay,
                             saved_request,
                             method,
+                            retry_safe,
                         },
                     );
                     sleep(self.config.poll_interval).then(move |_| ReqwestMsg::Poll(id))
@@ -628,13 +641,14 @@ impl<S: Shard + 'static> ReqwestWorker<S> {
             retry_delay,
             saved_request,
             method,
+            retry_safe,
         } = delivery;
 
         if let Err(err) = &result {
             if attempts_remaining > 0 {
                 if let (Some(saved), true) = (
                     saved_request.as_ref(),
-                    is_retryable(err, &self.config.retry),
+                    is_retryable(err, &self.config.retry, retry_safe),
                 ) {
                     self.metrics.retries.fetch_add(1, Ordering::Relaxed);
                     #[cfg(feature = "tracing")]
@@ -721,12 +735,22 @@ impl<S: Shard + 'static> ReqwestWorker<S> {
     }
 }
 
-fn is_retryable(err: &ReqwestError, policy: &RetryPolicy) -> bool {
+fn is_retryable(err: &ReqwestError, policy: &RetryPolicy, retry_safe: bool) -> bool {
+    if !retry_safe {
+        return false;
+    }
     match err {
         ReqwestError::Timeout => retry_on_timeout(policy),
         ReqwestError::Reqwest(_) => retry_on_reqwest_io(policy),
         _ => false,
     }
+}
+
+fn method_is_retry_safe_by_default(method: &Method) -> bool {
+    matches!(
+        *method,
+        Method::GET | Method::HEAD | Method::OPTIONS | Method::TRACE | Method::PUT | Method::DELETE
+    )
 }
 
 fn closed_task_error() -> ReqwestError {
@@ -997,6 +1021,7 @@ mod tests {
                     b"charge-card".to_vec(),
                 )),
                 method: "POST".to_string(),
+                retry_safe: false,
             },
         );
         worker.metrics.set_in_flight(1);
@@ -1019,6 +1044,14 @@ mod tests {
             on_timeout: true,
             on_reqwest_io: true,
         };
-        assert!(!is_retryable(&closed_task_error(), &policy));
+        assert!(!is_retryable(&closed_task_error(), &policy, true));
+    }
+
+    #[test]
+    fn retry_gate_rejects_non_idempotent_methods() {
+        assert!(method_is_retry_safe_by_default(&Method::GET));
+        assert!(method_is_retry_safe_by_default(&Method::DELETE));
+        assert!(!method_is_retry_safe_by_default(&Method::POST));
+        assert!(!method_is_retry_safe_by_default(&Method::PATCH));
     }
 }
