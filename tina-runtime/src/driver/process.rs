@@ -8,6 +8,12 @@ use std::os::unix::process::CommandExt;
 
 const PROCESS_DRAIN_JOIN_TIMEOUT: Duration = Duration::from_millis(100);
 
+/// Bound on how long the post-SIGKILL reap may block the process worker. A
+/// killed child normally reaps promptly, but one wedged in uninterruptible
+/// (`D`-state) I/O can delay it indefinitely; we surface `KillUncertain`
+/// rather than wedge the worker forever. (Adversarial finding F5.)
+const PROCESS_KILL_REAP_TIMEOUT: Duration = Duration::from_secs(2);
+
 pub(super) enum ProcessLane {
     Worker(ProcessWorkerLane),
 }
@@ -302,19 +308,45 @@ fn kill_and_reap(
     stderr: Option<JoinHandle<(Vec<u8>, bool)>>,
     fallback: CallError,
 ) -> CallOutput {
+    // Best-effort group kill so descendants holding stdout/stderr die too.
     #[cfg(unix)]
     let killed_group = kill_process_group(child.id()).is_ok();
     #[cfg(not(unix))]
     let killed_group = false;
 
-    if !killed_group && child.kill().is_err() {
+    // Also SIGKILL the leader directly. The external group kill can report
+    // success without promptly terminating the leader, so a direct kernel kill
+    // is what makes the bounded reap below settle quickly. `kill()` is `Ok`
+    // when the signal was delivered (including to a not-yet-reaped zombie) and
+    // `Err` only when the child has already been reaped.
+    let killed_leader = child.kill().is_ok();
+
+    if !killed_group && !killed_leader {
+        // Could not signal the process at all. If it has already exited on its
+        // own, report that exit; otherwise the kill outcome is uncertain.
         return match child.try_wait() {
             Ok(Some(status)) => process_exited(status, stdout, stderr, child.id()),
             Ok(None) | Err(_) => CallOutput::Failed(CallError::KillUncertain),
         };
     }
-    if child.wait().is_err() {
-        return CallOutput::Failed(CallError::KillUncertain);
+
+    // Bounded reap: never block the process worker forever on `child.wait()`.
+    // A child stuck in `D`-state can delay reaping; surface `KillUncertain`
+    // when the budget is spent instead of wedging the lane. (Finding F5.)
+    let reap_deadline = Instant::now() + PROCESS_KILL_REAP_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) => {
+                if Instant::now() >= reap_deadline {
+                    return CallOutput::Failed(CallError::KillUncertain);
+                }
+                thread::sleep(Duration::from_millis(1));
+            }
+            // The child is gone (already reaped); treat it as settled rather
+            // than uncertain — we did signal it above.
+            Err(_) => break,
+        }
     }
     let _ = join_drain_bounded(stdout, PROCESS_DRAIN_JOIN_TIMEOUT);
     let _ = join_drain_bounded(stderr, PROCESS_DRAIN_JOIN_TIMEOUT);

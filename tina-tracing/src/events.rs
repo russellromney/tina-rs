@@ -681,6 +681,7 @@ pub fn deferred_reply_rejected_reason_name(reason: DeferredReplyRejectedReason) 
 pub fn restart_skipped_reason_name(reason: RestartSkippedReason) -> &'static str {
     match reason {
         RestartSkippedReason::NotRestartable => "NotRestartable",
+        RestartSkippedReason::FactoryPanicked => "FactoryPanicked",
     }
 }
 

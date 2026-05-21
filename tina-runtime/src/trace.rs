@@ -302,6 +302,14 @@ pub enum CallKind {
 pub enum CallCompletionRejectedReason {
     /// The requesting isolate's mailbox was full when the runtime tried to
     /// enqueue the completion.
+    ///
+    /// This is a **distinct terminal class**: by the time the completion is
+    /// delivered the pending call has already been settled in the runtime's
+    /// bookkeeping, so a full requester mailbox here means the outcome is
+    /// **dropped** (surfaced only as this trace event), not redelivered. It is
+    /// therefore unlike a caller-observed `Full`/`Closed`/`Timeout` — the
+    /// requester never sees its continuation fire. Size the requester's mailbox
+    /// for its own in-flight completions to avoid this. (Adversarial finding C4.)
     MailboxFull,
 
     /// The requesting isolate had stopped (or its incarnation was
@@ -364,6 +372,10 @@ pub enum RestartSkippedReason {
     /// The child was spawned from a one-shot [`tina::ChildDefinition`] and has no
     /// restart recipe.
     NotRestartable,
+
+    /// The restartable child factory panicked while constructing the
+    /// replacement child.
+    FactoryPanicked,
 }
 
 /// Why a supervised restart response did not run.
@@ -1382,6 +1394,7 @@ fn send_rejected_tag(reason: SendRejectedReason) -> u8 {
 fn restart_skipped_tag(reason: RestartSkippedReason) -> u8 {
     match reason {
         RestartSkippedReason::NotRestartable => 1,
+        RestartSkippedReason::FactoryPanicked => 2,
     }
 }
 

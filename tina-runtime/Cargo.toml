@@ -11,7 +11,9 @@ repository = "https://github.com/russellromney/tina-rs"
 path = "src/lib.rs"
 
 [dependencies]
-tina = { path = "../tina" }
+# `runtime-internal` exposes the request-effect constructor the runtime needs;
+# it is gated so it stays off `tina`'s default public surface. (Finding H4.)
+tina = { path = "../tina", features = ["runtime-internal"] }
 tina-macros = { path = "../tina-macros" }
 tina-supervisor = { path = "../tina-supervisor" }
 # Phase Mariner substrate target. Vendored from Pekka Enberg's Betelgeuse with

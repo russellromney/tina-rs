@@ -10,5 +10,13 @@ repository = "https://github.com/russellromney/tina-rs"
 [lib]
 path = "src/lib.rs"
 
+[features]
+# Exposes `runtime_internal::request_effect_from_consumed_effect`, which can
+# fabricate a `RequestEffect` and therefore defeat the must-answer-caller rail.
+# Only the runtime crates (`tina-runtime`) opt into it; it is absent from
+# `tina`'s default public surface so application crates cannot reach it without
+# deliberately enabling this feature. (Adversarial finding H4.)
+runtime-internal = []
+
 [dependencies]
 tina-macros = { path = "../tina-macros" }

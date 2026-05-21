@@ -199,6 +199,10 @@ fn build_isolate(
             ));
         }
     };
+    // Defaults to `::tina`. A crate that depends only on `tina-runtime` (not
+    // `tina`) can author a `#[tina_runtime::isolate]` by passing
+    // `tina_crate = ::tina_runtime`, which re-exports the emitted items.
+    // (Adversarial finding H5.)
     let tina_crate = args
         .tina_crate
         .clone()
@@ -306,7 +310,11 @@ fn build_isolate(
         let event_body = Box::new(event_method.block.clone());
         let handle_call_tokens = quote! {
             #(#request_attrs)*
-            #[deny(unused_variables)]
+            // No blanket `deny(unused_variables)`: a handler may legitimately
+            // answer the caller without reading a unit/marker request payload.
+            // Caller-authority use is enforced by `require_call_authority_mentioned`
+            // and the `RequestEffect` linear type. (Adversarial finding H2.)
+            #[allow(unused_variables)]
             fn handle_call(
                 &mut self,
                 msg: Self::Message,

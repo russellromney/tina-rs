@@ -1585,6 +1585,14 @@ where
     /// the cause that closed it. Late replies for these surface as a
     /// rejection reason that mirrors the cause, instead of the
     /// generic `NoPendingCall` / `CallerClosed`.
+    ///
+    /// This attribution is **best-effort and bounded** by
+    /// `CANCELLED_CALL_RING_CAPACITY`. Once more than that many calls have been
+    /// cancelled, the oldest entries are evicted (counted by
+    /// `cancelled_call_cause_evictions`); a late reply for an evicted `call_id`
+    /// then degrades to `NoPendingCall` rather than its true cancel cause. A
+    /// non-zero eviction count is the signal that some late-reply causes may
+    /// have degraded. (Adversarial finding C5.)
     pub(crate) fn record_cancelled_call(&mut self, call_id: CallId, cause: tina::CancelCause) {
         if self.cancelled_calls.len() == CANCELLED_CALL_RING_CAPACITY {
             self.cancelled_calls.pop_front();
@@ -2236,7 +2244,23 @@ where
             }
         }
 
-        let outcome = recipe.create(self, parent);
+        let outcome = match catch_unwind(AssertUnwindSafe(|| recipe.create(self, parent))) {
+            Ok(outcome) => outcome,
+            Err(_) => {
+                self.child_records[child_record_index].restart_recipe = Some(recipe);
+                self.push_event(
+                    parent,
+                    Some(attempted.into()),
+                    RuntimeEventKind::RestartChildSkipped {
+                        child_ordinal,
+                        old_isolate: old_child.isolate,
+                        old_generation: old_child.generation,
+                        reason: RestartSkippedReason::FactoryPanicked,
+                    },
+                );
+                return;
+            }
+        };
         let new_child = outcome.child;
         let bootstrap_message = outcome.bootstrap_message;
         self.child_records[child_record_index].child = new_child;

@@ -300,6 +300,22 @@ fn extract_method(method: &TraitItemFn) -> Result<MethodSig> {
                 ));
             }
         };
+        // The generated `*_request` fn appends these parameters after the
+        // user's arguments; a method arg with one of these names would produce
+        // a duplicate-parameter error (E0415) inside generated code. Reject it
+        // here with a clear diagnostic. (Adversarial finding H3.)
+        if matches!(
+            name.to_string().as_str(),
+            "deadline" | "correlator" | "reply_to" | "max_payload"
+        ) {
+            return Err(Error::new_spanned(
+                &name,
+                format!(
+                    "argument name `{name}` is reserved by the generated request \
+                     builder; rename this service method argument"
+                ),
+            ));
+        }
         args.push(MethodArg {
             name,
             ty: (*typed.ty).clone(),

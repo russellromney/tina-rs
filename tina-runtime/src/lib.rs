@@ -243,7 +243,20 @@ pub use tcp_loops::{LoopStep, ReadExactStep, TcpReadExact, TcpReadToEof, TcpWrit
 ///
 /// This is the preferred runtime authoring path. It keeps the handler as normal
 /// Rust code and only fills the repetitive [`tina::Isolate`] associated types.
+///
+/// The macro roots generated paths at `::tina` by default, so the simplest
+/// setup also depends on the `tina` crate. A crate that wants to depend only on
+/// `tina-runtime` can pass `tina_crate = ::tina_runtime`; the items the macro
+/// emits ([`Isolate`], [`Effect`], [`Context`], [`CallContext`], etc.) are
+/// re-exported below for exactly that purpose. (Adversarial finding H5.)
 pub use tina_macros::runtime_isolate as isolate;
+// Re-export the `tina` items emitted by `#[tina_runtime::isolate]` so a crate
+// depending only on `tina-runtime` can author runtime isolates without also
+// importing `tina`. (Adversarial finding H5.)
+pub use tina::{
+    CallContext, CallRejectedReason, CallableIsolate, Context, Effect, Isolate, Outbound,
+    RequestCall, RequestEffect, ServiceMessage, SingleShard, reject,
+};
 pub use trace::{
     CallCompletionRejectedReason, CallKind, CallReplyRejectedReason, CauseId,
     DeferredReplyRejectedReason, DeferredSlotId, EffectKind, EventId, RestartSkippedReason,

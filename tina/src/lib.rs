@@ -269,7 +269,7 @@ macro_rules! isolate_types {
             spawn: $spawn,
             spawn_observed: $spawn_observed,
             call: $call,
-            fact: ::std::convert::Infallible,
+            fact: ::core::convert::Infallible,
             shard: $shard,
         }
     };
@@ -287,7 +287,7 @@ macro_rules! isolate_types {
             reply: $reply,
             send: $send,
             spawn: $spawn,
-            spawn_observed: ::std::convert::Infallible,
+            spawn_observed: ::core::convert::Infallible,
             call: $call,
             fact: $fact,
             shard: $shard,
@@ -308,7 +308,7 @@ macro_rules! isolate_types {
             spawn: $spawn,
             spawn_observed: ::core::convert::Infallible,
             call: $call,
-            fact: ::std::convert::Infallible,
+            fact: ::core::convert::Infallible,
             shard: $shard,
         }
     };
@@ -411,10 +411,20 @@ pub mod runtime_internal {
     /// Build a request-lane effect after caller authority has already been
     /// consumed.
     ///
-    /// This is intentionally hidden under `runtime_internal` so copied app code
-    /// cannot casually manufacture a request effect from `noop()`. Runtime-side
-    /// adapters use it after they have consumed a `RequestCall` into a
-    /// `RequestContext`.
+    /// This re-wraps an arbitrary [`crate::Effect`] into a [`crate::RequestEffect`],
+    /// so it can defeat the must-answer-caller rail (e.g. wrapping `noop()` into
+    /// a `RequestEffect` that answers nobody). It is therefore gated behind the
+    /// `runtime-internal` cargo feature and is **absent from `tina`'s default
+    /// public surface**: only crates that deliberately enable that feature (the
+    /// runtime crates) can reach it. Runtime-side adapters use it after they
+    /// have consumed a `RequestCall` into a `RequestContext`.
+    ///
+    /// Note: cargo features are additive, so an application that itself depends
+    /// on `tina-runtime` will see the feature enabled transitively. A complete
+    /// seal would require threading consumed-authority evidence through every
+    /// reply/park path; this gate removes the casual default-surface foot-gun.
+    /// (Adversarial finding H4.)
+    #[cfg(feature = "runtime-internal")]
     pub fn request_effect_from_consumed_effect<I>(
         effect: crate::Effect<I>,
     ) -> crate::RequestEffect<I>

@@ -258,37 +258,48 @@ where
         if !state.workers.iter().all(|w| w.signaled) {
             return;
         }
-        let mut joinable: Vec<(ShardId, ThreadedWorkerJoin, Arc<LiveShardMetrics>)> = Vec::new();
-        for worker in &mut state.workers {
-            if let Some(h) = worker.handle.take() {
-                joinable.push((worker.shard, h, Arc::clone(&worker.metrics)));
-            }
-        }
-        if joinable.is_empty() {
+        // Nothing to join if no worker still holds a handle.
+        if !state.workers.iter().any(|w| w.handle.is_some()) {
             return;
         }
         state.joining = true;
         drop(state);
 
+        // Take the worker handles only on whichever path actually runs. If we
+        // pre-took them here and moved them into the spawn closure, a failed
+        // `Builder::spawn` would drop that closure — detaching (leaking) every
+        // worker thread — and the inline fallback would re-take an already-empty
+        // set and falsely report `Closed`. Building `joinable` inside the
+        // spawned thread (or inline on spawn failure) keeps the handles owned by
+        // the path that joins them. (Adversarial finding E1.)
         let shared = Arc::clone(self);
         let spawn_result = thread::Builder::new()
             .name("tina-shutdown-joiner".to_string())
-            .spawn(move || joiner_main(shared, joinable));
+            .spawn(move || {
+                let joinable = shared.take_joinable();
+                joiner_main(shared, joinable);
+            });
         if spawn_result.is_err() {
             // Failed to spawn the joiner thread (rare). Join inline so the
             // runtime cannot leak its OS threads. The inline path still
             // runs through the panic-safe `joiner_main` wrapper.
-            let mut state = self.lock_state();
-            let mut joinable: Vec<(ShardId, ThreadedWorkerJoin, Arc<LiveShardMetrics>)> =
-                Vec::new();
-            for worker in &mut state.workers {
-                if let Some(h) = worker.handle.take() {
-                    joinable.push((worker.shard, h, Arc::clone(&worker.metrics)));
-                }
-            }
-            drop(state);
+            let joinable = self.take_joinable();
             joiner_main(Arc::clone(self), joinable);
         }
+    }
+
+    /// Take ownership of every worker join handle still held in state. Idempotent:
+    /// a handle already taken is left as `None`, so the spawned-joiner and the
+    /// inline-fallback paths can never double-join or strand a handle.
+    fn take_joinable(&self) -> Vec<(ShardId, ThreadedWorkerJoin, Arc<LiveShardMetrics>)> {
+        let mut state = self.lock_state();
+        let mut joinable = Vec::new();
+        for worker in &mut state.workers {
+            if let Some(h) = worker.handle.take() {
+                joinable.push((worker.shard, h, Arc::clone(&worker.metrics)));
+            }
+        }
+        joinable
     }
 
     /// Acquire the state lock, transparently recovering from a poisoned
