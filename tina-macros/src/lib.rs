@@ -145,6 +145,13 @@ pub fn isolate(args: TokenStream, input: TokenStream) -> TokenStream {
     expand_isolate(args, input, CallDefault::Infallible)
 }
 
+/// Like [`isolate`], but the call channel defaults to `RuntimeCall<Message>`.
+///
+/// The expansion still roots the rest of the authoring vocabulary
+/// (`Isolate`, `Effect`, `Context`, ...) at `::tina`, so the using crate must
+/// depend on `tina` and have it reachable as `::tina`. Only the call channel
+/// is rooted at `::tina_runtime`. Override with `tina_crate = ...` /
+/// `runtime_crate = ...` when the crate names differ.
 #[proc_macro_attribute]
 pub fn runtime_isolate(args: TokenStream, input: TokenStream) -> TokenStream {
     expand_isolate(args, input, CallDefault::RuntimeCall)
