@@ -32,8 +32,13 @@ pub struct ReqwestMetrics {
     pub invalid: u64,
     /// Reqwest tasks the worker terminated with a successful response.
     pub responses: u64,
-    /// Reqwest tasks the worker terminated with
-    /// [`crate::ReqwestError::Timeout`].
+    /// Reqwest attempts the worker aborted because the bridge
+    /// per-attempt deadline elapsed.
+    ///
+    /// Unlike bridges that keep external work leased until a physical
+    /// terminal result, reqwest timeout is a local task abort. The
+    /// bridge does not count a later upstream/server-side effect after
+    /// the abort.
     pub timeout: u64,
     /// Reqwest tasks the worker terminated with
     /// [`crate::ReqwestError::ResponseTooLarge`].

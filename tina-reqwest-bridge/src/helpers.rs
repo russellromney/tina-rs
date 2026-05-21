@@ -226,8 +226,10 @@ pub fn flatten_outcome(outcome: ReqwestCallOutcome) -> Result<ReqwestResponse, R
 ///   reproduce the failure.
 /// - **bridge `Timeout`:** `Transient(BridgeTimeout)`. The bridge gave
 ///   up waiting; the worker may have completed but we did not see it.
-/// - **worker `Timeout`:** `Transient(WorkerTimeout)`. The reqwest call
-///   exceeded its per-request deadline.
+/// - **worker `Timeout`:** `Transient(WorkerTimeout)`. The reqwest
+///   attempt exceeded its per-attempt deadline and the bridge aborted
+///   the spawned Tokio task. Upstream side effects may already have
+///   happened; retry only when the request is safe to repeat.
 /// - **worker `Reqwest`:** `Transient(WorkerTransport)`. Connect / IO
 ///   class errors are typically retryable.
 /// - **bridge `Full` / `Closed`, worker `Full` / `Closed`,
@@ -259,7 +261,9 @@ pub enum ReqwestTransientReason {
     /// IsolateCall deadline elapsed before the worker replied. The
     /// worker may still be processing; the bridge stopped waiting.
     BridgeTimeout,
-    /// The reqwest worker's per-attempt timeout elapsed.
+    /// The reqwest worker's per-attempt timeout elapsed and the bridge
+    /// aborted the spawned Tokio task. Upstream side effects may
+    /// already have happened.
     WorkerTimeout,
     /// reqwest returned a transport-class error (connect / IO / decode).
     /// Carries the underlying message; treat the string as opaque
