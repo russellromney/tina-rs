@@ -120,6 +120,8 @@ pub struct WaitList<K, R> {
     per_key_limit: Option<usize>,
     slots: Vec<Option<WaitEntry<K, R>>>,
     generations: Vec<u64>,
+    free_slots: Vec<usize>,
+    current: usize,
     next_seq: u64,
     high_water: usize,
     full_rejects: u64,
@@ -131,11 +133,10 @@ pub struct WaitList<K, R> {
 
 impl<K, R> std::fmt::Debug for WaitList<K, R> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let live = self.slots.iter().filter(|s| s.is_some()).count();
         f.debug_struct("WaitList")
             .field("capacity", &self.capacity)
             .field("per_key_limit", &self.per_key_limit)
-            .field("len", &live)
+            .field("len", &self.current)
             .field("high_water", &self.high_water)
             .field("full_rejects", &self.full_rejects)
             .field("key_full_rejects", &self.key_full_rejects)
@@ -268,9 +269,13 @@ where
         assert!(capacity > 0, "WaitList capacity must be positive");
         let mut slots = Vec::with_capacity(capacity);
         let mut generations = Vec::with_capacity(capacity);
+        let mut free_slots = Vec::with_capacity(capacity);
         for _ in 0..capacity {
             slots.push(None);
             generations.push(0);
+        }
+        for idx in (0..capacity).rev() {
+            free_slots.push(idx);
         }
         let seq = mint_wait_list_seq();
         Self {
@@ -278,6 +283,8 @@ where
             per_key_limit,
             slots,
             generations,
+            free_slots,
+            current: 0,
             next_seq: 0,
             high_water: 0,
             full_rejects: 0,
@@ -317,12 +324,12 @@ where
 
     /// Current waiter count (occupancy).
     pub fn len(&self) -> usize {
-        self.slots.iter().filter(|s| s.is_some()).count()
+        self.current
     }
 
     /// True when no slot is occupied.
     pub fn is_empty(&self) -> bool {
-        self.slots.iter().all(|s| s.is_none())
+        self.current == 0
     }
 
     /// Highest waiter count observed since construction.
@@ -373,13 +380,12 @@ where
     /// Reclaim slots whose caller has gone away.
     pub fn sweep(&mut self) -> usize {
         let mut reclaimed = 0;
-        for slot in self.slots.iter_mut() {
+        for idx in 0..self.slots.len() {
             let take = matches!(
-                slot.as_ref().map(|e| e.reply.state()),
+                self.slots[idx].as_ref().map(|e| e.reply.state()),
                 Some(DeferredSlotState::Closed)
             );
-            if take {
-                slot.take();
+            if take && self.remove_slot(idx).is_some() {
                 reclaimed += 1;
                 self.reclaimed += 1;
             }
@@ -397,7 +403,9 @@ where
         I: Isolate<Reply = R>,
         R: 'static,
     {
-        self.sweep();
+        if self.free_slots.is_empty() || self.per_key_limit.is_some() {
+            self.sweep();
+        }
 
         if let Some(limit) = self.per_key_limit {
             let count = self.count_for_key(&key);
@@ -406,7 +414,7 @@ where
                 return Err(WaitError::KeyFull { key, call });
             }
         }
-        if self.len() >= self.capacity {
+        if self.free_slots.is_empty() {
             self.full_rejects += 1;
             return Err(WaitError::Full { key, call });
         }
@@ -425,7 +433,9 @@ where
         I: Isolate<Reply = R>,
         R: 'static,
     {
-        self.sweep();
+        if self.free_slots.is_empty() || self.per_key_limit.is_some() {
+            self.sweep();
+        }
 
         if let Some(limit) = self.per_key_limit {
             let count = self.count_for_key(&key);
@@ -434,7 +444,7 @@ where
                 return Err(WaitCallError::KeyFull { key, call });
             }
         }
-        if self.len() >= self.capacity {
+        if self.free_slots.is_empty() {
             self.full_rejects += 1;
             return Err(WaitCallError::Full { key, call });
         }
@@ -451,26 +461,41 @@ where
     fn count_for_key(&self, key: &K) -> usize {
         self.slots
             .iter()
-            .filter(|s| s.as_ref().is_some_and(|e| &e.key == key))
+            .filter(|s| {
+                s.as_ref()
+                    .is_some_and(|e| &e.key == key && e.reply.state() == DeferredSlotState::Open)
+            })
             .count()
     }
 
     fn store_entry(&mut self, key: K, reply: DeferredReply<R>) -> WaitTicket<K> {
         let idx = self
-            .slots
-            .iter()
-            .position(|s| s.is_none())
+            .free_slots
+            .pop()
             .expect("admission already proved a free slot is available");
+        debug_assert!(self.slots[idx].is_none());
         self.generations[idx] = self.generations[idx].wrapping_add(1);
         let generation = self.generations[idx];
         self.next_seq = self.next_seq.wrapping_add(1);
         let seq = self.next_seq;
         self.slots[idx] = Some(WaitEntry { key, reply, seq });
-        let cur = self.len();
-        if cur > self.high_water {
-            self.high_water = cur;
+        self.current += 1;
+        if self.current > self.high_water {
+            self.high_water = self.current;
         }
         WaitTicket::new(idx, generation)
+    }
+
+    fn remove_slot(&mut self, idx: usize) -> Option<WaitEntry<K, R>> {
+        let entry = self.slots[idx].take();
+        if entry.is_some() {
+            self.current = self
+                .current
+                .checked_sub(1)
+                .expect("WaitList current count underflow");
+            self.free_slots.push(idx);
+        }
+        entry
     }
 
     /// Settle one waiter named by `ticket`.
@@ -489,7 +514,7 @@ where
                 _key: PhantomData,
             });
         }
-        let Some(entry) = self.slots[ticket.slot].take() else {
+        let Some(entry) = self.remove_slot(ticket.slot) else {
             return Err(WaitReplyError::Missing {
                 reply,
                 _key: PhantomData,
@@ -556,8 +581,8 @@ where
         R: 'static,
     {
         let mut out = Vec::new();
-        for slot in self.slots.iter_mut() {
-            if let Some(entry) = slot.take() {
+        for idx in 0..self.slots.len() {
+            if let Some(entry) = self.remove_slot(idx) {
                 out.push(reply_to::<I>(entry.reply, factory()));
             }
         }
@@ -566,10 +591,10 @@ where
 
     fn drain_for_key(&mut self, key: &K) -> Vec<WaitEntry<K, R>> {
         let mut entries: Vec<WaitEntry<K, R>> = Vec::new();
-        for slot in self.slots.iter_mut() {
-            let matches = slot.as_ref().is_some_and(|e| &e.key == key);
+        for idx in 0..self.slots.len() {
+            let matches = self.slots[idx].as_ref().is_some_and(|e| &e.key == key);
             if matches {
-                if let Some(entry) = slot.take() {
+                if let Some(entry) = self.remove_slot(idx) {
                     entries.push(entry);
                 }
             }
@@ -640,14 +665,16 @@ mod tests {
             key: K,
             req: tina::RequestContext<R>,
         ) -> Result<WaitTicket<K>, &'static str> {
-            self.sweep();
+            if self.free_slots.is_empty() || self.per_key_limit.is_some() {
+                self.sweep();
+            }
             if let Some(limit) = self.per_key_limit {
                 if self.count_for_key(&key) >= limit {
                     self.key_full_rejects += 1;
                     return Err("KeyFull");
                 }
             }
-            if self.len() >= self.capacity {
+            if self.free_slots.is_empty() {
                 self.full_rejects += 1;
                 return Err("Full");
             }
@@ -821,5 +848,29 @@ mod tests {
         list.admit_request(3, fake_request(12)).unwrap();
         list.admit_request(4, fake_request(13)).unwrap();
         assert_eq!(list.len(), 2);
+    }
+
+    #[test]
+    fn full_path_sweeps_closed_slot_before_rejecting() {
+        let mut list = WaitList::<u32, u32>::with_capacity(1);
+        list.store_entry(1, fake_slot_closed(10));
+        assert_eq!(list.len(), 1);
+
+        list.admit_request(2, fake_request(11))
+            .expect("closed full table should reclaim then admit");
+        assert_eq!(list.len(), 1);
+        assert_eq!(list.reclaimed(), 1);
+    }
+
+    #[test]
+    fn free_path_does_not_sweep_closed_slots_until_asked() {
+        let mut list = WaitList::<u32, u32>::with_capacity(3);
+        list.store_entry(1, fake_slot_closed(10));
+        list.admit_request(2, fake_request(11)).unwrap();
+
+        assert_eq!(list.len(), 2, "free admission should not scan/sweep");
+        assert_eq!(list.capacity_report().current_messages, 1);
+        assert_eq!(list.sweep(), 1);
+        assert_eq!(list.len(), 1);
     }
 }
