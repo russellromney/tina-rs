@@ -400,39 +400,20 @@ or a caller-asserted `M` (not honest under the LLM rule). Pick
 the typed-event vs. continuation form when the supervisor/spawn
 API gets revisited.
 
-### 16. Multi-worker TLS lane (or split accept/stream lanes)
+### 16. Multi-worker TLS lane (or split accept/stream lanes) — resolved first form
 
 **Surfaced by:** `specimen_native_https`, `tina-http/tests/client_tls_smoke.rs`.
 
-The runtime's TLS lane is one worker thread per shard. The worker
-processes one TLS op at a time: a `tls_accept` poll (busy-waiting
-on the listening socket plus driving the TLS handshake) blocks
-every other TLS op on that lane — `tls_read`, `tls_write`,
-`tls_close`, and any concurrent `tls_connect`. Two consequences
-visible from the example:
+The original first form used one TLS worker per shard, so a quiet
+stream could head-of-line-block accepts and other streams. The
+runtime now runs each in-flight TLS op on a worker thread bounded by
+`tls_lane_capacity`. `local_system_tls_quiet_stream_does_not_block_second_connection`
+pins the user story: one client completes TLS and goes quiet; a
+second client still handshakes, sends `ping`, and receives `pong`.
 
-- `HttpsListener` must use a *short* `tls_accept_timeout` (default
-  250ms) so the worker yields between accept polls and live
-  connections can drain. Each connection's per-op latency
-  effectively includes one accept-slice.
-- A Tina HTTPS server and a Tina HTTPS client cannot share a
-  runtime: both sides of one TLS handshake need the worker
-  concurrently and they deadlock. The example puts the
-  counterparty on a raw OS thread; the integration tests do the
-  same. Outbound HTTPS calls work, inbound HTTPS works, but they
-  must live in separate processes (or separate shards once shards
-  carry independent TLS lanes).
-
-**Build:** either a worker pool inside the existing TLS lane, or
-split accept/handshake from per-stream read/write/close so each
-lane has one worker (accept worker keeps poll-looping; stream
-workers move data). The choice determines how throughput scales
-and whether `tls_accept_timeout` can grow back to "wait
-indefinitely". Keep DER-only inputs, no system roots, no HTTP/2
-in scope.
-
-**Revisit when:** real users hit the same-process server+client
-constraint, or the example acquires a third role (proxy / mTLS).
+**Still true:** `tls_lane_capacity` is a hard cap, not magic
+unbounded TLS concurrency. Long-running operations still occupy
+slots until they finish or time out.
 Until then, first-form HTTPS is honest about its single-lane
 bottleneck.
 
