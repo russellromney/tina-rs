@@ -269,7 +269,7 @@ macro_rules! isolate_types {
             spawn: $spawn,
             spawn_observed: $spawn_observed,
             call: $call,
-            fact: ::std::convert::Infallible,
+            fact: ::core::convert::Infallible,
             shard: $shard,
         }
     };
@@ -287,7 +287,7 @@ macro_rules! isolate_types {
             reply: $reply,
             send: $send,
             spawn: $spawn,
-            spawn_observed: ::std::convert::Infallible,
+            spawn_observed: ::core::convert::Infallible,
             call: $call,
             fact: $fact,
             shard: $shard,
@@ -308,7 +308,7 @@ macro_rules! isolate_types {
             spawn: $spawn,
             spawn_observed: ::core::convert::Infallible,
             call: $call,
-            fact: ::std::convert::Infallible,
+            fact: ::core::convert::Infallible,
             shard: $shard,
         }
     };
