@@ -8,6 +8,11 @@ use std::os::unix::process::CommandExt;
 
 const PROCESS_DRAIN_JOIN_TIMEOUT: Duration = Duration::from_millis(100);
 
+/// Budget for reaping a child after we SIGKILL it. A reap that does not
+/// complete in this window (D-state child, or a kill that did not land) must
+/// not pin the process worker forever; we give up and report `KillUncertain`.
+const PROCESS_KILL_REAP_TIMEOUT: Duration = Duration::from_secs(2);
+
 pub(super) enum ProcessLane {
     Worker(ProcessWorkerLane),
 }
@@ -313,8 +318,21 @@ fn kill_and_reap(
             Ok(None) | Err(_) => CallOutput::Failed(CallError::KillUncertain),
         };
     }
-    if child.wait().is_err() {
-        return CallOutput::Failed(CallError::KillUncertain);
+    // Bound the post-kill reap. `child.wait()` blocks with no deadline, so a
+    // wedged reap (D-state child, or a SIGKILL that did not land) would pin the
+    // process worker thread forever; on Drop that thread is detached and leaks.
+    let reap_deadline = Instant::now() + PROCESS_KILL_REAP_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) => {
+                if Instant::now() >= reap_deadline {
+                    return CallOutput::Failed(CallError::KillUncertain);
+                }
+                thread::sleep(Duration::from_millis(1));
+            }
+            Err(_) => return CallOutput::Failed(CallError::KillUncertain),
+        }
     }
     let _ = join_drain_bounded(stdout, PROCESS_DRAIN_JOIN_TIMEOUT);
     let _ = join_drain_bounded(stderr, PROCESS_DRAIN_JOIN_TIMEOUT);
