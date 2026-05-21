@@ -307,28 +307,41 @@ fn kill_and_reap(
     stderr: Option<JoinHandle<(Vec<u8>, bool)>>,
     fallback: CallError,
 ) -> CallOutput {
+    // SIGKILL the leader directly first, while its pid is live. A process-
+    // group kill alone is not enough: it is best-effort and does not reliably
+    // reach the leader on every platform/pgid setup. When it "succeeds" but
+    // misses the leader, the leader keeps running until natural exit — the old
+    // unbounded `wait()` silently masked that by blocking until then; the
+    // bounded reap below would otherwise report `KillUncertain` for a child we
+    // never actually killed.
+    let killed_leader = child.kill().is_ok();
+    // Best-effort: kill the whole group so descendants that inherited the
+    // pipes die too. Done before reaping, so the leader's pid (== pgid) is
+    // still reserved and we cannot signal a recycled group.
     #[cfg(unix)]
-    let killed_group = kill_process_group(child.id()).is_ok();
-    #[cfg(not(unix))]
-    let killed_group = false;
+    let _ = kill_process_group(child.id());
 
-    if !killed_group && child.kill().is_err() {
+    if !killed_leader {
+        // The direct kill failed, almost always because the child had already
+        // exited on its own. Report its real status if we can reap it;
+        // otherwise fall back to the caller's typed terminal.
         return match child.try_wait() {
             Ok(Some(status)) => process_exited(status, stdout, stderr, child.id()),
-            Ok(None) | Err(_) => CallOutput::Failed(CallError::KillUncertain),
+            Ok(None) => CallOutput::Failed(CallError::KillUncertain),
+            Err(_) => CallOutput::Failed(fallback),
         };
     }
+
     // Bound the post-kill reap. A blocking `child.wait()` has no deadline, so a
     // wedged reap (D-state child, or a SIGKILL that did not land) would pin the
     // process worker thread forever; on Drop that thread is detached and leaks.
     let reap_deadline = Instant::now() + PROCESS_KILL_REAP_TIMEOUT;
     loop {
         match child.try_wait() {
-            // We reaped it, or it is simply gone. `Err` here is the
-            // runtime's own child reaper winning the race after we issued
-            // the kill — `try_wait` then has no child to wait on. A vanished
-            // child after a kill is a completed kill, not an uncertain one,
-            // so both cases fall through to the caller's typed `fallback`.
+            // We reaped it, or it is gone. `Err` is the runtime's own child
+            // reaper winning the race after our kill — `try_wait` then has no
+            // child to wait on. A vanished child after a kill is a completed
+            // kill, so both cases settle as the caller's typed `fallback`.
             Ok(Some(_)) | Err(_) => break,
             Ok(None) => {
                 if Instant::now() >= reap_deadline {
