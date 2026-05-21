@@ -30,9 +30,12 @@ pub struct ReqwestRequest {
     /// Optional per-request timeout that overrides
     /// [`ReqwestConfig::default_timeout`].
     ///
-    /// The timeout applies to the reqwest call itself (connect + send +
-    /// receive). Once a request exceeds this duration the bridge
-    /// surfaces [`ReqwestError::Timeout`] and counts the outcome.
+    /// The timeout applies to the reqwest attempt itself (connect +
+    /// send + receive). Once an attempt exceeds this duration the
+    /// bridge aborts the spawned Tokio task, surfaces
+    /// [`ReqwestError::Timeout`], and counts the outcome. Bytes already
+    /// on the wire may still be observed by the upstream peer; timeout
+    /// is not a proof that the server saw no request.
     pub timeout: Option<Duration>,
 }
 
@@ -94,8 +97,14 @@ pub enum ReqwestError {
     Full,
     /// Worker has been closed and rejects new work.
     Closed,
-    /// Request did not complete within its timeout (per-request override
-    /// or [`ReqwestConfig::default_timeout`]).
+    /// The bridge's per-attempt deadline elapsed and the spawned
+    /// reqwest task was aborted.
+    ///
+    /// This is different from bridges that keep external work leased
+    /// until a physical terminal result. Reqwest timeout is a local
+    /// abort/cancel outcome: bytes already written to the upstream may
+    /// still have effects, but the bridge will not observe or count a
+    /// later reqwest terminal result for this attempt.
     Timeout,
     /// Request body exceeded [`ReqwestConfig::request_body_limit`].
     RequestTooLarge,
@@ -168,10 +177,15 @@ impl Default for RedirectPolicy {
 /// # Idempotency
 ///
 /// Configuring retry is the user's promise that the configured
-/// requests are safe to repeat. The bridge does not inspect method,
-/// path, or headers to decide. If a request must not retry, set
-/// [`RetryPolicy::None`] for that worker or run it through a separate
-/// worker.
+/// retry-safe requests are safe to repeat. The bridge also applies a
+/// conservative method gate: only HTTP methods that are retry-safe by
+/// default (`GET`, `HEAD`, `OPTIONS`, `TRACE`, `PUT`, `DELETE`) are
+/// retried. `POST` and `PATCH` surface the first terminal error even
+/// when this policy enables timeout or IO retry, because a response
+/// body read error can happen after the upstream committed the request.
+/// If a non-idempotent operation is safe in your application, encode
+/// idempotency at the application layer and use a retry-safe method or
+/// a dedicated bridge worker/API that makes that promise explicit.
 ///
 /// # Not retried
 ///

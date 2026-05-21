@@ -869,15 +869,14 @@ fn execute_completion(state: &Rc<RefCell<DarwinState>>, c: &mut CompletionInner)
                 let Operation::Fsync(op) = c.operation_mut() else {
                     unreachable!()
                 };
-                let rc = unsafe { libc::fsync(op.fd) };
-                if rc < 0 {
-                    let err = io::Error::last_os_error();
-                    if err.raw_os_error() == Some(libc::EINTR) {
-                        return PollResult::Retry;
+                match full_fsync(op.fd) {
+                    Ok(()) => Ok(()),
+                    Err(err) => {
+                        if err.raw_os_error() == Some(libc::EINTR) {
+                            return PollResult::Retry;
+                        }
+                        Err(err)
                     }
-                    Err(err)
-                } else {
-                    Ok(())
                 }
             };
             unsafe { FsyncCompletion::from_inner_mut(c) }.complete(result);
@@ -1047,6 +1046,25 @@ fn set_nonblocking_and_cloexec(fd: RawFd) -> io::Result<()> {
     Ok(())
 }
 
+fn full_fsync(fd: libc::c_int) -> io::Result<()> {
+    let rc = unsafe { libc::fcntl(fd, libc::F_FULLFSYNC) };
+    if rc == 0 {
+        return Ok(());
+    }
+
+    let err = io::Error::last_os_error();
+    if err.raw_os_error() != Some(libc::ENOTSUP) {
+        return Err(err);
+    }
+
+    let rc = unsafe { libc::fsync(fd) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
 fn set_no_sigpipe(fd: RawFd) -> io::Result<()> {
     let on: libc::c_int = 1;
     let rc = unsafe {
@@ -1062,4 +1080,33 @@ fn set_no_sigpipe(fd: RawFd) -> io::Result<()> {
         return Err(io::Error::last_os_error());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Write;
+    use std::os::fd::AsRawFd;
+
+    use super::*;
+
+    #[test]
+    fn full_fsync_succeeds_for_regular_file() {
+        let path = std::env::temp_dir().join(format!(
+            "betelgeuse-fullfsync-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .expect("open temp file");
+        file.write_all(b"durable enough for test")
+            .expect("write temp file");
+        full_fsync(file.as_raw_fd()).expect("full fsync regular file");
+        drop(file);
+        let _ = std::fs::remove_file(path);
+    }
 }

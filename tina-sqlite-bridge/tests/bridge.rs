@@ -747,7 +747,33 @@ fn bridge_attempt_timeout_surfaces_and_late_result_is_recorded() {
         CallOutcome::Replied(Err(SqliteError::Timeout)) => {}
         other => panic!("expected Timeout, got {other:?}"),
     }
-    assert_eq!(bridge.metrics.snapshot().timeouts, 1);
+    let snap_after_timeout = bridge.metrics.snapshot();
+    assert_eq!(snap_after_timeout.timeouts, 1);
+    assert_eq!(
+        snap_after_timeout.current_in_flight, 1,
+        "timed-out SQLite work still owns the serial physical slot: {snap_after_timeout:?}"
+    );
+
+    let second_sink = Arc::new(Sink::default());
+    let second = register_caller(
+        &runtime,
+        bridge.address,
+        Arc::clone(&second_sink),
+        Duration::from_secs(2),
+    );
+    runtime
+        .try_send(
+            second,
+            CallerMsg::Run(SqliteRequest::Execute {
+                sql: "CREATE TABLE should_not_start(id INTEGER)".into(),
+                params: vec![],
+            }),
+        )
+        .expect("second request");
+    match second_sink.wait_one(Duration::from_secs(5)) {
+        CallOutcome::Replied(Err(SqliteError::Full)) => {}
+        other => panic!("expected Full while timed-out work still runs, got {other:?}"),
+    }
 
     // Wait for the worker to finish and bump late_results.
     let deadline = Instant::now() + Duration::from_secs(30);

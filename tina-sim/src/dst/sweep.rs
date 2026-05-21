@@ -112,6 +112,18 @@ where
     let mut seeds_examined = 0;
     for seed in seeds {
         let case = make_case(seed);
+        assert_eq!(
+            case.seed, seed,
+            "sweep make_case returned case.seed {} for swept seed {}",
+            case.seed, seed
+        );
+        assert_eq!(
+            case.history.seed(),
+            seed,
+            "sweep make_case returned history.seed {} for swept seed {}",
+            case.history.seed(),
+            seed
+        );
         seeds_examined += 1;
         let report = runner(&case);
         if let Err(reason) = check(&report) {

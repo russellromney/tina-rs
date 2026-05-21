@@ -31,12 +31,13 @@
 
 use std::alloc::Global;
 use std::any::Any;
+use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
-use tina::{DeferredSlotRegistry, Shard};
+use tina::{DeferredSlotRegistry, IsolateId, Shard};
 
 use betelgeuse::IOLoopHandle;
 
@@ -243,6 +244,14 @@ pub use tcp_loops::{LoopStep, ReadExactStep, TcpReadExact, TcpReadToEof, TcpWrit
 ///
 /// This is the preferred runtime authoring path. It keeps the handler as normal
 /// Rust code and only fills the repetitive [`tina::Isolate`] associated types.
+///
+/// **The expansion is rooted at `::tina`.** The generated impl names
+/// `::tina::Isolate`, `::tina::Effect`, `::tina::Context`, and friends, so the
+/// crate using this macro must depend on `tina` and have it reachable as
+/// `::tina` (the default crate name). Only the call channel is rooted at
+/// `::tina_runtime`. A crate that depends on `tina-runtime` alone will fail to
+/// compile with `unresolved import ::tina`; add `tina` as a direct dependency,
+/// or override the root with `#[tina_runtime::isolate(.., tina_crate = ::your_path)]`.
 pub use tina_macros::runtime_isolate as isolate;
 pub use trace::{
     CallCompletionRejectedReason, CallKind, CallReplyRejectedReason, CauseId,
@@ -315,6 +324,7 @@ where
     pub(crate) shard: S,
     pub(crate) mailbox_factory: F,
     pub(crate) entries: Vec<RegisteredEntry<S, F>>,
+    pub(crate) entry_indexes: HashMap<IsolateId, usize>,
     pub(crate) child_records: Vec<ChildRecord<S, F>>,
     pub(crate) supervisors: Vec<SupervisorRecord>,
     pub(crate) next_isolate_id: u64,
@@ -325,7 +335,9 @@ where
     pub(crate) trace_dropped: u64,
     pub(crate) driver: Box<dyn RuntimeDriver>,
     pub(crate) in_flight_calls: Vec<InFlightCall>,
+    pub(crate) in_flight_call_indexes: HashMap<CallId, usize>,
     pub(crate) translators: Vec<StoredTranslator>,
+    pub(crate) translator_indexes: HashMap<CallId, usize>,
     pub(crate) clock: Box<dyn Clock>,
     pub(crate) pending_isolate_calls: Vec<PendingIsolateCall>,
     pub(crate) round_messages: Vec<Option<DeliveredMessage>>,
@@ -599,6 +611,7 @@ where
             shard,
             mailbox_factory,
             entries: Vec::with_capacity(preallocation.entry_capacity),
+            entry_indexes: HashMap::with_capacity(preallocation.entry_capacity),
             child_records: Vec::with_capacity(preallocation.child_record_capacity),
             supervisors: Vec::with_capacity(preallocation.supervisor_capacity),
             next_isolate_id: 1,
@@ -609,7 +622,9 @@ where
             trace_dropped: 0,
             driver,
             in_flight_calls: Vec::with_capacity(preallocation.call_capacity),
+            in_flight_call_indexes: HashMap::with_capacity(preallocation.call_capacity),
             translators: Vec::with_capacity(preallocation.call_capacity),
+            translator_indexes: HashMap::with_capacity(preallocation.call_capacity),
             clock,
             pending_isolate_calls: Vec::with_capacity(preallocation.call_capacity),
             round_messages: Vec::with_capacity(preallocation.round_scratch_capacity),

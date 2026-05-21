@@ -226,10 +226,17 @@ struct ActiveStream {
     request_eof: bool,
     request_content_length: Option<usize>,
     request_bytes_received: usize,
+    request_flow_bytes_received: usize,
     pending_recv_window_credit: u32,
-    request_chunks: VecDeque<Vec<u8>>,
+    request_chunks: VecDeque<RequestDataChunk>,
     pending_request_body_reply: Option<tina::RequestContext<Http2ConnectionReply>>,
     reset: bool,
+}
+
+#[derive(Debug)]
+struct RequestDataChunk {
+    data: Vec<u8>,
+    flow_credit: usize,
 }
 
 #[derive(Debug)]
@@ -262,6 +269,7 @@ impl ActiveStream {
             request_eof: false,
             request_content_length: None,
             request_bytes_received: 0,
+            request_flow_bytes_received: 0,
             pending_recv_window_credit: 0,
             request_chunks: VecDeque::new(),
             pending_request_body_reply: None,
@@ -552,7 +560,7 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Http2Connection<
         effects: &mut Vec<Effect<Self>>,
     ) -> Result<(), Http2ProtocolError> {
         match frame.ty {
-            FRAME_SETTINGS => self.handle_settings(frame),
+            FRAME_SETTINGS => self.handle_settings(frame, effects),
             FRAME_HEADERS => self.handle_headers(frame, effects),
             FRAME_DATA => self.handle_data(frame, effects),
             FRAME_WINDOW_UPDATE => {
@@ -583,7 +591,11 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Http2Connection<
         Ok(())
     }
 
-    fn handle_settings(&mut self, frame: Frame) -> Result<(), Http2ProtocolError> {
+    fn handle_settings(
+        &mut self,
+        frame: Frame,
+        effects: &mut Vec<Effect<Self>>,
+    ) -> Result<(), Http2ProtocolError> {
         if frame.stream_id != 0 {
             return Err(Http2ProtocolError::BadStreamId);
         }
@@ -601,7 +613,10 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Http2Connection<
             let value = u32::from_be_bytes([setting[2], setting[3], setting[4], setting[5]]);
             self.apply_setting(id, value)?;
         }
-        self.enqueue_frame(settings_frame(true))
+        self.enqueue_frame(settings_frame(true))?;
+        self.flush_pending_responses(effects)?;
+        self.push_ready_response_pulls(effects);
+        Ok(())
     }
 
     fn apply_setting(&mut self, id: u16, value: u32) -> Result<(), Http2ProtocolError> {
@@ -755,9 +770,10 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Http2Connection<
             return Err(Http2ProtocolError::BadStreamId);
         }
         let payload = data_payload(&frame)?;
-        let len = payload.len();
-        let len_i32 = i32::try_from(len).map_err(|_| Http2ProtocolError::FlowControl)?;
-        if self.recv_window < len_i32 {
+        let data_len = payload.len();
+        let flow_len = frame.payload.len();
+        let flow_len_i32 = i32::try_from(flow_len).map_err(|_| Http2ProtocolError::FlowControl)?;
+        if self.recv_window < flow_len_i32 {
             self.report.flow_control_blocked += 1;
             self.emit_protocol_fact(
                 effects,
@@ -798,7 +814,7 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Http2Connection<
             );
             return Ok(());
         }
-        if self.streams[idx].recv_window < len_i32 {
+        if self.streams[idx].recv_window < flow_len_i32 {
             self.report.flow_control_blocked += 1;
             self.emit_protocol_fact(
                 effects,
@@ -813,7 +829,7 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Http2Connection<
         if let Some(content_length) = self.streams[idx].request_content_length {
             let received = self.streams[idx]
                 .request_bytes_received
-                .checked_add(len)
+                .checked_add(data_len)
                 .ok_or(Http2ProtocolError::HeadersTooLarge)?;
             if received > content_length {
                 self.report.protocol_errors += 1;
@@ -837,7 +853,7 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Http2Connection<
             self.streams[idx].body.len()
         };
         let new_len = buffered_len
-            .checked_add(len)
+            .checked_add(data_len)
             .ok_or(Http2ProtocolError::HeadersTooLarge)?;
         if new_len > self.limits.max_body_bytes {
             self.report.stream_full += 1;
@@ -864,12 +880,21 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Http2Connection<
             self.remove_stream(frame.stream_id);
             return Ok(());
         }
-        self.recv_window -= len_i32;
-        self.streams[idx].recv_window -= len_i32;
-        self.streams[idx].request_bytes_received += len;
+        self.recv_window -= flow_len_i32;
+        self.streams[idx].recv_window -= flow_len_i32;
+        self.streams[idx].request_bytes_received += data_len;
+        self.streams[idx].request_flow_bytes_received += flow_len;
         if self.streams[idx].request_dispatched_streaming {
             if !payload.is_empty() {
-                self.streams[idx].request_chunks.push_back(payload);
+                self.streams[idx]
+                    .request_chunks
+                    .push_back(RequestDataChunk {
+                        data: payload,
+                        flow_credit: flow_len,
+                    });
+            } else if flow_len > 0 {
+                self.add_request_window_credit(idx, flow_len);
+                self.maybe_flush_request_window_credit(frame.stream_id, false)?;
             }
         } else {
             self.streams[idx].body.extend_from_slice(&payload);
@@ -920,7 +945,22 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Http2Connection<
         bytes.copy_from_slice(&frame.payload);
         let increment = u32::from_be_bytes(bytes) & 0x7fff_ffff;
         if increment == 0 {
-            return Err(Http2ProtocolError::WindowOverflow);
+            if frame.stream_id == 0 {
+                return Err(Http2ProtocolError::WindowOverflow);
+            }
+            self.report.protocol_errors += 1;
+            self.enqueue_frame(rst_stream_frame(frame.stream_id, ERR_PROTOCOL_ERROR))?;
+            self.emit_protocol_fact(
+                effects,
+                ProtocolFact::Http2StreamReset {
+                    connection: self.connection_fact_id(),
+                    stream: Http2StreamId::new(frame.stream_id),
+                    direction: ProtocolDirection::Outbound,
+                    reason: Http2ResetReason::ProtocolError,
+                },
+            );
+            self.reset_active_stream_for_protocol(frame.stream_id, effects);
+            return Ok(());
         }
         if frame.stream_id == 0 {
             self.send_window = add_window(self.send_window, increment)?;
@@ -1017,7 +1057,7 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Http2Connection<
             body: HttpRequestBody::Buffered(std::mem::take(&mut self.streams[idx].body)),
         };
         let consumed = match &request.body {
-            HttpRequestBody::Buffered(bytes) => bytes.len(),
+            HttpRequestBody::Buffered(_) => self.streams[idx].request_flow_bytes_received,
             HttpRequestBody::Stream(_) | HttpRequestBody::Http2Stream(_) => 0,
         };
         if consumed > 0 {
@@ -1672,23 +1712,24 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Http2Connection<
         };
         if let Some(mut chunk) = self.streams[idx].request_chunks.pop_front() {
             let cap = self.limits.request_stream_chunk_size.max(1);
-            if chunk.len() > cap {
-                let rest = chunk.split_off(cap);
-                self.streams[idx].request_chunks.push_front(rest);
+            if chunk.data.len() > cap {
+                let rest = chunk.data.split_off(cap);
+                let rest_credit = rest.len();
+                chunk.flow_credit = chunk.flow_credit.saturating_sub(rest_credit);
+                self.streams[idx]
+                    .request_chunks
+                    .push_front(RequestDataChunk {
+                        data: rest,
+                        flow_credit: rest_credit,
+                    });
             }
-            let len = chunk.len();
-            self.recv_window = self.recv_window.saturating_add(len as i32);
-            self.pending_recv_window_credit =
-                self.pending_recv_window_credit.saturating_add(len as u32);
-            self.streams[idx].recv_window =
-                self.streams[idx].recv_window.saturating_add(len as i32);
-            self.streams[idx].pending_recv_window_credit = self.streams[idx]
-                .pending_recv_window_credit
-                .saturating_add(len as u32);
+            let credit = chunk.flow_credit;
+            let data = chunk.data;
+            self.add_request_window_credit(idx, credit);
             self.maybe_flush_request_window_credit(stream_id, false)?;
             return Ok(reply_to_request(
                 call,
-                Http2ConnectionReply::RequestChunk(RequestChunkReply::Chunk(chunk)),
+                Http2ConnectionReply::RequestChunk(RequestChunkReply::Chunk(data)),
             ));
         }
         if self.streams[idx].request_eof {
@@ -1701,6 +1742,20 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Http2Connection<
             self.streams[idx].pending_request_body_reply = Some(call);
             Ok(noop())
         }
+    }
+
+    fn add_request_window_credit(&mut self, stream_index: usize, credit: usize) {
+        let credit_i32 = i32::try_from(credit).unwrap_or(i32::MAX);
+        let credit_u32 = u32::try_from(credit).unwrap_or(u32::MAX);
+        self.recv_window = self.recv_window.saturating_add(credit_i32);
+        self.pending_recv_window_credit =
+            self.pending_recv_window_credit.saturating_add(credit_u32);
+        self.streams[stream_index].recv_window = self.streams[stream_index]
+            .recv_window
+            .saturating_add(credit_i32);
+        self.streams[stream_index].pending_recv_window_credit = self.streams[stream_index]
+            .pending_recv_window_credit
+            .saturating_add(credit_u32);
     }
 
     fn maybe_write_effect(&mut self) -> Effect<Self> {
@@ -2049,6 +2104,46 @@ mod tests {
         assert_eq!(
             conn.handle_window_update(frame, &mut effects),
             Err(Http2ProtocolError::WindowOverflow)
+        );
+    }
+
+    #[test]
+    fn zero_stream_window_update_resets_only_that_stream() {
+        let mut conn = unit_connection();
+        conn.streams.push(ActiveStream::new(
+            1,
+            HeaderBlock::default(),
+            DEFAULT_WINDOW,
+            DEFAULT_WINDOW,
+            false,
+        ));
+        let frame = Frame::new(FRAME_WINDOW_UPDATE, 0, 1, 0_u32.to_be_bytes().to_vec());
+        let mut effects: Vec<Effect<Http2Connection<UnitShard>>> = Vec::new();
+
+        conn.handle_window_update(frame, &mut effects)
+            .expect("stream zero WINDOW_UPDATE should not GOAWAY connection");
+
+        assert!(conn.find_stream(1).is_none(), "bad stream is removed");
+        assert_eq!(conn.write_queue.len(), 1);
+        let (queued, _) = try_decode_frame(&conn.write_queue[0], conn.limits.max_frame_size)
+            .expect("complete queued frame")
+            .expect("queued RST decodes");
+        assert_eq!(queued.ty, FRAME_RST_STREAM);
+        assert_eq!(queued.stream_id, 1);
+        let mut code = [0_u8; 4];
+        code.copy_from_slice(&queued.payload);
+        assert_eq!(u32::from_be_bytes(code), ERR_PROTOCOL_ERROR);
+        let facts = collect_facts(&effects);
+        assert!(
+            facts.iter().any(|f| matches!(
+                f,
+                ProtocolFact::Http2StreamReset {
+                    reason: Http2ResetReason::ProtocolError,
+                    direction: ProtocolDirection::Outbound,
+                    ..
+                }
+            )),
+            "expected outbound protocol reset fact, got {facts:?}",
         );
     }
 

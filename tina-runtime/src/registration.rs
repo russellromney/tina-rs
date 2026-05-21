@@ -349,6 +349,7 @@ where
         // allocator is monotonic so leaking one is harmless.
         let isolate = construct(self_addr);
 
+        let entry_index = self.entries.len();
         self.entries.push(RegisteredEntry {
             id: isolate_id,
             generation,
@@ -362,6 +363,7 @@ where
                 marker: PhantomData,
             })),
         });
+        self.entry_indexes.insert(isolate_id, entry_index);
 
         self_addr
     }
@@ -475,13 +477,23 @@ where
     }
 
     pub(crate) fn entry_index(&self, address: RegisteredAddress) -> Option<usize> {
-        self.entries
-            .iter()
-            .position(|entry| entry.id == address.isolate && entry.generation == address.generation)
+        let index = *self.entry_indexes.get(&address.isolate)?;
+        let entry = self.entries.get(index)?;
+        (entry.generation == address.generation).then_some(index)
     }
 
     pub(crate) fn entry_by_isolate(&self, isolate: IsolateId) -> Option<&RegisteredEntry<S, F>> {
         self.entries.iter().find(|entry| entry.id == isolate)
+    }
+
+    pub(crate) fn rebuild_entry_indexes(&mut self) {
+        self.entry_indexes.clear();
+        self.entry_indexes.extend(
+            self.entries
+                .iter()
+                .enumerate()
+                .map(|(index, entry)| (entry.id, index)),
+        );
     }
 
     pub(crate) fn child_record_index_by_child(&self, child: RegisteredAddress) -> Option<usize> {
@@ -540,6 +552,7 @@ where
         self.next_isolate_id += 1;
         let generation = AddressGeneration::new(0);
 
+        let entry_index = self.entries.len();
         self.entries.push(RegisteredEntry {
             id: isolate_id,
             generation,
@@ -553,6 +566,7 @@ where
                 marker: PhantomData,
             })),
         });
+        self.entry_indexes.insert(isolate_id, entry_index);
 
         RegisteredAddress {
             shard: self.shard.id(),
@@ -649,6 +663,7 @@ where
         self.next_isolate_id += 1;
         let generation = AddressGeneration::new(0);
 
+        let entry_index = self.entries.len();
         self.entries.push(RegisteredEntry {
             id: isolate_id,
             generation,
@@ -662,6 +677,7 @@ where
                 marker: PhantomData,
             })),
         });
+        self.entry_indexes.insert(isolate_id, entry_index);
 
         RegisteredAddress {
             shard: self.shard.id(),

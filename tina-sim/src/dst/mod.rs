@@ -1097,6 +1097,39 @@ mod replay_case_tests {
         assert_eq!(a, b);
     }
 
+    #[test]
+    #[should_panic(expected = "sweep make_case returned case.seed 0 for swept seed 1")]
+    fn sweep_seeds_rejects_case_that_ignores_swept_seed() {
+        let _ = sweep_seeds(
+            "bad sweep",
+            1..2,
+            |_seed| make_seeded_case(0),
+            run_seeded_case,
+            |_report| Ok(()),
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "sweep make_case returned history.seed 0 for swept seed 1")]
+    fn sweep_seeds_rejects_history_that_ignores_swept_seed() {
+        let _ = sweep_seeds(
+            "bad sweep",
+            1..2,
+            |seed| ReplayCase {
+                name: "sweep fixture",
+                seed,
+                config: ReplayConfig::new(),
+                scenario: "case seed is right but history seed is wrong",
+                history: History::new("sweep fixture", 0, vec![1, 2, 3]),
+                expected_event_count: 0,
+                expected_trace_hash: 0,
+                invariant: "history seed matches swept seed",
+            },
+            run_seeded_case,
+            |_report| Ok(()),
+        );
+    }
+
     fn run_full_history_case(case: &ReplayCase<u32>) -> ReplayReport<u32> {
         // Each operation contributes one fake event; sum is the projection.
         let events: Vec<RuntimeEvent> = (1..=case.history.len() as u64).map(fake_event).collect();

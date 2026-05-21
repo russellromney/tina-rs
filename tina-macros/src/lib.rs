@@ -145,6 +145,13 @@ pub fn isolate(args: TokenStream, input: TokenStream) -> TokenStream {
     expand_isolate(args, input, CallDefault::Infallible)
 }
 
+/// Like [`isolate`], but the call channel defaults to `RuntimeCall<Message>`.
+///
+/// The expansion still roots the rest of the authoring vocabulary
+/// (`Isolate`, `Effect`, `Context`, ...) at `::tina`, so the using crate must
+/// depend on `tina` and have it reachable as `::tina`. Only the call channel
+/// is rooted at `::tina_runtime`. Override with `tina_crate = ...` /
+/// `runtime_crate = ...` when the crate names differ.
 #[proc_macro_attribute]
 pub fn runtime_isolate(args: TokenStream, input: TokenStream) -> TokenStream {
     expand_isolate(args, input, CallDefault::RuntimeCall)
@@ -302,18 +309,24 @@ fn build_isolate(
         let (request_attrs, request_name, call_name, request_body) =
             validate_call_handler(&request_method, "handle_request", "request", "call")?;
         require_call_authority_mentioned(&request_body, &call_name)?;
+        let service_message_name =
+            Ident::new("__tina_service_message", proc_macro2::Span::mixed_site());
         let event_attrs = event_method.attrs.clone();
         let event_body = Box::new(event_method.block.clone());
+        // No `#[deny(unused_variables)]` here: it would override the caller's
+        // own lint level on the spliced request body and hard-error a handler
+        // that answers the caller without reading a unit/marker request. The
+        // `RequestEffect<Self>` linear type below already enforces the real
+        // invariant (the caller is answered); reading the payload is optional.
         let handle_call_tokens = quote! {
             #(#request_attrs)*
-            #[deny(unused_variables)]
             fn handle_call(
                 &mut self,
-                msg: Self::Message,
+                #service_message_name: Self::Message,
                 #call_name: #tina_crate::CallContext<'_, Self>,
             ) -> #tina_crate::Effect<Self> {
                 let #call_name = #tina_crate::RequestCall::new(#call_name);
-                match msg {
+                match #service_message_name {
                     #tina_crate::ServiceMessage::Request(#request_name) => {
                         let request_effect: #tina_crate::RequestEffect<Self> = #request_body;
                         request_effect.into_effect()

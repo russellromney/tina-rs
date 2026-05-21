@@ -10,6 +10,11 @@ use std::time::{Duration, Instant};
 use aws_sdk_s3::Client;
 use aws_sdk_s3::config::retry::RetryConfig;
 use aws_sdk_s3::config::{BehaviorVersion, Credentials, Region};
+use aws_sdk_s3::error::{ProvideErrorMetadata, SdkError};
+use aws_sdk_s3::operation::delete_object::DeleteObjectError;
+use aws_sdk_s3::operation::get_object::GetObjectError;
+use aws_sdk_s3::operation::head_object::HeadObjectError;
+use aws_sdk_s3::operation::put_object::PutObjectError;
 use aws_sdk_s3::primitives::ByteStream;
 use tina::CallContext;
 use tina::prelude::*;
@@ -589,7 +594,7 @@ async fn run_request(client: Client, request: S3Request, response_limit: usize) 
                         version_id: out.version_id,
                     })
                 })
-                .map_err(|e| S3Error::Sdk(e.to_string()))
+                .map_err(classify_put_error)
         }
         S3Request::GetObject(get) => {
             let limit = get
@@ -602,7 +607,7 @@ async fn run_request(client: Client, request: S3Request, response_limit: usize) 
                 .key(get.key)
                 .send()
                 .await
-                .map_err(|e| S3Error::Sdk(e.to_string()))?;
+                .map_err(classify_get_error)?;
             let body = read_capped(out.body, limit).await?;
             Ok(S3Response::Object(S3Object {
                 body,
@@ -624,7 +629,7 @@ async fn run_request(client: Client, request: S3Request, response_limit: usize) 
                     e_tag: out.e_tag,
                 })
             })
-            .map_err(|e| S3Error::Sdk(e.to_string())),
+            .map_err(classify_head_error),
         S3Request::DeleteObject(delete) => client
             .delete_object()
             .bucket(delete.bucket)
@@ -637,7 +642,65 @@ async fn run_request(client: Client, request: S3Request, response_limit: usize) 
                     delete_marker: out.delete_marker,
                 })
             })
-            .map_err(|e| S3Error::Sdk(e.to_string())),
+            .map_err(classify_delete_error),
+    }
+}
+
+fn classify_put_error(error: SdkError<PutObjectError>) -> S3Error {
+    classify_s3_error_from_metadata(&error).unwrap_or_else(|| S3Error::Sdk(error_detail(&error)))
+}
+
+fn classify_get_error(error: SdkError<GetObjectError>) -> S3Error {
+    if let Some(service) = error.as_service_error() {
+        if service.is_no_such_key() {
+            return S3Error::NotFound(error_detail(&error));
+        }
+    }
+    classify_s3_error_from_metadata(&error).unwrap_or_else(|| S3Error::Sdk(error_detail(&error)))
+}
+
+fn classify_head_error(error: SdkError<HeadObjectError>) -> S3Error {
+    if let Some(service) = error.as_service_error() {
+        if service.is_not_found() {
+            return S3Error::NotFound(error_detail(&error));
+        }
+    }
+    classify_s3_error_from_metadata(&error).unwrap_or_else(|| S3Error::Sdk(error_detail(&error)))
+}
+
+fn classify_delete_error(error: SdkError<DeleteObjectError>) -> S3Error {
+    classify_s3_error_from_metadata(&error).unwrap_or_else(|| S3Error::Sdk(error_detail(&error)))
+}
+
+fn classify_s3_error_from_metadata<E, R>(error: &SdkError<E, R>) -> Option<S3Error>
+where
+    E: ProvideErrorMetadata + std::fmt::Debug + std::fmt::Display,
+    R: std::fmt::Debug,
+{
+    let code = error.as_service_error()?.code()?;
+    let detail = error_detail(error);
+    match code {
+        "NoSuchBucket" | "NoSuchKey" | "NotFound" => Some(S3Error::NotFound(detail)),
+        "AccessDenied" => Some(S3Error::AccessDenied(detail)),
+        "SlowDown"
+        | "Throttling"
+        | "ThrottlingException"
+        | "TooManyRequestsException"
+        | "RequestLimitExceeded"
+        | "RequestThrottled" => Some(S3Error::Throttled(detail)),
+        _ => None,
+    }
+}
+
+fn error_detail<E, R>(error: &SdkError<E, R>) -> String
+where
+    E: std::fmt::Debug + std::fmt::Display,
+    R: std::fmt::Debug,
+{
+    if let Some(service) = error.as_service_error() {
+        format!("{service}; {service:?}")
+    } else {
+        format!("{error}; {error:?}")
     }
 }
 
@@ -690,7 +753,12 @@ fn tally_terminal(metrics: &MetricsInner, result: &S3Result) {
         Ok(_) => {
             metrics.responses.fetch_add(1, Ordering::Relaxed);
         }
-        Err(S3Error::Sdk(_)) => {
+        Err(
+            S3Error::NotFound(_)
+            | S3Error::AccessDenied(_)
+            | S3Error::Throttled(_)
+            | S3Error::Sdk(_),
+        ) => {
             metrics.sdk_errors.fetch_add(1, Ordering::Relaxed);
         }
         Err(S3Error::Body(_)) => {

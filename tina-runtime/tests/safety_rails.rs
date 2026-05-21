@@ -338,6 +338,67 @@ impl SplitClient {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Regression fixture (H2): a split-service request handler may answer the
+// caller without reading the request payload. The generated `handle_call`
+// must not impose its own `#[deny(unused_variables)]`, which would override
+// the user's lint choice and hard-error a legitimate marker request. The
+// `RequestEffect` linear type already enforces that the caller is answered;
+// reading the payload is not required. This module compiles iff the deny is
+// gone — its `#![allow(unused_variables)]` only takes effect once the macro
+// stops overriding it on the generated fn.
+// ---------------------------------------------------------------------------
+mod h2_unused_request_payload {
+    #![allow(dead_code, unused_variables)]
+    use super::*;
+
+    #[derive(Debug)]
+    enum MarkerEvent {
+        Set(u32),
+    }
+
+    // Marker request: carries no data the handler needs to read.
+    #[derive(Debug)]
+    struct MarkerRead;
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct MarkerReply(u32);
+
+    struct MarkerService {
+        value: u32,
+    }
+
+    #[tina_runtime::isolate(event = MarkerEvent, request = MarkerRead, reply = MarkerReply)]
+    impl MarkerService {
+        fn handle_event(
+            &mut self,
+            ev: MarkerEvent,
+            _cx: &mut Context<'_, SingleShard, Self::Reply>,
+        ) -> Effect<Self> {
+            match ev {
+                MarkerEvent::Set(value) => {
+                    self.value = value;
+                    noop()
+                }
+            }
+        }
+
+        fn handle_request(
+            &mut self,
+            req: MarkerRead,
+            caller: RequestCall<'_, Self>,
+        ) -> RequestEffect<Self> {
+            // Intentionally does not read `req`.
+            caller.reply(MarkerReply(self.value))
+        }
+    }
+
+    #[test]
+    fn marker_request_service_builds() {
+        let _service = MarkerService { value: 7 };
+    }
+}
+
 #[derive(Debug)]
 enum SplitProducerMsg {
     Publish(u32),

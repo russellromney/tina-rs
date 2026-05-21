@@ -258,36 +258,35 @@ where
         if !state.workers.iter().all(|w| w.signaled) {
             return;
         }
-        let mut joinable: Vec<(ShardId, ThreadedWorkerJoin, Arc<LiveShardMetrics>)> = Vec::new();
-        for worker in &mut state.workers {
-            if let Some(h) = worker.handle.take() {
-                joinable.push((worker.shard, h, Arc::clone(&worker.metrics)));
-            }
-        }
-        if joinable.is_empty() {
+        // Nothing left to join (every handle already taken by a prior joiner):
+        // don't spin up a joiner that would cache an empty report.
+        if !state.workers.iter().any(|w| w.handle.is_some()) {
             return;
         }
         state.joining = true;
         drop(state);
 
-        let shared = Arc::clone(self);
-        let spawn_result = thread::Builder::new()
-            .name("tina-shutdown-joiner".to_string())
-            .spawn(move || joiner_main(shared, joinable));
-        if spawn_result.is_err() {
-            // Failed to spawn the joiner thread (rare). Join inline so the
-            // runtime cannot leak its OS threads. The inline path still
-            // runs through the panic-safe `joiner_main` wrapper.
-            let mut state = self.lock_state();
-            let mut joinable: Vec<(ShardId, ThreadedWorkerJoin, Arc<LiveShardMetrics>)> =
-                Vec::new();
-            for worker in &mut state.workers {
-                if let Some(h) = worker.handle.take() {
-                    joinable.push((worker.shard, h, Arc::clone(&worker.metrics)));
-                }
-            }
-            drop(state);
-            joiner_main(Arc::clone(self), joinable);
+        // Do NOT take the worker handles here. `run_joiner` takes them under
+        // the lock itself, so a failed `spawn` re-runs the joiner inline with
+        // the handles still present. Taking them before the move would drop
+        // them with the un-spawned closure on a `spawn` error, silently
+        // leaking every worker thread while caching a false `Closed` report
+        // with no events (E1).
+        let spawned = if force_joiner_spawn_failure() {
+            false
+        } else {
+            let shared = Arc::clone(self);
+            thread::Builder::new()
+                .name("tina-shutdown-joiner".to_string())
+                .spawn(move || joiner_main(shared))
+                .is_ok()
+        };
+        if !spawned {
+            // Failed to spawn the joiner thread (rare; FD/thread-limit
+            // exhaustion). Join inline so no worker leaks and the report
+            // reflects real exits. The handles are still in state, so the
+            // panic-safe `joiner_main` wrapper takes and joins them here.
+            joiner_main(Arc::clone(self));
         }
     }
 
@@ -449,19 +448,36 @@ where
     ThreadedShutdownHandle::new(inner)
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Test seam: when set, [`SharedShutdownState::ensure_joiner_started`]
+    /// skips the real `thread::Builder::spawn` and takes the inline fallback,
+    /// letting a test drive the spawn-failure path deterministically.
+    static FORCE_JOINER_SPAWN_FAILURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+fn force_joiner_spawn_failure() -> bool {
+    FORCE_JOINER_SPAWN_FAILURE.with(std::cell::Cell::get)
+}
+
+#[cfg(not(test))]
+#[inline]
+fn force_joiner_spawn_failure() -> bool {
+    false
+}
+
 /// Panic-safe joiner entry point. Catches any unwind inside
 /// [`run_joiner`] so waiters surface
 /// [`ShutdownWaitError::WorkerStopped`] instead of hanging on a
 /// condvar that will never be notified.
-fn joiner_main<S, F>(
-    shared: Arc<SharedShutdownState<S, F>>,
-    joinable: Vec<(ShardId, ThreadedWorkerJoin, Arc<LiveShardMetrics>)>,
-) where
+fn joiner_main<S, F>(shared: Arc<SharedShutdownState<S, F>>)
+where
     S: Shard + Send + 'static,
     F: MailboxFactory + Send + 'static,
 {
     let shared_for_guard = Arc::clone(&shared);
-    let result = catch_unwind(AssertUnwindSafe(|| run_joiner(shared, joinable)));
+    let result = catch_unwind(AssertUnwindSafe(|| run_joiner(shared)));
     if result.is_err() {
         let mut state = shared_for_guard.lock_state();
         state.joiner_failed = true;
@@ -472,13 +488,25 @@ fn joiner_main<S, F>(
 
 /// Joiner thread body. Joins every worker, builds the terminal report,
 /// caches it under the shared lock, and notifies every waiter.
-fn run_joiner<S, F>(
-    shared: Arc<SharedShutdownState<S, F>>,
-    joinable: Vec<(ShardId, ThreadedWorkerJoin, Arc<LiveShardMetrics>)>,
-) where
+fn run_joiner<S, F>(shared: Arc<SharedShutdownState<S, F>>)
+where
     S: Shard + Send + 'static,
     F: MailboxFactory + Send + 'static,
 {
+    // Take the worker handles under the lock, then release it before joining
+    // (each `join()` blocks until its worker exits). Taking the handles here
+    // — not in the caller — is what keeps the spawn-failure fallback correct:
+    // whichever path actually runs the joiner finds the handles present.
+    let joinable: Vec<(ShardId, ThreadedWorkerJoin, Arc<LiveShardMetrics>)> = {
+        let mut state = shared.lock_state();
+        let mut joinable = Vec::new();
+        for worker in &mut state.workers {
+            if let Some(h) = worker.handle.take() {
+                joinable.push((worker.shard, h, Arc::clone(&worker.metrics)));
+            }
+        }
+        joinable
+    };
     let mut events: Vec<crate::trace::RuntimeEvent> = Vec::new();
     let mut failure: Option<ThreadedRuntimeError> = None;
     for (_shard, handle, metrics) in joinable {
@@ -579,4 +607,72 @@ where
         topology,
         Vec::new(),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mailbox::DefaultMailboxFactory;
+    use crate::threaded::ThreadedRuntimeConfig;
+    use std::collections::BTreeMap;
+    use std::sync::mpsc::sync_channel;
+
+    struct TestShard;
+    impl Shard for TestShard {
+        fn id(&self) -> ShardId {
+            ShardId::new(0)
+        }
+    }
+
+    /// A worker entry whose join handle is a real thread that exits
+    /// immediately with a clean exit. Joining it returns a
+    /// `ThreadedWorkerExit` and flips the shard's metrics to `Stopped`;
+    /// leaking the handle (not joining) leaves the metrics `RUNNING`.
+    fn fake_worker(shard_id: u32) -> ShutdownWorker<TestShard, DefaultMailboxFactory> {
+        let (commands, _rx) = sync_channel::<ThreadedCommand<TestShard, DefaultMailboxFactory>>(1);
+        let shard = ShardId::new(shard_id);
+        let metrics = Arc::new(LiveShardMetrics::new(
+            shard,
+            None,
+            ThreadedRuntimeConfig::default(),
+        ));
+        let handle = std::thread::spawn(|| ThreadedWorkerExit::clean(Vec::new()));
+        ShutdownWorker {
+            shard,
+            commands,
+            handle: Some(handle),
+            metrics,
+            signaled: true,
+        }
+    }
+
+    // E1: when the joiner thread cannot be spawned, the inline fallback must
+    // still join every worker and cache a real report. The pre-fix code took
+    // the handles before the spawn, dropped them with the un-spawned closure,
+    // then re-took already-empty handles inline — leaking every thread and
+    // caching an empty `Closed` report that lied.
+    #[test]
+    fn joiner_spawn_failure_joins_inline_without_leaking_or_lying() {
+        let workers = vec![fake_worker(1), fake_worker(2)];
+        let shared = Arc::new(SharedShutdownState::multi_shard(workers, BTreeMap::new()));
+
+        FORCE_JOINER_SPAWN_FAILURE.with(|f| f.set(true));
+        shared.ensure_joiner_started();
+        FORCE_JOINER_SPAWN_FAILURE.with(|f| f.set(false));
+
+        let state = shared.lock_state();
+        assert!(
+            state.workers.iter().all(|w| w.handle.is_none()),
+            "spawn-failure fallback must take every worker handle"
+        );
+        assert!(
+            state
+                .workers
+                .iter()
+                .all(|w| w.metrics.state() == LiveShardState::Stopped),
+            "every worker must actually be joined (Stopped), not leaked (RUNNING)"
+        );
+        let report = state.report.as_ref().expect("terminal report cached");
+        assert_eq!(report.state(), LocalSystemState::Closed);
+    }
 }

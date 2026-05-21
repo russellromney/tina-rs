@@ -323,6 +323,21 @@ fn rst_stream_error_code(frame: &TestFrame) -> u32 {
     u32::from_be_bytes(buf)
 }
 
+fn window_update_increment(frame: &TestFrame) -> u32 {
+    assert_eq!(
+        frame.ty, FRAME_WINDOW_UPDATE,
+        "expected WINDOW_UPDATE frame"
+    );
+    assert_eq!(
+        frame.payload.len(),
+        4,
+        "WINDOW_UPDATE payload must be exactly 4 bytes"
+    );
+    let mut buf = [0_u8; 4];
+    buf.copy_from_slice(&frame.payload[..4]);
+    u32::from_be_bytes(buf) & 0x7fff_ffff
+}
+
 struct StreamingResponseService {
     source: Address<tina_http::ResponseChunkMsg, tina_http::ResponseChunkReply>,
 }
@@ -591,6 +606,45 @@ fn http2_forbidden_connection_header_rejects() {
 }
 
 #[test]
+fn http2_te_header_must_be_trailers() {
+    let harness = Http2Harness::start(Http2ServerConfig::default());
+    let mut stream = connect_h2(harness.addr);
+    let mut block = request_headers("GET", "/counter");
+    literal("te", "gzip", &mut block);
+
+    write_frame(
+        &mut stream,
+        FRAME_HEADERS,
+        FLAG_END_HEADERS | FLAG_END_STREAM,
+        1,
+        &block,
+    );
+
+    let frame = read_until_goaway(&mut stream);
+    assert_eq!(goaway_error_code(&frame), ERR_PROTOCOL_ERROR);
+    harness.shutdown();
+}
+
+#[test]
+fn http2_te_trailers_header_is_allowed() {
+    let harness = Http2Harness::start(Http2ServerConfig::default());
+    let mut stream = connect_h2(harness.addr);
+    let mut block = request_headers("GET", "/counter");
+    literal("te", "trailers", &mut block);
+
+    write_frame(
+        &mut stream,
+        FRAME_HEADERS,
+        FLAG_END_HEADERS | FLAG_END_STREAM,
+        1,
+        &block,
+    );
+
+    assert_eq!(read_response_body(&mut stream, 1), b"0");
+    harness.shutdown();
+}
+
+#[test]
 fn http2_uppercase_header_rejects() {
     let harness = Http2Harness::start(Http2ServerConfig::default());
     let mut stream = connect_h2(harness.addr);
@@ -621,6 +675,24 @@ fn http2_missing_authority_rejects() {
         FLAG_END_HEADERS | FLAG_END_STREAM,
         1,
         &request_headers_without_authority("GET", "/counter"),
+    );
+
+    let frame = read_until_goaway(&mut stream);
+    assert_eq!(goaway_error_code(&frame), ERR_PROTOCOL_ERROR);
+    harness.shutdown();
+}
+
+#[test]
+fn http2_empty_path_rejects_before_service_dispatch() {
+    let harness = Http2Harness::start(Http2ServerConfig::default());
+    let mut stream = connect_h2(harness.addr);
+
+    write_frame(
+        &mut stream,
+        FRAME_HEADERS,
+        FLAG_END_HEADERS | FLAG_END_STREAM,
+        1,
+        &request_headers("GET", ""),
     );
 
     let frame = read_until_goaway(&mut stream);
@@ -767,6 +839,39 @@ fn http2_settings_initial_window_shrink_blocks_until_window_update() {
         .set_read_timeout(Some(Duration::from_secs(2)))
         .expect("restore read timeout");
     write_window_update(&mut stream, 1, 1);
+    assert_eq!(read_response_body(&mut stream, 1), b"0");
+    harness.shutdown();
+}
+
+#[test]
+fn http2_settings_initial_window_increase_unblocks_pending_response() {
+    let harness = Http2Harness::start(Http2ServerConfig::default());
+    let mut stream = connect_h2(harness.addr);
+    write_settings(&mut stream, &[(SETTINGS_INITIAL_WINDOW_SIZE, 0)]);
+    let ack = read_frame(&mut stream);
+    assert_eq!(ack.ty, FRAME_SETTINGS);
+    assert_ne!(ack.flags & FLAG_ACK, 0);
+
+    write_frame(
+        &mut stream,
+        FRAME_HEADERS,
+        FLAG_END_HEADERS | FLAG_END_STREAM,
+        1,
+        &request_headers("GET", "/counter"),
+    );
+
+    stream
+        .set_read_timeout(Some(Duration::from_millis(150)))
+        .expect("short read timeout");
+    assert!(
+        read_frame_result(&mut stream).is_err(),
+        "zero peer stream window should park outbound response DATA"
+    );
+
+    write_settings(&mut stream, &[(SETTINGS_INITIAL_WINDOW_SIZE, 1)]);
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .expect("restore read timeout");
     assert_eq!(read_response_body(&mut stream, 1), b"0");
     harness.shutdown();
 }
@@ -1329,6 +1434,34 @@ fn http2_inbound_data_obeys_stream_window() {
 }
 
 #[test]
+fn http2_zero_stream_window_update_resets_only_bad_stream() {
+    let harness = Http2Harness::start(Http2ServerConfig::default());
+    let mut stream = connect_h2(harness.addr);
+
+    write_frame(
+        &mut stream,
+        FRAME_HEADERS,
+        FLAG_END_HEADERS,
+        1,
+        &request_headers("POST", "/echo"),
+    );
+    write_window_update(&mut stream, 1, 0);
+
+    let frame = read_until_rst(&mut stream, 1);
+    assert_eq!(rst_stream_error_code(&frame), ERR_PROTOCOL_ERROR);
+
+    write_frame(
+        &mut stream,
+        FRAME_HEADERS,
+        FLAG_END_HEADERS | FLAG_END_STREAM,
+        3,
+        &request_headers("GET", "/counter"),
+    );
+    assert_eq!(read_response_body(&mut stream, 3), b"0");
+    harness.shutdown();
+}
+
+#[test]
 fn http2_data_consumption_returns_window_credit() {
     let harness = Http2Harness::start(Http2ServerConfig::default());
     let mut stream = connect_h2(harness.addr);
@@ -1363,5 +1496,61 @@ fn http2_data_consumption_returns_window_credit() {
     assert!(saw_connection_credit);
     assert!(saw_stream_credit);
     assert_eq!(body, b"abc");
+    harness.shutdown();
+}
+
+#[test]
+fn http2_padded_data_returns_window_credit_for_full_payload() {
+    let harness = Http2Harness::start(Http2ServerConfig::default());
+    let mut stream = connect_h2(harness.addr);
+
+    write_frame(
+        &mut stream,
+        FRAME_HEADERS,
+        FLAG_END_HEADERS,
+        1,
+        &request_headers("POST", "/echo"),
+    );
+    let mut payload = vec![2];
+    payload.extend_from_slice(b"abc");
+    payload.extend_from_slice(b"zz");
+    write_frame(
+        &mut stream,
+        FRAME_DATA,
+        FLAG_PADDED | FLAG_END_STREAM,
+        1,
+        &payload,
+    );
+
+    let mut connection_credit = None;
+    let mut stream_credit = None;
+    let mut body = Vec::new();
+    for _ in 0..10 {
+        let frame = read_frame(&mut stream);
+        match frame.ty {
+            FRAME_WINDOW_UPDATE if frame.stream_id == 0 => {
+                connection_credit = Some(window_update_increment(&frame));
+            }
+            FRAME_WINDOW_UPDATE if frame.stream_id == 1 => {
+                stream_credit = Some(window_update_increment(&frame));
+            }
+            FRAME_DATA if frame.stream_id == 1 => {
+                body.extend_from_slice(&frame.payload);
+                if frame.flags & FLAG_END_STREAM != 0 {
+                    break;
+                }
+            }
+            FRAME_HEADERS if frame.stream_id == 1 => {}
+            other => panic!("unexpected frame {other}: {frame:?}"),
+        }
+    }
+
+    assert_eq!(body, b"abc", "service sees only unpadded data bytes");
+    assert_eq!(
+        connection_credit,
+        Some(6),
+        "flow credit includes pad length"
+    );
+    assert_eq!(stream_credit, Some(6), "flow credit includes padding bytes");
     harness.shutdown();
 }

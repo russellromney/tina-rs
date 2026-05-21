@@ -1,6 +1,46 @@
 use super::*;
 use tina::RestartPolicy;
 
+#[derive(Debug)]
+struct PanickingRestartFactoryRoot {
+    factory_calls: Rc<Cell<usize>>,
+}
+
+impl Isolate for PanickingRestartFactoryRoot {
+    type Message = LineageMsg;
+    type Reply = ();
+    type Send = Outbound<NeverOutbound>;
+    type Spawn = tina::RestartableChildDefinition<ChildIsolate>;
+    type SpawnObserved = std::convert::Infallible;
+    type Call = std::convert::Infallible;
+    type Fact = ::std::convert::Infallible;
+    type Shard = TestShard;
+
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
+        match msg {
+            LineageMsg::SpawnChild => {
+                let factory_calls = Rc::clone(&self.factory_calls);
+                Effect::Spawn(tina::RestartableChildDefinition::new(
+                    move || {
+                        let call = factory_calls.get();
+                        factory_calls.set(call + 1);
+                        assert_eq!(call, 0, "restart factory panicked");
+                        ChildIsolate { leaf_capacity: 3 }
+                    },
+                    3,
+                ))
+            }
+            LineageMsg::Stop => Effect::Stop,
+            LineageMsg::Panic => panic!("panic inside panicking-factory root"),
+            LineageMsg::Restart | LineageMsg::SpawnGrandchild => Effect::Noop,
+        }
+    }
+}
+
 #[test]
 fn supervised_one_for_one_restarts_only_failed_child() {
     let factory_calls = Rc::new(Cell::new(0));
@@ -81,6 +121,58 @@ fn supervised_one_for_one_restarts_only_failed_child() {
             } if *failed_child == first_child
         )
     }));
+}
+
+#[test]
+fn supervised_restart_factory_panic_is_contained_and_skipped() {
+    let factory_calls = Rc::new(Cell::new(0));
+    let mut runtime = Runtime::new(TestShard, TestMailboxFactory);
+    let root = runtime.register(
+        PanickingRestartFactoryRoot {
+            factory_calls: Rc::clone(&factory_calls),
+        },
+        root_mailbox(),
+    );
+    runtime.supervise(
+        root,
+        SupervisorConfig::new(RestartPolicy::OneForOne, tina::RestartBudget::new(3)),
+    );
+
+    assert_eq!(runtime.try_send(root, LineageMsg::SpawnChild), Ok(()));
+    assert_eq!(runtime.step(), 1);
+    let child = last_spawned_child(runtime.trace());
+
+    assert_eq!(
+        runtime.try_send(lineage_address(child), LineageMsg::Panic),
+        Ok(())
+    );
+    let step_result = catch_unwind(AssertUnwindSafe(|| runtime.step()));
+    assert!(
+        step_result.is_ok(),
+        "restart factory panic must not escape the runtime step"
+    );
+
+    assert_eq!(factory_calls.get(), 2, "initial spawn + failed restart");
+    assert!(
+        runtime.trace().iter().any(|event| matches!(
+            event.kind(),
+            RuntimeEventKind::RestartChildSkipped {
+                old_isolate,
+                reason: RestartSkippedReason::FactoryPanicked,
+                ..
+            } if old_isolate == child
+        )),
+        "factory panic must become a visible restart-skip event"
+    );
+    assert!(
+        !runtime
+            .trace()
+            .iter()
+            .any(|event| matches!(event.kind(), RuntimeEventKind::RestartChildCompleted { .. })),
+        "failed factory must not report a completed restart"
+    );
+    assert_eq!(runtime.try_send(root, LineageMsg::Stop), Ok(()));
+    assert_eq!(runtime.step(), 1, "supervisor shard remains usable");
 }
 
 #[test]

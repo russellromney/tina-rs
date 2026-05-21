@@ -130,6 +130,9 @@ pub(super) fn add_header(
     ) {
         return Err(Http2ProtocolError::InvalidPseudoHeaders);
     }
+    if name == "te" && !value.trim().eq_ignore_ascii_case("trailers") {
+        return Err(Http2ProtocolError::InvalidPseudoHeaders);
+    }
     out.saw_regular = true;
     let header_name = HeaderName::from_bytes(name.as_bytes())
         .map_err(|_| Http2ProtocolError::InvalidPseudoHeaders)?;
@@ -235,7 +238,13 @@ pub(super) fn encode_response_trailers(response: &HttpResponse) -> Option<Vec<u8
 /// Validate the required pseudo-headers and authority/Host rule for an inbound
 /// HTTP/2 request. `:status` must not appear on requests.
 pub(super) fn validate_request_headers(headers: &HeaderBlock) -> Result<(), Http2ProtocolError> {
-    if headers.method.is_none() || headers.path.is_none() || headers.scheme.is_none() {
+    if headers.method.is_none() || headers.scheme.is_none() {
+        return Err(Http2ProtocolError::InvalidPseudoHeaders);
+    }
+    let Some(path) = headers.path.as_deref() else {
+        return Err(Http2ProtocolError::InvalidPseudoHeaders);
+    };
+    if !is_valid_request_path(path) {
         return Err(Http2ProtocolError::InvalidPseudoHeaders);
     }
     let has_authority = headers.authority.as_deref().is_some_and(|v| !v.is_empty())
@@ -251,6 +260,14 @@ pub(super) fn validate_request_headers(headers: &HeaderBlock) -> Result<(), Http
         return Err(Http2ProtocolError::InvalidPseudoHeaders);
     }
     Ok(())
+}
+
+fn is_valid_request_path(path: &str) -> bool {
+    // Tina's first HTTP/2 server accepts origin-form request paths.
+    // CONNECT/asterisk/empty targets are not first-form features. Raw
+    // whitespace/control bytes are rejected so a path cannot smuggle
+    // ambiguous downstream routing text.
+    path.starts_with('/') && path.bytes().all(|byte| byte > b' ' && byte != 0x7f)
 }
 
 /// Validate the required pseudo-headers for an inbound HTTP/2 response.
@@ -288,4 +305,48 @@ pub(super) fn validate_trailer_block(headers: &HeaderBlock) -> Result<(), Http2P
         return Err(Http2ProtocolError::ContentLengthMismatch);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn valid_request_headers(path: &str) -> HeaderBlock {
+        let mut headers = HeaderBlock::default();
+        add_header(&mut headers, ":method", "GET", 1024).unwrap();
+        add_header(&mut headers, ":scheme", "http", 1024).unwrap();
+        add_header(&mut headers, ":authority", "example.com", 1024).unwrap();
+        add_header(&mut headers, ":path", path, 1024).unwrap();
+        headers
+    }
+
+    #[test]
+    fn request_path_pseudo_header_must_not_be_empty() {
+        let headers = valid_request_headers("");
+        assert_eq!(
+            validate_request_headers(&headers),
+            Err(Http2ProtocolError::InvalidPseudoHeaders)
+        );
+    }
+
+    #[test]
+    fn request_path_pseudo_header_must_be_origin_form() {
+        for path in ["pkg.Service/Unary", "*", "http://example.com/x"] {
+            let headers = valid_request_headers(path);
+            assert_eq!(
+                validate_request_headers(&headers),
+                Err(Http2ProtocolError::InvalidPseudoHeaders),
+                "path {path:?} must reject"
+            );
+        }
+    }
+
+    #[test]
+    fn request_path_pseudo_header_rejects_control_bytes() {
+        let headers = valid_request_headers("/safe\r\nbad");
+        assert_eq!(
+            validate_request_headers(&headers),
+            Err(Http2ProtocolError::InvalidPseudoHeaders)
+        );
+    }
 }

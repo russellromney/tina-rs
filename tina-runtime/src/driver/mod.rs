@@ -1071,15 +1071,14 @@ mod tests {
 
     #[test]
     fn tls_lane_deadline_tombstones_queued_work_until_late_completion() {
-        let (command_sender, _command_receiver) = sync_channel(1);
         let (completion_sender, completions) = sync_channel(1);
         let cancelled = Arc::new(AtomicBool::new(false));
         let now = Instant::now();
         let mut lane = TlsWorkerLane {
             capacity: 1,
-            sender: Some(command_sender),
+            completion_sender: Some(completion_sender.clone()),
             completions,
-            handle: None,
+            handles: Vec::new(),
             pending: vec![TlsPending {
                 call_id: CallId::new(42),
                 lane: TlsPendingLane::Connect(CallId::new(42)),

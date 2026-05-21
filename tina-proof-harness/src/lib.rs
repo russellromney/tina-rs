@@ -20,5 +20,5 @@ pub mod live_replay;
 pub mod load;
 
 pub use bad_peer::{BadPeerOutcome, BadPeerScenario};
-pub use live_replay::{LiveTrace, LiveTraceHandle};
+pub use live_replay::{LiveTrace, LiveTraceHandle, LiveTraceLoss};
 pub use load::{LoadReport, LoadRun, LoadStop, OpOutcome};
