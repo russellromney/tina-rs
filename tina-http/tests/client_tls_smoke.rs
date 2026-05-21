@@ -1,6 +1,4 @@
-//! Native HTTPS client tests against a thread-spawned rustls server
-//! (Tina's TLS lane has one worker — server and client cannot share
-//! a runtime).
+//! Native HTTPS client tests against a thread-spawned rustls server.
 
 use std::convert::Infallible;
 use std::io::{Read, Write};

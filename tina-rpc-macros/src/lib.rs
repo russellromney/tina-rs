@@ -209,6 +209,11 @@ struct MethodArg {
     ty: Type,
 }
 
+/// Parameter names the generated `<method>_request` constructor appends after
+/// the user's method args. A trait method arg sharing one of these names would
+/// collide; [`extract_method`] rejects it with a spanned diagnostic.
+const RESERVED_REQUEST_PARAMS: [&str; 4] = ["deadline", "correlator", "reply_to", "max_payload"];
+
 fn extract_method(method: &TraitItemFn) -> Result<MethodSig> {
     if method.sig.asyncness.is_some() {
         return Err(Error::new_spanned(
@@ -300,6 +305,20 @@ fn extract_method(method: &TraitItemFn) -> Result<MethodSig> {
                 ));
             }
         };
+        // The generated `<method>_request` constructor appends these
+        // reserved parameters after the user's args. A method arg with one
+        // of these names collides (E0415 duplicate parameter) deep inside
+        // generated code; reject it here with a clear, spanned diagnostic.
+        if RESERVED_REQUEST_PARAMS.contains(&name.to_string().as_str()) {
+            return Err(Error::new_spanned(
+                &name,
+                format!(
+                    "argument name `{name}` is reserved by the generated \
+                     `{}_request` constructor; rename this parameter",
+                    method.sig.ident
+                ),
+            ));
+        }
         args.push(MethodArg {
             name,
             ty: (*typed.ty).clone(),

@@ -14,7 +14,7 @@ path = "src/lib.rs"
 tina = { path = "../tina" }
 tina-runtime = { path = "../tina-runtime" }
 tina-rpc = { path = "../tina-rpc" }
-tokio = { version = "1", features = ["sync", "time", "rt"] }
+tokio = { version = "1", features = ["sync", "time", "rt", "macros"] }
 tracing = { version = "0.1", default-features = false, features = ["std", "attributes"], optional = true }
 
 [features]

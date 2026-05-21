@@ -62,6 +62,9 @@ fn classify_s3_error(err: &S3Error) -> BridgeOutcomeClass {
             BridgeOutcomeClass::Fatal(BridgeFatal::TooLarge)
         }
         S3Error::InvalidRequest(_) => BridgeOutcomeClass::Fatal(BridgeFatal::InvalidRequest),
+        S3Error::NotFound(_) => BridgeOutcomeClass::Fatal(BridgeFatal::NotFound),
+        S3Error::AccessDenied(_) => BridgeOutcomeClass::Fatal(BridgeFatal::AccessDenied),
+        S3Error::Throttled(_) => BridgeOutcomeClass::Retryable(BridgeRetryable::ServiceThrottled),
         S3Error::Sdk(_) | S3Error::Body(_) => BridgeOutcomeClass::Fatal(BridgeFatal::SdkUnknown),
         S3Error::Internal(_) => BridgeOutcomeClass::Fatal(BridgeFatal::Internal),
     }
@@ -262,6 +265,33 @@ mod tests {
             outcome.classify(),
             BridgeOutcomeClass::Fatal(BridgeFatal::SdkUnknown)
         ));
+    }
+
+    #[test]
+    fn s3_throttled_classifies_as_retryable_service_pressure() {
+        let outcome: CallOutcome<Result<S3Response, S3Error>> =
+            CallOutcome::Replied(Err(S3Error::Throttled("SlowDown".into())));
+        assert_eq!(
+            outcome.classify(),
+            BridgeOutcomeClass::Retryable(BridgeRetryable::ServiceThrottled)
+        );
+    }
+
+    #[test]
+    fn s3_access_denied_and_not_found_are_fatal_typed_causes() {
+        let denied: CallOutcome<Result<S3Response, S3Error>> =
+            CallOutcome::Replied(Err(S3Error::AccessDenied("no".into())));
+        assert_eq!(
+            denied.classify(),
+            BridgeOutcomeClass::Fatal(BridgeFatal::AccessDenied)
+        );
+
+        let not_found: CallOutcome<Result<S3Response, S3Error>> =
+            CallOutcome::Replied(Err(S3Error::NotFound("missing".into())));
+        assert_eq!(
+            not_found.classify(),
+            BridgeOutcomeClass::Fatal(BridgeFatal::NotFound)
+        );
     }
 
     #[test]

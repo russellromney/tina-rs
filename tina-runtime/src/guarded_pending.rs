@@ -83,6 +83,8 @@ pub struct GuardedPendingReplies<K, R, G> {
     capacity: usize,
     slots: Vec<Option<GuardedEntry<K, R, G>>>,
     generations: Vec<u64>,
+    free_slots: Vec<usize>,
+    current: usize,
     high_water: usize,
     full_rejects: u64,
     reclaimed: u64,
@@ -93,10 +95,9 @@ pub struct GuardedPendingReplies<K, R, G> {
 
 impl<K, R, G> std::fmt::Debug for GuardedPendingReplies<K, R, G> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let live = self.slots.iter().filter(|s| s.is_some()).count();
         f.debug_struct("GuardedPendingReplies")
             .field("capacity", &self.capacity)
-            .field("len", &live)
+            .field("len", &self.current)
             .field("high_water", &self.high_water)
             .field("full_rejects", &self.full_rejects)
             .field("reclaimed", &self.reclaimed)
@@ -272,15 +273,21 @@ where
         );
         let mut slots = Vec::with_capacity(capacity);
         let mut generations = Vec::with_capacity(capacity);
+        let mut free_slots = Vec::with_capacity(capacity);
         for _ in 0..capacity {
             slots.push(None);
             generations.push(0);
+        }
+        for idx in (0..capacity).rev() {
+            free_slots.push(idx);
         }
         let seq = mint_guarded_seq();
         Self {
             capacity,
             slots,
             generations,
+            free_slots,
+            current: 0,
             high_water: 0,
             full_rejects: 0,
             reclaimed: 0,
@@ -336,12 +343,12 @@ where
 
     /// Number of occupied slots.
     pub fn len(&self) -> usize {
-        self.slots.iter().filter(|s| s.is_some()).count()
+        self.current
     }
 
     /// True when no slot is occupied.
     pub fn is_empty(&self) -> bool {
-        self.slots.iter().all(|s| s.is_none())
+        self.current == 0
     }
 
     /// Highest live count observed since construction.
@@ -369,13 +376,12 @@ where
     /// for each reclaimed slot is dropped here.
     pub fn sweep(&mut self) -> usize {
         let mut reclaimed = 0;
-        for slot in self.slots.iter_mut() {
+        for idx in 0..self.slots.len() {
             let take = matches!(
-                slot.as_ref().map(|e| e.reply.state()),
+                self.slots[idx].as_ref().map(|e| e.reply.state()),
                 Some(DeferredSlotState::Closed)
             );
-            if take {
-                slot.take();
+            if take && self.remove_slot(idx).is_some() {
                 reclaimed += 1;
                 self.reclaimed += 1;
             }
@@ -391,7 +397,9 @@ where
         reply: DeferredReply<R>,
         guard: G,
     ) -> Result<GuardedParkTicket<K>, GuardedInsertError<K, R, G>> {
-        self.sweep();
+        if self.free_slots.is_empty() {
+            self.sweep();
+        }
 
         if self
             .slots
@@ -401,7 +409,7 @@ where
             self.duplicate_keys += 1;
             return Err(GuardedInsertError::DuplicateKey { key, reply, guard });
         }
-        if self.len() >= self.capacity {
+        if self.free_slots.is_empty() {
             self.full_rejects += 1;
             return Err(GuardedInsertError::Full { key, reply, guard });
         }
@@ -420,7 +428,9 @@ where
         I: Isolate<Reply = R>,
         R: 'static,
     {
-        self.sweep();
+        if self.free_slots.is_empty() {
+            self.sweep();
+        }
 
         if self
             .slots
@@ -430,7 +440,7 @@ where
             self.duplicate_keys += 1;
             return Err(GuardedParkError::DuplicateKey { key, call, guard });
         }
-        if self.len() >= self.capacity {
+        if self.free_slots.is_empty() {
             self.full_rejects += 1;
             return Err(GuardedParkError::Full { key, call, guard });
         }
@@ -450,7 +460,9 @@ where
         I: Isolate<Reply = R>,
         R: 'static,
     {
-        self.sweep();
+        if self.free_slots.is_empty() {
+            self.sweep();
+        }
 
         if self
             .slots
@@ -460,7 +472,7 @@ where
             self.duplicate_keys += 1;
             return Err(GuardedParkCallError::DuplicateKey { key, call, guard });
         }
-        if self.len() >= self.capacity {
+        if self.free_slots.is_empty() {
             self.full_rejects += 1;
             return Err(GuardedParkCallError::Full { key, call, guard });
         }
@@ -489,7 +501,7 @@ where
         if self.generations[ticket.slot] != ticket.generation {
             return Err(GuardedTakeError::StaleTicket);
         }
-        let Some(entry) = self.slots[ticket.slot].take() else {
+        let Some(entry) = self.remove_slot(ticket.slot) else {
             return Err(GuardedTakeError::Missing);
         };
         Ok((entry.reply, entry.guard))
@@ -531,10 +543,12 @@ where
     /// stale-key ABA unreachable. Prefer [`take_ticket`](Self::take_ticket)
     /// for new code.
     pub fn take_by_key(&mut self, key: &K) -> Option<(DeferredReply<R>, G)> {
-        for slot in self.slots.iter_mut() {
-            let matches = slot.as_ref().is_some_and(|e| &e.key == key);
+        for idx in 0..self.slots.len() {
+            let matches = self.slots[idx].as_ref().is_some_and(|e| &e.key == key);
             if matches {
-                return slot.take().map(|entry| (entry.reply, entry.guard));
+                return self
+                    .remove_slot(idx)
+                    .map(|entry| (entry.reply, entry.guard));
             }
         }
         None
@@ -545,8 +559,8 @@ where
     /// terminal facts on shutdown.
     pub fn drain(&mut self) -> Vec<(K, DeferredReply<R>, G)> {
         let mut out = Vec::new();
-        for slot in self.slots.iter_mut() {
-            if let Some(entry) = slot.take() {
+        for idx in 0..self.slots.len() {
+            if let Some(entry) = self.remove_slot(idx) {
                 out.push((entry.key, entry.reply, entry.guard));
             }
         }
@@ -555,18 +569,30 @@ where
 
     fn store_entry(&mut self, key: K, reply: DeferredReply<R>, guard: G) -> GuardedParkTicket<K> {
         let idx = self
-            .slots
-            .iter()
-            .position(|s| s.is_none())
+            .free_slots
+            .pop()
             .expect("admission already proved a free slot is available");
+        debug_assert!(self.slots[idx].is_none());
         self.generations[idx] = self.generations[idx].wrapping_add(1);
         let generation = self.generations[idx];
         self.slots[idx] = Some(GuardedEntry { key, reply, guard });
-        let cur = self.len();
-        if cur > self.high_water {
-            self.high_water = cur;
+        self.current += 1;
+        if self.current > self.high_water {
+            self.high_water = self.current;
         }
         GuardedParkTicket::new(idx, generation)
+    }
+
+    fn remove_slot(&mut self, idx: usize) -> Option<GuardedEntry<K, R, G>> {
+        let entry = self.slots[idx].take();
+        if entry.is_some() {
+            self.current = self
+                .current
+                .checked_sub(1)
+                .expect("GuardedPendingReplies current count underflow");
+            self.free_slots.push(idx);
+        }
+        entry
     }
 }
 
@@ -719,13 +745,33 @@ mod tests {
         box_.insert_deferred_guarded(2, fake_slot_closed(11), mint())
             .unwrap();
         assert_eq!(count.get(), 0, "no guard dropped yet");
-        // Next insert sweeps the Closed slot, dropping its guard.
+        // Hot-path admissions do not scan the whole table when free
+        // slots remain. Explicit sweep is the caller-gone cleanup point.
         box_.insert_deferred_guarded(3, fake_slot(12), mint())
             .unwrap();
+        assert_eq!(count.get(), 0, "free admission does not sweep");
+        let reclaimed = box_.sweep();
+        assert_eq!(reclaimed, 1);
         assert_eq!(count.get(), 1, "Closed slot's guard dropped on sweep");
         // Explicit sweep does no further work.
         let reclaimed = box_.sweep();
         assert_eq!(reclaimed, 0);
+        assert_eq!(count.get(), 1);
+    }
+
+    #[test]
+    fn full_path_sweeps_closed_slot_before_rejecting() {
+        let (count, mint) = counter();
+        let mut box_ = GuardedPendingReplies::<u32, u32, DropCounter>::with_capacity(1);
+        box_.insert_deferred_guarded(1, fake_slot_closed(10), mint())
+            .unwrap();
+        assert_eq!(box_.len(), 1);
+        assert_eq!(count.get(), 0);
+
+        box_.insert_deferred_guarded(2, fake_slot(11), mint())
+            .expect("closed full table should reclaim then admit");
+        assert_eq!(box_.len(), 1);
+        assert_eq!(box_.reclaimed(), 1);
         assert_eq!(count.get(), 1);
     }
 
@@ -778,7 +824,9 @@ mod tests {
             req: RequestContext<R>,
             guard: G,
         ) -> Result<GuardedParkTicket<K>, ()> {
-            self.sweep();
+            if self.free_slots.is_empty() {
+                self.sweep();
+            }
             if self
                 .slots
                 .iter()
@@ -786,7 +834,7 @@ mod tests {
             {
                 return Err(());
             }
-            if self.len() >= self.capacity {
+            if self.free_slots.is_empty() {
                 return Err(());
             }
             Ok(self.store_entry(key, req.into_deferred(), guard))

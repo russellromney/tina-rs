@@ -19,3 +19,4 @@ serde_json = { version = "1.0", default-features = false, features = ["std"] }
 
 [dev-dependencies]
 proptest = { version = "1.6.0", default-features = false, features = ["std"] }
+trybuild = "1"

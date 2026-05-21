@@ -203,6 +203,17 @@ fn journal_index_path(path: &Path) -> PathBuf {
     ))
 }
 
+fn temp_journal_index_path(path: &Path) -> PathBuf {
+    let n = SNAPSHOT_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    path.with_extension(format!(
+        "{}idx.tmp.{n}",
+        path.extension()
+            .and_then(std::ffi::OsStr::to_str)
+            .map(|ext| format!("{ext}."))
+            .unwrap_or_default()
+    ))
+}
+
 fn load_journal_last_index(path: &Path) -> Result<Option<u64>, CallError> {
     let index_path = journal_index_path(path);
     let mut file = match OpenOptions::new().read(true).open(index_path) {
@@ -210,14 +221,22 @@ fn load_journal_last_index(path: &Path) -> Result<Option<u64>, CallError> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(_) => return Err(CallError::Io),
     };
-    let mut bytes = [0_u8; JOURNAL_INDEX_BYTES];
-    file.read_exact(&mut bytes)
-        .map_err(|_| CallError::CorruptRecord)?;
-    if &bytes[..8] != JOURNAL_INDEX_MAGIC {
-        return Err(CallError::CorruptRecord);
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).map_err(|_| CallError::Io)?;
+    if bytes.len() != JOURNAL_INDEX_BYTES {
+        return Ok(None);
     }
-    let last_index = read_u64(&bytes, 8).ok_or(CallError::CorruptRecord)?;
-    let expected_len = read_u64(&bytes, 16).ok_or(CallError::CorruptRecord)?;
+    if &bytes[..8] != JOURNAL_INDEX_MAGIC {
+        return Ok(None);
+    }
+    let last_index = match read_u64(&bytes, 8) {
+        Some(value) => value,
+        None => return Ok(None),
+    };
+    let expected_len = match read_u64(&bytes, 16) {
+        Some(value) => value,
+        None => return Ok(None),
+    };
     let actual_len = match fs::metadata(path) {
         Ok(metadata) => metadata.len(),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -231,19 +250,34 @@ fn load_journal_last_index(path: &Path) -> Result<Option<u64>, CallError> {
 
 fn store_journal_last_index(path: &Path, last_index: u64, file_len: u64) -> Result<(), CallError> {
     let index_path = journal_index_path(path);
-    let mut file = OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .write(true)
-        .open(index_path)
-        .map_err(|_| CallError::Io)?;
-    file.write_all(JOURNAL_INDEX_MAGIC)
-        .map_err(|_| CallError::Io)?;
-    file.write_all(&last_index.to_le_bytes())
-        .map_err(|_| CallError::Io)?;
-    file.write_all(&file_len.to_le_bytes())
-        .map_err(|_| CallError::Io)?;
-    file.sync_all().map_err(|_| CallError::Io)
+    let temp_path = temp_journal_index_path(path);
+    let write_result = (|| {
+        let mut file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&temp_path)
+            .map_err(|_| CallError::Io)?;
+        file.write_all(JOURNAL_INDEX_MAGIC)
+            .map_err(|_| CallError::Io)?;
+        file.write_all(&last_index.to_le_bytes())
+            .map_err(|_| CallError::Io)?;
+        file.write_all(&file_len.to_le_bytes())
+            .map_err(|_| CallError::Io)?;
+        file.sync_all().map_err(|_| CallError::Io)
+    })();
+    if let Err(error) = write_result {
+        let _ = fs::remove_file(&temp_path);
+        return Err(error);
+    }
+    if fs::rename(&temp_path, &index_path).is_err() {
+        let _ = fs::remove_file(&temp_path);
+        return Err(CallError::Io);
+    }
+    if sync_parent_directory(parent_directory(&index_path)).is_err() {
+        return Err(CallError::CommitUncertain);
+    }
+    Ok(())
 }
 
 fn repair_journal_tail(path: &Path, valid_prefix_len: u64) -> Result<(), CallError> {

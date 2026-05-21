@@ -1,7 +1,7 @@
 //! TLS lane and stream wrappers: rustls-backed TLS over Tina's runtime
-//! TCP, plus the per-shard worker thread that performs handshake / read /
-//! write / close on the substrate. `tls_lane_capacity` is queue depth, not
-//! concurrency; one worker drains the lane serially today.
+//! TCP, plus bounded per-operation worker threads that perform handshake /
+//! read / write / close on the substrate. `tls_lane_capacity` bounds
+//! in-flight TLS work for the shard.
 
 use super::*;
 
@@ -70,9 +70,9 @@ pub(super) enum TlsLane {
 
 pub(super) struct TlsWorkerLane {
     pub(super) capacity: usize,
-    pub(super) sender: Option<SyncSender<TlsCommand>>,
+    pub(super) completion_sender: Option<SyncSender<TlsCompletion>>,
     pub(super) completions: Receiver<TlsCompletion>,
-    pub(super) handle: Option<JoinHandle<()>>,
+    pub(super) handles: Vec<JoinHandle<()>>,
     pub(super) pending: Vec<TlsPending>,
     pub(super) listeners: Vec<TlsListenerEntry>,
     pub(super) streams: Vec<TlsStreamEntry>,
@@ -318,14 +318,12 @@ impl Drop for TlsLane {
 impl TlsWorkerLane {
     pub(super) fn new(capacity: usize) -> Self {
         assert!(capacity > 0, "TLS lane capacity must be > 0");
-        let (sender, receiver) = sync_channel(capacity);
         let (completion_sender, completions) = sync_channel(capacity.saturating_add(1));
-        let handle = thread::spawn(move || tls_worker_loop(receiver, completion_sender));
         Self {
             capacity,
-            sender: Some(sender),
+            completion_sender: Some(completion_sender),
             completions,
-            handle: Some(handle),
+            handles: Vec::with_capacity(capacity.min(INITIAL_DRIVER_PENDING_CAPACITY)),
             pending: Vec::with_capacity(capacity.min(INITIAL_DRIVER_PENDING_CAPACITY)),
             listeners: Vec::with_capacity(INITIAL_DRIVER_RESOURCE_CAPACITY),
             streams: Vec::with_capacity(INITIAL_DRIVER_RESOURCE_CAPACITY),
@@ -586,7 +584,7 @@ impl TlsWorkerLane {
                 result: CallOutput::Failed(CallError::Timeout),
             });
         }
-        let Some(sender) = &self.sender else {
+        let Some(completion_sender) = &self.completion_sender else {
             return Some(DriverCompletion {
                 call_id,
                 result: CallOutput::Failed(CallError::TlsClosed),
@@ -599,8 +597,21 @@ impl TlsWorkerLane {
             });
         }
         command.set_cancelled(Arc::clone(&cancelled));
-        match sender.try_send(command) {
-            Ok(()) => {
+        let completion_sender = completion_sender.clone();
+        let spawn = thread::Builder::new()
+            .name(format!("tina-tls-{call_id:?}"))
+            .spawn(move || {
+                let call_id = command.call_id();
+                let result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    execute_tls_command(command)
+                })) {
+                    Ok(result) => result,
+                    Err(_) => TlsCompletionResult::Output(CallOutput::Failed(CallError::Io)),
+                };
+                let _ = completion_sender.send(TlsCompletion { call_id, result });
+            });
+        match spawn {
+            Ok(handle) => {
                 self.pending.push(TlsPending {
                     call_id,
                     lane,
@@ -608,15 +619,12 @@ impl TlsWorkerLane {
                     cancelled,
                     timed_out: false,
                 });
+                self.handles.push(handle);
                 None
             }
-            Err(MpscTrySendError::Full(command)) => Some(DriverCompletion {
-                call_id: command.call_id(),
-                result: CallOutput::Failed(CallError::TlsFull),
-            }),
-            Err(MpscTrySendError::Disconnected(command)) => Some(DriverCompletion {
-                call_id: command.call_id(),
-                result: CallOutput::Failed(CallError::TlsClosed),
+            Err(_) => Some(DriverCompletion {
+                call_id,
+                result: CallOutput::Failed(CallError::Io),
             }),
         }
     }
@@ -652,11 +660,12 @@ impl TlsWorkerLane {
                 Ok(completion) => self.finish_completion(completion, completed),
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
-                    self.sender = None;
+                    self.completion_sender = None;
                     break;
                 }
             }
         }
+        self.reap_finished_workers();
     }
 
     pub(super) fn finish_completion(
@@ -758,38 +767,43 @@ impl TlsWorkerLane {
     }
 
     pub(super) fn cancel_pending(&mut self, deadline: Instant) {
-        // Drop the command sender so the worker thread can exit. Drain
-        // completions for the budget; remaining `self.pending` after the
-        // budget is stuck work that the worker has not finished and is
-        // surfaced through `resource_report`.
-        self.sender = None;
+        // Stop accepting new TLS work. Existing worker threads own
+        // cloned resources until they complete or the shutdown budget
+        // expires; remaining `self.pending` after the budget is stuck
+        // work and is surfaced through `resource_report`.
+        self.completion_sender = None;
         let mut sink = Vec::new();
         loop {
             self.drain_into_sink(&mut sink);
+            self.reap_finished_workers();
             if self.pending.is_empty() || Instant::now() >= deadline {
                 break;
             }
             thread::sleep(Duration::from_millis(1));
         }
         sink.clear();
-        if self
-            .handle
-            .as_ref()
-            .is_some_and(std::thread::JoinHandle::is_finished)
-        {
-            if let Some(handle) = self.handle.take() {
-                let _ = handle.join();
-            }
-            if self.pending.is_empty() {
-                self.listeners.clear();
-                self.streams.clear();
-            }
+        if self.pending.is_empty() {
+            self.listeners.clear();
+            self.streams.clear();
         }
     }
 
     pub(super) fn drain_into_sink(&mut self, sink: &mut Vec<DriverCompletion>) {
         while let Ok(completion) = self.completions.try_recv() {
             self.finish_completion(completion, sink);
+        }
+        self.reap_finished_workers();
+    }
+
+    pub(super) fn reap_finished_workers(&mut self) {
+        let mut index = 0;
+        while index < self.handles.len() {
+            if self.handles[index].is_finished() {
+                let handle = self.handles.swap_remove(index);
+                let _ = handle.join();
+            } else {
+                index += 1;
+            }
         }
     }
 
@@ -835,19 +849,6 @@ impl TlsWorkerLane {
 impl Drop for TlsWorkerLane {
     fn drop(&mut self) {
         self.cancel_pending(Instant::now());
-    }
-}
-
-pub(super) fn tls_worker_loop(
-    receiver: Receiver<TlsCommand>,
-    completions: SyncSender<TlsCompletion>,
-) {
-    while let Ok(command) = receiver.recv() {
-        let call_id = command.call_id();
-        let result = execute_tls_command(command);
-        if completions.send(TlsCompletion { call_id, result }).is_err() {
-            break;
-        }
     }
 }
 

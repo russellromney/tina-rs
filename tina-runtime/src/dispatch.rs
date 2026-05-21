@@ -75,8 +75,10 @@ where
     ) -> Result<(), DriverShutdownError> {
         let driver_result = self.driver.cancel_pending(deadline);
         self.translators.clear();
+        self.translator_indexes.clear();
 
         let in_flight_calls = std::mem::take(&mut self.in_flight_calls);
+        self.in_flight_call_indexes.clear();
         for call in in_flight_calls {
             self.push_event(
                 call.requester.isolate,
@@ -133,7 +135,10 @@ where
                 continue;
             }
 
-            let call = self.in_flight_calls.remove(index);
+            let call_id = self.in_flight_calls[index].call_id;
+            let call = self
+                .remove_in_flight_call(call_id)
+                .expect("indexed in-flight call exists");
             self.driver.cancel(call.call_id);
             self.remove_translator(call.call_id);
             self.push_event(
@@ -149,12 +154,50 @@ where
     }
 
     pub(crate) fn remove_translator(&mut self, call_id: CallId) {
-        let translator_index = self
-            .translators
-            .iter()
-            .position(|entry| entry.call_id == call_id)
+        self.remove_translator_entry(call_id)
             .unwrap_or_else(|| panic!("missing translator for call {call_id:?}"));
-        self.translators.remove(translator_index);
+    }
+
+    pub(crate) fn push_in_flight_call(&mut self, call: InFlightCall) {
+        let index = self.in_flight_calls.len();
+        let previous = self.in_flight_call_indexes.insert(call.call_id, index);
+        assert!(
+            previous.is_none(),
+            "duplicate in-flight call id {:?}",
+            call.call_id
+        );
+        self.in_flight_calls.push(call);
+    }
+
+    pub(crate) fn remove_in_flight_call(&mut self, call_id: CallId) -> Option<InFlightCall> {
+        let index = self.in_flight_call_indexes.remove(&call_id)?;
+        let removed = self.in_flight_calls.swap_remove(index);
+        if index < self.in_flight_calls.len() {
+            let moved = self.in_flight_calls[index].call_id;
+            self.in_flight_call_indexes.insert(moved, index);
+        }
+        Some(removed)
+    }
+
+    pub(crate) fn push_translator(&mut self, translator: StoredTranslator) {
+        let index = self.translators.len();
+        let previous = self.translator_indexes.insert(translator.call_id, index);
+        assert!(
+            previous.is_none(),
+            "duplicate translator for call {:?}",
+            translator.call_id
+        );
+        self.translators.push(translator);
+    }
+
+    pub(crate) fn remove_translator_entry(&mut self, call_id: CallId) -> Option<StoredTranslator> {
+        let index = self.translator_indexes.remove(&call_id)?;
+        let removed = self.translators.swap_remove(index);
+        if index < self.translators.len() {
+            let moved = self.translators[index].call_id;
+            self.translator_indexes.insert(moved, index);
+        }
+        Some(removed)
     }
 
     /// Runs one deterministic round over all registered isolates.
@@ -1045,7 +1088,7 @@ where
         // Register the translator and in-flight tracking before submission
         // so a synchronous completion (bind / close on Betelgeuse) can be
         // delivered through the same path as async completions.
-        self.in_flight_calls.push(InFlightCall {
+        self.push_in_flight_call(InFlightCall {
             call_id: context.call_id,
             call_kind,
             requester: context.requester,
@@ -1053,7 +1096,7 @@ where
             persistence,
             continuation_context: context.continuation_context,
         });
-        self.translators.push(StoredTranslator {
+        self.push_translator(StoredTranslator {
             call_id: context.call_id,
             translator: Some(translator),
         });
@@ -1077,22 +1120,11 @@ where
     /// Translator is not run; caller's continuation does not fire.
     /// Trace records `ResourceClosed`.
     pub(crate) fn cancel_in_flight_call_for_resource_close(&mut self, call_id: CallId) {
-        let Some(in_flight_index) = self
-            .in_flight_calls
-            .iter()
-            .position(|entry| entry.call_id == call_id)
-        else {
+        let Some(in_flight) = self.remove_in_flight_call(call_id) else {
             return;
         };
-        let in_flight = self.in_flight_calls.remove(in_flight_index);
 
-        if let Some(translator_index) = self
-            .translators
-            .iter()
-            .position(|entry| entry.call_id == call_id)
-        {
-            self.translators.remove(translator_index);
-        }
+        let _ = self.remove_translator_entry(call_id);
 
         self.push_event(
             in_flight.requester.isolate,
@@ -1795,19 +1827,13 @@ where
     }
 
     pub(crate) fn deliver_completion(&mut self, call_id: CallId, result: CallOutput) {
-        let in_flight_index = self
-            .in_flight_calls
-            .iter()
-            .position(|entry| entry.call_id == call_id)
+        let in_flight = self
+            .remove_in_flight_call(call_id)
             .unwrap_or_else(|| panic!("driver produced completion for unknown call {call_id:?}"));
-        let in_flight = self.in_flight_calls.remove(in_flight_index);
 
-        let translator_index = self
-            .translators
-            .iter()
-            .position(|entry| entry.call_id == call_id)
+        let mut stored = self
+            .remove_translator_entry(call_id)
             .unwrap_or_else(|| panic!("missing translator for call {call_id:?}"));
-        let mut stored = self.translators.remove(translator_index);
         let translator = stored
             .translator
             .take()
@@ -2269,7 +2295,23 @@ where
             }
         }
 
-        let outcome = recipe.create(self, parent);
+        let outcome = match catch_unwind(AssertUnwindSafe(|| recipe.create(self, parent))) {
+            Ok(outcome) => outcome,
+            Err(_) => {
+                self.child_records[child_record_index].restart_recipe = Some(recipe);
+                self.push_event(
+                    parent,
+                    Some(attempted.into()),
+                    RuntimeEventKind::RestartChildSkipped {
+                        child_ordinal,
+                        old_isolate: old_child.isolate,
+                        old_generation: old_child.generation,
+                        reason: RestartSkippedReason::FactoryPanicked,
+                    },
+                );
+                return;
+            }
+        };
         let new_child = outcome.child;
         let bootstrap_message = outcome.bootstrap_message;
         self.child_records[child_record_index].child = new_child;

@@ -322,6 +322,14 @@ async fn handle_s3(req: HyperRequest<Incoming>, state: S3State) -> HyperResponse
                 .body(Full::new(Bytes::new()))
                 .expect("put response")
         }
+        (Method::GET, false, false) if key == "slow-down" => {
+            s3_error_response(StatusCode::SERVICE_UNAVAILABLE, "SlowDown", "reduce rate")
+        }
+        (Method::GET, false, false) if key == "access-denied" => s3_error_response(
+            StatusCode::FORBIDDEN,
+            "AccessDenied",
+            "bucket access denied",
+        ),
         (Method::GET, false, false) => {
             let maybe = state
                 .objects
@@ -336,7 +344,7 @@ async fn handle_s3(req: HyperRequest<Incoming>, state: S3State) -> HyperResponse
                     .header("etag", "\"fake-etag\"")
                     .body(Full::new(Bytes::from(body)))
                     .expect("get response"),
-                None => response(StatusCode::NOT_FOUND, Bytes::new()),
+                None => s3_error_response(StatusCode::NOT_FOUND, "NoSuchKey", "missing key"),
             }
         }
         (Method::DELETE, false, false) => {
@@ -356,6 +364,17 @@ fn response(status: StatusCode, body: Bytes) -> HyperResponse<Body> {
         .status(status)
         .body(Full::new(body))
         .expect("response")
+}
+
+fn s3_error_response(status: StatusCode, code: &str, message: &str) -> HyperResponse<Body> {
+    let body = Bytes::from(format!(
+        "<Error><Code>{code}</Code><Message>{message}</Message></Error>"
+    ));
+    HyperResponse::builder()
+        .status(status)
+        .header("content-type", "application/xml")
+        .body(Full::new(body))
+        .expect("s3 error response")
 }
 
 #[test]
@@ -896,7 +915,7 @@ fn config_validation_rejects_zero_caps() {
 }
 
 #[test]
-fn sdk_http_error_maps_to_typed_error() {
+fn s3_not_found_maps_to_typed_error_and_classifier() {
     let s3 = FakeS3::spawn(Duration::ZERO);
     let cfg = s3_config(s3.endpoint_url());
     let runtime = make_runtime();
@@ -919,11 +938,106 @@ fn sdk_http_error_maps_to_typed_error() {
         )
         .expect("send");
     match sink.wait(Duration::from_secs(5)) {
-        tina_runtime::CallOutcome::Replied(Err(S3Error::Sdk(detail))) => {
-            assert!(!detail.is_empty());
+        tina_runtime::CallOutcome::Replied(Err(S3Error::NotFound(detail))) => {
+            assert!(
+                detail.contains("NoSuchKey"),
+                "typed error keeps SDK detail: {detail}"
+            );
         }
-        other => panic!("expected SDK error, got {other:?}"),
+        other => panic!("expected typed not-found error, got {other:?}"),
     }
+    assert_eq!(bridge.metrics.snapshot().sdk_errors, 1);
+    if let Ok(rt) = Arc::try_unwrap(runtime) {
+        let _ = rt.shutdown();
+    }
+    s3.stop();
+}
+
+#[test]
+fn s3_slowdown_maps_to_retryable_throttled_error() {
+    use tina_aws_bridge::{BridgeOutcomeClass, BridgeRetryable, S3OutcomeExt as _};
+
+    let s3 = FakeS3::spawn(Duration::ZERO);
+    let cfg = s3_config(s3.endpoint_url());
+    let runtime = make_runtime();
+    let bridge = install_bridge(&runtime, cfg);
+    let sink = Arc::new(Sink::default());
+    let caller = register_caller(
+        &runtime,
+        bridge.address,
+        Arc::clone(&sink),
+        Duration::from_secs(2),
+    );
+    runtime
+        .try_send(
+            caller,
+            CallerMsg::Run(S3Request::GetObject(S3GetObject {
+                bucket: "bucket".into(),
+                key: "slow-down".into(),
+                max_bytes: None,
+            })),
+        )
+        .expect("send");
+    let outcome = sink.wait(Duration::from_secs(5));
+    match &outcome {
+        tina_runtime::CallOutcome::Replied(Err(S3Error::Throttled(detail))) => {
+            assert!(
+                detail.contains("SlowDown"),
+                "typed error keeps SDK detail: {detail}"
+            );
+        }
+        other => panic!("expected typed throttled error, got {other:?}"),
+    }
+    assert_eq!(
+        outcome.classify(),
+        BridgeOutcomeClass::Retryable(BridgeRetryable::ServiceThrottled)
+    );
+    assert_eq!(bridge.metrics.snapshot().sdk_errors, 1);
+    if let Ok(rt) = Arc::try_unwrap(runtime) {
+        let _ = rt.shutdown();
+    }
+    s3.stop();
+}
+
+#[test]
+fn s3_access_denied_maps_to_typed_error_and_classifier() {
+    use tina_aws_bridge::{BridgeFatal, BridgeOutcomeClass, S3OutcomeExt as _};
+
+    let s3 = FakeS3::spawn(Duration::ZERO);
+    let cfg = s3_config(s3.endpoint_url());
+    let runtime = make_runtime();
+    let bridge = install_bridge(&runtime, cfg);
+    let sink = Arc::new(Sink::default());
+    let caller = register_caller(
+        &runtime,
+        bridge.address,
+        Arc::clone(&sink),
+        Duration::from_secs(2),
+    );
+    runtime
+        .try_send(
+            caller,
+            CallerMsg::Run(S3Request::GetObject(S3GetObject {
+                bucket: "bucket".into(),
+                key: "access-denied".into(),
+                max_bytes: None,
+            })),
+        )
+        .expect("send");
+    let outcome = sink.wait(Duration::from_secs(5));
+    match &outcome {
+        tina_runtime::CallOutcome::Replied(Err(S3Error::AccessDenied(detail))) => {
+            assert!(
+                detail.contains("AccessDenied"),
+                "typed error keeps SDK detail: {detail}"
+            );
+        }
+        other => panic!("expected typed access-denied error, got {other:?}"),
+    }
+    assert_eq!(
+        outcome.classify(),
+        BridgeOutcomeClass::Fatal(BridgeFatal::AccessDenied)
+    );
     assert_eq!(bridge.metrics.snapshot().sdk_errors, 1);
     if let Ok(rt) = Arc::try_unwrap(runtime) {
         let _ = rt.shutdown();

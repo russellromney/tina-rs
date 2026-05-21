@@ -1,0 +1,5 @@
+error: argument name `deadline` is reserved by the generated `charge_request` constructor; rename this parameter
+  --> tests/macro_compile_fail/reserved_arg_name.rs:10:26
+   |
+10 |     fn charge(&mut self, deadline: u64) -> u64;
+   |                          ^^^^^^^^

@@ -269,7 +269,7 @@ macro_rules! isolate_types {
             spawn: $spawn,
             spawn_observed: $spawn_observed,
             call: $call,
-            fact: ::std::convert::Infallible,
+            fact: ::core::convert::Infallible,
             shard: $shard,
         }
     };
@@ -287,7 +287,7 @@ macro_rules! isolate_types {
             reply: $reply,
             send: $send,
             spawn: $spawn,
-            spawn_observed: ::std::convert::Infallible,
+            spawn_observed: ::core::convert::Infallible,
             call: $call,
             fact: $fact,
             shard: $shard,
@@ -308,7 +308,7 @@ macro_rules! isolate_types {
             spawn: $spawn,
             spawn_observed: ::core::convert::Infallible,
             call: $call,
-            fact: ::std::convert::Infallible,
+            fact: ::core::convert::Infallible,
             shard: $shard,
         }
     };
@@ -411,11 +411,27 @@ pub mod runtime_internal {
     /// Build a request-lane effect after caller authority has already been
     /// consumed.
     ///
-    /// This is intentionally hidden under `runtime_internal` so copied app code
-    /// cannot casually manufacture a request effect from `noop()`. Runtime-side
-    /// adapters use it after they have consumed a `RequestCall` into a
-    /// `RequestContext`.
-    pub fn request_effect_from_consumed_effect<I>(
+    /// Runtime-side adapters use this after they have consumed a `RequestCall`
+    /// into a `RequestContext`. It re-wraps an arbitrary [`crate::Effect`] into
+    /// a [`crate::RequestEffect`], so it can manufacture the "caller answered"
+    /// witness from a `noop()` — the exact bad state the split-service
+    /// must-answer rail forbids.
+    ///
+    /// It is `unsafe` for that reason, not for memory safety: it is the one
+    /// hole through the must-answer rail, so calling it is an explicit,
+    /// `unsafe`-gated, reviewable opt-out that `#![forbid(unsafe_code)]` app
+    /// crates reject outright. Ordinary code answers the caller through
+    /// [`crate::RequestCall`] / [`crate::RequestContext`] instead.
+    ///
+    /// # Safety
+    ///
+    /// The caller must already have consumed the `RequestCall` authority for
+    /// this request (e.g. via `RequestContext`), so that `effect` genuinely
+    /// represents answering — or deliberately not answering — that one caller.
+    /// Manufacturing a `RequestEffect` without consuming the authority breaks
+    /// the "every call settles exactly once" invariant.
+    #[allow(unsafe_code)]
+    pub unsafe fn request_effect_from_consumed_effect<I>(
         effect: crate::Effect<I>,
     ) -> crate::RequestEffect<I>
     where
