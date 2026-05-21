@@ -1895,8 +1895,13 @@ fn same_non_default_seed_faulted_multishard_dispatcher_replays_same_artifact() {
 
 #[test]
 fn different_seeds_can_diverge_in_faulted_multishard_dispatcher_replay() {
+    // Under the splitmix64-mixed selector (G2), seed 19's ordinal-0
+    // timer-wake decision fires the delay and seed 17's does not, so
+    // their final times diverge. Pre-G2 this was seeds 17 vs 18, which
+    // diverged only via the `ordinal == 0 -> seed % modulus`
+    // short-circuit the fix removed (both now resolve identically).
     let delayed = SimulatorConfig {
-        seed: 17,
+        seed: 19,
         faults: FaultConfig {
             timer_wake: FaultMode::DelayBy {
                 one_in: 2,
@@ -1907,7 +1912,7 @@ fn different_seeds_can_diverge_in_faulted_multishard_dispatcher_replay() {
         ..Default::default()
     };
     let baseline = SimulatorConfig {
-        seed: 18,
+        seed: 17,
         faults: delayed.faults,
         ..Default::default()
     };

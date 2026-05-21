@@ -4697,8 +4697,12 @@ fn different_seeds_diverge_under_tcp_delay_faults() {
 
 #[test]
 fn different_seeds_diverge_under_tcp_ready_reordering() {
+    // Under the splitmix64-mixed selector (G2), seed 1's ordinal-0
+    // reorder decision fires and seed 0's does not — the reverse of the
+    // pre-G2 `ordinal == 0 -> seed % modulus` short-circuit. Re-pin so
+    // one seed still reorders and the other still preserves order.
     let reordered = SimulatorConfig {
-        seed: 0,
+        seed: 1,
         faults: FaultConfig {
             tcp_completion: TcpCompletionFaultMode::ReorderReady { one_in: 2 },
             ..Default::default()
@@ -4706,7 +4710,7 @@ fn different_seeds_diverge_under_tcp_ready_reordering() {
         ..Default::default()
     };
     let baseline = SimulatorConfig {
-        seed: 1,
+        seed: 0,
         faults: reordered.faults,
         ..Default::default()
     };
@@ -4720,12 +4724,12 @@ fn different_seeds_diverge_under_tcp_ready_reordering() {
     assert_eq!(
         reordered_accept_order,
         vec![reordered_second_waiter, reordered_first_waiter],
-        "seed 0 should reorder tied ready accept completions so the second waiter wins first"
+        "seed 1 should reorder tied ready accept completions so the second waiter wins first"
     );
     assert_eq!(
         baseline_accept_order,
         vec![baseline_first_waiter, baseline_second_waiter],
-        "seed 1 should preserve request-order accept visibility when ReorderReady does not fire"
+        "seed 0 should preserve request-order accept visibility when ReorderReady does not fire"
     );
     assert_ne!(
         reordered_accept_order, baseline_accept_order,

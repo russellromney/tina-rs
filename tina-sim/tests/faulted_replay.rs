@@ -313,8 +313,11 @@ fn structural_checker_observes_monotonic_event_ids() {
 
 #[test]
 fn same_seed_local_send_failure_replays_same_checker_failure() {
+    // Seed 3 is the first seed whose ordinal-0 local-send decision trips
+    // the delay under the splitmix64-mixed selector (G2). Seed 0 fired
+    // only under the old `ordinal == 0 -> seed % modulus` short-circuit.
     let config = SimulatorConfig {
-        seed: 0,
+        seed: 3,
         faults: FaultConfig {
             local_send: LocalSendFaultMode::DelayByRounds {
                 one_in: 2,
@@ -352,8 +355,12 @@ fn different_seeds_diverge_on_local_send_faults() {
         rounds: 1,
     };
 
+    // Seed 3 trips the ordinal-0 local-send delay under the mixed
+    // selector; seed 1 does not. (Pre-G2 this was seed 0 vs 1, which
+    // diverged only because of the `ordinal == 0 -> seed % modulus`
+    // short-circuit the fix removed.)
     let delayed = SimulatorConfig {
-        seed: 0,
+        seed: 3,
         faults: FaultConfig {
             local_send: fault,
             ..Default::default()
