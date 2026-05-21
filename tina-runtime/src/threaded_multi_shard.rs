@@ -888,6 +888,11 @@ where
     let mut terminal_overflow = VecDeque::new();
     let mut terminal_remote_drain_start = 0;
     let mut ordinary_remote_drain_start = 0;
+    // Terminal replies and ordinary sends are separate inbound classes.
+    // Rotate sources within each class, and alternate which class gets first
+    // chance so neither ordinary sends nor terminal replies can consume every
+    // bounded drain pass forever.
+    let mut drain_terminal_first = true;
     loop {
         shard_metrics.set_resource_counts(runtime.resource_report());
         let route_remote_lossless =
@@ -958,25 +963,47 @@ where
                 &route_remote_lossless,
             )
         };
-        let terminal_delivered = overflow_delivered
-            + drain_remote_inbound(
-                &mut runtime,
-                &remote_wiring.terminal_receivers,
-                &mut route_remote,
-                config.remote_inbound_drain_budget,
-                &mut terminal_remote_drain_start,
-            );
-        let ordinary_budget = config
-            .remote_inbound_drain_budget
-            .saturating_sub(terminal_delivered);
-        let remote_delivered = terminal_delivered
-            + drain_remote_inbound(
-                &mut runtime,
-                &remote_wiring.receivers,
-                &mut route_remote,
-                ordinary_budget,
-                &mut ordinary_remote_drain_start,
-            );
+        let remote_delivered = overflow_delivered
+            + if drain_terminal_first {
+                let terminal_delivered = drain_remote_inbound(
+                    &mut runtime,
+                    &remote_wiring.terminal_receivers,
+                    &mut route_remote,
+                    config.remote_inbound_drain_budget,
+                    &mut terminal_remote_drain_start,
+                );
+                let ordinary_budget = config
+                    .remote_inbound_drain_budget
+                    .saturating_sub(terminal_delivered);
+                terminal_delivered
+                    + drain_remote_inbound(
+                        &mut runtime,
+                        &remote_wiring.receivers,
+                        &mut route_remote,
+                        ordinary_budget,
+                        &mut ordinary_remote_drain_start,
+                    )
+            } else {
+                let ordinary_delivered = drain_remote_inbound(
+                    &mut runtime,
+                    &remote_wiring.receivers,
+                    &mut route_remote,
+                    config.remote_inbound_drain_budget,
+                    &mut ordinary_remote_drain_start,
+                );
+                let terminal_budget = config
+                    .remote_inbound_drain_budget
+                    .saturating_sub(ordinary_delivered);
+                ordinary_delivered
+                    + drain_remote_inbound(
+                        &mut runtime,
+                        &remote_wiring.terminal_receivers,
+                        &mut route_remote,
+                        terminal_budget,
+                        &mut terminal_remote_drain_start,
+                    )
+            };
+        drain_terminal_first = !drain_terminal_first;
         // Fairness: poll the local command queue after every bounded
         // remote-drain pass, not only when the drain delivered zero
         // envelopes. A sustained remote inbound flood keeps
