@@ -436,6 +436,12 @@ pub enum S3Error {
     ResponseTooLarge,
     /// Request failed bridge validation.
     InvalidRequest(String),
+    /// S3 reported the bucket or object was not found.
+    NotFound(String),
+    /// S3 denied the request.
+    AccessDenied(String),
+    /// S3 throttled the request after the SDK retry budget.
+    Throttled(String),
     /// AWS SDK returned an error.
     Sdk(String),
     /// Stream body read failed.
@@ -455,6 +461,9 @@ impl std::fmt::Display for S3Error {
                 f.write_str("s3 bridge: response body exceeds configured cap")
             }
             Self::InvalidRequest(msg) => write!(f, "s3 bridge: invalid request: {msg}"),
+            Self::NotFound(msg) => write!(f, "s3 bridge: not found: {msg}"),
+            Self::AccessDenied(msg) => write!(f, "s3 bridge: access denied: {msg}"),
+            Self::Throttled(msg) => write!(f, "s3 bridge: throttled: {msg}"),
             Self::Sdk(msg) => write!(f, "s3 bridge: sdk error: {msg}"),
             Self::Body(msg) => write!(f, "s3 bridge: body error: {msg}"),
             Self::Internal(msg) => write!(f, "s3 bridge: internal error: {msg}"),
