@@ -859,6 +859,70 @@ where
     crate::call::call(pool, WorkerPoolMsg::Close(mode), timeout).then(translator)
 }
 
+// Manual Isolate impl: message and reply types are generic over H,
+// which the runtime_isolate macro doesn't handle.
+impl<H, S> Isolate for WorkerPool<H, S>
+where
+    H: Send + Clone + 'static,
+    S: Shard + 'static,
+{
+    type Message = WorkerPoolMsg<H>;
+    type Reply = WorkerPoolReply<H>;
+    type Send = Outbound<Infallible>;
+    type Spawn = Infallible;
+    type SpawnObserved = Infallible;
+    type Call = RuntimeCall<WorkerPoolMsg<H>>;
+    type Fact = Infallible;
+    type Shard = S;
+
+    fn handle(
+        &mut self,
+        msg: WorkerPoolMsg<H>,
+        ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
+        // Always sweep first: cancelled waiters and rejected
+        // dispatches both need to be reclaimed before any state
+        // decision in this turn.
+        self.sweep_waiters();
+        self.sweep_in_flight();
+        match msg {
+            WorkerPoolMsg::Acquire => self.handle_acquire(ctx),
+            WorkerPoolMsg::Release { lease, disposition } => {
+                self.handle_release(lease, disposition)
+            }
+            WorkerPoolMsg::Close(mode) => self.handle_close(mode),
+            WorkerPoolMsg::PressureReport => reply(WorkerPoolReply::Pressure(self.pressure())),
+        }
+    }
+
+    fn handle_call(&mut self, msg: WorkerPoolMsg<H>, call: CallContext<'_, Self>) -> Effect<Self> {
+        // Always sweep first: cancelled waiters and rejected
+        // dispatches both need to be reclaimed before any state
+        // decision in this turn.
+        self.sweep_waiters();
+        self.sweep_in_flight();
+        match msg {
+            WorkerPoolMsg::Acquire => {
+                if self.closed.is_some() {
+                    self.counters.closed += 1;
+                    return call.reply(WorkerPoolReply::Acquire(AcquireOutcome::Closed));
+                }
+                let slot = call.into_request_context().into_deferred();
+                self.handle_acquire_slot(slot)
+            }
+            WorkerPoolMsg::Release { lease, disposition } => {
+                let _ = call;
+                self.handle_release(lease, disposition)
+            }
+            WorkerPoolMsg::Close(mode) => {
+                let _ = call;
+                self.handle_close(mode)
+            }
+            WorkerPoolMsg::PressureReport => call.reply(WorkerPoolReply::Pressure(self.pressure())),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -941,69 +1005,5 @@ mod tests {
         let remaining: Vec<u32> = pool.waiter_queue.iter().copied().collect();
         assert_eq!(remaining, vec![0, 2]);
         assert!(pool.free_waiter_slots.contains(&1));
-    }
-}
-
-// Manual Isolate impl: message and reply types are generic over H,
-// which the runtime_isolate macro doesn't handle.
-impl<H, S> Isolate for WorkerPool<H, S>
-where
-    H: Send + Clone + 'static,
-    S: Shard + 'static,
-{
-    type Message = WorkerPoolMsg<H>;
-    type Reply = WorkerPoolReply<H>;
-    type Send = Outbound<Infallible>;
-    type Spawn = Infallible;
-    type SpawnObserved = Infallible;
-    type Call = RuntimeCall<WorkerPoolMsg<H>>;
-    type Fact = Infallible;
-    type Shard = S;
-
-    fn handle(
-        &mut self,
-        msg: WorkerPoolMsg<H>,
-        ctx: &mut Context<'_, Self::Shard, Self::Reply>,
-    ) -> Effect<Self> {
-        // Always sweep first: cancelled waiters and rejected
-        // dispatches both need to be reclaimed before any state
-        // decision in this turn.
-        self.sweep_waiters();
-        self.sweep_in_flight();
-        match msg {
-            WorkerPoolMsg::Acquire => self.handle_acquire(ctx),
-            WorkerPoolMsg::Release { lease, disposition } => {
-                self.handle_release(lease, disposition)
-            }
-            WorkerPoolMsg::Close(mode) => self.handle_close(mode),
-            WorkerPoolMsg::PressureReport => reply(WorkerPoolReply::Pressure(self.pressure())),
-        }
-    }
-
-    fn handle_call(&mut self, msg: WorkerPoolMsg<H>, call: CallContext<'_, Self>) -> Effect<Self> {
-        // Always sweep first: cancelled waiters and rejected
-        // dispatches both need to be reclaimed before any state
-        // decision in this turn.
-        self.sweep_waiters();
-        self.sweep_in_flight();
-        match msg {
-            WorkerPoolMsg::Acquire => {
-                if self.closed.is_some() {
-                    self.counters.closed += 1;
-                    return call.reply(WorkerPoolReply::Acquire(AcquireOutcome::Closed));
-                }
-                let slot = call.into_request_context().into_deferred();
-                self.handle_acquire_slot(slot)
-            }
-            WorkerPoolMsg::Release { lease, disposition } => {
-                let _ = call;
-                self.handle_release(lease, disposition)
-            }
-            WorkerPoolMsg::Close(mode) => {
-                let _ = call;
-                self.handle_close(mode)
-            }
-            WorkerPoolMsg::PressureReport => call.reply(WorkerPoolReply::Pressure(self.pressure())),
-        }
     }
 }
