@@ -148,7 +148,7 @@ fn build_head(
         Method::from_bytes(method_str.as_bytes()).map_err(|_| RequestParseError::BadRequestLine)?;
 
     let raw_path = parsed.path.ok_or(RequestParseError::BadRequestLine)?;
-    if !is_origin_form(raw_path) {
+    if !is_valid_origin_form_request_target(raw_path) {
         return Err(RequestParseError::UnsupportedRequestTarget);
     }
     let path = raw_path.to_owned();
@@ -242,11 +242,19 @@ fn build_head(
     })
 }
 
-fn is_origin_form(target: &str) -> bool {
+pub(crate) fn is_valid_origin_form_request_target(target: &str) -> bool {
     // Origin-form is `/...` or `*` (asterisk-form for OPTIONS — we reject
     // it for first form). Authority-form (`example.com:80`) and
     // absolute-form (`http://example.com/`) are both rejected.
-    target.starts_with('/') && !target.starts_with("//")
+    //
+    // Whitespace and ASCII controls are rejected here and before outbound
+    // encoding so a path cannot smuggle a second request-line or header.
+    target.starts_with('/')
+        && !target.starts_with("//")
+        && target
+            .as_bytes()
+            .iter()
+            .all(|byte| *byte > b' ' && *byte != 0x7f)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -401,6 +409,10 @@ pub fn encode_keepalive_request(request: &HttpRequest) -> Vec<u8> {
 }
 
 fn encode_request_internal(request: &HttpRequest, connection_close: bool) -> Vec<u8> {
+    assert!(
+        is_valid_origin_form_request_target(&request.path),
+        "invalid HTTP/1 origin-form request target"
+    );
     let body_bytes: &[u8] = match &request.body {
         crate::types::HttpRequestBody::Buffered(bytes) => bytes,
         crate::types::HttpRequestBody::Stream(_) => {
@@ -795,6 +807,28 @@ mod tests {
             ParseProgress::Failed(RequestParseError::UnsupportedRequestTarget) => {}
             other => panic!("expected UnsupportedRequestTarget, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn request_target_validator_rejects_control_bytes() {
+        assert!(!is_valid_origin_form_request_target(
+            "/safe\r\nInjected: yes"
+        ));
+        assert!(!is_valid_origin_form_request_target("/safe\x7fbad"));
+        assert!(!is_valid_origin_form_request_target("/safe bad"));
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid HTTP/1 origin-form request target")]
+    fn encode_request_rejects_control_bytes_in_request_target() {
+        let req = HttpRequest {
+            method: Method::GET,
+            path: "/safe\r\nInjected: yes".to_owned(),
+            version: Version::HTTP_11,
+            headers: HeaderMap::new(),
+            body: crate::types::HttpRequestBody::Buffered(Vec::new()),
+        };
+        let _ = encode_request(&req);
     }
 
     #[test]
