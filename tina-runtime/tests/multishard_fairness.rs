@@ -21,7 +21,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use tina::{Address, Mailbox, TrySendError, prelude::*};
-use tina_runtime::{MailboxFactory, RuntimeCall, ThreadedMultiShardRuntime, ThreadedRuntimeConfig};
+use tina_runtime::{
+    CallOutcome, MailboxFactory, RuntimeCall, ThreadedMultiShardRuntime, ThreadedRuntimeConfig,
+    call,
+};
 
 #[derive(Debug, Clone, Copy)]
 struct AppShard(u32);
@@ -207,6 +210,90 @@ impl Isolate for ProbeSource {
             FloodMsg::Tick { .. } => send(self.target, FloodMsg::Probe),
             FloodMsg::Hit | FloodMsg::Probe => noop(),
         }
+    }
+}
+
+#[derive(Debug)]
+enum ReplyFloodMsg {
+    Start,
+    Returned(CallOutcome<ReplyFloodReply>),
+}
+
+#[derive(Debug)]
+enum ReplyFloodWorkerMsg {
+    Ping,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ReplyFloodReply;
+
+struct ReplyFloodCaller {
+    worker: Address<ReplyFloodWorkerMsg, ReplyFloodReply>,
+    running: Arc<std::sync::atomic::AtomicBool>,
+    replies: Arc<AtomicUsize>,
+}
+
+#[tina_runtime::isolate(
+    message = ReplyFloodMsg,
+    send = Outbound<ReplyFloodWorkerMsg>,
+    shard = AppShard
+)]
+impl ReplyFloodCaller {
+    fn handle(
+        &mut self,
+        msg: ReplyFloodMsg,
+        _ctx: &mut Context<'_, AppShard, Self::Reply>,
+    ) -> Effect<Self> {
+        match msg {
+            ReplyFloodMsg::Start => self.call_worker(),
+            ReplyFloodMsg::Returned(outcome) => {
+                assert!(
+                    matches!(outcome, CallOutcome::Replied(ReplyFloodReply)),
+                    "reply flood call should stay on the terminal reply path"
+                );
+                self.replies.fetch_add(1, Ordering::Relaxed);
+                self.call_worker()
+            }
+        }
+    }
+}
+
+impl ReplyFloodCaller {
+    fn call_worker(&self) -> Effect<Self> {
+        if !self.running.load(Ordering::Relaxed) {
+            return noop();
+        }
+        call(
+            self.worker,
+            ReplyFloodWorkerMsg::Ping,
+            Duration::from_secs(1),
+        )
+        .then(ReplyFloodMsg::Returned)
+    }
+}
+
+struct ReplyFloodWorker;
+
+#[tina_runtime::isolate(
+    message = ReplyFloodWorkerMsg,
+    reply = ReplyFloodReply,
+    shard = AppShard
+)]
+impl ReplyFloodWorker {
+    fn handle(
+        &mut self,
+        _msg: ReplyFloodWorkerMsg,
+        _ctx: &mut Context<'_, AppShard, Self::Reply>,
+    ) -> Effect<Self> {
+        noop()
+    }
+
+    fn handle_call(
+        &mut self,
+        _msg: ReplyFloodWorkerMsg,
+        call: CallContext<'_, Self>,
+    ) -> Effect<Self> {
+        call.reply(ReplyFloodReply)
     }
 }
 
@@ -485,5 +572,94 @@ fn remote_inbound_drain_rotates_between_sources_under_flood() {
     assert_eq!(
         observed_probes, 1,
         "source 22 probe starved behind source 11 remote flood"
+    );
+}
+
+/// Adversarial review C3: terminal replies and ordinary remote sends are
+/// separate inbound traffic classes. A steady reply flood into shard 22 must
+/// not consume every remote-drain pass and leave ordinary sends stuck until the
+/// reply flood ends.
+#[test]
+fn terminal_reply_flood_does_not_starve_ordinary_remote_sends() {
+    let runtime = make_runtime_with_config(
+        [AppShard(11), AppShard(22)],
+        ThreadedRuntimeConfig {
+            command_capacity: 256,
+            shard_pair_capacity: 256,
+            remote_inbound_drain_budget: 1,
+            ..ThreadedRuntimeConfig::default()
+        },
+    );
+    let hits = Arc::new(AtomicUsize::new(0));
+    let probes = Arc::new(AtomicUsize::new(0));
+    let replies = Arc::new(AtomicUsize::new(0));
+    let running = Arc::new(std::sync::atomic::AtomicBool::new(true));
+
+    let sink = runtime
+        .register_with_capacity_on::<Sink, _>(
+            ShardId::new(22),
+            Sink {
+                hits: Arc::clone(&hits),
+                probes: Arc::clone(&probes),
+            },
+            128,
+        )
+        .expect("register sink");
+    let worker = runtime
+        .register_with_capacity_on::<ReplyFloodWorker, _>(ShardId::new(11), ReplyFloodWorker, 512)
+        .expect("register reply worker");
+
+    for _ in 0..64 {
+        let caller = runtime
+            .register_with_capacity_on::<ReplyFloodCaller, _>(
+                ShardId::new(22),
+                ReplyFloodCaller {
+                    worker,
+                    running: Arc::clone(&running),
+                    replies: Arc::clone(&replies),
+                },
+                128,
+            )
+            .expect("register reply flood caller");
+        runtime
+            .try_send(caller, ReplyFloodMsg::Start)
+            .expect("start reply flood caller");
+    }
+
+    let flood_deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < flood_deadline && replies.load(Ordering::Relaxed) < 128 {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(
+        replies.load(Ordering::Relaxed) >= 128,
+        "reply flood must be active before probing ordinary traffic"
+    );
+
+    let source = runtime
+        .register_with_capacity_on::<FloodSource, _>(
+            ShardId::new(11),
+            FloodSource {
+                target: sink,
+                running: Arc::clone(&running),
+                fanout: 1,
+            },
+            8,
+        )
+        .expect("register ordinary source");
+    runtime
+        .try_send(source, FloodMsg::Tick { remaining: 1 })
+        .expect("kick ordinary probe");
+
+    let ordinary_deadline = Instant::now() + Duration::from_millis(750);
+    while Instant::now() < ordinary_deadline && hits.load(Ordering::Relaxed) == 0 {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let observed_hits = hits.load(Ordering::Relaxed);
+    running.store(false, Ordering::Relaxed);
+    std::thread::sleep(Duration::from_millis(100));
+    let _ = runtime.shutdown();
+    assert_eq!(
+        observed_hits, 1,
+        "ordinary remote send should land while terminal replies are still flooding"
     );
 }
