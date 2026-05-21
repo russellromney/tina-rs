@@ -351,7 +351,23 @@ fn shutdown_under_remote_flood_completes_bounded() {
 /// drains and reaches the target.
 #[test]
 fn ordinary_remote_throughput_still_progresses() {
-    let runtime = make_runtime();
+    const N: usize = 500;
+    // The producer fires N fire-and-forget cross-shard sends with no
+    // per-round sleep, so it can race ahead of the consumer. Size the
+    // cross-shard pair queue to hold the whole finite burst; otherwise
+    // the unthrottled producer overruns the steady-state default (64)
+    // and the overflow lands as typed SendRejected{Full}, not at the
+    // sink. The default only sufficed while the removed 1ms sleep
+    // happened to pace the producer (also why this test was macOS-flaky).
+    let config = ThreadedRuntimeConfig {
+        shard_pair_capacity: N + 16,
+        ..ThreadedRuntimeConfig::default()
+    };
+    let runtime = ThreadedMultiShardRuntime::with_config(
+        [AppShard(11), AppShard(22)],
+        WorkerMailboxFactory,
+        config,
+    );
     let hits = Arc::new(AtomicUsize::new(0));
     let probes = Arc::new(AtomicUsize::new(0));
 
@@ -362,7 +378,7 @@ fn ordinary_remote_throughput_still_progresses() {
                 hits: Arc::clone(&hits),
                 probes: Arc::clone(&probes),
             },
-            128,
+            N + 16,
         )
         .expect("register sink");
 
@@ -383,12 +399,12 @@ fn ordinary_remote_throughput_still_progresses() {
         )
         .expect("register source");
 
-    const N: usize = 500;
     runtime
         .try_send(source, FloodMsg::Tick { remaining: N })
         .expect("kick burst");
     let expected = N;
 
+    let start = Instant::now();
     // Every cross-shard message produced by the bounded burst should
     // land at the sink. With the fairness change, the worker still
     // drains its remote inbound budget on every pass, so ordinary
@@ -401,6 +417,12 @@ fn ordinary_remote_throughput_still_progresses() {
         hits.load(Ordering::Relaxed),
         expected,
         "fairness change must not regress finite cross-shard throughput"
+    );
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed < Duration::from_millis(300),
+        "productive cross-shard backlog paid a fixed sleep per round (took {:?})",
+        elapsed
     );
 
     running.store(false, Ordering::Relaxed);

@@ -976,7 +976,11 @@ where
 
         let delivered = runtime.step_with_remote(&mut |_, envelope| route_remote(envelope));
 
-        if delivered == 0 && remote_delivered == 0 && !runtime.has_in_flight_calls() {
+        if delivered > 0 || remote_delivered > 0 {
+            continue;
+        }
+
+        if !runtime.has_in_flight_calls() {
             match receiver.recv_timeout(config.idle_wait) {
                 Ok(ThreadedCommand::Run(command)) => command(&mut runtime),
                 Ok(ThreadedCommand::Shutdown) => {
@@ -987,7 +991,7 @@ where
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
             }
         } else {
-            thread::sleep(Duration::from_millis(1));
+            thread::yield_now();
         }
     }
 
