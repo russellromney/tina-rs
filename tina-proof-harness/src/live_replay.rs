@@ -9,10 +9,11 @@
 //!
 //! [`LiveTrace`] is that rung. It is a thin `TraceObserver` that
 //! collects [`RuntimeEvent`]s as the runtime emits them. After the
-//! workload, the caller calls [`LiveTrace::snapshot`] to get a live
-//! [`TraceShape`] (event_count, `stable_trace_hash`). A live runtime trace
-//! is not the same thing as a simulator trace. To make a live finding
-//! replayable, materialize the important facts into a
+//! workload, the caller calls [`LiveTrace::snapshot_complete`] to get a
+//! live [`TraceShape`] (event_count, `stable_trace_hash`) after proving no
+//! upstream buffered observer dropped events. A live runtime trace is not
+//! the same thing as a simulator trace. To make a live finding replayable,
+//! materialize the important facts into a
 //! [`tina_sim::dst::LiveReplayCapture`] and check it with
 //! [`tina_sim::dst::check_captured_replay`].
 //!
@@ -20,7 +21,12 @@
 //!
 //! 1. The observer never blocks. It pushes into a `Mutex<Vec<_>>` and
 //!    returns; if the user wants async drain, they pull events out.
-//! 2. The snapshot computes the trace hash using the same
+//! 2. The complete snapshot refuses to hash a lossy buffered capture.
+//!    If you install `BufferedTraceObserver`, pass its `dropped_count()`
+//!    to [`LiveTrace::snapshot_complete`] or
+//!    [`LiveTrace::compare_live_shape_complete`]. Plain
+//!    [`LiveTrace::snapshot`] remains available for diagnostics, not proof.
+//! 3. The snapshot computes the trace hash using the same
 //!    [`tina_runtime::stable_trace_hash`] the sim side uses. The hash is
 //!    a fingerprint of this live trace, not a claim that the live event
 //!    stream is byte-identical to a simulator run.
@@ -91,6 +97,10 @@ impl LiveTrace {
     }
 
     /// Snapshot the current shape: (event_count, stable_trace_hash).
+    ///
+    /// This is a diagnostic snapshot. If the trace reached `LiveTrace`
+    /// through a bounded buffer, use [`Self::snapshot_complete`] and pass
+    /// the buffer's dropped-event count before treating the hash as proof.
     pub fn snapshot(&self) -> TraceShape {
         let guard = self.events.lock().expect("live trace lock");
         let mut events = guard.clone();
@@ -99,6 +109,23 @@ impl LiveTrace {
             event_count: events.len(),
             trace_hash: stable_trace_hash(events.iter()),
         }
+    }
+
+    /// Snapshot a live trace only if the upstream capture path was lossless.
+    ///
+    /// Pass `BufferedTraceObserver::dropped_count()` when the live trace is
+    /// fed through a buffered observer. Pass `0` when `LiveTrace::observer()`
+    /// is installed directly.
+    pub fn snapshot_complete(
+        &self,
+        upstream_dropped_events: u64,
+    ) -> Result<TraceShape, LiveTraceLoss> {
+        if upstream_dropped_events != 0 {
+            return Err(LiveTraceLoss {
+                dropped_events: upstream_dropped_events,
+            });
+        }
+        Ok(self.snapshot())
     }
 
     /// Pressure summary for the captured trace.
@@ -139,6 +166,27 @@ impl LiveTrace {
             actual_trace_hash: actual.trace_hash,
         })
     }
+
+    /// Compare a saved live shape only if the upstream capture path was
+    /// lossless.
+    pub fn compare_live_shape_complete(
+        &self,
+        expected: TraceShape,
+        label: &'static str,
+        upstream_dropped_events: u64,
+    ) -> Result<Option<LiveReplayMismatch>, LiveTraceLoss> {
+        let actual = self.snapshot_complete(upstream_dropped_events)?;
+        if actual == expected {
+            return Ok(None);
+        }
+        Ok(Some(LiveReplayMismatch {
+            label,
+            expected_event_count: expected.event_count,
+            actual_event_count: actual.event_count,
+            expected_trace_hash: expected.trace_hash,
+            actual_trace_hash: actual.trace_hash,
+        }))
+    }
 }
 
 /// Bundled "trace + observer" handle returned by
@@ -148,6 +196,24 @@ pub struct LiveTraceHandle {
     pub trace: LiveTrace,
     pub observer: Arc<dyn TraceObserver>,
 }
+
+/// The live trace capture path lost events before the proof snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LiveTraceLoss {
+    pub dropped_events: u64,
+}
+
+impl std::fmt::Display for LiveTraceLoss {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "live trace capture dropped {} event(s); snapshot is diagnostic only",
+            self.dropped_events
+        )
+    }
+}
+
+impl std::error::Error for LiveTraceLoss {}
 
 struct LiveTraceObserver {
     events: Arc<Mutex<Vec<RuntimeEvent>>>,
@@ -248,6 +314,19 @@ mod tests {
         let shape = trace.snapshot();
         assert_eq!(shape.event_count, 3);
         assert_ne!(shape.trace_hash, 0);
+        assert_eq!(trace.snapshot_complete(0), Ok(shape));
+    }
+
+    #[test]
+    fn complete_snapshot_rejects_lossy_buffered_capture() {
+        let trace = LiveTrace::new();
+        let observer = trace.observer();
+        observer.on_event(&sample_event(1));
+
+        let loss = trace
+            .snapshot_complete(1)
+            .expect_err("proof snapshot must reject dropped buffered events");
+        assert_eq!(loss.dropped_events, 1);
     }
 
     #[test]
@@ -293,6 +372,15 @@ mod tests {
         let mismatch = trace.compare_live_shape(drifted, "stub").expect("mismatch");
         assert!(mismatch.count_diverged());
         assert!(!mismatch.hash_diverged());
+
+        let loss = trace
+            .compare_live_shape_complete(shape, "stub", 2)
+            .expect_err("lossy capture must fail before comparing hashes");
+        assert_eq!(loss.dropped_events, 2);
+        assert_eq!(
+            trace.compare_live_shape_complete(shape, "stub", 0),
+            Ok(None)
+        );
     }
 
     #[test]
