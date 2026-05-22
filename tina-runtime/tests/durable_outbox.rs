@@ -8,7 +8,7 @@
 use std::collections::VecDeque;
 use std::convert::Infallible;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -463,4 +463,131 @@ fn corrupt_journal_tail_stops_recovery_visibly() {
         notes(&observed)
     );
     assert!(sent(&observed).is_empty());
+}
+
+/// Append one outbox-framed enqueue and its completion to a real journal.
+fn append_done(journal: &Path, outbox: &mut DurableOutbox<Vec<u8>>, payload: &[u8]) {
+    let staged = outbox.enqueue(payload.to_vec()).expect("fits");
+    tina_runtime::persistence::append_journal_record(
+        journal,
+        staged.journal_index(),
+        staged.journal_bytes().to_vec(),
+    )
+    .expect("append enqueue");
+    let recorded = outbox.record(staged, Ok(())).expect("recorded");
+    let id = recorded.work_id();
+    let _ = outbox.apply(recorded);
+    match outbox.begin_complete(id) {
+        CompletionStart::Record(completion) => {
+            tina_runtime::persistence::append_journal_record(
+                journal,
+                completion.journal_index(),
+                completion.journal_bytes().to_vec(),
+            )
+            .expect("append completion");
+            outbox
+                .finish_complete(completion, Ok(()))
+                .expect("complete");
+        }
+        other => panic!("expected Record, got {other:?}"),
+    }
+}
+
+/// Append one outbox-framed enqueue that is recorded + applied but never
+/// completed, so it stays durably pending.
+fn append_pending(journal: &Path, outbox: &mut DurableOutbox<Vec<u8>>, payload: &[u8]) {
+    let staged = outbox.enqueue(payload.to_vec()).expect("fits");
+    tina_runtime::persistence::append_journal_record(
+        journal,
+        staged.journal_index(),
+        staged.journal_bytes().to_vec(),
+    )
+    .expect("append enqueue");
+    let recorded = outbox.record(staged, Ok(())).expect("recorded");
+    let _ = outbox.apply(recorded);
+}
+
+#[test]
+fn compaction_round_trip_shrinks_journal_and_resumes_pending() {
+    use tina_runtime::persistence;
+    let dir = unique_dir("compaction");
+    let journal = dir.join("outbox.journal");
+    let fence = dir.join("commit.fence");
+
+    // Run 1: two items fully sent + completed, one left pending. The journal
+    // accumulates five records (2 enqueue + 2 complete + 1 enqueue).
+    let mut outbox: DurableOutbox<Vec<u8>> = DurableOutbox::new(8);
+    append_done(&journal, &mut outbox, b"alpha");
+    append_done(&journal, &mut outbox, b"beta");
+    append_pending(&journal, &mut outbox, b"gamma");
+    assert_eq!(
+        persistence::replay_journal(&journal).unwrap().records.len(),
+        5
+    );
+
+    // Restart: recover + compact, then install the compacted journal under a
+    // commit fence so an interrupted swap would recover as uncertain.
+    let confidence =
+        CommitConfidence::from_fence_present(persistence::commit_fence_present(&fence).unwrap());
+    assert_eq!(confidence, CommitConfidence::Clean);
+    let (mut recovered, report, compacted) = DurableOutbox::<Vec<u8>>::recover_compacted(
+        8,
+        persistence::replay_journal(&journal),
+        confidence,
+    )
+    .expect("recover + compact");
+
+    persistence::raise_commit_fence(&fence).unwrap();
+    persistence::commit_file_atomic(&journal, &compacted).unwrap();
+    persistence::clear_commit_fence(&fence).unwrap();
+
+    // The journal now holds only the single pending enqueue.
+    assert_eq!(
+        persistence::replay_journal(&journal).unwrap().records.len(),
+        1
+    );
+
+    // Resume the pending work through the queue on the compacted outbox.
+    let mut queue = report.into_resume();
+    assert_eq!(
+        queue.next_apply(&mut recovered),
+        Some((WorkId(3), b"gamma".to_vec()))
+    );
+    assert_eq!(queue.next_apply(&mut recovered), None);
+
+    // A fresh recovery of the compacted journal sees the same pending work,
+    // no surviving completed records, and a clean tail (fence cleared).
+    let confidence =
+        CommitConfidence::from_fence_present(persistence::commit_fence_present(&fence).unwrap());
+    let (_outbox, report2) =
+        DurableOutbox::<Vec<u8>>::recover(8, persistence::replay_journal(&journal), confidence)
+            .expect("recover compacted");
+    assert_eq!(report2.tail_status, TailStatus::Clean);
+    assert!(report2.completed.is_empty());
+    let pending: Vec<u64> = report2.pending.iter().map(|w| w.work_id().0).collect();
+    assert_eq!(pending, vec![3]);
+}
+
+#[test]
+fn leftover_commit_fence_recovers_as_uncertain() {
+    use tina_runtime::persistence;
+    let dir = unique_dir("fence-uncertain");
+    let journal = dir.join("outbox.journal");
+    let fence = dir.join("commit.fence");
+
+    let mut outbox: DurableOutbox<Vec<u8>> = DurableOutbox::new(8);
+    append_pending(&journal, &mut outbox, b"work");
+
+    // Simulate a crash mid-commit: the fence was raised but never cleared.
+    persistence::raise_commit_fence(&fence).unwrap();
+
+    let confidence =
+        CommitConfidence::from_fence_present(persistence::commit_fence_present(&fence).unwrap());
+    assert_eq!(confidence, CommitConfidence::Uncertain);
+    let (_outbox, report) =
+        DurableOutbox::<Vec<u8>>::recover(8, persistence::replay_journal(&journal), confidence)
+            .expect("recover");
+    assert_eq!(report.tail_status, TailStatus::UncertainCommit);
+    // the work is still pending and will replay (at-least-once).
+    assert_eq!(report.pending.len(), 1);
 }

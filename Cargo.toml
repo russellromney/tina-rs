@@ -39,6 +39,7 @@ exclude = [
     "examples/specimen_native_http",
     "examples/specimen_sharded_keyspace",
     "examples/specimen_webhook_publisher",
+    "examples/specimen_webhook_outbox",
     "examples/specimen_retrying_outbound_http",
     "examples/specimen_rate_limited_worker",
     "examples/specimen_sharded_fanout_read",

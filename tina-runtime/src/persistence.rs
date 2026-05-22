@@ -5,7 +5,7 @@
 //! for recovery.
 
 use std::fs::{self, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -118,6 +118,92 @@ fn commit_snapshot_with_parent_sync(
         return Err(CallError::CommitUncertain);
     }
     Ok(())
+}
+
+/// Atomically replaces a file with `bytes`: writes a temp file, fsyncs it,
+/// renames into place, then fsyncs the parent directory where supported.
+///
+/// Returns [`CallError::CommitUncertain`] when the rename landed but the final
+/// parent-directory fsync could not be confirmed — the durable state is then
+/// unknown and the caller should recover from disk. Used to swap a compacted
+/// outbox journal in one durable step.
+pub fn commit_file_atomic(path: &Path, bytes: &[u8]) -> Result<(), CallError> {
+    commit_file_atomic_with_parent_sync(path, bytes, sync_parent_directory)
+}
+
+fn commit_file_atomic_with_parent_sync(
+    path: &Path,
+    bytes: &[u8],
+    sync_parent: impl FnOnce(&Path) -> Result<(), CallError>,
+) -> Result<(), CallError> {
+    let parent = parent_directory(path);
+    fs::create_dir_all(parent).map_err(|_| CallError::Io)?;
+    let temp_path = temp_file_path(path);
+    let write_result = (|| {
+        let mut file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&temp_path)
+            .map_err(|_| CallError::Io)?;
+        file.write_all(bytes).map_err(|_| CallError::Io)?;
+        file.sync_all().map_err(|_| CallError::Io)?;
+        Ok(())
+    })();
+    if let Err(error) = write_result {
+        let _ = fs::remove_file(&temp_path);
+        return Err(error);
+    }
+    if fs::rename(&temp_path, path).is_err() {
+        let _ = fs::remove_file(&temp_path);
+        return Err(CallError::Io);
+    }
+    if sync_parent(parent).is_err() {
+        return Err(CallError::CommitUncertain);
+    }
+    Ok(())
+}
+
+/// Raises a durable commit fence before a commit whose final durability step
+/// (the parent-directory fsync) could be interrupted by a crash.
+///
+/// The marker file is fsynced, and so is its parent directory, so the fence
+/// itself survives a crash. Pair with [`clear_commit_fence`] after the commit's
+/// final step confirms, and [`commit_fence_present`] on recovery: a leftover
+/// fence means the last commit could not confirm, which maps to
+/// [`crate::CommitConfidence::Uncertain`].
+pub fn raise_commit_fence(path: &Path) -> Result<(), CallError> {
+    let parent = parent_directory(path);
+    fs::create_dir_all(parent).map_err(|_| CallError::Io)?;
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(path)
+        .map_err(|_| CallError::Io)?;
+    file.sync_all().map_err(|_| CallError::Io)?;
+    sync_parent_directory(parent)
+}
+
+/// Clears the commit fence after a commit's final durability step confirmed.
+/// A missing fence is already cleared, so this is idempotent.
+pub fn clear_commit_fence(path: &Path) -> Result<(), CallError> {
+    match fs::remove_file(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(_) => return Err(CallError::Io),
+    }
+    sync_parent_directory(parent_directory(path))
+}
+
+/// Whether a commit fence is present. `true` means a prior commit raised the
+/// fence but never cleared it, so its durability is unconfirmed.
+pub fn commit_fence_present(path: &Path) -> Result<bool, CallError> {
+    match fs::metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(false),
+        Err(_) => Err(CallError::Io),
+    }
 }
 
 /// Loads one snapshot, returning `Ok(None)` when no committed snapshot exists.
@@ -398,6 +484,19 @@ fn temp_snapshot_path(path: &Path) -> PathBuf {
     ))
 }
 
+fn temp_file_path(path: &Path) -> PathBuf {
+    let file_name = path
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .unwrap_or("file");
+    let unique = SNAPSHOT_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    path.with_file_name(format!(
+        ".{file_name}.{}.{}.tmp",
+        std::process::id(),
+        unique
+    ))
+}
+
 fn parent_directory(path: &Path) -> &Path {
     match path.parent() {
         Some(parent) if !parent.as_os_str().is_empty() => parent,
@@ -525,5 +624,49 @@ mod tests {
             leftovers.is_empty(),
             "temp files should be cleaned after rename failure: {leftovers:?}"
         );
+    }
+
+    #[test]
+    fn commit_file_atomic_replaces_bytes_and_round_trips() {
+        let dir = unique_dir("atomic-file");
+        let path = dir.join("compacted.journal");
+        commit_file_atomic(&path, b"first").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"first");
+        // a second commit fully replaces the contents
+        commit_file_atomic(&path, b"second-longer").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"second-longer");
+    }
+
+    #[test]
+    fn commit_file_atomic_parent_sync_failure_is_uncertain_but_installed() {
+        let dir = unique_dir("atomic-uncertain");
+        let path = dir.join("compacted.journal");
+        let result =
+            commit_file_atomic_with_parent_sync(&path, b"installed", |_| Err(CallError::Io));
+        assert_eq!(result, Err(CallError::CommitUncertain));
+        // the rename landed; only the final durability step is unconfirmed.
+        assert_eq!(fs::read(&path).unwrap(), b"installed");
+    }
+
+    #[test]
+    fn commit_fence_lifecycle_is_present_then_cleared() {
+        let dir = unique_dir("fence");
+        let fence = dir.join("commit.fence");
+        assert!(!commit_fence_present(&fence).unwrap());
+        raise_commit_fence(&fence).unwrap();
+        assert!(commit_fence_present(&fence).unwrap());
+        clear_commit_fence(&fence).unwrap();
+        assert!(!commit_fence_present(&fence).unwrap());
+        // clearing an absent fence is idempotent.
+        clear_commit_fence(&fence).unwrap();
+    }
+
+    #[test]
+    fn leftover_commit_fence_reads_as_present_for_recovery() {
+        let dir = unique_dir("fence-leftover");
+        let fence = dir.join("commit.fence");
+        raise_commit_fence(&fence).unwrap();
+        // simulate a crash before the fence was cleared: a fresh read sees it.
+        assert!(commit_fence_present(&fence).unwrap());
     }
 }
