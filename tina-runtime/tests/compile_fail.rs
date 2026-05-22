@@ -30,3 +30,12 @@ fn bridge_classifier_cannot_return_string_in_place_of_typed_class() {
     let cases = trybuild::TestCases::new();
     cases.compile_fail("tests/bridge_compile_fail/bridge_classifier_stringly.rs");
 }
+
+#[test]
+fn durable_outbox_record_before_apply_is_enforced_at_compile_time() {
+    let cases = trybuild::TestCases::new();
+    // apply requires RecordedWork, so un-recorded work cannot be applied.
+    cases.compile_fail("tests/durable_outbox_compile_fail/apply_before_record.rs");
+    // apply consumes RecordedWork, so the same work cannot be applied twice.
+    cases.compile_fail("tests/durable_outbox_compile_fail/double_apply.rs");
+}
