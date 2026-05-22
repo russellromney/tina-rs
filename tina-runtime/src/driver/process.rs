@@ -258,47 +258,46 @@ fn process_worker_loop(
     }
 }
 
-/// Polls whether `child` has exited.
+/// Polls whether `child` has exited (without yet capturing its status).
 ///
-/// On Linux this peeks with `WNOHANG | WNOWAIT`: it reports the exit status
-/// without reaping, so the leader's pid (== its process-group id) stays
-/// reserved. [`process_exited`] can then kill the group without risking a
-/// recycled pgid (finding F3), and reaps the leader afterward. On other
-/// platforms it reaps immediately via `try_wait` (the recycle race remains a
-/// narrow, documented residual there).
+/// On Linux this peeks with `waitid(WEXITED | WNOHANG | WNOWAIT)`: it reports
+/// that the child exited without reaping it, so the leader stays a zombie and
+/// its pid (== its process-group id) stays reserved. [`process_exited`] can
+/// then kill the group without risking a recycled pgid (finding F3) and reap
+/// the leader for its real status afterward. (`WNOWAIT` is only valid for
+/// `waitid`, not `waitpid`/`wait4`.) On other platforms it reaps immediately
+/// via `try_wait`; the status is cached for the later `wait()`, and the
+/// recycle race remains a narrow, documented residual.
 #[cfg(target_os = "linux")]
 #[allow(unsafe_code)]
-fn poll_child_exit(
-    child: &mut std::process::Child,
-) -> std::io::Result<Option<std::process::ExitStatus>> {
-    use std::os::unix::process::ExitStatusExt;
-    let mut raw: libc::c_int = 0;
-    // SAFETY: `child.id()` is this child's live pid. `WNOHANG | WNOWAIT`
-    // reports its exit state without consuming the zombie, leaving it for the
-    // later `child.wait()` in `process_exited`. `raw` is a valid, initialized
-    // out-parameter; nothing else waits on this pid.
+fn child_has_exited(child: &mut std::process::Child) -> std::io::Result<bool> {
+    // SAFETY: zeroing a POD `siginfo_t` for use as an out-parameter.
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    // SAFETY: `P_PID` + the child's live pid; `WNOWAIT` reports the exit
+    // without consuming the zombie. `info` is a valid, zeroed out-parameter.
     let result = unsafe {
-        libc::waitpid(
-            child.id() as libc::pid_t,
-            &mut raw,
-            libc::WNOHANG | libc::WNOWAIT,
+        libc::waitid(
+            libc::P_PID,
+            child.id() as libc::id_t,
+            &mut info,
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
         )
     };
-    if result == 0 {
-        Ok(None)
-    } else if result > 0 {
-        Ok(Some(std::process::ExitStatus::from_raw(raw)))
-    } else {
-        Err(std::io::Error::last_os_error())
+    if result == -1 {
+        return Err(std::io::Error::last_os_error());
     }
+    // With `WNOHANG`, `waitid` returns 0 whether or not a child was waitable;
+    // a zeroed `si_pid` means "none ready yet", a nonzero one means it exited.
+    // SAFETY: reading `si_pid` from the populated `siginfo_t` union.
+    let si_pid = unsafe { info.si_pid() };
+    Ok(si_pid != 0)
 }
 
-/// Non-Linux: poll-and-reap via `try_wait` (no `WNOWAIT` peek).
+/// Non-Linux: poll-and-reap via `try_wait` (caches the status for the later
+/// `wait()` in `process_exited`).
 #[cfg(not(target_os = "linux"))]
-fn poll_child_exit(
-    child: &mut std::process::Child,
-) -> std::io::Result<Option<std::process::ExitStatus>> {
-    child.try_wait()
+fn child_has_exited(child: &mut std::process::Child) -> std::io::Result<bool> {
+    Ok(child.try_wait()?.is_some())
 }
 
 fn execute_process_command(command: ProcessCommand) -> CallOutput {
@@ -322,21 +321,21 @@ fn execute_process_command(command: ProcessCommand) -> CallOutput {
     let process_group = child.id();
     let started = Instant::now();
 
-    let status = loop {
+    loop {
         if command.cancelled.load(Ordering::Acquire) {
             return kill_and_reap(child, stdout, stderr, CallError::Timeout);
         }
         if started.elapsed() >= command.timeout {
             return kill_and_reap(child, stdout, stderr, CallError::Timeout);
         }
-        match poll_child_exit(&mut child) {
-            Ok(Some(status)) => break status,
-            Ok(None) => thread::sleep(Duration::from_millis(1)),
+        match child_has_exited(&mut child) {
+            Ok(true) => break,
+            Ok(false) => thread::sleep(Duration::from_millis(1)),
             Err(_) => return kill_and_reap(child, stdout, stderr, CallError::KillUncertain),
         }
-    };
+    }
 
-    process_exited(child, status, stdout, stderr, process_group)
+    process_exited(child, stdout, stderr, process_group)
 }
 
 fn kill_and_reap(
@@ -353,7 +352,7 @@ fn kill_and_reap(
     if !killed_group && child.kill().is_err() {
         let process_group = child.id();
         return match child.try_wait() {
-            Ok(Some(status)) => process_exited(child, status, stdout, stderr, process_group),
+            Ok(Some(_)) => process_exited(child, stdout, stderr, process_group),
             Ok(None) | Err(_) => CallOutput::Failed(CallError::KillUncertain),
         };
     }
@@ -398,8 +397,7 @@ fn kill_process_group(pid: u32) -> std::io::Result<()> {
 }
 
 fn process_exited(
-    child: std::process::Child,
-    status: std::process::ExitStatus,
+    mut child: std::process::Child,
     stdout: Option<JoinHandle<(Vec<u8>, bool)>>,
     stderr: Option<JoinHandle<(Vec<u8>, bool)>>,
     process_group: u32,
@@ -415,26 +413,20 @@ fn process_exited(
             // runtime rail after the bounded drain budget is spent.
             //
             // On Linux the leader was only peeked (WNOWAIT, see
-            // `poll_child_exit`), so it is still a zombie: its pid keeps
+            // `child_has_exited`), so it is still a zombie: its pid keeps
             // anchoring the group, and `kill -pgid` here cannot signal a
             // recycled group (F3). On other unix the leader was already reaped
             // in the poll loop, so a narrow recycle race remains here.
             let _ = kill_process_group(process_group);
         }
     }
-    // Linux: reap the leader we only peeked above (it is already a zombie, so
-    // this returns at once). Elsewhere the poll loop already reaped it.
-    #[cfg(target_os = "linux")]
-    {
-        let mut child = child;
-        let _ = child.wait();
-    }
-    #[cfg(not(target_os = "linux"))]
-    drop(child);
+    // Reap the leader for its real status. On Linux it is still a zombie (we
+    // only peeked it), so this must run *after* the group kill above to keep
+    // its pid reserved; it returns at once. Elsewhere the poll loop already
+    // reaped it and this returns the cached status.
+    let code = child.wait().ok().and_then(|status| status.code());
     CallOutput::ProcessExited {
-        status: ProcessStatus {
-            code: status.code(),
-        },
+        status: ProcessStatus { code },
         stdout,
         stderr,
         stdout_truncated,
