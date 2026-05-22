@@ -68,6 +68,13 @@ pub enum EffectKind {
     /// The handler returned [`tina::Effect::Stop`].
     Stop,
 
+    /// The handler returned [`tina::Effect::Fail`].
+    ///
+    /// Lifecycle is identical to [`Self::Stop`]; the distinction lets trace
+    /// readers tell a typed failure (which feeds supervision) from a clean
+    /// stop.
+    Fail,
+
     /// The handler returned [`tina::Effect::StopWith`].
     ///
     /// Lifecycle is identical to [`Self::Stop`]; the distinction lets trace
@@ -406,6 +413,11 @@ pub enum RuntimeEventKind {
 
     /// The handler unwound with a panic instead of returning an effect.
     HandlerPanicked,
+
+    /// The handler returned [`tina::Effect::Fail`]: a typed, non-panic
+    /// failure that stops the isolate and feeds supervision exactly like a
+    /// panic, recorded distinctly so the two never collapse.
+    HandlerReportedFailure,
 
     /// The handler returned, including the effect kind it produced.
     HandlerFinished {
@@ -1068,6 +1080,7 @@ fn effect_kind_tag(effect: EffectKind) -> u8 {
         EffectKind::SpawnObserved => 11,
         EffectKind::Reject => 12,
         EffectKind::Fact => 13,
+        EffectKind::Fail => 14,
     }
 }
 
@@ -1454,6 +1467,8 @@ fn write_kind_stable(kind: RuntimeEventKind, hasher: &mut StableHasher) {
         RuntimeEventKind::MailboxAccepted => hasher.write_u8(1),
         RuntimeEventKind::HandlerStarted => hasher.write_u8(2),
         RuntimeEventKind::HandlerPanicked => hasher.write_u8(3),
+        // Appended (tag 37): keep tags append-only, never renumber.
+        RuntimeEventKind::HandlerReportedFailure => hasher.write_u8(37),
         RuntimeEventKind::HandlerFinished { effect } => {
             hasher.write_u8(4);
             hasher.write_u8(effect_kind_tag(effect));

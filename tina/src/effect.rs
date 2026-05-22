@@ -49,6 +49,17 @@ where
     /// Stop the current isolate.
     Stop,
 
+    /// Fail the current isolate as a typed, non-panic failure.
+    ///
+    /// Same lifecycle as [`Self::Stop`] — the isolate stops and any
+    /// in-flight caller settles visibly — but the runtime records it as a
+    /// distinct `HandlerReportedFailure` fact and routes it through the
+    /// supervision policy exactly like a handler panic. A supervised child
+    /// is restarted per its parent's policy and budget; an unsupervised
+    /// isolate simply stops. Use this to fail loudly without unwinding the
+    /// thread, and keep panic and reported failure separate in the trace.
+    Fail,
+
     /// Stop the current isolate and publish a typed final result for a
     /// host-registered `observe_result::<T>` waiter.
     ///
@@ -260,6 +271,16 @@ where
     T: Send + 'static,
 {
     Effect::StopWith(StopResult::new(value))
+}
+
+/// Returns an effect that fails the current isolate as a typed, non-panic
+/// failure. See [`Effect::Fail`]: the isolate stops and, if supervised, is
+/// restarted per its parent's policy, recorded distinctly from a panic.
+pub fn fail<I>() -> Effect<I>
+where
+    I: Isolate,
+{
+    Effect::Fail
 }
 
 /// Returns an effect that asks the runtime to restart this isolate's direct

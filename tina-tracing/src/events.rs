@@ -68,6 +68,15 @@ pub fn emit_event(event: &RuntimeEvent) {
             shard,
             isolate,
         ),
+        RuntimeEventKind::HandlerReportedFailure => event!(
+            target: RUNTIME_TRACE_TARGET,
+            Level::ERROR,
+            kind = "handler_reported_failure",
+            event_id,
+            cause_id = ?cause_id,
+            shard,
+            isolate,
+        ),
         RuntimeEventKind::HandlerFinished { effect } => event!(
             target: RUNTIME_TRACE_TARGET,
             Level::TRACE,
@@ -560,6 +569,7 @@ pub fn effect_kind_name(kind: EffectKind) -> &'static str {
         EffectKind::Spawn => "spawn",
         EffectKind::SpawnObserved => "spawn_observed",
         EffectKind::Stop => "stop",
+        EffectKind::Fail => "fail",
         EffectKind::StopWith => "stop_with",
         EffectKind::RestartChildren => "restart_children",
         EffectKind::Call => "call",

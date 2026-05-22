@@ -448,7 +448,7 @@ pub mod prelude {
         ChildRef, Context, Deadline, DeferCancelableThrough, DeferThrough, DeferredReply, Effect,
         Isolate, IsolateId, Outbound, PendingCallSet, PendingCallSetInsertError, RequestCall,
         RequestContext, RequestDeferCancelableThrough, RequestDeferThrough, RequestEffect,
-        RestartableChildDefinition, Shard, ShardId, SingleShard, SpawnObservedError, batch,
+        RestartableChildDefinition, Shard, ShardId, SingleShard, SpawnObservedError, batch, fail,
         isolate, isolate_types, noop, reply, reply_to, reply_to_request, restart_children, send,
         sequence, spawn, spawn_observed, stop, stop_with,
         time::{

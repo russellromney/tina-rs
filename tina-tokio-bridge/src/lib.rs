@@ -436,6 +436,7 @@ where
         tina::Effect::Spawn(spawn) => tina::Effect::Spawn(spawn),
         tina::Effect::SpawnObserved(spawn) => match spawn {},
         tina::Effect::Stop => tina::Effect::Stop,
+        tina::Effect::Fail => tina::Effect::Fail,
         tina::Effect::StopWith(result) => tina::Effect::StopWith(result),
         tina::Effect::RestartChildren => tina::Effect::RestartChildren,
         tina::Effect::Call(call) => tina::Effect::Call(call),

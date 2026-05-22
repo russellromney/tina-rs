@@ -597,6 +597,7 @@ where
             ErasedEffect::SpawnObserved(spawn.into_erased_spawn_observed())
         }
         Effect::Stop => ErasedEffect::Stop,
+        Effect::Fail => ErasedEffect::Fail,
         // Sim has no host result waiter surface; StopWith stops the isolate
         // and drops the value. Trace still distinguishes via EffectKind.
         Effect::StopWith(_) => ErasedEffect::StopWith,
@@ -728,6 +729,7 @@ where
     Spawn(Box<dyn ErasedSpawn<S>>),
     SpawnObserved(Box<dyn ErasedSpawnObserved<S>>),
     Stop,
+    Fail,
     StopWith,
     RestartChildren,
     Call(ErasedCall),
@@ -752,6 +754,7 @@ where
             Self::Spawn(_) => EffectKind::Spawn,
             Self::SpawnObserved(_) => EffectKind::SpawnObserved,
             Self::Stop => EffectKind::Stop,
+            Self::Fail => EffectKind::Fail,
             Self::StopWith => EffectKind::StopWith,
             Self::RestartChildren => EffectKind::RestartChildren,
             Self::Call(_) => EffectKind::Call,
@@ -781,7 +784,7 @@ where
 
     fn stops_before_consuming_call_context(&self) -> bool {
         match self {
-            Self::Stop | Self::StopWith => true,
+            Self::Stop | Self::Fail | Self::StopWith => true,
             Self::Reply(_) | Self::Reject(_) => false,
             Self::Batch(effects) => {
                 for effect in effects {

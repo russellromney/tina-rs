@@ -32,6 +32,7 @@ enum WorkerMsg {
     Boot,
     Work(u32),
     Poison,
+    Fail,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,6 +75,7 @@ impl Isolate for Worker {
                 Effect::Noop
             }
             WorkerMsg::Poison => panic!("simulated worker panic"),
+            WorkerMsg::Fail => Effect::Fail,
         }
     }
 }
@@ -741,6 +743,60 @@ fn restart_budget_exhaustion_is_visible_and_reproducible() {
             }
         )
     }));
+}
+
+#[test]
+fn non_panic_child_failure_start_fail_restart_stop_sequence_is_replayable() {
+    fn run() -> Vec<RuntimeEvent> {
+        let observations = Rc::new(RefCell::new(Vec::new()));
+        let mut sim = Simulator::new(TestShard, SimulatorConfig::default());
+        let parent = sim.register(RestartableParent { observations });
+        sim.supervise(
+            parent,
+            SupervisorConfig::new(RestartPolicy::OneForOne, RestartBudget::new(2)),
+        );
+        sim.try_send(parent, ParentMsg::SpawnOne).unwrap();
+        sim.run_until_quiescent();
+
+        let first = spawned_children(sim.trace())[0];
+        // Typed, non-panic failure rather than a panic.
+        sim.try_send(address_for_worker(first), WorkerMsg::Fail)
+            .unwrap();
+        sim.run_until_quiescent();
+        sim.trace().to_vec()
+    }
+
+    let trace = run();
+    let replayed = run();
+    assert_eq!(trace, replayed, "fail/restart sequence must replay identically");
+
+    let first = spawned_children(&trace)[0];
+    // start -> fail -> stop -> restart, all visible and distinct from panic.
+    assert!(
+        trace
+            .iter()
+            .any(|event| matches!(event.kind(), RuntimeEventKind::Spawned { .. })),
+        "child start must be visible"
+    );
+    assert!(
+        trace.iter().any(|event| event.isolate() == first
+            && matches!(event.kind(), RuntimeEventKind::HandlerReportedFailure)),
+        "typed failure must be recorded distinctly"
+    );
+    assert!(
+        !trace
+            .iter()
+            .any(|event| matches!(event.kind(), RuntimeEventKind::HandlerPanicked)),
+        "a typed failure must not surface as a panic"
+    );
+    assert!(
+        trace.iter().any(|event| event.isolate() == first
+            && matches!(event.kind(), RuntimeEventKind::IsolateStopped)),
+        "failed child must stop"
+    );
+    let restarts = completed_restarts(&trace);
+    assert_eq!(restarts.len(), 1, "the failed child must be restarted once");
+    assert_eq!(restarts[0].0, first, "restart must replace the failed child");
 }
 
 #[test]

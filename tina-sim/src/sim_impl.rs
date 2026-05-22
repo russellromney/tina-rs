@@ -342,7 +342,7 @@ where
                         }
                     }
                     self.stop_entry(index, isolate_id, panicked.into());
-                    self.supervise_panic(
+                    self.supervise_failed_child(
                         RegisteredAddress {
                             shard: self.shard.id(),
                             isolate: isolate_id,
@@ -521,6 +521,28 @@ where
         match effect {
             ErasedEffect::Stop | ErasedEffect::StopWith => {
                 self.stop_entry(index, isolate_id, cause);
+                true
+            }
+            ErasedEffect::Fail => {
+                // Typed, non-panic failure: record it distinctly, stop the
+                // isolate, then feed supervision exactly like a panic so the
+                // sim and live runtimes restart identically.
+                let generation = self.entries[index].generation;
+                let failed = self.push_event(
+                    isolate_id,
+                    Some(cause),
+                    RuntimeEventKind::HandlerReportedFailure,
+                );
+                self.stop_entry(index, isolate_id, failed.into());
+                self.supervise_failed_child(
+                    RegisteredAddress {
+                        shard: self.shard.id(),
+                        isolate: isolate_id,
+                        generation,
+                    },
+                    failed.into(),
+                    round_messages,
+                );
                 true
             }
             ErasedEffect::Send(send) => {
@@ -1106,7 +1128,7 @@ where
         }
     }
 
-    pub(crate) fn supervise_panic(
+    pub(crate) fn supervise_failed_child(
         &mut self,
         failed_child: RegisteredAddress,
         cause: tina_runtime::CauseId,

@@ -60,6 +60,8 @@ pub enum RuntimeEventKindName {
     HandlerStarted,
     /// [`RuntimeEventKind::HandlerPanicked`].
     HandlerPanicked,
+    /// [`RuntimeEventKind::HandlerReportedFailure`].
+    HandlerReportedFailure,
     /// [`RuntimeEventKind::HandlerFinished`].
     HandlerFinished,
     /// [`RuntimeEventKind::EffectObserved`].
@@ -133,6 +135,7 @@ fn runtime_event_kind_name(kind: RuntimeEventKind) -> Option<RuntimeEventKindNam
         RuntimeEventKind::MailboxAccepted => RuntimeEventKindName::MailboxAccepted,
         RuntimeEventKind::HandlerStarted => RuntimeEventKindName::HandlerStarted,
         RuntimeEventKind::HandlerPanicked => RuntimeEventKindName::HandlerPanicked,
+        RuntimeEventKind::HandlerReportedFailure => RuntimeEventKindName::HandlerReportedFailure,
         RuntimeEventKind::HandlerFinished { .. } => RuntimeEventKindName::HandlerFinished,
         RuntimeEventKind::EffectObserved { .. } => RuntimeEventKindName::EffectObserved,
         RuntimeEventKind::SendDispatchAttempted { .. } => {
@@ -299,6 +302,7 @@ fn every_kind_except(keep: &[RuntimeEventKindName]) -> Vec<RuntimeEventKindName>
         N::MailboxAccepted,
         N::HandlerStarted,
         N::HandlerPanicked,
+        N::HandlerReportedFailure,
         N::HandlerFinished,
         N::EffectObserved,
         N::SendDispatchAttempted,

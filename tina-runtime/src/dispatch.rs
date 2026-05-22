@@ -327,7 +327,7 @@ where
                         }
                     }
                     self.stop_entry(index, isolate_id, handler_panicked.into());
-                    self.supervise_panic(
+                    self.supervise_failed_child(
                         RegisteredAddress {
                             shard: self.shard.id(),
                             isolate: isolate_id,
@@ -542,6 +542,29 @@ where
         match effect {
             ErasedEffect::Stop => {
                 self.stop_entry(index, isolate_id, cause);
+                true
+            }
+            ErasedEffect::Fail => {
+                // Typed, non-panic failure: record it distinctly, stop the
+                // isolate (any in-flight caller already settled visibly via
+                // the abandoned-context path), then feed supervision exactly
+                // like a panic.
+                let generation = self.entries[index].generation;
+                let failed = self.push_event(
+                    isolate_id,
+                    Some(cause),
+                    RuntimeEventKind::HandlerReportedFailure,
+                );
+                self.stop_entry(index, isolate_id, failed.into());
+                self.supervise_failed_child(
+                    RegisteredAddress {
+                        shard: self.shard.id(),
+                        isolate: isolate_id,
+                        generation,
+                    },
+                    failed.into(),
+                    round_messages,
+                );
                 true
             }
             ErasedEffect::StopWith(result) => {
@@ -2155,7 +2178,7 @@ where
         }
     }
 
-    pub(crate) fn supervise_panic(
+    pub(crate) fn supervise_failed_child(
         &mut self,
         failed_child: RegisteredAddress,
         cause: CauseId,
@@ -2865,6 +2888,7 @@ where
             ErasedEffect::SpawnObserved(spawn.into_erased_spawn_observed())
         }
         Effect::Stop => ErasedEffect::Stop,
+        Effect::Fail => ErasedEffect::Fail,
         Effect::StopWith(result) => ErasedEffect::StopWith(result),
         Effect::RestartChildren => ErasedEffect::RestartChildren,
         Effect::Call(call) => ErasedEffect::Call(call.into_erased_call()),
@@ -2913,6 +2937,7 @@ where
             ErasedEffect::SpawnObserved(spawn.into_erased_spawn_observed())
         }
         Effect::Stop => ErasedEffect::Stop,
+        Effect::Fail => ErasedEffect::Fail,
         Effect::StopWith(result) => ErasedEffect::StopWith(result),
         Effect::RestartChildren => ErasedEffect::RestartChildren,
         Effect::Call(call) => ErasedEffect::Call(call.into_erased_call()),
@@ -2958,6 +2983,7 @@ where
     Spawn(Box<dyn ErasedSpawn<S, F>>),
     SpawnObserved(Box<dyn ErasedSpawnObserved<S, F>>),
     Stop,
+    Fail,
     StopWith(StopResult),
     RestartChildren,
     Call(ErasedCall),
@@ -2983,6 +3009,7 @@ where
             Self::Spawn(_) => EffectKind::Spawn,
             Self::SpawnObserved(_) => EffectKind::SpawnObserved,
             Self::Stop => EffectKind::Stop,
+            Self::Fail => EffectKind::Fail,
             Self::StopWith(_) => EffectKind::StopWith,
             Self::RestartChildren => EffectKind::RestartChildren,
             Self::Call(_) => EffectKind::Call,
@@ -3012,7 +3039,7 @@ where
 
     pub(crate) fn stops_before_consuming_call_context(&self) -> bool {
         match self {
-            Self::Stop | Self::StopWith(_) => true,
+            Self::Stop | Self::Fail | Self::StopWith(_) => true,
             Self::Reply(_) | Self::Reject(_) => false,
             Self::Batch(effects) => {
                 for effect in effects {

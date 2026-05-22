@@ -36,6 +36,7 @@ impl Isolate for PanickingRestartFactoryRoot {
             }
             LineageMsg::Stop => Effect::Stop,
             LineageMsg::Panic => panic!("panic inside panicking-factory root"),
+            LineageMsg::Fail => Effect::Fail,
             LineageMsg::Restart | LineageMsg::SpawnGrandchild => Effect::Noop,
         }
     }
@@ -576,6 +577,99 @@ fn supervisor_report_names_budget_exhaustion_as_terminal_halt() {
             attempted_restart: 1,
             max_restarts: 0,
         })
+    );
+}
+
+#[test]
+fn non_panic_child_failure_restarts_with_new_incarnation_and_rejects_stale_address() {
+    use crate::supervision_report::SupervisorReport;
+
+    let factory_calls = Rc::new(Cell::new(0));
+    let mut runtime = Runtime::new(TestShard, TestMailboxFactory);
+    let root = runtime.register(
+        new_restartable_root(Rc::clone(&factory_calls)),
+        root_mailbox(),
+    );
+    runtime.supervise(
+        root,
+        SupervisorConfig::new(RestartPolicy::OneForOne, tina::RestartBudget::new(3)),
+    );
+
+    assert_eq!(runtime.try_send(root, LineageMsg::SpawnChild), Ok(()));
+    assert_eq!(runtime.step(), 1);
+    let child = last_spawned_child(runtime.trace());
+
+    // The child fails as a typed, non-panic outcome.
+    assert_eq!(
+        runtime.try_send(lineage_address(child), LineageMsg::Fail),
+        Ok(())
+    );
+    assert_eq!(runtime.step(), 1);
+
+    // A fresh incarnation replaced the failed child (initial spawn + restart).
+    let replacement = runtime.child_record_snapshot()[0].child_isolate;
+    assert_ne!(replacement, child);
+    assert_eq!(factory_calls.get(), 2);
+
+    // The failure is recorded distinctly from a panic.
+    assert!(
+        runtime.trace().iter().any(|event| event.isolate() == child
+            && matches!(event.kind(), RuntimeEventKind::HandlerReportedFailure)),
+        "typed failure must record HandlerReportedFailure"
+    );
+    assert!(
+        !runtime
+            .trace()
+            .iter()
+            .any(|event| matches!(event.kind(), RuntimeEventKind::HandlerPanicked)),
+        "a typed failure must not be recorded as a panic"
+    );
+
+    // The stale pre-restart address rejects loudly.
+    assert_eq!(
+        runtime.try_send(lineage_address(child), LineageMsg::SpawnChild),
+        Err(TrySendError::Closed(LineageMsg::SpawnChild))
+    );
+
+    // The same supervision path ran: one completed restart, naming the new
+    // incarnation under the owner.
+    let report = SupervisorReport::from_events(runtime.trace().iter(), root.isolate());
+    assert_eq!(report.restarts_completed, 1);
+    assert_eq!(report.children.len(), 1);
+    assert_eq!(report.children[0].latest_isolate, replacement);
+}
+
+#[test]
+fn unsupervised_isolate_failure_stops_without_restart() {
+    let factory_calls = Rc::new(Cell::new(0));
+    let mut runtime = Runtime::new(TestShard, TestMailboxFactory);
+    let root = runtime.register(
+        new_restartable_root(Rc::clone(&factory_calls)),
+        root_mailbox(),
+    );
+    // No `runtime.supervise(root, ...)`: the child has no supervisor.
+
+    assert_eq!(runtime.try_send(root, LineageMsg::SpawnChild), Ok(()));
+    assert_eq!(runtime.step(), 1);
+    let child = last_spawned_child(runtime.trace());
+
+    assert_eq!(
+        runtime.try_send(lineage_address(child), LineageMsg::Fail),
+        Ok(())
+    );
+    assert_eq!(runtime.step(), 1);
+
+    // No replacement: the factory ran once, for the initial spawn.
+    assert_eq!(factory_calls.get(), 1);
+    // The failure and stop are recorded, but supervision did nothing.
+    assert!(
+        runtime.trace().iter().any(|event| event.isolate() == child
+            && matches!(event.kind(), RuntimeEventKind::HandlerReportedFailure)),
+    );
+    assert_eq!(supervisor_events(runtime.trace()), Vec::new());
+    assert_eq!(
+        runtime.try_send(lineage_address(child), LineageMsg::SpawnChild),
+        Err(TrySendError::Closed(LineageMsg::SpawnChild))
     );
 }
 
