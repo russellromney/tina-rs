@@ -264,11 +264,13 @@ pub enum RecoveryError {
     /// stops visibly rather than guessing past the corruption.
     CorruptTail,
     /// Replaying pending work would exceed the configured capacity. Replay is
-    /// bounded; recovery refuses rather than growing without limit.
+    /// bounded; recovery refuses the moment the live backlog passes capacity
+    /// rather than scanning an oversized log.
     OverCapacity {
         /// The configured capacity.
         capacity: usize,
-        /// The number of pending records the journal would have replayed.
+        /// The live pending count when the bound was crossed (`capacity + 1`),
+        /// not the full backlog — recovery stops before reading the rest.
         pending: usize,
     },
     /// The journal could not be read.
@@ -381,7 +383,9 @@ impl<W: DurablePayload> DurableOutbox<W> {
     ///
     /// Returns [`OutboxFull`] carrying the original work when at capacity. On
     /// success the returned [`DurableWork`] carries the journal index and bytes
-    /// to append; the work is not yet durable.
+    /// to append; the work is not yet durable. Follow every `enqueue` with
+    /// exactly one [`record`](Self::record) or [`abandon`](Self::abandon) —
+    /// dropping the token leaks its capacity slot.
     pub fn enqueue(&mut self, work: W) -> Result<DurableWork<W>, OutboxFull<W>> {
         if self.is_full() {
             return Err(OutboxFull { work });
@@ -411,17 +415,24 @@ impl<W: DurablePayload> DurableOutbox<W> {
         staged: DurableWork<W>,
         append: Result<(), CallError>,
     ) -> Result<RecordedWork<W>, AppendFailed<W>> {
-        self.staged.remove(&staged.id.0);
+        // Only advance state for a token this outbox actually staged. A stale
+        // token (for example one held across a `recover`, which returns a fresh
+        // outbox) is not ours; do not fabricate a pending entry from it.
+        let was_staged = self.staged.remove(&staged.id.0);
         match append {
             Ok(()) => {
-                self.pending.insert(staged.id.0);
+                if was_staged {
+                    self.pending.insert(staged.id.0);
+                }
                 Ok(RecordedWork {
                     id: staged.id,
                     work: staged.work,
                 })
             }
             Err(error) => {
-                self.failed_total += 1;
+                if was_staged {
+                    self.failed_total += 1;
+                }
                 self.advance_watermark();
                 Err(AppendFailed {
                     error,
@@ -429,6 +440,19 @@ impl<W: DurablePayload> DurableOutbox<W> {
                 })
             }
         }
+    }
+
+    /// Abandon staged work without recording it, freeing its capacity slot and
+    /// returning the original work.
+    ///
+    /// Stage with [`enqueue`](Self::enqueue), then exactly one of:
+    /// [`record`](Self::record) (durable) or `abandon` (give up). Dropping the
+    /// [`DurableWork`] instead leaks its capacity slot — the `#[must_use]` lint
+    /// flags that.
+    pub fn abandon(&mut self, staged: DurableWork<W>) -> W {
+        self.staged.remove(&staged.id.0);
+        self.advance_watermark();
+        staged.work
     }
 
     /// Apply recorded work.
@@ -479,9 +503,13 @@ impl<W: DurablePayload> DurableOutbox<W> {
     ) -> Result<CommittedWork, CompletionFailed> {
         match append {
             Ok(()) => {
-                self.pending.remove(&completion.id.0);
-                self.mark_completed(completion.id);
-                self.completed_total += 1;
+                // Count and mark complete once. A second completion record for
+                // the same id (the work already left pending) is idempotent: the
+                // durable record is fine, but it is not a fresh completion.
+                if self.pending.remove(&completion.id.0) {
+                    self.mark_completed(completion.id);
+                    self.completed_total += 1;
+                }
                 Ok(CommittedWork { id: completion.id })
             }
             Err(error) => {
@@ -505,6 +533,10 @@ impl<W: DurablePayload> DurableOutbox<W> {
     /// capacity. Records are folded in journal order: an enqueue makes work
     /// pending, a completion clears it and marks the id completed. Pending work
     /// is returned as ready-to-apply [`RecordedWork`].
+    ///
+    /// This returns a *fresh* outbox. Any staged [`DurableWork`] from a prior
+    /// instance is stale against it; drop those tokens rather than recording
+    /// them here.
     pub fn recover(
         capacity: usize,
         replay: Result<JournalReplay, CallError>,
@@ -516,7 +548,8 @@ impl<W: DurablePayload> DurableOutbox<W> {
             Err(_) => return Err(RecoveryError::Io),
         };
 
-        let mut outbox = Self::new(capacity);
+        let cap = capacity.max(1);
+        let mut outbox = Self::new(cap);
         // Preserve durable order while reconstructing which work is still open.
         // `Vec` keeps insertion order for the report; the set guards membership.
         let mut pending_order: Vec<(WorkId, W)> = Vec::new();
@@ -538,6 +571,15 @@ impl<W: DurablePayload> DurableOutbox<W> {
                     };
                     if pending_ids.insert(id.0) {
                         pending_order.push((id, work));
+                        // Bound replay: refuse the moment the live backlog would
+                        // exceed capacity, instead of scanning an oversized log.
+                        // `pending` is the count at that point (capacity + 1).
+                        if pending_ids.len() > cap {
+                            return Err(RecoveryError::OverCapacity {
+                                capacity: cap,
+                                pending: pending_ids.len(),
+                            });
+                        }
                     }
                 }
                 TAG_COMPLETE => {
@@ -550,13 +592,6 @@ impl<W: DurablePayload> DurableOutbox<W> {
                 }
                 _ => return Err(RecoveryError::CorruptTail),
             }
-        }
-
-        if pending_order.len() > capacity.max(1) {
-            return Err(RecoveryError::OverCapacity {
-                capacity: capacity.max(1),
-                pending: pending_order.len(),
-            });
         }
 
         outbox.next_index = max_index + 1;
@@ -841,20 +876,103 @@ mod tests {
     }
 
     #[test]
-    fn recover_rejects_over_capacity_replay() {
+    fn recover_bails_at_capacity_plus_one_for_over_capacity_replay() {
         let records: Vec<(u64, Vec<u8>)> = (1..=4)
             .map(|i| (i, frame_record(TAG_ENQUEUE, WorkId(i), Some(b"x"))))
             .collect();
         let err =
             DurableOutbox::<Vec<u8>>::recover(2, Ok(replay_of(&records)), CommitConfidence::Clean)
                 .expect_err("over capacity");
+        // Bounded replay: refused at the third enqueue (capacity 2 + 1), not
+        // after scanning all four.
         assert_eq!(
             err,
             RecoveryError::OverCapacity {
                 capacity: 2,
-                pending: 4
+                pending: 3
             }
         );
+    }
+
+    #[test]
+    fn recover_within_capacity_with_interleaving_succeeds() {
+        // Enqueue/complete interleaved so the live backlog never exceeds 2,
+        // even though five items pass through a capacity-2 outbox.
+        let records = vec![
+            (1, frame_record(TAG_ENQUEUE, WorkId(1), Some(b"a"))),
+            (2, frame_record(TAG_ENQUEUE, WorkId(2), Some(b"b"))),
+            (3, frame_record(TAG_COMPLETE, WorkId(1), None)),
+            (4, frame_record(TAG_ENQUEUE, WorkId(3), Some(b"c"))),
+            (5, frame_record(TAG_COMPLETE, WorkId(2), None)),
+            (6, frame_record(TAG_ENQUEUE, WorkId(4), Some(b"d"))),
+        ];
+        let (_outbox, report) =
+            DurableOutbox::<Vec<u8>>::recover(2, Ok(replay_of(&records)), CommitConfidence::Clean)
+                .expect("within capacity");
+        let pending: Vec<u64> = report.pending.iter().map(|w| w.work_id().0).collect();
+        // 3 and 4 remain, in durable order.
+        assert_eq!(pending, vec![3, 4]);
+    }
+
+    #[test]
+    fn recover_preserves_pending_durable_order() {
+        let records = vec![
+            (1, frame_record(TAG_ENQUEUE, WorkId(1), Some(b"first"))),
+            (2, frame_record(TAG_ENQUEUE, WorkId(2), Some(b"second"))),
+            (3, frame_record(TAG_ENQUEUE, WorkId(3), Some(b"third"))),
+        ];
+        let (mut outbox, report) =
+            DurableOutbox::<Vec<u8>>::recover(8, Ok(replay_of(&records)), CommitConfidence::Clean)
+                .expect("recovered");
+        let order: Vec<Vec<u8>> = report
+            .pending
+            .into_iter()
+            .map(|recorded| match outbox.apply(recorded) {
+                ApplyStatus::Apply(work) => work,
+                ApplyStatus::DuplicateWork(_) => panic!("unexpected duplicate"),
+            })
+            .collect();
+        assert_eq!(
+            order,
+            vec![b"first".to_vec(), b"second".to_vec(), b"third".to_vec()]
+        );
+    }
+
+    #[test]
+    fn abandon_frees_capacity_and_returns_work() {
+        let mut outbox: DurableOutbox<Vec<u8>> = DurableOutbox::new(1);
+        let staged = outbox.enqueue(b"work".to_vec()).expect("fits");
+        assert!(outbox.is_full());
+        let work = outbox.abandon(staged);
+        assert_eq!(work, b"work".to_vec());
+        // slot reclaimed: a fresh enqueue fits, and nothing is left abandoned.
+        assert!(!outbox.is_full());
+        assert!(outbox.enqueue(b"next".to_vec()).is_ok());
+        let report = outbox.shutdown_report();
+        // the abandoned token freed its slot, so it is not reported as abandoned.
+        assert!(!report.abandoned.contains(&WorkId(1)));
+    }
+
+    #[test]
+    fn finish_complete_counts_completion_once_for_a_duplicate_record() {
+        let mut outbox: DurableOutbox<Vec<u8>> = DurableOutbox::new(4);
+        let recorded = record_ok(&mut outbox, b"x".to_vec());
+        let id = recorded.work_id();
+        let _ = outbox.apply(recorded);
+        // Stage two completion records before either finishes (a re-issued
+        // completion). Both durable appends succeed.
+        let first = match outbox.begin_complete(id) {
+            CompletionStart::Record(c) => c,
+            other => panic!("expected Record, got {other:?}"),
+        };
+        outbox.finish_complete(first, Ok(())).expect("first commit");
+        // The id already left pending; begin_complete is now idempotent.
+        assert!(matches!(
+            outbox.begin_complete(id),
+            CompletionStart::AlreadyCompleted(found) if found == id
+        ));
+        // Completion counted exactly once despite the extra round.
+        assert_eq!(outbox.shutdown_report().completed, 1);
     }
 
     #[test]

@@ -20,9 +20,10 @@ the truth — without an exactly-once claim or a durable mailbox.
   which only a successful durable record (or recovery of still-pending work)
   produces — so apply-before-record cannot be written. `apply` consumes the
   token, so the same work cannot be applied twice. A failed append returns the
-  original work in `AppendFailed`. Marking work complete is idempotent by
-  `WorkId` (`AlreadyCompleted`), not a silent success. Compile-fail proofs pin
-  both the apply-before-record and double-apply diagnostics.
+  original work in `AppendFailed`; `abandon` reclaims a staged slot when you
+  decide not to record. Marking work complete is idempotent by `WorkId`
+  (`AlreadyCompleted`), not a silent success. Compile-fail proofs pin both the
+  apply-before-record and double-apply diagnostics.
 - **Recovery names the tail.** `DurableOutbox::recover` replays the journal into
   a fresh outbox plus a `RecoveryReport`: pending work as ready-to-apply tokens,
   the ids already completed, and a `TailStatus` separating a clean tail, a
