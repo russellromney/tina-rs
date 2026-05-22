@@ -277,8 +277,13 @@ fn poll_child_exit(
     // reports its exit state without consuming the zombie, leaving it for the
     // later `child.wait()` in `process_exited`. `raw` is a valid, initialized
     // out-parameter; nothing else waits on this pid.
-    let result =
-        unsafe { libc::waitpid(child.id() as libc::pid_t, &mut raw, libc::WNOHANG | libc::WNOWAIT) };
+    let result = unsafe {
+        libc::waitpid(
+            child.id() as libc::pid_t,
+            &mut raw,
+            libc::WNOHANG | libc::WNOWAIT,
+        )
+    };
     if result == 0 {
         Ok(None)
     } else if result > 0 {
