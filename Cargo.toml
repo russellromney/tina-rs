@@ -61,6 +61,11 @@ exclude = [
     "examples/specimen_request_scope_fanout",
     "examples/specimen_websocket_room",
     "examples/specimen_local_io_codec_ipc",
+    "examples/extensions/tina-extension-capacity-surface",
+    "examples/extensions/tina-extension-custom-codec",
+    "examples/extensions/tina-extension-service-policy",
+    "examples/extensions/tina-extension-fake-bridge",
+    "examples/extensions/tina-extension-compile-fail",
 ]
 resolver = "2"
 

@@ -136,7 +136,7 @@ pub fn case() -> ReplayCase<Op> {
 // review (for example, when a new RuntimeEventKind variant gets added
 // or when the producer/sink isolate logic intentionally changes).
 const SAVED_EVENT_COUNT: usize = 54;
-const SAVED_TRACE_HASH: u64 = 0xc878_d2a4_3912_9480;
+const SAVED_TRACE_HASH: u64 = 0xb968_e0f8_3f76_56b4;
 
 /// Runs one [`ReplayCase`] and returns a [`ReplayReport`] whose event
 /// count and trace hash come from `tina_runtime::stable_trace_hash`.

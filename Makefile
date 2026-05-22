@@ -1,4 +1,5 @@
 SHELL := /bin/zsh
+EXAMPLES_TARGET_DIR ?= $(CURDIR)/target/verify-examples
 
 .PHONY: fmt fmt-check check test loom miri doc clippy portable-runtime-cost \
 	verify verify-examples proof-fast proof-soak proof-bad-peer \
@@ -28,15 +29,17 @@ doc:
 clippy:
 	cargo clippy --workspace --all-targets -- -D warnings
 
-# Walks examples/*/Cargo.toml (each is its own cargo workspace, excluded
-# from the main one). Builds + tests each so a workspace-only change
-# can't silently break a downstream specimen. Stops on first failure.
+# Walks examples/*/Cargo.toml and the extension smoke crates under
+# examples/extensions/*/Cargo.toml (each is its own cargo workspace,
+# excluded from the main one). Builds + tests each so a workspace-only
+# change can't silently break a downstream specimen or extension crate.
+# Stops on first failure.
 verify-examples:
 	@set -e; \
-	for manifest in examples/*/Cargo.toml; do \
+	for manifest in examples/*/Cargo.toml examples/extensions/*/Cargo.toml; do \
 		echo "==> $$manifest"; \
-		cargo test --manifest-path "$$manifest"; \
-		cargo clippy --manifest-path "$$manifest" --all-targets -- -D warnings; \
+		CARGO_TARGET_DIR="$(EXAMPLES_TARGET_DIR)" cargo test --manifest-path "$$manifest"; \
+		CARGO_TARGET_DIR="$(EXAMPLES_TARGET_DIR)" cargo clippy --manifest-path "$$manifest" --all-targets -- -D warnings; \
 	done
 
 portable-runtime-cost:

@@ -2,17 +2,15 @@
 
 ## Status
 
-- Future implementation plan for Wave B.
-- Can run in parallel with Phase 121 if ownership stays in public hook
-  traits, extension smoke crates, capability reports, and docs.
-- Runs after Phase 115 so hooks respect the core/battery boundary. Can absorb
-  lessons from Phase 117 codecs and Phase 118 service policies.
+- Completed.
+- Landed as public hook traits/data, extension smoke crates, capability
+  reports, and docs.
+- Built after Phase 115, so hooks respect the core/battery boundary.
 
 ## Starting Facts
 
-- Tina already has native TCP/TLS/HTTP/1/HTTP2/gRPC/WebSocket/timers/files/
-  process/DNS/pools/codecs work in flight or shipped. Async interop is not the
-  first answer for these.
+- Tina has native TCP/TLS/HTTP/1/HTTP2/gRPC/WebSocket/timers/files/process/DNS/
+  pools/codecs. Async interop is not the first answer for these.
 - Existing bridges (`reqwest`, `sqlx`, `sqlite`, `aws`, `tower`, `tokio`) prove
   the bridge pattern, but each still hand-rolls setup/lifecycle/metrics shape.
 - Phase 113 is the bridge author kit seed. This phase should expose public
@@ -36,13 +34,11 @@ I can plug in a codec, bridge, capacity surface, event sink, or policy without
 private runtime access and without weakening bounded/DST truth
 ```
 
-## Includes
+## Shipped
 
 - public capacity surface hook through existing `CapacitySurfaceReport` /
-  `CapacitySummary` data; add a trait only if an extension smoke crate cannot
-  work with owned reports
-- bounded event sink hook polish if existing `BoundedEventSink` lacks an
-  extension-facing shape
+  `CapacitySummary` data; no `CapacitySurface` trait was needed
+- bounded event sink extension hook through existing `BoundedEventSink`
 - sync codec adapter hook
 - service policy hook
 - bridge author smoke crate using the Phase 113 vocabulary

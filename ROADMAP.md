@@ -350,6 +350,14 @@ and reviews live under `.intent/phases/`.
   streaming, duplicate pseudo-header, continuation/priority, and flow-control
   edge cases are pinned with visible wire outcomes, and live multi-shard remote
   inbound drain no longer starves local runtime commands.
+- Ecosystem hooks and async boundary: public extension seams — an open
+  `SyncCodec` codec trait, an open `ServicePolicy` admission trait, a
+  read-shaped `RuntimeCapabilityReport`, and the aligned bridge / capacity /
+  event-sink vocabulary — plus five public-API-only extension smoke crates
+  (custom capacity surface, custom codec, custom policy, a bounded fake bridge
+  with caller-timeout honesty, and a compile-fail proof that extensions cannot
+  mint runtime-owned tokens or forge private reports), and docs classifying
+  native vs bridge vs unsupported async paths.
 
 These are recorded in `CHANGELOG.md`; the remaining near-term roadmap now
 starts with Wave A client/I/O/admission work below.
@@ -367,7 +375,6 @@ framework before public release-story work.
 | **119 Production resource and data maturity** | Wave A, after native protocol clients. Pool idle eviction/max lifetime/health/retire rules, pool shutdown reports, DB/HTTP/HTTP2/gRPC resource maturity, snapshot/journal restore patterns, and crash/corrupt-tail recovery specimens. Plan outline: `.intent/phases/119-production-resource-data-maturity/plan.md`. |
 | **120 Post-Wave-A ergonomics** | Digest Wave A into the copied service skeleton: outbound protocol clients, file/codec/local IPC, mature pools, durable restore, updated docs/findings, and cheap-model proof. Plan outline: `.intent/phases/120-post-wave-a-ergonomics/plan.md`. |
 | **121 Fairness and load behavior** | Wave B, after native protocol clients. Scheduler/session fairness proofs, timer fairness under hot load, protocol session fairness, remote inbound drain fairness, lag-ish reports, soak/load harnesses, and CPU/memory constrained runs. Plan outline: `.intent/phases/121-fairness-load-behavior/plan.md`. |
-| **122 Ecosystem hooks and async boundary** | Wave B. Public hooks for capacity surfaces, bounded event sinks, sync codecs, service policies, bridge authors, extension smoke crates, runtime capability reports, and explicit native/bridge/unsupported async boundary docs. Plan outline: `.intent/phases/122-ecosystem-hooks-async-boundary/plan.md`. |
 | **Trace timeline export** | Keep Tina's native `RuntimeEvent` trace canonical, then add an offline timeline exporter. V1 emits simple Chrome Trace Event JSON from `TraceSnapshot` / shutdown traces: shard and isolate metadata rows, duration slices for handler turns and runtime calls where timestamps exist, instant markers for `Full` / `Closed` / `Timeout` / late-reply / restart / shutdown facts, counter rows for mailbox, shard-pair, body, pool, and lane pressure, and causal flow ids from Tina cause/call ids. Add a tiny CLI or example command that writes `*.trace.json`, plus one `mini_saas_api` smoke artifact that opens in `chrome://tracing` and Perfetto UI. V2 adds Perfetto-compatible protobuf export once the Chrome mapping proves useful, with optional PerfettoSQL-friendly columns for event kind, isolate id, call id, cause id, and capacity surface. No live daemon integration, no replacement of DST/replay artifacts, and no hidden unbounded event sink. |
 | **125 Runtime supervision and fairness** | Post-122 core wave. Local multi-shard child ownership, parent-stop cleanup, replacement address refresh, failed-shard ingress truth, non-panic failure policy, supervisor reports, starvation-visible progress reports, and hot actor/session/timer/remote-edge proofs. Plan outline: `.intent/phases/125-supervision-failure-domains/plan.md`. |
 | **126 Durable local state and IPC** | Post-122 core wave. `DurableOutbox`, append-before-apply helper, bounded replay, restart recovery reports, corrupt/truncated/uncertain-tail outcomes, file streaming, rename-commit/directory-sync truth, Unix socket rails, framed local IPC, and local sidecar specimens. Plan outline: `.intent/phases/126-durable-work-restartable-state/plan.md`. |

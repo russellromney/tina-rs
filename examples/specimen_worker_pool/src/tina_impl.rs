@@ -3,8 +3,8 @@ use std::time::Duration;
 
 use tina::prelude::*;
 use tina_runtime::{
-    CallOutcome, DefaultThreadedMailboxFactory, PendingReplies, PendingRepliesTryCaptureError,
-    SleepReply, ThreadedRuntime, call, sleep,
+    CallOutcome, DefaultThreadedMailboxFactory, ParkCallError, PendingReplies, SleepReply,
+    ThreadedRuntime, call, sleep,
 };
 
 use crate::{CLIENTS, MAX_PENDING, Report, WORKERS, expected_for};
@@ -16,7 +16,7 @@ const CALL_TIMEOUT: Duration = Duration::from_secs(5);
 #[derive(Debug)]
 enum WorkerMsg {
     Do(u64),
-    Done(SleepReply, u64),
+    Done(RequestContext<WorkerReply>, SleepReply, u64),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -35,13 +35,24 @@ impl Worker {
         _ctx: &mut Context<'_, SingleShard, Self::Reply>,
     ) -> Effect<Self> {
         match msg {
+            WorkerMsg::Do(_) => noop(),
+            WorkerMsg::Done(req, Ok(()), result) => reply_to_request(req, WorkerReply(result)),
+            WorkerMsg::Done(req, Err(_), _) => reply_to_request(req, WorkerReply(0)),
+        }
+    }
+
+    fn handle_call(&mut self, msg: WorkerMsg, call_ctx: CallContext<'_, Self>) -> Effect<Self> {
+        match msg {
             // Vary the wait by id so replies arrive out of dispatch order.
             WorkerMsg::Do(payload) => {
                 let id = self.id;
-                sleep(self.work).then(move |reply| WorkerMsg::Done(reply, payload + id))
+                call_ctx
+                    .defer(sleep(self.work))
+                    .reply(move |req, reply| WorkerMsg::Done(req, reply, payload + id))
             }
-            WorkerMsg::Done(Ok(()), result) => reply(WorkerReply(result)),
-            WorkerMsg::Done(Err(_), _) => stop(),
+            WorkerMsg::Done(_, _, _) => {
+                call_ctx.reject(tina::CallRejectedReason::UnsupportedMessage)
+            }
         }
     }
 }
@@ -72,34 +83,46 @@ impl Frontend {
     fn handle(
         &mut self,
         msg: FrontendMsg,
-        ctx: &mut Context<'_, SingleShard, Self::Reply>,
+        _ctx: &mut Context<'_, SingleShard, Self::Reply>,
     ) -> Effect<Self> {
+        match msg {
+            FrontendMsg::Submit(_) => noop(),
+            FrontendMsg::WorkerDone(qid, outcome) => self.on_worker_done(qid, outcome),
+        }
+    }
+
+    fn handle_call(&mut self, msg: FrontendMsg, call_ctx: CallContext<'_, Self>) -> Effect<Self> {
         match msg {
             FrontendMsg::Submit(payload) => {
                 let qid = self.next_qid;
                 self.next_qid += 1;
-                match self.pending.try_capture(ctx, qid) {
-                    Ok(()) => {
+                match self.pending.park_call(qid, call_ctx) {
+                    Ok(_ticket) => {
                         let worker = self.workers[self.next_worker];
                         self.next_worker = (self.next_worker + 1) % self.workers.len();
                         call(worker, WorkerMsg::Do(payload), CALL_TIMEOUT)
                             .then(move |outcome| FrontendMsg::WorkerDone(qid, outcome))
                     }
-                    Err(PendingRepliesTryCaptureError::Full) => reply(FrontendReply::Full),
+                    Err(ParkCallError::Full { call, .. }) => call.reply(FrontendReply::Full),
+                    Err(ParkCallError::DuplicateKey { call, .. }) => call.reply(FrontendReply::Full),
                     Err(other) => panic!("try_capture: {other:?}"),
                 }
             }
-            FrontendMsg::WorkerDone(qid, outcome) => {
-                let Some(slot) = self.pending.take(&qid) else {
-                    return noop();
-                };
-                match outcome {
-                    CallOutcome::Replied(WorkerReply(v)) => {
-                        reply_to(slot, FrontendReply::Result(v))
-                    }
-                    _ => reply_to(slot, FrontendReply::Full),
-                }
+            FrontendMsg::WorkerDone(_, _) => {
+                call_ctx.reject(tina::CallRejectedReason::UnsupportedMessage)
             }
+        }
+    }
+}
+
+impl Frontend {
+    fn on_worker_done(&mut self, qid: u64, outcome: CallOutcome<WorkerReply>) -> Effect<Self> {
+        let Some(slot) = self.pending.take(&qid) else {
+            return noop();
+        };
+        match outcome {
+            CallOutcome::Replied(WorkerReply(v)) => reply_to(slot, FrontendReply::Result(v)),
+            _ => reply_to(slot, FrontendReply::Full),
         }
     }
 }

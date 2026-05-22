@@ -299,13 +299,11 @@ impl Isolate for StreamingEchoSource {
     }
 }
 
+type StreamingEchoSlot = Arc<Mutex<Option<GrpcRequestStream<CounterRequest>>>>;
+type StreamingEchoAddress = tina::Address<ResponseChunkMsg, ResponseChunkReply>;
+
 struct StreamingEchoSourcePool {
-    available: Mutex<
-        Vec<(
-            Arc<Mutex<Option<GrpcRequestStream<CounterRequest>>>>,
-            tina::Address<ResponseChunkMsg, ResponseChunkReply>,
-        )>,
-    >,
+    available: Mutex<Vec<(StreamingEchoSlot, StreamingEchoAddress)>>,
 }
 
 impl StreamingEchoSourcePool {

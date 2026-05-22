@@ -408,6 +408,94 @@ impl fmt::Display for AdmissionFailure {
 impl std::error::Error for AdmissionFailure {}
 
 // -----------------------------------------------------------------------------
+// ServicePolicy — the public admission-policy extension seam
+// -----------------------------------------------------------------------------
+
+/// A custom admission/rate policy.
+///
+/// This is the open extension seam for service pressure policies. The
+/// built-in policies ([`ConcurrencyLimit`], [`KeyedLimit`], [`RateLimit`])
+/// keep their ergonomic inherent `try_admit` methods, and also implement
+/// this trait so generic service code can drive a built-in or custom
+/// policy through one `(key, now) -> decision` shape. Policies that are
+/// not time-based ignore `now`.
+///
+/// The contract a custom policy must keep:
+///
+/// - **Return a decision; do not act.** [`decide`](ServicePolicy::decide)
+///   returns an [`AdmissionDecision`]. The policy must **not** send
+///   messages, spawn work, retry, sleep, or wait. Retry and waiting stay
+///   caller-owned (pair with [`crate::FullHandling`] when retry is the
+///   right answer). A `Wait { delay, .. }` decision is advice the caller
+///   acts on, never a hidden queue the policy drains.
+/// - **Be replayable.** `decide` must be a pure function of
+///   `(config, now, key history)`. Never read wall-clock time inside the
+///   policy; take `now` from `ctx.now()` (live) or the simulator
+///   (replay). The same inputs must yield the same decision so a DST run
+///   reproduces a live overload exactly.
+/// - **Report the truth.** [`report`](ServicePolicy::report) returns an
+///   [`AdmissionReport`] snapshot. Counts must be the policy's real
+///   state, not a fresh config, so a dashboard sees installed capacity
+///   and accumulated rejections.
+///
+/// Admission carries a move-only `Permit`/grant proof the caller releases
+/// (or drops) explicitly; the policy does not track it after the
+/// decision.
+pub trait ServicePolicy {
+    /// The key the policy admits against (`()` for a global policy).
+    type Key: ?Sized;
+    /// The move-only proof returned on admission.
+    type Permit;
+
+    /// Decide admission for `key` at logical time `now`. Pure over
+    /// `(config, now, key history)`; must not send, retry, sleep, or
+    /// wait.
+    fn decide(&mut self, key: &Self::Key, now: Instant) -> AdmissionDecision<Self::Permit>;
+
+    /// A replayable snapshot of the policy's pressure state.
+    fn report(&self) -> AdmissionReport;
+}
+
+impl<K: Eq + Clone> ServicePolicy for RateLimit<K> {
+    type Key = K;
+    type Permit = RateGrant<K>;
+
+    fn decide(&mut self, key: &K, now: Instant) -> AdmissionDecision<RateGrant<K>> {
+        self.try_admit(key, now)
+    }
+
+    fn report(&self) -> AdmissionReport {
+        RateLimit::report(self)
+    }
+}
+
+impl ServicePolicy for ConcurrencyLimit {
+    type Key = ();
+    type Permit = ConcurrencyPermit;
+
+    fn decide(&mut self, _key: &(), _now: Instant) -> AdmissionDecision<ConcurrencyPermit> {
+        self.try_admit()
+    }
+
+    fn report(&self) -> AdmissionReport {
+        ConcurrencyLimit::report(self)
+    }
+}
+
+impl<K: Eq + Clone> ServicePolicy for KeyedLimit<K> {
+    type Key = K;
+    type Permit = KeyedPermit<K>;
+
+    fn decide(&mut self, key: &K, _now: Instant) -> AdmissionDecision<KeyedPermit<K>> {
+        self.try_admit(key)
+    }
+
+    fn report(&self) -> AdmissionReport {
+        KeyedLimit::report(self)
+    }
+}
+
+// -----------------------------------------------------------------------------
 // ConcurrencyLimit
 // -----------------------------------------------------------------------------
 
@@ -1520,6 +1608,114 @@ mod tests {
 
     fn fixed_now() -> Instant {
         Instant::now()
+    }
+
+    /// Drive a policy through the trait, never the concrete type. Proves
+    /// generic service code can take any `ServicePolicy`.
+    fn admit_via_trait<P: ServicePolicy>(
+        policy: &mut P,
+        key: &P::Key,
+        now: Instant,
+    ) -> AdmissionDecision<P::Permit> {
+        policy.decide(key, now)
+    }
+
+    #[test]
+    fn rate_limit_is_a_service_policy() {
+        let mut limit: RateLimit<()> = RateLimit::new("policy.trait", 1, 1, 1);
+        let now = fixed_now();
+        // First decision admits (burst = 1).
+        assert!(matches!(
+            admit_via_trait(&mut limit, &(), now),
+            AdmissionDecision::Admitted(_)
+        ));
+        // Second decision in the same instant is rate-limited.
+        assert!(matches!(
+            admit_via_trait(&mut limit, &(), now),
+            AdmissionDecision::RateLimited { .. }
+        ));
+        // The trait report matches the inherent report.
+        assert_eq!(
+            ServicePolicy::report(&limit).rate_limited_count,
+            RateLimit::report(&limit).rate_limited_count
+        );
+    }
+
+    #[test]
+    fn concurrency_limit_is_a_service_policy() {
+        let mut limit = ConcurrencyLimit::with_capacity("policy.concurrency", 1);
+        let now = fixed_now();
+        let _held = admit_via_trait(&mut limit, &(), now)
+            .into_admitted()
+            .expect("first admission");
+        assert!(matches!(
+            admit_via_trait(&mut limit, &(), now),
+            AdmissionDecision::Full(_)
+        ));
+        assert_eq!(
+            ServicePolicy::report(&limit).full_count,
+            ConcurrencyLimit::report(&limit).full_count
+        );
+    }
+
+    #[test]
+    fn keyed_limit_is_a_service_policy() {
+        let mut limit = KeyedLimit::new("policy.keyed", 1, 1);
+        let now = fixed_now();
+        let key = "tenant-a";
+        let _held = admit_via_trait(&mut limit, &key, now)
+            .into_admitted()
+            .expect("first keyed admission");
+        assert!(matches!(
+            admit_via_trait(&mut limit, &key, now),
+            AdmissionDecision::Full(_)
+        ));
+        assert_eq!(
+            ServicePolicy::report(&limit).full_count,
+            KeyedLimit::report(&limit).full_count
+        );
+    }
+
+    #[test]
+    fn custom_service_policy_returns_typed_decisions_only() {
+        // A tiny extension-style policy: admit once, then close. Proves
+        // the trait is implementable outside the built-ins and that a
+        // policy can express the full decision vocabulary without ever
+        // sending or retrying.
+        struct OneShot {
+            used: bool,
+            report: AdmissionReport,
+        }
+        impl ServicePolicy for OneShot {
+            type Key = str;
+            type Permit = ();
+            fn decide(&mut self, _key: &str, _now: Instant) -> AdmissionDecision<()> {
+                if self.used {
+                    AdmissionDecision::Closed(self.report.clone())
+                } else {
+                    self.used = true;
+                    AdmissionDecision::Admitted(())
+                }
+            }
+            fn report(&self) -> AdmissionReport {
+                self.report.clone()
+            }
+        }
+
+        let template = ConcurrencyLimit::with_capacity("policy.oneshot", 1);
+        let mut policy = OneShot {
+            used: false,
+            report: template.report(),
+        };
+        let now = fixed_now();
+        assert!(matches!(
+            policy.decide("alice", now),
+            AdmissionDecision::Admitted(())
+        ));
+        assert!(matches!(
+            policy.decide("alice", now),
+            AdmissionDecision::Closed(_)
+        ));
     }
 
     #[test]

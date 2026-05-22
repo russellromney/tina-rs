@@ -49,21 +49,35 @@ struct Store {
 
 #[tina_runtime::isolate(message = StoreMsg, reply = StoreReply)]
 impl Store {
-    fn handle(&mut self, msg: StoreMsg, _ctx: &mut Context<'_, SingleShard, Self::Reply>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: StoreMsg,
+        _ctx: &mut Context<'_, SingleShard, Self::Reply>,
+    ) -> Effect<Self> {
+        reply(self.apply(msg))
+    }
+
+    fn handle_call(&mut self, msg: StoreMsg, call: tina::CallContext<'_, Self>) -> Effect<Self> {
+        call.reply(self.apply(msg))
+    }
+}
+
+impl Store {
+    fn apply(&mut self, msg: StoreMsg) -> StoreReply {
         match msg {
             StoreMsg::Set { key, value } => {
                 self.values.insert(key, value);
-                reply(StoreReply::Ok)
+                StoreReply::Ok
             }
             StoreMsg::Get { key } => match self.values.get(&key) {
-                Some(value) => reply(StoreReply::Value(value.clone())),
-                None => reply(StoreReply::Miss),
+                Some(value) => StoreReply::Value(value.clone()),
+                None => StoreReply::Miss,
             },
             StoreMsg::Del { key } => {
                 if self.values.remove(&key).is_some() {
-                    reply(StoreReply::Deleted)
+                    StoreReply::Deleted
                 } else {
-                    reply(StoreReply::Miss)
+                    StoreReply::Miss
                 }
             }
         }
@@ -101,7 +115,11 @@ struct Connection {
 
 #[tina_runtime::isolate(message = ConnectionMsg)]
 impl Connection {
-    fn handle(&mut self, msg: ConnectionMsg, _ctx: &mut Context<'_, SingleShard, Self::Reply>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: ConnectionMsg,
+        _ctx: &mut Context<'_, SingleShard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             ConnectionMsg::Begin => tcp_read(self.stream, 4096).then(ConnectionMsg::Read),
             ConnectionMsg::Read(Ok(bytes)) => {
@@ -203,7 +221,11 @@ struct Listener {
     spawn = ChildDefinition<Connection>,
 )]
 impl Listener {
-    fn handle(&mut self, msg: ListenerMsg, _ctx: &mut Context<'_, SingleShard, Self::Reply>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: ListenerMsg,
+        _ctx: &mut Context<'_, SingleShard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             ListenerMsg::Start => tcp_bind(self.bind_addr).then(ListenerMsg::Bound),
             ListenerMsg::Bound(Ok((listener, _local_addr))) => {

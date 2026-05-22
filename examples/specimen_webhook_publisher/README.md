@@ -114,6 +114,7 @@ fn check_layered(outcome: &ReqwestCallOutcome, label: &str) {
         CallOutcome::Full => panic!("{label} bridge full"),
         CallOutcome::Closed => panic!("{label} bridge closed"),
         CallOutcome::Timeout => panic!("{label} bridge call timed out"),
+        CallOutcome::Rejected(reason) => panic!("{label} bridge rejected: {reason:?}"),
     }
 }
 

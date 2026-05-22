@@ -86,7 +86,7 @@ pub mod wait_list;
 pub use admission::{
     AdmissionDecision, AdmissionFailure, AdmissionReport, ConcurrencyLimit, ConcurrencyPermit,
     ConcurrencyReleaseError, KeyedLimit, KeyedPermit, KeyedReleaseError, KeyedSlotReport,
-    PressureAction, RateGrant, RateKeyState, RateLimit, SurfaceName,
+    PressureAction, RateGrant, RateKeyState, RateLimit, ServicePolicy, SurfaceName,
 };
 pub use drain_state::{AdmitDecision, DrainReport, DrainStage, DrainState};
 pub use errors::{
@@ -146,8 +146,8 @@ pub use live_report::{
 
 pub use capabilities::{
     CancellationSupport, DriverRuntimeRequirement, DurabilityCapability, ResourceCapability,
-    ResourceExecutionShape, ResourceSupport, RuntimeCapabilities, ShutdownSupport,
-    TINA_DRIVER_RUNTIME_CONTRACT, TinaDriverRuntimeContract,
+    ResourceExecutionShape, ResourceSupport, RuntimeCapabilities, RuntimeCapabilityReport,
+    RuntimeCapabilityRow, ShutdownSupport, TINA_DRIVER_RUNTIME_CONTRACT, TinaDriverRuntimeContract,
 };
 #[cfg(test)]
 use clock::ManualClock;

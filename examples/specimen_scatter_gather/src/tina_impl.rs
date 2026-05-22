@@ -14,8 +14,8 @@ use std::time::Duration;
 
 use tina::prelude::*;
 use tina_runtime::{
-    CallOutcome, DefaultThreadedMailboxFactory, PendingReplies, PendingRepliesTryCaptureError,
-    RuntimeCall, ThreadedRuntime,
+    CallOutcome, DefaultThreadedMailboxFactory, ParkCallError, PendingReplies, RuntimeCall,
+    ThreadedRuntime,
 };
 
 use crate::{CLIENTS, MAX_IN_FLIGHT, Report, WORKERS, expected_aggregate};
@@ -38,9 +38,23 @@ struct Worker {
 
 #[tina::isolate(message = WorkerMsg, reply = WorkerReply)]
 impl Worker {
-    fn handle(&mut self, msg: WorkerMsg, _ctx: &mut Context<'_, SingleShard, Self::Reply>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: WorkerMsg,
+        _ctx: &mut Context<'_, SingleShard, Self::Reply>,
+    ) -> Effect<Self> {
+        reply(self.apply(msg))
+    }
+
+    fn handle_call(&mut self, msg: WorkerMsg, call: CallContext<'_, Self>) -> Effect<Self> {
+        call.reply(self.apply(msg))
+    }
+}
+
+impl Worker {
+    fn apply(&self, msg: WorkerMsg) -> WorkerReply {
         match msg {
-            WorkerMsg::Do(payload) => reply(WorkerReply(payload.wrapping_add(self.id))),
+            WorkerMsg::Do(payload) => WorkerReply(payload.wrapping_add(self.id)),
         }
     }
 }
@@ -77,13 +91,40 @@ struct Coordinator {
 
 #[tina_runtime::isolate(message = CoordMsg, reply = AggregateReply)]
 impl Coordinator {
-    fn handle(&mut self, msg: CoordMsg, ctx: &mut Context<'_, SingleShard, Self::Reply>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: CoordMsg,
+        _ctx: &mut Context<'_, SingleShard, Self::Reply>,
+    ) -> Effect<Self> {
+        match msg {
+            CoordMsg::Query(_) => noop(),
+            CoordMsg::WorkerDone(qid, outcome) => {
+                let Some(idx) = self.partials.iter().position(|p| p.qid == qid) else {
+                    return noop();
+                };
+                let partial = &mut self.partials[idx];
+                if let CallOutcome::Replied(WorkerReply(v)) = outcome {
+                    partial.sum = partial.sum.wrapping_add(v);
+                }
+                partial.remaining -= 1;
+                if partial.remaining == 0 {
+                    let done = self.partials.remove(idx);
+                    if let Some(slot) = self.pending.take(&qid) {
+                        return reply_to(slot, AggregateReply::Ok(done.sum));
+                    }
+                }
+                noop()
+            }
+        }
+    }
+
+    fn handle_call(&mut self, msg: CoordMsg, call_ctx: CallContext<'_, Self>) -> Effect<Self> {
         match msg {
             CoordMsg::Query(payload) => {
                 let qid = self.next_qid;
                 self.next_qid += 1;
-                match self.pending.try_capture(ctx, qid) {
-                    Ok(()) => {
+                match self.pending.park_call(qid, call_ctx) {
+                    Ok(_ticket) => {
                         self.partials.push(PartialQuery {
                             qid,
                             sum: 0,
@@ -106,26 +147,15 @@ impl Coordinator {
                     // Pending box full: reply Full to the caller
                     // without capturing. The caller observes a typed
                     // overload distinct from a successful aggregate.
-                    Err(PendingRepliesTryCaptureError::Full) => reply(AggregateReply::Full),
-                    Err(other) => panic!("unexpected try_capture error: {other:?}"),
+                    Err(ParkCallError::Full { call, .. }) => call.reply(AggregateReply::Full),
+                    Err(ParkCallError::DuplicateKey { call, .. }) => {
+                        call.reply(AggregateReply::Full)
+                    }
+                    Err(other) => panic!("park_call: {other:?}"),
                 }
             }
-            CoordMsg::WorkerDone(qid, outcome) => {
-                let Some(idx) = self.partials.iter().position(|p| p.qid == qid) else {
-                    return noop();
-                };
-                let partial = &mut self.partials[idx];
-                if let CallOutcome::Replied(WorkerReply(v)) = outcome {
-                    partial.sum = partial.sum.wrapping_add(v);
-                }
-                partial.remaining -= 1;
-                if partial.remaining == 0 {
-                    let done = self.partials.remove(idx);
-                    if let Some(slot) = self.pending.take(&qid) {
-                        return reply_to(slot, AggregateReply::Ok(done.sum));
-                    }
-                }
-                noop()
+            CoordMsg::WorkerDone(_, _) => {
+                call_ctx.reject(tina::CallRejectedReason::UnsupportedMessage)
             }
         }
     }
@@ -155,7 +185,11 @@ struct Driver {
 
 #[tina_runtime::isolate(message = DriverMsg)]
 impl Driver {
-    fn handle(&mut self, msg: DriverMsg, _ctx: &mut Context<'_, SingleShard, Self::Reply>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: DriverMsg,
+        _ctx: &mut Context<'_, SingleShard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             DriverMsg::Begin => {
                 let coord = self.coord;
