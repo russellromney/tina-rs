@@ -3,10 +3,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
+use tina::CallRejectedReason;
 use tina::prelude::*;
 use tina_runtime::{
-    CallOutcome, DefaultThreadedMailboxFactory, PendingReplies, PendingRepliesTryCaptureError,
-    SleepReply, ThreadedRuntime, call, sleep,
+    CallOutcome, DefaultThreadedMailboxFactory, ParkCallError, PendingReplies, SleepReply,
+    ThreadedRuntime, call, sleep,
 };
 
 use crate::{BATCH_SIZE, BATCH_TIMEOUT_MS, CALLERS, MAX_PENDING, Report};
@@ -42,14 +43,31 @@ impl Batcher {
     fn handle(
         &mut self,
         msg: BatcherMsg,
-        ctx: &mut Context<'_, SingleShard, Self::Reply>,
+        _ctx: &mut Context<'_, SingleShard, Self::Reply>,
     ) -> Effect<Self> {
+        match msg {
+            BatcherMsg::Submit(_) => noop(),
+            BatcherMsg::Tick(g, reply) => {
+                if reply.is_err() || self.pending_timer_gen != Some(g) {
+                    return noop();
+                }
+                self.pending_timer_gen = None;
+                if self.items.is_empty() {
+                    return noop();
+                }
+                self.timer_flushes.fetch_add(1, Ordering::Release);
+                self.flush()
+            }
+        }
+    }
+
+    fn handle_call(&mut self, msg: BatcherMsg, call_ctx: CallContext<'_, Self>) -> Effect<Self> {
         match msg {
             BatcherMsg::Submit(item) => {
                 let qid = self.next_qid;
                 self.next_qid += 1;
-                match self.pending.try_capture(ctx, qid) {
-                    Ok(()) => {
+                match self.pending.park_call(qid, call_ctx) {
+                    Ok(_ticket) => {
                         self.items.push(item);
                         self.qids.push(qid);
                         if self.items.len() >= BATCH_SIZE {
@@ -67,21 +85,14 @@ impl Batcher {
                         }
                         noop()
                     }
-                    Err(PendingRepliesTryCaptureError::Full) => reply(BatcherReply::Full),
-                    Err(other) => panic!("try_capture: {other:?}"),
+                    Err(ParkCallError::Full { call, .. }) => call.reply(BatcherReply::Full),
+                    Err(ParkCallError::DuplicateKey { call, .. }) => {
+                        call.reply(BatcherReply::Full)
+                    }
+                    Err(other) => panic!("park_call: {other:?}"),
                 }
             }
-            BatcherMsg::Tick(g, reply) => {
-                if reply.is_err() || self.pending_timer_gen != Some(g) {
-                    return noop();
-                }
-                self.pending_timer_gen = None;
-                if self.items.is_empty() {
-                    return noop();
-                }
-                self.timer_flushes.fetch_add(1, Ordering::Release);
-                self.flush()
-            }
+            BatcherMsg::Tick(_, _) => call_ctx.reject(CallRejectedReason::UnsupportedMessage),
         }
     }
 }

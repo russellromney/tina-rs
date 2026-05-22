@@ -77,35 +77,50 @@ struct Store {
 
 #[tina_runtime::isolate(message = StoreMsg, reply = StoreReply, shard = AppShard)]
 impl Store {
-    fn handle(&mut self, msg: StoreMsg, ctx: &mut Context<'_, AppShard, Self::Reply>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: StoreMsg,
+        ctx: &mut Context<'_, AppShard, Self::Reply>,
+    ) -> Effect<Self> {
+        reply(self.apply(msg, ctx.shard_id()))
+    }
+
+    fn handle_call(&mut self, msg: StoreMsg, call: CallContext<'_, Self>) -> Effect<Self> {
+        let shard_id = call.shard_id();
+        call.reply(self.apply(msg, shard_id))
+    }
+}
+
+impl Store {
+    fn apply(&mut self, msg: StoreMsg, shard_id: ShardId) -> StoreReply {
         match msg {
             StoreMsg::Set { key, value } => {
-                if let Err(w) = self.placement.require_owner_str(&key, ctx.shard_id()) {
-                    return reply(StoreReply::WrongShard(w));
+                if let Err(w) = self.placement.require_owner_str(&key, shard_id) {
+                    return StoreReply::WrongShard(w);
                 }
                 self.values.insert(key, value);
-                reply(StoreReply::Ok)
+                StoreReply::Ok
             }
             StoreMsg::Get { key } => {
-                if let Err(w) = self.placement.require_owner_str(&key, ctx.shard_id()) {
-                    return reply(StoreReply::WrongShard(w));
+                if let Err(w) = self.placement.require_owner_str(&key, shard_id) {
+                    return StoreReply::WrongShard(w);
                 }
                 match self.values.get(&key) {
-                    Some(value) => reply(StoreReply::Value(value.clone())),
-                    None => reply(StoreReply::Miss),
+                    Some(value) => StoreReply::Value(value.clone()),
+                    None => StoreReply::Miss,
                 }
             }
             StoreMsg::Del { key } => {
-                if let Err(w) = self.placement.require_owner_str(&key, ctx.shard_id()) {
-                    return reply(StoreReply::WrongShard(w));
+                if let Err(w) = self.placement.require_owner_str(&key, shard_id) {
+                    return StoreReply::WrongShard(w);
                 }
                 if self.values.remove(&key).is_some() {
-                    reply(StoreReply::Deleted)
+                    StoreReply::Deleted
                 } else {
-                    reply(StoreReply::Miss)
+                    StoreReply::Miss
                 }
             }
-            StoreMsg::Count => reply(StoreReply::Count(self.values.len() as u64)),
+            StoreMsg::Count => StoreReply::Count(self.values.len() as u64),
         }
     }
 }
@@ -132,7 +147,11 @@ struct Driver {
 
 #[tina_runtime::isolate(message = DriverMsg, shard = AppShard)]
 impl Driver {
-    fn handle(&mut self, msg: DriverMsg, _ctx: &mut Context<'_, AppShard, Self::Reply>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: DriverMsg,
+        _ctx: &mut Context<'_, AppShard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             DriverMsg::Begin => self.next_step(),
             DriverMsg::StoreReturned(outcome) => {

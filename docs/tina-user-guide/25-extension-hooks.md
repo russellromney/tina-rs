@@ -98,9 +98,13 @@ fn decide(&mut self, key: &Self::Key, now: Instant) -> AdmissionDecision<Self::P
 fn report(&self) -> AdmissionReport;
 ```
 
-The built-in policies (`ConcurrencyLimit`, `KeyedLimit`, `RateLimit`) are
-concrete types; `RateLimit` also implements `ServicePolicy` as the reference
-shape. A custom policy must:
+The built-in policies (`ConcurrencyLimit`, `KeyedLimit`, `RateLimit`) keep their
+direct `try_admit` methods and also implement `ServicePolicy`, so generic code
+can drive built-in or custom policies through one shape. `ConcurrencyLimit` uses
+key `()`. `KeyedLimit` and `RateLimit` use their normal key type. Non-time-based
+policies ignore `now`.
+
+A custom policy must:
 
 - **Return a decision; never act.** No sending, spawning, sleeping, retrying, or
   hidden queue. `Wait { delay }` is advice; the caller owns the wait.
@@ -109,6 +113,25 @@ shape. A custom policy must:
 - **Report the truth.** `report()` reflects real accumulated state.
 
 Proof: `examples/extensions/tina-extension-service-policy`.
+
+Tiny hook example:
+
+```rust
+use std::time::Instant;
+use tina_runtime::{AdmissionDecision, AdmissionReport, ServicePolicy};
+
+fn admit<P: ServicePolicy>(
+    policy: &mut P,
+    key: &P::Key,
+    now: Instant,
+) -> AdmissionDecision<P::Permit> {
+    policy.decide(key, now)
+}
+
+fn pressure<P: ServicePolicy>(policy: &P) -> AdmissionReport {
+    policy.report()
+}
+```
 
 ### Bridge author parts — `tina_runtime::bridge`
 
@@ -142,6 +165,11 @@ runtime it was handed can actually do, without reaching into private state. It
 renames nothing: `simulated_only` is `ResourceSupport::SimulatedOnly`,
 `tombstoned` is the tombstone shape, and so on.
 
+This report is read-shaped on purpose. It helps an extension choose a clear
+path — native rail, bounded bridge, or unsupported — but it does not install
+fallbacks, spawn helpers, or silently switch a native rail to an external async
+crate.
+
 ## What a hook may not do
 
 - import a private runtime module (there is no `runtime_internal`);
@@ -155,6 +183,12 @@ renames nothing: `simulated_only` is `ResourceSupport::SimulatedOnly`,
 
 These boundaries are pinned by `examples/extensions/tina-extension-compile-fail`,
 whose `compile_fail` doctests prove each forbidden shape does not compile.
+
+Not every boundedness rule can be made a Rust type error. A custom codec or
+policy can still write bad code internally, just like any Rust crate can put a
+`Vec` behind a method and grow it. Tina's hard line is: the runtime-owned tokens
+and private reports cannot be forged, and every extension smoke crate must prove
+its own bounded path with tests and capacity reports.
 
 ## Checklist for an extension crate
 

@@ -51,12 +51,12 @@ What is *not* bounded:
 
 ## Tina shape
 
-The coordinator captures the caller as a deferred slot via
-`PendingReplies::try_capture(ctx, qid)`. On admission failure
-(`Full`) it answers the caller immediately with
-`reply(AggregateReply::Full)` *without* consuming the caller —
-the slot ceremony is conditional on capacity. The successful
-aggregate is `AggregateReply::Ok(sum)`.
+The coordinator accepts external requests through `handle_call`.
+It parks the caller with `PendingReplies::park_call(qid, call_ctx)`.
+On admission failure (`Full`) it answers the caller immediately with
+`call.reply(AggregateReply::Full)`; the slot ceremony is conditional
+on capacity and never strands the caller. The successful aggregate is
+`AggregateReply::Ok(sum)`.
 
 Each admitted query becomes:
 

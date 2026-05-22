@@ -3,8 +3,8 @@ use std::time::Duration;
 
 use tina::prelude::*;
 use tina_runtime::{
-    CallOutcome, DefaultThreadedMailboxFactory, PendingReplies, PendingRepliesTryCaptureError,
-    ThreadedRuntime, call,
+    CallOutcome, DefaultThreadedMailboxFactory, ParkCallError, PendingReplies, ThreadedRuntime,
+    call,
 };
 
 use crate::{MAX_PENDING, REQUESTS, Report, Stage, classify};
@@ -31,9 +31,19 @@ impl ParseStage {
         msg: ParseInput,
         _ctx: &mut Context<'_, SingleShard, Self::Reply>,
     ) -> Effect<Self> {
+        reply(self.apply(msg))
+    }
+
+    fn handle_call(&mut self, msg: ParseInput, call: CallContext<'_, Self>) -> Effect<Self> {
+        call.reply(self.apply(msg))
+    }
+}
+
+impl ParseStage {
+    fn apply(&self, msg: ParseInput) -> ParseReply {
         match classify(msg.0) {
-            Stage::ParseFailure => reply(ParseReply::Failed),
-            _ => reply(ParseReply::Ok(msg.0)),
+            Stage::ParseFailure => ParseReply::Failed,
+            _ => ParseReply::Ok(msg.0),
         }
     }
 }
@@ -58,9 +68,19 @@ impl ValidateStage {
         msg: ValidateInput,
         _ctx: &mut Context<'_, SingleShard, Self::Reply>,
     ) -> Effect<Self> {
+        reply(self.apply(msg))
+    }
+
+    fn handle_call(&mut self, msg: ValidateInput, call: CallContext<'_, Self>) -> Effect<Self> {
+        call.reply(self.apply(msg))
+    }
+}
+
+impl ValidateStage {
+    fn apply(&self, msg: ValidateInput) -> ValidateReply {
         match classify(msg.0) {
-            Stage::ValidateFailure => reply(ValidateReply::Failed),
-            _ => reply(ValidateReply::Ok(msg.0)),
+            Stage::ValidateFailure => ValidateReply::Failed,
+            _ => ValidateReply::Ok(msg.0),
         }
     }
 }
@@ -82,10 +102,20 @@ impl ExecuteStage {
         msg: ExecuteInput,
         _ctx: &mut Context<'_, SingleShard, Self::Reply>,
     ) -> Effect<Self> {
+        reply(self.apply(msg))
+    }
+
+    fn handle_call(&mut self, msg: ExecuteInput, call: CallContext<'_, Self>) -> Effect<Self> {
+        call.reply(self.apply(msg))
+    }
+}
+
+impl ExecuteStage {
+    fn apply(&self, msg: ExecuteInput) -> ExecuteReply {
         // Pretend to do work with the parsed value; bind it so the
         // payload stays a real lesson rather than a unit hole.
         let ExecuteInput(_v) = msg;
-        reply(ExecuteReply)
+        ExecuteReply
     }
 }
 
@@ -120,48 +150,68 @@ impl Pipeline {
     fn handle(
         &mut self,
         msg: PipelineMsg,
-        ctx: &mut Context<'_, SingleShard, Self::Reply>,
+        _ctx: &mut Context<'_, SingleShard, Self::Reply>,
     ) -> Effect<Self> {
+        match msg {
+            PipelineMsg::Submit(_) => noop(),
+            PipelineMsg::Parsed(qid, outcome) => self.on_parsed(qid, outcome),
+            PipelineMsg::Validated(qid, outcome) => self.on_validated(qid, outcome),
+            PipelineMsg::Executed(qid, outcome) => self.on_executed(qid, outcome),
+        }
+    }
+
+    fn handle_call(&mut self, msg: PipelineMsg, call_ctx: CallContext<'_, Self>) -> Effect<Self> {
         match msg {
             PipelineMsg::Submit(input) => {
                 let qid = self.next_qid;
                 self.next_qid += 1;
-                match self.pending.try_capture(ctx, qid) {
-                    Ok(()) => call(self.parse, ParseInput(input), STAGE_TIMEOUT)
+                match self.pending.park_call(qid, call_ctx) {
+                    Ok(_ticket) => call(self.parse, ParseInput(input), STAGE_TIMEOUT)
                         .then(move |outcome| PipelineMsg::Parsed(qid, outcome)),
-                    Err(PendingRepliesTryCaptureError::Full) => reply(PipelineReply::Failed),
+                    Err(ParkCallError::Full { call, .. }) => call.reply(PipelineReply::Failed),
+                    Err(ParkCallError::DuplicateKey { call, .. }) => {
+                        call.reply(PipelineReply::Failed)
+                    }
                     Err(other) => panic!("try_capture: {other:?}"),
                 }
             }
-            PipelineMsg::Parsed(qid, outcome) => match outcome {
-                CallOutcome::Replied(ParseReply::Ok(v)) => {
-                    call(self.validate, ValidateInput(v), STAGE_TIMEOUT)
-                        .then(move |outcome| PipelineMsg::Validated(qid, outcome))
-                }
-                CallOutcome::Replied(ParseReply::Failed) => {
-                    self.bail(qid, PipelineReply::ParseFailed)
-                }
-                _ => self.bail(qid, PipelineReply::Failed),
-            },
-            PipelineMsg::Validated(qid, outcome) => match outcome {
-                CallOutcome::Replied(ValidateReply::Ok(v)) => {
-                    call(self.execute, ExecuteInput(v), STAGE_TIMEOUT)
-                        .then(move |outcome| PipelineMsg::Executed(qid, outcome))
-                }
-                CallOutcome::Replied(ValidateReply::Failed) => {
-                    self.bail(qid, PipelineReply::ValidateFailed)
-                }
-                _ => self.bail(qid, PipelineReply::Failed),
-            },
-            PipelineMsg::Executed(qid, outcome) => match outcome {
-                CallOutcome::Replied(ExecuteReply) => self.bail(qid, PipelineReply::Completed),
-                _ => self.bail(qid, PipelineReply::Failed),
-            },
+            PipelineMsg::Parsed(_, _)
+            | PipelineMsg::Validated(_, _)
+            | PipelineMsg::Executed(_, _) => {
+                call_ctx.reject(tina::CallRejectedReason::UnsupportedMessage)
+            }
         }
     }
 }
 
 impl Pipeline {
+    fn on_parsed(&mut self, qid: u64, outcome: CallOutcome<ParseReply>) -> Effect<Self> {
+        match outcome {
+            CallOutcome::Replied(ParseReply::Ok(v)) => call(self.validate, ValidateInput(v), STAGE_TIMEOUT)
+                .then(move |outcome| PipelineMsg::Validated(qid, outcome)),
+            CallOutcome::Replied(ParseReply::Failed) => self.bail(qid, PipelineReply::ParseFailed),
+            _ => self.bail(qid, PipelineReply::Failed),
+        }
+    }
+
+    fn on_validated(&mut self, qid: u64, outcome: CallOutcome<ValidateReply>) -> Effect<Self> {
+        match outcome {
+            CallOutcome::Replied(ValidateReply::Ok(v)) => call(self.execute, ExecuteInput(v), STAGE_TIMEOUT)
+                .then(move |outcome| PipelineMsg::Executed(qid, outcome)),
+            CallOutcome::Replied(ValidateReply::Failed) => {
+                self.bail(qid, PipelineReply::ValidateFailed)
+            }
+            _ => self.bail(qid, PipelineReply::Failed),
+        }
+    }
+
+    fn on_executed(&mut self, qid: u64, outcome: CallOutcome<ExecuteReply>) -> Effect<Self> {
+        match outcome {
+            CallOutcome::Replied(ExecuteReply) => self.bail(qid, PipelineReply::Completed),
+            _ => self.bail(qid, PipelineReply::Failed),
+        }
+    }
+
     fn bail(&mut self, qid: u64, value: PipelineReply) -> Effect<Self> {
         match self.pending.take(&qid) {
             Some(slot) => reply_to(slot, value),

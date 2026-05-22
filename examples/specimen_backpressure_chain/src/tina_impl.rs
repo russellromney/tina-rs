@@ -28,6 +28,7 @@ use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::Duration;
 
+use tina::CallRejectedReason;
 use tina::prelude::*;
 use tina_runtime::{
     CallOutcome, DefaultThreadedMailboxFactory, SleepReply, ThreadedRuntime, call, sleep,
@@ -37,10 +38,10 @@ use crate::{FAST_C_MS, REQUEST_COUNT, Report, SLOW_C_MS, TOTAL_DEADLINE_MS, c_is
 
 // ---------- Service C: does the slow work ----------
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 enum CMsg {
     Compute { iteration: u32 },
-    Done(SleepReply),
+    Done(RequestContext<()>, SleepReply),
 }
 
 struct ServiceC;
@@ -49,32 +50,36 @@ struct ServiceC;
 impl ServiceC {
     fn handle(&mut self, msg: CMsg, _ctx: &mut Context<'_, SingleShard>) -> Effect<Self> {
         match msg {
+            CMsg::Compute { .. } => noop(),
+            CMsg::Done(req, Ok(())) => reply_to_request(req, ()),
+            CMsg::Done(req, Err(_)) => reply_to_request(req, ()),
+        }
+    }
+
+    fn handle_call(&mut self, msg: CMsg, call_ctx: CallContext<'_, Self>) -> Effect<Self> {
+        match msg {
             CMsg::Compute { iteration } => {
                 let work = if c_is_slow(iteration) {
                     Duration::from_millis(SLOW_C_MS)
                 } else {
                     Duration::from_millis(FAST_C_MS)
                 };
-                sleep(work).then(CMsg::Done)
+                call_ctx.defer(sleep(work)).reply(CMsg::Done)
             }
-            // The sleep is plain time; pattern-match on the canonical
-            // reply alias so a cancelled timer (runtime shutdown)
-            // does not leak as a successful "C completed" response.
-            CMsg::Done(Ok(())) => reply(()),
-            CMsg::Done(Err(_)) => stop(),
+            CMsg::Done(_, _) => call_ctx.reject(CallRejectedReason::UnsupportedMessage),
         }
     }
 }
 
 // ---------- Service B: forwards to C with remaining budget ----------
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 enum BMsg {
     Forward {
         iteration: u32,
         deadline: Deadline,
     },
-    CDone(CallOutcome<()>),
+    CDone(RequestContext<BReply>, CallOutcome<()>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -90,7 +95,20 @@ struct ServiceB {
 
 #[tina_runtime::isolate(message = BMsg, reply = BReply)]
 impl ServiceB {
-    fn handle(&mut self, msg: BMsg, ctx: &mut Context<'_, SingleShard>) -> Effect<Self> {
+    fn handle(&mut self, msg: BMsg, _ctx: &mut Context<'_, SingleShard>) -> Effect<Self> {
+        match msg {
+            BMsg::Forward { .. } => noop(),
+            BMsg::CDone(req, outcome) => match outcome {
+                CallOutcome::Replied(()) => reply_to_request(req, BReply::Ok),
+                CallOutcome::Timeout => reply_to_request(req, BReply::CTimedOut),
+                CallOutcome::Full | CallOutcome::Closed | CallOutcome::Rejected(_) => {
+                    reply_to_request(req, BReply::Error)
+                }
+            },
+        }
+    }
+
+    fn handle_call(&mut self, msg: BMsg, call_ctx: CallContext<'_, Self>) -> Effect<Self> {
         match msg {
             BMsg::Forward { iteration, deadline } => {
                 // Read the remaining budget against B's own `now`.
@@ -98,24 +116,22 @@ impl ServiceB {
                 // deadline; the call to C waits no longer than what
                 // is left. Expired deadline -> `Duration::ZERO`, which
                 // surfaces as `CallOutcome::Timeout`.
-                let timeout = deadline.remaining_or_zero(ctx.now());
-                call(self.c_addr, CMsg::Compute { iteration }, timeout).then(BMsg::CDone)
+                let timeout = deadline.remaining_or_zero(call_ctx.now());
+                call_ctx
+                    .defer(call(self.c_addr, CMsg::Compute { iteration }, timeout))
+                    .reply(BMsg::CDone)
             }
-            BMsg::CDone(outcome) => match outcome {
-                CallOutcome::Replied(()) => reply(BReply::Ok),
-                CallOutcome::Timeout => reply(BReply::CTimedOut),
-                CallOutcome::Full | CallOutcome::Closed => reply(BReply::Error),
-            },
+            BMsg::CDone(_, _) => call_ctx.reject(CallRejectedReason::UnsupportedMessage),
         }
     }
 }
 
 // ---------- Service A: entry point ----------
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 enum AMsg {
     Submit { iteration: u32 },
-    BDone(CallOutcome<BReply>),
+    BDone(RequestContext<AReply>, CallOutcome<BReply>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -133,34 +149,44 @@ struct ServiceA {
 
 #[tina_runtime::isolate(message = AMsg, reply = AReply)]
 impl ServiceA {
-    fn handle(&mut self, msg: AMsg, ctx: &mut Context<'_, SingleShard>) -> Effect<Self> {
+    fn handle(&mut self, msg: AMsg, _ctx: &mut Context<'_, SingleShard>) -> Effect<Self> {
+        match msg {
+            AMsg::Submit { .. } => noop(),
+            AMsg::BDone(req, outcome) => match outcome {
+                CallOutcome::Replied(BReply::Ok) => reply_to_request(req, AReply::Success),
+                CallOutcome::Replied(BReply::CTimedOut) => reply_to_request(req, AReply::CTimedOut),
+                CallOutcome::Replied(BReply::Error) => reply_to_request(req, AReply::Error),
+                CallOutcome::Timeout => reply_to_request(req, AReply::ATimedOut),
+                CallOutcome::Full | CallOutcome::Closed | CallOutcome::Rejected(_) => {
+                    reply_to_request(req, AReply::Error)
+                }
+            },
+        }
+    }
+
+    fn handle_call(&mut self, msg: AMsg, call_ctx: CallContext<'_, Self>) -> Effect<Self> {
         match msg {
             AMsg::Submit { iteration } => {
                 // Anchor the deadline at A's `now`. Downstream hops
                 // read it against their own `now`, so the budget
                 // shrinks as it travels.
-                let deadline = ctx.deadline_after(self.budget);
-                call(
-                    self.b_addr,
-                    BMsg::Forward { iteration, deadline },
-                    // A's outer timeout is generous: it gives B room
-                    // to surface a typed `CTimedOut` reply *after* B's
-                    // own `call(C, ..., remaining_or_zero)` fires. If
-                    // A's outer timeout raced B's downstream call
-                    // exactly, A would observe `CallOutcome::Timeout`
-                    // first and lose the per-hop attribution this
-                    // specimen exists to teach.
-                    self.budget + Duration::from_millis(50),
-                )
-                .then(AMsg::BDone)
+                let deadline = Deadline::from_instant(call_ctx.now(), self.budget);
+                call_ctx
+                    .defer(call(
+                        self.b_addr,
+                        BMsg::Forward { iteration, deadline },
+                        // A's outer timeout is generous: it gives B room
+                        // to surface a typed `CTimedOut` reply *after* B's
+                        // own `call(C, ..., remaining_or_zero)` fires. If
+                        // A's outer timeout raced B's downstream call
+                        // exactly, A would observe `CallOutcome::Timeout`
+                        // first and lose the per-hop attribution this
+                        // specimen exists to teach.
+                        self.budget + Duration::from_millis(50),
+                    ))
+                    .reply(AMsg::BDone)
             }
-            AMsg::BDone(outcome) => match outcome {
-                CallOutcome::Replied(BReply::Ok) => reply(AReply::Success),
-                CallOutcome::Replied(BReply::CTimedOut) => reply(AReply::CTimedOut),
-                CallOutcome::Replied(BReply::Error) => reply(AReply::Error),
-                CallOutcome::Timeout => reply(AReply::ATimedOut),
-                CallOutcome::Full | CallOutcome::Closed => reply(AReply::Error),
-            },
+            AMsg::BDone(_, _) => call_ctx.reject(CallRejectedReason::UnsupportedMessage),
         }
     }
 }
@@ -193,7 +219,8 @@ impl Driver {
                     CallOutcome::Replied(AReply::Error) => self.report.chain_dropped += 1,
                     CallOutcome::Timeout
                     | CallOutcome::Full
-                    | CallOutcome::Closed => self.report.chain_dropped += 1,
+                    | CallOutcome::Closed
+                    | CallOutcome::Rejected(_) => self.report.chain_dropped += 1,
                 }
                 self.next_iteration += 1;
                 self.next_step()

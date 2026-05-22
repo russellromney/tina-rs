@@ -15,7 +15,9 @@ private runtime access, plus docs that classify every async path.
   and replayable; Tina still owns I/O.
 - **`tina_runtime::ServicePolicy`** — an open admission/rate-policy trait
   returning typed `AdmissionDecision`. A policy decides; it never sends, retries,
-  sleeps, or hides a queue. `RateLimit` implements it as the reference shape.
+  sleeps, or hides a queue. `ConcurrencyLimit`, `KeyedLimit`, and `RateLimit`
+  implement it, so generic service code can drive built-in or custom policies
+  through one shape.
 - **`tina_runtime::RuntimeCapabilityReport`** — a read-shaped view over
   `RuntimeCapabilities` naming, per rail, supported / unsupported /
   simulated-only / cancel-backed / tombstoned / drain-backed, with a

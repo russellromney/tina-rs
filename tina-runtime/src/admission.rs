@@ -414,13 +414,11 @@ impl std::error::Error for AdmissionFailure {}
 /// A custom admission/rate policy.
 ///
 /// This is the open extension seam for service pressure policies. The
-/// three built-in policies ([`ConcurrencyLimit`], [`KeyedLimit`],
-/// [`RateLimit`]) are concrete types, not implementations of this trait,
-/// because their `try_admit` shapes differ (no key, key, key + time).
-/// `ServicePolicy` is the most general `(key, now) -> decision` shape, so
-/// an extension crate can write its own policy and have generic service
-/// code drive it the same way. [`RateLimit`] implements it as the
-/// reference shape.
+/// built-in policies ([`ConcurrencyLimit`], [`KeyedLimit`], [`RateLimit`])
+/// keep their ergonomic inherent `try_admit` methods, and also implement
+/// this trait so generic service code can drive a built-in or custom
+/// policy through one `(key, now) -> decision` shape. Policies that are
+/// not time-based ignore `now`.
 ///
 /// The contract a custom policy must keep:
 ///
@@ -468,6 +466,32 @@ impl<K: Eq + Clone> ServicePolicy for RateLimit<K> {
 
     fn report(&self) -> AdmissionReport {
         RateLimit::report(self)
+    }
+}
+
+impl ServicePolicy for ConcurrencyLimit {
+    type Key = ();
+    type Permit = ConcurrencyPermit;
+
+    fn decide(&mut self, _key: &(), _now: Instant) -> AdmissionDecision<ConcurrencyPermit> {
+        self.try_admit()
+    }
+
+    fn report(&self) -> AdmissionReport {
+        ConcurrencyLimit::report(self)
+    }
+}
+
+impl<K: Eq + Clone> ServicePolicy for KeyedLimit<K> {
+    type Key = K;
+    type Permit = KeyedPermit<K>;
+
+    fn decide(&mut self, key: &K, _now: Instant) -> AdmissionDecision<KeyedPermit<K>> {
+        self.try_admit(key)
+    }
+
+    fn report(&self) -> AdmissionReport {
+        KeyedLimit::report(self)
     }
 }
 
@@ -1614,6 +1638,41 @@ mod tests {
         assert_eq!(
             ServicePolicy::report(&limit).rate_limited_count,
             RateLimit::report(&limit).rate_limited_count
+        );
+    }
+
+    #[test]
+    fn concurrency_limit_is_a_service_policy() {
+        let mut limit = ConcurrencyLimit::with_capacity("policy.concurrency", 1);
+        let now = fixed_now();
+        let _held = admit_via_trait(&mut limit, &(), now)
+            .into_admitted()
+            .expect("first admission");
+        assert!(matches!(
+            admit_via_trait(&mut limit, &(), now),
+            AdmissionDecision::Full(_)
+        ));
+        assert_eq!(
+            ServicePolicy::report(&limit).full_count,
+            ConcurrencyLimit::report(&limit).full_count
+        );
+    }
+
+    #[test]
+    fn keyed_limit_is_a_service_policy() {
+        let mut limit = KeyedLimit::new("policy.keyed", 1, 1);
+        let now = fixed_now();
+        let key = "tenant-a";
+        let _held = admit_via_trait(&mut limit, &key, now)
+            .into_admitted()
+            .expect("first keyed admission");
+        assert!(matches!(
+            admit_via_trait(&mut limit, &key, now),
+            AdmissionDecision::Full(_)
+        ));
+        assert_eq!(
+            ServicePolicy::report(&limit).full_count,
+            KeyedLimit::report(&limit).full_count
         );
     }
 

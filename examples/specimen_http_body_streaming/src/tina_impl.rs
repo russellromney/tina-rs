@@ -51,7 +51,21 @@ impl Isolate for StreamingService {
         request: HttpRequest,
         _ctx: &mut Context<'_, SingleShard, Self::Reply>,
     ) -> Effect<Self> {
-        let response = match request.path.as_str() {
+        reply(self.response_for(request))
+    }
+
+    fn handle_call(
+        &mut self,
+        request: HttpRequest,
+        call: tina::CallContext<'_, Self>,
+    ) -> Effect<Self> {
+        call.reply(self.response_for(request))
+    }
+}
+
+impl StreamingService {
+    fn response_for(&self, request: HttpRequest) -> HttpResponse {
+        match request.path.as_str() {
             "/big" => HttpResponse::stream_known_length(
                 StatusCode::OK,
                 RESPONSE_BODY_BYTES,
@@ -59,8 +73,7 @@ impl Isolate for StreamingService {
             ),
             "/big-chunked" => HttpResponse::stream_chunked(StatusCode::OK, self.chunked_source),
             _ => HttpResponse::not_found(),
-        };
-        reply(response)
+        }
     }
 }
 
