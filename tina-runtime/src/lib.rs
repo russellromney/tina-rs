@@ -51,6 +51,7 @@ mod clock;
 pub mod deferred;
 mod drain_state;
 mod driver;
+pub mod durable_outbox;
 mod errors;
 pub mod event_sink;
 mod fact;
@@ -154,6 +155,12 @@ use clock::ManualClock;
 use clock::{Clock, MonotonicClock};
 pub use mailbox::{DefaultMailboxFactory, DefaultThreadedMailboxFactory, MailboxFactory};
 
+pub use crate::durable_outbox::{
+    AppendFailed, ApplyStatus, CommitConfidence, CommittedWork, CompletionFailed, CompletionStart,
+    DurableCompletion, DurableOutbox, DurablePayload, DurableWork, OutboxFull,
+    OutboxShutdownReport, RecordError, RecordedWork, RecoveryError, RecoveryReport, StaleWork,
+    TailStatus, WorkId,
+};
 pub use crate::persistence::{
     LOCAL_PERSISTENCE_SUPPORT, LocalPersistenceSupport, PersistenceSupportLevel,
 };
