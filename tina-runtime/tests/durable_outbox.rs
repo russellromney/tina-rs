@@ -15,8 +15,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tina::{Mailbox, TrySendError, prelude::*};
 use tina_runtime::{
     ApplyStatus, CallError, CommitConfidence, CompletionStart, DurableCompletion, DurableOutbox,
-    DurableWork, JournalReplay, MailboxFactory, RecordedWork, RecoveryError, Runtime, TailStatus,
-    WorkId, journal_append, journal_replay,
+    DurableWork, JournalReplay, MailboxFactory, RecordError, RecordedWork, RecoveryError, Runtime,
+    TailStatus, WorkId, journal_append, journal_replay,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -190,8 +190,12 @@ impl WebhookService {
                     }
                 }
             }
-            Err(failed) => {
+            Err(RecordError::Append(failed)) => {
                 self.note(format!("append-error:{:?}", failed.error));
+                noop()
+            }
+            Err(RecordError::Stale(_stale)) => {
+                self.note("stale-record".to_owned());
                 noop()
             }
         }
@@ -217,8 +221,11 @@ impl WebhookService {
     }
 
     fn on_recovered(&mut self, replay: Result<JournalReplay, CallError>) -> Effect<Self> {
-        match DurableOutbox::<Vec<u8>>::recover(self.outbox.capacity(), replay, CommitConfidence::Clean)
-        {
+        match DurableOutbox::<Vec<u8>>::recover(
+            self.outbox.capacity(),
+            replay,
+            CommitConfidence::Clean,
+        ) {
             Ok((outbox, report)) => {
                 self.outbox = outbox;
                 self.note(format!("tail:{}", tail_label(report.tail_status)));
@@ -275,7 +282,11 @@ impl WebhookService {
     }
 
     fn note(&self, note: String) {
-        self.observed.lock().expect("observed mutex").notes.push(note);
+        self.observed
+            .lock()
+            .expect("observed mutex")
+            .notes
+            .push(note);
     }
 }
 
@@ -364,7 +375,11 @@ fn restart_resumes_unsent_work_without_replaying_completed_work() {
     let run1_notes = notes(&observed);
     assert!(run1_notes.iter().any(|note| note == "committed:1"));
     assert!(run1_notes.iter().any(|note| note == "committed:2"));
-    assert!(run1_notes.iter().any(|note| note == "crash-before-complete:3"));
+    assert!(
+        run1_notes
+            .iter()
+            .any(|note| note == "crash-before-complete:3")
+    );
     assert!(
         !run1_notes.iter().any(|note| note == "committed:3"),
         "gamma must not be marked sent before the crash: {run1_notes:?}"
@@ -395,7 +410,9 @@ fn restart_resumes_unsent_work_without_replaying_completed_work() {
         "completed work should be recovered as completed, not pending: {run2_notes:?}"
     );
     assert!(
-        run2_notes.iter().any(|note| note == "recovered-pending:[3]"),
+        run2_notes
+            .iter()
+            .any(|note| note == "recovered-pending:[3]"),
         "only the unsent work should be pending: {run2_notes:?}"
     );
     // Only gamma is resumed; alpha and beta are never re-sent.
@@ -439,7 +456,9 @@ fn corrupt_journal_tail_stops_recovery_visibly() {
     run_until_idle(&mut runtime);
 
     assert!(
-        notes(&observed).iter().any(|note| note == "recover-corrupt"),
+        notes(&observed)
+            .iter()
+            .any(|note| note == "recover-corrupt"),
         "corrupt checksum must stop recovery visibly: {:?}",
         notes(&observed)
     );

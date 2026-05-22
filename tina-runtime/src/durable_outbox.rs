@@ -23,7 +23,7 @@
 //!                        │                                   │
 //!                  (append err)                           apply
 //!                        ▼                                   ▼
-//!                   AppendFailed                       ApplyStatus::Apply(work)
+//!                    RecordError                      ApplyStatus::Apply(work)
 //!                  (work returned)                           │
 //!                                              begin_complete / finish_complete
 //!                                                            ▼
@@ -33,9 +33,10 @@
 //! - `enqueue` reserves a stable [`WorkId`] and frames the durable record.
 //!   Returns [`OutboxFull`] (carrying the original work) at capacity.
 //! - `record` confirms the durable append. Only a successful append yields a
-//!   [`RecordedWork`]; a failed append returns the original work in
-//!   [`AppendFailed`]. There is no way to obtain a `RecordedWork` without a
-//!   successful record, so apply-before-record cannot be expressed.
+//!   [`RecordedWork`]; a failed append or stale staged token returns the
+//!   original work in [`RecordError`]. There is no way to obtain a
+//!   `RecordedWork` without a successful record, so apply-before-record cannot
+//!   be expressed.
 //! - `apply` consumes the `RecordedWork` (so the same authorization cannot be
 //!   applied twice) and returns the work to act on.
 //! - `begin_complete` / `finish_complete` durably mark the work done. Marking
@@ -175,6 +176,26 @@ pub struct AppendFailed<W> {
     pub error: CallError,
     /// The work item that was not durably recorded.
     pub work: W,
+}
+
+/// A staged work token did not belong to this outbox anymore.
+///
+/// This is the stale-token guard for restart and recovery: an old
+/// [`DurableWork`] must not be able to mint a new [`RecordedWork`] after the
+/// outbox that staged it is gone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StaleWork<W> {
+    /// The work item carried by the stale token.
+    pub work: W,
+}
+
+/// Recording failed before a [`RecordedWork`] could be produced.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RecordError<W> {
+    /// The durable append failed.
+    Append(AppendFailed<W>),
+    /// The staged token was stale or belonged to a different outbox.
+    Stale(StaleWork<W>),
 }
 
 /// Outcome of [`DurableOutbox::apply`].
@@ -408,13 +429,14 @@ impl<W: DurablePayload> DurableOutbox<W> {
     ///
     /// `append` is the result the runtime returned for the
     /// [`crate::journal_append`] of `staged.journal_bytes()`. On `Ok` the work
-    /// becomes pending and a [`RecordedWork`] authorizes apply. On `Err` the
-    /// original work is returned in [`AppendFailed`] and capacity is freed.
+    /// becomes pending and a [`RecordedWork`] authorizes apply. On `Err`, or
+    /// when the staged token is stale, the original work is returned in
+    /// [`RecordError`] and no pending entry is fabricated.
     pub fn record(
         &mut self,
         staged: DurableWork<W>,
         append: Result<(), CallError>,
-    ) -> Result<RecordedWork<W>, AppendFailed<W>> {
+    ) -> Result<RecordedWork<W>, RecordError<W>> {
         // Only advance state for a token this outbox actually staged. A stale
         // token (for example one held across a `recover`, which returns a fresh
         // outbox) is not ours; do not fabricate a pending entry from it.
@@ -423,21 +445,24 @@ impl<W: DurablePayload> DurableOutbox<W> {
             Ok(()) => {
                 if was_staged {
                     self.pending.insert(staged.id.0);
+                    Ok(RecordedWork {
+                        id: staged.id,
+                        work: staged.work,
+                    })
+                } else {
+                    self.advance_watermark();
+                    Err(RecordError::Stale(StaleWork { work: staged.work }))
                 }
-                Ok(RecordedWork {
-                    id: staged.id,
-                    work: staged.work,
-                })
             }
             Err(error) => {
                 if was_staged {
                     self.failed_total += 1;
                 }
                 self.advance_watermark();
-                Err(AppendFailed {
+                Err(RecordError::Append(AppendFailed {
                     error,
                     work: staged.work,
-                })
+                }))
             }
         }
     }
@@ -483,11 +508,7 @@ impl<W: DurablePayload> DurableOutbox<W> {
         let index = self.next_index;
         self.next_index += 1;
         let payload = frame_record(TAG_COMPLETE, id, None);
-        CompletionStart::Record(DurableCompletion {
-            id,
-            index,
-            payload,
-        })
+        CompletionStart::Record(DurableCompletion { id, index, payload })
     }
 
     /// Confirm the durable append for a completion.
@@ -693,10 +714,7 @@ mod tests {
     use crate::{JournalRecord, persistence::encode_journal_record};
 
     /// Drive a staged enqueue through a successful durable append.
-    fn record_ok<W: DurablePayload>(
-        outbox: &mut DurableOutbox<W>,
-        work: W,
-    ) -> RecordedWork<W> {
+    fn record_ok<W: DurablePayload>(outbox: &mut DurableOutbox<W>, work: W) -> RecordedWork<W> {
         let staged = outbox.enqueue(work).unwrap_or_else(|_| panic!("not full"));
         outbox
             .record(staged, Ok(()))
@@ -735,11 +753,31 @@ mod tests {
         let failed = outbox
             .record(staged, Err(CallError::Io))
             .expect_err("append failed");
+        let RecordError::Append(failed) = failed else {
+            panic!("expected append failure");
+        };
         assert_eq!(failed.error, CallError::Io);
         assert_eq!(failed.work, b"work".to_vec());
         // capacity freed; a fresh enqueue succeeds.
         assert!(outbox.enqueue(b"retry".to_vec()).is_ok());
         assert_eq!(outbox.shutdown_report().failed, 1);
+    }
+
+    #[test]
+    fn stale_staged_token_cannot_mint_recorded_work() {
+        let mut old_outbox: DurableOutbox<Vec<u8>> = DurableOutbox::new(1);
+        let staged = old_outbox.enqueue(b"old".to_vec()).expect("fits");
+        let mut fresh_outbox: DurableOutbox<Vec<u8>> = DurableOutbox::new(1);
+
+        let err = fresh_outbox
+            .record(staged, Ok(()))
+            .expect_err("stale staged token rejected");
+        let RecordError::Stale(stale) = err else {
+            panic!("expected stale token");
+        };
+        assert_eq!(stale.work, b"old".to_vec());
+        assert_eq!(fresh_outbox.shutdown_report().pending, Vec::<WorkId>::new());
+        assert!(fresh_outbox.enqueue(b"new".to_vec()).is_ok());
     }
 
     #[test]
@@ -767,7 +805,9 @@ mod tests {
             CompletionStart::Record(c) => c,
             other => panic!("expected Record, got {other:?}"),
         };
-        let committed = outbox.finish_complete(completion, Ok(())).expect("committed");
+        let committed = outbox
+            .finish_complete(completion, Ok(()))
+            .expect("committed");
         assert_eq!(committed.work_id(), id);
 
         // second completion is idempotent, named, not silent.
@@ -825,7 +865,10 @@ mod tests {
         // completed work (id 1) cannot be re-applied: it is not in pending and
         // ids continue past it.
         let recorded = report.pending.into_iter().next().unwrap();
-        assert_eq!(outbox.apply(recorded), ApplyStatus::Apply(b"pending".to_vec()));
+        assert_eq!(
+            outbox.apply(recorded),
+            ApplyStatus::Apply(b"pending".to_vec())
+        );
         // next enqueue gets a fresh id past the recovered max.
         let next = outbox.enqueue(b"new".to_vec()).unwrap();
         assert_eq!(next.work_id(), WorkId(3));
@@ -1000,7 +1043,10 @@ mod tests {
         };
         outbox.finish_complete(completion, Ok(())).unwrap();
 
-        let stale = RecordedWork { id, work: b"x".to_vec() };
+        let stale = RecordedWork {
+            id,
+            work: b"x".to_vec(),
+        };
         assert_eq!(outbox.apply(stale), ApplyStatus::DuplicateWork(id));
     }
 
