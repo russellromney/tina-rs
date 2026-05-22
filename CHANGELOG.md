@@ -4,6 +4,34 @@ This file records completed work.
 
 ## Unreleased
 
+### Runtime Supervision And Fairness
+
+Make owned work fail loudly and let a host prove progress without trace
+spelunking. These are typed reports over facts the trace already records, plus
+one new typed failure outcome.
+
+- **`tina::Effect::Fail` (and `tina::fail()`)** — a handler can fail loudly
+  without unwinding. The isolate stops and any in-flight caller settles
+  visibly, exactly like a panic, but the runtime records a distinct
+  `HandlerReportedFailure` fact and routes it through the same supervision
+  policy: a supervised child restarts per its parent's policy and budget; an
+  unsupervised one just stops. Panic and reported failure never collapse into
+  one outcome. Wired through both effect erasers, the live dispatcher, and the
+  simulator, so live and replayed runs agree; new trace tags are append-only.
+- **`tina_runtime::SupervisorReport`** — a typed terminal supervision summary,
+  folded from the trace for one owner (mirrors `PressureSummary::from_events`).
+  Names children by stable ordinal with their latest incarnation, counts restart
+  triggers / attempts / completions / skips / rejections, and reports a distinct
+  halt reason (budget exhausted vs supervisor stopped). Composes with the
+  pressure and capacity readers over the same event slice.
+- **`tina_runtime::FairnessReport`** — per-isolate handler-turn and timer-tick
+  counts folded from the trace, plus a typed `StarvationWarning` that names the
+  victim and the hot isolate rather than hiding a progress gap. Progress is turns
+  taken and timers fired (deterministic), not a wall-clock promise. A proof runs
+  a self-flooding hot isolate beside a steadily-ready neighbor and a recurring
+  timer: round-robin keeps the neighbor within one turn of the flooder and the
+  timer keeps firing under load.
+
 ### Runtime Fixes
 
 - **Process group cleanup holds the Linux leader pid until descendant cleanup.**

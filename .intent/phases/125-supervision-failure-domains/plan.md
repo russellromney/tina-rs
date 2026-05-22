@@ -2,10 +2,42 @@
 
 ## Status
 
-- Future implementation plan for the first post-122 core wave.
+- In progress. First implementation wave landed on branch
+  `phase-125-supervision` (off `main`).
 - Combines the old supervision/failure-domain and runtime-fairness plans.
 - Runs after Phase 122. Can run beside durable-state work if ownership stays in
   runtime supervision, failure domains, fairness reports, and systems.
+
+### Shipped in this wave
+
+- **Non-panic typed child failure** (`Effect::Fail` / `fail()`): distinct
+  `HandlerReportedFailure` fact, same supervision/restart path as panic, live +
+  sim. Panic, typed failure, budget exhaustion, and supervisor-stop stay
+  separate outcomes.
+- **`SupervisorReport`**: typed terminal report (trace reader) naming children,
+  restarts, skips, rejections, latest incarnation, and a distinct halt reason
+  (budget exhausted vs supervisor stopped).
+- **`FairnessReport` + `StarvationWarning`**: per-isolate turn/timer counts with
+  a hot-self-sender-vs-steady-neighbor + timer-under-load proof. Progress is
+  turns and timers, not wall-clock.
+- Proofs landed: live single-shard restart → new incarnation + stale-address
+  rejection (panic and typed-failure variants); unsupervised failure stops
+  without restart; sim replay of start/fail/restart/stop; budget-exhaustion
+  terminal state; hot/quiet/timer fairness.
+
+### Deferred (see `review.md` findings)
+
+- **Parent-stop child cleanup (Workstream B)**: not started. Today a parent stop
+  does not cascade to children, and an existing guarantee
+  (`stopped_supervisor_rejects_later_child_failure_without_replacement`) relies
+  on children outliving the parent. A blessed cleanup path must be opt-in
+  (supervised-shutdown), not a change to default `Effect::Stop`.
+- **Cross-shard child ownership (Workstream D)**: not started. `spawn_isolate`
+  is same-shard only and child records key on a shard-local `IsolateId`; live
+  cross-shard ownership is a real architectural lift and warrants its own
+  session.
+- The local **remote-inbound-flood vs local-command** fairness proof already
+  shipped earlier (`tina-runtime/tests/multishard_fairness.rs`).
 
 ## Purpose
 
