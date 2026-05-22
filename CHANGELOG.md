@@ -8,7 +8,8 @@ This file records completed work.
 
 Make owned work fail loudly and let a host prove progress without trace
 spelunking. These are typed reports over facts the trace already records, plus
-new typed outcomes for failure and cross-shard ownership.
+new typed outcomes for failure and cross-shard observed spawn (spawn +
+learn-address; cross-shard supervision/ownership is a follow-on).
 
 - **`spawn_observed(child).on_shard(shard)`** — spawn an observed child on
   another (local, in-process) shard and learn its address back through the same

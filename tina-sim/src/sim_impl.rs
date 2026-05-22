@@ -707,25 +707,12 @@ where
                     generation: self.entries[index].generation,
                 };
                 if parts.target_shard == self.shard.id() {
+                    // Local owned observed spawn (register_remote_child records
+                    // the ChildRecord + parent-attributed Spawned); no
+                    // cross-shard ChildStarted fact.
                     let outcome = parts.spawn.spawn_remote(self, owner, cause);
-                    if let Ok(child) = &outcome {
-                        self.push_event(
-                            isolate_id,
-                            Some(cause),
-                            RuntimeEventKind::ChildStarted {
-                                child_shard: child.shard,
-                                child_isolate: child.isolate,
-                                child_generation: child.generation,
-                            },
-                        );
-                    }
                     let message = (parts.continuation)(outcome);
-                    let _ = self.dispatch_local_send(ErasedSend {
-                        target_shard: self.shard.id(),
-                        target_isolate: owner.isolate,
-                        target_generation: owner.generation,
-                        message,
-                    });
+                    self.deliver_observed_continuation(owner, message, cause);
                 } else {
                     let request_id = self.ids.next_call_id();
                     let payload: Box<dyn Any> = Box::new(parts.spawn);
@@ -753,12 +740,7 @@ where
                         let pending = self.pending_remote_spawns.remove(pos);
                         let message =
                             (pending.continuation)(Err(SpawnObservedError::DestinationUnavailable));
-                        let _ = self.dispatch_local_send(ErasedSend {
-                            target_shard: self.shard.id(),
-                            target_isolate: owner.isolate,
-                            target_generation: owner.generation,
-                            message,
-                        });
+                        self.deliver_observed_continuation(owner, message, cause);
                     }
                 }
                 false
@@ -1126,17 +1108,17 @@ where
         }
     }
 
-    /// Registers a child shipped from another shard via
-    /// `spawn_observed(...).on_shard(this_shard)`. No local parent (the owner
-    /// is remote); records `Spawned`, enqueues any bootstrap, returns the
-    /// address for the reply to carry home. Simulator mirror of the live
-    /// runtime's `register_remote_child`.
+    /// Registers a child for `spawn_observed(...).on_shard(owner_or_other)`.
+    /// Simulator mirror of the live runtime's `register_remote_child`: a
+    /// same-shard owner gets a proper owned child (ChildRecord + parent-
+    /// attributed `Spawned`); a cross-shard owner gets a parentless child with
+    /// `Spawned` recorded under itself.
     pub(crate) fn register_remote_child<I, Msg, Outbound>(
         &mut self,
         isolate: I,
         mailbox_capacity: usize,
         bootstrap_message: Option<Msg>,
-        _owner: RegisteredAddress,
+        owner: RegisteredAddress,
         cause: tina_runtime::CauseId,
     ) -> RegisteredAddress
     where
@@ -1154,10 +1136,29 @@ where
         Msg: 'static,
         Outbound: 'static,
     {
-        let child = self.register_entry::<I, Msg, Outbound>(isolate, None, mailbox_capacity);
+        let local_parent = (owner.shard == self.shard.id()).then_some(owner.isolate);
+        let child = self.register_entry::<I, Msg, Outbound>(isolate, local_parent, mailbox_capacity);
         let child_isolate = child.isolate;
+        let spawn_isolate = match local_parent {
+            Some(parent) => {
+                let child_ordinal = self
+                    .child_records
+                    .iter()
+                    .filter(|record| record.parent == parent)
+                    .count();
+                self.child_records.push(ChildRecord {
+                    parent,
+                    child,
+                    child_ordinal,
+                    mailbox_capacity,
+                    restart_recipe: None,
+                });
+                parent
+            }
+            None => child_isolate,
+        };
         let spawned = self.push_event(
-            child_isolate,
+            spawn_isolate,
             Some(cause),
             RuntimeEventKind::Spawned { child_isolate },
         );
@@ -1298,6 +1299,57 @@ where
                 stopped.into(),
                 precollected,
             );
+        }
+    }
+
+    /// Delivers an observed-spawn continuation to its owner through the traced
+    /// local-send path, so a full/closed/stale owner mailbox records
+    /// SendRejected truth rather than dropping the continuation silently.
+    /// Simulator mirror of the live runtime's `deliver_observed_continuation`.
+    pub(crate) fn deliver_observed_continuation(
+        &mut self,
+        owner: RegisteredAddress,
+        message: Box<dyn Any>,
+        cause: tina_runtime::CauseId,
+    ) {
+        let attempted = self.push_event(
+            owner.isolate,
+            Some(cause),
+            RuntimeEventKind::SendDispatchAttempted {
+                target_shard: owner.shard,
+                target_isolate: owner.isolate,
+                target_generation: owner.generation,
+            },
+        );
+        match self.dispatch_local_send(ErasedSend {
+            target_shard: owner.shard,
+            target_isolate: owner.isolate,
+            target_generation: owner.generation,
+            message,
+        }) {
+            Ok(()) => {
+                self.push_event(
+                    owner.isolate,
+                    Some(attempted.into()),
+                    RuntimeEventKind::SendAccepted {
+                        target_shard: owner.shard,
+                        target_isolate: owner.isolate,
+                        target_generation: owner.generation,
+                    },
+                );
+            }
+            Err(reason) => {
+                self.push_event(
+                    owner.isolate,
+                    Some(attempted.into()),
+                    RuntimeEventKind::SendRejected {
+                        target_shard: owner.shard,
+                        target_isolate: owner.isolate,
+                        target_generation: owner.generation,
+                        reason,
+                    },
+                );
+            }
         }
     }
 
@@ -5196,7 +5248,10 @@ where
         } = request;
         let outcome = match payload.downcast::<Box<dyn SimRemoteSpawn<S>>>() {
             Ok(spawn) => (*spawn).spawn_remote(self, owner, cause),
-            Err(_) => Err(SpawnObservedError::ZeroMailboxCapacity),
+            // Unreachable in practice (same `S`, identical `TypeId`); if it ever
+            // fires it is an internal invariant break, not a zero-capacity
+            // request.
+            Err(_) => Err(SpawnObservedError::DestinationUnavailable),
         };
         Some(QueuedRemoteEnvelope::SpawnReply(SimRemoteSpawnReply {
             request_id,
@@ -5236,12 +5291,7 @@ where
             );
         }
         let message = (pending.continuation)(outcome);
-        let _ = self.dispatch_local_send(ErasedSend {
-            target_shard: self.shard.id(),
-            target_isolate: requester.isolate,
-            target_generation: requester.generation,
-            message,
-        });
+        self.deliver_observed_continuation(requester, message, cause);
     }
 
     pub(crate) fn harvest_remote_send(
@@ -5419,6 +5469,11 @@ where
             self.entries[index].generation,
             stopped.into(),
         );
+        // Drop cross-shard observed-spawn requests this isolate awaited, so the
+        // boxed continuation cannot leak past the owner's stop (mirror of the
+        // live runtime).
+        self.pending_remote_spawns
+            .retain(|pending| pending.requester.isolate != isolate_id);
 
         // Drain any deferred reply slots this isolate captured.
         for record in self.promoted_slots.take_by_isolate(isolate_id) {

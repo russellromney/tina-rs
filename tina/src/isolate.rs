@@ -51,12 +51,15 @@ pub trait Isolate: Sized {
     type SpawnObserved;
 
     /// The payload produced by [`Effect::SpawnObservedOn`] — an observed
-    /// spawn placed on another shard.
+    /// spawn placed on another shard via `spawn_observed(child).on_shard(...)`.
     ///
     /// Defaults to [`std::convert::Infallible`]: isolates that never spawn a
     /// child onto another shard cannot construct the effect, and the type
-    /// system enforces it. Set it (via `spawn_observed(child).on_shard(...)`
-    /// the macro wires this for you) when an isolate owns a cross-shard child.
+    /// system enforces it. To use `.on_shard(...)`, set this to
+    /// `SpawnObservedRemote<Spawn, Self::Message, ChildMessage, ChildReply>` —
+    /// the `#[tina::isolate]` / `#[tina_runtime::isolate]` macros accept a
+    /// `spawn_observed_remote = ...` key for it, or set it directly on a
+    /// hand-written impl.
     type SpawnObservedRemote = core::convert::Infallible;
 
     /// The payload produced by [`Effect::Call`].

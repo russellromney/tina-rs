@@ -900,7 +900,10 @@ where
         let route_remote_lossless =
             |envelope: QueuedRemoteEnvelope| -> Result<(), Box<RemoteRouteFailure>> {
                 let target_shard = envelope.target_shard();
-                let terminal = matches!(envelope, QueuedRemoteEnvelope::CallReply(_));
+                let terminal = matches!(
+                    envelope,
+                    QueuedRemoteEnvelope::CallReply(_) | QueuedRemoteEnvelope::SpawnReply(_)
+                );
                 let metrics = remote_wiring
                     .queue_metrics
                     .get(&(source_shard, target_shard));
@@ -1069,7 +1072,10 @@ fn route_remote_preserving_terminal(
         Ok(()) => Ok(()),
         Err(failure)
             if failure.reason == SendRejectedReason::Full
-                && matches!(failure.envelope, QueuedRemoteEnvelope::CallReply(_)) =>
+                && matches!(
+                        failure.envelope,
+                        QueuedRemoteEnvelope::CallReply(_) | QueuedRemoteEnvelope::SpawnReply(_)
+                    ) =>
         {
             terminal_overflow.push_back(failure.envelope);
             Ok(())
@@ -1088,7 +1094,10 @@ fn drain_terminal_overflow(
             Ok(()) => delivered += 1,
             Err(failure)
                 if failure.reason == SendRejectedReason::Full
-                    && matches!(failure.envelope, QueuedRemoteEnvelope::CallReply(_)) =>
+                    && matches!(
+                        failure.envelope,
+                        QueuedRemoteEnvelope::CallReply(_) | QueuedRemoteEnvelope::SpawnReply(_)
+                    ) =>
             {
                 terminal_overflow.push_front(failure.envelope);
                 break;

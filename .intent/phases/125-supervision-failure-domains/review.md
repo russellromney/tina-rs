@@ -99,11 +99,16 @@ type-system barriers below were resolved as predicted:
    `Any` boxing did require `S: 'static, F: 'static` on the cross-shard step/
    harvest methods, propagated up the call chain.)
 
-Still open in D (cross-shard *ownership/supervision*, the harder half): owner
-stops a cross-shard child, and the multi-round failure → restart →
-`ChildAddressChanged` protocol (B detects failure, notifies A's supervisor, A
-decides on policy/budget, B restarts and replies with the new address). The
-owner link is recorded on the child's shard but not yet consumed.
+A same-shard `.on_shard(my_shard)` is registered as a normal owned child
+(parent + `ChildRecord`, `StopChildren` reaches it). A *cross-shard* child is
+registered with `parent = None` — the owner link is **not** recorded on the
+child's shard yet, which is what the supervision half needs.
+
+Still open in D (cross-shard *ownership/supervision*, the harder half): record
+the cross-shard owner link, let an owner stop a child on another shard, and the
+multi-round failure → restart → `ChildAddressChanged` protocol (B detects
+failure, notifies A's supervisor, A decides on policy/budget, B restarts and
+replies with the new address).
 
 ### D — original sequenced design (from the cross-shard plumbing map)
 

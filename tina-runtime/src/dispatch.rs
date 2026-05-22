@@ -731,22 +731,13 @@ where
                     generation: self.entries[index].generation,
                 };
                 if parts.target_shard == self.shard.id() {
-                    // on_shard() pointed at the owner's own shard: register
-                    // locally and run the continuation now — no round trip.
+                    // on_shard() pointed at the owner's own shard: this is an
+                    // ordinary local owned observed spawn (register_remote_child
+                    // records the ChildRecord and parent-attributed Spawned), so
+                    // no round trip and no cross-shard ChildStarted fact.
                     let outcome = parts.spawn.spawn_remote(self, owner, cause);
-                    if let Ok(child) = &outcome {
-                        self.push_event(
-                            isolate_id,
-                            Some(cause),
-                            RuntimeEventKind::ChildStarted {
-                                child_shard: child.shard,
-                                child_isolate: child.isolate,
-                                child_generation: child.generation,
-                            },
-                        );
-                    }
                     let message = (parts.continuation)(outcome);
-                    let _ = self.enqueue_entry_message(index, message.into_any(), None);
+                    self.deliver_observed_continuation(owner, message, cause);
                 } else {
                     let request_id = self.ids.next_call_id();
                     let payload: Box<dyn Any + Send> = Box::new(parts.spawn);
@@ -776,7 +767,7 @@ where
                             let pending = self.pending_remote_spawns.remove(pos);
                             let message =
                                 (pending.continuation)(Err(SpawnObservedError::DestinationUnavailable));
-                            let _ = self.enqueue_entry_message(index, message.into_any(), None);
+                            self.deliver_observed_continuation(owner, message, cause);
                         }
                     }
                 }
@@ -2218,6 +2209,11 @@ where
             self.entries[index].generation,
             stopped.into(),
         );
+        // Drop any cross-shard observed-spawn requests this isolate was waiting
+        // on. A later reply finds no pending record and is a no-op, so the
+        // boxed continuation cannot leak past the owner's stop.
+        self.pending_remote_spawns
+            .retain(|pending| pending.requester.isolate != isolate_id);
         if precollected.is_some() {
             self.push_event(
                 isolate_id,
@@ -2300,6 +2296,59 @@ where
                 stopped.into(),
                 precollected,
             );
+        }
+    }
+
+    /// Delivers an observed-spawn continuation message to its owner (on this
+    /// shard) through the traced local-send path, so a full or closed owner
+    /// mailbox produces the usual `SendDispatchAttempted` / `SendAccepted` /
+    /// `SendRejected` truth instead of a silent drop — matching ordinary
+    /// `spawn_observed`.
+    pub(crate) fn deliver_observed_continuation(
+        &mut self,
+        owner: RegisteredAddress,
+        message: ErasedMessage,
+        cause: CauseId,
+    ) {
+        let attempted = self.push_event(
+            owner.isolate,
+            Some(cause),
+            RuntimeEventKind::SendDispatchAttempted {
+                target_shard: owner.shard,
+                target_isolate: owner.isolate,
+                target_generation: owner.generation,
+            },
+        );
+        let send = ErasedSend {
+            target_shard: owner.shard,
+            target_isolate: owner.isolate,
+            target_generation: owner.generation,
+            message,
+        };
+        match self.dispatch_local_send(send) {
+            Ok(()) => {
+                self.push_event(
+                    owner.isolate,
+                    Some(attempted.into()),
+                    RuntimeEventKind::SendAccepted {
+                        target_shard: owner.shard,
+                        target_isolate: owner.isolate,
+                        target_generation: owner.generation,
+                    },
+                );
+            }
+            Err(reason) => {
+                self.push_event(
+                    owner.isolate,
+                    Some(attempted.into()),
+                    RuntimeEventKind::SendRejected {
+                        target_shard: owner.shard,
+                        target_isolate: owner.isolate,
+                        target_generation: owner.generation,
+                        reason,
+                    },
+                );
+            }
         }
     }
 

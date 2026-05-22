@@ -1,3 +1,6 @@
+// Defaults `Isolate::SpawnObservedRemote` to `Infallible` so existing isolate
+// impls and the `isolate_types!` macro stay source-compatible while adding the
+// cross-shard observed-spawn associated type. The workspace is already nightly.
 #![feature(associated_type_defaults)]
 #![deny(unsafe_code)]
 #![deny(missing_docs)]
@@ -235,6 +238,27 @@ pub use isolate::*;
 /// ```
 #[macro_export]
 macro_rules! isolate_types {
+    (
+        message: $message:ty,
+        reply: $reply:ty,
+        send: $send:ty,
+        spawn: $spawn:ty,
+        spawn_observed: $spawn_observed:ty,
+        spawn_observed_remote: $spawn_observed_remote:ty,
+        call: $call:ty,
+        fact: $fact:ty,
+        shard: $shard:ty $(,)?
+    ) => {
+        type Message = $message;
+        type Reply = $reply;
+        type Send = $send;
+        type Spawn = $spawn;
+        type SpawnObserved = $spawn_observed;
+        type SpawnObservedRemote = $spawn_observed_remote;
+        type Call = $call;
+        type Fact = $fact;
+        type Shard = $shard;
+    };
     (
         message: $message:ty,
         reply: $reply:ty,

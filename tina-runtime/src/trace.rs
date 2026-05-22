@@ -1984,6 +1984,9 @@ mod stable_hash_tests {
         assert_eq!(effect_kind_tag(EffectKind::SpawnObserved), 11);
         assert_eq!(effect_kind_tag(EffectKind::Reject), 12);
         assert_eq!(effect_kind_tag(EffectKind::Fact), 13);
+        assert_eq!(effect_kind_tag(EffectKind::Fail), 14);
+        assert_eq!(effect_kind_tag(EffectKind::StopChildren), 15);
+        assert_eq!(effect_kind_tag(EffectKind::SpawnObservedOn), 16);
     }
 
     #[test]

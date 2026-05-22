@@ -4,6 +4,11 @@
 
 - In progress. First implementation wave landed on branch
   `phase-125-supervision` (off `main`).
+- The "Includes" / "Required Proof" sections below describe the **full phase
+  intent**, not what has shipped. This Status block is the authoritative
+  progress record: see "Shipped in this wave" and "Deferred" — cross-shard
+  *ownership/supervision* (stop, restart, address-change) is **not** yet
+  implemented.
 - Combines the old supervision/failure-domain and runtime-fairness plans.
 - Runs after Phase 122. Can run beside durable-state work if ownership stays in
   runtime supervision, failure domains, fairness reports, and systems.

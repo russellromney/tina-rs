@@ -11,6 +11,12 @@
 //! it changes no runtime behavior and composes with the other report
 //! readers over the same event slice.
 //!
+//! Cross-shard caveat: a child spawned on *another* shard via
+//! `spawn_observed(child).on_shard(...)` records its `Spawned` fact on the
+//! child's shard (under the child), not under the owner, so it does **not**
+//! appear in `children_spawned` here. Same-shard children — including
+//! `.on_shard(my_shard)` — are owned and counted normally.
+//!
 //! Scope: per-child entries appear only for children the supervisor
 //! *acted on* — every restart attempt, skip, completion, and rejected
 //! failure carries the stable per-parent `child_ordinal`. A child that

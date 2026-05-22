@@ -583,17 +583,21 @@ where
         }
     }
 
-    /// Registers a child shipped from another shard via
-    /// `spawn_observed(...).on_shard(this_shard)`. The child has no *local*
-    /// parent (its owner lives on `owner`'s shard); it registers, records its
-    /// `Spawned` fact, and enqueues any bootstrap. Returns the new address for
-    /// the spawn reply to carry back to the owner.
+    /// Registers a child for `spawn_observed(...).on_shard(owner_or_other)`.
+    ///
+    /// When `owner` is on *this* shard (the degenerate `.on_shard(my_shard)`
+    /// case) the child is registered as a normal owned child of the owner — a
+    /// `ChildRecord` is recorded and `Spawned` is emitted under the parent — so
+    /// it behaves exactly like local `spawn_observed` (`StopChildren` reaches
+    /// it, lineage and reports see it). When `owner` is on another shard the
+    /// child has no local parent (`parent = None`) and `Spawned` is recorded
+    /// under the child on its own shard. Returns the new address.
     pub(crate) fn register_remote_child<I, Outbound>(
         &mut self,
         isolate: I,
         mailbox_capacity: usize,
         bootstrap_message: Option<I::Message>,
-        _owner: RegisteredAddress,
+        owner: RegisteredAddress,
         cause: CauseId,
     ) -> RegisteredAddress
     where
@@ -607,9 +611,10 @@ where
         I::Fact: IntoRuntimeFact + 'static,
         Outbound: 'static,
     {
+        let local_parent = (owner.shard == self.shard.id()).then_some(owner.isolate);
         let child = self.register_entry::<I, Outbound>(
             isolate,
-            None,
+            local_parent,
             Box::new(AnyMailboxAdapter {
                 mailbox: self
                     .mailbox_factory
@@ -617,8 +622,29 @@ where
             }),
         );
         let child_isolate = child.isolate;
+        // A same-shard owner records a ChildRecord and attributes the `Spawned`
+        // fact to the parent, exactly like local `spawn_observed`. A cross-shard
+        // child records `Spawned` under itself (its owner is not local).
+        let spawn_isolate = match local_parent {
+            Some(parent) => {
+                let child_ordinal = self
+                    .child_records
+                    .iter()
+                    .filter(|record| record.parent == parent)
+                    .count();
+                self.child_records.push(ChildRecord {
+                    parent,
+                    child,
+                    child_ordinal,
+                    mailbox_capacity,
+                    restart_recipe: None,
+                });
+                parent
+            }
+            None => child_isolate,
+        };
         let spawned = self.push_event(
-            child_isolate,
+            spawn_isolate,
             Some(cause),
             RuntimeEventKind::Spawned { child_isolate },
         );

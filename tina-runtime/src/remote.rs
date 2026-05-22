@@ -324,8 +324,11 @@ where
         } = request;
         let outcome = match payload.downcast::<Box<dyn SendErasedSpawn<S, F>>>() {
             Ok(spawn) => (*spawn).spawn_remote(self, owner, cause),
-            // Defensive: only this runtime's own boxed spawn type is ever sent.
-            Err(_) => Err(tina::SpawnObservedError::ZeroMailboxCapacity),
+            // Unreachable in practice: only this runtime boxes that payload and
+            // both shards share `S, F` (identical `TypeId`). If it ever fires it
+            // is an internal invariant break, not a zero-capacity request, so
+            // report the honest "could not complete on the destination".
+            Err(_) => Err(tina::SpawnObservedError::DestinationUnavailable),
         };
         Some(QueuedRemoteEnvelope::SpawnReply(RemoteSpawnReply {
             request_id,
@@ -368,13 +371,10 @@ where
             );
         }
         let message = (pending.continuation)(outcome);
-        if let Some(entry_index) = self
-            .entries
-            .iter()
-            .position(|entry| entry.id == requester.isolate && entry.generation == requester.generation)
-        {
-            let _ = self.enqueue_entry_message(entry_index, message.into_any(), None);
-        }
+        // Deliver through the traced local-send path so a full/closed/stale
+        // owner mailbox records SendRejected truth rather than dropping the
+        // continuation silently.
+        self.deliver_observed_continuation(requester, message, cause);
     }
 
     pub(crate) fn harvest_remote_send(

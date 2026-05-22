@@ -423,7 +423,10 @@ fn enqueue_remote_envelope_preserving_terminal(
             target_shard.get()
         )
     });
-    let terminal = matches!(envelope, QueuedRemoteEnvelope::CallReply(_));
+    let terminal = matches!(
+                    envelope,
+                    QueuedRemoteEnvelope::CallReply(_) | QueuedRemoteEnvelope::SpawnReply(_)
+                );
     let queue = if terminal {
         &mut buffers.next_terminal[queue_index]
     } else {
