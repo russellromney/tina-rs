@@ -20,7 +20,10 @@ enum WorkerMsg {
 }
 
 #[derive(Debug, Clone, Copy)]
-struct WorkerReply(u64);
+enum WorkerReply {
+    Result(u64),
+    TimerFailed,
+}
 
 struct Worker {
     id: u64,
@@ -36,8 +39,10 @@ impl Worker {
     ) -> Effect<Self> {
         match msg {
             WorkerMsg::Do(_) => noop(),
-            WorkerMsg::Done(req, Ok(()), result) => reply_to_request(req, WorkerReply(result)),
-            WorkerMsg::Done(req, Err(_), _) => reply_to_request(req, WorkerReply(0)),
+            WorkerMsg::Done(req, Ok(()), result) => {
+                reply_to_request(req, WorkerReply::Result(result))
+            }
+            WorkerMsg::Done(req, Err(_), _) => reply_to_request(req, WorkerReply::TimerFailed),
         }
     }
 
@@ -69,6 +74,7 @@ enum FrontendMsg {
 pub enum FrontendReply {
     Result(u64),
     Full,
+    Failed,
 }
 
 struct Frontend {
@@ -121,7 +127,10 @@ impl Frontend {
             return noop();
         };
         match outcome {
-            CallOutcome::Replied(WorkerReply(v)) => reply_to(slot, FrontendReply::Result(v)),
+            CallOutcome::Replied(WorkerReply::Result(v)) => {
+                reply_to(slot, FrontendReply::Result(v))
+            }
+            CallOutcome::Replied(WorkerReply::TimerFailed) => reply_to(slot, FrontendReply::Failed),
             _ => reply_to(slot, FrontendReply::Full),
         }
     }
