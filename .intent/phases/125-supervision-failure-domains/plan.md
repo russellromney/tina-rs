@@ -20,6 +20,14 @@
   `Effect::Stop` is unchanged and never cascades, so the
   `stopped_supervisor_rejects_later_child_failure_without_replacement` guarantee
   holds. `SupervisorReport` counts and names the closed children.
+- **Cross-shard observed spawn** (`spawn_observed(child).on_shard(shard)`):
+  first sub-phase of cross-shard child ownership. A parent on shard A spawns an
+  observed child on shard B and learns its address back via the continuation +
+  a `ChildStarted` fact. New `Isolate::SpawnObservedRemote` associated type
+  (defaulted `Infallible` via nightly `associated_type_defaults`, so existing
+  isolates are unchanged) and `Effect::SpawnObservedOn`. Send-erased spawn
+  payload carried monomorphically through the existing transport. Proven live
+  (`MultiShardRuntime`) and in the deterministic simulator (replay-stable).
 - **`SupervisorReport`**: typed terminal report (trace reader) naming children,
   restarts, skips, rejections, latest incarnation, and a distinct halt reason
   (budget exhausted vs supervisor stopped).
@@ -37,10 +45,12 @@
   `Effect::StopChildren` (above). Still open: the owner-stop-while-child-has-an
   -in-flight-call settle proof as a dedicated test, and a no-leaked-leases
   /permits/body-charges assertion after the cascade.
-- **Cross-shard child ownership (Workstream D)**: not started. `spawn_isolate`
-  is same-shard only and child records key on a shard-local `IsolateId`; live
-  cross-shard ownership is a real architectural lift and warrants its own
-  session.
+- **Cross-shard child ownership (Workstream D)**: spawn + learn-address sub-phase
+  shipped (above). Still open: cross-shard *stop* (owner stops a child on
+  another shard), cross-shard *failure → restart → `ChildAddressChanged`* (the
+  multi-round distributed-supervision protocol), and failed-shard ingress truth.
+  The owner link is registered on the child's shard but not yet consumed by a
+  supervision protocol.
 - The local **remote-inbound-flood vs local-command** fairness proof already
   shipped earlier (`tina-runtime/tests/multishard_fairness.rs`).
 

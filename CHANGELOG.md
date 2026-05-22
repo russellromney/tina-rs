@@ -8,7 +8,19 @@ This file records completed work.
 
 Make owned work fail loudly and let a host prove progress without trace
 spelunking. These are typed reports over facts the trace already records, plus
-one new typed failure outcome.
+new typed outcomes for failure and cross-shard ownership.
+
+- **`spawn_observed(child).on_shard(shard)`** — spawn an observed child on
+  another (local, in-process) shard and learn its address back through the same
+  `.then(...)` continuation. The child constructor is `Send` and ships to the
+  target shard, which registers it and replies with its address; the owner's
+  continuation waits on the owner shard until the reply lands, and a
+  `ChildStarted` fact records the learned address. Same-shard `spawn_observed`
+  is byte-for-byte unchanged; the `Send` bound only appears on `.on_shard`.
+  Isolates that never spawn cross-shard keep `SpawnObservedRemote = Infallible`
+  and cannot construct the effect. Proven live (`MultiShardRuntime`) and in the
+  deterministic simulator. (First sub-phase: spawn + learn address; cross-shard
+  stop/restart/address-change remain follow-on work.)
 
 - **`tina::Effect::Fail` (and `tina::fail()`)** — a handler can fail loudly
   without unwinding. The isolate stops and any in-flight caller settles

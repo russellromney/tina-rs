@@ -81,7 +81,31 @@ Still open:
   are orphaned exactly as they are after any isolate stop today. If recursive
   shutdown is wanted, that is a follow-up decision.
 
-### D — sequenced implementation design (from the cross-shard plumbing map)
+### D — spawn + learn-address sub-phase: SHIPPED
+
+`spawn_observed(child).on_shard(shard)` landed and is proven live
+(`MultiShardRuntime`) and in the deterministic simulator (replay-stable). Both
+type-system barriers below were resolved as predicted:
+
+1. New `Isolate::SpawnObservedRemote` associated type, defaulted to `Infallible`
+   via nightly `associated_type_defaults` — existing isolates and the
+   `isolate_types!` macro are source-unchanged. New `Effect::SpawnObservedOn`
+   carries it; a parallel `IntoSendErasedSpawnObserved` erasure (Send-bounded)
+   sits beside the existing one, propagated to ~34 runtime + ~13 sim bound sites.
+2. The live transport stayed **non-generic**: the `Send`-erased spawn box is
+   carried as `Box<dyn Any + Send>` and downcast back on the destination (same
+   `S, F`), so no `<S, F>` envelope refactor was needed. The earlier "transport
+   must go generic" prediction was avoided by the `Any` round-trip. (Adding the
+   `Any` boxing did require `S: 'static, F: 'static` on the cross-shard step/
+   harvest methods, propagated up the call chain.)
+
+Still open in D (cross-shard *ownership/supervision*, the harder half): owner
+stops a cross-shard child, and the multi-round failure → restart →
+`ChildAddressChanged` protocol (B detects failure, notifies A's supervisor, A
+decides on policy/budget, B restarts and replies with the new address). The
+owner link is recorded on the child's shard but not yet consumed.
+
+### D — original sequenced design (from the cross-shard plumbing map)
 
 The cross-shard transport today (`tina-runtime/src/remote.rs`,
 `threaded_multi_shard.rs`, `tina-sim/src/multi_shard.rs`) moves only two things
