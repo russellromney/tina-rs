@@ -51,6 +51,53 @@ learn-address; cross-shard supervision/ownership is a follow-on).
   a self-flooding hot isolate beside a steadily-ready neighbor and a recurring
   timer: round-robin keeps the neighbor within one turn of the flooder and the
   timer keeps firing under load.
+### Durable Local State And IPC
+
+A local service can record work before doing it, restart, and resume or report
+the truth — without an exactly-once claim or a durable mailbox.
+
+- **`tina_runtime::DurableOutbox`** — a bounded, restart-survivable record of
+  local work. `enqueue` reserves a stable `WorkId` and frames a durable journal
+  record; a full outbox returns `OutboxFull` carrying the original work back. The
+  outbox is a sync state machine: it produces the bytes to append and consumes
+  the append result, so Tina still owns the `journal_append` / `journal_replay`
+  I/O and the outbox stays testable without a filesystem. First form is
+  at-least-once: after recovery, recorded-but-not-completed work may run again.
+- **Record-before-apply is a type rule.** `apply` requires a `RecordedWork`,
+  which only a successful durable record (or recovery of still-pending work)
+  produces — so apply-before-record cannot be written. `apply` consumes the
+  token, so the same work cannot be applied twice. A failed append returns the
+  original work in `AppendFailed`; `abandon` reclaims a staged slot when you
+  decide not to record. Marking work complete is idempotent by `WorkId`
+  (`AlreadyCompleted`), not a silent success. Compile-fail proofs pin both the
+  apply-before-record and double-apply diagnostics.
+- **Recovery names the tail.** `DurableOutbox::recover` replays the journal into
+  a fresh outbox plus a `RecoveryReport`: pending work as ready-to-apply tokens,
+  the ids already completed, and a `TailStatus` separating a clean tail, a
+  repaired truncated tail, and an uncertain commit. A corrupt tail is rejected
+  by name as `RecoveryError::CorruptTail`; over-capacity replay is rejected as
+  `RecoveryError::OverCapacity`, keeping replay bounded. Completed work is listed
+  as completed, never resumed as pending. `OutboxShutdownReport` names pending,
+  abandoned, completed, and failed work at shutdown — no silent drop.
+- **Journal compaction bounds growth.** `DurableOutbox::recover_compacted`
+  rebuilds the outbox and also returns a compacted journal image — only the
+  still-pending enqueues, re-indexed from 1, with completed and stale records
+  dropped and `WorkId`s preserved. `tina_runtime::persistence::commit_file_atomic`
+  swaps it in one durable step (temp + fsync + rename + parent-dir fsync),
+  returning `CommitUncertain` when only the final fsync is unconfirmed.
+- **Commit fences make uncertain recovery turnkey.**
+  `persistence::{raise,clear}_commit_fence` + `commit_fence_present`, and
+  `CommitConfidence::from_fence_present`, let a service flag a commit whose final
+  durability step was interrupted, so the next recovery reports
+  `TailStatus::UncertainCommit` instead of silently clean.
+- **`ResumeQueue` drains pending work.** `RecoveryReport::into_resume` yields a
+  queue whose `next_apply` applies the next pending item through the outbox,
+  oldest first, skipping already-completed ids — the resume loop in one call.
+- **Codec ordering integrity proven.** A length-delimited frame buffered before
+  an oversize one is still delivered intact; only the oversize frame is rejected.
+- **Specimen.** `examples/specimen_webhook_outbox` runs the full enqueue → send →
+  mark-sent → restart → recover → compact → resume flow, comparing the durable
+  outbox against a hand-rolled flat-file outbox.
 
 ### Runtime Fixes
 
@@ -99,6 +146,79 @@ private runtime access, plus docs that classify every async path.
 - **Docs:** `docs/tina-user-guide/25-extension-hooks.md` (the extension contract
   and where third-party code belongs) and `26-async-boundary.md` (native vs
   bridge vs unsupported, with the common Tokio ecosystem cases sorted).
+
+### Resource Lifetime, Health, And Pool Retirement
+
+Long-lived pooled resources can now age out, retire on a health verdict,
+and report their shutdown — without the generic pool pretending it can
+close handles it does not own.
+
+- **New pool vocabulary** in `tina::pool`: `ResourceLifetime`
+  (`max_idle` / `max_lifetime`), `ResourceHealth`
+  (`Healthy`/`Suspect`/`Retire` + `disposition()`), `RetireReason`
+  (`IdleTimeout`/`MaxLifetime`/`Unhealthy`/`ForceClosed`),
+  `PolicyCheckPoint`, `RetiredResource`, `ResourcePolicyReport`,
+  `RefillOutcome`, and `PoolShutdownReport`.
+- **`WorkerPool` lifetime sweep.** `WorkerPool::with_lifetime(config,
+  resources, lifetime, now)` plus a new `WorkerPoolMsg::Maintain { now }`
+  retires idle resources past `max_idle` / `max_lifetime` and returns a
+  `ResourcePolicyReport` naming each retired slot and reason. Time is the
+  owner's: `now` rides in the message (drive it off a Tina timer), the
+  pool never reads a wall clock. A *leased* resource past `max_lifetime`
+  is reported old in `over_age_leased`, never stolen back from its
+  caller. Idle age is stamped by the first sweep that observes the slot
+  idle, so maintenance cadence bounds idle granularity.
+- **Owner-driven refill.** The pool marks retired slots and reports them;
+  it cannot build an `H`. `WorkerPoolMsg::Refill { resource_id, handle,
+  now }` lets the owner install a fresh resource into a retired slot to
+  reclaim capacity. Refill refuses a live (idle or leased) slot so a
+  resource is never swapped behind a caller's back. `maintain_effect` /
+  `refill_effect` are the call-site sugar.
+- **Health is the caller's verdict.** A generic pool cannot probe an
+  arbitrary handle. `ResourceHealth::Retire.disposition()` maps to a
+  release that drops the resource; the pool reports the retire.
+- **Typed shutdown report.** `PoolShutdownReport::from_pressure(mode,
+  &pressure)` folds a close mode and a post-close snapshot into the
+  lifecycle words — drain / force / closed / leased count — with
+  `drained()` true once nothing is left out on lease.
+- **HTTP/1 keepalive idle retirement.** `KeepaliveConnectionMsg::Maintain
+  { now, max_idle }` closes a connection's idle socket proactively and
+  replies `KeepaliveOutcome::Maintained { closed_idle }`. The pool slot
+  stays leasable; the next request reconnects cleanly instead of
+  discovering a dead socket on use. Closes the "no idle-connection
+  timeout" gap the module previously named as out of scope. A mid-request
+  connection resets its idle clock and is never closed by a sweep.
+- **DB bridge pressure stays honest.** SQLite and SQLx bridges already
+  project onto the shared `BridgePressure` vocabulary while keeping their
+  own truth; this work changes neither and does not fake SQLx pool
+  internals. The resource owner matrix records both rows.
+- **Docs.** New `docs/resource-owner-matrix.md` — checked-in evidence of
+  who owns the close/drain/force/report path for HTTP/1 keepalive, HTTP/2
+  client connection, HTTP/2 stream slot, SQLite bridge, SQLx bridge, the
+  generic `WorkerPool` handle, and local file/journal rails.
+- **Tests.** `tina-runtime/tests/pool_lifetime.rs` (18): idle retire
+  names why; never-leased retires on the first sweep; max-lifetime retire
+  is not handed to a new caller; max-age wins precedence over idle in the
+  reason; an idle-only policy never flags leased resources over-age; a
+  health verdict retires; over-age leased is reported not stolen;
+  multiple resources retire in one sweep; fill/retire/refill reclaims
+  capacity; refill keeps generations monotonic (no ABA after a
+  retire/refill); refill resets the age clock; refill serves a parked
+  waiter; the `maintain_effect`/`refill_effect` sugar drives the pool;
+  drain/force shutdown reports; refill rejections; `Maintain` on a closed
+  pool retires nothing; no-policy `Maintain` is a no-op. `tina/src/pool.rs`
+  (4): vocab unit tests for `ResourceLifetime` constructors,
+  `ResourceHealth::disposition`, and `PoolShutdownReport`.
+  `keepalive_pool.rs` (+2): idle sweep closes the socket and the next
+  request reconnects; unconnected/freshly-used connections are left
+  alone. Existing pool (19), keepalive (27), and bridge tests still pass.
+- **Deferred to the durable local state and IPC plan**
+  (`.intent/phases/126-durable-work-restartable-state/plan.md`): the
+  durable restore/service half — `RecoveryReport`, append-before-apply
+  type-state, corrupt/truncated/uncertain-tail outcomes, and durable
+  specimens. Those names collide directly with that plan's `RecordedWork`
+  / `CommittedWork` / `RecoveryReport`, so building them here would create
+  a second design of the same surface.
 
 ### Admission And Rate Policy
 

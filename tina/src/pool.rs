@@ -31,6 +31,7 @@
 //! `>= max_waiters + burst` to avoid surprises.
 
 use std::num::NonZeroU64;
+use std::time::Duration;
 
 /// Pool configuration. `capacity` is resource count; `max_waiters`
 /// caps parked callers.
@@ -335,6 +336,226 @@ impl PoolPressureReport {
     }
 }
 
+/// Idle-age and total-age retirement policy for pooled resources.
+///
+/// A pool built with a lifetime policy retires *idle* resources that
+/// have sat idle at least `max_idle`, or have lived at least
+/// `max_lifetime` overall. Retirement is driven by an explicit
+/// `Maintain { now }` sweep — the pool never reads the wall clock on
+/// its own, so idle/age timers are the owner's Tina timer, not a hidden
+/// `Instant::now()` inside resource code.
+///
+/// Two honest limits:
+///
+/// - A *leased* resource past `max_lifetime` is reported old, never
+///   stolen back from its caller. The owner sees it in
+///   [`ResourcePolicyReport::over_age_leased`].
+/// - Idle age is measured from the first maintenance sweep that
+///   observes the resource idle, so the sweep cadence bounds idle
+///   granularity. Run maintenance at least as often as `max_idle`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ResourceLifetime {
+    /// Retire an idle resource once it has been idle at least this
+    /// long. `None` disables idle retirement.
+    pub max_idle: Option<Duration>,
+    /// Retire a resource once its total age reaches this. Idle ones are
+    /// retired on the next sweep; leased ones are reported, not stolen.
+    /// `None` disables max-age retirement.
+    pub max_lifetime: Option<Duration>,
+}
+
+impl ResourceLifetime {
+    /// Construct from explicit idle / max-age limits.
+    pub const fn new(max_idle: Option<Duration>, max_lifetime: Option<Duration>) -> Self {
+        Self {
+            max_idle,
+            max_lifetime,
+        }
+    }
+
+    /// Idle-retirement only: retire resources idle at least `d`.
+    pub const fn idle_after(d: Duration) -> Self {
+        Self {
+            max_idle: Some(d),
+            max_lifetime: None,
+        }
+    }
+
+    /// Max-age only: retire resources older than `d`.
+    pub const fn max_age(d: Duration) -> Self {
+        Self {
+            max_idle: None,
+            max_lifetime: Some(d),
+        }
+    }
+
+    /// True when no limit is set — the policy retires nothing on age.
+    pub const fn is_unbounded(&self) -> bool {
+        self.max_idle.is_none() && self.max_lifetime.is_none()
+    }
+}
+
+/// A caller's health verdict for a leased resource, decided at an
+/// explicit check point (before handoff, after release, or during
+/// scheduled maintenance).
+///
+/// The caller owns the probe — a generic pool cannot inspect an
+/// arbitrary `H`. Map the verdict onto a release with
+/// [`ResourceHealth::disposition`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResourceHealth {
+    /// Resource is good; reuse it.
+    Healthy,
+    /// Resource is questionable but still usable. First form treats
+    /// this as reuse; the caller may downgrade to `Retire` itself.
+    Suspect,
+    /// Resource is bad; retire it.
+    Retire,
+}
+
+impl ResourceHealth {
+    /// Map this verdict onto the release disposition the pool acts on.
+    /// `Healthy`/`Suspect` reuse; `Retire` drops the resource.
+    pub fn disposition(self) -> ReleaseDisposition {
+        match self {
+            Self::Healthy | Self::Suspect => ReleaseDisposition::Reuse,
+            Self::Retire => ReleaseDisposition::Retire,
+        }
+    }
+}
+
+/// Why a resource left the pool.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetireReason {
+    /// Idle at least the lifetime policy's `max_idle`.
+    IdleTimeout,
+    /// Total age reached the lifetime policy's `max_lifetime`.
+    MaxLifetime,
+    /// Caller released it as unhealthy (`ReleaseDisposition::Retire`).
+    Unhealthy,
+    /// Pool was force-closed with the lease outstanding.
+    ForceClosed,
+}
+
+/// Where a lifetime / health decision was made. The report names the
+/// point so the owner knows whether age was found by a scheduled sweep
+/// or at the moment of handing / returning a resource.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PolicyCheckPoint {
+    /// A scheduled `Maintain { now }` sweep.
+    ScheduledMaintenance,
+    /// Just before handing a resource to a caller.
+    BeforeHandoff,
+    /// Just after a caller returned a resource.
+    AfterRelease,
+}
+
+/// One resource the pool retired, named with the reason and the point
+/// the decision was made.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetiredResource {
+    /// Slot that was retired.
+    pub resource_id: ResourceId,
+    /// Why it was retired.
+    pub reason: RetireReason,
+    /// Where the decision happened.
+    pub check_point: PolicyCheckPoint,
+}
+
+/// Result of a maintenance sweep.
+///
+/// Names which idle resources the sweep retired and why, and which
+/// *leased* resources are past `max_lifetime` — reported old, never
+/// stolen. `retired_slots` counts the empty slots an owner can
+/// [`refill`](crate::pool) to reclaim capacity.
+#[must_use = "ResourcePolicyReport names what maintenance retired — \
+              discarding it hides which slots need refill"]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ResourcePolicyReport {
+    /// Resources inspected (idle + leased, not already-retired slots).
+    pub inspected: usize,
+    /// Resources retired by this sweep, each with reason + check point.
+    pub retired: Vec<RetiredResource>,
+    /// Leased resources past `max_lifetime`. Reported old, not retired:
+    /// the pool never steals a resource out from under its caller.
+    pub over_age_leased: Vec<ResourceId>,
+    /// Idle resources remaining after the sweep.
+    pub available_after: usize,
+    /// Leased resources after the sweep.
+    pub leased_after: usize,
+    /// Empty (retired) slots in the pool after the sweep. Refill these
+    /// to restore capacity.
+    pub retired_slots: usize,
+}
+
+/// Outcome of refilling a retired slot with a fresh resource handle.
+///
+/// Refill is owner-driven: the pool cannot build an `H`, so the owner
+/// hands one back for a slot the pool retired. A live (idle or leased)
+/// slot is never silently replaced.
+#[must_use = "RefillOutcome reports whether the fresh resource was \
+              actually installed"]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefillOutcome {
+    /// Slot was retired and is now idle with the fresh handle. Capacity
+    /// reclaimed.
+    Refilled,
+    /// Named slot was not retired (idle or leased). Refill rejected so a
+    /// live resource is never replaced behind a caller's back.
+    NotRetired,
+    /// `resource_id` is out of range for this pool.
+    UnknownResource,
+    /// Pool is closed; no refills accepted.
+    Closed,
+}
+
+/// Typed shutdown summary built from a close mode plus a post-close
+/// pressure snapshot. Uses the existing lifecycle words: drain, force,
+/// closed, leased/leaked counts.
+///
+/// Build it with [`PoolShutdownReport::from_pressure`] after a
+/// `Close(mode)` ack and a `PressureReport` snapshot.
+#[must_use = "PoolShutdownReport carries the drain/force outcome — \
+              discarding it hides whether leases were left outstanding"]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PoolShutdownReport {
+    /// How the pool was closed.
+    pub mode: CloseMode,
+    /// True once a close has been applied.
+    pub closed: bool,
+    /// Resources still out on lease. Under `Drain` these are waiting to
+    /// return; under `Force` the pool retires them, so this should be
+    /// zero.
+    pub leased: usize,
+    /// Idle resources still held (drained but not yet refused).
+    pub available: usize,
+    /// Cumulative resources retired over the pool's life.
+    pub retired: u64,
+    /// Callers still parked when the snapshot was taken.
+    pub waiters: usize,
+}
+
+impl PoolShutdownReport {
+    /// Fold a close mode and a post-close pressure snapshot into a
+    /// shutdown summary.
+    pub fn from_pressure(mode: CloseMode, pressure: &PoolPressureReport) -> Self {
+        Self {
+            mode,
+            closed: pressure.closed,
+            leased: pressure.leased,
+            available: pressure.available,
+            retired: pressure.retired_count,
+            waiters: pressure.waiters,
+        }
+    }
+
+    /// True when nothing is left out on lease — a drain has fully
+    /// settled, or a force retired everything.
+    pub fn drained(&self) -> bool {
+        self.leased == 0
+    }
+}
+
 /// Why an acquire did not yield a lease, after the bridge layer.
 ///
 /// Returned by helpers that fold `CallOutcome<WorkerPoolReply<H>>`
@@ -465,5 +686,85 @@ pub mod runtime_internal {
             lease.generation,
             lease.handle,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resource_lifetime_constructors() {
+        let idle = ResourceLifetime::idle_after(Duration::from_secs(5));
+        assert_eq!(idle.max_idle, Some(Duration::from_secs(5)));
+        assert_eq!(idle.max_lifetime, None);
+        assert!(!idle.is_unbounded());
+
+        let age = ResourceLifetime::max_age(Duration::from_secs(30));
+        assert_eq!(age.max_idle, None);
+        assert_eq!(age.max_lifetime, Some(Duration::from_secs(30)));
+        assert!(!age.is_unbounded());
+
+        let both =
+            ResourceLifetime::new(Some(Duration::from_secs(5)), Some(Duration::from_secs(30)));
+        assert_eq!(both.max_idle, Some(Duration::from_secs(5)));
+        assert_eq!(both.max_lifetime, Some(Duration::from_secs(30)));
+        assert!(!both.is_unbounded());
+
+        // Default and the all-None case are unbounded — they retire
+        // nothing on age.
+        assert!(ResourceLifetime::default().is_unbounded());
+        assert!(ResourceLifetime::new(None, None).is_unbounded());
+    }
+
+    #[test]
+    fn resource_health_maps_to_disposition() {
+        // Only an explicit Retire drops the resource; a Suspect verdict
+        // still reuses (first form), so capacity is not shed on a hunch.
+        assert_eq!(
+            ResourceHealth::Healthy.disposition(),
+            ReleaseDisposition::Reuse
+        );
+        assert_eq!(
+            ResourceHealth::Suspect.disposition(),
+            ReleaseDisposition::Reuse
+        );
+        assert_eq!(
+            ResourceHealth::Retire.disposition(),
+            ReleaseDisposition::Retire
+        );
+    }
+
+    #[test]
+    fn shutdown_report_drain_with_outstanding_leases() {
+        let pressure = PoolPressureReport {
+            capacity: 4,
+            available: 1,
+            leased: 2,
+            waiters: 0,
+            retired_count: 3,
+            closed: true,
+            ..PoolPressureReport::default()
+        };
+        let report = PoolShutdownReport::from_pressure(CloseMode::Drain, &pressure);
+        assert_eq!(report.mode, CloseMode::Drain);
+        assert!(report.closed);
+        assert_eq!(report.leased, 2);
+        assert_eq!(report.available, 1);
+        assert_eq!(report.retired, 3);
+        assert!(!report.drained(), "two leases still out — not drained");
+    }
+
+    #[test]
+    fn shutdown_report_drained_when_nothing_leased() {
+        let pressure = PoolPressureReport {
+            capacity: 4,
+            available: 4,
+            leased: 0,
+            closed: true,
+            ..PoolPressureReport::default()
+        };
+        let report = PoolShutdownReport::from_pressure(CloseMode::Force, &pressure);
+        assert!(report.drained());
     }
 }

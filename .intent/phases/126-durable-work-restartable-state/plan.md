@@ -2,10 +2,40 @@
 
 ## Status
 
-- Future implementation plan for the first post-122 core wave.
+- First form shipped. `DurableOutbox` lands the bounded, restart-survivable
+  outbox with stable `WorkId`, append-before-apply type-state, recovery report,
+  and bounded replay. File streaming, Unix socket, and framed local IPC rails
+  were already first-form from the prior local-IO wave and are reverified here
+  (blast radius), not rebuilt.
 - Combines the old durable-state and storage/file/IPC completion plans.
 - Can run beside runtime supervision/fairness if ownership stays in local
   persistence, file rails, local IPC, codecs, and restart systems.
+
+### Shipped
+
+- `tina_runtime::DurableOutbox<W>` with `DurableWork` / `RecordedWork` /
+  `CommittedWork` type-state, `ApplyStatus`, `RecoveryReport`, `TailStatus`,
+  `RecoveryError`, `OutboxShutdownReport`, `CommitConfidence`, `DurablePayload`.
+- Append-before-apply enforced at compile time (trybuild: apply-before-record,
+  double-apply). Idempotent complete by `WorkId`. Failed append returns the
+  original work. Bounded capacity returns `OutboxFull`; bounded replay returns
+  `OverCapacity`.
+- Recovery separates clean / truncated-repaired / uncertain-commit; corrupt tail
+  rejected by name. Completed work never resumed as pending.
+- Module unit tests, user-shaped runtime integration tests (restart-resume,
+  corrupt-tail-stops), and a codec ordering-integrity test.
+
+### Shipped (follow-up wave)
+
+- Journal compaction: `recover_compacted` returns the outbox, report, and a
+  compacted journal image (pending-only, re-indexed, completed dropped, ids
+  preserved); `persistence::commit_file_atomic` swaps it durably.
+- Commit fence: `persistence::{raise,clear}_commit_fence` + `commit_fence_present`
+  and `CommitConfidence::from_fence_present`, so an interrupted commit recovers
+  as `UncertainCommit`.
+- `ResumeQueue` (`RecoveryReport::into_resume`): drains pending oldest-first,
+  applying through the outbox and skipping completed ids.
+- Runnable `examples/specimen_webhook_outbox` (durable vs. hand-rolled).
 
 ## Purpose
 

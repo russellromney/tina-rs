@@ -1,0 +1,11 @@
+error[E0382]: use of moved value: `recorded`
+  --> tests/durable_outbox_compile_fail/double_apply.rs:15:32
+   |
+10 |     let recorded: RecordedWork<Vec<u8>> = outbox
+   |         -------- move occurs because `recorded` has type `RecordedWork<Vec<u8>>`, which does not implement the `Copy` trait
+...
+13 |     let _first = outbox.apply(recorded);
+   |                               -------- value moved here
+14 |     // `recorded` was moved into the first apply; applying again cannot compile.
+15 |     let _second = outbox.apply(recorded);
+   |                                ^^^^^^^^ value used here after move
