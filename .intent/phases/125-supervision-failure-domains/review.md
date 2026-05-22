@@ -139,6 +139,50 @@ ownership claim):
 Estimated as a multi-session build; steps 1–5 are the tractable first sub-phase
 (cross-shard spawn/own/stop), step 6 the second.
 
+#### Two type-system barriers found by attempting the build (API shape: `.on_shard()`)
+
+The public shape `spawn_observed(child).on_shard(shard).then(...)` is settled.
+Attempting step 1 surfaced two concrete barriers the outline above glossed:
+
+1. **Getting a `Send`-erased spawn out of the effect needs a new `Isolate`
+   associated type.** `Effect::SpawnObserved` carries `I::SpawnObserved`, erased
+   by the runtime through `IntoErasedSpawnObserved` — which produces a
+   *non-`Send`* `Box<dyn ErasedSpawnObserved<S,F>>`. A single erasure impl cannot
+   conditionally require `Send` (one impl, no per-call-site bound), so a
+   cross-shard spawn cannot reuse that path without forcing `Send` on **all**
+   `spawn_observed` children (a breaking bound; some children hold `Rc`). The
+   clean alternative is a distinct effect variant carrying a distinct payload —
+   which, because `Effect<I>` can introduce no free type beyond `I`, means a new
+   `Isolate::SpawnObservedRemote` associated type. Adding an associated type
+   normally breaks every `Isolate` impl, but the workspace is on **nightly**, so
+   `#![feature(associated_type_defaults)]` can default it to `Infallible` and
+   keep existing impls (and the `isolate_types!` macro) source-compatible. So:
+   feasible, non-breaking, but it adds a nightly feature and a new public
+   associated type + a parallel erasure trait (`SendErasedSpawnObserved`).
+
+2. **The live cross-shard transport must become generic over `<S,F>`.** Today
+   `SendableQueuedRemoteEnvelope` and `ThreadedRemoteWiring` are monomorphic: a
+   message is `Box<dyn Any + Send>`. That works because the destination only
+   *enqueues* the message into an existing mailbox. A spawn must *register a new
+   entry* on the destination's `Runtime<S,F>`, which needs a
+   `Box<dyn SendErasedSpawnObserved<S,F> + Send>` — generic over `S,F`. A
+   monomorphic channel cannot carry it, and no `Box<dyn Any>` erasure escapes
+   this (registration is fundamentally generic over the isolate type and the
+   factory `F`). All shards in one `ThreadedMultiShardRuntime` share `S,F`, so
+   making the envelope + wiring generic over `<S,F>` is sound — but it is a
+   refactor of the performance-sensitive cross-shard hot path, not an additive
+   change. (The sim is exempt: `Simulator<S>`'s erased spawn is `ErasedSpawn<S>`,
+   no `F`, single thread, so the sim envelope only needs to go generic over `S`.)
+
+Consequence: cross-shard spawn is **all-or-nothing** for honesty. Shipping the
+public `.on_shard()` API while the *live* runtime can't service it (sim-only, or
+a typed-unsupported stub) would publish a broken surface — the exact thing the
+hostile note "do not claim cross-shard ownership unless a live test proves it"
+forbids. The full first sub-phase (public API + nightly assoc-type + new effect
++ `Send`-erasure + live `<S,F>` transport refactor + sim mirror + live test) is a
+large, single, indivisible landing — properly its own session with the transport
+refactor reviewed on its own.
+
 ### D — current state (not yet started in code)
 
 `registration.rs::spawn_isolate` always registers the child on `self.shard`
