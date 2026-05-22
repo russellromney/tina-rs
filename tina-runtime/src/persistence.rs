@@ -490,7 +490,11 @@ fn temp_file_path(path: &Path) -> PathBuf {
         .and_then(std::ffi::OsStr::to_str)
         .unwrap_or("file");
     let unique = SNAPSHOT_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-    path.with_file_name(format!(".{file_name}.{}.{}.tmp", std::process::id(), unique))
+    path.with_file_name(format!(
+        ".{file_name}.{}.{}.tmp",
+        std::process::id(),
+        unique
+    ))
 }
 
 fn parent_directory(path: &Path) -> &Path {

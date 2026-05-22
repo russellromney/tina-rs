@@ -703,7 +703,10 @@ impl<W: DurablePayload> DurableOutbox<W> {
     /// Fold a recovered journal into its open work, completed ids, and bounds.
     /// Shared by [`recover`](Self::recover) and
     /// [`recover_compacted`](Self::recover_compacted).
-    fn fold(replay: Result<JournalReplay, CallError>, cap: usize) -> Result<Folded<W>, RecoveryError> {
+    fn fold(
+        replay: Result<JournalReplay, CallError>,
+        cap: usize,
+    ) -> Result<Folded<W>, RecoveryError> {
         let replay = match replay {
             Ok(replay) => replay,
             Err(CallError::CorruptRecord) => return Err(RecoveryError::CorruptTail),
@@ -727,25 +730,29 @@ impl<W: DurablePayload> DurableOutbox<W> {
             max_work_id = max_work_id.max(id.0);
             match tag {
                 TAG_ENQUEUE => {
+                    if pending_ids.contains(&id.0) || completed_set.contains(&id.0) {
+                        return Err(RecoveryError::CorruptTail);
+                    }
                     let Some(work) = W::from_durable_bytes(payload) else {
                         return Err(RecoveryError::CorruptTail);
                     };
-                    if pending_ids.insert(id.0) {
-                        pending_order.push((id, work));
-                        // Bound replay: refuse the moment the live backlog would
-                        // exceed capacity, instead of scanning an oversized log.
-                        // `pending` is the count at that point (capacity + 1).
-                        if pending_ids.len() > cap {
-                            return Err(RecoveryError::OverCapacity {
-                                capacity: cap,
-                                pending: pending_ids.len(),
-                            });
-                        }
+                    pending_ids.insert(id.0);
+                    pending_order.push((id, work));
+                    // Bound replay: refuse the moment the live backlog would
+                    // exceed capacity, instead of scanning an oversized log.
+                    // `pending` is the count at that point (capacity + 1).
+                    if pending_ids.len() > cap {
+                        return Err(RecoveryError::OverCapacity {
+                            capacity: cap,
+                            pending: pending_ids.len(),
+                        });
                     }
                 }
                 TAG_COMPLETE => {
                     if pending_ids.remove(&id.0) {
                         pending_order.retain(|(pending_id, _)| pending_id.0 != id.0);
+                    } else if !completed_set.contains(&id.0) {
+                        return Err(RecoveryError::CorruptTail);
                     }
                     if completed_set.insert(id.0) {
                         completed_order.push(id);
@@ -1169,6 +1176,27 @@ mod tests {
         let err =
             DurableOutbox::<Vec<u8>>::recover(8, Ok(replay_of(&records)), CommitConfidence::Clean)
                 .expect_err("malformed framing");
+        assert_eq!(err, RecoveryError::CorruptTail);
+    }
+
+    #[test]
+    fn recover_rejects_duplicate_enqueue_id_as_corrupt() {
+        let records = vec![
+            (1, frame_record(TAG_ENQUEUE, WorkId(1), Some(b"first"))),
+            (2, frame_record(TAG_ENQUEUE, WorkId(1), Some(b"again"))),
+        ];
+        let err =
+            DurableOutbox::<Vec<u8>>::recover(8, Ok(replay_of(&records)), CommitConfidence::Clean)
+                .expect_err("duplicate enqueue id must be corrupt");
+        assert_eq!(err, RecoveryError::CorruptTail);
+    }
+
+    #[test]
+    fn recover_rejects_completion_without_enqueue_as_corrupt() {
+        let records = vec![(1, frame_record(TAG_COMPLETE, WorkId(7), None))];
+        let err =
+            DurableOutbox::<Vec<u8>>::recover(8, Ok(replay_of(&records)), CommitConfidence::Clean)
+                .expect_err("completion for unknown work must be corrupt");
         assert_eq!(err, RecoveryError::CorruptTail);
     }
 

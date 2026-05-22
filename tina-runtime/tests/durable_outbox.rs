@@ -485,7 +485,9 @@ fn append_done(journal: &Path, outbox: &mut DurableOutbox<Vec<u8>>, payload: &[u
                 completion.journal_bytes().to_vec(),
             )
             .expect("append completion");
-            outbox.finish_complete(completion, Ok(())).expect("complete");
+            outbox
+                .finish_complete(completion, Ok(()))
+                .expect("complete");
         }
         other => panic!("expected Record, got {other:?}"),
     }
@@ -518,7 +520,10 @@ fn compaction_round_trip_shrinks_journal_and_resumes_pending() {
     append_done(&journal, &mut outbox, b"alpha");
     append_done(&journal, &mut outbox, b"beta");
     append_pending(&journal, &mut outbox, b"gamma");
-    assert_eq!(persistence::replay_journal(&journal).unwrap().records.len(), 5);
+    assert_eq!(
+        persistence::replay_journal(&journal).unwrap().records.len(),
+        5
+    );
 
     // Restart: recover + compact, then install the compacted journal under a
     // commit fence so an interrupted swap would recover as uncertain.
@@ -537,7 +542,10 @@ fn compaction_round_trip_shrinks_journal_and_resumes_pending() {
     persistence::clear_commit_fence(&fence).unwrap();
 
     // The journal now holds only the single pending enqueue.
-    assert_eq!(persistence::replay_journal(&journal).unwrap().records.len(), 1);
+    assert_eq!(
+        persistence::replay_journal(&journal).unwrap().records.len(),
+        1
+    );
 
     // Resume the pending work through the queue on the compacted outbox.
     let mut queue = report.into_resume();
