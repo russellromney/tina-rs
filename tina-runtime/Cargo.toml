@@ -25,6 +25,9 @@ rustls = { version = "0.23", default-features = false, features = ["std", "ring"
 # flag-based handlers for SIGINT / SIGTERM. No async signal task, no
 # Tokio dependency, no custom unsafe handler.
 signal-hook = { version = "0.3", default-features = false }
+# Used only on Linux to peek a child's exit with WNOWAIT (process driver,
+# finding F3), keeping the leader's pid reserved across a process-group kill.
+libc = "0.2"
 
 [dev-dependencies]
 proptest = { version = "1.6.0", default-features = false, features = ["std"] }

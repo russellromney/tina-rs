@@ -258,6 +258,44 @@ fn process_worker_loop(
     }
 }
 
+/// Polls whether `child` has exited.
+///
+/// On Linux this peeks with `WNOHANG | WNOWAIT`: it reports the exit status
+/// without reaping, so the leader's pid (== its process-group id) stays
+/// reserved. [`process_exited`] can then kill the group without risking a
+/// recycled pgid (finding F3), and reaps the leader afterward. On other
+/// platforms it reaps immediately via `try_wait` (the recycle race remains a
+/// narrow, documented residual there).
+#[cfg(target_os = "linux")]
+#[allow(unsafe_code)]
+fn poll_child_exit(
+    child: &mut std::process::Child,
+) -> std::io::Result<Option<std::process::ExitStatus>> {
+    use std::os::unix::process::ExitStatusExt;
+    let mut raw: libc::c_int = 0;
+    // SAFETY: `child.id()` is this child's live pid. `WNOHANG | WNOWAIT`
+    // reports its exit state without consuming the zombie, leaving it for the
+    // later `child.wait()` in `process_exited`. `raw` is a valid, initialized
+    // out-parameter; nothing else waits on this pid.
+    let result =
+        unsafe { libc::waitpid(child.id() as libc::pid_t, &mut raw, libc::WNOHANG | libc::WNOWAIT) };
+    if result == 0 {
+        Ok(None)
+    } else if result > 0 {
+        Ok(Some(std::process::ExitStatus::from_raw(raw)))
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+/// Non-Linux: poll-and-reap via `try_wait` (no `WNOWAIT` peek).
+#[cfg(not(target_os = "linux"))]
+fn poll_child_exit(
+    child: &mut std::process::Child,
+) -> std::io::Result<Option<std::process::ExitStatus>> {
+    child.try_wait()
+}
+
 fn execute_process_command(command: ProcessCommand) -> CallOutput {
     if command.timeout.is_zero() {
         return CallOutput::Failed(CallError::Timeout);
@@ -286,14 +324,14 @@ fn execute_process_command(command: ProcessCommand) -> CallOutput {
         if started.elapsed() >= command.timeout {
             return kill_and_reap(child, stdout, stderr, CallError::Timeout);
         }
-        match child.try_wait() {
+        match poll_child_exit(&mut child) {
             Ok(Some(status)) => break status,
             Ok(None) => thread::sleep(Duration::from_millis(1)),
             Err(_) => return kill_and_reap(child, stdout, stderr, CallError::KillUncertain),
         }
     };
 
-    process_exited(status, stdout, stderr, process_group)
+    process_exited(child, status, stdout, stderr, process_group)
 }
 
 fn kill_and_reap(
@@ -308,8 +346,9 @@ fn kill_and_reap(
     let killed_group = false;
 
     if !killed_group && child.kill().is_err() {
+        let process_group = child.id();
         return match child.try_wait() {
-            Ok(Some(status)) => process_exited(status, stdout, stderr, child.id()),
+            Ok(Some(status)) => process_exited(child, status, stdout, stderr, process_group),
             Ok(None) | Err(_) => CallOutput::Failed(CallError::KillUncertain),
         };
     }
@@ -354,6 +393,7 @@ fn kill_process_group(pid: u32) -> std::io::Result<()> {
 }
 
 fn process_exited(
+    child: std::process::Child,
     status: std::process::ExitStatus,
     stdout: Option<JoinHandle<(Vec<u8>, bool)>>,
     stderr: Option<JoinHandle<(Vec<u8>, bool)>>,
@@ -368,9 +408,24 @@ fn process_exited(
             // hold stdout/stderr pipes open. `process_run` owns the whole
             // process group; do not let a background grandchild escape the
             // runtime rail after the bounded drain budget is spent.
+            //
+            // On Linux the leader was only peeked (WNOWAIT, see
+            // `poll_child_exit`), so it is still a zombie: its pid keeps
+            // anchoring the group, and `kill -pgid` here cannot signal a
+            // recycled group (F3). On other unix the leader was already reaped
+            // in the poll loop, so a narrow recycle race remains here.
             let _ = kill_process_group(process_group);
         }
     }
+    // Linux: reap the leader we only peeked above (it is already a zombie, so
+    // this returns at once). Elsewhere the poll loop already reaped it.
+    #[cfg(target_os = "linux")]
+    {
+        let mut child = child;
+        let _ = child.wait();
+    }
+    #[cfg(not(target_os = "linux"))]
+    drop(child);
     CallOutput::ProcessExited {
         status: ProcessStatus {
             code: status.code(),
