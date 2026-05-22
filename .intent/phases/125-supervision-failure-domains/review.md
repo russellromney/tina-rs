@@ -81,7 +81,65 @@ Still open:
   are orphaned exactly as they are after any isolate stop today. If recursive
   shutdown is wanted, that is a follow-up decision.
 
-### D — cross-shard child ownership (not started, largest lift)
+### D — sequenced implementation design (from the cross-shard plumbing map)
+
+The cross-shard transport today (`tina-runtime/src/remote.rs`,
+`threaded_multi_shard.rs`, `tina-sim/src/multi_shard.rs`) moves only two things
+between shard threads: `QueuedRemoteSend` (a `Box<dyn Any + Send>` message) and
+`RemoteCallReply`. A cross-shard call carries the requester `RegisteredAddress`
+in `MessageCallContext::Remote` so the reply routes home; cross-shard spawn is
+shaped the same way (request + address-bearing reply). Both engines step shards
+in ascending `ShardId` order with per-pair queues, so the protocol stays
+deterministic and replayable if every step is queue-mediated.
+
+The barrier: spawning on another shard means sending an **isolate constructor**
+across threads. Today `ErasedSpawn` and the spawn payload are **not `Send`**
+(`into_erased_spawn` boxes a non-`Send` trait object; the isolate value and
+bootstrap stay on the source shard). `ChildRecord.parent` and
+`RegisteredEntry.parent` are shard-local `IsolateId`s. So cross-shard ownership
+needs new type-foundation, not just new wiring.
+
+Sequenced plan (each step independently compiles + tests; live test gates the
+ownership claim):
+
+1. **Sendable spawn payload.** Add a `Send` spawn path: a
+   `Box<dyn SendErasedSpawn<S, F> + Send>` carrying an `I: Isolate<Shard = S> +
+   Send` constructor + `Send` bootstrap + (optional) `Send` restart recipe.
+   Same-shard `spawn`/`spawn_observed` stay non-`Send` and unchanged. The
+   natural public surface is to let `spawn_observed(child).on_shard(shard_id)`
+   target another shard, because spawn-observed already delivers the child
+   address back to the parent — exactly what cross-shard spawn must do.
+2. **Spawn request/reply envelopes.** `QueuedRemoteEnvelope::SpawnRequest {
+   owner: RegisteredAddress, payload: SendErasedSpawn, mailbox_capacity, cause }`
+   and reuse the `RemoteCallReply` shape to carry the new child
+   `RegisteredAddress` back to the owner (or a `SpawnRejected`). Add the
+   `Sendable*` mirrors for the threaded queues.
+3. **Register-from-envelope on the destination shard.** A `harvest_remote_spawn`
+   that runs the payload through `register_entry` (local `parent = None`, since
+   the owner is remote), records the owner link as a `RegisteredAddress`, and
+   returns the address-bearing reply. New `ChildRecord` variant (or a parallel
+   `RemoteChildRecord`) keyed by a `RegisteredAddress` owner.
+4. **Owner learns the address (ChildStarted).** Reply completes the owner's
+   pending spawn like a cross-shard call completion; deliver the `ChildRef` to
+   the parent. **Live test gate:** parent on shard A spawns a child on shard B
+   and learns its address.
+5. **Cross-shard stop.** `StopChildren` for a cross-shard child sends a stop
+   envelope to B; B stops the entry and replies with the terminal `ChildStopped`
+   truth. Live multi-shard parent-stop child cleanup proof.
+6. **Cross-shard failure → restart → ChildAddressChanged.** The hardest: B
+   detects child failure, notifies A's supervisor (policy + budget live on A);
+   A decides and tells B to restart (B holds the recipe); B replies with the new
+   address; A records it and emits `ChildAddressChanged`. This is a multi-round
+   protocol — its own sub-phase.
+7. **Mirror every step in `tina-sim/src/multi_shard.rs`** and revise
+   `multishard_simulation_supervision_keeps_children_on_parent_shard`
+   intentionally (it currently pins the same-shard invariant). Prove sim replay
+   determinism for the cross-shard start/fail/restart/stop sequence.
+
+Estimated as a multi-session build; steps 1–5 are the tractable first sub-phase
+(cross-shard spawn/own/stop), step 6 the second.
+
+### D — current state (not yet started in code)
 
 `registration.rs::spawn_isolate` always registers the child on `self.shard`
 (no shard parameter); `ChildRecord.parent` is a shard-local `IsolateId`; and
