@@ -209,16 +209,52 @@ fn make_client(
     runtime: &ThreadedRuntime<TestShard, DefaultThreadedMailboxFactory>,
     target: Http2Target,
 ) -> Address<Http2ClientMsg, Http2ClientReply> {
-    let client = runtime
-        .register_with_capacity::<Http2ClientConnection<TestShard>, _>(
-            Http2ClientConnection::<TestShard>::new(target, Http2ClientLimits::default()),
-            32,
-        )
-        .expect("register client");
+    let client = make_client_unstarted(runtime, target);
     runtime
         .try_send(client, Http2ClientMsg::Begin)
         .expect("begin");
     client
+}
+
+fn make_client_unstarted(
+    runtime: &ThreadedRuntime<TestShard, DefaultThreadedMailboxFactory>,
+    target: Http2Target,
+) -> Address<Http2ClientMsg, Http2ClientReply> {
+    runtime
+        .register_with_capacity::<Http2ClientConnection<TestShard>, _>(
+            Http2ClientConnection::<TestShard>::new(target, Http2ClientLimits::default()),
+            32,
+        )
+        .expect("register client")
+}
+
+fn submit_with_request_queued_before_begin(
+    runtime: &ThreadedRuntime<TestShard, DefaultThreadedMailboxFactory>,
+    client: Address<Http2ClientMsg, Http2ClientReply>,
+    request: Http2ClientRequest,
+) -> CallOutcome<Http2ClientReply> {
+    std::thread::scope(|scope| {
+        let waiter = scope.spawn(|| {
+            runtime
+                .call_blocking(
+                    client,
+                    Http2ClientMsg::Submit(request),
+                    Duration::from_secs(5),
+                )
+                .expect("call returns")
+        });
+
+        // Give the runtime a turn to admit and park the Submit before
+        // Begin can fail fast. The thing under test is "queued caller
+        // gets typed TLS failure"; without this ordering, a fast connect
+        // failure can close the isolate before the call is admitted, and
+        // CallOutcome::Closed is also honest.
+        std::thread::sleep(Duration::from_millis(50));
+        runtime
+            .try_send(client, Http2ClientMsg::Begin)
+            .expect("begin");
+        waiter.join().expect("submit thread")
+    })
 }
 
 #[test]
@@ -271,15 +307,13 @@ fn h2_over_tls_without_server_h2_alpn_is_typed_mismatch() {
         trust_roots: vec![cert_der],
         alpn: AlpnProtocols::h2(),
     };
-    let client = make_client(&runtime, target);
+    let client = make_client_unstarted(&runtime, target);
 
-    let outcome = runtime
-        .call_blocking(
-            client,
-            Http2ClientMsg::Submit(Http2ClientRequest::get("/secure")),
-            Duration::from_secs(5),
-        )
-        .expect("call returns");
+    let outcome = submit_with_request_queued_before_begin(
+        &runtime,
+        client,
+        Http2ClientRequest::get("/secure"),
+    );
     match outcome {
         CallOutcome::Replied(Http2ClientReply::Outcome {
             outcome: Http2ClientOutcome::TlsAlpnMismatch,
@@ -308,15 +342,13 @@ fn h2_over_tls_with_untrusted_cert_fails_without_panic() {
         trust_roots: vec![server_config(Vec::new()).1],
         alpn: AlpnProtocols::h2(),
     };
-    let client = make_client(&runtime, target);
+    let client = make_client_unstarted(&runtime, target);
 
-    let outcome = runtime
-        .call_blocking(
-            client,
-            Http2ClientMsg::Submit(Http2ClientRequest::get("/secure")),
-            Duration::from_secs(5),
-        )
-        .expect("call returns");
+    let outcome = submit_with_request_queued_before_begin(
+        &runtime,
+        client,
+        Http2ClientRequest::get("/secure"),
+    );
     match outcome {
         CallOutcome::Replied(Http2ClientReply::Outcome { outcome, .. }) => {
             assert!(

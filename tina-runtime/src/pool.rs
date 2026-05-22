@@ -40,10 +40,13 @@ use std::marker::PhantomData;
 use std::num::NonZeroU64;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
 
 use tina::pool::{
-    AcquireFailure, AcquireOutcome, CloseMode, PoolConfig, PoolId, PoolLease, PoolPressureReport,
-    ReleaseDisposition, ReleaseFailure, ReleaseOutcome, runtime_internal as pool_internal,
+    AcquireFailure, AcquireOutcome, CloseMode, PolicyCheckPoint, PoolConfig, PoolId, PoolLease,
+    PoolPressureReport, RefillOutcome, ReleaseDisposition, ReleaseFailure, ReleaseOutcome,
+    ResourceLifetime, ResourcePolicyReport, RetireReason, RetiredResource,
+    runtime_internal as pool_internal,
 };
 use tina::runtime_internal::{deferred_handle_ref, handle_shared};
 use tina::{
@@ -84,6 +87,26 @@ where
     Close(CloseMode),
     /// Request a [`PoolPressureReport`] snapshot.
     PressureReport,
+    /// Run a lifetime sweep at logical time `now`. Retires idle
+    /// resources past the lifetime policy and reports leased resources
+    /// past max age (reported, not stolen). No-op unless the pool was
+    /// built with [`WorkerPool::with_lifetime`]. `now` is the owner's
+    /// Tina clock (`ctx.now()`), not a wall clock the pool reads.
+    Maintain {
+        /// Logical time for this sweep.
+        now: Instant,
+    },
+    /// Install a fresh resource handle into a retired slot to reclaim
+    /// capacity. Owner-driven: the pool cannot build an `H`. A live
+    /// (idle or leased) slot is never replaced.
+    Refill {
+        /// Slot to refill (a `ResourceId` the pool retired).
+        resource_id: u32,
+        /// Fresh resource handle.
+        handle: H,
+        /// Logical time the fresh resource was created.
+        now: Instant,
+    },
 }
 
 impl<H> std::fmt::Debug for WorkerPoolMsg<H>
@@ -99,6 +122,11 @@ where
                 .finish(),
             Self::Close(mode) => f.debug_tuple("Close").field(mode).finish(),
             Self::PressureReport => f.write_str("PressureReport"),
+            Self::Maintain { now } => f.debug_struct("Maintain").field("now", now).finish(),
+            Self::Refill { resource_id, .. } => f
+                .debug_struct("Refill")
+                .field("resource_id", resource_id)
+                .finish(),
         }
     }
 }
@@ -116,6 +144,10 @@ where
     Closed,
     /// Reply to [`WorkerPoolMsg::PressureReport`].
     Pressure(PoolPressureReport),
+    /// Reply to [`WorkerPoolMsg::Maintain`].
+    Maintenance(ResourcePolicyReport),
+    /// Reply to [`WorkerPoolMsg::Refill`].
+    Refilled(RefillOutcome),
 }
 
 impl<H> std::fmt::Debug for WorkerPoolReply<H>
@@ -128,6 +160,8 @@ where
             Self::Release(outcome) => f.debug_tuple("Release").field(outcome).finish(),
             Self::Closed => f.write_str("Closed"),
             Self::Pressure(report) => f.debug_tuple("Pressure").field(report).finish(),
+            Self::Maintenance(report) => f.debug_tuple("Maintenance").field(report).finish(),
+            Self::Refilled(outcome) => f.debug_tuple("Refilled").field(outcome).finish(),
         }
     }
 }
@@ -142,7 +176,11 @@ where
 enum ResourceState {
     Idle { next_generation: u64 },
     Leased { generation: u64 },
-    Retired,
+    // Carries the next generation so a refill into this slot keeps the
+    // pool's generation counter monotonic. Reusing a low generation
+    // after a refill would weaken the stale-lease / double-release
+    // checks that key on generation order.
+    Retired { next_generation: u64 },
 }
 
 /// One in-flight Acquired dispatch the pool needs to confirm landed.
@@ -183,6 +221,13 @@ where
 {
     pool_id: PoolId,
     config: PoolConfig,
+    lifetime: Option<ResourceLifetime>,
+    // Per-slot timestamps, populated only when `lifetime` is set.
+    // `created_at` is set at build / refill and never moves — total age
+    // is from creation. `idle_since` is cleared on lease and re-stamped
+    // by the first maintenance sweep that sees the slot idle.
+    created_at: Vec<Option<Instant>>,
+    idle_since: Vec<Option<Instant>>,
     resources: Vec<Option<H>>,
     states: Vec<ResourceState>,
     idle: std::collections::VecDeque<u32>,
@@ -203,7 +248,34 @@ where
 {
     /// Build a pool over a fixed list of resource handles. Panics if
     /// `resources` is empty or its length disagrees with `config.capacity`.
+    ///
+    /// No lifetime policy: `Maintain` is a no-op and resources are only
+    /// retired by caller `Retire` or force-close.
     pub fn new(config: PoolConfig, resources: Vec<H>) -> Self {
+        Self::build(config, resources, None, None)
+    }
+
+    /// Build a pool with an idle/max-age [`ResourceLifetime`] policy.
+    ///
+    /// `now` stamps every resource's creation time. The owner drives
+    /// retirement with `Maintain { now }` (typically off a Tina timer);
+    /// the pool never reads the wall clock itself. Panics under the
+    /// same conditions as [`WorkerPool::new`].
+    pub fn with_lifetime(
+        config: PoolConfig,
+        resources: Vec<H>,
+        lifetime: ResourceLifetime,
+        now: Instant,
+    ) -> Self {
+        Self::build(config, resources, Some(lifetime), Some(now))
+    }
+
+    fn build(
+        config: PoolConfig,
+        resources: Vec<H>,
+        lifetime: Option<ResourceLifetime>,
+        now: Option<Instant>,
+    ) -> Self {
         assert!(
             !resources.is_empty(),
             "WorkerPool capacity must be > 0 (got empty resource list)"
@@ -234,9 +306,16 @@ where
             free_waiter_slots.push(idx as u32);
         }
         let resources_opt: Vec<Option<H>> = resources.into_iter().map(Some).collect();
+        // Resources start idle "now". Both timestamps anchor at build
+        // time when a lifetime policy is present, else stay None.
+        let created_at = vec![now; cap];
+        let idle_since = vec![now; cap];
         Self {
             pool_id,
             config,
+            lifetime,
+            created_at,
+            idle_since,
             resources: resources_opt,
             states,
             idle,
@@ -264,7 +343,7 @@ where
             match s {
                 ResourceState::Idle { .. } => available += 1,
                 ResourceState::Leased { .. } => leased += 1,
-                ResourceState::Retired => {}
+                ResourceState::Retired { .. } => {}
             }
         }
         PoolPressureReport {
@@ -338,6 +417,8 @@ where
                 *state = ResourceState::Idle {
                     next_generation: generation.saturating_add(1),
                 };
+                // Back to idle: re-stamp on the next maintenance sweep.
+                self.idle_since[resource_id as usize] = None;
                 self.idle.push_back(resource_id);
                 self.counters.dispatch_recovered += 1;
             }
@@ -370,7 +451,28 @@ where
         waiter
     }
 
+    // Retire one slot: drop its handle, mark it Retired, clear its
+    // lifetime timestamps, and bump the counter. Preserves the slot's
+    // next generation so a later refill stays monotonic. Leaves the
+    // idle queue alone — callers prune it (release never has the id
+    // queued; the maintenance sweep prunes after the pass).
+    fn retire_slot(&mut self, idx: u32) {
+        let next_generation = match self.states[idx as usize] {
+            ResourceState::Idle { next_generation } => next_generation,
+            // The outstanding lease's generation is now spent.
+            ResourceState::Leased { generation } => generation.saturating_add(1),
+            ResourceState::Retired { next_generation } => next_generation,
+        };
+        self.states[idx as usize] = ResourceState::Retired { next_generation };
+        self.resources[idx as usize] = None;
+        self.created_at[idx as usize] = None;
+        self.idle_since[idx as usize] = None;
+        self.counters.retired += 1;
+    }
+
     fn mint_lease(&mut self, resource_id: u32) -> PoolLease<H> {
+        // Leaving idle: the idle clock restarts when it returns.
+        self.idle_since[resource_id as usize] = None;
         let state = &mut self.states[resource_id as usize];
         let generation = match state {
             ResourceState::Idle { next_generation } => {
@@ -381,7 +483,7 @@ where
             ResourceState::Leased { .. } => {
                 panic!("mint_lease on already-leased resource_id={resource_id}")
             }
-            ResourceState::Retired => {
+            ResourceState::Retired { .. } => {
                 panic!("mint_lease on retired resource_id={resource_id}")
             }
         };
@@ -520,9 +622,7 @@ where
         if matches!(self.closed, Some(CloseMode::Force)) {
             if let ResourceState::Leased { generation } = state {
                 if *generation == lease_generation {
-                    self.states[raw_idx as usize] = ResourceState::Retired;
-                    self.resources[raw_idx as usize] = None;
-                    self.counters.retired += 1;
+                    self.retire_slot(raw_idx);
                 }
             }
             return reply(WorkerPoolReply::Release(ReleaseOutcome::PoolClosed));
@@ -531,13 +631,13 @@ where
         match state {
             ResourceState::Leased { generation } if *generation == lease_generation => {
                 if matches!(disposition, ReleaseDisposition::Retire) {
-                    self.states[raw_idx as usize] = ResourceState::Retired;
-                    self.resources[raw_idx as usize] = None;
-                    self.counters.retired += 1;
+                    self.retire_slot(raw_idx);
                     return reply(WorkerPoolReply::Release(ReleaseOutcome::Retired));
                 }
                 let next_generation = lease_generation.saturating_add(1);
                 self.states[raw_idx as usize] = ResourceState::Idle { next_generation };
+                // Back to idle: re-stamp on the next maintenance sweep.
+                self.idle_since[raw_idx as usize] = None;
                 if self.closed.is_some() {
                     // Drain mode: release is honored as Released, the
                     // resource sits Idle but cannot be re-acquired
@@ -564,7 +664,9 @@ where
             ResourceState::Idle { .. } => {
                 reply(WorkerPoolReply::Release(ReleaseOutcome::StaleLease))
             }
-            ResourceState::Retired => reply(WorkerPoolReply::Release(ReleaseOutcome::Retired)),
+            ResourceState::Retired { .. } => {
+                reply(WorkerPoolReply::Release(ReleaseOutcome::Retired))
+            }
         }
     }
 
@@ -598,9 +700,7 @@ where
         if upgraded_to_force {
             for idx in 0..self.states.len() {
                 if matches!(self.states[idx], ResourceState::Leased { .. }) {
-                    self.states[idx] = ResourceState::Retired;
-                    self.resources[idx] = None;
-                    self.counters.retired += 1;
+                    self.retire_slot(idx as u32);
                 }
             }
             // In-flight dispatches whose resource we just retired
@@ -627,6 +727,147 @@ where
         self.waiter_queue.clear();
 
         effects.push(reply(WorkerPoolReply::Closed));
+        batch(effects)
+    }
+
+    // Lifetime sweep at logical time `now`. Retires idle resources past
+    // the policy; reports (does not retire) over-age leased resources.
+    fn handle_maintain(&mut self, now: Instant) -> Effect<Self> {
+        let mut report = ResourcePolicyReport::default();
+        // Close owns shutdown semantics. A maintenance tick that races a
+        // close must not retire slots — in particular, force-close keeps
+        // idle slots in `Idle` state on purpose so a stray late release
+        // still reports `DoubleRelease`; retiring them here would change
+        // that to `Retired`. So report current shape and retire nothing.
+        if self.closed.is_some() {
+            self.fill_report_tail(&mut report);
+            return reply(WorkerPoolReply::Maintenance(report));
+        }
+        let Some(lifetime) = self.lifetime else {
+            // No policy: report current shape, retire nothing.
+            self.fill_report_tail(&mut report);
+            return reply(WorkerPoolReply::Maintenance(report));
+        };
+
+        let mut retired_any = false;
+        for idx in 0..self.states.len() {
+            match self.states[idx] {
+                ResourceState::Idle { .. } => {
+                    report.inspected += 1;
+                    // First sweep that sees the slot idle stamps the
+                    // idle clock; total age runs from creation.
+                    let idle_since = *self.idle_since[idx].get_or_insert(now);
+                    let idle_for = now.saturating_duration_since(idle_since);
+                    let age = self.created_at[idx].map(|c| now.saturating_duration_since(c));
+
+                    let over_age = match (lifetime.max_lifetime, age) {
+                        (Some(max), Some(age)) => age >= max,
+                        _ => false,
+                    };
+                    let over_idle = match lifetime.max_idle {
+                        Some(max) => idle_for >= max,
+                        None => false,
+                    };
+                    // Max-age takes precedence in the reason — it is the
+                    // stronger reason to retire.
+                    let reason = if over_age {
+                        Some(RetireReason::MaxLifetime)
+                    } else if over_idle {
+                        Some(RetireReason::IdleTimeout)
+                    } else {
+                        None
+                    };
+                    if let Some(reason) = reason {
+                        // SAFETY: idx < states.len(), so the raw resource
+                        // id is in range for this pool.
+                        let resource_id =
+                            unsafe { pool_internal::resource_id_from_raw(idx as u32) };
+                        self.retire_slot(idx as u32);
+                        retired_any = true;
+                        report.retired.push(RetiredResource {
+                            resource_id,
+                            reason,
+                            check_point: PolicyCheckPoint::ScheduledMaintenance,
+                        });
+                    }
+                }
+                ResourceState::Leased { .. } => {
+                    report.inspected += 1;
+                    let age = self.created_at[idx].map(|c| now.saturating_duration_since(c));
+                    let over_age = match (lifetime.max_lifetime, age) {
+                        (Some(max), Some(age)) => age >= max,
+                        _ => false,
+                    };
+                    if over_age {
+                        // Reported old, never stolen. The caller still
+                        // holds a valid lease.
+                        let resource_id =
+                            unsafe { pool_internal::resource_id_from_raw(idx as u32) };
+                        report.over_age_leased.push(resource_id);
+                    }
+                }
+                ResourceState::Retired { .. } => {}
+            }
+        }
+
+        if retired_any {
+            let states = &self.states;
+            self.idle
+                .retain(|i| matches!(states[*i as usize], ResourceState::Idle { .. }));
+        }
+
+        self.fill_report_tail(&mut report);
+        reply(WorkerPoolReply::Maintenance(report))
+    }
+
+    // Fill the count tail of a policy report from current state.
+    fn fill_report_tail(&self, report: &mut ResourcePolicyReport) {
+        let mut available = 0usize;
+        let mut leased = 0usize;
+        let mut retired_slots = 0usize;
+        for s in &self.states {
+            match s {
+                ResourceState::Idle { .. } => available += 1,
+                ResourceState::Leased { .. } => leased += 1,
+                ResourceState::Retired { .. } => retired_slots += 1,
+            }
+        }
+        report.available_after = available;
+        report.leased_after = leased;
+        report.retired_slots = retired_slots;
+    }
+
+    // Install a fresh handle into a retired slot. Owner-driven refill;
+    // never replaces a live (idle or leased) resource.
+    fn handle_refill(&mut self, resource_id: u32, handle: H, now: Instant) -> Effect<Self> {
+        if self.closed.is_some() {
+            return reply(WorkerPoolReply::Refilled(RefillOutcome::Closed));
+        }
+        let next_generation = match self.states.get(resource_id as usize) {
+            None => return reply(WorkerPoolReply::Refilled(RefillOutcome::UnknownResource)),
+            Some(ResourceState::Retired { next_generation }) => *next_generation,
+            // A live (idle or leased) slot is never replaced behind a
+            // caller's back.
+            Some(_) => return reply(WorkerPoolReply::Refilled(RefillOutcome::NotRetired)),
+        };
+
+        let idx = resource_id as usize;
+        // Fresh resource starts idle "now". The generation continues from
+        // where the retired slot left off, so leases minted before and
+        // after the refill stay distinguishable by generation.
+        self.states[idx] = ResourceState::Idle { next_generation };
+        self.resources[idx] = Some(handle);
+        self.created_at[idx] = self.lifetime.is_some().then_some(now);
+        self.idle_since[idx] = self.lifetime.is_some().then_some(now);
+
+        // A fresh idle resource may satisfy a parked waiter.
+        // `dispatch_to_next_waiter` either hands it off or returns it to
+        // the idle queue — never push it ourselves first.
+        let mut effects = Vec::with_capacity(2);
+        if let Some(handover) = self.dispatch_to_next_waiter(resource_id) {
+            effects.push(handover);
+        }
+        effects.push(reply(WorkerPoolReply::Refilled(RefillOutcome::Refilled)));
         batch(effects)
     }
 }
@@ -859,6 +1100,56 @@ where
     crate::call::call(pool, WorkerPoolMsg::Close(mode), timeout).then(translator)
 }
 
+/// Sugar for `call(pool, WorkerPoolMsg::Maintain { now }, timeout).then(...)`.
+///
+/// Drive this off a Tina timer (`ctx.now()` for `now`). The reply is a
+/// [`WorkerPoolReply::Maintenance`] carrying a
+/// [`tina::pool::ResourcePolicyReport`] naming what the sweep retired.
+pub fn maintain_effect<I, H, F, M>(
+    pool: tina::Address<WorkerPoolMsg<H>, WorkerPoolReply<H>>,
+    now: Instant,
+    timeout: std::time::Duration,
+    translator: F,
+) -> Effect<I>
+where
+    H: Send + 'static,
+    I: Isolate<Message = M, Call = RuntimeCall<M>>,
+    F: FnOnce(crate::call::CallOutcome<WorkerPoolReply<H>>) -> M + 'static,
+    M: 'static,
+{
+    crate::call::call(pool, WorkerPoolMsg::Maintain { now }, timeout).then(translator)
+}
+
+/// Sugar for `call(pool, WorkerPoolMsg::Refill { .. }, timeout).then(...)`.
+///
+/// Owner-driven capacity refill: hand a fresh resource handle back for a
+/// slot the pool retired. The reply is a [`WorkerPoolReply::Refilled`].
+pub fn refill_effect<I, H, F, M>(
+    pool: tina::Address<WorkerPoolMsg<H>, WorkerPoolReply<H>>,
+    resource_id: u32,
+    handle: H,
+    now: Instant,
+    timeout: std::time::Duration,
+    translator: F,
+) -> Effect<I>
+where
+    H: Send + 'static,
+    I: Isolate<Message = M, Call = RuntimeCall<M>>,
+    F: FnOnce(crate::call::CallOutcome<WorkerPoolReply<H>>) -> M + 'static,
+    M: 'static,
+{
+    crate::call::call(
+        pool,
+        WorkerPoolMsg::Refill {
+            resource_id,
+            handle,
+            now,
+        },
+        timeout,
+    )
+    .then(translator)
+}
+
 // Manual Isolate impl: message and reply types are generic over H,
 // which the runtime_isolate macro doesn't handle.
 impl<H, S> Isolate for WorkerPool<H, S>
@@ -892,6 +1183,12 @@ where
             }
             WorkerPoolMsg::Close(mode) => self.handle_close(mode),
             WorkerPoolMsg::PressureReport => reply(WorkerPoolReply::Pressure(self.pressure())),
+            WorkerPoolMsg::Maintain { now } => self.handle_maintain(now),
+            WorkerPoolMsg::Refill {
+                resource_id,
+                handle,
+                now,
+            } => self.handle_refill(resource_id, handle, now),
         }
     }
 
@@ -919,6 +1216,18 @@ where
                 self.handle_close(mode)
             }
             WorkerPoolMsg::PressureReport => call.reply(WorkerPoolReply::Pressure(self.pressure())),
+            WorkerPoolMsg::Maintain { now } => {
+                let _ = call;
+                self.handle_maintain(now)
+            }
+            WorkerPoolMsg::Refill {
+                resource_id,
+                handle,
+                now,
+            } => {
+                let _ = call;
+                self.handle_refill(resource_id, handle, now)
+            }
         }
     }
 }
