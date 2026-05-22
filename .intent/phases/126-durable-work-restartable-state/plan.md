@@ -25,14 +25,17 @@
 - Module unit tests, user-shaped runtime integration tests (restart-resume,
   corrupt-tail-stops), and a codec ordering-integrity test.
 
-### Deferred to follow-up
+### Shipped (follow-up wave)
 
-- A standalone runnable `examples/` webhook-outbox specimen (dual tina/tokio
-  impl). The enqueue, send, mark-sent, restart, resume-unsent flow is proven end
-  to end by `tina-runtime/tests/durable_outbox.rs`; the demo crate is polish.
-- Snapshot/compaction of the outbox journal (the first form is journal-only;
-  `CommitConfidence::Uncertain` is the seam where a compaction commit fence would
-  feed recovery).
+- Journal compaction: `recover_compacted` returns the outbox, report, and a
+  compacted journal image (pending-only, re-indexed, completed dropped, ids
+  preserved); `persistence::commit_file_atomic` swaps it durably.
+- Commit fence: `persistence::{raise,clear}_commit_fence` + `commit_fence_present`
+  and `CommitConfidence::from_fence_present`, so an interrupted commit recovers
+  as `UncertainCommit`.
+- `ResumeQueue` (`RecoveryReport::into_resume`): drains pending oldest-first,
+  applying through the outbox and skipping completed ids.
+- Runnable `examples/specimen_webhook_outbox` (durable vs. hand-rolled).
 
 ## Purpose
 
