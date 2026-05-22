@@ -54,6 +54,7 @@ mod driver;
 mod errors;
 pub mod event_sink;
 mod fact;
+pub mod fairness_report;
 pub mod file_loops;
 mod full_handling;
 pub mod guarded_pending;
@@ -234,6 +235,7 @@ pub use scope::{
     ScopeRegisterError, ScopeRegisterSharedError, ScopedAdmitError, ScopedCallHandle,
     ScopedReplyError, scope_register,
 };
+pub use fairness_report::{FairnessReport, IsolateProgress, StarvationWarning};
 pub use service_pressure::{ServicePressureReport, ServicePressureSurface, ServiceSurfaceState};
 pub use shared_scope::{SharedCapacityScope, SharedLease, SharedScopeFull, SharedScopeReport};
 pub use supervision_report::{ChildSupervision, SupervisorHalt, SupervisorReport};
