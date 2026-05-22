@@ -36,6 +36,9 @@ shrunk it, and committed the small regression case.
 - capture from `TraceSnapshot`, shutdown/resource reports, capacity summaries,
   protocol facts, and proof-harness reports
 - bounded capture limits for event/fact/string payload counts
+- visible capture-source metadata: runtime kind, live/sim backend, crate/git
+  revision when available, platform, schema version, and complete/partial trace
+  status
 - fact extractors for:
   - capacity high-water/full/final-current
   - `Full` / `Closed` / `Timeout` / `Rejected` terminal facts
@@ -83,8 +86,9 @@ Use user-workflow names:
 ```text
 capture_live_run
 LiveReplayCaptureBuilder
-CapturedFact
-UnsupportedReplayFact
+LiveReplayFact
+ReplayFact
+UnsupportedLiveFact
 CaptureSummary
 ReplayCaptureReport
 shrink_captured_replay
@@ -104,7 +108,7 @@ write_saved_replay_case("cases/slow-peer.case", &capture, encode_op)?;
 assert_captured_replay(&capture, &capture.to_replay_case(), run_sim)?;
 
 let shrunk = shrink_captured_replay(&capture, run_sim, check_bug)?;
-shrunk.write("cases/slow-peer-small.case")?;
+write_saved_replay_case("cases/slow-peer-small.case", shrunk.capture(), encode_op)?;
 ```
 
 Likely homes:
@@ -117,19 +121,62 @@ Likely homes:
 Rules:
 
 - Capture is bounded. If the cap is hit, emit `CaptureFull` /
-  `TraceTruncated` / `FactTruncated` and make replay fail closed unless the
-  case explicitly expects that truncation fact.
+  `TraceTruncated` / `FactTruncated`.
+- A truncated capture may be saved as evidence. It must not pass exact replay
+  unless truncation is itself explicit expected truth and the replay produces
+  the same truncation fact.
 - Every capture carries seed, replay config, topology roles, materialized
   history ops, invariant text, expected event count/hash, live facts, and
   unsupported facts.
-- Capture builders must not inspect arbitrary user state. Users pass facts in.
-- Fact extractors are boring adapters from existing reports to `CapturedFact`.
+- Every capture also carries `CaptureSource`: runtime kind, live/sim backend,
+  schema version, platform, optional crate/git revision, and trace completeness.
+- Capture builders must not inspect arbitrary user state. Users pass facts in or
+  pass existing Tina reports to blessed adapters.
+- Required adapters: `with_capacity_summary(...)`, `with_shutdown_report(...)`,
+  `with_protocol_report(...)`, `with_resource_report(...)`, and
+  `with_proof_harness_report(...)` if the source report exists on main.
+- Fact extractors are boring adapters from existing reports to `LiveReplayFact`.
 - Fact comparison is by stable names and values, not debug strings.
 - Missing fact, changed fact, extra unsupported fact, seed drift, config drift,
   and hash/count drift must produce different mismatch reasons.
 - Shrinking live-derived cases refreshes expected event count/hash for the
   shrunk case. No stale constants.
+- Shrinking must preserve the facts that prove the bug by default. If shrinking
+  changes, removes, or adds facts, the shrink report names the fact delta and
+  refuses the candidate unless the caller explicitly accepts that changed fact
+  set.
 - Saved case output is readable enough for code review.
+
+Exact replay passes only when all of these are true:
+
+- seed matches
+- config matches
+- topology/source shape matches
+- materialized history matches
+- expected event count/hash match
+- every required live fact matches
+- no unsupported live fact is present unless the expected outcome is
+  unsupported
+- capture was complete, or truncation is explicitly modeled and expected
+
+Public mismatch shape must be precise, not one string:
+
+```text
+CapturedReplayMismatch
+SeedDrift
+ConfigDrift
+HistoryDrift
+TopologyDrift
+SourceDrift
+MissingFact
+ChangedFact
+UnexpectedFact
+UnsupportedFact
+CaptureTruncated
+PartialTrace
+CountDrift
+HashDrift
+```
 
 ## User Proof Specimens
 
@@ -138,6 +185,10 @@ Required:
 - `examples/systems/system_live_replay_bugbox` becomes the canonical example.
   It must run a live-shaped smoke, save a case, replay it, shrink it, and keep a
   shrunk regression test.
+- The canonical example must exercise at least:
+  - one capacity/pressure fact
+  - one lifecycle/terminal fact
+  - one unsupported-fact or mismatch proof
 - If Phase 121 is on main, add one load/weirdness capture from Phase 121:
   hot actor/session pressure or protocol-session pressure.
 
@@ -173,12 +224,18 @@ The specimen README must show:
 - changed fact fails with expected/actual
 - unsupported fact fails closed and names the unsupported fact
 - bounded capture cap produces explicit truncation/full truth
+- truncated capture cannot pass exact replay through the default helper
 - partial/missing-shard live trace is rejected or saved with explicit partial
   truth that replay checks
 - shrink refreshes event count/hash and writes the refreshed constants
+- shrink refuses by default when the candidate deletes or changes the fact that
+  proves the bug
 - real system capture includes at least one pressure/lifecycle/protocol/durable
   fact, not only trace hash
 - real system shrunk regression is committed as a test
+- unsupported facts cannot be accidentally dropped by `to_replay_case`
+- saved cases cannot be built without config, materialized history, expected
+  shape, and fact set
 - docs snippets compile or are marked `ignore` with a reason
 - proof-harness integration prints one grep-friendly summary line naming saved
   path, unsupported facts count, event count, trace hash, and shrink result
@@ -188,9 +245,11 @@ The specimen README must show:
 Suggested verification commands:
 
 ```sh
+cargo test -p tina-sim live_replay -- --nocapture
 cargo test -p tina-sim saved_replay_cases -- --nocapture
 cargo test -p tina-proof-harness --tests -- --nocapture
 cargo test --manifest-path examples/systems/system_live_replay_bugbox/Cargo.toml -- --nocapture
+cargo test -p tina-sim --doc
 ```
 
 ## Docs And Examples
@@ -219,7 +278,10 @@ Commit facts.
 - Do not compare fact debug strings.
 - Do not make capture unbounded because traces are "just tests."
 - Do not hide config/topology/seed outside the saved case.
+- Do not hide capture source metadata outside the saved case.
 - Do not call a hash match replay if required facts are missing.
+- Do not let shrink remove the fact that made the live run interesting.
+- Do not let a truncated capture pass as exact replay.
 - Do not invent a second replay format unless saved-case versioning is tested.
 - Do not turn this into trace timeline export.
 - Do not leave the specimen as prose. It must run.
