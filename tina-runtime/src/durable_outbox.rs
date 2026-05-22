@@ -49,10 +49,11 @@
 //! that separates a clean tail, a repaired truncated tail, and an uncertain
 //! commit. A corrupt tail is rejected by name as [`RecoveryError::CorruptTail`].
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, VecDeque};
 use std::marker::PhantomData;
 
-use crate::{CallError, JournalReplay, JournalReplayWarning};
+use crate::persistence::encode_journal_record;
+use crate::{CallError, JournalRecord, JournalReplay, JournalReplayWarning};
 
 /// Inner-record tag for an enqueue record.
 const TAG_ENQUEUE: u8 = 0;
@@ -310,6 +311,53 @@ pub struct RecoveryReport<W> {
     pub completed: Vec<WorkId>,
 }
 
+impl<W> RecoveryReport<W> {
+    /// Turn the pending work into a [`ResumeQueue`] to drain after recovery,
+    /// oldest first.
+    pub fn into_resume(self) -> ResumeQueue<W> {
+        ResumeQueue {
+            items: self.pending.into(),
+        }
+    }
+}
+
+/// A drain queue of pending work to resume after recovery, oldest first.
+///
+/// Built by [`RecoveryReport::into_resume`]. Drive it one item at a time with
+/// [`next_apply`](Self::next_apply): for each returned `(WorkId, work)`, perform
+/// the side effect, then `begin_complete` / `finish_complete`. Resuming one at a
+/// time keeps the durable completion-record indices strictly increasing.
+#[derive(Debug)]
+pub struct ResumeQueue<W> {
+    items: VecDeque<RecordedWork<W>>,
+}
+
+impl<W: DurablePayload> ResumeQueue<W> {
+    /// Number of pending items left to resume.
+    pub fn len(&self) -> usize {
+        self.items.len()
+    }
+
+    /// Whether every pending item has been drained.
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+
+    /// Apply the next pending item through `outbox`, skipping any id that is
+    /// already completed, and return the work to act on with its id. Returns
+    /// `None` once the queue is drained.
+    pub fn next_apply(&mut self, outbox: &mut DurableOutbox<W>) -> Option<(WorkId, W)> {
+        while let Some(recorded) = self.items.pop_front() {
+            let id = recorded.work_id();
+            match outbox.apply(recorded) {
+                ApplyStatus::Apply(work) => return Some((id, work)),
+                ApplyStatus::DuplicateWork(_) => continue,
+            }
+        }
+        None
+    }
+}
+
 /// Final accounting of durable work at shutdown.
 ///
 /// `pending` and `abandoned` are bounded by the outbox capacity. `completed`
@@ -340,6 +388,19 @@ pub enum CommitConfidence {
     Clean,
     /// The last durable commit could not confirm its final step.
     Uncertain,
+}
+
+impl CommitConfidence {
+    /// Map a commit-fence presence flag to a confidence. A leftover fence
+    /// (`true`) means the last commit could not confirm its final durability
+    /// step. Pair with [`crate::persistence::commit_fence_present`].
+    pub fn from_fence_present(present: bool) -> Self {
+        if present {
+            Self::Uncertain
+        } else {
+            Self::Clean
+        }
+    }
 }
 
 /// Bounded, restart-survivable record of local work to perform.
@@ -563,19 +624,98 @@ impl<W: DurablePayload> DurableOutbox<W> {
         replay: Result<JournalReplay, CallError>,
         commit: CommitConfidence,
     ) -> Result<(Self, RecoveryReport<W>), RecoveryError> {
+        let cap = capacity.max(1);
+        let folded = Self::fold(replay, cap)?;
+
+        let mut outbox = Self::new(cap);
+        outbox.next_index = folded.max_index + 1;
+        outbox.next_work_id = folded.max_work_id + 1;
+        outbox.pending = folded.pending.iter().map(|(id, _)| id.0).collect();
+        outbox.completed = folded.completed_set;
+        outbox.advance_watermark();
+
+        let report = RecoveryReport {
+            tail_status: tail_status_for(commit, folded.warning),
+            pending: folded
+                .pending
+                .into_iter()
+                .map(|(id, work)| RecordedWork { id, work })
+                .collect(),
+            completed: folded.completed_order,
+        };
+        Ok((outbox, report))
+    }
+
+    /// Recover and compact the journal in one step.
+    ///
+    /// Like [`recover`](Self::recover), but also returns a **compacted journal
+    /// image**: only the still-pending enqueue records, re-indexed from 1, with
+    /// completed and stale records dropped. `WorkId`s are preserved, and the
+    /// returned outbox's next journal index continues right after the compacted
+    /// records — so a journal that has accumulated many completed records is
+    /// reset to just its live backlog.
+    ///
+    /// You must durably install the returned bytes at the journal path (for
+    /// example with [`crate::persistence::commit_file_atomic`]) **before** using
+    /// the returned outbox: its index counter is aligned to the compacted
+    /// journal, not the old one. Until you install them the on-disk journal is
+    /// the old, larger one, so a crash before install simply recovers the old
+    /// journal again (idempotent).
+    pub fn recover_compacted(
+        capacity: usize,
+        replay: Result<JournalReplay, CallError>,
+        commit: CommitConfidence,
+    ) -> Result<(Self, RecoveryReport<W>, Vec<u8>), RecoveryError> {
+        let cap = capacity.max(1);
+        let folded = Self::fold(replay, cap)?;
+
+        // Re-emit each still-pending enqueue as a fresh journal record, indexed
+        // from 1. Completed and stale records simply do not appear.
+        let mut compacted = Vec::new();
+        for (position, (id, work)) in folded.pending.iter().enumerate() {
+            let payload = frame_record(TAG_ENQUEUE, *id, Some(&work.to_durable_bytes()));
+            compacted.extend_from_slice(&encode_journal_record(&JournalRecord {
+                index: (position as u64) + 1,
+                bytes: payload,
+            }));
+        }
+        let pending_count = folded.pending.len() as u64;
+
+        let mut outbox = Self::new(cap);
+        outbox.next_index = pending_count + 1;
+        outbox.next_work_id = folded.max_work_id + 1;
+        outbox.pending = folded.pending.iter().map(|(id, _)| id.0).collect();
+        outbox.completed = folded.completed_set;
+        outbox.advance_watermark();
+
+        let report = RecoveryReport {
+            tail_status: tail_status_for(commit, folded.warning),
+            pending: folded
+                .pending
+                .into_iter()
+                .map(|(id, work)| RecordedWork { id, work })
+                .collect(),
+            completed: folded.completed_order,
+        };
+        Ok((outbox, report, compacted))
+    }
+
+    /// Fold a recovered journal into its open work, completed ids, and bounds.
+    /// Shared by [`recover`](Self::recover) and
+    /// [`recover_compacted`](Self::recover_compacted).
+    fn fold(replay: Result<JournalReplay, CallError>, cap: usize) -> Result<Folded<W>, RecoveryError> {
         let replay = match replay {
             Ok(replay) => replay,
             Err(CallError::CorruptRecord) => return Err(RecoveryError::CorruptTail),
             Err(_) => return Err(RecoveryError::Io),
         };
 
-        let cap = capacity.max(1);
-        let mut outbox = Self::new(cap);
         // Preserve durable order while reconstructing which work is still open.
         // `Vec` keeps insertion order for the report; the set guards membership.
         let mut pending_order: Vec<(WorkId, W)> = Vec::new();
         let mut pending_ids: BTreeSet<u64> = BTreeSet::new();
         let mut completed_order: Vec<WorkId> = Vec::new();
+        let mut completed_set: BTreeSet<u64> = BTreeSet::new();
         let mut max_index = 0_u64;
         let mut max_work_id = 0_u64;
 
@@ -607,7 +747,7 @@ impl<W: DurablePayload> DurableOutbox<W> {
                     if pending_ids.remove(&id.0) {
                         pending_order.retain(|(pending_id, _)| pending_id.0 != id.0);
                     }
-                    if outbox.completed.insert(id.0) {
+                    if completed_set.insert(id.0) {
                         completed_order.push(id);
                     }
                 }
@@ -615,32 +755,14 @@ impl<W: DurablePayload> DurableOutbox<W> {
             }
         }
 
-        outbox.next_index = max_index + 1;
-        outbox.next_work_id = max_work_id + 1;
-        outbox.pending = pending_ids;
-        outbox.advance_watermark();
-
-        let tail_status = match (commit, replay.warning) {
-            (CommitConfidence::Uncertain, _) => TailStatus::UncertainCommit,
-            (_, Some(JournalReplayWarning::TruncatedTail { valid_prefix_len })) => {
-                TailStatus::TruncatedTailRepaired { valid_prefix_len }
-            }
-            (CommitConfidence::Clean, None) => TailStatus::Clean,
-        };
-
-        let pending = pending_order
-            .into_iter()
-            .map(|(id, work)| RecordedWork { id, work })
-            .collect();
-
-        Ok((
-            outbox,
-            RecoveryReport {
-                tail_status,
-                pending,
-                completed: completed_order,
-            },
-        ))
+        Ok(Folded {
+            pending: pending_order,
+            completed_order,
+            completed_set,
+            max_index,
+            max_work_id,
+            warning: replay.warning,
+        })
     }
 
     /// Snapshot the outstanding work at shutdown.
@@ -683,6 +805,28 @@ impl<W: DurablePayload> DurableOutbox<W> {
             self.completed_watermark = new_watermark;
             self.completed.retain(|&id| id > new_watermark);
         }
+    }
+}
+
+/// Open work, completed ids, and bounds folded from a recovered journal.
+struct Folded<W> {
+    pending: Vec<(WorkId, W)>,
+    completed_order: Vec<WorkId>,
+    completed_set: BTreeSet<u64>,
+    max_index: u64,
+    max_work_id: u64,
+    warning: Option<JournalReplayWarning>,
+}
+
+/// Derive the recovered tail status. An uncertain commit wins over a truncated
+/// tail: the durability boundary is the more important thing to flag.
+fn tail_status_for(commit: CommitConfidence, warning: Option<JournalReplayWarning>) -> TailStatus {
+    match (commit, warning) {
+        (CommitConfidence::Uncertain, _) => TailStatus::UncertainCommit,
+        (_, Some(JournalReplayWarning::TruncatedTail { valid_prefix_len })) => {
+            TailStatus::TruncatedTailRepaired { valid_prefix_len }
+        }
+        (CommitConfidence::Clean, None) => TailStatus::Clean,
     }
 }
 
@@ -1077,5 +1221,81 @@ mod tests {
         assert_eq!(report.abandoned, vec![abandoned_id]);
         assert_eq!(report.completed, 1);
         assert_eq!(report.failed, 1);
+    }
+
+    #[test]
+    fn recover_compacted_drops_completed_and_reindexes_pending() {
+        let records = vec![
+            (1, frame_record(TAG_ENQUEUE, WorkId(1), Some(b"a"))),
+            (2, frame_record(TAG_COMPLETE, WorkId(1), None)),
+            (3, frame_record(TAG_ENQUEUE, WorkId(2), Some(b"b"))),
+            (4, frame_record(TAG_ENQUEUE, WorkId(3), Some(b"c"))),
+        ];
+        let (outbox, report, compacted) = DurableOutbox::<Vec<u8>>::recover_compacted(
+            8,
+            Ok(replay_of(&records)),
+            CommitConfidence::Clean,
+        )
+        .expect("recovered + compacted");
+        assert_eq!(report.completed, vec![WorkId(1)]);
+        let pending_ids: Vec<u64> = report.pending.iter().map(|w| w.work_id().0).collect();
+        assert_eq!(pending_ids, vec![2, 3]);
+        // next append continues right after the two compacted records.
+        assert_eq!(outbox.next_index, 3);
+
+        // the compacted journal holds only the pending enqueues, re-indexed 1,2.
+        let replay = crate::persistence::replay_journal_bytes(&compacted).unwrap();
+        assert_eq!(replay.records.len(), 2);
+        assert_eq!(replay.records[0].index, 1);
+        assert_eq!(replay.records[1].index, 2);
+        // recovering from the compacted image yields the same pending work and
+        // no completed records survive.
+        let (_outbox2, report2) =
+            DurableOutbox::<Vec<u8>>::recover(8, Ok(replay), CommitConfidence::Clean).unwrap();
+        let pending2: Vec<u64> = report2.pending.iter().map(|w| w.work_id().0).collect();
+        assert_eq!(pending2, vec![2, 3]);
+        assert!(report2.completed.is_empty());
+    }
+
+    #[test]
+    fn compacted_outbox_appends_contiguously_and_keeps_work_ids() {
+        let records = vec![
+            (1, frame_record(TAG_ENQUEUE, WorkId(1), Some(b"a"))),
+            (2, frame_record(TAG_ENQUEUE, WorkId(2), Some(b"b"))),
+        ];
+        let (mut outbox, _report, _compacted) = DurableOutbox::<Vec<u8>>::recover_compacted(
+            8,
+            Ok(replay_of(&records)),
+            CommitConfidence::Clean,
+        )
+        .unwrap();
+        // two pending compacted to indices 1,2, so the next append is index 3,
+        // and the next id continues past the recovered max.
+        let staged = outbox.enqueue(b"new".to_vec()).expect("fits");
+        assert_eq!(staged.journal_index(), 3);
+        assert_eq!(staged.work_id(), WorkId(3));
+    }
+
+    #[test]
+    fn resume_queue_yields_oldest_first_and_skips_completed() {
+        let records = vec![
+            (1, frame_record(TAG_ENQUEUE, WorkId(1), Some(b"first"))),
+            (2, frame_record(TAG_ENQUEUE, WorkId(2), Some(b"second"))),
+        ];
+        let (mut outbox, report) =
+            DurableOutbox::<Vec<u8>>::recover(8, Ok(replay_of(&records)), CommitConfidence::Clean)
+                .unwrap();
+        let mut queue = report.into_resume();
+        assert_eq!(queue.len(), 2);
+        // complete id 1 out of band so the queue must skip it on drain.
+        if let CompletionStart::Record(c) = outbox.begin_complete(WorkId(1)) {
+            outbox.finish_complete(c, Ok(())).unwrap();
+        }
+        assert_eq!(
+            queue.next_apply(&mut outbox),
+            Some((WorkId(2), b"second".to_vec()))
+        );
+        assert_eq!(queue.next_apply(&mut outbox), None);
+        assert!(queue.is_empty());
     }
 }

@@ -158,8 +158,8 @@ pub use mailbox::{DefaultMailboxFactory, DefaultThreadedMailboxFactory, MailboxF
 pub use crate::durable_outbox::{
     AppendFailed, ApplyStatus, CommitConfidence, CommittedWork, CompletionFailed, CompletionStart,
     DurableCompletion, DurableOutbox, DurablePayload, DurableWork, OutboxFull,
-    OutboxShutdownReport, RecordError, RecordedWork, RecoveryError, RecoveryReport, StaleWork,
-    TailStatus, WorkId,
+    OutboxShutdownReport, RecordError, RecordedWork, RecoveryError, RecoveryReport, ResumeQueue,
+    StaleWork, TailStatus, WorkId,
 };
 pub use crate::persistence::{
     LOCAL_PERSISTENCE_SUPPORT, LocalPersistenceSupport, PersistenceSupportLevel,
