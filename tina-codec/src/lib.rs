@@ -303,16 +303,22 @@ mod sync_codec_tests {
         type Malformed = ();
 
         fn feed(&mut self, bytes: &[u8]) {
-            // Bounded: stop appending once the unframed prefix would
-            // exceed the cap, and latch the Full outcome.
             if self.full {
                 return;
             }
-            if self.buf.len() + bytes.len() > self.cap && !self.buf.contains(&self.delim) {
-                self.full = true;
-                return;
+            for byte in bytes {
+                self.buf.push(*byte);
+                let unframed = self
+                    .buf
+                    .iter()
+                    .rev()
+                    .take_while(|seen| **seen != self.delim)
+                    .count();
+                if unframed > self.cap {
+                    self.full = true;
+                    return;
+                }
             }
-            self.buf.extend_from_slice(bytes);
         }
 
         fn next_frame(&mut self) -> FrameDecision<Self::Frame, Self::Malformed> {
@@ -374,5 +380,16 @@ mod sync_codec_tests {
         let out = drain(&mut line, b"x\ny\n");
         assert!(matches!(out[0], FrameDecision::Frame(ref f) if f == b"x"));
         assert!(matches!(out[1], FrameDecision::Frame(ref f) if f == b"y"));
+    }
+
+    #[test]
+    fn external_codec_accepts_delimiter_before_later_overflow() {
+        let mut codec = ByteSplitCodec::new(b'|', 4);
+        codec.feed(b"ok|abcdef");
+        assert!(matches!(
+            codec.next_frame(),
+            FrameDecision::Frame(ref f) if f == b"ok"
+        ));
+        assert!(matches!(codec.next_frame(), FrameDecision::Full));
     }
 }

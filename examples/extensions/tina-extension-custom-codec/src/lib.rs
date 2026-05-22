@@ -80,14 +80,18 @@ impl SyncCodec for SemicolonCodec {
         if self.full {
             return;
         }
-        // Bounded: if there is no delimiter yet and appending would push
-        // the unframed prefix past the cap, latch Full instead of growing.
-        let has_delim = self.buf.contains(&b';');
-        if !has_delim && self.buf.len() + bytes.len() > self.max_frame {
-            self.full = true;
-            return;
+        // Bounded per frame: append until the current unframed suffix
+        // crosses the cap. A delimiter that arrives before the cap still
+        // yields its frame, even if later bytes in the same read overflow
+        // the next frame.
+        for byte in bytes {
+            self.buf.push(*byte);
+            let unframed = self.buf.iter().rev().take_while(|b| **b != b';').count();
+            if unframed > self.max_frame {
+                self.full = true;
+                return;
+            }
         }
-        self.buf.extend_from_slice(bytes);
     }
 
     fn next_frame(&mut self) -> FrameDecision<Self::Frame, Self::Malformed> {
@@ -454,5 +458,16 @@ mod tests {
         );
         assert_eq!(a.server_saw, b.server_saw);
         assert_eq!(a.client_received, b.client_received);
+    }
+
+    #[test]
+    fn delimiter_before_later_overflow_keeps_finished_frame() {
+        let mut codec = SemicolonCodec::new(4);
+        codec.feed(b"ok;abcdef");
+        assert!(matches!(
+            codec.next_frame(),
+            FrameDecision::Frame(ref f) if f == b"ok"
+        ));
+        assert!(matches!(codec.next_frame(), FrameDecision::Full));
     }
 }
