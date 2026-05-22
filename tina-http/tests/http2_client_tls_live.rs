@@ -268,13 +268,15 @@ fn h2_over_tls_round_trips_with_alpn_h2() {
         trust_roots: vec![cert_der],
         alpn: AlpnProtocols::h2(),
     };
-    let client = make_client_unstarted(&runtime, target);
+    let client = make_client(&runtime, target);
 
-    let outcome = submit_with_request_queued_before_begin(
-        &runtime,
-        client,
-        Http2ClientRequest::get("/secure"),
-    );
+    let outcome = runtime
+        .call_blocking(
+            client,
+            Http2ClientMsg::Submit(Http2ClientRequest::get("/secure")),
+            Duration::from_secs(5),
+        )
+        .expect("call returns");
     match outcome {
         CallOutcome::Replied(Http2ClientReply::Outcome {
             outcome: Http2ClientOutcome::Replied(response),
@@ -340,15 +342,13 @@ fn h2_over_tls_with_untrusted_cert_fails_without_panic() {
         trust_roots: vec![server_config(Vec::new()).1],
         alpn: AlpnProtocols::h2(),
     };
-    let client = make_client(&runtime, target);
+    let client = make_client_unstarted(&runtime, target);
 
-    let outcome = runtime
-        .call_blocking(
-            client,
-            Http2ClientMsg::Submit(Http2ClientRequest::get("/secure")),
-            Duration::from_secs(5),
-        )
-        .expect("call returns");
+    let outcome = submit_with_request_queued_before_begin(
+        &runtime,
+        client,
+        Http2ClientRequest::get("/secure"),
+    );
     match outcome {
         CallOutcome::Replied(Http2ClientReply::Outcome { outcome, .. }) => {
             assert!(
