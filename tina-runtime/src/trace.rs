@@ -302,6 +302,15 @@ pub enum CallKind {
 pub enum CallCompletionRejectedReason {
     /// The requesting isolate's mailbox was full when the runtime tried to
     /// enqueue the completion.
+    ///
+    /// This is a distinct terminal class (finding C4, ratified): the pending
+    /// call is settled in the runtime's bookkeeping and this event is the only
+    /// record of the outcome. Unlike `Full`/`Closed`/`Timeout`, the caller's
+    /// handler does **not** observe the outcome as a delivered reply — its own
+    /// mailbox was the bottleneck. Observe this event (not a reply) to detect
+    /// the case; a caller that cannot tolerate a dropped continuation must keep
+    /// its mailbox from saturating. The runtime deliberately does not re-buffer
+    /// the outcome for redelivery (that would add an unbounded per-caller hold).
     MailboxFull,
 
     /// The requesting isolate had stopped (or its incarnation was
