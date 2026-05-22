@@ -1,0 +1,7 @@
+error[E0133]: call to unsafe function `tina::runtime_internal::request_effect_from_consumed_effect` is unsafe and requires unsafe block
+  --> tests/safety_rails_compile_fail/runtime_internal_forge_needs_unsafe.rs:21:5
+   |
+21 |     tina::runtime_internal::request_effect_from_consumed_effect(tina::noop())
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ call to unsafe function
+   |
+   = note: consult the function's documentation for information on how to avoid undefined behavior

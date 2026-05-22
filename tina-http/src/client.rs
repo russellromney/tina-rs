@@ -24,7 +24,10 @@ use tina_runtime::{
     tls_close, tls_connect, tls_read, tls_write,
 };
 
-use crate::parse::{HttpResponseHead, ResponseParseProgress, encode_request, parse_response_head};
+use crate::parse::{
+    HttpResponseHead, ResponseParseProgress, encode_request, is_valid_origin_form_request_target,
+    parse_response_head,
+};
 use crate::target::{HttpHostPolicy, HttpTarget};
 use crate::transport::HttpTransport;
 use crate::types::{
@@ -441,6 +444,9 @@ fn apply_host_policy(
     mut request: HttpRequest,
     target: &HttpTarget,
 ) -> Result<HttpRequest, HttpClientError> {
+    if !is_valid_origin_form_request_target(&request.path) {
+        return Err(HttpClientError::InvalidRequestTarget);
+    }
     let policy_value: Option<&str> = match target {
         HttpTarget::Http { host: None, .. } => None,
         HttpTarget::Http { host: Some(v), .. } => Some(v.as_str()),

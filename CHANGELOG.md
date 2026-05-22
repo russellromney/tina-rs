@@ -225,6 +225,724 @@ Linux and macOS; Windows waits on a `betelgeuse` Windows backend.
   connect/accept parking, wrong-resource typed errors, peer-close-while-
   read EOF settling, and listener-close refusing a parked connect; a
   golden `CallKind` tag-stability test; codec compile-fail fixtures.
+### DST Replay Honesty for the Native HTTP/2 Client
+
+The native HTTP/2 client does real outbound socket I/O
+(`tcp_connect`/`read`/`write`/`close`). The deterministic simulator's
+replay op-alphabet models *app* operations, not a remote peer's live
+socket completions, so a captured live client run cannot be silently
+re-driven from the op history. Rather than a silent no-op or a fake
+replay, a live capture carries a typed
+`tina_sim::dst::UnsupportedLiveFact` naming the client socket work, and
+`check_captured_replay` fails closed on it.
+
+- **`dst_http2_client.rs`** runs the native client live (h2c connect +
+  one GET), captures the run as a `LiveReplayCapture` whose
+  `unsupported_facts` name the client socket I/O, and asserts
+  `check_captured_replay` reports a `CapturedReplayChange::UnsupportedFact`
+  — proving the simulator does not fake the replay. The saved replay case
+  round-trips through `write_saved_replay_case` /
+  `read_saved_replay_case`, preserving the unsupported fact and the
+  explicit op history.
+
+### Streaming gRPC Client
+
+`GrpcClient` now covers server-streaming, client-streaming, and bidi on
+top of the HTTP/2 client's streaming bodies — Tina is a native streaming
+gRPC client, not only a server. The gRPC status stays first-class on
+every shape.
+
+- **`GrpcClient::server_streaming_request(path, &req)`** builds an
+  `OpenStream` (one buffered request message, a pulled response). Feed
+  each pulled `Http2ResponseChunk` to a `GrpcStreamDecoder` and fold it
+  with `decode_stream_chunk` into `GrpcStreamItem`s — `Message(..)` for
+  each decoded response message, then exactly one terminal `Status` /
+  `Transport` / `Malformed`.
+- **`GrpcClient::client_streaming_request(path, source)`** builds a
+  `SubmitStreaming` (a streamed request body of gRPC-framed messages, one
+  buffered response). The response decodes with the existing
+  `decode_unary`. `GrpcClient::frame(&msg)` length-prefixes a message for
+  the request `source` (e.g. an `IterBodySource`).
+- **`GrpcClient::bidi_request(path, source)`** builds an `OpenStream`
+  with a streamed request body and a pulled response, so the two
+  directions progress independently.
+- **`GrpcStreamDecoder`** reassembles length-prefixed gRPC messages
+  across response DATA chunks — a chunk may carry several messages, one,
+  or a fragment that spans chunks. It rejects compression and over-cap
+  lengths before allocating, and `finish()` flags a truncated trailing
+  frame. **`GrpcStreamItem<Resp>`** is the typed fold result;
+  `stream_head_status(headers)` reads a trailers-only status from the
+  response head.
+- **Live proofs** (`grpc_client_live.rs`, dialing an in-tree
+  `GrpcRouter`): server-streaming receives all messages then a status;
+  client-streaming sends several messages and gets the summed reply +
+  status; bidi echoes each streamed request back as a streamed response.
+  A compile-fail proof pins that a `GrpcStreamItem` cannot be coerced to
+  the response message (the status arm cannot be silently dropped).
+
+### HTTP/2 Client Streaming Response Bodies
+
+The HTTP/2 client can now deliver a response incrementally instead of
+buffering the whole body. This is the response half of streaming bodies
+and the remaining blocker for server-streaming / bidi gRPC.
+
+- **`Http2ClientMsg::OpenStream(Http2ClientStreamCall)`** opens a stream
+  whose response is pulled. The request body is buffered or streamed
+  (`Http2ClientRequestBody::{Buffered, Stream}`), so one call shape
+  serves both server-streaming (buffered request) and bidi (streamed
+  request). The first reply is an
+  `Http2ClientOutcome::ResponseStreaming { status, headers }` head — or a
+  terminal error outcome if the stream never opened.
+- **`Http2ClientMsg::ResponseNext { stream_id }`** pulls the body, one
+  `Http2ResponseChunk` per call: `Data(bytes)`, then `End { trailers }`
+  on clean END_STREAM, or a terminal `Reset(reason)` / `Closed` /
+  `ProtocolError`. One pull outstanding per stream; a second concurrent
+  pull is rejected.
+- **Credit-on-consume backpressure.** Received DATA is held under the
+  per-stream flow-control window and only `WINDOW_UPDATE`-credited as the
+  caller consumes each chunk. A slow consumer therefore closes the stream
+  window and backpressures the peer — there is no unbounded buffer. The
+  shared connection window is credited as DATA is received (batched), not
+  held until consume, so one slow stream does not stall the others;
+  per-stream backpressure is the only lever.
+- **Terminal truth reaches the live channel.** A reset / GOAWAY /
+  connection-close settles whichever caller channel is live: the
+  `OpenStream` waiter (if the head was never delivered) gets the terminal
+  `Outcome`; a parked `ResponseNext` pull gets the terminal
+  `ResponseChunk`. The `GrpcFinalStatusReceived` and `Http2StreamClosed`
+  facts fire on clean streamed completion exactly as on the buffered
+  path.
+- **Live proofs**: `OpenStream` GET delivers a head then a pulled body to
+  `End` (`http2_client_live.rs`); a 32 KB echo response reassembles
+  byte-for-byte across multiple pulled DATA frames; and a peer
+  RST_STREAM mid-stream delivers a terminal `Reset` chunk to the parked
+  pull (`http2_client_adversarial.rs`).
+
+### HTTP/2 Client Streaming Request Bodies
+
+The HTTP/2 client can now stream a request body from a chunk source
+instead of buffering the whole `Vec<u8>` up front. This is the request
+half of streaming bodies and the first half of the blocker for streaming
+gRPC.
+
+- **`Http2ClientStreamingRequest`** carries `method`, `path`, `headers`,
+  and a `source: Address<ResponseChunkMsg, ResponseChunkReply>` — the
+  same pull protocol the server uses, so [`IterBodySource`] is a request
+  source unchanged. Submit it with the call-only
+  `Http2ClientMsg::SubmitStreaming(..)`; it replies with one
+  `Http2ClientOutcome` like a buffered submit.
+- **Pull with backpressure.** The client sends HEADERS without
+  END_STREAM, then pulls one chunk at a time (`ResponseChunkMsg::Next`)
+  — never more than one pull in flight per stream, and only when the
+  stream's outbound buffer has drained. Body bytes ride out as DATA under
+  the existing stream + connection flow-control pacer, so a streamed
+  upload backpressures against a slow peer the same way a buffered one
+  does. The source ends the body with `Eof` (or `GrpcStatus`, treated as
+  end-of-body for a request); the final/empty DATA carries END_STREAM.
+  An empty DATA(END_STREAM) carries no payload, so a completed stream
+  closes its request half even when the connection send window is
+  exhausted.
+- **Failure is local.** If the source call fails (`Full`/`Closed`/
+  `Timeout`/`Rejected`), the client RST_STREAM(CANCEL)s that stream and
+  reports `LocalCancel` — it does not poison other streams. Pre-connect
+  streaming submits queue like buffered ones and drain with the typed
+  connect-failure outcome.
+- **Live proofs** (`http2_client_live.rs`): a multi-chunk streamed POST
+  to `/echo` round-trips byte-for-byte (server reassembles the DATA
+  frames), and an empty source still closes the request half with a lone
+  empty DATA(END_STREAM).
+
+### Native HTTP/2 Client over TLS (h2/TLS)
+
+Wires the HTTP/2 client to the TLS rail, turning the `TlsAlpnMismatch`
+placeholder into real h2/TLS. `Http2Target::Tls` now actually connects.
+
+- **Dual-rail connection.** A `ClientStream` enum {`Tcp`, `Tls`} backs
+  every IO site. `Http2Target::H2c` uses `tcp_connect` + `tcp_*`;
+  `Http2Target::Tls` uses `tls_connect_alpn` (offering the target's
+  `AlpnProtocols`) + `tls_read`/`tls_write`/`tls_close`. The HTTP/2
+  framing code above is rail-agnostic.
+- **Real ALPN negotiation.** A TLS connect that offers `h2` and gets
+  `h2` proceeds; the client also defends against a non-`h2` selection.
+  An offered-but-unnegotiated ALPN fails the connect with
+  `CallError::TlsAlpnMismatch`, surfaced as
+  `Http2ClientOutcome::TlsAlpnMismatch`. The `noop()` placeholder and
+  the `handle_submit` TLS short-circuit are gone; TLS submits queue
+  pre-connect like h2c.
+- **Half-duplex IO on TLS.** The runtime TLS lane is single-lane per
+  stream (read and write share one lane, one blocking worker), unlike
+  TCP's split read/write lanes. A new `pump_io` runs the connection
+  full-duplex on TCP (read always armed) and half-duplex on TLS (drain
+  writes, then arm a read) so the two directions never collide with a
+  `ResourceBusy`. This is correct for request/response (unary); a
+  concurrent full-duplex h2/TLS *stream* would need a non-blocking TLS
+  reactor in the runtime (split TLS lanes + sans-IO rustls in the poll
+  loop) — a future runtime-maturity phase, out of Phase 116 scope.
+- **`Http2ClientLimits::tls_io_timeout`** (default 30s) bounds the TLS
+  connect/handshake and per-call TLS read/write/close.
+- **Live proofs** (`http2_client_tls_live.rs`, hand-rolled rustls +
+  HTTP/2 server peer): h2/TLS GET round-trips with `h2` selected; a
+  server without `h2` ALPN yields `TlsAlpnMismatch`; an untrusted cert
+  fails with a typed non-`Replied` outcome and never panics. The h2c
+  suite is unchanged and still green.
+
+### TLS ALPN Rail (runtime + simulator)
+
+Promotes ALPN to a real core hook so "selected protocol is typed runtime
+truth" (the plan's Hostile Review Note), not a battery-only placeholder.
+
+- **`tina-runtime` TLS rail carries ALPN.** `CallInput::TlsConnect` and
+  `TlsBind` gain `alpn_protocols: Vec<Vec<u8>>` (raw wire bytes, empty =
+  no ALPN). `CallOutput::TlsConnected` and `TlsAccepted` gain
+  `selected_alpn: Option<Vec<u8>>`. New `CallError::TlsAlpnMismatch`
+  (trace tag 28, appended) fires when ALPN was offered but the peer
+  negotiated none — distinct from cert/name/handshake failures.
+- **Existing helpers unchanged; ALPN-aware variants added.**
+  `tls_connect` / `tls_bind` / `tls_accept` keep their signatures (offer
+  no ALPN, ignore selected), so the HTTP/1 TLS client and HTTPS listener
+  are untouched (no HTTP/1 rewrite). New `tls_connect_alpn`,
+  `tls_bind_alpn`, and `tls_accept_alpn` offer ALPN and report the
+  negotiated protocol; `into_tls_connected_alpn` / `into_tls_accepted_alpn`
+  extract `(stream, selected)`.
+- **rustls wiring.** The TLS worker sets `config.alpn_protocols` on
+  connect and bind, reads `conn.alpn_protocol()` after the handshake,
+  and fails a connect with `TlsAlpnMismatch` when ALPN was offered but
+  none negotiated.
+- **Simulator mirror.** `handle_tls_connect` threads the offered ALPN
+  and reports `selected_alpn` deterministically (the scripted server
+  accepts the client's top preference — a pure function of the offered
+  list, so saved cases do not replay under an ambient default).
+  Server-side ALPN negotiation and scripted ALPN-mismatch are noted as
+  future sim work.
+- **Runtime proofs** (`driver` tests): a real rustls handshake with
+  `h2` offered selects `h2`; a server advertising no ALPN with `h2`
+  offered yields `CallError::TlsAlpnMismatch`; no ALPN offered
+  negotiates `None` without a mismatch.
+
+Next: wire the HTTP/2 client to use the TLS rail for `Http2Target::Tls`
+(turning the client's `TlsAlpnMismatch` placeholder into real h2/TLS).
+
+### Native gRPC Client — Hostile-Review Fixes
+
+A hostile pass on the unary client found three issues, now fixed:
+
+- **Non-200 HTTP status was mislabeled `Malformed(BadFrame)`**, discarding
+  the gRPC HTTP-status mapping. `decode_unary` now treats an explicit
+  `grpc-status` as authoritative (regardless of HTTP status), and a
+  non-200 response *without* a `grpc-status` is synthesized into a typed
+  gRPC status per `grpc/doc/http-grpc-status-mapping.md` (404 →
+  `Unimplemented`, 401 → `Unauthenticated`, 403 → `PermissionDenied`,
+  429/502/503/504 → `Unavailable`, else `Unknown`). A 200 with no
+  `grpc-status` stays `Malformed(MissingTrailers)`. Six unit tests pin
+  the branches plus the mapping table.
+- **`GrpcTarget` was exported but never consumed.** It is now
+  load-bearing: `GrpcTarget::http2_connection::<S>()` builds the
+  connection isolate and `GrpcTarget::limits()` feeds `GrpcClient::new`.
+  The live test and the next caller construct through it.
+- **`unary_request` did not validate the method path.** It now
+  `debug_assert!`s an absolute (`/`-prefixed) path, catching a relative
+  path that would produce an invalid `:path` pseudo-header.
+
+New live test `unknown_method_returns_unimplemented_status` proves an
+unrouted method surfaces as `Status(Unimplemented)` (the server answers
+trailers-only).
+
+### Native gRPC Client — Unary First Form
+
+The plan's second-half keystone: Tina is now a native gRPC *client*, not
+only a server. `GrpcClient` is a thin, stateless wrapper over an
+`Http2ClientConnection` isolate — no Tokio, no hidden queue or runtime.
+
+- **`GrpcClient` + `GrpcTarget` + `GrpcUnaryOutcome`.** The unary path
+  encodes one `prost` message, submits it as one HTTP/2 stream, and
+  decodes the reply into a typed outcome where the gRPC status is
+  first-class:
+  - `Ok(Resp)` — OK status *and* a decoded response message.
+  - `Status(GrpcStatus)` — a non-OK gRPC status. A normal caller
+    outcome, never collapsed into a successful response.
+  - `Transport(Http2ClientOutcome)` — HTTP/2 transport failure before a
+    status was seen (closed, reset, protocol error, ALPN mismatch).
+  - `Malformed(GrpcError)` — reached the gRPC layer but not well-formed
+    (non-200 HTTP status, missing `grpc-status`, undecodable/oversized
+    message). `#[non_exhaustive]`.
+  Request size is capped on encode (`EncodeTooLarge`) before anything
+  reaches the wire; the response message is capped on decode.
+- **`ProtocolFact::GrpcFinalStatusReceived`.** Paired with the server's
+  `GrpcFinalStatusSent` (trace tag 9, appended). The HTTP/2 client
+  connection emits it when a stream completes carrying a `grpc-status`
+  (in trailers, or headers for a trailers-only response) — gRPC status
+  is runtime truth, not a private counter.
+- **Live proofs** (`tina-http/tests/grpc_client_live.rs`): unary OK
+  returns the decoded message; a non-OK status is `Status(NotFound)`,
+  not a success; the received status is emitted as a
+  `GrpcFinalStatusReceived` fact; an oversized request is rejected
+  before the wire.
+- **Compile-fail proofs** (doc-tests on `GrpcClient`): the unary helper
+  cannot accept a stream of messages (only a single `prost::Message`);
+  a `GrpcUnaryOutcome` cannot be treated as the response message,
+  forcing the caller to handle the status arm.
+- **Specimen updated.** `examples/specimen_grpc_counter` now drives its
+  own server with the native `GrpcClient` (the copied path), exercising
+  an OK call, a non-OK `PermissionDenied` status, and a client
+  cancellation — and proving the connection survives the cancel.
+  `run_smoke()` no longer uses `grpc_unary_call_h2c_blocking`.
+- **Docs updated.** The HTTP/gRPC user guide and the `tina-http` crate
+  doc now describe the native client path and demote
+  `grpc_unary_call_h2c_blocking` to a test-only convenience. The "native
+  gRPC is server-first" framing is gone.
+
+Deferred (named honestly, dependency-ordered):
+
+- **Streaming gRPC** (server-streaming / client-streaming / bidi)
+  depends on HTTP/2 client *streaming bodies*, which the client does not
+  have yet (it buffers). That is the next slice.
+- **h2/TLS gRPC** depends on the TLS ALPN runtime rail (also a later
+  slice); a TLS target resolves to `TlsAlpnMismatch` today.
+- **Tina-client → tonic-server interop** would need tonic as a
+  `tina-http` dependency (it is only a specimen dev-dependency today);
+  deferred rather than pulling tonic into the battery. Tina-client ↔
+  Tina-server gRPC is proven, and the existing tonic-client ↔
+  Tina-server test still passes after the shared-code split.
+
+### Native HTTP/2 Client — Plan Audit Follow-ups
+
+A re-read of the Phase 116 plan against the shipped code surfaced three
+proof items that were required but unproven, plus two intentional
+design divergences worth recording.
+
+- **Protocol-fact emission is now proven** (the plan's "protocol facts
+  emitted for stream lifecycle" item). The client emitted
+  `Http2StreamOpened` / `Http2StreamClosed` / `Http2StreamReset` facts,
+  but no test asserted it. New live tests capture facts from the
+  runtime trace (`complete_trace` →
+  `RuntimeEventKind::FactObserved`):
+  - `client_emits_outbound_open_and_close_lifecycle_facts` — a
+    happy-path GET emits an outbound `Http2StreamOpened` and a matching
+    `Http2StreamClosed`.
+  - `client_emits_inbound_reset_fact_on_peer_rst` — a peer RST_STREAM
+    emits an inbound `Http2StreamReset(RefusedStream)`.
+- **GOAWAY "lets admitted streams settle" half is now proven.** The
+  earlier test only covered the refusal half (`last_stream_id = 0`). New
+  `goaway_above_stream_id_lets_admitted_stream_settle_then_blocks_new_admission`:
+  a GOAWAY whose `last_stream_id` covers the in-flight stream lets that
+  stream complete normally, while a *subsequent* submit is refused
+  `Closed` — proving both the settle path and the post-GOAWAY admission
+  gate.
+
+Two intentional divergences from the plan's literal sketch, recorded so
+they are decisions and not oversights:
+
+- **No `Admitted` outcome variant.** The plan's outcome list included
+  `Admitted` alongside `Full` / `Closed` / etc., implying a two-phase
+  admit-then-await API. This slice uses a single-reply model instead:
+  one `Submit` call yields exactly one terminal `Http2ClientOutcome`
+  when the stream finishes. This is Tina-idiomatic (one reply per call)
+  and still supports concurrency — a calling isolate issues `Submit` as
+  a non-blocking call effect and gets the outcome later, so many
+  requests can be in flight at once (proven by
+  `concurrent_streams_do_not_cross_replies`). The two-phase
+  `Admitted { stream_id }` shape is not needed for that and is not
+  implemented.
+- **Response/request bodies are buffered, not chunk-delivered.** The
+  plan's "response DATA arrives in bounded chunks" / "request DATA
+  streaming is bounded" proof items are met on the *bounded* axis
+  (response cap + inbound window credit; outbound flow-control pacing)
+  but the caller still sees one buffered `Vec<u8>` per body, not a
+  chunk stream. Streaming chunk-source bodies (mirroring the server's
+  `IterBodySource`) are deferred with the rest of the streaming work.
+
+### Native HTTP/2 Client — Testing Gaps Closed
+
+Closes the testing gaps a third pass identified — claims that were
+true structurally but unproven, plus a stale comment and a few
+low-risk hardening items. No behavior change to the client beyond two
+dev-only `debug_assert`s; everything here is proof and polish.
+
+- **Concurrency / no-crossing proof.** New
+  `concurrent_streams_do_not_cross_replies` submits two requests from
+  separate host threads (via `std::thread::scope` sharing `&runtime`).
+  The hand-rolled peer replies in reverse order with stream-id-tagged
+  bodies; each caller asserts the body matches the stream id in its
+  own outcome. This is the first test where two streams are genuinely
+  in flight at once — the earlier "multiple streams" test was
+  sequential.
+- **`Full` admission + peer concurrency cap proof.** New
+  `peer_max_concurrent_streams_one_yields_full_for_the_excess_submit`:
+  the peer advertises `SETTINGS_MAX_CONCURRENT_STREAMS = 1` and holds
+  the first stream; of two concurrent submits, exactly one is admitted
+  and `Replied`, the other is rejected `Full`. Proves both the `Full`
+  outcome (previously unexercised live) and that the client honors the
+  peer's advertised cap.
+- **Caller-cancel proof.** New
+  `caller_cancel_returns_local_cancel_and_keeps_connection_alive`:
+  `Http2ClientMsg::Cancel { stream_id }` on a held stream returns
+  `LocalCancel` and a follow-up GET on the same connection still
+  succeeds. The `LocalCancel` path and the `Cancel` message were
+  wired in round 1 but had no live test.
+- **Real end-to-end flow-control proof.** New
+  `large_upload_paces_through_real_window_updates`: a 128 KB POST
+  against a peer that drains DATA and credits `WINDOW_UPDATE`
+  incrementally. Forces the outbound pacer to park on the 65535-byte
+  window and resume on credit, asserting `flow_control_parks > 0`.
+  (The in-tree server test stays at 32 KB because the server's
+  response path parks whole — the documented KNOWN LIMITATION.)
+- **Foreign-server interop proof.** New
+  `foreign_server_happy_path_get_returns_replied`: the client GETs a
+  hand-rolled, non-Tina HTTP/2 server (independent framing code) and
+  receives the body unchanged. Proves the client does not depend on
+  Tina-server framing quirks.
+- **Compile-fail proofs.** Two `compile_fail` doc-tests on
+  `Http2Target` pin that an `H2c` target cannot name `server_name` /
+  `trust_roots` and a `Tls` target cannot omit them. (The unary-vs-
+  streaming and gRPC-status-handling compile-fail proofs the plan also
+  names are gated on the gRPC client slice.)
+- **Stale test comment removed.** `http2_client_live.rs`'s header
+  claimed a `max_concurrent_streams = 1 → Full` test that did not
+  exist. The header now accurately lists what each test file covers
+  and points at the adversarial file for the rest.
+
+Low-risk hardening:
+
+- `Http2ClientConnection::new` `debug_assert`s `max_concurrent_streams
+  >= 1` (a zero cap silently rejects everything).
+- `connection_fact_id()` `debug_assert`s `self_isolate_id` is set, so a
+  fact emitted before the first handler turn (which would tag it with
+  connection id 0 and break replay correlation) is caught in dev/test.
+- In-source note on `complete_stream` documenting that a gRPC
+  trailers-only response lands `grpc-status` in `headers`, not
+  `trailers`, so the future gRPC wrapper checks both.
+
+The adversarial test binary now has 9 cases; the live binary 8; two
+new compile-fail doc-tests. Full `tina-http` suite green;
+`cargo fmt --check` and `cargo clippy -- -D warnings` clean.
+
+### Native HTTP/2 Client — Spec-Compliance Round 2
+
+Closes the bugs a second hostile pass found in the previously-untested
+inbound-misbehavior paths, plus two more the review surfaced. Each fix
+is pinned by an adversarial live test against a hand-rolled,
+deliberately-misbehaving HTTP/2 peer
+(`tina-http/tests/http2_client_adversarial.rs`).
+
+- **RST_STREAM on stream 0 is now a connection-level protocol error.**
+  `handle_rst_stream` rejected the illegal frame as a silent no-op
+  before (the stream-id-0 lookup just missed). RFC 9113 §6.4 requires
+  a connection-level PROTOCOL_ERROR; the client now fails the in-flight
+  stream with `Http2ProtocolError::BadStreamId` and tears the
+  connection down.
+- **GOAWAY payload is parsed and acted on.** The branch was six lines
+  that set a flag and ignored `last_stream_id` / error code. The client
+  now refuses every stream it opened with id `> last_stream_id` (those
+  were not processed by the peer, so the caller can safely retry):
+  `Closed` for a clean `GOAWAY(NO_ERROR)`, `Reset(reason)` for an
+  error-coded GOAWAY. Previously those streams hung until the socket
+  dropped.
+- **Removed `Http2ClientOutcome::FlowControlBlocked`.** Same lying-API
+  problem as `Timeout`: the variant was advertised but no code path
+  constructed it. Both land back when a real stream-level deadline
+  mechanism does. The exhaustive `outcome_surface_excludes_unimplemented_variants`
+  test now guards the whole outcome surface.
+- **`try_send` of a call-only message no longer drops silently.**
+  `Http2ClientMsg::Submit` / `::Report` delivered via `try_send` have
+  no reply channel; `Submit` would silently drop the request body. The
+  connection now `debug_assert!`s on the misuse (catches it in
+  dev/test) and the type doc states the call-only contract. Release
+  builds still no-op rather than killing the connection over a stray
+  send.
+- **PING frame errors are now correctly classified.** A PING on a
+  non-zero stream id is `BadStreamId` (PROTOCOL_ERROR); a wrong-length
+  PING is `BadFrameLength` (FRAME_SIZE_ERROR). They were collapsed into
+  `BadFrameLength` before.
+- **Server-side KNOWN LIMITATION noted.** `http2/server.rs`'s
+  `queue_or_send_response` parks a buffered response whole until the
+  full body fits the send window — a response larger than ~64 KB
+  deadlocks a strict peer (including the native client) that does not
+  pre-credit its receive window. This is a pre-existing server bug, not
+  a client regression; it is now documented in-source and queued for a
+  future "server response streaming" slice (the mirror of the client's
+  `flush_outbound_data` pacer).
+
+New adversarial tests, all passing:
+
+- `server_rst_stream_maps_to_typed_reset`
+- `server_rst_stream_on_stream_zero_is_connection_protocol_error`
+- `server_goaway_below_stream_id_refuses_unprocessed_stream`
+- `malformed_inbound_frame_does_not_panic_and_fails_stream_typed`
+
+### Native HTTP/2 Client — Hostile-Review Fixes
+
+Follow-up to the first-form client below. Addresses the issues a
+hostile self-review surfaced before this slice is presented as
+production-shaped:
+
+- **Outbound flow control (C1).** `admit_stream` no longer blasts the
+  request body straight into the write queue. Body bytes now sit in a
+  per-stream `outbound_body` VecDeque and are drained by a new
+  `flush_outbound_data` round-robin pacer that respects both the
+  stream and connection send-windows. `flush_outbound_data` is
+  re-entered from `handle_window_update` (peer credit arrived) and
+  from `apply_setting`'s `SETTINGS_INITIAL_WINDOW_SIZE` branch (peer
+  resized the initial window). A new `Http2ClientReport.flow_control_parks`
+  counter records each window-blocked iteration.
+- **Write reentrancy (C2).** The client now tracks `write_in_flight`
+  alongside `pending_write`. `write_more` is a no-op while a
+  `tcp_write` is awaiting completion, and a new `maybe_write_more`
+  helper is the *only* place callers nudge the writer. Without this
+  the driver's per-stream `lane_has_pending` check would return
+  `CallError::ResourceBusy` for back-to-back writes and the
+  connection would die.
+- **Route-key trust-root collision (C3).** `Http2Target::route_key`
+  now hashes the trust-root byte content instead of just counting
+  entries. Two TLS targets with the same authority/server_name/ALPN
+  but distinct roots now produce distinct keys, so a future Phase 119
+  pool cannot share a connection across security boundaries.
+- **DATA-before-HEADERS / DATA on closed stream (C4 + C5).** DATA
+  arriving before HEADERS on a stream is now a connection-level
+  `Http2ProtocolError::DataBeforeHeaders` GOAWAY (RFC 9113 §8.1).
+  DATA on an unknown / closed stream is a stream-level
+  RST_STREAM(STREAM_CLOSED), not a connection-level kill (RFC 9113
+  §6.9.1). The connection survives the misbehaving stream.
+- **Removed unreachable `Http2ClientOutcome::Timeout` (H1).** No path
+  in the client today returns a `Timeout` outcome — caller deadlines
+  arrive through `CallOutcome::TimedOut` at the host. Removing the
+  variant prevents silent advertising of behavior that does not
+  exist. A new test pins the present variants so re-adding `Timeout`
+  without wiring a real stream-level deadline breaks compilation.
+- **Outbound queue cap is now enforced (H3).** `Http2ClientLimits.
+  connection_outbound_queue_capacity` was dead config. Admission now
+  rejects with `Http2ClientOutcome::Full` and bumps a new
+  `outbound_queue_full` counter when the write queue is at the cap.
+  A new `pre_connect_submit_capacity` knob bounds the
+  before-connect submit queue.
+- **Outbound caller-cancel path (L7).** `Http2ClientMsg::Cancel
+  { stream_id }` is now wired: it sends RST_STREAM(CANCEL), emits an
+  outbound-direction `Http2StreamReset` fact, replies to the
+  original submitter with `LocalCancel`, and increments
+  `locally_cancelled` in the report.
+- **Body-cap error is now correctly labeled (M1).** A response body
+  that exceeds `max_response_body_bytes` returns
+  `Http2ProtocolError::BodyTooLarge { cap_bytes }`, not
+  `HeadersTooLarge`.
+- **Outbound HEADERS too large (M2).** A request whose encoded
+  HEADERS block does not fit one frame is rejected without consuming
+  a stream id and bumps a new `request_too_large` counter (not the
+  generic `protocol_errors` — the peer is innocent here). Surfaced
+  as `Http2ProtocolError::OutboundHeadersTooLarge`.
+- **Stream id exhaustion fails closed (M3).** After client stream id
+  space exhausts (2^31 streams), `stream_id_exhausted` is set and
+  subsequent admissions return
+  `Http2ProtocolError::StreamIdExhausted` instead of silently
+  reusing the last id.
+- **Trailer-block validation (L3).** A trailer HEADERS that carries
+  any pseudo-header now fails with
+  `Http2ProtocolError::InvalidTrailerPseudoHeader`; a `content-length`
+  trailer fails with `ContentLengthMismatch`. Both are connection-level
+  protocol errors per RFC 9113 §8.1.
+- **Removed `AlpnProtocols::wire()` (L1).** The
+  `#[allow(dead_code)]` helper was a footgun. It lands back when the
+  TLS rail actually consumes it.
+- `Http2ClientReport`, `Http2ClientReply`, `Http2ClientMsg`, and
+  `Http2ProtocolError` are now `#[non_exhaustive]`. `Http2ClientLimits`
+  is intentionally exhaustive so callers can construct it with
+  struct-update syntax — new fields go through a major-version bump.
+
+New / extended tests:
+
+- `h2c_post_body_is_echoed_back_byte_for_byte` — POST round-trip now
+  asserts the exact bytes echoed by `/echo`, not just status 200.
+- `h2c_multiple_streams_share_one_client_connection` — three
+  sequential GETs on one isolate, asserts
+  `opened_streams == closed_streams == 3` and zero protocol errors.
+- `response_body_above_cap_returns_typed_body_too_large` — pins the
+  new `BodyTooLarge { cap_bytes }` outcome label.
+- `h2c_post_large_body_paces_through_flow_control_window` — 32 KB
+  POST through the outbound flow-control pacer.
+- `tls_target_route_key_distinguishes_distinct_root_sets` — pins the
+  trust-root hashing fix from C3.
+- `outcome_does_not_include_timeout_variant` — compile-shape proof
+  that `Timeout` is gone from the outcome surface until a real
+  stream-level deadline lands.
+
+### Honest gaps still standing
+
+These are genuine future work, not unproven behavior. (The
+GOAWAY/RST/malformed-frame paths that were listed here are now fixed
+and pinned by adversarial live tests — see "Spec-Compliance Round 2"
+above.)
+
+- **Stream-level deadlines.** Until they land, the client has no
+  per-stream timeout: a caller enforces its own deadline via
+  `call_blocking_with_host_timeout` (surfacing as `CallOutcome::TimedOut`
+  at the host) and the connection keeps the stream slot until the
+  response, a reset, or connection close. The `Timeout` and
+  `FlowControlBlocked` outcome variants are deliberately absent until
+  this mechanism exists.
+- **Server response streaming.** `http2/server.rs` parks a buffered
+  response whole until it fits the send window (see the in-source
+  KNOWN LIMITATION). A response over ~64 KB deadlocks a strict peer.
+  This is a server-side fix — the mirror of the client's
+  `flow_control_parks` pacer — and is its own slice. The client's
+  outbound flow control is proven by `h2c_post_large_body_paces_through_flow_control_window`.
+- **Native gRPC client.** Not in this slice; the HTTP/2 client carries
+  response trailers visibly so the gRPC wrapper can read `grpc-status`.
+
+### Native HTTP/2 Client — First Form
+
+Builds on the module split below. Adds the native HTTP/2 client
+isolate the plan called for, plus the typed
+`Http2Target` / `AlpnProtocols` surface so authority, SNI, trust
+roots, and ALPN protocol selection are typed inputs, not
+string/byte bags.
+
+- `Http2ClientConnection<S>` is a Tina isolate over one TCP stream.
+  It sends the client preface and SETTINGS, opens odd-numbered
+  streams, enforces `max_concurrent_streams`, applies peer SETTINGS
+  (initial window, max frame size, max concurrent streams,
+  `ENABLE_PUSH`), tracks connection/stream flow-control windows
+  with `WINDOW_UPDATE` credit flushing, and reports lifecycle
+  through `ProtocolFact::Http2StreamOpened` / `Http2StreamClosed` /
+  `Http2StreamReset` with `direction: Outbound` for client-initiated
+  streams. Each request is one `Http2ClientMsg::Submit` call; the
+  connection captures the caller's `RequestContext` and replies
+  later with one typed `Http2ClientOutcome`.
+- `Http2ClientOutcome` covers every reason a Tina-owned client
+  stream can end in: `Replied(Http2ClientResponse)`, `Full`,
+  `Closed`, `FlowControlBlocked`, `Timeout`, `Reset(Http2ResetReason)`,
+  `LocalCancel`, `ProtocolError(Http2ProtocolError)`, and
+  `TlsAlpnMismatch`. The enum is `#[non_exhaustive]` so streaming
+  bodies and the live TLS ALPN path land as new arms without
+  breaking match sites.
+- `Http2Target::H2c { authority, addr }` and
+  `Http2Target::Tls { authority, addr, server_name, trust_roots, alpn }`
+  are typed shapes. `H2c` cannot carry SNI or trust roots; `Tls`
+  must carry both. `Http2Target::route_key()` folds authority,
+  TLS/root/ALPN policy into a stable key the pool work in Phase 119
+  will read.
+- `AlpnProtocols::h2()` / `AlpnProtocols::none()` is the named ALPN
+  config; no raw `Vec<Vec<u8>>` ALPN bag. This is the API the
+  runtime TLS rail will accept once the ALPN extension lands. Today
+  the runtime TLS rail does not yet plumb ALPN bytes, so the client
+  surfaces a typed `Http2ClientOutcome::TlsAlpnMismatch` for any
+  `Http2Target::Tls` target — no silent h2c fallback, no generic
+  IO error. Live HTTPS/2 with `h2` selection is a follow-up that
+  lands the ALPN bytes through `CallInput::TlsConnect` and reads
+  `selected_alpn` out of `CallOutput::TlsConnected`.
+- Live proofs in `tina-http/tests/http2_client_live.rs`:
+  - `h2c_get_round_trip_returns_typed_replied_outcome` — Tina HTTP/2
+    client GETs the existing Tina HTTP/2 server's Counter service
+    and receives `Http2ClientOutcome::Replied` with a 200 status
+    and a non-empty body.
+  - `h2c_post_body_is_round_tripped_through_data_frame` — POST with
+    a buffered body crosses one HEADERS + one DATA frame and the
+    server replies with 200.
+  - `tls_target_returns_typed_alpn_mismatch_without_touching_tls_rails`
+    — `Http2Target::Tls { .. }` resolves to the typed
+    `TlsAlpnMismatch` outcome without ever calling `tls_connect`.
+  - `tls_target_route_key_distinguishes_from_h2c_route_key` and
+    `request_method_and_path_round_trip_through_targets` pin the
+    target/request shapes for the future pool layer and gRPC client.
+- `tina-http`'s full test suite passes (libs + every integration
+  binary); no `cargo fmt` / `cargo clippy` warnings.
+
+### Honest Deferrals After This Checkpoint
+
+These items are named in the Phase 116 plan and are still future
+work after this slice. Each is a real gap, not a label.
+
+- TLS ALPN rail: `CallInput::TlsConnect` / `TlsBind` do not yet
+  accept `AlpnProtocols`, and `CallOutput::TlsConnected` /
+  `TlsAccepted` do not yet carry a `selected_alpn`. The client
+  surface already takes the named `AlpnProtocols::h2()` config, but
+  the bytes are not plumbed through rustls yet. Live HTTPS/2 with
+  `h2` selection unblocks once that lands.
+- Native gRPC client (`GrpcClient::unary` / `server_streaming` /
+  `client_streaming` / `bidi`): not implemented in this slice. The
+  HTTP/2 client now carries response trailers visibly so a later
+  `GrpcClient` wrapper can pull `grpc-status` out of
+  `Http2ClientResponse::trailers` and emit a paired
+  `ProtocolFact::GrpcFinalStatusReceived`. `grpc_unary_call_h2c_blocking`
+  remains the test-only blocking helper; production users still
+  copy the existing bridge path for now.
+- HTTP/2 client streaming request and response bodies. Today's
+  client buffers both under explicit caps. The typed outcome enum
+  pins where streaming variants land.
+- `Http2ClientMsg::Cancel { stream_id }` and a paired
+  `cancel_call`-shaped cancellation that emits outbound
+  RST_STREAM(CANCEL). The connection already maps a peer RST_STREAM
+  into `Http2ClientOutcome::Reset(reason)`.
+- DST replay coverage: the simulator does not yet return a typed
+  unsupported fact for live HTTP/2 client socket work, and no
+  saved replay case exercises the client. The lifecycle facts the
+  client emits reuse existing names so future replay plumbing is
+  mechanical.
+- Connection reuse beyond "one isolate carries many admitted
+  streams": idle eviction, max lifetime, and health policy are
+  Phase 119, the resource maturity slice the plan names. The
+  `Http2Target::route_key()` shape is in place so pool work can
+  consume it without re-keying.
+- HTTPS/2 client compile-fail proofs. The typed `Http2Target`
+  variants already make a roots-less TLS target structurally
+  impossible at the type level, but no `compile_fail` doctest pins
+  the gates explicitly.
+
+### Native Protocol Client Parity — Server-Only Module Split
+
+Checkpoint 1 of the native HTTP/2 / gRPC client work
+(`.intent/phases/116-native-protocol-client-parity`). The single-file
+`tina-http/src/http2.rs` is split into a module tree so the upcoming
+native HTTP/2 client can share frame/header/error helpers with the
+server without copy-paste.
+
+- `tina-http/src/http2/` becomes the module root, with
+  `mod.rs` re-exporting the previous public surface
+  (`Http2Listener`, `Http2Connection`, `Http2ConnectionMsg`,
+  `Http2ConnectionReply`, `Http2ConnectionReport`, `Http2Limits`,
+  `Http2ListenerMsg`, `Http2Outcome`, `Http2ProtocolError`,
+  `Http2ServerConfig`, `Http2StreamReport`, `Http2StreamState`)
+  under their existing paths.
+- `http2/frame.rs` owns frame encode/decode, the standard frame
+  builders (`settings_frame`, `rst_stream_frame`, `goaway_frame`,
+  `window_update_frame`, `headers_frame`, `data_frame`), padded /
+  PRIORITY payload extractors, the wire-level constants
+  (`CLIENT_PREFACE`, `FLAG_*`, `FRAME_*`, `PRIORITY_PAYLOAD_LEN`,
+  `DEFAULT_WINDOW`, `READ_CHUNK`, `WINDOW_CREDIT_FLUSH_THRESHOLD`),
+  and `add_window`.
+- `http2/headers.rs` owns HPACK encode/decode and pseudo-header
+  validation (`HeaderBlock`, `decode_headers_block_with`,
+  `encode_response_headers`, `encode_response_trailers`,
+  `validate_request_headers`, `SETTINGS_*`,
+  `DEFAULT_HEADER_TABLE_SIZE`, `MIN_/MAX_MAX_FRAME_SIZE`).
+- `http2/errors.rs` owns `Http2ProtocolError`, the wire error-code
+  constants (`ERR_*`), and `classify_h2_reset`.
+- `http2/server.rs` keeps the connection/listener isolates plus the
+  in-source server tests. It compiles only against the shared
+  helpers through `super::frame::*`, `super::headers::*`,
+  `super::errors::*`; no duplicate definitions remain.
+- The frame/header/error modules are internal (`pub(super)` items,
+  not re-exported from `mod.rs`). The public HTTP/2 surface is
+  unchanged — no new client types, no ALPN edits, no behavior
+  change. The existing HTTP/2 server tests pass after the move:
+  `cargo test -p tina-http --lib` (139 cases),
+  `cargo test -p tina-http --test http2_live` (32 cases), and
+  `cargo test -p tina-http --test grpc_live` (34 cases). The only
+  call-site change is `try_decode_frame`, which now takes
+  `max_frame_size: usize` instead of `&Http2Limits` so the frame
+  module does not depend on the server config struct.
+
+Honest deferrals — remaining slices of phase 116 (named in
+`.intent/phases/116-native-protocol-client-parity/plan.md`):
+
+- Native HTTP/2 client connection isolate (`Http2ClientConnection`)
+  with bounded stream-slot admission and typed admit/reset/timeout
+  outcomes; pooled-by-authority reuse.
+- Native gRPC client (unary, server-streaming, client-streaming,
+  bidi) over the client connection, with received `GrpcStatus` as a
+  protocol fact.
+- Typed `AlpnProtocols::h2()` / `none()` on the TLS rail and
+  selected-ALPN truth in TLS connect/accept output. The current
+  TLS rail has no ALPN; the deferral is named, not hidden.
+- Specimen updates that replace `grpc_unary_call_h2c_blocking` with
+  the copied client-isolate path.
 
 ### HTTP/2 And Multi-Shard Fairness Hardening (second pass)
 

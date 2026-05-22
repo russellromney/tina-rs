@@ -148,7 +148,7 @@ fn build_head(
         Method::from_bytes(method_str.as_bytes()).map_err(|_| RequestParseError::BadRequestLine)?;
 
     let raw_path = parsed.path.ok_or(RequestParseError::BadRequestLine)?;
-    if !is_origin_form(raw_path) {
+    if !is_valid_origin_form_request_target(raw_path) {
         return Err(RequestParseError::UnsupportedRequestTarget);
     }
     let path = raw_path.to_owned();
@@ -242,11 +242,19 @@ fn build_head(
     })
 }
 
-fn is_origin_form(target: &str) -> bool {
+pub(crate) fn is_valid_origin_form_request_target(target: &str) -> bool {
     // Origin-form is `/...` or `*` (asterisk-form for OPTIONS — we reject
     // it for first form). Authority-form (`example.com:80`) and
     // absolute-form (`http://example.com/`) are both rejected.
-    target.starts_with('/') && !target.starts_with("//")
+    //
+    // Whitespace and ASCII controls are rejected here and before outbound
+    // encoding so a path cannot smuggle a second request-line or header.
+    target.starts_with('/')
+        && !target.starts_with("//")
+        && target
+            .as_bytes()
+            .iter()
+            .all(|byte| *byte > b' ' && *byte != 0x7f)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -260,16 +268,26 @@ fn parse_transfer_encoding(value: &str) -> TransferEncodingFlags {
         chunked: false,
         unsupported: false,
     };
+    let mut saw_token = false;
+    let mut final_token_chunked = false;
     for token in value.split(',') {
         let token = token.trim();
-        if token.is_empty() || token.eq_ignore_ascii_case("identity") {
+        if token.is_empty() {
+            flags.unsupported = true;
             continue;
         }
+        saw_token = true;
         if token.eq_ignore_ascii_case("chunked") {
-            flags.chunked = true;
+            final_token_chunked = true;
         } else {
+            final_token_chunked = false;
             flags.unsupported = true;
         }
+    }
+    if saw_token && final_token_chunked {
+        flags.chunked = true;
+    } else {
+        flags.unsupported = true;
     }
     flags
 }
@@ -391,6 +409,10 @@ pub fn encode_keepalive_request(request: &HttpRequest) -> Vec<u8> {
 }
 
 fn encode_request_internal(request: &HttpRequest, connection_close: bool) -> Vec<u8> {
+    assert!(
+        is_valid_origin_form_request_target(&request.path),
+        "invalid HTTP/1 origin-form request target"
+    );
     let body_bytes: &[u8] = match &request.body {
         crate::types::HttpRequestBody::Buffered(bytes) => bytes,
         crate::types::HttpRequestBody::Stream(_) => {
@@ -691,7 +713,8 @@ mod tests {
 
     #[test]
     fn accepts_chunked_request_transfer_encoding_tokens() {
-        let buf = b"POST /upload HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: identity, chunked \r\n\r\n";
+        let buf =
+            b"POST /upload HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: CHUNKED \r\n\r\n";
         let limits = HttpLimits {
             inbound_stream_chunk_size: Some(1024),
             ..HttpLimits::default()
@@ -706,6 +729,33 @@ mod tests {
     fn rejects_unsupported_request_transfer_encoding_token() {
         let buf =
             b"POST /upload HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: gzip, chunked\r\n\r\n";
+        let limits = HttpLimits {
+            inbound_stream_chunk_size: Some(1024),
+            ..HttpLimits::default()
+        };
+        match parse_request_head(buf, &limits) {
+            ParseProgress::Failed(RequestParseError::UnsupportedTransferEncoding) => {}
+            other => panic!("expected UnsupportedTransferEncoding, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_identity_request_transfer_encoding() {
+        let buf =
+            b"POST /upload HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: identity\r\n\r\nhello";
+        let limits = HttpLimits {
+            inbound_stream_chunk_size: Some(1024),
+            ..HttpLimits::default()
+        };
+        match parse_request_head(buf, &limits) {
+            ParseProgress::Failed(RequestParseError::UnsupportedTransferEncoding) => {}
+            other => panic!("expected UnsupportedTransferEncoding, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_empty_request_transfer_encoding() {
+        let buf = b"POST /upload HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: \r\n\r\nhello";
         let limits = HttpLimits {
             inbound_stream_chunk_size: Some(1024),
             ..HttpLimits::default()
@@ -757,6 +807,28 @@ mod tests {
             ParseProgress::Failed(RequestParseError::UnsupportedRequestTarget) => {}
             other => panic!("expected UnsupportedRequestTarget, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn request_target_validator_rejects_control_bytes() {
+        assert!(!is_valid_origin_form_request_target(
+            "/safe\r\nInjected: yes"
+        ));
+        assert!(!is_valid_origin_form_request_target("/safe\x7fbad"));
+        assert!(!is_valid_origin_form_request_target("/safe bad"));
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid HTTP/1 origin-form request target")]
+    fn encode_request_rejects_control_bytes_in_request_target() {
+        let req = HttpRequest {
+            method: Method::GET,
+            path: "/safe\r\nInjected: yes".to_owned(),
+            version: Version::HTTP_11,
+            headers: HeaderMap::new(),
+            body: crate::types::HttpRequestBody::Buffered(Vec::new()),
+        };
+        let _ = encode_request(&req);
     }
 
     #[test]
@@ -1063,7 +1135,7 @@ mod tests {
 
     #[test]
     fn response_chunked_transfer_encoding_accepts_token_list() {
-        let buf = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: identity, chunked \r\n\r\n";
+        let buf = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: CHUNKED \r\n\r\n";
         match parse_response_head(buf, &limits()) {
             ResponseParseProgress::Complete { head, .. } => assert!(head.chunked),
             other => panic!("expected complete, got {other:?}"),
@@ -1073,6 +1145,15 @@ mod tests {
     #[test]
     fn response_unsupported_transfer_encoding_token_rejected() {
         let buf = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip, chunked\r\n\r\n";
+        match parse_response_head(buf, &limits()) {
+            ResponseParseProgress::Failed(ResponseParseError::UnsupportedTransferEncoding) => {}
+            other => panic!("expected UnsupportedTransferEncoding, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn response_identity_transfer_encoding_rejected() {
+        let buf = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: identity\r\n\r\nhello";
         match parse_response_head(buf, &limits()) {
             ResponseParseProgress::Failed(ResponseParseError::UnsupportedTransferEncoding) => {}
             other => panic!("expected UnsupportedTransferEncoding, got {other:?}"),

@@ -141,7 +141,7 @@ struct InFlight {
     response_rx: Receiver<SqliteResult>,
     started_at: Instant,
     abandoned: Arc<AtomicBool>,
-    reply_to: tina::RequestContext<SqliteResult>,
+    reply_to: Option<tina::RequestContext<SqliteResult>>,
     /// Stable name of the original request for tracing field reuse.
     /// `"execute"` or `"query"`. Carried even when the `tracing`
     /// feature is off so the field stays cheap and the type does
@@ -376,7 +376,7 @@ impl<S: Shard + 'static> SqliteWorker<S> {
             response_rx,
             started_at: Instant::now(),
             abandoned,
-            reply_to,
+            reply_to: Some(reply_to),
             request_kind,
         });
         self.metrics.admitted.fetch_add(1, Ordering::Relaxed);
@@ -409,16 +409,24 @@ impl<S: Shard + 'static> SqliteWorker<S> {
                 emit_replied(&result, request_kind);
                 #[cfg(not(feature = "tracing"))]
                 let _ = request_kind;
-                tina::reply_to_request(in_flight.reply_to, result)
+                if let Some(reply_to) = in_flight.reply_to {
+                    tina::reply_to_request(reply_to, result)
+                } else {
+                    noop()
+                }
             }
             Err(mpsc::TryRecvError::Empty) => {
-                if in_flight.started_at.elapsed() >= self.config.default_timeout {
+                let mut in_flight = in_flight;
+                if in_flight.reply_to.is_some()
+                    && in_flight.started_at.elapsed() >= self.config.default_timeout
+                {
                     // Bridge timeout. Tell the worker to bump
                     // `late_results` when it finishes; tally happens
-                    // in `worker_loop` regardless.
+                    // in `worker_loop` regardless. The physical slot
+                    // stays leased until the blocking thread reports
+                    // terminal truth.
                     in_flight.abandoned.store(true, Ordering::Release);
                     self.metrics.timeouts.fetch_add(1, Ordering::Relaxed);
-                    self.metrics.set_in_flight(0);
                     #[cfg(feature = "tracing")]
                     event!(
                         target: TRACE_TARGET_CALL,
@@ -428,7 +436,12 @@ impl<S: Shard + 'static> SqliteWorker<S> {
                         request_kind,
                         elapsed_ms = in_flight.started_at.elapsed().as_millis() as u64,
                     );
-                    return tina::reply_to_request(in_flight.reply_to, Err(SqliteError::Timeout));
+                    let reply_to = in_flight.reply_to.take().expect("reply_to checked above");
+                    self.in_flight = Some(in_flight);
+                    return batch(vec![
+                        tina::reply_to_request(reply_to, Err(SqliteError::Timeout)),
+                        sleep(self.config.poll_interval).then(|_| SqliteMsg::Poll),
+                    ]);
                 }
                 self.in_flight = Some(in_flight);
                 sleep(self.config.poll_interval).then(|_| SqliteMsg::Poll)
@@ -444,12 +457,16 @@ impl<S: Shard + 'static> SqliteWorker<S> {
                     request_kind,
                     detail = "worker thread terminated mid-request",
                 );
-                tina::reply_to_request(
-                    in_flight.reply_to,
-                    Err(SqliteError::Internal(
-                        "worker thread terminated mid-request".into(),
-                    )),
-                )
+                if let Some(reply_to) = in_flight.reply_to {
+                    tina::reply_to_request(
+                        reply_to,
+                        Err(SqliteError::Internal(
+                            "worker thread terminated mid-request".into(),
+                        )),
+                    )
+                } else {
+                    noop()
+                }
             }
         }
     }

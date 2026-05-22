@@ -681,6 +681,7 @@ pub fn deferred_reply_rejected_reason_name(reason: DeferredReplyRejectedReason) 
 pub fn restart_skipped_reason_name(reason: RestartSkippedReason) -> &'static str {
     match reason {
         RestartSkippedReason::NotRestartable => "NotRestartable",
+        RestartSkippedReason::FactoryPanicked => "FactoryPanicked",
     }
 }
 
@@ -706,6 +707,7 @@ pub fn call_error_name(error: CallError) -> &'static str {
         CallError::TlsCertificate => "TlsCertificate",
         CallError::TlsName => "TlsName",
         CallError::TlsHandshake => "TlsHandshake",
+        CallError::TlsAlpnMismatch => "TlsAlpnMismatch",
         CallError::SignalFull => "SignalFull",
         CallError::SignalClosed => "SignalClosed",
         CallError::ProcessFull => "ProcessFull",

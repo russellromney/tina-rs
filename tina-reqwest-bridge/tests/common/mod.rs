@@ -13,6 +13,7 @@ use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Request as HyperRequest, Response as HyperResponse, StatusCode};
 use hyper_util::rt::TokioIo;
+use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
 use tokio::runtime::Runtime;
 use tokio::sync::oneshot;
@@ -264,6 +265,91 @@ impl FlakyServer {
 }
 
 impl Drop for FlakyServer {
+    fn drop(&mut self) {
+        if let Some(tx) = self.shutdown.take() {
+            let _ = tx.send(());
+        }
+    }
+}
+
+/// Raw HTTP/1.1 server that accepts a request, sends a response with a
+/// larger Content-Length than body bytes written, and closes the socket.
+///
+/// This simulates a response-body read error after the upstream has
+/// already accepted the request. Retrying a POST in this state can
+/// duplicate server-side effects.
+pub struct TruncatedBodyServer {
+    pub addr: SocketAddr,
+    pub accepted: Counter,
+    shutdown: Option<oneshot::Sender<()>>,
+    runtime: Arc<Runtime>,
+    join: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl TruncatedBodyServer {
+    pub fn spawn() -> Self {
+        let runtime = Arc::new(
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .worker_threads(1)
+                .build()
+                .expect("truncated tokio runtime"),
+        );
+        let (addr_tx, addr_rx) = oneshot::channel::<SocketAddr>();
+        let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
+        let counter = Counter::default();
+        let counter_for_task = counter.clone();
+        let join = runtime.spawn(async move {
+            let listener = TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("truncated bind");
+            let addr = listener.local_addr().expect("truncated local addr");
+            addr_tx.send(addr).expect("truncated send addr");
+            loop {
+                tokio::select! {
+                    _ = &mut shutdown_rx => break,
+                    accept = listener.accept() => {
+                        let (mut stream, _peer) = match accept {
+                            Ok(p) => p,
+                            Err(_) => continue,
+                        };
+                        counter_for_task.bump();
+                        tokio::spawn(async move {
+                            let response = b"HTTP/1.1 200 OK\r\nContent-Length: 16\r\nConnection: close\r\n\r\nshort";
+                            let _ = stream.write_all(response).await;
+                            let _ = stream.shutdown().await;
+                        });
+                    }
+                }
+            }
+        });
+        let addr = addr_rx.blocking_recv().expect("truncated bound address");
+        Self {
+            addr,
+            accepted: counter,
+            shutdown: Some(shutdown_tx),
+            runtime,
+            join: Some(join),
+        }
+    }
+
+    pub fn url(&self, path: &str) -> String {
+        format!("http://{}{}", self.addr, path)
+    }
+
+    pub fn stop(mut self) {
+        if let Some(tx) = self.shutdown.take() {
+            let _ = tx.send(());
+        }
+        if let Some(join) = self.join.take() {
+            self.runtime.block_on(async move {
+                let _ = tokio::time::timeout(Duration::from_secs(2), join).await;
+            });
+        }
+    }
+}
+
+impl Drop for TruncatedBodyServer {
     fn drop(&mut self) {
         if let Some(tx) = self.shutdown.take() {
             let _ = tx.send(());

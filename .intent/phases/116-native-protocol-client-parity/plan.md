@@ -2,9 +2,95 @@
 
 ## Status
 
-- Future implementation plan for Wave A.
-- Runs after Phase 115 and Phase 124 land, because this phase reuses the
-  reorganized core/battery boundary and hardened HTTP/2 frame/header code.
+- In progress. Wave A. Phase 115 and Phase 124 have landed.
+- **Checkpoint 1 (server-only module split) landed.** The single-file
+  `tina-http/src/http2.rs` is now `tina-http/src/http2/{mod,frame,
+  headers,errors,server,target,client}.rs`. The frame/header/error
+  helpers are internal (`pub(super)`) and shared between the server
+  and the new native client. Public exports are unchanged for the
+  server surface; existing HTTP/2 and gRPC server tests pass.
+- **Native HTTP/2 client first form landed.** New typed
+  `Http2Target::H2c { authority, addr }` / `Http2Target::Tls
+  { authority, addr, server_name, trust_roots, alpn }`,
+  `AlpnProtocols::h2()` / `none()`, and the
+  `Http2ClientConnection<S>` isolate with bounded admission, typed
+  `Http2ClientOutcome` (Replied, Full, Closed, FlowControlBlocked,
+  Timeout, Reset, LocalCancel, ProtocolError, TlsAlpnMismatch), and
+  outbound client-stream protocol facts. Live tests in
+  `tina-http/tests/http2_client_live.rs` prove h2c GET, h2c POST,
+  typed TlsAlpnMismatch, route-key shape, and method/path round-trip.
+- **Native gRPC unary client landed.** `GrpcClient` over
+  `Http2ClientConnection` with `GrpcTarget` and a typed
+  `GrpcUnaryOutcome` (Ok / Status / Transport / Malformed); a non-OK
+  status is the caller outcome, never a hidden success. Received status
+  is emitted as `ProtocolFact::GrpcFinalStatusReceived` (trace tag 9,
+  paired with `GrpcFinalStatusSent`). Live tests, two compile-fail
+  proofs, specimen rewritten onto the native client (OK + non-OK +
+  cancel), and docs updated off `grpc_unary_call_h2c_blocking`.
+- **`Http2ClientMsg::Cancel { stream_id }` landed** with outbound
+  RST_STREAM(CANCEL), `LocalCancel` outcome, and an outbound reset fact
+  (parts 3/5).
+- **TLS ALPN rail landed (runtime + sim).** `CallInput::TlsConnect`/
+  `TlsBind` carry `alpn_protocols`; `CallOutput::TlsConnected`/
+  `TlsAccepted` carry `selected_alpn`; `CallError::TlsAlpnMismatch`.
+  New `tls_connect_alpn`/`tls_bind_alpn`/`tls_accept_alpn`. Real rustls
+  ALPN negotiation; runtime tests prove h2 selection + mismatch.
+- **HTTP/2 client over TLS landed.** `ClientStream` {Tcp, Tls};
+  `Http2Target::Tls` does `tls_connect_alpn` and runs HTTP/2 over the
+  encrypted stream. Real ALPN: offered-but-none → `TlsAlpnMismatch`
+  outcome. `pump_io` runs full-duplex on TCP and half-duplex on TLS.
+  Live h2/TLS tests prove round-trip + mismatch + untrusted-cert.
+- **HTTP/2 client streaming request bodies landed.**
+  `Http2ClientStreamingRequest { method, path, headers, source }` +
+  `Http2ClientMsg::SubmitStreaming(..)`. The client sends HEADERS
+  without END_STREAM, pulls one chunk at a time from the source (a
+  mirror of the server's `IterBodySource` `ResponseChunkMsg::Next`
+  pull), ships them as DATA under the existing flow-control pacer, and
+  closes the request half with the final/empty DATA(END_STREAM). Source
+  failure RST_STREAM(CANCEL)s only that stream (`LocalCancel`). Live
+  proofs: multi-chunk streamed POST to `/echo` round-trips, empty source
+  closes with a lone empty DATA(END_STREAM).
+- **HTTP/2 client streaming response bodies landed.**
+  `Http2ClientMsg::OpenStream(Http2ClientStreamCall)` (request body
+  buffered or streamed) replies a `ResponseStreaming { status, headers }`
+  head; the caller then pulls `Http2ResponseChunk`s with
+  `ResponseNext { stream_id }` — `Data` / `End { trailers }` / terminal
+  `Reset`/`Closed`/`ProtocolError`. Received DATA is held under the
+  stream window and only `WINDOW_UPDATE`-credited on consume, so a slow
+  caller backpressures the peer. Reset/close settles the live channel
+  (head waiter or parked pull). Live proofs: head-then-pull to `End`,
+  32 KB multi-frame reassembly, peer-RST → terminal `Reset` on the
+  parked pull. Both streaming halves are the gate for streaming gRPC.
+- **Streaming gRPC client landed.** `GrpcClient::server_streaming_request`
+  (OpenStream, buffered request, pulled response),
+  `client_streaming_request` (SubmitStreaming, streamed request, buffered
+  response via `decode_unary`), and `bidi_request` (OpenStream, streamed
+  request + pulled response). `GrpcStreamDecoder` reassembles
+  length-prefixed messages across response DATA chunks; `decode_stream_chunk`
+  folds chunks into `GrpcStreamItem`s ending in one first-class `Status`.
+  `frame(&msg)` length-prefixes a request message for the source. Live
+  proofs against an in-tree `GrpcRouter`: server-streaming receives all
+  messages + status, client-streaming sends many + gets the summed reply,
+  bidi echoes a streamed request back as a streamed response; plus a
+  `GrpcStreamItem`-not-the-message compile-fail.
+- **DST replay honesty landed.** `dst_http2_client.rs` captures a live
+  native HTTP/2 client run and marks the client socket I/O
+  (`tcp_connect`/`read`/`write`/`close`) as a typed
+  `UnsupportedLiveFact`; `check_captured_replay` fails closed with
+  `CapturedReplayChange::UnsupportedFact` (no silent no-op, no fake
+  replay), and the saved replay case round-trips preserving the
+  unsupported fact + op history.
+- **Remaining work in this phase** (still future slices, named in
+  *Includes* and *Proof Shape* below):
+  - **Full-duplex h2/TLS** (concurrent bidi over TLS): needs a
+    non-blocking TLS reactor in the runtime (split TLS read/write
+    lanes + sans-IO rustls in the poll loop). Out of Phase 116 scope;
+    a runtime-maturity phase. Unary/request-response h2/TLS works now.
+  - Connection-reuse pool (idle eviction, max lifetime, health
+    policy) — Phase 119, using the new
+    `Http2Target::route_key()` shape.
+  - Tina-client → tonic-server interop (needs tonic as a `tina-http`
+    dep; deferred). Tina-client ↔ Tina-server gRPC is proven.
 - Can run in parallel with phases 117 and 118 if ownership stays in `tina-http`,
   TLS ALPN rail data, protocol facts, docs, and protocol specimens.
 - Runs before Phase 119 resource maturity. HTTP/2/gRPC client pooling needs

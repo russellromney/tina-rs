@@ -75,8 +75,10 @@ where
     ) -> Result<(), DriverShutdownError> {
         let driver_result = self.driver.cancel_pending(deadline);
         self.translators.clear();
+        self.translator_indexes.clear();
 
         let in_flight_calls = std::mem::take(&mut self.in_flight_calls);
+        self.in_flight_call_indexes.clear();
         for call in in_flight_calls {
             self.push_event(
                 call.requester.isolate,
@@ -90,6 +92,8 @@ where
         }
 
         let pending_isolate_calls = std::mem::take(&mut self.pending_isolate_calls);
+        self.pending_isolate_call_indexes.clear();
+        self.pending_isolate_call_deadlines.clear();
         for call in pending_isolate_calls {
             // Mark any caller-held CallHandle as Cancelled so a late
             // poll of `handle.state()` reflects the truth instead of
@@ -131,7 +135,10 @@ where
                 continue;
             }
 
-            let call = self.in_flight_calls.remove(index);
+            let call_id = self.in_flight_calls[index].call_id;
+            let call = self
+                .remove_in_flight_call(call_id)
+                .expect("indexed in-flight call exists");
             self.driver.cancel(call.call_id);
             self.remove_translator(call.call_id);
             self.push_event(
@@ -147,12 +154,50 @@ where
     }
 
     pub(crate) fn remove_translator(&mut self, call_id: CallId) {
-        let translator_index = self
-            .translators
-            .iter()
-            .position(|entry| entry.call_id == call_id)
+        self.remove_translator_entry(call_id)
             .unwrap_or_else(|| panic!("missing translator for call {call_id:?}"));
-        self.translators.remove(translator_index);
+    }
+
+    pub(crate) fn push_in_flight_call(&mut self, call: InFlightCall) {
+        let index = self.in_flight_calls.len();
+        let previous = self.in_flight_call_indexes.insert(call.call_id, index);
+        assert!(
+            previous.is_none(),
+            "duplicate in-flight call id {:?}",
+            call.call_id
+        );
+        self.in_flight_calls.push(call);
+    }
+
+    pub(crate) fn remove_in_flight_call(&mut self, call_id: CallId) -> Option<InFlightCall> {
+        let index = self.in_flight_call_indexes.remove(&call_id)?;
+        let removed = self.in_flight_calls.swap_remove(index);
+        if index < self.in_flight_calls.len() {
+            let moved = self.in_flight_calls[index].call_id;
+            self.in_flight_call_indexes.insert(moved, index);
+        }
+        Some(removed)
+    }
+
+    pub(crate) fn push_translator(&mut self, translator: StoredTranslator) {
+        let index = self.translators.len();
+        let previous = self.translator_indexes.insert(translator.call_id, index);
+        assert!(
+            previous.is_none(),
+            "duplicate translator for call {:?}",
+            translator.call_id
+        );
+        self.translators.push(translator);
+    }
+
+    pub(crate) fn remove_translator_entry(&mut self, call_id: CallId) -> Option<StoredTranslator> {
+        let index = self.translator_indexes.remove(&call_id)?;
+        let removed = self.translators.swap_remove(index);
+        if index < self.translators.len() {
+            let moved = self.translators[index].call_id;
+            self.translator_indexes.insert(moved, index);
+        }
+        Some(removed)
     }
 
     /// Runs one deterministic round over all registered isolates.
@@ -1043,7 +1088,7 @@ where
         // Register the translator and in-flight tracking before submission
         // so a synchronous completion (bind / close on Betelgeuse) can be
         // delivered through the same path as async completions.
-        self.in_flight_calls.push(InFlightCall {
+        self.push_in_flight_call(InFlightCall {
             call_id: context.call_id,
             call_kind,
             requester: context.requester,
@@ -1051,7 +1096,7 @@ where
             persistence,
             continuation_context: context.continuation_context,
         });
-        self.translators.push(StoredTranslator {
+        self.push_translator(StoredTranslator {
             call_id: context.call_id,
             translator: Some(translator),
         });
@@ -1075,22 +1120,11 @@ where
     /// Translator is not run; caller's continuation does not fire.
     /// Trace records `ResourceClosed`.
     pub(crate) fn cancel_in_flight_call_for_resource_close(&mut self, call_id: CallId) {
-        let Some(in_flight_index) = self
-            .in_flight_calls
-            .iter()
-            .position(|entry| entry.call_id == call_id)
-        else {
+        let Some(in_flight) = self.remove_in_flight_call(call_id) else {
             return;
         };
-        let in_flight = self.in_flight_calls.remove(in_flight_index);
 
-        if let Some(translator_index) = self
-            .translators
-            .iter()
-            .position(|entry| entry.call_id == call_id)
-        {
-            self.translators.remove(translator_index);
-        }
+        let _ = self.remove_translator_entry(call_id);
 
         self.push_event(
             in_flight.requester.isolate,
@@ -1186,9 +1220,7 @@ where
         let call_kind = CallKind::ObservedSend;
         let message = translator(outcome);
 
-        let entry_index = self.entries.iter().position(|entry| {
-            entry.id == requester.isolate && entry.generation == requester.generation
-        });
+        let entry_index = self.entry_index(requester);
         let Some(entry_index) = entry_index else {
             self.push_event(
                 requester.isolate,
@@ -1315,7 +1347,7 @@ where
                     shared.set_call_id(context.call_id.get());
                     shared.set_shard_id(self.shard.id().get());
                 }
-                self.pending_isolate_calls.push(PendingIsolateCall {
+                self.push_pending_isolate_call(PendingIsolateCall {
                     call_id: context.call_id,
                     requester: context.requester,
                     cause: context.cause,
@@ -1359,6 +1391,48 @@ where
         }
     }
 
+    pub(crate) fn push_pending_isolate_call(&mut self, entry: PendingIsolateCall) {
+        let index = self.pending_isolate_calls.len();
+        let previous = self
+            .pending_isolate_call_indexes
+            .insert(entry.call_id, index);
+        assert!(
+            previous.is_none(),
+            "duplicate pending isolate call {:?}",
+            entry.call_id
+        );
+        self.pending_isolate_call_deadlines
+            .insert((entry.deadline, entry.insertion_order), entry.call_id);
+        self.pending_isolate_calls.push(entry);
+    }
+
+    pub(crate) fn remove_pending_isolate_call(
+        &mut self,
+        call_id: CallId,
+    ) -> Option<PendingIsolateCall> {
+        let index = self.pending_isolate_call_indexes.remove(&call_id)?;
+        let removed = self.pending_isolate_calls.swap_remove(index);
+        self.pending_isolate_call_deadlines
+            .remove(&(removed.deadline, removed.insertion_order));
+        if index < self.pending_isolate_calls.len() {
+            let moved = &self.pending_isolate_calls[index];
+            self.pending_isolate_call_indexes
+                .insert(moved.call_id, index);
+        }
+        Some(removed)
+    }
+
+    pub(crate) fn rebuild_pending_isolate_call_indexes(&mut self) {
+        self.pending_isolate_call_indexes.clear();
+        self.pending_isolate_call_deadlines.clear();
+        for (index, entry) in self.pending_isolate_calls.iter().enumerate() {
+            self.pending_isolate_call_indexes
+                .insert(entry.call_id, index);
+            self.pending_isolate_call_deadlines
+                .insert((entry.deadline, entry.insertion_order), entry.call_id);
+        }
+    }
+
     pub(crate) fn dispatch_cancel_call(
         &mut self,
         context: CallDispatchContext,
@@ -1388,13 +1462,8 @@ where
                             tina::CancelOutcome::WrongShard
                         } else {
                             let call_id = CallId::new(raw_call_id);
-                            match self
-                                .pending_isolate_calls
-                                .iter()
-                                .position(|entry| entry.call_id == call_id)
-                            {
-                                Some(index) => {
-                                    let mut entry = self.pending_isolate_calls.remove(index);
+                            match self.remove_pending_isolate_call(call_id) {
+                                Some(mut entry) => {
                                     // CallCancelled's trace cause chains back
                                     // to the original CallDispatchAttempted so
                                     // every CallDispatchAttempted has exactly
@@ -1429,10 +1498,7 @@ where
         };
 
         let message_any = translator(outcome);
-        let Some(entry_index) = self.entries.iter().position(|entry| {
-            entry.id == context.requester.isolate
-                && entry.generation == context.requester.generation
-        }) else {
+        let Some(entry_index) = self.entry_index(context.requester) else {
             self.push_event(
                 context.requester.isolate,
                 Some(context.cause),
@@ -1493,19 +1559,17 @@ where
     }
 
     pub(crate) fn harvest_isolate_call_timeouts(&mut self, now: Instant) {
-        while let Some(index) = self
-            .pending_isolate_calls
-            .iter()
-            .enumerate()
-            .filter(|(_, entry)| entry.deadline <= now)
-            .min_by(|(_, left), (_, right)| {
-                left.deadline
-                    .cmp(&right.deadline)
-                    .then_with(|| left.insertion_order.cmp(&right.insertion_order))
-            })
-            .map(|(index, _)| index)
+        while let Some((&(deadline, insertion_order), &call_id)) =
+            self.pending_isolate_call_deadlines.first_key_value()
         {
-            let mut entry = self.pending_isolate_calls.remove(index);
+            if deadline > now {
+                break;
+            }
+            self.pending_isolate_call_deadlines
+                .remove(&(deadline, insertion_order));
+            let Some(mut entry) = self.remove_pending_isolate_call(call_id) else {
+                continue;
+            };
             let translator = entry.translator.take().unwrap_or_else(|| {
                 panic!("translator for call {:?} already consumed", entry.call_id)
             });
@@ -1554,6 +1618,7 @@ where
                 && entry.requester.generation == owner_generation
         });
         self.pending_isolate_calls = kept;
+        self.rebuild_pending_isolate_call_indexes();
         for entry in owned.iter_mut() {
             self.record_cancelled_call(entry.call_id, tina::CancelCause::OwnerStopped);
         }
@@ -1629,14 +1694,9 @@ where
         cause: CauseId,
         outcome: CallOutcome<Box<dyn Any>>,
     ) -> bool {
-        let Some(index) = self
-            .pending_isolate_calls
-            .iter()
-            .position(|entry| entry.call_id == call_id)
-        else {
+        let Some(mut pending) = self.remove_pending_isolate_call(call_id) else {
             return false;
         };
-        let mut pending = self.pending_isolate_calls.remove(index);
         let translator = pending
             .translator
             .take()
@@ -1685,9 +1745,7 @@ where
         }
 
         let message = translator(outcome);
-        let Some(entry_index) = self.entries.iter().position(|entry| {
-            entry.id == requester.isolate && entry.generation == requester.generation
-        }) else {
+        let Some(entry_index) = self.entry_index(requester) else {
             self.push_event(
                 requester.isolate,
                 Some(cause),
@@ -1762,19 +1820,13 @@ where
     }
 
     pub(crate) fn deliver_completion(&mut self, call_id: CallId, result: CallOutput) {
-        let in_flight_index = self
-            .in_flight_calls
-            .iter()
-            .position(|entry| entry.call_id == call_id)
+        let in_flight = self
+            .remove_in_flight_call(call_id)
             .unwrap_or_else(|| panic!("driver produced completion for unknown call {call_id:?}"));
-        let in_flight = self.in_flight_calls.remove(in_flight_index);
 
-        let translator_index = self
-            .translators
-            .iter()
-            .position(|entry| entry.call_id == call_id)
+        let mut stored = self
+            .remove_translator_entry(call_id)
             .unwrap_or_else(|| panic!("missing translator for call {call_id:?}"));
-        let mut stored = self.translators.remove(translator_index);
         let translator = stored
             .translator
             .take()
@@ -1849,10 +1901,7 @@ where
 
         let message = translator(result);
 
-        let entry_index = self.entries.iter().position(|entry| {
-            entry.id == in_flight.requester.isolate
-                && entry.generation == in_flight.requester.generation
-        });
+        let entry_index = self.entry_index(in_flight.requester);
         let Some(entry_index) = entry_index else {
             self.push_event(
                 in_flight.requester.isolate,
@@ -2236,7 +2285,23 @@ where
             }
         }
 
-        let outcome = recipe.create(self, parent);
+        let outcome = match catch_unwind(AssertUnwindSafe(|| recipe.create(self, parent))) {
+            Ok(outcome) => outcome,
+            Err(_) => {
+                self.child_records[child_record_index].restart_recipe = Some(recipe);
+                self.push_event(
+                    parent,
+                    Some(attempted.into()),
+                    RuntimeEventKind::RestartChildSkipped {
+                        child_ordinal,
+                        old_isolate: old_child.isolate,
+                        old_generation: old_child.generation,
+                        reason: RestartSkippedReason::FactoryPanicked,
+                    },
+                );
+                return;
+            }
+        };
         let new_child = outcome.child;
         let bootstrap_message = outcome.bootstrap_message;
         self.child_records[child_record_index].child = new_child;
@@ -2352,12 +2417,18 @@ where
 
     pub(crate) fn gc_stopped_entries(&mut self) {
         let mut index = 0;
+        let mut removed_any = false;
         while index < self.entries.len() {
             if self.can_gc_stopped_entry(index) {
-                self.entries.remove(index);
+                let removed = self.entries.remove(index);
+                self.entry_indexes.remove(&removed.id);
+                removed_any = true;
             } else {
                 index += 1;
             }
+        }
+        if removed_any {
+            self.rebuild_entry_indexes();
         }
     }
 

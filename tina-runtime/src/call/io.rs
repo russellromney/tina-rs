@@ -125,6 +125,11 @@ pub enum CallInput {
         /// explicit trust roots instead of silently reaching into platform
         /// stores.
         root_certificates: Vec<Vec<u8>>,
+        /// ALPN protocols to offer, in preference order, as raw wire bytes
+        /// (e.g. `b"h2"`). Empty means no ALPN extension is offered. When
+        /// non-empty and the peer negotiates none, the connect fails with
+        /// [`CallError::TlsAlpnMismatch`].
+        alpn_protocols: Vec<Vec<u8>>,
         /// Maximum time for TCP connect and TLS handshake.
         timeout: Duration,
     },
@@ -137,6 +142,9 @@ pub enum CallInput {
         certificate_chain: Vec<Vec<u8>>,
         /// Private key in DER form.
         private_key: Vec<u8>,
+        /// ALPN protocols the server will accept, in preference order, as
+        /// raw wire bytes. Empty means the server does not negotiate ALPN.
+        alpn_protocols: Vec<Vec<u8>>,
     },
 
     /// Accept one inbound TLS stream from a TLS listener.
@@ -563,6 +571,9 @@ pub enum CallOutput {
     TlsConnected {
         /// The runtime-assigned TLS stream id.
         stream: TlsStreamId,
+        /// ALPN protocol the peer selected (raw wire bytes), or `None`
+        /// when no ALPN was offered/negotiated.
+        selected_alpn: Option<Vec<u8>>,
     },
 
     /// A TLS listener was bound and is ready to accept.
@@ -579,6 +590,9 @@ pub enum CallOutput {
         stream: TlsStreamId,
         /// Remote peer address.
         peer_addr: SocketAddr,
+        /// ALPN protocol negotiated with the client (raw wire bytes), or
+        /// `None` when no ALPN was offered/negotiated.
+        selected_alpn: Option<Vec<u8>>,
     },
 
     /// A TLS stream read decrypted bytes.
@@ -831,6 +845,12 @@ pub enum CallError {
 
     /// TLS handshake or protocol processing failed.
     TlsHandshake,
+
+    /// ALPN was offered on a TLS connect/accept but no protocol was
+    /// negotiated (the peer selected none, or selected one that was not
+    /// offered). Distinct from `TlsHandshake` so an ALPN mismatch is not
+    /// confused with a cert/name/handshake failure.
+    TlsAlpnMismatch,
 
     /// The bounded signal lane was full when the runtime tried to wait.
     SignalFull,

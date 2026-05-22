@@ -86,6 +86,33 @@ fn run_one(canned: Vec<u8>) -> Result<HttpResponse, HttpClientError> {
     result
 }
 
+fn run_one_request_to(
+    target: SocketAddr,
+    request: HttpRequest,
+) -> Result<HttpResponse, HttpClientError> {
+    let runtime = runtime();
+
+    let client = runtime
+        .register_with_capacity::<HttpClient<SingleShard>, Infallible>(
+            HttpClient::<SingleShard>::new(HttpClientConfig::dev()),
+            16,
+        )
+        .expect("register client");
+
+    let result = map_outcome(
+        runtime
+            .call_blocking(
+                client,
+                HttpClientMsg::call(target, request),
+                Duration::from_secs(2),
+            )
+            .expect("call runs"),
+    );
+
+    let _ = runtime.shutdown();
+    result
+}
+
 #[test]
 fn missing_content_length_surfaces_parse_error() {
     let canned = b"HTTP/1.1 200 OK\r\nServer: x\r\n\r\nhello".to_vec();
@@ -96,6 +123,19 @@ fn missing_content_length_surfaces_parse_error() {
             HttpClientError::Parse(ResponseParseError::MissingContentLength)
         ),
         "expected MissingContentLength, got {err:?}"
+    );
+}
+
+#[test]
+fn invalid_request_target_is_rejected_before_write() {
+    let request = HttpRequest::get("/safe\r\nInjected: yes")
+        .header("Host", "x")
+        .build();
+    let err = run_one_request_to("127.0.0.1:9".parse().expect("discard addr"), request)
+        .expect_err("client must reject invalid request target");
+    assert!(
+        matches!(err, HttpClientError::InvalidRequestTarget),
+        "expected InvalidRequestTarget, got {err:?}"
     );
 }
 

@@ -31,12 +31,13 @@
 
 use std::alloc::Global;
 use std::any::Any;
+use std::collections::{BTreeMap, HashMap};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
-use tina::{DeferredSlotRegistry, Shard};
+use tina::{DeferredSlotRegistry, IsolateId, Shard};
 
 use betelgeuse::IOLoopHandle;
 
@@ -183,9 +184,10 @@ pub use call::{
     journal_append, journal_replay, mkdir, path_metadata, process_run, read_dir, remove_file,
     rename_replace, send_observed, signal_wait, sleep, sleep_then, snapshot_commit, snapshot_load,
     sync_parent, tcp_accept, tcp_bind, tcp_close_listener, tcp_close_stream, tcp_connect, tcp_read,
-    tcp_write, tls_accept, tls_bind, tls_close, tls_close_listener, tls_connect, tls_read,
-    tls_write, udp_bind, udp_close_socket, udp_recv_from, udp_send_to, unix_accept, unix_bind,
-    unix_close_listener, unix_close_stream, unix_connect, unix_read, unix_write,
+    tcp_write, tls_accept, tls_accept_alpn, tls_bind, tls_bind_alpn, tls_close, tls_close_listener,
+    tls_connect, tls_connect_alpn, tls_read, tls_write, udp_bind, udp_close_socket, udp_recv_from,
+    udp_send_to, unix_accept, unix_bind, unix_close_listener, unix_close_stream, unix_connect,
+    unix_read, unix_write,
 };
 pub use call_group::{
     CallGroup, CallGroupBranchOutcome, CallGroupCancelOutcome, CallGroupCancelRequest,
@@ -242,6 +244,14 @@ pub use tcp_loops::{LoopStep, ReadExactStep, TcpReadExact, TcpReadToEof, TcpWrit
 ///
 /// This is the preferred runtime authoring path. It keeps the handler as normal
 /// Rust code and only fills the repetitive [`tina::Isolate`] associated types.
+///
+/// **The expansion is rooted at `::tina`.** The generated impl names
+/// `::tina::Isolate`, `::tina::Effect`, `::tina::Context`, and friends, so the
+/// crate using this macro must depend on `tina` and have it reachable as
+/// `::tina` (the default crate name). Only the call channel is rooted at
+/// `::tina_runtime`. A crate that depends on `tina-runtime` alone will fail to
+/// compile with `unresolved import ::tina`; add `tina` as a direct dependency,
+/// or override the root with `#[tina_runtime::isolate(.., tina_crate = ::your_path)]`.
 pub use tina_macros::runtime_isolate as isolate;
 pub use trace::{
     CallCompletionRejectedReason, CallKind, CallReplyRejectedReason, CauseId,
@@ -314,6 +324,7 @@ where
     pub(crate) shard: S,
     pub(crate) mailbox_factory: F,
     pub(crate) entries: Vec<RegisteredEntry<S, F>>,
+    pub(crate) entry_indexes: HashMap<IsolateId, usize>,
     pub(crate) child_records: Vec<ChildRecord<S, F>>,
     pub(crate) supervisors: Vec<SupervisorRecord>,
     pub(crate) next_isolate_id: u64,
@@ -324,9 +335,13 @@ where
     pub(crate) trace_dropped: u64,
     pub(crate) driver: Box<dyn RuntimeDriver>,
     pub(crate) in_flight_calls: Vec<InFlightCall>,
+    pub(crate) in_flight_call_indexes: HashMap<CallId, usize>,
     pub(crate) translators: Vec<StoredTranslator>,
+    pub(crate) translator_indexes: HashMap<CallId, usize>,
     pub(crate) clock: Box<dyn Clock>,
     pub(crate) pending_isolate_calls: Vec<PendingIsolateCall>,
+    pub(crate) pending_isolate_call_indexes: HashMap<CallId, usize>,
+    pub(crate) pending_isolate_call_deadlines: BTreeMap<(Instant, u64), CallId>,
     pub(crate) round_messages: Vec<Option<DeliveredMessage>>,
     pub(crate) driver_completions: Vec<DriverCompletion>,
     pub(crate) next_isolate_call_ordinal: u64,
@@ -598,6 +613,7 @@ where
             shard,
             mailbox_factory,
             entries: Vec::with_capacity(preallocation.entry_capacity),
+            entry_indexes: HashMap::with_capacity(preallocation.entry_capacity),
             child_records: Vec::with_capacity(preallocation.child_record_capacity),
             supervisors: Vec::with_capacity(preallocation.supervisor_capacity),
             next_isolate_id: 1,
@@ -608,9 +624,13 @@ where
             trace_dropped: 0,
             driver,
             in_flight_calls: Vec::with_capacity(preallocation.call_capacity),
+            in_flight_call_indexes: HashMap::with_capacity(preallocation.call_capacity),
             translators: Vec::with_capacity(preallocation.call_capacity),
+            translator_indexes: HashMap::with_capacity(preallocation.call_capacity),
             clock,
             pending_isolate_calls: Vec::with_capacity(preallocation.call_capacity),
+            pending_isolate_call_indexes: HashMap::with_capacity(preallocation.call_capacity),
+            pending_isolate_call_deadlines: BTreeMap::new(),
             round_messages: Vec::with_capacity(preallocation.round_scratch_capacity),
             driver_completions: Vec::with_capacity(preallocation.call_capacity),
             next_isolate_call_ordinal: 0,

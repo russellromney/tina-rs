@@ -96,7 +96,7 @@ the implementation proof and regression test names.
 | L3 | Fixed. `RecurringTick::Bounded(0)` missed-tick policy is pinned. Test: `recurring_tick` tests. |
 | L4 | Fixed. `elapsed_periods` avoids silent `u128` to `u64` truncation. Test: `recurring_tick` tests. |
 | L16 | Fixed. Trace projection preserves `CallError::Rejected(reason)` inner reason. Test: `call_failed_rejected_error_preserves_inner_reason`. |
-| H8 | Fixed first form. Public TLS lane docs/reports now state queue depth vs concurrency truth: one TLS worker per shard drains a bounded queue. Tests/docs: TLS lane pressure report coverage and `docs/tina-user-guide/12-io-model.md`. |
+| H8 | Fixed stronger. Public TLS lane docs/reports now state bounded worker-slot truth: each in-flight TLS op owns one worker slot up to `tls_lane_capacity`. Tests/docs: TLS lane pressure and quiet-stream concurrency coverage. |
 | H12 | Fixed first form. `#[tina::isolate]` / `#[tina_runtime::isolate]` accept `tina_crate = ...` and `runtime_crate = ...` path overrides, `#[tina_rpc::service]` accepts `tina_crate = ...` and `rpc_crate = ...`, and defaults use `core::convert::Infallible` where possible. Tests: `tina-macros` lib compile, runtime surface-alignment tests, and `service_macro_accepts_renamed_dependency_paths`. |
 | M11 | Fixed. SPSC requires power-of-two capacity and rejects non-power-of-two inputs. Test: `mailbox_rejects_non_power_of_two_capacity`. |
 | M12 | Fixed/proven. TLS blocking stream access remains owner-worker-thread only by API shape, and docs name the mutex scope. Tests: TLS local-system tests. |
@@ -278,7 +278,7 @@ the implementation proof and regression test names.
   `RestartBudget::within(max, Duration)` with a VecDeque of timestamps
   pruned by age.
 
-### H8. Per-shard TLS worker thread serializes all TLS work
+### H8. Per-shard TLS worker thread serializes all TLS work — superseded
 
 - Confidence: High. `tina-runtime/src/driver/tls.rs:803-814, 1026-1080`.
 - One worker per shard processes connect/bind/accept/read/write/close
@@ -287,6 +287,9 @@ the implementation proof and regression test names.
   "64 concurrent TLS ops" but means "1 concurrent, 64-deep queue."
 - Fix: pool the worker (`min(num_cpus/shard_count, 8)`) or use one
   worker per accepted stream; switch `accept_tls` away from polling.
+
+Current code uses bounded per-operation TLS worker slots instead of
+one serial worker. The cap remains `tls_lane_capacity`.
 
 ### H9. HTTP/2 does not reject HTTP/1 connection-specific headers — smuggling vector
 

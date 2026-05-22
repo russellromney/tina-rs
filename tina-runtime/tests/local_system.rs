@@ -4,7 +4,7 @@ use std::fs;
 use std::io::{Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::path::PathBuf;
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -138,6 +138,8 @@ impl LlamaService {
 enum CrossShardCallWorkerMsg {
     Echo(Vec<u8>),
     NoReply,
+    NoReplyId(u8),
+    ReleaseHeld,
     Stop,
 }
 
@@ -146,7 +148,8 @@ struct CrossShardCallReply(Vec<u8>);
 
 #[derive(Debug, Default)]
 struct CrossShardCallWorker {
-    held: Vec<tina::RequestContext<CrossShardCallReply>>,
+    held: Vec<(tina::RequestContext<CrossShardCallReply>, Vec<u8>)>,
+    held_count: Option<Arc<Mutex<usize>>>,
 }
 
 #[tina_runtime::isolate(
@@ -163,6 +166,17 @@ impl CrossShardCallWorker {
         match msg {
             CrossShardCallWorkerMsg::Echo(bytes) => reply(CrossShardCallReply(bytes)),
             CrossShardCallWorkerMsg::NoReply => noop(),
+            CrossShardCallWorkerMsg::NoReplyId(_) => noop(),
+            CrossShardCallWorkerMsg::ReleaseHeld => {
+                let effects = self
+                    .held
+                    .drain(..)
+                    .map(|(reply_to, bytes)| {
+                        tina::reply_to_request(reply_to, CrossShardCallReply(bytes))
+                    })
+                    .collect::<Vec<_>>();
+                batch(effects)
+            }
             CrossShardCallWorkerMsg::Stop => stop(),
         }
     }
@@ -175,8 +189,19 @@ impl CrossShardCallWorker {
         match msg {
             CrossShardCallWorkerMsg::Echo(bytes) => call.reply(CrossShardCallReply(bytes)),
             CrossShardCallWorkerMsg::NoReply => {
-                self.held.push(call.into_request_context());
+                self.held
+                    .push((call.into_request_context(), b"held".to_vec()));
                 noop()
+            }
+            CrossShardCallWorkerMsg::NoReplyId(id) => {
+                self.held.push((call.into_request_context(), vec![id]));
+                if let Some(count) = &self.held_count {
+                    *count.lock().expect("held count") += 1;
+                }
+                noop()
+            }
+            CrossShardCallWorkerMsg::ReleaseHeld => {
+                call.reject(tina::CallRejectedReason::UnsupportedMessage)
             }
             CrossShardCallWorkerMsg::Stop => {
                 call.reject(tina::CallRejectedReason::UnsupportedMessage)
@@ -189,6 +214,7 @@ impl CrossShardCallWorker {
 enum CrossShardCallClientMsg {
     Start(Address<CrossShardCallWorkerMsg, CrossShardCallReply>),
     StartTimeout(Address<CrossShardCallWorkerMsg, CrossShardCallReply>),
+    StartHeldOne(Address<CrossShardCallWorkerMsg, CrossShardCallReply>, u8),
     Returned(CallOutcome<CrossShardCallReply>),
 }
 
@@ -215,6 +241,12 @@ impl CrossShardCallClient {
                 worker,
                 CrossShardCallWorkerMsg::NoReply,
                 Duration::from_millis(20),
+            )
+            .then(CrossShardCallClientMsg::Returned),
+            CrossShardCallClientMsg::StartHeldOne(worker, id) => call(
+                worker,
+                CrossShardCallWorkerMsg::NoReplyId(id),
+                Duration::from_millis(500),
             )
             .then(CrossShardCallClientMsg::Returned),
             CrossShardCallClientMsg::Returned(outcome) => {
@@ -635,6 +667,102 @@ impl TlsServerService {
                 self.observed
                     .lock()
                     .expect("tls server observed lock")
+                    .push("failed:unexpected-shape".to_string());
+                noop()
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum MultiTlsServerMsg {
+    Start,
+    Bound(Result<(TlsListenerId, SocketAddr), CallError>),
+    Accepted(Result<(TlsStreamId, SocketAddr), CallError>, TlsListenerId),
+    Read(Result<Vec<u8>, CallError>, TlsStreamId),
+    Wrote(Result<usize, CallError>, TlsStreamId),
+    Closed(Result<(), CallError>),
+}
+
+#[derive(Debug)]
+struct MultiTlsServerService {
+    observed: Arc<Mutex<Vec<String>>>,
+    cert_der: Vec<u8>,
+    key_der: Vec<u8>,
+    accepts: usize,
+}
+
+#[tina_runtime::isolate(message = MultiTlsServerMsg, shard = AppShard)]
+impl MultiTlsServerService {
+    fn handle(
+        &mut self,
+        msg: MultiTlsServerMsg,
+        _ctx: &mut Context<'_, AppShard, Self::Reply>,
+    ) -> Effect<Self> {
+        match msg {
+            MultiTlsServerMsg::Start => tls_bind(
+                "127.0.0.1:0".parse().expect("loopback"),
+                vec![self.cert_der.clone()],
+                self.key_der.clone(),
+            )
+            .then(MultiTlsServerMsg::Bound),
+            MultiTlsServerMsg::Bound(Ok((listener, local_addr))) => {
+                self.observed
+                    .lock()
+                    .expect("multi tls observed lock")
+                    .push(format!("bound:{local_addr}"));
+                tls_accept(listener, Duration::from_secs(5))
+                    .then(move |result| MultiTlsServerMsg::Accepted(result, listener))
+            }
+            MultiTlsServerMsg::Accepted(Ok((stream, peer)), listener) => {
+                self.accepts += 1;
+                self.observed
+                    .lock()
+                    .expect("multi tls observed lock")
+                    .push(format!("accepted:{}:{peer}", self.accepts));
+                let read = tls_read(stream, 4, Duration::from_secs(5))
+                    .then(move |result| MultiTlsServerMsg::Read(result, stream));
+                if self.accepts == 1 {
+                    // The first stream intentionally goes quiet after TLS
+                    // handshake. Put its read before the next accept so the
+                    // old serial TLS worker head-of-line-blocks the second
+                    // connection.
+                    batch(vec![
+                        read,
+                        tls_accept(listener, Duration::from_secs(5))
+                            .then(move |result| MultiTlsServerMsg::Accepted(result, listener)),
+                    ])
+                } else {
+                    read
+                }
+            }
+            MultiTlsServerMsg::Read(Ok(bytes), stream) if bytes == b"ping" => {
+                tls_write(stream, b"pong".to_vec(), Duration::from_secs(5))
+                    .then(move |result| MultiTlsServerMsg::Wrote(result, stream))
+            }
+            MultiTlsServerMsg::Wrote(Ok(4), stream) => {
+                self.observed
+                    .lock()
+                    .expect("multi tls observed lock")
+                    .push("wrote:4".to_string());
+                tls_close(stream, Duration::from_secs(5)).then(MultiTlsServerMsg::Closed)
+            }
+            MultiTlsServerMsg::Closed(Ok(())) => noop(),
+            MultiTlsServerMsg::Bound(Err(error))
+            | MultiTlsServerMsg::Accepted(Err(error), _)
+            | MultiTlsServerMsg::Read(Err(error), _)
+            | MultiTlsServerMsg::Wrote(Err(error), _)
+            | MultiTlsServerMsg::Closed(Err(error)) => {
+                self.observed
+                    .lock()
+                    .expect("multi tls observed lock")
+                    .push(format!("failed:{error:?}"));
+                noop()
+            }
+            MultiTlsServerMsg::Read(Ok(_), _) | MultiTlsServerMsg::Wrote(Ok(_), _) => {
+                self.observed
+                    .lock()
+                    .expect("multi tls observed lock")
                     .push("failed:unexpected-shape".to_string());
                 noop()
             }
@@ -1478,6 +1606,31 @@ fn wait_for_addr(published: &Arc<Mutex<Option<SocketAddr>>>) -> SocketAddr {
         .expect("service did not publish address before timeout")
 }
 
+fn connect_rustls_client(
+    addr: SocketAddr,
+    cert_der: Vec<u8>,
+) -> rustls::StreamOwned<rustls::ClientConnection, TcpStream> {
+    let tcp = TcpStream::connect(addr).expect("connect tls server");
+    let mut roots = rustls::RootCertStore::empty();
+    roots
+        .add(rustls::pki_types::CertificateDer::from(cert_der))
+        .expect("add root cert");
+    let config = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    let server_name = rustls::pki_types::ServerName::try_from("localhost").expect("server name");
+    let connection =
+        rustls::ClientConnection::new(Arc::new(config), server_name).expect("client connection");
+    let mut stream = rustls::StreamOwned::new(connection, tcp);
+    while stream.conn.is_handshaking() {
+        stream
+            .conn
+            .complete_io(&mut stream.sock)
+            .expect("client handshake");
+    }
+    stream
+}
+
 fn wait_for_flag(flag: &Arc<(Mutex<bool>, Condvar)>) {
     let deadline = Instant::now() + Duration::from_secs(2);
     let (lock, cv) = &**flag;
@@ -1895,6 +2048,80 @@ fn blue_whale_combined_e2e_core_preallocation_and_cross_shard_call() {
 }
 
 #[test]
+fn live_cross_shard_terminal_replies_do_not_degrade_to_timeout_under_reply_queue_pressure() {
+    let outcomes = Arc::new(Mutex::new(Vec::new()));
+    let held_count = Arc::new(Mutex::new(0_usize));
+    let app = LocalSystem::<AppShard, AppMailboxFactory>::multi_shard(AppMailboxFactory)
+        .shard(AppShard(145))
+        .shard(AppShard(146))
+        .ingress_capacity(16)
+        .shard_pair_capacity(1)
+        .trace_retention(TraceRetention::Bounded(512))
+        .build();
+
+    let worker = app
+        .register_root_on::<CrossShardCallWorker, Infallible>(
+            ShardId::new(146),
+            CrossShardCallWorker {
+                held: Vec::new(),
+                held_count: Some(Arc::clone(&held_count)),
+            },
+            16,
+        )
+        .expect("register pressure worker");
+    let client = app
+        .register_root_on::<CrossShardCallClient, Infallible>(
+            ShardId::new(145),
+            CrossShardCallClient {
+                outcomes: Arc::clone(&outcomes),
+            },
+            16,
+        )
+        .expect("register pressure client");
+
+    for id in 0..3 {
+        app.try_send(client, CrossShardCallClientMsg::StartHeldOne(worker, id))
+            .expect("start held call");
+        wait_until_debug(
+            || *held_count.lock().expect("held count") == usize::from(id) + 1,
+            || format!("held={}", *held_count.lock().expect("held count")),
+        );
+    }
+
+    app.try_send(worker, CrossShardCallWorkerMsg::ReleaseHeld)
+        .expect("release held calls");
+
+    wait_until_debug(
+        || outcomes.lock().expect("outcomes").len() == 3,
+        || format!("outcomes={:?}", outcomes.lock().expect("outcomes")),
+    );
+    let got = outcomes.lock().expect("outcomes").clone();
+    assert_eq!(
+        got,
+        vec![
+            CallOutcome::Replied(CrossShardCallReply(vec![0])),
+            CallOutcome::Replied(CrossShardCallReply(vec![1])),
+            CallOutcome::Replied(CrossShardCallReply(vec![2])),
+        ]
+    );
+
+    let terminal = app
+        .shutdown()
+        .drain()
+        .join()
+        .expect("shutdown pressure app");
+    assert!(!terminal.trace().iter().any(|event| {
+        matches!(
+            event.kind(),
+            RuntimeEventKind::CallReplyRejected {
+                reason: tina_runtime::CallReplyRejectedReason::ReplyPathFull,
+                ..
+            }
+        )
+    }));
+}
+
+#[test]
 fn local_system_capabilities_name_supported_and_unsupported_resource_families() {
     let config = LocalSystemConfig {
         storage_lane_capacity: 7,
@@ -2245,6 +2472,122 @@ fn local_system_tls_server_accepts_reads_writes_and_closes() {
             terminal.trace()
         );
     }
+}
+
+#[test]
+fn local_system_tls_quiet_stream_does_not_block_second_connection() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
+        .expect("generate local cert");
+    let cert_der = certified.cert.der().to_vec();
+    let key_der = certified.key_pair.serialize_der();
+
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let config = LocalSystemConfig {
+        tls_lane_capacity: 4,
+        ..LocalSystemConfig::default()
+    };
+    let app = LocalSystem::single_shard(AppShard(430), AppMailboxFactory)
+        .config(config)
+        .trace_retention(TraceRetention::Bounded(256))
+        .build();
+    let address = app
+        .register_root::<MultiTlsServerService, Infallible>(
+            MultiTlsServerService {
+                observed: Arc::clone(&observed),
+                cert_der: cert_der.clone(),
+                key_der,
+                accepts: 0,
+            },
+            16,
+        )
+        .expect("register multi tls server service");
+
+    app.try_send(address, MultiTlsServerMsg::Start)
+        .expect("start multi tls server");
+    wait_until(|| {
+        observed
+            .lock()
+            .expect("multi tls observed lock")
+            .iter()
+            .any(|entry| entry.starts_with("bound:"))
+    });
+    let addr: SocketAddr = observed
+        .lock()
+        .expect("multi tls observed lock")
+        .iter()
+        .find_map(|entry| entry.strip_prefix("bound:").map(str::to_string))
+        .expect("bound addr")
+        .parse()
+        .expect("parse bound addr");
+
+    let (release_slow, slow_release) = mpsc::channel();
+    let slow_cert = cert_der.clone();
+    let slow = thread::spawn(move || {
+        let _stream = connect_rustls_client(addr, slow_cert);
+        let _ = slow_release.recv_timeout(Duration::from_secs(5));
+    });
+    wait_until(|| {
+        observed
+            .lock()
+            .expect("multi tls observed lock")
+            .iter()
+            .any(|entry| entry.starts_with("accepted:1:"))
+    });
+
+    let (done, finished) = mpsc::channel();
+    let fast = thread::spawn(move || {
+        let mut stream = connect_rustls_client(addr, cert_der);
+        stream.write_all(b"ping").expect("write fast ping");
+        stream.flush().expect("flush fast ping");
+        let mut response = [0_u8; 4];
+        stream.read_exact(&mut response).expect("read fast pong");
+        done.send(response).expect("send fast result");
+    });
+    let response = finished
+        .recv_timeout(Duration::from_millis(750))
+        .expect("second TLS client must not wait behind quiet first stream");
+    assert_eq!(&response, b"pong");
+
+    release_slow.send(()).expect("release slow client");
+    slow.join().expect("slow tls client");
+    fast.join().expect("fast tls client");
+    let terminal = app
+        .shutdown()
+        .drain()
+        .join()
+        .expect("local system shutdown");
+    assert!(
+        terminal
+            .trace()
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event.kind(),
+                    RuntimeEventKind::CallCompleted {
+                        call_kind: CallKind::TlsAccept,
+                        ..
+                    }
+                )
+            })
+            .count()
+            >= 2,
+        "second TLS accept must complete; trace: {:?}",
+        terminal.trace()
+    );
+    assert!(
+        terminal.trace().iter().any(|event| {
+            matches!(
+                event.kind(),
+                RuntimeEventKind::CallCompleted {
+                    call_kind: CallKind::TlsRead,
+                    ..
+                }
+            )
+        }),
+        "fast TLS read must complete; trace: {:?}",
+        terminal.trace()
+    );
 }
 
 #[test]

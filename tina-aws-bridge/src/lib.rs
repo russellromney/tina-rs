@@ -103,6 +103,11 @@
 //! caller-supplied SDK client, SDK retry policy is caller-owned and
 //! the metrics field `sdk_max_attempts` is `0`.
 //!
+//! S3 splits out `NotFound`, `AccessDenied`, and `Throttled` from
+//! generic SDK errors. A throttled S3 result is retryable service
+//! pressure after the SDK's own retry budget, not fatal unknown SDK
+//! noise.
+//!
 //! # Cancellation truth
 //!
 //! Once the bridge admits an operation and spawns the SDK future, a

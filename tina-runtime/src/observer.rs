@@ -37,6 +37,10 @@ pub(crate) type StoredObserver = Option<Arc<dyn TraceObserver>>;
 /// `try_send`. A dedicated drain thread invokes the wrapped observer. If the
 /// queue is full, the event is dropped and [`dropped_count`](Self::dropped_count)
 /// records the loss.
+///
+/// This adapter is useful for production-style observation where blocking the
+/// shard is worse than losing an event. Do not feed a proof/replay hash from a
+/// buffered observer unless the proof path first checks `dropped_count() == 0`.
 pub struct BufferedTraceObserver {
     sender: mpsc::SyncSender<RuntimeEvent>,
     dropped: AtomicU64,

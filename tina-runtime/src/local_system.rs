@@ -47,8 +47,8 @@ pub struct LocalSystemConfig {
     pub storage_lane_capacity: usize,
     /// Capacity of the bounded DNS lane.
     pub dns_lane_capacity: usize,
-    /// Queue capacity of the bounded TLS lane. This is not TLS concurrency:
-    /// each shard owns one TLS worker that drains this queue serially.
+    /// Capacity of the bounded TLS lane. Each in-flight TLS operation owns
+    /// one worker thread up to this cap.
     pub tls_lane_capacity: usize,
     /// Capacity of the bounded process lane.
     pub process_lane_capacity: usize,

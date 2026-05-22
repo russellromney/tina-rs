@@ -94,6 +94,25 @@ use std::time::Duration;
 
 use tina::{Address, AddressGeneration, CallHandleShared, CancelOutcome, IsolateId, ShardId};
 
+/// Safe in-runtime wrapper over tina's `unsafe` must-answer-rail escape hatch.
+///
+/// Every runtime adapter that re-wraps a finished effect into a
+/// `RequestEffect` routes through here so the `unsafe` is discharged once,
+/// centrally. The hole stays `unsafe` to foreign app crates (which cannot name
+/// this `pub(crate)` wrapper); they would have to call the `unsafe`
+/// `tina::runtime_internal` form, which the must-answer rail forbids outside an
+/// explicit `unsafe` block.
+#[allow(unsafe_code)]
+pub(crate) fn request_effect_from_consumed_effect<I: tina::Isolate>(
+    effect: tina::Effect<I>,
+) -> tina::RequestEffect<I> {
+    // SAFETY: every caller that reaches this wrapper has already consumed the
+    // matching `RequestCall` authority (via `RequestContext`) before producing
+    // `effect`, so the manufactured `RequestEffect` settles exactly that one
+    // caller — the precondition tina's escape hatch documents.
+    unsafe { tina::runtime_internal::request_effect_from_consumed_effect(effect) }
+}
+
 type ErasedReply = Box<dyn Any>;
 type ErasedCallOutcome = CallOutcome<ErasedReply>;
 type IsolateCallTranslator<M> = Box<dyn FnOnce(ErasedCallOutcome) -> M>;
@@ -795,10 +814,24 @@ impl CallOutput {
         }
     }
 
-    /// Extracts the successful TLS connect result.
+    /// Extracts the successful TLS connect result (stream id only,
+    /// discarding any negotiated ALPN). Used by non-ALPN callers.
     pub fn into_tls_connected(self) -> Result<TlsStreamId, CallError> {
         match self {
-            Self::TlsConnected { stream } => Ok(stream),
+            Self::TlsConnected { stream, .. } => Ok(stream),
+            Self::Failed(error) => Err(error),
+            other => Self::panic_wrong_shape("TlsConnected", &other),
+        }
+    }
+
+    /// Extracts the TLS connect result plus the negotiated ALPN protocol
+    /// (raw wire bytes), or `None` when no ALPN was negotiated.
+    pub fn into_tls_connected_alpn(self) -> Result<(TlsStreamId, Option<Vec<u8>>), CallError> {
+        match self {
+            Self::TlsConnected {
+                stream,
+                selected_alpn,
+            } => Ok((stream, selected_alpn)),
             Self::Failed(error) => Err(error),
             other => Self::panic_wrong_shape("TlsConnected", &other),
         }
@@ -816,10 +849,28 @@ impl CallOutput {
         }
     }
 
-    /// Extracts the successful TLS accept result.
+    /// Extracts the successful TLS accept result (stream + peer address,
+    /// discarding any negotiated ALPN).
     pub fn into_tls_accepted(self) -> Result<(TlsStreamId, SocketAddr), CallError> {
         match self {
-            Self::TlsAccepted { stream, peer_addr } => Ok((stream, peer_addr)),
+            Self::TlsAccepted {
+                stream, peer_addr, ..
+            } => Ok((stream, peer_addr)),
+            Self::Failed(error) => Err(error),
+            other => Self::panic_wrong_shape("TlsAccepted", &other),
+        }
+    }
+
+    /// Extracts the TLS accept result plus the negotiated ALPN protocol.
+    pub fn into_tls_accepted_alpn(
+        self,
+    ) -> Result<(TlsStreamId, SocketAddr, Option<Vec<u8>>), CallError> {
+        match self {
+            Self::TlsAccepted {
+                stream,
+                peer_addr,
+                selected_alpn,
+            } => Ok((stream, peer_addr, selected_alpn)),
             Self::Failed(error) => Err(error),
             other => Self::panic_wrong_shape("TlsAccepted", &other),
         }
@@ -1286,7 +1337,7 @@ where
         F: FnOnce(tina::RequestContext<Q>, SendOutcome) -> M + 'static,
         M: 'static,
     {
-        tina::runtime_internal::request_effect_from_consumed_effect(self.inner.reply(translator))
+        crate::call::request_effect_from_consumed_effect(self.inner.reply(translator))
     }
 }
 
@@ -1456,7 +1507,7 @@ where
         F: FnOnce(tina::RequestContext<Q>, CallOutcome<R>) -> M + 'static,
         M: 'static,
     {
-        tina::runtime_internal::request_effect_from_consumed_effect(self.inner.reply(translator))
+        crate::call::request_effect_from_consumed_effect(self.inner.reply(translator))
     }
 }
 

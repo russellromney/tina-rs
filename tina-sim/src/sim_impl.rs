@@ -1457,8 +1457,16 @@ where
                 addr,
                 server_name,
                 root_certificates,
+                alpn_protocols,
                 timeout,
-            } => self.handle_tls_connect(call_id, addr, server_name, root_certificates, timeout),
+            } => self.handle_tls_connect(
+                call_id,
+                addr,
+                server_name,
+                root_certificates,
+                alpn_protocols,
+                timeout,
+            ),
             CallInput::TlsBind { addr, .. } => self.handle_tls_bind(call_id, addr),
             CallInput::TlsAccept { listener, timeout } => {
                 self.handle_tls_accept(call_id, listener, timeout)
@@ -2234,6 +2242,7 @@ where
         addr: SocketAddr,
         server_name: String,
         _root_certificates: Vec<Vec<u8>>,
+        alpn_protocols: Vec<Vec<u8>>,
         timeout: Duration,
     ) {
         if timeout.is_zero() {
@@ -2288,7 +2297,16 @@ where
                     closed: false,
                     pending_connect_call: Some(call_id),
                 });
-                CallOutput::TlsConnected { stream }
+                // Deterministic ALPN model: the scripted server accepts the
+                // client's top preference. `selected_alpn` is a pure
+                // function of the offered list (call input), so saved cases
+                // do not replay under an ambient default. Scripted ALPN
+                // *mismatch* modeling is future sim work.
+                let selected_alpn = alpn_protocols.first().cloned();
+                CallOutput::TlsConnected {
+                    stream,
+                    selected_alpn,
+                }
             }
             ScriptedTlsConnectResult::Failed => CallOutput::Failed(CallError::Io),
             ScriptedTlsConnectResult::Certificate => CallOutput::Failed(CallError::TlsCertificate),
@@ -2391,6 +2409,9 @@ where
             CallOutput::TlsAccepted {
                 stream,
                 peer_addr: "127.0.0.1:50000".parse().expect("scripted peer addr"),
+                // Server-side ALPN negotiation is not yet modeled in the
+                // simulator; scripted accepts report no selected protocol.
+                selected_alpn: None,
             },
         );
     }
@@ -3913,9 +3934,8 @@ where
         let mut last_registration_index = None;
         for completion in ready {
             let completed_tls_stream = match &completion.result {
-                CallOutput::TlsConnected { stream } | CallOutput::TlsAccepted { stream, .. } => {
-                    Some(*stream)
-                }
+                CallOutput::TlsConnected { stream, .. }
+                | CallOutput::TlsAccepted { stream, .. } => Some(*stream),
                 _ => None,
             };
             if let Some(stream) = completed_tls_stream {
@@ -5632,9 +5652,6 @@ where
 
 pub(crate) fn fault_selector(seed: u64, tag: u64, ordinal: u64, modulus: u64) -> u64 {
     debug_assert!(modulus > 0);
-    if ordinal == 0 {
-        return seed % modulus;
-    }
     splitmix64(seed ^ tag.rotate_left(17) ^ ordinal.wrapping_mul(0x9E37_79B9_7F4A_7C15)) % modulus
 }
 

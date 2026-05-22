@@ -254,6 +254,14 @@ impl ChunkedDecoder {
         // Scan input for \r\n.
         for i in 0..input.len().saturating_sub(1) {
             if input[i] == b'\r' && input[i + 1] == b'\n' {
+                let total_line_len = self.size_len + i;
+                if total_line_len >= self.size_buf.len() {
+                    self.size_len = 0;
+                    return SizeResult::Error {
+                        error: ChunkedError::BadChunkSize,
+                        consumed: i + 2,
+                    };
+                }
                 let line = if self.size_len == 0 {
                     &input[..i]
                 } else {
@@ -290,17 +298,16 @@ impl ChunkedDecoder {
                 consumed: 0,
             };
         };
-        let save_len = input.len().min(space_left);
-        self.size_buf[self.size_len..self.size_len + save_len].copy_from_slice(&input[..save_len]);
-        self.size_len += save_len;
-
-        if self.size_len >= self.size_buf.len() {
+        if input.len() >= space_left {
             self.size_len = 0;
             return SizeResult::Error {
                 error: ChunkedError::BadChunkSize,
                 consumed: input.len(),
             };
         }
+        let save_len = input.len();
+        self.size_buf[self.size_len..self.size_len + save_len].copy_from_slice(&input[..save_len]);
+        self.size_len += save_len;
 
         SizeResult::NeedMore {
             consumed: input.len(),
@@ -568,6 +575,33 @@ mod tests {
         let huge_size = "f".repeat(MAX_SIZE_LINE_LEN + 1);
         let input = format!("{huge_size}\r\n");
         let (progress, _) = dec.feed(input.as_bytes());
+        assert!(matches!(
+            progress,
+            ChunkedProgress::Failed(ChunkedError::BadChunkSize)
+        ));
+    }
+
+    #[test]
+    fn overlong_chunk_extension_rejected_when_line_arrives_at_once() {
+        let mut dec = ChunkedDecoder::new(1024);
+        let extension = "a".repeat(MAX_SIZE_LINE_LEN + 1);
+        let input = format!("1;{extension}\r\nx\r\n0\r\n\r\n");
+        let (progress, _) = dec.feed(input.as_bytes());
+        assert!(matches!(
+            progress,
+            ChunkedProgress::Failed(ChunkedError::BadChunkSize)
+        ));
+    }
+
+    #[test]
+    fn overlong_chunk_extension_rejected_across_feeds() {
+        let mut dec = ChunkedDecoder::new(1024);
+        let prefix = format!("1;{}", "a".repeat(MAX_SIZE_LINE_LEN - 3));
+        let (progress, consumed) = dec.feed(prefix.as_bytes());
+        assert!(matches!(progress, ChunkedProgress::NeedMore));
+        assert_eq!(consumed, prefix.len());
+
+        let (progress, _) = dec.feed(b"aa\r\nx\r\n0\r\n\r\n");
         assert!(matches!(
             progress,
             ChunkedProgress::Failed(ChunkedError::BadChunkSize)

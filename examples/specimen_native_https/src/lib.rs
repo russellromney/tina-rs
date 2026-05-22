@@ -3,9 +3,7 @@
 //! GET /missing`. Tokio side: hand-rolled `tokio + tokio-rustls`.
 //! Tina side: `tina_http::HttpsListener` + Counter isolate.
 //!
-//! HTTPS *client* coverage lives in `tina-http/tests/client_tls_smoke.rs`
-//! — Tina's single-worker TLS lane deadlocks if server + client share
-//! a runtime.
+//! HTTPS *client* coverage lives in `tina-http/tests/client_tls_smoke.rs`.
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
