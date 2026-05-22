@@ -4,6 +4,36 @@ This file records completed work.
 
 ## Unreleased
 
+### Durable Local State And IPC
+
+A local service can record work before doing it, restart, and resume or report
+the truth — without an exactly-once claim or a durable mailbox.
+
+- **`tina_runtime::DurableOutbox`** — a bounded, restart-survivable record of
+  local work. `enqueue` reserves a stable `WorkId` and frames a durable journal
+  record; a full outbox returns `OutboxFull` carrying the original work back. The
+  outbox is a sync state machine: it produces the bytes to append and consumes
+  the append result, so Tina still owns the `journal_append` / `journal_replay`
+  I/O and the outbox stays testable without a filesystem. First form is
+  at-least-once: after recovery, recorded-but-not-completed work may run again.
+- **Record-before-apply is a type rule.** `apply` requires a `RecordedWork`,
+  which only a successful durable record (or recovery of still-pending work)
+  produces — so apply-before-record cannot be written. `apply` consumes the
+  token, so the same work cannot be applied twice. A failed append returns the
+  original work in `AppendFailed`. Marking work complete is idempotent by
+  `WorkId` (`AlreadyCompleted`), not a silent success. Compile-fail proofs pin
+  both the apply-before-record and double-apply diagnostics.
+- **Recovery names the tail.** `DurableOutbox::recover` replays the journal into
+  a fresh outbox plus a `RecoveryReport`: pending work as ready-to-apply tokens,
+  the ids already completed, and a `TailStatus` separating a clean tail, a
+  repaired truncated tail, and an uncertain commit. A corrupt tail is rejected
+  by name as `RecoveryError::CorruptTail`; over-capacity replay is rejected as
+  `RecoveryError::OverCapacity`, keeping replay bounded. Completed work is listed
+  as completed, never resumed as pending. `OutboxShutdownReport` names pending,
+  abandoned, completed, and failed work at shutdown — no silent drop.
+- **Codec ordering integrity proven.** A length-delimited frame buffered before
+  an oversize one is still delivered intact; only the oversize frame is rejected.
+
 ### Runtime Fixes
 
 - **Process group cleanup holds the Linux leader pid until descendant cleanup.**

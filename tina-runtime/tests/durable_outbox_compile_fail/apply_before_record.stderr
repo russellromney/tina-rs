@@ -1,0 +1,15 @@
+error[E0308]: mismatched types
+  --> tests/durable_outbox_compile_fail/apply_before_record.rs:11:26
+   |
+11 |     let _ = outbox.apply(staged);
+   |                    ----- ^^^^^^ expected `RecordedWork<Vec<u8>>`, found `DurableWork<Vec<u8>>`
+   |                    |
+   |                    arguments to this method are incorrect
+   |
+   = note: expected struct `RecordedWork<Vec<u8>>`
+              found struct `DurableWork<Vec<u8>>`
+note: method defined here
+  --> src/durable_outbox.rs
+   |
+   |     pub fn apply(&mut self, recorded: RecordedWork<W>) -> ApplyStatus<W> {
+   |            ^^^^^

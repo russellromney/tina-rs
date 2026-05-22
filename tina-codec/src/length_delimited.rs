@@ -307,6 +307,18 @@ mod tests {
     }
 
     #[test]
+    fn valid_frame_before_oversize_frame_is_delivered_intact() {
+        // A complete valid frame, then an oversize declaration (5 > cap 4).
+        let mut framer = LengthDelimitedFramer::new(LengthPrefix::U8, 4);
+        framer.feed([3u8, b'a', b'b', b'c', 5u8, b'X']);
+        // The good frame comes out clean first...
+        assert_eq!(framer.next_frame(), FrameDecision::Frame(b"abc".to_vec()));
+        // ...and only the oversize frame is rejected. The malformed tail did
+        // not corrupt the valid frame that preceded it.
+        assert_eq!(framer.next_frame(), FrameDecision::Full);
+    }
+
+    #[test]
     fn rejects_frame_at_cap_plus_one() {
         let mut framer = LengthDelimitedFramer::new(LengthPrefix::U8, 4);
         framer.feed([5u8]);
