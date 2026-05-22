@@ -602,6 +602,7 @@ where
         // and drops the value. Trace still distinguishes via EffectKind.
         Effect::StopWith(_) => ErasedEffect::StopWith,
         Effect::RestartChildren => ErasedEffect::RestartChildren,
+        Effect::StopChildren => ErasedEffect::StopChildren,
         Effect::Call(call) => {
             let call = match call.into_runtime_parts() {
                 RuntimeCallParts::Backend {
@@ -732,6 +733,7 @@ where
     Fail,
     StopWith,
     RestartChildren,
+    StopChildren,
     Call(ErasedCall),
     Batch(Vec<ErasedEffect<S>>),
     ReplyTo {
@@ -757,6 +759,7 @@ where
             Self::Fail => EffectKind::Fail,
             Self::StopWith => EffectKind::StopWith,
             Self::RestartChildren => EffectKind::RestartChildren,
+            Self::StopChildren => EffectKind::StopChildren,
             Self::Call(_) => EffectKind::Call,
             Self::Batch(_) => EffectKind::Batch,
             Self::ReplyTo { .. } => EffectKind::ReplyTo,

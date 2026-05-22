@@ -778,6 +778,10 @@ where
                 self.restart_children(isolate_id, cause, round_messages);
                 false
             }
+            ErasedEffect::StopChildren => {
+                self.stop_children(isolate_id, cause, round_messages);
+                false
+            }
             ErasedEffect::Batch(effects) => {
                 let mut batch_context = call_context;
                 for subeffect in effects {
@@ -1125,6 +1129,47 @@ where
             if self.child_records[child_record_index].parent == parent {
                 self.restart_child_record(parent, child_record_index, cause, round_messages);
             }
+        }
+    }
+
+    /// Stops every live child owned by `parent` (explicit supervised
+    /// shutdown). Mirrors the live runtime: each child stops through the
+    /// normal path and is named by a `ChildStopped` fact under the parent.
+    pub(crate) fn stop_children(
+        &mut self,
+        parent: IsolateId,
+        cause: tina_runtime::CauseId,
+        round_messages: &mut [Option<DeliveredMessage>],
+    ) {
+        let children: Vec<(usize, RegisteredAddress)> = self
+            .child_records
+            .iter()
+            .filter(|record| record.parent == parent)
+            .map(|record| (record.child_ordinal, record.child))
+            .collect();
+        for (child_ordinal, child) in children {
+            let Some(entry_index) = self.entry_index(child) else {
+                continue;
+            };
+            if self.entries[entry_index].stopped.get() {
+                continue;
+            }
+            let stopped = self.push_event(
+                parent,
+                Some(cause),
+                RuntimeEventKind::ChildStopped {
+                    child_ordinal,
+                    child_isolate: child.isolate,
+                    child_generation: child.generation,
+                },
+            );
+            let precollected = round_messages.get_mut(entry_index).and_then(Option::take);
+            self.stop_entry_with_precollected(
+                entry_index,
+                child.isolate,
+                stopped.into(),
+                precollected,
+            );
         }
     }
 

@@ -37,6 +37,7 @@ impl Isolate for PanickingRestartFactoryRoot {
             LineageMsg::Stop => Effect::Stop,
             LineageMsg::Panic => panic!("panic inside panicking-factory root"),
             LineageMsg::Fail => Effect::Fail,
+            LineageMsg::StopChildren => Effect::StopChildren,
             LineageMsg::Restart | LineageMsg::SpawnGrandchild => Effect::Noop,
         }
     }
@@ -637,6 +638,62 @@ fn non_panic_child_failure_restarts_with_new_incarnation_and_rejects_stale_addre
     assert_eq!(report.restarts_completed, 1);
     assert_eq!(report.children.len(), 1);
     assert_eq!(report.children[0].latest_isolate, replacement);
+}
+
+#[test]
+fn stop_children_closes_owned_children_and_reports_them_without_stopping_owner() {
+    use crate::supervision_report::SupervisorReport;
+
+    let mut runtime = Runtime::new(TestShard, TestMailboxFactory);
+    let root = runtime.register(new_root(), root_mailbox());
+
+    assert_eq!(runtime.try_send(root, LineageMsg::SpawnChild), Ok(()));
+    assert_eq!(runtime.step(), 1);
+    let first_child = last_spawned_child(runtime.trace());
+    assert_eq!(runtime.try_send(root, LineageMsg::SpawnChild), Ok(()));
+    assert_eq!(runtime.step(), 1);
+    let second_child = last_spawned_child(runtime.trace());
+
+    // Both children accept messages before shutdown.
+    assert_eq!(
+        runtime.try_send(lineage_address(first_child), LineageMsg::SpawnChild),
+        Ok(())
+    );
+    assert_eq!(
+        runtime.try_send(lineage_address(second_child), LineageMsg::SpawnChild),
+        Ok(())
+    );
+
+    // The owner stops its children as an explicit supervised shutdown.
+    assert_eq!(runtime.try_send(root, LineageMsg::StopChildren), Ok(()));
+    assert_eq!(runtime.step(), 1);
+
+    // Both children are now closed; their pending messages were abandoned.
+    assert_eq!(
+        runtime.try_send(lineage_address(first_child), LineageMsg::SpawnChild),
+        Err(TrySendError::Closed(LineageMsg::SpawnChild))
+    );
+    assert_eq!(
+        runtime.try_send(lineage_address(second_child), LineageMsg::SpawnChild),
+        Err(TrySendError::Closed(LineageMsg::SpawnChild))
+    );
+
+    // The owner itself stayed up: plain Stop never cascades, and neither does
+    // StopChildren cascade to the owner.
+    assert_eq!(runtime.try_send(root, LineageMsg::SpawnChild), Ok(()));
+
+    // The report names every child the owner closed, under the owner.
+    let report = SupervisorReport::from_events(runtime.trace().iter(), root.isolate());
+    assert_eq!(report.children_stopped, 2);
+    let stopped: Vec<_> = report
+        .children
+        .iter()
+        .filter(|child| child.stopped_by_owner)
+        .map(|child| child.latest_isolate)
+        .collect();
+    assert_eq!(stopped.len(), 2);
+    assert!(stopped.contains(&first_child));
+    assert!(stopped.contains(&second_child));
 }
 
 #[test]

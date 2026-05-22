@@ -439,6 +439,7 @@ where
         tina::Effect::Fail => tina::Effect::Fail,
         tina::Effect::StopWith(result) => tina::Effect::StopWith(result),
         tina::Effect::RestartChildren => tina::Effect::RestartChildren,
+        tina::Effect::StopChildren => tina::Effect::StopChildren,
         tina::Effect::Call(call) => tina::Effect::Call(call),
         tina::Effect::Batch(effects) => {
             tina::Effect::Batch(effects.into_iter().map(remap_effect).collect())

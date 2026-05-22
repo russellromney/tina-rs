@@ -14,6 +14,12 @@
   `HandlerReportedFailure` fact, same supervision/restart path as panic, live +
   sim. Panic, typed failure, budget exhaustion, and supervisor-stop stay
   separate outcomes.
+- **Explicit supervised shutdown** (`Effect::StopChildren` / `stop_children()`):
+  an owner closes every child it owns; each child stops through the normal path
+  (callers settle) and is named by a `ChildStopped` fact under the owner. Plain
+  `Effect::Stop` is unchanged and never cascades, so the
+  `stopped_supervisor_rejects_later_child_failure_without_replacement` guarantee
+  holds. `SupervisorReport` counts and names the closed children.
 - **`SupervisorReport`**: typed terminal report (trace reader) naming children,
   restarts, skips, rejections, latest incarnation, and a distinct halt reason
   (budget exhausted vs supervisor stopped).
@@ -27,11 +33,10 @@
 
 ### Deferred (see `review.md` findings)
 
-- **Parent-stop child cleanup (Workstream B)**: not started. Today a parent stop
-  does not cascade to children, and an existing guarantee
-  (`stopped_supervisor_rejects_later_child_failure_without_replacement`) relies
-  on children outliving the parent. A blessed cleanup path must be opt-in
-  (supervised-shutdown), not a change to default `Effect::Stop`.
+- **Parent-stop child cleanup (Workstream B)**: core shipped as the opt-in
+  `Effect::StopChildren` (above). Still open: the owner-stop-while-child-has-an
+  -in-flight-call settle proof as a dedicated test, and a no-leaked-leases
+  /permits/body-charges assertion after the cascade.
 - **Cross-shard child ownership (Workstream D)**: not started. `spawn_isolate`
   is same-shard only and child records key on a shard-local `IsolateId`; live
   cross-shard ownership is a real architectural lift and warrants its own

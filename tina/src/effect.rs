@@ -72,6 +72,18 @@ where
     /// policy.
     RestartChildren,
 
+    /// Stop every child this isolate owns, as an explicit supervised
+    /// shutdown.
+    ///
+    /// Each owned child stops through the normal stop path — its mailbox
+    /// closes, its in-flight calls cancel so callers settle visibly, and a
+    /// `ChildStopped` fact names the child under this owner. The owner
+    /// itself keeps running; pair with [`Self::Stop`] (for example
+    /// `batch([stop_children(), stop()])`) for a full owner-then-children
+    /// shutdown. Plain [`Self::Stop`] is unchanged and never cascades, so
+    /// children that should outlive their parent still do.
+    StopChildren,
+
     /// Ask the runtime to perform one external operation on the isolate's
     /// behalf and deliver the result back later as an ordinary
     /// [`Isolate::Message`] value.
@@ -281,6 +293,16 @@ where
     I: Isolate,
 {
     Effect::Fail
+}
+
+/// Returns an effect that stops every child this isolate owns, as an explicit
+/// supervised shutdown. See [`Effect::StopChildren`]: each child settles its
+/// callers and is named by a `ChildStopped` fact; the owner keeps running.
+pub fn stop_children<I>() -> Effect<I>
+where
+    I: Isolate,
+{
+    Effect::StopChildren
 }
 
 /// Returns an effect that asks the runtime to restart this isolate's direct

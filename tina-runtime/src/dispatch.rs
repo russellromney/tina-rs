@@ -709,6 +709,10 @@ where
                 self.restart_children(isolate_id, cause, round_messages);
                 false
             }
+            ErasedEffect::StopChildren => {
+                self.stop_children(isolate_id, cause, round_messages);
+                false
+            }
             ErasedEffect::Call(call) => {
                 let requester = RegisteredAddress {
                     shard: self.shard.id(),
@@ -2178,6 +2182,50 @@ where
         }
     }
 
+    /// Stops every live child owned by `parent` (explicit supervised
+    /// shutdown). Each child stops through the normal path, so its callers
+    /// settle and its pending work is cancelled; a `ChildStopped` fact names
+    /// it under the parent. The parent is not touched.
+    pub(crate) fn stop_children(
+        &mut self,
+        parent: IsolateId,
+        cause: CauseId,
+        round_messages: &mut [Option<DeliveredMessage>],
+    ) {
+        // Snapshot first: stopping a child mutates `entries` and the GC, which
+        // would invalidate a borrow held across the loop.
+        let children: Vec<(usize, RegisteredAddress)> = self
+            .child_records
+            .iter()
+            .filter(|record| record.parent == parent)
+            .map(|record| (record.child_ordinal, record.child))
+            .collect();
+        for (child_ordinal, child) in children {
+            let Some(entry_index) = self.entry_index(child) else {
+                continue;
+            };
+            if self.entries[entry_index].stopped.get() {
+                continue;
+            }
+            let stopped = self.push_event(
+                parent,
+                Some(cause),
+                RuntimeEventKind::ChildStopped {
+                    child_ordinal,
+                    child_isolate: child.isolate,
+                    child_generation: child.generation,
+                },
+            );
+            let precollected = round_messages.get_mut(entry_index).and_then(Option::take);
+            self.stop_entry_with_precollected(
+                entry_index,
+                child.isolate,
+                stopped.into(),
+                precollected,
+            );
+        }
+    }
+
     pub(crate) fn supervise_failed_child(
         &mut self,
         failed_child: RegisteredAddress,
@@ -2891,6 +2939,7 @@ where
         Effect::Fail => ErasedEffect::Fail,
         Effect::StopWith(result) => ErasedEffect::StopWith(result),
         Effect::RestartChildren => ErasedEffect::RestartChildren,
+        Effect::StopChildren => ErasedEffect::StopChildren,
         Effect::Call(call) => ErasedEffect::Call(call.into_erased_call()),
         Effect::Batch(effects) => ErasedEffect::Batch(
             effects
@@ -2940,6 +2989,7 @@ where
         Effect::Fail => ErasedEffect::Fail,
         Effect::StopWith(result) => ErasedEffect::StopWith(result),
         Effect::RestartChildren => ErasedEffect::RestartChildren,
+        Effect::StopChildren => ErasedEffect::StopChildren,
         Effect::Call(call) => ErasedEffect::Call(call.into_erased_call()),
         Effect::Batch(effects) => ErasedEffect::Batch(
             effects
@@ -2986,6 +3036,7 @@ where
     Fail,
     StopWith(StopResult),
     RestartChildren,
+    StopChildren,
     Call(ErasedCall),
     Batch(Vec<ErasedEffect<S, F>>),
     ReplyTo {
@@ -3012,6 +3063,7 @@ where
             Self::Fail => EffectKind::Fail,
             Self::StopWith(_) => EffectKind::StopWith,
             Self::RestartChildren => EffectKind::RestartChildren,
+            Self::StopChildren => EffectKind::StopChildren,
             Self::Call(_) => EffectKind::Call,
             Self::Batch(_) => EffectKind::Batch,
             Self::ReplyTo { .. } => EffectKind::ReplyTo,

@@ -450,7 +450,7 @@ pub mod prelude {
         RequestContext, RequestDeferCancelableThrough, RequestDeferThrough, RequestEffect,
         RestartableChildDefinition, Shard, ShardId, SingleShard, SpawnObservedError, batch, fail,
         isolate, isolate_types, noop, reply, reply_to, reply_to_request, restart_children, send,
-        sequence, spawn, spawn_observed, stop, stop_with,
+        sequence, spawn, spawn_observed, stop, stop_children, stop_with,
         time::{
             Backoff, BackoffDelay, IntervalDelay, MissedTickPolicy, RecurringCatchUp,
             RecurringTick, RecurringTickDecision, RecurringTickReport, RecurringTickStale,

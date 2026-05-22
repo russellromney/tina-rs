@@ -73,6 +73,9 @@ pub struct ChildSupervision {
     pub skipped_not_restartable: u64,
     /// Restart attempts skipped because the replacement factory panicked.
     pub skipped_factory_panicked: u64,
+    /// The owner stopped this child via supervised shutdown
+    /// ([`tina::Effect::StopChildren`]).
+    pub stopped_by_owner: bool,
 }
 
 impl ChildSupervision {
@@ -85,6 +88,7 @@ impl ChildSupervision {
             restarts_completed: 0,
             skipped_not_restartable: 0,
             skipped_factory_panicked: 0,
+            stopped_by_owner: false,
         }
     }
 }
@@ -115,6 +119,9 @@ pub struct SupervisorReport {
     pub rejected_budget_exceeded: u64,
     /// Failures rejected because the supervisor parent had stopped.
     pub rejected_supervisor_stopped: u64,
+    /// Children the owner closed via supervised shutdown
+    /// ([`tina::Effect::StopChildren`]).
+    pub children_stopped: u64,
     /// The supervisor's final give-up reason, if it gave up. Reflects the
     /// last rejection seen in the slice.
     pub halt: Option<SupervisorHalt>,
@@ -138,6 +145,7 @@ impl SupervisorReport {
         let mut skipped_factory_panicked = 0u64;
         let mut rejected_budget_exceeded = 0u64;
         let mut rejected_supervisor_stopped = 0u64;
+        let mut children_stopped = 0u64;
         let mut halt = None;
 
         for event in events {
@@ -211,6 +219,19 @@ impl SupervisorReport {
                         }
                     }
                 }
+                RuntimeEventKind::ChildStopped {
+                    child_ordinal,
+                    child_isolate,
+                    child_generation,
+                } => {
+                    children_stopped += 1;
+                    let child = children.entry(child_ordinal).or_insert_with(|| {
+                        ChildSupervision::seed(child_ordinal, child_isolate, child_generation)
+                    });
+                    child.stopped_by_owner = true;
+                    child.latest_isolate = child_isolate;
+                    child.latest_generation = child_generation;
+                }
                 _ => {}
             }
         }
@@ -225,6 +246,7 @@ impl SupervisorReport {
             skipped_factory_panicked,
             rejected_budget_exceeded,
             rejected_supervisor_stopped,
+            children_stopped,
             halt,
             children: children.into_values().collect(),
         }
@@ -240,6 +262,7 @@ impl SupervisorReport {
             || self.skipped_factory_panicked > 0
             || self.rejected_budget_exceeded > 0
             || self.rejected_supervisor_stopped > 0
+            || self.children_stopped > 0
     }
 
     /// True if the supervisor stopped restarting a failed child.
@@ -254,7 +277,7 @@ impl fmt::Display for SupervisorReport {
             formatter,
             "supervisor parent={} spawned={} restarts[triggered={} attempted={} completed={}] \
              skipped[not_restartable={} factory_panicked={}] \
-             rejected[budget={} supervisor_stopped={}] halt={}",
+             rejected[budget={} supervisor_stopped={}] stopped_by_owner={} halt={}",
             self.parent.get(),
             self.children_spawned,
             self.restarts_triggered,
@@ -264,6 +287,7 @@ impl fmt::Display for SupervisorReport {
             self.skipped_factory_panicked,
             self.rejected_budget_exceeded,
             self.rejected_supervisor_stopped,
+            self.children_stopped,
             match self.halt {
                 None => "none".to_string(),
                 Some(SupervisorHalt::BudgetExhausted {
@@ -470,7 +494,39 @@ mod tests {
             report.to_string(),
             "supervisor parent=7 spawned=0 restarts[triggered=0 attempted=0 completed=0] \
              skipped[not_restartable=0 factory_panicked=0] \
-             rejected[budget=1 supervisor_stopped=0] halt=budget_exhausted(4/3)"
+             rejected[budget=1 supervisor_stopped=0] stopped_by_owner=0 halt=budget_exhausted(4/3)"
         );
+    }
+
+    #[test]
+    fn child_stopped_by_owner_is_counted_and_named() {
+        let events = [
+            event(
+                1,
+                PARENT,
+                RuntimeEventKind::ChildStopped {
+                    child_ordinal: 0,
+                    child_isolate: isolate(10),
+                    child_generation: generation(0),
+                },
+            ),
+            event(
+                2,
+                PARENT,
+                RuntimeEventKind::ChildStopped {
+                    child_ordinal: 1,
+                    child_isolate: isolate(20),
+                    child_generation: generation(0),
+                },
+            ),
+        ];
+        let report = SupervisorReport::from_events(events.iter(), isolate(PARENT));
+        assert_eq!(report.children_stopped, 2);
+        assert!(report.non_zero());
+        assert_eq!(report.children.len(), 2);
+        assert!(report.children[0].stopped_by_owner);
+        assert_eq!(report.children[0].latest_isolate, isolate(10));
+        assert!(report.children[1].stopped_by_owner);
+        assert_eq!(report.children[1].latest_isolate, isolate(20));
     }
 }

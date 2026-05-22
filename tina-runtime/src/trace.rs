@@ -84,6 +84,9 @@ pub enum EffectKind {
     /// The handler returned [`tina::Effect::RestartChildren`].
     RestartChildren,
 
+    /// The handler returned [`tina::Effect::StopChildren`].
+    StopChildren,
+
     /// The handler returned [`tina::Effect::Call`].
     Call,
 
@@ -545,6 +548,21 @@ pub enum RuntimeEventKind {
 
         /// The generation of the fresh replacement isolate.
         new_generation: AddressGeneration,
+    },
+
+    /// The runner stopped one owned child as part of a supervised shutdown
+    /// ([`tina::Effect::StopChildren`]). Recorded under the owning parent, so
+    /// a [`crate::SupervisorReport`] can name every child the owner closed;
+    /// the child's own stop is its separate `IsolateStopped`.
+    ChildStopped {
+        /// Stable per-parent child ordinal.
+        child_ordinal: usize,
+
+        /// The child incarnation that was stopped.
+        child_isolate: IsolateId,
+
+        /// The generation of the child incarnation that was stopped.
+        child_generation: AddressGeneration,
     },
 
     /// The runner applied the stopped state after observing [`tina::Effect::Stop`].
@@ -1081,6 +1099,7 @@ fn effect_kind_tag(effect: EffectKind) -> u8 {
         EffectKind::Reject => 12,
         EffectKind::Fact => 13,
         EffectKind::Fail => 14,
+        EffectKind::StopChildren => 15,
     }
 }
 
@@ -1467,8 +1486,18 @@ fn write_kind_stable(kind: RuntimeEventKind, hasher: &mut StableHasher) {
         RuntimeEventKind::MailboxAccepted => hasher.write_u8(1),
         RuntimeEventKind::HandlerStarted => hasher.write_u8(2),
         RuntimeEventKind::HandlerPanicked => hasher.write_u8(3),
-        // Appended (tag 37): keep tags append-only, never renumber.
+        // Appended (tags 37+): keep tags append-only, never renumber.
         RuntimeEventKind::HandlerReportedFailure => hasher.write_u8(37),
+        RuntimeEventKind::ChildStopped {
+            child_ordinal,
+            child_isolate,
+            child_generation,
+        } => {
+            hasher.write_u8(38);
+            hasher.write_u64(child_ordinal as u64);
+            hasher.write_u64(child_isolate.get());
+            hasher.write_u64(child_generation.get());
+        }
         RuntimeEventKind::HandlerFinished { effect } => {
             hasher.write_u8(4);
             hasher.write_u8(effect_kind_tag(effect));

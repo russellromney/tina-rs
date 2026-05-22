@@ -31,6 +31,7 @@ enum LineageMsg {
     Panic,
     Fail,
     Restart,
+    StopChildren,
 }
 
 type RunEvidence = (
@@ -246,6 +247,7 @@ impl Isolate for RootIsolate {
             LineageMsg::Panic => panic!("panic inside root lineage isolate"),
             LineageMsg::Fail => Effect::Fail,
             LineageMsg::Restart => Effect::RestartChildren,
+            LineageMsg::StopChildren => Effect::StopChildren,
             LineageMsg::SpawnGrandchild => Effect::Noop,
         }
     }
@@ -284,6 +286,7 @@ impl Isolate for RestartableRootIsolate {
             LineageMsg::Stop => Effect::Stop,
             LineageMsg::Panic => panic!("panic inside restartable root isolate"),
             LineageMsg::Fail => Effect::Fail,
+            LineageMsg::StopChildren => Effect::StopChildren,
             LineageMsg::SpawnGrandchild => Effect::Noop,
         }
     }
@@ -312,6 +315,7 @@ impl Isolate for ChildIsolate {
             LineageMsg::Panic => panic!("panic inside child lineage isolate"),
             LineageMsg::Fail => Effect::Fail,
             LineageMsg::Restart => Effect::RestartChildren,
+            LineageMsg::StopChildren => Effect::StopChildren,
             LineageMsg::SpawnChild => Effect::Noop,
         }
     }

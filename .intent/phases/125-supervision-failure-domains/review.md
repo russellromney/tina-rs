@@ -48,6 +48,12 @@ capability gaps, and the design tensions a follow-up must respect.
 3. `FairnessReport` + `StarvationWarning` — per-isolate turns/timer-ticks,
    hot-vs-quiet + timer-under-load proof. Progress is turns and timers, not a
    wall-clock promise.
+4. `Effect::StopChildren` / `stop_children()` — explicit supervised shutdown.
+   Owner closes every owned child (callers settle), each named by a
+   `ChildStopped` fact under the owner; default `Effect::Stop` unchanged.
+   `SupervisorReport` counts/names the closed children. Live + sim, replay-
+   stable; new trace tags append-only (`ChildStopped` = 38,
+   `EffectKind::StopChildren` = 15).
 
 Tests: `tina-runtime` lib (501) and `tina-sim` lib (54) green; sim
 `supervision_simulation` (12) and `multishard_dispatcher` green; clippy clean on
@@ -55,27 +61,25 @@ Tests: `tina-runtime` lib (501) and `tina-sim` lib (54) green; sim
 
 ## Open capability gaps
 
-### B — parent-stop child cleanup (not started)
+### B — parent-stop child cleanup (core shipped; tail open)
 
-Today (`tina-runtime/src/dispatch.rs::stop_entry_full`) a parent stop closes
-only the parent's own mailbox and cancels only the parent's own calls. Children
-keep running and are GC'd only once no child record references the stopped
-entry.
+Shipped as the opt-in `Effect::StopChildren`: the owner walks its `child_records`
+and stops each live child through the normal path (mailbox closed, pending calls
+cancelled → callers settle), emitting a `ChildStopped` fact per child under the
+owner. Default `Effect::Stop` is untouched, so the pinned guarantee
+`stopped_supervisor_rejects_later_child_failure_without_replacement` (which needs
+children to outlive a plain parent stop) still holds. A parent does a full
+shutdown with `batch([stop_children(), stop()])`.
 
-Tension to respect: the existing test
-`stopped_supervisor_rejects_later_child_failure_without_replacement` sends a
-panic to a child *after* its supervisor parent has stopped and asserts
-`SupervisorRestartRejected { SupervisorStopped }`. That only holds because the
-child outlives the parent. So cascade-stop-on-parent-stop cannot become the
-default `Effect::Stop` behavior without breaking a pinned guarantee.
-
-Suggested shape: a separate opt-in "supervised shutdown" (e.g.
-`Effect::StopChildren`, or a supervisor-config flag) that (1) marks the parent
-stopping / stops admission, (2) walks `child_records` for that parent and stops
-each child with a distinct cause, (3) emits a terminal report. Leave plain
-`Effect::Stop` unchanged. The "owner stop while child has in-flight call settles
-caller visibly" proof belongs here, alongside a no-leaked-leases/permits/pending
-proof.
+Still open:
+- A dedicated "owner stop while a child has an in-flight call settles the caller
+  visibly" test. The settle already happens (the child's `stop_entry` cancels
+  pending calls), but it deserves its own named proof.
+- A no-leaked-leases/permits/body-charges/pending-calls assertion after the
+  cascade (compose `SupervisorReport` with the pressure/capacity readers).
+- `StopChildren` stops direct children only; grandchildren of a stopped child
+  are orphaned exactly as they are after any isolate stop today. If recursive
+  shutdown is wanted, that is a follow-up decision.
 
 ### D — cross-shard child ownership (not started, largest lift)
 

@@ -18,12 +18,19 @@ one new typed failure outcome.
   unsupervised one just stops. Panic and reported failure never collapse into
   one outcome. Wired through both effect erasers, the live dispatcher, and the
   simulator, so live and replayed runs agree; new trace tags are append-only.
+- **`tina::Effect::StopChildren` (and `tina::stop_children()`)** — an explicit
+  supervised shutdown. An owner stops every child it owns; each child stops
+  through the normal path so its callers settle and a `ChildStopped` fact names
+  it under the owner. The owner keeps running — pair with `stop()` for a full
+  owner-then-children shutdown. Plain `Effect::Stop` is unchanged and never
+  cascades, so children meant to outlive their parent still do.
 - **`tina_runtime::SupervisorReport`** — a typed terminal supervision summary,
   folded from the trace for one owner (mirrors `PressureSummary::from_events`).
   Names children by stable ordinal with their latest incarnation, counts restart
-  triggers / attempts / completions / skips / rejections, and reports a distinct
-  halt reason (budget exhausted vs supervisor stopped). Composes with the
-  pressure and capacity readers over the same event slice.
+  triggers / attempts / completions / skips / rejections, counts children the
+  owner closed via supervised shutdown, and reports a distinct halt reason
+  (budget exhausted vs supervisor stopped). Composes with the pressure and
+  capacity readers over the same event slice.
 - **`tina_runtime::FairnessReport`** — per-isolate handler-turn and timer-tick
   counts folded from the trace, plus a typed `StarvationWarning` that names the
   victim and the hot isolate rather than hiding a progress gap. Progress is turns

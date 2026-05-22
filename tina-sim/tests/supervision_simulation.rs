@@ -85,6 +85,7 @@ enum ParentMsg {
     SpawnOne,
     SpawnTwo,
     RestartChildren,
+    StopChildren,
 }
 
 #[derive(Debug)]
@@ -126,6 +127,7 @@ impl Isolate for RestartableParent {
                 Effect::Batch(vec![Effect::Spawn(self.spec()), Effect::Spawn(self.spec())])
             }
             ParentMsg::RestartChildren => Effect::RestartChildren,
+            ParentMsg::StopChildren => Effect::StopChildren,
         }
     }
 }
@@ -170,6 +172,7 @@ impl Isolate for DynamicBootstrapParent {
                 )
             }
             ParentMsg::RestartChildren => Effect::RestartChildren,
+            ParentMsg::StopChildren => Effect::StopChildren,
             ParentMsg::SpawnTwo => unreachable!("dynamic parent only spawns one child"),
         }
     }
@@ -206,6 +209,7 @@ impl Isolate for OneShotParent {
                 .with_initial_message(WorkerMsg::Boot),
             ),
             ParentMsg::RestartChildren => Effect::RestartChildren,
+            ParentMsg::StopChildren => Effect::StopChildren,
             ParentMsg::SpawnTwo => unreachable!("one-shot parent only spawns one child"),
         }
     }
@@ -352,6 +356,7 @@ impl Isolate for NestedParent {
                 )
             }
             ParentMsg::RestartChildren => Effect::RestartChildren,
+            ParentMsg::StopChildren => Effect::StopChildren,
             ParentMsg::SpawnTwo => unreachable!("nested parent only spawns one child"),
         }
     }
@@ -797,6 +802,46 @@ fn non_panic_child_failure_start_fail_restart_stop_sequence_is_replayable() {
     let restarts = completed_restarts(&trace);
     assert_eq!(restarts.len(), 1, "the failed child must be restarted once");
     assert_eq!(restarts[0].0, first, "restart must replace the failed child");
+}
+
+#[test]
+fn stop_children_closes_owned_children_and_replays() {
+    fn run() -> Vec<RuntimeEvent> {
+        let observations = Rc::new(RefCell::new(Vec::new()));
+        let mut sim = Simulator::new(TestShard, SimulatorConfig::default());
+        let parent = sim.register(RestartableParent { observations });
+        sim.try_send(parent, ParentMsg::SpawnTwo).unwrap();
+        sim.run_until_quiescent();
+
+        sim.try_send(parent, ParentMsg::StopChildren).unwrap();
+        sim.run_until_quiescent();
+        sim.trace().to_vec()
+    }
+
+    let trace = run();
+    let replayed = run();
+    assert_eq!(trace, replayed, "supervised shutdown must replay identically");
+
+    let children = spawned_children(&trace);
+    assert_eq!(children.len(), 2, "two children were spawned");
+
+    // Both children were closed by the owner, each named under the parent.
+    let stopped: Vec<IsolateId> = trace
+        .iter()
+        .filter_map(|event| match event.kind() {
+            RuntimeEventKind::ChildStopped { child_isolate, .. } => Some(child_isolate),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(stopped.len(), 2);
+    for child in &children {
+        assert!(stopped.contains(child), "child {child:?} must be stopped");
+        assert!(
+            trace.iter().any(|event| event.isolate() == *child
+                && matches!(event.kind(), RuntimeEventKind::IsolateStopped)),
+            "stopped child must record its own IsolateStopped"
+        );
+    }
 }
 
 #[test]
