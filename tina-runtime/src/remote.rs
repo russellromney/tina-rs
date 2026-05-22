@@ -18,13 +18,15 @@ use crate::call::{CallId, CallOutcome};
 use crate::mailbox::MailboxFactory;
 use crate::trace::{CallReplyRejectedReason, CauseId, RuntimeEventKind, SendRejectedReason};
 use crate::{
-    ErasedMessage, ErasedSend, MessageCallContext, RegisteredAddress, Runtime,
-    call_reply_reason_for_cause,
+    ErasedMessage, ErasedSend, MessageCallContext, PendingRemoteSpawn, RegisteredAddress, Runtime,
+    SendErasedSpawn, call_reply_reason_for_cause,
 };
 
 pub(crate) enum QueuedRemoteEnvelope {
     Send(QueuedRemoteSend),
     CallReply(RemoteCallReply),
+    SpawnRequest(RemoteSpawnRequest),
+    SpawnReply(RemoteSpawnReply),
 }
 
 impl QueuedRemoteEnvelope {
@@ -32,8 +34,31 @@ impl QueuedRemoteEnvelope {
         match self {
             Self::Send(send) => send.send.target_shard,
             Self::CallReply(reply) => reply.requester.shard,
+            Self::SpawnRequest(request) => request.target_shard,
+            Self::SpawnReply(reply) => reply.requester.shard,
         }
     }
+}
+
+/// A cross-shard `spawn_observed(...).on_shard(B)` request. The `payload` is a
+/// type-erased `Box<dyn SendErasedSpawn<S, F>>` (boxed as `Any` so the
+/// monomorphic envelope can carry it); the destination shard — same `S, F` —
+/// downcasts it back, registers the child, and replies.
+pub(crate) struct RemoteSpawnRequest {
+    pub(crate) request_id: CallId,
+    pub(crate) target_shard: ShardId,
+    pub(crate) owner: RegisteredAddress,
+    pub(crate) payload: Box<dyn Any + Send>,
+    pub(crate) cause: CauseId,
+}
+
+/// The reply to a [`RemoteSpawnRequest`]: the new child's address, or the
+/// spawn error, routed back to the owner shard.
+pub(crate) struct RemoteSpawnReply {
+    pub(crate) request_id: CallId,
+    pub(crate) requester: RegisteredAddress,
+    pub(crate) cause: CauseId,
+    pub(crate) outcome: Result<RegisteredAddress, tina::SpawnObservedError>,
 }
 
 pub(crate) fn remote_call_outcome_envelope(
@@ -105,6 +130,10 @@ impl SendableQueuedRemoteSend {
 pub(crate) enum SendableQueuedRemoteEnvelope {
     Send(SendableQueuedRemoteSend),
     CallReply(SendableRemoteCallReply),
+    // Spawn request/reply payloads are already `Send`, so they cross threads
+    // unchanged — no separate sendable mirror is needed.
+    SpawnRequest(RemoteSpawnRequest),
+    SpawnReply(RemoteSpawnReply),
 }
 
 impl SendableQueuedRemoteEnvelope {
@@ -118,6 +147,8 @@ impl SendableQueuedRemoteEnvelope {
             QueuedRemoteEnvelope::CallReply(reply) => {
                 Self::CallReply(SendableRemoteCallReply::new(reply))
             }
+            QueuedRemoteEnvelope::SpawnRequest(request) => Self::SpawnRequest(request),
+            QueuedRemoteEnvelope::SpawnReply(reply) => Self::SpawnReply(reply),
         }
     }
 
@@ -127,6 +158,8 @@ impl SendableQueuedRemoteEnvelope {
             Self::CallReply(reply) => {
                 QueuedRemoteEnvelope::CallReply(reply.into_remote_call_reply())
             }
+            Self::SpawnRequest(request) => QueuedRemoteEnvelope::SpawnRequest(request),
+            Self::SpawnReply(reply) => QueuedRemoteEnvelope::SpawnReply(reply),
         }
     }
 }
@@ -252,13 +285,95 @@ where
     pub(crate) fn harvest_remote_envelope(
         &mut self,
         queued: QueuedRemoteEnvelope,
-    ) -> Option<QueuedRemoteEnvelope> {
+    ) -> Option<QueuedRemoteEnvelope>
+    where
+        S: 'static,
+        F: 'static,
+    {
         match queued {
             QueuedRemoteEnvelope::Send(send) => self.harvest_remote_send(send),
             QueuedRemoteEnvelope::CallReply(reply) => {
                 self.harvest_remote_call_reply(reply);
                 None
             }
+            QueuedRemoteEnvelope::SpawnRequest(request) => self.harvest_remote_spawn_request(request),
+            QueuedRemoteEnvelope::SpawnReply(reply) => {
+                self.harvest_remote_spawn_reply(reply);
+                None
+            }
+        }
+    }
+
+    /// Destination-shard harvest of a cross-shard spawn request: recover the
+    /// `Send`-erased spawn (boxed as `Any`; same `S, F` here so the downcast
+    /// succeeds), register the child, and reply with its address.
+    pub(crate) fn harvest_remote_spawn_request(
+        &mut self,
+        request: RemoteSpawnRequest,
+    ) -> Option<QueuedRemoteEnvelope>
+    where
+        S: 'static,
+        F: 'static,
+    {
+        let RemoteSpawnRequest {
+            request_id,
+            target_shard: _,
+            owner,
+            payload,
+            cause,
+        } = request;
+        let outcome = match payload.downcast::<Box<dyn SendErasedSpawn<S, F>>>() {
+            Ok(spawn) => (*spawn).spawn_remote(self, owner, cause),
+            // Defensive: only this runtime's own boxed spawn type is ever sent.
+            Err(_) => Err(tina::SpawnObservedError::ZeroMailboxCapacity),
+        };
+        Some(QueuedRemoteEnvelope::SpawnReply(RemoteSpawnReply {
+            request_id,
+            requester: owner,
+            cause,
+            outcome,
+        }))
+    }
+
+    /// Owner-shard harvest of a cross-shard spawn reply: record the
+    /// `ChildStarted` truth and run the held continuation into the owner's
+    /// mailbox so the parent learns the child's address.
+    pub(crate) fn harvest_remote_spawn_reply(&mut self, reply: RemoteSpawnReply) {
+        let RemoteSpawnReply {
+            request_id,
+            requester: _,
+            cause,
+            outcome,
+        } = reply;
+        let Some(index) = self
+            .pending_remote_spawns
+            .iter()
+            .position(|pending| pending.request_id == request_id)
+        else {
+            return;
+        };
+        let pending: PendingRemoteSpawn = self.pending_remote_spawns.remove(index);
+        // The owner address comes from the pending record we kept, not the
+        // reply, so a stray reply cannot redirect the continuation.
+        let requester = pending.requester;
+        if let Ok(child) = &outcome {
+            self.push_event(
+                requester.isolate,
+                Some(cause),
+                RuntimeEventKind::ChildStarted {
+                    child_shard: child.shard,
+                    child_isolate: child.isolate,
+                    child_generation: child.generation,
+                },
+            );
+        }
+        let message = (pending.continuation)(outcome);
+        if let Some(entry_index) = self
+            .entries
+            .iter()
+            .position(|entry| entry.id == requester.isolate && entry.generation == requester.generation)
+        {
+            let _ = self.enqueue_entry_message(entry_index, message.into_any(), None);
         }
     }
 

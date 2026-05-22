@@ -398,7 +398,7 @@ where
 
 impl<I> Isolate for BridgeGuard<I>
 where
-    I: Isolate<SpawnObserved = Infallible>,
+    I: Isolate<SpawnObserved = Infallible, SpawnObservedRemote = Infallible>,
     I::Message: BridgeMessage,
 {
     type Message = I::Message;
@@ -425,7 +425,7 @@ where
 
 fn remap_effect<I>(effect: tina::Effect<I>) -> tina::Effect<BridgeGuard<I>>
 where
-    I: Isolate<SpawnObserved = Infallible>,
+    I: Isolate<SpawnObserved = Infallible, SpawnObservedRemote = Infallible>,
     I::Message: BridgeMessage,
 {
     match effect {
@@ -435,6 +435,7 @@ where
         tina::Effect::Send(send) => tina::Effect::Send(send),
         tina::Effect::Spawn(spawn) => tina::Effect::Spawn(spawn),
         tina::Effect::SpawnObserved(spawn) => match spawn {},
+        tina::Effect::SpawnObservedOn(spawn) => match spawn {},
         tina::Effect::Stop => tina::Effect::Stop,
         tina::Effect::Fail => tina::Effect::Fail,
         tina::Effect::StopWith(result) => tina::Effect::StopWith(result),
@@ -653,6 +654,7 @@ where
                 Send = TinaOutbound<Outbound>,
                 Spawn = Infallible,
                 SpawnObserved = Infallible,
+                SpawnObservedRemote = Infallible,
             > + Send
             + 'static,
         I::Message: BridgeMessage + From<BridgeRequest<M, R>> + Send + 'static,

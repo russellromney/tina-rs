@@ -15,7 +15,7 @@ use crate::clock::MonotonicClock;
 use crate::mailbox::MailboxFactory;
 use crate::sharded::ReplyAdapter;
 use crate::trace::{RuntimeEvent, SendRejectedReason};
-use crate::{IdSource, IntoErasedSpawn, IntoErasedSpawnObserved, QueuedRemoteEnvelope, Runtime};
+use crate::{IdSource, IntoErasedSpawn, IntoErasedSpawnObserved, IntoSendErasedSpawnObserved, QueuedRemoteEnvelope, Runtime};
 
 type RemoteQueueIndexes = BTreeMap<(ShardId, ShardId), usize>;
 type RemoteQueues = Vec<VecDeque<QueuedRemoteEnvelope>>;
@@ -172,6 +172,7 @@ where
         I::Reply: 'static,
         I::Spawn: IntoErasedSpawn<S, F> + 'static,
         I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
+        I::SpawnObservedRemote: IntoSendErasedSpawnObserved<S, F, I::Message> + 'static,
         I::Call: IntoErasedCall<I::Message> + 'static,
         I::Fact: crate::fact::IntoRuntimeFact + 'static,
         Outbound: 'static,
@@ -196,6 +197,7 @@ where
         I::Reply: 'static,
         I::Spawn: IntoErasedSpawn<S, F> + 'static,
         I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
+        I::SpawnObservedRemote: IntoSendErasedSpawnObserved<S, F, I::Message> + 'static,
         I::Call: IntoErasedCall<I::Message> + 'static,
         I::Fact: crate::fact::IntoRuntimeFact + 'static,
         Outbound: 'static,
@@ -219,6 +221,7 @@ where
         I::Reply: 'static,
         I::Spawn: IntoErasedSpawn<S, F> + 'static,
         I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
+        I::SpawnObservedRemote: IntoSendErasedSpawnObserved<S, F, I::Message> + 'static,
         I::Call: IntoErasedCall<I::Message> + 'static,
         I::Fact: crate::fact::IntoRuntimeFact + 'static,
         Outbound: 'static,

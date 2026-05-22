@@ -38,7 +38,7 @@ use crate::mailbox::MailboxFactory;
 use crate::trace::{CauseId, RuntimeEventKind};
 use crate::{
     AnyMailboxAdapter, ChildRecord, DeliveredMessage, ErasedMailbox, HandlerAdapter,
-    IntoErasedSpawn, IntoErasedSpawnObserved, MailboxAdapter, MessageCallContext,
+    IntoErasedSpawn, IntoErasedSpawnObserved, IntoSendErasedSpawnObserved, MailboxAdapter, MessageCallContext,
     RegisteredAddress, RegisteredEntry, Runtime, SendOnlyServiceHandle, SendableHandlerAdapter,
     ServiceHandle, SpawnOutcome, SplitServiceHandle, SupervisorRecord,
 };
@@ -63,6 +63,7 @@ where
         I::Reply: 'static,
         I::Spawn: IntoErasedSpawn<S, F> + 'static,
         I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
+        I::SpawnObservedRemote: IntoSendErasedSpawnObserved<S, F, I::Message> + 'static,
         I::Call: IntoErasedCall<I::Message> + 'static,
         I::Fact: IntoRuntimeFact + 'static,
         Outbound: 'static,
@@ -93,6 +94,7 @@ where
         I::Reply: 'static,
         I::Spawn: IntoErasedSpawn<S, F> + 'static,
         I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
+        I::SpawnObservedRemote: IntoSendErasedSpawnObserved<S, F, I::Message> + 'static,
         I::Call: IntoErasedCall<I::Message> + 'static,
         I::Fact: IntoRuntimeFact + 'static,
         Outbound: 'static,
@@ -173,6 +175,7 @@ where
         I::Reply: 'static,
         I::Spawn: IntoErasedSpawn<S, F> + 'static,
         I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
+        I::SpawnObservedRemote: IntoSendErasedSpawnObserved<S, F, I::Message> + 'static,
         I::Call: IntoErasedCall<I::Message> + 'static,
         I::Fact: IntoRuntimeFact + 'static,
         Outbound: 'static,
@@ -198,6 +201,7 @@ where
         I::Message: 'static,
         I::Spawn: IntoErasedSpawn<S, F> + 'static,
         I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
+        I::SpawnObservedRemote: IntoSendErasedSpawnObserved<S, F, I::Message> + 'static,
         I::Call: IntoErasedCall<I::Message> + 'static,
         I::Fact: IntoRuntimeFact + 'static,
         Outbound: 'static,
@@ -233,6 +237,7 @@ where
         I::Reply: 'static,
         I::Spawn: IntoErasedSpawn<S, F> + 'static,
         I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
+        I::SpawnObservedRemote: IntoSendErasedSpawnObserved<S, F, I::Message> + 'static,
         I::Call: IntoErasedCall<I::Message> + 'static,
         I::Fact: IntoRuntimeFact + 'static,
         Outbound: 'static,
@@ -267,6 +272,7 @@ where
         I::Reply: 'static,
         I::Spawn: IntoErasedSpawn<S, F> + 'static,
         I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
+        I::SpawnObservedRemote: IntoSendErasedSpawnObserved<S, F, I::Message> + 'static,
         I::Call: IntoErasedCall<I::Message> + 'static,
         I::Fact: IntoRuntimeFact + 'static,
         Outbound: 'static,
@@ -327,6 +333,7 @@ where
         I::Reply: 'static,
         I::Spawn: IntoErasedSpawn<S, F> + 'static,
         I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
+        I::SpawnObservedRemote: IntoSendErasedSpawnObserved<S, F, I::Message> + 'static,
         I::Call: IntoErasedCall<I::Message> + 'static,
         I::Fact: IntoRuntimeFact + 'static,
         Outbound: 'static,
@@ -544,6 +551,7 @@ where
         I::Reply: 'static,
         I::Spawn: IntoErasedSpawn<S, F> + 'static,
         I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
+        I::SpawnObservedRemote: IntoSendErasedSpawnObserved<S, F, I::Message> + 'static,
         I::Call: IntoErasedCall<I::Message> + 'static,
         I::Fact: IntoRuntimeFact + 'static,
         Outbound: 'static,
@@ -575,6 +583,51 @@ where
         }
     }
 
+    /// Registers a child shipped from another shard via
+    /// `spawn_observed(...).on_shard(this_shard)`. The child has no *local*
+    /// parent (its owner lives on `owner`'s shard); it registers, records its
+    /// `Spawned` fact, and enqueues any bootstrap. Returns the new address for
+    /// the spawn reply to carry back to the owner.
+    pub(crate) fn register_remote_child<I, Outbound>(
+        &mut self,
+        isolate: I,
+        mailbox_capacity: usize,
+        bootstrap_message: Option<I::Message>,
+        _owner: RegisteredAddress,
+        cause: CauseId,
+    ) -> RegisteredAddress
+    where
+        I: Isolate<Shard = S, Send = TinaOutbound<Outbound>> + 'static,
+        I::Message: 'static,
+        I::Reply: 'static,
+        I::Spawn: IntoErasedSpawn<S, F> + 'static,
+        I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
+        I::SpawnObservedRemote: IntoSendErasedSpawnObserved<S, F, I::Message> + 'static,
+        I::Call: IntoErasedCall<I::Message> + 'static,
+        I::Fact: IntoRuntimeFact + 'static,
+        Outbound: 'static,
+    {
+        let child = self.register_entry::<I, Outbound>(
+            isolate,
+            None,
+            Box::new(AnyMailboxAdapter {
+                mailbox: self
+                    .mailbox_factory
+                    .create::<Box<dyn Any>>(mailbox_capacity),
+            }),
+        );
+        let child_isolate = child.isolate;
+        let spawned = self.push_event(
+            child_isolate,
+            Some(cause),
+            RuntimeEventKind::Spawned { child_isolate },
+        );
+        if let Some(message) = bootstrap_message {
+            self.enqueue_bootstrap_message(child, Box::new(message), spawned.into());
+        }
+        child
+    }
+
     pub(crate) fn register_sendable_with_capacity<I, Outbound>(
         &mut self,
         isolate: I,
@@ -586,6 +639,7 @@ where
         I::Reply: Send + 'static,
         I::Spawn: IntoErasedSpawn<S, F> + 'static,
         I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
+        I::SpawnObservedRemote: IntoSendErasedSpawnObserved<S, F, I::Message> + 'static,
         I::Call: IntoErasedCall<I::Message> + 'static,
         I::Fact: IntoRuntimeFact + 'static,
         Outbound: Send + 'static,
@@ -616,6 +670,7 @@ where
         I::Reply: Send + 'static,
         I::Spawn: IntoErasedSpawn<S, F> + 'static,
         I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
+        I::SpawnObservedRemote: IntoSendErasedSpawnObserved<S, F, I::Message> + 'static,
         I::Call: IntoErasedCall<I::Message> + 'static,
         I::Fact: IntoRuntimeFact + 'static,
         Outbound: Send + 'static,
@@ -655,6 +710,7 @@ where
         I::Reply: Send + 'static,
         I::Spawn: IntoErasedSpawn<S, F> + 'static,
         I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
+        I::SpawnObservedRemote: IntoSendErasedSpawnObserved<S, F, I::Message> + 'static,
         I::Call: IntoErasedCall<I::Message> + 'static,
         I::Fact: IntoRuntimeFact + 'static,
         Outbound: Send + 'static,
@@ -699,6 +755,7 @@ where
         I::Reply: 'static,
         I::Spawn: IntoErasedSpawn<S, F> + 'static,
         I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
+        I::SpawnObservedRemote: IntoSendErasedSpawnObserved<S, F, I::Message> + 'static,
         I::Call: IntoErasedCall<I::Message> + 'static,
         I::Fact: IntoRuntimeFact + 'static,
         Outbound: 'static,

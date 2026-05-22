@@ -130,8 +130,9 @@ use remote::{QueuedRemoteEnvelope, SendableQueuedRemoteEnvelope};
 
 pub(crate) use dispatch::{
     AnyMailboxAdapter, ChildRecord, ErasedMailbox, ErasedMessage, ErasedSend, HandlerAdapter,
-    IntoErasedSpawn, IntoErasedSpawnObserved, MailboxAdapter, RegisteredAddress, RegisteredEntry,
-    SendableHandlerAdapter, SpawnOutcome, SupervisorRecord,
+    IntoErasedSpawn, IntoErasedSpawnObserved, IntoSendErasedSpawnObserved, MailboxAdapter,
+    PendingRemoteSpawn, RegisteredAddress, RegisteredEntry, SendErasedSpawn, SendableHandlerAdapter,
+    SpawnOutcome, SupervisorRecord,
 };
 #[cfg(test)]
 pub(crate) use dispatch::{ChildRecordSnapshot, SupervisorRecordSnapshot};
@@ -346,6 +347,9 @@ where
     pub(crate) pending_isolate_calls: Vec<PendingIsolateCall>,
     pub(crate) pending_isolate_call_indexes: HashMap<CallId, usize>,
     pub(crate) pending_isolate_call_deadlines: BTreeMap<(Instant, u64), CallId>,
+    /// Cross-shard `spawn_observed(...).on_shard(...)` requests awaiting their
+    /// address reply from the destination shard. Keyed by request id.
+    pub(crate) pending_remote_spawns: Vec<PendingRemoteSpawn>,
     pub(crate) round_messages: Vec<Option<DeliveredMessage>>,
     pub(crate) driver_completions: Vec<DriverCompletion>,
     pub(crate) next_isolate_call_ordinal: u64,
@@ -635,6 +639,7 @@ where
             pending_isolate_calls: Vec::with_capacity(preallocation.call_capacity),
             pending_isolate_call_indexes: HashMap::with_capacity(preallocation.call_capacity),
             pending_isolate_call_deadlines: BTreeMap::new(),
+            pending_remote_spawns: Vec::new(),
             round_messages: Vec::with_capacity(preallocation.round_scratch_capacity),
             driver_completions: Vec::with_capacity(preallocation.call_capacity),
             next_isolate_call_ordinal: 0,

@@ -931,9 +931,12 @@ mod tests {
             Effect::Send(_) => shape.send += 1,
             Effect::Spawn(_) => shape.spawn += 1,
             Effect::SpawnObserved(_) => shape.spawn_observed += 1,
+            Effect::SpawnObservedOn(_) => shape.spawn_observed += 1,
             Effect::Stop => shape.stop += 1,
+            Effect::Fail => shape.stop += 1,
             Effect::StopWith(_) => shape.stop_with += 1,
             Effect::RestartChildren => shape.restart += 1,
+            Effect::StopChildren => shape.restart += 1,
             Effect::Call(_) => shape.call += 1,
             Effect::Batch(items) => {
                 for item in items {

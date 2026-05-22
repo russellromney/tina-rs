@@ -37,7 +37,7 @@ use crate::observer::TraceObserver;
 use crate::shutdown::{SharedShutdownState, ShutdownWorker, ThreadedShutdownHandle, handle_for};
 use crate::trace::{CallKind, RuntimeEvent};
 use crate::{
-    IdSource, IntoErasedSpawn, IntoErasedSpawnObserved, PreallocationConfig, Runtime,
+    IdSource, IntoErasedSpawn, IntoErasedSpawnObserved, IntoSendErasedSpawnObserved, PreallocationConfig, Runtime,
     TraceRetention,
 };
 
@@ -351,6 +351,7 @@ where
         I::Reply: 'static,
         I::Spawn: IntoErasedSpawn<S, F> + 'static,
         I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
+        I::SpawnObservedRemote: IntoSendErasedSpawnObserved<S, F, I::Message> + 'static,
         I::Call: IntoErasedCall<I::Message> + 'static,
         I::Fact: crate::fact::IntoRuntimeFact + 'static,
         Outbound: 'static,
@@ -382,6 +383,7 @@ where
         I::Reply: 'static,
         I::Spawn: IntoErasedSpawn<S, F> + 'static,
         I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
+        I::SpawnObservedRemote: IntoSendErasedSpawnObserved<S, F, I::Message> + 'static,
         I::Call: IntoErasedCall<I::Message> + 'static,
         I::Fact: crate::fact::IntoRuntimeFact + 'static,
         Outbound: 'static,
@@ -407,6 +409,7 @@ where
         I::Message: 'static,
         I::Spawn: IntoErasedSpawn<S, F> + 'static,
         I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
+        I::SpawnObservedRemote: IntoSendErasedSpawnObserved<S, F, I::Message> + 'static,
         I::Call: IntoErasedCall<I::Message> + 'static,
         I::Fact: crate::fact::IntoRuntimeFact + 'static,
         Outbound: 'static,
@@ -438,6 +441,7 @@ where
         I::Reply: 'static,
         I::Spawn: IntoErasedSpawn<S, F> + 'static,
         I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
+        I::SpawnObservedRemote: IntoSendErasedSpawnObserved<S, F, I::Message> + 'static,
         I::Call: IntoErasedCall<I::Message> + 'static,
         I::Fact: crate::fact::IntoRuntimeFact + 'static,
         Outbound: 'static,
@@ -466,6 +470,7 @@ where
         I::Reply: 'static,
         I::Spawn: IntoErasedSpawn<S, F> + 'static,
         I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
+        I::SpawnObservedRemote: IntoSendErasedSpawnObserved<S, F, I::Message> + 'static,
         I::Call: IntoErasedCall<I::Message> + 'static,
         I::Fact: crate::fact::IntoRuntimeFact + 'static,
         Outbound: 'static,
@@ -515,6 +520,7 @@ where
         I::Reply: 'static,
         I::Spawn: IntoErasedSpawn<S, F> + 'static,
         I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
+        I::SpawnObservedRemote: IntoSendErasedSpawnObserved<S, F, I::Message> + 'static,
         I::Call: IntoErasedCall<I::Message> + 'static,
         I::Fact: crate::fact::IntoRuntimeFact + 'static,
         Outbound: 'static,
@@ -1396,8 +1402,8 @@ pub(crate) fn threaded_worker_loop<S, F>(
     observer: Option<Arc<dyn TraceObserver>>,
 ) -> ThreadedWorkerExit
 where
-    S: Shard,
-    F: MailboxFactory,
+    S: Shard + 'static,
+    F: MailboxFactory + 'static,
 {
     metrics.set_worker_thread_id(format!("{:?}", thread::current().id()));
     let mut runtime = Runtime::with_clock_and_ids_and_driver_and_preallocation(
@@ -1462,8 +1468,8 @@ where
 
 pub(crate) fn deliver_shutdown_signal_and_drain<S, F>(runtime: &mut Runtime<S, F>)
 where
-    S: Shard,
-    F: MailboxFactory,
+    S: Shard + 'static,
+    F: MailboxFactory + 'static,
 {
     runtime.notify_signal("shutdown");
     for _ in 0..1024 {

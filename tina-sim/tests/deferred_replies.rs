@@ -135,7 +135,7 @@ fn count_kind(events: &[RuntimeEvent], pred: impl Fn(&RuntimeEventKind) -> bool)
     events.iter().filter(|e| pred(&e.kind())).count()
 }
 
-fn step_to_idle<S: Shard>(sim: &mut Simulator<S>) {
+fn step_to_idle<S: Shard + 'static>(sim: &mut Simulator<S>) {
     while sim.step() > 0 {}
 }
 

@@ -65,6 +65,10 @@ pub enum EffectKind {
     /// The handler returned [`tina::Effect::SpawnObserved`].
     SpawnObserved,
 
+    /// The handler returned [`tina::Effect::SpawnObservedOn`] — an observed
+    /// spawn placed on another shard.
+    SpawnObservedOn,
+
     /// The handler returned [`tina::Effect::Stop`].
     Stop,
 
@@ -478,6 +482,21 @@ pub enum RuntimeEventKind {
     Spawned {
         /// The isolate identifier assigned to the new child.
         child_isolate: IsolateId,
+    },
+
+    /// The owner learned the address of a child it spawned on another shard
+    /// ([`tina::Effect::SpawnObservedOn`]). Recorded under the owner when the
+    /// cross-shard spawn reply lands, so the start is observable without
+    /// trace spelunking; the child's own creation is `Spawned` on its shard.
+    ChildStarted {
+        /// The shard the child was placed on.
+        child_shard: ShardId,
+
+        /// The new child's isolate id.
+        child_isolate: IsolateId,
+
+        /// The new child's address generation.
+        child_generation: AddressGeneration,
     },
 
     /// The runtime began a supervised restart response to a child panic.
@@ -1100,6 +1119,7 @@ fn effect_kind_tag(effect: EffectKind) -> u8 {
         EffectKind::Fact => 13,
         EffectKind::Fail => 14,
         EffectKind::StopChildren => 15,
+        EffectKind::SpawnObservedOn => 16,
     }
 }
 
@@ -1495,6 +1515,16 @@ fn write_kind_stable(kind: RuntimeEventKind, hasher: &mut StableHasher) {
         } => {
             hasher.write_u8(38);
             hasher.write_u64(child_ordinal as u64);
+            hasher.write_u64(child_isolate.get());
+            hasher.write_u64(child_generation.get());
+        }
+        RuntimeEventKind::ChildStarted {
+            child_shard,
+            child_isolate,
+            child_generation,
+        } => {
+            hasher.write_u8(39);
+            hasher.write_u32(child_shard.get());
             hasher.write_u64(child_isolate.get());
             hasher.write_u64(child_generation.get());
         }

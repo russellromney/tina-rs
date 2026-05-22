@@ -500,6 +500,60 @@ where
     fn into_erased_spawn_observed(self) -> Box<dyn ErasedSpawnObserved<S>>;
 }
 
+// --- Cross-shard observed spawn (simulator mirror of the live runtime) -------
+//
+// The simulator is single-threaded, so there is no `Send` requirement: the
+// spawn payload is carried between shards as `Box<dyn Any>` and downcast back
+// on the destination (same `S`). The owner's continuation stays on the owner
+// shard until the address reply arrives — same protocol as the live runtime.
+
+pub(crate) trait SimRemoteSpawn<S>
+where
+    S: Shard,
+{
+    fn spawn_remote(
+        self: Box<Self>,
+        sim: &mut Simulator<S>,
+        owner: RegisteredAddress,
+        cause: tina_runtime::CauseId,
+    ) -> Result<RegisteredAddress, SpawnObservedError>;
+}
+
+pub(crate) trait IntoSimRemoteSpawn<S>
+where
+    S: Shard,
+{
+    fn into_sim_remote_spawn(self) -> Box<dyn SimRemoteSpawn<S>>;
+}
+
+pub(crate) struct SimRemoteSpawnObservedParts<S>
+where
+    S: Shard,
+{
+    pub(crate) target_shard: ShardId,
+    pub(crate) spawn: Box<dyn SimRemoteSpawn<S>>,
+    #[allow(clippy::type_complexity)]
+    pub(crate) continuation:
+        Box<dyn FnOnce(Result<RegisteredAddress, SpawnObservedError>) -> Box<dyn Any>>,
+}
+
+pub(crate) trait IntoSimRemoteSpawnObserved<S, ParentMessage>
+where
+    S: Shard,
+{
+    fn into_sim_remote_spawn_observed(self) -> SimRemoteSpawnObservedParts<S>;
+}
+
+/// A cross-shard observed spawn awaiting its address reply, held on the owner
+/// shard. Simulator mirror of the live runtime's `PendingRemoteSpawn`.
+pub(crate) struct PendingRemoteSpawn {
+    pub(crate) request_id: CallId,
+    pub(crate) requester: RegisteredAddress,
+    #[allow(clippy::type_complexity)]
+    pub(crate) continuation:
+        Box<dyn FnOnce(Result<RegisteredAddress, SpawnObservedError>) -> Box<dyn Any>>,
+}
+
 pub(crate) struct HandlerAdapter<I, Outbound>
 where
     I: Isolate,
@@ -514,6 +568,7 @@ where
         + 'static,
     I::Spawn: IntoErasedSpawn<S> + 'static,
     I::SpawnObserved: IntoErasedSpawnObserved<S, I::Message> + 'static,
+    I::SpawnObservedRemote: IntoSimRemoteSpawnObserved<S, I::Message> + 'static,
     I::Reply: 'static,
     I::Fact: tina_runtime::IntoRuntimeFact + 'static,
     Msg: 'static,
@@ -572,6 +627,7 @@ where
         + 'static,
     I::Spawn: IntoErasedSpawn<S> + 'static,
     I::SpawnObserved: IntoErasedSpawnObserved<S, I::Message> + 'static,
+    I::SpawnObservedRemote: IntoSimRemoteSpawnObserved<S, I::Message> + 'static,
     I::Reply: 'static,
     I::Fact: tina_runtime::IntoRuntimeFact + 'static,
     I::Fact: tina_runtime::IntoRuntimeFact + 'static,
@@ -595,6 +651,9 @@ where
         Effect::Spawn(spawn) => ErasedEffect::Spawn(spawn.into_erased_spawn()),
         Effect::SpawnObserved(spawn) => {
             ErasedEffect::SpawnObserved(spawn.into_erased_spawn_observed())
+        }
+        Effect::SpawnObservedOn(spawn) => {
+            ErasedEffect::SpawnObservedOn(spawn.into_sim_remote_spawn_observed())
         }
         Effect::Stop => ErasedEffect::Stop,
         Effect::Fail => ErasedEffect::Fail,
@@ -729,6 +788,7 @@ where
     Send(ErasedSend),
     Spawn(Box<dyn ErasedSpawn<S>>),
     SpawnObserved(Box<dyn ErasedSpawnObserved<S>>),
+    SpawnObservedOn(SimRemoteSpawnObservedParts<S>),
     Stop,
     Fail,
     StopWith,
@@ -755,6 +815,7 @@ where
             Self::Send(_) => EffectKind::Send,
             Self::Spawn(_) => EffectKind::Spawn,
             Self::SpawnObserved(_) => EffectKind::SpawnObserved,
+            Self::SpawnObservedOn(_) => EffectKind::SpawnObservedOn,
             Self::Stop => EffectKind::Stop,
             Self::Fail => EffectKind::Fail,
             Self::StopWith => EffectKind::StopWith,
@@ -821,6 +882,8 @@ pub(crate) struct QueuedRemoteSend {
 pub(crate) enum QueuedRemoteEnvelope {
     Send(QueuedRemoteSend),
     CallReply(RemoteCallReply),
+    SpawnRequest(SimRemoteSpawnRequest),
+    SpawnReply(SimRemoteSpawnReply),
 }
 
 impl QueuedRemoteEnvelope {
@@ -828,8 +891,30 @@ impl QueuedRemoteEnvelope {
         match self {
             Self::Send(queued) => queued.send.target_shard,
             Self::CallReply(reply) => reply.requester.shard,
+            Self::SpawnRequest(request) => request.target_shard,
+            Self::SpawnReply(reply) => reply.requester.shard,
         }
     }
+}
+
+/// A cross-shard observed-spawn request. `payload` is the `Box<dyn
+/// SimRemoteSpawn<S>>` erased to `Any` so the envelope stays non-generic; the
+/// destination shard (same `S`) downcasts it back.
+pub(crate) struct SimRemoteSpawnRequest {
+    pub(crate) request_id: CallId,
+    pub(crate) target_shard: ShardId,
+    pub(crate) owner: RegisteredAddress,
+    pub(crate) payload: Box<dyn Any>,
+    pub(crate) cause: tina_runtime::CauseId,
+}
+
+/// The reply to a [`SimRemoteSpawnRequest`]: the new child's address (or the
+/// spawn error), routed back to the owner shard.
+pub(crate) struct SimRemoteSpawnReply {
+    pub(crate) request_id: CallId,
+    pub(crate) requester: RegisteredAddress,
+    pub(crate) cause: tina_runtime::CauseId,
+    pub(crate) outcome: Result<RegisteredAddress, SpawnObservedError>,
 }
 
 pub(crate) fn remote_call_outcome_envelope(

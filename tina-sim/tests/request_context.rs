@@ -16,7 +16,7 @@ use tina::{
 use tina_runtime::{CallOutcome, RuntimeCall, RuntimeEventKind};
 use tina_sim::{MultiShardSimulator, MultiShardSimulatorConfig, Simulator, SimulatorConfig};
 
-fn step_to_idle<S: Shard>(sim: &mut Simulator<S>) {
+fn step_to_idle<S: Shard + 'static>(sim: &mut Simulator<S>) {
     while sim.step() > 0 {}
 }
 

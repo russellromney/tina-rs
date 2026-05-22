@@ -46,6 +46,15 @@ where
     /// to the parent as an ordinary later message.
     SpawnObserved(I::SpawnObserved),
 
+    /// Start a new isolate instance on another shard and report the typed
+    /// child reference back to the parent as an ordinary later message.
+    ///
+    /// Built by `spawn_observed(child).on_shard(shard).then(...)`. The child
+    /// registers on the target shard; the address returns to the parent on a
+    /// later turn. Isolates that never spawn cross-shard have
+    /// `SpawnObservedRemote = Infallible` and cannot construct this variant.
+    SpawnObservedOn(I::SpawnObservedRemote),
+
     /// Stop the current isolate.
     Stop,
 
