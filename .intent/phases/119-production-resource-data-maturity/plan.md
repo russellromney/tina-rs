@@ -2,7 +2,33 @@
 
 ## Status
 
-- Future implementation plan for Wave A.
+- Resource half implemented (2026-05-22). Shipped:
+  - `ResourceLifetime` / `ResourceHealth` / `RetireReason` /
+    `PolicyCheckPoint` / `RetiredResource` / `ResourcePolicyReport` /
+    `RefillOutcome` / `PoolShutdownReport` vocabulary in `tina::pool`.
+  - `WorkerPool` maintenance sweep (`Maintain { now }`, owner-driven time)
+    that retires idle resources past idle/max age, reports over-age leased
+    (never stolen), plus owner-driven `Refill` to reclaim capacity.
+  - HTTP/1 keepalive idle retirement (`KeepaliveConnectionMsg::Maintain`),
+    closing the "no idle-connection timeout" gap. Keepalive shutdown
+    report (`KeepalivePoolShutdownReport`) already existed and is reused.
+  - Checked-in resource owner matrix: `docs/resource-owner-matrix.md`.
+  - DB bridge pressure confirmed aligned on `BridgePressure` without
+    faking SQLx internals (no bridge code change needed).
+  - User-shaped proofs: `tina-runtime/tests/pool_lifetime.rs` (18),
+    `tina/src/pool.rs` vocab unit tests (4), and two new keepalive
+    idle-retirement tests.
+- Deferred to Phase 126 (durable local state and IPC): the durable
+  restore/service half — `JournaledState` / `PendingJournalAppend<T>` /
+  `CommittedMutation<T>` / `RecoveryReport`, corrupt/torn-tail recovery
+  specimens, `system_redisish_keyspace`, `system_audit_log`, and the
+  durability-misorder trybuild. These collide directly with Phase 126's
+  `RecordedWork` / `CommittedWork` / `RecoveryReport` and append-before-
+  apply helper; building them here would be a second design of the same
+  names. See "Does Not Include" deferral note below.
+- HTTP/2/gRPC client resource maturity and HTTP/2 stream-slot lifetime
+  remain owned by Phase 116/127, per the layering note; not retrofitted
+  here.
 - Runs after Phase 116. HTTP/2/gRPC client resource maturity needs the real
   client connection and stream-slot shape first.
 - Also builds on Phase 118 admission policy. Resource health/retire reports
