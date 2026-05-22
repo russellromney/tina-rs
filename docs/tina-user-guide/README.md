@@ -49,6 +49,8 @@ Read in order if new:
 23. [Core And Batteries](23-core-and-batteries.md)
 24. [Battery Authoring Checklist](24-battery-authoring.md)
 25. [Bridge Author Kit (copied path)](30-bridge-author-kit.md)
+26. [Extension Hooks](25-extension-hooks.md)
+27. [The Async Boundary](26-async-boundary.md)
 
 The reading order separates **learn core** (pages 0–17, 19, 21) from
 **choose batteries** (pages 18, 20, 22, 25, plus 23–24 which explain the

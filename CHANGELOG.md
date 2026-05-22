@@ -4,6 +4,40 @@ This file records completed work.
 
 ## Unreleased
 
+### Ecosystem Hooks And Async Boundary
+
+Public extension seams so third-party crates can grow the ecosystem without
+private runtime access, plus docs that classify every async path.
+
+- **`tina_codec::SyncCodec`** — an open sync-codec extension trait (the sealed
+  `Framer` stays for the built-ins). Both built-in framers also implement it, so
+  generic code drives a built-in or a custom codec. Codecs stay sync, bounded,
+  and replayable; Tina still owns I/O.
+- **`tina_runtime::ServicePolicy`** — an open admission/rate-policy trait
+  returning typed `AdmissionDecision`. A policy decides; it never sends, retries,
+  sleeps, or hides a queue. `RateLimit` implements it as the reference shape.
+- **`tina_runtime::RuntimeCapabilityReport`** — a read-shaped view over
+  `RuntimeCapabilities` naming, per rail, supported / unsupported /
+  simulated-only / cancel-backed / tombstoned / drain-backed, with a
+  grep-friendly discovery report. It renames nothing.
+- **Bridge author parts and the capacity surface / bounded event sink hooks**
+  are the existing `tina_runtime::bridge` vocabulary, `CapacitySurfaceReport` +
+  `CapacitySummary::push`, and `BoundedEventSink` — aligned and proven as
+  extension hooks, not rebuilt under new names.
+- **Five workspace-excluded extension smoke crates under
+  `examples/extensions/`** using public APIs only: a custom capacity surface
+  that joins a `CapacitySummary`; a custom `SyncCodec` driving a sim service; a
+  custom per-key `ServicePolicy` proven replayable; a bounded-worker fake bridge
+  proving setup/closer/metrics/pressure/shutdown and caller-timeout honesty
+  (`ExternalWorkMayContinue`, never a claim that external work stopped); and a
+  compile-fail crate whose `compile_fail` doctests prove an extension cannot
+  import a private runtime module, mint a runtime-owned permit, or forge a
+  private `BridgePressure` / `ResourceCapability`. Each crate ships a README
+  command and a smoke test, and `make verify-examples` now walks them.
+- **Docs:** `docs/tina-user-guide/25-extension-hooks.md` (the extension contract
+  and where third-party code belongs) and `26-async-boundary.md` (native vs
+  bridge vs unsupported, with the common Tokio ecosystem cases sorted).
+
 ### Admission And Rate Policy
 
 (Pre-merge tightening — see the "fixes" sections below for the deltas

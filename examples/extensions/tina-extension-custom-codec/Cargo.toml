@@ -1,0 +1,18 @@
+[workspace]
+
+[package]
+name = "tina-extension-custom-codec"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+tina = { path = "../../../tina" }
+tina-runtime = { path = "../../../tina-runtime" }
+tina-sim = { path = "../../../tina-sim" }
+tina-codec = { path = "../../../tina-codec" }

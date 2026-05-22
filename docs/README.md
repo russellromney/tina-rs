@@ -8,6 +8,10 @@ Start here:
   Tina core ends and the blessed batteries begin
 - [Battery Authoring Checklist](tina-user-guide/24-battery-authoring.md) —
   what a battery (first- or third-party) owes the rest of the system
+- [Extension Hooks](tina-user-guide/25-extension-hooks.md) — public seams a
+  third-party crate uses to add codecs, policies, surfaces, sinks, and bridges
+- [The Async Boundary](tina-user-guide/26-async-boundary.md) — native vs bridge
+  vs unsupported for common Tokio ecosystem needs
 
 The guide is intentionally practical and grug-first. It is for humans and LLM
 sessions that need to build with Tina without rediscovering the model by

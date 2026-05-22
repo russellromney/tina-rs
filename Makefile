@@ -28,12 +28,14 @@ doc:
 clippy:
 	cargo clippy --workspace --all-targets -- -D warnings
 
-# Walks examples/*/Cargo.toml (each is its own cargo workspace, excluded
-# from the main one). Builds + tests each so a workspace-only change
-# can't silently break a downstream specimen. Stops on first failure.
+# Walks examples/*/Cargo.toml and the extension smoke crates under
+# examples/extensions/*/Cargo.toml (each is its own cargo workspace,
+# excluded from the main one). Builds + tests each so a workspace-only
+# change can't silently break a downstream specimen or extension crate.
+# Stops on first failure.
 verify-examples:
 	@set -e; \
-	for manifest in examples/*/Cargo.toml; do \
+	for manifest in examples/*/Cargo.toml examples/extensions/*/Cargo.toml; do \
 		echo "==> $$manifest"; \
 		cargo test --manifest-path "$$manifest"; \
 		cargo clippy --manifest-path "$$manifest" --all-targets -- -D warnings; \

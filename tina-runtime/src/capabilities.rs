@@ -356,3 +356,267 @@ const UNIX_RAIL_CAPABILITY: ResourceCapability = ResourceCapability::new(
     ShutdownSupport::NotApplicable,
     None,
 );
+
+// -----------------------------------------------------------------------------
+// RuntimeCapabilityReport — read-shaped capability discovery
+// -----------------------------------------------------------------------------
+
+/// One rail's capability, paired with a stable name.
+///
+/// This is a faithful view over a [`ResourceCapability`] — it renames
+/// nothing and invents nothing. The predicate helpers exist so callers,
+/// dashboards, and extension authors can ask the plan's questions
+/// ("is this supported? sim-backed? cancel-backed? drain-backed?")
+/// against one stable vocabulary instead of matching four enums by hand.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RuntimeCapabilityRow {
+    /// Stable rail name (e.g. `"tcp"`, `"local_persistence"`).
+    pub name: &'static str,
+    /// The underlying capability row.
+    pub capability: ResourceCapability,
+}
+
+impl RuntimeCapabilityRow {
+    /// Tina can execute this rail on the live runtime.
+    pub const fn is_supported(&self) -> bool {
+        matches!(self.capability.support(), ResourceSupport::Supported)
+    }
+
+    /// Tina cannot honestly execute this rail on the live runtime.
+    pub const fn is_unsupported(&self) -> bool {
+        matches!(self.capability.support(), ResourceSupport::Unsupported)
+    }
+
+    /// This rail exists only inside the deterministic simulator.
+    pub const fn is_sim_only(&self) -> bool {
+        matches!(self.capability.support(), ResourceSupport::SimulatedOnly)
+    }
+
+    /// This rail expects an explicit user adapter or service isolate.
+    pub const fn is_adapter_only(&self) -> bool {
+        matches!(self.capability.support(), ResourceSupport::AdapterOnly)
+    }
+
+    /// Pending work on this rail can be canceled (before start or
+    /// tombstoned after start).
+    pub const fn is_cancel_backed(&self) -> bool {
+        matches!(
+            self.capability.cancellation(),
+            CancellationSupport::CancelableBeforeStart | CancellationSupport::TombstonedAfterStart
+        )
+    }
+
+    /// Started work on this rail is tombstoned (cancel or shutdown lets a
+    /// late completion land as a recorded tombstone, not a fresh effect).
+    pub const fn is_tombstoned(&self) -> bool {
+        matches!(
+            self.capability.cancellation(),
+            CancellationSupport::TombstonedAfterStart
+        ) || matches!(self.capability.shutdown(), ShutdownSupport::Tombstoned)
+    }
+
+    /// Shutdown drains this rail's pending work to a settled terminal state.
+    pub const fn is_drain_backed(&self) -> bool {
+        matches!(self.capability.shutdown(), ShutdownSupport::Drained)
+    }
+
+    fn support_word(&self) -> &'static str {
+        match self.capability.support() {
+            ResourceSupport::Supported => "supported",
+            ResourceSupport::Unsupported => "unsupported",
+            ResourceSupport::SimulatedOnly => "simulated_only",
+            ResourceSupport::AdapterOnly => "adapter_only",
+        }
+    }
+
+    fn execution_word(&self) -> &'static str {
+        match self.capability.execution() {
+            ResourceExecutionShape::Inline => "inline",
+            ResourceExecutionShape::CompletionBacked => "completion_backed",
+            ResourceExecutionShape::PollBacked => "poll_backed",
+            ResourceExecutionShape::LaneBackedBlocking => "lane_backed_blocking",
+            ResourceExecutionShape::ExternalAdapter => "external_adapter",
+            ResourceExecutionShape::NotApplicable => "n/a",
+        }
+    }
+
+    fn cancellation_word(&self) -> &'static str {
+        match self.capability.cancellation() {
+            CancellationSupport::CancelableBeforeStart => "cancelable_before_start",
+            CancellationSupport::TombstonedAfterStart => "tombstoned_after_start",
+            CancellationSupport::ResourceCloseOnly => "resource_close_only",
+            CancellationSupport::NotCancelable => "not_cancelable",
+            CancellationSupport::NotApplicable => "n/a",
+        }
+    }
+
+    fn shutdown_word(&self) -> &'static str {
+        match self.capability.shutdown() {
+            ShutdownSupport::Drained => "drained",
+            ShutdownSupport::Canceled => "canceled",
+            ShutdownSupport::Tombstoned => "tombstoned",
+            ShutdownSupport::Unsupported => "unsupported",
+            ShutdownSupport::NotApplicable => "n/a",
+        }
+    }
+
+    /// One grep-friendly discovery line for this rail.
+    pub fn discovery_line(&self) -> String {
+        let cap = match self.capability.capacity() {
+            Some(c) => c.to_string(),
+            None => "-".to_string(),
+        };
+        format!(
+            "cap rail={} support={} exec={} cancel={} shutdown={} capacity={}",
+            self.name,
+            self.support_word(),
+            self.execution_word(),
+            self.cancellation_word(),
+            self.shutdown_word(),
+            cap,
+        )
+    }
+}
+
+/// Read-shaped capability report over a [`RuntimeCapabilities`] table.
+///
+/// `RuntimeCapabilities` is the structured truth; this report is the
+/// grep-friendly, predicate-friendly rendering of it. It names every
+/// runtime-owned rail and says, explicitly, whether each is supported,
+/// unsupported, simulated-only, cancel-backed, tombstoned, or
+/// drain-backed. Extension authors use it to discover what the runtime
+/// they were handed can actually do — without reaching into private
+/// runtime state.
+///
+/// The report renames nothing: `simulated_only` is the existing
+/// [`ResourceSupport::SimulatedOnly`], `tombstoned` is the existing
+/// tombstone shape, and so on. It is a view, not a second source of
+/// truth.
+#[derive(Debug, Clone)]
+pub struct RuntimeCapabilityReport {
+    rows: Vec<RuntimeCapabilityRow>,
+}
+
+impl RuntimeCapabilityReport {
+    /// Build the report from a capability table.
+    pub fn from_capabilities(caps: &RuntimeCapabilities) -> Self {
+        let rows = vec![
+            RuntimeCapabilityRow {
+                name: "timers",
+                capability: caps.timers,
+            },
+            RuntimeCapabilityRow {
+                name: "tcp",
+                capability: caps.tcp,
+            },
+            RuntimeCapabilityRow {
+                name: "local_file",
+                capability: caps.local_file,
+            },
+            RuntimeCapabilityRow {
+                name: "local_persistence",
+                capability: caps.local_persistence,
+            },
+            RuntimeCapabilityRow {
+                name: "storage_lane",
+                capability: caps.storage_lane,
+            },
+            RuntimeCapabilityRow {
+                name: "dns",
+                capability: caps.dns,
+            },
+            RuntimeCapabilityRow {
+                name: "udp",
+                capability: caps.udp,
+            },
+            RuntimeCapabilityRow {
+                name: "tls",
+                capability: caps.tls,
+            },
+            RuntimeCapabilityRow {
+                name: "process",
+                capability: caps.process,
+            },
+            RuntimeCapabilityRow {
+                name: "signal",
+                capability: caps.signal,
+            },
+            RuntimeCapabilityRow {
+                name: "unix",
+                capability: caps.unix,
+            },
+        ];
+        Self { rows }
+    }
+
+    /// All rail rows, in a stable order.
+    pub fn rows(&self) -> &[RuntimeCapabilityRow] {
+        &self.rows
+    }
+
+    /// Look up one rail by name.
+    pub fn rail(&self, name: &str) -> Option<&RuntimeCapabilityRow> {
+        self.rows.iter().find(|r| r.name == name)
+    }
+
+    /// One discovery line per rail, newline-joined.
+    pub fn discovery_report(&self) -> String {
+        let mut out = String::new();
+        for row in &self.rows {
+            out.push_str(&row.discovery_line());
+            out.push('\n');
+        }
+        out
+    }
+}
+
+impl RuntimeCapabilities {
+    /// Render this table as a read-shaped [`RuntimeCapabilityReport`].
+    pub fn report(&self) -> RuntimeCapabilityReport {
+        RuntimeCapabilityReport::from_capabilities(self)
+    }
+}
+
+#[cfg(test)]
+mod capability_report_tests {
+    use super::*;
+
+    #[test]
+    fn report_names_every_rail_and_renames_nothing() {
+        let caps = RuntimeCapabilities::threaded(4096);
+        let report = caps.report();
+        assert_eq!(report.rows().len(), 11);
+        // tcp is supported, completion-backed, tombstoned on cancel and
+        // shutdown — exactly what the table says.
+        let tcp = report.rail("tcp").expect("tcp rail present");
+        assert!(tcp.is_supported());
+        assert!(tcp.is_cancel_backed());
+        assert!(tcp.is_tombstoned());
+        assert!(!tcp.is_drain_backed());
+        // timers cancel before start and drain on... they cancel on
+        // shutdown, so not drain-backed but cancel-backed.
+        let timers = report.rail("timers").expect("timers rail present");
+        assert!(timers.is_cancel_backed());
+        // signal drains on shutdown.
+        let signal = report.rail("signal").expect("signal rail present");
+        assert!(signal.is_drain_backed());
+    }
+
+    #[test]
+    fn discovery_report_is_grep_friendly() {
+        let caps = RuntimeCapabilities::threaded(4096);
+        let text = caps.report().discovery_report();
+        assert!(text.lines().count() == 11);
+        assert!(text.contains("cap rail=tcp support=supported"));
+        assert!(text.contains("rail=local_persistence"));
+        assert!(text.contains("capacity=4096"));
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn unix_rail_is_explicitly_unsupported_off_unix() {
+        let caps = RuntimeCapabilities::threaded(4096);
+        let unix = caps.report().rail("unix").expect("unix rail named");
+        assert!(unix.is_unsupported());
+    }
+}
