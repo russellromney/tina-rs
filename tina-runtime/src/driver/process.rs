@@ -263,6 +263,38 @@ fn process_worker_loop(
     }
 }
 
+#[cfg(target_os = "linux")]
+#[allow(unsafe_code)]
+fn child_has_exited(child: &mut std::process::Child) -> std::io::Result<bool> {
+    // SAFETY: zeroing a POD `siginfo_t` for use as an out-parameter.
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    // SAFETY: `P_PID` + this child's pid; `WNOWAIT` reports exit without
+    // consuming the zombie. That keeps the leader pid (also the process-group
+    // id) reserved until `process_exited` has cleaned up descendants.
+    let result = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            child.id() as libc::id_t,
+            &mut info,
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        )
+    };
+    if result == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // With `WNOHANG`, waitid returns 0 even when no child is ready. A zero
+    // si_pid means "not exited yet"; nonzero means the child is waitable.
+    let si_pid = unsafe { info.si_pid() };
+    Ok(si_pid != 0)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn child_has_exited(child: &mut std::process::Child) -> std::io::Result<bool> {
+    // Non-Linux has no portable WNOWAIT equivalent here. `try_wait` reaps, and
+    // `Child::wait` later returns the cached status.
+    Ok(child.try_wait()?.is_some())
+}
+
 fn execute_process_command(command: ProcessCommand) -> CallOutput {
     if command.timeout.is_zero() {
         return CallOutput::Failed(CallError::Timeout);
@@ -284,21 +316,21 @@ fn execute_process_command(command: ProcessCommand) -> CallOutput {
     let process_group = child.id();
     let started = Instant::now();
 
-    let status = loop {
+    loop {
         if command.cancelled.load(Ordering::Acquire) {
             return kill_and_reap(child, stdout, stderr, CallError::Timeout);
         }
         if started.elapsed() >= command.timeout {
             return kill_and_reap(child, stdout, stderr, CallError::Timeout);
         }
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) => thread::sleep(Duration::from_millis(1)),
+        match child_has_exited(&mut child) {
+            Ok(true) => break,
+            Ok(false) => thread::sleep(Duration::from_millis(1)),
             Err(_) => return kill_and_reap(child, stdout, stderr, CallError::KillUncertain),
         }
-    };
+    }
 
-    process_exited(status, stdout, stderr, process_group)
+    process_exited(child, stdout, stderr, process_group)
 }
 
 fn kill_and_reap(
@@ -325,8 +357,9 @@ fn kill_and_reap(
         // The direct kill failed, almost always because the child had already
         // exited on its own. Report its real status if we can reap it;
         // otherwise fall back to the caller's typed terminal.
+        let process_group = child.id();
         return match child.try_wait() {
-            Ok(Some(status)) => process_exited(status, stdout, stderr, child.id()),
+            Ok(Some(_)) => process_exited(child, stdout, stderr, process_group),
             Ok(None) => CallOutput::Failed(CallError::KillUncertain),
             Err(_) => CallOutput::Failed(fallback),
         };
@@ -389,7 +422,7 @@ fn kill_process_group(pid: u32) -> std::io::Result<()> {
 }
 
 fn process_exited(
-    status: std::process::ExitStatus,
+    mut child: std::process::Child,
     stdout: Option<JoinHandle<(Vec<u8>, bool)>>,
     stderr: Option<JoinHandle<(Vec<u8>, bool)>>,
     process_group: u32,
@@ -403,13 +436,18 @@ fn process_exited(
             // hold stdout/stderr pipes open. `process_run` owns the whole
             // process group; do not let a background grandchild escape the
             // runtime rail after the bounded drain budget is spent.
+            //
+            // On Linux, normal completion only peeked the leader exit with
+            // `waitid(WNOWAIT)`, so the leader stays as a zombie and its pid
+            // still reserves this process-group id while we signal the group.
+            // On other Unix platforms the poll path already reaped the leader,
+            // so a narrow pid-reuse race remains documented here.
             let _ = kill_process_group(process_group);
         }
     }
+    let code = child.wait().ok().and_then(|status| status.code());
     CallOutput::ProcessExited {
-        status: ProcessStatus {
-            code: status.code(),
-        },
+        status: ProcessStatus { code },
         stdout,
         stderr,
         stdout_truncated,

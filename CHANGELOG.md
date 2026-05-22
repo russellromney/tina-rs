@@ -4,6 +4,18 @@ This file records completed work.
 
 ## Unreleased
 
+### Runtime Fixes
+
+- **Process group cleanup holds the Linux leader pid until descendant cleanup.**
+  `process_run` now peeks child exit with `waitid(WNOWAIT)` on Linux, so a
+  truncated stdout/stderr drain can kill the owned process group before the
+  leader pid is reaped and possibly recycled. The non-Linux path stays
+  best-effort and documented.
+- **Completion-pressure truth documented.** `MailboxFull` at call-completion
+  delivery is ratified as a distinct trace-only terminal class, and the
+  recently-cancelled cause ring is documented as bounded best-effort attribution
+  with an observable eviction counter.
+
 ### Ecosystem Hooks And Async Boundary
 
 Public extension seams so third-party crates can grow the ecosystem without

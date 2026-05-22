@@ -302,6 +302,14 @@ pub enum CallKind {
 pub enum CallCompletionRejectedReason {
     /// The requesting isolate's mailbox was full when the runtime tried to
     /// enqueue the completion.
+    ///
+    /// This is a distinct terminal class: the pending call is already settled
+    /// in runtime bookkeeping, but the requester mailbox cannot receive the
+    /// continuation. The caller does not observe a delivered reply. Operators
+    /// must observe this trace event, and callers that cannot tolerate it must
+    /// size their own mailbox for their in-flight completions. Tina does not
+    /// re-buffer this outcome for redelivery because that would add hidden
+    /// per-caller storage.
     MailboxFull,
 
     /// The requesting isolate had stopped (or its incarnation was

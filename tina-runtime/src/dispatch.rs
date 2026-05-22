@@ -1650,6 +1650,13 @@ where
     /// the cause that closed it. Late replies for these surface as a
     /// rejection reason that mirrors the cause, instead of the
     /// generic `NoPendingCall` / `CallerClosed`.
+    ///
+    /// The ring is bounded at `CANCELLED_CALL_RING_CAPACITY` by design: late
+    /// cause attribution is best-effort. Beyond capacity, the oldest entry is
+    /// evicted and a later reply for it degrades to the generic reason. Each
+    /// eviction increments `cancelled_call_cause_evictions`, exposed through
+    /// [`crate::Runtime::cancelled_call_cause_evictions`], so the degradation is
+    /// visible without adding an unbounded late-reply table.
     pub(crate) fn record_cancelled_call(&mut self, call_id: CallId, cause: tina::CancelCause) {
         if self.cancelled_calls.len() == CANCELLED_CALL_RING_CAPACITY {
             self.cancelled_calls.pop_front();
