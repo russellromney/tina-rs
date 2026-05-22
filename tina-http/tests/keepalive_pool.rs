@@ -2421,3 +2421,113 @@ fn stop_after_force_close_drops_transport_and_closes_isolate() {
     rig.shutdown();
     server.stop();
 }
+
+// Drive one idle-retirement sweep on a connection by address; return
+// whether it closed an idle socket.
+fn maintain_conn(
+    rig: &TestRig,
+    conn: KeepaliveConnAddr,
+    now: std::time::Instant,
+    max_idle: Duration,
+) -> bool {
+    match rig
+        .rt()
+        .call_blocking(
+            conn,
+            KeepaliveConnectionMsg::Maintain { now, max_idle },
+            Duration::from_secs(2),
+        )
+        .expect("maintain call")
+    {
+        CallOutcome::Replied(KeepaliveOutcome::Maintained { closed_idle }) => closed_idle,
+        other => panic!("expected Maintained reply, got {other:?}"),
+    }
+}
+
+fn keepalive_request(rig: &TestRig, conn: KeepaliveConnAddr) -> bool {
+    match rig
+        .rt()
+        .call_blocking(
+            conn,
+            KeepaliveConnectionMsg::request(req(), Duration::from_secs(2)),
+            Duration::from_secs(2),
+        )
+        .expect("request call")
+    {
+        CallOutcome::Replied(outcome) => {
+            let (result, must_retire) = outcome.into_request_result();
+            assert_eq!(result.expect("200 response").status, 200);
+            must_retire
+        }
+        other => panic!("expected request reply, got {other:?}"),
+    }
+}
+
+#[test]
+fn idle_maintenance_closes_socket_and_next_request_reconnects() {
+    let server = ScriptedServer::start(ServerPolicy::Keepalive);
+    let rig = TestRig::start();
+    let handles = rig.build_pool(HttpTarget::http(server.addr), 1, 4);
+    let conn = handles.connections[0];
+    let t0 = std::time::Instant::now();
+    let max_idle = Duration::from_millis(50);
+
+    // First request opens one TCP connection; the response is reusable.
+    assert!(!keepalive_request(&rig, conn), "keepalive response is reusable");
+    assert_eq!(server.accepts(), 1, "first request opens one connection");
+
+    // The first sweep only stamps the idle clock — nothing is closed.
+    assert!(!maintain_conn(&rig, conn, t0, max_idle));
+    assert_eq!(server.accepts(), 1, "stamping sweep keeps the socket");
+
+    // A sweep past max_idle closes the idle socket and reports it.
+    assert!(
+        maintain_conn(&rig, conn, t0 + Duration::from_millis(100), max_idle),
+        "idle past max_idle should retire the socket"
+    );
+
+    // The slot is still leasable: the next request reconnects, so the
+    // server records a second accept. The idle socket did not silently
+    // become a stale-on-next-use failure.
+    assert!(!keepalive_request(&rig, conn));
+    assert_eq!(
+        server.accepts(),
+        2,
+        "idle retirement forced a clean reconnect"
+    );
+
+    rig.shutdown();
+    server.stop();
+}
+
+#[test]
+fn maintenance_leaves_unconnected_and_freshly_used_connections_alone() {
+    let server = ScriptedServer::start(ServerPolicy::Keepalive);
+    let rig = TestRig::start();
+    let handles = rig.build_pool(HttpTarget::http(server.addr), 1, 4);
+    let conn = handles.connections[0];
+    let t0 = std::time::Instant::now();
+    let max_idle = Duration::from_millis(50);
+
+    // A never-connected slot has no socket to close.
+    assert!(!maintain_conn(&rig, conn, t0, max_idle));
+    assert_eq!(server.accepts(), 0, "no connection opened yet");
+
+    // After a request the connection is idle but freshly used. The first
+    // sweep only stamps the idle clock (idle age starts at 0), so it does
+    // not close the socket and the next request reuses it. (A connection
+    // mid-request is left alone too — `handle_maintain` returns early
+    // when `in_flight` is set, before any close.)
+    assert!(!keepalive_request(&rig, conn));
+    assert_eq!(server.accepts(), 1);
+    assert!(!maintain_conn(&rig, conn, t0 + Duration::from_millis(200), max_idle));
+    assert!(!keepalive_request(&rig, conn));
+    assert_eq!(
+        server.accepts(),
+        1,
+        "a freshly-used connection is reused, not retired"
+    );
+
+    rig.shutdown();
+    server.stop();
+}

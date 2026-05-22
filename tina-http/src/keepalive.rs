@@ -59,11 +59,26 @@
 //! pool. `OriginKey` is the value type that names that identity for
 //! diagnostics and equality checks.
 //!
+//! # Idle retirement
+//!
+//! A connection closes its idle socket proactively when the owner runs
+//! a maintenance sweep: [`KeepaliveConnectionMsg::Maintain`] carries
+//! `now` and `max_idle` (the owner's Tina clock + policy, never a
+//! wall-clock read inside the isolate). A connection idle at least
+//! `max_idle` closes its transport and replies `Maintained {
+//! closed_idle: true }`. The pool slot stays leasable — the next
+//! request reconnects. Idle age is measured from the first sweep that
+//! sees the connection idle, so run maintenance at least as often as
+//! `max_idle`. An active request resets the idle clock; the sweep never
+//! touches a connection mid-request.
+//!
 //! # Out of scope (first form)
 //!
-//! - No idle-connection timeout. A long-idle stale socket is
-//!   discovered on the next request via a write/read failure and
-//!   reported as `must_retire`.
+//! - No max-lifetime-by-time retirement of keepalive connections yet;
+//!   only idle retirement and lazy stale-on-next-request discovery.
+//! - A long-idle socket missed between sweeps is still discovered on
+//!   the next request via a write/read failure and reported as
+//!   `must_retire`.
 //! - No hidden retry. A `must_retire` reply is the consumer's signal
 //!   to choose whether to acquire another lease and retry, or
 //!   surface the failure.
@@ -181,6 +196,18 @@ pub enum KeepaliveConnectionMsg {
     /// Used during pool shutdown to avoid leaking transports past
     /// pool close. See module docs for the recommended sequence.
     Stop,
+    /// Run an idle-retirement sweep at logical time `now`. If the
+    /// connection has been idle at least `max_idle` and holds a live
+    /// transport, it closes the socket and replies `Maintained {
+    /// closed_idle: true }`. `now` is the owner's Tina clock, not a
+    /// wall clock the isolate reads. A connection mid-request resets its
+    /// idle clock and is never closed by the sweep.
+    Maintain {
+        /// Logical time for this sweep.
+        now: Instant,
+        /// Retire after the connection has been idle at least this long.
+        max_idle: Duration,
+    },
 
     Connected(Result<(tina_runtime::StreamId, SocketAddr, SocketAddr), CallError>),
     TlsConnected(Result<tina_runtime::TlsStreamId, CallError>),
@@ -227,6 +254,13 @@ pub enum KeepaliveOutcome {
     /// `CallOutcome::Closed` once the runtime tears the address
     /// down.
     Stopped,
+    /// Reply to [`KeepaliveConnectionMsg::Maintain`]. `closed_idle` is
+    /// true when the sweep closed an idle transport (the slot is still
+    /// leasable; the next request reconnects).
+    Maintained {
+        /// True when the sweep closed an idle socket.
+        closed_idle: bool,
+    },
 }
 
 impl KeepaliveOutcome {
@@ -240,6 +274,7 @@ impl KeepaliveOutcome {
                 must_retire,
             } => (result, must_retire),
             Self::Stopped => panic!("expected Request outcome, got Stopped"),
+            Self::Maintained { .. } => panic!("expected Request outcome, got Maintained"),
         }
     }
 }
@@ -264,6 +299,11 @@ pub struct KeepaliveConnection<S: Shard + 'static> {
     /// generation in its payload; a generation mismatch flags the
     /// message as stale and a no-op.
     request_generation: u64,
+    /// When the idle clock started, stamped lazily by the first
+    /// maintenance sweep that sees the connection idle. Cleared at
+    /// request start and after an idle-retirement close. `None` means
+    /// "not observed idle yet" or "active".
+    idle_since: Option<Instant>,
     _shard: PhantomData<S>,
 }
 
@@ -295,6 +335,7 @@ impl<S: Shard + 'static> KeepaliveConnection<S> {
             in_flight: None,
             pending_connect_bytes: None,
             request_generation: 0,
+            idle_since: None,
             _shard: PhantomData,
         }
     }
@@ -332,6 +373,10 @@ impl<S: Shard + 'static> Isolate for KeepaliveConnection<S> {
             } => self.handle_request(*request, request_timeout, None),
 
             KeepaliveConnectionMsg::Stop => self.handle_stop(None),
+
+            KeepaliveConnectionMsg::Maintain { now, max_idle } => {
+                self.handle_maintain(now, max_idle, None)
+            }
 
             KeepaliveConnectionMsg::Connected(Ok((stream, _local, _peer))) => {
                 if self.in_flight.is_none() {
@@ -428,6 +473,10 @@ impl<S: Shard + 'static> Isolate for KeepaliveConnection<S> {
                 let reply_to = call.into_request_context();
                 self.handle_stop(Some(reply_to))
             }
+            KeepaliveConnectionMsg::Maintain { now, max_idle } => {
+                let reply_to = call.into_request_context();
+                self.handle_maintain(now, max_idle, Some(reply_to))
+            }
             _ => call.reject(tina::CallRejectedReason::UnsupportedMessage),
         }
     }
@@ -465,6 +514,9 @@ impl<S: Shard + 'static> KeepaliveConnection<S> {
             }
         };
         let request_bytes = encode_keepalive_request(&request);
+
+        // A request makes the connection active: the idle clock resets.
+        self.idle_since = None;
 
         // Bound to u64::MAX overflow with a loud panic. 2^64 requests
         // on one connection isolate is unreachable in practice;
@@ -539,6 +591,56 @@ impl<S: Shard + 'static> KeepaliveConnection<S> {
         effects.push(reply_effect);
         effects.push(stop_effect);
         batch(effects)
+    }
+
+    fn handle_maintain(
+        &mut self,
+        now: Instant,
+        max_idle: Duration,
+        reply_to: Option<RequestContext<KeepaliveOutcome>>,
+    ) -> Effect<Self> {
+        // Only an idle connection holding a live transport can retire.
+        // A mid-request connection resets its idle clock and is left
+        // alone; a connectionless slot has nothing to close.
+        if self.in_flight.is_some() {
+            self.idle_since = None;
+            return reply_keepalive_outcome(
+                reply_to,
+                KeepaliveOutcome::Maintained { closed_idle: false },
+            );
+        }
+        if self.transport.is_none() {
+            self.idle_since = None;
+            return reply_keepalive_outcome(
+                reply_to,
+                KeepaliveOutcome::Maintained { closed_idle: false },
+            );
+        }
+
+        // First sweep that sees the connection idle stamps the clock.
+        let idle_since = *self.idle_since.get_or_insert(now);
+        let idle_for = now.saturating_duration_since(idle_since);
+        if idle_for < max_idle {
+            return reply_keepalive_outcome(
+                reply_to,
+                KeepaliveOutcome::Maintained { closed_idle: false },
+            );
+        }
+
+        // Idle past the limit: close the socket now. The isolate owns
+        // the transport, so this is the owner-specific close path — not
+        // generic pool magic. The slot stays leasable; the next request
+        // reconnects.
+        self.idle_since = None;
+        let close_effect = self.close_transport_fire_and_forget();
+        let reply_effect: Effect<Self> = reply_keepalive_outcome(
+            reply_to,
+            KeepaliveOutcome::Maintained { closed_idle: true },
+        );
+        match close_effect {
+            Some(close) => batch(vec![reply_effect, close]),
+            None => reply_effect,
+        }
     }
 
     fn transport_or_flat_error(

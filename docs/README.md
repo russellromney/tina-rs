@@ -12,6 +12,8 @@ Start here:
   third-party crate uses to add codecs, policies, surfaces, sinks, and bridges
 - [The Async Boundary](tina-user-guide/26-async-boundary.md) — native vs bridge
   vs unsupported for common Tokio ecosystem needs
+- [Resource Owner Matrix](resource-owner-matrix.md) — who owns the
+  close/drain/force/report path for each long-lived resource kind
 
 The guide is intentionally practical and grug-first. It is for humans and LLM
 sessions that need to build with Tina without rediscovering the model by
