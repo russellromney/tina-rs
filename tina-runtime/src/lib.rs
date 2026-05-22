@@ -77,6 +77,7 @@ pub mod shared_scope;
 pub mod shared_work;
 mod shutdown;
 mod single_call_gate;
+pub mod supervision_report;
 pub mod tcp_loops;
 mod threaded;
 mod threaded_multi_shard;
@@ -235,6 +236,7 @@ pub use scope::{
 };
 pub use service_pressure::{ServicePressureReport, ServicePressureSurface, ServiceSurfaceState};
 pub use shared_scope::{SharedCapacityScope, SharedLease, SharedScopeFull, SharedScopeReport};
+pub use supervision_report::{ChildSupervision, SupervisorHalt, SupervisorReport};
 pub use shared_work::{
     SharedWork, SharedWorkCallError, SharedWorkError, SharedWorkReplyError, SharedWorkSnapshot,
     SharedWorkTicket, request_effect_after_shared_wait,

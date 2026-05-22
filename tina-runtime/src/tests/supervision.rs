@@ -496,6 +496,90 @@ fn supervise_before_children_and_reconfigure_reset_budget_are_supported() {
 }
 
 #[test]
+fn supervisor_report_summarizes_restart_history_for_one_owner() {
+    use crate::supervision_report::SupervisorReport;
+
+    let factory_calls = Rc::new(Cell::new(0));
+    let mut runtime = Runtime::new(TestShard, TestMailboxFactory);
+    let root = runtime.register(
+        new_restartable_root(Rc::clone(&factory_calls)),
+        root_mailbox(),
+    );
+    runtime.supervise(
+        root,
+        SupervisorConfig::new(RestartPolicy::OneForOne, tina::RestartBudget::new(3)),
+    );
+
+    assert_eq!(runtime.try_send(root, LineageMsg::SpawnChild), Ok(()));
+    assert_eq!(runtime.step(), 1);
+    let child = last_spawned_child(runtime.trace());
+    assert_eq!(
+        runtime.try_send(lineage_address(child), LineageMsg::Panic),
+        Ok(())
+    );
+    assert_eq!(runtime.step(), 1);
+
+    let report = SupervisorReport::from_events(runtime.trace().iter(), root.isolate());
+    assert_eq!(report.parent, root.isolate());
+    assert_eq!(report.children_spawned, 1);
+    assert_eq!(report.restarts_triggered, 1);
+    assert_eq!(report.restarts_attempted, 1);
+    assert_eq!(report.restarts_completed, 1);
+    assert_eq!(report.skipped_not_restartable, 0);
+    assert_eq!(report.rejected_budget_exceeded, 0);
+    assert!(report.halt.is_none());
+    assert!(report.non_zero());
+    assert!(!report.halted());
+
+    assert_eq!(report.children.len(), 1);
+    let entry = report.children[0];
+    assert_eq!(entry.child_ordinal, 0);
+    assert_eq!(entry.restarts_completed, 1);
+    // The report's latest incarnation matches the live record's replacement.
+    let replacement = runtime.child_record_snapshot()[0].child_isolate;
+    assert_eq!(entry.latest_isolate, replacement);
+    assert_ne!(entry.latest_isolate, child);
+}
+
+#[test]
+fn supervisor_report_names_budget_exhaustion_as_terminal_halt() {
+    use crate::supervision_report::{SupervisorHalt, SupervisorReport};
+
+    let factory_calls = Rc::new(Cell::new(0));
+    let mut runtime = Runtime::new(TestShard, TestMailboxFactory);
+    let root = runtime.register(
+        new_restartable_root(Rc::clone(&factory_calls)),
+        root_mailbox(),
+    );
+    runtime.supervise(
+        root,
+        SupervisorConfig::new(RestartPolicy::OneForOne, tina::RestartBudget::new(0)),
+    );
+
+    assert_eq!(runtime.try_send(root, LineageMsg::SpawnChild), Ok(()));
+    assert_eq!(runtime.step(), 1);
+    let child = last_spawned_child(runtime.trace());
+    assert_eq!(
+        runtime.try_send(lineage_address(child), LineageMsg::Panic),
+        Ok(())
+    );
+    assert_eq!(runtime.step(), 1);
+
+    let report = SupervisorReport::from_events(runtime.trace().iter(), root.isolate());
+    assert_eq!(report.children_spawned, 1);
+    assert_eq!(report.restarts_completed, 0);
+    assert_eq!(report.rejected_budget_exceeded, 1);
+    assert!(report.halted());
+    assert_eq!(
+        report.halt,
+        Some(SupervisorHalt::BudgetExhausted {
+            attempted_restart: 1,
+            max_restarts: 0,
+        })
+    );
+}
+
+#[test]
 fn supervise_panics_for_unknown_stale_or_cross_shard_parent_addresses() {
     let mut runtime = Runtime::new(TestShard, TestMailboxFactory);
     let root = runtime.register(new_root(), root_mailbox());
