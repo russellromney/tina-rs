@@ -566,3 +566,24 @@ This wave (red-PR repairs + remaining uncovered):
   cleanup branch after a natural exit. Not patched here because a correct fix
   is a deliberate platform/unsafe design decision, not a minimal change, and a
   half-fix risks double-reap. Recommend a focused Linux `WNOWAIT` design pass.
+
+### Resolution update — 2026-05-22 (append-only)
+
+The three deferrals above were subsequently resolved on **PR #187** (one PR,
+separate commits), superseding their DEFER status:
+
+- **C4 — RESOLVED (ratified).** Documented `MailboxFull` on
+  `CallCompletionRejectedReason` as the intentional distinct terminal class:
+  observe the event, not a reply; the runtime deliberately does not re-buffer
+  for redelivery. Option (a). No behavior change.
+- **C5 — RESOLVED (ratified).** Documented the bounded best-effort cause ring
+  and that its eviction counter is observable via
+  `Runtime::cancelled_call_cause_evictions`; the bound is kept intentionally.
+  No behavior change.
+- **F3 — RESOLVED (fixed, Linux).** `child_has_exited` peeks the leader with
+  `waitid(WEXITED | WNOHANG | WNOWAIT)` (not `waitpid`, where `WNOWAIT` is
+  invalid → `EINVAL`), leaving it a zombie so its pid stays reserved;
+  `process_exited` kills the group while the pid is reserved, then reaps the
+  leader for its status. One scoped `unsafe` + a Linux-only `libc` dep. Other
+  unix keeps reap-in-loop with the narrow residual race documented; macOS
+  behavior unchanged. Ubuntu CI validates the Linux path.
