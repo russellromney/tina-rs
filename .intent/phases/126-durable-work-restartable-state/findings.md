@@ -21,52 +21,42 @@ recovery outcome was renamed. Tests: `tina-runtime` persistence (11) + lib
 (499), `tina-codec` (34), `tina-sim` persistence_simulation (7), and
 `specimen_local_io_codec_ipc` (8).
 
-## Gaps worth a follow-up
+## Closed in the follow-up wave
 
-### 1. Journal compaction is out of the first form (capability gap)
+- **Journal compaction (was gap 1).** `recover_compacted` rebuilds the outbox and
+  returns a compacted journal image (pending-only, re-indexed, completed dropped,
+  `WorkId`s preserved, next index aligned). `persistence::commit_file_atomic`
+  swaps it durably. The on-disk journal is now bounded by the live backlog, not
+  the lifetime of completions.
+- **Commit fence (was gap 2).** `persistence::{raise,clear}_commit_fence` +
+  `commit_fence_present` and `CommitConfidence::from_fence_present` make
+  `UncertainCommit` turnkey across restart — the caller persists a marker, not a
+  bespoke confidence record.
+- **Resume driver (was gap 3).** `RecoveryReport::into_resume` →
+  `ResumeQueue::next_apply` drains pending oldest-first, applies through the
+  outbox, and skips already-completed ids, pinning the one-at-a-time index rule.
+- **Specimen (was gap 6).** `examples/specimen_webhook_outbox` runs the full
+  flow, durable vs. hand-rolled.
 
-The outbox is journal-only. The in-memory `completed` set is watermark-pruned so
-it stays bounded, but the **on-disk journal grows without bound** until something
-truncates it. Pending capacity is bounded; the log is not. A compaction snapshot
-(fold completed work away, rewrite the journal to its pending tail) is the
-missing piece. This is the same shape the existing snapshot+journal helpers use;
-the outbox just does not own it yet.
+## Gaps still open
 
-### 2. `UncertainCommit` provenance is caller-carried (ergonomic gap)
-
-`recover` takes `CommitConfidence` as an input. To report `UncertainCommit`
-honestly across a restart, the caller must persist its last commit's confidence
-itself (a commit fence) — the outbox does not own that disk marker in the first
-form. This is honest (the outbox surfaces exactly what it was told) but pushes
-bookkeeping onto every user. A small `commit_fence` helper in `persistence`
-(write intent, clear on clean dir-fsync, read leftover on recovery) would make
-`UncertainCommit` turnkey and would naturally pair with compaction (gap 1).
-
-### 3. No built-in resume driver (ergonomic gap)
-
-`RecoveryReport.pending` is a `Vec<RecordedWork>`. Resuming N items durably means
-either one append in flight at a time (to keep journal indices strictly
-increasing) or a batch the caller assembles. The integration test hand-rolls a
-one-at-a-time `drive_resume`. A bounded "drain pending, re-apply, re-complete"
-helper would remove that boilerplate and pin the index-ordering rule in one
-place.
-
-### 4. `DurablePayload` is hand-encoded (minor ergonomic gap)
+### `DurablePayload` is hand-encoded (minor ergonomic gap)
 
 Application payloads implement `to_durable_bytes` / `from_durable_bytes` by hand.
 Fine and dependency-free for the first form. A `serde` feature bridge or a derive
 would lower the adoption cost without changing the honesty boundary.
 
-### 5. Double framing (minor, accepted)
+### Double framing (minor, accepted)
 
 The outbox frames `[tag][work_id][payload]` inside the journal's own
 `[magic][index][len][checksum][payload]` framing. Two layers, one extra header
 per record. Acceptable for the first form; a dedicated journal record kind could
 collapse it later if the overhead ever matters.
 
-### 6. Standalone webhook-outbox specimen deferred (documentation gap)
+### Compaction is restart-time only (capability note)
 
-The enqueue → send → mark-sent → restart → resume-unsent flow is proven end to
-end in `tina-runtime/tests/durable_outbox.rs`. A runnable `examples/` crate (dual
-tina/tokio impl, matching the other specimens) would document it for users; it is
-polish, not proof, so it was deferred.
+`recover_compacted` compacts at recovery. A long-running process that never
+restarts still grows its journal until the next restart. A live, in-place
+rotation (snapshot the running outbox, swap the journal, realign `next_index`
+without a recover) is the natural next step; it needs the outbox to retain
+pending payloads in memory, which the current `apply`-moves-`W` design avoids.

@@ -32,8 +32,25 @@ the truth — without an exactly-once claim or a durable mailbox.
   `RecoveryError::OverCapacity`, keeping replay bounded. Completed work is listed
   as completed, never resumed as pending. `OutboxShutdownReport` names pending,
   abandoned, completed, and failed work at shutdown — no silent drop.
+- **Journal compaction bounds growth.** `DurableOutbox::recover_compacted`
+  rebuilds the outbox and also returns a compacted journal image — only the
+  still-pending enqueues, re-indexed from 1, with completed and stale records
+  dropped and `WorkId`s preserved. `tina_runtime::persistence::commit_file_atomic`
+  swaps it in one durable step (temp + fsync + rename + parent-dir fsync),
+  returning `CommitUncertain` when only the final fsync is unconfirmed.
+- **Commit fences make uncertain recovery turnkey.**
+  `persistence::{raise,clear}_commit_fence` + `commit_fence_present`, and
+  `CommitConfidence::from_fence_present`, let a service flag a commit whose final
+  durability step was interrupted, so the next recovery reports
+  `TailStatus::UncertainCommit` instead of silently clean.
+- **`ResumeQueue` drains pending work.** `RecoveryReport::into_resume` yields a
+  queue whose `next_apply` applies the next pending item through the outbox,
+  oldest first, skipping already-completed ids — the resume loop in one call.
 - **Codec ordering integrity proven.** A length-delimited frame buffered before
   an oversize one is still delivered intact; only the oversize frame is rejected.
+- **Specimen.** `examples/specimen_webhook_outbox` runs the full enqueue → send →
+  mark-sent → restart → recover → compact → resume flow, comparing the durable
+  outbox against a hand-rolled flat-file outbox.
 
 ### Runtime Fixes
 
