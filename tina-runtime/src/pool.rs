@@ -43,8 +43,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use tina::pool::{
-    AcquireFailure, AcquireOutcome, CloseMode, PoolConfig, PoolId, PoolLease, PoolPressureReport,
-    PolicyCheckPoint, RefillOutcome, ReleaseDisposition, ReleaseFailure, ReleaseOutcome,
+    AcquireFailure, AcquireOutcome, CloseMode, PolicyCheckPoint, PoolConfig, PoolId, PoolLease,
+    PoolPressureReport, RefillOutcome, ReleaseDisposition, ReleaseFailure, ReleaseOutcome,
     ResourceLifetime, ResourcePolicyReport, RetireReason, RetiredResource,
     runtime_internal as pool_internal,
 };

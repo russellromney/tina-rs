@@ -2473,7 +2473,10 @@ fn idle_maintenance_closes_socket_and_next_request_reconnects() {
     let max_idle = Duration::from_millis(50);
 
     // First request opens one TCP connection; the response is reusable.
-    assert!(!keepalive_request(&rig, conn), "keepalive response is reusable");
+    assert!(
+        !keepalive_request(&rig, conn),
+        "keepalive response is reusable"
+    );
     assert_eq!(server.accepts(), 1, "first request opens one connection");
 
     // The first sweep only stamps the idle clock — nothing is closed.
@@ -2520,7 +2523,12 @@ fn maintenance_leaves_unconnected_and_freshly_used_connections_alone() {
     // when `in_flight` is set, before any close.)
     assert!(!keepalive_request(&rig, conn));
     assert_eq!(server.accepts(), 1);
-    assert!(!maintain_conn(&rig, conn, t0 + Duration::from_millis(200), max_idle));
+    assert!(!maintain_conn(
+        &rig,
+        conn,
+        t0 + Duration::from_millis(200),
+        max_idle
+    ));
     assert!(!keepalive_request(&rig, conn));
     assert_eq!(
         server.accepts(),

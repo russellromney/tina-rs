@@ -705,10 +705,8 @@ mod tests {
         assert_eq!(age.max_lifetime, Some(Duration::from_secs(30)));
         assert!(!age.is_unbounded());
 
-        let both = ResourceLifetime::new(
-            Some(Duration::from_secs(5)),
-            Some(Duration::from_secs(30)),
-        );
+        let both =
+            ResourceLifetime::new(Some(Duration::from_secs(5)), Some(Duration::from_secs(30)));
         assert_eq!(both.max_idle, Some(Duration::from_secs(5)));
         assert_eq!(both.max_lifetime, Some(Duration::from_secs(30)));
         assert!(!both.is_unbounded());
@@ -723,9 +721,18 @@ mod tests {
     fn resource_health_maps_to_disposition() {
         // Only an explicit Retire drops the resource; a Suspect verdict
         // still reuses (first form), so capacity is not shed on a hunch.
-        assert_eq!(ResourceHealth::Healthy.disposition(), ReleaseDisposition::Reuse);
-        assert_eq!(ResourceHealth::Suspect.disposition(), ReleaseDisposition::Reuse);
-        assert_eq!(ResourceHealth::Retire.disposition(), ReleaseDisposition::Retire);
+        assert_eq!(
+            ResourceHealth::Healthy.disposition(),
+            ReleaseDisposition::Reuse
+        );
+        assert_eq!(
+            ResourceHealth::Suspect.disposition(),
+            ReleaseDisposition::Reuse
+        );
+        assert_eq!(
+            ResourceHealth::Retire.disposition(),
+            ReleaseDisposition::Retire
+        );
     }
 
     #[test]

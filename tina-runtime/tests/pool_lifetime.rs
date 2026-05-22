@@ -18,7 +18,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tina::pool::{
-    AcquireOutcome, CloseMode, PoolConfig, PoolLease, PoolPressureReport, PolicyCheckPoint,
+    AcquireOutcome, CloseMode, PolicyCheckPoint, PoolConfig, PoolLease, PoolPressureReport,
     PoolShutdownReport, RefillOutcome, ReleaseDisposition, ReleaseOutcome, ResourceHealth,
     ResourceLifetime, ResourcePolicyReport, RetireReason,
 };
@@ -39,7 +39,11 @@ const T: Duration = Duration::from_secs(5);
 // reply out a channel for the host to assert on.
 enum HelperMsg {
     DoMaintain(Instant),
-    DoRefill { id: u32, handle: Resource, now: Instant },
+    DoRefill {
+        id: u32,
+        handle: Resource,
+        now: Instant,
+    },
     Done(CallOutcome<WorkerPoolReply<Resource>>),
 }
 
@@ -71,7 +75,10 @@ impl HelperDriver {
 }
 
 fn runtime() -> Arc<Rt> {
-    Arc::new(ThreadedRuntime::new(SingleShard, DefaultThreadedMailboxFactory))
+    Arc::new(ThreadedRuntime::new(
+        SingleShard,
+        DefaultThreadedMailboxFactory,
+    ))
 }
 
 fn register(rt: &Rt, pool: WorkerPool<Resource, SingleShard>) -> PoolAddr {
@@ -119,7 +126,13 @@ fn maintain(rt: &Rt, pool: PoolAddr, now: Instant) -> ResourcePolicyReport {
     }
 }
 
-fn refill(rt: &Rt, pool: PoolAddr, resource_id: u32, handle: Resource, now: Instant) -> RefillOutcome {
+fn refill(
+    rt: &Rt,
+    pool: PoolAddr,
+    resource_id: u32,
+    handle: Resource,
+    now: Instant,
+) -> RefillOutcome {
     match reply(
         rt,
         pool,
@@ -171,12 +184,18 @@ fn idle_retire_reports_why() {
     // Use the resource, then return it idle. Release resets the idle
     // clock; the first sweep re-stamps it.
     let lease = acquire_lease(&rt, pool);
-    assert_eq!(release(&rt, pool, lease, ReleaseDisposition::Reuse), ReleaseOutcome::Released);
+    assert_eq!(
+        release(&rt, pool, lease, ReleaseDisposition::Reuse),
+        ReleaseOutcome::Released
+    );
 
     // First sweep observes it idle and stamps the clock — nothing to
     // retire yet.
     let first = maintain(&rt, pool, t0 + Duration::from_secs(1));
-    assert!(first.retired.is_empty(), "first sweep should stamp, not retire: {first:?}");
+    assert!(
+        first.retired.is_empty(),
+        "first sweep should stamp, not retire: {first:?}"
+    );
 
     // Six seconds later it has been idle past the limit.
     let report = maintain(&rt, pool, t0 + Duration::from_secs(7));
@@ -207,7 +226,10 @@ fn max_lifetime_retire_does_not_hand_stale_to_new_caller() {
 
     // Borrow and return; the resource is idle again.
     let lease = acquire_lease(&rt, pool);
-    assert_eq!(release(&rt, pool, lease, ReleaseDisposition::Reuse), ReleaseOutcome::Released);
+    assert_eq!(
+        release(&rt, pool, lease, ReleaseDisposition::Reuse),
+        ReleaseOutcome::Released
+    );
 
     // Past max age. created_at is build time, so one sweep retires it.
     let report = maintain(&rt, pool, t0 + Duration::from_secs(11));
@@ -220,10 +242,16 @@ fn max_lifetime_retire_does_not_hand_stale_to_new_caller() {
 
     // The owner refills the slot with a fresh resource; now acquire
     // succeeds and hands out the fresh handle.
-    assert_eq!(refill(&rt, pool, 0, 20, t0 + Duration::from_secs(11)), RefillOutcome::Refilled);
+    assert_eq!(
+        refill(&rt, pool, 0, 20, t0 + Duration::from_secs(11)),
+        RefillOutcome::Refilled
+    );
     let fresh = acquire_lease(&rt, pool);
     assert_eq!(*fresh.handle(), 20);
-    assert_eq!(release(&rt, pool, fresh, ReleaseDisposition::Reuse), ReleaseOutcome::Released);
+    assert_eq!(
+        release(&rt, pool, fresh, ReleaseDisposition::Reuse),
+        ReleaseOutcome::Released
+    );
 
     shutdown(rt);
 }
@@ -297,7 +325,10 @@ fn idle_only_policy_does_not_report_over_age_leased() {
     assert!(report.over_age_leased.is_empty(), "{report:?}");
     assert!(report.retired.is_empty(), "{report:?}");
     assert_eq!(report.leased_after, 1);
-    assert_eq!(release(&rt, pool, lease, ReleaseDisposition::Reuse), ReleaseOutcome::Released);
+    assert_eq!(
+        release(&rt, pool, lease, ReleaseDisposition::Reuse),
+        ReleaseOutcome::Released
+    );
 
     shutdown(rt);
 }
@@ -322,7 +353,12 @@ fn multiple_resources_retired_in_one_sweep() {
     assert_eq!(report.retired.len(), 3, "{report:?}");
     assert_eq!(report.available_after, 0);
     assert_eq!(report.retired_slots, 3);
-    assert!(report.retired.iter().all(|r| r.reason == RetireReason::IdleTimeout));
+    assert!(
+        report
+            .retired
+            .iter()
+            .all(|r| r.reason == RetireReason::IdleTimeout)
+    );
     let mut ids: Vec<u32> = report.retired.iter().map(|r| r.resource_id.get()).collect();
     ids.sort_unstable();
     assert_eq!(ids, vec![0, 1, 2]);
@@ -342,7 +378,10 @@ fn health_check_retires_bad_resource() {
     // is the vocabulary; it maps onto the release disposition.
     let verdict = ResourceHealth::Retire;
     assert_eq!(verdict.disposition(), ReleaseDisposition::Retire);
-    assert_eq!(release(&rt, pool, lease, verdict.disposition()), ReleaseOutcome::Retired);
+    assert_eq!(
+        release(&rt, pool, lease, verdict.disposition()),
+        ReleaseOutcome::Retired
+    );
 
     let p = pressure(&rt, pool);
     assert_eq!(p.retired_count, 1);
@@ -350,8 +389,14 @@ fn health_check_retires_bad_resource() {
     assert_eq!(p.leased, 0);
 
     // A Healthy/Suspect verdict reuses instead of retiring.
-    assert_eq!(ResourceHealth::Healthy.disposition(), ReleaseDisposition::Reuse);
-    assert_eq!(ResourceHealth::Suspect.disposition(), ReleaseDisposition::Reuse);
+    assert_eq!(
+        ResourceHealth::Healthy.disposition(),
+        ReleaseDisposition::Reuse
+    );
+    assert_eq!(
+        ResourceHealth::Suspect.disposition(),
+        ReleaseDisposition::Reuse
+    );
 
     shutdown(rt);
 }
@@ -374,13 +419,19 @@ fn over_age_leased_is_reported_not_stolen() {
     let lease = acquire_lease(&rt, pool);
 
     let report = maintain(&rt, pool, t0 + Duration::from_secs(11));
-    assert!(report.retired.is_empty(), "leased resource must not be retired: {report:?}");
+    assert!(
+        report.retired.is_empty(),
+        "leased resource must not be retired: {report:?}"
+    );
     assert_eq!(report.over_age_leased.len(), 1, "{report:?}");
     assert_eq!(report.over_age_leased[0].get(), 0);
     assert_eq!(report.leased_after, 1);
 
     // The lease is still valid — the sweep did not steal it.
-    assert_eq!(release(&rt, pool, lease, ReleaseDisposition::Reuse), ReleaseOutcome::Released);
+    assert_eq!(
+        release(&rt, pool, lease, ReleaseDisposition::Reuse),
+        ReleaseOutcome::Released
+    );
 
     shutdown(rt);
 }
@@ -397,7 +448,10 @@ fn fill_retire_refill_reclaims_capacity() {
 
     // Retire one as unhealthy. Capacity is now effectively 1.
     let retired_id = a.resource_id().get();
-    assert_eq!(release(&rt, pool, a, ReleaseDisposition::Retire), ReleaseOutcome::Retired);
+    assert_eq!(
+        release(&rt, pool, a, ReleaseDisposition::Retire),
+        ReleaseOutcome::Retired
+    );
     let p = pressure(&rt, pool);
     assert_eq!(p.leased, 1);
     assert_eq!(p.available, 0);
@@ -407,13 +461,22 @@ fn fill_retire_refill_reclaims_capacity() {
 
     // Refill the retired slot with a fresh resource: capacity reclaimed.
     let now = Instant::now();
-    assert_eq!(refill(&rt, pool, retired_id, 99, now), RefillOutcome::Refilled);
+    assert_eq!(
+        refill(&rt, pool, retired_id, 99, now),
+        RefillOutcome::Refilled
+    );
     let c = acquire_lease(&rt, pool);
     assert_eq!(*c.handle(), 99);
     assert_eq!(pressure(&rt, pool).leased, 2);
 
-    assert_eq!(release(&rt, pool, b, ReleaseDisposition::Reuse), ReleaseOutcome::Released);
-    assert_eq!(release(&rt, pool, c, ReleaseDisposition::Reuse), ReleaseOutcome::Released);
+    assert_eq!(
+        release(&rt, pool, b, ReleaseDisposition::Reuse),
+        ReleaseOutcome::Released
+    );
+    assert_eq!(
+        release(&rt, pool, c, ReleaseDisposition::Reuse),
+        ReleaseOutcome::Released
+    );
 
     shutdown(rt);
 }
@@ -427,19 +490,28 @@ fn refill_keeps_generation_monotonic() {
     let lease = acquire_lease(&rt, pool);
     assert_eq!(lease.generation(), 1);
     let retired_id = lease.resource_id().get();
-    assert_eq!(release(&rt, pool, lease, ReleaseDisposition::Retire), ReleaseOutcome::Retired);
+    assert_eq!(
+        release(&rt, pool, lease, ReleaseDisposition::Retire),
+        ReleaseOutcome::Retired
+    );
 
     // Refilled slot must NOT reset to generation 1 — that would let a
     // stale generation-1 lease alias the reborn slot. The next lease
     // continues the monotonic counter.
-    assert_eq!(refill(&rt, pool, retired_id, 20, Instant::now()), RefillOutcome::Refilled);
+    assert_eq!(
+        refill(&rt, pool, retired_id, 20, Instant::now()),
+        RefillOutcome::Refilled
+    );
     let reborn = acquire_lease(&rt, pool);
     assert!(
         reborn.generation() > 1,
         "refilled slot reused generation {} — must stay monotonic",
         reborn.generation()
     );
-    assert_eq!(release(&rt, pool, reborn, ReleaseDisposition::Reuse), ReleaseOutcome::Released);
+    assert_eq!(
+        release(&rt, pool, reborn, ReleaseDisposition::Reuse),
+        ReleaseOutcome::Released
+    );
 
     shutdown(rt);
 }
@@ -459,14 +531,25 @@ fn refill_resets_the_age_clock() {
     );
 
     // Original resource ages out and is retired.
-    assert_eq!(maintain(&rt, pool, t0 + Duration::from_secs(11)).retired.len(), 1);
+    assert_eq!(
+        maintain(&rt, pool, t0 + Duration::from_secs(11))
+            .retired
+            .len(),
+        1
+    );
 
     // Refill at t0+11s: the fresh resource's age starts there, not at t0.
-    assert_eq!(refill(&rt, pool, 0, 20, t0 + Duration::from_secs(11)), RefillOutcome::Refilled);
+    assert_eq!(
+        refill(&rt, pool, 0, 20, t0 + Duration::from_secs(11)),
+        RefillOutcome::Refilled
+    );
 
     // 4s after refill it is still young — not retired.
     let young = maintain(&rt, pool, t0 + Duration::from_secs(15));
-    assert!(young.retired.is_empty(), "refilled resource aged from t0, not refill: {young:?}");
+    assert!(
+        young.retired.is_empty(),
+        "refilled resource aged from t0, not refill: {young:?}"
+    );
     assert_eq!(young.available_after, 1);
 
     // 11s after refill it is finally over max age again.
@@ -489,10 +572,16 @@ fn refill_rejects_live_unknown_and_closed() {
 
     // Leased (live) slot: same.
     let lease = acquire_lease(&rt, pool);
-    assert_eq!(refill(&rt, pool, lease.resource_id().get(), 50, now), RefillOutcome::NotRetired);
+    assert_eq!(
+        refill(&rt, pool, lease.resource_id().get(), 50, now),
+        RefillOutcome::NotRetired
+    );
 
     // Out of range.
-    assert_eq!(refill(&rt, pool, 99, 50, now), RefillOutcome::UnknownResource);
+    assert_eq!(
+        refill(&rt, pool, 99, 50, now),
+        RefillOutcome::UnknownResource
+    );
 
     // Closed pool refuses refills.
     let _ = release(&rt, pool, lease, ReleaseDisposition::Reuse);
@@ -516,11 +605,20 @@ fn shutdown_report_drain_keeps_leased_visible() {
     assert_eq!(report.mode, CloseMode::Drain);
     assert!(report.closed);
     assert_eq!(report.leased, 2);
-    assert!(!report.drained(), "drain with leases out is not drained: {report:?}");
+    assert!(
+        !report.drained(),
+        "drain with leases out is not drained: {report:?}"
+    );
 
     // Outstanding leases return normally under drain.
-    assert_eq!(release(&rt, pool, a, ReleaseDisposition::Reuse), ReleaseOutcome::Released);
-    assert_eq!(release(&rt, pool, b, ReleaseDisposition::Reuse), ReleaseOutcome::Released);
+    assert_eq!(
+        release(&rt, pool, a, ReleaseDisposition::Reuse),
+        ReleaseOutcome::Released
+    );
+    assert_eq!(
+        release(&rt, pool, b, ReleaseDisposition::Reuse),
+        ReleaseOutcome::Released
+    );
 
     let p = pressure(&rt, pool);
     let report = PoolShutdownReport::from_pressure(CloseMode::Drain, &p);
@@ -543,7 +641,10 @@ fn shutdown_report_force_retires_and_counts() {
     let report = PoolShutdownReport::from_pressure(CloseMode::Force, &p);
     assert_eq!(report.mode, CloseMode::Force);
     assert!(report.closed);
-    assert_eq!(report.leased, 0, "force retires outstanding leases: {report:?}");
+    assert_eq!(
+        report.leased, 0,
+        "force retires outstanding leases: {report:?}"
+    );
     assert_eq!(report.retired, 2);
     assert!(report.drained());
 
@@ -565,13 +666,19 @@ fn maintain_on_closed_pool_retires_nothing() {
     );
 
     let lease = acquire_lease(&rt, pool);
-    assert_eq!(release(&rt, pool, lease, ReleaseDisposition::Reuse), ReleaseOutcome::Released);
+    assert_eq!(
+        release(&rt, pool, lease, ReleaseDisposition::Reuse),
+        ReleaseOutcome::Released
+    );
 
     // Close owns shutdown. A maintenance tick that races the close must
     // not retire idle slots, even long past the idle limit.
     close(&rt, pool, CloseMode::Drain);
     let report = maintain(&rt, pool, t0 + Duration::from_secs(100));
-    assert!(report.retired.is_empty(), "closed pool must not retire on maintain: {report:?}");
+    assert!(
+        report.retired.is_empty(),
+        "closed pool must not retire on maintain: {report:?}"
+    );
     assert_eq!(report.available_after, 1);
     assert_eq!(report.retired_slots, 0);
 
@@ -616,11 +723,20 @@ fn refill_serves_parked_waiter() {
     // Let the waiter park, then retire the leased resource and refill the
     // slot. The fresh resource is dispatched straight to the waiter.
     std::thread::sleep(Duration::from_millis(100));
-    assert_eq!(release(&rt, pool, a, ReleaseDisposition::Retire), ReleaseOutcome::Retired);
-    assert_eq!(refill(&rt, pool, retired_id, 77, Instant::now()), RefillOutcome::Refilled);
+    assert_eq!(
+        release(&rt, pool, a, ReleaseDisposition::Retire),
+        ReleaseOutcome::Retired
+    );
+    assert_eq!(
+        refill(&rt, pool, retired_id, 77, Instant::now()),
+        RefillOutcome::Refilled
+    );
 
     let served = waiter.join().expect("waiter thread");
-    assert_eq!(served, 77, "parked waiter received the freshly refilled resource");
+    assert_eq!(
+        served, 77,
+        "parked waiter received the freshly refilled resource"
+    );
 
     shutdown(rt);
 }

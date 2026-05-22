@@ -633,10 +633,8 @@ impl<S: Shard + 'static> KeepaliveConnection<S> {
         // reconnects.
         self.idle_since = None;
         let close_effect = self.close_transport_fire_and_forget();
-        let reply_effect: Effect<Self> = reply_keepalive_outcome(
-            reply_to,
-            KeepaliveOutcome::Maintained { closed_idle: true },
-        );
+        let reply_effect: Effect<Self> =
+            reply_keepalive_outcome(reply_to, KeepaliveOutcome::Maintained { closed_idle: true });
         match close_effect {
             Some(close) => batch(vec![reply_effect, close]),
             None => reply_effect,
