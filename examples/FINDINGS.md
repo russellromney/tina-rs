@@ -14,6 +14,47 @@ valid; the long-form history lives in
 Finding numbers are stable across phases — when a finding closes it
 moves to the [Closed](#closed) section below with the same number.
 
+### 2026-05-23 Status Pass
+
+The recent Wave A / post-122 work closed a lot of old pain:
+native HTTP/2/gRPC client parity, local I/O/codec/Unix IPC, admission and
+rate policy, resource lifetime, durable outbox, ecosystem hooks, and
+supervision/fairness reports are now landed and recorded in `CHANGELOG.md`.
+
+What is still active after reading the specimens and systems:
+
+- **Whole-service copied path.** `mini_saas_api`, `system_metrics_shipper`,
+  `system_job_queue`, and `system_realtime_rooms` all prove Tina can build the
+  shape, but the user still stitches together many nouns. Phase 120 should
+  rewrite a small set on the blessed path and delete stale README guidance.
+- **Admission across parked work.** `system_api_gateway_limits` and
+  `system_soak_http_db` still show manual multi-scope charge/rollback and
+  "park this caller while holding this charge" ceremony. The important user
+  spelling is "admit all charges or answer Full, then release exactly once."
+- **Race / cancel / retry ceremony.** `ergonomics_playground` and
+  `system_job_queue` show the model is correct, but starting a race or
+  re-binding a cancelable caller after worker crash is still too manual.
+  Helpers must preserve branch identity, loser cancellation, late-reply truth,
+  and bounded pending storage.
+- **Cross-isolate setup.** Scatter/gather and paired registration still make
+  users write bind/start adapter plumbing for the happy path.
+- **Runtime observation while running.** Several protocol/IPC specimens still
+  want "observe accumulated facts" without `Arc<Mutex<_>>` side channels.
+  Trace projection may be the right blessed path; if not, build a typed
+  observation helper.
+- **Local I/O companions.** Phase 117 shipped the rails, but the specimens want
+  Unix `write_all` / `read_to_eof`, framed writers, and a less clunky
+  `FileCopyBounded` drive loop.
+- **Session/control-message lifecycle.** WebSocket systems still expose rough
+  edges around app-level control messages, send-vs-call entry points, and
+  deterministic slow-peer proof. Phase 127 should own this, not Phase 120.
+- **Live trace to sim.** The bug-box specimen validates the direction; Phase
+  128 should make projection/capture/shrink the copied path.
+
+Some older entries below are partly historical and say "shipped" inside the
+section. Keep their numbers stable until the next cleanup pass moves those
+paragraphs to `FINDINGS_HISTORY.md`.
+
 ### Admission and rate policy ergonomics
 
 **Surfaced by:** `system_tenant_rate_limiter`, `system_api_gateway_limits`,

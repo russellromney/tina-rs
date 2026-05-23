@@ -4,6 +4,17 @@ This file records completed work.
 
 ## Unreleased
 
+### Roadmap And Specimen Bookkeeping
+
+- Updated `ROADMAP.md` so completed Wave A/post-122 work no longer appears as
+  active implementation work: native HTTP/2/gRPC client parity, local I/O/codec
+  and Unix IPC, admission/rate policy, production resource lifetime, durable
+  local outbox/work recovery, and supervision/fairness are now treated as
+  landed work with follow-up edges.
+- Refreshed the current evidence snapshot to match the shipped protocol,
+  persistence, bridge-extension, and supervision surfaces before the next
+  ergonomics pass.
+
 ### Runtime Supervision And Fairness
 
 Make owned work fail loudly and let a host prove progress without trace

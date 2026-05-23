@@ -129,6 +129,14 @@ These are not lost. They are folded into bigger systems:
 
 ## Build Order
 
+Recent work has already built the first wave of small systems:
+`mini_saas_api`, `ergonomics_playground`, `system_job_queue`,
+`system_metrics_shipper`, `system_realtime_rooms`, `system_live_replay_bugbox`,
+`system_api_gateway_limits`, `system_soak_http_db`, `system_cache_with_fill`,
+`system_lock_manager`, `system_session_auth`, `system_tenant_rate_limiter`,
+and `system_webhook_relay`. Their repeated pain is summarized in
+[`../FINDINGS.md`](../FINDINGS.md).
+
 Start with small systems that pull hard:
 
 1. `mini_saas_api`
