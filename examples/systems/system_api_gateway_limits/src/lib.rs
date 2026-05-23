@@ -17,7 +17,7 @@ use std::time::Duration;
 use tina::{CallContext, prelude::*};
 use tina_runtime::{
     CallOutcome, CapacitySummary, DefaultThreadedMailboxFactory, GuardedPendingReplies,
-    ServiceHandle, SharedCapacityScope, SharedLease, SharedScopeFull, SleepReply, ThreadedRuntime,
+    ServiceHandle, SharedCapacityReservation, SharedCapacityScope, SleepReply, ThreadedRuntime,
     format_assertion_failure, format_discovery_line, sleep,
 };
 
@@ -129,16 +129,6 @@ pub enum GatewayReply {
     },
 }
 
-/// Both shared leases a request holds while in flight: one weight unit
-/// against the in-flight-request budget, one against the body-bytes
-/// budget. Dropping this releases both (each `SharedLease` releases on
-/// drop), so parking it as the guard keeps the two budgets honest across
-/// the multi-turn hold.
-struct RequestCharge {
-    _in_flight: SharedLease,
-    _body: SharedLease,
-}
-
 struct Gateway {
     scope: SharedCapacityScope,
     body_scope: SharedCapacityScope,
@@ -146,7 +136,7 @@ struct Gateway {
     list_weight: usize,
     upload_body: usize,
     list_body: usize,
-    pending: GuardedPendingReplies<u64, GatewayReply, RequestCharge>,
+    pending: GuardedPendingReplies<u64, GatewayReply, SharedCapacityReservation>,
     next_qid: u64,
 }
 
@@ -217,50 +207,23 @@ impl Gateway {
         hold: Duration,
         call: CallContext<'_, Self>,
     ) -> Effect<Self> {
-        // Charge the in-flight-request budget first.
         let weight = self.weight_for(route);
-        let in_flight = match self.scope.try_admit(weight) {
-            Ok(lease) => lease,
-            Err(SharedScopeFull {
-                scope,
-                requested,
-                current,
-                max,
-            }) => {
-                return call.reply(GatewayReply::Full {
-                    filled: scope,
-                    requested,
-                    current,
-                    max,
-                });
-            }
-        };
-
-        // Then the body-bytes budget. If it is full, drop the in-flight
-        // lease (rolls back the first charge) and report the body surface.
         let body_bytes = self.body_for(route);
-        let body = match self.body_scope.try_admit(body_bytes) {
-            Ok(lease) => lease,
-            Err(SharedScopeFull {
-                scope,
-                requested,
-                current,
-                max,
-            }) => {
-                drop(in_flight);
+        let charge = match SharedCapacityReservation::try_reserve([
+            self.scope.charge(weight),
+            self.body_scope.charge(body_bytes),
+        ]) {
+            Ok(charge) => charge,
+            Err(full) => {
                 return call.reply(GatewayReply::Full {
-                    filled: scope,
-                    requested,
-                    current,
-                    max,
+                    filled: full.scope,
+                    requested: full.requested,
+                    current: full.current,
+                    max: full.max,
                 });
             }
         };
 
-        let charge = RequestCharge {
-            _in_flight: in_flight,
-            _body: body,
-        };
         let qid = self.next_qid;
         let next_qid = qid + 1;
         match self.pending.park_call_guarded(qid, call, charge) {
@@ -291,9 +254,6 @@ impl Gateway {
     }
 
     fn hold_done(&mut self, qid: u64, route: Route, _result: SleepReply) -> Effect<Self> {
-        // take_by_key returns the parked caller and the RequestCharge;
-        // dropping the charge releases both shared leases (in-flight and
-        // body bytes). reply_to drives the slot to settled.
         let Some((slot, charge)) = self.pending.take_by_key(&qid) else {
             return noop();
         };
@@ -423,8 +383,8 @@ pub fn run(config: RunConfig) -> anyhow::Result<RunReport> {
     }
 
     // Owner stop must release every held charge. Shutdown drops the
-    // gateway isolate, which drops its `HashMap<qid, SharedLease>`,
-    // which releases. The post-shutdown snapshot is the load-bearing
+    // gateway isolate, which drops every parked capacity reservation.
+    // The post-shutdown snapshot is the load-bearing
     // proof: `current` must be 0 even if callers were still timing
     // out at shutdown time.
     shutdown(runtime);

@@ -125,15 +125,17 @@ impl Driver {
                 let mut effects = Vec::with_capacity(self.workers.len());
                 for (idx, worker) in self.workers.iter().enumerate() {
                     let key = idx as u32;
-                    let token = self.group.reserve_token().expect("group sized to FANOUT");
-                    let (effect, handle) = call_cancelable(*worker, WorkerMsg::Do, CALL_TIMEOUT)
-                        .then(move |outcome| DriverMsg::Returned {
-                            worker: key,
-                            token,
-                            outcome,
-                        });
-                    self.group
-                        .insert_reserved(key, token, handle)
+                    let effect = self
+                        .group
+                        .start_cancelable(
+                            key,
+                            call_cancelable(*worker, WorkerMsg::Do, CALL_TIMEOUT),
+                            |worker, token, outcome| DriverMsg::Returned {
+                                worker,
+                                token,
+                                outcome,
+                            },
+                        )
                         .expect("group sized to FANOUT");
                     effects.push(effect);
                 }

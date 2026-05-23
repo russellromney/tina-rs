@@ -115,15 +115,16 @@ impl QuoteGateway {
 
         for (idx, provider) in self.providers.iter().copied().enumerate() {
             let key = idx as u32;
-            let token = group.reserve_token().expect("group sized to providers");
-            let (effect, handle) = call_cancelable(provider, ProviderMsg::Quote, CALL_TIMEOUT)
-                .then(move |outcome| QuoteGatewayMsg::ProviderReturned {
+            let effect = group
+                .start_cancelable(
                     key,
-                    token,
-                    outcome,
-                });
-            group
-                .insert_reserved(key, token, handle)
+                    call_cancelable(provider, ProviderMsg::Quote, CALL_TIMEOUT),
+                    |key, token, outcome| QuoteGatewayMsg::ProviderReturned {
+                        key,
+                        token,
+                        outcome,
+                    },
+                )
                 .expect("fresh group accepts each provider");
             effects.push(effect);
         }
