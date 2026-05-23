@@ -662,6 +662,10 @@ fn websocket_accept_key(key: &str) -> String {
     base64::engine::general_purpose::STANDARD.encode(digest)
 }
 
+pub(crate) fn websocket_accept_key_for_client(key: &str) -> String {
+    websocket_accept_key(key)
+}
+
 fn parse_subprotocol_headers(headers: &HeaderMap) -> Result<Vec<String>, WebSocketError> {
     let mut out = Vec::new();
     for value in headers.get_all(SEC_WEBSOCKET_PROTOCOL) {
@@ -720,6 +724,14 @@ fn is_subprotocol_token(token: &str) -> bool {
 }
 
 pub(crate) fn parse_client_frame(buf: &mut Vec<u8>, limits: WebSocketLimits) -> FrameParse {
+    parse_frame(buf, limits, true)
+}
+
+pub(crate) fn parse_server_frame(buf: &mut Vec<u8>, limits: WebSocketLimits) -> FrameParse {
+    parse_frame(buf, limits, false)
+}
+
+fn parse_frame(buf: &mut Vec<u8>, limits: WebSocketLimits, expect_masked: bool) -> FrameParse {
     if buf.len() < 2 {
         return FrameParse::NeedMore;
     }
@@ -732,8 +744,11 @@ pub(crate) fn parse_client_frame(buf: &mut Vec<u8>, limits: WebSocketLimits) -> 
     if rsv != 0 {
         return FrameParse::Error(WebSocketError::UnsupportedExtension);
     }
-    if !masked {
+    if expect_masked && !masked {
         return FrameParse::Error(WebSocketError::ClientFrameUnmasked);
+    }
+    if !expect_masked && masked {
+        return FrameParse::Error(WebSocketError::ServerFrameMasked);
     }
     let mut offset = 2usize;
     let mut len = usize::from(b1 & 0x7f);
@@ -791,8 +806,13 @@ pub(crate) fn parse_client_frame(buf: &mut Vec<u8>, limits: WebSocketLimits) -> 
     if len > limits.max_message_bytes {
         return FrameParse::Error(WebSocketError::MessageTooLarge);
     }
-    let Some(mask_end) = offset.checked_add(4) else {
-        return FrameParse::Error(WebSocketError::FrameTooLarge);
+    let mask_end = if masked {
+        let Some(mask_end) = offset.checked_add(4) else {
+            return FrameParse::Error(WebSocketError::FrameTooLarge);
+        };
+        mask_end
+    } else {
+        offset
     };
     let Some(frame_end) = mask_end.checked_add(len) else {
         return FrameParse::Error(WebSocketError::FrameTooLarge);
@@ -800,16 +820,22 @@ pub(crate) fn parse_client_frame(buf: &mut Vec<u8>, limits: WebSocketLimits) -> 
     if buf.len() < frame_end {
         return FrameParse::NeedMore;
     }
-    let mask = [
-        buf[offset],
-        buf[offset + 1],
-        buf[offset + 2],
-        buf[offset + 3],
-    ];
+    let mask = if masked {
+        [
+            buf[offset],
+            buf[offset + 1],
+            buf[offset + 2],
+            buf[offset + 3],
+        ]
+    } else {
+        [0, 0, 0, 0]
+    };
     offset = mask_end;
     let mut payload = buf[offset..frame_end].to_vec();
-    for (i, byte) in payload.iter_mut().enumerate() {
-        *byte ^= mask[i % 4];
+    if masked {
+        for (i, byte) in payload.iter_mut().enumerate() {
+            *byte ^= mask[i % 4];
+        }
     }
     buf.drain(..frame_end);
     match opcode {
@@ -842,6 +868,52 @@ pub(crate) fn encode_server_message(message: WebSocketMessage) -> Result<Vec<u8>
             encode_server_frame(0x8, payload)
         }
     }
+}
+
+pub(crate) fn encode_client_message(
+    message: WebSocketMessage,
+    mask: [u8; 4],
+) -> Result<Vec<u8>, WebSocketError> {
+    match message {
+        WebSocketMessage::Text(text) => encode_client_frame(0x1, text.into_bytes(), mask),
+        WebSocketMessage::Binary(bytes) => encode_client_frame(0x2, bytes, mask),
+        WebSocketMessage::Ping(bytes) => encode_client_frame(0x9, bytes, mask),
+        WebSocketMessage::Pong(bytes) => encode_client_frame(0xA, bytes, mask),
+        WebSocketMessage::Close(code, reason) => {
+            let mut payload = Vec::with_capacity(2 + reason.len());
+            if let Some(code) = code {
+                payload.extend_from_slice(&code.0.to_be_bytes());
+            }
+            payload.extend_from_slice(&reason);
+            encode_client_frame(0x8, payload, mask)
+        }
+    }
+}
+
+pub(crate) fn encode_client_frame(
+    opcode: u8,
+    payload: Vec<u8>,
+    mask: [u8; 4],
+) -> Result<Vec<u8>, WebSocketError> {
+    if opcode >= 0x8 && payload.len() > 125 {
+        return Err(WebSocketError::ControlFrameTooLarge);
+    }
+    let mut out = Vec::with_capacity(payload.len() + 14);
+    out.push(0x80 | opcode);
+    if payload.len() < 126 {
+        out.push(0x80 | payload.len() as u8);
+    } else if u16::try_from(payload.len()).is_ok() {
+        out.push(0x80 | 126);
+        out.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+    } else {
+        out.push(0x80 | 127);
+        out.extend_from_slice(&(payload.len() as u64).to_be_bytes());
+    }
+    out.extend_from_slice(&mask);
+    for (i, byte) in payload.into_iter().enumerate() {
+        out.push(byte ^ mask[i % 4]);
+    }
+    Ok(out)
 }
 
 pub(crate) fn encode_server_frame(opcode: u8, payload: Vec<u8>) -> Result<Vec<u8>, WebSocketError> {

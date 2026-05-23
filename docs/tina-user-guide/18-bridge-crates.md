@@ -28,7 +28,12 @@ typed `GrpcStatus` trailers, message caps, no compression, and deadline
 mapping. The specimens prove tonic `0.12` h2c interop for the core modes. It
 is not tonic feature parity, not grpcurl reflection, not pooled production
 gRPC clients, and not HTTP/2 mTLS.
-Native HTTPS/1.1 lives in `tina-http`'s
+Native WebSocket client sessions live in `tina-http` too:
+`WebSocketClientConnection` owns a TCP/TLS rail, performs the HTTP/1.1
+upgrade, masks outbound client frames, auto-answers ping with pong, exposes
+typed send/receive/report calls, and emits WebSocket close facts. It is a
+native session, not a reconnecting client manager and not a bridge. Native
+HTTPS/1.1 lives in `tina-http`'s
 `HttpsListener` and `HttpClient` — explicit DER cert config, typed
 startup, matchable TLS errors. For repeated outbound
 requests against the same origin, `tina_http::build_keepalive_pool`

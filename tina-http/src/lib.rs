@@ -139,8 +139,15 @@
 //! [`SendOutcomeAction`]. Idle-eviction policy, the close timer, and any
 //! recurring tick stay in the room isolate.
 //!
-//! Still out of scope: HTTP/2 TLS ALPN, ACME, mTLS, SNI routing,
-//! system roots, certificate reload, redirects, cookies. For mature
+//! WebSocket client: [`WebSocketClientConnection`] is the native client
+//! session. It owns one TCP/TLS rail, performs the HTTP/1.1 upgrade, masks
+//! client frames, parses server frames, auto-answers ping with pong, and
+//! exposes typed `Connect` / `Send` / `Receive` / `Report` calls. It is not a
+//! reconnecting or pooled client manager.
+//!
+//! Still out of scope: ACME, mTLS, SNI routing, system roots, certificate
+//! reload, redirects, cookies, WebSocket permessage-deflate, HTTP/2
+//! WebSocket, and pooled/reconnecting WebSocket client managers. For mature
 //! outbound web-client behaviour use the `tina-reqwest-bridge` crate.
 
 #![cfg_attr(docsrs, feature(doc_cfg))]
@@ -164,6 +171,7 @@ pub mod target;
 pub mod transport;
 pub mod types;
 pub mod websocket;
+pub mod websocket_client;
 pub mod websocket_room;
 
 pub use body_metrics::{BodyCapacityFull, BodyMetrics, BodyPressureReport};
@@ -232,6 +240,11 @@ pub use websocket::{
     WebSocketSendOutcome, WebSocketSessionHandle, WebSocketSessionId, WebSocketSessionMsg,
     WebSocketSessionOutcome, WebSocketSessionReport, WebSocketSessionReportOutcome,
     WebSocketUpgradeRequest, websocket_upgrade,
+};
+pub use websocket_client::{
+    WebSocketClientConnected, WebSocketClientConnection, WebSocketClientError,
+    WebSocketClientEvent, WebSocketClientMsg, WebSocketClientReply, WebSocketClientReport,
+    WebSocketClientState, WebSocketTarget,
 };
 pub use websocket_room::{
     AdmitOutcome, SendOutcomeAction, WebSocketMemberTable, WebSocketMemberTableReport,
