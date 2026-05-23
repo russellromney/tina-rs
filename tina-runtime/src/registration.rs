@@ -38,9 +38,9 @@ use crate::mailbox::MailboxFactory;
 use crate::trace::{CauseId, RuntimeEventKind};
 use crate::{
     AnyMailboxAdapter, ChildRecord, DeliveredMessage, ErasedMailbox, HandlerAdapter,
-    IntoErasedSpawn, IntoErasedSpawnObserved, IntoSendErasedSpawnObserved, MailboxAdapter, MessageCallContext,
-    RegisteredAddress, RegisteredEntry, Runtime, SendOnlyServiceHandle, SendableHandlerAdapter,
-    ServiceHandle, SpawnOutcome, SplitServiceHandle, SupervisorRecord,
+    IntoErasedSpawn, IntoErasedSpawnObserved, IntoSendErasedSpawnObserved, MailboxAdapter,
+    MessageCallContext, RegisteredAddress, RegisteredEntry, Runtime, SendOnlyServiceHandle,
+    SendableHandlerAdapter, ServiceHandle, SpawnOutcome, SplitServiceHandle, SupervisorRecord,
 };
 
 impl<S, F> Runtime<S, F>

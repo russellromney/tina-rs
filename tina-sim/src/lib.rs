@@ -1681,12 +1681,18 @@ mod tests {
 
         let (child, trace) = run();
         let (replay_child, replay_trace) = run();
-        assert_eq!(trace, replay_trace, "cross-shard spawn must replay identically");
+        assert_eq!(
+            trace, replay_trace,
+            "cross-shard spawn must replay identically"
+        );
 
         // The owner learned the child's address, and it lives on shard 22.
         let child = child.expect("parent learns the cross-shard child address");
         assert_eq!(child.address.shard(), ShardId::new(22));
-        assert_eq!(replay_child.map(|c| c.address.shard()), Some(ShardId::new(22)));
+        assert_eq!(
+            replay_child.map(|c| c.address.shard()),
+            Some(ShardId::new(22))
+        );
 
         // The child was created on shard 22, not the owner's shard 11.
         assert!(

@@ -40,8 +40,8 @@ use crate::shutdown::{SharedShutdownState, ShutdownWorker, ThreadedShutdownHandl
 use crate::threaded::{ThreadedCommand, ThreadedRuntimeConfig, deliver_shutdown_signal_and_drain};
 use crate::trace::{RuntimeEvent, SendRejectedReason};
 use crate::{
-    IdSource, IntoErasedSpawn, IntoErasedSpawnObserved, IntoSendErasedSpawnObserved, QueuedRemoteEnvelope, Runtime,
-    SendableQueuedRemoteEnvelope,
+    IdSource, IntoErasedSpawn, IntoErasedSpawnObserved, IntoSendErasedSpawnObserved,
+    QueuedRemoteEnvelope, Runtime, SendableQueuedRemoteEnvelope,
 };
 
 /// One live worker-per-shard runtime over a fixed shard set.
@@ -1073,9 +1073,9 @@ fn route_remote_preserving_terminal(
         Err(failure)
             if failure.reason == SendRejectedReason::Full
                 && matches!(
-                        failure.envelope,
-                        QueuedRemoteEnvelope::CallReply(_) | QueuedRemoteEnvelope::SpawnReply(_)
-                    ) =>
+                    failure.envelope,
+                    QueuedRemoteEnvelope::CallReply(_) | QueuedRemoteEnvelope::SpawnReply(_)
+                ) =>
         {
             terminal_overflow.push_back(failure.envelope);
             Ok(())

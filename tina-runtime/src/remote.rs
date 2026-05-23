@@ -296,7 +296,9 @@ where
                 self.harvest_remote_call_reply(reply);
                 None
             }
-            QueuedRemoteEnvelope::SpawnRequest(request) => self.harvest_remote_spawn_request(request),
+            QueuedRemoteEnvelope::SpawnRequest(request) => {
+                self.harvest_remote_spawn_request(request)
+            }
             QueuedRemoteEnvelope::SpawnReply(reply) => {
                 self.harvest_remote_spawn_reply(reply);
                 None

@@ -9,7 +9,9 @@ use std::cell::RefCell;
 use std::convert::Infallible;
 use std::rc::Rc;
 
-use tina::{ChildDefinition, ChildRef, SpawnObservedError, SpawnObservedRemote, TrySendError, prelude::*};
+use tina::{
+    ChildDefinition, ChildRef, SpawnObservedError, SpawnObservedRemote, TrySendError, prelude::*,
+};
 use tina_runtime::{DefaultMailboxFactory, MultiShardRuntime, RuntimeCall, RuntimeEventKind};
 
 #[derive(Debug, Clone, Copy)]
@@ -179,8 +181,14 @@ fn on_shard_to_own_shard_makes_an_owned_local_child_no_child_started() {
         runtime.step();
     }
 
-    let child = learned.borrow().expect("owner learns the local child address");
-    assert_eq!(child.address.shard(), ShardId::new(11), "child is on the owner's shard");
+    let child = learned
+        .borrow()
+        .expect("owner learns the local child address");
+    assert_eq!(
+        child.address.shard(),
+        ShardId::new(11),
+        "child is on the owner's shard"
+    );
     // Local owned spawn does not record the cross-shard ChildStarted fact.
     assert!(
         !runtime
@@ -191,7 +199,9 @@ fn on_shard_to_own_shard_makes_an_owned_local_child_no_child_started() {
     );
 
     // It is genuinely owned: StopChildren on the owner closes it.
-    runtime.try_send(parent, CrossParentMsg::StopChildren).unwrap();
+    runtime
+        .try_send(parent, CrossParentMsg::StopChildren)
+        .unwrap();
     for _ in 0..4 {
         runtime.step();
     }
@@ -231,8 +241,14 @@ fn owner_stop_before_reply_cleans_up_pending_spawn_without_panic() {
     }
 
     // The continuation was never delivered to the stopped owner.
-    assert!(learned.borrow().is_none(), "stopped owner must not learn the address");
-    assert!(error.borrow().is_none(), "no error continuation delivered either");
+    assert!(
+        learned.borrow().is_none(),
+        "stopped owner must not learn the address"
+    );
+    assert!(
+        error.borrow().is_none(),
+        "no error continuation delivered either"
+    );
     // No panic reaching here is the cleanup proof; a leaked/late continuation
     // into the dead owner mailbox would otherwise surface as a rejected send.
 }

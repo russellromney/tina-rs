@@ -37,8 +37,8 @@ use crate::observer::TraceObserver;
 use crate::shutdown::{SharedShutdownState, ShutdownWorker, ThreadedShutdownHandle, handle_for};
 use crate::trace::{CallKind, RuntimeEvent};
 use crate::{
-    IdSource, IntoErasedSpawn, IntoErasedSpawnObserved, IntoSendErasedSpawnObserved, PreallocationConfig, Runtime,
-    TraceRetention,
+    IdSource, IntoErasedSpawn, IntoErasedSpawnObserved, IntoSendErasedSpawnObserved,
+    PreallocationConfig, Runtime, TraceRetention,
 };
 
 /// Configuration for [`ThreadedRuntime`].

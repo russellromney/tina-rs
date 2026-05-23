@@ -719,10 +719,8 @@ fn unsupervised_isolate_failure_stops_without_restart() {
     // No replacement: the factory ran once, for the initial spawn.
     assert_eq!(factory_calls.get(), 1);
     // The failure and stop are recorded, but supervision did nothing.
-    assert!(
-        runtime.trace().iter().any(|event| event.isolate() == child
-            && matches!(event.kind(), RuntimeEventKind::HandlerReportedFailure)),
-    );
+    assert!(runtime.trace().iter().any(|event| event.isolate() == child
+        && matches!(event.kind(), RuntimeEventKind::HandlerReportedFailure)),);
     assert_eq!(supervisor_events(runtime.trace()), Vec::new());
     assert_eq!(
         runtime.try_send(lineage_address(child), LineageMsg::SpawnChild),

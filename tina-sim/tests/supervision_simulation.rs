@@ -773,7 +773,10 @@ fn non_panic_child_failure_start_fail_restart_stop_sequence_is_replayable() {
 
     let trace = run();
     let replayed = run();
-    assert_eq!(trace, replayed, "fail/restart sequence must replay identically");
+    assert_eq!(
+        trace, replayed,
+        "fail/restart sequence must replay identically"
+    );
 
     let first = spawned_children(&trace)[0];
     // start -> fail -> stop -> restart, all visible and distinct from panic.
@@ -801,7 +804,10 @@ fn non_panic_child_failure_start_fail_restart_stop_sequence_is_replayable() {
     );
     let restarts = completed_restarts(&trace);
     assert_eq!(restarts.len(), 1, "the failed child must be restarted once");
-    assert_eq!(restarts[0].0, first, "restart must replace the failed child");
+    assert_eq!(
+        restarts[0].0, first,
+        "restart must replace the failed child"
+    );
 }
 
 #[test]
@@ -820,7 +826,10 @@ fn stop_children_closes_owned_children_and_replays() {
 
     let trace = run();
     let replayed = run();
-    assert_eq!(trace, replayed, "supervised shutdown must replay identically");
+    assert_eq!(
+        trace, replayed,
+        "supervised shutdown must replay identically"
+    );
 
     let children = spawned_children(&trace);
     assert_eq!(children.len(), 2, "two children were spawned");

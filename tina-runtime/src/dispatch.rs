@@ -765,8 +765,9 @@ where
                             .position(|pending| pending.request_id == request_id)
                         {
                             let pending = self.pending_remote_spawns.remove(pos);
-                            let message =
-                                (pending.continuation)(Err(SpawnObservedError::DestinationUnavailable));
+                            let message = (pending.continuation)(Err(
+                                SpawnObservedError::DestinationUnavailable,
+                            ));
                             self.deliver_observed_continuation(owner, message, cause);
                         }
                     }

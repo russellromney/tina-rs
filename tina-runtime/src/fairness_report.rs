@@ -109,11 +109,13 @@ impl FairnessReport {
         Self {
             isolates: rows
                 .into_iter()
-                .map(|(isolate, (handler_turns, sleep_completions))| IsolateProgress {
-                    isolate,
-                    handler_turns,
-                    sleep_completions,
-                })
+                .map(
+                    |(isolate, (handler_turns, sleep_completions))| IsolateProgress {
+                        isolate,
+                        handler_turns,
+                        sleep_completions,
+                    },
+                )
                 .collect(),
         }
     }

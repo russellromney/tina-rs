@@ -15,7 +15,10 @@ use crate::clock::MonotonicClock;
 use crate::mailbox::MailboxFactory;
 use crate::sharded::ReplyAdapter;
 use crate::trace::{RuntimeEvent, SendRejectedReason};
-use crate::{IdSource, IntoErasedSpawn, IntoErasedSpawnObserved, IntoSendErasedSpawnObserved, QueuedRemoteEnvelope, Runtime};
+use crate::{
+    IdSource, IntoErasedSpawn, IntoErasedSpawnObserved, IntoSendErasedSpawnObserved,
+    QueuedRemoteEnvelope, Runtime,
+};
 
 type RemoteQueueIndexes = BTreeMap<(ShardId, ShardId), usize>;
 type RemoteQueues = Vec<VecDeque<QueuedRemoteEnvelope>>;
@@ -424,9 +427,9 @@ fn enqueue_remote_envelope_preserving_terminal(
         )
     });
     let terminal = matches!(
-                    envelope,
-                    QueuedRemoteEnvelope::CallReply(_) | QueuedRemoteEnvelope::SpawnReply(_)
-                );
+        envelope,
+        QueuedRemoteEnvelope::CallReply(_) | QueuedRemoteEnvelope::SpawnReply(_)
+    );
     let queue = if terminal {
         &mut buffers.next_terminal[queue_index]
     } else {

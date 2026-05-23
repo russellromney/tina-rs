@@ -132,8 +132,8 @@ use remote::{QueuedRemoteEnvelope, SendableQueuedRemoteEnvelope};
 pub(crate) use dispatch::{
     AnyMailboxAdapter, ChildRecord, ErasedMailbox, ErasedMessage, ErasedSend, HandlerAdapter,
     IntoErasedSpawn, IntoErasedSpawnObserved, IntoSendErasedSpawnObserved, MailboxAdapter,
-    PendingRemoteSpawn, RegisteredAddress, RegisteredEntry, SendErasedSpawn, SendableHandlerAdapter,
-    SpawnOutcome, SupervisorRecord,
+    PendingRemoteSpawn, RegisteredAddress, RegisteredEntry, SendErasedSpawn,
+    SendableHandlerAdapter, SpawnOutcome, SupervisorRecord,
 };
 #[cfg(test)]
 pub(crate) use dispatch::{ChildRecordSnapshot, SupervisorRecordSnapshot};
@@ -222,6 +222,7 @@ pub use fact::{
     Http2StreamId, IntoRuntimeFact, ProtocolConnectionId, ProtocolDirection, ProtocolFact,
     ProtocolFamily, RuntimeFact, WebSocketCloseReason, WebSocketSessionId,
 };
+pub use fairness_report::{FairnessReport, IsolateProgress, StarvationWarning};
 pub use file_loops::{
     CopyLeg, FileCopyBounded, FileLoopEnd, FileLoopReport, FileLoopStep, FileReadChunks,
     FileWriteAll,
@@ -243,14 +244,13 @@ pub use scope::{
     ScopeRegisterError, ScopeRegisterSharedError, ScopedAdmitError, ScopedCallHandle,
     ScopedReplyError, scope_register,
 };
-pub use fairness_report::{FairnessReport, IsolateProgress, StarvationWarning};
 pub use service_pressure::{ServicePressureReport, ServicePressureSurface, ServiceSurfaceState};
 pub use shared_scope::{SharedCapacityScope, SharedLease, SharedScopeFull, SharedScopeReport};
-pub use supervision_report::{ChildSupervision, SupervisorHalt, SupervisorReport};
 pub use shared_work::{
     SharedWork, SharedWorkCallError, SharedWorkError, SharedWorkReplyError, SharedWorkSnapshot,
     SharedWorkTicket, request_effect_after_shared_wait,
 };
+pub use supervision_report::{ChildSupervision, SupervisorHalt, SupervisorReport};
 pub use tcp_loops::{LoopStep, ReadExactStep, TcpReadExact, TcpReadToEof, TcpWriteAll};
 /// Declares a Tina isolate whose call channel defaults to [`RuntimeCall<Message>`](RuntimeCall).
 ///

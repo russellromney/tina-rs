@@ -1137,7 +1137,8 @@ where
         Outbound: 'static,
     {
         let local_parent = (owner.shard == self.shard.id()).then_some(owner.isolate);
-        let child = self.register_entry::<I, Msg, Outbound>(isolate, local_parent, mailbox_capacity);
+        let child =
+            self.register_entry::<I, Msg, Outbound>(isolate, local_parent, mailbox_capacity);
         let child_isolate = child.isolate;
         let spawn_isolate = match local_parent {
             Some(parent) => {

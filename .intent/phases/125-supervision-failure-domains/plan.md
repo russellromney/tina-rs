@@ -26,9 +26,9 @@
   `stopped_supervisor_rejects_later_child_failure_without_replacement` guarantee
   holds. `SupervisorReport` counts and names the closed children.
 - **Cross-shard observed spawn** (`spawn_observed(child).on_shard(shard)`):
-  first sub-phase of cross-shard child ownership. A parent on shard A spawns an
-  observed child on shard B and learns its address back via the continuation +
-  a `ChildStarted` fact. New `Isolate::SpawnObservedRemote` associated type
+  first plumbing sub-phase toward cross-shard child ownership. A parent on shard
+  A spawns an observed child on shard B and learns its address back via the
+  continuation + a `ChildStarted` fact. New `Isolate::SpawnObservedRemote` associated type
   (defaulted `Infallible` via nightly `associated_type_defaults`, so existing
   isolates are unchanged) and `Effect::SpawnObservedOn`. Send-erased spawn
   payload carried monomorphically through the existing transport. Proven live
@@ -59,8 +59,8 @@
   shipped (above). Still open: cross-shard *stop* (owner stops a child on
   another shard), cross-shard *failure → restart → `ChildAddressChanged`* (the
   multi-round distributed-supervision protocol), and failed-shard ingress truth.
-  The owner link is registered on the child's shard but not yet consumed by a
-  supervision protocol.
+  The cross-shard child is currently parentless on its own shard; recording the
+  remote owner link is part of the deferred supervision protocol.
 - The local **remote-inbound-flood vs local-command** fairness proof already
   shipped earlier (`tina-runtime/tests/multishard_fairness.rs`).
 
