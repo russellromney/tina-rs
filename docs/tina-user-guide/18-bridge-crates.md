@@ -16,18 +16,18 @@ limits, visible ping/pong and close messages, client masking
 validation, and unmasked server frames. It is not HTTP/2 WebSocket,
 permessage-deflate, a browser session framework, or a broad client
 crate. For the bounded room/fanout copy path, see
-[Native WebSocket Server](20-native-websocket-server.md). Native HTTP/2 now has a
-server-first h2c path in `tina-http::Http2Listener`: cleartext
-prior-knowledge transport, bounded stream table, explicit
-connection/stream flow-control windows, ordinary `HttpRequest` /
-`HttpResponse` service dispatch, streamed response DATA from Tina chunk
-sources, and gRPC request-body pull sources. Native gRPC now layers unary,
-server-streaming, client-streaming, and first bidirectional `prost` messages on
-that h2c path through `tina_http::GrpcRouter`: `streaming` gives typed request
-pulls through `GrpcRequestStream`, typed `GrpcStatus` trailers, message caps,
-no compression, and service timeout mapped to `DeadlineExceeded`. The specimen
-proves tonic `0.12` h2c interop for those server-side modes. It is not tonic
-parity, not grpcurl reflection, not HTTPS/2 ALPN, and not a broad client.
+[Native WebSocket Server](20-native-websocket-server.md). Native HTTP/2 has a
+server h2c path in `tina-http::Http2Listener` and a client path in
+`tina-http::Http2ClientConnection`: bounded stream tables, explicit
+connection/stream flow-control windows, typed protocol errors, streaming
+request/response bodies, and protocol facts. The client can target h2c or
+h2/TLS with explicit ALPN through `Http2Target`. Native gRPC layers unary,
+server-streaming, client-streaming, and bidirectional `prost` messages on those
+HTTP/2 pieces through `GrpcRouter` and `GrpcClient`: typed request pulls,
+typed `GrpcStatus` trailers, message caps, no compression, and deadline
+mapping. The specimens prove tonic `0.12` h2c interop for the core modes. It
+is not tonic feature parity, not grpcurl reflection, not pooled production
+gRPC clients, and not HTTP/2 mTLS.
 Native HTTPS/1.1 lives in `tina-http`'s
 `HttpsListener` and `HttpClient` — explicit DER cert config, typed
 startup, matchable TLS errors. For repeated outbound
@@ -48,10 +48,10 @@ address in `handles.connections`, checking for
 lease admission. With `CloseMode::Drain`, the helper waits for
 leased connections to return before stopping connection isolates;
 if that deadline fires, the report names the remaining leased count
-and leaves connections running. Reach for a bridge when you need
-outbound HTTP/2 client behavior, HTTPS/2 ALPN, system trust roots,
-redirects/cookies, an existing Axum app, or a third-party SDK that only
-ships a Tokio client.
+and leaves connections running. Reach for a bridge when you need the
+broader ecosystem behavior Tina has not chosen to own natively:
+system trust roots, redirects/cookies, proxies, existing Axum/Tower
+apps, or a third-party SDK that only ships a Tokio client.
 
 ## What ships today
 
@@ -60,7 +60,7 @@ ships a Tokio client.
 | `tina-tokio-bridge` | Tokio caller → Tina isolate | A Tokio handler needs a bounded request/reply path into a Tina service. |
 | `tina-tower-bridge` | `tower::Service` over a Tina bridge | An Axum/Hyper/Tower stack wants to call a Tina service through normal Tower middleware. |
 | `tina-rpc-tokio` | Tokio caller → `tina-rpc` framed client | A Tokio task wants an `await`able shape over a registered `tina_rpc::Client` (correlator demux, bounded admission, opt-in retry). Wraps the existing client; does not own the wire. |
-| `tina-reqwest-bridge` | Tina caller → outbound HTTP via `reqwest` | A Tina service needs outbound HTTP/2, redirects, cookies, system trust roots, or other mature web-client behaviour. Native HTTPS/1.1 from `tina-http::HttpClient` covers single-request DER-rooted calls; native HTTP/2 is server-side h2c first form only; reqwest covers everything else. |
+| `tina-reqwest-bridge` | Tina caller → outbound HTTP via `reqwest` | A Tina service needs redirects, cookies, system trust roots, proxy/middleware behavior, or other mature web-client behaviour. Native `tina-http` covers HTTP/1.1, HTTPS/1.1, HTTP/2 h2c/h2-TLS client basics, keepalive pools, and protocol facts; reqwest covers the broad web-client ecosystem. |
 | `tina-sqlite-bridge` | Tina caller → SQLite via `rusqlite` | A Tina service needs an in-process SQL database. SQLite is sync C; the bridge owns one connection on a blocking std thread. Autocommit only; no pool, no transactions in first form. |
 | `tina-sqlx-bridge` | Tina caller → Postgres via `sqlx::PgPool` | A Tina service needs to reach a real Postgres without blocking shard threads. Two-runtime cost: the bridge spawns SQLx work on Tokio. Postgres-first. Ships `Execute`, `FetchOne`, bounded `FetchMany`, atomic-script `Transaction`, and opt-in DB-side cancel. Generic `sqlx::Database`, ORM, migrations, and user-struct row mapping stay non-goals. |
 | `tina-aws-bridge` | Tina caller → AWS SDK S3/SQS/DynamoDB/SNS/Secrets Manager | A Tina service needs AWS SDK behavior without letting AWS/Hyper/Tokio pressure become invisible. Ships S3 (`PutObject`, bounded `GetObject`, `HeadObject`, `DeleteObject`), SQS (`SendMessage`, `ReceiveMessage`, `DeleteMessage`), DynamoDB (`GetItem`, `PutItem`, `UpdateItem`, `DeleteItem`, `Query` with typed capacity facts), SNS (`Publish`), and Secrets Manager (`GetSecretValue`). The SDK still owns SigV4, credentials, HTTP, TLS, endpoints, and service protocols. |

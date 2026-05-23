@@ -6,15 +6,17 @@ Flows, one binary:
 
 - `file-ingest` — bounded file streaming via
   `tina_runtime::FileReadChunks`, plus a bounded `FileCopyBounded`
-  pump that copies src→dst and reads the destination back. The smoke
-  reads a small payload and copies one; the bad-input proof exercises
-  a cap shorter than the file and asserts `FileLoopEnd::CapReached`
-  instead of a silent truncation.
+  pump that owns the read/write alternation while still surfacing one
+  continuation per rail completion. The smoke reads a small payload
+  and copies one; the bad-input proof exercises a cap shorter than the
+  file and asserts `FileLoopEnd::CapReached` instead of a silent
+  truncation.
 - `admin-socket` — local admin sidecar over a simulator Unix-domain
   socket pair with line-delimited commands from
-  `tina_codec::LineFramer`. Smoke run sends three commands; the
-  bad-input proof feeds an over-long line and asserts the framer
-  surfaces `Full` and the connection is torn down.
+  `tina_codec::LineFramer` and the `UnixReadToEof` / `UnixWriteAll`
+  loop shape. Smoke run sends three commands; the bad-input proof
+  feeds an over-long line and asserts the framer surfaces `Full` and
+  the connection is torn down.
 - `framed-keyspace` — mini-keyspace protocol with length-prefixed
   frames using `tina_codec::LengthDelimitedFramer`. Smoke run does
   `set`/`get`; the bad-input proof feeds a frame whose declared

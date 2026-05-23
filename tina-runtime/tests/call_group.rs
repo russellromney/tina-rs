@@ -170,15 +170,16 @@ impl Svc {
         let mut effects = Vec::with_capacity(self.workers.len());
         for (idx, worker) in self.workers.iter().enumerate() {
             let key = idx as u32;
-            let token = group.reserve_token().expect("group sized to workers");
-            let (effect, handle) = call_cancelable(*worker, WorkerMsg::Do, Duration::from_secs(2))
-                .then(move |outcome| SvcMsg::Returned {
-                    worker: key,
-                    token,
-                    outcome,
-                });
-            group
-                .insert_reserved(key, token, handle)
+            let effect = group
+                .start_cancelable(
+                    key,
+                    call_cancelable(*worker, WorkerMsg::Do, Duration::from_secs(2)),
+                    |worker, token, outcome| SvcMsg::Returned {
+                        worker,
+                        token,
+                        outcome,
+                    },
+                )
                 .expect("race group sized to workers");
             effects.push(effect);
         }
@@ -363,17 +364,17 @@ impl OwnerDriver {
                 let mut effects = Vec::with_capacity(self.workers.len());
                 for (idx, worker) in self.workers.iter().enumerate() {
                     let key = idx as u32;
-                    let token = self.group.reserve_token().expect("group sized to workers");
-                    let (effect, handle) =
-                        call_cancelable(*worker, WorkerMsg::Do, Duration::from_secs(2)).then(
-                            move |outcome| OwnerMsg::Returned {
-                                worker: key,
+                    let effect = self
+                        .group
+                        .start_cancelable(
+                            key,
+                            call_cancelable(*worker, WorkerMsg::Do, Duration::from_secs(2)),
+                            |worker, token, outcome| OwnerMsg::Returned {
+                                worker,
                                 token,
                                 outcome,
                             },
-                        );
-                    self.group
-                        .insert_reserved(key, token, handle)
+                        )
                         .expect("owner group sized to workers");
                     effects.push(effect);
                 }

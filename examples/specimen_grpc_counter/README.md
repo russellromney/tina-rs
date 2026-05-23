@@ -63,4 +63,4 @@ cargo test --manifest-path examples/specimen_grpc_counter/Cargo.toml specimen_gr
 ```
 
 grpcurl reflection, interceptors, load balancing, production pooled clients,
-and TLS ALPN are later work.
+server-side HTTPS/2 ALPN, and mTLS are later work.

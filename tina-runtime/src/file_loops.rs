@@ -371,6 +371,32 @@ pub enum CopyLeg {
     Done,
 }
 
+/// Reply routed back into [`FileCopyBounded::advance`].
+#[derive(Debug)]
+pub enum FileCopyProgress {
+    /// Result of the last source `file_read_at`.
+    Read(FileReadReply),
+    /// Result of the last destination `file_write_at`.
+    Write(FileWriteReply),
+}
+
+/// Unified copy-pump step.
+pub enum FileCopyStep<I: Isolate> {
+    /// Helper issued the next read or write effect. Return it.
+    Pending(tina::Effect<I>),
+    /// Copy stopped with a terminal report.
+    Done(FileLoopReport),
+}
+
+impl<I: Isolate> std::fmt::Debug for FileCopyStep<I> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Pending(_) => formatter.write_str("Pending(<effect>)"),
+            Self::Done(report) => formatter.debug_tuple("Done").field(report).finish(),
+        }
+    }
+}
+
 impl FileCopyBounded {
     /// Build a bounded copy pump.
     ///
@@ -441,6 +467,62 @@ impl FileCopyBounded {
     {
         let buffer = self.in_flight.as_ref()?;
         Some(file_write_at(self.dst, buffer.clone(), self.pending_write_offset).then(on_progress))
+    }
+
+    /// Build the next effect for the current leg.
+    ///
+    /// This is the copy path for new callers. The older
+    /// [`next_leg`](Self::next_leg) / [`next_effect_read`](Self::next_effect_read)
+    /// / [`next_effect_write`](Self::next_effect_write) trio remains available
+    /// when a service wants to branch manually.
+    pub fn next_effect<I, M, FR, FW>(&self, on_read: FR, on_write: FW) -> Option<tina::Effect<I>>
+    where
+        I: Isolate<Message = M, Call = RuntimeCall<M>>,
+        FR: FnOnce(FileReadReply) -> M + Send + 'static,
+        FW: FnOnce(FileWriteReply) -> M + Send + 'static,
+        M: 'static,
+    {
+        match self.next_leg() {
+            CopyLeg::Read => self.next_effect_read(on_read),
+            CopyLeg::Write => self.next_effect_write(on_write),
+            CopyLeg::Done => None,
+        }
+    }
+
+    /// Record one read or write reply and return the next effect or terminal
+    /// report.
+    pub fn advance<I, M, FR, FW>(
+        &mut self,
+        progress: FileCopyProgress,
+        on_read: FR,
+        on_write: FW,
+    ) -> FileCopyStep<I>
+    where
+        I: Isolate<Message = M, Call = RuntimeCall<M>>,
+        FR: FnOnce(FileReadReply) -> M + Send + 'static,
+        FW: FnOnce(FileWriteReply) -> M + Send + 'static,
+        M: 'static,
+    {
+        let leg = match progress {
+            FileCopyProgress::Read(reply) => self.record_read(reply),
+            FileCopyProgress::Write(reply) => self.record_write(reply),
+        };
+        match leg {
+            Ok(CopyLeg::Read) => self
+                .next_effect_read(on_read)
+                .map(FileCopyStep::Pending)
+                .unwrap_or_else(|| {
+                    FileCopyStep::Done(self.terminal_report(FileLoopEnd::Done, None))
+                }),
+            Ok(CopyLeg::Write) => self
+                .next_effect_write(on_write)
+                .map(FileCopyStep::Pending)
+                .unwrap_or_else(|| {
+                    FileCopyStep::Done(self.terminal_report(FileLoopEnd::Done, None))
+                }),
+            Ok(CopyLeg::Done) => FileCopyStep::Done(self.terminal_report(FileLoopEnd::Done, None)),
+            Err(report) => FileCopyStep::Done(report),
+        }
     }
 
     /// Record a `file_read_at` reply.

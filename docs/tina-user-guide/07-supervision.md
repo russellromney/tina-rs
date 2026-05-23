@@ -90,6 +90,17 @@ too much medicine is poison
 
 Use small budgets in tests to prove failure is contained.
 
+Two budget shapes ship:
+
+- `RestartBudget::new(max)` — runtime-lifetime cap. After `max`
+  restarts, the next failure is terminal.
+- `RestartBudget::within(max, window)` — windowed cap. Restart count
+  resets after the window passes.
+
+Use the lifetime cap for simple "never restart more than N times" services.
+Use the windowed cap for long-lived workers where a burst is bad but one
+failure per hour is acceptable.
+
 ## What To Test
 
 For each supervised Tina port, test:

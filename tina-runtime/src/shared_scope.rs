@@ -28,6 +28,13 @@
 //! drop(lease);
 //! assert_eq!(scope.snapshot().current, 0);
 //!
+//! let bytes = SharedCapacityScope::new("api.body", "bytes", 1024);
+//! let reservation = SharedCapacityReservation::try_reserve([
+//!     scope.charge(1),
+//!     bytes.charge(256),
+//! ]).expect("both caps have room");
+//! drop(reservation); // releases both charges
+//!
 //! let mut summary = CapacitySummary::new();
 //! summary
 //!     .push(scope.surface_report(CapacityMode::Fixed))
@@ -83,6 +90,68 @@ pub struct SharedScopeReport {
     pub released: u64,
     /// Cumulative weight admitted.
     pub admitted: u64,
+}
+
+/// One requested charge against a [`SharedCapacityScope`].
+///
+/// Build with [`SharedCapacityScope::charge`], then pass one or more charges to
+/// [`SharedCapacityReservation::try_reserve`]. The helper admits every charge or
+/// rolls back the ones it already admitted before returning `Full`.
+#[derive(Debug, Clone)]
+#[must_use = "pass charges to SharedCapacityReservation::try_reserve"]
+pub struct SharedCapacityCharge {
+    scope: SharedCapacityScope,
+    weight: usize,
+}
+
+/// A group of shared-capacity charges that release together on drop.
+///
+/// Use this when a request must hold more than one budget while it is parked:
+/// for example one request-count unit and N body bytes. Admission is
+/// all-or-nothing. If a later charge is full, earlier charges are dropped before
+/// the error returns, so callers do not hand-write rollback.
+#[derive(Debug)]
+#[must_use = "dropping the reservation releases every charge"]
+pub struct SharedCapacityReservation {
+    leases: Vec<SharedLease>,
+}
+
+impl SharedCapacityReservation {
+    /// Attempts to reserve every supplied charge.
+    ///
+    /// On success, dropping the returned reservation releases every charge. On
+    /// failure, all earlier charges have already been released and the error
+    /// names the scope that refused admission.
+    pub fn try_reserve(
+        charges: impl IntoIterator<Item = SharedCapacityCharge>,
+    ) -> Result<Self, SharedScopeFull> {
+        let mut leases = Vec::new();
+        for charge in charges {
+            match charge.scope.try_admit(charge.weight) {
+                Ok(lease) => leases.push(lease),
+                Err(full) => {
+                    drop(leases);
+                    return Err(full);
+                }
+            }
+        }
+        Ok(Self { leases })
+    }
+
+    /// Number of charged scopes in this reservation.
+    pub fn len(&self) -> usize {
+        self.leases.len()
+    }
+
+    /// True when this reservation has no charges.
+    pub fn is_empty(&self) -> bool {
+        self.leases.is_empty()
+    }
+
+    /// Releases every charge now. Equivalent to `drop`.
+    pub fn release(self) {
+        // drop runs
+    }
 }
 
 impl SharedScopeReport {
@@ -205,6 +274,14 @@ impl SharedCapacityScope {
                 }
                 Err(observed) => cur = observed,
             }
+        }
+    }
+
+    /// Builds a requested charge for an all-or-nothing reservation.
+    pub fn charge(&self, weight: usize) -> SharedCapacityCharge {
+        SharedCapacityCharge {
+            scope: self.clone(),
+            weight,
         }
     }
 
@@ -377,6 +454,38 @@ mod tests {
         assert_eq!(err.current, 60);
         drop(big);
         let _ok = scope.try_admit(50).unwrap();
+    }
+
+    #[test]
+    fn reservation_reserves_and_releases_multiple_scopes() {
+        let requests = SharedCapacityScope::new("gw.in_flight", "requests", 4);
+        let bytes = SharedCapacityScope::new("gw.bytes", "bytes", 100);
+
+        let reservation =
+            SharedCapacityReservation::try_reserve([requests.charge(2), bytes.charge(60)]).unwrap();
+
+        assert_eq!(reservation.len(), 2);
+        assert_eq!(requests.snapshot().current, 2);
+        assert_eq!(bytes.snapshot().current, 60);
+        drop(reservation);
+        assert_eq!(requests.snapshot().current, 0);
+        assert_eq!(bytes.snapshot().current, 0);
+    }
+
+    #[test]
+    fn reservation_rolls_back_when_later_scope_is_full() {
+        let requests = SharedCapacityScope::new("gw.in_flight", "requests", 4);
+        let bytes = SharedCapacityScope::new("gw.bytes", "bytes", 100);
+        let _held = bytes.try_admit(80).unwrap();
+
+        let err = SharedCapacityReservation::try_reserve([requests.charge(2), bytes.charge(60)])
+            .unwrap_err();
+
+        assert_eq!(err.scope, "gw.bytes");
+        assert_eq!(requests.snapshot().current, 0);
+        assert_eq!(bytes.snapshot().current, 80);
+        assert_eq!(requests.snapshot().admitted, 2);
+        assert_eq!(requests.snapshot().released, 2);
     }
 
     #[test]

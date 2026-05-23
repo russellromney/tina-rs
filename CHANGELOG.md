@@ -4,6 +4,24 @@ This file records completed work.
 
 ## Unreleased
 
+### Ergonomic Obvious Fixes
+
+- Added `SharedCapacityReservation` and `SharedCapacityScope::charge(...)` so a
+  request can reserve multiple shared budgets all-or-nothing. Failed later
+  charges roll back earlier charges before returning the refusing
+  `SharedScopeFull`. `system_api_gateway_limits` now uses this instead of
+  hand-written in-flight/body rollback.
+- Added `CallGroup::start_cancelable(...)`, the copy path for first-success
+  races. It reserves the generation token, builds the cancelable continuation,
+  stores the handle, and returns the effect only after the group accepted the
+  branch. `ergonomics_playground`, `specimen_cancellation_chain`, and the live
+  `call_group` tests now use it.
+- Added `UnixWriteAll` and `UnixReadToEof`, mirroring the TCP loop helpers for
+  Unix-domain streams, including `Ok(0)` stuck-write detection.
+- Added the unified `FileCopyBounded::next_effect(...)` /
+  `FileCopyBounded::advance(...)` copy-pump path and migrated the local I/O
+  specimen away from manual `next_leg` dispatch.
+
 ### Roadmap And Specimen Bookkeeping
 
 - Updated `ROADMAP.md` so completed Wave A/post-122 work no longer appears as

@@ -275,8 +275,8 @@ pub fn bad_input_cap_reached() -> SpecimenReport {
 }
 
 // ---------------------------------------------------------------------------
-// FileCopyBounded: pump bytes src -> dst, bounded, with explicit
-// read/write leg dispatch via `next_leg`.
+// FileCopyBounded: pump bytes src -> dst, bounded, through the unified
+// advance/next_effect shape.
 // ---------------------------------------------------------------------------
 
 #[derive(Debug)]
@@ -307,18 +307,15 @@ struct CopyPump {
 
 impl CopyPump {
     fn drive(&mut self) -> Effect<Self> {
-        use tina_runtime::CopyLeg;
-        let pump = self.pump.as_ref().expect("pump armed");
-        match pump.next_leg() {
-            CopyLeg::Read => pump
-                .next_effect_read(CopyMsg::Read)
-                .unwrap_or_else(tina::noop),
-            CopyLeg::Write => pump
-                .next_effect_write(CopyMsg::Wrote)
-                .unwrap_or_else(tina::noop),
-            CopyLeg::Done => {
-                self.finish(self.pump.as_ref().unwrap().report(FileLoopEnd::CapReached))
-            }
+        let next = {
+            let pump = self.pump.as_ref().expect("pump armed");
+            pump.next_effect(CopyMsg::Read, CopyMsg::Wrote)
+                .map(Ok)
+                .unwrap_or_else(|| Err(pump.report(FileLoopEnd::CapReached)))
+        };
+        match next {
+            Ok(effect) => effect,
+            Err(report) => self.finish(report),
         }
     }
 
@@ -373,16 +370,24 @@ impl Isolate for CopyPump {
             CopyMsg::DstOpened(Err(_)) => Effect::Stop,
             CopyMsg::Read(reply) => {
                 let pump = self.pump.as_mut().expect("pump armed");
-                match pump.record_read(reply) {
-                    Ok(_leg) => self.drive(),
-                    Err(report) => self.finish(report),
+                match pump.advance(
+                    tina_runtime::FileCopyProgress::Read(reply),
+                    CopyMsg::Read,
+                    CopyMsg::Wrote,
+                ) {
+                    tina_runtime::FileCopyStep::Pending(effect) => effect,
+                    tina_runtime::FileCopyStep::Done(report) => self.finish(report),
                 }
             }
             CopyMsg::Wrote(reply) => {
                 let pump = self.pump.as_mut().expect("pump armed");
-                match pump.record_write(reply) {
-                    Ok(_leg) => self.drive(),
-                    Err(report) => self.finish(report),
+                match pump.advance(
+                    tina_runtime::FileCopyProgress::Write(reply),
+                    CopyMsg::Read,
+                    CopyMsg::Wrote,
+                ) {
+                    tina_runtime::FileCopyStep::Pending(effect) => effect,
+                    tina_runtime::FileCopyStep::Done(report) => self.finish(report),
                 }
             }
             CopyMsg::DstReadBack(Ok(bytes)) => {

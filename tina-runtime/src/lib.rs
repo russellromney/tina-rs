@@ -84,6 +84,7 @@ pub mod tcp_loops;
 mod threaded;
 mod threaded_multi_shard;
 mod trace;
+pub mod unix_loops;
 pub mod wait_list;
 
 pub use admission::{
@@ -202,7 +203,8 @@ pub use call::{
 pub use call_group::{
     CallGroup, CallGroupBranchOutcome, CallGroupCancelOutcome, CallGroupCancelRequest,
     CallGroupInsertError, CallGroupRecordCancelError, CallGroupRecordReplyError,
-    CallGroupReplyStep, CallGroupReport, CallGroupReserveError, CallGroupToken,
+    CallGroupReplyStep, CallGroupReport, CallGroupReserveError, CallGroupStartError,
+    CallGroupToken,
 };
 pub use capacity::{
     CapacityAssertError, CapacityNameError, CapacitySummary, SurfaceAssertion,
@@ -224,8 +226,8 @@ pub use fact::{
 };
 pub use fairness_report::{FairnessReport, IsolateProgress, StarvationWarning};
 pub use file_loops::{
-    CopyLeg, FileCopyBounded, FileLoopEnd, FileLoopReport, FileLoopStep, FileReadChunks,
-    FileWriteAll,
+    CopyLeg, FileCopyBounded, FileCopyProgress, FileCopyStep, FileLoopEnd, FileLoopReport,
+    FileLoopStep, FileReadChunks, FileWriteAll,
 };
 pub use guarded_pending::{
     GuardedInsertError, GuardedParkCallError, GuardedParkError, GuardedParkTicket,
@@ -245,7 +247,10 @@ pub use scope::{
     ScopedReplyError, scope_register,
 };
 pub use service_pressure::{ServicePressureReport, ServicePressureSurface, ServiceSurfaceState};
-pub use shared_scope::{SharedCapacityScope, SharedLease, SharedScopeFull, SharedScopeReport};
+pub use shared_scope::{
+    SharedCapacityCharge, SharedCapacityReservation, SharedCapacityScope, SharedLease,
+    SharedScopeFull, SharedScopeReport,
+};
 pub use shared_work::{
     SharedWork, SharedWorkCallError, SharedWorkError, SharedWorkReplyError, SharedWorkSnapshot,
     SharedWorkTicket, request_effect_after_shared_wait,
@@ -271,6 +276,7 @@ pub use trace::{
     RuntimeEvent, RuntimeEventKind, RuntimeTraceExt, SendRejectedReason, SupervisionRejectedReason,
     stable_trace_hash,
 };
+pub use unix_loops::{UnixReadToEof, UnixWriteAll};
 pub use wait_list::{
     WaitCallError as WaitListCallError, WaitError as WaitListError, WaitList,
     WaitReplyError as WaitListReplyError, WaitSnapshot as WaitListSnapshot, WaitTicket,

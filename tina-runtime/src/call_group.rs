@@ -1,7 +1,16 @@
 //! Bounded named helper for explicit isolate-call races.
 //!
 //! `CallGroup` is state and report vocabulary, not a scheduler. Users
-//! still build and return the visible Tina effects:
+//! still build and return the visible Tina effects. The copied path is
+//! [`CallGroup::start_cancelable`]:
+//!
+//! - it reserves a [`CallGroupToken`];
+//! - starts a [`crate::call_cancelable`] branch;
+//! - stores the returned [`tina::CallHandle`];
+//! - routes the reply continuation back with the token.
+//!
+//! The lower-level gears remain available when a service needs to split those
+//! steps:
 //!
 //! - reserve a [`CallGroupToken`] for each branch;
 //! - start each branch with [`crate::call_cancelable`];
@@ -22,6 +31,7 @@
 use tina::{CallHandle, CancelOutcome};
 
 use crate::CallOutcome;
+use crate::call::{CancelableCall, RuntimeCall};
 
 /// Opaque generation returned by [`CallGroup::insert`].
 ///
@@ -117,6 +127,22 @@ pub enum CallGroupInsertError<K, R> {
         token: CallGroupToken,
         /// Rejected call handle.
         handle: CallHandle<R>,
+    },
+}
+
+/// Reasons [`CallGroup::start_cancelable`] may reject a branch before
+/// returning its effect.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CallGroupStartError<K> {
+    /// Every slot is already live or reserved.
+    Full {
+        /// Rejected branch key.
+        key: K,
+    },
+    /// A live branch already uses this key.
+    DuplicateKey {
+        /// Rejected branch key.
+        key: K,
     },
 }
 
@@ -306,12 +332,7 @@ where
         key: K,
         handle: CallHandle<R>,
     ) -> Result<CallGroupToken, CallGroupInsertError<K, R>> {
-        if self.entries.is_empty() && matches!(self.race_state, RaceState::Complete) {
-            self.branch_outcomes.clear();
-            self.cancel_outcomes.clear();
-            self.expected_cancels.clear();
-            self.race_state = RaceState::Collecting;
-        }
+        self.reset_completed_if_empty();
         if self.entries.iter().any(|entry| entry.key == key) {
             return Err(CallGroupInsertError::DuplicateKey { key, handle });
         }
@@ -356,12 +377,7 @@ where
         token: CallGroupToken,
         handle: CallHandle<R>,
     ) -> Result<(), CallGroupInsertError<K, R>> {
-        if self.entries.is_empty() && matches!(self.race_state, RaceState::Complete) {
-            self.branch_outcomes.clear();
-            self.cancel_outcomes.clear();
-            self.expected_cancels.clear();
-            self.race_state = RaceState::Collecting;
-        }
+        self.reset_completed_if_empty();
         let Some(reserved_pos) = self
             .reserved_tokens
             .iter()
@@ -380,6 +396,64 @@ where
         let _ = self.reserved_tokens.swap_remove(reserved_pos);
         self.entries.push(Entry { key, token, handle });
         Ok(())
+    }
+
+    /// Builds, stores, and returns one cancelable branch effect.
+    ///
+    /// This is the copy path for first-success races:
+    ///
+    /// 1. reserve the generation token;
+    /// 2. build the cancelable call continuation carrying that token;
+    /// 3. store the handle under `key`;
+    /// 4. return the effect only after storage succeeds.
+    ///
+    /// The helper does not schedule the effect and does not cancel anything by
+    /// itself. Loser cancellation still comes back through
+    /// [`record_reply`](Self::record_reply) as explicit
+    /// [`CallGroupCancelRequest`] values.
+    pub fn start_cancelable<I, M, T, F>(
+        &mut self,
+        key: K,
+        call: CancelableCall<T, R>,
+        translator: F,
+    ) -> Result<tina::Effect<I>, CallGroupStartError<K>>
+    where
+        I: tina::Isolate<Message = M, Call = RuntimeCall<M>>,
+        F: FnOnce(K, CallGroupToken, CallOutcome<R>) -> M + 'static,
+        K: Clone + 'static,
+        M: 'static,
+        T: Send + 'static,
+        R: 'static,
+    {
+        self.reset_completed_if_empty();
+        if self.entries.iter().any(|entry| entry.key == key) {
+            return Err(CallGroupStartError::DuplicateKey { key });
+        }
+        let token = self
+            .reserve_token()
+            .map_err(|CallGroupReserveError::Full| CallGroupStartError::Full {
+                key: key.clone(),
+            })?;
+        let continuation_key = key.clone();
+        let (effect, handle) =
+            call.then(move |outcome| translator(continuation_key, token, outcome));
+        let reserved_pos = self
+            .reserved_tokens
+            .iter()
+            .position(|reserved| *reserved == token)
+            .expect("start_cancelable just reserved this token");
+        let _ = self.reserved_tokens.swap_remove(reserved_pos);
+        self.entries.push(Entry { key, token, handle });
+        Ok(effect)
+    }
+
+    fn reset_completed_if_empty(&mut self) {
+        if self.entries.is_empty() && matches!(self.race_state, RaceState::Complete) {
+            self.branch_outcomes.clear();
+            self.cancel_outcomes.clear();
+            self.expected_cancels.clear();
+            self.race_state = RaceState::Collecting;
+        }
     }
 
     /// Records one branch reply under a first-success race policy.

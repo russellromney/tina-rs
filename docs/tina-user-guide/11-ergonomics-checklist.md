@@ -1022,10 +1022,11 @@ as a small method on the sub-struct).
 ### TCP loops (read-to-eof, write-all)
 
 Follow the canonical patterns in
-[`docs/tcp-loops.md`](../tcp-loops.md). Driver-level
-`tcp_write_all` / `tcp_read_to_eof` are deliberately deferred — the
-documented user patterns keep partial-write progress observable in
-the trace.
+[`docs/tcp-loops.md`](../tcp-loops.md). Prefer `TcpWriteAll`,
+`TcpReadToEof`, `UnixWriteAll`, `UnixReadToEof`, and the file loop
+helpers over hand-rolled byte counters. They still expose one effect
+and one continuation per rail step, so partial progress stays visible
+in the trace.
 
 ### Mailbox capacity sizing
 

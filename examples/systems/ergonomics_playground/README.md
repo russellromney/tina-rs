@@ -30,6 +30,8 @@ What felt good:
   ambient.
 - `CallGroup` is the right semantic object for first-success races: it keeps
   winner, losers, and cancel outcomes named.
+- `CallGroup::start_cancelable` is the copied path now: it reserves the token,
+  stores the cancel handle, and only then returns the child effect.
 - `PendingReplies::drain_replies_with_into_effect` is exactly the helper a batch
   service wants at flush time.
 - Single-flight cache fill is a natural Tina shape: one explicit fill call, one
@@ -37,8 +39,9 @@ What felt good:
 
 What felt rough:
 
-- Starting a two-branch race still has noticeable ceremony: reserve token,
-  build cancelable call, insert handle, route token back in the continuation.
+- Race handling still has honest state: after the winner replies to the
+  original caller, loser cancellation completions can arrive later and must
+  still be recorded.
 - A service that replies to the original caller before loser cancellations settle
   needs a little state dance: the request is gone, but the race is not complete.
 - `PendingReplies` is smooth from `handle(...)` via `try_capture`; from

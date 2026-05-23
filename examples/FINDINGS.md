@@ -28,23 +28,23 @@ What is still active after reading the specimens and systems:
   shape, but the user still stitches together many nouns. Phase 120 should
   rewrite a small set on the blessed path and delete stale README guidance.
 - **Admission across parked work.** `system_api_gateway_limits` and
-  `system_soak_http_db` still show manual multi-scope charge/rollback and
-  "park this caller while holding this charge" ceremony. The important user
-  spelling is "admit all charges or answer Full, then release exactly once."
+  `system_soak_http_db` still show "park this caller while holding this
+  charge" ceremony. The multi-scope charge/rollback half now has
+  `SharedCapacityReservation`; the remaining gap is a park-friendly local
+  concurrency charge.
 - **Race / cancel / retry ceremony.** `ergonomics_playground` and
-  `system_job_queue` show the model is correct, but starting a race or
-  re-binding a cancelable caller after worker crash is still too manual.
-  Helpers must preserve branch identity, loser cancellation, late-reply truth,
-  and bounded pending storage.
+  `system_job_queue` show the model is correct. `CallGroup::start_cancelable`
+  now removes the branch-start token/handle ceremony; re-binding a cancelable
+  caller after worker crash remains intentionally unsolved.
 - **Cross-isolate setup.** Scatter/gather and paired registration still make
   users write bind/start adapter plumbing for the happy path.
 - **Runtime observation while running.** Several protocol/IPC specimens still
   want "observe accumulated facts" without `Arc<Mutex<_>>` side channels.
   Trace projection may be the right blessed path; if not, build a typed
   observation helper.
-- **Local I/O companions.** Phase 117 shipped the rails, but the specimens want
-  Unix `write_all` / `read_to_eof`, framed writers, and a less clunky
-  `FileCopyBounded` drive loop.
+- **Local I/O companions.** Phase 117 shipped the rails; `UnixWriteAll`,
+  `UnixReadToEof`, and the unified `FileCopyBounded` drive path now cover most
+  of the boring companions. Framed writers remain open.
 - **Session/control-message lifecycle.** WebSocket systems still expose rough
   edges around app-level control messages, send-vs-call entry points, and
   deterministic slow-peer proof. Phase 127 should own this, not Phase 120.
@@ -72,31 +72,30 @@ What felt good:
   seeds*. The boilerplate buys determinism nothing else can.
 - `retry_after` is exact, not approximate — time-based tests assert
   `== 100ms` and `== ["k=ok", "k=rate(100ms)"]` with no jitter tolerance.
-- Move-only permits + RAII release: parking a `SharedLease` as a
-  `GuardedPendingReplies` guard makes owner-stop release fall out for free
-  (`current == 0` after shutdown is the proof).
+- Move-only permits + RAII release: parking a
+  `SharedCapacityReservation` as a `GuardedPendingReplies` guard makes
+  owner-stop release fall out for free (`current == 0` after shutdown
+  is the proof).
 - `FullHandling` composition keeps retry visibly caller-owned, and
   "idempotency key named on the message" is the right home for the safety
   claim.
 
 What felt rough:
 
-- **`ConcurrencyPermit` is not drop-to-release, but `SharedLease` is**, and
+- **`ConcurrencyPermit` is not drop-to-release, but shared capacity is**, and
   the mismatch fights the deferred-reply pattern. `GuardedPendingReplies`
-  releases its guard by *dropping* it; a dropped `ConcurrencyPermit` leaks
-  the inner `LocalPermitGate` permit (loudly, but still a leak), while a
-  dropped `SharedLease` releases clean. This is why
-  `system_api_gateway_limits` stayed on raw `SharedCapacityScope` +
-  `SharedLease` instead of migrating to `ConcurrencyLimit`. **Build:** a
-  park-friendly concurrency charge that releases on drop (or a guarded
-  pending box that calls an explicit releaser), so the local-gate path
-  composes with multi-turn parking the way shared leases already do.
-- **Charging two shared budgets per request is manual two-phase with
-  rollback.** The gateway charges in-flight, then body bytes, and must
-  `drop(in_flight)` on body-full or it leaks; forgetting the rollback is
-  silent. `ConcurrencyLimit::with_shared_scope` takes only one scope.
-  **Build:** a multi-scope charge that admits all-or-nothing and rolls back
-  atomically.
+  releases its guard by *dropping* it; a dropped `ConcurrencyPermit`
+  leaks the inner `LocalPermitGate` permit (loudly, but still a leak),
+  while `SharedCapacityReservation` releases clean. This is why
+  `system_api_gateway_limits` stays on `SharedCapacityScope` instead of
+  migrating to `ConcurrencyLimit`. **Build:** a park-friendly
+  concurrency charge that releases on drop (or a guarded pending box
+  that calls an explicit releaser), so the local-gate path composes with
+  multi-turn parking the way shared capacity already does.
+- **Charging two shared budgets per request used to be manual two-phase with
+  rollback.** Closed by `SharedCapacityReservation::try_reserve([...])`, which
+  admits every charge or drops earlier leases before returning the full scope.
+  `ConcurrencyLimit::with_shared_scope` still takes only one shared scope.
 - **The exhaustive 7-variant match is honest but verbose.** A policy that
   can only produce 2–3 variants (`RateLimit<()>` in the pacing worker)
   still forces a pile of `_ => unreachable!()`. `into_admitted()` saves the
@@ -749,8 +748,9 @@ that proposal.
 `tina_runtime::GuardedPendingReplies<K, R, G>` pairs the parked caller
 with one RAII `G` guard, drops it exactly once on reply / drain /
 caller-gone sweep, and returns it back to the caller on failed
-admission. `system_api_gateway_limits` and `system_soak_http_db` both
-delete their `HashMap<qid, SharedLease>` sidecars in this phase.
+admission. `system_api_gateway_limits` now parks a
+`SharedCapacityReservation` directly in the slot, so there is no
+sidecar charge table.
 
 *(Historical finding kept below for context.)*
 
@@ -932,19 +932,9 @@ What felt good:
 
 What felt rough — each is a `Build`:
 
-- **Unix loop helpers are missing.** The new Unix rails shipped with no
-  `UnixWriteAll` / `UnixReadToEof`, so the partial-write loop
-  (`Wrote(Ok(count)) => drain; re-issue or advance`) was hand-rolled in
-  the admin server, the keyspace server, and the live echo test. Worse,
-  `Ok(0)` = backpressure is invisible in the types: the naive re-issue
-  loop hot-spins (this was review finding B7; the specimen now bounds it
-  by hand). This is the **third sighting** of the historical
-  `tcp_read_to_eof` / `tcp_write_all` companions finding
-  ([`FINDINGS_HISTORY.md`](FINDINGS_HISTORY.md), Round-era item 5, after
-  `specimen_outbound_fetch` and `specimen_mux_client`) — now on a freshly
-  added rail family with *zero* companions. **Build:** `UnixWriteAll`
-  (with `Ok(0)`/stuck-write detection) and `UnixReadToEof`, mirroring the
-  `file_loops` and `tcp_loops` helpers.
+- **Unix loop helpers were missing.** Closed by `UnixWriteAll` and
+  `UnixReadToEof`, mirroring the TCP helpers and surfacing `Ok(0)` stuck writes
+  as `CallError::Io` instead of hot-spinning.
 
 - **The codec owns decode but not encode+write.** `LineFramer` /
   `LengthDelimitedFramer` parse beautifully, but to *send* a framed reply
@@ -954,12 +944,9 @@ What felt rough — each is a `Build`:
   companion (e.g. a `LengthDelimitedWriter` / line writer that produces
   the bounded write effect), so encode+write reads like decode.
 
-- **`FileCopyBounded`'s two-method API is clunky.** Driving the copy pump
-  needs `match next_leg()` then the right `record_read` / `record_write`,
-  more ceremony than the single `advance()` on `FileReadChunks` /
-  `FileWriteAll`. **Build:** a unified `advance`-shaped step that names
-  which leg fired (e.g. `CopyStep::{PendingRead, PendingWrite, Done}`),
-  so callers stop branching on `next_leg` by hand.
+- **`FileCopyBounded`'s two-method API was clunky.** Closed by the unified
+  `next_effect(...)` / `advance(FileCopyProgress, ...)` path. The old
+  `next_leg` / `record_*` gears remain when a caller wants the mechanism.
 
 - **No blessed way to observe an isolate mid-run.** Every IPC specimen
   smuggles results out through `Arc<Mutex<Vec<...>>>` because the isolate
