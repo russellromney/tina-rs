@@ -17,6 +17,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use tina_runtime::{ServicePressureReport, ServiceSurfaceState};
+
 /// Per-op observation. Latency is included so the user can see
 /// timeout-vs-success-vs-error distributions without log scraping.
 #[derive(Debug, Clone)]
@@ -61,6 +63,193 @@ pub struct LoadRun {
     pub label: &'static str,
 }
 
+/// Phase-121 name for a configured load run. Alias kept so older
+/// specimens using `LoadRun` keep compiling.
+pub type LoadProfile = LoadRun;
+
+/// One bounded surface observed at the end of a load run.
+///
+/// The fields mirror the service pressure convention: no hidden
+/// buffers, no retries smuggled into the harness, just high-water,
+/// final-current, full counts, and an explicit leak verdict.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SurfacePlateau {
+    pub name: String,
+    pub kind: &'static str,
+    pub capacity: Option<usize>,
+    pub high_water: usize,
+    pub final_current: usize,
+    pub full: u64,
+    pub max_messages: Option<usize>,
+    pub current_messages: usize,
+    pub high_water_messages: usize,
+    pub max_weight: Option<usize>,
+    pub current_weight: Option<usize>,
+    pub high_water_weight: Option<usize>,
+    pub shared_max_weight: Option<usize>,
+    pub shared_current_weight: Option<usize>,
+    pub shared_high_water_weight: Option<usize>,
+    pub leak_clean: bool,
+}
+
+/// A surface the specimen knows exists but cannot measure numerically.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnavailableSurface {
+    pub name: String,
+    pub kind: &'static str,
+    pub reason: String,
+}
+
+impl SurfacePlateau {
+    /// Project every measured surface in a service pressure report.
+    /// Use [`UnavailableSurface::from_service_pressure`] to carry the
+    /// explicit unavailable half of the same report.
+    pub fn from_service_pressure(report: &ServicePressureReport) -> Vec<Self> {
+        report
+            .surfaces
+            .iter()
+            .filter_map(|surface| match &surface.state {
+                ServiceSurfaceState::Measured(capacity) => {
+                    let high_water = [
+                        capacity.high_water_messages,
+                        capacity.high_water_weight.unwrap_or(0),
+                        capacity.shared_high_water_weight.unwrap_or(0),
+                    ]
+                    .into_iter()
+                    .max()
+                    .unwrap_or(0);
+                    let final_current = [
+                        capacity.current_messages,
+                        capacity.current_weight.unwrap_or(0),
+                        capacity.shared_current_weight.unwrap_or(0),
+                    ]
+                    .into_iter()
+                    .max()
+                    .unwrap_or(0);
+                    let capacity_limit = [
+                        capacity.max_messages,
+                        capacity.max_weight,
+                        capacity.shared_max_weight,
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .max();
+                    let full = capacity
+                        .full_count
+                        .saturating_add(capacity.weight_full_count)
+                        .saturating_add(capacity.shared_weight_full_count);
+                    let leak_clean = capacity.current_messages == 0
+                        && capacity.current_weight.unwrap_or(0) == 0
+                        && capacity.shared_current_weight.unwrap_or(0) == 0;
+                    Some(Self {
+                        name: surface.name.clone(),
+                        kind: surface.kind,
+                        capacity: capacity_limit,
+                        high_water,
+                        final_current,
+                        full,
+                        max_messages: capacity.max_messages,
+                        current_messages: capacity.current_messages,
+                        high_water_messages: capacity.high_water_messages,
+                        max_weight: capacity.max_weight,
+                        current_weight: capacity.current_weight,
+                        high_water_weight: capacity.high_water_weight,
+                        shared_max_weight: capacity.shared_max_weight,
+                        shared_current_weight: capacity.shared_current_weight,
+                        shared_high_water_weight: capacity.shared_high_water_weight,
+                        leak_clean,
+                    })
+                }
+                ServiceSurfaceState::Unavailable { .. } => None,
+            })
+            .collect()
+    }
+
+    /// One-line key=value shape for specimen output.
+    pub fn summary_line(&self) -> String {
+        let mut line = format!(
+            "surface name={} kind={} capacity={} high_water={} final_current={} full={}",
+            report_value(&self.name),
+            report_value(self.kind),
+            option_usize(self.capacity),
+            self.high_water,
+            self.final_current,
+            self.full,
+        );
+        line.push_str(&format!(
+            " max_messages={} current_messages={} high_water_messages={}",
+            option_usize(self.max_messages),
+            self.current_messages,
+            self.high_water_messages,
+        ));
+        line.push_str(&format!(
+            " max_weight={} current_weight={} high_water_weight={}",
+            option_usize(self.max_weight),
+            option_usize(self.current_weight),
+            option_usize(self.high_water_weight),
+        ));
+        line.push_str(&format!(
+            " shared_max_weight={} shared_current_weight={} shared_high_water_weight={} leak_clean={}",
+            option_usize(self.shared_max_weight),
+            option_usize(self.shared_current_weight),
+            option_usize(self.shared_high_water_weight),
+            self.leak_clean,
+        ));
+        line
+    }
+}
+
+impl UnavailableSurface {
+    /// Project every explicitly unavailable surface in a service pressure
+    /// report. This keeps "we cannot measure that" user-visible.
+    pub fn from_service_pressure(report: &ServicePressureReport) -> Vec<Self> {
+        report
+            .surfaces
+            .iter()
+            .filter_map(|surface| match &surface.state {
+                ServiceSurfaceState::Measured(_) => None,
+                ServiceSurfaceState::Unavailable { reason } => Some(Self {
+                    name: surface.name.clone(),
+                    kind: surface.kind,
+                    reason: reason.clone(),
+                }),
+            })
+            .collect()
+    }
+
+    /// One-line key=value shape for specimen output.
+    pub fn summary_line(&self) -> String {
+        format!(
+            "surface name={} kind={} state=unavailable reason={}",
+            report_value(&self.name),
+            report_value(self.kind),
+            report_value(&self.reason),
+        )
+    }
+}
+
+/// End-of-run observations supplied by the specimen.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoadObservation {
+    pub leak_clean: bool,
+    pub surface_plateaus: Vec<SurfacePlateau>,
+    pub unavailable_surfaces: Vec<UnavailableSurface>,
+    pub trace_hash: Option<u64>,
+    pub late: u64,
+}
+
+impl Default for LoadObservation {
+    fn default() -> Self {
+        Self {
+            leak_clean: true,
+            surface_plateaus: Vec::new(),
+            unavailable_surfaces: Vec::new(),
+            trace_hash: None,
+            late: 0,
+        }
+    }
+}
+
 /// Summary of one [`LoadRun`].
 ///
 /// `leak_clean` is `true` when the optional `leak_check` was either not
@@ -85,12 +274,20 @@ pub struct LoadReport {
     pub latency_max_us: u64,
     pub elapsed_ms: u64,
     pub leak_clean: bool,
+    pub surface_plateaus: Vec<SurfacePlateau>,
+    pub unavailable_surfaces: Vec<UnavailableSurface>,
+    pub trace_hash: Option<u64>,
+    pub late: u64,
     /// Typed pressure summary: rate, burst length, first-error
     /// position, per-kind breakdown. Lets a specimen assert
     /// "pressure stayed under N per mille" or "no burst longer than
     /// K consecutive errors" without parsing the summary line.
     pub pressure: PressureSummary,
 }
+
+/// Phase-121 name for the report returned by [`LoadProfile`]. Alias kept
+/// alongside [`LoadReport`] for existing call sites.
+pub type LoadRunReport = LoadReport;
 
 /// Pressure summary for one [`LoadReport`].
 ///
@@ -126,7 +323,7 @@ impl PressureSummary {
             if i > 0 {
                 by_kind.push(',');
             }
-            by_kind.push_str(&format!("{k}:{v}"));
+            by_kind.push_str(&format!("{}:{v}", report_value(k)));
         }
         format!(
             "pressure total={} rate_per_mille={} max_consecutive={} first_err_op={} by_kind=[{}]",
@@ -146,8 +343,8 @@ impl LoadReport {
     pub fn summary_line(&self) -> String {
         format!(
             "load label={} workers={} ops={} ok={} err={} timeout={} \
-             min_us={} p50_us={} p99_us={} max_us={} elapsed_ms={} leak_clean={} {}",
-            self.label,
+             min_us={} p50_us={} p99_us={} max_us={} elapsed_ms={} leak_clean={} late={} trace_hash={} surfaces={} unavailable_surfaces={} {}",
+            report_value(self.label),
             self.workers,
             self.ops_attempted,
             self.ops_ok,
@@ -159,6 +356,12 @@ impl LoadReport {
             self.latency_max_us,
             self.elapsed_ms,
             self.leak_clean,
+            self.late,
+            self.trace_hash
+                .map(|hash| hash.to_string())
+                .unwrap_or_else(|| "none".to_string()),
+            self.surface_plateaus.len(),
+            self.unavailable_surfaces.len(),
             self.pressure.summary_line(),
         )
     }
@@ -173,6 +376,29 @@ pub fn run<F, L>(run: LoadRun, op: F, leak_check: Option<L>) -> LoadReport
 where
     F: Fn(usize) -> OpOutcome + Send + Sync + 'static,
     L: FnOnce() -> bool,
+{
+    run_with_observation(
+        run,
+        op,
+        leak_check.map(|check| {
+            move || LoadObservation {
+                leak_clean: check(),
+                ..LoadObservation::default()
+            }
+        }),
+    )
+}
+
+/// Run `op` under load and collect a typed end-of-run observation.
+///
+/// Use this when a specimen can report capacity high-water/final-current
+/// counts, late results, and trace fingerprints. The harness records what
+/// the specimen returns; it does not retry, drain hidden queues, or turn
+/// `Full` into success.
+pub fn run_with_observation<F, O>(run: LoadRun, op: F, observation: Option<O>) -> LoadReport
+where
+    F: Fn(usize) -> OpOutcome + Send + Sync + 'static,
+    O: FnOnce() -> LoadObservation,
 {
     assert!(run.workers > 0, "LoadRun.workers must be > 0");
     assert!(
@@ -247,7 +473,10 @@ where
     }
     let elapsed = started.elapsed();
 
-    let leak_clean = leak_check.map(|f| f()).unwrap_or(true);
+    let observation = observation.map(|f| f()).unwrap_or_else(|| LoadObservation {
+        leak_clean: true,
+        ..LoadObservation::default()
+    });
 
     let mut latencies = combined.latencies_us;
     latencies.sort_unstable();
@@ -287,7 +516,15 @@ where
         latency_p99_us: p99,
         latency_max_us: max,
         elapsed_ms: elapsed.as_millis() as u64,
-        leak_clean,
+        leak_clean: observation.leak_clean
+            && observation
+                .surface_plateaus
+                .iter()
+                .all(|surface| surface.leak_clean),
+        surface_plateaus: observation.surface_plateaus,
+        unavailable_surfaces: observation.unavailable_surfaces,
+        trace_hash: observation.trace_hash,
+        late: observation.late,
         pressure,
     }
 }
@@ -339,10 +576,31 @@ fn percentile(sorted: &[u64], pct: u32) -> u64 {
     sorted[idx]
 }
 
+fn option_usize(value: Option<usize>) -> String {
+    value
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "none".to_string())
+}
+
+fn report_value(value: &str) -> String {
+    if value.is_empty()
+        || value.chars().any(|c| {
+            c.is_whitespace()
+                || c.is_control()
+                || matches!(c, '=' | '[' | ']' | ',' | ':' | '"' | '\\')
+        })
+    {
+        format!("{value:?}")
+    } else {
+        value.to_string()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicU64;
+    use tina::capacity::{CapacityMode, CapacitySurfaceReport};
 
     #[test]
     fn ops_cap_bounds_work_count() {
@@ -419,6 +677,24 @@ mod tests {
     }
 
     #[test]
+    fn pressure_summary_quotes_error_kinds_that_would_break_key_value_lines() {
+        let report = run(
+            LoadRun {
+                workers: 1,
+                stop: LoadStop::ops(1),
+                label: "label with space",
+            },
+            |_| OpOutcome::Err {
+                kind: "mailbox full",
+            },
+            None::<fn() -> bool>,
+        );
+        let line = report.summary_line();
+        assert!(line.contains("label=\"label with space\""), "{line}");
+        assert!(line.contains("by_kind=[\"mailbox full\":1]"), "{line}");
+    }
+
+    #[test]
     fn leak_check_is_reported() {
         let report = run(
             LoadRun {
@@ -430,6 +706,145 @@ mod tests {
             Some(|| false),
         );
         assert!(!report.leak_clean);
+    }
+
+    #[test]
+    fn load_observation_reports_surfaces_late_and_trace_hash() {
+        let report = run_with_observation(
+            LoadRun {
+                workers: 1,
+                stop: LoadStop::ops(2),
+                label: "observed",
+            },
+            |_| OpOutcome::Ok,
+            Some(|| LoadObservation {
+                leak_clean: true,
+                surface_plateaus: vec![SurfacePlateau {
+                    name: "svc.mailbox".to_string(),
+                    kind: "mailbox",
+                    capacity: Some(4),
+                    high_water: 4,
+                    final_current: 0,
+                    full: 1,
+                    max_messages: Some(4),
+                    current_messages: 0,
+                    high_water_messages: 4,
+                    max_weight: None,
+                    current_weight: None,
+                    high_water_weight: None,
+                    shared_max_weight: None,
+                    shared_current_weight: None,
+                    shared_high_water_weight: None,
+                    leak_clean: true,
+                }],
+                unavailable_surfaces: vec![UnavailableSurface {
+                    name: "svc.protocol".to_string(),
+                    kind: "protocol",
+                    reason: "not exercised".to_string(),
+                }],
+                trace_hash: Some(42),
+                late: 3,
+            }),
+        );
+        assert_eq!(report.ops_ok, 2);
+        assert!(report.leak_clean);
+        assert_eq!(report.surface_plateaus.len(), 1);
+        assert_eq!(report.unavailable_surfaces.len(), 1);
+        assert_eq!(report.trace_hash, Some(42));
+        assert_eq!(report.late, 3);
+        let line = report.summary_line();
+        assert!(line.contains("late=3"), "{line}");
+        assert!(line.contains("trace_hash=42"), "{line}");
+        assert!(line.contains("surfaces=1"), "{line}");
+        assert!(line.contains("unavailable_surfaces=1"), "{line}");
+    }
+
+    #[test]
+    fn surface_plateau_projects_service_pressure_without_hidden_leaks_or_missing_surfaces() {
+        let mut pressure = ServicePressureReport::new("svc");
+        pressure.add_measured(
+            "mailbox",
+            CapacitySurfaceReport::count("svc.mailbox", CapacityMode::Fixed, 4, 0, 4, 2)
+                .with_shared_scope("body.bytes", 100, 0, 90, 3),
+        );
+        pressure.add_unavailable("svc.ws", "protocol", "not exercised");
+
+        let plateaus = SurfacePlateau::from_service_pressure(&pressure);
+        let unavailable = UnavailableSurface::from_service_pressure(&pressure);
+        assert_eq!(plateaus.len(), 1);
+        assert_eq!(plateaus[0].name, "svc.mailbox");
+        assert_eq!(plateaus[0].capacity, Some(100));
+        assert_eq!(plateaus[0].high_water, 90);
+        assert_eq!(plateaus[0].high_water_messages, 4);
+        assert_eq!(plateaus[0].shared_high_water_weight, Some(90));
+        assert_eq!(plateaus[0].final_current, 0);
+        assert_eq!(plateaus[0].full, 5);
+        assert!(plateaus[0].leak_clean);
+        assert_eq!(unavailable.len(), 1);
+        assert_eq!(unavailable[0].name, "svc.ws");
+        assert_eq!(unavailable[0].reason, "not exercised");
+    }
+
+    #[test]
+    fn surface_lines_quote_sloppy_names_and_show_each_capacity_axis() {
+        let plateau = SurfacePlateau {
+            name: "svc mailbox".to_string(),
+            kind: "mail box",
+            capacity: Some(4),
+            high_water: 9,
+            final_current: 0,
+            full: 1,
+            max_messages: Some(4),
+            current_messages: 0,
+            high_water_messages: 4,
+            max_weight: Some(100),
+            current_weight: Some(0),
+            high_water_weight: Some(9),
+            shared_max_weight: None,
+            shared_current_weight: None,
+            shared_high_water_weight: None,
+            leak_clean: true,
+        };
+        let line = plateau.summary_line();
+        assert!(line.contains("name=\"svc mailbox\""), "{line}");
+        assert!(line.contains("kind=\"mail box\""), "{line}");
+        assert!(line.contains("max_messages=4"), "{line}");
+        assert!(line.contains("high_water_weight=9"), "{line}");
+    }
+
+    #[test]
+    fn nonzero_weight_or_shared_current_marks_surface_leaky() {
+        let mut pressure = ServicePressureReport::new("svc");
+        pressure.add_measured(
+            "body",
+            CapacitySurfaceReport::weighted(
+                "svc.body",
+                CapacityMode::Fixed,
+                100,
+                3,
+                10,
+                0,
+                "bytes",
+            )
+            .with_shared_scope("scope", 100, 0, 10, 0),
+        );
+        let plateaus = SurfacePlateau::from_service_pressure(&pressure);
+        assert_eq!(plateaus[0].final_current, 3);
+        assert!(!plateaus[0].leak_clean);
+    }
+
+    #[test]
+    fn aggregate_current_does_not_hide_message_count_when_shared_weight_exists() {
+        let mut pressure = ServicePressureReport::new("svc");
+        pressure.add_measured(
+            "mixed",
+            CapacitySurfaceReport::count("svc.mixed", CapacityMode::Fixed, 4, 2, 3, 0)
+                .with_shared_scope("scope", 100, 0, 50, 0),
+        );
+        let plateaus = SurfacePlateau::from_service_pressure(&pressure);
+        assert_eq!(plateaus[0].final_current, 2);
+        assert_eq!(plateaus[0].high_water, 50);
+        assert!(!plateaus[0].leak_clean);
     }
 
     #[test]

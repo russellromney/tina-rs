@@ -4,8 +4,8 @@ use std::time::{Duration, Instant};
 
 use tina::prelude::*;
 use tina_runtime::{
-    DefaultThreadedMailboxFactory, HostBurstOutcomes, SingleCallGate, SleepReply, ThreadedRuntime,
-    sleep,
+    DefaultThreadedMailboxFactory, FairnessReport, HostBurstOutcomes, SingleCallGate, SleepReply,
+    ThreadedRuntime, sleep, stable_trace_hash,
 };
 
 use crate::{COLD_WRITES_PER_SHARD, HOT_WRITES, PER_WRITE_MS, Report, SHARD_MAILBOX, SHARDS};
@@ -149,6 +149,46 @@ pub fn run() -> anyhow::Result<Report> {
         cold_rejected += s.mailbox_full + s.ingress_full;
     }
 
+    let trace = runtime.trace();
+    let fairness = FairnessReport::from_events(trace.events().iter());
+    let hot_isolate = stores[0].isolate();
+    let hot_turns = fairness.turns(hot_isolate);
+    let cold_turns: Vec<u64> = stores[1..]
+        .iter()
+        .map(|store| fairness.turns(store.isolate()))
+        .collect();
+    let cold_min_turns = cold_turns.iter().copied().min().unwrap_or(0);
+    let cold_expected_turns = outcomes[1..]
+        .iter()
+        .map(|outcome| u64::from(outcome.snapshot().admitted) * 2 + 1)
+        .collect::<Vec<_>>();
+    let cold_min_expected_turns = cold_expected_turns.iter().copied().min().unwrap_or(0);
+    let max_cold_progress_deficit_turns = cold_expected_turns
+        .iter()
+        .zip(cold_turns.iter())
+        .map(|(expected, actual)| expected.saturating_sub(*actual))
+        .max()
+        .unwrap_or(0);
+    let progress_gaps = stores[1..]
+        .iter()
+        .map(|store| fairness.progress_gap(store.isolate(), hot_isolate, None))
+        .collect::<Vec<_>>();
+    let max_progress_gap_turns = progress_gaps
+        .iter()
+        .map(|lag| lag.observed)
+        .max()
+        .unwrap_or(0);
+    let fairness_line = format!(
+        "{} {}",
+        fairness,
+        progress_gaps
+            .iter()
+            .map(|lag| lag.summary_line())
+            .collect::<Vec<_>>()
+            .join(" ")
+    );
+    let trace_hash = stable_trace_hash(trace.events().iter());
+
     if let Ok(rt) = Arc::try_unwrap(runtime) {
         let _ = rt.shutdown();
     }
@@ -157,6 +197,13 @@ pub fn run() -> anyhow::Result<Report> {
         hot_rejected,
         cold_admitted,
         cold_rejected,
+        hot_turns,
+        cold_min_turns,
+        cold_min_expected_turns,
+        max_cold_progress_deficit_turns,
+        max_progress_gap_turns,
+        trace_hash,
+        fairness_line,
         exit_clean: true,
     })
 }

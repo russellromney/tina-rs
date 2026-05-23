@@ -21,4 +21,7 @@ pub mod load;
 
 pub use bad_peer::{BadPeerOutcome, BadPeerScenario};
 pub use live_replay::{LiveTrace, LiveTraceHandle, LiveTraceLoss};
-pub use load::{LoadReport, LoadRun, LoadStop, OpOutcome};
+pub use load::{
+    LoadObservation, LoadProfile, LoadReport, LoadRun, LoadRunReport, LoadStop, OpOutcome,
+    SurfacePlateau, UnavailableSurface,
+};

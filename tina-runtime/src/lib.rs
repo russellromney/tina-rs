@@ -224,7 +224,7 @@ pub use fact::{
     Http2StreamId, IntoRuntimeFact, ProtocolConnectionId, ProtocolDirection, ProtocolFact,
     ProtocolFamily, RuntimeFact, WebSocketCloseReason, WebSocketSessionId,
 };
-pub use fairness_report::{FairnessReport, IsolateProgress, StarvationWarning};
+pub use fairness_report::{FairnessReport, IsolateProgress, LagObservation, StarvationWarning};
 pub use file_loops::{
     CopyLeg, FileCopyBounded, FileCopyProgress, FileCopyStep, FileLoopEnd, FileLoopReport,
     FileLoopStep, FileReadChunks, FileWriteAll,

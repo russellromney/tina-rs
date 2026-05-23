@@ -27,6 +27,11 @@ The smoke test asserts:
 - every burst write is accounted for;
 - the hot shard rejected at least one write (overload was visible);
 - the cold shards admitted everything (fairness held).
+- Tina's trace-derived `FairnessReport` says every cold isolate made
+  enough progress to process its admitted writes and drain command. The
+  raw hot-vs-cold `progress_gap_turns` is printed honestly, but it is not
+  treated as unfair by itself because the hot shard may legitimately
+  admit more work.
 
 ## What feels good
 
