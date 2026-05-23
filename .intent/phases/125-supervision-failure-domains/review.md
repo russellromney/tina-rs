@@ -246,3 +246,56 @@ integration *binary* suite (`tests/*.rs`) could not finish linking under that
 constraint; the affected files use `match event.kind() { … _ => … }` catch-alls,
 so the additive new variants do not change their compile or pass behavior.
 Re-run `cargo test -p tina-runtime --tests` once the volume has room.
+
+# Second hostile review (post-merge, deep pass)
+
+A second, deliberately hostile review (three agents + an adversarial Codex-style
+pass) on the merged branch. Findings and their disposition.
+
+## Fixed
+- **FairnessReport overclaimed.** `timer_ticks` actually counted *any* `Sleep`
+  completion → renamed to `sleep_completions` (field + accessor + Display). The
+  module doc, CHANGELOG, and plan now scope it honestly as the *progress-count*
+  slice; `ReadyTurnLag` / `TimerLateBy` / `RemoteDrainYield` from the plan's
+  Implementation Shape are explicitly **not** implemented (they need a per-turn
+  ready signal and event timestamps the trace does not carry).
+- **`StarvationWarning` footgun.** Added `FairnessReport::starvation_by_gap`
+  (compares victim vs hot directly), so callers no longer need to thread an
+  external round count; the live proof now uses it.
+- **Downcast-fail masked an internal bug** → `debug_assert!(false, …)` before
+  the `DestinationUnavailable` fallback in both engines.
+- **Docs:** `.on_shard` now documents (a) only `ChildDefinition` is supported
+  (`RestartableChildDefinition` is `!Send` → trait-bound error), (b) unknown
+  shard panics like any cross-shard send, (c) a cross-shard child is not yet
+  supervision-owned and `.on_shard(my_shard)` is an owned local spawn.
+  `isolate_types!` documents that only its full arm accepts
+  `spawn_observed_remote`. The "behaves exactly like local spawn_observed"
+  claim was softened (continuation trace-cause differs). CHANGELOG carries the
+  SupervisorReport cross-shard caveat.
+- **Test:** `spawn_on_remote_then_stop_in_one_turn_is_safe` pins that batching a
+  remote spawn before a stop is owner-side safe (no panic, no continuation).
+
+## Documented as known D1 limitations (not fixed — out of sub-phase scope)
+- **A panicking user continuation is not caught.** The `spawn_observed`
+  continuation (cross-shard *and* ordinary same-shard) runs in
+  `execute_effect` / harvest, outside the handler `catch_unwind`, so a panicking
+  continuation unwinds the shard worker. This is a pre-existing runtime property
+  (ordinary `spawn_observed` has it too), not new here; making continuations
+  panic-safe is a runtime-wide policy decision, not a D1 change.
+- **A dying owner orphans an in-flight cross-shard spawn.** Owner stop / restart
+  / `batch([spawn.on_shard(B), stop()])` sweeps the pending record; the reply
+  comes home to a gone owner and is harmlessly dropped, but the child created on
+  B is orphaned (cross-shard children are not yet supervision-owned). Recording
+  the remote owner link + stopping the orphan is the deferred supervision half.
+- **`.on_shard(unknown_shard)` panics** the worker (consistent with any
+  cross-shard `send`/`call` to an unknown shard). A typed error would require
+  changing shared routing semantics — a separate decision.
+
+## Open decision (needs project owner)
+- **Nightly regression of the `tina` trait crate.** `tina` was the only
+  stable-clean crate (no `#![feature]`), and declares `rust-version = "1.85"`.
+  `Isolate::SpawnObservedRemote`'s default uses `associated_type_defaults`
+  (nightly), making `tina` nightly-only. Non-breaking, but a real regression of
+  the trait crate's stable usability. The alternative (drop the default) keeps
+  `tina` stable but is a breaking change to **every** hand-written `Isolate`
+  impl (each must add `type SpawnObservedRemote = Infallible;`). Decision pending.

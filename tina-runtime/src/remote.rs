@@ -325,10 +325,14 @@ where
         let outcome = match payload.downcast::<Box<dyn SendErasedSpawn<S, F>>>() {
             Ok(spawn) => (*spawn).spawn_remote(self, owner, cause),
             // Unreachable in practice: only this runtime boxes that payload and
-            // both shards share `S, F` (identical `TypeId`). If it ever fires it
-            // is an internal invariant break, not a zero-capacity request, so
-            // report the honest "could not complete on the destination".
-            Err(_) => Err(tina::SpawnObservedError::DestinationUnavailable),
+            // both shards share `S, F` (identical `TypeId`). A failure is an
+            // internal invariant break, so trip in debug/test rather than
+            // silently masquerading as a transport failure; release degrades to
+            // a typed DestinationUnavailable.
+            Err(_) => {
+                debug_assert!(false, "cross-shard spawn payload downcast failed");
+                Err(tina::SpawnObservedError::DestinationUnavailable)
+            }
         };
         Some(QueuedRemoteEnvelope::SpawnReply(RemoteSpawnReply {
             request_id,

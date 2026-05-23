@@ -721,6 +721,21 @@ impl<S, M, R> SpawnObservedBuilder<S, M, R> {
     /// later turn, once the destination shard registers it. Same-shard
     /// `spawn_observed` is unaffected — this method is the only place the
     /// `Send` requirement appears.
+    ///
+    /// Scope and sharp edges (this is the first cross-shard sub-phase):
+    ///
+    /// - Only [`ChildDefinition`] is supported as the spawn payload.
+    ///   [`RestartableChildDefinition`] is `!Send` (it holds boxed `Fn`
+    ///   factories), so `.on_shard(...)` on one is a `Send` trait-bound error;
+    ///   cross-shard *restartable* children await the restart protocol.
+    /// - A *cross-shard* child is not yet supervision-owned: the owner holds
+    ///   its `ChildRef`, but `StopChildren` / supervision do not yet reach
+    ///   across shards. `.on_shard(my_own_shard)` degenerates to an ordinary
+    ///   owned local `spawn_observed`.
+    /// - Targeting a `ShardId` the runtime does not own panics the worker
+    ///   (same as any cross-shard `send`/`call` to an unknown shard); a
+    ///   *known* but full/stopped shard settles the continuation with
+    ///   [`SpawnObservedError::DestinationUnavailable`].
     pub fn on_shard(self, shard: ShardId) -> RemoteSpawnObservedBuilder<S, M, R>
     where
         S: Send,

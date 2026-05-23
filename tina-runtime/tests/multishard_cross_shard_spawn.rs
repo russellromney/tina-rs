@@ -55,6 +55,7 @@ impl Isolate for CrossChild {
 #[derive(Debug)]
 enum CrossParentMsg {
     SpawnOn(ShardId),
+    SpawnOnThenStop(ShardId),
     ChildStarted(Result<ChildRef<CrossChildMsg>, SpawnObservedError>),
     StopChildren,
     StopNow,
@@ -85,6 +86,12 @@ impl CrossParent {
             CrossParentMsg::SpawnOn(shard) => spawn_observed(ChildDefinition::new(CrossChild, 4))
                 .on_shard(shard)
                 .then(CrossParentMsg::ChildStarted),
+            CrossParentMsg::SpawnOnThenStop(shard) => batch(vec![
+                spawn_observed(ChildDefinition::new(CrossChild, 4))
+                    .on_shard(shard)
+                    .then(CrossParentMsg::ChildStarted),
+                stop(),
+            ]),
             CrossParentMsg::ChildStarted(Ok(child)) => {
                 *self.learned.borrow_mut() = Some(child);
                 // Address the cross-shard child through the learned ref.
@@ -228,4 +235,46 @@ fn owner_stop_before_reply_cleans_up_pending_spawn_without_panic() {
     assert!(error.borrow().is_none(), "no error continuation delivered either");
     // No panic reaching here is the cleanup proof; a leaked/late continuation
     // into the dead owner mailbox would otherwise surface as a rejected send.
+}
+
+// `batch([SpawnObservedOn(remote), stop()])` routes the request, then the same
+// turn's stop sweeps the pending record. The reply comes home to a gone owner
+// and is harmlessly dropped: no panic, no continuation. (The child is created
+// on the target shard and orphaned — cross-shard ownership is a follow-on; this
+// pins only that the owner side stays safe.)
+#[test]
+fn spawn_on_remote_then_stop_in_one_turn_is_safe() {
+    let learned = Rc::new(RefCell::new(None));
+    let error = Rc::new(RefCell::new(None));
+    let mut runtime =
+        MultiShardRuntime::new([CrossShard(11), CrossShard(22)], DefaultMailboxFactory);
+    let parent = runtime.register_with_capacity_on::<CrossParent, CrossChildMsg>(
+        ShardId::new(11),
+        CrossParent {
+            learned: Rc::clone(&learned),
+            error: Rc::clone(&error),
+        },
+        8,
+    );
+
+    runtime
+        .try_send(parent, CrossParentMsg::SpawnOnThenStop(ShardId::new(22)))
+        .unwrap();
+    for _ in 0..12 {
+        runtime.step();
+    }
+
+    assert!(
+        learned.borrow().is_none() && error.borrow().is_none(),
+        "owner stopped in the same turn must not receive any continuation"
+    );
+    // The child was still created on the target shard (it is now orphaned).
+    assert!(
+        runtime
+            .trace()
+            .iter()
+            .any(|event| event.shard() == ShardId::new(22)
+                && matches!(event.kind(), RuntimeEventKind::Spawned { .. })),
+        "the target shard still created the child"
+    );
 }

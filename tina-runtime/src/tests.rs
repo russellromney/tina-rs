@@ -2682,7 +2682,7 @@ fn hot_self_sender_does_not_starve_steady_isolate_and_timer_keeps_firing() {
     let report = FairnessReport::from_events(runtime.trace().iter());
     let hot_turns = report.turns(hot.isolate());
     let steady_turns = report.turns(steady.isolate());
-    let timer_ticks = report.timer_ticks(timer.isolate());
+    let timer_sleeps = report.sleep_completions(timer.isolate());
 
     // Round-robin gives every continuously-ready isolate one turn per
     // step, so the hot flooder cannot pull more than one turn ahead of
@@ -2691,18 +2691,19 @@ fn hot_self_sender_does_not_starve_steady_isolate_and_timer_keeps_firing() {
         hot_turns.abs_diff(steady_turns) <= 1,
         "hot {hot_turns} steady {steady_turns} should stay within one turn"
     );
-    // The steady isolate is not starved: it cleared the floor a fair
-    // scheduler owes a continuously-ready isolate.
+    // The steady isolate is not starved — checked by the gap form, which
+    // needs no external round count: it stays within one turn of the hot
+    // flooder.
     assert!(
         report
-            .starvation(steady.isolate(), hot.isolate(), hot_turns.saturating_sub(1))
+            .starvation_by_gap(steady.isolate(), hot.isolate(), 1)
             .is_none(),
         "steady isolate must not be reported starved: {report}"
     );
-    // The timer kept firing the whole time despite the hot load.
+    // The recurring timer kept firing the whole time despite the hot load.
     assert!(
-        timer_ticks >= rounds - 2,
-        "timer should keep firing under load, got {timer_ticks} of {rounds}"
+        timer_sleeps >= rounds - 2,
+        "timer should keep firing under load, got {timer_sleeps} of {rounds}"
     );
 }
 

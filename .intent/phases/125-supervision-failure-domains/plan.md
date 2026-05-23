@@ -36,9 +36,14 @@
 - **`SupervisorReport`**: typed terminal report (trace reader) naming children,
   restarts, skips, rejections, latest incarnation, and a distinct halt reason
   (budget exhausted vs supervisor stopped).
-- **`FairnessReport` + `StarvationWarning`**: per-isolate turn/timer counts with
-  a hot-self-sender-vs-steady-neighbor + timer-under-load proof. Progress is
-  turns and timers, not wall-clock.
+- **`FairnessReport` + `StarvationWarning`** (progress-count slice only):
+  per-isolate handler-turn and sleep-completion counts with a
+  hot-self-sender-vs-steady-neighbor + timer-under-load proof, plus a
+  round-count-free `starvation_by_gap`. Progress is turns and sleeps, not
+  wall-clock. The plan's `ReadyTurnLag` / `TimerLateBy` / `RemoteDrainYield`
+  observables are **not** implemented (they need a per-turn ready signal and
+  event timestamps the trace lacks); the remote-flood-vs-local-command proof
+  shipped earlier in `tina-runtime/tests/multishard_fairness.rs`.
 - Proofs landed: live single-shard restart → new incarnation + stale-address
   rejection (panic and typed-failure variants); unsupervised failure stops
   without restart; sim replay of start/fail/restart/stop; budget-exhaustion

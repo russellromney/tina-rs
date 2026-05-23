@@ -236,6 +236,12 @@ pub use isolate::*;
 ///     }
 /// }
 /// ```
+///
+/// Cross-shard note: `spawn_observed_remote` is only accepted by the fully
+/// explicit arm (all nine keys). The abbreviated arms omit it and pin
+/// `SpawnObservedRemote = Infallible`. To author a cross-shard-spawning isolate
+/// with the declarative macro, spell out every key — or prefer
+/// `#[tina::isolate]`, which defaults each key independently.
 #[macro_export]
 macro_rules! isolate_types {
     (

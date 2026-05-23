@@ -1,4 +1,4 @@
-//! Fairness diagnostics.
+//! Fairness diagnostics: per-isolate **progress counts**.
 //!
 //! The scheduler gives each ready isolate at most one handler turn per
 //! delivery round (round-robin in registration order). That bounds how
@@ -12,15 +12,31 @@
 //! and [`SupervisorReport`](crate::SupervisorReport): it changes no
 //! scheduling and adds no events. Two trace facts carry the signal —
 //! `HandlerStarted` (one per handler turn) and `CallCompleted` with
-//! `CallKind::Sleep` (one per timer fire) — both already recorded under
-//! the isolate they belong to.
+//! `CallKind::Sleep` (one per successful sleep). Both are already recorded
+//! under the isolate they belong to.
+//!
+//! ## Scope (what this is and is not)
+//!
+//! This ships the *progress-count* slice of fairness: handler turns and
+//! sleep completions, plus a typed [`StarvationWarning`]. It is **not** the
+//! full lag/latency surface. In particular:
+//!
+//! - `sleep_completions` counts every successful `Sleep` completion (a
+//!   recurring timer's fires re-arm one-shot sleeps, so this is its fire
+//!   count — but a single one-shot `sleep()` also counts as one). It is not
+//!   a "missed ticks" or "late by" measure.
+//! - Ready-turn lag (turns waited while ready), timer lateness in runtime
+//!   time, and remote-drain yield counts are **not** implemented here — they
+//!   need instrumentation the trace does not yet carry (a per-turn
+//!   ready signal and event timestamps). They remain future work.
 //!
 //! What this does *not* claim: wall-clock or real-time guarantees.
-//! "Progress" here is turns taken and timers fired, which are
+//! "Progress" here is turns taken and sleeps completed, which are
 //! deterministic under the simulator and the single-shard runner. If a
 //! caller's scenario can starve a victim (for example a handler that
-//! monopolizes a turn with long synchronous work), [`Self::starvation`]
-//! reports the bad condition by name rather than hiding it.
+//! monopolizes a turn with long synchronous work), [`Self::starvation`] /
+//! [`Self::starvation_by_gap`] report the bad condition by name rather than
+//! hiding it.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -38,8 +54,10 @@ pub struct IsolateProgress {
     /// Handler turns taken (`HandlerStarted` events). One per delivered
     /// message the isolate actually handled.
     pub handler_turns: u64,
-    /// Timer fires received (`CallCompleted` with `CallKind::Sleep`).
-    pub timer_ticks: u64,
+    /// Successful `Sleep` completions (`CallCompleted` with
+    /// `CallKind::Sleep`). For a recurring timer this is its fire count;
+    /// one-shot sleeps count too. Not a missed-ticks or late-by measure.
+    pub sleep_completions: u64,
 }
 
 /// A named starvation condition: `victim` made far less progress than
@@ -91,10 +109,10 @@ impl FairnessReport {
         Self {
             isolates: rows
                 .into_iter()
-                .map(|(isolate, (handler_turns, timer_ticks))| IsolateProgress {
+                .map(|(isolate, (handler_turns, sleep_completions))| IsolateProgress {
                     isolate,
                     handler_turns,
-                    timer_ticks,
+                    sleep_completions,
                 })
                 .collect(),
         }
@@ -110,19 +128,22 @@ impl FairnessReport {
         self.progress(isolate).map_or(0, |p| p.handler_turns)
     }
 
-    /// Timer fires received by `isolate` (zero if it armed none).
-    pub fn timer_ticks(&self, isolate: IsolateId) -> u64 {
-        self.progress(isolate).map_or(0, |p| p.timer_ticks)
+    /// Successful sleep completions for `isolate` (zero if it armed none).
+    pub fn sleep_completions(&self, isolate: IsolateId) -> u64 {
+        self.progress(isolate).map_or(0, |p| p.sleep_completions)
     }
 
-    /// Checks whether `victim` was starved relative to `hot`.
+    /// Checks whether `victim` was starved relative to `hot`, against a
+    /// caller-supplied floor.
     ///
     /// Returns a [`StarvationWarning`] when the victim cleared fewer than
     /// `expected_min_victim_turns` while the hot isolate ran at all. The
     /// floor is the caller's: it knows how many rounds it drove and what
     /// progress a fair scheduler owes a continuously-ready isolate. Under
     /// the round-robin runner a steadily-ready victim earns one turn per
-    /// round, so the floor is normally the round count.
+    /// round, so the floor is normally the round count. When you do not
+    /// track rounds, prefer [`Self::starvation_by_gap`], which compares the
+    /// two isolates directly from data this report already holds.
     pub fn starvation(
         &self,
         victim: IsolateId,
@@ -143,6 +164,36 @@ impl FairnessReport {
             None
         }
     }
+
+    /// Checks starvation by the *gap* between two isolates, needing no
+    /// external round count.
+    ///
+    /// Fires when the hot isolate ran ahead of the victim by more than
+    /// `max_allowed_gap` turns (`hot_turns - victim_turns > max_allowed_gap`)
+    /// while the hot isolate ran at all. Under the round-robin runner two
+    /// continuously-ready isolates stay within one turn, so a gap of `1` is
+    /// the natural threshold. The reported `expected_min_victim_turns` is
+    /// `hot_turns - max_allowed_gap` (the floor the gap implies).
+    pub fn starvation_by_gap(
+        &self,
+        victim: IsolateId,
+        hot: IsolateId,
+        max_allowed_gap: u64,
+    ) -> Option<StarvationWarning> {
+        let victim_turns = self.turns(victim);
+        let hot_turns = self.turns(hot);
+        if hot_turns > 0 && hot_turns.saturating_sub(victim_turns) > max_allowed_gap {
+            Some(StarvationWarning {
+                victim,
+                hot,
+                victim_turns,
+                hot_turns,
+                expected_min_victim_turns: hot_turns.saturating_sub(max_allowed_gap),
+            })
+        } else {
+            None
+        }
+    }
 }
 
 impl fmt::Display for FairnessReport {
@@ -154,10 +205,10 @@ impl fmt::Display for FairnessReport {
             }
             write!(
                 formatter,
-                "isolate={} turns={} timers={}",
+                "isolate={} turns={} sleeps={}",
                 row.isolate.get(),
                 row.handler_turns,
-                row.timer_ticks,
+                row.sleep_completions,
             )?;
         }
         write!(formatter, "]")
@@ -197,7 +248,7 @@ mod tests {
     }
 
     #[test]
-    fn counts_turns_and_timer_ticks_per_isolate() {
+    fn counts_turns_and_sleep_completions_per_isolate() {
         let events = [
             turn(1, 1),
             turn(2, 2),
@@ -208,10 +259,37 @@ mod tests {
         let report = FairnessReport::from_events(events.iter());
         assert_eq!(report.turns(IsolateId::new(1)), 3);
         assert_eq!(report.turns(IsolateId::new(2)), 1);
-        assert_eq!(report.timer_ticks(IsolateId::new(2)), 1);
-        assert_eq!(report.timer_ticks(IsolateId::new(1)), 0);
+        assert_eq!(report.sleep_completions(IsolateId::new(2)), 1);
+        assert_eq!(report.sleep_completions(IsolateId::new(1)), 0);
         assert_eq!(report.turns(IsolateId::new(99)), 0);
         assert!(report.progress(IsolateId::new(99)).is_none());
+    }
+
+    #[test]
+    fn starvation_by_gap_needs_no_external_round_count() {
+        // Hot 10, victim 2 -> gap 8 > 1 -> warns.
+        let mut events = Vec::new();
+        let mut id = 1;
+        for _ in 0..10 {
+            events.push(turn(id, 1));
+            id += 1;
+        }
+        for _ in 0..2 {
+            events.push(turn(id, 2));
+            id += 1;
+        }
+        let report = FairnessReport::from_events(events.iter());
+        let warning = report
+            .starvation_by_gap(IsolateId::new(2), IsolateId::new(1), 1)
+            .expect("gap of 8 must warn");
+        assert_eq!(warning.victim_turns, 2);
+        assert_eq!(warning.hot_turns, 10);
+        // Within-one-turn (fair round-robin) does not warn.
+        assert!(
+            report
+                .starvation_by_gap(IsolateId::new(1), IsolateId::new(2), 1)
+                .is_none()
+        );
     }
 
     #[test]
@@ -273,7 +351,7 @@ mod tests {
         let report = FairnessReport::from_events(events.iter());
         assert_eq!(
             report.to_string(),
-            "fairness [isolate=1 turns=1 timers=1 isolate=2 turns=1 timers=0]"
+            "fairness [isolate=1 turns=1 sleeps=1 isolate=2 turns=1 sleeps=0]"
         );
     }
 }

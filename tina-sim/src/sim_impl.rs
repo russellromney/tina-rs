@@ -5248,10 +5248,12 @@ where
         } = request;
         let outcome = match payload.downcast::<Box<dyn SimRemoteSpawn<S>>>() {
             Ok(spawn) => (*spawn).spawn_remote(self, owner, cause),
-            // Unreachable in practice (same `S`, identical `TypeId`); if it ever
-            // fires it is an internal invariant break, not a zero-capacity
-            // request.
-            Err(_) => Err(SpawnObservedError::DestinationUnavailable),
+            // Unreachable in practice (same `S`, identical `TypeId`). Trip in
+            // debug/test on an internal invariant break rather than masking it.
+            Err(_) => {
+                debug_assert!(false, "cross-shard spawn payload downcast failed");
+                Err(SpawnObservedError::DestinationUnavailable)
+            }
         };
         Some(QueuedRemoteEnvelope::SpawnReply(SimRemoteSpawnReply {
             request_id,

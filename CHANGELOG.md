@@ -43,14 +43,20 @@ learn-address; cross-shard supervision/ownership is a follow-on).
   triggers / attempts / completions / skips / rejections, counts children the
   owner closed via supervised shutdown, and reports a distinct halt reason
   (budget exhausted vs supervisor stopped). Composes with the pressure and
-  capacity readers over the same event slice.
-- **`tina_runtime::FairnessReport`** — per-isolate handler-turn and timer-tick
-  counts folded from the trace, plus a typed `StarvationWarning` that names the
-  victim and the hot isolate rather than hiding a progress gap. Progress is turns
-  taken and timers fired (deterministic), not a wall-clock promise. A proof runs
-  a self-flooding hot isolate beside a steadily-ready neighbor and a recurring
-  timer: round-robin keeps the neighbor within one turn of the flooder and the
-  timer keeps firing under load.
+  capacity readers over the same event slice. (Same-shard children only: a
+  cross-shard observed child records its `Spawned` on the child's shard, so it
+  is not reflected here.)
+- **`tina_runtime::FairnessReport`** — the progress-count slice of fairness:
+  per-isolate handler-turn and sleep-completion counts folded from the trace,
+  plus a typed `StarvationWarning` (with a round-count-free `starvation_by_gap`
+  form) that names the victim and the hot isolate rather than hiding a progress
+  gap. Progress is turns taken and sleeps completed (deterministic), not a
+  wall-clock promise. A proof runs a self-flooding hot isolate beside a
+  steadily-ready neighbor and a recurring timer: round-robin keeps the neighbor
+  within one turn of the flooder and the timer keeps firing under load.
+  Ready-turn lag, timer lateness, and remote-drain-yield counts are **not** in
+  this report yet (they need instrumentation the trace does not carry); the
+  remote-flood-vs-local-command fairness proof shipped earlier.
 ### Durable Local State And IPC
 
 A local service can record work before doing it, restart, and resume or report

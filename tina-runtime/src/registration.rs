@@ -588,10 +588,13 @@ where
     /// When `owner` is on *this* shard (the degenerate `.on_shard(my_shard)`
     /// case) the child is registered as a normal owned child of the owner — a
     /// `ChildRecord` is recorded and `Spawned` is emitted under the parent — so
-    /// it behaves exactly like local `spawn_observed` (`StopChildren` reaches
-    /// it, lineage and reports see it). When `owner` is on another shard the
-    /// child has no local parent (`parent = None`) and `Spawned` is recorded
-    /// under the child on its own shard. Returns the new address.
+    /// it matches local `spawn_observed` for ownership and lifecycle:
+    /// `StopChildren` reaches it, and lineage and reports see it. (One trace
+    /// nuance: the continuation send is caused by the handler-finished event
+    /// rather than the `Spawned` event, so the causality edge differs slightly
+    /// from local `spawn_observed`.) When `owner` is on another shard the child
+    /// has no local parent (`parent = None`) and `Spawned` is recorded under the
+    /// child on its own shard. Returns the new address.
     pub(crate) fn register_remote_child<I, Outbound>(
         &mut self,
         isolate: I,
