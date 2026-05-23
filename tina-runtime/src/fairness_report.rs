@@ -34,9 +34,9 @@
 //! "Progress" here is turns taken and sleeps completed, which are
 //! deterministic under the simulator and the single-shard runner. If a
 //! caller's scenario can starve a victim (for example a handler that
-//! monopolizes a turn with long synchronous work), [`Self::starvation`] /
-//! [`Self::starvation_by_gap`] report the bad condition by name rather than
-//! hiding it.
+//! monopolizes a turn with long synchronous work),
+//! [`FairnessReport::starvation`] / [`FairnessReport::starvation_by_gap`]
+//! report the bad condition by name rather than hiding it.
 
 use std::collections::BTreeMap;
 use std::fmt;
