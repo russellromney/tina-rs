@@ -19,6 +19,166 @@ use super::projection::{
 };
 use super::{History, ReplayCase, ReplayConfig, ReplayReport};
 
+/// Whether the trace source was complete enough for exact replay proof.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TraceCompleteness {
+    /// The capture path is known to have retained every event it saw.
+    Complete,
+    /// The capture path is missing named shards or dropped events.
+    Partial,
+    /// The capture reached an explicit event/fact/string bound.
+    Truncated,
+}
+
+/// Metadata about where a live replay capture came from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CaptureSource {
+    /// Human-readable source label.
+    pub label: String,
+    /// Runtime shape, e.g. `threaded`, `local-system`, `sim`.
+    pub runtime_kind: String,
+    /// Backend shape, e.g. `live`, `sim`, `tokio`.
+    pub backend: String,
+    /// Capture schema version.
+    pub schema_version: u32,
+    /// Platform string recorded by the builder.
+    pub platform: String,
+    /// Optional crate version or application revision.
+    pub crate_revision: Option<String>,
+    /// Optional git revision when the caller has it.
+    pub git_revision: Option<String>,
+    /// Whether the trace is complete enough for exact replay proof.
+    pub trace_completeness: TraceCompleteness,
+}
+
+impl CaptureSource {
+    /// Builds default source metadata from a label.
+    pub fn new(label: impl Into<String>) -> Self {
+        Self {
+            label: label.into(),
+            runtime_kind: "unknown".to_owned(),
+            backend: "live".to_owned(),
+            schema_version: 1,
+            platform: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
+            crate_revision: option_env!("CARGO_PKG_VERSION").map(str::to_owned),
+            git_revision: option_env!("VERGEN_GIT_SHA").map(str::to_owned),
+            trace_completeness: TraceCompleteness::Complete,
+        }
+    }
+
+    /// Sets the runtime kind.
+    pub fn runtime_kind(mut self, runtime_kind: impl Into<String>) -> Self {
+        self.runtime_kind = runtime_kind.into();
+        self
+    }
+
+    /// Sets the backend kind.
+    pub fn backend(mut self, backend: impl Into<String>) -> Self {
+        self.backend = backend.into();
+        self
+    }
+
+    /// Sets optional git revision metadata.
+    pub fn git_revision(mut self, git_revision: impl Into<String>) -> Self {
+        self.git_revision = Some(git_revision.into());
+        self
+    }
+
+    /// Marks trace completeness.
+    pub const fn with_trace_completeness(mut self, completeness: TraceCompleteness) -> Self {
+        self.trace_completeness = completeness;
+        self
+    }
+}
+
+impl std::fmt::Display for CaptureSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} runtime={} backend={} schema={} platform={} trace={:?}",
+            self.label,
+            self.runtime_kind,
+            self.backend,
+            self.schema_version,
+            self.platform,
+            self.trace_completeness
+        )?;
+        if let Some(revision) = &self.crate_revision {
+            write!(f, " crate={revision}")?;
+        }
+        if let Some(revision) = &self.git_revision {
+            write!(f, " git={revision}")?;
+        }
+        Ok(())
+    }
+}
+
+/// Bounds applied while turning live material into a replay capture.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CaptureLimits {
+    /// Maximum runtime events to hash into the captured shape.
+    pub max_events: usize,
+    /// Maximum typed replay facts.
+    pub max_live_facts: usize,
+    /// Maximum unsupported facts.
+    pub max_unsupported_facts: usize,
+    /// Maximum materialized history operations.
+    pub max_history_ops: usize,
+    /// Maximum string payload length for source/fact text.
+    pub max_string_bytes: usize,
+}
+
+impl Default for CaptureLimits {
+    fn default() -> Self {
+        Self {
+            max_events: 16_384,
+            max_live_facts: 256,
+            max_unsupported_facts: 256,
+            max_history_ops: 16_384,
+            max_string_bytes: 512,
+        }
+    }
+}
+
+/// Human-sized capture summary suitable for one grep-friendly line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CaptureSummary {
+    /// Captured case name.
+    pub name: &'static str,
+    /// Replay seed.
+    pub seed: u64,
+    /// Number of materialized operations.
+    pub history_len: usize,
+    /// Expected projected trace shape.
+    pub expected: TraceShape,
+    /// Number of typed replay facts.
+    pub live_fact_count: usize,
+    /// Number of unsupported facts.
+    pub unsupported_fact_count: usize,
+    /// Number of topology roles.
+    pub topology_role_count: usize,
+    /// Whether replay is blocked by unsupported/partial/truncated truth.
+    pub replay_blocked: bool,
+}
+
+impl std::fmt::Display for CaptureSummary {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "capture name={} seed={} ops={} events={} hash=0x{:016x} live_facts={} unsupported={} topology_roles={} replay_blocked={}",
+            self.name,
+            self.seed,
+            self.history_len,
+            self.expected.event_count,
+            self.expected.trace_hash,
+            self.live_fact_count,
+            self.unsupported_fact_count,
+            self.topology_role_count,
+            self.replay_blocked
+        )
+    }
+}
+
 /// A live fact the current replay operation alphabet cannot model.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UnsupportedLiveFact {
@@ -195,13 +355,22 @@ pub struct LiveReplayCapture<Op> {
     pub invariant: &'static str,
     /// Short note naming where the capture came from.
     pub source: &'static str,
+    /// Typed source metadata for review and replay gating.
+    pub source_metadata: CaptureSource,
     /// Live facts not represented by the replay config/history.
     pub unsupported_facts: Vec<UnsupportedLiveFact>,
     /// Typed facts the replay runner must reproduce exactly.
     pub live_facts: Vec<LiveReplayFact>,
+    /// True when a capture bound was reached while building this capture.
+    pub truncated: bool,
 }
 
 impl<Op> LiveReplayCapture<Op> {
+    /// Starts the blessed live-run capture builder.
+    pub fn builder(name: &'static str) -> LiveReplayCaptureBuilder<Op> {
+        LiveReplayCaptureBuilder::new(name)
+    }
+
     /// Captures a replay attempt from explicit parts and runtime events.
     #[allow(clippy::too_many_arguments)]
     pub fn from_events(
@@ -259,8 +428,10 @@ impl<Op> LiveReplayCapture<Op> {
             expected,
             invariant,
             source,
+            source_metadata: CaptureSource::new(source),
             unsupported_facts,
             live_facts: Vec::new(),
+            truncated: false,
         })
     }
 
@@ -309,8 +480,10 @@ impl<Op> LiveReplayCapture<Op> {
             expected: TraceShape::from_report(report),
             invariant: case.invariant,
             source,
+            source_metadata: CaptureSource::new(source).backend("sim"),
             unsupported_facts: Vec::new(),
             live_facts: Vec::new(),
+            truncated: false,
         }
     }
 
@@ -342,6 +515,37 @@ impl<Op> LiveReplayCapture<Op> {
         self
     }
 
+    /// Replaces source metadata and returns the capture.
+    pub fn with_source_metadata(mut self, source_metadata: CaptureSource) -> Self {
+        self.source_metadata = source_metadata;
+        self
+    }
+
+    /// Marks the capture as truncated and adds visible unsupported truth.
+    pub fn with_truncated(mut self, reason: impl Into<String>) -> Self {
+        self.truncated = true;
+        self.source_metadata.trace_completeness = TraceCompleteness::Truncated;
+        self.unsupported_facts
+            .push(UnsupportedLiveFact::new("CaptureTruncated", reason));
+        self
+    }
+
+    /// Returns a compact summary for logs and proof-harness output.
+    pub fn summary(&self) -> CaptureSummary {
+        CaptureSummary {
+            name: self.name,
+            seed: self.seed,
+            history_len: self.history.len(),
+            expected: self.expected,
+            live_fact_count: self.live_facts.len(),
+            unsupported_fact_count: self.unsupported_facts.len(),
+            topology_role_count: self.topology_roles.len(),
+            replay_blocked: self.truncated
+                || self.source_metadata.trace_completeness != TraceCompleteness::Complete
+                || !self.unsupported_facts.is_empty(),
+        }
+    }
+
     /// Converts the capture into a normal [`ReplayCase`] pinned to the
     /// captured trace shape.
     pub fn to_replay_case(&self) -> ReplayCase<Op>
@@ -360,6 +564,286 @@ impl<Op> LiveReplayCapture<Op> {
         }
     }
 }
+
+/// Convenience entrypoint for [`LiveReplayCaptureBuilder`].
+pub fn capture_live_run<Op>(name: &'static str) -> LiveReplayCaptureBuilder<Op> {
+    LiveReplayCaptureBuilder::new(name)
+}
+
+/// Builder for turning one live-shaped run into an explicit replay capture.
+#[derive(Debug, Clone)]
+pub struct LiveReplayCaptureBuilder<Op> {
+    name: &'static str,
+    seed: Option<u64>,
+    config: Option<ReplayConfig>,
+    scenario: Option<&'static str>,
+    history: Option<Vec<Op>>,
+    invariant: Option<&'static str>,
+    source: Option<&'static str>,
+    source_metadata: Option<CaptureSource>,
+    projection: TraceProjection,
+    events: Option<Vec<RuntimeEvent>>,
+    live_facts: Vec<LiveReplayFact>,
+    unsupported_facts: Vec<UnsupportedLiveFact>,
+    limits: CaptureLimits,
+    truncated: bool,
+}
+
+impl<Op> LiveReplayCaptureBuilder<Op> {
+    /// Starts a capture builder for `name`.
+    pub fn new(name: &'static str) -> Self {
+        Self {
+            name,
+            seed: None,
+            config: None,
+            scenario: None,
+            history: None,
+            invariant: None,
+            source: None,
+            source_metadata: None,
+            projection: TraceProjection::Exact,
+            events: None,
+            live_facts: Vec::new(),
+            unsupported_facts: Vec::new(),
+            limits: CaptureLimits::default(),
+            truncated: false,
+        }
+    }
+
+    /// Sets capture bounds.
+    pub const fn with_limits(mut self, limits: CaptureLimits) -> Self {
+        self.limits = limits;
+        self
+    }
+
+    /// Sets the replay seed.
+    pub const fn with_seed(mut self, seed: u64) -> Self {
+        self.seed = Some(seed);
+        self
+    }
+
+    /// Sets the replay config.
+    pub fn with_config(mut self, config: ReplayConfig) -> Self {
+        self.config = Some(config);
+        self
+    }
+
+    /// Sets the scenario text.
+    pub const fn with_scenario(mut self, scenario: &'static str) -> Self {
+        self.scenario = Some(scenario);
+        self
+    }
+
+    /// Sets the invariant text.
+    pub const fn with_invariant(mut self, invariant: &'static str) -> Self {
+        self.invariant = Some(invariant);
+        self
+    }
+
+    /// Sets source metadata.
+    pub fn with_source_metadata(mut self, source_metadata: CaptureSource) -> Self {
+        self.source_metadata = Some(source_metadata);
+        self
+    }
+
+    /// Sets a source label.
+    pub const fn with_source(mut self, source: &'static str) -> Self {
+        self.source = Some(source);
+        self
+    }
+
+    /// Sets the projection contract.
+    pub fn with_projection(mut self, projection: TraceProjection) -> Self {
+        self.projection = projection;
+        self
+    }
+
+    /// Sets the materialized replay history.
+    pub fn with_history(mut self, history: Vec<Op>) -> Self {
+        if history.len() > self.limits.max_history_ops {
+            self.truncated = true;
+            self.unsupported_facts.push(UnsupportedLiveFact::new(
+                "FactTruncated",
+                format!(
+                    "history ops {} exceeded cap {}",
+                    history.len(),
+                    self.limits.max_history_ops
+                ),
+            ));
+            self.history = Some(
+                history
+                    .into_iter()
+                    .take(self.limits.max_history_ops)
+                    .collect(),
+            );
+        } else {
+            self.history = Some(history);
+        }
+        self
+    }
+
+    /// Sets runtime trace events.
+    pub fn with_trace(mut self, events: &[RuntimeEvent]) -> Self {
+        if events.len() > self.limits.max_events {
+            self.truncated = true;
+            self.unsupported_facts.push(UnsupportedLiveFact::new(
+                "TraceTruncated",
+                format!(
+                    "trace events {} exceeded cap {}",
+                    events.len(),
+                    self.limits.max_events
+                ),
+            ));
+            self.events = Some(events[..self.limits.max_events].to_vec());
+        } else {
+            self.events = Some(events.to_vec());
+        }
+        self
+    }
+
+    /// Adds one typed replay fact.
+    pub fn with_fact(mut self, fact: LiveReplayFact) -> Self {
+        if self.live_facts.len() >= self.limits.max_live_facts {
+            self.truncated = true;
+            self.unsupported_facts.push(UnsupportedLiveFact::new(
+                "FactTruncated",
+                format!("live fact cap {} reached", self.limits.max_live_facts),
+            ));
+        } else {
+            self.live_facts.push(fact);
+        }
+        self
+    }
+
+    /// Adds one capacity summary fact.
+    pub fn with_capacity_summary(self, report: &CapacitySurfaceReport) -> Self {
+        self.with_fact(LiveReplayFact::capacity_surface(report))
+    }
+
+    /// Records a typed unsupported fact.
+    pub fn with_unsupported_fact(
+        mut self,
+        fact: impl Into<String>,
+        reason: impl Into<String>,
+    ) -> Self {
+        if self.unsupported_facts.len() >= self.limits.max_unsupported_facts {
+            self.truncated = true;
+            return self;
+        }
+        let fact = truncate_string(fact.into(), self.limits.max_string_bytes);
+        let reason = truncate_string(reason.into(), self.limits.max_string_bytes);
+        self.unsupported_facts
+            .push(UnsupportedLiveFact::new(fact, reason));
+        self
+    }
+
+    /// Adapter placeholder for shutdown reports that callers have already
+    /// reduced to a fact. Keeping this method explicit gives copied workflow
+    /// code a stable place to hang the report conversion.
+    pub fn with_shutdown_report(self, fact: LiveReplayFact) -> Self {
+        self.with_fact(fact)
+    }
+
+    /// Adapter placeholder for protocol reports that callers have already
+    /// reduced to a fact.
+    pub fn with_protocol_report(self, fact: LiveReplayFact) -> Self {
+        self.with_fact(fact)
+    }
+
+    /// Adapter placeholder for resource reports that callers have already
+    /// reduced to a fact.
+    pub fn with_resource_report(self, fact: LiveReplayFact) -> Self {
+        self.with_fact(fact)
+    }
+
+    /// Adapter placeholder for proof-harness reports that callers have
+    /// already reduced to replay facts.
+    pub fn with_proof_harness_report(self, fact: LiveReplayFact) -> Self {
+        self.with_fact(fact)
+    }
+
+    /// Finishes the capture. Missing required replay material is an error.
+    pub fn finish(mut self) -> Result<LiveReplayCapture<Op>, LiveReplayCaptureBuildError> {
+        let seed = self
+            .seed
+            .ok_or(LiveReplayCaptureBuildError::Missing("seed"))?;
+        let config = self
+            .config
+            .ok_or(LiveReplayCaptureBuildError::Missing("config"))?;
+        let scenario = self
+            .scenario
+            .ok_or(LiveReplayCaptureBuildError::Missing("scenario"))?;
+        let history = self
+            .history
+            .ok_or(LiveReplayCaptureBuildError::Missing("history"))?;
+        let invariant = self
+            .invariant
+            .ok_or(LiveReplayCaptureBuildError::Missing("invariant"))?;
+        let source = self.source.unwrap_or("live capture");
+        let events = self
+            .events
+            .ok_or(LiveReplayCaptureBuildError::Missing("trace"))?;
+        let expected = project_trace_shape(&events, &self.projection)
+            .map_err(LiveReplayCaptureBuildError::Projection)?;
+        let config_hash = replay_config_hash(&config);
+        let topology_roles = config.mailboxes.keys().copied().collect();
+        let mut source_metadata = self
+            .source_metadata
+            .unwrap_or_else(|| CaptureSource::new(source));
+        if self.truncated {
+            source_metadata.trace_completeness = TraceCompleteness::Truncated;
+            self.unsupported_facts.push(UnsupportedLiveFact::new(
+                "CaptureFull",
+                "capture builder reached at least one configured bound",
+            ));
+        }
+        Ok(LiveReplayCapture {
+            name: self.name,
+            seed,
+            config,
+            topology_roles,
+            config_hash,
+            projection: self.projection,
+            scenario,
+            history: History::new(self.name, seed, history),
+            expected,
+            invariant,
+            source,
+            source_metadata,
+            unsupported_facts: self.unsupported_facts,
+            live_facts: self.live_facts,
+            truncated: self.truncated,
+        })
+    }
+}
+
+fn truncate_string(mut value: String, max: usize) -> String {
+    if value.len() > max {
+        value.truncate(max);
+        value.push_str("...");
+    }
+    value
+}
+
+/// Error returned by [`LiveReplayCaptureBuilder::finish`].
+#[derive(Debug)]
+pub enum LiveReplayCaptureBuildError {
+    /// A required field was absent.
+    Missing(&'static str),
+    /// The selected projection rejected the supplied trace.
+    Projection(TraceProjectionError),
+}
+
+impl std::fmt::Display for LiveReplayCaptureBuildError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Missing(field) => write!(f, "live replay capture missing `{field}`"),
+            Self::Projection(error) => write!(f, "live replay capture projection failed: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for LiveReplayCaptureBuildError {}
 
 /// A saved captured case with owned strings.
 ///
@@ -380,6 +864,8 @@ pub struct SavedReplayCase<Op> {
     pub invariant: String,
     /// Capture source label.
     pub source: String,
+    /// Typed capture source metadata.
+    pub source_metadata: CaptureSource,
     /// Debug rendering of the replay config at capture time.
     pub config_debug: String,
     /// Diagnostic config hash at capture time.
@@ -394,6 +880,8 @@ pub struct SavedReplayCase<Op> {
     pub live_facts: Vec<String>,
     /// Captured expected trace shape.
     pub expected: TraceShape,
+    /// Whether capture bounds were reached.
+    pub truncated: bool,
     /// Materialized operation history.
     pub history: Vec<Op>,
 }
@@ -413,6 +901,7 @@ impl<Op> SavedReplayCase<Op> {
             scenario: capture.scenario.to_owned(),
             invariant: capture.invariant.to_owned(),
             source: capture.source.to_owned(),
+            source_metadata: capture.source_metadata.clone(),
             config_debug: format!("{:?}", capture.config),
             config_hash: capture.config_hash(),
             topology_roles: capture
@@ -424,6 +913,7 @@ impl<Op> SavedReplayCase<Op> {
             unsupported_facts: capture.unsupported_facts.clone(),
             live_facts: capture.live_facts.iter().map(ToString::to_string).collect(),
             expected: capture.expected,
+            truncated: capture.truncated,
             history: capture
                 .history
                 .operations()
@@ -599,6 +1089,12 @@ where
     body.push_str(&format!("scenario={}\n", capture.scenario));
     body.push_str(&format!("invariant={}\n", capture.invariant));
     body.push_str(&format!("source={}\n", capture.source));
+    body.push_str(&format!("source_metadata={}\n", capture.source_metadata));
+    body.push_str(&format!(
+        "trace_completeness={:?}\n",
+        capture.source_metadata.trace_completeness
+    ));
+    body.push_str(&format!("capture_truncated={}\n", capture.truncated));
     body.push_str(&format!("config_hash=0x{:016x}\n", capture.config_hash()));
     body.push_str(&format!("config_debug={:?}\n", capture.config));
     body.push_str(&format!("projection_debug={:?}\n", capture.projection));
@@ -664,6 +1160,9 @@ where
     let mut scenario = None;
     let mut invariant = None;
     let mut source = None;
+    let mut source_metadata = None;
+    let mut trace_completeness = None;
+    let mut capture_truncated = None;
     let mut config_debug = None;
     let mut config_hash = None;
     let mut topology_roles = Vec::new();
@@ -697,6 +1196,31 @@ where
             "scenario" => scenario = Some(value.to_owned()),
             "invariant" => invariant = Some(value.to_owned()),
             "source" => source = Some(value.to_owned()),
+            "source_metadata" => source_metadata = Some(value.to_owned()),
+            "trace_completeness" => {
+                trace_completeness = Some(match value {
+                    "Complete" => TraceCompleteness::Complete,
+                    "Partial" => TraceCompleteness::Partial,
+                    "Truncated" => TraceCompleteness::Truncated,
+                    other => {
+                        return Err(SavedReplayCaseError::Decode {
+                            line: line_no,
+                            reason: format!("unknown trace_completeness {other:?}"),
+                        });
+                    }
+                })
+            }
+            "capture_truncated" => {
+                capture_truncated =
+                    Some(
+                        value
+                            .parse::<bool>()
+                            .map_err(|error| SavedReplayCaseError::Decode {
+                                line: line_no,
+                                reason: format!("invalid capture_truncated: {error}"),
+                            })?,
+                    )
+            }
             "config_debug" => config_debug = Some(value.to_owned()),
             "config_hash" => config_hash = Some(parse_hex_u64(value, line_no, "config_hash")?),
             "projection_debug" => projection_debug = Some(value.to_owned()),
@@ -748,6 +1272,11 @@ where
         scenario: scenario.ok_or(SavedReplayCaseError::MissingField("scenario"))?,
         invariant: invariant.ok_or(SavedReplayCaseError::MissingField("invariant"))?,
         source: source.ok_or(SavedReplayCaseError::MissingField("source"))?,
+        source_metadata: {
+            let label = source_metadata.unwrap_or_else(|| "legacy saved capture".to_owned());
+            CaptureSource::new(label)
+                .with_trace_completeness(trace_completeness.unwrap_or(TraceCompleteness::Complete))
+        },
         config_debug: config_debug.ok_or(SavedReplayCaseError::MissingField("config_debug"))?,
         config_hash: config_hash.ok_or(SavedReplayCaseError::MissingField("config_hash"))?,
         topology_roles,
@@ -761,6 +1290,7 @@ where
             trace_hash: expected_trace_hash
                 .ok_or(SavedReplayCaseError::MissingField("expected_trace_hash"))?,
         },
+        truncated: capture_truncated.unwrap_or(false),
         history,
     })
 }
@@ -786,6 +1316,10 @@ pub enum CapturedReplayChange {
     Seed,
     /// Scenario text changed.
     Scenario,
+    /// Source metadata makes exact replay unsafe.
+    Source,
+    /// Capture reached a bound or came from an incomplete trace.
+    Capture,
     /// Capture contains live facts that are not modeled by replay history/config.
     UnsupportedFact,
     /// Typed live facts changed or were not reproduced by the candidate.
@@ -965,6 +1499,8 @@ impl<Op: Debug> std::fmt::Display for CapturedReplayMismatch<Op> {
                     CapturedReplayChange::Name => "name",
                     CapturedReplayChange::Seed => "seed",
                     CapturedReplayChange::Scenario => "scenario",
+                    CapturedReplayChange::Source => "source",
+                    CapturedReplayChange::Capture => "capture",
                     CapturedReplayChange::UnsupportedFact => "unsupported fact",
                     CapturedReplayChange::LiveFact => "live fact",
                     CapturedReplayChange::Projection => "projection",
@@ -982,6 +1518,11 @@ impl<Op: Debug> std::fmt::Display for CapturedReplayMismatch<Op> {
             for fact in &self.unsupported_facts {
                 writeln!(f, "      - {fact}")?;
             }
+        }
+        if self.includes(CapturedReplayChange::Source)
+            || self.includes(CapturedReplayChange::Capture)
+        {
+            writeln!(f, "  source:    {}", self.source)?;
         }
         if self.includes(CapturedReplayChange::LiveFact) {
             writeln!(f, "  live facts:")?;
@@ -1156,6 +1697,12 @@ where
     let mut changes = Vec::new();
     if !capture.unsupported_facts.is_empty() {
         changes.push(CapturedReplayChange::UnsupportedFact);
+    }
+    if capture.truncated
+        || capture.source_metadata.trace_completeness != TraceCompleteness::Complete
+    {
+        changes.push(CapturedReplayChange::Capture);
+        changes.push(CapturedReplayChange::Source);
     }
     if !live_fact_sets_match(&capture.live_facts, &actual_live_facts) {
         changes.push(CapturedReplayChange::LiveFact);

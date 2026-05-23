@@ -8,7 +8,9 @@
 
 use std::fmt::Debug;
 
-use super::{History, ReplayCase, ReplayReport};
+use super::{
+    History, LiveReplayCapture, LiveReplayReport, ReplayCase, ReplayReport, TraceProjectionError,
+};
 
 /// Deletion-only shrinker settings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -219,4 +221,122 @@ where
         shrunk_case: current_case,
         shrunk_report: current_report,
     }
+}
+
+/// One shrunk live-derived replay capture.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShrinkCapturedReport<Op, Output> {
+    /// Original history length.
+    pub original_len: usize,
+    /// Shrunk history length.
+    pub shrunk_len: usize,
+    /// How many candidate deletions were attempted.
+    pub attempts: usize,
+    /// Caller-supplied reason describing the bug being preserved.
+    pub reason: String,
+    /// Shrunk capture with refreshed expected trace shape.
+    pub shrunk_capture: LiveReplayCapture<Op>,
+    /// Runner's report for the shrunk case.
+    pub shrunk_report: LiveReplayReport<Output>,
+}
+
+impl<Op, Output> ShrinkCapturedReport<Op, Output> {
+    /// Returns the shrunk capture.
+    pub const fn capture(&self) -> &LiveReplayCapture<Op> {
+        &self.shrunk_capture
+    }
+}
+
+impl<Op, Output> std::fmt::Display for ShrinkCapturedReport<Op, Output>
+where
+    Op: Debug,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(
+            f,
+            "shrunk captured replay `{}` from {} ops to {} ops in {} attempts",
+            self.shrunk_capture.name, self.original_len, self.shrunk_len, self.attempts
+        )?;
+        writeln!(f, "reason: {}", self.reason)?;
+        writeln!(f, "summary: {}", self.shrunk_capture.summary())?;
+        writeln!(f, "history ({} ops):", self.shrunk_capture.history.len())?;
+        for op in self.shrunk_capture.history.operations() {
+            writeln!(f, "    - {op:?}")?;
+        }
+        write!(
+            f,
+            "review step: fact set was preserved exactly; commit the shrunk \
+             capture only after confirming it still proves the same live bug."
+        )
+    }
+}
+
+/// Deletion-shrinks a live-derived capture while preserving its fact set.
+///
+/// By default, a candidate is accepted only when `still_fails` is true and the
+/// simulator report reproduces the exact same typed live facts as the original
+/// capture. The returned capture refreshes `expected_event_count` and
+/// `expected_trace_hash` from the accepted candidate, so it can be saved
+/// directly with `write_saved_replay_case`.
+pub fn shrink_captured_replay<Op, Output, Runner, StillFails>(
+    capture: &LiveReplayCapture<Op>,
+    config: ShrinkConfig,
+    reason: impl Into<String>,
+    mut runner: Runner,
+    mut still_fails: StillFails,
+) -> Result<ShrinkCapturedReport<Op, Output>, TraceProjectionError>
+where
+    Op: Clone,
+    Runner: FnMut(&ReplayCase<Op>) -> Result<LiveReplayReport<Output>, TraceProjectionError>,
+    StillFails: FnMut(&LiveReplayReport<Output>) -> bool,
+{
+    let original_len = capture.history.len();
+    let mut current_capture = capture.clone();
+    let mut current_report = runner(&current_capture.to_replay_case())?;
+    let expected_facts = capture.live_facts.clone();
+    let mut index = 0;
+    let mut attempts = 0;
+
+    while index < current_capture.history.len() && attempts < config.max_attempts {
+        let mut candidate_ops = current_capture.history.operations().to_vec();
+        candidate_ops.remove(index);
+        let candidate_history = current_capture.history.with_operations(candidate_ops);
+        let mut candidate_capture = current_capture.clone();
+        candidate_capture.history = candidate_history;
+        let candidate_case = candidate_capture.to_replay_case();
+        attempts += 1;
+
+        let candidate_report = runner(&candidate_case)?;
+        if still_fails(&candidate_report)
+            && same_fact_set(&expected_facts, &candidate_report.live_facts)
+        {
+            candidate_capture.expected.event_count = candidate_report.replay.event_count;
+            candidate_capture.expected.trace_hash = candidate_report.replay.trace_hash;
+            current_capture = candidate_capture;
+            current_report = candidate_report;
+            index = 0;
+        } else {
+            index += 1;
+        }
+    }
+
+    current_capture.expected.event_count = current_report.replay.event_count;
+    current_capture.expected.trace_hash = current_report.replay.trace_hash;
+
+    Ok(ShrinkCapturedReport {
+        original_len,
+        shrunk_len: current_capture.history.len(),
+        attempts,
+        reason: reason.into(),
+        shrunk_capture: current_capture,
+        shrunk_report: current_report,
+    })
+}
+
+fn same_fact_set(left: &[super::LiveReplayFact], right: &[super::LiveReplayFact]) -> bool {
+    let mut left = left.iter().map(ToString::to_string).collect::<Vec<_>>();
+    let mut right = right.iter().map(ToString::to_string).collect::<Vec<_>>();
+    left.sort();
+    right.sort();
+    left == right
 }

@@ -18,10 +18,11 @@ use tina::prelude::*;
 use tina::{IsolateId, ShardId};
 use tina_runtime::{EventId, RuntimeEvent, RuntimeEventKind, SendRejectedReason};
 use tina_sim::dst::{
-    LiveReplayCapture, LiveReplayFact, LiveReplayReport, ReplayCase, ReplayConfig, ReplayReport,
-    RuntimeEventKindName, ShrinkConfig, TraceProjection, assert_replay_case, check_captured_replay,
-    check_replay_case, discover_constants, read_saved_replay_case, shrink_replay_case,
-    write_saved_replay_case,
+    CaptureLimits, CaptureSource, LiveReplayCapture, LiveReplayFact, LiveReplayReport, ReplayCase,
+    ReplayConfig, ReplayReport, RuntimeEventKindName, ShrinkConfig, TraceCompleteness,
+    TraceProjection, assert_replay_case, capture_live_run, check_captured_replay,
+    check_replay_case, discover_constants, read_saved_replay_case, shrink_captured_replay,
+    shrink_replay_case, write_saved_replay_case,
 };
 use tina_sim::{FaultConfig, LocalSendFaultMode, Simulator};
 
@@ -303,6 +304,11 @@ fn capture_burst_overflow() -> LiveReplayCapture<Op> {
         "HTTP/1 keepalive/body pressure live-shaped capture",
         &report,
     )
+    .with_source_metadata(
+        CaptureSource::new("HTTP/1 keepalive/body pressure live-shaped capture")
+            .runtime_kind("sim-smoke")
+            .backend("sim"),
+    )
     .with_live_fact(fact)
 }
 
@@ -411,6 +417,16 @@ fn live_replay_capture_includes_config_topology_and_mailboxes() {
     assert_eq!(capture.config.mailbox(SINK_ROLE), 2);
     assert!(capture.topology_roles.contains(&SOURCE_ROLE));
     assert!(capture.topology_roles.contains(&SINK_ROLE));
+    assert_eq!(
+        capture.source_metadata.trace_completeness,
+        TraceCompleteness::Complete
+    );
+    assert!(
+        capture
+            .summary()
+            .to_string()
+            .contains("replay_blocked=false")
+    );
 }
 
 #[test]
@@ -433,6 +449,85 @@ fn live_replay_unsupported_fact_is_reported_fail_closed() {
     let rendered = mismatch.to_string();
     assert!(rendered.contains("unsupported fact"));
     assert!(rendered.contains("reqwest completion body bytes"));
+}
+
+#[test]
+fn capture_live_run_builder_records_metadata_and_facts() {
+    let case = burst_overflow_case();
+    let events = vec![fake_event(1, RuntimeEventKind::HandlerStarted)];
+    let fact = LiveReplayFact::capacity_surface(&CapacitySurfaceReport::count(
+        "builder.capacity",
+        CapacityMode::Fixed,
+        4,
+        1,
+        2,
+        0,
+    ));
+
+    let capture = capture_live_run(case.name)
+        .with_seed(case.seed)
+        .with_config(case.config.clone())
+        .with_scenario(case.scenario)
+        .with_history(case.history.operations().to_vec())
+        .with_invariant(case.invariant)
+        .with_source_metadata(
+            CaptureSource::new("builder live smoke")
+                .runtime_kind("threaded")
+                .backend("live"),
+        )
+        .with_trace(&events)
+        .with_fact(fact)
+        .finish()
+        .expect("builder capture");
+
+    assert_eq!(capture.expected.event_count, 1);
+    assert_eq!(capture.source_metadata.runtime_kind, "threaded");
+    assert_eq!(capture.source_metadata.label, "builder live smoke");
+    assert_eq!(capture.live_facts.len(), 1);
+    assert!(capture.summary().to_string().contains(case.name));
+}
+
+#[test]
+fn bounded_capture_adds_explicit_truncation_truth_and_fails_closed() {
+    let case = burst_overflow_case();
+    let events = vec![
+        fake_event(1, RuntimeEventKind::HandlerStarted),
+        fake_event(2, RuntimeEventKind::MailboxAccepted),
+    ];
+    let capture = capture_live_run(case.name)
+        .with_limits(CaptureLimits {
+            max_events: 1,
+            ..CaptureLimits::default()
+        })
+        .with_seed(case.seed)
+        .with_config(case.config.clone())
+        .with_scenario(case.scenario)
+        .with_history(case.history.operations().to_vec())
+        .with_invariant(case.invariant)
+        .with_source("bounded capture")
+        .with_trace(&events)
+        .finish()
+        .expect("truncated capture is saveable evidence");
+    assert!(capture.truncated);
+    assert!(
+        capture
+            .unsupported_facts
+            .iter()
+            .any(|fact| fact.fact == "TraceTruncated" || fact.fact == "CaptureFull")
+    );
+
+    let replay_case = capture.to_replay_case();
+    let mismatch = check_captured_replay(&capture, &replay_case, |_| {
+        LiveReplayReport::from_case_and_events(
+            &replay_case,
+            &events[..1],
+            (),
+            TraceProjection::Exact,
+        )
+    })
+    .expect_err("default exact replay rejects truncated capture");
+    assert!(mismatch.includes(tina_sim::dst::CapturedReplayChange::Capture));
+    assert!(mismatch.to_string().contains("CaptureFull"));
 }
 
 #[test]
@@ -534,5 +629,32 @@ fn live_replay_shrink_refreshes_constants_for_live_derived_case() {
     assert_eq!(
         report.shrunk_case.expected_trace_hash,
         report.shrunk_report.trace_hash
+    );
+}
+
+#[test]
+fn shrink_captured_replay_preserves_fact_set_by_default() {
+    let capture = capture_burst_overflow();
+    let report = shrink_captured_replay(
+        &capture,
+        ShrinkConfig::default(),
+        "full rejection fact remains exact",
+        run_burst_overflow_live_replay,
+        |report| report.replay.output.full_rejections >= 1,
+    )
+    .expect("shrink runs");
+
+    assert_eq!(
+        report.capture().expected.event_count,
+        report.shrunk_report.replay.event_count
+    );
+    assert_eq!(
+        report.capture().expected.trace_hash,
+        report.shrunk_report.replay.trace_hash
+    );
+    assert_eq!(
+        report.capture().live_facts,
+        capture.live_facts,
+        "live-derived shrink preserves proving facts by default",
     );
 }

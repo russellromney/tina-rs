@@ -8,20 +8,23 @@ Live capture → sim replay → shrink, in one specimen.
   wire a live trace observer before the first event.
 - `tina_proof_harness::LiveTrace` to capture the live trace shape
   (event count + `stable_trace_hash`).
-- `tina_sim::dst::ReplayCase`, `assert_replay_case`,
-  `observe_replay_case`, `discover_constants`, `delete_shrink` for the
-  deterministic sim side.
+- `tina_sim::dst::capture_live_run`, `write_saved_replay_case`,
+  `read_saved_replay_case`, `assert_captured_replay`, and
+  `shrink_captured_replay` for the live-to-sim handoff.
+- `tina_sim::dst::ReplayCase`, `assert_replay_case`, and
+  `discover_constants` for the deterministic sim side.
 
 The "bug in a box" is a contrived rare-drop sink that silently
 discards `POISON_VALUE = 7`. The same isolate logic runs once live and
 once in the sim; the saved sim case pins the trace shape with
-`expected_event_count` + `expected_trace_hash`, and the shrinker
-reduces the original 8-op history down to its minimal trigger.
+`expected_event_count` + `expected_trace_hash`. The live capture also
+saves source metadata, a capacity fact, explicit history, and an
+unsupported-fact proof that fails closed.
 
 ## Commands
 
 ```sh
-# Smoke (run end-to-end, all five assertions):
+# Smoke (run end-to-end):
 cargo test --manifest-path examples/systems/system_live_replay_bugbox/Cargo.toml
 
 # Replay-regression PR gate (alias for the above):
@@ -32,8 +35,9 @@ The smoke prints one summary line on success, for example:
 
 ```text
 bugbox live_received=4 live_events=54 live_hash=0xc878d2a439129480 \
-  sim_events=54 sim_hash=0xe0f7990dddf0fb49 \
-  shrunk_from=8 to=1 discovered_seeds=4 live_pressure_nonzero=false
+  sim_events=54 sim_hash=0xc878d2a439129480 \
+  shrunk_from=8 to=5 discovered_seeds=4 live_pressure_nonzero=false \
+  capture_blocked=false unsupported_proof=true
 ```
 
 The numbers mean:
@@ -43,9 +47,11 @@ The numbers mean:
 | `live_received` | live sink received N non-poison values |
 | `live_events`, `live_hash` | live trace shape captured via `LiveTrace` |
 | `sim_events`, `sim_hash` | sim trace shape that the saved case pins |
-| `shrunk_from`, `to` | deletion shrink: original → minimal bug-preserving history |
+| `shrunk_from`, `to` | live-derived shrink: original → smaller fact-preserving history |
 | `discovered_seeds` | rows printed by `discover_constants` for the seed sweep |
 | `live_pressure_nonzero` | `false` on a clean run; `true` if any `SendRejected`/`CallCompletionRejected`/`CallReplyRejected` event was captured. Pressure facts come from `tina_runtime::PressureSummary` via `LiveTrace::pressure_summary()`. |
+| `capture_blocked` | `true` if unsupported/partial/truncated capture truth blocks exact replay |
+| `unsupported_proof` | `true` when an intentionally unsupported live fact failed closed |
 
 ## What finding the run exposes
 
@@ -57,11 +63,26 @@ The numbers mean:
   `assert_replay_case` fails loudly with the case's history printed in
   the panic.
 - Shrink failure — if the deletion shrinker stops shrinking before the
-  bug-preserving subset, the original history is logged so a coding
-  agent reading only the smoke output can copy the failing case.
+  smaller fact-preserving subset, the original history is logged so a
+  coding agent reading only the smoke output can copy the failing case.
+- Unsupported fact loss — the smoke adds an unsupported live-only fact
+  and proves `check_captured_replay` rejects it instead of silently
+  dropping it.
 - `discover_constants` output — `eprintln!("{d}")` per row prints the
   commented `expected_event_count` / `expected_trace_hash` block ready
   to paste into a new `.expecting(...)` chain on a sibling case.
+
+## Copied workflow
+
+1. Run the live smoke with `LiveTrace` installed before the first event.
+2. Inspect the capture summary line (`capture_blocked=false` means exact
+   replay is allowed).
+3. Save the case with `write_saved_replay_case`.
+4. Read it back with `read_saved_replay_case` and convert it with the
+   typed `ReplayConfig`.
+5. Replay it with `assert_captured_replay`.
+6. Shrink it with `shrink_captured_replay`.
+7. Commit the shrunk saved case and the regression test that proves it.
 
 ## How to add a new saved case
 
@@ -95,8 +116,8 @@ What felt good:
 - `assert_replay_case` panics with the full case history, the
   expected vs actual count + hash, and the next review step — enough
   for a coding agent to make a decision from the panic alone.
-- `delete_shrink` is exactly the shape the bug-shrinking workflow
-  wants: one closure (`still_fails`) drives everything.
+- `shrink_captured_replay` keeps the proving fact set intact while it
+  refreshes the shrunk case's expected count/hash.
 
 What felt rough:
 - Pinned constants drift the second you change isolate logic; the
@@ -113,8 +134,9 @@ Tina capability pulled:
 - `tina_runtime::TraceObserver`, `with_config_and_trace_observer`,
   `stable_trace_hash`.
 - `tina_sim::dst::ReplayCase`, `assert_replay_case`,
-  `observe_replay_case`, `discover_constants`, `delete_shrink`,
-  `ShrinkConfig`, `ShrunkFailure`.
+  `discover_constants`, `capture_live_run`, `assert_captured_replay`,
+  `write_saved_replay_case`, `read_saved_replay_case`,
+  `shrink_captured_replay`, `ShrinkConfig`.
 - `tina_proof_harness::live_replay::LiveTrace`.
 
 Suggested follow-up:
@@ -126,5 +148,5 @@ Suggested follow-up:
   a builder shortcut on `LocalSystemBuilder`-shaped helpers.
 
 Verdict:
-- keep. Phase 108's user-proof gate "live capture → replay → shrink"
+- keep. The user-proof gate "live capture → save → replay → shrink"
   ships as a runnable specimen, not a doc claim.
