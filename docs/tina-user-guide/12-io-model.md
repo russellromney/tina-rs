@@ -82,22 +82,21 @@ recorded and replayed.
 For protocols, prefer boring sync codec crates:
 
 - HTTP/1 parse with `httparse`
-- HTTP/2 cleartext server first form with Tina-owned frames, bounded stream
-  table, and explicit flow-control windows
-- gRPC unary, server-streaming, client-streaming, and first bidirectional
-  streaming form over Tina HTTP/2 h2c with `prost`, typed `GrpcStatus`
-  trailers, explicit message caps, service-call timeout mapping, and no
-  compression
+- HTTP/2 server/client with Tina-owned frames, bounded stream tables, explicit
+  flow-control windows, h2c server, and h2c/h2-TLS client targets
+- gRPC unary, server-streaming, client-streaming, and bidirectional streaming
+  over Tina HTTP/2 with `prost`, typed `GrpcStatus` trailers, explicit message
+  caps, service-call timeout mapping, and no compression
 - HTTP types with `http`
 - TLS state machine with `rustls` — driven by the runtime's per-shard TLS
   worker and bounded TLS queue
   (`tls_bind` / `tls_accept` / `tls_connect` / `tls_read` / `tls_write`
   / `tls_close`). `tina-http`'s `HttpsListener` and `HttpClient` use
   these directly: HTTP/1.1 over a real `rustls` handshake, no Tokio
-  edge. DER cert/key inputs are explicit; no system trust roots, no
-  HTTPS/2, no ALPN. HTTP/2's first form is cleartext h2c server-side
-  only. gRPC's first form also uses that h2c path; TLS ALPN remains future
-  work.
+  edge. DER cert/key inputs are explicit; no system trust roots.
+  HTTP/2 client targets can use cleartext h2c or h2 over TLS with
+  explicit ALPN. HTTP/2 server is still prior-knowledge h2c; HTTPS/2
+  server ALPN and mTLS are future work.
 - JSON with `serde_json`
 - protobuf with `prost`
 - Postgres wire with `postgres-protocol`
@@ -125,11 +124,12 @@ the continuation, the runtime trace still shows every rail call, and
 the helper owns the boring offset/progress math. See
 [`../tcp-loops.md`](../tcp-loops.md).
 
-## Native gRPC First Form
+## Native gRPC
 
-`tina-http::GrpcRouter` is the current native gRPC layer. It sits on
-`Http2Listener`, so the transport is prior-knowledge cleartext h2c in this
-slice.
+`tina-http::GrpcRouter` is the native gRPC server layer. It sits on
+`Http2Listener`, so the server transport is prior-knowledge cleartext h2c in
+this slice. `tina-http::GrpcClient` is the native client layer over
+`Http2ClientConnection`; it can target h2c or h2/TLS through `Http2Target`.
 
 What ships:
 
@@ -149,18 +149,19 @@ What ships:
 - explicit per-message caps through `GrpcLimits` (`512 KiB` by default);
 - service-call timeout mapped to `DeadlineExceeded`;
 - compression rejected as `Unimplemented`.
+- native `GrpcClient` for unary, server-streaming, client-streaming, and
+  bidirectional streaming;
 - tonic `0.12` h2c interop against the specimen for unary,
   server-streaming, client-streaming, and bidirectional streaming.
 
 What does not ship yet:
 
-- TLS ALPN / HTTPS/2 gRPC;
 - grpcurl scripts or reflection;
-- tonic compatibility, interceptors, reflection, health, or load balancing;
-- a pooled Tina gRPC client service.
+- tonic feature parity, interceptors, reflection, health, or load balancing;
+- pooled production gRPC clients and HTTP/2 mTLS.
 
 The tiny `grpc_unary_call_h2c_blocking` helper exists to prove the native wire
 path in tests and specimens without pulling in Tokio, hyper, or tonic. It is a
 blocking helper, not a Tina client service, and it does not emit runtime trace
-facts. Production client topology should become a normal Tina client service
-once HTTP/2 client plumbing grows beyond this first form.
+facts. Prefer `GrpcClient` for Tina services because it runs through the
+runtime HTTP/2 client and emits protocol facts.

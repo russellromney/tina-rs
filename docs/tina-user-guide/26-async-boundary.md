@@ -56,8 +56,8 @@ proves and reports them.
 - **Full `reqwest` HTTP client** (redirects, cookies, connection reuse you do not
   want to reimplement) → `tina-reqwest-bridge`. (Simple outbound HTTP can be
   native via `tina-http`.)
-- **Postgres** (`sqlx`, `tokio-postgres`) → `tina-sqlx-bridge`. No native pg
-  client ships; the bridge bounds the pool and classifies outcomes.
+- **Postgres** (`sqlx`) → `tina-sqlx-bridge`. No native pg wire client ships;
+  the bridge bounds the SQLx pool and classifies outcomes.
 - **SQLite** (`rusqlite`, `sqlx`) → `tina-sqlite-bridge`. A serial blocking
   bridge; its capacity is small (`1`), not absent.
 - **AWS SDK** (`aws-sdk-s3`, …) → `tina-aws-bridge`. Bounds admission into the

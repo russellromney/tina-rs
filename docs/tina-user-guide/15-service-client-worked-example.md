@@ -9,16 +9,14 @@ client service replies once
 caller sees CallOutcome
 ```
 
-This is the shape for HTTP clients, RPC clients, database clients, and other
-outbound services.
+This is the shape for HTTP clients, RPC clients, database clients, gRPC
+clients, and other outbound services.
 
-Native gRPC is currently server-first. `tina-http::GrpcRouter` serves unary
-`prost` messages over the native HTTP/2 h2c listener, and
-`grpc_unary_call_h2c_blocking` is only a tiny blocking specimen/test helper to
-prove the wire path without Tokio. It is not a Tina client service and does not
-emit runtime trace facts. A production gRPC client should follow the
-service-client state-machine shape below once the native HTTP/2 client grows
-into a real Tina client service.
+Native gRPC now follows this rule: `GrpcClient` is a small wrapper over the
+native `Http2ClientConnection` service, while `GrpcRouter` is the server.
+Host-only blocking helpers remain test conveniences; production Tina code
+should use service-shaped clients so pressure, cancellation, and protocol
+facts stay visible.
 
 ## Public Call Shape
 

@@ -109,8 +109,9 @@
 //! [`GrpcStreamItem`]s. On every shape a non-OK status is the caller
 //! outcome (never hidden in a success) and the received status is a
 //! `GrpcFinalStatusReceived` protocol fact. Both reject compression and
-//! cap message bytes. Interceptors, reflection, production pooled
-//! clients, and tonic interop are later slices.
+//! cap message bytes. The specimens prove tonic h2c interop for the
+//! core modes. Interceptors, reflection, load balancing, and
+//! production pooled clients are later slices.
 //!
 //! WebSocket: [`websocket_upgrade`] validates server-side HTTP/1.1
 //! upgrades for [`HttpListener`] and [`HttpsListener`]. After the

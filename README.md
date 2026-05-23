@@ -332,6 +332,8 @@ where the setup is still too heavy.
 
 | Section | What it covers |
 |---|---|
+| [`docs/tina-user-guide/README.md`](docs/tina-user-guide/README.md) | Full reading order |
+| [`docs/tina-user-guide/00-agent-quickstart.md`](docs/tina-user-guide/00-agent-quickstart.md) | Short checklist for humans and coding agents |
 | [`docs/tina-user-guide/01-mental-model.md`](docs/tina-user-guide/01-mental-model.md) | The model in one page |
 | [`docs/tina-user-guide/02-first-isolate.md`](docs/tina-user-guide/02-first-isolate.md) | Writing your first isolate |
 | [`docs/tina-user-guide/03-effects-and-runtime-calls.md`](docs/tina-user-guide/03-effects-and-runtime-calls.md) | Effects and runtime calls |
@@ -347,6 +349,12 @@ where the setup is still too heavy.
 | [`docs/tina-user-guide/13-outcome-glossary.md`](docs/tina-user-guide/13-outcome-glossary.md) | Outcome glossary |
 | [`docs/tina-user-guide/14-lifecycle-and-shutdown.md`](docs/tina-user-guide/14-lifecycle-and-shutdown.md) | Lifecycle and shutdown |
 | [`docs/tina-user-guide/15-service-client-worked-example.md`](docs/tina-user-guide/15-service-client-worked-example.md) | Service-client worked example |
+| [`docs/tina-user-guide/18-bridge-crates.md`](docs/tina-user-guide/18-bridge-crates.md) | Native-vs-bridge choice |
+| [`docs/tina-user-guide/22-http-http2-grpc.md`](docs/tina-user-guide/22-http-http2-grpc.md) | HTTP/2 and gRPC protocol facts |
+| [`docs/tina-user-guide/23-core-and-batteries.md`](docs/tina-user-guide/23-core-and-batteries.md) | Core and battery boundaries |
+| [`docs/tina-user-guide/25-extension-hooks.md`](docs/tina-user-guide/25-extension-hooks.md) | Extension hooks |
+| [`docs/tina-user-guide/26-async-boundary.md`](docs/tina-user-guide/26-async-boundary.md) | Async ecosystem boundary |
+| [`docs/tina-user-guide/30-bridge-author-kit.md`](docs/tina-user-guide/30-bridge-author-kit.md) | Bridge author copied path |
 | [`ROADMAP.md`](ROADMAP.md) | Phases, near-term work, and explicit non-goals |
 | [`CHANGELOG.md`](CHANGELOG.md) | Completed phases |
 
@@ -355,20 +363,20 @@ where the setup is still too heavy.
 Implemented today: explicit-step single-shard runtime, multi-shard runner with
 bounded shard-pair queues, `ThreadedRuntime` over Betelgeuse, runtime-owned
 TCP/UDP/DNS/TLS/file/path/process/signal/persistence rails, isolate calls
-with mandatory timeout, native first-form HTTP/1.1, framed RPC with typed
-service helpers, supervision with `OneForOne`/`OneForAll`/`RestForOne` and
-runtime-lifetime restart budgets, terminal shutdown reports with topology and
-trace, `tina-sim` with virtual time / seeded faults / scripted I/O / replay /
-DST shrinking, and narrow Tokio bridge crates with typed
-`Full`/`Closed`/`Timeout` outcomes.
+with mandatory timeout, native HTTP/1.1, native HTTP/2 server/client,
+native gRPC server/client streaming modes, native WebSocket server, framed RPC
+with typed service helpers, supervision with `OneForOne`/`OneForAll`/
+`RestForOne` and lifetime/windowed restart budgets, terminal shutdown reports
+with topology and trace, `tina-sim` with virtual time / seeded faults /
+scripted I/O / replay / DST shrinking, and bounded bridge crates for Tokio,
+Tower, reqwest, SQLite, SQLx/Postgres, and AWS SDK work.
 
 Not yet:
 
-* native HTTP/2 / gRPC service stack (planned, see [ROADMAP.md](ROADMAP.md));
-* native database client (PG wire / SQLite); current path is the bridge to `sqlx`/`tokio-postgres`;
+* broad native WebSocket client, HTTP/2 mTLS, gRPC reflection/interceptors/load balancing, and pooled production gRPC clients;
+* native database wire clients (PG wire / SQLite-native runtime rail); current paths are `tina-sqlite-bridge` over `rusqlite` and `tina-sqlx-bridge` over SQLx/Postgres;
 * broad Linux performance claim; Linux already uses Betelgeuse's native backend;
 * remoting or clustering;
-* time-windowed restart budgets (runtime-lifetime budgets only today);
 * production performance claim;
 * a stable public API.
 

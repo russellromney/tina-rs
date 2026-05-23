@@ -65,13 +65,13 @@ requires `I::Fact: IntoRuntimeFact`; the bundled `ProtocolFact` impl
 covers this. Any user-defined fact type must implement `IntoRuntimeFact`
 or registration is a compile error.
 
-## Native gRPC client (unary)
+## Native gRPC Client
 
 Tina is a native gRPC client, not only a server. `GrpcClient` sits over
-an `Http2ClientConnection` isolate — no Tokio, no hidden queue. The
-unary path encodes one `prost` message, submits it as one HTTP/2 stream,
-and decodes the reply into a typed `GrpcUnaryOutcome` where the gRPC
-status is first-class:
+an `Http2ClientConnection` isolate — no Tokio, no hidden queue. Unary
+calls encode one `prost` message, submit it as one HTTP/2 stream, and
+decode the reply into a typed `GrpcUnaryOutcome` where the gRPC status
+is first-class:
 
 ```rust,ignore
 use tina_http::{GrpcClient, GrpcLimits, GrpcUnaryOutcome,
@@ -104,10 +104,19 @@ successful response. The received status is emitted as a
 `ProtocolFact::GrpcFinalStatusReceived` fact — the receive-side mirror
 of the server's `GrpcFinalStatusSent`.
 
-Server-streaming, client-streaming, and bidi clients need the HTTP/2
-client's streaming-body support and are a later slice. h2/TLS gRPC
-clients need the TLS ALPN rail (also a later slice); a TLS target today
-resolves to `Http2ClientOutcome::TlsAlpnMismatch`.
+Streaming client calls use the same service:
+
+- `GrpcClient::server_streaming_request(path, &req)` opens a response stream.
+  Pull chunks with `Http2ClientMsg::ResponseNext` and fold them through
+  `GrpcStreamDecoder`.
+- `GrpcClient::client_streaming_request(path, source)` sends a streamed request
+  body and decodes one final response.
+- `GrpcClient::bidi_request(path, source)` sends a streamed request body while
+  the caller pulls streamed response chunks.
+
+The HTTP/2 client can target `Http2Target::H2c` or `Http2Target::Tls`.
+If TLS ALPN does not select `h2`, the caller sees
+`Http2ClientOutcome::TlsAlpnMismatch`.
 
 ## What does NOT emit facts
 
