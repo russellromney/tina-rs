@@ -29,7 +29,9 @@ enum LineageMsg {
     SpawnGrandchild,
     Stop,
     Panic,
+    Fail,
     Restart,
+    StopChildren,
 }
 
 type RunEvidence = (
@@ -243,7 +245,9 @@ impl Isolate for RootIsolate {
             )),
             LineageMsg::Stop => Effect::Stop,
             LineageMsg::Panic => panic!("panic inside root lineage isolate"),
+            LineageMsg::Fail => Effect::Fail,
             LineageMsg::Restart => Effect::RestartChildren,
+            LineageMsg::StopChildren => Effect::StopChildren,
             LineageMsg::SpawnGrandchild => Effect::Noop,
         }
     }
@@ -281,6 +285,8 @@ impl Isolate for RestartableRootIsolate {
             LineageMsg::Restart => Effect::RestartChildren,
             LineageMsg::Stop => Effect::Stop,
             LineageMsg::Panic => panic!("panic inside restartable root isolate"),
+            LineageMsg::Fail => Effect::Fail,
+            LineageMsg::StopChildren => Effect::StopChildren,
             LineageMsg::SpawnGrandchild => Effect::Noop,
         }
     }
@@ -307,7 +313,9 @@ impl Isolate for ChildIsolate {
             }
             LineageMsg::Stop => Effect::Stop,
             LineageMsg::Panic => panic!("panic inside child lineage isolate"),
+            LineageMsg::Fail => Effect::Fail,
             LineageMsg::Restart => Effect::RestartChildren,
+            LineageMsg::StopChildren => Effect::StopChildren,
             LineageMsg::SpawnChild => Effect::Noop,
         }
     }
@@ -1273,6 +1281,76 @@ impl Isolate for Sleeper {
                 },
             )),
             TimerMsg::Fired => Effect::Noop,
+            TimerMsg::StopNow => Effect::Stop,
+        }
+    }
+}
+
+/// Self-sends `fan` messages per turn. With `fan >= 2` the bounded
+/// mailbox saturates and the isolate stays continuously ready; with
+/// `fan == 1` it stays steadily ready at one queued message. Used to
+/// model a hot self-flooder beside a quiet-but-ready neighbor.
+#[derive(Debug)]
+struct SelfFlooder {
+    fan: usize,
+}
+
+impl Isolate for SelfFlooder {
+    type Message = FairMsg;
+    type Reply = ();
+    type Send = Outbound<FairMsg>;
+    type Spawn = Infallible;
+    type SpawnObserved = std::convert::Infallible;
+    type Call = Infallible;
+    type Fact = ::std::convert::Infallible;
+    type Shard = TestShard;
+
+    fn handle(
+        &mut self,
+        _msg: Self::Message,
+        ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
+        // Best-effort self-sends; once the mailbox is full the extra
+        // sends become SendRejected, which keeps the isolate saturated
+        // without panicking.
+        let mut effects = Vec::with_capacity(self.fan);
+        for _ in 0..self.fan {
+            effects.push(ctx.send_self(FairMsg::Tick));
+        }
+        Effect::Batch(effects)
+    }
+}
+
+/// Re-arms a sleep on every fire, so it keeps making timer progress for
+/// as long as the runtime keeps scheduling it.
+#[derive(Debug)]
+struct RecurringSleeper {
+    delay: Duration,
+}
+
+impl Isolate for RecurringSleeper {
+    type Message = TimerMsg;
+    type Reply = ();
+    type Send = Outbound<NeverOutbound>;
+    type Spawn = Infallible;
+    type SpawnObserved = std::convert::Infallible;
+    type Call = RuntimeCall<TimerMsg>;
+    type Fact = ::std::convert::Infallible;
+    type Shard = TestShard;
+
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
+        match msg {
+            TimerMsg::StartSleep | TimerMsg::Fired => Effect::Call(RuntimeCall::new(
+                CallInput::Sleep { after: self.delay },
+                |result| match result {
+                    CallOutput::TimerFired => TimerMsg::Fired,
+                    other => panic!("expected TimerFired, got {other:?}"),
+                },
+            )),
             TimerMsg::StopNow => Effect::Stop,
         }
     }
@@ -2574,6 +2652,58 @@ fn cooperative_hot_isolate_does_not_starve_quiet_isolate_in_one_round() {
     assert_eq!(
         seen.borrow().as_slice(),
         ["hot", "quiet", "hot", "hot", "hot", "hot"]
+    );
+}
+
+#[test]
+fn hot_self_sender_does_not_starve_steady_isolate_and_timer_keeps_firing() {
+    use crate::fairness_report::FairnessReport;
+
+    let (mut runtime, clock) = new_manual_runtime();
+    let hot = runtime.register(SelfFlooder { fan: 2 }, TestMailbox::new(8));
+    let steady = runtime.register(SelfFlooder { fan: 1 }, TestMailbox::new(8));
+    let timer = runtime.register(
+        RecurringSleeper {
+            delay: Duration::from_millis(1),
+        },
+        TestMailbox::new(4),
+    );
+
+    runtime.try_send(hot, FairMsg::Tick).unwrap();
+    runtime.try_send(steady, FairMsg::Tick).unwrap();
+    runtime.try_send(timer, TimerMsg::StartSleep).unwrap();
+
+    let rounds = 20u64;
+    for _ in 0..rounds {
+        clock.advance(Duration::from_millis(1));
+        runtime.step();
+    }
+
+    let report = FairnessReport::from_events(runtime.trace().iter());
+    let hot_turns = report.turns(hot.isolate());
+    let steady_turns = report.turns(steady.isolate());
+    let timer_sleeps = report.sleep_completions(timer.isolate());
+
+    // Round-robin gives every continuously-ready isolate one turn per
+    // step, so the hot flooder cannot pull more than one turn ahead of
+    // the steadily-ready neighbor.
+    assert!(
+        hot_turns.abs_diff(steady_turns) <= 1,
+        "hot {hot_turns} steady {steady_turns} should stay within one turn"
+    );
+    // The steady isolate is not starved — checked by the gap form, which
+    // needs no external round count: it stays within one turn of the hot
+    // flooder.
+    assert!(
+        report
+            .starvation_by_gap(steady.isolate(), hot.isolate(), 1)
+            .is_none(),
+        "steady isolate must not be reported starved: {report}"
+    );
+    // The recurring timer kept firing the whole time despite the hot load.
+    assert!(
+        timer_sleeps >= rounds - 2,
+        "timer should keep firing under load, got {timer_sleeps} of {rounds}"
     );
 }
 

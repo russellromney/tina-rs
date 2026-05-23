@@ -46,8 +46,28 @@ where
     /// to the parent as an ordinary later message.
     SpawnObserved(I::SpawnObserved),
 
+    /// Start a new isolate instance on another shard and report the typed
+    /// child reference back to the parent as an ordinary later message.
+    ///
+    /// Built by `spawn_observed(child).on_shard(shard).then(...)`. The child
+    /// registers on the target shard; the address returns to the parent on a
+    /// later turn. Isolates that never spawn cross-shard have
+    /// `SpawnObservedRemote = Infallible` and cannot construct this variant.
+    SpawnObservedOn(I::SpawnObservedRemote),
+
     /// Stop the current isolate.
     Stop,
+
+    /// Fail the current isolate as a typed, non-panic failure.
+    ///
+    /// Same lifecycle as [`Self::Stop`] — the isolate stops and any
+    /// in-flight caller settles visibly — but the runtime records it as a
+    /// distinct `HandlerReportedFailure` fact and routes it through the
+    /// supervision policy exactly like a handler panic. A supervised child
+    /// is restarted per its parent's policy and budget; an unsupervised
+    /// isolate simply stops. Use this to fail loudly without unwinding the
+    /// thread, and keep panic and reported failure separate in the trace.
+    Fail,
 
     /// Stop the current isolate and publish a typed final result for a
     /// host-registered `observe_result::<T>` waiter.
@@ -60,6 +80,18 @@ where
     /// Restart this isolate's children according to the runtime's supervision
     /// policy.
     RestartChildren,
+
+    /// Stop every child this isolate owns, as an explicit supervised
+    /// shutdown.
+    ///
+    /// Each owned child stops through the normal stop path — its mailbox
+    /// closes, its in-flight calls cancel so callers settle visibly, and a
+    /// `ChildStopped` fact names the child under this owner. The owner
+    /// itself keeps running; pair with [`Self::Stop`] (for example
+    /// `batch([stop_children(), stop()])`) for a full owner-then-children
+    /// shutdown. Plain [`Self::Stop`] is unchanged and never cascades, so
+    /// children that should outlive their parent still do.
+    StopChildren,
 
     /// Ask the runtime to perform one external operation on the isolate's
     /// behalf and deliver the result back later as an ordinary
@@ -260,6 +292,26 @@ where
     T: Send + 'static,
 {
     Effect::StopWith(StopResult::new(value))
+}
+
+/// Returns an effect that fails the current isolate as a typed, non-panic
+/// failure. See [`Effect::Fail`]: the isolate stops and, if supervised, is
+/// restarted per its parent's policy, recorded distinctly from a panic.
+pub fn fail<I>() -> Effect<I>
+where
+    I: Isolate,
+{
+    Effect::Fail
+}
+
+/// Returns an effect that stops every child this isolate owns, as an explicit
+/// supervised shutdown. See [`Effect::StopChildren`]: each child settles its
+/// callers and is named by a `ChildStopped` fact; the owner keeps running.
+pub fn stop_children<I>() -> Effect<I>
+where
+    I: Isolate,
+{
+    Effect::StopChildren
 }
 
 /// Returns an effect that asks the runtime to restart this isolate's direct

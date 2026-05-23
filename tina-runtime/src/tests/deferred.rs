@@ -22,8 +22,8 @@ use crate::{
 
 fn step_to_idle<S, F>(runtime: &mut Runtime<S, F>)
 where
-    S: Shard,
-    F: MailboxFactory,
+    S: Shard + 'static,
+    F: MailboxFactory + 'static,
 {
     // Simple drain loop: keep stepping while any work happens.
     while runtime.step() > 0 {}

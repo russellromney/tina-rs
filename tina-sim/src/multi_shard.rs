@@ -17,7 +17,10 @@ use crate::config::{
     Checker, CheckerDecision, CheckerFailure, DurableImage, MultiShardReplayArtifact,
     SimulatorConfig,
 };
-use crate::{IdSource, IntoErasedSpawn, IntoErasedSpawnObserved, QueuedRemoteEnvelope, Simulator};
+use crate::{
+    IdSource, IntoErasedSpawn, IntoErasedSpawnObserved, IntoSimRemoteSpawnObserved,
+    QueuedRemoteEnvelope, Simulator,
+};
 
 type RemoteQueueIndexes = BTreeMap<(ShardId, ShardId), usize>;
 type RemoteQueues = Vec<VecDeque<QueuedRemoteEnvelope>>;
@@ -186,6 +189,7 @@ where
         I::Call: RuntimeCallable,
         I::Spawn: IntoErasedSpawn<S> + 'static,
         I::SpawnObserved: IntoErasedSpawnObserved<S, I::Message> + 'static,
+        I::SpawnObservedRemote: IntoSimRemoteSpawnObserved<S, I::Message> + 'static,
         I::Reply: 'static,
         I::Fact: tina_runtime::IntoRuntimeFact + 'static,
         Msg: 'static,
@@ -214,6 +218,7 @@ where
         I::Call: RuntimeCallable,
         I::Spawn: IntoErasedSpawn<S> + 'static,
         I::SpawnObserved: IntoErasedSpawnObserved<S, I::Message> + 'static,
+        I::SpawnObservedRemote: IntoSimRemoteSpawnObserved<S, I::Message> + 'static,
         I::Reply: 'static,
         I::Fact: tina_runtime::IntoRuntimeFact + 'static,
         Msg: 'static,
@@ -573,7 +578,10 @@ fn enqueue_remote_envelope_preserving_terminal(
             target_shard.get()
         )
     });
-    let terminal = matches!(envelope, QueuedRemoteEnvelope::CallReply(_));
+    let terminal = matches!(
+        envelope,
+        QueuedRemoteEnvelope::CallReply(_) | QueuedRemoteEnvelope::SpawnReply(_)
+    );
     let queue = if terminal {
         &mut buffers.next_terminal[queue_index]
     } else {

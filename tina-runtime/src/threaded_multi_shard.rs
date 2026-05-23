@@ -40,8 +40,8 @@ use crate::shutdown::{SharedShutdownState, ShutdownWorker, ThreadedShutdownHandl
 use crate::threaded::{ThreadedCommand, ThreadedRuntimeConfig, deliver_shutdown_signal_and_drain};
 use crate::trace::{RuntimeEvent, SendRejectedReason};
 use crate::{
-    IdSource, IntoErasedSpawn, IntoErasedSpawnObserved, QueuedRemoteEnvelope, Runtime,
-    SendableQueuedRemoteEnvelope,
+    IdSource, IntoErasedSpawn, IntoErasedSpawnObserved, IntoSendErasedSpawnObserved,
+    QueuedRemoteEnvelope, Runtime, SendableQueuedRemoteEnvelope,
 };
 
 /// One live worker-per-shard runtime over a fixed shard set.
@@ -345,6 +345,7 @@ where
         I::Reply: Send + 'static,
         I::Spawn: IntoErasedSpawn<S, F> + 'static,
         I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
+        I::SpawnObservedRemote: IntoSendErasedSpawnObserved<S, F, I::Message> + 'static,
         I::Call: IntoErasedCall<I::Message> + 'static,
         I::Fact: crate::fact::IntoRuntimeFact + 'static,
         Outbound: Send + 'static,
@@ -370,6 +371,7 @@ where
         I::Reply: Send + 'static,
         I::Spawn: IntoErasedSpawn<S, F> + 'static,
         I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
+        I::SpawnObservedRemote: IntoSendErasedSpawnObserved<S, F, I::Message> + 'static,
         I::Call: IntoErasedCall<I::Message> + 'static,
         I::Fact: crate::fact::IntoRuntimeFact + 'static,
         Outbound: Send + 'static,
@@ -880,8 +882,8 @@ fn threaded_worker_loop_with_remote<S, F>(
     shard_metrics: Arc<LiveShardMetrics>,
 ) -> ThreadedWorkerExit
 where
-    S: Shard,
-    F: MailboxFactory,
+    S: Shard + 'static,
+    F: MailboxFactory + 'static,
 {
     shard_metrics.set_worker_thread_id(format!("{:?}", thread::current().id()));
     let source_shard = runtime.shard().id();
@@ -898,7 +900,10 @@ where
         let route_remote_lossless =
             |envelope: QueuedRemoteEnvelope| -> Result<(), Box<RemoteRouteFailure>> {
                 let target_shard = envelope.target_shard();
-                let terminal = matches!(envelope, QueuedRemoteEnvelope::CallReply(_));
+                let terminal = matches!(
+                    envelope,
+                    QueuedRemoteEnvelope::CallReply(_) | QueuedRemoteEnvelope::SpawnReply(_)
+                );
                 let metrics = remote_wiring
                     .queue_metrics
                     .get(&(source_shard, target_shard));
@@ -1067,7 +1072,10 @@ fn route_remote_preserving_terminal(
         Ok(()) => Ok(()),
         Err(failure)
             if failure.reason == SendRejectedReason::Full
-                && matches!(failure.envelope, QueuedRemoteEnvelope::CallReply(_)) =>
+                && matches!(
+                    failure.envelope,
+                    QueuedRemoteEnvelope::CallReply(_) | QueuedRemoteEnvelope::SpawnReply(_)
+                ) =>
         {
             terminal_overflow.push_back(failure.envelope);
             Ok(())
@@ -1086,7 +1094,10 @@ fn drain_terminal_overflow(
             Ok(()) => delivered += 1,
             Err(failure)
                 if failure.reason == SendRejectedReason::Full
-                    && matches!(failure.envelope, QueuedRemoteEnvelope::CallReply(_)) =>
+                    && matches!(
+                        failure.envelope,
+                        QueuedRemoteEnvelope::CallReply(_) | QueuedRemoteEnvelope::SpawnReply(_)
+                    ) =>
             {
                 terminal_overflow.push_front(failure.envelope);
                 break;
@@ -1110,8 +1121,8 @@ fn drain_remote_inbound<S, F>(
     next_start: &mut usize,
 ) -> usize
 where
-    S: Shard,
-    F: MailboxFactory,
+    S: Shard + 'static,
+    F: MailboxFactory + 'static,
 {
     if budget == 0 || remote_receivers.is_empty() {
         return 0;

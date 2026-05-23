@@ -21,6 +21,7 @@ struct IsolateArgs {
     send: Option<Type>,
     spawn: Option<Type>,
     spawn_observed: Option<Type>,
+    spawn_observed_remote: Option<Type>,
     call: Option<Type>,
     fact: Option<Type>,
     shard: Option<Type>,
@@ -39,6 +40,7 @@ impl Parse for IsolateArgs {
             send: None,
             spawn: None,
             spawn_observed: None,
+            spawn_observed_remote: None,
             call: None,
             fact: None,
             shard: None,
@@ -95,13 +97,18 @@ impl Parse for IsolateArgs {
                     "spawn_observed" => {
                         set_once(&mut args.spawn_observed, value, "spawn_observed")?
                     }
+                    "spawn_observed_remote" => set_once(
+                        &mut args.spawn_observed_remote,
+                        value,
+                        "spawn_observed_remote",
+                    )?,
                     "call" => set_once(&mut args.call, value, "call")?,
                     "fact" => set_once(&mut args.fact, value, "fact")?,
                     "shard" => set_once(&mut args.shard, value, "shard")?,
                     _ => {
                         return Err(Error::new_spanned(
                             key,
-                            "expected one of: message, event, request, reply, send, spawn, spawn_observed, call, fact, shard, tina_crate, runtime_crate, send_only",
+                            "expected one of: message, event, request, reply, send, spawn, spawn_observed, spawn_observed_remote, call, fact, shard, tina_crate, runtime_crate, send_only",
                         ));
                     }
                 }
@@ -261,6 +268,9 @@ fn build_isolate(
         .unwrap_or_else(|| syn::parse_quote!(::core::convert::Infallible));
     let spawn_observed = args
         .spawn_observed
+        .unwrap_or_else(|| syn::parse_quote!(::core::convert::Infallible));
+    let spawn_observed_remote = args
+        .spawn_observed_remote
         .unwrap_or_else(|| syn::parse_quote!(::core::convert::Infallible));
     let call = match args.call {
         Some(call) => call,
@@ -434,6 +444,7 @@ fn build_isolate(
             type Send = #send;
             type Spawn = #spawn;
             type SpawnObserved = #spawn_observed;
+            type SpawnObservedRemote = #spawn_observed_remote;
             type Call = #call;
             type Fact = #fact;
             type Shard = #shard;

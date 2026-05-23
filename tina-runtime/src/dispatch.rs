@@ -29,7 +29,9 @@ use crate::call::{
 use crate::driver::DriverShutdownError;
 use crate::fact::{IntoRuntimeFact, RuntimeFact};
 use crate::mailbox::MailboxFactory;
-use crate::remote::{QueuedRemoteEnvelope, QueuedRemoteSend, RemoteCallOutcome, RemoteCallReply};
+use crate::remote::{
+    QueuedRemoteEnvelope, QueuedRemoteSend, RemoteCallOutcome, RemoteCallReply, RemoteSpawnRequest,
+};
 use crate::trace::{
     CallCompletionRejectedReason, CallKind, CallReplyRejectedReason, CauseId,
     DeferredReplyRejectedReason, DeferredSlotId, EffectKind, EventId, RestartSkippedReason,
@@ -208,7 +210,11 @@ where
     /// isolate gets at most one delivery chance, in registration order.
     ///
     /// The return value is the number of handlers that ran in this round.
-    pub fn step(&mut self) -> usize {
+    pub fn step(&mut self) -> usize
+    where
+        S: 'static,
+        F: 'static,
+    {
         let shard_id = self.shard.id();
         self.step_with_remote(&mut |_source_shard, envelope| {
             let target_shard = envelope.target_shard();
@@ -227,6 +233,13 @@ where
                     shard_id.get(),
                 );
                 }
+                QueuedRemoteEnvelope::SpawnRequest(_) | QueuedRemoteEnvelope::SpawnReply(_) => {
+                    panic!(
+                        "cross-shard spawn requires a multi-shard runtime: target shard {} != runtime shard {}",
+                        target_shard.get(),
+                        shard_id.get(),
+                    );
+                }
             }
         })
     }
@@ -234,6 +247,8 @@ where
     pub(crate) fn step_with_remote<FR>(&mut self, route_remote: &mut FR) -> usize
     where
         FR: FnMut(ShardId, QueuedRemoteEnvelope) -> Result<(), SendRejectedReason>,
+        S: 'static,
+        F: 'static,
     {
         let now = self.clock.now();
         self.advance_driver(now);
@@ -327,7 +342,7 @@ where
                         }
                     }
                     self.stop_entry(index, isolate_id, handler_panicked.into());
-                    self.supervise_panic(
+                    self.supervise_failed_child(
                         RegisteredAddress {
                             shard: self.shard.id(),
                             isolate: isolate_id,
@@ -537,11 +552,38 @@ where
         call_context: Option<MessageCallContext>,
         round_messages: &mut [Option<DeliveredMessage>],
         route_remote: &mut impl FnMut(ShardId, QueuedRemoteEnvelope) -> Result<(), SendRejectedReason>,
-    ) -> bool {
+    ) -> bool
+    where
+        S: 'static,
+        F: 'static,
+    {
         let isolate_id = self.entries[index].id;
         match effect {
             ErasedEffect::Stop => {
                 self.stop_entry(index, isolate_id, cause);
+                true
+            }
+            ErasedEffect::Fail => {
+                // Typed, non-panic failure: record it distinctly, stop the
+                // isolate (any in-flight caller already settled visibly via
+                // the abandoned-context path), then feed supervision exactly
+                // like a panic.
+                let generation = self.entries[index].generation;
+                let failed = self.push_event(
+                    isolate_id,
+                    Some(cause),
+                    RuntimeEventKind::HandlerReportedFailure,
+                );
+                self.stop_entry(index, isolate_id, failed.into());
+                self.supervise_failed_child(
+                    RegisteredAddress {
+                        shard: self.shard.id(),
+                        isolate: isolate_id,
+                        generation,
+                    },
+                    failed.into(),
+                    round_messages,
+                );
                 true
             }
             ErasedEffect::StopWith(result) => {
@@ -682,8 +724,62 @@ where
                 }
                 false
             }
+            ErasedEffect::SpawnObservedOn(parts) => {
+                let owner = RegisteredAddress {
+                    shard: self.shard.id(),
+                    isolate: isolate_id,
+                    generation: self.entries[index].generation,
+                };
+                if parts.target_shard == self.shard.id() {
+                    // on_shard() pointed at the owner's own shard: this is an
+                    // ordinary local owned observed spawn (register_remote_child
+                    // records the ChildRecord and parent-attributed Spawned), so
+                    // no round trip and no cross-shard ChildStarted fact.
+                    let outcome = parts.spawn.spawn_remote(self, owner, cause);
+                    let message = (parts.continuation)(outcome);
+                    self.deliver_observed_continuation(owner, message, cause);
+                } else {
+                    let request_id = self.ids.next_call_id();
+                    let payload: Box<dyn Any + Send> = Box::new(parts.spawn);
+                    self.pending_remote_spawns.push(PendingRemoteSpawn {
+                        request_id,
+                        requester: owner,
+                        continuation: parts.continuation,
+                    });
+                    let routed = route_remote(
+                        self.shard.id(),
+                        QueuedRemoteEnvelope::SpawnRequest(RemoteSpawnRequest {
+                            request_id,
+                            target_shard: parts.target_shard,
+                            owner,
+                            payload,
+                            cause,
+                        }),
+                    );
+                    if routed.is_err() {
+                        // The target shard could not accept the request; settle
+                        // the owner's continuation with a typed error now.
+                        if let Some(pos) = self
+                            .pending_remote_spawns
+                            .iter()
+                            .position(|pending| pending.request_id == request_id)
+                        {
+                            let pending = self.pending_remote_spawns.remove(pos);
+                            let message = (pending.continuation)(Err(
+                                SpawnObservedError::DestinationUnavailable,
+                            ));
+                            self.deliver_observed_continuation(owner, message, cause);
+                        }
+                    }
+                }
+                false
+            }
             ErasedEffect::RestartChildren => {
                 self.restart_children(isolate_id, cause, round_messages);
+                false
+            }
+            ErasedEffect::StopChildren => {
+                self.stop_children(isolate_id, cause, round_messages);
                 false
             }
             ErasedEffect::Call(call) => {
@@ -2114,6 +2210,11 @@ where
             self.entries[index].generation,
             stopped.into(),
         );
+        // Drop any cross-shard observed-spawn requests this isolate was waiting
+        // on. A later reply finds no pending record and is a no-op, so the
+        // boxed continuation cannot leak past the owner's stop.
+        self.pending_remote_spawns
+            .retain(|pending| pending.requester.isolate != isolate_id);
         if precollected.is_some() {
             self.push_event(
                 isolate_id,
@@ -2155,7 +2256,104 @@ where
         }
     }
 
-    pub(crate) fn supervise_panic(
+    /// Stops every live child owned by `parent` (explicit supervised
+    /// shutdown). Each child stops through the normal path, so its callers
+    /// settle and its pending work is cancelled; a `ChildStopped` fact names
+    /// it under the parent. The parent is not touched.
+    pub(crate) fn stop_children(
+        &mut self,
+        parent: IsolateId,
+        cause: CauseId,
+        round_messages: &mut [Option<DeliveredMessage>],
+    ) {
+        // Snapshot first: stopping a child mutates `entries` and the GC, which
+        // would invalidate a borrow held across the loop.
+        let children: Vec<(usize, RegisteredAddress)> = self
+            .child_records
+            .iter()
+            .filter(|record| record.parent == parent)
+            .map(|record| (record.child_ordinal, record.child))
+            .collect();
+        for (child_ordinal, child) in children {
+            let Some(entry_index) = self.entry_index(child) else {
+                continue;
+            };
+            if self.entries[entry_index].stopped.get() {
+                continue;
+            }
+            let stopped = self.push_event(
+                parent,
+                Some(cause),
+                RuntimeEventKind::ChildStopped {
+                    child_ordinal,
+                    child_isolate: child.isolate,
+                    child_generation: child.generation,
+                },
+            );
+            let precollected = round_messages.get_mut(entry_index).and_then(Option::take);
+            self.stop_entry_with_precollected(
+                entry_index,
+                child.isolate,
+                stopped.into(),
+                precollected,
+            );
+        }
+    }
+
+    /// Delivers an observed-spawn continuation message to its owner (on this
+    /// shard) through the traced local-send path, so a full or closed owner
+    /// mailbox produces the usual `SendDispatchAttempted` / `SendAccepted` /
+    /// `SendRejected` truth instead of a silent drop — matching ordinary
+    /// `spawn_observed`.
+    pub(crate) fn deliver_observed_continuation(
+        &mut self,
+        owner: RegisteredAddress,
+        message: ErasedMessage,
+        cause: CauseId,
+    ) {
+        let attempted = self.push_event(
+            owner.isolate,
+            Some(cause),
+            RuntimeEventKind::SendDispatchAttempted {
+                target_shard: owner.shard,
+                target_isolate: owner.isolate,
+                target_generation: owner.generation,
+            },
+        );
+        let send = ErasedSend {
+            target_shard: owner.shard,
+            target_isolate: owner.isolate,
+            target_generation: owner.generation,
+            message,
+        };
+        match self.dispatch_local_send(send) {
+            Ok(()) => {
+                self.push_event(
+                    owner.isolate,
+                    Some(attempted.into()),
+                    RuntimeEventKind::SendAccepted {
+                        target_shard: owner.shard,
+                        target_isolate: owner.isolate,
+                        target_generation: owner.generation,
+                    },
+                );
+            }
+            Err(reason) => {
+                self.push_event(
+                    owner.isolate,
+                    Some(attempted.into()),
+                    RuntimeEventKind::SendRejected {
+                        target_shard: owner.shard,
+                        target_isolate: owner.isolate,
+                        target_generation: owner.generation,
+                        reason,
+                    },
+                );
+            }
+        }
+    }
+
+    pub(crate) fn supervise_failed_child(
         &mut self,
         failed_child: RegisteredAddress,
         cause: CauseId,
@@ -2705,6 +2903,7 @@ where
     I::Reply: 'static,
     I::Spawn: IntoErasedSpawn<S, F> + 'static,
     I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
+    I::SpawnObservedRemote: IntoSendErasedSpawnObserved<S, F, I::Message> + 'static,
     I::Call: IntoErasedCall<I::Message> + 'static,
     I::Fact: IntoRuntimeFact + 'static,
     Outbound: 'static,
@@ -2777,6 +2976,7 @@ where
     I::Reply: Send + 'static,
     I::Spawn: IntoErasedSpawn<S, F> + 'static,
     I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
+    I::SpawnObservedRemote: IntoSendErasedSpawnObserved<S, F, I::Message> + 'static,
     I::Call: IntoErasedCall<I::Message> + 'static,
     I::Fact: IntoRuntimeFact + 'static,
     Outbound: Send + 'static,
@@ -2841,6 +3041,7 @@ where
     I::Reply: 'static,
     I::Spawn: IntoErasedSpawn<S, F> + 'static,
     I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
+    I::SpawnObservedRemote: IntoSendErasedSpawnObserved<S, F, I::Message> + 'static,
     I::Call: IntoErasedCall<I::Message> + 'static,
     I::Fact: IntoRuntimeFact + 'static,
     Outbound: 'static,
@@ -2864,9 +3065,14 @@ where
         Effect::SpawnObserved(spawn) => {
             ErasedEffect::SpawnObserved(spawn.into_erased_spawn_observed())
         }
+        Effect::SpawnObservedOn(spawn) => {
+            ErasedEffect::SpawnObservedOn(spawn.into_send_erased_spawn_observed())
+        }
         Effect::Stop => ErasedEffect::Stop,
+        Effect::Fail => ErasedEffect::Fail,
         Effect::StopWith(result) => ErasedEffect::StopWith(result),
         Effect::RestartChildren => ErasedEffect::RestartChildren,
+        Effect::StopChildren => ErasedEffect::StopChildren,
         Effect::Call(call) => ErasedEffect::Call(call.into_erased_call()),
         Effect::Batch(effects) => ErasedEffect::Batch(
             effects
@@ -2889,6 +3095,7 @@ where
     I::Reply: Send + 'static,
     I::Spawn: IntoErasedSpawn<S, F> + 'static,
     I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
+    I::SpawnObservedRemote: IntoSendErasedSpawnObserved<S, F, I::Message> + 'static,
     I::Call: IntoErasedCall<I::Message> + 'static,
     I::Fact: IntoRuntimeFact + 'static,
     Outbound: Send + 'static,
@@ -2912,9 +3119,14 @@ where
         Effect::SpawnObserved(spawn) => {
             ErasedEffect::SpawnObserved(spawn.into_erased_spawn_observed())
         }
+        Effect::SpawnObservedOn(spawn) => {
+            ErasedEffect::SpawnObservedOn(spawn.into_send_erased_spawn_observed())
+        }
         Effect::Stop => ErasedEffect::Stop,
+        Effect::Fail => ErasedEffect::Fail,
         Effect::StopWith(result) => ErasedEffect::StopWith(result),
         Effect::RestartChildren => ErasedEffect::RestartChildren,
+        Effect::StopChildren => ErasedEffect::StopChildren,
         Effect::Call(call) => ErasedEffect::Call(call.into_erased_call()),
         Effect::Batch(effects) => ErasedEffect::Batch(
             effects
@@ -2957,9 +3169,12 @@ where
     Send(ErasedSend),
     Spawn(Box<dyn ErasedSpawn<S, F>>),
     SpawnObserved(Box<dyn ErasedSpawnObserved<S, F>>),
+    SpawnObservedOn(SendSpawnObservedParts<S, F>),
     Stop,
+    Fail,
     StopWith(StopResult),
     RestartChildren,
+    StopChildren,
     Call(ErasedCall),
     Batch(Vec<ErasedEffect<S, F>>),
     ReplyTo {
@@ -2982,9 +3197,12 @@ where
             Self::Send(_) => EffectKind::Send,
             Self::Spawn(_) => EffectKind::Spawn,
             Self::SpawnObserved(_) => EffectKind::SpawnObserved,
+            Self::SpawnObservedOn(_) => EffectKind::SpawnObservedOn,
             Self::Stop => EffectKind::Stop,
+            Self::Fail => EffectKind::Fail,
             Self::StopWith(_) => EffectKind::StopWith,
             Self::RestartChildren => EffectKind::RestartChildren,
+            Self::StopChildren => EffectKind::StopChildren,
             Self::Call(_) => EffectKind::Call,
             Self::Batch(_) => EffectKind::Batch,
             Self::ReplyTo { .. } => EffectKind::ReplyTo,
@@ -3012,7 +3230,7 @@ where
 
     pub(crate) fn stops_before_consuming_call_context(&self) -> bool {
         match self {
-            Self::Stop | Self::StopWith(_) => true,
+            Self::Stop | Self::Fail | Self::StopWith(_) => true,
             Self::Reply(_) | Self::Reject(_) => false,
             Self::Batch(effects) => {
                 for effect in effects {
@@ -3168,6 +3386,7 @@ where
     I::Reply: 'static,
     I::Spawn: IntoErasedSpawn<S, F> + 'static,
     I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
+    I::SpawnObservedRemote: IntoSendErasedSpawnObserved<S, F, I::Message> + 'static,
     I::Call: IntoErasedCall<I::Message> + 'static,
     I::Fact: IntoRuntimeFact + 'static,
     Outbound: 'static,
@@ -3206,6 +3425,7 @@ where
     I::Reply: 'static,
     I::Spawn: IntoErasedSpawn<S, F> + 'static,
     I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
+    I::SpawnObservedRemote: IntoSendErasedSpawnObserved<S, F, I::Message> + 'static,
     I::Call: IntoErasedCall<I::Message> + 'static,
     I::Fact: IntoRuntimeFact + 'static,
     OutboundMsg: 'static,
@@ -3220,6 +3440,193 @@ where
             bootstrap_message,
             marker: PhantomData,
         })
+    }
+}
+
+// --- Cross-shard (Send) spawn machinery -------------------------------------
+//
+// A cross-shard `spawn_observed(child).on_shard(B)` ships the child constructor
+// to shard B, which registers it and replies with the new address. Only the
+// *constructor* crosses the thread boundary (hence `Send`); the parent's
+// continuation stays on the owner shard, held until the address comes back.
+
+/// A `Send` spawn payload that registers a child on the destination shard and
+/// returns its address. The owner's continuation is not carried here — it runs
+/// on the owner shard when the reply arrives.
+pub(crate) trait SendErasedSpawn<S, F>: Send
+where
+    S: Shard,
+    F: MailboxFactory,
+{
+    fn spawn_remote(
+        self: Box<Self>,
+        runtime: &mut Runtime<S, F>,
+        owner: RegisteredAddress,
+        cause: CauseId,
+    ) -> Result<RegisteredAddress, SpawnObservedError>;
+}
+
+pub(crate) trait IntoSendErasedSpawn<S, F>
+where
+    S: Shard,
+    F: MailboxFactory,
+{
+    fn into_send_erased_spawn(self) -> Box<dyn SendErasedSpawn<S, F>>;
+}
+
+/// The owner-shard parts of a cross-shard observed spawn: the target shard, the
+/// `Send` payload to ship there, and the continuation thunk that turns the
+/// later `RegisteredAddress` (or error) into the parent's continuation message.
+pub(crate) struct SendSpawnObservedParts<S, F>
+where
+    S: Shard,
+    F: MailboxFactory,
+{
+    pub(crate) target_shard: ShardId,
+    pub(crate) spawn: Box<dyn SendErasedSpawn<S, F>>,
+    #[allow(clippy::type_complexity)]
+    pub(crate) continuation:
+        Box<dyn FnOnce(Result<RegisteredAddress, SpawnObservedError>) -> ErasedMessage>,
+}
+
+pub(crate) trait IntoSendErasedSpawnObserved<S, F, ParentMessage>
+where
+    S: Shard,
+    F: MailboxFactory,
+{
+    fn into_send_erased_spawn_observed(self) -> SendSpawnObservedParts<S, F>;
+}
+
+/// A cross-shard observed spawn awaiting its address reply, held on the owner
+/// shard. The continuation turns the later address (or error) into the parent's
+/// continuation message.
+pub(crate) struct PendingRemoteSpawn {
+    pub(crate) request_id: CallId,
+    pub(crate) requester: RegisteredAddress,
+    #[allow(clippy::type_complexity)]
+    pub(crate) continuation:
+        Box<dyn FnOnce(Result<RegisteredAddress, SpawnObservedError>) -> ErasedMessage>,
+}
+
+impl<S, F> IntoSendErasedSpawn<S, F> for std::convert::Infallible
+where
+    S: Shard,
+    F: MailboxFactory,
+{
+    fn into_send_erased_spawn(self) -> Box<dyn SendErasedSpawn<S, F>> {
+        match self {}
+    }
+}
+
+impl<S, F, ParentMessage> IntoSendErasedSpawnObserved<S, F, ParentMessage>
+    for std::convert::Infallible
+where
+    S: Shard,
+    F: MailboxFactory,
+{
+    fn into_send_erased_spawn_observed(self) -> SendSpawnObservedParts<S, F> {
+        match self {}
+    }
+}
+
+pub(crate) struct SendSpawnAdapter<I, Outbound>
+where
+    I: Isolate,
+{
+    pub(crate) isolate: I,
+    pub(crate) mailbox_capacity: usize,
+    pub(crate) bootstrap_message: Option<I::Message>,
+    pub(crate) marker: PhantomData<fn(Outbound) -> Outbound>,
+}
+
+impl<I, S, F, Outbound> SendErasedSpawn<S, F> for SendSpawnAdapter<I, Outbound>
+where
+    I: Isolate<Shard = S, Send = TinaOutbound<Outbound>> + Send + 'static,
+    I::Message: Send + 'static,
+    I::Reply: 'static,
+    I::Spawn: IntoErasedSpawn<S, F> + 'static,
+    I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
+    I::SpawnObservedRemote: IntoSendErasedSpawnObserved<S, F, I::Message> + 'static,
+    I::Call: IntoErasedCall<I::Message> + 'static,
+    I::Fact: IntoRuntimeFact + 'static,
+    Outbound: Send + 'static,
+    S: Shard,
+    F: MailboxFactory,
+{
+    fn spawn_remote(
+        self: Box<Self>,
+        runtime: &mut Runtime<S, F>,
+        owner: RegisteredAddress,
+        cause: CauseId,
+    ) -> Result<RegisteredAddress, SpawnObservedError> {
+        if self.mailbox_capacity == 0 {
+            return Err(SpawnObservedError::ZeroMailboxCapacity);
+        }
+        Ok(runtime.register_remote_child::<I, Outbound>(
+            self.isolate,
+            self.mailbox_capacity,
+            self.bootstrap_message,
+            owner,
+            cause,
+        ))
+    }
+}
+
+impl<I, S, F, OutboundMsg> IntoSendErasedSpawn<S, F> for tina::ChildDefinition<I>
+where
+    I: Isolate<Shard = S, Send = TinaOutbound<OutboundMsg>> + Send + 'static,
+    I::Message: Send + 'static,
+    I::Reply: 'static,
+    I::Spawn: IntoErasedSpawn<S, F> + 'static,
+    I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
+    I::SpawnObservedRemote: IntoSendErasedSpawnObserved<S, F, I::Message> + 'static,
+    I::Call: IntoErasedCall<I::Message> + 'static,
+    I::Fact: IntoRuntimeFact + 'static,
+    OutboundMsg: Send + 'static,
+    S: Shard,
+    F: MailboxFactory,
+{
+    fn into_send_erased_spawn(self) -> Box<dyn SendErasedSpawn<S, F>> {
+        let (isolate, mailbox_capacity, bootstrap_message) = self.into_parts();
+        Box::new(SendSpawnAdapter::<I, OutboundMsg> {
+            isolate,
+            mailbox_capacity,
+            bootstrap_message,
+            marker: PhantomData,
+        })
+    }
+}
+
+impl<Spawn, ParentMessage, ChildMessage, ChildReply, S, F>
+    IntoSendErasedSpawnObserved<S, F, ParentMessage>
+    for tina::SpawnObservedRemote<Spawn, ParentMessage, ChildMessage, ChildReply>
+where
+    Spawn: IntoSendErasedSpawn<S, F> + Send + 'static,
+    ParentMessage: 'static,
+    ChildMessage: 'static,
+    ChildReply: 'static,
+    S: Shard,
+    F: MailboxFactory,
+{
+    fn into_send_erased_spawn_observed(self) -> SendSpawnObservedParts<S, F> {
+        let (spawn, target_shard, continuation) = self.into_parts();
+        let continuation = Box::new(
+            move |result: Result<RegisteredAddress, SpawnObservedError>| -> ErasedMessage {
+                let typed = result.map(|address| {
+                    ChildRef::new(Address::<ChildMessage, ChildReply>::new_with_generation(
+                        address.shard,
+                        address.isolate,
+                        address.generation,
+                    ))
+                });
+                ErasedMessage::Local(Box::new(continuation(typed)))
+            },
+        );
+        SendSpawnObservedParts {
+            target_shard,
+            spawn: spawn.into_send_erased_spawn(),
+            continuation,
+        }
     }
 }
 
@@ -3240,6 +3647,7 @@ where
     I::Reply: 'static,
     I::Spawn: IntoErasedSpawn<S, F> + 'static,
     I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
+    I::SpawnObservedRemote: IntoSendErasedSpawnObserved<S, F, I::Message> + 'static,
     I::Call: IntoErasedCall<I::Message> + 'static,
     I::Fact: IntoRuntimeFact + 'static,
     Outbound: 'static,
@@ -3284,6 +3692,7 @@ where
     I::Reply: 'static,
     I::Spawn: IntoErasedSpawn<S, F> + 'static,
     I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
+    I::SpawnObservedRemote: IntoSendErasedSpawnObserved<S, F, I::Message> + 'static,
     I::Call: IntoErasedCall<I::Message> + 'static,
     I::Fact: IntoRuntimeFact + 'static,
     Outbound: 'static,
@@ -3309,6 +3718,7 @@ where
     I::Reply: 'static,
     I::Spawn: IntoErasedSpawn<S, F> + 'static,
     I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
+    I::SpawnObservedRemote: IntoSendErasedSpawnObserved<S, F, I::Message> + 'static,
     I::Call: IntoErasedCall<I::Message> + 'static,
     I::Fact: IntoRuntimeFact + 'static,
     OutboundMsg: 'static,

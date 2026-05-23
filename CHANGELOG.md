@@ -4,6 +4,59 @@ This file records completed work.
 
 ## Unreleased
 
+### Runtime Supervision And Fairness
+
+Make owned work fail loudly and let a host prove progress without trace
+spelunking. These are typed reports over facts the trace already records, plus
+new typed outcomes for failure and cross-shard observed spawn (spawn +
+learn-address; cross-shard supervision/ownership is a follow-on).
+
+- **`spawn_observed(child).on_shard(shard)`** — spawn an observed child on
+  another (local, in-process) shard and learn its address back through the same
+  `.then(...)` continuation. The child constructor is `Send` and ships to the
+  target shard, which registers it and replies with its address; the owner's
+  continuation waits on the owner shard until the reply lands, and a
+  `ChildStarted` fact records the learned address. Same-shard `spawn_observed`
+  is byte-for-byte unchanged; the `Send` bound only appears on `.on_shard`.
+  Isolates that never spawn cross-shard keep `SpawnObservedRemote = Infallible`
+  and cannot construct the effect. Proven live (`MultiShardRuntime`) and in the
+  deterministic simulator. (First sub-phase: spawn + learn address; cross-shard
+  stop/restart/address-change remain follow-on work.)
+
+- **`tina::Effect::Fail` (and `tina::fail()`)** — a handler can fail loudly
+  without unwinding. The isolate stops and any in-flight caller settles
+  visibly, exactly like a panic, but the runtime records a distinct
+  `HandlerReportedFailure` fact and routes it through the same supervision
+  policy: a supervised child restarts per its parent's policy and budget; an
+  unsupervised one just stops. Panic and reported failure never collapse into
+  one outcome. Wired through both effect erasers, the live dispatcher, and the
+  simulator, so live and replayed runs agree; new trace tags are append-only.
+- **`tina::Effect::StopChildren` (and `tina::stop_children()`)** — an explicit
+  supervised shutdown. An owner stops every child it owns; each child stops
+  through the normal path so its callers settle and a `ChildStopped` fact names
+  it under the owner. The owner keeps running — pair with `stop()` for a full
+  owner-then-children shutdown. Plain `Effect::Stop` is unchanged and never
+  cascades, so children meant to outlive their parent still do.
+- **`tina_runtime::SupervisorReport`** — a typed terminal supervision summary,
+  folded from the trace for one owner (mirrors `PressureSummary::from_events`).
+  Names children by stable ordinal with their latest incarnation, counts restart
+  triggers / attempts / completions / skips / rejections, counts children the
+  owner closed via supervised shutdown, and reports a distinct halt reason
+  (budget exhausted vs supervisor stopped). Composes with the pressure and
+  capacity readers over the same event slice. (Same-shard children only: a
+  cross-shard observed child records its `Spawned` on the child's shard, so it
+  is not reflected here.)
+- **`tina_runtime::FairnessReport`** — the progress-count slice of fairness:
+  per-isolate handler-turn and sleep-completion counts folded from the trace,
+  plus a typed `StarvationWarning` (with a round-count-free `starvation_by_gap`
+  form) that names the victim and the hot isolate rather than hiding a progress
+  gap. Progress is turns taken and sleeps completed (deterministic), not a
+  wall-clock promise. A proof runs a self-flooding hot isolate beside a
+  steadily-ready neighbor and a recurring timer: round-robin keeps the neighbor
+  within one turn of the flooder and the timer keeps firing under load.
+  Ready-turn lag, timer lateness, and remote-drain-yield counts are **not** in
+  this report yet (they need instrumentation the trace does not carry); the
+  remote-flood-vs-local-command fairness proof shipped earlier.
 ### Durable Local State And IPC
 
 A local service can record work before doing it, restart, and resume or report

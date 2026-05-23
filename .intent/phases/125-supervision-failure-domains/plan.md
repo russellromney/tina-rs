@@ -2,10 +2,67 @@
 
 ## Status
 
-- Future implementation plan for the first post-122 core wave.
+- In progress. First implementation wave landed on branch
+  `phase-125-supervision` (off `main`).
+- The "Includes" / "Required Proof" sections below describe the **full phase
+  intent**, not what has shipped. This Status block is the authoritative
+  progress record: see "Shipped in this wave" and "Deferred" — cross-shard
+  *ownership/supervision* (stop, restart, address-change) is **not** yet
+  implemented.
 - Combines the old supervision/failure-domain and runtime-fairness plans.
 - Runs after Phase 122. Can run beside durable-state work if ownership stays in
   runtime supervision, failure domains, fairness reports, and systems.
+
+### Shipped in this wave
+
+- **Non-panic typed child failure** (`Effect::Fail` / `fail()`): distinct
+  `HandlerReportedFailure` fact, same supervision/restart path as panic, live +
+  sim. Panic, typed failure, budget exhaustion, and supervisor-stop stay
+  separate outcomes.
+- **Explicit supervised shutdown** (`Effect::StopChildren` / `stop_children()`):
+  an owner closes every child it owns; each child stops through the normal path
+  (callers settle) and is named by a `ChildStopped` fact under the owner. Plain
+  `Effect::Stop` is unchanged and never cascades, so the
+  `stopped_supervisor_rejects_later_child_failure_without_replacement` guarantee
+  holds. `SupervisorReport` counts and names the closed children.
+- **Cross-shard observed spawn** (`spawn_observed(child).on_shard(shard)`):
+  first plumbing sub-phase toward cross-shard child ownership. A parent on shard
+  A spawns an observed child on shard B and learns its address back via the
+  continuation + a `ChildStarted` fact. New `Isolate::SpawnObservedRemote` associated type
+  (defaulted `Infallible` via nightly `associated_type_defaults`, so existing
+  isolates are unchanged) and `Effect::SpawnObservedOn`. Send-erased spawn
+  payload carried monomorphically through the existing transport. Proven live
+  (`MultiShardRuntime`) and in the deterministic simulator (replay-stable).
+- **`SupervisorReport`**: typed terminal report (trace reader) naming children,
+  restarts, skips, rejections, latest incarnation, and a distinct halt reason
+  (budget exhausted vs supervisor stopped).
+- **`FairnessReport` + `StarvationWarning`** (progress-count slice only):
+  per-isolate handler-turn and sleep-completion counts with a
+  hot-self-sender-vs-steady-neighbor + timer-under-load proof, plus a
+  round-count-free `starvation_by_gap`. Progress is turns and sleeps, not
+  wall-clock. The plan's `ReadyTurnLag` / `TimerLateBy` / `RemoteDrainYield`
+  observables are **not** implemented (they need a per-turn ready signal and
+  event timestamps the trace lacks); the remote-flood-vs-local-command proof
+  shipped earlier in `tina-runtime/tests/multishard_fairness.rs`.
+- Proofs landed: live single-shard restart → new incarnation + stale-address
+  rejection (panic and typed-failure variants); unsupervised failure stops
+  without restart; sim replay of start/fail/restart/stop; budget-exhaustion
+  terminal state; hot/quiet/timer fairness.
+
+### Deferred (see `review.md` findings)
+
+- **Parent-stop child cleanup (Workstream B)**: core shipped as the opt-in
+  `Effect::StopChildren` (above). Still open: the owner-stop-while-child-has-an
+  -in-flight-call settle proof as a dedicated test, and a no-leaked-leases
+  /permits/body-charges assertion after the cascade.
+- **Cross-shard child ownership (Workstream D)**: spawn + learn-address sub-phase
+  shipped (above). Still open: cross-shard *stop* (owner stops a child on
+  another shard), cross-shard *failure → restart → `ChildAddressChanged`* (the
+  multi-round distributed-supervision protocol), and failed-shard ingress truth.
+  The cross-shard child is currently parentless on its own shard; recording the
+  remote owner link is part of the deferred supervision protocol.
+- The local **remote-inbound-flood vs local-command** fairness proof already
+  shipped earlier (`tina-runtime/tests/multishard_fairness.rs`).
 
 ## Purpose
 

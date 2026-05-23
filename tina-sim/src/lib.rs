@@ -145,6 +145,7 @@ where
     pub(crate) in_flight_calls: Vec<InFlightCall>,
     pub(crate) translators: Vec<StoredTranslator>,
     pub(crate) pending_isolate_calls: Vec<PendingIsolateCall>,
+    pub(crate) pending_remote_spawns: Vec<PendingRemoteSpawn>,
     pub(crate) round_messages: Vec<Option<DeliveredMessage>>,
     pub(crate) next_isolate_call_ordinal: u64,
     pub(crate) last_checker_failure: Option<CheckerFailure>,
@@ -218,6 +219,7 @@ where
             in_flight_calls: Vec::with_capacity(INITIAL_CALL_CAPACITY),
             translators: Vec::with_capacity(INITIAL_CALL_CAPACITY),
             pending_isolate_calls: Vec::with_capacity(INITIAL_CALL_CAPACITY),
+            pending_remote_spawns: Vec::new(),
             round_messages: Vec::with_capacity(INITIAL_ENTRY_CAPACITY),
             next_isolate_call_ordinal: 0,
             last_checker_failure: None,
@@ -574,6 +576,86 @@ mod tests {
                     *self.spawn_error.borrow_mut() = Some(error);
                     noop()
                 }
+            }
+        }
+    }
+
+    // Cross-shard observed spawn: the child must be `Send` to cross shards,
+    // so it holds no `Rc`. The owner keeps the learned address in an `Rc`
+    // (the owner never crosses a shard boundary).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum SimCrossChildMsg {
+        Ping,
+    }
+
+    #[derive(Debug)]
+    struct SimCrossChild;
+
+    impl Isolate for SimCrossChild {
+        type Message = SimCrossChildMsg;
+        type Reply = ();
+        type Send = Outbound<Infallible>;
+        type Spawn = Infallible;
+        type SpawnObserved = Infallible;
+        type Call = RuntimeCall<Self::Message>;
+        type Fact = ::std::convert::Infallible;
+        type Shard = NumberedShard;
+
+        fn handle(
+            &mut self,
+            msg: Self::Message,
+            _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+        ) -> Effect<Self> {
+            match msg {
+                SimCrossChildMsg::Ping => noop(),
+            }
+        }
+    }
+
+    #[derive(Debug)]
+    enum SimCrossParentMsg {
+        SpawnOn(ShardId),
+        ChildStarted(Result<ChildRef<SimCrossChildMsg>, SpawnObservedError>),
+    }
+
+    #[derive(Debug)]
+    struct SimCrossParent {
+        learned: Rc<RefCell<Option<ChildRef<SimCrossChildMsg>>>>,
+    }
+
+    impl Isolate for SimCrossParent {
+        type Message = SimCrossParentMsg;
+        type Reply = ();
+        type Send = Outbound<SimCrossChildMsg>;
+        type Spawn = Infallible;
+        type SpawnObserved = Infallible;
+        type SpawnObservedRemote = tina::SpawnObservedRemote<
+            ChildDefinition<SimCrossChild>,
+            Self::Message,
+            SimCrossChildMsg,
+            (),
+        >;
+        type Call = RuntimeCall<Self::Message>;
+        type Fact = ::std::convert::Infallible;
+        type Shard = NumberedShard;
+
+        fn handle(
+            &mut self,
+            msg: Self::Message,
+            _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+        ) -> Effect<Self> {
+            match msg {
+                SimCrossParentMsg::SpawnOn(shard) => {
+                    spawn_observed(ChildDefinition::new(SimCrossChild, 4))
+                        .on_shard(shard)
+                        .then(SimCrossParentMsg::ChildStarted)
+                }
+                SimCrossParentMsg::ChildStarted(Ok(child)) => {
+                    *self.learned.borrow_mut() = Some(child);
+                    // Address the cross-shard child through the learned ref.
+                    send(child.address, SimCrossChildMsg::Ping)
+                }
+                SimCrossParentMsg::ChildStarted(Err(_)) => noop(),
             }
         }
     }
@@ -1573,6 +1655,61 @@ mod tests {
             .collect();
         let expected: Vec<_> = source_order.into_iter().map(|(_, id)| id).collect();
         assert_eq!(destination_causes, expected);
+    }
+
+    #[test]
+    fn multishard_simulation_spawns_observed_child_on_another_shard_and_learns_address() {
+        fn run() -> (Option<ChildRef<SimCrossChildMsg>>, Vec<RuntimeEvent>) {
+            let learned = Rc::new(RefCell::new(None));
+            let mut sim = MultiShardSimulator::new(
+                [NumberedShard(11), NumberedShard(22)],
+                SimulatorConfig::default(),
+            );
+            let parent = sim.register_with_capacity_on::<SimCrossParent, _, SimCrossChildMsg>(
+                ShardId::new(11),
+                SimCrossParent {
+                    learned: Rc::clone(&learned),
+                },
+                4,
+            );
+            sim.try_send(parent, SimCrossParentMsg::SpawnOn(ShardId::new(22)))
+                .unwrap();
+            sim.run_until_quiescent();
+            let child = *learned.borrow();
+            (child, sim.trace().to_vec())
+        }
+
+        let (child, trace) = run();
+        let (replay_child, replay_trace) = run();
+        assert_eq!(
+            trace, replay_trace,
+            "cross-shard spawn must replay identically"
+        );
+
+        // The owner learned the child's address, and it lives on shard 22.
+        let child = child.expect("parent learns the cross-shard child address");
+        assert_eq!(child.address.shard(), ShardId::new(22));
+        assert_eq!(
+            replay_child.map(|c| c.address.shard()),
+            Some(ShardId::new(22))
+        );
+
+        // The child was created on shard 22, not the owner's shard 11.
+        assert!(
+            trace.iter().any(|event| event.shard() == ShardId::new(22)
+                && matches!(event.kind(), RuntimeEventKind::Spawned { .. })),
+            "child must be spawned on the target shard"
+        );
+        // The owner (shard 11) recorded the ChildStarted truth naming shard 22.
+        assert!(
+            trace.iter().any(|event| event.shard() == ShardId::new(11)
+                && matches!(
+                    event.kind(),
+                    RuntimeEventKind::ChildStarted { child_shard, .. }
+                        if child_shard == ShardId::new(22)
+                )),
+            "owner must record ChildStarted for the cross-shard child"
+        );
     }
 
     #[test]

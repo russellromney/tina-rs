@@ -24,8 +24,8 @@ use crate::observer::TraceObserver;
 use crate::trace::{RuntimeEvent, RuntimeEventKind};
 use crate::{
     DEFAULT_SHUTDOWN_LANE_DRAIN_TIMEOUT, IntoErasedSpawn, IntoErasedSpawnObserved,
-    PreallocationConfig, Runtime, ThreadedMultiShardRuntime, ThreadedRuntime,
-    ThreadedRuntimeConfig, TraceRetention,
+    IntoSendErasedSpawnObserved, PreallocationConfig, Runtime, ThreadedMultiShardRuntime,
+    ThreadedRuntime, ThreadedRuntimeConfig, TraceRetention,
 };
 
 /// Preferred public bounded-shape config for local Tina systems.
@@ -710,6 +710,7 @@ where
         I::Reply: 'static,
         I::Spawn: IntoErasedSpawn<S, F> + 'static,
         I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
+        I::SpawnObservedRemote: IntoSendErasedSpawnObserved<S, F, I::Message> + 'static,
         I::Call: IntoErasedCall<I::Message> + 'static,
         I::Fact: crate::fact::IntoRuntimeFact + 'static,
         Outbound: 'static,
@@ -1125,6 +1126,7 @@ where
         I::Reply: Send + 'static,
         I::Spawn: IntoErasedSpawn<S, F> + 'static,
         I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
+        I::SpawnObservedRemote: IntoSendErasedSpawnObserved<S, F, I::Message> + 'static,
         I::Call: IntoErasedCall<I::Message> + 'static,
         I::Fact: crate::fact::IntoRuntimeFact + 'static,
         Outbound: Send + 'static,

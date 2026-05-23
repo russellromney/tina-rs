@@ -1,3 +1,7 @@
+// Defaults `Isolate::SpawnObservedRemote` to `Infallible` so existing isolate
+// impls and the `isolate_types!` macro stay source-compatible while adding the
+// cross-shard observed-spawn associated type. The workspace is already nightly.
+#![feature(associated_type_defaults)]
 #![deny(unsafe_code)]
 #![deny(missing_docs)]
 #![deny(rustdoc::broken_intra_doc_links)]
@@ -232,8 +236,35 @@ pub use isolate::*;
 ///     }
 /// }
 /// ```
+///
+/// Cross-shard note: `spawn_observed_remote` is only accepted by the fully
+/// explicit arm (all nine keys). The abbreviated arms omit it and pin
+/// `SpawnObservedRemote = Infallible`. To author a cross-shard-spawning isolate
+/// with the declarative macro, spell out every key — or prefer
+/// `#[tina::isolate]`, which defaults each key independently.
 #[macro_export]
 macro_rules! isolate_types {
+    (
+        message: $message:ty,
+        reply: $reply:ty,
+        send: $send:ty,
+        spawn: $spawn:ty,
+        spawn_observed: $spawn_observed:ty,
+        spawn_observed_remote: $spawn_observed_remote:ty,
+        call: $call:ty,
+        fact: $fact:ty,
+        shard: $shard:ty $(,)?
+    ) => {
+        type Message = $message;
+        type Reply = $reply;
+        type Send = $send;
+        type Spawn = $spawn;
+        type SpawnObserved = $spawn_observed;
+        type SpawnObservedRemote = $spawn_observed_remote;
+        type Call = $call;
+        type Fact = $fact;
+        type Shard = $shard;
+    };
     (
         message: $message:ty,
         reply: $reply:ty,
@@ -448,9 +479,9 @@ pub mod prelude {
         ChildRef, Context, Deadline, DeferCancelableThrough, DeferThrough, DeferredReply, Effect,
         Isolate, IsolateId, Outbound, PendingCallSet, PendingCallSetInsertError, RequestCall,
         RequestContext, RequestDeferCancelableThrough, RequestDeferThrough, RequestEffect,
-        RestartableChildDefinition, Shard, ShardId, SingleShard, SpawnObservedError, batch,
+        RestartableChildDefinition, Shard, ShardId, SingleShard, SpawnObservedError, batch, fail,
         isolate, isolate_types, noop, reply, reply_to, reply_to_request, restart_children, send,
-        sequence, spawn, spawn_observed, stop, stop_with,
+        sequence, spawn, spawn_observed, stop, stop_children, stop_with,
         time::{
             Backoff, BackoffDelay, IntervalDelay, MissedTickPolicy, RecurringCatchUp,
             RecurringTick, RecurringTickDecision, RecurringTickReport, RecurringTickStale,

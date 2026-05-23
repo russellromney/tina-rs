@@ -60,6 +60,8 @@ pub enum RuntimeEventKindName {
     HandlerStarted,
     /// [`RuntimeEventKind::HandlerPanicked`].
     HandlerPanicked,
+    /// [`RuntimeEventKind::HandlerReportedFailure`].
+    HandlerReportedFailure,
     /// [`RuntimeEventKind::HandlerFinished`].
     HandlerFinished,
     /// [`RuntimeEventKind::EffectObserved`].
@@ -82,6 +84,10 @@ pub enum RuntimeEventKindName {
     RestartChildSkipped,
     /// [`RuntimeEventKind::RestartChildCompleted`].
     RestartChildCompleted,
+    /// [`RuntimeEventKind::ChildStopped`].
+    ChildStopped,
+    /// [`RuntimeEventKind::ChildStarted`].
+    ChildStarted,
     /// [`RuntimeEventKind::IsolateStopped`].
     IsolateStopped,
     /// [`RuntimeEventKind::MessageAbandoned`].
@@ -133,6 +139,7 @@ fn runtime_event_kind_name(kind: RuntimeEventKind) -> Option<RuntimeEventKindNam
         RuntimeEventKind::MailboxAccepted => RuntimeEventKindName::MailboxAccepted,
         RuntimeEventKind::HandlerStarted => RuntimeEventKindName::HandlerStarted,
         RuntimeEventKind::HandlerPanicked => RuntimeEventKindName::HandlerPanicked,
+        RuntimeEventKind::HandlerReportedFailure => RuntimeEventKindName::HandlerReportedFailure,
         RuntimeEventKind::HandlerFinished { .. } => RuntimeEventKindName::HandlerFinished,
         RuntimeEventKind::EffectObserved { .. } => RuntimeEventKindName::EffectObserved,
         RuntimeEventKind::SendDispatchAttempted { .. } => {
@@ -154,6 +161,8 @@ fn runtime_event_kind_name(kind: RuntimeEventKind) -> Option<RuntimeEventKindNam
         RuntimeEventKind::RestartChildCompleted { .. } => {
             RuntimeEventKindName::RestartChildCompleted
         }
+        RuntimeEventKind::ChildStopped { .. } => RuntimeEventKindName::ChildStopped,
+        RuntimeEventKind::ChildStarted { .. } => RuntimeEventKindName::ChildStarted,
         RuntimeEventKind::IsolateStopped => RuntimeEventKindName::IsolateStopped,
         RuntimeEventKind::MessageAbandoned => RuntimeEventKindName::MessageAbandoned,
         RuntimeEventKind::CallDispatchAttempted { .. } => {
@@ -299,6 +308,7 @@ fn every_kind_except(keep: &[RuntimeEventKindName]) -> Vec<RuntimeEventKindName>
         N::MailboxAccepted,
         N::HandlerStarted,
         N::HandlerPanicked,
+        N::HandlerReportedFailure,
         N::HandlerFinished,
         N::EffectObserved,
         N::SendDispatchAttempted,
@@ -310,6 +320,8 @@ fn every_kind_except(keep: &[RuntimeEventKindName]) -> Vec<RuntimeEventKindName>
         N::RestartChildAttempted,
         N::RestartChildSkipped,
         N::RestartChildCompleted,
+        N::ChildStopped,
+        N::ChildStarted,
         N::IsolateStopped,
         N::MessageAbandoned,
         N::CallDispatchAttempted,

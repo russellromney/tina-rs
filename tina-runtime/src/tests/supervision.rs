@@ -36,6 +36,8 @@ impl Isolate for PanickingRestartFactoryRoot {
             }
             LineageMsg::Stop => Effect::Stop,
             LineageMsg::Panic => panic!("panic inside panicking-factory root"),
+            LineageMsg::Fail => Effect::Fail,
+            LineageMsg::StopChildren => Effect::StopChildren,
             LineageMsg::Restart | LineageMsg::SpawnGrandchild => Effect::Noop,
         }
     }
@@ -493,6 +495,237 @@ fn supervise_before_children_and_reconfigure_reset_budget_are_supported() {
 
     assert_eq!(factory_calls.get(), 3);
     assert_eq!(runtime.supervisor_snapshot().len(), 1);
+}
+
+#[test]
+fn supervisor_report_summarizes_restart_history_for_one_owner() {
+    use crate::supervision_report::SupervisorReport;
+
+    let factory_calls = Rc::new(Cell::new(0));
+    let mut runtime = Runtime::new(TestShard, TestMailboxFactory);
+    let root = runtime.register(
+        new_restartable_root(Rc::clone(&factory_calls)),
+        root_mailbox(),
+    );
+    runtime.supervise(
+        root,
+        SupervisorConfig::new(RestartPolicy::OneForOne, tina::RestartBudget::new(3)),
+    );
+
+    assert_eq!(runtime.try_send(root, LineageMsg::SpawnChild), Ok(()));
+    assert_eq!(runtime.step(), 1);
+    let child = last_spawned_child(runtime.trace());
+    assert_eq!(
+        runtime.try_send(lineage_address(child), LineageMsg::Panic),
+        Ok(())
+    );
+    assert_eq!(runtime.step(), 1);
+
+    let report = SupervisorReport::from_events(runtime.trace().iter(), root.isolate());
+    assert_eq!(report.parent, root.isolate());
+    assert_eq!(report.children_spawned, 1);
+    assert_eq!(report.restarts_triggered, 1);
+    assert_eq!(report.restarts_attempted, 1);
+    assert_eq!(report.restarts_completed, 1);
+    assert_eq!(report.skipped_not_restartable, 0);
+    assert_eq!(report.rejected_budget_exceeded, 0);
+    assert!(report.halt.is_none());
+    assert!(report.non_zero());
+    assert!(!report.halted());
+
+    assert_eq!(report.children.len(), 1);
+    let entry = report.children[0];
+    assert_eq!(entry.child_ordinal, 0);
+    assert_eq!(entry.restarts_completed, 1);
+    // The report's latest incarnation matches the live record's replacement.
+    let replacement = runtime.child_record_snapshot()[0].child_isolate;
+    assert_eq!(entry.latest_isolate, replacement);
+    assert_ne!(entry.latest_isolate, child);
+}
+
+#[test]
+fn supervisor_report_names_budget_exhaustion_as_terminal_halt() {
+    use crate::supervision_report::{SupervisorHalt, SupervisorReport};
+
+    let factory_calls = Rc::new(Cell::new(0));
+    let mut runtime = Runtime::new(TestShard, TestMailboxFactory);
+    let root = runtime.register(
+        new_restartable_root(Rc::clone(&factory_calls)),
+        root_mailbox(),
+    );
+    runtime.supervise(
+        root,
+        SupervisorConfig::new(RestartPolicy::OneForOne, tina::RestartBudget::new(0)),
+    );
+
+    assert_eq!(runtime.try_send(root, LineageMsg::SpawnChild), Ok(()));
+    assert_eq!(runtime.step(), 1);
+    let child = last_spawned_child(runtime.trace());
+    assert_eq!(
+        runtime.try_send(lineage_address(child), LineageMsg::Panic),
+        Ok(())
+    );
+    assert_eq!(runtime.step(), 1);
+
+    let report = SupervisorReport::from_events(runtime.trace().iter(), root.isolate());
+    assert_eq!(report.children_spawned, 1);
+    assert_eq!(report.restarts_completed, 0);
+    assert_eq!(report.rejected_budget_exceeded, 1);
+    assert!(report.halted());
+    assert_eq!(
+        report.halt,
+        Some(SupervisorHalt::BudgetExhausted {
+            attempted_restart: 1,
+            max_restarts: 0,
+        })
+    );
+}
+
+#[test]
+fn non_panic_child_failure_restarts_with_new_incarnation_and_rejects_stale_address() {
+    use crate::supervision_report::SupervisorReport;
+
+    let factory_calls = Rc::new(Cell::new(0));
+    let mut runtime = Runtime::new(TestShard, TestMailboxFactory);
+    let root = runtime.register(
+        new_restartable_root(Rc::clone(&factory_calls)),
+        root_mailbox(),
+    );
+    runtime.supervise(
+        root,
+        SupervisorConfig::new(RestartPolicy::OneForOne, tina::RestartBudget::new(3)),
+    );
+
+    assert_eq!(runtime.try_send(root, LineageMsg::SpawnChild), Ok(()));
+    assert_eq!(runtime.step(), 1);
+    let child = last_spawned_child(runtime.trace());
+
+    // The child fails as a typed, non-panic outcome.
+    assert_eq!(
+        runtime.try_send(lineage_address(child), LineageMsg::Fail),
+        Ok(())
+    );
+    assert_eq!(runtime.step(), 1);
+
+    // A fresh incarnation replaced the failed child (initial spawn + restart).
+    let replacement = runtime.child_record_snapshot()[0].child_isolate;
+    assert_ne!(replacement, child);
+    assert_eq!(factory_calls.get(), 2);
+
+    // The failure is recorded distinctly from a panic.
+    assert!(
+        runtime.trace().iter().any(|event| event.isolate() == child
+            && matches!(event.kind(), RuntimeEventKind::HandlerReportedFailure)),
+        "typed failure must record HandlerReportedFailure"
+    );
+    assert!(
+        !runtime
+            .trace()
+            .iter()
+            .any(|event| matches!(event.kind(), RuntimeEventKind::HandlerPanicked)),
+        "a typed failure must not be recorded as a panic"
+    );
+
+    // The stale pre-restart address rejects loudly.
+    assert_eq!(
+        runtime.try_send(lineage_address(child), LineageMsg::SpawnChild),
+        Err(TrySendError::Closed(LineageMsg::SpawnChild))
+    );
+
+    // The same supervision path ran: one completed restart, naming the new
+    // incarnation under the owner.
+    let report = SupervisorReport::from_events(runtime.trace().iter(), root.isolate());
+    assert_eq!(report.restarts_completed, 1);
+    assert_eq!(report.children.len(), 1);
+    assert_eq!(report.children[0].latest_isolate, replacement);
+}
+
+#[test]
+fn stop_children_closes_owned_children_and_reports_them_without_stopping_owner() {
+    use crate::supervision_report::SupervisorReport;
+
+    let mut runtime = Runtime::new(TestShard, TestMailboxFactory);
+    let root = runtime.register(new_root(), root_mailbox());
+
+    assert_eq!(runtime.try_send(root, LineageMsg::SpawnChild), Ok(()));
+    assert_eq!(runtime.step(), 1);
+    let first_child = last_spawned_child(runtime.trace());
+    assert_eq!(runtime.try_send(root, LineageMsg::SpawnChild), Ok(()));
+    assert_eq!(runtime.step(), 1);
+    let second_child = last_spawned_child(runtime.trace());
+
+    // Both children accept messages before shutdown.
+    assert_eq!(
+        runtime.try_send(lineage_address(first_child), LineageMsg::SpawnChild),
+        Ok(())
+    );
+    assert_eq!(
+        runtime.try_send(lineage_address(second_child), LineageMsg::SpawnChild),
+        Ok(())
+    );
+
+    // The owner stops its children as an explicit supervised shutdown.
+    assert_eq!(runtime.try_send(root, LineageMsg::StopChildren), Ok(()));
+    assert_eq!(runtime.step(), 1);
+
+    // Both children are now closed; their pending messages were abandoned.
+    assert_eq!(
+        runtime.try_send(lineage_address(first_child), LineageMsg::SpawnChild),
+        Err(TrySendError::Closed(LineageMsg::SpawnChild))
+    );
+    assert_eq!(
+        runtime.try_send(lineage_address(second_child), LineageMsg::SpawnChild),
+        Err(TrySendError::Closed(LineageMsg::SpawnChild))
+    );
+
+    // The owner itself stayed up: plain Stop never cascades, and neither does
+    // StopChildren cascade to the owner.
+    assert_eq!(runtime.try_send(root, LineageMsg::SpawnChild), Ok(()));
+
+    // The report names every child the owner closed, under the owner.
+    let report = SupervisorReport::from_events(runtime.trace().iter(), root.isolate());
+    assert_eq!(report.children_stopped, 2);
+    let stopped: Vec<_> = report
+        .children
+        .iter()
+        .filter(|child| child.stopped_by_owner)
+        .map(|child| child.latest_isolate)
+        .collect();
+    assert_eq!(stopped.len(), 2);
+    assert!(stopped.contains(&first_child));
+    assert!(stopped.contains(&second_child));
+}
+
+#[test]
+fn unsupervised_isolate_failure_stops_without_restart() {
+    let factory_calls = Rc::new(Cell::new(0));
+    let mut runtime = Runtime::new(TestShard, TestMailboxFactory);
+    let root = runtime.register(
+        new_restartable_root(Rc::clone(&factory_calls)),
+        root_mailbox(),
+    );
+    // No `runtime.supervise(root, ...)`: the child has no supervisor.
+
+    assert_eq!(runtime.try_send(root, LineageMsg::SpawnChild), Ok(()));
+    assert_eq!(runtime.step(), 1);
+    let child = last_spawned_child(runtime.trace());
+
+    assert_eq!(
+        runtime.try_send(lineage_address(child), LineageMsg::Fail),
+        Ok(())
+    );
+    assert_eq!(runtime.step(), 1);
+
+    // No replacement: the factory ran once, for the initial spawn.
+    assert_eq!(factory_calls.get(), 1);
+    // The failure and stop are recorded, but supervision did nothing.
+    assert!(runtime.trace().iter().any(|event| event.isolate() == child
+        && matches!(event.kind(), RuntimeEventKind::HandlerReportedFailure)),);
+    assert_eq!(supervisor_events(runtime.trace()), Vec::new());
+    assert_eq!(
+        runtime.try_send(lineage_address(child), LineageMsg::SpawnChild),
+        Err(TrySendError::Closed(LineageMsg::SpawnChild))
+    );
 }
 
 #[test]

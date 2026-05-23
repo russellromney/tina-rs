@@ -65,8 +65,19 @@ pub enum EffectKind {
     /// The handler returned [`tina::Effect::SpawnObserved`].
     SpawnObserved,
 
+    /// The handler returned [`tina::Effect::SpawnObservedOn`] — an observed
+    /// spawn placed on another shard.
+    SpawnObservedOn,
+
     /// The handler returned [`tina::Effect::Stop`].
     Stop,
+
+    /// The handler returned [`tina::Effect::Fail`].
+    ///
+    /// Lifecycle is identical to [`Self::Stop`]; the distinction lets trace
+    /// readers tell a typed failure (which feeds supervision) from a clean
+    /// stop.
+    Fail,
 
     /// The handler returned [`tina::Effect::StopWith`].
     ///
@@ -76,6 +87,9 @@ pub enum EffectKind {
 
     /// The handler returned [`tina::Effect::RestartChildren`].
     RestartChildren,
+
+    /// The handler returned [`tina::Effect::StopChildren`].
+    StopChildren,
 
     /// The handler returned [`tina::Effect::Call`].
     Call,
@@ -407,6 +421,11 @@ pub enum RuntimeEventKind {
     /// The handler unwound with a panic instead of returning an effect.
     HandlerPanicked,
 
+    /// The handler returned [`tina::Effect::Fail`]: a typed, non-panic
+    /// failure that stops the isolate and feeds supervision exactly like a
+    /// panic, recorded distinctly so the two never collapse.
+    HandlerReportedFailure,
+
     /// The handler returned, including the effect kind it produced.
     HandlerFinished {
         /// The effect kind returned by the handler.
@@ -463,6 +482,21 @@ pub enum RuntimeEventKind {
     Spawned {
         /// The isolate identifier assigned to the new child.
         child_isolate: IsolateId,
+    },
+
+    /// The owner learned the address of a child it spawned on another shard
+    /// ([`tina::Effect::SpawnObservedOn`]). Recorded under the owner when the
+    /// cross-shard spawn reply lands, so the start is observable without
+    /// trace spelunking; the child's own creation is `Spawned` on its shard.
+    ChildStarted {
+        /// The shard the child was placed on.
+        child_shard: ShardId,
+
+        /// The new child's isolate id.
+        child_isolate: IsolateId,
+
+        /// The new child's address generation.
+        child_generation: AddressGeneration,
     },
 
     /// The runtime began a supervised restart response to a child panic.
@@ -533,6 +567,21 @@ pub enum RuntimeEventKind {
 
         /// The generation of the fresh replacement isolate.
         new_generation: AddressGeneration,
+    },
+
+    /// The runner stopped one owned child as part of a supervised shutdown
+    /// ([`tina::Effect::StopChildren`]). Recorded under the owning parent, so
+    /// a [`crate::SupervisorReport`] can name every child the owner closed;
+    /// the child's own stop is its separate `IsolateStopped`.
+    ChildStopped {
+        /// Stable per-parent child ordinal.
+        child_ordinal: usize,
+
+        /// The child incarnation that was stopped.
+        child_isolate: IsolateId,
+
+        /// The generation of the child incarnation that was stopped.
+        child_generation: AddressGeneration,
     },
 
     /// The runner applied the stopped state after observing [`tina::Effect::Stop`].
@@ -1068,6 +1117,9 @@ fn effect_kind_tag(effect: EffectKind) -> u8 {
         EffectKind::SpawnObserved => 11,
         EffectKind::Reject => 12,
         EffectKind::Fact => 13,
+        EffectKind::Fail => 14,
+        EffectKind::StopChildren => 15,
+        EffectKind::SpawnObservedOn => 16,
     }
 }
 
@@ -1454,6 +1506,28 @@ fn write_kind_stable(kind: RuntimeEventKind, hasher: &mut StableHasher) {
         RuntimeEventKind::MailboxAccepted => hasher.write_u8(1),
         RuntimeEventKind::HandlerStarted => hasher.write_u8(2),
         RuntimeEventKind::HandlerPanicked => hasher.write_u8(3),
+        // Appended (tags 37+): keep tags append-only, never renumber.
+        RuntimeEventKind::HandlerReportedFailure => hasher.write_u8(37),
+        RuntimeEventKind::ChildStopped {
+            child_ordinal,
+            child_isolate,
+            child_generation,
+        } => {
+            hasher.write_u8(38);
+            hasher.write_u64(child_ordinal as u64);
+            hasher.write_u64(child_isolate.get());
+            hasher.write_u64(child_generation.get());
+        }
+        RuntimeEventKind::ChildStarted {
+            child_shard,
+            child_isolate,
+            child_generation,
+        } => {
+            hasher.write_u8(39);
+            hasher.write_u32(child_shard.get());
+            hasher.write_u64(child_isolate.get());
+            hasher.write_u64(child_generation.get());
+        }
         RuntimeEventKind::HandlerFinished { effect } => {
             hasher.write_u8(4);
             hasher.write_u8(effect_kind_tag(effect));
@@ -1910,6 +1984,9 @@ mod stable_hash_tests {
         assert_eq!(effect_kind_tag(EffectKind::SpawnObserved), 11);
         assert_eq!(effect_kind_tag(EffectKind::Reject), 12);
         assert_eq!(effect_kind_tag(EffectKind::Fact), 13);
+        assert_eq!(effect_kind_tag(EffectKind::Fail), 14);
+        assert_eq!(effect_kind_tag(EffectKind::StopChildren), 15);
+        assert_eq!(effect_kind_tag(EffectKind::SpawnObservedOn), 16);
     }
 
     #[test]

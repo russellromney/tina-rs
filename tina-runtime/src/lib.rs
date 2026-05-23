@@ -55,6 +55,7 @@ pub mod durable_outbox;
 mod errors;
 pub mod event_sink;
 mod fact;
+pub mod fairness_report;
 pub mod file_loops;
 mod full_handling;
 pub mod guarded_pending;
@@ -78,6 +79,7 @@ pub mod shared_scope;
 pub mod shared_work;
 mod shutdown;
 mod single_call_gate;
+pub mod supervision_report;
 pub mod tcp_loops;
 mod threaded;
 mod threaded_multi_shard;
@@ -129,7 +131,8 @@ use remote::{QueuedRemoteEnvelope, SendableQueuedRemoteEnvelope};
 
 pub(crate) use dispatch::{
     AnyMailboxAdapter, ChildRecord, ErasedMailbox, ErasedMessage, ErasedSend, HandlerAdapter,
-    IntoErasedSpawn, IntoErasedSpawnObserved, MailboxAdapter, RegisteredAddress, RegisteredEntry,
+    IntoErasedSpawn, IntoErasedSpawnObserved, IntoSendErasedSpawnObserved, MailboxAdapter,
+    PendingRemoteSpawn, RegisteredAddress, RegisteredEntry, SendErasedSpawn,
     SendableHandlerAdapter, SpawnOutcome, SupervisorRecord,
 };
 #[cfg(test)]
@@ -219,6 +222,7 @@ pub use fact::{
     Http2StreamId, IntoRuntimeFact, ProtocolConnectionId, ProtocolDirection, ProtocolFact,
     ProtocolFamily, RuntimeFact, WebSocketCloseReason, WebSocketSessionId,
 };
+pub use fairness_report::{FairnessReport, IsolateProgress, StarvationWarning};
 pub use file_loops::{
     CopyLeg, FileCopyBounded, FileLoopEnd, FileLoopReport, FileLoopStep, FileReadChunks,
     FileWriteAll,
@@ -246,6 +250,7 @@ pub use shared_work::{
     SharedWork, SharedWorkCallError, SharedWorkError, SharedWorkReplyError, SharedWorkSnapshot,
     SharedWorkTicket, request_effect_after_shared_wait,
 };
+pub use supervision_report::{ChildSupervision, SupervisorHalt, SupervisorReport};
 pub use tcp_loops::{LoopStep, ReadExactStep, TcpReadExact, TcpReadToEof, TcpWriteAll};
 /// Declares a Tina isolate whose call channel defaults to [`RuntimeCall<Message>`](RuntimeCall).
 ///
@@ -349,6 +354,9 @@ where
     pub(crate) pending_isolate_calls: Vec<PendingIsolateCall>,
     pub(crate) pending_isolate_call_indexes: HashMap<CallId, usize>,
     pub(crate) pending_isolate_call_deadlines: BTreeMap<(Instant, u64), CallId>,
+    /// Cross-shard `spawn_observed(...).on_shard(...)` requests awaiting their
+    /// address reply from the destination shard. Keyed by request id.
+    pub(crate) pending_remote_spawns: Vec<PendingRemoteSpawn>,
     pub(crate) round_messages: Vec<Option<DeliveredMessage>>,
     pub(crate) driver_completions: Vec<DriverCompletion>,
     pub(crate) next_isolate_call_ordinal: u64,
@@ -638,6 +646,7 @@ where
             pending_isolate_calls: Vec::with_capacity(preallocation.call_capacity),
             pending_isolate_call_indexes: HashMap::with_capacity(preallocation.call_capacity),
             pending_isolate_call_deadlines: BTreeMap::new(),
+            pending_remote_spawns: Vec::new(),
             round_messages: Vec::with_capacity(preallocation.round_scratch_capacity),
             driver_completions: Vec::with_capacity(preallocation.call_capacity),
             next_isolate_call_ordinal: 0,

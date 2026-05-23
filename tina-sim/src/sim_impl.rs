@@ -78,6 +78,7 @@ where
         I::Call: RuntimeCallable,
         I::Spawn: IntoErasedSpawn<S> + 'static,
         I::SpawnObserved: IntoErasedSpawnObserved<S, I::Message> + 'static,
+        I::SpawnObservedRemote: IntoSimRemoteSpawnObserved<S, I::Message> + 'static,
         I::Reply: 'static,
         I::Fact: tina_runtime::IntoRuntimeFact + 'static,
         Msg: 'static,
@@ -113,6 +114,7 @@ where
         I::Call: RuntimeCallable,
         I::Spawn: IntoErasedSpawn<S> + 'static,
         I::SpawnObserved: IntoErasedSpawnObserved<S, I::Message> + 'static,
+        I::SpawnObservedRemote: IntoSimRemoteSpawnObserved<S, I::Message> + 'static,
         I::Reply: 'static,
         I::Fact: tina_runtime::IntoRuntimeFact + 'static,
         Msg: 'static,
@@ -224,7 +226,10 @@ where
     /// The simulator samples virtual time once at the start of the round,
     /// harvests due timers, and then gives each registered isolate at most one
     /// delivery chance in registration order.
-    pub fn step(&mut self) -> usize {
+    pub fn step(&mut self) -> usize
+    where
+        S: 'static,
+    {
         let shard_id = self.shard.id();
         self.step_with_remote(&mut |_source_shard, envelope| {
             let target_shard = envelope.target_shard();
@@ -243,6 +248,13 @@ where
                         shard_id.get(),
                     );
                 }
+                QueuedRemoteEnvelope::SpawnRequest(_) | QueuedRemoteEnvelope::SpawnReply(_) => {
+                    panic!(
+                        "cross-shard spawn requires a multi-shard simulator: target shard {} != simulator shard {}",
+                        target_shard.get(),
+                        shard_id.get(),
+                    );
+                }
             }
         })
     }
@@ -250,6 +262,7 @@ where
     pub(crate) fn step_with_remote<FR>(&mut self, route_remote: &mut FR) -> usize
     where
         FR: FnMut(ShardId, QueuedRemoteEnvelope) -> Result<(), SendRejectedReason>,
+        S: 'static,
     {
         self.step_ordinal += 1;
         let now = self.virtual_now;
@@ -342,7 +355,7 @@ where
                         }
                     }
                     self.stop_entry(index, isolate_id, panicked.into());
-                    self.supervise_panic(
+                    self.supervise_failed_child(
                         RegisteredAddress {
                             shard: self.shard.id(),
                             isolate: isolate_id,
@@ -412,7 +425,10 @@ where
     /// advances virtual time to the earliest pending deadline and keeps
     /// stepping. This is the simplest honest driver for the first replayable
     /// Voyager slice.
-    pub fn run_until_quiescent(&mut self) -> usize {
+    pub fn run_until_quiescent(&mut self) -> usize
+    where
+        S: 'static,
+    {
         let mut total = 0;
         loop {
             let delivered = self.step();
@@ -437,7 +453,10 @@ where
     pub fn run_until_quiescent_checked<C: Checker>(
         &mut self,
         checker: &mut C,
-    ) -> Option<CheckerFailure> {
+    ) -> Option<CheckerFailure>
+    where
+        S: 'static,
+    {
         self.last_checker_failure = None;
         let mut observed_len = 0;
         loop {
@@ -516,11 +535,36 @@ where
         call_context: Option<MessageCallContext>,
         round_messages: &mut [Option<DeliveredMessage>],
         route_remote: &mut impl FnMut(ShardId, QueuedRemoteEnvelope) -> Result<(), SendRejectedReason>,
-    ) -> bool {
+    ) -> bool
+    where
+        S: 'static,
+    {
         let isolate_id = self.entries[index].id;
         match effect {
             ErasedEffect::Stop | ErasedEffect::StopWith => {
                 self.stop_entry(index, isolate_id, cause);
+                true
+            }
+            ErasedEffect::Fail => {
+                // Typed, non-panic failure: record it distinctly, stop the
+                // isolate, then feed supervision exactly like a panic so the
+                // sim and live runtimes restart identically.
+                let generation = self.entries[index].generation;
+                let failed = self.push_event(
+                    isolate_id,
+                    Some(cause),
+                    RuntimeEventKind::HandlerReportedFailure,
+                );
+                self.stop_entry(index, isolate_id, failed.into());
+                self.supervise_failed_child(
+                    RegisteredAddress {
+                        shard: self.shard.id(),
+                        isolate: isolate_id,
+                        generation,
+                    },
+                    failed.into(),
+                    round_messages,
+                );
                 true
             }
             ErasedEffect::Send(send) => {
@@ -656,6 +700,51 @@ where
                 }
                 false
             }
+            ErasedEffect::SpawnObservedOn(parts) => {
+                let owner = RegisteredAddress {
+                    shard: self.shard.id(),
+                    isolate: isolate_id,
+                    generation: self.entries[index].generation,
+                };
+                if parts.target_shard == self.shard.id() {
+                    // Local owned observed spawn (register_remote_child records
+                    // the ChildRecord + parent-attributed Spawned); no
+                    // cross-shard ChildStarted fact.
+                    let outcome = parts.spawn.spawn_remote(self, owner, cause);
+                    let message = (parts.continuation)(outcome);
+                    self.deliver_observed_continuation(owner, message, cause);
+                } else {
+                    let request_id = self.ids.next_call_id();
+                    let payload: Box<dyn Any> = Box::new(parts.spawn);
+                    self.pending_remote_spawns.push(PendingRemoteSpawn {
+                        request_id,
+                        requester: owner,
+                        continuation: parts.continuation,
+                    });
+                    let routed = route_remote(
+                        self.shard.id(),
+                        QueuedRemoteEnvelope::SpawnRequest(SimRemoteSpawnRequest {
+                            request_id,
+                            target_shard: parts.target_shard,
+                            owner,
+                            payload,
+                            cause,
+                        }),
+                    );
+                    if routed.is_err()
+                        && let Some(pos) = self
+                            .pending_remote_spawns
+                            .iter()
+                            .position(|pending| pending.request_id == request_id)
+                    {
+                        let pending = self.pending_remote_spawns.remove(pos);
+                        let message =
+                            (pending.continuation)(Err(SpawnObservedError::DestinationUnavailable));
+                        self.deliver_observed_continuation(owner, message, cause);
+                    }
+                }
+                false
+            }
             ErasedEffect::Call(call) => {
                 let requester = RegisteredAddress {
                     shard: self.shard.id(),
@@ -754,6 +843,10 @@ where
             }
             ErasedEffect::RestartChildren => {
                 self.restart_children(isolate_id, cause, round_messages);
+                false
+            }
+            ErasedEffect::StopChildren => {
+                self.stop_children(isolate_id, cause, round_messages);
                 false
             }
             ErasedEffect::Batch(effects) => {
@@ -986,6 +1079,7 @@ where
             > + 'static,
         I::Spawn: IntoErasedSpawn<S> + 'static,
         I::SpawnObserved: IntoErasedSpawnObserved<S, I::Message> + 'static,
+        I::SpawnObservedRemote: IntoSimRemoteSpawnObserved<S, I::Message> + 'static,
         I::Reply: 'static,
         I::Fact: tina_runtime::IntoRuntimeFact + 'static,
         Msg: 'static,
@@ -1014,6 +1108,67 @@ where
         }
     }
 
+    /// Registers a child for `spawn_observed(...).on_shard(owner_or_other)`.
+    /// Simulator mirror of the live runtime's `register_remote_child`: a
+    /// same-shard owner gets a proper owned child (ChildRecord + parent-
+    /// attributed `Spawned`); a cross-shard owner gets a parentless child with
+    /// `Spawned` recorded under itself.
+    pub(crate) fn register_remote_child<I, Msg, Outbound>(
+        &mut self,
+        isolate: I,
+        mailbox_capacity: usize,
+        bootstrap_message: Option<Msg>,
+        owner: RegisteredAddress,
+        cause: tina_runtime::CauseId,
+    ) -> RegisteredAddress
+    where
+        I: Isolate<
+                Message = Msg,
+                Shard = S,
+                Send = TinaOutbound<Outbound>,
+                Call = RuntimeCall<Msg>,
+            > + 'static,
+        I::Spawn: IntoErasedSpawn<S> + 'static,
+        I::SpawnObserved: IntoErasedSpawnObserved<S, I::Message> + 'static,
+        I::SpawnObservedRemote: IntoSimRemoteSpawnObserved<S, I::Message> + 'static,
+        I::Reply: 'static,
+        I::Fact: tina_runtime::IntoRuntimeFact + 'static,
+        Msg: 'static,
+        Outbound: 'static,
+    {
+        let local_parent = (owner.shard == self.shard.id()).then_some(owner.isolate);
+        let child =
+            self.register_entry::<I, Msg, Outbound>(isolate, local_parent, mailbox_capacity);
+        let child_isolate = child.isolate;
+        let spawn_isolate = match local_parent {
+            Some(parent) => {
+                let child_ordinal = self
+                    .child_records
+                    .iter()
+                    .filter(|record| record.parent == parent)
+                    .count();
+                self.child_records.push(ChildRecord {
+                    parent,
+                    child,
+                    child_ordinal,
+                    mailbox_capacity,
+                    restart_recipe: None,
+                });
+                parent
+            }
+            None => child_isolate,
+        };
+        let spawned = self.push_event(
+            spawn_isolate,
+            Some(cause),
+            RuntimeEventKind::Spawned { child_isolate },
+        );
+        if let Some(message) = bootstrap_message {
+            self.enqueue_bootstrap_message(child, Box::new(message), spawned.into());
+        }
+        child
+    }
+
     pub(crate) fn spawn_isolate<I, Msg, Outbound>(
         &mut self,
         parent: IsolateId,
@@ -1030,6 +1185,7 @@ where
             > + 'static,
         I::Spawn: IntoErasedSpawn<S> + 'static,
         I::SpawnObserved: IntoErasedSpawnObserved<S, I::Message> + 'static,
+        I::SpawnObservedRemote: IntoSimRemoteSpawnObserved<S, I::Message> + 'static,
         I::Reply: 'static,
         I::Fact: tina_runtime::IntoRuntimeFact + 'static,
         Msg: 'static,
@@ -1106,7 +1262,99 @@ where
         }
     }
 
-    pub(crate) fn supervise_panic(
+    /// Stops every live child owned by `parent` (explicit supervised
+    /// shutdown). Mirrors the live runtime: each child stops through the
+    /// normal path and is named by a `ChildStopped` fact under the parent.
+    pub(crate) fn stop_children(
+        &mut self,
+        parent: IsolateId,
+        cause: tina_runtime::CauseId,
+        round_messages: &mut [Option<DeliveredMessage>],
+    ) {
+        let children: Vec<(usize, RegisteredAddress)> = self
+            .child_records
+            .iter()
+            .filter(|record| record.parent == parent)
+            .map(|record| (record.child_ordinal, record.child))
+            .collect();
+        for (child_ordinal, child) in children {
+            let Some(entry_index) = self.entry_index(child) else {
+                continue;
+            };
+            if self.entries[entry_index].stopped.get() {
+                continue;
+            }
+            let stopped = self.push_event(
+                parent,
+                Some(cause),
+                RuntimeEventKind::ChildStopped {
+                    child_ordinal,
+                    child_isolate: child.isolate,
+                    child_generation: child.generation,
+                },
+            );
+            let precollected = round_messages.get_mut(entry_index).and_then(Option::take);
+            self.stop_entry_with_precollected(
+                entry_index,
+                child.isolate,
+                stopped.into(),
+                precollected,
+            );
+        }
+    }
+
+    /// Delivers an observed-spawn continuation to its owner through the traced
+    /// local-send path, so a full/closed/stale owner mailbox records
+    /// SendRejected truth rather than dropping the continuation silently.
+    /// Simulator mirror of the live runtime's `deliver_observed_continuation`.
+    pub(crate) fn deliver_observed_continuation(
+        &mut self,
+        owner: RegisteredAddress,
+        message: Box<dyn Any>,
+        cause: tina_runtime::CauseId,
+    ) {
+        let attempted = self.push_event(
+            owner.isolate,
+            Some(cause),
+            RuntimeEventKind::SendDispatchAttempted {
+                target_shard: owner.shard,
+                target_isolate: owner.isolate,
+                target_generation: owner.generation,
+            },
+        );
+        match self.dispatch_local_send(ErasedSend {
+            target_shard: owner.shard,
+            target_isolate: owner.isolate,
+            target_generation: owner.generation,
+            message,
+        }) {
+            Ok(()) => {
+                self.push_event(
+                    owner.isolate,
+                    Some(attempted.into()),
+                    RuntimeEventKind::SendAccepted {
+                        target_shard: owner.shard,
+                        target_isolate: owner.isolate,
+                        target_generation: owner.generation,
+                    },
+                );
+            }
+            Err(reason) => {
+                self.push_event(
+                    owner.isolate,
+                    Some(attempted.into()),
+                    RuntimeEventKind::SendRejected {
+                        target_shard: owner.shard,
+                        target_isolate: owner.isolate,
+                        target_generation: owner.generation,
+                        reason,
+                    },
+                );
+            }
+        }
+    }
+
+    pub(crate) fn supervise_failed_child(
         &mut self,
         failed_child: RegisteredAddress,
         cause: tina_runtime::CauseId,
@@ -4962,14 +5210,91 @@ where
     pub(crate) fn harvest_remote_envelope(
         &mut self,
         queued: QueuedRemoteEnvelope,
-    ) -> Option<QueuedRemoteEnvelope> {
+    ) -> Option<QueuedRemoteEnvelope>
+    where
+        S: 'static,
+    {
         match queued {
             QueuedRemoteEnvelope::Send(send) => self.harvest_remote_send(send),
             QueuedRemoteEnvelope::CallReply(reply) => {
                 self.harvest_remote_call_reply(reply);
                 None
             }
+            QueuedRemoteEnvelope::SpawnRequest(request) => {
+                self.harvest_remote_spawn_request(request)
+            }
+            QueuedRemoteEnvelope::SpawnReply(reply) => {
+                self.harvest_remote_spawn_reply(reply);
+                None
+            }
         }
+    }
+
+    /// Destination-shard harvest of a cross-shard spawn request: recover the
+    /// erased spawn (boxed as `Any`; same `S` here), register the child, reply
+    /// with its address.
+    pub(crate) fn harvest_remote_spawn_request(
+        &mut self,
+        request: SimRemoteSpawnRequest,
+    ) -> Option<QueuedRemoteEnvelope>
+    where
+        S: 'static,
+    {
+        let SimRemoteSpawnRequest {
+            request_id,
+            target_shard: _,
+            owner,
+            payload,
+            cause,
+        } = request;
+        let outcome = match payload.downcast::<Box<dyn SimRemoteSpawn<S>>>() {
+            Ok(spawn) => (*spawn).spawn_remote(self, owner, cause),
+            // Unreachable in practice (same `S`, identical `TypeId`). Trip in
+            // debug/test on an internal invariant break rather than masking it.
+            Err(_) => {
+                debug_assert!(false, "cross-shard spawn payload downcast failed");
+                Err(SpawnObservedError::DestinationUnavailable)
+            }
+        };
+        Some(QueuedRemoteEnvelope::SpawnReply(SimRemoteSpawnReply {
+            request_id,
+            requester: owner,
+            cause,
+            outcome,
+        }))
+    }
+
+    /// Owner-shard harvest of a cross-shard spawn reply: record `ChildStarted`
+    /// and run the held continuation into the owner's mailbox.
+    pub(crate) fn harvest_remote_spawn_reply(&mut self, reply: SimRemoteSpawnReply) {
+        let SimRemoteSpawnReply {
+            request_id,
+            requester: _,
+            cause,
+            outcome,
+        } = reply;
+        let Some(index) = self
+            .pending_remote_spawns
+            .iter()
+            .position(|pending| pending.request_id == request_id)
+        else {
+            return;
+        };
+        let pending: PendingRemoteSpawn = self.pending_remote_spawns.remove(index);
+        let requester = pending.requester;
+        if let Ok(child) = &outcome {
+            self.push_event(
+                requester.isolate,
+                Some(cause),
+                RuntimeEventKind::ChildStarted {
+                    child_shard: child.shard,
+                    child_isolate: child.isolate,
+                    child_generation: child.generation,
+                },
+            );
+        }
+        let message = (pending.continuation)(outcome);
+        self.deliver_observed_continuation(requester, message, cause);
     }
 
     pub(crate) fn harvest_remote_send(
@@ -5147,6 +5472,11 @@ where
             self.entries[index].generation,
             stopped.into(),
         );
+        // Drop cross-shard observed-spawn requests this isolate awaited, so the
+        // boxed continuation cannot leak past the owner's stop (mirror of the
+        // live runtime).
+        self.pending_remote_spawns
+            .retain(|pending| pending.requester.isolate != isolate_id);
 
         // Drain any deferred reply slots this isolate captured.
         for record in self.promoted_slots.take_by_isolate(isolate_id) {
@@ -5504,6 +5834,7 @@ where
         + 'static,
     I::Spawn: IntoErasedSpawn<S> + 'static,
     I::SpawnObserved: IntoErasedSpawnObserved<S, I::Message> + 'static,
+    I::SpawnObservedRemote: IntoSimRemoteSpawnObserved<S, I::Message> + 'static,
     I::Reply: 'static,
     I::Fact: tina_runtime::IntoRuntimeFact + 'static,
     Msg: 'static,
@@ -5537,6 +5868,7 @@ where
         + 'static,
     I::Spawn: IntoErasedSpawn<S> + 'static,
     I::SpawnObserved: IntoErasedSpawnObserved<S, I::Message> + 'static,
+    I::SpawnObservedRemote: IntoSimRemoteSpawnObserved<S, I::Message> + 'static,
     I::Reply: 'static,
     I::Fact: tina_runtime::IntoRuntimeFact + 'static,
     Msg: 'static,
@@ -5551,6 +5883,123 @@ where
             bootstrap_message,
             marker: PhantomData,
         })
+    }
+}
+
+// --- Cross-shard observed spawn impls (simulator) ---------------------------
+
+pub(crate) struct SimRemoteSpawnAdapter<I, Outbound>
+where
+    I: Isolate,
+{
+    pub(crate) isolate: I,
+    pub(crate) mailbox_capacity: usize,
+    pub(crate) bootstrap_message: Option<I::Message>,
+    pub(crate) marker: PhantomData<fn(Outbound) -> Outbound>,
+}
+
+impl<I, S, Msg, Outbound> SimRemoteSpawn<S> for SimRemoteSpawnAdapter<I, Outbound>
+where
+    I: Isolate<Message = Msg, Shard = S, Send = TinaOutbound<Outbound>, Call = RuntimeCall<Msg>>
+        + 'static,
+    I::Spawn: IntoErasedSpawn<S> + 'static,
+    I::SpawnObserved: IntoErasedSpawnObserved<S, I::Message> + 'static,
+    I::SpawnObservedRemote: IntoSimRemoteSpawnObserved<S, I::Message> + 'static,
+    I::Reply: 'static,
+    I::Fact: tina_runtime::IntoRuntimeFact + 'static,
+    Msg: 'static,
+    Outbound: 'static,
+    S: Shard,
+{
+    fn spawn_remote(
+        self: Box<Self>,
+        sim: &mut Simulator<S>,
+        owner: RegisteredAddress,
+        cause: tina_runtime::CauseId,
+    ) -> Result<RegisteredAddress, SpawnObservedError> {
+        if self.mailbox_capacity == 0 {
+            return Err(SpawnObservedError::ZeroMailboxCapacity);
+        }
+        Ok(sim.register_remote_child::<I, Msg, Outbound>(
+            self.isolate,
+            self.mailbox_capacity,
+            self.bootstrap_message,
+            owner,
+            cause,
+        ))
+    }
+}
+
+impl<I, S, Msg, Outbound> IntoSimRemoteSpawn<S> for ChildDefinition<I>
+where
+    I: Isolate<Message = Msg, Shard = S, Send = TinaOutbound<Outbound>, Call = RuntimeCall<Msg>>
+        + 'static,
+    I::Spawn: IntoErasedSpawn<S> + 'static,
+    I::SpawnObserved: IntoErasedSpawnObserved<S, I::Message> + 'static,
+    I::SpawnObservedRemote: IntoSimRemoteSpawnObserved<S, I::Message> + 'static,
+    I::Reply: 'static,
+    I::Fact: tina_runtime::IntoRuntimeFact + 'static,
+    Msg: 'static,
+    Outbound: 'static,
+    S: Shard,
+{
+    fn into_sim_remote_spawn(self) -> Box<dyn SimRemoteSpawn<S>> {
+        let (isolate, mailbox_capacity, bootstrap_message) = self.into_parts();
+        Box::new(SimRemoteSpawnAdapter::<I, Outbound> {
+            isolate,
+            mailbox_capacity,
+            bootstrap_message,
+            marker: PhantomData,
+        })
+    }
+}
+
+impl<S> IntoSimRemoteSpawn<S> for Infallible
+where
+    S: Shard,
+{
+    fn into_sim_remote_spawn(self) -> Box<dyn SimRemoteSpawn<S>> {
+        match self {}
+    }
+}
+
+impl<S, ParentMessage> IntoSimRemoteSpawnObserved<S, ParentMessage> for Infallible
+where
+    S: Shard,
+{
+    fn into_sim_remote_spawn_observed(self) -> SimRemoteSpawnObservedParts<S> {
+        match self {}
+    }
+}
+
+impl<Spawn, ParentMessage, ChildMessage, ChildReply, S> IntoSimRemoteSpawnObserved<S, ParentMessage>
+    for tina::SpawnObservedRemote<Spawn, ParentMessage, ChildMessage, ChildReply>
+where
+    Spawn: IntoSimRemoteSpawn<S> + 'static,
+    ParentMessage: 'static,
+    ChildMessage: 'static,
+    ChildReply: 'static,
+    S: Shard,
+{
+    fn into_sim_remote_spawn_observed(self) -> SimRemoteSpawnObservedParts<S> {
+        let (spawn, target_shard, continuation) = self.into_parts();
+        let continuation = Box::new(
+            move |result: Result<RegisteredAddress, SpawnObservedError>| -> Box<dyn Any> {
+                let typed = result.map(|address| {
+                    ChildRef::new(Address::<ChildMessage, ChildReply>::new_with_generation(
+                        address.shard,
+                        address.isolate,
+                        address.generation,
+                    ))
+                });
+                Box::new(continuation(typed)) as Box<dyn Any>
+            },
+        );
+        SimRemoteSpawnObservedParts {
+            target_shard,
+            spawn: spawn.into_sim_remote_spawn(),
+            continuation,
+        }
     }
 }
 
@@ -5570,6 +6019,7 @@ where
         + 'static,
     I::Spawn: IntoErasedSpawn<S> + 'static,
     I::SpawnObserved: IntoErasedSpawnObserved<S, I::Message> + 'static,
+    I::SpawnObservedRemote: IntoSimRemoteSpawnObserved<S, I::Message> + 'static,
     I::Reply: 'static,
     I::Fact: tina_runtime::IntoRuntimeFact + 'static,
     Msg: 'static,
@@ -5609,6 +6059,7 @@ where
         + 'static,
     I::Spawn: IntoErasedSpawn<S> + 'static,
     I::SpawnObserved: IntoErasedSpawnObserved<S, I::Message> + 'static,
+    I::SpawnObservedRemote: IntoSimRemoteSpawnObserved<S, I::Message> + 'static,
     I::Reply: 'static,
     I::Fact: tina_runtime::IntoRuntimeFact + 'static,
     Msg: 'static,
@@ -5633,6 +6084,7 @@ where
         + 'static,
     I::Spawn: IntoErasedSpawn<S> + 'static,
     I::SpawnObserved: IntoErasedSpawnObserved<S, I::Message> + 'static,
+    I::SpawnObservedRemote: IntoSimRemoteSpawnObserved<S, I::Message> + 'static,
     I::Reply: 'static,
     I::Fact: tina_runtime::IntoRuntimeFact + 'static,
     Msg: 'static,

@@ -50,6 +50,18 @@ pub trait Isolate: Sized {
     /// The payload produced by [`Effect::SpawnObserved`].
     type SpawnObserved;
 
+    /// The payload produced by [`Effect::SpawnObservedOn`] — an observed
+    /// spawn placed on another shard via `spawn_observed(child).on_shard(...)`.
+    ///
+    /// Defaults to [`std::convert::Infallible`]: isolates that never spawn a
+    /// child onto another shard cannot construct the effect, and the type
+    /// system enforces it. To use `.on_shard(...)`, set this to
+    /// `SpawnObservedRemote<Spawn, Self::Message, ChildMessage, ChildReply>` —
+    /// the `#[tina::isolate]` / `#[tina_runtime::isolate]` macros accept a
+    /// `spawn_observed_remote = ...` key for it, or set it directly on a
+    /// hand-written impl.
+    type SpawnObservedRemote = core::convert::Infallible;
+
     /// The payload produced by [`Effect::Call`].
     ///
     /// A call describes one runtime-owned external operation (TCP I/O,
@@ -590,6 +602,11 @@ pub enum SpawnObservedError {
     /// form can report the rejection through its continuation before any child
     /// is recorded.
     ZeroMailboxCapacity,
+
+    /// A cross-shard `spawn_observed(...).on_shard(...)` could not reach the
+    /// target shard (its inbound queue was full or the shard had stopped), so
+    /// no child was created. Same-shard observed spawn never produces this.
+    DestinationUnavailable,
 }
 
 /// Type-level child address information carried by supported spawn requests.
@@ -692,6 +709,105 @@ impl<S, P, M, R> SpawnObserved<S, P, M, R> {
     /// Consumes this request into its spawn payload and continuation.
     pub fn into_parts(self) -> SpawnObservedParts<S, P, M, R> {
         (self.spawn, self.continuation)
+    }
+}
+
+impl<S, M, R> SpawnObservedBuilder<S, M, R> {
+    /// Places the observed child on `shard` instead of the parent's shard.
+    ///
+    /// The child constructor and its bootstrap must be `Send` to cross the
+    /// shard boundary (hence the `S: Send` bound). The child's address still
+    /// returns to the parent through the same `.then(...)` continuation, on a
+    /// later turn, once the destination shard registers it. Same-shard
+    /// `spawn_observed` is unaffected — this method is the only place the
+    /// `Send` requirement appears.
+    ///
+    /// Scope and sharp edges (this is the first cross-shard sub-phase):
+    ///
+    /// - Only [`ChildDefinition`] is supported as the spawn payload.
+    ///   [`RestartableChildDefinition`] is `!Send` (it holds boxed `Fn`
+    ///   factories), so `.on_shard(...)` on one is a `Send` trait-bound error;
+    ///   cross-shard *restartable* children await the restart protocol.
+    /// - A *cross-shard* child is not yet supervision-owned: the owner holds
+    ///   its `ChildRef`, but `StopChildren` / supervision do not yet reach
+    ///   across shards. `.on_shard(my_own_shard)` degenerates to an ordinary
+    ///   owned local `spawn_observed`.
+    /// - Targeting a `ShardId` the runtime does not own panics the worker
+    ///   (same as any cross-shard `send`/`call` to an unknown shard); a
+    ///   *known* but full/stopped shard settles the continuation with
+    ///   [`SpawnObservedError::DestinationUnavailable`].
+    pub fn on_shard(self, shard: ShardId) -> RemoteSpawnObservedBuilder<S, M, R>
+    where
+        S: Send,
+    {
+        RemoteSpawnObservedBuilder {
+            spawn: self.spawn,
+            target_shard: shard,
+            marker: PhantomData,
+        }
+    }
+}
+
+/// Builder returned by [`SpawnObservedBuilder::on_shard`]. Finishes with
+/// [`Self::then`] into an [`Effect::SpawnObservedOn`].
+#[must_use = "an on_shard spawn request has no effect until returned as an Effect"]
+#[derive(Debug)]
+pub struct RemoteSpawnObservedBuilder<S, M, R = ()> {
+    spawn: S,
+    target_shard: ShardId,
+    marker: SpawnObservedMarker<M, R>,
+}
+
+impl<S, M, R> RemoteSpawnObservedBuilder<S, M, R> {
+    /// Maps the runtime's later cross-shard child-start result into a parent
+    /// continuation message.
+    pub fn then<I, P, F>(self, continuation: F) -> Effect<I>
+    where
+        I: Isolate<Message = P, SpawnObservedRemote = SpawnObservedRemote<S, P, M, R>>,
+        F: FnOnce(SpawnObservedResult<M, R>) -> P + 'static,
+    {
+        Effect::SpawnObservedOn(SpawnObservedRemote {
+            spawn: self.spawn,
+            target_shard: self.target_shard,
+            continuation: Box::new(continuation),
+            marker: PhantomData,
+        })
+    }
+}
+
+/// Cross-shard observed-spawn request: spawn payload, target shard, and the
+/// continuation that delivers the typed child reference back to the parent.
+#[must_use = "an on_shard spawn request has no effect until returned as an Effect"]
+pub struct SpawnObservedRemote<S, P, M, R = ()> {
+    spawn: S,
+    target_shard: ShardId,
+    continuation: SpawnObservedContinuation<P, M, R>,
+    marker: SpawnObservedMarker<M, R>,
+}
+
+impl<S, P, M, R> std::fmt::Debug for SpawnObservedRemote<S, P, M, R>
+where
+    S: std::fmt::Debug,
+{
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SpawnObservedRemote")
+            .field("spawn", &self.spawn)
+            .field("target_shard", &self.target_shard)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<S, P, M, R> SpawnObservedRemote<S, P, M, R> {
+    /// The shard the child is to be placed on.
+    pub fn target_shard(&self) -> ShardId {
+        self.target_shard
+    }
+
+    /// Consumes this request into its spawn payload, target shard, and
+    /// continuation.
+    pub fn into_parts(self) -> (S, ShardId, SpawnObservedContinuation<P, M, R>) {
+        (self.spawn, self.target_shard, self.continuation)
     }
 }
 
