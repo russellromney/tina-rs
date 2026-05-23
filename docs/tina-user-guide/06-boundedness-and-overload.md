@@ -194,6 +194,35 @@ Rules the layer keeps:
 gateway, one `RateLimit<TenantId>`, hot/cold tenants, and a
 `retry_after` that is byte-identical across runs.
 
+## Shared Weighted Budgets
+
+When one request consumes more than one shard-local budget, do not
+hand-roll a rollback chain. Use `SharedCapacityReservation`.
+
+```rust
+let reservation = match SharedCapacityReservation::try_reserve([
+    in_flight.charge(route_weight),
+    body_bytes.charge(request_len),
+]) {
+    Ok(reservation) => reservation,
+    Err(full) => return call.reply(Reply::Full {
+        surface: full.scope,
+        requested: full.requested,
+        current: full.current,
+        max: full.max,
+    }),
+};
+```
+
+If any charge is full, already-acquired charges are released before
+`try_reserve` returns. If the returned reservation is parked in
+`GuardedPendingReplies`, dropping the slot on reply, drain, or
+caller-gone sweep releases every charge exactly once.
+
+Use this when the user story is "one request costs N units from several
+shared surfaces": body bytes plus in-flight work, tenant work plus
+global work, or pool waiters plus per-route admission.
+
 ## Timeout Is Load Control
 
 Request/reply uses timeout:

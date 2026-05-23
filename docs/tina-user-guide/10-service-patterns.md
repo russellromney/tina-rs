@@ -585,6 +585,52 @@ ids both refer to the "same cache key."
 one RAII guard. The guard drops exactly once on reply, drain, or
 caller-gone sweep.
 
+When the guard is a `SharedCapacityReservation`, this is the copied
+path for multi-turn work that holds shared capacity:
+
+```rust
+let reservation = match SharedCapacityReservation::try_reserve([
+    in_flight.charge(1),
+    body_bytes.charge(request_len),
+]) {
+    Ok(reservation) => reservation,
+    Err(full) => return call.reply(Reply::Full(full.scope)),
+};
+
+match pending.park_call_guarded(id, call, reservation) {
+    Ok(_ticket) => sleep(work).then(move |result| Msg::Done { id, result }),
+    Err(error) => error.into_call().reply(Reply::Busy),
+}
+```
+
+The service stores one thing: the pending reply slot plus the guard.
+There is no parallel "remember to release the budget" table.
+
+### First success across calls → `CallGroup::start_cancelable`
+
+For "race these calls, answer with the first good result, cancel the
+rest," use `CallGroup::start_cancelable`.
+
+```rust
+let mut group = CallGroup::with_capacity(providers.len());
+let mut effects = Vec::new();
+
+for (key, provider) in providers.iter().copied().enumerate() {
+    let effect = group.start_cancelable(
+        key,
+        call_cancelable(provider, ProviderMsg::Quote, timeout),
+        |key, token, outcome| Msg::ProviderReturned { key, token, outcome },
+    )?;
+    effects.push(effect);
+}
+```
+
+The helper reserves the token, stores the cancel handle, and returns
+the effect only after the group can track it. That removes the old
+"reserve token, build effect, insert handle" dance. The continuation
+still carries the token back, so stale completions cannot remove a
+newer branch that reused the same key.
+
 ### Reply later to the current caller → `call.defer(...).reply(...)`
 
 > *The handler has caller authority right now but needs to do some work

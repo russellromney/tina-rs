@@ -109,6 +109,22 @@ Do not hide Tokio under a Tina service and call it native.
 
 Bridges are allowed. Bridges should say they are bridges.
 
+## Boring Loop Helpers
+
+One-shot rails stay truthful: `tcp_write`, `unix_write`, and file writes
+may make partial progress, and reads return one chunk at a time. For
+normal "write all" and "read until EOF/cap" service code, use the loop
+helpers instead of hand-rolling byte counters:
+
+- `TcpWriteAll` / `TcpReadToEof`
+- `UnixWriteAll` / `UnixReadToEof`
+- `FileReadChunks` / `FileWriteAll` / `FileCopyBounded`
+
+Each helper exposes one step at a time. Your message enum still sees
+the continuation, the runtime trace still shows every rail call, and
+the helper owns the boring offset/progress math. See
+[`../tcp-loops.md`](../tcp-loops.md).
+
 ## Native gRPC First Form
 
 `tina-http::GrpcRouter` is the current native gRPC layer. It sits on

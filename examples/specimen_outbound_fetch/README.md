@@ -83,10 +83,9 @@ What 059 Rock 3 already closed:
   one trace event, so partial progress is still visible.
 What this suggests:
 
-- TCP-loop helpers (`tcp_write_all`, `tcp_read_to_eof`) are the
-  next ergonomics step for client isolates. The trade-off is real
-  (helpers hide per-step trace events), but a documented helper
-  with the trade-off named would shrink real code.
+- TCP-loop helpers are the copied path now. They should stay
+  step-shaped (`next_effect` / `advance`) so they shrink real code
+  without hiding per-step trace events.
 
 What 059 already closed:
 

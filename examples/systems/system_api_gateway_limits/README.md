@@ -1,6 +1,7 @@
 # system_api_gateway_limits
 
-Two routes, two shared weighted budgets. Proves [`SharedCapacityScope`].
+Two routes, two shared weighted budgets. Proves
+`SharedCapacityReservation` over two `SharedCapacityScope`s.
 
 A gateway isolate exposes "upload" and "list" requests. Both routes
 charge **two** shared, shard-local weighted scopes on every request:
@@ -10,13 +11,13 @@ charge **two** shared, shard-local weighted scopes on every request:
 - `gateway.body_bytes` (cap `4096`) — request body size; uploads are
   `1024` bytes, lists `128`.
 
-A request is admitted only if **both** budgets have room: the gateway
-charges in-flight first, then body bytes, and rolls back the in-flight
-charge if the body budget is full. Callers race; whichever budget fills
-first surfaces `Full { filled: "<scope>", … }` naming the exact shared
-surface that was exhausted. The smoke tests drive both the in-flight-bound
-case (default config) and the body-bytes-bound case (loose in-flight cap,
-tight body cap).
+A request is admitted only if **both** budgets have room:
+`SharedCapacityReservation::try_reserve([in_flight.charge(...),
+body_bytes.charge(...)])` charges both or neither. Callers race;
+whichever budget fills first surfaces `Full { filled: "<scope>", … }`
+naming the exact shared surface that was exhausted. The smoke tests
+drive both the in-flight-bound case (default config) and the
+body-bytes-bound case (loose in-flight cap, tight body cap).
 
 ## Run
 
@@ -59,27 +60,18 @@ system=system_api_gateway_limits upload_admitted=A upload_full=F upload_timeout=
 
 ## Findings
 
-What felt good:
-
-- `SharedCapacityScope::try_admit` returns a lease whose `Drop`
-  releases the charge. Owner-stop release falls out of dropping the
-  lease — no lifecycle hook needed.
+- `SharedCapacityReservation::try_reserve` makes the two-budget charge
+  all-or-nothing. No manual rollback branch.
+- `GuardedPendingReplies` parks the caller and owns the reservation.
+  Owner-stop release falls out of dropping the parked guard — no
+  lifecycle hook needed.
 - `discovery_line` and `surface_report` use the same shape as the
   capacity discovery line, so one grepper covers both.
 
 What felt rough:
 
-- Charging **two** shared budgets per request is manual two-phase with
-  rollback: charge in-flight, then body bytes, and `drop(in_flight)` on
-  body-full or the first charge leaks. `ConcurrencyLimit::with_shared_scope`
-  takes only one scope, so the second dimension is hand-rolled. A
-  multi-scope all-or-nothing charge would remove the rollback footgun.
-- This specimen stays on raw `SharedCapacityScope` + `SharedLease` rather
-  than `ConcurrencyLimit` precisely because the charge is parked across a
-  multi-turn hold: `GuardedPendingReplies` releases its guard by *dropping*
-  it, and `SharedLease` drops clean while a `ConcurrencyPermit` would leak
-  its inner permit on drop. See the cross-specimen "Admission and rate
-  policy ergonomics" entry in [`../../FINDINGS.md`](../../FINDINGS.md).
+- This specimen still names each scope at construction and at reporting
+  time. A service-level scope registry could make that less repetitive.
 - `tina-runtime` does not yet ship a runtime-wide registry of
   scopes, so each isolate carries its own clone. That is fine for a
   shard but a service builder may want a `register_scope("name")`
@@ -87,14 +79,13 @@ What felt rough:
 
 Tina capability pulled:
 
-- `SharedCapacityScope`, `SharedLease`, `SharedScopeFull`.
+- `SharedCapacityScope`, `SharedCapacityReservation`, `SharedScopeFull`.
+- `GuardedPendingReplies`.
 - `CapacitySummary::assert_no_full` for one-shot CI.
 - `format_assertion_failure` for copyable FAIL lines.
 
 Suggested follow-up:
 
-- Lease handoff into `PendingReplies` slot so isolates do not need a
-  parallel `HashMap`.
 - Service-level scope registry mirroring `register_with_capacity`.
 
 Verdict:

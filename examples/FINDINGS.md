@@ -72,25 +72,26 @@ What felt good:
   seeds*. The boilerplate buys determinism nothing else can.
 - `retry_after` is exact, not approximate — time-based tests assert
   `== 100ms` and `== ["k=ok", "k=rate(100ms)"]` with no jitter tolerance.
-- Move-only permits + RAII release: parking a `SharedLease` as a
-  `GuardedPendingReplies` guard makes owner-stop release fall out for free
-  (`current == 0` after shutdown is the proof).
+- Move-only permits + RAII release: parking a
+  `SharedCapacityReservation` as a `GuardedPendingReplies` guard makes
+  owner-stop release fall out for free (`current == 0` after shutdown
+  is the proof).
 - `FullHandling` composition keeps retry visibly caller-owned, and
   "idempotency key named on the message" is the right home for the safety
   claim.
 
 What felt rough:
 
-- **`ConcurrencyPermit` is not drop-to-release, but `SharedLease` is**, and
+- **`ConcurrencyPermit` is not drop-to-release, but shared capacity is**, and
   the mismatch fights the deferred-reply pattern. `GuardedPendingReplies`
-  releases its guard by *dropping* it; a dropped `ConcurrencyPermit` leaks
-  the inner `LocalPermitGate` permit (loudly, but still a leak), while a
-  dropped `SharedLease` releases clean. This is why
-  `system_api_gateway_limits` stayed on raw `SharedCapacityScope` +
-  `SharedLease` instead of migrating to `ConcurrencyLimit`. **Build:** a
-  park-friendly concurrency charge that releases on drop (or a guarded
-  pending box that calls an explicit releaser), so the local-gate path
-  composes with multi-turn parking the way shared leases already do.
+  releases its guard by *dropping* it; a dropped `ConcurrencyPermit`
+  leaks the inner `LocalPermitGate` permit (loudly, but still a leak),
+  while `SharedCapacityReservation` releases clean. This is why
+  `system_api_gateway_limits` stays on `SharedCapacityScope` instead of
+  migrating to `ConcurrencyLimit`. **Build:** a park-friendly
+  concurrency charge that releases on drop (or a guarded pending box
+  that calls an explicit releaser), so the local-gate path composes with
+  multi-turn parking the way shared capacity already does.
 - **Charging two shared budgets per request used to be manual two-phase with
   rollback.** Closed by `SharedCapacityReservation::try_reserve([...])`, which
   admits every charge or drops earlier leases before returning the full scope.
@@ -747,8 +748,9 @@ that proposal.
 `tina_runtime::GuardedPendingReplies<K, R, G>` pairs the parked caller
 with one RAII `G` guard, drops it exactly once on reply / drain /
 caller-gone sweep, and returns it back to the caller on failed
-admission. `system_api_gateway_limits` and `system_soak_http_db` both
-delete their `HashMap<qid, SharedLease>` sidecars in this phase.
+admission. `system_api_gateway_limits` now parks a
+`SharedCapacityReservation` directly in the slot, so there is no
+sidecar charge table.
 
 *(Historical finding kept below for context.)*
 
