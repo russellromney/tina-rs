@@ -358,6 +358,8 @@ impl<S: Shard + 'static> WebSocketClientConnection<S> {
         if self.state == WebSocketClientState::Connecting || self.should_read_more() {
             self.read_more()
         } else if self.close_sent {
+            self.state = WebSocketClientState::Closed;
+            self.report.state = self.state;
             self.close_transport()
         } else {
             noop()
@@ -444,6 +446,11 @@ impl<S: Shard + 'static> WebSocketClientConnection<S> {
         message: WebSocketMessage,
         call: CallContext<'_, Self>,
     ) -> Effect<Self> {
+        if self.state == WebSocketClientState::Closed {
+            return call.reply(WebSocketClientReply::Sent(Err(
+                WebSocketClientError::Closed,
+            )));
+        }
         if self.state != WebSocketClientState::Open {
             return call.reply(WebSocketClientReply::Sent(Err(
                 WebSocketClientError::NotConnected,
@@ -473,6 +480,14 @@ impl<S: Shard + 'static> WebSocketClientConnection<S> {
         if self.state == WebSocketClientState::Closed {
             return call.reply(WebSocketClientReply::Event(Err(
                 WebSocketClientError::Closed,
+            )));
+        }
+        if matches!(
+            self.state,
+            WebSocketClientState::Idle | WebSocketClientState::Connecting
+        ) {
+            return call.reply(WebSocketClientReply::Event(Err(
+                WebSocketClientError::NotConnected,
             )));
         }
         if self.pending_receive.is_some() {

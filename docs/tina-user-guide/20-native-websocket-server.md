@@ -56,10 +56,12 @@ let next = runtime.call_blocking(client, WebSocketClientMsg::Receive, timeout)?;
 ```
 
 The client owns ping/pong and close-handshake facts without hiding pressure:
-send and receive are ordinary bounded calls; `Report` returns queued events,
-queued outbound frames/bytes, outbound full counters, high-water counts, close
-flags, and lifecycle state. There is no hidden reconnect or unbounded
-background stream.
+send and receive are ordinary bounded calls; `Receive` before connection
+returns a typed `NotConnected` outcome; `Send` after a terminal close returns
+typed `Closed`; `Report` returns queued events, queued outbound frames/bytes,
+outbound full counters, high-water counts, close flags, and lifecycle state.
+There is no hidden reconnect or unbounded background stream: inbound reads are
+armed by a caller's `Receive` pull, except for the initial handshake.
 
 ## Copy Path
 

@@ -737,6 +737,18 @@ fn native_websocket_client_handles_ping_and_close() {
         }
         other => panic!("expected close event, got {other:?}"),
     }
+    std::thread::sleep(Duration::from_millis(50));
+    match runtime
+        .call_blocking(client, WebSocketClientMsg::Report, Duration::from_secs(5))
+        .expect("report after close")
+    {
+        CallOutcome::Replied(WebSocketClientReply::Report(report)) => {
+            assert_eq!(report.state, tina_http::WebSocketClientState::Closed);
+            assert!(report.close_sent);
+            assert!(report.close_received);
+        }
+        other => panic!("expected report after close, got {other:?}"),
+    }
 }
 
 #[test]
@@ -780,11 +792,30 @@ fn native_websocket_client_user_close_updates_report_and_rejects_late_send() {
         .expect("report")
     {
         CallOutcome::Replied(WebSocketClientReply::Report(report)) => {
-            assert_eq!(report.state, tina_http::WebSocketClientState::Closing);
+            assert!(
+                matches!(
+                    report.state,
+                    tina_http::WebSocketClientState::Closing
+                        | tina_http::WebSocketClientState::Closed
+                ),
+                "expected closing or closed after local close, got {:?}",
+                report.state
+            );
             assert!(report.close_sent);
             assert_eq!(report.sent_messages, 1);
         }
         other => panic!("expected report, got {other:?}"),
+    }
+    std::thread::sleep(Duration::from_millis(50));
+    match runtime
+        .call_blocking(client, WebSocketClientMsg::Report, Duration::from_secs(5))
+        .expect("final report")
+    {
+        CallOutcome::Replied(WebSocketClientReply::Report(report)) => {
+            assert_eq!(report.state, tina_http::WebSocketClientState::Closed);
+            assert!(report.close_sent);
+        }
+        other => panic!("expected final report, got {other:?}"),
     }
     match runtime
         .call_blocking(
@@ -795,9 +826,9 @@ fn native_websocket_client_user_close_updates_report_and_rejects_late_send() {
         .expect("late send")
     {
         CallOutcome::Replied(WebSocketClientReply::Sent(Err(
-            tina_http::WebSocketClientError::NotConnected,
+            tina_http::WebSocketClientError::Closed,
         ))) => {}
-        other => panic!("expected late send rejection, got {other:?}"),
+        other => panic!("expected closed late send rejection, got {other:?}"),
     }
 }
 
@@ -853,6 +884,35 @@ fn native_websocket_client_invalid_target_rejects_before_connecting() {
             tina_http::WebSocketClientError::InvalidTarget,
         ))) => {}
         other => panic!("expected invalid subprotocol, got {other:?}"),
+    }
+    let _ = runtime.shutdown();
+}
+
+#[test]
+fn native_websocket_client_receive_before_connect_is_typed_not_connected() {
+    let runtime = ThreadedRuntime::with_config(
+        TestShard,
+        DefaultThreadedMailboxFactory,
+        ThreadedRuntimeConfig {
+            command_capacity: 64,
+            idle_wait: Duration::from_millis(1),
+            ..Default::default()
+        },
+    );
+    let client = runtime
+        .register_with_capacity::<WebSocketClientConnection<TestShard>, Infallible>(
+            WebSocketClientConnection::new(WebSocketLimits::default()),
+            16,
+        )
+        .expect("register websocket client");
+    match runtime
+        .call_blocking(client, WebSocketClientMsg::Receive, Duration::from_secs(5))
+        .expect("receive before connect")
+    {
+        CallOutcome::Replied(WebSocketClientReply::Event(Err(
+            tina_http::WebSocketClientError::NotConnected,
+        ))) => {}
+        other => panic!("expected typed not-connected receive, got {other:?}"),
     }
     let _ = runtime.shutdown();
 }

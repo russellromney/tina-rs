@@ -165,8 +165,10 @@ the runtime trace.
 It is session-shaped on purpose: no hidden reconnect, no retry loop, no
 unbounded receive stream, and no Tokio fallback. The caller registers one
 client connection isolate, calls `WebSocketClientMsg::Connect`, then uses
-bounded `Send`, `Receive`, and `Report` calls. `WebSocketTarget` carries
-the explicit `Host`, path, and for `wss`, SNI plus DER trust roots.
+bounded `Send`, `Receive`, and `Report` calls. `Receive` arms the next inbound
+read after the handshake, so a peer cannot fill an invisible background receive
+queue while the app is not pulling. `WebSocketTarget` carries the explicit
+`Host`, path, and for `wss`, SNI plus DER trust roots.
 
 What does not ship yet: permessage-deflate, Autobahn compliance
 classification, HTTP/2 WebSocket, proxy/cookie/redirect behavior, and a
