@@ -352,6 +352,19 @@ impl WebSocketAccept {
     }
 }
 
+/// App-injected control event for WebSocket session apps.
+///
+/// Tina's connection owner never emits this from wire input and never turns it
+/// into a protocol fact. It is just an ordinary bounded app message with a
+/// non-string spelling, so `Full` / `Closed` / `Timeout` remain visible at the
+/// send/call site that injects it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WebSocketSessionControl {
+    Start,
+    Tick(u64),
+    Drain,
+}
+
 /// Inbound message delivered from a WebSocket session to an app isolate.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WebSocketSessionMsg {
@@ -392,6 +405,7 @@ pub enum WebSocketSessionMsg {
     Close(Option<WebSocketCloseCode>, Vec<u8>),
     Pressure(WebSocketError),
     SendOutcome(WebSocketSendOutcome),
+    AppControl(WebSocketSessionControl),
     /// App/admin message for production-shaped room shutdown. Tina's
     /// connection owner never emits this variant; room code may send it
     /// to its own WebSocket app isolate to close every stored session
@@ -1035,6 +1049,16 @@ mod tests {
             generation: 0,
         };
         assert_ne!(stale, refill);
+    }
+
+    #[test]
+    fn app_control_lane_is_not_peer_text() {
+        let control = WebSocketSessionMsg::AppControl(WebSocketSessionControl::Tick(42));
+        assert_ne!(control, WebSocketSessionMsg::Text("__tick:42".to_string()));
+        assert!(matches!(
+            control,
+            WebSocketSessionMsg::AppControl(WebSocketSessionControl::Tick(42))
+        ));
     }
 
     #[test]

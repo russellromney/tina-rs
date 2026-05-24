@@ -16,11 +16,10 @@ slow-peer handling, explicit shutdown, and member-table pressure.
 - A recurring liveness tick — one `sleep_then` self-reschedules the room
   every `presence_tick`, broadcasts a heartbeat to every live member, and
   evicts members whose last activity was older than `idle_evict`.
-- An explicit bootstrap message — the host sends one
-  `Text("__bootstrap__")` after `register_with_capacity` so the recurring
-  tick starts. Forgetting that one `try_send` produces a quiet service whose
-  startup effect never runs (this is the same pattern Finding 22 in
-  `examples/FINDINGS.md` calls out).
+- An explicit app-control bootstrap — the host sends
+  `WebSocketSessionMsg::AppControl(Start)` after `register_with_capacity` so
+  the recurring tick starts. Forgetting that one `try_send` produces a quiet
+  service whose startup effect never runs.
 - A bounded fan-out path that emits sends via `tina::send` (try_send) so
   that send admission is reported back to the room through the connection
   isolate's `call_websocket_app(SendOutcome)` path. See the **rough**
@@ -108,12 +107,11 @@ What felt good:
 
 What felt rough:
 
-- **Internal control messages are encoded as `WebSocketSessionMsg::Text`
-  with magic prefixes (`__bootstrap__`, `__tick:N`)** because the public
-  enum has no app-injected variant for "wake up". The `specimen_websocket_room`
-  uses the same trick. A small typed app-side variant (`WebSocketSessionMsg::AppTick`
-  or similar) would remove the string-prefix dispatch and the
-  catch-all fallthroughs that have to ignore stray legacy `Text` events.
+- ~~Internal control messages are encoded as `WebSocketSessionMsg::Text`
+  with magic prefixes (`__bootstrap__`, `__tick:N`).~~ Phase 120 replaced
+  this with `WebSocketSessionMsg::AppControl(WebSocketSessionControl::...)`.
+  Control remains an ordinary bounded app message, but it is no longer peer
+  text.
 - **`handle.text_effect::<Self>` (`call(...).then(SendOutcome)`) interacts
   badly with the connection isolate when emitted from the room's
   `handle_call` return value.** Concrete observed behaviour: the FIRST

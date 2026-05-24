@@ -367,6 +367,103 @@ impl LoadReport {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoadAssertionFailure {
+    pub claim: &'static str,
+    pub observed: String,
+}
+
+impl std::fmt::Display for LoadAssertionFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} failed; observed {}", self.claim, self.observed)
+    }
+}
+
+impl std::error::Error for LoadAssertionFailure {}
+
+pub fn cold_work_made_progress(report: &LoadReport) -> Result<(), LoadAssertionFailure> {
+    if report.ops_ok > 0 {
+        return Ok(());
+    }
+    Err(LoadAssertionFailure {
+        claim: "cold work made progress",
+        observed: report.summary_line(),
+    })
+}
+
+pub fn timer_kept_firing(report: &LoadReport) -> Result<(), LoadAssertionFailure> {
+    if report.ops_attempted > 0 && report.ops_timeout == 0 {
+        return Ok(());
+    }
+    Err(LoadAssertionFailure {
+        claim: "timer kept firing",
+        observed: report.summary_line(),
+    })
+}
+
+pub fn surface_plateaued_cleanly(
+    report: &LoadReport,
+    surface_name: &str,
+) -> Result<(), LoadAssertionFailure> {
+    let Some(surface) = report
+        .surface_plateaus
+        .iter()
+        .find(|surface| surface.name == surface_name)
+    else {
+        return Err(LoadAssertionFailure {
+            claim: "surface plateaued cleanly",
+            observed: format!(
+                "missing surface {surface_name:?}; report {}",
+                report.summary_line()
+            ),
+        });
+    };
+    if surface.full == 0 && surface.final_current <= surface.high_water && surface.leak_clean {
+        return Ok(());
+    }
+    Err(LoadAssertionFailure {
+        claim: "surface plateaued cleanly",
+        observed: surface.summary_line(),
+    })
+}
+
+pub fn no_leaked_capacity_at_shutdown(report: &LoadReport) -> Result<(), LoadAssertionFailure> {
+    if report.leak_clean
+        && report
+            .surface_plateaus
+            .iter()
+            .all(|surface| surface.leak_clean)
+    {
+        return Ok(());
+    }
+    let observed = report
+        .surface_plateaus
+        .iter()
+        .find(|surface| !surface.leak_clean)
+        .map(SurfacePlateau::summary_line)
+        .unwrap_or_else(|| report.summary_line());
+    Err(LoadAssertionFailure {
+        claim: "no leaked capacity at shutdown",
+        observed,
+    })
+}
+
+pub fn assert_cold_work_made_progress(report: &LoadReport) {
+    cold_work_made_progress(report).unwrap();
+}
+
+pub fn assert_timer_kept_firing(report: &LoadReport) {
+    timer_kept_firing(report).unwrap();
+}
+
+pub fn assert_surface_plateaued_cleanly(report: &LoadReport, surface_name: &str) {
+    surface_plateaued_cleanly(report, surface_name).unwrap();
+}
+
+pub fn assert_no_leaked_capacity_at_shutdown(report: &LoadReport) {
+    no_leaked_capacity_at_shutdown(report).unwrap();
+}
+
 /// Run `op` under load.
 ///
 /// `op` is invoked per worker, per iteration. It must be `Send + Sync`
@@ -973,5 +1070,99 @@ mod tests {
         let line = report.summary_line();
         assert!(line.contains("min_us="), "{line}");
         assert!(line.contains("pressure total="), "{line}");
+    }
+
+    #[test]
+    fn task_shaped_load_assertions_accept_clean_report() {
+        let report = run_with_observation(
+            LoadRun {
+                workers: 1,
+                stop: LoadStop::ops(3),
+                label: "assertions",
+            },
+            |_| OpOutcome::Ok,
+            Some(|| LoadObservation {
+                surface_plateaus: vec![SurfacePlateau {
+                    name: "svc.mailbox".to_string(),
+                    kind: "mailbox",
+                    capacity: Some(4),
+                    high_water: 2,
+                    final_current: 0,
+                    full: 0,
+                    max_messages: Some(4),
+                    current_messages: 0,
+                    high_water_messages: 2,
+                    max_weight: None,
+                    current_weight: None,
+                    high_water_weight: None,
+                    shared_max_weight: None,
+                    shared_current_weight: None,
+                    shared_high_water_weight: None,
+                    leak_clean: true,
+                }],
+                ..LoadObservation::default()
+            }),
+        );
+
+        cold_work_made_progress(&report).unwrap();
+        timer_kept_firing(&report).unwrap();
+        surface_plateaued_cleanly(&report, "svc.mailbox").unwrap();
+        no_leaked_capacity_at_shutdown(&report).unwrap();
+    }
+
+    #[test]
+    fn load_assertion_failure_names_claim_and_observed_line() {
+        let report = run(
+            LoadRun {
+                workers: 1,
+                stop: LoadStop::ops(1),
+                label: "failing_assertion",
+            },
+            |_| OpOutcome::Timeout,
+            None::<fn() -> bool>,
+        );
+        let failure = cold_work_made_progress(&report).unwrap_err();
+        assert_eq!(failure.claim, "cold work made progress");
+        assert!(failure.observed.contains("load label=failing_assertion"));
+    }
+
+    #[test]
+    fn capacity_assertions_fail_on_leak_and_missing_surface() {
+        let leaky = run_with_observation(
+            LoadRun {
+                workers: 1,
+                stop: LoadStop::ops(1),
+                label: "leaky",
+            },
+            |_| OpOutcome::Ok,
+            Some(|| LoadObservation {
+                surface_plateaus: vec![SurfacePlateau {
+                    name: "svc.mailbox".to_string(),
+                    kind: "mailbox",
+                    capacity: Some(1),
+                    high_water: 1,
+                    final_current: 1,
+                    full: 0,
+                    max_messages: Some(1),
+                    current_messages: 1,
+                    high_water_messages: 1,
+                    max_weight: None,
+                    current_weight: None,
+                    high_water_weight: None,
+                    shared_max_weight: None,
+                    shared_current_weight: None,
+                    shared_high_water_weight: None,
+                    leak_clean: false,
+                }],
+                ..LoadObservation::default()
+            }),
+        );
+        let missing = surface_plateaued_cleanly(&leaky, "missing").unwrap_err();
+        assert_eq!(missing.claim, "surface plateaued cleanly");
+        assert!(missing.observed.contains("missing surface"));
+
+        let leak = no_leaked_capacity_at_shutdown(&leaky).unwrap_err();
+        assert_eq!(leak.claim, "no leaked capacity at shutdown");
+        assert!(leak.observed.contains("final_current=1"));
     }
 }

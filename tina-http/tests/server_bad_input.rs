@@ -17,7 +17,7 @@
 mod common;
 
 use std::io::{Read, Write};
-use std::net::TcpStream;
+use std::net::{Shutdown, TcpStream};
 use std::time::Duration;
 
 use common::{TestHarness, assert_status_starts_with, scripted_request};
@@ -146,9 +146,62 @@ fn peer_close_mid_request_does_not_panic_or_hang() {
     harness.shutdown();
 }
 
+#[test]
+fn bad_peer_sequence_does_not_stop_accept_loop() {
+    let harness = TestHarness::start();
+
+    // Immediate close and half-close paths can surface as reply bytes,
+    // EOF, or a reset to the peer. The invariant we care about here is
+    // stronger and user-facing: every later fresh connection must still
+    // be accepted instead of seeing ConnectionRefused because the
+    // listener treated one bad accept as fatal.
+    let reset = TcpStream::connect_timeout(&harness.addr, Duration::from_secs(2))
+        .expect("reset peer connects");
+    drop(reset);
+
+    let mut half_close = TcpStream::connect_timeout(&harness.addr, Duration::from_secs(2))
+        .expect("half-close peer connects");
+    half_close
+        .set_read_timeout(Some(Duration::from_millis(300)))
+        .expect("half-close read timeout");
+    half_close
+        .write_all(b"GET /counter HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+        .expect("half-close request");
+    half_close.flush().expect("half-close flush");
+    let _ = half_close.shutdown(Shutdown::Write);
+    let _ = drain_allowing_reset(&mut half_close);
+
+    let malformed = scripted_request(harness.addr, b"NOT A REAL HTTP REQUEST\r\n\r\n");
+    assert_status_starts_with(&malformed, "400");
+
+    let follow_up = scripted_request(harness.addr, b"GET /counter HTTP/1.1\r\nHost: x\r\n\r\n");
+    assert_status_starts_with(&follow_up, "200");
+
+    harness.shutdown();
+}
+
 #[allow(dead_code)]
 fn fully_read(stream: &mut TcpStream) -> Vec<u8> {
     let mut response = Vec::new();
     stream.read_to_end(&mut response).expect("read response");
     response
+}
+
+fn drain_allowing_reset(stream: &mut TcpStream) -> Vec<u8> {
+    let mut response = Vec::new();
+    match stream.read_to_end(&mut response) {
+        Ok(_) => response,
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::TimedOut
+                    | std::io::ErrorKind::WouldBlock
+            ) =>
+        {
+            response
+        }
+        Err(other) => panic!("unexpected half-close drain error: {other:?}"),
+    }
 }
