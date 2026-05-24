@@ -80,8 +80,8 @@ shutdown, and bug-in-a-box replay without stitching ten specimens together.
 Small-to-medium blast radius.
 
 - Allowed: docs, examples, specimens, prelude/import guidance, copied snippets,
-  findings cleanup, tiny wrappers/adapters around already-landed behavior when
-  two copied examples prove the need.
+  findings cleanup, and small public helpers in `tina-http` /
+  `tina-proof-harness` / `tina-sim::dst` when they wrap already-landed behavior.
 - Not allowed: core runtime semantics, protocol behavior, resource policy
   behavior, durability semantics, or new major nouns.
 - If a helper needs behavior changes in a core crate, stop and make a separate
@@ -92,12 +92,18 @@ Small-to-medium blast radius.
 
 ## Implementation Shape
 
-Touch only copied paths and examples/docs around newly landed Wave A features:
+Touch copied paths, examples/docs, and the small public helper surfaces named
+below. Do not invent extra helpers beyond this list.
 
-- Add `examples/systems/system_copied_service_path` as the canonical
-  production-shaped service skeleton. Keep existing systems as evidence; do not
-  turn `mini_saas_api` into the one giant example.
-- The skeleton must use:
+- Add `examples/systems/system_copied_service_path` as the canonical copied
+  service skeleton. Keep existing systems as evidence; do not turn
+  `mini_saas_api` into the one giant example.
+- Add one tiny companion crate named
+  `examples/systems/system_copied_service_path_companion`. The companion owns
+  the proof steps that would make the canonical skeleton hard to read. The
+  README for the canonical skeleton must link to the companion and explain the
+  one copied path through both.
+- Across the canonical skeleton and companion, prove:
   - HTTP or gRPC request entry
   - one native protocol client path (HTTP/2/gRPC/WebSocket client session)
   - one native WebSocket session or session-like long-lived client path
@@ -110,6 +116,13 @@ Touch only copied paths and examples/docs around newly landed Wave A features:
   should be about what the app does, not the old problem:
   - add `WebSocketSessionMsg::AppControl(WebSocketSessionControl)` with small
     built-in control events: `Start`, `Tick(u64)`, and `Drain`
+  - these events are app-injected only; the WebSocket connection owner never
+    emits them from wire input, never treats them as peer text, and never turns
+    them into protocol facts
+  - delivery is ordinary bounded app-message delivery, so `Full` / `Closed` /
+    `Timeout` truth stays exactly where it is today
+  - app code chooses the meaning of `Tick(u64)` and `Drain`; Tina only provides
+    the non-string lane
   - keep `WebSocketSessionMsg::Shutdown` for shutdown
   - copied examples must remove string prefixes like `__bootstrap__` and
     `__tick:N`
@@ -117,10 +130,15 @@ Touch only copied paths and examples/docs around newly landed Wave A features:
   "capture this run":
   - add `tina_proof_harness::RunCapture`
   - `RunCapture::new("name").observer()` installs before the first event
-  - `RunCapture::finish(...)` returns the bounded live replay capture/report
+  - `RunCapture::finish(...)` must require explicit replay inputs:
+    `ReplayConfig`, materialized history, invariant text, expected trace shape,
+    topology/mailbox roles, and any live facts / unsupported facts the user
+    wants to preserve
+  - `finish(...)` may fill source metadata, trace completeness, event count,
+    live trace hash, pressure summary, and capture truncation/loss truth
   - it must install the trace observer before the first event
   - it must return the same bounded `LiveReplayCapture` / report truth, not a
-    hidden global collector
+    hidden global collector and not guessed config/history/facts
 - Add small user-facing wrappers or docs aliases for bug workflow:
   - `capture_run(...)`
   - `save_bug(...)`
@@ -136,6 +154,9 @@ Touch only copied paths and examples/docs around newly landed Wave A features:
   - "surface plateaued cleanly"
   - "no leaked capacity at shutdown"
   Names should describe the user claim, not the internal counter.
+  Public helpers return `Result<..., LoadAssertionFailure>` (or a narrower
+  typed error) and have panic wrappers only for tests. Failure output names the
+  observed report line and the user claim that failed.
 - Add a short "which noun do I use?" guide for the new primitives. Keep it
   grouped by task, not by type list:
   - "limit work"
@@ -152,14 +173,15 @@ Touch only copied paths and examples/docs around newly landed Wave A features:
   with phase numbers.
 - Update `examples/systems/README.md` so each completed system has a smoke
   command and names which Wave A primitive it exercises.
-- Add cheap-model instructions: build one tiny feature using only the skeleton
-  README, then record any new rough edge in findings.
-- Add cheap-model proof, not just instructions:
-  - create one tiny completed system/specimen that follows only the refreshed
-    skeleton README;
+- Add executable cheap-model proof, not just instructions:
+  - create one tiny completed system/specimen named
+    `examples/systems/system_copied_service_path_smoke` that follows only the
+    refreshed skeleton README;
   - it must compile and run by a documented command;
-  - if the author needed unstated lore, record that as a finding and fix the
-    copied path or docs.
+  - its README has a short checklist: "what I copied", "what was not obvious",
+    and "what got fixed in the copied path";
+  - if writing it required unstated lore, fix the copied path or docs before
+    the PR is ready.
 - Keep names task-shaped:
   - "call another service"
   - "limit work"
@@ -190,8 +212,13 @@ Touch only copied paths and examples/docs around newly landed Wave A features:
 - the copied bug workflow runs: capture -> save -> read -> replay -> shrink
 - fairness/load assertions are used by a real specimen/system instead of raw
   "stare at progress_gap_turns" interpretation
-- at least one common wrong setup becomes compile-fail or impossible through
-  the copied path
+- these common wrong setups become compile-fail or impossible through the
+  copied path:
+  - trying to use WebSocket app control by sending peer `Text("__tick:N")`
+    from the skeleton path
+  - trying to build a captured replay without explicit config/history
+  - trying to treat `progress_gap_turns` as an automatic unfairness failure
+    through the assertion helper
 - the refreshed skeleton has a smoke test, a load-ish test, a shutdown test, and
   one bad-config/bad-input test
 - the skeleton includes one overload path and one recovery/shutdown path,
@@ -203,6 +230,8 @@ Touch only copied paths and examples/docs around newly landed Wave A features:
 - the skeleton proves at least one compile-time guardrail from recent phases by
   linking to or adding a trybuild case for the copied mistake
 - every changed snippet compiles or is marked `ignore` with a reason
+- rustdoc links stay clean:
+  `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps`
 - findings diff proves no stale "Eiffel" or pre-helper wording returned
 - docs honestly keep these gaps open: raw WebSocket byte replay, WebSocket
   compliance/Autobahn, pooled/reconnecting WebSocket client manager, and
