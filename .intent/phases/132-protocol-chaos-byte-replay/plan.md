@@ -3,140 +3,183 @@
 ## Status
 
 - Future implementation phase.
-- Can run beside Phase 131 only if ownership stays mostly in tests,
-  `tina-proof-harness`, and parser/replay fixes.
 - One PR.
+- Can run beside 131 if it owns `tina-proof-harness`, parser tests, protocol
+  regression tests, and docs.
 
 ## Grug Truth
 
 Happy-path protocol tests lie.
 
-Real peers half-close, reset, send bad bytes, stall, reconnect, and violate
-framing rules. Tina should turn those into typed outcomes and replayable facts.
+Real peers reset, half-close, drip bytes, send bad frames, stall, and reconnect
+too fast. Tina should answer with typed protocol truth, not logs.
+
+## Current Code Facts
+
+- `tina-proof-harness::bad_peer` already has TCP/HTTP-ish scenarios:
+  half-close, reset, slowloris, stalled reader/writer, malformed frame, TLS
+  handshake failure, reconnect storm.
+- `ProtocolFact` already has stable families for HTTP/2, HTTP body, WebSocket,
+  and gRPC.
+- `TraceProjection::http2_streams`, `websocket_sessions`, and `grpc_status`
+  already project protocol facts.
+- Live replay capture exists, but `LiveReplayFact` currently carries capacity
+  facts only. Protocol byte replay needs a new, explicit case format.
 
 ## Goal
 
-Make native protocol correctness credible.
+Ship credible protocol bad-peer proof:
 
-Ship:
-
-- reusable bad-peer scenarios
-- WebSocket compliance-style classification
-- WebSocket byte-level replay first form
-- HTTP/2/gRPC bad-peer probes
-- CI-sized and long-soak commands
-- fixes for bugs the harness finds
-
-## Starting Facts
-
-- `tina-proof-harness::bad_peer` already has small TCP/HTTP scenarios.
-- WebSocket server/client/session facts exist.
-- HTTP/2/gRPC protocol facts exist.
-- Live trace replay capture exists, but not byte-perfect protocol replay.
-- Roadmap still names Autobahn-style classification and WebSocket byte replay.
+- typed `ProtocolChaosReport`;
+- bounded WebSocket compliance-style corpus;
+- WebSocket byte replay;
+- protocol facts in live replay cases;
+- HTTP/2 and gRPC bad-peer probes;
+- proof targets that run fast in CI and longer locally;
+- regression fixes for bugs the harness finds.
 
 ## Does Not Include
 
-- no full public benchmark suite
-- no giant fuzz platform
-- no network daemon recorder
-- no claim of byte-perfect replay for every TCP stream
-- no production compliance badge unless the test actually runs the corpus
-- no hidden sleeps in tests; flaky timing means bug
+- no full Autobahn badge;
+- no giant fuzz platform;
+- no downloaded corpus;
+- no byte-perfect replay claim for arbitrary OS socket races;
+- no log scraping;
+- no hidden sleeps. Repeated flakes are bugs.
 
-## Decisions
+## Names And Homes
 
-- Home for reusable drivers: `tina-proof-harness`.
-- User-facing names:
-  - `BadPeerScenario`
+- Reuse `tina-proof-harness`.
+- Keep `BadPeerScenario`.
+- Add:
   - `ProtocolChaosReport`
+  - `ProtocolChaosCase`
   - `WebSocketComplianceCase`
   - `ProtocolByteReplayCase`
-- Byte replay is explicit:
-  - supported protocol frames can replay
-  - unsupported raw stream behavior records `UnsupportedFact`
-  - no pretending a live OS socket race is deterministic
-- WebSocket compliance first form is local and bounded. Do not add Autobahn in
-  this phase. Use the same category names where they help, but keep the corpus
-  hermetic and CI-stable.
-- Corpus files live in repo as data or code, not downloaded during tests.
-- Each case has:
-  - name
-  - input bytes/actions
-  - expected wire close/reset/status
-  - expected protocol fact
-  - expected app-delivery rule
-- CI target runs the bounded corpus. Long soak repeats the same scenarios at
-  higher count; it must not add different semantics.
+  - `ProtocolByteReplayReport`
+- Byte replay lives in `tina-proof-harness`, not `tina-sim` core.
+  It replays materialized protocol bytes through pure parser/session state and
+  compares typed protocol facts.
+- Add `LiveReplayFact::Protocol(ProtocolFact)` in `tina-sim` so live capture
+  can save protocol facts beside capacity facts. Raw socket physics that the
+  simulator cannot model still records `UnsupportedFact`.
 
 ## Implementation
 
-### Rock 1: Bad-Peer Harness Upgrade
+### Rock 1: Protocol Chaos Report
 
-Extend typed bad-peer scenarios:
+Extend the bad-peer harness so every scenario returns one typed report:
 
-- half-close during request
-- reset during body
-- slowloris headers
-- stalled writer
-- stalled reader
-- malformed HTTP/2 frame
-- malformed WebSocket frame
-- bad TLS handshake
-- reconnect storm
+- case name;
+- protocol family;
+- bytes written/read;
+- peer action;
+- server/client terminal action;
+- app delivery count;
+- close/reset/status, when any;
+- protocol facts observed;
+- elapsed budget;
+- unsupported facts, if any.
 
-Each scenario returns `ProtocolChaosReport`, not logs.
+Do not remove the existing simple `BadPeerOutcome`; either wrap it or add a
+conversion path so current users keep compiling.
 
-### Rock 2: WebSocket Compliance Cases
+### Rock 2: WebSocket Compliance Corpus
 
-Add a bounded local corpus:
+Add a small hermetic corpus:
 
-- valid text/binary/fragmented frames
-- invalid UTF-8 across fragments
-- reserved bits without negotiated extension
-- oversized lengths
-- masked server frame / unmasked client frame where applicable
-- ping/pong/close handshake edge cases
+- valid text;
+- valid binary;
+- valid fragmented text;
+- invalid UTF-8 across fragments;
+- reserved bits without extension;
+- oversized control frame;
+- oversized message;
+- masked server frame;
+- unmasked client frame;
+- ping/pong edge;
+- close handshake edge.
 
-Classify as pass/fail with typed reason.
-Do not merely assert "connection closed." Assert whether app code saw a message,
-which close code was sent, and which protocol fact was emitted.
+Each `WebSocketComplianceCase` must name:
 
-### Rock 3: Protocol Byte Replay
+- input bytes/actions;
+- expected app messages;
+- expected close code/error;
+- expected `ProtocolFact`;
+- expected report counters.
 
-Add first replay helper for materialized WebSocket frame bytes:
+Malformed bytes must not reach app code as valid data.
 
-- history is bytes + direction + expected protocol facts
-- cap total bytes/events
-- replay parser/session state in sim or pure protocol harness
-- unsupported live facts fail closed
-- saved case writer/reader for the byte case
-- shrink helper that can remove byte chunks/events and refresh expected facts
+### Rock 3: WebSocket Byte Replay
 
-### Rock 4: HTTP/2 And gRPC Bad-Peer Proofs
+Add `ProtocolByteReplayCase` for WebSocket:
 
-Add probes:
+- ordered byte chunks;
+- direction: client-to-server or server-to-client;
+- max bytes and max chunks;
+- expected app deliveries;
+- expected close/reset;
+- expected protocol facts;
+- saved-case read/write;
+- shrink helper that removes chunks/events and refreshes expected facts.
 
-- invalid frame size
-- duplicate pseudo-header
-- stream reset while response body active
-- GOAWAY while streams active
-- gRPC trailers missing status
-- oversized gRPC message
+Unsupported live facts fail closed with `UnsupportedFact`. They do not pass as
+exact replay.
 
-Every probe asserts typed outcome and protocol fact.
+### Rock 4: Protocol Facts In Live Replay
+
+Extend live replay facts:
+
+- `LiveReplayFact::Protocol(ProtocolFact)`;
+- saved-case read/write for protocol facts;
+- display lines that include protocol family;
+- projection helpers that keep HTTP/2, WebSocket, or gRPC facts;
+- mismatch rows that distinguish absent replayable fact from unsupported
+  live-only fact.
+
+Do not hash debug strings. Use the typed `ProtocolFact` values and existing
+stable trace/fact tags.
+
+### Rock 5: HTTP/2 And gRPC Probes
+
+Add hermetic bad-peer probes:
+
+- invalid HTTP/2 frame size;
+- duplicate pseudo-header;
+- DATA after stream close;
+- RST_STREAM while response body is active;
+- GOAWAY while streams are active;
+- flow-control window exhaustion;
+- gRPC trailers missing `grpc-status`;
+- oversized gRPC message.
+
+Each probe asserts typed outcome and protocol fact. Do not merely assert
+"connection closed".
+
+### Rock 6: Make Targets And Docs
+
+Update:
+
+- `make proof-fast` to include the CI-sized bounded corpus;
+- `make proof-bad-peer` to print typed reports with `--nocapture`;
+- `make proof-soak` to repeat the same semantics at higher count;
+- `examples/systems/README.md` with when to use proof harness vs local test.
 
 ## Required Proof
 
-- CI-sized proof target runs fast and deterministic.
-- Long-soak target is opt-in and documented.
-- Every scenario has typed outcome and no log scraping.
-- Every scenario has a stable name and appears in the final report.
-- Malformed bytes never reach app-level user message as valid data.
-- Valid fragmented text reaches app code exactly once after reassembly.
-- Slow/stalled peer hits a cap or timeout with visible report.
-- Reconnect storm does not leak live sessions or queued bytes.
-- WebSocket byte replay reproduces a saved bad frame case.
-- Byte replay shrink produces a smaller case and refreshed expected facts.
+- CI proof is deterministic and fast.
+- Long soak is opt-in and documented.
+- Every scenario has stable name and typed report row.
+- Valid fragmented WebSocket text reaches app code once after reassembly.
+- Invalid WebSocket bytes do not reach app code as valid messages.
+- WebSocket close code/fact/report counters match expected case data.
+- HTTP/2 malformed frames map to typed reset/GOAWAY/protocol-error facts.
+- gRPC missing-status and oversized-message cases return typed gRPC outcomes.
+- Slow/stalled peer hits cap or timeout with visible report.
+- Reconnect storm does not leak sessions, connect attempts, or queued bytes.
+- Byte replay reproduces one saved bad-frame case.
+- Shrink produces a smaller case and freshly observed expected facts.
+- Saved live replay case can include WebSocket/HTTP2/gRPC protocol facts.
+- Protocol fact mismatch says replayable-diverged vs unsupported-live-only.
 - Unsupported byte replay facts fail closed.
-- Any parser/protocol fix gets a before-failing, after-passing regression.
+- Parser/protocol bug fixes include a failing-before, passing-after test.

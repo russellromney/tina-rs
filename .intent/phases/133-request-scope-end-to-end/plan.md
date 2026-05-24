@@ -3,140 +3,160 @@
 ## Status
 
 - Future implementation phase.
-- Runs after Phase 120 if it wants the refreshed service skeleton.
 - One PR.
+- Can run beside 131/132/134 if it owns request-scope adapters, one system
+  specimen, docs, and tests.
 
 ## Grug Truth
 
 A request is a tree.
 
-When the client goes away, the tree should stop waiting. Tina-owned rails should
-cancel or close as strongly as they can. External work may finish late, but it
-must not become a ghost.
+When the caller goes away, the tree stops waiting. Tina-owned rails cancel or
+close as strongly as Tina can. External work may finish late, but it must not
+become a ghost.
+
+## Current Code Facts
+
+- `RequestScope`, `RequestScopeSet`, `ScopeCancelReport`, and
+  `ScopeCancelCause` already exist in `tina-runtime::scope`.
+- `CallContext::defer_scoped(scope, label, call_cancelable(...))` already
+  exists.
+- `DeferredScopedCall::try_admit(...)` already does the all-or-nothing path:
+  store pending token, register child in scope, roll back pending storage if
+  scope registration fails, and only then return the child effect.
+- HTTP/1 response sources already have `ResponseChunkMsg::Cancel`.
+- HTTP/1 request-body pulls and HTTP/2 body streams already have call-shaped
+  pull/cancel paths.
+- `mini_saas_api` is the current copied service skeleton: HTTP + SQLite +
+  keepalive pool + shutdown/report.
+
+So this phase should integrate the existing primitive. Do not rebuild request
+scope from scratch.
 
 ## Goal
 
-Make request-scoped cancellation the copied path for real services.
+Make request-scoped cancellation the copied path for real services:
 
-Ship:
-
-- request scope wired through HTTP request handling
-- body stream cancel
-- timer cancel
-- pool acquire / lease cancel
-- DB/bridge late-result truth
-- WebSocket/gRPC session close integration, adding scoped adapters where needed
-- one request-shaped report
-
-## Starting Facts
-
-- `RequestScope`, `RequestScopeSet`, and scoped call helpers exist.
-- Scope cancel is single-shard honest; cross-shard cancel reports
-  `WrongShard`.
-- Protocol/body/pool/bridge resources have their own close/report surfaces.
-- Current services still wire much of this by hand.
+- one service request owns one `RequestScope`;
+- body streams, timers, pool waits, pool leases, DB/bridge calls, outbound
+  calls, and session operations register as scoped children where Tina owns a
+  cancel handle;
+- cancel produces a report with the same typed cause vocabulary everywhere;
+- late external completions remain visible as late/rejected truth;
+- one canonical system demonstrates the whole path.
 
 ## Does Not Include
 
-- no fake cancellation of already-accepted external work
-- no cross-shard magic beyond visible `WrongShard`
-- no global request registry
-- no hidden background canceller
-- no retry policy
-- no broad web framework
+- no fake cancellation of already-accepted external work;
+- no cross-shard magic beyond visible `WrongShard`;
+- no global request registry;
+- no hidden background canceller;
+- no retry policy;
+- no web framework router.
 
-## Decisions
+## Names And Homes
 
-- User-facing names:
+- Keep core names:
   - `RequestScope`
-  - `RequestScopeReport`
-  - `ScopedRequest`
-  - `ScopedRequestSet`
-- Cancellation causes stay typed:
-  - client disconnect
-  - caller cancel
-  - timeout
-  - owner stop
-  - shutdown drain
-  - user-defined
-- A scope report must include:
-  - registered children
-  - cancel cause
-  - cancelled count
-  - already-settled count
-  - wrong-shard rows
-  - late-result count if observed
-  - unreleased capacity after drain
-- Bridge/external late completion stays worker-terminal plus
-  `CallReplyRejected`; do not convert it to success or silence.
-- Scoped child admission follows the same rule as cancelable deferred work:
-  register the child with the scope before returning/dispatching the child
-  effect. If registration fails, recover the caller authority and do not start
-  the child work.
-- Scope cancel is idempotent. The first cause wins; later cancels are reported
-  as already-cancelled, not as new terminal truth.
+  - `RequestScopeSet`
+  - `ScopeCancelReport`
+  - `ScopeCancelCause`
+- Add:
+  - `ScopedRequestReport` as the request-level aggregate. It wraps
+    `ScopeCancelReport`, `RequestScopeSetCapacityReport`, late-result counts,
+    and unsupported rows. It must not replace `ScopeCancelReport`.
+- Add adapters near the resources they adapt:
+  - HTTP body/request adapters in `tina-http`;
+  - pool/bridge examples in systems/specimens;
+  - docs in request-reply and lifecycle pages.
 
 ## Implementation
 
-### Rock 1: HTTP Scoped Request Path
+### Rock 1: HTTP Request Scope Copied Path
 
-Add a copied path for native HTTP handlers:
+Add a small copied helper/pattern for HTTP services:
 
-- create scope on request admission
-- register body/source/DB/timer child work
-- cancel scope on client disconnect or request timeout
-- include scope report in service shutdown/report path
-- reject/admit scope before handler starts child work
+- allocate `RequestScope::with_child_cap(RequestScopeId::alloc(), cap)` when
+  the request is admitted;
+- store it in a bounded `RequestScopeSet` keyed by request id;
+- close admission with `Full(report)` if the set is full;
+- cancel with `ClientDisconnect`, `Timeout`, `OwnerStopped`, or explicit
+  caller cancel;
+- drain/remove the scope on final reply.
 
-### Rock 2: Body And Stream Cancel
+Use existing `defer_scoped(...).try_admit(...)` for cancelable child work.
+Do not return a child effect if pending/scope admission fails.
 
-Wire cancel through:
+### Rock 2: Body, Timer, Pool, Bridge Adapters
 
-- request body stream pull
-- response body source
-- WebSocket session close where request owns a session operation
-- gRPC stream scoped adapter for unary and one streaming mode
+Prove scoped behavior for:
 
-If a protocol cannot support a scoped child in this phase, add an explicit
-unsupported row in the scope report and a test that proves it fails closed.
+- response body source: cancel calls `ResponseChunkMsg::Cancel`;
+- request body pull: client disconnect/request timeout releases the parked
+  pull authority;
+- `sleep`/deadline child: scope cancel calls `cancel_call`;
+- pool acquire wait: scope cancel releases caller capacity;
+- held pool lease: owner-stop/drain retires or releases according to existing
+  pool disposition truth;
+- SQLite or SQLx bridge call: caller sees cancel/timeout, worker terminal late
+  truth remains visible;
+- reqwest or HTTP keepalive outbound call: late completion is not success.
 
-### Rock 3: Pool And Bridge Integration
+Rails that cannot support scoped cancellation in this phase must emit an
+explicit unsupported row in `ScopedRequestReport` and have a test proving the
+row fails closed. Do not leave a prose-only unsupported path.
 
-Prove scoped:
+### Rock 3: WebSocket/gRPC Session Operations
 
-- pool acquire waiting
-- held pool lease during request
-- SQLite or SQLx bridge call
-- local reqwest bridge call against a hermetic in-process server
+Add scoped adapters for operations a request owns:
 
-Caller timeout and worker-terminal late completion remain distinct.
-Every scoped adapter must return the original caller/request authority on
-failed scope registration.
+- WebSocket send/report/close through a session handle;
+- gRPC unary call;
+- one gRPC streaming pull or cancel path.
 
-### Rock 4: Canonical System
+Do not claim a whole long-lived WebSocket session is a short HTTP request
+scope. Scope only the operation owned by the request.
 
-Update one production-shaped system:
+### Rock 4: Canonical System Proof
 
-- HTTP request
-- streaming body or response
-- DB/pool operation
-- outbound bridge/client call
-- timer/deadline
-- shutdown while request active
+Update `examples/systems/mini_saas_api` to use request scopes for at least:
 
-The README should show the copied path and the report.
+- `POST /items/{id}/notify`;
+- a DB lookup;
+- a keepalive pool acquire/request/release path;
+- a timer/deadline;
+- shutdown while one request is active.
+
+Add one tiny new system `examples/systems/system_scoped_request_tree` focused
+on streaming body disconnect. Keep it small: one HTTP route, one body stream,
+one timer, one cancelable child, one report.
+
+### Rock 5: Docs
+
+Update:
+
+- request-reply guide: multi-turn + scoped child example;
+- lifecycle guide: first-cause-wins cancel report;
+- service patterns: "one HTTP request = one request tree";
+- `mini_saas_api` README with the exact copied shape.
 
 ## Required Proof
 
+- Scope set full returns typed admission failure and returns authority.
+- Scope registration failure does not dispatch child work.
 - Client disconnect cancels scope and reports child rows.
 - Request timeout cancels timer/body/pool/bridge waits.
-- Double cancel keeps the first cause and reports the second as redundant.
-- Owner stop drains scopes and reports unreleased capacity as zero.
-- Scope registration failure does not dispatch child work.
-- Bridge accepted work may finish late; trace/report names the late truth.
+- Double cancel keeps first cause and reports later cancel as redundant.
+- Owner stop drains scopes and reports unreleased capacity as zero or names the
+  unreleased resource.
+- Bridge accepted work may finish late; trace/report names late truth.
 - Cross-shard child registered into scope reports `WrongShard`, not success.
-- A dropped/closed body source receives cancel or an explicit unsupported row.
-- Scope cap full returns typed admission failure and returns authority.
+- Dropped/closed body source receives cancel or explicit unsupported row.
 - Cancel after child completion reports already-settled, not cancelled.
-- Live test and sim/replay proof agree where facts are supported; unsupported
-  facts fail closed.
+- Stale child completion cannot remove or settle a newer request with the same
+  key.
+- `mini_saas_api` smoke proves user-visible HTTP response for disconnect,
+  timeout, full, shutdown, and late bridge completion.
+- `system_scoped_request_tree` proves streaming body disconnect without
+  depending on the larger SaaS flow.
+- Sim/replay agrees where facts are supported. Unsupported facts fail closed.
