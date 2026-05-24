@@ -372,8 +372,9 @@ If the simulator runner does not reproduce them, replay fails closed.
 
 ```rust
 use tina_sim::dst::{
-    LiveReplayCapture, LiveReplayFact, LiveReplayReport, RuntimeEventKindName,
-    TraceProjection, check_captured_replay, read_saved_replay_case,
+    CaptureLimits, CaptureSource, LiveReplayFact, LiveReplayReport,
+    RuntimeEventKindName, TraceProjection, capture_live_run,
+    check_captured_replay, read_saved_replay_case, shrink_captured_replay,
     write_saved_replay_case,
 };
 
@@ -381,20 +382,24 @@ let projection = TraceProjection::Projected {
     included: vec![RuntimeEventKindName::CallCancelled],
     ignored: vec![RuntimeEventKindName::HandlerStarted],
 };
-let capture = LiveReplayCapture::from_events_with_options(
-    "late reply after cancel",
-    seed,
-    replay_config.clone(),
-    "caller cancels before the worker reply is delivered",
-    ops,
-    "late reply is rejected as CallerCancelled",
-    "threaded runtime staging run",
-    &live_trace,
-    projection,
-    Vec::new(),
-)?;
 let body_fact = LiveReplayFact::capacity_surface(&http_body_capacity_report);
-let capture = capture.with_live_fact(body_fact.clone());
+let capture = capture_live_run("late reply after cancel")
+    .with_limits(CaptureLimits::default())
+    .with_seed(seed)
+    .with_config(replay_config.clone())
+    .with_scenario("caller cancels before the worker reply is delivered")
+    .with_history(ops)
+    .with_invariant("late reply is rejected as CallerCancelled")
+    .with_source("threaded runtime staging run")
+    .with_source_metadata(
+        CaptureSource::new("threaded runtime staging run")
+            .runtime_kind("threaded")
+            .backend("live"),
+    )
+    .with_projection(projection)
+    .with_trace(&live_trace)
+    .with_fact(body_fact.clone())
+    .finish()?;
 
 write_saved_replay_case("cases/late-reply.case", &capture, |op| op.to_string())?;
 
@@ -415,13 +420,24 @@ check_captured_replay(&capture, &case, |case| {
     )?
     .with_live_fact(body_fact.clone()))
 })?;
+
+let shrunk = shrink_captured_replay(
+    &capture,
+    Default::default(),
+    "late reply rejection survives",
+    run_live_replay_case,
+    |report| report.replay.output.saw_late_reply_rejected,
+)?;
+write_saved_replay_case("cases/late-reply-small.case", shrunk.capture(), |op| {
+    op.to_string()
+})?;
 ```
 
 The saved-case file is intentionally small and line-oriented. It stores
-name, seed, scenario, invariant, source, config debug/hash, topology
-roles, projection debug, typed live fact display lines, unsupported
-facts, expected event count/hash, and one `op=` line per materialized
-operation. Tina does not
+name, seed, scenario, invariant, source metadata, config debug/hash,
+topology roles, projection debug, typed live fact display lines,
+unsupported facts, expected event count/hash, truncation status, and
+one `op=` line per materialized operation. Tina does not
 deserialize arbitrary service config for you; the caller supplies the
 typed `ReplayConfig` when loading, and the helper checks the config hash
 before replay.
@@ -433,6 +449,13 @@ ignored event kind. An event kind that is not named fails closed with a
 typed projection mismatch. Unsupported facts are also fail-closed: they
 are saved and printed in the mismatch report until the history/config
 is rich enough to model them.
+
+Capture is bounded. If event, history, fact, or string limits are hit,
+the capture is still saveable as evidence, but it carries explicit
+`TraceTruncated` / `FactTruncated` / `CaptureFull` truth and the default
+exact replay helper rejects it. A partial live trace is the same kind of
+honesty: save it if it helps debug, but do not call it replayable until
+the partial fact is modeled and expected.
 
 Unsupported facts are a success of honesty, not a Tina failure. They say
 "this capture noticed something real, and the replay case cannot model it
@@ -483,8 +506,8 @@ The copied workflow:
 5. save it with write_saved_replay_case
 6. run check_captured_replay against the simulator runner
 7. if unsupported facts appear, either support them or keep the replay blocked
-8. when it fails for the expected bug, use shrink_replay_case on capture.to_replay_case()
-9. shrink only materialized history ops, recompute expected count/hash, and commit the shrunk ReplayCase plus the saved case
+8. when it fails for the expected bug, use shrink_captured_replay
+9. shrink only materialized history ops, preserve the proving fact set, recompute expected count/hash, and commit the shrunk saved case plus the regression test
 ```
 
 ## Bug Report Shape

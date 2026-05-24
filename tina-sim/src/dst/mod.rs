@@ -995,6 +995,7 @@ mod replay_case_tests {
             scenario: c.scenario.to_owned(),
             invariant: c.invariant.to_owned(),
             source: capture.source.to_owned(),
+            source_metadata: capture.source_metadata.clone(),
             config_debug: format!("{:?}", c.config),
             config_hash: capture.config_hash(),
             topology_roles: capture
@@ -1006,6 +1007,7 @@ mod replay_case_tests {
             unsupported_facts: capture.unsupported_facts.clone(),
             live_facts: capture.live_facts.iter().map(ToString::to_string).collect(),
             expected: capture.expected,
+            truncated: capture.truncated,
             history: c.history.operations().to_vec(),
         };
 

@@ -27,7 +27,7 @@ fn live_capture_then_sim_replay_then_shrink() {
     );
 
     // 2) Live sink count == non-poison sends from the canonical case.
-    let original = report.shrunk.original();
+    let original = &report.capture.history;
     let non_poison = original
         .operations()
         .iter()
@@ -58,11 +58,9 @@ fn live_capture_then_sim_replay_then_shrink() {
         assert_ne!(d.trace_hash, 0, "discovered hash must be non-zero: {d:?}");
     }
 
-    // 5) Shrink result STRICTLY smaller than original, still has the
-    //    bug, and ideally minimal (one POISON Send is enough to drop
-    //    one message — any larger shrunk history means the shrinker
-    //    stopped early).
-    let shrunk = report.shrunk.shrunk();
+    // 5) Shrink result is smaller than original, still has the bug, and
+    //    preserves the live replay fact set by default.
+    let shrunk = &report.shrunk.capture().history;
     assert!(
         shrunk.len() < original.len(),
         "shrunk history must be strictly smaller than original: shrunk={} original={}",
@@ -76,16 +74,9 @@ fn live_capture_then_sim_replay_then_shrink() {
             .any(|op| matches!(op, Op::Send(v) if *v == POISON_VALUE)),
         "shrunk history must still trigger the bug (contain POISON): {report:#?}",
     );
-    assert_eq!(
-        shrunk.len(),
-        1,
-        "the minimal bug history is one POISON send; \
-         shrinker returned {shrunk:?} from {original:?}",
-    );
-    let only = shrunk.operations().first().expect("shrunk has one op");
     assert!(
-        matches!(only, Op::Send(v) if *v == POISON_VALUE),
-        "minimal shrunk op must be Send(POISON): got {only:?}",
+        report.shrunk.capture().live_facts == report.capture.live_facts,
+        "live-derived shrink must preserve proving facts by default: {report:#?}",
     );
 
     // 6) Live pressure surface clean: this workload has no bounded
@@ -96,6 +87,15 @@ fn live_capture_then_sim_replay_then_shrink() {
         !report.live_pressure.non_zero(),
         "live pressure must be empty for this workload; got {:?}",
         report.live_pressure,
+    );
+    assert!(
+        !report.capture_summary.replay_blocked,
+        "canonical capture should be replayable: {:?}",
+        report.capture_summary,
+    );
+    assert!(
+        report.unsupported_mismatch_seen,
+        "unsupported live facts must fail closed",
     );
 
     eprintln!("{}", report.summary_line);

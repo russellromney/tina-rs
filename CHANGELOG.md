@@ -16,6 +16,18 @@ This file records completed work.
   call-only messages delivered by `try_send` increment
   `wrong_lane_messages` instead of disappearing as uncounted no-ops.
 
+### Live Trace Replay Capture
+
+- Added the blessed live-weirdness to simulator-replay workflow:
+  `capture_live_run(...)`, `LiveReplayCapture`, source metadata,
+  truncation/unsupported-fact truth, saved-case round trips, and
+  `shrink_captured_replay(...)`. Captures now carry seed, config, explicit
+  history, expected trace shape, replay facts, and source completeness so live
+  evidence cannot quietly masquerade as exact replay when facts are missing.
+- Updated the live replay bugbox system specimen to exercise live capture,
+  saved-case read/write, exact replay, fail-closed unsupported facts, and
+  fact-preserving shrink output.
+
 ### Hostile Review Fixes
 
 - Made SQLite and SQLx bridge installed addresses callable capabilities

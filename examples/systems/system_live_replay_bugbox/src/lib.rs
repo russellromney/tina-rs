@@ -7,9 +7,11 @@
 //!   wire a live trace observer before the first event.
 //! - [`tina_proof_harness::LiveTrace`] to capture the live trace shape
 //!   (event count + `stable_trace_hash`).
-//! - [`tina_sim::dst::ReplayCase`] / [`tina_sim::dst::observe_replay_case`] /
-//!   [`tina_sim::dst::assert_replay_case`] for the saved-seed sim replay.
-//! - [`tina_sim::dst::delete_shrink`] for the deletion shrinker.
+//! - [`tina_sim::dst::capture_live_run`] /
+//!   [`tina_sim::dst::assert_captured_replay`] /
+//!   [`tina_sim::dst::shrink_captured_replay`] for the live-derived saved case.
+//! - [`tina_sim::dst::ReplayCase`] / [`tina_sim::dst::assert_replay_case`] for
+//!   the saved-seed sim replay.
 //! - [`tina_sim::dst::discover_constants`] for the "pin constants"
 //!   sweep helper.
 //!
@@ -17,7 +19,8 @@
 //! specific value (`POISON_VALUE`). Live capture sees the workload run
 //! end-to-end; the sim replay finds the exact subset of ops that still
 //! drops at least one message; the shrinker reduces the offending
-//! history to its minimum.
+//! history while preserving the fact set that made the live capture
+//! interesting.
 //!
 //! Read this top-to-bottom: `Op` → live → sim case → sim runner →
 //! shrink → `run()` ties them together.
@@ -28,12 +31,16 @@ use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use tina::capacity::{CapacityMode, CapacitySurfaceReport};
 use tina::prelude::*;
 use tina_proof_harness::live_replay::LiveTrace;
 use tina_runtime::{DefaultThreadedMailboxFactory, ThreadedRuntime, ThreadedRuntimeConfig};
 use tina_sim::dst::{
-    DiscoveredConstants, ReplayCase, ReplayConfig, ReplayReport, ShrinkConfig, ShrunkFailure,
-    TraceShape, assert_replay_case, delete_shrink, discover_constants, observe_replay_case,
+    CaptureSource, CaptureSummary, DiscoveredConstants, LiveReplayCapture, LiveReplayFact,
+    LiveReplayReport, ReplayCase, ReplayConfig, ReplayReport, ShrinkConfig, ShrinkCapturedReport,
+    TraceProjection, TraceShape, assert_captured_replay, assert_replay_case, capture_live_run,
+    check_captured_replay, discover_constants, read_saved_replay_case, shrink_captured_replay,
+    write_saved_replay_case,
 };
 use tina_sim::{FaultConfig, LocalSendFaultMode, Simulator};
 
@@ -67,14 +74,36 @@ pub struct BugboxReport {
     pub live_pressure: tina_runtime::PressureSummary,
     pub sim_pinned: SavedCase,
     pub sim_report: ReplayReport<Output>,
+    pub capture: LiveReplayCapture<Op>,
+    pub capture_summary: CaptureSummary,
+    pub capture_replay: LiveReplayReport<Output>,
     pub discovered: Vec<DiscoveredConstants>,
-    pub shrunk: ShrunkFailure<Op>,
+    pub shrunk: ShrinkCapturedReport<Op, Output>,
+    pub unsupported_mismatch_seen: bool,
     pub summary_line: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Output {
     pub messages_received: usize,
+    pub poison_sent: bool,
+}
+
+fn encode_op(op: &Op) -> String {
+    match op {
+        Op::Send(value) => format!("send:{value}"),
+        Op::Drain => "drain".to_owned(),
+    }
+}
+
+fn decode_op(text: &str) -> Result<Op, String> {
+    if text == "drain" {
+        return Ok(Op::Drain);
+    }
+    let Some(value) = text.strip_prefix("send:") else {
+        return Err(format!("unknown op {text:?}"));
+    };
+    Ok(Op::Send(value.parse::<u32>().map_err(|error| error.to_string())?))
 }
 
 /// The saved-seed sim case that pairs with this specimen's live
@@ -207,7 +236,7 @@ pub const SAVED_SEED: u64 = 108;
 /// `observe_replay_case`). When the case is exercised again later the
 /// pinned values let `assert_replay_case` fail loudly on drift.
 const SAVED_EVENT_COUNT: usize = 54;
-const SAVED_TRACE_HASH: u64 = 0xe0f7_990d_ddf0_fb49;
+const SAVED_TRACE_HASH: u64 = 0xc878_d2a4_3912_9480;
 
 fn faults() -> FaultConfig {
     FaultConfig {
@@ -248,6 +277,10 @@ pub fn case() -> ReplayCase<Op> {
 /// Sim runner. Reads every knob from the case; the history is
 /// load-bearing (deleting an op changes the trace).
 pub fn run_case(case: &ReplayCase<Op>) -> ReplayReport<Output> {
+    run_case_with_events(case).0
+}
+
+fn run_case_with_events(case: &ReplayCase<Op>) -> (ReplayReport<Output>, Vec<tina_runtime::RuntimeEvent>) {
     let mut sim = Simulator::new(SingleShard, case.simulator_config());
     let received = Rc::new(RefCell::new(Vec::new()));
     let sink = sim.register_with_mailbox_capacity(
@@ -272,7 +305,42 @@ pub fn run_case(case: &ReplayCase<Op>) -> ReplayReport<Output> {
     sim.run_until_quiescent();
 
     let messages_received = received.borrow().len();
-    ReplayReport::from_case_and_events(case, sim.trace(), Output { messages_received })
+    let events = sim.trace().to_vec();
+    let poison_sent = case
+        .history
+        .operations()
+        .iter()
+        .any(|op| matches!(op, Op::Send(v) if *v == POISON_VALUE));
+    (
+        ReplayReport::from_case_and_events(
+            case,
+            &events,
+            Output {
+                messages_received,
+                poison_sent,
+            },
+        ),
+        events,
+    )
+}
+
+fn replay_fact(output: &Output) -> LiveReplayFact {
+    LiveReplayFact::capacity_surface(&CapacitySurfaceReport::count(
+        "bugbox.sink.receive-count",
+        CapacityMode::Fixed,
+        8,
+        0,
+        output.messages_received,
+        0,
+    ))
+}
+
+fn run_captured_case(
+    case: &ReplayCase<Op>,
+) -> Result<LiveReplayReport<Output>, tina_sim::dst::TraceProjectionError> {
+    let report = run_case(case);
+    let fact = replay_fact(&report.output);
+    Ok(LiveReplayReport::exact(report).with_live_fact(fact))
 }
 
 // ---------------------------------------------------------------------------
@@ -339,13 +407,67 @@ pub fn run() -> anyhow::Result<BugboxReport> {
         .map_err(|e| anyhow::anyhow!("live runtime shutdown: {e:?}"))?;
     let live_received_count = live_received.lock().expect("live sink lock").len();
     let live_shape = live_trace.snapshot();
+    let live_events = live_trace.events();
     let live_pressure = live_trace.pressure_summary();
 
     // 2) Sim replay. assert_replay_case panics on drift; the saved
     //    constants must match.
     let sim_report = assert_replay_case(&live_case, run_case);
+    let fact = replay_fact(&sim_report.output);
 
-    // 3) Helper: discover_constants over a small seed sweep so a coding
+    // 3) Live capture -> save -> read -> replay. The capture keeps the live
+    //    trace shape, explicit replay config/history, typed facts, and source
+    //    metadata together.
+    let capture = capture_live_run(live_case.name)
+        .with_seed(live_case.seed)
+        .with_config(live_case.config.clone())
+        .with_scenario(live_case.scenario)
+        .with_history(live_case.history.operations().to_vec())
+        .with_invariant(live_case.invariant)
+        .with_source("system_live_replay_bugbox live smoke")
+        .with_source_metadata(
+            CaptureSource::new("system_live_replay_bugbox live smoke")
+                .runtime_kind("threaded")
+                .backend("live"),
+        )
+        .with_projection(TraceProjection::Exact)
+        .with_trace(&live_events)
+        .with_capacity_summary(&CapacitySurfaceReport::count(
+            "bugbox.sink.receive-count",
+            CapacityMode::Fixed,
+            8,
+            0,
+            sim_report.output.messages_received,
+            0,
+        ))
+        .finish()?;
+    let capture_summary = capture.summary();
+
+    let path = std::env::temp_dir().join(format!(
+        "system-live-replay-bugbox-{}-{}.case",
+        std::process::id(),
+        capture.expected.trace_hash
+    ));
+    write_saved_replay_case(&path, &capture, encode_op)?;
+    let saved = read_saved_replay_case(&path, decode_op)?;
+    let _ = std::fs::remove_file(&path);
+    let replay_case = saved.to_replay_case(
+        live_case.name,
+        live_case.config.clone(),
+        live_case.scenario,
+        live_case.invariant,
+    )?;
+    let capture_replay = assert_captured_replay(&capture, &replay_case, run_captured_case);
+    assert_eq!(capture_replay.live_facts, vec![fact.clone()]);
+
+    let unsupported = capture
+        .clone()
+        .with_unsupported_fact("wall-clock drain timing", "live runtime drains continuously");
+    let unsupported_mismatch_seen =
+        check_captured_replay(&unsupported, &unsupported.to_replay_case(), run_captured_case)
+            .is_err();
+
+    // 4) Helper: discover_constants over a small seed sweep so a coding
     //    agent that wants to pin a new case can copy the printed
     //    constants directly. `discover_constants` requires `&'static
     //    str` labels, so the labels are listed as constants.
@@ -374,53 +496,31 @@ pub fn run() -> anyhow::Result<BugboxReport> {
         .collect();
     let discovered = discover_constants(sweep_cases, run_case);
 
-    // 4) Shrink: find the minimum history that still drops at least
-    //    one message. "Still buggy" = sink.received < non-poison ops.
-    let shrunk = delete_shrink(
-        &live_case.history,
+    // 5) Shrink: find the minimum live-derived capture that still drops at
+    //    least one poison message while preserving the replay fact set.
+    let shrunk = shrink_captured_replay(
+        &capture,
         ShrinkConfig::default(),
-        "at least one non-poison message lost",
-        |history| {
-            // Build a fresh case at the candidate history and check
-            // whether the bug still reproduces.
-            let candidate = ReplayCase::new(
-                live_case.name,
-                live_case.seed,
-                live_case.config.clone(),
-                live_case.scenario,
-                history.operations().to_vec(),
-                live_case.invariant,
-            );
-            let report = observe_replay_case(&candidate, run_case);
-            let non_poison = history
-                .operations()
-                .iter()
-                .filter(|op| matches!(op, Op::Send(v) if *v != POISON_VALUE))
-                .count();
-            // The bug is "the sink discards POISON". A history still
-            // shows the bug iff it contains at least one POISON send,
-            // because that is the value the sink silently drops.
-            report.output.messages_received == non_poison
-                && history
-                    .operations()
-                    .iter()
-                    .any(|op| matches!(op, Op::Send(v) if *v == POISON_VALUE))
-        },
-    );
+        "at least one poison message is silently dropped",
+        run_captured_case,
+        |report| report.replay.output.poison_sent,
+    )?;
 
     let summary_line = format!(
         "bugbox live_received={live_received_count} live_events={live_count} \
          live_hash=0x{live_hash:016x} sim_events={sim_count} sim_hash=0x{sim_hash:016x} \
          shrunk_from={from} to={to} discovered_seeds={ds} \
-         live_pressure_nonzero={pressure_nonzero}",
+         live_pressure_nonzero={pressure_nonzero} capture_blocked={capture_blocked} \
+         unsupported_proof={unsupported_mismatch_seen}",
         live_count = live_shape.event_count,
         live_hash = live_shape.trace_hash,
         sim_count = sim_report.event_count,
         sim_hash = sim_report.trace_hash,
-        from = shrunk.original().len(),
-        to = shrunk.shrunk().len(),
+        from = shrunk.original_len,
+        to = shrunk.shrunk_len,
         ds = discovered.len(),
         pressure_nonzero = live_pressure.non_zero(),
+        capture_blocked = capture_summary.replay_blocked,
     );
 
     Ok(BugboxReport {
@@ -433,8 +533,12 @@ pub fn run() -> anyhow::Result<BugboxReport> {
             live_trace_hash: live_shape.trace_hash,
         },
         sim_report,
+        capture,
+        capture_summary,
+        capture_replay,
         discovered,
         shrunk,
+        unsupported_mismatch_seen,
         summary_line,
     })
 }
