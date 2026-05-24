@@ -740,6 +740,172 @@ fn native_websocket_client_handles_ping_and_close() {
 }
 
 #[test]
+fn native_websocket_client_user_close_updates_report_and_rejects_late_send() {
+    let harness = Harness::start(WebSocketLimits::default());
+    let runtime = harness.runtime.as_ref().expect("runtime");
+    let client = runtime
+        .register_with_capacity::<WebSocketClientConnection<TestShard>, Infallible>(
+            WebSocketClientConnection::new(WebSocketLimits::default()),
+            16,
+        )
+        .expect("register websocket client");
+    assert!(matches!(
+        runtime
+            .call_blocking(
+                client,
+                WebSocketClientMsg::Connect {
+                    target: WebSocketTarget::ws(harness.addr, "localhost", "/ws"),
+                    subprotocols: Vec::new(),
+                },
+                Duration::from_secs(5),
+            )
+            .expect("connect call"),
+        CallOutcome::Replied(WebSocketClientReply::Connected(Ok(_)))
+    ));
+    assert!(matches!(
+        runtime
+            .call_blocking(
+                client,
+                WebSocketClientMsg::Send(WebSocketMessage::Close(
+                    Some(WebSocketCloseCode(1000)),
+                    b"done".to_vec(),
+                )),
+                Duration::from_secs(5),
+            )
+            .expect("send close"),
+        CallOutcome::Replied(WebSocketClientReply::Sent(Ok(())))
+    ));
+    match runtime
+        .call_blocking(client, WebSocketClientMsg::Report, Duration::from_secs(5))
+        .expect("report")
+    {
+        CallOutcome::Replied(WebSocketClientReply::Report(report)) => {
+            assert_eq!(report.state, tina_http::WebSocketClientState::Closing);
+            assert!(report.close_sent);
+            assert_eq!(report.sent_messages, 1);
+        }
+        other => panic!("expected report, got {other:?}"),
+    }
+    match runtime
+        .call_blocking(
+            client,
+            WebSocketClientMsg::Send(WebSocketMessage::Text("late".to_owned())),
+            Duration::from_secs(5),
+        )
+        .expect("late send")
+    {
+        CallOutcome::Replied(WebSocketClientReply::Sent(Err(
+            tina_http::WebSocketClientError::NotConnected,
+        ))) => {}
+        other => panic!("expected late send rejection, got {other:?}"),
+    }
+}
+
+#[test]
+fn native_websocket_client_invalid_target_rejects_before_connecting() {
+    let runtime = ThreadedRuntime::with_config(
+        TestShard,
+        DefaultThreadedMailboxFactory,
+        ThreadedRuntimeConfig {
+            command_capacity: 64,
+            idle_wait: Duration::from_millis(1),
+            ..Default::default()
+        },
+    );
+    let client = runtime
+        .register_with_capacity::<WebSocketClientConnection<TestShard>, Infallible>(
+            WebSocketClientConnection::new(WebSocketLimits::default()),
+            16,
+        )
+        .expect("register websocket client");
+    match runtime
+        .call_blocking(
+            client,
+            WebSocketClientMsg::Connect {
+                target: WebSocketTarget::ws(
+                    "127.0.0.1:9".parse().unwrap(),
+                    "localhost\r\nX-Bad: yes",
+                    "/ws",
+                ),
+                subprotocols: Vec::new(),
+            },
+            Duration::from_secs(5),
+        )
+        .expect("connect call")
+    {
+        CallOutcome::Replied(WebSocketClientReply::Connected(Err(
+            tina_http::WebSocketClientError::InvalidTarget,
+        ))) => {}
+        other => panic!("expected invalid target, got {other:?}"),
+    }
+    match runtime
+        .call_blocking(
+            client,
+            WebSocketClientMsg::Connect {
+                target: WebSocketTarget::ws("127.0.0.1:9".parse().unwrap(), "localhost", "/ws"),
+                subprotocols: vec!["bad protocol".to_owned()],
+            },
+            Duration::from_secs(5),
+        )
+        .expect("connect call")
+    {
+        CallOutcome::Replied(WebSocketClientReply::Connected(Err(
+            tina_http::WebSocketClientError::InvalidTarget,
+        ))) => {}
+        other => panic!("expected invalid subprotocol, got {other:?}"),
+    }
+    let _ = runtime.shutdown();
+}
+
+#[test]
+fn native_websocket_client_connect_failure_returns_typed_error_not_closed_call() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("reserve addr");
+    let addr = listener.local_addr().expect("local addr");
+    drop(listener);
+    let runtime = ThreadedRuntime::with_config(
+        TestShard,
+        DefaultThreadedMailboxFactory,
+        ThreadedRuntimeConfig {
+            command_capacity: 64,
+            idle_wait: Duration::from_millis(1),
+            ..Default::default()
+        },
+    );
+    let client = runtime
+        .register_with_capacity::<WebSocketClientConnection<TestShard>, Infallible>(
+            WebSocketClientConnection::new(WebSocketLimits::default()),
+            16,
+        )
+        .expect("register websocket client");
+    match runtime
+        .call_blocking(
+            client,
+            WebSocketClientMsg::Connect {
+                target: WebSocketTarget::ws(addr, "localhost", "/ws"),
+                subprotocols: Vec::new(),
+            },
+            Duration::from_secs(5),
+        )
+        .expect("connect call")
+    {
+        CallOutcome::Replied(WebSocketClientReply::Connected(Err(
+            tina_http::WebSocketClientError::Connect,
+        ))) => {}
+        other => panic!("expected typed connect error, got {other:?}"),
+    }
+    match runtime
+        .call_blocking(client, WebSocketClientMsg::Report, Duration::from_secs(5))
+        .expect("report")
+    {
+        CallOutcome::Replied(WebSocketClientReply::Report(report)) => {
+            assert_eq!(report.state, tina_http::WebSocketClientState::Closed);
+        }
+        other => panic!("expected report after failed connect, got {other:?}"),
+    }
+    let _ = runtime.shutdown();
+}
+
+#[test]
 fn native_websocket_client_bad_peer_masked_server_frame_is_protocol_error() {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind bad peer");
     let addr = listener.local_addr().expect("local addr");
@@ -818,6 +984,193 @@ fn native_websocket_client_bad_peer_masked_server_frame_is_protocol_error() {
             assert_eq!(report.state, tina_http::WebSocketClientState::Closed);
         }
         other => panic!("expected report, got {other:?}"),
+    }
+    server.join().expect("bad peer thread");
+    let _ = runtime.shutdown();
+}
+
+#[test]
+fn native_websocket_client_bad_handshake_requires_upgrade_headers() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind bad peer");
+    let addr = listener.local_addr().expect("local addr");
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("read timeout");
+        let request = read_upgrade_head(&mut stream);
+        let key = sec_websocket_key_from_request(&request);
+        let accept = websocket_accept_for_key(&key);
+        write!(
+            stream,
+            "HTTP/1.1 101 Switching Protocols\r\n\
+             Sec-WebSocket-Accept: {accept}\r\n\r\n"
+        )
+        .expect("write bad upgrade");
+    });
+
+    let runtime = ThreadedRuntime::with_config(
+        TestShard,
+        DefaultThreadedMailboxFactory,
+        ThreadedRuntimeConfig {
+            command_capacity: 64,
+            idle_wait: Duration::from_millis(1),
+            ..Default::default()
+        },
+    );
+    let client = runtime
+        .register_with_capacity::<WebSocketClientConnection<TestShard>, Infallible>(
+            WebSocketClientConnection::new(WebSocketLimits::default()),
+            16,
+        )
+        .expect("register websocket client");
+    match runtime
+        .call_blocking(
+            client,
+            WebSocketClientMsg::Connect {
+                target: WebSocketTarget::ws(addr, "localhost", "/ws"),
+                subprotocols: Vec::new(),
+            },
+            Duration::from_secs(5),
+        )
+        .expect("connect call")
+    {
+        CallOutcome::Replied(WebSocketClientReply::Connected(Err(
+            tina_http::WebSocketClientError::BadHandshake,
+        ))) => {}
+        other => panic!("expected bad handshake, got {other:?}"),
+    }
+    server.join().expect("bad peer thread");
+    let _ = runtime.shutdown();
+}
+
+#[test]
+fn native_websocket_client_rejects_unoffered_server_subprotocol() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind bad peer");
+    let addr = listener.local_addr().expect("local addr");
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("read timeout");
+        let request = read_upgrade_head(&mut stream);
+        let key = sec_websocket_key_from_request(&request);
+        let accept = websocket_accept_for_key(&key);
+        write!(
+            stream,
+            "HTTP/1.1 101 Switching Protocols\r\n\
+             Upgrade: websocket\r\n\
+             Connection: Upgrade\r\n\
+             Sec-WebSocket-Accept: {accept}\r\n\
+             Sec-WebSocket-Protocol: other.v1\r\n\r\n"
+        )
+        .expect("write bad subprotocol upgrade");
+    });
+
+    let runtime = ThreadedRuntime::with_config(
+        TestShard,
+        DefaultThreadedMailboxFactory,
+        ThreadedRuntimeConfig {
+            command_capacity: 64,
+            idle_wait: Duration::from_millis(1),
+            ..Default::default()
+        },
+    );
+    let client = runtime
+        .register_with_capacity::<WebSocketClientConnection<TestShard>, Infallible>(
+            WebSocketClientConnection::new(WebSocketLimits::default()),
+            16,
+        )
+        .expect("register websocket client");
+    match runtime
+        .call_blocking(
+            client,
+            WebSocketClientMsg::Connect {
+                target: WebSocketTarget::ws(addr, "localhost", "/ws"),
+                subprotocols: vec!["chat.v1".to_owned()],
+            },
+            Duration::from_secs(5),
+        )
+        .expect("connect call")
+    {
+        CallOutcome::Replied(WebSocketClientReply::Connected(Err(
+            tina_http::WebSocketClientError::UnsupportedSubprotocol,
+        ))) => {}
+        other => panic!("expected unsupported subprotocol, got {other:?}"),
+    }
+    server.join().expect("bad peer thread");
+    let _ = runtime.shutdown();
+}
+
+#[test]
+fn native_websocket_client_bad_close_payload_is_protocol_error() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind bad peer");
+    let addr = listener.local_addr().expect("local addr");
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("read timeout");
+        let request = read_upgrade_head(&mut stream);
+        let key = sec_websocket_key_from_request(&request);
+        let accept = websocket_accept_for_key(&key);
+        write!(
+            stream,
+            "HTTP/1.1 101 Switching Protocols\r\n\
+             Upgrade: websocket\r\n\
+             Connection: Upgrade\r\n\
+             Sec-WebSocket-Accept: {accept}\r\n\r\n"
+        )
+        .expect("write upgrade");
+        stream
+            .write_all(&unmasked_frame(0x8, &[0x03]))
+            .expect("write bad close");
+    });
+
+    let runtime = ThreadedRuntime::with_config(
+        TestShard,
+        DefaultThreadedMailboxFactory,
+        ThreadedRuntimeConfig {
+            command_capacity: 64,
+            idle_wait: Duration::from_millis(1),
+            ..Default::default()
+        },
+    );
+    let client = runtime
+        .register_with_capacity::<WebSocketClientConnection<TestShard>, Infallible>(
+            WebSocketClientConnection::new(WebSocketLimits::default()),
+            16,
+        )
+        .expect("register websocket client");
+    assert!(matches!(
+        runtime
+            .call_blocking(
+                client,
+                WebSocketClientMsg::Connect {
+                    target: WebSocketTarget::ws(addr, "localhost", "/ws"),
+                    subprotocols: Vec::new(),
+                },
+                Duration::from_secs(5),
+            )
+            .expect("connect call"),
+        CallOutcome::Replied(WebSocketClientReply::Connected(Ok(_)))
+    ));
+    match runtime
+        .call_blocking(client, WebSocketClientMsg::Receive, Duration::from_secs(5))
+        .expect("receive protocol close")
+    {
+        CallOutcome::Replied(WebSocketClientReply::Event(Ok(WebSocketClientEvent::Close {
+            code,
+            reason,
+        }))) => {
+            assert_eq!(code, Some(WebSocketCloseCode(1002)));
+            assert!(
+                String::from_utf8(reason)
+                    .expect("reason utf8")
+                    .contains("InvalidClosePayload")
+            );
+        }
+        other => panic!("expected protocol close event, got {other:?}"),
     }
     server.join().expect("bad peer thread");
     let _ = runtime.shutdown();

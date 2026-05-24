@@ -79,6 +79,7 @@ pub enum WebSocketClientError {
     Busy,
     NotConnected,
     Closed,
+    InvalidTarget,
     Connect,
     Tls(CallError),
     Write,
@@ -294,9 +295,23 @@ impl<S: Shard + 'static> WebSocketClientConnection<S> {
                 WebSocketClientReply::Connected(Err(WebSocketClientError::Busy)),
             );
         }
+        if !valid_target(&target) || !subprotocols.iter().all(|p| is_subprotocol_token(p)) {
+            return reply_to_ws(
+                reply_to,
+                WebSocketClientReply::Connected(Err(WebSocketClientError::InvalidTarget)),
+            );
+        }
         let key = client_key(self.mask_seed);
         let request = encode_upgrade_request(&target, &key, &subprotocols);
         self.state = WebSocketClientState::Connecting;
+        self.close_sent = false;
+        self.close_received = false;
+        self.selected_subprotocol = None;
+        self.events.clear();
+        self.pending_write.clear();
+        self.write_queue.clear();
+        self.queued_write_bytes = 0;
+        self.read_buf.clear();
         self.report.state = self.state;
         self.pending_connect = Some(PendingConnect {
             key,
@@ -373,7 +388,14 @@ impl<S: Shard + 'static> WebSocketClientConnection<S> {
                 };
                 let expected = crate::websocket::websocket_accept_key_for_client(&pending.key);
                 if head.status != StatusCode::SWITCHING_PROTOCOLS {
-                    return self.fail_connect(WebSocketClientError::BadHandshake);
+                    return self
+                        .fail_connect_reply(WebSocketClientError::BadHandshake, pending.reply_to);
+                }
+                if !header_has_token(&head.headers, http::header::UPGRADE, "websocket")
+                    || !header_has_token(&head.headers, http::header::CONNECTION, "upgrade")
+                {
+                    return self
+                        .fail_connect_reply(WebSocketClientError::BadHandshake, pending.reply_to);
                 }
                 if head
                     .headers
@@ -381,7 +403,10 @@ impl<S: Shard + 'static> WebSocketClientConnection<S> {
                     .and_then(|v| v.to_str().ok())
                     != Some(expected.as_str())
                 {
-                    return self.fail_connect(WebSocketClientError::AcceptMismatch);
+                    return self.fail_connect_reply(
+                        WebSocketClientError::AcceptMismatch,
+                        pending.reply_to,
+                    );
                 }
                 let selected = head
                     .headers
@@ -390,7 +415,10 @@ impl<S: Shard + 'static> WebSocketClientConnection<S> {
                     .map(str::to_owned);
                 if let Some(selected) = &selected {
                     if !pending.subprotocols.iter().any(|p| p == selected) {
-                        return self.fail_connect(WebSocketClientError::UnsupportedSubprotocol);
+                        return self.fail_connect_reply(
+                            WebSocketClientError::UnsupportedSubprotocol,
+                            pending.reply_to,
+                        );
                     }
                 }
                 self.read_buf.drain(..head_len);
@@ -420,6 +448,12 @@ impl<S: Shard + 'static> WebSocketClientConnection<S> {
             return call.reply(WebSocketClientReply::Sent(Err(
                 WebSocketClientError::NotConnected,
             )));
+        }
+        if let WebSocketMessage::Close(code, reason) = message {
+            return batch(vec![
+                call.reply(WebSocketClientReply::Sent(Ok(()))),
+                self.enqueue_close(code, reason),
+            ]);
         }
         match self.enqueue_message(message) {
             Ok(()) => batch(vec![
@@ -457,14 +491,16 @@ impl<S: Shard + 'static> WebSocketClientConnection<S> {
                 FrameParse::Frame(frame) => match frame.opcode {
                     0x1 => match String::from_utf8(frame.payload) {
                         Ok(text) => self.push_event(WebSocketClientEvent::Text(text)),
-                        Err(_) => return self.close_with(WebSocketCloseReason::ProtocolError),
+                        Err(_) => return self.fail_protocol(WebSocketError::ProtocolError),
                     },
                     0x2 => self.push_event(WebSocketClientEvent::Binary(frame.payload)),
                     0x8 => {
                         self.close_received = true;
                         self.report.close_received = true;
-                        let (code, reason) = decode_close_payload(&frame.payload)
-                            .unwrap_or((Some(WebSocketCloseCode(1002)), Vec::new()));
+                        let (code, reason) = match decode_close_payload(&frame.payload) {
+                            Ok(decoded) => decoded,
+                            Err(error) => return self.fail_protocol(error),
+                        };
                         self.push_event(WebSocketClientEvent::Close { code, reason });
                         effects.push(self.enqueue_close(code, Vec::new()));
                         effects
@@ -520,6 +556,8 @@ impl<S: Shard + 'static> WebSocketClientConnection<S> {
     fn enqueue_message(&mut self, message: WebSocketMessage) -> Result<(), WebSocketError> {
         let bytes = encode_client_message(message, self.next_mask())?;
         if self.pending_write.is_empty() && !self.write_in_flight {
+            self.report.high_water_outbound_bytes =
+                self.report.high_water_outbound_bytes.max(bytes.len());
             self.pending_write = bytes;
         } else {
             if self.write_queue.len() >= self.limits.outbound_frame_queue_capacity {
@@ -615,17 +653,21 @@ impl<S: Shard + 'static> WebSocketClientConnection<S> {
         if self.state != WebSocketClientState::Open {
             return false;
         }
-        match self.transport {
-            Some(ClientTransport::Tcp(_)) => true,
-            Some(ClientTransport::Tls(_)) => self.pending_receive.is_some(),
-            None => false,
-        }
+        self.transport.is_some() && self.pending_receive.is_some()
     }
 
     fn fail_connect(&mut self, error: WebSocketClientError) -> Effect<Self> {
+        let reply_to = self.pending_connect.take().and_then(|p| p.reply_to);
+        self.fail_connect_reply(error, reply_to)
+    }
+
+    fn fail_connect_reply(
+        &mut self,
+        error: WebSocketClientError,
+        reply_to: Option<RequestContext<WebSocketClientReply>>,
+    ) -> Effect<Self> {
         self.state = WebSocketClientState::Closed;
         self.report.state = self.state;
-        let reply_to = self.pending_connect.take().and_then(|p| p.reply_to);
         batch(vec![
             reply_to_ws(reply_to, WebSocketClientReply::Connected(Err(error))),
             self.close_transport(),
@@ -650,7 +692,7 @@ impl<S: Shard + 'static> WebSocketClientConnection<S> {
 
     fn close_transport(&mut self) -> Effect<Self> {
         let Some(transport) = self.transport.take() else {
-            return stop();
+            return noop();
         };
         match transport {
             ClientTransport::Tcp(stream) => {
@@ -725,4 +767,51 @@ fn encode_upgrade_request(target: &WebSocketTarget, key: &str, subprotocols: &[S
     }
     request.push_str("\r\n");
     request.into_bytes()
+}
+
+fn valid_target(target: &WebSocketTarget) -> bool {
+    let (host, path) = match target {
+        WebSocketTarget::Ws { host, path, .. } | WebSocketTarget::Wss { host, path, .. } => {
+            (host, path)
+        }
+    };
+    !host.is_empty()
+        && !host.bytes().any(|b| matches!(b, b'\r' | b'\n'))
+        && path.starts_with('/')
+        && !path.bytes().any(|b| matches!(b, b'\r' | b'\n'))
+}
+
+fn header_has_token(headers: &http::HeaderMap, name: http::HeaderName, token: &str) -> bool {
+    headers.get_all(name).iter().any(|value| {
+        value.to_str().ok().is_some_and(|s| {
+            s.split(',')
+                .any(|part| part.trim().eq_ignore_ascii_case(token))
+        })
+    })
+}
+
+fn is_subprotocol_token(token: &str) -> bool {
+    !token.is_empty()
+        && token.bytes().all(|b| {
+            matches!(
+                b,
+                b'!' | b'#'
+                    | b'$'
+                    | b'%'
+                    | b'&'
+                    | b'\''
+                    | b'*'
+                    | b'+'
+                    | b'-'
+                    | b'.'
+                    | b'^'
+                    | b'_'
+                    | b'`'
+                    | b'|'
+                    | b'~'
+                    | b'0'..=b'9'
+                    | b'A'..=b'Z'
+                    | b'a'..=b'z'
+            )
+        })
 }
