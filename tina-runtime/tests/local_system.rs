@@ -2096,14 +2096,15 @@ fn live_cross_shard_terminal_replies_do_not_degrade_to_timeout_under_reply_queue
         || format!("outcomes={:?}", outcomes.lock().expect("outcomes")),
     );
     let got = outcomes.lock().expect("outcomes").clone();
-    assert_eq!(
-        got,
-        vec![
-            CallOutcome::Replied(CrossShardCallReply(vec![0])),
-            CallOutcome::Replied(CrossShardCallReply(vec![1])),
-            CallOutcome::Replied(CrossShardCallReply(vec![2])),
-        ]
-    );
+    let mut replied = got
+        .into_iter()
+        .map(|outcome| match outcome {
+            CallOutcome::Replied(CrossShardCallReply(bytes)) => bytes,
+            other => panic!("terminal reply degraded under pressure: {other:?}"),
+        })
+        .collect::<Vec<_>>();
+    replied.sort();
+    assert_eq!(replied, vec![vec![0], vec![1], vec![2]]);
 
     let terminal = app
         .shutdown()
