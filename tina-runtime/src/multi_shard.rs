@@ -16,8 +16,8 @@ use crate::mailbox::MailboxFactory;
 use crate::sharded::ReplyAdapter;
 use crate::trace::{RuntimeEvent, SendRejectedReason};
 use crate::{
-    IdSource, IntoErasedSpawn, IntoErasedSpawnObserved, IntoSendErasedSpawnObserved,
-    QueuedRemoteEnvelope, Runtime,
+    ChildRestartedWaiter, IdSource, IntoErasedSpawn, IntoErasedSpawnObserved,
+    IntoSendErasedSpawnObserved, QueuedRemoteEnvelope, Runtime,
 };
 
 type RemoteQueueIndexes = BTreeMap<(ShardId, ShardId), usize>;
@@ -301,6 +301,18 @@ where
         self.runtimes[index].child_lifecycle_report(parent)
     }
 
+    /// Registers a typed waiter for the next child restart reported on the
+    /// parent's owning shard. Cross-shard child restarts resolve here with the
+    /// replacement shard/isolate/generation, so callers do not need to mine the
+    /// trace for replacement addresses.
+    pub fn observe_child_restarted<M: 'static, R>(
+        &mut self,
+        parent: Address<M, R>,
+    ) -> ChildRestartedWaiter {
+        self.runtime_mut(parent.shard())
+            .observe_child_restarted(parent)
+    }
+
     /// Attempts one typed global ingress send routed strictly by target shard.
     pub fn try_send<M: 'static, R>(
         &self,
@@ -447,6 +459,7 @@ fn enqueue_remote_envelope_preserving_terminal(
         QueuedRemoteEnvelope::CallReply(_)
             | QueuedRemoteEnvelope::SpawnReply(_)
             | QueuedRemoteEnvelope::ChildStopped(_)
+            | QueuedRemoteEnvelope::ChildRestarted(_)
     );
     let queue = if terminal {
         &mut buffers.next_terminal[queue_index]

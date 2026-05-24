@@ -30,6 +30,8 @@ pub(crate) enum QueuedRemoteEnvelope {
     SpawnCancel(RemoteSpawnCancel),
     ChildStop(RemoteChildStop),
     ChildStopped(RemoteChildStopped),
+    ChildRestart(RemoteChildRestart),
+    ChildRestarted(RemoteChildRestarted),
 }
 
 impl QueuedRemoteEnvelope {
@@ -42,6 +44,8 @@ impl QueuedRemoteEnvelope {
             Self::SpawnCancel(cancel) => cancel.target_shard,
             Self::ChildStop(stop) => stop.child.shard,
             Self::ChildStopped(stopped) => stopped.owner.shard,
+            Self::ChildRestart(restart) => restart.child.shard,
+            Self::ChildRestarted(restarted) => restarted.owner.shard,
         }
     }
 }
@@ -86,6 +90,21 @@ pub(crate) struct RemoteChildStopped {
     pub(crate) owner: RegisteredAddress,
     pub(crate) child: RegisteredAddress,
     pub(crate) child_ordinal: usize,
+    pub(crate) cause: CauseId,
+}
+
+pub(crate) struct RemoteChildRestart {
+    pub(crate) owner: RegisteredAddress,
+    pub(crate) child: RegisteredAddress,
+    pub(crate) child_ordinal: usize,
+    pub(crate) cause: CauseId,
+}
+
+pub(crate) struct RemoteChildRestarted {
+    pub(crate) owner: RegisteredAddress,
+    pub(crate) child_ordinal: usize,
+    pub(crate) old_child: RegisteredAddress,
+    pub(crate) outcome: Result<RegisteredAddress, crate::RestartSkippedReason>,
     pub(crate) cause: CauseId,
 }
 
@@ -165,6 +184,8 @@ pub(crate) enum SendableQueuedRemoteEnvelope {
     SpawnCancel(RemoteSpawnCancel),
     ChildStop(RemoteChildStop),
     ChildStopped(RemoteChildStopped),
+    ChildRestart(RemoteChildRestart),
+    ChildRestarted(RemoteChildRestarted),
 }
 
 impl SendableQueuedRemoteEnvelope {
@@ -183,6 +204,8 @@ impl SendableQueuedRemoteEnvelope {
             QueuedRemoteEnvelope::SpawnCancel(cancel) => Self::SpawnCancel(cancel),
             QueuedRemoteEnvelope::ChildStop(stop) => Self::ChildStop(stop),
             QueuedRemoteEnvelope::ChildStopped(stopped) => Self::ChildStopped(stopped),
+            QueuedRemoteEnvelope::ChildRestart(restart) => Self::ChildRestart(restart),
+            QueuedRemoteEnvelope::ChildRestarted(restarted) => Self::ChildRestarted(restarted),
         }
     }
 
@@ -197,6 +220,8 @@ impl SendableQueuedRemoteEnvelope {
             Self::SpawnCancel(cancel) => QueuedRemoteEnvelope::SpawnCancel(cancel),
             Self::ChildStop(stop) => QueuedRemoteEnvelope::ChildStop(stop),
             Self::ChildStopped(stopped) => QueuedRemoteEnvelope::ChildStopped(stopped),
+            Self::ChildRestart(restart) => QueuedRemoteEnvelope::ChildRestart(restart),
+            Self::ChildRestarted(restarted) => QueuedRemoteEnvelope::ChildRestarted(restarted),
         }
     }
 }
@@ -341,6 +366,13 @@ where
             QueuedRemoteEnvelope::ChildStop(stop) => self.harvest_remote_child_stop(stop),
             QueuedRemoteEnvelope::ChildStopped(stopped) => {
                 self.harvest_remote_child_stopped(stopped);
+                None
+            }
+            QueuedRemoteEnvelope::ChildRestart(restart) => {
+                self.harvest_remote_child_restart(restart)
+            }
+            QueuedRemoteEnvelope::ChildRestarted(restarted) => {
+                self.harvest_remote_child_restarted(restarted);
                 None
             }
         }
@@ -494,6 +526,66 @@ where
                 child_generation: stopped.child.generation,
             },
         );
+    }
+
+    pub(crate) fn harvest_remote_child_restart(
+        &mut self,
+        restart: RemoteChildRestart,
+    ) -> Option<QueuedRemoteEnvelope> {
+        self.restart_remote_owned_child(
+            restart.owner,
+            restart.child,
+            restart.child_ordinal,
+            restart.cause,
+        )
+    }
+
+    pub(crate) fn harvest_remote_child_restarted(&mut self, restarted: RemoteChildRestarted) {
+        let Some(record_index) = self.child_records.iter().position(|record| {
+            record.parent == restarted.owner.isolate
+                && record.remote_owner.is_none()
+                && record.child_ordinal == restarted.child_ordinal
+                && record.child == restarted.old_child
+        }) else {
+            return;
+        };
+        match restarted.outcome {
+            Ok(new_child) => {
+                self.child_records[record_index].child = new_child;
+                self.push_event(
+                    restarted.owner.isolate,
+                    Some(restarted.cause),
+                    RuntimeEventKind::RestartChildCompleted {
+                        child_ordinal: restarted.child_ordinal,
+                        old_isolate: restarted.old_child.isolate,
+                        old_generation: restarted.old_child.generation,
+                        new_isolate: new_child.isolate,
+                        new_generation: new_child.generation,
+                    },
+                );
+                self.observation.notify_child_restarted(
+                    restarted.owner.isolate,
+                    crate::observation::ChildRestarted {
+                        child_ordinal: restarted.child_ordinal,
+                        new_shard: new_child.shard,
+                        new_isolate: new_child.isolate,
+                        new_generation: new_child.generation,
+                    },
+                );
+            }
+            Err(reason) => {
+                self.push_event(
+                    restarted.owner.isolate,
+                    Some(restarted.cause),
+                    RuntimeEventKind::RestartChildSkipped {
+                        child_ordinal: restarted.child_ordinal,
+                        old_isolate: restarted.old_child.isolate,
+                        old_generation: restarted.old_child.generation,
+                        reason,
+                    },
+                );
+            }
+        }
     }
 
     pub(crate) fn harvest_remote_send(

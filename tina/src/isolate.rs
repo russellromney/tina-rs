@@ -964,3 +964,11 @@ where
     type Message = I::Message;
     type Reply = I::Reply;
 }
+
+impl<I> SpawnAddress for CrossShardRestartableChildDefinition<I>
+where
+    I: Isolate,
+{
+    type Message = I::Message;
+    type Reply = I::Reply;
+}

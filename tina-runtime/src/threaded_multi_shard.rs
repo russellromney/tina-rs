@@ -470,6 +470,18 @@ where
         .and_then(|report| report.map_err(|_| ThreadedRuntimeError::WorkerStopped))
     }
 
+    /// Registers a typed waiter for the next child restart reported on the
+    /// parent's owning shard. Remote child restarts resolve through the owner
+    /// shard with the replacement address fields.
+    pub fn observe_child_restarted<M: 'static, R: 'static>(
+        &self,
+        parent: Address<M, R>,
+    ) -> Result<observation::ChildRestartedWaiter, ThreadedRuntimeError> {
+        self.call_on(parent.shard(), move |runtime| {
+            runtime.observe_child_restarted(parent)
+        })
+    }
+
     /// Attempts bounded ingress to the worker that owns `address`.
     pub fn try_send<M: Send + 'static, R: 'static>(
         &self,
@@ -917,6 +929,7 @@ where
                     QueuedRemoteEnvelope::CallReply(_)
                         | QueuedRemoteEnvelope::SpawnReply(_)
                         | QueuedRemoteEnvelope::ChildStopped(_)
+                        | QueuedRemoteEnvelope::ChildRestarted(_)
                 );
                 let metrics = remote_wiring
                     .queue_metrics
@@ -1091,6 +1104,7 @@ fn route_remote_preserving_terminal(
                     QueuedRemoteEnvelope::CallReply(_)
                         | QueuedRemoteEnvelope::SpawnReply(_)
                         | QueuedRemoteEnvelope::ChildStopped(_)
+                        | QueuedRemoteEnvelope::ChildRestarted(_)
                 ) =>
         {
             terminal_overflow.push_back(failure.envelope);
@@ -1115,6 +1129,7 @@ fn drain_terminal_overflow(
                         QueuedRemoteEnvelope::CallReply(_)
                             | QueuedRemoteEnvelope::SpawnReply(_)
                             | QueuedRemoteEnvelope::ChildStopped(_)
+                            | QueuedRemoteEnvelope::ChildRestarted(_)
                     ) =>
             {
                 terminal_overflow.push_front(failure.envelope);

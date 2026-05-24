@@ -31,8 +31,8 @@ use crate::driver::DriverShutdownError;
 use crate::fact::{IntoRuntimeFact, RuntimeFact};
 use crate::mailbox::MailboxFactory;
 use crate::remote::{
-    QueuedRemoteEnvelope, QueuedRemoteSend, RemoteCallOutcome, RemoteCallReply, RemoteChildStop,
-    RemoteSpawnCancel, RemoteSpawnRequest,
+    QueuedRemoteEnvelope, QueuedRemoteSend, RemoteCallOutcome, RemoteCallReply, RemoteChildRestart,
+    RemoteChildRestarted, RemoteChildStop, RemoteSpawnCancel, RemoteSpawnRequest,
 };
 use crate::trace::{
     CallCompletionRejectedReason, CallKind, CallReplyRejectedReason, CauseId,
@@ -239,7 +239,9 @@ where
                 | QueuedRemoteEnvelope::SpawnReply(_)
                 | QueuedRemoteEnvelope::SpawnCancel(_)
                 | QueuedRemoteEnvelope::ChildStop(_)
-                | QueuedRemoteEnvelope::ChildStopped(_) => {
+                | QueuedRemoteEnvelope::ChildStopped(_)
+                | QueuedRemoteEnvelope::ChildRestart(_)
+                | QueuedRemoteEnvelope::ChildRestarted(_) => {
                     panic!(
                         "cross-shard child control requires a multi-shard runtime: target shard {} != runtime shard {}",
                         target_shard.get(),
@@ -2279,6 +2281,16 @@ where
                 if self.child_records[child_record_index].child.shard != self.shard.id() {
                     let child = self.child_records[child_record_index].child;
                     let child_ordinal = self.child_records[child_record_index].child_ordinal;
+                    if self.child_records[child_record_index].remote_restartable {
+                        self.request_remote_child_restart(
+                            parent,
+                            child,
+                            child_ordinal,
+                            cause,
+                            route_remote,
+                        );
+                        continue;
+                    }
                     self.push_event(
                         parent,
                         Some(cause),
@@ -2294,6 +2306,51 @@ where
                 }
                 self.restart_child_record(parent, child_record_index, cause, round_messages);
             }
+        }
+    }
+
+    pub(crate) fn request_remote_child_restart(
+        &mut self,
+        parent: IsolateId,
+        child: RegisteredAddress,
+        child_ordinal: usize,
+        cause: CauseId,
+        route_remote: &mut impl FnMut(ShardId, QueuedRemoteEnvelope) -> Result<(), SendRejectedReason>,
+    ) {
+        let owner = RegisteredAddress {
+            shard: self.shard.id(),
+            isolate: parent,
+            generation: self
+                .entry_by_isolate(parent)
+                .map(|entry| entry.generation)
+                .unwrap_or_else(|| AddressGeneration::new(0)),
+        };
+        let attempted = self.push_event(
+            parent,
+            Some(cause),
+            RuntimeEventKind::RestartChildAttempted {
+                child_ordinal,
+                old_isolate: child.isolate,
+                old_generation: child.generation,
+            },
+        );
+        if let Err(reason) = route_remote(
+            self.shard.id(),
+            QueuedRemoteEnvelope::ChildRestart(RemoteChildRestart {
+                owner,
+                child,
+                child_ordinal,
+                cause: attempted.into(),
+            }),
+        ) {
+            self.push_event(
+                parent,
+                Some(attempted.into()),
+                RuntimeEventKind::RemoteChildControlRejected {
+                    target_shard: child.shard,
+                    reason,
+                },
+            );
         }
     }
 
@@ -2501,11 +2558,19 @@ where
         child_ordinal: usize,
         cause: CauseId,
     ) -> Option<QueuedRemoteEnvelope> {
-        let Some(entry_index) = self.entry_index(child) else {
+        let current_child = self
+            .child_records
+            .iter()
+            .find(|record| {
+                record.remote_owner == Some(owner) && record.child_ordinal == child_ordinal
+            })
+            .map(|record| record.child)
+            .unwrap_or(child);
+        let Some(entry_index) = self.entry_index(current_child) else {
             return Some(QueuedRemoteEnvelope::ChildStopped(
                 crate::remote::RemoteChildStopped {
                     owner,
-                    child,
+                    child: current_child,
                     child_ordinal,
                     cause,
                 },
@@ -2513,25 +2578,108 @@ where
         };
         if !self.entries[entry_index].stopped.get() {
             self.push_event(
-                child.isolate,
+                current_child.isolate,
                 Some(cause),
                 RuntimeEventKind::RemoteChildStopRequested {
-                    child_shard: child.shard,
+                    child_shard: current_child.shard,
                     child_ordinal,
-                    child_isolate: child.isolate,
-                    child_generation: child.generation,
+                    child_isolate: current_child.isolate,
+                    child_generation: current_child.generation,
                 },
             );
-            self.stop_entry(entry_index, child.isolate, cause);
+            self.stop_entry(entry_index, current_child.isolate, cause);
         }
         Some(QueuedRemoteEnvelope::ChildStopped(
             crate::remote::RemoteChildStopped {
                 owner,
-                child,
+                child: current_child,
                 child_ordinal,
                 cause,
             },
         ))
+    }
+
+    pub(crate) fn restart_remote_owned_child(
+        &mut self,
+        owner: RegisteredAddress,
+        child: RegisteredAddress,
+        child_ordinal: usize,
+        cause: CauseId,
+    ) -> Option<QueuedRemoteEnvelope> {
+        let Some(record_index) = self.child_records.iter().position(|record| {
+            record.remote_owner == Some(owner)
+                && record.child_ordinal == child_ordinal
+                && record.child == child
+        }) else {
+            return Some(QueuedRemoteEnvelope::ChildRestarted(RemoteChildRestarted {
+                owner,
+                child_ordinal,
+                old_child: child,
+                outcome: Err(RestartSkippedReason::RemoteNotRestartable),
+                cause,
+            }));
+        };
+        let Some(recipe) = self.child_records[record_index].restart_recipe.clone() else {
+            return Some(QueuedRemoteEnvelope::ChildRestarted(RemoteChildRestarted {
+                owner,
+                child_ordinal,
+                old_child: child,
+                outcome: Err(RestartSkippedReason::RemoteNotRestartable),
+                cause,
+            }));
+        };
+
+        if let Some(old_entry_index) = self.entry_index(child) {
+            if !self.entries[old_entry_index].stopped.get() {
+                self.stop_entry(old_entry_index, child.isolate, cause);
+            }
+        }
+
+        let outcome = match catch_unwind(AssertUnwindSafe(|| {
+            recipe.create_remote(self, owner, child_ordinal, cause)
+        })) {
+            Ok(Some(outcome)) => outcome,
+            Ok(None) => {
+                self.child_records[record_index].restart_recipe = Some(recipe);
+                return Some(QueuedRemoteEnvelope::ChildRestarted(RemoteChildRestarted {
+                    owner,
+                    child_ordinal,
+                    old_child: child,
+                    outcome: Err(RestartSkippedReason::RemoteNotRestartable),
+                    cause,
+                }));
+            }
+            Err(_) => {
+                self.child_records[record_index].restart_recipe = Some(recipe);
+                return Some(QueuedRemoteEnvelope::ChildRestarted(RemoteChildRestarted {
+                    owner,
+                    child_ordinal,
+                    old_child: child,
+                    outcome: Err(RestartSkippedReason::FactoryPanicked),
+                    cause,
+                }));
+            }
+        };
+
+        let new_child = outcome.child;
+        let bootstrap_message = outcome.bootstrap_message;
+        self.child_records[record_index].child = new_child;
+        self.child_records[record_index].mailbox_capacity = outcome.mailbox_capacity;
+        self.child_records[record_index].restart_recipe = Some(recipe);
+        self.child_records[record_index].remote_request_id = None;
+        self.child_records[record_index].remote_owner = Some(owner);
+
+        if let Some(message) = bootstrap_message {
+            self.enqueue_bootstrap_message(new_child, message, cause);
+        }
+
+        Some(QueuedRemoteEnvelope::ChildRestarted(RemoteChildRestarted {
+            owner,
+            child_ordinal,
+            old_child: child,
+            outcome: Ok(new_child),
+            cause,
+        }))
     }
 
     /// Delivers an observed-spawn continuation message to its owner (on this
@@ -2882,11 +3030,9 @@ where
             isolate: entry.id,
             generation: entry.generation,
         };
-        if self
-            .child_records
-            .iter()
-            .any(|record| record.parent == entry.id || record.child == address)
-        {
+        if self.child_records.iter().any(|record| {
+            (record.parent == entry.id && record.remote_owner.is_none()) || record.child == address
+        }) {
             return false;
         }
         if self
@@ -3096,6 +3242,16 @@ where
     F: MailboxFactory,
 {
     fn create(&self, runtime: &mut Runtime<S, F>, parent: IsolateId) -> SpawnOutcome<S, F>;
+
+    fn create_remote(
+        &self,
+        _runtime: &mut Runtime<S, F>,
+        _owner: RegisteredAddress,
+        _child_ordinal: usize,
+        _cause: CauseId,
+    ) -> Option<SpawnOutcome<S, F>> {
+        None
+    }
 }
 
 pub(crate) trait IntoErasedSpawn<S, F>
@@ -4081,6 +4237,29 @@ where
             self.mailbox_capacity,
             bootstrap_message,
         )
+    }
+
+    fn create_remote(
+        &self,
+        runtime: &mut Runtime<S, F>,
+        owner: RegisteredAddress,
+        _child_ordinal: usize,
+        _cause: CauseId,
+    ) -> Option<SpawnOutcome<S, F>> {
+        let isolate = (self.factory)();
+        let bootstrap_message = self.bootstrap_factory.as_ref().map(|f| f());
+        let outcome = runtime.spawn_isolate::<I, Outbound>(
+            owner.isolate,
+            isolate,
+            self.mailbox_capacity,
+            bootstrap_message,
+        );
+        if owner.shard != runtime.shard.id() {
+            if let Some(entry_index) = runtime.entry_index(outcome.child) {
+                runtime.entries[entry_index].parent = None;
+            }
+        }
+        Some(outcome)
     }
 }
 
