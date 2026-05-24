@@ -9,11 +9,19 @@
 
 mod common;
 
+use std::convert::Infallible;
+use std::net::TcpListener;
 use std::time::Duration;
 
-use common::{TestHarness, assert_status_and_body, assert_status_starts_with, scripted_request};
-use tina_http::HttpListenerMsg;
-use tina_runtime::{CallKind, RuntimeEventKind};
+use common::{
+    Counter, TestHarness, TestShard, assert_status_and_body, assert_status_starts_with,
+    scripted_request,
+};
+use tina_http::{HttpLimits, HttpListener, HttpListenerMsg, HttpStartupError};
+use tina_runtime::{
+    CallKind, CallOutcome, DefaultThreadedMailboxFactory, RuntimeEventKind, ThreadedRuntime,
+    ThreadedRuntimeConfig,
+};
 
 fn assert_connection_close(response: &[u8]) {
     let text = std::str::from_utf8(response).expect("http response is utf8");
@@ -50,16 +58,19 @@ fn native_http_server_serves_get_and_post() {
 
 #[test]
 fn second_start_does_not_rebind_or_leak_listener() {
-    // HttpListener's reply type is `()` so we can't surface a typed
-    // AlreadyStarted error here; the contract is that the second
-    // Start is a no-op and the trace shows exactly one TcpBind.
     let harness = TestHarness::start();
-    // TestHarness already sent Start once during start(). Send a
-    // second Start — should be a no-op.
     let runtime = harness.runtime_handle();
-    runtime
-        .try_send(harness.listener_address(), HttpListenerMsg::Start)
-        .expect("send second Start");
+    let duplicate = runtime
+        .call_blocking(
+            harness.listener_address(),
+            HttpListenerMsg::Start,
+            Duration::from_secs(2),
+        )
+        .expect("duplicate Start call returns");
+    assert_eq!(
+        duplicate,
+        CallOutcome::Replied(Err(HttpStartupError::AlreadyStarted))
+    );
 
     // Give the second Start a chance to run and any (incorrect)
     // second tcp_bind to land in the trace.
@@ -82,4 +93,44 @@ fn second_start_does_not_rebind_or_leak_listener() {
         tcp_bind_completions, 1,
         "exactly one tcp_bind should have completed (got {tcp_bind_completions})",
     );
+}
+
+#[test]
+fn startup_bind_error_is_returned_to_caller() {
+    let occupied = TcpListener::bind("127.0.0.1:0").expect("bind guard socket");
+    let bind_addr = occupied.local_addr().expect("guard local addr");
+    let runtime = ThreadedRuntime::with_config(
+        TestShard,
+        DefaultThreadedMailboxFactory,
+        ThreadedRuntimeConfig {
+            command_capacity: 64,
+            idle_wait: Duration::from_millis(1),
+            ..Default::default()
+        },
+    );
+    let service = runtime
+        .register_with_capacity::<Counter, Infallible>(Counter::default(), 16)
+        .expect("register counter");
+    let listener = runtime
+        .register_with_capacity::<HttpListener<TestShard>, _>(
+            HttpListener::new(
+                bind_addr,
+                service,
+                HttpLimits::default(),
+                Duration::from_secs(2),
+                16,
+            ),
+            8,
+        )
+        .expect("register listener");
+
+    let startup = runtime
+        .call_blocking(listener, HttpListenerMsg::Start, Duration::from_secs(2))
+        .expect("startup call returns");
+    match startup {
+        CallOutcome::Replied(Err(HttpStartupError::Bind { .. })) => {}
+        other => panic!("expected typed bind error, got {other:?}"),
+    }
+    drop(occupied);
+    runtime.shutdown().expect("shutdown");
 }

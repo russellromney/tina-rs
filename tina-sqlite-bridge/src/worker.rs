@@ -191,7 +191,7 @@ pub struct SqliteWorker<S: Shard + 'static> {
 /// Result of [`SqliteWorker::install`].
 pub struct InstalledSqliteBridge<S: Shard + 'static> {
     /// Tina address callers use with `call(...)`.
-    pub address: Address<SqliteMsg, SqliteResult>,
+    pub address: tina::CallAddress<SqliteMsg, SqliteResult>,
     /// Closer for graceful drain.
     pub closer: SqliteCloser,
     /// Metrics handle.
@@ -488,7 +488,7 @@ impl<S: Shard + Send + 'static> SqliteWorker<S> {
             .register_with_capacity::<_, Infallible>(worker, cap)
             .map_err(|e| InstallError::Register(format!("{e:?}")))?;
         Ok(InstalledSqliteBridge {
-            address,
+            address: address.callable(),
             closer,
             metrics,
             _shard: PhantomData,

@@ -86,7 +86,7 @@ let bridge = SqliteWorker::<SingleShard>::install(&runtime, cfg)?;
 
 // From the host thread. Service isolates should still use
 // execute_call(...).then(...) when they want a continuation message.
-let outcome = runtime.call_blocking(
+let outcome = runtime.call_blocking_typed(
     bridge.address,
     SqliteMsg::Request(SqliteRequest::execute(
         "UPDATE counter SET value = value + 1 WHERE id = 0",

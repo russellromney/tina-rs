@@ -777,7 +777,7 @@ impl Room {
 pub struct RoomServer {
     addr: SocketAddr,
     runtime: ThreadedRuntime<DemoShard, DefaultThreadedMailboxFactory>,
-    listener: Address<HttpListenerMsg>,
+    listener: tina_http::HttpListenerAddress,
     room: Address<WebSocketSessionMsg, WebSocketSessionOutcome>,
     report: Arc<SharedReport>,
 }
