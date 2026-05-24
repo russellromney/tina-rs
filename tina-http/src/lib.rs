@@ -239,9 +239,9 @@ pub use types::{
 pub use websocket::{
     WebSocketAccept, WebSocketCloseCode, WebSocketError, WebSocketLimits, WebSocketMessage,
     WebSocketOutboundQueue, WebSocketReportRequest, WebSocketSend, WebSocketSendError,
-    WebSocketSendOutcome, WebSocketSessionHandle, WebSocketSessionId, WebSocketSessionMsg,
-    WebSocketSessionOutcome, WebSocketSessionReport, WebSocketSessionReportOutcome,
-    WebSocketUpgradeRequest, websocket_upgrade,
+    WebSocketSendOutcome, WebSocketSessionControl, WebSocketSessionHandle, WebSocketSessionId,
+    WebSocketSessionMsg, WebSocketSessionOutcome, WebSocketSessionReport,
+    WebSocketSessionReportOutcome, WebSocketUpgradeRequest, websocket_upgrade,
 };
 pub use websocket_client::{
     WebSocketClientConnected, WebSocketClientConnection, WebSocketClientError,

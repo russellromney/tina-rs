@@ -758,7 +758,8 @@ impl Room {
             | WebSocketSessionMsg::Ping(_)
             | WebSocketSessionMsg::Pong(_)
             | WebSocketSessionMsg::Pressure(_)
-            | WebSocketSessionMsg::Closed(_) => reply(WebSocketSessionOutcome::None),
+            | WebSocketSessionMsg::Closed(_)
+            | WebSocketSessionMsg::AppControl(_) => reply(WebSocketSessionOutcome::None),
             WebSocketSessionMsg::SessionAccepted {
                 selected_subprotocol,
                 ..

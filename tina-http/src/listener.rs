@@ -234,13 +234,27 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Isolate for Http
                     tcp_accept(listener).then(HttpListenerMsg::Accepted),
                 ])
             }
-            HttpListenerMsg::Accepted(Err(_)) => {
-                // Accept failed (likely listener was closed). Drop into
-                // close path if still open, else stop.
-                if let Some(listener) = self.listener.take() {
-                    tcp_close_listener(listener).then(HttpListenerMsg::ListenerClosed)
-                } else {
-                    stop()
+            HttpListenerMsg::Accepted(Err(error)) => {
+                if self.stopping {
+                    return stop();
+                }
+                let Some(listener) = self.listener else {
+                    return stop();
+                };
+                match error {
+                    // A bad peer can make the substrate surface an
+                    // accept-side I/O error even though the listener
+                    // socket is still usable. Keep the front door alive;
+                    // the failed accept is already visible in the trace.
+                    CallError::Io => tcp_accept(listener).then(HttpListenerMsg::Accepted),
+                    _ => {
+                        self.stopping = true;
+                        if let Some(listener) = self.listener.take() {
+                            tcp_close_listener(listener).then(HttpListenerMsg::ListenerClosed)
+                        } else {
+                            stop()
+                        }
+                    }
                 }
             }
 

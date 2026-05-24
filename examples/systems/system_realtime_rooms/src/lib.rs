@@ -9,8 +9,8 @@
 //! - Recurring liveness tick: a single `sleep_then` self-reschedules the room
 //!   every `presence_tick`, broadcasts a heartbeat to every live member, and
 //!   evicts members whose last broadcast was older than `idle_evict`.
-//! - Explicit bootstrap message: the host sends one `Text("__bootstrap__")`
-//!   after register so the recurring tick starts. Forgetting this produces a
+//! - Explicit bootstrap control: the host sends `AppControl(Start)` after
+//!   register so the recurring tick starts. Forgetting this produces a
 //!   quiet room (Finding 22 in `examples/FINDINGS.md`).
 //! - Graceful shutdown via the public `WebSocketSessionMsg::Shutdown` variant,
 //!   which the room translates into bounded `handle.close_effect::<Room>`
@@ -29,15 +29,12 @@ use tina::prelude::*;
 use tina_http::{
     AdmitOutcome, HttpConnectionMsg, HttpLimits, HttpListener, HttpListenerMsg, HttpRequest,
     HttpResponse, SendOutcomeAction, WebSocketCloseCode, WebSocketError, WebSocketLimits,
-    WebSocketMemberTable, WebSocketSessionHandle, WebSocketSessionId, WebSocketSessionMsg,
-    WebSocketSessionOutcome, websocket_upgrade,
+    WebSocketMemberTable, WebSocketSessionControl, WebSocketSessionHandle, WebSocketSessionId,
+    WebSocketSessionMsg, WebSocketSessionOutcome, websocket_upgrade,
 };
 use tina_runtime::{
     DefaultThreadedMailboxFactory, RuntimeCall, ThreadedRuntime, ThreadedRuntimeConfig, sleep_then,
 };
-
-const BOOTSTRAP_TEXT: &str = "__bootstrap__";
-const TICK_PREFIX: &str = "__tick:";
 
 /// Tunables for one specimen run.
 #[derive(Debug, Clone, Copy)]
@@ -233,19 +230,12 @@ impl tina::CallableIsolate for Room {}
 impl Room {
     fn dispatch(&mut self, msg: WebSocketSessionMsg, now: Instant) -> Effect<Self> {
         match msg {
-            // ---- internal scheduling messages (encoded as Text) -----------
-            WebSocketSessionMsg::Text(text) if text == BOOTSTRAP_TEXT => self.on_bootstrap(),
-            WebSocketSessionMsg::Text(text)
-                if text
-                    .strip_prefix(TICK_PREFIX)
-                    .and_then(|n| n.parse::<u64>().ok())
-                    .is_some() =>
-            {
-                let generation = text
-                    .strip_prefix(TICK_PREFIX)
-                    .and_then(|n| n.parse::<u64>().ok())
-                    .expect("guard checked above");
+            WebSocketSessionMsg::AppControl(WebSocketSessionControl::Start) => self.on_bootstrap(),
+            WebSocketSessionMsg::AppControl(WebSocketSessionControl::Tick(generation)) => {
                 self.on_tick(generation, now)
+            }
+            WebSocketSessionMsg::AppControl(WebSocketSessionControl::Drain) => {
+                self.on_shutdown(Some(WebSocketCloseCode(1001)), b"server drain".to_vec())
             }
             // ---- session lifecycle ----------------------------------------
             WebSocketSessionMsg::SessionOpen { session } => self.on_session_open(session, now),
@@ -307,8 +297,10 @@ impl Room {
             return reply(WebSocketSessionOutcome::None);
         }
         self.tick_generation = self.tick_generation.saturating_add(1);
-        let label = format!("{TICK_PREFIX}{}", self.tick_generation);
-        sleep_then(self.presence_tick, WebSocketSessionMsg::Text(label))
+        sleep_then(
+            self.presence_tick,
+            WebSocketSessionMsg::AppControl(WebSocketSessionControl::Tick(self.tick_generation)),
+        )
     }
 
     fn on_tick(&mut self, generation: u64, now: Instant) -> Effect<Self> {
@@ -726,13 +718,12 @@ impl RoomServer {
             .expect("start listener");
         let addr = bound.wait(Duration::from_secs(2)).expect("bound address");
 
-        // Bootstrap the room's recurring tick. Forgetting this is the
-        // exact "quiet service" failure Finding 22 calls out. The bootstrap
-        // is an internal continuation: route it through the send lane.
+        // Bootstrap the room's recurring tick through the typed app-control
+        // lane. It is still an ordinary bounded message to the room.
         runtime
             .try_send(
                 room.send.address(),
-                WebSocketSessionMsg::Text(BOOTSTRAP_TEXT.into()),
+                WebSocketSessionMsg::AppControl(WebSocketSessionControl::Start),
             )
             .expect("bootstrap");
 
@@ -961,6 +952,12 @@ pub mod test_client {
     }
 
     impl Client {
+        pub fn send_text(&mut self, text: &str) -> anyhow::Result<()> {
+            self.ws
+                .send(Message::Text(text.to_owned().into()))
+                .map_err(anyhow::Error::from)
+        }
+
         pub fn recv_text_timeout(&mut self, timeout: Duration) -> RecvOutcome {
             if let MaybeTlsStream::Plain(stream) = self.ws.get_mut() {
                 let _ = stream.set_read_timeout(Some(timeout));

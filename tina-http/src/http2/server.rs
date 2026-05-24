@@ -2003,11 +2003,23 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Isolate for Http
                     tcp_accept(listener).then(Http2ListenerMsg::Accepted),
                 ])
             }
-            Http2ListenerMsg::Accepted(Err(_)) => {
-                if let Some(listener) = self.listener.take() {
-                    tcp_close_listener(listener).then(Http2ListenerMsg::ListenerClosed)
-                } else {
-                    stop()
+            Http2ListenerMsg::Accepted(Err(error)) => {
+                if self.stopping {
+                    return stop();
+                }
+                let Some(listener) = self.listener else {
+                    return stop();
+                };
+                match error {
+                    CallError::Io => tcp_accept(listener).then(Http2ListenerMsg::Accepted),
+                    _ => {
+                        self.stopping = true;
+                        if let Some(listener) = self.listener.take() {
+                            tcp_close_listener(listener).then(Http2ListenerMsg::ListenerClosed)
+                        } else {
+                            stop()
+                        }
+                    }
                 }
             }
             Http2ListenerMsg::Stop => {

@@ -1,0 +1,10 @@
+[package]
+name = "system_copied_service_path_smoke"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+system_copied_service_path = { path = "../system_copied_service_path" }
