@@ -12,8 +12,8 @@ in the deterministic trace. Replay sees the same fact in the same order.
 
 Today `RuntimeFact` has one family: `RuntimeFact::Protocol(ProtocolFact)`.
 The first protocol fact set covers HTTP/2 stream lifecycle and flow
-control, HTTP body high-water, WebSocket session lifecycle, and the
-native gRPC final status frame.
+control, HTTP body high-water, WebSocket server/client session lifecycle,
+and the native gRPC final status frame.
 
 ```rust
 use tina_runtime::{

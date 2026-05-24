@@ -15,10 +15,53 @@ That means:
 - upgrade code can inspect offered subprotocols/extensions and select one
   subprotocol for the `101` response.
 
-It does not mean HTTP/2 WebSocket, permessage-deflate compression, automatic
-reconnect, or a broad native WebSocket client crate.
+It does not mean HTTP/2 WebSocket, permessage-deflate compression, or automatic
+reconnect. The native client session lives in
+`WebSocketClientConnection`; it is one explicit client connection, not a
+pooled/reconnecting client manager.
 Browser extension offers such as `permessage-deflate` are ignored unless Tina
 explicitly negotiates an extension in the future.
+
+## Native Client
+
+`WebSocketClientConnection` is the client-side match for this server shape. A
+caller registers the isolate, calls `WebSocketClientMsg::Connect` with a
+`WebSocketTarget::ws(...)` or `WebSocketTarget::wss(...)`, then uses bounded
+`Send`, `Receive`, and `Report` calls:
+
+```rust,ignore
+use tina_http::{
+    WebSocketClientConnection, WebSocketClientMsg, WebSocketMessage,
+    WebSocketTarget,
+};
+
+let client = runtime.register_with_capacity::<WebSocketClientConnection<S>, _>(
+    WebSocketClientConnection::new(Default::default()),
+    16,
+)?;
+let connected = runtime.call_blocking(
+    client,
+    WebSocketClientMsg::Connect {
+        target: WebSocketTarget::ws(addr, "localhost", "/room"),
+        subprotocols: vec!["tina.room.v1".to_owned()],
+    },
+    timeout,
+)?;
+let sent = runtime.call_blocking(
+    client,
+    WebSocketClientMsg::Send(WebSocketMessage::Text("hello".to_owned())),
+    timeout,
+)?;
+let next = runtime.call_blocking(client, WebSocketClientMsg::Receive, timeout)?;
+```
+
+The client owns ping/pong and close-handshake facts without hiding pressure:
+send and receive are ordinary bounded calls; `Receive` before connection
+returns a typed `NotConnected` outcome; `Send` after a terminal close returns
+typed `Closed`; `Report` returns queued events, queued outbound frames/bytes,
+outbound full counters, high-water counts, close flags, and lifecycle state.
+There is no hidden reconnect or unbounded background stream: inbound reads are
+armed by a caller's `Receive` pull, except for the initial handshake.
 
 ## Copy Path
 
@@ -225,9 +268,9 @@ reports describe live operator state, facts describe replay truth.
 
 ## What This Is Not
 
-This is a usable bounded server surface, not the final WebSocket product
-story. Before Tina should call WebSockets "fully ready" from a user
-perspective, it still needs at least a standards/compliance pass, automated
-Autobahn classification, simulator/live-replay facts for the byte path, and a
-product decision on Tina-native client support versus documented external
-clients.
+This is a usable bounded server plus native client-session surface, not the
+final WebSocket product story. Before Tina should call WebSockets "fully
+ready" from a user perspective, it still needs at least a standards/compliance
+pass, automated Autobahn classification, simulator/live-replay facts for the
+byte path, and a product decision on whether pooled/reconnecting client
+managers belong in core or an extension crate.

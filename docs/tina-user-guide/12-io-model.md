@@ -154,6 +154,26 @@ What ships:
 - tonic `0.12` h2c interop against the specimen for unary,
   server-streaming, client-streaming, and bidirectional streaming.
 
+## Native WebSocket Client
+
+`tina-http::WebSocketClientConnection` is the native WebSocket client
+session. It owns a TCP or TLS rail, performs the HTTP/1.1 upgrade, masks
+client frames, parses server frames, auto-answers ping with pong, exposes
+typed send/receive/report calls, and emits WebSocket close facts through
+the runtime trace.
+
+It is session-shaped on purpose: no hidden reconnect, no retry loop, no
+unbounded receive stream, and no Tokio fallback. The caller registers one
+client connection isolate, calls `WebSocketClientMsg::Connect`, then uses
+bounded `Send`, `Receive`, and `Report` calls. `Receive` arms the next inbound
+read after the handshake, so a peer cannot fill an invisible background receive
+queue while the app is not pulling. `WebSocketTarget` carries the explicit
+`Host`, path, and for `wss`, SNI plus DER trust roots.
+
+What does not ship yet: permessage-deflate, Autobahn compliance
+classification, HTTP/2 WebSocket, proxy/cookie/redirect behavior, and a
+pooled/reconnecting client manager.
+
 What does not ship yet:
 
 - grpcurl scripts or reflection;
