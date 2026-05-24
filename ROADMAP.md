@@ -371,8 +371,7 @@ and reviews live under `.intent/phases/`.
   hardening follow-ups.
 
 These are recorded in `CHANGELOG.md`; the remaining near-term roadmap now
-starts with ergonomics, cross-shard ownership, join/select helpers, and trace
-timeline export below.
+starts with ergonomics, cross-shard ownership, and trace timeline export below.
 
 ## Near-term roadmap
 
@@ -382,9 +381,8 @@ framework before public release-story work.
 | Phase | Purpose |
 |---|---|
 | **120 Post-Wave ergonomics** | Digest the now-landed Wave A/post-122 features into one copied service path: protocol clients, file/codec/local IPC, admission/rate policy, mature pools, durable outbox, supervision/fairness reports, shutdown, updated findings, and cheap-model proof. Plan outline: `.intent/phases/120-post-wave-a-ergonomics/plan.md`. |
-| **Cross-shard child ownership** | Follow-up to observed cross-shard spawn: remote owner links, cross-shard stop/restart/address-change truth, stale replacement addresses, and reports that do not require trace spelunking. Must preserve bounded remote queues and replay truth. |
-| **Join-all / stream-select helpers** | First-success `CallGroup` exists. Add join-all and stream-select only when a real specimen needs them, preserving branch identity, bounded pending/result storage, explicit cancellation, partial results, and late-reply trace truth. |
-| **Trace timeline export** | Keep Tina's native `RuntimeEvent` trace canonical, then add an offline timeline exporter. V1 emits simple Chrome Trace Event JSON from `TraceSnapshot` / shutdown traces: shard and isolate metadata rows, duration slices for handler turns and runtime calls where timestamps exist, instant markers for `Full` / `Closed` / `Timeout` / late-reply / restart / shutdown facts, counter rows for mailbox, shard-pair, body, pool, and lane pressure, and causal flow ids from Tina cause/call ids. Add a tiny CLI or example command that writes `*.trace.json`, plus one `mini_saas_api` smoke artifact that opens in `chrome://tracing` and Perfetto UI. V2 adds Perfetto-compatible protobuf export once the Chrome mapping proves useful, with optional PerfettoSQL-friendly columns for event kind, isolate id, call id, cause id, and capacity surface. No live daemon integration, no replacement of DST/replay artifacts, and no hidden unbounded event sink. |
+| **129 Cross-shard child ownership** | Follow-up to observed cross-shard spawn: remote owner links, cross-shard stop/restart/address-change truth, stale replacement addresses, and reports that do not require trace spelunking. Must preserve bounded remote queues and replay truth. Plan: `.intent/phases/129-cross-shard-child-ownership/plan.md`. |
+| **130 Trace timeline export** | Keep Tina's native `RuntimeEvent` trace canonical, then add an offline Chrome Trace JSON exporter from `TraceSnapshot` / shutdown traces. Use logical event-id time, not fake wall-clock time. Include shard/isolate metadata, handler/call slices where pairs exist, typed instant markers, pressure facts, partial-trace truth, and cause/call ids. Plan: `.intent/phases/130-trace-timeline-export/plan.md`. |
 | **Alpaca rename** | Before public launch, rename the project/crates/docs away from Tina to Alpaca so the lineage is respectful and clear: independently maintained Rust framework, inspired by Peter Mbanugo's Tina/Odin and Seastar, not an official Tina port. |
 | **Barend Biesheuvel visible flow ergonomics** | Optional high-level ergonomics only after the local runtime core feels boring: a `flow!`-style authoring surface that preserves named suspension points, visible failure policy, trace step names, and ordinary Tina message/effect expansion. No fake async, no hidden retries, no hidden queues. |
 
