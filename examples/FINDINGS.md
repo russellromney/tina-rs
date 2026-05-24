@@ -16,17 +16,17 @@ moves to the [Closed](#closed) section below with the same number.
 
 ### 2026-05-23 Status Pass
 
-The recent Wave A / post-122 work closed a lot of old pain:
+The recent Wave A / post-122 / Phase 120 work closed a lot of old pain:
 native HTTP/2/gRPC client parity, local I/O/codec/Unix IPC, admission and
 rate policy, resource lifetime, durable outbox, ecosystem hooks, and
 supervision/fairness reports are now landed and recorded in `CHANGELOG.md`.
+Phase 120 also made the copied service path explicit:
+`system_copied_service_path`, its companion proof, and a smoke-copy crate now
+show the blessed service shape without asking readers to stitch ten specimens
+together.
 
 What is still active after reading the specimens and systems:
 
-- **Whole-service copied path.** `mini_saas_api`, `system_metrics_shipper`,
-  `system_job_queue`, and `system_realtime_rooms` all prove Tina can build the
-  shape, but the user still stitches together many nouns. Phase 120 should
-  rewrite a small set on the blessed path and delete stale README guidance.
 - **Admission across parked work.** `system_api_gateway_limits` and
   `system_soak_http_db` still show "park this caller while holding this
   charge" ceremony. The multi-scope charge/rollback half now has
@@ -34,8 +34,10 @@ What is still active after reading the specimens and systems:
   concurrency charge.
 - **Race / cancel / retry ceremony.** `ergonomics_playground` and
   `system_job_queue` show the model is correct. `CallGroup::start_cancelable`
-  now removes the branch-start token/handle ceremony; re-binding a cancelable
-  caller after worker crash remains intentionally unsolved.
+  now removes the branch-start token/handle ceremony, and Phase 120 added
+  `CallJoinSet` / `CallSelectSet` for the common join-all and select-next
+  cases. Re-binding a cancelable caller after worker crash remains
+  intentionally unsolved.
 - **Cross-isolate setup.** Scatter/gather and paired registration still make
   users write bind/start adapter plumbing for the happy path.
 - **Runtime observation while running.** Several protocol/IPC specimens still
@@ -46,12 +48,16 @@ What is still active after reading the specimens and systems:
   `UnixReadToEof`, and the unified `FileCopyBounded` drive path now cover most
   of the boring companions. Framed writers remain open.
 - **Session/control-message lifecycle.** Phase 127 added the native WebSocket
-  client session and tightened session protocol facts. Remaining rough edges
-  are higher-level app control messages, pooled/reconnecting client managers,
-  and broader protocol hardening.
+  client session and tightened session protocol facts. Phase 120 added typed
+  `WebSocketSessionMsg::AppControl` for app-injected `Start` / `Tick` /
+  `Drain` messages so systems do not smuggle control through peer text.
+  Remaining rough edges are pooled/reconnecting client managers and broader
+  protocol hardening.
 - **Live trace to sim.** Phase 128 made projection/capture/shrink the copied
-  path. Remaining rough edges are adding more supported live facts and using
-  the workflow in more production-shaped systems.
+  path, and Phase 120 added `RunCapture` plus `capture_run` / `save_bug` /
+  `replay_bug` / `shrink_bug` workflow wrappers. Remaining rough edges are
+  adding more supported live facts and using the workflow in more
+  production-shaped systems.
 
 Some older entries below are partly historical and say "shipped" inside the
 section. Keep their numbers stable until the next cleanup pass moves those
@@ -966,6 +972,45 @@ What felt rough — each is a `Build`:
 
 Findings shipped by recent phases. Numbers are kept stable so
 existing README references stay valid.
+
+### 36. Whole-service copied path — Phase 120 shipped
+
+**Surfaced by:** `mini_saas_api`, `system_metrics_shipper`,
+`system_job_queue`, `system_realtime_rooms`, and the post-Wave-A system
+specimens.
+
+Closed by `system_copied_service_path`,
+`system_copied_service_path_companion`, and
+`system_copied_service_path_smoke`. A reader can now copy one ordinary service
+skeleton and see the normal Tina path for request entry, bounded replies,
+session app-control messages, service limits, reports, owner-stop shutdown,
+live capture/replay/shrink workflow, fairness/load assertions, and join/select
+helpers.
+
+The important product choice: the copied path did not hide request/reply
+authority in callbacks and did not build a fake async/select framework.
+`CallJoinSet` and `CallSelectSet` keep named branch identity, bounded
+pending/results, explicit loser cancellation, partial reports, and late-reply
+truth visible. The companion proof and smoke-copy crate exist so a cheap model
+or tired human can tell whether the path is actually copyable.
+
+### 37. Accept-loop bad-peer survivability — Phase 120 hostile review
+
+**Surfaced by:** `system_realtime_rooms/tests/bad_peer.rs`,
+`tina-http/tests/server_bad_input.rs`.
+
+The realtime-room bad-peer suite exposed a real listener survivability bug.
+The plain HTTP listener treated any `tcp_accept` error as fatal and closed the
+listener. A peer reset or half-close can surface as accept-side
+`CallError::Io`, so one bad peer could shut the front door and make the next
+peer observe `ConnectionRefused`.
+
+Closed by re-arming the HTTP/1 and h2c accept loops on accept-side
+`CallError::Io` while preserving fatal handling for non-`Io` internal contract
+errors. The proof is user-facing, not pretty-wire-output-facing: reset,
+half-close, and malformed peers may observe reply bytes, EOF, or reset
+depending on OS close timing, but later fresh connections must still be
+accepted and served.
 
 ### 26. Call-shaped sends from `handle_call` deliver completions back as calls — closed by phase 114
 
