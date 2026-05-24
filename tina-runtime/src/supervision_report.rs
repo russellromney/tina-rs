@@ -223,6 +223,10 @@ impl SupervisorReport {
                             skipped_factory_panicked += 1;
                             child.skipped_factory_panicked += 1;
                         }
+                        RestartSkippedReason::RemoteNotRestartable => {
+                            skipped_not_restartable += 1;
+                            child.skipped_not_restartable += 1;
+                        }
                     }
                 }
                 RuntimeEventKind::ChildStopped {

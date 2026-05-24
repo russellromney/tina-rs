@@ -27,6 +27,9 @@ pub(crate) enum QueuedRemoteEnvelope {
     CallReply(RemoteCallReply),
     SpawnRequest(RemoteSpawnRequest),
     SpawnReply(RemoteSpawnReply),
+    SpawnCancel(RemoteSpawnCancel),
+    ChildStop(RemoteChildStop),
+    ChildStopped(RemoteChildStopped),
 }
 
 impl QueuedRemoteEnvelope {
@@ -36,6 +39,9 @@ impl QueuedRemoteEnvelope {
             Self::CallReply(reply) => reply.requester.shard,
             Self::SpawnRequest(request) => request.target_shard,
             Self::SpawnReply(reply) => reply.requester.shard,
+            Self::SpawnCancel(cancel) => cancel.target_shard,
+            Self::ChildStop(stop) => stop.child.shard,
+            Self::ChildStopped(stopped) => stopped.owner.shard,
         }
     }
 }
@@ -48,6 +54,7 @@ pub(crate) struct RemoteSpawnRequest {
     pub(crate) request_id: CallId,
     pub(crate) target_shard: ShardId,
     pub(crate) owner: RegisteredAddress,
+    pub(crate) child_ordinal: usize,
     pub(crate) payload: Box<dyn Any + Send>,
     pub(crate) cause: CauseId,
 }
@@ -59,6 +66,27 @@ pub(crate) struct RemoteSpawnReply {
     pub(crate) requester: RegisteredAddress,
     pub(crate) cause: CauseId,
     pub(crate) outcome: Result<RegisteredAddress, tina::SpawnObservedError>,
+}
+
+pub(crate) struct RemoteSpawnCancel {
+    pub(crate) request_id: CallId,
+    pub(crate) target_shard: ShardId,
+    pub(crate) owner: RegisteredAddress,
+    pub(crate) cause: CauseId,
+}
+
+pub(crate) struct RemoteChildStop {
+    pub(crate) owner: RegisteredAddress,
+    pub(crate) child: RegisteredAddress,
+    pub(crate) child_ordinal: usize,
+    pub(crate) cause: CauseId,
+}
+
+pub(crate) struct RemoteChildStopped {
+    pub(crate) owner: RegisteredAddress,
+    pub(crate) child: RegisteredAddress,
+    pub(crate) child_ordinal: usize,
+    pub(crate) cause: CauseId,
 }
 
 pub(crate) fn remote_call_outcome_envelope(
@@ -134,6 +162,9 @@ pub(crate) enum SendableQueuedRemoteEnvelope {
     // unchanged — no separate sendable mirror is needed.
     SpawnRequest(RemoteSpawnRequest),
     SpawnReply(RemoteSpawnReply),
+    SpawnCancel(RemoteSpawnCancel),
+    ChildStop(RemoteChildStop),
+    ChildStopped(RemoteChildStopped),
 }
 
 impl SendableQueuedRemoteEnvelope {
@@ -149,6 +180,9 @@ impl SendableQueuedRemoteEnvelope {
             }
             QueuedRemoteEnvelope::SpawnRequest(request) => Self::SpawnRequest(request),
             QueuedRemoteEnvelope::SpawnReply(reply) => Self::SpawnReply(reply),
+            QueuedRemoteEnvelope::SpawnCancel(cancel) => Self::SpawnCancel(cancel),
+            QueuedRemoteEnvelope::ChildStop(stop) => Self::ChildStop(stop),
+            QueuedRemoteEnvelope::ChildStopped(stopped) => Self::ChildStopped(stopped),
         }
     }
 
@@ -160,6 +194,9 @@ impl SendableQueuedRemoteEnvelope {
             }
             Self::SpawnRequest(request) => QueuedRemoteEnvelope::SpawnRequest(request),
             Self::SpawnReply(reply) => QueuedRemoteEnvelope::SpawnReply(reply),
+            Self::SpawnCancel(cancel) => QueuedRemoteEnvelope::SpawnCancel(cancel),
+            Self::ChildStop(stop) => QueuedRemoteEnvelope::ChildStop(stop),
+            Self::ChildStopped(stopped) => QueuedRemoteEnvelope::ChildStopped(stopped),
         }
     }
 }
@@ -299,8 +336,11 @@ where
             QueuedRemoteEnvelope::SpawnRequest(request) => {
                 self.harvest_remote_spawn_request(request)
             }
-            QueuedRemoteEnvelope::SpawnReply(reply) => {
-                self.harvest_remote_spawn_reply(reply);
+            QueuedRemoteEnvelope::SpawnReply(reply) => self.harvest_remote_spawn_reply(reply),
+            QueuedRemoteEnvelope::SpawnCancel(cancel) => self.harvest_remote_spawn_cancel(cancel),
+            QueuedRemoteEnvelope::ChildStop(stop) => self.harvest_remote_child_stop(stop),
+            QueuedRemoteEnvelope::ChildStopped(stopped) => {
+                self.harvest_remote_child_stopped(stopped);
                 None
             }
         }
@@ -321,11 +361,24 @@ where
             request_id,
             target_shard: _,
             owner,
+            child_ordinal,
             payload,
             cause,
         } = request;
+        if self
+            .remote_spawn_cancel_tombstones
+            .iter()
+            .any(|t| *t == request_id)
+        {
+            return Some(QueuedRemoteEnvelope::SpawnReply(RemoteSpawnReply {
+                request_id,
+                requester: owner,
+                cause,
+                outcome: Err(tina::SpawnObservedError::DestinationUnavailable),
+            }));
+        }
         let outcome = match payload.downcast::<Box<dyn SendErasedSpawn<S, F>>>() {
-            Ok(spawn) => (*spawn).spawn_remote(self, owner, cause),
+            Ok(spawn) => (*spawn).spawn_remote(self, owner, child_ordinal, Some(request_id), cause),
             // Unreachable in practice: only this runtime boxes that payload and
             // both shards share `S, F` (identical `TypeId`). A failure is an
             // internal invariant break, so trip in debug/test rather than
@@ -347,25 +400,32 @@ where
     /// Owner-shard harvest of a cross-shard spawn reply: record the
     /// `ChildStarted` truth and run the held continuation into the owner's
     /// mailbox so the parent learns the child's address.
-    pub(crate) fn harvest_remote_spawn_reply(&mut self, reply: RemoteSpawnReply) {
+    pub(crate) fn harvest_remote_spawn_reply(
+        &mut self,
+        reply: RemoteSpawnReply,
+    ) -> Option<QueuedRemoteEnvelope> {
         let RemoteSpawnReply {
             request_id,
             requester: _,
             cause,
             outcome,
         } = reply;
-        let Some(index) = self
+        let index = self
             .pending_remote_spawns
             .iter()
-            .position(|pending| pending.request_id == request_id)
-        else {
-            return;
-        };
+            .position(|pending| pending.request_id == request_id)?;
         let pending: PendingRemoteSpawn = self.pending_remote_spawns.remove(index);
         // The owner address comes from the pending record we kept, not the
         // reply, so a stray reply cannot redirect the continuation.
         let requester = pending.requester;
         if let Ok(child) = &outcome {
+            self.record_remote_child_on_owner(
+                requester.isolate,
+                *child,
+                pending.child_ordinal,
+                pending.mailbox_capacity,
+                pending.remote_restartable,
+            );
             self.push_event(
                 requester.isolate,
                 Some(cause),
@@ -375,12 +435,65 @@ where
                     child_generation: child.generation,
                 },
             );
+            let owner_stopped = self
+                .entry_by_isolate(requester.isolate)
+                .is_none_or(|entry| {
+                    entry.generation != requester.generation || entry.stopped.get()
+                });
+            if owner_stopped {
+                return Some(QueuedRemoteEnvelope::ChildStop(RemoteChildStop {
+                    owner: requester,
+                    child: *child,
+                    child_ordinal: pending.child_ordinal,
+                    cause,
+                }));
+            }
         }
         let message = (pending.continuation)(outcome);
         // Deliver through the traced local-send path so a full/closed/stale
         // owner mailbox records SendRejected truth rather than dropping the
         // continuation silently.
         self.deliver_observed_continuation(requester, message, cause);
+        None
+    }
+
+    pub(crate) fn harvest_remote_spawn_cancel(
+        &mut self,
+        cancel: RemoteSpawnCancel,
+    ) -> Option<QueuedRemoteEnvelope> {
+        self.remember_remote_spawn_cancel(cancel.request_id, cancel.owner.isolate, cancel.cause);
+        if let Some(record_index) = self
+            .child_records
+            .iter()
+            .position(|record| record.remote_request_id == Some(cancel.request_id))
+        {
+            let child = self.child_records[record_index].child;
+            let child_ordinal = self.child_records[record_index].child_ordinal;
+            let cause = cancel.cause;
+            self.stop_remote_owned_child(cancel.owner, child, child_ordinal, cause)
+        } else {
+            None
+        }
+    }
+
+    pub(crate) fn harvest_remote_child_stop(
+        &mut self,
+        stop: RemoteChildStop,
+    ) -> Option<QueuedRemoteEnvelope> {
+        self.stop_remote_owned_child(stop.owner, stop.child, stop.child_ordinal, stop.cause)
+    }
+
+    pub(crate) fn harvest_remote_child_stopped(&mut self, stopped: RemoteChildStopped) {
+        self.push_event(
+            stopped.owner.isolate,
+            Some(stopped.cause),
+            RuntimeEventKind::RemoteChildStopped {
+                child_shard: stopped.child.shard,
+                child_ordinal: stopped.child_ordinal,
+                child_isolate: stopped.child.isolate,
+                child_generation: stopped.child.generation,
+            },
+        );
     }
 
     pub(crate) fn harvest_remote_send(

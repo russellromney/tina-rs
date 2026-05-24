@@ -109,12 +109,14 @@ where
             let shard_id = shard.id();
             shard_indexes.insert(shard_id, runtimes.len());
             shard_ids.push(shard_id);
-            runtimes.push(Runtime::with_clock_and_ids(
+            let mut runtime = Runtime::with_clock_and_ids(
                 shard,
                 mailbox_factory.clone(),
                 Box::new(MonotonicClock),
                 ids.clone(),
-            ));
+            );
+            runtime.remote_child_control_capacity = config.shard_pair_capacity;
+            runtimes.push(runtime);
         }
         let (remote_queue_indexes, remote_queues) =
             build_remote_queues(&shard_ids, config.shard_pair_capacity);
@@ -285,6 +287,20 @@ where
         self.runtime_mut(parent.shard()).supervise(parent, config);
     }
 
+    /// Returns the live runtime-owned lifecycle report for direct children of
+    /// `parent`.
+    pub fn child_lifecycle_report<M: 'static, R>(
+        &self,
+        parent: Address<M, R>,
+    ) -> Result<crate::ChildLifecycleReport, crate::ChildLifecycleReportError> {
+        let Some(index) = self.shard_indexes.get(&parent.shard()).copied() else {
+            return Err(crate::ChildLifecycleReportError::ParentShardUnavailable(
+                parent.shard(),
+            ));
+        };
+        self.runtimes[index].child_lifecycle_report(parent)
+    }
+
     /// Attempts one typed global ingress send routed strictly by target shard.
     pub fn try_send<M: 'static, R>(
         &self,
@@ -428,7 +444,9 @@ fn enqueue_remote_envelope_preserving_terminal(
     });
     let terminal = matches!(
         envelope,
-        QueuedRemoteEnvelope::CallReply(_) | QueuedRemoteEnvelope::SpawnReply(_)
+        QueuedRemoteEnvelope::CallReply(_)
+            | QueuedRemoteEnvelope::SpawnReply(_)
+            | QueuedRemoteEnvelope::ChildStopped(_)
     );
     let queue = if terminal {
         &mut buffers.next_terminal[queue_index]

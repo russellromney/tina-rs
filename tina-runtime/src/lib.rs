@@ -47,6 +47,7 @@ mod call;
 mod call_group;
 mod capabilities;
 pub mod capacity;
+mod child_lifecycle;
 mod clock;
 pub mod deferred;
 mod drain_state;
@@ -210,6 +211,9 @@ pub use capacity::{
     CapacityAssertError, CapacityNameError, CapacitySummary, SurfaceAssertion,
     format_assertion_failure, format_discovery_line, format_discovery_report,
 };
+pub use child_lifecycle::{
+    ChildLifecycle, ChildLifecycleReport, ChildLifecycleReportError, ChildLifecycleState,
+};
 pub use deferred::{
     InsertError as PendingRepliesInsertError, ParkCallError, ParkError, ParkTicket, PendingReplies,
     ReplyParkedError, TakeParkedError, TryCaptureError as PendingRepliesTryCaptureError,
@@ -363,6 +367,9 @@ where
     /// Cross-shard `spawn_observed(...).on_shard(...)` requests awaiting their
     /// address reply from the destination shard. Keyed by request id.
     pub(crate) pending_remote_spawns: Vec<PendingRemoteSpawn>,
+    pub(crate) remote_spawn_cancel_tombstones: std::collections::VecDeque<CallId>,
+    pub(crate) remote_child_control_capacity: usize,
+    pub(crate) remote_child_control_full: u64,
     pub(crate) round_messages: Vec<Option<DeliveredMessage>>,
     pub(crate) driver_completions: Vec<DriverCompletion>,
     pub(crate) next_isolate_call_ordinal: u64,
@@ -653,6 +660,9 @@ where
             pending_isolate_call_indexes: HashMap::with_capacity(preallocation.call_capacity),
             pending_isolate_call_deadlines: BTreeMap::new(),
             pending_remote_spawns: Vec::new(),
+            remote_spawn_cancel_tombstones: std::collections::VecDeque::with_capacity(64),
+            remote_child_control_capacity: 64,
+            remote_child_control_full: 0,
             round_messages: Vec::with_capacity(preallocation.round_scratch_capacity),
             driver_completions: Vec::with_capacity(preallocation.call_capacity),
             next_isolate_call_ordinal: 0,

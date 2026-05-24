@@ -29,9 +29,12 @@ use crate::observation::{
     OperationDoneWaiter, ResultWaitError,
 };
 use crate::trace::{CallKind, RuntimeEvent};
+use crate::{
+    ChildLifecycleReport, ChildLifecycleReportError, RegisteredAddress, Runtime, TraceObserver,
+    TraceRetention, pressure,
+};
 #[cfg(test)]
 use crate::{ChildRecordSnapshot, SupervisorRecordSnapshot};
-use crate::{Runtime, TraceObserver, TraceRetention, pressure};
 
 impl<S, F> Runtime<S, F>
 where
@@ -143,6 +146,27 @@ where
     ) -> ChildRestartedWaiter {
         self.observation
             .register_child_restarted(parent_address.isolate())
+    }
+
+    /// Returns the live runtime-owned lifecycle report for direct children of
+    /// `parent_address`.
+    pub fn child_lifecycle_report<M, R>(
+        &self,
+        parent_address: Address<M, R>,
+    ) -> Result<ChildLifecycleReport, ChildLifecycleReportError> {
+        if parent_address.shard() != self.shard.id() {
+            return Err(ChildLifecycleReportError::ParentShardUnavailable(
+                parent_address.shard(),
+            ));
+        }
+        ChildLifecycleReport::from_runtime(
+            self,
+            RegisteredAddress {
+                shard: parent_address.shard(),
+                isolate: parent_address.isolate(),
+                generation: parent_address.generation(),
+            },
+        )
     }
 
     /// Registers a typed result waiter for the isolate at `address`.
@@ -289,7 +313,7 @@ where
                 child_generation: record.child.generation,
                 child_ordinal: record.child_ordinal,
                 mailbox_capacity: record.mailbox_capacity,
-                restartable: record.restart_recipe.is_some(),
+                restartable: record.restart_recipe.is_some() || record.remote_restartable,
             })
             .collect()
     }

@@ -14,6 +14,7 @@ use std::collections::VecDeque;
 use std::marker::PhantomData;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tina::{
@@ -30,7 +31,8 @@ use crate::driver::DriverShutdownError;
 use crate::fact::{IntoRuntimeFact, RuntimeFact};
 use crate::mailbox::MailboxFactory;
 use crate::remote::{
-    QueuedRemoteEnvelope, QueuedRemoteSend, RemoteCallOutcome, RemoteCallReply, RemoteSpawnRequest,
+    QueuedRemoteEnvelope, QueuedRemoteSend, RemoteCallOutcome, RemoteCallReply, RemoteChildStop,
+    RemoteSpawnCancel, RemoteSpawnRequest,
 };
 use crate::trace::{
     CallCompletionRejectedReason, CallKind, CallReplyRejectedReason, CauseId,
@@ -233,9 +235,13 @@ where
                     shard_id.get(),
                 );
                 }
-                QueuedRemoteEnvelope::SpawnRequest(_) | QueuedRemoteEnvelope::SpawnReply(_) => {
+                QueuedRemoteEnvelope::SpawnRequest(_)
+                | QueuedRemoteEnvelope::SpawnReply(_)
+                | QueuedRemoteEnvelope::SpawnCancel(_)
+                | QueuedRemoteEnvelope::ChildStop(_)
+                | QueuedRemoteEnvelope::ChildStopped(_) => {
                     panic!(
-                        "cross-shard spawn requires a multi-shard runtime: target shard {} != runtime shard {}",
+                        "cross-shard child control requires a multi-shard runtime: target shard {} != runtime shard {}",
                         target_shard.get(),
                         shard_id.get(),
                     );
@@ -341,6 +347,11 @@ where
                             );
                         }
                     }
+                    self.cleanup_remote_children_for_owner(
+                        isolate_id,
+                        handler_panicked.into(),
+                        route_remote,
+                    );
                     self.stop_entry(index, isolate_id, handler_panicked.into());
                     self.supervise_failed_child(
                         RegisteredAddress {
@@ -560,6 +571,7 @@ where
         let isolate_id = self.entries[index].id;
         match effect {
             ErasedEffect::Stop => {
+                self.cleanup_remote_children_for_owner(isolate_id, cause, route_remote);
                 self.stop_entry(index, isolate_id, cause);
                 true
             }
@@ -574,6 +586,7 @@ where
                     Some(cause),
                     RuntimeEventKind::HandlerReportedFailure,
                 );
+                self.cleanup_remote_children_for_owner(isolate_id, failed.into(), route_remote);
                 self.stop_entry(index, isolate_id, failed.into());
                 self.supervise_failed_child(
                     RegisteredAddress {
@@ -587,6 +600,7 @@ where
                 true
             }
             ErasedEffect::StopWith(result) => {
+                self.cleanup_remote_children_for_owner(isolate_id, cause, route_remote);
                 self.stop_entry_with_result(index, isolate_id, cause, result);
                 true
             }
@@ -735,15 +749,25 @@ where
                     // ordinary local owned observed spawn (register_remote_child
                     // records the ChildRecord and parent-attributed Spawned), so
                     // no round trip and no cross-shard ChildStarted fact.
-                    let outcome = parts.spawn.spawn_remote(self, owner, cause);
+                    let child_ordinal = self.next_child_ordinal(owner.isolate);
+                    let outcome = parts
+                        .spawn
+                        .spawn_remote(self, owner, child_ordinal, None, cause);
                     let message = (parts.continuation)(outcome);
                     self.deliver_observed_continuation(owner, message, cause);
                 } else {
                     let request_id = self.ids.next_call_id();
+                    let child_ordinal = self.next_child_ordinal(owner.isolate);
+                    let mailbox_capacity = parts.mailbox_capacity;
+                    let remote_restartable = parts.remote_restartable;
                     let payload: Box<dyn Any + Send> = Box::new(parts.spawn);
                     self.pending_remote_spawns.push(PendingRemoteSpawn {
                         request_id,
                         requester: owner,
+                        target_shard: parts.target_shard,
+                        child_ordinal,
+                        mailbox_capacity,
+                        remote_restartable,
                         continuation: parts.continuation,
                     });
                     let routed = route_remote(
@@ -752,6 +776,7 @@ where
                             request_id,
                             target_shard: parts.target_shard,
                             owner,
+                            child_ordinal,
                             payload,
                             cause,
                         }),
@@ -775,11 +800,11 @@ where
                 false
             }
             ErasedEffect::RestartChildren => {
-                self.restart_children(isolate_id, cause, round_messages);
+                self.restart_children(isolate_id, cause, round_messages, route_remote);
                 false
             }
             ErasedEffect::StopChildren => {
-                self.stop_children(isolate_id, cause, round_messages);
+                self.stop_children(isolate_id, cause, round_messages, route_remote);
                 false
             }
             ErasedEffect::Call(call) => {
@@ -2210,11 +2235,6 @@ where
             self.entries[index].generation,
             stopped.into(),
         );
-        // Drop any cross-shard observed-spawn requests this isolate was waiting
-        // on. A later reply finds no pending record and is a no-op, so the
-        // boxed continuation cannot leak past the owner's stop.
-        self.pending_remote_spawns
-            .retain(|pending| pending.requester.isolate != isolate_id);
         if precollected.is_some() {
             self.push_event(
                 isolate_id,
@@ -2248,9 +2268,30 @@ where
         parent: IsolateId,
         cause: CauseId,
         round_messages: &mut [Option<DeliveredMessage>],
+        route_remote: &mut impl FnMut(ShardId, QueuedRemoteEnvelope) -> Result<(), SendRejectedReason>,
     ) {
         for child_record_index in 0..self.child_records.len() {
-            if self.child_records[child_record_index].parent == parent {
+            if self.child_records[child_record_index].parent == parent
+                && self.child_records[child_record_index]
+                    .remote_owner
+                    .is_none()
+            {
+                if self.child_records[child_record_index].child.shard != self.shard.id() {
+                    let child = self.child_records[child_record_index].child;
+                    let child_ordinal = self.child_records[child_record_index].child_ordinal;
+                    self.push_event(
+                        parent,
+                        Some(cause),
+                        RuntimeEventKind::RestartChildSkipped {
+                            child_ordinal,
+                            old_isolate: child.isolate,
+                            old_generation: child.generation,
+                            reason: RestartSkippedReason::RemoteNotRestartable,
+                        },
+                    );
+                    let _ = route_remote;
+                    continue;
+                }
                 self.restart_child_record(parent, child_record_index, cause, round_messages);
             }
         }
@@ -2265,16 +2306,21 @@ where
         parent: IsolateId,
         cause: CauseId,
         round_messages: &mut [Option<DeliveredMessage>],
+        route_remote: &mut impl FnMut(ShardId, QueuedRemoteEnvelope) -> Result<(), SendRejectedReason>,
     ) {
         // Snapshot first: stopping a child mutates `entries` and the GC, which
         // would invalidate a borrow held across the loop.
         let children: Vec<(usize, RegisteredAddress)> = self
             .child_records
             .iter()
-            .filter(|record| record.parent == parent)
+            .filter(|record| record.parent == parent && record.remote_owner.is_none())
             .map(|record| (record.child_ordinal, record.child))
             .collect();
         for (child_ordinal, child) in children {
+            if child.shard != self.shard.id() {
+                self.request_remote_child_stop(parent, child, child_ordinal, cause, route_remote);
+                continue;
+            }
             let Some(entry_index) = self.entry_index(child) else {
                 continue;
             };
@@ -2298,6 +2344,194 @@ where
                 precollected,
             );
         }
+    }
+
+    pub(crate) fn next_child_ordinal(&self, parent: IsolateId) -> usize {
+        let records = self
+            .child_records
+            .iter()
+            .filter(|record| record.parent == parent && record.remote_owner.is_none())
+            .count();
+        let pending = self
+            .pending_remote_spawns
+            .iter()
+            .filter(|pending| pending.requester.isolate == parent)
+            .count();
+        records + pending
+    }
+
+    pub(crate) fn cleanup_remote_children_for_owner(
+        &mut self,
+        parent: IsolateId,
+        cause: CauseId,
+        route_remote: &mut impl FnMut(ShardId, QueuedRemoteEnvelope) -> Result<(), SendRejectedReason>,
+    ) {
+        let owner = RegisteredAddress {
+            shard: self.shard.id(),
+            isolate: parent,
+            generation: self
+                .entry_by_isolate(parent)
+                .map(|entry| entry.generation)
+                .unwrap_or_else(|| AddressGeneration::new(0)),
+        };
+        let pending: Vec<_> = self
+            .pending_remote_spawns
+            .iter()
+            .filter(|pending| pending.requester.isolate == parent)
+            .map(|pending| (pending.request_id, pending.target_shard))
+            .collect();
+        let mut cancelled = Vec::new();
+        for (request_id, target_shard) in pending {
+            let cancel = QueuedRemoteEnvelope::SpawnCancel(RemoteSpawnCancel {
+                request_id,
+                target_shard,
+                owner,
+                cause,
+            });
+            match route_remote(self.shard.id(), cancel) {
+                Ok(()) => cancelled.push(request_id),
+                Err(reason) => {
+                    self.push_event(
+                        parent,
+                        Some(cause),
+                        RuntimeEventKind::RemoteChildControlRejected {
+                            target_shard,
+                            reason,
+                        },
+                    );
+                }
+            }
+        }
+        self.pending_remote_spawns.retain(|pending| {
+            pending.requester.isolate != parent || !cancelled.contains(&pending.request_id)
+        });
+
+        let children: Vec<_> = self
+            .child_records
+            .iter()
+            .filter(|record| {
+                record.parent == parent
+                    && record.remote_owner.is_none()
+                    && record.child.shard != self.shard.id()
+            })
+            .map(|record| (record.child_ordinal, record.child))
+            .collect();
+        for (child_ordinal, child) in children {
+            self.request_remote_child_stop(parent, child, child_ordinal, cause, route_remote);
+        }
+    }
+
+    pub(crate) fn request_remote_child_stop(
+        &mut self,
+        parent: IsolateId,
+        child: RegisteredAddress,
+        child_ordinal: usize,
+        cause: CauseId,
+        route_remote: &mut impl FnMut(ShardId, QueuedRemoteEnvelope) -> Result<(), SendRejectedReason>,
+    ) {
+        let owner = RegisteredAddress {
+            shard: self.shard.id(),
+            isolate: parent,
+            generation: self
+                .entry_by_isolate(parent)
+                .map(|entry| entry.generation)
+                .unwrap_or_else(|| AddressGeneration::new(0)),
+        };
+        let requested = self.push_event(
+            parent,
+            Some(cause),
+            RuntimeEventKind::RemoteChildStopRequested {
+                child_shard: child.shard,
+                child_ordinal,
+                child_isolate: child.isolate,
+                child_generation: child.generation,
+            },
+        );
+        if let Err(reason) = route_remote(
+            self.shard.id(),
+            QueuedRemoteEnvelope::ChildStop(RemoteChildStop {
+                owner,
+                child,
+                child_ordinal,
+                cause: requested.into(),
+            }),
+        ) {
+            self.push_event(
+                parent,
+                Some(requested.into()),
+                RuntimeEventKind::RemoteChildControlRejected {
+                    target_shard: child.shard,
+                    reason,
+                },
+            );
+        }
+    }
+
+    pub(crate) fn remember_remote_spawn_cancel(
+        &mut self,
+        request_id: CallId,
+        isolate: IsolateId,
+        cause: CauseId,
+    ) {
+        if self
+            .remote_spawn_cancel_tombstones
+            .iter()
+            .any(|existing| *existing == request_id)
+        {
+            return;
+        }
+        if self.remote_spawn_cancel_tombstones.len() == self.remote_child_control_capacity {
+            self.remote_spawn_cancel_tombstones.pop_front();
+            self.remote_child_control_full = self.remote_child_control_full.saturating_add(1);
+            self.push_event(
+                isolate,
+                Some(cause),
+                RuntimeEventKind::RemoteChildControlPressure {
+                    capacity: self.remote_child_control_capacity,
+                },
+            );
+        }
+        self.remote_spawn_cancel_tombstones.push_back(request_id);
+    }
+
+    pub(crate) fn stop_remote_owned_child(
+        &mut self,
+        owner: RegisteredAddress,
+        child: RegisteredAddress,
+        child_ordinal: usize,
+        cause: CauseId,
+    ) -> Option<QueuedRemoteEnvelope> {
+        let Some(entry_index) = self.entry_index(child) else {
+            return Some(QueuedRemoteEnvelope::ChildStopped(
+                crate::remote::RemoteChildStopped {
+                    owner,
+                    child,
+                    child_ordinal,
+                    cause,
+                },
+            ));
+        };
+        if !self.entries[entry_index].stopped.get() {
+            self.push_event(
+                child.isolate,
+                Some(cause),
+                RuntimeEventKind::RemoteChildStopRequested {
+                    child_shard: child.shard,
+                    child_ordinal,
+                    child_isolate: child.isolate,
+                    child_generation: child.generation,
+                },
+            );
+            self.stop_entry(entry_index, child.isolate, cause);
+        }
+        Some(QueuedRemoteEnvelope::ChildStopped(
+            crate::remote::RemoteChildStopped {
+                owner,
+                child,
+                child_ordinal,
+                cause,
+            },
+        ))
     }
 
     /// Delivers an observed-spawn continuation message to its owner (on this
@@ -2536,6 +2770,7 @@ where
             parent,
             observation::ChildRestarted {
                 child_ordinal,
+                new_shard: new_child.shard,
                 new_isolate: new_child.isolate,
                 new_generation: new_child.generation,
             },
@@ -2781,6 +3016,9 @@ where
     pub(crate) child_ordinal: usize,
     pub(crate) mailbox_capacity: usize,
     pub(crate) restart_recipe: Option<Rc<dyn ErasedRestartRecipe<S, F>>>,
+    pub(crate) remote_request_id: Option<CallId>,
+    pub(crate) remote_owner: Option<RegisteredAddress>,
+    pub(crate) remote_restartable: bool,
 }
 
 pub(crate) struct SupervisorRecord {
@@ -3462,6 +3700,8 @@ where
         self: Box<Self>,
         runtime: &mut Runtime<S, F>,
         owner: RegisteredAddress,
+        child_ordinal: usize,
+        request_id: Option<CallId>,
         cause: CauseId,
     ) -> Result<RegisteredAddress, SpawnObservedError>;
 }
@@ -3471,6 +3711,12 @@ where
     S: Shard,
     F: MailboxFactory,
 {
+    fn mailbox_capacity(&self) -> usize;
+
+    fn remote_restartable(&self) -> bool {
+        false
+    }
+
     fn into_send_erased_spawn(self) -> Box<dyn SendErasedSpawn<S, F>>;
 }
 
@@ -3484,6 +3730,8 @@ where
 {
     pub(crate) target_shard: ShardId,
     pub(crate) spawn: Box<dyn SendErasedSpawn<S, F>>,
+    pub(crate) mailbox_capacity: usize,
+    pub(crate) remote_restartable: bool,
     #[allow(clippy::type_complexity)]
     pub(crate) continuation:
         Box<dyn FnOnce(Result<RegisteredAddress, SpawnObservedError>) -> ErasedMessage>,
@@ -3503,6 +3751,10 @@ where
 pub(crate) struct PendingRemoteSpawn {
     pub(crate) request_id: CallId,
     pub(crate) requester: RegisteredAddress,
+    pub(crate) target_shard: ShardId,
+    pub(crate) child_ordinal: usize,
+    pub(crate) mailbox_capacity: usize,
+    pub(crate) remote_restartable: bool,
     #[allow(clippy::type_complexity)]
     pub(crate) continuation:
         Box<dyn FnOnce(Result<RegisteredAddress, SpawnObservedError>) -> ErasedMessage>,
@@ -3513,6 +3765,10 @@ where
     S: Shard,
     F: MailboxFactory,
 {
+    fn mailbox_capacity(&self) -> usize {
+        match *self {}
+    }
+
     fn into_send_erased_spawn(self) -> Box<dyn SendErasedSpawn<S, F>> {
         match self {}
     }
@@ -3557,6 +3813,8 @@ where
         self: Box<Self>,
         runtime: &mut Runtime<S, F>,
         owner: RegisteredAddress,
+        child_ordinal: usize,
+        request_id: Option<CallId>,
         cause: CauseId,
     ) -> Result<RegisteredAddress, SpawnObservedError> {
         if self.mailbox_capacity == 0 {
@@ -3567,6 +3825,10 @@ where
             self.mailbox_capacity,
             self.bootstrap_message,
             owner,
+            child_ordinal,
+            request_id,
+            (owner.shard != runtime.shard.id()).then_some(owner),
+            None,
             cause,
         ))
     }
@@ -3586,6 +3848,10 @@ where
     S: Shard,
     F: MailboxFactory,
 {
+    fn mailbox_capacity(&self) -> usize {
+        self.mailbox_capacity()
+    }
+
     fn into_send_erased_spawn(self) -> Box<dyn SendErasedSpawn<S, F>> {
         let (isolate, mailbox_capacity, bootstrap_message) = self.into_parts();
         Box::new(SendSpawnAdapter::<I, OutboundMsg> {
@@ -3610,6 +3876,8 @@ where
 {
     fn into_send_erased_spawn_observed(self) -> SendSpawnObservedParts<S, F> {
         let (spawn, target_shard, continuation) = self.into_parts();
+        let mailbox_capacity = spawn.mailbox_capacity();
+        let remote_restartable = spawn.remote_restartable();
         let continuation = Box::new(
             move |result: Result<RegisteredAddress, SpawnObservedError>| -> ErasedMessage {
                 let typed = result.map(|address| {
@@ -3624,6 +3892,8 @@ where
         );
         SendSpawnObservedParts {
             target_shard,
+            mailbox_capacity,
+            remote_restartable,
             spawn: spawn.into_send_erased_spawn(),
             continuation,
         }
@@ -3731,6 +4001,118 @@ where
             factory,
             mailbox_capacity,
             bootstrap_factory,
+            marker: PhantomData,
+        })
+    }
+}
+
+pub(crate) struct CrossShardRestartableSpawnAdapter<I, Outbound>
+where
+    I: Isolate,
+{
+    pub(crate) factory: Arc<dyn Fn() -> I + Send + Sync>,
+    pub(crate) mailbox_capacity: usize,
+    pub(crate) bootstrap_factory: Option<Arc<dyn Fn() -> I::Message + Send + Sync>>,
+    pub(crate) marker: PhantomData<fn(Outbound) -> Outbound>,
+}
+
+impl<I, S, F, Outbound> SendErasedSpawn<S, F> for CrossShardRestartableSpawnAdapter<I, Outbound>
+where
+    I: Isolate<Shard = S, Send = TinaOutbound<Outbound>> + Send + 'static,
+    I::Message: Send + 'static,
+    I::Reply: 'static,
+    I::Spawn: IntoErasedSpawn<S, F> + 'static,
+    I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
+    I::SpawnObservedRemote: IntoSendErasedSpawnObserved<S, F, I::Message> + 'static,
+    I::Call: IntoErasedCall<I::Message> + 'static,
+    I::Fact: IntoRuntimeFact + 'static,
+    Outbound: Send + 'static,
+    S: Shard,
+    F: MailboxFactory,
+{
+    fn spawn_remote(
+        self: Box<Self>,
+        runtime: &mut Runtime<S, F>,
+        owner: RegisteredAddress,
+        child_ordinal: usize,
+        request_id: Option<CallId>,
+        cause: CauseId,
+    ) -> Result<RegisteredAddress, SpawnObservedError> {
+        if self.mailbox_capacity == 0 {
+            return Err(SpawnObservedError::ZeroMailboxCapacity);
+        }
+        let adapter = Rc::new(*self);
+        let isolate = (adapter.factory)();
+        let bootstrap = adapter.bootstrap_factory.as_ref().map(|f| f());
+        Ok(runtime.register_remote_child::<I, Outbound>(
+            isolate,
+            adapter.mailbox_capacity,
+            bootstrap,
+            owner,
+            child_ordinal,
+            request_id,
+            (owner.shard != runtime.shard.id()).then_some(owner),
+            Some(adapter),
+            cause,
+        ))
+    }
+}
+
+impl<I, S, F, Outbound> ErasedRestartRecipe<S, F> for CrossShardRestartableSpawnAdapter<I, Outbound>
+where
+    I: Isolate<Shard = S, Send = TinaOutbound<Outbound>> + Send + 'static,
+    I::Message: Send + 'static,
+    I::Reply: 'static,
+    I::Spawn: IntoErasedSpawn<S, F> + 'static,
+    I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
+    I::SpawnObservedRemote: IntoSendErasedSpawnObserved<S, F, I::Message> + 'static,
+    I::Call: IntoErasedCall<I::Message> + 'static,
+    I::Fact: IntoRuntimeFact + 'static,
+    Outbound: Send + 'static,
+    S: Shard,
+    F: MailboxFactory,
+{
+    fn create(&self, runtime: &mut Runtime<S, F>, parent: IsolateId) -> SpawnOutcome<S, F> {
+        let isolate = (self.factory)();
+        let bootstrap_message = self.bootstrap_factory.as_ref().map(|f| f());
+        runtime.spawn_isolate::<I, Outbound>(
+            parent,
+            isolate,
+            self.mailbox_capacity,
+            bootstrap_message,
+        )
+    }
+}
+
+impl<I, S, F, OutboundMsg> IntoSendErasedSpawn<S, F>
+    for tina::CrossShardRestartableChildDefinition<I>
+where
+    I: Isolate<Shard = S, Send = TinaOutbound<OutboundMsg>> + Send + 'static,
+    I::Message: Send + 'static,
+    I::Reply: 'static,
+    I::Spawn: IntoErasedSpawn<S, F> + 'static,
+    I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
+    I::SpawnObservedRemote: IntoSendErasedSpawnObserved<S, F, I::Message> + 'static,
+    I::Call: IntoErasedCall<I::Message> + 'static,
+    I::Fact: IntoRuntimeFact + 'static,
+    OutboundMsg: Send + 'static,
+    S: Shard,
+    F: MailboxFactory,
+{
+    fn mailbox_capacity(&self) -> usize {
+        self.mailbox_capacity()
+    }
+
+    fn remote_restartable(&self) -> bool {
+        true
+    }
+
+    fn into_send_erased_spawn(self) -> Box<dyn SendErasedSpawn<S, F>> {
+        let (factory, mailbox_capacity, bootstrap_factory) = self.into_parts();
+        Box::new(CrossShardRestartableSpawnAdapter::<I, OutboundMsg> {
+            factory: Arc::from(factory),
+            mailbox_capacity,
+            bootstrap_factory: bootstrap_factory.map(Arc::from),
             marker: PhantomData,
         })
     }

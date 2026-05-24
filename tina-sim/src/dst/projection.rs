@@ -88,6 +88,14 @@ pub enum RuntimeEventKindName {
     ChildStopped,
     /// [`RuntimeEventKind::ChildStarted`].
     ChildStarted,
+    /// [`RuntimeEventKind::RemoteChildStopRequested`].
+    RemoteChildStopRequested,
+    /// [`RuntimeEventKind::RemoteChildStopped`].
+    RemoteChildStopped,
+    /// [`RuntimeEventKind::RemoteChildControlRejected`].
+    RemoteChildControlRejected,
+    /// [`RuntimeEventKind::RemoteChildControlPressure`].
+    RemoteChildControlPressure,
     /// [`RuntimeEventKind::IsolateStopped`].
     IsolateStopped,
     /// [`RuntimeEventKind::MessageAbandoned`].
@@ -163,6 +171,16 @@ fn runtime_event_kind_name(kind: RuntimeEventKind) -> Option<RuntimeEventKindNam
         }
         RuntimeEventKind::ChildStopped { .. } => RuntimeEventKindName::ChildStopped,
         RuntimeEventKind::ChildStarted { .. } => RuntimeEventKindName::ChildStarted,
+        RuntimeEventKind::RemoteChildStopRequested { .. } => {
+            RuntimeEventKindName::RemoteChildStopRequested
+        }
+        RuntimeEventKind::RemoteChildStopped { .. } => RuntimeEventKindName::RemoteChildStopped,
+        RuntimeEventKind::RemoteChildControlRejected { .. } => {
+            RuntimeEventKindName::RemoteChildControlRejected
+        }
+        RuntimeEventKind::RemoteChildControlPressure { .. } => {
+            RuntimeEventKindName::RemoteChildControlPressure
+        }
         RuntimeEventKind::IsolateStopped => RuntimeEventKindName::IsolateStopped,
         RuntimeEventKind::MessageAbandoned => RuntimeEventKindName::MessageAbandoned,
         RuntimeEventKind::CallDispatchAttempted { .. } => {
@@ -322,6 +340,10 @@ fn every_kind_except(keep: &[RuntimeEventKindName]) -> Vec<RuntimeEventKindName>
         N::RestartChildCompleted,
         N::ChildStopped,
         N::ChildStarted,
+        N::RemoteChildStopRequested,
+        N::RemoteChildStopped,
+        N::RemoteChildControlRejected,
+        N::RemoteChildControlPressure,
         N::IsolateStopped,
         N::MessageAbandoned,
         N::CallDispatchAttempted,

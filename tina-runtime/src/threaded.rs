@@ -37,8 +37,8 @@ use crate::observer::TraceObserver;
 use crate::shutdown::{SharedShutdownState, ShutdownWorker, ThreadedShutdownHandle, handle_for};
 use crate::trace::{CallKind, RuntimeEvent};
 use crate::{
-    IdSource, IntoErasedSpawn, IntoErasedSpawnObserved, IntoSendErasedSpawnObserved,
-    PreallocationConfig, Runtime, TraceRetention,
+    ChildLifecycleReport, IdSource, IntoErasedSpawn, IntoErasedSpawnObserved,
+    IntoSendErasedSpawnObserved, PreallocationConfig, Runtime, TraceRetention,
 };
 
 /// Configuration for [`ThreadedRuntime`].
@@ -636,6 +636,15 @@ where
             Ok(waiter) => waiter,
             Err(_) => observation::stopped_child_restarted_waiter(),
         }
+    }
+
+    /// Returns a live child lifecycle report from the worker shard.
+    pub fn child_lifecycle_report<M: 'static, R: 'static>(
+        &self,
+        parent_address: Address<M, R>,
+    ) -> Result<ChildLifecycleReport, ThreadedRuntimeError> {
+        self.call(move |runtime| runtime.child_lifecycle_report(parent_address))
+            .and_then(|report| report.map_err(|_| ThreadedRuntimeError::WorkerStopped))
     }
 
     /// Registers a typed result waiter for the isolate at `address` on the
