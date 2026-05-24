@@ -113,6 +113,10 @@ impl std::fmt::Display for CaptureSource {
     }
 }
 
+fn encode_saved_bool(value: bool) -> &'static str {
+    if value { "true" } else { "false" }
+}
+
 /// Bounds applied while turning live material into a replay capture.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CaptureLimits {
@@ -661,8 +665,7 @@ impl<Op> LiveReplayCaptureBuilder<Op> {
     /// Sets the materialized replay history.
     pub fn with_history(mut self, history: Vec<Op>) -> Self {
         if history.len() > self.limits.max_history_ops {
-            self.truncated = true;
-            self.unsupported_facts.push(UnsupportedLiveFact::new(
+            self.mark_truncated(UnsupportedLiveFact::new(
                 "FactTruncated",
                 format!(
                     "history ops {} exceeded cap {}",
@@ -685,8 +688,7 @@ impl<Op> LiveReplayCaptureBuilder<Op> {
     /// Sets runtime trace events.
     pub fn with_trace(mut self, events: &[RuntimeEvent]) -> Self {
         if events.len() > self.limits.max_events {
-            self.truncated = true;
-            self.unsupported_facts.push(UnsupportedLiveFact::new(
+            self.mark_truncated(UnsupportedLiveFact::new(
                 "TraceTruncated",
                 format!(
                     "trace events {} exceeded cap {}",
@@ -704,8 +706,7 @@ impl<Op> LiveReplayCaptureBuilder<Op> {
     /// Adds one typed replay fact.
     pub fn with_fact(mut self, fact: LiveReplayFact) -> Self {
         if self.live_facts.len() >= self.limits.max_live_facts {
-            self.truncated = true;
-            self.unsupported_facts.push(UnsupportedLiveFact::new(
+            self.mark_truncated(UnsupportedLiveFact::new(
                 "FactTruncated",
                 format!("live fact cap {} reached", self.limits.max_live_facts),
             ));
@@ -727,7 +728,13 @@ impl<Op> LiveReplayCaptureBuilder<Op> {
         reason: impl Into<String>,
     ) -> Self {
         if self.unsupported_facts.len() >= self.limits.max_unsupported_facts {
-            self.truncated = true;
+            self.mark_truncated(UnsupportedLiveFact::new(
+                "FactTruncated",
+                format!(
+                    "unsupported fact cap {} reached",
+                    self.limits.max_unsupported_facts
+                ),
+            ));
             return self;
         }
         let fact = truncate_string(fact.into(), self.limits.max_string_bytes);
@@ -742,6 +749,18 @@ impl<Op> LiveReplayCaptureBuilder<Op> {
     /// code a stable place to hang the report conversion.
     pub fn with_shutdown_report(self, fact: LiveReplayFact) -> Self {
         self.with_fact(fact)
+    }
+
+    fn mark_truncated(&mut self, fact: UnsupportedLiveFact) {
+        self.truncated = true;
+        if !self
+            .unsupported_facts
+            .iter()
+            .any(|existing| existing.fact == fact.fact && existing.reason == fact.reason)
+            && self.unsupported_facts.len() < self.limits.max_unsupported_facts
+        {
+            self.unsupported_facts.push(fact);
+        }
     }
 
     /// Adapter placeholder for protocol reports that callers have already
@@ -819,7 +838,11 @@ impl<Op> LiveReplayCaptureBuilder<Op> {
 
 fn truncate_string(mut value: String, max: usize) -> String {
     if value.len() > max {
-        value.truncate(max);
+        let mut boundary = max;
+        while boundary > 0 && !value.is_char_boundary(boundary) {
+            boundary -= 1;
+        }
+        value.truncate(boundary);
         value.push_str("...");
     }
     value
@@ -1054,6 +1077,16 @@ fn reject_newline(field: &str, value: &str) -> Result<(), SavedReplayCaseError> 
     Ok(())
 }
 
+fn reject_saved_delimiter(field: &str, value: &str) -> Result<(), SavedReplayCaseError> {
+    if value.contains(" | ") {
+        return Err(SavedReplayCaseError::Decode {
+            line: 0,
+            reason: format!("{field} may not contain the saved-case delimiter ` | `"),
+        });
+    }
+    Ok(())
+}
+
 /// Writes a small line-oriented saved replay capture.
 ///
 /// Each operation is already materialized in the file as an `op=` line. The
@@ -1071,12 +1104,24 @@ where
     reject_newline("scenario", capture.scenario)?;
     reject_newline("invariant", capture.invariant)?;
     reject_newline("source", capture.source)?;
+    reject_newline("source_label", &capture.source_metadata.label)?;
+    reject_newline("source_runtime_kind", &capture.source_metadata.runtime_kind)?;
+    reject_newline("source_backend", &capture.source_metadata.backend)?;
+    reject_newline("source_platform", &capture.source_metadata.platform)?;
+    if let Some(revision) = &capture.source_metadata.crate_revision {
+        reject_newline("source_crate_revision", revision)?;
+    }
+    if let Some(revision) = &capture.source_metadata.git_revision {
+        reject_newline("source_git_revision", revision)?;
+    }
     for role in &capture.topology_roles {
         reject_newline("topology_role", role)?;
     }
     for fact in &capture.unsupported_facts {
         reject_newline("unsupported_fact", &fact.fact)?;
         reject_newline("unsupported_reason", &fact.reason)?;
+        reject_saved_delimiter("unsupported_fact", &fact.fact)?;
+        reject_saved_delimiter("unsupported_reason", &fact.reason)?;
     }
     for fact in &capture.live_facts {
         reject_newline("live_fact", &fact.to_string())?;
@@ -1089,12 +1134,37 @@ where
     body.push_str(&format!("scenario={}\n", capture.scenario));
     body.push_str(&format!("invariant={}\n", capture.invariant));
     body.push_str(&format!("source={}\n", capture.source));
-    body.push_str(&format!("source_metadata={}\n", capture.source_metadata));
+    body.push_str(&format!("source_label={}\n", capture.source_metadata.label));
+    body.push_str(&format!(
+        "source_runtime_kind={}\n",
+        capture.source_metadata.runtime_kind
+    ));
+    body.push_str(&format!(
+        "source_backend={}\n",
+        capture.source_metadata.backend
+    ));
+    body.push_str(&format!(
+        "source_schema_version={}\n",
+        capture.source_metadata.schema_version
+    ));
+    body.push_str(&format!(
+        "source_platform={}\n",
+        capture.source_metadata.platform
+    ));
+    if let Some(revision) = &capture.source_metadata.crate_revision {
+        body.push_str(&format!("source_crate_revision={revision}\n"));
+    }
+    if let Some(revision) = &capture.source_metadata.git_revision {
+        body.push_str(&format!("source_git_revision={revision}\n"));
+    }
     body.push_str(&format!(
         "trace_completeness={:?}\n",
         capture.source_metadata.trace_completeness
     ));
-    body.push_str(&format!("capture_truncated={}\n", capture.truncated));
+    body.push_str(&format!(
+        "capture_truncated={}\n",
+        encode_saved_bool(capture.truncated)
+    ));
     body.push_str(&format!("config_hash=0x{:016x}\n", capture.config_hash()));
     body.push_str(&format!("config_debug={:?}\n", capture.config));
     body.push_str(&format!("projection_debug={:?}\n", capture.projection));
@@ -1160,7 +1230,13 @@ where
     let mut scenario = None;
     let mut invariant = None;
     let mut source = None;
-    let mut source_metadata = None;
+    let mut source_label = None;
+    let mut source_runtime_kind = None;
+    let mut source_backend = None;
+    let mut source_schema_version = None;
+    let mut source_platform = None;
+    let mut source_crate_revision = None;
+    let mut source_git_revision = None;
     let mut trace_completeness = None;
     let mut capture_truncated = None;
     let mut config_debug = None;
@@ -1196,7 +1272,24 @@ where
             "scenario" => scenario = Some(value.to_owned()),
             "invariant" => invariant = Some(value.to_owned()),
             "source" => source = Some(value.to_owned()),
-            "source_metadata" => source_metadata = Some(value.to_owned()),
+            "source_metadata" => source_label = Some(value.to_owned()),
+            "source_label" => source_label = Some(value.to_owned()),
+            "source_runtime_kind" => source_runtime_kind = Some(value.to_owned()),
+            "source_backend" => source_backend = Some(value.to_owned()),
+            "source_schema_version" => {
+                source_schema_version =
+                    Some(
+                        value
+                            .parse::<u32>()
+                            .map_err(|error| SavedReplayCaseError::Decode {
+                                line: line_no,
+                                reason: format!("invalid source_schema_version: {error}"),
+                            })?,
+                    )
+            }
+            "source_platform" => source_platform = Some(value.to_owned()),
+            "source_crate_revision" => source_crate_revision = Some(value.to_owned()),
+            "source_git_revision" => source_git_revision = Some(value.to_owned()),
             "trace_completeness" => {
                 trace_completeness = Some(match value {
                     "Complete" => TraceCompleteness::Complete,
@@ -1273,9 +1366,25 @@ where
         invariant: invariant.ok_or(SavedReplayCaseError::MissingField("invariant"))?,
         source: source.ok_or(SavedReplayCaseError::MissingField("source"))?,
         source_metadata: {
-            let label = source_metadata.unwrap_or_else(|| "legacy saved capture".to_owned());
-            CaptureSource::new(label)
-                .with_trace_completeness(trace_completeness.unwrap_or(TraceCompleteness::Complete))
+            let mut metadata = CaptureSource::new(
+                source_label.unwrap_or_else(|| "legacy saved capture".to_owned()),
+            )
+            .with_trace_completeness(trace_completeness.unwrap_or(TraceCompleteness::Complete));
+            if let Some(runtime_kind) = source_runtime_kind {
+                metadata.runtime_kind = runtime_kind;
+            }
+            if let Some(backend) = source_backend {
+                metadata.backend = backend;
+            }
+            if let Some(schema_version) = source_schema_version {
+                metadata.schema_version = schema_version;
+            }
+            if let Some(platform) = source_platform {
+                metadata.platform = platform;
+            }
+            metadata.crate_revision = source_crate_revision;
+            metadata.git_revision = source_git_revision;
+            metadata
         },
         config_debug: config_debug.ok_or(SavedReplayCaseError::MissingField("config_debug"))?,
         config_hash: config_hash.ok_or(SavedReplayCaseError::MissingField("config_hash"))?,
@@ -1806,11 +1915,17 @@ fn captured_mismatch<Op: Clone>(
 }
 
 fn live_fact_sets_match(left: &[LiveReplayFact], right: &[LiveReplayFact]) -> bool {
-    let mut left_keys = left.iter().map(ToString::to_string).collect::<Vec<_>>();
-    let mut right_keys = right.iter().map(ToString::to_string).collect::<Vec<_>>();
-    left_keys.sort();
-    right_keys.sort();
-    left_keys == right_keys
+    if left.len() != right.len() {
+        return false;
+    }
+    let mut unmatched = right.to_vec();
+    for fact in left {
+        let Some(index) = unmatched.iter().position(|candidate| candidate == fact) else {
+            return false;
+        };
+        unmatched.remove(index);
+    }
+    unmatched.is_empty()
 }
 
 /// Test sugar over [`check_captured_replay`].

@@ -9,7 +9,8 @@
 use std::fmt::Debug;
 
 use super::{
-    History, LiveReplayCapture, LiveReplayReport, ReplayCase, ReplayReport, TraceProjectionError,
+    History, LiveReplayCapture, LiveReplayFact, LiveReplayReport, ReplayCase, ReplayReport,
+    TraceProjectionError,
 };
 
 /// Deletion-only shrinker settings.
@@ -238,6 +239,62 @@ pub struct ShrinkCapturedReport<Op, Output> {
     pub shrunk_capture: LiveReplayCapture<Op>,
     /// Runner's report for the shrunk case.
     pub shrunk_report: LiveReplayReport<Output>,
+    /// Candidate deletions refused because they changed the proving fact set.
+    pub fact_set_rejections: Vec<FactSetDelta>,
+}
+
+/// Fact-set delta observed while trying to shrink a captured replay.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FactSetDelta {
+    /// Candidate deletion index that caused the delta.
+    pub deletion_index: usize,
+    /// Expected fact display lines.
+    pub expected: Vec<String>,
+    /// Actual fact display lines.
+    pub actual: Vec<String>,
+}
+
+/// Error returned when shrinking a live-derived capture cannot safely proceed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ShrinkCapturedReplayError {
+    /// The runner could not apply the capture projection.
+    Projection(TraceProjectionError),
+    /// The initial or candidate run changed the proving fact set.
+    FactSetChanged {
+        /// Context for the fact-set drift.
+        phase: &'static str,
+        /// Expected fact display lines.
+        expected: Vec<String>,
+        /// Actual fact display lines.
+        actual: Vec<String>,
+    },
+}
+
+impl std::fmt::Display for ShrinkCapturedReplayError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Projection(error) => {
+                write!(f, "captured replay shrink projection failed: {error}")
+            }
+            Self::FactSetChanged {
+                phase,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "captured replay shrink changed live fact set during {phase}: expected {:?}, got {:?}",
+                expected, actual
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ShrinkCapturedReplayError {}
+
+impl From<TraceProjectionError> for ShrinkCapturedReplayError {
+    fn from(value: TraceProjectionError) -> Self {
+        Self::Projection(value)
+    }
 }
 
 impl<Op, Output> ShrinkCapturedReport<Op, Output> {
@@ -263,6 +320,16 @@ where
         for op in self.shrunk_capture.history.operations() {
             writeln!(f, "    - {op:?}")?;
         }
+        if !self.fact_set_rejections.is_empty() {
+            writeln!(f, "fact-set-preserving refusals:")?;
+            for delta in &self.fact_set_rejections {
+                writeln!(
+                    f,
+                    "    deletion_index={} expected={:?} actual={:?}",
+                    delta.deletion_index, delta.expected, delta.actual
+                )?;
+            }
+        }
         write!(
             f,
             "review step: fact set was preserved exactly; commit the shrunk \
@@ -284,7 +351,7 @@ pub fn shrink_captured_replay<Op, Output, Runner, StillFails>(
     reason: impl Into<String>,
     mut runner: Runner,
     mut still_fails: StillFails,
-) -> Result<ShrinkCapturedReport<Op, Output>, TraceProjectionError>
+) -> Result<ShrinkCapturedReport<Op, Output>, ShrinkCapturedReplayError>
 where
     Op: Clone,
     Runner: FnMut(&ReplayCase<Op>) -> Result<LiveReplayReport<Output>, TraceProjectionError>,
@@ -292,10 +359,18 @@ where
 {
     let original_len = capture.history.len();
     let mut current_capture = capture.clone();
-    let mut current_report = runner(&current_capture.to_replay_case())?;
     let expected_facts = capture.live_facts.clone();
+    let mut current_report = runner(&current_capture.to_replay_case())?;
+    if !same_fact_set(&expected_facts, &current_report.live_facts) {
+        return Err(ShrinkCapturedReplayError::FactSetChanged {
+            phase: "initial replay",
+            expected: fact_lines(&expected_facts),
+            actual: fact_lines(&current_report.live_facts),
+        });
+    }
     let mut index = 0;
     let mut attempts = 0;
+    let mut fact_set_rejections = Vec::new();
 
     while index < current_capture.history.len() && attempts < config.max_attempts {
         let mut candidate_ops = current_capture.history.operations().to_vec();
@@ -307,9 +382,16 @@ where
         attempts += 1;
 
         let candidate_report = runner(&candidate_case)?;
-        if still_fails(&candidate_report)
-            && same_fact_set(&expected_facts, &candidate_report.live_facts)
-        {
+        if still_fails(&candidate_report) {
+            if !same_fact_set(&expected_facts, &candidate_report.live_facts) {
+                fact_set_rejections.push(FactSetDelta {
+                    deletion_index: index,
+                    expected: fact_lines(&expected_facts),
+                    actual: fact_lines(&candidate_report.live_facts),
+                });
+                index += 1;
+                continue;
+            }
             candidate_capture.expected.event_count = candidate_report.replay.event_count;
             candidate_capture.expected.trace_hash = candidate_report.replay.trace_hash;
             current_capture = candidate_capture;
@@ -330,13 +412,26 @@ where
         reason: reason.into(),
         shrunk_capture: current_capture,
         shrunk_report: current_report,
+        fact_set_rejections,
     })
 }
 
-fn same_fact_set(left: &[super::LiveReplayFact], right: &[super::LiveReplayFact]) -> bool {
-    let mut left = left.iter().map(ToString::to_string).collect::<Vec<_>>();
-    let mut right = right.iter().map(ToString::to_string).collect::<Vec<_>>();
+fn same_fact_set(left: &[LiveReplayFact], right: &[LiveReplayFact]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    let mut unmatched = right.to_vec();
+    for fact in left {
+        let Some(index) = unmatched.iter().position(|candidate| candidate == fact) else {
+            return false;
+        };
+        unmatched.remove(index);
+    }
+    unmatched.is_empty()
+}
+
+fn fact_lines(facts: &[LiveReplayFact]) -> Vec<String> {
+    let mut left = facts.iter().map(ToString::to_string).collect::<Vec<_>>();
     left.sort();
-    right.sort();
-    left == right
+    left
 }
