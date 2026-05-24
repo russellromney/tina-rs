@@ -18,10 +18,11 @@ use tina::prelude::*;
 use tina::{IsolateId, ShardId};
 use tina_runtime::{EventId, RuntimeEvent, RuntimeEventKind, SendRejectedReason};
 use tina_sim::dst::{
-    LiveReplayCapture, LiveReplayFact, LiveReplayReport, ReplayCase, ReplayConfig, ReplayReport,
-    RuntimeEventKindName, ShrinkConfig, TraceProjection, assert_replay_case, check_captured_replay,
-    check_replay_case, discover_constants, read_saved_replay_case, shrink_replay_case,
-    write_saved_replay_case,
+    CaptureLimits, CaptureSource, LiveReplayCapture, LiveReplayFact, LiveReplayReport, ReplayCase,
+    ReplayConfig, ReplayReport, RuntimeEventKindName, ShrinkCapturedReplayError, ShrinkConfig,
+    TraceCompleteness, TraceProjection, assert_replay_case, capture_live_run,
+    check_captured_replay, check_replay_case, discover_constants, read_saved_replay_case,
+    shrink_captured_replay, shrink_replay_case, write_saved_replay_case,
 };
 use tina_sim::{FaultConfig, LocalSendFaultMode, Simulator};
 
@@ -303,6 +304,11 @@ fn capture_burst_overflow() -> LiveReplayCapture<Op> {
         "HTTP/1 keepalive/body pressure live-shaped capture",
         &report,
     )
+    .with_source_metadata(
+        CaptureSource::new("HTTP/1 keepalive/body pressure live-shaped capture")
+            .runtime_kind("sim-smoke")
+            .backend("sim"),
+    )
     .with_live_fact(fact)
 }
 
@@ -350,6 +356,16 @@ fn captured_http1_body_pressure_case_saves_and_converts() {
 
     assert_eq!(saved.name, capture.name);
     assert_eq!(saved.history, capture.history.operations());
+    assert_eq!(
+        saved.source_metadata.label,
+        "HTTP/1 keepalive/body pressure live-shaped capture"
+    );
+    assert_eq!(saved.source_metadata.runtime_kind, "sim-smoke");
+    assert_eq!(saved.source_metadata.backend, "sim");
+    assert_eq!(
+        saved.source_metadata.trace_completeness,
+        TraceCompleteness::Complete
+    );
     assert_eq!(saved.live_facts.len(), capture.live_facts.len());
     assert!(
         saved
@@ -368,6 +384,31 @@ fn captured_http1_body_pressure_case_saves_and_converts() {
         .expect("saved config hash matches typed config");
     check_captured_replay(&capture, &case, run_burst_overflow_live_replay)
         .expect("saved captured case converts back to replay");
+}
+
+#[test]
+fn saved_replay_case_round_trips_full_source_metadata() {
+    let mut capture = capture_burst_overflow().with_source_metadata(
+        CaptureSource::new("metadata round trip")
+            .runtime_kind("threaded")
+            .backend("live")
+            .git_revision("abc123"),
+    );
+    capture.source_metadata.schema_version = 99;
+    capture.source_metadata.platform = "test-os-test-arch".to_owned();
+    capture.source_metadata.crate_revision = Some("crate-1".to_owned());
+    capture.source_metadata.trace_completeness = TraceCompleteness::Partial;
+
+    let path = std::env::temp_dir().join(format!(
+        "tina-source-metadata-{}-{}.case",
+        std::process::id(),
+        capture.expected.trace_hash
+    ));
+    write_saved_replay_case(&path, &capture, encode_op).expect("write saved replay case");
+    let saved = read_saved_replay_case(&path, decode_op).expect("read saved replay case");
+    let _ = std::fs::remove_file(&path);
+
+    assert_eq!(saved.source_metadata, capture.source_metadata);
 }
 
 #[test]
@@ -411,6 +452,24 @@ fn live_replay_capture_includes_config_topology_and_mailboxes() {
     assert_eq!(capture.config.mailbox(SINK_ROLE), 2);
     assert!(capture.topology_roles.contains(&SOURCE_ROLE));
     assert!(capture.topology_roles.contains(&SINK_ROLE));
+    assert_eq!(
+        capture.source_metadata.trace_completeness,
+        TraceCompleteness::Complete
+    );
+    assert!(
+        capture
+            .summary()
+            .to_string()
+            .contains("replay_blocked=false")
+    );
+    assert!(
+        capture
+            .summary()
+            .to_string()
+            .contains("name=\"http1 keepalive body pressure under local-send delay\""),
+        "summary must keep key=value output parseable for human case names: {}",
+        capture.summary(),
+    );
 }
 
 #[test]
@@ -433,6 +492,184 @@ fn live_replay_unsupported_fact_is_reported_fail_closed() {
     let rendered = mismatch.to_string();
     assert!(rendered.contains("unsupported fact"));
     assert!(rendered.contains("reqwest completion body bytes"));
+}
+
+#[test]
+fn partial_trace_capture_is_saveable_but_not_exact_replayable() {
+    let capture = capture_burst_overflow().with_source_metadata(
+        CaptureSource::new("partial live trace")
+            .runtime_kind("threaded")
+            .backend("live")
+            .with_trace_completeness(TraceCompleteness::Partial),
+    );
+    assert!(capture.summary().replay_blocked);
+
+    let case = capture.to_replay_case();
+    let mismatch = check_captured_replay(&capture, &case, run_burst_overflow_live_replay)
+        .expect_err("partial trace must block exact replay");
+    assert!(mismatch.includes(tina_sim::dst::CapturedReplayChange::Capture));
+    assert!(mismatch.includes(tina_sim::dst::CapturedReplayChange::Source));
+}
+
+#[test]
+fn saved_replay_case_rejects_unsupported_fact_delimiter_loss() {
+    let capture = capture_burst_overflow()
+        .with_unsupported_fact("external | completion", "would be ambiguous in line format");
+    let path = std::env::temp_dir().join(format!(
+        "tina-delimiter-loss-{}-{}.case",
+        std::process::id(),
+        capture.expected.trace_hash
+    ));
+    let err = write_saved_replay_case(&path, &capture, encode_op)
+        .expect_err("ambiguous unsupported facts must not be saved lossily");
+    let _ = std::fs::remove_file(&path);
+    assert!(err.to_string().contains("delimiter"));
+}
+
+#[test]
+fn capture_live_run_builder_records_metadata_and_facts() {
+    let case = burst_overflow_case();
+    let events = vec![fake_event(1, RuntimeEventKind::HandlerStarted)];
+    let fact = LiveReplayFact::capacity_surface(&CapacitySurfaceReport::count(
+        "builder.capacity",
+        CapacityMode::Fixed,
+        4,
+        1,
+        2,
+        0,
+    ));
+
+    let capture = capture_live_run(case.name)
+        .with_seed(case.seed)
+        .with_config(case.config.clone())
+        .with_scenario(case.scenario)
+        .with_history(case.history.operations().to_vec())
+        .with_invariant(case.invariant)
+        .with_source_metadata(
+            CaptureSource::new("builder live smoke")
+                .runtime_kind("threaded")
+                .backend("live"),
+        )
+        .with_trace(&events)
+        .with_fact(fact)
+        .finish()
+        .expect("builder capture");
+
+    assert_eq!(capture.expected.event_count, 1);
+    assert_eq!(capture.source_metadata.runtime_kind, "threaded");
+    assert_eq!(capture.source_metadata.label, "builder live smoke");
+    assert_eq!(capture.live_facts.len(), 1);
+    assert!(capture.summary().to_string().contains(case.name));
+}
+
+#[test]
+fn bounded_capture_adds_explicit_truncation_truth_and_fails_closed() {
+    let case = burst_overflow_case();
+    let events = vec![
+        fake_event(1, RuntimeEventKind::HandlerStarted),
+        fake_event(2, RuntimeEventKind::MailboxAccepted),
+    ];
+    let capture = capture_live_run(case.name)
+        .with_limits(CaptureLimits {
+            max_events: 1,
+            ..CaptureLimits::default()
+        })
+        .with_seed(case.seed)
+        .with_config(case.config.clone())
+        .with_scenario(case.scenario)
+        .with_history(case.history.operations().to_vec())
+        .with_invariant(case.invariant)
+        .with_source("bounded capture")
+        .with_trace(&events)
+        .finish()
+        .expect("truncated capture is saveable evidence");
+    assert!(capture.truncated);
+    assert!(
+        capture
+            .unsupported_facts
+            .iter()
+            .any(|fact| fact.fact == "TraceTruncated" || fact.fact == "CaptureFull")
+    );
+
+    let replay_case = capture.to_replay_case();
+    let mismatch = check_captured_replay(&capture, &replay_case, |_| {
+        LiveReplayReport::from_case_and_events(
+            &replay_case,
+            &events[..1],
+            (),
+            TraceProjection::Exact,
+        )
+    })
+    .expect_err("default exact replay rejects truncated capture");
+    assert!(mismatch.includes(tina_sim::dst::CapturedReplayChange::Capture));
+    assert!(mismatch.to_string().contains("CaptureFull"));
+}
+
+#[test]
+fn bounded_capture_unicode_truncation_is_safe_and_visible() {
+    let case = burst_overflow_case();
+    let events = vec![fake_event(1, RuntimeEventKind::HandlerStarted)];
+    let capture = capture_live_run(case.name)
+        .with_limits(CaptureLimits {
+            max_string_bytes: 1,
+            ..CaptureLimits::default()
+        })
+        .with_seed(case.seed)
+        .with_config(case.config.clone())
+        .with_scenario(case.scenario)
+        .with_history(case.history.operations().to_vec())
+        .with_invariant(case.invariant)
+        .with_source("unicode truncation")
+        .with_trace(&events)
+        .with_unsupported_fact("ééé", "原因原因")
+        .finish()
+        .expect("unicode truncation should not panic");
+
+    assert_eq!(capture.unsupported_facts[0].fact, "...");
+    assert!(capture.unsupported_facts[0].reason.ends_with("..."));
+}
+
+#[test]
+fn live_fact_cap_records_one_truncation_fact_and_fails_closed() {
+    let case = burst_overflow_case();
+    let events = vec![fake_event(1, RuntimeEventKind::HandlerStarted)];
+    let fact = LiveReplayFact::capacity_surface(&CapacitySurfaceReport::count(
+        "capped.fact",
+        CapacityMode::Fixed,
+        1,
+        0,
+        0,
+        0,
+    ));
+    let capture = capture_live_run(case.name)
+        .with_limits(CaptureLimits {
+            max_live_facts: 1,
+            ..CaptureLimits::default()
+        })
+        .with_seed(case.seed)
+        .with_config(case.config.clone())
+        .with_scenario(case.scenario)
+        .with_history(case.history.operations().to_vec())
+        .with_invariant(case.invariant)
+        .with_source("fact cap")
+        .with_trace(&events)
+        .with_fact(fact.clone())
+        .with_fact(fact.clone())
+        .with_fact(fact)
+        .finish()
+        .expect("fact cap capture");
+
+    assert!(capture.truncated);
+    assert_eq!(capture.live_facts.len(), 1);
+    assert_eq!(
+        capture
+            .unsupported_facts
+            .iter()
+            .filter(|fact| fact.fact == "FactTruncated")
+            .count(),
+        1,
+        "repeated over-cap facts should not make unbounded unsupported entries",
+    );
 }
 
 #[test]
@@ -535,4 +772,89 @@ fn live_replay_shrink_refreshes_constants_for_live_derived_case() {
         report.shrunk_case.expected_trace_hash,
         report.shrunk_report.trace_hash
     );
+}
+
+#[test]
+fn shrink_captured_replay_preserves_fact_set_by_default() {
+    let capture = capture_burst_overflow();
+    let report = shrink_captured_replay(
+        &capture,
+        ShrinkConfig::default(),
+        "full rejection fact remains exact",
+        run_burst_overflow_live_replay,
+        |report| report.replay.output.full_rejections >= 1,
+    )
+    .expect("shrink runs");
+
+    assert_eq!(
+        report.capture().expected.event_count,
+        report.shrunk_report.replay.event_count
+    );
+    assert_eq!(
+        report.capture().expected.trace_hash,
+        report.shrunk_report.replay.trace_hash
+    );
+    assert_eq!(
+        report.capture().live_facts,
+        capture.live_facts,
+        "live-derived shrink preserves proving facts by default",
+    );
+}
+
+#[test]
+fn shrink_captured_replay_refuses_when_initial_fact_set_is_missing() {
+    let capture = capture_burst_overflow();
+    let err = shrink_captured_replay(
+        &capture,
+        ShrinkConfig::default(),
+        "full rejection fact remains exact",
+        |case| {
+            let report = run_burst_overflow_case(case);
+            Ok(LiveReplayReport::exact(report))
+        },
+        |report| report.replay.output.full_rejections >= 1,
+    )
+    .expect_err("initial fact mismatch must block shrink");
+
+    match err {
+        ShrinkCapturedReplayError::FactSetChanged {
+            phase,
+            expected,
+            actual,
+        } => {
+            assert_eq!(phase, "initial replay");
+            assert_eq!(expected.len(), 1);
+            assert!(actual.is_empty());
+        }
+        other => panic!("unexpected shrink error: {other:?}"),
+    }
+}
+
+#[test]
+fn shrink_captured_replay_names_candidate_fact_set_delta() {
+    let capture = capture_burst_overflow();
+    let original_len = capture.history.len();
+    let report = shrink_captured_replay(
+        &capture,
+        ShrinkConfig { max_attempts: 1 },
+        "candidate fact delta is visible",
+        |case| {
+            let report = run_burst_overflow_case(case);
+            let live_report = if case.history.len() == original_len {
+                LiveReplayReport::exact(report).with_live_facts(capture.live_facts.clone())
+            } else {
+                LiveReplayReport::exact(report)
+            };
+            Ok(live_report)
+        },
+        |_| true,
+    )
+    .expect("candidate fact deltas refuse candidates without failing the shrink");
+
+    assert_eq!(report.shrunk_len, original_len);
+    assert_eq!(report.fact_set_rejections.len(), 1);
+    assert_eq!(report.fact_set_rejections[0].deletion_index, 0);
+    assert_eq!(report.fact_set_rejections[0].expected.len(), 1);
+    assert!(report.fact_set_rejections[0].actual.is_empty());
+    assert!(report.to_string().contains("fact-set-preserving refusals"));
 }
