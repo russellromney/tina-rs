@@ -143,6 +143,38 @@ emit_events(runtime.trace().iter());
 emit_trace_snapshot(&snapshot);
 ```
 
+### Timeline JSON
+
+For visual inspection, `tina-tracing` can export one Chrome Trace
+Event JSON file from an existing `TraceSnapshot` or `&[RuntimeEvent]`:
+
+```rust
+use tina_tracing::{TraceTimeline, write_chrome_trace_json};
+
+let timeline = TraceTimeline::from_snapshot(&snapshot)
+    .with_name("mini-saas smoke")
+    .finish();
+
+write_chrome_trace_json(&timeline, "target/tina-traces/smoke.trace.json")?;
+```
+
+Open the file in Chrome's tracing viewer or Perfetto. The timeline is
+only a view: `RuntimeEvent` remains the canonical truth for replay,
+hashing, and assertions. Timeline timestamps use
+`time_kind="logical_event_id"`: `ts` is the event id, and duration
+slices show event ordering distance, not wall-clock latency. Partial
+snapshots stay explicit in metadata with `missing_shards`; exporting
+does not make an incomplete trace complete.
+
+Runnable demo:
+
+```bash
+cargo run --example export_timeline -p tina-tracing
+```
+
+It writes `target/tina-traces/export_timeline.trace.json` and prints
+the path.
+
 Per-snapshot live topology dump:
 
 ```rust
