@@ -428,6 +428,10 @@ fn push_runtime_events(timeline: &TraceTimeline, out: &mut Vec<EmittedEvent>, or
             | RuntimeEventKind::RestartChildSkipped { .. }
             | RuntimeEventKind::RestartChildCompleted { .. }
             | RuntimeEventKind::ChildStopped { .. }
+            | RuntimeEventKind::RemoteChildStopRequested { .. }
+            | RuntimeEventKind::RemoteChildStopped { .. }
+            | RuntimeEventKind::RemoteChildControlRejected { .. }
+            | RuntimeEventKind::RemoteChildControlPressure { .. }
             | RuntimeEventKind::IsolateStopped
             | RuntimeEventKind::MessageAbandoned
             | RuntimeEventKind::CallReplyRejected { .. }
@@ -917,6 +921,33 @@ fn insert_kind_args(args: &mut Map<String, Value>, kind: RuntimeEventKind) {
             args.insert("child_isolate".into(), json!(child_isolate.get()));
             args.insert("child_generation".into(), json!(child_generation.get()));
         }
+        RuntimeEventKind::RemoteChildStopRequested {
+            child_shard,
+            child_ordinal,
+            child_isolate,
+            child_generation,
+        }
+        | RuntimeEventKind::RemoteChildStopped {
+            child_shard,
+            child_ordinal,
+            child_isolate,
+            child_generation,
+        } => {
+            args.insert("child_shard".into(), json!(child_shard.get()));
+            args.insert("child_ordinal".into(), json!(child_ordinal));
+            args.insert("child_isolate".into(), json!(child_isolate.get()));
+            args.insert("child_generation".into(), json!(child_generation.get()));
+        }
+        RuntimeEventKind::RemoteChildControlRejected {
+            target_shard,
+            reason,
+        } => {
+            args.insert("target_shard".into(), json!(target_shard.get()));
+            args.insert("reason".into(), json!(send_rejected_reason_name(reason)));
+        }
+        RuntimeEventKind::RemoteChildControlPressure { capacity } => {
+            args.insert("capacity".into(), json!(capacity));
+        }
         RuntimeEventKind::CallDispatchAttempted { call_id, call_kind }
         | RuntimeEventKind::CallCompleted { call_id, call_kind } => {
             insert_call_args(args, call_id, call_kind);
@@ -1023,6 +1054,10 @@ fn event_name(kind: RuntimeEventKind) -> &'static str {
         RuntimeEventKind::RestartChildSkipped { .. } => "restart_child_skipped",
         RuntimeEventKind::RestartChildCompleted { .. } => "restart_child_completed",
         RuntimeEventKind::ChildStopped { .. } => "child_stopped",
+        RuntimeEventKind::RemoteChildStopRequested { .. } => "remote_child_stop_requested",
+        RuntimeEventKind::RemoteChildStopped { .. } => "remote_child_stopped",
+        RuntimeEventKind::RemoteChildControlRejected { .. } => "remote_child_control_rejected",
+        RuntimeEventKind::RemoteChildControlPressure { .. } => "remote_child_control_pressure",
         RuntimeEventKind::IsolateStopped => "isolate_stopped",
         RuntimeEventKind::MessageAbandoned => "message_abandoned",
         RuntimeEventKind::CallDispatchAttempted { .. } => "call_dispatch_attempted",
@@ -1073,6 +1108,10 @@ fn event_category(kind: RuntimeEventKind) -> &'static str {
         | RuntimeEventKind::RestartChildSkipped { .. }
         | RuntimeEventKind::RestartChildCompleted { .. }
         | RuntimeEventKind::ChildStopped { .. }
+        | RuntimeEventKind::RemoteChildStopRequested { .. }
+        | RuntimeEventKind::RemoteChildStopped { .. }
+        | RuntimeEventKind::RemoteChildControlRejected { .. }
+        | RuntimeEventKind::RemoteChildControlPressure { .. }
         | RuntimeEventKind::IsolateStopped
         | RuntimeEventKind::MessageAbandoned => "lifecycle",
         RuntimeEventKind::DeferredReplyCaptured { .. }
