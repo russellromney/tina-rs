@@ -145,36 +145,154 @@ fn apply_trace<'a>(
             continue;
         }
         match event.kind() {
-            RuntimeEventKind::RemoteChildStopRequested { child_ordinal, .. }
-            | RuntimeEventKind::ChildStopped { child_ordinal, .. }
-                if child_ordinal == child.child_ordinal =>
+            RuntimeEventKind::RemoteChildStopRequested {
+                child_ordinal,
+                child_isolate,
+                child_generation,
+                ..
+            }
+            | RuntimeEventKind::ChildStopped {
+                child_ordinal,
+                child_isolate,
+                child_generation,
+            } if child_ordinal == child.child_ordinal
+                && child_isolate == child.isolate
+                && child_generation == child.generation =>
             {
                 child.state = ChildLifecycleState::Stopping;
             }
-            RuntimeEventKind::RemoteChildStopped { child_ordinal, .. }
-                if child_ordinal == child.child_ordinal =>
+            RuntimeEventKind::RemoteChildStopped {
+                child_ordinal,
+                child_isolate,
+                child_generation,
+                ..
+            } if child_ordinal == child.child_ordinal
+                && child_isolate == child.isolate
+                && child_generation == child.generation =>
             {
                 child.state = ChildLifecycleState::Stopped;
             }
             RuntimeEventKind::RestartChildSkipped {
                 child_ordinal,
+                old_isolate,
+                old_generation,
                 reason,
                 ..
-            } if child_ordinal == child.child_ordinal => {
+            } if child_ordinal == child.child_ordinal
+                && old_isolate == child.isolate
+                && old_generation == child.generation =>
+            {
                 child.state = ChildLifecycleState::RestartSkipped;
                 child.last_restart_skipped = Some(reason);
             }
             RuntimeEventKind::RestartChildCompleted {
                 child_ordinal,
+                old_isolate,
+                old_generation,
                 new_isolate,
                 new_generation,
                 ..
             } if child_ordinal == child.child_ordinal => {
-                child.isolate = new_isolate;
-                child.generation = new_generation;
-                child.state = ChildLifecycleState::Restarted;
+                if old_isolate == child.isolate && old_generation == child.generation {
+                    child.isolate = new_isolate;
+                    child.generation = new_generation;
+                    child.state = ChildLifecycleState::Restarted;
+                } else if new_isolate == child.isolate && new_generation == child.generation {
+                    child.state = ChildLifecycleState::Restarted;
+                }
             }
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{EventId, RuntimeEventKind};
+
+    fn event(id: u64, parent: IsolateId, kind: RuntimeEventKind) -> RuntimeEvent {
+        RuntimeEvent::new(EventId::new(id), None, ShardId::new(1), parent, kind)
+    }
+
+    fn child() -> ChildLifecycle {
+        ChildLifecycle {
+            child_ordinal: 0,
+            shard: ShardId::new(2),
+            isolate: IsolateId::new(10),
+            generation: AddressGeneration::new(1),
+            state: ChildLifecycleState::Live,
+            last_restart_skipped: None,
+        }
+    }
+
+    #[test]
+    fn stale_old_incarnation_stop_does_not_clobber_restarted_child() {
+        let parent = IsolateId::new(1);
+        let mut child = child();
+        let events = [
+            event(
+                1,
+                parent,
+                RuntimeEventKind::RestartChildCompleted {
+                    child_ordinal: 0,
+                    old_isolate: IsolateId::new(10),
+                    old_generation: AddressGeneration::new(1),
+                    new_isolate: IsolateId::new(11),
+                    new_generation: AddressGeneration::new(2),
+                },
+            ),
+            event(
+                2,
+                parent,
+                RuntimeEventKind::RemoteChildStopped {
+                    child_shard: ShardId::new(2),
+                    child_ordinal: 0,
+                    child_isolate: IsolateId::new(10),
+                    child_generation: AddressGeneration::new(1),
+                },
+            ),
+        ];
+
+        apply_trace(events.iter(), parent, &mut child);
+
+        assert_eq!(child.isolate, IsolateId::new(11));
+        assert_eq!(child.generation, AddressGeneration::new(2));
+        assert_eq!(child.state, ChildLifecycleState::Restarted);
+    }
+
+    #[test]
+    fn current_incarnation_stop_after_restart_marks_replacement_stopped() {
+        let parent = IsolateId::new(1);
+        let mut child = child();
+        let events = [
+            event(
+                1,
+                parent,
+                RuntimeEventKind::RestartChildCompleted {
+                    child_ordinal: 0,
+                    old_isolate: IsolateId::new(10),
+                    old_generation: AddressGeneration::new(1),
+                    new_isolate: IsolateId::new(11),
+                    new_generation: AddressGeneration::new(2),
+                },
+            ),
+            event(
+                2,
+                parent,
+                RuntimeEventKind::RemoteChildStopped {
+                    child_shard: ShardId::new(2),
+                    child_ordinal: 0,
+                    child_isolate: IsolateId::new(11),
+                    child_generation: AddressGeneration::new(2),
+                },
+            ),
+        ];
+
+        apply_trace(events.iter(), parent, &mut child);
+
+        assert_eq!(child.isolate, IsolateId::new(11));
+        assert_eq!(child.generation, AddressGeneration::new(2));
+        assert_eq!(child.state, ChildLifecycleState::Stopped);
     }
 }
