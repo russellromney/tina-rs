@@ -4,6 +4,18 @@ This file records completed work.
 
 ## Unreleased
 
+### Native WebSocket Client Session
+
+- Added a native bounded WebSocket client session to `tina-http` with explicit
+  `ws://` and `wss://` targets, native HTTP/1.1 upgrade validation, client
+  frame masking, pull-shaped `Receive`, typed send/report calls, TLS trust-root
+  truth, protocol-close facts, and visible pressure counters.
+- Hardened WebSocket client terminal behavior: connect failure returns typed
+  `Connect`, failed handshakes preserve the pending connect reply,
+  receive-before-connect returns `NotConnected`, close remains reportable, and
+  call-only messages delivered by `try_send` increment
+  `wrong_lane_messages` instead of disappearing as uncounted no-ops.
+
 ### Hostile Review Fixes
 
 - Made SQLite and SQLx bridge installed addresses callable capabilities

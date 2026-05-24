@@ -116,6 +116,9 @@ pub struct WebSocketClientReport {
     pub pings_received: u64,
     pub pongs_received: u64,
     pub protocol_errors: u64,
+    /// Call-only messages received through fire-and-forget `try_send`.
+    /// This is caller misuse, but it must be visible in release builds.
+    pub wrong_lane_messages: u64,
     pub outbound_queue_full: u64,
     pub outbound_bytes_full: u64,
     pub queued_events: usize,
@@ -260,7 +263,7 @@ impl<S: Shard + 'static> Isolate for WebSocketClientConnection<S> {
             WebSocketClientMsg::Connect { .. }
             | WebSocketClientMsg::Send(_)
             | WebSocketClientMsg::Receive
-            | WebSocketClientMsg::Report => noop(),
+            | WebSocketClientMsg::Report => self.wrong_lane_message(),
         }
     }
 
@@ -739,6 +742,11 @@ impl<S: Shard + 'static> WebSocketClientConnection<S> {
         report
     }
 
+    fn wrong_lane_message(&mut self) -> Effect<Self> {
+        self.report.wrong_lane_messages = self.report.wrong_lane_messages.saturating_add(1);
+        noop()
+    }
+
     fn next_mask(&mut self) -> [u8; 4] {
         self.mask_seed = self
             .mask_seed
@@ -829,4 +837,20 @@ fn is_subprotocol_token(token: &str) -> bool {
                     | b'a'..=b'z'
             )
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wrong_lane_message_is_counted_in_release_path() {
+        let mut client =
+            WebSocketClientConnection::<tina::SingleShard>::new(WebSocketLimits::default());
+
+        let _ = client.wrong_lane_message();
+        let _ = client.wrong_lane_message();
+
+        assert_eq!(client.snapshot().wrong_lane_messages, 2);
+    }
 }
