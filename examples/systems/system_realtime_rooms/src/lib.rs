@@ -952,6 +952,12 @@ pub mod test_client {
     }
 
     impl Client {
+        pub fn send_text(&mut self, text: &str) -> anyhow::Result<()> {
+            self.ws
+                .send(Message::Text(text.to_owned().into()))
+                .map_err(anyhow::Error::from)
+        }
+
         pub fn recv_text_timeout(&mut self, timeout: Duration) -> RecvOutcome {
             if let MaybeTlsStream::Plain(stream) = self.ws.get_mut() {
                 let _ = stream.set_read_timeout(Some(timeout));
