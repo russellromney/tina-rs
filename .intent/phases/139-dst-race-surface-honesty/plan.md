@@ -3,6 +3,12 @@
 ## Status
 
 - Planned (2026-05-24). Half honesty-doc edit, half loom/shuttle expansion.
+- **Verified against `origin/main` a6cbaa9:** live multi-shard `trace()` merges +
+  sorts by event id (`threaded_multi_shard.rs:570-580`), "events across shards
+  interleave freely" comment still at `:106`, loom still only on
+  `tina-mailbox-spsc`, `LiveReplayCapture`/`LiveReplayFact` present
+  (`tina-sim/src/dst/replay_case.rs`). The cross-shard-child-ownership work (#199)
+  did not change the introspection/interleaving story. Premise holds.
 - Closes the gap the thread-per-core review named: the deterministic oracle is
   single-threaded on purpose, so it proves **logical** interleavings, not
   **physical** memory-ordering races on the live parallel substrate — and the

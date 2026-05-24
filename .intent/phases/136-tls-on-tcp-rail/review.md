@@ -114,3 +114,31 @@ process spawn are expected survivors with written justification.
 The HTTP/2 ">64KB response" deadlock (`http2/server.rs:1245`,
 `http2_client_adversarial.rs:801`) is an HTTP/2 flow-control test limitation, not
 the TLS lane. It is out of scope here and must not be folded into the #16 story.
+
+## Plan Review 2 — re-verification against `origin/main` a6cbaa9 (2026-05-24)
+
+Plan Review 1 (and plan v2) were authored against a stale branch. Re-verified
+every Starting Fact on main. One premise was wrong:
+
+- **The single-serial-worker / deadlock / "can't share a runtime" framing is
+  stale.** Main reworked TLS to **one spawned OS thread per in-flight TLS op**
+  (`tls.rs:601` `thread::Builder...spawn("tina-tls-{call_id}")`, bounded by
+  `tls_lane_capacity` → `CallError::TlsFull`, reaped at `tls.rs:798`). FINDINGS
+  #16 is already **"resolved first form"** by this rework; the quiet-stream test
+  `local_system_tls_quiet_stream_does_not_block_second_connection` proves
+  server+client share a runtime *today*.
+- **Consequence for the plan:** the motivation is no longer "fix the deadlock"
+  and the headline proof is no longer a "#16 killer." The real TPC defect is now
+  **per-operation OS-thread spawn/reap churn on the hot path** — strictly worse
+  than a serial worker. Plan v3 reframes Starting Facts, motivation, Staged
+  Delivery (TLS-4 deletes the per-op spawn + `reap_finished_workers`), and makes
+  the **headline proof "zero TLS threads spawned"**.
+- **Facts that still hold (verified):** `StreamOwned` over std `TcpStream`/
+  `TcpListener` (`tls.rs:8-9`, connect `:934`, bind `:994`); `tls_connect` takes a
+  resolved `SocketAddr` + SNI (`call/tls.rs:10-15`, DNS independent); one-pending-op
+  → `ResourceBusy` (`driver/mod.rs:95,1222`); plain TCP on the Betelgeuse loop on
+  the shard thread (`threaded.rs:221,1423`); rustls sans-I/O API available.
+- **Line numbers** drifted from the stale-branch citations and are corrected in
+  plan v3.
+
+Everything else in Plan Review 1 stands.

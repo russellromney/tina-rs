@@ -4,10 +4,14 @@
 
 - Planned (2026-05-24). Implementation plan; auditing is done (this Status +
   Starting Facts capture it).
+- **Verified against `origin/main` a6cbaa9:** `storage.rs` has zero Betelgeuse
+  refs, `StorageLane` is still `Inline | Worker(std::fs thread)`, and Betelgeuse
+  exposes `open/pread/pwrite/fsync/mkdir/size` on both platforms (`io/darwin.rs`,
+  `io/linux.rs`). Premise holds.
 - Same anti-pattern as Phase 136 (TLS): a blocking worker lane that bypasses
   Betelgeuse, even though Betelgeuse already exposes the file ops we need.
 - Lower urgency than TLS (storage is correct today and cold for most services;
-  TLS is on the wrong substrate everywhere and deadlocks). Sequence after 136.
+  TLS spawns a thread per op and is on the wrong substrate). Sequence after 136.
 
 ## Starting Facts
 

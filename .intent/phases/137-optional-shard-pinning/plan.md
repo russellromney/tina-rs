@@ -1,114 +1,128 @@
-# Phase 137: Optional Shard Pinning
+# Phase 137: Hard Shard Pinning (finish the affinity layer)
 
 ## Status
 
-- Planned (2026-05-24). Not started.
-- Authored after a thread-per-core review found **no CPU affinity anywhere** in
-  the workspace: shard worker threads float across cores at the OS scheduler's
-  whim, eroding the cache/NUMA locality that is the point of thread-per-core.
-- Low effort, high leverage. Pairs naturally after Phase 136 (TLS off its lane),
-  which lowers the per-shard thread count and makes pinning cleaner.
+- Planned (2026-05-24), v2 after deep-dive against `origin/main` (`a6cbaa9`).
+  **The v1 premise ("no CPU affinity anywhere") was wrong** — it was written
+  against a stale branch. Main already ships the affinity *vocabulary,
+  config, and reporting*; what is missing is the syscall that actually pins.
+- This phase finishes that layer: make a requested core produce a real OS pin
+  on Linux, reported as `AffinityStatus::Applied`, instead of only advisory
+  intent.
+- Low effort, high leverage. Pairs naturally after Phase 136 (TLS off its
+  per-operation threads), which lowers the per-shard thread count.
 
-## Starting Facts
+## Starting Facts (verified on `origin/main` a6cbaa9)
 
-- `grep` for `affinity` / `sched_setaffinity` / `core_affinity` across the
-  workspace (excluding the vendored substrate) returns **nothing**.
-- Shard worker threads are spawned plainly at `threaded.rs:311` and
-  `threaded_multi_shard.rs:264` via `thread::Builder`, with no pinning.
-- SYSTEM.md already states hard OS thread pinning is **not claimed**. This phase
-  makes it an opt-in capability, not a silent default.
-- Per shard today there is one shard thread plus several mostly-idle helper-lane
-  threads (DNS, storage, process, unix, and — until Phase 136 — TLS). Pinning the
-  shard thread while leaving the helper threads free is the intended shape.
+- The affinity layer **already exists** — do not reinvent it:
+  - `tina-runtime/src/threaded.rs:73-78`: `configured_core: Option<usize>` —
+    "Desired OS core for this shard worker… does not hard-pin the worker
+    without a platform-specific affinity [backend]." Default `None`
+    (`threaded.rs:107`).
+  - `tina-runtime/src/live_report.rs:244-258`: `AffinityStatus { NotRequested,
+    Applied, Unsupported, Failed(String), AdvisoryOnly }`. `Applied` is
+    documented as "the backend proved hard affinity was applied."
+  - `LiveShardReport` carries `configured_core`, `observed_core`, and
+    `affinity_status` (`live_report.rs`).
+  - Today, setting `configured_core` yields `AffinityStatus::AdvisoryOnly`
+    (`live_report.rs:167-170`) — ownership intent, **no OS scheduling control**.
+    Nothing ever produces `Applied`.
+- Shard worker threads spawn at `threaded.rs:311` and
+  `threaded_multi_shard.rs:264` via `thread::Builder`. The pin must be applied
+  **inside the spawned thread**, before it runs its loop.
 
 ## Purpose
 
-Let an operator pin shard worker threads to cores, so the hot per-shard work
-keeps its caches warm and stays NUMA-local, without forcing it on anyone or
-lying under container CPU limits.
+Make `configured_core` real on platforms that can pin, and honest everywhere
+else — so a requested core is either an OS-proven `Applied` pin or a typed
+`Unsupported`/`Failed`, never `AdvisoryOnly` masquerading as control.
 
 ```text
-on a box where I own the cores, I can pin shard N to core N and keep the cold
-helper lanes floating, and on a box where I don't (k8s CPU quota), pinning
-degrades to off instead of pinning to cores I've been throttled off of
+on Linux I set configured_core = N and the shard worker is actually pinned to
+core N (observed_core == N, affinity_status == Applied); on macOS the same
+request reports Unsupported instead of pretending; helper lanes stay unpinned
 ```
 
 ## Includes
 
-- A `PinPolicy` config on the threaded multi-shard runtime:
-  - `Off` (default — current behavior, byte-for-byte unchanged),
-  - `Sequential` (shard *i* → core *i*),
-  - `Cores(Vec<usize>)` (shard *i* → the *i*-th core in the provided list).
-- Pinning applied at shard-thread spawn (`threaded.rs:311`,
-  `threaded_multi_shard.rs:264`) **only on platforms where the OS performs a real
-  hard pin** (Linux `sched_setaffinity`). We offer "hard pinning" only where it is
-  hard. Prefer a vetted dependency (`core_affinity`) restricted to platforms with
-  real support; a thin `libc` wrapper is acceptable if the crate's guarantees are
-  fuzzy.
-- **Helper-lane threads are explicitly NOT pinned.** They float onto spare cores
-  so they soak idle capacity rather than fighting a shard for its core. This is a
-  stated rule, not an accident.
-- Available-core detection so `Sequential` over-provisioned past the core count,
-  or `Cores([...])` naming an absent core, **fails loudly at setup** rather than
-  pinning wrong or silently.
-- Capability/topology report: the live topology snapshot names whether shards are
-  pinned and to which core (advisory ownership already exists; extend it to carry
-  real pin state, distinct from advisory).
+- A hard-pin step inside the shard worker thread body (`threaded.rs:311`,
+  `threaded_multi_shard.rs:264`): if `configured_core` is `Some(core)`, call
+  the platform pin **from within the new thread** before the loop starts.
+  - **Linux:** `sched_setaffinity` (via a vetted `core_affinity`-style dep
+    restricted to real-pin platforms, or a thin `libc` wrapper). On success set
+    `AffinityStatus::Applied` and record `observed_core`. On failure set
+    `Failed(reason)` and keep running unpinned.
+  - **macOS / any platform without a hard pin:** set
+    `AffinityStatus::Unsupported`. **No best-effort hint path.** Darwin offers
+    only affinity *hints*; we do not dress a hint up as a pin.
+- `observed_core` populated from a real read-back of the running thread's core
+  where the platform supports it (this is the proof hook).
+- **Helper-lane threads stay unpinned** (DNS, storage, process, unix, and TLS
+  workers until Phase 136 retires them). They float onto spare cores. Stated
+  rule, not an accident.
+- Available-core validation: a `configured_core` past the core count fails
+  loudly at setup (typed error), not a silent mis-pin.
+
+## Reuse, Do Not Reinvent
+
+- **Use the existing `configured_core` config.** Do **not** add a new
+  `PinPolicy` enum (the v1 plan's mistake). The knob already exists per shard.
+- **Use the existing `AffinityStatus` variants.** `Applied` / `Unsupported` /
+  `Failed` were added for exactly this; this phase makes them reachable.
+  `AdvisoryOnly` stays for callers who want intent-only reporting without a pin.
+- **Use the existing `LiveShardReport` fields** (`configured_core`,
+  `observed_core`, `affinity_status`). No new report surface.
 
 ## Does Not Include
 
-- Pinning helper lanes (intentional — see above).
-- **Best-effort macOS affinity hints.** macOS only offers thread-affinity
-  *hints*, not a hard pin. We do **not** ship a hint path dressed up as pinning.
-  On macOS (and any platform without a real hard pin) the capability reports
-  `NotClaimed` and `PinPolicy` other than `Off` returns a typed unsupported
-  result at setup. "Hard pinning" means the OS actually pins, or we don't claim
-  it.
-- NUMA-aware memory placement / first-touch allocation tuning. Out of scope; a
-  later phase if a workload proves it matters.
-- Any change to the explicit-step or simulator runtimes — pinning is a live-
-  substrate concern only and has no semantic effect.
-- A claim that pinning improves throughput. This phase ships the *mechanism* and
-  honest reporting; a benchmark phase owns any performance claim.
+- A new config enum or a second affinity surface.
+- Pinning helper lanes.
+- macOS best-effort hints (reports `Unsupported`).
+- NUMA memory placement / first-touch tuning.
+- Any change to explicit-step or simulator runtimes (live-substrate only; no
+  semantic effect).
+- A throughput claim (mechanism + honest reporting only; a benchmark phase owns
+  performance claims).
 
 ## How We Prove The New Behavior (direct proof)
 
-- `PinPolicy::Off` produces byte-identical behavior to today (no affinity call
-  made) — proved by a test asserting the spawn path takes the no-pin branch.
-- `Sequential` / `Cores` actually pin: a live test reads back the calling
-  thread's affinity mask inside the shard worker and asserts it matches the
-  requested core.
-- Over-provision / absent-core configs return a typed setup error, not a panic
-  and not a silent mis-pin.
-- Topology report reflects the pin state.
+- **Linux pin works:** with `configured_core = N`, the shard worker reports
+  `affinity_status == Applied` and `observed_core == N` (read back inside the
+  thread). This is the headline proof.
+- **`configured_core == None`** is byte-identical to today: `NotRequested`, no
+  affinity syscall (assert the no-pin branch).
+- **macOS / unsupported:** `configured_core = N` reports `Unsupported`, runs
+  unpinned, does not error the runtime.
+- **Out-of-range core** fails loudly at setup with a typed error.
+- **`Failed(reason)`** path: a forced-failure pin reports `Failed` and the shard
+  keeps running unpinned (pinning is best-effort-correctness, not fatal).
 
 ## How We Prove We Did Not Break Old Intent (blast-radius proof)
 
-- Full existing threaded-runtime and multi-shard suites pass with
-  `PinPolicy::Off` (default), confirming zero behavior change when the feature is
-  unused.
-- A run with pinning enabled passes the same multi-shard service e2e as the
-  unpinned run (pinning changes scheduling, not semantics).
-- On a platform without affinity support (or under a restrictive cgroup), setup
-  degrades to a typed unsupported/off result — proved by a guarded test or an
-  honest `NotClaimed`-style capability.
+- Existing threaded-runtime / multi-shard suites pass with `configured_core`
+  unset (default), confirming zero behavior change when unused.
+- Existing `AffinityStatus::AdvisoryOnly` reporting still works for callers that
+  set a core but do not want a hard pin (if that distinction is kept) — or the
+  advisory path is explicitly migrated and that migration is proven.
+- A pinned run passes the same multi-shard service e2e as an unpinned run
+  (pinning changes scheduling, not semantics).
 
 ## Risks / Open Decisions
 
-- **macOS is decided: `NotClaimed`.** No hint path. Hard pinning ships only where
-  the OS hard-pins (Linux). This is settled, not an open question.
-- **Crate vs raw syscall (open).** `core_affinity` (restricted to real-pin
-  platforms) vs a thin `sched_setaffinity` wrapper. Decide in implementation;
-  prefer the vetted crate if its Linux guarantee is solid.
+- **`AdvisoryOnly` vs `Applied` semantics.** Decide whether `configured_core`
+  now *always* attempts a hard pin (→ `Applied`/`Unsupported`/`Failed`), or
+  whether a separate opt-in distinguishes "advisory intent" from "please pin."
+  Lean: `configured_core` means "pin if you can," and `AdvisoryOnly` is retired
+  or kept only for an explicit intent-only mode. Resolve in `Plan Review 1`.
+- **macOS is decided: `Unsupported`.** No hint path. Settled.
+- **Crate vs raw syscall (open).** `core_affinity` (real-pin platforms only) vs
+  a thin `sched_setaffinity` wrapper. Decide in implementation.
 - **Container reality.** Under k8s CPU quotas "one thread per core" is fuzzy.
-  Default `Off` and loud-on-misconfig keep us honest; do not auto-pin.
-- **Interaction with helper lanes.** Keep them unpinned. If a future workload
-  shows a helper lane starving, that is a separate decision, not a reason to pin
-  everything.
+  Out-of-range / throttled cores must surface as `Failed`/`Unsupported`, not a
+  silent mis-pin.
 
 ## IDD Next Step
 
-Plan only (Session A). Next: `Plan Review 1` in
-`.intent/phases/137-optional-shard-pinning/review.md` before any code.
-Open scope questions for that review are flagged inline above — resolve the
-crate-vs-syscall and macOS-support questions there.
+Plan v2 (Session A), corrected against main. Next: `Plan Review 1` in
+`.intent/phases/137-optional-shard-pinning/review.md` (resolve the
+`AdvisoryOnly`-vs-`Applied` semantics and crate-vs-syscall) before any code.

@@ -2,8 +2,10 @@
 
 ## Status
 
-- Planned v2 (2026-05-24), after `Plan Review 1` (hostile) in `review.md`.
-  v2 folds in: downstream `tina-http` impact, the one-pending-op pump rule,
+- Planned v3 (2026-05-24). v2 was hostile-reviewed (`review.md` Plan Review 1);
+  v3 corrects the Starting Facts against `origin/main` (`a6cbaa9`) after a
+  deep-dive found the worker model had changed (`review.md` Plan Review 2).
+- v2/v3 fold in: downstream `tina-http` impact, the one-pending-op pump rule,
   the four subtle-semantics that are the real work, comprehensive proof, the
   specimen rewrite, the DNS clarification, and a pointer to the removal phase.
 - This is an **implementation** plan. The auditing is done (see `review.md`).
@@ -11,20 +13,28 @@
 - Sequencing: lands before HTTP/2 TLS ALPN / mTLS (Phase 127), which inherit the
   substrate TLS sits on.
 
-## Starting Facts (current truth in `tina-runtime/src/driver/tls.rs`)
+## Starting Facts (verified on `origin/main` a6cbaa9)
 
 - TLS uses `rustls::StreamOwned<Connection, std::net::TcpStream>` (`tls.rs:8-9`)
-  — rustls in **blocking mode** over a **std blocking socket**.
-- Server binds its own `std::net::TcpListener` (`tls.rs:993`); client uses
-  `TcpStream::connect_timeout` (`tls.rs:933`). Neither touches Betelgeuse.
-- Handshake/read/write/close run on a per-shard **worker thread** that drains
-  serially (`tls.rs:4`). One op blocks all TLS on that shard.
-- FINDINGS #16: Tina HTTPS server + client **cannot share a runtime** (the single
-  worker deadlocks both sides of one handshake); `HttpsListener` carries a
-  busy-wait `tls_accept_timeout` (`listener_tls.rs:44-72`) to yield between accept
-  polls.
+  — rustls in **blocking mode** over a **std blocking socket**. This is the core
+  problem and is unchanged. The fix target stands.
+- Server binds its own `std::net::TcpListener` (`tls.rs:994`); client uses
+  `TcpStream::connect_timeout` (`tls.rs:934`). Neither touches Betelgeuse.
+- **The worker model changed (this is the corrected fact).** TLS is no longer a
+  single serial worker. Each in-flight TLS op now runs on **its own spawned OS
+  thread** — `thread::Builder::new().name("tina-tls-{call_id}").spawn(...)`
+  (`tls.rs:601`), bounded by `tls_lane_capacity` (`CallError::TlsFull` when
+  exceeded), reaped by `reap_finished_workers` (`tls.rs:798`). FINDINGS #16 is
+  marked **"resolved first form"** by this rework
+  (`local_system_tls_quiet_stream_does_not_block_second_connection` pins it).
+- So the motivation is **not** "fix the serial deadlock" (already done). It is:
+  TLS still bypasses Betelgeuse on blocking sockets, and now **spawns and reaps
+  one OS thread per TLS operation** (handshake/read/write/close). That is
+  thread-churn on the hot path — strictly *worse* for thread-per-core than the
+  old single worker — capped only by `tls_lane_capacity`. The fix puts TLS on the
+  per-shard substrate and spawns **zero** threads.
 - Plain TCP already rides the per-shard Betelgeuse loop on the shard thread
-  (`threaded.rs:220-221,1408-1409`). TLS is the only side door.
+  (`threaded.rs:221,1423`). TLS is the only protocol still off-substrate.
 - `rustls` connection types are sans-I/O: `read_tls`, `process_new_packets`,
   `reader`, `writer`, `write_tls`, `is_handshaking`, `wants_read/write`,
   `alpn_protocol`. They never own a socket.
@@ -32,7 +42,7 @@
   (`call/tls.rs:10-15`): addr is **pre-resolved**; SNI name is carried. DNS is a
   separate rail and **is not part of this phase**.
 - The TCP/TLS rail rejects a second in-flight op on a stream with
-  `CallError::ResourceBusy` (`driver/mod.rs:95,1223`).
+  `CallError::ResourceBusy` (`driver/mod.rs:95,1222`).
 
 ## Purpose
 
@@ -111,8 +121,10 @@ tests:
 - `RuntimeCapabilities`: TLS family moves lane-backed/blocking →
   **completion-backed (rides the TCP rail)**. `tls_lane_capacity` removed or
   repurposed as a per-stream pending cap (decide at TLS-4).
-- FINDINGS #16 → Closed. SYSTEM.md TLS paragraph rewritten. The review memo's
-  Odin-divergence note updated to "TLS now on-substrate."
+- FINDINGS #16 (already "resolved first form" via per-op threads) updated to the
+  stronger closure: TLS is now completion-backed on the TCP rail, no per-op
+  threads. SYSTEM.md TLS paragraph rewritten; review memo's Odin-divergence note
+  updated to "TLS now on-substrate."
 
 ## Downstream Impact (must change in this phase)
 
@@ -121,14 +133,14 @@ tests:
   changes accordingly. Accept is now completion-driven.
 - `tina-http/src/keepalive.rs`: no signature change; re-point keepalive-over-TLS
   tests at a shared runtime.
-- `examples/specimen_native_https/*`: rewrite so a **Tina HTTPS client and Tina
-  HTTPS server run in one runtime** (today the client is stdlib rustls on a
-  separate thread/process). Keep the `tokio+tokio-rustls` impl as an interop
-  counterparty.
-- `tina-http/tests/client_tls_smoke.rs`: fold into the same-runtime path; it only
-  lived separately because of the deadlock.
-- `examples/README.md:148`: rewrite the `specimen_native_https` description (drop
-  "single-worker TLS lane" / "cannot share a runtime").
+- `examples/specimen_native_https/*` + `tina-http/tests/client_tls_smoke.rs`:
+  update to demonstrate **on-substrate TLS with zero TLS threads spawned**. (The
+  same-runtime client+server case already works on main via per-op threads — the
+  new win is that it works with no per-op thread spawn, on the shard loop.) Keep
+  the `tokio+tokio-rustls` impl as an interop counterparty.
+- `examples/README.md`: update the `specimen_native_https` description — drop the
+  "per-operation worker threads / `tls_lane_capacity`" framing, say
+  "completion-backed on the TCP rail."
 
 ## Does Not Include
 
@@ -150,10 +162,11 @@ tests:
   delete client std-socket + worker use; client TLS capability completion-backed.
 - **TLS-3 — server path.** `tls_accept` over the Betelgeuse **listener** rail;
   wrap accepted streams with `ServerConnection`; same pump. Removes the accept
-  busy-wait; server + client share one runtime.
-- **TLS-4 — delete the lane.** Remove `TlsWorkerLane`, `tls_worker_loop`,
-  `StreamOwned`, blocking `read_tls`/`write_tls`, std-socket imports. Update
-  capabilities, SYSTEM.md, FINDINGS #16, the downstream HTTP/specimen surface.
+  busy-wait and the per-accept thread spawn.
+- **TLS-4 — delete the lane.** Remove `TlsWorkerLane`, the per-op
+  `thread::Builder...spawn`, `reap_finished_workers`, `StreamOwned`, blocking
+  `read_tls`/`write_tls`, std-socket imports. Update capabilities, SYSTEM.md,
+  FINDINGS #16, the downstream HTTP/specimen surface.
 - **TLS-5 — optional, evidence-gated.** Only if a measured workload shows
   handshake asymmetric crypto as a shard hot spot: offload **only** that step.
   Not default.
@@ -163,13 +176,16 @@ tests:
 Handshake asymmetric crypto (ECDHE/RSA) now runs on the shard thread. Steady-state
 record crypto is cheap; a flood of *new* connections becomes shard CPU — the
 ordinary "CPU-bound handler blocks its shard" property, now **visible and
-boundable by accept rate** instead of hidden on a serial worker that deadlocks.
-TLS-5 is the escape hatch. Recorded so it is a decision, not a surprise.
+boundable by accept rate** instead of hidden on a churn of per-operation worker
+threads. TLS-5 is the escape hatch. Recorded so it is a decision, not a surprise.
 
 ## How We Prove The New Behavior (direct proof — comprehensive)
 
-1. **Same-runtime Tina-client ↔ Tina-server** in one process/runtime — the exact
-   case FINDINGS #16 calls impossible. This passing **is** the closure of #16.
+1. **Zero TLS threads spawned (the headline).** TLS connect/handshake/read/write/
+   close complete on the shard via Betelgeuse completions, with a thread-count
+   assertion proving no `tina-tls-*` thread is created. (Same-runtime client+server
+   already works on main via per-op threads; the new claim is *on-substrate, no
+   threads*.)
 2. **Three-direction interop:** Tina↔Tina, Tina-client ↔ `tokio+tokio-rustls`
    server, stdlib-rustls client ↔ Tina-server (counterparties already exist in
    `specimen_native_https`).
