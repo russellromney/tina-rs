@@ -13,10 +13,11 @@ use tina::{
 use tina_runtime::{
     CallCompletionRejectedReason, CallError, CallId, CallKind, CallOutcome,
     CallReplyRejectedReason, CapacitySummary, CauseId, DeferredReplyRejectedReason, DeferredSlotId,
-    EventId, Http2StreamId, MailboxFactory, PressureSummary, ProtocolConnectionId,
+    EventId, GrpcStatusCode, GrpcStreamId, Http2CloseReason, Http2FlowControlSide,
+    Http2ResetReason, Http2StreamId, MailboxFactory, PressureSummary, ProtocolConnectionId,
     ProtocolDirection, ProtocolFact, Runtime, RuntimeCall, RuntimeEvent, RuntimeEventKind,
     RuntimeFact, SendRejectedReason, SupervisionRejectedReason, ThreadedRuntime,
-    ThreadedRuntimeConfig, call,
+    ThreadedRuntimeConfig, WebSocketCloseReason, WebSocketSessionId, call,
 };
 use tina_tracing::{TraceTimeline, to_chrome_trace_json_string, write_chrome_trace_json};
 
@@ -367,27 +368,109 @@ fn child_lifecycle_and_restart_events_appear_with_child_fields() {
 }
 
 #[test]
-fn protocol_facts_appear_as_typed_instants() {
-    let root = export(&[evt(
-        1,
-        RuntimeEventKind::FactObserved {
-            fact: RuntimeFact::Protocol(ProtocolFact::Http2StreamOpened {
+fn protocol_facts_appear_as_typed_instants_with_stable_tokens() {
+    let cases = [
+        (
+            ProtocolFact::Http2StreamOpened {
                 connection: ProtocolConnectionId::new(3),
                 stream: Http2StreamId::new(1),
                 direction: ProtocolDirection::Outbound,
-            }),
-        },
-    )]);
-    let fact = first_named(&root, "fact_observed");
-    assert_eq!(fact["ph"], "i");
-    assert_eq!(fact["cat"], "protocol");
-    assert_eq!(fact["args"]["fact_family"], "protocol");
-    assert!(
-        fact["args"]["fact"]
-            .as_str()
-            .unwrap()
-            .contains("Http2StreamOpened")
-    );
+            },
+            "http2_stream_opened",
+            "http2",
+        ),
+        (
+            ProtocolFact::Http2StreamClosed {
+                connection: ProtocolConnectionId::new(3),
+                stream: Http2StreamId::new(1),
+                reason: Http2CloseReason::EndStream,
+            },
+            "http2_stream_closed",
+            "http2",
+        ),
+        (
+            ProtocolFact::Http2StreamReset {
+                connection: ProtocolConnectionId::new(3),
+                stream: Http2StreamId::new(1),
+                direction: ProtocolDirection::Inbound,
+                reason: Http2ResetReason::Cancel,
+            },
+            "http2_stream_reset",
+            "http2",
+        ),
+        (
+            ProtocolFact::Http2FlowControlFull {
+                connection: ProtocolConnectionId::new(3),
+                stream: Http2StreamId::new(0),
+                side: Http2FlowControlSide::ConnectionSend,
+            },
+            "http2_flow_control_full",
+            "http2",
+        ),
+        (
+            ProtocolFact::HttpBodyHighWater {
+                connection: ProtocolConnectionId::new(3),
+                body_id: 4,
+                direction: ProtocolDirection::Inbound,
+                buffered_bytes: 1024,
+                threshold_bytes: 512,
+            },
+            "http_body_high_water",
+            "http_body",
+        ),
+        (
+            ProtocolFact::WebSocketSlowPeerClosed {
+                session: WebSocketSessionId::new(5),
+                queued_frames: 6,
+                queued_bytes: 2048,
+            },
+            "websocket_slow_peer_closed",
+            "websocket",
+        ),
+        (
+            ProtocolFact::WebSocketSessionClosed {
+                session: WebSocketSessionId::new(5),
+                reason: WebSocketCloseReason::Normal,
+                code: Some(1000),
+            },
+            "websocket_session_closed",
+            "websocket",
+        ),
+        (
+            ProtocolFact::GrpcFinalStatusSent {
+                connection: ProtocolConnectionId::new(3),
+                stream: GrpcStreamId::new(7),
+                status: GrpcStatusCode::Ok,
+            },
+            "grpc_final_status_sent",
+            "grpc",
+        ),
+        (
+            ProtocolFact::GrpcFinalStatusReceived {
+                connection: ProtocolConnectionId::new(3),
+                stream: GrpcStreamId::new(7),
+                status: GrpcStatusCode::Cancelled,
+            },
+            "grpc_final_status_received",
+            "grpc",
+        ),
+    ];
+
+    for (index, (protocol_fact, fact_name, protocol_family)) in cases.into_iter().enumerate() {
+        let root = export(&[evt(
+            index as u64 + 1,
+            RuntimeEventKind::FactObserved {
+                fact: RuntimeFact::Protocol(protocol_fact),
+            },
+        )]);
+        let fact = first_named(&root, "fact_observed");
+        assert_eq!(fact["ph"], "i");
+        assert_eq!(fact["cat"], "protocol");
+        assert_eq!(fact["args"]["fact_family"], "protocol");
+        assert_eq!(fact["args"]["fact_name"], fact_name);
+        assert_eq!(fact["args"]["protocol_family"], protocol_family);
+        assert!(!fact["args"]["fact"].as_str().unwrap().is_empty());
+    }
 }
 
 #[test]

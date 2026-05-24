@@ -14,8 +14,8 @@ use tina::capacity::CapacitySurfaceReport;
 use tina::{AddressGeneration, IsolateId, ShardId};
 use tina_runtime::{
     CallId, CapacitySummary, FairnessReport, LocalSystemShutdownReport, PressureSummary,
-    RuntimeEvent, RuntimeEventKind, ServiceShutdownReport, SupervisionRejectedReason,
-    TraceSnapshot,
+    ProtocolFact, ProtocolFamily, RuntimeEvent, RuntimeEventKind, RuntimeFact,
+    ServiceShutdownReport, SupervisionRejectedReason, TraceSnapshot,
 };
 
 use crate::events::{
@@ -993,6 +993,13 @@ fn insert_kind_args(args: &mut Map<String, Value>, kind: RuntimeEventKind) {
         RuntimeEventKind::FactObserved { fact } => {
             args.insert("fact".into(), json!(format!("{fact:?}")));
             args.insert("fact_family".into(), json!(fact_family_name(fact)));
+            args.insert("fact_name".into(), json!(fact_name(fact)));
+            if let RuntimeFact::Protocol(protocol) = fact {
+                args.insert(
+                    "protocol_family".into(),
+                    json!(protocol_family_name(protocol.family())),
+                );
+            }
         }
     }
 }
@@ -1086,8 +1093,40 @@ fn event_category(kind: RuntimeEventKind) -> &'static str {
 
 fn fact_family_name(fact: tina_runtime::RuntimeFact) -> &'static str {
     match fact {
-        tina_runtime::RuntimeFact::Protocol(_) => "protocol",
+        RuntimeFact::Protocol(_) => "protocol",
         _ => "unknown",
+    }
+}
+
+fn fact_name(fact: RuntimeFact) -> &'static str {
+    match fact {
+        RuntimeFact::Protocol(protocol) => protocol_fact_name(protocol),
+        _ => "unknown",
+    }
+}
+
+fn protocol_fact_name(fact: ProtocolFact) -> &'static str {
+    match fact {
+        ProtocolFact::Http2StreamOpened { .. } => "http2_stream_opened",
+        ProtocolFact::Http2StreamClosed { .. } => "http2_stream_closed",
+        ProtocolFact::Http2StreamReset { .. } => "http2_stream_reset",
+        ProtocolFact::Http2FlowControlFull { .. } => "http2_flow_control_full",
+        ProtocolFact::HttpBodyHighWater { .. } => "http_body_high_water",
+        ProtocolFact::WebSocketSlowPeerClosed { .. } => "websocket_slow_peer_closed",
+        ProtocolFact::WebSocketSessionClosed { .. } => "websocket_session_closed",
+        ProtocolFact::GrpcFinalStatusSent { .. } => "grpc_final_status_sent",
+        ProtocolFact::GrpcFinalStatusReceived { .. } => "grpc_final_status_received",
+        _ => "unknown_protocol_fact",
+    }
+}
+
+fn protocol_family_name(family: ProtocolFamily) -> &'static str {
+    match family {
+        ProtocolFamily::Http2 => "http2",
+        ProtocolFamily::HttpBody => "http_body",
+        ProtocolFamily::WebSocket => "websocket",
+        ProtocolFamily::Grpc => "grpc",
+        _ => "unknown_protocol_family",
     }
 }
 
