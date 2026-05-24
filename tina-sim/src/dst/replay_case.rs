@@ -170,7 +170,7 @@ impl std::fmt::Display for CaptureSummary {
         write!(
             f,
             "capture name={} seed={} ops={} events={} hash=0x{:016x} live_facts={} unsupported={} topology_roles={} replay_blocked={}",
-            self.name,
+            saved_report_value(self.name),
             self.seed,
             self.history_len,
             self.expected.event_count,
@@ -180,6 +180,20 @@ impl std::fmt::Display for CaptureSummary {
             self.topology_role_count,
             self.replay_blocked
         )
+    }
+}
+
+fn saved_report_value(value: &str) -> String {
+    if value.is_empty()
+        || value.chars().any(|c| {
+            c.is_whitespace()
+                || c.is_control()
+                || matches!(c, '=' | '[' | ']' | ',' | ':' | '"' | '\\')
+        })
+    {
+        format!("{value:?}")
+    } else {
+        value.to_owned()
     }
 }
 

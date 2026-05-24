@@ -462,6 +462,14 @@ fn live_replay_capture_includes_config_topology_and_mailboxes() {
             .to_string()
             .contains("replay_blocked=false")
     );
+    assert!(
+        capture
+            .summary()
+            .to_string()
+            .contains("name=\"http1 keepalive body pressure under local-send delay\""),
+        "summary must keep key=value output parseable for human case names: {}",
+        capture.summary(),
+    );
 }
 
 #[test]
