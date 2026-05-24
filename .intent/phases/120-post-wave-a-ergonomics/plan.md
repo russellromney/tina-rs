@@ -18,6 +18,9 @@
   messages.
 - Phase 110 covers workflow pending helpers. This phase should use them in the
   copied path, not rebuild them.
+- `CallGroup` covers first-success races. This phase also owns the two other
+  copied Tokio shapes users reach for: join all branches, and handle whichever
+  branch finishes next.
 - Phase 121 made fairness/load observable. Phase 127 made WebSocket
   server/client sessions production-shaped enough to copy. Phase 128 made live
   capture -> replay -> shrink real. This phase must teach those as one service
@@ -58,6 +61,9 @@ shutdown, and bug-in-a-box replay without stitching ten specimens together.
   `LiveReplayCapture` type for library authors
 - copied fairness/load assertions by workload type, not only raw
   `progress_gap_turns` numbers
+- join-all and select-next helpers over named cancelable calls, preserving
+  branch identity, bounded storage, explicit owner-stop cancellation, partial
+  reports, and late-reply truth
 - update prelude/import tiers
 - simplify repeated setup only after repetition is proven
 - replace copied snippets that still teach old/raw paths
@@ -74,14 +80,17 @@ shutdown, and bug-in-a-box replay without stitching ten specimens together.
 - no raw WebSocket byte replay
 - no pooled/reconnecting WebSocket client manager
 - no long soak in default CI
+- no broad `select!` clone, async stream framework, hidden scheduler, or
+  heterogeneous branch magic beyond "wrap replies in your own enum"
 
 ## Blast Radius
 
 Small-to-medium blast radius.
 
 - Allowed: docs, examples, specimens, prelude/import guidance, copied snippets,
-  findings cleanup, and small public helpers in `tina-http` /
-  `tina-proof-harness` / `tina-sim::dst` when they wrap already-landed behavior.
+  findings cleanup, and the named public helpers in `tina-runtime`,
+  `tina-http`, `tina-proof-harness`, and `tina-sim::dst` when they wrap
+  already-landed behavior.
 - Not allowed: core runtime semantics, protocol behavior, resource policy
   behavior, durability semantics, or new major nouns.
 - If a helper needs behavior changes in a core crate, stop and make a separate
@@ -157,6 +166,28 @@ below. Do not invent extra helpers beyond this list.
   Public helpers return `Result<..., LoadAssertionFailure>` (or a narrower
   typed error) and have panic wrappers only for tests. Failure output names the
   observed report line and the user claim that failed.
+- Add join-all and select-next workflow helpers next to `CallGroup`:
+  - add `CallJoinSet<K, R>` for finite "start N calls, wait for all terminal
+    outcomes" workflows
+  - add `CallSelectSet<K, R>` for finite "start N calls, process each terminal
+    outcome as it arrives" workflows
+  - both are fixed-capacity and named by user keys
+  - both use generation tokens so stale continuations cannot remove newer same
+    keys
+  - both have `start_cancelable(...)` copy paths that return an effect only
+    after the set has accepted the branch
+  - both expose `drain_pending_for_cancel(...)` for owner stop, plus explicit
+    `record_cancel(...)` for cancel outcomes
+  - `CallJoinSet` report is ready only after every branch has a terminal
+    outcome or an explicit cancel outcome
+  - `CallSelectSet` returns one `SelectedCall<K, R>` per recorded terminal
+    branch; it may have a partial report while other branches are still live
+  - late replies after owner-stop cancellation are recorded/rejected with the
+    same late-reply truth as `CallGroup`; do not silently drop them
+  - public errors return the key/token/outcome/handle needed for the service to
+    reply, cancel, or report pressure visibly
+  - keep first-success `CallGroup` source-compatible; do not contort it into a
+    policy enum if that makes the existing copied path worse
 - Add a short "which noun do I use?" guide for the new primitives. Keep it
   grouped by task, not by type list:
   - "limit work"
@@ -168,6 +199,8 @@ below. Do not invent extra helpers beyond this list.
   - "capture a bug"
   - "prove a hot path did not starve a cold path"
   - "control a session app"
+  - "wait for all calls"
+  - "handle whichever call returns next"
 - Update prelude/import docs only where the copied path proves repetition.
 - Move solved findings from `examples/FINDINGS.md` to history or mark closed
   with phase numbers.
@@ -192,6 +225,8 @@ below. Do not invent extra helpers beyond this list.
   - "save/replay/shrink this bug"
   - "prove progress"
   - "control this session"
+  - "join all calls"
+  - "select next completed call"
   Avoid type-index docs as the first learning path.
 
 ## Proof Shape
@@ -212,6 +247,15 @@ below. Do not invent extra helpers beyond this list.
 - the copied bug workflow runs: capture -> save -> read -> replay -> shrink
 - fairness/load assertions are used by a real specimen/system instead of raw
   "stare at progress_gap_turns" interpretation
+- `CallJoinSet` is used by `specimen_dynamic_worker_pool` or a successor to
+  replace manual join-all aggregation
+- `CallSelectSet` is used by a small specimen/system to process out-of-order
+  branch completions without hiding branch identity
+- join/select tests prove full admission, duplicate key, stale token,
+  owner-stop cancellation, late reply after cancel, partial report, and
+  all-complete report
+- join/select helpers have compile-fail or impossible paths for "effect
+  returned before branch storage accepted it"
 - these common wrong setups become compile-fail or impossible through the
   copied path:
   - trying to use WebSocket app control by sending peer `Text("__tick:N")`
@@ -219,6 +263,7 @@ below. Do not invent extra helpers beyond this list.
   - trying to build a captured replay without explicit config/history
   - trying to treat `progress_gap_turns` as an automatic unfairness failure
     through the assertion helper
+  - trying to start a join/select branch without storing the handle/token first
 - the refreshed skeleton has a smoke test, a load-ish test, a shutdown test, and
   one bad-config/bad-input test
 - the skeleton includes one overload path and one recovery/shutdown path,
@@ -244,7 +289,8 @@ below. Do not invent extra helpers beyond this list.
   remove named pressure/cancel/reply outcomes.
 - Do not add new major nouns in this phase. Small task-shaped wrappers are okay
   only when they wrap landed semantics and make the copied path harder to wire
-  wrong.
+  wrong. The only new public nouns allowed by this plan are the explicitly
+  named join/select, WebSocket control, capture, and assertion helper types.
 - Do not leave stale current findings that describe already-solved pain.
 - Do not rename `LiveReplayCapture` away for library authors. Add user-facing
   copied workflow names around it.
@@ -252,3 +298,7 @@ below. Do not invent extra helpers beyond this list.
   claim true. Assert workload progress first.
 - Do not fake a WebSocket manager in this phase. A single explicit client
   session is landed; pooled/reconnecting managers remain separate work.
+- Do not build a generic async `select!` clone. Join/select helpers are finite,
+  named, bounded Tina call sets with visible cancellation and reports.
+- Do not make join/select hide heterogeneous reply typing. Users wrap different
+  replies in an enum when they need mixed branches.
