@@ -635,7 +635,7 @@ where
             winner,
             branch_outcomes: self.branch_outcomes,
             cancel_outcomes: self.cancel_outcomes,
-            pending: self.entries.len(),
+            pending: self.entries.len() + self.reserved_tokens.len() + self.expected_cancels.len(),
             complete: matches!(self.race_state, RaceState::Complete),
         }
     }
@@ -1058,7 +1058,7 @@ where
         CallJoinReport {
             branch_outcomes: self.branch_outcomes,
             cancel_outcomes: self.cancel_outcomes,
-            pending: self.entries.len() + self.expected_cancels.len(),
+            pending: self.entries.len() + self.reserved_tokens.len() + self.expected_cancels.len(),
             complete: self.entries.is_empty()
                 && self.reserved_tokens.is_empty()
                 && self.expected_cancels.is_empty(),
@@ -1401,7 +1401,7 @@ where
         CallSelectReport {
             selected: self.selected.clone(),
             cancel_outcomes: self.cancel_outcomes.clone(),
-            pending: self.entries.len() + self.expected_cancels.len(),
+            pending: self.entries.len() + self.reserved_tokens.len() + self.expected_cancels.len(),
             complete: self.report_ready(),
         }
     }
@@ -1418,7 +1418,7 @@ where
         CallSelectReport {
             selected: self.selected,
             cancel_outcomes: self.cancel_outcomes,
-            pending: self.entries.len() + self.expected_cancels.len(),
+            pending: self.entries.len() + self.reserved_tokens.len() + self.expected_cancels.len(),
             complete: self.entries.is_empty()
                 && self.reserved_tokens.is_empty()
                 && self.expected_cancels.is_empty(),
@@ -1808,6 +1808,32 @@ mod tests {
     }
 
     #[test]
+    fn race_report_pending_counts_reserved_tokens_and_expected_cancels() {
+        let mut group: CallGroup<u8, Reply> = CallGroup::with_capacity(3);
+        let _reserved = group.reserve_token().unwrap();
+        let report = group.into_report();
+        assert_eq!(report.pending, 1);
+        assert!(!report.complete);
+
+        let mut group: CallGroup<u8, Reply> = CallGroup::with_capacity(3);
+        let winner = group.insert(1, make_handle()).unwrap();
+        let loser = group.insert(2, make_handle()).unwrap();
+        let won = group
+            .record_reply(1, winner, CallOutcome::Replied(Reply(10)), |reply| {
+                reply.0 >= 10
+            })
+            .unwrap();
+        assert_eq!(won.cancel_losers.len(), 1);
+        assert_eq!(won.cancel_losers[0].token(), loser);
+        let report = group.into_report();
+        assert_eq!(
+            report.pending, 1,
+            "expected loser-cancel truth is still pending"
+        );
+        assert!(!report.complete);
+    }
+
+    #[test]
     fn join_set_waits_for_every_terminal_outcome() {
         let mut set: CallJoinSet<&'static str, Reply> = CallJoinSet::with_capacity(2);
         let a = set.insert("a", make_handle()).unwrap();
@@ -1890,6 +1916,16 @@ mod tests {
         assert!(!set.is_full(), "failed insert must release reserved slot");
         let fresh = set.reserve_token().unwrap();
         assert_ne!(reserved, fresh);
+    }
+
+    #[test]
+    fn join_set_report_pending_counts_reserved_tokens() {
+        let mut set: CallJoinSet<&'static str, Reply> = CallJoinSet::with_capacity(2);
+        let _reserved = set.reserve_token().unwrap();
+
+        let report = set.into_report();
+        assert_eq!(report.pending, 1);
+        assert!(!report.complete);
     }
 
     #[test]
@@ -1989,5 +2025,18 @@ mod tests {
         assert!(report.complete);
         assert_eq!(report.selected.len(), 1);
         assert_eq!(report.cancel_outcomes.len(), 1);
+    }
+
+    #[test]
+    fn select_set_report_pending_counts_reserved_tokens() {
+        let mut set: CallSelectSet<&'static str, Reply> = CallSelectSet::with_capacity(2);
+        let _reserved = set.reserve_token().unwrap();
+
+        let partial = set.partial_report();
+        assert_eq!(partial.pending, 1);
+        assert!(!partial.complete);
+        let report = set.into_report();
+        assert_eq!(report.pending, 1);
+        assert!(!report.complete);
     }
 }
