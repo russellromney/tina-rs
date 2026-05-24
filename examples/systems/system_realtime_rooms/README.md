@@ -1,9 +1,8 @@
 # system_realtime_rooms
 
 A production-shaped WebSocket room with a recurring liveness tick. This is
-the system specimen the Phase 094 "Still not done" list calls out as
-*"production realtime-room system specimen with recurring liveness"* and the
-entry in `examples/systems/README.md` for `system_realtime_rooms`.
+the system specimen for bounded realtime-room behavior: recurring liveness,
+slow-peer handling, explicit shutdown, and member-table pressure.
 
 ## What this pulls on
 
@@ -32,11 +31,11 @@ entry in `examples/systems/README.md` for `system_realtime_rooms`.
 
 ## What it deliberately does NOT do
 
-- No simulator/replay coverage of WebSocket bytes (that's still open on the
-  Phase 094 deferral list).
+- No simulator/replay coverage of raw WebSocket bytes; replay currently uses
+  higher-level protocol facts.
 - No browser CI; the smoke uses `tungstenite` clients over `ws://`.
-- No `permessage-deflate`, no native client, no HTTP/2 WebSocket — those
-  are all explicit Phase 094 non-goals.
+- No `permessage-deflate`, no pooled/reconnecting native client manager, no
+  HTTP/2 WebSocket — those remain explicit follow-up edges.
 - No multi-room sharding; one bounded room is enough to surface the
   recurring-liveness pain.
 
@@ -98,7 +97,7 @@ The smoke covers three scenarios end-to-end:
 
 What felt good:
 
-- The Phase 094 public WebSocket surface (`WebSocketSessionHandle`,
+- The native WebSocket server surface (`WebSocketSessionHandle`,
   `WebSocketSessionId`, `WebSocketSessionMsg`) is enough to build a
   bounded, fan-out room without touching `HttpConnection` internals.
 - `register_with_capacity` plus one `try_send(addr, Bootstrap)` from the

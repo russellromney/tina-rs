@@ -45,8 +45,8 @@ exit status.
 
 ## Fairness/load companion lines
 
-Phase 121 keeps the pressure line small, but load-capable specimens may
-also print companion key=value lines:
+Keep the pressure line small. Load-capable specimens may also print companion
+key=value lines:
 
 ```text
 fairness side=tina fairness [isolate=1 turns=11 sleeps=5 isolate=2 turns=9 sleeps=4 ...] lag kind=progress_gap_turns subject=2 reference=1 observed=2 bound=none exceeded=false

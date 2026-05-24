@@ -1,4 +1,4 @@
-# Native WebSocket Server
+# Native WebSocket Server And Client
 
 `tina-http` supports native bounded server-side WebSockets for HTTP/1.1.
 

@@ -43,7 +43,7 @@ Read in order if new:
 17. [Pressure Report Convention](17-pressure-report-convention.md)
 18. [Bridge Crates](18-bridge-crates.md)
 19. [Tracing](19-tracing.md)
-20. [Native WebSocket Server](20-native-websocket-server.md)
+20. [Native WebSocket Server And Client](20-native-websocket-server.md)
 21. [Compile-Time Safety Rails](21-compile-time-safety-rails.md)
 22. [HTTP/HTTP2/gRPC Protocol Facts](22-http-http2-grpc.md)
 23. [Core And Batteries](23-core-and-batteries.md)

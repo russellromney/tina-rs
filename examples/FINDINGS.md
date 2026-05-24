@@ -45,11 +45,13 @@ What is still active after reading the specimens and systems:
 - **Local I/O companions.** Phase 117 shipped the rails; `UnixWriteAll`,
   `UnixReadToEof`, and the unified `FileCopyBounded` drive path now cover most
   of the boring companions. Framed writers remain open.
-- **Session/control-message lifecycle.** WebSocket systems still expose rough
-  edges around app-level control messages, send-vs-call entry points, and
-  deterministic slow-peer proof. Phase 127 should own this, not Phase 120.
-- **Live trace to sim.** The bug-box specimen validates the direction; Phase
-  128 should make projection/capture/shrink the copied path.
+- **Session/control-message lifecycle.** Phase 127 added the native WebSocket
+  client session and tightened session protocol facts. Remaining rough edges
+  are higher-level app control messages, pooled/reconnecting client managers,
+  and broader protocol hardening.
+- **Live trace to sim.** Phase 128 made projection/capture/shrink the copied
+  path. Remaining rough edges are adding more supported live facts and using
+  the workflow in more production-shaped systems.
 
 Some older entries below are partly historical and say "shipped" inside the
 section. Keep their numbers stable until the next cleanup pass moves those

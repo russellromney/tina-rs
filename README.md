@@ -364,7 +364,8 @@ Implemented today: explicit-step single-shard runtime, multi-shard runner with
 bounded shard-pair queues, `ThreadedRuntime` over Betelgeuse, runtime-owned
 TCP/UDP/DNS/TLS/file/path/process/signal/persistence rails, isolate calls
 with mandatory timeout, native HTTP/1.1, native HTTP/2 server/client,
-native gRPC server/client streaming modes, native WebSocket server, framed RPC
+native gRPC server/client streaming modes, native WebSocket server/client
+sessions, framed RPC
 with typed service helpers, supervision with `OneForOne`/`OneForAll`/
 `RestForOne` and lifetime/windowed restart budgets, terminal shutdown reports
 with topology and trace, `tina-sim` with virtual time / seeded faults /
@@ -373,7 +374,7 @@ Tower, reqwest, SQLite, SQLx/Postgres, and AWS SDK work.
 
 Not yet:
 
-* broad native WebSocket client, HTTP/2 mTLS, gRPC reflection/interceptors/load balancing, and pooled production gRPC clients;
+* pooled/reconnecting native WebSocket client managers, HTTP/2 mTLS, gRPC reflection/interceptors/load balancing, and pooled production gRPC clients;
 * native database wire clients (PG wire / SQLite-native runtime rail); current paths are `tina-sqlite-bridge` over `rusqlite` and `tina-sqlx-bridge` over SQLx/Postgres;
 * broad Linux performance claim; Linux already uses Betelgeuse's native backend;
 * remoting or clustering;

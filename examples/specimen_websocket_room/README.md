@@ -91,5 +91,6 @@ Room send outcomes distinguish
 
 Still out of scope here: HTTP/2 WebSocket, permessage-deflate compression,
 automatic reconnect, Autobahn classification, live trace to simulator replay,
-and a broad native WebSocket client crate. Browser extension offers are ignored
-unless Tina explicitly negotiates an extension in a later slice.
+and pooled/reconnecting native WebSocket client managers. Browser extension
+offers are ignored unless Tina explicitly negotiates an extension in a later
+slice.

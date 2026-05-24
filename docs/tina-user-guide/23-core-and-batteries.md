@@ -58,8 +58,9 @@ Blessed Tina crates that ship the most-used protocols and adapters. App
 authors choose batteries; they do not have to read battery internals to
 understand Tina.
 
-- `tina-http` — native HTTP/1.1 + HTTP/2 server, native gRPC h2c server,
-  native WebSocket server, HTTPS, keepalive client pool, body streaming.
+- `tina-http` — native HTTP/1.1 + HTTP/2 server/client, native gRPC h2c
+  server/client modes, native WebSocket server/client sessions, HTTPS,
+  keepalive client pool, body streaming.
 - `tina-tracing` — opt-in tracing surface for Tina events.
 - `tina-proof-harness` — assertion-backed proof helpers used by specimens.
 - `tina-rpc` and `tina-rpc-tokio` — typed Tina-internal RPC types and the
