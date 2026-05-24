@@ -43,6 +43,7 @@
 //!
 //! - [`events`] — per-event emission.
 //! - [`live`] — per-snapshot emission.
+//! - [`timeline`] — offline Chrome Trace JSON export.
 //!
 //! # Live wiring (preferred)
 //!
@@ -96,6 +97,7 @@
 pub mod events;
 pub mod live;
 mod observer;
+pub mod timeline;
 
 pub use observer::TracingObserver;
 
@@ -114,6 +116,10 @@ pub use events::{
     restart_skipped_reason_name, send_rejected_reason_name,
 };
 pub use live::{affinity_status_name, emit_snapshot, shard_state_name};
+pub use timeline::{
+    TimelineExportError, TraceTimeline, TraceTimelineBuilder, TraceTimelineInput,
+    TraceTimelineOptions, to_chrome_trace_json_string, write_chrome_trace_json,
+};
 
 /// Target for every runtime trace event this crate emits.
 pub const RUNTIME_TRACE_TARGET: &str = "tina_runtime::trace";

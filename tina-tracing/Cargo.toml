@@ -13,6 +13,7 @@ path = "src/lib.rs"
 [dependencies]
 tina = { path = "../tina" }
 tina-runtime = { path = "../tina-runtime" }
+serde_json = "1"
 tracing = { version = "0.1", default-features = false, features = ["std"] }
 # Optional dep that backs `install_global_default_subscriber` behind
 # the `subscriber` feature. Tests and examples pull tracing-subscriber
