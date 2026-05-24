@@ -45,7 +45,8 @@ restarts, and shutdown in order.
 - Export Chrome Trace Event JSON first.
 - Use logical time:
   - `ts = event_id` in microsecond-ish units
-  - duration slices use event-id distance when matching begin/end events exist
+  - duration slices use `max(1, end_event_id - start_event_id)` when matching
+    begin/end events exist
   - metadata must say `time_kind = "logical_event_id"`
 - If wall-clock timestamps arrive later, add a new time mode. Do not fake it
   now.
@@ -86,15 +87,36 @@ names.
 
 ## Mapping Rules
 
-Emit Chrome Trace Event JSON (`traceEvents` array):
+Emit a Chrome Trace Event JSON object:
+
+```json
+{
+  "displayTimeUnit": "us",
+  "traceEvents": []
+}
+```
+
+Each event must use normal Chrome fields:
+
+- `name`
+- `cat`
+- `ph`
+- `ts`
+- `pid`
+- `tid`
+- `args`
+
+Emit `traceEvents` entries:
 
 - metadata rows:
+  - `ph = "M"`
   - process/runtime name
   - pid `0` for the Tina runtime
   - one tid per shard using the raw `ShardId`
   - isolate ids in event args; do not pretend isolates are OS threads
   - trace completeness and missing shards
 - instant events for ordinary runtime facts:
+  - `ph = "i"`
   - `Full`
   - `Closed`
   - `Timeout`
@@ -104,13 +126,18 @@ Emit Chrome Trace Event JSON (`traceEvents` array):
   - shutdown / stopped
   - protocol facts
 - duration slices where Tina has paired facts:
+  - `ph = "X"`
   - handler turn: `HandlerStarted` to matching `HandlerFinished` /
     `HandlerPanicked` / `HandlerReportedFailure`
   - runtime call: `CallDispatchAttempted` to `CallCompleted` / `CallFailed` /
     `CallCompletionRejected` / `CallCancelled`
   - deferred reply: `DeferredReplyCaptured` to sent/rejected/dropped
 - counters:
-  - pressure/capacity facts when present in `FactObserved` or supplied report
+  - `ph = "C"`
+  - `CapacitySummary` surfaces: one counter event per surface with
+    `current`, `high_water`, `full_count`, and weight fields when present
+  - `PressureSummary` / trace-derived pressure: one counter event with
+    non-zero pressure counters
   - missing counter sources should not be invented
 - flow/correlation:
   - include `event_id`, `cause_id`, `call_id`, `slot_id`, shard, isolate, and
@@ -130,7 +157,7 @@ All typed reasons stay typed strings. Do not collapse to `"error"`.
 - Pair deferred reply spans by `DeferredSlotId`.
 - If an end event has no begin, export it as an instant with
   `unmatched = "missing_begin"`.
-- If a begin event has no end, export an instant/short slice with
+- If a begin event has no end, export an instant at the begin time with
   `unmatched = "missing_end"`. Do not panic or invent an end.
 - Sort output by:
   1. logical timestamp

@@ -55,10 +55,16 @@ spelunking or a side registry.
 - Owner stop runs child cleanup too. It must not orphan a child that has already
   been admitted on the target shard.
 - If owner stops while a spawn request is still in flight, the destination must
-  either:
-  - not create the child, or
-  - create it and immediately stop it through recorded owner-stop truth.
-  It must not leave the current orphan behavior.
+  not leave the current orphan behavior. Pin the protocol:
+  - owner stop sends `RemoteSpawnCancel { request_id, owner }` for every
+    in-flight remote spawn
+  - destination keeps a bounded cancel tombstone keyed by `request_id`
+  - if cancel arrives before spawn request, later spawn request is rejected and
+    no child is created
+  - if cancel arrives after child creation, destination stops that child through
+    normal stop semantics
+  - if spawn reply races with owner stop, owner-side child record is marked
+    stopping and remote stop is sent before the owner is considered clean
 - Restart/address-change truth is owner-visible:
   - old address becomes stale
   - replacement address is available through `ChildRestarted` waiters and
@@ -66,8 +72,15 @@ spelunking or a side registry.
   - callers do not need to search raw trace to find the new address
 - First form does not make `RestartableChildDefinition` cross shards unless the
   recipe can be stored and re-run on the child shard with normal `Send` bounds.
-  If that is not true in the current code, remote restart must be a typed
-  `RestartChildSkipped { reason: RemoteNotRestartable }` fact by adding
+  This phase adds a sendable restart recipe if the existing
+  `RestartableChildDefinition` cannot cross threads:
+  - user-facing name: `CrossShardRestartableChildDefinition`
+  - constructor: `CrossShardRestartableChildDefinition::new(factory, capacity)`
+  - factory bounds: `Fn() -> I + Send + Sync + 'static`
+  - bootstrap factory bounds: `Fn() -> I::Message + Send + Sync + 'static`
+  - child/message/reply/fact bounds match cross-shard observed spawn
+  If a child was not spawned with a remote restart recipe, remote restart must
+  emit `RestartChildSkipped { reason: RemoteNotRestartable }` by adding
   `RestartSkippedReason::RemoteNotRestartable`. Do not fake restart by
   respawning on the owner shard.
 
@@ -86,14 +99,23 @@ Add runtime-owned remote ownership records:
 - extend the child record to carry child shard, remote-owner flag, and owner
   address/generation
 - add bounded remote envelopes for child control:
+  - remote spawn cancel
   - stop child
   - child stopped ack/report
   - restart child request or restart skipped report
   - child address changed report
+- add a bounded remote-child control table with id->index lookup and a free
+  slot stack; do not add another uncapped flat `Vec` hot path
+- control/tombstone capacity is a real budget:
+  - single-threaded `MultiShardRuntime` uses `ThreadedRuntimeConfig::default().shard_pair_capacity`
+    as the default when no config exists
+  - threaded/local-system multi-shard uses `shard_pair_capacity`
+  - `Full` on this table is trace-visible as remote child-control pressure
 - keep the destination-shard child stop path using normal stop semantics, so
   pending calls/captures/resources settle exactly like a local stop
-- make owner-side reports consume acks/reports through ordinary bounded owner
-  delivery, not a hidden side channel
+- owner-side runtime records must update before any optional app-message
+  delivery. If the owner app mailbox is full, trace `Full` and keep
+  `ChildLifecycleReport` correct.
 
 Add user-facing report/query helpers:
 
@@ -149,6 +171,8 @@ Live multi-shard tests:
 - `ChildRestartedWaiter` includes `new_shard` for remote children
 - live `ChildLifecycleReport` and terminal report agree on child state after
   shutdown
+- owner mailbox full during remote stopped/restarted report still leaves
+  `ChildLifecycleReport` updated
 
 Simulator tests:
 
@@ -158,12 +182,16 @@ Simulator tests:
   reordered unrelated events
 - bounded shard-pair full during remote stop/restart produces typed pressure
   and no hidden retry
+- cancel-before-spawn-request and cancel-after-child-created are both replayed
+  deterministically
 
 Compile/API tests:
 
 - ordinary same-shard child code still compiles unchanged
 - `spawn_observed(...).on_shard(...)` still requires `Send` payloads
 - non-`Send` restart recipe cannot cross shards silently
+- `CrossShardRestartableChildDefinition` accepts only sendable factories and
+  bootstrap messages
 - same-shard `.on_shard(self_shard)` still creates an owned local child and
   emits no cross-shard `ChildStarted`
 - old code using `ChildRestarted { child_ordinal, new_isolate, new_generation,
