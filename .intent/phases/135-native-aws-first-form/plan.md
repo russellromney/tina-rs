@@ -115,8 +115,8 @@ Allowed new dependencies:
 - `percent-encoding`
 - `quick-xml`
 
-If implementation needs another dependency, it must be sync, small, and named
-in the PR rationale.
+No other dependency in this phase. If a new crate looks necessary, stop and
+update this plan first.
 
 ## Pinned Shape
 
@@ -178,8 +178,7 @@ Config validation rejects:
 - zero pool capacity, zero in-flight capacity, zero mailbox capacity;
 - zero request/response body limits;
 - SQS `ReceiveMessage.max_messages == 0`;
-- SQS `wait_time_seconds` greater than the operation timeout budget unless the
-  caller explicitly chooses a larger operation timeout.
+- SQS `wait_time_seconds` greater than or equal to the operation timeout.
 
 No user callback runs inside hidden storage. Continuations still return ordinary
 messages to the AWS isolate.
@@ -216,16 +215,17 @@ AwsSigningClock::System
 AwsSigningClock::Fixed(AwsSigningTime)
 ```
 
-The signer itself takes `AwsSigningTime`. The live client may use
-`AwsSigningClock::System`, but tests and replay-shaped examples use `Fixed`.
-Reports name the signing timestamp, not the secret.
+The signer itself takes `AwsSigningTime`. The live client uses the configured
+`AwsSigningClock`: `System` for normal live use, `Fixed` for tests and
+replay-shaped examples. Reports name the signing timestamp, not the secret.
 
 Do not support `UNSIGNED-PAYLOAD` in first form. Always sign the actual payload
 hash.
 
 Credential debug/display:
 
-- access key id may show only a short redacted prefix/suffix;
+- access key id debug is `AKIA...LAST4` style: first 4 chars, `...`, last 4
+  chars, or `<redacted>` if too short;
 - secret access key never appears;
 - session token never appears;
 - panic/report text must not include raw credentials.
@@ -236,9 +236,11 @@ Do not accept raw AWS URLs for signing.
 
 S3:
 
-- `S3BucketName` validates bucket names.
-- `S3ObjectKey` is arbitrary bytes/string except empty key is rejected where the
-  operation needs an object key.
+- `S3BucketName` validates 3..=63 byte DNS-style names: lowercase ASCII
+  letters, digits, dot, hyphen; starts/ends with letter or digit; no empty
+  labels.
+- `S3ObjectKey` is UTF-8 `String`, 1..=1024 bytes after UTF-8 encoding.
+  Binary/non-UTF-8 keys are out of scope.
 - Path-style canonical URI is `/{bucket}/{encoded-key-segments}`.
 - Virtual-hosted canonical URI is `/{encoded-key-segments}` and endpoint host is
   `{bucket}.{base_host}`.
@@ -280,7 +282,7 @@ For every operation:
 4. sign;
 5. acquire a keepalive pool lease;
 6. call `KeepaliveConnectionMsg::request`;
-7. release the lease as `Reuse` unless the connection isolate itself is suspect;
+7. release the lease as `Reuse`;
 8. parse service response;
 9. reply with typed AWS outcome.
 
@@ -291,7 +293,7 @@ the AWS response cap. Do not let `tina-http` buffer a larger response and then
 have AWS reject it after the fact.
 
 If a caller timeout/cancel fires after HTTP admission, Tina stops waiting. AWS
-may still have acted. Late completion is counted and cannot later settle the
+can still have acted. Late completion is counted and cannot later settle the
 caller as success.
 
 Close:
@@ -375,7 +377,7 @@ the public/internal message split already used elsewhere.
 Timeout/cancel truth:
 
 - before HTTP admission: caller sees typed timeout/cancel, no bytes sent;
-- after HTTP request admitted/sent: Tina stops waiting, but remote service may
+- after HTTP request admitted/sent: Tina stops waiting, but remote service can
   have acted;
 - late HTTP completion is counted and cannot become success for the caller.
 
@@ -498,8 +500,7 @@ Add hermetic fake servers in tests:
 Use native Tina HTTP server for the fake services so the tests prove native Tina
 on both sides of the wire.
 
-The fake servers are not public API. Keep them in integration test support
-unless a later system specimen proves a shared fake crate is useful.
+The fake servers are not public API. Keep them in integration test support.
 
 ### Rock 6: System Specimen And Docs
 
@@ -533,6 +534,7 @@ Docs:
   facts.
 - Caller-supplied raw canonical paths/URLs are not accepted by the public S3
   API.
+- Invalid S3 bucket names and empty/oversized keys fail before signing.
 - SQS queue URL parser rejects missing scheme/host/path and preserves the queue
   path used for signing.
 - Config validation rejects zero caps and impossible long-poll timeout budgets
