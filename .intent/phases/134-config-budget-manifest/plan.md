@@ -71,6 +71,15 @@ Ship a structured manifest for:
   - missing required caps for copied service skeleton
   - expired `unbounded_for_now`
 - Wrong weight choices are still user bugs. Reports must make them visible.
+- Manifest is not a global registry. It is explicit data a service passes into
+  setup. Runtime/config adapters may read it, but no hidden singleton owns the
+  service.
+- Manifest names must match capacity/report names. A mismatch is a testable
+  service bug, not "close enough."
+- Secrets do not live in the manifest. Paths/env var names may, secret values
+  may not.
+- The manifest has a schema version so saved replay/capture artifacts can say
+  which shape they used.
 
 ## Implementation
 
@@ -101,6 +110,8 @@ Make the copied service path accept a manifest:
 
 Do not require every old API to take the manifest. First form may be explicit
 adapter methods that build existing configs.
+Add a consistency checker that compares the manifest against a running service
+report/capacity summary and returns typed missing/extra/mismatched surfaces.
 
 ### Rock 3: Replay And Capture
 
@@ -111,6 +122,8 @@ Include manifest summary in:
 - timeline/export metadata when Phase 130 is present
 
 Changing replay-affecting manifest values must change or invalidate replay.
+Non-replay-affecting display metadata may change without invalidating replay,
+but the report must say it was ignored.
 
 ### Rock 4: Systems
 
@@ -125,10 +138,14 @@ Update one canonical service and one small system:
 - Duplicate surface names fail validation.
 - Zero/invalid caps fail validation.
 - Explicit unbounded-with-expiry validates before expiry and fails after.
+- Secret-looking values are rejected or redacted in display output.
 - Manifest can build existing runtime/service configs.
 - Service pressure report surfaces line up with manifest surfaces.
+- Missing/extra/mismatched report surfaces fail the consistency checker with
+  typed rows.
 - Replay capture includes manifest metadata.
 - Changing a replay-affecting budget changes or invalidates the replay case.
+- Changing non-replay display metadata does not change replay, and the report
+  says it was non-replay-affecting.
 - A cheap-model-style copied service can find all caps in the manifest, not by
   grep across handlers.
-

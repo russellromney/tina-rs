@@ -69,6 +69,12 @@ Ship:
   - unreleased capacity after drain
 - Bridge/external late completion stays worker-terminal plus
   `CallReplyRejected`; do not convert it to success or silence.
+- Scoped child admission follows the same rule as cancelable deferred work:
+  register the child with the scope before returning/dispatching the child
+  effect. If registration fails, recover the caller authority and do not start
+  the child work.
+- Scope cancel is idempotent. The first cause wins; later cancels are reported
+  as already-cancelled, not as new terminal truth.
 
 ## Implementation
 
@@ -80,6 +86,7 @@ Add a copied path for native HTTP handlers:
 - register body/source/DB/timer child work
 - cancel scope on client disconnect or request timeout
 - include scope report in service shutdown/report path
+- reject/admit scope before handler starts child work
 
 ### Rock 2: Body And Stream Cancel
 
@@ -103,6 +110,8 @@ Prove scoped:
 - local reqwest bridge call against a hermetic in-process server
 
 Caller timeout and worker-terminal late completion remain distinct.
+Every scoped adapter must return the original caller/request authority on
+failed scope registration.
 
 ### Rock 4: Canonical System
 
@@ -121,10 +130,13 @@ The README should show the copied path and the report.
 
 - Client disconnect cancels scope and reports child rows.
 - Request timeout cancels timer/body/pool/bridge waits.
+- Double cancel keeps the first cause and reports the second as redundant.
 - Owner stop drains scopes and reports unreleased capacity as zero.
+- Scope registration failure does not dispatch child work.
 - Bridge accepted work may finish late; trace/report names the late truth.
 - Cross-shard child registered into scope reports `WrongShard`, not success.
 - A dropped/closed body source receives cancel or an explicit unsupported row.
 - Scope cap full returns typed admission failure and returns authority.
+- Cancel after child completion reports already-settled, not cancelled.
 - Live test and sim/replay proof agree where facts are supported; unsupported
   facts fail closed.

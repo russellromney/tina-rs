@@ -52,6 +52,11 @@ Ship:
 
 ## Decisions
 
+- API home:
+  - shared connect policy types live in `tina-http` first, because the first
+    consumers are HTTP/WebSocket/gRPC clients;
+  - do not put protocol-specific managers in `tina-runtime`;
+  - policy vocabulary stays in `tina-http` for this phase.
 - User-facing name: `ConnectPolicy`.
 - User-facing manager names:
   - `WebSocketClientManager`
@@ -63,6 +68,13 @@ Ship:
   - max live sessions
   - stale-session close behavior
   - total queue cap
+- Budgets are separate and reported:
+  - waiting callers
+  - live sessions/connections
+  - connect attempts in flight
+  - reconnect attempts remaining
+  - per-session outbound messages/bytes
+  - closed/stale session reports retained
 - Manager admission returns typed outcomes:
   - `Admitted`
   - `Full(report)`
@@ -75,13 +87,19 @@ Ship:
   - port
   - resolved addresses
   - attempted addresses
+  - winning address, when any
   - address family
-  - timeout / full / closed / refused / TLS failure
+  - timeout / full / closed / refused / TLS failure / cancelled loser
 - Happy Eyeballs first form:
   - fixed delay between IPv6 and IPv4 attempts
   - bounded max attempts
   - deterministic order in sim
   - visible loser close/cancel truth
+- Endpoint identity is typed data:
+  - `EndpointId`
+  - endpoint address/authority/SNI
+  - generation for replacement/stale reports
+  Do not make users correlate stale sessions by string logs.
 - WebSocket manager is first proof because it has long-lived sessions,
   reconnect, ping/pong, close, and slow-peer pressure.
 - HTTP/2/gRPC pools use a fixed endpoint list + round-robin +
@@ -101,6 +119,10 @@ Add a small policy type near outbound protocol code:
 
 Use runtime DNS and TCP/TLS calls. Do not spawn a background resolver.
 
+The connect helper must own the loser-cancel path. A raced connect attempt may
+be cancelled, time out, fail, or complete late. Every terminal path must appear
+in `ConnectReport`; late completions must be tombstoned or rejected visibly.
+
 ### Rock 2: WebSocket Client Manager
 
 Build a bounded manager over `WebSocketClientConnection`:
@@ -112,6 +134,8 @@ Build a bounded manager over `WebSocketClientConnection`:
 - keeps old session close reports
 - reports wrong-lane messages
 - drains on shutdown
+- does not dispatch a connect/session effect until the relevant manager slot is
+  admitted
 
 ### Rock 3: HTTP/2 And gRPC Pool Shape
 
@@ -126,6 +150,8 @@ Add first manager/pool shape:
 - pressure report
 
 Keep protocol-specific truth. Do not collapse HTTP/2 reset and gRPC status.
+If Rock 3 cannot fit after Rocks 1-2, leave a compile-checked shared pool
+interface and one tiny proof adapter; do not ship a half-working protocol pool.
 
 ### Rock 4: Specimens
 
@@ -142,8 +168,14 @@ Update or add systems:
 - Reconnect storm with closed port has deterministic typed failures.
 - DNS full and DNS timeout surface distinctly from TCP connect failure.
 - Happy Eyeballs attempts are bounded and reported.
+- Happy Eyeballs loser completions do not leak in-flight slots and do not become
+  successful user replies.
 - HTTP/2/gRPC pool returns `NoHealthyEndpoint` when every endpoint is closed.
+- Endpoint generation prevents stale session replies from replacing the current
+  session.
 - Shutdown closes sessions and returns a manager report.
+- Request-scope cancellation of a manager operation reports cancelled children
+  and keeps late connect/session completions visible.
 - Sim/replay either reproduces supported facts or records explicit unsupported
   facts. No silent exact replay claim.
 - No hidden queue: tests fill every queue/pool/session cap and assert typed

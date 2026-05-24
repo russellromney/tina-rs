@@ -59,6 +59,15 @@ Ship:
 - WebSocket compliance first form is local and bounded. Do not add Autobahn in
   this phase. Use the same category names where they help, but keep the corpus
   hermetic and CI-stable.
+- Corpus files live in repo as data or code, not downloaded during tests.
+- Each case has:
+  - name
+  - input bytes/actions
+  - expected wire close/reset/status
+  - expected protocol fact
+  - expected app-delivery rule
+- CI target runs the bounded corpus. Long soak repeats the same scenarios at
+  higher count; it must not add different semantics.
 
 ## Implementation
 
@@ -90,6 +99,8 @@ Add a bounded local corpus:
 - ping/pong/close handshake edge cases
 
 Classify as pass/fail with typed reason.
+Do not merely assert "connection closed." Assert whether app code saw a message,
+which close code was sent, and which protocol fact was emitted.
 
 ### Rock 3: Protocol Byte Replay
 
@@ -99,6 +110,8 @@ Add first replay helper for materialized WebSocket frame bytes:
 - cap total bytes/events
 - replay parser/session state in sim or pure protocol harness
 - unsupported live facts fail closed
+- saved case writer/reader for the byte case
+- shrink helper that can remove byte chunks/events and refresh expected facts
 
 ### Rock 4: HTTP/2 And gRPC Bad-Peer Proofs
 
@@ -118,9 +131,12 @@ Every probe asserts typed outcome and protocol fact.
 - CI-sized proof target runs fast and deterministic.
 - Long-soak target is opt-in and documented.
 - Every scenario has typed outcome and no log scraping.
+- Every scenario has a stable name and appears in the final report.
 - Malformed bytes never reach app-level user message as valid data.
+- Valid fragmented text reaches app code exactly once after reassembly.
 - Slow/stalled peer hits a cap or timeout with visible report.
 - Reconnect storm does not leak live sessions or queued bytes.
 - WebSocket byte replay reproduces a saved bad frame case.
+- Byte replay shrink produces a smaller case and refreshed expected facts.
 - Unsupported byte replay facts fail closed.
 - Any parser/protocol fix gets a before-failing, after-passing regression.
