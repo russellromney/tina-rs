@@ -21,6 +21,10 @@ This file records completed work.
   asserting cold shards process their admitted work instead of comparing raw
   hot/cold turn counts as if differently sized workloads should have identical
   progress.
+- Tightened the proof-harness `ReconnectStorm` scenario so `count` means the
+  total number of connection attempts. Closed-port storm tests now prove
+  aggregate connection errors deterministically instead of depending on kernel
+  listen-backlog timing.
 
 ### Hostile Review Fixes
 

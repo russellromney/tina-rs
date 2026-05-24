@@ -175,6 +175,10 @@ pub fn run(
     scenario: BadPeerScenario,
 ) -> BadPeerOutcome {
     let started = Instant::now();
+    if let BadPeerScenario::ReconnectStorm { count } = scenario {
+        return run_storm(label, started, addr, connect_timeout, count);
+    }
+
     let stream = match TcpStream::connect_timeout(&addr, connect_timeout) {
         Ok(s) => s,
         Err(err) => {
@@ -236,12 +240,7 @@ pub fn run(
             // surface so the typed scenario name is "TLS failure".
             run_malformed(label, started, stream, client_hello, drain_for)
         }
-        BadPeerScenario::ReconnectStorm { count } => {
-            // The stream we already opened counts as one connection; spin
-            // `count - 1` more.
-            drop(stream);
-            run_storm(label, started, addr, connect_timeout, count)
-        }
+        BadPeerScenario::ReconnectStorm { .. } => unreachable!("handled before initial connect"),
     }
 }
 
@@ -402,10 +401,10 @@ fn run_storm(
     count: usize,
 ) -> BadPeerOutcome {
     let mut outcome = base_outcome(label, started);
-    let mut connects_ok: usize = 1; // The dispatcher already opened one stream.
+    let mut connects_ok: usize = 0;
     let mut connects_failed: usize = 0;
     let mut connection_errors = Vec::new();
-    for _ in 0..count.saturating_sub(1) {
+    for _ in 0..count {
         match TcpStream::connect_timeout(&addr, connect_timeout) {
             Ok(stream) => {
                 connects_ok += 1;
@@ -419,7 +418,7 @@ fn run_storm(
             }
         }
     }
-    outcome.connected = true;
+    outcome.connected = connects_ok > 0;
     outcome.connects_ok = connects_ok;
     outcome.connects_failed = connects_failed;
     outcome.connection_errors = connection_errors;
@@ -646,11 +645,7 @@ mod tests {
     fn reconnect_storm_preserves_aggregate_connection_errors() {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
         let addr = listener.local_addr().expect("addr");
-        let server = thread::spawn(move || {
-            let (_stream, _) = listener.accept().expect("accept first");
-            drop(listener);
-            thread::sleep(Duration::from_millis(100));
-        });
+        drop(listener);
 
         let outcome = run(
             "storm",
@@ -658,15 +653,12 @@ mod tests {
             Duration::from_millis(100),
             BadPeerScenario::ReconnectStorm { count: 4 },
         );
-        let _ = server.join();
-        assert!(outcome.connected, "{outcome:?}");
-        // The kernel may admit one extra connection from the listen
-        // backlog while the server thread is dropping the listener. The
-        // Tina proof here is aggregate truth: every attempted reconnect
-        // is counted as ok or failed, and failures are preserved with
-        // their OS error strings.
-        assert!(outcome.connects_ok >= 1, "{outcome:?}");
-        assert!(outcome.connects_failed > 0, "{outcome:?}");
+        // Closed port: every attempted reconnect is counted as a failure,
+        // and the OS error strings are preserved. No listen backlog timing
+        // participates in this proof.
+        assert!(!outcome.connected, "{outcome:?}");
+        assert_eq!(outcome.connects_ok, 0, "{outcome:?}");
+        assert_eq!(outcome.connects_failed, 4, "{outcome:?}");
         assert_eq!(outcome.connects_ok + outcome.connects_failed, 4);
         assert!(!outcome.connection_errors.is_empty(), "{outcome:?}");
         assert!(
