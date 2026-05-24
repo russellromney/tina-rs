@@ -26,7 +26,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError, SyncSender};
 use std::time::Duration;
 
-use tina::{AddressGeneration, IsolateId, StopResult};
+use tina::{AddressGeneration, IsolateId, ShardId, StopResult};
 
 use crate::call::{CallError, CallId};
 use crate::trace::CallKind;
@@ -105,6 +105,8 @@ pub(crate) enum OperationDoneOutcome {
 pub struct ChildRestarted {
     /// The stable per-parent child ordinal that was restarted.
     pub child_ordinal: usize,
+    /// The shard where the new child incarnation lives.
+    pub new_shard: ShardId,
     /// The new child incarnation's isolate id.
     pub new_isolate: IsolateId,
     /// The new child incarnation's address generation.

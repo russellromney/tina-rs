@@ -8,11 +8,16 @@
 use std::cell::RefCell;
 use std::convert::Infallible;
 use std::rc::Rc;
+use std::time::Duration;
 
 use tina::{
-    ChildDefinition, ChildRef, SpawnObservedError, SpawnObservedRemote, TrySendError, prelude::*,
+    ChildDefinition, ChildRef, CrossShardRestartableChildDefinition, SpawnObservedError,
+    SpawnObservedRemote, TrySendError, prelude::*,
 };
-use tina_runtime::{DefaultMailboxFactory, MultiShardRuntime, RuntimeCall, RuntimeEventKind};
+use tina_runtime::{
+    DefaultMailboxFactory, MultiShardRuntime, MultiShardRuntimeConfig, RuntimeCall,
+    RuntimeEventKind,
+};
 
 #[derive(Debug, Clone, Copy)]
 struct CrossShard(u32);
@@ -57,9 +62,11 @@ impl Isolate for CrossChild {
 #[derive(Debug)]
 enum CrossParentMsg {
     SpawnOn(ShardId),
+    SpawnTwoOnThenStop(ShardId),
     SpawnOnThenStop(ShardId),
     ChildStarted(Result<ChildRef<CrossChildMsg>, SpawnObservedError>),
     StopChildren,
+    RestartChildren,
     StopNow,
 }
 
@@ -67,6 +74,48 @@ enum CrossParentMsg {
 struct CrossParent {
     learned: Rc<RefCell<Option<ChildRef<CrossChildMsg>>>>,
     error: Rc<RefCell<Option<SpawnObservedError>>>,
+}
+
+#[derive(Debug)]
+enum RestartParentMsg {
+    SpawnRestartableOn(ShardId),
+    ChildStarted(Result<ChildRef<CrossChildMsg>, SpawnObservedError>),
+    RestartChildren,
+    StopNow,
+}
+
+#[derive(Debug)]
+struct RestartParent {
+    learned: Rc<RefCell<Option<ChildRef<CrossChildMsg>>>>,
+}
+
+#[tina_runtime::isolate(
+    message = RestartParentMsg,
+    send = Outbound<CrossChildMsg>,
+    spawn_observed_remote = SpawnObservedRemote<CrossShardRestartableChildDefinition<CrossChild>, RestartParentMsg, CrossChildMsg, ()>,
+    shard = CrossShard,
+)]
+impl RestartParent {
+    fn handle(
+        &mut self,
+        msg: RestartParentMsg,
+        _ctx: &mut Context<'_, CrossShard, Self::Reply>,
+    ) -> Effect<Self> {
+        match msg {
+            RestartParentMsg::SpawnRestartableOn(shard) => {
+                spawn_observed(CrossShardRestartableChildDefinition::new(|| CrossChild, 4))
+                    .on_shard(shard)
+                    .then(RestartParentMsg::ChildStarted)
+            }
+            RestartParentMsg::ChildStarted(Ok(child)) => {
+                *self.learned.borrow_mut() = Some(child);
+                noop()
+            }
+            RestartParentMsg::ChildStarted(Err(_)) => noop(),
+            RestartParentMsg::RestartChildren => restart_children(),
+            RestartParentMsg::StopNow => stop(),
+        }
+    }
 }
 
 // Authored through the preferred `#[tina_runtime::isolate]` macro surface,
@@ -88,6 +137,15 @@ impl CrossParent {
             CrossParentMsg::SpawnOn(shard) => spawn_observed(ChildDefinition::new(CrossChild, 4))
                 .on_shard(shard)
                 .then(CrossParentMsg::ChildStarted),
+            CrossParentMsg::SpawnTwoOnThenStop(shard) => batch(vec![
+                spawn_observed(ChildDefinition::new(CrossChild, 4))
+                    .on_shard(shard)
+                    .then(CrossParentMsg::ChildStarted),
+                spawn_observed(ChildDefinition::new(CrossChild, 4))
+                    .on_shard(shard)
+                    .then(CrossParentMsg::ChildStarted),
+                stop(),
+            ]),
             CrossParentMsg::SpawnOnThenStop(shard) => batch(vec![
                 spawn_observed(ChildDefinition::new(CrossChild, 4))
                     .on_shard(shard)
@@ -104,6 +162,7 @@ impl CrossParent {
                 noop()
             }
             CrossParentMsg::StopChildren => stop_children(),
+            CrossParentMsg::RestartChildren => restart_children(),
             CrossParentMsg::StopNow => stop(),
         }
     }
@@ -163,8 +222,13 @@ fn live_multishard_parent_spawns_observed_child_on_another_shard_and_learns_addr
 #[test]
 fn on_shard_to_own_shard_makes_an_owned_local_child_no_child_started() {
     let learned = Rc::new(RefCell::new(None));
-    let mut runtime =
-        MultiShardRuntime::new([CrossShard(11), CrossShard(22)], DefaultMailboxFactory);
+    let mut runtime = MultiShardRuntime::with_config(
+        [CrossShard(11), CrossShard(22)],
+        DefaultMailboxFactory,
+        MultiShardRuntimeConfig {
+            shard_pair_capacity: 1,
+        },
+    );
     let parent = runtime.register_with_capacity_on::<CrossParent, CrossChildMsg>(
         ShardId::new(11),
         CrossParent {
@@ -254,12 +318,10 @@ fn owner_stop_before_reply_cleans_up_pending_spawn_without_panic() {
 }
 
 // `batch([SpawnObservedOn(remote), stop()])` routes the request, then the same
-// turn's stop sweeps the pending record. The reply comes home to a gone owner
-// and is harmlessly dropped: no panic, no continuation. (The child is created
-// on the target shard and orphaned — cross-shard ownership is a follow-on; this
-// pins only that the owner side stays safe.)
+// turn's stop cancels or stops the remote child. No continuation reaches the
+// stopped owner, and the remote address (if admitted) is closed.
 #[test]
-fn spawn_on_remote_then_stop_in_one_turn_is_safe() {
+fn cross_shard_child_ownership_spawn_on_remote_then_stop_in_one_turn_is_safe() {
     let learned = Rc::new(RefCell::new(None));
     let error = Rc::new(RefCell::new(None));
     let mut runtime =
@@ -284,13 +346,364 @@ fn spawn_on_remote_then_stop_in_one_turn_is_safe() {
         learned.borrow().is_none() && error.borrow().is_none(),
         "owner stopped in the same turn must not receive any continuation"
     );
-    // The child was still created on the target shard (it is now orphaned).
+    let trace = runtime.trace();
+    if let Some((_, child_isolate)) = trace.iter().find_map(|event| {
+        if event.shard() == ShardId::new(22) {
+            if let RuntimeEventKind::Spawned { child_isolate } = event.kind() {
+                return Some((event.shard(), child_isolate));
+            }
+        }
+        None
+    }) {
+        let child = tina::Address::<CrossChildMsg>::new(ShardId::new(22), child_isolate);
+        assert_eq!(
+            runtime.try_send(child, CrossChildMsg::Ping),
+            Err(TrySendError::Closed(CrossChildMsg::Ping)),
+            "admitted remote child must be stopped by owner cleanup"
+        );
+    }
     assert!(
-        runtime
+        trace
+            .iter()
+            .any(|event| matches!(event.kind(), RuntimeEventKind::RemoteChildStopped { .. }))
+            || !trace.iter().any(|event| event.shard() == ShardId::new(22)
+                && matches!(event.kind(), RuntimeEventKind::Spawned { .. })),
+        "remote spawn is either cancelled before admission or stopped after admission"
+    );
+}
+
+#[test]
+fn cross_shard_child_ownership_stop_children_stops_remote_child_and_lifecycle_report_records_it() {
+    let learned = Rc::new(RefCell::new(None));
+    let mut runtime =
+        MultiShardRuntime::new([CrossShard(11), CrossShard(22)], DefaultMailboxFactory);
+    let parent = runtime.register_with_capacity_on::<CrossParent, CrossChildMsg>(
+        ShardId::new(11),
+        CrossParent {
+            learned: Rc::clone(&learned),
+            error: Rc::new(RefCell::new(None)),
+        },
+        8,
+    );
+
+    runtime
+        .try_send(parent, CrossParentMsg::SpawnOn(ShardId::new(22)))
+        .unwrap();
+    for _ in 0..12 {
+        runtime.step();
+    }
+    let child = learned.borrow().expect("remote child address learned");
+    let report = runtime
+        .child_lifecycle_report(parent)
+        .expect("live lifecycle report");
+    assert_eq!(report.children.len(), 1);
+    assert_eq!(report.children[0].shard, ShardId::new(22));
+
+    runtime
+        .try_send(parent, CrossParentMsg::StopChildren)
+        .unwrap();
+    for _ in 0..12 {
+        runtime.step();
+    }
+
+    assert_eq!(
+        runtime.try_send(child.address, CrossChildMsg::Ping),
+        Err(TrySendError::Closed(CrossChildMsg::Ping))
+    );
+    let report = runtime
+        .child_lifecycle_report(parent)
+        .expect("live lifecycle report after stop_children");
+    assert!(matches!(
+        report.children[0].state,
+        tina_runtime::ChildLifecycleState::Stopped
+    ));
+    assert!(runtime.trace().iter().any(|event| matches!(
+        event.kind(),
+        RuntimeEventKind::RemoteChildStopRequested { child_shard, .. }
+            if child_shard == ShardId::new(22)
+    )));
+    assert!(runtime.trace().iter().any(|event| matches!(
+        event.kind(),
+        RuntimeEventKind::RemoteChildStopped { child_shard, .. }
+            if child_shard == ShardId::new(22)
+    )));
+}
+
+#[test]
+fn cross_shard_child_ownership_remote_owner_id_does_not_collide_with_local_parent() {
+    let learned = Rc::new(RefCell::new(None));
+    let mut runtime =
+        MultiShardRuntime::new([CrossShard(11), CrossShard(22)], DefaultMailboxFactory);
+    let owner = runtime.register_with_capacity_on::<CrossParent, CrossChildMsg>(
+        ShardId::new(11),
+        CrossParent {
+            learned: Rc::clone(&learned),
+            error: Rc::new(RefCell::new(None)),
+        },
+        8,
+    );
+    let local_same_numeric_parent = runtime
+        .register_with_capacity_on::<CrossParent, CrossChildMsg>(
+            ShardId::new(22),
+            CrossParent {
+                learned: Rc::new(RefCell::new(None)),
+                error: Rc::new(RefCell::new(None)),
+            },
+            8,
+        );
+    assert_eq!(owner.isolate(), local_same_numeric_parent.isolate());
+
+    runtime
+        .try_send(owner, CrossParentMsg::SpawnOn(ShardId::new(22)))
+        .unwrap();
+    for _ in 0..12 {
+        runtime.step();
+    }
+    let child = learned.borrow().expect("remote child address learned");
+
+    runtime
+        .try_send(local_same_numeric_parent, CrossParentMsg::StopChildren)
+        .unwrap();
+    for _ in 0..8 {
+        runtime.step();
+    }
+
+    assert_eq!(runtime.try_send(child.address, CrossChildMsg::Ping), Ok(()));
+}
+
+#[test]
+fn cross_shard_child_ownership_cancel_pressure_does_not_orphan_admitted_children() {
+    let learned = Rc::new(RefCell::new(None));
+    let mut runtime = MultiShardRuntime::with_config(
+        [CrossShard(11), CrossShard(22)],
+        DefaultMailboxFactory,
+        MultiShardRuntimeConfig {
+            shard_pair_capacity: 2,
+        },
+    );
+    let parent = runtime.register_with_capacity_on::<CrossParent, CrossChildMsg>(
+        ShardId::new(11),
+        CrossParent {
+            learned: Rc::clone(&learned),
+            error: Rc::new(RefCell::new(None)),
+        },
+        8,
+    );
+
+    runtime
+        .try_send(parent, CrossParentMsg::SpawnTwoOnThenStop(ShardId::new(22)))
+        .unwrap();
+    for _ in 0..20 {
+        runtime.step();
+    }
+
+    assert!(learned.borrow().is_none());
+    let spawned_children: Vec<_> = runtime
+        .trace()
+        .iter()
+        .filter_map(|event| {
+            if event.shard() == ShardId::new(22) {
+                if let RuntimeEventKind::Spawned { child_isolate } = event.kind() {
+                    return Some(child_isolate);
+                }
+            }
+            None
+        })
+        .collect();
+    assert_eq!(spawned_children.len(), 2);
+    for child_isolate in spawned_children {
+        let child = tina::Address::<CrossChildMsg>::new(ShardId::new(22), child_isolate);
+        assert_eq!(
+            runtime.try_send(child, CrossChildMsg::Ping),
+            Err(TrySendError::Closed(CrossChildMsg::Ping))
+        );
+    }
+    assert!(runtime.trace().iter().any(|event| matches!(
+        event.kind(),
+        RuntimeEventKind::RemoteChildControlRejected {
+            reason: tina_runtime::SendRejectedReason::Full,
+            ..
+        }
+    )));
+}
+
+#[test]
+fn cross_shard_restartable_child_restarts_on_remote_shard_and_reports_replacement_address() {
+    let learned = Rc::new(RefCell::new(None));
+    let mut runtime =
+        MultiShardRuntime::new([CrossShard(11), CrossShard(22)], DefaultMailboxFactory);
+    let parent = runtime.register_with_capacity_on::<RestartParent, CrossChildMsg>(
+        ShardId::new(11),
+        RestartParent {
+            learned: Rc::clone(&learned),
+        },
+        8,
+    );
+
+    runtime
+        .try_send(
+            parent,
+            RestartParentMsg::SpawnRestartableOn(ShardId::new(22)),
+        )
+        .unwrap();
+    for _ in 0..12 {
+        runtime.step();
+    }
+    let old_child = learned.borrow().expect("remote child address learned");
+    let restart_waiter = runtime.observe_child_restarted(parent);
+
+    runtime
+        .try_send(parent, RestartParentMsg::RestartChildren)
+        .unwrap();
+    for _ in 0..12 {
+        runtime.step();
+    }
+
+    let restarted = restart_waiter
+        .wait(Duration::from_secs(1))
+        .expect("remote restart waiter resolves");
+    assert_eq!(restarted.child_ordinal, 0);
+    assert_eq!(restarted.new_shard, ShardId::new(22));
+    assert_ne!(restarted.new_isolate, old_child.address.isolate());
+
+    let replacement = tina::Address::<CrossChildMsg>::new(ShardId::new(22), restarted.new_isolate);
+    assert_eq!(
+        runtime.try_send(old_child.address, CrossChildMsg::Ping),
+        Err(TrySendError::Closed(CrossChildMsg::Ping)),
+        "old remote child address must be stale after restart"
+    );
+    assert_eq!(
+        runtime.try_send(replacement, CrossChildMsg::Ping),
+        Ok(()),
+        "replacement address from typed waiter must be live"
+    );
+
+    let report = runtime
+        .child_lifecycle_report(parent)
+        .expect("remote restart lifecycle report");
+    assert_eq!(report.children.len(), 1);
+    assert_eq!(report.children[0].shard, ShardId::new(22));
+    assert_eq!(report.children[0].isolate, restarted.new_isolate);
+    assert!(matches!(
+        report.children[0].state,
+        tina_runtime::ChildLifecycleState::Restarted
+    ));
+    assert!(runtime.trace().iter().any(|event| matches!(
+        event.kind(),
+        RuntimeEventKind::RestartChildCompleted {
+            new_isolate,
+            new_generation,
+            ..
+        } if new_isolate == restarted.new_isolate
+            && new_generation == restarted.new_generation
+            && event.shard() == ShardId::new(11)
+    )));
+}
+
+#[test]
+fn cross_shard_restart_children_skips_non_restartable_remote_child_without_faking_local_restart() {
+    let learned = Rc::new(RefCell::new(None));
+    let mut runtime =
+        MultiShardRuntime::new([CrossShard(11), CrossShard(22)], DefaultMailboxFactory);
+    let parent = runtime.register_with_capacity_on::<CrossParent, CrossChildMsg>(
+        ShardId::new(11),
+        CrossParent {
+            learned: Rc::clone(&learned),
+            error: Rc::new(RefCell::new(None)),
+        },
+        8,
+    );
+
+    runtime
+        .try_send(parent, CrossParentMsg::SpawnOn(ShardId::new(22)))
+        .unwrap();
+    for _ in 0..12 {
+        runtime.step();
+    }
+    let child = learned.borrow().expect("remote child address learned");
+
+    runtime
+        .try_send(parent, CrossParentMsg::RestartChildren)
+        .unwrap();
+    for _ in 0..8 {
+        runtime.step();
+    }
+
+    assert_eq!(
+        runtime.try_send(child.address, CrossChildMsg::Ping),
+        Ok(()),
+        "non-restartable remote child remains live at its original address"
+    );
+    assert!(runtime.trace().iter().any(|event| matches!(
+        event.kind(),
+        RuntimeEventKind::RestartChildSkipped {
+            reason: tina_runtime::RestartSkippedReason::RemoteNotRestartable,
+            ..
+        } if event.shard() == ShardId::new(11)
+    )));
+    assert!(
+        !runtime
             .trace()
             .iter()
-            .any(|event| event.shard() == ShardId::new(22)
-                && matches!(event.kind(), RuntimeEventKind::Spawned { .. })),
-        "the target shard still created the child"
+            .any(|event| matches!(event.kind(), RuntimeEventKind::RestartChildCompleted { .. }))
     );
+}
+
+#[test]
+fn owner_stop_racing_remote_restart_stops_replacement_child_too() {
+    let learned = Rc::new(RefCell::new(None));
+    let mut runtime =
+        MultiShardRuntime::new([CrossShard(11), CrossShard(22)], DefaultMailboxFactory);
+    let parent = runtime.register_with_capacity_on::<RestartParent, CrossChildMsg>(
+        ShardId::new(11),
+        RestartParent {
+            learned: Rc::clone(&learned),
+        },
+        8,
+    );
+
+    runtime
+        .try_send(
+            parent,
+            RestartParentMsg::SpawnRestartableOn(ShardId::new(22)),
+        )
+        .unwrap();
+    for _ in 0..12 {
+        runtime.step();
+    }
+
+    runtime
+        .try_send(parent, RestartParentMsg::RestartChildren)
+        .unwrap();
+    runtime.step();
+    runtime.try_send(parent, RestartParentMsg::StopNow).unwrap();
+    for _ in 0..12 {
+        runtime.step();
+    }
+
+    let old_child = learned
+        .borrow()
+        .expect("initial child address learned")
+        .address;
+    let mut remote_children = vec![old_child];
+    remote_children.extend(runtime.trace().iter().filter_map(|event| {
+        if let RuntimeEventKind::RestartChildCompleted { new_isolate, .. } = event.kind() {
+            return Some(tina::Address::<CrossChildMsg>::new(
+                ShardId::new(22),
+                new_isolate,
+            ));
+        }
+        None
+    }));
+    assert!(
+        remote_children.len() >= 2,
+        "restart race should create an initial child and a replacement"
+    );
+    for child in remote_children {
+        assert_eq!(
+            runtime.try_send(child, CrossChildMsg::Ping),
+            Err(TrySendError::Closed(CrossChildMsg::Ping)),
+            "owner stop must not orphan any remote restart incarnation"
+        );
+    }
 }

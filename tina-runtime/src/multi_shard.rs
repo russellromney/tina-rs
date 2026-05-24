@@ -16,8 +16,8 @@ use crate::mailbox::MailboxFactory;
 use crate::sharded::ReplyAdapter;
 use crate::trace::{RuntimeEvent, SendRejectedReason};
 use crate::{
-    IdSource, IntoErasedSpawn, IntoErasedSpawnObserved, IntoSendErasedSpawnObserved,
-    QueuedRemoteEnvelope, Runtime,
+    ChildRestartedWaiter, IdSource, IntoErasedSpawn, IntoErasedSpawnObserved,
+    IntoSendErasedSpawnObserved, QueuedRemoteEnvelope, Runtime,
 };
 
 type RemoteQueueIndexes = BTreeMap<(ShardId, ShardId), usize>;
@@ -109,12 +109,14 @@ where
             let shard_id = shard.id();
             shard_indexes.insert(shard_id, runtimes.len());
             shard_ids.push(shard_id);
-            runtimes.push(Runtime::with_clock_and_ids(
+            let mut runtime = Runtime::with_clock_and_ids(
                 shard,
                 mailbox_factory.clone(),
                 Box::new(MonotonicClock),
                 ids.clone(),
-            ));
+            );
+            runtime.remote_child_control_capacity = config.shard_pair_capacity;
+            runtimes.push(runtime);
         }
         let (remote_queue_indexes, remote_queues) =
             build_remote_queues(&shard_ids, config.shard_pair_capacity);
@@ -285,6 +287,32 @@ where
         self.runtime_mut(parent.shard()).supervise(parent, config);
     }
 
+    /// Returns the live runtime-owned lifecycle report for direct children of
+    /// `parent`.
+    pub fn child_lifecycle_report<M: 'static, R>(
+        &self,
+        parent: Address<M, R>,
+    ) -> Result<crate::ChildLifecycleReport, crate::ChildLifecycleReportError> {
+        let Some(index) = self.shard_indexes.get(&parent.shard()).copied() else {
+            return Err(crate::ChildLifecycleReportError::ParentShardUnavailable(
+                parent.shard(),
+            ));
+        };
+        self.runtimes[index].child_lifecycle_report(parent)
+    }
+
+    /// Registers a typed waiter for the next child restart reported on the
+    /// parent's owning shard. Cross-shard child restarts resolve here with the
+    /// replacement shard/isolate/generation, so callers do not need to mine the
+    /// trace for replacement addresses.
+    pub fn observe_child_restarted<M: 'static, R>(
+        &mut self,
+        parent: Address<M, R>,
+    ) -> ChildRestartedWaiter {
+        self.runtime_mut(parent.shard())
+            .observe_child_restarted(parent)
+    }
+
     /// Attempts one typed global ingress send routed strictly by target shard.
     pub fn try_send<M: 'static, R>(
         &self,
@@ -428,7 +456,10 @@ fn enqueue_remote_envelope_preserving_terminal(
     });
     let terminal = matches!(
         envelope,
-        QueuedRemoteEnvelope::CallReply(_) | QueuedRemoteEnvelope::SpawnReply(_)
+        QueuedRemoteEnvelope::CallReply(_)
+            | QueuedRemoteEnvelope::SpawnReply(_)
+            | QueuedRemoteEnvelope::ChildStopped(_)
+            | QueuedRemoteEnvelope::ChildRestarted(_)
     );
     let queue = if terminal {
         &mut buffers.next_terminal[queue_index]

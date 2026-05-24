@@ -32,6 +32,7 @@ use tina::{
 use tina_supervisor::SupervisorConfig;
 
 use crate::call::IntoErasedCall;
+use crate::dispatch::ErasedRestartRecipe;
 use crate::errors::{RegisterBootstrapError, SuperviseError};
 use crate::fact::IntoRuntimeFact;
 use crate::mailbox::MailboxFactory;
@@ -506,7 +507,7 @@ where
     pub(crate) fn child_record_index_by_child(&self, child: RegisteredAddress) -> Option<usize> {
         self.child_records
             .iter()
-            .position(|record| record.child == child)
+            .position(|record| record.child == child && record.remote_owner.is_none())
     }
 
     pub(crate) fn supervisor_index(&self, parent: IsolateId) -> Option<usize> {
@@ -595,12 +596,17 @@ where
     /// from local `spawn_observed`.) When `owner` is on another shard the child
     /// has no local parent (`parent = None`) and `Spawned` is recorded under the
     /// child on its own shard. Returns the new address.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn register_remote_child<I, Outbound>(
         &mut self,
         isolate: I,
         mailbox_capacity: usize,
         bootstrap_message: Option<I::Message>,
         owner: RegisteredAddress,
+        child_ordinal: usize,
+        remote_request_id: Option<crate::CallId>,
+        remote_owner: Option<RegisteredAddress>,
+        restart_recipe: Option<std::rc::Rc<dyn ErasedRestartRecipe<S, F>>>,
         cause: CauseId,
     ) -> RegisteredAddress
     where
@@ -630,21 +636,31 @@ where
         // child records `Spawned` under itself (its owner is not local).
         let spawn_isolate = match local_parent {
             Some(parent) => {
-                let child_ordinal = self
-                    .child_records
-                    .iter()
-                    .filter(|record| record.parent == parent)
-                    .count();
                 self.child_records.push(ChildRecord {
                     parent,
                     child,
                     child_ordinal,
                     mailbox_capacity,
-                    restart_recipe: None,
+                    restart_recipe,
+                    remote_request_id: None,
+                    remote_owner: None,
+                    remote_restartable: false,
                 });
                 parent
             }
-            None => child_isolate,
+            None => {
+                self.child_records.push(ChildRecord {
+                    parent: owner.isolate,
+                    child,
+                    child_ordinal,
+                    mailbox_capacity,
+                    restart_recipe,
+                    remote_request_id,
+                    remote_owner,
+                    remote_restartable: false,
+                });
+                child_isolate
+            }
         };
         let spawned = self.push_event(
             spawn_isolate,
@@ -815,7 +831,7 @@ where
         let child_ordinal = self
             .child_records
             .iter()
-            .filter(|record| record.parent == parent)
+            .filter(|record| record.parent == parent && record.remote_owner.is_none())
             .count();
 
         self.child_records.push(ChildRecord {
@@ -824,6 +840,36 @@ where
             child_ordinal,
             mailbox_capacity: outcome.mailbox_capacity,
             restart_recipe: outcome.restart_recipe,
+            remote_request_id: None,
+            remote_owner: None,
+            remote_restartable: false,
+        });
+    }
+
+    pub(crate) fn record_remote_child_on_owner(
+        &mut self,
+        parent: IsolateId,
+        child: RegisteredAddress,
+        child_ordinal: usize,
+        mailbox_capacity: usize,
+        remote_restartable: bool,
+    ) {
+        if self.child_records.iter().any(|record| {
+            record.parent == parent
+                && record.remote_owner.is_none()
+                && record.child_ordinal == child_ordinal
+        }) {
+            return;
+        }
+        self.child_records.push(ChildRecord {
+            parent,
+            child,
+            child_ordinal,
+            mailbox_capacity,
+            restart_recipe: None,
+            remote_request_id: None,
+            remote_owner: None,
+            remote_restartable,
         });
     }
 }

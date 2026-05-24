@@ -368,6 +368,61 @@ fn child_lifecycle_and_restart_events_appear_with_child_fields() {
 }
 
 #[test]
+fn remote_child_lifecycle_events_appear_with_remote_fields() {
+    let root = export(&[
+        evt(
+            1,
+            RuntimeEventKind::RemoteChildStopRequested {
+                child_shard: ShardId::new(4),
+                child_ordinal: 2,
+                child_isolate: IsolateId::new(20),
+                child_generation: AddressGeneration::new(3),
+            },
+        ),
+        evt(
+            2,
+            RuntimeEventKind::RemoteChildStopped {
+                child_shard: ShardId::new(4),
+                child_ordinal: 2,
+                child_isolate: IsolateId::new(20),
+                child_generation: AddressGeneration::new(3),
+            },
+        ),
+        evt(
+            3,
+            RuntimeEventKind::RemoteChildControlRejected {
+                target_shard: ShardId::new(4),
+                reason: SendRejectedReason::Full,
+            },
+        ),
+        evt(
+            4,
+            RuntimeEventKind::RemoteChildControlPressure { capacity: 8 },
+        ),
+    ]);
+
+    let requested = first_named(&root, "remote_child_stop_requested");
+    assert_eq!(requested["cat"], "lifecycle");
+    assert_eq!(requested["args"]["child_shard"], 4);
+    assert_eq!(requested["args"]["child_ordinal"], 2);
+    assert_eq!(requested["args"]["child_isolate"], 20);
+    assert_eq!(requested["args"]["child_generation"], 3);
+
+    let stopped = first_named(&root, "remote_child_stopped");
+    assert_eq!(stopped["args"]["child_shard"], 4);
+    assert_eq!(stopped["args"]["child_ordinal"], 2);
+    assert_eq!(stopped["args"]["child_isolate"], 20);
+    assert_eq!(stopped["args"]["child_generation"], 3);
+
+    let rejected = first_named(&root, "remote_child_control_rejected");
+    assert_eq!(rejected["args"]["target_shard"], 4);
+    assert_eq!(rejected["args"]["reason"], "Full");
+
+    let pressure = first_named(&root, "remote_child_control_pressure");
+    assert_eq!(pressure["args"]["capacity"], 8);
+}
+
+#[test]
 fn protocol_facts_appear_as_typed_instants_with_stable_tokens() {
     let cases = [
         (

@@ -16,6 +16,15 @@ Larger app-shaped probes live in [`systems/`](systems/). These
 "system specimens" combine several Tina parts at once so cheap model
 work can pull on rough edges before they become design debt.
 
+Phase 129's cross-shard child ownership specimen lives at
+[`specimen_cross_shard_child_ownership/`](specimen_cross_shard_child_ownership/).
+It prints:
+
+```text
+child_lifecycle phase=129 parent=1 children=2 shards=[1, 2] state=live
+child_lifecycle phase=129 parent=1 stopped=2 pending_remote_control=0
+```
+
 Before writing or rewriting an example, check the
 [ergonomics checklist](../docs/tina-user-guide/11-ergonomics-checklist.md)
 for the primitives the runtime now ships (mailbox factory, single-shard

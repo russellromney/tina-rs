@@ -390,6 +390,10 @@ pub enum RestartSkippedReason {
     /// The restartable child factory panicked while constructing the
     /// replacement child.
     FactoryPanicked,
+
+    /// The child lives on another shard and was not spawned with a sendable
+    /// cross-shard restart recipe.
+    RemoteNotRestartable,
 }
 
 /// Why a supervised restart response did not run.
@@ -497,6 +501,46 @@ pub enum RuntimeEventKind {
 
         /// The new child's address generation.
         child_generation: AddressGeneration,
+    },
+
+    /// The owner requested that a child on another shard stop through the
+    /// destination shard's normal stop path.
+    RemoteChildStopRequested {
+        /// The shard the child lives on.
+        child_shard: ShardId,
+        /// Stable per-parent child ordinal.
+        child_ordinal: usize,
+        /// The child incarnation being stopped.
+        child_isolate: IsolateId,
+        /// The child generation being stopped.
+        child_generation: AddressGeneration,
+    },
+
+    /// The owner shard observed a stopped report for a child on another shard.
+    RemoteChildStopped {
+        /// The shard the child lived on.
+        child_shard: ShardId,
+        /// Stable per-parent child ordinal.
+        child_ordinal: usize,
+        /// The child incarnation that stopped.
+        child_isolate: IsolateId,
+        /// The child generation that stopped.
+        child_generation: AddressGeneration,
+    },
+
+    /// Remote child-control delivery hit bounded pressure.
+    RemoteChildControlRejected {
+        /// The shard the control message targeted.
+        target_shard: ShardId,
+        /// The typed pressure/closure reason.
+        reason: SendRejectedReason,
+    },
+
+    /// The destination shard's bounded remote child-control tombstone table
+    /// was full and evicted an older tombstone.
+    RemoteChildControlPressure {
+        /// Configured capacity of the bounded table.
+        capacity: usize,
     },
 
     /// The runtime began a supervised restart response to a child panic.
@@ -1447,6 +1491,7 @@ fn restart_skipped_tag(reason: RestartSkippedReason) -> u8 {
     match reason {
         RestartSkippedReason::NotRestartable => 1,
         RestartSkippedReason::FactoryPanicked => 2,
+        RestartSkippedReason::RemoteNotRestartable => 3,
     }
 }
 
@@ -1527,6 +1572,42 @@ fn write_kind_stable(kind: RuntimeEventKind, hasher: &mut StableHasher) {
             hasher.write_u32(child_shard.get());
             hasher.write_u64(child_isolate.get());
             hasher.write_u64(child_generation.get());
+        }
+        RuntimeEventKind::RemoteChildStopRequested {
+            child_shard,
+            child_ordinal,
+            child_isolate,
+            child_generation,
+        } => {
+            hasher.write_u8(40);
+            hasher.write_u32(child_shard.get());
+            hasher.write_u64(child_ordinal as u64);
+            hasher.write_u64(child_isolate.get());
+            hasher.write_u64(child_generation.get());
+        }
+        RuntimeEventKind::RemoteChildStopped {
+            child_shard,
+            child_ordinal,
+            child_isolate,
+            child_generation,
+        } => {
+            hasher.write_u8(41);
+            hasher.write_u32(child_shard.get());
+            hasher.write_u64(child_ordinal as u64);
+            hasher.write_u64(child_isolate.get());
+            hasher.write_u64(child_generation.get());
+        }
+        RuntimeEventKind::RemoteChildControlRejected {
+            target_shard,
+            reason,
+        } => {
+            hasher.write_u8(42);
+            hasher.write_u32(target_shard.get());
+            hasher.write_u8(send_rejected_tag(reason));
+        }
+        RuntimeEventKind::RemoteChildControlPressure { capacity } => {
+            hasher.write_u8(43);
+            hasher.write_u64(capacity as u64);
         }
         RuntimeEventKind::HandlerFinished { effect } => {
             hasher.write_u8(4);

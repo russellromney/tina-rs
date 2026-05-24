@@ -53,6 +53,7 @@ exclude = [
     "examples/specimen_cancellation_chain",
     "examples/specimen_owned_state_leak",
     "examples/specimen_worker_pool",
+    "examples/specimen_cross_shard_child_ownership",
     "examples/specimen_bounded_batcher",
     "examples/specimen_webhook_fanout",
     "examples/specimen_hot_key_fairness",

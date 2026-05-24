@@ -889,7 +889,83 @@ pub type RestartableChildParts<I> = (
     Option<Box<dyn Fn() -> <I as Isolate>::Message>>,
 );
 
+/// Sendable restartable spawn request for local in-process cross-shard
+/// children.
+#[must_use = "a spawn request has no effect until a runtime executes it"]
+pub struct CrossShardRestartableChildDefinition<I>
+where
+    I: Isolate,
+{
+    factory: Box<dyn Fn() -> I + Send + Sync>,
+    mailbox_capacity: usize,
+    bootstrap_factory: Option<Box<dyn Fn() -> I::Message + Send + Sync>>,
+}
+
+impl<I> std::fmt::Debug for CrossShardRestartableChildDefinition<I>
+where
+    I: Isolate,
+{
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CrossShardRestartableChildDefinition")
+            .field("mailbox_capacity", &self.mailbox_capacity)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<I> CrossShardRestartableChildDefinition<I>
+where
+    I: Isolate,
+{
+    /// Creates a new sendable cross-shard restartable spawn request.
+    pub fn new<F>(factory: F, mailbox_capacity: usize) -> Self
+    where
+        F: Fn() -> I + Send + Sync + 'static,
+    {
+        Self {
+            factory: Box::new(factory),
+            mailbox_capacity,
+            bootstrap_factory: None,
+        }
+    }
+
+    /// Adds one initial child message for the first and replacement
+    /// incarnations.
+    pub fn with_initial_message<F>(mut self, bootstrap: F) -> Self
+    where
+        F: Fn() -> I::Message + Send + Sync + 'static,
+    {
+        self.bootstrap_factory = Some(Box::new(bootstrap));
+        self
+    }
+
+    /// Returns the requested mailbox capacity.
+    pub const fn mailbox_capacity(&self) -> usize {
+        self.mailbox_capacity
+    }
+
+    /// Consumes the request and returns its sendable parts.
+    pub fn into_parts(self) -> CrossShardRestartableChildParts<I> {
+        (self.factory, self.mailbox_capacity, self.bootstrap_factory)
+    }
+}
+
+/// Tuple returned by [`CrossShardRestartableChildDefinition::into_parts`].
+pub type CrossShardRestartableChildParts<I> = (
+    Box<dyn Fn() -> I + Send + Sync>,
+    usize,
+    Option<Box<dyn Fn() -> <I as Isolate>::Message + Send + Sync>>,
+);
+
 impl<I> SpawnAddress for RestartableChildDefinition<I>
+where
+    I: Isolate,
+{
+    type Message = I::Message;
+    type Reply = I::Reply;
+}
+
+impl<I> SpawnAddress for CrossShardRestartableChildDefinition<I>
 where
     I: Isolate,
 {

@@ -40,8 +40,8 @@ use crate::shutdown::{SharedShutdownState, ShutdownWorker, ThreadedShutdownHandl
 use crate::threaded::{ThreadedCommand, ThreadedRuntimeConfig, deliver_shutdown_signal_and_drain};
 use crate::trace::{RuntimeEvent, SendRejectedReason};
 use crate::{
-    IdSource, IntoErasedSpawn, IntoErasedSpawnObserved, IntoSendErasedSpawnObserved,
-    QueuedRemoteEnvelope, Runtime, SendableQueuedRemoteEnvelope,
+    ChildLifecycleReport, IdSource, IntoErasedSpawn, IntoErasedSpawnObserved,
+    IntoSendErasedSpawnObserved, QueuedRemoteEnvelope, Runtime, SendableQueuedRemoteEnvelope,
 };
 
 /// One live worker-per-shard runtime over a fixed shard set.
@@ -456,6 +456,29 @@ where
     ) -> Result<(), ThreadedRuntimeError> {
         self.call_on(parent.shard(), move |runtime| {
             runtime.supervise(parent, config)
+        })
+    }
+
+    /// Returns a live child lifecycle report from the parent shard.
+    pub fn child_lifecycle_report<M: 'static, R: 'static>(
+        &self,
+        parent: Address<M, R>,
+    ) -> Result<ChildLifecycleReport, ThreadedRuntimeError> {
+        self.call_on(parent.shard(), move |runtime| {
+            runtime.child_lifecycle_report(parent)
+        })
+        .and_then(|report| report.map_err(|_| ThreadedRuntimeError::WorkerStopped))
+    }
+
+    /// Registers a typed waiter for the next child restart reported on the
+    /// parent's owning shard. Remote child restarts resolve through the owner
+    /// shard with the replacement address fields.
+    pub fn observe_child_restarted<M: 'static, R: 'static>(
+        &self,
+        parent: Address<M, R>,
+    ) -> Result<observation::ChildRestartedWaiter, ThreadedRuntimeError> {
+        self.call_on(parent.shard(), move |runtime| {
+            runtime.observe_child_restarted(parent)
         })
     }
 
@@ -885,6 +908,7 @@ where
     S: Shard + 'static,
     F: MailboxFactory + 'static,
 {
+    runtime.remote_child_control_capacity = config.shard_pair_capacity;
     shard_metrics.set_worker_thread_id(format!("{:?}", thread::current().id()));
     let source_shard = runtime.shard().id();
     let mut terminal_overflow = VecDeque::new();
@@ -902,7 +926,10 @@ where
                 let target_shard = envelope.target_shard();
                 let terminal = matches!(
                     envelope,
-                    QueuedRemoteEnvelope::CallReply(_) | QueuedRemoteEnvelope::SpawnReply(_)
+                    QueuedRemoteEnvelope::CallReply(_)
+                        | QueuedRemoteEnvelope::SpawnReply(_)
+                        | QueuedRemoteEnvelope::ChildStopped(_)
+                        | QueuedRemoteEnvelope::ChildRestarted(_)
                 );
                 let metrics = remote_wiring
                     .queue_metrics
@@ -1074,7 +1101,10 @@ fn route_remote_preserving_terminal(
             if failure.reason == SendRejectedReason::Full
                 && matches!(
                     failure.envelope,
-                    QueuedRemoteEnvelope::CallReply(_) | QueuedRemoteEnvelope::SpawnReply(_)
+                    QueuedRemoteEnvelope::CallReply(_)
+                        | QueuedRemoteEnvelope::SpawnReply(_)
+                        | QueuedRemoteEnvelope::ChildStopped(_)
+                        | QueuedRemoteEnvelope::ChildRestarted(_)
                 ) =>
         {
             terminal_overflow.push_back(failure.envelope);
@@ -1096,7 +1126,10 @@ fn drain_terminal_overflow(
                 if failure.reason == SendRejectedReason::Full
                     && matches!(
                         failure.envelope,
-                        QueuedRemoteEnvelope::CallReply(_) | QueuedRemoteEnvelope::SpawnReply(_)
+                        QueuedRemoteEnvelope::CallReply(_)
+                            | QueuedRemoteEnvelope::SpawnReply(_)
+                            | QueuedRemoteEnvelope::ChildStopped(_)
+                            | QueuedRemoteEnvelope::ChildRestarted(_)
                     ) =>
             {
                 terminal_overflow.push_front(failure.envelope);
