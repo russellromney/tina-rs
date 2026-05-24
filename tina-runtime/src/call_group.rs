@@ -246,8 +246,8 @@ pub enum CallGroupRecordReplyError<K, R> {
         /// Reply outcome that could not be recorded.
         outcome: CallOutcome<R>,
     },
-    /// A first-success race already reached its winner and drained
-    /// losers for cancellation.
+    /// A first-success race already reached its winner and this reply
+    /// does not name one of the losers currently being cancelled.
     RaceAlreadyWon {
         /// Branch key carried by the continuation.
         key: K,
@@ -475,6 +475,30 @@ where
         F: FnOnce(&R) -> bool,
     {
         if !matches!(self.race_state, RaceState::Collecting) {
+            if self
+                .expected_cancels
+                .iter()
+                .any(|expected| expected.key == key && expected.token == token)
+                && !self
+                    .branch_outcomes
+                    .iter()
+                    .any(|outcome| outcome.token == token)
+            {
+                assert!(
+                    self.branch_outcomes.len() < self.capacity,
+                    "CallGroup branch outcome storage exceeded fixed capacity",
+                );
+                self.branch_outcomes.push(CallGroupBranchOutcome {
+                    key,
+                    token,
+                    outcome,
+                    classified_success: false,
+                });
+                return Ok(CallGroupReplyStep {
+                    cancel_losers: Vec::new(),
+                    report_ready: self.report_ready(),
+                });
+            }
             return Err(CallGroupRecordReplyError::RaceAlreadyWon {
                 key,
                 token,
@@ -820,6 +844,41 @@ mod tests {
         let report = group.into_report();
         assert!(report.complete);
         assert_eq!(report.winner, Some(b));
+        assert_eq!(report.cancel_outcomes.len(), 1);
+    }
+
+    #[test]
+    fn late_loser_reply_after_winner_is_recorded_not_rejected() {
+        let mut group: CallGroup<u8, Reply> = CallGroup::with_capacity(2);
+        let winner = group.insert(1, make_handle()).unwrap();
+        let loser = group.insert(2, make_handle()).unwrap();
+
+        let won = group
+            .record_reply(1, winner, CallOutcome::Replied(Reply(10)), |reply| {
+                reply.0 >= 10
+            })
+            .unwrap();
+        assert_eq!(won.cancel_losers.len(), 1);
+        assert!(!won.report_ready);
+
+        let late = group
+            .record_reply(2, loser, CallOutcome::Replied(Reply(9)), |reply| {
+                reply.0 >= 10
+            })
+            .unwrap();
+        assert!(late.cancel_losers.is_empty());
+        assert!(!late.report_ready);
+
+        assert!(
+            group
+                .record_cancel(2, loser, CancelOutcome::AlreadyCompleted)
+                .unwrap(),
+            "late reply plus observed cancel outcome completes the race"
+        );
+        let report = group.into_report();
+        assert!(report.complete);
+        assert_eq!(report.winner, Some(winner));
+        assert_eq!(report.branch_outcomes.len(), 2);
         assert_eq!(report.cancel_outcomes.len(), 1);
     }
 

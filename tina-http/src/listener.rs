@@ -10,6 +10,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use tina::prelude::*;
+use tina::{CallContext, RequestContext, reply_to_request};
 use tina_runtime::{
     CallError, ListenerId, StreamId, tcp_accept, tcp_bind, tcp_close_listener, tcp_close_stream,
 };
@@ -40,6 +41,29 @@ pub enum HttpListenerMsg {
     StreamClosed(Result<(), CallError>),
 }
 
+/// HTTP listener is bound. `local_addr` carries the kernel-assigned
+/// port when the caller bound `:0`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HttpReady {
+    pub local_addr: SocketAddr,
+}
+
+/// Address type for a plain HTTP listener.
+pub type HttpListenerAddress = Address<HttpListenerMsg, Result<HttpReady, HttpStartupError>>;
+
+/// Plain HTTP listener could not start. No child spawned, no listener
+/// resource held.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HttpStartupError {
+    /// `tcp_bind` failed. `source` is the typed runtime error.
+    Bind { source: CallError },
+    /// Second `Start` on the same listener. The first bind still owns
+    /// the listener — no second bind happens.
+    AlreadyStarted,
+    /// `Stop` arrived while startup was in flight.
+    Stopped,
+}
+
 /// Listener isolate.
 ///
 /// Generic over the user's `Shard` and the service's message type
@@ -57,6 +81,7 @@ pub struct HttpListener<S: Shard + 'static, M: From<HttpRequest> + Send + 'stati
     /// behaviour as before.
     metrics: Option<BodyMetrics>,
     listener: Option<ListenerId>,
+    pending_start_reply: Option<RequestContext<Result<HttpReady, HttpStartupError>>>,
     /// Set on the first `Start`. Second Start is a no-op.
     started: bool,
     stopping: bool,
@@ -89,6 +114,7 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpListener<S, 
             connection_mailbox_capacity,
             metrics: None,
             listener: None,
+            pending_start_reply: None,
             started: false,
             stopping: false,
             _shard: PhantomData,
@@ -128,7 +154,7 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpListener<S, 
 impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Isolate for HttpListener<S, M> {
     tina::isolate_types! {
         message: HttpListenerMsg,
-        reply: (),
+        reply: Result<HttpReady, HttpStartupError>,
         send: tina::Outbound<std::convert::Infallible>,
         spawn: ChildDefinition<HttpConnection<S, M>>,
         call: tina_runtime::RuntimeCall<HttpListenerMsg>,
@@ -155,18 +181,37 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Isolate for Http
 
             HttpListenerMsg::Bound(Ok((listener, local_addr))) => {
                 self.listener = Some(listener);
-                let _ = local_addr;
                 if self.stopping {
                     // Stop arrived while bind was in flight. Close
                     // the just-bound listener immediately rather
                     // than starting the accept loop, otherwise the
                     // listener would leak until full shutdown.
                     let listener = self.listener.take().expect("set just above");
-                    return tcp_close_listener(listener).then(HttpListenerMsg::ListenerClosed);
+                    let close = tcp_close_listener(listener).then(HttpListenerMsg::ListenerClosed);
+                    return match self.pending_start_reply.take() {
+                        Some(request) => batch(vec![
+                            reply_to_request(request, Err(HttpStartupError::Stopped)),
+                            close,
+                        ]),
+                        None => close,
+                    };
                 }
-                tcp_accept(listener).then(HttpListenerMsg::Accepted)
+                let accept = tcp_accept(listener).then(HttpListenerMsg::Accepted);
+                match self.pending_start_reply.take() {
+                    Some(request) => batch(vec![
+                        reply_to_request(request, Ok(HttpReady { local_addr })),
+                        accept,
+                    ]),
+                    None => accept,
+                }
             }
-            HttpListenerMsg::Bound(Err(_)) => stop(),
+            HttpListenerMsg::Bound(Err(source)) => match self.pending_start_reply.take() {
+                Some(request) => batch(vec![
+                    reply_to_request(request, Err(HttpStartupError::Bind { source })),
+                    stop(),
+                ]),
+                None => stop(),
+            },
 
             HttpListenerMsg::Accepted(Ok((stream, _peer))) => {
                 if self.stopping {
@@ -225,6 +270,20 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Isolate for Http
                 // through the orphan-close path.
                 noop()
             }
+        }
+    }
+
+    fn handle_call(&mut self, msg: HttpListenerMsg, call: CallContext<'_, Self>) -> Effect<Self> {
+        match msg {
+            HttpListenerMsg::Start => {
+                if self.started {
+                    return call.reply(Err(HttpStartupError::AlreadyStarted));
+                }
+                self.started = true;
+                self.pending_start_reply = Some(call.into_request_context());
+                tcp_bind(self.bind_addr).then(HttpListenerMsg::Bound)
+            }
+            _ => call.reject(tina::CallRejectedReason::UnsupportedMessage),
         }
     }
 }
