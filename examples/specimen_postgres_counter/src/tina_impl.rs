@@ -86,7 +86,7 @@ fn run_counter_script(
         }
     }
 
-    let outcome = runtime.call_blocking(
+    let outcome = runtime.call_blocking_typed(
         db,
         PgMsg::Send(PgRequest::fetch_one(finalize_sql(table))),
         SQL_TIMEOUT,
@@ -105,7 +105,7 @@ fn execute(
     db: tina_sqlx_bridge::PgAddress,
     sql: String,
 ) -> anyhow::Result<u64> {
-    let outcome = runtime.call_blocking(db, PgMsg::Send(PgRequest::execute(sql)), SQL_TIMEOUT)?;
+    let outcome = runtime.call_blocking_typed(db, PgMsg::Send(PgRequest::execute(sql)), SQL_TIMEOUT)?;
     match outcome {
         CallOutcome::Replied(Ok(PgResponse::Executed { rows_affected })) => Ok(rows_affected),
         other => anyhow::bail!("unexpected execute outcome {other:?}"),

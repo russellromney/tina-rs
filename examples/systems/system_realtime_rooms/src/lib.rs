@@ -644,7 +644,7 @@ fn serialize_stats(stats: &RoomStats) -> String {
 pub struct RoomServer {
     addr: std::net::SocketAddr,
     runtime: ThreadedRuntime<RoomShard, DefaultThreadedMailboxFactory>,
-    listener: Address<HttpListenerMsg>,
+    listener: tina_http::HttpListenerAddress,
     // Both lanes are needed at startup: a `try_send` for bootstrap/shutdown
     // (internal continuations) and a `CallAddress` for the gateway → room
     // call-shaped path. Holding the full `ServiceHandle` keeps both lanes

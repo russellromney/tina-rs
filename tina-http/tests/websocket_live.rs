@@ -165,7 +165,7 @@ impl WsEcho {
 struct Harness {
     addr: SocketAddr,
     runtime: Option<ThreadedRuntime<TestShard, DefaultThreadedMailboxFactory>>,
-    listener: Address<HttpListenerMsg>,
+    listener: tina_http::HttpListenerAddress,
     _serial_guard: MutexGuard<'static, ()>,
 }
 

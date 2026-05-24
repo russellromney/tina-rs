@@ -4,6 +4,22 @@ This file records completed work.
 
 ## Unreleased
 
+### Hostile Review Fixes
+
+- Made SQLite and SQLx bridge installed addresses callable capabilities
+  (`CallAddress`) instead of raw sendable addresses. The copied bridge helper
+  path now uses `call_typed`, and doctests prove bad `SendAddress` usage does
+  not compile.
+- Made `CallGroup` record a loser reply that arrives after a first-success
+  winner but before the loser cancel outcome. Real races can queue that reply;
+  services should not panic on it.
+- Added call-shaped startup replies to the plain HTTP listener, matching the
+  HTTPS listener shape for `Ready`, `AlreadyStarted`, and bind errors while
+  preserving the old send-shaped `Start` path for existing tests/specimens.
+- Added `Http2ClientReport::wrong_lane_messages` so HTTP/2 call-only messages
+  delivered through `try_send` are visible in release builds instead of
+  disappearing as uncounted no-ops.
+
 ### Ergonomic Obvious Fixes
 
 - Added `SharedCapacityReservation` and `SharedCapacityScope::charge(...)` so a

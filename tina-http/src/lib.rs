@@ -194,7 +194,9 @@ pub use keepalive::{
     KeepalivePoolDrainOutcome, KeepalivePoolHandles, KeepalivePoolShutdownReport, OriginKey,
     build_keepalive_pool, shutdown_keepalive_pool,
 };
-pub use listener::{HttpListener, HttpListenerMsg};
+pub use listener::{
+    HttpListener, HttpListenerAddress, HttpListenerMsg, HttpReady, HttpStartupError,
+};
 pub use listener_tls::{
     HttpsListener, HttpsListenerMsg, HttpsReady, HttpsServerConfig, HttpsStartupError,
     TlsServerIdentity,
