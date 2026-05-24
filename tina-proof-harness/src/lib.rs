@@ -20,8 +20,14 @@ pub mod live_replay;
 pub mod load;
 
 pub use bad_peer::{BadPeerOutcome, BadPeerScenario};
-pub use live_replay::{LiveTrace, LiveTraceHandle, LiveTraceLoss};
+pub use live_replay::{
+    LiveTrace, LiveTraceHandle, LiveTraceLoss, RunCapture, RunCaptureFinishError, RunCaptureInputs,
+    capture_run, replay_bug, save_bug, shrink_bug,
+};
 pub use load::{
-    LoadObservation, LoadProfile, LoadReport, LoadRun, LoadRunReport, LoadStop, OpOutcome,
-    SurfacePlateau, UnavailableSurface,
+    LoadAssertionFailure, LoadObservation, LoadProfile, LoadReport, LoadRun, LoadRunReport,
+    LoadStop, OpOutcome, SurfacePlateau, UnavailableSurface, assert_cold_work_made_progress,
+    assert_no_leaked_capacity_at_shutdown, assert_surface_plateaued_cleanly,
+    assert_timer_kept_firing, cold_work_made_progress, no_leaked_capacity_at_shutdown,
+    surface_plateaued_cleanly, timer_kept_firing,
 };

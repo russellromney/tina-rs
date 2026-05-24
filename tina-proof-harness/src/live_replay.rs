@@ -33,8 +33,15 @@
 
 use std::sync::{Arc, Mutex};
 
+use std::collections::BTreeSet;
+use std::path::Path;
 use tina_runtime::{PressureSummary, RuntimeEvent, TraceObserver, stable_trace_hash};
-use tina_sim::dst::TraceShape;
+
+use tina_sim::dst::{
+    CaptureSource, LiveReplayCapture, LiveReplayCaptureBuildError, LiveReplayCaptureBuilder,
+    LiveReplayFact, ReplayCase, ReplayConfig, SavedReplayCaseError, TraceProjection,
+    TraceProjectionError, TraceShape, UnsupportedLiveFact,
+};
 
 /// Live trace collector.
 ///
@@ -273,6 +280,180 @@ impl std::fmt::Display for LiveReplayMismatch {
     }
 }
 
+/// User-facing "capture this run" handle.
+///
+/// Create this before constructing the runtime, pass [`observer`](Self::observer)
+/// into the runtime builder, run the workload, then call [`finish`](Self::finish)
+/// with explicit replay material. The helper only wires the live observer and
+/// fills capture metadata from observed events; it does not guess history,
+/// mailbox roles, invariants, or replay facts.
+#[derive(Debug, Clone)]
+pub struct RunCapture {
+    name: &'static str,
+    trace: LiveTrace,
+}
+
+impl RunCapture {
+    pub fn new(name: &'static str) -> Self {
+        Self {
+            name,
+            trace: LiveTrace::new(),
+        }
+    }
+
+    pub fn observer(&self) -> Arc<dyn TraceObserver> {
+        self.trace.observer()
+    }
+
+    pub fn trace(&self) -> &LiveTrace {
+        &self.trace
+    }
+
+    pub fn finish<Op>(
+        self,
+        inputs: RunCaptureInputs<Op>,
+    ) -> Result<LiveReplayCapture<Op>, RunCaptureFinishError> {
+        let expected_roles: BTreeSet<_> = inputs.topology_roles.iter().copied().collect();
+        let config_roles: BTreeSet<_> = inputs.config.mailboxes.keys().copied().collect();
+        if expected_roles != config_roles {
+            return Err(RunCaptureFinishError::TopologyRolesMismatch {
+                expected: expected_roles.into_iter().collect(),
+                config: config_roles.into_iter().collect(),
+            });
+        }
+        let observed = self
+            .trace
+            .snapshot_complete(inputs.upstream_dropped_events)
+            .map_err(RunCaptureFinishError::TraceLoss)?;
+        if observed != inputs.expected {
+            return Err(RunCaptureFinishError::ExpectedShapeMismatch {
+                expected: inputs.expected,
+                observed,
+            });
+        }
+
+        let mut builder = LiveReplayCaptureBuilder::new(self.name)
+            .with_seed(inputs.seed)
+            .with_config(inputs.config)
+            .with_scenario(inputs.scenario)
+            .with_history(inputs.history)
+            .with_invariant(inputs.invariant)
+            .with_source(inputs.source)
+            .with_source_metadata(inputs.source_metadata)
+            .with_projection(inputs.projection)
+            .with_trace(&self.trace.events());
+        for fact in inputs.live_facts {
+            builder = builder.with_fact(fact);
+        }
+        for fact in inputs.unsupported_facts {
+            builder = builder.with_unsupported_fact(fact.fact, fact.reason);
+        }
+        builder.finish().map_err(RunCaptureFinishError::Build)
+    }
+}
+
+/// Explicit replay material required to finish a [`RunCapture`].
+#[derive(Debug, Clone)]
+pub struct RunCaptureInputs<Op> {
+    pub seed: u64,
+    pub config: ReplayConfig,
+    pub topology_roles: Vec<&'static str>,
+    pub scenario: &'static str,
+    pub history: Vec<Op>,
+    pub invariant: &'static str,
+    pub expected: TraceShape,
+    pub source: &'static str,
+    pub source_metadata: CaptureSource,
+    pub projection: TraceProjection,
+    pub upstream_dropped_events: u64,
+    pub live_facts: Vec<LiveReplayFact>,
+    pub unsupported_facts: Vec<UnsupportedLiveFact>,
+}
+
+#[derive(Debug)]
+pub enum RunCaptureFinishError {
+    TraceLoss(LiveTraceLoss),
+    ExpectedShapeMismatch {
+        expected: TraceShape,
+        observed: TraceShape,
+    },
+    TopologyRolesMismatch {
+        expected: Vec<&'static str>,
+        config: Vec<&'static str>,
+    },
+    Build(LiveReplayCaptureBuildError),
+}
+
+impl std::fmt::Display for RunCaptureFinishError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TraceLoss(loss) => write!(f, "{loss}"),
+            Self::ExpectedShapeMismatch { expected, observed } => write!(
+                f,
+                "capture expected trace shape events={} hash=0x{:016x}, observed events={} hash=0x{:016x}",
+                expected.event_count,
+                expected.trace_hash,
+                observed.event_count,
+                observed.trace_hash
+            ),
+            Self::TopologyRolesMismatch { expected, config } => write!(
+                f,
+                "capture topology roles {:?} do not match ReplayConfig mailbox roles {:?}",
+                expected, config
+            ),
+            Self::Build(err) => write!(f, "{err}"),
+        }
+    }
+}
+
+impl std::error::Error for RunCaptureFinishError {}
+
+pub fn capture_run<Op>(name: &'static str) -> LiveReplayCaptureBuilder<Op> {
+    tina_sim::dst::capture_live_run(name)
+}
+
+pub fn save_bug<Op, F>(
+    path: impl AsRef<Path>,
+    capture: &LiveReplayCapture<Op>,
+    encode_op: F,
+) -> Result<(), SavedReplayCaseError>
+where
+    F: FnMut(&Op) -> String,
+{
+    tina_sim::dst::write_saved_replay_case(path, capture, encode_op)
+}
+
+pub fn replay_bug<Op, Output, Runner>(
+    capture: &LiveReplayCapture<Op>,
+    candidate: &ReplayCase<Op>,
+    runner: Runner,
+) -> tina_sim::dst::LiveReplayReport<Output>
+where
+    Op: Clone + PartialEq + std::fmt::Debug,
+    Runner: FnMut(
+        &ReplayCase<Op>,
+    ) -> Result<tina_sim::dst::LiveReplayReport<Output>, TraceProjectionError>,
+{
+    tina_sim::dst::assert_captured_replay(capture, candidate, runner)
+}
+
+pub fn shrink_bug<Op, Output, Runner, StillFails>(
+    capture: &LiveReplayCapture<Op>,
+    config: tina_sim::dst::ShrinkConfig,
+    reason: impl Into<String>,
+    runner: Runner,
+    still_fails: StillFails,
+) -> Result<tina_sim::dst::ShrinkCapturedReport<Op, Output>, tina_sim::dst::ShrinkCapturedReplayError>
+where
+    Op: Clone,
+    Runner: FnMut(
+        &ReplayCase<Op>,
+    ) -> Result<tina_sim::dst::LiveReplayReport<Output>, TraceProjectionError>,
+    StillFails: FnMut(&tina_sim::dst::LiveReplayReport<Output>) -> bool,
+{
+    tina_sim::dst::shrink_captured_replay(capture, config, reason, runner, still_fails)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -407,5 +588,178 @@ mod tests {
         let pressure = trace.pressure_summary();
         assert!(!pressure.non_zero());
         assert!(!pressure.any_full());
+    }
+
+    #[test]
+    fn run_capture_finishes_only_with_explicit_matching_replay_inputs() {
+        let capture = RunCapture::new("copied_path");
+        let observer = capture.observer();
+        observer.on_event(&sample_event(1));
+        observer.on_event(&sample_event(2));
+        let expected = capture.trace().snapshot();
+        let config = ReplayConfig::new().with_mailbox("svc", 4);
+
+        let finished = capture
+            .finish(RunCaptureInputs {
+                seed: 7,
+                config,
+                topology_roles: vec!["svc"],
+                scenario: "request reaches service",
+                history: vec!["op"],
+                invariant: "request completed",
+                expected,
+                source: "unit test",
+                source_metadata: CaptureSource::new("unit test").runtime_kind("local-system"),
+                projection: TraceProjection::Exact,
+                upstream_dropped_events: 0,
+                live_facts: Vec::new(),
+                unsupported_facts: Vec::new(),
+            })
+            .unwrap();
+
+        assert_eq!(finished.name, "copied_path");
+        assert_eq!(finished.summary().history_len, 1);
+        assert_eq!(finished.expected, expected);
+    }
+
+    #[test]
+    fn run_capture_rejects_topology_role_drift_and_lossy_trace() {
+        let capture = RunCapture::new("bad_roles");
+        capture.observer().on_event(&sample_event(1));
+        let expected = capture.trace().snapshot();
+        let err = capture
+            .finish::<&'static str>(RunCaptureInputs {
+                seed: 1,
+                config: ReplayConfig::new().with_mailbox("actual", 2),
+                topology_roles: vec!["expected"],
+                scenario: "drift",
+                history: vec!["op"],
+                invariant: "same roles",
+                expected,
+                source: "unit test",
+                source_metadata: CaptureSource::new("unit test"),
+                projection: TraceProjection::Exact,
+                upstream_dropped_events: 0,
+                live_facts: Vec::new(),
+                unsupported_facts: Vec::new(),
+            })
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            RunCaptureFinishError::TopologyRolesMismatch { .. }
+        ));
+
+        let lossy = RunCapture::new("lossy");
+        lossy.observer().on_event(&sample_event(1));
+        let expected = lossy.trace().snapshot();
+        let err = lossy
+            .finish::<&'static str>(RunCaptureInputs {
+                seed: 1,
+                config: ReplayConfig::new().with_mailbox("svc", 2),
+                topology_roles: vec!["svc"],
+                scenario: "lossy",
+                history: vec!["op"],
+                invariant: "complete trace",
+                expected,
+                source: "unit test",
+                source_metadata: CaptureSource::new("unit test"),
+                projection: TraceProjection::Exact,
+                upstream_dropped_events: 1,
+                live_facts: Vec::new(),
+                unsupported_facts: Vec::new(),
+            })
+            .unwrap_err();
+        assert!(matches!(err, RunCaptureFinishError::TraceLoss(_)));
+    }
+
+    #[test]
+    fn run_capture_rejects_expected_shape_drift() {
+        let capture = RunCapture::new("shape_drift");
+        capture.observer().on_event(&sample_event(1));
+        let mut expected = capture.trace().snapshot();
+        expected.event_count += 1;
+        let err = capture
+            .finish::<&'static str>(RunCaptureInputs {
+                seed: 1,
+                config: ReplayConfig::new().with_mailbox("svc", 2),
+                topology_roles: vec!["svc"],
+                scenario: "shape drift",
+                history: vec!["op"],
+                invariant: "same shape",
+                expected,
+                source: "unit test",
+                source_metadata: CaptureSource::new("unit test"),
+                projection: TraceProjection::Exact,
+                upstream_dropped_events: 0,
+                live_facts: Vec::new(),
+                unsupported_facts: Vec::new(),
+            })
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            RunCaptureFinishError::ExpectedShapeMismatch { .. }
+        ));
+    }
+
+    #[test]
+    fn bug_workflow_wrappers_delegate_to_saved_replay_primitives() {
+        let capture = RunCapture::new("bug_wrappers");
+        let observer = capture.observer();
+        observer.on_event(&sample_event(1));
+        let events = capture.trace().events();
+        let expected = capture.trace().snapshot();
+        let finished = capture
+            .finish(RunCaptureInputs {
+                seed: 11,
+                config: ReplayConfig::new().with_mailbox("svc", 1),
+                topology_roles: vec!["svc"],
+                scenario: "wrapper smoke",
+                history: vec!["op"],
+                invariant: "replays",
+                expected,
+                source: "unit test",
+                source_metadata: CaptureSource::new("unit test"),
+                projection: TraceProjection::Exact,
+                upstream_dropped_events: 0,
+                live_facts: Vec::new(),
+                unsupported_facts: Vec::new(),
+            })
+            .unwrap();
+
+        let path = std::env::temp_dir().join(format!(
+            "tina-proof-harness-bug-wrapper-{}.case",
+            std::process::id()
+        ));
+        save_bug(&path, &finished, |op| op.to_string()).unwrap();
+        assert!(path.exists());
+        let _ = std::fs::remove_file(&path);
+
+        let case = finished.to_replay_case();
+        let report = replay_bug(&finished, &case, |case| {
+            tina_sim::dst::LiveReplayReport::from_case_and_events(
+                case,
+                &events,
+                "ok",
+                TraceProjection::Exact,
+            )
+        });
+        assert_eq!(report.replay.event_count, expected.event_count);
+
+        let shrunk = shrink_bug(
+            &finished,
+            tina_sim::dst::ShrinkConfig { max_attempts: 0 },
+            "kept failing",
+            |case| {
+                tina_sim::dst::LiveReplayReport::from_case_and_events(
+                    case,
+                    &events,
+                    "ok",
+                    TraceProjection::Exact,
+                )
+            },
+            |_| true,
+        )
+        .unwrap();
+        assert_eq!(shrunk.capture().history.len(), 1);
     }
 }

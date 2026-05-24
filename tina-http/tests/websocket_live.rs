@@ -159,6 +159,7 @@ impl WsEcho {
             | WebSocketSessionMsg::SessionClosed { .. }
             | WebSocketSessionMsg::SessionReport(_)
             | WebSocketSessionMsg::SendOutcome(_)
+            | WebSocketSessionMsg::AppControl(_)
             | WebSocketSessionMsg::Shutdown { .. }
             | WebSocketSessionMsg::Ping(_) => WebSocketSessionOutcome::None,
         }
