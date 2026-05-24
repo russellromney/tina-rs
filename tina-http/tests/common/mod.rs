@@ -18,7 +18,8 @@ use http::{Method, StatusCode};
 use tina::CallContext;
 use tina::prelude::*;
 use tina_http::{
-    BodyMetrics, HttpLimits, HttpListener, HttpListenerMsg, HttpRequest, HttpResponse,
+    BodyMetrics, HttpLimits, HttpListener, HttpListenerAddress, HttpListenerMsg, HttpRequest,
+    HttpResponse,
 };
 use tina_runtime::{
     DefaultThreadedMailboxFactory, RuntimeEvent, RuntimeEventKind, ThreadedRuntime,
@@ -119,7 +120,7 @@ impl Default for HarnessConfig {
 pub struct TestHarness {
     pub addr: SocketAddr,
     runtime: Option<ThreadedRuntime<TestShard, DefaultThreadedMailboxFactory>>,
-    listener: Address<HttpListenerMsg>,
+    listener: HttpListenerAddress,
 }
 
 impl TestHarness {
@@ -208,7 +209,7 @@ impl TestHarness {
     /// Returns the listener isolate address for tests that need to
     /// send extra `HttpListenerMsg`s to it (e.g. idempotency
     /// regression tests).
-    pub fn listener_address(&self) -> Address<HttpListenerMsg> {
+    pub fn listener_address(&self) -> HttpListenerAddress {
         self.listener
     }
 }

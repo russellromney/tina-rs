@@ -78,7 +78,7 @@ fn run_counter_script(
     db: tina_sqlite_bridge::SqliteAddress,
 ) -> anyhow::Result<u64> {
     for _ in 0..INCREMENTS {
-        let outcome = runtime.call_blocking(
+        let outcome = runtime.call_blocking_typed(
             db,
             SqliteMsg::Request(SqliteRequest::execute(
                 "UPDATE counter SET value = value + 1 WHERE id = 0",
@@ -91,7 +91,7 @@ fn run_counter_script(
         }
     }
 
-    let outcome = runtime.call_blocking(
+    let outcome = runtime.call_blocking_typed(
         db,
         SqliteMsg::Request(SqliteRequest::query_rows(
             "SELECT value FROM counter WHERE id = 0",

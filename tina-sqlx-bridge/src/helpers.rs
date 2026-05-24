@@ -34,11 +34,11 @@
 
 use std::time::Duration;
 
-use tina::Address;
+use tina::CallAddress;
 use tina::Effect;
 use tina::Isolate;
 use tina_runtime::bridge::{BridgeFatal, BridgeOutcomeClass, BridgeRetryable, BridgeUnavailable};
-use tina_runtime::{CallOutcome, IsolateCall, RuntimeCall, call};
+use tina_runtime::{CallOutcome, IsolateCall, RuntimeCall, call_typed};
 
 use crate::types::{PgError, PgRequest, PgResponse, PgRow, PgStep, PgTransactionOutcome};
 use crate::worker::PgMsg;
@@ -53,7 +53,18 @@ pub type PgResult = Result<PgResponse, PgError>;
 /// ```ignore
 /// struct App { db: PgAddress, ... }
 /// ```
-pub type PgAddress = Address<PgMsg, PgResult>;
+///
+/// Compile rail: the bridge request lane is callable, not sendable.
+///
+/// ```compile_fail
+/// use tina_sqlx_bridge::{PgAddress, PgMsg};
+///
+/// fn wants_send(_addr: tina::SendAddress<PgMsg>) {}
+/// fn wrong(addr: PgAddress) {
+///     wants_send(addr);
+/// }
+/// ```
+pub type PgAddress = CallAddress<PgMsg, PgResult>;
 
 /// Full reply shape: `CallOutcome<Result<PgResponse, PgError>>`.
 pub type PgCallOutcome = CallOutcome<PgResult>;
@@ -108,7 +119,7 @@ impl PgRows {
 
 /// Submit one Postgres request through a registered worker.
 ///
-/// Thin wrapper over `tina_runtime::call(addr, PgMsg::Send(req),
+/// Thin wrapper over `tina_runtime::call_typed(addr, PgMsg::Send(req),
 /// timeout)`. The reply preserves the response enum and both error
 /// layers.
 pub fn send_request(
@@ -116,7 +127,7 @@ pub fn send_request(
     request: PgRequest,
     timeout: Duration,
 ) -> IsolateCall<PgMsg, PgResult> {
-    call(addr, PgMsg::Send(request), timeout)
+    call_typed(addr, PgMsg::Send(request), timeout)
 }
 
 // ---------------------------------------------------------------------------

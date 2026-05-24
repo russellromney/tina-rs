@@ -34,11 +34,11 @@
 
 use std::time::Duration;
 
-use tina::Address;
+use tina::CallAddress;
 use tina::Effect;
 use tina::Isolate;
 use tina_runtime::bridge::{BridgeFatal, BridgeOutcomeClass, BridgeRetryable, BridgeUnavailable};
-use tina_runtime::{CallOutcome, IsolateCall, RuntimeCall, call};
+use tina_runtime::{CallOutcome, IsolateCall, RuntimeCall, call_typed};
 
 use crate::SqliteError;
 use crate::types::{SqliteRequest, SqliteResponse, SqliteValue};
@@ -54,7 +54,18 @@ pub type SqliteResult = Result<SqliteResponse, SqliteError>;
 /// ```ignore
 /// struct App { db: SqliteAddress, ... }
 /// ```
-pub type SqliteAddress = Address<SqliteMsg, SqliteResult>;
+///
+/// Compile rail: the bridge request lane is callable, not sendable.
+///
+/// ```compile_fail
+/// use tina_sqlite_bridge::{SqliteAddress, SqliteMsg};
+///
+/// fn wants_send(_addr: tina::SendAddress<SqliteMsg>) {}
+/// fn wrong(addr: SqliteAddress) {
+///     wants_send(addr);
+/// }
+/// ```
+pub type SqliteAddress = CallAddress<SqliteMsg, SqliteResult>;
 
 /// Full reply shape: `CallOutcome<Result<SqliteResponse, SqliteError>>`.
 pub type SqliteCallOutcome = CallOutcome<SqliteResult>;
@@ -142,7 +153,7 @@ impl<'a> Row<'a> {
 
 /// Submit one SQLite request through a registered worker.
 ///
-/// Thin wrapper over `tina_runtime::call(addr, SqliteMsg::Request(req),
+/// Thin wrapper over `tina_runtime::call_typed(addr, SqliteMsg::Request(req),
 /// timeout)`. The reply preserves the response enum and both error
 /// layers.
 pub fn send_request(
@@ -150,7 +161,7 @@ pub fn send_request(
     request: SqliteRequest,
     timeout: Duration,
 ) -> IsolateCall<SqliteMsg, SqliteResult> {
-    call(addr, SqliteMsg::Request(request), timeout)
+    call_typed(addr, SqliteMsg::Request(request), timeout)
 }
 
 // ---------------------------------------------------------------------------

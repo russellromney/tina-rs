@@ -137,6 +137,10 @@ pub struct Http2ClientReport {
     /// Streams parked waiting on flow-control credit before being
     /// admitted to the wire. Counts events, not currently-parked count.
     pub flow_control_parks: u64,
+    /// Call-only messages received through fire-and-forget `try_send`.
+    /// This is a caller bug, but it must be visible in release builds:
+    /// request bodies must not disappear as an uncounted `noop()`.
+    pub wrong_lane_messages: u64,
 }
 
 /// Typed first-form HTTP/2 client outcomes.
@@ -292,8 +296,9 @@ pub enum Http2ResponseChunk {
 /// `Submit` and `Report` are **call-only**: they must be delivered with
 /// `call` / `call_blocking`, which provide the reply channel the
 /// connection answers on. Delivering them with `try_send` has no reply
-/// channel — `Submit` would silently drop the request body — so the
-/// connection `debug_assert!`s on the misuse and otherwise ignores it.
+/// channel. The connection increments
+/// [`Http2ClientReport::wrong_lane_messages`] so the bad send is visible
+/// instead of disappearing as an uncounted `noop()`.
 #[non_exhaustive]
 #[derive(Debug, Clone)]
 pub enum Http2ClientMsg {
@@ -658,25 +663,11 @@ impl<S: Shard + 'static> Isolate for Http2ClientConnection<S> {
             }
             Http2ClientMsg::RequestSourceCancelled => noop(),
             Http2ClientMsg::Stop => self.begin_goaway_shutdown(),
-            // `Report`, `Submit`, and `SubmitStreaming` are call-only: they
-            // carry no reply channel when delivered via `try_send`, so the
-            // caller would never learn the outcome (`Submit` would silently
-            // drop the request body). Catch the misuse in dev/test; a stray
-            // `try_send` must not kill the connection in production, so
-            // release builds drop it. See the doc comment on `Http2ClientMsg`.
             Http2ClientMsg::Report
             | Http2ClientMsg::Submit(_)
             | Http2ClientMsg::SubmitStreaming(_)
             | Http2ClientMsg::OpenStream(_)
-            | Http2ClientMsg::ResponseNext { .. } => {
-                debug_assert!(
-                    false,
-                    "Http2ClientMsg::Submit / ::SubmitStreaming / ::OpenStream / \
-                     ::ResponseNext / ::Report are call-only; use `call` / \
-                     `call_blocking`, not `try_send`",
-                );
-                noop()
-            }
+            | Http2ClientMsg::ResponseNext { .. } => self.wrong_lane_message(),
         }
     }
 
@@ -723,6 +714,11 @@ impl<S: Shard + 'static> Http2ClientConnection<S> {
                 tcp_connect(addr).then(Http2ClientMsg::Connected)
             }
         }
+    }
+
+    fn wrong_lane_message(&mut self) -> Effect<Self> {
+        self.report.wrong_lane_messages = self.report.wrong_lane_messages.saturating_add(1);
+        noop()
     }
 
     /// TLS connect completed. If the target asked for `h2` ALPN, require
@@ -2361,6 +2357,22 @@ mod tests {
         let req = Http2ClientRequest::post("/x", b"hi".to_vec());
         assert_eq!(req.method, Method::POST);
         assert_eq!(req.body, b"hi");
+    }
+
+    #[test]
+    fn wrong_lane_message_is_counted_in_release_path() {
+        let target = Http2Target::H2c {
+            authority: "x".into(),
+            addr: (Ipv4Addr::LOCALHOST, 80).into(),
+        };
+        let mut client =
+            Http2ClientConnection::<tina::SingleShard>::new(target, Http2ClientLimits::default());
+
+        let _ = client.wrong_lane_message();
+        assert_eq!(client.report.wrong_lane_messages, 1);
+
+        let _ = client.wrong_lane_message();
+        assert_eq!(client.report.wrong_lane_messages, 2);
     }
 
     #[test]

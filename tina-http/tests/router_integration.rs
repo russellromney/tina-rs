@@ -13,7 +13,10 @@ use std::time::Duration;
 use http::{Method, StatusCode};
 use tina::CallContext;
 use tina::prelude::*;
-use tina_http::{HttpLimits, HttpListener, HttpListenerMsg, HttpRequest, HttpResponse, Router};
+use tina_http::{
+    HttpLimits, HttpListener, HttpListenerAddress, HttpListenerMsg, HttpRequest, HttpResponse,
+    Router,
+};
 use tina_runtime::{
     DefaultThreadedMailboxFactory, RuntimeEvent, ThreadedRuntime, ThreadedRuntimeConfig,
 };
@@ -60,7 +63,7 @@ impl Isolate for Service {
 fn start_router_harness() -> (
     std::net::SocketAddr,
     ThreadedRuntime<TestShard, DefaultThreadedMailboxFactory>,
-    Address<HttpListenerMsg>,
+    HttpListenerAddress,
 ) {
     let runtime = ThreadedRuntime::with_config(
         TestShard,
@@ -105,7 +108,7 @@ fn start_router_harness() -> (
 
 fn shutdown(
     runtime: ThreadedRuntime<TestShard, DefaultThreadedMailboxFactory>,
-    listener: Address<HttpListenerMsg>,
+    listener: HttpListenerAddress,
 ) -> Vec<RuntimeEvent> {
     let _ = runtime.try_send(listener, HttpListenerMsg::Stop);
     runtime.shutdown().unwrap_or_default()

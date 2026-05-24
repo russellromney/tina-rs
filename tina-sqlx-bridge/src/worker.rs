@@ -91,7 +91,7 @@ struct InFlight {
 /// Result of [`PgWorker::install`] / [`PgWorker::install_with_pool`].
 pub struct InstalledPgBridge<S: Shard + 'static> {
     /// Tina address callers use with `call(...)`.
-    pub address: Address<PgMsg, PgResult>,
+    pub address: tina::CallAddress<PgMsg, PgResult>,
     /// Closer for graceful drain.
     pub closer: PgCloser,
     /// Metrics handle.
@@ -549,7 +549,7 @@ impl<S: Shard + Send + 'static> PgWorker<S> {
             .register_with_capacity::<_, Infallible>(worker, cap)
             .map_err(|e| InstallError::Register(format!("{e:?}")))?;
         Ok(InstalledPgBridge {
-            address,
+            address: address.callable(),
             closer,
             metrics,
             _shard: PhantomData,
@@ -605,7 +605,7 @@ impl<S: Shard + Send + 'static> PgWorker<S> {
             .register_with_capacity::<_, Infallible>(worker, cap)
             .map_err(|e| InstallError::Register(format!("{e:?}")))?;
         Ok(InstalledPgBridge {
-            address,
+            address: address.callable(),
             closer,
             metrics,
             _shard: PhantomData,
