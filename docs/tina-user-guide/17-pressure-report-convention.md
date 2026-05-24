@@ -43,6 +43,25 @@ the runner's stdout verbatim. A specimen that emits no `pressure`
 line is uninstrumented and the runner just prints its duration plus
 exit status.
 
+## Fairness/load companion lines
+
+Phase 121 keeps the pressure line small, but load-capable specimens may
+also print companion key=value lines:
+
+```text
+fairness side=tina fairness [isolate=1 turns=11 sleeps=5 isolate=2 turns=9 sleeps=4 ...] lag kind=progress_gap_turns subject=2 reference=1 observed=2 bound=none exceeded=false
+surface name=svc.mailbox kind=mailbox capacity=4 high_water=4 final_current=0 full=2 max_messages=4 current_messages=0 high_water_messages=4 max_weight=none current_weight=none high_water_weight=none shared_max_weight=none shared_current_weight=none shared_high_water_weight=none leak_clean=true
+surface name=svc.ws kind=protocol state=unavailable reason="not exercised by this profile"
+```
+
+`progress_gap_turns` is deliberately not wall-clock scheduler latency.
+It means one isolate took N more handler turns than another over the
+same trace window. Treat that as a lag observation, not an automatic
+failure: a hot isolate that admitted more work can honestly have more
+turns. If a surface cannot be measured, put it in the service
+`ServicePressureReport` as `Unavailable`; do not silently omit it from the
+user-facing report.
+
 ## Why a convention, not a framework
 
 A shared "metrics struct" would force every specimen to depend on the

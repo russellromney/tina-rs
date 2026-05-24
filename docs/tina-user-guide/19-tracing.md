@@ -125,6 +125,37 @@ Hot-path rules:
 `TraceRetention::Off` + observer = stream-only mode: in-memory trace
 stays empty, every event flows through the hook.
 
+## Fairness Reports
+
+`tina_runtime::FairnessReport::from_events(...)` is a trace reader. It
+counts handler turns and successful sleep completions per isolate, then
+can emit `LagObservation` rows such as `progress_gap_turns`. That name is
+intentional: it reports a Tina-visible progress gap, not wall-clock
+scheduler latency or a real-time guarantee.
+
+Use this for service/load specimens that need to prove a hot isolate did
+not silently starve a cold isolate or recurring timer:
+
+```rust
+let report = tina_runtime::FairnessReport::from_events(snapshot.events().iter());
+let lag = report.progress_gap(cold.isolate(), hot.isolate(), None);
+println!("{}", lag.summary_line());
+
+// Assert the workload-specific fact, not raw equality with the hot
+// isolate. A hot isolate may legitimately have more turns if it admitted
+// more work.
+assert!(report.turns(cold.isolate()) >= expected_cold_turns);
+```
+
+Use a bounded `progress_gap(..., Some(n))` only when the scenario really
+keeps both isolates continuously ready for comparable work. For skewed
+traffic, report the raw gap and assert the cold workload's own progress.
+
+Where the trace cannot observe the thing you want — timer lateness,
+ready-turn lag, or remote-drain yield counts — report the surface as
+unavailable or use a more specific specimen counter. Do not rename a
+progress count into latency.
+
 ### End-of-run dump
 
 For tests, tools, one-shot scripts that don't want a subscriber up

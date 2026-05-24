@@ -18,8 +18,9 @@
 //! ## Scope (what this is and is not)
 //!
 //! This ships the *progress-count* slice of fairness: handler turns and
-//! sleep completions, plus a typed [`StarvationWarning`]. It is **not** the
-//! full lag/latency surface. In particular:
+//! sleep completions, plus typed [`LagObservation`] and
+//! [`StarvationWarning`] values. It is **not** the full lag/latency surface.
+//! In particular:
 //!
 //! - `sleep_completions` counts every successful `Sleep` completion (a
 //!   recurring timer's fires re-arm one-shot sleeps, so this is its fire
@@ -29,6 +30,9 @@
 //!   time, and remote-drain yield counts are **not** implemented here — they
 //!   need instrumentation the trace does not yet carry (a per-turn
 //!   ready signal and event timestamps). They remain future work.
+//! - [`LagObservation`] therefore names `progress_gap_turns`, not
+//!   scheduler latency. It is a user-visible "one isolate made N more
+//!   handler turns than another" fact folded from existing trace events.
 //!
 //! What this does *not* claim: wall-clock or real-time guarantees.
 //! "Progress" here is turns taken and sleeps completed, which are
@@ -75,6 +79,49 @@ pub struct StarvationWarning {
     pub hot_turns: u64,
     /// The floor the victim was expected to clear but did not.
     pub expected_min_victim_turns: u64,
+}
+
+/// Tina-visible fairness lag folded from existing trace facts.
+///
+/// This intentionally does **not** claim wall-clock latency. The only lag
+/// kind currently reported is `progress_gap_turns`: the difference between
+/// one isolate's handler turns and another's over the same trace window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LagObservation {
+    /// Stable observation kind. Kept as a string so user-facing report
+    /// lines do not need an enum formatter.
+    pub kind: &'static str,
+    /// The isolate that fell behind.
+    pub subject: IsolateId,
+    /// The isolate used as the comparison point.
+    pub reference: IsolateId,
+    /// Observed lag amount, in the units named by [`Self::kind`].
+    pub observed: u64,
+    /// Caller-supplied bound, in the same units. `None` means the caller
+    /// asked only to report the observation, not to judge it.
+    pub bound: Option<u64>,
+}
+
+impl LagObservation {
+    /// True when the observation exceeds its bound.
+    pub fn exceeded_bound(&self) -> bool {
+        self.bound.is_some_and(|bound| self.observed > bound)
+    }
+
+    /// One-line key=value shape for specimen output.
+    pub fn summary_line(&self) -> String {
+        format!(
+            "lag kind={} subject={} reference={} observed={} bound={} exceeded={}",
+            self.kind,
+            self.subject.get(),
+            self.reference.get(),
+            self.observed,
+            self.bound
+                .map(|bound| bound.to_string())
+                .unwrap_or_else(|| "none".to_string()),
+            self.exceeded_bound(),
+        )
+    }
 }
 
 /// Per-isolate fairness counts folded from a trace slice.
@@ -195,6 +242,42 @@ impl FairnessReport {
         } else {
             None
         }
+    }
+
+    /// Reports the handler-turn progress gap between `reference` and
+    /// `subject`.
+    ///
+    /// A positive observation means `reference` took more handler turns
+    /// than `subject`. The caller decides whether that is bad by supplying
+    /// an optional `bound`; this method only reports a Tina-visible fact.
+    pub fn progress_gap(
+        &self,
+        subject: IsolateId,
+        reference: IsolateId,
+        bound: Option<u64>,
+    ) -> LagObservation {
+        let subject_turns = self.turns(subject);
+        let reference_turns = self.turns(reference);
+        LagObservation {
+            kind: "progress_gap_turns",
+            subject,
+            reference,
+            observed: reference_turns.saturating_sub(subject_turns),
+            bound,
+        }
+    }
+
+    /// Progress-gap observations for every isolate compared with `reference`.
+    pub fn progress_gaps_from(
+        &self,
+        reference: IsolateId,
+        bound: Option<u64>,
+    ) -> Vec<LagObservation> {
+        self.isolates
+            .iter()
+            .filter(|row| row.isolate != reference)
+            .map(|row| self.progress_gap(row.isolate, reference, bound))
+            .collect()
     }
 }
 
@@ -345,6 +428,51 @@ mod tests {
                 .starvation(IsolateId::new(2), IsolateId::new(1), 100)
                 .is_none()
         );
+    }
+
+    #[test]
+    fn progress_gap_reports_tina_visible_lag_without_latency_claims() {
+        let events = [turn(1, 1), turn(2, 1), turn(3, 1), turn(4, 2)];
+        let report = FairnessReport::from_events(events.iter());
+
+        let lag = report.progress_gap(IsolateId::new(2), IsolateId::new(1), Some(1));
+        assert_eq!(
+            lag,
+            LagObservation {
+                kind: "progress_gap_turns",
+                subject: IsolateId::new(2),
+                reference: IsolateId::new(1),
+                observed: 2,
+                bound: Some(1),
+            }
+        );
+        assert!(lag.exceeded_bound());
+        assert_eq!(
+            lag.summary_line(),
+            "lag kind=progress_gap_turns subject=2 reference=1 observed=2 bound=1 exceeded=true"
+        );
+    }
+
+    #[test]
+    fn progress_gap_can_name_a_victim_that_never_ran() {
+        let events = [turn(1, 1), turn(2, 1)];
+        let report = FairnessReport::from_events(events.iter());
+
+        let lag = report.progress_gap(IsolateId::new(99), IsolateId::new(1), Some(0));
+        assert_eq!(lag.observed, 2);
+        assert!(lag.exceeded_bound());
+        assert_eq!(report.turns(IsolateId::new(99)), 0);
+    }
+
+    #[test]
+    fn unbounded_progress_gap_reports_without_failing() {
+        let events = [turn(1, 1), turn(2, 1), turn(3, 2)];
+        let report = FairnessReport::from_events(events.iter());
+
+        let lag = report.progress_gap(IsolateId::new(2), IsolateId::new(1), None);
+        assert_eq!(lag.observed, 1);
+        assert!(!lag.exceeded_bound());
+        assert!(lag.summary_line().contains("bound=none"));
     }
 
     #[test]

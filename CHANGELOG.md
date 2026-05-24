@@ -4,6 +4,28 @@ This file records completed work.
 
 ## Unreleased
 
+### Fairness And Load Behavior
+
+- Added `LagObservation` to `tina_runtime::FairnessReport` for copyable
+  `progress_gap_turns` report lines. It stays honest about the unit: handler
+  turn progress folded from the trace, not wall-clock scheduler latency.
+- Extended `tina-proof-harness::load` with Phase-121 names
+  (`LoadProfile`, `LoadRunReport`), end-of-run `LoadObservation`,
+  `SurfacePlateau`, trace hash, late-result count, and surface leak
+  reporting. Surface lines now quote sloppy names, carry unavailable
+  surfaces explicitly, and preserve count/weight/shared-weight axes instead
+  of collapsing them into one lossy number. Existing `LoadRun`/`LoadReport`
+  call sites keep working.
+- Updated `specimen_hot_key_fairness` so Tina prints trace-derived fairness
+  progress, progress-gap lag observations, and a stable trace hash while
+  asserting cold shards process their admitted work instead of comparing raw
+  hot/cold turn counts as if differently sized workloads should have identical
+  progress.
+- Tightened the proof-harness `ReconnectStorm` scenario so `count` means the
+  total number of connection attempts. Closed-port storm tests now prove
+  aggregate connection errors deterministically instead of depending on kernel
+  listen-backlog timing.
+
 ### Native WebSocket Client Session
 
 - Added a native bounded WebSocket client session to `tina-http` with explicit
