@@ -39,6 +39,27 @@ This file records completed work.
   into its live-replay fact, and a `tests/budget.rs` suite proves the documented
   caps are exactly the manifest rows and every live surface has a row.
 
+### Race-Surface Honesty
+
+- Drew the explicit line between what replay proves and what it does not: the
+  simulator is single-threaded and proves logical interleavings (message,
+  timer, and completion order) with byte-for-byte replay; it does not, and
+  cannot, catch physical memory-ordering races on the live parallel runtime.
+  Updated the README, the DST user guide, the roadmap north star, and the Odin
+  review memo to stop implying replay reaches the physical substrate.
+- Enumerated and verified the custom shared-memory race surface in
+  `.intent/SYSTEM.md` and `.intent/race-surface-allowlist.txt`: the SPSC mailbox
+  and `SharedCapacityScope` are the only first-party lock-free structures.
+  Cross-shard transport is `std::sync::mpsc`; the remaining atomics are
+  single-writer handshake cells, metrics counters, or id generators.
+- Added a loom model for `SharedCapacityScope` reserve/admit/release/high-water
+  behavior, proving the cap holds and counters stay conserved under every short
+  interleaving.
+- Added a `make verify` guard that fails when a new synchronization primitive
+  (`UnsafeCell`, `unsafe impl Send|Sync`, or atomic) appears in core code
+  outside the reviewed allowlist, so a new primitive cannot land without review
+  and a model.
+
 ### Hard Shard Pinning
 
 - Made `configured_core` a real OS pin instead of advisory intent: on Linux a
