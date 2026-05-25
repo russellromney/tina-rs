@@ -191,6 +191,78 @@ fn https_listener_serves_get_through_real_rustls_client() {
     let _ = runtime.shutdown();
 }
 
+// Bounded-overlap multi-connection proof (mirrors the tcp_echo "many
+// sequential clients without rebinding"): one HttpsListener serves a sequence
+// of separate TLS connections, re-accepting each on the shared on-shard TLS
+// lane, with counter state advancing across connections and the listener
+// staying up the whole time.
+#[test]
+fn https_listener_serves_many_sequential_connections_on_one_listener() {
+    let GeneratedIdentity { identity, cert_der } = generate_identity();
+    let runtime = build_runtime();
+    let counter = runtime
+        .register_with_capacity::<Counter, Infallible>(Counter::default(), 16)
+        .expect("register counter");
+    let listener_isolate = HttpsListener::<TestShard>::new(
+        "127.0.0.1:0".parse().unwrap(),
+        counter,
+        HttpsServerConfig::dev(identity),
+    );
+    let listener = runtime
+        .register_with_capacity::<HttpsListener<TestShard>, _>(listener_isolate, 8)
+        .expect("register https listener");
+    let ready = match start_listener(&runtime, listener) {
+        CallOutcome::Replied(Ok(ready)) => ready,
+        other => panic!("startup did not reply ready: {other:?}"),
+    };
+
+    let trailing_value = |bytes: &[u8]| -> u32 {
+        let text = std::str::from_utf8(bytes).expect("utf8 response");
+        assert!(
+            text.starts_with("HTTP/1.1 200"),
+            "expected 200, got {text:?}"
+        );
+        text.rsplit("\r\n\r\n")
+            .next()
+            .and_then(|body| body.trim().parse().ok())
+            .expect("counter body")
+    };
+
+    // GET sees 0, three POSTs raise it to 3, final GET confirms 3 — each on a
+    // fresh connection the listener accepted in turn.
+    let get0 = run_https_request(
+        ready.local_addr,
+        cert_der.clone(),
+        b"GET /counter HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    );
+    assert_eq!(trailing_value(&get0), 0);
+    for _ in 0..3 {
+        let posted = run_https_request(
+            ready.local_addr,
+            cert_der.clone(),
+            b"POST /counter HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        );
+        assert!(
+            std::str::from_utf8(&posted)
+                .unwrap()
+                .starts_with("HTTP/1.1 200")
+        );
+    }
+    let get_final = run_https_request(
+        ready.local_addr,
+        cert_der,
+        b"GET /counter HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    );
+    assert_eq!(
+        trailing_value(&get_final),
+        3,
+        "counter survived across connections"
+    );
+
+    let _ = runtime.try_send(listener, HttpsListenerMsg::Stop);
+    let _ = runtime.shutdown();
+}
+
 #[test]
 fn observe_next_tls_bound_resolves_when_listener_binds() {
     // The runtime's TLS-bound observer is the trace-shaped sibling
