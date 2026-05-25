@@ -2365,6 +2365,231 @@ fn local_system_tls_rail_connects_writes_reads_and_closes() {
     }
 }
 
+// The #16 closure: a Tina TLS *server* and a Tina TLS *client* on the same
+// shard in one runtime. The old single-worker lane deadlocked both sides of one
+// handshake; the on-shard sans-I/O pump interleaves them. No std socket peer,
+// no second runtime — both ends are Tina.
+#[test]
+fn local_system_tls_client_and_server_share_one_runtime() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
+        .expect("generate local cert");
+    let cert_der = certified.cert.der().to_vec();
+    let key_der = certified.key_pair.serialize_der();
+
+    let server_seen = Arc::new(Mutex::new(Vec::new()));
+    let client_seen = Arc::new(Mutex::new(Vec::new()));
+    let app = LocalSystem::single_shard(AppShard(60), AppMailboxFactory)
+        .trace_retention(TraceRetention::Bounded(256))
+        .build();
+
+    let server = app
+        .register_root::<TlsServerService, Infallible>(
+            TlsServerService {
+                observed: Arc::clone(&server_seen),
+                cert_der: cert_der.clone(),
+                key_der,
+            },
+            8,
+        )
+        .expect("register tls server");
+    app.try_send(server, TlsServerMsg::Start)
+        .expect("start tls server");
+
+    // Discover the kernel-assigned port the server bound.
+    wait_until(|| {
+        server_seen
+            .lock()
+            .expect("server seen lock")
+            .iter()
+            .any(|entry| entry.starts_with("bound:"))
+    });
+    let addr: SocketAddr = server_seen
+        .lock()
+        .expect("server seen lock")
+        .iter()
+        .find_map(|entry| entry.strip_prefix("bound:").map(str::to_string))
+        .expect("bound addr")
+        .parse()
+        .expect("parse bound addr");
+
+    // The Tina client connects to the Tina server in the same runtime.
+    let client = app
+        .register_root::<TlsClientService, Infallible>(
+            TlsClientService {
+                observed: Arc::clone(&client_seen),
+                stream: None,
+            },
+            8,
+        )
+        .expect("register tls client");
+    app.try_send(client, TlsClientMsg::Start { addr, cert_der })
+        .expect("start tls client");
+
+    wait_until(|| {
+        client_seen.lock().expect("client seen lock").as_slice()
+            == ["connected", "wrote:4", "pong", "closed"]
+    });
+    wait_until(|| {
+        server_seen
+            .lock()
+            .expect("server seen lock")
+            .iter()
+            .any(|entry| entry == "closed")
+    });
+
+    let terminal = app.shutdown().drain().join().expect("clean shutdown");
+    // The pump serializes its own TCP ops, so an internal write-during-read
+    // (handshake flights, alerts) never collides with the rail's one-pending-op
+    // rule: no TLS call fails with ResourceBusy.
+    assert!(
+        !terminal.trace().iter().any(|event| matches!(
+            event.kind(),
+            RuntimeEventKind::CallFailed {
+                reason: CallError::ResourceBusy,
+                ..
+            }
+        )),
+        "no TLS op should fail with ResourceBusy on the same-runtime path"
+    );
+}
+
+// A TLS client that reads until the peer hangs up, recording whether the
+// connection ended with a clean `close_notify` (an empty read) or an abrupt
+// truncation (a typed error) — the two must stay distinct.
+#[derive(Debug, Clone)]
+enum TlsProbeMsg {
+    Start { addr: SocketAddr, cert_der: Vec<u8> },
+    Connected(Result<TlsStreamId, CallError>),
+    Read(Result<Vec<u8>, CallError>),
+}
+
+#[derive(Debug)]
+struct TlsProbeClient {
+    terminal: Arc<Mutex<Option<String>>>,
+    stream: Option<TlsStreamId>,
+}
+
+#[tina_runtime::isolate(message = TlsProbeMsg, shard = AppShard)]
+impl TlsProbeClient {
+    fn handle(
+        &mut self,
+        msg: TlsProbeMsg,
+        _ctx: &mut Context<'_, AppShard, Self::Reply>,
+    ) -> Effect<Self> {
+        match msg {
+            TlsProbeMsg::Start { addr, cert_der } => {
+                tls_connect(addr, "localhost", vec![cert_der], Duration::from_secs(5))
+                    .then(TlsProbeMsg::Connected)
+            }
+            TlsProbeMsg::Connected(Ok(stream)) => {
+                self.stream = Some(stream);
+                tls_read(stream, 64, Duration::from_secs(5)).then(TlsProbeMsg::Read)
+            }
+            TlsProbeMsg::Connected(Err(error)) => {
+                *self.terminal.lock().expect("probe lock") = Some(format!("connect-err:{error:?}"));
+                noop()
+            }
+            TlsProbeMsg::Read(Ok(bytes)) if bytes.is_empty() => {
+                // Empty read == clean close_notify.
+                *self.terminal.lock().expect("probe lock") = Some("clean-eof".to_string());
+                noop()
+            }
+            TlsProbeMsg::Read(Ok(_)) => {
+                // Got application data; read again to reach the close.
+                let stream = self.stream.expect("probe stream");
+                tls_read(stream, 64, Duration::from_secs(5)).then(TlsProbeMsg::Read)
+            }
+            TlsProbeMsg::Read(Err(error)) => {
+                *self.terminal.lock().expect("probe lock") = Some(format!("read-err:{error:?}"));
+                noop()
+            }
+        }
+    }
+}
+
+/// Spawn a one-shot rustls server that writes `hello`, then closes the way
+/// `clean` selects: a clean `close_notify` alert, or an abrupt TCP teardown
+/// (truncation) with no alert.
+fn spawn_probe_peer(
+    cert_der: Vec<u8>,
+    key_der: Vec<u8>,
+    clean: bool,
+) -> (SocketAddr, std::thread::JoinHandle<()>) {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let server_cert = rustls::pki_types::CertificateDer::from(cert_der);
+    let server_key =
+        rustls::pki_types::PrivateKeyDer::Pkcs8(rustls::pki_types::PrivatePkcs8KeyDer::from(key_der));
+    let config = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(vec![server_cert], server_key)
+        .expect("probe server config");
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind probe listener");
+    let addr = listener.local_addr().expect("probe local addr");
+    let handle = thread::spawn(move || {
+        let (tcp, _) = listener.accept().expect("probe accept");
+        let connection =
+            rustls::ServerConnection::new(Arc::new(config)).expect("probe server connection");
+        let mut stream = rustls::StreamOwned::new(connection, tcp);
+        stream.write_all(b"hello").expect("probe write");
+        stream.flush().expect("probe flush");
+        if clean {
+            // Clean close: send the close_notify alert before dropping.
+            stream.conn.send_close_notify();
+            let _ = stream.flush();
+        } else {
+            // Truncation: tear the TCP connection down with no close_notify.
+            let _ = stream.sock.shutdown(std::net::Shutdown::Both);
+        }
+        drop(stream);
+    });
+    (addr, handle)
+}
+
+fn run_probe(clean: bool) -> String {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
+        .expect("generate local cert");
+    let cert_der = certified.cert.der().to_vec();
+    let key_der = certified.key_pair.serialize_der();
+    let (addr, peer) = spawn_probe_peer(cert_der.clone(), key_der, clean);
+
+    let terminal = Arc::new(Mutex::new(None));
+    let app = LocalSystem::single_shard(AppShard(61), AppMailboxFactory)
+        .trace_retention(TraceRetention::Bounded(128))
+        .build();
+    let probe = app
+        .register_root::<TlsProbeClient, Infallible>(
+            TlsProbeClient {
+                terminal: Arc::clone(&terminal),
+                stream: None,
+            },
+            8,
+        )
+        .expect("register probe client");
+    app.try_send(probe, TlsProbeMsg::Start { addr, cert_der })
+        .expect("start probe");
+    wait_until(|| terminal.lock().expect("probe lock").is_some());
+    let outcome = terminal.lock().expect("probe lock").clone().expect("probe terminal");
+    app.shutdown().drain().join().expect("probe shutdown");
+    peer.join().expect("probe peer thread");
+    outcome
+}
+
+#[test]
+fn local_system_tls_clean_close_notify_reads_empty() {
+    assert_eq!(run_probe(true), "clean-eof");
+}
+
+#[test]
+fn local_system_tls_truncation_is_a_typed_error_not_a_clean_eof() {
+    let outcome = run_probe(false);
+    assert!(
+        outcome.starts_with("read-err:"),
+        "truncation must surface as a typed read error, got {outcome:?}"
+    );
+}
+
 #[test]
 fn local_system_tls_server_accepts_reads_writes_and_closes() {
     let _ = rustls::crypto::ring::default_provider().install_default();

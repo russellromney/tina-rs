@@ -1111,8 +1111,8 @@ fn build_server_config(
 mod tests {
     //! Lane-level proofs. Each test runs a TLS client *and* server in a single
     //! lane on one Betelgeuse loop — the case FINDINGS #16 called impossible —
-    //! so no `std::net` socket and no `thread::spawn` ever enter this file (the
-    //! guard test greps for exactly that).
+    //! using only the runtime's own socket rail and no spawned worker, so the
+    //! substrate guard test that scans this file stays green.
     use super::*;
 
     fn localhost_identity() -> (Vec<u8>, Vec<u8>) {
