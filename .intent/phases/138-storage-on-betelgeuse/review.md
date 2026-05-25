@@ -221,3 +221,37 @@ entirely over the live reactor — the user-facing proof.
 - Path lock keys on the path as given (no canonicalization) — aliased paths to
   one file are the caller's responsibility, same as the app picking one journal
   path. The realistic per-service-fixed-path usage is safe.
+
+## Implementation Review 3 — third hostile pass (2026-05-25)
+
+Re-attacked from memory-safety and failure-visibility angles. No new correctness
+bugs; verified one subtle safety property and closed three coverage gaps.
+
+### Verified, not changed — no use-after-free dropping a cancelled job's box
+
+A cancelled job's completion `Box` is freed only when the backend no longer owns
+it: retention is keyed on `backend_owns` (slot armed **and** no result yet), so a
+box the backend still points into is never dropped mid-operation. The Betelgeuse
+contract `has_result ⟹ backend done with the pointer` is the same one the TCP
+lane relies on. The shared loop's `pending_completion_count` guard runs in
+`tcp.cancel_pending` *after* storage and counts storage's still-owned slots too,
+so a genuinely-stuck storage completion still surfaces `BackendStillOwnsCompletions`
+and its box stays alive in `jobs` until final drop (after which `step()` is never
+called again — freeing raw-pointer list entries without deref is safe).
+
+### Coverage closed
+
+- `reactor_snapshot_commit_then_load_round_trips` — the full *successful* snapshot
+  path on the rail (encode → temp write+fsync → rename → parent fsync → open →
+  size → pread → decode) round-trips bytes + `last_journal_index`. The earlier
+  snapshot tests only covered failure/corruption.
+- `reactor_append_to_non_directory_parent_is_io` — a create-dir fallback-leg
+  failure surfaces a typed `Io`, not a panic or hang (matches inline).
+- `reactor_write_failure_is_io_and_installs_nothing` — an injected pwrite failure
+  on the snapshot temp yields `Io` and installs no snapshot (rename never runs).
+
+### Second review (post-additions) — clean
+
+The three additions exercise only existing reactor code paths; fmt and
+`clippy --all-targets -- -D warnings` stay clean, and the lib/local_system/
+blast-radius suites stay green. No behavior change, only proof breadth.

@@ -2717,6 +2717,99 @@ mod reactor_proofs {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    #[test]
+    fn reactor_snapshot_commit_then_load_round_trips() {
+        // The full successful snapshot path on the rail: encode → temp write +
+        // fsync → rename → parent fsync, then open → size → pread → decode.
+        let dir = unique_dir("snapshot-round-trip");
+        let snapshot = dir.join("state.snapshot");
+        let io_loop = io_loop(Global).expect("init io loop");
+        let mut lane = StorageLane::reactor(io_loop, 4);
+
+        let committed = drive_submit(
+            &mut lane,
+            CallId::new(1),
+            StorageJob::SnapshotCommit {
+                path: snapshot.clone(),
+                bytes: b"durable-state".to_vec(),
+                last_journal_index: 12,
+            },
+        );
+        assert!(matches!(committed, CallOutput::SnapshotCommitted));
+
+        let loaded = drive_submit(
+            &mut lane,
+            CallId::new(2),
+            StorageJob::SnapshotLoad {
+                path: snapshot.clone(),
+            },
+        );
+        let CallOutput::SnapshotLoaded {
+            snapshot: Some(image),
+        } = loaded
+        else {
+            panic!("expected a loaded snapshot, got {loaded:?}");
+        };
+        assert_eq!(image.bytes, b"durable-state");
+        assert_eq!(image.last_journal_index, 12);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn reactor_append_to_non_directory_parent_is_io() {
+        // A journal whose parent is a regular file cannot have its directory
+        // created; the create-dir fallback leg fails and the append surfaces a
+        // typed Io error (not a panic or hang), matching the inline path.
+        let dir = unique_dir("bad-parent");
+        let blocking = dir.join("not-a-dir");
+        std::fs::write(&blocking, b"stone").expect("write blocking file");
+        let journal = blocking.join("state.journal");
+        let io_loop = io_loop(Global).expect("init io loop");
+        let mut lane = StorageLane::reactor(io_loop, 4);
+
+        let result = drive_submit(
+            &mut lane,
+            CallId::new(1),
+            StorageJob::JournalAppend {
+                path: journal,
+                record_index: 1,
+                bytes: b"first".to_vec(),
+            },
+        );
+        assert!(matches!(result, CallOutput::Failed(CallError::Io)));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn reactor_write_failure_is_io_and_installs_nothing() {
+        // A failing pwrite (e.g. full disk) on the snapshot temp surfaces Io,
+        // and the rename never runs, so no snapshot is installed.
+        let dir = unique_dir("write-fail");
+        let snapshot = dir.join("state.snapshot");
+        let (mut lane, _state) = fault_lane(
+            FaultConfig {
+                fail_pwrite: true,
+                ..FaultConfig::default()
+            },
+            4,
+        );
+        let result = drive_submit(
+            &mut lane,
+            CallId::new(1),
+            StorageJob::SnapshotCommit {
+                path: snapshot.clone(),
+                bytes: b"never-installed".to_vec(),
+                last_journal_index: 1,
+            },
+        );
+        assert!(matches!(result, CallOutput::Failed(CallError::Io)));
+        assert!(
+            !snapshot.exists(),
+            "a failed temp write must not install a snapshot"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     // ---- fault backend --------------------------------------------------
 
     #[derive(Default, Clone)]
@@ -2727,6 +2820,9 @@ mod reactor_proofs {
         /// Complete each pread/pwrite one byte at a time, forcing the lane's
         /// partial-transfer loops to re-issue until the whole buffer moves.
         partial_io: bool,
+        /// Fail every pwrite (e.g. a full disk), so a write-family job reports
+        /// a typed Io error instead of installing partial data.
+        fail_pwrite: bool,
     }
 
     fn fault_lane(config: FaultConfig, capacity: usize) -> (StorageLane, Rc<RefCell<FaultState>>) {
@@ -2950,7 +3046,9 @@ mod reactor_proofs {
                 } else {
                     &buf[..]
                 };
-                let result = {
+                let result = if st.config.fail_pwrite {
+                    Err(io::Error::other("injected pwrite failure"))
+                } else {
                     let file = st.files.get(&op.fd).expect("fd open");
                     file.write_at(chunk, *offset)
                 };
