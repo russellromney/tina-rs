@@ -10,6 +10,12 @@ repository = "https://github.com/russellromney/tina-rs"
 [lib]
 path = "src/lib.rs"
 
+[features]
+# Swaps `shared_scope`'s cap counters to loom atomics so
+# `tests/loom_shared_scope.rs` can model the lock-free reserve/release CAS
+# loops. Off by default; only the loom test build enables it.
+loom = ["dep:loom"]
+
 [dependencies]
 tina = { path = "../tina" }
 tina-macros = { path = "../tina-macros" }
@@ -19,6 +25,8 @@ tina-supervisor = { path = "../tina-supervisor" }
 # TCP call family can report socket addresses honestly.
 betelgeuse = { path = "../vendor-betelgeuse" }
 rustls = { version = "0.23", default-features = false, features = ["std", "ring"] }
+# Only compiled under `--features loom` for the shared-capacity-scope model.
+loom = { version = "0.7.2", optional = true }
 
 [target.'cfg(unix)'.dependencies]
 # Phase Sadie's-Ward (043) live signal capture. Used only for installing

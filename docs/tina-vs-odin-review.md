@@ -144,6 +144,12 @@ Watch this, don't panic.
   and **protocol facts** (HTTP/2/WebSocket/gRPC wire outcomes replayable)
   (`ROADMAP.md`, `examples/FINDINGS.md`). Odin states "same seed = same
   execution"; tina-rs makes the failing run a portable, shrinkable artifact.
+  The honest line, now stated in the docs and `.intent/SYSTEM.md`: this replay
+  is of **logical** interleavings. The simulator is single-threaded on purpose
+  and does not catch physical memory-ordering races — those live on a small,
+  enumerated shared-memory surface (the SPSC mailbox and `SharedCapacityScope`)
+  that loom checks instead. Replay is not "all the way down" to the physical
+  substrate, and the positioning no longer implies it is.
 - **Compile-time rails.** Typed `Address<M,R>`, `Send`-bound enforcement, the
   four `compile_fail` leak proofs (`01-mental-model.md`), and the event/request
   split that makes "request variant matched in event handler" a compile error

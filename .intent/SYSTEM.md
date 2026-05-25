@@ -293,6 +293,97 @@ story. Tokio owns the edge; Tina owns isolate state. The runtime call types do
 not pick a backend, so the simulator, the current runtime, the Betelgeuse
 substrate, and later runtimes can share one meaning model.
 
+## What replay proves: logical interleavings, not physical memory ordering
+
+The deterministic simulator and the explicit-step runtime are single-threaded
+on purpose. That single-threadedness is *why* replay works. They are faithful
+for **logical interleavings** — message delivery order, timer wake order,
+mailbox-full timing, restart races, cross-shard delivery delay, TCP completion
+order — and they replay those interleavings byte-for-byte from a
+`(seed, config, history)` triple.
+
+They do **not** reproduce the **physical memory ordering** of the live parallel
+substrate. "Events across shards interleave freely" on the threaded multi-shard
+runtime; that is physics, not a defect. The live path stays fully
+introspectable — each shard's trace merges by global event id, and topology,
+live-shard metrics, and terminal shutdown reports are emitted — but it is not
+byte-reproducible, and the simulator does not, and cannot, catch a physical
+data race.
+
+This faithfulness claim is **conditioned on the shared-nothing rule**: sim is
+faithful for logical interleavings *because* isolate code is shared-nothing and
+each shard runs sequentially. It holds only as long as no helper type smuggles
+cross-thread shared state past that rule. The shared-memory race surface below
+is the enumerated, guarded list of where the rule is deliberately bent, and how
+each spot is proven.
+
+The division of labor is fixed:
+
+- the simulator and explicit-step runtime own logical interleavings plus
+  deterministic replay — everything in handler and shard-sequential space.
+- loom/shuttle own physical memory ordering, on the enumerated shared-memory
+  surface only.
+- the live parallel runtime is real and introspectable, but **not**
+  byte-reproducible.
+
+Do not describe replay as catching data races, and do not describe the live
+parallel path as replayable. Both are over-claims this contract exists to stop.
+
+## Shared-memory race surface
+
+Tina is shared-nothing by rule, so the custom cross-thread shared-memory surface
+is tiny. It is enumerated in `.intent/race-surface-allowlist.txt` and guarded by
+`scripts/race_surface_guard.sh` (wired into `make verify`): a new `UnsafeCell`,
+`unsafe impl Send|Sync`, or atomic in core code outside that list fails the
+check, so a new synchronization primitive cannot land without review and a
+model. The guard is surrogate proof — it catches additions to the surface; the
+per-structure loom models prove the existing structures.
+
+Two custom lock-free structures, both loom-modeled:
+
+- the **SPSC mailbox** (`tina-mailbox-spsc`) — one-producer/one-consumer ring,
+  `UnsafeCell` + atomics; loom in `tina-mailbox-spsc/tests/loom_spsc.rs`.
+- **`SharedCapacityScope`** (`tina-runtime/src/shared_scope.rs`) — a public,
+  cloneable, `Arc`-backed weighted cap with reserve/release CAS loops. It is
+  shard-local by intent but cross-thread-capable by type shape, so it is treated
+  as a real shared-memory surface and modeled, not assumed safe; loom in
+  `tina-runtime/tests/loom_shared_scope.rs`.
+
+Everything else is **not** a custom lock-free structure:
+
+- the **cross-shard transport is `std::sync::mpsc`** (standard library).
+  Trusted, not ours to loom; loom cannot meaningfully explore it.
+- **single-writer handshake cells** — the bounded blocking driver lanes
+  (DNS/TLS/process/storage) and the signal-hook handler share `Arc<AtomicBool>`
+  cancel/signal flags with their real OS worker threads
+  (`tina-runtime/src/driver/*`); `DeferredSlotShared` / `CallHandleShared`
+  (`tina/src/context.rs`) and the typed observation done-flags
+  (`tina-runtime/src/observation.rs`) cross threads through `Arc` the same way.
+  All are single-writer `store`/`load` (or single-consumer `swap`) flags with
+  documented ordering — genuine cross-thread state, but not lock-free
+  algorithms, so they need recording, not a loom model.
+- **metrics counters** (`event_sink`, `observer`, `live_report`, `host_burst`)
+  are Relaxed atomics that only count; they never guard shared data.
+- **monotonic id / temp-name counters** and one diagnostic tally are `AtomicU64`
+  generators. Some are genuinely cross-thread: the threaded multi-shard runtime
+  hands every shard thread a clone of one `IdSource` (`lib.rs`), so global
+  event/call ids come from a shared `Arc<AtomicU64>` incremented across shard
+  threads, and the per-structure `static AtomicU64` id sources are
+  process-global. They are `fetch_add` unique-id generators (Relaxed is enough
+  for uniqueness), not lock-free data structures, so they are out of loom scope
+  but stay on the allowlist as cross-thread atomics.
+- **vendored Betelgeuse** is trusted-vendored, loomed upstream where feasible.
+
+The honest finding stands: the SPSC mailbox and `SharedCapacityScope` are the
+only first-party custom lock-free structures. Everything else is stdlib,
+single-writer handshakes, cross-thread-but-count-only metrics, unique-id
+generators, or vendored. There is no runtime task-list or effect-batching
+shared atomic. Global event ids *are* drawn from a shared cross-thread atomic in
+the threaded runtime (a monotonic counter, not a lock-free structure); the trace
+is then merged by sort over those ids. The explicit-step oracle shares the same
+`IdSource` but touches it single-threaded, which is why its runs stay
+byte-reproducible.
+
 ## Crate boundaries that must not drift
 
 - `tina` owns the shared words of the system and small shared policy types.
