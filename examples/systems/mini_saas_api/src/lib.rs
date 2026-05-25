@@ -9,8 +9,10 @@ use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::time::Duration;
 
+use tina_runtime::budget::BudgetManifestReport;
 use tina_runtime::lifecycle::{Health, Lifecycle, ServiceShutdownReport, ServiceTopology};
 
+pub mod budget;
 pub mod tina_impl;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -62,6 +64,15 @@ pub struct RunReport {
     pub multi_turn_notify: bool,
     pub capacity_before_shutdown_line: String,
     pub capacity_during_shutdown_line: String,
+    /// Budget manifest joined with the live pressure report at
+    /// shutdown: configured cap + observed use/full per surface.
+    pub budget_report: Option<BudgetManifestReport>,
+    /// One-line summary of [`Self::budget_report`].
+    pub budget_report_line: String,
+    /// One-line replay export: schema + hash over replay-affecting caps.
+    pub budget_replay_line: String,
+    /// `true` if every declared surface matched the live report.
+    pub budget_consistent: bool,
     pub terminal_line: String,
     pub startup_summary_line: String,
     pub startup_discovery_lines: Vec<String>,

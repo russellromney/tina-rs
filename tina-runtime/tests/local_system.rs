@@ -2298,12 +2298,23 @@ fn local_system_capabilities_name_supported_and_unsupported_resource_families() 
         capabilities.local_file.execution(),
         ResourceExecutionShape::CompletionBacked
     );
+    // Live durability rides the Betelgeuse completion rail; the ops
+    // Betelgeuse lacks fall to the named off-shard fallback worker.
     assert_eq!(
         capabilities.storage_lane.execution(),
+        ResourceExecutionShape::CompletionBacked
+    );
+    assert_eq!(
+        capabilities.local_persistence.execution(),
+        ResourceExecutionShape::CompletionBacked
+    );
+    assert_eq!(
+        capabilities.storage_metadata_fallback.execution(),
         ResourceExecutionShape::LaneBackedBlocking
     );
     assert_eq!(capabilities.storage_lane.capacity(), Some(7));
     assert_eq!(capabilities.local_persistence.capacity(), Some(7));
+    assert_eq!(capabilities.storage_metadata_fallback.capacity(), Some(7));
 
     assert_eq!(capabilities.dns.support(), ResourceSupport::Supported);
     assert_eq!(
@@ -4785,6 +4796,72 @@ fn local_system_end_to_end_service_routes_cross_shard_persists_and_recovers() {
             .trace()
             .iter()
             .any(|event| { matches!(event.kind(), RuntimeEventKind::RecoveryFinished) })
+    );
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn local_system_recovers_torn_journal_then_repairs_on_next_append() {
+    // User perspective over the live Betelgeuse rail: a journal with a torn
+    // tail recovers its complete prefix, and the next append repairs the tail
+    // and lands — byte-for-byte the inline path, now on the reactor.
+    let dir = unique_dir("local-app-torn-recover");
+    fs::create_dir_all(&dir).expect("create torn recover dir");
+    let snapshot_path = dir.join("state.snapshot");
+    let journal_path = dir.join("state.journal");
+    let good = tina_runtime::persistence::encode_journal_record(&tina_runtime::JournalRecord {
+        index: 1,
+        bytes: b"hay".to_vec(),
+    });
+    fs::write(&journal_path, [good, vec![9, 9, 9]].concat()).expect("write torn journal");
+
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let app = LocalSystem::single_shard(AppShard(77), AppMailboxFactory)
+        .ingress_capacity(8)
+        .storage_lane_capacity(4)
+        .trace_retention(TraceRetention::Bounded(512))
+        .build();
+    let worker = app
+        .register_root::<DurableWorker, Infallible>(
+            DurableWorker::new(snapshot_path, journal_path.clone(), Arc::clone(&observed)),
+            8,
+        )
+        .expect("register torn-recover worker");
+
+    app.try_send(worker, DurableWorkerMsg::Recover)
+        .expect("recover handoff");
+    wait_until(|| {
+        observed
+            .lock()
+            .expect("observed lock")
+            .iter()
+            .any(|state| state == "hay")
+    });
+    app.try_send(worker, DurableWorkerMsg::Feed("oats".to_owned()))
+        .expect("feed handoff");
+    wait_until(|| {
+        observed
+            .lock()
+            .expect("observed lock")
+            .iter()
+            .any(|state| state == "hay,oats")
+    });
+
+    app.shutdown().drain().join().expect("shutdown torn app");
+
+    let repaired =
+        tina_runtime::persistence::replay_journal(&journal_path).expect("replay repaired journal");
+    assert_eq!(
+        repaired.warning, None,
+        "the torn tail must be repaired by the next append"
+    );
+    assert_eq!(
+        repaired
+            .records
+            .iter()
+            .map(|record| String::from_utf8(record.bytes.clone()).expect("utf8"))
+            .collect::<Vec<_>>(),
+        vec!["hay", "oats"]
     );
     let _ = fs::remove_dir_all(dir);
 }

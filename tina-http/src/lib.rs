@@ -153,6 +153,7 @@
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
 pub mod body_metrics;
+pub mod budget;
 pub mod chunked_decoder;
 pub mod client;
 pub mod connection;

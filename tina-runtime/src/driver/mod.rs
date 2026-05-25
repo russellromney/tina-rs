@@ -276,8 +276,8 @@ impl BetelgeuseDriver {
     ) -> Self {
         Self {
             tls: TlsLane::new(tls_lane_capacity, io_loop.clone()),
-            tcp: BetelgeuseTcp::with_io_loop(io_loop),
-            storage: StorageLane::new(storage_lane_capacity),
+            tcp: BetelgeuseTcp::with_io_loop(io_loop.clone()),
+            storage: StorageLane::reactor(io_loop, storage_lane_capacity),
             dns: DnsLane::new(dns_lane_capacity),
             process: ProcessLane::new(process_lane_capacity),
             unix: UnixLane::new(),
@@ -675,7 +675,8 @@ mod tests {
 
     #[test]
     fn storage_lane_rejects_full_without_sleep_as_proof() {
-        let mut lane = StorageLane::new(1);
+        let io_loop = io_loop(Global).expect("init io loop");
+        let mut lane = StorageLane::reactor(io_loop, 1);
         let (started_tx, started_rx) = sync_channel(1);
         let (release_tx, release_rx) = sync_channel(1);
 
@@ -689,7 +690,11 @@ mod tests {
             )
             .is_none()
         );
+        // The parked job occupies the one capacity slot for its whole life.
+        let mut completed = Vec::new();
+        lane.advance(&mut completed);
         started_rx.recv().expect("parked storage job started");
+        assert!(completed.is_empty());
 
         let full = lane
             .submit(
@@ -711,7 +716,8 @@ mod tests {
 
     #[test]
     fn storage_lane_cancellation_swallows_late_completion() {
-        let mut lane = StorageLane::new(1);
+        let io_loop = io_loop(Global).expect("init io loop");
+        let mut lane = StorageLane::reactor(io_loop, 1);
         let (started_tx, started_rx) = sync_channel(1);
         let (release_tx, release_rx) = sync_channel(1);
 
@@ -725,12 +731,13 @@ mod tests {
             )
             .is_none()
         );
+        let mut completed = Vec::new();
+        lane.advance(&mut completed);
         started_rx.recv().expect("parked storage job started");
         assert!(lane.cancel(CallId::new(7)));
         assert!(!lane.has_pending());
 
         release_tx.send(()).expect("release parked storage job");
-        let mut completed = Vec::new();
         for _ in 0..64 {
             lane.advance(&mut completed);
             if !completed.is_empty() {
@@ -884,7 +891,11 @@ mod tests {
 
     #[test]
     fn storage_lane_shutdown_skips_buffered_work_that_never_started() {
-        let mut lane = StorageLane::new(2);
+        // Reactor storage progresses only on `advance` (no worker thread for
+        // the durability path). A job cancelled before its first poll never
+        // starts: the proof that canceled queued work does not start.
+        let io_loop = io_loop(Global).expect("init io loop");
+        let mut lane = StorageLane::reactor(io_loop, 2);
         let (first_started_tx, first_started_rx) = sync_channel(1);
         let (first_release_tx, first_release_rx) = sync_channel(1);
         let (queued_started_tx, queued_started_rx) = sync_channel(1);
@@ -900,9 +911,6 @@ mod tests {
             )
             .is_none()
         );
-        first_started_rx
-            .recv()
-            .expect("first parked storage job started");
         assert!(
             lane.submit(
                 CallId::new(12),
@@ -914,14 +922,21 @@ mod tests {
             .is_none()
         );
 
+        // Cancel #12 before any advance, so it is never polled.
         lane.cancel(CallId::new(12));
+        let mut completed = Vec::new();
+        lane.advance(&mut completed);
+        first_started_rx
+            .recv()
+            .expect("first parked storage job started");
+
         first_release_tx
             .send(())
             .expect("release first parked storage job");
         lane.cancel_pending(Instant::now());
         assert!(
             queued_started_rx.try_recv().is_err(),
-            "queued storage work must not start after shutdown cancellation"
+            "queued storage work cancelled before its first poll must not start"
         );
     }
 
@@ -1128,7 +1143,8 @@ mod tests {
 
     #[test]
     fn storage_park_counts_as_pending_only() {
-        let mut lane = StorageLane::new(1);
+        let io_loop = io_loop(Global).expect("init io loop");
+        let mut lane = StorageLane::reactor(io_loop, 1);
         let (started_tx, started_rx) = sync_channel(1);
         let (release_tx, release_rx) = sync_channel(1);
         assert!(
@@ -1141,10 +1157,12 @@ mod tests {
             )
             .is_none()
         );
+        let mut completed = Vec::new();
+        lane.advance(&mut completed);
         started_rx.recv().expect("park job started");
         // Storage contributes to pending_calls but not worker_held: the
-        // worker thread does the OS work but the runtime does not see a
-        // separate handle.
+        // durability path rides the shard reactor, so the runtime does not
+        // see a separate handle.
         assert_eq!(lane.physical_pending_count(), 1);
 
         release_tx.send(()).expect("release park job");
@@ -1331,46 +1349,12 @@ mod tests {
     // -------------------------------------------------------------------
     // Bounded shutdown drain.
     //
-    // Each lane's `cancel_pending(deadline)` must return inside the
-    // budget even when the worker is stuck, surfacing remaining work via
-    // the pending count rather than blocking shutdown forever.
+    // Each lane's `cancel_pending(deadline)` must return inside the budget
+    // even when work is stuck, surfacing remaining work via the pending
+    // count rather than blocking forever. The storage reactor's bounded-
+    // shutdown proof lives in `driver::storage` tests, where a fault
+    // backend can hold a Betelgeuse completion past the budget.
     // -------------------------------------------------------------------
-
-    #[test]
-    fn storage_lane_shutdown_returns_within_budget_when_worker_stuck() {
-        let mut lane = StorageLane::new(1);
-        let (started_tx, started_rx) = sync_channel(1);
-        // Park job that will not be released — simulates a stuck worker.
-        let (_release_tx, release_rx) = sync_channel(1);
-        assert!(
-            lane.submit(
-                CallId::new(1),
-                StorageJob::Park {
-                    started: started_tx,
-                    release: release_rx,
-                },
-            )
-            .is_none()
-        );
-        started_rx.recv().expect("park job started");
-
-        let budget = Duration::from_millis(50);
-        let started = Instant::now();
-        lane.cancel_pending(Instant::now() + budget);
-        let elapsed = started.elapsed();
-
-        // Bounded: must not exceed budget by an order of magnitude even
-        // under load on a busy CI machine.
-        assert!(
-            elapsed < budget * 10,
-            "shutdown took {elapsed:?}, expected to return near {budget:?}"
-        );
-        // Stuck work stays visible in the physical count.
-        assert!(
-            lane.physical_pending_count() >= 1,
-            "stuck park job must remain visible after bounded shutdown"
-        );
-    }
 
     #[test]
     fn betelgeuse_tcp_shutdown_returns_within_budget() {
