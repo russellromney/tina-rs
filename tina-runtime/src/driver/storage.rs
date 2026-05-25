@@ -2188,12 +2188,13 @@ mod reactor_proofs {
 
     fn drive(lane: &mut StorageLane, call_id: CallId) -> CallOutput {
         let mut completed = Vec::new();
-        for _ in 0..2000 {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
             lane.advance(&mut completed);
             if let Some(index) = completed.iter().position(|c| c.call_id == call_id) {
                 return completed.remove(index).result;
             }
-            thread::yield_now();
+            thread::sleep(Duration::from_millis(1));
         }
         panic!("storage completion {call_id:?} did not arrive");
     }
