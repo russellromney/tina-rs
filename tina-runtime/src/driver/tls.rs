@@ -1148,6 +1148,18 @@ mod tests {
         )
     }
 
+    /// A self-signed `localhost` cert whose validity window is entirely in the
+    /// past, so a conformant client must reject it during the handshake.
+    fn expired_localhost_identity() -> (Vec<u8>, Vec<u8>) {
+        let mut params =
+            rcgen::CertificateParams::new(vec!["localhost".to_string()]).expect("cert params");
+        params.not_before = rcgen::date_time_ymd(2000, 1, 1);
+        params.not_after = rcgen::date_time_ymd(2001, 1, 1);
+        let key = rcgen::KeyPair::generate().expect("key pair");
+        let cert = params.self_signed(&key).expect("self-sign expired cert");
+        (cert.der().to_vec(), key.serialize_der())
+    }
+
     fn fresh_lane(capacity: usize) -> TlsLane {
         let io_loop = io_loop(Global).expect("init io loop for tls lane test");
         TlsLane::new(capacity, io_loop)
@@ -1604,5 +1616,53 @@ mod tests {
         let mut more = Vec::new();
         lane.advance(Instant::now(), &mut more);
         assert!(more.is_empty(), "no second completion for a timed-out op");
+    }
+
+    #[test]
+    fn lane_connect_rejects_expired_server_cert() {
+        // The cert chain validates structurally but its validity window is in
+        // the past; the client must reject it during the handshake rather than
+        // proceed. Pins that cert validation (here, expiry) is not weakened.
+        let mut lane = fresh_lane(64);
+        let mut completed = Vec::new();
+        let (cert, key) = expired_localhost_identity();
+        let bound = lane
+            .submit_bind(
+                CallId::new(1),
+                loopback(),
+                vec![cert.clone()],
+                key,
+                Vec::new(),
+                Instant::now(),
+            )
+            .expect("bind inline");
+        let (listener, addr) = match bound.result {
+            CallOutput::TlsBound {
+                listener,
+                local_addr,
+            } => (listener, local_addr),
+            other => panic!("{other:?}"),
+        };
+        assert!(
+            lane.submit_accept(CallId::new(2), listener, long(), Instant::now())
+                .is_none()
+        );
+        assert!(
+            lane.submit_connect(
+                CallId::new(3),
+                addr,
+                "localhost".to_string(),
+                vec![cert],
+                Vec::new(),
+                long(),
+                Instant::now(),
+            )
+            .is_none()
+        );
+        // The client rejects the expired cert; surfaced as a handshake failure.
+        assert!(matches!(
+            drive(&mut lane, &mut completed, CallId::new(3)),
+            CallOutput::Failed(CallError::TlsHandshake)
+        ));
     }
 }
