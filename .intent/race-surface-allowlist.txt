@@ -1,0 +1,83 @@
+# Race-surface allowlist — verified shared-memory concurrency surface
+#
+# This file is the machine-checked inventory of every core-crate library file
+# that uses a shared-memory synchronization primitive (UnsafeCell,
+# `unsafe impl Send|Sync`, or `std`/`loom` atomics). `scripts/race_surface_guard.sh`
+# fails CI when the set of such files drifts from this list — a *new* primitive
+# in an unlisted file, or a listed file that no longer has one. Either way a
+# human must look, classify, and (for genuine cross-thread structures) add a
+# loom/shuttle model before it lands.
+#
+# This is surrogate proof. It catches *additions* to the surface. It does not
+# prove the existing set race-free — the per-structure loom models do that.
+#
+# Scope: the shared-nothing semantic core only —
+#   tina, tina-runtime, tina-sim, tina-mailbox-spsc, tina-supervisor (their src/).
+# The choice is not arbitrary — every first-party crate is accounted for:
+#   - tina-codec / tina-rpc / tina-rpc-macros / tina-macros / tina-tracing carry
+#     no shared-memory primitive at all (verified by the same grep).
+#   - Bridges (tokio/tower/reqwest/sqlite/sqlx/aws/rpc-tokio) are the explicitly
+#     different trusted-edge boundary where Tina meets SDK queues/threads
+#     (`.intent/SYSTEM.md` bridge posture).
+#   - tina-proof-harness uses atomics but is test/proof tooling, not the shipped
+#     semantic core (like examples and tests). Add it to CORE_SRC in the guard if
+#     that ever changes.
+# Vendored Betelgeuse is trusted-vendored, loomed upstream where feasible.
+#
+# The guard ignores comment-only matches (a primitive named in a doc comment is
+# not real usage) and in-`src` `tests.rs` modules (test code, not shipped). It
+# matches the atomic type names directly, so a multi-line `use std::sync::{
+# atomic::{...}}` or a re-export that hides the `sync::atomic` token is still
+# caught.
+#
+# Classifications:
+#   custom-lock-free  — hand-written lock-free algorithm; MUST have a loom model
+#   handshake-cell    — single-writer atomic state/flag crossing threads via Arc,
+#                       documented ordering; not a lock-free algorithm
+#   metrics-counter   — Relaxed atomic counters (count only; never guard data)
+#   id-counter        — fetch_add unique-id / temp-name generator (Relaxed). May
+#                       be cross-thread: a process-global `static AtomicU64`, or
+#                       the shared `IdSource` the threaded runtime clones to every
+#                       shard thread. Not a lock-free data structure.
+#   diagnostic-counter— process-global diagnostic tally
+#
+# Format: <path>  <classification>  [note]
+
+# --- custom lock-free (loom-modeled) ---
+tina-mailbox-spsc/src/lib.rs            custom-lock-free   SPSC ring; UnsafeCell + atomics; loom: tina-mailbox-spsc/tests/loom_spsc.rs
+tina-runtime/src/shared_scope.rs        custom-lock-free   SharedCapacityScope reserve/release CAS; loom: tina-runtime/tests/loom_shared_scope.rs
+
+# --- handshake cells (single-writer cross-thread flag, store(Release)/load(Acquire)) ---
+tina/src/context.rs                     handshake-cell     DeferredSlotShared / CallHandleShared state stamping (single shard writer; Relaxed or Release/Acquire)
+tina-runtime/src/observation.rs         handshake-cell     bounded typed waiter done-flags (AtomicBool set/read) + std mpsc delivery
+tina-runtime/src/bridge.rs              handshake-cell     AtomicBool closed flag at the bridge boundary
+# Driver-lane cancel/signal flags shared with real OS worker threads
+# (blocking DNS/TLS/process resolver lanes, the storage lane, and the
+# signal-hook handler). store(true)/load() cancellation, single-consumer swap
+# for signals; not lock-free algorithms.
+tina-runtime/src/driver/mod.rs          handshake-cell     Arc<AtomicBool> cancel flags + os-signal flags wired through the driver
+tina-runtime/src/driver/dns.rs          handshake-cell     Arc<AtomicBool> cancel flag for the blocking DNS lane
+tina-runtime/src/driver/tls.rs          handshake-cell     Arc<AtomicBool> cancel flag for the blocking TLS lane
+tina-runtime/src/driver/process.rs      handshake-cell     Arc<AtomicBool> cancel flag for the bounded process lane
+tina-runtime/src/driver/storage.rs      handshake-cell     Arc<AtomicBool> cancel flag for the storage lane
+tina-runtime/src/driver/signals.rs      handshake-cell     Arc<AtomicBool> SIGINT/SIGTERM flags (set by handler, single-consumer swap)
+
+# --- live metrics counters (Relaxed, count-only) ---
+tina-runtime/src/event_sink.rs          metrics-counter    high_water / dropped / dropped_oldest
+tina-runtime/src/observer.rs            metrics-counter    dropped event tally
+tina-runtime/src/live_report.rs         metrics-counter    accepted / rejected_full / rejected_closed snapshot counters
+tina-runtime/src/host_burst.rs          metrics-counter    submitted / observed / admitted burst counters
+
+# --- monotonic id / temp-name counters ---
+tina-runtime/src/lib.rs                 id-counter         IdSource next_event_id / next_call_id; shared Arc<AtomicU64> cloned to every shard thread in the threaded runtime (single-threaded in the explicit-step oracle)
+tina-runtime/src/admission.rs           id-counter         NEXT_GATE_ID
+tina-runtime/src/call/groups.rs         id-counter         call-group COUNTER
+tina-runtime/src/deferred.rs            id-counter         deferred-slot COUNTER
+tina-runtime/src/guarded_pending.rs     id-counter         guarded-pending COUNTER
+tina-runtime/src/pool.rs                id-counter         pool-entry COUNTER
+tina-runtime/src/scope.rs               id-counter         NEXT_SCOPE_ID
+tina-runtime/src/wait_list.rs           id-counter         wait-list COUNTER
+tina-runtime/src/persistence.rs         id-counter         SNAPSHOT_TEMP_COUNTER
+
+# --- diagnostic counters ---
+tina-runtime/src/local_permit.rs        diagnostic-counter DROPPED_PERMIT_COUNT leak tally
