@@ -1321,6 +1321,58 @@ mod tests {
     }
 
     #[test]
+    fn lane_transfers_a_large_payload_in_bounded_chunks() {
+        // A payload several TLS records / pump-turn caps long. One `tls_write`
+        // drives encrypt+flush incrementally with a bounded plaintext buffer and
+        // a per-turn ciphertext cap; the reader drains it across many reads. No
+        // unbounded buffering, no `ResourceBusy`.
+        let mut lane = fresh_lane(64);
+        let mut completed = Vec::new();
+        let (server_stream, _accepted, client_stream, _connected) =
+            handshake_pair(&mut lane, &mut completed, Vec::new(), Vec::new());
+
+        let payload: Vec<u8> = (0..200_000).map(|i| (i % 251) as u8).collect();
+        assert!(
+            lane.submit_write(
+                CallId::new(100),
+                client_stream,
+                payload.clone(),
+                long(),
+                Instant::now()
+            )
+            .is_none()
+        );
+        assert!(matches!(
+            drive(&mut lane, &mut completed, CallId::new(100)),
+            CallOutput::TlsWrote { count } if count == payload.len()
+        ));
+
+        let mut received = Vec::new();
+        let mut next = 101;
+        while received.len() < payload.len() {
+            assert!(
+                lane.submit_read(
+                    CallId::new(next),
+                    server_stream,
+                    64 * 1024,
+                    long(),
+                    Instant::now()
+                )
+                .is_none()
+            );
+            match drive(&mut lane, &mut completed, CallId::new(next)) {
+                CallOutput::TlsRead { bytes } => {
+                    assert!(!bytes.is_empty(), "unexpected clean EOF mid-transfer");
+                    received.extend_from_slice(&bytes);
+                }
+                other => panic!("unexpected read output: {other:?}"),
+            }
+            next += 1;
+        }
+        assert_eq!(received, payload);
+    }
+
+    #[test]
     fn lane_negotiates_alpn_h2_on_both_sides() {
         let mut lane = fresh_lane(64);
         let mut completed = Vec::new();
