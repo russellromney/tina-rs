@@ -939,10 +939,19 @@ impl TlsLane {
     }
 
     pub(super) fn cancel_pending(&mut self, _deadline: Instant) {
-        // Release every backend-held completion slot, then drop our boxes. We
-        // share the io_loop with the TCP lane, which runs its own
-        // `cancel_pending` (and the final `pending_completion_count()==0`
-        // assertion) after us; clearing references here keeps that honest.
+        // Orderly shutdown only. We share the io_loop with the TCP lane, so
+        // `cancel_pending_completions` fails *every* backend-held slot (TCP's
+        // too). That is safe here because shutdown runs before any lane drops —
+        // every completion box is still alive — and it lets the TCP lane's own
+        // `cancel_pending` (run last) see an empty backend and assert
+        // `pending_completion_count() == 0`. Once the backend has released the
+        // slots we can drop our boxes.
+        //
+        // This must NOT run from `Drop`: on a bare runtime drop the TCP lane's
+        // field drops first and frees its boxes, leaving the backend's watch
+        // list dangling — walking it here would be use-after-free. A dropped
+        // lane simply lets its boxes (and the io_loop handle) fall; the backend
+        // is torn down without ever dereferencing the stale pointers.
         let _ = self.io_loop.cancel_pending_completions();
         self.pending.clear();
         self.streams.clear();
@@ -1001,11 +1010,11 @@ impl TlsLane {
     }
 }
 
-impl Drop for TlsLane {
-    fn drop(&mut self) {
-        self.cancel_pending(Instant::now());
-    }
-}
+// No `Drop` impl on purpose: the TLS lane shares its Betelgeuse loop with the
+// TCP lane, and `cancel_pending_completions` is a whole-loop operation that is
+// only safe before any lane has dropped (see `cancel_pending`). On a bare drop
+// the lane's boxes and io_loop handle simply fall; the backend tears down
+// without dereferencing them.
 
 impl TlsPending {
     /// Whether the backend still holds a pointer to one of this op's
