@@ -121,20 +121,29 @@ struct TlsPending {
 /// The per-op state machine. Connect/Accept/Close own their [`TlsIo`] in the
 /// pending entry; Read/Write drive the [`TlsIo`] living in `streams`.
 enum TlsOpState {
-    Connect { io: TlsIo, alpn_offered: bool },
+    Connect {
+        io: TlsIo,
+        alpn_offered: bool,
+    },
     Accept {
         config: Arc<rustls::ServerConfig>,
         accept: Box<AcceptCompletion>,
         io: Option<TlsIo>,
         peer_addr: Option<SocketAddr>,
     },
-    Read { stream: TlsStreamId, max_len: usize },
+    Read {
+        stream: TlsStreamId,
+        max_len: usize,
+    },
     Write {
         stream: TlsStreamId,
         plaintext: Vec<u8>,
         fed: usize,
     },
-    Close { io: TlsIo, sent_close_notify: bool },
+    Close {
+        io: TlsIo,
+        sent_close_notify: bool,
+    },
 }
 
 /// One step of pumping a [`TlsIo`] toward a goal.
@@ -172,7 +181,9 @@ impl TlsIo {
                 if !c.has_result() {
                     return Ok(false);
                 }
-                let result = c.take_result().expect("connect completion advertised a result");
+                let result = c
+                    .take_result()
+                    .expect("connect completion advertised a result");
                 self.socket_op = SocketOp::Idle;
                 result.map(|()| true).map_err(|_| CallError::Io)
             }
@@ -180,7 +191,9 @@ impl TlsIo {
                 if !c.has_result() {
                     return Ok(false);
                 }
-                let result = c.take_result().expect("recv completion advertised a result");
+                let result = c
+                    .take_result()
+                    .expect("recv completion advertised a result");
                 self.socket_op = SocketOp::Idle;
                 match result {
                     Ok(bytes) if bytes.is_empty() => {
@@ -198,7 +211,9 @@ impl TlsIo {
                 if !c.has_result() {
                     return Ok(false);
                 }
-                let result = c.take_result().expect("send completion advertised a result");
+                let result = c
+                    .take_result()
+                    .expect("send completion advertised a result");
                 self.socket_op = SocketOp::Idle;
                 match result {
                     Ok(count) => {
@@ -270,7 +285,11 @@ impl TlsIo {
     /// Arm one bounded `recv`. Caller guarantees `socket_op` is Idle.
     fn arm_recv(&mut self) -> Result<(), CallError> {
         let mut completion = Box::new(RecvCompletion::new());
-        if self.socket.recv(&mut completion, TLS_CIPHERTEXT_CHUNK).is_err() {
+        if self
+            .socket
+            .recv(&mut completion, TLS_CIPHERTEXT_CHUNK)
+            .is_err()
+        {
             return Err(CallError::Io);
         }
         self.socket_op = SocketOp::Recv(completion);
@@ -409,11 +428,7 @@ impl TlsLane {
         };
         let id = TlsListenerId::new(self.next_listener_id);
         self.next_listener_id += 1;
-        self.listeners.push(TlsListenerEntry {
-            id,
-            socket,
-            config,
-        });
+        self.listeners.push(TlsListenerEntry { id, socket, config });
         Some(DriverCompletion {
             call_id,
             result: CallOutput::TlsBound {
@@ -865,8 +880,8 @@ impl TlsLane {
                 // Feed as much plaintext as rustls' bounded buffer accepts,
                 // then flush its ciphertext before feeding more.
                 while *fed < plaintext.len() {
-                    let written =
-                        std::io::Write::write(&mut io.conn.writer(), &plaintext[*fed..]).unwrap_or(0);
+                    let written = std::io::Write::write(&mut io.conn.writer(), &plaintext[*fed..])
+                        .unwrap_or(0);
                     if written == 0 {
                         break;
                     }
@@ -1145,7 +1160,10 @@ mod tests {
             if let Some(index) = completed.iter().position(|c| c.call_id == call_id) {
                 return completed.remove(index).result;
             }
-            assert!(Instant::now() < deadline, "call {call_id:?} did not complete");
+            assert!(
+                Instant::now() < deadline,
+                "call {call_id:?} did not complete"
+            );
             lane.advance(Instant::now(), completed);
             std::thread::sleep(Duration::from_millis(1));
         }
@@ -1165,17 +1183,28 @@ mod tests {
     ) -> (TlsStreamId, CallOutput, TlsStreamId, CallOutput) {
         let (cert, key) = localhost_identity();
         let bound = lane
-            .submit_bind(CallId::new(1), loopback(), vec![cert.clone()], key, server_alpn, Instant::now())
+            .submit_bind(
+                CallId::new(1),
+                loopback(),
+                vec![cert.clone()],
+                key,
+                server_alpn,
+                Instant::now(),
+            )
             .expect("bind completes inline");
         let (listener, addr) = match bound.result {
-            CallOutput::TlsBound { listener, local_addr } => (listener, local_addr),
+            CallOutput::TlsBound {
+                listener,
+                local_addr,
+            } => (listener, local_addr),
             other => panic!("unexpected bind: {other:?}"),
         };
-        assert!(lane
-            .submit_accept(CallId::new(2), listener, long(), Instant::now())
-            .is_none());
-        assert!(lane
-            .submit_connect(
+        assert!(
+            lane.submit_accept(CallId::new(2), listener, long(), Instant::now())
+                .is_none()
+        );
+        assert!(
+            lane.submit_connect(
                 CallId::new(3),
                 addr,
                 "localhost".to_string(),
@@ -1184,7 +1213,8 @@ mod tests {
                 long(),
                 Instant::now(),
             )
-            .is_none());
+            .is_none()
+        );
         let accepted = drive(lane, completed, CallId::new(2));
         let server_stream = match &accepted {
             CallOutput::TlsAccepted { stream, .. } => *stream,
@@ -1206,16 +1236,24 @@ mod tests {
             handshake_pair(&mut lane, &mut completed, Vec::new(), Vec::new());
 
         // client -> server
-        assert!(lane
-            .submit_write(CallId::new(4), client_stream, b"ping".to_vec(), long(), Instant::now())
-            .is_none());
+        assert!(
+            lane.submit_write(
+                CallId::new(4),
+                client_stream,
+                b"ping".to_vec(),
+                long(),
+                Instant::now()
+            )
+            .is_none()
+        );
         assert!(matches!(
             drive(&mut lane, &mut completed, CallId::new(4)),
             CallOutput::TlsWrote { count: 4 }
         ));
-        assert!(lane
-            .submit_read(CallId::new(5), server_stream, 16, long(), Instant::now())
-            .is_none());
+        assert!(
+            lane.submit_read(CallId::new(5), server_stream, 16, long(), Instant::now())
+                .is_none()
+        );
         assert_eq!(
             match drive(&mut lane, &mut completed, CallId::new(5)) {
                 CallOutput::TlsRead { bytes } => bytes,
@@ -1225,16 +1263,24 @@ mod tests {
         );
 
         // server -> client
-        assert!(lane
-            .submit_write(CallId::new(6), server_stream, b"pong".to_vec(), long(), Instant::now())
-            .is_none());
+        assert!(
+            lane.submit_write(
+                CallId::new(6),
+                server_stream,
+                b"pong".to_vec(),
+                long(),
+                Instant::now()
+            )
+            .is_none()
+        );
         assert!(matches!(
             drive(&mut lane, &mut completed, CallId::new(6)),
             CallOutput::TlsWrote { count: 4 }
         ));
-        assert!(lane
-            .submit_read(CallId::new(7), client_stream, 16, long(), Instant::now())
-            .is_none());
+        assert!(
+            lane.submit_read(CallId::new(7), client_stream, 16, long(), Instant::now())
+                .is_none()
+        );
         assert_eq!(
             match drive(&mut lane, &mut completed, CallId::new(7)) {
                 CallOutput::TlsRead { bytes } => bytes,
@@ -1244,16 +1290,18 @@ mod tests {
         );
 
         // clean close_notify -> the peer's read sees a clean (empty) EOF.
-        assert!(lane
-            .submit_close(CallId::new(8), client_stream, long(), Instant::now())
-            .is_none());
+        assert!(
+            lane.submit_close(CallId::new(8), client_stream, long(), Instant::now())
+                .is_none()
+        );
         assert!(matches!(
             drive(&mut lane, &mut completed, CallId::new(8)),
             CallOutput::TlsClosed
         ));
-        assert!(lane
-            .submit_read(CallId::new(9), server_stream, 16, long(), Instant::now())
-            .is_none());
+        assert!(
+            lane.submit_read(CallId::new(9), server_stream, 16, long(), Instant::now())
+                .is_none()
+        );
         assert_eq!(
             match drive(&mut lane, &mut completed, CallId::new(9)) {
                 CallOutput::TlsRead { bytes } => bytes,
@@ -1267,8 +1315,12 @@ mod tests {
     fn lane_negotiates_alpn_h2_on_both_sides() {
         let mut lane = fresh_lane(64);
         let mut completed = Vec::new();
-        let (_server_stream, accepted, _client_stream, connected) =
-            handshake_pair(&mut lane, &mut completed, vec![b"h2".to_vec()], vec![b"h2".to_vec()]);
+        let (_server_stream, accepted, _client_stream, connected) = handshake_pair(
+            &mut lane,
+            &mut completed,
+            vec![b"h2".to_vec()],
+            vec![b"h2".to_vec()],
+        );
         assert!(matches!(
             accepted,
             CallOutput::TlsAccepted { selected_alpn: Some(ref a), .. } if a == b"h2"
@@ -1285,17 +1337,28 @@ mod tests {
         let mut completed = Vec::new();
         let (cert, key) = localhost_identity();
         let bound = lane
-            .submit_bind(CallId::new(1), loopback(), vec![cert.clone()], key, Vec::new(), Instant::now())
+            .submit_bind(
+                CallId::new(1),
+                loopback(),
+                vec![cert.clone()],
+                key,
+                Vec::new(),
+                Instant::now(),
+            )
             .expect("bind inline");
         let (listener, addr) = match bound.result {
-            CallOutput::TlsBound { listener, local_addr } => (listener, local_addr),
+            CallOutput::TlsBound {
+                listener,
+                local_addr,
+            } => (listener, local_addr),
             other => panic!("{other:?}"),
         };
-        assert!(lane
-            .submit_accept(CallId::new(2), listener, long(), Instant::now())
-            .is_none());
-        assert!(lane
-            .submit_connect(
+        assert!(
+            lane.submit_accept(CallId::new(2), listener, long(), Instant::now())
+                .is_none()
+        );
+        assert!(
+            lane.submit_connect(
                 CallId::new(3),
                 addr,
                 "localhost".to_string(),
@@ -1304,7 +1367,8 @@ mod tests {
                 long(),
                 Instant::now(),
             )
-            .is_none());
+            .is_none()
+        );
         assert!(matches!(
             drive(&mut lane, &mut completed, CallId::new(3)),
             CallOutput::Failed(CallError::TlsAlpnMismatch)
@@ -1319,7 +1383,10 @@ mod tests {
             handshake_pair(&mut lane, &mut completed, vec![b"h2".to_vec()], Vec::new());
         assert!(matches!(
             connected,
-            CallOutput::TlsConnected { selected_alpn: None, .. }
+            CallOutput::TlsConnected {
+                selected_alpn: None,
+                ..
+            }
         ));
     }
 
@@ -1330,14 +1397,24 @@ mod tests {
         let (_server, _accepted, client, _connected) =
             handshake_pair(&mut lane, &mut completed, Vec::new(), Vec::new());
         // First read parks (no data from the idle peer).
-        assert!(lane
-            .submit_read(CallId::new(10), client, 16, long(), Instant::now())
-            .is_none());
+        assert!(
+            lane.submit_read(CallId::new(10), client, 16, long(), Instant::now())
+                .is_none()
+        );
         // Second op on the same stream is rejected, not queued behind it.
         let busy = lane
-            .submit_write(CallId::new(11), client, b"x".to_vec(), long(), Instant::now())
+            .submit_write(
+                CallId::new(11),
+                client,
+                b"x".to_vec(),
+                long(),
+                Instant::now(),
+            )
             .expect("second op rejected inline");
-        assert!(matches!(busy.result, CallOutput::Failed(CallError::ResourceBusy)));
+        assert!(matches!(
+            busy.result,
+            CallOutput::Failed(CallError::ResourceBusy)
+        ));
     }
 
     #[test]
@@ -1346,32 +1423,80 @@ mod tests {
         let (cert, key) = localhost_identity();
         // Bind but never accept; the connect's handshake stays in flight.
         let bound = lane
-            .submit_bind(CallId::new(1), loopback(), vec![cert.clone()], key, Vec::new(), Instant::now())
+            .submit_bind(
+                CallId::new(1),
+                loopback(),
+                vec![cert.clone()],
+                key,
+                Vec::new(),
+                Instant::now(),
+            )
             .expect("bind inline");
         let addr = match bound.result {
             CallOutput::TlsBound { local_addr, .. } => local_addr,
             other => panic!("{other:?}"),
         };
-        assert!(lane
-            .submit_connect(CallId::new(2), addr, "localhost".to_string(), vec![cert], Vec::new(), long(), Instant::now())
-            .is_none());
+        assert!(
+            lane.submit_connect(
+                CallId::new(2),
+                addr,
+                "localhost".to_string(),
+                vec![cert],
+                Vec::new(),
+                long(),
+                Instant::now()
+            )
+            .is_none()
+        );
         let report = lane.resource_report();
-        assert_eq!(report.owned_resource_count(), 1, "the listener is table-owned");
-        assert_eq!(report.worker_held_resource_count(), 1, "the connecting socket is un-tabled");
-        assert_eq!(report.pending_driver_call_count(), 1, "the connect is the only pending op");
+        assert_eq!(
+            report.owned_resource_count(),
+            1,
+            "the listener is table-owned"
+        );
+        assert_eq!(
+            report.worker_held_resource_count(),
+            1,
+            "the connecting socket is un-tabled"
+        );
+        assert_eq!(
+            report.pending_driver_call_count(),
+            1,
+            "the connect is the only pending op"
+        );
     }
 
     #[test]
     fn lane_capacity_rejects_overflow_with_tls_full() {
         let mut lane = fresh_lane(1);
         let addr: SocketAddr = "127.0.0.1:9".parse().expect("discard port addr");
-        assert!(lane
-            .submit_connect(CallId::new(1), addr, "localhost".to_string(), Vec::new(), Vec::new(), long(), Instant::now())
-            .is_none());
+        assert!(
+            lane.submit_connect(
+                CallId::new(1),
+                addr,
+                "localhost".to_string(),
+                Vec::new(),
+                Vec::new(),
+                long(),
+                Instant::now()
+            )
+            .is_none()
+        );
         let full = lane
-            .submit_connect(CallId::new(2), addr, "localhost".to_string(), Vec::new(), Vec::new(), long(), Instant::now())
+            .submit_connect(
+                CallId::new(2),
+                addr,
+                "localhost".to_string(),
+                Vec::new(),
+                Vec::new(),
+                long(),
+                Instant::now(),
+            )
             .expect("second op past capacity rejected inline");
-        assert!(matches!(full.result, CallOutput::Failed(CallError::TlsFull)));
+        assert!(matches!(
+            full.result,
+            CallOutput::Failed(CallError::TlsFull)
+        ));
     }
 
     #[test]
@@ -1383,14 +1508,21 @@ mod tests {
         // client sends its ClientHello, and then waits forever for a server
         // that never reads it. The whole-op deadline fires once.
         let bound = lane
-            .submit_bind(CallId::new(1), loopback(), vec![cert.clone()], key, Vec::new(), Instant::now())
+            .submit_bind(
+                CallId::new(1),
+                loopback(),
+                vec![cert.clone()],
+                key,
+                Vec::new(),
+                Instant::now(),
+            )
             .expect("bind inline");
         let addr = match bound.result {
             CallOutput::TlsBound { local_addr, .. } => local_addr,
             other => panic!("{other:?}"),
         };
-        assert!(lane
-            .submit_connect(
+        assert!(
+            lane.submit_connect(
                 CallId::new(2),
                 addr,
                 "localhost".to_string(),
@@ -1399,7 +1531,8 @@ mod tests {
                 Duration::from_millis(150),
                 Instant::now(),
             )
-            .is_none());
+            .is_none()
+        );
         assert!(matches!(
             drive(&mut lane, &mut completed, CallId::new(2)),
             CallOutput::Failed(CallError::Timeout)

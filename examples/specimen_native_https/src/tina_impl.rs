@@ -134,7 +134,11 @@ pub fn run() -> anyhow::Result<Report> {
     // driven by Tina's own HTTPS client against Tina's own HTTPS server.
     let fetch = |req: HttpRequest| -> anyhow::Result<HttpResponse> {
         match runtime
-            .call_blocking(client, HttpClientMsg::call(target(), req), Duration::from_secs(5))
+            .call_blocking(
+                client,
+                HttpClientMsg::call(target(), req),
+                Duration::from_secs(5),
+            )
             .map_err(|e| anyhow::anyhow!("client call failed: {e:?}"))?
         {
             CallOutcome::Replied(Ok(response)) => Ok(response),
@@ -147,7 +151,10 @@ pub fn run() -> anyhow::Result<Report> {
     if first.status == StatusCode::OK {
         report.successful_get += 1;
     }
-    anyhow::ensure!(body_text(&first).trim() == "0", "first GET should report counter=0");
+    anyhow::ensure!(
+        body_text(&first).trim() == "0",
+        "first GET should report counter=0"
+    );
 
     for _ in 0..3 {
         let posted = fetch(request(Method::POST, "/counter"))?;

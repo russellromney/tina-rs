@@ -2518,8 +2518,9 @@ fn spawn_probe_peer(
 ) -> (SocketAddr, std::thread::JoinHandle<()>) {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let server_cert = rustls::pki_types::CertificateDer::from(cert_der);
-    let server_key =
-        rustls::pki_types::PrivateKeyDer::Pkcs8(rustls::pki_types::PrivatePkcs8KeyDer::from(key_der));
+    let server_key = rustls::pki_types::PrivateKeyDer::Pkcs8(
+        rustls::pki_types::PrivatePkcs8KeyDer::from(key_der),
+    );
     let config = rustls::ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(vec![server_cert], server_key)
@@ -2570,7 +2571,11 @@ fn run_probe(clean: bool) -> String {
     app.try_send(probe, TlsProbeMsg::Start { addr, cert_der })
         .expect("start probe");
     wait_until(|| terminal.lock().expect("probe lock").is_some());
-    let outcome = terminal.lock().expect("probe lock").clone().expect("probe terminal");
+    let outcome = terminal
+        .lock()
+        .expect("probe lock")
+        .clone()
+        .expect("probe terminal");
     app.shutdown().drain().join().expect("probe shutdown");
     peer.join().expect("probe peer thread");
     outcome
