@@ -70,11 +70,17 @@ pub struct ThreadedRuntimeConfig {
     /// Capacity of runtime-owned signal waits.
     pub signal_capacity: usize,
 
-    /// Desired OS core for this shard worker.
+    /// OS CPU id to hard-pin this shard worker to.
     ///
-    /// The current portable backend reports this as advisory intent only. It
-    /// does not hard-pin the worker without a platform-specific affinity
-    /// implementation.
+    /// `Some(n)` means "pin this worker to OS CPU id `n` if the platform can."
+    /// `n` is an OS CPU id checked against the process's allowed affinity mask,
+    /// not an index into `0..num_cpus`. On Linux the worker pins with
+    /// `sched_setaffinity` and reports [`crate::AffinityStatus::Applied`]; a
+    /// core outside the allowed mask reports [`crate::AffinityStatus::Failed`]
+    /// and the worker runs unpinned. Platforms without a hard pin (e.g. macOS)
+    /// report [`crate::AffinityStatus::Unsupported`]. Helper-lane threads are
+    /// never pinned. Default `None` makes no affinity call
+    /// ([`crate::AffinityStatus::NotRequested`]).
     pub configured_core: Option<usize>,
 
     /// Setup-time reserves for runtime-owned metadata.
@@ -1414,7 +1420,6 @@ where
     S: Shard + 'static,
     F: MailboxFactory + 'static,
 {
-    metrics.set_worker_thread_id(format!("{:?}", thread::current().id()));
     let mut runtime = Runtime::with_clock_and_ids_and_driver_and_preallocation(
         shard,
         mailbox_factory,
@@ -1433,6 +1438,13 @@ where
     runtime.set_trace_retention(config.trace_retention);
     // Wire the observer before any event records.
     runtime.set_trace_observer(observer);
+
+    // Pin this worker (if requested and the platform can) only after the driver
+    // has spawned its helper lanes above, so those lanes inherit the unpinned
+    // mask and float onto spare cores. Pin before the loop so a report that
+    // names the worker carries its proven pin outcome.
+    let affinity = crate::affinity::apply(config.configured_core);
+    metrics.publish_worker_start(format!("{:?}", thread::current().id()), affinity);
 
     loop {
         metrics.set_resource_counts(runtime.resource_report());

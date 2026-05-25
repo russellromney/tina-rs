@@ -909,7 +909,13 @@ where
     F: MailboxFactory + 'static,
 {
     runtime.remote_child_control_capacity = config.shard_pair_capacity;
-    shard_metrics.set_worker_thread_id(format!("{:?}", thread::current().id()));
+    // Pin this shard worker (if requested and the platform can). The driver's
+    // helper lanes were already spawned when `runtime` was built above, so they
+    // inherit the unpinned mask; later per-op helper threads float off the pin.
+    // Pin before recording the thread id so a report that names the worker
+    // carries its proven pin outcome.
+    let affinity = crate::affinity::apply(config.configured_core);
+    shard_metrics.publish_worker_start(format!("{:?}", thread::current().id()), affinity);
     let source_shard = runtime.shard().id();
     let mut terminal_overflow = VecDeque::new();
     let mut terminal_remote_drain_start = 0;

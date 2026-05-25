@@ -54,9 +54,12 @@ pub struct LocalSystemConfig {
     pub process_lane_capacity: usize,
     /// Capacity of runtime-owned signal waits.
     pub signal_capacity: usize,
-    /// Desired OS core for shard workers. This is advisory until a backend can
-    /// prove hard affinity. Multi-shard local systems treat this as the first
-    /// core in stable shard order and assign later shards to contiguous cores.
+    /// OS CPU id to hard-pin shard workers to. `Some(n)` pins on platforms that
+    /// can (Linux), reports [`crate::AffinityStatus::Unsupported`] elsewhere,
+    /// and [`crate::AffinityStatus::Failed`] for a core outside the process's
+    /// allowed affinity mask. Multi-shard local systems treat this as the core
+    /// for the first shard in stable order and assign later shards to
+    /// contiguous OS CPU ids (`n + ordinal`).
     pub configured_core: Option<usize>,
     /// Setup-time reserves for runtime-owned metadata.
     pub preallocation: PreallocationConfig,
@@ -847,10 +850,14 @@ where
         self
     }
 
-    /// Records desired worker core ownership as advisory intent.
+    /// Hard-pins this shard worker to OS CPU id `core` where the platform can.
     ///
-    /// The current portable backend does not hard-pin the worker. Topology
-    /// reports show [`crate::AffinityStatus::AdvisoryOnly`] when this is set.
+    /// On Linux the worker pins via `sched_setaffinity` and topology reports
+    /// [`crate::AffinityStatus::Applied`] with the observed core; `core` is an
+    /// OS CPU id checked against the process's allowed affinity mask, not an
+    /// index into `0..num_cpus`. Platforms without a hard pin report
+    /// [`crate::AffinityStatus::Unsupported`]; a core outside the mask reports
+    /// [`crate::AffinityStatus::Failed`] and the worker runs unpinned.
     pub const fn configured_core(mut self, core: usize) -> Self {
         self.config.configured_core = Some(core);
         self
@@ -1035,8 +1042,13 @@ where
         self
     }
 
-    /// Records desired worker core ownership as advisory intent for every
-    /// shard in this local system.
+    /// Hard-pins shard workers to OS CPU ids starting at `core`, where the
+    /// platform can. The first shard in stable order pins to `core` and later
+    /// shards to contiguous ids (`core + ordinal`). On Linux each worker pins
+    /// via `sched_setaffinity` and reports [`crate::AffinityStatus::Applied`];
+    /// platforms without a hard pin report
+    /// [`crate::AffinityStatus::Unsupported`], and an id outside the process's
+    /// allowed affinity mask reports [`crate::AffinityStatus::Failed`].
     pub const fn configured_core(mut self, core: usize) -> Self {
         self.config.configured_core = Some(core);
         self

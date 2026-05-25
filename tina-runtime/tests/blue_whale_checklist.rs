@@ -2,7 +2,6 @@
 enum BlueWhaleStatus {
     True,
     Partial,
-    Advisory,
     Future,
     NonGoal,
 }
@@ -22,8 +21,8 @@ const BLUE_WHALE_CHECKLIST: &[BlueWhaleItem] = &[
     },
     BlueWhaleItem {
         name: "thread pinning",
-        status: BlueWhaleStatus::Advisory,
-        evidence: "AffinityStatus reports NotRequested or AdvisoryOnly; no OS pinning claim yet",
+        status: BlueWhaleStatus::Partial,
+        evidence: "configured_core hard-pins the shard worker on Linux (sched_setaffinity, AffinityStatus::Applied with observed core); Unsupported on macOS, Failed for a core outside the process affinity mask; helper lanes stay unpinned",
     },
     BlueWhaleItem {
         name: "SPSC/cross-shard queues",
@@ -89,9 +88,12 @@ fn blue_whale_checklist_classifies_every_seastar_shaped_claim() {
         );
     }
 
+    // Thread pinning is a real OS hard pin on Linux (Unsupported elsewhere), no
+    // longer advisory-only. This rewrite is itself the proof that the old
+    // "no OS pinning claim yet" non-claim was lifted on purpose.
     assert!(
         BLUE_WHALE_CHECKLIST.iter().any(|item| {
-            item.name == "thread pinning" && item.status == BlueWhaleStatus::Advisory
+            item.name == "thread pinning" && item.status == BlueWhaleStatus::Partial
         })
     );
     assert!(
