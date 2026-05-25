@@ -4,7 +4,7 @@
 use std::convert::Infallible;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use http::{Method, StatusCode};
@@ -16,8 +16,8 @@ use tina_http::{
     HttpsServerConfig, HttpsStartupError, TlsServerIdentity,
 };
 use tina_runtime::{
-    CallKind, CallOutcome, DefaultThreadedMailboxFactory, RuntimeTraceExt, ThreadedRuntime,
-    ThreadedRuntimeConfig,
+    CallKind, CallOutcome, DefaultThreadedMailboxFactory, RuntimeEvent, RuntimeEventKind,
+    RuntimeTraceExt, ThreadedRuntime, ThreadedRuntimeConfig, TraceObserver,
 };
 
 #[derive(Debug, Default)]
@@ -79,6 +79,21 @@ impl Counter {
 
 type HttpsStartOutcome = CallOutcome<Result<HttpsReady, HttpsStartupError>>;
 
+#[derive(Debug, Default)]
+struct CollectingObserver(Mutex<Vec<RuntimeEvent>>);
+
+impl TraceObserver for CollectingObserver {
+    fn on_event(&self, event: &RuntimeEvent) {
+        self.0.lock().expect("trace observer lock").push(*event);
+    }
+}
+
+impl CollectingObserver {
+    fn events(&self) -> Vec<RuntimeEvent> {
+        self.0.lock().expect("trace observer lock").clone()
+    }
+}
+
 struct GeneratedIdentity {
     identity: TlsServerIdentity,
     cert_der: Vec<u8>,
@@ -128,15 +143,47 @@ fn run_https_request(addr: SocketAddr, root_cert_der: Vec<u8>, request: &[u8]) -
 }
 
 fn build_runtime() -> ThreadedRuntime<TestShard, DefaultThreadedMailboxFactory> {
-    ThreadedRuntime::with_config(
-        TestShard,
-        DefaultThreadedMailboxFactory,
-        ThreadedRuntimeConfig {
-            command_capacity: 64,
-            idle_wait: Duration::from_millis(1),
-            ..Default::default()
-        },
-    )
+    build_runtime_with_observer(None)
+}
+
+fn build_runtime_with_observer(
+    observer: Option<Arc<dyn TraceObserver>>,
+) -> ThreadedRuntime<TestShard, DefaultThreadedMailboxFactory> {
+    let config = ThreadedRuntimeConfig {
+        command_capacity: 64,
+        idle_wait: Duration::from_millis(1),
+        ..Default::default()
+    };
+    if let Some(observer) = observer {
+        return ThreadedRuntime::with_config_and_trace_observer(
+            TestShard,
+            DefaultThreadedMailboxFactory,
+            config,
+            observer,
+        );
+    }
+    ThreadedRuntime::with_config(TestShard, DefaultThreadedMailboxFactory, config)
+}
+
+fn count_completed(events: &[RuntimeEvent], call_kind: CallKind) -> usize {
+    events
+        .iter()
+        .filter(|event| {
+            matches!(
+                event.kind(),
+                RuntimeEventKind::CallCompleted { call_kind: kind, .. } if kind == call_kind
+            )
+        })
+        .count()
+}
+
+fn any_failed(events: &[RuntimeEvent], call_kind: CallKind) -> bool {
+    events.iter().any(|event| {
+        matches!(
+            event.kind(),
+            RuntimeEventKind::CallFailed { call_kind: kind, .. } if kind == call_kind
+        )
+    })
 }
 
 fn start_listener(
@@ -311,7 +358,8 @@ fn second_start_returns_already_started_without_rebinding() {
         cert_der: _,
     } = generate_identity();
 
-    let runtime = build_runtime();
+    let observer = Arc::new(CollectingObserver::default());
+    let runtime = build_runtime_with_observer(Some(observer.clone()));
     let counter = runtime
         .register_with_capacity::<Counter, Infallible>(Counter::default(), 16)
         .expect("register counter");
@@ -346,11 +394,12 @@ fn second_start_returns_already_started_without_rebinding() {
     stopped
         .wait(Duration::from_secs(5))
         .expect("listener stops cleanly after Stop");
-    let trace = runtime.shutdown().unwrap_or_default();
-    let tls_bind_completions = trace.count_completed(CallKind::TlsBind);
+    let trace = runtime.shutdown().expect("shutdown after second start");
+    let events = observer.events();
+    let tls_bind_completions = count_completed(&events, CallKind::TlsBind);
     assert_eq!(
         tls_bind_completions, 1,
-        "exactly one tls_bind should have completed (got {tls_bind_completions})",
+        "exactly one tls_bind should have completed (got {tls_bind_completions}); retained trace: {trace:#?}; observed events: {events:#?}",
     );
 }
 
@@ -366,7 +415,8 @@ fn stop_with_pending_accept_closes_listener_cleanly() {
         cert_der: _,
     } = generate_identity();
 
-    let runtime = build_runtime();
+    let observer = Arc::new(CollectingObserver::default());
+    let runtime = build_runtime_with_observer(Some(observer.clone()));
     let counter = runtime
         .register_with_capacity::<Counter, Infallible>(Counter::default(), 16)
         .expect("register counter");
@@ -391,16 +441,17 @@ fn stop_with_pending_accept_closes_listener_cleanly() {
         .wait(Duration::from_secs(5))
         .expect("listener isolate stops cleanly after Stop");
 
-    let trace = runtime.shutdown().unwrap_or_default();
-    let listener_close_completed = trace.any_completed(CallKind::TlsListenerClose);
-    let listener_close_failed = trace.any_failed(CallKind::TlsListenerClose);
+    let trace = runtime.shutdown().expect("shutdown after listener stop");
+    let events = observer.events();
+    let listener_close_completed = count_completed(&events, CallKind::TlsListenerClose) > 0;
+    let listener_close_failed = any_failed(&events, CallKind::TlsListenerClose);
     assert!(
         listener_close_completed,
-        "tls_close_listener must complete cleanly; trace: {trace:#?}",
+        "tls_close_listener must complete cleanly; retained trace: {trace:#?}; observed events: {events:#?}",
     );
     assert!(
         !listener_close_failed,
-        "tls_close_listener must not fail with ResourceBusy; trace: {trace:#?}",
+        "tls_close_listener must not fail with ResourceBusy; retained trace: {trace:#?}; observed events: {events:#?}",
     );
 }
 
