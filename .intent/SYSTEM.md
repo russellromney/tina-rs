@@ -339,10 +339,15 @@ Everything else is **not** a custom lock-free structure:
 
 - the **cross-shard transport is `std::sync::mpsc`** (standard library).
   Trusted, not ours to loom; loom cannot meaningfully explore it.
-- **single-writer handshake cells** — `DeferredSlotShared` / `CallHandleShared`
+- **single-writer handshake cells** — the bounded blocking driver lanes
+  (DNS/TLS/process/storage) and the signal-hook handler share `Arc<AtomicBool>`
+  cancel/signal flags with their real OS worker threads
+  (`tina-runtime/src/driver/*`); `DeferredSlotShared` / `CallHandleShared`
   (`tina/src/context.rs`) and the typed observation done-flags
-  (`tina-runtime/src/observation.rs`) — cross threads through `Arc` but are
-  single-writer atomic state with documented ordering, not lock-free algorithms.
+  (`tina-runtime/src/observation.rs`) cross threads through `Arc` the same way.
+  All are single-writer `store`/`load` (or single-consumer `swap`) flags with
+  documented ordering — genuine cross-thread state, but not lock-free
+  algorithms, so they need recording, not a loom model.
 - **metrics counters** (`event_sink`, `observer`, `live_report`, `host_burst`)
   are Relaxed atomics that only count; they never guard shared data.
 - **monotonic id / temp-name counters** and one diagnostic tally are ordinary
