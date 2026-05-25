@@ -37,13 +37,19 @@ impl TlsServerIdentity {
     }
 }
 
-/// HTTPS listener config. Two distinct TLS deadlines keep accept polling
-/// and per-stream I/O honest under bounded TLS lane capacity.
+/// Default accept deadline: long enough to mean "wait for a client". TLS
+/// accept is now completion-driven over the TCP rail, so the listener parks on
+/// one lane slot until a connection arrives (or the listener is closed) rather
+/// than busy-polling. The deadline only bounds a fully idle accept; on expiry
+/// the listener simply re-accepts.
+const TLS_ACCEPT_WAIT: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// HTTPS listener config.
 ///
-/// `tls_accept_timeout` is short (default 250ms) so the listener
-/// re-polls instead of parking one lane slot forever on an idle
-/// listener. `tls_io_timeout` bounds individual
-/// `tls_read`/`tls_write`/`tls_close` ops.
+/// `tls_accept_timeout` is a real accept deadline (default "wait"): the
+/// completion-driven accept parks until a client connects or the deadline
+/// elapses, at which point the listener re-accepts. `tls_io_timeout` bounds
+/// individual `tls_read`/`tls_write`/`tls_close` ops.
 #[derive(Debug, Clone)]
 pub struct HttpsServerConfig {
     pub http: HttpServerConfig,
@@ -53,22 +59,22 @@ pub struct HttpsServerConfig {
 }
 
 impl HttpsServerConfig {
-    /// Dev preset: 250ms accept, 30s I/O.
+    /// Dev preset: wait-for-client accept, 30s I/O.
     pub fn dev(identity: TlsServerIdentity) -> Self {
         Self {
             http: HttpServerConfig::dev(),
             identity,
-            tls_accept_timeout: Duration::from_millis(250),
+            tls_accept_timeout: TLS_ACCEPT_WAIT,
             tls_io_timeout: Duration::from_secs(30),
         }
     }
 
-    /// Pressure preset: 100ms accept, 1s I/O.
+    /// Pressure preset: wait-for-client accept, 1s I/O.
     pub fn pressure(identity: TlsServerIdentity) -> Self {
         Self {
             http: HttpServerConfig::pressure(),
             identity,
-            tls_accept_timeout: Duration::from_millis(100),
+            tls_accept_timeout: TLS_ACCEPT_WAIT,
             tls_io_timeout: Duration::from_secs(1),
         }
     }
@@ -257,10 +263,10 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Isolate for Http
                 let Some(listener) = self.listener else {
                     return stop();
                 };
-                // Re-accept on transient errors. `Timeout` = empty
-                // accept slice; `TlsHandshake` = malformed peer
-                // bytes (no `TlsStreamId` allocated). Everything
-                // else would busy-loop — close out.
+                // Re-accept on transient errors. `Timeout` = the idle accept
+                // deadline elapsed with no client; `TlsHandshake` = a malformed
+                // peer was rejected mid-handshake (no `TlsStreamId` allocated).
+                // Everything else (e.g. `TargetClosed`) is terminal — close out.
                 match error {
                     CallError::Timeout | CallError::TlsHandshake => {
                         tls_accept(listener, self.tls_accept_timeout)
