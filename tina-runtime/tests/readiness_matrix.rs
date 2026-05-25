@@ -122,10 +122,10 @@ fn rows() -> Vec<MatrixRow> {
         MatrixRow {
             capability: "thread/core affinity",
             status: ReadinessStatus::Partial,
-            evidence: "advisory configured/observed core reporting; no hard pinning",
+            evidence: "configured_core hard-pins the shard worker on Linux (sched_setaffinity over the allowed affinity mask, reported Applied with observed core); Unsupported on macOS, Failed for an out-of-mask core; helper lanes unpinned",
             tina: None,
             tokio_note: "Tokio multi-thread work stealing is a different ownership model.",
-            glommio_note: "Glommio has a stronger Linux thread-per-core executor story.",
+            glommio_note: "Glommio pins thread-per-core by default; Tina's hard pin is opt-in, Linux-only, and leaves helper lanes unpinned.",
         },
         MatrixRow {
             capability: "cost reporting",
