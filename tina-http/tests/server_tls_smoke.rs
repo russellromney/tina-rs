@@ -341,7 +341,11 @@ fn second_start_returns_already_started_without_rebinding() {
         "second Start should reply AlreadyStarted, got {outcome_b:?}"
     );
 
+    let stopped = runtime.observe_isolate_complete(listener);
     let _ = runtime.try_send(listener, HttpsListenerMsg::Stop);
+    stopped
+        .wait(Duration::from_secs(5))
+        .expect("listener stops cleanly after Stop");
     let trace = runtime.shutdown().unwrap_or_default();
     let tls_bind_completions = trace.count_completed(CallKind::TlsBind);
     assert_eq!(

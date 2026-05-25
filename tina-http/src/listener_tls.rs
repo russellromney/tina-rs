@@ -135,6 +135,7 @@ pub struct HttpsListener<S: Shard + 'static, M: From<HttpRequest> + Send + 'stat
     /// Set on the first `Start`. Second Start replies `AlreadyStarted`.
     started: bool,
     stopping: bool,
+    closing_listener: bool,
     _shard: PhantomData<S>,
 }
 
@@ -161,6 +162,7 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpsListener<S,
             pending_start_reply: None,
             started: false,
             stopping: false,
+            closing_listener: false,
             _shard: PhantomData,
         }
     }
@@ -209,6 +211,7 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Isolate for Http
                     // Stop arrived while bind was in flight. Close
                     // the just-bound listener; fail any pending startup call.
                     let listener = self.listener.take().expect("set just above");
+                    self.closing_listener = true;
                     let close = tls_close_listener(listener).then(HttpsListenerMsg::ListenerClosed);
                     return match self.pending_start_reply.take() {
                         Some(request) => batch(vec![
@@ -257,8 +260,14 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Isolate for Http
             HttpsListenerMsg::Accepted(Err(error)) => {
                 if self.stopping {
                     // The pending accept already cleared via the
-                    // lane's close-wins synthetic `TargetClosed`.
-                    return stop();
+                    // lane's close-wins synthetic `TargetClosed`. If Stop already
+                    // started `tls_close_listener`, wait for `ListenerClosed` so
+                    // the close terminal event is visible before the isolate stops.
+                    return if self.closing_listener {
+                        noop()
+                    } else {
+                        stop()
+                    };
                 }
                 let Some(listener) = self.listener else {
                     return stop();
@@ -275,6 +284,7 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Isolate for Http
                     _ => {
                         self.stopping = true;
                         if let Some(listener) = self.listener.take() {
+                            self.closing_listener = true;
                             tls_close_listener(listener).then(HttpsListenerMsg::ListenerClosed)
                         } else {
                             stop()
@@ -289,13 +299,22 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Isolate for Http
                 }
                 self.stopping = true;
                 if let Some(listener) = self.listener.take() {
+                    self.closing_listener = true;
                     tls_close_listener(listener).then(HttpsListenerMsg::ListenerClosed)
+                } else if self.started {
+                    // Bind is still in flight. Do not stop yet: the eventual
+                    // Bound message either closes the just-created listener or
+                    // reports the bind failure before the isolate exits.
+                    noop()
                 } else {
                     stop()
                 }
             }
 
-            HttpsListenerMsg::ListenerClosed(_) => stop(),
+            HttpsListenerMsg::ListenerClosed(_) => {
+                self.closing_listener = false;
+                stop()
+            }
             HttpsListenerMsg::StreamClosed(_) => noop(),
         }
     }
