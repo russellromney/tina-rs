@@ -205,6 +205,15 @@ If something can fail, Tina makes it traceable.
 
 If something can race, Tina makes it replayable.
 
+The replay is of *logical* interleavings — message, timer, and completion
+order — which is what the single-threaded simulator proves and reproduces
+byte-for-byte. Physical memory-ordering races are a separate, tiny surface:
+shared-nothing isolates keep it small, and the custom lock-free structures on
+it (the SPSC mailbox and `SharedCapacityScope`) are loom-checked, not assumed
+safe. The live parallel runtime is fully introspectable but not
+byte-reproducible. See [`.intent/SYSTEM.md`](.intent/SYSTEM.md) for the verified
+race surface.
+
 ## Explicit by design
 
 Tina keeps the important parts visible.
