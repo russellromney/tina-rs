@@ -3,7 +3,7 @@ EXAMPLES_TARGET_DIR ?= $(CURDIR)/target/verify-examples
 
 .PHONY: fmt fmt-check check test loom miri doc clippy portable-runtime-cost \
 	verify verify-examples proof-fast proof-soak proof-bad-peer \
-	proof-replay-regression
+	proof-replay-regression race-surface-guard
 
 fmt:
 	cargo fmt --all
@@ -19,6 +19,15 @@ test:
 
 loom:
 	cargo test -p tina-mailbox-spsc --features loom --test loom_spsc
+	cargo test -p tina-runtime --features loom --test loom_shared_scope
+
+# Race-surface guard: fail if a new shared-memory synchronization primitive
+# (UnsafeCell / unsafe impl Send|Sync / atomic) appears in core-crate code
+# outside the reviewed allowlist (.intent/race-surface-allowlist.txt).
+# Surrogate proof — it catches additions; the loom models prove the existing
+# structures.
+race-surface-guard:
+	./scripts/race_surface_guard.sh
 
 miri:
 	cargo +nightly miri test -p tina-mailbox-spsc --test miri_spsc
@@ -77,7 +86,7 @@ proof-bad-peer:
 proof-replay-regression:
 	cargo test --manifest-path examples/systems/system_live_replay_bugbox/Cargo.toml --test smoke
 
-verify: fmt-check check test loom doc clippy
+verify: fmt-check check test loom race-surface-guard doc clippy
 	cargo run -p tina-runtime --example portable_runtime_cost | tee /tmp/tina-verify-cost.txt
 	grep -E "cost smoke / local machine / not benchmark" /tmp/tina-verify-cost.txt
 	grep -E "mailbox local push/pop|local send|live ingress|cross-shard send|isolate call|timer|TCP loopback|TLS loopback|file read/write|journal append|bridge call" /tmp/tina-verify-cost.txt

@@ -41,10 +41,27 @@
 //!     .unwrap();
 //! ```
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use self::sync::{Arc, AtomicU64, AtomicUsize, Ordering};
 
 use tina::capacity::{CapacityMode, CapacitySurfaceReport};
+
+// Under `--features loom` the cap counters become loom atomics so the
+// loom model (`tests/loom_shared_scope.rs`) can explore every legal
+// interleaving of the lock-free reserve/release CAS loops. The shipped
+// build keeps the std types; only this module swaps, because it is the
+// only cross-thread CAS surface in the runtime crate. See
+// `.intent/SYSTEM.md` "Shared-memory race surface".
+#[cfg(feature = "loom")]
+mod sync {
+    pub(crate) use loom::sync::Arc;
+    pub(crate) use loom::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+}
+
+#[cfg(not(feature = "loom"))]
+mod sync {
+    pub(crate) use std::sync::Arc;
+    pub(crate) use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+}
 
 /// Why [`SharedCapacityScope::try_admit`] rejected an admission.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -420,7 +437,10 @@ fn saturating_sub_release(target: &AtomicUsize, n: usize) {
     }
 }
 
-#[cfg(test)]
+// These exercise the std build with real threads. Under `--features loom`
+// the cap counters are loom atomics, which panic outside `loom::model`, and
+// the lock-free behavior is instead proven by `tests/loom_shared_scope.rs`.
+#[cfg(all(test, not(feature = "loom")))]
 mod tests {
     use super::*;
     use std::sync::Barrier;

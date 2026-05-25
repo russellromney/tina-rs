@@ -13,6 +13,18 @@ seed + config + history + expected trace shape is replay
 
 Sim proves state-machine interleavings. Live proves physics.
 
+That line is exact, and worth being precise about. The simulator is
+single-threaded on purpose — that is *why* replay works. It proves **logical**
+interleavings: the order messages arrive, timers wake, mailboxes fill, children
+restart, and I/O completes. Same `(seed, config, history)`, same trace,
+byte-for-byte.
+
+It does **not** prove **physical** memory ordering on the live parallel
+substrate. Events across shards interleave freely there; that is physics, not a
+defect. The simulator does not, and cannot, catch a physical data race. Those
+live on a separate, tiny shared-memory surface that loom checks instead — see
+[What Sim Does Not Prove](#what-sim-does-not-prove).
+
 ## What Sim Gives You
 
 - deterministic time
@@ -29,8 +41,15 @@ Sim proves state-machine interleavings. Live proves physics.
 - allocator behavior
 - cgroup memory kill behavior
 - live deployment behavior
+- physical memory-ordering races on the live parallel runtime
 
-For those things you still need real I/O and real processes.
+For the first five you still need real I/O and real processes. The last one is
+different: shared-nothing isolates keep the cross-thread shared-memory surface
+tiny, and the custom lock-free structures on it — the SPSC mailbox and
+`SharedCapacityScope` — are proven by loom models, not by the simulator. The
+verified surface and the guard that keeps it honest are recorded in
+[`.intent/SYSTEM.md`](../../.intent/SYSTEM.md) ("Shared-memory race surface")
+and [`.intent/race-surface-allowlist.txt`](../../.intent/race-surface-allowlist.txt).
 
 ## The Workflow
 
