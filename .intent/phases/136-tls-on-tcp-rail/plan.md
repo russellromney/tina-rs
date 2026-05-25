@@ -2,16 +2,20 @@
 
 ## Status
 
-- Planned v3 (2026-05-24). v2 was hostile-reviewed (`review.md` Plan Review 1);
-  v3 corrects the Starting Facts against `origin/main` (`a6cbaa9`) after a
-  deep-dive found the worker model had changed (`review.md` Plan Review 2).
+- Planned v4 (2026-05-24). v2 hostile-reviewed (Plan Review 1); v3 corrected facts
+  against `origin/main` (Plan Review 2); v4 folds in Plan Review 3 (security-posture
+  invariant + adversarial tests, ALPN-is-already-live blast radius,
+  `tls_lane_capacity` decision, guard scoping, the TLS-oracle fact).
 - v2/v3 fold in: downstream `tina-http` impact, the one-pending-op pump rule,
   the four subtle-semantics that are the real work, comprehensive proof, the
   specimen rewrite, the DNS clarification, and a pointer to the removal phase.
 - This is an **implementation** plan. The auditing is done (see `review.md`).
   Every step below lands code and proof; no step is investigation.
-- Sequencing: lands before HTTP/2 TLS ALPN / mTLS (Phase 127), which inherit the
-  substrate TLS sits on.
+- Sequencing: this is foundational substrate work. Note that HTTP/2-over-TLS ALPN
+  **already exists on main** (it is not a future Phase 127 deliverable that
+  "inherits" the substrate) — so ALPN is a live consumer this phase must not
+  break (blast radius), and mTLS/system-roots remain the only TLS items left to
+  127.
 
 ## Starting Facts (verified on `origin/main` a6cbaa9)
 
@@ -43,6 +47,17 @@
   separate rail and **is not part of this phase**.
 - The TCP/TLS rail rejects a second in-flight op on a stream with
   `CallError::ResourceBusy` (`driver/mod.rs:95,1222`).
+- **TLS has no inline/explicit-step path today.** `TlsLane` has only a `Worker`
+  variant, built by *both* driver constructors (`driver/mod.rs:252` and `:277`),
+  so even the explicit-step driver uses TLS worker threads — its only
+  deterministic oracle is `tina-sim`'s scripted TLS. Storage, by contrast, has
+  `StorageLane::Inline` for the explicit driver. **Bonus of this rewrite:** a
+  sans-I/O state machine over the *driver's* TCP rail means TLS rides whatever TCP
+  the driver provides (Betelgeuse on threaded; the explicit driver's TCP rail on
+  explicit-step), which removes the worker lane from *both* constructors and gives
+  explicit-step TLS a deterministic path it lacks today. TLS-1 must define the
+  explicit-step path concretely (ride its TCP rail; if the explicit driver has no
+  usable TCP rail, TLS is documented threaded-only with sim-scripted as oracle).
 
 ## Purpose
 
@@ -85,6 +100,12 @@ tests:
 7. **One pending TLS op per stream** stays true at the isolate boundary.
 8. **Simulator TLS unchanged** — scripted semantic I/O, not cryptography. Live
    path only.
+9. **Security posture does not change (what-will-not-change).** Certificate
+   verification, SNI / server-name checking, the DER-only root policy, and "no
+   silent downgrade" are byte-for-byte the same. A sans-I/O rewrite must not treat
+   a `process_new_packets` error as success or skip the verifier. This is the most
+   dangerous thing the rewrite can break and is guarded by adversarial tests
+   (below), not assumed.
 
 ## Includes
 
@@ -112,15 +133,20 @@ tests:
   buffer surfaces a typed `Full`-class outcome rather than growing.
 - **close_notify vs truncation.** Clean `close_notify` maps to clean close; abrupt
   TCP EOF mid-record maps to the existing error outcome. Distinct, matching today.
-- **close-wins / tombstone.** Reproduce `cancelled_by_close` →
-  `Failed(TargetClosed)`, cancellation, and late-completion tombstoning exactly
-  (`tls.rs:82-85` today), now as on-shard state.
+- **close-wins / tombstone.** Reproduce close-wins, cancellation, and
+  late-completion tombstoning exactly. **Parity target = main's current per-op
+  cancellation code** (per-op `cancelled` `AtomicBool` + the reaper), not the
+  stale single-worker `cancelled_by_close` model — re-anchor to the live source
+  before coding.
 
 ### Capability + docs
 
 - `RuntimeCapabilities`: TLS family moves lane-backed/blocking →
-  **completion-backed (rides the TCP rail)**. `tls_lane_capacity` removed or
-  repurposed as a per-stream pending cap (decide at TLS-4).
+  **completion-backed (rides the TCP rail)**. **Decided (Plan Review 3):**
+  `tls_lane_capacity` is **kept as the per-stream pending cap** (least churn — it
+  is a public field on `HttpsListenerConfig` / LocalSystem config). Not removed.
+  Its meaning shifts from "concurrent worker slots" to "pending TLS ops"; existing
+  configs that set it still compile and bound work. Blast-radius check below.
 - FINDINGS #16 (already "resolved first form" via per-op threads) updated to the
   stronger closure: TLS is now completion-backed on the TCP rail, no per-op
   threads. SYSTEM.md TLS paragraph rewritten; review memo's Odin-divergence note
@@ -144,9 +170,9 @@ tests:
 
 ## Does Not Include
 
-- HTTP/2 TLS ALPN end-to-end, mTLS, system root stores (DER-only stays) — Phase
-  127. This phase only guarantees ALPN bytes still flow (the `alpn_protocol()`
-  accessor already exists).
+- mTLS and system root stores (DER-only stays) — Phase 127. **Note:** HTTP/2-over-
+  TLS ALPN is *not* deferred — it already exists on main and must keep working
+  (it is in blast-radius proof, not Does-Not-Include).
 - Any simulator TLS change.
 - Any plain-TCP rail change.
 - A TLS connection pool.
@@ -199,16 +225,30 @@ threads. TLS-5 is the escape hatch. Recorded so it is a decision, not a surprise
    not per-TCP-op.
 8. **Write-during-read:** force rustls `wants_write` mid-`tls_read`; assert no
    `ResourceBusy`, op completes (guards Hard Constraint 6).
-9. **Cancellation / close-wins / tombstone parity** with the old lane.
+9. **Cancellation / close-wins / tombstone parity** with main's per-op model.
 10. **Bounded-overlap multi-connection** TLS (mirror the `tcp_echo` proof):
     listener stays up across sequential + overlapping clients, closes clean.
-11. **Guard test:** `std::net::Tcp*` and `thread::spawn` absent from
-    `driver/tls.rs` after TLS-4; a thread-count assertion shows no TLS worker.
+11. **Adversarial security tests (guards Hard Constraint 9 — the scariest
+    regression):** wrong-CA / expired cert → handshake **rejected**; wrong SNI →
+    rejected; truncated handshake → rejected. These are `direct proof` that a
+    handshake never succeeds when it must fail. (Main has no such test today —
+    `local_system.rs:2698` only checks a generic handshake failure.)
+12. **Guard test (scoped correctly):** `std::net::Tcp*` and `thread::spawn` absent
+    from the **whole TLS path** (not just `driver/tls.rs` — a pump helper in
+    another module would evade a single-file grep), **plus** a runtime assertion
+    that no `tina-tls-*`-named thread is ever created (the per-op threads are
+    named, so this is a precise live check), **plus** the TLS capability reports
+    completion-backed.
 
 ## How We Prove We Did Not Break Old Intent (blast-radius proof)
 
-- Native HTTPS server+client, HTTP/2-over-TLS ALPN, and keepalive-over-HTTPS
-  tests pass on the new path.
+- Native HTTPS server+client and keepalive-over-HTTPS tests pass on the new path.
+- **HTTP/2-over-TLS ALPN still negotiates `h2` and still produces
+  `Http2ClientOutcome::TlsAlpnMismatch` on mismatch** (`tina-http/src/lib.rs:88-90`,
+  `AlpnProtocols::h2()`) — this is a *live* consumer, so it is blast radius, not a
+  future inheritance.
+- **Existing configs that set `tls_lane_capacity` still compile and bound work**
+  under its new "pending TLS ops" meaning.
 - TLS cancellation/timeout/close-wins outcomes + trace facts match (re-run the
   TLS ResourceRail DST).
 - The simulator TLS suite is unchanged and green (proves the live change did not
@@ -229,5 +269,5 @@ not this one, "removes the old model entirely."
 
 ## IDD Next Step
 
-Plan v2 + Plan Review 1 are done. Next: `Implementation Review 1` after TLS-1
+Plan v4 + Plan Reviews 1–3 are done. Next: `Implementation Review 1` after TLS-1
 lands, then proceed through TLS-2..4. Begin coding only on go.

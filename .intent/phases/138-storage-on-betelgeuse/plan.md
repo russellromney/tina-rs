@@ -2,8 +2,9 @@
 
 ## Status
 
-- Planned (2026-05-24). Implementation plan; auditing is done (this Status +
-  Starting Facts capture it).
+- Planned v2 (2026-05-24): folds in `Plan Review 1` (the real pwrite→fsync
+  ordering proof, CommitUncertain injection points, off-shard fallback decision,
+  guard scoped to supported ops, verified Inline/Worker split).
 - **Verified against `origin/main` a6cbaa9:** `storage.rs` has zero Betelgeuse
   refs, `StorageLane` is still `Inline | Worker(std::fs thread)`, and Betelgeuse
   exposes `open/pread/pwrite/fsync/mkdir/size` on both platforms (`io/darwin.rs`,
@@ -33,9 +34,11 @@
   is **not** a correctness bug.
 - Betelgeuse has **no** `rename`, `unlink`/`remove`, `readdir`, or `statx`/
   metadata op. Those storage jobs cannot ride Betelgeuse as-is.
-- `StorageLane::Inline` (synchronous std::fs) is used by the **explicit-step
-  runtime — the deterministic oracle**. `StorageLane::Worker` (thread) is the
-  **live `ThreadedRuntime`** path. This phase changes the live path only.
+- `StorageLane::Inline` (synchronous std::fs) is built **only** by the
+  explicit/default driver (`driver/mod.rs:250` `StorageLane::inline()`) — the
+  deterministic oracle. `StorageLane::Worker` (thread) is built by the threaded
+  driver (`driver/mod.rs:275` `StorageLane::new(cap)`) — the live `ThreadedRuntime`.
+  Inline is never a live config. This phase changes the live (Worker) path only.
 - Durability semantics in place: append-before-apply, snapshot
   `last_journal_index`, journal `record_index`, truncated-tail, checksum,
   `CallError::CommitUncertain` when rename succeeds but final durability is
@@ -65,16 +68,24 @@ byte-for-byte the same
    only — exactly mirroring the TLS split.
 3. **Recovery semantics are preserved exactly.** append-before-apply, torn-tail,
    checksum, duplicate/out-of-order index, and `CommitUncertain` produce the same
-   typed outcomes and trace facts as today. Ordering is enforced by **waiting for
-   the fsync completion before applying state** — the continuation message arrives
-   only after the Betelgeuse fsync completes.
+   typed outcomes and trace facts as today. Two distinct ordering rules, both
+   load-bearing on a completion substrate (std::fs got the first for free):
+   - **`pwrite` must complete before `fsync` is submitted.** Submitting fsync
+     before the pwrite completion is harvested can fsync stale/partial data. This
+     is the real hazard io_uring introduces and a happy-path test will not catch.
+   - **`fsync` must complete before state is applied** — the continuation message
+     arrives only after the Betelgeuse fsync completes.
 4. **Bounded admission stays visible.** `StorageFull` / `StorageClosed` semantics
    survive; "storage lane capacity = total accepted pending work" still holds,
    now as pending Betelgeuse file ops rather than channel slots.
 5. **Metadata ops that Betelgeuse lacks** (`rename`, `remove`, `readdir`,
-   `metadata`) keep a thin fallback. Mechanism is an explicit decision (see Open
-   Decisions): a tiny bounded syscall path vs inline-on-shard for these rare/fast
-   ops. Parent-dir sync is `fsync` on the directory fd → rides Betelgeuse.
+   `metadata`) keep a thin fallback **off the shard thread** — a tiny bounded
+   worker. **Decided: not inline-on-shard.** `rename` (and the snapshot-commit
+   rename + parent fsync) can block, and blocking the shard thread is the one
+   thing thread-per-core forbids — running it inline "because it's rare" trades a
+   clean off-shard path for an on-shard stall, which is the exact footgun this
+   workstream removes. Parent-dir sync is `fsync` on the directory fd → rides
+   Betelgeuse.
 
 ## Includes
 
@@ -107,17 +118,24 @@ byte-for-byte the same
 
 - Journal append + replay round-trip on the live runtime, asserting bytes,
   `record_index`, and **no storage worker thread spawned**.
-- Append-before-apply ordering: state mutates only after the Betelgeuse fsync
-  completion (assert the continuation ordering, not just the final value).
-- `CommitUncertain` reproduced when the final durability step cannot be proven.
+- **Ordering under reordered completions (the real proof, not happy-path).** Use
+  the Betelgeuse simulated backend with delayed/reordered completions to assert
+  (a) `fsync` is never submitted before its `pwrite` completion is harvested, and
+  (b) `apply` never observes state whose `pwrite`+`fsync` have not both completed
+  in order. A happy-path round-trip is only `surrogate proof` here.
+- `CommitUncertain` reproduced **via named injection points**: Betelgeuse
+  simulated fsync-failure for the fsync leg, and a fault hook on the fallback
+  `rename` for the rename leg — assert `CommitUncertain` arises from each.
 - Torn-tail / corrupt-checksum / duplicate-index recovery produce the same typed
   outcomes as the std::fs path.
 - `StorageFull` / `StorageClosed` still fire under bounded pressure; canceled
   queued work does not start.
 - Capability report shows completion-backed for supported ops and names the
-  fallback ops.
-- Guard: no `thread::spawn` for the storage durability path after deletion; a
-  thread-count assertion shows no storage worker.
+  fallback-worker ops.
+- Guard: no `thread::spawn` for the **Betelgeuse-supported** durability ops
+  (pwrite/pread/fsync/mkdir/size). The thin metadata fallback worker is the *one*
+  permitted storage thread — the guard asserts the supported ops do not spawn,
+  not "zero storage threads" (the fallback is off-shard by design, Constraint 5).
 
 ## How We Prove We Did Not Break Old Intent (blast-radius proof)
 
@@ -129,13 +147,12 @@ byte-for-byte the same
 
 ## Open Decisions
 
-- **Fallback mechanism for rename/remove/readdir/metadata.** Tiny bounded syscall
-  worker (one rare-ops thread) vs inline-on-shard (accept a brief block for rare,
-  fast metadata syscalls). Lean inline for `metadata`/`readdir`/`remove`; the
-  `rename` leg of snapshot commit is rare (commit-time only) and also a candidate
-  for inline. Decide in `Plan Review 1` / `Implementation Review 1`.
+- **Fallback mechanism — DECIDED (Plan Review 1):** a tiny bounded **off-shard**
+  worker for `rename`/`remove`/`readdir`/`metadata` (and the rename leg of
+  snapshot commit). Not inline-on-shard — see Hard Constraint 5. The guard is
+  scoped to the Betelgeuse-supported ops accordingly.
 - **Whether to upstream `renameat`/`unlinkat` into Betelgeuse later** to remove
-  the fallback entirely — defer; only if the fallback proves costly.
+  the fallback worker entirely — defer; only if the fallback proves costly.
 
 ## Pointer: removal of the broader old model
 
@@ -149,6 +166,7 @@ removal is 140.
 
 ## IDD Next Step
 
-Plan only (Session A). Next: `Plan Review 1` in
-`.intent/phases/138-storage-on-betelgeuse/review.md` (resolve the fallback
-mechanism) before any code.
+Plan v2 (Session A): Plan Review 1 folded in (fallback decided off-shard,
+ordering proof sharpened, CommitUncertain injection named). Next:
+`Implementation Review 1` after the first journal-append-on-Betelgeuse increment.
+Begin coding only on go.

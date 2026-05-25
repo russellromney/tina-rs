@@ -2,10 +2,18 @@
 
 ## Status
 
-- Planned (2026-05-24), v2 after deep-dive against `origin/main` (`a6cbaa9`).
-  **The v1 premise ("no CPU affinity anywhere") was wrong** — it was written
-  against a stale branch. Main already ships the affinity *vocabulary,
-  config, and reporting*; what is missing is the syscall that actually pins.
+- Planned v3 (2026-05-24): v2 corrected the premise against `origin/main`
+  (`a6cbaa9`); v3 folds in `Plan Review 1` (decides the `configured_core`
+  meaning, names the real blast radius, specifies the readback mechanism).
+- **v1's premise ("no CPU affinity anywhere") was wrong.** Main already ships the
+  affinity *vocabulary, config, and reporting*; what is missing is the syscall
+  that actually pins.
+- **Decided (was the open question):** `configured_core = Some(n)` now **means
+  "pin to core n if the platform can."** It produces `Applied` (Linux pin
+  succeeded), `Unsupported` (no hard pin on this platform), or `Failed(reason)`.
+  `AffinityStatus::AdvisoryOnly` is **no longer a value `configured_core`
+  produces** — it is retired unless a future explicit intent-only mode is added,
+  and none has been requested.
 - This phase finishes that layer: make a requested core produce a real OS pin
   on Linux, reported as `AffinityStatus::Applied`, instead of only advisory
   intent.
@@ -55,8 +63,11 @@ request reports Unsupported instead of pretending; helper lanes stay unpinned
   - **macOS / any platform without a hard pin:** set
     `AffinityStatus::Unsupported`. **No best-effort hint path.** Darwin offers
     only affinity *hints*; we do not dress a hint up as a pin.
-- `observed_core` populated from a real read-back of the running thread's core
-  where the platform supports it (this is the proof hook).
+- `observed_core` populated from a real read-back **inside the worker thread**,
+  after the pin, via `sched_getcpu()` (the running core) — pin to a *single-core*
+  mask so `getcpu()` deterministically returns `n`. (`sched_getaffinity` returns
+  the mask, not the running core; use `getcpu` so the test is not flaky on a
+  multi-core CI box.)
 - **Helper-lane threads stay unpinned** (DNS, storage, process, unix, and TLS
   workers until Phase 136 retires them). They float onto spare cores. Stated
   rule, not an accident.
@@ -69,7 +80,7 @@ request reports Unsupported instead of pretending; helper lanes stay unpinned
   `PinPolicy` enum (the v1 plan's mistake). The knob already exists per shard.
 - **Use the existing `AffinityStatus` variants.** `Applied` / `Unsupported` /
   `Failed` were added for exactly this; this phase makes them reachable.
-  `AdvisoryOnly` stays for callers who want intent-only reporting without a pin.
+  `AdvisoryOnly` is retired as a `configured_core` outcome (see Decided, above).
 - **Use the existing `LiveShardReport` fields** (`configured_core`,
   `observed_core`, `affinity_status`). No new report surface.
 
@@ -96,24 +107,36 @@ request reports Unsupported instead of pretending; helper lanes stay unpinned
 - **Out-of-range core** fails loudly at setup with a typed error.
 - **`Failed(reason)`** path: a forced-failure pin reports `Failed` and the shard
   keeps running unpinned (pinning is best-effort-correctness, not fatal).
+- **Container/quota behavior — honest proof terms:** `surrogate proof` =
+  unit-test the error-mapping for an out-of-range / unavailable core →
+  `Failed`/typed setup error. `missing proof` = a real cgroup-restricted env
+  (hard in CI). Do not let "degrades cleanly under quotas" read as direct proof.
 
 ## How We Prove We Did Not Break Old Intent (blast-radius proof)
 
 - Existing threaded-runtime / multi-shard suites pass with `configured_core`
-  unset (default), confirming zero behavior change when unused.
-- Existing `AffinityStatus::AdvisoryOnly` reporting still works for callers that
-  set a core but do not want a hard pin (if that distinction is kept) — or the
-  advisory path is explicitly migrated and that migration is proven.
+  unset (default `NotRequested`), confirming zero behavior change when unused.
+- **Named blast radius (the meaning change has teeth):** these sites assert the
+  *old* outcome and must be migrated, with the migration itself proving the
+  intent changed on purpose:
+  - `tina-runtime/tests/local_system.rs:1908,1935,1936` —
+    `assert_eq!(shard.affinity_status(), &AffinityStatus::AdvisoryOnly)` → become
+    `Applied` on a Linux box with a pinnable core, `Unsupported` otherwise.
+    Tests must branch on platform/CI capability, not hard-code `AdvisoryOnly`.
+  - `tina-runtime/tests/blue_whale_checklist.rs:26` — evidence string
+    "AffinityStatus reports NotRequested or AdvisoryOnly; **no OS pinning claim
+    yet**" is a checked invariant asserting the opposite of this phase. Rewrite it
+    to the new claim; that rewrite is proof the non-claim was lifted deliberately.
+  - `tina-runtime/src/local_system.rs:853` doc ("reports `AdvisoryOnly` when set")
+    updated to the new outcomes.
 - A pinned run passes the same multi-shard service e2e as an unpinned run
   (pinning changes scheduling, not semantics).
 
 ## Risks / Open Decisions
 
-- **`AdvisoryOnly` vs `Applied` semantics.** Decide whether `configured_core`
-  now *always* attempts a hard pin (→ `Applied`/`Unsupported`/`Failed`), or
-  whether a separate opt-in distinguishes "advisory intent" from "please pin."
-  Lean: `configured_core` means "pin if you can," and `AdvisoryOnly` is retired
-  or kept only for an explicit intent-only mode. Resolve in `Plan Review 1`.
+- **`AdvisoryOnly` vs `Applied` — DECIDED** (see Status): `configured_core` means
+  "pin if you can"; `AdvisoryOnly` retired as a `configured_core` outcome. No
+  longer open.
 - **macOS is decided: `Unsupported`.** No hint path. Settled.
 - **Crate vs raw syscall (open).** `core_affinity` (real-pin platforms only) vs
   a thin `sched_setaffinity` wrapper. Decide in implementation.
@@ -123,6 +146,6 @@ request reports Unsupported instead of pretending; helper lanes stay unpinned
 
 ## IDD Next Step
 
-Plan v2 (Session A), corrected against main. Next: `Plan Review 1` in
-`.intent/phases/137-optional-shard-pinning/review.md` (resolve the
-`AdvisoryOnly`-vs-`Applied` semantics and crate-vs-syscall) before any code.
+Plan v3 (Session A): Plan Review 1 folded in (semantics decided, blast radius
+named, readback specified). Remaining open: crate-vs-syscall, resolved at
+`Implementation Review 1`. Begin coding only on go.

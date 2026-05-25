@@ -142,3 +142,67 @@ every Starting Fact on main. One premise was wrong:
   plan v3.
 
 Everything else in Plan Review 1 stands.
+
+## Plan Review 3 — hostile, IDD completeness/intent/testing pass (2026-05-24)
+
+v3 is strong on architecture. Four gaps against the IDD bar (intent =
+"what will not change," and "how could this break while tests pass?").
+
+### Finding 1 (blocking) — no proof for the scariest TLS failure: a handshake that succeeds when it must fail
+
+The proof list has interop + ALPN but **no adversarial negative test**. Checked
+main: there is essentially none today either (`local_system.rs:2698` only checks a
+generic `failed:TlsHandshake`/`Timeout`). A sans-I/O rewrite can silently weaken
+verification (forgotten verifier, `process_new_packets` error treated as success).
+That is the #1 thing this rewrite can break, and nothing guards it.
+**Required plan change:** add to "what will not change" a **security-posture
+invariant** (cert verification, SNI/name check, DER-only root policy, no
+downgrade) with adversarial tests: wrong-CA / expired cert → handshake rejected;
+wrong SNI → rejected; truncated handshake → rejected. These are `direct proof` of
+the invariant, not blast radius.
+
+### Finding 2 — ALPN-over-TLS is already live; the sequencing/Does-Not-Include framing understates blast radius
+
+The plan says it "lands before HTTP/2 TLS ALPN (Phase 127), which inherit the
+substrate" and lists HTTP/2 TLS ALPN under Does Not Include. But ALPN over the TLS
+rail **already exists on main**: `tina-http/src/lib.rs:88-90` ("`Http2Target::Tls`
+dials the TLS rail with `h2` ALPN", `Http2ClientOutcome::TlsAlpnMismatch`),
+`AlpnProtocols::h2()`. So ALPN is a **live consumer this phase must not break**,
+not a future phase that inherits. **Required plan change:** move "HTTP/2-over-TLS
+ALPN negotiation + `TlsAlpnMismatch` still fire" into blast-radius proof; reword
+the sequencing note (127 is not a prerequisite for ALPN existing).
+
+### Finding 3 — `tls_lane_capacity` removal is an unowned public-config change
+
+"removed or repurposed (decide at TLS-4)" defers a **public config** decision
+(`HttpsListenerConfig`, LocalSystem config) past implementation. IDD says escalate
+public-API changes. **Required plan change:** decide now — keep the name as the
+per-stream pending cap (least churn) or deprecate with a migration note — and add
+a blast-radius check that existing configs setting `tls_lane_capacity` still
+compile/behave.
+
+### Finding 4 — the no-thread guard is grep-scoped too narrowly, and the close-wins parity cites stale lines
+
+- Guard 11 greps `driver/tls.rs` for `thread::spawn`. A pump helper in another
+  module (e.g. a new `driver/tls_pump.rs` or `driver/mod.rs`) would evade it.
+  **Required:** scope the guard to the whole TLS path, and pair it with a runtime
+  assertion that no `tina-tls-*` thread name is ever created (the per-op threads
+  are named, so this is a precise live check).
+- The close-wins/tombstone parity cites `tls.rs:82-85`, a **stale-branch** line
+  range for the old single-worker `cancelled_by_close`. Main's per-op-thread model
+  has different cancellation code (per-op `cancelled` AtomicBool + reaper).
+  **Required:** re-anchor the parity target to main's current per-op cancellation
+  semantics and fix the citation.
+
+### Finding 5 — what is the oracle for TLS?
+
+The plan says "simulator TLS unchanged, live path only." Confirm in Starting Facts
+whether TLS exists on the explicit-step runtime at all, or whether its only
+determinism story is sim-scripted TLS. If sim-scripted is the only oracle, say so
+plainly so the DST claim is not read as more than it is.
+
+### Keep
+
+Hard Constraints 1–8, the four-subtle-semantics section, the per-op-thread-churn
+motivation, and the staged cutover are all good and stay.
+

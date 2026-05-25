@@ -2,7 +2,14 @@
 
 ## Status
 
-- Planned (2026-05-24). Half honesty-doc edit, half loom/shuttle expansion.
+- Planned v2 (2026-05-24): folds in `Plan Review 1`, which found this phase's own
+  enumerated surface was unverified and partly wrong. v2 makes "verify the surface
+  first" Step 1, and the coverage half collapses accordingly (see below).
+- **Honest correction:** the cross-shard transport is `std::sync::mpsc`
+  (vendored stdlib, not ours to loom); there are no "runtime task-list /
+  effect-batching atomics" as a shared structure; the real custom lock-free
+  surface is likely just the already-loomed SPSC mailbox, with `shared_scope.rs`
+  as the one genuine open question.
 - **Verified against `origin/main` a6cbaa9:** live multi-shard `trace()` merges +
   sorts by event id (`threaded_multi_shard.rs:570-580`), "events across shards
   interleave freely" comment still at `:106`, loom still only on
@@ -28,13 +35,25 @@
 - What the live parallel path does **not** give: byte-reproducible replay of the
   physical interleaving — "events across shards interleave freely"
   (`threaded_multi_shard.rs:104-106`). That is physics, not a defect.
-- The physical-race surface is **small and enumerable**: the SPSC mailbox, the
-  cross-shard shard-pair queue, runtime task-list / effect-batching atomics, and
-  the vendored Betelgeuse internals.
-- loom covers `tina-mailbox-spsc` **only** today. Runtime internals are not
-  loom-covered. `ROADMAP.md` already lists "loom expansion beyond mailbox" and a
-  possible `shuttle`/model-check backend as future work — this phase promotes the
-  honest-doc + the first real expansion from someday to done.
+- The physical-race surface is **small** — but the v1 enumeration was wrong and
+  must be verified, not asserted (Step 1 of this phase). What main actually shows:
+  - **SPSC mailbox** — custom lock-free, **already loom-covered**.
+  - **Cross-shard transport = `std::sync::mpsc::SyncSender`/`Receiver`**
+    (`threaded_multi_shard.rs:59,67,213`) — standard library. Not ours to loom;
+    loom cannot meaningfully explore it.
+  - **No "task-list / effect-batching atomics" shared structure exists.** The
+    `AtomicU64`s on main (`wait_list`, `pool`, `deferred`, `admission`,
+    `call/groups`, `guarded_pending`, `local_permit`, `persistence`) are
+    shard-local id/capacity counters, not lock-free concurrency.
+  - **Global event ids are not a shared atomic** — merged by sort across shards.
+  - **`shared_scope.rs`** (`Arc<SharedScopeInner>` + `AtomicU64`/`AtomicUsize`) is
+    the **one open question**: SYSTEM.md calls `SharedCapacityScope` *shard-local*,
+    so its atomics are either removable shard-local defensiveness or a genuine
+    cross-thread loom candidate. The phase must determine which.
+- loom covers `tina-mailbox-spsc` **only** today. Given the above, "loom expansion
+  beyond mailbox" likely has **little real target** — the honest outcome may be
+  "SPSC is the only custom lock-free structure; everything else is stdlib or
+  shard-local." That is a result to confirm and write down, not a gap to fill.
 - `LiveReplayCapture` / `LiveReplayFact` (`tina-sim/src/dst/replay_case.rs`) is
   the bridge that carries a live anomaly (seed/config/history/declared facts) into
   the deterministic oracle.
@@ -66,6 +85,11 @@ logical and lives in the deterministic oracle.
   in handler / shard-sequential space); loom/shuttle = physical memory ordering on
   the enumerated surface; live parallel = real + introspectable + **not**
   byte-reproducible. Stop implying the sim catches data races.
+- **State the faithfulness claim conditioned on the verified surface.** "Sim is
+  faithful for logical interleavings *because* isolate code is shared-nothing and
+  each shard runs sequentially" holds only if no helper smuggles cross-thread
+  shared state — the `shared_scope` question is the live test of that. Write the
+  claim with that condition, or it is the same hand-wave this phase removes.
 - Update the over-claiming prose: the "replayable all the way down" language in
   README / the review memo / user-guide DST chapter gets the logical-vs-physical
   qualifier.
@@ -74,20 +98,30 @@ logical and lives in the deterministic oracle.
   The plan is not blocked on that call — write the section, place it per the
   decision.
 
-### Coverage (tests)
+### Coverage (tests) — collapses to verification + one decision
 
-- Extend loom to the **cross-shard shard-pair queue** and **runtime task-list /
-  effect-batching atomics**. Use `shuttle` (randomized) instead where the loom
-  state space explodes.
-- Add these to the `make verify` gate so the enumerated surface is actually
-  exercised, not just listed.
+- **Step 1 (do this first): verify the surface.** Grep the workspace for custom
+  lock-free code (`UnsafeCell`, `unsafe impl Send|Sync`, hand-rolled atomics used
+  as synchronization rather than counters). The expected result is: SPSC mailbox
+  (loomed) + stdlib channels + the `shared_scope` question.
+- **Resolve `shared_scope`:** confirm whether `SharedCapacityScope` is ever
+  touched from more than one thread. If shard-local (one shard thread), its
+  atomics are removable defensiveness — record that. If genuinely cross-thread,
+  add a loom (or `shuttle`, if the state space is large) model for it.
+- **Do not loom stdlib channels** (the cross-shard transport). Not ours to verify.
+- Wire whatever real new model results into `make verify`. If the honest finding
+  is "nothing new to loom," that conclusion is the deliverable — write it down.
 
-### Discipline (guard)
+### Discipline (guard) — defined precisely so it is implementable
 
-- A new shared atomic / lock-free structure / `unsafe impl Sync` outside the
-  enumerated set must arrive **with** a loom (or shuttle) model and be added to
-  the enumeration. Enforce with a CI check that flags new atomics / `UnsafeCell` /
-  `unsafe impl Send|Sync` outside the listed files for review.
+- A maintained **allowlist file** names the verified shared-memory structures and
+  their files (seeded from Step 1). A CI check fails when a **new** `UnsafeCell`,
+  `unsafe impl Send|Sync`, or atomic-used-as-synchronization appears in a file not
+  on the allowlist, forcing review + a model before it lands.
+- This is `surrogate proof`: it catches *additions* to the surface. It does not
+  prove the existing set race-free — that is what the per-structure loom models
+  do. Ordinary atomic counters are explicitly out of scope (allowlist the files
+  that legitimately hold them) so the guard is signal, not noise.
 
 ## Does Not Include
 
@@ -101,11 +135,13 @@ logical and lives in the deterministic oracle.
 
 ## How We Prove The New Behavior (direct proof)
 
-- New loom/shuttle tests for the shard-pair queue and task-list atomics pass and
-  are wired into `make verify`.
-- The concurrency-surface enumeration exists and matches the code (the CI guard
-  fails if a new atomic appears outside the listed set without an entry).
-- The over-claiming prose is corrected (doc diff).
+- Step 1 surface verification is recorded (the grep + its conclusion), and the
+  `shared_scope` question is resolved one way or the other (atomics removed as
+  shard-local, **or** a loom/shuttle model added).
+- The concurrency-surface enumeration exists and matches the code; the allowlist
+  CI guard fails if a new synchronization primitive appears off-list.
+- The over-claiming prose is corrected (doc diff), with the faithfulness claim
+  conditioned on the verified surface.
 
 ## How We Prove We Did Not Break Old Intent (blast-radius proof)
 
@@ -127,6 +163,7 @@ logical and lives in the deterministic oracle.
 
 ## IDD Next Step
 
-Plan only (Session A). Next: `Plan Review 1` in
-`.intent/phases/139-dst-race-surface-honesty/review.md` (resolve the SYSTEM.md
-decision and loom-vs-shuttle) before any code.
+Plan v2 (Session A): Plan Review 1 folded in (surface corrected, coverage
+collapsed to verify-first, guard defined as allowlist-diff). Remaining open:
+the SYSTEM.md keep/demote/drop decision (Open Decisions) and the `shared_scope`
+cross-thread question (Step 1). Begin only on go.
