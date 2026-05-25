@@ -2197,14 +2197,17 @@ fn local_system_capabilities_name_supported_and_unsupported_resource_families() 
     );
     assert_eq!(capabilities.signal.capacity(), Some(4));
     assert_eq!(capabilities.tls.support(), ResourceSupport::Supported);
+    // TLS rides the Betelgeuse TCP rail now (rustls sans-I/O on the shard), so
+    // it is completion-backed like TCP — not a blocking worker lane.
     assert_eq!(
         capabilities.tls.execution(),
-        ResourceExecutionShape::LaneBackedBlocking
+        ResourceExecutionShape::CompletionBacked
     );
     assert_eq!(
         capabilities.tls.cancellation(),
         CancellationSupport::TombstonedAfterStart
     );
+    // tls_lane_capacity stays the shard-total cap on in-flight TLS ops.
     assert_eq!(capabilities.tls.capacity(), Some(5));
 
     assert_eq!(
