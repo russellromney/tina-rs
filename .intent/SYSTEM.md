@@ -96,8 +96,11 @@ communicate through bounded command queues. Live cross-shard sends move
 isolate calls route typed reply/full/closed/timeout outcomes back to the
 requester shard. This is an execution path, not a second semantic model: the
 explicit-step runtime and simulator remain the oracle. Peer quarantine,
-cross-shard child ownership, shard restart propagation, hard OS thread
-pinning, and network remoting are not claimed.
+cross-shard child ownership, shard restart propagation, and network
+remoting are not claimed. Opt-in hard pinning of a shard worker to an OS
+CPU id is claimed on Linux (`sched_setaffinity` over the process's allowed
+affinity mask, reported `Applied`/`Unsupported`/`Failed`); other platforms
+report `Unsupported` and helper lanes stay unpinned.
 
 `LocalSystem` and `LocalMultiShardSystem` are the preferred local live app
 owners. They wrap the live substrate with a public bounded-shape config,

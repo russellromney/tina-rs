@@ -601,6 +601,10 @@ impl TlsWorkerLane {
         let spawn = thread::Builder::new()
             .name(format!("tina-tls-{call_id:?}"))
             .spawn(move || {
+                // This per-op worker is spawned from the shard worker thread,
+                // which may be pinned to one core. Float off that pin so a
+                // helper lane never fights a shard for its core.
+                crate::affinity::float_helper_thread();
                 let call_id = command.call_id();
                 let result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     execute_tls_command(command)
