@@ -44,6 +44,8 @@ use betelgeuse::IOLoopHandle;
 pub mod admission;
 mod affinity;
 pub mod bridge;
+pub mod budget;
+mod budget_adapters;
 mod call;
 mod call_group;
 mod capabilities;
@@ -169,6 +171,12 @@ pub use crate::durable_outbox::{
 };
 pub use crate::persistence::{
     LOCAL_PERSISTENCE_SUPPORT, LocalPersistenceSupport, PersistenceSupportLevel,
+};
+pub use budget::{
+    BUDGET_SCHEMA_VERSION, BudgetBuildError, BudgetCap, BudgetConsistencyReport,
+    BudgetConsistencyRow, BudgetKind, BudgetManifestReport, BudgetManifestRow, BudgetReplayExport,
+    BudgetSource, BudgetSurface, BudgetUnit, BudgetValidationError, ObservedBudget,
+    ReplayBudgetEntry, ReplayImpact, ServiceBudgetManifest,
 };
 #[allow(deprecated)]
 pub use call::{

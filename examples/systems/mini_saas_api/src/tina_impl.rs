@@ -42,10 +42,25 @@ use crate::{RunMode, RunReport, UserObservation, get, post, put};
 type PoolAddr = Address<WorkerPoolMsg<KeepaliveConnAddr>, WorkerPoolReply<KeepaliveConnAddr>>;
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
-const BODY_CAP_BYTES: usize = 32;
-const CONTROLLER_MAILBOX_CAPACITY: usize = 2;
+// Caps are declared once in `crate::budget`. Install sites read the
+// operative caps back from the validated manifest (`ServiceCaps`); the
+// in-isolate body check, display formatting, and the replay fact use
+// these two consts, which the manifest is built from and a test ties to
+// the manifest rows.
+use crate::budget::{BODY_CAP_BYTES, CONTROLLER_MAILBOX_CAPACITY};
 
 pub fn run(mode: RunMode) -> anyhow::Result<RunReport> {
+    // Validate the budget manifest before binding anything. A bad cap
+    // fails here with typed errors, not at first traffic. The operative
+    // install caps are then read back from the manifest object, so the
+    // listener/bridge/pool below are configured *from the manifest*.
+    let manifest = crate::budget::manifest();
+    manifest
+        .validate()
+        .map_err(|errors| anyhow::anyhow!("invalid budget manifest: {errors:?}"))?;
+    let caps = crate::budget::ServiceCaps::from_manifest(&manifest)
+        .map_err(|missing| anyhow::anyhow!("manifest missing install caps: {missing:?}"))?;
+
     let dir = tempfile::tempdir()?;
     let db_path = dir.path().join("mini-saas.sqlite");
     seed_db(&db_path)?;
@@ -63,14 +78,14 @@ pub fn run(mode: RunMode) -> anyhow::Result<RunReport> {
             .with_default_timeout(Duration::from_secs(2))
             .with_busy_timeout(Duration::from_millis(250))
             .with_poll_interval(Duration::from_millis(1))
-            .with_mailbox_capacity(2),
+            .with_mailbox_capacity(caps.sqlite_mailbox),
     )
     .map_err(|e| anyhow::anyhow!("install sqlite bridge: {e}"))?;
 
     let notify_service = runtime
-        .register_with_capacity::<_, Infallible>(NotifySink::default(), 8)
+        .register_with_capacity::<_, Infallible>(NotifySink::default(), caps.notify_mailbox)
         .map_err(|e| anyhow::anyhow!("register notify sink: {e:?}"))?;
-    let notify_listener_config = listener_config(1024);
+    let notify_listener_config = listener_config(caps.notify_body);
     let notify_listener = runtime
         .register_with_capacity::<_, Infallible>(
             HttpListener::<SingleShard, NotifyMsg>::with_config(
@@ -93,9 +108,9 @@ pub fn run(mode: RunMode) -> anyhow::Result<RunReport> {
         &runtime,
         HttpTarget::http_with_host(notify_addr, "notify.local"),
         HttpClientConfig::pressure(),
-        PoolConfig::new(1, 0),
-        8,
-        8,
+        PoolConfig::new(caps.outbound_pool, 0),
+        caps.outbound_connection_mailbox,
+        caps.outbound_pool_mailbox,
     )
     .map_err(|e| anyhow::anyhow!("build outbound keepalive pool: {e:?}"))?;
 
@@ -107,12 +122,16 @@ pub fn run(mode: RunMode) -> anyhow::Result<RunReport> {
                 sqlite.metrics.clone(),
                 outbound.pool,
                 public_body_metrics.clone(),
+                caps.body,
+                caps.controller_mailbox,
             ),
-            CONTROLLER_MAILBOX_CAPACITY,
+            caps.controller_mailbox,
         )
         .map_err(|e| anyhow::anyhow!("register controller: {e:?}"))?;
 
-    let main_listener_config = listener_config(BODY_CAP_BYTES);
+    let mut main_listener_config = listener_config(caps.body);
+    // Accept-queue depth is installed from the manifest too.
+    main_listener_config.listener_mailbox_capacity = caps.main_listener_mailbox;
     let main_listener = runtime
         .register_with_capacity::<_, Infallible>(
             HttpListener::<SingleShard, ControllerMsg>::with_config(
@@ -120,7 +139,9 @@ pub fn run(mode: RunMode) -> anyhow::Result<RunReport> {
                 controller,
                 main_listener_config,
             )
-            .with_metrics(public_body_metrics),
+            // Listener takes a clone so the shutdown budget report can
+            // still snapshot live body high-water/full from this handle.
+            .with_metrics(public_body_metrics.clone()),
             main_listener_config.listener_mailbox_capacity,
         )
         .map_err(|e| anyhow::anyhow!("register main listener: {e:?}"))?;
@@ -319,6 +340,22 @@ pub fn run(mode: RunMode) -> anyhow::Result<RunReport> {
     lifecycle_transitions.push(Lifecycle::Stopped);
     report.lifecycle_transitions = lifecycle_transitions;
     report.multi_turn_notify = report.notified_item && deferred_replies >= 3;
+
+    // Join the declared manifest with what the run actually observed:
+    // body high-water/full from BodyMetrics, db in-flight from the
+    // bridge report. Caps come from the manifest; live numbers come
+    // from the reports, never the other way around.
+    let live_budget = live_budget_pressure(
+        &public_body_metrics.snapshot(),
+        main_listener_config.limits.max_body_bytes,
+        &db_pressure,
+    );
+    let budget_report = manifest.report(&live_budget);
+    report.budget_report_line = budget_report.summary_line();
+    report.budget_replay_line = manifest.replay_export().summary_line();
+    report.budget_consistent = budget_report.consistency.is_consistent();
+    report.budget_report = Some(budget_report);
+
     report.terminal_line = format!(
         "terminal db.capacity={} db.closed={} outbound.drain={:?} outbound.stop_requested={} \
          outbound.stop_stopped={} outbound.stop_timed_out={} outbound.stop_rejected={} \
@@ -522,9 +559,19 @@ fn live_replay_fact(case: ReplayCase) -> anyhow::Result<String> {
     ));
     check_live_replay_case(&replay_case, capacity_fact)
         .map_err(|e| anyhow::anyhow!("live replay capture mismatch: {e}"))?;
+    // Pin the budget config the case depends on: the replay-affecting
+    // hash changes if the body cap (or any replay-affecting cap)
+    // changes, so a saved case never silently rides ambient defaults.
+    let replay = crate::budget::manifest().replay_export();
     Ok(format!(
-        "case={} ops=[{}:{}:{}bytes] fact=status_413 cap={}",
-        case.name, case.method, case.path, case.request_body_bytes, case.cap
+        "case={} ops=[{}:{}:{}bytes] fact=status_413 cap={} budget_schema={} budget_hash={:016x}",
+        case.name,
+        case.method,
+        case.path,
+        case.request_body_bytes,
+        case.cap,
+        replay.schema_version,
+        replay.replay_affecting_hash,
     ))
 }
 
@@ -680,6 +727,14 @@ struct Controller {
     db_metrics: SqliteMetricsHandle,
     outbound_pool: PoolAddr,
     body_metrics: BodyMetrics,
+    /// Public body cap, read from the budget manifest at startup. The
+    /// listener enforces the same cap; this is the handler-side check
+    /// for buffered bodies that reach the isolate.
+    body_cap: usize,
+    /// Mailbox cap the controller was registered with, read from the
+    /// manifest. Surfaced in `/debug/capacity` so the reported value
+    /// comes from the manifest object, not a separate const.
+    controller_mailbox: usize,
     next_id: i64,
     /// Public-ingress admission state. The controller drives `Open` →
     /// `Draining` on `CloseIngress`; per-request completion lives in the
@@ -696,12 +751,16 @@ impl Controller {
         db_metrics: SqliteMetricsHandle,
         outbound_pool: PoolAddr,
         body_metrics: BodyMetrics,
+        body_cap: usize,
+        controller_mailbox: usize,
     ) -> Self {
         Self {
             db,
             db_metrics,
             outbound_pool,
             body_metrics,
+            body_cap,
+            controller_mailbox,
             next_id: 1,
             drain: DrainState::new(),
             live_items: HashMap::new(),
@@ -898,7 +957,14 @@ impl Isolate for Controller {
                     req,
                     text(
                         StatusCode::OK,
-                        capacity_body(body, db, outbound, self.drain.stage()),
+                        capacity_body(
+                            body,
+                            db,
+                            outbound,
+                            self.drain.stage(),
+                            self.body_cap,
+                            self.controller_mailbox,
+                        ),
                     ),
                 )
             }
@@ -958,7 +1024,7 @@ impl Controller {
                 "streaming_body_unsupported\n",
             ));
         };
-        if body.len() > BODY_CAP_BYTES {
+        if body.len() > self.body_cap {
             return call.reply(text(StatusCode::PAYLOAD_TOO_LARGE, "body_full\n"));
         }
         let body = String::from_utf8_lossy(body);
@@ -1128,14 +1194,16 @@ fn capacity_body(
     db: SqlitePressureReport,
     outbound: PoolPressureReport,
     drain_stage: DrainStage,
+    body_cap: usize,
+    controller_mailbox: usize,
 ) -> String {
     let stage = drain_stage_label(drain_stage);
     format!(
-        "http.body_cap={BODY_CAP_BYTES} http.request_body_current={} \
+        "http.body_cap={body_cap} http.request_body_current={} \
          http.request_body_high_water={} http.response_body_current={} \
          http.response_body_high_water={} http.body_full={} http.body_timeout={} \
          http.body_io_error={} \
-         controller.mailbox={CONTROLLER_MAILBOX_CAPACITY} drain.stage={stage} \
+         controller.mailbox={controller_mailbox} drain.stage={stage} \
          db.capacity={} db.waiters={} db.max_waiters={} db.in_flight={} db.high_water={} \
          db.full={} db.closed={} db.timeout={} outbound.capacity={} outbound.waiters={} \
          outbound.max_waiters={} outbound.in_flight={} outbound.high_water_waiters={} \
@@ -1209,6 +1277,15 @@ fn text(status: StatusCode, body: impl Into<String>) -> HttpResponse {
 pub fn run_soak(config: crate::SoakConfig) -> anyhow::Result<crate::SoakReport> {
     use tina_proof_harness::load::{self, LoadRun, LoadStop, OpOutcome};
 
+    // Same manifest, same install caps as `run`: the soak service is
+    // configured from the manifest too.
+    let manifest = crate::budget::manifest();
+    manifest
+        .validate()
+        .map_err(|errors| anyhow::anyhow!("invalid budget manifest: {errors:?}"))?;
+    let caps = crate::budget::ServiceCaps::from_manifest(&manifest)
+        .map_err(|missing| anyhow::anyhow!("manifest missing install caps: {missing:?}"))?;
+
     let dir = tempfile::tempdir()?;
     let db_path = dir.path().join("mini-saas.sqlite");
     seed_db(&db_path)?;
@@ -1229,14 +1306,14 @@ pub fn run_soak(config: crate::SoakConfig) -> anyhow::Result<crate::SoakReport> 
             .with_default_timeout(Duration::from_secs(2))
             .with_busy_timeout(Duration::from_millis(250))
             .with_poll_interval(Duration::from_millis(1))
-            .with_mailbox_capacity(2),
+            .with_mailbox_capacity(caps.sqlite_mailbox),
     )
     .map_err(|e| anyhow::anyhow!("install sqlite bridge: {e}"))?;
 
     let notify_service = runtime
-        .register_with_capacity::<_, Infallible>(NotifySink::default(), 8)
+        .register_with_capacity::<_, Infallible>(NotifySink::default(), caps.notify_mailbox)
         .map_err(|e| anyhow::anyhow!("register notify sink: {e:?}"))?;
-    let notify_listener_config = listener_config(1024);
+    let notify_listener_config = listener_config(caps.notify_body);
     let notify_listener = runtime
         .register_with_capacity::<_, Infallible>(
             HttpListener::<SingleShard, NotifyMsg>::with_config(
@@ -1259,9 +1336,9 @@ pub fn run_soak(config: crate::SoakConfig) -> anyhow::Result<crate::SoakReport> 
         &runtime,
         HttpTarget::http_with_host(notify_addr, "notify.local"),
         HttpClientConfig::pressure(),
-        PoolConfig::new(1, 0),
-        8,
-        8,
+        PoolConfig::new(caps.outbound_pool, 0),
+        caps.outbound_connection_mailbox,
+        caps.outbound_pool_mailbox,
     )
     .map_err(|e| anyhow::anyhow!("build outbound keepalive pool: {e:?}"))?;
 
@@ -1273,12 +1350,16 @@ pub fn run_soak(config: crate::SoakConfig) -> anyhow::Result<crate::SoakReport> 
                 sqlite.metrics.clone(),
                 outbound.pool,
                 public_body_metrics.clone(),
+                caps.body,
+                caps.controller_mailbox,
             ),
-            CONTROLLER_MAILBOX_CAPACITY,
+            caps.controller_mailbox,
         )
         .map_err(|e| anyhow::anyhow!("register controller: {e:?}"))?;
 
-    let main_listener_config = listener_config(BODY_CAP_BYTES);
+    let mut main_listener_config = listener_config(caps.body);
+    // Accept-queue depth is installed from the manifest too.
+    main_listener_config.listener_mailbox_capacity = caps.main_listener_mailbox;
     let main_listener = runtime
         .register_with_capacity::<_, Infallible>(
             HttpListener::<SingleShard, ControllerMsg>::with_config(
@@ -1505,6 +1586,89 @@ fn build_pressure_snapshot(db: &SqlitePressureReport) -> tina_runtime::ServicePr
             db.full_count,
         ),
     );
+    report
+}
+
+/// Live pressure report named to match the budget manifest exactly.
+///
+/// What the resulting consistency check proves, precisely:
+/// - **Cap agreement** for the surfaces the runtime actually samples —
+///   `http.request_body` and `db.in_flight` — because those are
+///   `Measured` with real numbers from runtime reports.
+/// - **Presence + no-extra** for every declared surface: each appears
+///   here (measured or explicit `Unavailable`), so a missing or
+///   undeclared surface fails the check.
+///
+/// It does *not* re-derive the caps of the `Unavailable` surfaces — the
+/// runtime does not sample per-isolate mailbox depth, and the outbound
+/// pool is sampled live via `/debug/capacity` rather than re-called from
+/// the host during teardown. For those surfaces the manifest is the
+/// *install* source (caps flow manifest -> `ServiceCaps` -> the
+/// `register_*` / config calls), which is a code-level guarantee, not a
+/// runtime-observed one. Nothing is silently dropped.
+///
+/// `body_cap` is the cap the listener was *actually* installed with
+/// (read from the live config object, not a const), so the body-cap
+/// consistency check would catch a listener configured off-manifest.
+fn live_budget_pressure(
+    body: &BodyPressureReport,
+    body_cap: usize,
+    db: &SqlitePressureReport,
+) -> tina_runtime::ServicePressureReport {
+    use tina_runtime::ServicePressureReport;
+
+    let mut report = ServicePressureReport::new("mini_saas_api");
+    report.add_measured(
+        "body",
+        CapacitySurfaceReport::weighted(
+            "http.request_body",
+            CapacityMode::Fixed,
+            body_cap,
+            body.request_body_current,
+            body.request_body_high_water,
+            body.body_full_count,
+            "bytes",
+        ),
+    );
+    report.add_measured(
+        "bridge",
+        CapacitySurfaceReport::count(
+            "db.in_flight",
+            CapacityMode::Fixed,
+            db.capacity,
+            db.leased,
+            db.high_water as usize,
+            db.full_count,
+        ),
+    );
+    for (name, reason) in [
+        (
+            "controller.mailbox",
+            "mailbox depth not individually sampled",
+        ),
+        ("db.mailbox", "mailbox depth not individually sampled"),
+        ("notify.mailbox", "mailbox depth not individually sampled"),
+        (
+            "notify.request_body",
+            "internal notify listener body not sampled from this scope",
+        ),
+        ("outbound.pool", "sampled live via /debug/capacity"),
+        ("outbound.in_flight", "sampled live via /debug/capacity"),
+        (
+            "outbound.connection.mailbox",
+            "mailbox depth not individually sampled",
+        ),
+        (
+            "outbound.pool.mailbox",
+            "mailbox depth not individually sampled",
+        ),
+        (
+            "http.main_listener.mailbox",
+            "accept-queue depth not sampled from this scope",
+        ),
+    ] {
+        report.add_unavailable(name, "mailbox", reason);
+    }
     report
 }
 

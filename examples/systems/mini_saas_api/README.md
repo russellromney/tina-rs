@@ -32,13 +32,56 @@ outbound connection leases. No domain state is hidden behind
 
 ## Capacity
 
-| Surface | Cap |
-| --- | --- |
-| HTTP body bytes | `32` for the public API listener |
-| controller mailbox | `2` |
-| SQLite bridge mailbox | `2` |
-| SQLite pool shape | one in-flight connection, no waiters |
-| outbound keepalive pool | one connection, zero waiters |
+Every cap is declared once in `src/budget.rs` as a `ServiceBudgetManifest`.
+`run()` validates that manifest, then reads the operative caps back from it
+(`ServiceCaps::from_manifest`) and configures the listener, SQLite bridge,
+keepalive pool, and isolate mailboxes from those values — the manifest, not a
+scattered literal, is what installs the service.
+
+| Surface (manifest name) | Cap | Replay |
+| --- | --- | --- |
+| `http.request_body` | `32` bytes, public API listener | replay-affecting |
+| `notify.request_body` | `1024` bytes, internal notify service | replay-affecting |
+| `controller.mailbox` | `2` | replay-affecting |
+| `db.mailbox` | `2` | replay-affecting |
+| `db.in_flight` | `1` (serial worker) | replay-affecting |
+| `notify.mailbox` | `8` | replay-affecting |
+| `outbound.pool` / `outbound.in_flight` | `1` connection, zero waiters | replay-affecting |
+| `outbound.connection.mailbox` / `outbound.pool.mailbox` | `8` | replay-affecting |
+| `http.main_listener.mailbox` | `4` (accept-queue depth) | display-only |
+
+`run()` calls `manifest.validate()` before binding any socket: a zero
+cap, an unbounded escape under production policy, a duplicate name, or a
+secret-looking value fails there with a typed error, not at first
+traffic. At shutdown the host joins the manifest with the live pressure
+report (`manifest.report(&pressure)`); `RunReport::budget_report` carries
+configured cap + observed `cur`/`high`/`full` per surface, and
+`budget_consistent` proves every live surface had a manifest row. The
+`tests/budget.rs` suite pins that the documented caps above are exactly
+the manifest rows.
+
+What the manifest covers and what it doesn't, honestly:
+
+- **Installed from the manifest:** the public body cap (enforced at the
+  parser and re-checked in the handler), the accept mailbox, the SQLite
+  bridge mailbox, the notify mailbox/body, and the outbound pool +
+  mailboxes — all read back via `ServiceCaps::from_manifest`.
+- **Measured live in the shutdown join:** `http.request_body` and
+  `db.in_flight` carry real numbers from runtime reports; the body-cap
+  fact comes from the actual listener config, not a const, so a listener
+  configured off-manifest would fail the consistency check.
+- **Declared but `Unavailable` in that join:** per-isolate mailbox depths
+  (the runtime does not sample them) and the outbound pool (observable
+  live via `/debug/capacity`, which calls the pool from inside the
+  runtime; the host avoids re-calling it during teardown). These are
+  explicit `Unavailable`, never silently dropped. `db.in_flight` is `1`
+  because the serial bridge pins `max_in_flight == 1`; the row documents
+  that pinned value.
+- **Deliberately not a row:** the HTTP per-connection mailbox is a
+  `tina-http` preset internal (`HttpServerConfig`); a service that wants
+  it in the manifest can pull it in with `HttpServerConfig::budget_surfaces`.
+  Deadlines (`service_call_timeout`, request timeouts) are not surfaced —
+  the unit vocabulary is count and weight, not time.
 
 `GET /debug/capacity` returns a small key=value line with real HTTP body
 current/high-water/full/timeout/io counters, controller mailbox cap, the

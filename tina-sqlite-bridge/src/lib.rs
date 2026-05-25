@@ -140,6 +140,7 @@
 //! calls are outside `tina-sim`'s observation; replay parity is
 //! best-effort at the bridge boundary only.
 
+mod budget;
 mod helpers;
 mod metrics;
 mod types;
