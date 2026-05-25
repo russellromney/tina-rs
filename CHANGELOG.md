@@ -4,6 +4,22 @@ This file records completed work.
 
 ## Unreleased
 
+### Hard Shard Pinning
+
+- Made `configured_core` a real OS pin instead of advisory intent: on Linux a
+  shard worker pins itself with `sched_setaffinity` over the process's allowed
+  affinity mask and reports `AffinityStatus::Applied` with the observed core,
+  read back inside the worker via `sched_getcpu`. `configured_core` is an OS CPU
+  id checked against the allowed mask, not an index into `0..num_cpus`.
+- A requested core outside the allowed mask reports `AffinityStatus::Failed`
+  with a reason and the worker keeps running unpinned — never a silent mis-pin.
+  Platforms without a hard pin (macOS and others) report
+  `AffinityStatus::Unsupported`; default `None` stays `NotRequested` and makes
+  no affinity call. Helper-lane threads are never pinned.
+- Retired `AffinityStatus::AdvisoryOnly` as an outcome `configured_core` can
+  produce; the variant is kept only as a reserved slot for a possible future
+  intent-only knob.
+
 ### Copied Service Ergonomics And Workflow Helpers
 
 - Added the Phase 120 copied-service path: canonical system specimens for a
@@ -3064,12 +3080,12 @@ API additions:
 
 - Added `AffinityStatus` and shard/core ownership reporting to live topology:
   `LiveShardReport` now exposes worker name, worker thread id, configured
-  core, optional observed core, and affinity status. The current portable
-  backend reports configured cores as `AdvisoryOnly`; it does not claim hard
-  OS pinning.
+  core, optional observed core, and affinity status. (This first shipped as
+  advisory reporting only; hard pinning landed later — see Hard Shard Pinning
+  above.)
 - Added `configured_core` to `LocalSystemConfig` and
-  `ThreadedRuntimeConfig`. Multi-shard local systems treat it as the first
-  core in stable shard order and report contiguous advisory core ownership.
+  `ThreadedRuntimeConfig`. Multi-shard local systems treat it as the core for
+  the first shard in stable order, with later shards on contiguous OS CPU ids.
 - Added `PreallocationConfig` for setup-time runtime-owned metadata reserves:
   isolate entries, child records, supervisors, trace events, in-flight calls,
   translators, isolate-call metadata, driver-completion scratch, and per-step

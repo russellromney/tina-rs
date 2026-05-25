@@ -61,6 +61,51 @@ Tina owns:
 
 The backend owns platform mechanics.
 
+## Shard Worker Pinning (opt-in)
+
+By default a shard worker thread floats across cores at the OS scheduler's
+whim. `configured_core` pins it to one OS CPU id, where the platform can:
+
+```rust
+use tina_runtime::{AffinityStatus, LocalSystem};
+
+// Pin shard 0's worker to OS CPU id 2. In a multi-shard system the next
+// shard gets CPU 3, and so on (core + ordinal).
+let app = LocalSystem::single_shard(MyShard(0), MyMailboxFactory)
+    .configured_core(2)
+    .build();
+
+let topology = app.topology();
+let shard = topology.shard(ShardId::new(0)).unwrap();
+match shard.affinity_status() {
+    // Linux: a real sched_setaffinity pin, proven by reading the core back.
+    AffinityStatus::Applied => assert_eq!(shard.observed_core(), Some(2)),
+    // macOS and other platforms have no hard pin; the worker runs unpinned.
+    AffinityStatus::Unsupported => {}
+    // CPU 2 was not in the process's allowed affinity mask (e.g. a cgroup or
+    // cpuset). The worker runs unpinned rather than mis-pinning; the reason
+    // is on the value.
+    AffinityStatus::Failed(reason) => eprintln!("pin failed: {reason}"),
+    other => unreachable!("configured_core never reports {other:?}"),
+}
+```
+
+Honest rules:
+
+- `configured_core` is an **OS CPU id**, checked against the process's allowed
+  affinity mask — not an index into `0..num_cpus`. Containers and cpusets can
+  expose sparse ids, so do not assume CPU 0 exists.
+- A real hard pin happens only on Linux (`sched_setaffinity`). macOS offers
+  only affinity *hints*, so it reports `Unsupported` rather than pretending.
+- An id outside the allowed mask reports `Failed` and the worker keeps running
+  unpinned — never a silent mis-pin to the wrong core.
+- Only the shard worker is pinned. Helper lanes (DNS, storage, process, TLS)
+  stay unpinned so they soak spare cores instead of fighting a shard for its
+  core.
+- Default is unpinned (`NotRequested`); no affinity syscall is made.
+
+This ships the mechanism and honest reporting, not a throughput claim.
+
 ## What The Simulator Owns
 
 The simulator replaces physical I/O with scripted I/O.
