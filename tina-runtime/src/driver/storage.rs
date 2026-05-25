@@ -205,10 +205,6 @@ impl ReactorStorage {
         }
     }
 
-    fn active_count(&self) -> usize {
-        self.jobs.iter().filter(|job| !job.user_cancelled).count()
-    }
-
     fn submit(&mut self, call_id: CallId, job: StorageJob) -> Option<DriverCompletion> {
         if self.fallback.is_closed() {
             return Some(DriverCompletion {
@@ -216,7 +212,7 @@ impl ReactorStorage {
                 result: CallOutput::Failed(CallError::StorageClosed),
             });
         }
-        if self.active_count() >= self.capacity {
+        if self.jobs.len() >= self.capacity {
             return Some(DriverCompletion {
                 call_id,
                 result: CallOutput::Failed(CallError::StorageFull),
@@ -2575,6 +2571,46 @@ mod reactor_proofs {
         assert!(
             completed.is_empty(),
             "cancelled work delivers no terminal completion"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn cancelled_stuck_job_still_counts_against_physical_capacity() {
+        let dir = unique_dir("cancel-stuck-capacity");
+        let first = dir.join("first.journal");
+        let second = dir.join("second.journal");
+        crate::persistence::append_journal_record(&first, 1, b"x".to_vec()).expect("seed first");
+        crate::persistence::append_journal_record(&second, 1, b"y".to_vec()).expect("seed second");
+
+        let (mut lane, _state) = fault_lane(
+            FaultConfig {
+                never_complete: true,
+                ..FaultConfig::default()
+            },
+            1,
+        );
+        assert!(
+            lane.submit(CallId::new(1), StorageJob::JournalReplay { path: first },)
+                .is_none()
+        );
+        let mut completed = Vec::new();
+        lane.advance(&mut completed); // arms a size completion that never lands
+        assert!(completed.is_empty());
+        assert_eq!(lane.physical_pending_count(), 1);
+        assert!(lane.cancel(CallId::new(1)));
+
+        let rejected = lane
+            .submit(CallId::new(2), StorageJob::JournalReplay { path: second })
+            .expect("physically stuck cancelled work still occupies the lane");
+        assert!(matches!(
+            rejected.result,
+            CallOutput::Failed(CallError::StorageFull)
+        ));
+        assert_eq!(
+            lane.physical_pending_count(),
+            1,
+            "storage capacity remains a physical work bound"
         );
         let _ = std::fs::remove_dir_all(dir);
     }
