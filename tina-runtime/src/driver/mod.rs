@@ -471,10 +471,11 @@ impl RuntimeDriver for BetelgeuseDriver {
         self.signals.clear();
         self.storage.cancel_pending(deadline);
         self.dns.cancel_pending(deadline);
-        self.tls.cancel_pending(deadline);
+        let tls_result = self.tls.cancel_pending(deadline);
         self.process.cancel_pending(deadline);
         self.unix.cancel_pending(deadline);
-        self.tcp.cancel_pending(deadline)
+        let tcp_result = self.tcp.cancel_pending(deadline);
+        tls_result.and(tcp_result)
     }
 
     fn cancel(&mut self, call_id: CallId) -> bool {

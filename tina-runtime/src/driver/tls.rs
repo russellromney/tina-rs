@@ -971,26 +971,41 @@ impl TlsLane {
         true
     }
 
-    pub(super) fn cancel_pending(&mut self, _deadline: Instant) {
+    pub(super) fn cancel_pending(&mut self, deadline: Instant) -> Result<(), DriverShutdownError> {
         // Orderly shutdown only. We share the io_loop with the TCP lane, so
-        // `cancel_pending_completions` fails *every* backend-held slot (TCP's
-        // too). That is safe here because shutdown runs before any lane drops —
-        // every completion box is still alive — and it lets the TCP lane's own
-        // `cancel_pending` (run last) see an empty backend and assert
-        // `pending_completion_count() == 0`. Once the backend has released the
-        // slots we can drop our boxes.
+        // `cancel_pending_completions` targets *every* backend-held slot. On
+        // Linux, cancelling an in-flight operation is itself asynchronous:
+        // the completion box is not safe to drop until the backend reports
+        // the cancelled result. Drain TLS-owned boxes here before TCP performs
+        // the final shared-loop shutdown check.
         //
         // This must NOT run from `Drop`: on a bare runtime drop the TCP lane's
         // field drops first and frees its boxes, leaving the backend's watch
         // list dangling — walking it here would be use-after-free. A dropped
         // lane simply lets its boxes (and the io_loop handle) fall; the backend
         // is torn down without ever dereferencing the stale pointers.
-        let _ = self.io_loop.cancel_pending_completions();
-        self.pending.clear();
-        self.streams.clear();
+        for pending in &mut self.pending {
+            pending.cancelled = true;
+        }
+        let cancel_result = self.io_loop.cancel_pending_completions();
+        while Instant::now() < deadline && self.has_live_socket_work() {
+            let _ = self.io_loop.step();
+            self.reap_cancelled_tombstones();
+            thread::sleep(Duration::from_millis(1));
+        }
+        self.reap_cancelled_tombstones();
+        let tls_released = !self.has_live_socket_work();
+        if tls_released {
+            self.pending.clear();
+            self.streams.clear();
+        }
         for entry in self.listeners.drain(..) {
             entry.socket.close();
         }
+        if cancel_result.is_err() || !tls_released {
+            return Err(DriverShutdownError::BackendStillOwnsCompletions);
+        }
+        Ok(())
     }
 
     pub(super) fn resource_report(&self) -> DriverResourceReport {
@@ -1040,6 +1055,17 @@ impl TlsLane {
             });
         }
         None
+    }
+
+    fn reap_cancelled_tombstones(&mut self) {
+        let mut index = 0;
+        while index < self.pending.len() {
+            if self.pending[index].cancelled && !self.pending[index].holds_live_backend_ref() {
+                self.pending.remove(index);
+            } else {
+                index += 1;
+            }
+        }
     }
 }
 
