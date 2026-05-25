@@ -1040,14 +1040,25 @@ fn drive_handshake(io: &mut TlsIo) -> PumpStep {
         return PumpStep::Failed(error);
     }
     io.egress();
+    // Flush any handshake output (including the client's final `Finished`)
+    // before declaring the handshake done — otherwise the peer never sees the
+    // last flight and its own handshake hangs forever.
+    if !io.outbound.is_empty() {
+        return match io.arm_send() {
+            Ok(()) => PumpStep::Pending,
+            Err(error) => PumpStep::Failed(error),
+        };
+    }
     if !io.conn.is_handshaking() {
         return PumpStep::Done;
     }
-    // Still handshaking: flush handshake output or read more. A clean EOF
+    // Still handshaking and nothing to send: read more. A clean EOF
     // mid-handshake is a truncated handshake.
-    match io.flush_or_fill(true) {
-        Ok(true) => PumpStep::Pending,
-        Ok(false) => PumpStep::Failed(CallError::TlsHandshake),
+    if io.read_eof {
+        return PumpStep::Failed(CallError::TlsHandshake);
+    }
+    match io.arm_recv() {
+        Ok(()) => PumpStep::Pending,
         Err(error) => PumpStep::Failed(error),
     }
 }
@@ -1094,4 +1105,310 @@ fn build_server_config(
         .map_err(|_| CallError::TlsCertificate)?;
     config.alpn_protocols = alpn_protocols;
     Ok(config)
+}
+
+#[cfg(test)]
+mod tests {
+    //! Lane-level proofs. Each test runs a TLS client *and* server in a single
+    //! lane on one Betelgeuse loop — the case FINDINGS #16 called impossible —
+    //! so no `std::net` socket and no `thread::spawn` ever enter this file (the
+    //! guard test greps for exactly that).
+    use super::*;
+
+    fn localhost_identity() -> (Vec<u8>, Vec<u8>) {
+        let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
+            .expect("generate local cert");
+        (
+            certified.cert.der().to_vec(),
+            certified.key_pair.serialize_der(),
+        )
+    }
+
+    fn fresh_lane(capacity: usize) -> TlsLane {
+        let io_loop = io_loop(Global).expect("init io loop for tls lane test");
+        TlsLane::new(capacity, io_loop)
+    }
+
+    fn loopback() -> SocketAddr {
+        "127.0.0.1:0".parse().expect("loopback addr")
+    }
+
+    /// Advance the lane until `call_id` completes, returning its output. Keeps
+    /// a shared completion buffer so a peer op finishing first is not lost.
+    fn drive(
+        lane: &mut TlsLane,
+        completed: &mut Vec<DriverCompletion>,
+        call_id: CallId,
+    ) -> CallOutput {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(index) = completed.iter().position(|c| c.call_id == call_id) {
+                return completed.remove(index).result;
+            }
+            assert!(Instant::now() < deadline, "call {call_id:?} did not complete");
+            lane.advance(Instant::now(), completed);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    fn long() -> Duration {
+        Duration::from_secs(5)
+    }
+
+    /// bind a server, accept + connect on the same lane, returning both stream
+    /// ids and both handshake outputs.
+    fn handshake_pair(
+        lane: &mut TlsLane,
+        completed: &mut Vec<DriverCompletion>,
+        server_alpn: Vec<Vec<u8>>,
+        client_alpn: Vec<Vec<u8>>,
+    ) -> (TlsStreamId, CallOutput, TlsStreamId, CallOutput) {
+        let (cert, key) = localhost_identity();
+        let bound = lane
+            .submit_bind(CallId::new(1), loopback(), vec![cert.clone()], key, server_alpn, Instant::now())
+            .expect("bind completes inline");
+        let (listener, addr) = match bound.result {
+            CallOutput::TlsBound { listener, local_addr } => (listener, local_addr),
+            other => panic!("unexpected bind: {other:?}"),
+        };
+        assert!(lane
+            .submit_accept(CallId::new(2), listener, long(), Instant::now())
+            .is_none());
+        assert!(lane
+            .submit_connect(
+                CallId::new(3),
+                addr,
+                "localhost".to_string(),
+                vec![cert],
+                client_alpn,
+                long(),
+                Instant::now(),
+            )
+            .is_none());
+        let accepted = drive(lane, completed, CallId::new(2));
+        let server_stream = match &accepted {
+            CallOutput::TlsAccepted { stream, .. } => *stream,
+            other => panic!("unexpected accept: {other:?}"),
+        };
+        let connected = drive(lane, completed, CallId::new(3));
+        let client_stream = match &connected {
+            CallOutput::TlsConnected { stream, .. } => *stream,
+            other => panic!("unexpected connect: {other:?}"),
+        };
+        (server_stream, accepted, client_stream, connected)
+    }
+
+    #[test]
+    fn lane_runs_client_and_server_echo_in_one_lane() {
+        let mut lane = fresh_lane(64);
+        let mut completed = Vec::new();
+        let (server_stream, _accepted, client_stream, _connected) =
+            handshake_pair(&mut lane, &mut completed, Vec::new(), Vec::new());
+
+        // client -> server
+        assert!(lane
+            .submit_write(CallId::new(4), client_stream, b"ping".to_vec(), long(), Instant::now())
+            .is_none());
+        assert!(matches!(
+            drive(&mut lane, &mut completed, CallId::new(4)),
+            CallOutput::TlsWrote { count: 4 }
+        ));
+        assert!(lane
+            .submit_read(CallId::new(5), server_stream, 16, long(), Instant::now())
+            .is_none());
+        assert_eq!(
+            match drive(&mut lane, &mut completed, CallId::new(5)) {
+                CallOutput::TlsRead { bytes } => bytes,
+                other => panic!("{other:?}"),
+            },
+            b"ping"
+        );
+
+        // server -> client
+        assert!(lane
+            .submit_write(CallId::new(6), server_stream, b"pong".to_vec(), long(), Instant::now())
+            .is_none());
+        assert!(matches!(
+            drive(&mut lane, &mut completed, CallId::new(6)),
+            CallOutput::TlsWrote { count: 4 }
+        ));
+        assert!(lane
+            .submit_read(CallId::new(7), client_stream, 16, long(), Instant::now())
+            .is_none());
+        assert_eq!(
+            match drive(&mut lane, &mut completed, CallId::new(7)) {
+                CallOutput::TlsRead { bytes } => bytes,
+                other => panic!("{other:?}"),
+            },
+            b"pong"
+        );
+
+        // clean close_notify -> the peer's read sees a clean (empty) EOF.
+        assert!(lane
+            .submit_close(CallId::new(8), client_stream, long(), Instant::now())
+            .is_none());
+        assert!(matches!(
+            drive(&mut lane, &mut completed, CallId::new(8)),
+            CallOutput::TlsClosed
+        ));
+        assert!(lane
+            .submit_read(CallId::new(9), server_stream, 16, long(), Instant::now())
+            .is_none());
+        assert_eq!(
+            match drive(&mut lane, &mut completed, CallId::new(9)) {
+                CallOutput::TlsRead { bytes } => bytes,
+                other => panic!("clean close should read empty, got {other:?}"),
+            },
+            Vec::<u8>::new()
+        );
+    }
+
+    #[test]
+    fn lane_negotiates_alpn_h2_on_both_sides() {
+        let mut lane = fresh_lane(64);
+        let mut completed = Vec::new();
+        let (_server_stream, accepted, _client_stream, connected) =
+            handshake_pair(&mut lane, &mut completed, vec![b"h2".to_vec()], vec![b"h2".to_vec()]);
+        assert!(matches!(
+            accepted,
+            CallOutput::TlsAccepted { selected_alpn: Some(ref a), .. } if a == b"h2"
+        ));
+        assert!(matches!(
+            connected,
+            CallOutput::TlsConnected { selected_alpn: Some(ref a), .. } if a == b"h2"
+        ));
+    }
+
+    #[test]
+    fn lane_connect_alpn_offered_but_server_declines_is_mismatch() {
+        let mut lane = fresh_lane(64);
+        let mut completed = Vec::new();
+        let (cert, key) = localhost_identity();
+        let bound = lane
+            .submit_bind(CallId::new(1), loopback(), vec![cert.clone()], key, Vec::new(), Instant::now())
+            .expect("bind inline");
+        let (listener, addr) = match bound.result {
+            CallOutput::TlsBound { listener, local_addr } => (listener, local_addr),
+            other => panic!("{other:?}"),
+        };
+        assert!(lane
+            .submit_accept(CallId::new(2), listener, long(), Instant::now())
+            .is_none());
+        assert!(lane
+            .submit_connect(
+                CallId::new(3),
+                addr,
+                "localhost".to_string(),
+                vec![cert],
+                vec![b"h2".to_vec()],
+                long(),
+                Instant::now(),
+            )
+            .is_none());
+        assert!(matches!(
+            drive(&mut lane, &mut completed, CallId::new(3)),
+            CallOutput::Failed(CallError::TlsAlpnMismatch)
+        ));
+    }
+
+    #[test]
+    fn lane_connect_without_alpn_offer_negotiates_none() {
+        let mut lane = fresh_lane(64);
+        let mut completed = Vec::new();
+        let (_server, _accepted, _client, connected) =
+            handshake_pair(&mut lane, &mut completed, vec![b"h2".to_vec()], Vec::new());
+        assert!(matches!(
+            connected,
+            CallOutput::TlsConnected { selected_alpn: None, .. }
+        ));
+    }
+
+    #[test]
+    fn lane_rejects_second_op_on_a_stream_with_resource_busy() {
+        let mut lane = fresh_lane(64);
+        let mut completed = Vec::new();
+        let (_server, _accepted, client, _connected) =
+            handshake_pair(&mut lane, &mut completed, Vec::new(), Vec::new());
+        // First read parks (no data from the idle peer).
+        assert!(lane
+            .submit_read(CallId::new(10), client, 16, long(), Instant::now())
+            .is_none());
+        // Second op on the same stream is rejected, not queued behind it.
+        let busy = lane
+            .submit_write(CallId::new(11), client, b"x".to_vec(), long(), Instant::now())
+            .expect("second op rejected inline");
+        assert!(matches!(busy.result, CallOutput::Failed(CallError::ResourceBusy)));
+    }
+
+    #[test]
+    fn lane_in_flight_connect_counts_worker_held_and_pending_only() {
+        let mut lane = fresh_lane(64);
+        let (cert, key) = localhost_identity();
+        // Bind but never accept; the connect's handshake stays in flight.
+        let bound = lane
+            .submit_bind(CallId::new(1), loopback(), vec![cert.clone()], key, Vec::new(), Instant::now())
+            .expect("bind inline");
+        let addr = match bound.result {
+            CallOutput::TlsBound { local_addr, .. } => local_addr,
+            other => panic!("{other:?}"),
+        };
+        assert!(lane
+            .submit_connect(CallId::new(2), addr, "localhost".to_string(), vec![cert], Vec::new(), long(), Instant::now())
+            .is_none());
+        let report = lane.resource_report();
+        assert_eq!(report.owned_resource_count(), 1, "the listener is table-owned");
+        assert_eq!(report.worker_held_resource_count(), 1, "the connecting socket is un-tabled");
+        assert_eq!(report.pending_driver_call_count(), 1, "the connect is the only pending op");
+    }
+
+    #[test]
+    fn lane_capacity_rejects_overflow_with_tls_full() {
+        let mut lane = fresh_lane(1);
+        let addr: SocketAddr = "127.0.0.1:9".parse().expect("discard port addr");
+        assert!(lane
+            .submit_connect(CallId::new(1), addr, "localhost".to_string(), Vec::new(), Vec::new(), long(), Instant::now())
+            .is_none());
+        let full = lane
+            .submit_connect(CallId::new(2), addr, "localhost".to_string(), Vec::new(), Vec::new(), long(), Instant::now())
+            .expect("second op past capacity rejected inline");
+        assert!(matches!(full.result, CallOutput::Failed(CallError::TlsFull)));
+    }
+
+    #[test]
+    fn lane_connect_times_out_once_when_handshake_stalls() {
+        let mut lane = fresh_lane(64);
+        let mut completed = Vec::new();
+        let (cert, key) = localhost_identity();
+        // Bind but never accept: the TCP connect lands in the backlog, the
+        // client sends its ClientHello, and then waits forever for a server
+        // that never reads it. The whole-op deadline fires once.
+        let bound = lane
+            .submit_bind(CallId::new(1), loopback(), vec![cert.clone()], key, Vec::new(), Instant::now())
+            .expect("bind inline");
+        let addr = match bound.result {
+            CallOutput::TlsBound { local_addr, .. } => local_addr,
+            other => panic!("{other:?}"),
+        };
+        assert!(lane
+            .submit_connect(
+                CallId::new(2),
+                addr,
+                "localhost".to_string(),
+                vec![cert],
+                Vec::new(),
+                Duration::from_millis(150),
+                Instant::now(),
+            )
+            .is_none());
+        assert!(matches!(
+            drive(&mut lane, &mut completed, CallId::new(2)),
+            CallOutput::Failed(CallError::Timeout)
+        ));
+        // The timed-out op delivers exactly one terminal, then tombstones: no
+        // second completion, and `has_pending` no longer counts it as active.
+        assert!(!lane.has_pending());
+        let mut more = Vec::new();
+        lane.advance(Instant::now(), &mut more);
+        assert!(more.is_empty(), "no second completion for a timed-out op");
+    }
 }

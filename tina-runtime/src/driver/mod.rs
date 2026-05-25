@@ -39,6 +39,10 @@ use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
+// Only lane unit tests build `Arc<Mutex<_>>` resolver fixtures; the live
+// driver no longer holds a `Mutex` now that TLS rides the TCP rail.
+#[cfg(test)]
+use std::sync::Mutex;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
