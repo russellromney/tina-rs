@@ -4,6 +4,24 @@ This file records completed work.
 
 ## Unreleased
 
+### TLS On The TCP Rail
+
+- Moved native TLS off per-operation worker threads and onto the runtime's own
+  Betelgeuse TCP rail: the runtime now owns a rustls connection (sans-I/O) per
+  TLS stream and drives handshake/read/write/close on the shard thread as TCP
+  completions arrive. No TLS worker thread, no second socket stack.
+- A Tina TLS client and server can now share one runtime — previously the single
+  TLS worker deadlocked both sides of one handshake. The `specimen_native_https`
+  Tina side now runs an HTTPS client and server together in one runtime.
+- Public `tls_*` call signatures are unchanged. The TLS layer owns its socket
+  exclusively and serializes its internal reads/writes, so a single `tls_*` call
+  can interleave I/O without a self-inflicted `ResourceBusy`. `tls_lane_capacity`
+  is now the shard-total cap on in-flight TLS ops. The HTTPS listener's accept is
+  completion-driven (a real "wait" deadline, not a busy-wait poll).
+- Preserved the security posture (cert validation, SNI/name check, DER-root
+  policy), the clean-`close_notify`-vs-truncation distinction, and the
+  cancellation/close-wins/timeout-tombstone outcomes. Simulator TLS is unchanged.
+
 ### Copied Service Ergonomics And Workflow Helpers
 
 - Added the Phase 120 copied-service path: canonical system specimens for a
