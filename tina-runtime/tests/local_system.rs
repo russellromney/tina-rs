@@ -11,16 +11,17 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tina::{Mailbox, TrySendError, prelude::*};
 use tina_runtime::{
     AffinityStatus, CallError, CallKind, CallOutcome, CancellationSupport, FileId, ListenerId,
-    LiveShardState, LocalSystem, LocalSystemConfig, LocalSystemConfigError, LocalSystemState,
-    MailboxFactory, PathKind, PathMetadata, PersistenceSupportLevel, PreallocationConfig,
-    ResourceExecutionShape, ResourceSupport, RuntimeEventKind, ShutdownSupport,
-    ShutdownUncleanReason, SnapshotImage, StreamId, ThreadedRuntimeError, ThreadedTrySendError,
-    TlsListenerId, TlsStreamId, TraceRetention, UdpSocketId, call, dns_lookup, file_close,
-    file_create, file_fsync, file_read, file_size, file_write, journal_append, journal_replay,
-    path_metadata, process_run, read_dir, remove_file, rename_replace, signal_wait, sleep,
-    snapshot_load, sync_parent, tcp_accept, tcp_bind, tcp_close_listener, tcp_close_stream,
-    tcp_read, tcp_write, tls_accept, tls_bind, tls_close, tls_close_listener, tls_connect,
-    tls_read, tls_write, udp_bind, udp_close_socket, udp_recv_from, udp_send_to,
+    LiveShardReport, LiveShardState, LocalSystem, LocalSystemConfig, LocalSystemConfigError,
+    LocalSystemState, MailboxFactory, PathKind, PathMetadata, PersistenceSupportLevel,
+    PreallocationConfig, ResourceExecutionShape, ResourceSupport, RuntimeEventKind,
+    ShutdownSupport, ShutdownUncleanReason, SnapshotImage, StreamId, ThreadedRuntimeError,
+    ThreadedTrySendError, TlsListenerId, TlsStreamId, TraceRetention, UdpSocketId, call,
+    dns_lookup, file_close, file_create, file_fsync, file_read, file_size, file_write,
+    journal_append, journal_replay, path_metadata, process_run, read_dir, remove_file,
+    rename_replace, signal_wait, sleep, snapshot_load, sync_parent, tcp_accept, tcp_bind,
+    tcp_close_listener, tcp_close_stream, tcp_read, tcp_write, tls_accept, tls_bind, tls_close,
+    tls_close_listener, tls_connect, tls_read, tls_write, udp_bind, udp_close_socket,
+    udp_recv_from, udp_send_to,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -1577,6 +1578,53 @@ fn wait_until(mut predicate: impl FnMut() -> bool) {
     assert!(predicate(), "condition did not become true before timeout");
 }
 
+/// OS CPU ids this process is allowed to run on. Tests pick pin targets from
+/// this mask instead of assuming CPU 0 exists or that ids are dense.
+#[cfg(target_os = "linux")]
+fn allowed_cores() -> Vec<usize> {
+    // SAFETY: a zeroed `cpu_set_t` is a valid empty out-parameter; pid 0 reads
+    // the calling thread's allowed mask.
+    let mut set: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+    let rc =
+        unsafe { libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut set) };
+    assert_eq!(
+        rc,
+        0,
+        "sched_getaffinity failed: {}",
+        std::io::Error::last_os_error()
+    );
+    (0..(libc::CPU_SETSIZE as usize))
+        // SAFETY: `cpu` is below CPU_SETSIZE and `set` was filled above.
+        .filter(|&cpu| unsafe { libc::CPU_ISSET(cpu, &set) })
+        .collect()
+}
+
+/// Asserts a shard configured to `core` reports the right pin outcome: a proven
+/// Linux pin (`Applied` + observed core) when `core` is in the allowed mask,
+/// `Failed` when it is not, and `Unsupported` on platforms without a hard pin.
+fn assert_pin_outcome(shard: &LiveShardReport, core: usize) {
+    #[cfg(target_os = "linux")]
+    {
+        if allowed_cores().contains(&core) {
+            assert_eq!(shard.affinity_status(), &AffinityStatus::Applied);
+            assert_eq!(shard.observed_core(), Some(core));
+        } else {
+            assert!(
+                matches!(shard.affinity_status(), AffinityStatus::Failed(_)),
+                "core {core} outside the allowed mask must fail loudly, got {:?}",
+                shard.affinity_status()
+            );
+            assert_eq!(shard.observed_core(), None);
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = core;
+        assert_eq!(shard.affinity_status(), &AffinityStatus::Unsupported);
+        assert_eq!(shard.observed_core(), None);
+    }
+}
+
 fn wait_until_debug(mut predicate: impl FnMut() -> bool, debug: impl Fn() -> String) {
     let deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < deadline {
@@ -1886,10 +1934,22 @@ fn local_system_topology_report_before_and_after_shutdown() {
 }
 
 #[test]
-fn local_system_topology_reports_advisory_configured_core() {
+fn local_system_topology_reports_pin_outcome_for_configured_core() {
+    // Headline proof: on Linux pick a core from the process's allowed affinity
+    // mask, pin to it, and assert the worker observes itself there (Applied +
+    // observed == requested). Off Linux the same request reports Unsupported.
+    #[cfg(target_os = "linux")]
+    let core = *allowed_cores()
+        .first()
+        .expect("the process has at least one allowed core");
+    #[cfg(not(target_os = "linux"))]
+    let core = 0usize;
+
     let app = LocalSystem::single_shard(AppShard(36), AppMailboxFactory)
-        .configured_core(2)
+        .configured_core(core)
         .build();
+    // The worker records its thread id only after the pin runs, so waiting on
+    // the thread id means the affinity status below is the proven outcome.
     wait_until(|| {
         app.topology()
             .shard(ShardId::new(36))
@@ -1903,19 +1963,96 @@ fn local_system_topology_reports_advisory_configured_core() {
         .expect("single shard report exists");
     assert_eq!(shard.worker_name(), Some("tina-shard-36"));
     assert!(shard.worker_thread_id().is_some());
-    assert_eq!(shard.configured_core(), Some(2));
-    assert_eq!(shard.observed_core(), None);
-    assert_eq!(shard.affinity_status(), &AffinityStatus::AdvisoryOnly);
+    assert_eq!(shard.configured_core(), Some(core));
+    assert_pin_outcome(shard, core);
+
+    // A pinned shard still serves: register an isolate and prove a message is
+    // handled on the pinned worker.
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let address = app
+        .register_root::<LlamaService, Infallible>(
+            LlamaService {
+                seen: Arc::clone(&seen),
+            },
+            8,
+        )
+        .expect("register root on pinned shard");
+    app.try_send(address, LlamaMsg::Feed(7))
+        .expect("bounded handoff to pinned shard");
+    wait_until(|| seen.lock().expect("seen lock").as_slice() == [7]);
+    assert_eq!(
+        app.topology()
+            .shard(ShardId::new(36))
+            .expect("shard report")
+            .state(),
+        LiveShardState::Running
+    );
 
     app.shutdown().drain().join().expect("clean shutdown");
 }
 
 #[test]
-fn local_multi_shard_topology_reports_contiguous_advisory_cores() {
+#[cfg(target_os = "linux")]
+fn local_system_unavailable_core_reports_failed_and_keeps_serving() {
+    // A requested core outside the process's allowed mask must fail loudly and
+    // keep the shard serving unpinned — never crash, never silently mis-pin.
+    let allowed = allowed_cores();
+    let max = allowed.iter().copied().max().unwrap_or(0);
+    let absent = (0..=max + 1)
+        .find(|cpu| !allowed.contains(cpu))
+        .expect("an unallowed core id exists at or below max+1");
+
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let app = LocalSystem::single_shard(AppShard(37), AppMailboxFactory)
+        .configured_core(absent)
+        .build();
+    let address = app
+        .register_root::<LlamaService, Infallible>(
+            LlamaService {
+                seen: Arc::clone(&seen),
+            },
+            8,
+        )
+        .expect("register root despite failed pin");
+    app.try_send(address, LlamaMsg::Feed(13))
+        .expect("bounded handoff to unpinned shard");
+    wait_until(|| seen.lock().expect("seen lock").as_slice() == [13]);
+
+    let topology = app.topology();
+    let shard = topology.shard(ShardId::new(37)).expect("shard report");
+    assert!(
+        matches!(shard.affinity_status(), AffinityStatus::Failed(_)),
+        "an unavailable core must report Failed, got {:?}",
+        shard.affinity_status()
+    );
+    assert_eq!(shard.observed_core(), None);
+    assert_eq!(shard.configured_core(), Some(absent));
+    assert_eq!(shard.state(), LiveShardState::Running);
+
+    app.shutdown().drain().join().expect("clean shutdown");
+}
+
+#[test]
+fn local_multi_shard_topology_reports_pin_outcome_per_shard() {
+    // Prefer two contiguous allowed ids so both shards prove Applied; fall back
+    // to the lowest allowed id (per-shard outcome still asserted). Never assume
+    // CPU 0 exists or that allowed ids are dense.
+    #[cfg(target_os = "linux")]
+    let base = {
+        let allowed = allowed_cores();
+        (0..)
+            .take(libc::CPU_SETSIZE as usize)
+            .find(|c| allowed.contains(c) && allowed.contains(&(c + 1)))
+            .or_else(|| allowed.first().copied())
+            .expect("the process has at least one allowed core")
+    };
+    #[cfg(not(target_os = "linux"))]
+    let base = 8usize;
+
     let app = LocalSystem::multi_shard(AppMailboxFactory)
         .shard(AppShard(42))
         .shard(AppShard(40))
-        .configured_core(8)
+        .configured_core(base)
         .build();
     wait_until(|| {
         let topology = app.topology();
@@ -1928,12 +2065,11 @@ fn local_multi_shard_topology_reports_contiguous_advisory_cores() {
     let topology = app.topology();
     let first = topology.shard(ShardId::new(40)).expect("first shard");
     let second = topology.shard(ShardId::new(42)).expect("second shard");
-    assert_eq!(first.configured_core(), Some(8));
-    assert_eq!(second.configured_core(), Some(9));
-    assert_eq!(first.observed_core(), None);
-    assert_eq!(second.observed_core(), None);
-    assert_eq!(first.affinity_status(), &AffinityStatus::AdvisoryOnly);
-    assert_eq!(second.affinity_status(), &AffinityStatus::AdvisoryOnly);
+    // Stable shard order pins shard 40 (ordinal 0) to base, shard 42 to base+1.
+    assert_eq!(first.configured_core(), Some(base));
+    assert_eq!(second.configured_core(), Some(base + 1));
+    assert_pin_outcome(first, base);
+    assert_pin_outcome(second, base + 1);
 
     app.shutdown().drain().join().expect("clean shutdown");
 }

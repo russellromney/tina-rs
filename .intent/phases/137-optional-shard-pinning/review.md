@@ -77,3 +77,51 @@ Verdict: one needless implementation fork remained.
 the needed calls are exactly Linux syscalls (`sched_getaffinity`,
 `sched_setaffinity`, `sched_getcpu`). Fixed in plan v4: use a tiny local `libc`
 wrapper, no new affinity crate.
+
+## Implementation (2026-05-25)
+
+Built exactly to plan v4. No new crate, no new config enum, no new report
+surface.
+
+- New `tina-runtime/src/affinity.rs`: `apply(Option<usize>)` runs inside the
+  worker thread. Linux reads the allowed mask (`sched_getaffinity`), validates
+  the requested OS CPU id against it (pure `validate_core`, unit-tested as the
+  surrogate proof), pins to a single-core mask (`sched_setaffinity`), and proves
+  it by reading the running core back (`sched_getcpu`). Non-Linux returns
+  `Unsupported`. `None` returns `NotRequested` with no syscall.
+- `LiveShardMetrics` now publishes thread id + affinity status + observed core
+  under one lock from inside the worker (`publish_worker_start`), before
+  recording the thread id, so a report that names the worker also carries its
+  proven pin outcome. Both worker loops (`threaded.rs`,
+  `threaded_multi_shard.rs`) call `affinity::apply`; helper lanes are untouched.
+
+Blast radius migrated, not patched over:
+
+- `local_system.rs` topology tests now pick a core from the process's allowed
+  mask and assert `Applied` + `observed_core == configured` on Linux,
+  `Unsupported` off Linux, and `Failed` for a core outside the mask. They no
+  longer hard-code `AdvisoryOnly` or assume CPU 0/contiguous ids.
+- `blue_whale_checklist.rs` "thread pinning" line rewritten from "no OS pinning
+  claim yet" to the real Linux claim; the `Advisory` status was removed. That
+  rewrite is the proof the non-claim was lifted on purpose.
+- `AffinityStatus::AdvisoryOnly` retired as a `configured_core` outcome; kept as
+  a reserved variant (tracing string mapping unchanged).
+
+Proof status:
+
+- Direct: Linux pin `Applied` + `observed == configured`; `None` →
+  `NotRequested`; macOS → `Unsupported`; `Failed` for an out-of-mask core; a
+  pinned shard still serves; an unavailable core keeps the shard serving; the
+  helper-lane float restores the original mask for a child spawned under a pin.
+- **Executed on real Linux** (aarch64 nightly container, real `sched_setaffinity`
+  / `sched_getcpu` and io_uring substrate): all 6 affinity unit tests pass and
+  all 3 affinity integration tests pass (io_uring needs `seccomp=unconfined` in
+  Docker — that EPERM is a substrate/seccomp limit, not an affinity defect). The
+  x86_64 Linux path is additionally type- and clippy-checked, and runs in CI on
+  `ubuntu-latest`.
+- Surrogate: `validate_core` reject path unit-tested for an out-of-range core.
+- Missing (honest): a real cgroup/cpuset-restricted environment — hard in CI.
+- Blast radius: full `local_system` (46) and `sharded_threaded` (9) suites green
+  with pinning enabled and with default `None`; `tina-tracing` (24) green;
+  `tina-http` TLS suites green (the TLS-driver float touch); whole workspace
+  builds; `fmt` + `clippy -D warnings` + `cargo doc -D warnings` clean.
