@@ -4,6 +4,25 @@ This file records completed work.
 
 ## Unreleased
 
+### Live Durability On The Per-Shard I/O Rail
+
+- Moved the live runtime's durability reads/writes/fsync/size onto the per-shard
+  Betelgeuse completion rail. Journal appends, snapshot commits, snapshot loads,
+  journal replays, and parent-directory syncs now ride the same reactor the shard
+  already runs for its sockets, instead of a separate storage worker thread.
+- Kept a thin bounded off-shard fallback worker only for the operations the I/O
+  rail has no opcode for — rename, remove, readdir, and metadata (plus internal
+  recursive directory creation and torn-tail truncation). The capability report
+  names that fallback explicitly (`storage_metadata_fallback`) and now reports the
+  durability family as completion-backed rather than lane-backed-blocking.
+- Preserved recovery semantics: append-before-apply ordering, torn-tail, checksum,
+  duplicate/out-of-order index, `CommitUncertain`, and `StorageFull`/`StorageClosed`
+  produce the same typed outcomes as before, with the pwrite completion harvested
+  before fsync is submitted. Concurrent writes to the same journal/snapshot path
+  are serialized so they cannot interleave their offsets (matching the old
+  single-worker behavior); distinct paths still overlap. The explicit-step oracle
+  keeps its synchronous inline path unchanged.
+
 ### Config And Budget Manifest
 
 - Added `tina_runtime::budget`: a `ServiceBudgetManifest` that declares a

@@ -214,10 +214,19 @@ pub struct RuntimeCapabilities {
     pub tcp: ResourceCapability,
     /// Runtime-owned local file support.
     pub local_file: ResourceCapability,
-    /// Runtime-owned local persistence support.
+    /// Runtime-owned local persistence support. On the live runtime the
+    /// durability ops (open/pread/pwrite/fsync/size) ride the per-shard
+    /// Betelgeuse completion rail, hence `CompletionBacked`. The few ops
+    /// Betelgeuse lacks are reported separately on [`Self::storage_metadata_fallback`].
     pub local_persistence: ResourceCapability,
-    /// Shared storage lane used by blocking storage and persistence work.
+    /// Shared storage lane that bounds total accepted pending storage work.
     pub storage_lane: ResourceCapability,
+    /// The thin off-shard fallback worker for the storage ops Betelgeuse has
+    /// no opcode for: rename, remove, readdir, and metadata (plus internal
+    /// recursive directory creation and torn-tail truncation). Named
+    /// explicitly so the report does not imply the whole storage family rides
+    /// the reactor.
+    pub storage_metadata_fallback: ResourceCapability,
     /// Runtime-owned DNS support.
     pub dns: ResourceCapability,
     /// Runtime-owned UDP support.
@@ -280,12 +289,19 @@ impl RuntimeCapabilities {
             ),
             local_persistence: ResourceCapability::new(
                 ResourceSupport::Supported,
-                ResourceExecutionShape::LaneBackedBlocking,
+                ResourceExecutionShape::CompletionBacked,
                 CancellationSupport::TombstonedAfterStart,
                 ShutdownSupport::Tombstoned,
                 Some(storage_lane_capacity),
             ),
             storage_lane: ResourceCapability::new(
+                ResourceSupport::Supported,
+                ResourceExecutionShape::CompletionBacked,
+                CancellationSupport::TombstonedAfterStart,
+                ShutdownSupport::Tombstoned,
+                Some(storage_lane_capacity),
+            ),
+            storage_metadata_fallback: ResourceCapability::new(
                 ResourceSupport::Supported,
                 ResourceExecutionShape::LaneBackedBlocking,
                 CancellationSupport::TombstonedAfterStart,
@@ -522,6 +538,10 @@ impl RuntimeCapabilityReport {
                 capability: caps.storage_lane,
             },
             RuntimeCapabilityRow {
+                name: "storage_metadata_fallback",
+                capability: caps.storage_metadata_fallback,
+            },
+            RuntimeCapabilityRow {
                 name: "dns",
                 capability: caps.dns,
             },
@@ -585,7 +605,7 @@ mod capability_report_tests {
     fn report_names_every_rail_and_renames_nothing() {
         let caps = RuntimeCapabilities::threaded(4096);
         let report = caps.report();
-        assert_eq!(report.rows().len(), 11);
+        assert_eq!(report.rows().len(), 12);
         // tcp is supported, completion-backed, tombstoned on cancel and
         // shutdown — exactly what the table says.
         let tcp = report.rail("tcp").expect("tcp rail present");
@@ -593,6 +613,22 @@ mod capability_report_tests {
         assert!(tcp.is_cancel_backed());
         assert!(tcp.is_tombstoned());
         assert!(!tcp.is_drain_backed());
+        // Live durability rides the Betelgeuse completion rail; only the ops
+        // Betelgeuse lacks fall to the named fallback worker.
+        let persistence = report
+            .rail("local_persistence")
+            .expect("local_persistence rail present");
+        assert_eq!(
+            persistence.capability.execution(),
+            ResourceExecutionShape::CompletionBacked
+        );
+        let fallback = report
+            .rail("storage_metadata_fallback")
+            .expect("storage_metadata_fallback rail present");
+        assert_eq!(
+            fallback.capability.execution(),
+            ResourceExecutionShape::LaneBackedBlocking
+        );
         // timers cancel before start and drain on... they cancel on
         // shutdown, so not drain-backed but cancel-backed.
         let timers = report.rail("timers").expect("timers rail present");
@@ -606,9 +642,13 @@ mod capability_report_tests {
     fn discovery_report_is_grep_friendly() {
         let caps = RuntimeCapabilities::threaded(4096);
         let text = caps.report().discovery_report();
-        assert!(text.lines().count() == 11);
+        assert!(text.lines().count() == 12);
         assert!(text.contains("cap rail=tcp support=supported"));
         assert!(text.contains("rail=local_persistence"));
+        assert!(text.contains("rail=local_persistence support=supported exec=completion_backed"));
+        assert!(text.contains(
+            "rail=storage_metadata_fallback support=supported exec=lane_backed_blocking"
+        ));
         assert!(text.contains("capacity=4096"));
     }
 
