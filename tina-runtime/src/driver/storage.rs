@@ -2651,15 +2651,19 @@ mod reactor_proofs {
 
         let mut completed = Vec::new();
         let mut seen = HashMap::new();
-        for _ in 0..4000 {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while seen.len() < 2 && Instant::now() < deadline {
             lane.advance(&mut completed);
             for done in completed.drain(..) {
                 seen.insert(done.call_id, done.result);
             }
-            if seen.len() == 2 {
-                break;
-            }
+            thread::sleep(Duration::from_millis(1));
         }
+        assert_eq!(
+            seen.len(),
+            2,
+            "both serialized appends should complete before the proof deadline; seen={seen:?}"
+        );
         assert!(matches!(
             seen.get(&CallId::new(1)),
             Some(CallOutput::JournalAppended { record_index: 1 })
