@@ -350,16 +350,25 @@ Everything else is **not** a custom lock-free structure:
   algorithms, so they need recording, not a loom model.
 - **metrics counters** (`event_sink`, `observer`, `live_report`, `host_burst`)
   are Relaxed atomics that only count; they never guard shared data.
-- **monotonic id / temp-name counters** and one diagnostic tally are ordinary
-  `AtomicU64` generators, explicitly out of scope so the guard stays signal, not
-  noise.
+- **monotonic id / temp-name counters** and one diagnostic tally are `AtomicU64`
+  generators. Some are genuinely cross-thread: the threaded multi-shard runtime
+  hands every shard thread a clone of one `IdSource` (`lib.rs`), so global
+  event/call ids come from a shared `Arc<AtomicU64>` incremented across shard
+  threads, and the per-structure `static AtomicU64` id sources are
+  process-global. They are `fetch_add` unique-id generators (Relaxed is enough
+  for uniqueness), not lock-free data structures, so they are out of loom scope
+  but stay on the allowlist as cross-thread atomics.
 - **vendored Betelgeuse** is trusted-vendored, loomed upstream where feasible.
 
 The honest finding stands: the SPSC mailbox and `SharedCapacityScope` are the
 only first-party custom lock-free structures. Everything else is stdlib,
-single-writer handshakes, ordinary counters, or vendored. There is no runtime
-task-list or effect-batching shared atomic, and global event ids are merged by
-sort across shards, not held in a cross-thread atomic.
+single-writer handshakes, cross-thread-but-count-only metrics, unique-id
+generators, or vendored. There is no runtime task-list or effect-batching
+shared atomic. Global event ids *are* drawn from a shared cross-thread atomic in
+the threaded runtime (a monotonic counter, not a lock-free structure); the trace
+is then merged by sort over those ids. The explicit-step oracle shares the same
+`IdSource` but touches it single-threaded, which is why its runs stay
+byte-reproducible.
 
 ## Crate boundaries that must not drift
 

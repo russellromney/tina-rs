@@ -13,9 +13,15 @@
 #
 # Scope: the shared-nothing semantic core only —
 #   tina, tina-runtime, tina-sim, tina-mailbox-spsc, tina-supervisor (their src/).
-# Bridges (tokio/tower/reqwest/sqlite/sqlx/aws/rpc-tokio) are the explicitly
-# different trusted-edge boundary where Tina meets SDK queues/threads
-# (`.intent/SYSTEM.md` bridge posture); examples and tests are not shipped.
+# The choice is not arbitrary — every first-party crate is accounted for:
+#   - tina-codec / tina-rpc / tina-rpc-macros / tina-macros / tina-tracing carry
+#     no shared-memory primitive at all (verified by the same grep).
+#   - Bridges (tokio/tower/reqwest/sqlite/sqlx/aws/rpc-tokio) are the explicitly
+#     different trusted-edge boundary where Tina meets SDK queues/threads
+#     (`.intent/SYSTEM.md` bridge posture).
+#   - tina-proof-harness uses atomics but is test/proof tooling, not the shipped
+#     semantic core (like examples and tests). Add it to CORE_SRC in the guard if
+#     that ever changes.
 # Vendored Betelgeuse is trusted-vendored, loomed upstream where feasible.
 #
 # The guard ignores comment-only matches (a primitive named in a doc comment is
@@ -29,7 +35,10 @@
 #   handshake-cell    — single-writer atomic state/flag crossing threads via Arc,
 #                       documented ordering; not a lock-free algorithm
 #   metrics-counter   — Relaxed atomic counters (count only; never guard data)
-#   id-counter        — monotonic id / temp-name generator
+#   id-counter        — fetch_add unique-id / temp-name generator (Relaxed). May
+#                       be cross-thread: a process-global `static AtomicU64`, or
+#                       the shared `IdSource` the threaded runtime clones to every
+#                       shard thread. Not a lock-free data structure.
 #   diagnostic-counter— process-global diagnostic tally
 #
 # Format: <path>  <classification>  [note]
@@ -60,7 +69,7 @@ tina-runtime/src/live_report.rs         metrics-counter    accepted / rejected_f
 tina-runtime/src/host_burst.rs          metrics-counter    submitted / observed / admitted burst counters
 
 # --- monotonic id / temp-name counters ---
-tina-runtime/src/lib.rs                 id-counter         next_event_id / next_call_id sources
+tina-runtime/src/lib.rs                 id-counter         IdSource next_event_id / next_call_id; shared Arc<AtomicU64> cloned to every shard thread in the threaded runtime (single-threaded in the explicit-step oracle)
 tina-runtime/src/admission.rs           id-counter         NEXT_GATE_ID
 tina-runtime/src/call/groups.rs         id-counter         call-group COUNTER
 tina-runtime/src/deferred.rs            id-counter         deferred-slot COUNTER
