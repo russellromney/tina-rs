@@ -1,178 +1,318 @@
-//! TLS lane and stream wrappers: rustls-backed TLS over Tina's runtime
-//! TCP, plus bounded per-operation worker threads that perform handshake /
-//! read / write / close on the substrate. `tls_lane_capacity` bounds
-//! in-flight TLS work for the shard.
+//! TLS over Tina's Betelgeuse TCP rail, with rustls in sans-I/O mode.
+//!
+//! The runtime owns a rustls [`rustls::Connection`] per [`TlsStreamId`] and
+//! drives it on the shard thread as Betelgeuse harvests TCP completions — no
+//! worker thread, no second socket stack, server and client can share one
+//! runtime. Each TLS op owns its underlying Betelgeuse socket exclusively and
+//! serializes its own TCP ops: at most one `recv` *or* `send` in flight at a
+//! time (Hard Constraint 6). A single `tls_*` call may issue an interleaved
+//! *sequence* of recv/send, never two at once — that is what keeps the
+//! one-pending-op rule from re-creating the old handshake deadlock.
+//!
+//! `tls_lane_capacity` bounds the shard-total count of in-flight TLS ops; a
+//! submission past it fails with [`CallError::TlsFull`].
 
 use super::*;
 
-pub(super) type TlsClientStream = rustls::StreamOwned<rustls::ClientConnection, TcpStream>;
-pub(super) type TlsServerStream = rustls::StreamOwned<rustls::ServerConnection, TcpStream>;
+/// Max ciphertext bytes pulled from the socket in one pump turn. Mirrors a
+/// `tcp_read` `max_len` so one pump turn cannot process unbounded records and
+/// starve the shard. One TLS record is at most ~16 KiB + overhead.
+const TLS_CIPHERTEXT_CHUNK: usize = 16 * 1024;
 
-pub(super) enum TlsRuntimeStream {
-    Client(TlsClientStream),
-    Server(TlsServerStream),
+/// Bound on rustls' internal plaintext buffer. Keeps `tls_write` from growing
+/// unbounded against a slow peer: the op drives encrypt+flush incrementally and
+/// completes only once all ciphertext is on the wire. A peer that never drains
+/// surfaces as the whole-op timeout, not unbounded memory.
+const TLS_PLAINTEXT_BUFFER_LIMIT: usize = 64 * 1024;
+
+/// The on-shard TLS lane. Holds a clone of the runtime's Betelgeuse loop and
+/// owns every TLS socket exclusively (the isolate only ever sees the opaque
+/// [`TlsStreamId`] / [`TlsListenerId`]).
+pub(super) struct TlsLane {
+    io_loop: IOLoopHandle<Global>,
+    /// Shard-total cap on in-flight TLS ops (`tls_lane_capacity`).
+    capacity: usize,
+    next_listener_id: u64,
+    next_stream_id: u64,
+    listeners: Vec<TlsListenerEntry>,
+    /// Established streams between ops. Each owns its rustls connection,
+    /// socket, ciphertext buffers, and at most one in-flight Betelgeuse op.
+    streams: Vec<TlsStreamEntry>,
+    pending: Vec<TlsPending>,
+    /// Call ids cancelled by close-wins. `advance` drains them into synthetic
+    /// `Failed(TargetClosed)` completions exactly once; the op then tombstones
+    /// until its backend completion slot (if any) is released.
+    cancelled_by_close: Vec<CallId>,
 }
 
-impl Read for TlsRuntimeStream {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        match self {
-            Self::Client(stream) => stream.read(buf),
-            Self::Server(stream) => stream.read(buf),
-        }
-    }
-}
-
-impl Write for TlsRuntimeStream {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        match self {
-            Self::Client(stream) => stream.write(buf),
-            Self::Server(stream) => stream.write(buf),
-        }
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        match self {
-            Self::Client(stream) => stream.flush(),
-            Self::Server(stream) => stream.flush(),
-        }
-    }
-}
-
-impl TlsRuntimeStream {
-    pub(super) fn tcp(&self) -> &TcpStream {
-        match self {
-            Self::Client(stream) => &stream.sock,
-            Self::Server(stream) => &stream.sock,
-        }
-    }
-
-    pub(super) fn send_close_notify(&mut self) {
-        match self {
-            Self::Client(stream) => stream.conn.send_close_notify(),
-            Self::Server(stream) => stream.conn.send_close_notify(),
-        }
-    }
-
-    /// The ALPN protocol negotiated during the handshake, as raw wire
-    /// bytes, or `None` when no ALPN was negotiated.
-    pub(super) fn alpn_protocol(&self) -> Option<Vec<u8>> {
-        let raw = match self {
-            Self::Client(stream) => stream.conn.alpn_protocol(),
-            Self::Server(stream) => stream.conn.alpn_protocol(),
-        };
-        raw.map(|bytes| bytes.to_vec())
-    }
-}
-
-pub(super) enum TlsLane {
-    Worker(TlsWorkerLane),
-}
-
-pub(super) struct TlsWorkerLane {
-    pub(super) capacity: usize,
-    pub(super) completion_sender: Option<SyncSender<TlsCompletion>>,
-    pub(super) completions: Receiver<TlsCompletion>,
-    pub(super) handles: Vec<JoinHandle<()>>,
-    pub(super) pending: Vec<TlsPending>,
-    pub(super) listeners: Vec<TlsListenerEntry>,
-    pub(super) streams: Vec<TlsStreamEntry>,
-    pub(super) next_listener_id: u64,
-    pub(super) next_stream_id: u64,
-    /// Call ids cancelled by close-wins. `advance()` drains into
-    /// synthetic `Failed(TargetClosed)` completions; the worker's
-    /// real completion is dropped because the pending entry is gone.
-    pub(super) cancelled_by_close: Vec<CallId>,
-}
-
-pub(super) struct TlsListenerEntry {
+struct TlsListenerEntry {
     id: TlsListenerId,
-    listener: Arc<TcpListener>,
+    socket: Box<dyn IOSocket>,
     config: Arc<rustls::ServerConfig>,
 }
 
-pub(super) struct TlsStreamEntry {
+struct TlsStreamEntry {
     id: TlsStreamId,
-    stream: Arc<Mutex<TlsRuntimeStream>>,
+    io: TlsIo,
 }
 
-pub(super) struct TlsPending {
-    pub(super) call_id: CallId,
-    pub(super) lane: TlsPendingLane,
-    pub(super) deadline: Instant,
-    pub(super) cancelled: Arc<AtomicBool>,
-    pub(super) timed_out: bool,
+/// One TLS connection's byte machine: the rustls connection, its owned socket,
+/// the bounded inbound/outbound ciphertext buffers, and the single in-flight
+/// Betelgeuse op (Hard Constraint 6: never two at once).
+struct TlsIo {
+    conn: rustls::Connection,
+    socket: Box<dyn IOSocket>,
+    /// Ciphertext recv'd from the socket but not yet accepted by `read_tls`.
+    inbound: Vec<u8>,
+    /// Ciphertext drained from rustls awaiting `send`. Front is consumed as
+    /// sends complete.
+    outbound: Vec<u8>,
+    socket_op: SocketOp,
+    /// The socket reported clean TCP EOF (recv returned 0 bytes).
+    read_eof: bool,
+    /// The TCP EOF has been signalled into rustls (`read_tls` of an empty
+    /// reader sets `has_seen_eof`). Signalled at most once.
+    eof_signaled: bool,
 }
 
+/// The single Betelgeuse op a [`TlsIo`] may have in flight.
+enum SocketOp {
+    Idle,
+    Connect(Box<ConnectCompletion>),
+    Recv(Box<RecvCompletion>),
+    Send(Box<SendCompletion>),
+}
+
+impl SocketOp {
+    /// True while the backend still holds a pointer to this op's completion
+    /// slot — the box must not be dropped until the backend releases it.
+    fn live(&self) -> bool {
+        match self {
+            Self::Idle => false,
+            Self::Connect(c) => !c.has_result(),
+            Self::Recv(c) => !c.has_result(),
+            Self::Send(c) => !c.has_result(),
+        }
+    }
+}
+
+/// Which isolate-facing lane a pending op occupies. Mirrors the TCP rail:
+/// duplicate work on one stream/listener lane is rejected with `ResourceBusy`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum TlsPendingLane {
+enum TlsLaneKey {
     Connect(CallId),
-    ListenerAccept(TlsListenerId),
+    Accept(TlsListenerId),
     Stream(TlsStreamId),
 }
 
-pub(super) enum TlsCommand {
-    Bind {
-        call_id: CallId,
-        addr: SocketAddr,
-        certificate_chain: Vec<Vec<u8>>,
-        private_key: Vec<u8>,
-        alpn_protocols: Vec<Vec<u8>>,
-        cancelled: Arc<AtomicBool>,
-    },
+struct TlsPending {
+    call_id: CallId,
+    lane: TlsLaneKey,
+    /// Whole-op deadline, computed once at submit; every internal TCP op runs
+    /// against this single deadline (Hole 3 #1: timeout spans the whole op).
+    deadline: Instant,
+    /// Set by user-cancel, timeout, or close-wins. A cancelled op never pumps
+    /// again and never delivers a real result; it lingers only to keep a live
+    /// backend completion slot alive (tombstone).
+    cancelled: bool,
+    state: TlsOpState,
+}
+
+/// The per-op state machine. Connect/Accept/Close own their [`TlsIo`] in the
+/// pending entry; Read/Write drive the [`TlsIo`] living in `streams`.
+enum TlsOpState {
+    Connect { io: TlsIo, alpn_offered: bool },
     Accept {
-        call_id: CallId,
-        listener: Arc<TcpListener>,
+        listener: TlsListenerId,
         config: Arc<rustls::ServerConfig>,
-        timeout: Duration,
-        cancelled: Arc<AtomicBool>,
+        accept: Box<AcceptCompletion>,
+        io: Option<TlsIo>,
+        peer_addr: Option<SocketAddr>,
     },
-    Connect {
-        call_id: CallId,
-        addr: SocketAddr,
-        server_name: String,
-        root_certificates: Vec<Vec<u8>>,
-        alpn_protocols: Vec<Vec<u8>>,
-        timeout: Duration,
-        cancelled: Arc<AtomicBool>,
-    },
-    Read {
-        call_id: CallId,
-        stream: Arc<Mutex<TlsRuntimeStream>>,
-        max_len: usize,
-        timeout: Duration,
-        cancelled: Arc<AtomicBool>,
-    },
+    Read { stream: TlsStreamId, max_len: usize },
     Write {
-        call_id: CallId,
-        stream: Arc<Mutex<TlsRuntimeStream>>,
-        bytes: Vec<u8>,
-        timeout: Duration,
-        cancelled: Arc<AtomicBool>,
+        stream: TlsStreamId,
+        plaintext: Vec<u8>,
+        fed: usize,
     },
-    Close {
-        call_id: CallId,
-        stream: Arc<Mutex<TlsRuntimeStream>>,
-        timeout: Duration,
-        cancelled: Arc<AtomicBool>,
-    },
+    Close { io: TlsIo, sent_close_notify: bool },
 }
 
-pub(super) struct TlsCompletion {
-    pub(super) call_id: CallId,
-    pub(super) result: TlsCompletionResult,
+/// One step of pumping a [`TlsIo`] toward a goal.
+enum PumpStep {
+    /// A socket op is in flight (or more data is needed): call again next turn.
+    Pending,
+    /// The goal is met; carry the typed output back to the op handler.
+    Done,
+    /// The op failed with this typed error.
+    Failed(CallError),
 }
 
-pub(super) enum TlsCompletionResult {
-    Bound(Box<Result<(TcpListener, rustls::ServerConfig), CallError>>),
-    Accepted(Box<Result<(TlsRuntimeStream, SocketAddr), CallError>>),
-    Connected(Box<Result<TlsRuntimeStream, CallError>>),
-    Output(CallOutput),
+impl TlsIo {
+    fn new(conn: rustls::Connection, socket: Box<dyn IOSocket>) -> Self {
+        let mut io = Self {
+            conn,
+            socket,
+            inbound: Vec::new(),
+            outbound: Vec::new(),
+            socket_op: SocketOp::Idle,
+            read_eof: false,
+            eof_signaled: false,
+        };
+        io.conn.set_buffer_limit(Some(TLS_PLAINTEXT_BUFFER_LIMIT));
+        io
+    }
+
+    /// Harvest the single in-flight Betelgeuse op if it has a result. Returns
+    /// `Ok(true)` when an op completed (state advanced), `Ok(false)` when the
+    /// op is still in flight, `Err` on a socket error.
+    fn harvest(&mut self) -> Result<bool, CallError> {
+        match &mut self.socket_op {
+            SocketOp::Idle => Ok(false),
+            SocketOp::Connect(c) => {
+                if !c.has_result() {
+                    return Ok(false);
+                }
+                let result = c.take_result().expect("connect completion advertised a result");
+                self.socket_op = SocketOp::Idle;
+                result.map(|()| true).map_err(|_| CallError::Io)
+            }
+            SocketOp::Recv(c) => {
+                if !c.has_result() {
+                    return Ok(false);
+                }
+                let result = c.take_result().expect("recv completion advertised a result");
+                self.socket_op = SocketOp::Idle;
+                match result {
+                    Ok(bytes) if bytes.is_empty() => {
+                        self.read_eof = true;
+                        Ok(true)
+                    }
+                    Ok(bytes) => {
+                        self.inbound.extend_from_slice(&bytes);
+                        Ok(true)
+                    }
+                    Err(_) => Err(CallError::Io),
+                }
+            }
+            SocketOp::Send(c) => {
+                if !c.has_result() {
+                    return Ok(false);
+                }
+                let result = c.take_result().expect("send completion advertised a result");
+                self.socket_op = SocketOp::Idle;
+                match result {
+                    Ok(count) => {
+                        let count = count.min(self.outbound.len());
+                        self.outbound.drain(..count);
+                        Ok(true)
+                    }
+                    Err(_) => Err(CallError::Io),
+                }
+            }
+        }
+    }
+
+    /// Feed buffered inbound ciphertext into rustls and process records. Marks
+    /// rustls' `has_seen_eof` exactly once when the socket has hit TCP EOF so
+    /// `reader()` can distinguish a clean `close_notify` from truncation.
+    fn ingest(&mut self) -> Result<(), CallError> {
+        loop {
+            if self.conn.wants_read() && !self.inbound.is_empty() {
+                let mut src: &[u8] = &self.inbound;
+                let read = match self.conn.read_tls(&mut src) {
+                    // rustls' input buffer is full: drain plaintext first.
+                    Ok(0) => break,
+                    Ok(n) => n,
+                    Err(_) => return Err(CallError::Io),
+                };
+                self.inbound.drain(..read);
+            } else if self.conn.wants_read() && self.read_eof && !self.eof_signaled {
+                let _ = self.conn.read_tls(&mut std::io::empty());
+                self.eof_signaled = true;
+            } else {
+                break;
+            }
+            let was_handshaking = self.conn.is_handshaking();
+            if self.conn.process_new_packets().is_err() {
+                return Err(if was_handshaking {
+                    CallError::TlsHandshake
+                } else {
+                    CallError::Io
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Pull all pending TLS output (handshake messages, alerts, encrypted
+    /// records, `close_notify`) into the outbound ciphertext buffer.
+    fn egress(&mut self) {
+        while self.conn.wants_write() {
+            if self.conn.write_tls(&mut self.outbound).is_err() {
+                break;
+            }
+        }
+    }
+
+    /// Arm one `send` for the front of the outbound buffer. Caller guarantees
+    /// `socket_op` is Idle and outbound is non-empty (Hard Constraint 6).
+    fn arm_send(&mut self) -> Result<(), CallError> {
+        let end = self.outbound.len().min(TLS_CIPHERTEXT_CHUNK);
+        let chunk = self.outbound[..end].to_vec();
+        let mut completion = Box::new(SendCompletion::new());
+        if self.socket.send(&mut completion, chunk).is_err() {
+            return Err(CallError::Io);
+        }
+        self.socket_op = SocketOp::Send(completion);
+        Ok(())
+    }
+
+    /// Arm one bounded `recv`. Caller guarantees `socket_op` is Idle.
+    fn arm_recv(&mut self) -> Result<(), CallError> {
+        let mut completion = Box::new(RecvCompletion::new());
+        if self.socket.recv(&mut completion, TLS_CIPHERTEXT_CHUNK).is_err() {
+            return Err(CallError::Io);
+        }
+        self.socket_op = SocketOp::Recv(completion);
+        Ok(())
+    }
+
+    /// Flush outbound ciphertext (one send) then, if nothing is queued and the
+    /// connection still wants input, arm one recv. Returns whether a socket op
+    /// is now in flight.
+    fn flush_or_fill(&mut self, want_more_input: bool) -> Result<bool, CallError> {
+        if !matches!(self.socket_op, SocketOp::Idle) {
+            return Ok(true);
+        }
+        if !self.outbound.is_empty() {
+            self.arm_send()?;
+            return Ok(true);
+        }
+        if want_more_input && !self.read_eof {
+            self.arm_recv()?;
+            return Ok(true);
+        }
+        Ok(false)
+    }
 }
 
 impl TlsLane {
-    pub(super) fn new(capacity: usize) -> Self {
-        Self::Worker(TlsWorkerLane::new(capacity))
+    pub(super) fn new(capacity: usize, io_loop: IOLoopHandle<Global>) -> Self {
+        assert!(capacity > 0, "TLS lane capacity must be > 0");
+        Self {
+            io_loop,
+            capacity,
+            next_listener_id: 1,
+            next_stream_id: 1,
+            listeners: Vec::with_capacity(INITIAL_DRIVER_RESOURCE_CAPACITY),
+            streams: Vec::with_capacity(INITIAL_DRIVER_RESOURCE_CAPACITY),
+            pending: Vec::with_capacity(INITIAL_DRIVER_PENDING_CAPACITY),
+            cancelled_by_close: Vec::new(),
+        }
     }
+
+    // --- submission ------------------------------------------------------
 
     #[allow(clippy::too_many_arguments)]
     pub(super) fn submit_connect(
@@ -185,178 +325,103 @@ impl TlsLane {
         timeout: Duration,
         now: Instant,
     ) -> Option<DriverCompletion> {
-        match self {
-            Self::Worker(lane) => lane.submit_connect(
+        if let Some(failure) = self.reject_if_full_or_zero(call_id, timeout) {
+            return Some(failure);
+        }
+        let alpn_offered = !alpn_protocols.is_empty();
+        let conn = match build_client_connection(&server_name, root_certificates, alpn_protocols) {
+            Ok(conn) => conn,
+            Err(error) => {
+                return Some(DriverCompletion {
+                    call_id,
+                    result: CallOutput::Failed(error),
+                });
+            }
+        };
+        let socket = match self.io_loop.socket() {
+            Ok(socket) => socket,
+            Err(_) => {
+                return Some(DriverCompletion {
+                    call_id,
+                    result: CallOutput::Failed(CallError::Io),
+                });
+            }
+        };
+        let mut completion = Box::new(ConnectCompletion::new());
+        if socket.connect(&mut completion, addr).is_err() {
+            return Some(DriverCompletion {
                 call_id,
-                addr,
-                server_name,
-                root_certificates,
-                alpn_protocols,
-                timeout,
-                now,
-            ),
+                result: CallOutput::Failed(CallError::Io),
+            });
         }
-    }
-
-    pub(super) fn submit_bind(
-        &mut self,
-        call_id: CallId,
-        addr: SocketAddr,
-        certificate_chain: Vec<Vec<u8>>,
-        private_key: Vec<u8>,
-        alpn_protocols: Vec<Vec<u8>>,
-        now: Instant,
-    ) -> Option<DriverCompletion> {
-        match self {
-            Self::Worker(lane) => lane.submit_bind(
-                call_id,
-                addr,
-                certificate_chain,
-                private_key,
-                alpn_protocols,
-                now,
-            ),
-        }
-    }
-
-    pub(super) fn submit_accept(
-        &mut self,
-        call_id: CallId,
-        listener: TlsListenerId,
-        timeout: Duration,
-        now: Instant,
-    ) -> Option<DriverCompletion> {
-        match self {
-            Self::Worker(lane) => lane.submit_accept(call_id, listener, timeout, now),
-        }
-    }
-
-    pub(super) fn submit_listener_close(
-        &mut self,
-        call_id: CallId,
-        listener: TlsListenerId,
-    ) -> Option<DriverCompletion> {
-        match self {
-            Self::Worker(lane) => lane.submit_listener_close(call_id, listener),
-        }
-    }
-
-    pub(super) fn submit_read(
-        &mut self,
-        call_id: CallId,
-        stream: TlsStreamId,
-        max_len: usize,
-        timeout: Duration,
-        now: Instant,
-    ) -> Option<DriverCompletion> {
-        match self {
-            Self::Worker(lane) => lane.submit_read(call_id, stream, max_len, timeout, now),
-        }
-    }
-
-    pub(super) fn submit_write(
-        &mut self,
-        call_id: CallId,
-        stream: TlsStreamId,
-        bytes: Vec<u8>,
-        timeout: Duration,
-        now: Instant,
-    ) -> Option<DriverCompletion> {
-        match self {
-            Self::Worker(lane) => lane.submit_write(call_id, stream, bytes, timeout, now),
-        }
-    }
-
-    pub(super) fn submit_close(
-        &mut self,
-        call_id: CallId,
-        stream: TlsStreamId,
-        timeout: Duration,
-        now: Instant,
-    ) -> Option<DriverCompletion> {
-        match self {
-            Self::Worker(lane) => lane.submit_close(call_id, stream, timeout, now),
-        }
-    }
-
-    pub(super) fn advance(&mut self, now: Instant, completed: &mut Vec<DriverCompletion>) {
-        match self {
-            Self::Worker(lane) => lane.advance(now, completed),
-        }
-    }
-
-    pub(super) fn has_pending(&self) -> bool {
-        match self {
-            Self::Worker(lane) => lane.has_pending(),
-        }
-    }
-
-    pub(super) fn cancel(&mut self, call_id: CallId) -> bool {
-        match self {
-            Self::Worker(lane) => lane.cancel(call_id),
-        }
-    }
-
-    pub(super) fn cancel_pending(&mut self, deadline: Instant) {
-        match self {
-            Self::Worker(lane) => lane.cancel_pending(deadline),
-        }
-    }
-
-    pub(super) fn resource_report(&self) -> DriverResourceReport {
-        match self {
-            Self::Worker(lane) => lane.resource_report(),
-        }
-    }
-}
-
-impl Drop for TlsLane {
-    fn drop(&mut self) {
-        self.cancel_pending(Instant::now());
-    }
-}
-impl TlsWorkerLane {
-    pub(super) fn new(capacity: usize) -> Self {
-        assert!(capacity > 0, "TLS lane capacity must be > 0");
-        let (completion_sender, completions) = sync_channel(capacity.saturating_add(1));
-        Self {
-            capacity,
-            completion_sender: Some(completion_sender),
-            completions,
-            handles: Vec::with_capacity(capacity.min(INITIAL_DRIVER_PENDING_CAPACITY)),
-            pending: Vec::with_capacity(capacity.min(INITIAL_DRIVER_PENDING_CAPACITY)),
-            listeners: Vec::with_capacity(INITIAL_DRIVER_RESOURCE_CAPACITY),
-            streams: Vec::with_capacity(INITIAL_DRIVER_RESOURCE_CAPACITY),
-            next_listener_id: 1,
-            next_stream_id: 1,
-            cancelled_by_close: Vec::new(),
-        }
-    }
-
-    pub(super) fn submit_bind(
-        &mut self,
-        call_id: CallId,
-        addr: SocketAddr,
-        certificate_chain: Vec<Vec<u8>>,
-        private_key: Vec<u8>,
-        alpn_protocols: Vec<Vec<u8>>,
-        now: Instant,
-    ) -> Option<DriverCompletion> {
-        let cancelled = Arc::new(AtomicBool::new(false));
-        self.submit_command(
+        let mut io = TlsIo::new(rustls::Connection::Client(conn), socket);
+        io.socket_op = SocketOp::Connect(completion);
+        self.pending.push(TlsPending {
             call_id,
-            TlsPendingLane::Connect(call_id),
-            Arc::clone(&cancelled),
-            now,
-            TlsCommand::Bind {
+            lane: TlsLaneKey::Connect(call_id),
+            deadline: now + timeout,
+            cancelled: false,
+            state: TlsOpState::Connect { io, alpn_offered },
+        });
+        None
+    }
+
+    pub(super) fn submit_bind(
+        &mut self,
+        call_id: CallId,
+        addr: SocketAddr,
+        certificate_chain: Vec<Vec<u8>>,
+        private_key: Vec<u8>,
+        alpn_protocols: Vec<Vec<u8>>,
+        _now: Instant,
+    ) -> Option<DriverCompletion> {
+        let config = match build_server_config(certificate_chain, private_key, alpn_protocols) {
+            Ok(config) => Arc::new(config),
+            Err(error) => {
+                return Some(DriverCompletion {
+                    call_id,
+                    result: CallOutput::Failed(error),
+                });
+            }
+        };
+        let socket = match self.io_loop.socket() {
+            Ok(socket) => socket,
+            Err(_) => {
+                return Some(DriverCompletion {
+                    call_id,
+                    result: CallOutput::Failed(CallError::Io),
+                });
+            }
+        };
+        if socket.bind(addr).is_err() {
+            return Some(DriverCompletion {
                 call_id,
-                addr,
-                certificate_chain,
-                private_key,
-                alpn_protocols,
-                cancelled,
+                result: CallOutput::Failed(CallError::Io),
+            });
+        }
+        let local_addr = match socket.local_addr() {
+            Ok(addr) => addr,
+            Err(_) => {
+                return Some(DriverCompletion {
+                    call_id,
+                    result: CallOutput::Failed(CallError::Io),
+                });
+            }
+        };
+        let id = TlsListenerId::new(self.next_listener_id);
+        self.next_listener_id += 1;
+        self.listeners.push(TlsListenerEntry {
+            id,
+            socket,
+            config,
+        });
+        Some(DriverCompletion {
+            call_id,
+            result: CallOutput::TlsBound {
+                listener: id,
+                local_addr,
             },
-        )
+        })
     }
 
     pub(super) fn submit_accept(
@@ -366,33 +431,44 @@ impl TlsWorkerLane {
         timeout: Duration,
         now: Instant,
     ) -> Option<DriverCompletion> {
-        let lane = TlsPendingLane::ListenerAccept(listener);
-        if self.lane_has_pending(lane) {
+        let lane = TlsLaneKey::Accept(listener);
+        if self.lane_has_active(lane) {
             return Some(DriverCompletion {
                 call_id,
                 result: CallOutput::Failed(CallError::ResourceBusy),
             });
         }
-        let Some(entry) = self.listener(listener) else {
+        if let Some(failure) = self.reject_if_full_or_zero(call_id, timeout) {
+            return Some(failure);
+        }
+        let Some(entry) = self.listeners.iter().find(|entry| entry.id == listener) else {
             return Some(DriverCompletion {
                 call_id,
                 result: CallOutput::Failed(CallError::InvalidResource),
             });
         };
-        let cancelled = Arc::new(AtomicBool::new(false));
-        self.submit_command(
+        let config = Arc::clone(&entry.config);
+        let mut accept = Box::new(AcceptCompletion::new());
+        if entry.socket.accept(&mut accept).is_err() {
+            return Some(DriverCompletion {
+                call_id,
+                result: CallOutput::Failed(CallError::Io),
+            });
+        }
+        self.pending.push(TlsPending {
             call_id,
             lane,
-            Arc::clone(&cancelled),
-            now,
-            TlsCommand::Accept {
-                call_id,
-                listener: entry.0,
-                config: entry.1,
-                timeout,
-                cancelled,
+            deadline: now + timeout,
+            cancelled: false,
+            state: TlsOpState::Accept {
+                listener,
+                config,
+                accept,
+                io: None,
+                peer_addr: None,
             },
-        )
+        });
+        None
     }
 
     pub(super) fn submit_listener_close(
@@ -406,93 +482,20 @@ impl TlsWorkerLane {
                 result: CallOutput::Failed(CallError::InvalidResource),
             });
         };
-        // Close wins: cancel any pending accept on this listener.
-        // Mirrors `do_listener_close` on the TCP lane.
+        // Close wins: cancel any pending accept on this listener. The accept's
+        // backend completion slot is kept alive (tombstone) until released.
         for pending in self.pending.iter_mut() {
-            if matches!(pending.lane, TlsPendingLane::ListenerAccept(l) if l == listener)
-                && !pending.cancelled.load(Ordering::Acquire)
-            {
-                pending.cancelled.store(true, Ordering::Release);
-                pending.timed_out = true;
+            if pending.lane == TlsLaneKey::Accept(listener) && !pending.cancelled {
+                pending.cancelled = true;
                 self.cancelled_by_close.push(pending.call_id);
             }
         }
-        self.listeners.remove(index);
+        let entry = self.listeners.remove(index);
+        entry.socket.close();
         Some(DriverCompletion {
             call_id,
             result: CallOutput::TlsListenerClosed,
         })
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub(super) fn submit_connect(
-        &mut self,
-        call_id: CallId,
-        addr: SocketAddr,
-        server_name: String,
-        root_certificates: Vec<Vec<u8>>,
-        alpn_protocols: Vec<Vec<u8>>,
-        timeout: Duration,
-        now: Instant,
-    ) -> Option<DriverCompletion> {
-        let cancelled = Arc::new(AtomicBool::new(false));
-        self.submit_command(
-            call_id,
-            TlsPendingLane::Connect(call_id),
-            cancelled,
-            now,
-            TlsCommand::Connect {
-                call_id,
-                addr,
-                server_name,
-                root_certificates,
-                alpn_protocols,
-                timeout,
-                cancelled: Arc::new(AtomicBool::new(false)),
-            },
-        )
-    }
-
-    pub(super) fn submit_close(
-        &mut self,
-        call_id: CallId,
-        stream_id: TlsStreamId,
-        timeout: Duration,
-        now: Instant,
-    ) -> Option<DriverCompletion> {
-        let lane = TlsPendingLane::Stream(stream_id);
-        let Some(stream_arc) = self.stream(stream_id) else {
-            return Some(DriverCompletion {
-                call_id,
-                result: CallOutput::Failed(CallError::InvalidResource),
-            });
-        };
-        // Close wins: cancel any pending read/write on this stream.
-        for pending in self.pending.iter_mut() {
-            if pending.lane == lane && !pending.cancelled.load(Ordering::Acquire) {
-                pending.cancelled.store(true, Ordering::Release);
-                pending.timed_out = true;
-                self.cancelled_by_close.push(pending.call_id);
-            }
-        }
-        // Free the lane slot now. The worker still flushes through
-        // its cloned `Arc<Mutex<TlsRuntimeStream>>`; further
-        // read/write/close submissions on this id see
-        // `InvalidResource`.
-        self.streams.retain(|entry| entry.id != stream_id);
-        let cancelled = Arc::new(AtomicBool::new(false));
-        self.submit_command(
-            call_id,
-            lane,
-            Arc::clone(&cancelled),
-            now,
-            TlsCommand::Close {
-                call_id,
-                stream: stream_arc,
-                timeout,
-                cancelled,
-            },
-        )
     }
 
     pub(super) fn submit_read(
@@ -503,33 +506,30 @@ impl TlsWorkerLane {
         timeout: Duration,
         now: Instant,
     ) -> Option<DriverCompletion> {
-        let lane = TlsPendingLane::Stream(stream);
-        if self.lane_has_pending(lane) {
+        let lane = TlsLaneKey::Stream(stream);
+        if self.lane_has_active(lane) {
             return Some(DriverCompletion {
                 call_id,
                 result: CallOutput::Failed(CallError::ResourceBusy),
             });
         }
-        let Some(stream) = self.stream(stream) else {
+        if !self.streams.iter().any(|entry| entry.id == stream) {
             return Some(DriverCompletion {
                 call_id,
                 result: CallOutput::Failed(CallError::InvalidResource),
             });
-        };
-        let cancelled = Arc::new(AtomicBool::new(false));
-        self.submit_command(
+        }
+        if let Some(failure) = self.reject_if_full_or_zero(call_id, timeout) {
+            return Some(failure);
+        }
+        self.pending.push(TlsPending {
             call_id,
             lane,
-            Arc::clone(&cancelled),
-            now,
-            TlsCommand::Read {
-                call_id,
-                stream,
-                max_len,
-                timeout,
-                cancelled,
-            },
-        )
+            deadline: now + timeout,
+            cancelled: false,
+            state: TlsOpState::Read { stream, max_len },
+        });
+        None
     }
 
     pub(super) fn submit_write(
@@ -540,114 +540,103 @@ impl TlsWorkerLane {
         timeout: Duration,
         now: Instant,
     ) -> Option<DriverCompletion> {
-        let lane = TlsPendingLane::Stream(stream);
-        if self.lane_has_pending(lane) {
+        let lane = TlsLaneKey::Stream(stream);
+        if self.lane_has_active(lane) {
             return Some(DriverCompletion {
                 call_id,
                 result: CallOutput::Failed(CallError::ResourceBusy),
             });
         }
-        let Some(stream) = self.stream(stream) else {
+        if !self.streams.iter().any(|entry| entry.id == stream) {
+            return Some(DriverCompletion {
+                call_id,
+                result: CallOutput::Failed(CallError::InvalidResource),
+            });
+        }
+        if let Some(failure) = self.reject_if_full_or_zero(call_id, timeout) {
+            return Some(failure);
+        }
+        self.pending.push(TlsPending {
+            call_id,
+            lane,
+            deadline: now + timeout,
+            cancelled: false,
+            state: TlsOpState::Write {
+                stream,
+                plaintext: bytes,
+                fed: 0,
+            },
+        });
+        None
+    }
+
+    pub(super) fn submit_close(
+        &mut self,
+        call_id: CallId,
+        stream: TlsStreamId,
+        timeout: Duration,
+        now: Instant,
+    ) -> Option<DriverCompletion> {
+        let Some(index) = self.streams.iter().position(|entry| entry.id == stream) else {
             return Some(DriverCompletion {
                 call_id,
                 result: CallOutput::Failed(CallError::InvalidResource),
             });
         };
-        let cancelled = Arc::new(AtomicBool::new(false));
-        self.submit_command(
+        if let Some(failure) = self.reject_if_full_or_zero(call_id, timeout) {
+            return Some(failure);
+        }
+        // Close wins: cancel any pending read/write on this stream. Its
+        // backend completion slot lives in the stream's `TlsIo`, which the
+        // close op takes ownership of below — so removing the read/write
+        // pending entry never drops a live slot.
+        for pending in self.pending.iter_mut() {
+            if pending.lane == TlsLaneKey::Stream(stream) && !pending.cancelled {
+                pending.cancelled = true;
+                self.cancelled_by_close.push(pending.call_id);
+            }
+        }
+        // Take the stream out of the table; further read/write/close on this id
+        // now see `InvalidResource`. The close op owns the `TlsIo` and flushes
+        // `close_notify` through it.
+        let entry = self.streams.remove(index);
+        self.pending.push(TlsPending {
             call_id,
-            lane,
-            Arc::clone(&cancelled),
-            now,
-            TlsCommand::Write {
-                call_id,
-                stream,
-                bytes,
-                timeout,
-                cancelled,
+            lane: TlsLaneKey::Stream(stream),
+            deadline: now + timeout,
+            cancelled: false,
+            state: TlsOpState::Close {
+                io: entry.io,
+                sent_close_notify: false,
             },
-        )
+        });
+        None
     }
 
-    pub(super) fn submit_command(
-        &mut self,
-        call_id: CallId,
-        lane: TlsPendingLane,
-        cancelled: Arc<AtomicBool>,
-        now: Instant,
-        mut command: TlsCommand,
-    ) -> Option<DriverCompletion> {
-        let timeout = command.timeout();
-        if command.timeout().is_zero() {
-            return Some(DriverCompletion {
-                call_id,
-                result: CallOutput::Failed(CallError::Timeout),
-            });
-        }
-        let Some(completion_sender) = &self.completion_sender else {
-            return Some(DriverCompletion {
-                call_id,
-                result: CallOutput::Failed(CallError::TlsClosed),
-            });
-        };
-        if self.pending.len() >= self.capacity {
-            return Some(DriverCompletion {
-                call_id,
-                result: CallOutput::Failed(CallError::TlsFull),
-            });
-        }
-        command.set_cancelled(Arc::clone(&cancelled));
-        let completion_sender = completion_sender.clone();
-        let spawn = thread::Builder::new()
-            .name(format!("tina-tls-{call_id:?}"))
-            .spawn(move || {
-                let call_id = command.call_id();
-                let result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    execute_tls_command(command)
-                })) {
-                    Ok(result) => result,
-                    Err(_) => TlsCompletionResult::Output(CallOutput::Failed(CallError::Io)),
-                };
-                let _ = completion_sender.send(TlsCompletion { call_id, result });
-            });
-        match spawn {
-            Ok(handle) => {
-                self.pending.push(TlsPending {
-                    call_id,
-                    lane,
-                    deadline: now + timeout,
-                    cancelled,
-                    timed_out: false,
-                });
-                self.handles.push(handle);
-                None
-            }
-            Err(_) => Some(DriverCompletion {
-                call_id,
-                result: CallOutput::Failed(CallError::Io),
-            }),
-        }
-    }
+    // --- advance / pump --------------------------------------------------
 
     pub(super) fn advance(&mut self, now: Instant, completed: &mut Vec<DriverCompletion>) {
-        // Drain close-wins cancellations into synthetic completions.
-        while let Some(call_id) = self.cancelled_by_close.pop() {
-            if let Some(idx) = self.pending.iter().position(|p| p.call_id == call_id) {
-                self.pending.remove(idx);
-            }
-            completed.push(DriverCompletion {
-                call_id,
-                result: CallOutput::Failed(CallError::TargetClosed),
-            });
+        // Step the shared Betelgeuse loop only while TLS has live work, so a
+        // runtime that uses no TLS (and the deterministic simulated-IO TCP
+        // tests) never sees an extra step from this lane.
+        if self.has_live_socket_work() {
+            let _ = self.io_loop.step();
         }
 
-        for pending in &mut self.pending {
-            if !pending.timed_out
-                && !pending.cancelled.load(Ordering::Acquire)
-                && now >= pending.deadline
-            {
-                pending.timed_out = true;
-                pending.cancelled.store(true, Ordering::Release);
+        // Close-wins cancellations become one synthetic `TargetClosed` each.
+        while let Some(call_id) = self.cancelled_by_close.pop() {
+            if self.pending.iter().any(|p| p.call_id == call_id) {
+                completed.push(DriverCompletion {
+                    call_id,
+                    result: CallOutput::Failed(CallError::TargetClosed),
+                });
+            }
+        }
+
+        // Whole-op timeouts: one `Timeout` each, then tombstone.
+        for pending in self.pending.iter_mut() {
+            if !pending.cancelled && now >= pending.deadline {
+                pending.cancelled = true;
                 completed.push(DriverCompletion {
                     call_id: pending.call_id,
                     result: CallOutput::Failed(CallError::Timeout),
@@ -655,287 +644,424 @@ impl TlsWorkerLane {
             }
         }
 
-        loop {
-            match self.completions.try_recv() {
-                Ok(completion) => self.finish_completion(completion, completed),
-                Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => {
-                    self.completion_sender = None;
-                    break;
+        // Pump active ops. Index-based so completed ops can hand their `TlsIo`
+        // back into `self.streams` and so cancelled tombstones can be reaped.
+        let mut index = 0;
+        while index < self.pending.len() {
+            if self.pending[index].cancelled {
+                // Tombstone: drop once the backend no longer holds the slot.
+                if self.pending[index].holds_live_backend_ref() {
+                    index += 1;
+                } else {
+                    self.pending.remove(index);
                 }
+                continue;
+            }
+            match self.pump(index) {
+                Some(result) => {
+                    let call_id = self.pending.remove(index).call_id;
+                    completed.push(DriverCompletion { call_id, result });
+                }
+                None => index += 1,
             }
         }
-        self.reap_finished_workers();
     }
 
-    pub(super) fn finish_completion(
-        &mut self,
-        completion: TlsCompletion,
-        completed: &mut Vec<DriverCompletion>,
-    ) {
-        let Some(index) = self
-            .pending
-            .iter()
-            .position(|entry| entry.call_id == completion.call_id)
-        else {
-            return;
-        };
-        let pending = self.pending.remove(index);
-        if pending.cancelled.load(Ordering::Acquire) || pending.timed_out {
-            return;
+    /// Drives one active pending op. Returns `Some(output)` when it completes,
+    /// `None` when it is still in flight.
+    fn pump(&mut self, index: usize) -> Option<CallOutput> {
+        // Read/Write borrow the `TlsIo` from `self.streams`; the others own it
+        // in their pending state. Split the borrow accordingly.
+        match &self.pending[index].state {
+            TlsOpState::Read { .. } | TlsOpState::Write { .. } => self.pump_stream_op(index),
+            TlsOpState::Connect { .. } => self.pump_connect(index),
+            TlsOpState::Accept { .. } => self.pump_accept(index),
+            TlsOpState::Close { .. } => self.pump_close(index),
         }
-        let result = match completion.result {
-            TlsCompletionResult::Bound(result) => match *result {
-                Ok((listener, config)) => {
-                    let id = TlsListenerId::new(self.next_listener_id);
-                    self.next_listener_id += 1;
-                    let local_addr = listener.local_addr().map_err(|_| CallError::Io);
-                    let listener = Arc::new(listener);
-                    self.listeners.push(TlsListenerEntry {
-                        id,
-                        listener,
-                        config: Arc::new(config),
-                    });
-                    match local_addr {
-                        Ok(local_addr) => CallOutput::TlsBound {
-                            listener: id,
-                            local_addr,
-                        },
-                        Err(error) => CallOutput::Failed(error),
-                    }
-                }
-                Err(error) => CallOutput::Failed(error),
-            },
-            TlsCompletionResult::Accepted(result) => match *result {
-                Ok((stream, peer_addr)) => {
-                    let selected_alpn = stream.alpn_protocol();
-                    let id = TlsStreamId::new(self.next_stream_id);
-                    self.next_stream_id += 1;
-                    self.streams.push(TlsStreamEntry {
-                        id,
-                        stream: Arc::new(Mutex::new(stream)),
-                    });
-                    CallOutput::TlsAccepted {
-                        stream: id,
-                        peer_addr,
-                        selected_alpn,
-                    }
-                }
-                Err(error) => CallOutput::Failed(error),
-            },
-            TlsCompletionResult::Connected(result) => match *result {
-                Ok(stream) => {
-                    let selected_alpn = stream.alpn_protocol();
-                    let id = TlsStreamId::new(self.next_stream_id);
-                    self.next_stream_id += 1;
-                    self.streams.push(TlsStreamEntry {
-                        id,
-                        stream: Arc::new(Mutex::new(stream)),
-                    });
-                    CallOutput::TlsConnected {
-                        stream: id,
-                        selected_alpn,
-                    }
-                }
-                Err(error) => CallOutput::Failed(error),
-            },
-            // Streams are removed at `submit_close` time, not here.
-            TlsCompletionResult::Output(output) => output,
-        };
-        completed.push(DriverCompletion {
-            call_id: completion.call_id,
-            result,
-        });
     }
+
+    fn pump_connect(&mut self, index: usize) -> Option<CallOutput> {
+        let step = {
+            let TlsOpState::Connect { io, .. } = &mut self.pending[index].state else {
+                unreachable!("pump_connect on non-connect op");
+            };
+            drive_handshake(io)
+        };
+        match step {
+            PumpStep::Pending => None,
+            PumpStep::Failed(error) => Some(CallOutput::Failed(error)),
+            PumpStep::Done => {
+                let TlsOpState::Connect { io, alpn_offered } =
+                    std::mem::replace(&mut self.pending[index].state, TlsOpState::taken())
+                else {
+                    unreachable!();
+                };
+                if alpn_offered && io.conn.alpn_protocol().is_none() {
+                    return Some(CallOutput::Failed(CallError::TlsAlpnMismatch));
+                }
+                let selected_alpn = io.conn.alpn_protocol().map(<[u8]>::to_vec);
+                let id = self.register_stream(io);
+                Some(CallOutput::TlsConnected {
+                    stream: id,
+                    selected_alpn,
+                })
+            }
+        }
+    }
+
+    fn pump_accept(&mut self, index: usize) -> Option<CallOutput> {
+        // Phase A: wait for the listener accept to land a socket, then wrap it
+        // in a `ServerConnection`.
+        {
+            let TlsOpState::Accept {
+                config,
+                accept,
+                io,
+                peer_addr,
+                ..
+            } = &mut self.pending[index].state
+            else {
+                unreachable!("pump_accept on non-accept op");
+            };
+            if io.is_none() {
+                if !accept.has_result() {
+                    return None;
+                }
+                let socket = match accept.take_result().expect("accept advertised a result") {
+                    Ok(socket) => socket,
+                    Err(_) => return Some(CallOutput::Failed(CallError::Io)),
+                };
+                let addr = match socket.peer_addr() {
+                    Ok(addr) => addr,
+                    Err(_) => return Some(CallOutput::Failed(CallError::Io)),
+                };
+                let conn = match rustls::ServerConnection::new(Arc::clone(config)) {
+                    Ok(conn) => conn,
+                    Err(_) => return Some(CallOutput::Failed(CallError::TlsHandshake)),
+                };
+                *peer_addr = Some(addr);
+                *io = Some(TlsIo::new(rustls::Connection::Server(conn), socket));
+            }
+        }
+
+        // Phase B: drive the server handshake.
+        let step = {
+            let TlsOpState::Accept { io, .. } = &mut self.pending[index].state else {
+                unreachable!();
+            };
+            drive_handshake(io.as_mut().expect("io set in phase A"))
+        };
+        match step {
+            PumpStep::Pending => None,
+            PumpStep::Failed(error) => Some(CallOutput::Failed(error)),
+            PumpStep::Done => {
+                let TlsOpState::Accept { io, peer_addr, .. } =
+                    std::mem::replace(&mut self.pending[index].state, TlsOpState::taken())
+                else {
+                    unreachable!();
+                };
+                let io = io.expect("io set in phase A");
+                let selected_alpn = io.conn.alpn_protocol().map(<[u8]>::to_vec);
+                let id = self.register_stream(io);
+                Some(CallOutput::TlsAccepted {
+                    stream: id,
+                    peer_addr: peer_addr.expect("peer addr set in phase A"),
+                    selected_alpn,
+                })
+            }
+        }
+    }
+
+    fn pump_close(&mut self, index: usize) -> Option<CallOutput> {
+        let TlsOpState::Close {
+            io,
+            sent_close_notify,
+        } = &mut self.pending[index].state
+        else {
+            unreachable!("pump_close on non-close op");
+        };
+        // Harvest any socket op the preempted read/write left in flight before
+        // queueing close_notify, so we never run two socket ops at once.
+        if let Err(error) = io.harvest() {
+            return Some(CallOutput::Failed(error));
+        }
+        if io.socket_op.live() {
+            return None;
+        }
+        if !*sent_close_notify {
+            io.conn.send_close_notify();
+            *sent_close_notify = true;
+        }
+        io.egress();
+        match io.flush_or_fill(false) {
+            Ok(true) => None,
+            Ok(false) => Some(CallOutput::TlsClosed),
+            Err(error) => Some(CallOutput::Failed(error)),
+        }
+    }
+
+    fn pump_stream_op(&mut self, index: usize) -> Option<CallOutput> {
+        let stream_id = match &self.pending[index].state {
+            TlsOpState::Read { stream, .. } | TlsOpState::Write { stream, .. } => *stream,
+            _ => unreachable!(),
+        };
+        let Some(stream_index) = self.streams.iter().position(|entry| entry.id == stream_id) else {
+            // The stream vanished (closed underneath us). Surface it as a
+            // closed target rather than a silent hang.
+            return Some(CallOutput::Failed(CallError::TargetClosed));
+        };
+
+        // Pre-step: harvest the one in-flight socket op, feed/process inbound,
+        // and pull outbound ciphertext. Scoped so the goal step can re-borrow.
+        {
+            let io = &mut self.streams[stream_index].io;
+            if let Err(error) = io.harvest() {
+                return Some(CallOutput::Failed(error));
+            }
+            if io.socket_op.live() {
+                return None;
+            }
+            if let Err(error) = io.ingest() {
+                return Some(CallOutput::Failed(error));
+            }
+            io.egress();
+        }
+
+        match &mut self.pending[index].state {
+            TlsOpState::Read { max_len, .. } => {
+                let max_len = *max_len;
+                let io = &mut self.streams[stream_index].io;
+                // Flush any wants_write (alerts, key updates) before reading —
+                // the write-during-read path, still one socket op at a time.
+                if !io.outbound.is_empty() {
+                    return match io.flush_or_fill(false) {
+                        Ok(_) => None,
+                        Err(error) => Some(CallOutput::Failed(error)),
+                    };
+                }
+                let mut buffer = vec![0_u8; max_len];
+                match std::io::Read::read(&mut io.conn.reader(), &mut buffer) {
+                    Ok(count) => {
+                        buffer.truncate(count);
+                        Some(CallOutput::TlsRead { bytes: buffer })
+                    }
+                    Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                        // Need more ciphertext. Arm a recv.
+                        match io.flush_or_fill(true) {
+                            Ok(true) => None,
+                            Ok(false) => Some(CallOutput::Failed(CallError::Io)),
+                            Err(error) => Some(CallOutput::Failed(error)),
+                        }
+                    }
+                    // Clean close_notify reads as `Ok(0)` above (empty
+                    // `TlsRead`, matching today). Truncation surfaces here as
+                    // `UnexpectedEof` -> `Io`, distinct from a clean close.
+                    Err(error) if error.kind() == ErrorKind::UnexpectedEof => {
+                        Some(CallOutput::Failed(CallError::Io))
+                    }
+                    Err(_) => Some(CallOutput::Failed(CallError::Io)),
+                }
+            }
+            TlsOpState::Write { plaintext, fed, .. } => {
+                let io = &mut self.streams[stream_index].io;
+                // Feed as much plaintext as rustls' bounded buffer accepts,
+                // then flush its ciphertext before feeding more.
+                while *fed < plaintext.len() {
+                    let written =
+                        std::io::Write::write(&mut io.conn.writer(), &plaintext[*fed..]).unwrap_or(0);
+                    if written == 0 {
+                        break;
+                    }
+                    *fed += written;
+                }
+                io.egress();
+                let drained =
+                    *fed >= plaintext.len() && io.outbound.is_empty() && !io.conn.wants_write();
+                if drained && matches!(io.socket_op, SocketOp::Idle) {
+                    return Some(CallOutput::TlsWrote {
+                        count: plaintext.len(),
+                    });
+                }
+                match io.flush_or_fill(false) {
+                    Ok(_) => None,
+                    Err(error) => Some(CallOutput::Failed(error)),
+                }
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    /// Moves a fully-handshaked connection into the stream table and returns
+    /// its freshly-allocated id.
+    fn register_stream(&mut self, io: TlsIo) -> TlsStreamId {
+        let id = TlsStreamId::new(self.next_stream_id);
+        self.next_stream_id += 1;
+        self.streams.push(TlsStreamEntry { id, io });
+        id
+    }
+
+    // --- lifecycle -------------------------------------------------------
 
     pub(super) fn has_pending(&self) -> bool {
-        self.pending
-            .iter()
-            .any(|entry| !entry.cancelled.load(Ordering::Acquire) && !entry.timed_out)
+        self.pending.iter().any(|entry| !entry.cancelled)
+    }
+
+    /// Whether any backend completion slot is in flight — used to decide
+    /// whether to step the shared loop this turn.
+    fn has_live_socket_work(&self) -> bool {
+        self.pending.iter().any(|p| p.holds_live_backend_ref())
+            || self.streams.iter().any(|s| s.io.socket_op.live())
     }
 
     pub(super) fn cancel(&mut self, call_id: CallId) -> bool {
         let Some(pending) = self
             .pending
             .iter_mut()
-            .find(|entry| entry.call_id == call_id && !entry.cancelled.load(Ordering::Acquire))
+            .find(|entry| entry.call_id == call_id && !entry.cancelled)
         else {
             return false;
         };
-        pending.cancelled.store(true, Ordering::Release);
+        pending.cancelled = true;
         true
     }
 
-    pub(super) fn cancel_pending(&mut self, deadline: Instant) {
-        // Stop accepting new TLS work. Existing worker threads own
-        // cloned resources until they complete or the shutdown budget
-        // expires; remaining `self.pending` after the budget is stuck
-        // work and is surfaced through `resource_report`.
-        self.completion_sender = None;
-        let mut sink = Vec::new();
-        loop {
-            self.drain_into_sink(&mut sink);
-            self.reap_finished_workers();
-            if self.pending.is_empty() || Instant::now() >= deadline {
-                break;
-            }
-            thread::sleep(Duration::from_millis(1));
+    pub(super) fn cancel_pending(&mut self, _deadline: Instant) {
+        // Release every backend-held completion slot, then drop our boxes. We
+        // share the io_loop with the TCP lane, which runs its own
+        // `cancel_pending` (and the final `pending_completion_count()==0`
+        // assertion) after us; clearing references here keeps that honest.
+        let _ = self.io_loop.cancel_pending_completions();
+        self.pending.clear();
+        self.streams.clear();
+        for entry in self.listeners.drain(..) {
+            entry.socket.close();
         }
-        sink.clear();
-        if self.pending.is_empty() {
-            self.listeners.clear();
-            self.streams.clear();
-        }
-    }
-
-    pub(super) fn drain_into_sink(&mut self, sink: &mut Vec<DriverCompletion>) {
-        while let Ok(completion) = self.completions.try_recv() {
-            self.finish_completion(completion, sink);
-        }
-        self.reap_finished_workers();
-    }
-
-    pub(super) fn reap_finished_workers(&mut self) {
-        let mut index = 0;
-        while index < self.handles.len() {
-            if self.handles[index].is_finished() {
-                let handle = self.handles.swap_remove(index);
-                let _ = handle.join();
-            } else {
-                index += 1;
-            }
-        }
-    }
-
-    pub(super) fn stream(&self, stream: TlsStreamId) -> Option<Arc<Mutex<TlsRuntimeStream>>> {
-        self.streams
-            .iter()
-            .find(|entry| entry.id == stream)
-            .map(|entry| Arc::clone(&entry.stream))
-    }
-
-    pub(super) fn lane_has_pending(&self, lane: TlsPendingLane) -> bool {
-        self.pending
-            .iter()
-            .any(|entry| entry.lane == lane && !entry.cancelled.load(Ordering::Acquire))
-    }
-
-    pub(super) fn listener(
-        &self,
-        listener: TlsListenerId,
-    ) -> Option<(Arc<TcpListener>, Arc<rustls::ServerConfig>)> {
-        self.listeners
-            .iter()
-            .find(|entry| entry.id == listener)
-            .map(|entry| (Arc::clone(&entry.listener), Arc::clone(&entry.config)))
     }
 
     pub(super) fn resource_report(&self) -> DriverResourceReport {
-        // Each in-flight TLS op parks cloned `Arc<TcpListener>` /
-        // `Arc<Mutex<TlsRuntimeStream>>` inside the worker thread for
-        // the duration of accept/handshake/read/write/close. Count
-        // physical entries so stuck-after-shutdown work stays visible.
-        let physical = self.pending.len();
+        // worker_held: in-flight ops holding a socket not represented by a
+        // table id (connect/accept/close). Read/write keep their socket in the
+        // stream table, so they are counted under tls_streams instead.
+        let worker_held = self
+            .pending
+            .iter()
+            .filter(|p| p.holds_untabled_socket())
+            .count();
         DriverResourceReport {
             listeners: self.listeners.len(),
             tls_streams: self.streams.len(),
-            worker_held: physical,
-            pending_calls: physical,
+            worker_held,
+            // Physical pending entries the runtime still waits on. Cancelled
+            // tombstones drop out; timeout/close-win entries already delivered
+            // their terminal and are cancelled, so they too drop out here.
+            pending_calls: self.pending.iter().filter(|p| !p.cancelled).count(),
             ..DriverResourceReport::default()
         }
     }
+
+    // --- helpers ---------------------------------------------------------
+
+    fn lane_has_active(&self, lane: TlsLaneKey) -> bool {
+        self.pending
+            .iter()
+            .any(|entry| entry.lane == lane && !entry.cancelled)
+    }
+
+    fn reject_if_full_or_zero(
+        &self,
+        call_id: CallId,
+        timeout: Duration,
+    ) -> Option<DriverCompletion> {
+        if timeout.is_zero() {
+            return Some(DriverCompletion {
+                call_id,
+                result: CallOutput::Failed(CallError::Timeout),
+            });
+        }
+        if self.pending.iter().filter(|p| !p.cancelled).count() >= self.capacity {
+            return Some(DriverCompletion {
+                call_id,
+                result: CallOutput::Failed(CallError::TlsFull),
+            });
+        }
+        None
+    }
 }
 
-impl Drop for TlsWorkerLane {
+impl Drop for TlsLane {
     fn drop(&mut self) {
         self.cancel_pending(Instant::now());
     }
 }
 
-pub(super) fn execute_tls_command(command: TlsCommand) -> TlsCompletionResult {
-    match command {
-        TlsCommand::Bind {
-            addr,
-            certificate_chain,
-            private_key,
-            alpn_protocols,
-            cancelled,
-            ..
-        } => TlsCompletionResult::Bound(Box::new(bind_tls_listener(
-            addr,
-            certificate_chain,
-            private_key,
-            alpn_protocols,
-            &cancelled,
-        ))),
-        TlsCommand::Accept {
-            listener,
-            config,
-            timeout,
-            cancelled,
-            ..
-        } => TlsCompletionResult::Accepted(Box::new(accept_tls(
-            listener, config, timeout, &cancelled,
-        ))),
-        TlsCommand::Connect {
-            addr,
-            server_name,
-            root_certificates,
-            alpn_protocols,
-            timeout,
-            cancelled,
-            ..
-        } => TlsCompletionResult::Connected(Box::new(connect_tls(
-            addr,
-            &server_name,
-            root_certificates,
-            alpn_protocols,
-            timeout,
-            &cancelled,
-        ))),
-        TlsCommand::Read {
-            stream,
-            max_len,
-            timeout,
-            cancelled,
-            ..
-        } => TlsCompletionResult::Output(read_tls(stream, max_len, timeout, &cancelled)),
-        TlsCommand::Write {
-            stream,
-            bytes,
-            timeout,
-            cancelled,
-            ..
-        } => TlsCompletionResult::Output(write_tls(stream, &bytes, timeout, &cancelled)),
-        TlsCommand::Close {
-            stream,
-            timeout,
-            cancelled,
-            ..
-        } => TlsCompletionResult::Output(close_tls(stream, timeout, &cancelled)),
+impl TlsPending {
+    /// Whether the backend still holds a pointer to one of this op's
+    /// completion slots — gates tombstone reaping.
+    fn holds_live_backend_ref(&self) -> bool {
+        match &self.state {
+            TlsOpState::Connect { io, .. } | TlsOpState::Close { io, .. } => io.socket_op.live(),
+            TlsOpState::Accept { io: Some(io), .. } => io.socket_op.live(),
+            TlsOpState::Accept {
+                io: None, accept, ..
+            } => !accept.has_result(),
+            // Read/Write drive a socket owned by the stream table, not by the
+            // op, so the op holds no slot of its own.
+            TlsOpState::Read { .. } | TlsOpState::Write { .. } => false,
+        }
+    }
+
+    /// Whether this op holds a socket not represented by a stream-table id.
+    fn holds_untabled_socket(&self) -> bool {
+        matches!(
+            self.state,
+            TlsOpState::Connect { .. } | TlsOpState::Accept { .. } | TlsOpState::Close { .. }
+        )
     }
 }
 
-pub(super) fn connect_tls(
-    addr: SocketAddr,
+impl TlsOpState {
+    /// A spent placeholder used while moving a [`TlsIo`] out of a pending op.
+    fn taken() -> Self {
+        Self::Read {
+            stream: TlsStreamId::new(0),
+            max_len: 0,
+        }
+    }
+}
+
+/// Drives a [`TlsIo`] one step toward a completed handshake.
+fn drive_handshake(io: &mut TlsIo) -> PumpStep {
+    match io.harvest() {
+        Ok(_) => {}
+        Err(error) => return PumpStep::Failed(error),
+    }
+    if io.socket_op.live() {
+        return PumpStep::Pending;
+    }
+    if let Err(error) = io.ingest() {
+        return PumpStep::Failed(error);
+    }
+    io.egress();
+    if !io.conn.is_handshaking() {
+        return PumpStep::Done;
+    }
+    // Still handshaking: flush handshake output or read more. A clean EOF
+    // mid-handshake is a truncated handshake.
+    match io.flush_or_fill(true) {
+        Ok(true) => PumpStep::Pending,
+        Ok(false) => PumpStep::Failed(CallError::TlsHandshake),
+        Err(error) => PumpStep::Failed(error),
+    }
+}
+
+/// Builds a rustls client connection with explicit DER roots and optional ALPN.
+/// No system root store, no client auth — the same security posture as before.
+fn build_client_connection(
     server_name: &str,
     root_certificates: Vec<Vec<u8>>,
     alpn_protocols: Vec<Vec<u8>>,
-    timeout: Duration,
-    cancelled: &AtomicBool,
-) -> Result<TlsRuntimeStream, CallError> {
+) -> Result<rustls::ClientConnection, CallError> {
     let _ = rustls::crypto::ring::default_provider().install_default();
-    if cancelled.load(Ordering::Acquire) {
-        return Err(CallError::Timeout);
-    }
-    if timeout.is_zero() {
-        return Err(CallError::Timeout);
-    }
-    let tcp = TcpStream::connect_timeout(&addr, timeout).map_err(|_| CallError::Io)?;
-    // `set_*_timeout` only fails for `Some(zero)`/`None`; never here.
-    let _ = tcp.set_read_timeout(Some(timeout));
-    let _ = tcp.set_write_timeout(Some(timeout));
-
     let mut roots = rustls::RootCertStore::empty();
     for certificate in root_certificates {
         roots
@@ -945,42 +1071,20 @@ pub(super) fn connect_tls(
     let mut config = rustls::ClientConfig::builder()
         .with_root_certificates(roots)
         .with_no_client_auth();
-    let alpn_offered = !alpn_protocols.is_empty();
     config.alpn_protocols = alpn_protocols;
     let server_name = rustls::pki_types::ServerName::try_from(server_name.to_string())
         .map_err(|_| CallError::TlsName)?;
-    let connection = rustls::ClientConnection::new(Arc::new(config), server_name)
-        .map_err(|_| CallError::TlsName)?;
-    let mut stream = rustls::StreamOwned::new(connection, tcp);
-    while stream.conn.is_handshaking() {
-        if cancelled.load(Ordering::Acquire) {
-            return Err(CallError::Timeout);
-        }
-        stream
-            .conn
-            .complete_io(&mut stream.sock)
-            .map_err(|_| CallError::TlsHandshake)?;
-    }
-    // If we offered ALPN but the peer negotiated none, fail closed with a
-    // typed mismatch rather than silently proceeding on a protocol the
-    // caller did not ask for.
-    if alpn_offered && stream.conn.alpn_protocol().is_none() {
-        return Err(CallError::TlsAlpnMismatch);
-    }
-    Ok(TlsRuntimeStream::Client(stream))
+    rustls::ClientConnection::new(Arc::new(config), server_name).map_err(|_| CallError::TlsName)
 }
 
-pub(super) fn bind_tls_listener(
-    addr: SocketAddr,
+/// Builds a rustls server config from explicit DER cert chain + PKCS#8 key and
+/// optional ALPN.
+fn build_server_config(
     certificate_chain: Vec<Vec<u8>>,
     private_key: Vec<u8>,
     alpn_protocols: Vec<Vec<u8>>,
-    cancelled: &AtomicBool,
-) -> Result<(TcpListener, rustls::ServerConfig), CallError> {
+) -> Result<rustls::ServerConfig, CallError> {
     let _ = rustls::crypto::ring::default_provider().install_default();
-    if cancelled.load(Ordering::Acquire) {
-        return Err(CallError::Timeout);
-    }
     let certificates = certificate_chain
         .into_iter()
         .map(rustls::pki_types::CertificateDer::from)
@@ -991,219 +1095,5 @@ pub(super) fn bind_tls_listener(
         .with_single_cert(certificates, private_key)
         .map_err(|_| CallError::TlsCertificate)?;
     config.alpn_protocols = alpn_protocols;
-    let listener = TcpListener::bind(addr).map_err(|_| CallError::Io)?;
-    Ok((listener, config))
-}
-
-pub(super) fn accept_tls(
-    listener: Arc<TcpListener>,
-    config: Arc<rustls::ServerConfig>,
-    timeout: Duration,
-    cancelled: &AtomicBool,
-) -> Result<(TlsRuntimeStream, SocketAddr), CallError> {
-    if cancelled.load(Ordering::Acquire) || timeout.is_zero() {
-        return Err(CallError::Timeout);
-    }
-    listener
-        .set_nonblocking(true)
-        .map_err(|_| CallError::TlsClosed)?;
-    let deadline = Instant::now()
-        .checked_add(timeout)
-        .ok_or(CallError::Timeout)?;
-    // Idle accept poll. `thread::yield_now()` would burn CPU on a
-    // bound-but-quiet listener; sleep a millisecond between polls
-    // so an HTTPS listener that nobody is calling stays cheap.
-    // 1ms is well below the typical accept-deadline grain
-    // (250ms in dev, 100ms in pressure) and short enough that
-    // accept latency stays imperceptible.
-    let poll_interval = Duration::from_millis(1);
-    let (tcp, peer_addr) = loop {
-        if cancelled.load(Ordering::Acquire) || Instant::now() >= deadline {
-            return Err(CallError::Timeout);
-        }
-        match listener.accept() {
-            Ok(accepted) => break accepted,
-            Err(error) if error.kind() == ErrorKind::WouldBlock => {
-                thread::sleep(poll_interval);
-            }
-            Err(_) => return Err(CallError::Io),
-        }
-    };
-    tcp.set_nonblocking(false).map_err(|_| CallError::Io)?;
-    let remaining = deadline
-        .checked_duration_since(Instant::now())
-        .filter(|remaining| !remaining.is_zero())
-        .ok_or(CallError::Timeout)?;
-    // Infallible; see `connect_tls`.
-    let _ = tcp.set_read_timeout(Some(remaining));
-    let _ = tcp.set_write_timeout(Some(remaining));
-    let connection = rustls::ServerConnection::new(config).map_err(|_| CallError::TlsHandshake)?;
-    let mut stream = rustls::StreamOwned::new(connection, tcp);
-    while stream.conn.is_handshaking() {
-        if cancelled.load(Ordering::Acquire) || Instant::now() >= deadline {
-            return Err(CallError::Timeout);
-        }
-        let remaining = deadline
-            .checked_duration_since(Instant::now())
-            .filter(|remaining| !remaining.is_zero())
-            .ok_or(CallError::Timeout)?;
-        let _ = stream.sock.set_read_timeout(Some(remaining));
-        let _ = stream.sock.set_write_timeout(Some(remaining));
-        stream
-            .conn
-            .complete_io(&mut stream.sock)
-            .map_err(tls_handshake_error)?;
-    }
-    Ok((TlsRuntimeStream::Server(stream), peer_addr))
-}
-
-pub(super) fn tls_handshake_error(error: std::io::Error) -> CallError {
-    if matches!(
-        error.kind(),
-        ErrorKind::WouldBlock | ErrorKind::TimedOut | ErrorKind::Interrupted
-    ) {
-        CallError::Timeout
-    } else {
-        CallError::TlsHandshake
-    }
-}
-
-pub(super) fn read_tls(
-    stream: Arc<Mutex<TlsRuntimeStream>>,
-    max_len: usize,
-    timeout: Duration,
-    cancelled: &AtomicBool,
-) -> CallOutput {
-    if cancelled.load(Ordering::Acquire) {
-        return CallOutput::Failed(CallError::Timeout);
-    }
-    let mut guard = match stream.lock() {
-        Ok(guard) => guard,
-        Err(_) => return CallOutput::Failed(CallError::TlsClosed),
-    };
-    let _ = guard.tcp().set_read_timeout(Some(timeout));
-    let mut buffer = vec![0; max_len];
-    match guard.read(&mut buffer) {
-        Ok(count) => {
-            buffer.truncate(count);
-            CallOutput::TlsRead { bytes: buffer }
-        }
-        Err(error)
-            if matches!(
-                error.kind(),
-                ErrorKind::WouldBlock | ErrorKind::TimedOut | ErrorKind::Interrupted
-            ) =>
-        {
-            CallOutput::Failed(CallError::Timeout)
-        }
-        Err(_) => CallOutput::Failed(CallError::Io),
-    }
-}
-
-pub(super) fn write_tls(
-    stream: Arc<Mutex<TlsRuntimeStream>>,
-    bytes: &[u8],
-    timeout: Duration,
-    cancelled: &AtomicBool,
-) -> CallOutput {
-    if cancelled.load(Ordering::Acquire) {
-        return CallOutput::Failed(CallError::Timeout);
-    }
-    let mut guard = match stream.lock() {
-        Ok(guard) => guard,
-        Err(_) => return CallOutput::Failed(CallError::TlsClosed),
-    };
-    let _ = guard.tcp().set_write_timeout(Some(timeout));
-    match guard.write(bytes) {
-        Ok(count) => {
-            if guard.flush().is_err() {
-                return CallOutput::Failed(CallError::Io);
-            }
-            CallOutput::TlsWrote { count }
-        }
-        Err(error)
-            if matches!(
-                error.kind(),
-                ErrorKind::WouldBlock | ErrorKind::TimedOut | ErrorKind::Interrupted
-            ) =>
-        {
-            CallOutput::Failed(CallError::Timeout)
-        }
-        Err(_) => CallOutput::Failed(CallError::Io),
-    }
-}
-
-pub(super) fn close_tls(
-    stream: Arc<Mutex<TlsRuntimeStream>>,
-    timeout: Duration,
-    cancelled: &AtomicBool,
-) -> CallOutput {
-    if cancelled.load(Ordering::Acquire) {
-        return CallOutput::Failed(CallError::Timeout);
-    }
-    let mut guard = match stream.lock() {
-        Ok(guard) => guard,
-        Err(_) => return CallOutput::Failed(CallError::TlsClosed),
-    };
-    let _ = guard.tcp().set_write_timeout(Some(timeout));
-    guard.send_close_notify();
-    match guard.flush() {
-        Ok(()) => CallOutput::TlsClosed,
-        Err(error)
-            if matches!(
-                error.kind(),
-                ErrorKind::WouldBlock | ErrorKind::TimedOut | ErrorKind::Interrupted
-            ) =>
-        {
-            CallOutput::Failed(CallError::Timeout)
-        }
-        Err(_) => CallOutput::Failed(CallError::Io),
-    }
-}
-
-impl TlsCommand {
-    pub(super) fn call_id(&self) -> CallId {
-        match self {
-            Self::Bind { call_id, .. }
-            | Self::Accept { call_id, .. }
-            | Self::Connect { call_id, .. }
-            | Self::Read { call_id, .. }
-            | Self::Write { call_id, .. }
-            | Self::Close { call_id, .. } => *call_id,
-        }
-    }
-
-    pub(super) fn timeout(&self) -> Duration {
-        match self {
-            Self::Bind { .. } => Duration::from_secs(86_400),
-            Self::Accept { timeout, .. }
-            | Self::Connect { timeout, .. }
-            | Self::Read { timeout, .. }
-            | Self::Write { timeout, .. }
-            | Self::Close { timeout, .. } => *timeout,
-        }
-    }
-
-    pub(super) fn set_cancelled(&mut self, cancelled: Arc<AtomicBool>) {
-        match self {
-            Self::Bind {
-                cancelled: slot, ..
-            }
-            | Self::Accept {
-                cancelled: slot, ..
-            }
-            | Self::Connect {
-                cancelled: slot, ..
-            }
-            | Self::Read {
-                cancelled: slot, ..
-            }
-            | Self::Write {
-                cancelled: slot, ..
-            }
-            | Self::Close {
-                cancelled: slot, ..
-            } => *slot = cancelled,
-        }
-    }
+    Ok(config)
 }
