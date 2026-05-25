@@ -1,15 +1,18 @@
 # specimen_native_https
 
-A tiny HTTPS/1.1 counter service. Tokio side: `tokio +
-tokio-rustls`, hand-rolled HTTP/1.1 over a TLS-wrapped socket. Tina
-side: `tina_http::HttpsListener` + a `Counter` isolate. The shared
-`scripted_client` is a stdlib rustls client that hits both sides
-identically: `GET /counter → POST × 3 → GET /counter → GET /missing`.
+A tiny HTTPS/1.1 counter service, run two ways through the same scripted flow:
+`GET /counter → POST × 3 → GET /counter → GET /missing`.
 
-The complement of [`specimen_native_http`](../specimen_native_http/README.md);
-this is the *server* comparison for HTTPS specifically. The Tina HTTPS
-**client** (`HttpClient` over `HttpTarget::Https`) is exercised by the
-integration tests in `tina-http/tests/client_tls_smoke.rs`.
+- **Tokio side:** a hand-rolled `tokio + tokio-rustls` server, hit by the
+  stdlib-rustls `scripted_client` — the interop counterparty.
+- **Tina side:** a `tina_http::HttpsListener` server **and** a
+  `tina_http::HttpClient` HTTPS client in **one runtime, on one shard**. TLS
+  rides Tina's Betelgeuse TCP rail (rustls sans-I/O on the shard thread), so a
+  Tina HTTPS client and server share a runtime. The old single-worker TLS lane
+  deadlocked both sides of one handshake — which is why the client used to live
+  in a separate stdlib-rustls process; it no longer has to.
+
+The complement of [`specimen_native_http`](../specimen_native_http/README.md).
 
 ## Run
 
@@ -30,9 +33,9 @@ side=tina  successful_get=2 successful_post=3 final_counter_value=3
 
 ## Read
 
-- [`src/tokio_impl.rs`](src/tokio_impl.rs)
-- [`src/tina_impl.rs`](src/tina_impl.rs)
-- [`src/lib.rs`](src/lib.rs) — the shared scripted rustls client.
+- [`src/tokio_impl.rs`](src/tokio_impl.rs) — the tokio+tokio-rustls counterparty.
+- [`src/tina_impl.rs`](src/tina_impl.rs) — the all-Tina client+server in one runtime.
+- [`src/lib.rs`](src/lib.rs) — the stdlib-rustls `scripted_client` for the tokio side.
 - [`src/tls_identity.rs`](src/tls_identity.rs) — rcgen self-sign.
 
 ## Shape
@@ -64,17 +67,15 @@ no atomics — the isolate owns it).
   Tokio side relies on the `with_single_cert` builder erroring at
   startup; the Tina side surfaces the same outcome via the runtime's
   typed `CallError`.
-- **TLS errors stay TLS errors.** When `HttpClient` is the caller (in
-  the integration tests), TLS reasons surface as
-  `HttpClientError::Transport { phase, source }` carrying
-  `TlsName`, `TlsCertificate`, `TlsHandshake`, `TlsFull`,
-  `TlsClosed`, or `Timeout`. They do *not* collapse into a generic
-  `Connect`/`Read`/`Write`.
-- **The HTTPS client side is in tests, not the example.** The
-  integration tests prove the client side end-to-end against a
-  thread-spawned rustls server. The runtime TLS lane is bounded:
-  each in-flight TLS operation occupies one worker slot up to
-  `tls_lane_capacity`.
+- **TLS errors stay TLS errors.** With `HttpClient` as the caller, TLS reasons
+  surface as `HttpClientError::Transport { phase, source }` carrying `TlsName`,
+  `TlsCertificate`, `TlsHandshake`, `TlsFull`, `TlsClosed`, or `Timeout`. They
+  do *not* collapse into a generic `Connect`/`Read`/`Write`.
+- **Client and server share a runtime.** The Tina side runs both ends on one
+  shard: TLS is a layer over the runtime's TCP rail, not a separate
+  blocking-socket subsystem on a worker thread. `tls_lane_capacity` bounds the
+  shard-total count of in-flight TLS ops (handshakes, reads, writes, closes),
+  not a per-stream worker slot.
 
 ## Where the boring deferred work lives
 
