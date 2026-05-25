@@ -2769,6 +2769,9 @@ fn local_system_shutdown_reports_in_flight_tls_handshake_resource() {
         .expect("parse bound addr");
     let raw = TcpStream::connect(addr).expect("connect raw tcp to tls listener");
 
+    // While the server is mid-handshake (raw peer never sends a ClientHello),
+    // the in-flight op is visible: the accept op holds an un-tabled socket
+    // (worker_held) and the handshake recv is a pending driver call.
     wait_until(|| {
         let topology = app.topology();
         let shard = topology
@@ -2777,25 +2780,31 @@ fn local_system_shutdown_reports_in_flight_tls_handshake_resource() {
         shard.worker_held_resource_count() > 0 && shard.pending_driver_call_count() > 0
     });
 
+    // TLS now rides the Betelgeuse rail, so a stuck handshake is cancellable
+    // on the substrate — shutdown drains it cleanly to zero rather than
+    // parking an unkillable worker thread (this is the #16 closure). The
+    // in-flight handshake recv is released by the substrate's pending-
+    // completion cancellation.
     let terminal = app.shutdown().drain().join_report();
-    assert!(!terminal.shutdown_report().clean());
     assert!(
-        terminal.shutdown_report().remaining_owned_resource_count() >= 1,
-        "shutdown must not claim zero while TLS worker still owns accept/handshake resource"
+        terminal.shutdown_report().clean(),
+        "in-flight TLS handshake must drain cleanly on the TCP rail at shutdown"
     );
-    assert!(
+    assert_eq!(
+        terminal.shutdown_report().remaining_owned_resource_count(),
+        0
+    );
+    assert_eq!(
         terminal
             .shutdown_report()
-            .remaining_worker_held_resource_count()
-            >= 1,
-        "shutdown must report TLS worker-held resource clones while handshake is stuck"
+            .remaining_worker_held_resource_count(),
+        0
     );
-    assert!(
+    assert_eq!(
         terminal
             .shutdown_report()
-            .remaining_pending_driver_call_count()
-            >= 1,
-        "shutdown must report the stuck TLS accept/handshake call"
+            .remaining_pending_driver_call_count(),
+        0
     );
     drop(raw);
 }
@@ -2859,11 +2868,15 @@ fn local_system_tls_lane_full_is_visible_with_configured_capacity() {
     });
 
     let terminal = app.shutdown().drain().join_report();
+    // `tls_bind` now completes inline (it just creates a listener), so it does
+    // not consume a lane slot. `tls_lane_capacity` bounds in-flight async TLS
+    // ops, so the second server's parked `tls_accept` is what hits `TlsFull`
+    // while the first server's accept holds the only slot.
     assert!(terminal.trace().iter().any(|event| {
         matches!(
             event.kind(),
             RuntimeEventKind::CallFailed {
-                call_kind: CallKind::TlsBind,
+                call_kind: CallKind::TlsAccept,
                 reason: CallError::TlsFull,
                 ..
             }

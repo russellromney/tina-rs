@@ -306,9 +306,12 @@ impl RuntimeCapabilities {
                 ShutdownSupport::Canceled,
                 None,
             ),
+            // TLS now rides the Betelgeuse TCP rail (rustls sans-I/O on the
+            // shard thread), not a blocking worker lane. `tls_lane_capacity`
+            // stays as the shard-total cap on in-flight TLS ops.
             tls: ResourceCapability::new(
                 ResourceSupport::Supported,
-                ResourceExecutionShape::LaneBackedBlocking,
+                ResourceExecutionShape::CompletionBacked,
                 CancellationSupport::TombstonedAfterStart,
                 ShutdownSupport::Tombstoned,
                 Some(tls_lane_capacity),

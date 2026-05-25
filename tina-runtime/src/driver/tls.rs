@@ -123,7 +123,6 @@ struct TlsPending {
 enum TlsOpState {
     Connect { io: TlsIo, alpn_offered: bool },
     Accept {
-        listener: TlsListenerId,
         config: Arc<rustls::ServerConfig>,
         accept: Box<AcceptCompletion>,
         io: Option<TlsIo>,
@@ -461,7 +460,6 @@ impl TlsLane {
             deadline: now + timeout,
             cancelled: false,
             state: TlsOpState::Accept {
-                listener,
                 config,
                 accept,
                 io: None,

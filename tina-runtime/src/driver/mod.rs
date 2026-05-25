@@ -28,15 +28,15 @@
 //!   shutdown was clean.
 //!
 use std::alloc::Global;
-use std::io::{ErrorKind, Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs, UdpSocket};
+use std::io::{ErrorKind, Read};
+use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::mpsc::{
     Receiver, SyncSender, TryRecvError, TrySendError as MpscTrySendError, sync_channel,
 };
 use std::sync::{
-    Arc, Mutex,
+    Arc,
     atomic::{AtomicBool, Ordering},
 };
 use std::thread::{self, JoinHandle};
@@ -70,8 +70,6 @@ use signals::{OsSignalDispatcher, SignalWaitEntry};
 use storage::{StorageJob, StorageLane};
 use tcp::BetelgeuseTcp;
 use tls::TlsLane;
-#[cfg(test)]
-use tls::{TlsCompletion, TlsCompletionResult, TlsPending, TlsPendingLane, TlsWorkerLane};
 use unix::UnixLane;
 
 const INITIAL_DRIVER_TIMER_CAPACITY: usize = 8;
@@ -246,10 +244,12 @@ impl BetelgeuseDriver {
 
     pub(crate) fn with_io_loop(io_loop: IOLoopHandle<Global>) -> Self {
         Self {
+            // TLS rides the same Betelgeuse loop as plain TCP — a cloned
+            // handle, not a second socket stack.
+            tls: TlsLane::new(DEFAULT_TLS_LANE_CAPACITY, io_loop.clone()),
             tcp: BetelgeuseTcp::with_io_loop(io_loop),
             storage: StorageLane::inline(),
             dns: DnsLane::new(DEFAULT_DNS_LANE_CAPACITY),
-            tls: TlsLane::new(DEFAULT_TLS_LANE_CAPACITY),
             process: ProcessLane::new(DEFAULT_PROCESS_LANE_CAPACITY),
             unix: UnixLane::new(),
             signals: Vec::with_capacity(
@@ -271,10 +271,10 @@ impl BetelgeuseDriver {
         signal_capacity: usize,
     ) -> Self {
         Self {
+            tls: TlsLane::new(tls_lane_capacity, io_loop.clone()),
             tcp: BetelgeuseTcp::with_io_loop(io_loop),
             storage: StorageLane::new(storage_lane_capacity),
             dns: DnsLane::new(dns_lane_capacity),
-            tls: TlsLane::new(tls_lane_capacity),
             process: ProcessLane::new(process_lane_capacity),
             unix: UnixLane::new(),
             signals: Vec::with_capacity(signal_capacity.min(INITIAL_DRIVER_PENDING_CAPACITY)),
@@ -878,267 +878,6 @@ mod tests {
     }
 
     #[test]
-    fn tls_lane_connects_writes_reads_and_closes_against_local_rustls_server() {
-        use std::io::{Read, Write};
-        use std::net::TcpListener;
-
-        let _ = rustls::crypto::ring::default_provider().install_default();
-        let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
-            .expect("generate local cert");
-        let cert_der = certified.cert.der().to_vec();
-        let key_der = certified.key_pair.serialize_der();
-        let server_cert = rustls::pki_types::CertificateDer::from(cert_der.clone());
-        let server_key = rustls::pki_types::PrivateKeyDer::Pkcs8(
-            rustls::pki_types::PrivatePkcs8KeyDer::from(key_der),
-        );
-        let server_config = rustls::ServerConfig::builder()
-            .with_no_client_auth()
-            .with_single_cert(vec![server_cert], server_key)
-            .expect("server config");
-
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind tls test listener");
-        let addr = listener.local_addr().expect("local addr");
-        let server = thread::spawn(move || {
-            let (tcp, _) = listener.accept().expect("accept tls client");
-            let connection =
-                rustls::ServerConnection::new(Arc::new(server_config)).expect("server conn");
-            let mut stream = rustls::StreamOwned::new(connection, tcp);
-            let mut request = [0_u8; 4];
-            stream.read_exact(&mut request).expect("read request");
-            assert_eq!(&request, b"ping");
-            stream.write_all(b"pong").expect("write response");
-            stream.flush().expect("flush response");
-        });
-
-        let mut lane = TlsWorkerLane::new(4);
-        assert!(
-            lane.submit_connect(
-                CallId::new(1),
-                addr,
-                "localhost".to_string(),
-                vec![cert_der],
-                Vec::new(),
-                Duration::from_secs(1),
-                Instant::now(),
-            )
-            .is_none()
-        );
-        let stream = wait_for_tls_completion(&mut lane, CallId::new(1), |output| match output {
-            CallOutput::TlsConnected { stream, .. } => Some(stream),
-            other => panic!("unexpected TLS connect output: {other:?}"),
-        });
-
-        assert!(
-            lane.submit_write(
-                CallId::new(2),
-                stream,
-                b"ping".to_vec(),
-                Duration::from_secs(1),
-                Instant::now(),
-            )
-            .is_none()
-        );
-        let wrote = wait_for_tls_completion(&mut lane, CallId::new(2), |output| match output {
-            CallOutput::TlsWrote { count } => Some(count),
-            other => panic!("unexpected TLS write output: {other:?}"),
-        });
-        assert_eq!(wrote, 4);
-
-        assert!(
-            lane.submit_read(
-                CallId::new(3),
-                stream,
-                4,
-                Duration::from_secs(1),
-                Instant::now()
-            )
-            .is_none()
-        );
-        let read = wait_for_tls_completion(&mut lane, CallId::new(3), |output| match output {
-            CallOutput::TlsRead { bytes } => Some(bytes),
-            other => panic!("unexpected TLS read output: {other:?}"),
-        });
-        assert_eq!(read, b"pong");
-
-        assert!(
-            lane.submit_close(
-                CallId::new(4),
-                stream,
-                Duration::from_secs(1),
-                Instant::now()
-            )
-            .is_none()
-        );
-        wait_for_tls_completion(&mut lane, CallId::new(4), |output| match output {
-            CallOutput::TlsClosed => Some(()),
-            other => panic!("unexpected TLS close output: {other:?}"),
-        });
-        server.join().expect("server thread");
-    }
-
-    /// Spawn a one-shot rustls server advertising `server_alpn`, returning
-    /// its bound address and join handle. The server drives its handshake
-    /// to completion then drops.
-    fn spawn_alpn_tls_server(
-        server_alpn: Vec<Vec<u8>>,
-    ) -> (SocketAddr, Vec<u8>, thread::JoinHandle<()>) {
-        let _ = rustls::crypto::ring::default_provider().install_default();
-        let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
-            .expect("generate local cert");
-        let cert_der = certified.cert.der().to_vec();
-        let key_der = certified.key_pair.serialize_der();
-        let server_cert = rustls::pki_types::CertificateDer::from(cert_der.clone());
-        let server_key = rustls::pki_types::PrivateKeyDer::Pkcs8(
-            rustls::pki_types::PrivatePkcs8KeyDer::from(key_der),
-        );
-        let mut server_config = rustls::ServerConfig::builder()
-            .with_no_client_auth()
-            .with_single_cert(vec![server_cert], server_key)
-            .expect("server config");
-        server_config.alpn_protocols = server_alpn;
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind alpn tls listener");
-        let addr = listener.local_addr().expect("local addr");
-        let handle = thread::spawn(move || {
-            let (mut tcp, _) = listener.accept().expect("accept alpn client");
-            let mut conn =
-                rustls::ServerConnection::new(Arc::new(server_config)).expect("server conn");
-            while conn.is_handshaking() {
-                if conn.complete_io(&mut tcp).is_err() {
-                    return;
-                }
-            }
-            // Hold briefly so the client side finishes its handshake read.
-            thread::sleep(Duration::from_millis(50));
-        });
-        (addr, cert_der, handle)
-    }
-
-    #[test]
-    fn connect_tls_selects_offered_alpn_protocol() {
-        let (addr, cert_der, server) = spawn_alpn_tls_server(vec![b"h2".to_vec()]);
-        let cancelled = AtomicBool::new(false);
-        let stream = tls::connect_tls(
-            addr,
-            "localhost",
-            vec![cert_der],
-            vec![b"h2".to_vec()],
-            Duration::from_secs(2),
-            &cancelled,
-        )
-        .expect("h2 connect");
-        assert_eq!(stream.alpn_protocol(), Some(b"h2".to_vec()));
-        drop(stream);
-        server.join().expect("server thread");
-    }
-
-    #[test]
-    fn connect_tls_alpn_offered_but_server_declines_is_mismatch() {
-        // Server advertises no ALPN; client offers h2. The handshake
-        // completes but negotiates no protocol, so the connect fails with
-        // a typed mismatch rather than silently proceeding.
-        let (addr, cert_der, server) = spawn_alpn_tls_server(Vec::new());
-        let cancelled = AtomicBool::new(false);
-        let result = tls::connect_tls(
-            addr,
-            "localhost",
-            vec![cert_der],
-            vec![b"h2".to_vec()],
-            Duration::from_secs(2),
-            &cancelled,
-        );
-        assert_eq!(result.err(), Some(CallError::TlsAlpnMismatch));
-        server.join().expect("server thread");
-    }
-
-    #[test]
-    fn connect_tls_without_alpn_offer_negotiates_none() {
-        // No ALPN offered → no mismatch even though the server supports h2.
-        let (addr, cert_der, server) = spawn_alpn_tls_server(vec![b"h2".to_vec()]);
-        let cancelled = AtomicBool::new(false);
-        let stream = tls::connect_tls(
-            addr,
-            "localhost",
-            vec![cert_der],
-            Vec::new(),
-            Duration::from_secs(2),
-            &cancelled,
-        )
-        .expect("plain connect");
-        assert_eq!(stream.alpn_protocol(), None);
-        drop(stream);
-        server.join().expect("server thread");
-    }
-
-    #[test]
-    fn tls_lane_deadline_tombstones_queued_work_until_late_completion() {
-        let (completion_sender, completions) = sync_channel(1);
-        let cancelled = Arc::new(AtomicBool::new(false));
-        let now = Instant::now();
-        let mut lane = TlsWorkerLane {
-            capacity: 1,
-            completion_sender: Some(completion_sender.clone()),
-            completions,
-            handles: Vec::new(),
-            pending: vec![TlsPending {
-                call_id: CallId::new(42),
-                lane: TlsPendingLane::Connect(CallId::new(42)),
-                deadline: now + Duration::from_millis(1),
-                cancelled: Arc::clone(&cancelled),
-                timed_out: false,
-            }],
-            listeners: Vec::new(),
-            streams: Vec::new(),
-            next_listener_id: 1,
-            next_stream_id: 1,
-            cancelled_by_close: Vec::new(),
-        };
-
-        let mut completed = Vec::new();
-        lane.advance(now + Duration::from_millis(2), &mut completed);
-        assert_eq!(completed.len(), 1);
-        assert_eq!(completed[0].call_id, CallId::new(42));
-        assert!(matches!(
-            completed[0].result,
-            CallOutput::Failed(CallError::Timeout)
-        ));
-        assert!(cancelled.load(Ordering::Acquire));
-        assert!(!lane.has_pending());
-        assert_eq!(lane.pending.len(), 1);
-
-        completion_sender
-            .send(TlsCompletion {
-                call_id: CallId::new(42),
-                result: TlsCompletionResult::Output(CallOutput::TlsClosed),
-            })
-            .expect("send late TLS completion");
-        completed.clear();
-        lane.advance(now + Duration::from_millis(3), &mut completed);
-        assert!(completed.is_empty());
-        assert!(lane.pending.is_empty());
-    }
-
-    fn wait_for_tls_completion<T>(
-        lane: &mut TlsWorkerLane,
-        call_id: CallId,
-        map: impl Fn(CallOutput) -> Option<T>,
-    ) -> T {
-        let mut completed = Vec::new();
-        let deadline = Instant::now() + Duration::from_secs(3);
-        while Instant::now() < deadline {
-            lane.advance(Instant::now(), &mut completed);
-            if let Some(index) = completed
-                .iter()
-                .position(|completion| completion.call_id == call_id)
-            {
-                let completion = completed.remove(index);
-                return map(completion.result).expect("mapped TLS completion");
-            }
-            thread::sleep(Duration::from_millis(1));
-        }
-        panic!("TLS completion {call_id:?} did not arrive");
-    }
-
-    #[test]
     fn storage_lane_shutdown_skips_buffered_work_that_never_started() {
         let mut lane = StorageLane::new(2);
         let (first_started_tx, first_started_rx) = sync_channel(1);
@@ -1473,46 +1212,6 @@ mod tests {
 
         cancelled.store(true, Ordering::Release);
         lane.cancel_pending(Instant::now());
-    }
-
-    #[test]
-    fn tls_pending_op_contributes_to_worker_held_and_pending() {
-        // Drive a TLS connect to a non-listening port so the lane stays
-        // in flight long enough to observe the count. The connect will
-        // eventually fail, but during the in-flight window the lane
-        // reports both worker-held and pending.
-        let mut lane = TlsWorkerLane::new(2);
-        let unreachable: SocketAddr = "127.0.0.1:1".parse().expect("loopback addr");
-        assert!(
-            lane.submit_connect(
-                CallId::new(1),
-                unreachable,
-                "localhost".to_string(),
-                vec![],
-                Vec::new(),
-                Duration::from_secs(2),
-                Instant::now(),
-            )
-            .is_none()
-        );
-        let report = lane.resource_report();
-        assert_eq!(
-            report.worker_held_resource_count(),
-            report.pending_driver_call_count(),
-            "TLS in-flight ops contribute equally to worker_held and pending"
-        );
-        assert!(report.pending_driver_call_count() >= 1);
-
-        // Drain so the lane drop does not race with the live connect.
-        let mut completed = Vec::new();
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while Instant::now() < deadline {
-            lane.advance(Instant::now(), &mut completed);
-            if !completed.is_empty() {
-                break;
-            }
-            thread::sleep(Duration::from_millis(5));
-        }
     }
 
     // -------------------------------------------------------------------
