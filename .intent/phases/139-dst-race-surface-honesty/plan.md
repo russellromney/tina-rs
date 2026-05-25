@@ -2,14 +2,17 @@
 
 ## Status
 
-- Planned v2 (2026-05-24): folds in `Plan Review 1`, which found this phase's own
-  enumerated surface was unverified and partly wrong. v2 makes "verify the surface
-  first" Step 1, and the coverage half collapses accordingly (see below).
+- Planned v3 (2026-05-25): folds in `Plan Review 1`, which found this phase's own
+  enumerated surface was unverified and partly wrong, and `Plan Review 2`, which
+  keeps `.intent/SYSTEM.md` load-bearing and treats `shared_scope` as
+  cross-thread-capable by public type shape.
 - **Honest correction:** the cross-shard transport is `std::sync::mpsc`
   (vendored stdlib, not ours to loom); there are no "runtime task-list /
   effect-batching atomics" as a shared structure; the real custom lock-free
-  surface is likely just the already-loomed SPSC mailbox, with `shared_scope.rs`
-  as the one genuine open question.
+  surface is the already-loomed SPSC mailbox plus `shared_scope.rs`, which is
+  public, `Arc`-backed, and therefore must be treated as cross-thread-capable
+  unless we change its type shape. This plan chooses to model it rather than
+  pretend intent makes it shard-local.
 - **Verified against `origin/main` a6cbaa9:** live multi-shard `trace()` merges +
   sorts by event id (`threaded_multi_shard.rs:570-580`), "events across shards
   interleave freely" comment still at `:106`, loom still only on
@@ -47,9 +50,11 @@
     shard-local id/capacity counters, not lock-free concurrency.
   - **Global event ids are not a shared atomic** — merged by sort across shards.
   - **`shared_scope.rs`** (`Arc<SharedScopeInner>` + `AtomicU64`/`AtomicUsize`) is
-    the **one open question**: SYSTEM.md calls `SharedCapacityScope` *shard-local*,
-    so its atomics are either removable shard-local defensiveness or a genuine
-    cross-thread loom candidate. The phase must determine which.
+    public and cloneable. Even if the intended service pattern is shard-local,
+    the type can cross threads. **Decision:** treat it as a real shared-memory
+    surface and add a loom/shuttle model for reserve/admit/release/drop/high-water
+    behavior, unless the implementation first makes the type non-cross-thread at
+    compile time.
 - loom covers `tina-mailbox-spsc` **only** today. Given the above, "loom expansion
   beyond mailbox" likely has **little real target** — the honest outcome may be
   "SPSC is the only custom lock-free structure; everything else is stdlib or
@@ -78,9 +83,12 @@ logical and lives in the deterministic oracle.
 
 ### Honesty (docs)
 
-- **Enumerate the shared-memory concurrency surface** in one place: SPSC mailbox,
-  shard-pair queue, runtime task-list / effect-batching atomics, vendored
-  Betelgeuse (named as trusted-vendored, loom-where-feasible). Short by design.
+- **Enumerate the verified shared-memory concurrency surface** in one place:
+  SPSC mailbox (custom lock-free, already loomed), `shared_scope.rs`
+  (`SharedCapacityScope`, modeled in this phase), standard-library cross-shard
+  channels (named as stdlib/trusted, not loom-targeted), and vendored Betelgeuse
+  internals (trusted-vendored, loom-where-feasible upstream). Do **not** list the
+  old false targets ("runtime task-list" / "effect-batching atomics").
 - **Draw the line explicitly:** sim = logical interleavings + replay (everything
   in handler / shard-sequential space); loom/shuttle = physical memory ordering on
   the enumerated surface; live parallel = real + introspectable + **not**
@@ -93,21 +101,22 @@ logical and lives in the deterministic oracle.
 - Update the over-claiming prose: the "replayable all the way down" language in
   README / the review memo / user-guide DST chapter gets the logical-vs-physical
   qualifier.
-- Home for the enumeration: SYSTEM.md **if** it stays the source of truth
-  (see Open Decisions), else a `docs/tina-user-guide` concurrency-surface page.
-  The plan is not blocked on that call — write the section, place it per the
-  decision.
+- Home for the enumeration: **keep and renew `.intent/SYSTEM.md`** as the
+  internal truth contract, then add a short user-guide pointer for humans. A
+  stale truth doc is bad; the fix is to make this section load-bearing and guard
+  it, not to scatter the truth.
 
 ### Coverage (tests) — collapses to verification + one decision
 
-- **Step 1 (do this first): verify the surface.** Grep the workspace for custom
-  lock-free code (`UnsafeCell`, `unsafe impl Send|Sync`, hand-rolled atomics used
-  as synchronization rather than counters). The expected result is: SPSC mailbox
-  (loomed) + stdlib channels + the `shared_scope` question.
-- **Resolve `shared_scope`:** confirm whether `SharedCapacityScope` is ever
-  touched from more than one thread. If shard-local (one shard thread), its
-  atomics are removable defensiveness — record that. If genuinely cross-thread,
-  add a loom (or `shuttle`, if the state space is large) model for it.
+- **Surface inventory artifact.** Add/update a checked file that records the
+  verified custom shared-memory surface: SPSC mailbox (loomed), `shared_scope`,
+  standard-library channels, vendored Betelgeuse internals, and ordinary
+  shard-local atomic counters. The expected surface is named here; if code grep
+  finds a different surface, stop and update the plan before changing semantics.
+- **Model `shared_scope`:** add a loom (or `shuttle`, if the state space is
+  large) model for `SharedCapacityScope` reserve/admit/release/drop/high-water
+  behavior. Do not "fix" this by changing the public type shape in this phase;
+  shared scopes are public and cloneable today, so prove the existing shape.
 - **Do not loom stdlib channels** (the cross-shard transport). Not ours to verify.
 - Wire whatever real new model results into `make verify`. If the honest finding
   is "nothing new to loom," that conclusion is the deliverable — write it down.
@@ -135,9 +144,8 @@ logical and lives in the deterministic oracle.
 
 ## How We Prove The New Behavior (direct proof)
 
-- Step 1 surface verification is recorded (the grep + its conclusion), and the
-  `shared_scope` question is resolved one way or the other (atomics removed as
-  shard-local, **or** a loom/shuttle model added).
+- Surface verification is recorded, and `shared_scope` is modeled with
+  loom/shuttle.
 - The concurrency-surface enumeration exists and matches the code; the allowlist
   CI guard fails if a new synchronization primitive appears off-list.
 - The over-claiming prose is corrected (doc diff), with the faithfulness claim
@@ -149,21 +157,18 @@ logical and lives in the deterministic oracle.
 - `LiveReplayCapture` round-trips still work — the bridge story is intact.
 - Existing SPSC loom coverage still green; new coverage is additive.
 
-## Open Decisions
+## Decisions
 
-- **SYSTEM.md keep / demote / drop.** It is currently fairly honest about
-  non-claims (the review found it useful), but the owner says it is not actively
-  maintained — and a *stale* truth-doc is worse than none. Three options:
-  (a) keep it and give it this race-surface section as a renewed, load-bearing
-  job; (b) demote it to an index/pointer and move truth into `docs/`; (c) drop it
-  and rely on `docs/` + phase reviews. Recommendation: **(a)** — this phase gives
-  SYSTEM.md exactly the kind of current-truth content it is meant to hold. Decide
-  before placing the enumeration.
-- loom vs shuttle per structure — decide by state-space size in implementation.
+- **Keep and renew `.intent/SYSTEM.md`.** It stays the internal shape-protection
+  contract. This phase gives it a load-bearing race-surface section and a CI guard
+  so it cannot silently rot.
+- **`shared_scope` is treated as cross-thread-capable.** Model it. No public type
+  shape change in this phase.
+- loom vs shuttle per structure is an implementation choice by state-space size;
+  the required outcome is a checked model or compile-fail non-cross-thread proof.
 
 ## IDD Next Step
 
-Plan v2 (Session A): Plan Review 1 folded in (surface corrected, coverage
-collapsed to verify-first, guard defined as allowlist-diff). Remaining open:
-the SYSTEM.md keep/demote/drop decision (Open Decisions) and the `shared_scope`
-cross-thread question (Step 1). Begin only on go.
+Plan v3 (Session A): Plan Review 1 folded in, then second-review fixes applied:
+surface corrected, `.intent/SYSTEM.md` kept/renewed, `shared_scope` treated as
+cross-thread-capable, guard defined as allowlist-diff. Begin only on go.

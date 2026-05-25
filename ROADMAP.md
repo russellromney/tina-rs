@@ -137,11 +137,14 @@ Orthogonal to feature phases but necessary before public release claims.
   simulator stays visible; the goal is removing ceremony so every user writes
   DST tests as easily as unit tests.
 
-- **Loom expansion beyond mailbox.** Loom covers `tina-mailbox-spsc`. It should
-  also cover shard-pair queues, runtime internal task lists, and effect
-  batching atomics. These are the real concurrency hazards. If a bounded
-  multi-producer mailbox (`tina-mailbox-mpsc`) ships, it must have loom
-  coverage before the crate is usable.
+- **Race-surface honesty beyond mailbox.** Loom covers `tina-mailbox-spsc`.
+  Phase 139 tightens the actual surface: cross-shard transport is stdlib
+  channels, "task-list/effect-batching atomics" are not real shared structures,
+  and `SharedCapacityScope` is the current public cross-thread-capable helper
+  that needs a loom/shuttle model. Future shared-memory primitives must be
+  added to the allowlist + model before merge. If a bounded multi-producer
+  mailbox (`tina-mailbox-mpsc`) ships, it must have loom coverage before the
+  crate is usable.
 
 - **Property-based and generative testing.** `tina-sim` generates interleavings
   from a seed, but not random message sequences, fault configurations, or
@@ -388,6 +391,11 @@ framework before public release-story work.
 | **133 Request scope end-to-end** | Wire request-scoped cancellation through real HTTP/WebSocket/gRPC/body/pool/bridge flows so client disconnect, timeout, owner stop, and shutdown produce one request-shaped report with honest late-result truth. Plan: `.intent/phases/133-request-scope-end-to-end/plan.md`. |
 | **134 Config and budget manifest** | Make boundedness copyable: one structured service manifest for mailboxes, pools, body bytes, DNS/connect policy, retries, deadlines, shared scopes, and replay-affecting config. Plan: `.intent/phases/134-config-budget-manifest/plan.md`. |
 | **135 Native AWS first form** | Add a native Tina AWS battery for the smallest honest production shape: static SigV4 with explicit signing time, native S3 put/get/head/delete, native SQS send/receive/delete, native HTTP keepalive under Phase 131 endpoint/connect policy, bounded bodies/in-flight work, typed pressure/lifecycle reports, hermetic fake-AWS tests, and clear native-vs-SDK-bridge docs. Plan: `.intent/phases/135-native-aws-first-form/plan.md`. |
+| **136 TLS on the TCP rail** | Move rustls to sans-I/O over Tina's Betelgeuse-backed TCP rail. Delete per-operation `tina-tls-*` worker threads, preserve SNI/cert/DER-root security, keep `tls_lane_capacity` as a per-shard total pending-op cap, and prove HTTP/1.1, HTTP/2 ALPN, keepalive, interop, timeout, truncation, and cancellation truth. Plan: `.intent/phases/136-tls-on-tcp-rail/plan.md`. |
+| **137 Hard shard pinning** | Finish the existing affinity layer: `configured_core` means "pin this shard worker to this OS CPU id if the platform can." Linux applies `sched_setaffinity` over the allowed affinity mask; macOS reports `Unsupported`; helper lanes stay unpinned. Plan: `.intent/phases/137-optional-shard-pinning/plan.md`. |
+| **138 Storage on Betelgeuse** | Move live durability reads/writes/fsync/mkdir/size onto Betelgeuse file ops while preserving append-before-apply, commit-uncertain, recovery, pressure, and the explicit-step oracle. Keep only a thin off-shard fallback worker for rename/remove/readdir/metadata. Plan: `.intent/phases/138-storage-on-betelgeuse/plan.md`. |
+| **139 DST race-surface honesty** | Make the logical-vs-physical replay line explicit: sim proves logical interleavings; live parallel runs are introspectable, not byte-reproducible; custom shared-memory surfaces are enumerated and modeled/guarded. Renew `.intent/SYSTEM.md` with the verified race surface. Plan: `.intent/phases/139-dst-race-surface-honesty/plan.md`. |
+| **140 Retire bypass-Betelgeuse lanes** | Dependency-gated on 136+138. Sweep remaining runtime rails so each Tina-owned rail either rides Betelgeuse or has a short written bounded-blocking-lane justification. Move Unix sockets onto the substrate; keep DNS/process only with capability/report truth. Plan: `.intent/phases/140-retire-bypass-betelgeuse-lanes/plan.md`. |
 | **Alpaca rename** | Before public launch, rename the project/crates/docs away from Tina to Alpaca so the lineage is respectful and clear: independently maintained Rust framework, inspired by Peter Mbanugo's Tina/Odin and Seastar, not an official Tina port. |
 | **Barend Biesheuvel visible flow ergonomics** | Optional high-level ergonomics only after the local runtime core feels boring: a `flow!`-style authoring surface that preserves named suspension points, visible failure policy, trace step names, and ordinary Tina message/effect expansion. No fake async, no hidden retries, no hidden queues. |
 

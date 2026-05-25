@@ -206,3 +206,22 @@ plainly so the DST claim is not read as more than it is.
 Hard Constraints 1–8, the four-subtle-semantics section, the per-op-thread-churn
 motivation, and the staged cutover are all good and stay.
 
+## Plan Review 4 — second reviewer (2026-05-25)
+
+Verdict: good plan, but one boundedness phrase was wrong enough to send an
+implementer sideways.
+
+### Finding 1 — `tls_lane_capacity` must remain shard-total, not per-stream
+
+The plan said `tls_lane_capacity` becomes a "per-stream pending cap." That would
+weaken the old public budget: capacity 64 used to mean at most 64 admitted TLS
+ops on the shard; "64 per stream" could admit unbounded-ish total work as stream
+count grows. Fixed in plan v5: `tls_lane_capacity` is the **per-shard total
+pending TLS-op cap**. One pending op per stream still holds separately.
+
+### Finding 2 — explicit-step TLS must not blur simulator truth
+
+The plan's "bonus" language could be read as requiring cryptographic TLS in the
+simulator. Fixed in plan v5: `tina-sim` scripted TLS stays unchanged. The live
+threaded path is required; explicit-step runtime TLS may improve only if it
+naturally rides an existing explicit TCP rail.

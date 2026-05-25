@@ -2,9 +2,11 @@
 
 ## Status
 
-- Planned v3 (2026-05-24): v2 corrected the premise against `origin/main`
+- Planned v4 (2026-05-25): v2 corrected the premise against `origin/main`
   (`a6cbaa9`); v3 folds in `Plan Review 1` (decides the `configured_core`
-  meaning, names the real blast radius, specifies the readback mechanism).
+  meaning, names the real blast radius, specifies the readback mechanism). v4
+  clarifies that `configured_core` is an OS CPU id selected from the process's
+  allowed affinity mask, not `0..num_cpus`.
 - **v1's premise ("no CPU affinity anywhere") was wrong.** Main already ships the
   affinity *vocabulary, config, and reporting*; what is missing is the syscall
   that actually pins.
@@ -46,9 +48,10 @@ else — so a requested core is either an OS-proven `Applied` pin or a typed
 `Unsupported`/`Failed`, never `AdvisoryOnly` masquerading as control.
 
 ```text
-on Linux I set configured_core = N and the shard worker is actually pinned to
-core N (observed_core == N, affinity_status == Applied); on macOS the same
-request reports Unsupported instead of pretending; helper lanes stay unpinned
+on Linux I set configured_core = an OS CPU id in this process's allowed affinity
+mask, and the shard worker is actually pinned there (observed_core == that id,
+affinity_status == Applied); on macOS the same request reports Unsupported
+instead of pretending; helper lanes stay unpinned
 ```
 
 ## Includes
@@ -56,8 +59,10 @@ request reports Unsupported instead of pretending; helper lanes stay unpinned
 - A hard-pin step inside the shard worker thread body (`threaded.rs:311`,
   `threaded_multi_shard.rs:264`): if `configured_core` is `Some(core)`, call
   the platform pin **from within the new thread** before the loop starts.
-  - **Linux:** `sched_setaffinity` (via a vetted `core_affinity`-style dep
-    restricted to real-pin platforms, or a thin `libc` wrapper). On success set
+  - **Linux:** use the existing Unix `libc` dependency to call
+    `sched_getaffinity`, `sched_setaffinity`, and `sched_getcpu` directly. Do
+    not add `core_affinity` or another crate for this. Treat `configured_core`
+    as an OS CPU id, not "nth available core." On success set
     `AffinityStatus::Applied` and record `observed_core`. On failure set
     `Failed(reason)` and keep running unpinned.
   - **macOS / any platform without a hard pin:** set
@@ -71,8 +76,11 @@ request reports Unsupported instead of pretending; helper lanes stay unpinned
 - **Helper-lane threads stay unpinned** (DNS, storage, process, unix, and TLS
   workers until Phase 136 retires them). They float onto spare cores. Stated
   rule, not an accident.
-- Available-core validation: a `configured_core` past the core count fails
-  loudly at setup (typed error), not a silent mis-pin.
+- Available-core validation: read the process's allowed affinity mask on Linux
+  and reject a `configured_core` not present in that mask. Do not use
+  `0..num_cpus` as proof; containers and cpusets can expose sparse allowed CPU
+  ids. Unsupported platforms report `Unsupported` rather than validating against
+  a fake mask.
 
 ## Reuse, Do Not Reinvent
 
@@ -97,14 +105,16 @@ request reports Unsupported instead of pretending; helper lanes stay unpinned
 
 ## How We Prove The New Behavior (direct proof)
 
-- **Linux pin works:** with `configured_core = N`, the shard worker reports
+- **Linux pin works:** choose `N` from the process's allowed affinity mask, set
+  `configured_core = N`, and assert the shard worker reports
   `affinity_status == Applied` and `observed_core == N` (read back inside the
   thread). This is the headline proof.
 - **`configured_core == None`** is byte-identical to today: `NotRequested`, no
   affinity syscall (assert the no-pin branch).
 - **macOS / unsupported:** `configured_core = N` reports `Unsupported`, runs
   unpinned, does not error the runtime.
-- **Out-of-range core** fails loudly at setup with a typed error.
+- **Unavailable core** (not in the allowed affinity mask) fails loudly at setup
+  with a typed error.
 - **`Failed(reason)`** path: a forced-failure pin reports `Failed` and the shard
   keeps running unpinned (pinning is best-effort-correctness, not fatal).
 - **Container/quota behavior — honest proof terms:** `surrogate proof` =
@@ -121,8 +131,10 @@ request reports Unsupported instead of pretending; helper lanes stay unpinned
   intent changed on purpose:
   - `tina-runtime/tests/local_system.rs:1908,1935,1936` —
     `assert_eq!(shard.affinity_status(), &AffinityStatus::AdvisoryOnly)` → become
-    `Applied` on a Linux box with a pinnable core, `Unsupported` otherwise.
-    Tests must branch on platform/CI capability, not hard-code `AdvisoryOnly`.
+    `Applied` on Linux when the requested OS CPU id is in the process affinity
+    mask, `Unsupported` otherwise. Tests must branch on platform/CI capability
+    and pick from the allowed mask, not hard-code `AdvisoryOnly` or assume CPU
+    `0` is available.
   - `tina-runtime/tests/blue_whale_checklist.rs:26` — evidence string
     "AffinityStatus reports NotRequested or AdvisoryOnly; **no OS pinning claim
     yet**" is a checked invariant asserting the opposite of this phase. Rewrite it
@@ -132,20 +144,21 @@ request reports Unsupported instead of pretending; helper lanes stay unpinned
 - A pinned run passes the same multi-shard service e2e as an unpinned run
   (pinning changes scheduling, not semantics).
 
-## Risks / Open Decisions
+## Risks / Decisions
 
 - **`AdvisoryOnly` vs `Applied` — DECIDED** (see Status): `configured_core` means
   "pin if you can"; `AdvisoryOnly` retired as a `configured_core` outcome. No
   longer open.
 - **macOS is decided: `Unsupported`.** No hint path. Settled.
-- **Crate vs raw syscall (open).** `core_affinity` (real-pin platforms only) vs
-  a thin `sched_setaffinity` wrapper. Decide in implementation.
-- **Container reality.** Under k8s CPU quotas "one thread per core" is fuzzy.
-  Out-of-range / throttled cores must surface as `Failed`/`Unsupported`, not a
-  silent mis-pin.
+- **Linux backend is decided:** use a tiny `libc` wrapper around
+  `sched_getaffinity` / `sched_setaffinity` / `sched_getcpu`. No new dependency.
+- **Container reality.** Under k8s CPU quotas and cpusets, "one thread per core"
+  is fuzzy and allowed CPU ids may be sparse. Pin only to ids in the allowed
+  mask; unavailable / throttled cores must surface as a typed setup error,
+  `Failed(reason)`, or `Unsupported`, not a silent mis-pin.
 
 ## IDD Next Step
 
-Plan v3 (Session A): Plan Review 1 folded in (semantics decided, blast radius
-named, readback specified). Remaining open: crate-vs-syscall, resolved at
-`Implementation Review 1`. Begin coding only on go.
+Plan v4 (Session A): Plan Review 1 folded in (semantics decided, blast radius
+named, readback specified, Linux backend pinned to `libc`). Begin coding only on
+go.

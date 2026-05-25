@@ -66,3 +66,35 @@ to remove.
 
 The logical-vs-physical framing, the LiveReplayCapture bridge, and the refusal to
 build a parallel oracle are all correct and stay.
+
+## Plan Review 2 — second reviewer (2026-05-25)
+
+Verdict: v2 fixed the false surface list, but still left two choices too fuzzy
+for implementation.
+
+### Finding 1 — keep `.intent/SYSTEM.md` and make it load-bearing
+
+The plan still asked whether to keep/demote/drop SYSTEM.md. Decided in plan v3:
+keep and renew `.intent/SYSTEM.md` as the internal shape-protection contract.
+The race-surface section goes there, with a user-guide pointer and a CI guard so
+it cannot silently rot.
+
+### Finding 2 — `shared_scope` is cross-thread-capable by API shape
+
+`SharedCapacityScope` is public, cloneable, and `Arc`-backed. Intent saying
+"shard-local" is not enough when the type can cross threads. Fixed in plan v3:
+treat it as a real shared-memory surface and model it with loom/shuttle, unless
+the implementation deliberately changes the public type shape so crossing
+threads no longer compiles.
+
+## Plan Review 3 — grug cleanup (2026-05-25)
+
+Verdict: the plan still left an escape hatch where the implementation could
+avoid modeling `shared_scope` by changing the public type shape. That is a
+different public API phase.
+
+### Finding 1 — prove the shape we already shipped
+
+`SharedCapacityScope` is already public, cloneable, and `Arc`-backed. Fixed in
+plan v3: model it with loom/shuttle in this phase. Do not change the public type
+shape here.

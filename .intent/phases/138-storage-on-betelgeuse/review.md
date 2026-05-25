@@ -64,3 +64,16 @@ unambiguous. One sentence in Starting Facts.
 
 The Betelgeuse-op vs fallback-op split, recovery-semantics-preserved constraint,
 and the oracle-untouched mirror of the TLS split are all right.
+
+## Plan Review 2 — second reviewer (2026-05-25)
+
+Verdict: the fallback-worker decision is right; the headline proof wording still
+needed to match it.
+
+### Finding 1 — do not claim "no storage worker" while keeping a fallback worker
+
+The plan correctly keeps rename/remove/readdir/metadata off the shard on a tiny
+bounded fallback worker. One proof bullet still said "no storage worker thread
+spawned." Fixed in plan v3: the direct proof is "no worker thread for
+Betelgeuse-supported durability ops"; the metadata fallback worker is allowed
+and named.

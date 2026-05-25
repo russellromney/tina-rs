@@ -55,3 +55,25 @@ read as a proven claim.
 
 macOS = `Unsupported` (no hint path), helper lanes stay unpinned, reuse of the
 existing config/enum/report. All correct.
+
+## Plan Review 2 — second reviewer (2026-05-25)
+
+Verdict: still right, but core numbering needed to be made OS-real.
+
+### Finding 1 — `configured_core` cannot mean `0..num_cpus`
+
+Containers and cpusets can expose sparse allowed CPU ids. Pinning to CPU 0 may
+be invalid even when the process has several cores available. Fixed in plan v4:
+`configured_core` is an OS CPU id and Linux validation reads the process's
+allowed affinity mask. Tests choose from that mask rather than assuming CPU 0.
+
+## Plan Review 3 — implementation-choice cleanup (2026-05-25)
+
+Verdict: one needless implementation fork remained.
+
+### Finding 1 — do not leave crate-vs-syscall as planning work
+
+`tina-runtime` already has a Unix `libc` dependency for process handling, and
+the needed calls are exactly Linux syscalls (`sched_getaffinity`,
+`sched_setaffinity`, `sched_getcpu`). Fixed in plan v4: use a tiny local `libc`
+wrapper, no new affinity crate.

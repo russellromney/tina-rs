@@ -2,10 +2,12 @@
 
 ## Status
 
-- Planned v4 (2026-05-24). v2 hostile-reviewed (Plan Review 1); v3 corrected facts
+- Planned v5 (2026-05-25). v2 hostile-reviewed (Plan Review 1); v3 corrected facts
   against `origin/main` (Plan Review 2); v4 folds in Plan Review 3 (security-posture
   invariant + adversarial tests, ALPN-is-already-live blast radius,
-  `tls_lane_capacity` decision, guard scoping, the TLS-oracle fact).
+  `tls_lane_capacity` decision, guard scoping, the TLS-oracle fact). v5 tightens
+  the public TLS capacity meaning: `tls_lane_capacity` remains a per-shard total
+  pending-op cap, not a per-stream budget.
 - v2/v3 fold in: downstream `tina-http` impact, the one-pending-op pump rule,
   the four subtle-semantics that are the real work, comprehensive proof, the
   specimen rewrite, the DNS clarification, and a pointer to the removal phase.
@@ -51,13 +53,11 @@
   variant, built by *both* driver constructors (`driver/mod.rs:252` and `:277`),
   so even the explicit-step driver uses TLS worker threads — its only
   deterministic oracle is `tina-sim`'s scripted TLS. Storage, by contrast, has
-  `StorageLane::Inline` for the explicit driver. **Bonus of this rewrite:** a
-  sans-I/O state machine over the *driver's* TCP rail means TLS rides whatever TCP
-  the driver provides (Betelgeuse on threaded; the explicit driver's TCP rail on
-  explicit-step), which removes the worker lane from *both* constructors and gives
-  explicit-step TLS a deterministic path it lacks today. TLS-1 must define the
-  explicit-step path concretely (ride its TCP rail; if the explicit driver has no
-  usable TCP rail, TLS is documented threaded-only with sim-scripted as oracle).
+  `StorageLane::Inline` for the explicit driver. The rewrite should ride the
+  driver's TCP rail where that rail exists. `tina-sim`'s scripted TLS contract
+  stays unchanged; an explicit-step runtime TLS path is allowed only if it
+  naturally falls out of the existing explicit TCP rail. Do not make the
+  simulator cryptographic to satisfy this phase.
 
 ## Purpose
 
@@ -98,8 +98,11 @@ tests:
    call may issue an interleaved *sequence* of TCP ops, never two concurrently.
    This is what keeps the one-pending-op rule from re-creating a deadlock.
 7. **One pending TLS op per stream** stays true at the isolate boundary.
-8. **Simulator TLS unchanged** — scripted semantic I/O, not cryptography. Live
-   path only.
+8. **Simulator TLS unchanged** — scripted semantic I/O, not cryptography. The
+   live threaded path is the required cutover. The explicit-step runtime may gain
+   deterministic TLS only by riding an existing explicit TCP rail; if that rail is
+   not usable, keep explicit-step TLS documented as unsupported/threaded-only and
+   leave `tina-sim` as the oracle.
 9. **Security posture does not change (what-will-not-change).** Certificate
    verification, SNI / server-name checking, the DER-only root policy, and "no
    silent downgrade" are byte-for-byte the same. A sans-I/O rewrite must not treat
@@ -143,10 +146,12 @@ tests:
 
 - `RuntimeCapabilities`: TLS family moves lane-backed/blocking →
   **completion-backed (rides the TCP rail)**. **Decided (Plan Review 3):**
-  `tls_lane_capacity` is **kept as the per-stream pending cap** (least churn — it
-  is a public field on `HttpsListenerConfig` / LocalSystem config). Not removed.
-  Its meaning shifts from "concurrent worker slots" to "pending TLS ops"; existing
-  configs that set it still compile and bound work. Blast-radius check below.
+  `tls_lane_capacity` is kept as the **per-shard total pending TLS-op cap** (least
+  churn — it is a public field on `HttpsListenerConfig` / LocalSystem config).
+  Not removed. It must not become "N per stream": one pending TLS op per stream
+  already holds, and the old public budget meant "at most N admitted TLS ops on
+  this shard." Existing configs that set it still compile and bound total work.
+  Blast-radius check below.
 - FINDINGS #16 (already "resolved first form" via per-op threads) updated to the
   stronger closure: TLS is now completion-backed on the TCP rail, no per-op
   threads. SYSTEM.md TLS paragraph rewritten; review memo's Odin-divergence note
@@ -247,8 +252,10 @@ threads. TLS-5 is the escape hatch. Recorded so it is a decision, not a surprise
   `Http2ClientOutcome::TlsAlpnMismatch` on mismatch** (`tina-http/src/lib.rs:88-90`,
   `AlpnProtocols::h2()`) — this is a *live* consumer, so it is blast radius, not a
   future inheritance.
-- **Existing configs that set `tls_lane_capacity` still compile and bound work**
-  under its new "pending TLS ops" meaning.
+- **Existing configs that set `tls_lane_capacity` still compile and bound total
+  shard work** under its new "total pending TLS ops" meaning. Add a pressure test
+  with many streams proving cap `N` admits at most `N` pending TLS ops across the
+  shard, not `N` per stream.
 - TLS cancellation/timeout/close-wins outcomes + trace facts match (re-run the
   TLS ResourceRail DST).
 - The simulator TLS suite is unchanged and green (proves the live change did not
@@ -259,15 +266,14 @@ threads. TLS-5 is the escape hatch. Recorded so it is a decision, not a surprise
 TLS is the first instance of a recurring anti-pattern — a blocking worker lane
 that bypasses Betelgeuse (also storage, Phase 138; also unix-domain sockets,
 which are sockets and could ride the substrate). Phase 136 cuts TLS over and
-deletes the **TLS-specific** old code. A separate, yet-unplanned phase —
-working name **Phase 140: Retire the bypass-Betelgeuse lane model** — should,
-once 136 and 138 prove the pattern, remove the generic worker-lane scaffolding
-and move/justify the remaining lanes: unix-domain sockets onto the substrate;
-DNS resolver and process spawn kept as blocking lanes **with written
-justification** (no Betelgeuse opcode for `getaddrinfo` / `fork`). That phase,
-not this one, "removes the old model entirely."
+deletes the **TLS-specific** old code. **Phase 140: Retire Bypass-Betelgeuse
+Lanes** is dependency-gated on 136 + 138; once they prove the pattern, 140 moves
+or justifies the remaining lanes: unix-domain sockets onto the substrate; DNS
+resolver and process spawn kept as blocking lanes **with written justification**
+(no Betelgeuse opcode for `getaddrinfo` / `fork`). That phase, not this one,
+"removes the old model entirely."
 
 ## IDD Next Step
 
-Plan v4 + Plan Reviews 1–3 are done. Next: `Implementation Review 1` after TLS-1
+Plan v5 + Plan Reviews 1–3 are done. Next: `Implementation Review 1` after TLS-1
 lands, then proceed through TLS-2..4. Begin coding only on go.

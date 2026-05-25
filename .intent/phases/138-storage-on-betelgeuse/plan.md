@@ -2,9 +2,11 @@
 
 ## Status
 
-- Planned v2 (2026-05-24): folds in `Plan Review 1` (the real pwrite→fsync
+- Planned v3 (2026-05-25): folds in `Plan Review 1` (the real pwrite→fsync
   ordering proof, CommitUncertain injection points, off-shard fallback decision,
-  guard scoped to supported ops, verified Inline/Worker split).
+  guard scoped to supported ops, verified Inline/Worker split). v3 tightens the
+  headline proof wording so it does not contradict the intentional metadata
+  fallback worker.
 - **Verified against `origin/main` a6cbaa9:** `storage.rs` has zero Betelgeuse
   refs, `StorageLane` is still `Inline | Worker(std::fs thread)`, and Betelgeuse
   exposes `open/pread/pwrite/fsync/mkdir/size` on both platforms (`io/darwin.rs`,
@@ -96,8 +98,8 @@ byte-for-byte the same
   - `SnapshotLoad` / `JournalReplay` → `open` + `pread` (+ `size`).
   - `SyncParent` → directory `fsync` (Betelgeuse).
 - A thin fallback for `RenameReplace`, `RemoveFile`, `ReadDir`, `PathMetadata`
-  (and the rename leg of `SnapshotCommit`) — see Open Decisions for the chosen
-  mechanism.
+  (and the rename leg of `SnapshotCommit`). This fallback is a bounded off-shard
+  worker, not inline shard work.
 - The pending/cancel/timeout/tombstone accounting for storage rebuilt over the
   Betelgeuse completion model, preserving `StorageFull`/`StorageClosed`/cancel.
 - Capability truth: storage family for the live runtime reports
@@ -117,7 +119,8 @@ byte-for-byte the same
 ## How We Prove The New Behavior (direct proof)
 
 - Journal append + replay round-trip on the live runtime, asserting bytes,
-  `record_index`, and **no storage worker thread spawned**.
+  `record_index`, and **no worker thread is used for Betelgeuse-supported
+  durability ops**. The thin metadata fallback worker is allowed and named.
 - **Ordering under reordered completions (the real proof, not happy-path).** Use
   the Betelgeuse simulated backend with delayed/reordered completions to assert
   (a) `fsync` is never submitted before its `pwrite` completion is harvested, and
@@ -145,7 +148,7 @@ byte-for-byte the same
   green (proves the live change did not leak into the oracle).
 - Composed live TCP + persistence proof still holds.
 
-## Open Decisions
+## Decisions / Later
 
 - **Fallback mechanism — DECIDED (Plan Review 1):** a tiny bounded **off-shard**
   worker for `rename`/`remove`/`readdir`/`metadata` (and the rename leg of
@@ -157,16 +160,15 @@ byte-for-byte the same
 ## Pointer: removal of the broader old model
 
 Storage is the second instance of the bypass-Betelgeuse lane anti-pattern (TLS,
-Phase 136, is the first). After 136 and 138 prove the pattern, **Phase 140
-(unplanned): Retire the bypass-Betelgeuse lane model** should remove the generic
-worker-lane scaffolding and move/justify the remaining lanes (unix sockets onto
-the substrate; DNS resolver and process spawn kept as blocking lanes with written
-justification). This phase deletes the storage-specific worker; the broad model
-removal is 140.
+Phase 136, is the first). After 136 and 138 prove the pattern, **Phase 140:
+Retire Bypass-Betelgeuse Lanes** removes or justifies the remaining bypass lanes
+(unix sockets onto the substrate; DNS resolver and process spawn kept as blocking
+lanes with written justification). This phase deletes the storage-specific
+durability worker; the broad model removal is 140.
 
 ## IDD Next Step
 
-Plan v2 (Session A): Plan Review 1 folded in (fallback decided off-shard,
+Plan v3 (Session A): Plan Review 1 folded in (fallback decided off-shard,
 ordering proof sharpened, CommitUncertain injection named). Next:
 `Implementation Review 1` after the first journal-append-on-Betelgeuse increment.
 Begin coding only on go.
