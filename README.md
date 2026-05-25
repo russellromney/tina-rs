@@ -2,9 +2,13 @@
 
 ![tina-rs hero](tina.png)
 
-Tina is a Rust concurrency framework for services built from isolated state
-machines: each one owns its state, communicates through bounded queues, and
-asks the runtime to perform side effects.
+Tina is a bounded Rust concurrency framework for services built from isolated
+state machines. It makes queue capacity, overload, cancellation, shutdown,
+runtime side effects, and deterministic replay explicit in the API.
+
+Use Tina when service behavior depends on where work is queued, which state is
+owned by which execution lane, what happens after timeout/cancel/shutdown, and
+whether a failing interleaving can be replayed.
 
 In Tokio, the main unit of concurrency is a `Future`: a function-shaped state
 machine that yields at `.await` points. That works well for many I/O-heavy
@@ -21,38 +25,43 @@ to a journal, spawn a child, stop. The runtime interprets effects, owns I/O
 and time, and resumes isolates by delivering continuation messages.
 
 The project includes its own runtimes: `tina-runtime` for live execution and
-`tina-sim` for deterministic simulation.
-
-This means Tina is a runtime, but not an async/await runtime. It is closer to
-a bounded actor/runtime system with thread-per-core scheduling and
-deterministic simulation as first-class constraints.
+`tina-sim` for deterministic simulation. Tina is a runtime, but not an
+async/await runtime. It is a bounded service framework with shard-local
+execution, runtime-owned I/O, and deterministic simulation as first-class
+constraints. Optional OS thread pinning and the remaining substrate-alignment
+work are active roadmap items.
 
 `tina-rs` is an independent Rust implementation inspired by
 [Peter Mbanugo's Tina](https://github.com/pmbanugo/tina), a thread-per-core
 concurrency framework in Odin, and by his article
 [The Tokio/Rayon Trap and Why Async/Await Fails Concurrency](https://pmbanugo.me/blog/why-async-await-complect-concurrency).
-The design also rhymes with Erlang/OTP supervision, Seastar-style shard-local
+The design uses ideas from Erlang/OTP supervision, Seastar-style shard-local
 execution, and TigerBeetle-style deterministic testing: keep state owned,
 queues bounded, and execution replayable.
 
-> Tina is experimental and in active development. The model is now strong
-> enough to write specimen services against; the public API is still moving.
+> Tina is experimental and in active development. The model is strong enough to
+> write real specimen services against; the public API is still moving.
 
 ## Copyable Service Skeleton
 
-The current production-shaped service skeleton is
-[`examples/systems/mini_saas_api`](examples/systems/mini_saas_api/). It uses
-native `tina-http`, a controller isolate, `tina-sqlite-bridge`, a native
-outbound keepalive pool, health/readiness, graceful shutdown, capacity
-reporting, and a live-replay fact.
+The current copied path starts with
+[`examples/systems/system_copied_service_path`](examples/systems/system_copied_service_path/).
+It is intentionally smaller than a product: one readable service shape that
+shows request entry, admission, durable state, session control, fairness/load
+assertions, live capture, and replay.
 
 Run it from the repo root:
 
 ```sh
-cargo test --manifest-path examples/systems/mini_saas_api/Cargo.toml
-cargo run --manifest-path examples/systems/mini_saas_api/Cargo.toml -- smoke
-cargo run --manifest-path examples/systems/mini_saas_api/Cargo.toml -- pressure
+cargo run --manifest-path examples/systems/system_copied_service_path/Cargo.toml
+cargo test --manifest-path examples/systems/system_copied_service_path/Cargo.toml
 ```
+
+For a larger service-shaped system, see
+[`examples/systems/mini_saas_api`](examples/systems/mini_saas_api/): native
+`tina-http`, a controller isolate, `tina-sqlite-bridge`, an outbound keepalive
+pool, health/readiness, graceful shutdown, capacity reporting, and a
+live-replay fact.
 
 Tina is aimed at services where these properties matter more than linear
 `async fn` syntax:
@@ -76,6 +85,40 @@ Tina is aimed at services where these properties matter more than linear
 * **Deterministic simulation.** The same isolate code runs under the live
   `ThreadedRuntime` and under `tina-sim` with virtual time, seeded faults,
   saved replay cases, and shrinking. Same seed, same config, same failure.
+
+## Programming Model Compared With Tokio
+
+Tina is not a drop-in replacement for Tokio's async runtime. It is a different
+service architecture. In a Tina service:
+
+| Tokio-shaped code often reaches for | Tina's default shape |
+|---|---|
+| `tokio::spawn` task graphs | named isolates with typed messages |
+| `Arc<Mutex<AppState>>` | shard-local state owned by one isolate |
+| channels whose backlog is hidden in plumbing | bounded mailboxes with typed `Full` |
+| future cancellation by drop/abort | visible timeout, cancel, and late-reply facts |
+| logs as the main debugging artifact | runtime trace, capacity reports, and replay cases |
+
+The cost is more message variants and more explicit state transitions. The
+result is that overload, shutdown, cancellation, and replay are represented as
+typed program facts instead of out-of-band conventions.
+
+## Tradeoffs
+
+Tina is not optimized for the shortest happy-path handler.
+
+* Linear request code is often more verbose than `async fn`.
+* Multi-turn workflows add message variants; the suspension points are named,
+  not hidden.
+* Capacity must be chosen and reported. There is no secret unbounded escape
+  hatch.
+* Async ecosystem crates usually enter through explicit bridges, not arbitrary
+  futures smuggled into an isolate.
+* Some protocol/client surfaces are initial implementations rather than hardened
+  production replacements.
+
+Those costs are justified only when they surface a concrete fact: bounded
+pressure, typed terminal outcomes, trace events, or replayable state.
 
 ## A TCP echo connection
 
@@ -166,9 +209,12 @@ isolate per accepted socket, lives in
                        └─── Bounded shard-pair queues ────┘
 ```
 
-A **shard** owns one core's worth of work: its isolates, their mailboxes, the
+A **shard** owns one lane of service work: its isolates, their mailboxes, the
 runtime's driver rails for time and I/O, supervision records, and the
-shard-pair queues that connect it to other shards. Shards share no memory.
+shard-pair queues that connect it to other shards. The design is
+thread-per-core-shaped and shared-nothing; hard OS pinning and the remaining
+substrate-alignment work are active roadmap items, so the README does not claim
+that every helper lane is already pinned to a core.
 
 An **isolate** is a typed struct with a synchronous `handle` method that
 returns an `Effect`. Isolates are referenced through typed `Address<M, R>`
@@ -188,22 +234,30 @@ The repository is a Cargo workspace:
 | [`tina-supervisor`](tina-supervisor/) | Supervisor configuration: `RestartPolicy`, `RestartBudget`, `SupervisorConfig`. |
 | [`tina-runtime`](tina-runtime/) | Explicit-step runtime, multi-shard runner, `ThreadedRuntime` over the [Betelgeuse](https://github.com/penberg/betelgeuse) backend, runtime-owned I/O, isolate calls, local snapshot/journal persistence. |
 | [`tina-sim`](tina-sim/) | Deterministic simulator with virtual time, seeded faults, scripted I/O, durable images, and replay. |
-| [`tina-http`](tina-http/) | First-form native HTTP/1.1 server/client/pool pieces built as Tina state machines. |
-| [`tina-rpc`](tina-rpc/) | First-form framed request/reply, service registry, typed service helpers, and bounded RPC semantics. |
+| [`tina-http`](tina-http/) | Native HTTP/1.1, HTTPS, HTTP/2, gRPC, WebSocket server/client sessions, keepalive pools, body streaming/chunking, protocol facts, and typed pressure/lifecycle reports. |
+| [`tina-codec`](tina-codec/) | Open synchronous codec trait for bounded parser/framer adapters. |
+| [`tina-rpc`](tina-rpc/) | Framed request/reply, service registry, typed service helpers, and bounded RPC semantics. |
 | [`tina-rpc-tokio`](tina-rpc-tokio/) | Tokio async facade over native Tina RPC for ecosystem-edge callers. |
 | [`tina-tokio-bridge`](tina-tokio-bridge/) | Bounded ingress from a host Tokio runtime into a Tina service, for axum/Tower/Hyper integration. |
+| [`tina-tower-bridge`](tina-tower-bridge/) | Bounded Tower service bridge. |
+| [`tina-reqwest-bridge`](tina-reqwest-bridge/) | Bounded reqwest bridge with caller-owned retry/classification and bridge pressure truth. |
 | [`tina-sqlite-bridge`](tina-sqlite-bridge/) | First-form SQLite worker around `rusqlite`. One connection, one blocking thread, autocommit only, named caps for mailbox / in-flight / pool / pending replies. |
-| [`tina-aws-bridge`](tina-aws-bridge/) | First-form AWS SDK bridge for S3 and SQS. Service-shaped requests, explicit config, bounded admission/in-flight work, body/message caps, typed errors, metrics, and honest late-result/close-drain semantics. |
+| [`tina-sqlx-bridge`](tina-sqlx-bridge/) | Bounded SQLx/Postgres bridge with typed values, transactions, fetch-many, cancellation truth, metrics, and pressure reports. |
+| [`tina-aws-bridge`](tina-aws-bridge/) | AWS SDK bridge for S3, SQS, SNS, DynamoDB, and Secrets Manager. Service-shaped requests, explicit config, bounded admission/in-flight work, body/message caps, typed errors, metrics, and honest late-result/close-drain semantics. |
+| [`tina-tracing`](tina-tracing/) | Runtime trace to `tracing` events and offline Chrome Trace JSON timeline export. |
+| [`tina-proof-harness`](tina-proof-harness/) | Load/fairness assertions, bad-peer scenarios, and live-run capture helpers for system specimens. |
 
 End consumers depend on `tina` plus one runtime or simulator crate.
 
-## The rule
+## Design Invariants
 
-If something can overload, Tina makes it visible.
+Tina's APIs are organized around three invariants:
 
-If something can fail, Tina makes it traceable.
-
-If something can race, Tina makes it replayable.
+* queues and resource lanes are bounded or explicitly reported as unsupported;
+* terminal outcomes (`Full`, `Closed`, `Timeout`, cancellation, late reply,
+  rejection) are typed values;
+* runtime behavior is traceable, and simulator-supported behavior is replayable
+  from explicit seed/config/history.
 
 ## Explicit by design
 
@@ -213,12 +267,12 @@ A handler matches a message and returns one effect. Runtime calls come back as
 named continuation messages. Timeouts, `Full`, `Closed`, and mailbox capacity
 are in the code you read.
 
-This is not accidental verbosity. Tina accepts helpers that remove boring
-bookkeeping. Tina rejects helpers that hide who owns state, what can overload,
-where timeout lives, or what message comes next.
+This is not accidental verbosity. Helpers may remove repeated bookkeeping, but
+they must keep state ownership, capacity, timeout, and continuation messages
+visible.
 
 That matters for humans, and it matters for LLMs. Copyable local patterns are
-safer than clever APIs whose important rules live somewhere else.
+safer than APIs whose important rules live outside the call site.
 
 ### Cancelable deferred calls
 
@@ -268,8 +322,6 @@ order, and TCP completion order under bounded fault models. Live and
 simulated runs share the same handler code; the difference is the driver
 underneath.
 
-Same seed. Same config. Same failure.
-
 See [`tina-sim/tests/`](tina-sim/tests/) and
 [`docs/tina-user-guide/08-simulation-and-dst.md`](docs/tina-user-guide/08-simulation-and-dst.md)
 for replay, DST, and fault-injection details.
@@ -285,7 +337,7 @@ make verify
 Run a canonical example:
 
 ```bash
-cargo run --example tcp_echo -p tina-runtime
+cargo run --manifest-path examples/systems/system_copied_service_path/Cargo.toml
 ```
 
 Run the paired Tokio-vs-Tina comparisons:
@@ -309,6 +361,8 @@ cargo run --manifest-path examples/specimen_replay_dst/Cargo.toml -- compare
 
 | Example | What it shows |
 |---|---|
+| [`examples/systems/system_copied_service_path`](examples/systems/system_copied_service_path/) | Current copied service skeleton: request entry, limits, durable state, session control, fairness/load proof, live capture, replay, join/select helpers. |
+| [`examples/systems/mini_saas_api`](examples/systems/mini_saas_api/) | Larger service-shaped system with native HTTP, SQLite bridge, outbound keepalive pool, readiness, shutdown, capacity reporting, and live-replay fact. |
 | [`tina-runtime/examples/task_dispatcher.rs`](tina-runtime/examples/task_dispatcher.rs) | Smallest complete service: dispatcher isolate, worker isolates, supervision. Recommended starting point. |
 | [`tina-runtime/examples/tcp_echo.rs`](tina-runtime/examples/tcp_echo.rs) | Runtime-owned TCP from listener through connection close, including bounded multi-client overlap. |
 | [`tina-tokio-bridge/examples/llama_bridge.rs`](tina-tokio-bridge/examples/llama_bridge.rs) | Bridging an existing Tokio/axum app into a Tina-supervised core. |
@@ -317,16 +371,14 @@ The [`examples/`](examples/) directory at the repo root contains **specimens**:
 paired Tokio-vs-Tina implementations of common service shapes (chat fanout,
 key/value store, axum counter, supervised worker, persistent counter,
 deterministic replay, outbound fetch, graceful shutdown, and more). They are
-specimens for feel and behavior, not a shared harness prison. Cross-cutting
+specimens for comparing shape and behavior, not a shared framework. Cross-cutting
 findings live in
 [`examples/FINDINGS.md`](examples/FINDINGS.md).
 
-Recent specimens are also the best place to see the newer app shapes:
-rate-limited workers use a `BurstClosed` control message instead of a host
-atomic, outbound HTTP retry keeps retry policy in the caller while the
-reqwest bridge only classifies outcomes, and sharded fanout uses
-`ShardPlacement` / `ShardServiceTable` / `ReplyAdapter` while honestly showing
-where the setup is still too heavy.
+Recent systems show newer app shapes: gateway limits, rate-limit policy,
+realtime WebSocket rooms, job queues, live replay bug capture, metrics shipping,
+and soak-shaped HTTP/DB services. These examples are used to find rough edges;
+the findings file is part of the development loop, not a release document.
 
 ## Documentation
 
@@ -362,20 +414,22 @@ where the setup is still too heavy.
 
 Implemented today: explicit-step single-shard runtime, multi-shard runner with
 bounded shard-pair queues, `ThreadedRuntime` over Betelgeuse, runtime-owned
-TCP/UDP/DNS/TLS/file/path/process/signal/persistence rails, isolate calls
-with mandatory timeout, native HTTP/1.1, native HTTP/2 server/client,
-native gRPC server/client streaming modes, native WebSocket server/client
-sessions, framed RPC
-with typed service helpers, supervision with `OneForOne`/`OneForAll`/
-`RestForOne` and lifetime/windowed restart budgets, terminal shutdown reports
-with topology and trace, `tina-sim` with virtual time / seeded faults /
-scripted I/O / replay / DST shrinking, and bounded bridge crates for Tokio,
+TCP/UDP/DNS/TLS/file/path/process/signal/persistence rails, isolate calls with
+mandatory timeout, native HTTP/1.1, native HTTP/2 server/client, native gRPC
+server/client streaming modes, native WebSocket server/client sessions, framed
+RPC with typed service helpers, supervision with `OneForOne`/`OneForAll`/
+`RestForOne` and lifetime/windowed restart budgets, cross-shard child ownership
+inside the local multi-shard runtime, terminal shutdown reports with topology
+and trace, Chrome Trace JSON timeline export, `tina-sim` with virtual time /
+seeded faults / scripted I/O / replay / DST shrinking, live-run capture helpers,
+capacity/fairness/load proof harnesses, and bounded bridge crates for Tokio,
 Tower, reqwest, SQLite, SQLx/Postgres, and AWS SDK work.
 
 Not yet:
 
 * pooled/reconnecting native WebSocket client managers, HTTP/2 mTLS, gRPC reflection/interceptors/load balancing, and pooled production gRPC clients;
 * native database wire clients (PG wire / SQLite-native runtime rail); current paths are `tina-sqlite-bridge` over `rusqlite` and `tina-sqlx-bridge` over SQLx/Postgres;
+* full thread-per-core substrate alignment: shard-local execution is the design, but optional hard pinning and moving remaining TLS/storage/Unix bypass lanes fully onto the substrate are active work;
 * broad Linux performance claim; Linux already uses Betelgeuse's native backend;
 * remoting or clustering;
 * production performance claim;
