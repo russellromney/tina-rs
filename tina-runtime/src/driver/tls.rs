@@ -596,8 +596,16 @@ impl TlsLane {
                 result: CallOutput::Failed(CallError::InvalidResource),
             });
         };
-        if let Some(failure) = self.reject_if_full_or_zero(call_id, timeout) {
-            return Some(failure);
+        // Close is teardown, not new in-flight work, so it is exempt from the
+        // lane capacity cap: a shard at capacity must still be able to drain a
+        // stream (a `TlsFull` here would deadlock cleanup, and closing in fact
+        // frees the stream's own in-flight op). A zero timeout is still a
+        // typed `Timeout`.
+        if timeout.is_zero() {
+            return Some(DriverCompletion {
+                call_id,
+                result: CallOutput::Failed(CallError::Timeout),
+            });
         }
         // Close wins: cancel any pending read/write on this stream. Its
         // backend completion slot lives in the stream's `TlsIo`, which the
@@ -852,6 +860,23 @@ impl TlsLane {
                         Err(error) => Some(CallOutput::Failed(error)),
                     };
                 }
+                // `wants_read()` is true exactly when rustls has no buffered
+                // plaintext and the peer has not cleanly closed. If so — and we
+                // have not hit TCP EOF — there is nothing to read yet, so fetch
+                // more ciphertext *before* allocating a `max_len` read buffer
+                // for data that has not arrived. Only allocate once there is
+                // plaintext to deliver or a close/EOF to surface.
+                if io.conn.wants_read() && !io.read_eof {
+                    return match io.flush_or_fill(true) {
+                        Ok(true) => None,
+                        // `!read_eof` guarantees `flush_or_fill` armed a recv.
+                        Ok(false) => Some(CallOutput::Failed(CallError::Io)),
+                        Err(error) => Some(CallOutput::Failed(error)),
+                    };
+                }
+                if max_len == 0 {
+                    return Some(CallOutput::TlsRead { bytes: Vec::new() });
+                }
                 let mut buffer = vec![0_u8; max_len];
                 match std::io::Read::read(&mut io.conn.reader(), &mut buffer) {
                     Ok(count) => {
@@ -859,7 +884,8 @@ impl TlsLane {
                         Some(CallOutput::TlsRead { bytes: buffer })
                     }
                     Err(error) if error.kind() == ErrorKind::WouldBlock => {
-                        // Need more ciphertext. Arm a recv.
+                        // Rare: rustls reported no plaintext after all. Fetch
+                        // more ciphertext rather than allocate again next turn.
                         match io.flush_or_fill(true) {
                             Ok(true) => None,
                             Ok(false) => Some(CallOutput::Failed(CallError::Io)),
@@ -1663,6 +1689,110 @@ mod tests {
         assert!(matches!(
             drive(&mut lane, &mut completed, CallId::new(3)),
             CallOutput::Failed(CallError::TlsHandshake)
+        ));
+    }
+
+    #[test]
+    fn lane_close_is_admitted_even_at_capacity() {
+        // Close is teardown, exempt from the in-flight cap: a shard at capacity
+        // must still be able to drain a stream. (A `TlsFull` on close would
+        // deadlock cleanup.)
+        let mut lane = fresh_lane(2);
+        let mut completed = Vec::new();
+        let (cert, key) = localhost_identity();
+        let bound = lane
+            .submit_bind(
+                CallId::new(1),
+                loopback(),
+                vec![cert.clone()],
+                key,
+                Vec::new(),
+                Instant::now(),
+            )
+            .expect("bind inline");
+        let (listener, addr) = match bound.result {
+            CallOutput::TlsBound {
+                listener,
+                local_addr,
+            } => (listener, local_addr),
+            other => panic!("{other:?}"),
+        };
+        // Establish one real client stream (accept + connect fit capacity 2).
+        assert!(
+            lane.submit_accept(CallId::new(2), listener, long(), Instant::now())
+                .is_none()
+        );
+        assert!(
+            lane.submit_connect(
+                CallId::new(3),
+                addr,
+                "localhost".to_string(),
+                vec![cert.clone()],
+                Vec::new(),
+                long(),
+                Instant::now()
+            )
+            .is_none()
+        );
+        let _ = drive(&mut lane, &mut completed, CallId::new(2));
+        let client_stream = match drive(&mut lane, &mut completed, CallId::new(3)) {
+            CallOutput::TlsConnected { stream, .. } => stream,
+            other => panic!("connect: {other:?}"),
+        };
+
+        // Fill the lane to capacity with two parked connects (the listener has
+        // no pending accept, so their handshakes stall).
+        assert!(
+            lane.submit_connect(
+                CallId::new(4),
+                addr,
+                "localhost".to_string(),
+                vec![cert.clone()],
+                Vec::new(),
+                long(),
+                Instant::now()
+            )
+            .is_none()
+        );
+        assert!(
+            lane.submit_connect(
+                CallId::new(5),
+                addr,
+                "localhost".to_string(),
+                vec![cert],
+                Vec::new(),
+                long(),
+                Instant::now()
+            )
+            .is_none()
+        );
+        // Sanity: a fresh connect now *is* refused — the cap is real.
+        let refused = lane
+            .submit_connect(
+                CallId::new(6),
+                addr,
+                "localhost".to_string(),
+                Vec::new(),
+                Vec::new(),
+                long(),
+                Instant::now(),
+            )
+            .expect("connect past capacity refused");
+        assert!(matches!(
+            refused.result,
+            CallOutput::Failed(CallError::TlsFull)
+        ));
+
+        // Close of the established stream is admitted despite the full lane,
+        // and completes.
+        assert!(
+            lane.submit_close(CallId::new(7), client_stream, long(), Instant::now())
+                .is_none(),
+            "close must be admitted at capacity, not refused with TlsFull"
+        );
+        assert!(matches!(
+            drive(&mut lane, &mut completed, CallId::new(7)),
+            CallOutput::TlsClosed
         ));
     }
 }
