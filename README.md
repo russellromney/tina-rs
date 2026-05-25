@@ -2,13 +2,13 @@
 
 ![tina-rs hero](tina.png)
 
-Tina is a bounded Rust concurrency framework for predictable services:
-isolated state machines, visible overload, runtime-owned effects, and
-deterministic replay.
+Tina is a bounded Rust concurrency framework for services built from isolated
+state machines. It makes queue capacity, overload, cancellation, shutdown,
+runtime side effects, and deterministic replay explicit in the API.
 
-Use Tina when the hard parts of the service are not just "do I/O" but "know
-where work is queued, what can overload, what was cancelled, what shut down, and
-how to replay the failure."
+Use Tina when service behavior depends on where work is queued, which state is
+owned by which execution lane, what happens after timeout/cancel/shutdown, and
+whether a failing interleaving can be replayed.
 
 In Tokio, the main unit of concurrency is a `Future`: a function-shaped state
 machine that yields at `.await` points. That works well for many I/O-heavy
@@ -27,14 +27,15 @@ and time, and resumes isolates by delivering continuation messages.
 The project includes its own runtimes: `tina-runtime` for live execution and
 `tina-sim` for deterministic simulation. Tina is a runtime, but not an
 async/await runtime. It is a bounded service framework with shard-local
-execution, optional thread-per-core shape, runtime-owned I/O, and deterministic
-simulation as first-class constraints.
+execution, runtime-owned I/O, and deterministic simulation as first-class
+constraints. Optional OS thread pinning and the remaining substrate-alignment
+work are active roadmap items.
 
 `tina-rs` is an independent Rust implementation inspired by
 [Peter Mbanugo's Tina](https://github.com/pmbanugo/tina), a thread-per-core
 concurrency framework in Odin, and by his article
 [The Tokio/Rayon Trap and Why Async/Await Fails Concurrency](https://pmbanugo.me/blog/why-async-await-complect-concurrency).
-The design also rhymes with Erlang/OTP supervision, Seastar-style shard-local
+The design uses ideas from Erlang/OTP supervision, Seastar-style shard-local
 execution, and TigerBeetle-style deterministic testing: keep state owned,
 queues bounded, and execution replayable.
 
@@ -85,10 +86,10 @@ Tina is aimed at services where these properties matter more than linear
   `ThreadedRuntime` and under `tina-sim` with virtual time, seeded faults,
   saved replay cases, and shrinking. Same seed, same config, same failure.
 
-## What Tina Replaces
+## Programming Model Compared With Tokio
 
 Tina is not a drop-in replacement for Tokio's async runtime. It is a different
-service shape. In a Tina service:
+service architecture. In a Tina service:
 
 | Tokio-shaped code often reaches for | Tina's default shape |
 |---|---|
@@ -98,11 +99,11 @@ service shape. In a Tina service:
 | future cancellation by drop/abort | visible timeout, cancel, and late-reply facts |
 | logs as the main debugging artifact | runtime trace, capacity reports, and replay cases |
 
-The cost is real: more message variants and more explicit state transitions.
-The reward is that overload, shutdown, cancellation, and replay are ordinary
-program facts instead of conventions you hope every task follows.
+The cost is more message variants and more explicit state transitions. The
+result is that overload, shutdown, cancellation, and replay are represented as
+typed program facts instead of out-of-band conventions.
 
-## Where It Hurts
+## Tradeoffs
 
 Tina is not optimized for the shortest happy-path handler.
 
@@ -113,11 +114,11 @@ Tina is not optimized for the shortest happy-path handler.
   hatch.
 * Async ecosystem crates usually enter through explicit bridges, not arbitrary
   futures smuggled into an isolate.
-* Some protocol/client surfaces are still first-real-form rather than hardened
+* Some protocol/client surfaces are initial implementations rather than hardened
   production replacements.
 
-Those costs are deliberate only when they buy something visible: bounded
-pressure, typed terminal outcomes, trace facts, or replayable state.
+Those costs are justified only when they surface a concrete fact: bounded
+pressure, typed terminal outcomes, trace events, or replayable state.
 
 ## A TCP echo connection
 
@@ -248,13 +249,15 @@ The repository is a Cargo workspace:
 
 End consumers depend on `tina` plus one runtime or simulator crate.
 
-## The rule
+## Design Invariants
 
-If something can overload, Tina makes it visible.
+Tina's APIs are organized around three invariants:
 
-If something can fail, Tina makes it traceable.
-
-If something can race, Tina makes it replayable.
+* queues and resource lanes are bounded or explicitly reported as unsupported;
+* terminal outcomes (`Full`, `Closed`, `Timeout`, cancellation, late reply,
+  rejection) are typed values;
+* runtime behavior is traceable, and simulator-supported behavior is replayable
+  from explicit seed/config/history.
 
 ## Explicit by design
 
@@ -264,12 +267,12 @@ A handler matches a message and returns one effect. Runtime calls come back as
 named continuation messages. Timeouts, `Full`, `Closed`, and mailbox capacity
 are in the code you read.
 
-This is not accidental verbosity. Tina accepts helpers that remove boring
-bookkeeping. Tina rejects helpers that hide who owns state, what can overload,
-where timeout lives, or what message comes next.
+This is not accidental verbosity. Helpers may remove repeated bookkeeping, but
+they must keep state ownership, capacity, timeout, and continuation messages
+visible.
 
 That matters for humans, and it matters for LLMs. Copyable local patterns are
-safer than clever APIs whose important rules live somewhere else.
+safer than APIs whose important rules live outside the call site.
 
 ### Cancelable deferred calls
 
@@ -318,8 +321,6 @@ different seed exercises different timer-wake ordering, send delivery
 order, and TCP completion order under bounded fault models. Live and
 simulated runs share the same handler code; the difference is the driver
 underneath.
-
-Same seed. Same config. Same failure.
 
 See [`tina-sim/tests/`](tina-sim/tests/) and
 [`docs/tina-user-guide/08-simulation-and-dst.md`](docs/tina-user-guide/08-simulation-and-dst.md)
@@ -370,15 +371,14 @@ The [`examples/`](examples/) directory at the repo root contains **specimens**:
 paired Tokio-vs-Tina implementations of common service shapes (chat fanout,
 key/value store, axum counter, supervised worker, persistent counter,
 deterministic replay, outbound fetch, graceful shutdown, and more). They are
-specimens for feel and behavior, not a shared harness prison. Cross-cutting
+specimens for comparing shape and behavior, not a shared framework. Cross-cutting
 findings live in
 [`examples/FINDINGS.md`](examples/FINDINGS.md).
 
-Recent systems are also the best place to see the newer app shapes: gateway
-limits, rate-limit policy, realtime WebSocket rooms, job queues, live replay
-bugboxes, metrics shipping, and soak-shaped HTTP/DB services. They are supposed
-to find rough edges; the findings file is part of the project loop, not a
-marketing page.
+Recent systems show newer app shapes: gateway limits, rate-limit policy,
+realtime WebSocket rooms, job queues, live replay bug capture, metrics shipping,
+and soak-shaped HTTP/DB services. These examples are used to find rough edges;
+the findings file is part of the development loop, not a release document.
 
 ## Documentation
 
