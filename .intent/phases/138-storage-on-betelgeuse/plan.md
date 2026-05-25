@@ -2,6 +2,11 @@
 
 ## Status
 
+- Implemented (2026-05-25): live durability rides the per-shard Betelgeuse rail
+  (`driver/storage.rs` `StorageLane::Reactor`); the explicit-step oracle keeps
+  the inline `std::fs` path. Fallback worker handles only the ops Betelgeuse
+  lacks. See `Implementation Review 1` in `review.md` for the proofs and
+  self-found issues.
 - Planned v3 (2026-05-25): folds in `Plan Review 1` (the real pwrite→fsync
   ordering proof, CommitUncertain injection points, off-shard fallback decision,
   guard scoped to supported ops, verified Inline/Worker split). v3 tightens the

@@ -279,7 +279,7 @@ fn validate_next_journal_index(path: &Path, record_index: u64) -> Result<(), Cal
     Ok(())
 }
 
-fn journal_index_path(path: &Path) -> PathBuf {
+pub(crate) fn journal_index_path(path: &Path) -> PathBuf {
     path.with_extension(format!(
         "{}idx",
         path.extension()
@@ -289,7 +289,7 @@ fn journal_index_path(path: &Path) -> PathBuf {
     ))
 }
 
-fn temp_journal_index_path(path: &Path) -> PathBuf {
+pub(crate) fn temp_journal_index_path(path: &Path) -> PathBuf {
     let n = SNAPSHOT_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
     path.with_extension(format!(
         "{}idx.tmp.{n}",
@@ -298,6 +298,27 @@ fn temp_journal_index_path(path: &Path) -> PathBuf {
             .map(|ext| format!("{ext}."))
             .unwrap_or_default()
     ))
+}
+
+/// Parses a journal index sidecar's bytes into `(last_index, expected_len)`,
+/// or `None` when the bytes are not a well-formed sidecar. The reactor storage
+/// lane reuses this so its sidecar format matches the inline path exactly.
+pub(crate) fn parse_journal_index(bytes: &[u8]) -> Option<(u64, u64)> {
+    if bytes.len() != JOURNAL_INDEX_BYTES || &bytes[..8] != JOURNAL_INDEX_MAGIC {
+        return None;
+    }
+    let last_index = read_u64(bytes, 8)?;
+    let expected_len = read_u64(bytes, 16)?;
+    Some((last_index, expected_len))
+}
+
+/// Encodes a journal index sidecar. Mirror of [`parse_journal_index`].
+pub(crate) fn encode_journal_index(last_index: u64, file_len: u64) -> Vec<u8> {
+    let mut out = Vec::with_capacity(JOURNAL_INDEX_BYTES);
+    out.extend_from_slice(JOURNAL_INDEX_MAGIC);
+    out.extend_from_slice(&last_index.to_le_bytes());
+    out.extend_from_slice(&file_len.to_le_bytes());
+    out
 }
 
 fn load_journal_last_index(path: &Path) -> Result<Option<u64>, CallError> {
@@ -309,19 +330,8 @@ fn load_journal_last_index(path: &Path) -> Result<Option<u64>, CallError> {
     };
     let mut bytes = Vec::new();
     file.read_to_end(&mut bytes).map_err(|_| CallError::Io)?;
-    if bytes.len() != JOURNAL_INDEX_BYTES {
+    let Some((last_index, expected_len)) = parse_journal_index(&bytes) else {
         return Ok(None);
-    }
-    if &bytes[..8] != JOURNAL_INDEX_MAGIC {
-        return Ok(None);
-    }
-    let last_index = match read_u64(&bytes, 8) {
-        Some(value) => value,
-        None => return Ok(None),
-    };
-    let expected_len = match read_u64(&bytes, 16) {
-        Some(value) => value,
-        None => return Ok(None),
     };
     let actual_len = match fs::metadata(path) {
         Ok(metadata) => metadata.len(),
@@ -344,11 +354,7 @@ fn store_journal_last_index(path: &Path, last_index: u64, file_len: u64) -> Resu
             .write(true)
             .open(&temp_path)
             .map_err(|_| CallError::Io)?;
-        file.write_all(JOURNAL_INDEX_MAGIC)
-            .map_err(|_| CallError::Io)?;
-        file.write_all(&last_index.to_le_bytes())
-            .map_err(|_| CallError::Io)?;
-        file.write_all(&file_len.to_le_bytes())
+        file.write_all(&encode_journal_index(last_index, file_len))
             .map_err(|_| CallError::Io)?;
         file.sync_all().map_err(|_| CallError::Io)
     })();
@@ -471,7 +477,7 @@ pub fn replay_journal_bytes(bytes: &[u8]) -> Result<JournalReplay, CallError> {
     Ok(JournalReplay { records, warning })
 }
 
-fn temp_snapshot_path(path: &Path) -> PathBuf {
+pub(crate) fn temp_snapshot_path(path: &Path) -> PathBuf {
     let file_name = path
         .file_name()
         .and_then(std::ffi::OsStr::to_str)
