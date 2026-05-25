@@ -4,6 +4,46 @@ This file records completed work.
 
 ## Unreleased
 
+### Copied Service Ergonomics And Workflow Helpers
+
+- Added the Phase 120 copied-service path: canonical system specimens for a
+  production-shaped Tina service, companion/smoke proof crates, a "which noun do
+  I use?" guide, refreshed systems/finding docs, and cleaned WebSocket app-control
+  examples away from stringly bootstrap/tick messages.
+- Added `RunCapture` / live-replay proof-harness helpers and task-shaped bug
+  workflow wrappers so copied services can capture a run, save a bug, replay it,
+  and shrink it without stitching together lower-level DST APIs.
+- Added fairness/load assertion helpers for common user claims and expanded
+  bounded workflow helpers with join-all / select-next shapes over named
+  cancelable calls while preserving branch identity, capacity, cancellation, and
+  late-reply truth.
+
+### Cross-Shard Child Ownership
+
+- Made cross-shard observed children owned within the local multi-shard runtime:
+  parents can spawn onto another shard, learn the typed child address, stop or
+  clean up children through bounded remote control, and observe lifecycle state
+  without trace spelunking.
+- Added child lifecycle reports, remote child-control trace facts, replay/DST
+  projection support, threaded/explicit runtime query paths, and a
+  `specimen_cross_shard_child_ownership` example.
+- Preserved bounded shard-pair pressure and stale-address truth: remote child
+  stop/restart/cancel races report typed outcomes instead of relying on a hidden
+  registry or unbounded owner queue.
+
+### Trace Timeline Export
+
+- Added `tina_tracing::TraceTimeline` and Chrome Trace JSON export from
+  `TraceSnapshot` / runtime traces using logical event-id time. Timeline export
+  is an offline visual view; `RuntimeEvent` remains canonical replay truth.
+- The exporter includes shard/isolate metadata, partial-trace truth, handler and
+  call slices where pairs exist, deferred-reply spans, child lifecycle and
+  protocol facts, pressure/capacity counters, cause/call ids, deterministic
+  ordering, and visible unmatched begin/end events.
+- Added `tina-tracing/examples/export_timeline.rs`, tracing docs, and timeline
+  tests covering empty/partial traces, typed failures, protocol facts, child
+  lifecycle, JSON validity, and deterministic output.
+
 ### Fairness And Load Behavior
 
 - Added `LagObservation` to `tina_runtime::FairnessReport` for copyable

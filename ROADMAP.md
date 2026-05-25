@@ -76,7 +76,7 @@ start from an honest baseline rather than from stale roadmap wording.
 | Bounded mailbox semantics | `tina-mailbox-spsc` proves FIFO, `Full`/`Closed`, no hidden overflow queue, drop accounting, allocation accounting, focused Miri unsafe-memory checks, and selected Loom interleavings. Cross-shard shard-pair queues are bounded and directly proved in Galileo. | This is not a full formal proof for every capacity/interleaving/refactor. Any future multi-producer mailbox support must preserve the same bounded contract and is not implemented. |
 | Single-shard runtime delivery | `tina-runtime` has deterministic trace IDs and causal links, registration-order stepping, local send dispatch, local spawn dispatch, typed ingress, stop-and-abandon, panic capture, address generations, runtime-owned parent-child lineage, restartable child records, direct-child `RestartChildren` execution, supervised panic restart and explicit `Effect::Fail` restart with policy/budget config, explicit `Effect::StopChildren`, lifetime and windowed restart budgets, stopped-entry collection after settled restarts, `SupervisorReport`, `FairnessReport`, an assertion-backed task-dispatcher proof package, and generated-history property tests. | Cross-shard child stop/restart/address-change is still future work. The generated-history model is bounded and does not prove arbitrary user programs. |
 | Failure isolation | Unwinding handler panics become runtime events; the panicking isolate stops and the same round continues deterministically. | This is not Tina-Odin's OS trap boundary. Rust segfault isolation, shard quarantine, and `panic = "abort"` behavior are out of scope unless a later phase explicitly designs them. |
-| Multi-shard runtime/sim | `tina-runtime` and `tina-sim` expose multi-shard explicit-step runners with root placement, global event/call ids, bounded shard-pair queues, reserved terminal reply lanes, next-step-only remote visibility, deterministic harvest order, source-time versus destination-time delivery stages, simulator replay, user-shaped dispatcher proofs, sealed address-local remote-failure behavior, and shard-local supervision/restart ownership. The live Betelgeuse multi-shard runner has bounded ingress, bounded cross-shard transport, live cross-shard isolate-call request/reply transport, first-class live topology reports, visible queue-pressure counters, per-shard `Running`/`Stopped`/`Failed` lifecycle reports, partial trace snapshots after shard failure, terminal shutdown reports with topology/resource/error truth retained together, advisory shard/core ownership reporting, and a bounded remote-inbound drain budget. | Hard OS thread pinning, peer quarantine, shard-restart propagation, and cross-shard child ownership remain future work. |
+| Multi-shard runtime/sim | `tina-runtime` and `tina-sim` expose multi-shard explicit-step runners with root placement, global event/call ids, bounded shard-pair queues, reserved terminal reply lanes, next-step-only remote visibility, deterministic harvest order, source-time versus destination-time delivery stages, simulator replay, user-shaped dispatcher proofs, sealed address-local remote-failure behavior, shard-local supervision/restart ownership, and local cross-shard child ownership with bounded remote child-control, lifecycle reports, and stale-address truth. The live Betelgeuse multi-shard runner has bounded ingress, bounded cross-shard transport, live cross-shard isolate-call request/reply transport, first-class live topology reports, visible queue-pressure counters, per-shard `Running`/`Stopped`/`Failed` lifecycle reports, partial trace snapshots after shard failure, terminal shutdown reports with topology/resource/error truth retained together, advisory shard/core ownership reporting, and a bounded remote-inbound drain budget. | Hard OS thread pinning, peer quarantine, shard-restart propagation, and distributed remoting/clustering remain future work. |
 | Replayability | Runtime traces are deterministic across repeated identical single-shard runs, including generated operation histories and small generated dispatcher workloads. Trace replay proofs can reconstruct worker completions and restart outcomes from the runtime event model alone. `tina-sim` adds virtual time, replay records, deterministic per-tag seeded fault streams over timer-wake/local-send/TCP-completion behavior, checker failures, spawn/supervision replay, scripted TCP simulation, multi-shard trace observers, structured replay config/projection checks, multi-shard replay under default and non-default seeded configs, and multi-shard checker failure replay. | Real substrate liveness faults remain future work; current explicit-step shard-liveness non-claims are sealed. |
 | Runtime allocation story | The SPSC mailbox hot path is tested for no per-message allocation after warm-up. Ruud Lubbers pins a narrow numerical runtime cost model for selected hot paths: multi-shard send, isolate call, timer, TCP read/write, batch, spawn/restart, trace pressure, live ingress, and high-cardinality idle stepping. Runtime and simulator now reuse per-step scratch and prebuild coordinator storage where tests prove the warmed path. `PreallocationConfig` lets live systems reserve runtime-owned metadata at setup. | No broad runtime/simulator allocation-free claim is supported yet; boxed erasure, traces, replay records, backend-owned completion slots, call translators, and user payloads may still allocate. |
 | Reference examples | A Rust task-dispatcher proof package and a TCP echo proof package both exist with matching runnable examples, backed by assertions rather than logs alone. The echo proof now keeps the listener alive across a one-client smoke run, a sequential multi-client run, and a bounded-overlap run, then closes the listener cleanly and exits. | These are still proof workloads, not a broad production-server claim or benchmark story. |
@@ -113,7 +113,7 @@ Current future proof gaps to keep visible:
 - Runtime allocation behavior is intentionally claimed only for the narrow
   measured paths recorded in the current cost model.
 - Real substrate peer/shard liveness, shard-restart propagation, and
-  cross-shard child ownership remain future work.
+  distributed remoting/clustering remain future work.
 
 ## Testing infrastructure roadmap
 
@@ -366,15 +366,16 @@ and reviews live under `.intent/phases/`.
   lifetime, durable local work/outbox, and supervision/fairness reports are now
   recorded in `CHANGELOG.md`. Their open edges move forward as follow-ups,
   not as "first form still in progress."
-- Fairness/load, native session, and live-replay tranche: Phase 121 fairness
-  load reports, Phase 127 native WebSocket client/session protocol work, and
-  Phase 128 live trace-to-sim replay capture are now recorded in
-  `CHANGELOG.md`. Their remaining edges move forward as ergonomics,
-  cross-shard ownership, join/select helpers, trace export, and protocol
-  hardening follow-ups.
+- Fairness/load, native session, live-replay, copied-service ergonomics,
+  cross-shard child ownership, and trace timeline tranche: Phases 120, 121,
+  127, 128, 129, and 130 are now recorded in `CHANGELOG.md`. Their remaining
+  edges move forward as outbound session managers, protocol chaos/byte replay,
+  request-scope propagation, config/budget manifest, native AWS, substrate
+  alignment, and protocol hardening follow-ups.
 
 These are recorded in `CHANGELOG.md`; the remaining near-term roadmap now
-starts with ergonomics, cross-shard ownership, and trace timeline export below.
+starts with outbound/session hardening, protocol chaos, request-scope,
+configuration, native AWS, and substrate alignment below.
 
 ## Near-term roadmap
 
@@ -383,9 +384,6 @@ framework before public release-story work.
 
 | Phase | Purpose |
 |---|---|
-| **120 Post-Wave ergonomics** | Digest the now-landed Wave A/post-122 features into one copied service path: protocol clients, file/codec/local IPC, admission/rate policy, mature pools, durable outbox, supervision/fairness reports, shutdown, updated findings, and cheap-model proof. Plan outline: `.intent/phases/120-post-wave-a-ergonomics/plan.md`. |
-| **129 Cross-shard child ownership** | Follow-up to observed cross-shard spawn: remote owner links, cross-shard stop/restart/address-change truth, stale replacement addresses, and reports that do not require trace spelunking. Must preserve bounded remote queues and replay truth. Plan: `.intent/phases/129-cross-shard-child-ownership/plan.md`. |
-| **130 Trace timeline export** | Keep Tina's native `RuntimeEvent` trace canonical, then add an offline Chrome Trace JSON exporter from `TraceSnapshot` / shutdown traces. Use logical event-id time, not fake wall-clock time. Include shard/isolate metadata, handler/call slices where pairs exist, typed instant markers, pressure facts, partial-trace truth, and cause/call ids. Plan: `.intent/phases/130-trace-timeline-export/plan.md`. |
 | **131 Outbound connect/session managers** | Turn native outbound protocol clients from "one session works" into production-shaped managers: DNS/connect policy, bounded reconnect, stale session replacement, WebSocket manager first, HTTP/2/gRPC pool shape next, and typed pressure/lifecycle reports. Plan: `.intent/phases/131-outbound-connect-session-managers/plan.md`. |
 | **132 Protocol chaos and byte replay** | Harden the native protocol stack against bad peers, malformed bytes, resets, slow readers/writers, reconnect storms, and protocol-byte replay gaps. This is proof work with code surfaces where needed, not benchmark theater. Plan: `.intent/phases/132-protocol-chaos-byte-replay/plan.md`. |
 | **133 Request scope end-to-end** | Wire request-scoped cancellation through real HTTP/WebSocket/gRPC/body/pool/bridge flows so client disconnect, timeout, owner stop, and shutdown produce one request-shaped report with honest late-result truth. Plan: `.intent/phases/133-request-scope-end-to-end/plan.md`. |
