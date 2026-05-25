@@ -802,7 +802,14 @@ impl TlsLane {
             unreachable!("pump_close on non-close op");
         };
         // Harvest any socket op the preempted read/write left in flight before
-        // queueing close_notify, so we never run two socket ops at once.
+        // queueing close_notify, so we never run two socket ops at once. We
+        // cannot abandon that op: its completion box lives in this `TlsIo`, and
+        // the backend still points at it, so completing the close here would
+        // drop a referenced box. We therefore wait for the inherited op to
+        // release; the whole-op deadline is the backstop (an idle peer turns
+        // this close into a `Timeout`). In practice only the isolate-facing
+        // close of an *idle* stream reaches here (one pending op per stream),
+        // so `socket_op` is normally already Idle.
         if let Err(error) = io.harvest() {
             return Some(CallOutput::Failed(error));
         }
