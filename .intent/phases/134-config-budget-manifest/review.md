@@ -121,6 +121,35 @@ per-connection mailbox is a `tina-http` preset internal that a service can pull
 in via `HttpServerConfig::budget_surfaces` but mini_saas does not declare; dual
 count+weight surfaces are outside the one-dimension-per-surface model.
 
+## Third review round (fresh independent pass on the post-fix code)
+
+A second independent reviewer read the *final* committed code (to catch
+regressions from the fix wave). It found **no HIGH bug and no regression** —
+the length-prefixed hash, the UTF-8-safe secret detector (ASCII needles +
+`to_ascii_lowercase` keep all slices on char boundaries), the unconditional
+zero-check, and live-dimension selection all hold. Two MED findings, both in
+the mini_saas example, fixed:
+
+- **`controller.mailbox` in `/debug/capacity` printed from a const, not the
+  manifest-derived cap** (circular with the smoke assertion). Fixed: the
+  controller now carries `controller_mailbox` (from `caps.controller_mailbox`,
+  like `body_cap`) and the line reports that, so the displayed value comes
+  from the manifest object.
+- **The consistency comment oversold the proof.** Fixed: the
+  `live_budget_pressure` doc now states precisely that the consistency check
+  proves cap agreement only for the *sampled* surfaces (`http.request_body`,
+  `db.in_flight`) plus presence/no-extra for all; the unsampled surfaces are
+  manifest-*installed* (a code-level guarantee via `ServiceCaps`), not
+  runtime-re-derived.
+
+LOW findings documented rather than changed: a count surface that also carries
+a shared-weight scope is compared on its count dimension only (noted on
+`BudgetUnit::is_weight`); internal spaces in a weight label are allowed (the
+discovery line quotes them and the hash length-prefixes the field — comment
+corrected); an unbounded surface read by `ServiceCaps` would report "missing
+install cap", which is unreachable under the service's Production policy that
+rejects unbounded at `validate()`.
+
 ## Known limits / deliberately manual
 
 - Time deadlines and retry-budget durations: out of vocabulary, stay manual.

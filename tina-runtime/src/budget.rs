@@ -149,6 +149,11 @@ impl BudgetUnit {
     /// `Weight`). The live [`CapacitySurfaceReport`] distinguishes the
     /// count dimension from the weight dimension, so consistency
     /// checks compare dimension here, not the finer count flavors.
+    ///
+    /// A surface is modeled as one dimension. A live report that is
+    /// count-capped *and* also charges a shared weight scope is compared
+    /// on its count dimension only; expressing a combined count + shared
+    /// weight surface in one manifest row is out of scope for this form.
     pub fn is_weight(&self) -> bool {
         matches!(self, Self::Bytes | Self::Weight { .. })
     }
@@ -770,8 +775,10 @@ impl ServiceBudgetManifest {
             }
 
             // A user-defined weight label appears in reports and is
-            // hashed for replay; reject control characters and an empty
-            // label so it stays a clean, visible token.
+            // hashed for replay. Reject an empty/all-whitespace label
+            // and control characters; internal spaces are allowed (the
+            // discovery line quotes them and the hash length-prefixes
+            // the field, so neither can be corrupted).
             if let BudgetUnit::Weight { label } = &surface.unit {
                 if label.trim().is_empty() || label.chars().any(|c| c.is_control()) {
                     errors.push(BudgetValidationError::InvalidUnitLabel {

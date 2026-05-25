@@ -123,6 +123,7 @@ pub fn run(mode: RunMode) -> anyhow::Result<RunReport> {
                 outbound.pool,
                 public_body_metrics.clone(),
                 caps.body,
+                caps.controller_mailbox,
             ),
             caps.controller_mailbox,
         )
@@ -730,6 +731,10 @@ struct Controller {
     /// listener enforces the same cap; this is the handler-side check
     /// for buffered bodies that reach the isolate.
     body_cap: usize,
+    /// Mailbox cap the controller was registered with, read from the
+    /// manifest. Surfaced in `/debug/capacity` so the reported value
+    /// comes from the manifest object, not a separate const.
+    controller_mailbox: usize,
     next_id: i64,
     /// Public-ingress admission state. The controller drives `Open` →
     /// `Draining` on `CloseIngress`; per-request completion lives in the
@@ -747,6 +752,7 @@ impl Controller {
         outbound_pool: PoolAddr,
         body_metrics: BodyMetrics,
         body_cap: usize,
+        controller_mailbox: usize,
     ) -> Self {
         Self {
             db,
@@ -754,6 +760,7 @@ impl Controller {
             outbound_pool,
             body_metrics,
             body_cap,
+            controller_mailbox,
             next_id: 1,
             drain: DrainState::new(),
             live_items: HashMap::new(),
@@ -950,7 +957,14 @@ impl Isolate for Controller {
                     req,
                     text(
                         StatusCode::OK,
-                        capacity_body(body, db, outbound, self.drain.stage(), self.body_cap),
+                        capacity_body(
+                            body,
+                            db,
+                            outbound,
+                            self.drain.stage(),
+                            self.body_cap,
+                            self.controller_mailbox,
+                        ),
                     ),
                 )
             }
@@ -1181,6 +1195,7 @@ fn capacity_body(
     outbound: PoolPressureReport,
     drain_stage: DrainStage,
     body_cap: usize,
+    controller_mailbox: usize,
 ) -> String {
     let stage = drain_stage_label(drain_stage);
     format!(
@@ -1188,7 +1203,7 @@ fn capacity_body(
          http.request_body_high_water={} http.response_body_current={} \
          http.response_body_high_water={} http.body_full={} http.body_timeout={} \
          http.body_io_error={} \
-         controller.mailbox={CONTROLLER_MAILBOX_CAPACITY} drain.stage={stage} \
+         controller.mailbox={controller_mailbox} drain.stage={stage} \
          db.capacity={} db.waiters={} db.max_waiters={} db.in_flight={} db.high_water={} \
          db.full={} db.closed={} db.timeout={} outbound.capacity={} outbound.waiters={} \
          outbound.max_waiters={} outbound.in_flight={} outbound.high_water_waiters={} \
@@ -1336,6 +1351,7 @@ pub fn run_soak(config: crate::SoakConfig) -> anyhow::Result<crate::SoakReport> 
                 outbound.pool,
                 public_body_metrics.clone(),
                 caps.body,
+                caps.controller_mailbox,
             ),
             caps.controller_mailbox,
         )
@@ -1574,14 +1590,22 @@ fn build_pressure_snapshot(db: &SqlitePressureReport) -> tina_runtime::ServicePr
 }
 
 /// Live pressure report named to match the budget manifest exactly.
-/// Surfaces we sample (public body cap, db in-flight) are `Measured`
-/// with real numbers read from runtime reports; the surfaces whose live
-/// depth the runtime does not sample from this scope are explicit
-/// `Unavailable`, never silently dropped, so the manifest's consistency
-/// check stays honest. (Outbound pool pressure is observable live via
-/// `/debug/capacity`, which calls the pool from inside the runtime;
-/// re-calling it from the host during shutdown is avoided so the
-/// teardown stays thread-frugal.)
+///
+/// What the resulting consistency check proves, precisely:
+/// - **Cap agreement** for the surfaces the runtime actually samples —
+///   `http.request_body` and `db.in_flight` — because those are
+///   `Measured` with real numbers from runtime reports.
+/// - **Presence + no-extra** for every declared surface: each appears
+///   here (measured or explicit `Unavailable`), so a missing or
+///   undeclared surface fails the check.
+///
+/// It does *not* re-derive the caps of the `Unavailable` surfaces — the
+/// runtime does not sample per-isolate mailbox depth, and the outbound
+/// pool is sampled live via `/debug/capacity` rather than re-called from
+/// the host during teardown. For those surfaces the manifest is the
+/// *install* source (caps flow manifest -> `ServiceCaps` -> the
+/// `register_*` / config calls), which is a code-level guarantee, not a
+/// runtime-observed one. Nothing is silently dropped.
 ///
 /// `body_cap` is the cap the listener was *actually* installed with
 /// (read from the live config object, not a const), so the body-cap
