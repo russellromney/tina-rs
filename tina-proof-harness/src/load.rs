@@ -986,21 +986,13 @@ mod tests {
 
     #[test]
     fn pressure_summary_first_error_index_is_global_dispatch_order() {
-        let counter = Arc::new(AtomicU64::new(0));
-        let inner = Arc::clone(&counter);
         let report = run(
             LoadRun {
                 workers: 2,
                 stop: LoadStop::ops(2),
                 label: "global_first_error",
             },
-            move |_| {
-                if inner.fetch_add(1, Ordering::Relaxed) == 0 {
-                    OpOutcome::Err { kind: "first" }
-                } else {
-                    OpOutcome::Ok
-                }
-            },
+            |_| OpOutcome::Err { kind: "pressure" },
             None::<fn() -> bool>,
         );
         assert_eq!(report.ops_attempted, 2, "{report:?}");

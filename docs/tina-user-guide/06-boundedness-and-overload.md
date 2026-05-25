@@ -12,6 +12,118 @@ Important words:
 If a system is under pressure, it should shed load explicitly instead of
 quietly growing hidden queues.
 
+## Start Here: The Budget Manifest
+
+A real service has many caps: mailboxes, pools, body bytes, lanes,
+protocol sessions, bridge in-flight. Scattered through handlers and
+`register_*` calls, they are easy to lose and easy to guess. Declare
+them once in a `ServiceBudgetManifest` instead.
+
+```rust
+use tina_runtime::budget::{
+    BudgetCap, BudgetKind, BudgetSurface, BudgetUnit, ServiceBudgetManifest,
+};
+use tina::capacity::CapacityPolicy;
+
+let mut manifest = ServiceBudgetManifest::new("billing", CapacityPolicy::Production)
+    .require_kind(BudgetKind::Mailbox)
+    .require_kind(BudgetKind::BodyBytes);
+
+manifest.add(
+    BudgetSurface::new(
+        "billing.controller.mailbox",
+        BudgetKind::Mailbox,
+        BudgetUnit::Messages,
+        BudgetCap::fixed(32),
+    )
+    .owned_by("controller"),
+);
+manifest.add(
+    BudgetSurface::new(
+        "billing.http.request_body",
+        BudgetKind::BodyBytes,
+        BudgetUnit::Bytes,
+        BudgetCap::fixed(64 * 1024),
+    )
+    .owned_by("listener"),
+);
+
+// Fails before any socket binds, with typed errors — never a panic
+// and never a silent fallback.
+manifest.validate().expect("real caps validate");
+```
+
+Then read the caps back from the manifest at each call site instead of
+re-typing a literal:
+
+```rust
+let body_cap = manifest.cap_max("billing.http.request_body").unwrap();
+```
+
+`validate()` rejects the mistakes that bite in production:
+
+- duplicate or whitespace-bearing surface names;
+- a zero cap (it would deadlock a queue, fake EOF on a byte budget, or
+  disable a rail — never a real budget);
+- an `Unbounded` cap under `CapacityPolicy::Production`, or an expired
+  `unbounded_for_now`;
+- a printable field that looks like a secret value (env var *names* and
+  file paths are fine; a `password=...`, a credential URL, an AWS key
+  id, or a PEM block is rejected);
+- a missing `require_kind` row a copied skeleton must carry.
+
+### Build rows from the configs you already have
+
+You do not hand-type every row. The config structs emit their own:
+
+```rust
+manifest.extend(local_system_config.budget_surfaces("runtime"));
+manifest.extend(http_server_config.budget_surfaces("http"));
+manifest.extend(sqlite_config.budget_surfaces("db"));
+```
+
+The mapping is exact: one config field, one row. Adapters describe what
+the config already says; they never invent a cap. Time deadlines
+(`service_call_timeout`, `request_timeout`, …) are deliberately *not*
+surfaced — the unit vocabulary is count and weight, not time, so a
+deadline stays plain config rather than a faked count.
+
+### Join the manifest with what actually happened
+
+Pass the live [`ServicePressureReport`](#pressure-report-convention) to
+`manifest.report(...)` to get one object answering "what did I
+configure, what was used, what was full?". The configured caps come from
+the manifest; the observed `cur` / `high` / `full` numbers come from the
+runtime report, never the other way around.
+
+```rust
+let report = manifest.report(&live_pressure);
+println!("{}", report.summary_line());
+// budget service=billing schema=1 surfaces=8 observed=2 full=true consistent=true
+assert!(report.consistency.is_consistent()); // every live surface has a row
+```
+
+`compare_capacity_summary` and `compare_service_pressure` return typed
+rows — `Missing`, `Extra`, `CapMismatch`, `UnitMismatch`, `ModeMismatch`
+— so a manifest that drifts from the live surfaces fails a test, not a
+3am page.
+
+### Pin replay-affecting caps
+
+Mark each surface `ReplayAffecting` (the default) or `display_only()`.
+`manifest.replay_export()` hashes only the replay-affecting caps:
+
+```rust
+let export = manifest.replay_export();
+// Pin export.replay_affecting_hash into a saved DST case. Changing a
+// replay-affecting cap changes the hash; changing a display-only cap
+// (e.g. an accept-queue depth) does not, and the export names what it
+// ignored.
+```
+
+This keeps a saved replay case from silently riding ambient defaults:
+if a body cap that the case depends on changes, the hash changes too.
+
 ## Mailbox Capacity
 
 Every isolate mailbox has capacity. The capacity is one number, but
