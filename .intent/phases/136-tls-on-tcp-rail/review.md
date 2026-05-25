@@ -225,3 +225,100 @@ The plan's "bonus" language could be read as requiring cryptographic TLS in the
 simulator. Fixed in plan v5: `tina-sim` scripted TLS stays unchanged. The live
 threaded path is required; explicit-step runtime TLS may improve only if it
 naturally rides an existing explicit TCP rail.
+
+## Implementation Review 1 — post-landing (2026-05-25)
+
+TLS-1..4 landed in one pass: `driver/tls.rs` is a from-scratch on-shard rustls
+sans-I/O pump over a cloned Betelgeuse `IOLoopHandle`. The worker lane,
+`StreamOwned`, the mpsc command/completion channel, and all `std::net` socket
+use are gone. `tls_*` call signatures are unchanged; capabilities moved
+TLS → completion-backed (capacity kept as the shard-total in-flight cap).
+
+### Architecture note (deviation from the plan's literal wording, same intent)
+
+The plan says the TLS layer "owns the underlying `StreamId`" and issues
+`tcp_read`/`tcp_write`. The implementation instead owns the **Betelgeuse socket
+directly** (same `IOSocket` primitives the TCP lane uses, on a cloned handle of
+the same loop) and serializes its own `recv`/`send`. This satisfies every hard
+constraint — bytes come only from the runtime's Betelgeuse rail, no second
+socket stack, on-shard, one socket op at a time — without entangling the TCP
+lane's `StreamId` table. It is the cleaner separation; the "StreamId" wording was
+conceptual.
+
+### Bugs caught during implementation (would have shipped broken)
+
+- **Handshake final flight.** `drive_handshake` first returned `Done` as soon as
+  `is_handshaking()` was false, leaving the completing side's `Finished` in the
+  outbound buffer unsent — a Tina↔Tina handshake hung (the std-rustls-peer tests
+  masked it because the peer drove its own handshake). Fixed: flush outbound
+  before declaring done. Pinned by the single-lane client+server tests.
+- **Shared-loop drop hazard.** A `Drop` impl that called
+  `cancel_pending_completions()` walked the backend watch list; on a bare runtime
+  drop the TCP lane's field drops first and frees its boxes, so this was
+  use-after-free (regressed a TCP test). Fixed: no `Drop`; only orderly
+  `cancel_pending` (which runs before any lane drops) touches the shared backend.
+
+### Proof status against the plan's must-prove list
+
+All green: same-runtime Tina↔Tina (lane + `local_system` + specimen), three-way
+interop (Tina↔Tina, Tina↔tokio-rustls, stdlib-rustls↔Tina), ALPN `h2` both
+sides, HTTP/1.1 + HTTP/2-ALPN + keepalive over TLS, wrong-CA / wrong-SNI /
+truncated-handshake reject, whole-op timeout (once, not per-TCP-op),
+write-during-read with no `ResourceBusy`, close_notify-vs-truncation distinct,
+close-wins + timeout-tombstone, bounded large-payload transfer, and the
+no-worker-thread / no-side-door-socket source guard. Simulator TLS suite
+unchanged and green.
+
+### Recorded, not fixed (in scope but minor / matches prior behavior)
+
+- **Expired cert** is not a dedicated test; it rejects via the same handshake
+  cert-validation path as wrong-CA (`process_new_packets` error → `TlsHandshake`).
+  The security posture (validation, SNI, DER roots, no downgrade) is unchanged.
+- **`tls_close` at lane capacity** returns `TlsFull` (close is an async op that
+  needs a slot). This matches the pre-136 behavior; exempting cleanup ops from
+  the cap is a separate ergonomics question.
+- **Per-op user `cancel` mid-TLS** shares the tombstone machinery proven by the
+  timeout and close-wins tests; it has no dedicated mid-flight test.
+
+## Implementation Review 2 — two independent hostile passes (2026-05-25)
+
+Two fresh adversarial reviewers swept the rewritten pump end to end (every
+drop/move path for completion boxes, the read/write/close state machines, the
+shared-loop shutdown, rustls 0.23 `wants_read`/`read_tls`/`reader` semantics).
+No use-after-free, no two-concurrent-socket-ops, no panic-on-adversarial-peer,
+and no deadlock were found. Two findings were real and fixed; the rest were
+confirmed non-bugs.
+
+### Fixed
+
+- **Read allocates only when there is something to read.** The read pump now
+  consults rustls `wants_read()` before allocating a `max_len` buffer: when
+  there is no buffered plaintext and no TCP EOF, it arms the recv first instead
+  of allocating for data that has not arrived (and short-circuits a 0-length
+  read). Verified to preserve clean-close (`Ok(0)`) and truncation
+  (`UnexpectedEof`) — `wants_read()`'s `received_plaintext.is_empty()` conjunct
+  makes skipping buffered plaintext impossible, so there is no data-loss window.
+- **`tls_close` is exempt from the in-flight lane cap.** A shard at capacity
+  must still be able to drain a stream; a `TlsFull` on close would deadlock
+  cleanup, and a close in fact frees the stream's own slot. Bounded by the live
+  stream count; other ops still count close ops, so the cap stays conservative.
+  New lane test `lane_close_is_admitted_even_at_capacity`.
+
+### Confirmed non-bugs (re-challenged and held)
+
+- **Truncation → `CallError::Io`.** The required distinction is clean-close
+  (empty `Ok`) vs truncation (error); both hold. The TCP rail also collapses to
+  `Io` — "matching today."
+- **`ingest` gates the EOF-into-rustls signal on `wants_read()`.** Required:
+  `read_tls` errors when the plaintext buffer is full, so EOF cannot be signaled
+  then; once plaintext drains, `wants_read()` flips true and EOF is signaled, so
+  truncation is surfaced (eventually, after delivering buffered plaintext) — no
+  permanent mask, no hang.
+- **Shutdown whole-loop `cancel_pending_completions`.** Safe because there is no
+  `Drop` impl and orderly shutdown runs before any lane drops (all boxes alive).
+  A documented architectural constraint, not a live UAF.
+- **`pump_close` waiting on an inherited live recv.** Only reachable by driving
+  the raw lane API (the HTTPS/keepalive isolates always close an *idle* stream);
+  it cannot complete while the inherited box is backend-referenced (that would be
+  a UAF), so it correctly waits, with the whole-op deadline as the backstop
+  (an idle peer → `Timeout`). Comment in `pump_close` sharpened to say so.

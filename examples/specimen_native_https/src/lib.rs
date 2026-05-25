@@ -1,9 +1,13 @@
-//! Tina-vs-Tokio HTTPS/1.1 counter server. Same scripted rustls
-//! client hits both: `GET /counter → POST × 3 → GET /counter →
-//! GET /missing`. Tokio side: hand-rolled `tokio + tokio-rustls`.
-//! Tina side: `tina_http::HttpsListener` + Counter isolate.
+//! Tina-vs-Tokio HTTPS/1.1 counter specimen. The scripted flow is the same on
+//! both sides: `GET /counter → POST × 3 → GET /counter → GET /missing`.
 //!
-//! HTTPS *client* coverage lives in `tina-http/tests/client_tls_smoke.rs`.
+//! - Tokio side (`tokio_impl`): a hand-rolled `tokio + tokio-rustls` server,
+//!   hit by the stdlib-rustls [`scripted_client`] below — the interop
+//!   counterparty.
+//! - Tina side (`tina_impl`): a `tina_http::HttpsListener` server **and** a
+//!   `tina_http::HttpClient` HTTPS client in **one runtime, on one shard**.
+//!   TLS rides Tina's TCP rail, so client and server share a runtime — the
+//!   case the old single-worker TLS lane could not run.
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};

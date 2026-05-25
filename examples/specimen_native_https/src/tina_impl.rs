@@ -1,17 +1,24 @@
-//! Tina HTTPS server. The host gates startup on the typed call-shaped
-//! `Start` reply, then drives the scripted client once `Ready` lands.
+//! All-Tina HTTPS counter specimen: a `tina_http::HttpsListener` server **and**
+//! a `tina_http::HttpClient` HTTPS client share one runtime, on one shard. The
+//! client scripts `GET /counter → POST × 3 → GET /counter → GET /missing`
+//! against the server. Before Phase 136 this was impossible — the single TLS
+//! worker deadlocked both sides of one handshake — so the client lived in a
+//! separate stdlib-rustls process. Now TLS rides the TCP rail and both ends are
+//! Tina.
 
 use std::convert::Infallible;
 use std::time::Duration;
 
+use http::{Method, StatusCode, Version};
 use tina::prelude::*;
 use tina_http::{
-    HttpRequest, HttpResponse, HttpsListener, HttpsListenerMsg, HttpsServerConfig, StatefulRouter,
-    TlsServerIdentity,
+    HttpClient, HttpClientConfig, HttpClientMsg, HttpHostPolicy, HttpRequest, HttpRequestBody,
+    HttpResponse, HttpResponseBody, HttpTarget, HttpsListener, HttpsListenerMsg, HttpsServerConfig,
+    StatefulRouter, TlsServerIdentity, TlsTrustRoots,
 };
 use tina_runtime::{CallOutcome, DefaultThreadedMailboxFactory, ThreadedRuntime};
 
-use crate::{Report, scripted_client, tls_identity};
+use crate::{Report, tls_identity};
 
 #[derive(Debug, Default)]
 struct Counter {
@@ -50,6 +57,23 @@ impl Counter {
     }
 }
 
+fn request(method: Method, path: &str) -> HttpRequest {
+    HttpRequest {
+        method,
+        path: path.to_string(),
+        version: Version::HTTP_11,
+        headers: http::HeaderMap::new(),
+        body: HttpRequestBody::default(),
+    }
+}
+
+fn body_text(response: &HttpResponse) -> String {
+    match &response.body {
+        HttpResponseBody::Buffered(bytes) => String::from_utf8_lossy(bytes).into_owned(),
+        _ => String::new(),
+    }
+}
+
 pub fn run() -> anyhow::Result<Report> {
     let identity_bundle = tls_identity::generate();
     let identity = TlsServerIdentity::from_der(
@@ -72,26 +96,83 @@ pub fn run() -> anyhow::Result<Report> {
             8,
         )
         .map_err(|e| anyhow::anyhow!("register listener: {e:?}"))?;
-
-    let outcome = runtime
-        .call_blocking(
-            listener,
-            HttpsListenerMsg::Start,
-            Duration::from_secs(5),
+    // The HTTPS client shares the runtime — and the shard, and the TLS lane —
+    // with the server it talks to.
+    let client = runtime
+        .register_with_capacity::<HttpClient<SingleShard>, Infallible>(
+            HttpClient::<SingleShard>::new(HttpClientConfig::dev()),
+            16,
         )
-        .map_err(|e| anyhow::anyhow!("https startup call failed: {e:?}"))?;
-    let ready = match outcome {
+        .map_err(|e| anyhow::anyhow!("register client: {e:?}"))?;
+
+    let ready = match runtime
+        .call_blocking(listener, HttpsListenerMsg::Start, Duration::from_secs(5))
+        .map_err(|e| anyhow::anyhow!("https startup call failed: {e:?}"))?
+    {
         CallOutcome::Replied(Ok(ready)) => ready,
-        CallOutcome::Replied(Err(error)) => {
-            anyhow::bail!("https startup failed: {error:?}")
-        }
+        CallOutcome::Replied(Err(error)) => anyhow::bail!("https startup failed: {error:?}"),
         CallOutcome::Full => anyhow::bail!("https startup call back-pressured (mailbox full)"),
         CallOutcome::Closed => anyhow::bail!("https listener closed before reply"),
         CallOutcome::Timeout => anyhow::bail!("https startup timed out before listener replied"),
         CallOutcome::Rejected(reason) => anyhow::bail!("https startup rejected: {reason:?}"),
     };
 
-    let report = scripted_client(ready.local_addr, identity_bundle.cert_der);
+    let trust = TlsTrustRoots::from_der(vec![identity_bundle.cert_der.clone()]);
+    let target = || HttpTarget::Https {
+        addr: ready.local_addr,
+        server_name: "localhost".to_string(),
+        trust_roots: trust.clone(),
+        host: HttpHostPolicy::Explicit("localhost".to_string()),
+    };
+
+    let mut report = Report {
+        exit_clean: true,
+        ..Report::default()
+    };
+
+    // The same scripted flow the stdlib client runs against the tokio side, now
+    // driven by Tina's own HTTPS client against Tina's own HTTPS server.
+    let fetch = |req: HttpRequest| -> anyhow::Result<HttpResponse> {
+        match runtime
+            .call_blocking(
+                client,
+                HttpClientMsg::call(target(), req),
+                Duration::from_secs(5),
+            )
+            .map_err(|e| anyhow::anyhow!("client call failed: {e:?}"))?
+        {
+            CallOutcome::Replied(Ok(response)) => Ok(response),
+            CallOutcome::Replied(Err(error)) => Err(anyhow::anyhow!("client error: {error:?}")),
+            other => Err(anyhow::anyhow!("client call did not reply: {other:?}")),
+        }
+    };
+
+    let first = fetch(request(Method::GET, "/counter"))?;
+    if first.status == StatusCode::OK {
+        report.successful_get += 1;
+    }
+    anyhow::ensure!(
+        body_text(&first).trim() == "0",
+        "first GET should report counter=0"
+    );
+
+    for _ in 0..3 {
+        let posted = fetch(request(Method::POST, "/counter"))?;
+        if posted.status == StatusCode::OK {
+            report.successful_post += 1;
+        }
+    }
+
+    let second = fetch(request(Method::GET, "/counter"))?;
+    if second.status == StatusCode::OK {
+        report.successful_get += 1;
+    }
+    report.final_counter_value = body_text(&second).trim().parse().unwrap_or(0);
+
+    let missing = fetch(request(Method::GET, "/missing"))?;
+    if missing.status == StatusCode::NOT_FOUND {
+        report.got_404_for_missing = true;
+    }
 
     runtime
         .try_send(listener, HttpsListenerMsg::Stop)

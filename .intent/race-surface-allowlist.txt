@@ -52,12 +52,11 @@ tina/src/context.rs                     handshake-cell     DeferredSlotShared / 
 tina-runtime/src/observation.rs         handshake-cell     bounded typed waiter done-flags (AtomicBool set/read) + std mpsc delivery
 tina-runtime/src/bridge.rs              handshake-cell     AtomicBool closed flag at the bridge boundary
 # Driver-lane cancel/signal flags shared with real OS worker threads
-# (blocking DNS/TLS/process resolver lanes, the storage lane, and the
-# signal-hook handler). store(true)/load() cancellation, single-consumer swap
-# for signals; not lock-free algorithms.
+# (blocking DNS/process lanes, the storage fallback lane, and the signal-hook
+# handler). store(true)/load() cancellation, single-consumer swap for signals;
+# not lock-free algorithms.
 tina-runtime/src/driver/mod.rs          handshake-cell     Arc<AtomicBool> cancel flags + os-signal flags wired through the driver
 tina-runtime/src/driver/dns.rs          handshake-cell     Arc<AtomicBool> cancel flag for the blocking DNS lane
-tina-runtime/src/driver/tls.rs          handshake-cell     Arc<AtomicBool> cancel flag for the blocking TLS lane
 tina-runtime/src/driver/process.rs      handshake-cell     Arc<AtomicBool> cancel flag for the bounded process lane
 tina-runtime/src/driver/storage.rs      handshake-cell     Arc<AtomicBool> cancel flag for the storage lane
 tina-runtime/src/driver/signals.rs      handshake-cell     Arc<AtomicBool> SIGINT/SIGTERM flags (set by handler, single-consumer swap)

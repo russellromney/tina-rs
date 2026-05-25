@@ -15,10 +15,10 @@
 //!
 //! The pin runs from inside the worker thread itself (affinity is per-thread).
 //! Only the shard worker is pinned. A pinned thread's children inherit its
-//! single-core mask on Linux, so helper-lane threads the worker spawns later
-//! (e.g. per-operation TLS workers) call [`float_helper_thread`] at startup to
-//! reset to the process's original mask — helper lanes stay unpinned and float
-//! onto spare cores rather than fighting a shard for its core.
+//! single-core mask on Linux, so any helper-lane thread a worker spawns after
+//! it pins itself can call [`float_helper_thread`] at startup to reset to the
+//! process's original mask — helper lanes stay unpinned and float onto spare
+//! cores rather than fighting a shard for its core.
 
 #[cfg(target_os = "linux")]
 use std::sync::OnceLock;
@@ -89,6 +89,7 @@ pub(crate) fn apply(configured_core: Option<usize>) -> AffinityOutcome {
 /// stuck on a shard's core. Best-effort and a no-op when nothing has pinned or
 /// the platform has no hard pin.
 #[cfg(target_os = "linux")]
+#[allow(dead_code)]
 pub(crate) fn float_helper_thread() {
     if let Some(allowed) = ORIGINAL_ALLOWED.get() {
         let _ = set_affinity(allowed);
@@ -96,6 +97,7 @@ pub(crate) fn float_helper_thread() {
 }
 
 #[cfg(not(target_os = "linux"))]
+#[allow(dead_code)]
 pub(crate) fn float_helper_thread() {}
 
 /// Rejects a requested core that is not in the process's allowed affinity mask.

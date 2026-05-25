@@ -184,11 +184,22 @@ tombstoned on timeout/cancel because standard OS resolver calls are not
 preempted by Tina. Do not claim hidden unbounded resolver queues or preemptive
 DNS cancellation.
 
-Native TLS is a Tina-owned bounded blocking driver rail over runtime-owned
-`TlsStreamId`s. It uses real TLS semantics for connect/handshake/read/write/
-close, reports certificate/name/handshake/I/O/full/closed/timeout outcomes, and
-enforces one pending TLS operation per TLS stream. Simulator TLS is semantic
-scripted I/O, not cryptography.
+Native TLS is a layer over the runtime's own Betelgeuse TCP rail, not a separate
+blocking-socket subsystem: the runtime owns a rustls connection (sans-I/O) per
+runtime-owned `TlsStreamId` and drives the handshake/read/write/close state
+machine on the shard thread as Betelgeuse harvests TCP completions — no worker
+thread, no second socket stack, so a Tina TLS client and server can share one
+runtime. The TLS layer owns the underlying TCP socket exclusively and serializes
+its own internal socket ops (at most one read *or* write in flight), so a single
+`tls_*` call can interleave reads and writes without tripping the rail's
+one-pending-op rule. It uses real TLS semantics for cert validation, SNI/name
+check, and DER-root policy, distinguishes a clean `close_notify` from
+truncation, reports certificate/name/handshake/I/O/full/closed/timeout outcomes,
+and enforces one pending TLS operation per TLS stream at the isolate boundary.
+`tls_lane_capacity` bounds the shard-total count of in-flight TLS ops. Handshake
+asymmetric crypto runs on the shard thread (an accepted tradeoff: visible and
+boundable by accept rate). Simulator TLS is unchanged — semantic scripted I/O,
+not cryptography.
 
 Runtime shutdown notification is a Tina-owned signal rail: shutdown can deliver
 a bounded `"shutdown"` notification into waiting isolates before the worker

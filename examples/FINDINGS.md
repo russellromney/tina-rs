@@ -448,22 +448,26 @@ or a caller-asserted `M` (not honest under the LLM rule). Pick
 the typed-event vs. continuation form when the supervisor/spawn
 API gets revisited.
 
-### 16. Multi-worker TLS lane (or split accept/stream lanes) — resolved first form
+### 16. Multi-worker TLS lane (or split accept/stream lanes) — closed
 
 **Surfaced by:** `specimen_native_https`, `tina-http/tests/client_tls_smoke.rs`.
 
-The original first form used one TLS worker per shard, so a quiet
-stream could head-of-line-block accepts and other streams. The
-runtime now runs each in-flight TLS op on a worker thread bounded by
-`tls_lane_capacity`. `local_system_tls_quiet_stream_does_not_block_second_connection`
-pins the user story: one client completes TLS and goes quiet; a
-second client still handshakes, sends `ping`, and receives `pong`.
+**Closed.** TLS no longer runs on worker threads at all. The runtime owns a
+rustls connection (sans-I/O) per `TlsStreamId` and drives the
+handshake/read/write/close state machine on the shard thread as Betelgeuse
+harvests TCP completions — TLS is a layer over the runtime's own TCP rail, not a
+second socket stack. The single TLS worker that head-of-line-blocked accepts and
+deadlocked a same-runtime client+server is gone. `local_system_tls_quiet_stream_does_not_block_second_connection`
+still pins the quiet-stream story, and `local_system_tls_client_and_server_share_one_runtime`
+runs a Tina TLS client and server on one shard in one runtime — the exact case
+this finding called impossible. The substrate guard
+(`tina-runtime/tests/tls_substrate_guard.rs`) pins the absence of any
+`tina-tls-*` worker thread or private socket stack.
 
-**Still true:** `tls_lane_capacity` is a hard cap, not magic
-unbounded TLS concurrency. Long-running operations still occupy
-slots until they finish or time out.
-Until then, first-form HTTPS is honest about its single-lane
-bottleneck.
+**Still true:** `tls_lane_capacity` is a hard cap — now the shard-total count of
+in-flight TLS ops, not magic unbounded concurrency. Handshake asymmetric crypto
+runs on the shard thread, an accepted tradeoff: visible and boundable by accept
+rate rather than hidden on a serial worker that deadlocks.
 
 ### 15. Deadline as first-class context
 
