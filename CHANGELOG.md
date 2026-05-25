@@ -4,6 +4,41 @@ This file records completed work.
 
 ## Unreleased
 
+### Config And Budget Manifest
+
+- Added `tina_runtime::budget`: a `ServiceBudgetManifest` that declares a
+  service's bounded surfaces (mailboxes, pools, body bytes, lanes, shard pairs,
+  protocol sessions, connect attempts, bridge in-flight, event sinks, pending
+  replies/calls, request scopes) in one place. Each `BudgetSurface` carries a
+  stable name, kind, unit, cap or explicit unbounded policy, capacity mode,
+  owner/shard labels, replay impact, and source.
+- `manifest.validate()` rejects bad caps before runtime startup with typed
+  `BudgetValidationError`s — duplicate/empty/whitespace names, zero caps (which
+  would deadlock a queue, fake EOF on a byte budget, or disable a rail),
+  bounded/unbounded mode conflicts, policy-rejected or expired unbounded modes,
+  secret-looking printable fields, and missing required surface kinds. No silent
+  clamping, no hidden unbounded default.
+- Added config adapters that build manifest rows from existing configs:
+  `LocalSystemConfig`, `ThreadedRuntimeConfig`, `MultiShardRuntimeConfig`,
+  HTTP/1 server/client/pool configs, HTTP/2 server/client limits,
+  `WebSocketLimits`, and the SQLite bridge install config. The mapping is exact
+  (one field, one row); adapters never invent caps. Time deadlines are
+  deliberately not surfaced — the unit vocabulary is count and weight, not time.
+- Added consistency checks (`compare_capacity_summary`,
+  `compare_service_pressure`, `compare_manifest`) returning typed
+  missing/extra/cap/unit/mode/replay-impact rows, and `manifest.report(...)`,
+  which joins declared caps with observed `cur`/`high`/`full` facts from the
+  live pressure report. Observed numbers always come from runtime reports, never
+  guessed config.
+- Added `manifest.replay_export()`: a stable hash over the replay-affecting
+  surfaces plus the list of display-only surfaces it ignored. Changing a
+  replay-affecting cap changes the hash; changing a display-only cap does not.
+- Migrated `mini_saas_api` to declare every cap once in a budget manifest and
+  read caps back from it. The service validates the manifest before binding,
+  joins it with the live pressure report at shutdown, pins the manifest hash
+  into its live-replay fact, and a `tests/budget.rs` suite proves the documented
+  caps are exactly the manifest rows and every live surface has a row.
+
 ### Copied Service Ergonomics And Workflow Helpers
 
 - Added the Phase 120 copied-service path: canonical system specimens for a

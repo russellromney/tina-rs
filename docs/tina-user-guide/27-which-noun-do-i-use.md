@@ -4,6 +4,9 @@ Start from the task, not the type list.
 
 | Task | Use |
 |---|---|
+| declare all my service caps in one place | `ServiceBudgetManifest` + `BudgetSurface`; read caps back with `manifest.cap_max(name)` |
+| check configured vs observed caps | `manifest.report(&pressure)` / `compare_capacity_summary` / `compare_service_pressure` |
+| pin replay-affecting config in a DST case | `manifest.replay_export()` (hashes only `ReplayAffecting` surfaces) |
 | limit work | `ConcurrencyLimit`, `KeyedLimit`, `SharedCapacityScope`, or a bounded mailbox |
 | retry after `Full` | `FullHandling` when retry policy is the service contract |
 | call another service | native `tina-http` HTTP/2/gRPC/WebSocket client helpers or a bridge crate |

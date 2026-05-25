@@ -96,9 +96,38 @@ fn smoke_covers_service_layers() {
     assert_eq!(terminal["outbound.stop_already_closed"], "0");
     assert_eq!(terminal["outbound.stop_failures"], "0");
     assert!(report.terminal_line.contains("trace_pressure=completion["));
-    assert_eq!(
+    // The replay fact now pins the budget config the case depends on:
+    // the body cap plus the replay-affecting hash, so the saved case
+    // never silently rides ambient defaults.
+    assert!(
+        report.live_replay_fact.starts_with(
+            "case=mini_saas_body_full ops=[post:/items:41bytes] fact=status_413 cap=32"
+        ),
+        "live_replay_fact shape: {}",
         report.live_replay_fact,
-        "case=mini_saas_body_full ops=[post:/items:41bytes] fact=status_413 cap=32"
+    );
+    assert!(
+        report
+            .live_replay_fact
+            .contains(" budget_schema=1 budget_hash="),
+        "live_replay_fact must pin the budget hash: {}",
+        report.live_replay_fact,
+    );
+
+    // The budget manifest joined with the live pressure report: every
+    // declared surface matched a live surface, and the report names the
+    // configured + observed budgets in one greppable line.
+    assert!(
+        report.budget_consistent,
+        "budget mismatch: {}",
+        report.budget_report_line
+    );
+    assert!(
+        report
+            .budget_report_line
+            .starts_with("budget service=mini_saas_api schema=1"),
+        "budget_report_line shape: {}",
+        report.budget_report_line,
     );
 
     // Startup summary line names every bounded surface, including

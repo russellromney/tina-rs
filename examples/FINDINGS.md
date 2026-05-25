@@ -994,6 +994,19 @@ pending/results, explicit loser cancellation, partial reports, and late-reply
 truth visible. The companion proof and smoke-copy crate exist so a cheap model
 or tired human can tell whether the path is actually copyable.
 
+The config/budget half of the copied path is now closed too. Services used to
+scatter caps through handlers and `register_*` literals, so a reader could not
+see all knobs before the service ran. `tina_runtime::budget::ServiceBudgetManifest`
+makes boundedness copyable: one object declares every cap with kind/unit/replay
+impact, validates before startup with typed errors, builds rows from existing
+configs through adapters, joins configured caps with observed pressure, and
+exports the replay-affecting caps a saved DST case depends on. `mini_saas_api`
+declares all its caps in one `src/budget.rs` manifest and reads them back from
+there; `tests/budget.rs` proves the documented caps are exactly the manifest
+rows and that every live surface has a row. Still deliberately manual: time
+deadlines and retry-budget *durations* (the unit vocabulary is count and weight,
+not time) and per-isolate mailbox depth the runtime does not sample.
+
 ### 37. Accept-loop bad-peer survivability — Phase 120 hostile review
 
 **Surfaced by:** `system_realtime_rooms/tests/bad_peer.rs`,
