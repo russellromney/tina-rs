@@ -2,6 +2,8 @@
 
 ## Status
 
+- Implemented (2026-05-25). See `review.md` "Implementation" for what shipped
+  and the proof status.
 - Planned v4 (2026-05-25): v2 corrected the premise against `origin/main`
   (`a6cbaa9`); v3 folds in `Plan Review 1` (decides the `configured_core`
   meaning, names the real blast radius, specifies the readback mechanism). v4

@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use tina::ShardId;
 
+use crate::affinity::AffinityOutcome;
 use crate::driver::DriverResourceReport;
 use crate::{PreallocationConfig, ThreadedRuntimeConfig, TraceRetention};
 
@@ -135,13 +136,22 @@ impl LiveQueueMetrics {
     }
 }
 
+/// Startup facts the worker thread publishes once, under a single lock, so a
+/// report that shows a worker thread id also shows that worker's final pin
+/// outcome (the pin runs before the thread id is recorded).
+#[derive(Debug)]
+struct WorkerStartup {
+    thread_id: Option<String>,
+    affinity_status: AffinityStatus,
+    observed_core: Option<usize>,
+}
+
 #[derive(Debug)]
 pub(crate) struct LiveShardMetrics {
     shard: ShardId,
     worker_name: Option<String>,
-    worker_thread_id: Mutex<Option<String>>,
     configured_core: Option<usize>,
-    affinity_status: AffinityStatus,
+    startup: Mutex<WorkerStartup>,
     preallocation: PreallocationConfig,
     pub(crate) config: ThreadedRuntimeConfig,
     state: AtomicU8,
@@ -162,13 +172,12 @@ impl LiveShardMetrics {
         Self {
             shard,
             worker_name,
-            worker_thread_id: Mutex::new(None),
             configured_core: config.configured_core,
-            affinity_status: if config.configured_core.is_some() {
-                AffinityStatus::AdvisoryOnly
-            } else {
-                AffinityStatus::NotRequested
-            },
+            startup: Mutex::new(WorkerStartup {
+                thread_id: None,
+                affinity_status: pre_start_affinity_status(config.configured_core),
+                observed_core: None,
+            }),
             preallocation: config.preallocation,
             config,
             state: AtomicU8::new(LiveShardState::RUNNING),
@@ -203,25 +212,32 @@ impl LiveShardMetrics {
             .store(report.pending_driver_call_count(), Ordering::Release);
     }
 
-    pub(crate) fn set_worker_thread_id(&self, id: String) {
-        *self
-            .worker_thread_id
-            .lock()
-            .expect("worker thread id lock poisoned") = Some(id);
+    /// Records the worker's thread id and its proven pin outcome together, so
+    /// any report that names the worker thread also carries that worker's final
+    /// affinity status and observed core.
+    pub(crate) fn publish_worker_start(&self, thread_id: String, affinity: AffinityOutcome) {
+        let mut startup = self.startup.lock().expect("worker startup lock poisoned");
+        startup.thread_id = Some(thread_id);
+        startup.affinity_status = affinity.status;
+        startup.observed_core = affinity.observed_core;
     }
 
     pub(crate) fn report(&self) -> LiveShardReport {
+        let (worker_thread_id, affinity_status, observed_core) = {
+            let startup = self.startup.lock().expect("worker startup lock poisoned");
+            (
+                startup.thread_id.clone(),
+                startup.affinity_status.clone(),
+                startup.observed_core,
+            )
+        };
         LiveShardReport {
             shard: self.shard,
             worker_name: self.worker_name.clone(),
-            worker_thread_id: self
-                .worker_thread_id
-                .lock()
-                .expect("worker thread id lock poisoned")
-                .clone(),
+            worker_thread_id,
             configured_core: self.configured_core,
-            observed_core: None,
-            affinity_status: self.affinity_status.clone(),
+            observed_core,
+            affinity_status,
             preallocation: self.preallocation,
             remote_inbound_drain_budget: self.config.remote_inbound_drain_budget,
             shutdown_lane_drain_timeout: self.config.shutdown_lane_drain_timeout,
@@ -241,19 +257,42 @@ impl LiveShardMetrics {
     }
 }
 
+/// Status this metrics block reports before the worker thread has started and
+/// published its proven outcome. Authoritative affinity is only known once the
+/// worker runs the pin; until then a requested core makes no claim
+/// (`Unsupported`), and `None` is simply `NotRequested`.
+fn pre_start_affinity_status(configured_core: Option<usize>) -> AffinityStatus {
+    match configured_core {
+        None => AffinityStatus::NotRequested,
+        Some(_) => AffinityStatus::Unsupported,
+    }
+}
+
 /// Shard-worker affinity state.
+///
+/// Authoritative once the worker thread has started (its
+/// [`worker_thread_id`](LiveShardReport::worker_thread_id) is present): the pin
+/// runs and publishes its outcome before the worker records its thread id.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AffinityStatus {
-    /// No core affinity was requested.
+    /// No core affinity was requested (`configured_core` was `None`); no
+    /// affinity syscall was made.
     NotRequested,
-    /// The backend proved hard affinity was applied.
+    /// The platform performed a real hard pin (Linux `sched_setaffinity`) and
+    /// the worker observed itself running on the requested core.
     Applied,
-    /// The platform/backend cannot support hard affinity.
+    /// The platform offers no hard pin (e.g. macOS exposes only affinity
+    /// hints); the worker runs unpinned.
     Unsupported,
-    /// Affinity was requested but failed with a visible reason.
+    /// A pin was requested but could not be applied — for example the requested
+    /// core is not in the process's allowed affinity mask. The string carries
+    /// the reason; the worker runs unpinned rather than mis-pinning.
     Failed(String),
-    /// Affinity is recorded as ownership intent only; no OS scheduling control
-    /// is claimed.
+    /// Reserved for a future explicit intent-only mode. **Not produced by
+    /// `configured_core`**, which now performs a real pin where the platform
+    /// can (`Applied`) and reports `Unsupported`/`Failed` otherwise. Kept as a
+    /// typed slot in case an advisory-only knob is added; no path produces it
+    /// today.
     AdvisoryOnly,
 }
 

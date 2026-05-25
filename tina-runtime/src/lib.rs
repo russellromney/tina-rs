@@ -42,6 +42,7 @@ use tina::{DeferredSlotRegistry, IsolateId, Shard};
 use betelgeuse::IOLoopHandle;
 
 pub mod admission;
+mod affinity;
 pub mod bridge;
 mod call;
 mod call_group;
