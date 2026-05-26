@@ -1775,5 +1775,162 @@ mod tests {
             );
             assert_eq!(driver.resource_report().pending_driver_call_count(), 0);
         }
+
+        #[test]
+        fn parked_then_closed_accept_does_not_strand_a_pending_call_and_reaps_by_shutdown() {
+            // The hard case: arm an accept, ADVANCE so the backend parks it
+            // (watched on the event loop), THEN close the listener. The
+            // close-cancelled op must (a) immediately stop counting as a
+            // pending driver call, (b) never deliver a spurious completion,
+            // and (c) leave no physical pending entry once the bounded
+            // shutdown drain releases the backend's completion slot.
+            let io_loop = io_loop(Global).expect("init io loop");
+            let mut driver = BetelgeuseDriver::with_io_loop(io_loop);
+            let listener = bind_listener(&mut driver, 1);
+            assert!(
+                driver
+                    .submit(
+                        CallId::new(2),
+                        CallInput::UnixAccept { listener },
+                        Instant::now()
+                    )
+                    .is_none()
+            );
+            // Park it: with no peer, the accept registers with the event loop.
+            let mut sink = Vec::new();
+            for _ in 0..4 {
+                driver.advance(Instant::now(), &mut sink);
+            }
+            assert!(sink.is_empty(), "no peer, so accept must not complete yet");
+            assert_eq!(driver.unix.physical_pending_len(), 1);
+
+            // Close wins over the parked accept.
+            let closed = driver
+                .submit(
+                    CallId::new(3),
+                    CallInput::UnixListenerClose { listener },
+                    Instant::now(),
+                )
+                .expect("close completes inline");
+            assert!(matches!(closed.result, CallOutput::UnixListenerClosed));
+            assert!(driver.take_cancelled_by_close().contains(&CallId::new(2)));
+            // Immediately uncounted as a pending driver call.
+            assert_eq!(driver.resource_report().pending_driver_call_count(), 0);
+
+            let mut spurious = Vec::new();
+            for _ in 0..16 {
+                driver.advance(Instant::now(), &mut spurious);
+                thread::sleep(Duration::from_millis(1));
+            }
+            assert!(
+                !spurious.iter().any(|c| c.call_id == CallId::new(2)),
+                "close-cancelled accept must never deliver a completion"
+            );
+
+            // Bounded shutdown must reap every physical entry: the backend
+            // releases the completion slot and the lane drops the tombstone.
+            let result = driver.cancel_pending(Instant::now() + Duration::from_millis(200));
+            assert!(result.is_ok(), "shutdown should release the backend slot");
+            assert_eq!(
+                driver.unix.physical_pending_len(),
+                0,
+                "shutdown must leave no stranded pending entry"
+            );
+        }
+
+        #[test]
+        fn many_connect_close_cycles_keep_logical_pending_zero_and_shutdown_reaps_all() {
+            // Open/connect/close many streams. Each cycle reads with no data
+            // (parking the read on the event loop) then closes the stream.
+            //
+            // Two honest invariants, matching the TCP/TLS lanes:
+            //  - The *logical* pending count (work the runtime still waits on)
+            //    stays at zero across cycles — a close-cancelled read never
+            //    counts and never delivers a completion.
+            //  - A close-cancelled read that was already parked leaves a
+            //    physical tombstone Box: it cannot be freed while the backend
+            //    still holds a pointer to it, and Betelgeuse exposes no per-op
+            //    cancel (only whole-loop `cancel_pending_completions`). Those
+            //    tombstones are released by the bounded shutdown drain — so
+            //    physical pending may rise during the run but is fully reaped
+            //    at shutdown, never permanently stranded.
+            let io_loop = io_loop(Global).expect("init io loop");
+            let mut driver = BetelgeuseDriver::with_io_loop(io_loop);
+            let mut next = 1_000u64;
+            for _ in 0..24 {
+                let (_listener, server, _client) = connected_pair(&mut driver);
+                assert!(
+                    driver
+                        .submit(
+                            CallId::new(next),
+                            CallInput::UnixRead {
+                                stream: server,
+                                max_len: 16
+                            },
+                            Instant::now()
+                        )
+                        .is_none()
+                );
+                next += 1;
+                // Park the read.
+                let mut sink = Vec::new();
+                driver.advance(Instant::now(), &mut sink);
+                // Close wins over the parked read.
+                let closed = driver
+                    .submit(
+                        CallId::new(next),
+                        CallInput::UnixStreamClose { stream: server },
+                        Instant::now(),
+                    )
+                    .expect("close completes inline");
+                assert!(matches!(closed.result, CallOutput::UnixStreamClosed));
+                next += 1;
+                let _ = driver.take_cancelled_by_close();
+                driver.advance(Instant::now(), &mut sink);
+                // The runtime never waits on a close-cancelled read.
+                assert_eq!(driver.resource_report().pending_driver_call_count(), 0);
+                assert!(!driver.unix.has_pending());
+            }
+
+            // Bounded shutdown reaps any close-cancelled tombstones the backend
+            // still referenced, leaving nothing stranded.
+            let result = driver.cancel_pending(Instant::now() + Duration::from_millis(500));
+            assert!(result.is_ok(), "shutdown should release all backend slots");
+            assert_eq!(driver.unix.physical_pending_len(), 0);
+        }
+
+        #[test]
+        fn connect_to_missing_path_is_typed_not_found() {
+            // A connect to a path with no listener must surface a typed
+            // NotFound, not Io or a hang.
+            let io_loop = io_loop(Global).expect("init io loop");
+            let mut driver = BetelgeuseDriver::with_io_loop(io_loop);
+            let missing = unique_sock("missing");
+            assert!(
+                driver
+                    .submit(
+                        CallId::new(1),
+                        CallInput::UnixConnect {
+                            path: missing.clone()
+                        },
+                        Instant::now()
+                    )
+                    .is_none()
+            );
+            let completed = advance_until(&mut driver, |all| {
+                all.iter().any(|c| c.call_id == CallId::new(1))
+            });
+            let result = completed
+                .iter()
+                .find(|c| c.call_id == CallId::new(1))
+                .map(|c| &c.result)
+                .expect("connect to missing path completes");
+            assert!(
+                matches!(result, CallOutput::Failed(CallError::NotFound)),
+                "expected NotFound for a missing path, got {result:?}"
+            );
+
+            let _ = driver.cancel_pending(Instant::now() + Duration::from_millis(100));
+        }
     }
 }

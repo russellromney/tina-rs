@@ -181,6 +181,22 @@ impl UnixLane {
             0
         }
     }
+
+    /// Physical pending-entry count, including tombstoned (cancelled /
+    /// close-cancelled) ops the backend may still reference. Tests use this to
+    /// prove the table stays bounded and that shutdown reaps every entry.
+    #[cfg(test)]
+    pub(super) fn physical_pending_len(&self) -> usize {
+        #[cfg(unix)]
+        {
+            let Self::Live(lane) = self;
+            lane.physical_pending_len()
+        }
+        #[cfg(not(unix))]
+        {
+            0
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -387,6 +403,16 @@ mod imp {
             while index < self.pending.len() {
                 let mut op = self.pending.remove(index);
                 if op.user_cancelled || op.shutdown_marked {
+                    // A cancelled / close-cancelled op is dropped once its
+                    // completion has a result — the backend no longer owns the
+                    // slot, so the Box is safe to free. If it has no result
+                    // yet (e.g. an accept/read that was already parked on the
+                    // event loop when its resource closed), it stays as a
+                    // tombstone: freeing it now would dangle the backend's
+                    // stored pointer, and Betelgeuse has no per-op cancel. The
+                    // bounded shutdown drain releases these via the whole-loop
+                    // `cancel_pending_completions`. This matches the TCP/TLS
+                    // lanes exactly.
                     if op.kind.has_result() {
                         continue;
                     }
@@ -499,6 +525,11 @@ mod imp {
             // (per-call cancel or close-win) drops out; shutdown-stuck work
             // stays counted so the terminal report names it.
             self.pending.iter().filter(|op| !op.user_cancelled).count()
+        }
+
+        #[cfg(test)]
+        pub(crate) fn physical_pending_len(&self) -> usize {
+            self.pending.len()
         }
 
         fn try_complete(&mut self, op: &mut PendingOperation) -> Option<CallOutput> {
