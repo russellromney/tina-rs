@@ -9,7 +9,8 @@
 use std::fmt::Write;
 
 use tina_runtime::{
-    EventId, ProtocolFamily, RuntimeEvent, RuntimeEventKind, RuntimeFact, stable_trace_hash,
+    EventId, ProtocolFact, ProtocolFamily, RuntimeEvent, RuntimeEventKind, RuntimeFact,
+    stable_trace_hash,
 };
 
 use super::{ReplayConfig, ReplayReport};
@@ -442,6 +443,84 @@ impl std::fmt::Display for ProtocolReplayMismatch {
 
 impl std::error::Error for ProtocolReplayMismatch {}
 
+/// A protocol fact known to come from live-only physics the simulator does
+/// not model (real socket, kernel timing, OS scheduling). Used to tell a
+/// coverage gap apart from a real divergence during protocol-fact replay.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnsupportedProtocolFact {
+    /// The typed live-only fact.
+    pub fact: ProtocolFact,
+    /// Why the simulator cannot reproduce it.
+    pub reason: String,
+}
+
+impl UnsupportedProtocolFact {
+    /// Records one live-only protocol fact and its reason.
+    pub fn new(fact: ProtocolFact, reason: impl Into<String>) -> Self {
+        Self {
+            fact,
+            reason: reason.into(),
+        }
+    }
+}
+
+/// Compares the protocol facts a live capture saw against the ones a
+/// simulator replay reproduced and classifies every gap.
+///
+/// Comparison is multiset-based on the typed [`ProtocolFact`] values — never
+/// debug strings — so reordering does not register as a divergence.
+///
+/// - A live fact the sim did not reproduce that is named in `unsupported`
+///   becomes [`ProtocolReplayMismatch::UnsupportedProtocolFact`]: a known
+///   simulator-coverage gap, not a bug.
+/// - Any other live fact the sim did not reproduce becomes
+///   [`ProtocolReplayMismatch::Diverged`] with `live_only = true`: a real
+///   divergence.
+/// - A sim fact the live capture never saw becomes
+///   [`ProtocolReplayMismatch::Diverged`] with `live_only = false`.
+///
+/// An empty result means the protocol-fact families matched.
+pub fn classify_protocol_facts(
+    live: &[ProtocolFact],
+    sim: &[ProtocolFact],
+    unsupported: &[UnsupportedProtocolFact],
+) -> Vec<ProtocolReplayMismatch> {
+    let mut mismatches = Vec::new();
+    // Match sim facts off against live facts so leftovers on each side are
+    // the gaps. Multiset semantics: each fact consumes one counterpart.
+    let mut remaining_sim = sim.to_vec();
+    for fact in live {
+        if let Some(index) = remaining_sim.iter().position(|candidate| candidate == fact) {
+            remaining_sim.remove(index);
+            continue;
+        }
+        // Live fact with no sim counterpart: coverage gap or real divergence.
+        if let Some(reason) = unsupported
+            .iter()
+            .find(|entry| entry.fact == *fact)
+            .map(|entry| entry.reason.clone())
+        {
+            mismatches.push(ProtocolReplayMismatch::UnsupportedProtocolFact {
+                fact: *fact,
+                reason,
+            });
+        } else {
+            mismatches.push(ProtocolReplayMismatch::Diverged {
+                fact: *fact,
+                live_only: true,
+            });
+        }
+    }
+    // Sim facts with no live counterpart are sim-only divergences.
+    for fact in remaining_sim {
+        mismatches.push(ProtocolReplayMismatch::Diverged {
+            fact,
+            live_only: false,
+        });
+    }
+    mismatches
+}
+
 /// Applies a visible projection and returns the resulting trace shape.
 pub fn project_trace_shape(
     events: &[RuntimeEvent],
@@ -856,4 +935,94 @@ fn encode_storage_config(out: &mut String, config: crate::ScriptedStorageFaultCo
     out.push_str(";uncertain_snapshot=");
     encode_option_u64(out, config.commit_uncertain_snapshot_at);
     out.push('}');
+}
+
+#[cfg(test)]
+mod protocol_fact_tests {
+    use super::*;
+    use tina_runtime::{
+        GrpcStatusCode, GrpcStreamId, Http2ResetReason, Http2StreamId, ProtocolConnectionId,
+        ProtocolDirection, WebSocketCloseReason, WebSocketSessionId,
+    };
+
+    fn ws_closed(code: u16) -> ProtocolFact {
+        ProtocolFact::WebSocketSessionClosed {
+            session: WebSocketSessionId::new(1),
+            reason: WebSocketCloseReason::Normal,
+            code: Some(code),
+        }
+    }
+
+    fn h2_reset() -> ProtocolFact {
+        ProtocolFact::Http2StreamReset {
+            connection: ProtocolConnectionId::new(1),
+            stream: Http2StreamId::new(1),
+            direction: ProtocolDirection::Inbound,
+            reason: Http2ResetReason::FrameSizeError,
+        }
+    }
+
+    fn grpc_status() -> ProtocolFact {
+        ProtocolFact::GrpcFinalStatusReceived {
+            connection: ProtocolConnectionId::new(1),
+            stream: GrpcStreamId::new(1),
+            status: GrpcStatusCode::ResourceExhausted,
+        }
+    }
+
+    #[test]
+    fn classify_protocol_facts_clean_when_sets_match_regardless_of_order() {
+        let live = [ws_closed(1000), h2_reset(), grpc_status()];
+        let sim = [grpc_status(), ws_closed(1000), h2_reset()];
+        assert!(classify_protocol_facts(&live, &sim, &[]).is_empty());
+    }
+
+    #[test]
+    fn classify_protocol_facts_marks_live_only_as_diverged() {
+        let live = [ws_closed(1000), h2_reset()];
+        let sim = [ws_closed(1000)];
+        let mismatches = classify_protocol_facts(&live, &sim, &[]);
+        assert_eq!(mismatches.len(), 1);
+        assert!(matches!(
+            mismatches[0],
+            ProtocolReplayMismatch::Diverged {
+                live_only: true,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn classify_protocol_facts_marks_unsupported_separately_from_diverged() {
+        let live = [ws_closed(1000), h2_reset()];
+        let sim = [ws_closed(1000)];
+        let unsupported = [UnsupportedProtocolFact::new(
+            h2_reset(),
+            "kernel reset timing not modeled",
+        )];
+        let mismatches = classify_protocol_facts(&live, &sim, &unsupported);
+        assert_eq!(mismatches.len(), 1);
+        match &mismatches[0] {
+            ProtocolReplayMismatch::UnsupportedProtocolFact { fact, reason } => {
+                assert_eq!(*fact, h2_reset());
+                assert!(reason.contains("kernel reset"));
+            }
+            other => panic!("expected unsupported, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_protocol_facts_marks_sim_only_as_diverged_not_live_only() {
+        let live = [ws_closed(1000)];
+        let sim = [ws_closed(1000), grpc_status()];
+        let mismatches = classify_protocol_facts(&live, &sim, &[]);
+        assert_eq!(mismatches.len(), 1);
+        assert!(matches!(
+            mismatches[0],
+            ProtocolReplayMismatch::Diverged {
+                live_only: false,
+                ..
+            }
+        ));
+    }
 }

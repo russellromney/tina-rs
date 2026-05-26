@@ -67,7 +67,10 @@ portable-runtime-cost:
 # regression slots.
 
 # Fast PR proof: build + run the small bad-peer and replay-shape tests
-# in two of the most representative system specimens. Each test owns
+# in two of the most representative system specimens, plus the bounded
+# protocol-chaos corpus (WebSocket compliance cases, HTTP/2 + gRPC
+# probes, byte replay). `cargo test -p tina-proof-harness` runs the
+# in-crate corpus and the `protocol_regression` suite. Each test owns
 # its own short timeout; the whole target should finish in well under
 # a minute on a developer machine.
 proof-fast:
@@ -76,16 +79,19 @@ proof-fast:
 	cargo test --manifest-path examples/systems/system_live_replay_bugbox/Cargo.toml --test smoke
 
 # Slow soak: the load harness against mini_saas_api with the visible
-# typed capacity contract. Runs longer than the fast gate but still
-# finishes in seconds; safe for a nightly cron.
+# typed capacity contract, plus the protocol-chaos corpus repeated at a
+# higher count via TINA_PROTOCOL_SOAK_ITERS. Same semantics as the fast
+# gate, just more reps; finishes in seconds and is safe for a nightly cron.
 proof-soak:
 	cargo test --manifest-path examples/systems/mini_saas_api/Cargo.toml --test soak -- --nocapture
+	TINA_PROTOCOL_SOAK_ITERS=500 cargo test -p tina-proof-harness --test protocol_regression protocol_chaos_soak -- --nocapture
 
 # Local bad-peer: the in-crate proof tests plus the realtime_rooms
-# bad-peer scenarios with `--nocapture` so the typed BadPeerOutcome
-# lines are visible.
+# bad-peer scenarios with `--nocapture` so the typed BadPeerOutcome and
+# ProtocolChaosReport lines are visible.
 proof-bad-peer:
 	cargo test -p tina-proof-harness -- --nocapture
+	cargo test -p tina-proof-harness --test protocol_regression print_typed_protocol_chaos_reports -- --nocapture
 	cargo test --manifest-path examples/systems/system_realtime_rooms/Cargo.toml --test bad_peer -- --nocapture
 
 # Replay regression: re-run the saved-seed sim cases. A mismatch fails

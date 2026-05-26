@@ -199,16 +199,59 @@ pieces, each tiny on purpose:
   live-to-sim replay, materialize the live facts into
   `tina_sim::dst::LiveReplayCapture` before comparing. Used by
   `system_live_replay_bugbox`.
+- `tina_proof_harness::protocol_chaos` — one typed `ProtocolChaosReport`
+  for every bad-peer story (TCP, WebSocket, HTTP/2, gRPC): family, byte
+  tallies, peer/terminal action, app delivery count, close/reset/status,
+  the typed `ProtocolFact` sequence, and unsupported facts. The fact
+  fingerprint hashes typed `ProtocolFact` values, never debug strings.
+- `tina_proof_harness::websocket` — a pure WebSocket session engine and a
+  hermetic compliance corpus (valid/fragmented text, invalid UTF-8 across
+  fragments, reserved bits, oversized control/message, masking direction,
+  ping/pong and close edges). Each case names the exact app messages that
+  reach app code, so "valid data reaches app once" and "malformed bytes
+  never do" are both provable.
+- `tina_proof_harness::byte_replay` — `ProtocolByteReplayCase`: save a
+  bad-frame case as ordered byte chunks, reproduce it, and shrink it.
+  Unsupported facts or an over-budget case fail closed; they never pass
+  as an exact replay.
+- `tina_proof_harness::http2` / `::grpc` — hermetic bad-peer probes that
+  map malformed HTTP/2 frames and bad gRPC framing to typed reset /
+  GOAWAY / flow-control / status facts, not a bare "connection closed".
+- `LiveReplayFact::Protocol(ProtocolFact)` lets a live capture save
+  protocol facts beside capacity facts. A mixed capture fails replay if
+  either family diverges; `classify_protocol_facts` tells a real
+  divergence apart from a live-only simulator-coverage gap.
 
 Copy-pasteable proof targets live in the top-level `Makefile`:
 
 ```sh
-make proof-fast               # PR gate
-make proof-soak               # nightly load
-make proof-bad-peer           # local bad-peer
+make proof-fast               # PR gate (includes the bounded protocol corpus)
+make proof-soak               # nightly load + protocol corpus at higher count
+make proof-bad-peer           # local bad-peer + typed ProtocolChaosReport lines
 make proof-replay-regression  # saved-seed sim regression
 ```
 
 If a specimen would otherwise hand-roll a slow-reader / RST /
-malformed-HTTP driver, reach for `tina-proof-harness` instead. The
-typed outcome is part of what makes "the bug reproduces" cheap.
+malformed-HTTP / bad-frame driver, reach for `tina-proof-harness`
+instead. The typed outcome is part of what makes "the bug reproduces"
+cheap.
+
+### Proof harness vs local test
+
+Use a **local `#[test]`** when the thing under test is the specimen's own
+glue: a route table, a handler's reply shape, a config default. The proof
+lives next to the code and never needs to be reused.
+
+Reach for the **proof harness** when the thing under test is a protocol or
+load behaviour Tina must answer the same way everywhere:
+
+- bad-peer transport twists (half-close, RST, slowloris, reconnect storm)
+  → `bad_peer` + `ProtocolChaosReport`;
+- WebSocket/HTTP2/gRPC framing abuse → the compliance corpus and probes;
+- "this exact byte sequence breaks the parser" → save a
+  `ProtocolByteReplayCase`, then shrink it;
+- "this live overload reproduces in the sim" → `LiveReplayCapture` with
+  protocol and capacity facts.
+
+The harness output is a typed value, so a regression test asserts on
+fields and a fact fingerprint rather than scraping logs.
