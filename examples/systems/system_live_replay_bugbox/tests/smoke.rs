@@ -97,6 +97,11 @@ fn live_capture_then_sim_replay_then_shrink() {
         report.unsupported_mismatch_seen,
         "unsupported live facts must fail closed",
     );
+    assert!(
+        report.summary_line.contains("saved_bugbox="),
+        "summary should point at the saved overload bugbox: {}",
+        report.summary_line,
+    );
 
     eprintln!("{}", report.summary_line);
 }

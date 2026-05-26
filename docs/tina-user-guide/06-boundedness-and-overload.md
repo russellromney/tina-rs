@@ -526,6 +526,40 @@ Request and response body reports can share the same `http.bodies`
 scope, but that scope is shard-local: one `BodyMetrics` instance
 threaded through one listener and its connection isolates.
 
+## Turn Overload Into A Bugbox
+
+When overload happens in a live run, save the bounded facts, not the
+vibes:
+
+```rust
+use tina_sim::dst::{
+    assert_no_hidden_buffering, assert_overload_visible, capture_overload_run,
+    save_overload_bug,
+};
+
+assert_no_hidden_buffering(&capacity_report);
+assert_overload_visible(&capacity_report);
+
+let capture = capture_overload_run("slow peer filled broadcast targets")
+    .with_seed(seed)
+    .with_config(replay_config)
+    .with_scenario("one slow peer should not create hidden fanout")
+    .with_history(ops)
+    .with_invariant("broadcast overload is visible as Full")
+    .with_trace(&live_trace)
+    .with_capacity_summary(&capacity_report)
+    .finish()?;
+
+let saved = save_overload_bug("cases/slow-peer.case", &capture, |op| op.to_string())?;
+eprintln!("{saved}");
+```
+
+The replay side must reproduce the same capacity fact with
+`replay_overload_bug(...)`. If the live run contains a protocol or
+external-bridge fact the simulator cannot model yet, record it as an
+unsupported fact. Replay then fails closed instead of pretending the case
+is deterministic.
+
 ## What Counts As Failure
 
 Good failure:

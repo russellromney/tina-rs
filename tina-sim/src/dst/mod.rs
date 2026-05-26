@@ -33,6 +33,7 @@
 
 mod discovery;
 mod invariants;
+mod overload;
 mod projection;
 mod replay_case;
 mod shrink;
@@ -40,6 +41,7 @@ mod sweep;
 
 pub use discovery::*;
 pub use invariants::*;
+pub use overload::*;
 pub use projection::*;
 pub use replay_case::*;
 pub use shrink::*;

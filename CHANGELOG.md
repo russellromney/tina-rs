@@ -4,6 +4,20 @@ This file records completed work.
 
 ## Unreleased
 
+### Overload Bugbox Replay
+
+- Added overload-focused DST helpers: `capture_overload_run`,
+  `save_overload_bug`, `replay_overload_bug`, and bounded capacity assertions
+  (`check_no_hidden_buffering`, `assert_no_hidden_buffering`,
+  `check_overload_visible`, `assert_overload_visible`). They sit on top of the
+  existing live trace-to-sim replay machinery and keep unsupported live facts
+  fail-closed.
+- Added unit coverage for two overload-shaped saved cases (broadcast/slow-peer
+  and pool waiters), unsupported-fact rejection, saved bugbox hints, and hidden
+  buffering assertions.
+- Updated `system_live_replay_bugbox` and the user guide to use the overload
+  bugbox names when pressure facts are the thing being captured.
+
 ### Unix-Domain Sockets On The Per-Shard I/O Rail
 
 - Moved Unix-domain sockets off their private blocking worker thread and onto the

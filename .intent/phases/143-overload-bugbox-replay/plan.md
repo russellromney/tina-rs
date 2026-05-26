@@ -1,5 +1,8 @@
 # Phase 143: Overload Bugbox Replay
 
+Status: implemented in PR. `tina_sim::dst` now exposes overload bugbox
+helpers and assertions; `system_live_replay_bugbox` uses the overload names.
+
 ## Goal
 
 Turn overload incidents into Tina bugboxes:
@@ -56,4 +59,3 @@ the most common production failure: too much work in flight.
 - Live specimen test captures then replays one small overload incident.
 - Shrink proof: removed non-essential operations refresh expected count/hash.
 - Failure-message test: a user gets the command/path needed to replay.
-

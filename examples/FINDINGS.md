@@ -57,7 +57,10 @@ What is still active after reading the specimens and systems:
   path, and Phase 120 added `RunCapture` plus `capture_run` / `save_bug` /
   `replay_bug` / `shrink_bug` workflow wrappers. Remaining rough edges are
   adding more supported live facts and using the workflow in more
-  production-shaped systems.
+  production-shaped systems. Phase 143 adds the overload-shaped names
+  (`capture_overload_run`, `save_overload_bug`, `replay_overload_bug`) and
+  bounded capacity assertions; protocol-specific overload facts remain the
+  next expansion point.
 
 Some older entries below are partly historical and say "shipped" inside the
 section. Keep their numbers stable until the next cleanup pass moves those
