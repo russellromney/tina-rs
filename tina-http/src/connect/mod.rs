@@ -20,11 +20,22 @@
 //!   and budget surfaces.
 //! - [`report`] — [`ConnectReport`], [`ConnectAttemptReport`], and the DNS /
 //!   attempt outcome vocabulary.
+//! - [`attempts`] — the [`ConnectAttempts`] helper that admits a bounded set
+//!   of attempts, races them via a [`tina_runtime::CallGroup`], cancels
+//!   losers, tombstones late completions, and builds the [`ConnectReport`].
+//!   The connect attempt itself is a `call_cancelable` to a protocol client
+//!   isolate (a [`crate::WebSocketClientConnection`], an
+//!   [`crate::Http2ClientConnection`]) that owns its own stream and closes
+//!   it on stop — there is no separate connector isolate to leak.
 
+pub mod attempts;
 pub mod endpoint;
 pub mod policy;
 pub mod report;
 
+pub use attempts::{
+    AttemptKey, ConnectAttempts, ConnectAttemptsError, ConnectStep, DnsClassification,
+};
 pub use endpoint::{
     ConnectSecurity, EndpointGeneration, EndpointId, GrpcEndpoint, Http2Endpoint, HttpEndpoint,
     ResolvedEndpoint, WebSocketEndpoint,

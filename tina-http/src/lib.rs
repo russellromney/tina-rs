@@ -179,8 +179,9 @@ pub mod websocket_room;
 pub use body_metrics::{BodyCapacityFull, BodyMetrics, BodyPressureReport};
 pub use client::{HttpClient, HttpClientMsg, OutboundCall};
 pub use connect::{
-    AddressFamily, AddressFamilyPolicy, ConnectAttemptOutcome, ConnectAttemptReport, ConnectPolicy,
-    ConnectPolicyError, ConnectReport, ConnectSecurity, ConnectTlsTruth, DnsOutcome,
+    AddressFamily, AddressFamilyPolicy, AttemptKey, ConnectAttemptOutcome, ConnectAttemptReport,
+    ConnectAttempts, ConnectAttemptsError, ConnectPolicy, ConnectPolicyError, ConnectReport,
+    ConnectSecurity, ConnectStep, ConnectTlsTruth, DnsClassification, DnsOutcome,
     EndpointGeneration, EndpointId, GrpcEndpoint, HappyEyeballsPolicy, Http2Endpoint, HttpEndpoint,
     ResolvedEndpoint, WebSocketEndpoint,
 };
