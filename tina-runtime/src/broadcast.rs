@@ -294,7 +294,7 @@ where
     K: Clone + Eq,
 {
     /// Build a tracker from the configured cap and admitted target keys.
-    pub fn new(max_targets: usize, keys: impl IntoIterator<Item = K>) -> Self {
+    fn new(max_targets: usize, keys: impl IntoIterator<Item = K>) -> Self {
         Self {
             max_targets,
             pending: keys

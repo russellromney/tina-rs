@@ -11,7 +11,9 @@ use std::time::Duration;
 
 use tina::prelude::*;
 use tina::ChildDefinition;
-use tina_runtime::{BoundedEffects, DefaultThreadedMailboxFactory, ThreadedRuntime, bounded_batch};
+use tina_runtime::{
+    BoundedItems, DefaultThreadedMailboxFactory, ThreadedRuntime, bounded_batch,
+};
 
 use crate::{Report, WORK_VALUES, WORKER_COUNT};
 
@@ -70,16 +72,15 @@ impl Coordinator {
         match msg {
             CoordMsg::Start => {
                 let parent = self.self_addr;
-                let effects = BoundedEffects::try_from_iter(
-                    self.expected as usize,
-                    self.chunks.drain(..).map(|chunk| {
-                        spawn(
-                            ChildDefinition::new(Worker { parent, chunk }, 4)
-                                .with_initial_message(WorkerMsg::Compute),
-                        )
-                    }),
-                )
-                .expect("worker spawn effects are capped by WORKER_COUNT");
+                let chunks =
+                    BoundedItems::try_from_iter(self.expected as usize, self.chunks.drain(..))
+                        .expect("worker chunks are capped by WORKER_COUNT");
+                let effects = chunks.map_effects(|chunk| {
+                    spawn(
+                        ChildDefinition::new(Worker { parent, chunk }, 4)
+                            .with_initial_message(WorkerMsg::Compute),
+                    )
+                });
                 bounded_batch(effects)
             }
             CoordMsg::WorkerDone(partial) => {

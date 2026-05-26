@@ -27,6 +27,7 @@
 
 use std::cell::RefCell;
 use std::convert::Infallible;
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -80,6 +81,7 @@ pub struct BugboxReport {
     pub discovered: Vec<DiscoveredConstants>,
     pub shrunk: ShrinkCapturedReport<Op, Output>,
     pub unsupported_mismatch_seen: bool,
+    pub saved_bugbox_path: PathBuf,
     pub summary_line: String,
 }
 
@@ -544,6 +546,7 @@ pub fn run() -> anyhow::Result<BugboxReport> {
         discovered,
         shrunk,
         unsupported_mismatch_seen,
+        saved_bugbox_path: bugbox_save.path,
         summary_line,
     })
 }

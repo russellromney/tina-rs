@@ -4,6 +4,17 @@ This file records completed work.
 
 ## Unreleased
 
+### Hostile Review Fixes
+
+- Tightened the bounded fanout rails after review: `BroadcastTracker`
+  construction now stays behind `BroadcastTargets`, request-sized examples map
+  `BoundedItems` into effects only after admission, and the boundedness guide
+  teaches that safer copied path.
+- Made overload hidden-buffer assertions reject malformed weighted reports that
+  declare a weight cap without a real current/high-water observation.
+- Made the live replay bugbox system smoke prove the saved bugbox file exists
+  and clean it up after the run.
+
 ### Overload Bugbox Replay
 
 - Added overload-focused DST helpers: `capture_overload_run`,
