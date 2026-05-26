@@ -1,0 +1,15 @@
+error[E0308]: mismatched types
+  --> tests/bounded_compile_fail/raw_vec_batch.rs:30:27
+   |
+30 |     let _ = bounded_batch(raw);
+   |             ------------- ^^^ expected `BoundedEffects<_>`, found `Vec<Effect<Owner>>`
+   |             |
+   |             arguments to this function are incorrect
+   |
+   = note: expected struct `BoundedEffects<_>`
+              found struct `Vec<tina::Effect<Owner>>`
+note: function defined here
+  --> src/bounded.rs
+   |
+   | pub fn bounded_batch<I>(effects: BoundedEffects<I>) -> Effect<I>
+   |        ^^^^^^^^^^^^^

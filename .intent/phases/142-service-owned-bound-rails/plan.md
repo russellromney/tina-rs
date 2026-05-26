@@ -1,5 +1,11 @@
 # Phase 142: Service-Owned Bound Rails
 
+## Status
+
+Ready for review. `BoundedItems`, `BoundedEffects`, `bounded_batch`,
+`assert_service_owned_bound`, two migrated specimens, docs, and focused proofs
+are in the PR.
+
 ## Goal
 
 Make request-sized work harder to write accidentally.
@@ -54,4 +60,3 @@ owned cap before producing many effects.
   where applicable.
 - Specimen tests prove observed high-water/full counts match the configured cap.
 - Docs compile where snippets are real Rust.
-

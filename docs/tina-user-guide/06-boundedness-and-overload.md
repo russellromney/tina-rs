@@ -232,6 +232,61 @@ Tina should be able to say:
 accepted=12000 full=38000 timeouts=0 exit=clean
 ```
 
+## Request-Sized Loops
+
+The review question for every fanout loop is:
+
+```text
+what is the max in-flight work, and did the service choose it?
+```
+
+This is the bad shape:
+
+```rust
+let effects = request
+    .items
+    .into_iter()
+    .map(|item| call(worker, WorkerMsg::Run(item), timeout).then(Msg::Done))
+    .collect::<Vec<_>>();
+batch(effects)
+```
+
+The request chose how many effects exist.
+
+Use a service-owned wrapper before effects exist:
+
+```rust
+use tina_runtime::{BoundedEffects, BoundedItems, bounded_batch};
+
+let items = match BoundedItems::try_from_iter(self.max_items_per_request, request.items) {
+    Ok(items) => items,
+    Err(_) => return reply(Reply::TooManyItems),
+};
+
+let effects = BoundedEffects::try_from_iter(
+    self.max_items_per_request,
+    items
+        .into_vec()
+        .into_iter()
+        .map(|item| call(worker, WorkerMsg::Run(item), timeout).then(Msg::Done)),
+)
+.expect("items already passed the same service-owned cap");
+
+bounded_batch(effects)
+```
+
+`BoundedItems` and `BoundedEffects` are small rails, not magic. They reject
+zero caps and stop at the first over-cap item/effect. They preserve order.
+Tests can pin the contract with:
+
+```rust
+tina_runtime::assert_service_owned_bound(
+    "orders.batch.items",
+    Some(config.max_items_per_request),
+    Some(report.items_observed),
+)?;
+```
+
 ## Bounded Pools
 
 When the bounded thing is "borrow one of N resources, do work, give

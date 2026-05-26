@@ -39,3 +39,9 @@ fn durable_outbox_record_before_apply_is_enforced_at_compile_time() {
     // apply consumes RecordedWork, so the same work cannot be applied twice.
     cases.compile_fail("tests/durable_outbox_compile_fail/double_apply.rs");
 }
+
+#[test]
+fn bounded_batch_requires_bounded_effects() {
+    let cases = trybuild::TestCases::new();
+    cases.compile_fail("tests/bounded_compile_fail/raw_vec_batch.rs");
+}
