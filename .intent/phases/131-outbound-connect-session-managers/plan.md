@@ -4,8 +4,10 @@
 
 - Future implementation phase.
 - One PR.
-- Can run beside 132/133/134 if it owns only `tina-http` outbound client
-  code, specimens, and docs.
+- Can run beside 132/133 if it owns only `tina-http` outbound client code,
+  specimens, and docs.
+- Phase 134 budget manifests are shipped. New manager/pool/connect caps must
+  expose manifest rows and pressure/capacity reports.
 
 ## Grug Truth
 
@@ -26,6 +28,10 @@ report when it fails.
 - `tina_runtime::dns_lookup(host, port, timeout)` exists. The live runtime has
   a bounded DNS lane. The simulator has `ScriptedDnsConfig`.
 - WebSocket client is explicitly one session, not a reconnecting manager.
+- `ServiceBudgetManifest`, `BudgetSurface`, capacity reports, and
+  `manifest.report(...)` exist.
+- `BoundedItems::map_effects(...)` exists for service-owned fanout before
+  effects are built.
 
 So this phase must add host/authority endpoint APIs, not only policy structs
 beside the existing clients.
@@ -41,6 +47,7 @@ Ship the copied outbound-client path:
 - HTTP/2 and gRPC fixed-endpoint pools;
 - endpoint generations and stale-session reports;
 - typed pressure/lifecycle reports;
+- budget-manifest adapters for manager/pool/connect-attempt caps;
 - sim/replay facts or explicit unsupported facts.
 
 ## Does Not Include
@@ -71,6 +78,7 @@ Ship the copied outbound-client path:
   - `ConnectReport`
   - `EndpointId`
   - `EndpointGeneration`
+  - `ConnectBudgetSurfaces` or an equivalent manifest adapter
 - Add managers:
   - `WebSocketClientManager`
   - `Http2ClientPool`
@@ -127,6 +135,14 @@ resolver. Do not make live DNS pluggable in this phase; sim tests use
 - cancelled loser truth;
 - late completion/tombstone count.
 
+`ConnectPolicy` must validate before first use:
+
+- zero attempt caps are rejected;
+- `max_concurrent_connect_attempts <= max_total_attempts`;
+- Happy Eyeballs delay is explicit, even when zero;
+- every retry/reconnect cap can be represented as a `BudgetSurface`;
+- reports and manifest rows use the same stable surface names.
+
 ### Rock 2: Bounded Connect Helper
 
 Build one Tina-shaped helper that managers call:
@@ -134,6 +150,9 @@ Build one Tina-shaped helper that managers call:
 - DNS is one runtime call.
 - TCP/TLS connect attempts are ordinary Tina calls.
 - Happy Eyeballs uses bounded call handles and `cancel_call` for losers.
+- Attempt lists must pass through `BoundedItems::try_from_iter(...).map_effects(...)`
+  or a stronger equivalent. A request/DNS result must not construct connect
+  effects before the service-owned attempt cap admits them.
 - Losers can complete late; late completions are counted and ignored, not
   converted into success.
 - The helper returns a resolved low-level target or a typed `ConnectReport`.
@@ -154,6 +173,8 @@ Build `WebSocketClientManager` over `WebSocketClientConnection`:
 - drains/close-stops sessions on shutdown;
 - reports per-session outbound queue/bytes pressure from the underlying
   WebSocket report.
+- exposes budget surfaces for sessions, reconnect attempts, pending outbound
+  operations, and queued events/bytes where the underlying report has caps.
 
 Endpoint generation must prevent an old session reply from replacing the
 current session.
@@ -171,6 +192,8 @@ Add fixed-endpoint pools. Keep this boring:
 - stale connection retire;
 - `NoHealthyEndpoint` when every endpoint is closed/unhealthy;
 - separate HTTP/2 reset truth from gRPC status truth.
+- expose budget surfaces for endpoint count, connections, pre-connect waiters,
+  in-flight streams, and idle/stale retained reports.
 
 Do not add dynamic membership. Do not collapse HTTP/2 reset, GOAWAY, TLS/ALPN,
 and gRPC final status into one generic error.
@@ -183,6 +206,8 @@ Update/add:
 - One small gRPC client service using `GrpcClientPool`.
 - One closed-port reconnect-storm test.
 - User guide outbound-client section showing endpoint -> policy -> manager.
+- `mini_saas_api` or another system with one outbound manager cap in its
+  `ServiceBudgetManifest` and a manifest-vs-live consistency proof.
 
 ## Required Proof
 
@@ -205,5 +230,7 @@ Update/add:
 - Shutdown closes/drains sessions and returns a manager report.
 - Request-scope cancellation of a connect/session operation cancels Tina-owned
   waits and reports late completions.
+- Manager/pool/connect caps appear in a budget manifest and live pressure join;
+  a stale or missing manifest row fails a test.
 - Sim/replay either reproduces supported facts or records explicit unsupported
   facts. No exact replay lie.

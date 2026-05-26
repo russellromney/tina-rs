@@ -6,6 +6,7 @@
 - One PR.
 - Can run beside 131 if it owns `tina-proof-harness`, parser tests, protocol
   regression tests, and docs.
+- Can also run beside 133 if it does not change request-scope APIs.
 
 ## Grug Truth
 
@@ -23,8 +24,13 @@ too fast. Tina should answer with typed protocol truth, not logs.
   and gRPC.
 - `TraceProjection::http2_streams`, `websocket_sessions`, and `grpc_status`
   already project protocol facts.
+- Protocol facts already enter traces as `RuntimeFact::Protocol(...)`.
 - Live replay capture exists, but `LiveReplayFact` currently carries capacity
-  facts only. Protocol byte replay needs a new, explicit case format.
+  facts only. Protocol byte replay needs a new, explicit case format and a
+  typed `LiveReplayFact::Protocol(...)` bridge.
+- Phase 143 shipped overload bugbox helpers. Protocol chaos should reuse the
+  same fail-closed discipline: unsupported facts are explicit rows, never
+  "close enough."
 
 ## Goal
 
@@ -122,6 +128,7 @@ Add `ProtocolByteReplayCase` for WebSocket:
 - expected protocol facts;
 - saved-case read/write;
 - shrink helper that removes chunks/events and refreshes expected facts.
+- stable hash/expected fact count over typed protocol facts, not debug text.
 
 Unsupported live facts fail closed with `UnsupportedFact`. They do not pass as
 exact replay.
@@ -136,6 +143,8 @@ Extend live replay facts:
 - projection helpers that keep HTTP/2, WebSocket, or gRPC facts;
 - mismatch rows that distinguish absent replayable fact from unsupported
   live-only fact.
+- overload bugbox integration: a protocol chaos case with bounded pressure can
+  save both protocol facts and capacity facts in one capture.
 
 Do not hash debug strings. Use the typed `ProtocolFact` values and existing
 stable trace/fact tags.
@@ -182,4 +191,6 @@ Update:
 - Saved live replay case can include WebSocket/HTTP2/gRPC protocol facts.
 - Protocol fact mismatch says replayable-diverged vs unsupported-live-only.
 - Unsupported byte replay facts fail closed.
+- A saved case that mixes protocol facts and capacity/overload facts fails if
+  either family diverges.
 - Parser/protocol bug fixes include a failing-before, passing-after test.

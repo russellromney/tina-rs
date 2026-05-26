@@ -4,8 +4,10 @@
 
 - Future implementation phase.
 - One PR.
-- Can run beside 131/132/134 if it owns request-scope adapters, one system
+- Can run beside 131/132 if it owns request-scope adapters, one system
   specimen, docs, and tests.
+- Phase 134 budget manifests are shipped. Request-scope caps and child caps
+  must surface as manifest rows in the copied system.
 
 ## Grug Truth
 
@@ -27,6 +29,9 @@ become a ghost.
 - HTTP/1 response sources already have `ResponseChunkMsg::Cancel`.
 - HTTP/1 request-body pulls and HTTP/2 body streams already have call-shaped
   pull/cancel paths.
+- Plain `sleep(...)` is not currently `CallHandle`-cancelable. A scoped timer
+  path must either add a real cancelable timer rail or ship a ticketed
+  tombstone helper that reports "timer ignored after scope cancel" honestly.
 - `mini_saas_api` is the current copied service skeleton: HTTP + SQLite +
   keepalive pool + shutdown/report.
 
@@ -43,6 +48,7 @@ Make request-scoped cancellation the copied path for real services:
   cancel handle;
 - cancel produces a report with the same typed cause vocabulary everywhere;
 - late external completions remain visible as late/rejected truth;
+- request-scope caps appear in the service budget manifest;
 - one canonical system demonstrates the whole path.
 
 ## Does Not Include
@@ -65,6 +71,9 @@ Make request-scoped cancellation the copied path for real services:
   - `ScopedRequestReport` as the request-level aggregate. It wraps
     `ScopeCancelReport`, `RequestScopeSetCapacityReport`, late-result counts,
     and unsupported rows. It must not replace `ScopeCancelReport`.
+  - `ScopedTimer` / `ScopedTimerSet` only if the phase chooses the tombstone
+    timer path. Name it for the user action ("timer for this request"), not
+    for internal handle mechanics.
 - Add adapters near the resources they adapt:
   - HTTP body/request adapters in `tina-http`;
   - pool/bridge examples in systems/specimens;
@@ -83,6 +92,8 @@ Add a small copied helper/pattern for HTTP services:
 - cancel with `ClientDisconnect`, `Timeout`, `OwnerStopped`, or explicit
   caller cancel;
 - drain/remove the scope on final reply.
+- install `RequestScopeSet` and per-request child caps from
+  `ServiceBudgetManifest`, not scattered constants, in the copied system.
 
 Use existing `defer_scoped(...).try_admit(...)` for cancelable child work.
 Do not return a child effect if pending/scope admission fails.
@@ -94,7 +105,11 @@ Prove scoped behavior for:
 - response body source: cancel calls `ResponseChunkMsg::Cancel`;
 - request body pull: client disconnect/request timeout releases the parked
   pull authority;
-- `sleep`/deadline child: scope cancel calls `cancel_call`;
+- timer/deadline child: either a new cancelable timer rail returns a
+  `CallHandle`, or the phase ships a bounded `ScopedTimer` tombstone helper.
+  In the tombstone path, the runtime sleep may still fire, but the continuation
+  observes the cancelled ticket, skips user work, and reports the ignored
+  timer. Do not pretend the timer was physically cancelled.
 - pool acquire wait: scope cancel releases caller capacity;
 - held pool lease: owner-stop/drain retires or releases according to existing
   pool disposition truth;
@@ -126,6 +141,7 @@ Update `examples/systems/mini_saas_api` to use request scopes for at least:
 - a keepalive pool acquire/request/release path;
 - a timer/deadline;
 - shutdown while one request is active.
+- budget-manifest consistency for request scopes and scoped children.
 
 Add one tiny new system `examples/systems/system_scoped_request_tree` focused
 on streaming body disconnect. Keep it small: one HTTP route, one body stream,
@@ -144,8 +160,12 @@ Update:
 
 - Scope set full returns typed admission failure and returns authority.
 - Scope registration failure does not dispatch child work.
+- Scoped timer cancellation is honest: either `cancel_call` closes a real
+  cancelable timer wait, or a tombstoned timer fires later and is ignored with
+  a report row.
 - Client disconnect cancels scope and reports child rows.
-- Request timeout cancels timer/body/pool/bridge waits.
+- Request timeout cancels/tombstones timer work and cancels body/pool/bridge
+  waits where those rails expose cancellation authority.
 - Double cancel keeps first cause and reports later cancel as redundant.
 - Owner stop drains scopes and reports unreleased capacity as zero or names the
   unreleased resource.
@@ -157,6 +177,8 @@ Update:
   key.
 - `mini_saas_api` smoke proves user-visible HTTP response for disconnect,
   timeout, full, shutdown, and late bridge completion.
+- `mini_saas_api` budget test proves request-scope surfaces are declared and
+  joined with live pressure.
 - `system_scoped_request_tree` proves streaming body disconnect without
   depending on the larger SaaS flow.
 - Sim/replay agrees where facts are supported. Unsupported facts fail closed.
