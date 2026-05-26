@@ -98,6 +98,22 @@ impl<T> BoundedItems<T> {
     pub fn into_vec(self) -> Vec<T> {
         self.items
     }
+
+    /// Map admitted items into runtime effects after the item list has already
+    /// passed the service-owned cap.
+    ///
+    /// Prefer this over building effects from a raw request iterator: the
+    /// over-cap item is rejected before any corresponding effect can exist.
+    pub fn map_effects<I, F>(self, mut f: F) -> BoundedEffects<I>
+    where
+        I: Isolate,
+        F: FnMut(T) -> Effect<I>,
+    {
+        BoundedEffects {
+            max_effects: self.max_items,
+            effects: self.items.into_iter().map(&mut f).collect(),
+        }
+    }
 }
 
 /// Error while collecting a service-bounded effect list.
@@ -144,6 +160,10 @@ where
     I: Isolate,
 {
     /// Collect effects up to `max_effects`.
+    ///
+    /// Use this when the effect iterator is already service-bounded. If the
+    /// iterator comes from request data, prefer `BoundedItems::map_effects` so
+    /// over-cap request items are rejected before their effects are built.
     pub fn try_from_iter(
         max_effects: usize,
         iter: impl IntoIterator<Item = Effect<I>>,
@@ -351,6 +371,15 @@ mod tests {
                 observed: 2,
             })
         ));
+    }
+
+    #[test]
+    fn bounded_items_map_to_effects_after_admission() {
+        let addr = tina::Address::<Msg>::new(tina::ShardId::new(0), tina::IsolateId::new(1));
+        let items = BoundedItems::try_from_iter(4, [1_u8, 2, 3]).unwrap();
+        let effects = items.map_effects::<Owner, _>(|item| send(addr, Msg::Item(item)));
+        assert_eq!(effects.max_effects(), 4);
+        assert_eq!(effects.len(), 3);
     }
 
     #[test]

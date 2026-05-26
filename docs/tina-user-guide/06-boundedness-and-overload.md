@@ -256,27 +256,24 @@ The request chose how many effects exist.
 Use a service-owned wrapper before effects exist:
 
 ```rust
-use tina_runtime::{BoundedEffects, BoundedItems, bounded_batch};
+use tina_runtime::{BoundedItems, bounded_batch};
 
 let items = match BoundedItems::try_from_iter(self.max_items_per_request, request.items) {
     Ok(items) => items,
     Err(_) => return reply(Reply::TooManyItems),
 };
 
-let effects = BoundedEffects::try_from_iter(
-    self.max_items_per_request,
-    items
-        .into_vec()
-        .into_iter()
-        .map(|item| call(worker, WorkerMsg::Run(item), timeout).then(Msg::Done)),
-)
-.expect("items already passed the same service-owned cap");
+let effects = items.map_effects(|item| {
+    call(worker, WorkerMsg::Run(item), timeout).then(Msg::Done)
+});
 
 bounded_batch(effects)
 ```
 
 `BoundedItems` and `BoundedEffects` are small rails, not magic. They reject
 zero caps and stop at the first over-cap item/effect. They preserve order.
+Prefer `BoundedItems::map_effects(...)` when a request list is the source of
+the work: the list is capped before any per-item effect is constructed.
 Tests can pin the contract with:
 
 ```rust

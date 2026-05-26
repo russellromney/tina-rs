@@ -102,6 +102,11 @@ fn live_capture_then_sim_replay_then_shrink() {
         "summary should point at the saved overload bugbox: {}",
         report.summary_line,
     );
-
+    assert!(
+        report.saved_bugbox_path.exists(),
+        "saved bugbox path should exist until the smoke test cleans it: {:?}",
+        report.saved_bugbox_path,
+    );
     eprintln!("{}", report.summary_line);
+    std::fs::remove_file(&report.saved_bugbox_path).expect("remove saved bugbox temp file");
 }

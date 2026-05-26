@@ -141,6 +141,14 @@ pub enum OverloadAssertionError {
         /// Observed high-water.
         high_water: usize,
     },
+    /// A weighted cap was configured but the report omitted the observation
+    /// fields needed to prove it stayed bounded.
+    MissingObservation {
+        /// Surface name.
+        surface: String,
+        /// Axis whose observed fields were absent.
+        axis: &'static str,
+    },
     /// A test expected overload, but no visible `Full` fact was recorded.
     OverloadNotVisible {
         /// Surface name.
@@ -163,6 +171,12 @@ impl std::fmt::Display for OverloadAssertionError {
                 f,
                 "surface {surface:?} buffered past {axis} cap {cap}: high_water={high_water}"
             ),
+            Self::MissingObservation { surface, axis } => {
+                write!(
+                    f,
+                    "surface {surface:?} is missing {axis} observation fields"
+                )
+            }
             Self::OverloadNotVisible { surface } => {
                 write!(
                     f,
@@ -196,10 +210,18 @@ pub fn check_no_hidden_buffering(
     }
     if let Some(cap) = report.max_weight {
         bounded = true;
-        let high_water = report
-            .high_water_weight
-            .unwrap_or(report.current_weight.unwrap_or(0));
-        let current = report.current_weight.unwrap_or(0);
+        let Some(high_water) = report.high_water_weight else {
+            return Err(OverloadAssertionError::MissingObservation {
+                surface: report.name.clone(),
+                axis: "weight",
+            });
+        };
+        let Some(current) = report.current_weight else {
+            return Err(OverloadAssertionError::MissingObservation {
+                surface: report.name.clone(),
+                axis: "weight",
+            });
+        };
         if high_water > cap || current > cap {
             return Err(OverloadAssertionError::HiddenBuffering {
                 surface: report.name.clone(),
@@ -211,10 +233,18 @@ pub fn check_no_hidden_buffering(
     }
     if let Some(cap) = report.shared_max_weight {
         bounded = true;
-        let high_water = report
-            .shared_high_water_weight
-            .unwrap_or(report.shared_current_weight.unwrap_or(0));
-        let current = report.shared_current_weight.unwrap_or(0);
+        let Some(high_water) = report.shared_high_water_weight else {
+            return Err(OverloadAssertionError::MissingObservation {
+                surface: report.name.clone(),
+                axis: "shared_weight",
+            });
+        };
+        let Some(current) = report.shared_current_weight else {
+            return Err(OverloadAssertionError::MissingObservation {
+                surface: report.name.clone(),
+                axis: "shared_weight",
+            });
+        };
         if high_water > cap || current > cap {
             return Err(OverloadAssertionError::HiddenBuffering {
                 surface: report.name.clone(),
@@ -339,6 +369,23 @@ mod tests {
         assert!(matches!(
             error,
             OverloadAssertionError::MissingConfiguredCap { .. }
+        ));
+
+        let mut missing_weight = CapacitySurfaceReport::weighted(
+            "http.body",
+            CapacityMode::Fixed,
+            1024,
+            128,
+            256,
+            0,
+            "bytes",
+        );
+        missing_weight.high_water_weight = None;
+        let error =
+            check_no_hidden_buffering(&missing_weight).expect_err("missing weight observation");
+        assert!(matches!(
+            error,
+            OverloadAssertionError::MissingObservation { axis: "weight", .. }
         ));
     }
 

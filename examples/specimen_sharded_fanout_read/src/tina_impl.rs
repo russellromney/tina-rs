@@ -30,8 +30,8 @@ use tina_runtime::sharded::{
     ShardServiceTable,
 };
 use tina_runtime::{
-    BoundedEffects, BoundedItems, DefaultThreadedMailboxFactory, RuntimeCall,
-    ThreadedMultiShardRuntime, bounded_batch,
+    BoundedItems, DefaultThreadedMailboxFactory, RuntimeCall, ThreadedMultiShardRuntime,
+    bounded_batch,
 };
 
 use crate::{Report, SEED_VALUES, SHARD_RAW_IDS};
@@ -142,17 +142,13 @@ impl Isolate for ScatterCoord {
                 .expect("placement target list is capped by ScatterGatherConfig");
                 self.targets_in_order = targets.as_slice().to_vec();
                 self.pending_targets = targets.as_slice().to_vec();
-                let effects = BoundedEffects::try_from_iter(
-                    self.config.max_targets,
-                    targets.iter().copied().map(|shard| {
-                        let address = self
-                            .table
-                            .address_for(shard)
-                            .expect("shard came from placement.shards()");
-                        send(address, ShardCounterMsg::Get { reply_to: bridge })
-                    }),
-                )
-                .expect("scatter effects are capped by ScatterGatherConfig");
+                let effects = targets.map_effects(|shard| {
+                    let address = self
+                        .table
+                        .address_for(shard)
+                        .expect("shard came from placement.shards()");
+                    send(address, ShardCounterMsg::Get { reply_to: bridge })
+                });
                 bounded_batch(effects)
             }
             ScatterCoordMsg::Reply(reply) => {
