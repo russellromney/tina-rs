@@ -476,4 +476,34 @@ mod tests {
         let mismatch = probe.check().expect_err("drift detected");
         assert!(mismatch.diverged.contains(&"outcome"));
     }
+
+    #[test]
+    fn compressed_flag_without_decompressor_is_unimplemented() {
+        let mut body = encode_grpc_frame(b"payload");
+        body[0] = 1; // set the compression flag with no negotiated codec.
+        let run = decode_grpc_response(&body, &[("grpc-status", "0")], GrpcLimits::default());
+        assert_eq!(run.outcome, GrpcOutcome::CompressedUnsupported);
+        assert_eq!(run.facts, vec![status_fact(GrpcStatusCode::Unimplemented)]);
+    }
+
+    #[test]
+    fn malformed_status_value_defaults_to_unknown() {
+        let body = encode_grpc_frame(b"ok");
+        let run = decode_grpc_response(
+            &body,
+            &[("grpc-status", "not-a-number")],
+            GrpcLimits::default(),
+        );
+        // A status the client cannot parse is treated as no usable status:
+        // the gRPC default, UNKNOWN.
+        assert_eq!(run.outcome, GrpcOutcome::MissingStatus);
+        assert_eq!(run.facts, vec![status_fact(GrpcStatusCode::Unknown)]);
+    }
+
+    #[test]
+    fn status_header_match_is_case_insensitive() {
+        let body = encode_grpc_frame(b"ok");
+        let run = decode_grpc_response(&body, &[("Grpc-Status", "5")], GrpcLimits::default());
+        assert_eq!(run.outcome, GrpcOutcome::Status(GrpcStatusCode::NotFound));
+    }
 }

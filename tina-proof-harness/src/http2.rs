@@ -714,4 +714,38 @@ mod tests {
         let mismatch = probe.check().expect_err("drift detected");
         assert!(mismatch.diverged.contains(&"outcome"));
     }
+
+    #[test]
+    fn connection_level_flow_control_exhaustion_is_typed() {
+        // A small connection window with a roomy stream window: the reserve
+        // empties the connection side, not the stream side.
+        let limits = Http2Limits {
+            max_frame_size: 16_384,
+            initial_stream_window: 1_000,
+            initial_connection_window: 64,
+        };
+        let mut conn = Http2Connection::new(limits);
+        conn.apply(&Http2Frame::Headers {
+            stream: 1,
+            pseudo_headers: vec![(":method", "POST"), (":path", "/upload")],
+            declared_len: 32,
+            end_stream: false,
+        });
+        conn.apply(&Http2Frame::WindowReserve {
+            stream: 1,
+            bytes: 64,
+        });
+        let (facts, outcome) = conn.finish();
+        assert_eq!(
+            outcome,
+            Http2Outcome::FlowControlExhausted(Http2FlowControlSide::ConnectionSend)
+        );
+        assert!(facts.iter().any(|fact| matches!(
+            fact,
+            ProtocolFact::Http2FlowControlFull {
+                side: Http2FlowControlSide::ConnectionSend,
+                ..
+            }
+        )));
+    }
 }

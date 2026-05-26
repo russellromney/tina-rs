@@ -769,7 +769,7 @@ fn decode_reason(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::websocket::{WebSocketLimits, client_frame};
+    use crate::websocket::{WebSocketLimits, client_frame, server_frame};
 
     const OPCODE_TEXT: u8 = 0x1;
     const OPCODE_PING: u8 = 0x9;
@@ -880,5 +880,41 @@ mod tests {
         case.expected_fact_hash ^= 0xdead;
         let mismatch = case.replay().expect_err("fact hash drift");
         assert!(mismatch.includes(ByteReplayField::FactHash));
+    }
+
+    #[test]
+    fn server_to_client_direction_reproduces_and_round_trips() {
+        // Server→client frames must be unmasked. A valid server text frame
+        // delivers; a masked frame (illegal from a server) is a protocol error.
+        let chunks = vec![
+            server_frame(true, OPCODE_TEXT, b"hi"),
+            client_frame(true, OPCODE_TEXT, b"illegal-mask"),
+        ];
+        let case = ProtocolByteReplayCase::capture(
+            "ws_s2c",
+            ByteReplayDirection::ServerToClient,
+            WebSocketLimits::default(),
+            chunks,
+        );
+        let report = case.replay().expect("reproduces");
+        assert_eq!(report.app_deliveries, 1);
+        assert_eq!(
+            report.close,
+            Some((Some(1002), WebSocketCloseReason::ProtocolError))
+        );
+
+        let path = std::env::temp_dir().join(format!(
+            "tina-byte-s2c-{}-{}.case",
+            std::process::id(),
+            case.expected_fact_hash
+        ));
+        case.save(&path).expect("save");
+        let loaded = ProtocolByteReplayCase::load(&path, "ws_s2c").expect("load");
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(loaded.direction, ByteReplayDirection::ServerToClient);
+        assert_eq!(loaded, case);
+        loaded
+            .replay()
+            .expect("loaded server-to-client case reproduces");
     }
 }

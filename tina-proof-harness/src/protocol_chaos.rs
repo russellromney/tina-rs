@@ -327,11 +327,10 @@ impl ProtocolChaosExpectation {
         if report.close_status != self.close_status {
             diverged.push(ChaosField::CloseStatus);
         }
-        // Compare facts as an ordered sequence via the stable typed fingerprint
-        // so a debug-string drift never masks a fact change, and vice versa.
-        if protocol_fact_sequence_hash(&report.protocol_facts)
-            != protocol_fact_sequence_hash(&self.protocol_facts)
-        {
+        // Compare the typed fact sequences directly: exact, order-sensitive,
+        // and collision-free. The stable fingerprint exists for the saved
+        // byte-replay form where the typed values cannot be stored inline.
+        if report.protocol_facts != self.protocol_facts {
             diverged.push(ChaosField::ProtocolFacts);
         }
         if diverged.is_empty() {

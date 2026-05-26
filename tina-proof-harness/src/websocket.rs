@@ -168,10 +168,6 @@ impl WebSocketSession {
 
     fn drain(&mut self) {
         while !self.closed {
-            if self.frames >= self.limits.max_frames {
-                self.close_with(WsViolation::Protocol);
-                return;
-            }
             match parse_frame(&self.buffer, self.role, self.limits) {
                 FrameStep::NeedMore => return,
                 FrameStep::Violation(v) => {
@@ -181,6 +177,14 @@ impl WebSocketSession {
                 FrameStep::Frame(frame) => {
                     self.buffer.drain(..frame.total_len);
                     self.frames += 1;
+                    // The cap rejects a frame *beyond* the limit only. A session
+                    // that sends exactly `max_frames` frames must not close: the
+                    // check sits after a successful parse, not at the top of the
+                    // loop where an empty buffer would trip it spuriously.
+                    if self.frames > self.limits.max_frames {
+                        self.close_with(WsViolation::Protocol);
+                        return;
+                    }
                     self.handle_frame(frame);
                 }
             }
@@ -992,5 +996,100 @@ mod tests {
             expected_facts: vec![ws_closed(1002, WebSocketCloseReason::ProtocolError)],
         };
         case.check().expect("1-byte close payload closes 1002");
+    }
+
+    #[test]
+    fn max_frames_cap_allows_exactly_the_limit_and_rejects_beyond() {
+        let limits = WebSocketLimits {
+            max_message_bytes: 1 << 16,
+            max_frame_payload: 1 << 16,
+            max_frames: 3,
+        };
+        // Exactly the limit: three valid frames, no spurious close. This is the
+        // regression guard for the off-by-one cap check.
+        let mut at_limit =
+            WebSocketSession::new(WebSocketRole::Server, WebSocketSessionId::new(1), limits);
+        for ch in b"abc" {
+            at_limit.feed(&client_frame(true, OPCODE_TEXT, &[*ch]));
+        }
+        let run = at_limit.finish();
+        assert_eq!(
+            run.app_messages.len(),
+            3,
+            "exactly max_frames must deliver all: {run:?}"
+        );
+        assert!(
+            run.close.is_none(),
+            "exactly max_frames must not close: {run:?}"
+        );
+
+        // One beyond the limit: the extra frame is rejected with a protocol close.
+        let mut beyond =
+            WebSocketSession::new(WebSocketRole::Server, WebSocketSessionId::new(1), limits);
+        for ch in b"abcd" {
+            beyond.feed(&client_frame(true, OPCODE_TEXT, &[*ch]));
+        }
+        let run = beyond.finish();
+        assert_eq!(
+            run.app_messages.len(),
+            3,
+            "only frames within the cap reach app: {run:?}"
+        );
+        assert_eq!(
+            run.close,
+            Some((Some(1002), WebSocketCloseReason::ProtocolError))
+        );
+    }
+
+    #[test]
+    fn invalid_close_code_is_protocol_error() {
+        // 1005 is reserved and must not appear on the wire.
+        let case = WebSocketComplianceCase {
+            name: "ws_invalid_close_code",
+            role: WebSocketRole::Server,
+            limits: WebSocketLimits::default(),
+            input: client_frame(true, OPCODE_CLOSE, &close_payload(1005, "")),
+            expected_app_messages: vec![],
+            expected_close: Some((Some(1002), WebSocketCloseReason::ProtocolError)),
+            expected_facts: vec![ws_closed(1002, WebSocketCloseReason::ProtocolError)],
+        };
+        case.check().expect("reserved close code 1005 closes 1002");
+    }
+
+    #[test]
+    fn single_frame_invalid_utf8_is_rejected() {
+        let case = WebSocketComplianceCase {
+            name: "ws_single_invalid_utf8",
+            role: WebSocketRole::Server,
+            limits: WebSocketLimits::default(),
+            input: client_frame(true, OPCODE_TEXT, &[0xff, 0xfe]),
+            expected_app_messages: vec![],
+            expected_close: Some((Some(1007), WebSocketCloseReason::ProtocolError)),
+            expected_facts: vec![ws_closed(1007, WebSocketCloseReason::ProtocolError)],
+        };
+        case.check()
+            .expect("single-frame invalid UTF-8 closes 1007");
+    }
+
+    #[test]
+    fn control_frame_interleaved_during_fragmentation_is_allowed() {
+        // text(FIN=0,"Hel") ping("hb") continuation(FIN=1,"lo") reassembles to
+        // "Hello" and counts the ping, without closing.
+        let mut input = client_frame(false, OPCODE_TEXT, b"Hel");
+        input.extend(client_frame(true, OPCODE_PING, b"hb"));
+        input.extend(client_frame(true, OPCODE_CONTINUATION, b"lo"));
+        let mut session = WebSocketSession::new(
+            WebSocketRole::Server,
+            WebSocketSessionId::new(1),
+            WebSocketLimits::default(),
+        );
+        session.feed(&input);
+        let run = session.finish();
+        assert_eq!(run.app_messages, vec![AppMessage::Text("Hello".to_owned())]);
+        assert_eq!(run.pings, 1);
+        assert!(
+            run.close.is_none(),
+            "interleaved control frame must not close: {run:?}"
+        );
     }
 }
