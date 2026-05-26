@@ -6,11 +6,15 @@
 pub mod tina_impl;
 pub mod tokio_impl;
 
-/// Workload knobs. The server attempts `burst` deliveries into a
-/// slow-consumer queue with `slow_consumer_capacity`.
+/// Workload knobs.
+///
+/// The client asks for `burst` deliveries. The Tina server only turns
+/// `max_broadcast_targets` of them into runtime effects; the rest are counted
+/// as visible `Full` pressure before they can become hidden work.
 #[derive(Debug, Clone, Copy)]
 pub struct RunConfig {
     pub burst: usize,
+    pub max_broadcast_targets: usize,
     pub slow_consumer_capacity: usize,
 }
 
@@ -18,6 +22,7 @@ impl Default for RunConfig {
     fn default() -> Self {
         Self {
             burst: 64,
+            max_broadcast_targets: 64,
             slow_consumer_capacity: 1,
         }
     }

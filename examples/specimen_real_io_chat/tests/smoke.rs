@@ -25,3 +25,24 @@ fn tina_smoke() {
         "every fanout attempt must be accounted for: {report:?}",
     );
 }
+
+#[test]
+fn tina_caps_request_sized_fanout_before_effects() {
+    let config = RunConfig {
+        burst: 16,
+        max_broadcast_targets: 4,
+        slow_consumer_capacity: 1,
+    };
+    let report = tina_impl::run(config).expect("tina side ran");
+    assert_eq!(
+        report.total(),
+        config.burst,
+        "pre-shed and admitted fanout must both be accounted for: {report:?}",
+    );
+    assert_eq!(report.accepted, 1, "slow consumer cap admits one");
+    assert_eq!(
+        report.full, 15,
+        "three admitted targets hit mailbox Full and twelve targets are shed before effects exist",
+    );
+    assert_eq!(report.buffered, 0);
+}

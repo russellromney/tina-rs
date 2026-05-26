@@ -10,6 +10,7 @@ fn main() -> anyhow::Result<()> {
         .unwrap_or(RunConfig::default().burst);
     let config = RunConfig {
         burst,
+        max_broadcast_targets: burst,
         ..Default::default()
     };
 

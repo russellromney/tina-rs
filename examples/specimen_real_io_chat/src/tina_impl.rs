@@ -1,8 +1,8 @@
 //! Tina: real loopback TCP, bounded slow-consumer mailbox, fanout
-//! through `send_observed`. Over-cap admissions surface as wire-side
-//! and event-side `Full` outcomes — the connection isolate tallies
-//! them and writes the count to the wire so the client (and the
-//! caller of [`run`]) can read it back.
+//! through `broadcast_observed`. Over-cap admissions surface as
+//! wire-side and event-side `Full` outcomes — the connection isolate
+//! tallies them and writes the count to the wire so the client (and
+//! the caller of [`run`]) can read it back.
 
 use std::convert::Infallible;
 use std::io::{Read, Write};
@@ -12,9 +12,10 @@ use std::time::Duration;
 
 use tina::prelude::*;
 use tina_runtime::{
-    DefaultThreadedMailboxFactory, ListenerId, SendOutcome, StreamId, TcpAcceptReply, TcpBindReply,
-    TcpListenerCloseReply, TcpReadReply, TcpStreamCloseReply, TcpWriteReply, ThreadedRuntime,
-    send_observed, tcp_accept, tcp_bind, tcp_close_listener, tcp_close_stream, tcp_read, tcp_write,
+    BroadcastReport, BroadcastTargets, BroadcastTracker, DefaultThreadedMailboxFactory,
+    ListenerId, SendOutcome, StreamId, TcpAcceptReply, TcpBindReply, TcpListenerCloseReply,
+    TcpReadReply, TcpStreamCloseReply, TcpWriteReply, ThreadedRuntime, broadcast_observed,
+    tcp_accept, tcp_bind, tcp_close_listener, tcp_close_stream, tcp_read, tcp_write,
 };
 
 use crate::{Report, RunConfig};
@@ -38,41 +39,71 @@ impl SlowClient {
 }
 
 // -------------------------------------------------------------------
-// Connection: read the requested burst from the wire, fan it out via
-// `send_observed`, count admission outcomes, write the metrics line
-// back, close.
+// Connection: read the requested burst from the wire, cap it at the
+// service-owned broadcast target limit, fan it out via
+// `broadcast_observed`, count admission outcomes, write the metrics
+// line back, close.
 // -------------------------------------------------------------------
 
 #[derive(Debug, Clone)]
 enum ConnectionMsg {
     Begin,
     Read(TcpReadReply),
-    Observed(SendOutcome),
+    Observed(usize, SendOutcome),
     Wrote(TcpWriteReply),
     Closed(TcpStreamCloseReply),
 }
 
-/// Connection state that starts at zero on every accepted stream.
-/// Lives in its own struct so the spawn site reads
-/// `counts: Counts::default()` instead of zeroing five fields.
-#[derive(Debug, Default, Clone, Copy)]
-struct Counts {
+#[derive(Debug, Default)]
+struct FanoutState {
     burst: usize,
-    accepted: usize,
-    full: usize,
-    closed: usize,
+    pre_shed_full: usize,
+    tracker: Option<BroadcastTracker<usize>>,
 }
 
-impl Counts {
-    fn observed(&self) -> usize {
-        self.accepted + self.full + self.closed
+impl FanoutState {
+    fn start<M>(
+        &mut self,
+        requested_burst: usize,
+        max_targets: usize,
+        slow_client: Address<M>,
+    ) -> anyhow::Result<BroadcastTargets<usize, M>>
+    where
+        M: 'static,
+    {
+        self.burst = requested_burst;
+        let admitted_targets = requested_burst.min(max_targets);
+        self.pre_shed_full = requested_burst.saturating_sub(admitted_targets);
+        let targets =
+            BroadcastTargets::try_from_iter(max_targets, (0..admitted_targets).map(|index| (index, slow_client)))?;
+        self.tracker = Some(targets.tracker());
+        Ok(targets)
+    }
+
+    fn record(&mut self, key: usize, outcome: SendOutcome) -> anyhow::Result<Option<(usize, usize, usize)>> {
+        let tracker = self
+            .tracker
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("broadcast outcome without tracker"))?;
+        let Some(report) = tracker.record(key, outcome)? else {
+            return Ok(None);
+        };
+        report.assert_all_accounted_for(report.outcomes().len())?;
+        let (accepted, full, closed) = counts_from_report(&report, self.pre_shed_full);
+        debug_assert_eq!(
+            accepted + full + closed,
+            self.burst,
+            "broadcast accounting must cover admitted and pre-shed targets",
+        );
+        Ok(Some((accepted, full, closed)))
     }
 }
 
 struct Connection {
     stream: StreamId,
     slow_client: Address<DeliverMsg>,
-    counts: Counts,
+    max_broadcast_targets: usize,
+    fanout: FanoutState,
 }
 
 #[tina_runtime::isolate(
@@ -84,34 +115,27 @@ impl Connection {
         match msg {
             ConnectionMsg::Begin => tcp_read(self.stream, 32).then(ConnectionMsg::Read),
             ConnectionMsg::Read(Ok(bytes)) => {
-                self.counts.burst = parse_burst(&bytes);
-                batch(
-                    (0..self.counts.burst)
-                        .map(|index| {
-                            send_observed(self.slow_client, DeliverMsg(index))
-                                .then(ConnectionMsg::Observed)
-                        })
-                        .collect::<Vec<_>>(),
-                )
+                let requested_burst = parse_burst(&bytes);
+                let targets =
+                    match self
+                        .fanout
+                        .start(requested_burst, self.max_broadcast_targets, self.slow_client)
+                    {
+                        Ok(targets) => targets,
+                        Err(_) => return stop(),
+                    };
+                if targets.is_empty() {
+                    return write_counts(self.stream, 0, self.fanout.pre_shed_full, 0);
+                }
+                broadcast_observed(targets, |index| DeliverMsg(*index), ConnectionMsg::Observed)
             }
-            ConnectionMsg::Observed(outcome) => {
-                if outcome.is_accepted() {
-                    self.counts.accepted += 1;
-                } else if outcome.is_full() {
-                    self.counts.full += 1;
-                } else {
-                    debug_assert!(outcome.is_closed());
-                    self.counts.closed += 1;
-                }
-                if self.counts.observed() < self.counts.burst {
-                    return noop();
-                }
-                let response = format!(
-                    "accepted={} full={} closed={}\n",
-                    self.counts.accepted, self.counts.full, self.counts.closed,
-                )
-                .into_bytes();
-                tcp_write(self.stream, response).then(ConnectionMsg::Wrote)
+            ConnectionMsg::Observed(key, outcome) => {
+                let counts = match self.fanout.record(key, outcome) {
+                    Ok(Some(counts)) => counts,
+                    Ok(None) => return noop(),
+                    Err(_) => return stop(),
+                };
+                write_counts(self.stream, counts.0, counts.1, counts.2)
             }
             ConnectionMsg::Wrote(Ok(_)) => {
                 tcp_close_stream(self.stream).then(ConnectionMsg::Closed)
@@ -140,6 +164,7 @@ struct Listener {
     bind_addr: SocketAddr,
     slow_client: Address<DeliverMsg>,
     connection_capacity: usize,
+    max_broadcast_targets: usize,
     listener: Option<ListenerId>,
 }
 
@@ -163,7 +188,8 @@ impl Listener {
                             Connection {
                                 stream,
                                 slow_client: self.slow_client,
-                                counts: Counts::default(),
+                                max_broadcast_targets: self.max_broadcast_targets,
+                                fanout: FanoutState::default(),
                             },
                             self.connection_capacity,
                         )
@@ -191,12 +217,11 @@ pub fn run(config: RunConfig) -> anyhow::Result<Report> {
         .register_with_capacity::<_, Infallible>(SlowClient, config.slow_consumer_capacity)
         .map_err(|e| anyhow::anyhow!("register slow client: {e:?}"))?;
 
-    // The connection mailbox absorbs one observed-reply per fanout
-    // attempt (047 finding: replies count against the requester) plus
-    // a small slack for other ConnectionMsg variants. Sizing it to
-    // `burst + slack` is the simplest way to prove no reply slot is
-    // ever full.
-    let connection_capacity = config.burst.saturating_add(16);
+    // The connection mailbox absorbs one observed-reply per admitted
+    // broadcast target plus a small slack for ordinary connection
+    // messages. The request can ask for more; those excess targets
+    // are counted as visible Full before they become effects.
+    let connection_capacity = config.max_broadcast_targets.saturating_add(16);
 
     let bind_addr: SocketAddr = "127.0.0.1:0".parse()?;
     let listener = runtime
@@ -205,6 +230,7 @@ pub fn run(config: RunConfig) -> anyhow::Result<Report> {
                 bind_addr,
                 slow_client,
                 connection_capacity,
+                max_broadcast_targets: config.max_broadcast_targets,
                 listener: None,
             },
             8,
@@ -291,4 +317,17 @@ fn parse_response(bytes: &[u8]) -> anyhow::Result<(usize, usize, usize)> {
         full.ok_or_else(|| anyhow::anyhow!("missing full field"))?,
         closed.ok_or_else(|| anyhow::anyhow!("missing closed field"))?,
     ))
+}
+
+fn counts_from_report(report: &BroadcastReport<usize>, pre_shed_full: usize) -> (usize, usize, usize) {
+    (
+        report.accepted(),
+        report.full().saturating_add(pre_shed_full),
+        report.closed(),
+    )
+}
+
+fn write_counts(stream: StreamId, accepted: usize, full: usize, closed: usize) -> Effect<Connection> {
+    let response = format!("accepted={accepted} full={full} closed={closed}\n").into_bytes();
+    tcp_write(stream, response).then(ConnectionMsg::Wrote)
 }
