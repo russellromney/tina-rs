@@ -490,6 +490,44 @@ let capture = capture.with_unsupported_fact(
 );
 ```
 
+### Overload Bugboxes
+
+For overload incidents, use the names that match the workflow:
+
+```rust
+use tina_sim::dst::{
+    assert_no_hidden_buffering, assert_overload_visible, capture_overload_run,
+    replay_overload_bug, save_overload_bug,
+};
+
+assert_no_hidden_buffering(&pool_waiter_report);
+assert_overload_visible(&pool_waiter_report);
+
+let capture = capture_overload_run("db pool waiters went full")
+    .with_seed(seed)
+    .with_config(replay_config.clone())
+    .with_scenario("many callers wait on a small pool")
+    .with_history(ops)
+    .with_invariant("pool pressure is visible as Full")
+    .with_trace(&live_trace)
+    .with_capacity_summary(&pool_waiter_report)
+    .finish()?;
+
+let saved = save_overload_bug("cases/db-pool-full.case", &capture, |op| {
+    op.to_string()
+})?;
+eprintln!("{saved}");
+
+replay_overload_bug(&capture, &capture.to_replay_case(), run_case)?;
+```
+
+`assert_no_hidden_buffering` proves the surface had a configured cap and
+the observed high-water stayed inside it. `assert_overload_visible`
+additionally requires at least one visible `Full`/weight-full fact. These
+helpers do not infer facts from logs. They check the capacity reports you
+recorded and then let replay prove the simulator produced the same typed
+facts.
+
 If replay cannot match the capture, `CapturedReplayMismatch` says what
 changed:
 

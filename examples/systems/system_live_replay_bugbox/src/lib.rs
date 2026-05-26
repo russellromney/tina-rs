@@ -7,8 +7,8 @@
 //!   wire a live trace observer before the first event.
 //! - [`tina_proof_harness::LiveTrace`] to capture the live trace shape
 //!   (event count + `stable_trace_hash`).
-//! - [`tina_sim::dst::capture_live_run`] /
-//!   [`tina_sim::dst::assert_captured_replay`] /
+//! - [`tina_sim::dst::capture_overload_run`] /
+//!   [`tina_sim::dst::replay_overload_bug`] /
 //!   [`tina_sim::dst::shrink_captured_replay`] for the live-derived saved case.
 //! - [`tina_sim::dst::ReplayCase`] / [`tina_sim::dst::assert_replay_case`] for
 //!   the saved-seed sim replay.
@@ -38,9 +38,9 @@ use tina_runtime::{DefaultThreadedMailboxFactory, ThreadedRuntime, ThreadedRunti
 use tina_sim::dst::{
     CaptureSource, CaptureSummary, DiscoveredConstants, LiveReplayCapture, LiveReplayFact,
     LiveReplayReport, ReplayCase, ReplayConfig, ReplayReport, ShrinkConfig, ShrinkCapturedReport,
-    TraceProjection, TraceShape, assert_captured_replay, assert_replay_case, capture_live_run,
-    check_captured_replay, discover_constants, read_saved_replay_case, shrink_captured_replay,
-    write_saved_replay_case,
+    TraceProjection, TraceShape, assert_no_hidden_buffering, assert_captured_replay,
+    assert_replay_case, capture_overload_run, check_captured_replay, discover_constants,
+    read_saved_replay_case, replay_overload_bug, save_overload_bug, shrink_captured_replay,
 };
 use tina_sim::{FaultConfig, LocalSendFaultMode, Simulator};
 
@@ -418,7 +418,16 @@ pub fn run() -> anyhow::Result<BugboxReport> {
     // 3) Live capture -> save -> read -> replay. The capture keeps the live
     //    trace shape, explicit replay config/history, typed facts, and source
     //    metadata together.
-    let capture = capture_live_run(live_case.name)
+    let receive_count_surface = CapacitySurfaceReport::count(
+        "bugbox.sink.receive-count",
+        CapacityMode::Fixed,
+        8,
+        0,
+        live_received_count,
+        0,
+    );
+    assert_no_hidden_buffering(&receive_count_surface);
+    let capture = capture_overload_run(live_case.name)
         .with_seed(live_case.seed)
         .with_config(live_case.config.clone())
         .with_scenario(live_case.scenario)
@@ -432,14 +441,7 @@ pub fn run() -> anyhow::Result<BugboxReport> {
         )
         .with_projection(TraceProjection::Exact)
         .with_trace(&live_events)
-        .with_capacity_summary(&CapacitySurfaceReport::count(
-            "bugbox.sink.receive-count",
-            CapacityMode::Fixed,
-            8,
-            0,
-            sim_report.output.messages_received,
-            0,
-        ))
+        .with_capacity_summary(&receive_count_surface)
         .finish()?;
     let capture_summary = capture.summary();
 
@@ -448,16 +450,18 @@ pub fn run() -> anyhow::Result<BugboxReport> {
         std::process::id(),
         capture.expected.trace_hash
     ));
-    write_saved_replay_case(&path, &capture, encode_op)?;
+    let bugbox_save = save_overload_bug(&path, &capture, encode_op)?;
     let saved = read_saved_replay_case(&path, decode_op)?;
-    let _ = std::fs::remove_file(&path);
     let replay_case = saved.to_replay_case(
         live_case.name,
         live_case.config.clone(),
         live_case.scenario,
         live_case.invariant,
     )?;
-    let capture_replay = assert_captured_replay(&capture, &replay_case, run_captured_case);
+    let capture_replay = replay_overload_bug(&capture, &replay_case, run_captured_case)
+        .map_err(|error| anyhow::anyhow!("overload replay failed: {error}"))?;
+    let asserted_capture_replay = assert_captured_replay(&capture, &replay_case, run_captured_case);
+    assert_eq!(capture_replay, asserted_capture_replay);
     assert_eq!(capture_replay.live_facts, vec![fact.clone()]);
 
     let unsupported = capture
@@ -511,7 +515,7 @@ pub fn run() -> anyhow::Result<BugboxReport> {
          live_hash=0x{live_hash:016x} sim_events={sim_count} sim_hash=0x{sim_hash:016x} \
          shrunk_from={from} to={to} discovered_seeds={ds} \
          live_pressure_nonzero={pressure_nonzero} capture_blocked={capture_blocked} \
-         unsupported_proof={unsupported_mismatch_seen}",
+         unsupported_proof={unsupported_mismatch_seen} saved_bugbox={saved_path}",
         live_count = live_shape.event_count,
         live_hash = live_shape.trace_hash,
         sim_count = sim_report.event_count,
@@ -521,6 +525,7 @@ pub fn run() -> anyhow::Result<BugboxReport> {
         ds = discovered.len(),
         pressure_nonzero = live_pressure.non_zero(),
         capture_blocked = capture_summary.replay_blocked,
+        saved_path = bugbox_save.path.display(),
     );
 
     Ok(BugboxReport {

@@ -15,8 +15,9 @@ Start from the task, not the type list.
 | shut down | `DrainState`, `ServiceShutdownReport`, explicit close/cancel outcomes |
 | capture a bug | `RunCapture::new("name").observer()` before the runtime starts |
 | save/replay/shrink this bug | `save_bug`, `replay_bug`, `shrink_bug` |
+| capture an overload bug | `capture_overload_run`, `save_overload_bug`, `replay_overload_bug` |
+| prove overload was visible | `assert_overload_visible` / `assert_no_hidden_buffering` |
 | prove a hot path did not starve a cold path | `cold_work_made_progress`, `timer_kept_firing`, and fairness/load reports |
 | control a session app | `WebSocketSessionMsg::AppControl(WebSocketSessionControl::...)` |
 | wait for all calls | `CallJoinSet` |
 | handle whichever call returns next | `CallSelectSet` |
-
