@@ -2373,14 +2373,19 @@ fn local_system_capabilities_name_supported_and_unsupported_resource_families() 
         PersistenceSupportLevel::NotClaimed
     );
 
-    // Unix-domain rail: live OS-backed lane on Unix, typed unsupported
-    // (not cfg-silent) elsewhere.
+    // Unix-domain rail: live substrate-backed lane on Unix (rides the
+    // Betelgeuse completion loop like TCP), typed unsupported (not
+    // cfg-silent) elsewhere.
     #[cfg(unix)]
     {
         assert_eq!(capabilities.unix.support(), ResourceSupport::Supported);
         assert_eq!(
             capabilities.unix.execution(),
-            ResourceExecutionShape::PollBacked
+            ResourceExecutionShape::CompletionBacked
+        );
+        assert_eq!(
+            capabilities.unix.cancellation(),
+            CancellationSupport::TombstonedAfterStart
         );
     }
     #[cfg(not(unix))]

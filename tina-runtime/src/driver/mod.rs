@@ -251,11 +251,13 @@ impl BetelgeuseDriver {
             // TLS rides the same Betelgeuse loop as plain TCP — a cloned
             // handle, not a second socket stack.
             tls: TlsLane::new(DEFAULT_TLS_LANE_CAPACITY, io_loop.clone()),
+            // Unix-domain sockets ride the same Betelgeuse loop as TCP/TLS —
+            // a cloned handle, not a second socket stack.
+            unix: UnixLane::new(io_loop.clone()),
             tcp: BetelgeuseTcp::with_io_loop(io_loop),
             storage: StorageLane::inline(),
             dns: DnsLane::new(DEFAULT_DNS_LANE_CAPACITY),
             process: ProcessLane::new(DEFAULT_PROCESS_LANE_CAPACITY),
-            unix: UnixLane::new(),
             signals: Vec::with_capacity(
                 DEFAULT_SIGNAL_CAPACITY.min(INITIAL_DRIVER_PENDING_CAPACITY),
             ),
@@ -276,11 +278,11 @@ impl BetelgeuseDriver {
     ) -> Self {
         Self {
             tls: TlsLane::new(tls_lane_capacity, io_loop.clone()),
+            unix: UnixLane::new(io_loop.clone()),
             tcp: BetelgeuseTcp::with_io_loop(io_loop.clone()),
             storage: StorageLane::reactor(io_loop, storage_lane_capacity),
             dns: DnsLane::new(dns_lane_capacity),
             process: ProcessLane::new(process_lane_capacity),
-            unix: UnixLane::new(),
             signals: Vec::with_capacity(signal_capacity.min(INITIAL_DRIVER_PENDING_CAPACITY)),
             signal_capacity,
             timers: Vec::with_capacity(INITIAL_DRIVER_TIMER_CAPACITY),
@@ -473,9 +475,12 @@ impl RuntimeDriver for BetelgeuseDriver {
         self.dns.cancel_pending(deadline);
         let tls_result = self.tls.cancel_pending(deadline);
         self.process.cancel_pending(deadline);
-        self.unix.cancel_pending(deadline);
+        // Unix shares the Betelgeuse loop with TCP; it must release its own
+        // completion boxes before the TCP lane runs the final whole-loop
+        // release check.
+        let unix_result = self.unix.cancel_pending(deadline);
         let tcp_result = self.tcp.cancel_pending(deadline);
-        tls_result.and(tcp_result)
+        tls_result.and(unix_result).and(tcp_result)
     }
 
     fn cancel(&mut self, call_id: CallId) -> bool {
@@ -528,10 +533,11 @@ impl RuntimeDriver for BetelgeuseDriver {
             udp_sockets: tcp.udp_sockets,
             files: tcp.files,
             // Worker-held: TLS in-flight ops parking cloned listener/stream
-            // arcs, plus process calls owning a live Child. DNS/storage/Unix
-            // workers do not hold a runtime-visible OS handle beyond the
-            // table-owned listener/stream ids, so they contribute zero here
-            // per the plan's count rules.
+            // arcs, plus process calls owning a live Child. The Unix lane is
+            // now completion-backed like TCP (its in-flight connect socket is
+            // not a separate OS-handle clone), and DNS/storage workers hold no
+            // runtime-visible OS handle beyond table-owned ids, so they
+            // contribute zero here per the plan's count rules.
             worker_held: tls.worker_held + process_pending,
             // Pending counts use physical entries (not filtered on the
             // user-cancel flag) so that work the runtime asked to cancel
@@ -1421,5 +1427,510 @@ mod tests {
         let mut completed = Vec::new();
         driver.advance(Instant::now(), &mut completed);
         assert_eq!(driver.resource_report().pending_driver_call_count(), 0);
+    }
+
+    // -------------------------------------------------------------------
+    // Unix-domain rail (now completion-backed over the shared Betelgeuse
+    // loop). These drive the live driver directly to prove lane discipline,
+    // close-wins cancellation, and bounded shutdown — the parts the
+    // higher-level echo round-trip does not isolate.
+    // -------------------------------------------------------------------
+    #[cfg(unix)]
+    mod unix_lane {
+        use super::*;
+        use crate::call::{UnixListenerId, UnixStreamId};
+        use std::sync::atomic::AtomicU64;
+
+        fn unique_sock(label: &str) -> std::path::PathBuf {
+            static SEQ: AtomicU64 = AtomicU64::new(0);
+            let n = SEQ.fetch_add(1, Ordering::Relaxed);
+            std::env::temp_dir().join(format!(
+                "tina-unixlane-{label}-{}-{n}.sock",
+                std::process::id()
+            ))
+        }
+
+        /// Advances the driver until `done` is satisfied or a 2s safety
+        /// deadline elapses; returns every completion observed.
+        fn advance_until(
+            driver: &mut BetelgeuseDriver,
+            done: impl Fn(&[DriverCompletion]) -> bool,
+        ) -> Vec<DriverCompletion> {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let mut all = Vec::new();
+            loop {
+                driver.advance(Instant::now(), &mut all);
+                if done(&all) || Instant::now() >= deadline {
+                    return all;
+                }
+                thread::sleep(Duration::from_millis(1));
+            }
+        }
+
+        // The substrate unlinks the listener socket file on close and clears a
+        // stale file before bind, so these tests need no `std::fs` cleanup.
+        fn bind_listener(driver: &mut BetelgeuseDriver, call: u64) -> UnixListenerId {
+            let path = unique_sock("lane");
+            let bound = driver
+                .submit(
+                    CallId::new(call),
+                    CallInput::UnixBind { path },
+                    Instant::now(),
+                )
+                .expect("bind completes inline");
+            match bound.result {
+                CallOutput::UnixBound { listener, .. } => listener,
+                other => panic!("unexpected bind result: {other:?}"),
+            }
+        }
+
+        /// Binds a listener and returns both its id and the path, for callers
+        /// that also need to connect a client to it.
+        fn bind_listener_with_path(
+            driver: &mut BetelgeuseDriver,
+            call: u64,
+        ) -> (UnixListenerId, PathBuf) {
+            let path = unique_sock("lane");
+            let bound = driver
+                .submit(
+                    CallId::new(call),
+                    CallInput::UnixBind { path: path.clone() },
+                    Instant::now(),
+                )
+                .expect("bind completes inline");
+            match bound.result {
+                CallOutput::UnixBound { listener, .. } => (listener, path),
+                other => panic!("unexpected bind result: {other:?}"),
+            }
+        }
+
+        /// Binds, accepts, and connects to produce a live server/client stream
+        /// pair through the substrate.
+        fn connected_pair(
+            driver: &mut BetelgeuseDriver,
+        ) -> (UnixListenerId, UnixStreamId, UnixStreamId) {
+            let (listener, path) = bind_listener_with_path(driver, 100);
+            assert!(
+                driver
+                    .submit(
+                        CallId::new(101),
+                        CallInput::UnixAccept { listener },
+                        Instant::now()
+                    )
+                    .is_none()
+            );
+            assert!(
+                driver
+                    .submit(
+                        CallId::new(102),
+                        CallInput::UnixConnect { path: path.clone() },
+                        Instant::now()
+                    )
+                    .is_none()
+            );
+            let completed = advance_until(driver, |all| {
+                all.iter().any(|c| c.call_id == CallId::new(101))
+                    && all.iter().any(|c| c.call_id == CallId::new(102))
+            });
+            let server = completed
+                .iter()
+                .find_map(|c| match (&c.call_id, &c.result) {
+                    (id, CallOutput::UnixAccepted { stream }) if *id == CallId::new(101) => {
+                        Some(*stream)
+                    }
+                    _ => None,
+                })
+                .expect("accept produced a server stream");
+            let client = completed
+                .iter()
+                .find_map(|c| match (&c.call_id, &c.result) {
+                    (id, CallOutput::UnixConnected { stream }) if *id == CallId::new(102) => {
+                        Some(*stream)
+                    }
+                    _ => None,
+                })
+                .expect("connect produced a client stream");
+            (listener, server, client)
+        }
+
+        #[test]
+        fn duplicate_lane_work_is_resource_busy_and_invalid_ids_are_typed() {
+            let io_loop = io_loop(Global).expect("init io loop");
+            let mut driver = BetelgeuseDriver::with_io_loop(io_loop);
+            let listener = bind_listener(&mut driver, 1);
+
+            // First accept arms a pending op; a second on the same listener
+            // lane is rejected ResourceBusy, not silently queued.
+            assert!(
+                driver
+                    .submit(
+                        CallId::new(2),
+                        CallInput::UnixAccept { listener },
+                        Instant::now()
+                    )
+                    .is_none()
+            );
+            let busy = driver
+                .submit(
+                    CallId::new(3),
+                    CallInput::UnixAccept { listener },
+                    Instant::now(),
+                )
+                .expect("duplicate accept is synchronous");
+            assert!(matches!(
+                busy.result,
+                CallOutput::Failed(CallError::ResourceBusy)
+            ));
+
+            // Work on a resource id that the lane never handed out is typed
+            // InvalidResource, not a panic or a hang.
+            let bogus_listener = UnixListenerId::new(9_999);
+            let invalid = driver
+                .submit(
+                    CallId::new(4),
+                    CallInput::UnixAccept {
+                        listener: bogus_listener,
+                    },
+                    Instant::now(),
+                )
+                .expect("invalid accept is synchronous");
+            assert!(matches!(
+                invalid.result,
+                CallOutput::Failed(CallError::InvalidResource)
+            ));
+            let bogus_stream = UnixStreamId::new(9_999);
+            let invalid_read = driver
+                .submit(
+                    CallId::new(5),
+                    CallInput::UnixRead {
+                        stream: bogus_stream,
+                        max_len: 16,
+                    },
+                    Instant::now(),
+                )
+                .expect("invalid read is synchronous");
+            assert!(matches!(
+                invalid_read.result,
+                CallOutput::Failed(CallError::InvalidResource)
+            ));
+
+            let _ = driver.cancel_pending(Instant::now() + Duration::from_millis(100));
+        }
+
+        #[test]
+        fn duplicate_read_lane_is_resource_busy() {
+            let io_loop = io_loop(Global).expect("init io loop");
+            let mut driver = BetelgeuseDriver::with_io_loop(io_loop);
+            let (_listener, server, _client) = connected_pair(&mut driver);
+
+            // No bytes are queued, so the first read stays pending.
+            assert!(
+                driver
+                    .submit(
+                        CallId::new(200),
+                        CallInput::UnixRead {
+                            stream: server,
+                            max_len: 16
+                        },
+                        Instant::now()
+                    )
+                    .is_none()
+            );
+            let busy = driver
+                .submit(
+                    CallId::new(201),
+                    CallInput::UnixRead {
+                        stream: server,
+                        max_len: 16,
+                    },
+                    Instant::now(),
+                )
+                .expect("duplicate read is synchronous");
+            assert!(matches!(
+                busy.result,
+                CallOutput::Failed(CallError::ResourceBusy)
+            ));
+
+            let _ = driver.cancel_pending(Instant::now() + Duration::from_millis(100));
+        }
+
+        #[test]
+        fn close_listener_cancels_pending_accept_without_hang_or_leak() {
+            let io_loop = io_loop(Global).expect("init io loop");
+            let mut driver = BetelgeuseDriver::with_io_loop(io_loop);
+            let listener = bind_listener(&mut driver, 1);
+            assert!(
+                driver
+                    .submit(
+                        CallId::new(2),
+                        CallInput::UnixAccept { listener },
+                        Instant::now()
+                    )
+                    .is_none()
+            );
+            assert_eq!(driver.resource_report().listeners, 1);
+
+            // Close wins over the pending accept.
+            let closed = driver
+                .submit(
+                    CallId::new(3),
+                    CallInput::UnixListenerClose { listener },
+                    Instant::now(),
+                )
+                .expect("close completes inline");
+            assert!(matches!(closed.result, CallOutput::UnixListenerClosed));
+
+            // The runtime drains the close-cancelled accept id; its
+            // continuation must not fire as a fresh completion.
+            let cancelled = driver.take_cancelled_by_close();
+            assert!(cancelled.contains(&CallId::new(2)));
+
+            let mut spurious = Vec::new();
+            for _ in 0..16 {
+                driver.advance(Instant::now(), &mut spurious);
+                thread::sleep(Duration::from_millis(1));
+            }
+            assert!(
+                !spurious.iter().any(|c| c.call_id == CallId::new(2)),
+                "cancelled accept must not deliver a completion"
+            );
+            // Listener gone; the cancelled accept no longer counts as pending.
+            assert_eq!(driver.resource_report().listeners, 0);
+            assert_eq!(driver.resource_report().pending_driver_call_count(), 0);
+            assert!(!driver.unix.has_pending());
+
+            let _ = driver.cancel_pending(Instant::now() + Duration::from_millis(100));
+        }
+
+        #[test]
+        fn close_stream_cancels_pending_read() {
+            let io_loop = io_loop(Global).expect("init io loop");
+            let mut driver = BetelgeuseDriver::with_io_loop(io_loop);
+            let (_listener, server, _client) = connected_pair(&mut driver);
+            assert!(
+                driver
+                    .submit(
+                        CallId::new(300),
+                        CallInput::UnixRead {
+                            stream: server,
+                            max_len: 16
+                        },
+                        Instant::now()
+                    )
+                    .is_none()
+            );
+
+            let closed = driver
+                .submit(
+                    CallId::new(301),
+                    CallInput::UnixStreamClose { stream: server },
+                    Instant::now(),
+                )
+                .expect("close completes inline");
+            assert!(matches!(closed.result, CallOutput::UnixStreamClosed));
+            assert!(driver.take_cancelled_by_close().contains(&CallId::new(300)));
+
+            let mut spurious = Vec::new();
+            for _ in 0..16 {
+                driver.advance(Instant::now(), &mut spurious);
+                thread::sleep(Duration::from_millis(1));
+            }
+            assert!(!spurious.iter().any(|c| c.call_id == CallId::new(300)));
+            assert!(!driver.unix.has_pending());
+
+            let _ = driver.cancel_pending(Instant::now() + Duration::from_millis(100));
+        }
+
+        #[test]
+        fn shutdown_after_pending_unix_work_is_clean_within_budget() {
+            let io_loop = io_loop(Global).expect("init io loop");
+            let mut driver = BetelgeuseDriver::with_io_loop(io_loop);
+            let listener = bind_listener(&mut driver, 1);
+            // In-flight accept with no peer: nothing will complete it.
+            assert!(
+                driver
+                    .submit(
+                        CallId::new(2),
+                        CallInput::UnixAccept { listener },
+                        Instant::now()
+                    )
+                    .is_none()
+            );
+            assert!(driver.unix.has_pending());
+
+            let budget = Duration::from_millis(100);
+            let started = Instant::now();
+            let result = driver.cancel_pending(Instant::now() + budget);
+            let elapsed = started.elapsed();
+            assert!(
+                elapsed < budget * 10,
+                "unix shutdown took {elapsed:?}, expected to return near {budget:?}"
+            );
+            // The shared-loop release either drains the slot (Ok) or reports
+            // the exact driver truth; on the local backend the cancel is
+            // synchronous, so it must be clean and leave nothing pending.
+            assert!(
+                result.is_ok(),
+                "local backend cancel is synchronous; shutdown should be clean"
+            );
+            assert_eq!(driver.resource_report().pending_driver_call_count(), 0);
+        }
+
+        #[test]
+        fn parked_then_closed_accept_does_not_strand_a_pending_call_and_reaps_by_shutdown() {
+            // The hard case: arm an accept, ADVANCE so the backend parks it
+            // (watched on the event loop), THEN close the listener. The
+            // close-cancelled op must (a) immediately stop counting as a
+            // pending driver call, (b) never deliver a spurious completion,
+            // and (c) leave no physical pending entry once the bounded
+            // shutdown drain releases the backend's completion slot.
+            let io_loop = io_loop(Global).expect("init io loop");
+            let mut driver = BetelgeuseDriver::with_io_loop(io_loop);
+            let listener = bind_listener(&mut driver, 1);
+            assert!(
+                driver
+                    .submit(
+                        CallId::new(2),
+                        CallInput::UnixAccept { listener },
+                        Instant::now()
+                    )
+                    .is_none()
+            );
+            // Park it: with no peer, the accept registers with the event loop.
+            let mut sink = Vec::new();
+            for _ in 0..4 {
+                driver.advance(Instant::now(), &mut sink);
+            }
+            assert!(sink.is_empty(), "no peer, so accept must not complete yet");
+            assert_eq!(driver.unix.physical_pending_len(), 1);
+
+            // Close wins over the parked accept.
+            let closed = driver
+                .submit(
+                    CallId::new(3),
+                    CallInput::UnixListenerClose { listener },
+                    Instant::now(),
+                )
+                .expect("close completes inline");
+            assert!(matches!(closed.result, CallOutput::UnixListenerClosed));
+            assert!(driver.take_cancelled_by_close().contains(&CallId::new(2)));
+            // Immediately uncounted as a pending driver call.
+            assert_eq!(driver.resource_report().pending_driver_call_count(), 0);
+
+            let mut spurious = Vec::new();
+            for _ in 0..16 {
+                driver.advance(Instant::now(), &mut spurious);
+                thread::sleep(Duration::from_millis(1));
+            }
+            assert!(
+                !spurious.iter().any(|c| c.call_id == CallId::new(2)),
+                "close-cancelled accept must never deliver a completion"
+            );
+
+            // Bounded shutdown must reap every physical entry: the backend
+            // releases the completion slot and the lane drops the tombstone.
+            let result = driver.cancel_pending(Instant::now() + Duration::from_millis(200));
+            assert!(result.is_ok(), "shutdown should release the backend slot");
+            assert_eq!(
+                driver.unix.physical_pending_len(),
+                0,
+                "shutdown must leave no stranded pending entry"
+            );
+        }
+
+        #[test]
+        fn many_connect_close_cycles_keep_logical_pending_zero_and_shutdown_reaps_all() {
+            // Open/connect/close many streams. Each cycle reads with no data
+            // (parking the read on the event loop) then closes the stream.
+            //
+            // Two honest invariants, matching the TCP/TLS lanes:
+            //  - The *logical* pending count (work the runtime still waits on)
+            //    stays at zero across cycles — a close-cancelled read never
+            //    counts and never delivers a completion.
+            //  - A close-cancelled read that was already parked leaves a
+            //    physical tombstone Box: it cannot be freed while the backend
+            //    still holds a pointer to it, and Betelgeuse exposes no per-op
+            //    cancel (only whole-loop `cancel_pending_completions`). Those
+            //    tombstones are released by the bounded shutdown drain — so
+            //    physical pending may rise during the run but is fully reaped
+            //    at shutdown, never permanently stranded.
+            let io_loop = io_loop(Global).expect("init io loop");
+            let mut driver = BetelgeuseDriver::with_io_loop(io_loop);
+            let mut next = 1_000u64;
+            for _ in 0..24 {
+                let (_listener, server, _client) = connected_pair(&mut driver);
+                assert!(
+                    driver
+                        .submit(
+                            CallId::new(next),
+                            CallInput::UnixRead {
+                                stream: server,
+                                max_len: 16
+                            },
+                            Instant::now()
+                        )
+                        .is_none()
+                );
+                next += 1;
+                // Park the read.
+                let mut sink = Vec::new();
+                driver.advance(Instant::now(), &mut sink);
+                // Close wins over the parked read.
+                let closed = driver
+                    .submit(
+                        CallId::new(next),
+                        CallInput::UnixStreamClose { stream: server },
+                        Instant::now(),
+                    )
+                    .expect("close completes inline");
+                assert!(matches!(closed.result, CallOutput::UnixStreamClosed));
+                next += 1;
+                let _ = driver.take_cancelled_by_close();
+                driver.advance(Instant::now(), &mut sink);
+                // The runtime never waits on a close-cancelled read.
+                assert_eq!(driver.resource_report().pending_driver_call_count(), 0);
+                assert!(!driver.unix.has_pending());
+            }
+
+            // Bounded shutdown reaps any close-cancelled tombstones the backend
+            // still referenced, leaving nothing stranded.
+            let result = driver.cancel_pending(Instant::now() + Duration::from_millis(500));
+            assert!(result.is_ok(), "shutdown should release all backend slots");
+            assert_eq!(driver.unix.physical_pending_len(), 0);
+        }
+
+        #[test]
+        fn connect_to_missing_path_is_typed_not_found() {
+            // A connect to a path with no listener must surface a typed
+            // NotFound, not Io or a hang.
+            let io_loop = io_loop(Global).expect("init io loop");
+            let mut driver = BetelgeuseDriver::with_io_loop(io_loop);
+            let missing = unique_sock("missing");
+            assert!(
+                driver
+                    .submit(
+                        CallId::new(1),
+                        CallInput::UnixConnect {
+                            path: missing.clone()
+                        },
+                        Instant::now()
+                    )
+                    .is_none()
+            );
+            let completed = advance_until(&mut driver, |all| {
+                all.iter().any(|c| c.call_id == CallId::new(1))
+            });
+            let result = completed
+                .iter()
+                .find(|c| c.call_id == CallId::new(1))
+                .map(|c| &c.result)
+                .expect("connect to missing path completes");
+            assert!(
+                matches!(result, CallOutput::Failed(CallError::NotFound)),
+                "expected NotFound for a missing path, got {result:?}"
+            );
+
+            let _ = driver.cancel_pending(Instant::now() + Duration::from_millis(100));
+        }
     }
 }

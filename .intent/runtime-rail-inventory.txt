@@ -1,0 +1,42 @@
+# Runtime-owned rail bypass inventory — every Tina-owned rail that is NOT
+# substrate-backed.
+#
+# This file is the machine-checked list of every `tina-runtime` driver file
+# that contains a *bypass primitive*: a worker thread (`thread::spawn` /
+# `thread::Builder`), a blocking `std` stream socket (`std::os::unix::net`,
+# `std::net::TcpListener`/`TcpStream`), or blocking `std::fs` work
+# (`OpenOptions`, `rename`, `remove_file`, `read_dir`, `metadata`, ...).
+# `scripts/rail_inventory_guard.sh` fails CI when the set of such files drifts
+# from this list — a *new* bypass primitive in an unlisted file, or a listed
+# file that no longer has one. Either way a human must look, classify the rail,
+# and update the runtime capability report (`RailClass` in
+# `tina-runtime/src/capabilities.rs`) before it lands.
+#
+# This is the substrate-honesty companion to `.intent/race-surface-allowlist.txt`.
+# The rule it enforces is the Phase 140 rule: every runtime-owned rail either
+# rides the per-shard Betelgeuse completion substrate (TCP, TLS, local file,
+# persistence, storage lane, Unix-domain sockets) or appears here with a short
+# written reason why it stays a bounded blocking/fallback lane.
+#
+# Scope: `tina-runtime/src/driver` only — the runtime-owned substrate driver.
+# Other crates do not own substrate rails. Betelgeuse is trusted-vendored
+# substrate, not a bypass lane.
+#
+# The guard ignores comment-only matches (a primitive named in a doc comment is
+# not real usage). `thread::sleep` is not `thread::spawn`/`Builder` and does not
+# count; UDP rides a nonblocking `std::net::UdpSocket` polled on the shard
+# thread (poll-backed, not a worker), so it is intentionally not a bypass
+# primitive.
+#
+# Classifications (must match the rail's `RailClass` in the capability report):
+#   fallback-worker          — bounded off-shard worker for the NARROW ops the
+#                              substrate has no opcode for; names the exact ops
+#   justified-blocking-lane  — bounded blocking lane kept off the substrate on
+#                              purpose, with a written reason (OS lifecycle /
+#                              no portable completion opcode)
+#
+# Format: <path>  <classification>  [note]
+
+tina-runtime/src/driver/dns.rs       justified-blocking-lane  blocking getaddrinfo/resolver worker; no portable completion opcode
+tina-runtime/src/driver/process.rs   justified-blocking-lane  fork/exec/wait/reap worker; OS process lifecycle, not reactor I/O
+tina-runtime/src/driver/storage.rs   fallback-worker          narrow off-shard worker for rename/remove/readdir/metadata (+ recursive mkdir, torn-tail truncation); live read/write/fsync/size/mkdir ride the substrate

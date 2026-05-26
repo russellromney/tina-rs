@@ -263,6 +263,7 @@ enum HangingMsg {
 
 struct CancelRecordingSource {
     chunk: Vec<u8>,
+    received_next: Arc<AtomicBool>,
     received_cancel: Arc<AtomicBool>,
 }
 
@@ -283,6 +284,7 @@ impl Isolate for CancelRecordingSource {
     ) -> Effect<Self> {
         match msg {
             tina_http::ResponseChunkMsg::Next => {
+                self.received_next.store(true, Ordering::Release);
                 reply(tina_http::ResponseChunkReply::Chunk(self.chunk.clone()))
             }
             tina_http::ResponseChunkMsg::Cancel => {
@@ -300,6 +302,7 @@ impl Isolate for CancelRecordingSource {
     ) -> Effect<Self> {
         match msg {
             tina_http::ResponseChunkMsg::Next => {
+                self.received_next.store(true, Ordering::Release);
                 call.reply(tina_http::ResponseChunkReply::Chunk(self.chunk.clone()))
             }
             tina_http::ResponseChunkMsg::Cancel => {
@@ -859,6 +862,7 @@ fn grpc_server_streaming_peer_reset_cancels_response_source() {
         .register_with_capacity::<CancelRecordingSource, Infallible>(
             CancelRecordingSource {
                 chunk: encoded,
+                received_next: Arc::new(AtomicBool::new(false)),
                 received_cancel: Arc::clone(&received_cancel),
             },
             16,
@@ -901,11 +905,13 @@ fn grpc_server_streaming_peer_reset_cancels_response_source() {
 #[test]
 fn grpc_server_streaming_non_reading_peer_reset_cancels_blocked_source() {
     let runtime = runtime();
+    let received_next = Arc::new(AtomicBool::new(false));
     let received_cancel = Arc::new(AtomicBool::new(false));
     let source = runtime
         .register_with_capacity::<CancelRecordingSource, Infallible>(
             CancelRecordingSource {
                 chunk: vec![0; 128 * 1024],
+                received_next: Arc::clone(&received_next),
                 received_cancel: Arc::clone(&received_cancel),
             },
             16,
@@ -933,7 +939,10 @@ fn grpc_server_streaming_non_reading_peer_reset_cancels_blocked_source() {
         ),
     );
     write_frame(&mut stream, FRAME_DATA, FLAG_END_STREAM, 1, &body);
-    std::thread::sleep(Duration::from_millis(50));
+    assert!(
+        wait_for_atomic_flag(&received_next, Duration::from_secs(1)),
+        "server must install and pull the response source before the reset proof starts"
+    );
 
     write_frame(&mut stream, FRAME_RST_STREAM, 0, 1, &0_u32.to_be_bytes());
     assert!(

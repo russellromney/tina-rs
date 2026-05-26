@@ -154,9 +154,10 @@ pub use live_report::{
 };
 
 pub use capabilities::{
-    CancellationSupport, DriverRuntimeRequirement, DurabilityCapability, ResourceCapability,
-    ResourceExecutionShape, ResourceSupport, RuntimeCapabilities, RuntimeCapabilityReport,
-    RuntimeCapabilityRow, ShutdownSupport, TINA_DRIVER_RUNTIME_CONTRACT, TinaDriverRuntimeContract,
+    CancellationSupport, DriverRuntimeRequirement, DurabilityCapability, RailClass,
+    ResourceCapability, ResourceExecutionShape, ResourceSupport, RuntimeCapabilities,
+    RuntimeCapabilityReport, RuntimeCapabilityRow, ShutdownSupport, TINA_DRIVER_RUNTIME_CONTRACT,
+    TinaDriverRuntimeContract,
 };
 #[cfg(test)]
 use clock::ManualClock;

@@ -138,6 +138,21 @@ pub trait IOSocket {
     /// Binds the socket to `addr`.
     fn bind(&self, addr: SocketAddr) -> stdio::Result<()>;
 
+    /// Binds the socket to a Unix-domain `path` and starts listening.
+    ///
+    /// Unix-domain sockets are sockets: bind/accept/recv/send/close all
+    /// follow the same completion model as the internet rail. Only the
+    /// addressing differs, so this is a separate entry point rather than an
+    /// overloaded [`IOSocket::bind`]. The accepted streams returned by
+    /// [`IOSocket::accept`] are ordinary stream sockets and need no
+    /// Unix-specific handling. Backends own the socket-file lifecycle: a
+    /// stale socket file at `path` is cleared before bind, and the file is
+    /// unlinked when the listener is [`IOSocket::close`]d.
+    fn bind_unix(&self, path: &Path) -> stdio::Result<()>;
+
+    /// Connects this socket to a Unix-domain `path`.
+    fn connect_unix(&self, c: &mut ConnectCompletion, path: &Path) -> stdio::Result<()>;
+
     /// Returns the socket's local address.
     fn local_addr(&self) -> stdio::Result<SocketAddr>;
 

@@ -6,7 +6,7 @@ use std::{
     mem::{self, MaybeUninit},
     net::SocketAddr,
     os::{fd::RawFd, unix::ffi::OsStrExt},
-    path::Path,
+    path::{Path, PathBuf},
     ptr::NonNull,
     rc::Rc,
 };
@@ -78,6 +78,9 @@ struct DarwinSocket {
     state: Rc<RefCell<DarwinState>>,
     fd: Rc<RefCell<Option<Rc<OwnedFd>>>>,
     kind: Rc<RefCell<Option<SocketKind>>>,
+    /// Set for a Unix-domain listener: the socket file this listener owns.
+    /// Cleared (unlinked, if still a socket) when the listener is closed.
+    unix_bind_path: Rc<RefCell<Option<PathBuf>>>,
 }
 
 pub struct DarwinIO {
@@ -171,6 +174,21 @@ impl DarwinIO {
                 }
                 return Err(err);
             }
+        }
+        Ok(Rc::new(OwnedFd::new(fd)))
+    }
+
+    fn socket_fd_unix() -> io::Result<Rc<OwnedFd>> {
+        trace!("socket domain=AF_UNIX type=SOCK_STREAM");
+        let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if let Err(err) = set_nonblocking_and_cloexec(fd).and_then(|_| set_no_sigpipe(fd)) {
+            unsafe {
+                libc::close(fd);
+            }
+            return Err(err);
         }
         Ok(Rc::new(OwnedFd::new(fd)))
     }
@@ -307,6 +325,56 @@ impl IOSocket for DarwinSocket {
 
         *self.fd.borrow_mut() = Some(fd);
         *self.kind.borrow_mut() = Some(SocketKind::Listener);
+        Ok(())
+    }
+
+    fn bind_unix(&self, path: &Path) -> io::Result<()> {
+        let fd = DarwinIO::socket_fd_unix()?;
+        let (storage, len) = unix_sockaddr_to_raw(path)?;
+        // Clear a stale socket file so a re-bind after an unclean exit
+        // succeeds. Only removes a socket inode, never a regular file or
+        // symlink at a user-supplied path.
+        unlink_if_socket(path);
+        trace!("bind_unix fd={} path={}", fd.raw(), path.display());
+        let rc = unsafe {
+            libc::bind(
+                fd.raw(),
+                (&storage as *const libc::sockaddr_storage).cast(),
+                len,
+            )
+        };
+        if rc < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let rc = unsafe { libc::listen(fd.raw(), 128) };
+        if rc < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        *self.fd.borrow_mut() = Some(fd);
+        *self.kind.borrow_mut() = Some(SocketKind::Listener);
+        *self.unix_bind_path.borrow_mut() = Some(path.to_path_buf());
+        Ok(())
+    }
+
+    fn connect_unix(&self, c: &mut ConnectCompletion, path: &Path) -> io::Result<()> {
+        if self.fd.borrow().is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "connect called on initialized socket",
+            ));
+        }
+        let fd = DarwinIO::socket_fd_unix()?;
+        let (storage, len) = unix_sockaddr_to_raw(path)?;
+        let inner = c.inner_mut();
+        inner.prepare(Operation::Connect(ConnectOp {
+            fd: fd.raw(),
+            addr: storage,
+            len,
+            attempted: false,
+        }));
+        *self.fd.borrow_mut() = Some(fd);
+        *self.kind.borrow_mut() = Some(SocketKind::Stream);
+        queue(&self.state, inner);
         Ok(())
     }
 
@@ -492,6 +560,11 @@ impl IOSocket for DarwinSocket {
     fn close(&self) {
         self.fd.borrow_mut().take();
         self.kind.borrow_mut().take();
+        // A Unix listener owns its socket file; unlink it on close so a
+        // later bind at the same path is not blocked by a stale inode.
+        if let Some(path) = self.unix_bind_path.borrow_mut().take() {
+            unlink_if_socket(&path);
+        }
     }
 }
 
@@ -508,6 +581,7 @@ impl IO for DarwinIO {
             state: self.state.clone(),
             fd: Rc::new(RefCell::new(None)),
             kind: Rc::new(RefCell::new(None)),
+            unix_bind_path: Rc::new(RefCell::new(None)),
         }))
     }
 
@@ -704,6 +778,7 @@ fn execute_completion(state: &Rc<RefCell<DarwinState>>, c: &mut CompletionInner)
                         state: state.clone(),
                         fd: Rc::new(RefCell::new(Some(Rc::new(OwnedFd::new(accepted))))),
                         kind: Rc::new(RefCell::new(Some(SocketKind::Stream))),
+                        unix_bind_path: Rc::new(RefCell::new(None)),
                     }) as Box<dyn IOSocket>)
                 }
             };
@@ -975,6 +1050,64 @@ fn socket_addr_to_raw(addr: SocketAddr) -> (libc::sockaddr_storage, libc::sockle
                 storage,
                 mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t,
             )
+        }
+    }
+}
+
+/// Packs a filesystem `path` into a `sockaddr_un` carried inside a
+/// `sockaddr_storage`. `len` is the precise `SUN_LEN`: the offset of
+/// `sun_path` plus the path bytes plus the trailing NUL. Pathname Unix
+/// sockets only; abstract-namespace sockets are out of scope.
+fn unix_sockaddr_to_raw(path: &Path) -> io::Result<(libc::sockaddr_storage, libc::socklen_t)> {
+    let bytes = path.as_os_str().as_bytes();
+    let mut sun: libc::sockaddr_un = unsafe { mem::zeroed() };
+    if bytes.len() >= sun.sun_path.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("unix socket path too long: {}", path.display()),
+        ));
+    }
+    if bytes.contains(&0) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "unix socket path contains interior NUL",
+        ));
+    }
+    sun.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    for (dst, src) in sun.sun_path.iter_mut().zip(bytes.iter()) {
+        *dst = *src as libc::c_char;
+    }
+    let path_offset = {
+        let base = &sun as *const _ as usize;
+        let path_ptr = &sun.sun_path as *const _ as usize;
+        path_ptr - base
+    };
+    let len = (path_offset + bytes.len() + 1) as libc::socklen_t;
+    sun.sun_len = len as u8;
+
+    let mut storage = unsafe { mem::zeroed::<libc::sockaddr_storage>() };
+    unsafe {
+        std::ptr::write((&mut storage as *mut libc::sockaddr_storage).cast(), sun);
+    }
+    Ok((storage, len))
+}
+
+/// Best-effort removal of a Unix socket file. Removes the path only when it
+/// is a socket inode, so a regular file or symlink a caller placed there is
+/// never destroyed.
+fn unlink_if_socket(path: &Path) {
+    let Ok(cpath) = c_string(path) else {
+        return;
+    };
+    let mut stat = MaybeUninit::<libc::stat>::uninit();
+    let rc = unsafe { libc::lstat(cpath.as_ptr(), stat.as_mut_ptr()) };
+    if rc != 0 {
+        return;
+    }
+    let stat = unsafe { stat.assume_init() };
+    if (stat.st_mode & libc::S_IFMT) == libc::S_IFSOCK {
+        unsafe {
+            libc::unlink(cpath.as_ptr());
         }
     }
 }

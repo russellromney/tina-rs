@@ -238,8 +238,9 @@ pub struct RuntimeCapabilities {
     /// Runtime-owned signal support.
     pub signal: ResourceCapability,
     /// Runtime-owned Unix-domain socket support. `Supported` on Unix
-    /// platforms (live OS-backed lane); `Unsupported` elsewhere — the
-    /// capability stays named rather than cfg-silently dropped.
+    /// platforms (live substrate-backed lane riding the per-shard Betelgeuse
+    /// completion loop, like TCP); `Unsupported` elsewhere — the capability
+    /// stays named rather than cfg-silently dropped.
     pub unix: ResourceCapability,
     /// Platform durability support details.
     pub durability: DurabilityCapability,
@@ -354,16 +355,18 @@ impl RuntimeCapabilities {
 
 /// Live Unix-domain rail capability for the current platform.
 ///
-/// On Unix, the live driver runs an OS-backed lane that polls
-/// non-blocking sockets. On non-Unix there is no backend, so the
+/// On Unix, the live driver runs a completion-backed lane that rides the
+/// per-shard Betelgeuse loop — the same substrate as TCP/TLS, on the shard
+/// thread, with no private worker. Started work is tombstoned on cancel and
+/// shutdown, exactly like TCP. On non-Unix there is no backend, so the
 /// capability is reported `Unsupported` with `NotApplicable` shapes —
 /// callers see a typed capability, not a cfg-silent gap.
 #[cfg(unix)]
 const UNIX_RAIL_CAPABILITY: ResourceCapability = ResourceCapability::new(
     ResourceSupport::Supported,
-    ResourceExecutionShape::PollBacked,
-    CancellationSupport::ResourceCloseOnly,
-    ShutdownSupport::Canceled,
+    ResourceExecutionShape::CompletionBacked,
+    CancellationSupport::TombstonedAfterStart,
+    ShutdownSupport::Tombstoned,
     None,
 );
 
@@ -376,9 +379,87 @@ const UNIX_RAIL_CAPABILITY: ResourceCapability = ResourceCapability::new(
     None,
 );
 
+/// Substrate posture for the Unix-domain rail on the current platform: it
+/// rides the Betelgeuse completion substrate on Unix, and there is no live
+/// backend off Unix.
+#[cfg(unix)]
+const UNIX_RAIL_CLASS: RailClass = RailClass::CompletionBacked;
+#[cfg(not(unix))]
+const UNIX_RAIL_CLASS: RailClass = RailClass::Unsupported;
+
+/// Why the storage metadata fallback stays a bounded off-shard worker.
+const STORAGE_FALLBACK_JUSTIFICATION: &str = "Narrow off-shard worker for the storage ops Betelgeuse has no opcode for: \
+     rename, remove, readdir, and metadata (plus internal recursive directory \
+     creation and torn-tail truncation). Live read/write/fsync/size/mkdir ride \
+     the completion substrate; this is not a general storage lane.";
+
+/// Why DNS stays a bounded blocking lane rather than a substrate opcode.
+const DNS_LANE_JUSTIFICATION: &str = "Platform getaddrinfo/resolver behavior (hosts file, nsswitch, mDNS, search \
+     domains) has no portable completion opcode. Name resolution is a blocking \
+     library call, not reactor I/O, so it runs on a bounded worker lane off the \
+     shard thread with explicit capacity, cancellation, and shutdown drain.";
+
+/// Why process spawn/wait stays a bounded blocking lane.
+const PROCESS_LANE_JUSTIFICATION: &str = "fork/exec/wait/reap are OS process lifecycle, not reactor I/O, and have no \
+     portable completion opcode. The lane stays a bounded blocking worker off \
+     the shard thread; cancellation requests a kill and the shutdown drain \
+     reports exactly what could not be reaped in budget.";
+
 // -----------------------------------------------------------------------------
 // RuntimeCapabilityReport — read-shaped capability discovery
 // -----------------------------------------------------------------------------
+
+/// Substrate posture for one runtime-owned rail.
+///
+/// This is the Phase 140 question made machine-readable: does this rail ride
+/// the per-shard Betelgeuse completion substrate, or is it a bounded
+/// blocking/fallback lane that stays off the substrate for a written reason?
+/// Every Tina-owned rail must answer with exactly one of these.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RailClass {
+    /// Rides the per-shard Betelgeuse completion substrate on the shard
+    /// thread. No worker thread, no blocking syscall (TCP, TLS, local file,
+    /// persistence, storage lane, Unix-domain sockets).
+    CompletionBacked,
+    /// Small runtime bookkeeping that completes inline on the shard thread
+    /// with no I/O (timers).
+    Inline,
+    /// Nonblocking resource work polled by the Tina driver step on the shard
+    /// thread — no worker thread, no blocking syscall (UDP, signal flags).
+    PollBacked,
+    /// A bounded off-shard worker for the *narrow* set of ops the substrate
+    /// has no opcode for. Not a general lane: the justification names the
+    /// exact ops (storage metadata fallback).
+    FallbackWorker,
+    /// A bounded blocking lane deliberately kept off the substrate, with a
+    /// written reason: the work is OS lifecycle, not reactor I/O, and has no
+    /// portable completion opcode (DNS resolver, process spawn/wait).
+    JustifiedBlockingLane,
+    /// Scripted by the deterministic simulator only; no live execution shape.
+    SimulatorScripted,
+    /// No live backend on this platform.
+    Unsupported,
+}
+
+impl RailClass {
+    /// Whether this class is a worker-thread or blocking lane that owes a
+    /// written justification in the capability report.
+    pub const fn requires_justification(self) -> bool {
+        matches!(self, Self::FallbackWorker | Self::JustifiedBlockingLane)
+    }
+
+    fn word(self) -> &'static str {
+        match self {
+            Self::CompletionBacked => "completion_backed",
+            Self::Inline => "inline",
+            Self::PollBacked => "poll_backed",
+            Self::FallbackWorker => "fallback_worker",
+            Self::JustifiedBlockingLane => "justified_blocking_lane",
+            Self::SimulatorScripted => "simulator_scripted",
+            Self::Unsupported => "unsupported",
+        }
+    }
+}
 
 /// One rail's capability, paired with a stable name.
 ///
@@ -387,12 +468,23 @@ const UNIX_RAIL_CAPABILITY: ResourceCapability = ResourceCapability::new(
 /// dashboards, and extension authors can ask the plan's questions
 /// ("is this supported? sim-backed? cancel-backed? drain-backed?")
 /// against one stable vocabulary instead of matching four enums by hand.
+///
+/// [`RailClass`] answers the Phase 140 substrate question, and
+/// [`Self::justification`] carries the written reason for any rail that is a
+/// bounded blocking or fallback lane rather than substrate-backed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RuntimeCapabilityRow {
     /// Stable rail name (e.g. `"tcp"`, `"local_persistence"`).
     pub name: &'static str,
     /// The underlying capability row.
     pub capability: ResourceCapability,
+    /// Substrate posture: substrate-backed, fallback worker, justified
+    /// blocking lane, simulator-scripted, or unsupported.
+    pub class: RailClass,
+    /// Written reason a rail stays a bounded blocking/fallback lane instead
+    /// of riding the substrate. `Some` exactly when
+    /// [`RailClass::requires_justification`] holds.
+    pub justification: Option<&'static str>,
 }
 
 impl RuntimeCapabilityRow {
@@ -437,6 +529,17 @@ impl RuntimeCapabilityRow {
     /// Shutdown drains this rail's pending work to a settled terminal state.
     pub const fn is_drain_backed(&self) -> bool {
         matches!(self.capability.shutdown(), ShutdownSupport::Drained)
+    }
+
+    /// This rail rides the per-shard Betelgeuse completion substrate.
+    pub const fn is_completion_backed(&self) -> bool {
+        matches!(self.class, RailClass::CompletionBacked)
+    }
+
+    /// This rail is a bounded off-shard worker or blocking lane that stays
+    /// off the substrate — and therefore carries a written justification.
+    pub const fn is_blocking_or_fallback_lane(&self) -> bool {
+        self.class.requires_justification()
     }
 
     fn support_word(&self) -> &'static str {
@@ -486,8 +589,9 @@ impl RuntimeCapabilityRow {
             None => "-".to_string(),
         };
         format!(
-            "cap rail={} support={} exec={} cancel={} shutdown={} capacity={}",
+            "cap rail={} class={} support={} exec={} cancel={} shutdown={} capacity={}",
             self.name,
+            self.class.word(),
             self.support_word(),
             self.execution_word(),
             self.cancellation_word(),
@@ -523,50 +627,74 @@ impl RuntimeCapabilityReport {
             RuntimeCapabilityRow {
                 name: "timers",
                 capability: caps.timers,
+                class: RailClass::Inline,
+                justification: None,
             },
             RuntimeCapabilityRow {
                 name: "tcp",
                 capability: caps.tcp,
+                class: RailClass::CompletionBacked,
+                justification: None,
             },
             RuntimeCapabilityRow {
                 name: "local_file",
                 capability: caps.local_file,
+                class: RailClass::CompletionBacked,
+                justification: None,
             },
             RuntimeCapabilityRow {
                 name: "local_persistence",
                 capability: caps.local_persistence,
+                class: RailClass::CompletionBacked,
+                justification: None,
             },
             RuntimeCapabilityRow {
                 name: "storage_lane",
                 capability: caps.storage_lane,
+                class: RailClass::CompletionBacked,
+                justification: None,
             },
             RuntimeCapabilityRow {
                 name: "storage_metadata_fallback",
                 capability: caps.storage_metadata_fallback,
+                class: RailClass::FallbackWorker,
+                justification: Some(STORAGE_FALLBACK_JUSTIFICATION),
             },
             RuntimeCapabilityRow {
                 name: "dns",
                 capability: caps.dns,
+                class: RailClass::JustifiedBlockingLane,
+                justification: Some(DNS_LANE_JUSTIFICATION),
             },
             RuntimeCapabilityRow {
                 name: "udp",
                 capability: caps.udp,
+                class: RailClass::PollBacked,
+                justification: None,
             },
             RuntimeCapabilityRow {
                 name: "tls",
                 capability: caps.tls,
+                class: RailClass::CompletionBacked,
+                justification: None,
             },
             RuntimeCapabilityRow {
                 name: "process",
                 capability: caps.process,
+                class: RailClass::JustifiedBlockingLane,
+                justification: Some(PROCESS_LANE_JUSTIFICATION),
             },
             RuntimeCapabilityRow {
                 name: "signal",
                 capability: caps.signal,
+                class: RailClass::PollBacked,
+                justification: None,
             },
             RuntimeCapabilityRow {
                 name: "unix",
                 capability: caps.unix,
+                class: UNIX_RAIL_CLASS,
+                justification: None,
             },
         ];
         Self { rows }
@@ -616,6 +744,7 @@ mod capability_report_tests {
         assert!(tcp.is_cancel_backed());
         assert!(tcp.is_tombstoned());
         assert!(!tcp.is_drain_backed());
+        assert!(tcp.is_completion_backed());
         // Live durability rides the Betelgeuse completion rail; only the ops
         // Betelgeuse lacks fall to the named fallback worker.
         let persistence = report
@@ -646,13 +775,82 @@ mod capability_report_tests {
         let caps = RuntimeCapabilities::threaded(4096);
         let text = caps.report().discovery_report();
         assert!(text.lines().count() == 12);
-        assert!(text.contains("cap rail=tcp support=supported"));
+        assert!(text.contains("cap rail=tcp class=completion_backed support=supported"));
         assert!(text.contains("rail=local_persistence"));
-        assert!(text.contains("rail=local_persistence support=supported exec=completion_backed"));
         assert!(text.contains(
-            "rail=storage_metadata_fallback support=supported exec=lane_backed_blocking"
+            "rail=local_persistence class=completion_backed support=supported exec=completion_backed"
         ));
+        assert!(text.contains(
+            "rail=storage_metadata_fallback class=fallback_worker support=supported exec=lane_backed_blocking"
+        ));
+        assert!(text.contains("rail=dns class=justified_blocking_lane"));
+        assert!(text.contains("rail=process class=justified_blocking_lane"));
         assert!(text.contains("capacity=4096"));
+    }
+
+    #[test]
+    fn every_rail_has_a_class_and_blocking_lanes_carry_a_justification() {
+        let caps = RuntimeCapabilities::threaded(4096);
+        let report = caps.report();
+        for row in report.rows() {
+            // A justification is present exactly for fallback/blocking lanes.
+            assert_eq!(
+                row.justification.is_some(),
+                row.class.requires_justification(),
+                "rail {} justification/class mismatch",
+                row.name,
+            );
+            if let Some(reason) = row.justification {
+                assert!(
+                    reason.len() > 40,
+                    "rail {} justification is too thin to be a real reason",
+                    row.name,
+                );
+            }
+        }
+        // The substrate story: the socket/file/persistence rails ride the
+        // completion substrate; only DNS and process remain justified blocking
+        // lanes, and only the metadata fallback remains a fallback worker.
+        for completion in [
+            "tcp",
+            "tls",
+            "local_file",
+            "local_persistence",
+            "storage_lane",
+        ] {
+            assert!(
+                report.rail(completion).unwrap().is_completion_backed(),
+                "{completion} should be completion-backed",
+            );
+        }
+        assert_eq!(
+            report.rail("dns").unwrap().class,
+            RailClass::JustifiedBlockingLane
+        );
+        assert_eq!(
+            report.rail("process").unwrap().class,
+            RailClass::JustifiedBlockingLane
+        );
+        assert_eq!(
+            report.rail("storage_metadata_fallback").unwrap().class,
+            RailClass::FallbackWorker
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_rail_rides_the_completion_substrate_on_unix() {
+        let caps = RuntimeCapabilities::threaded(4096);
+        let unix = *caps.report().rail("unix").expect("unix rail named");
+        assert!(unix.is_supported());
+        assert!(unix.is_completion_backed());
+        assert!(unix.is_tombstoned());
+        // No worker-lane justification: it rides the substrate.
+        assert!(unix.justification.is_none());
+        assert_eq!(
+            unix.capability.execution(),
+            ResourceExecutionShape::CompletionBacked
+        );
     }
 
     #[cfg(not(unix))]
