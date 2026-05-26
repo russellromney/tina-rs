@@ -10,7 +10,8 @@
 //! - passes when the inventory matches the bypass surface,
 //! - fails on a new off-inventory bypass primitive (a worker thread),
 //! - fails on a stale inventory entry,
-//! - ignores comment-only matches and in-`src` `tests.rs` modules.
+//! - ignores comment-only matches, block comments, and in-`src` `tests.rs`
+//!   modules.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -156,6 +157,12 @@ fn guard_ignores_comment_only_and_test_modules() {
     write(
         &driver.join("doc_only.rs"),
         "/// This rail used to use thread::spawn before it rode the substrate.\npub fn f() {}\n",
+    );
+    // A block-comment body naming a bypass primitive should also stay prose,
+    // not become an inventory requirement.
+    write(
+        &driver.join("block_comment.rs"),
+        "/*\n * Old implementation used std::os::unix::net here.\n */\npub fn f() {}\n",
     );
     // A real primitive, but in an in-src test module (not shipped surface).
     write(

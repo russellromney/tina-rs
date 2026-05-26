@@ -43,15 +43,15 @@ if [[ ! -f "$INVENTORY" ]]; then
 fi
 
 # Files in the driver dir that contain a primitive in real code, not just a
-# comment. A line is "real" if it matches the pattern and is not a `//`/`///`
-# comment line.
+# comment. A line is "real" if it matches the pattern and is not a line
+# comment or block-comment body line.
 found=""
 while IFS= read -r file; do
     # In-`src` `tests.rs` modules are test code, not shipped rail surface.
     case "$(basename "$file")" in
         tests.rs) continue ;;
     esac
-    if grep -E "$PATTERN" "$file" | grep -qvE '^[[:space:]]*//'; then
+    if grep -E "$PATTERN" "$file" | grep -qvE '^[[:space:]]*(//|/\*|\*)'; then
         found+="$file"$'\n'
     fi
 done < <(grep -RlE "$PATTERN" --include='*.rs' "${DRIVER_SRC[@]}" 2>/dev/null || true)
