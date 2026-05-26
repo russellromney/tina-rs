@@ -69,7 +69,7 @@ impl From<SocketAddr> for HttpTarget {
 
 /// DER trust roots for a TLS client. Construct via
 /// [`TlsTrustRoots::from_der`].
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TlsTrustRoots {
     pub root_certificates_der: Vec<Vec<u8>>,
 }

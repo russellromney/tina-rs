@@ -156,6 +156,7 @@ pub mod body_metrics;
 pub mod budget;
 pub mod chunked_decoder;
 pub mod client;
+pub mod connect;
 pub mod connection;
 pub mod grpc;
 pub mod grpc_client;
@@ -177,6 +178,12 @@ pub mod websocket_room;
 
 pub use body_metrics::{BodyCapacityFull, BodyMetrics, BodyPressureReport};
 pub use client::{HttpClient, HttpClientMsg, OutboundCall};
+pub use connect::{
+    AddressFamily, AddressFamilyPolicy, ConnectAttemptOutcome, ConnectAttemptReport, ConnectPolicy,
+    ConnectPolicyError, ConnectReport, ConnectSecurity, ConnectTlsTruth, DnsOutcome,
+    EndpointGeneration, EndpointId, GrpcEndpoint, HappyEyeballsPolicy, Http2Endpoint, HttpEndpoint,
+    ResolvedEndpoint, WebSocketEndpoint,
+};
 pub use connection::{HttpConnection, HttpConnectionMsg, response_for_call_outcome};
 pub use grpc::{
     GrpcClientStreamingRequest, GrpcError, GrpcLimits, GrpcRawStreamingRequest,
