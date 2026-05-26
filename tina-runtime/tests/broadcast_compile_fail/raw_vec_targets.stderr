@@ -1,0 +1,15 @@
+error[E0308]: mismatched types
+  --> tests/broadcast_compile_fail/raw_vec_targets.rs:24:28
+   |
+24 |         broadcast_observed(raw_targets, |key| Msg::Deliver(*key), Msg::Done);
+   |         ------------------ ^^^^^^^^^^^ expected `BroadcastTargets<u8, Msg>`, found `Vec<(u8, Address<Msg>)>`
+   |         |
+   |         arguments to this function are incorrect
+   |
+   = note: expected struct `BroadcastTargets<u8, Msg>`
+              found struct `Vec<(u8, tina::Address<Msg>)>`
+note: function defined here
+  --> src/broadcast.rs
+   |
+   | pub fn broadcast_observed<I, K, M, P, MakeMessage, Continue>(
+   |        ^^^^^^^^^^^^^^^^^^

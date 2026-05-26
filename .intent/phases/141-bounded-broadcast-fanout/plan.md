@@ -1,5 +1,11 @@
 # Phase 141: Bounded Broadcast Fanout
 
+## Status
+
+Ready for review. `BroadcastTargets`, `BroadcastTracker`,
+`BroadcastReport`, `broadcast_observed`, the chat specimen migration, docs,
+and focused proofs are in the PR.
+
 ## Goal
 
 Make the common "send this to many sessions/subscribers" path Tina-shaped:
@@ -67,4 +73,3 @@ items, but the service owns the fanout bound.
 - Specimen smoke: Tina chat still reports no hidden buffering.
 - Compile-fail/doc proof: the broadcast effect helper requires
   `BroadcastTargets`, so a raw request `Vec` cannot be passed directly.
-

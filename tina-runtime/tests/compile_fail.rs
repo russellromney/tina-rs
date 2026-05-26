@@ -45,3 +45,9 @@ fn bounded_batch_requires_bounded_effects() {
     let cases = trybuild::TestCases::new();
     cases.compile_fail("tests/bounded_compile_fail/raw_vec_batch.rs");
 }
+
+#[test]
+fn broadcast_observed_requires_bounded_targets() {
+    let cases = trybuild::TestCases::new();
+    cases.compile_fail("tests/broadcast_compile_fail/raw_vec_targets.rs");
+}

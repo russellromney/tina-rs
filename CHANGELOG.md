@@ -4,6 +4,22 @@ This file records completed work.
 
 ## Unreleased
 
+### Bounded Broadcast Fanout
+
+- Added `tina_runtime::broadcast`: `BroadcastTargets`, `BroadcastTracker`,
+  `BroadcastReport`, and `broadcast_observed` for the common
+  room/session/pubsub shape. A service must build a bounded target list before
+  it can create many observed-send effects, so request-sized fanout has to pass
+  through a service-owned cap.
+- Updated `examples/specimen_real_io_chat` to use the broadcast helper. The
+  specimen now distinguishes the client-requested burst from
+  `max_broadcast_targets`; targets over the cap are counted as visible `Full`
+  before they become runtime effects, while admitted targets still report
+  `Accepted` / `Full` / `Closed` through ordinary continuation messages.
+- Documented the bounded-broadcast copied path and the mailbox sizing rule:
+  fanout owners must provision continuation slots for admitted targets, not for
+  arbitrary request size.
+
 ### Service-Owned Bound Rails
 
 - Added `BoundedItems`, `BoundedEffects`, and `bounded_batch` to make

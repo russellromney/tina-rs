@@ -45,6 +45,7 @@ pub mod admission;
 mod affinity;
 pub mod bounded;
 pub mod bridge;
+pub mod broadcast;
 pub mod budget;
 mod budget_adapters;
 mod call;
@@ -177,6 +178,10 @@ pub use crate::persistence::{
 pub use bounded::{
     BoundedEffects, BoundedEffectsError, BoundedItems, BoundedItemsError, ServiceOwnedBoundError,
     assert_service_owned_bound, bounded_batch,
+};
+pub use broadcast::{
+    BroadcastAssertError, BroadcastOutcome, BroadcastRecordError, BroadcastReport, BroadcastTarget,
+    BroadcastTargets, BroadcastTargetsError, BroadcastTracker, broadcast_observed,
 };
 pub use budget::{
     BUDGET_SCHEMA_VERSION, BudgetBuildError, BudgetCap, BudgetConsistencyReport,
