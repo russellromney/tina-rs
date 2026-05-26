@@ -29,7 +29,10 @@ use tina_runtime::sharded::{
     ScatterGatherConfig, ScatterGatherReport, ScatterGatherTargetOutcome, ShardPlacement,
     ShardServiceTable,
 };
-use tina_runtime::{DefaultThreadedMailboxFactory, RuntimeCall, ThreadedMultiShardRuntime};
+use tina_runtime::{
+    BoundedEffects, BoundedItems, DefaultThreadedMailboxFactory, RuntimeCall,
+    ThreadedMultiShardRuntime, bounded_batch,
+};
 
 use crate::{Report, SEED_VALUES, SHARD_RAW_IDS};
 
@@ -132,20 +135,25 @@ impl Isolate for ScatterCoord {
             }
             ScatterCoordMsg::Start => {
                 let bridge = self.bridge.expect("Bind must arrive before Start");
-                let mut effects = Vec::new();
-                self.targets_in_order = self.table.placement().shards().to_vec();
-                for shard in self.targets_in_order.iter().copied() {
-                    self.pending_targets.push(shard);
-                    let address = self
-                        .table
-                        .address_for(shard)
-                        .expect("shard came from placement.shards()");
-                    effects.push(send(
-                        address,
-                        ShardCounterMsg::Get { reply_to: bridge },
-                    ));
-                }
-                batch(effects)
+                let targets = BoundedItems::try_from_iter(
+                    self.config.max_targets,
+                    self.table.placement().shards().iter().copied(),
+                )
+                .expect("placement target list is capped by ScatterGatherConfig");
+                self.targets_in_order = targets.as_slice().to_vec();
+                self.pending_targets = targets.as_slice().to_vec();
+                let effects = BoundedEffects::try_from_iter(
+                    self.config.max_targets,
+                    targets.iter().copied().map(|shard| {
+                        let address = self
+                            .table
+                            .address_for(shard)
+                            .expect("shard came from placement.shards()");
+                        send(address, ShardCounterMsg::Get { reply_to: bridge })
+                    }),
+                )
+                .expect("scatter effects are capped by ScatterGatherConfig");
+                bounded_batch(effects)
             }
             ScatterCoordMsg::Reply(reply) => {
                 let ShardCounterReply { shard, value } = reply;

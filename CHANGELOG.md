@@ -20,6 +20,20 @@ This file records completed work.
   fanout owners must provision continuation slots for admitted targets, not for
   arbitrary request size.
 
+### Service-Owned Bound Rails
+
+- Added `BoundedItems`, `BoundedEffects`, and `bounded_batch` to make
+  request-sized loops pass through an explicit service-owned cap before they
+  become many runtime effects. The helpers reject zero caps, stop at the first
+  over-cap item/effect, and preserve order for admitted work.
+- Added `assert_service_owned_bound(...)` for specimen and system smoke tests:
+  a copied assertion that catches unbounded declarations, missing observations,
+  zero caps, and observed work that exceeds the configured cap.
+- Updated `specimen_dynamic_worker_pool` and
+  `specimen_sharded_fanout_read` to use bounded effect rails and bound
+  assertions, and documented the "what is the max in-flight work, and did the
+  service choose it?" review rule.
+
 ### Unix-Domain Sockets On The Per-Shard I/O Rail
 
 - Moved Unix-domain sockets off their private blocking worker thread and onto the
