@@ -405,7 +405,12 @@ impl<S: Shard + 'static> WebSocketClientManager<S> {
         };
         let stagger = !self.config.connect_policy.happy_eyeballs.delay.is_zero();
         let mut effects: Vec<Effect<Self>> = Vec::new();
-        while let Some(addr) = self.connect.as_mut().and_then(|c| c.take_candidate()) {
+        // Only take a candidate when a connection slot is free, so a popped
+        // candidate is never dropped for want of a slot.
+        while self.idle_slot().is_some() {
+            let Some(addr) = self.connect.as_mut().and_then(|c| c.take_candidate()) else {
+                break;
+            };
             match self.start_attempt(addr, generation) {
                 Some(effect) => effects.push(effect),
                 None => break,
@@ -487,23 +492,22 @@ impl<S: Shard + 'static> WebSocketClientManager<S> {
         match step {
             ConnectStep::Won { losers } => {
                 let winner_slot = self.slot_dialing(addr);
+                let mut effects: Vec<Effect<Self>> = Vec::new();
                 if let Some(slot) = winner_slot {
                     let generation = connect_generation(self.connect.as_ref());
-                    match self.state.install_session(
-                        generation,
-                        slot,
-                        addr,
-                    ) {
+                    match self.state.install_session(generation, slot, addr) {
                         Ok(()) => {
                             self.conn_states[slot] = ConnState::Session { generation };
                         }
                         Err(_) => {
-                            // Could not install (slot full / stale): stop it.
+                            // Could not install (slot full / stale): the
+                            // connection is open, so stop it to release the
+                            // stream rather than leak it.
+                            effects.push(send(self.connections[slot], WebSocketClientMsg::Stop));
                             self.conn_states[slot] = ConnState::Idle;
                         }
                     }
                 }
-                let mut effects: Vec<Effect<Self>> = Vec::new();
                 for loser in losers {
                     let (laddr, ltoken, handle) = loser.into_parts();
                     if let Some(slot) = self.slot_dialing(laddr) {
