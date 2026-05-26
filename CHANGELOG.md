@@ -18,6 +18,36 @@ This file records completed work.
 - Updated `system_live_replay_bugbox` and the user guide to use the overload
   bugbox names when pressure facts are the thing being captured.
 
+### Bounded Broadcast Fanout
+
+- Added `tina_runtime::broadcast`: `BroadcastTargets`, `BroadcastTracker`,
+  `BroadcastReport`, and `broadcast_observed` for the common
+  room/session/pubsub shape. A service must build a bounded target list before
+  it can create many observed-send effects, so request-sized fanout has to pass
+  through a service-owned cap.
+- Updated `examples/specimen_real_io_chat` to use the broadcast helper. The
+  specimen now distinguishes the client-requested burst from
+  `max_broadcast_targets`; targets over the cap are counted as visible `Full`
+  before they become runtime effects, while admitted targets still report
+  `Accepted` / `Full` / `Closed` through ordinary continuation messages.
+- Documented the bounded-broadcast copied path and the mailbox sizing rule:
+  fanout owners must provision continuation slots for admitted targets, not for
+  arbitrary request size.
+
+### Service-Owned Bound Rails
+
+- Added `BoundedItems`, `BoundedEffects`, and `bounded_batch` to make
+  request-sized loops pass through an explicit service-owned cap before they
+  become many runtime effects. The helpers reject zero caps, stop at the first
+  over-cap item/effect, and preserve order for admitted work.
+- Added `assert_service_owned_bound(...)` for specimen and system smoke tests:
+  a copied assertion that catches unbounded declarations, missing observations,
+  zero caps, and observed work that exceeds the configured cap.
+- Updated `specimen_dynamic_worker_pool` and
+  `specimen_sharded_fanout_read` to use bounded effect rails and bound
+  assertions, and documented the "what is the max in-flight work, and did the
+  service choose it?" review rule.
+
 ### Unix-Domain Sockets On The Per-Shard I/O Rail
 
 - Moved Unix-domain sockets off their private blocking worker thread and onto the

@@ -49,7 +49,7 @@ What does **not** count:
 | Connection isolate      | `1 (incoming start) + max_pending_calls + max_pending_observed`. |
 | Store isolate (callee)  | `expected_concurrent_callers + 1`.                                |
 | Worker pool member      | `1` per concurrent job + 1 for the bootstrap message.             |
-| Fanout isolate          | `fanout_width + 1` if it observes every send.                     |
+| Fanout isolate          | `max_broadcast_targets + 1` if it observes every send.            |
 
 The `+1` slots are reserved for the isolate's own outstanding
 continuations — that's the load-bearing part.
@@ -81,12 +81,15 @@ rejection appears.
 
 `examples/specimen_real_io_chat`'s first draft sized its connection mailbox
 at the obvious "one slot per concurrent operation" value. Each connection
-issued a burst of 64 `send_observed(...).then(...)` calls into a fanout.
-The isolate could not absorb 64 reply messages before it could finish
-writing its response, so the fanout reply path saw `MailboxFull`
-rejections in the trace. The fix was to size the connection mailbox at
-*64 + the small inbound traffic budget*, which is exactly the
-"reply slots count against the caller" rule above.
+issued a burst of 64 observed sends into a fanout. The isolate could not
+absorb 64 reply messages before it could finish writing its response, so
+the fanout reply path saw `MailboxFull` rejections in the trace.
+
+The current specimen uses `BroadcastTargets` / `broadcast_observed` and
+sizes the connection mailbox to `max_broadcast_targets + slack`. If a
+request asks for more targets than the service cap, the extra targets are
+counted as visible `Full` before they become effects. Admitted targets still
+produce observed-send replies, so the same capacity rule applies.
 
 ## Why this is the rule
 

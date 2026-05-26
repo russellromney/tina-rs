@@ -232,6 +232,112 @@ Tina should be able to say:
 accepted=12000 full=38000 timeouts=0 exit=clean
 ```
 
+## Request-Sized Loops
+
+The review question for every fanout loop is:
+
+```text
+what is the max in-flight work, and did the service choose it?
+```
+
+This is the bad shape:
+
+```rust
+let effects = request
+    .items
+    .into_iter()
+    .map(|item| call(worker, WorkerMsg::Run(item), timeout).then(Msg::Done))
+    .collect::<Vec<_>>();
+batch(effects)
+```
+
+The request chose how many effects exist.
+
+Use a service-owned wrapper before effects exist:
+
+```rust
+use tina_runtime::{BoundedEffects, BoundedItems, bounded_batch};
+
+let items = match BoundedItems::try_from_iter(self.max_items_per_request, request.items) {
+    Ok(items) => items,
+    Err(_) => return reply(Reply::TooManyItems),
+};
+
+let effects = BoundedEffects::try_from_iter(
+    self.max_items_per_request,
+    items
+        .into_vec()
+        .into_iter()
+        .map(|item| call(worker, WorkerMsg::Run(item), timeout).then(Msg::Done)),
+)
+.expect("items already passed the same service-owned cap");
+
+bounded_batch(effects)
+```
+
+`BoundedItems` and `BoundedEffects` are small rails, not magic. They reject
+zero caps and stop at the first over-cap item/effect. They preserve order.
+Tests can pin the contract with:
+
+```rust
+tina_runtime::assert_service_owned_bound(
+    "orders.batch.items",
+    Some(config.max_items_per_request),
+    Some(report.items_observed),
+)?;
+```
+
+## Bounded Broadcast
+
+When one event goes to many sessions, do not build effects from a raw
+request-sized `Vec`. Build a `BroadcastTargets` first. The service chooses
+`max_targets`, and anything past that cap is refused before it can become
+runtime work.
+
+```rust
+use tina_runtime::{BroadcastTargets, BroadcastTracker, broadcast_observed};
+
+enum RoomMsg {
+    Publish { body: Bytes },
+    Delivered(SessionId, SendOutcome),
+}
+
+struct Room {
+    subscribers: Vec<(SessionId, Address<SessionMsg>)>,
+    max_broadcast_targets: usize,
+    broadcast: Option<BroadcastTracker<SessionId>>,
+}
+
+RoomMsg::Publish { body } => {
+    let targets = match BroadcastTargets::try_from_iter(
+        self.max_broadcast_targets,
+        self.subscribers.iter().map(|(id, addr)| (*id, *addr)),
+    ) {
+        Ok(targets) => targets,
+        Err(_) => return reply_full(),
+    };
+    self.broadcast = Some(targets.tracker());
+    broadcast_observed(
+        targets,
+        |_| SessionMsg::Deliver(body.clone()),
+        RoomMsg::Delivered,
+    )
+}
+
+RoomMsg::Delivered(id, outcome) => {
+    if let Some(report) = self.broadcast.as_mut().unwrap().record(id, outcome).unwrap() {
+        assert!(report.assert_all_accounted_for(report.outcomes().len()).is_ok());
+        // report.accepted(), report.full(), report.closed()
+    }
+    noop()
+}
+```
+
+The helper is intentionally small. It does not own rooms, retries, or
+session cleanup. It gives the service a bounded target list, one ordinary
+continuation per target, and one report that accounts for
+`Accepted` / `Full` / `Closed`.
+
 ## Bounded Pools
 
 When the bounded thing is "borrow one of N resources, do work, give
