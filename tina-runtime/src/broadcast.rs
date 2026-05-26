@@ -3,7 +3,7 @@
 //! These helpers are the copied Tina path for "send this to many sessions" or
 //! "fan this event to many subscribers." The service chooses `max_targets`
 //! before any effects exist, every attempted send goes through
-//! [`send_observed`](crate::send_observed), and the owner receives one ordinary
+//! [`send_observed`], and the owner receives one ordinary
 //! continuation message per target.
 //!
 //! This is deliberately not a room framework. It is the small bounded kernel
