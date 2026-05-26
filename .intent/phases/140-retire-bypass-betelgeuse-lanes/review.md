@@ -35,3 +35,50 @@ Main already has `driver/unix.rs` as a private blocking worker over
 should not keep a hidden worker. Fixed in plan v1: Phase 140 must move Unix
 bind/accept/connect/read/write/close onto a completion-backed rail, adding narrow
 Betelgeuse backend support if needed.
+
+## Implementation 1 — shipped (2026-05-25)
+
+All six core items landed; the proof bar above is met.
+
+### Unix-domain sockets onto the substrate
+
+- `driver/unix.rs` is now `BetelgeuseUnix`: a completion-backed lane sharing the
+  per-shard Betelgeuse loop with TCP/TLS. The `std::os::unix::net` worker thread
+  is gone. Lane discipline matches TCP (accept/read/write lanes, `ResourceBusy`,
+  close-wins, tombstoned shutdown, no Drop walking the shared backend).
+- Added the missing Unix *addressing* to vendored Betelgeuse:
+  `IOSocket::bind_unix` / `connect_unix` (darwin + linux real, simulated
+  `Unsupported`), with the socket-file lifecycle owned in the substrate
+  (stale-unlink before bind; unlink-on-close, socket inodes only). Accept/recv/
+  send/close were already family-agnostic at the fd layer.
+
+### DNS / process / storage held as written-down lanes
+
+- DNS and process stay justified blocking lanes; the storage fallback stays the
+  narrow rename/remove/readdir/metadata worker. Each carries a justification
+  string in the capability report.
+
+### Capability classification + guard
+
+- `RailClass` (completion-backed / inline / poll-backed / fallback-worker /
+  justified-blocking-lane / simulator-scripted / unsupported) + per-rail
+  justification on the capability report. Unix is now completion-backed.
+- `scripts/rail_inventory_guard.sh` + `.intent/runtime-rail-inventory.txt` fail
+  the build (via `make verify`) if a runtime rail adds a worker thread / blocking
+  std socket / blocking std::fs without being inventoried.
+
+### Proof
+
+- Substrate: `vendor-betelgeuse/tests/io.rs` unix round-trip + EOF (both backends).
+- Runtime live: `local_system.rs::unix_live_echo` round-trip + socket-file safety.
+- Pressure / lifecycle / shutdown: `driver::tests::unix_lane::*`.
+- Classification: `capabilities` unit tests + `tests/rail_capability_inventory.rs`.
+- Guard fires: `tests/rail_inventory_guard.rs`.
+- `cargo fmt --all --check`, clippy on betelgeuse + tina-runtime, and the full
+  `tina-runtime` + `tina-sim` suites pass.
+
+### Deliberately retained blocking lanes
+
+DNS resolver, process spawn/wait, and the rename/remove/readdir/metadata storage
+fallback. Each is bounded, inventoried, and classified with a written reason; no
+hidden Unix worker remains.

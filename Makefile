@@ -3,7 +3,7 @@ EXAMPLES_TARGET_DIR ?= $(CURDIR)/target/verify-examples
 
 .PHONY: fmt fmt-check check test loom miri doc clippy portable-runtime-cost \
 	verify verify-examples proof-fast proof-soak proof-bad-peer \
-	proof-replay-regression race-surface-guard
+	proof-replay-regression race-surface-guard rail-inventory-guard
 
 fmt:
 	cargo fmt --all
@@ -28,6 +28,14 @@ loom:
 # structures.
 race-surface-guard:
 	./scripts/race_surface_guard.sh
+
+# Rail-inventory guard: fail if a runtime-owned rail adds a worker thread,
+# blocking std socket, or blocking std::fs work outside the reviewed inventory
+# (.intent/runtime-rail-inventory.txt). Enforces the Phase 140 rule that every
+# rail rides the Betelgeuse substrate or is an inventoried blocking/fallback
+# lane with a written reason.
+rail-inventory-guard:
+	./scripts/rail_inventory_guard.sh
 
 miri:
 	cargo +nightly miri test -p tina-mailbox-spsc --test miri_spsc
@@ -86,7 +94,7 @@ proof-bad-peer:
 proof-replay-regression:
 	cargo test --manifest-path examples/systems/system_live_replay_bugbox/Cargo.toml --test smoke
 
-verify: fmt-check check test loom race-surface-guard doc clippy
+verify: fmt-check check test loom race-surface-guard rail-inventory-guard doc clippy
 	cargo run -p tina-runtime --example portable_runtime_cost | tee /tmp/tina-verify-cost.txt
 	grep -E "cost smoke / local machine / not benchmark" /tmp/tina-verify-cost.txt
 	grep -E "mailbox local push/pop|local send|live ingress|cross-shard send|isolate call|timer|TCP loopback|TLS loopback|file read/write|journal append|bridge call" /tmp/tina-verify-cost.txt

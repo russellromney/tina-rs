@@ -1,15 +1,20 @@
 //! Unix-domain socket lane.
 //!
 //! Tina owns Unix-domain resource identity, lane discipline, and
-//! close/cancel semantics; the OS owns the socket mechanics. On Unix
-//! platforms this lane runs a single worker thread that owns every
-//! `UnixListener` / `UnixStream` as a non-blocking socket and drives a
-//! poll loop: commands arrive over a bounded channel, completions go
-//! back over another. The runtime, not the worker, assigns
-//! [`UnixListenerId`] / [`UnixStreamId`] values, so isolate code never
-//! sees a raw fd.
+//! close/cancel semantics; the substrate owns the socket mechanics. Unix
+//! sockets are sockets, so this lane follows the same rule as TCP/TLS:
+//! it rides the per-shard Betelgeuse completion substrate, on the shard
+//! thread, with no private worker thread and no blocking `std` socket
+//! work. The runtime, not the substrate, assigns [`UnixListenerId`] /
+//! [`UnixStreamId`] values, so isolate code never sees a raw fd.
 //!
-//! On non-Unix platforms there is no worker; every Unix call completes
+//! The narrow Unix-domain addressing the substrate previously lacked
+//! (`bind_unix` / `connect_unix` plus the socket-file lifecycle) was added
+//! directly to Betelgeuse rather than left in a hidden worker. Accept,
+//! read, write, and close already worked at the substrate's family-agnostic
+//! socket layer.
+//!
+//! On non-Unix platforms there is no backend; every Unix call completes
 //! with a typed [`CallError::Unsupported`]. The capability is named, not
 //! cfg-silently dropped.
 //!
@@ -18,7 +23,8 @@
 //! [`CallError::ResourceBusy`]. Close wins over pending work — pending
 //! ops on the closed resource are cancelled (the caller's continuation
 //! does not fire; the runtime records `ResourceClosed`), and closing a
-//! listener removes the underlying socket file.
+//! listener removes the underlying socket file (Betelgeuse owns that
+//! unlink as part of socket-file lifecycle).
 
 use super::*;
 
@@ -26,9 +32,9 @@ use crate::call::{UnixListenerId, UnixStreamId};
 
 /// Driver-side handle for the Unix-domain rail.
 pub(super) enum UnixLane {
-    /// Live OS-backed lane (Unix platforms).
+    /// Live substrate-backed lane (Unix platforms).
     #[cfg(unix)]
-    Live(imp::LiveUnixLane),
+    Live(imp::BetelgeuseUnix),
     /// No live backend on this platform; every call is typed
     /// `Unsupported`.
     #[cfg(not(unix))]
@@ -42,20 +48,22 @@ impl std::fmt::Debug for UnixLane {
 }
 
 impl UnixLane {
-    pub(super) fn new() -> Self {
+    pub(super) fn new(io_loop: IOLoopHandle<Global>) -> Self {
         #[cfg(unix)]
         {
-            Self::Live(imp::LiveUnixLane::new())
+            Self::Live(imp::BetelgeuseUnix::with_io_loop(io_loop))
         }
         #[cfg(not(unix))]
         {
+            let _ = io_loop;
             Self::Unsupported
         }
     }
 
     /// Submits one Unix-domain call. Returns `Some` for a synchronous
-    /// outcome (rejection or unsupported), `None` when the op was handed
-    /// to the worker and will complete on a later `advance`.
+    /// outcome (bind/close, rejection, or unsupported), `None` when the op
+    /// was armed against the substrate and will complete on a later
+    /// `advance`.
     pub(super) fn submit(
         &mut self,
         call_id: CallId,
@@ -113,15 +121,16 @@ impl UnixLane {
         }
     }
 
-    pub(super) fn cancel_pending(&mut self, deadline: Instant) {
+    pub(super) fn cancel_pending(&mut self, deadline: Instant) -> Result<(), DriverShutdownError> {
         #[cfg(unix)]
         {
             let Self::Live(lane) = self;
-            lane.cancel_pending(deadline);
+            lane.cancel_pending(deadline)
         }
         #[cfg(not(unix))]
         {
             let _ = deadline;
+            Ok(())
         }
     }
 
@@ -176,143 +185,96 @@ impl UnixLane {
 
 #[cfg(unix)]
 mod imp {
-    use std::collections::HashSet;
-    use std::io::{ErrorKind, Read, Write};
-    use std::os::unix::fs::FileTypeExt;
-    use std::os::unix::net::{UnixListener, UnixStream};
+    use std::alloc::Global;
+    use std::io::ErrorKind;
     use std::path::PathBuf;
-    use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TryRecvError, sync_channel};
-    use std::thread::{self, JoinHandle};
-    use std::time::{Duration, Instant};
+    use std::time::Instant;
 
-    use super::super::{CallError, CallId, CallInput, CallOutput, DriverCompletion};
+    use betelgeuse::{
+        AcceptCompletion, ConnectCompletion, IO, IOLoop, IOLoopHandle, IOSocket, RecvCompletion,
+        SendCompletion,
+    };
+
+    use super::super::{
+        CallError, CallId, CallInput, CallOutput, DriverCompletion, DriverShutdownError,
+        INITIAL_DRIVER_PENDING_CAPACITY, INITIAL_DRIVER_RESOURCE_CAPACITY,
+    };
     use super::{UnixListenerId, UnixStreamId};
 
-    /// Bounded command queue depth between the driver and the worker.
-    const COMMAND_CAPACITY: usize = 256;
-    /// Poll cadence for in-flight non-blocking ops when no command wakes
-    /// the worker. Bounds read/accept/write latency for local IPC.
-    const POLL_INTERVAL: Duration = Duration::from_millis(1);
-
-    /// Which resource lane a pending op occupies, for `ResourceBusy`.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    enum LaneKey {
-        Accept(u64),
-        Read(u64),
-        Write(u64),
-        // Connect/bind/close are one-shot per call and never reject as busy.
-        OneShot,
-    }
-
-    struct DriverPending {
-        call_id: CallId,
-        lane: LaneKey,
-    }
-
-    enum WorkerCommand {
-        Bind {
-            call_id: CallId,
-            listener_id: u64,
-            path: PathBuf,
-        },
-        Connect {
-            call_id: CallId,
-            stream_id: u64,
-            path: PathBuf,
-        },
-        Accept {
-            call_id: CallId,
-            listener_id: u64,
-            new_stream_id: u64,
-        },
-        Read {
-            call_id: CallId,
-            stream_id: u64,
-            max_len: usize,
-        },
-        Write {
-            call_id: CallId,
-            stream_id: u64,
-            bytes: Vec<u8>,
-        },
-        CloseListener {
-            call_id: CallId,
-            listener_id: u64,
-        },
-        CloseStream {
-            call_id: CallId,
-            stream_id: u64,
-        },
-        CancelOp {
-            call_id: CallId,
-        },
-    }
-
-    struct WorkerCompletion {
-        call_id: CallId,
-        result: CallOutput,
-    }
-
-    /// Driver-side handle. Owns id assignment, the open-set used for
-    /// synchronous `InvalidResource` / `ResourceBusy` validation, and the
-    /// channels to the worker.
-    pub(crate) struct LiveUnixLane {
+    /// Runtime-owned Betelgeuse Unix-domain state.
+    ///
+    /// Shares the per-shard Betelgeuse loop with the TCP/TLS/storage lanes —
+    /// a cloned handle, not a second socket stack. Owns all real Unix socket
+    /// state; isolate code only ever sees the runtime's opaque
+    /// [`UnixListenerId`] / [`UnixStreamId`] values.
+    pub(crate) struct BetelgeuseUnix {
+        io_loop: IOLoopHandle<Global>,
         next_listener_id: u64,
         next_stream_id: u64,
-        open_listeners: HashSet<u64>,
-        open_streams: HashSet<u64>,
-        pending: Vec<DriverPending>,
+        listeners: Vec<ListenerEntry>,
+        streams: Vec<StreamEntry>,
+        pending: Vec<PendingOperation>,
+        /// Calls cancelled by resource close. Runtime drains and traces them.
         cancelled_by_close: Vec<CallId>,
-        commands: Option<SyncSender<WorkerCommand>>,
-        completions: Receiver<WorkerCompletion>,
-        handle: Option<JoinHandle<()>>,
     }
 
-    impl LiveUnixLane {
-        pub(crate) fn new() -> Self {
-            let (command_tx, command_rx) = sync_channel(COMMAND_CAPACITY);
-            let (completion_tx, completion_rx) = sync_channel(COMMAND_CAPACITY.saturating_add(1));
-            let handle = thread::spawn(move || worker_loop(command_rx, completion_tx));
+    struct ListenerEntry {
+        id: UnixListenerId,
+        socket: Box<dyn IOSocket>,
+    }
+
+    struct StreamEntry {
+        id: UnixStreamId,
+        socket: Box<dyn IOSocket>,
+    }
+
+    /// One async operation in flight against Betelgeuse.
+    ///
+    /// The completion slot is heap-allocated so Betelgeuse's stored pointer
+    /// to the inner `CompletionInner` stays valid while the
+    /// `PendingOperation` is moved through the `pending` vector.
+    struct PendingOperation {
+        call_id: CallId,
+        kind: PendingKind,
+        lane: PendingLane,
+        /// User explicitly cancelled this op via `cancel(call_id)`, or close
+        /// won over it. Once set, the op no longer counts as a pending driver
+        /// call: the runtime stopped waiting for its result.
+        user_cancelled: bool,
+        /// Shutdown drain blanket-marked this op for backend pointer release.
+        /// Stays counted as a pending driver call so the terminal report can
+        /// name work the lane could not finish in budget.
+        shutdown_marked: bool,
+    }
+
+    enum PendingKind {
+        Accept(Box<AcceptCompletion>),
+        Connect {
+            completion: Box<ConnectCompletion>,
+            socket: Option<Box<dyn IOSocket>>,
+        },
+        Read(Box<RecvCompletion>),
+        Write(Box<SendCompletion>),
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum PendingLane {
+        ListenerAccept(UnixListenerId),
+        Connect(CallId),
+        StreamRead(UnixStreamId),
+        StreamWrite(UnixStreamId),
+    }
+
+    impl BetelgeuseUnix {
+        pub(crate) fn with_io_loop(io_loop: IOLoopHandle<Global>) -> Self {
             Self {
+                io_loop,
                 next_listener_id: 1,
                 next_stream_id: 1,
-                open_listeners: HashSet::new(),
-                open_streams: HashSet::new(),
-                pending: Vec::new(),
+                listeners: Vec::with_capacity(INITIAL_DRIVER_RESOURCE_CAPACITY),
+                streams: Vec::with_capacity(INITIAL_DRIVER_RESOURCE_CAPACITY),
+                pending: Vec::with_capacity(INITIAL_DRIVER_PENDING_CAPACITY),
                 cancelled_by_close: Vec::new(),
-                commands: Some(command_tx),
-                completions: completion_rx,
-                handle: Some(handle),
-            }
-        }
-
-        fn lane_busy(&self, lane: LaneKey) -> bool {
-            self.pending.iter().any(|pending| pending.lane == lane)
-        }
-
-        fn send_pending(
-            &mut self,
-            pending: DriverPending,
-            command: WorkerCommand,
-        ) -> Option<DriverCompletion> {
-            let call_id = pending.call_id;
-            self.pending.push(pending);
-            let Some(sender) = &self.commands else {
-                self.pending.retain(|pending| pending.call_id != call_id);
-                return Some(DriverCompletion {
-                    call_id,
-                    result: CallOutput::Failed(CallError::Io),
-                });
-            };
-            match sender.try_send(command) {
-                Ok(()) => None,
-                Err(_) => {
-                    self.pending.retain(|pending| pending.call_id != call_id);
-                    Some(DriverCompletion {
-                        call_id,
-                        result: CallOutput::Failed(CallError::Io),
-                    })
-                }
             }
         }
 
@@ -322,129 +284,66 @@ mod imp {
             request: CallInput,
         ) -> Option<DriverCompletion> {
             match request {
-                CallInput::UnixBind { path } => {
-                    let listener_id = self.next_listener_id;
-                    self.next_listener_id += 1;
-                    self.send_pending(
-                        DriverPending {
-                            call_id,
-                            lane: LaneKey::OneShot,
-                        },
-                        WorkerCommand::Bind {
-                            call_id,
-                            listener_id,
-                            path,
-                        },
-                    )
-                }
+                CallInput::UnixBind { path } => Some(DriverCompletion {
+                    call_id,
+                    result: self.do_bind(path),
+                }),
+                CallInput::UnixListenerClose { listener } => Some(DriverCompletion {
+                    call_id,
+                    result: self.do_listener_close(listener),
+                }),
+                CallInput::UnixStreamClose { stream } => Some(DriverCompletion {
+                    call_id,
+                    result: self.do_stream_close(stream),
+                }),
                 CallInput::UnixConnect { path } => {
-                    let stream_id = self.next_stream_id;
-                    self.next_stream_id += 1;
-                    self.send_pending(
-                        DriverPending {
-                            call_id,
-                            lane: LaneKey::OneShot,
-                        },
-                        WorkerCommand::Connect {
-                            call_id,
-                            stream_id,
-                            path,
-                        },
-                    )
+                    let lane = PendingLane::Connect(call_id);
+                    match self.arm_connect(&path) {
+                        Ok(kind) => {
+                            self.push_pending(call_id, kind, lane);
+                            None
+                        }
+                        Err(result) => Some(DriverCompletion { call_id, result }),
+                    }
                 }
                 CallInput::UnixAccept { listener } => {
-                    if !self.open_listeners.contains(&listener.get()) {
-                        return self.fail(call_id, CallError::InvalidResource);
+                    let lane = PendingLane::ListenerAccept(listener);
+                    if self.lane_has_pending(lane) {
+                        return Some(self.fail(call_id, CallError::ResourceBusy));
                     }
-                    let lane = LaneKey::Accept(listener.get());
-                    if self.lane_busy(lane) {
-                        return self.fail(call_id, CallError::ResourceBusy);
+                    match self.arm_accept(listener) {
+                        Ok(kind) => {
+                            self.push_pending(call_id, kind, lane);
+                            None
+                        }
+                        Err(result) => Some(DriverCompletion { call_id, result }),
                     }
-                    let new_stream_id = self.next_stream_id;
-                    self.next_stream_id += 1;
-                    self.send_pending(
-                        DriverPending { call_id, lane },
-                        WorkerCommand::Accept {
-                            call_id,
-                            listener_id: listener.get(),
-                            new_stream_id,
-                        },
-                    )
                 }
                 CallInput::UnixRead { stream, max_len } => {
-                    if !self.open_streams.contains(&stream.get()) {
-                        return self.fail(call_id, CallError::InvalidResource);
+                    let lane = PendingLane::StreamRead(stream);
+                    if self.lane_has_pending(lane) {
+                        return Some(self.fail(call_id, CallError::ResourceBusy));
                     }
-                    let lane = LaneKey::Read(stream.get());
-                    if self.lane_busy(lane) {
-                        return self.fail(call_id, CallError::ResourceBusy);
+                    match self.arm_read(stream, max_len) {
+                        Ok(kind) => {
+                            self.push_pending(call_id, kind, lane);
+                            None
+                        }
+                        Err(result) => Some(DriverCompletion { call_id, result }),
                     }
-                    self.send_pending(
-                        DriverPending { call_id, lane },
-                        WorkerCommand::Read {
-                            call_id,
-                            stream_id: stream.get(),
-                            max_len,
-                        },
-                    )
                 }
                 CallInput::UnixWrite { stream, bytes } => {
-                    if !self.open_streams.contains(&stream.get()) {
-                        return self.fail(call_id, CallError::InvalidResource);
+                    let lane = PendingLane::StreamWrite(stream);
+                    if self.lane_has_pending(lane) {
+                        return Some(self.fail(call_id, CallError::ResourceBusy));
                     }
-                    let lane = LaneKey::Write(stream.get());
-                    if self.lane_busy(lane) {
-                        return self.fail(call_id, CallError::ResourceBusy);
+                    match self.arm_write(stream, bytes) {
+                        Ok(kind) => {
+                            self.push_pending(call_id, kind, lane);
+                            None
+                        }
+                        Err(result) => Some(DriverCompletion { call_id, result }),
                     }
-                    self.send_pending(
-                        DriverPending { call_id, lane },
-                        WorkerCommand::Write {
-                            call_id,
-                            stream_id: stream.get(),
-                            bytes,
-                        },
-                    )
-                }
-                CallInput::UnixListenerClose { listener } => {
-                    if !self.open_listeners.contains(&listener.get()) {
-                        return self.fail(call_id, CallError::InvalidResource);
-                    }
-                    let result = self.send_pending(
-                        DriverPending {
-                            call_id,
-                            lane: LaneKey::OneShot,
-                        },
-                        WorkerCommand::CloseListener {
-                            call_id,
-                            listener_id: listener.get(),
-                        },
-                    );
-                    if result.is_none() {
-                        self.open_listeners.remove(&listener.get());
-                        self.cancel_lane_ops(LaneKey::Accept(listener.get()));
-                    }
-                    result
-                }
-                CallInput::UnixStreamClose { stream } => {
-                    if !self.open_streams.contains(&stream.get()) {
-                        return self.fail(call_id, CallError::InvalidResource);
-                    }
-                    let result = self.send_pending(
-                        DriverPending {
-                            call_id,
-                            lane: LaneKey::OneShot,
-                        },
-                        WorkerCommand::CloseStream {
-                            call_id,
-                            stream_id: stream.get(),
-                        },
-                    );
-                    if result.is_none() {
-                        self.open_streams.remove(&stream.get());
-                        self.cancel_lane_ops(LaneKey::Read(stream.get()));
-                        self.cancel_lane_ops(LaneKey::Write(stream.get()));
-                    }
-                    result
                 }
                 other => {
                     // The dispatcher only routes Unix variants here.
@@ -456,88 +355,74 @@ mod imp {
             }
         }
 
-        fn fail(&self, call_id: CallId, error: CallError) -> Option<DriverCompletion> {
-            Some(DriverCompletion {
+        fn fail(&self, call_id: CallId, error: CallError) -> DriverCompletion {
+            DriverCompletion {
                 call_id,
                 result: CallOutput::Failed(error),
-            })
-        }
-
-        /// Cancels pending ops on a resource lane that is being closed.
-        /// Their continuations must not fire; the runtime records
-        /// `ResourceClosed` from `take_cancelled_by_close`.
-        fn cancel_lane_ops(&mut self, lane: LaneKey) {
-            let mut still = Vec::with_capacity(self.pending.len());
-            for pending in std::mem::take(&mut self.pending) {
-                if pending.lane == lane {
-                    self.cancelled_by_close.push(pending.call_id);
-                    if let Some(sender) = &self.commands {
-                        let _ = sender.try_send(WorkerCommand::CancelOp {
-                            call_id: pending.call_id,
-                        });
-                    }
-                } else {
-                    still.push(pending);
-                }
-            }
-            self.pending = still;
-        }
-
-        pub(crate) fn advance(&mut self, completed: &mut Vec<DriverCompletion>) {
-            loop {
-                match self.completions.try_recv() {
-                    Ok(completion) => self.finish(completion, completed),
-                    Err(TryRecvError::Empty) => break,
-                    Err(TryRecvError::Disconnected) => {
-                        self.commands = None;
-                        break;
-                    }
-                }
             }
         }
 
-        fn finish(&mut self, completion: WorkerCompletion, completed: &mut Vec<DriverCompletion>) {
-            let Some(index) = self
-                .pending
-                .iter()
-                .position(|pending| pending.call_id == completion.call_id)
-            else {
-                // Op was cancelled (per-call or by close); drop the result.
-                return;
-            };
-            self.pending.remove(index);
-            // Maintain the open-set from successful create completions.
-            match &completion.result {
-                CallOutput::UnixBound { listener, .. } => {
-                    self.open_listeners.insert(listener.get());
-                }
-                CallOutput::UnixAccepted { stream } | CallOutput::UnixConnected { stream } => {
-                    self.open_streams.insert(stream.get());
-                }
-                _ => {}
-            }
-            completed.push(DriverCompletion {
-                call_id: completion.call_id,
-                result: completion.result,
+        fn push_pending(&mut self, call_id: CallId, kind: PendingKind, lane: PendingLane) {
+            self.pending.push(PendingOperation {
+                call_id,
+                kind,
+                lane,
+                user_cancelled: false,
+                shutdown_marked: false,
             });
         }
 
+        fn lane_has_pending(&self, lane: PendingLane) -> bool {
+            self.pending.iter().any(|op| op.lane == lane)
+        }
+
+        pub(crate) fn advance(&mut self, completed: &mut Vec<DriverCompletion>) {
+            // One substrate tick. Errors here are non-fatal: pending ops still
+            // hold their slots and will be checked anyway.
+            let _ = self.io_loop.step();
+
+            // Drain in submission order so completion ordering is stable
+            // relative to submission ordering whenever Betelgeuse permits it.
+            let mut index = 0;
+            while index < self.pending.len() {
+                let mut op = self.pending.remove(index);
+                if op.user_cancelled || op.shutdown_marked {
+                    if op.kind.has_result() {
+                        continue;
+                    }
+                    self.pending.insert(index, op);
+                    index += 1;
+                    continue;
+                }
+
+                match self.try_complete(&mut op) {
+                    Some(result) => completed.push(DriverCompletion {
+                        call_id: op.call_id,
+                        result,
+                    }),
+                    None => {
+                        self.pending.insert(index, op);
+                        index += 1;
+                    }
+                }
+            }
+        }
+
         pub(crate) fn has_pending(&self) -> bool {
-            !self.pending.is_empty()
+            self.pending
+                .iter()
+                .any(|op| !op.user_cancelled && !op.shutdown_marked)
         }
 
         pub(crate) fn cancel(&mut self, call_id: CallId) -> bool {
             let Some(index) = self
                 .pending
                 .iter()
-                .position(|pending| pending.call_id == call_id)
+                .position(|op| op.call_id == call_id && !op.user_cancelled)
             else {
                 return false;
             };
-            self.pending.remove(index);
-            if let Some(sender) = &self.commands {
-                let _ = sender.try_send(WorkerCommand::CancelOp { call_id });
-            }
+            self.pending[index].user_cancelled = true;
             true
         }
 
@@ -545,385 +430,295 @@ mod imp {
             std::mem::take(&mut self.cancelled_by_close)
         }
 
-        pub(crate) fn cancel_pending(&mut self, deadline: Instant) {
-            // Drop the command sender so the worker exits once it returns
-            // from its current poll tick; drain completions for the budget.
-            self.commands = None;
-            let mut sink = Vec::new();
-            loop {
-                self.advance(&mut sink);
-                if self.pending.is_empty() || Instant::now() >= deadline {
-                    break;
-                }
-                thread::sleep(Duration::from_millis(1));
+        /// Cancels pending Unix operations during runtime shutdown.
+        ///
+        /// Mirrors the TCP lane: marks every pending op `shutdown_marked`
+        /// (so stuck work surfaces in `pending_call_count`), asks the shared
+        /// loop to release backend-owned slots, closes owned resources, and
+        /// drains within the budget. Because the loop is shared with the TCP
+        /// lane that performs the final whole-loop release check, this lane
+        /// must release its own boxes before that check runs.
+        pub(crate) fn cancel_pending(
+            &mut self,
+            deadline: Instant,
+        ) -> Result<(), DriverShutdownError> {
+            for op in &mut self.pending {
+                op.shutdown_marked = true;
             }
-            sink.clear();
-            if self.handle.as_ref().is_some_and(JoinHandle::is_finished) {
-                if let Some(handle) = self.handle.take() {
-                    let _ = handle.join();
+            let cancel_result = self
+                .io_loop
+                .cancel_pending_completions()
+                .map_err(|_| DriverShutdownError::BackendStillOwnsCompletions);
+            self.close_all_resources();
+            self.drain_marked_pending_for_shutdown(deadline);
+            if cancel_result.is_err() || !self.pending.is_empty() {
+                return Err(DriverShutdownError::BackendStillOwnsCompletions);
+            }
+            Ok(())
+        }
+
+        fn drain_marked_pending_for_shutdown(&mut self, deadline: Instant) {
+            // Step the shared loop until either all pending entries drain or
+            // the per-shard shutdown budget elapses. Each step gives the
+            // backend a chance to release ownership of completion slots.
+            loop {
+                if self.pending.is_empty() || Instant::now() >= deadline {
+                    return;
                 }
+                let _ = self.io_loop.step();
+                let mut index = 0;
+                while index < self.pending.len() {
+                    if self.pending[index].kind.has_result() {
+                        self.pending.remove(index);
+                    } else {
+                        index += 1;
+                    }
+                }
+            }
+        }
+
+        fn close_all_resources(&mut self) {
+            for entry in std::mem::take(&mut self.listeners) {
+                entry.socket.close();
+            }
+            for entry in std::mem::take(&mut self.streams) {
+                entry.socket.close();
             }
         }
 
         pub(crate) fn listener_count(&self) -> usize {
-            self.open_listeners.len()
+            self.listeners.len()
         }
 
         pub(crate) fn stream_count(&self) -> usize {
-            self.open_streams.len()
+            self.streams.len()
         }
 
         pub(crate) fn pending_call_count(&self) -> usize {
-            self.pending.len()
+            // Physical entries the runtime still waits on. User-cancelled work
+            // (per-call cancel or close-win) drops out; shutdown-stuck work
+            // stays counted so the terminal report names it.
+            self.pending.iter().filter(|op| !op.user_cancelled).count()
         }
-    }
 
-    impl Drop for LiveUnixLane {
-        fn drop(&mut self) {
-            self.cancel_pending(Instant::now());
+        fn try_complete(&mut self, op: &mut PendingOperation) -> Option<CallOutput> {
+            match &mut op.kind {
+                PendingKind::Accept(completion) => {
+                    if !completion.has_result() {
+                        return None;
+                    }
+                    let result = completion
+                        .take_result()
+                        .expect("accept completion advertised a result");
+                    match result {
+                        Ok(socket) => {
+                            let stream_id = UnixStreamId::new(self.next_stream_id);
+                            self.next_stream_id += 1;
+                            self.streams.push(StreamEntry {
+                                id: stream_id,
+                                socket,
+                            });
+                            Some(CallOutput::UnixAccepted { stream: stream_id })
+                        }
+                        Err(_) => Some(CallOutput::Failed(CallError::Io)),
+                    }
+                }
+                PendingKind::Connect { completion, socket } => {
+                    if !completion.has_result() {
+                        return None;
+                    }
+                    let result = completion
+                        .take_result()
+                        .expect("connect completion advertised a result");
+                    match result {
+                        Ok(()) => {
+                            let socket = socket.take().expect("connected socket available");
+                            let stream_id = UnixStreamId::new(self.next_stream_id);
+                            self.next_stream_id += 1;
+                            self.streams.push(StreamEntry {
+                                id: stream_id,
+                                socket,
+                            });
+                            Some(CallOutput::UnixConnected { stream: stream_id })
+                        }
+                        Err(error) if error.kind() == ErrorKind::NotFound => {
+                            Some(CallOutput::Failed(CallError::NotFound))
+                        }
+                        Err(_) => Some(CallOutput::Failed(CallError::Io)),
+                    }
+                }
+                PendingKind::Read(completion) => {
+                    if !completion.has_result() {
+                        return None;
+                    }
+                    let result = completion
+                        .take_result()
+                        .expect("recv completion advertised a result");
+                    match result {
+                        Ok(bytes) => Some(CallOutput::UnixRead { bytes }),
+                        Err(_) => Some(CallOutput::Failed(CallError::Io)),
+                    }
+                }
+                PendingKind::Write(completion) => {
+                    if !completion.has_result() {
+                        return None;
+                    }
+                    let result = completion
+                        .take_result()
+                        .expect("send completion advertised a result");
+                    match result {
+                        Ok(count) => Some(CallOutput::UnixWrote { count }),
+                        Err(_) => Some(CallOutput::Failed(CallError::Io)),
+                    }
+                }
+            }
         }
-    }
 
-    // ---- Worker thread -----------------------------------------------------
+        fn do_bind(&mut self, path: PathBuf) -> CallOutput {
+            let socket = match self.io_loop.socket() {
+                Ok(socket) => socket,
+                Err(_) => return CallOutput::Failed(CallError::Io),
+            };
+            if socket.bind_unix(&path).is_err() {
+                return CallOutput::Failed(CallError::Io);
+            }
+            let id = UnixListenerId::new(self.next_listener_id);
+            self.next_listener_id += 1;
+            self.listeners.push(ListenerEntry { id, socket });
+            CallOutput::UnixBound { listener: id, path }
+        }
 
-    struct Worker {
-        listeners: Vec<(u64, UnixListener, PathBuf)>,
-        streams: Vec<(u64, UnixStream)>,
-        pending: Vec<WorkerPending>,
-        completions: SyncSender<WorkerCompletion>,
-    }
+        fn do_listener_close(&mut self, listener: UnixListenerId) -> CallOutput {
+            // Close wins: cancel any pending accept on this listener.
+            for op in self.pending.iter_mut() {
+                if matches!(op.lane, PendingLane::ListenerAccept(l) if l == listener)
+                    && !op.user_cancelled
+                {
+                    op.user_cancelled = true;
+                    self.cancelled_by_close.push(op.call_id);
+                }
+            }
+            match self.listeners.iter().position(|entry| entry.id == listener) {
+                Some(index) => {
+                    let entry = self.listeners.remove(index);
+                    // Betelgeuse unlinks the listener's socket file on close.
+                    entry.socket.close();
+                    CallOutput::UnixListenerClosed
+                }
+                None => CallOutput::Failed(CallError::InvalidResource),
+            }
+        }
 
-    enum WorkerOp {
-        Accept {
-            listener_id: u64,
-            new_stream_id: u64,
-        },
-        Read {
-            stream_id: u64,
+        fn do_stream_close(&mut self, stream: UnixStreamId) -> CallOutput {
+            // Close wins: cancel any pending read or write on this stream.
+            for op in self.pending.iter_mut() {
+                let on_this_stream = match op.lane {
+                    PendingLane::StreamRead(s) | PendingLane::StreamWrite(s) => s == stream,
+                    _ => false,
+                };
+                if on_this_stream && !op.user_cancelled {
+                    op.user_cancelled = true;
+                    self.cancelled_by_close.push(op.call_id);
+                }
+            }
+            match self.streams.iter().position(|entry| entry.id == stream) {
+                Some(index) => {
+                    let entry = self.streams.remove(index);
+                    entry.socket.close();
+                    CallOutput::UnixStreamClosed
+                }
+                None => CallOutput::Failed(CallError::InvalidResource),
+            }
+        }
+
+        fn arm_connect(&mut self, path: &std::path::Path) -> Result<PendingKind, CallOutput> {
+            let socket = self
+                .io_loop
+                .socket()
+                .map_err(|_| CallOutput::Failed(CallError::Io))?;
+            let mut completion = Box::new(ConnectCompletion::new());
+            if socket.connect_unix(&mut completion, path).is_err() {
+                return Err(CallOutput::Failed(CallError::Io));
+            }
+            Ok(PendingKind::Connect {
+                completion,
+                socket: Some(socket),
+            })
+        }
+
+        fn arm_accept(&mut self, listener: UnixListenerId) -> Result<PendingKind, CallOutput> {
+            let entry = self
+                .listeners
+                .iter()
+                .find(|entry| entry.id == listener)
+                .ok_or(CallOutput::Failed(CallError::InvalidResource))?;
+            let mut completion = Box::new(AcceptCompletion::new());
+            if entry.socket.accept(&mut completion).is_err() {
+                return Err(CallOutput::Failed(CallError::Io));
+            }
+            Ok(PendingKind::Accept(completion))
+        }
+
+        fn arm_read(
+            &mut self,
+            stream: UnixStreamId,
             max_len: usize,
-        },
-        Write {
-            stream_id: u64,
+        ) -> Result<PendingKind, CallOutput> {
+            let entry = self
+                .streams
+                .iter()
+                .find(|entry| entry.id == stream)
+                .ok_or(CallOutput::Failed(CallError::InvalidResource))?;
+            let mut completion = Box::new(RecvCompletion::new());
+            if entry.socket.recv(&mut completion, max_len).is_err() {
+                return Err(CallOutput::Failed(CallError::Io));
+            }
+            Ok(PendingKind::Read(completion))
+        }
+
+        fn arm_write(
+            &mut self,
+            stream: UnixStreamId,
             bytes: Vec<u8>,
-            written: usize,
-        },
+        ) -> Result<PendingKind, CallOutput> {
+            let entry = self
+                .streams
+                .iter()
+                .find(|entry| entry.id == stream)
+                .ok_or(CallOutput::Failed(CallError::InvalidResource))?;
+            let mut completion = Box::new(SendCompletion::new());
+            if entry.socket.send(&mut completion, bytes).is_err() {
+                return Err(CallOutput::Failed(CallError::Io));
+            }
+            Ok(PendingKind::Write(completion))
+        }
     }
 
-    struct WorkerPending {
-        call_id: CallId,
-        op: WorkerOp,
-    }
-
-    fn worker_loop(commands: Receiver<WorkerCommand>, completions: SyncSender<WorkerCompletion>) {
-        let mut worker = Worker {
-            listeners: Vec::new(),
-            streams: Vec::new(),
-            pending: Vec::new(),
-            completions,
-        };
-        loop {
-            // Drain all queued commands first.
-            let mut disconnected = false;
-            loop {
-                match commands.try_recv() {
-                    Ok(command) => {
-                        if worker.handle(command) {
-                            return;
-                        }
-                    }
-                    Err(TryRecvError::Empty) => break,
-                    Err(TryRecvError::Disconnected) => {
-                        disconnected = true;
-                        break;
-                    }
-                }
-            }
-
-            let progressed = worker.poll_pending();
-
-            if disconnected {
-                // No more commands will arrive. Make one final poll pass so
-                // already-accepted reads/writes can drain, then exit when
-                // nothing is left to do.
-                if worker.pending.is_empty() || !progressed {
-                    return;
-                }
-                continue;
-            }
-
-            if progressed {
-                continue;
-            }
-
-            // Nothing to do this tick: block for a new command, waking on
-            // the poll interval to retry in-flight non-blocking ops.
-            match commands.recv_timeout(POLL_INTERVAL) {
-                Ok(command) => {
-                    if worker.handle(command) {
-                        return;
-                    }
-                }
-                Err(RecvTimeoutError::Timeout) => {}
-                Err(RecvTimeoutError::Disconnected) => {
-                    if worker.pending.is_empty() {
-                        return;
-                    }
-                }
+    impl PendingKind {
+        fn has_result(&self) -> bool {
+            match self {
+                Self::Accept(completion) => completion.has_result(),
+                Self::Connect { completion, .. } => completion.has_result(),
+                Self::Read(completion) => completion.has_result(),
+                Self::Write(completion) => completion.has_result(),
             }
         }
     }
 
-    impl Worker {
-        /// Handles one command. Returns `true` if the worker should exit.
-        fn handle(&mut self, command: WorkerCommand) -> bool {
-            match command {
-                WorkerCommand::Bind {
-                    call_id,
-                    listener_id,
-                    path,
-                } => {
-                    let result = self.do_bind(listener_id, path);
-                    self.complete(call_id, result)
-                }
-                WorkerCommand::Connect {
-                    call_id,
-                    stream_id,
-                    path,
-                } => {
-                    let result = self.do_connect(stream_id, path);
-                    self.complete(call_id, result)
-                }
-                WorkerCommand::Accept {
-                    call_id,
-                    listener_id,
-                    new_stream_id,
-                } => {
-                    self.pending.push(WorkerPending {
-                        call_id,
-                        op: WorkerOp::Accept {
-                            listener_id,
-                            new_stream_id,
-                        },
-                    });
-                    false
-                }
-                WorkerCommand::Read {
-                    call_id,
-                    stream_id,
-                    max_len,
-                } => {
-                    self.pending.push(WorkerPending {
-                        call_id,
-                        op: WorkerOp::Read { stream_id, max_len },
-                    });
-                    false
-                }
-                WorkerCommand::Write {
-                    call_id,
-                    stream_id,
-                    bytes,
-                } => {
-                    self.pending.push(WorkerPending {
-                        call_id,
-                        op: WorkerOp::Write {
-                            stream_id,
-                            bytes,
-                            written: 0,
-                        },
-                    });
-                    false
-                }
-                WorkerCommand::CloseListener {
-                    call_id,
-                    listener_id,
-                } => {
-                    if let Some(index) = self
-                        .listeners
-                        .iter()
-                        .position(|(id, _, _)| *id == listener_id)
-                    {
-                        let (_, listener, path) = self.listeners.remove(index);
-                        drop(listener);
-                        // Remove the socket file the listener owned, unless
-                        // user code replaced the path while it was open.
-                        let _ = remove_socket_file(&path);
-                    }
-                    self.complete(call_id, CallOutput::UnixListenerClosed)
-                }
-                WorkerCommand::CloseStream { call_id, stream_id } => {
-                    if let Some(index) = self.streams.iter().position(|(id, _)| *id == stream_id) {
-                        self.streams.remove(index);
-                    }
-                    self.complete(call_id, CallOutput::UnixStreamClosed)
-                }
-                WorkerCommand::CancelOp { call_id } => {
-                    self.pending.retain(|pending| pending.call_id != call_id);
-                    false
-                }
-            }
-        }
+    // No `Drop` impl on purpose: the Unix lane shares its Betelgeuse loop
+    // with the TCP lane, and `cancel_pending_completions` is a whole-loop
+    // operation only safe before any lane has dropped (see the TLS lane's
+    // note). On a bare runtime drop the lane's boxes and io_loop handle
+    // simply fall; the backend is torn down without dereferencing them.
 
-        fn do_bind(&mut self, listener_id: u64, path: PathBuf) -> CallOutput {
-            // Best-effort: clear a stale socket file so a re-bind at the
-            // same path after an unclean exit succeeds. Never remove a
-            // regular file or symlink at a user-supplied path.
-            let _ = remove_socket_file(&path);
-            match UnixListener::bind(&path) {
-                Ok(listener) => {
-                    if listener.set_nonblocking(true).is_err() {
-                        return CallOutput::Failed(CallError::Io);
-                    }
-                    self.listeners.push((listener_id, listener, path.clone()));
-                    CallOutput::UnixBound {
-                        listener: UnixListenerId::new(listener_id),
-                        path,
-                    }
-                }
-                Err(_) => CallOutput::Failed(CallError::Io),
-            }
-        }
-
-        fn do_connect(&mut self, stream_id: u64, path: PathBuf) -> CallOutput {
-            match UnixStream::connect(&path) {
-                Ok(stream) => {
-                    if stream.set_nonblocking(true).is_err() {
-                        return CallOutput::Failed(CallError::Io);
-                    }
-                    self.streams.push((stream_id, stream));
-                    CallOutput::UnixConnected {
-                        stream: UnixStreamId::new(stream_id),
-                    }
-                }
-                Err(error) if error.kind() == ErrorKind::NotFound => {
-                    CallOutput::Failed(CallError::NotFound)
-                }
-                Err(_) => CallOutput::Failed(CallError::Io),
-            }
-        }
-
-        /// Tries every pending op once. Returns whether any op completed
-        /// (so the loop polls again immediately instead of sleeping).
-        fn poll_pending(&mut self) -> bool {
-            let mut completed_any = false;
-            let mut index = 0;
-            while index < self.pending.len() {
-                let outcome = self.try_op(index);
-                match outcome {
-                    OpOutcome::Pending => index += 1,
-                    OpOutcome::Done(result) => {
-                        let pending = self.pending.remove(index);
-                        completed_any = true;
-                        if self.complete(pending.call_id, result) {
-                            // Completion channel is gone; nothing more to do.
-                            return completed_any;
-                        }
-                    }
-                }
-            }
-            completed_any
-        }
-
-        fn try_op(&mut self, index: usize) -> OpOutcome {
-            match &mut self.pending[index].op {
-                WorkerOp::Accept {
-                    listener_id,
-                    new_stream_id,
-                } => {
-                    let listener_id = *listener_id;
-                    let new_stream_id = *new_stream_id;
-                    let Some((_, listener, _)) =
-                        self.listeners.iter().find(|(id, _, _)| *id == listener_id)
-                    else {
-                        return OpOutcome::Done(CallOutput::Failed(CallError::InvalidResource));
-                    };
-                    match listener.accept() {
-                        Ok((stream, _addr)) => {
-                            if stream.set_nonblocking(true).is_err() {
-                                return OpOutcome::Done(CallOutput::Failed(CallError::Io));
-                            }
-                            self.streams.push((new_stream_id, stream));
-                            OpOutcome::Done(CallOutput::UnixAccepted {
-                                stream: UnixStreamId::new(new_stream_id),
-                            })
-                        }
-                        Err(error) if error.kind() == ErrorKind::WouldBlock => OpOutcome::Pending,
-                        Err(_) => OpOutcome::Done(CallOutput::Failed(CallError::Io)),
-                    }
-                }
-                WorkerOp::Read { stream_id, max_len } => {
-                    let stream_id = *stream_id;
-                    let max_len = *max_len;
-                    let Some((_, stream)) =
-                        self.streams.iter_mut().find(|(id, _)| *id == stream_id)
-                    else {
-                        return OpOutcome::Done(CallOutput::Failed(CallError::InvalidResource));
-                    };
-                    let mut buffer = vec![0u8; max_len];
-                    match stream.read(&mut buffer) {
-                        Ok(read) => {
-                            buffer.truncate(read);
-                            OpOutcome::Done(CallOutput::UnixRead { bytes: buffer })
-                        }
-                        Err(error) if error.kind() == ErrorKind::WouldBlock => OpOutcome::Pending,
-                        Err(error) if error.kind() == ErrorKind::Interrupted => OpOutcome::Pending,
-                        Err(_) => OpOutcome::Done(CallOutput::Failed(CallError::Io)),
-                    }
-                }
-                WorkerOp::Write {
-                    stream_id,
-                    bytes,
-                    written,
-                } => {
-                    let stream_id = *stream_id;
-                    let Some((_, stream)) =
-                        self.streams.iter_mut().find(|(id, _)| *id == stream_id)
-                    else {
-                        return OpOutcome::Done(CallOutput::Failed(CallError::InvalidResource));
-                    };
-                    match stream.write(&bytes[*written..]) {
-                        Ok(0) => {
-                            // Peer cannot accept more and made no progress.
-                            OpOutcome::Done(CallOutput::UnixWrote { count: *written })
-                        }
-                        Ok(count) => {
-                            *written += count;
-                            // One write call reports the bytes accepted by
-                            // this syscall; the helper loops for the rest.
-                            OpOutcome::Done(CallOutput::UnixWrote { count: *written })
-                        }
-                        Err(error) if error.kind() == ErrorKind::WouldBlock => {
-                            if *written > 0 {
-                                OpOutcome::Done(CallOutput::UnixWrote { count: *written })
-                            } else {
-                                OpOutcome::Pending
-                            }
-                        }
-                        Err(error) if error.kind() == ErrorKind::Interrupted => OpOutcome::Pending,
-                        Err(_) => OpOutcome::Done(CallOutput::Failed(CallError::Io)),
-                    }
-                }
-            }
-        }
-
-        /// Sends a completion. Returns `true` if the channel is gone.
-        fn complete(&self, call_id: CallId, result: CallOutput) -> bool {
-            self.completions
-                .send(WorkerCompletion { call_id, result })
-                .is_err()
-        }
-    }
-
-    enum OpOutcome {
-        Pending,
-        Done(CallOutput),
-    }
-
-    fn remove_socket_file(path: &PathBuf) -> std::io::Result<()> {
-        match std::fs::symlink_metadata(path) {
-            Ok(metadata) if metadata.file_type().is_socket() => std::fs::remove_file(path),
-            Ok(_) => Ok(()),
-            Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(error),
+    impl std::fmt::Debug for BetelgeuseUnix {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter
+                .debug_struct("BetelgeuseUnix")
+                .field("listeners", &self.listeners.len())
+                .field("streams", &self.streams.len())
+                .field("pending", &self.pending.len())
+                .finish_non_exhaustive()
         }
     }
 }

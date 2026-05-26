@@ -4,6 +4,33 @@ This file records completed work.
 
 ## Unreleased
 
+### Unix-Domain Sockets On The Per-Shard I/O Rail
+
+- Moved Unix-domain sockets off their private blocking worker thread and onto the
+  per-shard Betelgeuse completion rail — the same substrate TCP and TLS already
+  ride, on the shard thread, with no `std::os::unix::net` and no worker. Bind,
+  accept, connect, read, write, and close are now completion-backed, with the
+  same lane discipline as TCP (one accept/read/write lane each, `ResourceBusy`
+  on duplicates, close-wins cancellation, tombstoned shutdown).
+- Added the narrow Unix-domain support the substrate lacked directly to vendored
+  Betelgeuse (`bind_unix` / `connect_unix` plus socket-file lifecycle: a stale
+  socket file is cleared before bind, and a listener's socket file is unlinked on
+  close — only ever a socket inode, never a regular file or symlink at a
+  user-supplied path). Accept, recv, send, and close already worked at the
+  substrate's family-agnostic socket layer.
+- Every runtime-owned rail now self-classifies in the capability report as
+  completion-backed, fallback-worker, justified-blocking-lane, simulator-scripted,
+  or unsupported. DNS (platform resolver) and process spawn/wait carry written
+  reasons for staying bounded blocking lanes; the storage rename/remove/readdir/
+  metadata worker is named a fallback, not a general storage lane. The Unix rail
+  is now reported completion-backed, not poll-backed.
+- Added a static rail-inventory guard (`scripts/rail_inventory_guard.sh`, run by
+  `make verify`) that fails the build if a runtime-owned rail adds a worker
+  thread, a blocking std socket, or blocking `std::fs` work without being listed
+  in `.intent/runtime-rail-inventory.txt` and classified in the capability
+  report. A runtime test keeps the file inventory and the capability classes in
+  sync.
+
 ### TLS On The TCP Rail
 
 - Moved native TLS off per-operation worker threads and onto the runtime's own

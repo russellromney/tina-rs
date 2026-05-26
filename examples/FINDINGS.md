@@ -448,6 +448,29 @@ or a caller-asserted `M` (not honest under the LLM rule). Pick
 the typed-event vs. continuation form when the supervisor/spawn
 API gets revisited.
 
+### 17. Private Unix-domain socket worker thread — closed
+
+**Surfaced by:** `specimen_local_io_codec_ipc` (`live_unix_smoke`, `admin_socket`),
+`tina-runtime/tests/local_system.rs` (`unix_live_echo`).
+
+**Closed.** Unix-domain sockets no longer run on a private worker thread over
+`std::os::unix::net`. The runtime drives bind/accept/connect/read/write/close on
+the shard thread as completions on the same per-shard Betelgeuse loop TCP and TLS
+already ride — Unix sockets are sockets, so they follow the same substrate rule.
+The narrow Unix addressing the substrate lacked (`bind_unix` / `connect_unix` and
+the socket-file unlink lifecycle) was added to vendored Betelgeuse rather than
+left in a hidden worker. The lane keeps TCP's discipline: one accept/read/write
+lane each, `ResourceBusy` on duplicates, close-wins cancellation, tombstoned
+shutdown. The capability report now classifies it completion-backed, and the
+rail-inventory guard (`scripts/rail_inventory_guard.sh`) fails the build if a
+worker thread or blocking std socket reappears in a runtime rail off-inventory.
+
+**Still true:** DNS (platform resolver) and process spawn/wait stay bounded
+blocking lanes on purpose — they are OS lifecycle / library calls with no
+portable completion opcode, and the capability report carries their written
+reason. A narrow rename/remove/readdir/metadata storage fallback is the only
+remaining off-shard storage worker.
+
 ### 16. Multi-worker TLS lane (or split accept/stream lanes) — closed
 
 **Surfaced by:** `specimen_native_https`, `tina-http/tests/client_tls_smoke.rs`.

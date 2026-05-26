@@ -308,6 +308,17 @@ impl IOSocket for SimulatedSocket {
         Ok(())
     }
 
+    fn bind_unix(&self, _path: &Path) -> io::Result<()> {
+        // The simulated backend models internet TCP only. Tina's
+        // deterministic Unix-domain rail is scripted by `tina-sim`, not by
+        // this backend, so the substrate-level Unix ops are unsupported here.
+        Err(unsupported("simulated unix bind"))
+    }
+
+    fn connect_unix(&self, _c: &mut ConnectCompletion, _path: &Path) -> io::Result<()> {
+        Err(unsupported("simulated unix connect"))
+    }
+
     fn local_addr(&self) -> io::Result<SocketAddr> {
         let state = self.state.lock().expect("simulated io mutex");
         let socket_id = *self.socket_id.lock().expect("socket id mutex");

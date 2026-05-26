@@ -639,6 +639,20 @@ impl IOSocket for StuckReleaseSocket {
         Err(io::Error::new(io::ErrorKind::Unsupported, "stuck connect"))
     }
 
+    fn bind_unix(&self, _path: &std::path::Path) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "stuck unix bind",
+        ))
+    }
+
+    fn connect_unix(&self, _c: &mut ConnectCompletion, _path: &std::path::Path) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "stuck unix connect",
+        ))
+    }
+
     fn recv(&self, _c: &mut RecvCompletion, _len: usize) -> io::Result<()> {
         Err(io::Error::new(io::ErrorKind::Unsupported, "stuck recv"))
     }
