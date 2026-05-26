@@ -183,7 +183,11 @@ pub use connect::{
     ConnectAttempts, ConnectAttemptsError, ConnectPolicy, ConnectPolicyError, ConnectReport,
     ConnectSecurity, ConnectStep, ConnectTlsTruth, DnsClassification, DnsOutcome,
     EndpointGeneration, EndpointId, GrpcEndpoint, HappyEyeballsPolicy, Http2Endpoint, HttpEndpoint,
-    ResolvedEndpoint, WebSocketEndpoint,
+    InstallError, ResolvedEndpoint, RetainedSessionReport, SessionEndReason, WebSocketClientManager,
+    WebSocketConnectOutcome, WebSocketEndpoint, WebSocketManagerAddr, WebSocketManagerConfig,
+    WebSocketManagerConfigError, WebSocketManagerHandles, WebSocketManagerMsg,
+    WebSocketManagerReply, WebSocketManagerReport, WebSocketManagerShutdownReport,
+    WebSocketManagerState, WebSocketSessionError, WsConnAddr, build_websocket_client_manager,
 };
 pub use connection::{HttpConnection, HttpConnectionMsg, response_for_call_outcome};
 pub use grpc::{

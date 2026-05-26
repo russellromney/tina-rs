@@ -32,9 +32,17 @@ pub mod attempts;
 pub mod endpoint;
 pub mod policy;
 pub mod report;
+pub mod websocket_manager;
 
 pub use attempts::{
     AttemptKey, ConnectAttempts, ConnectAttemptsError, ConnectStep, DnsClassification,
+};
+pub use websocket_manager::{
+    InstallError, RetainedSessionReport, SessionEndReason, WebSocketClientManager,
+    WebSocketConnectOutcome, WebSocketManagerAddr, WebSocketManagerConfig,
+    WebSocketManagerConfigError, WebSocketManagerHandles, WebSocketManagerMsg,
+    WebSocketManagerReply, WebSocketManagerReport, WebSocketManagerShutdownReport,
+    WebSocketManagerState, WebSocketSessionError, WsConnAddr, build_websocket_client_manager,
 };
 pub use endpoint::{
     ConnectSecurity, EndpointGeneration, EndpointId, GrpcEndpoint, Http2Endpoint, HttpEndpoint,
