@@ -116,6 +116,51 @@ fn live_surfaces_all_have_manifest_rows_and_observed_facts() {
 }
 
 #[test]
+fn request_scope_surfaces_declared_and_joined_with_live_pressure() {
+    // Declared: the scope-set capacity and the per-request child cap are
+    // manifest rows of the RequestScope kind, not scattered constants.
+    let manifest = budget::manifest();
+    let set = manifest
+        .surface("request.scope_set")
+        .expect("request.scope_set must be a manifest row");
+    assert_eq!(set.kind, BudgetKind::RequestScope);
+    let child = manifest
+        .surface("request.scope_child_cap")
+        .expect("request.scope_child_cap must be a manifest row");
+    assert_eq!(child.kind, BudgetKind::RequestScope);
+
+    // Joined with live pressure: after a run that drove notify requests,
+    // the scope-set surface carries observed facts (a non-zero high-water,
+    // since the notify path admitted at least one scope), and every slot
+    // came back (current == 0, full == 0).
+    let report = run(RunMode::Smoke).expect("smoke run");
+    assert!(
+        report.budget_consistent,
+        "manifest vs live mismatch: {:?}",
+        report.budget_report.as_ref().map(|r| &r.consistency.rows),
+    );
+    let budget_report = report.budget_report.expect("budget report present");
+    let scope_row = budget_report
+        .row("request.scope_set")
+        .expect("scope-set row")
+        .observed
+        .as_ref()
+        .expect("scope-set observed facts joined from live metrics");
+    assert!(
+        scope_row.high_water >= 1,
+        "the notify path should admit at least one request scope: {scope_row:?}",
+    );
+    assert_eq!(
+        scope_row.current, 0,
+        "every notify scope should be retired by shutdown: {scope_row:?}",
+    );
+    assert_eq!(
+        scope_row.full_count, 0,
+        "the smoke run should not exhaust the scope set: {scope_row:?}",
+    );
+}
+
+#[test]
 fn replay_export_pins_body_cap_and_ignores_display_only() {
     let manifest = budget::manifest();
     assert_eq!(

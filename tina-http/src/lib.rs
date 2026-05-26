@@ -167,6 +167,7 @@ pub mod parse;
 pub mod pool;
 pub mod request_builder;
 pub mod router;
+pub mod scope;
 pub mod streaming;
 pub mod target;
 pub mod transport;
@@ -217,6 +218,11 @@ pub use parse::{
 pub use pool::{HttpConnectionPool, HttpPoolMsg};
 pub use request_builder::RequestBuilder;
 pub use router::{RouteHandler, Router, StatefulHandler, StatefulRouter};
+pub use scope::{
+    ScopedRailRejected, cancel_response_source, scoped_grpc_unary, scoped_operation,
+    scoped_request_body_pull, scoped_websocket_close, scoped_websocket_report,
+    scoped_websocket_send,
+};
 // `ResponseStream` and `ChunkedResponseStream` exist as types
 // behind the `HttpResponseBody` variants, but callers never name
 // them: the loud-API constructors `HttpResponse::stream_known_length`

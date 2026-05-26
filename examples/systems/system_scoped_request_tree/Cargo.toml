@@ -1,0 +1,15 @@
+[package]
+name = "system_scoped_request_tree"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+anyhow = "1"
+http = "1"
+tina = { path = "../../../tina" }
+tina-http = { path = "../../../tina-http" }
+tina-runtime = { path = "../../../tina-runtime" }
+tina-sim = { path = "../../../tina-sim" }

@@ -37,6 +37,13 @@ pub const OUTBOUND_CONNECTION_MAILBOX: usize = 8;
 pub const OUTBOUND_POOL_MAILBOX: usize = 8;
 /// Public listener accept mailbox.
 pub const MAIN_LISTENER_MAILBOX: usize = 4;
+/// Concurrent request scopes the controller admits. One scope per
+/// in-flight `POST /items/{id}/notify`; hitting the cap sheds with a typed
+/// answer rather than growing.
+pub const REQUEST_SCOPE_SET_CAPACITY: usize = 8;
+/// Child rails one notify request's scope may register (the outbound
+/// keepalive request call is the one cancelable child today).
+pub const REQUEST_SCOPE_CHILD_CAP: usize = 2;
 
 /// Build the service budget manifest. Production policy: an
 /// unbounded escape would be rejected here, not silently accepted.
@@ -139,6 +146,30 @@ pub fn manifest() -> ServiceBudgetManifest {
         )
         .owned_by("outbound.pool"),
     );
+    // Request-scope set: one scope per in-flight notify request. The cap
+    // is the concurrent-request ceiling for the scoped path; admission
+    // sheds past it rather than growing. The scope caps shape admission,
+    // so they are replay-affecting (the default).
+    m.add(
+        BudgetSurface::new(
+            "request.scope_set",
+            BudgetKind::RequestScope,
+            BudgetUnit::Sessions,
+            BudgetCap::fixed(REQUEST_SCOPE_SET_CAPACITY),
+        )
+        .owned_by("controller"),
+    );
+    // Per-request child cap: how many cancelable child rails one request's
+    // scope may register. A structural bound, not an aggregate counter.
+    m.add(
+        BudgetSurface::new(
+            "request.scope_child_cap",
+            BudgetKind::RequestScope,
+            BudgetUnit::Calls,
+            BudgetCap::fixed(REQUEST_SCOPE_CHILD_CAP),
+        )
+        .owned_by("controller"),
+    );
     // Accept-queue depth. It bounds queued accepts for operator
     // dashboards but does not enter the saved body-cap replay case, so
     // it is display-only for replay: changing it must not invalidate
@@ -172,6 +203,8 @@ pub struct ServiceCaps {
     pub outbound_connection_mailbox: usize,
     pub outbound_pool_mailbox: usize,
     pub main_listener_mailbox: usize,
+    pub request_scope_set: usize,
+    pub request_scope_child_cap: usize,
 }
 
 impl ServiceCaps {
@@ -197,6 +230,8 @@ impl ServiceCaps {
             outbound_connection_mailbox: read("outbound.connection.mailbox"),
             outbound_pool_mailbox: read("outbound.pool.mailbox"),
             main_listener_mailbox: read("http.main_listener.mailbox"),
+            request_scope_set: read("request.scope_set"),
+            request_scope_child_cap: read("request.scope_child_cap"),
         };
         if missing.is_empty() {
             Ok(caps)
@@ -221,6 +256,8 @@ pub fn documented_caps() -> Vec<(&'static str, usize)> {
         ("outbound.in_flight", OUTBOUND_POOL_CAPACITY),
         ("outbound.connection.mailbox", OUTBOUND_CONNECTION_MAILBOX),
         ("outbound.pool.mailbox", OUTBOUND_POOL_MAILBOX),
+        ("request.scope_set", REQUEST_SCOPE_SET_CAPACITY),
+        ("request.scope_child_cap", REQUEST_SCOPE_CHILD_CAP),
         ("http.main_listener.mailbox", MAIN_LISTENER_MAILBOX),
     ]
 }

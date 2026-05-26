@@ -4,6 +4,32 @@ This file records completed work.
 
 ## Unreleased
 
+### Request Scope End-To-End
+
+- Added `ScopedRequestReport`, the request-level aggregate that wraps a
+  `ScopeCancelReport`, the post-removal `RequestScopeSetCapacityReport`,
+  late-result counts, ignored-timer counts, and any `UnsupportedScopeRow`s —
+  one typed value for "the request went away; here is what was cancelled, what
+  had settled, how much capacity came back, and what could not be cancelled."
+- Added `ScopedTimerSet` / `ScopedTimer`: a bounded tombstone timer for request
+  deadlines. Plain `sleep` is not cancelable, so cancelling tombstones the
+  ticket and a late physical fire is reported as `IgnoredLate` and skipped,
+  never a pretended physical cancel.
+- Added `tina_http::scope` adapters that register HTTP rails into a request
+  scope: `scoped_request_body_pull`, `scoped_websocket_send` / `_report` /
+  `_close`, `scoped_grpc_unary`, the generic `scoped_operation`, and the
+  protocol-honest `cancel_response_source`. A scoped WebSocket operation is a
+  single send/report/close, never the whole session.
+- Added `system_scoped_request_tree`: one streaming route, one tombstoned
+  deadline, one cancelable child, one report. A mid-body client disconnect
+  cancels the child, the timer fires late and is ignored, and the scope slot is
+  reclaimed, with sim/replay agreement on the scope-set surface.
+- `mini_saas_api` now owns a request scope on its notify path: the outbound
+  keepalive request call registers as a cancelable child, the scope set and
+  per-request child cap are declared as `request.scope_set` /
+  `request.scope_child_cap` budget rows and joined with live pressure, and the
+  set returns to zero in-use under load.
+
 ### Hostile Review Fixes
 
 - Tightened the bounded fanout rails after review: `BroadcastTracker`

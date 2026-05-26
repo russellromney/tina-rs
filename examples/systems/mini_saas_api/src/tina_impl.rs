@@ -25,8 +25,9 @@ use tina_runtime::lifecycle::{
 };
 use tina_runtime::pool::{WorkerPoolMsg, WorkerPoolReply};
 use tina_runtime::{
-    CallOutcome, DefaultThreadedMailboxFactory, DrainStage, DrainState, RuntimeCall, RuntimeEvent,
-    RuntimeEventKind, ThreadedRuntime, ThreadedRuntimeConfig, call, sleep,
+    CallOutcome, DefaultThreadedMailboxFactory, DrainStage, DrainState, RequestScope,
+    RequestScopeId, RequestScopeSet, RuntimeCall, RuntimeEvent, RuntimeEventKind, ThreadedRuntime,
+    ThreadedRuntimeConfig, call, call_cancelable, sleep,
 };
 use tina_sim::dst::{
     LiveReplayCapture, LiveReplayFact, LiveReplayReport, ReplayCase as DstReplayCase, ReplayConfig,
@@ -48,6 +49,60 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
 // these two consts, which the manifest is built from and a test ties to
 // the manifest rows.
 use crate::budget::{BODY_CAP_BYTES, CONTROLLER_MAILBOX_CAPACITY};
+
+/// Shared live counters for the controller's request-scope set.
+///
+/// The controller updates these as it admits and retires notify scopes;
+/// the host snapshots them at shutdown to join the `request.scope_set`
+/// budget surface with real numbers instead of declared config alone.
+#[derive(Clone, Default)]
+struct ScopeSetMetrics {
+    inner: std::sync::Arc<ScopeSetMetricsInner>,
+}
+
+#[derive(Default)]
+struct ScopeSetMetricsInner {
+    capacity: std::sync::atomic::AtomicUsize,
+    in_use: std::sync::atomic::AtomicUsize,
+    high_water: std::sync::atomic::AtomicUsize,
+    full_count: std::sync::atomic::AtomicU64,
+}
+
+impl ScopeSetMetrics {
+    fn with_capacity(capacity: usize) -> Self {
+        let metrics = Self::default();
+        metrics
+            .inner
+            .capacity
+            .store(capacity, std::sync::atomic::Ordering::Relaxed);
+        metrics
+    }
+
+    /// Record that `in_use` scopes are now admitted (caller passes the set
+    /// length after the insert). Bumps the high-water mark.
+    fn observe_in_use(&self, in_use: usize) {
+        use std::sync::atomic::Ordering;
+        self.inner.in_use.store(in_use, Ordering::Relaxed);
+        self.inner.high_water.fetch_max(in_use, Ordering::Relaxed);
+    }
+
+    fn on_full(&self) {
+        self.inner
+            .full_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// `(capacity, in_use, high_water, full_count)`.
+    fn snapshot(&self) -> (usize, usize, usize, u64) {
+        use std::sync::atomic::Ordering;
+        (
+            self.inner.capacity.load(Ordering::Relaxed),
+            self.inner.in_use.load(Ordering::Relaxed),
+            self.inner.high_water.load(Ordering::Relaxed),
+            self.inner.full_count.load(Ordering::Relaxed),
+        )
+    }
+}
 
 pub fn run(mode: RunMode) -> anyhow::Result<RunReport> {
     // Validate the budget manifest before binding anything. A bad cap
@@ -115,6 +170,7 @@ pub fn run(mode: RunMode) -> anyhow::Result<RunReport> {
     .map_err(|e| anyhow::anyhow!("build outbound keepalive pool: {e:?}"))?;
 
     let public_body_metrics = BodyMetrics::default();
+    let scope_metrics = ScopeSetMetrics::with_capacity(caps.request_scope_set);
     let controller = runtime
         .register_with_capacity::<_, Infallible>(
             Controller::new(
@@ -124,6 +180,9 @@ pub fn run(mode: RunMode) -> anyhow::Result<RunReport> {
                 public_body_metrics.clone(),
                 caps.body,
                 caps.controller_mailbox,
+                caps.request_scope_set,
+                caps.request_scope_child_cap,
+                scope_metrics.clone(),
             ),
             caps.controller_mailbox,
         )
@@ -349,6 +408,7 @@ pub fn run(mode: RunMode) -> anyhow::Result<RunReport> {
         &public_body_metrics.snapshot(),
         main_listener_config.limits.max_body_bytes,
         &db_pressure,
+        &scope_metrics,
     );
     let budget_report = manifest.report(&live_budget);
     report.budget_report_line = budget_report.summary_line();
@@ -743,9 +803,21 @@ struct Controller {
     /// `drain.finish()` is never called from inside the controller.
     drain: DrainState,
     live_items: HashMap<i64, String>,
+    /// One request scope per in-flight `POST /items/{id}/notify`. Capacity
+    /// and per-request child cap are installed from the budget manifest.
+    notify_scopes: RequestScopeSet<u64>,
+    /// Per-request child cap read from the manifest; used to size each
+    /// notify request's scope.
+    scope_child_cap: usize,
+    /// Shared live counters for the scope set, joined into the budget
+    /// report at shutdown.
+    scope_metrics: ScopeSetMetrics,
+    /// Monotonic key for scope-set entries.
+    next_scope_id: u64,
 }
 
 impl Controller {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         db: SqliteAddress,
         db_metrics: SqliteMetricsHandle,
@@ -753,6 +825,9 @@ impl Controller {
         body_metrics: BodyMetrics,
         body_cap: usize,
         controller_mailbox: usize,
+        scope_set_capacity: usize,
+        scope_child_cap: usize,
+        scope_metrics: ScopeSetMetrics,
     ) -> Self {
         Self {
             db,
@@ -764,6 +839,23 @@ impl Controller {
             next_id: 1,
             drain: DrainState::new(),
             live_items: HashMap::new(),
+            notify_scopes: RequestScopeSet::with_capacity(scope_set_capacity),
+            scope_child_cap,
+            scope_metrics,
+            next_scope_id: 1,
+        }
+    }
+
+    /// Retire a notify scope on a terminal branch: drop the set entry and
+    /// refresh the live counters. Idempotent; a missing key is fine
+    /// (already retired). Every retire point reaches here with no child
+    /// rail still pending — the outbound child is registered only after a
+    /// lease is acquired and has settled by the time the release returns;
+    /// the not-found / acquire-error branches retire before any child is
+    /// registered. So dropping the scope cannot strand an open wait.
+    fn retire_scope(&mut self, scope_id: u64) {
+        if self.notify_scopes.remove(&scope_id).is_ok() {
+            self.scope_metrics.observe_in_use(self.notify_scopes.len());
         }
     }
 }
@@ -790,12 +882,14 @@ enum ControllerMsg {
     Loaded(RequestContext<HttpResponse>, i64, CallOutcome<SqliteResult>),
     NotifyLoaded(
         RequestContext<HttpResponse>,
+        u64,
         i64,
         bool,
         CallOutcome<SqliteResult>,
     ),
     NotifyAcquired(
         RequestContext<HttpResponse>,
+        u64,
         i64,
         String,
         bool,
@@ -803,11 +897,13 @@ enum ControllerMsg {
     ),
     NotifySent(
         RequestContext<HttpResponse>,
+        u64,
         PoolLease<KeepaliveConnAddr>,
         CallOutcome<KeepaliveOutcome>,
     ),
     NotifyReleased(
         RequestContext<HttpResponse>,
+        u64,
         bool,
         CallOutcome<WorkerPoolReply<KeepaliveConnAddr>>,
     ),
@@ -888,38 +984,62 @@ impl Isolate for Controller {
             ControllerMsg::Loaded(req, id, outcome) => {
                 reply_to_request(req, item_response(id, outcome))
             }
-            ControllerMsg::NotifyLoaded(req, id, slow, outcome) => {
+            ControllerMsg::NotifyLoaded(req, scope_id, id, slow, outcome) => {
                 match item_from_rows(id, outcome) {
                     Ok(Some(name)) => {
                         call(self.outbound_pool, WorkerPoolMsg::Acquire, REQUEST_TIMEOUT)
                             .then_with_request(req, move |req, outcome| {
-                                ControllerMsg::NotifyAcquired(req, id, name, slow, outcome)
+                                ControllerMsg::NotifyAcquired(
+                                    req, scope_id, id, name, slow, outcome,
+                                )
                             })
                     }
-                    Ok(None) => reply_to_request(req, text(StatusCode::NOT_FOUND, "not_found\n")),
-                    Err(response) => reply_to_request(req, *response),
+                    Ok(None) => {
+                        self.retire_scope(scope_id);
+                        reply_to_request(req, text(StatusCode::NOT_FOUND, "not_found\n"))
+                    }
+                    Err(response) => {
+                        self.retire_scope(scope_id);
+                        reply_to_request(req, *response)
+                    }
                 }
             }
-            ControllerMsg::NotifyAcquired(req, id, name, slow, outcome) => match outcome {
-                CallOutcome::Replied(WorkerPoolReply::Acquire(AcquireOutcome::Acquired(lease))) => {
-                    let body = if slow {
-                        format!("id={id}&name={name}&slow=true")
-                    } else {
-                        format!("id={id}&name={name}")
-                    };
-                    let request = HttpRequest::post("/notify").text_body(body).build();
-                    call(
-                        *lease.handle(),
-                        KeepaliveConnectionMsg::request(request, REQUEST_TIMEOUT),
-                        REQUEST_TIMEOUT + Duration::from_secs(1),
-                    )
-                    .then_with_request(req, move |req, outcome| {
-                        ControllerMsg::NotifySent(req, lease, outcome)
-                    })
+            ControllerMsg::NotifyAcquired(req, scope_id, id, name, slow, outcome) => {
+                match outcome {
+                    CallOutcome::Replied(WorkerPoolReply::Acquire(AcquireOutcome::Acquired(
+                        lease,
+                    ))) => {
+                        let body = if slow {
+                            format!("id={id}&name={name}&slow=true")
+                        } else {
+                            format!("id={id}&name={name}")
+                        };
+                        let request = HttpRequest::post("/notify").text_body(body).build();
+                        // The outbound request call is the request's cancelable
+                        // child: register it into the scope so a scope cancel
+                        // (owner stop, request abort) closes the parked wait.
+                        let (effect, handle) = call_cancelable(
+                            *lease.handle(),
+                            KeepaliveConnectionMsg::request(request, REQUEST_TIMEOUT),
+                            REQUEST_TIMEOUT + Duration::from_secs(1),
+                        )
+                        .then(move |outcome| {
+                            ControllerMsg::NotifySent(req, scope_id, lease, outcome)
+                        });
+                        if let Some(scope) = self.notify_scopes.get(&scope_id) {
+                            scope.register("outbound_request", handle).expect(
+                                "fresh notify scope has room for the single outbound child rail",
+                            );
+                        }
+                        effect
+                    }
+                    other => {
+                        self.retire_scope(scope_id);
+                        reply_to_request(req, pool_acquire_error_response(other))
+                    }
                 }
-                other => reply_to_request(req, pool_acquire_error_response(other)),
-            },
-            ControllerMsg::NotifySent(req, lease, outcome) => {
+            }
+            ControllerMsg::NotifySent(req, scope_id, lease, outcome) => {
                 let (ok, disposition) = match &outcome {
                     CallOutcome::Replied(KeepaliveOutcome::Request {
                         result: Ok(response),
@@ -933,19 +1053,24 @@ impl Isolate for Controller {
                     REQUEST_TIMEOUT,
                 )
                 .then_with_request(req, move |req, release| {
-                    ControllerMsg::NotifyReleased(req, ok, release)
+                    ControllerMsg::NotifyReleased(req, scope_id, ok, release)
                 })
             }
-            ControllerMsg::NotifyReleased(req, ok, release) => match release {
-                CallOutcome::Replied(WorkerPoolReply::Release(ReleaseOutcome::Released)) if ok => {
-                    reply_to_request(req, text(StatusCode::OK, "notified\n"))
+            ControllerMsg::NotifyReleased(req, scope_id, ok, release) => {
+                self.retire_scope(scope_id);
+                match release {
+                    CallOutcome::Replied(WorkerPoolReply::Release(ReleaseOutcome::Released))
+                        if ok =>
+                    {
+                        reply_to_request(req, text(StatusCode::OK, "notified\n"))
+                    }
+                    CallOutcome::Replied(WorkerPoolReply::Release(_)) if ok => reply_to_request(
+                        req,
+                        text(StatusCode::SERVICE_UNAVAILABLE, "outbound_release\n"),
+                    ),
+                    _ => reply_to_request(req, text(StatusCode::BAD_GATEWAY, "notify_failed\n")),
                 }
-                CallOutcome::Replied(WorkerPoolReply::Release(_)) if ok => reply_to_request(
-                    req,
-                    text(StatusCode::SERVICE_UNAVAILABLE, "outbound_release\n"),
-                ),
-                _ => reply_to_request(req, text(StatusCode::BAD_GATEWAY, "notify_failed\n")),
-            },
+            }
             ControllerMsg::CapacityPool(req, outcome) => {
                 let body = self.body_metrics.snapshot();
                 let db = self.db_metrics.pressure_report();
@@ -1065,13 +1190,30 @@ impl Controller {
                 .reply(move |req, outcome| ControllerMsg::Loaded(req, id, outcome)),
             (&http::Method::POST, true) => {
                 let slow = body_text(&request).contains("slow");
+                // One scope per notify request, sized from the manifest.
+                // Admit it before dispatching any child work; a full set
+                // sheds with a typed answer and dispatches nothing.
+                let scope_id = self.next_scope_id;
+                self.next_scope_id += 1;
+                let scope =
+                    RequestScope::with_child_cap(RequestScopeId::alloc(), self.scope_child_cap);
+                if self.notify_scopes.try_insert(scope_id, scope).is_err() {
+                    self.scope_metrics.on_full();
+                    return call.reply(text(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "request_scopes_full\n",
+                    ));
+                }
+                self.scope_metrics.observe_in_use(self.notify_scopes.len());
                 call.defer(send_request(
                     self.db,
                     SqliteRequest::query_rows("SELECT name FROM items WHERE id = ?", 1)
                         .params(vec![SqliteValue::Integer(id)]),
                     REQUEST_TIMEOUT,
                 ))
-                .reply(move |req, outcome| ControllerMsg::NotifyLoaded(req, id, slow, outcome))
+                .reply(move |req, outcome| {
+                    ControllerMsg::NotifyLoaded(req, scope_id, id, slow, outcome)
+                })
             }
             _ => call.reply(text(StatusCode::METHOD_NOT_ALLOWED, "method_not_allowed\n")),
         }
@@ -1343,6 +1485,7 @@ pub fn run_soak(config: crate::SoakConfig) -> anyhow::Result<crate::SoakReport> 
     .map_err(|e| anyhow::anyhow!("build outbound keepalive pool: {e:?}"))?;
 
     let public_body_metrics = BodyMetrics::default();
+    let scope_metrics = ScopeSetMetrics::with_capacity(caps.request_scope_set);
     let controller = runtime
         .register_with_capacity::<_, Infallible>(
             Controller::new(
@@ -1352,6 +1495,9 @@ pub fn run_soak(config: crate::SoakConfig) -> anyhow::Result<crate::SoakReport> 
                 public_body_metrics.clone(),
                 caps.body,
                 caps.controller_mailbox,
+                caps.request_scope_set,
+                caps.request_scope_child_cap,
+                scope_metrics.clone(),
             ),
             caps.controller_mailbox,
         )
@@ -1614,6 +1760,7 @@ fn live_budget_pressure(
     body: &BodyPressureReport,
     body_cap: usize,
     db: &SqlitePressureReport,
+    scope_metrics: &ScopeSetMetrics,
 ) -> tina_runtime::ServicePressureReport {
     use tina_runtime::ServicePressureReport;
 
@@ -1628,6 +1775,20 @@ fn live_budget_pressure(
             body.request_body_high_water,
             body.body_full_count,
             "bytes",
+        ),
+    );
+    // Request-scope set joined with live counters: cap from the manifest,
+    // in-use / high-water / full from the controller's shared metrics.
+    let (scope_cap, scope_in_use, scope_high_water, scope_full) = scope_metrics.snapshot();
+    report.add_measured(
+        "request_scope",
+        CapacitySurfaceReport::count(
+            "request.scope_set",
+            CapacityMode::Fixed,
+            scope_cap,
+            scope_in_use,
+            scope_high_water,
+            scope_full,
         ),
     );
     report.add_measured(
@@ -1665,6 +1826,10 @@ fn live_budget_pressure(
         (
             "http.main_listener.mailbox",
             "accept-queue depth not sampled from this scope",
+        ),
+        (
+            "request.scope_child_cap",
+            "per-request structural child cap; not an aggregate live counter",
         ),
     ] {
         report.add_unavailable(name, "mailbox", reason);
