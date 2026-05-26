@@ -31,11 +31,18 @@
 pub mod attempts;
 pub mod endpoint;
 pub mod policy;
+pub mod pool;
 pub mod report;
 pub mod websocket_manager;
 
 pub use attempts::{
     AttemptKey, ConnectAttempts, ConnectAttemptsError, ConnectStep, DnsClassification,
+};
+pub use pool::{
+    EndpointDownReason, EndpointHealthSignal, FixedEndpointPool, FixedEndpointPoolConfig,
+    FixedEndpointPoolError, FixedEndpointPoolReport, GrpcClientPool, Http2ClientPool,
+    Http2PickOutcome, Http2PoolBuildError, PickOutcome, RetireReason, RetiredEndpointReport,
+    build_http2_client_pool, grpc_health_signal, http2_health_signal,
 };
 pub use websocket_manager::{
     InstallError, RetainedSessionReport, SessionEndReason, WebSocketClientManager,
