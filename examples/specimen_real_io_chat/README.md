@@ -5,6 +5,8 @@ Same workload, two implementations, real loopback TCP:
 - One client connects, writes a burst size N, shuts down its write side.
 - The server tries to fan out N messages into a slow consumer with
   capacity 1.
+- The Tina side only admits up to its service-owned broadcast cap into
+  runtime effects; extra requested targets become visible `Full`.
 - The server writes back what it observed, then closes.
 - Read both sides; see how each one expresses "the consumer can't keep up."
 
@@ -24,9 +26,9 @@ comparison=specimen_real_io_chat side=tokio burst=64 accepted=64 full=0 closed=0
 comparison=specimen_real_io_chat side=tina  burst=64 accepted=1  full=63 closed=0 delivered=1 buffered=0
 ```
 
-`accepted + full + closed == burst` always — every fanout attempt is
-accounted for. `delivered` is what reaches the slow consumer; everything
-else is implicit somewhere.
+`accepted + full + closed == burst` always — every requested fanout
+attempt is accounted for. `delivered` is what reaches the slow consumer;
+everything else is implicit somewhere.
 
 ## Read
 
@@ -54,14 +56,17 @@ Tina uses one isolate per role:
 
 - **`SlowClient`** — the bounded slow consumer (mailbox capacity 1).
 - **`Connection`** — owns the accepted TCP stream; reads the burst,
-  fans out via `send_observed(...)`, classifies each admission outcome
+  caps fanout with `BroadcastTargets`, fans out via
+  `broadcast_observed(...)`, classifies each admission outcome
   (`Accepted` / `Full` / `Closed`), writes the count back.
 - **`Listener`** — `tcp_bind` → `tcp_accept` → `spawn(Connection)`.
 
-`send_observed` is the load-bearing primitive: it tells the producer
-*at the moment of send* whether the target took the message or
-rejected it as `Full`. The Connection isolate counts these and only
-writes its response after every fanout attempt is observed.
+`broadcast_observed` is the copied path for this shape. It builds on
+`send_observed`, so the producer still learns *at the moment of send*
+whether the target took the message or rejected it as `Full`. The
+Connection isolate keeps a `BroadcastTracker` and only writes its
+response after every admitted target is observed. Targets over the
+service cap are counted as `Full` before they become effects.
 
 When you run it, `accepted=1` (the slow consumer's capacity) and
 `full=N-1` (every over-cap admission visible). Nothing buffered.
@@ -83,21 +88,19 @@ What feels better:
 What feels worse:
 
 - **Tina's setup has more pieces.** Three isolates (SlowClient,
-  Connection, Listener) plus the `send_observed(...).then(...)`
-  fanout pattern. Tokio is one async block with a `for` loop and a
-  channel. Each Tina piece is small (047 retired the mailbox-factory
-  and per-shard-type boilerplate, and `runtime.observe_next_bound()`
-  retired the `Arc<Mutex<Option<SocketAddr>>>` side channel) but
-  there are more of them.
-- **The `send_observed` ceremony.** Fanout that wants admission
-  outcomes is `batch((0..N).map(|i| send_observed(...).then(...)).collect())`
-  plus a per-message `Observed(SendOutcome)` arm in the Connection.
-  Clear, but verbose for a "broadcast to subscribers" shape.
+  Connection, Listener) plus the `BroadcastTargets` / `BroadcastTracker`
+  state. Tokio is one async block with a `for` loop and a channel.
+  Each Tina piece is small, but there are more of them.
+- **The broadcast helper still exposes the message turn.**
+  `broadcast_observed(...)` removes the hand-written batch, but each
+  target still replies through an ordinary
+  `Observed(target, SendOutcome)` message. That is more code than a
+  callback, and it is also the traceable Tina truth.
 - **The connection mailbox sizing rule.** Each `send_observed` reply
-  lands in the Connection's mailbox, so the Connection's capacity
-  must be `burst + slack`. This is documented (047, see
-  `docs/mailbox-capacity.md`) but it's still a number you have to
-  size correctly per workload.
+  lands in the Connection's mailbox, so the Connection's capacity must
+  be `max_broadcast_targets + slack`. This is documented (047, see
+  `docs/mailbox-capacity.md`) but it's still a number you have to size
+  correctly per workload.
 
 What this suggests:
 
@@ -105,10 +108,9 @@ What this suggests:
   workloads. The Tokio shape is a footgun unless every operator
   knows the channel is unbounded; Tina makes the condition
   observable at the producer.
-- The `send_observed` + per-message `Observed` arm is the clean
-  shape today, but a "broadcast with bounded admission and one
-  aggregated outcome" combinator would fit chat-room and pubsub
-  patterns better.
+- `BroadcastTargets` makes the service-owned bound explicit before
+  runtime effects exist. That is the important difference from
+  `for item in request { spawn/send }`.
 - The remaining setup cost — three isolates plus reply-slot mailbox
   sizing — is where future ergonomics work for fanout services
   should focus.

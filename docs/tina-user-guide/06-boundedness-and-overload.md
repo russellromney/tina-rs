@@ -232,6 +232,57 @@ Tina should be able to say:
 accepted=12000 full=38000 timeouts=0 exit=clean
 ```
 
+## Bounded Broadcast
+
+When one event goes to many sessions, do not build effects from a raw
+request-sized `Vec`. Build a `BroadcastTargets` first. The service chooses
+`max_targets`, and anything past that cap is refused before it can become
+runtime work.
+
+```rust
+use tina_runtime::{BroadcastTargets, BroadcastTracker, broadcast_observed};
+
+enum RoomMsg {
+    Publish { body: Bytes },
+    Delivered(SessionId, SendOutcome),
+}
+
+struct Room {
+    subscribers: Vec<(SessionId, Address<SessionMsg>)>,
+    max_broadcast_targets: usize,
+    broadcast: Option<BroadcastTracker<SessionId>>,
+}
+
+RoomMsg::Publish { body } => {
+    let targets = match BroadcastTargets::try_from_iter(
+        self.max_broadcast_targets,
+        self.subscribers.iter().map(|(id, addr)| (*id, *addr)),
+    ) {
+        Ok(targets) => targets,
+        Err(_) => return reply_full(),
+    };
+    self.broadcast = Some(targets.tracker());
+    broadcast_observed(
+        targets,
+        |_| SessionMsg::Deliver(body.clone()),
+        RoomMsg::Delivered,
+    )
+}
+
+RoomMsg::Delivered(id, outcome) => {
+    if let Some(report) = self.broadcast.as_mut().unwrap().record(id, outcome).unwrap() {
+        assert!(report.assert_all_accounted_for(report.outcomes().len()).is_ok());
+        // report.accepted(), report.full(), report.closed()
+    }
+    noop()
+}
+```
+
+The helper is intentionally small. It does not own rooms, retries, or
+session cleanup. It gives the service a bounded target list, one ordinary
+continuation per target, and one report that accounts for
+`Accepted` / `Full` / `Closed`.
+
 ## Bounded Pools
 
 When the bounded thing is "borrow one of N resources, do work, give
