@@ -22,7 +22,9 @@
 pub mod isolate;
 pub mod state;
 
-use tina_runtime::budget::{BudgetCap, BudgetKind, BudgetSurface, BudgetUnit};
+use tina::capacity::{CapacityMode, CapacityPolicy, CapacitySurfaceReport};
+use tina_runtime::ServicePressureReport;
+use tina_runtime::budget::{BudgetCap, BudgetKind, BudgetSurface, BudgetUnit, ServiceBudgetManifest};
 
 use crate::connect::policy::{ConnectPolicy, ConnectPolicyError};
 use crate::websocket::WebSocketLimits;
@@ -114,6 +116,65 @@ impl WebSocketManagerConfig {
         );
         surfaces
     }
+
+    /// Build a service budget manifest naming every cap under `{prefix}.*`.
+    pub fn manifest(&self, service: &str, prefix: &str) -> ServiceBudgetManifest {
+        let mut manifest = ServiceBudgetManifest::new(service, CapacityPolicy::Production);
+        manifest.extend(self.budget_surfaces(prefix));
+        manifest
+    }
+
+    /// Build a live pressure report that joins against [`Self::manifest`].
+    ///
+    /// Emits a live row for every manifest surface: the session and reconnect
+    /// caps are measured from `report`; the per-connect and per-session
+    /// surfaces are marked unavailable (sampled per connect, not continuously
+    /// measured). Every manifest row therefore has a live counterpart, so a
+    /// stale or missing row is the only way the consistency check fails.
+    pub fn service_pressure(
+        &self,
+        service: &str,
+        prefix: &str,
+        report: &WebSocketManagerReport,
+    ) -> ServicePressureReport {
+        let sessions_name = format!("{prefix}.sessions");
+        let reconnects_name = format!("{prefix}.reconnects");
+        let mut pressure = ServicePressureReport::new(service);
+        for surface in self.budget_surfaces(prefix) {
+            if surface.name == sessions_name {
+                pressure.add_measured(
+                    "sessions",
+                    CapacitySurfaceReport::count(
+                        surface.name,
+                        CapacityMode::Fixed,
+                        self.max_sessions,
+                        report.sessions_open,
+                        report.sessions_open,
+                        report.full_rejections,
+                    ),
+                );
+            } else if surface.name == reconnects_name {
+                pressure.add_measured(
+                    "reconnects",
+                    CapacitySurfaceReport::count(
+                        surface.name,
+                        CapacityMode::Fixed,
+                        self.max_reconnects.max(1),
+                        report.reconnects_used,
+                        report.reconnects_used,
+                        0,
+                    ),
+                );
+            } else {
+                pressure.add_unavailable(
+                    surface.name,
+                    "connect",
+                    "sampled per connect; not continuously measured",
+                );
+            }
+        }
+        pressure
+    }
 }
 
 /// Why a [`WebSocketManagerConfig`] failed validation.
@@ -142,8 +203,7 @@ impl std::error::Error for WebSocketManagerConfigError {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tina::capacity::CapacityPolicy;
-    use tina_runtime::budget::ServiceBudgetManifest;
+    use crate::connect::endpoint::EndpointId;
 
     #[test]
     fn config_validates_and_rejects_zero_caps() {
@@ -177,5 +237,55 @@ mod tests {
         let mut m = ServiceBudgetManifest::new("rooms", CapacityPolicy::Production);
         m.extend(surfaces);
         m.validate().unwrap();
+    }
+
+    #[test]
+    fn manifest_joins_live_pressure_and_drift_fails() {
+        let cfg = WebSocketManagerConfig::new(ConnectPolicy::balanced());
+        let manifest = cfg.manifest("rooms", "rooms.upstream");
+        manifest.validate().expect("manifest validates");
+
+        // A live report from a manager state with one open session.
+        let mut state = WebSocketManagerState::new(
+            EndpointId::new(1),
+            cfg.max_sessions,
+            cfg.max_reconnects,
+            cfg.retained_reports,
+        );
+        let generation = state.begin_generation();
+        state
+            .install_session(generation, 0, "127.0.0.1:9000".parse().unwrap())
+            .unwrap();
+        let report = state.report();
+
+        let pressure = cfg.service_pressure("rooms", "rooms.upstream", &report);
+        let joined = manifest.report(&pressure);
+        assert!(
+            joined.consistency.is_consistent(),
+            "manifest vs live must be consistent: {:?}",
+            joined.consistency.rows
+        );
+        assert!(
+            joined
+                .row("rooms.upstream.sessions")
+                .and_then(|r| r.observed.as_ref())
+                .is_some(),
+            "the sessions surface must be measured from the live report"
+        );
+
+        // Drift: a manifest that declares a surface the live side never
+        // reports. The missing live row must fail the consistency check.
+        let mut drifted = cfg.manifest("rooms", "rooms.upstream");
+        drifted.add(BudgetSurface::new(
+            "rooms.upstream.bogus",
+            BudgetKind::Pool,
+            BudgetUnit::Connections,
+            BudgetCap::fixed(1),
+        ));
+        let drift_join = drifted.report(&pressure);
+        assert!(
+            !drift_join.consistency.is_consistent(),
+            "a manifest row with no live surface must fail consistency"
+        );
     }
 }

@@ -142,13 +142,21 @@
 //! WebSocket client: [`WebSocketClientConnection`] is the native client
 //! session. It owns one TCP/TLS rail, performs the HTTP/1.1 upgrade, masks
 //! client frames, parses server frames, auto-answers ping with pong, and
-//! exposes typed `Connect` / `Send` / `Receive` / `Report` calls. It is not a
-//! reconnecting or pooled client manager.
+//! exposes typed `Connect` / `Send` / `Receive` / `Report` calls.
+//!
+//! Outbound clients ([`connect`]): unresolved endpoints ([`HttpEndpoint`],
+//! [`Http2Endpoint`], [`GrpcEndpoint`], [`WebSocketEndpoint`]) resolve into
+//! the targets above through a bounded [`ConnectPolicy`] (bounded DNS, bounded
+//! connect, Happy Eyeballs). [`WebSocketClientManager`] is the reconnecting
+//! WebSocket client over a bounded connection pool, with a generation guard
+//! and bounded reconnect; [`Http2ClientPool`] and [`GrpcClientPool`] are
+//! fixed-endpoint round-robin pools that keep HTTP/2 transport truth separate
+//! from gRPC status truth.
 //!
 //! Still out of scope: ACME, mTLS, SNI routing, system roots, certificate
 //! reload, redirects, cookies, WebSocket permessage-deflate, HTTP/2
-//! WebSocket, and pooled/reconnecting WebSocket client managers. For mature
-//! outbound web-client behaviour use the `tina-reqwest-bridge` crate.
+//! WebSocket, and dynamic service discovery. For mature outbound web-client
+//! behaviour use the `tina-reqwest-bridge` crate.
 
 #![cfg_attr(docsrs, feature(doc_cfg))]
 

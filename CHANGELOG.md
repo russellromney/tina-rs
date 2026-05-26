@@ -4,6 +4,38 @@ This file records completed work.
 
 ## Unreleased
 
+### Outbound Connect And Session Managers
+
+- Added unresolved outbound endpoints (`HttpEndpoint`, `Http2Endpoint`,
+  `GrpcEndpoint`, `WebSocketEndpoint`) that resolve into the existing
+  low-level targets at a chosen address, preserving Host/authority, SNI,
+  trust roots, and ALPN truth. The resolved targets stay as escape hatches.
+- Added `ConnectPolicy` over bounded runtime DNS and TCP/TLS connect, with
+  address-family ordering and a Happy Eyeballs policy. It validates before
+  first use (no zero attempt caps, no zero deadlines, no concurrency above
+  the total cap) and exposes stable budget surfaces.
+- Added the `ConnectAttempts` connect helper: it classifies a DNS result
+  (Full/Closed/Timeout/Failed distinct from any connect failure), admits a
+  bounded candidate set through `BoundedItems`, races attempts via a
+  `CallGroup`, cancels losers when a winner appears, and tombstones any loser
+  that completes late so it can never become a user success. Typed
+  `ConnectReport` keeps the ordered attempt list with per-attempt family and
+  reason, the winner, and the cancelled-loser / late-completion counts.
+- Added `WebSocketClientManager`: a reconnecting WebSocket client over a
+  bounded connection pool with one current session, bounded reconnect, a
+  generation guard that drops stale-session replies, bounded retained
+  closed/stale reports, drain-on-shutdown, and per-session pressure. A live
+  closed-port reconnect-storm test proves the path is bounded and leaks no
+  sessions or attempts.
+- Added fixed-endpoint `Http2ClientPool` and `GrpcClientPool`: round-robin
+  over healthy endpoints, a per-connection in-flight stream cap, a
+  pre-connect waiter cap, idle/stale retire, and `NoHealthyEndpoint` when
+  every endpoint is down. HTTP/2 transport truth (reset/GOAWAY/ALPN) stays
+  separate from gRPC status truth.
+- Wired manager/pool/connect caps into budget manifests with a live pressure
+  join; a stale or missing manifest row fails the consistency check.
+- Added the outbound-clients user-guide page (endpoint → policy → manager).
+
 ### Hostile Review Fixes
 
 - Tightened the bounded fanout rails after review: `BroadcastTracker`
