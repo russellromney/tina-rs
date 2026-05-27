@@ -1,0 +1,18 @@
+[workspace]
+
+[package]
+name = "perf-native"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[dependencies]
+anyhow = "1"
+axum = "0.7"
+tina = { path = "../../../tina" }
+tina-http = { path = "../../../tina-http" }
+tina-proof-harness = { path = "../../../tina-proof-harness" }
+tina-runtime = { path = "../../../tina-runtime" }
+tokio = { version = "1", features = ["macros", "net", "rt", "sync", "time"] }
