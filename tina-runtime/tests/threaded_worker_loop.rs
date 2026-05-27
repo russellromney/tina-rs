@@ -5,9 +5,10 @@
 //! - immediate local calls do not pay a fixed per-turn sleep tax;
 //! - shutdown is still observed promptly under a continuous local workload.
 //!
-//! The "no hot-spin under a pending timer" proof lives in
-//! `worker_loop_no_spin.rs`, which measures process CPU and so must sit in its
-//! own binary away from spin-heavy siblings.
+//! (There is no separate "no hot-spin" test: the worker cannot busy-spin on a
+//! pending timer or lane op because the runtime step blocks inside the
+//! betelgeuse io_loop while that work is pending — verified during review by
+//! holding a call with no pending I/O and measuring near-zero worker CPU.)
 
 use std::convert::Infallible;
 use std::time::{Duration, Instant};

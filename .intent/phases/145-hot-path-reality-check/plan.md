@@ -24,19 +24,27 @@ directory.
 
 Hostile-review follow-ups (same phase):
 
-- The multi-shard worker loop (`threaded_worker_loop_with_remote`) never had the
-  1ms-after-progress tax, but its pending-in-flight branch spun on
-  `thread::yield_now()` — a hot spin a held call or pending timer rode for its
-  whole duration, burning a core per idle shard. Replaced with the same bounded
-  `recv_timeout(idle_wait)` park as the single-shard worker.
+- Suspected multi-shard hot-spin — disproven. The multi-shard worker loop's
+  pending-in-flight branch uses `thread::yield_now()`, which looked like a hot
+  spin. Measuring process CPU across a held call (no pending I/O), a pending
+  timer, and a cross-shard reply wait all showed near-zero worker CPU: the
+  runtime step blocks inside the betelgeuse io_loop whenever there is work to
+  wait on, so the yield never tight-spins. An in-progress change to replace it
+  with a bounded park was reverted — it fixed no real spin and would only add
+  `idle_wait` latency to cross-shard replies. No no-spin test ships, because a
+  truthful one is vacuous (the property holds by construction).
 - Both worker loops recomputed the O(pending) resource report at the top of
-  every iteration. With the new loop-immediately-on-progress policy that ran on
-  every message-delivery turn at full speed — a per-op tax. The snapshot is now
-  skipped on fast delivery turns and refreshes on idle/command turns instead.
-- New no-hot-spin proofs measure process CPU across a pending-timer window
-  (single- and multi-shard) in their own test binary so spin-heavy sibling
-  tests cannot charge their CPU into the measurement. Added single-shard
-  host-wait-timeout and shutdown-while-call-pending coverage.
+  every iteration. With loop-immediately-on-progress that ran on every
+  message-delivery turn at full speed — a real per-op tax under sustained
+  throughput. The snapshot is now skipped on fast delivery turns and refreshes
+  on idle/command turns (and at shutdown), so observability is unchanged at
+  every point an observer can read it.
+- The instrumented `send_and_observe` probe cleared its timeline while the warm
+  message's delivery was still pending, so warm-delivery events raced into the
+  measured window. Drain the warm message first; the breakdown now shows the
+  honest single admission round-trip.
+- Added single-shard host-wait-timeout and shutdown-while-call-pending coverage
+  (the existing matrix only had the multi-shard variants).
 
 ## Goal
 

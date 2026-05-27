@@ -1075,22 +1075,26 @@ where
             continue;
         }
 
-        // Nothing local, remote, or overflow was deliverable. Park on the
-        // command queue with the bounded `idle_wait`. This wakes immediately on
-        // a new command and otherwise re-polls the driver (timers, lane I/O)
-        // and remote inbound after `idle_wait`. The old branch spun on
-        // `thread::yield_now()` whenever a call was in flight — a pending timer
-        // or cross-shard reply with nothing else to deliver burned a whole core
-        // per idle shard. Parking honors the same no-hot-spin policy as the
-        // single-shard worker (phase 145).
-        match receiver.recv_timeout(config.idle_wait) {
-            Ok(ThreadedCommand::Run(command)) => command(&mut runtime),
-            Ok(ThreadedCommand::Shutdown) => {
-                deliver_shutdown_signal_and_drain(&mut runtime);
-                break;
+        // Nothing local, remote, or overflow was deliverable. With no in-flight
+        // work, park on the command queue with the bounded `idle_wait` and
+        // re-poll remote inbound each tick. With work in flight, yield: the
+        // runtime step blocks inside the betelgeuse io_loop while a timer or
+        // lane op is pending, so this yield does not hot-spin (verified: a held
+        // call or pending timer with nothing else to deliver does not burn a
+        // core). A bounded park here instead would only add `idle_wait` latency
+        // to a cross-shard reply for no benefit.
+        if !runtime.has_in_flight_calls() {
+            match receiver.recv_timeout(config.idle_wait) {
+                Ok(ThreadedCommand::Run(command)) => command(&mut runtime),
+                Ok(ThreadedCommand::Shutdown) => {
+                    deliver_shutdown_signal_and_drain(&mut runtime);
+                    break;
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
             }
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+        } else {
+            thread::yield_now();
         }
     }
 
