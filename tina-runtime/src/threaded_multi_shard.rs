@@ -925,8 +925,16 @@ where
     // chance so neither ordinary sends nor terminal replies can consume every
     // bounded drain pass forever.
     let mut drain_terminal_first = true;
+    // Refresh the live resource snapshot on idle and command turns, but not
+    // after a fast delivery turn: recomputing the O(pending) resource report on
+    // every hot turn is the per-op tax this phase removes. Counts refresh again
+    // as soon as the worker parks or runs a command (phase 145).
+    let mut refresh_metrics = true;
     loop {
-        shard_metrics.set_resource_counts(runtime.resource_report());
+        if refresh_metrics {
+            shard_metrics.set_resource_counts(runtime.resource_report());
+        }
+        refresh_metrics = true;
         let route_remote_lossless =
             |envelope: QueuedRemoteEnvelope| -> Result<(), Box<RemoteRouteFailure>> {
                 let target_shard = envelope.target_shard();
@@ -1063,21 +1071,26 @@ where
         let delivered = runtime.step_with_remote(&mut |_, envelope| route_remote(envelope));
 
         if delivered > 0 || remote_delivered > 0 || !terminal_overflow.is_empty() {
+            refresh_metrics = false;
             continue;
         }
 
-        if !runtime.has_in_flight_calls() {
-            match receiver.recv_timeout(config.idle_wait) {
-                Ok(ThreadedCommand::Run(command)) => command(&mut runtime),
-                Ok(ThreadedCommand::Shutdown) => {
-                    deliver_shutdown_signal_and_drain(&mut runtime);
-                    break;
-                }
-                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+        // Nothing local, remote, or overflow was deliverable. Park on the
+        // command queue with the bounded `idle_wait`. This wakes immediately on
+        // a new command and otherwise re-polls the driver (timers, lane I/O)
+        // and remote inbound after `idle_wait`. The old branch spun on
+        // `thread::yield_now()` whenever a call was in flight — a pending timer
+        // or cross-shard reply with nothing else to deliver burned a whole core
+        // per idle shard. Parking honors the same no-hot-spin policy as the
+        // single-shard worker (phase 145).
+        match receiver.recv_timeout(config.idle_wait) {
+            Ok(ThreadedCommand::Run(command)) => command(&mut runtime),
+            Ok(ThreadedCommand::Shutdown) => {
+                deliver_shutdown_signal_and_drain(&mut runtime);
+                break;
             }
-        } else {
-            thread::yield_now();
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
         }
     }
 

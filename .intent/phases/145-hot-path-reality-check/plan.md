@@ -22,6 +22,22 @@ allocations) and ~45us/turn cross-thread scheduling — named, not a sleep. See
 `perf_after.txt` / `hotpath_before.txt` / `hotpath_after.txt` evidence in this
 directory.
 
+Hostile-review follow-ups (same phase):
+
+- The multi-shard worker loop (`threaded_worker_loop_with_remote`) never had the
+  1ms-after-progress tax, but its pending-in-flight branch spun on
+  `thread::yield_now()` — a hot spin a held call or pending timer rode for its
+  whole duration, burning a core per idle shard. Replaced with the same bounded
+  `recv_timeout(idle_wait)` park as the single-shard worker.
+- Both worker loops recomputed the O(pending) resource report at the top of
+  every iteration. With the new loop-immediately-on-progress policy that ran on
+  every message-delivery turn at full speed — a per-op tax. The snapshot is now
+  skipped on fast delivery turns and refreshes on idle/command turns instead.
+- New no-hot-spin proofs measure process CPU across a pending-timer window
+  (single- and multi-shard) in their own test binary so spin-heavy sibling
+  tests cannot charge their CPU into the measurement. Added single-shard
+  host-wait-timeout and shutdown-while-call-pending coverage.
+
 ## Goal
 
 Phase 144 made the truth visible:

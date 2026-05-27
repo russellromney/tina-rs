@@ -1446,8 +1446,16 @@ where
     let affinity = crate::affinity::apply(config.configured_core);
     metrics.publish_worker_start(format!("{:?}", thread::current().id()), affinity);
 
+    // Refresh the live resource snapshot on idle and command turns, but not
+    // after a fast delivery turn: recomputing the O(pending) resource report on
+    // every hot turn is the per-op tax this phase removes. Counts refresh again
+    // as soon as the worker parks or runs a command (phase 145).
+    let mut refresh_metrics = true;
     loop {
-        metrics.set_resource_counts(runtime.resource_report());
+        if refresh_metrics {
+            metrics.set_resource_counts(runtime.resource_report());
+        }
+        refresh_metrics = true;
         match receiver.try_recv() {
             Ok(ThreadedCommand::Run(command)) => {
                 command(&mut runtime);
@@ -1468,6 +1476,7 @@ where
         // milliseconds of latency (phase 145).
         let delivered = runtime.step();
         if delivered > 0 {
+            refresh_metrics = false;
             continue;
         }
 

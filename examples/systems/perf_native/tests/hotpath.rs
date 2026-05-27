@@ -18,6 +18,7 @@
 
 use std::collections::HashMap;
 use std::convert::Infallible;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -49,16 +50,23 @@ enum CounterMsg {
 }
 
 #[derive(Debug)]
-struct Counter;
+struct Counter {
+    count: Arc<AtomicU64>,
+}
 
 #[tina_runtime::isolate(message = CounterMsg)]
 impl Counter {
     fn handle(
         &mut self,
-        _msg: CounterMsg,
+        msg: CounterMsg,
         _ctx: &mut Context<'_, SingleShard, Self::Reply>,
     ) -> Effect<Self> {
-        noop()
+        match msg {
+            CounterMsg::Hit => {
+                self.count.fetch_add(1, Ordering::Relaxed);
+                noop()
+            }
+        }
     }
 }
 
@@ -160,6 +168,29 @@ fn median(samples: &[u64]) -> u64 {
     sorted[sorted.len() / 2]
 }
 
+fn register_counter(runtime: &Runtime, count: &Arc<AtomicU64>) -> Address<CounterMsg> {
+    runtime
+        .register_with_capacity::<_, Infallible>(
+            Counter {
+                count: Arc::clone(count),
+            },
+            CAP,
+        )
+        .expect("register counter")
+}
+
+fn wait_count(count: &AtomicU64, target: u64) {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while count.load(Ordering::Relaxed) < target {
+        assert!(
+            Instant::now() < deadline,
+            "counter stalled at {} (target {target})",
+            count.load(Ordering::Relaxed)
+        );
+        std::thread::yield_now();
+    }
+}
+
 /// Turns one instrumented timeline into named stage gaps: host submit -> first
 /// worker event -> ... -> host unblock. Repeated boundaries get a numeric
 /// suffix so two inter-turn gaps stay distinct in the report.
@@ -214,9 +245,8 @@ fn push_stage(
 
 fn probe_try_send() -> HotPathReport {
     let runtime = new_runtime(None);
-    let addr = runtime
-        .register_with_capacity::<_, Infallible>(Counter, CAP)
-        .expect("register counter");
+    let count = Arc::new(AtomicU64::new(0));
+    let addr = register_counter(&runtime, &count);
     for _ in 0..WARMUP {
         runtime
             .try_send(addr, CounterMsg::Hit)
@@ -246,9 +276,8 @@ fn probe_try_send() -> HotPathReport {
 
 fn probe_send_and_observe() -> HotPathReport {
     let runtime = new_runtime(None);
-    let addr = runtime
-        .register_with_capacity::<_, Infallible>(Counter, CAP)
-        .expect("register counter");
+    let count = Arc::new(AtomicU64::new(0));
+    let addr = register_counter(&runtime, &count);
     for _ in 0..WARMUP {
         runtime
             .send_and_observe(addr, CounterMsg::Hit)
@@ -278,12 +307,16 @@ fn probe_send_and_observe() -> HotPathReport {
 fn instrumented_send_and_observe() -> Vec<HotPathStage> {
     let timer = Arc::new(StageTimer::default());
     let runtime = new_runtime(Some(timer.clone()));
-    let addr = runtime
-        .register_with_capacity::<_, Infallible>(Counter, CAP)
-        .expect("register counter");
+    let count = Arc::new(AtomicU64::new(0));
+    let addr = register_counter(&runtime, &count);
     runtime
         .send_and_observe(addr, CounterMsg::Hit)
         .expect("warm observed admission");
+    // Drain the warm message fully (delivered, not just admitted) before
+    // clearing the timeline. `send_and_observe` returns at admission and the
+    // worker delivers on a later turn, so without this the warm message's
+    // delivery events race into the measured window and the breakdown lies.
+    wait_count(&count, 1);
     timer.clear();
     let t0 = Instant::now();
     runtime
