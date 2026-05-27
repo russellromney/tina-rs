@@ -62,6 +62,13 @@ pub struct RunReport {
     pub shutdown_in_flight_typed: bool,
     pub shutdown_clean: bool,
     pub multi_turn_notify: bool,
+    /// Owner-stop scope sweep line: `scopes_drained scopes_cancelled=N
+    /// children_cancelled=M unreleased=K`. The graceful shutdown completes
+    /// in-flight work first, so this reports zero unreleased capacity.
+    pub scopes_drain_line: String,
+    /// `true` when the owner-stop sweep reported zero unreleased scope
+    /// capacity.
+    pub scopes_drain_unreleased_zero: bool,
     pub capacity_before_shutdown_line: String,
     pub capacity_during_shutdown_line: String,
     /// Budget manifest joined with the live pressure report at
@@ -125,6 +132,28 @@ pub struct ResponseParts {
 
 pub fn run(mode: RunMode) -> anyhow::Result<RunReport> {
     tina_impl::run(mode)
+}
+
+/// Typed outcome of [`prove_drain_cancels_active_scope`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DrainActiveReport {
+    /// Scopes cancelled by the owner-stop sweep (one active notify).
+    pub scopes_cancelled: usize,
+    /// Child rails still pending at sweep time and cancelled.
+    pub children_cancelled: usize,
+    /// Scope-set slots left occupied after the sweep.
+    pub unreleased: usize,
+    /// The stranded slow notify got an error / non-`notified` answer.
+    pub slow_notify_aborted: bool,
+    /// Raw `scopes_drained …` line the sweep replied.
+    pub drain_line: String,
+}
+
+/// Drive a notify request held mid-outbound, then drain the scope set so
+/// the still-pending outbound child is cancelled. Proves the request scope
+/// in the copied service is functional, not decorative.
+pub fn prove_drain_cancels_active_scope() -> anyhow::Result<DrainActiveReport> {
+    tina_impl::prove_drain_cancels_active_scope()
 }
 
 /// Tunables for [`run_soak`].

@@ -194,6 +194,15 @@ and refreshes the live `request.scope_set` counters; the soak proof shows the
 set returning to zero in-use under load. A late upstream completion after a
 scope cancel stays a visible rejected trace fact, never a delivered success.
 
+At shutdown the host runs an owner-stop sweep (`ControllerMsg::DrainScopes`):
+the controller drains its `RequestScopeSet` and cancels every still-pending
+child rail with `OwnerStopped`, replying with `scopes_cancelled` /
+`children_cancelled` / `unreleased` counts. Graceful shutdown completes the
+in-flight notify first, so the sweep reports zero unreleased. The
+`tests/scope_drain.rs` proof holds a notify mid-outbound, drains while its
+child is parked, and shows that child cancelled and the caller answered with
+an error — the registered child rail is functional, not decorative.
+
 The fuller request-tree story — streaming-body disconnect, a tombstoned
 deadline timer, and the `ScopedRequestReport` aggregate — is proven small in
 `examples/systems/system_scoped_request_tree`.

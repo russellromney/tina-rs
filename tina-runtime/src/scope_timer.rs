@@ -121,10 +121,18 @@ struct ScopedTimerEntry {
 /// Bounded fixed-capacity storage of armed scoped timers.
 ///
 /// One entry per live (or tombstoned-but-not-yet-fired) timer. The cap is
-/// the maximum number of timers in flight at once; arming past the cap is
+/// the maximum number of timers tracked at once; arming past the cap is
 /// refused, never silently grown. Cancelling tombstones an entry; the
 /// entry survives until its physical sleep fires and the continuation
 /// calls [`Self::observe_fire`].
+///
+/// **Sizing the cap.** A tombstone keeps its slot until its physical sleep
+/// fires, so the cap must cover *live* timers **plus** the tombstones of
+/// recently-cancelled requests that are still inside their deadline
+/// window. A service that cancels requests faster than the deadline can
+/// accumulate roughly `request_rate × deadline` tombstones; size the cap
+/// for that, not just for the number of concurrent live requests, or new
+/// arms will be refused while old tombstones drain.
 #[derive(Debug)]
 pub struct ScopedTimerSet {
     entries: Vec<ScopedTimerEntry>,

@@ -28,7 +28,10 @@ This file records completed work.
   keepalive request call registers as a cancelable child, the scope set and
   per-request child cap are declared as `request.scope_set` /
   `request.scope_child_cap` budget rows and joined with live pressure, and the
-  set returns to zero in-use under load.
+  set returns to zero in-use under load. Shutdown runs an owner-stop scope
+  sweep (`DrainScopes`) that cancels any still-pending child rail and reports
+  unreleased capacity; a focused proof drains a notify held mid-outbound and
+  shows its parked child cancelled.
 
 ### Hostile Review Fixes
 

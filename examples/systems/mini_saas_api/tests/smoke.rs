@@ -25,6 +25,18 @@ fn smoke_covers_service_layers() {
     assert!(report.shutdown_in_flight_typed);
     assert!(report.shutdown_clean);
     assert!(report.multi_turn_notify);
+    // Owner-stop scope sweep: the in-flight notify drained to completion
+    // first, so the sweep finds the set empty and reports zero unreleased.
+    assert!(
+        report.scopes_drain_unreleased_zero,
+        "owner-stop sweep should report zero unreleased scopes: {}",
+        report.scopes_drain_line,
+    );
+    assert!(
+        report.scopes_drain_line.starts_with("scopes_drained "),
+        "scopes_drain_line shape: {}",
+        report.scopes_drain_line,
+    );
     assert_eq!(
         report.observations,
         vec![

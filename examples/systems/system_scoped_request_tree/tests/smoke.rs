@@ -37,6 +37,11 @@ fn streaming_body_disconnect_cancels_request_tree() {
         report.disconnect_report_line,
     );
     assert!(
+        report.timeout_replied_504,
+        "a request that blew its deadline must get a live-timer 504: {}",
+        report.summary_line(),
+    );
+    assert!(
         report.timers_ignored_late >= 1,
         "a tombstoned deadline timer must fire late and be ignored, not run: {}",
         report.summary_line(),

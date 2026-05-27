@@ -50,16 +50,27 @@ use tina_sim::dst::{
 };
 
 /// Per-request deadline. Short so the tombstoned timer fires inside the
-/// test window; the request itself completes in microseconds on loopback.
-const REQUEST_DEADLINE: Duration = Duration::from_millis(60);
+/// test window; a complete request settles in microseconds on loopback,
+/// so the margin to the deadline is large.
+const REQUEST_DEADLINE: Duration = Duration::from_millis(100);
 const CHILD_TIMEOUT: Duration = Duration::from_secs(5);
 const CHUNK_SIZE: usize = 64;
-/// Concurrent request scopes the service will admit.
-const SCOPE_SET_CAPACITY: usize = 2;
+/// Concurrent request scopes the service will admit. This specimen serves
+/// **one upload at a time**: the shared `Enrich` worker holds a single
+/// deferred slot, so admitting a second concurrent upload would clobber
+/// the first's slot. A second concurrent upload sheds with `503
+/// scope_set_full` rather than corrupting the first. Concurrency is the
+/// larger service's job (`mini_saas_api`), not this small proof.
+const SCOPE_SET_CAPACITY: usize = 1;
 /// Per-request child rails. One enrich child is the whole tree here.
 const SCOPE_CHILD_CAP: usize = 1;
-/// Timers in flight at once (one deadline per concurrent request).
-const TIMER_CAP: usize = 4;
+/// Timers tracked at once. A tombstoned timer keeps its slot until its
+/// physical sleep fires (`IgnoredLate`), so the cap must cover the live
+/// timer **plus** every recently-completed request's tombstone still
+/// inside its deadline window. This specimen drives a short burst of
+/// requests faster than the deadline, so several tombstones coexist;
+/// size the cap with headroom for that, not just for one live timer.
+const TIMER_CAP: usize = 8;
 
 type RequestId = u64;
 
@@ -78,6 +89,9 @@ pub struct ScopedTreeReport {
     pub timers_ignored_late: u64,
     /// The scope set reclaimed every slot after the disconnect teardown.
     pub scope_capacity_reclaimed: bool,
+    /// A request that blew its deadline got a live-timer (`Run`) teardown
+    /// and a user-visible `504`.
+    pub timeout_replied_504: bool,
     /// Child results that arrived after their scope was cancelled.
     pub late_results: usize,
     /// The enrich rail's async cancel ack came back `Cancelled` (the wait
@@ -95,13 +109,14 @@ impl ScopedTreeReport {
         format!(
             "system=scoped_request_tree clean_completion={} disconnect_cancelled_children={} \
              disconnect_cause_client={} disconnect_report_clean={} timers_ignored_late={} \
-             scope_capacity_reclaimed={} late_results={}",
+             scope_capacity_reclaimed={} timeout_replied_504={} late_results={}",
             self.clean_completion,
             self.disconnect_cancelled_children,
             self.disconnect_cause_client,
             self.disconnect_report_clean,
             self.timers_ignored_late,
             self.scope_capacity_reclaimed,
+            self.timeout_replied_504,
             self.late_results,
         )
     }
@@ -536,7 +551,14 @@ pub fn run() -> anyhow::Result<ScopedTreeReport> {
         "controller never recorded a disconnect report"
     );
 
-    // 3. Wait for the tombstoned deadline timers to fire and be ignored.
+    // 3. Deadline timeout: send an incomplete body and hold the socket
+    //    open. The request can never finish, so its live deadline fires
+    //    (`ScopedTimerFire::Run`) and the user sees a 504. This is
+    //    race-free: the request is structurally stuck until the deadline.
+    let timeout_response = upload_incomplete_and_read(addr, 64, 8);
+    let timeout_replied_504 = timeout_response.starts_with("HTTP/1.1 504");
+
+    // 4. Wait for the tombstoned deadline timers to fire and be ignored.
     wait_for(Duration::from_secs(2), || {
         obs.lock().expect("obs").timers_ignored_late >= 1
     });
@@ -563,6 +585,7 @@ pub fn run() -> anyhow::Result<ScopedTreeReport> {
         disconnect_report_clean: disconnect.is_clean(),
         timers_ignored_late: snapshot.timers_ignored_late,
         scope_capacity_reclaimed: disconnect.unreleased_capacity() == 0,
+        timeout_replied_504,
         late_results: snapshot.late_results,
         enrich_cancel_ack_cancelled,
         disconnect_report_line: disconnect.summary_line(),
@@ -601,6 +624,31 @@ fn upload_then_disconnect(
     // Drop the socket mid-body: the server's body pull sees a short read.
     drop(stream);
     Ok(())
+}
+
+/// Send an incomplete body and keep the socket open. The request can never
+/// complete, so its deadline fires `Run` and the server writes a 504.
+/// Returns whatever the server wrote (tolerating an early close).
+fn upload_incomplete_and_read(addr: SocketAddr, declared: usize, send_bytes: usize) -> String {
+    let connect = TcpStream::connect_timeout(&addr, Duration::from_secs(2));
+    let Ok(mut stream) = connect else {
+        return String::new();
+    };
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+    let head = format!(
+        "POST /upload HTTP/1.1\r\nHost: x\r\nContent-Length: {declared}\r\nConnection: close\r\n\r\n"
+    );
+    if stream.write_all(head.as_bytes()).is_err()
+        || stream.write_all(&vec![b'x'; send_bytes]).is_err()
+        || stream.flush().is_err()
+    {
+        return String::new();
+    }
+    // Hold the socket open with the body incomplete; read whatever the
+    // server sends (the 504). Tolerate an early close after the response.
+    let mut response = Vec::new();
+    let _ = stream.read_to_end(&mut response);
+    String::from_utf8_lossy(&response).into_owned()
 }
 
 fn wait_for(total: Duration, mut cond: impl FnMut() -> bool) -> bool {
