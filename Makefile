@@ -69,6 +69,7 @@ perf:
 	cargo run --release -p tina-runtime --example portable_runtime_cost
 	cargo test --release -p tina-proof-harness perf_report -- --nocapture
 	cargo test --release --manifest-path examples/systems/perf_native/Cargo.toml --test perf -- --nocapture
+	cargo test --release --manifest-path examples/systems/perf_native/Cargo.toml --test hotpath -- --nocapture
 	cargo test --release --manifest-path examples/systems/mini_saas_api/Cargo.toml --test perf -- --nocapture
 
 perf-compare:

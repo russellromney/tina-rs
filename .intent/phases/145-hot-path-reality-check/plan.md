@@ -1,6 +1,26 @@
 # Phase 145: Hot Path Reality Check
 
-Status: planned.
+Status: implemented.
+
+Outcome: the shard worker slept a flat 1ms after every progress step, taxing
+each runtime turn. A tiny local call needs several turns, so observed admission
+and host calls ran millisecond-scale. The fix loops immediately while steps
+deliver work and parks on the command queue (bounded `idle_wait`) only when
+nothing is deliverable. Results (release, local):
+
+- `observed_admission` p50 1.34ms -> 53us
+- `host_request_reply` p50 5.79ms -> 210us
+- `service_request_reply_chain` p50 12.07ms -> 400us
+- HTTP rows fell ~10-16x as a free downstream effect
+
+`host_request_reply` p50 (~210us) landed below the 500us threshold after the
+worker-loop fix, so Rock 5 (direct host-call path) and Rock 6 (observed-send
+allocation) were not needed this phase. The remaining ~10x gap to Tokio is the
+per-call host-driver register + reply channel + boxed command (484 vs 133
+allocations) and ~45us/turn cross-thread scheduling — named, not a sleep. See
+`examples/systems/perf_native/README.md` and the `perf_before.txt` /
+`perf_after.txt` / `hotpath_before.txt` / `hotpath_after.txt` evidence in this
+directory.
 
 ## Goal
 

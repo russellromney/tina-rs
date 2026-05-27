@@ -22,8 +22,8 @@ use tina_http::{
     HttpListener, HttpListenerMsg, HttpRequest, HttpResponse, HttpServerConfig, StatusCode,
 };
 use tina_proof_harness::{
-    LoadObservation, LoadReport, LoadRun, LoadStop, OpOutcome, PerfAllocationReport, PerfComparisonReport,
-    PerfReport, SemanticMatch,
+    LoadObservation, LoadReport, LoadRun, LoadStop, OpOutcome, PerfAllocationReport,
+    PerfComparisonReport, PerfReport, SemanticMatch,
 };
 use tina_runtime::{
     CallOutcome, DefaultThreadedMailboxFactory, ThreadedRuntime, ThreadedRuntimeConfig,
@@ -284,9 +284,7 @@ impl ChainService {
             ChainMsg::Run => call_ctx
                 .defer(call(self.ping, PingMsg::Ping, CALL_TIMEOUT))
                 .reply(ChainMsg::PingReturned),
-            ChainMsg::PingReturned(_, _) => {
-                call_ctx.reject(CallRejectedReason::UnsupportedMessage)
-            }
+            ChainMsg::PingReturned(_, _) => call_ctx.reject(CallRejectedReason::UnsupportedMessage),
         }
     }
 }
@@ -403,9 +401,9 @@ fn tina_observed_admission_row() -> anyhow::Result<PerfReport> {
         },
         move |_| match rt.send_and_observe(addr, CounterMsg::Hit) {
             Ok(()) => OpOutcome::Ok,
-            Err(ThreadedSendObservedError::IngressFull | ThreadedSendObservedError::MailboxFull) => {
-                OpOutcome::Err { kind: "full" }
-            }
+            Err(
+                ThreadedSendObservedError::IngressFull | ThreadedSendObservedError::MailboxFull,
+            ) => OpOutcome::Err { kind: "full" },
             Err(ThreadedSendObservedError::MailboxClosed) => OpOutcome::Err { kind: "closed" },
             Err(ThreadedSendObservedError::WorkerStopped) => OpOutcome::Err { kind: "stopped" },
         },
@@ -584,7 +582,9 @@ fn tokio_service_call_chain_row() -> anyhow::Result<PerfReport> {
     service_tx
         .blocking_send(warm_tx)
         .expect("warm tokio service chain send");
-    warm_rx.blocking_recv().expect("warm tokio service chain reply");
+    warm_rx
+        .blocking_recv()
+        .expect("warm tokio service chain reply");
 
     let (load, allocations) = run_counted(
         LoadRun {
@@ -622,12 +622,9 @@ fn tina_http1_close_row() -> anyhow::Result<PerfReport> {
 }
 
 fn tokio_http1_close_row() -> anyhow::Result<PerfReport> {
-    tokio_http_row(
-        "axum_http1_close",
-        "http1_close",
-        small_body(),
-        |addr| http_get(addr, false, 1, small_body().len()),
-    )
+    tokio_http_row("axum_http1_close", "http1_close", small_body(), |addr| {
+        http_get(addr, false, 1, small_body().len())
+    })
 }
 
 fn tina_http1_keepalive_row() -> anyhow::Result<PerfReport> {
@@ -942,7 +939,11 @@ fn tokio_call_op(tx: &mpsc::Sender<oneshot::Sender<()>>) -> OpOutcome {
     }
 }
 
-fn run_counted<F, O>(run: LoadRun, op: F, observation: Option<O>) -> (LoadReport, PerfAllocationReport)
+fn run_counted<F, O>(
+    run: LoadRun,
+    op: F,
+    observation: Option<O>,
+) -> (LoadReport, PerfAllocationReport)
 where
     F: Fn(usize) -> OpOutcome + Send + Sync + 'static,
     O: FnOnce() -> LoadObservation,
@@ -954,6 +955,18 @@ where
         observation,
     );
     (load, finish_allocations("load_worker_op"))
+}
+
+/// Runs `f` on the calling thread and returns its result plus the number of
+/// allocations the global counting allocator saw during the call.
+///
+/// Host-thread scope only: work the runtime does on its own worker thread is
+/// not counted here. That is the honest scope for the host-side per-op cost a
+/// caller pays (channel + boxed command per `call_blocking` / observed send).
+pub fn count_host_allocations<T>(f: impl FnOnce() -> T) -> (T, u64) {
+    reset_allocations();
+    let result = counted_allocations(f);
+    (result, ALLOCATIONS.load(Ordering::Relaxed))
 }
 
 fn counted_allocations<T>(f: impl FnOnce() -> T) -> T {

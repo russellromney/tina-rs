@@ -1461,19 +1461,32 @@ where
             Err(std::sync::mpsc::TryRecvError::Empty) => {}
         }
 
+        // Drain everything the shard can make progress on right now. A step
+        // that delivered handlers loops back immediately and steps again —
+        // no per-turn sleep tax. A tiny local call needs several runtime
+        // turns; throttling each turn by 1ms turned microseconds of work into
+        // milliseconds of latency (phase 145).
         let delivered = runtime.step();
-        if delivered == 0 && !runtime.has_in_flight_calls() {
-            match receiver.recv_timeout(config.idle_wait) {
-                Ok(ThreadedCommand::Run(command)) => command(&mut runtime),
-                Ok(ThreadedCommand::Shutdown) => {
-                    deliver_shutdown_signal_and_drain(&mut runtime);
-                    break;
-                }
-                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+        if delivered > 0 {
+            continue;
+        }
+
+        // Nothing was deliverable this turn. Park on the command queue so a
+        // new command (including shutdown) wakes the worker immediately. The
+        // bounded `idle_wait` timeout makes the worker re-poll the driver for
+        // runtime-owned work (timers, lane I/O completions, listeners) it
+        // cannot be signalled about, without hot-spinning the CPU. This single
+        // policy covers both "fully idle" and "waiting on a pending timer/I/O":
+        // in both cases the only honest move is to sleep until either a command
+        // arrives or it is time to re-poll the driver.
+        match receiver.recv_timeout(config.idle_wait) {
+            Ok(ThreadedCommand::Run(command)) => command(&mut runtime),
+            Ok(ThreadedCommand::Shutdown) => {
+                deliver_shutdown_signal_and_drain(&mut runtime);
+                break;
             }
-        } else {
-            thread::sleep(Duration::from_millis(1));
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
         }
     }
 
