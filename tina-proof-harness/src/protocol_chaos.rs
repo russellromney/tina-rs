@@ -197,9 +197,14 @@ impl ProtocolChaosReport {
                 TerminalAction::ServerClosed,
                 Some(ProtocolCloseStatus::TransportClosed),
             )
-        } else if !outcome.connected {
+        } else if !outcome.connected || matches!(peer_action, PeerAction::ReconnectStorm) {
+            // No connection, or a reconnect storm whose terminal truth is the
+            // aggregate connect accounting on the outcome, not a per-connection
+            // close. Either way there is no single terminal action to claim.
             (TerminalAction::None, None)
         } else {
+            // Connected, but the server neither closed nor reset within our
+            // drain window: a timeout from the client's view.
             (TerminalAction::TimedOut, None)
         };
         Self {
@@ -560,6 +565,48 @@ mod tests {
             report.close_status,
             Some(ProtocolCloseStatus::TransportClosed)
         );
+    }
+
+    #[test]
+    fn from_bad_peer_storm_has_no_single_terminal_but_stall_times_out() {
+        // A reconnect storm that fully connected has no per-connection
+        // terminal — it must not be mislabelled as a timeout.
+        let storm = BadPeerOutcome {
+            label: "storm",
+            connected: true,
+            bytes_sent: 0,
+            bytes_read: 0,
+            reply_prefix: String::new(),
+            server_closed: false,
+            peer_reset: false,
+            elapsed_ms: 3,
+            error: None,
+            connects_failed: 0,
+            connection_errors: Vec::new(),
+            connects_ok: 5,
+        };
+        let report = ProtocolChaosReport::from_bad_peer(
+            "storm",
+            ProtocolChaosFamily::Tcp,
+            PeerAction::ReconnectStorm,
+            &storm,
+        );
+        assert_eq!(report.terminal_action, TerminalAction::None);
+        assert_eq!(report.close_status, None);
+
+        // A single connection that connected but saw no close/reset is a
+        // genuine client-side timeout.
+        let stalled = BadPeerOutcome {
+            connects_ok: 1,
+            ..storm
+        };
+        let report = ProtocolChaosReport::from_bad_peer(
+            "stalled",
+            ProtocolChaosFamily::Http1,
+            PeerAction::Stalled,
+            &stalled,
+        );
+        assert_eq!(report.terminal_action, TerminalAction::TimedOut);
     }
 
     #[test]

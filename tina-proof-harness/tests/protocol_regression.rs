@@ -27,7 +27,7 @@ use tina_sim::dst::{
     LiveReplayCapture, LiveReplayFact, LiveReplayReport, ProtocolReplayMismatch, ReplayCase,
     ReplayConfig, ReplayReport, TraceProjectionError, UnsupportedProtocolFact,
     capture_overload_run, check_captured_replay, classify_protocol_facts, overload_capacity_fact,
-    replay_overload_bug, save_overload_bug, write_saved_replay_case,
+    read_saved_replay_case, replay_overload_bug, save_overload_bug, write_saved_replay_case,
 };
 
 const OPCODE_TEXT: u8 = 0x1;
@@ -363,10 +363,33 @@ fn saved_capture_live_fact_lines_name_the_family() {
     ));
     write_saved_replay_case(&path, &capture, |op| (*op).to_owned()).expect("save");
     let body = std::fs::read_to_string(&path).expect("read");
-    let _ = std::fs::remove_file(&path);
     assert!(body.contains("protocol WebSocket"), "{body}");
     assert!(body.contains("protocol Http2"), "{body}");
     assert!(body.contains("protocol Grpc"), "{body}");
+
+    // The saved live-fact lines survive a read back, family token intact —
+    // even though protocol-fact debug bodies and capacity facts both carry
+    // characters the line format also uses.
+    let saved = read_saved_replay_case::<&'static str, _>(&path, |text| match text {
+        "run" => Ok("run"),
+        other => Err(format!("unexpected op {other:?}")),
+    })
+    .expect("read back");
+    let _ = std::fs::remove_file(&path);
+    assert_eq!(saved.live_facts.len(), 3, "{:?}", saved.live_facts);
+    assert!(
+        saved
+            .live_facts
+            .iter()
+            .any(|f| f.contains("protocol WebSocket"))
+    );
+    assert!(
+        saved
+            .live_facts
+            .iter()
+            .any(|f| f.contains("protocol Http2"))
+    );
+    assert!(saved.live_facts.iter().any(|f| f.contains("protocol Grpc")));
 }
 
 #[test]

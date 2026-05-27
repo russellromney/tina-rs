@@ -813,6 +813,8 @@ mod tests {
     fn shrink_reduces_chunks_and_refreshes_expected_facts() {
         let case = bad_frame_case();
         let original_close = case.expected_close;
+        // The original delivers the valid "ok" text before the bad frame.
+        assert_eq!(case.expected_app_deliveries, 1);
         let shrink = case.shrink(|report| {
             // The bug is "session closes with a protocol-error fact".
             report.close == Some((Some(1002), WebSocketCloseReason::ProtocolError))
@@ -829,8 +831,10 @@ mod tests {
         );
         // Close preserved; the bug-defining close is unchanged by shrinking.
         assert_eq!(shrink.shrunk_case.expected_close, original_close);
-        // Expectations were refreshed, not inherited stale: app deliveries may
-        // drop once the leading valid text chunk is removed.
+        // Expectations were freshly observed, not inherited stale: dropping the
+        // leading valid text chunk drops the app delivery from 1 to 0, and the
+        // shrunk case pins that new value.
+        assert_eq!(shrink.shrunk_case.expected_app_deliveries, 0);
         assert_eq!(
             shrink.shrunk_case.expected_app_deliveries,
             report.app_deliveries
@@ -916,5 +920,60 @@ mod tests {
         loaded
             .replay()
             .expect("loaded server-to-client case reproduces");
+    }
+
+    #[test]
+    fn load_rejects_name_mismatch_corrupt_header_and_missing_field() {
+        let case = bad_frame_case();
+        let path = std::env::temp_dir().join(format!(
+            "tina-byte-err-{}-{}.case",
+            std::process::id(),
+            case.expected_fact_hash
+        ));
+        case.save(&path).expect("save");
+        // A saved name that does not match the caller's static name fails closed.
+        let err = ProtocolByteReplayCase::load(&path, "different_name")
+            .expect_err("name mismatch must fail closed");
+        assert!(matches!(
+            err,
+            ProtocolByteReplayIoError::NameMismatch { .. }
+        ));
+        let _ = std::fs::remove_file(&path);
+
+        // A file with an unknown header fails to decode.
+        let corrupt =
+            std::env::temp_dir().join(format!("tina-byte-corrupt-{}.case", std::process::id()));
+        std::fs::write(&corrupt, "not-a-valid-header\nname=x\n").expect("write");
+        let err = ProtocolByteReplayCase::load(&corrupt, "x")
+            .expect_err("corrupt header must fail to decode");
+        assert!(matches!(err, ProtocolByteReplayIoError::Decode { .. }));
+        let _ = std::fs::remove_file(&corrupt);
+
+        // A well-formed header missing required fields reports the field.
+        let partial =
+            std::env::temp_dir().join(format!("tina-byte-partial-{}.case", std::process::id()));
+        std::fs::write(&partial, "tina-protocol-byte-replay-v1\nname=x\n").expect("write");
+        let err = ProtocolByteReplayCase::load(&partial, "x")
+            .expect_err("missing fields must fail closed");
+        assert!(matches!(err, ProtocolByteReplayIoError::MissingField(_)));
+        let _ = std::fs::remove_file(&partial);
+    }
+
+    #[test]
+    fn load_rejects_bad_hex_chunk() {
+        let corrupt =
+            std::env::temp_dir().join(format!("tina-byte-badhex-{}.case", std::process::id()));
+        // An odd-length hex chunk cannot decode to bytes.
+        let body = "tina-protocol-byte-replay-v1\n\
+            name=x\ndirection=client-to-server\n\
+            max_message_bytes=16\nmax_frame_payload=16\nmax_frames=16\n\
+            max_bytes=16\nmax_chunks=4\nexpected_app_deliveries=0\n\
+            expected_close=none\nexpected_fact_count=0\n\
+            expected_fact_hash=0x0\nchunk=abc\n";
+        std::fs::write(&corrupt, body).expect("write");
+        let err = ProtocolByteReplayCase::load(&corrupt, "x")
+            .expect_err("odd-length hex chunk must fail to decode");
+        assert!(matches!(err, ProtocolByteReplayIoError::Decode { .. }));
+        let _ = std::fs::remove_file(&corrupt);
     }
 }

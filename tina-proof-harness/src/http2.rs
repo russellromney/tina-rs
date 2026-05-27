@@ -735,17 +735,23 @@ mod tests {
             stream: 1,
             bytes: 64,
         });
-        let (facts, outcome) = conn.finish();
+        // Inspect via the borrowing accessors before consuming the connection.
         assert_eq!(
-            outcome,
-            Http2Outcome::FlowControlExhausted(Http2FlowControlSide::ConnectionSend)
+            conn.outcome(),
+            &Http2Outcome::FlowControlExhausted(Http2FlowControlSide::ConnectionSend)
         );
-        assert!(facts.iter().any(|fact| matches!(
+        assert!(conn.facts().iter().any(|fact| matches!(
             fact,
             ProtocolFact::Http2FlowControlFull {
                 side: Http2FlowControlSide::ConnectionSend,
                 ..
             }
         )));
+        let (facts, outcome) = conn.finish();
+        assert_eq!(
+            outcome,
+            Http2Outcome::FlowControlExhausted(Http2FlowControlSide::ConnectionSend)
+        );
+        assert_eq!(facts.len(), 2, "stream-opened + flow-control-full");
     }
 }
