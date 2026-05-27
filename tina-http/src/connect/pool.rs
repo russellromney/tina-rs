@@ -890,6 +890,18 @@ mod tests {
     }
 
     #[test]
+    fn mark_healthy_revives_a_downed_endpoint_for_reuse() {
+        let mut p = pool(2);
+        p.mark_unhealthy(0, EndpointDownReason::Transport);
+        p.mark_unhealthy(1, EndpointDownReason::Closed);
+        assert_eq!(p.pick(), PickOutcome::NoHealthyEndpoint);
+        // An out-of-band probe revives one endpoint; it becomes pickable.
+        p.mark_healthy(0);
+        assert_eq!(p.healthy_count(), 1);
+        assert!(matches!(p.pick(), PickOutcome::Picked { index: 0 }));
+    }
+
+    #[test]
     fn config_rejects_zero_caps() {
         let mut cfg = FixedEndpointPoolConfig::balanced();
         cfg.max_in_flight_per_conn = 0;
