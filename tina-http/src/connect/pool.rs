@@ -184,6 +184,13 @@ pub enum FixedEndpointPoolError {
     ZeroRetainedReports,
     /// The pool was built with no endpoints.
     NoEndpoints,
+    /// The target list and connection list had different lengths.
+    MismatchedConnections {
+        /// Number of targets.
+        targets: usize,
+        /// Number of connection addresses.
+        connections: usize,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -502,7 +509,10 @@ impl Http2ClientPool {
         config: FixedEndpointPoolConfig,
     ) -> Result<Self, FixedEndpointPoolError> {
         if targets.len() != connections.len() {
-            return Err(FixedEndpointPoolError::NoEndpoints);
+            return Err(FixedEndpointPoolError::MismatchedConnections {
+                targets: targets.len(),
+                connections: connections.len(),
+            });
         }
         let route_keys = targets.iter().map(Http2Target::route_key).collect();
         Ok(Self {
@@ -644,8 +654,102 @@ mod tests {
     use super::*;
     use crate::grpc::{GrpcStatus, GrpcStatusCode};
     use tina::capacity::CapacityPolicy;
+    use tina::{AddressGeneration, IsolateId, ShardId};
     use tina_runtime::Http2ResetReason;
     use tina_runtime::budget::ServiceBudgetManifest;
+
+    fn dummy_conn(id: u64) -> Address<Http2ClientMsg, Http2ClientReply> {
+        Address::new_with_generation(
+            ShardId::new(0),
+            IsolateId::new(id),
+            AddressGeneration::new(0),
+        )
+    }
+
+    fn h2c_target(authority: &str, port: u16) -> Http2Target {
+        Http2Target::H2c {
+            authority: authority.to_string(),
+            addr: format!("127.0.0.1:{port}").parse().unwrap(),
+        }
+    }
+
+    fn handle_pool(n: usize) -> Http2ClientPool {
+        let targets: Vec<Http2Target> = (0..n)
+            .map(|i| h2c_target(&format!("svc{i}"), 50000 + i as u16))
+            .collect();
+        let conns: Vec<_> = (0..n).map(|i| dummy_conn(i as u64 + 1)).collect();
+        Http2ClientPool::new(&targets, conns, FixedEndpointPoolConfig::balanced()).unwrap()
+    }
+
+    fn picked_index(outcome: Http2PickOutcome) -> usize {
+        match outcome {
+            Http2PickOutcome::Picked { index, .. } => index,
+            other => panic!("expected Picked, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn http2_pool_handle_round_robins_then_no_healthy() {
+        let mut pool = handle_pool(2);
+        let i0 = picked_index(pool.pick());
+        let i1 = picked_index(pool.pick());
+        assert_ne!(i0, i1, "round robin visits both connections");
+        // An HTTP/2 reset on each endpoint downs the pool.
+        pool.record_outcome(i0, &Http2ClientOutcome::Reset(Http2ResetReason::Cancel));
+        pool.record_outcome(i1, &Http2ClientOutcome::Closed);
+        assert!(matches!(pool.pick(), Http2PickOutcome::NoHealthyEndpoint));
+        assert_eq!(pool.report().healthy, 0);
+    }
+
+    #[test]
+    fn http2_pool_handle_keeps_endpoint_on_full() {
+        let mut pool = handle_pool(1);
+        let i = picked_index(pool.pick());
+        pool.record_outcome(i, &Http2ClientOutcome::Full);
+        // Admission-full is not a transport fault: the endpoint stays up.
+        assert_eq!(pool.report().healthy, 1);
+        assert!(matches!(pool.pick(), Http2PickOutcome::Picked { .. }));
+    }
+
+    #[test]
+    fn mismatched_target_and_connection_counts_are_rejected() {
+        let targets = vec![h2c_target("a", 1), h2c_target("b", 2)];
+        let conns = vec![dummy_conn(1)];
+        match Http2ClientPool::new(&targets, conns, FixedEndpointPoolConfig::balanced()) {
+            Err(FixedEndpointPoolError::MismatchedConnections {
+                targets: 2,
+                connections: 1,
+            }) => {}
+            other => panic!("expected MismatchedConnections, got a different result: {:?}", other.is_ok()),
+        }
+    }
+
+    #[test]
+    fn grpc_pool_handle_keeps_endpoint_on_status_but_downs_on_transport() {
+        let targets = vec![h2c_target("svc", 50051)];
+        let conns = vec![dummy_conn(1)];
+        let mut pool =
+            GrpcClientPool::new(&targets, conns, FixedEndpointPoolConfig::balanced()).unwrap();
+        let i = match pool.pick() {
+            Http2PickOutcome::Picked { index, .. } => index,
+            other => panic!("{other:?}"),
+        };
+        // A non-OK gRPC status: the server answered. Endpoint stays healthy.
+        let status: GrpcUnaryOutcome<u8> =
+            GrpcUnaryOutcome::Status(GrpcStatus::new(GrpcStatusCode::PermissionDenied));
+        pool.record_unary_outcome(i, &status);
+        assert_eq!(pool.state().healthy_count(), 1);
+        // A transport failure downs it.
+        let i = match pool.pick() {
+            Http2PickOutcome::Picked { index, .. } => index,
+            other => panic!("{other:?}"),
+        };
+        let transport: GrpcUnaryOutcome<u8> =
+            GrpcUnaryOutcome::Transport(Http2ClientOutcome::Closed);
+        pool.record_unary_outcome(i, &transport);
+        assert_eq!(pool.state().healthy_count(), 0);
+        assert!(matches!(pool.pick(), Http2PickOutcome::NoHealthyEndpoint));
+    }
 
     fn pool(n: usize) -> FixedEndpointPool {
         let keys = (0..n).map(|i| format!("ep{i}")).collect();

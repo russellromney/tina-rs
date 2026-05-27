@@ -55,6 +55,13 @@ pub struct WebSocketManagerConfig {
     pub max_reconnects: usize,
     /// Maximum retained closed/stale session reports.
     pub retained_reports: usize,
+    /// Deadline for one routed session operation (send / receive / report).
+    ///
+    /// A `Receive` blocks until an event or close, so this is the liveness
+    /// bound on a quiet session: if a session op does not complete within it,
+    /// the session is retired as unresponsive and the caller sees `TimedOut`.
+    /// Kept separate from the connect deadline — they bound different waits.
+    pub session_op_timeout: std::time::Duration,
 }
 
 impl WebSocketManagerConfig {
@@ -68,6 +75,7 @@ impl WebSocketManagerConfig {
             max_sessions: 1,
             max_reconnects: 3,
             retained_reports: 4,
+            session_op_timeout: std::time::Duration::from_secs(30),
         }
     }
 

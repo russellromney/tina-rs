@@ -166,14 +166,6 @@ impl<R> ConnectAttempts<R> {
         self.generation
     }
 
-    /// Seed the candidate set directly from a resolved address (the
-    /// endpoint already carried a `SocketAddr`, so DNS was not consulted).
-    pub fn seed_resolved(&mut self, addr: SocketAddr) {
-        self.dns = DnsOutcome::NotAttempted;
-        self.resolved_addresses = vec![addr];
-        self.candidates = VecDeque::from(vec![addr]);
-    }
-
     /// Classify one runtime DNS result and admit the bounded candidate set.
     ///
     /// The ordered, family-policy address list is capped to the
@@ -665,6 +657,57 @@ mod tests {
                 .iter()
                 .any(|x| x.addr == a2 && x.outcome == ConnectAttemptOutcome::LateCompletion)
         );
+    }
+
+    #[test]
+    fn three_way_race_winner_cancels_two_losers_one_completes_late() {
+        let mut a = attempts(policy(3, 4, 4));
+        a.record_dns(Ok(vec![v4(1), v4(2), v4(3)]));
+        let a1 = a.take_candidate().unwrap();
+        let t1 = start_attempt(&mut a, a1);
+        let a2 = a.take_candidate().unwrap();
+        let t2 = start_attempt(&mut a, a2);
+        let a3 = a.take_candidate().unwrap();
+        let t3 = start_attempt(&mut a, a3);
+        assert_eq!(a.in_flight(), 3);
+
+        // a2 connects first → winner, a1 and a3 are losers to cancel.
+        let losers = match a.record_attempt(
+            a2,
+            t2,
+            CallOutcome::Replied(ConnReply { ok: true }),
+            classify,
+        ) {
+            ConnectStep::Won { losers } => losers,
+            other => panic!("expected Won, got {other:?}"),
+        };
+        assert_eq!(losers.len(), 2);
+
+        // a1 fails late (arrives as a message), a3 is cancelled cleanly.
+        let late =
+            a.record_attempt(a1, t1, CallOutcome::Replied(ConnReply { ok: false }), classify);
+        assert!(matches!(
+            late,
+            ConnectStep::LateCompletion { connected: false, .. }
+        ));
+        // Even an unused token (t3) cancel must settle the race exactly once.
+        for req in losers {
+            let (addr, token, _handle) = req.into_parts();
+            let _ = a.record_cancel(addr, token, CancelOutcome::Cancelled);
+        }
+        assert!(a.is_settled());
+        let report = a.into_report();
+        assert_eq!(report.winner, Some(a2));
+        assert_eq!(report.cancelled_losers, 2, "both losers were cancelled");
+        assert_eq!(report.late_completions, 1, "a1 completed late");
+        // a1's terminal row is its late completion, not a clean cancel.
+        assert!(
+            report
+                .attempted
+                .iter()
+                .any(|x| x.addr == a1 && x.outcome == ConnectAttemptOutcome::LateCompletion)
+        );
+        let _ = t3;
     }
 
     #[test]

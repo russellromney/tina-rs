@@ -19,7 +19,7 @@ use tina_runtime::{
 
 use crate::connect::attempts::{ConnectAttempts, ConnectStep};
 use crate::connect::endpoint::{EndpointGeneration, EndpointId, WebSocketEndpoint};
-use crate::connect::report::{ConnectAttemptOutcome, ConnectReport};
+use crate::connect::report::{ConnectAttemptOutcome, ConnectReport, DnsOutcome};
 use crate::websocket::WebSocketMessage;
 use crate::websocket_client::{
     WebSocketClientConnection, WebSocketClientError, WebSocketClientEvent, WebSocketClientMsg,
@@ -109,6 +109,9 @@ pub enum WebSocketSessionError {
     Closed,
     /// A session operation is already in flight.
     Busy,
+    /// The session operation did not complete within `session_op_timeout`;
+    /// the session was retired as unresponsive.
+    TimedOut,
     /// The underlying session reported a protocol/transport error.
     Session(WebSocketClientError),
 }
@@ -161,6 +164,10 @@ pub enum WebSocketManagerMsg {
     Dns(Result<Vec<SocketAddr>, CallError>),
     /// One connect attempt completion.
     AttemptReply {
+        /// Connect generation this attempt belongs to. A `CallGroup` restarts
+        /// its token counter per connect, so the generation is what tells a
+        /// stale reply from a prior connect apart from a live one.
+        generation: EndpointGeneration,
         /// Dialed address.
         addr: SocketAddr,
         /// Branch token.
@@ -170,6 +177,8 @@ pub enum WebSocketManagerMsg {
     },
     /// One loser-cancel completion.
     CancelDone {
+        /// Connect generation this cancel belongs to.
+        generation: EndpointGeneration,
         /// Loser address.
         addr: SocketAddr,
         /// Branch token.
@@ -294,15 +303,17 @@ impl<S: Shard + 'static> Isolate for WebSocketClientManager<S> {
         match msg {
             WebSocketManagerMsg::Dns(result) => self.on_dns(result),
             WebSocketManagerMsg::AttemptReply {
+                generation,
                 addr,
                 token,
                 outcome,
-            } => self.on_attempt(addr, token, outcome),
+            } => self.on_attempt(generation, addr, token, outcome),
             WebSocketManagerMsg::CancelDone {
+                generation,
                 addr,
                 token,
                 outcome,
-            } => self.on_cancel(addr, token, outcome),
+            } => self.on_cancel(generation, addr, token, outcome),
             WebSocketManagerMsg::StaggerTick { generation } => self.on_stagger(generation),
             WebSocketManagerMsg::SessionSent {
                 generation,
@@ -358,7 +369,7 @@ impl<S: Shard + 'static> WebSocketClientManager<S> {
         }
         // A connect after the first is a reconnect: spend the bounded budget.
         if self.started_once && !self.state.record_reconnect() {
-            let report = self.minimal_report(DnsForcedFail::NoHealthy);
+            let report = self.no_dial_report();
             self.state.retain_failed_connect(EndpointGeneration::new(0), true);
             return call_ctx.reply(WebSocketManagerReply::Connect(
                 WebSocketConnectOutcome::NoHealthyEndpoint(report),
@@ -464,8 +475,9 @@ impl<S: Shard + 'static> WebSocketClientManager<S> {
             },
             timeout,
         );
-        match connect.start::<Self, _, _, _>(addr, call, |addr, token, outcome| {
+        match connect.start::<Self, _, _, _>(addr, call, move |addr, token, outcome| {
             WebSocketManagerMsg::AttemptReply {
+                generation,
                 addr,
                 token,
                 outcome,
@@ -481,10 +493,20 @@ impl<S: Shard + 'static> WebSocketClientManager<S> {
 
     fn on_attempt(
         &mut self,
+        generation: EndpointGeneration,
         addr: SocketAddr,
         token: CallGroupToken,
         outcome: CallOutcome<WebSocketClientReply>,
     ) -> Effect<Self> {
+        // A reply from a prior connect (the CallGroup token counter restarts
+        // per connect) must never touch the current one.
+        if self
+            .connect
+            .as_ref()
+            .is_none_or(|c| c.generation() != generation)
+        {
+            return noop();
+        }
         let Some(connect) = self.connect.as_mut() else {
             return noop();
         };
@@ -494,7 +516,6 @@ impl<S: Shard + 'static> WebSocketClientManager<S> {
                 let winner_slot = self.slot_dialing(addr);
                 let mut effects: Vec<Effect<Self>> = Vec::new();
                 if let Some(slot) = winner_slot {
-                    let generation = connect_generation(self.connect.as_ref());
                     match self.state.install_session(generation, slot, addr) {
                         Ok(()) => {
                             self.conn_states[slot] = ConnState::Session { generation };
@@ -516,6 +537,7 @@ impl<S: Shard + 'static> WebSocketClientManager<S> {
                     }
                     effects.push(cancel_call(handle).then(move |outcome| {
                         WebSocketManagerMsg::CancelDone {
+                            generation,
                             addr: laddr,
                             token: ltoken,
                             outcome,
@@ -556,10 +578,18 @@ impl<S: Shard + 'static> WebSocketClientManager<S> {
 
     fn on_cancel(
         &mut self,
+        generation: EndpointGeneration,
         addr: SocketAddr,
         token: CallGroupToken,
         outcome: CancelOutcome,
     ) -> Effect<Self> {
+        if self
+            .connect
+            .as_ref()
+            .is_none_or(|c| c.generation() != generation)
+        {
+            return noop();
+        }
         let Some(connect) = self.connect.as_mut() else {
             return noop();
         };
@@ -589,13 +619,16 @@ impl<S: Shard + 'static> WebSocketClientManager<S> {
         };
         let generation = connect.generation();
         let report = connect.into_report();
-        let all_timeout = !report.attempted.is_empty()
-            && report
-                .attempted
-                .iter()
-                .all(|a| a.outcome == ConnectAttemptOutcome::ConnectTimeout);
+        // A DNS timeout, or every dialed attempt timing out, is a TimedOut
+        // outcome; any other failure mix is ConnectFailed.
+        let timed_out = report.dns == DnsOutcome::Timeout
+            || (!report.attempted.is_empty()
+                && report
+                    .attempted
+                    .iter()
+                    .all(|a| a.outcome == ConnectAttemptOutcome::ConnectTimeout));
         self.state.retain_failed_connect(generation, false);
-        let outcome = if all_timeout {
+        let outcome = if timed_out {
             WebSocketConnectOutcome::TimedOut(report)
         } else {
             WebSocketConnectOutcome::ConnectFailed(report)
@@ -630,7 +663,7 @@ impl<S: Shard + 'static> WebSocketClientManager<S> {
         call(
             self.connections[slot],
             WebSocketClientMsg::Send(message),
-            self.config.connect_policy.connect_timeout,
+            self.config.session_op_timeout,
         )
         .then(move |outcome| WebSocketManagerMsg::SessionSent {
             generation,
@@ -656,7 +689,12 @@ impl<S: Shard + 'static> WebSocketClientManager<S> {
                 self.reply_send(Err(mapped))
             }
             CallOutcome::Replied(_) => self.reply_send(Err(WebSocketSessionError::Closed)),
-            CallOutcome::Timeout => self.reply_send(Err(WebSocketSessionError::Closed)),
+            CallOutcome::Timeout => {
+                // The session did not answer in time: retire it as
+                // unresponsive so the next Connect is a bounded reconnect.
+                self.retire_current(SessionEndReason::ClosedByPeer);
+                self.reply_send(Err(WebSocketSessionError::TimedOut))
+            }
             CallOutcome::Full | CallOutcome::Closed | CallOutcome::Rejected(_) => {
                 self.retire_current(SessionEndReason::ClosedByPeer);
                 self.reply_send(Err(WebSocketSessionError::Closed))
@@ -689,7 +727,7 @@ impl<S: Shard + 'static> WebSocketClientManager<S> {
         call(
             self.connections[slot],
             WebSocketClientMsg::Receive,
-            self.config.connect_policy.connect_timeout,
+            self.config.session_op_timeout,
         )
         .then(move |outcome| WebSocketManagerMsg::SessionEvent {
             generation,
@@ -720,7 +758,12 @@ impl<S: Shard + 'static> WebSocketClientManager<S> {
                 self.reply_receive(Err(mapped))
             }
             CallOutcome::Replied(_) => self.reply_receive(Err(WebSocketSessionError::Closed)),
-            CallOutcome::Timeout => self.reply_receive(Err(WebSocketSessionError::Closed)),
+            CallOutcome::Timeout => {
+                // A receive that never completed within the liveness bound:
+                // retire the session rather than leave its pull half-open.
+                self.retire_current(SessionEndReason::ClosedByPeer);
+                self.reply_receive(Err(WebSocketSessionError::TimedOut))
+            }
             CallOutcome::Full | CallOutcome::Closed | CallOutcome::Rejected(_) => {
                 self.retire_current(SessionEndReason::ClosedByPeer);
                 self.reply_receive(Err(WebSocketSessionError::Closed))
@@ -749,7 +792,7 @@ impl<S: Shard + 'static> WebSocketClientManager<S> {
                 return call(
                     self.connections[slot],
                     WebSocketClientMsg::Report,
-                    self.config.connect_policy.connect_timeout,
+                    self.config.session_op_timeout,
                 )
                 .then(move |outcome| WebSocketManagerMsg::SessionReport {
                     generation,
@@ -797,11 +840,13 @@ impl<S: Shard + 'static> WebSocketClientManager<S> {
         // Cancel any in-flight connect race.
         let mut attempts_cancelled = 0usize;
         if let Some(connect) = self.connect.as_mut() {
+            let generation = connect.generation();
             for loser in connect.drain_for_cancel() {
                 let (laddr, ltoken, handle) = loser.into_parts();
                 attempts_cancelled += 1;
                 effects.push(cancel_call(handle).then(move |outcome| {
                     WebSocketManagerMsg::CancelDone {
+                        generation,
                         addr: laddr,
                         token: ltoken,
                         outcome,
@@ -865,7 +910,9 @@ impl<S: Shard + 'static> WebSocketClientManager<S> {
         EndpointId::new(1)
     }
 
-    fn minimal_report(&self, _forced: DnsForcedFail) -> ConnectReport {
+    /// A report for a reconnect refused before any dial (budget exhausted):
+    /// no DNS, no attempts, no winner.
+    fn no_dial_report(&self) -> ConnectReport {
         ConnectReport {
             endpoint: self.state_endpoint_id(),
             generation: self
@@ -884,16 +931,6 @@ impl<S: Shard + 'static> WebSocketClientManager<S> {
             late_completions: 0,
         }
     }
-}
-
-enum DnsForcedFail {
-    NoHealthy,
-}
-
-fn connect_generation(connect: Option<&ConnectAttempts<WebSocketClientReply>>) -> EndpointGeneration {
-    connect
-        .map(|c| c.generation())
-        .unwrap_or(EndpointGeneration::new(0))
 }
 
 /// Classify a WebSocket connect reply into a typed attempt outcome.
