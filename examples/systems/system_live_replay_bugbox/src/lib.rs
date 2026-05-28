@@ -38,8 +38,8 @@ use tina_proof_harness::live_replay::LiveTrace;
 use tina_runtime::{DefaultThreadedMailboxFactory, ThreadedRuntime, ThreadedRuntimeConfig};
 use tina_sim::dst::{
     CaptureSource, CaptureSummary, DiscoveredConstants, LiveReplayCapture, LiveReplayFact,
-    LiveReplayReport, ReplayCase, ReplayConfig, ReplayReport, ShrinkConfig, ShrinkCapturedReport,
-    TraceProjection, TraceShape, assert_no_hidden_buffering, assert_captured_replay,
+    LiveReplayReport, ReplayCase, ReplayConfig, ReplayReport, ShrinkCapturedReport, ShrinkConfig,
+    TraceProjection, TraceShape, assert_captured_replay, assert_no_hidden_buffering,
     assert_replay_case, capture_overload_run, check_captured_replay, discover_constants,
     read_saved_replay_case, replay_overload_bug, save_overload_bug, shrink_captured_replay,
 };
@@ -105,7 +105,9 @@ fn decode_op(text: &str) -> Result<Op, String> {
     let Some(value) = text.strip_prefix("send:") else {
         return Err(format!("unknown op {text:?}"));
     };
-    Ok(Op::Send(value.parse::<u32>().map_err(|error| error.to_string())?))
+    Ok(Op::Send(
+        value.parse::<u32>().map_err(|error| error.to_string())?,
+    ))
 }
 
 /// The saved-seed sim case that pairs with this specimen's live
@@ -238,7 +240,7 @@ pub const SAVED_SEED: u64 = 108;
 /// `observe_replay_case`). When the case is exercised again later the
 /// pinned values let `assert_replay_case` fail loudly on drift.
 const SAVED_EVENT_COUNT: usize = 54;
-const SAVED_TRACE_HASH: u64 = 0xc878_d2a4_3912_9480;
+const SAVED_TRACE_HASH: u64 = 0x95fc_22d4_ad72_5d33;
 
 fn faults() -> FaultConfig {
     FaultConfig {
@@ -255,7 +257,12 @@ fn faults() -> FaultConfig {
 pub fn case() -> ReplayCase<Op> {
     let config = ReplayConfig::with_faults(faults())
         .with_mailbox(PRODUCER_ROLE, 8)
-        .with_mailbox(SINK_ROLE, 8);
+        .with_mailbox(SINK_ROLE, 8)
+        // Live capture uses `ThreadedRuntime`, which registers a host-call
+        // dispatcher pool at worker startup. Reserve the same id range in
+        // the sim so user-isolate ids match and the captured trace replays
+        // exactly.
+        .with_reserved_system_isolates(tina_runtime::HOST_CALL_DISPATCHER_POOL_SIZE);
     ReplayCase::new(
         "system_live_replay_bugbox_canonical",
         SAVED_SEED,
@@ -282,7 +289,9 @@ pub fn run_case(case: &ReplayCase<Op>) -> ReplayReport<Output> {
     run_case_with_events(case).0
 }
 
-fn run_case_with_events(case: &ReplayCase<Op>) -> (ReplayReport<Output>, Vec<tina_runtime::RuntimeEvent>) {
+fn run_case_with_events(
+    case: &ReplayCase<Op>,
+) -> (ReplayReport<Output>, Vec<tina_runtime::RuntimeEvent>) {
     let mut sim = Simulator::new(SingleShard, case.simulator_config());
     let received = Rc::new(RefCell::new(Vec::new()));
     let sink = sim.register_with_mailbox_capacity(
@@ -466,12 +475,16 @@ pub fn run() -> anyhow::Result<BugboxReport> {
     assert_eq!(capture_replay, asserted_capture_replay);
     assert_eq!(capture_replay.live_facts, vec![fact.clone()]);
 
-    let unsupported = capture
-        .clone()
-        .with_unsupported_fact("wall-clock drain timing", "live runtime drains continuously");
-    let unsupported_mismatch_seen =
-        check_captured_replay(&unsupported, &unsupported.to_replay_case(), run_captured_case)
-            .is_err();
+    let unsupported = capture.clone().with_unsupported_fact(
+        "wall-clock drain timing",
+        "live runtime drains continuously",
+    );
+    let unsupported_mismatch_seen = check_captured_replay(
+        &unsupported,
+        &unsupported.to_replay_case(),
+        run_captured_case,
+    )
+    .is_err();
 
     // 4) Helper: discover_constants over a small seed sweep so a coding
     //    agent that wants to pin a new case can copy the printed

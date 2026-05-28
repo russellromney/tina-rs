@@ -102,22 +102,34 @@ What is still bad (named, not hidden):
 - The HTTP rows still count only load-worker allocations; server-thread
   allocation accounting needs a process/sample-level probe later.
 
-Suggested follow-up (in order of leverage):
-- **Persistent host-call dispatcher** (Rock 5): replace the per-call
-  `HostCallDriver` registration with a pool of long-lived dispatcher isolates
-  per worker, round-robin selected. *Attempted in this session and verified
-  to deliver the reduction (17 → 11 process allocations per call, perf row
-  back to ~205 µs) — but reverted because the dispatcher pool consumes
-  `IsolateId`s at worker startup, breaking the live-capture → sim-replay
-  determinism invariant the runtime relies on (the bugbox smoke test caught
-  this).* Making Rock 5 DST-compatible needs either (a) a reserved
-  system-isolate ID range so user-isolate IDs stay parity-equal between live
-  and sim, (b) registering equivalent placeholder isolates in sim, or (c)
-  making system isolates trace-invisible. None are simple; this is a real
-  cross-cutting change, not a one-file fix.
+**Rock 5 landed**: the per-call `HostCallDriver` registration is gone,
+replaced by a pool of `HOST_CALL_DISPATCHER_POOL_SIZE = 8` long-lived
+dispatcher isolates per worker, round-robin selected via a wrapping atomic
+counter. Each `call_blocking` now pushes a `Box<dyn HostCallTaskBegin<S>>`
+onto an already-registered dispatcher's mailbox instead of registering a
+fresh isolate (mailbox + adapter + handler box + isolate entry + call-context
+queue) per call.
+
+DST replay parity was preserved by giving the simulator a
+`reserved_system_isolates` knob so user-isolate ids stay equal in both live
+and sim. The bugbox replay runner sets it to
+`tina_runtime::HOST_CALL_DISPATCHER_POOL_SIZE` and the captured trace
+replays bit-exact again. The bugbox's `SAVED_TRACE_HASH` was rebaked once
+to reflect the shifted-but-now-deterministic ids.
+
+Measured before/after Rock 5:
+
+| metric                              | before  | after   |
+|-------------------------------------|---------|---------|
+| `call_blocking` process allocs/call | 17      | **11**  |
+| `call_blocking` host allocs/call    | 4       | 5       |
+| probe p50 (single host thread)      | ~190 µs | ~183 µs |
+| perf row p50 (4 concurrent threads) | ~210 µs | ~205 µs |
+
+Suggested next follow-ups:
 - **Pre-allocated reply channel pool** (per-host-thread `thread_local`),
   type-erased via a slot table. Removes the `mpsc::channel` + sender-box
-  allocations on the host side.
+  allocations on the host side (the remaining 5 host allocs per call).
 - Add repeated-run / historical tracking before any public performance claim.
 - Add process-level allocation/RSS probes for HTTP and WebSocket rows.
 

@@ -136,7 +136,11 @@ pub const DEFAULT_SHUTDOWN_LANE_DRAIN_TIMEOUT: Duration = Duration::from_millis(
 /// Sized to cover typical concurrent host workloads; concurrency beyond this
 /// will round-robin onto already-busy dispatchers and partially serialize,
 /// which is the same backpressure shape Tina applies elsewhere.
-pub(crate) const HOST_CALL_DISPATCHER_POOL_SIZE: usize = 8;
+///
+/// Exposed publicly so DST replay runners can set
+/// `SimulatorConfig::reserved_system_isolates` to this value and keep
+/// user-isolate ids in parity between live and sim.
+pub const HOST_CALL_DISPATCHER_POOL_SIZE: usize = 8;
 
 /// Extra host-side delivery grace used by the legacy one-timeout
 /// `call_blocking` wrapper so a target call timeout can be delivered as

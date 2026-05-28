@@ -174,13 +174,19 @@ where
     }
 
     pub(crate) fn with_ids(shard: S, config: SimulatorConfig, ids: IdSource) -> Self {
+        // Advance the user-visible `IsolateId` counter past the system isolates
+        // a live `ThreadedRuntime` registers at startup (e.g. its host-call
+        // dispatcher pool). The simulator never registers those isolates
+        // itself, but skipping their id range keeps user-isolate ids in
+        // parity between live and sim so the captured trace replays exactly.
+        let next_isolate_id = 1 + config.reserved_system_isolates as u64;
         Self {
             shard,
             config,
             entries: Vec::with_capacity(INITIAL_ENTRY_CAPACITY),
             child_records: Vec::with_capacity(INITIAL_CHILD_RECORD_CAPACITY),
             supervisors: Vec::with_capacity(INITIAL_SUPERVISOR_CAPACITY),
-            next_isolate_id: 1,
+            next_isolate_id,
             next_listener_id: 1,
             next_stream_id: 1,
             next_udp_socket_id: 1,

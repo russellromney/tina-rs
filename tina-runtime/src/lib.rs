@@ -148,7 +148,10 @@ pub(crate) use dispatch::{ChildRecordSnapshot, SupervisorRecordSnapshot};
 
 pub use shutdown::ThreadedShutdownHandle;
 pub use single_call_gate::SingleCallGate;
-pub use threaded::{DEFAULT_SHUTDOWN_LANE_DRAIN_TIMEOUT, ThreadedRuntime, ThreadedRuntimeConfig};
+pub use threaded::{
+    DEFAULT_SHUTDOWN_LANE_DRAIN_TIMEOUT, HOST_CALL_DISPATCHER_POOL_SIZE, ThreadedRuntime,
+    ThreadedRuntimeConfig,
+};
 pub use threaded_multi_shard::ThreadedMultiShardRuntime;
 
 pub use live_report::{
