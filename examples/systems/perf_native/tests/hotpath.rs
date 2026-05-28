@@ -45,21 +45,19 @@ const CALL_CEILING_NS: u64 = 500_000; // 500us
 
 // Pinned warmed allocation ceilings (one warmed op). Two flavors: host-thread
 // scope (what the caller's thread pays per op) and process-wide (host + every
-// allocation the runtime worker thread makes on the caller's behalf —
-// dispatcher routing, in-flight-call entry, translator, etc.). The
+// allocation the runtime worker thread makes on the caller's behalf — driver
+// mailbox, isolate entry, in-flight-call entry, translator, etc.). The
 // process-wide number is the *real* per-op cost.
 //
-// Observed steady-state today (after Rock 5 — persistent host-call dispatcher
-// pool replacing the per-call `HostCallDriver`):
-//   try_send         host=1  process=1
-//   send_and_observe host=4  process=5
-//   call_blocking    host=5  process=11  (was 4 / 17 pre-Rock 5)
+// Observed steady-state today: try_send 1/1, send_and_observe 4/5,
+// call_blocking 4/17. The huge `call_blocking` process count is the per-call
+// `HostCallDriver` registration; eliminating it is the next big win (Rock 5).
 const HANDOFF_HOST_ALLOCATIONS_CEILING: u64 = 2;
 const OBSERVED_HOST_ALLOCATIONS_CEILING: u64 = 6;
-const CALL_HOST_ALLOCATIONS_CEILING: u64 = 7;
+const CALL_HOST_ALLOCATIONS_CEILING: u64 = 8;
 const HANDOFF_PROCESS_ALLOCATIONS_CEILING: u64 = 2;
 const OBSERVED_PROCESS_ALLOCATIONS_CEILING: u64 = 8;
-const CALL_PROCESS_ALLOCATIONS_CEILING: u64 = 14;
+const CALL_PROCESS_ALLOCATIONS_CEILING: u64 = 20;
 
 type Runtime = ThreadedRuntime<SingleShard, DefaultThreadedMailboxFactory>;
 
