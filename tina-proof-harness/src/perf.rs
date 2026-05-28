@@ -340,7 +340,13 @@ pub struct HotPathReport {
     pub min_ns: u64,
     pub max_ns: u64,
     pub stages: Vec<HotPathStage>,
+    /// Allocations the caller's host thread makes per op. Misses anything the
+    /// runtime worker thread allocates on the caller's behalf — see
+    /// [`HotPathReport::process_allocations`] for the full picture.
     pub allocations: Option<u64>,
+    /// Allocations the whole process makes per op: host thread + runtime
+    /// worker thread + lane workers. This is the real per-op allocation cost.
+    pub process_allocations: Option<u64>,
     pub env: PerfEnvironment,
 }
 
@@ -352,6 +358,26 @@ impl HotPathReport {
         mut totals_ns: Vec<u64>,
         stages: Vec<HotPathStage>,
         allocations: Option<u64>,
+    ) -> Self {
+        Self::from_samples_with_process_allocations(
+            label,
+            totals_ns.drain(..).collect(),
+            stages,
+            allocations,
+            None,
+        )
+    }
+
+    /// Builds a report including both host-thread allocations (`allocations`)
+    /// and whole-process allocations (`process_allocations`). The latter
+    /// captures everything the runtime worker thread allocates on the
+    /// caller's behalf, which the host-only count misses.
+    pub fn from_samples_with_process_allocations(
+        label: &'static str,
+        mut totals_ns: Vec<u64>,
+        stages: Vec<HotPathStage>,
+        allocations: Option<u64>,
+        process_allocations: Option<u64>,
     ) -> Self {
         assert!(
             !totals_ns.is_empty(),
@@ -370,6 +396,7 @@ impl HotPathReport {
             max_ns,
             stages,
             allocations,
+            process_allocations,
             env: PerfEnvironment::detect(),
         }
     }
@@ -379,7 +406,7 @@ impl HotPathReport {
     /// greppable.
     pub fn summary_line(&self) -> String {
         let mut line = format!(
-            "hotpath label={} iterations={} p50_us={} p50_ns={} min_ns={} max_ns={} allocations={} {}",
+            "hotpath label={} iterations={} p50_us={} p50_ns={} min_ns={} max_ns={} host_allocations={} process_allocations={} {}",
             report_value(self.label),
             self.iterations,
             self.p50_ns / 1_000,
@@ -389,8 +416,18 @@ impl HotPathReport {
             self.allocations
                 .map(|value| value.to_string())
                 .unwrap_or_else(|| "unknown".to_string()),
+            self.process_allocations
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "unknown".to_string()),
             self.env.summary_fields(),
         );
+        // Back-compat: keep the original key so existing grep lines still match.
+        line.push_str(&format!(
+            " allocations={}",
+            self.allocations
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "unknown".to_string())
+        ));
         for stage in &self.stages {
             line.push_str(&format!(
                 " stage.{}_ns={}",
@@ -412,12 +449,18 @@ impl HotPathReport {
         }
         stages.push('}');
         format!(
-            "{{\"schema\":\"tina.hotpath.v1\",\"label\":{},\"iterations\":{},\"p50_ns\":{},\"min_ns\":{},\"max_ns\":{},\"allocations\":{},\"platform\":{},\"arch\":{},\"profile\":{},\"git_sha\":{},\"stages\":{}}}",
+            "{{\"schema\":\"tina.hotpath.v1\",\"label\":{},\"iterations\":{},\"p50_ns\":{},\"min_ns\":{},\"max_ns\":{},\"host_allocations\":{},\"process_allocations\":{},\"allocations\":{},\"platform\":{},\"arch\":{},\"profile\":{},\"git_sha\":{},\"stages\":{}}}",
             json_string(self.label),
             self.iterations,
             self.p50_ns,
             self.min_ns,
             self.max_ns,
+            self.allocations
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "null".to_string()),
+            self.process_allocations
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "null".to_string()),
             self.allocations
                 .map(|value| value.to_string())
                 .unwrap_or_else(|| "null".to_string()),

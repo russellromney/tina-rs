@@ -43,19 +43,29 @@ thread_local! {
 static ALLOCATIONS: AtomicU64 = AtomicU64::new(0);
 static ALLOCATED_BYTES: AtomicU64 = AtomicU64::new(0);
 
+// Process-wide allocation counter. Counts every allocation in the whole
+// process, regardless of which thread or whether thread-local gating is on.
+// Probes that want to see worker-thread allocations (driver mailbox, isolate
+// entry, etc.) read this via [`count_process_allocations`].
+static PROCESS_ALLOCATIONS: AtomicU64 = AtomicU64::new(0);
+static PROCESS_ALLOCATED_BYTES: AtomicU64 = AtomicU64::new(0);
+
 struct CountingAllocator;
 
 unsafe impl GlobalAlloc for CountingAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         // SAFETY: Delegates to the process global allocator with the same layout.
         let ptr = unsafe { System.alloc(layout) };
-        if !ptr.is_null()
-            && COUNT_ALLOCATIONS
+        if !ptr.is_null() {
+            PROCESS_ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
+            PROCESS_ALLOCATED_BYTES.fetch_add(layout.size() as u64, Ordering::Relaxed);
+            if COUNT_ALLOCATIONS
                 .try_with(|enabled| enabled.get())
                 .unwrap_or(false)
-        {
-            ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
-            ALLOCATED_BYTES.fetch_add(layout.size() as u64, Ordering::Relaxed);
+            {
+                ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
+                ALLOCATED_BYTES.fetch_add(layout.size() as u64, Ordering::Relaxed);
+            }
         }
         ptr
     }
@@ -967,6 +977,32 @@ pub fn count_host_allocations<T>(f: impl FnOnce() -> T) -> (T, u64) {
     reset_allocations();
     let result = counted_allocations(f);
     (result, ALLOCATIONS.load(Ordering::Relaxed))
+}
+
+/// Runs `f` and returns its result plus the number of allocations the whole
+/// process saw during the call — every thread, no gate.
+///
+/// Use this to surface allocations the runtime's worker thread makes on a
+/// caller's behalf (driver mailbox, isolate entry, etc.) which the host-only
+/// counter misses. Run probes one at a time; concurrent measurements will
+/// share the counter and contaminate each other.
+pub fn count_process_allocations<T>(f: impl FnOnce() -> T) -> (T, u64) {
+    let before = PROCESS_ALLOCATIONS.load(Ordering::Relaxed);
+    let result = f();
+    let after = PROCESS_ALLOCATIONS.load(Ordering::Relaxed);
+    (result, after.saturating_sub(before))
+}
+
+/// Runs `f` once and returns its result plus both allocation counts for that
+/// same call: `(result, host_allocations, process_allocations)`. Run probes
+/// one at a time; the process counter is shared across threads.
+pub fn count_all_allocations<T>(f: impl FnOnce() -> T) -> (T, u64, u64) {
+    reset_allocations();
+    let process_before = PROCESS_ALLOCATIONS.load(Ordering::Relaxed);
+    let result = counted_allocations(f);
+    let process_after = PROCESS_ALLOCATIONS.load(Ordering::Relaxed);
+    let host = ALLOCATIONS.load(Ordering::Relaxed);
+    (result, host, process_after.saturating_sub(process_before))
 }
 
 fn counted_allocations<T>(f: impl FnOnce() -> T) -> T {

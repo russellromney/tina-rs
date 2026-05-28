@@ -22,7 +22,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use perf_native::count_host_allocations;
+use perf_native::count_all_allocations;
 use tina::prelude::*;
 use tina_proof_harness::{HotPathReport, HotPathStage};
 use tina_runtime::{
@@ -43,14 +43,21 @@ const HANDOFF_CEILING_NS: u64 = 100_000; // 100us
 const OBSERVED_CEILING_NS: u64 = 500_000; // 500us
 const CALL_CEILING_NS: u64 = 500_000; // 500us
 
-// Pinned warmed allocation ceilings (one host-thread op past warmup). These
-// catch a host-side allocation regression — e.g., a future change that boxes
-// or channel-allocates extra per call — without locking down a fragile exact
-// count. Observed steady-state today: try_send=1, send_and_observe=4,
-// call_blocking=4. Headroom is small on purpose.
-const HANDOFF_ALLOCATIONS_CEILING: u64 = 2;
-const OBSERVED_ALLOCATIONS_CEILING: u64 = 6;
-const CALL_ALLOCATIONS_CEILING: u64 = 8;
+// Pinned warmed allocation ceilings (one warmed op). Two flavors: host-thread
+// scope (what the caller's thread pays per op) and process-wide (host + every
+// allocation the runtime worker thread makes on the caller's behalf — driver
+// mailbox, isolate entry, in-flight-call entry, translator, etc.). The
+// process-wide number is the *real* per-op cost.
+//
+// Observed steady-state today: try_send 1/1, send_and_observe 4/5,
+// call_blocking 4/17. The huge `call_blocking` process count is the per-call
+// `HostCallDriver` registration; eliminating it is the next big win (Rock 5).
+const HANDOFF_HOST_ALLOCATIONS_CEILING: u64 = 2;
+const OBSERVED_HOST_ALLOCATIONS_CEILING: u64 = 6;
+const CALL_HOST_ALLOCATIONS_CEILING: u64 = 8;
+const HANDOFF_PROCESS_ALLOCATIONS_CEILING: u64 = 2;
+const OBSERVED_PROCESS_ALLOCATIONS_CEILING: u64 = 8;
+const CALL_PROCESS_ALLOCATIONS_CEILING: u64 = 20;
 
 type Runtime = ThreadedRuntime<SingleShard, DefaultThreadedMailboxFactory>;
 
@@ -271,16 +278,17 @@ fn probe_try_send() -> HotPathReport {
             .expect("try_send handoff");
         totals.push(t0.elapsed().as_nanos() as u64);
     }
-    let (_outcome, allocations) =
-        count_host_allocations(|| runtime.try_send(addr, CounterMsg::Hit));
+    let (_outcome, host_allocations, process_allocations) =
+        count_all_allocations(|| runtime.try_send(addr, CounterMsg::Hit));
 
     let p50 = median(&totals);
     shutdown(runtime);
-    HotPathReport::from_samples(
+    HotPathReport::from_samples_with_process_allocations(
         "hotpath_try_send",
         totals,
         vec![HotPathStage::new("host_submit_to_command_accepted", p50)],
-        Some(allocations),
+        Some(host_allocations),
+        Some(process_allocations),
     )
 }
 
@@ -301,16 +309,17 @@ fn probe_send_and_observe() -> HotPathReport {
             .expect("observed admission");
         totals.push(t0.elapsed().as_nanos() as u64);
     }
-    let (_outcome, allocations) =
-        count_host_allocations(|| runtime.send_and_observe(addr, CounterMsg::Hit));
+    let (_outcome, host_allocations, process_allocations) =
+        count_all_allocations(|| runtime.send_and_observe(addr, CounterMsg::Hit));
     shutdown(runtime);
 
     let stages = instrumented_send_and_observe();
-    HotPathReport::from_samples(
+    HotPathReport::from_samples_with_process_allocations(
         "hotpath_send_and_observe",
         totals,
         stages,
-        Some(allocations),
+        Some(host_allocations),
+        Some(process_allocations),
     )
 }
 
@@ -365,12 +374,18 @@ fn probe_call_blocking() -> HotPathReport {
         totals.push(t0.elapsed().as_nanos() as u64);
         assert_eq!(outcome, CallOutcome::Replied(PingReply::Pong));
     }
-    let (_outcome, allocations) =
-        count_host_allocations(|| runtime.call_blocking(ping, PingMsg::Ping, CALL_TIMEOUT));
+    let (_outcome, host_allocations, process_allocations) =
+        count_all_allocations(|| runtime.call_blocking(ping, PingMsg::Ping, CALL_TIMEOUT));
     shutdown(runtime);
 
     let stages = instrumented_call_blocking();
-    HotPathReport::from_samples("hotpath_call_blocking", totals, stages, Some(allocations))
+    HotPathReport::from_samples_with_process_allocations(
+        "hotpath_call_blocking",
+        totals,
+        stages,
+        Some(host_allocations),
+        Some(process_allocations),
+    )
 }
 
 fn instrumented_call_blocking() -> Vec<HotPathStage> {
@@ -432,32 +447,53 @@ fn hotpath_probes_report_and_stay_bounded() {
         call_blocking.p50_ns
     );
 
-    // Pin warmed host-thread allocations so a future regression that boxes or
-    // channel-allocates extra per op fails loudly rather than hiding in the
-    // reported number. Steady-state today: 1 / 4 / 4.
-    let try_send_allocations = try_send.allocations.expect("try_send allocations");
-    let observed_allocations = send_and_observe
-        .allocations
-        .expect("send_and_observe allocations");
-    let call_allocations = call_blocking
-        .allocations
-        .expect("call_blocking allocations");
+    // Pin both host-thread and process-wide allocations. Host pins the
+    // caller-side cost; process pins the true per-op cost including everything
+    // the worker thread allocates on the caller's behalf.
+    let try_send_host = try_send.allocations.expect("try_send host");
+    let observed_host = send_and_observe.allocations.expect("send_and_observe host");
+    let call_host = call_blocking.allocations.expect("call_blocking host");
+    let try_send_process = try_send.process_allocations.expect("try_send process");
+    let observed_process = send_and_observe
+        .process_allocations
+        .expect("send_and_observe process");
+    let call_process = call_blocking
+        .process_allocations
+        .expect("call_blocking process");
     assert!(
-        try_send_allocations <= HANDOFF_ALLOCATIONS_CEILING,
-        "try_send allocates {} per op (ceiling {})",
-        try_send_allocations,
-        HANDOFF_ALLOCATIONS_CEILING
+        try_send_host <= HANDOFF_HOST_ALLOCATIONS_CEILING,
+        "try_send host {} (ceiling {})",
+        try_send_host,
+        HANDOFF_HOST_ALLOCATIONS_CEILING
     );
     assert!(
-        observed_allocations <= OBSERVED_ALLOCATIONS_CEILING,
-        "send_and_observe allocates {} per op (ceiling {})",
-        observed_allocations,
-        OBSERVED_ALLOCATIONS_CEILING
+        observed_host <= OBSERVED_HOST_ALLOCATIONS_CEILING,
+        "send_and_observe host {} (ceiling {})",
+        observed_host,
+        OBSERVED_HOST_ALLOCATIONS_CEILING
     );
     assert!(
-        call_allocations <= CALL_ALLOCATIONS_CEILING,
-        "call_blocking allocates {} per op (ceiling {})",
-        call_allocations,
-        CALL_ALLOCATIONS_CEILING
+        call_host <= CALL_HOST_ALLOCATIONS_CEILING,
+        "call_blocking host {} (ceiling {})",
+        call_host,
+        CALL_HOST_ALLOCATIONS_CEILING
+    );
+    assert!(
+        try_send_process <= HANDOFF_PROCESS_ALLOCATIONS_CEILING,
+        "try_send process {} (ceiling {})",
+        try_send_process,
+        HANDOFF_PROCESS_ALLOCATIONS_CEILING
+    );
+    assert!(
+        observed_process <= OBSERVED_PROCESS_ALLOCATIONS_CEILING,
+        "send_and_observe process {} (ceiling {})",
+        observed_process,
+        OBSERVED_PROCESS_ALLOCATIONS_CEILING
+    );
+    assert!(
+        call_process <= CALL_PROCESS_ALLOCATIONS_CEILING,
+        "call_blocking process {} (ceiling {})",
+        call_process,
+        CALL_PROCESS_ALLOCATIONS_CEILING
     );
 }
