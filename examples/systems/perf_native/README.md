@@ -87,20 +87,31 @@ What felt good:
   so the fix belonged in the worker loop, not the ingress path.
 
 What is still bad (named, not hidden):
-- `host_request_reply` is still ~10× Tokio at ~210 µs p50. The cost is the
-  per-call host driver: `call_blocking` registers a one-shot driver isolate and
-  allocates a reply channel + boxed command per call (484 allocations vs
-  Tokio's 133). It is no longer millisecond-scale, so the driver path stays for
-  now; the allocation + multi-turn cost is the next bottleneck, not a sleep.
-- The floor is now ~45 µs per worker turn: cross-thread wakeup and scheduling
-  between the host and the shard worker. A call is ~3 turns.
+- `host_request_reply` is still ~10× Tokio at ~200 µs p50. The probe now
+  measures **17 process-wide allocations per call** (host + worker thread),
+  not the 4 it used to report — the host-only counter hid 13 worker-thread
+  allocations from registering a fresh `HostCallDriver` isolate per call
+  (mailbox + adapter box + handler box + isolate entry + in-flight-call entry
+  + translator + call-context queue).
+- Roughly half the latency is the three cross-thread wakeups required by the
+  three runtime turns (`Begin` → target → `Returned`); the other half is the
+  per-call driver registration. The Tokio comparison is partly architectural:
+  Tokio's `current_thread` runtime is single-threaded so its `call_blocking`
+  has zero cross-thread cost — `Tina`'s `ThreadedRuntime` is shard-per-thread
+  by design and pays one wakeup per turn.
 - The HTTP rows still count only load-worker allocations; server-thread
   allocation accounting needs a process/sample-level probe later.
 
-Suggested follow-up:
-- If `host_request_reply` needs to drop further, replace the per-call driver
-  isolate with a runtime-owned host-call path (bounded pending table) — same
-  `CallOutcome` truth, fewer allocations and turns.
+Suggested follow-up (in order of leverage):
+- **Persistent host-call dispatcher** (Rock 5): replace the per-call
+  `HostCallDriver` registration with one long-lived dispatcher isolate per
+  worker. Type-erase the per-call message via `Box<dyn HostCallTaskBegin>` /
+  `Box<dyn HostCallTaskComplete>`. Eliminates the per-call mailbox/adapter/
+  handler-box/entry allocations (saves ~5–7 per call, down from 17 toward
+  ~10). Same `CallOutcome` truth; same 3 turns; same cross-thread cost.
+- **Pre-allocated reply channel pool** (per-host-thread `thread_local`),
+  type-erased via a slot table. Removes the `mpsc::channel` + sender-box
+  allocations on the host side.
 - Add repeated-run / historical tracking before any public performance claim.
 - Add process-level allocation/RSS probes for HTTP and WebSocket rows.
 
