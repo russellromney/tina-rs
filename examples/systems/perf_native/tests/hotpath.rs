@@ -35,12 +35,22 @@ const ITERS: usize = 200;
 const WARMUP: usize = 40;
 const CALL_TIMEOUT: Duration = Duration::from_secs(2);
 
-// Loose ceilings. They exist to catch a regression back to millisecond-scale
-// local work, not to pin an exact number on a shared machine. Tiny same-shard
-// work should sit far below these after the worker-loop fix.
+// Loose latency ceilings. They exist to catch a regression back to
+// millisecond-scale local work, not to pin an exact number on a shared
+// machine. Tiny same-shard work should sit far below these after the
+// worker-loop fix.
 const HANDOFF_CEILING_NS: u64 = 100_000; // 100us
 const OBSERVED_CEILING_NS: u64 = 500_000; // 500us
 const CALL_CEILING_NS: u64 = 500_000; // 500us
+
+// Pinned warmed allocation ceilings (one host-thread op past warmup). These
+// catch a host-side allocation regression — e.g., a future change that boxes
+// or channel-allocates extra per call — without locking down a fragile exact
+// count. Observed steady-state today: try_send=1, send_and_observe=4,
+// call_blocking=4. Headroom is small on purpose.
+const HANDOFF_ALLOCATIONS_CEILING: u64 = 2;
+const OBSERVED_ALLOCATIONS_CEILING: u64 = 6;
+const CALL_ALLOCATIONS_CEILING: u64 = 8;
 
 type Runtime = ThreadedRuntime<SingleShard, DefaultThreadedMailboxFactory>;
 
@@ -420,5 +430,34 @@ fn hotpath_probes_report_and_stay_bounded() {
         call_blocking.p50_ns < CALL_CEILING_NS,
         "host call must not be millisecond-scale: {} ns",
         call_blocking.p50_ns
+    );
+
+    // Pin warmed host-thread allocations so a future regression that boxes or
+    // channel-allocates extra per op fails loudly rather than hiding in the
+    // reported number. Steady-state today: 1 / 4 / 4.
+    let try_send_allocations = try_send.allocations.expect("try_send allocations");
+    let observed_allocations = send_and_observe
+        .allocations
+        .expect("send_and_observe allocations");
+    let call_allocations = call_blocking
+        .allocations
+        .expect("call_blocking allocations");
+    assert!(
+        try_send_allocations <= HANDOFF_ALLOCATIONS_CEILING,
+        "try_send allocates {} per op (ceiling {})",
+        try_send_allocations,
+        HANDOFF_ALLOCATIONS_CEILING
+    );
+    assert!(
+        observed_allocations <= OBSERVED_ALLOCATIONS_CEILING,
+        "send_and_observe allocates {} per op (ceiling {})",
+        observed_allocations,
+        OBSERVED_ALLOCATIONS_CEILING
+    );
+    assert!(
+        call_allocations <= CALL_ALLOCATIONS_CEILING,
+        "call_blocking allocates {} per op (ceiling {})",
+        call_allocations,
+        CALL_ALLOCATIONS_CEILING
     );
 }
