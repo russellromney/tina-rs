@@ -104,11 +104,17 @@ What is still bad (named, not hidden):
 
 Suggested follow-up (in order of leverage):
 - **Persistent host-call dispatcher** (Rock 5): replace the per-call
-  `HostCallDriver` registration with one long-lived dispatcher isolate per
-  worker. Type-erase the per-call message via `Box<dyn HostCallTaskBegin>` /
-  `Box<dyn HostCallTaskComplete>`. Eliminates the per-call mailbox/adapter/
-  handler-box/entry allocations (saves ~5–7 per call, down from 17 toward
-  ~10). Same `CallOutcome` truth; same 3 turns; same cross-thread cost.
+  `HostCallDriver` registration with a pool of long-lived dispatcher isolates
+  per worker, round-robin selected. *Attempted in this session and verified
+  to deliver the reduction (17 → 11 process allocations per call, perf row
+  back to ~205 µs) — but reverted because the dispatcher pool consumes
+  `IsolateId`s at worker startup, breaking the live-capture → sim-replay
+  determinism invariant the runtime relies on (the bugbox smoke test caught
+  this).* Making Rock 5 DST-compatible needs either (a) a reserved
+  system-isolate ID range so user-isolate IDs stay parity-equal between live
+  and sim, (b) registering equivalent placeholder isolates in sim, or (c)
+  making system isolates trace-invisible. None are simple; this is a real
+  cross-cutting change, not a one-file fix.
 - **Pre-allocated reply channel pool** (per-host-thread `thread_local`),
   type-erased via a slot table. Removes the `mpsc::channel` + sender-box
   allocations on the host side.
