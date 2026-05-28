@@ -317,6 +317,11 @@ fn instrumented_send_and_observe() -> Vec<HotPathStage> {
     // worker delivers on a later turn, so without this the warm message's
     // delivery events race into the measured window and the breakdown lies.
     wait_count(&count, 1);
+    // `wait_count` sees the increment inside `handle()`, but the runtime emits
+    // `HandlerFinished` and `EffectObserved` *after* the handler returns. A
+    // worker round-trip serializes the clear past those tail events so they do
+    // not race into the next window. (Pure read, no extra trace events.)
+    let _ = runtime.has_in_flight_calls();
     timer.clear();
     let t0 = Instant::now();
     runtime
@@ -367,6 +372,11 @@ fn instrumented_call_blocking() -> Vec<HotPathStage> {
     runtime
         .call_blocking(ping, PingMsg::Ping, CALL_TIMEOUT)
         .expect("warm call");
+    // `call_blocking` returns when the driver sends its outcome on the reply
+    // channel, *before* the runtime processes the driver's `stop()` effect and
+    // emits `IsolateStopped`. A worker round-trip serializes the clear past
+    // that tail so it cannot race into the measured window.
+    let _ = runtime.has_in_flight_calls();
     timer.clear();
     let t0 = Instant::now();
     let outcome = runtime
