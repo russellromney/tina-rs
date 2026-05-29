@@ -67,6 +67,7 @@ mod full_handling;
 pub mod guarded_pending;
 mod host_burst;
 mod host_call_dispatcher;
+mod host_call_reply_pool;
 pub mod lifecycle;
 mod live_report;
 mod local_permit;

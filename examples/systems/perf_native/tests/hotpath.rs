@@ -49,17 +49,18 @@ const CALL_CEILING_NS: u64 = 500_000; // 500us
 // dispatcher routing, in-flight-call entry, translator, etc.). The
 // process-wide number is the *real* per-op cost.
 //
-// Observed steady-state today (after Rock 5 — persistent host-call dispatcher
-// pool replacing the per-call `HostCallDriver`):
+// Observed steady-state today (after Rock 5 + per-host-thread reply channel
+// pool — the dispatcher pool eliminates per-call `HostCallDriver`
+// registration, the reply pool eliminates the per-call `mpsc::channel()`):
 //   try_send         host=1  process=1
 //   send_and_observe host=4  process=5
-//   call_blocking    host=5  process=11  (was 4 / 17 pre-Rock 5)
+//   call_blocking    host=2  process=7  (4/17 pre-Rock-5, 5/11 post-Rock-5)
 const HANDOFF_HOST_ALLOCATIONS_CEILING: u64 = 2;
 const OBSERVED_HOST_ALLOCATIONS_CEILING: u64 = 6;
-const CALL_HOST_ALLOCATIONS_CEILING: u64 = 7;
+const CALL_HOST_ALLOCATIONS_CEILING: u64 = 4;
 const HANDOFF_PROCESS_ALLOCATIONS_CEILING: u64 = 2;
 const OBSERVED_PROCESS_ALLOCATIONS_CEILING: u64 = 8;
-const CALL_PROCESS_ALLOCATIONS_CEILING: u64 = 14;
+const CALL_PROCESS_ALLOCATIONS_CEILING: u64 = 10;
 
 type Runtime = ThreadedRuntime<SingleShard, DefaultThreadedMailboxFactory>;
 

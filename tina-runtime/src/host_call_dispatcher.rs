@@ -27,12 +27,12 @@
 
 use std::convert::Infallible;
 use std::marker::PhantomData;
-use std::sync::mpsc;
 use std::time::Duration;
 
 use tina::{Address, Context, Effect, Isolate, Outbound as TinaOutbound, Shard};
 
 use crate::call::{CallOutcome, RuntimeCall, call};
+use crate::host_call_reply_pool::TypedReplySender;
 
 /// One persistent dispatcher isolate per worker shard.
 pub(crate) struct HostCallDispatcher<S: Shard + 'static> {
@@ -77,7 +77,7 @@ where
     pub(crate) target: Address<M, R>,
     pub(crate) message: M,
     pub(crate) timeout: Duration,
-    pub(crate) sender: mpsc::Sender<CallOutcome<R>>,
+    pub(crate) sender: TypedReplySender<CallOutcome<R>>,
     pub(crate) _marker: PhantomData<S>,
 }
 
@@ -103,17 +103,18 @@ where
 
 pub(crate) struct ConcreteHostCallComplete<R: Send + 'static> {
     pub(crate) outcome: CallOutcome<R>,
-    pub(crate) sender: mpsc::Sender<CallOutcome<R>>,
+    pub(crate) sender: TypedReplySender<CallOutcome<R>>,
 }
 
 impl<R: Send + 'static> HostCallTaskComplete for ConcreteHostCallComplete<R> {
     fn complete(self: Box<Self>) {
         let ConcreteHostCallComplete { outcome, sender } = *self;
         // The host may have already given up (HostWaitTimeout) and dropped the
-        // receiver — in which case the send fails silently, the outcome is
-        // discarded, and the runtime's late-reply trace event already records
-        // that the call completed.
-        let _ = sender.send(outcome);
+        // receiver — in which case `send` stores into a shared state nobody
+        // will read, and the channel is freed when the sender drops. The
+        // runtime's late-reply trace event already records that the call
+        // completed.
+        sender.send(outcome);
     }
 }
 

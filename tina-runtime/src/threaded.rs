@@ -9,7 +9,7 @@
 use std::alloc::Global;
 use std::convert::Infallible;
 use std::marker::PhantomData;
-use std::sync::{Arc, mpsc};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -1244,14 +1244,19 @@ where
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
             % self.dispatchers.len();
         let dispatcher_addr = self.dispatchers[idx];
-        let (reply_tx, reply_rx) = mpsc::channel();
+        // Check out a typed reply channel from this host thread's pool. A
+        // warmed-up pool turns the per-call `mpsc::channel()` allocation into
+        // a `Vec::pop()`; cold paths allocate one new typed channel and
+        // recycle it forever.
+        let reply = crate::host_call_reply_pool::checkout::<CallOutcome<R>>();
+        let sender = reply.sender();
         // Type-erase the per-call task and hand it to the persistent dispatcher
         // — no per-call isolate registration, no per-call mailbox/handler box.
         let begin: Box<dyn HostCallTaskBegin<S>> = Box::new(ConcreteHostCallBegin::<S, M, R> {
             target: address,
             message,
             timeout: target_timeout,
-            sender: reply_tx,
+            sender,
             _marker: PhantomData,
         });
         let command = ThreadedCommand::Run(Box::new(move |runtime| {
@@ -1265,18 +1270,31 @@ where
         match self.commands.try_send(command) {
             Ok(()) => {}
             Err(std::sync::mpsc::TrySendError::Full(_)) => {
+                // `reply` returns to the pool naturally on drop here — the
+                // sender lives inside `command`, which we still own and which
+                // drops on this branch.
+                crate::host_call_reply_pool::checkin(reply);
                 return Err(ThreadedRuntimeError::CommandFull);
             }
             Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                crate::host_call_reply_pool::checkin(reply);
                 self.metrics.set_state(LiveShardState::Failed);
                 return Err(ThreadedRuntimeError::WorkerStopped);
             }
         }
 
-        match reply_rx.recv_timeout(host_wait_timeout) {
+        let outcome = reply.recv_timeout(host_wait_timeout);
+        // Return the channel to the pool *only if* no sender is outstanding
+        // — `checkin` enforces this via `Arc::strong_count == 1`. A
+        // `HostWaitTimeout` while the dispatcher still holds the sender leaves
+        // the channel un-poolable; it dies when the late sender drops.
+        crate::host_call_reply_pool::checkin(reply);
+        match outcome {
             Ok(outcome) => Ok(outcome),
-            Err(mpsc::RecvTimeoutError::Timeout) => Err(ThreadedRuntimeError::HostWaitTimeout),
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
+            Err(crate::host_call_reply_pool::RecvError::Timeout) => {
+                Err(ThreadedRuntimeError::HostWaitTimeout)
+            }
+            Err(crate::host_call_reply_pool::RecvError::Disconnected) => {
                 self.metrics.set_state(LiveShardState::Failed);
                 Err(ThreadedRuntimeError::WorkerStopped)
             }
