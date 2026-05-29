@@ -1,0 +1,76 @@
+#!/usr/bin/env bash
+# Runs `make perf` and compares each row's tina_p50_ns against the median of
+# the most recent N runs in the perf history. Exits non-zero on any row
+# regressing by more than THRESHOLD_PERCENT.
+#
+# Designed for a pre-merge gate: a small p50 wobble across runs is normal,
+# but a real regression (e.g. allocations doubled, latency tripled) should
+# fail loudly. Uses median-of-N so a single jittery outlier doesn't trip
+# the gate; uses the most recent N so a long-stale baseline doesn't either.
+
+set -euo pipefail
+
+HISTORY_FILE=".intent/phases/145-hot-path-reality-check/perf_history.jsonl"
+WINDOW="${PERF_CHECK_WINDOW:-5}"
+THRESHOLD_PERCENT="${PERF_CHECK_THRESHOLD:-25}"
+
+if [[ ! -f $HISTORY_FILE ]]; then
+  echo "no history at $HISTORY_FILE — run scripts/perf_record.sh first" >&2
+  exit 0
+fi
+
+echo "Running make perf..." >&2
+output=$(make perf 2>&1)
+
+fail=0
+
+# Iterate each label observed in the current run.
+labels=$(grep '^perf-compare' <<< "$output" | grep -oE 'label=[a-z0-9_]+' | sed 's/label=//' | sort -u)
+
+printf '%-32s %12s %12s %8s %s\n' "label" "current_ns" "median_ns" "delta%" "verdict"
+printf '%-32s %12s %12s %8s %s\n' "-----" "----------" "---------" "------" "-------"
+
+for label in $labels; do
+  current=$(grep "^perf-compare label=$label " <<< "$output" | grep -oE 'tina_p50_ns=[0-9]+' | head -1 | cut -d= -f2)
+  if [[ -z $current ]]; then
+    printf '%-32s %12s %12s %8s %s\n' "$label" "?" "?" "?" "skipped (no current p50)"
+    continue
+  fi
+
+  # Pull p50 from history for this label's compare rows. tail to the most
+  # recent WINDOW entries, then sort numerically to take the median.
+  historical=$(grep '"kind":"compare"' "$HISTORY_FILE" \
+                 | grep "\"label\":\"$label\"" \
+                 | grep -oE '"tina_p50_ns":[0-9]+' \
+                 | cut -d: -f2 \
+                 | tail -n "$WINDOW" \
+                 | sort -n)
+
+  if [[ -z $historical ]]; then
+    printf '%-32s %12s %12s %8s %s\n' "$label" "$current" "-" "-" "no history (first run for this label)"
+    continue
+  fi
+
+  count=$(wc -l <<< "$historical" | tr -d ' ')
+  # Median index (1-based).
+  median_idx=$(( (count + 1) / 2 ))
+  median=$(sed -n "${median_idx}p" <<< "$historical")
+
+  if [[ -z $median || $median -eq 0 ]]; then
+    printf '%-32s %12s %12s %8s %s\n' "$label" "$current" "$median" "-" "median zero — skipped"
+    continue
+  fi
+
+  delta_pct=$(( (current - median) * 100 / median ))
+
+  if (( delta_pct > THRESHOLD_PERCENT )); then
+    printf '%-32s %12s %12s %+8d %s\n' "$label" "$current" "$median" "$delta_pct" "REGRESSION (> +${THRESHOLD_PERCENT}%)"
+    fail=1
+  elif (( delta_pct < -THRESHOLD_PERCENT )); then
+    printf '%-32s %12s %12s %+8d %s\n' "$label" "$current" "$median" "$delta_pct" "improvement"
+  else
+    printf '%-32s %12s %12s %+8d %s\n' "$label" "$current" "$median" "$delta_pct" "ok"
+  fi
+done
+
+exit "$fail"
