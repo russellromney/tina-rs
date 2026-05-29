@@ -711,6 +711,7 @@ fn tina_http_row(
         .map_err(|e| anyhow::anyhow!("observe tina http bind: {e:?}"))?;
     http_get(addr, keepalive, if keepalive { 2 } else { 1 }, expected_len)?;
 
+    let process_before = ProcessSnapshot::now();
     let (load, allocations) = run_counted(
         LoadRun {
             workers: WORKERS,
@@ -723,6 +724,8 @@ fn tina_http_row(
         },
         None::<fn() -> LoadObservation>,
     );
+    let (allocs_delta, rss_delta) = ProcessSnapshot::now().delta_from(process_before);
+    print_process_metrics(label, allocs_delta, rss_delta);
     let _ = runtime.try_send(listener, HttpListenerMsg::Stop);
     shutdown_runtime(runtime)?;
     Ok(PerfReport::from_load_with_allocations(
@@ -769,6 +772,7 @@ fn tokio_http_row(
     });
     let addr = addr_rx.recv_timeout(Duration::from_secs(2))?;
     request(addr)?;
+    let process_before = ProcessSnapshot::now();
     let (load, allocations) = run_counted(
         LoadRun {
             workers: WORKERS,
@@ -781,6 +785,8 @@ fn tokio_http_row(
         },
         None::<fn() -> LoadObservation>,
     );
+    let (allocs_delta, rss_delta) = ProcessSnapshot::now().delta_from(process_before);
+    print_process_metrics(label, allocs_delta, rss_delta);
     let _ = stop_tx.send(());
     done_rx.recv_timeout(Duration::from_secs(2))?;
     handle
@@ -1003,6 +1009,67 @@ pub fn count_all_allocations<T>(f: impl FnOnce() -> T) -> (T, u64, u64) {
     let process_after = PROCESS_ALLOCATIONS.load(Ordering::Relaxed);
     let host = ALLOCATIONS.load(Ordering::Relaxed);
     (result, host, process_after.saturating_sub(process_before))
+}
+
+/// Resident set size in kilobytes for the calling process, from `getrusage`.
+/// Macros into 0 if the call fails (it shouldn't; the syscall is a hard
+/// requirement of POSIX). On macOS `ru_maxrss` is reported in bytes; on
+/// Linux it is kilobytes — we normalise both to kilobytes here.
+pub fn rss_kb_now() -> u64 {
+    // SAFETY: `getrusage` writes into a caller-owned `rusage`; zero-init is
+    // valid.
+    let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+    let rc = unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) };
+    if rc != 0 {
+        return 0;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // macOS reports bytes — convert to kilobytes.
+        (usage.ru_maxrss as u64) / 1024
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        // Linux + most other unices already report kilobytes.
+        usage.ru_maxrss as u64
+    }
+}
+
+/// Snapshot of "what the whole process has done so far" — total
+/// allocations and current RSS. Take one before a measured region and one
+/// after; the deltas are the region's true process cost.
+#[derive(Debug, Clone, Copy)]
+pub struct ProcessSnapshot {
+    pub allocations: u64,
+    pub rss_kb: u64,
+}
+
+impl ProcessSnapshot {
+    pub fn now() -> Self {
+        Self {
+            allocations: PROCESS_ALLOCATIONS.load(Ordering::Relaxed),
+            rss_kb: rss_kb_now(),
+        }
+    }
+
+    /// Returns `(allocations_delta, rss_delta_kb)`. RSS can go down, so the
+    /// delta is signed; allocations are monotone.
+    pub fn delta_from(&self, before: ProcessSnapshot) -> (u64, i64) {
+        (
+            self.allocations.saturating_sub(before.allocations),
+            (self.rss_kb as i64) - (before.rss_kb as i64),
+        )
+    }
+}
+
+/// Prints one extra `perf-process` line for a row, capturing the
+/// whole-process cost the existing thread-local-gated `tina_allocations`
+/// number misses (server-thread allocations, RSS growth). Stable
+/// grep-friendly key=value shape so historical tracking can scrape it.
+pub fn print_process_metrics(label: &str, allocations_delta: u64, rss_delta_kb: i64) {
+    println!(
+        "perf-process label={label} process_allocations={allocations_delta} rss_delta_kb={rss_delta_kb}"
+    );
 }
 
 fn counted_allocations<T>(f: impl FnOnce() -> T) -> T {

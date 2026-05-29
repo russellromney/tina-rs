@@ -11,6 +11,7 @@ publish = false
 [dependencies]
 anyhow = "1"
 axum = "0.7"
+libc = "0.2"
 tina = { path = "../../../tina" }
 tina-http = { path = "../../../tina-http" }
 tina-proof-harness = { path = "../../../tina-proof-harness" }
