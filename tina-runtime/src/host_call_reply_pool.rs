@@ -35,8 +35,8 @@ struct ReplyState<R> {
 }
 
 struct ReplyInner<R> {
-    value: Option<R>,
-    sender_dropped: bool,
+    value: Option<(Instant, R)>,
+    sender_dropped_at: Option<Instant>,
 }
 
 /// Receiver side of a reusable typed one-shot channel. Holds an `Arc` to the
@@ -52,7 +52,7 @@ impl<R: Send + 'static> TypedReply<R> {
             state: Arc::new(ReplyState {
                 inner: Mutex::new(ReplyInner {
                     value: None,
-                    sender_dropped: false,
+                    sender_dropped_at: None,
                 }),
                 cond: Condvar::new(),
             }),
@@ -75,11 +75,17 @@ impl<R: Send + 'static> TypedReply<R> {
         let mut guard = self.state.inner.lock().expect("reply recv lock");
         let started_at = Instant::now();
         loop {
-            if let Some(value) = guard.value.take() {
-                return Ok(value);
+            if let Some((sent_at, value)) = guard.value.take() {
+                if sent_at.saturating_duration_since(started_at) <= timeout {
+                    return Ok(value);
+                }
+                return Err(RecvError::Timeout);
             }
-            if guard.sender_dropped {
-                return Err(RecvError::Disconnected);
+            if let Some(dropped_at) = guard.sender_dropped_at {
+                if dropped_at.saturating_duration_since(started_at) <= timeout {
+                    return Err(RecvError::Disconnected);
+                }
+                return Err(RecvError::Timeout);
             }
             let elapsed = started_at.elapsed();
             if elapsed >= timeout {
@@ -100,7 +106,7 @@ impl<R: Send + 'static> TypedReply<R> {
     fn reset_for_reuse(&mut self) {
         let mut guard = self.state.inner.lock().expect("reply reset lock");
         guard.value = None;
-        guard.sender_dropped = false;
+        guard.sender_dropped_at = None;
     }
 }
 
@@ -115,7 +121,7 @@ impl<R: Send + 'static> TypedReplySender<R> {
         // Hold the lock only to set the value. The notify in `Drop` (which
         // runs after this method returns) wakes the receiver.
         let mut guard = self.state.inner.lock().expect("reply send lock");
-        guard.value = Some(value);
+        guard.value = Some((Instant::now(), value));
     }
 }
 
@@ -126,7 +132,7 @@ impl<R: Send + 'static> Drop for TypedReplySender<R> {
         {
             let mut guard = self.state.inner.lock().expect("reply drop lock");
             if guard.value.is_none() {
-                guard.sender_dropped = true;
+                guard.sender_dropped_at = Some(Instant::now());
             }
         }
         self.state.cond.notify_one();
@@ -219,6 +225,38 @@ mod tests {
             reply.recv_timeout(Duration::from_millis(20)),
             Err(RecvError::Timeout)
         ));
+        checkin(reply);
+    }
+
+    #[test]
+    fn late_send_after_timeout_still_reports_timeout() {
+        let reply = checkout::<u32>();
+        let sender = reply.sender();
+        let handle = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(30));
+            sender.send(7);
+        });
+        assert!(matches!(
+            reply.recv_timeout(Duration::from_millis(5)),
+            Err(RecvError::Timeout)
+        ));
+        handle.join().unwrap();
+        checkin(reply);
+    }
+
+    #[test]
+    fn late_drop_after_timeout_still_reports_timeout() {
+        let reply = checkout::<u32>();
+        let sender = reply.sender();
+        let handle = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(30));
+            drop(sender);
+        });
+        assert!(matches!(
+            reply.recv_timeout(Duration::from_millis(5)),
+            Err(RecvError::Timeout)
+        ));
+        handle.join().unwrap();
         checkin(reply);
     }
 
