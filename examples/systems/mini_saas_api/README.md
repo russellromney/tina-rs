@@ -230,6 +230,9 @@ cargo test --manifest-path examples/systems/mini_saas_api/Cargo.toml --test smok
 
 # Load/soak proof (Phase 108) with typed capacity contract:
 cargo test --manifest-path examples/systems/mini_saas_api/Cargo.toml --test soak -- --nocapture
+
+# Local performance row for the repo-level `make perf` command:
+cargo test --release --manifest-path examples/systems/mini_saas_api/Cargo.toml --test perf -- --nocapture
 ```
 
 The soak proof drives 4 workers × 240 ops across three lanes
@@ -252,6 +255,13 @@ typed `pressure` summary on the load report (rate, burst length,
 first error position, per-kind breakdown) lets specimens assert
 "pressure stayed under N per mille" or "no burst longer than K
 consecutive errors" without parsing the summary line.
+
+The perf test is the same kind of work, tuned smaller and wrapped in
+`tina_proof_harness::PerfReport`. It prints a `perf ...` line and a
+`{"schema":"tina.perf_report.v1", ...}` line with local-machine timing,
+pressure, capacity-surface count, and `comparison_baseline=none`. It is local
+release-mode performance evidence for this checkout; Tokio/hyper comparison
+comes later through equivalent-workload baselines.
 
 What this exposes when it fails:
 

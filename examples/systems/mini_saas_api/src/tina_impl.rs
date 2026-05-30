@@ -1645,7 +1645,7 @@ fn text(status: StatusCode, body: impl Into<String>) -> HttpResponse {
 /// initial create). The point is "many requests, real shutdown, no
 /// leaks" — not throughput.
 pub fn run_soak(config: crate::SoakConfig) -> anyhow::Result<crate::SoakReport> {
-    use tina_proof_harness::load::{self, LoadRun, LoadStop, OpOutcome};
+    use tina_proof_harness::load::{self, LoadObservation, LoadRun, LoadStop, OpOutcome};
 
     // Same manifest, same install caps as `run`: the soak service is
     // configured from the manifest too.
@@ -1778,7 +1778,9 @@ pub fn run_soak(config: crate::SoakConfig) -> anyhow::Result<crate::SoakReport> 
     // and the soak only proves the HTTP+DB shape.
     let op_addr = addr;
     let timeout = config.connect_timeout;
-    let load_report = load::run(
+    let observe_addr = addr;
+    let observe_trace = live_trace.clone();
+    let load_report = load::run_with_observation(
         LoadRun {
             workers: config.workers,
             stop: LoadStop::ops(config.op_count),
@@ -1819,7 +1821,23 @@ pub fn run_soak(config: crate::SoakConfig) -> anyhow::Result<crate::SoakReport> 
                 Err(_) => OpOutcome::Timeout,
             }
         },
-        None::<fn() -> bool>,
+        Some(move || match crate::get(observe_addr, "/debug/capacity") {
+            Ok(capacity) => {
+                let mut observation = load_observation_from_capacity_body(capacity.body.trim_end());
+                let pressure = observe_trace.pressure_summary();
+                observation.late = pressure.reply_rejected_no_pending_call;
+                observation
+            }
+            Err(_) => LoadObservation {
+                leak_clean: false,
+                unavailable_surfaces: vec![tina_proof_harness::UnavailableSurface {
+                    name: "mini_saas_api.capacity".to_string(),
+                    kind: "http_probe",
+                    reason: "GET /debug/capacity failed after load".to_string(),
+                }],
+                ..LoadObservation::default()
+            },
+        }),
     );
 
     // Snapshot capacity while the runtime is still up.
@@ -1881,6 +1899,104 @@ pub fn run_soak(config: crate::SoakConfig) -> anyhow::Result<crate::SoakReport> 
         terminal_line,
         shutdown_clean,
     })
+}
+
+fn load_observation_from_capacity_body(body: &str) -> tina_proof_harness::LoadObservation {
+    use tina_proof_harness::{LoadObservation, SurfacePlateau};
+
+    let http_cap = parse_usize_field(body, "http.body_cap");
+    let http_current = parse_usize_field(body, "http.request_body_current").unwrap_or(0);
+    let http_high = parse_usize_field(body, "http.request_body_high_water").unwrap_or(0);
+    let http_full = parse_u64_field(body, "http.body_full").unwrap_or(0);
+
+    let db_cap = parse_usize_field(body, "db.capacity");
+    let db_current = parse_usize_field(body, "db.in_flight").unwrap_or(0);
+    let db_high = parse_usize_field(body, "db.high_water").unwrap_or(0);
+    let db_full = parse_u64_field(body, "db.full").unwrap_or(0);
+
+    let outbound_cap = parse_usize_field(body, "outbound.max_waiters");
+    let outbound_current = parse_usize_field(body, "outbound.waiters").unwrap_or(0);
+    let outbound_high = parse_usize_field(body, "outbound.high_water_waiters").unwrap_or(0);
+    let outbound_full = parse_u64_field(body, "outbound.full").unwrap_or(0);
+
+    let surfaces = vec![
+        SurfacePlateau {
+            name: "http.request_body".to_string(),
+            kind: "body_bytes",
+            capacity: http_cap,
+            high_water: http_high,
+            final_current: http_current,
+            full: http_full,
+            max_messages: None,
+            current_messages: 0,
+            high_water_messages: 0,
+            max_weight: http_cap,
+            current_weight: Some(http_current),
+            high_water_weight: Some(http_high),
+            shared_max_weight: None,
+            shared_current_weight: None,
+            shared_high_water_weight: None,
+            leak_clean: http_current == 0,
+        },
+        SurfacePlateau {
+            name: "db.in_flight".to_string(),
+            kind: "bridge",
+            capacity: db_cap,
+            high_water: db_high,
+            final_current: db_current,
+            full: db_full,
+            max_messages: db_cap,
+            current_messages: db_current,
+            high_water_messages: db_high,
+            max_weight: None,
+            current_weight: None,
+            high_water_weight: None,
+            shared_max_weight: None,
+            shared_current_weight: None,
+            shared_high_water_weight: None,
+            leak_clean: db_current == 0,
+        },
+        SurfacePlateau {
+            name: "outbound.pool_waiters".to_string(),
+            kind: "pool_waiters",
+            capacity: outbound_cap,
+            high_water: outbound_high,
+            final_current: outbound_current,
+            full: outbound_full,
+            max_messages: outbound_cap,
+            current_messages: outbound_current,
+            high_water_messages: outbound_high,
+            max_weight: None,
+            current_weight: None,
+            high_water_weight: None,
+            shared_max_weight: None,
+            shared_current_weight: None,
+            shared_high_water_weight: None,
+            leak_clean: outbound_current == 0,
+        },
+    ];
+
+    LoadObservation {
+        leak_clean: surfaces.iter().all(|surface| surface.leak_clean),
+        surface_plateaus: surfaces,
+        unavailable_surfaces: Vec::new(),
+        trace_hash: None,
+        late: 0,
+    }
+}
+
+fn parse_usize_field(line: &str, key: &str) -> Option<usize> {
+    parse_field(line, key).and_then(|value| value.parse().ok())
+}
+
+fn parse_u64_field(line: &str, key: &str) -> Option<u64> {
+    parse_field(line, key).and_then(|value| value.parse().ok())
+}
+
+fn parse_field<'a>(line: &'a str, key: &str) -> Option<&'a str> {
+    let prefix = format!("{key}=");
+    line.split_whitespace()
+        .find_map(|part| part.strip_prefix(&prefix))
 }
 
 struct StartupSummary {

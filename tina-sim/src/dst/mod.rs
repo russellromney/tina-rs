@@ -225,6 +225,16 @@ impl ReplayConfig {
         self
     }
 
+    /// Reserves `n` `IsolateId`s in the simulator so user-isolate ids stay
+    /// in parity with a live `ThreadedRuntime` that registers system
+    /// isolates at worker startup (e.g. its host-call dispatcher pool, of
+    /// size [`tina_runtime::HOST_CALL_DISPATCHER_POOL_SIZE`]). Set this in
+    /// live-replay runners so the captured trace replays exactly.
+    pub fn with_reserved_system_isolates(mut self, n: usize) -> Self {
+        self.simulator.reserved_system_isolates = n;
+        self
+    }
+
     /// Returns the declared mailbox capacity for `role`, panicking if
     /// the case never declared one. Loud panic surfaces missing
     /// declarations early.
@@ -1213,5 +1223,142 @@ mod replay_case_tests {
         );
         assert_eq!(report.attempts, 3);
         assert_eq!(report.shrunk_len, report.original_len);
+    }
+
+    fn ws_close_fact() -> tina_runtime::ProtocolFact {
+        tina_runtime::ProtocolFact::WebSocketSessionClosed {
+            session: tina_runtime::WebSocketSessionId::new(1),
+            reason: tina_runtime::WebSocketCloseReason::ProtocolError,
+            code: Some(1002),
+        }
+    }
+
+    fn h2_reset_fact() -> tina_runtime::ProtocolFact {
+        tina_runtime::ProtocolFact::Http2StreamReset {
+            connection: tina_runtime::ProtocolConnectionId::new(1),
+            stream: tina_runtime::Http2StreamId::new(3),
+            direction: tina_runtime::ProtocolDirection::Inbound,
+            reason: tina_runtime::Http2ResetReason::FrameSizeError,
+        }
+    }
+
+    fn grpc_status_fact() -> tina_runtime::ProtocolFact {
+        tina_runtime::ProtocolFact::GrpcFinalStatusReceived {
+            connection: tina_runtime::ProtocolConnectionId::new(1),
+            stream: tina_runtime::GrpcStreamId::new(7),
+            status: tina_runtime::GrpcStatusCode::ResourceExhausted,
+        }
+    }
+
+    #[test]
+    fn live_replay_fact_protocol_display_names_family() {
+        let ws = LiveReplayFact::protocol(ws_close_fact());
+        assert_eq!(
+            ws.protocol_family(),
+            Some(tina_runtime::ProtocolFamily::WebSocket)
+        );
+        let rendered = ws.to_string();
+        assert!(rendered.contains("protocol WebSocket"), "{rendered}");
+        assert!(rendered.contains("WebSocketSessionClosed"), "{rendered}");
+
+        let h2 = LiveReplayFact::protocol(h2_reset_fact());
+        assert!(h2.to_string().contains("protocol Http2"), "{}", h2);
+        let grpc = LiveReplayFact::protocol(grpc_status_fact());
+        assert!(grpc.to_string().contains("protocol Grpc"), "{}", grpc);
+    }
+
+    #[test]
+    fn live_capture_can_save_websocket_http2_grpc_protocol_facts() {
+        let c = case();
+        let events: Vec<RuntimeEvent> = (1..=3).map(fake_event).collect();
+        let facts = vec![
+            LiveReplayFact::protocol(ws_close_fact()),
+            LiveReplayFact::protocol(h2_reset_fact()),
+            LiveReplayFact::protocol(grpc_status_fact()),
+        ];
+        let capture =
+            LiveReplayCapture::from_case_and_events(&c, "protocol chaos capture", &events)
+                .with_live_facts(facts.clone());
+        let replay_case = capture.to_replay_case();
+
+        fn runner_with_facts(
+            facts: Vec<LiveReplayFact>,
+        ) -> impl FnMut(&ReplayCase<u32>) -> Result<LiveReplayReport<u32>, TraceProjectionError>
+        {
+            move |case: &ReplayCase<u32>| {
+                let events: Vec<RuntimeEvent> = (1..=3).map(fake_event).collect();
+                Ok(
+                    LiveReplayReport::exact(ReplayReport::from_case_and_events(case, &events, 6))
+                        .with_live_facts(facts.clone()),
+                )
+            }
+        }
+
+        check_captured_replay(&capture, &replay_case, runner_with_facts(facts.clone()))
+            .expect("reproducing all three protocol families replays clean");
+
+        // Dropping the HTTP/2 fact fails closed as a LiveFact change.
+        let dropped: Vec<LiveReplayFact> = facts
+            .iter()
+            .filter(|fact| fact.protocol_family() != Some(tina_runtime::ProtocolFamily::Http2))
+            .cloned()
+            .collect();
+        let mismatch = check_captured_replay(&capture, &replay_case, runner_with_facts(dropped))
+            .expect_err("missing protocol fact must fail closed");
+        assert!(mismatch.includes(CapturedReplayChange::LiveFact));
+        assert!(mismatch.to_string().contains("Http2StreamReset"));
+    }
+
+    #[test]
+    fn mixed_protocol_and_capacity_capture_fails_if_either_family_diverges() {
+        let c = case();
+        let events: Vec<RuntimeEvent> = (1..=3).map(fake_event).collect();
+        let capacity = LiveReplayFact::capacity_surface(&CapacitySurfaceReport::weighted(
+            "ws.outbound.queue",
+            CapacityMode::Fixed,
+            16,
+            0,
+            12,
+            2,
+            "frames",
+        ));
+        let protocol = LiveReplayFact::protocol(ws_close_fact());
+        let capture =
+            LiveReplayCapture::from_case_and_events(&c, "mixed protocol+capacity", &events)
+                .with_live_facts(vec![capacity.clone(), protocol.clone()]);
+        let replay_case = capture.to_replay_case();
+
+        fn runner(
+            facts: Vec<LiveReplayFact>,
+        ) -> impl FnMut(&ReplayCase<u32>) -> Result<LiveReplayReport<u32>, TraceProjectionError>
+        {
+            move |case: &ReplayCase<u32>| {
+                let events: Vec<RuntimeEvent> = (1..=3).map(fake_event).collect();
+                Ok(
+                    LiveReplayReport::exact(ReplayReport::from_case_and_events(case, &events, 6))
+                        .with_live_facts(facts.clone()),
+                )
+            }
+        }
+
+        // Both families reproduced: clean.
+        check_captured_replay(
+            &capture,
+            &replay_case,
+            runner(vec![capacity.clone(), protocol.clone()]),
+        )
+        .expect("reproducing both families replays");
+
+        // Protocol family diverges (capacity intact): fail.
+        let protocol_drift =
+            check_captured_replay(&capture, &replay_case, runner(vec![capacity.clone()]))
+                .expect_err("dropping the protocol fact must fail the whole capture");
+        assert!(protocol_drift.includes(CapturedReplayChange::LiveFact));
+
+        // Capacity family diverges (protocol intact): fail.
+        let capacity_drift =
+            check_captured_replay(&capture, &replay_case, runner(vec![protocol.clone()]))
+                .expect_err("dropping the capacity fact must fail the whole capture");
+        assert!(capacity_drift.includes(CapturedReplayChange::LiveFact));
     }
 }

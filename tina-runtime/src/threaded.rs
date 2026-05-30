@@ -9,15 +9,15 @@
 use std::alloc::Global;
 use std::convert::Infallible;
 use std::marker::PhantomData;
-use std::sync::{Arc, mpsc};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
 use betelgeuse::{IOLoopHandle, io_loop};
-use tina::{Address, Context, Effect, Isolate, Outbound as TinaOutbound, Shard, TrySendError};
+use tina::{Address, Isolate, Outbound as TinaOutbound, Shard, TrySendError};
 use tina_supervisor::SupervisorConfig;
 
-use crate::call::{CallOutcome, IntoErasedCall, RuntimeCall, call};
+use crate::call::{CallOutcome, IntoErasedCall};
 use crate::capabilities::RuntimeCapabilities;
 use crate::clock::MonotonicClock;
 use crate::driver::{self, BetelgeuseDriver};
@@ -26,6 +26,9 @@ use crate::errors::{
     ThreadedRuntimeError, ThreadedSendObservedError, ThreadedTrySendError,
 };
 use crate::host_burst::HostBurstOutcomes;
+use crate::host_call_dispatcher::{
+    ConcreteHostCallBegin, DispatcherMsg, HostCallDispatcher, HostCallTaskBegin,
+};
 use crate::live_report::{LiveShardMetrics, LiveShardState, LiveTopologyReport};
 use crate::local_system::{
     LocalSystemTerminalReport, ThreadedCommandFn, ThreadedIoLoopFactory, ThreadedWorkerExit,
@@ -122,6 +125,23 @@ impl Default for ThreadedRuntimeConfig {
 /// Per-shard default budget for draining lane workers after cancellation.
 pub const DEFAULT_SHUTDOWN_LANE_DRAIN_TIMEOUT: Duration = Duration::from_millis(100);
 
+/// Number of persistent host-call dispatcher isolates registered per worker.
+///
+/// One dispatcher would serialize all concurrent host calls through a single
+/// mailbox (and a single isolate, which gets one `step()` delivery per turn).
+/// A small pool restores the parallelism the old per-call `HostCallDriver`
+/// path got "for free" from having a fresh isolate per call, without paying
+/// the per-call registration cost.
+///
+/// Sized to cover typical concurrent host workloads; concurrency beyond this
+/// will round-robin onto already-busy dispatchers and partially serialize,
+/// which is the same backpressure shape Tina applies elsewhere.
+///
+/// Exposed publicly so DST replay runners can set
+/// `SimulatorConfig::reserved_system_isolates` to this value and keep
+/// user-isolate ids in parity between live and sim.
+pub const HOST_CALL_DISPATCHER_POOL_SIZE: usize = 8;
+
 /// Extra host-side delivery grace used by the legacy one-timeout
 /// `call_blocking` wrapper so a target call timeout can be delivered as
 /// `CallOutcome::Timeout` instead of racing the host wait timer.
@@ -134,57 +154,6 @@ where
 {
     Run(ThreadedCommandFn<S, F>),
     Shutdown,
-}
-
-enum HostCallMsg<M, R> {
-    Begin {
-        target: Address<M, R>,
-        message: M,
-        timeout: Duration,
-    },
-    Returned(CallOutcome<R>),
-}
-
-struct HostCallDriver<S, M, R>
-where
-    S: Shard + 'static,
-{
-    sender: mpsc::Sender<CallOutcome<R>>,
-    _marker: PhantomData<(S, M)>,
-}
-
-impl<S, M, R> Isolate for HostCallDriver<S, M, R>
-where
-    S: Shard + 'static,
-    M: Send + 'static,
-    R: Send + 'static,
-{
-    tina::isolate_types! {
-        message: HostCallMsg<M, R>,
-        reply: (),
-        send: TinaOutbound<Infallible>,
-        spawn: Infallible,
-        call: RuntimeCall<HostCallMsg<M, R>>,
-        shard: S,
-    }
-
-    fn handle(
-        &mut self,
-        msg: HostCallMsg<M, R>,
-        _ctx: &mut Context<'_, S, Self::Reply>,
-    ) -> Effect<Self> {
-        match msg {
-            HostCallMsg::Begin {
-                target,
-                message,
-                timeout,
-            } => call(target, message, timeout).then(HostCallMsg::Returned),
-            HostCallMsg::Returned(outcome) => {
-                let _ = self.sender.send(outcome);
-                tina::stop()
-            }
-        }
-    }
 }
 
 /// One live shard-owned runtime worker.
@@ -207,6 +176,23 @@ where
     F: MailboxFactory + Send + 'static,
 {
     commands: std::sync::mpsc::SyncSender<ThreadedCommand<S, F>>,
+    /// Pool of persistent host-call dispatchers. Registered once at worker
+    /// startup and reused for every `call_blocking`. A single dispatcher
+    /// would serialize concurrent host calls (one Begin per isolate per
+    /// `step()` turn); a pool of size K lets up to K calls execute their
+    /// Begin / Returned handlers in the same turn — same parallelism the
+    /// old per-call `HostCallDriver` enjoyed — without the per-call mailbox /
+    /// isolate-entry / handler-box allocations.
+    ///
+    /// Empty means the worker thread died before publishing addresses (e.g.
+    /// a panicking mailbox factory): `call_blocking` surfaces `WorkerStopped`
+    /// instead of hanging or panicking the constructor, matching the
+    /// deferred-failure model the rest of `ThreadedRuntime`'s API uses.
+    dispatchers: Arc<Vec<Address<DispatcherMsg<S>, ()>>>,
+    /// Round-robin selector for the dispatcher pool. Wrapping atomic add is
+    /// cheap and stays correct under concurrent host-thread access; modulo
+    /// pool size at read time.
+    dispatcher_next: Arc<std::sync::atomic::AtomicUsize>,
     metrics: Arc<LiveShardMetrics>,
     shutdown: Arc<SharedShutdownState<S, F>>,
 }
@@ -314,6 +300,12 @@ where
         let io_loop_factory: ThreadedIoLoopFactory = Box::new(io_loop_factory);
         let worker_metrics = Arc::clone(&metrics);
         let worker_observer = observer;
+        // One-shot channel for the worker to publish the persistent host-call
+        // dispatcher pool's addresses back to the host once the runtime has
+        // registered them. We block briefly on construction so `call_blocking`
+        // can use the addresses immediately.
+        let (dispatcher_tx, dispatcher_rx) =
+            std::sync::mpsc::channel::<Vec<Address<DispatcherMsg<S>, ()>>>();
         let handle = thread::Builder::new()
             .name(worker_name)
             .spawn(move || {
@@ -325,9 +317,23 @@ where
                     io_loop_factory,
                     worker_metrics,
                     worker_observer,
+                    dispatcher_tx,
                 )
             })
             .expect("failed to spawn Tina threaded worker");
+        // `Disconnected` means the worker thread died before it could
+        // register the dispatcher pool — surface that to subsequent ops as
+        // `WorkerStopped`, don't panic the constructor. `Timeout` means the
+        // worker is stuck (registration normally takes microseconds); 5s is
+        // far past any plausible setup time, so panic in that case.
+        let dispatchers = match dispatcher_rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(addrs) => Arc::new(addrs),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Arc::new(Vec::new()),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                panic!("worker failed to publish host-call dispatcher pool in 5s");
+            }
+        };
+        let dispatcher_next = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
         let shutdown = Arc::new(SharedShutdownState::single_shard(ShutdownWorker {
             shard: shard_id,
@@ -339,6 +345,8 @@ where
 
         Self {
             commands,
+            dispatchers,
+            dispatcher_next,
             metrics,
             shutdown,
         }
@@ -1221,46 +1229,79 @@ where
         M: Send + 'static,
         R: Send + 'static,
     {
-        let (reply_tx, reply_rx) = mpsc::channel();
-        let driver = HostCallDriver::<S, M, R> {
-            sender: reply_tx,
+        // If the worker died before publishing the dispatcher pool (e.g. a
+        // panicking mailbox factory blew up registration), the runtime has
+        // no usable host-call path. Surface that as `WorkerStopped` instead of
+        // dispatching into the void.
+        if self.dispatchers.is_empty() {
+            self.metrics.set_state(LiveShardState::Failed);
+            return Err(ThreadedRuntimeError::WorkerStopped);
+        }
+        // Round-robin across the dispatcher pool. Wrapping atomic add stays
+        // correct under concurrent host-thread access; modulo at read time.
+        let idx = self
+            .dispatcher_next
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            % self.dispatchers.len();
+        let dispatcher_addr = self.dispatchers[idx];
+        // Check out a typed reply channel from this host thread's pool. A
+        // warmed-up pool turns the per-call `mpsc::channel()` allocation into
+        // a `Vec::pop()`; cold paths allocate one new typed channel and
+        // recycle it forever.
+        let reply = crate::host_call_reply_pool::checkout::<CallOutcome<R>>();
+        let sender = reply.sender();
+        // Type-erase the per-call task and hand it to the persistent dispatcher
+        // — no per-call isolate registration, no per-call mailbox/handler box.
+        let begin: Box<dyn HostCallTaskBegin<S>> = Box::new(ConcreteHostCallBegin::<S, M, R> {
+            target: address,
+            message,
+            timeout: target_timeout,
+            sender,
             _marker: PhantomData,
-        };
+        });
         let command = ThreadedCommand::Run(Box::new(move |runtime| {
-            let driver_addr =
-                runtime.register_with_capacity::<HostCallDriver<S, M, R>, Infallible>(driver, 2);
-            match runtime.try_send(
-                driver_addr,
-                HostCallMsg::Begin {
-                    target: address,
-                    message,
-                    timeout: target_timeout,
-                },
-            ) {
+            match runtime.try_send(dispatcher_addr, DispatcherMsg::Begin(begin)) {
                 Ok(()) => {}
-                Err(TrySendError::Full(_)) => {
-                    panic!("fresh host-call driver mailbox was unexpectedly full");
+                Err(TrySendError::Full(DispatcherMsg::Begin(begin))) => {
+                    begin.reject_full();
                 }
-                Err(TrySendError::Closed(_)) => {
-                    panic!("fresh host-call driver mailbox was unexpectedly closed");
+                Err(TrySendError::Closed(DispatcherMsg::Begin(begin))) => {
+                    begin.reject_closed();
+                }
+                Err(TrySendError::Full(DispatcherMsg::Returned))
+                | Err(TrySendError::Closed(DispatcherMsg::Returned)) => {
+                    unreachable!("host call command only sends Begin messages");
                 }
             }
         }));
         match self.commands.try_send(command) {
             Ok(()) => {}
             Err(std::sync::mpsc::TrySendError::Full(_)) => {
+                // `reply` returns to the pool naturally on drop here — the
+                // sender lives inside `command`, which we still own and which
+                // drops on this branch.
+                crate::host_call_reply_pool::checkin(reply);
                 return Err(ThreadedRuntimeError::CommandFull);
             }
             Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                crate::host_call_reply_pool::checkin(reply);
                 self.metrics.set_state(LiveShardState::Failed);
                 return Err(ThreadedRuntimeError::WorkerStopped);
             }
         }
 
-        match reply_rx.recv_timeout(host_wait_timeout) {
+        let outcome = reply.recv_timeout(host_wait_timeout);
+        // Return the channel to the pool *only if* no sender is outstanding
+        // — `checkin` enforces this via `Arc::strong_count == 1`. A
+        // `HostWaitTimeout` while the dispatcher still holds the sender leaves
+        // the channel un-poolable; it dies when the late sender drops.
+        crate::host_call_reply_pool::checkin(reply);
+        match outcome {
             Ok(outcome) => Ok(outcome),
-            Err(mpsc::RecvTimeoutError::Timeout) => Err(ThreadedRuntimeError::HostWaitTimeout),
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
+            Err(crate::host_call_reply_pool::RecvError::Timeout) => {
+                Err(ThreadedRuntimeError::HostWaitTimeout)
+            }
+            Err(crate::host_call_reply_pool::RecvError::Disconnected) => {
                 self.metrics.set_state(LiveShardState::Failed);
                 Err(ThreadedRuntimeError::WorkerStopped)
             }
@@ -1407,6 +1448,7 @@ where
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn threaded_worker_loop<S, F>(
     shard: S,
     mailbox_factory: F,
@@ -1415,9 +1457,10 @@ pub(crate) fn threaded_worker_loop<S, F>(
     io_loop_factory: ThreadedIoLoopFactory,
     metrics: Arc<LiveShardMetrics>,
     observer: Option<Arc<dyn TraceObserver>>,
+    dispatcher_tx: std::sync::mpsc::Sender<Vec<Address<DispatcherMsg<S>, ()>>>,
 ) -> ThreadedWorkerExit
 where
-    S: Shard + 'static,
+    S: Shard + Send + 'static,
     F: MailboxFactory + 'static,
 {
     let mut runtime = Runtime::with_clock_and_ids_and_driver_and_preallocation(
@@ -1439,6 +1482,27 @@ where
     // Wire the observer before any event records.
     runtime.set_trace_observer(observer);
 
+    // Register the persistent host-call dispatcher pool and publish their
+    // addresses back to the host so `call_blocking` can target them without
+    // a per-call isolate registration (phase 145 Rock 5). Each dispatcher's
+    // mailbox is sized to `command_capacity`: at peak, an in-flight host
+    // call routed to a given dispatcher occupies at most one slot in that
+    // dispatcher's mailbox (Begin pending or Returned pending, never both),
+    // matching the command-queue backpressure bound.
+    let mut dispatcher_addrs = Vec::with_capacity(HOST_CALL_DISPATCHER_POOL_SIZE);
+    for _ in 0..HOST_CALL_DISPATCHER_POOL_SIZE {
+        let addr = runtime.register_with_capacity::<HostCallDispatcher<S>, Infallible>(
+            HostCallDispatcher::new(),
+            config.command_capacity,
+        );
+        dispatcher_addrs.push(addr);
+    }
+    // If the host hung up between spawn and registration we just drop the
+    // addresses; the worker continues to run normally and the host will
+    // surface its own panic via the recv_timeout on its side.
+    let _ = dispatcher_tx.send(dispatcher_addrs);
+    drop(dispatcher_tx);
+
     // Pin this worker (if requested and the platform can) only after the driver
     // has spawned its helper lanes above, so those lanes inherit the unpinned
     // mask and float onto spare cores. Pin before the loop so a report that
@@ -1446,8 +1510,16 @@ where
     let affinity = crate::affinity::apply(config.configured_core);
     metrics.publish_worker_start(format!("{:?}", thread::current().id()), affinity);
 
+    // Refresh the live resource snapshot on idle and command turns, but not
+    // after a fast delivery turn: recomputing the O(pending) resource report on
+    // every hot turn is the per-op tax this phase removes. Counts refresh again
+    // as soon as the worker parks or runs a command (phase 145).
+    let mut refresh_metrics = true;
     loop {
-        metrics.set_resource_counts(runtime.resource_report());
+        if refresh_metrics {
+            metrics.set_resource_counts(runtime.resource_report());
+        }
+        refresh_metrics = true;
         match receiver.try_recv() {
             Ok(ThreadedCommand::Run(command)) => {
                 command(&mut runtime);
@@ -1461,19 +1533,33 @@ where
             Err(std::sync::mpsc::TryRecvError::Empty) => {}
         }
 
+        // Drain everything the shard can make progress on right now. A step
+        // that delivered handlers loops back immediately and steps again —
+        // no per-turn sleep tax. A tiny local call needs several runtime
+        // turns; throttling each turn by 1ms turned microseconds of work into
+        // milliseconds of latency (phase 145).
         let delivered = runtime.step();
-        if delivered == 0 && !runtime.has_in_flight_calls() {
-            match receiver.recv_timeout(config.idle_wait) {
-                Ok(ThreadedCommand::Run(command)) => command(&mut runtime),
-                Ok(ThreadedCommand::Shutdown) => {
-                    deliver_shutdown_signal_and_drain(&mut runtime);
-                    break;
-                }
-                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+        if delivered > 0 {
+            refresh_metrics = false;
+            continue;
+        }
+
+        // Nothing was deliverable this turn. Park on the command queue so a
+        // new command (including shutdown) wakes the worker immediately. The
+        // bounded `idle_wait` timeout makes the worker re-poll the driver for
+        // runtime-owned work (timers, lane I/O completions, listeners) it
+        // cannot be signalled about, without hot-spinning the CPU. This single
+        // policy covers both "fully idle" and "waiting on a pending timer/I/O":
+        // in both cases the only honest move is to sleep until either a command
+        // arrives or it is time to re-poll the driver.
+        match receiver.recv_timeout(config.idle_wait) {
+            Ok(ThreadedCommand::Run(command)) => command(&mut runtime),
+            Ok(ThreadedCommand::Shutdown) => {
+                deliver_shutdown_signal_and_drain(&mut runtime);
+                break;
             }
-        } else {
-            thread::sleep(Duration::from_millis(1));
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
         }
     }
 

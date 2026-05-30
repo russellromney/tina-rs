@@ -238,23 +238,18 @@ where
             );
         }
 
-        let Some(entry) = self
-            .entries
-            .iter()
-            .find(|entry| entry.id == address.isolate())
-        else {
+        // Resolve to entry index in O(1) via `entry_indexes`. The helper also
+        // re-checks the address generation, so an unknown isolate and a stale
+        // generation both surface as `Closed` here — same as before. The
+        // previous code scanned `self.entries` twice (once via `find`, once
+        // via `position`) to recover the same index.
+        let Some(entry_index) = self.entry_index(RegisteredAddress {
+            shard: address.shard(),
+            isolate: address.isolate(),
+            generation: address.generation(),
+        }) else {
             return Err(TrySendError::Closed(message));
         };
-
-        if entry.generation != address.generation() {
-            return Err(TrySendError::Closed(message));
-        }
-
-        let entry_index = self
-            .entries
-            .iter()
-            .position(|entry| entry.id == address.isolate())
-            .unwrap_or_else(|| panic!("runtime ingress found entry then lost it"));
 
         match self.enqueue_entry_message(entry_index, Box::new(message), None) {
             Ok(()) => Ok(()),

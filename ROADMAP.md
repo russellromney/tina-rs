@@ -192,10 +192,14 @@ Orthogonal to feature phases but necessary before public release claims.
   assert malformed definitions fail at compile time. This is standard for
   macro-heavy crates.
 
-- **Benchmark / performance regression framework.** The current cost-smoke
-  (`portable_runtime_cost`) is a smoke test, not a benchmark. Before
-  production claims we need a `criterion`-based regression suite with
-  historical tracking, not just one-shot local runs.
+- **Benchmark / performance regression framework.** `make perf` now gives alpha
+  users local release-mode performance evidence over runtime cost rows, native
+  Tina-vs-bounded-Tokio rows, and one whole-service load row with
+  pressure/capacity/leak truth. Native rows now split first-queue host enqueue,
+  observed admission, host request/reply, chained service request/reply, and
+  HTTP/1 close/keepalive/body cases. Before production claims we still need
+  broader native rows, historical tracking, and repeated equivalent-workload
+  runs on stable hardware.
 
 - **HTTP/1 parser conformance suite.** Beyond our own DST, we should run an
   established HTTP parser test corpus (e.g., `httparse` test vectors, or a
@@ -296,12 +300,12 @@ and reviews live under `.intent/phases/`.
   `LocalMultiShardSystem` service harness, runtime-call continuation replies
   through I/O/persistence, executable budget manifest, visible placement and
   backpressure policy proofs, service-level DST with saved seed and shrink,
-  portable cost-smoke command, and focused CI gate.
+  portable local cost rows, and focused CI gate.
 - Baobab: executable local-service readiness matrix, Baobab user-service
   gauntlet over TCP/timer/DNS/process/file/persistence/cross-shard call/
   shutdown, live multi-shard sibling-survives-failed-shard proof, selected
   LocalSystem rail/backpressure e2e gate, saved-seed service/persistence/bridge
-  DST histories, real Tina local timing smoke rows, all folded into
+  DST histories, real Tina local timing rows, all folded into
   `make verify`.
 - DST as a first-class dev mode: a "bug in a box" `ReplayCase` /
   `ReplayReport` / `ReplayConfig` shape in `tina_sim::dst` carrying the
@@ -397,6 +401,8 @@ framework before public release-story work.
 | **132 Protocol chaos and byte replay** | Harden the native protocol stack against bad peers, malformed bytes, resets, slow readers/writers, reconnect storms, and protocol-byte replay gaps. This is proof work with code surfaces where needed, not benchmark theater. Plan: `.intent/phases/132-protocol-chaos-byte-replay/plan.md`. |
 | **133 Request scope end-to-end** | Wire request-scoped cancellation through real HTTP/WebSocket/gRPC/body/pool/bridge flows so client disconnect, timeout, owner stop, and shutdown produce one request-shaped report with honest late-result truth. Plan: `.intent/phases/133-request-scope-end-to-end/plan.md`. |
 | **135 Native AWS first form** | Add a native Tina AWS battery for the smallest honest production shape: static SigV4 with explicit signing time, native S3 put/get/head/delete, native SQS send/receive/delete, native HTTP keepalive under Phase 131 endpoint/connect policy, bounded bodies/in-flight work, typed pressure/lifecycle reports, hermetic fake-AWS tests, and clear native-vs-SDK-bridge docs. Plan: `.intent/phases/135-native-aws-first-form/plan.md`. |
+| **144 Native performance evidence** | Benchmark basic native Tina designs, compare them with equivalent bounded Tokio designs, find allocation/overhead hot spots, improve the obvious Tina-owned waste, and record before/after rows. No SQLite/app-shaped benchmark as the headline. Plan: `.intent/phases/144-native-performance-evidence/plan.md`. |
+| **145 Hot path reality check** | Explain and fix the millisecond-scale live hot path from Phase 144: stage timing for `try_send` / `send_and_observe` / `call_blocking`, remove the worker-loop progress sleep tax if confirmed, avoid per-call host driver isolate overhead if still hot, and prove before/after without weakening Tina truth. Plan: `.intent/phases/145-hot-path-reality-check/plan.md`. |
 | **Alpaca rename** | Before public launch, rename the project/crates/docs away from Tina to Alpaca so the lineage is respectful and clear: independently maintained Rust framework, inspired by Peter Mbanugo's Tina/Odin and Seastar, not an official Tina port. |
 | **Barend Biesheuvel visible flow ergonomics** | Optional high-level ergonomics only after the local runtime core feels boring: a `flow!`-style authoring surface that preserves named suspension points, visible failure policy, trace step names, and ordinary Tina message/effect expansion. No fake async, no hidden retries, no hidden queues. |
 
@@ -748,7 +754,7 @@ shape.
 | Race/join helpers | First-success `CallGroup` exists. Add join-all, stream select, and child-ref sugar only when real specimens pull on them. | Common `select!` / `join!` Tokio shapes can be written in Tina without hiding which branch won or what got cancelled. |
 | Timer vocabulary | Interval, backoff, retry-delay, debounce, and throttle helper state exists. Future work is periodic service patterns, jitter policy, and deadline propagation polish where real services need it. | Periodic and retrying services stop hand-rolling sleep loops and still replay deterministically. |
 | Production service skeleton | A small executable skeleton tying HTTP/HTTPS, routing, DB pool, outbound keepalive, graceful shutdown, tracing, capacity assertions, and DST seed capture together. | An LLM can copy one real-service shape and replace a moderate Tokio app without stitching ten specimens by hand. |
-| Protocol and client breadth | Shipped: HTTP/2 server/client, gRPC server/client streaming modes, WebSocket server/client sessions, AWS bridge breadth, and protocol facts. Remaining: HTTP/2 mTLS, gRPC reflection/interceptors/load balancing, pooled/reconnecting client managers, client-side session lifecycle polish, and protocol-byte replay where facts are not enough. | Common Tokio protocol workloads have native Tina paths instead of falling back to Tokio bridges at the first real boundary, without hiding stream pressure. |
+| Protocol and client breadth | Shipped: HTTP/2 server/client, gRPC server/client streaming modes, WebSocket server/client sessions, AWS bridge breadth, and protocol facts. Remaining: HTTP/2 mTLS, gRPC reflection/interceptors/load balancing, pooled/reconnecting client managers, client-side session lifecycle polish, and protocol-byte replay beyond the shipped WebSocket bad-frame workflow. | Common Tokio protocol workloads have native Tina paths instead of falling back to Tokio bridges at the first real boundary, without hiding stream pressure. |
 | Compile-time diagnostics | `#[diagnostic::on_unimplemented]` and macro error polish for `Isolate`, message/send/call bounds, non-`Send`, non-`'static`, wrong shard, and wrong reply shapes. | Humans and LLMs see "this message is not Send" instead of trait soup. |
 | Resource lifecycle unification | One boring vocabulary across runtime resources and bridges: open/start, ready, use, close, cancel, drain, terminal report, pressure report. | No stream/file/process/bridge worker can be stranded invisibly; every resource has the same mental model. |
 | Fairness under load | Prove and expose fairness for actor/session scheduling under hot keys, slow sessions, remote inbound drain, timers, and protocol sessions. Add reports for starvation-ish lag where a bounded runtime can observe it honestly. | One hot actor or WebSocket session should not quietly starve unrelated work; when it can, the report says so. |
@@ -763,7 +769,7 @@ shape.
 | State snapshot and restore | Blessed snapshot/journal/restore patterns for shard-owned state, including append-before-apply proofs and torn-write recovery specimens. | Ordinary services can restart with state safely, not only demos with in-memory maps. |
 | Saga / compensation pattern | Typed multi-step workflow pattern over DB, HTTP, pools, and services, with explicit compensation, timeout, cancellation, and partial-failure reports. | Multi-resource business workflows become readable Tina state machines instead of ad hoc async control flow. |
 | Load and soak harness | A reusable harness for long runs that records capacity high-water, full counts, latency-ish summaries, resource leaks, and trace fingerprints. | Teams can prove a Tina service stays bounded for an hour before claiming it is production-shaped. |
-| Chaos / bad-peer harness | Reusable bad-peer probes: half-close, reset, slowloris, stalled writers, reconnect storms, TLS failure, malformed frames, and browser/client interop. | Protocol work stops passing only happy-path unit tests and starts proving the failure shapes real services meet. |
+| Chaos / bad-peer harness | Shipped: transport bad-peer probes (half-close, reset, slowloris, stalled writers, reconnect storms, TLS failure, malformed frames), one typed `ProtocolChaosReport` per story, a hermetic WebSocket compliance corpus, WebSocket byte-replay save/shrink, and HTTP/2 and gRPC bad-peer probes that map malformed framing to typed facts. Remaining: browser/client interop and more real-service probe coverage. | Protocol work stops passing only happy-path unit tests and starts proving the failure shapes real services meet. |
 | DNS/connect policy | Explicit connect timeout, DNS timeout, Happy-Eyeballs/connect racing story, address-family policy, and typed partial failure reports. | Outbound clients do not hang or hide which name/address path failed. |
 | Unix sockets and local IPC | Shipped: Unix-domain listener/client rails in live runtime and simulator, plus local IPC specimens. Remaining: Unix loop helpers (`write_all`, `read_to_eof`) and the same ergonomic companions TCP/file already earned. | Tina can own local admin/sidecar protocols without jumping back to Tokio for one socket kind. |
 | File streaming and codec helpers | Shipped: bounded file streaming/copy helpers, line and length-delimited codecs, and open `SyncCodec`. Remaining: framed writers and a less clunky `FileCopyBounded` drive loop. | Services can serve files, ingest files, and parse framed protocols without hand-rolling the same loops. |
