@@ -12,7 +12,7 @@ use std::io;
 use std::path::Path;
 
 use tina::capacity::{CapacityMode, CapacitySurfaceReport};
-use tina_runtime::{EventId, RuntimeEvent};
+use tina_runtime::{EventId, ProtocolFact, ProtocolFamily, RuntimeEvent};
 
 use super::projection::{
     TraceProjection, TraceProjectionError, TraceShape, project_trace_shape, replay_config_hash,
@@ -231,13 +231,41 @@ impl std::fmt::Display for UnsupportedLiveFact {
 pub enum LiveReplayFact {
     /// A bounded capacity surface snapshot such as HTTP body bytes or pool
     /// pressure.
-    CapacitySurface(CapacityReplayFact),
+    ///
+    /// Boxed: a [`CapacityReplayFact`] is far larger than the small typed
+    /// [`Protocol`](Self::Protocol) fact, and these facts are cloned and moved
+    /// in `Vec`s through every capture, so the big variant stays on the heap.
+    CapacitySurface(Box<CapacityReplayFact>),
+    /// A typed protocol-layer fact (HTTP/2, HTTP body, WebSocket, gRPC).
+    ///
+    /// Stored as the typed [`ProtocolFact`] value, never a debug string, so
+    /// replay comparison and the stable trace/fact tags stay authoritative.
+    Protocol(ProtocolFact),
 }
 
 impl LiveReplayFact {
     /// Captures one [`CapacitySurfaceReport`] as replay-comparable data.
     pub fn capacity_surface(report: &CapacitySurfaceReport) -> Self {
-        Self::CapacitySurface(CapacityReplayFact::from_report(report))
+        Self::CapacitySurface(Box::new(CapacityReplayFact::from_report(report)))
+    }
+
+    /// Wraps one typed [`ProtocolFact`] as a replay-comparable fact.
+    pub const fn protocol(fact: ProtocolFact) -> Self {
+        Self::Protocol(fact)
+    }
+
+    /// Returns the protocol fact when this is a [`Self::Protocol`] fact.
+    pub const fn as_protocol(&self) -> Option<ProtocolFact> {
+        match self {
+            Self::Protocol(fact) => Some(*fact),
+            Self::CapacitySurface(_) => None,
+        }
+    }
+
+    /// Returns the protocol family this fact belongs to, when it is a
+    /// protocol fact. Capacity facts return `None`.
+    pub fn protocol_family(&self) -> Option<ProtocolFamily> {
+        self.as_protocol().map(ProtocolFact::family)
     }
 }
 
@@ -245,6 +273,9 @@ impl std::fmt::Display for LiveReplayFact {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::CapacitySurface(fact) => write!(f, "{fact}"),
+            // Display includes the protocol family so a saved-case line names
+            // the family without re-deriving it from the debug body.
+            Self::Protocol(fact) => write!(f, "protocol {:?} {fact:?}", fact.family()),
         }
     }
 }

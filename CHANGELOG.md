@@ -4,6 +4,44 @@ This file records completed work.
 
 ## Unreleased
 
+### Protocol Chaos And Byte Replay
+
+- Made protocol bad-peer behaviour proof-shaped. Every bad-peer story now
+  reduces to one typed `ProtocolChaosReport` (family, byte tallies, peer and
+  terminal action, app delivery count, close/reset/status, the typed
+  `ProtocolFact` sequence, elapsed budget, and unsupported facts), with a
+  `ProtocolChaosCase`/`ProtocolChaosExpectation` to assert it. The existing
+  `BadPeerOutcome` is unchanged and folds into a report via
+  `ProtocolChaosReport::from_bad_peer`.
+- Added a pure WebSocket session engine and a hermetic compliance corpus to
+  `tina-proof-harness`: valid text/binary, valid fragmented text (including a
+  codepoint split across frames), invalid UTF-8 across fragments, reserved
+  bits without an extension, oversized control and message frames, masking
+  direction, and ping/pong and close-handshake edges. Each case names the
+  exact app messages, so valid data is proven to reach app code once and
+  malformed bytes are proven never to.
+- Added `ProtocolByteReplayCase`: save a bad-frame case as ordered byte
+  chunks, reproduce it, and shrink it down to the minimal chunk set that still
+  triggers the bug, refreshing the expected facts for the smaller case. The
+  expected facts are pinned as a count plus a stable fingerprint over the
+  typed `ProtocolFact` values — never debug text. Unsupported facts or an
+  over-budget case fail closed and never pass as an exact replay.
+- Added hermetic HTTP/2 and gRPC bad-peer probes that map malformed framing to
+  typed facts and outcomes — invalid frame size, duplicate pseudo-header, DATA
+  after stream close, RST_STREAM mid-body, GOAWAY with active streams,
+  flow-control window exhaustion, gRPC missing `grpc-status` (defaulted to
+  UNKNOWN), and oversized gRPC messages — instead of a bare "connection
+  closed".
+- Added `LiveReplayFact::Protocol(ProtocolFact)` so a live capture can save
+  protocol facts beside capacity facts; its display names the protocol family.
+  A capture mixing protocol and capacity facts fails replay if either family
+  diverges, and `classify_protocol_facts` tells a real divergence apart from a
+  live-only simulator-coverage gap (`UnsupportedProtocolFact`).
+- Updated `make proof-fast` to run the bounded protocol corpus, `make
+  proof-bad-peer` to print typed report lines with `--nocapture`, and `make
+  proof-soak` to repeat the corpus at a higher count. Documented when to reach
+  for the proof harness versus a local test in the systems README.
+
 ### Outbound Connect And Session Managers
 
 - Added unresolved outbound endpoints (`HttpEndpoint`, `Http2Endpoint`,
