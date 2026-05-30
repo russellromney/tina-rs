@@ -142,13 +142,21 @@
 //! WebSocket client: [`WebSocketClientConnection`] is the native client
 //! session. It owns one TCP/TLS rail, performs the HTTP/1.1 upgrade, masks
 //! client frames, parses server frames, auto-answers ping with pong, and
-//! exposes typed `Connect` / `Send` / `Receive` / `Report` calls. It is not a
-//! reconnecting or pooled client manager.
+//! exposes typed `Connect` / `Send` / `Receive` / `Report` calls.
+//!
+//! Outbound clients ([`connect`]): unresolved endpoints ([`HttpEndpoint`],
+//! [`Http2Endpoint`], [`GrpcEndpoint`], [`WebSocketEndpoint`]) resolve into
+//! the targets above through a bounded [`ConnectPolicy`] (bounded DNS, bounded
+//! connect, Happy Eyeballs). [`WebSocketClientManager`] is the reconnecting
+//! WebSocket client over a bounded connection pool, with a generation guard
+//! and bounded reconnect; [`Http2ClientPool`] and [`GrpcClientPool`] are
+//! fixed-endpoint round-robin pools that keep HTTP/2 transport truth separate
+//! from gRPC status truth.
 //!
 //! Still out of scope: ACME, mTLS, SNI routing, system roots, certificate
 //! reload, redirects, cookies, WebSocket permessage-deflate, HTTP/2
-//! WebSocket, and pooled/reconnecting WebSocket client managers. For mature
-//! outbound web-client behaviour use the `tina-reqwest-bridge` crate.
+//! WebSocket, and dynamic service discovery. For mature outbound web-client
+//! behaviour use the `tina-reqwest-bridge` crate.
 
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
@@ -156,6 +164,7 @@ pub mod body_metrics;
 pub mod budget;
 pub mod chunked_decoder;
 pub mod client;
+pub mod connect;
 pub mod connection;
 pub mod grpc;
 pub mod grpc_client;
@@ -177,6 +186,22 @@ pub mod websocket_room;
 
 pub use body_metrics::{BodyCapacityFull, BodyMetrics, BodyPressureReport};
 pub use client::{HttpClient, HttpClientMsg, OutboundCall};
+pub use connect::{
+    AddressFamily, AddressFamilyPolicy, AttemptKey, ConnectAttemptOutcome, ConnectAttemptReport,
+    ConnectAttempts, ConnectAttemptsError, ConnectPolicy, ConnectPolicyError, ConnectReport,
+    ConnectSecurity, ConnectStep, ConnectTlsTruth, DnsClassification, DnsOutcome,
+    EndpointDownReason, EndpointGeneration, EndpointHealthSignal, EndpointId, FixedEndpointPool,
+    FixedEndpointPoolConfig, FixedEndpointPoolError, FixedEndpointPoolReport, GrpcClientPool,
+    GrpcEndpoint, HappyEyeballsPolicy, Http2ClientPool, Http2Endpoint, Http2PickOutcome,
+    Http2PoolBuildError, HttpEndpoint, InstallError, PickOutcome, ResolvedEndpoint,
+    RetainedSessionReport, RetireReason, RetiredEndpointReport, SessionEndReason,
+    WebSocketClientManager, WebSocketConnectOutcome, WebSocketEndpoint, WebSocketManagerAddr,
+    WebSocketManagerConfig, WebSocketManagerConfigError, WebSocketManagerHandles,
+    WebSocketManagerMsg, WebSocketManagerReply, WebSocketManagerReport,
+    WebSocketManagerShutdownReport, WebSocketManagerState, WebSocketSessionError, WsConnAddr,
+    build_http2_client_pool, build_websocket_client_manager, grpc_health_signal,
+    http2_health_signal,
+};
 pub use connection::{HttpConnection, HttpConnectionMsg, response_for_call_outcome};
 pub use grpc::{
     GrpcClientStreamingRequest, GrpcError, GrpcLimits, GrpcRawStreamingRequest,
