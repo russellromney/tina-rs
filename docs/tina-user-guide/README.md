@@ -51,10 +51,11 @@ Read in order if new:
 25. [Extension Hooks](25-extension-hooks.md)
 26. [The Async Boundary](26-async-boundary.md)
 27. [Which Noun Do I Use?](27-which-noun-do-i-use.md)
+28. [Outbound Clients: Endpoint → Policy → Manager](28-outbound-clients.md)
 30. [Bridge Author Kit (copied path)](30-bridge-author-kit.md)
 
 The reading order separates **learn core** (pages 0–17, 19, 21) from
-**choose batteries** (pages 18, 20, 22, 25, plus 23–24 which explain the
+**choose batteries** (pages 18, 20, 22, 25, 28, plus 23–24 which explain the
 boundary itself). New users should not need to read battery docs to
 understand Tina core.
 
