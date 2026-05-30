@@ -5273,6 +5273,23 @@ fn local_system_reports_live_owned_resources_and_shutdown_cleanup() {
     app.try_send(address, HeldFileMsg::Start(path.clone()))
         .expect("held file start handoff");
     wait_until(|| seen.lock().expect("held file seen lock").as_slice() == ["opened"]);
+    wait_until_debug(
+        || {
+            app.topology()
+                .shard(ShardId::new(52))
+                .expect("held file shard")
+                .owned_resource_count()
+                == 1
+        },
+        || {
+            format!(
+                "topology={:?}",
+                app.topology()
+                    .shard(ShardId::new(52))
+                    .expect("held file shard")
+            )
+        },
+    );
 
     let live_topology = app.topology();
     assert_eq!(
