@@ -179,7 +179,11 @@ where
         // dispatcher pool). The simulator never registers those isolates
         // itself, but skipping their id range keeps user-isolate ids in
         // parity between live and sim so the captured trace replays exactly.
-        let next_isolate_id = 1 + config.reserved_system_isolates as u64;
+        let reserved_system_isolates = u64::try_from(config.reserved_system_isolates)
+            .expect("reserved system isolate count must fit in u64");
+        let next_isolate_id = reserved_system_isolates
+            .checked_add(1)
+            .expect("reserved system isolate count leaves no user id space");
         Self {
             shard,
             config,

@@ -60,6 +60,8 @@ pub(crate) enum DispatcherMsg<S: Shard + 'static> {
 /// the typed `call(target, message, timeout)` effect internally.
 pub(crate) trait HostCallTaskBegin<S: Shard + 'static>: Send + 'static {
     fn execute(self: Box<Self>) -> Effect<HostCallDispatcher<S>>;
+    fn reject_full(self: Box<Self>);
+    fn reject_closed(self: Box<Self>);
 }
 
 /// "Deliver this outcome to the waiting host thread" task. Concrete impls
@@ -98,6 +100,14 @@ where
         call(target, message, timeout).then(move |outcome: CallOutcome<R>| {
             DispatcherMsg::Returned(Box::new(ConcreteHostCallComplete { outcome, sender }))
         })
+    }
+
+    fn reject_full(self: Box<Self>) {
+        self.sender.send(CallOutcome::Full);
+    }
+
+    fn reject_closed(self: Box<Self>) {
+        self.sender.send(CallOutcome::Closed);
     }
 }
 
@@ -140,5 +150,57 @@ impl<S: Shard + 'static> Isolate for HostCallDispatcher<S> {
                 tina::noop()
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use tina::ShardId;
+
+    use crate::host_call_reply_pool::{checkin, checkout};
+
+    #[derive(Debug, Clone, Copy)]
+    struct TestShard;
+
+    impl Shard for TestShard {
+        fn id(&self) -> ShardId {
+            ShardId::new(0)
+        }
+    }
+
+    struct RejectOnly {
+        sender: TypedReplySender<CallOutcome<u32>>,
+    }
+
+    impl HostCallTaskBegin<TestShard> for RejectOnly {
+        fn execute(self: Box<Self>) -> Effect<HostCallDispatcher<TestShard>> {
+            unreachable!("reject-only test task should not execute")
+        }
+
+        fn reject_full(self: Box<Self>) {
+            self.sender.send(CallOutcome::Full);
+        }
+
+        fn reject_closed(self: Box<Self>) {
+            self.sender.send(CallOutcome::Closed);
+        }
+    }
+
+    #[test]
+    fn rejected_begin_reports_full_instead_of_disconnect() {
+        let reply = checkout::<CallOutcome<u32>>();
+        let task: Box<dyn HostCallTaskBegin<TestShard>> = Box::new(RejectOnly {
+            sender: reply.sender(),
+        });
+
+        task.reject_full();
+
+        assert!(matches!(
+            reply.recv_timeout(Duration::from_secs(1)),
+            Ok(CallOutcome::Full)
+        ));
+        checkin(reply);
     }
 }

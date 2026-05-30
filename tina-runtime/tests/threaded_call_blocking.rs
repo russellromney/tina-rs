@@ -1,5 +1,5 @@
 use std::convert::Infallible;
-use std::sync::Arc;
+use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -276,6 +276,75 @@ fn call_blocking_with_host_timeout_surfaces_host_wait_timeout() {
     );
 
     assert_eq!(outcome, Err(ThreadedRuntimeError::HostWaitTimeout));
+    let _ = runtime.shutdown();
+}
+
+#[test]
+fn call_blocking_dispatcher_pressure_never_reports_worker_stopped() {
+    let runtime = Arc::new(ThreadedRuntime::with_config(
+        TestShard,
+        DefaultThreadedMailboxFactory,
+        ThreadedRuntimeConfig {
+            command_capacity: 1,
+            idle_wait: Duration::from_millis(2),
+            ..Default::default()
+        },
+    ));
+    let silent = runtime
+        .register_with_capacity::<Silent, Infallible>(Silent, 1)
+        .expect("register silent");
+
+    // Tiny command and target mailboxes force a messy burst through the
+    // persistent dispatcher pool. Any outcome may be legitimate pressure,
+    // but `WorkerStopped` would be a lie caused by dropping the dispatcher
+    // task without answering the pooled host reply.
+    let workers = 256;
+    let barrier = Arc::new(Barrier::new(workers));
+    let mut handles = Vec::with_capacity(workers);
+    for _ in 0..workers {
+        let runtime = Arc::clone(&runtime);
+        let barrier = Arc::clone(&barrier);
+        handles.push(thread::spawn(move || {
+            barrier.wait();
+            runtime.call_blocking_with_host_timeout(
+                silent,
+                SilentMsg::Start,
+                Duration::from_secs(1),
+                Duration::from_secs(2),
+            )
+        }));
+    }
+
+    let mut counts = std::collections::BTreeMap::new();
+    for handle in handles {
+        match handle.join().expect("caller thread joined") {
+            Ok(CallOutcome::Full) => *counts.entry("full").or_insert(0usize) += 1,
+            Err(ThreadedRuntimeError::WorkerStopped) => {
+                *counts.entry("worker_stopped").or_insert(0usize) += 1
+            }
+            Ok(CallOutcome::Replied(_)) => *counts.entry("replied").or_insert(0usize) += 1,
+            Ok(CallOutcome::Timeout) => *counts.entry("timeout").or_insert(0usize) += 1,
+            Ok(CallOutcome::Closed) => *counts.entry("closed").or_insert(0usize) += 1,
+            Ok(CallOutcome::Rejected(_)) => *counts.entry("rejected").or_insert(0usize) += 1,
+            Err(ThreadedRuntimeError::CommandFull) => {
+                *counts.entry("command_full").or_insert(0usize) += 1
+            }
+            Err(ThreadedRuntimeError::HostWaitTimeout) => {
+                *counts.entry("host_wait_timeout").or_insert(0usize) += 1
+            }
+            Err(_) => *counts.entry("other_error").or_insert(0usize) += 1,
+        }
+    }
+
+    assert_eq!(
+        counts.get("worker_stopped").copied().unwrap_or(0),
+        0,
+        "{counts:?}"
+    );
+    let runtime = match Arc::try_unwrap(runtime) {
+        Ok(runtime) => runtime,
+        Err(_) => panic!("no extra runtime refs"),
+    };
     let _ = runtime.shutdown();
 }
 

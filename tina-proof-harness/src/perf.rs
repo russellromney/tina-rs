@@ -355,17 +355,11 @@ impl HotPathReport {
     /// an optional single-run stage breakdown and allocation count.
     pub fn from_samples(
         label: &'static str,
-        mut totals_ns: Vec<u64>,
+        totals_ns: Vec<u64>,
         stages: Vec<HotPathStage>,
         allocations: Option<u64>,
     ) -> Self {
-        Self::from_samples_with_process_allocations(
-            label,
-            totals_ns.drain(..).collect(),
-            stages,
-            allocations,
-            None,
-        )
+        Self::from_samples_with_process_allocations(label, totals_ns, stages, allocations, None)
     }
 
     /// Builds a report including both host-thread allocations (`allocations`)

@@ -1260,12 +1260,19 @@ where
             _marker: PhantomData,
         });
         let command = ThreadedCommand::Run(Box::new(move |runtime| {
-            // The dispatcher mailbox is sized to `command_capacity`, matching
-            // the command-queue bound; in normal use it cannot be full while
-            // the command queue had room. A full or closed dispatcher mailbox
-            // drops `begin` here, which drops the sender, which surfaces to
-            // the host as `Disconnected` -> `WorkerStopped` below.
-            let _ = runtime.try_send(dispatcher_addr, DispatcherMsg::Begin(begin));
+            match runtime.try_send(dispatcher_addr, DispatcherMsg::Begin(begin)) {
+                Ok(()) => {}
+                Err(TrySendError::Full(DispatcherMsg::Begin(begin))) => {
+                    begin.reject_full();
+                }
+                Err(TrySendError::Closed(DispatcherMsg::Begin(begin))) => {
+                    begin.reject_closed();
+                }
+                Err(TrySendError::Full(DispatcherMsg::Returned(_)))
+                | Err(TrySendError::Closed(DispatcherMsg::Returned(_))) => {
+                    unreachable!("host call command only sends Begin messages");
+                }
+            }
         }));
         match self.commands.try_send(command) {
             Ok(()) => {}

@@ -13,13 +13,18 @@ nothing is deliverable. Results (release, local):
 - `service_request_reply_chain` p50 12.07ms -> 400us
 - HTTP rows fell ~10-16x as a free downstream effect
 
-`host_request_reply` p50 (~210us) landed below the 500us threshold after the
-worker-loop fix, so Rock 5 (direct host-call path) and Rock 6 (observed-send
-allocation) were not needed this phase. The remaining ~10x gap to Tokio is the
-per-call host-driver register + reply channel + boxed command (484 vs 133
-allocations) and ~45us/turn cross-thread scheduling — named, not a sleep. See
-`examples/systems/perf_native/README.md` and the `perf_before.txt` /
-`perf_after.txt` / `hotpath_before.txt` / `hotpath_after.txt` evidence in this
+The first fix made the row acceptable, but the probes still showed avoidable
+host-call work. This phase also shipped the host-call dispatcher pool and the
+per-host-thread reply channel pool:
+
+- no fresh `HostCallDriver` isolate per `call_blocking`;
+- `call_blocking` process allocations 17 -> 7;
+- host-thread allocations 5 -> 2 after the reply pool;
+- DST replay parity via `SimulatorConfig::reserved_system_isolates`.
+
+The remaining gap is now named: same-shard host calls still pay several
+cross-thread worker turns, and HTTP still allocates 1.45-1.8x the Axum row.
+See `examples/systems/perf_native/README.md` and the evidence files in this
 directory.
 
 Hostile-review follow-ups (same phase):

@@ -87,20 +87,14 @@ What felt good:
   so the fix belonged in the worker loop, not the ingress path.
 
 What is still bad (named, not hidden):
-- `host_request_reply` is still ~10× Tokio at ~200 µs p50. The probe now
-  measures **17 process-wide allocations per call** (host + worker thread),
-  not the 4 it used to report — the host-only counter hid 13 worker-thread
-  allocations from registering a fresh `HostCallDriver` isolate per call
-  (mailbox + adapter box + handler box + isolate entry + in-flight-call entry
-  + translator + call-context queue).
-- Roughly half the latency is the three cross-thread wakeups required by the
-  three runtime turns (`Begin` → target → `Returned`); the other half is the
-  per-call driver registration. The Tokio comparison is partly architectural:
-  Tokio's `current_thread` runtime is single-threaded so its `call_blocking`
-  has zero cross-thread cost — `Tina`'s `ThreadedRuntime` is shard-per-thread
-  by design and pays one wakeup per turn.
-- The HTTP rows still count only load-worker allocations; server-thread
-  allocation accounting needs a process/sample-level probe later.
+- `host_request_reply` is still ~10× Tokio at roughly 200 µs p50. The per-call
+  driver registration is gone, but the truthful Tina path still crosses from
+  host thread -> shard worker -> target isolate -> dispatcher -> host.
+- The Tokio comparison is partly architectural: Tokio's `current_thread`
+  runtime has zero cross-thread host-call cost. Tina's `ThreadedRuntime` is
+  shard-per-thread by design and pays worker-turn wakeups.
+- The HTTP rows now have whole-process allocation rows. Tina HTTP still
+  allocates roughly 1.45-1.8x the Axum comparison row on the same request.
 
 **Rock 5 landed**: the per-call `HostCallDriver` registration is gone,
 replaced by a pool of `HOST_CALL_DISPATCHER_POOL_SIZE = 8` long-lived
@@ -117,21 +111,23 @@ and sim. The bugbox replay runner sets it to
 replays bit-exact again. The bugbox's `SAVED_TRACE_HASH` was rebaked once
 to reflect the shifted-but-now-deterministic ids.
 
-Measured before/after Rock 5:
+Measured before/after the host-call dispatcher pool and reply channel pool:
 
 | metric                              | before  | after   |
 |-------------------------------------|---------|---------|
-| `call_blocking` process allocs/call | 17      | **11**  |
-| `call_blocking` host allocs/call    | 4       | 5       |
-| probe p50 (single host thread)      | ~190 µs | ~183 µs |
+| `call_blocking` process allocs/call | 17      | **7**   |
+| `call_blocking` host allocs/call    | 5       | **2**   |
+| probe p50 (single host thread)      | ~190 µs | ~198 µs |
 | perf row p50 (4 concurrent threads) | ~210 µs | ~205 µs |
 
 Suggested next follow-ups:
-- **Pre-allocated reply channel pool** (per-host-thread `thread_local`),
-  type-erased via a slot table. Removes the `mpsc::channel` + sender-box
-  allocations on the host side (the remaining 5 host allocs per call).
+- `tcp_read_into(buf, max_len)` / `tcp_write_borrowed(slice)` so HTTP can stop
+  allocating a fresh `Vec<u8>` per socket read/write only to copy into its own
+  reusable buffers.
+- Smaller HTTP request/response allocation shapes (`SmallVec` headers,
+  response body reuse) before making any public HTTP performance claim.
 - Add repeated-run / historical tracking before any public performance claim.
-- Add process-level allocation/RSS probes for HTTP and WebSocket rows.
+- Verify Linux/x86_64 perf behavior; this phase was measured on macOS aarch64.
 
 Verdict:
 - keep

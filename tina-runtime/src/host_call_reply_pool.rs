@@ -189,7 +189,6 @@ pub(crate) fn checkin<R: Send + 'static>(mut reply: TypedReply<R>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::thread;
 
     #[test]
@@ -251,15 +250,12 @@ mod tests {
         // Drain any state from prior tests on this thread.
         REPLY_POOLS.with(|pools| pools.borrow_mut().clear());
 
-        let counter = AtomicUsize::new(0);
         for _ in 0..32 {
             let reply = checkout::<u64>();
             let sender = reply.sender();
             sender.send(1);
             assert_eq!(reply.recv_timeout(Duration::from_secs(1)).unwrap(), 1);
             checkin(reply);
-            counter.fetch_add(1, Ordering::Relaxed);
         }
-        assert_eq!(counter.load(Ordering::Relaxed), 32);
     }
 }
