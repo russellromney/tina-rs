@@ -73,7 +73,7 @@ impl<R: Send + 'static> TypedReply<R> {
     /// happened in time.
     pub(crate) fn recv_timeout(&self, timeout: Duration) -> Result<R, RecvError> {
         let mut guard = self.state.inner.lock().expect("reply recv lock");
-        let deadline = Instant::now() + timeout;
+        let started_at = Instant::now();
         loop {
             if let Some(value) = guard.value.take() {
                 return Ok(value);
@@ -81,11 +81,11 @@ impl<R: Send + 'static> TypedReply<R> {
             if guard.sender_dropped {
                 return Err(RecvError::Disconnected);
             }
-            let now = Instant::now();
-            if now >= deadline {
+            let elapsed = started_at.elapsed();
+            if elapsed >= timeout {
                 return Err(RecvError::Timeout);
             }
-            let remaining = deadline - now;
+            let remaining = timeout.saturating_sub(elapsed);
             let (next_guard, _wait_result) = self
                 .state
                 .cond
@@ -232,6 +232,20 @@ mod tests {
         let value = reply.recv_timeout(Duration::from_secs(1)).unwrap();
         handle.join().unwrap();
         assert_eq!(value, 7);
+        checkin(reply);
+    }
+
+    #[test]
+    fn huge_timeout_does_not_overflow_deadline_math() {
+        let reply = checkout::<u32>();
+        let sender = reply.sender();
+        let handle = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(1));
+            sender.send(9);
+        });
+        let value = reply.recv_timeout(Duration::MAX).unwrap();
+        handle.join().unwrap();
+        assert_eq!(value, 9);
         checkin(reply);
     }
 
