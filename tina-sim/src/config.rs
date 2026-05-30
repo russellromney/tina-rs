@@ -54,6 +54,18 @@ pub struct SimulatorConfig {
 
     /// Default per-stream caps for Unix-domain rails in the simulator.
     pub unix: UnixSimConfig,
+
+    /// Reserve this many `IsolateId`s at simulator construction so a sim
+    /// replay matches a live `ThreadedRuntime` that registers system
+    /// isolates (e.g. its host-call dispatcher pool) at worker startup.
+    ///
+    /// The simulator never registers those system isolates itself — sim is
+    /// the semantic oracle and host-call routing isn't part of its model —
+    /// it just advances its `IsolateId` counter so user isolates get the
+    /// same ids in both modes and the captured trace replays exactly.
+    /// Default `0` keeps every existing test unaffected; live-replay
+    /// runners set this to `tina_runtime::HOST_CALL_DISPATCHER_POOL_SIZE`.
+    pub reserved_system_isolates: usize,
 }
 
 /// Per-stream caps applied to simulator Unix-domain rails.

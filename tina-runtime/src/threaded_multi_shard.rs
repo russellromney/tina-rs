@@ -925,8 +925,16 @@ where
     // chance so neither ordinary sends nor terminal replies can consume every
     // bounded drain pass forever.
     let mut drain_terminal_first = true;
+    // Refresh the live resource snapshot on idle and command turns, but not
+    // after a fast delivery turn: recomputing the O(pending) resource report on
+    // every hot turn is the per-op tax this phase removes. Counts refresh again
+    // as soon as the worker parks or runs a command (phase 145).
+    let mut refresh_metrics = true;
     loop {
-        shard_metrics.set_resource_counts(runtime.resource_report());
+        if refresh_metrics {
+            shard_metrics.set_resource_counts(runtime.resource_report());
+        }
+        refresh_metrics = true;
         let route_remote_lossless =
             |envelope: QueuedRemoteEnvelope| -> Result<(), Box<RemoteRouteFailure>> {
                 let target_shard = envelope.target_shard();
@@ -1063,9 +1071,18 @@ where
         let delivered = runtime.step_with_remote(&mut |_, envelope| route_remote(envelope));
 
         if delivered > 0 || remote_delivered > 0 || !terminal_overflow.is_empty() {
+            refresh_metrics = false;
             continue;
         }
 
+        // Nothing local, remote, or overflow was deliverable. With no in-flight
+        // work, park on the command queue with the bounded `idle_wait` and
+        // re-poll remote inbound each tick. With work in flight, yield: the
+        // runtime step blocks inside the betelgeuse io_loop while a timer or
+        // lane op is pending, so this yield does not hot-spin (verified: a held
+        // call or pending timer with nothing else to deliver does not burn a
+        // core). A bounded park here instead would only add `idle_wait` latency
+        // to a cross-shard reply for no benefit.
         if !runtime.has_in_flight_calls() {
             match receiver.recv_timeout(config.idle_wait) {
                 Ok(ThreadedCommand::Run(command)) => command(&mut runtime),

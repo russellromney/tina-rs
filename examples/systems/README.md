@@ -112,6 +112,7 @@ Keep a separate system only when it finds a different class of pain.
 | `system_lock_manager` | Local lock manager with leases, renewals, lease-expiry hand-off, FIFO per-key wait queues, and stale-handle detection. Run with `cargo test --manifest-path examples/systems/system_lock_manager/Cargo.toml`. | `PendingReplies`, `CallContext`, runtime-owned `sleep`, FIFO fairness, stale handle detection, bounded waiters. |
 | `system_order_book` | Sharded in-memory order books for hot symbols with matching, snapshots, and streaming readers. | Hot-key pressure, sharded state, deterministic replay, slow streaming readers, capacity scopes. |
 | `system_soak_http_db` | Fast in-process soak that emits the discovery lines a real HTTP+DB service would print: `scope name=…`, `events sink=…`, `capacity surface=…`, `service=… full=N …`, and copyable `FAIL surface=…` lines. Run with `cargo test --manifest-path examples/systems/system_soak_http_db/Cargo.toml`. | `SharedCapacityScope`, `BoundedEventSink`, `ServicePressureReport`, `CapacitySummary::assert_no_full`, `format_assertion_failure`. |
+| `perf_native` | Native performance rows for Tina designs against bounded Tokio designs: host enqueue, observed admission, host request/reply, service request/reply chain, HTTP/1 close, HTTP/1 keepalive, and fixed body. Run with `cargo test --release --manifest-path examples/systems/perf_native/Cargo.toml --test perf -- --nocapture` or `make perf-compare`. | `PerfReport`, `PerfComparisonReport`, median-of-five release timing, allocation counts, pressure/leak truth, semantic-match labels. |
 
 ## Folded Ideas
 
@@ -229,6 +230,8 @@ make proof-fast               # PR gate (includes the bounded protocol corpus)
 make proof-soak               # nightly load + protocol corpus at higher count
 make proof-bad-peer           # local bad-peer + typed ProtocolChaosReport lines
 make proof-replay-regression  # saved-seed sim regression
+make perf                     # local release-mode performance evidence
+make perf-compare             # native Tina vs bounded Tokio rows
 ```
 
 If a specimen would otherwise hand-roll a slow-reader / RST /

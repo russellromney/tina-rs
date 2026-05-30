@@ -1,8 +1,8 @@
 SHELL := /bin/zsh
 EXAMPLES_TARGET_DIR ?= $(CURDIR)/target/verify-examples
 
-.PHONY: fmt fmt-check check test loom miri doc clippy portable-runtime-cost \
-	verify verify-examples proof-fast proof-soak proof-bad-peer \
+.PHONY: fmt fmt-check check test loom miri doc clippy portable-runtime-cost perf \
+	perf-compare verify verify-examples proof-fast proof-soak proof-bad-peer \
 	proof-replay-regression race-surface-guard rail-inventory-guard
 
 fmt:
@@ -62,6 +62,30 @@ verify-examples:
 portable-runtime-cost:
 	cargo run -p tina-runtime --example portable_runtime_cost
 
+# Local performance evidence. Release mode, local machine. Prints timing plus
+# boundedness truth: pressure, capacity surfaces, leak/shutdown facts, and
+# native Tina-vs-bounded-Tokio comparison rows where semantics are explicit.
+perf:
+	cargo run --release -p tina-runtime --example portable_runtime_cost
+	cargo test --release -p tina-proof-harness perf_report -- --nocapture
+	cargo test --release --manifest-path examples/systems/perf_native/Cargo.toml --test perf -- --nocapture
+	cargo test --release --manifest-path examples/systems/perf_native/Cargo.toml --test hotpath -- --nocapture
+	cargo test --release --manifest-path examples/systems/mini_saas_api/Cargo.toml --test perf -- --nocapture
+
+perf-compare:
+	cargo test --release --manifest-path examples/systems/perf_native/Cargo.toml --test perf -- --nocapture
+
+# Record current `make perf` rows to perf_history.jsonl, append-only.
+# Use before merging a perf-relevant change so future runs can diff against it.
+perf-record:
+	./scripts/perf_record.sh
+
+# Run `make perf` and compare each row's tina_p50_ns against the median of the
+# most recent runs in perf_history.jsonl. Exits non-zero on regression.
+# Tune via PERF_CHECK_WINDOW (default 5) and PERF_CHECK_THRESHOLD (default 25).
+perf-check:
+	./scripts/perf_check.sh
+
 # Phase 108 proof targets. Each one is copy-pasteable into a PR check.
 # `proof-fast` is the PR gate. The other three are local / nightly /
 # regression slots.
@@ -102,7 +126,7 @@ proof-replay-regression:
 
 verify: fmt-check check test loom race-surface-guard rail-inventory-guard doc clippy
 	cargo run -p tina-runtime --example portable_runtime_cost | tee /tmp/tina-verify-cost.txt
-	grep -E "cost smoke / local machine / not benchmark" /tmp/tina-verify-cost.txt
+	grep -E "cost rows / local_machine comparison_baseline=none" /tmp/tina-verify-cost.txt
 	grep -E "mailbox local push/pop|local send|live ingress|cross-shard send|isolate call|timer|TCP loopback|TLS loopback|file read/write|journal append|bridge call" /tmp/tina-verify-cost.txt
-	grep -E "measured-local-smoke" /tmp/tina-verify-cost.txt
+	grep -E "measured-local-cost" /tmp/tina-verify-cost.txt
 	grep -E "not-measured:" /tmp/tina-verify-cost.txt

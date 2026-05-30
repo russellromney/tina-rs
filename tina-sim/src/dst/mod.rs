@@ -225,6 +225,16 @@ impl ReplayConfig {
         self
     }
 
+    /// Reserves `n` `IsolateId`s in the simulator so user-isolate ids stay
+    /// in parity with a live `ThreadedRuntime` that registers system
+    /// isolates at worker startup (e.g. its host-call dispatcher pool, of
+    /// size [`tina_runtime::HOST_CALL_DISPATCHER_POOL_SIZE`]). Set this in
+    /// live-replay runners so the captured trace replays exactly.
+    pub fn with_reserved_system_isolates(mut self, n: usize) -> Self {
+        self.simulator.reserved_system_isolates = n;
+        self
+    }
+
     /// Returns the declared mailbox capacity for `role`, panicking if
     /// the case never declared one. Loud panic surfaces missing
     /// declarations early.
