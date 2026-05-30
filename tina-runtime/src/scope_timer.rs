@@ -28,7 +28,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Stable identifier for one armed scoped timer.
 ///
-/// Process-monotonic via [`ScopedTimerId::alloc`]. A reused request key
+/// Process-monotonic via the runtime's scoped-timer id allocator. A reused request key
 /// never reuses a timer id, so a late fire for an old timer cannot be
 /// confused with a new one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
