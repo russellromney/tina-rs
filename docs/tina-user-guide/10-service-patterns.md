@@ -113,6 +113,68 @@ cargo run --manifest-path examples/systems/mini_saas_api/Cargo.toml -- pressure
 This is a skeleton, not a framework. It deliberately keeps route parsing,
 small response helpers, and scenario glue specimen-local.
 
+## One HTTP Request Is One Request Tree
+
+A request is a tree. The caller is the root. Every rail the request opens —
+a body stream, a timer, a pool wait, a DB or outbound call — is a child.
+When the caller goes away, the tree stops waiting.
+
+`tina_runtime::RequestScope` is the bookkeeping for that tree. One service
+request owns one scope; the scope holds a clone of each child rail's cancel
+handle. A bounded `RequestScopeSet` keyed by request id holds the in-flight
+scopes, sized from the budget manifest, not a scattered constant.
+
+```text
+request admitted
+  -> RequestScope::with_child_cap(id, child_cap)
+  -> scope_set.try_insert(req_id, scope)   // Full -> shed, dispatch nothing
+  -> defer_scoped(&scope, "db", work).try_admit(...)   // all-or-nothing
+  -> ... more scoped children ...
+caller goes away (disconnect / timeout / owner stop)
+  -> scope.cancel_into_effect(cause, translator)
+  -> ScopedRequestReport { cancelled children, capacity reclaimed, ... }
+final reply
+  -> scope_set.remove(req_id)
+```
+
+Admission is all-or-nothing. `defer_scoped(...).try_admit(...)` stores the
+pending token, registers the child in the scope, and only then returns the
+child effect. If pending or scope admission fails, no child work is
+dispatched and the caller authority is handed back so the service answers
+deliberately.
+
+Honesty rules the cancel path:
+
+- Scope cancel closes Tina-owned waits and reclaims caller capacity. It does
+  not un-start work a bridge already accepted; a late completion still
+  becomes a visible rejected trace fact, never a ghost.
+- A cross-shard child reports `WrongShard` in its cancel row, never silent
+  success.
+- A rail Tina cannot cancel (a buffered body already in hand, a
+  fire-and-forget send) is recorded as an `UnsupportedScopeRow` in
+  `ScopedRequestReport`, not pretended-cancelled.
+- Plain `sleep` is not `CallHandle`-cancelable. A request deadline uses a
+  `ScopedTimerSet`: cancelling tombstones the ticket, and when the physical
+  sleep fires later the continuation observes `ScopedTimerFire::IgnoredLate`
+  and skips the user work. The timer is ignored, not magically un-fired.
+
+HTTP rails register through the adapters in `tina_http::scope`:
+
+```rust
+// Parked request-body pull, owned by the scope:
+let pull = scoped_request_body_pull(&scope, stream.source, "body", t, on_chunk)?;
+// A WebSocket send the request owns (the session is not the scope):
+let send = scoped_websocket_send(&scope, session, msg, "ws_send", t, on_outcome)?;
+// The protocol-honest response-source cancel:
+let stop = cancel_response_source(source, t, on_ack);
+```
+
+`examples/systems/system_scoped_request_tree` is the small end-to-end proof:
+one streaming route, one timer, one cancelable child, one report. A mid-body
+disconnect cancels the child, tombstones the timer, and reclaims the slot.
+`examples/systems/mini_saas_api` shows the scope on its notify path with the
+caps declared as `request.scope_set` / `request.scope_child_cap` budget rows.
+
 ## Topology Shapes
 
 The registry should not become a scheduler.

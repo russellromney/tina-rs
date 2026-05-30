@@ -101,6 +101,7 @@ proof-fast:
 	cargo test -p tina-proof-harness
 	cargo test --manifest-path examples/systems/system_realtime_rooms/Cargo.toml --test bad_peer
 	cargo test --manifest-path examples/systems/system_live_replay_bugbox/Cargo.toml --test smoke
+	cargo test --manifest-path examples/systems/system_scoped_request_tree/Cargo.toml --test smoke
 
 # Slow soak: the load harness against mini_saas_api with the visible
 # typed capacity contract, plus the protocol-chaos corpus repeated at a

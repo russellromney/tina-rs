@@ -723,6 +723,134 @@ where
     }
 }
 
+// ---------- ScopedRequestReport ----------
+
+/// One rail a request used that Tina cannot scope-cancel in this phase.
+///
+/// A rail with no cancel handle — a fire-and-forget send, a buffered body
+/// already consumed, a bridge that accepted work without a cancel token —
+/// must say so out loud. The service records an `UnsupportedScopeRow`
+/// instead of pretending the rail was cancelled. A prose-only "we can't
+/// cancel this" is not allowed; it has to be a typed row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnsupportedScopeRow {
+    /// Service-supplied rail label, e.g. `"buffered_body"`.
+    pub rail: &'static str,
+    /// Why this rail cannot be scope-cancelled.
+    pub reason: &'static str,
+}
+
+/// Request-level aggregate produced when a request scope is torn down.
+///
+/// Wraps the synchronous [`ScopeCancelReport`] (per-child cancel rows),
+/// the [`RequestScopeSetCapacityReport`] taken *after* the scope was
+/// removed from its set, a count of child results that arrived late (after
+/// cancel — visible as rejected trace facts, never ghosts), the number of
+/// tombstoned timers that fired late and were ignored, and any rails the
+/// service could not scope-cancel.
+///
+/// It deliberately *wraps* [`ScopeCancelReport`] rather than replacing it:
+/// the per-child cancel vocabulary stays the single source of truth.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScopedRequestReport {
+    /// Per-child cancel report from [`RequestScope::cancel_into_effects`]
+    /// (or [`RequestScope::cancel_synchronously`]).
+    pub cancel: ScopeCancelReport,
+    /// Scope-set capacity snapshot taken after the request's scope was
+    /// removed. Owner-stop drains want `in_use` to reach zero.
+    pub capacity: RequestScopeSetCapacityReport,
+    /// Child results delivered after the scope was cancelled. The service
+    /// counts these as it observes them; each underlying reply is a
+    /// rejected trace fact, never delivered to the gone caller.
+    pub late_results: usize,
+    /// Tombstoned timers that fired after cancel and were ignored. Sourced
+    /// from [`ScopedTimerSet::ignored_late`](crate::scope_timer::ScopedTimerSet::ignored_late).
+    pub timers_ignored_late: u64,
+    /// Rails that could not be scope-cancelled in this phase.
+    pub unsupported: Vec<UnsupportedScopeRow>,
+}
+
+impl ScopedRequestReport {
+    /// Builds a report from a cancel report and a post-removal capacity
+    /// snapshot. Late-result, ignored-timer, and unsupported counts start
+    /// empty; add them with the builder methods as the request learns of
+    /// them.
+    pub fn new(cancel: ScopeCancelReport, capacity: RequestScopeSetCapacityReport) -> Self {
+        Self {
+            cancel,
+            capacity,
+            late_results: 0,
+            timers_ignored_late: 0,
+            unsupported: Vec::new(),
+        }
+    }
+
+    /// Records the number of late child completions the request observed.
+    pub fn with_late_results(mut self, late_results: usize) -> Self {
+        self.late_results = late_results;
+        self
+    }
+
+    /// Records the number of tombstoned timers that fired late and were
+    /// ignored.
+    pub fn with_timers_ignored_late(mut self, ignored: u64) -> Self {
+        self.timers_ignored_late = ignored;
+        self
+    }
+
+    /// Adds one rail the service could not scope-cancel.
+    pub fn with_unsupported(mut self, rail: &'static str, reason: &'static str) -> Self {
+        self.unsupported.push(UnsupportedScopeRow { rail, reason });
+        self
+    }
+
+    /// The cause the scope was cancelled for.
+    pub fn cause(&self) -> ScopeCancelCause {
+        self.cancel.cause
+    }
+
+    /// Children whose wait was still open at cancel time (this cancel
+    /// closed them).
+    pub fn cancelled_children(&self) -> usize {
+        self.cancel.cancelled_count()
+    }
+
+    /// Children that had already settled before the cancel reached them.
+    pub fn settled_children(&self) -> usize {
+        self.cancel.already_settled_count()
+    }
+
+    /// Scope slots still occupied after the request was removed from its
+    /// set. Owner-stop drains expect zero.
+    pub fn unreleased_capacity(&self) -> usize {
+        self.capacity.in_use
+    }
+
+    /// `true` when every rail the request used was scope-cancelable (no
+    /// unsupported rows). Late completions and ignored timers do not make
+    /// a report unclean — they are honest, expected facts.
+    pub fn is_clean(&self) -> bool {
+        self.unsupported.is_empty()
+    }
+
+    /// One grep-friendly line summarizing the request teardown.
+    pub fn summary_line(&self) -> String {
+        format!(
+            "scope={} cause={:?} children={} cancelled={} settled={} late_results={} \
+             timers_ignored_late={} unreleased_capacity={} unsupported={}",
+            self.cancel.scope_id.get(),
+            self.cancel.cause,
+            self.cancel.children.len(),
+            self.cancelled_children(),
+            self.settled_children(),
+            self.late_results,
+            self.timers_ignored_late,
+            self.unreleased_capacity(),
+            self.unsupported.len(),
+        )
+    }
+}
+
 // ---------- defer_scoped helper ----------
 
 use crate::call::{
@@ -1128,6 +1256,43 @@ mod tests {
         // Refill the freed slot.
         set.try_insert(3, s3).expect("admit 3 after refill");
         assert!(set.is_full());
+    }
+
+    #[test]
+    fn scoped_request_report_wraps_cancel_and_capacity() {
+        let scope = RequestScope::with_child_cap(RequestScopeId::alloc(), 4);
+        scope.register("db", fake_handle::<u32>()).unwrap();
+        scope.register("pool", fake_handle::<u32>()).unwrap();
+        let cancel = scope.cancel_synchronously(ScopeCancelCause::ClientDisconnect);
+
+        // After the request was removed from a set with one slot, the set
+        // is empty: unreleased capacity is zero.
+        let capacity = RequestScopeSetCapacityReport {
+            in_use: 0,
+            capacity: 1,
+        };
+        let report = ScopedRequestReport::new(cancel, capacity)
+            .with_late_results(1)
+            .with_timers_ignored_late(2)
+            .with_unsupported("buffered_body", "no cancel handle once consumed");
+
+        assert_eq!(report.cause(), ScopeCancelCause::ClientDisconnect);
+        // Both children were Pending (fake handles never settle), so both
+        // count as cancelled, none as settled.
+        assert_eq!(report.cancelled_children(), 2);
+        assert_eq!(report.settled_children(), 0);
+        assert_eq!(report.late_results, 1);
+        assert_eq!(report.timers_ignored_late, 2);
+        assert_eq!(report.unreleased_capacity(), 0);
+        assert!(
+            !report.is_clean(),
+            "an unsupported row must make the report not clean",
+        );
+        assert_eq!(report.unsupported.len(), 1);
+        assert_eq!(report.unsupported[0].rail, "buffered_body");
+        // The wrapped cancel report is untouched — still the single source
+        // of truth for per-child rows.
+        assert_eq!(report.cancel.children.len(), 2);
     }
 
     #[test]

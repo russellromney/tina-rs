@@ -294,6 +294,16 @@ What the scope can honestly do:
 - Provide a synchronous [`ScopeCancelReport`] listing every registered
   rail and its state at cancel time.
 
+First cause wins. The first `cancel_into_effect(...)` sets the cause; a
+second cancel keeps the original cause and returns an empty effect, so a
+client disconnect that races a per-request timeout reports one cause, not
+two. Wrap the cancel report, the post-removal
+`RequestScopeSetCapacityReport`, and the late-result / ignored-timer
+counts in a `ScopedRequestReport` — the request-level aggregate that says,
+in one typed value: what cause, which children were cancelled vs already
+settled, how much capacity came back, and any rails that could not be
+scope-cancelled.
+
 What the scope cannot do:
 
 - Stop external work a bridge already accepted. A SQLx query that
@@ -301,11 +311,18 @@ What the scope cannot do:
   already sent, a SQLite blocking call mid-flight — these run to their
   own conclusion. Their replies become typed `late_results` /
   `CallReplyRejected` trace facts the same as for a plain cancel.
-- Stop sleep or raw TCP/TLS today. Scope cancellation rides the same
-  rail as `cancel_call`, so anything that does not expose a
-  `CallHandle` (`sleep`, `tcp_read`, body sources outside the streaming
-  helper) is not scope-cancellable yet. Wire `Cancel`-style application
-  messages for those rails until first-form cancel reaches them.
+- Physically cancel a `sleep`. Plain `sleep` has no `CallHandle`. A
+  per-request deadline uses a `ScopedTimerSet`: cancelling tombstones the
+  ticket, and when the physical sleep fires later the continuation reads
+  `ScopedTimerFire::IgnoredLate` and skips the user work. The ignored
+  count is visible truth, not a pretended physical cancel.
+- Cancel a rail that exposes no cancel handle. A buffered body already in
+  the handler's hand, a fire-and-forget send — these are recorded as an
+  `UnsupportedScopeRow` in the report, never pretended-cancelled. HTTP
+  body pulls, WebSocket session operations, and response sources *do*
+  have honest cancels through the `tina_http::scope` adapters
+  (`scoped_request_body_pull`, `scoped_websocket_send`/`_report`/`_close`,
+  `cancel_response_source`).
 
 The bounded [`RequestScopeSet`] holds one scope per concurrent request:
 

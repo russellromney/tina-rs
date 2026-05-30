@@ -387,14 +387,33 @@ return admit; // child effect runs only after admission succeeded
 ```
 
 When the request dies (client disconnect, per-request deadline, owner
-stop), call `scope.cancel_into_effects(cause, translator)`. It returns
-a synchronous [`ScopeCancelReport`] and a list of `Effect::Call`
-cancellations — return them from the handler. Any rail that does not
-expose a `CallHandle` (sleep, raw TCP read/write, body sources) is not
-yet scope-cancellable; wire an application `Cancel` message for those.
+stop), call `scope.cancel_into_effect(cause, translator)`. It returns a
+synchronous `ScopeCancelReport` and one batched `Effect::Call` cancel —
+return it from the handler. Wrap that report, the post-removal
+`RequestScopeSetCapacityReport`, and any late-result / ignored-timer
+counts in a `ScopedRequestReport` so the request-level teardown is one
+typed value.
+
+Two honesty rules for rails that do not fit a plain `CallHandle` cancel:
+
+- **Timers.** Plain `sleep` is not `CallHandle`-cancelable. Use a
+  `ScopedTimerSet`: arm a `ScopedTimer` for the deadline, tombstone it on
+  cancel, and when the physical sleep fires later the continuation reads
+  `ScopedTimerFire::IgnoredLate` and skips the user work. The ignored
+  count is visible, never a silent magic cancel.
+- **HTTP body/session rails.** Use the adapters in `tina_http::scope`:
+  `scoped_request_body_pull` registers a parked body pull,
+  `scoped_websocket_send` / `_report` / `_close` register a single
+  WebSocket operation a request owns (the session is not the scope), and
+  `cancel_response_source` issues the protocol-honest
+  `ResponseChunkMsg::Cancel`. A rail with no cancel handle (a buffered
+  body already in hand) is recorded as an `UnsupportedScopeRow`, not
+  pretended-cancelled.
 
 See [lifecycle § Request-Scoped Cancellation](14-lifecycle-and-shutdown.md#request-scoped-cancellation)
-for the full truth table and bridge honesty rules.
+for the full truth table and bridge honesty rules, and
+[service patterns § One HTTP Request Is One Request Tree](10-service-patterns.md#one-http-request-is-one-request-tree)
+for the copied shape.
 
 ## Grug Rule
 

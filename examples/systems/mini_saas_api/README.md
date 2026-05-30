@@ -48,6 +48,8 @@ scattered literal, is what installs the service.
 | `notify.mailbox` | `8` | replay-affecting |
 | `outbound.pool` / `outbound.in_flight` | `1` connection, zero waiters | replay-affecting |
 | `outbound.connection.mailbox` / `outbound.pool.mailbox` | `8` | replay-affecting |
+| `request.scope_set` | `8` concurrent notify request scopes | replay-affecting |
+| `request.scope_child_cap` | `2` child rails per notify request | replay-affecting |
 | `http.main_listener.mailbox` | `4` (accept-queue depth) | display-only |
 
 `run()` calls `manifest.validate()` before binding any socket: a zero
@@ -66,10 +68,13 @@ What the manifest covers and what it doesn't, honestly:
   parser and re-checked in the handler), the accept mailbox, the SQLite
   bridge mailbox, the notify mailbox/body, and the outbound pool +
   mailboxes — all read back via `ServiceCaps::from_manifest`.
-- **Measured live in the shutdown join:** `http.request_body` and
-  `db.in_flight` carry real numbers from runtime reports; the body-cap
-  fact comes from the actual listener config, not a const, so a listener
-  configured off-manifest would fail the consistency check.
+- **Measured live in the shutdown join:** `http.request_body`,
+  `db.in_flight`, and `request.scope_set` carry real numbers from runtime
+  reports; the body-cap fact comes from the actual listener config, not a
+  const, so a listener configured off-manifest would fail the consistency
+  check. The scope-set surface joins live `in_use`/`high_water` from the
+  controller's request-scope metrics — after a run the high-water is
+  non-zero and every slot has been reclaimed.
 - **Declared but `Unavailable` in that join:** per-isolate mailbox depths
   (the runtime does not sample them) and the outbound pool (observable
   live via `/debug/capacity`, which calls the pool from inside the
@@ -175,6 +180,32 @@ Each follow-on hop calls `then_with_request(req, ...)` to keep that context
 moving across messages. The final turn settles the caller with
 `reply_to_request`. There is no hidden caller context preservation; `Full`,
 `Closed`, and `Timeout` remain distinct in the route bodies at every hop.
+
+### Request Scope On The Notify Path
+
+`POST /items/{id}/notify` owns a `RequestScope` for its lifetime. The scope
+is admitted into a bounded `RequestScopeSet` (sized from `request.scope_set`)
+when the request is accepted — a full set sheds with `503
+request_scopes_full` and dispatches no child work. The outbound keepalive
+**request** call is registered into the scope as a cancelable child, so an
+owner-stop or request abort closes its parked wait rather than leaking it.
+Every terminal branch (404, pool error, release outcome) retires the scope
+and refreshes the live `request.scope_set` counters; the soak proof shows the
+set returning to zero in-use under load. A late upstream completion after a
+scope cancel stays a visible rejected trace fact, never a delivered success.
+
+At shutdown the host runs an owner-stop sweep (`ControllerMsg::DrainScopes`):
+the controller drains its `RequestScopeSet` and cancels every still-pending
+child rail with `OwnerStopped`, replying with `scopes_cancelled` /
+`children_cancelled` / `unreleased` counts. Graceful shutdown completes the
+in-flight notify first, so the sweep reports zero unreleased. The
+`tests/scope_drain.rs` proof holds a notify mid-outbound, drains while its
+child is parked, and shows that child cancelled and the caller answered with
+an error — the registered child rail is functional, not decorative.
+
+The fuller request-tree story — streaming-body disconnect, a tombstoned
+deadline timer, and the `ScopedRequestReport` aggregate — is proven small in
+`examples/systems/system_scoped_request_tree`.
 
 ## Live-Replay Fact
 

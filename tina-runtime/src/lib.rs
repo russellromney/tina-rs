@@ -81,6 +81,7 @@ pub mod persistence;
 pub mod pool;
 pub mod pressure;
 pub mod scope;
+pub mod scope_timer;
 pub mod service_pressure;
 pub mod sharded;
 pub mod shared_scope;
@@ -276,7 +277,10 @@ pub use scope::{
     RequestScopeInsertError, RequestScopeRemoveError, RequestScopeSet,
     RequestScopeSetCapacityReport, ScopeCancelCause, ScopeCancelReport, ScopeChildReport,
     ScopeRegisterError, ScopeRegisterSharedError, ScopedAdmitError, ScopedCallHandle,
-    ScopedReplyError, scope_register,
+    ScopedReplyError, ScopedRequestReport, UnsupportedScopeRow, scope_register,
+};
+pub use scope_timer::{
+    ScopedTimer, ScopedTimerArmError, ScopedTimerFire, ScopedTimerId, ScopedTimerSet,
 };
 pub use service_pressure::{ServicePressureReport, ServicePressureSurface, ServiceSurfaceState};
 pub use shared_scope::{
