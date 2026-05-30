@@ -7,13 +7,12 @@
 //! worker startup and amortizes them across every host call for the worker's
 //! lifetime.
 //!
-//! Type erasure: the dispatcher's `Message` carries a typed task as
-//! `Box<dyn HostCallTaskBegin<S>>` for the issue phase and
-//! `Box<dyn HostCallTaskComplete>` for the reply-delivery phase. Each
-//! concrete `Begin` knows its own `M` / `R` and issues the typed call
-//! internally; the `.then` translator closes over the reply sender so when
-//! the call completes the runtime produces a `Returned` carrying a
-//! `Complete` that delivers the outcome.
+//! Type erasure: the dispatcher's `Message` carries a typed begin task as
+//! `Box<dyn HostCallTaskBegin<S>>`. Each concrete `Begin` knows its own `M` /
+//! `R` and issues the typed call internally. The `.then` translator closes
+//! over the reply sender and delivers the host-visible outcome before
+//! producing a bookkeeping `Returned` message. That makes the host answer
+//! independent of dispatcher mailbox pressure on the return path.
 //!
 //! Bounds preserved (same as the old per-call driver):
 //!
@@ -52,8 +51,8 @@ impl<S: Shard + 'static> HostCallDispatcher<S> {
 pub(crate) enum DispatcherMsg<S: Shard + 'static> {
     /// Host enqueued a new call: execute it (issue the typed call).
     Begin(Box<dyn HostCallTaskBegin<S>>),
-    /// The call replied: deliver the outcome to the host.
-    Returned(Box<dyn HostCallTaskComplete>),
+    /// The call replied and the host has already been answered.
+    Returned,
 }
 
 /// "Issue a host call" task. Concrete impls know their `M` / `R` and call
@@ -62,12 +61,6 @@ pub(crate) trait HostCallTaskBegin<S: Shard + 'static>: Send + 'static {
     fn execute(self: Box<Self>) -> Effect<HostCallDispatcher<S>>;
     fn reject_full(self: Box<Self>);
     fn reject_closed(self: Box<Self>);
-}
-
-/// "Deliver this outcome to the waiting host thread" task. Concrete impls
-/// hold the typed outcome and the typed reply sender.
-pub(crate) trait HostCallTaskComplete: Send + 'static {
-    fn complete(self: Box<Self>);
 }
 
 pub(crate) struct ConcreteHostCallBegin<S, M, R>
@@ -98,7 +91,11 @@ where
             _marker,
         } = *self;
         call(target, message, timeout).then(move |outcome: CallOutcome<R>| {
-            DispatcherMsg::Returned(Box::new(ConcreteHostCallComplete { outcome, sender }))
+            // Answer the parked host thread in the translator itself. A later
+            // `Returned` bookkeeping message can be dropped under dispatcher
+            // pressure without stranding the host-side reply channel.
+            sender.send(outcome);
+            DispatcherMsg::Returned
         })
     }
 
@@ -108,23 +105,6 @@ where
 
     fn reject_closed(self: Box<Self>) {
         self.sender.send(CallOutcome::Closed);
-    }
-}
-
-pub(crate) struct ConcreteHostCallComplete<R: Send + 'static> {
-    pub(crate) outcome: CallOutcome<R>,
-    pub(crate) sender: TypedReplySender<CallOutcome<R>>,
-}
-
-impl<R: Send + 'static> HostCallTaskComplete for ConcreteHostCallComplete<R> {
-    fn complete(self: Box<Self>) {
-        let ConcreteHostCallComplete { outcome, sender } = *self;
-        // The host may have already given up (HostWaitTimeout) and dropped the
-        // receiver — in which case `send` stores into a shared state nobody
-        // will read, and the channel is freed when the sender drops. The
-        // runtime's late-reply trace event already records that the call
-        // completed.
-        sender.send(outcome);
     }
 }
 
@@ -145,10 +125,7 @@ impl<S: Shard + 'static> Isolate for HostCallDispatcher<S> {
     ) -> Effect<Self> {
         match msg {
             DispatcherMsg::Begin(task) => task.execute(),
-            DispatcherMsg::Returned(complete) => {
-                complete.complete();
-                tina::noop()
-            }
+            DispatcherMsg::Returned => tina::noop(),
         }
     }
 }

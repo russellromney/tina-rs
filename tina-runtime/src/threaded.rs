@@ -1268,8 +1268,8 @@ where
                 Err(TrySendError::Closed(DispatcherMsg::Begin(begin))) => {
                     begin.reject_closed();
                 }
-                Err(TrySendError::Full(DispatcherMsg::Returned(_)))
-                | Err(TrySendError::Closed(DispatcherMsg::Returned(_))) => {
+                Err(TrySendError::Full(DispatcherMsg::Returned))
+                | Err(TrySendError::Closed(DispatcherMsg::Returned)) => {
                     unreachable!("host call command only sends Begin messages");
                 }
             }
