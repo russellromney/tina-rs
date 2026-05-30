@@ -1,10 +1,13 @@
 use std::convert::Infallible;
-use std::time::Duration;
+use std::sync::{Arc, Barrier};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use tina::prelude::*;
 use tina::{RequestContext, reply_to_request};
 use tina_runtime::{
-    CallOutcome, DefaultThreadedMailboxFactory, RuntimeCall, ThreadedRuntime, ThreadedRuntimeConfig,
+    CallOutcome, DefaultThreadedMailboxFactory, RuntimeCall, ThreadedRuntime,
+    ThreadedRuntimeConfig, ThreadedRuntimeError,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -252,4 +255,133 @@ fn call_blocking_defer_through_multi_turn_callee_preserves_request_context() {
 
     assert_eq!(outcome, CallOutcome::Replied(42));
     runtime.shutdown().expect("shutdown");
+}
+
+#[test]
+fn call_blocking_with_host_timeout_surfaces_host_wait_timeout() {
+    let runtime = runtime();
+    let silent = runtime
+        .register_with_capacity::<Silent, Infallible>(Silent, 4)
+        .expect("register silent");
+
+    // Silent::Start parks on a 100ms timer before replying. A generous target
+    // deadline keeps the call alive while a tiny host budget expires first, so
+    // the host wait surfaces distinctly as HostWaitTimeout — not a target
+    // Timeout, and not a hang.
+    let outcome = runtime.call_blocking_with_host_timeout(
+        silent,
+        SilentMsg::Start,
+        Duration::from_secs(2),
+        Duration::from_millis(20),
+    );
+
+    assert_eq!(outcome, Err(ThreadedRuntimeError::HostWaitTimeout));
+    let _ = runtime.shutdown();
+}
+
+#[test]
+fn call_blocking_dispatcher_pressure_never_reports_worker_stopped() {
+    let runtime = Arc::new(ThreadedRuntime::with_config(
+        TestShard,
+        DefaultThreadedMailboxFactory,
+        ThreadedRuntimeConfig {
+            command_capacity: 1,
+            idle_wait: Duration::from_millis(2),
+            ..Default::default()
+        },
+    ));
+    let silent = runtime
+        .register_with_capacity::<Silent, Infallible>(Silent, 1)
+        .expect("register silent");
+
+    // Tiny command and target mailboxes force a messy burst through the
+    // persistent dispatcher pool. Any outcome may be legitimate pressure,
+    // but `WorkerStopped` would be a lie caused by dropping the dispatcher
+    // task without answering the pooled host reply.
+    let workers = 256;
+    let barrier = Arc::new(Barrier::new(workers));
+    let mut handles = Vec::with_capacity(workers);
+    for _ in 0..workers {
+        let runtime = Arc::clone(&runtime);
+        let barrier = Arc::clone(&barrier);
+        handles.push(thread::spawn(move || {
+            barrier.wait();
+            runtime.call_blocking_with_host_timeout(
+                silent,
+                SilentMsg::Start,
+                Duration::from_secs(1),
+                Duration::from_secs(2),
+            )
+        }));
+    }
+
+    let mut counts = std::collections::BTreeMap::new();
+    for handle in handles {
+        match handle.join().expect("caller thread joined") {
+            Ok(CallOutcome::Full) => *counts.entry("full").or_insert(0usize) += 1,
+            Err(ThreadedRuntimeError::WorkerStopped) => {
+                *counts.entry("worker_stopped").or_insert(0usize) += 1
+            }
+            Ok(CallOutcome::Replied(_)) => *counts.entry("replied").or_insert(0usize) += 1,
+            Ok(CallOutcome::Timeout) => *counts.entry("timeout").or_insert(0usize) += 1,
+            Ok(CallOutcome::Closed) => *counts.entry("closed").or_insert(0usize) += 1,
+            Ok(CallOutcome::Rejected(_)) => *counts.entry("rejected").or_insert(0usize) += 1,
+            Err(ThreadedRuntimeError::CommandFull) => {
+                *counts.entry("command_full").or_insert(0usize) += 1
+            }
+            Err(ThreadedRuntimeError::HostWaitTimeout) => {
+                *counts.entry("host_wait_timeout").or_insert(0usize) += 1
+            }
+            Err(_) => *counts.entry("other_error").or_insert(0usize) += 1,
+        }
+    }
+
+    assert_eq!(
+        counts.get("worker_stopped").copied().unwrap_or(0),
+        0,
+        "{counts:?}"
+    );
+    let runtime = match Arc::try_unwrap(runtime) {
+        Ok(runtime) => runtime,
+        Err(_) => panic!("no extra runtime refs"),
+    };
+    let _ = runtime.shutdown();
+}
+
+#[test]
+fn shutdown_while_call_pending_unblocks_caller_promptly() {
+    let runtime = Arc::new(runtime());
+    let silent = runtime
+        .register_with_capacity::<Silent, Infallible>(Silent, 4)
+        .expect("register silent");
+    let shutdown = runtime.shutdown_handle();
+
+    let rt = Arc::clone(&runtime);
+    let caller =
+        thread::spawn(move || rt.call_blocking(silent, SilentMsg::Start, Duration::from_secs(30)));
+
+    // Let the call reach the worker and park on its 100ms timer.
+    thread::sleep(Duration::from_millis(20));
+    let requested = Instant::now();
+    let _ = shutdown.request_shutdown();
+    let outcome = caller.join().expect("caller thread");
+    let elapsed = requested.elapsed();
+
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "pending caller was not unblocked promptly after shutdown: {elapsed:?}"
+    );
+    // No hang: the caller always sees a visible result. The worker stopped out
+    // from under the wait (WorkerStopped), or a terminal call outcome landed.
+    assert!(
+        matches!(
+            outcome,
+            Err(ThreadedRuntimeError::WorkerStopped)
+                | Ok(CallOutcome::Timeout)
+                | Ok(CallOutcome::Closed)
+                | Ok(CallOutcome::Replied(_))
+        ),
+        "unexpected pending-shutdown outcome: {outcome:?}"
+    );
+    drop(runtime);
 }

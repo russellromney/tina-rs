@@ -75,7 +75,11 @@ fn native_perf_comparison_rows_are_printable_and_bounded() {
             report.summary_line().contains("perf-compare "),
             "comparison line shape"
         );
-        assert_eq!(report.samples, 5, "median-of-five samples for {}", report.label);
+        assert_eq!(
+            report.samples, 5,
+            "median-of-five samples for {}",
+            report.label
+        );
         assert!(
             report.summary_line().contains("samples=5"),
             "comparison samples line shape"
@@ -90,7 +94,9 @@ fn native_perf_comparison_rows_are_printable_and_bounded() {
             report.label,
         );
         assert!(
-            report.json_line().contains("\"schema\":\"tina.perf_compare.v1\""),
+            report
+                .json_line()
+                .contains("\"schema\":\"tina.perf_compare.v1\""),
             "comparison json shape"
         );
         assert!(

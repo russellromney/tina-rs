@@ -304,6 +304,169 @@ impl PerfComparisonReport {
     }
 }
 
+/// One measured boundary inside a hot-path probe, in nanoseconds.
+///
+/// A stage is a wall-clock gap between two observable points: host submit,
+/// a worker-thread trace event (captured live through a `TraceObserver`),
+/// or host unblock. The name describes the boundary, not a guess at the
+/// cause — `host_submit_to_worker_pickup`, not "wakeup tax".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HotPathStage {
+    pub name: String,
+    pub nanos: u64,
+}
+
+impl HotPathStage {
+    pub fn new(name: impl Into<String>, nanos: u64) -> Self {
+        Self {
+            name: name.into(),
+            nanos,
+        }
+    }
+}
+
+/// A hot-path probe report: end-to-end latency over N iterations plus a
+/// single representative per-stage breakdown.
+///
+/// Prints both nanoseconds and microseconds so a sub-microsecond stage never
+/// rounds into a fake zero. The stage breakdown comes from one instrumented
+/// run; the p50/min/max come from the full iteration set so a single slow
+/// scheduling hiccup does not masquerade as the steady-state cost.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HotPathReport {
+    pub label: &'static str,
+    pub iterations: u64,
+    pub p50_ns: u64,
+    pub min_ns: u64,
+    pub max_ns: u64,
+    pub stages: Vec<HotPathStage>,
+    /// Allocations the caller's host thread makes per op. Misses anything the
+    /// runtime worker thread allocates on the caller's behalf — see
+    /// [`HotPathReport::process_allocations`] for the full picture.
+    pub allocations: Option<u64>,
+    /// Allocations the whole process makes per op: host thread + runtime
+    /// worker thread + lane workers. This is the real per-op allocation cost.
+    pub process_allocations: Option<u64>,
+    pub env: PerfEnvironment,
+}
+
+impl HotPathReport {
+    /// Builds a report from a non-empty set of per-iteration totals (ns) plus
+    /// an optional single-run stage breakdown and allocation count.
+    pub fn from_samples(
+        label: &'static str,
+        totals_ns: Vec<u64>,
+        stages: Vec<HotPathStage>,
+        allocations: Option<u64>,
+    ) -> Self {
+        Self::from_samples_with_process_allocations(label, totals_ns, stages, allocations, None)
+    }
+
+    /// Builds a report including both host-thread allocations (`allocations`)
+    /// and whole-process allocations (`process_allocations`). The latter
+    /// captures everything the runtime worker thread allocates on the
+    /// caller's behalf, which the host-only count misses.
+    pub fn from_samples_with_process_allocations(
+        label: &'static str,
+        mut totals_ns: Vec<u64>,
+        stages: Vec<HotPathStage>,
+        allocations: Option<u64>,
+        process_allocations: Option<u64>,
+    ) -> Self {
+        assert!(
+            !totals_ns.is_empty(),
+            "hot-path report needs at least one timing sample"
+        );
+        totals_ns.sort_unstable();
+        let iterations = totals_ns.len() as u64;
+        let p50_ns = totals_ns[totals_ns.len() / 2];
+        let min_ns = *totals_ns.first().expect("non-empty");
+        let max_ns = *totals_ns.last().expect("non-empty");
+        Self {
+            label,
+            iterations,
+            p50_ns,
+            min_ns,
+            max_ns,
+            stages,
+            allocations,
+            process_allocations,
+            env: PerfEnvironment::detect(),
+        }
+    }
+
+    /// One-line key=value shape for humans, CI logs, and grep. Each stage is
+    /// its own `stage.<name>_ns=<v>` field so the line stays flat and
+    /// greppable.
+    pub fn summary_line(&self) -> String {
+        let mut line = format!(
+            "hotpath label={} iterations={} p50_us={} p50_ns={} min_ns={} max_ns={} host_allocations={} process_allocations={} {}",
+            report_value(self.label),
+            self.iterations,
+            self.p50_ns / 1_000,
+            self.p50_ns,
+            self.min_ns,
+            self.max_ns,
+            self.allocations
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "unknown".to_string()),
+            self.process_allocations
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "unknown".to_string()),
+            self.env.summary_fields(),
+        );
+        // Back-compat: keep the original key so existing grep lines still match.
+        line.push_str(&format!(
+            " allocations={}",
+            self.allocations
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "unknown".to_string())
+        ));
+        for stage in &self.stages {
+            line.push_str(&format!(
+                " stage.{}_ns={}",
+                report_value(&stage.name),
+                stage.nanos
+            ));
+        }
+        line
+    }
+
+    /// Tiny JSON shape for tools. Stages land in a nested object keyed by name.
+    pub fn json_line(&self) -> String {
+        let mut stages = String::from("{");
+        for (index, stage) in self.stages.iter().enumerate() {
+            if index > 0 {
+                stages.push(',');
+            }
+            stages.push_str(&format!("{}:{}", json_string(&stage.name), stage.nanos));
+        }
+        stages.push('}');
+        format!(
+            "{{\"schema\":\"tina.hotpath.v1\",\"label\":{},\"iterations\":{},\"p50_ns\":{},\"min_ns\":{},\"max_ns\":{},\"host_allocations\":{},\"process_allocations\":{},\"allocations\":{},\"platform\":{},\"arch\":{},\"profile\":{},\"git_sha\":{},\"stages\":{}}}",
+            json_string(self.label),
+            self.iterations,
+            self.p50_ns,
+            self.min_ns,
+            self.max_ns,
+            self.allocations
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "null".to_string()),
+            self.process_allocations
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "null".to_string()),
+            self.allocations
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "null".to_string()),
+            json_string(self.env.platform),
+            json_string(self.env.arch),
+            json_string(&self.env.profile),
+            json_string(&self.env.git_sha),
+            stages,
+        )
+    }
+}
+
 fn ratio_per_mille(a: u64, b: u64) -> Option<u64> {
     if b == 0 {
         return None;
@@ -487,5 +650,43 @@ mod tests {
             "{json}"
         );
         assert!(json.contains("\"tina_allocations\":null"), "{json}");
+    }
+
+    #[test]
+    fn hotpath_report_prints_ns_us_and_named_stages() {
+        let report = HotPathReport::from_samples(
+            "hotpath_call_blocking",
+            vec![900, 1100, 1000, 1200, 800],
+            vec![
+                HotPathStage::new("host_submit_to_worker_pickup", 250),
+                HotPathStage::new("begin_to_target_handler", 120),
+            ],
+            Some(7),
+        );
+        let line = report.summary_line();
+        assert!(line.starts_with("hotpath "), "{line}");
+        assert!(line.contains("iterations=5"), "{line}");
+        assert!(line.contains("p50_ns=1000"), "{line}");
+        assert!(line.contains("p50_us=1"), "{line}");
+        assert!(line.contains("min_ns=800"), "{line}");
+        assert!(line.contains("max_ns=1200"), "{line}");
+        assert!(line.contains("allocations=7"), "{line}");
+        assert!(
+            line.contains("stage.host_submit_to_worker_pickup_ns=250"),
+            "{line}"
+        );
+        assert!(
+            line.contains("stage.begin_to_target_handler_ns=120"),
+            "{line}"
+        );
+
+        let json = report.json_line();
+        assert!(json.contains("\"schema\":\"tina.hotpath.v1\""), "{json}");
+        assert!(json.contains("\"p50_ns\":1000"), "{json}");
+        assert!(
+            json.contains("\"host_submit_to_worker_pickup\":250"),
+            "{json}"
+        );
+        assert!(json.contains("\"allocations\":7"), "{json}");
     }
 }

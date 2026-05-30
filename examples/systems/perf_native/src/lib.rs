@@ -22,8 +22,8 @@ use tina_http::{
     HttpListener, HttpListenerMsg, HttpRequest, HttpResponse, HttpServerConfig, StatusCode,
 };
 use tina_proof_harness::{
-    LoadObservation, LoadReport, LoadRun, LoadStop, OpOutcome, PerfAllocationReport, PerfComparisonReport,
-    PerfReport, SemanticMatch,
+    LoadObservation, LoadReport, LoadRun, LoadStop, OpOutcome, PerfAllocationReport,
+    PerfComparisonReport, PerfReport, SemanticMatch,
 };
 use tina_runtime::{
     CallOutcome, DefaultThreadedMailboxFactory, ThreadedRuntime, ThreadedRuntimeConfig,
@@ -43,19 +43,29 @@ thread_local! {
 static ALLOCATIONS: AtomicU64 = AtomicU64::new(0);
 static ALLOCATED_BYTES: AtomicU64 = AtomicU64::new(0);
 
+// Process-wide allocation counter. Counts every allocation in the whole
+// process, regardless of which thread or whether thread-local gating is on.
+// Probes that want to see worker-thread allocations (driver mailbox, isolate
+// entry, etc.) read this via [`count_process_allocations`].
+static PROCESS_ALLOCATIONS: AtomicU64 = AtomicU64::new(0);
+static PROCESS_ALLOCATED_BYTES: AtomicU64 = AtomicU64::new(0);
+
 struct CountingAllocator;
 
 unsafe impl GlobalAlloc for CountingAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         // SAFETY: Delegates to the process global allocator with the same layout.
         let ptr = unsafe { System.alloc(layout) };
-        if !ptr.is_null()
-            && COUNT_ALLOCATIONS
+        if !ptr.is_null() {
+            PROCESS_ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
+            PROCESS_ALLOCATED_BYTES.fetch_add(layout.size() as u64, Ordering::Relaxed);
+            if COUNT_ALLOCATIONS
                 .try_with(|enabled| enabled.get())
                 .unwrap_or(false)
-        {
-            ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
-            ALLOCATED_BYTES.fetch_add(layout.size() as u64, Ordering::Relaxed);
+            {
+                ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
+                ALLOCATED_BYTES.fetch_add(layout.size() as u64, Ordering::Relaxed);
+            }
         }
         ptr
     }
@@ -284,9 +294,7 @@ impl ChainService {
             ChainMsg::Run => call_ctx
                 .defer(call(self.ping, PingMsg::Ping, CALL_TIMEOUT))
                 .reply(ChainMsg::PingReturned),
-            ChainMsg::PingReturned(_, _) => {
-                call_ctx.reject(CallRejectedReason::UnsupportedMessage)
-            }
+            ChainMsg::PingReturned(_, _) => call_ctx.reject(CallRejectedReason::UnsupportedMessage),
         }
     }
 }
@@ -403,9 +411,9 @@ fn tina_observed_admission_row() -> anyhow::Result<PerfReport> {
         },
         move |_| match rt.send_and_observe(addr, CounterMsg::Hit) {
             Ok(()) => OpOutcome::Ok,
-            Err(ThreadedSendObservedError::IngressFull | ThreadedSendObservedError::MailboxFull) => {
-                OpOutcome::Err { kind: "full" }
-            }
+            Err(
+                ThreadedSendObservedError::IngressFull | ThreadedSendObservedError::MailboxFull,
+            ) => OpOutcome::Err { kind: "full" },
             Err(ThreadedSendObservedError::MailboxClosed) => OpOutcome::Err { kind: "closed" },
             Err(ThreadedSendObservedError::WorkerStopped) => OpOutcome::Err { kind: "stopped" },
         },
@@ -584,7 +592,9 @@ fn tokio_service_call_chain_row() -> anyhow::Result<PerfReport> {
     service_tx
         .blocking_send(warm_tx)
         .expect("warm tokio service chain send");
-    warm_rx.blocking_recv().expect("warm tokio service chain reply");
+    warm_rx
+        .blocking_recv()
+        .expect("warm tokio service chain reply");
 
     let (load, allocations) = run_counted(
         LoadRun {
@@ -622,12 +632,9 @@ fn tina_http1_close_row() -> anyhow::Result<PerfReport> {
 }
 
 fn tokio_http1_close_row() -> anyhow::Result<PerfReport> {
-    tokio_http_row(
-        "axum_http1_close",
-        "http1_close",
-        small_body(),
-        |addr| http_get(addr, false, 1, small_body().len()),
-    )
+    tokio_http_row("axum_http1_close", "http1_close", small_body(), |addr| {
+        http_get(addr, false, 1, small_body().len())
+    })
 }
 
 fn tina_http1_keepalive_row() -> anyhow::Result<PerfReport> {
@@ -704,6 +711,7 @@ fn tina_http_row(
         .map_err(|e| anyhow::anyhow!("observe tina http bind: {e:?}"))?;
     http_get(addr, keepalive, if keepalive { 2 } else { 1 }, expected_len)?;
 
+    let process_before = ProcessSnapshot::now();
     let (load, allocations) = run_counted(
         LoadRun {
             workers: WORKERS,
@@ -716,6 +724,8 @@ fn tina_http_row(
         },
         None::<fn() -> LoadObservation>,
     );
+    let (allocs_delta, rss_delta) = ProcessSnapshot::now().delta_from(process_before);
+    print_process_metrics(label, allocs_delta, rss_delta);
     let _ = runtime.try_send(listener, HttpListenerMsg::Stop);
     shutdown_runtime(runtime)?;
     Ok(PerfReport::from_load_with_allocations(
@@ -762,6 +772,7 @@ fn tokio_http_row(
     });
     let addr = addr_rx.recv_timeout(Duration::from_secs(2))?;
     request(addr)?;
+    let process_before = ProcessSnapshot::now();
     let (load, allocations) = run_counted(
         LoadRun {
             workers: WORKERS,
@@ -774,6 +785,8 @@ fn tokio_http_row(
         },
         None::<fn() -> LoadObservation>,
     );
+    let (allocs_delta, rss_delta) = ProcessSnapshot::now().delta_from(process_before);
+    print_process_metrics(label, allocs_delta, rss_delta);
     let _ = stop_tx.send(());
     done_rx.recv_timeout(Duration::from_secs(2))?;
     handle
@@ -942,7 +955,11 @@ fn tokio_call_op(tx: &mpsc::Sender<oneshot::Sender<()>>) -> OpOutcome {
     }
 }
 
-fn run_counted<F, O>(run: LoadRun, op: F, observation: Option<O>) -> (LoadReport, PerfAllocationReport)
+fn run_counted<F, O>(
+    run: LoadRun,
+    op: F,
+    observation: Option<O>,
+) -> (LoadReport, PerfAllocationReport)
 where
     F: Fn(usize) -> OpOutcome + Send + Sync + 'static,
     O: FnOnce() -> LoadObservation,
@@ -954,6 +971,105 @@ where
         observation,
     );
     (load, finish_allocations("load_worker_op"))
+}
+
+/// Runs `f` on the calling thread and returns its result plus the number of
+/// allocations the global counting allocator saw during the call.
+///
+/// Host-thread scope only: work the runtime does on its own worker thread is
+/// not counted here. That is the honest scope for the host-side per-op cost a
+/// caller pays (channel + boxed command per `call_blocking` / observed send).
+pub fn count_host_allocations<T>(f: impl FnOnce() -> T) -> (T, u64) {
+    reset_allocations();
+    let result = counted_allocations(f);
+    (result, ALLOCATIONS.load(Ordering::Relaxed))
+}
+
+/// Runs `f` and returns its result plus the number of allocations the whole
+/// process saw during the call — every thread, no gate.
+///
+/// Use this to surface allocations the runtime's worker thread makes on a
+/// caller's behalf (driver mailbox, isolate entry, etc.) which the host-only
+/// counter misses. Run probes one at a time; concurrent measurements will
+/// share the counter and contaminate each other.
+pub fn count_process_allocations<T>(f: impl FnOnce() -> T) -> (T, u64) {
+    let before = PROCESS_ALLOCATIONS.load(Ordering::Relaxed);
+    let result = f();
+    let after = PROCESS_ALLOCATIONS.load(Ordering::Relaxed);
+    (result, after.saturating_sub(before))
+}
+
+/// Runs `f` once and returns its result plus both allocation counts for that
+/// same call: `(result, host_allocations, process_allocations)`. Run probes
+/// one at a time; the process counter is shared across threads.
+pub fn count_all_allocations<T>(f: impl FnOnce() -> T) -> (T, u64, u64) {
+    reset_allocations();
+    let process_before = PROCESS_ALLOCATIONS.load(Ordering::Relaxed);
+    let result = counted_allocations(f);
+    let process_after = PROCESS_ALLOCATIONS.load(Ordering::Relaxed);
+    let host = ALLOCATIONS.load(Ordering::Relaxed);
+    (result, host, process_after.saturating_sub(process_before))
+}
+
+/// Resident set size in kilobytes for the calling process, from `getrusage`.
+/// Macros into 0 if the call fails (it shouldn't; the syscall is a hard
+/// requirement of POSIX). On macOS `ru_maxrss` is reported in bytes; on
+/// Linux it is kilobytes — we normalise both to kilobytes here.
+pub fn rss_kb_now() -> u64 {
+    // SAFETY: `getrusage` writes into a caller-owned `rusage`; zero-init is
+    // valid.
+    let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+    let rc = unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) };
+    if rc != 0 {
+        return 0;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // macOS reports bytes — convert to kilobytes.
+        (usage.ru_maxrss as u64) / 1024
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        // Linux + most other unices already report kilobytes.
+        usage.ru_maxrss as u64
+    }
+}
+
+/// Snapshot of "what the whole process has done so far" — total
+/// allocations and current RSS. Take one before a measured region and one
+/// after; the deltas are the region's true process cost.
+#[derive(Debug, Clone, Copy)]
+pub struct ProcessSnapshot {
+    pub allocations: u64,
+    pub rss_kb: u64,
+}
+
+impl ProcessSnapshot {
+    pub fn now() -> Self {
+        Self {
+            allocations: PROCESS_ALLOCATIONS.load(Ordering::Relaxed),
+            rss_kb: rss_kb_now(),
+        }
+    }
+
+    /// Returns `(allocations_delta, rss_delta_kb)`. RSS can go down, so the
+    /// delta is signed; allocations are monotone.
+    pub fn delta_from(&self, before: ProcessSnapshot) -> (u64, i64) {
+        (
+            self.allocations.saturating_sub(before.allocations),
+            (self.rss_kb as i64) - (before.rss_kb as i64),
+        )
+    }
+}
+
+/// Prints one extra `perf-process` line for a row, capturing the
+/// whole-process cost the existing thread-local-gated `tina_allocations`
+/// number misses (server-thread allocations, RSS growth). Stable
+/// grep-friendly key=value shape so historical tracking can scrape it.
+pub fn print_process_metrics(label: &str, allocations_delta: u64, rss_delta_kb: i64) {
+    println!(
+        "perf-process label={label} process_allocations={allocations_delta} rss_delta_kb={rss_delta_kb}"
+    );
 }
 
 fn counted_allocations<T>(f: impl FnOnce() -> T) -> T {

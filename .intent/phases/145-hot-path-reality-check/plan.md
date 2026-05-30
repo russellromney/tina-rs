@@ -1,6 +1,55 @@
 # Phase 145: Hot Path Reality Check
 
-Status: planned.
+Status: implemented.
+
+Outcome: the shard worker slept a flat 1ms after every progress step, taxing
+each runtime turn. A tiny local call needs several turns, so observed admission
+and host calls ran millisecond-scale. The fix loops immediately while steps
+deliver work and parks on the command queue (bounded `idle_wait`) only when
+nothing is deliverable. Results (release, local):
+
+- `observed_admission` p50 1.34ms -> 53us
+- `host_request_reply` p50 5.79ms -> 210us
+- `service_request_reply_chain` p50 12.07ms -> 400us
+- HTTP rows fell ~10-16x as a free downstream effect
+
+The first fix made the row acceptable, but the probes still showed avoidable
+host-call work. This phase also shipped the host-call dispatcher pool and the
+per-host-thread reply channel pool:
+
+- no fresh `HostCallDriver` isolate per `call_blocking`;
+- `call_blocking` process allocations 17 -> 7;
+- host-thread allocations 5 -> 2 after the reply pool;
+- DST replay parity via `SimulatorConfig::reserved_system_isolates`.
+
+The remaining gap is now named: same-shard host calls still pay several
+cross-thread worker turns, and HTTP still allocates 1.45-1.8x the Axum row.
+See `examples/systems/perf_native/README.md` and the evidence files in this
+directory.
+
+Hostile-review follow-ups (same phase):
+
+- Suspected multi-shard hot-spin — disproven. The multi-shard worker loop's
+  pending-in-flight branch uses `thread::yield_now()`, which looked like a hot
+  spin. Measuring process CPU across a held call (no pending I/O), a pending
+  timer, and a cross-shard reply wait all showed near-zero worker CPU: the
+  runtime step blocks inside the betelgeuse io_loop whenever there is work to
+  wait on, so the yield never tight-spins. An in-progress change to replace it
+  with a bounded park was reverted — it fixed no real spin and would only add
+  `idle_wait` latency to cross-shard replies. No no-spin test ships, because a
+  truthful one is vacuous (the property holds by construction).
+- Both worker loops recomputed the O(pending) resource report at the top of
+  every iteration. With loop-immediately-on-progress that ran on every
+  message-delivery turn at full speed — a real per-op tax under sustained
+  throughput. The snapshot is now skipped on fast delivery turns and refreshes
+  on idle/command turns (and at shutdown), so observability is unchanged at
+  every point an observer can read it.
+- The instrumented `send_and_observe` probe cleared its timeline while the warm
+  message's delivery was still pending, so warm-delivery events raced into the
+  measured window. Drain the warm message first; the breakdown now shows the
+  honest single admission round-trip.
+- Added single-shard host-wait-timeout and shutdown-while-call-pending coverage
+  (the existing matrix only had the multi-shard variants).
 
 ## Goal
 

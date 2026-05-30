@@ -35,5 +35,6 @@ pub use load::{
     surface_plateaued_cleanly, timer_kept_firing,
 };
 pub use perf::{
-    PerfAllocationReport, PerfComparisonReport, PerfEnvironment, PerfReport, SemanticMatch,
+    HotPathReport, HotPathStage, PerfAllocationReport, PerfComparisonReport, PerfEnvironment,
+    PerfReport, SemanticMatch,
 };
