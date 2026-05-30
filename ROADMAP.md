@@ -192,10 +192,14 @@ Orthogonal to feature phases but necessary before public release claims.
   assert malformed definitions fail at compile time. This is standard for
   macro-heavy crates.
 
-- **Benchmark / performance regression framework.** The current cost-smoke
-  (`portable_runtime_cost`) is a smoke test, not a benchmark. Before
-  production claims we need a `criterion`-based regression suite with
-  historical tracking, not just one-shot local runs.
+- **Benchmark / performance regression framework.** `make perf` now gives alpha
+  users local release-mode performance evidence over runtime cost rows, native
+  Tina-vs-bounded-Tokio rows, and one whole-service load row with
+  pressure/capacity/leak truth. Native rows now split first-queue host enqueue,
+  observed admission, host request/reply, chained service request/reply, and
+  HTTP/1 close/keepalive/body cases. Before production claims we still need
+  broader native rows, historical tracking, and repeated equivalent-workload
+  runs on stable hardware.
 
 - **HTTP/1 parser conformance suite.** Beyond our own DST, we should run an
   established HTTP parser test corpus (e.g., `httparse` test vectors, or a
@@ -296,12 +300,12 @@ and reviews live under `.intent/phases/`.
   `LocalMultiShardSystem` service harness, runtime-call continuation replies
   through I/O/persistence, executable budget manifest, visible placement and
   backpressure policy proofs, service-level DST with saved seed and shrink,
-  portable cost-smoke command, and focused CI gate.
+  portable local cost rows, and focused CI gate.
 - Baobab: executable local-service readiness matrix, Baobab user-service
   gauntlet over TCP/timer/DNS/process/file/persistence/cross-shard call/
   shutdown, live multi-shard sibling-survives-failed-shard proof, selected
   LocalSystem rail/backpressure e2e gate, saved-seed service/persistence/bridge
-  DST histories, real Tina local timing smoke rows, all folded into
+  DST histories, real Tina local timing rows, all folded into
   `make verify`.
 - DST as a first-class dev mode: a "bug in a box" `ReplayCase` /
   `ReplayReport` / `ReplayConfig` shape in `tina_sim::dst` carrying the
@@ -397,6 +401,8 @@ framework before public release-story work.
 | **132 Protocol chaos and byte replay** | Harden the native protocol stack against bad peers, malformed bytes, resets, slow readers/writers, reconnect storms, and protocol-byte replay gaps. This is proof work with code surfaces where needed, not benchmark theater. Plan: `.intent/phases/132-protocol-chaos-byte-replay/plan.md`. |
 | **133 Request scope end-to-end** | Wire request-scoped cancellation through real HTTP/WebSocket/gRPC/body/pool/bridge flows so client disconnect, timeout, owner stop, and shutdown produce one request-shaped report with honest late-result truth. Plan: `.intent/phases/133-request-scope-end-to-end/plan.md`. |
 | **135 Native AWS first form** | Add a native Tina AWS battery for the smallest honest production shape: static SigV4 with explicit signing time, native S3 put/get/head/delete, native SQS send/receive/delete, native HTTP keepalive under Phase 131 endpoint/connect policy, bounded bodies/in-flight work, typed pressure/lifecycle reports, hermetic fake-AWS tests, and clear native-vs-SDK-bridge docs. Plan: `.intent/phases/135-native-aws-first-form/plan.md`. |
+| **144 Native performance evidence** | Benchmark basic native Tina designs, compare them with equivalent bounded Tokio designs, find allocation/overhead hot spots, improve the obvious Tina-owned waste, and record before/after rows. No SQLite/app-shaped benchmark as the headline. Plan: `.intent/phases/144-native-performance-evidence/plan.md`. |
+| **145 Hot path reality check** | Explain and fix the millisecond-scale live hot path from Phase 144: stage timing for `try_send` / `send_and_observe` / `call_blocking`, remove the worker-loop progress sleep tax if confirmed, avoid per-call host driver isolate overhead if still hot, and prove before/after without weakening Tina truth. Plan: `.intent/phases/145-hot-path-reality-check/plan.md`. |
 | **Alpaca rename** | Before public launch, rename the project/crates/docs away from Tina to Alpaca so the lineage is respectful and clear: independently maintained Rust framework, inspired by Peter Mbanugo's Tina/Odin and Seastar, not an official Tina port. |
 | **Barend Biesheuvel visible flow ergonomics** | Optional high-level ergonomics only after the local runtime core feels boring: a `flow!`-style authoring surface that preserves named suspension points, visible failure policy, trace step names, and ordinary Tina message/effect expansion. No fake async, no hidden retries, no hidden queues. |
 

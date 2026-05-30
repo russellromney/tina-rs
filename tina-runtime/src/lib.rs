@@ -66,6 +66,8 @@ pub mod file_loops;
 mod full_handling;
 pub mod guarded_pending;
 mod host_burst;
+mod host_call_dispatcher;
+mod host_call_reply_pool;
 pub mod lifecycle;
 mod live_report;
 mod local_permit;
@@ -147,7 +149,10 @@ pub(crate) use dispatch::{ChildRecordSnapshot, SupervisorRecordSnapshot};
 
 pub use shutdown::ThreadedShutdownHandle;
 pub use single_call_gate::SingleCallGate;
-pub use threaded::{DEFAULT_SHUTDOWN_LANE_DRAIN_TIMEOUT, ThreadedRuntime, ThreadedRuntimeConfig};
+pub use threaded::{
+    DEFAULT_SHUTDOWN_LANE_DRAIN_TIMEOUT, HOST_CALL_DISPATCHER_POOL_SIZE, ThreadedRuntime,
+    ThreadedRuntimeConfig,
+};
 pub use threaded_multi_shard::ThreadedMultiShardRuntime;
 
 pub use live_report::{

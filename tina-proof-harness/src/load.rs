@@ -12,8 +12,8 @@
 //! it returns false, [`LoadReport::leak_clean`] is `false` and the
 //! caller can fail the test with a meaningful capacity reason.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -254,8 +254,8 @@ impl Default for LoadObservation {
 ///
 /// `leak_clean` is `true` when the optional `leak_check` was either not
 /// supplied or returned true. Latency is reported as min/p50/p99/max in
-/// microseconds — enough to make a slow soak visible, small enough to
-/// fit in one printable line.
+/// nanoseconds for machine comparison and microseconds for compact human
+/// summaries.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LoadReport {
     pub label: &'static str,
@@ -268,6 +268,10 @@ pub struct LoadReport {
     /// existing call sites keep compiling; also surfaced via
     /// [`PressureSummary::by_kind`].
     pub err_kinds: Vec<(String, u64)>,
+    pub latency_min_ns: u64,
+    pub latency_p50_ns: u64,
+    pub latency_p99_ns: u64,
+    pub latency_max_ns: u64,
     pub latency_min_us: u64,
     pub latency_p50_us: u64,
     pub latency_p99_us: u64,
@@ -504,19 +508,23 @@ where
     );
 
     let op = Arc::new(op);
-    let stop_at = run.stop.duration.map(|d| Instant::now() + d);
+    let stop_after = run.stop.duration;
     let op_cap = run.stop.op_count.unwrap_or(u64::MAX);
     let ops_dispatched = Arc::new(AtomicU64::new(0));
     let halted = Arc::new(AtomicBool::new(false));
+    let start_gate = Arc::new(Barrier::new(run.workers + 1));
 
-    let started = Instant::now();
     let mut handles = Vec::with_capacity(run.workers);
     for worker_id in 0..run.workers {
         let op = Arc::clone(&op);
         let ops_dispatched = Arc::clone(&ops_dispatched);
         let halted = Arc::clone(&halted);
+        let start_gate = Arc::clone(&start_gate);
+        let latency_capacity = latency_capacity_for_worker(op_cap, run.workers);
         let handle = thread::spawn(move || -> WorkerObs {
-            let mut obs = WorkerObs::default();
+            start_gate.wait();
+            let stop_at = stop_after.map(|d| Instant::now() + d);
+            let mut obs = WorkerObs::with_latency_capacity(latency_capacity);
             let mut current_streak: u64 = 0;
             loop {
                 if halted.load(Ordering::Acquire) {
@@ -536,7 +544,7 @@ where
                 let t0 = Instant::now();
                 let outcome = op(worker_id);
                 let dt = t0.elapsed();
-                obs.latencies_us.push(duration_to_us(dt));
+                obs.latencies_ns.push(duration_to_ns(dt));
                 let pressure = !matches!(outcome, OpOutcome::Ok);
                 match outcome {
                     OpOutcome::Ok => obs.ok += 1,
@@ -563,6 +571,8 @@ where
         handles.push(handle);
     }
 
+    let started = Instant::now();
+    start_gate.wait();
     let mut combined = WorkerObs::default();
     for handle in handles {
         let obs = handle.join().expect("worker join");
@@ -575,12 +585,12 @@ where
         ..LoadObservation::default()
     });
 
-    let mut latencies = combined.latencies_us;
+    let mut latencies = combined.latencies_ns;
     latencies.sort_unstable();
-    let min = latencies.first().copied().unwrap_or(0);
-    let max = latencies.last().copied().unwrap_or(0);
-    let p50 = percentile(&latencies, 50);
-    let p99 = percentile(&latencies, 99);
+    let min_ns = latencies.first().copied().unwrap_or(0);
+    let max_ns = latencies.last().copied().unwrap_or(0);
+    let p50_ns = percentile(&latencies, 50);
+    let p99_ns = percentile(&latencies, 99);
 
     let mut err_kinds: Vec<(String, u64)> = combined.err_kinds.into_iter().collect();
     err_kinds.sort();
@@ -608,10 +618,14 @@ where
         ops_err: combined.err,
         ops_timeout: combined.timeout,
         err_kinds,
-        latency_min_us: min,
-        latency_p50_us: p50,
-        latency_p99_us: p99,
-        latency_max_us: max,
+        latency_min_ns: min_ns,
+        latency_p50_ns: p50_ns,
+        latency_p99_ns: p99_ns,
+        latency_max_ns: max_ns,
+        latency_min_us: ns_to_us(min_ns),
+        latency_p50_us: ns_to_us(p50_ns),
+        latency_p99_us: ns_to_us(p99_ns),
+        latency_max_us: ns_to_us(max_ns),
         elapsed_ms: elapsed.as_millis() as u64,
         leak_clean: observation.leak_clean
             && observation
@@ -632,12 +646,19 @@ struct WorkerObs {
     err: u64,
     timeout: u64,
     err_kinds: std::collections::BTreeMap<String, u64>,
-    latencies_us: Vec<u64>,
+    latencies_ns: Vec<u64>,
     max_consecutive: u64,
     first_error_global_index: Option<u64>,
 }
 
 impl WorkerObs {
+    fn with_latency_capacity(capacity: usize) -> Self {
+        Self {
+            latencies_ns: Vec::with_capacity(capacity),
+            ..Self::default()
+        }
+    }
+
     fn merge(&mut self, other: WorkerObs) {
         self.ok += other.ok;
         self.err += other.err;
@@ -645,7 +666,7 @@ impl WorkerObs {
         for (k, v) in other.err_kinds {
             *self.err_kinds.entry(k).or_insert(0) += v;
         }
-        self.latencies_us.extend(other.latencies_us);
+        self.latencies_ns.extend(other.latencies_ns);
         if other.max_consecutive > self.max_consecutive {
             self.max_consecutive = other.max_consecutive;
         }
@@ -659,8 +680,20 @@ impl WorkerObs {
     }
 }
 
-fn duration_to_us(d: Duration) -> u64 {
-    d.as_micros().min(u128::from(u64::MAX)) as u64
+fn latency_capacity_for_worker(op_cap: u64, workers: usize) -> usize {
+    if op_cap == u64::MAX {
+        return 0;
+    }
+    let workers = workers.max(1) as u64;
+    op_cap.div_ceil(workers).saturating_add(1) as usize
+}
+
+fn duration_to_ns(d: Duration) -> u64 {
+    d.as_nanos().min(u128::from(u64::MAX)) as u64
+}
+
+fn ns_to_us(ns: u64) -> u64 {
+    ns / 1_000
 }
 
 fn percentile(sorted: &[u64], pct: u32) -> u64 {

@@ -18,8 +18,12 @@ use tina_runtime::{
 };
 
 fn main() {
-    let profile = option_env!("PROFILE").unwrap_or("unknown");
-    println!("tina portable runtime cost smoke / local machine / not benchmark");
+    let profile = if cfg!(debug_assertions) {
+        "debug"
+    } else {
+        "release"
+    };
+    println!("tina portable runtime cost rows / local_machine comparison_baseline=none");
     println!(
         "backend=betelgeuse-shaped-local profile={profile} platform={}",
         std::env::consts::OS
@@ -32,14 +36,19 @@ fn main() {
         queue.push_back(black_box(1_u64));
         black_box(queue.pop_front());
     });
-    print_measured_once("local send", 200, measure_local_send);
-    print_measured_once("live ingress", 200, measure_live_ingress);
-    print_measured_once("cross-shard send", 200, measure_cross_shard_send);
-    print_measured_once("isolate call", 200, measure_isolate_call);
+    print_measured_total("local send", 200, measure_local_send());
+    print_measured_total("live ingress", 200, measure_live_ingress());
+    print_measured_total("cross-shard send", 200, measure_cross_shard_send());
+    print_measured_total("isolate call", 200, measure_isolate_call());
     print_measured("timer", 10_000, || {
         black_box(Instant::now() + Duration::from_micros(1));
     });
-    print_measured_once("Tina TCP loopback", 20, measure_tina_tcp_loopback);
+    print_measured_total_with_status(
+        "Tina TCP loopback setup/request/shutdown",
+        20,
+        measure_tina_tcp_loopback(),
+        "measured-local-cost-includes-setup",
+    );
     print_unmeasured("TLS loopback", "covered by e2e; no portable cost row yet");
     print_measured("file read/write", 20, || {
         let path = temp_path("file-cost");
@@ -66,14 +75,15 @@ fn print_measured(label: &str, iterations: u64, mut run: impl FnMut()) {
         run();
     }
     let total_ns = started.elapsed().as_nanos();
-    println!("{label},{iterations},{total_ns},measured-local-smoke");
+    println!("{label},{iterations},{total_ns},measured-local-cost");
 }
 
-fn print_measured_once(label: &str, iterations: u64, run: impl FnOnce(u64)) {
-    let started = Instant::now();
-    run(iterations);
-    let total_ns = started.elapsed().as_nanos();
-    println!("{label},{iterations},{total_ns},measured-local-smoke");
+fn print_measured_total(label: &str, iterations: u64, total_ns: u128) {
+    print_measured_total_with_status(label, iterations, total_ns, "measured-local-cost");
+}
+
+fn print_measured_total_with_status(label: &str, iterations: u64, total_ns: u128, status: &str) {
+    println!("{label},{iterations},{total_ns},{status}");
 }
 
 fn print_unmeasured(label: &str, reason: &str) {
@@ -378,7 +388,8 @@ impl TcpCostService {
     }
 }
 
-fn measure_live_ingress(iterations: u64) {
+fn measure_live_ingress() -> u128 {
+    let iterations = 200;
     let count = Arc::new(AtomicU64::new(0));
     let app = LocalSystem::single_shard(CostShard(1), CostMailboxFactory)
         .ingress_capacity(iterations as usize + 8)
@@ -391,18 +402,25 @@ fn measure_live_ingress(iterations: u64) {
             iterations as usize + 8,
         )
         .expect("register cost counter");
+    app.try_send(counter, CountMsg::Hit)
+        .expect("warm cost ingress send");
+    wait_count(&count, 1);
+    let started = Instant::now();
     for _ in 0..iterations {
         app.try_send(counter, CountMsg::Hit)
             .expect("cost ingress send");
     }
-    wait_count(&count, iterations);
+    wait_count(&count, iterations + 1);
+    let total = started.elapsed().as_nanos();
     app.shutdown()
         .drain()
         .join()
         .expect("cost ingress shutdown");
+    total
 }
 
-fn measure_local_send(iterations: u64) {
+fn measure_local_send() -> u128 {
+    let iterations = 200;
     let count = Arc::new(AtomicU64::new(0));
     let app = LocalSystem::single_shard(CostShard(6), CostMailboxFactory)
         .ingress_capacity(iterations as usize + 8)
@@ -418,18 +436,25 @@ fn measure_local_send(iterations: u64) {
     let relay = app
         .register_root::<Relay, CountMsg>(Relay { target: counter }, iterations as usize + 8)
         .expect("register cost local relay");
+    app.try_send(relay, RelayMsg::Forward)
+        .expect("warm cost local relay send");
+    wait_count(&count, 1);
+    let started = Instant::now();
     for _ in 0..iterations {
         app.try_send(relay, RelayMsg::Forward)
             .expect("cost local relay send");
     }
-    wait_count(&count, iterations);
+    wait_count(&count, iterations + 1);
+    let total = started.elapsed().as_nanos();
     app.shutdown()
         .drain()
         .join()
         .expect("cost local send shutdown");
+    total
 }
 
-fn measure_cross_shard_send(iterations: u64) {
+fn measure_cross_shard_send() -> u128 {
+    let iterations = 200;
     let count = Arc::new(AtomicU64::new(0));
     let app = LocalSystem::<CostShard, CostMailboxFactory>::multi_shard(CostMailboxFactory)
         .shard(CostShard(2))
@@ -453,18 +478,25 @@ fn measure_cross_shard_send(iterations: u64) {
             iterations as usize + 8,
         )
         .expect("register cost relay");
+    app.try_send(relay, RelayMsg::Forward)
+        .expect("warm cost relay send");
+    wait_count(&count, 1);
+    let started = Instant::now();
     for _ in 0..iterations {
         app.try_send(relay, RelayMsg::Forward)
             .expect("cost relay send");
     }
-    wait_count(&count, iterations);
+    wait_count(&count, iterations + 1);
+    let total = started.elapsed().as_nanos();
     app.shutdown()
         .drain()
         .join()
         .expect("cost cross-shard shutdown");
+    total
 }
 
-fn measure_isolate_call(iterations: u64) {
+fn measure_isolate_call() -> u128 {
+    let iterations = 200;
     let count = Arc::new(AtomicU64::new(0));
     let app = LocalSystem::<CostShard, CostMailboxFactory>::multi_shard(CostMailboxFactory)
         .shard(CostShard(4))
@@ -489,15 +521,23 @@ fn measure_isolate_call(iterations: u64) {
             iterations as usize + 8,
         )
         .expect("register cost ping client");
+    app.try_send(client, ClientMsg::Start)
+        .expect("warm cost call start");
+    wait_count(&count, 1);
+    let started = Instant::now();
     for _ in 0..iterations {
         app.try_send(client, ClientMsg::Start)
             .expect("cost call start");
     }
-    wait_count(&count, iterations);
+    wait_count(&count, iterations + 1);
+    let total = started.elapsed().as_nanos();
     app.shutdown().drain().join().expect("cost call shutdown");
+    total
 }
 
-fn measure_tina_tcp_loopback(iterations: u64) {
+fn measure_tina_tcp_loopback() -> u128 {
+    let iterations = 20;
+    let started = Instant::now();
     for _ in 0..iterations {
         let published = Arc::new(Mutex::new(None));
         let completed = Arc::new(AtomicU64::new(0));
@@ -536,6 +576,7 @@ fn measure_tina_tcp_loopback(iterations: u64) {
             panic!("Tina TCP cost path failed: {reason}");
         }
     }
+    started.elapsed().as_nanos()
 }
 
 fn wait_socket_addr(published: &Mutex<Option<SocketAddr>>) -> SocketAddr {

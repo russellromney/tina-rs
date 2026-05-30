@@ -35,6 +35,9 @@
 #   handshake-cell    — single-writer atomic state/flag crossing threads via Arc,
 #                       documented ordering; not a lock-free algorithm
 #   metrics-counter   — Relaxed atomic counters (count only; never guard data)
+#   scheduler-counter — Relaxed atomic counter used to spread work across a
+#                       fixed set of scheduler-owned targets; never guards data
+#                       or decides safety.
 #   id-counter        — fetch_add unique-id / temp-name generator (Relaxed). May
 #                       be cross-thread: a process-global `static AtomicU64`, or
 #                       the shared `IdSource` the threaded runtime clones to every
@@ -66,6 +69,9 @@ tina-runtime/src/event_sink.rs          metrics-counter    high_water / dropped 
 tina-runtime/src/observer.rs            metrics-counter    dropped event tally
 tina-runtime/src/live_report.rs         metrics-counter    accepted / rejected_full / rejected_closed snapshot counters
 tina-runtime/src/host_burst.rs          metrics-counter    submitted / observed / admitted burst counters
+
+# --- scheduler/load-spread counters ---
+tina-runtime/src/threaded.rs            scheduler-counter  host-call dispatcher round-robin selector (advisory load spread only)
 
 # --- monotonic id / temp-name counters ---
 tina-runtime/src/lib.rs                 id-counter         IdSource next_event_id / next_call_id; shared Arc<AtomicU64> cloned to every shard thread in the threaded runtime (single-threaded in the explicit-step oracle)

@@ -36,6 +36,25 @@ This file records completed work.
   join; a stale or missing manifest row fails the consistency check.
 - Added the outbound-clients user-guide page (endpoint → policy → manager).
 
+### Local Performance Evidence
+
+- Added `tina_proof_harness::PerfReport`, a small wrapper over load/soak
+  reports that prints local-machine timing, pressure, capacity-surface counts,
+  leak truth, platform/profile/git metadata, nanosecond fields for fast rows,
+  optional allocation counts, and an explicit `comparison_baseline=none` field.
+- Added `make perf`: it runs the existing portable runtime cost rows in release
+  mode, proof-harness perf report tests, native Tina-vs-bounded-Tokio rows
+  (`host_enqueue`, `observed_admission`, `host_request_reply`,
+  `service_request_reply_chain`, HTTP/1 close, HTTP/1 keepalive, and HTTP/1
+  fixed body), and a whole-service `mini_saas_api` HTTP + SQLite +
+  outbound-pool load run that prints both grep-friendly and JSON perf lines.
+- Added `make perf-compare` for the native comparison rows only, plus
+  `tina_proof_harness::PerfComparisonReport` for median-of-five
+  ratio/semantic-match output.
+- Wired the `mini_saas_api` soak path to attach live `/debug/capacity`
+  observations to its `LoadReport`, so the perf row carries capacity surfaces
+  instead of timing without boundedness truth.
+
 ### Hostile Review Fixes
 
 - Tightened the bounded fanout rails after review: `BroadcastTracker`
