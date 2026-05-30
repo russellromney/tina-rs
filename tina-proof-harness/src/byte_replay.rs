@@ -321,7 +321,11 @@ impl ProtocolByteReplayCase {
             self.expected_fact_hash
         ));
         for fact in &self.unsupported_facts {
-            if fact.fact.contains('\n') || fact.fact.contains(" | ") {
+            if fact.fact.contains('\n')
+                || fact.fact.contains(" | ")
+                || fact.reason.contains('\n')
+                || fact.reason.contains(" | ")
+            {
                 return Err(ProtocolByteReplayIoError::Decode {
                     line: 0,
                     reason: "unsupported fact contains a reserved delimiter".to_owned(),
@@ -360,6 +364,7 @@ impl ProtocolByteReplayCase {
         }
 
         let mut saved_name = None;
+        let mut family_seen = false;
         let mut direction = None;
         let mut max_message_bytes = None;
         let mut max_frame_payload = None;
@@ -390,6 +395,7 @@ impl ProtocolByteReplayCase {
                             reason: format!("unsupported family {value:?}"),
                         });
                     }
+                    family_seen = true;
                 }
                 "direction" => {
                     direction = Some(ByteReplayDirection::from_label(value).ok_or_else(|| {
@@ -435,6 +441,9 @@ impl ProtocolByteReplayCase {
                 expected: name,
                 actual: saved_name,
             });
+        }
+        if !family_seen {
+            return Err(ProtocolByteReplayIoError::MissingField("family"));
         }
         Ok(Self {
             name,
@@ -871,6 +880,21 @@ mod tests {
     }
 
     #[test]
+    fn save_rejects_unsupported_fact_reason_delimiters() {
+        let case = bad_frame_case().with_unsupported_fact("future-fact", "bad | delimiter");
+        let path = std::env::temp_dir().join(format!(
+            "tina-byte-bad-reason-{}-{}.case",
+            std::process::id(),
+            case.expected_fact_hash
+        ));
+        let err = case
+            .save(&path)
+            .expect_err("reserved delimiter in reason must fail closed");
+        assert!(matches!(err, ProtocolByteReplayIoError::Decode { .. }));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
     fn over_budget_case_is_replay_blocked() {
         let case = bad_frame_case().with_budget(2, 1);
         assert!(case.replay_blocked());
@@ -965,7 +989,7 @@ mod tests {
             std::env::temp_dir().join(format!("tina-byte-badhex-{}.case", std::process::id()));
         // An odd-length hex chunk cannot decode to bytes.
         let body = "tina-protocol-byte-replay-v1\n\
-            name=x\ndirection=client-to-server\n\
+            name=x\nfamily=websocket\ndirection=client-to-server\n\
             max_message_bytes=16\nmax_frame_payload=16\nmax_frames=16\n\
             max_bytes=16\nmax_chunks=4\nexpected_app_deliveries=0\n\
             expected_close=none\nexpected_fact_count=0\n\
@@ -975,5 +999,25 @@ mod tests {
             .expect_err("odd-length hex chunk must fail to decode");
         assert!(matches!(err, ProtocolByteReplayIoError::Decode { .. }));
         let _ = std::fs::remove_file(&corrupt);
+    }
+
+    #[test]
+    fn load_requires_family_field() {
+        let missing =
+            std::env::temp_dir().join(format!("tina-byte-no-family-{}.case", std::process::id()));
+        let body = "tina-protocol-byte-replay-v1\n\
+            name=x\ndirection=client-to-server\n\
+            max_message_bytes=16\nmax_frame_payload=16\nmax_frames=16\n\
+            max_bytes=16\nmax_chunks=4\nexpected_app_deliveries=0\n\
+            expected_close=none\nexpected_fact_count=0\n\
+            expected_fact_hash=0x0\nchunk=abcd\n";
+        std::fs::write(&missing, body).expect("write");
+        let err =
+            ProtocolByteReplayCase::load(&missing, "x").expect_err("missing family must fail");
+        assert!(matches!(
+            err,
+            ProtocolByteReplayIoError::MissingField("family")
+        ));
+        let _ = std::fs::remove_file(&missing);
     }
 }
