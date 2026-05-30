@@ -81,6 +81,7 @@ tina-runtime/src/deferred.rs            id-counter         deferred-slot COUNTER
 tina-runtime/src/guarded_pending.rs     id-counter         guarded-pending COUNTER
 tina-runtime/src/pool.rs                id-counter         pool-entry COUNTER
 tina-runtime/src/scope.rs               id-counter         NEXT_SCOPE_ID
+tina-runtime/src/scope_timer.rs         id-counter         NEXT_TIMER_ID
 tina-runtime/src/wait_list.rs           id-counter         wait-list COUNTER
 tina-runtime/src/persistence.rs         id-counter         SNAPSHOT_TEMP_COUNTER
 
