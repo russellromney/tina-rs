@@ -12,8 +12,6 @@ path = "src/lib.rs"
 
 [dependencies]
 socket2 = "0.6"
+tina = { path = "../tina" }
 tina-runtime = { path = "../tina-runtime" }
 tina-sim = { path = "../tina-sim" }
-
-[dev-dependencies]
-tina = { path = "../tina" }
