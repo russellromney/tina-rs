@@ -7,7 +7,7 @@
 //! report honest:
 //!
 //! - typed connect / send / receive replies, including `Full`, `Closed`,
-//!   `NoHealthyEndpoint`, `ConnectFailed`, `TimedOut`, and `Stale`;
+//!   `NoHealthyEndpoint`, `ConnectFailed`, and `TimedOut`;
 //! - a generation guard so an old session's reply can never replace the
 //!   current one;
 //! - bounded retained closed/stale session reports;
@@ -24,7 +24,9 @@ pub mod state;
 
 use tina::capacity::{CapacityMode, CapacityPolicy, CapacitySurfaceReport};
 use tina_runtime::ServicePressureReport;
-use tina_runtime::budget::{BudgetCap, BudgetKind, BudgetSurface, BudgetUnit, ServiceBudgetManifest};
+use tina_runtime::budget::{
+    BudgetCap, BudgetKind, BudgetSurface, BudgetUnit, ServiceBudgetManifest,
+};
 
 use crate::connect::policy::{ConnectPolicy, ConnectPolicyError};
 use crate::websocket::WebSocketLimits;
@@ -241,7 +243,11 @@ mod tests {
         assert!(names.contains(&"rooms.upstream.sessions"));
         assert!(names.contains(&"rooms.upstream.reconnects"));
         assert!(names.contains(&"rooms.upstream.connect.attempts"));
-        assert!(names.iter().any(|n| n.starts_with("rooms.upstream.session.")));
+        assert!(
+            names
+                .iter()
+                .any(|n| n.starts_with("rooms.upstream.session."))
+        );
         let mut m = ServiceBudgetManifest::new("rooms", CapacityPolicy::Production);
         m.extend(surfaces);
         m.validate().unwrap();

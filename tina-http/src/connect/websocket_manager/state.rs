@@ -135,7 +135,9 @@ impl WebSocketManagerState {
 
     /// True when `generation` names the current session.
     pub fn is_current_session(&self, generation: EndpointGeneration) -> bool {
-        self.current.as_ref().is_some_and(|s| s.generation == generation)
+        self.current
+            .as_ref()
+            .is_some_and(|s| s.generation == generation)
     }
 
     /// True when `generation` is the connect in progress.
@@ -292,10 +294,7 @@ impl WebSocketManagerState {
             stale_count: self.stale_count,
             connect_failed_count: self.connect_failed_count,
             no_healthy_count: self.no_healthy_count,
-            current_pressure: self
-                .current
-                .as_ref()
-                .and_then(|s| s.pressure.clone()),
+            current_pressure: self.current.as_ref().and_then(|s| s.pressure.clone()),
             retained: self.retained.iter().cloned().collect(),
         }
     }
@@ -402,7 +401,11 @@ mod tests {
             ..Default::default()
         };
         s.record_pressure(g1, old);
-        assert!(s.report().current_pressure.is_none_or(|p| p.queued_outbound_bytes != 999));
+        assert!(
+            s.report()
+                .current_pressure
+                .is_none_or(|p| p.queued_outbound_bytes != 999)
+        );
         assert!(s.report().stale_replies_ignored >= 1);
     }
 

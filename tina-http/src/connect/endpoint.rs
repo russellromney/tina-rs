@@ -9,9 +9,9 @@
 
 use std::net::SocketAddr;
 
-use crate::http2::{AlpnProtocols, Http2Target};
 use crate::grpc::GrpcLimits;
 use crate::grpc_client::GrpcTarget;
+use crate::http2::{AlpnProtocols, Http2Target};
 use crate::target::{HttpHostPolicy, HttpTarget, TlsTrustRoots};
 use crate::websocket_client::WebSocketTarget;
 
@@ -182,7 +182,10 @@ impl HttpEndpoint {
     /// plain endpoint.
     #[must_use]
     pub fn server_name(mut self, server_name: impl Into<String>) -> Self {
-        if let Http1Security::Tls { server_name: sni, .. } = &mut self.security {
+        if let Http1Security::Tls {
+            server_name: sni, ..
+        } = &mut self.security
+        {
             *sni = server_name.into();
         }
         self
@@ -200,7 +203,9 @@ impl HttpEndpoint {
 
     /// The effective wire authority / `Host:` value.
     pub fn authority(&self) -> String {
-        self.host_header.clone().unwrap_or_else(|| self.host.clone())
+        self.host_header
+            .clone()
+            .unwrap_or_else(|| self.host.clone())
     }
 
     /// The transport security to dial. HTTP/1 over TLS offers no ALPN.
@@ -569,7 +574,10 @@ mod tests {
                 alpn,
             } => {
                 assert_eq!(server_name, "sni.local");
-                assert_eq!(trust_roots.root_certificates_der, roots.root_certificates_der);
+                assert_eq!(
+                    trust_roots.root_certificates_der,
+                    roots.root_certificates_der
+                );
                 assert!(!alpn.is_h2());
             }
             other => panic!("expected Tls, got {other:?}"),
@@ -633,7 +641,10 @@ mod tests {
                 assert_eq!(host, "rt.local");
                 assert_eq!(path, "/ws");
                 assert_eq!(server_name, "sni.local");
-                assert_eq!(trust_roots.root_certificates_der, roots.root_certificates_der);
+                assert_eq!(
+                    trust_roots.root_certificates_der,
+                    roots.root_certificates_der
+                );
             }
             other => panic!("expected Wss, got {other:?}"),
         }

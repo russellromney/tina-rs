@@ -15,9 +15,7 @@ use std::collections::VecDeque;
 
 use tina::{Address, Shard};
 use tina_runtime::budget::{BudgetCap, BudgetKind, BudgetSurface, BudgetUnit};
-use tina_runtime::{
-    DefaultThreadedMailboxFactory, ThreadedRuntime, ThreadedRuntimeError,
-};
+use tina_runtime::{DefaultThreadedMailboxFactory, ThreadedRuntime, ThreadedRuntimeError};
 
 use crate::grpc_client::GrpcUnaryOutcome;
 use crate::http2::{
@@ -65,12 +63,8 @@ pub fn http2_health_signal(outcome: &Http2ClientOutcome) -> EndpointHealthSignal
         }
         Http2ClientOutcome::LocalCancel => EndpointHealthSignal::Healthy,
         Http2ClientOutcome::Full => EndpointHealthSignal::Busy,
-        Http2ClientOutcome::Closed => {
-            EndpointHealthSignal::Unhealthy(EndpointDownReason::Closed)
-        }
-        Http2ClientOutcome::Reset(_) => {
-            EndpointHealthSignal::Unhealthy(EndpointDownReason::Reset)
-        }
+        Http2ClientOutcome::Closed => EndpointHealthSignal::Unhealthy(EndpointDownReason::Closed),
+        Http2ClientOutcome::Reset(_) => EndpointHealthSignal::Unhealthy(EndpointDownReason::Reset),
         Http2ClientOutcome::ProtocolError(_) => {
             EndpointHealthSignal::Unhealthy(EndpointDownReason::ProtocolError)
         }
@@ -124,6 +118,9 @@ impl FixedEndpointPoolConfig {
         if self.max_in_flight_per_conn == 0 {
             return Err(FixedEndpointPoolError::ZeroStreams);
         }
+        if self.pre_connect_queue_cap == 0 {
+            return Err(FixedEndpointPoolError::ZeroPreConnectQueueCap);
+        }
         if self.retained_reports == 0 {
             return Err(FixedEndpointPoolError::ZeroRetainedReports);
         }
@@ -161,7 +158,7 @@ impl FixedEndpointPoolConfig {
                 format!("{prefix}.pre_connect_waiters"),
                 BudgetKind::Mailbox,
                 BudgetUnit::Messages,
-                BudgetCap::fixed(self.pre_connect_queue_cap.max(1)),
+                BudgetCap::fixed(self.pre_connect_queue_cap),
             )
             .owned_by("h2.pool"),
             BudgetSurface::new(
@@ -180,6 +177,8 @@ impl FixedEndpointPoolConfig {
 pub enum FixedEndpointPoolError {
     /// `max_in_flight_per_conn` was zero.
     ZeroStreams,
+    /// `pre_connect_queue_cap` was zero.
+    ZeroPreConnectQueueCap,
     /// `retained_reports` was zero.
     ZeroRetainedReports,
     /// The pool was built with no endpoints.
@@ -316,9 +315,7 @@ impl FixedEndpointPool {
         for step in 0..n {
             let index = (self.cursor + step) % n;
             let slot = &self.endpoints[index];
-            if slot.healthy
-                && !slot.retired
-                && slot.in_flight < self.config.max_in_flight_per_conn
+            if slot.healthy && !slot.retired && slot.in_flight < self.config.max_in_flight_per_conn
             {
                 self.cursor = (index + 1) % n;
                 let slot = &mut self.endpoints[index];
@@ -536,7 +533,8 @@ impl Http2ClientPool {
     /// Feed one HTTP/2 outcome back: releases the stream slot and applies the
     /// transport health signal.
     pub fn record_outcome(&mut self, index: usize, outcome: &Http2ClientOutcome) {
-        self.state.record_signal(index, http2_health_signal(outcome));
+        self.state
+            .record_signal(index, http2_health_signal(outcome));
     }
 
     /// The shared pool state (health, caps, reports).
@@ -720,7 +718,10 @@ mod tests {
                 targets: 2,
                 connections: 1,
             }) => {}
-            other => panic!("expected MismatchedConnections, got a different result: {:?}", other.is_ok()),
+            other => panic!(
+                "expected MismatchedConnections, got a different result: {:?}",
+                other.is_ok()
+            ),
         }
     }
 
@@ -817,7 +818,11 @@ mod tests {
             EndpointHealthSignal::Healthy
         );
         g.record_signal(0, grpc_health_signal(&status_outcome));
-        assert_eq!(g.healthy_count(), 1, "gRPC status does not down the endpoint");
+        assert_eq!(
+            g.healthy_count(),
+            1,
+            "gRPC status does not down the endpoint"
+        );
 
         // An HTTP/2 reset: a transport failure. Endpoint goes down.
         let mut h = pool(1);
@@ -885,8 +890,18 @@ mod tests {
         p.retire(1, RetireReason::Stale);
         let report = p.report();
         assert_eq!(report.healthy, 1);
-        assert!(report.retained.iter().any(|r| r.reason == RetireReason::Idle));
-        assert!(report.retained.iter().any(|r| r.reason == RetireReason::Stale));
+        assert!(
+            report
+                .retained
+                .iter()
+                .any(|r| r.reason == RetireReason::Idle)
+        );
+        assert!(
+            report
+                .retained
+                .iter()
+                .any(|r| r.reason == RetireReason::Stale)
+        );
     }
 
     #[test]
@@ -906,6 +921,20 @@ mod tests {
         let mut cfg = FixedEndpointPoolConfig::balanced();
         cfg.max_in_flight_per_conn = 0;
         assert_eq!(cfg.validate(), Err(FixedEndpointPoolError::ZeroStreams));
+
+        let mut cfg = FixedEndpointPoolConfig::balanced();
+        cfg.pre_connect_queue_cap = 0;
+        assert_eq!(
+            cfg.validate(),
+            Err(FixedEndpointPoolError::ZeroPreConnectQueueCap)
+        );
+
+        let mut cfg = FixedEndpointPoolConfig::balanced();
+        cfg.retained_reports = 0;
+        assert_eq!(
+            cfg.validate(),
+            Err(FixedEndpointPoolError::ZeroRetainedReports)
+        );
     }
 
     #[test]

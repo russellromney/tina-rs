@@ -38,11 +38,20 @@ pub mod websocket_manager;
 pub use attempts::{
     AttemptKey, ConnectAttempts, ConnectAttemptsError, ConnectStep, DnsClassification,
 };
+pub use endpoint::{
+    ConnectSecurity, EndpointGeneration, EndpointId, GrpcEndpoint, Http2Endpoint, HttpEndpoint,
+    ResolvedEndpoint, WebSocketEndpoint,
+};
+pub use policy::{AddressFamilyPolicy, ConnectPolicy, ConnectPolicyError, HappyEyeballsPolicy};
 pub use pool::{
     EndpointDownReason, EndpointHealthSignal, FixedEndpointPool, FixedEndpointPoolConfig,
     FixedEndpointPoolError, FixedEndpointPoolReport, GrpcClientPool, Http2ClientPool,
     Http2PickOutcome, Http2PoolBuildError, PickOutcome, RetireReason, RetiredEndpointReport,
     build_http2_client_pool, grpc_health_signal, http2_health_signal,
+};
+pub use report::{
+    AddressFamily, ConnectAttemptOutcome, ConnectAttemptReport, ConnectReport, ConnectTlsTruth,
+    DnsOutcome,
 };
 pub use websocket_manager::{
     InstallError, RetainedSessionReport, SessionEndReason, WebSocketClientManager,
@@ -50,15 +59,4 @@ pub use websocket_manager::{
     WebSocketManagerConfigError, WebSocketManagerHandles, WebSocketManagerMsg,
     WebSocketManagerReply, WebSocketManagerReport, WebSocketManagerShutdownReport,
     WebSocketManagerState, WebSocketSessionError, WsConnAddr, build_websocket_client_manager,
-};
-pub use endpoint::{
-    ConnectSecurity, EndpointGeneration, EndpointId, GrpcEndpoint, Http2Endpoint, HttpEndpoint,
-    ResolvedEndpoint, WebSocketEndpoint,
-};
-pub use policy::{
-    AddressFamilyPolicy, ConnectPolicy, ConnectPolicyError, HappyEyeballsPolicy,
-};
-pub use report::{
-    AddressFamily, ConnectAttemptOutcome, ConnectAttemptReport, ConnectReport, ConnectTlsTruth,
-    DnsOutcome,
 };

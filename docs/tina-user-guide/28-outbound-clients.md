@@ -73,11 +73,13 @@ let handles = build_websocket_client_manager(&runtime, ws, config, 32, 16)?;
 // call(handles.manager, WebSocketManagerMsg::Connect, timeout) → WebSocketConnectOutcome
 ```
 
-The manager returns typed outcomes: `Connected`, `ConnectFailed`,
-`NoHealthyEndpoint`, `TimedOut`, `Full`, plus `Stale`/`Closed` on session
-operations. A generation guard drops any reply from an old session, so a stale
-session can never replace the current one. Each `Report` folds the current
-session's outbound queue/byte pressure. Shutdown drains and stops sessions.
+The manager returns typed connect outcomes: `Connected`, `ConnectFailed`,
+`NoHealthyEndpoint`, `TimedOut`, `Full`, and `Closed` when shutdown wins a
+connect in progress. Session operations return `NotConnected`, `Busy`,
+`TimedOut`, or `Closed` instead of hanging. A generation guard drops any reply
+from an old session, so a stale session can never replace the current one. Each
+`Report` folds the current session's outbound queue/byte pressure. Shutdown
+drains and stops sessions.
 
 For a fixed list of backends, `Http2ClientPool` and `GrpcClientPool` round-robin
 over healthy endpoints with a per-connection stream cap and `NoHealthyEndpoint`

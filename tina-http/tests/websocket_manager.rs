@@ -13,8 +13,8 @@ use std::net::TcpListener;
 use std::sync::mpsc;
 use std::time::Duration;
 
-use tina::prelude::*;
 use tina::Address;
+use tina::prelude::*;
 use tina_http::{
     AddressFamilyPolicy, ConnectPolicy, WebSocketConnectOutcome, WebSocketEndpoint,
     WebSocketManagerConfig, WebSocketManagerMsg, WebSocketManagerReply, WebSocketManagerReport,

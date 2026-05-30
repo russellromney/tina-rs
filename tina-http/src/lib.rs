@@ -194,12 +194,13 @@ pub use connect::{
     FixedEndpointPoolConfig, FixedEndpointPoolError, FixedEndpointPoolReport, GrpcClientPool,
     GrpcEndpoint, HappyEyeballsPolicy, Http2ClientPool, Http2Endpoint, Http2PickOutcome,
     Http2PoolBuildError, HttpEndpoint, InstallError, PickOutcome, ResolvedEndpoint,
-    RetireReason, RetiredEndpointReport, RetainedSessionReport, SessionEndReason,
-    WebSocketClientManager, build_http2_client_pool, grpc_health_signal, http2_health_signal,
-    WebSocketConnectOutcome, WebSocketEndpoint, WebSocketManagerAddr, WebSocketManagerConfig,
-    WebSocketManagerConfigError, WebSocketManagerHandles, WebSocketManagerMsg,
-    WebSocketManagerReply, WebSocketManagerReport, WebSocketManagerShutdownReport,
-    WebSocketManagerState, WebSocketSessionError, WsConnAddr, build_websocket_client_manager,
+    RetainedSessionReport, RetireReason, RetiredEndpointReport, SessionEndReason,
+    WebSocketClientManager, WebSocketConnectOutcome, WebSocketEndpoint, WebSocketManagerAddr,
+    WebSocketManagerConfig, WebSocketManagerConfigError, WebSocketManagerHandles,
+    WebSocketManagerMsg, WebSocketManagerReply, WebSocketManagerReport,
+    WebSocketManagerShutdownReport, WebSocketManagerState, WebSocketSessionError, WsConnAddr,
+    build_http2_client_pool, build_websocket_client_manager, grpc_health_signal,
+    http2_health_signal,
 };
 pub use connection::{HttpConnection, HttpConnectionMsg, response_for_call_outcome};
 pub use grpc::{

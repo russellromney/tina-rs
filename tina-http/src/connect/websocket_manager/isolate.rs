@@ -64,11 +64,10 @@ where
     let mut connections: Vec<WsConnAddr> = Vec::with_capacity(pool);
     for _ in 0..pool {
         let conn = WebSocketClientConnection::<S>::new(config.session_limits);
-        let address = runtime
-            .register_with_capacity::<WebSocketClientConnection<S>, Infallible>(
-                conn,
-                connection_mailbox_capacity,
-            )?;
+        let address = runtime.register_with_capacity::<WebSocketClientConnection<S>, Infallible>(
+            conn,
+            connection_mailbox_capacity,
+        )?;
         connections.push(address);
     }
     let manager = WebSocketClientManager::<S>::new(endpoint, config, connections.clone());
@@ -96,6 +95,8 @@ pub enum WebSocketConnectOutcome {
     TimedOut(ConnectReport),
     /// A connect is already in progress, or no connection slot is free.
     Full,
+    /// The manager closed while this connect was still in progress.
+    Closed(ConnectReport),
     /// A session is already open at this generation.
     AlreadyConnected(EndpointGeneration),
 }
@@ -364,13 +365,15 @@ impl<S: Shard + 'static> WebSocketClientManager<S> {
             ));
         }
         if self.connect.is_some() || self.pending_connect.is_some() {
-            return call_ctx
-                .reply(WebSocketManagerReply::Connect(WebSocketConnectOutcome::Full));
+            return call_ctx.reply(WebSocketManagerReply::Connect(
+                WebSocketConnectOutcome::Full,
+            ));
         }
         // A connect after the first is a reconnect: spend the bounded budget.
         if self.started_once && !self.state.record_reconnect() {
             let report = self.no_dial_report();
-            self.state.retain_failed_connect(EndpointGeneration::new(0), true);
+            self.state
+                .retain_failed_connect(EndpointGeneration::new(0), true);
             return call_ctx.reply(WebSocketManagerReply::Connect(
                 WebSocketConnectOutcome::NoHealthyEndpoint(report),
             ));
@@ -652,7 +655,9 @@ impl<S: Shard + 'static> WebSocketClientManager<S> {
             )));
         };
         if self.pending_send.is_some() {
-            return call_ctx.reply(WebSocketManagerReply::Sent(Err(WebSocketSessionError::Busy)));
+            return call_ctx.reply(WebSocketManagerReply::Sent(Err(
+                WebSocketSessionError::Busy,
+            )));
         }
         let Some(slot) = self.state.current_conn_index() else {
             return call_ctx.reply(WebSocketManagerReply::Sent(Err(
@@ -681,9 +686,7 @@ impl<S: Shard + 'static> WebSocketClientManager<S> {
             return self.reply_send(Err(WebSocketSessionError::Closed));
         }
         match outcome {
-            CallOutcome::Replied(WebSocketClientReply::Sent(Ok(()))) => {
-                self.reply_send(Ok(()))
-            }
+            CallOutcome::Replied(WebSocketClientReply::Sent(Ok(()))) => self.reply_send(Ok(())),
             CallOutcome::Replied(WebSocketClientReply::Sent(Err(error))) => {
                 let mapped = self.map_session_error(generation, error);
                 self.reply_send(Err(mapped))
@@ -716,7 +719,9 @@ impl<S: Shard + 'static> WebSocketClientManager<S> {
             )));
         };
         if self.pending_receive.is_some() {
-            return call_ctx.reply(WebSocketManagerReply::Event(Err(WebSocketSessionError::Busy)));
+            return call_ctx.reply(WebSocketManagerReply::Event(Err(
+                WebSocketSessionError::Busy,
+            )));
         }
         let Some(slot) = self.state.current_conn_index() else {
             return call_ctx.reply(WebSocketManagerReply::Event(Err(
@@ -854,9 +859,38 @@ impl<S: Shard + 'static> WebSocketClientManager<S> {
                 }));
             }
         }
+        if let Some(req) = self.pending_connect.take() {
+            let report = self
+                .connect
+                .as_ref()
+                .map(ConnectAttempts::report)
+                .unwrap_or_else(|| self.no_dial_report());
+            effects.push(reply_to_request(
+                req,
+                WebSocketManagerReply::Connect(WebSocketConnectOutcome::Closed(report)),
+            ));
+        }
         self.connect = None;
         if self.state.has_session() {
             self.state.retire_current(SessionEndReason::ClosedLocal);
+        }
+        if let Some(req) = self.pending_send.take() {
+            effects.push(reply_to_request(
+                req,
+                WebSocketManagerReply::Sent(Err(WebSocketSessionError::Closed)),
+            ));
+        }
+        if let Some(req) = self.pending_receive.take() {
+            effects.push(reply_to_request(
+                req,
+                WebSocketManagerReply::Event(Err(WebSocketSessionError::Closed)),
+            ));
+        }
+        if let Some(req) = self.pending_report.take() {
+            effects.push(reply_to_request(
+                req,
+                WebSocketManagerReply::Report(self.state.report()),
+            ));
         }
         let report = WebSocketManagerShutdownReport {
             stopped,
@@ -901,9 +935,9 @@ impl<S: Shard + 'static> WebSocketClientManager<S> {
     }
 
     fn slot_dialing(&self, addr: SocketAddr) -> Option<usize> {
-        self.conn_states.iter().position(|s| {
-            matches!(s, ConnState::Dialing { addr: a, .. } if *a == addr)
-        })
+        self.conn_states
+            .iter()
+            .position(|s| matches!(s, ConnState::Dialing { addr: a, .. } if *a == addr))
     }
 
     fn state_endpoint_id(&self) -> EndpointId {

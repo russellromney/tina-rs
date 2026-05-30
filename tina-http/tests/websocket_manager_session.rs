@@ -16,7 +16,7 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 use tina::prelude::*;
-use tina::{Address, CallContext};
+use tina::{Address, CallContext, reply_to_request};
 use tina_http::{
     AddressFamilyPolicy, ConnectPolicy, WebSocketClientConnected, WebSocketClientEvent,
     WebSocketClientManager, WebSocketClientMsg, WebSocketClientReply, WebSocketClientReport,
@@ -43,6 +43,8 @@ impl Shard for TestShard {
 struct StubConn {
     events: VecDeque<WebSocketClientEvent>,
     report: WebSocketClientReport,
+    hold_connect: bool,
+    held_connects: Vec<tina::RequestContext<WebSocketClientReply>>,
 }
 
 impl Isolate for StubConn {
@@ -57,26 +59,53 @@ impl Isolate for StubConn {
 
     fn handle(
         &mut self,
-        _msg: WebSocketClientMsg,
+        msg: WebSocketClientMsg,
         _ctx: &mut Context<'_, TestShard, WebSocketClientReply>,
     ) -> Effect<Self> {
-        // Stop and stray fire-and-forget messages: nothing to do in the stub.
-        noop()
+        match msg {
+            WebSocketClientMsg::Stop => {
+                let mut effects = Vec::new();
+                while let Some(req) = self.held_connects.pop() {
+                    effects.push(reply_to_request(
+                        req,
+                        WebSocketClientReply::Connected(Err(
+                            tina_http::WebSocketClientError::Closed,
+                        )),
+                    ));
+                }
+                batch(effects)
+            }
+            _ => noop(),
+        }
     }
 
-    fn handle_call(&mut self, msg: WebSocketClientMsg, call_ctx: CallContext<'_, Self>) -> Effect<Self> {
+    fn handle_call(
+        &mut self,
+        msg: WebSocketClientMsg,
+        call_ctx: CallContext<'_, Self>,
+    ) -> Effect<Self> {
         match msg {
-            WebSocketClientMsg::Connect { .. } => call_ctx.reply(WebSocketClientReply::Connected(
-                Ok(WebSocketClientConnected {
-                    selected_subprotocol: None,
-                }),
-            )),
+            WebSocketClientMsg::Connect { .. } => {
+                if self.hold_connect {
+                    self.held_connects.push(call_ctx.into_request_context());
+                    noop()
+                } else {
+                    call_ctx.reply(WebSocketClientReply::Connected(Ok(
+                        WebSocketClientConnected {
+                            selected_subprotocol: None,
+                        },
+                    )))
+                }
+            }
             WebSocketClientMsg::Send(_) => call_ctx.reply(WebSocketClientReply::Sent(Ok(()))),
             WebSocketClientMsg::Receive => {
-                let event = self.events.pop_front().unwrap_or(WebSocketClientEvent::Close {
-                    code: Some(WebSocketCloseCode(1000)),
-                    reason: Vec::new(),
-                });
+                let event = self
+                    .events
+                    .pop_front()
+                    .unwrap_or(WebSocketClientEvent::Close {
+                        code: Some(WebSocketCloseCode(1000)),
+                        reason: Vec::new(),
+                    });
                 call_ctx.reply(WebSocketClientReply::Event(Ok(event)))
             }
             WebSocketClientMsg::Report => {
@@ -155,6 +184,8 @@ fn session_lifecycle_connect_send_receive_then_bounded_reconnect() {
             },
         ]),
         report,
+        hold_connect: false,
+        held_connects: Vec::new(),
     };
     let stub_addr = runtime
         .register_with_capacity::<StubConn, Infallible>(stub, 16)
@@ -206,9 +237,9 @@ fn session_lifecycle_connect_send_receive_then_bounded_reconnect() {
 
     // Send routes to the session.
     assert_eq!(
-        op(WebSocketManagerMsg::Send(tina_http::WebSocketMessage::Text(
-            "ping".to_string()
-        ))),
+        op(WebSocketManagerMsg::Send(
+            tina_http::WebSocketMessage::Text("ping".to_string())
+        )),
         WebSocketManagerReply::Sent(Ok(()))
     );
 
@@ -222,10 +253,7 @@ fn session_lifecycle_connect_send_receive_then_bounded_reconnect() {
     match op(WebSocketManagerMsg::Report) {
         WebSocketManagerReply::Report(r) => {
             assert!(r.has_session);
-            assert_eq!(
-                r.current_pressure.map(|p| p.queued_outbound_bytes),
-                Some(7)
-            );
+            assert_eq!(r.current_pressure.map(|p| p.queued_outbound_bytes), Some(7));
         }
         other => panic!("expected Report, got {other:?}"),
     }
@@ -242,9 +270,9 @@ fn session_lifecycle_connect_send_receive_then_bounded_reconnect() {
 
     // A send with no session is NotConnected, not a panic.
     assert_eq!(
-        op(WebSocketManagerMsg::Send(tina_http::WebSocketMessage::Text(
-            "x".to_string()
-        ))),
+        op(WebSocketManagerMsg::Send(
+            tina_http::WebSocketMessage::Text("x".to_string())
+        )),
         WebSocketManagerReply::Sent(Err(WebSocketSessionError::NotConnected))
     );
 
@@ -277,6 +305,82 @@ fn session_lifecycle_connect_send_receive_then_bounded_reconnect() {
         }
         other => panic!("expected Shutdown, got {other:?}"),
     }
+
+    let _ = runtime.shutdown();
+}
+
+#[test]
+fn shutdown_mid_connect_answers_the_connect_caller() {
+    let runtime = ThreadedRuntime::with_config(
+        TestShard,
+        DefaultThreadedMailboxFactory,
+        ThreadedRuntimeConfig {
+            command_capacity: 64,
+            idle_wait: Duration::from_millis(1),
+            ..Default::default()
+        },
+    );
+
+    let stub = StubConn {
+        events: VecDeque::new(),
+        report: WebSocketClientReport::default(),
+        hold_connect: true,
+        held_connects: Vec::new(),
+    };
+    let stub_addr = runtime
+        .register_with_capacity::<StubConn, Infallible>(stub, 16)
+        .expect("register stub");
+
+    let mut policy = ConnectPolicy::balanced();
+    policy.address_family = AddressFamilyPolicy::PreserveOrder;
+    policy.max_resolved_addresses = 1;
+    policy.max_total_attempts = 1;
+    policy.happy_eyeballs.max_concurrent_attempts = 1;
+    policy.happy_eyeballs.delay = Duration::ZERO;
+    policy.dns_timeout = Duration::from_secs(2);
+    policy.connect_timeout = Duration::from_secs(30);
+
+    let config = WebSocketManagerConfig::new(policy);
+    let endpoint = WebSocketEndpoint::ws("127.0.0.1", 8080, "/ws");
+    let manager = WebSocketClientManager::<TestShard>::new(endpoint, config, vec![stub_addr]);
+    let manager_addr = runtime
+        .register_with_capacity::<WebSocketClientManager<TestShard>, WebSocketClientMsg>(
+            manager, 32,
+        )
+        .expect("register manager");
+
+    let (tx, rx) = mpsc::channel();
+    let driver = Driver {
+        manager: manager_addr,
+        notify: tx,
+    };
+    let driver_addr = runtime
+        .register_with_capacity::<Driver, Infallible>(driver, 32)
+        .expect("register driver");
+
+    let _ = runtime.try_send(driver_addr, DriverMsg::Op(WebSocketManagerMsg::Connect));
+    std::thread::sleep(Duration::from_millis(50));
+    let _ = runtime.try_send(driver_addr, DriverMsg::Op(WebSocketManagerMsg::Shutdown));
+
+    let first = wait(&rx);
+    let second = wait(&rx);
+    let replies = [first, second];
+
+    assert!(
+        replies
+            .iter()
+            .any(|reply| matches!(reply, WebSocketManagerReply::Shutdown(_))),
+        "shutdown caller receives a reply: {replies:?}"
+    );
+    assert!(
+        replies.iter().any(|reply| {
+            matches!(
+                reply,
+                WebSocketManagerReply::Connect(WebSocketConnectOutcome::Closed(_))
+            )
+        }),
+        "pending connect caller is closed, not left to timeout: {replies:?}"
+    );
 
     let _ = runtime.shutdown();
 }

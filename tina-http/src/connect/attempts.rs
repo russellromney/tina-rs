@@ -28,8 +28,8 @@ use std::net::SocketAddr;
 
 use tina::{CancelOutcome, Effect, Isolate};
 use tina_runtime::{
-    BoundedItems, CallError, CallGroup, CallGroupCancelRequest, CallGroupStartError, CallGroupToken,
-    CallOutcome, CancelableCall, RuntimeCall,
+    BoundedItems, CallError, CallGroup, CallGroupCancelRequest, CallGroupStartError,
+    CallGroupToken, CallOutcome, CancelableCall, RuntimeCall,
 };
 
 use super::endpoint::{ConnectSecurity, EndpointGeneration, EndpointId};
@@ -555,12 +555,18 @@ mod tests {
     #[test]
     fn dns_failure_is_classified_and_settles() {
         let mut a = attempts(policy(2, 4, 3));
-        assert_eq!(a.record_dns(Err(CallError::DnsFull)), DnsClassification::Failed);
+        assert_eq!(
+            a.record_dns(Err(CallError::DnsFull)),
+            DnsClassification::Failed
+        );
         assert_eq!(a.dns_outcome(), &DnsOutcome::Full);
         assert!(!a.can_start());
 
         let mut a = attempts(policy(2, 4, 3));
-        assert_eq!(a.record_dns(Err(CallError::Timeout)), DnsClassification::Failed);
+        assert_eq!(
+            a.record_dns(Err(CallError::Timeout)),
+            DnsClassification::Failed
+        );
         assert_eq!(a.dns_outcome(), &DnsOutcome::Timeout);
 
         let mut a = attempts(policy(2, 4, 3));
@@ -607,7 +613,12 @@ mod tests {
         let _t2 = start_attempt(&mut a, a2);
 
         // a1 connects first → winner, a2 is a loser to cancel.
-        let step = a.record_attempt(a1, t1, CallOutcome::Replied(ConnReply { ok: true }), classify);
+        let step = a.record_attempt(
+            a1,
+            t1,
+            CallOutcome::Replied(ConnReply { ok: true }),
+            classify,
+        );
         match step {
             ConnectStep::Won { losers } => {
                 assert_eq!(losers.len(), 1);
@@ -627,13 +638,23 @@ mod tests {
         let a2 = a.take_candidate().unwrap();
         let t2 = start_attempt(&mut a, a2);
 
-        let won = a.record_attempt(a1, t1, CallOutcome::Replied(ConnReply { ok: true }), classify);
+        let won = a.record_attempt(
+            a1,
+            t1,
+            CallOutcome::Replied(ConnReply { ok: true }),
+            classify,
+        );
         let losers = match won {
             ConnectStep::Won { losers } => losers,
             other => panic!("expected Won, got {other:?}"),
         };
         // The loser's connect *succeeds late*, arriving as a message.
-        let step = a.record_attempt(a2, t2, CallOutcome::Replied(ConnReply { ok: true }), classify);
+        let step = a.record_attempt(
+            a2,
+            t2,
+            CallOutcome::Replied(ConnReply { ok: true }),
+            classify,
+        );
         assert!(matches!(
             step,
             ConnectStep::LateCompletion {
@@ -684,11 +705,18 @@ mod tests {
         assert_eq!(losers.len(), 2);
 
         // a1 fails late (arrives as a message), a3 is cancelled cleanly.
-        let late =
-            a.record_attempt(a1, t1, CallOutcome::Replied(ConnReply { ok: false }), classify);
+        let late = a.record_attempt(
+            a1,
+            t1,
+            CallOutcome::Replied(ConnReply { ok: false }),
+            classify,
+        );
         assert!(matches!(
             late,
-            ConnectStep::LateCompletion { connected: false, .. }
+            ConnectStep::LateCompletion {
+                connected: false,
+                ..
+            }
         ));
         // Even an unused token (t3) cancel must settle the race exactly once.
         for req in losers {
@@ -716,7 +744,12 @@ mod tests {
         a.record_dns(Ok(vec![v4(1), v4(2)]));
         let a1 = a.take_candidate().unwrap();
         let t1 = start_attempt(&mut a, a1);
-        let s1 = a.record_attempt(a1, t1, CallOutcome::Replied(ConnReply { ok: false }), classify);
+        let s1 = a.record_attempt(
+            a1,
+            t1,
+            CallOutcome::Replied(ConnReply { ok: false }),
+            classify,
+        );
         assert!(matches!(s1, ConnectStep::Continue));
         let a2 = a.take_candidate().unwrap();
         let t2 = start_attempt(&mut a, a2);
@@ -740,10 +773,20 @@ mod tests {
         assert_eq!(a.candidates_remaining(), 2);
         let a1 = a.take_candidate().unwrap();
         let t1 = start_attempt(&mut a, a1);
-        a.record_attempt(a1, t1, CallOutcome::Replied(ConnReply { ok: false }), classify);
+        a.record_attempt(
+            a1,
+            t1,
+            CallOutcome::Replied(ConnReply { ok: false }),
+            classify,
+        );
         let a2 = a.take_candidate().unwrap();
         let t2 = start_attempt(&mut a, a2);
-        a.record_attempt(a2, t2, CallOutcome::Replied(ConnReply { ok: false }), classify);
+        a.record_attempt(
+            a2,
+            t2,
+            CallOutcome::Replied(ConnReply { ok: false }),
+            classify,
+        );
         assert!(a.take_candidate().is_none());
         assert_eq!(a.started_total(), 2);
     }

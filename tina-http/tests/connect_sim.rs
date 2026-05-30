@@ -92,7 +92,9 @@ impl Isolate for DnsProbe {
                     Self::policy(),
                 );
                 attempts.record_dns(result);
-                self.observed.borrow_mut().push(attempts.dns_outcome().clone());
+                self.observed
+                    .borrow_mut()
+                    .push(attempts.dns_outcome().clone());
                 Effect::Noop
             }
         }
@@ -113,10 +115,7 @@ fn scripted_dns_success_failure_timeout_map_to_distinct_outcome_rows() {
                     host: "ok.local".to_string(),
                     port: 8080,
                     complete_after_step: 1,
-                    result: ScriptedDnsResult::Resolved(vec![
-                        local_addr(48100),
-                        local_addr(48101),
-                    ]),
+                    result: ScriptedDnsResult::Resolved(vec![local_addr(48100), local_addr(48101)]),
                 },
                 ScriptedDnsLookupConfig {
                     host: "fail.local".to_string(),

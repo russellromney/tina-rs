@@ -121,12 +121,14 @@ impl ConnectPolicy {
         let mut ordered: Vec<SocketAddr> = match self.address_family {
             AddressFamilyPolicy::PreserveOrder => addrs.to_vec(),
             AddressFamilyPolicy::Ipv6First => {
-                let mut v: Vec<SocketAddr> = addrs.iter().filter(|a| a.is_ipv6()).copied().collect();
+                let mut v: Vec<SocketAddr> =
+                    addrs.iter().filter(|a| a.is_ipv6()).copied().collect();
                 v.extend(addrs.iter().filter(|a| a.is_ipv4()).copied());
                 v
             }
             AddressFamilyPolicy::Ipv4First => {
-                let mut v: Vec<SocketAddr> = addrs.iter().filter(|a| a.is_ipv4()).copied().collect();
+                let mut v: Vec<SocketAddr> =
+                    addrs.iter().filter(|a| a.is_ipv4()).copied().collect();
                 v.extend(addrs.iter().filter(|a| a.is_ipv6()).copied());
                 v
             }
@@ -199,12 +201,8 @@ impl fmt::Display for ConnectPolicyError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::ZeroTotalAttempts => f.write_str("max_total_attempts must be positive"),
-            Self::ZeroResolvedAddresses => {
-                f.write_str("max_resolved_addresses must be positive")
-            }
-            Self::ZeroConcurrentAttempts => {
-                f.write_str("max_concurrent_attempts must be positive")
-            }
+            Self::ZeroResolvedAddresses => f.write_str("max_resolved_addresses must be positive"),
+            Self::ZeroConcurrentAttempts => f.write_str("max_concurrent_attempts must be positive"),
             Self::ConcurrencyAboveTotal { concurrent, total } => write!(
                 f,
                 "max_concurrent_attempts {concurrent} exceeds max_total_attempts {total}"
