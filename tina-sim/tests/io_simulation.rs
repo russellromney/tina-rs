@@ -100,8 +100,8 @@ impl Isolate for Connection {
 enum ClientMsg {
     Start(SocketAddr),
     Connected(Result<(StreamId, SocketAddr, SocketAddr), CallError>),
-    Wrote(Result<usize, CallError>),
-    Read(Result<Vec<u8>, CallError>),
+    Wrote(Result<(Vec<u8>, usize), CallError>),
+    Read(Result<(Vec<u8>, usize), CallError>),
     Closed(Result<(), CallError>),
 }
 
@@ -143,48 +143,54 @@ impl Isolate for Client {
             )),
             ClientMsg::Connected(Ok((stream, _local_addr, _peer_addr))) => {
                 self.stream = Some(stream);
-                self.pending_write = self.payload.clone();
+                self.pending_write = std::mem::take(&mut self.payload);
                 Effect::Call(RuntimeCall::new(
-                    CallInput::TcpWrite {
+                    CallInput::TcpWriteOwned {
                         stream,
-                        bytes: self.pending_write.clone(),
+                        bytes: std::mem::take(&mut self.pending_write),
                     },
                     |result| match result {
-                        CallOutput::TcpWrote { count } => ClientMsg::Wrote(Ok(count)),
+                        CallOutput::TcpWroteOwned { bytes, count } => {
+                            ClientMsg::Wrote(Ok((bytes, count)))
+                        }
                         CallOutput::Failed(error) => ClientMsg::Wrote(Err(error)),
                         other => panic!("unexpected write result {other:?}"),
                     },
                 ))
             }
-            ClientMsg::Wrote(Ok(count)) => {
+            ClientMsg::Wrote(Ok((mut bytes, count))) => {
                 let stream = self.stream.expect("stream set after connect");
-                if count >= self.pending_write.len() {
-                    self.pending_write.clear();
+                if count >= bytes.len() {
                     Effect::Call(RuntimeCall::new(
-                        CallInput::TcpRead { stream, max_len: 4 },
+                        CallInput::TcpReadBuf {
+                            stream,
+                            buffer: Vec::with_capacity(16),
+                            max_len: 4,
+                        },
                         |result| match result {
-                            CallOutput::TcpRead { bytes } => ClientMsg::Read(Ok(bytes)),
+                            CallOutput::TcpReadBuf { buffer, len } => {
+                                ClientMsg::Read(Ok((buffer, len)))
+                            }
                             CallOutput::Failed(error) => ClientMsg::Read(Err(error)),
                             other => panic!("unexpected read result {other:?}"),
                         },
                     ))
                 } else {
-                    self.pending_write.drain(..count);
+                    bytes.drain(..count);
                     Effect::Call(RuntimeCall::new(
-                        CallInput::TcpWrite {
-                            stream,
-                            bytes: self.pending_write.clone(),
-                        },
+                        CallInput::TcpWriteOwned { stream, bytes },
                         |result| match result {
-                            CallOutput::TcpWrote { count } => ClientMsg::Wrote(Ok(count)),
+                            CallOutput::TcpWroteOwned { bytes, count } => {
+                                ClientMsg::Wrote(Ok((bytes, count)))
+                            }
                             CallOutput::Failed(error) => ClientMsg::Wrote(Err(error)),
                             other => panic!("unexpected write result {other:?}"),
                         },
                     ))
                 }
             }
-            ClientMsg::Read(Ok(bytes)) => {
-                *self.observed.lock().expect("observed mutex") = Some(bytes);
+            ClientMsg::Read(Ok((buffer, len))) => {
+                *self.observed.lock().expect("observed mutex") = Some(buffer[..len].to_vec());
                 let stream = self.stream.expect("stream set after connect");
                 Effect::Call(RuntimeCall::new(
                     CallInput::TcpStreamClose { stream },

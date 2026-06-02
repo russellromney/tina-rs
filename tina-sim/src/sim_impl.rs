@@ -1681,7 +1681,15 @@ where
             CallInput::TcpRead { stream, max_len } => {
                 self.handle_tcp_read(call_id, stream, max_len)
             }
+            CallInput::TcpReadBuf {
+                stream,
+                buffer,
+                max_len,
+            } => self.handle_tcp_read_buf(call_id, stream, buffer, max_len),
             CallInput::TcpWrite { stream, bytes } => self.handle_tcp_write(call_id, stream, bytes),
+            CallInput::TcpWriteOwned { stream, bytes } => {
+                self.handle_tcp_write_owned(call_id, stream, bytes)
+            }
             CallInput::TcpListenerClose { listener } => {
                 self.handle_tcp_listener_close(call_id, listener)
             }
@@ -1727,11 +1735,22 @@ where
                 max_len,
                 timeout,
             } => self.handle_tls_read(call_id, stream, max_len, timeout),
+            CallInput::TlsReadBuf {
+                stream,
+                buffer,
+                max_len,
+                timeout,
+            } => self.handle_tls_read_buf(call_id, stream, buffer, max_len, timeout),
             CallInput::TlsWrite {
                 stream,
                 bytes,
                 timeout,
             } => self.handle_tls_write(call_id, stream, bytes, timeout),
+            CallInput::TlsWriteOwned {
+                stream,
+                bytes,
+                timeout,
+            } => self.handle_tls_write_owned(call_id, stream, bytes, timeout),
             CallInput::TlsClose { stream, timeout } => {
                 self.handle_tls_close(call_id, stream, timeout)
             }
@@ -2211,6 +2230,32 @@ where
         self.schedule_tcp_completion(call_id, resource, result);
     }
 
+    pub(crate) fn handle_tcp_read_buf(
+        &mut self,
+        call_id: CallId,
+        stream: tina_runtime::StreamId,
+        buffer: Vec<u8>,
+        max_len: usize,
+    ) {
+        let Some(stream_index) = self.stream_index(stream) else {
+            self.deliver_completion(call_id, CallOutput::Failed(CallError::InvalidResource));
+            return;
+        };
+
+        let resource = TcpResourceKey::StreamRead(stream);
+        if self.resource_has_active_pending(resource) {
+            self.deliver_completion(call_id, CallOutput::Failed(CallError::ResourceBusy));
+            return;
+        }
+
+        let Some(result) = self.stream_read_buf_result(stream_index, buffer, max_len) else {
+            self.deliver_completion(call_id, CallOutput::Failed(CallError::InvalidResource));
+            return;
+        };
+
+        self.schedule_tcp_completion(call_id, resource, result);
+    }
+
     pub(crate) fn handle_tcp_write(
         &mut self,
         call_id: CallId,
@@ -2229,6 +2274,31 @@ where
         }
 
         let Some(result) = self.stream_write_result(stream_index, &bytes) else {
+            self.deliver_completion(call_id, CallOutput::Failed(CallError::InvalidResource));
+            return;
+        };
+
+        self.schedule_tcp_completion(call_id, resource, result);
+    }
+
+    pub(crate) fn handle_tcp_write_owned(
+        &mut self,
+        call_id: CallId,
+        stream: tina_runtime::StreamId,
+        bytes: Vec<u8>,
+    ) {
+        let Some(stream_index) = self.stream_index(stream) else {
+            self.deliver_completion(call_id, CallOutput::Failed(CallError::InvalidResource));
+            return;
+        };
+
+        let resource = TcpResourceKey::StreamWrite(stream);
+        if self.resource_has_active_pending(resource) {
+            self.deliver_completion(call_id, CallOutput::Failed(CallError::ResourceBusy));
+            return;
+        }
+
+        let Some(result) = self.stream_write_owned_result(stream_index, bytes) else {
             self.deliver_completion(call_id, CallOutput::Failed(CallError::InvalidResource));
             return;
         };
@@ -2730,6 +2800,62 @@ where
         self.schedule_tls_completion(call_id, resource, self.step_ordinal + 1, result);
     }
 
+    pub(crate) fn handle_tls_read_buf(
+        &mut self,
+        call_id: CallId,
+        stream: TlsStreamId,
+        mut buffer: Vec<u8>,
+        max_len: usize,
+        timeout: Duration,
+    ) {
+        if timeout.is_zero() {
+            self.deliver_completion_at(
+                call_id,
+                CallOutput::Failed(CallError::Timeout),
+                self.step_ordinal + 1,
+            );
+            return;
+        }
+
+        let Some(stream_index) = self.tls_stream_index(stream) else {
+            self.deliver_completion(call_id, CallOutput::Failed(CallError::InvalidResource));
+            return;
+        };
+        if self.tls_streams[stream_index].closed {
+            self.deliver_completion(call_id, CallOutput::Failed(CallError::InvalidResource));
+            return;
+        }
+        if self.tls_streams[stream_index]
+            .pending_connect_call
+            .is_some()
+        {
+            self.deliver_completion(call_id, CallOutput::Failed(CallError::InvalidResource));
+            return;
+        }
+        let resource = TcpResourceKey::TlsStream(stream);
+        if self.resource_has_active_pending(resource) {
+            self.deliver_completion(call_id, CallOutput::Failed(CallError::ResourceBusy));
+            return;
+        }
+
+        let result = match self.tls_streams[stream_index].reads.pop_front() {
+            Some(ScriptedTlsReadResult::Bytes(bytes)) => {
+                buffer.clear();
+                buffer.extend(bytes.into_iter().take(max_len));
+                let len = buffer.len();
+                CallOutput::TlsReadBuf { buffer, len }
+            }
+            Some(ScriptedTlsReadResult::Eof) => {
+                buffer.clear();
+                CallOutput::TlsReadBuf { buffer, len: 0 }
+            }
+            Some(ScriptedTlsReadResult::Failed) => CallOutput::Failed(CallError::Io),
+            Some(ScriptedTlsReadResult::Timeout) => CallOutput::Failed(CallError::Timeout),
+            None => CallOutput::Failed(CallError::Io),
+        };
+        self.schedule_tls_completion(call_id, resource, self.step_ordinal + 1, result);
+    }
+
     pub(crate) fn handle_tls_write(
         &mut self,
         call_id: CallId,
@@ -2770,6 +2896,55 @@ where
         let result = match self.tls_streams[stream_index].writes.pop_front() {
             Some(ScriptedTlsWriteResult::Wrote(count)) => CallOutput::TlsWrote {
                 count: count.min(bytes.len()),
+            },
+            Some(ScriptedTlsWriteResult::Failed) => CallOutput::Failed(CallError::Io),
+            Some(ScriptedTlsWriteResult::Timeout) => CallOutput::Failed(CallError::Timeout),
+            None => CallOutput::Failed(CallError::Io),
+        };
+        self.schedule_tls_completion(call_id, resource, self.step_ordinal + 1, result);
+    }
+
+    pub(crate) fn handle_tls_write_owned(
+        &mut self,
+        call_id: CallId,
+        stream: TlsStreamId,
+        bytes: Vec<u8>,
+        timeout: Duration,
+    ) {
+        if timeout.is_zero() {
+            self.deliver_completion_at(
+                call_id,
+                CallOutput::Failed(CallError::Timeout),
+                self.step_ordinal + 1,
+            );
+            return;
+        }
+
+        let Some(stream_index) = self.tls_stream_index(stream) else {
+            self.deliver_completion(call_id, CallOutput::Failed(CallError::InvalidResource));
+            return;
+        };
+        if self.tls_streams[stream_index].closed {
+            self.deliver_completion(call_id, CallOutput::Failed(CallError::InvalidResource));
+            return;
+        }
+        if self.tls_streams[stream_index]
+            .pending_connect_call
+            .is_some()
+        {
+            self.deliver_completion(call_id, CallOutput::Failed(CallError::InvalidResource));
+            return;
+        }
+        let resource = TcpResourceKey::TlsStream(stream);
+        if self.resource_has_active_pending(resource) {
+            self.deliver_completion(call_id, CallOutput::Failed(CallError::ResourceBusy));
+            return;
+        }
+
+        let result = match self.tls_streams[stream_index].writes.pop_front() {
+            Some(ScriptedTlsWriteResult::Wrote(count)) => CallOutput::TlsWroteOwned {
+                count: count.min(bytes.len()),
+                bytes,
             },
             Some(ScriptedTlsWriteResult::Failed) => CallOutput::Failed(CallError::Io),
             Some(ScriptedTlsWriteResult::Timeout) => CallOutput::Failed(CallError::Timeout),
@@ -4111,6 +4286,37 @@ where
         Some(CallOutput::TcpRead { bytes })
     }
 
+    pub(crate) fn stream_read_buf_result(
+        &mut self,
+        stream_index: usize,
+        mut buffer: Vec<u8>,
+        max_len: usize,
+    ) -> Option<CallOutput> {
+        let stream = self.streams.get_mut(stream_index)?;
+        if stream.closed {
+            return None;
+        }
+
+        buffer.clear();
+        let read_cap = stream.read_chunk_cap.unwrap_or(max_len);
+        let target_len = max_len.min(read_cap);
+        while buffer.len() < target_len {
+            let Some(mut chunk) = stream.inbound_chunks.pop_front() else {
+                break;
+            };
+            let remaining = target_len - buffer.len();
+            if chunk.len() <= remaining {
+                buffer.extend_from_slice(&chunk);
+            } else {
+                buffer.extend_from_slice(&chunk[..remaining]);
+                chunk.drain(..remaining);
+                stream.inbound_chunks.push_front(chunk);
+            }
+        }
+        let len = buffer.len();
+        Some(CallOutput::TcpReadBuf { buffer, len })
+    }
+
     pub(crate) fn stream_write_result(
         &mut self,
         stream_index: usize,
@@ -4125,6 +4331,22 @@ where
         let count = bytes.len().min(stream.write_cap).min(remaining_capacity);
         stream.output.extend_from_slice(&bytes[..count]);
         Some(CallOutput::TcpWrote { count })
+    }
+
+    pub(crate) fn stream_write_owned_result(
+        &mut self,
+        stream_index: usize,
+        bytes: Vec<u8>,
+    ) -> Option<CallOutput> {
+        let stream = self.streams.get_mut(stream_index)?;
+        if stream.closed {
+            return None;
+        }
+
+        let remaining_capacity = stream.output_capacity.saturating_sub(stream.output.len());
+        let count = bytes.len().min(stream.write_cap).min(remaining_capacity);
+        stream.output.extend_from_slice(&bytes[..count]);
+        Some(CallOutput::TcpWroteOwned { bytes, count })
     }
 
     pub(crate) fn promote_ready_udp_datagrams(&mut self, socket_index: usize) {
@@ -5698,8 +5920,8 @@ pub(crate) fn call_kind(request: &CallInput) -> CallKind {
         CallInput::TcpBind { .. } => CallKind::TcpBind,
         CallInput::TcpAccept { .. } => CallKind::TcpAccept,
         CallInput::TcpConnect { .. } => CallKind::TcpConnect,
-        CallInput::TcpRead { .. } => CallKind::TcpRead,
-        CallInput::TcpWrite { .. } => CallKind::TcpWrite,
+        CallInput::TcpRead { .. } | CallInput::TcpReadBuf { .. } => CallKind::TcpRead,
+        CallInput::TcpWrite { .. } | CallInput::TcpWriteOwned { .. } => CallKind::TcpWrite,
         CallInput::TcpListenerClose { .. } => CallKind::TcpListenerClose,
         CallInput::TcpStreamClose { .. } => CallKind::TcpStreamClose,
         CallInput::UdpBind { .. } => CallKind::UdpBind,
@@ -5711,8 +5933,8 @@ pub(crate) fn call_kind(request: &CallInput) -> CallKind {
         CallInput::TlsBind { .. } => CallKind::TlsBind,
         CallInput::TlsAccept { .. } => CallKind::TlsAccept,
         CallInput::TlsListenerClose { .. } => CallKind::TlsListenerClose,
-        CallInput::TlsRead { .. } => CallKind::TlsRead,
-        CallInput::TlsWrite { .. } => CallKind::TlsWrite,
+        CallInput::TlsRead { .. } | CallInput::TlsReadBuf { .. } => CallKind::TlsRead,
+        CallInput::TlsWrite { .. } | CallInput::TlsWriteOwned { .. } => CallKind::TlsWrite,
         CallInput::TlsClose { .. } => CallKind::TlsClose,
         CallInput::SignalWait { .. } => CallKind::SignalWait,
         CallInput::ProcessRun { .. } => CallKind::ProcessRun,

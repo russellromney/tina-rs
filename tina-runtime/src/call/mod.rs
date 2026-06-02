@@ -742,8 +742,22 @@ impl CallOutput {
     pub fn into_tcp_read(self) -> Result<Vec<u8>, CallError> {
         match self {
             Self::TcpRead { bytes } => Ok(bytes),
+            Self::TcpReadBuf { buffer, len } => Ok(buffer.into_iter().take(len).collect()),
             Self::Failed(error) => Err(error),
             other => Self::panic_wrong_shape("TcpRead", &other),
+        }
+    }
+
+    /// Extracts the successful TCP reusable-buffer read payload.
+    pub fn into_tcp_read_buf(self) -> Result<TcpReadBufReply, CallError> {
+        match self {
+            Self::TcpReadBuf { buffer, len } => Ok(TcpReadBufReply { buffer, len }),
+            Self::TcpRead { bytes } => {
+                let len = bytes.len();
+                Ok(TcpReadBufReply { buffer: bytes, len })
+            }
+            Self::Failed(error) => Err(error),
+            other => Self::panic_wrong_shape("TcpReadBuf", &other),
         }
     }
 
@@ -751,8 +765,21 @@ impl CallOutput {
     pub fn into_tcp_wrote(self) -> Result<usize, CallError> {
         match self {
             Self::TcpWrote { count } => Ok(count),
+            Self::TcpWroteOwned { count, .. } => Ok(count),
             Self::Failed(error) => Err(error),
             other => Self::panic_wrong_shape("TcpWrote", &other),
+        }
+    }
+
+    /// Extracts the successful TCP reusable-buffer write payload.
+    pub fn into_tcp_wrote_owned(self) -> Result<TcpWriteOwnedReply, CallError> {
+        match self {
+            Self::TcpWroteOwned { bytes, count } => Ok(TcpWriteOwnedReply {
+                bytes,
+                written: count,
+            }),
+            Self::Failed(error) => Err(error),
+            other => Self::panic_wrong_shape("TcpWroteOwned", &other),
         }
     }
 
@@ -880,8 +907,22 @@ impl CallOutput {
     pub fn into_tls_read(self) -> Result<Vec<u8>, CallError> {
         match self {
             Self::TlsRead { bytes } => Ok(bytes),
+            Self::TlsReadBuf { buffer, len } => Ok(buffer.into_iter().take(len).collect()),
             Self::Failed(error) => Err(error),
             other => Self::panic_wrong_shape("TlsRead", &other),
+        }
+    }
+
+    /// Extracts the successful TLS reusable-buffer read payload.
+    pub fn into_tls_read_buf(self) -> Result<TlsReadBufReply, CallError> {
+        match self {
+            Self::TlsReadBuf { buffer, len } => Ok(TlsReadBufReply { buffer, len }),
+            Self::TlsRead { bytes } => {
+                let len = bytes.len();
+                Ok(TlsReadBufReply { buffer: bytes, len })
+            }
+            Self::Failed(error) => Err(error),
+            other => Self::panic_wrong_shape("TlsReadBuf", &other),
         }
     }
 
@@ -889,8 +930,21 @@ impl CallOutput {
     pub fn into_tls_wrote(self) -> Result<usize, CallError> {
         match self {
             Self::TlsWrote { count } => Ok(count),
+            Self::TlsWroteOwned { count, .. } => Ok(count),
             Self::Failed(error) => Err(error),
             other => Self::panic_wrong_shape("TlsWrote", &other),
+        }
+    }
+
+    /// Extracts the successful TLS reusable-buffer write payload.
+    pub fn into_tls_wrote_owned(self) -> Result<TlsWriteOwnedReply, CallError> {
+        match self {
+            Self::TlsWroteOwned { bytes, count } => Ok(TlsWriteOwnedReply {
+                bytes,
+                written: count,
+            }),
+            Self::Failed(error) => Err(error),
+            other => Self::panic_wrong_shape("TlsWroteOwned", &other),
         }
     }
 

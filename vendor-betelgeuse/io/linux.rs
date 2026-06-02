@@ -18,7 +18,7 @@ use crate::{
     AcceptCompletion, AcceptOp, CompletionInner, ConnectCompletion, ConnectOp, FsyncCompletion,
     FsyncOp, IO, IOFile, IOLoop, IOSocket, MkdirCompletion, MkdirOp, OpenOptions, Operation,
     PReadCompletion, PReadOp, PWriteCompletion, PWriteOp, RecvCompletion, RecvOp, SendCompletion,
-    SendOp, SizeCompletion, SizeOp,
+    SendOp, SendOwnedCompletion, SizeCompletion, SizeOp,
 };
 
 enum SocketKind {
@@ -111,7 +111,10 @@ impl IoUringIO {
             return false;
         }
         match completion.operation() {
-            Operation::Accept(_) | Operation::Recv(_) | Operation::Send(_) => {
+            Operation::Accept(_)
+            | Operation::Recv(_)
+            | Operation::Send(_)
+            | Operation::SendOwned(_) => {
                 errno == libc::EAGAIN || errno == libc::EWOULDBLOCK || errno == libc::EINTR
             }
             Operation::Connect(_) => errno == libc::EINTR,
@@ -140,7 +143,7 @@ impl IoUringIO {
                     .flags(op.flags)
                     .build()
             }
-            Operation::Send(op) => {
+            Operation::Send(op) | Operation::SendOwned(op) => {
                 opcode::Send::new(types::Fd(op.fd), op.buf.as_ptr(), op.buf.len() as u32)
                     .flags(op.flags)
                     .build()
@@ -218,6 +221,17 @@ impl IoUringIO {
                     Ok(result as usize)
                 };
                 unsafe { SendCompletion::from_inner_mut(c) }.complete(r);
+            }
+            Operation::SendOwned(_) => {
+                let r = if result < 0 {
+                    Err(io_uring_err(result))
+                } else {
+                    let Operation::SendOwned(op) = c.operation_mut() else {
+                        unreachable!()
+                    };
+                    Ok((mem::take(&mut op.buf), result as usize))
+                };
+                unsafe { SendOwnedCompletion::from_inner_mut(c) }.complete(r);
             }
             Operation::PRead(_) => {
                 let r = if result < 0 {
@@ -558,6 +572,15 @@ impl IOSocket for IoUringSocket {
     }
 
     fn recv(&self, c: &mut RecvCompletion, len: usize) -> io::Result<()> {
+        self.recv_buf(c, vec![0_u8; len], len)
+    }
+
+    fn recv_buf(
+        &self,
+        c: &mut RecvCompletion,
+        mut buffer: Vec<u8>,
+        max_len: usize,
+    ) -> io::Result<()> {
         let fd = self
             .fd
             .borrow()
@@ -581,10 +604,11 @@ impl IOSocket for IoUringSocket {
                 ));
             }
         }
+        buffer.resize(max_len, 0);
         let inner = c.inner_mut();
         inner.prepare(Operation::Recv(RecvOp {
             fd,
-            buf: vec![0_u8; len],
+            buf: buffer,
             flags: libc::MSG_DONTWAIT,
         }));
         queue(&self.state, inner);
@@ -617,6 +641,40 @@ impl IOSocket for IoUringSocket {
         }
         let inner = c.inner_mut();
         inner.prepare(Operation::Send(SendOp {
+            fd,
+            buf,
+            flags: libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,
+        }));
+        queue(&self.state, inner);
+        Ok(())
+    }
+
+    fn send_owned(&self, c: &mut SendOwnedCompletion, buf: Vec<u8>) -> io::Result<()> {
+        let fd = self
+            .fd
+            .borrow()
+            .as_ref()
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotConnected, "send called on closed socket")
+            })?
+            .raw();
+        match &*self.kind.borrow() {
+            Some(SocketKind::Stream) => {}
+            Some(SocketKind::Listener) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "send called on listener socket",
+                ));
+            }
+            None => {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotConnected,
+                    "send called on closed socket",
+                ));
+            }
+        }
+        let inner = c.inner_mut();
+        inner.prepare(Operation::SendOwned(SendOp {
             fd,
             buf,
             flags: libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,

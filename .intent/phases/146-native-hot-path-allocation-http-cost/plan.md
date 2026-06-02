@@ -2,12 +2,27 @@
 
 ## Status
 
-- Future implementation plan.
-- Runs after Phase 145.
-- One PR unless the reusable-I/O-buffer API forces a narrow runtime/simulator
-  PR first.
-- Owns native performance rows, runtime TCP/TLS I/O buffer reuse, HTTP/1
-  allocation/copy reduction, and proof that speed did not weaken Tina truth.
+- Implemented in `codex/phase-146-hot-path`.
+- Added owned-buffer TCP/TLS call helpers and driver/simulator support.
+- Migrated native HTTP/1 server, one-shot client, and keepalive client to the
+  owned-buffer read/write path.
+- Removed concrete HTTP encoder string allocations for lengths/chunk framing.
+- Added p90 perf fields and Phase 146 perf history/check defaults.
+- Evidence: `.intent/phases/146-native-hot-path-allocation-http-cost/perf_history.jsonl`.
+
+Open truth after implementation:
+
+- HTTP/1 fixed-body close is much closer to Axum in local rows, but not a
+  production claim.
+- HTTP/1 close and especially keepalive still show real latency cost. The next
+  bottleneck is not the old fresh read buffer/clone-before-write tax; it is
+  worker-turn/scheduling cost plus remaining HTTP allocation shape.
+- Standalone WebSocket client and HTTP/2 still use compatibility read/write
+  helpers. This phase only migrated HTTP/1 server/client/keepalive and the
+  WebSocket server paths inside `HttpConnection`.
+- `TypedCall<T>` still returns `Result<T, CallError>`, so owned buffers return
+  on success. Driver failures do not return the buffer without a broader typed
+  error-envelope migration.
 
 ## Grug Truth
 

@@ -72,7 +72,9 @@ enum PendingKind {
         socket: Option<Box<dyn IOSocket>>,
     },
     Read(Box<RecvCompletion>),
+    ReadBuf(Box<RecvCompletion>),
     Write(Box<SendCompletion>),
+    WriteOwned(Box<SendOwnedCompletion>),
     UdpRecv {
         socket: UdpSocketId,
         max_len: usize,
@@ -174,6 +176,8 @@ impl BetelgeuseTcp {
             | CallInput::TlsBind { .. }
             | CallInput::TlsAccept { .. }
             | CallInput::TlsListenerClose { .. }
+            | CallInput::TlsReadBuf { .. }
+            | CallInput::TlsWriteOwned { .. }
             | CallInput::TlsRead { .. }
             | CallInput::TlsWrite { .. }
             | CallInput::TlsClose { .. } => Some(DriverCompletion {
@@ -391,6 +395,32 @@ impl BetelgeuseTcp {
                     Err(result) => Some(DriverCompletion { call_id, result }),
                 }
             }
+            CallInput::TcpReadBuf {
+                stream,
+                buffer,
+                max_len,
+            } => {
+                let lane = PendingLane::StreamRead(stream);
+                if self.lane_has_pending(lane) {
+                    return Some(DriverCompletion {
+                        call_id,
+                        result: CallOutput::Failed(CallError::ResourceBusy),
+                    });
+                }
+                match self.arm_read_buf(stream, buffer, max_len) {
+                    Ok(pending) => {
+                        self.pending.push(PendingOperation {
+                            call_id,
+                            kind: pending,
+                            lane,
+                            user_cancelled: false,
+                            shutdown_marked: false,
+                        });
+                        None
+                    }
+                    Err(result) => Some(DriverCompletion { call_id, result }),
+                }
+            }
             CallInput::TcpWrite { stream, bytes } => {
                 let lane = PendingLane::StreamWrite(stream);
                 if self.lane_has_pending(lane) {
@@ -400,6 +430,28 @@ impl BetelgeuseTcp {
                     });
                 }
                 match self.arm_write(stream, bytes) {
+                    Ok(pending) => {
+                        self.pending.push(PendingOperation {
+                            call_id,
+                            kind: pending,
+                            lane,
+                            user_cancelled: false,
+                            shutdown_marked: false,
+                        });
+                        None
+                    }
+                    Err(result) => Some(DriverCompletion { call_id, result }),
+                }
+            }
+            CallInput::TcpWriteOwned { stream, bytes } => {
+                let lane = PendingLane::StreamWrite(stream);
+                if self.lane_has_pending(lane) {
+                    return Some(DriverCompletion {
+                        call_id,
+                        result: CallOutput::Failed(CallError::ResourceBusy),
+                    });
+                }
+                match self.arm_write_owned(stream, bytes) {
                     Ok(pending) => {
                         self.pending.push(PendingOperation {
                             call_id,
@@ -670,6 +722,21 @@ impl BetelgeuseTcp {
                     Err(_) => Some(CallOutput::Failed(CallError::Io)),
                 }
             }
+            PendingKind::ReadBuf(completion) => {
+                if !completion.has_result() {
+                    return None;
+                }
+                let result = completion
+                    .take_result()
+                    .expect("recv completion advertised a result");
+                match result {
+                    Ok(buffer) => {
+                        let len = buffer.len();
+                        Some(CallOutput::TcpReadBuf { buffer, len })
+                    }
+                    Err(_) => Some(CallOutput::Failed(CallError::Io)),
+                }
+            }
             PendingKind::Write(completion) => {
                 if !completion.has_result() {
                     return None;
@@ -679,6 +746,18 @@ impl BetelgeuseTcp {
                     .expect("send completion advertised a result");
                 match result {
                     Ok(count) => Some(CallOutput::TcpWrote { count }),
+                    Err(_) => Some(CallOutput::Failed(CallError::Io)),
+                }
+            }
+            PendingKind::WriteOwned(completion) => {
+                if !completion.has_result() {
+                    return None;
+                }
+                let result = completion
+                    .take_result()
+                    .expect("send-owned completion advertised a result");
+                match result {
+                    Ok((bytes, count)) => Some(CallOutput::TcpWroteOwned { bytes, count }),
                     Err(_) => Some(CallOutput::Failed(CallError::Io)),
                 }
             }
@@ -964,6 +1043,28 @@ impl BetelgeuseTcp {
         Ok(PendingKind::Read(completion))
     }
 
+    fn arm_read_buf(
+        &mut self,
+        stream: StreamId,
+        buffer: Vec<u8>,
+        max_len: usize,
+    ) -> Result<PendingKind, CallOutput> {
+        let entry = self
+            .streams
+            .iter()
+            .find(|entry| entry.id == stream)
+            .ok_or(CallOutput::Failed(CallError::InvalidResource))?;
+        let mut completion = Box::new(RecvCompletion::new());
+        if entry
+            .socket
+            .recv_buf(&mut completion, buffer, max_len)
+            .is_err()
+        {
+            return Err(CallOutput::Failed(CallError::Io));
+        }
+        Ok(PendingKind::ReadBuf(completion))
+    }
+
     fn arm_write(&mut self, stream: StreamId, bytes: Vec<u8>) -> Result<PendingKind, CallOutput> {
         let entry = self
             .streams
@@ -975,6 +1076,23 @@ impl BetelgeuseTcp {
             return Err(CallOutput::Failed(CallError::Io));
         }
         Ok(PendingKind::Write(completion))
+    }
+
+    fn arm_write_owned(
+        &mut self,
+        stream: StreamId,
+        bytes: Vec<u8>,
+    ) -> Result<PendingKind, CallOutput> {
+        let entry = self
+            .streams
+            .iter()
+            .find(|entry| entry.id == stream)
+            .ok_or(CallOutput::Failed(CallError::InvalidResource))?;
+        let mut completion = Box::new(SendOwnedCompletion::new());
+        if entry.socket.send_owned(&mut completion, bytes).is_err() {
+            return Err(CallOutput::Failed(CallError::Io));
+        }
+        Ok(PendingKind::WriteOwned(completion))
     }
 
     fn arm_file_read(
@@ -1054,7 +1172,9 @@ impl PendingKind {
             Self::Accept(completion) => completion.has_result(),
             Self::Connect { completion, .. } => completion.has_result(),
             Self::Read(completion) => completion.has_result(),
+            Self::ReadBuf(completion) => completion.has_result(),
             Self::Write(completion) => completion.has_result(),
+            Self::WriteOwned(completion) => completion.has_result(),
             Self::UdpRecv { .. } => false,
             Self::FileRead(completion) => completion.has_result(),
             Self::FileWrite(completion) => completion.has_result(),

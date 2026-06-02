@@ -109,7 +109,7 @@ impl PerfReport {
     /// for alpha consumers.
     pub fn json_line(&self) -> String {
         format!(
-            "{{\"schema\":\"tina.perf_report.v1\",\"label\":{},\"kind\":{},\"comparison_baseline\":{},\"platform\":{},\"arch\":{},\"profile\":{},\"git_sha\":{},\"workers\":{},\"ops\":{},\"ok\":{},\"err\":{},\"timeout\":{},\"p50_us\":{},\"p99_us\":{},\"max_us\":{},\"p50_ns\":{},\"p99_ns\":{},\"max_ns\":{},\"elapsed_ms\":{},\"leak_clean\":{},\"pressure_total\":{},\"pressure_rate_per_mille\":{},\"surfaces\":{},\"unavailable_surfaces\":{},\"allocation_scope\":{},\"allocations\":{},\"allocated_bytes\":{}}}",
+            "{{\"schema\":\"tina.perf_report.v1\",\"label\":{},\"kind\":{},\"comparison_baseline\":{},\"platform\":{},\"arch\":{},\"profile\":{},\"git_sha\":{},\"workers\":{},\"ops\":{},\"ok\":{},\"err\":{},\"timeout\":{},\"p50_us\":{},\"p90_us\":{},\"p99_us\":{},\"max_us\":{},\"p50_ns\":{},\"p90_ns\":{},\"p99_ns\":{},\"max_ns\":{},\"elapsed_ms\":{},\"leak_clean\":{},\"pressure_total\":{},\"pressure_rate_per_mille\":{},\"surfaces\":{},\"unavailable_surfaces\":{},\"allocation_scope\":{},\"allocations\":{},\"allocated_bytes\":{}}}",
             json_string(self.label),
             json_string(self.kind),
             json_string(self.comparison_baseline),
@@ -123,9 +123,11 @@ impl PerfReport {
             self.load.ops_err,
             self.load.ops_timeout,
             self.load.latency_p50_us,
+            self.load.latency_p90_us,
             self.load.latency_p99_us,
             self.load.latency_max_us,
             self.load.latency_p50_ns,
+            self.load.latency_p90_ns,
             self.load.latency_p99_ns,
             self.load.latency_max_ns,
             self.load.elapsed_ms,
@@ -231,9 +233,16 @@ impl PerfComparisonReport {
         )
     }
 
+    pub fn p90_ratio_per_mille(&self) -> Option<u64> {
+        ratio_per_mille(
+            self.tina.load.latency_p90_ns,
+            self.baseline.load.latency_p90_ns,
+        )
+    }
+
     pub fn summary_line(&self) -> String {
         format!(
-            "perf-compare label={} semantic_match={} mismatch_reason={} samples={} sample_policy={} tina_p50_us={} baseline_p50_us={} tina_p50_ns={} baseline_p50_ns={} p50_ratio_per_mille={} tina_p99_us={} baseline_p99_us={} tina_p99_ns={} baseline_p99_ns={} p99_ratio_per_mille={} tina_allocations={} baseline_allocations={} tina_allocated_bytes={} baseline_allocated_bytes={} tina_pressure={} baseline_pressure={} tina_leak_clean={} baseline_leak_clean={}",
+            "perf-compare label={} semantic_match={} mismatch_reason={} samples={} sample_policy={} tina_p50_us={} baseline_p50_us={} tina_p50_ns={} baseline_p50_ns={} p50_ratio_per_mille={} tina_p90_us={} baseline_p90_us={} tina_p90_ns={} baseline_p90_ns={} p90_ratio_per_mille={} tina_p99_us={} baseline_p99_us={} tina_p99_ns={} baseline_p99_ns={} p99_ratio_per_mille={} tina_allocations={} baseline_allocations={} tina_allocated_bytes={} baseline_allocated_bytes={} tina_pressure={} baseline_pressure={} tina_leak_clean={} baseline_leak_clean={}",
             report_value(self.label),
             self.semantic_match.as_str(),
             report_value(self.mismatch_reason),
@@ -244,6 +253,13 @@ impl PerfComparisonReport {
             self.tina.load.latency_p50_ns,
             self.baseline.load.latency_p50_ns,
             self.ratio_per_mille()
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "none".to_string()),
+            self.tina.load.latency_p90_us,
+            self.baseline.load.latency_p90_us,
+            self.tina.load.latency_p90_ns,
+            self.baseline.load.latency_p90_ns,
+            self.p90_ratio_per_mille()
                 .map(|value| value.to_string())
                 .unwrap_or_else(|| "none".to_string()),
             self.tina.load.latency_p99_us,
@@ -269,7 +285,7 @@ impl PerfComparisonReport {
 
     pub fn json_line(&self) -> String {
         format!(
-            "{{\"schema\":\"tina.perf_compare.v1\",\"label\":{},\"semantic_match\":{},\"mismatch_reason\":{},\"samples\":{},\"sample_policy\":{},\"tina_p50_us\":{},\"baseline_p50_us\":{},\"tina_p50_ns\":{},\"baseline_p50_ns\":{},\"p50_ratio_per_mille\":{},\"tina_p99_us\":{},\"baseline_p99_us\":{},\"tina_p99_ns\":{},\"baseline_p99_ns\":{},\"p99_ratio_per_mille\":{},\"tina_allocations\":{},\"baseline_allocations\":{},\"tina_allocated_bytes\":{},\"baseline_allocated_bytes\":{},\"tina_pressure\":{},\"baseline_pressure\":{},\"tina_leak_clean\":{},\"baseline_leak_clean\":{}}}",
+            "{{\"schema\":\"tina.perf_compare.v1\",\"label\":{},\"semantic_match\":{},\"mismatch_reason\":{},\"samples\":{},\"sample_policy\":{},\"tina_p50_us\":{},\"baseline_p50_us\":{},\"tina_p50_ns\":{},\"baseline_p50_ns\":{},\"p50_ratio_per_mille\":{},\"tina_p90_us\":{},\"baseline_p90_us\":{},\"tina_p90_ns\":{},\"baseline_p90_ns\":{},\"p90_ratio_per_mille\":{},\"tina_p99_us\":{},\"baseline_p99_us\":{},\"tina_p99_ns\":{},\"baseline_p99_ns\":{},\"p99_ratio_per_mille\":{},\"tina_allocations\":{},\"baseline_allocations\":{},\"tina_allocated_bytes\":{},\"baseline_allocated_bytes\":{},\"tina_pressure\":{},\"baseline_pressure\":{},\"tina_leak_clean\":{},\"baseline_leak_clean\":{}}}",
             json_string(self.label),
             json_string(self.semantic_match.as_str()),
             json_string(self.mismatch_reason),
@@ -280,6 +296,13 @@ impl PerfComparisonReport {
             self.tina.load.latency_p50_ns,
             self.baseline.load.latency_p50_ns,
             self.ratio_per_mille()
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "null".to_string()),
+            self.tina.load.latency_p90_us,
+            self.baseline.load.latency_p90_us,
+            self.tina.load.latency_p90_ns,
+            self.baseline.load.latency_p90_ns,
+            self.p90_ratio_per_mille()
                 .map(|value| value.to_string())
                 .unwrap_or_else(|| "null".to_string()),
             self.tina.load.latency_p99_us,

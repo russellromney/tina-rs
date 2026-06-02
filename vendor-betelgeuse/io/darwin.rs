@@ -17,7 +17,7 @@ use crate::{
     AcceptCompletion, AcceptOp, CompletionInner, ConnectCompletion, ConnectOp, FsyncCompletion,
     FsyncOp, IO, IOFile, IOLoop, IOSocket, MkdirCompletion, MkdirOp, OpenOptions, Operation,
     PReadCompletion, PReadOp, PWriteCompletion, PWriteOp, RecvCompletion, RecvOp, SendCompletion,
-    SendOp, SizeCompletion, SizeOp,
+    SendOp, SendOwnedCompletion, SizeCompletion, SizeOp,
 };
 
 enum SocketKind {
@@ -426,6 +426,15 @@ impl IOSocket for DarwinSocket {
     }
 
     fn recv(&self, c: &mut RecvCompletion, len: usize) -> io::Result<()> {
+        self.recv_buf(c, vec![0_u8; len], len)
+    }
+
+    fn recv_buf(
+        &self,
+        c: &mut RecvCompletion,
+        mut buffer: Vec<u8>,
+        max_len: usize,
+    ) -> io::Result<()> {
         let fd = self
             .fd
             .borrow()
@@ -450,10 +459,11 @@ impl IOSocket for DarwinSocket {
             }
         }
 
+        buffer.resize(max_len, 0);
         let inner = c.inner_mut();
         inner.prepare(Operation::Recv(RecvOp {
             fd,
-            buf: vec![0_u8; len],
+            buf: buffer,
             flags: libc::MSG_DONTWAIT,
         }));
         queue(&self.state, inner);
@@ -487,6 +497,41 @@ impl IOSocket for DarwinSocket {
 
         let inner = c.inner_mut();
         inner.prepare(Operation::Send(SendOp {
+            fd,
+            buf,
+            flags: libc::MSG_DONTWAIT,
+        }));
+        queue(&self.state, inner);
+        Ok(())
+    }
+
+    fn send_owned(&self, c: &mut SendOwnedCompletion, buf: Vec<u8>) -> io::Result<()> {
+        let fd = self
+            .fd
+            .borrow()
+            .as_ref()
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotConnected, "send called on closed socket")
+            })?
+            .raw();
+        match &*self.kind.borrow() {
+            Some(SocketKind::Stream) => {}
+            Some(SocketKind::Listener) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "send called on listener socket",
+                ));
+            }
+            None => {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotConnected,
+                    "send called on closed socket",
+                ));
+            }
+        }
+
+        let inner = c.inner_mut();
+        inner.prepare(Operation::SendOwned(SendOp {
             fd,
             buf,
             flags: libc::MSG_DONTWAIT,
@@ -714,6 +759,9 @@ fn fail_completion(c: &mut CompletionInner, err: io::Error) {
         },
         Operation::Recv(_) => unsafe { RecvCompletion::from_inner_mut(c) }.complete(Err(err)),
         Operation::Send(_) => unsafe { SendCompletion::from_inner_mut(c) }.complete(Err(err)),
+        Operation::SendOwned(_) => unsafe {
+            SendOwnedCompletion::from_inner_mut(c).complete(Err(err));
+        },
         Operation::PRead(_) => unsafe { PReadCompletion::from_inner_mut(c) }.complete(Err(err)),
         Operation::PWrite(_) => unsafe { PWriteCompletion::from_inner_mut(c) }.complete(Err(err)),
         Operation::Fsync(_) => unsafe { FsyncCompletion::from_inner_mut(c) }.complete(Err(err)),
@@ -728,7 +776,7 @@ fn operation_fd_filter(op: &Operation) -> io::Result<(RawFd, i16)> {
         Operation::Accept(op) => Ok((op.fd, libc::EVFILT_READ)),
         Operation::Connect(op) => Ok((op.fd, libc::EVFILT_WRITE)),
         Operation::Recv(op) => Ok((op.fd, libc::EVFILT_READ)),
-        Operation::Send(op) => Ok((op.fd, libc::EVFILT_WRITE)),
+        Operation::Send(op) | Operation::SendOwned(op) => Ok((op.fd, libc::EVFILT_WRITE)),
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "operation cannot be watched by kqueue",
@@ -884,6 +932,29 @@ fn execute_completion(state: &Rc<RefCell<DarwinState>>, c: &mut CompletionInner)
                 }
             };
             unsafe { SendCompletion::from_inner_mut(c) }.complete(result);
+            PollResult::Done
+        }
+        Operation::SendOwned(_) => {
+            let result = {
+                let Operation::SendOwned(op) = c.operation_mut() else {
+                    unreachable!()
+                };
+                let rc =
+                    unsafe { libc::send(op.fd, op.buf.as_ptr().cast(), op.buf.len(), op.flags) };
+                if rc < 0 {
+                    let err = io::Error::last_os_error();
+                    if err.kind() == io::ErrorKind::WouldBlock {
+                        return PollResult::Wait;
+                    }
+                    if err.raw_os_error() == Some(libc::EINTR) {
+                        return PollResult::Retry;
+                    }
+                    Err(err)
+                } else {
+                    Ok((mem::take(&mut op.buf), rc as usize))
+                }
+            };
+            unsafe { SendOwnedCompletion::from_inner_mut(c) }.complete(result);
             PollResult::Done
         }
         Operation::PRead(_) => {

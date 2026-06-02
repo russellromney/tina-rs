@@ -37,9 +37,10 @@ use tina::{IsolateId, Mailbox, RestartBudget, RestartPolicy, TrySendError, prelu
 use tina_runtime::{
     CallCompletionRejectedReason, CallError, CallInput, CallKind, FileId, ListenerId,
     MailboxFactory, Runtime, RuntimeCall, RuntimeEvent, RuntimeEventKind, StreamId,
-    ThreadedRuntime, ThreadedRuntimeConfig, ThreadedSendObservedError, ThreadedTrySendError,
-    file_close, file_create, file_fsync, file_read, file_size, file_write, mkdir, tcp_accept,
-    tcp_bind, tcp_close_listener, tcp_close_stream, tcp_connect, tcp_read, tcp_write,
+    TcpReadBufReply, TcpWriteOwnedReply, ThreadedRuntime, ThreadedRuntimeConfig,
+    ThreadedSendObservedError, ThreadedTrySendError, file_close, file_create, file_fsync,
+    file_read, file_size, file_write, mkdir, tcp_accept, tcp_bind, tcp_close_listener,
+    tcp_close_stream, tcp_connect, tcp_read, tcp_read_buf, tcp_write, tcp_write_owned,
 };
 use tina_supervisor::SupervisorConfig;
 
@@ -110,6 +111,7 @@ impl MailboxFactory for TestMailboxFactory {
 type BoundAddr = Arc<Mutex<Option<SocketAddr>>>;
 type ClientObserved = Arc<Mutex<Option<Vec<u8>>>>;
 type FileObserved = Arc<Mutex<Option<(u64, Vec<u8>)>>>;
+type OwnedClientObserved = Arc<Mutex<Option<OwnedClientReport>>>;
 
 // ---------------------------------------------------------------------------
 // Connection handler isolate. One per accepted connection.
@@ -256,6 +258,82 @@ impl Isolate for OutboundClient {
             | OutboundClientEvent::Wrote(Err(_))
             | OutboundClientEvent::Read(Err(_))
             | OutboundClientEvent::Closed(Err(_)) => stop(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OwnedClientReport {
+    wrote: usize,
+    returned_write_bytes: Vec<u8>,
+    read_len: usize,
+    returned_read_prefix: Vec<u8>,
+    returned_read_capacity: usize,
+}
+
+#[derive(Debug, Clone)]
+enum OwnedClientEvent {
+    Start(SocketAddr),
+    Connected(Result<(StreamId, SocketAddr, SocketAddr), CallError>),
+    Wrote(Result<TcpWriteOwnedReply, CallError>),
+    Read(Result<TcpReadBufReply, CallError>),
+    Closed(Result<(), CallError>),
+}
+
+#[derive(Debug)]
+struct OwnedBufferClient {
+    payload: Vec<u8>,
+    stream: Option<StreamId>,
+    wrote: Option<(usize, Vec<u8>)>,
+    observed: OwnedClientObserved,
+}
+
+impl Isolate for OwnedBufferClient {
+    tina::isolate_types! {
+        message: OwnedClientEvent,
+        reply: (),
+        send: Outbound<Infallible>,
+        spawn: Infallible,
+        call: RuntimeCall<OwnedClientEvent>,
+        shard: TestShard,
+    }
+
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
+        match msg {
+            OwnedClientEvent::Start(addr) => tcp_connect(addr).then(OwnedClientEvent::Connected),
+            OwnedClientEvent::Connected(Ok((stream, _local_addr, _peer_addr))) => {
+                self.stream = Some(stream);
+                tcp_write_owned(stream, std::mem::take(&mut self.payload))
+                    .then(OwnedClientEvent::Wrote)
+            }
+            OwnedClientEvent::Wrote(Ok(reply)) => {
+                let stream = self.stream.expect("stream set after connect");
+                self.wrote = Some((reply.written, reply.bytes));
+                let scratch = Vec::with_capacity(128);
+                tcp_read_buf(stream, scratch, 64).then(OwnedClientEvent::Read)
+            }
+            OwnedClientEvent::Read(Ok(reply)) => {
+                let stream = self.stream.expect("stream set after connect");
+                let (wrote, returned_write_bytes) =
+                    self.wrote.take().expect("write completed before read");
+                *self.observed.lock().expect("observed mutex") = Some(OwnedClientReport {
+                    wrote,
+                    returned_write_bytes,
+                    read_len: reply.len,
+                    returned_read_prefix: reply.buffer[..reply.len].to_vec(),
+                    returned_read_capacity: reply.buffer.capacity(),
+                });
+                tcp_close_stream(stream).then(OwnedClientEvent::Closed)
+            }
+            OwnedClientEvent::Closed(Ok(())) => stop(),
+            OwnedClientEvent::Connected(Err(_))
+            | OwnedClientEvent::Wrote(Err(_))
+            | OwnedClientEvent::Read(Err(_))
+            | OwnedClientEvent::Closed(Err(_)) => stop(),
         }
     }
 }
@@ -961,6 +1039,73 @@ fn tcp_connect_client_round_trips_against_local_server() {
         observed.lock().expect("observed mutex").as_deref(),
         Some(&b"pong"[..])
     );
+    assert_eq!(
+        count_call_completed(runtime.trace(), CallKind::TcpConnect),
+        1
+    );
+    assert_eq!(count_call_completed(runtime.trace(), CallKind::TcpWrite), 1);
+    assert_eq!(count_call_completed(runtime.trace(), CallKind::TcpRead), 1);
+    assert_eq!(
+        count_call_completed(runtime.trace(), CallKind::TcpStreamClose),
+        1
+    );
+}
+
+#[test]
+fn tcp_owned_buffer_helpers_return_buffer_ownership() {
+    let server = TcpListener::bind("127.0.0.1:0").expect("bind local server");
+    let server_addr = server.local_addr().expect("server local addr");
+    let server_thread = thread::spawn(move || {
+        let (mut stream, _) = server.accept().expect("server accepts tina client");
+        let mut request = [0_u8; 4];
+        stream
+            .read_exact(&mut request)
+            .expect("server reads request");
+        assert_eq!(&request, b"ping");
+        stream.write_all(b"pong").expect("server writes reply");
+    });
+
+    let observed: OwnedClientObserved = Arc::new(Mutex::new(None));
+    let mut runtime = Runtime::new(TestShard, TestMailboxFactory);
+    let client = runtime.register(
+        OwnedBufferClient {
+            payload: b"ping".to_vec(),
+            stream: None,
+            wrote: None,
+            observed: Arc::clone(&observed),
+        },
+        TestMailbox::new(8),
+    );
+
+    runtime
+        .try_send(client, OwnedClientEvent::Start(server_addr))
+        .expect("client bootstrap accepts");
+
+    step_until(
+        &mut runtime,
+        Duration::from_secs(5),
+        "owned-buffer tcp client",
+        |runtime| {
+            observed.lock().expect("observed mutex").is_some()
+                && !runtime.has_in_flight_calls()
+                && runtime.trace().iter().any(|event| {
+                    event.isolate() == client.isolate()
+                        && matches!(event.kind(), RuntimeEventKind::IsolateStopped)
+                })
+        },
+    );
+
+    server_thread.join().expect("server thread joins");
+    let report = observed
+        .lock()
+        .expect("observed mutex")
+        .clone()
+        .expect("owned helper report");
+    assert_eq!(report.wrote, 4);
+    assert_eq!(report.returned_write_bytes, b"ping");
+    assert_eq!(report.read_len, 4);
+    assert_eq!(report.returned_read_prefix, b"pong");
+    assert!(report.returned_read_capacity >= 128);
     assert_eq!(
         count_call_completed(runtime.trace(), CallKind::TcpConnect),
         1

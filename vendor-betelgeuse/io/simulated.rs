@@ -22,6 +22,7 @@ use std::{
 use crate::{
     AcceptCompletion, AcceptOp, ConnectCompletion, ConnectOp, IO, IOFile, IOLoop, IOLoopHandle,
     IOSocket, OpenOptions, Operation, RecvCompletion, RecvOp, SendCompletion, SendOp,
+    SendOwnedCompletion,
 };
 
 /// Deterministic simulated I/O backend configuration.
@@ -266,10 +267,17 @@ enum SimulatedPendingOp {
     Recv {
         socket_id: i32,
         len: usize,
+        buffer: Vec<u8>,
         completion: usize,
         delay: Option<u64>,
     },
     Send {
+        socket_id: i32,
+        bytes: Vec<u8>,
+        completion: usize,
+        delay: Option<u64>,
+    },
+    SendOwned {
         socket_id: i32,
         bytes: Vec<u8>,
         completion: usize,
@@ -401,6 +409,15 @@ impl IOSocket for SimulatedSocket {
     }
 
     fn recv(&self, c: &mut RecvCompletion, len: usize) -> io::Result<()> {
+        self.recv_buf(c, vec![0_u8; len], len)
+    }
+
+    fn recv_buf(
+        &self,
+        c: &mut RecvCompletion,
+        mut buffer: Vec<u8>,
+        max_len: usize,
+    ) -> io::Result<()> {
         let state = self.state.lock().expect("simulated io mutex");
         let socket_id = *self.socket_id.lock().expect("socket id mutex");
         let socket = state
@@ -414,9 +431,10 @@ impl IOSocket for SimulatedSocket {
             ));
         }
         drop(state);
+        buffer.resize(max_len, 0);
         c.inner_mut().prepare(Operation::Recv(RecvOp {
             fd: socket_id,
-            buf: vec![0_u8; len],
+            buf: buffer.clone(),
             flags: 0,
         }));
         self.state
@@ -425,7 +443,8 @@ impl IOSocket for SimulatedSocket {
             .pending
             .push_back(SimulatedPendingOp::Recv {
                 socket_id,
-                len,
+                len: max_len,
+                buffer,
                 completion: c as *mut RecvCompletion as usize,
                 delay: None,
             });
@@ -459,6 +478,38 @@ impl IOSocket for SimulatedSocket {
                 socket_id,
                 bytes: buf,
                 completion: c as *mut SendCompletion as usize,
+                delay: None,
+            });
+        Ok(())
+    }
+
+    fn send_owned(&self, c: &mut SendOwnedCompletion, buf: Vec<u8>) -> io::Result<()> {
+        let state = self.state.lock().expect("simulated io mutex");
+        let socket_id = *self.socket_id.lock().expect("socket id mutex");
+        let socket = state
+            .sockets
+            .get(&socket_id)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "stream missing"))?;
+        if socket.closed || !matches!(socket.kind, SimulatedSocketKind::Stream) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "send requires open stream",
+            ));
+        }
+        drop(state);
+        c.inner_mut().prepare(Operation::SendOwned(SendOp {
+            fd: socket_id,
+            buf: buf.clone(),
+            flags: 0,
+        }));
+        self.state
+            .lock()
+            .expect("simulated io mutex")
+            .pending
+            .push_back(SimulatedPendingOp::SendOwned {
+                socket_id,
+                bytes: buf,
+                completion: c as *mut SendOwnedCompletion as usize,
                 delay: None,
             });
         Ok(())
@@ -574,7 +625,8 @@ impl SimulatedPendingOp {
             Self::Connect { delay, .. }
             | Self::Accept { delay, .. }
             | Self::Recv { delay, .. }
-            | Self::Send { delay, .. } => delay,
+            | Self::Send { delay, .. }
+            | Self::SendOwned { delay, .. } => delay,
         }
     }
 
@@ -656,7 +708,12 @@ impl SimulatedPendingOp {
                 let stream_id = listener.backlog.pop_front()?;
                 Some(SimulatedReadyResult::Accept(Ok(stream_id)))
             }
-            Self::Recv { socket_id, len, .. } => {
+            Self::Recv {
+                socket_id,
+                len,
+                buffer,
+                ..
+            } => {
                 let Some(stream) = state.sockets.get_mut(socket_id) else {
                     return Some(SimulatedReadyResult::Recv(Err(io::Error::new(
                         io::ErrorKind::NotConnected,
@@ -673,8 +730,9 @@ impl SimulatedPendingOp {
                     return None;
                 }
                 let count = (*len).min(stream.inbound.len());
-                let bytes = stream.inbound.drain(..count).collect();
-                Some(SimulatedReadyResult::Recv(Ok(bytes)))
+                buffer.clear();
+                buffer.extend(stream.inbound.drain(..count));
+                Some(SimulatedReadyResult::Recv(Ok(std::mem::take(buffer))))
             }
             Self::Send {
                 socket_id, bytes, ..
@@ -712,6 +770,45 @@ impl SimulatedPendingOp {
                 }
                 Some(SimulatedReadyResult::Send(Ok(count)))
             }
+            Self::SendOwned {
+                socket_id, bytes, ..
+            } => {
+                let max_count = state.config.max_send_chunk.unwrap_or(bytes.len());
+                let Some(stream) = state.sockets.get_mut(socket_id) else {
+                    return Some(SimulatedReadyResult::SendOwned(Err(io::Error::new(
+                        io::ErrorKind::NotConnected,
+                        "stream missing",
+                    ))));
+                };
+                if stream.closed {
+                    return Some(SimulatedReadyResult::SendOwned(Err(io::Error::new(
+                        io::ErrorKind::NotConnected,
+                        "stream closed",
+                    ))));
+                }
+                let count = max_count.min(bytes.len());
+                if let Some(peer_stream_id) = stream.peer_stream_id {
+                    let Some(peer) = state.sockets.get_mut(&peer_stream_id) else {
+                        return Some(SimulatedReadyResult::SendOwned(Err(io::Error::new(
+                            io::ErrorKind::NotConnected,
+                            "peer stream missing",
+                        ))));
+                    };
+                    if peer.closed {
+                        return Some(SimulatedReadyResult::SendOwned(Err(io::Error::new(
+                            io::ErrorKind::NotConnected,
+                            "peer stream closed",
+                        ))));
+                    }
+                    peer.inbound.extend(bytes[..count].iter().copied());
+                } else {
+                    stream.peer_output.extend_from_slice(&bytes[..count]);
+                }
+                Some(SimulatedReadyResult::SendOwned(Ok((
+                    std::mem::take(bytes),
+                    count,
+                ))))
+            }
         }
     }
 
@@ -731,7 +828,7 @@ impl SimulatedPendingOp {
                 }
                 _ => true,
             },
-            Self::Send { .. } => true,
+            Self::Send { .. } | Self::SendOwned { .. } => true,
         }
     }
 
@@ -756,6 +853,9 @@ impl SimulatedPendingOp {
             (Self::Send { completion, .. }, SimulatedReadyResult::Send(result)) => unsafe {
                 (&mut *(completion as *mut SendCompletion)).complete(result);
             },
+            (Self::SendOwned { completion, .. }, SimulatedReadyResult::SendOwned(result)) => unsafe {
+                (&mut *(completion as *mut SendOwnedCompletion)).complete(result);
+            },
             _ => unreachable!("pending op and ready result mismatch"),
         }
     }
@@ -775,6 +875,9 @@ impl SimulatedPendingOp {
             Self::Send { completion, .. } => unsafe {
                 (&mut *(completion as *mut SendCompletion)).complete(Err(error()));
             },
+            Self::SendOwned { completion, .. } => unsafe {
+                (&mut *(completion as *mut SendOwnedCompletion)).complete(Err(error()));
+            },
         }
     }
 }
@@ -784,6 +887,7 @@ enum SimulatedReadyResult {
     Accept(io::Result<i32>),
     Recv(io::Result<Vec<u8>>),
     Send(io::Result<usize>),
+    SendOwned(io::Result<(Vec<u8>, usize)>),
 }
 
 fn mix(mut value: u64) -> u64 {

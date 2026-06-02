@@ -20,8 +20,9 @@ use http::header::HOST;
 use tina::prelude::*;
 use tina::{CallContext, RequestContext, reply_to_request};
 use tina_runtime::{
-    CallError, StreamId, TlsStreamId, sleep, tcp_close_stream, tcp_connect, tcp_read, tcp_write,
-    tls_close, tls_connect, tls_read, tls_write,
+    CallError, StreamId, TcpReadBufReply, TcpWriteOwnedReply, TlsReadBufReply, TlsStreamId,
+    TlsWriteOwnedReply, sleep, tcp_close_stream, tcp_connect, tcp_read_buf, tcp_write_owned,
+    tls_close, tls_connect, tls_read_buf, tls_write_owned,
 };
 
 use crate::parse::{
@@ -57,8 +58,8 @@ pub enum HttpClientMsg {
     Call(Box<OutboundCall>),
     Connected(Result<(StreamId, SocketAddr, SocketAddr), CallError>),
     TlsConnected(Result<TlsStreamId, CallError>),
-    Wrote(Result<usize, CallError>),
-    Read(Result<Vec<u8>, CallError>),
+    Wrote(Result<TcpWriteOwnedReply, CallError>),
+    Read(Result<TcpReadBufReply, CallError>),
     Closed(Result<(), CallError>),
     Deadline(Result<(), CallError>),
 }
@@ -88,6 +89,7 @@ struct ActiveCall {
     request_bytes: Vec<u8>,
     transport: Option<HttpTransport>,
     pending_write: Vec<u8>,
+    read_scratch: Vec<u8>,
     read_buf: Vec<u8>,
     parsed_head: Option<HttpResponseHead>,
     head_len: usize,
@@ -144,7 +146,7 @@ impl<S: Shard + 'static> Isolate for HttpClient<S> {
                     return tcp_close_stream(stream).then(HttpClientMsg::Closed);
                 };
                 state.transport = Some(HttpTransport::Tcp(stream));
-                state.pending_write = state.request_bytes.clone();
+                state.pending_write = std::mem::take(&mut state.request_bytes);
                 self.write_more()
             }
             HttpClientMsg::Connected(Err(_)) => self.fail(HttpClientError::Connect),
@@ -155,7 +157,7 @@ impl<S: Shard + 'static> Isolate for HttpClient<S> {
                         .then(HttpClientMsg::Closed);
                 };
                 state.transport = Some(HttpTransport::Tls(stream));
-                state.pending_write = state.request_bytes.clone();
+                state.pending_write = std::mem::take(&mut state.request_bytes);
                 self.write_more()
             }
             HttpClientMsg::TlsConnected(Err(source)) => self.fail(HttpClientError::Transport {
@@ -163,14 +165,14 @@ impl<S: Shard + 'static> Isolate for HttpClient<S> {
                 source,
             }),
 
-            HttpClientMsg::Wrote(Ok(count)) => self.handle_wrote(count),
+            HttpClientMsg::Wrote(Ok(reply)) => self.handle_wrote(reply),
             HttpClientMsg::Wrote(Err(source)) => self.fail(self.transport_or_flat_error(
                 HttpTransportPhase::Write,
                 source,
                 HttpClientError::Write,
             )),
 
-            HttpClientMsg::Read(Ok(bytes)) => self.handle_bytes_read(bytes),
+            HttpClientMsg::Read(Ok(reply)) => self.handle_read_reply(reply),
             HttpClientMsg::Read(Err(source)) => self.fail(self.transport_or_flat_error(
                 HttpTransportPhase::Read,
                 source,
@@ -230,6 +232,7 @@ impl<S: Shard + 'static> HttpClient<S> {
             request_bytes,
             transport: None,
             pending_write: Vec::new(),
+            read_scratch: Vec::with_capacity(READ_CHUNK),
             read_buf: Vec::new(),
             parsed_head: None,
             head_len: 0,
@@ -272,49 +275,66 @@ impl<S: Shard + 'static> HttpClient<S> {
     }
 
     fn write_more(&mut self) -> Effect<Self> {
-        let state = self.state.as_ref().expect("state present during write");
+        let state = self.state.as_mut().expect("state present during write");
         let transport = state.transport.expect("transport set before write");
-        let bytes = state.pending_write.clone();
+        let bytes = std::mem::take(&mut state.pending_write);
         match transport {
-            HttpTransport::Tcp(stream) => tcp_write(stream, bytes).then(HttpClientMsg::Wrote),
+            HttpTransport::Tcp(stream) => tcp_write_owned(stream, bytes).then(HttpClientMsg::Wrote),
             HttpTransport::Tls(stream) => {
-                tls_write(stream, bytes, self.config.request_timeout).then(HttpClientMsg::Wrote)
+                tls_write_owned(stream, bytes, self.config.request_timeout)
+                    .then(|result| HttpClientMsg::Wrote(result.map(tls_write_reply_to_tcp)))
             }
         }
     }
 
-    fn handle_wrote(&mut self, count: usize) -> Effect<Self> {
+    fn handle_wrote(&mut self, reply: TcpWriteOwnedReply) -> Effect<Self> {
+        let TcpWriteOwnedReply {
+            mut bytes,
+            written: count,
+        } = reply;
         let Some(state) = self.state.as_mut() else {
             return noop();
         };
         if count == 0 {
+            state.pending_write = bytes;
             return self.fail(HttpClientError::Write);
         }
-        if count >= state.pending_write.len() {
-            state.pending_write.clear();
+        if count >= bytes.len() {
             self.read_more()
         } else {
-            state.pending_write.drain(..count);
+            bytes.drain(..count);
+            state.pending_write = bytes;
             self.write_more()
         }
     }
 
     fn read_more(&mut self) -> Effect<Self> {
-        let state = self.state.as_ref().expect("state present during read");
+        let state = self.state.as_mut().expect("state present during read");
         let transport = state.transport.expect("transport set before read");
+        let buffer = std::mem::take(&mut state.read_scratch);
         match transport {
-            HttpTransport::Tcp(stream) => tcp_read(stream, READ_CHUNK).then(HttpClientMsg::Read),
+            HttpTransport::Tcp(stream) => {
+                tcp_read_buf(stream, buffer, READ_CHUNK).then(HttpClientMsg::Read)
+            }
             HttpTransport::Tls(stream) => {
-                tls_read(stream, READ_CHUNK, self.config.request_timeout).then(HttpClientMsg::Read)
+                tls_read_buf(stream, buffer, READ_CHUNK, self.config.request_timeout)
+                    .then(|result| HttpClientMsg::Read(result.map(tls_read_reply_to_tcp)))
             }
         }
     }
 
-    fn handle_bytes_read(&mut self, bytes: Vec<u8>) -> Effect<Self> {
+    fn handle_read_reply(&mut self, reply: TcpReadBufReply) -> Effect<Self> {
+        let TcpReadBufReply { buffer, len } = reply;
+        self.handle_bytes_read(buffer, len)
+    }
+
+    fn handle_bytes_read(&mut self, mut buffer: Vec<u8>, len: usize) -> Effect<Self> {
         let Some(state) = self.state.as_mut() else {
             return noop();
         };
-        if bytes.is_empty() {
+        if len == 0 {
+            buffer.clear();
+            state.read_scratch = buffer;
             // Peer closed: succeed if body is complete, else fail.
             return if state.parsed_head.is_some() && body_complete(state) {
                 self.deliver_success()
@@ -322,7 +342,9 @@ impl<S: Shard + 'static> HttpClient<S> {
                 self.fail(HttpClientError::Closed)
             };
         }
-        state.read_buf.extend_from_slice(&bytes);
+        state.read_buf.extend_from_slice(&buffer[..len]);
+        buffer.clear();
+        state.read_scratch = buffer;
 
         if state.parsed_head.is_none() {
             match parse_response_head(&state.read_buf, &self.config.limits) {
@@ -431,6 +453,20 @@ fn body_complete(state: &ActiveCall) -> bool {
     } else {
         let needed = state.head_len + head.content_length;
         state.read_buf.len() >= needed
+    }
+}
+
+fn tls_read_reply_to_tcp(reply: TlsReadBufReply) -> TcpReadBufReply {
+    TcpReadBufReply {
+        buffer: reply.buffer,
+        len: reply.len,
+    }
+}
+
+fn tls_write_reply_to_tcp(reply: TlsWriteOwnedReply) -> TcpWriteOwnedReply {
+    TcpWriteOwnedReply {
+        bytes: reply.bytes,
+        written: reply.written,
     }
 }
 

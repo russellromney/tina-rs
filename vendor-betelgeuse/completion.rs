@@ -2,7 +2,7 @@
 //!
 //! There is one concrete completion type per operation kind:
 //! [`AcceptCompletion`], [`ConnectCompletion`], [`RecvCompletion`], [`SendCompletion`],
-//! [`PReadCompletion`], [`PWriteCompletion`], [`FsyncCompletion`],
+//! [`SendOwnedCompletion`], [`PReadCompletion`], [`PWriteCompletion`], [`FsyncCompletion`],
 //! [`SizeCompletion`], [`MkdirCompletion`]. Each is a thin wrapper around
 //! [`CompletionInner`] (the shared state machine and operation slot) and
 //! carries its own typed result.
@@ -126,6 +126,11 @@ define_completion!(
 define_completion!(
     /// Completion slot for a `send(2)`-style operation. Yields the byte count sent.
     pub struct SendCompletion => io::Result<usize>
+);
+
+define_completion!(
+    /// Completion slot for a `send(2)`-style operation that returns the buffer.
+    pub struct SendOwnedCompletion => io::Result<(Vec<u8>, usize)>
 );
 
 define_completion!(
@@ -266,6 +271,8 @@ pub enum Operation {
     Recv(RecvOp),
     /// Send bytes to a connected socket.
     Send(SendOp),
+    /// Send bytes to a connected socket and return the buffer.
+    SendOwned(SendOp),
     /// Read bytes from a file at a fixed offset.
     PRead(PReadOp),
     /// Write bytes to a file at a fixed offset.

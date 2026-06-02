@@ -3,7 +3,10 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use super::{CallInput, CallOutput, TlsListenerId, TlsStreamId, TypedCall};
+use super::{
+    CallInput, CallOutput, TlsListenerId, TlsReadBufReply, TlsStreamId, TlsWriteOwnedReply,
+    TypedCall,
+};
 
 /// Returns a typed TLS connect helper with explicit DER root certificates
 /// and no ALPN. Existing (HTTP/1) callers stay on this signature.
@@ -129,6 +132,24 @@ pub fn tls_read(stream: TlsStreamId, max_len: usize, timeout: Duration) -> Typed
     )
 }
 
+/// Returns a typed TLS read helper that reuses caller-owned plaintext storage.
+pub fn tls_read_buf(
+    stream: TlsStreamId,
+    buffer: Vec<u8>,
+    max_len: usize,
+    timeout: Duration,
+) -> TypedCall<TlsReadBufReply> {
+    TypedCall::new(
+        CallInput::TlsReadBuf {
+            stream,
+            buffer,
+            max_len,
+            timeout,
+        },
+        CallOutput::into_tls_read_buf,
+    )
+}
+
 /// Returns a typed TLS write helper.
 pub fn tls_write(stream: TlsStreamId, bytes: Vec<u8>, timeout: Duration) -> TypedCall<usize> {
     TypedCall::new(
@@ -138,6 +159,22 @@ pub fn tls_write(stream: TlsStreamId, bytes: Vec<u8>, timeout: Duration) -> Type
             timeout,
         },
         CallOutput::into_tls_wrote,
+    )
+}
+
+/// Returns a typed TLS write helper that gives the caller-owned bytes back.
+pub fn tls_write_owned(
+    stream: TlsStreamId,
+    bytes: Vec<u8>,
+    timeout: Duration,
+) -> TypedCall<TlsWriteOwnedReply> {
+    TypedCall::new(
+        CallInput::TlsWriteOwned {
+            stream,
+            bytes,
+            timeout,
+        },
+        CallOutput::into_tls_wrote_owned,
     )
 }
 
