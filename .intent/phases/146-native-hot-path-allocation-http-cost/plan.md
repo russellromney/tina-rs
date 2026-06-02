@@ -93,6 +93,30 @@ separate semantic phase.
 - Effects are owned values. A borrowed `&mut [u8]` must not cross the runtime
   effect boundary.
 
+## Planning Decisions Already Made
+
+No implementation session should spend this phase deciding these again:
+
+- Reusable I/O uses **owned buffers that move through effects and come back**.
+  No borrowed `&mut [u8]` crosses a runtime call boundary.
+- HTTP server reads use a per-connection `read_scratch` buffer. The scratch
+  buffer moves into `tcp_read_buf` / `tls_read_buf` and comes back with `len`.
+  Existing partial request bytes stay in `read_buf`.
+- HTTP writes move the pending wire buffer into the runtime call and receive it
+  back with the accepted byte count. No clone-before-write.
+- TLS gets the same public owned plaintext read/write API in this phase.
+  The claim is "no caller-side fresh plaintext buffer/clone"; rustls may still
+  keep internal ciphertext/plaintext buffers.
+- Header-map replacement is out of scope. This phase does encoder/header-byte
+  allocation cleanup only. If `HeaderMap` remains the dominant cost, seed a
+  later phase from evidence.
+- Same-turn continuation / "stay in handler" is out of scope. This phase records
+  handler-turn counts; it does not add a new runtime control-flow primitive.
+- Perf history for this phase lives under
+  `.intent/phases/146-native-hot-path-allocation-http-cost/perf_history.jsonl`.
+  Scripts may accept an override, but the default should move to the current
+  phase evidence file.
+
 ## Likely Files
 
 Runtime I/O:
@@ -120,8 +144,7 @@ Perf/proof:
 - `tina-proof-harness/src/perf.rs`
 - `scripts/perf_record.sh`
 - `scripts/perf_check.sh`
-- `.intent/phases/145-hot-path-reality-check/perf_history.jsonl` or the new
-  phase evidence file
+- `.intent/phases/146-native-hot-path-allocation-http-cost/perf_history.jsonl`
 
 ## Rock 0: Make Perf Rows Harder To Lie With
 
@@ -130,7 +153,7 @@ Tighten the existing perf harness before claiming wins.
 Required:
 
 - `make perf` / `make perf-compare` print:
-  - p50 / p90 / max;
+  - p50 / p90 / p99 / max;
   - process allocations;
   - process allocated bytes;
   - worker-thread allocations where the probe can honestly see them;
@@ -139,8 +162,13 @@ Required:
   - git sha, platform, and profile.
 - `make perf-record` writes rows with all fields needed for later comparison.
 - `make perf-check` compares against the checked-in baseline.
+- extend `LoadReport` / perf report output with `latency_p90_us` and
+  `latency_p90_ns`.
 - Perf history stores platform-specific rows separately. Do not merge macOS and
   Linux into one number.
+- perf history default path moves to this phase's evidence file; keep an env
+  override (for example `TINA_PERF_HISTORY_FILE`) so future phases do not edit
+  scripts just to change the evidence path.
 - The README explains which rows are framework hot paths, which are HTTP rows,
   and which are only partial semantic matches.
 
@@ -162,6 +190,8 @@ Target shape:
 ```rust
 tcp_read_buf(stream, buffer, max_len) -> TypedCall<TcpReadBufReply>
 tcp_write_owned(stream, bytes) -> TypedCall<TcpWriteOwnedReply>
+tls_read_buf(stream, buffer, max_len, timeout) -> TypedCall<TlsReadBufReply>
+tls_write_owned(stream, bytes, timeout) -> TypedCall<TlsWriteOwnedReply>
 ```
 
 Where the reply owns the buffer again:
@@ -176,6 +206,16 @@ TcpWriteOwnedReply {
     bytes: Vec<u8>,
     written: usize,
 }
+
+TlsReadBufReply {
+    buffer: Vec<u8>,
+    len: usize,
+}
+
+TlsWriteOwnedReply {
+    bytes: Vec<u8>,
+    written: usize,
+}
 ```
 
 Rules:
@@ -186,22 +226,21 @@ Rules:
 - Errors return enough ownership truth to avoid leaking capacity or stranded
   bytes. If returning the buffer on every error makes the public shape noisy,
   document and test where the bytes are dropped.
-- Existing `tcp_read` / `tcp_write` stay as compatibility helpers unless
-  migration is tiny and source-compatible.
+- Existing `tcp_read` / `tcp_write` / `tls_read` / `tls_write` stay as
+  compatibility helpers and may be implemented by allocating a temporary owned
+  buffer internally.
 - Add stable trace/call tags append-only if new call variants are needed.
 - Simulator gets byte-identical semantics for the new calls.
-
-TLS:
-
-- Add the same owned-buffer shape for TLS if it can reuse the TCP-rail TLS
-  machinery without a second semantic design.
-- If TLS cannot fit safely in this PR, document exact deferral and keep HTTPS
-  perf rows out of any win claim.
+- On error, return the buffer in the typed reply if the call reached the driver
+  and the runtime still owns the buffer. For submission failures that return
+  `CallError` before driver ownership is established, dropping the buffer is
+  acceptable only through the compatibility helper; the owned-buffer helper must
+  preserve ownership where possible. Test this rule.
 
 Proof:
 
-- TCP live read/write success, EOF, partial write, close, cancel, and shutdown
-  tests.
+- TCP and TLS live read/write success, EOF, partial write, close, cancel, and
+  shutdown tests.
 - Simulator parity for read/write buffers.
 - Stable trace hashes update only where the new call variant is used.
 - No unbounded buffer growth; callers own the buffer capacity.
@@ -219,16 +258,26 @@ Target files:
 
 Required:
 
-- `HttpConnection` reuses a read buffer instead of receiving a fresh read
-  `Vec<u8>` and copying it into `self.read_buf`.
+- Add `read_scratch: Vec<u8>` to `HttpConnection`.
+- `HttpConnection` uses `tcp_read_buf` / `tls_read_buf` with
+  `std::mem::take(&mut self.read_scratch)`.
+- The returned scratch buffer is retained for the next socket read.
+- If `self.read_buf` is empty, move or swap the scratch bytes into `read_buf`
+  where possible. If partial head/body bytes already exist, append only the
+  valid prefix from scratch.
 - `write_pending()` stops cloning the full pending response before every write.
+- Add an in-flight write state if needed so `pending_response` can move into the
+  runtime and return through the write reply.
 - Partial writes still drain exactly the accepted prefix.
 - Body-pressure accounting stays exact.
 - Known-length, chunked, WebSocket, request-body streaming, and keepalive paths
   keep their current wire behavior.
-- Request body pull avoids `drain(..take).collect()` where a split/reuse path
-  can remove a copy without making the API worse. If this part is not safe,
-  leave it for a named follow-up and prove the rest.
+- Request body pull stops using `drain(..take).collect()` for the common
+  front-chunk case. Use a bounded buffer/split shape that avoids shifting the
+  whole remaining body on every chunk. The public `RequestChunkReply::Chunk` may
+  still own a `Vec<u8>`.
+- WebSocket read/write paths use the same scratch/write-owned path where they
+  sit inside `HttpConnection`.
 
 Proof:
 
@@ -267,19 +316,20 @@ Proof:
 - perf rows for keepalive and fixed body improve or name the next bottleneck;
 - dead connection retirement still works after buffer reuse.
 
-## Rock 4: Smaller HTTP Header And Response Allocation
+## Rock 4: Concrete HTTP Encoder Allocation Cleanup
 
-After Rocks 1-3, use the perf evidence to remove the next obvious HTTP
-allocation.
+Remove concrete encoder allocations. Do not redesign request headers here.
 
-Allowed fixes:
+Required:
 
 - improve response-head capacity calculation so common responses do not
   reallocate;
-- avoid `to_string()` allocation for common content lengths/status fields where
-  a stack buffer is easy;
-- reduce small-header allocation if measured rows show `HeaderMap` construction
-  dominates common requests;
+- replace `length.to_string()` and similar numeric formatting with direct
+  `write!(&mut Vec<u8>, ...)` or a tiny stack decimal/hex helper so no
+  temporary `String` is allocated;
+- replace `format!("{:x}\r\n", n).into_bytes()` in chunked response framing with
+  direct write into the output `Vec<u8>`;
+- pre-size chunked response frames as `hex_len + 2 + body_len + 2`;
 - reuse response-body/head buffers inside a connection where ownership stays
   clear.
 
@@ -290,6 +340,7 @@ Rules:
 - Do not weaken duplicate-header, content-length, transfer-encoding, Host, or
   parser strictness.
 - Do not replace correctness with a special-case benchmark path.
+- Do not replace `HeaderMap` in this phase.
 
 Proof:
 
@@ -298,11 +349,9 @@ Proof:
 - one request with many headers still uses the heap fallback correctly;
 - common small request path uses the measured smaller shape.
 
-## Rock 5: Measure Handler-Turn Cost, Then Only Fix If Evidence Demands
+## Rock 5: Record Handler-Turn Cost
 
 HTTP may still be slower because it takes many Tina turns.
-
-Measure first.
 
 Add or extend hot-path reports to count worker turns and named stages for:
 
@@ -322,18 +371,15 @@ Stage names should be concrete:
 - close or keepalive loop;
 - host unblocked.
 
-If a narrow same-turn continuation primitive removes a repeated Tina-owned turn
-without hiding a suspension point, implement it.
-
-If the fix would become fake async, hidden callbacks, or state mutation outside
-the handler, do not build it in this phase.
+This phase does not add a same-turn continuation primitive. The implementation
+must record the turn count and write the observed next bottleneck into the
+phase evidence. If turn count is dominant, name the next semantic phase there.
 
 Proof:
 
 - report says whether remaining cost is allocation, turn count, socket floor, or
   semantic cost;
-- no new helper hides failure/cancel/pressure facts;
-- if no turn-count fix lands, the README names why.
+- no new helper hides failure/cancel/pressure facts.
 
 ## Rock 6: Linux Verification
 
