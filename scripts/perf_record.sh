@@ -6,7 +6,7 @@
 # time. Each line covers ONE row from ONE `make perf` invocation. Two row
 # shapes are emitted today:
 #
-#   {"kind":"compare", "timestamp":..., "git_sha":..., "label":..., "tina_p50_ns":..., "tina_p99_ns":..., "tina_allocations":...}
+#   {"kind":"compare", "timestamp":..., "git_sha":..., "label":..., "tina_p50_ns":..., "tina_p90_ns":..., "tina_p99_ns":..., "tina_allocations":...}
 #   {"kind":"process", "timestamp":..., "git_sha":..., "label":..., "process_allocations":..., "rss_delta_kb":...}
 #
 # A `perf-compare` line stays the canonical "row" — `perf-process` lines are

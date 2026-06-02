@@ -284,7 +284,8 @@ enum OwnedClientEvent {
 struct OwnedBufferClient {
     payload: Vec<u8>,
     stream: Option<StreamId>,
-    wrote: Option<(usize, Vec<u8>)>,
+    total_written: usize,
+    first_returned_write_bytes: Option<Vec<u8>>,
     observed: OwnedClientObserved,
 }
 
@@ -312,16 +313,26 @@ impl Isolate for OwnedBufferClient {
             }
             OwnedClientEvent::Wrote(Ok(reply)) => {
                 let stream = self.stream.expect("stream set after connect");
-                self.wrote = Some((reply.written, reply.bytes));
+                if self.first_returned_write_bytes.is_none() {
+                    self.first_returned_write_bytes = Some(reply.bytes.clone());
+                }
+                self.total_written += reply.written;
+                if reply.written < reply.bytes.len() {
+                    let mut remaining = reply.bytes;
+                    remaining.drain(..reply.written);
+                    return tcp_write_owned(stream, remaining).then(OwnedClientEvent::Wrote);
+                }
                 let scratch = Vec::with_capacity(128);
                 tcp_read_buf(stream, scratch, 64).then(OwnedClientEvent::Read)
             }
             OwnedClientEvent::Read(Ok(reply)) => {
                 let stream = self.stream.expect("stream set after connect");
-                let (wrote, returned_write_bytes) =
-                    self.wrote.take().expect("write completed before read");
+                let returned_write_bytes = self
+                    .first_returned_write_bytes
+                    .take()
+                    .expect("write completed before read");
                 *self.observed.lock().expect("observed mutex") = Some(OwnedClientReport {
-                    wrote,
+                    wrote: self.total_written,
                     returned_write_bytes,
                     read_len: reply.len,
                     returned_read_prefix: reply.buffer[..reply.len].to_vec(),
@@ -1071,7 +1082,8 @@ fn tcp_owned_buffer_helpers_return_buffer_ownership() {
         OwnedBufferClient {
             payload: b"ping".to_vec(),
             stream: None,
-            wrote: None,
+            total_written: 0,
+            first_returned_write_bytes: None,
             observed: Arc::clone(&observed),
         },
         TestMailbox::new(8),
@@ -1116,6 +1128,60 @@ fn tcp_owned_buffer_helpers_return_buffer_ownership() {
         count_call_completed(runtime.trace(), CallKind::TcpStreamClose),
         1
     );
+}
+
+#[test]
+fn owned_buffer_client_retries_partial_owned_write_with_returned_bytes() {
+    let observed: OwnedClientObserved = Arc::new(Mutex::new(None));
+    let mut client = OwnedBufferClient {
+        payload: Vec::new(),
+        stream: Some(StreamId::new(7)),
+        total_written: 0,
+        first_returned_write_bytes: None,
+        observed,
+    };
+    let mut shard = TestShard;
+    let mut ctx = Context::new(&mut shard, IsolateId::new(42));
+
+    let effect = client.handle(
+        OwnedClientEvent::Wrote(Ok(TcpWriteOwnedReply {
+            bytes: b"hello".to_vec(),
+            written: 2,
+        })),
+        &mut ctx,
+    );
+    let Effect::Call(second_write) = effect else {
+        panic!("expected retry write call");
+    };
+    assert!(matches!(
+        second_write.request(),
+        CallInput::TcpWriteOwned { bytes, .. } if bytes == b"llo"
+    ));
+    assert_eq!(client.total_written, 2);
+    assert_eq!(
+        client.first_returned_write_bytes.as_deref(),
+        Some(&b"hello"[..])
+    );
+
+    let effect = client.handle(
+        OwnedClientEvent::Wrote(Ok(TcpWriteOwnedReply {
+            bytes: b"llo".to_vec(),
+            written: 3,
+        })),
+        &mut ctx,
+    );
+    let Effect::Call(next_read) = effect else {
+        panic!("expected read after remaining bytes drain");
+    };
+    assert!(matches!(
+        next_read.request(),
+        CallInput::TcpReadBuf {
+            stream,
+            max_len: 64,
+            ..
+        } if *stream == StreamId::new(7)
+    ));
+    assert_eq!(client.total_written, 5);
 }
 
 #[test]

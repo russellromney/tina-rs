@@ -120,14 +120,35 @@ Measured before/after the host-call dispatcher pool and reply channel pool:
 | probe p50 (single host thread)      | ~190 µs | ~198 µs |
 | perf row p50 (4 concurrent threads) | ~210 µs | ~205 µs |
 
+## Phase 146 owned-buffer pass
+
+The next pass added Tina-shaped owned-buffer calls:
+
+- `tcp_read_buf` / `tls_read_buf`;
+- `tcp_write_owned` / `tls_write_owned`.
+
+Buffers move through effects and come back on success. Native HTTP/1 server,
+one-shot client, keepalive client, and server WebSocket paths use that shape
+now. This removes the obvious "read fresh Vec, copy into HTTP buffer, drop it"
+and "clone pending write bytes before every write" waste.
+
+Current local truth is still not a production claim:
+
+- HTTP/1 fixed-body close is closer to Axum in good runs.
+- HTTP/1 close and keepalive are still slower/noisier than Axum.
+- Whole-process allocation rows still show Tina HTTP around 1.4-1.8x Axum on
+  these rows.
+- Standalone WebSocket client and HTTP/2 still use the compatibility helpers.
+- Owned buffers return on success; the current `TypedCall<T>` error envelope
+  does not return the buffer on driver failure.
+
 Suggested next follow-ups:
-- `tcp_read_into(buf, max_len)` / `tcp_write_borrowed(slice)` so HTTP can stop
-  allocating a fresh `Vec<u8>` per socket read/write only to copy into its own
-  reusable buffers.
 - Smaller HTTP request/response allocation shapes (`SmallVec` headers,
   response body reuse) before making any public HTTP performance claim.
-- Add repeated-run / historical tracking before any public performance claim.
-- Verify Linux/x86_64 perf behavior; this phase was measured on macOS aarch64.
+- Reduce HTTP worker-turn/scheduling cost now that the obvious buffer waste is
+  gone.
+- Add more repeated-run history before any public performance claim.
+- Verify Linux/x86_64 perf behavior; these rows were measured on macOS aarch64.
 
 Verdict:
 - keep
