@@ -50,6 +50,26 @@ The phase may claim:
 - overload perf rows still show `Full` / `Closed` / `Timeout` truth;
 - the next bottleneck is named from evidence.
 
+## What Will Not Change
+
+This phase changes cost, not Tina's semantics.
+
+Do not change:
+
+- public `CallOutcome` meaning;
+- service `Full` / `Closed` / `Timeout` / `Rejected` mapping;
+- request-scope cancellation truth;
+- trace/replay stable tags except append-only additions for new call variants;
+- HTTP/1 parser strictness;
+- HTTP body-pressure accounting;
+- HTTP keepalive close/retire semantics;
+- TLS certificate/SNI/ALPN verification truth;
+- simulator replay determinism;
+- bounded admission and explicit buffer ownership.
+
+If a proposed optimization needs one of those to change, stop and split a
+separate semantic phase.
+
 ## Starting Facts
 
 - `examples/systems/perf_native` exists and records native Tina vs bounded
@@ -72,6 +92,36 @@ The phase may claim:
   - client/keepalive paths have the same broad read/write shape.
 - Effects are owned values. A borrowed `&mut [u8]` must not cross the runtime
   effect boundary.
+
+## Likely Files
+
+Runtime I/O:
+
+- `tina-runtime/src/call/tcp.rs`
+- `tina-runtime/src/call/tls.rs`
+- `tina-runtime/src/call/io.rs`
+- `tina-runtime/src/driver/tcp.rs`
+- `tina-runtime/src/driver/tls.rs`
+- `tina-runtime/src/tcp_loops.rs`
+- `tina-sim/src/...` call/replay support for new call variants
+- runtime TCP/TLS tests
+
+HTTP:
+
+- `tina-http/src/connection.rs`
+- `tina-http/src/client.rs`
+- `tina-http/src/keepalive.rs`
+- `tina-http/src/parse.rs`
+- HTTP server/client/keepalive/body/WebSocket tests
+
+Perf/proof:
+
+- `examples/systems/perf_native`
+- `tina-proof-harness/src/perf.rs`
+- `scripts/perf_record.sh`
+- `scripts/perf_check.sh`
+- `.intent/phases/145-hot-path-reality-check/perf_history.jsonl` or the new
+  phase evidence file
 
 ## Rock 0: Make Perf Rows Harder To Lie With
 
@@ -333,6 +383,23 @@ Proof:
 - faster paths still emit the same typed outcomes;
 - no hidden retry or buffering is added to improve numbers.
 
+## Traps
+
+Review these before coding:
+
+- Borrowed buffers crossing an effect boundary are not Tina-shaped. Use owned
+  buffers that move out and back.
+- `Vec::with_capacity` can still allocate per op if the buffer is not retained
+  by the owner. The point is reuse, not a prettier constructor.
+- Returning a buffer on error can make APIs noisy, but dropping it can hide
+  capacity ownership. Pick one rule and prove it.
+- A faster HTTP row that loses `Full` / body-cap / timeout truth is a bad row.
+- A faster write path that assumes all writes complete is wrong; partial writes
+  are normal.
+- TLS may need a separate owned-buffer path because rustls owns encrypted and
+  plaintext buffers internally. Do not weaken cert/SNI checks to make it fit.
+- Perf rows are local evidence. They are not a production performance claim.
+
 ## Does Not Include
 
 - no public production performance claim;
@@ -366,6 +433,41 @@ If `cargo test -p tina-http --tests` is too broad while iterating, run the
 touched HTTP client/server/keepalive/body/WebSocket tests first, but the final
 PR must run the broad HTTP test set.
 
+## Proof Matrix
+
+Direct proof:
+
+- owned TCP/TLS read/write buffer tests hit the new public call helpers;
+- HTTP server/client/keepalive tests use the new reusable path, not the old
+  fresh-`Vec` path;
+- perf rows show before/after latency and allocation deltas.
+
+Integration proof:
+
+- native HTTP server + client path still works over TCP;
+- HTTPS path works if TLS buffer reuse lands;
+- keepalive pool still reuses and retires connections correctly;
+- simulator replay covers any new call variants used by the runtime path.
+
+E2E proof:
+
+- `examples/systems/perf_native` exercises host send/call, HTTP close,
+  keepalive, fixed body, and overload/capacity rows through public paths;
+- at least one overload row proves faster code still exposes pressure and final
+  capacity state.
+
+Blast-radius proof:
+
+- existing HTTP bad-input/parser strictness tests pass;
+- existing chunked/body lifecycle/WebSocket tests pass;
+- existing TLS/HTTPS tests pass if TLS is touched;
+- existing DST/proof-fast gate passes;
+- stable trace tags are append-only.
+
+If a proof is missing because a sub-rock is deliberately deferred, say so in
+the PR summary and in the phase evidence. Do not call the deferred behavior
+done.
+
 ## Done
 
 - A user can run `make perf` and see credible Tina-native rows.
@@ -375,3 +477,13 @@ PR must run the broad HTTP test set.
 - Tiny host send/call rows remain below millisecond scale.
 - Faster paths still prove `Full` / `Closed` / `Timeout` / cancel truth.
 - The next bottleneck is explicit enough to seed the next phase.
+
+## After Proof
+
+Only after the implementation and proof pass:
+
+- update `CHANGELOG.md` with what got faster and what stayed bad;
+- update `examples/systems/perf_native/README.md` with before/after rows;
+- update `.intent/SYSTEM.md` only if the work changes the proved baseline
+  truth, not merely because a benchmark improved;
+- write `commits.txt` with commit hashes and the proof commands/evidence.
