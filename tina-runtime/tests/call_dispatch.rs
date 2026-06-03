@@ -21,6 +21,7 @@ use std::alloc::Global;
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::convert::Infallible;
+use std::io::Read;
 use std::net::{SocketAddr, TcpStream};
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
@@ -277,6 +278,12 @@ struct Writer {
 }
 
 #[derive(Debug)]
+struct TerminalWriter {
+    stream: StreamId,
+    log: Rc<RefCell<Vec<WriterMsg>>>,
+}
+
+#[derive(Debug)]
 struct Closer {
     log: Rc<RefCell<Vec<CloserMsg>>>,
 }
@@ -425,6 +432,48 @@ impl Isolate for Writer {
                     CallOutput::TcpWrote { .. } => WriterMsg::WroteObserved,
                     CallOutput::Failed(_) => WriterMsg::FailedObserved,
                     other => panic!("unexpected write result {other:?}"),
+                },
+            )),
+            WriterMsg::StopNow => Effect::Stop,
+            WriterMsg::WroteObserved => {
+                self.log.borrow_mut().push(WriterMsg::WroteObserved);
+                Effect::Noop
+            }
+            WriterMsg::FailedObserved => {
+                self.log.borrow_mut().push(WriterMsg::FailedObserved);
+                Effect::Noop
+            }
+        }
+    }
+}
+
+impl Isolate for TerminalWriter {
+    type Message = WriterMsg;
+    type Reply = ();
+    type Send = Outbound<NeverOutbound>;
+    type Spawn = Infallible;
+    type SpawnObserved = std::convert::Infallible;
+    type Call = RuntimeCall<WriterMsg>;
+    type Fact = ::std::convert::Infallible;
+    type Shard = TestShard;
+
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
+        match msg {
+            WriterMsg::StartWrite => Effect::Call(RuntimeCall::new(
+                CallInput::TcpWriteOwnedClose {
+                    stream: self.stream,
+                    bytes: b"terminal close".to_vec(),
+                },
+                |result| match result {
+                    CallOutput::TcpWroteOwnedClose { closed: true, .. } => WriterMsg::WroteObserved,
+                    CallOutput::TcpWroteOwnedClose { closed: false, .. }
+                    | CallOutput::TcpWroteOwnedFailed { .. }
+                    | CallOutput::Failed(_) => WriterMsg::FailedObserved,
+                    other => panic!("unexpected terminal write-close result {other:?}"),
                 },
             )),
             WriterMsg::StopNow => Effect::Stop,
@@ -1474,6 +1523,151 @@ fn stream_close_while_read_pending_cancels_read_and_closes() {
             }
         )),
         "trace must NOT record TcpStreamClose ResourceBusy under the new contract"
+    );
+}
+
+#[test]
+fn terminal_write_close_while_read_pending_cancels_read_and_closes() {
+    let listener_slot = Arc::new(Mutex::new(None));
+    let addr_slot = Arc::new(Mutex::new(None));
+    let stream_slot = Rc::new(Cell::new(None));
+    let reader_log = Rc::new(RefCell::new(Vec::new()));
+    let writer_log = Rc::new(RefCell::new(Vec::new()));
+    let bind_addr: SocketAddr = "127.0.0.1:0".parse().expect("loopback parse");
+
+    let mut runtime = Runtime::new(TestShard, TestMailboxFactory);
+    let binder = runtime.register(
+        Binder {
+            bind_addr,
+            listener_slot: Arc::clone(&listener_slot),
+            addr_slot: Arc::clone(&addr_slot),
+        },
+        TestMailbox::new(8),
+    );
+
+    runtime
+        .try_send(binder, BinderMsg::StartBind)
+        .expect("ingress accepts StartBind");
+    runtime.step();
+    runtime.step();
+
+    let listener = listener_slot
+        .lock()
+        .expect("listener mutex")
+        .expect("listener published");
+    let local_addr = addr_slot
+        .lock()
+        .expect("addr mutex")
+        .expect("addr published");
+
+    let acceptor = runtime.register(
+        StreamAcceptor {
+            listener,
+            stream_slot: Rc::clone(&stream_slot),
+        },
+        TestMailbox::new(8),
+    );
+    runtime
+        .try_send(acceptor, AcceptStreamMsg::StartAccept)
+        .expect("ingress accepts StartAccept");
+    runtime.step();
+
+    let mut client = TcpStream::connect(local_addr).expect("connect to listener");
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while stream_slot.get().is_none() {
+        runtime.step();
+        if Instant::now() > deadline {
+            panic!(
+                "timed out waiting for accepted stream; trace = {:#?}",
+                runtime.trace()
+            );
+        }
+    }
+
+    let stream = stream_slot.get().expect("accepted stream id");
+    let reader = runtime.register(
+        Reader {
+            stream,
+            log: Rc::clone(&reader_log),
+        },
+        TestMailbox::new(8),
+    );
+    let writer = runtime.register(
+        TerminalWriter {
+            stream,
+            log: Rc::clone(&writer_log),
+        },
+        TestMailbox::new(8),
+    );
+
+    runtime
+        .try_send(reader, ReaderMsg::StartRead)
+        .expect("ingress accepts StartRead");
+    runtime.step();
+    assert!(runtime.has_in_flight_calls());
+
+    runtime
+        .try_send(writer, WriterMsg::StartWrite)
+        .expect("ingress accepts terminal StartWrite");
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while writer_log.borrow().is_empty() {
+        runtime.step();
+        if Instant::now() > deadline {
+            panic!(
+                "timed out waiting for terminal write-close; trace = {:#?}",
+                runtime.trace()
+            );
+        }
+    }
+
+    let mut wire = Vec::new();
+    client
+        .read_to_end(&mut wire)
+        .expect("client observes terminal close");
+    assert_eq!(wire, b"terminal close");
+
+    assert_eq!(*writer_log.borrow(), vec![WriterMsg::WroteObserved]);
+    assert!(
+        reader_log.borrow().is_empty(),
+        "the pending read continuation must not fire after terminal write-close"
+    );
+
+    let kinds = call_event_kinds(runtime.trace());
+    assert!(
+        kinds.iter().any(|k| matches!(
+            k,
+            RuntimeEventKind::CallCompletionRejected {
+                call_kind: CallKind::TcpRead,
+                reason: CallCompletionRejectedReason::ResourceClosed,
+                ..
+            }
+        )),
+        "trace must record TcpRead ResourceClosed after terminal write-close: {kinds:?}"
+    );
+    assert!(
+        !kinds.iter().any(|k| matches!(
+            k,
+            RuntimeEventKind::CallCompletionRejected {
+                call_kind: CallKind::TcpWriteClose,
+                reason: CallCompletionRejectedReason::ResourceClosed,
+                ..
+            }
+        )),
+        "terminal write-close must not reject its own completed call: {kinds:?}"
+    );
+    assert!(
+        kinds.iter().any(|k| matches!(
+            k,
+            RuntimeEventKind::CallCompleted {
+                call_kind: CallKind::TcpWriteClose,
+                ..
+            }
+        )),
+        "trace must record TcpWriteClose CallCompleted: {kinds:?}"
+    );
+    assert!(
+        !runtime.has_in_flight_calls(),
+        "terminal write-close must reclaim the pending read call state"
     );
 }
 

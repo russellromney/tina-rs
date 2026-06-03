@@ -37,6 +37,21 @@ Recorded history:
 
 - .intent/phases/147-http-turn-allocation-cost/perf_history.jsonl
 
+latest Fix terminal write-close resource cancellation
+
+Evidence:
+
+- cargo test -p tina-runtime --test call_dispatch terminal_write_close_while_read_pending_cancels_read_and_closes -- --nocapture
+- cargo test -p tina-runtime --test call_dispatch -- --nocapture
+- cargo test -p tina-runtime trace::stable_hash_tests::call_kind_tags_are_stable_golden -- --nocapture
+- cargo test -p tina-http --test server_smoke -- --nocapture
+- cargo test -p tina-http --test dst_simulator saved_seed_interleaving_fingerprint_is_stable -- --nocapture
+- cargo test -p tina-http --tests -- --nocapture
+- cargo clippy -p tina-runtime -p tina-sim -p tina-http --all-targets -- -D warnings
+- cargo fmt --all --check
+- git diff --check
+- make proof-fast
+
 532cd65 Add terminal TCP write-close rail
 
 Evidence:

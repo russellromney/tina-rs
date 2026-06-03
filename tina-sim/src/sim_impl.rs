@@ -2357,6 +2357,9 @@ where
             self.deliver_completion(call_id, CallOutput::Failed(CallError::InvalidResource));
             return;
         };
+        if matches!(result, CallOutput::TcpWroteOwnedClose { closed: true, .. }) {
+            self.cancel_backend_calls_for_resource(TcpResourceKey::StreamRead(stream));
+        }
 
         self.schedule_tcp_completion(call_id, resource, result);
     }

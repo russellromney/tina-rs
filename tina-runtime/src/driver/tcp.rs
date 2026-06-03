@@ -810,6 +810,7 @@ impl BetelgeuseTcp {
                     Ok((bytes, count)) => {
                         let closed = count >= bytes.len();
                         if closed {
+                            self.cancel_pending_stream_ops(*stream, Some(op.call_id));
                             self.close_stream_entry(*stream);
                         }
                         Some(CallOutput::TcpWroteOwnedClose {
@@ -952,7 +953,19 @@ impl BetelgeuseTcp {
 
     pub(super) fn do_stream_close(&mut self, stream: StreamId) -> CallOutput {
         // Close wins: cancel any pending read or write on this stream.
+        self.cancel_pending_stream_ops(stream, None);
+
+        match self.close_stream_entry(stream) {
+            true => CallOutput::TcpStreamClosed,
+            false => CallOutput::Failed(CallError::InvalidResource),
+        }
+    }
+
+    fn cancel_pending_stream_ops(&mut self, stream: StreamId, except: Option<CallId>) {
         for op in self.pending.iter_mut() {
+            if except == Some(op.call_id) {
+                continue;
+            }
             let on_this_stream = match op.lane {
                 PendingLane::StreamRead(s) | PendingLane::StreamWrite(s) => s == stream,
                 _ => false,
@@ -961,11 +974,6 @@ impl BetelgeuseTcp {
                 op.user_cancelled = true;
                 self.cancelled_by_close.push(op.call_id);
             }
-        }
-
-        match self.close_stream_entry(stream) {
-            true => CallOutput::TcpStreamClosed,
-            false => CallOutput::Failed(CallError::InvalidResource),
         }
     }
 

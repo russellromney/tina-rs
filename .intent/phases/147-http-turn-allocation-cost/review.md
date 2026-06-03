@@ -12,6 +12,12 @@
 - Small no-metrics buffered HTTP/1 responses now coalesce head+body into one
   TCP write. The guardrail is explicit: larger buffered bodies stay split, and
   metrics-enabled bodies stay split so body-pressure accounting does not lie.
+- Deep hostile review found one correctness hole in the terminal write-close
+  rail: it closed the stream without cancelling sibling pending reads the way
+  `tcp_close_stream` does. Fixed live and sim so terminal write-close is a real
+  close operation: sibling pending reads get `ResourceClosed`, the terminal
+  write-close call itself completes normally, and in-flight call state is
+  reclaimed.
 - Pressure proof is attached: oversized HTTP bodies produce typed `full`,
   body-pressure surfaces, and drained final current.
 
