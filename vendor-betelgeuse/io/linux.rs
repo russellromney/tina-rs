@@ -17,8 +17,8 @@ use log::trace;
 use crate::{
     AcceptCompletion, AcceptOp, CompletionInner, ConnectCompletion, ConnectOp, FsyncCompletion,
     FsyncOp, IO, IOFile, IOLoop, IOSocket, MkdirCompletion, MkdirOp, OpenOptions, Operation,
-    PReadCompletion, PReadOp, PWriteCompletion, PWriteOp, RecvCompletion, RecvOp, SendCompletion,
-    SendOp, SendOwnedCompletion, SizeCompletion, SizeOp,
+    PReadCompletion, PReadOp, PWriteCompletion, PWriteOp, RecvBufCompletion, RecvCompletion,
+    RecvOp, SendCompletion, SendOp, SendOwnedCompletion, SizeCompletion, SizeOp,
 };
 
 enum SocketKind {
@@ -113,6 +113,7 @@ impl IoUringIO {
         match completion.operation() {
             Operation::Accept(_)
             | Operation::Recv(_)
+            | Operation::RecvBuf(_)
             | Operation::Send(_)
             | Operation::SendOwned(_) => {
                 errno == libc::EAGAIN || errno == libc::EWOULDBLOCK || errno == libc::EINTR
@@ -138,7 +139,7 @@ impl IoUringIO {
                 op.len,
             )
             .build(),
-            Operation::Recv(op) => {
+            Operation::Recv(op) | Operation::RecvBuf(op) => {
                 opcode::Recv::new(types::Fd(op.fd), op.buf.as_mut_ptr(), op.buf.len() as u32)
                     .flags(op.flags)
                     .build()
@@ -214,6 +215,20 @@ impl IoUringIO {
                 };
                 unsafe { RecvCompletion::from_inner_mut(c) }.complete(r);
             }
+            Operation::RecvBuf(_) => {
+                let r = if result < 0 {
+                    let Operation::RecvBuf(op) = c.operation_mut() else {
+                        unreachable!()
+                    };
+                    Err((io_uring_err(result), mem::take(&mut op.buf)))
+                } else {
+                    let Operation::RecvBuf(op) = c.operation_mut() else {
+                        unreachable!()
+                    };
+                    Ok((mem::take(&mut op.buf), result as usize))
+                };
+                unsafe { RecvBufCompletion::from_inner_mut(c) }.complete(r);
+            }
             Operation::Send(_) => {
                 let r = if result < 0 {
                     Err(io_uring_err(result))
@@ -224,7 +239,10 @@ impl IoUringIO {
             }
             Operation::SendOwned(_) => {
                 let r = if result < 0 {
-                    Err(io_uring_err(result))
+                    let Operation::SendOwned(op) = c.operation_mut() else {
+                        unreachable!()
+                    };
+                    Err((io_uring_err(result), mem::take(&mut op.buf)))
                 } else {
                     let Operation::SendOwned(op) = c.operation_mut() else {
                         unreachable!()
@@ -572,15 +590,6 @@ impl IOSocket for IoUringSocket {
     }
 
     fn recv(&self, c: &mut RecvCompletion, len: usize) -> io::Result<()> {
-        self.recv_buf(c, vec![0_u8; len], len)
-    }
-
-    fn recv_buf(
-        &self,
-        c: &mut RecvCompletion,
-        mut buffer: Vec<u8>,
-        max_len: usize,
-    ) -> io::Result<()> {
         let fd = self
             .fd
             .borrow()
@@ -604,9 +613,49 @@ impl IOSocket for IoUringSocket {
                 ));
             }
         }
-        buffer.resize(max_len, 0);
         let inner = c.inner_mut();
         inner.prepare(Operation::Recv(RecvOp {
+            fd,
+            buf: vec![0_u8; len],
+            flags: libc::MSG_DONTWAIT,
+        }));
+        queue(&self.state, inner);
+        Ok(())
+    }
+
+    fn recv_buf(
+        &self,
+        c: &mut RecvBufCompletion,
+        mut buffer: Vec<u8>,
+        max_len: usize,
+    ) -> Result<(), (io::Error, Vec<u8>)> {
+        let fd = match self.fd.borrow().as_ref().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotConnected, "recv called on closed socket")
+        }) {
+            Ok(fd) => fd.raw(),
+            Err(error) => return Err((error, buffer)),
+        };
+        match &*self.kind.borrow() {
+            Some(SocketKind::Stream) => {}
+            Some(SocketKind::Listener) => {
+                return Err((
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "recv called on listener socket",
+                    ),
+                    buffer,
+                ));
+            }
+            None => {
+                return Err((
+                    io::Error::new(io::ErrorKind::NotConnected, "recv called on closed socket"),
+                    buffer,
+                ));
+            }
+        }
+        buffer.resize(max_len, 0);
+        let inner = c.inner_mut();
+        inner.prepare(Operation::RecvBuf(RecvOp {
             fd,
             buf: buffer,
             flags: libc::MSG_DONTWAIT,
@@ -649,27 +698,32 @@ impl IOSocket for IoUringSocket {
         Ok(())
     }
 
-    fn send_owned(&self, c: &mut SendOwnedCompletion, buf: Vec<u8>) -> io::Result<()> {
-        let fd = self
-            .fd
-            .borrow()
-            .as_ref()
-            .ok_or_else(|| {
-                io::Error::new(io::ErrorKind::NotConnected, "send called on closed socket")
-            })?
-            .raw();
+    fn send_owned(
+        &self,
+        c: &mut SendOwnedCompletion,
+        buf: Vec<u8>,
+    ) -> Result<(), (io::Error, Vec<u8>)> {
+        let fd = match self.fd.borrow().as_ref().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotConnected, "send called on closed socket")
+        }) {
+            Ok(fd) => fd.raw(),
+            Err(error) => return Err((error, buf)),
+        };
         match &*self.kind.borrow() {
             Some(SocketKind::Stream) => {}
             Some(SocketKind::Listener) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "send called on listener socket",
+                return Err((
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "send called on listener socket",
+                    ),
+                    buf,
                 ));
             }
             None => {
-                return Err(io::Error::new(
-                    io::ErrorKind::NotConnected,
-                    "send called on closed socket",
+                return Err((
+                    io::Error::new(io::ErrorKind::NotConnected, "send called on closed socket"),
+                    buf,
                 ));
             }
         }

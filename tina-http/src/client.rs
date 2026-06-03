@@ -279,10 +279,16 @@ impl<S: Shard + 'static> HttpClient<S> {
         let transport = state.transport.expect("transport set before write");
         let bytes = std::mem::take(&mut state.pending_write);
         match transport {
-            HttpTransport::Tcp(stream) => tcp_write_owned(stream, bytes).then(HttpClientMsg::Wrote),
+            HttpTransport::Tcp(stream) => tcp_write_owned(stream, bytes)
+                .then(|result| HttpClientMsg::Wrote(result.map_err(|error| error.error))),
             HttpTransport::Tls(stream) => {
-                tls_write_owned(stream, bytes, self.config.request_timeout)
-                    .then(|result| HttpClientMsg::Wrote(result.map(tls_write_reply_to_tcp)))
+                tls_write_owned(stream, bytes, self.config.request_timeout).then(|result| {
+                    HttpClientMsg::Wrote(
+                        result
+                            .map(tls_write_reply_to_tcp)
+                            .map_err(|error| error.error),
+                    )
+                })
             }
         }
     }
@@ -313,12 +319,18 @@ impl<S: Shard + 'static> HttpClient<S> {
         let transport = state.transport.expect("transport set before read");
         let buffer = std::mem::take(&mut state.read_scratch);
         match transport {
-            HttpTransport::Tcp(stream) => {
-                tcp_read_buf(stream, buffer, READ_CHUNK).then(HttpClientMsg::Read)
-            }
+            HttpTransport::Tcp(stream) => tcp_read_buf(stream, buffer, READ_CHUNK)
+                .then(|result| HttpClientMsg::Read(result.map_err(|error| error.error))),
             HttpTransport::Tls(stream) => {
-                tls_read_buf(stream, buffer, READ_CHUNK, self.config.request_timeout)
-                    .then(|result| HttpClientMsg::Read(result.map(tls_read_reply_to_tcp)))
+                tls_read_buf(stream, buffer, READ_CHUNK, self.config.request_timeout).then(
+                    |result| {
+                        HttpClientMsg::Read(
+                            result
+                                .map(tls_read_reply_to_tcp)
+                                .map_err(|error| error.error),
+                        )
+                    },
+                )
             }
         }
     }

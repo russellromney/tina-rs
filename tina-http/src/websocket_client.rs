@@ -17,8 +17,9 @@ use http::header::{SEC_WEBSOCKET_ACCEPT, SEC_WEBSOCKET_PROTOCOL};
 use tina::prelude::*;
 use tina::{CallContext, RequestContext, reply_to_request};
 use tina_runtime::{
-    CallError, ProtocolFact, StreamId, TlsStreamId, WebSocketCloseReason, tcp_close_stream,
-    tcp_connect, tcp_read, tcp_write, tls_close, tls_connect, tls_read, tls_write,
+    CallError, ProtocolFact, StreamId, TcpReadBufReply, TcpWriteOwnedReply, TlsReadBufReply,
+    TlsStreamId, TlsWriteOwnedReply, WebSocketCloseReason, tcp_close_stream, tcp_connect,
+    tcp_read_buf, tcp_write_owned, tls_close, tls_connect, tls_read_buf, tls_write_owned,
 };
 
 use crate::parse::{ResponseParseProgress, parse_response_head};
@@ -31,6 +32,20 @@ use crate::websocket::{
 
 const READ_CHUNK: usize = 4096;
 static NEXT_MASK_SEED: AtomicU64 = AtomicU64::new(0x9e37_79b9_7f4a_7c15);
+
+fn tls_read_reply_to_tcp(reply: TlsReadBufReply) -> TcpReadBufReply {
+    TcpReadBufReply {
+        buffer: reply.buffer,
+        len: reply.len,
+    }
+}
+
+fn tls_write_reply_to_tcp(reply: TlsWriteOwnedReply) -> TcpWriteOwnedReply {
+    TcpWriteOwnedReply {
+        bytes: reply.bytes,
+        written: reply.written,
+    }
+}
 
 #[derive(Debug, Clone)]
 pub enum WebSocketTarget {
@@ -152,8 +167,8 @@ pub enum WebSocketClientMsg {
     Stop,
     Connected(Result<(StreamId, SocketAddr, SocketAddr), CallError>),
     TlsConnected(Result<TlsStreamId, CallError>),
-    Wrote(Result<usize, CallError>),
-    Read(Result<Vec<u8>, CallError>),
+    Wrote(Result<TcpWriteOwnedReply, CallError>),
+    Read(Result<TcpReadBufReply, CallError>),
     Closed(Result<(), CallError>),
 }
 
@@ -185,6 +200,7 @@ pub struct WebSocketClientConnection<S: Shard + 'static> {
     pending_connect: Option<PendingConnect>,
     pending_receive: Option<RequestContext<WebSocketClientReply>>,
     read_buf: Vec<u8>,
+    read_scratch: Vec<u8>,
     pending_write: Vec<u8>,
     write_queue: VecDeque<Vec<u8>>,
     queued_write_bytes: usize,
@@ -209,6 +225,7 @@ impl<S: Shard + 'static> WebSocketClientConnection<S> {
             pending_connect: None,
             pending_receive: None,
             read_buf: Vec::new(),
+            read_scratch: Vec::new(),
             pending_write: Vec::new(),
             write_queue: VecDeque::new(),
             queued_write_bytes: 0,
@@ -254,9 +271,9 @@ impl<S: Shard + 'static> Isolate for WebSocketClientConnection<S> {
             WebSocketClientMsg::TlsConnected(Err(error)) => {
                 self.fail_connect(WebSocketClientError::Tls(error))
             }
-            WebSocketClientMsg::Wrote(Ok(n)) => self.handle_wrote(n),
+            WebSocketClientMsg::Wrote(Ok(reply)) => self.handle_wrote(reply),
             WebSocketClientMsg::Wrote(Err(_)) => self.close_with(WebSocketCloseReason::Abnormal),
-            WebSocketClientMsg::Read(Ok(bytes)) => self.handle_read(bytes),
+            WebSocketClientMsg::Read(Ok(reply)) => self.handle_read(reply),
             WebSocketClientMsg::Read(Err(_)) => self.close_with(WebSocketCloseReason::Abnormal),
             WebSocketClientMsg::Closed(_) => noop(),
             WebSocketClientMsg::Stop => self.close_with(WebSocketCloseReason::LocalInitiated),
@@ -346,10 +363,12 @@ impl<S: Shard + 'static> WebSocketClientConnection<S> {
         self.write_more()
     }
 
-    fn handle_wrote(&mut self, n: usize) -> Effect<Self> {
+    fn handle_wrote(&mut self, reply: TcpWriteOwnedReply) -> Effect<Self> {
         self.write_in_flight = false;
-        let drain = n.min(self.pending_write.len());
-        self.pending_write.drain(..drain);
+        let TcpWriteOwnedReply { mut bytes, written } = reply;
+        let drain = written.min(bytes.len());
+        bytes.drain(..drain);
+        self.pending_write = bytes;
         if !self.pending_write.is_empty() {
             return self.write_more();
         }
@@ -369,12 +388,15 @@ impl<S: Shard + 'static> WebSocketClientConnection<S> {
         }
     }
 
-    fn handle_read(&mut self, bytes: Vec<u8>) -> Effect<Self> {
+    fn handle_read(&mut self, reply: TcpReadBufReply) -> Effect<Self> {
         self.read_in_flight = false;
-        if bytes.is_empty() {
+        let TcpReadBufReply { buffer, len } = reply;
+        if len == 0 {
+            self.read_scratch = buffer;
             return self.close_with(WebSocketCloseReason::GoingAway);
         }
-        self.read_buf.extend_from_slice(&bytes);
+        self.read_buf.extend_from_slice(&buffer[..len]);
+        self.read_scratch = buffer;
         if self.state == WebSocketClientState::Connecting {
             return self.try_finish_handshake();
         }
@@ -635,16 +657,19 @@ impl<S: Shard + 'static> WebSocketClientConnection<S> {
             return noop();
         };
         self.write_in_flight = true;
+        let bytes = std::mem::take(&mut self.pending_write);
         match transport {
-            ClientTransport::Tcp(stream) => {
-                tcp_write(stream, self.pending_write.clone()).then(WebSocketClientMsg::Wrote)
+            ClientTransport::Tcp(stream) => tcp_write_owned(stream, bytes)
+                .then(|result| WebSocketClientMsg::Wrote(result.map_err(|error| error.error))),
+            ClientTransport::Tls(stream) => {
+                tls_write_owned(stream, bytes, self.limits.ping_pong_timeout).then(|result| {
+                    WebSocketClientMsg::Wrote(
+                        result
+                            .map(tls_write_reply_to_tcp)
+                            .map_err(|error| error.error),
+                    )
+                })
             }
-            ClientTransport::Tls(stream) => tls_write(
-                stream,
-                self.pending_write.clone(),
-                self.limits.ping_pong_timeout,
-            )
-            .then(WebSocketClientMsg::Wrote),
         }
     }
 
@@ -656,13 +681,20 @@ impl<S: Shard + 'static> WebSocketClientConnection<S> {
             return noop();
         };
         self.read_in_flight = true;
+        let buffer = std::mem::take(&mut self.read_scratch);
         match transport {
-            ClientTransport::Tcp(stream) => {
-                tcp_read(stream, READ_CHUNK).then(WebSocketClientMsg::Read)
-            }
+            ClientTransport::Tcp(stream) => tcp_read_buf(stream, buffer, READ_CHUNK)
+                .then(|result| WebSocketClientMsg::Read(result.map_err(|error| error.error))),
             ClientTransport::Tls(stream) => {
-                tls_read(stream, READ_CHUNK, self.limits.ping_pong_timeout)
-                    .then(WebSocketClientMsg::Read)
+                tls_read_buf(stream, buffer, READ_CHUNK, self.limits.ping_pong_timeout).then(
+                    |result| {
+                        WebSocketClientMsg::Read(
+                            result
+                                .map(tls_read_reply_to_tcp)
+                                .map_err(|error| error.error),
+                        )
+                    },
+                )
             }
         }
     }

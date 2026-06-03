@@ -4,8 +4,8 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use super::{
-    CallInput, CallOutput, TlsListenerId, TlsReadBufReply, TlsStreamId, TlsWriteOwnedReply,
-    TypedCall,
+    CallInput, CallOutput, TlsListenerId, TlsReadBufError, TlsReadBufReply, TlsStreamId,
+    TlsWriteOwnedError, TlsWriteOwnedReply, TypedCall,
 };
 
 /// Returns a typed TLS connect helper with explicit DER root certificates
@@ -138,7 +138,7 @@ pub fn tls_read_buf(
     buffer: Vec<u8>,
     max_len: usize,
     timeout: Duration,
-) -> TypedCall<TlsReadBufReply> {
+) -> TypedCall<TlsReadBufReply, TlsReadBufError> {
     TypedCall::new(
         CallInput::TlsReadBuf {
             stream,
@@ -167,7 +167,7 @@ pub fn tls_write_owned(
     stream: TlsStreamId,
     bytes: Vec<u8>,
     timeout: Duration,
-) -> TypedCall<TlsWriteOwnedReply> {
+) -> TypedCall<TlsWriteOwnedReply, TlsWriteOwnedError> {
     TypedCall::new(
         CallInput::TlsWriteOwned {
             stream,

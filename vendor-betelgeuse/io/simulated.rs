@@ -21,8 +21,8 @@ use std::{
 
 use crate::{
     AcceptCompletion, AcceptOp, ConnectCompletion, ConnectOp, IO, IOFile, IOLoop, IOLoopHandle,
-    IOSocket, OpenOptions, Operation, RecvCompletion, RecvOp, SendCompletion, SendOp,
-    SendOwnedCompletion,
+    IOSocket, OpenOptions, Operation, RecvBufCompletion, RecvCompletion, RecvOp, SendCompletion,
+    SendOp, SendOwnedCompletion,
 };
 
 /// Deterministic simulated I/O backend configuration.
@@ -271,6 +271,13 @@ enum SimulatedPendingOp {
         completion: usize,
         delay: Option<u64>,
     },
+    RecvBuf {
+        socket_id: i32,
+        len: usize,
+        buffer: Vec<u8>,
+        completion: usize,
+        delay: Option<u64>,
+    },
     Send {
         socket_id: i32,
         bytes: Vec<u8>,
@@ -409,15 +416,6 @@ impl IOSocket for SimulatedSocket {
     }
 
     fn recv(&self, c: &mut RecvCompletion, len: usize) -> io::Result<()> {
-        self.recv_buf(c, vec![0_u8; len], len)
-    }
-
-    fn recv_buf(
-        &self,
-        c: &mut RecvCompletion,
-        mut buffer: Vec<u8>,
-        max_len: usize,
-    ) -> io::Result<()> {
         let state = self.state.lock().expect("simulated io mutex");
         let socket_id = *self.socket_id.lock().expect("socket id mutex");
         let socket = state
@@ -431,10 +429,9 @@ impl IOSocket for SimulatedSocket {
             ));
         }
         drop(state);
-        buffer.resize(max_len, 0);
         c.inner_mut().prepare(Operation::Recv(RecvOp {
             fd: socket_id,
-            buf: buffer.clone(),
+            buf: vec![0_u8; len],
             flags: 0,
         }));
         self.state
@@ -443,9 +440,52 @@ impl IOSocket for SimulatedSocket {
             .pending
             .push_back(SimulatedPendingOp::Recv {
                 socket_id,
+                len,
+                buffer: vec![0_u8; len],
+                completion: c as *mut RecvCompletion as usize,
+                delay: None,
+            });
+        Ok(())
+    }
+
+    fn recv_buf(
+        &self,
+        c: &mut RecvBufCompletion,
+        mut buffer: Vec<u8>,
+        max_len: usize,
+    ) -> Result<(), (io::Error, Vec<u8>)> {
+        let state = self.state.lock().expect("simulated io mutex");
+        let socket_id = *self.socket_id.lock().expect("socket id mutex");
+        let socket = match state
+            .sockets
+            .get(&socket_id)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "stream missing"))
+        {
+            Ok(socket) => socket,
+            Err(error) => return Err((error, buffer)),
+        };
+        if socket.closed || !matches!(socket.kind, SimulatedSocketKind::Stream) {
+            return Err((
+                io::Error::new(io::ErrorKind::InvalidInput, "recv requires open stream"),
+                buffer,
+            ));
+        }
+        drop(state);
+        buffer.resize(max_len, 0);
+        c.inner_mut().prepare(Operation::RecvBuf(RecvOp {
+            fd: socket_id,
+            buf: buffer.clone(),
+            flags: 0,
+        }));
+        self.state
+            .lock()
+            .expect("simulated io mutex")
+            .pending
+            .push_back(SimulatedPendingOp::RecvBuf {
+                socket_id,
                 len: max_len,
                 buffer,
-                completion: c as *mut RecvCompletion as usize,
+                completion: c as *mut RecvBufCompletion as usize,
                 delay: None,
             });
         Ok(())
@@ -483,17 +523,25 @@ impl IOSocket for SimulatedSocket {
         Ok(())
     }
 
-    fn send_owned(&self, c: &mut SendOwnedCompletion, buf: Vec<u8>) -> io::Result<()> {
+    fn send_owned(
+        &self,
+        c: &mut SendOwnedCompletion,
+        buf: Vec<u8>,
+    ) -> Result<(), (io::Error, Vec<u8>)> {
         let state = self.state.lock().expect("simulated io mutex");
         let socket_id = *self.socket_id.lock().expect("socket id mutex");
-        let socket = state
+        let socket = match state
             .sockets
             .get(&socket_id)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "stream missing"))?;
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "stream missing"))
+        {
+            Ok(socket) => socket,
+            Err(error) => return Err((error, buf)),
+        };
         if socket.closed || !matches!(socket.kind, SimulatedSocketKind::Stream) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "send requires open stream",
+            return Err((
+                io::Error::new(io::ErrorKind::InvalidInput, "send requires open stream"),
+                buf,
             ));
         }
         drop(state);
@@ -625,6 +673,7 @@ impl SimulatedPendingOp {
             Self::Connect { delay, .. }
             | Self::Accept { delay, .. }
             | Self::Recv { delay, .. }
+            | Self::RecvBuf { delay, .. }
             | Self::Send { delay, .. }
             | Self::SendOwned { delay, .. } => delay,
         }
@@ -734,6 +783,35 @@ impl SimulatedPendingOp {
                 buffer.extend(stream.inbound.drain(..count));
                 Some(SimulatedReadyResult::Recv(Ok(std::mem::take(buffer))))
             }
+            Self::RecvBuf {
+                socket_id,
+                len,
+                buffer,
+                ..
+            } => {
+                let Some(stream) = state.sockets.get_mut(socket_id) else {
+                    return Some(SimulatedReadyResult::RecvBuf(Err((
+                        io::Error::new(io::ErrorKind::NotConnected, "stream missing"),
+                        std::mem::take(buffer),
+                    ))));
+                };
+                if stream.closed {
+                    return Some(SimulatedReadyResult::RecvBuf(Err((
+                        io::Error::new(io::ErrorKind::NotConnected, "stream closed"),
+                        std::mem::take(buffer),
+                    ))));
+                }
+                if stream.inbound.is_empty() && !stream.peer_input_closed {
+                    return None;
+                }
+                let count = (*len).min(stream.inbound.len());
+                buffer.clear();
+                buffer.extend(stream.inbound.drain(..count));
+                Some(SimulatedReadyResult::RecvBuf(Ok((
+                    std::mem::take(buffer),
+                    count,
+                ))))
+            }
             Self::Send {
                 socket_id, bytes, ..
             } => {
@@ -775,29 +853,29 @@ impl SimulatedPendingOp {
             } => {
                 let max_count = state.config.max_send_chunk.unwrap_or(bytes.len());
                 let Some(stream) = state.sockets.get_mut(socket_id) else {
-                    return Some(SimulatedReadyResult::SendOwned(Err(io::Error::new(
-                        io::ErrorKind::NotConnected,
-                        "stream missing",
+                    return Some(SimulatedReadyResult::SendOwned(Err((
+                        io::Error::new(io::ErrorKind::NotConnected, "stream missing"),
+                        std::mem::take(bytes),
                     ))));
                 };
                 if stream.closed {
-                    return Some(SimulatedReadyResult::SendOwned(Err(io::Error::new(
-                        io::ErrorKind::NotConnected,
-                        "stream closed",
+                    return Some(SimulatedReadyResult::SendOwned(Err((
+                        io::Error::new(io::ErrorKind::NotConnected, "stream closed"),
+                        std::mem::take(bytes),
                     ))));
                 }
                 let count = max_count.min(bytes.len());
                 if let Some(peer_stream_id) = stream.peer_stream_id {
                     let Some(peer) = state.sockets.get_mut(&peer_stream_id) else {
-                        return Some(SimulatedReadyResult::SendOwned(Err(io::Error::new(
-                            io::ErrorKind::NotConnected,
-                            "peer stream missing",
+                        return Some(SimulatedReadyResult::SendOwned(Err((
+                            io::Error::new(io::ErrorKind::NotConnected, "peer stream missing"),
+                            std::mem::take(bytes),
                         ))));
                     };
                     if peer.closed {
-                        return Some(SimulatedReadyResult::SendOwned(Err(io::Error::new(
-                            io::ErrorKind::NotConnected,
-                            "peer stream closed",
+                        return Some(SimulatedReadyResult::SendOwned(Err((
+                            io::Error::new(io::ErrorKind::NotConnected, "peer stream closed"),
+                            std::mem::take(bytes),
                         ))));
                     }
                     peer.inbound.extend(bytes[..count].iter().copied());
@@ -822,12 +900,14 @@ impl SimulatedPendingOp {
                 Some(listener) if !listener.closed => !listener.backlog.is_empty(),
                 _ => true,
             },
-            Self::Recv { socket_id, .. } => match state.sockets.get(socket_id) {
-                Some(stream) if !stream.closed => {
-                    !stream.inbound.is_empty() || stream.peer_input_closed
+            Self::Recv { socket_id, .. } | Self::RecvBuf { socket_id, .. } => {
+                match state.sockets.get(socket_id) {
+                    Some(stream) if !stream.closed => {
+                        !stream.inbound.is_empty() || stream.peer_input_closed
+                    }
+                    _ => true,
                 }
-                _ => true,
-            },
+            }
             Self::Send { .. } | Self::SendOwned { .. } => true,
         }
     }
@@ -849,6 +929,9 @@ impl SimulatedPendingOp {
             },
             (Self::Recv { completion, .. }, SimulatedReadyResult::Recv(result)) => unsafe {
                 (&mut *(completion as *mut RecvCompletion)).complete(result);
+            },
+            (Self::RecvBuf { completion, .. }, SimulatedReadyResult::RecvBuf(result)) => unsafe {
+                (&mut *(completion as *mut RecvBufCompletion)).complete(result);
             },
             (Self::Send { completion, .. }, SimulatedReadyResult::Send(result)) => unsafe {
                 (&mut *(completion as *mut SendCompletion)).complete(result);
@@ -872,11 +955,18 @@ impl SimulatedPendingOp {
             Self::Recv { completion, .. } => unsafe {
                 (&mut *(completion as *mut RecvCompletion)).complete(Err(error()));
             },
+            Self::RecvBuf {
+                completion, buffer, ..
+            } => unsafe {
+                (&mut *(completion as *mut RecvBufCompletion)).complete(Err((error(), buffer)));
+            },
             Self::Send { completion, .. } => unsafe {
                 (&mut *(completion as *mut SendCompletion)).complete(Err(error()));
             },
-            Self::SendOwned { completion, .. } => unsafe {
-                (&mut *(completion as *mut SendOwnedCompletion)).complete(Err(error()));
+            Self::SendOwned {
+                completion, bytes, ..
+            } => unsafe {
+                (&mut *(completion as *mut SendOwnedCompletion)).complete(Err((error(), bytes)));
             },
         }
     }
@@ -886,8 +976,9 @@ enum SimulatedReadyResult {
     Connect(io::Result<()>),
     Accept(io::Result<i32>),
     Recv(io::Result<Vec<u8>>),
+    RecvBuf(Result<(Vec<u8>, usize), (io::Error, Vec<u8>)>),
     Send(io::Result<usize>),
-    SendOwned(io::Result<(Vec<u8>, usize)>),
+    SendOwned(Result<(Vec<u8>, usize), (io::Error, Vec<u8>)>),
 }
 
 fn mix(mut value: u64) -> u64 {

@@ -53,8 +53,8 @@ impl SendOutcome {
     }
 }
 
-impl<T> TypedCall<T> {
-    pub(super) fn new(request: CallInput, decode: fn(CallOutput) -> Result<T, CallError>) -> Self {
+impl<T, E> TypedCall<T, E> {
+    pub(super) fn new(request: CallInput, decode: fn(CallOutput) -> Result<T, E>) -> Self {
         Self { request, decode }
     }
 
@@ -66,8 +66,9 @@ impl<T> TypedCall<T> {
     pub fn reply<I, F, M>(self, translator: F) -> tina::Effect<I>
     where
         I: tina::Isolate<Message = M, Call = RuntimeCall<M>>,
-        F: FnOnce(Result<T, CallError>) -> M + 'static,
+        F: FnOnce(Result<T, E>) -> M + 'static,
         T: 'static,
+        E: 'static,
     {
         self.then(translator)
     }
@@ -76,8 +77,9 @@ impl<T> TypedCall<T> {
     pub fn then<I, F, M>(self, translator: F) -> tina::Effect<I>
     where
         I: tina::Isolate<Message = M, Call = RuntimeCall<M>>,
-        F: FnOnce(Result<T, CallError>) -> M + 'static,
+        F: FnOnce(Result<T, E>) -> M + 'static,
         T: 'static,
+        E: 'static,
     {
         let decode = self.decode;
         tina::Effect::Call(RuntimeCall::new(self.request, move |output| {
@@ -98,8 +100,9 @@ impl<T> TypedCall<T> {
     ) -> tina::Effect<I>
     where
         I: tina::Isolate<Message = M, Call = RuntimeCall<M>>,
-        F: FnOnce(tina::RequestContext<Q>, Result<T, CallError>) -> M + 'static,
+        F: FnOnce(tina::RequestContext<Q>, Result<T, E>) -> M + 'static,
         T: 'static,
+        E: 'static,
         M: 'static,
         Q: 'static,
     {
@@ -115,8 +118,9 @@ impl<T> TypedCall<T> {
     ) -> tina::Effect<I>
     where
         I: tina::Isolate<Message = M, Call = RuntimeCall<M>>,
-        F: FnOnce(tina::RequestContext<Q>, Result<T, CallError>) -> M + 'static,
+        F: FnOnce(tina::RequestContext<Q>, Result<T, E>) -> M + 'static,
         T: 'static,
+        E: 'static,
         M: 'static,
         Q: 'static,
     {
@@ -127,10 +131,11 @@ impl<T> TypedCall<T> {
     }
 }
 
-impl<T, Q> DeferredTypedCall<T, Q>
+impl<T, Q, E> DeferredTypedCall<T, Q, E>
 where
     T: 'static,
     Q: 'static,
+    E: 'static,
 {
     /// Builds the continuation that carries the captured caller request.
     ///
@@ -140,36 +145,38 @@ where
     pub fn reply<I, F, M>(self, translator: F) -> tina::Effect<I>
     where
         I: tina::Isolate<Message = M, Reply = Q, Call = RuntimeCall<M>>,
-        F: FnOnce(tina::RequestContext<Q>, Result<T, CallError>) -> M + 'static,
+        F: FnOnce(tina::RequestContext<Q>, Result<T, E>) -> M + 'static,
         M: 'static,
     {
         self.inner.then_with_request(self.request, translator)
     }
 }
 
-impl<T, Q> RequestDeferredTypedCall<T, Q>
+impl<T, Q, E> RequestDeferredTypedCall<T, Q, E>
 where
     T: 'static,
     Q: 'static,
+    E: 'static,
 {
     /// Builds a request effect whose continuation carries caller authority.
     pub fn reply<I, F, M>(self, translator: F) -> tina::RequestEffect<I>
     where
         I: tina::Isolate<Message = M, Reply = Q, Call = RuntimeCall<M>>,
-        F: FnOnce(tina::RequestContext<Q>, Result<T, CallError>) -> M + 'static,
+        F: FnOnce(tina::RequestContext<Q>, Result<T, E>) -> M + 'static,
         M: 'static,
     {
         crate::call::request_effect_from_consumed_effect(self.inner.reply(translator))
     }
 }
 
-impl<T, I> tina::DeferThrough<I> for TypedCall<T>
+impl<T, E, I> tina::DeferThrough<I> for TypedCall<T, E>
 where
     T: 'static,
+    E: 'static,
     I: tina::Isolate,
     I::Reply: 'static,
 {
-    type Deferred = DeferredTypedCall<T, I::Reply>;
+    type Deferred = DeferredTypedCall<T, I::Reply, E>;
 
     fn defer_through(self, call: tina::CallContext<'_, I>) -> Self::Deferred {
         DeferredTypedCall {
@@ -179,13 +186,14 @@ where
     }
 }
 
-impl<T, I> tina::RequestDeferThrough<I> for TypedCall<T>
+impl<T, E, I> tina::RequestDeferThrough<I> for TypedCall<T, E>
 where
     T: 'static,
+    E: 'static,
     I: tina::Isolate,
     I::Reply: 'static,
 {
-    type RequestDeferred = RequestDeferredTypedCall<T, I::Reply>;
+    type RequestDeferred = RequestDeferredTypedCall<T, I::Reply, E>;
 
     fn defer_request_through(self, call: tina::RequestCall<'_, I>) -> Self::RequestDeferred {
         RequestDeferredTypedCall {

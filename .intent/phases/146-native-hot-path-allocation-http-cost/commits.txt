@@ -19,6 +19,6 @@ Evidence commands run during implementation/review:
 - ./scripts/perf_check.sh
 
 Open truth:
-- Owned buffers return on success. The current TypedCall<T> error envelope still drops owned buffers on driver errors; fixing that needs a broader typed error-envelope phase.
-- HTTP/1 server/client/keepalive moved to owned-buffer calls, but standalone WebSocket client and HTTP/2 still use compatibility helpers.
+- Owned-buffer failures now return buffer/bytes through rail-specific error envelopes. Plain compatibility helpers still collapse errors to CallError.
+- HTTP/1 server/client/keepalive, HTTP/2 server/client, and standalone/server WebSocket paths use owned-buffer read/write calls.
 - Perf history is local macOS aarch64 evidence, not a production claim.

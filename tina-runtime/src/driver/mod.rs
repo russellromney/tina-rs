@@ -48,8 +48,8 @@ use std::time::{Duration, Instant};
 
 use betelgeuse::{
     AcceptCompletion, ConnectCompletion, FsyncCompletion, IO, IOFile, IOLoop, IOLoopHandle,
-    IOSocket, MkdirCompletion, OpenOptions, PReadCompletion, PWriteCompletion, RecvCompletion,
-    SendCompletion, SendOwnedCompletion, SizeCompletion, io_loop,
+    IOSocket, MkdirCompletion, OpenOptions, PReadCompletion, PWriteCompletion, RecvBufCompletion,
+    RecvCompletion, SendCompletion, SendOwnedCompletion, SizeCompletion, io_loop,
 };
 
 use crate::call::{

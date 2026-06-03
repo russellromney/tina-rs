@@ -28,6 +28,15 @@ pub struct TcpReadBufReply {
     pub len: usize,
 }
 
+/// Owned-buffer TCP read failure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TcpReadBufError {
+    /// The runtime failure.
+    pub error: CallError,
+    /// Caller-owned buffer returned by the runtime.
+    pub buffer: Vec<u8>,
+}
+
 /// Successful owned-buffer TCP write reply.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TcpWriteOwnedReply {
@@ -35,6 +44,15 @@ pub struct TcpWriteOwnedReply {
     pub bytes: Vec<u8>,
     /// Bytes accepted by the stream.
     pub written: usize,
+}
+
+/// Owned-buffer TCP write failure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TcpWriteOwnedError {
+    /// The runtime failure.
+    pub error: CallError,
+    /// Caller-owned bytes returned by the runtime.
+    pub bytes: Vec<u8>,
 }
 
 /// Successful owned-buffer TLS read reply.
@@ -46,6 +64,15 @@ pub struct TlsReadBufReply {
     pub len: usize,
 }
 
+/// Owned-buffer TLS read failure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TlsReadBufError {
+    /// The runtime failure.
+    pub error: CallError,
+    /// Caller-owned plaintext buffer returned by the runtime.
+    pub buffer: Vec<u8>,
+}
+
 /// Successful owned-buffer TLS write reply.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TlsWriteOwnedReply {
@@ -53,6 +80,15 @@ pub struct TlsWriteOwnedReply {
     pub bytes: Vec<u8>,
     /// Plaintext bytes accepted by the TLS stream.
     pub written: usize,
+}
+
+/// Owned-buffer TLS write failure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TlsWriteOwnedError {
+    /// The runtime failure.
+    pub error: CallError,
+    /// Caller-owned plaintext bytes returned by the runtime.
+    pub bytes: Vec<u8>,
 }
 
 /// One concrete call shape understood by `tina-runtime`.
@@ -615,6 +651,14 @@ pub enum CallOutput {
         len: usize,
     },
 
+    /// A reusable-buffer TCP read failed and returned its buffer.
+    TcpReadBufFailed {
+        /// Caller-owned buffer returned by the runtime.
+        buffer: Vec<u8>,
+        /// Runtime failure.
+        error: CallError,
+    },
+
     /// A write moved `count` bytes onto the stream. The issuing isolate is
     /// responsible for issuing another write if `count` is less than the
     /// requested length.
@@ -629,6 +673,14 @@ pub enum CallOutput {
         bytes: Vec<u8>,
         /// Bytes accepted by the stream.
         count: usize,
+    },
+
+    /// A reusable-buffer TCP write failed and returned its bytes.
+    TcpWroteOwnedFailed {
+        /// Caller-owned bytes returned by the runtime.
+        bytes: Vec<u8>,
+        /// Runtime failure.
+        error: CallError,
     },
 
     /// A listener was closed and its resources released.
@@ -706,6 +758,14 @@ pub enum CallOutput {
         len: usize,
     },
 
+    /// A reusable-buffer TLS read failed and returned its buffer.
+    TlsReadBufFailed {
+        /// Caller-owned plaintext buffer returned by the runtime.
+        buffer: Vec<u8>,
+        /// Runtime failure.
+        error: CallError,
+    },
+
     /// A TLS stream wrote plaintext bytes.
     TlsWrote {
         /// Plaintext byte count accepted by the TLS stream.
@@ -718,6 +778,18 @@ pub enum CallOutput {
         bytes: Vec<u8>,
         /// Plaintext byte count accepted by the TLS stream.
         count: usize,
+    },
+
+    /// A reusable-buffer TLS write failed and returned its bytes.
+    ///
+    /// The returned bytes are the caller-owned plaintext allocation. The error
+    /// still decides retry safety; for TLS, some plaintext may already have
+    /// been accepted by the connection state before a later transport failure.
+    TlsWroteOwnedFailed {
+        /// Caller-owned plaintext bytes returned by the runtime.
+        bytes: Vec<u8>,
+        /// Runtime failure.
+        error: CallError,
     },
 
     /// A TLS stream was closed.

@@ -568,17 +568,35 @@ impl TlsLane {
         if self.lane_has_active(lane) {
             return Some(DriverCompletion {
                 call_id,
-                result: CallOutput::Failed(CallError::ResourceBusy),
+                result: CallOutput::TlsReadBufFailed {
+                    buffer,
+                    error: CallError::ResourceBusy,
+                },
             });
         }
         if !self.streams.iter().any(|entry| entry.id == stream) {
             return Some(DriverCompletion {
                 call_id,
-                result: CallOutput::Failed(CallError::InvalidResource),
+                result: CallOutput::TlsReadBufFailed {
+                    buffer,
+                    error: CallError::InvalidResource,
+                },
             });
         }
         if let Some(failure) = self.reject_if_full_or_zero(call_id, timeout) {
-            return Some(failure);
+            let error = match failure.result {
+                CallOutput::Failed(error) => error,
+                other => {
+                    return Some(DriverCompletion {
+                        call_id,
+                        result: other,
+                    });
+                }
+            };
+            return Some(DriverCompletion {
+                call_id,
+                result: CallOutput::TlsReadBufFailed { buffer, error },
+            });
         }
         self.pending.push(TlsPending {
             call_id,
@@ -606,17 +624,35 @@ impl TlsLane {
         if self.lane_has_active(lane) {
             return Some(DriverCompletion {
                 call_id,
-                result: CallOutput::Failed(CallError::ResourceBusy),
+                result: CallOutput::TlsWroteOwnedFailed {
+                    bytes,
+                    error: CallError::ResourceBusy,
+                },
             });
         }
         if !self.streams.iter().any(|entry| entry.id == stream) {
             return Some(DriverCompletion {
                 call_id,
-                result: CallOutput::Failed(CallError::InvalidResource),
+                result: CallOutput::TlsWroteOwnedFailed {
+                    bytes,
+                    error: CallError::InvalidResource,
+                },
             });
         }
         if let Some(failure) = self.reject_if_full_or_zero(call_id, timeout) {
-            return Some(failure);
+            let error = match failure.result {
+                CallOutput::Failed(error) => error,
+                other => {
+                    return Some(DriverCompletion {
+                        call_id,
+                        result: other,
+                    });
+                }
+            };
+            return Some(DriverCompletion {
+                call_id,
+                result: CallOutput::TlsWroteOwnedFailed { bytes, error },
+            });
         }
         self.pending.push(TlsPending {
             call_id,
@@ -644,17 +680,35 @@ impl TlsLane {
         if self.lane_has_active(lane) {
             return Some(DriverCompletion {
                 call_id,
-                result: CallOutput::Failed(CallError::ResourceBusy),
+                result: CallOutput::TlsWroteOwnedFailed {
+                    bytes,
+                    error: CallError::ResourceBusy,
+                },
             });
         }
         if !self.streams.iter().any(|entry| entry.id == stream) {
             return Some(DriverCompletion {
                 call_id,
-                result: CallOutput::Failed(CallError::InvalidResource),
+                result: CallOutput::TlsWroteOwnedFailed {
+                    bytes,
+                    error: CallError::InvalidResource,
+                },
             });
         }
         if let Some(failure) = self.reject_if_full_or_zero(call_id, timeout) {
-            return Some(failure);
+            let error = match failure.result {
+                CallOutput::Failed(error) => error,
+                other => {
+                    return Some(DriverCompletion {
+                        call_id,
+                        result: other,
+                    });
+                }
+            };
+            return Some(DriverCompletion {
+                call_id,
+                result: CallOutput::TlsWroteOwnedFailed { bytes, error },
+            });
         }
         self.pending.push(TlsPending {
             call_id,
@@ -1009,14 +1063,23 @@ impl TlsLane {
                 if !io.outbound.is_empty() {
                     return match io.flush_or_fill(false) {
                         Ok(_) => None,
-                        Err(error) => Some(CallOutput::Failed(error)),
+                        Err(error) => Some(CallOutput::TlsReadBufFailed {
+                            buffer: std::mem::take(buffer),
+                            error,
+                        }),
                     };
                 }
                 if io.conn.wants_read() && !io.read_eof {
                     return match io.flush_or_fill(true) {
                         Ok(true) => None,
-                        Ok(false) => Some(CallOutput::Failed(CallError::Io)),
-                        Err(error) => Some(CallOutput::Failed(error)),
+                        Ok(false) => Some(CallOutput::TlsReadBufFailed {
+                            buffer: std::mem::take(buffer),
+                            error: CallError::Io,
+                        }),
+                        Err(error) => Some(CallOutput::TlsReadBufFailed {
+                            buffer: std::mem::take(buffer),
+                            error,
+                        }),
                     };
                 }
                 buffer.resize(max_len, 0);
@@ -1032,14 +1095,26 @@ impl TlsLane {
                     Err(error) if error.kind() == ErrorKind::WouldBlock => {
                         match io.flush_or_fill(true) {
                             Ok(true) => None,
-                            Ok(false) => Some(CallOutput::Failed(CallError::Io)),
-                            Err(error) => Some(CallOutput::Failed(error)),
+                            Ok(false) => Some(CallOutput::TlsReadBufFailed {
+                                buffer: std::mem::take(buffer),
+                                error: CallError::Io,
+                            }),
+                            Err(error) => Some(CallOutput::TlsReadBufFailed {
+                                buffer: std::mem::take(buffer),
+                                error,
+                            }),
                         }
                     }
                     Err(error) if error.kind() == ErrorKind::UnexpectedEof => {
-                        Some(CallOutput::Failed(CallError::Io))
+                        Some(CallOutput::TlsReadBufFailed {
+                            buffer: std::mem::take(buffer),
+                            error: CallError::Io,
+                        })
                     }
-                    Err(_) => Some(CallOutput::Failed(CallError::Io)),
+                    Err(_) => Some(CallOutput::TlsReadBufFailed {
+                        buffer: std::mem::take(buffer),
+                        error: CallError::Io,
+                    }),
                 }
             }
             TlsOpState::Write { plaintext, fed, .. } => {
@@ -1064,7 +1139,10 @@ impl TlsLane {
                 }
                 match io.flush_or_fill(false) {
                     Ok(_) => None,
-                    Err(error) => Some(CallOutput::Failed(error)),
+                    Err(error) => Some(CallOutput::TlsWroteOwnedFailed {
+                        bytes: std::mem::take(plaintext),
+                        error,
+                    }),
                 }
             }
             TlsOpState::WriteOwned { plaintext, fed, .. } => {
@@ -1089,7 +1167,10 @@ impl TlsLane {
                 }
                 match io.flush_or_fill(false) {
                     Ok(_) => None,
-                    Err(error) => Some(CallOutput::Failed(error)),
+                    Err(error) => Some(CallOutput::TlsWroteOwnedFailed {
+                        bytes: std::mem::take(plaintext),
+                        error,
+                    }),
                 }
             }
             _ => unreachable!(),
@@ -1603,6 +1684,79 @@ mod tests {
             next += 1;
         }
         assert_eq!(received, payload);
+    }
+
+    #[test]
+    fn owned_tls_write_failures_return_plaintext_bytes() {
+        let mut lane = fresh_lane(64);
+        let invalid_bytes = b"invalid stream".to_vec();
+        let invalid = lane
+            .submit_write_owned(
+                CallId::new(10),
+                TlsStreamId::new(99),
+                invalid_bytes.clone(),
+                long(),
+                Instant::now(),
+            )
+            .expect("invalid stream completes inline");
+        assert!(matches!(
+            invalid.result,
+            CallOutput::TlsWroteOwnedFailed {
+                bytes,
+                error: CallError::InvalidResource,
+            } if bytes == invalid_bytes
+        ));
+
+        let mut completed = Vec::new();
+        let (_server_stream, _accepted, client_stream, _connected) =
+            handshake_pair(&mut lane, &mut completed, Vec::new(), Vec::new());
+
+        let timeout_bytes = b"zero timeout".to_vec();
+        let timeout = lane
+            .submit_write_owned(
+                CallId::new(11),
+                client_stream,
+                timeout_bytes.clone(),
+                Duration::ZERO,
+                Instant::now(),
+            )
+            .expect("zero timeout completes inline");
+        assert!(matches!(
+            timeout.result,
+            CallOutput::TlsWroteOwnedFailed {
+                bytes,
+                error: CallError::Timeout,
+            } if bytes == timeout_bytes
+        ));
+
+        assert!(
+            lane.submit_read_buf(
+                CallId::new(12),
+                client_stream,
+                Vec::new(),
+                16,
+                long(),
+                Instant::now()
+            )
+            .is_none()
+        );
+        let busy_bytes = b"busy lane".to_vec();
+        let busy = lane
+            .submit_write_owned(
+                CallId::new(13),
+                client_stream,
+                busy_bytes.clone(),
+                long(),
+                Instant::now(),
+            )
+            .expect("busy stream completes inline");
+        assert!(matches!(
+            busy.result,
+            CallOutput::TlsWroteOwnedFailed {
+                bytes,
+                error: CallError::ResourceBusy,
+            } if bytes == busy_bytes
+        ));
     }
 
     #[test]

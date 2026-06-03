@@ -309,7 +309,7 @@ impl Isolate for OwnedBufferClient {
             OwnedClientEvent::Connected(Ok((stream, _local_addr, _peer_addr))) => {
                 self.stream = Some(stream);
                 tcp_write_owned(stream, std::mem::take(&mut self.payload))
-                    .then(OwnedClientEvent::Wrote)
+                    .then(|result| OwnedClientEvent::Wrote(result.map_err(|error| error.error)))
             }
             OwnedClientEvent::Wrote(Ok(reply)) => {
                 let stream = self.stream.expect("stream set after connect");
@@ -320,10 +320,13 @@ impl Isolate for OwnedBufferClient {
                 if reply.written < reply.bytes.len() {
                     let mut remaining = reply.bytes;
                     remaining.drain(..reply.written);
-                    return tcp_write_owned(stream, remaining).then(OwnedClientEvent::Wrote);
+                    return tcp_write_owned(stream, remaining).then(|result| {
+                        OwnedClientEvent::Wrote(result.map_err(|error| error.error))
+                    });
                 }
                 let scratch = Vec::with_capacity(128);
-                tcp_read_buf(stream, scratch, 64).then(OwnedClientEvent::Read)
+                tcp_read_buf(stream, scratch, 64)
+                    .then(|result| OwnedClientEvent::Read(result.map_err(|error| error.error)))
             }
             OwnedClientEvent::Read(Ok(reply)) => {
                 let stream = self.stream.expect("stream set after connect");

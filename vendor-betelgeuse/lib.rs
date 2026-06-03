@@ -34,8 +34,9 @@ pub mod task;
 
 pub use completion::{
     AcceptCompletion, AcceptOp, ConnectCompletion, ConnectOp, FsyncCompletion, FsyncOp,
-    MkdirCompletion, MkdirOp, PReadCompletion, PReadOp, PWriteCompletion, PWriteOp, RecvCompletion,
-    RecvOp, SendCompletion, SendOp, SendOwnedCompletion, SizeCompletion, SizeOp,
+    MkdirCompletion, MkdirOp, PReadCompletion, PReadOp, PWriteCompletion, PWriteOp,
+    RecvBufCompletion, RecvCompletion, RecvOp, SendCompletion, SendOp, SendOwnedCompletion,
+    SizeCompletion, SizeOp,
 };
 
 pub use completion::{CompletionInner, Operation};
@@ -176,17 +177,21 @@ pub trait IOSocket {
     /// allocation.
     fn recv_buf(
         &self,
-        c: &mut RecvCompletion,
+        c: &mut RecvBufCompletion,
         buffer: Vec<u8>,
         max_len: usize,
-    ) -> stdio::Result<()>;
+    ) -> Result<(), (stdio::Error, Vec<u8>)>;
 
     /// Sends the contents of `buf` on a connected socket.
     fn send(&self, c: &mut SendCompletion, buf: Vec<u8>) -> stdio::Result<()>;
 
     /// Sends the contents of `buf` and returns the same buffer with the
     /// accepted byte count.
-    fn send_owned(&self, c: &mut SendOwnedCompletion, buf: Vec<u8>) -> stdio::Result<()>;
+    fn send_owned(
+        &self,
+        c: &mut SendOwnedCompletion,
+        buf: Vec<u8>,
+    ) -> Result<(), (stdio::Error, Vec<u8>)>;
 
     /// Enables or disables the `TCP_NODELAY` socket option.
     ///

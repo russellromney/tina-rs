@@ -641,12 +641,16 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
     fn read_more(&mut self) -> Effect<Self> {
         let buffer = std::mem::take(&mut self.read_scratch);
         match self.transport {
-            HttpTransport::Tcp(stream) => {
-                tcp_read_buf(stream, buffer, READ_CHUNK).then(HttpConnectionMsg::Read)
-            }
+            HttpTransport::Tcp(stream) => tcp_read_buf(stream, buffer, READ_CHUNK)
+                .then(|result| HttpConnectionMsg::Read(result.map_err(|error| error.error))),
             HttpTransport::Tls(stream) => {
-                tls_read_buf(stream, buffer, READ_CHUNK, self.tls_io_timeout)
-                    .then(|result| HttpConnectionMsg::Read(result.map(tls_read_reply_to_tcp)))
+                tls_read_buf(stream, buffer, READ_CHUNK, self.tls_io_timeout).then(|result| {
+                    HttpConnectionMsg::Read(
+                        result
+                            .map(tls_read_reply_to_tcp)
+                            .map_err(|error| error.error),
+                    )
+                })
             }
         }
     }
@@ -961,11 +965,17 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
         }
         let buffer = std::mem::take(&mut self.read_scratch);
         match self.transport {
-            HttpTransport::Tcp(stream) => {
-                tcp_read_buf(stream, buffer, want).then(HttpConnectionMsg::BodyChunkRead)
-            }
+            HttpTransport::Tcp(stream) => tcp_read_buf(stream, buffer, want).then(|result| {
+                HttpConnectionMsg::BodyChunkRead(result.map_err(|error| error.error))
+            }),
             HttpTransport::Tls(stream) => tls_read_buf(stream, buffer, want, self.tls_io_timeout)
-                .then(|result| HttpConnectionMsg::BodyChunkRead(result.map(tls_read_reply_to_tcp))),
+                .then(|result| {
+                    HttpConnectionMsg::BodyChunkRead(
+                        result
+                            .map(tls_read_reply_to_tcp)
+                            .map_err(|error| error.error),
+                    )
+                }),
         }
     }
 
@@ -1047,15 +1057,20 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
                         return match self.transport {
                             HttpTransport::Tcp(stream) => {
                                 let buffer = std::mem::take(&mut self.read_scratch);
-                                tcp_read_buf(stream, buffer, next_want)
-                                    .then(HttpConnectionMsg::BodyChunkRead)
+                                tcp_read_buf(stream, buffer, next_want).then(|result| {
+                                    HttpConnectionMsg::BodyChunkRead(
+                                        result.map_err(|error| error.error),
+                                    )
+                                })
                             }
                             HttpTransport::Tls(stream) => {
                                 let buffer = std::mem::take(&mut self.read_scratch);
                                 tls_read_buf(stream, buffer, next_want, self.tls_io_timeout).then(
                                     |result| {
                                         HttpConnectionMsg::BodyChunkRead(
-                                            result.map(tls_read_reply_to_tcp),
+                                            result
+                                                .map(tls_read_reply_to_tcp)
+                                                .map_err(|error| error.error),
                                         )
                                     },
                                 )
@@ -1178,11 +1193,17 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
     fn write_pending(&mut self) -> Effect<Self> {
         let bytes = std::mem::take(&mut self.pending_response);
         match self.transport {
-            HttpTransport::Tcp(stream) => {
-                tcp_write_owned(stream, bytes).then(HttpConnectionMsg::Wrote)
+            HttpTransport::Tcp(stream) => tcp_write_owned(stream, bytes)
+                .then(|result| HttpConnectionMsg::Wrote(result.map_err(|error| error.error))),
+            HttpTransport::Tls(stream) => {
+                tls_write_owned(stream, bytes, self.tls_io_timeout).then(|result| {
+                    HttpConnectionMsg::Wrote(
+                        result
+                            .map(tls_write_reply_to_tcp)
+                            .map_err(|error| error.error),
+                    )
+                })
             }
-            HttpTransport::Tls(stream) => tls_write_owned(stream, bytes, self.tls_io_timeout)
-                .then(|result| HttpConnectionMsg::Wrote(result.map(tls_write_reply_to_tcp))),
         }
     }
 
@@ -1492,11 +1513,16 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
         }
         let buffer = std::mem::take(&mut self.read_scratch);
         match self.transport {
-            HttpTransport::Tcp(stream) => {
-                tcp_read_buf(stream, buffer, max).then(HttpConnectionMsg::Read)
-            }
+            HttpTransport::Tcp(stream) => tcp_read_buf(stream, buffer, max)
+                .then(|result| HttpConnectionMsg::Read(result.map_err(|error| error.error))),
             HttpTransport::Tls(stream) => tls_read_buf(stream, buffer, max, self.tls_io_timeout)
-                .then(|result| HttpConnectionMsg::Read(result.map(tls_read_reply_to_tcp))),
+                .then(|result| {
+                    HttpConnectionMsg::Read(
+                        result
+                            .map(tls_read_reply_to_tcp)
+                            .map_err(|error| error.error),
+                    )
+                }),
         }
     }
 
@@ -2052,11 +2078,17 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
         };
         let bytes = std::mem::take(&mut ws.pending_write);
         match self.transport {
-            HttpTransport::Tcp(stream) => {
-                tcp_write_owned(stream, bytes).then(HttpConnectionMsg::Wrote)
+            HttpTransport::Tcp(stream) => tcp_write_owned(stream, bytes)
+                .then(|result| HttpConnectionMsg::Wrote(result.map_err(|error| error.error))),
+            HttpTransport::Tls(stream) => {
+                tls_write_owned(stream, bytes, self.tls_io_timeout).then(|result| {
+                    HttpConnectionMsg::Wrote(
+                        result
+                            .map(tls_write_reply_to_tcp)
+                            .map_err(|error| error.error),
+                    )
+                })
             }
-            HttpTransport::Tls(stream) => tls_write_owned(stream, bytes, self.tls_io_timeout)
-                .then(|result| HttpConnectionMsg::Wrote(result.map(tls_write_reply_to_tcp))),
         }
     }
 

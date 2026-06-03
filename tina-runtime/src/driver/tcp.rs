@@ -72,7 +72,7 @@ enum PendingKind {
         socket: Option<Box<dyn IOSocket>>,
     },
     Read(Box<RecvCompletion>),
-    ReadBuf(Box<RecvCompletion>),
+    ReadBuf(Box<RecvBufCompletion>),
     Write(Box<SendCompletion>),
     WriteOwned(Box<SendOwnedCompletion>),
     UdpRecv {
@@ -404,7 +404,10 @@ impl BetelgeuseTcp {
                 if self.lane_has_pending(lane) {
                     return Some(DriverCompletion {
                         call_id,
-                        result: CallOutput::Failed(CallError::ResourceBusy),
+                        result: CallOutput::TcpReadBufFailed {
+                            buffer,
+                            error: CallError::ResourceBusy,
+                        },
                     });
                 }
                 match self.arm_read_buf(stream, buffer, max_len) {
@@ -448,7 +451,10 @@ impl BetelgeuseTcp {
                 if self.lane_has_pending(lane) {
                     return Some(DriverCompletion {
                         call_id,
-                        result: CallOutput::Failed(CallError::ResourceBusy),
+                        result: CallOutput::TcpWroteOwnedFailed {
+                            bytes,
+                            error: CallError::ResourceBusy,
+                        },
                     });
                 }
                 match self.arm_write_owned(stream, bytes) {
@@ -730,11 +736,11 @@ impl BetelgeuseTcp {
                     .take_result()
                     .expect("recv completion advertised a result");
                 match result {
-                    Ok(buffer) => {
-                        let len = buffer.len();
-                        Some(CallOutput::TcpReadBuf { buffer, len })
-                    }
-                    Err(_) => Some(CallOutput::Failed(CallError::Io)),
+                    Ok((buffer, len)) => Some(CallOutput::TcpReadBuf { buffer, len }),
+                    Err((_error, buffer)) => Some(CallOutput::TcpReadBufFailed {
+                        buffer,
+                        error: CallError::Io,
+                    }),
                 }
             }
             PendingKind::Write(completion) => {
@@ -758,7 +764,10 @@ impl BetelgeuseTcp {
                     .expect("send-owned completion advertised a result");
                 match result {
                     Ok((bytes, count)) => Some(CallOutput::TcpWroteOwned { bytes, count }),
-                    Err(_) => Some(CallOutput::Failed(CallError::Io)),
+                    Err((_error, bytes)) => Some(CallOutput::TcpWroteOwnedFailed {
+                        bytes,
+                        error: CallError::Io,
+                    }),
                 }
             }
             PendingKind::UdpRecv {
@@ -1049,18 +1058,18 @@ impl BetelgeuseTcp {
         buffer: Vec<u8>,
         max_len: usize,
     ) -> Result<PendingKind, CallOutput> {
-        let entry = self
-            .streams
-            .iter()
-            .find(|entry| entry.id == stream)
-            .ok_or(CallOutput::Failed(CallError::InvalidResource))?;
-        let mut completion = Box::new(RecvCompletion::new());
-        if entry
-            .socket
-            .recv_buf(&mut completion, buffer, max_len)
-            .is_err()
-        {
-            return Err(CallOutput::Failed(CallError::Io));
+        let Some(entry) = self.streams.iter().find(|entry| entry.id == stream) else {
+            return Err(CallOutput::TcpReadBufFailed {
+                buffer,
+                error: CallError::InvalidResource,
+            });
+        };
+        let mut completion = Box::new(RecvBufCompletion::new());
+        if let Err((_error, buffer)) = entry.socket.recv_buf(&mut completion, buffer, max_len) {
+            return Err(CallOutput::TcpReadBufFailed {
+                buffer,
+                error: CallError::Io,
+            });
         }
         Ok(PendingKind::ReadBuf(completion))
     }
@@ -1083,14 +1092,18 @@ impl BetelgeuseTcp {
         stream: StreamId,
         bytes: Vec<u8>,
     ) -> Result<PendingKind, CallOutput> {
-        let entry = self
-            .streams
-            .iter()
-            .find(|entry| entry.id == stream)
-            .ok_or(CallOutput::Failed(CallError::InvalidResource))?;
+        let Some(entry) = self.streams.iter().find(|entry| entry.id == stream) else {
+            return Err(CallOutput::TcpWroteOwnedFailed {
+                bytes,
+                error: CallError::InvalidResource,
+            });
+        };
         let mut completion = Box::new(SendOwnedCompletion::new());
-        if entry.socket.send_owned(&mut completion, bytes).is_err() {
-            return Err(CallOutput::Failed(CallError::Io));
+        if let Err((_error, bytes)) = entry.socket.send_owned(&mut completion, bytes) {
+            return Err(CallOutput::TcpWroteOwnedFailed {
+                bytes,
+                error: CallError::Io,
+            });
         }
         Ok(PendingKind::WriteOwned(completion))
     }

@@ -127,10 +127,11 @@ The next pass added Tina-shaped owned-buffer calls:
 - `tcp_read_buf` / `tls_read_buf`;
 - `tcp_write_owned` / `tls_write_owned`.
 
-Buffers move through effects and come back on success. Native HTTP/1 server,
-one-shot client, keepalive client, and server WebSocket paths use that shape
-now. This removes the obvious "read fresh Vec, copy into HTTP buffer, drop it"
-and "clone pending write bytes before every write" waste.
+Buffers move through effects and come back on success and on owned-helper
+failure. Native HTTP/1 server, one-shot client, keepalive client, server
+WebSocket, HTTP/2 server/client, and standalone WebSocket client paths use that
+shape now. This removes the obvious "read fresh Vec, copy into HTTP buffer,
+drop it" and "clone pending write bytes before every write" waste.
 
 Current local truth is still not a production claim:
 
@@ -138,9 +139,9 @@ Current local truth is still not a production claim:
 - HTTP/1 close and keepalive are still slower/noisier than Axum.
 - Whole-process allocation rows still show Tina HTTP around 1.4-1.8x Axum on
   these rows.
-- Standalone WebSocket client and HTTP/2 still use the compatibility helpers.
-- Owned buffers return on success; the current `TypedCall<T>` error envelope
-  does not return the buffer on driver failure.
+- Plain compatibility helpers still collapse owned-helper failures to
+  `CallError` and discard their temporary buffers. Use the owned helpers when
+  buffer reuse matters.
 
 Suggested next follow-ups:
 - Smaller HTTP request/response allocation shapes (`SmallVec` headers,

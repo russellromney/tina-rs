@@ -6,7 +6,8 @@
 use std::net::SocketAddr;
 
 use super::{
-    CallInput, CallOutput, ListenerId, StreamId, TcpReadBufReply, TcpWriteOwnedReply, TypedCall,
+    CallInput, CallOutput, ListenerId, StreamId, TcpReadBufError, TcpReadBufReply,
+    TcpWriteOwnedError, TcpWriteOwnedReply, TypedCall,
 };
 
 /// Returns a typed TCP bind helper that later yields one listener id and
@@ -46,7 +47,7 @@ pub fn tcp_read_buf(
     stream: StreamId,
     buffer: Vec<u8>,
     max_len: usize,
-) -> TypedCall<TcpReadBufReply> {
+) -> TypedCall<TcpReadBufReply, TcpReadBufError> {
     TypedCall::new(
         CallInput::TcpReadBuf {
             stream,
@@ -66,7 +67,10 @@ pub fn tcp_write(stream: StreamId, bytes: Vec<u8>) -> TypedCall<usize> {
 }
 
 /// Returns a typed TCP write helper that gives the caller-owned bytes back.
-pub fn tcp_write_owned(stream: StreamId, bytes: Vec<u8>) -> TypedCall<TcpWriteOwnedReply> {
+pub fn tcp_write_owned(
+    stream: StreamId,
+    bytes: Vec<u8>,
+) -> TypedCall<TcpWriteOwnedReply, TcpWriteOwnedError> {
     TypedCall::new(
         CallInput::TcpWriteOwned { stream, bytes },
         CallOutput::into_tcp_wrote_owned,

@@ -662,12 +662,15 @@ impl<S: Shard + 'static> KeepaliveConnection<S> {
         let transport = self.transport.expect("transport set before write");
         let bytes = std::mem::take(&mut in_flight.pending_write);
         match transport {
-            HttpTransport::Tcp(stream) => {
-                tcp_write_owned(stream, bytes).then(KeepaliveConnectionMsg::Wrote)
-            }
+            HttpTransport::Tcp(stream) => tcp_write_owned(stream, bytes)
+                .then(|result| KeepaliveConnectionMsg::Wrote(result.map_err(|error| error.error))),
             HttpTransport::Tls(stream) => {
                 tls_write_owned(stream, bytes, self.config.request_timeout).then(|result| {
-                    KeepaliveConnectionMsg::Wrote(result.map(tls_write_reply_to_tcp))
+                    KeepaliveConnectionMsg::Wrote(
+                        result
+                            .map(tls_write_reply_to_tcp)
+                            .map_err(|error| error.error),
+                    )
                 })
             }
         }
@@ -699,12 +702,18 @@ impl<S: Shard + 'static> KeepaliveConnection<S> {
         let in_flight = self.in_flight.as_mut().expect("in_flight present");
         let buffer = std::mem::take(&mut in_flight.read_scratch);
         match transport {
-            HttpTransport::Tcp(stream) => {
-                tcp_read_buf(stream, buffer, READ_CHUNK).then(KeepaliveConnectionMsg::Read)
-            }
+            HttpTransport::Tcp(stream) => tcp_read_buf(stream, buffer, READ_CHUNK)
+                .then(|result| KeepaliveConnectionMsg::Read(result.map_err(|error| error.error))),
             HttpTransport::Tls(stream) => {
-                tls_read_buf(stream, buffer, READ_CHUNK, self.config.request_timeout)
-                    .then(|result| KeepaliveConnectionMsg::Read(result.map(tls_read_reply_to_tcp)))
+                tls_read_buf(stream, buffer, READ_CHUNK, self.config.request_timeout).then(
+                    |result| {
+                        KeepaliveConnectionMsg::Read(
+                            result
+                                .map(tls_read_reply_to_tcp)
+                                .map_err(|error| error.error),
+                        )
+                    },
+                )
             }
         }
     }
