@@ -20,6 +20,11 @@ This file records completed work.
   pressure accounting when metrics are enabled. Local hotpath evidence moved
   fixed-body close from 33 to 28 observed stages and four-request keepalive
   from 111 to 91 observed stages; the generic close row remains noisy.
+- Added the terminal `TcpWriteClose` runtime rail for small TCP close
+  responses and tightened it after hostile review so it obeys ordinary
+  close-wins truth: sibling pending reads are rejected as `ResourceClosed`, the
+  terminal write-close call completes normally, and in-flight call state is
+  reclaimed in live runtime and simulator paths.
 - Added an HTTP body-pressure perf probe that drives `max_body_bytes` overload,
   records typed `full` pressure, projects `BodyMetrics` into service-pressure
   surfaces, and proves final current drains back to zero.
