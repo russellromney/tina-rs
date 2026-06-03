@@ -36,3 +36,25 @@ Evidence:
 Recorded history:
 
 - .intent/phases/147-http-turn-allocation-cost/perf_history.jsonl
+
+532cd65 Add terminal TCP write-close rail
+
+Evidence:
+
+- cargo fmt --all --check
+- git diff --check
+- cargo test -p tina-runtime terminal_owned_write_decoder_names_closed_state -- --nocapture
+- cargo test -p tina-runtime trace::stable_hash_tests::call_kind_tags_are_stable_golden -- --nocapture
+- cargo test -p tina-http --test server_smoke -- --nocapture
+- cargo test -p tina-http --test dst_simulator saved_seed_interleaving_fingerprint_is_stable -- --nocapture
+- cargo test -p tina-http --tests -- --nocapture
+- cargo clippy -p tina-runtime -p tina-sim -p tina-http --all-targets -- -D warnings
+- make proof-fast
+- cargo test --release --manifest-path examples/systems/perf_native/Cargo.toml --test hotpath -- --nocapture
+- cargo test --release --manifest-path examples/systems/perf_native/Cargo.toml --test perf -- --nocapture
+- make perf-record
+- make perf-check
+
+Recorded history:
+
+- .intent/phases/147-http-turn-allocation-cost/perf_history.jsonl
