@@ -2,7 +2,7 @@
 
 ## Status
 
-- In progress on `codex/phase-147-http-turn-allocation-cost`.
+- Implemented on `codex/phase-147-http-turn-allocation-cost`.
 - Phase 146 removed the obvious fresh-read-buffer and clone-before-write waste.
 - Current truth: Tina HTTP/1 still allocates more than Axum and close/keepalive
   rows are still slower/noisier.
@@ -13,6 +13,7 @@
 - HTTP body-pressure proof row is implemented locally: declared-too-large
   requests produce typed `full`, service-pressure surfaces, and drained final
   current.
+- Evidence is recorded in `perf_history.jsonl` and `commits.txt`.
 
 ## Grug Truth
 

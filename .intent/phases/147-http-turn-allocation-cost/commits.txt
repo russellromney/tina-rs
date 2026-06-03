@@ -1,0 +1,18 @@
+734df13 Measure HTTP turn and allocation cost
+
+Evidence:
+
+- cargo fmt --all --check
+- git diff --check
+- cargo test -p tina-proof-harness perf::tests::hotpath_report_prints_ns_us_and_named_stages -- --nocapture
+- cargo test -p tina-http parse::tests:: -- --nocapture
+- cargo test --release --manifest-path examples/systems/perf_native/Cargo.toml --test perf -- --nocapture
+- cargo test --release --manifest-path examples/systems/perf_native/Cargo.toml --test hotpath -- --nocapture
+- cargo clippy -p tina-http -p tina-proof-harness --all-targets -- -D warnings
+- cargo clippy --release --manifest-path examples/systems/perf_native/Cargo.toml --all-targets -- -D warnings
+- make perf-record
+- make perf-check
+
+Recorded history:
+
+- .intent/phases/147-http-turn-allocation-cost/perf_history.jsonl
