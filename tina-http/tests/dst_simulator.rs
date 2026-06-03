@@ -427,11 +427,12 @@ fn saved_seed_interleaving_fingerprint_is_stable() {
     /// Bump only after reviewing why the trace shape changed.
     /// Last update: buffered responses now write head and body in
     /// separate `tcp_write` calls so the body-pressure counter
-    /// reflects only body bytes, not head + body together. The
-    /// extra `tcp_write` per response shifts the trace.
-    const EXPECTED_HASH: u64 = 2_303_719_639_085_124_584;
+    /// reflects only body bytes, not head + body together. Small
+    /// no-metrics responses coalesce head + body, so intentional
+    /// write-shape changes move this trace.
+    const EXPECTED_HASH: u64 = 9_645_939_483_850_450_883;
     /// Pinned trace event count for `SAVED_SEED` + the config below.
-    const EXPECTED_LEN: usize = 105;
+    const EXPECTED_LEN: usize = 95;
 
     let bind: SocketAddr = "127.0.0.1:9007".parse().unwrap();
     let peer_a: SocketAddr = "10.0.0.1:55008".parse().unwrap();

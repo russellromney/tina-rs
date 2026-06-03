@@ -28,6 +28,7 @@ Evidence:
 - cargo clippy -p tina-http --all-targets -- -D warnings
 - cargo test -p tina-http --test server_smoke -- --nocapture
 - cargo test -p tina-http --test body_metrics -- --nocapture
+- cargo test -p tina-http --test dst_simulator saved_seed_interleaving_fingerprint_is_stable -- --nocapture
 - cargo test --release --manifest-path examples/systems/perf_native/Cargo.toml --test hotpath -- --nocapture
 - make perf-record
 - make perf-check
