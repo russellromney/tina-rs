@@ -19,6 +19,78 @@ use super::{
     ListenerId, StreamId, TlsListenerId, TlsStreamId, UdpSocketId, UnixListenerId, UnixStreamId,
 };
 
+/// Successful owned-buffer TCP read reply.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TcpReadBufReply {
+    /// Caller-owned buffer returned by the runtime.
+    pub buffer: Vec<u8>,
+    /// Valid bytes in `buffer[..len]`.
+    pub len: usize,
+}
+
+/// Owned-buffer TCP read failure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TcpReadBufError {
+    /// The runtime failure.
+    pub error: CallError,
+    /// Caller-owned buffer returned by the runtime.
+    pub buffer: Vec<u8>,
+}
+
+/// Successful owned-buffer TCP write reply.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TcpWriteOwnedReply {
+    /// Caller-owned bytes returned by the runtime.
+    pub bytes: Vec<u8>,
+    /// Bytes accepted by the stream.
+    pub written: usize,
+}
+
+/// Owned-buffer TCP write failure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TcpWriteOwnedError {
+    /// The runtime failure.
+    pub error: CallError,
+    /// Caller-owned bytes returned by the runtime.
+    pub bytes: Vec<u8>,
+}
+
+/// Successful owned-buffer TLS read reply.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TlsReadBufReply {
+    /// Caller-owned plaintext buffer returned by the runtime.
+    pub buffer: Vec<u8>,
+    /// Valid plaintext bytes in `buffer[..len]`.
+    pub len: usize,
+}
+
+/// Owned-buffer TLS read failure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TlsReadBufError {
+    /// The runtime failure.
+    pub error: CallError,
+    /// Caller-owned plaintext buffer returned by the runtime.
+    pub buffer: Vec<u8>,
+}
+
+/// Successful owned-buffer TLS write reply.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TlsWriteOwnedReply {
+    /// Caller-owned plaintext bytes returned by the runtime.
+    pub bytes: Vec<u8>,
+    /// Plaintext bytes accepted by the TLS stream.
+    pub written: usize,
+}
+
+/// Owned-buffer TLS write failure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TlsWriteOwnedError {
+    /// The runtime failure.
+    pub error: CallError,
+    /// Caller-owned plaintext bytes returned by the runtime.
+    pub bytes: Vec<u8>,
+}
+
 /// One concrete call shape understood by `tina-runtime`.
 ///
 /// New verbs are added by extending this enum, not by adding a top-level
@@ -62,6 +134,19 @@ pub enum CallInput {
         max_len: usize,
     },
 
+    /// Read up to `max_len` bytes from a stream into caller-owned storage.
+    ///
+    /// The runtime returns the same buffer and reports the valid prefix in
+    /// `buffer[..len]`. EOF remains `len == 0`.
+    TcpReadBuf {
+        /// The stream to read from.
+        stream: StreamId,
+        /// Reusable caller-owned storage.
+        buffer: Vec<u8>,
+        /// The maximum number of bytes the runtime may deliver.
+        max_len: usize,
+    },
+
     /// Write `bytes` to a stream. Partial writes are surfaced through
     /// [`CallOutput::TcpWrote`] so the issuing isolate can decide whether
     /// to issue another write for the remaining bytes.
@@ -69,6 +154,15 @@ pub enum CallInput {
         /// The stream to write to.
         stream: StreamId,
 
+        /// The payload to write.
+        bytes: Vec<u8>,
+    },
+
+    /// Write caller-owned bytes to a stream and return them with the accepted
+    /// byte count.
+    TcpWriteOwned {
+        /// The stream to write to.
+        stream: StreamId,
         /// The payload to write.
         bytes: Vec<u8>,
     },
@@ -171,8 +265,31 @@ pub enum CallInput {
         timeout: Duration,
     },
 
+    /// Read decrypted bytes from a TLS stream into caller-owned storage.
+    TlsReadBuf {
+        /// TLS stream to read from.
+        stream: TlsStreamId,
+        /// Reusable caller-owned plaintext storage.
+        buffer: Vec<u8>,
+        /// Maximum decrypted bytes to return.
+        max_len: usize,
+        /// Maximum time for this read.
+        timeout: Duration,
+    },
+
     /// Write decrypted bytes to a TLS stream.
     TlsWrite {
+        /// TLS stream to write to.
+        stream: TlsStreamId,
+        /// Plaintext bytes to write through TLS.
+        bytes: Vec<u8>,
+        /// Maximum time for this write.
+        timeout: Duration,
+    },
+
+    /// Write caller-owned plaintext bytes to a TLS stream and return them with
+    /// the accepted plaintext byte count.
+    TlsWriteOwned {
         /// TLS stream to write to.
         stream: TlsStreamId,
         /// Plaintext bytes to write through TLS.
@@ -413,8 +530,8 @@ impl CallInput {
             Self::TcpBind { .. } => crate::trace::CallKind::TcpBind,
             Self::TcpAccept { .. } => crate::trace::CallKind::TcpAccept,
             Self::TcpConnect { .. } => crate::trace::CallKind::TcpConnect,
-            Self::TcpRead { .. } => crate::trace::CallKind::TcpRead,
-            Self::TcpWrite { .. } => crate::trace::CallKind::TcpWrite,
+            Self::TcpRead { .. } | Self::TcpReadBuf { .. } => crate::trace::CallKind::TcpRead,
+            Self::TcpWrite { .. } | Self::TcpWriteOwned { .. } => crate::trace::CallKind::TcpWrite,
             Self::TcpListenerClose { .. } => crate::trace::CallKind::TcpListenerClose,
             Self::TcpStreamClose { .. } => crate::trace::CallKind::TcpStreamClose,
             Self::UdpBind { .. } => crate::trace::CallKind::UdpBind,
@@ -425,8 +542,8 @@ impl CallInput {
             Self::TlsBind { .. } => crate::trace::CallKind::TlsBind,
             Self::TlsAccept { .. } => crate::trace::CallKind::TlsAccept,
             Self::TlsListenerClose { .. } => crate::trace::CallKind::TlsListenerClose,
-            Self::TlsRead { .. } => crate::trace::CallKind::TlsRead,
-            Self::TlsWrite { .. } => crate::trace::CallKind::TlsWrite,
+            Self::TlsRead { .. } | Self::TlsReadBuf { .. } => crate::trace::CallKind::TlsRead,
+            Self::TlsWrite { .. } | Self::TlsWriteOwned { .. } => crate::trace::CallKind::TlsWrite,
             Self::TlsClose { .. } => crate::trace::CallKind::TlsClose,
             Self::DnsLookup { .. } => crate::trace::CallKind::DnsLookup,
             Self::SignalWait { .. } => crate::trace::CallKind::SignalWait,
@@ -526,12 +643,44 @@ pub enum CallOutput {
         bytes: Vec<u8>,
     },
 
+    /// A reusable-buffer TCP read completed.
+    TcpReadBuf {
+        /// Caller-owned buffer returned by the runtime.
+        buffer: Vec<u8>,
+        /// Valid bytes in `buffer[..len]`.
+        len: usize,
+    },
+
+    /// A reusable-buffer TCP read failed and returned its buffer.
+    TcpReadBufFailed {
+        /// Caller-owned buffer returned by the runtime.
+        buffer: Vec<u8>,
+        /// Runtime failure.
+        error: CallError,
+    },
+
     /// A write moved `count` bytes onto the stream. The issuing isolate is
     /// responsible for issuing another write if `count` is less than the
     /// requested length.
     TcpWrote {
         /// The number of bytes the runtime accepted.
         count: usize,
+    },
+
+    /// A reusable-buffer TCP write completed.
+    TcpWroteOwned {
+        /// Caller-owned bytes returned by the runtime.
+        bytes: Vec<u8>,
+        /// Bytes accepted by the stream.
+        count: usize,
+    },
+
+    /// A reusable-buffer TCP write failed and returned its bytes.
+    TcpWroteOwnedFailed {
+        /// Caller-owned bytes returned by the runtime.
+        bytes: Vec<u8>,
+        /// Runtime failure.
+        error: CallError,
     },
 
     /// A listener was closed and its resources released.
@@ -601,10 +750,46 @@ pub enum CallOutput {
         bytes: Vec<u8>,
     },
 
+    /// A reusable-buffer TLS read completed.
+    TlsReadBuf {
+        /// Caller-owned plaintext buffer returned by the runtime.
+        buffer: Vec<u8>,
+        /// Valid plaintext bytes in `buffer[..len]`.
+        len: usize,
+    },
+
+    /// A reusable-buffer TLS read failed and returned its buffer.
+    TlsReadBufFailed {
+        /// Caller-owned plaintext buffer returned by the runtime.
+        buffer: Vec<u8>,
+        /// Runtime failure.
+        error: CallError,
+    },
+
     /// A TLS stream wrote plaintext bytes.
     TlsWrote {
         /// Plaintext byte count accepted by the TLS stream.
         count: usize,
+    },
+
+    /// A reusable-buffer TLS write completed.
+    TlsWroteOwned {
+        /// Caller-owned plaintext bytes returned by the runtime.
+        bytes: Vec<u8>,
+        /// Plaintext byte count accepted by the TLS stream.
+        count: usize,
+    },
+
+    /// A reusable-buffer TLS write failed and returned its bytes.
+    ///
+    /// The returned bytes are the caller-owned plaintext allocation. The error
+    /// still decides retry safety; for TLS, some plaintext may already have
+    /// been accepted by the connection state before a later transport failure.
+    TlsWroteOwnedFailed {
+        /// Caller-owned plaintext bytes returned by the runtime.
+        bytes: Vec<u8>,
+        /// Runtime failure.
+        error: CallError,
     },
 
     /// A TLS stream was closed.

@@ -48,8 +48,8 @@ use std::time::{Duration, Instant};
 
 use betelgeuse::{
     AcceptCompletion, ConnectCompletion, FsyncCompletion, IO, IOFile, IOLoop, IOLoopHandle,
-    IOSocket, MkdirCompletion, OpenOptions, PReadCompletion, PWriteCompletion, RecvCompletion,
-    SendCompletion, SizeCompletion, io_loop,
+    IOSocket, MkdirCompletion, OpenOptions, PReadCompletion, PWriteCompletion, RecvBufCompletion,
+    RecvCompletion, SendCompletion, SendOwnedCompletion, SizeCompletion, io_loop,
 };
 
 use crate::call::{
@@ -399,11 +399,26 @@ impl RuntimeDriver for BetelgeuseDriver {
                 max_len,
                 timeout,
             } => self.tls.submit_read(call_id, stream, max_len, timeout, now),
+            CallInput::TlsReadBuf {
+                stream,
+                buffer,
+                max_len,
+                timeout,
+            } => self
+                .tls
+                .submit_read_buf(call_id, stream, buffer, max_len, timeout, now),
             CallInput::TlsWrite {
                 stream,
                 bytes,
                 timeout,
             } => self.tls.submit_write(call_id, stream, bytes, timeout, now),
+            CallInput::TlsWriteOwned {
+                stream,
+                bytes,
+                timeout,
+            } => self
+                .tls
+                .submit_write_owned(call_id, stream, bytes, timeout, now),
             CallInput::TlsClose { stream, timeout } => {
                 self.tls.submit_close(call_id, stream, timeout, now)
             }

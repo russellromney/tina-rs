@@ -19,8 +19,8 @@ use tina::reply_to_request;
 use tina_runtime::{
     CallError, CallOutcome, Http2CloseReason, Http2FlowControlSide, Http2ResetReason,
     Http2StreamId, ListenerId, ProtocolConnectionId, ProtocolDirection, ProtocolFact, StreamId,
-    call, call_cancelable, cancel_call, tcp_accept, tcp_bind, tcp_close_listener, tcp_close_stream,
-    tcp_read, tcp_write,
+    TcpReadBufReply, TcpWriteOwnedReply, call, call_cancelable, cancel_call, tcp_accept, tcp_bind,
+    tcp_close_listener, tcp_close_stream, tcp_read_buf, tcp_write_owned,
 };
 
 use crate::streaming::{
@@ -282,7 +282,7 @@ impl ActiveStream {
 #[derive(Debug, Clone)]
 pub enum Http2ConnectionMsg {
     Begin,
-    Read(Result<Vec<u8>, CallError>),
+    Read(Result<TcpReadBufReply, CallError>),
     ServiceReturned {
         stream_id: u32,
         outcome: CallOutcome<HttpResponse>,
@@ -303,7 +303,7 @@ pub enum Http2ConnectionMsg {
         stream_id: u32,
         outcome: tina::CancelOutcome,
     },
-    Wrote(Result<usize, CallError>),
+    Wrote(Result<TcpWriteOwnedReply, CallError>),
     Closed(Result<(), CallError>),
     RequestBodyNext {
         stream_id: u32,
@@ -331,6 +331,7 @@ pub struct Http2Connection<S: Shard, M: From<HttpRequest> + Send + 'static = Htt
     limits: Http2Limits,
     service_call_timeout: Duration,
     read_buf: Vec<u8>,
+    read_scratch: Vec<u8>,
     hpack_decoder: hpack::Decoder<'static>,
     preface_seen: bool,
     streams: Vec<ActiveStream>,
@@ -343,6 +344,7 @@ pub struct Http2Connection<S: Shard, M: From<HttpRequest> + Send + 'static = Htt
     reset_churn: u32,
     goaway: bool,
     closing_after_write: bool,
+    write_in_flight: bool,
     pending_write: Vec<u8>,
     write_queue: VecDeque<Vec<u8>>,
     report: Http2ConnectionReport,
@@ -364,6 +366,7 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Http2Connection<
             limits,
             service_call_timeout,
             read_buf: Vec::new(),
+            read_scratch: Vec::new(),
             hpack_decoder: hpack::Decoder::new(),
             preface_seen: false,
             streams: Vec::with_capacity(limits.max_concurrent_streams),
@@ -376,6 +379,7 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Http2Connection<
             reset_churn: 0,
             goaway: false,
             closing_after_write: false,
+            write_in_flight: false,
             pending_write: Vec::new(),
             write_queue: VecDeque::new(),
             report: Http2ConnectionReport::default(),
@@ -423,7 +427,7 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Isolate for Http
         }
         match msg {
             Http2ConnectionMsg::Begin => self.read_more(),
-            Http2ConnectionMsg::Read(Ok(bytes)) => self.handle_read(bytes),
+            Http2ConnectionMsg::Read(Ok(reply)) => self.handle_read(reply),
             Http2ConnectionMsg::Read(Err(_)) => self.close_now(),
             Http2ConnectionMsg::ServiceReturned { stream_id, outcome } => {
                 self.handle_service_returned(stream_id, outcome)
@@ -434,7 +438,7 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Isolate for Http
             }
             Http2ConnectionMsg::StreamSourceCancelDone { .. } => noop(),
             Http2ConnectionMsg::StreamSourcePullCancelled { .. } => noop(),
-            Http2ConnectionMsg::Wrote(Ok(n)) => self.handle_wrote(n),
+            Http2ConnectionMsg::Wrote(Ok(reply)) => self.handle_wrote(reply),
             Http2ConnectionMsg::Wrote(Err(_)) => self.close_now(),
             Http2ConnectionMsg::Closed(_) => stop(),
             Http2ConnectionMsg::RequestBodyNext { .. } => noop(),
@@ -462,10 +466,15 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Isolate for Http
 
 impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Http2Connection<S, M> {
     fn read_more(&mut self) -> Effect<Self> {
-        tcp_read(self.stream, READ_CHUNK).then(Http2ConnectionMsg::Read)
+        let buffer = std::mem::take(&mut self.read_scratch);
+        tcp_read_buf(self.stream, buffer, READ_CHUNK)
+            .then(|result| Http2ConnectionMsg::Read(result.map_err(|error| error.error)))
     }
 
     fn write_more(&mut self) -> Effect<Self> {
+        if self.write_in_flight {
+            return noop();
+        }
         if self.pending_write.is_empty() {
             if let Some(next) = self.write_queue.pop_front() {
                 self.pending_write = next;
@@ -477,7 +486,10 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Http2Connection<
             }
             return noop();
         }
-        tcp_write(self.stream, self.pending_write.clone()).then(Http2ConnectionMsg::Wrote)
+        let bytes = std::mem::take(&mut self.pending_write);
+        self.write_in_flight = true;
+        tcp_write_owned(self.stream, bytes)
+            .then(|result| Http2ConnectionMsg::Wrote(result.map_err(|error| error.error)))
     }
 
     fn close_now(&mut self) -> Effect<Self> {
@@ -489,7 +501,9 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Http2Connection<
         let _ = self.enqueue_frame(goaway_frame(self.highest_client_stream_id, ERR_NO_ERROR));
         self.report.goaway_sent += 1;
         self.closing_after_write = true;
-        if self.pending_write.is_empty() && !self.write_queue.is_empty() {
+        if self.write_in_flight {
+            noop()
+        } else if self.pending_write.is_empty() && !self.write_queue.is_empty() {
             self.write_more()
         } else if self.pending_write.is_empty() {
             self.close_now()
@@ -498,11 +512,14 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Http2Connection<
         }
     }
 
-    fn handle_read(&mut self, bytes: Vec<u8>) -> Effect<Self> {
-        if bytes.is_empty() {
+    fn handle_read(&mut self, reply: TcpReadBufReply) -> Effect<Self> {
+        let TcpReadBufReply { buffer, len } = reply;
+        if len == 0 {
+            self.read_scratch = buffer;
             return self.close_now();
         }
-        self.read_buf.extend_from_slice(&bytes);
+        self.read_buf.extend_from_slice(&buffer[..len]);
+        self.read_scratch = buffer;
         let mut effects = Vec::new();
         if let Err(error) = self.process_buffer(&mut effects) {
             self.report.protocol_errors += 1;
@@ -523,7 +540,10 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Http2Connection<
         }
         if !self.closing_after_write {
             effects.push(self.read_more());
-        } else if self.pending_write.is_empty() && self.write_queue.is_empty() {
+        } else if self.pending_write.is_empty()
+            && self.write_queue.is_empty()
+            && !self.write_in_flight
+        {
             effects.push(self.close_now());
         }
         batch(effects)
@@ -1828,9 +1848,12 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Http2Connection<
         }
     }
 
-    fn handle_wrote(&mut self, count: usize) -> Effect<Self> {
-        let drain = count.min(self.pending_write.len());
-        self.pending_write.drain(..drain);
+    fn handle_wrote(&mut self, reply: TcpWriteOwnedReply) -> Effect<Self> {
+        self.write_in_flight = false;
+        let TcpWriteOwnedReply { mut bytes, written } = reply;
+        let drain = written.min(bytes.len());
+        bytes.drain(..drain);
+        self.pending_write = bytes;
         if self.pending_write.is_empty() {
             if !self.write_queue.is_empty() {
                 return self.write_more();
@@ -2230,7 +2253,9 @@ mod tests {
         let _ = conn.begin_goaway_shutdown();
         assert!(conn.goaway);
         assert_eq!(conn.report().goaway_sent, 1);
-        assert!(!conn.pending_write.is_empty() || !conn.write_queue.is_empty());
+        assert!(
+            conn.write_in_flight || !conn.pending_write.is_empty() || !conn.write_queue.is_empty()
+        );
     }
 
     #[test]

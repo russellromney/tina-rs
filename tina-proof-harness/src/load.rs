@@ -270,10 +270,12 @@ pub struct LoadReport {
     pub err_kinds: Vec<(String, u64)>,
     pub latency_min_ns: u64,
     pub latency_p50_ns: u64,
+    pub latency_p90_ns: u64,
     pub latency_p99_ns: u64,
     pub latency_max_ns: u64,
     pub latency_min_us: u64,
     pub latency_p50_us: u64,
+    pub latency_p90_us: u64,
     pub latency_p99_us: u64,
     pub latency_max_us: u64,
     pub elapsed_ms: u64,
@@ -347,7 +349,7 @@ impl LoadReport {
     pub fn summary_line(&self) -> String {
         format!(
             "load label={} workers={} ops={} ok={} err={} timeout={} \
-             min_us={} p50_us={} p99_us={} max_us={} elapsed_ms={} leak_clean={} late={} trace_hash={} surfaces={} unavailable_surfaces={} {}",
+             min_us={} p50_us={} p90_us={} p99_us={} max_us={} elapsed_ms={} leak_clean={} late={} trace_hash={} surfaces={} unavailable_surfaces={} {}",
             report_value(self.label),
             self.workers,
             self.ops_attempted,
@@ -356,6 +358,7 @@ impl LoadReport {
             self.ops_timeout,
             self.latency_min_us,
             self.latency_p50_us,
+            self.latency_p90_us,
             self.latency_p99_us,
             self.latency_max_us,
             self.elapsed_ms,
@@ -590,6 +593,7 @@ where
     let min_ns = latencies.first().copied().unwrap_or(0);
     let max_ns = latencies.last().copied().unwrap_or(0);
     let p50_ns = percentile(&latencies, 50);
+    let p90_ns = percentile(&latencies, 90);
     let p99_ns = percentile(&latencies, 99);
 
     let mut err_kinds: Vec<(String, u64)> = combined.err_kinds.into_iter().collect();
@@ -620,10 +624,12 @@ where
         err_kinds,
         latency_min_ns: min_ns,
         latency_p50_ns: p50_ns,
+        latency_p90_ns: p90_ns,
         latency_p99_ns: p99_ns,
         latency_max_ns: max_ns,
         latency_min_us: ns_to_us(min_ns),
         latency_p50_us: ns_to_us(p50_ns),
+        latency_p90_us: ns_to_us(p90_ns),
         latency_p99_us: ns_to_us(p99_ns),
         latency_max_us: ns_to_us(max_ns),
         elapsed_ms: elapsed.as_millis() as u64,

@@ -15,6 +15,8 @@
 //! reports the declared length) and constructing the full
 //! [`HttpRequest`].
 
+use std::io::Write as _;
+
 use http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Version};
 
 use crate::types::{HttpLimits, HttpRequest, RequestParseError, ResponseParseError};
@@ -356,7 +358,7 @@ pub fn encode_response_head(
         _ => match response.body.declared_length() {
             Some(length) => {
                 out.extend_from_slice(b"Content-Length: ");
-                out.extend_from_slice(length.to_string().as_bytes());
+                write!(&mut out, "{length}").expect("write to Vec");
                 out.extend_from_slice(b"\r\n");
             }
             None => {
@@ -446,7 +448,7 @@ fn encode_request_internal(request: &HttpRequest, connection_close: bool) -> Vec
         out.extend_from_slice(b"\r\n");
     }
     out.extend_from_slice(b"Content-Length: ");
-    out.extend_from_slice(body_bytes.len().to_string().as_bytes());
+    write!(&mut out, "{}", body_bytes.len()).expect("write to Vec");
     out.extend_from_slice(b"\r\n");
     if connection_close {
         out.extend_from_slice(b"Connection: close\r\n");

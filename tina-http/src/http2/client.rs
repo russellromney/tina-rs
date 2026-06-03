@@ -35,9 +35,10 @@ use tina::prelude::*;
 use tina::reply_to_request;
 use tina_runtime::{
     CallError, CallOutcome, Http2CloseReason, Http2ResetReason, Http2StreamId,
-    ProtocolConnectionId, ProtocolDirection, ProtocolFact, StreamId, TlsStreamId, call,
-    tcp_close_stream, tcp_connect, tcp_read, tcp_write, tls_close, tls_connect_alpn, tls_read,
-    tls_write,
+    ProtocolConnectionId, ProtocolDirection, ProtocolFact, StreamId, TcpReadBufReply,
+    TcpWriteOwnedReply, TlsReadBufReply, TlsStreamId, TlsWriteOwnedReply, call, tcp_close_stream,
+    tcp_connect, tcp_read_buf, tcp_write_owned, tls_close, tls_connect_alpn, tls_read_buf,
+    tls_write_owned,
 };
 
 use crate::streaming::{ResponseChunkMsg, ResponseChunkReply};
@@ -70,6 +71,20 @@ use super::target::Http2Target;
 enum ClientStream {
     Tcp(StreamId),
     Tls(TlsStreamId),
+}
+
+fn tls_read_reply_to_tcp(reply: TlsReadBufReply) -> TcpReadBufReply {
+    TcpReadBufReply {
+        buffer: reply.buffer,
+        len: reply.len,
+    }
+}
+
+fn tls_write_reply_to_tcp(reply: TlsWriteOwnedReply) -> TcpWriteOwnedReply {
+    TcpWriteOwnedReply {
+        bytes: reply.bytes,
+        written: reply.written,
+    }
 }
 
 /// Client connection limits. Mirrors the server's [`super::Http2Limits`]
@@ -346,9 +361,9 @@ pub enum Http2ClientMsg {
     /// negotiated ALPN protocol.
     TlsConnected(Result<(TlsStreamId, Option<Vec<u8>>), CallError>),
     /// Internal: read completion (either rail).
-    Read(Result<Vec<u8>, CallError>),
+    Read(Result<TcpReadBufReply, CallError>),
     /// Internal: write completion (either rail).
-    Wrote(Result<usize, CallError>),
+    Wrote(Result<TcpWriteOwnedReply, CallError>),
     /// Internal: close completion (either rail).
     Closed(Result<(), CallError>),
 }
@@ -499,6 +514,7 @@ pub struct Http2ClientConnection<S: Shard + 'static> {
     streams: Vec<ActiveClientStream>,
     next_stream_id: u32,
     read_buf: Vec<u8>,
+    read_scratch: Vec<u8>,
     hpack_decoder: hpack::Decoder<'static>,
     preface_sent: bool,
     peer_initial_stream_window: i32,
@@ -573,6 +589,7 @@ impl<S: Shard + 'static> Http2ClientConnection<S> {
             streams: Vec::with_capacity(limits.max_concurrent_streams),
             next_stream_id: 1,
             read_buf: Vec::new(),
+            read_scratch: Vec::new(),
             hpack_decoder: hpack::Decoder::new(),
             preface_sent: false,
             peer_initial_stream_window: DEFAULT_WINDOW,
@@ -652,9 +669,9 @@ impl<S: Shard + 'static> Isolate for Http2ClientConnection<S> {
                 self.close_with(Http2ClientOutcome::TlsAlpnMismatch)
             }
             Http2ClientMsg::TlsConnected(Err(_)) => self.close_with(Http2ClientOutcome::Closed),
-            Http2ClientMsg::Read(Ok(bytes)) => self.handle_read(bytes),
+            Http2ClientMsg::Read(Ok(reply)) => self.handle_read(reply),
             Http2ClientMsg::Read(Err(_)) => self.close_with(Http2ClientOutcome::Closed),
-            Http2ClientMsg::Wrote(Ok(n)) => self.handle_wrote(n),
+            Http2ClientMsg::Wrote(Ok(reply)) => self.handle_wrote(reply),
             Http2ClientMsg::Wrote(Err(_)) => self.close_with(Http2ClientOutcome::Closed),
             Http2ClientMsg::Closed(_) => stop(),
             Http2ClientMsg::Cancel { stream_id } => self.handle_cancel(stream_id),
@@ -1436,13 +1453,16 @@ impl<S: Shard + 'static> Http2ClientConnection<S> {
         batch(effects)
     }
 
-    fn handle_read(&mut self, bytes: Vec<u8>) -> Effect<Self> {
+    fn handle_read(&mut self, reply: TcpReadBufReply) -> Effect<Self> {
         // This read completed; free the read lane before pumping.
         self.read_in_flight = false;
-        if bytes.is_empty() {
+        let TcpReadBufReply { buffer, len } = reply;
+        if len == 0 {
+            self.read_scratch = buffer;
             return self.close_with(Http2ClientOutcome::Closed);
         }
-        self.read_buf.extend_from_slice(&bytes);
+        self.read_buf.extend_from_slice(&buffer[..len]);
+        self.read_scratch = buffer;
         let mut effects: Vec<Effect<Self>> = Vec::new();
         let max_frame_size = self.limits.max_frame_size;
         loop {
@@ -2005,15 +2025,16 @@ impl<S: Shard + 'static> Http2ClientConnection<S> {
         batch(effects)
     }
 
-    fn handle_wrote(&mut self, n: usize) -> Effect<Self> {
+    fn handle_wrote(&mut self, reply: TcpWriteOwnedReply) -> Effect<Self> {
         // Wrote completion: drain the bytes we know flushed, clear the
         // in-flight flag, then let `pump_io` schedule the next write — or,
         // on the half-duplex TLS rail, arm the response read now that the
         // write lane is free.
         self.write_in_flight = false;
-        if n > 0 && self.pending_write.len() >= n {
-            self.pending_write.drain(..n);
-        }
+        let TcpWriteOwnedReply { mut bytes, written } = reply;
+        let drain = written.min(bytes.len());
+        bytes.drain(..drain);
+        self.pending_write = bytes;
         if self.pending_write.is_empty() {
             if let Some(next) = self.write_queue.pop_front() {
                 self.pending_write = next;
@@ -2096,11 +2117,18 @@ impl<S: Shard + 'static> Http2ClientConnection<S> {
             return noop();
         }
         self.write_in_flight = true;
-        let bytes = self.pending_write.clone();
+        let bytes = std::mem::take(&mut self.pending_write);
         match stream {
-            ClientStream::Tcp(s) => tcp_write(s, bytes).then(Http2ClientMsg::Wrote),
+            ClientStream::Tcp(s) => tcp_write_owned(s, bytes)
+                .then(|result| Http2ClientMsg::Wrote(result.map_err(|error| error.error))),
             ClientStream::Tls(s) => {
-                tls_write(s, bytes, self.limits.tls_io_timeout).then(Http2ClientMsg::Wrote)
+                tls_write_owned(s, bytes, self.limits.tls_io_timeout).then(|result| {
+                    Http2ClientMsg::Wrote(
+                        result
+                            .map(tls_write_reply_to_tcp)
+                            .map_err(|error| error.error),
+                    )
+                })
             }
         }
     }
@@ -2110,11 +2138,18 @@ impl<S: Shard + 'static> Http2ClientConnection<S> {
             return noop();
         };
         self.read_in_flight = true;
+        let buffer = std::mem::take(&mut self.read_scratch);
         match stream {
-            ClientStream::Tcp(s) => tcp_read(s, READ_CHUNK).then(Http2ClientMsg::Read),
-            ClientStream::Tls(s) => {
-                tls_read(s, READ_CHUNK, self.limits.tls_io_timeout).then(Http2ClientMsg::Read)
-            }
+            ClientStream::Tcp(s) => tcp_read_buf(s, buffer, READ_CHUNK)
+                .then(|result| Http2ClientMsg::Read(result.map_err(|error| error.error))),
+            ClientStream::Tls(s) => tls_read_buf(s, buffer, READ_CHUNK, self.limits.tls_io_timeout)
+                .then(|result| {
+                    Http2ClientMsg::Read(
+                        result
+                            .map(tls_read_reply_to_tcp)
+                            .map_err(|error| error.error),
+                    )
+                }),
         }
     }
 

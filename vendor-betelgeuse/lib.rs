@@ -34,8 +34,9 @@ pub mod task;
 
 pub use completion::{
     AcceptCompletion, AcceptOp, ConnectCompletion, ConnectOp, FsyncCompletion, FsyncOp,
-    MkdirCompletion, MkdirOp, PReadCompletion, PReadOp, PWriteCompletion, PWriteOp, RecvCompletion,
-    RecvOp, SendCompletion, SendOp, SizeCompletion, SizeOp,
+    MkdirCompletion, MkdirOp, PReadCompletion, PReadOp, PWriteCompletion, PWriteOp,
+    RecvBufCompletion, RecvCompletion, RecvOp, SendCompletion, SendOp, SendOwnedCompletion,
+    SizeCompletion, SizeOp,
 };
 
 pub use completion::{CompletionInner, Operation};
@@ -168,8 +169,29 @@ pub trait IOSocket {
     /// Receives up to `len` bytes from a connected socket.
     fn recv(&self, c: &mut RecvCompletion, len: usize) -> stdio::Result<()>;
 
+    /// Receives up to `max_len` bytes into caller-owned storage.
+    ///
+    /// The completion yields the same buffer back with its length truncated to
+    /// the bytes read. Backends may grow `buffer` if its capacity is too small,
+    /// but callers that keep reusing the returned buffer avoid per-read
+    /// allocation.
+    fn recv_buf(
+        &self,
+        c: &mut RecvBufCompletion,
+        buffer: Vec<u8>,
+        max_len: usize,
+    ) -> Result<(), (stdio::Error, Vec<u8>)>;
+
     /// Sends the contents of `buf` on a connected socket.
     fn send(&self, c: &mut SendCompletion, buf: Vec<u8>) -> stdio::Result<()>;
+
+    /// Sends the contents of `buf` and returns the same buffer with the
+    /// accepted byte count.
+    fn send_owned(
+        &self,
+        c: &mut SendOwnedCompletion,
+        buf: Vec<u8>,
+    ) -> Result<(), (stdio::Error, Vec<u8>)>;
 
     /// Enables or disables the `TCP_NODELAY` socket option.
     ///

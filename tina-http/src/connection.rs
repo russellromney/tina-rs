@@ -38,14 +38,16 @@
 //!
 //! Parser failures map per [`crate::types::RequestParseError::status`].
 
+use std::io::Write as _;
 use std::time::Duration;
 
 use http::StatusCode;
 use tina::prelude::*;
 use tina::{CallContext, RequestContext, reply_to_request};
 use tina_runtime::{
-    CallError, CallOutcome, call, sleep, tcp_close_stream, tcp_read, tcp_write, tls_close,
-    tls_read, tls_write,
+    CallError, CallOutcome, TcpReadBufReply, TcpWriteOwnedReply, TlsReadBufReply,
+    TlsWriteOwnedReply, call, sleep, tcp_close_stream, tcp_read_buf, tcp_write_owned, tls_close,
+    tls_read_buf, tls_write_owned,
 };
 
 use crate::body_metrics::BodyMetrics;
@@ -68,6 +70,20 @@ use crate::websocket::{
 /// of what the kernel has buffered.
 const READ_CHUNK: usize = 4096;
 const WEBSOCKET_PENDING_APP_MSG_CAP: usize = 4;
+
+fn tls_read_reply_to_tcp(reply: TlsReadBufReply) -> TcpReadBufReply {
+    TcpReadBufReply {
+        buffer: reply.buffer,
+        len: reply.len,
+    }
+}
+
+fn tls_write_reply_to_tcp(reply: TlsWriteOwnedReply) -> TcpWriteOwnedReply {
+    TcpWriteOwnedReply {
+        bytes: reply.bytes,
+        written: reply.written,
+    }
+}
 
 struct WebSocketState {
     session_id: WebSocketSessionId,
@@ -133,8 +149,8 @@ impl WebSocketState {
 pub enum HttpConnectionMsg {
     /// Kick off the read loop. Sent once by the listener after spawn.
     Begin,
-    /// `tcp_read` reply.
-    Read(Result<Vec<u8>, CallError>),
+    /// `tcp_read_buf` reply.
+    Read(Result<TcpReadBufReply, CallError>),
     /// Per-iteration head/idle deadline. Carries the request
     /// generation it was scheduled for so that a stale deadline from
     /// a previous keepalive iteration is recognised and dropped.
@@ -151,8 +167,8 @@ pub enum HttpConnectionMsg {
     },
     /// Service `call` reply.
     ServiceReturned(CallOutcome<HttpResponse>),
-    /// `tcp_write` reply.
-    Wrote(Result<usize, CallError>),
+    /// `tcp_write_owned` reply.
+    Wrote(Result<TcpWriteOwnedReply, CallError>),
     /// `tcp_close_stream` reply.
     Closed(Result<(), CallError>),
     /// App reply to one WebSocket session event.
@@ -186,7 +202,7 @@ pub enum HttpConnectionMsg {
     /// outer call context (the service's `RequestBodyNext` call)
     /// propagates through this continuation, so `Effect::Reply` here
     /// answers the service.
-    BodyChunkRead(Result<Vec<u8>, CallError>),
+    BodyChunkRead(Result<TcpReadBufReply, CallError>),
 }
 
 impl HttpConnectionMsg {
@@ -226,6 +242,7 @@ pub struct HttpConnection<S: Shard, M: From<HttpRequest> + Send + 'static = Http
 
     // Accumulating wire state.
     read_buf: Vec<u8>,
+    read_scratch: Vec<u8>,
     parsed_head: Option<HttpRequestHead>,
     head_len: usize,
 
@@ -386,6 +403,7 @@ impl<S: Shard, M: From<HttpRequest> + Send + 'static> HttpConnection<S, M> {
             metrics_request_charge: 0,
             metrics_response_charge: 0,
             read_buf: Vec::new(),
+            read_scratch: Vec::with_capacity(READ_CHUNK),
             parsed_head: None,
             head_len: 0,
             pending_response: Vec::new(),
@@ -449,7 +467,7 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Isolate for Http
         match msg {
             HttpConnectionMsg::Begin => self.start(),
 
-            HttpConnectionMsg::Read(Ok(bytes)) => self.handle_bytes_read(bytes),
+            HttpConnectionMsg::Read(Ok(reply)) => self.handle_read_reply(reply),
             HttpConnectionMsg::Read(Err(_)) => {
                 // Mid-body buffered read failure (head parsed, body
                 // not yet complete). Distinct from a clean post-body
@@ -471,7 +489,7 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Isolate for Http
 
             HttpConnectionMsg::ServiceReturned(outcome) => self.handle_service_outcome(outcome),
 
-            HttpConnectionMsg::Wrote(Ok(count)) => self.handle_wrote(count),
+            HttpConnectionMsg::Wrote(Ok(reply)) => self.handle_wrote(reply),
             HttpConnectionMsg::Wrote(Err(_)) => {
                 if self.websocket.is_some() {
                     return self.begin_close();
@@ -621,21 +639,36 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
     }
 
     fn read_more(&mut self) -> Effect<Self> {
+        let buffer = std::mem::take(&mut self.read_scratch);
         match self.transport {
-            HttpTransport::Tcp(stream) => {
-                tcp_read(stream, READ_CHUNK).then(HttpConnectionMsg::Read)
-            }
+            HttpTransport::Tcp(stream) => tcp_read_buf(stream, buffer, READ_CHUNK)
+                .then(|result| HttpConnectionMsg::Read(result.map_err(|error| error.error))),
             HttpTransport::Tls(stream) => {
-                tls_read(stream, READ_CHUNK, self.tls_io_timeout).then(HttpConnectionMsg::Read)
+                tls_read_buf(stream, buffer, READ_CHUNK, self.tls_io_timeout).then(|result| {
+                    HttpConnectionMsg::Read(
+                        result
+                            .map(tls_read_reply_to_tcp)
+                            .map_err(|error| error.error),
+                    )
+                })
             }
         }
     }
 
-    fn handle_bytes_read(&mut self, bytes: Vec<u8>) -> Effect<Self> {
+    fn handle_read_reply(&mut self, reply: TcpReadBufReply) -> Effect<Self> {
+        self.handle_bytes_read(reply.buffer, reply.len)
+    }
+
+    fn handle_bytes_read(&mut self, mut buffer: Vec<u8>, len: usize) -> Effect<Self> {
         if self.websocket.is_some() {
-            return self.handle_websocket_bytes_read(bytes);
+            let effect = self.handle_websocket_bytes_read(&buffer[..len]);
+            buffer.clear();
+            self.read_scratch = buffer;
+            return effect;
         }
-        if bytes.is_empty() {
+        if len == 0 {
+            buffer.clear();
+            self.read_scratch = buffer;
             // Peer closed cleanly. If we already parsed a head and have
             // a partial body, this is a truncated request — close
             // without dispatching. If we haven't parsed yet, also close.
@@ -653,7 +686,9 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
         }
 
         let pre_len = self.read_buf.len();
-        self.read_buf.extend_from_slice(&bytes);
+        self.read_buf.extend_from_slice(&buffer[..len]);
+        buffer.clear();
+        self.read_scratch = buffer;
 
         if self.parsed_head.is_none() {
             match parse_request_head(&self.read_buf, &self.limits) {
@@ -928,19 +963,28 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
             self.body_eof_replied = true;
             return self.reply_request_body_chunk(RequestChunkReply::Eof);
         }
+        let buffer = std::mem::take(&mut self.read_scratch);
         match self.transport {
-            HttpTransport::Tcp(stream) => {
-                tcp_read(stream, want).then(HttpConnectionMsg::BodyChunkRead)
-            }
-            HttpTransport::Tls(stream) => {
-                tls_read(stream, want, self.tls_io_timeout).then(HttpConnectionMsg::BodyChunkRead)
-            }
+            HttpTransport::Tcp(stream) => tcp_read_buf(stream, buffer, want).then(|result| {
+                HttpConnectionMsg::BodyChunkRead(result.map_err(|error| error.error))
+            }),
+            HttpTransport::Tls(stream) => tls_read_buf(stream, buffer, want, self.tls_io_timeout)
+                .then(|result| {
+                    HttpConnectionMsg::BodyChunkRead(
+                        result
+                            .map(tls_read_reply_to_tcp)
+                            .map_err(|error| error.error),
+                    )
+                }),
         }
     }
 
-    fn handle_body_chunk_read(&mut self, result: Result<Vec<u8>, CallError>) -> Effect<Self> {
-        let bytes = match result {
-            Ok(bytes) => bytes,
+    fn handle_body_chunk_read(
+        &mut self,
+        result: Result<TcpReadBufReply, CallError>,
+    ) -> Effect<Self> {
+        let (mut buffer, len) = match result {
+            Ok(reply) => (reply.buffer, reply.len),
             // Surface the typed error so service can tell short
             // delivery (Eof) from truncation (Error). Distinguish
             // timeout from other IO errors in the metrics, and
@@ -955,7 +999,9 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
                 return self.reply_request_body_chunk(RequestChunkReply::Error(error));
             }
         };
-        if bytes.is_empty() {
+        if len == 0 {
+            buffer.clear();
+            self.read_scratch = buffer;
             // Peer closed mid-body. Service notices via `delivered < expected`.
             // The wire was short, so this is a truncation event from a
             // metrics standpoint — the server cannot fulfil the
@@ -969,8 +1015,10 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
             return self.reply_request_body_chunk(RequestChunkReply::Eof);
         }
         if self.inbound_chunked {
-            self.inbound_received += bytes.len();
-            self.chunked_raw_buffer.extend_from_slice(&bytes);
+            self.inbound_received += len;
+            self.chunked_raw_buffer.extend_from_slice(&buffer[..len]);
+            buffer.clear();
+            self.read_scratch = buffer;
             if let Some(ref mut decoder) = self.chunked_decoder {
                 let prev_len = self.inbound_buffer.len();
                 let max = READ_CHUNK.min(self.inbound_chunk_size.max(1));
@@ -1008,21 +1056,36 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
                         }
                         return match self.transport {
                             HttpTransport::Tcp(stream) => {
-                                tcp_read(stream, next_want).then(HttpConnectionMsg::BodyChunkRead)
+                                let buffer = std::mem::take(&mut self.read_scratch);
+                                tcp_read_buf(stream, buffer, next_want).then(|result| {
+                                    HttpConnectionMsg::BodyChunkRead(
+                                        result.map_err(|error| error.error),
+                                    )
+                                })
                             }
                             HttpTransport::Tls(stream) => {
-                                tls_read(stream, next_want, self.tls_io_timeout)
-                                    .then(HttpConnectionMsg::BodyChunkRead)
+                                let buffer = std::mem::take(&mut self.read_scratch);
+                                tls_read_buf(stream, buffer, next_want, self.tls_io_timeout).then(
+                                    |result| {
+                                        HttpConnectionMsg::BodyChunkRead(
+                                            result
+                                                .map(tls_read_reply_to_tcp)
+                                                .map_err(|error| error.error),
+                                        )
+                                    },
+                                )
                             }
                         };
                     }
                 }
             }
         } else {
-            self.inbound_received += bytes.len();
-            self.inbound_buffer.extend_from_slice(&bytes);
-            if self.charge_request(bytes.len()).is_err() {
-                let keep = self.inbound_buffer.len().saturating_sub(bytes.len());
+            self.inbound_received += len;
+            self.inbound_buffer.extend_from_slice(&buffer[..len]);
+            buffer.clear();
+            self.read_scratch = buffer;
+            if self.charge_request(len).is_err() {
+                let keep = self.inbound_buffer.len().saturating_sub(len);
                 self.inbound_buffer.truncate(keep);
                 self.body_eof_replied = true;
                 return reply(RequestChunkReply::Error(CallError::StorageFull));
@@ -1040,7 +1103,12 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
                 .min(self.inbound_buffer.len())
                 .min(remaining_total)
         };
-        let chunk: Vec<u8> = self.inbound_buffer.drain(..take).collect();
+        let chunk = if take == self.inbound_buffer.len() {
+            std::mem::take(&mut self.inbound_buffer)
+        } else {
+            let tail = self.inbound_buffer.split_off(take);
+            std::mem::replace(&mut self.inbound_buffer, tail)
+        };
         self.inbound_delivered += take;
         // The chunk has left the connection; release its charge.
         self.release_request(take);
@@ -1123,20 +1191,29 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
     /// we know how many bytes the runtime accepted; we do not pre-copy
     /// the buffer with an offset.
     fn write_pending(&mut self) -> Effect<Self> {
-        let bytes = self.pending_response.clone();
+        let bytes = std::mem::take(&mut self.pending_response);
         match self.transport {
-            HttpTransport::Tcp(stream) => tcp_write(stream, bytes).then(HttpConnectionMsg::Wrote),
+            HttpTransport::Tcp(stream) => tcp_write_owned(stream, bytes)
+                .then(|result| HttpConnectionMsg::Wrote(result.map_err(|error| error.error))),
             HttpTransport::Tls(stream) => {
-                tls_write(stream, bytes, self.tls_io_timeout).then(HttpConnectionMsg::Wrote)
+                tls_write_owned(stream, bytes, self.tls_io_timeout).then(|result| {
+                    HttpConnectionMsg::Wrote(
+                        result
+                            .map(tls_write_reply_to_tcp)
+                            .map_err(|error| error.error),
+                    )
+                })
             }
         }
     }
 
-    fn handle_wrote(&mut self, count: usize) -> Effect<Self> {
+    fn handle_wrote(&mut self, reply: TcpWriteOwnedReply) -> Effect<Self> {
+        let TcpWriteOwnedReply { mut bytes, written } = reply;
         if self.websocket.is_some() {
-            return self.handle_websocket_wrote(count);
+            return self.handle_websocket_wrote(bytes, written);
         }
-        if count == 0 {
+        if written == 0 {
+            self.pending_response = bytes;
             // Wire stalled with no progress — treat as truncation
             // when a body was still owed.
             if self.has_pending_body() {
@@ -1154,10 +1231,9 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
         // sent, releasing `count` against the charge is exact:
         // head writes release zero (charge is zero); body writes
         // release exactly the body bytes that drained.
-        let release = count.min(self.metrics_response_charge);
+        let release = written.min(self.metrics_response_charge);
         self.release_response(release);
-        if count >= self.pending_response.len() {
-            self.pending_response.clear();
+        if written >= bytes.len() {
             // Buffer drained. Three cases:
             //  - buffered body was queued behind the head -> promote
             //    it, charge once, write it.
@@ -1191,7 +1267,8 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
                 self.finish_response()
             }
         } else {
-            self.pending_response.drain(..count);
+            bytes.drain(..written);
+            self.pending_response = bytes;
             self.write_pending()
         }
     }
@@ -1342,7 +1419,8 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
     /// allows either case but the wire convention is lowercase.
     fn write_chunked_data(&mut self, bytes: Vec<u8>) -> Effect<Self> {
         let n = bytes.len();
-        let mut framed = format!("{:x}\r\n", n).into_bytes();
+        let mut framed = Vec::with_capacity(bytes.len() + 32);
+        write!(&mut framed, "{n:x}\r\n").expect("write to Vec");
         framed.extend_from_slice(&bytes);
         framed.extend_from_slice(b"\r\n");
         self.pending_response = framed;
@@ -1433,21 +1511,34 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
         if max == 0 {
             return self.websocket_protocol_close(WebSocketError::ReadBufferTooLarge);
         }
+        let buffer = std::mem::take(&mut self.read_scratch);
         match self.transport {
-            HttpTransport::Tcp(stream) => tcp_read(stream, max).then(HttpConnectionMsg::Read),
-            HttpTransport::Tls(stream) => {
-                tls_read(stream, max, self.tls_io_timeout).then(HttpConnectionMsg::Read)
-            }
+            HttpTransport::Tcp(stream) => tcp_read_buf(stream, buffer, max)
+                .then(|result| HttpConnectionMsg::Read(result.map_err(|error| error.error))),
+            HttpTransport::Tls(stream) => tls_read_buf(stream, buffer, max, self.tls_io_timeout)
+                .then(|result| {
+                    HttpConnectionMsg::Read(
+                        result
+                            .map(tls_read_reply_to_tcp)
+                            .map_err(|error| error.error),
+                    )
+                }),
         }
     }
 
-    fn handle_websocket_wrote(&mut self, count: usize) -> Effect<Self> {
+    fn handle_websocket_wrote(&mut self, mut bytes: Vec<u8>, count: usize) -> Effect<Self> {
         if count == 0 {
+            if self.websocket_upgrade_after_write {
+                self.pending_response = bytes;
+            } else if let Some(ws) = self.websocket.as_mut() {
+                ws.pending_write = bytes;
+            }
             return self.begin_close();
         }
         if self.websocket_upgrade_after_write {
-            if count < self.pending_response.len() {
-                self.pending_response.drain(..count);
+            if count < bytes.len() {
+                bytes.drain(..count);
+                self.pending_response = bytes;
                 return self.write_pending();
             }
             self.pending_response.clear();
@@ -1475,8 +1566,9 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
         let Some(ws) = self.websocket.as_mut() else {
             return self.begin_close();
         };
-        if count < ws.pending_write.len() {
-            ws.pending_write.drain(..count);
+        if count < bytes.len() {
+            bytes.drain(..count);
+            ws.pending_write = bytes;
             return self.websocket_write_pending();
         }
         ws.pending_write.clear();
@@ -1495,7 +1587,7 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
         self.websocket_continue_read()
     }
 
-    fn handle_websocket_bytes_read(&mut self, bytes: Vec<u8>) -> Effect<Self> {
+    fn handle_websocket_bytes_read(&mut self, bytes: &[u8]) -> Effect<Self> {
         if bytes.is_empty() {
             let Some(session_id) = self.websocket.as_ref().map(|ws| ws.session_id) else {
                 return self.begin_close();
@@ -1519,7 +1611,7 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
         let Some(ws) = self.websocket.as_mut() else {
             return self.begin_close();
         };
-        ws.read_buf.extend_from_slice(&bytes);
+        ws.read_buf.extend_from_slice(bytes);
         if ws.read_buf.len() > ws.limits.read_buffer_high_water {
             return self.websocket_protocol_close(WebSocketError::ReadBufferTooLarge);
         }
@@ -1981,14 +2073,21 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
     }
 
     fn websocket_write_pending(&mut self) -> Effect<Self> {
-        let Some(ws) = self.websocket.as_ref() else {
+        let Some(ws) = self.websocket.as_mut() else {
             return self.begin_close();
         };
-        let bytes = ws.pending_write.clone();
+        let bytes = std::mem::take(&mut ws.pending_write);
         match self.transport {
-            HttpTransport::Tcp(stream) => tcp_write(stream, bytes).then(HttpConnectionMsg::Wrote),
+            HttpTransport::Tcp(stream) => tcp_write_owned(stream, bytes)
+                .then(|result| HttpConnectionMsg::Wrote(result.map_err(|error| error.error))),
             HttpTransport::Tls(stream) => {
-                tls_write(stream, bytes, self.tls_io_timeout).then(HttpConnectionMsg::Wrote)
+                tls_write_owned(stream, bytes, self.tls_io_timeout).then(|result| {
+                    HttpConnectionMsg::Wrote(
+                        result
+                            .map(tls_write_reply_to_tcp)
+                            .map_err(|error| error.error),
+                    )
+                })
             }
         }
     }

@@ -1,8 +1,8 @@
 //! Completion-based IO primitives shared by all backends.
 //!
 //! There is one concrete completion type per operation kind:
-//! [`AcceptCompletion`], [`ConnectCompletion`], [`RecvCompletion`], [`SendCompletion`],
-//! [`PReadCompletion`], [`PWriteCompletion`], [`FsyncCompletion`],
+//! [`AcceptCompletion`], [`ConnectCompletion`], [`RecvCompletion`], [`RecvBufCompletion`],
+//! [`SendCompletion`], [`SendOwnedCompletion`], [`PReadCompletion`], [`PWriteCompletion`], [`FsyncCompletion`],
 //! [`SizeCompletion`], [`MkdirCompletion`]. Each is a thin wrapper around
 //! [`CompletionInner`] (the shared state machine and operation slot) and
 //! carries its own typed result.
@@ -124,8 +124,25 @@ define_completion!(
 );
 
 define_completion!(
+    /// Completion slot for a caller-owned-buffer `recv(2)` operation.
+    ///
+    /// Backend errors return the buffer too, so runtime rails can keep owned
+    /// buffer reuse honest even on failure paths.
+    pub struct RecvBufCompletion => Result<(Vec<u8>, usize), (io::Error, Vec<u8>)>
+);
+
+define_completion!(
     /// Completion slot for a `send(2)`-style operation. Yields the byte count sent.
     pub struct SendCompletion => io::Result<usize>
+);
+
+define_completion!(
+    /// Completion slot for a `send(2)`-style operation that returns the buffer.
+    ///
+    /// Backend errors return the bytes too. A returned buffer does not prove
+    /// the peer observed nothing; callers must still inspect the error and
+    /// rail semantics before retrying.
+    pub struct SendOwnedCompletion => Result<(Vec<u8>, usize), (io::Error, Vec<u8>)>
 );
 
 define_completion!(
@@ -264,8 +281,12 @@ pub enum Operation {
     Connect(ConnectOp),
     /// Receive bytes from a connected socket.
     Recv(RecvOp),
+    /// Receive bytes into caller-owned storage.
+    RecvBuf(RecvOp),
     /// Send bytes to a connected socket.
     Send(SendOp),
+    /// Send bytes to a connected socket and return the buffer.
+    SendOwned(SendOp),
     /// Read bytes from a file at a fixed offset.
     PRead(PReadOp),
     /// Write bytes to a file at a fixed offset.

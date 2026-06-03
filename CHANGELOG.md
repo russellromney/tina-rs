@@ -92,6 +92,22 @@ This file records completed work.
 - Wired the `mini_saas_api` soak path to attach live `/debug/capacity`
   observations to its `LoadReport`, so the perf row carries capacity surfaces
   instead of timing without boundedness truth.
+- Added owned-buffer TCP/TLS runtime calls (`tcp_read_buf`,
+  `tcp_write_owned`, `tls_read_buf`, `tls_write_owned`) so hot paths can move
+  reusable buffers through effects and get them back instead of allocating a
+  fresh read buffer or cloning pending write bytes per call. The simulator
+  supports the same calls, and live/sim TCP tests pin the public helper shape.
+- Moved native HTTP/1 server, one-shot client, and keepalive client read/write
+  paths onto the owned-buffer calls. The server keeps its body-pressure,
+  keepalive, chunked, and WebSocket semantics; request-body chunk delivery also
+  avoids the common `drain(..).collect()` path.
+- Tightened HTTP encoder allocation paths by writing content lengths and
+  chunked frame headers directly into the output buffer instead of allocating
+  temporary strings.
+- Extended load/perf output with p90 latency fields, moved perf history to the
+  Phase 146 evidence file with `TINA_PERF_HISTORY_FILE` override, and made
+  `perf-check` require enough local history plus an absolute tolerance before
+  failing tiny-row comparisons.
 
 ### Request Scope End-To-End
 

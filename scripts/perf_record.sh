@@ -6,7 +6,7 @@
 # time. Each line covers ONE row from ONE `make perf` invocation. Two row
 # shapes are emitted today:
 #
-#   {"kind":"compare", "timestamp":..., "git_sha":..., "label":..., "tina_p50_ns":..., "tina_p99_ns":..., "tina_allocations":...}
+#   {"kind":"compare", "timestamp":..., "git_sha":..., "label":..., "tina_p50_ns":..., "tina_p90_ns":..., "tina_p99_ns":..., "tina_allocations":...}
 #   {"kind":"process", "timestamp":..., "git_sha":..., "label":..., "process_allocations":..., "rss_delta_kb":...}
 #
 # A `perf-compare` line stays the canonical "row" — `perf-process` lines are
@@ -19,7 +19,7 @@
 
 set -euo pipefail
 
-HISTORY_FILE=".intent/phases/145-hot-path-reality-check/perf_history.jsonl"
+HISTORY_FILE="${TINA_PERF_HISTORY_FILE:-.intent/phases/146-native-hot-path-allocation-http-cost/perf_history.jsonl}"
 
 mode="record"
 input_file=""
@@ -58,12 +58,13 @@ emit_compare_lines() {
     [[ -z $line ]] && continue
     label=$(grep -oE 'label=[a-z0-9_]+' <<< "$line" | head -1 | cut -d= -f2 || true)
     p50=$(grep -oE 'tina_p50_ns=[0-9]+' <<< "$line" | head -1 | cut -d= -f2 || true)
+    p90=$(grep -oE 'tina_p90_ns=[0-9]+' <<< "$line" | head -1 | cut -d= -f2 || true)
     p99=$(grep -oE 'tina_p99_ns=[0-9]+' <<< "$line" | head -1 | cut -d= -f2 || true)
     allocs=$(grep -oE 'tina_allocations=[0-9]+' <<< "$line" | head -1 | cut -d= -f2 || true)
     base_p50=$(grep -oE 'baseline_p50_ns=[0-9]+' <<< "$line" | head -1 | cut -d= -f2 || true)
     if [[ -n $label && -n $p50 ]]; then
-      printf '{"kind":"compare","timestamp":"%s","git_sha":"%s","label":"%s","tina_p50_ns":%s,"tina_p99_ns":%s,"tina_allocations":%s,"baseline_p50_ns":%s}\n' \
-        "$timestamp" "$git_sha" "$label" "$p50" "${p99:-null}" "${allocs:-null}" "${base_p50:-null}"
+      printf '{"kind":"compare","timestamp":"%s","git_sha":"%s","label":"%s","tina_p50_ns":%s,"tina_p90_ns":%s,"tina_p99_ns":%s,"tina_allocations":%s,"baseline_p50_ns":%s}\n' \
+        "$timestamp" "$git_sha" "$label" "$p50" "${p90:-null}" "${p99:-null}" "${allocs:-null}" "${base_p50:-null}"
     fi
   done < <(grep '^perf-compare' <<< "$output" || true)
 }

@@ -2,12 +2,29 @@
 
 ## Status
 
-- Future implementation plan.
-- Runs after Phase 145.
-- One PR unless the reusable-I/O-buffer API forces a narrow runtime/simulator
-  PR first.
-- Owns native performance rows, runtime TCP/TLS I/O buffer reuse, HTTP/1
-  allocation/copy reduction, and proof that speed did not weaken Tina truth.
+- Implemented in `codex/phase-146-hot-path`.
+- Added owned-buffer TCP/TLS call helpers and driver/simulator support.
+- Migrated native HTTP/1 server, one-shot client, and keepalive client to the
+  owned-buffer read/write path.
+- Follow-up fixes migrated HTTP/2 server/client and the standalone WebSocket
+  client to the same owned-buffer path.
+- Owned-buffer helper failures now return the owned buffer/bytes through
+  rail-specific error envelopes.
+- Removed concrete HTTP encoder string allocations for lengths/chunk framing.
+- Added p90 perf fields and Phase 146 perf history/check defaults.
+- Evidence: `.intent/phases/146-native-hot-path-allocation-http-cost/perf_history.jsonl`.
+
+Open truth after implementation:
+
+- HTTP/1 fixed-body close is much closer to Axum in local rows, but not a
+  production claim.
+- HTTP/1 close and especially keepalive still show real latency cost. The next
+  bottleneck is not the old fresh read buffer/clone-before-write tax; it is
+  worker-turn/scheduling cost plus remaining HTTP allocation shape.
+- HTTP/2 and standalone WebSocket no longer sit on compatibility read/write
+  helpers.
+- Owned-buffer driver failures return the buffer/bytes. Plain compatibility
+  helpers still collapse errors to `CallError` and discard temporary buffers.
 
 ## Grug Truth
 
@@ -453,8 +470,8 @@ Review these before coding:
 - no global allocator trick;
 - no removing trace/capacity/replay facts;
 - no hidden queues;
-- no HTTP/2/gRPC/WebSocket tuning unless the reusable I/O work naturally applies
-  through shared runtime calls;
+- no protocol-specific HTTP/2/gRPC/WebSocket tuning beyond moving their socket
+  reads/writes onto the shared reusable I/O calls;
 - no native AWS performance work;
 - no benchmark that uses SQLite or another bridge as the headline Rust-vs-Tina
   comparison.

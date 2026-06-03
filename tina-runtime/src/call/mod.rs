@@ -358,6 +358,10 @@ impl<M> RuntimeCall<M> {
     {
         Self::new(request, move |output| match output {
             CallOutput::Failed(error) => translator(Err(error)),
+            CallOutput::TcpReadBufFailed { error, .. }
+            | CallOutput::TcpWroteOwnedFailed { error, .. }
+            | CallOutput::TlsReadBufFailed { error, .. }
+            | CallOutput::TlsWroteOwnedFailed { error, .. } => translator(Err(error)),
             other => translator(Ok(other)),
         })
     }
@@ -742,8 +746,27 @@ impl CallOutput {
     pub fn into_tcp_read(self) -> Result<Vec<u8>, CallError> {
         match self {
             Self::TcpRead { bytes } => Ok(bytes),
+            Self::TcpReadBuf { buffer, len } => Ok(buffer.into_iter().take(len).collect()),
+            Self::TcpReadBufFailed { error, .. } => Err(error),
             Self::Failed(error) => Err(error),
             other => Self::panic_wrong_shape("TcpRead", &other),
+        }
+    }
+
+    /// Extracts the successful TCP reusable-buffer read payload.
+    pub fn into_tcp_read_buf(self) -> Result<TcpReadBufReply, TcpReadBufError> {
+        match self {
+            Self::TcpReadBuf { buffer, len } => Ok(TcpReadBufReply { buffer, len }),
+            Self::TcpRead { bytes } => {
+                let len = bytes.len();
+                Ok(TcpReadBufReply { buffer: bytes, len })
+            }
+            Self::TcpReadBufFailed { buffer, error } => Err(TcpReadBufError { error, buffer }),
+            Self::Failed(error) => Err(TcpReadBufError {
+                error,
+                buffer: Vec::new(),
+            }),
+            other => Self::panic_wrong_shape("TcpReadBuf", &other),
         }
     }
 
@@ -751,8 +774,26 @@ impl CallOutput {
     pub fn into_tcp_wrote(self) -> Result<usize, CallError> {
         match self {
             Self::TcpWrote { count } => Ok(count),
+            Self::TcpWroteOwned { count, .. } => Ok(count),
+            Self::TcpWroteOwnedFailed { error, .. } => Err(error),
             Self::Failed(error) => Err(error),
             other => Self::panic_wrong_shape("TcpWrote", &other),
+        }
+    }
+
+    /// Extracts the successful TCP reusable-buffer write payload.
+    pub fn into_tcp_wrote_owned(self) -> Result<TcpWriteOwnedReply, TcpWriteOwnedError> {
+        match self {
+            Self::TcpWroteOwned { bytes, count } => Ok(TcpWriteOwnedReply {
+                bytes,
+                written: count,
+            }),
+            Self::TcpWroteOwnedFailed { bytes, error } => Err(TcpWriteOwnedError { error, bytes }),
+            Self::Failed(error) => Err(TcpWriteOwnedError {
+                error,
+                bytes: Vec::new(),
+            }),
+            other => Self::panic_wrong_shape("TcpWroteOwned", &other),
         }
     }
 
@@ -880,8 +921,27 @@ impl CallOutput {
     pub fn into_tls_read(self) -> Result<Vec<u8>, CallError> {
         match self {
             Self::TlsRead { bytes } => Ok(bytes),
+            Self::TlsReadBuf { buffer, len } => Ok(buffer.into_iter().take(len).collect()),
+            Self::TlsReadBufFailed { error, .. } => Err(error),
             Self::Failed(error) => Err(error),
             other => Self::panic_wrong_shape("TlsRead", &other),
+        }
+    }
+
+    /// Extracts the successful TLS reusable-buffer read payload.
+    pub fn into_tls_read_buf(self) -> Result<TlsReadBufReply, TlsReadBufError> {
+        match self {
+            Self::TlsReadBuf { buffer, len } => Ok(TlsReadBufReply { buffer, len }),
+            Self::TlsRead { bytes } => {
+                let len = bytes.len();
+                Ok(TlsReadBufReply { buffer: bytes, len })
+            }
+            Self::TlsReadBufFailed { buffer, error } => Err(TlsReadBufError { error, buffer }),
+            Self::Failed(error) => Err(TlsReadBufError {
+                error,
+                buffer: Vec::new(),
+            }),
+            other => Self::panic_wrong_shape("TlsReadBuf", &other),
         }
     }
 
@@ -889,8 +949,26 @@ impl CallOutput {
     pub fn into_tls_wrote(self) -> Result<usize, CallError> {
         match self {
             Self::TlsWrote { count } => Ok(count),
+            Self::TlsWroteOwned { count, .. } => Ok(count),
+            Self::TlsWroteOwnedFailed { error, .. } => Err(error),
             Self::Failed(error) => Err(error),
             other => Self::panic_wrong_shape("TlsWrote", &other),
+        }
+    }
+
+    /// Extracts the successful TLS reusable-buffer write payload.
+    pub fn into_tls_wrote_owned(self) -> Result<TlsWriteOwnedReply, TlsWriteOwnedError> {
+        match self {
+            Self::TlsWroteOwned { bytes, count } => Ok(TlsWriteOwnedReply {
+                bytes,
+                written: count,
+            }),
+            Self::TlsWroteOwnedFailed { bytes, error } => Err(TlsWriteOwnedError { error, bytes }),
+            Self::Failed(error) => Err(TlsWriteOwnedError {
+                error,
+                bytes: Vec::new(),
+            }),
+            other => Self::panic_wrong_shape("TlsWroteOwned", &other),
         }
     }
 
@@ -1162,9 +1240,9 @@ impl CallOutput {
 /// Doc-hidden carrier used by typed call helpers like [`sleep`] and
 /// [`tcp_read`].
 #[doc(hidden)]
-pub struct TypedCall<T> {
+pub struct TypedCall<T, E = CallError> {
     request: CallInput,
-    decode: fn(CallOutput) -> Result<T, CallError>,
+    decode: fn(CallOutput) -> Result<T, E>,
 }
 
 /// Prepared observed-send helper returned by [`send_observed`].
@@ -1212,15 +1290,15 @@ pub struct RequestDeferredIsolateCall<T, R, Q> {
 /// Prepared typed runtime-call continuation after caller authority was
 /// captured.
 #[doc(hidden)]
-pub struct DeferredTypedCall<T, Q> {
-    inner: TypedCall<T>,
+pub struct DeferredTypedCall<T, Q, E = CallError> {
+    inner: TypedCall<T, E>,
     request: tina::RequestContext<Q>,
 }
 
 /// Request-effect wrapper for [`DeferredTypedCall`].
 #[doc(hidden)]
-pub struct RequestDeferredTypedCall<T, Q> {
-    inner: DeferredTypedCall<T, Q>,
+pub struct RequestDeferredTypedCall<T, Q, E = CallError> {
+    inner: DeferredTypedCall<T, Q, E>,
 }
 
 impl<T> ObservedSend<T>
@@ -1909,6 +1987,71 @@ mod pending_cancelable_call_set_tests {
         let removed = set.remove(&Key(1), ticket).expect("remove");
 
         assert_eq!(removed.into_request_context().slot_id(), 1);
+    }
+
+    #[test]
+    fn owned_read_failure_decoders_return_buffers() {
+        let tcp_buffer = vec![1, 2, 3, 4];
+        let tcp_error = CallOutput::TcpReadBufFailed {
+            buffer: tcp_buffer.clone(),
+            error: CallError::ResourceBusy,
+        }
+        .into_tcp_read_buf()
+        .expect_err("owned TCP read failure should return error envelope");
+        assert_eq!(tcp_error.error, CallError::ResourceBusy);
+        assert_eq!(tcp_error.buffer, tcp_buffer);
+
+        let tls_buffer = vec![8, 9, 10];
+        let tls_error = CallOutput::TlsReadBufFailed {
+            buffer: tls_buffer.clone(),
+            error: CallError::Timeout,
+        }
+        .into_tls_read_buf()
+        .expect_err("owned TLS read failure should return error envelope");
+        assert_eq!(tls_error.error, CallError::Timeout);
+        assert_eq!(tls_error.buffer, tls_buffer);
+    }
+
+    #[test]
+    fn owned_write_failure_decoders_return_bytes() {
+        let tcp_bytes = b"hello".to_vec();
+        let tcp_error = CallOutput::TcpWroteOwnedFailed {
+            bytes: tcp_bytes.clone(),
+            error: CallError::InvalidResource,
+        }
+        .into_tcp_wrote_owned()
+        .expect_err("owned TCP write failure should return error envelope");
+        assert_eq!(tcp_error.error, CallError::InvalidResource);
+        assert_eq!(tcp_error.bytes, tcp_bytes);
+
+        let tls_bytes = b"secret plaintext".to_vec();
+        let tls_error = CallOutput::TlsWroteOwnedFailed {
+            bytes: tls_bytes.clone(),
+            error: CallError::Io,
+        }
+        .into_tls_wrote_owned()
+        .expect_err("owned TLS write failure should return error envelope");
+        assert_eq!(tls_error.error, CallError::Io);
+        assert_eq!(tls_error.bytes, tls_bytes);
+    }
+
+    #[test]
+    fn raw_map_result_treats_owned_failures_as_errors() {
+        let call = RuntimeCall::map_result(
+            CallInput::TcpReadBuf {
+                stream: StreamId::new(1),
+                buffer: Vec::new(),
+                max_len: 1,
+            },
+            |result| result,
+        );
+        let (_request, translator) = call.into_parts();
+
+        let result = translator(CallOutput::TcpReadBufFailed {
+            buffer: vec![0],
+            error: CallError::ResourceBusy,
+        });
+        assert!(matches!(result, Err(CallError::ResourceBusy)));
     }
 
     #[test]

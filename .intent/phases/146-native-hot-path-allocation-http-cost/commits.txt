@@ -1,0 +1,24 @@
+Phase 146 commits and evidence
+
+Implementation commit:
+- d1959dd Implement phase 146 native hot-path buffer reuse
+
+Review-fix commit:
+- ecfc385 Tighten phase 146 review fixes
+  - fixed stale perf_native README follow-up text after owned-buffer work landed
+  - added a focused partial-write proof for the owned TCP write helper fixture
+  - regenerated perf history from the committed implementation state
+
+Evidence commands run during implementation/review:
+- cargo fmt --all --check
+- git diff --check
+- cargo clippy -p tina-runtime -p tina-sim -p tina-http -p tina-proof-harness --all-targets -- -D warnings
+- make proof-fast
+- cargo test -p tina-runtime --test tcp_echo owned_buffer -- --nocapture
+- ./scripts/perf_record.sh
+- ./scripts/perf_check.sh
+
+Open truth:
+- Owned-buffer failures now return buffer/bytes through rail-specific error envelopes. Plain compatibility helpers still collapse errors to CallError.
+- HTTP/1 server/client/keepalive, HTTP/2 server/client, and standalone/server WebSocket paths use owned-buffer read/write calls.
+- Perf history is local macOS aarch64 evidence, not a production claim.

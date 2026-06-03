@@ -100,8 +100,10 @@ use tina::prelude::*;
 use tina::{CallContext, RequestContext, reply_to_request};
 use tina_runtime::pool::{WorkerPool, WorkerPoolMsg, WorkerPoolReply};
 use tina_runtime::{
-    CallError, CallOutcome, ThreadedRuntime, ThreadedRuntimeError, sleep, tcp_close_stream,
-    tcp_connect, tcp_read, tcp_write, tls_close, tls_connect, tls_read, tls_write,
+    CallError, CallOutcome, TcpReadBufReply, TcpWriteOwnedReply, ThreadedRuntime,
+    ThreadedRuntimeError, TlsReadBufReply, TlsWriteOwnedReply, sleep, tcp_close_stream,
+    tcp_connect, tcp_read_buf, tcp_write_owned, tls_close, tls_connect, tls_read_buf,
+    tls_write_owned,
 };
 
 use crate::chunked_decoder::{ChunkedDecoder, FeedAllResult};
@@ -211,8 +213,8 @@ pub enum KeepaliveConnectionMsg {
 
     Connected(Result<(tina_runtime::StreamId, SocketAddr, SocketAddr), CallError>),
     TlsConnected(Result<tina_runtime::TlsStreamId, CallError>),
-    Wrote(Result<usize, CallError>),
-    Read(Result<Vec<u8>, CallError>),
+    Wrote(Result<TcpWriteOwnedReply, CallError>),
+    Read(Result<TcpReadBufReply, CallError>),
     Closed(Result<(), CallError>),
     /// `generation` distinguishes the deadline for *this* request
     /// from stale deadlines scheduled by prior requests on the same
@@ -312,6 +314,7 @@ struct InFlight {
     /// `Deadline` continuations from prior requests.
     generation: u64,
     pending_write: Vec<u8>,
+    read_scratch: Vec<u8>,
     read_buf: Vec<u8>,
     decoded_chunked_body: Vec<u8>,
     chunked_decoder: Option<ChunkedDecoder>,
@@ -418,7 +421,7 @@ impl<S: Shard + 'static> Isolate for KeepaliveConnection<S> {
                 self.fail_request(HttpClientError::Transport { phase, source }, true)
             }
 
-            KeepaliveConnectionMsg::Wrote(Ok(count)) => self.handle_wrote(count),
+            KeepaliveConnectionMsg::Wrote(Ok(reply)) => self.handle_wrote(reply),
             KeepaliveConnectionMsg::Wrote(Err(source)) => {
                 let error = self.transport_or_flat_error(
                     HttpTransportPhase::Write,
@@ -428,7 +431,7 @@ impl<S: Shard + 'static> Isolate for KeepaliveConnection<S> {
                 self.fail_request(error, true)
             }
 
-            KeepaliveConnectionMsg::Read(Ok(bytes)) => self.handle_bytes_read(bytes),
+            KeepaliveConnectionMsg::Read(Ok(reply)) => self.handle_read_reply(reply),
             KeepaliveConnectionMsg::Read(Err(source)) => {
                 let error = self.transport_or_flat_error(
                     HttpTransportPhase::Read,
@@ -531,6 +534,7 @@ impl<S: Shard + 'static> KeepaliveConnection<S> {
         self.in_flight = Some(InFlight {
             generation,
             pending_write: Vec::new(),
+            read_scratch: Vec::with_capacity(READ_CHUNK),
             read_buf: Vec::new(),
             decoded_chunked_body: Vec::new(),
             chunked_decoder: None,
@@ -654,50 +658,78 @@ impl<S: Shard + 'static> KeepaliveConnection<S> {
     }
 
     fn write_more(&mut self) -> Effect<Self> {
-        let in_flight = self.in_flight.as_ref().expect("in_flight present");
+        let in_flight = self.in_flight.as_mut().expect("in_flight present");
         let transport = self.transport.expect("transport set before write");
-        let bytes = in_flight.pending_write.clone();
+        let bytes = std::mem::take(&mut in_flight.pending_write);
         match transport {
-            HttpTransport::Tcp(stream) => {
-                tcp_write(stream, bytes).then(KeepaliveConnectionMsg::Wrote)
+            HttpTransport::Tcp(stream) => tcp_write_owned(stream, bytes)
+                .then(|result| KeepaliveConnectionMsg::Wrote(result.map_err(|error| error.error))),
+            HttpTransport::Tls(stream) => {
+                tls_write_owned(stream, bytes, self.config.request_timeout).then(|result| {
+                    KeepaliveConnectionMsg::Wrote(
+                        result
+                            .map(tls_write_reply_to_tcp)
+                            .map_err(|error| error.error),
+                    )
+                })
             }
-            HttpTransport::Tls(stream) => tls_write(stream, bytes, self.config.request_timeout)
-                .then(KeepaliveConnectionMsg::Wrote),
         }
     }
 
-    fn handle_wrote(&mut self, count: usize) -> Effect<Self> {
+    fn handle_wrote(&mut self, reply: TcpWriteOwnedReply) -> Effect<Self> {
+        let TcpWriteOwnedReply {
+            mut bytes,
+            written: count,
+        } = reply;
         let Some(in_flight) = self.in_flight.as_mut() else {
             return noop();
         };
         if count == 0 {
+            in_flight.pending_write = bytes;
             return self.fail_request(HttpClientError::Write, true);
         }
-        if count >= in_flight.pending_write.len() {
-            in_flight.pending_write.clear();
+        if count >= bytes.len() {
             self.read_more()
         } else {
-            in_flight.pending_write.drain(..count);
+            bytes.drain(..count);
+            in_flight.pending_write = bytes;
             self.write_more()
         }
     }
 
     fn read_more(&mut self) -> Effect<Self> {
         let transport = self.transport.expect("transport set before read");
+        let in_flight = self.in_flight.as_mut().expect("in_flight present");
+        let buffer = std::mem::take(&mut in_flight.read_scratch);
         match transport {
-            HttpTransport::Tcp(stream) => {
-                tcp_read(stream, READ_CHUNK).then(KeepaliveConnectionMsg::Read)
+            HttpTransport::Tcp(stream) => tcp_read_buf(stream, buffer, READ_CHUNK)
+                .then(|result| KeepaliveConnectionMsg::Read(result.map_err(|error| error.error))),
+            HttpTransport::Tls(stream) => {
+                tls_read_buf(stream, buffer, READ_CHUNK, self.config.request_timeout).then(
+                    |result| {
+                        KeepaliveConnectionMsg::Read(
+                            result
+                                .map(tls_read_reply_to_tcp)
+                                .map_err(|error| error.error),
+                        )
+                    },
+                )
             }
-            HttpTransport::Tls(stream) => tls_read(stream, READ_CHUNK, self.config.request_timeout)
-                .then(KeepaliveConnectionMsg::Read),
         }
     }
 
-    fn handle_bytes_read(&mut self, bytes: Vec<u8>) -> Effect<Self> {
+    fn handle_read_reply(&mut self, reply: TcpReadBufReply) -> Effect<Self> {
+        let TcpReadBufReply { buffer, len } = reply;
+        self.handle_bytes_read(buffer, len)
+    }
+
+    fn handle_bytes_read(&mut self, mut buffer: Vec<u8>, len: usize) -> Effect<Self> {
         let Some(in_flight) = self.in_flight.as_mut() else {
             return noop();
         };
-        if bytes.is_empty() {
+        if len == 0 {
+            buffer.clear();
+            in_flight.read_scratch = buffer;
             // Peer closed. If we already framed a response and the
             // body is complete, deliver success; otherwise it's a
             // truncation. Either way the transport is gone — must
@@ -708,7 +740,9 @@ impl<S: Shard + 'static> KeepaliveConnection<S> {
                 self.fail_request(HttpClientError::Closed, true)
             };
         }
-        in_flight.read_buf.extend_from_slice(&bytes);
+        in_flight.read_buf.extend_from_slice(&buffer[..len]);
+        buffer.clear();
+        in_flight.read_scratch = buffer;
 
         if in_flight.parsed_head.is_none() {
             match parse_response_head(&in_flight.read_buf, &self.config.limits) {
@@ -874,6 +908,20 @@ fn body_complete(state: &InFlight) -> bool {
     };
     let needed = state.head_len + head.content_length;
     state.read_buf.len() >= needed
+}
+
+fn tls_read_reply_to_tcp(reply: TlsReadBufReply) -> TcpReadBufReply {
+    TcpReadBufReply {
+        buffer: reply.buffer,
+        len: reply.len,
+    }
+}
+
+fn tls_write_reply_to_tcp(reply: TlsWriteOwnedReply) -> TcpWriteOwnedReply {
+    TcpWriteOwnedReply {
+        bytes: reply.bytes,
+        written: reply.written,
+    }
 }
 
 fn reply_keepalive_outcome<S: Shard + 'static>(

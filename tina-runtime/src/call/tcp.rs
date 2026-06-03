@@ -5,7 +5,10 @@
 
 use std::net::SocketAddr;
 
-use super::{CallInput, CallOutput, ListenerId, StreamId, TypedCall};
+use super::{
+    CallInput, CallOutput, ListenerId, StreamId, TcpReadBufError, TcpReadBufReply,
+    TcpWriteOwnedError, TcpWriteOwnedReply, TypedCall,
+};
 
 /// Returns a typed TCP bind helper that later yields one listener id and
 /// bound address.
@@ -39,11 +42,38 @@ pub fn tcp_read(stream: StreamId, max_len: usize) -> TypedCall<Vec<u8>> {
     )
 }
 
+/// Returns a typed TCP read helper that reuses caller-owned storage.
+pub fn tcp_read_buf(
+    stream: StreamId,
+    buffer: Vec<u8>,
+    max_len: usize,
+) -> TypedCall<TcpReadBufReply, TcpReadBufError> {
+    TypedCall::new(
+        CallInput::TcpReadBuf {
+            stream,
+            buffer,
+            max_len,
+        },
+        CallOutput::into_tcp_read_buf,
+    )
+}
+
 /// Returns a typed TCP write helper that later yields the accepted byte count.
 pub fn tcp_write(stream: StreamId, bytes: Vec<u8>) -> TypedCall<usize> {
     TypedCall::new(
         CallInput::TcpWrite { stream, bytes },
         CallOutput::into_tcp_wrote,
+    )
+}
+
+/// Returns a typed TCP write helper that gives the caller-owned bytes back.
+pub fn tcp_write_owned(
+    stream: StreamId,
+    bytes: Vec<u8>,
+) -> TypedCall<TcpWriteOwnedReply, TcpWriteOwnedError> {
+    TypedCall::new(
+        CallInput::TcpWriteOwned { stream, bytes },
+        CallOutput::into_tcp_wrote_owned,
     )
 }
 

@@ -13,7 +13,8 @@ use std::time::{Duration, Instant};
 
 use betelgeuse::{
     AcceptCompletion, AcceptOp, ConnectCompletion, IO, IOFile, IOLoop, IOLoopHandle, IOSocket,
-    OpenOptions, Operation, RecvCompletion, SendCompletion, io::simulated::SimulatedIO,
+    OpenOptions, Operation, RecvBufCompletion, RecvCompletion, SendCompletion, SendOwnedCompletion,
+    io::simulated::SimulatedIO,
 };
 use tina::{CallContext, Mailbox, TrySendError, prelude::*};
 use tina_runtime::{
@@ -657,8 +658,31 @@ impl IOSocket for StuckReleaseSocket {
         Err(io::Error::new(io::ErrorKind::Unsupported, "stuck recv"))
     }
 
+    fn recv_buf(
+        &self,
+        _c: &mut RecvBufCompletion,
+        buffer: Vec<u8>,
+        _max_len: usize,
+    ) -> Result<(), (io::Error, Vec<u8>)> {
+        Err((
+            io::Error::new(io::ErrorKind::Unsupported, "stuck recv_buf"),
+            buffer,
+        ))
+    }
+
     fn send(&self, _c: &mut SendCompletion, _buf: Vec<u8>) -> io::Result<()> {
         Err(io::Error::new(io::ErrorKind::Unsupported, "stuck send"))
+    }
+
+    fn send_owned(
+        &self,
+        _c: &mut SendOwnedCompletion,
+        buf: Vec<u8>,
+    ) -> Result<(), (io::Error, Vec<u8>)> {
+        Err((
+            io::Error::new(io::ErrorKind::Unsupported, "stuck send_owned"),
+            buf,
+        ))
     }
 
     fn set_nodelay(&self, _on: bool) -> io::Result<()> {

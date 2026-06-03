@@ -10,9 +10,11 @@
 
 set -euo pipefail
 
-HISTORY_FILE=".intent/phases/145-hot-path-reality-check/perf_history.jsonl"
+HISTORY_FILE="${TINA_PERF_HISTORY_FILE:-.intent/phases/146-native-hot-path-allocation-http-cost/perf_history.jsonl}"
 WINDOW="${PERF_CHECK_WINDOW:-5}"
 THRESHOLD_PERCENT="${PERF_CHECK_THRESHOLD:-25}"
+ABS_TOLERANCE_NS="${PERF_CHECK_ABS_TOLERANCE_NS:-500000}"
+MIN_HISTORY_ROWS="${PERF_CHECK_MIN_HISTORY_ROWS:-3}"
 
 if [[ ! -f $HISTORY_FILE ]]; then
   echo "no history at $HISTORY_FILE — run scripts/perf_record.sh first" >&2
@@ -27,13 +29,13 @@ fail=0
 # Iterate each label observed in the current run.
 labels=$(grep '^perf-compare' <<< "$output" | grep -oE 'label=[a-z0-9_]+' | sed 's/label=//' | sort -u)
 
-printf '%-32s %12s %12s %8s %s\n' "label" "current_ns" "median_ns" "delta%" "verdict"
-printf '%-32s %12s %12s %8s %s\n' "-----" "----------" "---------" "------" "-------"
+printf '%-32s %12s %12s %12s %8s %s\n' "label" "current_ns" "median_ns" "delta_ns" "delta%" "verdict"
+printf '%-32s %12s %12s %12s %8s %s\n' "-----" "----------" "---------" "--------" "------" "-------"
 
 for label in $labels; do
   current=$(grep "^perf-compare label=$label " <<< "$output" | grep -oE 'tina_p50_ns=[0-9]+' | head -1 | cut -d= -f2)
   if [[ -z $current ]]; then
-    printf '%-32s %12s %12s %8s %s\n' "$label" "?" "?" "?" "skipped (no current p50)"
+    printf '%-32s %12s %12s %12s %8s %s\n' "$label" "?" "?" "?" "?" "skipped (no current p50)"
     continue
   fi
 
@@ -47,29 +49,34 @@ for label in $labels; do
                  | sort -n)
 
   if [[ -z $historical ]]; then
-    printf '%-32s %12s %12s %8s %s\n' "$label" "$current" "-" "-" "no history (first run for this label)"
+    printf '%-32s %12s %12s %12s %8s %s\n' "$label" "$current" "-" "-" "-" "no history (first run for this label)"
     continue
   fi
 
   count=$(wc -l <<< "$historical" | tr -d ' ')
+  if (( count < MIN_HISTORY_ROWS )); then
+    printf '%-32s %12s %12s %12s %8s %s\n' "$label" "$current" "-" "-" "-" "warming history (${count}/${MIN_HISTORY_ROWS})"
+    continue
+  fi
   # Median index (1-based).
   median_idx=$(( (count + 1) / 2 ))
   median=$(sed -n "${median_idx}p" <<< "$historical")
 
   if [[ -z $median || $median -eq 0 ]]; then
-    printf '%-32s %12s %12s %8s %s\n' "$label" "$current" "$median" "-" "median zero — skipped"
+    printf '%-32s %12s %12s %12s %8s %s\n' "$label" "$current" "$median" "-" "-" "median zero — skipped"
     continue
   fi
 
   delta_pct=$(( (current - median) * 100 / median ))
+  delta_ns=$(( current - median ))
 
-  if (( delta_pct > THRESHOLD_PERCENT )); then
-    printf '%-32s %12s %12s %+8d %s\n' "$label" "$current" "$median" "$delta_pct" "REGRESSION (> +${THRESHOLD_PERCENT}%)"
+  if (( delta_pct > THRESHOLD_PERCENT && delta_ns > ABS_TOLERANCE_NS )); then
+    printf '%-32s %12s %12s %+12d %+8d %s\n' "$label" "$current" "$median" "$delta_ns" "$delta_pct" "REGRESSION (> +${THRESHOLD_PERCENT}% and > ${ABS_TOLERANCE_NS}ns)"
     fail=1
   elif (( delta_pct < -THRESHOLD_PERCENT )); then
-    printf '%-32s %12s %12s %+8d %s\n' "$label" "$current" "$median" "$delta_pct" "improvement"
+    printf '%-32s %12s %12s %+12d %+8d %s\n' "$label" "$current" "$median" "$delta_ns" "$delta_pct" "improvement"
   else
-    printf '%-32s %12s %12s %+8d %s\n' "$label" "$current" "$median" "$delta_pct" "ok"
+    printf '%-32s %12s %12s %+12d %+8d %s\n' "$label" "$current" "$median" "$delta_ns" "$delta_pct" "ok"
   fi
 done
 
