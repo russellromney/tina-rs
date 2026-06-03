@@ -151,5 +151,33 @@ Suggested next follow-ups:
 - Add more repeated-run history before any public performance claim.
 - Verify Linux/x86_64 perf behavior; these rows were measured on macOS aarch64.
 
-Verdict:
-- keep
+## Phase 147 HTTP turn/allocation pass
+
+Phase 146 also left two evidence holes:
+
+- `perf-process` rows counted allocations but not allocated bytes;
+- checked-in history rows did not carry platform/arch/profile, so macOS and
+  Linux could be mixed accidentally.
+
+Phase 147 fixes those first. The default history now lives at
+`.intent/phases/147-http-turn-allocation-cost/perf_history.jsonl`, and rows
+carry `platform`, `arch`, and `profile`.
+
+The hotpath test now also prints HTTP rows:
+
+- `hotpath_http1_close_request`;
+- `hotpath_http1_keepalive_sequential`;
+- `hotpath_http1_fixed_body_close`.
+
+These rows expose `stage_count`. On local macOS/aarch64 evidence, close and
+fixed-body paths still take dozens of runtime-observed stages, and four
+keepalive requests take over one hundred stages. That is the next real cost:
+not the old buffer clone, but turn count plus remaining HTTP allocation shape.
+
+The perf test also prints an HTTP body-pressure probe. It sends requests that
+exceed `max_body_bytes`, expects typed `full` pressure, projects the body
+metrics into service-pressure surfaces, and asserts final current returns to
+zero.
+
+Current verdict: keep the evidence, keep optimizing, do not make a production
+performance claim yet.

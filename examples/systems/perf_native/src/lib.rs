@@ -17,17 +17,19 @@ use std::time::{Duration, Instant};
 use axum::Router;
 use axum::routing::get;
 use tina::CallRejectedReason;
+use tina::capacity::{CapacityMode, CapacitySurfaceReport};
 use tina::prelude::*;
 use tina_http::{
-    HttpListener, HttpListenerMsg, HttpRequest, HttpResponse, HttpServerConfig, StatusCode,
+    BodyMetrics, HttpLimits, HttpListener, HttpListenerMsg, HttpRequest, HttpResponse,
+    HttpServerConfig, StatusCode,
 };
 use tina_proof_harness::{
     LoadObservation, LoadReport, LoadRun, LoadStop, OpOutcome, PerfAllocationReport,
-    PerfComparisonReport, PerfReport, SemanticMatch,
+    PerfComparisonReport, PerfReport, SemanticMatch, SurfacePlateau, UnavailableSurface,
 };
 use tina_runtime::{
     CallOutcome, DefaultThreadedMailboxFactory, ThreadedRuntime, ThreadedRuntimeConfig,
-    ThreadedSendObservedError, call,
+    ServicePressureReport, ThreadedSendObservedError, call,
 };
 use tokio::net::TcpListener;
 use tokio::runtime::Builder;
@@ -165,6 +167,99 @@ pub fn http1_fixed_body_compare() -> anyhow::Result<PerfComparisonReport> {
         SemanticMatch::Partial,
         "same close-per-request client reads a fixed 4096-byte response body; native tina-http vs axum/hyper",
     )
+}
+
+pub fn http_body_pressure_probe() -> anyhow::Result<LoadReport> {
+    const MAX_BODY_BYTES: usize = 16;
+    const TOO_LARGE_BODY_BYTES: usize = 999;
+    const PRESSURE_OPS: u64 = 8;
+
+    let runtime = new_runtime();
+    let metrics = BodyMetrics::with_body_capacity("perf.http.bodies", MAX_BODY_BYTES, MAX_BODY_BYTES);
+    let service = runtime
+        .register_with_capacity::<_, Infallible>(
+            BodyService {
+                body: Arc::new(small_body()),
+            },
+            CAPACITY,
+        )
+        .map_err(|e| anyhow::anyhow!("register tina http pressure service: {e:?}"))?;
+    let config = HttpServerConfig {
+        limits: HttpLimits {
+            max_body_bytes: MAX_BODY_BYTES,
+            ..HttpLimits::default()
+        },
+        ..HttpServerConfig::dev()
+    };
+    let listener = runtime
+        .register_with_capacity::<_, Infallible>(
+            HttpListener::<SingleShard>::with_config("127.0.0.1:0".parse()?, service, config)
+                .with_metrics(metrics.clone()),
+            config.listener_mailbox_capacity,
+        )
+        .map_err(|e| anyhow::anyhow!("register tina http pressure listener: {e:?}"))?;
+    let bound = runtime.observe_next_bound();
+    runtime
+        .try_send(listener, HttpListenerMsg::Start)
+        .map_err(|e| anyhow::anyhow!("start tina http pressure listener: {e:?}"))?;
+    let addr = bound
+        .wait(Duration::from_secs(2))
+        .map_err(|e| anyhow::anyhow!("observe tina http pressure bind: {e:?}"))?;
+
+    let (load, _allocations) = run_counted(
+        LoadRun {
+            workers: 1,
+            stop: LoadStop::ops(PRESSURE_OPS),
+            label: "tina_http_body_pressure",
+        },
+        move |_| match http_post_declared_too_large(addr, TOO_LARGE_BODY_BYTES) {
+            Ok(()) => OpOutcome::Err { kind: "full" },
+            Err(_) => OpOutcome::Err { kind: "http_error" },
+        },
+        Some({
+            let metrics = metrics.clone();
+            move || body_pressure_observation(&metrics, MAX_BODY_BYTES)
+        }),
+    );
+
+    let _ = runtime.try_send(listener, HttpListenerMsg::Stop);
+    shutdown_runtime(runtime)?;
+    Ok(load)
+}
+
+fn body_pressure_observation(metrics: &BodyMetrics, max_body_bytes: usize) -> LoadObservation {
+    let snapshot = metrics.snapshot();
+    let mut report = ServicePressureReport::new("perf.http.body_pressure");
+    if let Some(request) =
+        snapshot.request_capacity_report("perf.http.request_body", CapacityMode::Fixed)
+    {
+        let high_water = request.high_water_weight.unwrap_or(0);
+        report.add_measured("body", request);
+        report.add_measured(
+            "body",
+            CapacitySurfaceReport::weighted(
+                "perf.http.max_body_bytes",
+                CapacityMode::Fixed,
+                max_body_bytes,
+                0,
+                high_water,
+                snapshot.body_full_count,
+                "bytes",
+            ),
+        );
+    } else {
+        report.add_unavailable(
+            "perf.http.request_body",
+            "body",
+            "body metrics were not configured",
+        );
+    }
+    LoadObservation {
+        leak_clean: snapshot.drained(),
+        surface_plateaus: SurfacePlateau::from_service_pressure(&report),
+        unavailable_surfaces: UnavailableSurface::from_service_pressure(&report),
+        ..LoadObservation::default()
+    }
 }
 
 fn compare_samples(
@@ -724,8 +819,9 @@ fn tina_http_row(
         },
         None::<fn() -> LoadObservation>,
     );
-    let (allocs_delta, rss_delta) = ProcessSnapshot::now().delta_from(process_before);
-    print_process_metrics(label, allocs_delta, rss_delta);
+    let (allocs_delta, allocated_bytes_delta, rss_delta) =
+        ProcessSnapshot::now().delta_from(process_before);
+    print_process_metrics(label, allocs_delta, allocated_bytes_delta, rss_delta);
     let _ = runtime.try_send(listener, HttpListenerMsg::Stop);
     shutdown_runtime(runtime)?;
     Ok(PerfReport::from_load_with_allocations(
@@ -785,8 +881,9 @@ fn tokio_http_row(
         },
         None::<fn() -> LoadObservation>,
     );
-    let (allocs_delta, rss_delta) = ProcessSnapshot::now().delta_from(process_before);
-    print_process_metrics(label, allocs_delta, rss_delta);
+    let (allocs_delta, allocated_bytes_delta, rss_delta) =
+        ProcessSnapshot::now().delta_from(process_before);
+    print_process_metrics(label, allocs_delta, allocated_bytes_delta, rss_delta);
     let _ = stop_tx.send(());
     done_rx.recv_timeout(Duration::from_secs(2))?;
     handle
@@ -1041,6 +1138,7 @@ pub fn rss_kb_now() -> u64 {
 #[derive(Debug, Clone, Copy)]
 pub struct ProcessSnapshot {
     pub allocations: u64,
+    pub allocated_bytes: u64,
     pub rss_kb: u64,
 }
 
@@ -1048,15 +1146,18 @@ impl ProcessSnapshot {
     pub fn now() -> Self {
         Self {
             allocations: PROCESS_ALLOCATIONS.load(Ordering::Relaxed),
+            allocated_bytes: PROCESS_ALLOCATED_BYTES.load(Ordering::Relaxed),
             rss_kb: rss_kb_now(),
         }
     }
 
-    /// Returns `(allocations_delta, rss_delta_kb)`. RSS can go down, so the
-    /// delta is signed; allocations are monotone.
-    pub fn delta_from(&self, before: ProcessSnapshot) -> (u64, i64) {
+    /// Returns `(allocations_delta, allocated_bytes_delta, rss_delta_kb)`. RSS
+    /// can go down, so the delta is signed; allocation counters are monotone.
+    pub fn delta_from(&self, before: ProcessSnapshot) -> (u64, u64, i64) {
         (
             self.allocations.saturating_sub(before.allocations),
+            self.allocated_bytes
+                .saturating_sub(before.allocated_bytes),
             (self.rss_kb as i64) - (before.rss_kb as i64),
         )
     }
@@ -1066,9 +1167,14 @@ impl ProcessSnapshot {
 /// whole-process cost the existing thread-local-gated `tina_allocations`
 /// number misses (server-thread allocations, RSS growth). Stable
 /// grep-friendly key=value shape so historical tracking can scrape it.
-pub fn print_process_metrics(label: &str, allocations_delta: u64, rss_delta_kb: i64) {
+pub fn print_process_metrics(
+    label: &str,
+    allocations_delta: u64,
+    allocated_bytes_delta: u64,
+    rss_delta_kb: i64,
+) {
     println!(
-        "perf-process label={label} process_allocations={allocations_delta} rss_delta_kb={rss_delta_kb}"
+        "perf-process label={label} process_allocations={allocations_delta} process_allocated_bytes={allocated_bytes_delta} rss_delta_kb={rss_delta_kb}"
     );
 }
 
@@ -1110,14 +1216,35 @@ fn http_get(
 ) -> anyhow::Result<()> {
     let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(2))?;
     stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+    let close_request = b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
+    let keepalive_request = b"GET / HTTP/1.1\r\nHost: x\r\nConnection: keep-alive\r\n\r\n";
     for i in 0..requests {
         let close = !keepalive || i + 1 == requests;
-        let connection = if close { "close" } else { "keep-alive" };
-        stream.write_all(
-            format!("GET / HTTP/1.1\r\nHost: x\r\nConnection: {connection}\r\n\r\n").as_bytes(),
-        )?;
+        let request = if close {
+            close_request.as_slice()
+        } else {
+            keepalive_request.as_slice()
+        };
+        stream.write_all(request)?;
         stream.flush()?;
         read_one_response(&mut stream, expected_body_len)?;
+    }
+    Ok(())
+}
+
+fn http_post_declared_too_large(addr: SocketAddr, declared_len: usize) -> anyhow::Result<()> {
+    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(2))?;
+    stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+    let request = format!(
+        "POST / HTTP/1.1\r\nHost: x\r\nConnection: close\r\nContent-Length: {declared_len}\r\n\r\n"
+    );
+    stream.write_all(request.as_bytes())?;
+    stream.flush()?;
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response)?;
+    let head = std::str::from_utf8(&response)?;
+    if !head.starts_with("HTTP/1.1 413") {
+        anyhow::bail!("expected 413 for declared-too-large body, got {head:?}");
     }
     Ok(())
 }

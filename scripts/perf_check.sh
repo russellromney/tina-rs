@@ -10,18 +10,29 @@
 
 set -euo pipefail
 
-HISTORY_FILE="${TINA_PERF_HISTORY_FILE:-.intent/phases/146-native-hot-path-allocation-http-cost/perf_history.jsonl}"
+HISTORY_FILE="${TINA_PERF_HISTORY_FILE:-.intent/phases/147-http-turn-allocation-cost/perf_history.jsonl}"
 WINDOW="${PERF_CHECK_WINDOW:-5}"
 THRESHOLD_PERCENT="${PERF_CHECK_THRESHOLD:-25}"
 ABS_TOLERANCE_NS="${PERF_CHECK_ABS_TOLERANCE_NS:-500000}"
 MIN_HISTORY_ROWS="${PERF_CHECK_MIN_HISTORY_ROWS:-3}"
+case "$(uname -s)" in
+  Darwin) platform=macos ;;
+  Linux) platform=linux ;;
+  *) platform=$(uname -s | tr '[:upper:]' '[:lower:]') ;;
+esac
+case "$(uname -m)" in
+  arm64) arch=aarch64 ;;
+  x86_64|aarch64) arch=$(uname -m) ;;
+  *) arch=$(uname -m | tr '[:upper:]' '[:lower:]') ;;
+esac
+profile=release
 
 if [[ ! -f $HISTORY_FILE ]]; then
   echo "no history at $HISTORY_FILE — run scripts/perf_record.sh first" >&2
   exit 0
 fi
 
-echo "Running make perf..." >&2
+echo "Running make perf for platform=$platform arch=$arch profile=$profile..." >&2
 output=$(make perf 2>&1)
 
 fail=0
@@ -42,6 +53,9 @@ for label in $labels; do
   # Pull p50 from history for this label's compare rows. tail to the most
   # recent WINDOW entries, then sort numerically to take the median.
   historical=$(grep '"kind":"compare"' "$HISTORY_FILE" \
+                 | grep "\"platform\":\"$platform\"" \
+                 | grep "\"arch\":\"$arch\"" \
+                 | grep "\"profile\":\"$profile\"" \
                  | grep "\"label\":\"$label\"" \
                  | grep -oE '"tina_p50_ns":[0-9]+' \
                  | cut -d: -f2 \

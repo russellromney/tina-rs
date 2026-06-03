@@ -18,12 +18,17 @@
 
 use std::collections::HashMap;
 use std::convert::Infallible;
+use std::io::{Read, Write};
+use std::net::{SocketAddr, TcpStream};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use perf_native::count_all_allocations;
 use tina::prelude::*;
+use tina_http::{
+    HttpListener, HttpListenerMsg, HttpRequest, HttpResponse, HttpServerConfig, StatusCode,
+};
 use tina_proof_harness::{HotPathReport, HotPathStage};
 use tina_runtime::{
     CallOutcome, DefaultThreadedMailboxFactory, RuntimeEvent, RuntimeEventKind, ThreadedRuntime,
@@ -61,6 +66,9 @@ const CALL_HOST_ALLOCATIONS_CEILING: u64 = 4;
 const HANDOFF_PROCESS_ALLOCATIONS_CEILING: u64 = 2;
 const OBSERVED_PROCESS_ALLOCATIONS_CEILING: u64 = 8;
 const CALL_PROCESS_ALLOCATIONS_CEILING: u64 = 10;
+const HTTP_HOTPATH_ITERS: usize = 32;
+const HTTP_HOTPATH_WARMUP: usize = 4;
+const HTTP_FIXED_BODY_BYTES: usize = 4096;
 
 type Runtime = ThreadedRuntime<SingleShard, DefaultThreadedMailboxFactory>;
 
@@ -120,6 +128,29 @@ impl Ping {
     }
 }
 
+#[derive(Debug)]
+struct BodyService {
+    body: Arc<Vec<u8>>,
+}
+
+#[tina_runtime::isolate(message = HttpRequest, reply = HttpResponse)]
+impl BodyService {
+    fn handle(
+        &mut self,
+        _msg: HttpRequest,
+        _ctx: &mut Context<'_, SingleShard, Self::Reply>,
+    ) -> Effect<Self> {
+        noop()
+    }
+
+    fn handle_call(&mut self, _msg: HttpRequest, call: CallContext<'_, Self>) -> Effect<Self> {
+        call.reply(HttpResponse::with_body(
+            StatusCode::OK,
+            self.body.as_ref().clone(),
+        ))
+    }
+}
+
 /// Records the wall-clock instant of every worker-thread trace event so a
 /// single instrumented op can be broken into per-turn stages. The lock is
 /// only contended while the host clears or snapshots, both done when the
@@ -153,11 +184,23 @@ fn kind_label(kind: RuntimeEventKind) -> &'static str {
     match kind {
         RuntimeEventKind::MailboxAccepted => "mbox_accepted",
         RuntimeEventKind::HandlerStarted => "handler_started",
+        RuntimeEventKind::HandlerPanicked => "handler_panicked",
+        RuntimeEventKind::HandlerReportedFailure => "handler_failed",
         RuntimeEventKind::HandlerFinished { .. } => "handler_finished",
         RuntimeEventKind::EffectObserved { .. } => "effect_observed",
         RuntimeEventKind::SendDispatchAttempted { .. } => "send_attempted",
         RuntimeEventKind::SendAccepted { .. } => "send_accepted",
         RuntimeEventKind::SendRejected { .. } => "send_rejected",
+        RuntimeEventKind::CallDispatchAttempted { .. } => "call_attempted",
+        RuntimeEventKind::CallCompleted { .. } => "call_completed",
+        RuntimeEventKind::CallFailed { .. } => "call_failed",
+        RuntimeEventKind::CallCompletionRejected { .. } => "call_completion_rejected",
+        RuntimeEventKind::CallReplyRejected { .. } => "call_reply_rejected",
+        RuntimeEventKind::CallReplyAbandoned { .. } => "call_reply_abandoned",
+        RuntimeEventKind::CallRejected { .. } => "call_rejected",
+        RuntimeEventKind::CallCancelled { .. } => "call_cancelled",
+        RuntimeEventKind::IsolateStopped => "isolate_stopped",
+        RuntimeEventKind::MessageAbandoned => "message_abandoned",
         _ => "other",
     }
 }
@@ -417,16 +460,228 @@ fn instrumented_call_blocking() -> Vec<HotPathStage> {
     stages_from_timeline(t0, &events, t_end)
 }
 
+fn probe_http1_close() -> HotPathReport {
+    probe_http1(
+        "hotpath_http1_close_request",
+        small_body(),
+        false,
+        1,
+        small_body().len(),
+    )
+}
+
+fn probe_http1_keepalive() -> HotPathReport {
+    probe_http1(
+        "hotpath_http1_keepalive_sequential",
+        small_body(),
+        true,
+        4,
+        small_body().len(),
+    )
+}
+
+fn probe_http1_fixed_body() -> HotPathReport {
+    probe_http1(
+        "hotpath_http1_fixed_body_close",
+        vec![b'x'; HTTP_FIXED_BODY_BYTES],
+        false,
+        1,
+        HTTP_FIXED_BODY_BYTES,
+    )
+}
+
+fn probe_http1(
+    label: &'static str,
+    body: Vec<u8>,
+    keepalive: bool,
+    requests_per_op: usize,
+    expected_body_len: usize,
+) -> HotPathReport {
+    let (runtime, addr) = start_http_runtime(None, body.clone(), keepalive);
+    for _ in 0..HTTP_HOTPATH_WARMUP {
+        http_get(addr, keepalive, requests_per_op, expected_body_len).expect("warm http request");
+    }
+    let mut totals = Vec::with_capacity(HTTP_HOTPATH_ITERS);
+    for _ in 0..HTTP_HOTPATH_ITERS {
+        let t0 = Instant::now();
+        http_get(addr, keepalive, requests_per_op, expected_body_len).expect("http hotpath op");
+        totals.push(t0.elapsed().as_nanos() as u64);
+    }
+    let (_outcome, host_allocations, process_allocations) = count_all_allocations(|| {
+        http_get(addr, keepalive, requests_per_op, expected_body_len)
+    });
+    shutdown(runtime);
+
+    let stages = instrumented_http1(body, keepalive, requests_per_op, expected_body_len);
+    HotPathReport::from_samples_with_process_allocations(
+        label,
+        totals,
+        stages,
+        Some(host_allocations),
+        Some(process_allocations),
+    )
+}
+
+fn instrumented_http1(
+    body: Vec<u8>,
+    keepalive: bool,
+    requests_per_op: usize,
+    expected_body_len: usize,
+) -> Vec<HotPathStage> {
+    let timer = Arc::new(StageTimer::default());
+    let (runtime, addr) = start_http_runtime(Some(timer.clone()), body, keepalive);
+    http_get(addr, keepalive, requests_per_op, expected_body_len).expect("warm http request");
+    // The warm request returns to the std client before the connection isolate
+    // necessarily processes every close/tail trace event. Drain that tail so
+    // the one instrumented request owns the timeline below.
+    std::thread::sleep(Duration::from_millis(20));
+    let _ = runtime.has_in_flight_calls();
+    timer.clear();
+    let t0 = Instant::now();
+    http_get(addr, keepalive, requests_per_op, expected_body_len).expect("instrumented http");
+    let t_end = Instant::now();
+    let events = timer.snapshot();
+    shutdown(runtime);
+    stages_from_timeline(t0, &events, t_end)
+}
+
+fn start_http_runtime(
+    observer: Option<Arc<dyn TraceObserver>>,
+    body: Vec<u8>,
+    keepalive: bool,
+) -> (Runtime, SocketAddr) {
+    let runtime = new_runtime(observer);
+    let service = runtime
+        .register_with_capacity::<_, Infallible>(
+            BodyService {
+                body: Arc::new(body),
+            },
+            CAP,
+        )
+        .expect("register body service");
+    let mut config = HttpServerConfig::dev();
+    if keepalive {
+        config.limits.keepalive_idle_timeout = Some(Duration::from_secs(2));
+    }
+    let listener = runtime
+        .register_with_capacity::<_, Infallible>(
+            HttpListener::<SingleShard>::with_config("127.0.0.1:0".parse().unwrap(), service, config),
+            config.listener_mailbox_capacity,
+        )
+        .expect("register http listener");
+    let bound = runtime.observe_next_bound();
+    runtime
+        .try_send(listener, HttpListenerMsg::Start)
+        .expect("start http listener");
+    let addr = bound.wait(Duration::from_secs(2)).expect("observe bound");
+    (runtime, addr)
+}
+
+fn small_body() -> Vec<u8> {
+    b"ok\n".to_vec()
+}
+
+fn http_get(
+    addr: SocketAddr,
+    keepalive: bool,
+    requests: usize,
+    expected_body_len: usize,
+) -> anyhow::Result<()> {
+    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(2))?;
+    stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+    let close_request = b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
+    let keepalive_request = b"GET / HTTP/1.1\r\nHost: x\r\nConnection: keep-alive\r\n\r\n";
+    for i in 0..requests {
+        let close = !keepalive || i + 1 == requests;
+        let request = if close {
+            close_request.as_slice()
+        } else {
+            keepalive_request.as_slice()
+        };
+        stream.write_all(request)?;
+        stream.flush()?;
+        read_one_response(&mut stream, expected_body_len)?;
+    }
+    Ok(())
+}
+
+fn read_one_response(stream: &mut TcpStream, expected_body_len: usize) -> anyhow::Result<()> {
+    let mut response = Vec::with_capacity(256 + expected_body_len);
+    let head_end = loop {
+        let mut byte = [0; 1];
+        let n = stream.read(&mut byte)?;
+        if n == 0 {
+            anyhow::bail!("peer closed before response head");
+        }
+        response.push(byte[0]);
+        if let Some(pos) = response.windows(4).position(|w| w == b"\r\n\r\n") {
+            break pos + 4;
+        }
+        if response.len() > 64 * 1024 {
+            anyhow::bail!("response head too large");
+        }
+    };
+    let head = std::str::from_utf8(&response[..head_end])?;
+    if !head.starts_with("HTTP/1.1 200") {
+        anyhow::bail!("unexpected response head: {head:?}");
+    }
+    let content_length = parse_content_length(head)?;
+    if content_length != expected_body_len {
+        anyhow::bail!("unexpected content length {content_length}, expected {expected_body_len}");
+    }
+    while response.len() - head_end < content_length {
+        let mut buf = [0; 4096];
+        let n = stream.read(&mut buf)?;
+        if n == 0 {
+            anyhow::bail!("peer closed before full body");
+        }
+        response.extend_from_slice(&buf[..n]);
+    }
+    Ok(())
+}
+
+fn parse_content_length(head: &str) -> anyhow::Result<usize> {
+    for line in head.lines() {
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        if name.eq_ignore_ascii_case("content-length") {
+            return value
+                .trim()
+                .parse::<usize>()
+                .map_err(|e| anyhow::anyhow!("bad content-length {value:?}: {e}"));
+        }
+    }
+    anyhow::bail!("missing content-length")
+}
+
 #[test]
 fn hotpath_probes_report_and_stay_bounded() {
     let try_send = probe_try_send();
     let send_and_observe = probe_send_and_observe();
     let call_blocking = probe_call_blocking();
+    let http_close = probe_http1_close();
+    let http_keepalive = probe_http1_keepalive();
+    let http_fixed_body = probe_http1_fixed_body();
 
-    for report in [&try_send, &send_and_observe, &call_blocking] {
+    for report in [
+        &try_send,
+        &send_and_observe,
+        &call_blocking,
+        &http_close,
+        &http_keepalive,
+        &http_fixed_body,
+    ] {
         println!("{}", report.summary_line());
         println!("{}", report.json_line());
-        assert!(report.iterations as usize == ITERS, "iteration count");
+        if report.label.starts_with("hotpath_http1_") {
+            assert_eq!(
+                report.iterations as usize, HTTP_HOTPATH_ITERS,
+                "HTTP iteration count"
+            );
+        } else {
+            assert_eq!(report.iterations as usize, ITERS, "iteration count");
+        }
         assert!(!report.stages.is_empty(), "stage breakdown present");
         assert!(
             report.allocations.is_some(),
