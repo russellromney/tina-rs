@@ -18,3 +18,20 @@ Evidence:
 Recorded history:
 
 - .intent/phases/147-http-turn-allocation-cost/perf_history.jsonl
+
+c41aafa Coalesce small buffered HTTP responses
+
+Evidence:
+
+- cargo fmt --all --check
+- git diff --check
+- cargo clippy -p tina-http --all-targets -- -D warnings
+- cargo test -p tina-http --test server_smoke -- --nocapture
+- cargo test -p tina-http --test body_metrics -- --nocapture
+- cargo test --release --manifest-path examples/systems/perf_native/Cargo.toml --test hotpath -- --nocapture
+- make perf-record
+- make perf-check
+
+Recorded history:
+
+- .intent/phases/147-http-turn-allocation-cost/perf_history.jsonl
