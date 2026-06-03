@@ -13,6 +13,10 @@
 - Small no-metrics buffered HTTP/1 responses now write head+body in one TCP
   write. Large buffered bodies still split to avoid copying giant bodies, and
   metrics-enabled responses still split to keep body-pressure truth exact.
+- Small no-metrics TCP close responses now use a terminal `TcpWriteClose` rail:
+  full write closes the stream in the TCP lane, partial write returns the bytes
+  and leaves the stream open for retry. This removes a separate close call on
+  the common HTTP/1 close path without hiding partial-write truth.
 - HTTP body-pressure proof row is implemented locally: declared-too-large
   requests produce typed `full`, service-pressure surfaces, and drained final
   current.
@@ -169,5 +173,7 @@ make proof-fast
 - HTTP turn cost is measured through public paths.
 - At least one HTTP allocation/turn cost improves with proof.
 - Small buffered response coalescing is bounded and pinned by small/large tests.
+- Terminal TCP write-close is pinned by live HTTP trace tests and simulator
+  replay hash/count.
 - If remaining cost is still high, the next bottleneck is named from evidence.
 - HTTP overload still prints pressure/final-current truth.

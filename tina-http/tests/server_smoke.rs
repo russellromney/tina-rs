@@ -15,6 +15,7 @@ use std::time::Duration;
 
 use common::{
     Counter, TestHarness, TestShard, assert_status_and_body, assert_status_starts_with,
+    count_tcp_stream_close_completions, count_tcp_write_close_completions,
     count_tcp_write_completions, scripted_request,
 };
 use tina_http::{HttpLimits, HttpListener, HttpListenerMsg, HttpStartupError};
@@ -65,9 +66,19 @@ fn default_buffered_response_writes_head_and_body_once() {
 
     let trace = harness.shutdown();
     let tcp_writes = count_tcp_write_completions(&trace);
+    let tcp_write_closes = count_tcp_write_close_completions(&trace);
+    let tcp_stream_closes = count_tcp_stream_close_completions(&trace);
     assert_eq!(
-        tcp_writes, 1,
-        "default no-metrics buffered response should write head+body once; trace had {tcp_writes} tcp writes",
+        tcp_writes, 0,
+        "default no-metrics buffered response should not need a separate plain TcpWrite; trace had {tcp_writes}",
+    );
+    assert_eq!(
+        tcp_write_closes, 1,
+        "default no-metrics buffered response should write head+body and close once; trace had {tcp_write_closes} tcp write-close calls",
+    );
+    assert_eq!(
+        tcp_stream_closes, 0,
+        "terminal write-close should not need a separate TcpStreamClose; trace had {tcp_stream_closes}",
     );
 }
 

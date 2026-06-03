@@ -775,6 +775,7 @@ impl CallOutput {
         match self {
             Self::TcpWrote { count } => Ok(count),
             Self::TcpWroteOwned { count, .. } => Ok(count),
+            Self::TcpWroteOwnedClose { count, .. } => Ok(count),
             Self::TcpWroteOwnedFailed { error, .. } => Err(error),
             Self::Failed(error) => Err(error),
             other => Self::panic_wrong_shape("TcpWrote", &other),
@@ -794,6 +795,32 @@ impl CallOutput {
                 bytes: Vec::new(),
             }),
             other => Self::panic_wrong_shape("TcpWroteOwned", &other),
+        }
+    }
+
+    /// Extracts the successful TCP reusable-buffer terminal-write payload.
+    pub fn into_tcp_wrote_owned_close(self) -> Result<TcpWriteOwnedCloseReply, TcpWriteOwnedError> {
+        match self {
+            Self::TcpWroteOwnedClose {
+                bytes,
+                count,
+                closed,
+            } => Ok(TcpWriteOwnedCloseReply {
+                bytes,
+                written: count,
+                closed,
+            }),
+            Self::TcpWroteOwned { bytes, count } => Ok(TcpWriteOwnedCloseReply {
+                bytes,
+                written: count,
+                closed: false,
+            }),
+            Self::TcpWroteOwnedFailed { bytes, error } => Err(TcpWriteOwnedError { error, bytes }),
+            Self::Failed(error) => Err(TcpWriteOwnedError {
+                error,
+                bytes: Vec::new(),
+            }),
+            other => Self::panic_wrong_shape("TcpWroteOwnedClose", &other),
         }
     }
 
@@ -2033,6 +2060,40 @@ mod pending_cancelable_call_set_tests {
         .expect_err("owned TLS write failure should return error envelope");
         assert_eq!(tls_error.error, CallError::Io);
         assert_eq!(tls_error.bytes, tls_bytes);
+    }
+
+    #[test]
+    fn terminal_owned_write_decoder_names_closed_state() {
+        let closed = CallOutput::TcpWroteOwnedClose {
+            bytes: b"done".to_vec(),
+            count: 4,
+            closed: true,
+        }
+        .into_tcp_wrote_owned_close()
+        .expect("terminal write-close success");
+        assert_eq!(closed.bytes, b"done");
+        assert_eq!(closed.written, 4);
+        assert!(closed.closed);
+
+        let partial = CallOutput::TcpWroteOwnedClose {
+            bytes: b"partial".to_vec(),
+            count: 3,
+            closed: false,
+        }
+        .into_tcp_wrote_owned_close()
+        .expect("partial terminal write stays open");
+        assert_eq!(partial.bytes, b"partial");
+        assert_eq!(partial.written, 3);
+        assert!(!partial.closed);
+
+        let failed = CallOutput::TcpWroteOwnedFailed {
+            bytes: b"return me".to_vec(),
+            error: CallError::ResourceBusy,
+        }
+        .into_tcp_wrote_owned_close()
+        .expect_err("terminal write-close failure returns bytes");
+        assert_eq!(failed.error, CallError::ResourceBusy);
+        assert_eq!(failed.bytes, b"return me");
     }
 
     #[test]

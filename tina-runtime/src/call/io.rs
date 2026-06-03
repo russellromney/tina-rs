@@ -55,6 +55,20 @@ pub struct TcpWriteOwnedError {
     pub bytes: Vec<u8>,
 }
 
+/// Successful owned-buffer TCP terminal write reply.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TcpWriteOwnedCloseReply {
+    /// Caller-owned bytes returned by the runtime.
+    pub bytes: Vec<u8>,
+    /// Bytes accepted by the stream.
+    pub written: usize,
+    /// True when the full buffer was accepted and the stream was closed.
+    ///
+    /// Partial writes leave the stream open so the caller can issue another
+    /// terminal write for the remaining bytes instead of truncating the wire.
+    pub closed: bool,
+}
+
 /// Successful owned-buffer TLS read reply.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TlsReadBufReply {
@@ -161,6 +175,19 @@ pub enum CallInput {
     /// Write caller-owned bytes to a stream and return them with the accepted
     /// byte count.
     TcpWriteOwned {
+        /// The stream to write to.
+        stream: StreamId,
+        /// The payload to write.
+        bytes: Vec<u8>,
+    },
+
+    /// Write caller-owned bytes to a stream and close the stream only if the
+    /// full buffer is accepted.
+    ///
+    /// Partial writes return the bytes and accepted count with
+    /// `closed == false`; the caller must retry the remaining bytes or close
+    /// deliberately.
+    TcpWriteOwnedClose {
         /// The stream to write to.
         stream: StreamId,
         /// The payload to write.
@@ -532,6 +559,7 @@ impl CallInput {
             Self::TcpConnect { .. } => crate::trace::CallKind::TcpConnect,
             Self::TcpRead { .. } | Self::TcpReadBuf { .. } => crate::trace::CallKind::TcpRead,
             Self::TcpWrite { .. } | Self::TcpWriteOwned { .. } => crate::trace::CallKind::TcpWrite,
+            Self::TcpWriteOwnedClose { .. } => crate::trace::CallKind::TcpWriteClose,
             Self::TcpListenerClose { .. } => crate::trace::CallKind::TcpListenerClose,
             Self::TcpStreamClose { .. } => crate::trace::CallKind::TcpStreamClose,
             Self::UdpBind { .. } => crate::trace::CallKind::UdpBind,
@@ -673,6 +701,16 @@ pub enum CallOutput {
         bytes: Vec<u8>,
         /// Bytes accepted by the stream.
         count: usize,
+    },
+
+    /// A reusable-buffer TCP terminal write completed.
+    TcpWroteOwnedClose {
+        /// Caller-owned bytes returned by the runtime.
+        bytes: Vec<u8>,
+        /// Bytes accepted by the stream.
+        count: usize,
+        /// Whether the runtime closed the stream after the write.
+        closed: bool,
     },
 
     /// A reusable-buffer TCP write failed and returned its bytes.

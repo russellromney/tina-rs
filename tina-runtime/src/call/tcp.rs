@@ -7,7 +7,7 @@ use std::net::SocketAddr;
 
 use super::{
     CallInput, CallOutput, ListenerId, StreamId, TcpReadBufError, TcpReadBufReply,
-    TcpWriteOwnedError, TcpWriteOwnedReply, TypedCall,
+    TcpWriteOwnedCloseReply, TcpWriteOwnedError, TcpWriteOwnedReply, TypedCall,
 };
 
 /// Returns a typed TCP bind helper that later yields one listener id and
@@ -74,6 +74,22 @@ pub fn tcp_write_owned(
     TypedCall::new(
         CallInput::TcpWriteOwned { stream, bytes },
         CallOutput::into_tcp_wrote_owned,
+    )
+}
+
+/// Returns a typed TCP terminal-write helper.
+///
+/// If the runtime accepts the full buffer, it closes the stream in the same
+/// backend operation and returns `closed == true`. Partial writes leave the
+/// stream open and return `closed == false` so callers can retry the remaining
+/// bytes without truncating the wire.
+pub fn tcp_write_owned_close(
+    stream: StreamId,
+    bytes: Vec<u8>,
+) -> TypedCall<TcpWriteOwnedCloseReply, TcpWriteOwnedError> {
+    TypedCall::new(
+        CallInput::TcpWriteOwnedClose { stream, bytes },
+        CallOutput::into_tcp_wrote_owned_close,
     )
 }
 

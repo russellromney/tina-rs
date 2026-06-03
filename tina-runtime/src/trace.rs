@@ -176,6 +176,9 @@ pub enum CallKind {
     /// A TCP stream write.
     TcpWrite,
 
+    /// A TCP stream terminal write that closes if the full buffer lands.
+    TcpWriteClose,
+
     /// A TCP listener close.
     TcpListenerClose,
 
@@ -1440,6 +1443,7 @@ fn call_kind_tag(kind: CallKind) -> u8 {
         CallKind::UnixWrite => 46,
         CallKind::UnixListenerClose => 47,
         CallKind::UnixStreamClose => 48,
+        CallKind::TcpWriteClose => 49,
     }
 }
 
@@ -2276,6 +2280,8 @@ mod stable_hash_tests {
             (CallKind::UnixWrite, 46),
             (CallKind::UnixListenerClose, 47),
             (CallKind::UnixStreamClose, 48),
+            // Phase 147 terminal TCP write-close rail, appended.
+            (CallKind::TcpWriteClose, 49),
         ];
         for (kind, expected) in cases {
             assert_eq!(
