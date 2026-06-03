@@ -170,9 +170,16 @@ The hotpath test now also prints HTTP rows:
 - `hotpath_http1_fixed_body_close`.
 
 These rows expose `stage_count`. On local macOS/aarch64 evidence, close and
-fixed-body paths still take dozens of runtime-observed stages, and four
-keepalive requests take over one hundred stages. That is the next real cost:
-not the old buffer clone, but turn count plus remaining HTTP allocation shape.
+fixed-body paths still take dozens of runtime-observed stages.
+
+The first HTTP turn cleanup coalesces small no-metrics buffered responses into
+one TCP write. Large buffered bodies still stay split so the server does not
+copy a giant body into the head buffer, and metrics-enabled responses still
+split so body-pressure accounting stays exact. Local hotpath evidence moved
+fixed-body close from 33 to 28 observed stages and four-request keepalive from
+111 to 91 observed stages. The generic close row is still noisy. That is
+better, but the next real cost is still turn count plus remaining HTTP
+allocation shape.
 
 The perf test also prints an HTTP body-pressure probe. It sends requests that
 exceed `max_body_bytes`, expects typed `full` pressure, projects the body

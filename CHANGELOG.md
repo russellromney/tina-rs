@@ -15,6 +15,11 @@ This file records completed work.
 - Removed benchmark-client request-format allocation noise from the native
   perf specimen and presized common HTTP/1 request/response encoder buffers.
   This is still local alpha evidence, not a production performance claim.
+- Coalesced small no-metrics buffered HTTP/1 responses into one TCP write,
+  while keeping large buffered responses split and preserving exact body
+  pressure accounting when metrics are enabled. Local hotpath evidence moved
+  fixed-body close from 33 to 28 observed stages and four-request keepalive
+  from 111 to 91 observed stages; the generic close row remains noisy.
 - Added an HTTP body-pressure perf probe that drives `max_body_bytes` overload,
   records typed `full` pressure, projects `BodyMetrics` into service-pressure
   surfaces, and proves final current drains back to zero.

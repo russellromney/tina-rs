@@ -69,6 +69,7 @@ use crate::websocket::{
 /// single read does not pull more than this into the runtime, regardless
 /// of what the kernel has buffered.
 const READ_CHUNK: usize = 4096;
+const COALESCE_BUFFERED_RESPONSE_BODY_LIMIT: usize = READ_CHUNK;
 const WEBSOCKET_PENDING_APP_MSG_CAP: usize = 4;
 
 fn tls_read_reply_to_tcp(reply: TlsReadBufReply) -> TcpReadBufReply {
@@ -1151,9 +1152,17 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
         let head_bytes = encode_response_head(&response, connection_close);
         match response.body {
             HttpResponseBody::Buffered(body_bytes) => {
-                self.pending_response = head_bytes;
-                if !body_bytes.is_empty() {
+                let can_coalesce = self.metrics.is_none()
+                    && body_bytes.len() <= COALESCE_BUFFERED_RESPONSE_BODY_LIMIT;
+                if can_coalesce {
+                    self.pending_response = head_bytes;
+                    self.pending_response.reserve_exact(body_bytes.len());
+                    self.pending_response.extend_from_slice(&body_bytes);
+                } else if !body_bytes.is_empty() {
+                    self.pending_response = head_bytes;
                     self.pending_buffered_body = Some(body_bytes);
+                } else {
+                    self.pending_response = head_bytes;
                 }
                 self.write_pending()
             }

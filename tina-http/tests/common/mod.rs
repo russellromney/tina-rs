@@ -230,6 +230,19 @@ pub fn count_tcp_read_completions(trace: &[RuntimeEvent]) -> usize {
         .count()
 }
 
+pub fn count_tcp_write_completions(trace: &[RuntimeEvent]) -> usize {
+    trace
+        .iter()
+        .filter(|event| {
+            matches!(
+                event.kind(),
+                RuntimeEventKind::CallCompleted { call_kind, .. }
+                    if matches!(call_kind, tina_runtime::CallKind::TcpWrite)
+            )
+        })
+        .count()
+}
+
 impl Drop for TestHarness {
     fn drop(&mut self) {
         if let Some(runtime) = self.runtime.take() {

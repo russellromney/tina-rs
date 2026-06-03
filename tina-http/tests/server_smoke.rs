@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use common::{
     Counter, TestHarness, TestShard, assert_status_and_body, assert_status_starts_with,
-    scripted_request,
+    count_tcp_write_completions, scripted_request,
 };
 use tina_http::{HttpLimits, HttpListener, HttpListenerMsg, HttpStartupError};
 use tina_runtime::{
@@ -54,6 +54,44 @@ fn native_http_server_serves_get_and_post() {
     assert_connection_close(&response_d);
 
     harness.shutdown();
+}
+
+#[test]
+fn default_buffered_response_writes_head_and_body_once() {
+    let harness = TestHarness::start();
+
+    let response = scripted_request(harness.addr, b"GET /counter HTTP/1.1\r\nHost: x\r\n\r\n");
+    assert_status_and_body(&response, "200", "0");
+
+    let trace = harness.shutdown();
+    let tcp_writes = count_tcp_write_completions(&trace);
+    assert_eq!(
+        tcp_writes, 1,
+        "default no-metrics buffered response should write head+body once; trace had {tcp_writes} tcp writes",
+    );
+}
+
+#[test]
+fn large_buffered_response_keeps_head_and_body_split() {
+    let harness = TestHarness::start();
+    let body = vec![b'x'; 4097];
+    let mut request = format!(
+        "POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\n\r\n",
+        body.len()
+    )
+    .into_bytes();
+    request.extend_from_slice(&body);
+
+    let response = scripted_request(harness.addr, &request);
+    let expected = std::str::from_utf8(&body).expect("ascii body");
+    assert_status_and_body(&response, "200", expected);
+
+    let trace = harness.shutdown();
+    let tcp_writes = count_tcp_write_completions(&trace);
+    assert_eq!(
+        tcp_writes, 2,
+        "large no-metrics buffered response should avoid coalescing into a copied mega-buffer; trace had {tcp_writes} tcp writes",
+    );
 }
 
 #[test]
