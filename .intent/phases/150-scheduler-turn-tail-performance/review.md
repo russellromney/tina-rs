@@ -140,3 +140,60 @@ Decision:
   call/HTTP probes are not scheduler-gap-bound. Two fixes applied (hot-path
   clock cost, command/shutdown-during-drain tests); the rest accepted with
   rationale. Headline p50/p90 wins are expected from Rocks 3-5.
+
+## Implementation Review — Rock 3 (hostile, self-adversarial)
+
+Reviewer goal: break the bounded FIFO completion carry-over — find a way to
+drop a completion, reorder one, panic, busy-spin, or corrupt accounting.
+
+Findings:
+
+- [P1][fixed during impl] CARRIED-COMPLETION PANIC RACE. `deliver_completion`
+  panics ("driver produced completion for unknown call") if the in-flight call
+  is gone. Carry-over holds a completion across steps, so a removal between
+  harvest and delivery would panic. Audited every in-flight removal path:
+  (1) `harvest_isolate_call_timeouts` operates on `pending_isolate_calls` /
+  `pending_isolate_call_deadlines`, a SEPARATE map from the backend
+  `in_flight_calls` `deliver_completion` uses — no timeout race; (2) a lane
+  resolves each call exactly once (close wins over a pending op), so a
+  completed call is not also close-cancelled; (3) shutdown rejects in-flight
+  calls and clears translators. Fixes: `cancel_in_flight_calls_for_shutdown`
+  now clears `pending_completions`; the close-cancel loop purges matching
+  carried completions. The panic stays a true invariant.
+- [P2][verified] CARRY-OVER IS BOUNDED. `pending_completions` can hold at most
+  one entry per in-flight backend call, and in-flight backend calls are bounded
+  by lane capacities + mailbox admission. So the carry-over is bounded by the
+  same admission control as everything else — not a new unbounded queue.
+- [P2][verified] NO BUSY-SPIN, NO STARVED DRAIN. advance_driver runs before the
+  per-step message snapshot, so completion messages it enqueues are handled the
+  same step and `step() > 0` keeps the bounded hot-drain productive until the
+  carry-over empties. If a completion is rejected (mailbox full) and no handler
+  runs, `step()` may return 0, but `has_pending_runtime_work` reports the
+  carry-over so the worker re-polls at idle_repoll (a park, not a spin) and
+  drains on subsequent advances. Bounded either way.
+- [P2][verified] ACCOUNTING UNCHANGED. A call stays in `in_flight_calls` until
+  `deliver_completion` removes it, so a carried (undelivered) completion's call
+  is still counted in the resource report and body-pressure accounting — the
+  call genuinely is not complete until delivered. No drift; the
+  "do not weaken body-pressure accounting" rule holds.
+- [P2][verified] DETERMINISTIC ORDER. Carried (older) entries are delivered
+  before fresh ones (FIFO), and driver.advance produces a deterministic order
+  per call, so completion order is stable across the budget boundary. The DST
+  saved-seed fingerprint is unchanged (default budget 64 >> the sim's
+  completions-per-advance, so the sim never splits a batch).
+- [P3][accepted] NO DIRECT FAILURE-UNDER-CARRY-OVER TEST. `deliver_completion`
+  is byte-for-byte unchanged, so its CallFailed/terminal-cause recording is
+  invariant to *when* carry-over calls it; the FIFO test covers
+  delivery/order/no-drop, and the existing terminal-completion and DST tests
+  (which exercise failure/rejection paths) pass. A direct "failing completion
+  carried then delivered still records CallFailed" test needs a
+  failure-producing driver in the manual runtime; deferred to the Rock 9
+  proof-fast / DST sweep rather than adding bespoke failure-injection here.
+
+Decision:
+
+- Rock 3 bounds a previously unbounded drain while preserving order, failure
+  truth, and accounting. Like Rock 2 it is structural — the warmed probes have
+  1-3 completions per advance, far under the budget, so it does not move warmed
+  p50; its value is the bound (a completion burst can no longer make one step
+  unbounded) and the carry-over plumbing the ready scheduler (Rock 4) builds on.
