@@ -54,15 +54,21 @@ Phase 147 history exists. Phase 148 needs its own append-only history.
 Build:
 
 - create `.intent/phases/148-native-performance-linux-turn-soak/perf_history.jsonl`;
+- create `.intent/phases/148-native-performance-linux-turn-soak/perf_sample.txt`
+  with one `perf-compare`, one `perf-process`, and one `hotpath` line;
 - update `scripts/perf_record.sh` / `scripts/perf_check.sh` default history path
   to Phase 148;
+- teach `perf_record.sh` to record `hotpath` rows too, including
+  `stage_count`, host/process allocations, platform, arch, profile, and git sha;
+- teach `perf_check.sh` to check hotpath stage-count and process-allocation
+  rows with loose thresholds, not only `perf-compare` p50 rows;
 - keep Phase 147 history untouched;
 - add dry-run parser proof if the path or row schema changes.
 
 Proof:
 
 - `scripts/perf_record.sh --dry-run --read-from <sample>` emits Phase 148-shaped
-  rows;
+  compare/process/hotpath rows;
 - `make perf-check` works with empty/warming Phase 148 history.
 
 ## Rock 1: Sharpen HTTP Stage Proof
@@ -84,8 +90,13 @@ Build:
 Proof:
 
 - hotpath rows print `stage_count`;
+- hotpath rows are recorded into Phase 148 history;
 - each HTTP row has non-empty named stages;
 - close/fixed/keepalive row labels stay stable;
+- HTTP stage counts are asserted with named constants:
+  - start from the Phase 147 observed counts;
+  - give slack for trace noise;
+  - tighten a constant only after a measured improvement lands;
 - a regression back to millisecond-scale local work fails loudly.
 
 ## Rock 2: Reduce HTTP Turn Count Where Honest
@@ -114,8 +125,10 @@ Not allowed:
 Proof:
 
 - before/after `hotpath_http1_*` rows are recorded in commits/review;
-- at least one HTTP row improves in stage count, or the review names the next
-  exact blocker from evidence;
+- at least one HTTP row improves in stage count, or at least one HTTP row
+  improves in process allocations / allocated bytes;
+- if neither improves, the phase is not done: stop and hand back the exact
+  blocker instead of merging a "we looked" slice;
 - `tina-http` keepalive, close, body, chunked, WebSocket upgrade, and DST tests
   still pass.
 
@@ -161,8 +174,11 @@ Build:
 
 Proof:
 
-- at least one Linux/x86 row set is recorded, or the review says exactly why it
-  could not be produced in this environment;
+- at least one Linux/x86 row set is recorded in Phase 148 history or uploaded as
+  the manual workflow artifact;
+- if GitHub workflow execution is unavailable to the session, the workflow file,
+  command, and expected artifact shape are still tested locally by dry-run
+  parsing, and `review.md` names the missing external proof;
 - `perf_check.sh` compares only matching platform/arch/profile rows.
 
 ## Rock 5: Whole-Service Soak Proof
@@ -176,17 +192,22 @@ Build:
 - keep the existing short soak public-front-door workload;
 - sharpen pool coverage so the outbound pool is proven by direct pressure/report
   fields, not only "some error happened";
-- attach process allocation/RSS evidence to the whole-service perf row if
-  practical;
+- add a direct notify/outbound-pool activity field to the capacity or soak
+  report, such as attempted notify ops plus acquired/released/retired leases;
+- attach process allocation/RSS evidence to the whole-service perf row, or emit
+  explicit `unknown` fields with a test proving the report shape does not lie;
 - add an opt-in long soak command:
   - 10 minutes by default when explicitly requested;
   - 1 hour when `TINA_LONG_SOAK_SECONDS=3600`;
   - never run the long soak in normal verify.
+- add the `make proof-long-soak` target named in this plan.
 
 Proof:
 
 - short soak proves useful work, no transport timeout, typed pressure coverage,
   leak-clean shutdown, and clean terminal report;
+- short soak proves the notify/outbound-pool lane by direct service/pool facts,
+  not by inferring from generic errors;
 - long soak command prints ops, p50/p99, capacity surfaces, RSS delta if
   available, and final-current zero;
 - README names which command is CI-sized and which is opt-in.
@@ -220,6 +241,7 @@ cargo test --release --manifest-path examples/systems/perf_native/Cargo.toml --t
 cargo test --release --manifest-path examples/systems/perf_native/Cargo.toml --test perf -- --nocapture
 cargo test --manifest-path examples/systems/mini_saas_api/Cargo.toml --test soak -- --nocapture
 cargo test --release --manifest-path examples/systems/mini_saas_api/Cargo.toml --test perf -- --nocapture
+scripts/perf_record.sh --dry-run --read-from .intent/phases/148-native-performance-linux-turn-soak/perf_sample.txt
 make perf-record
 make perf-check
 make proof-fast
@@ -230,6 +252,7 @@ Blast radius:
 ```sh
 make check
 make proof-soak
+make -n proof-long-soak
 ```
 
 Optional, not a normal PR gate:
@@ -243,8 +266,7 @@ TINA_LONG_SOAK_SECONDS=3600 make proof-long-soak
 
 - Phase 148 history exists and is the default perf history.
 - HTTP hotpath rows are sharper and still public-path.
-- At least one measured HTTP turn/allocation cost is reduced, or the next exact
-  blocker is named from evidence.
+- At least one measured HTTP turn/allocation cost is reduced.
 - Linux/x86 row support is real, and Linux rows are recorded or explicitly
   blocked by environment.
 - `mini_saas_api` is the whole-service perf/soak exhibit.
