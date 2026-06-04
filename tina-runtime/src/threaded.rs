@@ -194,11 +194,42 @@ pub const DEFAULT_HOST_CALL_DELIVERY_GRACE: Duration = Duration::from_millis(100
 
 pub(crate) enum ThreadedCommand<S, F>
 where
-    S: Shard,
+    S: Shard + 'static,
     F: MailboxFactory,
 {
     Run(ThreadedCommandFn<S, F>),
+    /// A `call_blocking` enqueue. A typed variant instead of a boxed `Run`
+    /// closure so the host pays one allocation per call (the type-erased begin
+    /// task) instead of two (begin task + command closure). The worker routes
+    /// it to the dispatcher exactly as the closure did, preserving the
+    /// `Full`/`Closed` reject truth.
+    HostCall {
+        dispatcher: Address<DispatcherMsg<S>, ()>,
+        begin: Box<dyn HostCallTaskBegin<S>>,
+    },
     Shutdown,
+}
+
+/// Routes a `HostCall` command to its dispatcher on the worker thread, turning
+/// a full/closed dispatcher mailbox into the host-visible `Full`/`Closed`
+/// outcome (via the sender the begin task owns) instead of a dropped reply.
+pub(crate) fn run_host_call<S, F>(
+    runtime: &mut Runtime<S, F>,
+    dispatcher: Address<DispatcherMsg<S>, ()>,
+    begin: Box<dyn HostCallTaskBegin<S>>,
+) where
+    S: Shard + 'static,
+    F: MailboxFactory + 'static,
+{
+    match runtime.try_send(dispatcher, DispatcherMsg::Begin(begin)) {
+        Ok(()) => {}
+        Err(TrySendError::Full(DispatcherMsg::Begin(begin))) => begin.reject_full(),
+        Err(TrySendError::Closed(DispatcherMsg::Begin(begin))) => begin.reject_closed(),
+        Err(TrySendError::Full(DispatcherMsg::Returned))
+        | Err(TrySendError::Closed(DispatcherMsg::Returned)) => {
+            unreachable!("host call command only sends Begin messages")
+        }
+    }
 }
 
 /// One live shard-owned runtime worker.
@@ -1316,21 +1347,10 @@ where
             sender,
             _marker: PhantomData,
         });
-        let command = ThreadedCommand::Run(Box::new(move |runtime| {
-            match runtime.try_send(dispatcher_addr, DispatcherMsg::Begin(begin)) {
-                Ok(()) => {}
-                Err(TrySendError::Full(DispatcherMsg::Begin(begin))) => {
-                    begin.reject_full();
-                }
-                Err(TrySendError::Closed(DispatcherMsg::Begin(begin))) => {
-                    begin.reject_closed();
-                }
-                Err(TrySendError::Full(DispatcherMsg::Returned))
-                | Err(TrySendError::Closed(DispatcherMsg::Returned)) => {
-                    unreachable!("host call command only sends Begin messages");
-                }
-            }
-        }));
+        let command = ThreadedCommand::HostCall {
+            dispatcher: dispatcher_addr,
+            begin,
+        };
         match self.commands.try_send(command) {
             Ok(()) => {}
             Err(std::sync::mpsc::TrySendError::Full(_)) => {
@@ -1583,6 +1603,10 @@ where
                 command(&mut runtime);
                 continue;
             }
+            Ok(ThreadedCommand::HostCall { dispatcher, begin }) => {
+                run_host_call(&mut runtime, dispatcher, begin);
+                continue;
+            }
             Ok(ThreadedCommand::Shutdown) => {
                 deliver_shutdown_signal_and_drain(&mut runtime);
                 break;
@@ -1611,6 +1635,9 @@ where
             // Shutdown leaves the hot path immediately.
             match receiver.try_recv() {
                 Ok(ThreadedCommand::Run(command)) => command(&mut runtime),
+                Ok(ThreadedCommand::HostCall { dispatcher, begin }) => {
+                    run_host_call(&mut runtime, dispatcher, begin)
+                }
                 Ok(ThreadedCommand::Shutdown) => {
                     deliver_shutdown_signal_and_drain(&mut runtime);
                     break 'worker;
@@ -1650,6 +1677,9 @@ where
         };
         match receiver.recv_timeout(park) {
             Ok(ThreadedCommand::Run(command)) => command(&mut runtime),
+            Ok(ThreadedCommand::HostCall { dispatcher, begin }) => {
+                run_host_call(&mut runtime, dispatcher, begin)
+            }
             Ok(ThreadedCommand::Shutdown) => {
                 deliver_shutdown_signal_and_drain(&mut runtime);
                 break;

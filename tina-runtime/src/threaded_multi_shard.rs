@@ -37,7 +37,9 @@ use crate::observation;
 use crate::observer::TraceObserver;
 use crate::sharded::ReplyAdapter;
 use crate::shutdown::{SharedShutdownState, ShutdownWorker, ThreadedShutdownHandle, handle_for};
-use crate::threaded::{ThreadedCommand, ThreadedRuntimeConfig, deliver_shutdown_signal_and_drain};
+use crate::threaded::{
+    ThreadedCommand, ThreadedRuntimeConfig, deliver_shutdown_signal_and_drain, run_host_call,
+};
 use crate::trace::{RuntimeEvent, SendRejectedReason};
 use crate::{
     ChildLifecycleReport, IdSource, IntoErasedSpawn, IntoErasedSpawnObserved,
@@ -1075,6 +1077,10 @@ where
                 command(&mut runtime);
                 continue;
             }
+            Ok(ThreadedCommand::HostCall { dispatcher, begin }) => {
+                run_host_call(&mut runtime, dispatcher, begin);
+                continue;
+            }
             Ok(ThreadedCommand::Shutdown) => {
                 deliver_shutdown_signal_and_drain(&mut runtime);
                 break;
@@ -1113,6 +1119,9 @@ where
             };
             match receiver.recv_timeout(park) {
                 Ok(ThreadedCommand::Run(command)) => command(&mut runtime),
+                Ok(ThreadedCommand::HostCall { dispatcher, begin }) => {
+                    run_host_call(&mut runtime, dispatcher, begin)
+                }
                 Ok(ThreadedCommand::Shutdown) => {
                     deliver_shutdown_signal_and_drain(&mut runtime);
                     break;
