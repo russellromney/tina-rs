@@ -197,3 +197,58 @@ Decision:
   1-3 completions per advance, far under the budget, so it does not move warmed
   p50; its value is the bound (a completion burst can no longer make one step
   unbounded) and the carry-over plumbing the ready scheduler (Rock 4) builds on.
+
+## Implementation Review — Rock 4 (hostile, self-adversarial)
+
+Reviewer goal: break the ready scheduler — find a stuck message, a wrong-
+incarnation delivery, a double-schedule, a fairness or ordering regression, or
+a behaviour difference from the old full scan.
+
+Findings:
+
+- [P1][verified] BEHAVIOUR-PRESERVING. Recv'ing only ready isolates equals
+  scanning all iff every non-empty mailbox is marked ready. Guaranteed because
+  (a) the ONLY mailbox enqueue is `enqueue_entry_message`, which calls
+  `mark_entry_ready` (the 3218/3244 `try_send` hits are inside the mailbox
+  trait impl, not bypasses); (b) a per-step `debug_assert!` runs
+  `first_unscheduled_nonempty_isolate` across all 653 lib tests + threaded +
+  http + DST and never fires; (c) the DST saved-seed fingerprint is UNCHANGED.
+  `round_messages` stays entry-indexed and the dispatch loop runs handlers in
+  index order, so the delivered set and per-entry order are identical.
+- [P1][verified] INCARNATION SAFETY. The queue stores (id, generation), not the
+  entry index, because `gc_stopped_entries` compacts the Vec. At pop time the id
+  is resolved through `entry_indexes` (stable identity) and the generation is
+  checked, so a stale entry for a stopped/gc'd/restarted isolate resolves to
+  None or a generation mismatch and is dropped — never delivered to the wrong
+  incarnation. `stop_entry` clears the bit; gc destroys it with the entry.
+- [P2][verified] DOUBLE-SCHEDULE / REQUEUE. The `ready` bit is the invariant
+  "bit set <=> exactly one (id, gen) queued for this incarnation": mark pushes
+  only when the bit is clear; a still-non-empty entry is requeued with the bit
+  left set (no duplicate); a drained entry clears the bit. The snapshot pops
+  exactly the round-start count, so requeued/newly-ready entries (appended at
+  the back) are processed next round — one message per isolate per round, self-
+  send stays a later turn.
+- [P2][accepted] NOT FULLY O(ready) — TWO CHEAP O(entries) PASSES REMAIN. The
+  expensive per-isolate work (the mailbox recv: virtual call + lock + context
+  pop) is now O(ready). But `round_messages.resize_with(len, None)` and the
+  dispatch loop `for index in 0..len` are still O(entries) — cheap (a memset and
+  None-checks), and the dispatch loop must stay entry-indexed because the
+  supervision/restart paths do `round_messages.get_mut(entry_index)`. So the
+  quiet-isolate win is "no recv on empty mailboxes", not "zero per-step work".
+  Honest framing in docs; a fully O(ready) dispatch is future work.
+- [P3][accepted] HOT-PATH HASHMAP LOOKUP. With few isolates the snapshot now
+  does one `entry_indexes` lookup per ready entry instead of a direct index.
+  Negligible expected (hot path has ~3 isolates), but to be confirmed by a Fly
+  Linux re-measure of Rocks 2-4 together (needs a `fly deploy` approval).
+- [P3][accepted] FAIRNESS TEST TIMING. `equal_isolates_advance_in_lockstep`
+  asserts spread <= 5 and min > 100 over a 100ms run. Round-robin holds per step
+  regardless of machine load, so the spread is robust; min > 100 could in theory
+  flake on an extremely slow box (thousands of rounds normally fit in 100ms).
+
+Decision:
+
+- Rock 4 lands the ready scheduler as a pure, provably-equivalent optimization
+  (DST fingerprint unchanged), with incarnation safety and a debug detector for
+  the one catastrophic failure mode (a missed mark-ready). The recv cost is now
+  O(ready); the residual cheap O(entries) passes and the hot-path lookup are
+  documented honestly and a Fly re-measure will confirm no hot-path regression.
