@@ -1946,6 +1946,14 @@ where
         for op in completed.drain(..) {
             self.deliver_completion(op.call_id, op.result);
         }
+        // Some close-like operations complete during driver advancement
+        // (for example terminal write-close) and cancel sibling pending
+        // resource calls as they close. Drain those cancellations here just
+        // like `dispatch_runtime_call` does for close calls that complete
+        // inline during submit.
+        for cancelled in self.driver.take_cancelled_by_close() {
+            self.cancel_in_flight_call_for_resource_close(cancelled);
+        }
         self.driver_completions = completed;
     }
 

@@ -1690,6 +1690,9 @@ where
             CallInput::TcpWriteOwned { stream, bytes } => {
                 self.handle_tcp_write_owned(call_id, stream, bytes)
             }
+            CallInput::TcpWriteOwnedClose { stream, bytes } => {
+                self.handle_tcp_write_owned_close(call_id, stream, bytes)
+            }
             CallInput::TcpListenerClose { listener } => {
                 self.handle_tcp_listener_close(call_id, listener)
             }
@@ -2302,6 +2305,61 @@ where
             self.deliver_completion(call_id, CallOutput::Failed(CallError::InvalidResource));
             return;
         };
+
+        self.schedule_tcp_completion(call_id, resource, result);
+    }
+
+    pub(crate) fn handle_tcp_write_owned_close(
+        &mut self,
+        call_id: CallId,
+        stream: tina_runtime::StreamId,
+        bytes: Vec<u8>,
+    ) {
+        let Some(stream_index) = self.stream_index(stream) else {
+            self.deliver_completion(
+                call_id,
+                CallOutput::TcpWroteOwnedFailed {
+                    bytes,
+                    error: CallError::InvalidResource,
+                },
+            );
+            return;
+        };
+
+        let resource = TcpResourceKey::StreamWrite(stream);
+        if self.resource_has_active_pending(resource) {
+            self.deliver_completion(
+                call_id,
+                CallOutput::TcpWroteOwnedFailed {
+                    bytes,
+                    error: CallError::ResourceBusy,
+                },
+            );
+            return;
+        }
+
+        if self
+            .streams
+            .get(stream_index)
+            .is_none_or(|stream| stream.closed)
+        {
+            self.deliver_completion(
+                call_id,
+                CallOutput::TcpWroteOwnedFailed {
+                    bytes,
+                    error: CallError::InvalidResource,
+                },
+            );
+            return;
+        }
+
+        let Some(result) = self.stream_write_owned_close_result(stream_index, bytes) else {
+            self.deliver_completion(call_id, CallOutput::Failed(CallError::InvalidResource));
+            return;
+        };
+        if matches!(result, CallOutput::TcpWroteOwnedClose { closed: true, .. }) {
+            self.cancel_backend_calls_for_resource(TcpResourceKey::StreamRead(stream));
+        }
 
         self.schedule_tcp_completion(call_id, resource, result);
     }
@@ -4349,6 +4407,30 @@ where
         Some(CallOutput::TcpWroteOwned { bytes, count })
     }
 
+    pub(crate) fn stream_write_owned_close_result(
+        &mut self,
+        stream_index: usize,
+        bytes: Vec<u8>,
+    ) -> Option<CallOutput> {
+        let stream = self.streams.get_mut(stream_index)?;
+        if stream.closed {
+            return None;
+        }
+
+        let remaining_capacity = stream.output_capacity.saturating_sub(stream.output.len());
+        let count = bytes.len().min(stream.write_cap).min(remaining_capacity);
+        stream.output.extend_from_slice(&bytes[..count]);
+        let closed = count >= bytes.len();
+        if closed {
+            stream.closed = true;
+        }
+        Some(CallOutput::TcpWroteOwnedClose {
+            bytes,
+            count,
+            closed,
+        })
+    }
+
     pub(crate) fn promote_ready_udp_datagrams(&mut self, socket_index: usize) {
         let current_step = self.step_ordinal;
         while self.udp_sockets[socket_index]
@@ -5922,6 +6004,7 @@ pub(crate) fn call_kind(request: &CallInput) -> CallKind {
         CallInput::TcpConnect { .. } => CallKind::TcpConnect,
         CallInput::TcpRead { .. } | CallInput::TcpReadBuf { .. } => CallKind::TcpRead,
         CallInput::TcpWrite { .. } | CallInput::TcpWriteOwned { .. } => CallKind::TcpWrite,
+        CallInput::TcpWriteOwnedClose { .. } => CallKind::TcpWriteClose,
         CallInput::TcpListenerClose { .. } => CallKind::TcpListenerClose,
         CallInput::TcpStreamClose { .. } => CallKind::TcpStreamClose,
         CallInput::UdpBind { .. } => CallKind::UdpBind,

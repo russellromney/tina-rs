@@ -6,8 +6,8 @@
 # time. Each line covers ONE row from ONE `make perf` invocation. Two row
 # shapes are emitted today:
 #
-#   {"kind":"compare", "timestamp":..., "git_sha":..., "label":..., "tina_p50_ns":..., "tina_p90_ns":..., "tina_p99_ns":..., "tina_allocations":...}
-#   {"kind":"process", "timestamp":..., "git_sha":..., "label":..., "process_allocations":..., "rss_delta_kb":...}
+#   {"kind":"compare", "timestamp":..., "git_sha":..., "platform":..., "arch":..., "profile":"release", "label":..., "tina_p50_ns":..., "tina_p90_ns":..., "tina_p99_ns":..., "tina_allocations":..., "tina_allocated_bytes":...}
+#   {"kind":"process", "timestamp":..., "git_sha":..., "platform":..., "arch":..., "profile":"release", "label":..., "process_allocations":..., "process_allocated_bytes":..., "rss_delta_kb":...}
 #
 # A `perf-compare` line stays the canonical "row" — `perf-process` lines are
 # extras emitted by HTTP rows (whole-process allocation + RSS delta).
@@ -19,7 +19,7 @@
 
 set -euo pipefail
 
-HISTORY_FILE="${TINA_PERF_HISTORY_FILE:-.intent/phases/146-native-hot-path-allocation-http-cost/perf_history.jsonl}"
+HISTORY_FILE="${TINA_PERF_HISTORY_FILE:-.intent/phases/147-http-turn-allocation-cost/perf_history.jsonl}"
 
 mode="record"
 input_file=""
@@ -43,6 +43,17 @@ done
 
 timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 git_sha=$(git rev-parse --short HEAD)
+case "$(uname -s)" in
+  Darwin) platform=macos ;;
+  Linux) platform=linux ;;
+  *) platform=$(uname -s | tr '[:upper:]' '[:lower:]') ;;
+esac
+case "$(uname -m)" in
+  arm64) arch=aarch64 ;;
+  x86_64|aarch64) arch=$(uname -m) ;;
+  *) arch=$(uname -m | tr '[:upper:]' '[:lower:]') ;;
+esac
+profile=release
 
 if [[ -n $input_file ]]; then
   output=$(cat "$input_file")
@@ -61,10 +72,12 @@ emit_compare_lines() {
     p90=$(grep -oE 'tina_p90_ns=[0-9]+' <<< "$line" | head -1 | cut -d= -f2 || true)
     p99=$(grep -oE 'tina_p99_ns=[0-9]+' <<< "$line" | head -1 | cut -d= -f2 || true)
     allocs=$(grep -oE 'tina_allocations=[0-9]+' <<< "$line" | head -1 | cut -d= -f2 || true)
+    allocated_bytes=$(grep -oE 'tina_allocated_bytes=[0-9]+' <<< "$line" | head -1 | cut -d= -f2 || true)
     base_p50=$(grep -oE 'baseline_p50_ns=[0-9]+' <<< "$line" | head -1 | cut -d= -f2 || true)
+    base_allocated_bytes=$(grep -oE 'baseline_allocated_bytes=[0-9]+' <<< "$line" | head -1 | cut -d= -f2 || true)
     if [[ -n $label && -n $p50 ]]; then
-      printf '{"kind":"compare","timestamp":"%s","git_sha":"%s","label":"%s","tina_p50_ns":%s,"tina_p90_ns":%s,"tina_p99_ns":%s,"tina_allocations":%s,"baseline_p50_ns":%s}\n' \
-        "$timestamp" "$git_sha" "$label" "$p50" "${p90:-null}" "${p99:-null}" "${allocs:-null}" "${base_p50:-null}"
+      printf '{"kind":"compare","timestamp":"%s","git_sha":"%s","platform":"%s","arch":"%s","profile":"%s","label":"%s","tina_p50_ns":%s,"tina_p90_ns":%s,"tina_p99_ns":%s,"tina_allocations":%s,"tina_allocated_bytes":%s,"baseline_p50_ns":%s,"baseline_allocated_bytes":%s}\n' \
+        "$timestamp" "$git_sha" "$platform" "$arch" "$profile" "$label" "$p50" "${p90:-null}" "${p99:-null}" "${allocs:-null}" "${allocated_bytes:-null}" "${base_p50:-null}" "${base_allocated_bytes:-null}"
     fi
   done < <(grep '^perf-compare' <<< "$output" || true)
 }
@@ -74,10 +87,11 @@ emit_process_lines() {
     [[ -z $line ]] && continue
     label=$(grep -oE 'label=[a-zA-Z0-9_]+' <<< "$line" | head -1 | cut -d= -f2 || true)
     process_allocs=$(grep -oE 'process_allocations=[0-9]+' <<< "$line" | head -1 | cut -d= -f2 || true)
+    process_allocated_bytes=$(grep -oE 'process_allocated_bytes=[0-9]+' <<< "$line" | head -1 | cut -d= -f2 || true)
     rss=$(grep -oE 'rss_delta_kb=-?[0-9]+' <<< "$line" | head -1 | cut -d= -f2 || true)
     if [[ -n $label && -n $process_allocs ]]; then
-      printf '{"kind":"process","timestamp":"%s","git_sha":"%s","label":"%s","process_allocations":%s,"rss_delta_kb":%s}\n' \
-        "$timestamp" "$git_sha" "$label" "$process_allocs" "${rss:-null}"
+      printf '{"kind":"process","timestamp":"%s","git_sha":"%s","platform":"%s","arch":"%s","profile":"%s","label":"%s","process_allocations":%s,"process_allocated_bytes":%s,"rss_delta_kb":%s}\n' \
+        "$timestamp" "$git_sha" "$platform" "$arch" "$profile" "$label" "$process_allocs" "${process_allocated_bytes:-null}" "${rss:-null}"
     fi
   done < <(grep '^perf-process' <<< "$output" || true)
 }

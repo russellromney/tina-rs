@@ -75,6 +75,10 @@ enum PendingKind {
     ReadBuf(Box<RecvBufCompletion>),
     Write(Box<SendCompletion>),
     WriteOwned(Box<SendOwnedCompletion>),
+    WriteOwnedClose {
+        stream: StreamId,
+        completion: Box<SendOwnedCompletion>,
+    },
     UdpRecv {
         socket: UdpSocketId,
         max_len: usize,
@@ -471,6 +475,31 @@ impl BetelgeuseTcp {
                     Err(result) => Some(DriverCompletion { call_id, result }),
                 }
             }
+            CallInput::TcpWriteOwnedClose { stream, bytes } => {
+                let lane = PendingLane::StreamWrite(stream);
+                if self.lane_has_pending(lane) {
+                    return Some(DriverCompletion {
+                        call_id,
+                        result: CallOutput::TcpWroteOwnedFailed {
+                            bytes,
+                            error: CallError::ResourceBusy,
+                        },
+                    });
+                }
+                match self.arm_write_owned_close(stream, bytes) {
+                    Ok(pending) => {
+                        self.pending.push(PendingOperation {
+                            call_id,
+                            kind: pending,
+                            lane,
+                            user_cancelled: false,
+                            shutdown_marked: false,
+                        });
+                        None
+                    }
+                    Err(result) => Some(DriverCompletion { call_id, result }),
+                }
+            }
             CallInput::SnapshotCommit { .. }
             | CallInput::SnapshotLoad { .. }
             | CallInput::JournalAppend { .. }
@@ -770,6 +799,32 @@ impl BetelgeuseTcp {
                     }),
                 }
             }
+            PendingKind::WriteOwnedClose { stream, completion } => {
+                if !completion.has_result() {
+                    return None;
+                }
+                let result = completion
+                    .take_result()
+                    .expect("send-owned-close completion advertised a result");
+                match result {
+                    Ok((bytes, count)) => {
+                        let closed = count >= bytes.len();
+                        if closed {
+                            self.cancel_pending_stream_ops(*stream, Some(op.call_id));
+                            self.close_stream_entry(*stream);
+                        }
+                        Some(CallOutput::TcpWroteOwnedClose {
+                            bytes,
+                            count,
+                            closed,
+                        })
+                    }
+                    Err((_error, bytes)) => Some(CallOutput::TcpWroteOwnedFailed {
+                        bytes,
+                        error: CallError::Io,
+                    }),
+                }
+            }
             PendingKind::UdpRecv {
                 socket,
                 max_len,
@@ -898,7 +953,19 @@ impl BetelgeuseTcp {
 
     pub(super) fn do_stream_close(&mut self, stream: StreamId) -> CallOutput {
         // Close wins: cancel any pending read or write on this stream.
+        self.cancel_pending_stream_ops(stream, None);
+
+        match self.close_stream_entry(stream) {
+            true => CallOutput::TcpStreamClosed,
+            false => CallOutput::Failed(CallError::InvalidResource),
+        }
+    }
+
+    fn cancel_pending_stream_ops(&mut self, stream: StreamId, except: Option<CallId>) {
         for op in self.pending.iter_mut() {
+            if except == Some(op.call_id) {
+                continue;
+            }
             let on_this_stream = match op.lane {
                 PendingLane::StreamRead(s) | PendingLane::StreamWrite(s) => s == stream,
                 _ => false,
@@ -907,15 +974,6 @@ impl BetelgeuseTcp {
                 op.user_cancelled = true;
                 self.cancelled_by_close.push(op.call_id);
             }
-        }
-
-        match self.streams.iter().position(|entry| entry.id == stream) {
-            Some(index) => {
-                let entry = self.streams.remove(index);
-                entry.socket.close();
-                CallOutput::TcpStreamClosed
-            }
-            None => CallOutput::Failed(CallError::InvalidResource),
         }
     }
 
@@ -1108,6 +1166,38 @@ impl BetelgeuseTcp {
         Ok(PendingKind::WriteOwned(completion))
     }
 
+    fn arm_write_owned_close(
+        &mut self,
+        stream: StreamId,
+        bytes: Vec<u8>,
+    ) -> Result<PendingKind, CallOutput> {
+        let Some(entry) = self.streams.iter().find(|entry| entry.id == stream) else {
+            return Err(CallOutput::TcpWroteOwnedFailed {
+                bytes,
+                error: CallError::InvalidResource,
+            });
+        };
+        let mut completion = Box::new(SendOwnedCompletion::new());
+        if let Err((_error, bytes)) = entry.socket.send_owned(&mut completion, bytes) {
+            return Err(CallOutput::TcpWroteOwnedFailed {
+                bytes,
+                error: CallError::Io,
+            });
+        }
+        Ok(PendingKind::WriteOwnedClose { stream, completion })
+    }
+
+    fn close_stream_entry(&mut self, stream: StreamId) -> bool {
+        match self.streams.iter().position(|entry| entry.id == stream) {
+            Some(index) => {
+                let entry = self.streams.remove(index);
+                entry.socket.close();
+                true
+            }
+            None => false,
+        }
+    }
+
     fn arm_file_read(
         &mut self,
         file: FileId,
@@ -1188,6 +1278,7 @@ impl PendingKind {
             Self::ReadBuf(completion) => completion.has_result(),
             Self::Write(completion) => completion.has_result(),
             Self::WriteOwned(completion) => completion.has_result(),
+            Self::WriteOwnedClose { completion, .. } => completion.has_result(),
             Self::UdpRecv { .. } => false,
             Self::FileRead(completion) => completion.has_result(),
             Self::FileWrite(completion) => completion.has_result(),

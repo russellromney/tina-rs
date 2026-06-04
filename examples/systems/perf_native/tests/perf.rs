@@ -1,4 +1,4 @@
-use perf_native::run_all;
+use perf_native::{http_body_pressure_probe, run_all};
 use tina_proof_harness::SemanticMatch;
 
 #[test]
@@ -104,4 +104,34 @@ fn native_perf_comparison_rows_are_printable_and_bounded() {
             "comparison json samples shape"
         );
     }
+}
+
+#[test]
+fn http_body_pressure_probe_reports_full_and_drained() {
+    let report = http_body_pressure_probe().expect("run HTTP body pressure probe");
+    println!("{}", report.summary_line());
+    for surface in &report.surface_plateaus {
+        println!("{}", surface.summary_line());
+    }
+
+    assert_eq!(report.label, "tina_http_body_pressure");
+    assert_eq!(report.ops_attempted, 8);
+    assert_eq!(report.ops_ok, 0);
+    assert_eq!(report.ops_err, 8);
+    assert_eq!(report.ops_timeout, 0);
+    assert_eq!(
+        report.pressure.by_kind,
+        vec![("full".to_string(), 8)],
+        "expected max-body overload to stay typed as full",
+    );
+    assert!(report.leak_clean, "body pressure should drain cleanly");
+
+    let max_body = report
+        .surface_plateaus
+        .iter()
+        .find(|surface| surface.name == "perf.http.max_body_bytes")
+        .expect("max body capacity surface");
+    assert_eq!(max_body.full, 8);
+    assert_eq!(max_body.final_current, 0);
+    assert!(max_body.leak_clean);
 }

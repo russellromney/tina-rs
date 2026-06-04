@@ -45,9 +45,9 @@ use http::StatusCode;
 use tina::prelude::*;
 use tina::{CallContext, RequestContext, reply_to_request};
 use tina_runtime::{
-    CallError, CallOutcome, TcpReadBufReply, TcpWriteOwnedReply, TlsReadBufReply,
-    TlsWriteOwnedReply, call, sleep, tcp_close_stream, tcp_read_buf, tcp_write_owned, tls_close,
-    tls_read_buf, tls_write_owned,
+    CallError, CallOutcome, TcpReadBufReply, TcpWriteOwnedCloseReply, TcpWriteOwnedReply,
+    TlsReadBufReply, TlsWriteOwnedReply, call, sleep, tcp_close_stream, tcp_read_buf,
+    tcp_write_owned, tcp_write_owned_close, tls_close, tls_read_buf, tls_write_owned,
 };
 
 use crate::body_metrics::BodyMetrics;
@@ -69,6 +69,7 @@ use crate::websocket::{
 /// single read does not pull more than this into the runtime, regardless
 /// of what the kernel has buffered.
 const READ_CHUNK: usize = 4096;
+const COALESCE_BUFFERED_RESPONSE_BODY_LIMIT: usize = READ_CHUNK;
 const WEBSOCKET_PENDING_APP_MSG_CAP: usize = 4;
 
 fn tls_read_reply_to_tcp(reply: TlsReadBufReply) -> TcpReadBufReply {
@@ -169,6 +170,8 @@ pub enum HttpConnectionMsg {
     ServiceReturned(CallOutcome<HttpResponse>),
     /// `tcp_write_owned` reply.
     Wrote(Result<TcpWriteOwnedReply, CallError>),
+    /// `tcp_write_owned_close` reply.
+    WroteClose(Result<TcpWriteOwnedCloseReply, CallError>),
     /// `tcp_close_stream` reply.
     Closed(Result<(), CallError>),
     /// App reply to one WebSocket session event.
@@ -498,6 +501,18 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Isolate for Http
                 // either still queued in `pending_response`, sitting
                 // in `pending_buffered_body`, or being streamed.
                 // Record the truncation so the metric is honest.
+                if self.has_pending_body() {
+                    self.record_body_io_error();
+                }
+                let cancel = self.cancel_stream_source();
+                let close = self.begin_close();
+                match cancel {
+                    Some(c) => batch(vec![c, close]),
+                    None => close,
+                }
+            }
+            HttpConnectionMsg::WroteClose(Ok(reply)) => self.handle_wrote_close(reply),
+            HttpConnectionMsg::WroteClose(Err(_)) => {
                 if self.has_pending_body() {
                     self.record_body_io_error();
                 }
@@ -1151,11 +1166,26 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
         let head_bytes = encode_response_head(&response, connection_close);
         match response.body {
             HttpResponseBody::Buffered(body_bytes) => {
-                self.pending_response = head_bytes;
-                if !body_bytes.is_empty() {
+                let can_coalesce = self.metrics.is_none()
+                    && body_bytes.len() <= COALESCE_BUFFERED_RESPONSE_BODY_LIMIT;
+                if can_coalesce {
+                    self.pending_response = head_bytes;
+                    self.pending_response.reserve_exact(body_bytes.len());
+                    self.pending_response.extend_from_slice(&body_bytes);
+                } else if !body_bytes.is_empty() {
+                    self.pending_response = head_bytes;
                     self.pending_buffered_body = Some(body_bytes);
+                } else {
+                    self.pending_response = head_bytes;
                 }
-                self.write_pending()
+                if self.will_close
+                    && matches!(self.transport, HttpTransport::Tcp(_))
+                    && self.pending_buffered_body.is_none()
+                {
+                    self.write_pending_close()
+                } else {
+                    self.write_pending()
+                }
             }
             HttpResponseBody::Stream(ResponseStream {
                 content_length,
@@ -1203,6 +1233,18 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
                             .map_err(|error| error.error),
                     )
                 })
+            }
+        }
+    }
+
+    fn write_pending_close(&mut self) -> Effect<Self> {
+        let bytes = std::mem::take(&mut self.pending_response);
+        match self.transport {
+            HttpTransport::Tcp(stream) => tcp_write_owned_close(stream, bytes)
+                .then(|result| HttpConnectionMsg::WroteClose(result.map_err(|error| error.error))),
+            HttpTransport::Tls(_) => {
+                self.pending_response = bytes;
+                self.write_pending()
             }
         }
     }
@@ -1271,6 +1313,32 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
             self.pending_response = bytes;
             self.write_pending()
         }
+    }
+
+    fn handle_wrote_close(&mut self, reply: TcpWriteOwnedCloseReply) -> Effect<Self> {
+        let TcpWriteOwnedCloseReply {
+            mut bytes,
+            written,
+            closed,
+        } = reply;
+        if written == 0 {
+            self.pending_response = bytes;
+            if self.has_pending_body() {
+                self.record_body_io_error();
+            }
+            return self.begin_close();
+        }
+        let release = written.min(self.metrics_response_charge);
+        self.release_response(release);
+        if written >= bytes.len() {
+            if closed {
+                return stop();
+            }
+            return self.begin_close();
+        }
+        bytes.drain(..written);
+        self.pending_response = bytes;
+        self.write_pending_close()
     }
 
     /// Called once a response has fully drained to the wire. Either

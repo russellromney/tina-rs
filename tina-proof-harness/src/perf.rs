@@ -423,13 +423,14 @@ impl HotPathReport {
     /// greppable.
     pub fn summary_line(&self) -> String {
         let mut line = format!(
-            "hotpath label={} iterations={} p50_us={} p50_ns={} min_ns={} max_ns={} host_allocations={} process_allocations={} {}",
+            "hotpath label={} iterations={} p50_us={} p50_ns={} min_ns={} max_ns={} stage_count={} host_allocations={} process_allocations={} {}",
             report_value(self.label),
             self.iterations,
             self.p50_ns / 1_000,
             self.p50_ns,
             self.min_ns,
             self.max_ns,
+            self.stages.len(),
             self.allocations
                 .map(|value| value.to_string())
                 .unwrap_or_else(|| "unknown".to_string()),
@@ -466,12 +467,13 @@ impl HotPathReport {
         }
         stages.push('}');
         format!(
-            "{{\"schema\":\"tina.hotpath.v1\",\"label\":{},\"iterations\":{},\"p50_ns\":{},\"min_ns\":{},\"max_ns\":{},\"host_allocations\":{},\"process_allocations\":{},\"allocations\":{},\"platform\":{},\"arch\":{},\"profile\":{},\"git_sha\":{},\"stages\":{}}}",
+            "{{\"schema\":\"tina.hotpath.v1\",\"label\":{},\"iterations\":{},\"p50_ns\":{},\"min_ns\":{},\"max_ns\":{},\"stage_count\":{},\"host_allocations\":{},\"process_allocations\":{},\"allocations\":{},\"platform\":{},\"arch\":{},\"profile\":{},\"git_sha\":{},\"stages\":{}}}",
             json_string(self.label),
             self.iterations,
             self.p50_ns,
             self.min_ns,
             self.max_ns,
+            self.stages.len(),
             self.allocations
                 .map(|value| value.to_string())
                 .unwrap_or_else(|| "null".to_string()),
@@ -693,6 +695,7 @@ mod tests {
         assert!(line.contains("p50_us=1"), "{line}");
         assert!(line.contains("min_ns=800"), "{line}");
         assert!(line.contains("max_ns=1200"), "{line}");
+        assert!(line.contains("stage_count=2"), "{line}");
         assert!(line.contains("allocations=7"), "{line}");
         assert!(
             line.contains("stage.host_submit_to_worker_pickup_ns=250"),
@@ -706,6 +709,7 @@ mod tests {
         let json = report.json_line();
         assert!(json.contains("\"schema\":\"tina.hotpath.v1\""), "{json}");
         assert!(json.contains("\"p50_ns\":1000"), "{json}");
+        assert!(json.contains("\"stage_count\":2"), "{json}");
         assert!(
             json.contains("\"host_submit_to_worker_pickup\":250"),
             "{json}"

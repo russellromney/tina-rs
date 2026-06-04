@@ -294,6 +294,72 @@ fn parse_transfer_encoding(value: &str) -> TransferEncodingFlags {
     flags
 }
 
+fn decimal_len(mut value: usize) -> usize {
+    let mut digits = 1;
+    while value >= 10 {
+        value /= 10;
+        digits += 1;
+    }
+    digits
+}
+
+fn response_head_capacity(
+    response: &crate::types::HttpResponse,
+    connection_close: bool,
+    version_str: &str,
+    reason: &str,
+) -> usize {
+    let status_line = version_str.len() + 1 + response.status.as_str().len() + 1 + reason.len() + 2;
+    let headers = response
+        .headers
+        .iter()
+        .filter(|(name, _)| {
+            **name != http::header::CONTENT_LENGTH
+                && **name != http::header::TRANSFER_ENCODING
+                && !(connection_close && **name == http::header::CONNECTION)
+        })
+        .map(|(name, value)| name.as_str().len() + 2 + value.as_bytes().len() + 2)
+        .sum::<usize>();
+    let framing = match &response.body {
+        crate::types::HttpResponseBody::WebSocket(_) => 0,
+        _ => match response.body.declared_length() {
+            Some(length) => b"Content-Length: ".len() + decimal_len(length) + 2,
+            None => b"Transfer-Encoding: chunked\r\n".len(),
+        },
+    };
+    let connection = if connection_close {
+        b"Connection: close\r\n".len()
+    } else {
+        0
+    };
+    status_line + headers + framing + connection + 2
+}
+
+fn request_capacity(
+    request: &HttpRequest,
+    body_len: usize,
+    connection_close: bool,
+    version_str: &str,
+) -> usize {
+    let request_line =
+        request.method.as_str().len() + 1 + request.path.len() + 1 + version_str.len() + 2;
+    let headers = request
+        .headers
+        .iter()
+        .filter(|(name, _)| {
+            **name != http::header::CONTENT_LENGTH && **name != http::header::CONNECTION
+        })
+        .map(|(name, value)| name.as_str().len() + 2 + value.as_bytes().len() + 2)
+        .sum::<usize>();
+    let content_length = b"Content-Length: ".len() + decimal_len(body_len) + 2;
+    let connection = if connection_close {
+        b"Connection: close\r\n".len()
+    } else {
+        0
+    };
+    request_line + headers + content_length + connection + 2 + body_len
+}
+
 /// Serialises a response head onto a wire buffer using HTTP/1.1 framing.
 ///
 /// Emits status line + headers + framing line + optional
@@ -315,8 +381,6 @@ pub fn encode_response_head(
     response: &crate::types::HttpResponse,
     connection_close: bool,
 ) -> Vec<u8> {
-    let mut out = Vec::with_capacity(128);
-
     let version_str = match response.version {
         Version::HTTP_10 => "HTTP/1.0",
         Version::HTTP_11 => "HTTP/1.1",
@@ -324,6 +388,12 @@ pub fn encode_response_head(
     };
     let status = response.status;
     let reason = status.canonical_reason().unwrap_or("");
+    let mut out = Vec::with_capacity(response_head_capacity(
+        response,
+        connection_close,
+        version_str,
+        reason,
+    ));
     out.extend_from_slice(version_str.as_bytes());
     out.extend_from_slice(b" ");
     out.extend_from_slice(status.as_str().as_bytes());
@@ -382,7 +452,10 @@ pub fn encode_response_head(
 pub fn encode_response(response: &crate::types::HttpResponse, connection_close: bool) -> Vec<u8> {
     let mut out = encode_response_head(response, connection_close);
     match &response.body {
-        crate::types::HttpResponseBody::Buffered(bytes) => out.extend_from_slice(bytes),
+        crate::types::HttpResponseBody::Buffered(bytes) => {
+            out.reserve_exact(bytes.len());
+            out.extend_from_slice(bytes);
+        }
         crate::types::HttpResponseBody::Stream(_)
         | crate::types::HttpResponseBody::ChunkedStream(_)
         | crate::types::HttpResponseBody::WebSocket(_) => {
@@ -424,13 +497,17 @@ fn encode_request_internal(request: &HttpRequest, connection_close: bool) -> Vec
             panic!("encode_request cannot serialise an HTTP/2 streaming body")
         }
     };
-    let mut out = Vec::with_capacity(128 + body_bytes.len());
-
     let version_str = match request.version {
         Version::HTTP_10 => "HTTP/1.0",
         Version::HTTP_11 => "HTTP/1.1",
         _ => "HTTP/1.1",
     };
+    let mut out = Vec::with_capacity(request_capacity(
+        request,
+        body_bytes.len(),
+        connection_close,
+        version_str,
+    ));
     out.extend_from_slice(request.method.as_str().as_bytes());
     out.extend_from_slice(b" ");
     out.extend_from_slice(request.path.as_bytes());
@@ -985,6 +1062,14 @@ mod tests {
     }
 
     #[test]
+    fn encode_response_common_path_presizes_exactly() {
+        let mut response = crate::types::HttpResponse::with_status(StatusCode::OK);
+        response.body = b"hello".to_vec().into();
+        let bytes = encode_response(&response, true);
+        assert_eq!(bytes.capacity(), bytes.len());
+    }
+
+    #[test]
     fn encode_response_emits_connection_close_when_requested() {
         let response = crate::types::HttpResponse::with_status(StatusCode::OK);
         let bytes = encode_response(&response, true);
@@ -1027,6 +1112,13 @@ mod tests {
         assert!(text.starts_with("GET /x HTTP/1.1\r\n"));
         assert!(text.contains("Content-Length: 0\r\n"));
         assert!(text.contains("Connection: close\r\n"));
+    }
+
+    #[test]
+    fn encode_request_common_path_presizes_exactly() {
+        let req = HttpRequest::get("/x").build();
+        let bytes = encode_request(&req);
+        assert_eq!(bytes.capacity(), bytes.len());
     }
 
     #[test]
