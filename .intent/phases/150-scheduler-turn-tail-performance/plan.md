@@ -55,13 +55,27 @@ Known code shape:
 
 ## Goal
 
-Make tail and turn performance meaningfully better.
+Make p50 and p90 much faster, and make the whole distribution tighter.
+
+Tina should not win one pretty median while p90/p99 stay messy. This phase is
+about distribution shape:
+
+- lower p50;
+- lower p90;
+- smaller p90/p50 ratio;
+- fewer scheduler gaps;
+- lower max scheduler gap;
+- p99 improved where practical, or explained by named external/system noise
+  with stage evidence.
 
 Done means:
 
-- `hotpath_call_blocking` gets lower p50 and p90/p99, or the review explains
-  the exact irreducible cross-thread cost with stage evidence;
-- HTTP/1 close/fixed/keepalive hotpath rows have lower tail or fewer turns;
+- `hotpath_call_blocking` improves p50 and p90, and does not regress p99
+  without exact stage evidence;
+- `hotpath_service_request_reply_chain_tail` improves p50 and p90;
+- HTTP/1 close/fixed/keepalive hotpath rows improve p50 and p90 or show fewer
+  scheduler gaps with exact stage evidence;
+- at least two key rows reduce `p90 / p50`;
 - worker loop does not burn CPU while idle or while waiting on timers/I/O;
 - fairness/load tests still prove hot actors cannot starve cold actors;
 - Linux/x86 rows exist or the review names the exact external blocker;
@@ -85,11 +99,21 @@ Done means:
 Build:
 
 - extend hotpath reports with:
-  - p90 and p99 stage totals, not only p50 total;
+  - p50, p90, and p99 totals;
+  - `p90_over_p50_per_mille`;
+  - `p99_over_p50_per_mille`;
   - slowest stage names for p90/p99 samples;
+  - traced and untraced sample modes for key rows;
   - worker park/yield counts if observable;
   - `scheduler_gap_count` for gaps above a chosen threshold;
   - `max_scheduler_gap_ns`;
+- add a compact distribution summary:
+  - `min_ns`;
+  - `p50_ns`;
+  - `p90_ns`;
+  - `p99_ns`;
+  - `max_ns`;
+  - `range_over_p50_per_mille`;
 - keep existing p50 fields for compatibility;
 - update `perf_record.sh` and `perf_check.sh` parsing for the new fields;
 - add rows:
@@ -98,20 +122,29 @@ Build:
   - `hotpath_http1_close_request_tail`;
   - `hotpath_http1_keepalive_steady_state_tail`;
   - `hotpath_http1_fixed_body_close_tail`.
+- for each key row, record:
+  - traced row, with stage breakdown;
+  - untraced row, without observer overhead;
+  - delta between them.
 
 Threshold:
 
 - use `100us` as the first scheduler-gap threshold on local release rows;
 - make the threshold a report field so Linux can tune it later if needed;
-- do not fail CI on p99 timing, only record and compare locally.
+- do not fail normal CI on p99 timing;
+- `make perf-check` may fail local/opt-in perf checks on structural counters,
+  allocation ceilings, and large distribution regressions against matching
+  platform/arch/profile history.
 
 Proof:
 
 - tests prove JSON/text rows contain p50/p90/p99, slowest stage, gap count, and
   max gap;
+- tests prove traced/untraced row labels cannot be confused;
 - sample parser accepts the new rows;
 - old Phase 149 rows still parse;
-- review names which stages dominate p90/p99 before and after code changes.
+- review names which stages dominate p90/p99 before and after code changes;
+- review names observer overhead for each key row.
 
 ## Rock 2: Bounded Worker Drain Budget
 
@@ -164,7 +197,11 @@ Proof:
   - multi-shard remote flood does not starve command/shutdown;
   - multi-shard local hot actor does not starve remote inbound;
 - existing fairness/load tests pass;
-- new perf rows show fewer/lower scheduler gaps.
+- new perf rows show:
+  - lower p50 and p90 for host/service call rows;
+  - fewer scheduler gaps;
+  - lower max scheduler gap;
+  - lower p90/p50 ratio on at least one host/service row.
 
 ## Rock 3: Backend Completion Batch Drain
 
@@ -279,7 +316,9 @@ Proof:
 - dispatcher mailbox full is visible;
 - multi-threaded host burst stays bounded;
 - process allocations for `hotpath_call_blocking` do not regress and should
-  improve if this rock changes storage.
+  improve if this rock changes storage;
+- p50 and p90 improve on `hotpath_call_blocking_tail`, or review gives exact
+  stage evidence for why they did not.
 
 ## Rock 6: HTTP Protocol Turn Cleanup
 
@@ -306,7 +345,10 @@ Proof:
 
 - HTTP/1 server smoke, keepalive, body lifecycle, streaming response, chunked,
   WebSocket upgrade, and pressure tests pass;
-- hotpath close/fixed/keepalive rows show fewer turns or smaller tail gaps;
+- hotpath close/fixed/keepalive rows show:
+  - lower p50 and p90, or fewer scheduler gaps with exact reason;
+  - lower p90/p50 ratio on at least one HTTP row;
+  - no p99 regression without a named stage reason;
 - wire bytes match before/after tests;
 - close failure and partial write tests prove no swallowed failure;
 - body high-water/current returns to zero;
@@ -327,6 +369,7 @@ Rows:
 
 - `hotpath_call_blocking_tail`;
 - `hotpath_service_request_reply_chain_tail`;
+- traced/untraced variants of both host/service rows;
 - `http1_close_request`;
 - `http1_fixed_body_close`;
 - `http1_keepalive_steady_state_small`;
@@ -337,7 +380,8 @@ Proof:
 
 - macOS rows and Linux rows are keyed by platform/arch/profile;
 - `perf_check` never compares macOS against Linux;
-- review states whether Linux shows the same bottleneck or a different one.
+- review states whether Linux shows the same bottleneck or a different one;
+- review states whether Linux distribution shape improved, not only p50.
 
 ## Rock 8: Soak And CPU Sanity
 
@@ -381,7 +425,9 @@ Required wording:
 
 - local evidence;
 - not production performance claim;
-- p50 improved vs tails improved;
+- p50/p90 improved vs tails improved;
+- whether p90/p50 tightened;
+- traced vs untraced overhead;
 - what cost remains;
 - Linux status;
 - next bottleneck after the phase.
@@ -412,8 +458,13 @@ If a command is skipped, `review.md` must say why.
 
 This phase is done only when:
 
-- at least one host/service call row improves;
-- at least one HTTP hotpath tail row improves;
+- `hotpath_call_blocking_tail` improves p50 and p90, or review proves the exact
+  irreducible stage cost;
+- `hotpath_service_request_reply_chain_tail` improves p50 and p90, or review
+  proves the exact irreducible stage cost;
+- at least one HTTP close/fixed/keepalive tail row improves p50 and p90;
+- at least two key rows reduce p90/p50 ratio;
+- traced and untraced rows both exist for key host/service paths;
 - no fairness/load regression;
 - no idle spin;
 - no hidden terminal truth loss;

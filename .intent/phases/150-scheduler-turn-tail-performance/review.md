@@ -54,3 +54,24 @@ Decision:
 - Phase 150 is now a true big scheduler phase: tail-aware measurement, bounded
   drain, completion batching, ready scheduler, host-call tightening, HTTP turn
   cleanup, Linux evidence, and soak/CPU sanity.
+
+## Plan Review 3
+
+Findings:
+
+- [P2] The plan still allowed one pretty p50 to count as progress. It now
+  requires p50 and p90 improvement on host/service rows, at least one HTTP
+  p50+p90 improvement, and p90/p50 tightening on at least two key rows.
+- [P2] Trace observer overhead could be mistaken for runtime cost. Plan now
+  requires traced and untraced variants for key rows plus review text naming
+  observer overhead.
+- [P2] p99 could regress silently as long as p50 improved. Plan now requires
+  no p99 regression without exact stage evidence, and p99/max gap fields in the
+  report.
+- [P3] Linux evidence could show only median improvement. Plan now requires
+  Linux distribution-shape discussion, not only p50.
+
+Decision:
+
+- Phase 150 success is distribution tightening: faster p50, faster p90, smaller
+  p90/p50 ratio, fewer scheduler gaps, no idle spin, no fairness regression.
