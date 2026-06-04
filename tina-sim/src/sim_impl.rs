@@ -34,21 +34,22 @@ use tina::{
 use tina_runtime::{
     CallCompletionRejectedReason, CallError, CallId, CallInput, CallKind, CallOutcome, CallOutput,
     CallReplyRejectedReason, CauseId, DeferredReplyRejectedReason, DeferredSlotId, DnsLookupReply,
-    EffectKind, EventId, FileCloseReply, FileFsyncReply, FileId, FileOpenOptions, FileOpenReply,
-    FileReadReply, FileSizeReply, FileWriteReply, IntoErasedCall, IntoRuntimeFact, IsolateCall,
-    JournalAppendReply, JournalRecord, JournalReplay, JournalReplayReply, JournalReplayWarning,
-    ListenerId, MkdirReply, PathKind, PathMetadata, PathMetadataReply, PersistenceTraceInfo,
-    ProcessRunReply, ProcessRunResult, ProcessStatus, ReadDirReply, RemoveFileReply,
-    RenameReplaceReply, RestartSkippedReason, RuntimeCall, RuntimeCallable, RuntimeEvent,
-    RuntimeEventKind, RuntimeFact, SendOutcome, SendRejectedReason, SignalWaitReply,
-    SnapshotCommitReply, SnapshotImage, SnapshotLoadReply, StreamId, SupervisionRejectedReason,
-    SyncParentReply, TcpAcceptReply, TcpBindReply, TcpConnectReply, TcpListenerCloseReply,
-    TcpReadReply, TcpStreamCloseReply, TcpWriteReply, TlsAcceptReply, TlsBindReply, TlsCloseReply,
-    TlsConnectReply, TlsListenerCloseReply, TlsListenerId, TlsReadReply, TlsStreamId,
-    TlsWriteReply, UdpBindReply, UdpCloseSocketReply, UdpRecvFromReply, UdpSendToReply,
-    UdpSocketId, UnixAcceptReply, UnixBindReply, UnixConnectReply, UnixListenerCloseReply,
-    UnixListenerId, UnixReadReply, UnixStreamCloseReply, UnixStreamId, UnixWriteReply,
-    call_reply_reason_for_cause, deferred_reply_reason_for_cause,
+    EffectKind, ErasedRuntimeCallCompletion, EventId, FileCloseReply, FileFsyncReply, FileId,
+    FileOpenOptions, FileOpenReply, FileReadReply, FileSizeReply, FileWriteReply, IntoErasedCall,
+    IntoRuntimeFact, IsolateCall, JournalAppendReply, JournalRecord, JournalReplay,
+    JournalReplayReply, JournalReplayWarning, ListenerId, MkdirReply, PathKind, PathMetadata,
+    PathMetadataReply, PersistenceTraceInfo, ProcessRunReply, ProcessRunResult, ProcessStatus,
+    ReadDirReply, RemoveFileReply, RenameReplaceReply, RestartSkippedReason, RuntimeCall,
+    RuntimeCallable, RuntimeEvent, RuntimeEventKind, RuntimeFact, SendOutcome, SendRejectedReason,
+    SignalWaitReply, SnapshotCommitReply, SnapshotImage, SnapshotLoadReply, StreamId,
+    SupervisionRejectedReason, SyncParentReply, TcpAcceptReply, TcpBindReply, TcpConnectReply,
+    TcpListenerCloseReply, TcpReadReply, TcpStreamCloseReply, TcpWriteReply,
+    TerminalCompletionAction, TlsAcceptReply, TlsBindReply, TlsCloseReply, TlsConnectReply,
+    TlsListenerCloseReply, TlsListenerId, TlsReadReply, TlsStreamId, TlsWriteReply, UdpBindReply,
+    UdpCloseSocketReply, UdpRecvFromReply, UdpSendToReply, UdpSocketId, UnixAcceptReply,
+    UnixBindReply, UnixConnectReply, UnixListenerCloseReply, UnixListenerId, UnixReadReply,
+    UnixStreamCloseReply, UnixStreamId, UnixWriteReply, call_reply_reason_for_cause,
+    deferred_reply_reason_for_cause,
 };
 use tina_supervisor::SupervisorConfig;
 
@@ -5315,10 +5316,7 @@ where
             .take()
             .unwrap_or_else(|| panic!("translator for call {call_id:?} already consumed"));
 
-        let failure_reason = match &result {
-            CallOutput::Failed(reason) => Some(*reason),
-            _ => None,
-        };
+        let failure_reason = call_output_failure_reason(&result);
         if let Some(reason) = failure_reason {
             self.push_event(
                 in_flight.requester.isolate,
@@ -5332,7 +5330,21 @@ where
         }
         self.push_persistence_completion_events(&in_flight, &result, failure_reason);
 
-        let message = translator(result);
+        let completion = translator(result);
+        if failure_reason.is_some()
+            && !matches!(completion, ErasedRuntimeCallCompletion::Message(_))
+        {
+            self.push_event(
+                in_flight.requester.isolate,
+                Some(in_flight.cause),
+                RuntimeEventKind::CallCompletionRejected {
+                    call_id,
+                    call_kind: in_flight.call_kind,
+                    reason: CallCompletionRejectedReason::TerminalActionOnFailure,
+                },
+            );
+            return;
+        }
 
         let entry_index = self.entries.iter().position(|entry| {
             entry.id == in_flight.requester.isolate
@@ -5364,44 +5376,106 @@ where
             return;
         }
 
-        match self.entries[entry_index].inbox.push(
-            message,
+        self.deliver_backend_completion_action_at(
+            entry_index,
+            in_flight,
+            call_id,
+            completion,
+            failure_reason,
             visible_at_step,
-            in_flight.continuation_context,
-        ) {
-            Ok(()) => {
-                if failure_reason.is_none() {
-                    self.push_event(
-                        in_flight.requester.isolate,
-                        Some(in_flight.cause),
-                        RuntimeEventKind::CallCompleted {
-                            call_id,
-                            call_kind: in_flight.call_kind,
-                        },
-                    );
+        );
+    }
+
+    fn deliver_backend_completion_action_at(
+        &mut self,
+        entry_index: usize,
+        in_flight: InFlightCall,
+        call_id: CallId,
+        completion: ErasedRuntimeCallCompletion,
+        failure_reason: Option<CallError>,
+        visible_at_step: u64,
+    ) {
+        match completion {
+            ErasedRuntimeCallCompletion::Message(message) => {
+                match self.entries[entry_index].inbox.push(
+                    message,
+                    visible_at_step,
+                    in_flight.continuation_context,
+                ) {
+                    Ok(()) => {
+                        if failure_reason.is_none() {
+                            self.push_event(
+                                in_flight.requester.isolate,
+                                Some(in_flight.cause),
+                                RuntimeEventKind::CallCompleted {
+                                    call_id,
+                                    call_kind: in_flight.call_kind,
+                                },
+                            );
+                        }
+                    }
+                    Err(TrySendError::Full(_)) => {
+                        self.push_event(
+                            in_flight.requester.isolate,
+                            Some(in_flight.cause),
+                            RuntimeEventKind::CallCompletionRejected {
+                                call_id,
+                                call_kind: in_flight.call_kind,
+                                reason: CallCompletionRejectedReason::MailboxFull,
+                            },
+                        );
+                    }
+                    Err(TrySendError::Closed(_)) => {
+                        self.push_event(
+                            in_flight.requester.isolate,
+                            Some(in_flight.cause),
+                            RuntimeEventKind::CallCompletionRejected {
+                                call_id,
+                                call_kind: in_flight.call_kind,
+                                reason: CallCompletionRejectedReason::RequesterClosed,
+                            },
+                        );
+                    }
                 }
             }
-            Err(TrySendError::Full(_)) => {
+            ErasedRuntimeCallCompletion::Noop => {
                 self.push_event(
                     in_flight.requester.isolate,
                     Some(in_flight.cause),
-                    RuntimeEventKind::CallCompletionRejected {
+                    RuntimeEventKind::CallCompleted {
                         call_id,
                         call_kind: in_flight.call_kind,
-                        reason: CallCompletionRejectedReason::MailboxFull,
+                    },
+                );
+                self.push_event(
+                    in_flight.requester.isolate,
+                    Some(in_flight.cause),
+                    RuntimeEventKind::CallCompletionAction {
+                        call_id,
+                        call_kind: in_flight.call_kind,
+                        action: TerminalCompletionAction::Noop,
                     },
                 );
             }
-            Err(TrySendError::Closed(_)) => {
+            ErasedRuntimeCallCompletion::StopRequester => {
                 self.push_event(
                     in_flight.requester.isolate,
                     Some(in_flight.cause),
-                    RuntimeEventKind::CallCompletionRejected {
+                    RuntimeEventKind::CallCompleted {
                         call_id,
                         call_kind: in_flight.call_kind,
-                        reason: CallCompletionRejectedReason::RequesterClosed,
                     },
                 );
+                let action = self.push_event(
+                    in_flight.requester.isolate,
+                    Some(in_flight.cause),
+                    RuntimeEventKind::CallCompletionAction {
+                        call_id,
+                        call_kind: in_flight.call_kind,
+                        action: TerminalCompletionAction::StopRequester,
+                    },
+                );
+                self.stop_entry(entry_index, in_flight.requester.isolate, action.into());
             }
         }
     }
@@ -5994,6 +6068,17 @@ where
                 entry.id == requester.isolate && entry.generation == requester.generation
             })
             .unwrap_or_else(|| panic!("missing registered requester for timer call {call_id:?}"))
+    }
+}
+
+fn call_output_failure_reason(result: &CallOutput) -> Option<CallError> {
+    match result {
+        CallOutput::Failed(reason)
+        | CallOutput::TcpReadBufFailed { error: reason, .. }
+        | CallOutput::TcpWroteOwnedFailed { error: reason, .. }
+        | CallOutput::TlsReadBufFailed { error: reason, .. }
+        | CallOutput::TlsWroteOwnedFailed { error: reason, .. } => Some(*reason),
+        _ => None,
     }
 }
 

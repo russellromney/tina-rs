@@ -2,17 +2,20 @@
 
 ## Status
 
-- Session A plan on `main`.
+- Session B implementation complete on `codex/phase-148-native-performance`.
 - Phase 147 is merged.
 - Current truth:
   - Tina HTTP/1 has useful local perf evidence.
   - The old worker-loop sleep tax is fixed.
   - Fresh read-buffer and clone-before-write waste are fixed for migrated HTTP/1 paths.
   - Small no-metrics close responses can use terminal `TcpWriteClose`.
+  - Phase 148 records compare/process/hotpath rows in its own history.
+  - HTTP/1 coalesced buffered writes reserve head + body once.
   - HTTP/1 still shows too many observed stages.
   - Whole-process allocation rows still show Tina HTTP allocating more than Axum.
-  - Linux/x86 perf evidence is not yet recorded.
-  - `mini_saas_api` already has the best whole-service perf/soak seam.
+  - Linux/x86 perf evidence has a manual workflow but was not run locally.
+  - `mini_saas_api` has direct notify/outbound-pool soak facts and an opt-in
+    long soak command.
 
 ## Grug Truth
 

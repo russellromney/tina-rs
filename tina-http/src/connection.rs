@@ -45,13 +45,17 @@ use http::StatusCode;
 use tina::prelude::*;
 use tina::{CallContext, RequestContext, reply_to_request};
 use tina_runtime::{
-    CallError, CallOutcome, TcpReadBufReply, TcpWriteOwnedCloseReply, TcpWriteOwnedReply,
-    TlsReadBufReply, TlsWriteOwnedReply, call, sleep, tcp_close_stream, tcp_read_buf,
-    tcp_write_owned, tcp_write_owned_close, tls_close, tls_read_buf, tls_write_owned,
+    CallError, CallInput, CallOutcome, CallOutput, RuntimeCall, RuntimeCallCompletion,
+    TcpReadBufReply, TcpWriteOwnedCloseReply, TcpWriteOwnedReply, TlsReadBufReply,
+    TlsWriteOwnedReply, call, sleep, tcp_close_stream, tcp_read_buf, tcp_write_owned, tls_close,
+    tls_read_buf, tls_write_owned,
 };
 
 use crate::body_metrics::BodyMetrics;
-use crate::parse::{HttpRequestHead, ParseProgress, encode_response_head, parse_request_head};
+use crate::parse::{
+    HttpRequestHead, ParseProgress, encode_response_head, encode_response_head_with_extra_capacity,
+    parse_request_head,
+};
 use crate::streaming::{
     RequestChunkReply, RequestStream, ResponseChunkMsg, ResponseChunkReply, ResponseStream,
 };
@@ -1163,14 +1167,24 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
         // gone on the wire yet, making `current` lie.
         let connection_close =
             !matches!(response.body, HttpResponseBody::WebSocket(_)) && self.will_close;
-        let head_bytes = encode_response_head(&response, connection_close);
+        let coalesced_body_len = match &response.body {
+            HttpResponseBody::Buffered(body_bytes)
+                if self.metrics.is_none()
+                    && body_bytes.len() <= COALESCE_BUFFERED_RESPONSE_BODY_LIMIT =>
+            {
+                Some(body_bytes.len())
+            }
+            _ => None,
+        };
+        let head_bytes = if let Some(body_len) = coalesced_body_len {
+            encode_response_head_with_extra_capacity(&response, connection_close, body_len)
+        } else {
+            encode_response_head(&response, connection_close)
+        };
         match response.body {
             HttpResponseBody::Buffered(body_bytes) => {
-                let can_coalesce = self.metrics.is_none()
-                    && body_bytes.len() <= COALESCE_BUFFERED_RESPONSE_BODY_LIMIT;
-                if can_coalesce {
+                if coalesced_body_len.is_some() {
                     self.pending_response = head_bytes;
-                    self.pending_response.reserve_exact(body_bytes.len());
                     self.pending_response.extend_from_slice(&body_bytes);
                 } else if !body_bytes.is_empty() {
                     self.pending_response = head_bytes;
@@ -1240,8 +1254,21 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
     fn write_pending_close(&mut self) -> Effect<Self> {
         let bytes = std::mem::take(&mut self.pending_response);
         match self.transport {
-            HttpTransport::Tcp(stream) => tcp_write_owned_close(stream, bytes)
-                .then(|result| HttpConnectionMsg::WroteClose(result.map_err(|error| error.error))),
+            HttpTransport::Tcp(stream) => Effect::Call(RuntimeCall::new_with_completion(
+                CallInput::TcpWriteOwnedClose { stream, bytes },
+                |output| match output {
+                    CallOutput::TcpWroteOwnedClose {
+                        bytes,
+                        count,
+                        closed,
+                    } if count >= bytes.len() && closed => RuntimeCallCompletion::StopRequester,
+                    other => RuntimeCallCompletion::Message(HttpConnectionMsg::WroteClose(
+                        other
+                            .into_tcp_wrote_owned_close()
+                            .map_err(|error| error.error),
+                    )),
+                },
+            )),
             HttpTransport::Tls(_) => {
                 self.pending_response = bytes;
                 self.write_pending()

@@ -425,11 +425,19 @@ fn saved_seed_interleaving_fingerprint_is_stable() {
     const SAVED_SEED: u64 = 0xBEEF_C0DE;
     /// Pinned trace fingerprint for `SAVED_SEED` + the config below.
     /// Bump only after reviewing why the trace shape changed.
-    /// Last update: small no-metrics close responses use the terminal
-    /// `TcpWriteClose` rail instead of `TcpWrite` + separate close.
-    const EXPECTED_HASH: u64 = 13_325_941_435_510_494_120;
+    /// Last update: the terminal close-after-write completion now uses the
+    /// `StopRequester` action, so each `Connection: close` path records a
+    /// `CallCompletionAction` + ordinary `IsolateStopped` instead of
+    /// delivering a close-completion message the connection isolate then
+    /// processes in a separate handler turn. Both peers close, so len drops
+    /// by the two removed close-handling turns and gains two
+    /// `CallCompletionAction` facts (85 -> 81). Completion, terminal-action,
+    /// and stop facts are all still recorded; the terminal-action semantics
+    /// are proven directly by `runtime_terminal_completion_action` and
+    /// `timer_semantics`.
+    const EXPECTED_HASH: u64 = 3_203_362_481_028_129_978;
     /// Pinned trace event count for `SAVED_SEED` + the config below.
-    const EXPECTED_LEN: usize = 85;
+    const EXPECTED_LEN: usize = 81;
 
     let bind: SocketAddr = "127.0.0.1:9007".parse().unwrap();
     let peer_a: SocketAddr = "10.0.0.1:55008".parse().unwrap();

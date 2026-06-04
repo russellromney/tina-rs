@@ -1000,6 +1000,12 @@ struct Controller {
     scope_metrics: ScopeSetMetrics,
     /// Monotonic key for scope-set entries.
     next_scope_id: u64,
+    /// Direct notify/outbound facts for soak proof. Pressure counters can be
+    /// zero in a healthy serial run; these say the pool lane actually ran.
+    notify_attempted: u64,
+    outbound_acquired: u64,
+    outbound_released: u64,
+    outbound_retired: u64,
 }
 
 impl Controller {
@@ -1029,6 +1035,10 @@ impl Controller {
             scope_child_cap,
             scope_metrics,
             next_scope_id: 1,
+            notify_attempted: 0,
+            outbound_acquired: 0,
+            outbound_released: 0,
+            outbound_retired: 0,
         }
     }
 
@@ -1232,6 +1242,7 @@ impl Isolate for Controller {
                     CallOutcome::Replied(WorkerPoolReply::Acquire(AcquireOutcome::Acquired(
                         lease,
                     ))) => {
+                        self.outbound_acquired += 1;
                         let body = if slow {
                             format!("id={id}&name={name}&slow=true")
                         } else {
@@ -1281,6 +1292,15 @@ impl Isolate for Controller {
             }
             ControllerMsg::NotifyReleased(req, scope_id, ok, release) => {
                 self.retire_scope(scope_id);
+                match &release {
+                    CallOutcome::Replied(WorkerPoolReply::Release(ReleaseOutcome::Released)) => {
+                        self.outbound_released += 1;
+                    }
+                    CallOutcome::Replied(WorkerPoolReply::Release(ReleaseOutcome::Retired)) => {
+                        self.outbound_retired += 1;
+                    }
+                    _ => {}
+                }
                 match release {
                     CallOutcome::Replied(WorkerPoolReply::Release(ReleaseOutcome::Released))
                         if ok =>
@@ -1312,6 +1332,10 @@ impl Isolate for Controller {
                             self.drain.stage(),
                             self.body_cap,
                             self.controller_mailbox,
+                            self.notify_attempted,
+                            self.outbound_acquired,
+                            self.outbound_released,
+                            self.outbound_retired,
                         ),
                     ),
                 )
@@ -1432,6 +1456,7 @@ impl Controller {
                         "request_scopes_full\n",
                     ));
                 }
+                self.notify_attempted += 1;
                 self.scope_metrics.observe_in_use(self.notify_scopes.len());
                 call.defer(send_request(
                     self.db,
@@ -1566,6 +1591,10 @@ fn capacity_body(
     drain_stage: DrainStage,
     body_cap: usize,
     controller_mailbox: usize,
+    notify_attempted: u64,
+    outbound_acquired: u64,
+    outbound_released: u64,
+    outbound_retired: u64,
 ) -> String {
     let stage = drain_stage_label(drain_stage);
     format!(
@@ -1574,6 +1603,8 @@ fn capacity_body(
          http.response_body_high_water={} http.body_full={} http.body_timeout={} \
          http.body_io_error={} \
          controller.mailbox={controller_mailbox} drain.stage={stage} \
+         notify.attempted={notify_attempted} outbound.acquired={outbound_acquired} \
+         outbound.released={outbound_released} outbound.retired={outbound_retired} \
          db.capacity={} db.waiters={} db.max_waiters={} db.in_flight={} db.high_water={} \
          db.full={} db.closed={} db.timeout={} outbound.capacity={} outbound.waiters={} \
          outbound.max_waiters={} outbound.in_flight={} outbound.high_water_waiters={} \

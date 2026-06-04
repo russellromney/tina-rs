@@ -188,3 +188,80 @@ zero.
 
 Current verdict: keep the evidence, keep optimizing, do not make a production
 performance claim yet.
+
+## Phase 148 performance rows
+
+Phase 148 moves the append-only perf history to
+`.intent/phases/148-native-performance-linux-turn-soak/perf_history.jsonl`.
+`scripts/perf_record.sh` now records three row families:
+
+- `perf-compare` rows: Tina-vs-baseline p50/p90/p99 and allocation counts.
+- `perf-process` rows: whole-process allocation count, allocated bytes, and
+  RSS delta for HTTP rows.
+- `hotpath` rows: p50, stage count, host allocations, and process allocations.
+
+Run and append local rows:
+
+```sh
+make perf-record
+```
+
+Check the current run against matching platform/arch/profile history:
+
+```sh
+make perf-check
+```
+
+Linux/x86 evidence is opt-in and manual for now. Maintainers can run the
+manual GitHub workflow named `perf` on Ubuntu, or run `make perf-record` on a
+Linux/x86_64 machine and keep the resulting JSONL rows with the review.
+
+Phase 148 also removes one small HTTP/1 allocation source: coalesced buffered
+responses reserve head + body capacity once instead of encoding the head and
+then growing the buffer when the body is appended. This is a real cleanup, not
+a production-speed claim. HTTP close/keepalive still spend many runtime turns,
+and Linux rows still need repeated evidence.
+
+## Phase 149 structural rows
+
+Phase 149 keeps the same humility but measures sharper things:
+
+- hotpath rows now print `event_stage_count`, `handler_turn_count`,
+  `runtime_call_count`, `service_call_count`, `completion_count`, and
+  `rejected_completion_count`;
+- compare rows now include warmed keepalive steady-state workloads:
+  `http1_keepalive_steady_state_small` and
+  `http1_keepalive_steady_state_fixed`;
+- HTTP/1 close-after-write can use a runtime terminal completion action,
+  removing the `WroteClose` handler turn only when the TCP rail reports a full
+  successful write and close.
+
+Local macOS/aarch64 sample from the Phase 149 branch:
+
+| row | Tina p50 | Axum p50 | note |
+| --- | --- | --- | --- |
+| `http1_close_request` | 0.84 ms | 0.56 ms | includes connect/accept; Tina p90 still much worse |
+| `http1_keepalive_sequential` | 1.98 ms | 1.98 ms | four requests per op; Tina p90 still about 2x |
+| `http1_fixed_body_close` | 0.80 ms | 0.72 ms | includes connect/accept; Tina p90 still much worse |
+| `http1_keepalive_steady_state_small` | 0.36 ms | 0.39 ms | warmed stream; Tina p90 still much worse |
+| `http1_keepalive_steady_state_fixed` | 0.37 ms | 0.42 ms | warmed stream; Tina p90 still much worse |
+
+Hotpath stage truth from the same branch:
+
+| row | stages | handler turns | runtime calls | service calls |
+| --- | ---: | ---: | ---: | ---: |
+| `hotpath_http1_close_request` | 26 | 4 | 3 | 1 |
+| `hotpath_http1_fixed_body_close` | 26 | 4 | 3 | 1 |
+| `hotpath_http1_keepalive_steady_state_small` | 16 | 3 | 1 | 1 |
+
+Current verdict:
+
+- the terminal close path is a real structural win for close-after-body rows;
+- steady-state rows make the remaining request cost easier to see;
+- Tina HTTP/1 p50 is now in the same neighborhood as the Axum comparison on
+  these local rows;
+- Tina HTTP/1 tail latency is still poor/noisy enough that this is not a
+  production performance claim;
+- process allocation rows are better than before but still not production
+  proof;
+- Linux/x86 rows still need repeated evidence before public performance claims.

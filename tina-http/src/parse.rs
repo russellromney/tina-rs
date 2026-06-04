@@ -381,6 +381,16 @@ pub fn encode_response_head(
     response: &crate::types::HttpResponse,
     connection_close: bool,
 ) -> Vec<u8> {
+    encode_response_head_with_extra_capacity(response, connection_close, 0)
+}
+
+/// Serialises a response head and reserves extra trailing capacity for callers
+/// that will immediately append buffered body bytes.
+pub(crate) fn encode_response_head_with_extra_capacity(
+    response: &crate::types::HttpResponse,
+    connection_close: bool,
+    extra_capacity: usize,
+) -> Vec<u8> {
     let version_str = match response.version {
         Version::HTTP_10 => "HTTP/1.0",
         Version::HTTP_11 => "HTTP/1.1",
@@ -388,12 +398,10 @@ pub fn encode_response_head(
     };
     let status = response.status;
     let reason = status.canonical_reason().unwrap_or("");
-    let mut out = Vec::with_capacity(response_head_capacity(
-        response,
-        connection_close,
-        version_str,
-        reason,
-    ));
+    let capacity = response_head_capacity(response, connection_close, version_str, reason)
+        .checked_add(extra_capacity)
+        .expect("HTTP response head capacity overflow");
+    let mut out = Vec::with_capacity(capacity);
     out.extend_from_slice(version_str.as_bytes());
     out.extend_from_slice(b" ");
     out.extend_from_slice(status.as_str().as_bytes());
@@ -450,10 +458,14 @@ pub fn encode_response_head(
 /// Panics if the response body is a streaming source — streamed
 /// responses use the head encoder and write chunks separately.
 pub fn encode_response(response: &crate::types::HttpResponse, connection_close: bool) -> Vec<u8> {
-    let mut out = encode_response_head(response, connection_close);
+    let extra_capacity = match &response.body {
+        crate::types::HttpResponseBody::Buffered(bytes) => bytes.len(),
+        _ => 0,
+    };
+    let mut out =
+        encode_response_head_with_extra_capacity(response, connection_close, extra_capacity);
     match &response.body {
         crate::types::HttpResponseBody::Buffered(bytes) => {
-            out.reserve_exact(bytes.len());
             out.extend_from_slice(bytes);
         }
         crate::types::HttpResponseBody::Stream(_)

@@ -4,6 +4,48 @@ This file records completed work.
 
 ## Unreleased
 
+### Structural HTTP/Runtime Performance
+
+- Moved perf history defaults to Phase 149 and added hotpath counters that
+  separate trace-event stages from handler turns, backend calls, service calls,
+  successful completions, and rejected completions.
+- Added steady-state HTTP/1 keepalive comparison and hotpath rows that reuse
+  warmed connections, so request cost after session setup is visible beside
+  connect/accept rows.
+- Added a narrow runtime terminal completion action for backend calls:
+  `Message`, `StopRequester`, and `Noop`. Native HTTP/1 uses it for successful
+  full TCP write-close completions, removing the extra `WroteClose` handler
+  turn while preserving partial-write and failure paths.
+- Added trace and pressure vocabulary for terminal completion actions and
+  terminal-action-on-failure rejection, with live and simulator delivery paths
+  preserving failure truth.
+- Extended `perf_native` rows to include steady-state keepalive small/fixed
+  HTTP/1 comparisons against Axum/hyper. Local macOS/aarch64 evidence remains
+  alpha evidence, not a production performance claim.
+
+### Native Performance Rows And Soak Truth
+
+- Moved perf history to Phase 148 and taught `perf_record.sh` /
+  `perf_check.sh` to record and compare `hotpath` rows, including
+  `stage_count` and process allocations. The checker still uses loose,
+  matching platform/arch/profile gates; ordinary verify does not fail on
+  shared-machine p50 wobble.
+- Added a manual Ubuntu `perf` workflow that runs `make perf-record` and
+  uploads the Phase 148 JSONL evidence, so Linux/x86 rows can be collected
+  without making normal CI performance-sensitive.
+- Presized coalesced HTTP/1 buffered response writes so the connection reserves
+  head + body capacity once instead of growing the buffer after encoding the
+  head. Wire behavior and body-pressure accounting are unchanged.
+- Tightened native hotpath proof with named HTTP stage-count ceilings and
+  process-allocation evidence for every hotpath row.
+- Strengthened `mini_saas_api` soak proof with direct notify/outbound-pool
+  activity fields (`notify.attempted`, `outbound.acquired`,
+  `outbound.released`, `outbound.retired`) instead of inferring pool coverage
+  from generic pressure or errors.
+- Added `make proof-long-soak`, an ignored opt-in long soak for
+  `mini_saas_api` that defaults to 10 minutes and supports
+  `TINA_LONG_SOAK_SECONDS=3600` for one-hour runs.
+
 ### HTTP Hot-Path Evidence And Allocation Cleanup
 
 - Added Phase 147 HTTP hotpath probes for native HTTP/1 close, keepalive, and

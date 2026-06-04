@@ -77,6 +77,10 @@ fn smoke_covers_service_layers() {
     assert_eq!(capacity["http.body_io_error"], "0");
     assert_eq!(capacity["controller.mailbox"], "2");
     assert_eq!(capacity["drain.stage"], "open");
+    assert_at_least(&capacity, "notify.attempted", 3);
+    assert_at_least(&capacity, "outbound.acquired", 3);
+    assert_at_least(&capacity, "outbound.released", 3);
+    assert_eq!(capacity["outbound.retired"], "0");
     assert_eq!(capacity["db.capacity"], "1");
     assert_eq!(capacity["db.waiters"], "0");
     assert_eq!(capacity["db.max_waiters"], "0");
@@ -349,6 +353,9 @@ fn pressure_covers_outbound_pool_full() {
     );
 
     let capacity = capacity_fields(&report.capacity_before_shutdown_line);
+    assert_at_least(&capacity, "notify.attempted", 2);
+    assert_at_least(&capacity, "outbound.acquired", 1);
+    assert_at_least(&capacity, "outbound.released", 1);
     assert_eq!(capacity["outbound.full"], "1");
     assert_eq!(capacity["outbound.capacity"], "1");
     assert_eq!(capacity["outbound.max_waiters"], "0");

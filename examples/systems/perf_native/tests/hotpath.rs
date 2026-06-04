@@ -26,13 +26,14 @@ use std::time::{Duration, Instant};
 
 use perf_native::count_all_allocations;
 use tina::prelude::*;
+use tina::IsolateId;
 use tina_http::{
     HttpListener, HttpListenerMsg, HttpRequest, HttpResponse, HttpServerConfig, StatusCode,
 };
-use tina_proof_harness::{HotPathReport, HotPathStage};
+use tina_proof_harness::{HotPathCounters, HotPathReport, HotPathStage};
 use tina_runtime::{
-    CallOutcome, DefaultThreadedMailboxFactory, RuntimeEvent, RuntimeEventKind, ThreadedRuntime,
-    ThreadedRuntimeConfig, TraceObserver,
+    CallKind, CallOutcome, DefaultThreadedMailboxFactory, RuntimeEvent, RuntimeEventKind,
+    ThreadedRuntime, ThreadedRuntimeConfig, TraceObserver,
 };
 
 const CAP: usize = 512;
@@ -69,6 +70,12 @@ const CALL_PROCESS_ALLOCATIONS_CEILING: u64 = 10;
 const HTTP_HOTPATH_ITERS: usize = 32;
 const HTTP_HOTPATH_WARMUP: usize = 4;
 const HTTP_FIXED_BODY_BYTES: usize = 4096;
+// HTTP stage ceilings are intentionally loose. They catch a bad turn-count
+// regression while leaving timing and trace noise to perf history.
+const HTTP_CLOSE_STAGE_CEILING: usize = 48;
+const HTTP_KEEPALIVE_STAGE_CEILING: usize = 120;
+const HTTP_FIXED_BODY_STAGE_CEILING: usize = 48;
+const HTTP_STEADY_STAGE_CEILING: usize = 36;
 
 type Runtime = ThreadedRuntime<SingleShard, DefaultThreadedMailboxFactory>;
 
@@ -157,7 +164,7 @@ impl BodyService {
 /// worker is idle.
 #[derive(Default)]
 struct StageTimer {
-    events: Mutex<Vec<(&'static str, Instant)>>,
+    events: Mutex<Vec<TraceSample>>,
 }
 
 impl StageTimer {
@@ -165,18 +172,34 @@ impl StageTimer {
         self.events.lock().expect("stage timer lock").clear();
     }
 
-    fn snapshot(&self) -> Vec<(&'static str, Instant)> {
+    fn snapshot(&self) -> Vec<TraceSample> {
         self.events.lock().expect("stage timer lock").clone()
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TraceSample {
+    label: &'static str,
+    isolate: IsolateId,
+    kind: RuntimeEventKind,
+    at: Instant,
+}
+
+#[derive(Debug, Clone)]
+struct HotPathBreakdown {
+    stages: Vec<HotPathStage>,
+    counters: HotPathCounters,
 }
 
 impl TraceObserver for StageTimer {
     fn on_event(&self, event: &RuntimeEvent) {
         let label = kind_label(event.kind());
-        self.events
-            .lock()
-            .expect("stage timer lock")
-            .push((label, Instant::now()));
+        self.events.lock().expect("stage timer lock").push(TraceSample {
+            label,
+            isolate: event.isolate(),
+            kind: event.kind(),
+            at: Instant::now(),
+        });
     }
 }
 
@@ -194,6 +217,7 @@ fn kind_label(kind: RuntimeEventKind) -> &'static str {
         RuntimeEventKind::CallDispatchAttempted { .. } => "call_attempted",
         RuntimeEventKind::CallCompleted { .. } => "call_completed",
         RuntimeEventKind::CallFailed { .. } => "call_failed",
+        RuntimeEventKind::CallCompletionAction { .. } => "call_completion_action",
         RuntimeEventKind::CallCompletionRejected { .. } => "call_completion_rejected",
         RuntimeEventKind::CallReplyRejected { .. } => "call_reply_rejected",
         RuntimeEventKind::CallReplyAbandoned { .. } => "call_reply_abandoned",
@@ -259,17 +283,36 @@ fn wait_count(count: &AtomicU64, target: u64) {
 /// suffix so two inter-turn gaps stay distinct in the report.
 fn stages_from_timeline(
     t0: Instant,
-    events: &[(&'static str, Instant)],
+    events: &[TraceSample],
     t_end: Instant,
-) -> Vec<HotPathStage> {
+) -> HotPathBreakdown {
+    stages_from_filtered_timeline(t0, events, t_end, |_| true)
+}
+
+fn stages_from_filtered_timeline<F>(
+    t0: Instant,
+    events: &[TraceSample],
+    t_end: Instant,
+    mut include: F,
+) -> HotPathBreakdown
+where
+    F: FnMut(TraceSample) -> bool,
+{
     let mut stages = Vec::new();
     let mut counts: HashMap<String, u32> = HashMap::new();
     let mut prev_label = "host_submit";
     let mut prev_at = t0;
-    for &(label, at) in events {
+    let mut counters = HotPathCounters::default();
+    for sample in events.iter().copied() {
+        if !include(sample) {
+            continue;
+        }
+        let label = sample.label;
+        let at = sample.at;
         if at > t_end {
             continue;
         }
+        count_event(sample.kind, &mut counters);
         let nanos = at.saturating_duration_since(prev_at).as_nanos() as u64;
         push_stage(
             &mut stages,
@@ -287,7 +330,54 @@ fn stages_from_timeline(
         format!("{prev_label}__to__host_unblocked"),
         tail,
     );
-    stages
+    counters.event_stage_count = stages.len();
+    HotPathBreakdown { stages, counters }
+}
+
+fn dominant_connection_isolate(
+    events: &[TraceSample],
+    t0: Instant,
+    t_end: Instant,
+    service: IsolateId,
+) -> Option<IsolateId> {
+    let mut counts: HashMap<IsolateId, usize> = HashMap::new();
+    for sample in events.iter().copied() {
+        if sample.at < t0 || sample.at > t_end || sample.isolate == service {
+            continue;
+        }
+        *counts.entry(sample.isolate).or_insert(0) += 1;
+    }
+    counts.into_iter().max_by_key(|(_isolate, count)| *count).map(|(isolate, _)| isolate)
+}
+
+fn stages_from_http_timeline(
+    t0: Instant,
+    events: &[TraceSample],
+    t_end: Instant,
+    service: IsolateId,
+) -> HotPathBreakdown {
+    let Some(connection) = dominant_connection_isolate(events, t0, t_end, service) else {
+        return stages_from_timeline(t0, events, t_end);
+    };
+    stages_from_filtered_timeline(t0, events, t_end, |sample| {
+        sample.isolate == connection || sample.isolate == service
+    })
+}
+
+fn count_event(kind: RuntimeEventKind, counters: &mut HotPathCounters) {
+    match kind {
+        RuntimeEventKind::HandlerStarted => counters.handler_turn_count += 1,
+        RuntimeEventKind::CallDispatchAttempted {
+            call_kind: CallKind::IsolateCall,
+            ..
+        } => counters.service_call_count += 1,
+        RuntimeEventKind::CallDispatchAttempted { .. } => counters.runtime_call_count += 1,
+        RuntimeEventKind::CallCompleted { .. } => counters.completion_count += 1,
+        RuntimeEventKind::CallCompletionRejected { .. } => {
+            counters.rejected_completion_count += 1;
+        }
+        _ => {}
+    }
 }
 
 fn push_stage(
@@ -359,17 +449,18 @@ fn probe_send_and_observe() -> HotPathReport {
         count_all_allocations(|| runtime.send_and_observe(addr, CounterMsg::Hit));
     shutdown(runtime);
 
-    let stages = instrumented_send_and_observe();
-    HotPathReport::from_samples_with_process_allocations(
+    let breakdown = instrumented_send_and_observe();
+    HotPathReport::from_samples_with_counters(
         "hotpath_send_and_observe",
         totals,
-        stages,
+        breakdown.stages,
         Some(host_allocations),
         Some(process_allocations),
+        breakdown.counters,
     )
 }
 
-fn instrumented_send_and_observe() -> Vec<HotPathStage> {
+fn instrumented_send_and_observe() -> HotPathBreakdown {
     let timer = Arc::new(StageTimer::default());
     let runtime = new_runtime(Some(timer.clone()));
     let count = Arc::new(AtomicU64::new(0));
@@ -424,17 +515,18 @@ fn probe_call_blocking() -> HotPathReport {
         count_all_allocations(|| runtime.call_blocking(ping, PingMsg::Ping, CALL_TIMEOUT));
     shutdown(runtime);
 
-    let stages = instrumented_call_blocking();
-    HotPathReport::from_samples_with_process_allocations(
+    let breakdown = instrumented_call_blocking();
+    HotPathReport::from_samples_with_counters(
         "hotpath_call_blocking",
         totals,
-        stages,
+        breakdown.stages,
         Some(host_allocations),
         Some(process_allocations),
+        breakdown.counters,
     )
 }
 
-fn instrumented_call_blocking() -> Vec<HotPathStage> {
+fn instrumented_call_blocking() -> HotPathBreakdown {
     let timer = Arc::new(StageTimer::default());
     let runtime = new_runtime(Some(timer.clone()));
     let ping = runtime
@@ -490,6 +582,33 @@ fn probe_http1_fixed_body() -> HotPathReport {
     )
 }
 
+fn probe_http1_keepalive_steady_state() -> HotPathReport {
+    let body = small_body();
+    let (runtime, addr, _service) = start_http_runtime(None, body.clone(), true);
+    for _ in 0..HTTP_HOTPATH_WARMUP {
+        http_get_reused(addr, 2, body.len()).expect("warm steady-state http request");
+    }
+    let mut totals = Vec::with_capacity(HTTP_HOTPATH_ITERS);
+    for _ in 0..HTTP_HOTPATH_ITERS {
+        let t0 = Instant::now();
+        http_get_reused(addr, 1, body.len()).expect("steady-state http hotpath op");
+        totals.push(t0.elapsed().as_nanos() as u64);
+    }
+    let (_outcome, host_allocations, process_allocations) =
+        count_all_allocations(|| http_get_reused(addr, 1, body.len()));
+    shutdown(runtime);
+
+    let breakdown = instrumented_http1_steady_state(body);
+    HotPathReport::from_samples_with_counters(
+        "hotpath_http1_keepalive_steady_state_small",
+        totals,
+        breakdown.stages,
+        Some(host_allocations),
+        Some(process_allocations),
+        breakdown.counters,
+    )
+}
+
 fn probe_http1(
     label: &'static str,
     body: Vec<u8>,
@@ -497,7 +616,7 @@ fn probe_http1(
     requests_per_op: usize,
     expected_body_len: usize,
 ) -> HotPathReport {
-    let (runtime, addr) = start_http_runtime(None, body.clone(), keepalive);
+    let (runtime, addr, _service) = start_http_runtime(None, body.clone(), keepalive);
     for _ in 0..HTTP_HOTPATH_WARMUP {
         http_get(addr, keepalive, requests_per_op, expected_body_len).expect("warm http request");
     }
@@ -512,13 +631,14 @@ fn probe_http1(
     });
     shutdown(runtime);
 
-    let stages = instrumented_http1(body, keepalive, requests_per_op, expected_body_len);
-    HotPathReport::from_samples_with_process_allocations(
+    let breakdown = instrumented_http1(body, keepalive, requests_per_op, expected_body_len);
+    HotPathReport::from_samples_with_counters(
         label,
         totals,
-        stages,
+        breakdown.stages,
         Some(host_allocations),
         Some(process_allocations),
+        breakdown.counters,
     )
 }
 
@@ -527,9 +647,9 @@ fn instrumented_http1(
     keepalive: bool,
     requests_per_op: usize,
     expected_body_len: usize,
-) -> Vec<HotPathStage> {
+) -> HotPathBreakdown {
     let timer = Arc::new(StageTimer::default());
-    let (runtime, addr) = start_http_runtime(Some(timer.clone()), body, keepalive);
+    let (runtime, addr, service) = start_http_runtime(Some(timer.clone()), body, keepalive);
     http_get(addr, keepalive, requests_per_op, expected_body_len).expect("warm http request");
     // The warm request returns to the std client before the connection isolate
     // necessarily processes every close/tail trace event. Drain that tail so
@@ -542,14 +662,37 @@ fn instrumented_http1(
     let t_end = Instant::now();
     let events = timer.snapshot();
     shutdown(runtime);
-    stages_from_timeline(t0, &events, t_end)
+    stages_from_http_timeline(t0, &events, t_end, service)
+}
+
+fn instrumented_http1_steady_state(body: Vec<u8>) -> HotPathBreakdown {
+    let expected_body_len = body.len();
+    let timer = Arc::new(StageTimer::default());
+    let (runtime, addr, service) = start_http_runtime(Some(timer.clone()), body, true);
+    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(2))
+        .expect("connect steady-state instrumented");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .expect("set read timeout");
+    http_get_on_stream(&mut stream, false, expected_body_len).expect("warm steady-state request");
+    std::thread::sleep(Duration::from_millis(20));
+    let _ = runtime.has_in_flight_calls();
+    timer.clear();
+    let t0 = Instant::now();
+    http_get_on_stream(&mut stream, false, expected_body_len).expect("instrumented steady-state");
+    let t_end = Instant::now();
+    let events = timer.snapshot();
+    let _ = http_get_on_stream(&mut stream, true, expected_body_len);
+    drop(stream);
+    shutdown(runtime);
+    stages_from_http_timeline(t0, &events, t_end, service)
 }
 
 fn start_http_runtime(
     observer: Option<Arc<dyn TraceObserver>>,
     body: Vec<u8>,
     keepalive: bool,
-) -> (Runtime, SocketAddr) {
+) -> (Runtime, SocketAddr, IsolateId) {
     let runtime = new_runtime(observer);
     let service = runtime
         .register_with_capacity::<_, Infallible>(
@@ -574,7 +717,7 @@ fn start_http_runtime(
         .try_send(listener, HttpListenerMsg::Start)
         .expect("start http listener");
     let addr = bound.wait(Duration::from_secs(2)).expect("observe bound");
-    (runtime, addr)
+    (runtime, addr, service.isolate())
 }
 
 fn small_body() -> Vec<u8> {
@@ -603,6 +746,34 @@ fn http_get(
         read_one_response(&mut stream, expected_body_len)?;
     }
     Ok(())
+}
+
+fn http_get_reused(
+    addr: SocketAddr,
+    requests: usize,
+    expected_body_len: usize,
+) -> anyhow::Result<()> {
+    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(2))?;
+    stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+    for index in 0..requests {
+        http_get_on_stream(&mut stream, index + 1 == requests, expected_body_len)?;
+    }
+    Ok(())
+}
+
+fn http_get_on_stream(
+    stream: &mut TcpStream,
+    close: bool,
+    expected_body_len: usize,
+) -> anyhow::Result<()> {
+    let request = if close {
+        b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n".as_slice()
+    } else {
+        b"GET / HTTP/1.1\r\nHost: x\r\nConnection: keep-alive\r\n\r\n".as_slice()
+    };
+    stream.write_all(request)?;
+    stream.flush()?;
+    read_one_response(stream, expected_body_len)
 }
 
 fn read_one_response(stream: &mut TcpStream, expected_body_len: usize) -> anyhow::Result<()> {
@@ -655,6 +826,16 @@ fn parse_content_length(head: &str) -> anyhow::Result<usize> {
     anyhow::bail!("missing content-length")
 }
 
+fn assert_stage_count(report: &HotPathReport, ceiling: usize) {
+    assert!(
+        report.stages.len() <= ceiling,
+        "{} stage_count={} ceiling={ceiling} stages={:?}",
+        report.label,
+        report.stages.len(),
+        report.stages
+    );
+}
+
 #[test]
 fn hotpath_probes_report_and_stay_bounded() {
     let try_send = probe_try_send();
@@ -663,6 +844,7 @@ fn hotpath_probes_report_and_stay_bounded() {
     let http_close = probe_http1_close();
     let http_keepalive = probe_http1_keepalive();
     let http_fixed_body = probe_http1_fixed_body();
+    let http_steady = probe_http1_keepalive_steady_state();
 
     for report in [
         &try_send,
@@ -671,6 +853,7 @@ fn hotpath_probes_report_and_stay_bounded() {
         &http_close,
         &http_keepalive,
         &http_fixed_body,
+        &http_steady,
     ] {
         println!("{}", report.summary_line());
         println!("{}", report.json_line());
@@ -687,7 +870,35 @@ fn hotpath_probes_report_and_stay_bounded() {
             report.allocations.is_some(),
             "host allocation evidence present"
         );
+        assert!(
+            report.process_allocations.is_some(),
+            "process allocation evidence present for {}",
+            report.label
+        );
+        assert_eq!(
+            report.counters.event_stage_count,
+            report.stages.len(),
+            "event_stage_count mirrors stage_count for {}",
+            report.label
+        );
     }
+
+    assert_stage_count(&http_close, HTTP_CLOSE_STAGE_CEILING);
+    assert_stage_count(&http_keepalive, HTTP_KEEPALIVE_STAGE_CEILING);
+    assert_stage_count(&http_fixed_body, HTTP_FIXED_BODY_STAGE_CEILING);
+    assert_stage_count(&http_steady, HTTP_STEADY_STAGE_CEILING);
+    assert!(
+        http_steady.counters.handler_turn_count <= http_keepalive.counters.handler_turn_count,
+        "steady-state should not have more handler turns than connect/accept keepalive: steady={} keepalive={}",
+        http_steady.counters.handler_turn_count,
+        http_keepalive.counters.handler_turn_count
+    );
+    assert!(
+        http_steady.counters.runtime_call_count <= http_keepalive.counters.runtime_call_count,
+        "steady-state should not have more backend calls than connect/accept keepalive: steady={} keepalive={}",
+        http_steady.counters.runtime_call_count,
+        http_keepalive.counters.runtime_call_count
+    );
 
     assert!(
         try_send.min_ns < HANDOFF_CEILING_NS,

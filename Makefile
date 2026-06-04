@@ -2,7 +2,7 @@ SHELL := /bin/zsh
 EXAMPLES_TARGET_DIR ?= $(CURDIR)/target/verify-examples
 
 .PHONY: fmt fmt-check check test loom miri doc clippy portable-runtime-cost perf \
-	perf-compare verify verify-examples proof-fast proof-soak proof-bad-peer \
+	perf-compare verify verify-examples proof-fast proof-soak proof-long-soak proof-bad-peer \
 	proof-replay-regression race-surface-guard rail-inventory-guard
 
 fmt:
@@ -110,6 +110,11 @@ proof-fast:
 proof-soak:
 	cargo test --manifest-path examples/systems/mini_saas_api/Cargo.toml --test soak -- --nocapture
 	TINA_PROTOCOL_SOAK_ITERS=500 cargo test -p tina-proof-harness --test protocol_regression protocol_chaos_soak -- --nocapture
+
+# Opt-in long soak. Not a normal PR gate. Default is 10 minutes; set
+# TINA_LONG_SOAK_SECONDS=3600 for the one-hour run.
+proof-long-soak:
+	cargo test --manifest-path examples/systems/mini_saas_api/Cargo.toml --test long_soak -- --ignored --nocapture
 
 # Local bad-peer: the in-crate proof tests plus the realtime_rooms
 # bad-peer scenarios with `--nocapture` so the typed BadPeerOutcome and

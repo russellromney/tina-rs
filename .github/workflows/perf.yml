@@ -1,0 +1,29 @@
+name: perf
+
+on:
+  workflow_dispatch:
+
+jobs:
+  linux-release-rows:
+    name: native perf rows (ubuntu-latest)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install zsh
+        run: sudo apt-get update && sudo apt-get install -y zsh
+
+      - name: Install Rust nightly
+        run: rustup toolchain install nightly --profile minimal
+
+      - name: Record perf rows
+        run: make perf-record
+
+      - name: Print perf rows
+        run: cat .intent/phases/148-native-performance-linux-turn-soak/perf_history.jsonl
+
+      - name: Upload perf history
+        uses: actions/upload-artifact@v4
+        with:
+          name: tina-perf-linux-x86_64-jsonl
+          path: .intent/phases/148-native-performance-linux-turn-soak/perf_history.jsonl

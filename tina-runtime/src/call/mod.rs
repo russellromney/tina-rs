@@ -198,7 +198,7 @@ impl<M> RuntimeCallable for RuntimeCall<M> {}
 enum RuntimeCallKind<M> {
     Backend {
         request: CallInput,
-        translator: Box<dyn FnOnce(CallOutput) -> M>,
+        translator: Box<dyn FnOnce(CallOutput) -> RuntimeCallCompletion<M>>,
     },
     ObservedSend {
         target_shard: ShardId,
@@ -227,6 +227,29 @@ enum RuntimeCallKind<M> {
     },
 }
 
+/// What a backend runtime call should do when it completes.
+///
+/// Most calls produce an ordinary later-turn message. Terminal protocol code
+/// may use the narrower actions to avoid a handler turn when no user policy
+/// boundary is crossed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeCallCompletion<M> {
+    /// Deliver the message to the requesting isolate, which is the ordinary
+    /// Tina completion path.
+    Message(M),
+    /// Stop the requesting isolate after a successful backend completion.
+    StopRequester,
+    /// Record the successful backend completion and enqueue no message.
+    Noop,
+}
+
+#[doc(hidden)]
+pub enum ErasedRuntimeCallCompletion {
+    Message(Box<dyn Any>),
+    StopRequester,
+    Noop,
+}
+
 impl<M> RuntimeCall<M> {
     /// Creates a new runtime-owned call request.
     ///
@@ -238,6 +261,22 @@ impl<M> RuntimeCall<M> {
     pub fn new<F>(request: CallInput, translator: F) -> Self
     where
         F: FnOnce(CallOutput) -> M + 'static,
+    {
+        Self::new_with_completion(request, move |output| {
+            RuntimeCallCompletion::Message(translator(output))
+        })
+    }
+
+    /// Creates a runtime-owned call request with a terminal completion action.
+    ///
+    /// This is deliberately narrower than "run another effect". Use
+    /// [`RuntimeCallCompletion::Message`] for normal user-visible continuations.
+    /// `StopRequester` and `Noop` are for protocol-internal terminal work after
+    /// a successful backend completion; backend failures still use the ordinary
+    /// message path so failure truth cannot disappear.
+    pub fn new_with_completion<F>(request: CallInput, translator: F) -> Self
+    where
+        F: FnOnce(CallOutput) -> RuntimeCallCompletion<M> + 'static,
     {
         Self {
             kind: RuntimeCallKind::Backend {
@@ -382,8 +421,50 @@ impl<M> RuntimeCall<M> {
         }
     }
 
-    /// Splits the call into its request and translator.
-    pub fn into_parts(self) -> (CallInput, Box<dyn FnOnce(CallOutput) -> M>) {
+    /// Splits the call into its request and message translator.
+    ///
+    /// This compatibility helper is only for ordinary message-producing
+    /// calls. Use [`Self::into_completion_parts`] when a backend or test
+    /// harness must preserve terminal completion actions.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the call is not a backend request, or when the completion
+    /// translator returns [`RuntimeCallCompletion::StopRequester`] or
+    /// [`RuntimeCallCompletion::Noop`].
+    pub fn into_parts(self) -> (CallInput, Box<dyn FnOnce(CallOutput) -> M>)
+    where
+        M: 'static,
+    {
+        let (request, translator) = self.into_completion_parts();
+        (
+            request,
+            Box::new(move |output| match translator(output) {
+                RuntimeCallCompletion::Message(message) => message,
+                RuntimeCallCompletion::StopRequester | RuntimeCallCompletion::Noop => {
+                    panic!("RuntimeCall::into_parts cannot unwrap a terminal completion action")
+                }
+            }),
+        )
+    }
+
+    /// Splits the call into its request and full completion translator.
+    ///
+    /// Runtime backends and tests that can see terminal actions should prefer
+    /// this over [`Self::into_parts`]. It preserves
+    /// [`RuntimeCallCompletion::StopRequester`] and
+    /// [`RuntimeCallCompletion::Noop`] instead of forcing them through the
+    /// ordinary message path.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the call is not a backend request.
+    pub fn into_completion_parts(
+        self,
+    ) -> (
+        CallInput,
+        Box<dyn FnOnce(CallOutput) -> RuntimeCallCompletion<M>>,
+    ) {
         match self.kind {
             RuntimeCallKind::Backend {
                 request,
@@ -471,7 +552,7 @@ pub enum RuntimeCallParts<M> {
         /// Concrete backend request.
         request: CallInput,
         /// Completion translator.
-        translator: Box<dyn FnOnce(CallOutput) -> M>,
+        translator: Box<dyn FnOnce(CallOutput) -> RuntimeCallCompletion<M>>,
     },
     /// Runtime-observed send request.
     ObservedSend {
@@ -549,7 +630,7 @@ pub(crate) enum ErasedCallKind {
         /// Concrete backend request.
         request: CallInput,
         /// Completion translator erased to `Any`.
-        translator: Box<dyn FnOnce(CallOutput) -> Box<dyn Any>>,
+        translator: Box<dyn FnOnce(CallOutput) -> ErasedRuntimeCallCompletion>,
     },
     /// Runtime-observed send attempt.
     ObservedSend {
@@ -630,8 +711,14 @@ where
             } => ErasedCall {
                 kind: ErasedCallKind::Backend {
                     request,
-                    translator: Box::new(move |result| {
-                        Box::new(translator(result)) as Box<dyn Any>
+                    translator: Box::new(move |result| match translator(result) {
+                        RuntimeCallCompletion::Message(message) => {
+                            ErasedRuntimeCallCompletion::Message(Box::new(message))
+                        }
+                        RuntimeCallCompletion::StopRequester => {
+                            ErasedRuntimeCallCompletion::StopRequester
+                        }
+                        RuntimeCallCompletion::Noop => ErasedRuntimeCallCompletion::Noop,
                     }),
                 },
             },
@@ -1888,6 +1975,31 @@ pub type UnixListenerCloseReply = CallReply<()>;
 
 /// Reply delivered by [`unix_close_stream`].
 pub type UnixStreamCloseReply = CallReply<()>;
+
+#[cfg(test)]
+mod runtime_call_tests {
+    use super::*;
+
+    #[test]
+    fn into_completion_parts_preserves_terminal_completion_actions() {
+        let call: RuntimeCall<()> = RuntimeCall::new_with_completion(
+            CallInput::Sleep {
+                after: Duration::from_millis(1),
+            },
+            |output| match output {
+                CallOutput::TimerFired => RuntimeCallCompletion::Noop,
+                other => panic!("unexpected output: {other:?}"),
+            },
+        );
+
+        let (request, translator) = call.into_completion_parts();
+        assert!(matches!(request, CallInput::Sleep { .. }));
+        assert!(matches!(
+            translator(CallOutput::TimerFired),
+            RuntimeCallCompletion::Noop,
+        ));
+    }
+}
 
 #[cfg(test)]
 mod pending_cancelable_call_set_tests {
