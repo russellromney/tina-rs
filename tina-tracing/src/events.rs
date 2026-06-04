@@ -13,7 +13,7 @@ use tina::CallRejectedReason;
 use tina_runtime::{
     CallCompletionRejectedReason, CallError, CallKind, CallReplyRejectedReason,
     DeferredReplyRejectedReason, EffectKind, RestartSkippedReason, RuntimeEvent, RuntimeEventKind,
-    SendRejectedReason, SupervisionRejectedReason, TraceSnapshot,
+    SendRejectedReason, SupervisionRejectedReason, TerminalCompletionAction, TraceSnapshot,
 };
 use tracing::{Level, event};
 
@@ -426,6 +426,22 @@ pub fn emit_event(event: &RuntimeEvent) {
             call_kind = call_kind_name(call_kind),
             reason = call_completion_rejected_reason_name(reason),
         ),
+        RuntimeEventKind::CallCompletionAction {
+            call_id,
+            call_kind,
+            action,
+        } => event!(
+            target: RUNTIME_TRACE_TARGET,
+            Level::TRACE,
+            kind = "call_completion_action",
+            event_id,
+            cause_id = ?cause_id,
+            shard,
+            isolate,
+            call_id = call_id.get(),
+            call_kind = call_kind_name(call_kind),
+            action = terminal_completion_action_name(action),
+        ),
         RuntimeEventKind::CallReplyRejected { call_id, reason } => event!(
             target: RUNTIME_TRACE_TARGET,
             Level::WARN,
@@ -743,6 +759,15 @@ pub fn call_completion_rejected_reason_name(reason: CallCompletionRejectedReason
         CallCompletionRejectedReason::MailboxFull => "MailboxFull",
         CallCompletionRejectedReason::RequesterClosed => "RequesterClosed",
         CallCompletionRejectedReason::ResourceClosed => "ResourceClosed",
+        CallCompletionRejectedReason::TerminalActionOnFailure => "TerminalActionOnFailure",
+    }
+}
+
+/// Stable string name for a [`TerminalCompletionAction`].
+pub fn terminal_completion_action_name(action: TerminalCompletionAction) -> &'static str {
+    match action {
+        TerminalCompletionAction::StopRequester => "StopRequester",
+        TerminalCompletionAction::Noop => "Noop",
     }
 }
 

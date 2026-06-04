@@ -250,7 +250,7 @@ fn terminal_stop_completion_records_action_and_stops_in_sim() {
     assert!(
         sim.trace()
             .iter()
-            .any(|event| { matches!(event.kind(), RuntimeEventKind::IsolateStopped { .. }) })
+            .any(|event| { matches!(event.kind(), RuntimeEventKind::IsolateStopped) })
     );
 }
 
@@ -288,7 +288,7 @@ fn terminal_noop_completion_records_action_and_keeps_isolate_alive_in_sim() {
     assert!(
         !sim.trace()
             .iter()
-            .any(|event| { matches!(event.kind(), RuntimeEventKind::IsolateStopped { .. }) })
+            .any(|event| { matches!(event.kind(), RuntimeEventKind::IsolateStopped) })
     );
 
     sim.try_send(sleeper, TimerMsg::Start).unwrap();

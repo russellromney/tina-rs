@@ -22,7 +22,7 @@ use crate::events::{
     call_completion_rejected_reason_name, call_error_name, call_kind_name,
     call_rejected_reason_name, call_reply_rejected_reason_name, cancel_cause_name,
     deferred_reply_rejected_reason_name, effect_kind_name, restart_skipped_reason_name,
-    send_rejected_reason_name,
+    send_rejected_reason_name, terminal_completion_action_name,
 };
 
 const RUNTIME_PID: u64 = 0;
@@ -381,6 +381,7 @@ fn push_runtime_events(timeline: &TraceTimeline, out: &mut Vec<EmittedEvent>, or
             RuntimeEventKind::CallCompleted { call_id, .. }
             | RuntimeEventKind::CallFailed { call_id, .. }
             | RuntimeEventKind::CallCompletionRejected { call_id, .. }
+            | RuntimeEventKind::CallCompletionAction { call_id, .. }
             | RuntimeEventKind::CallCancelled { call_id, .. } => {
                 if let Some(start) = call_starts.remove(&call_id) {
                     push_call_span(start, event, out, order);
@@ -971,6 +972,17 @@ fn insert_kind_args(args: &mut Map<String, Value>, kind: RuntimeEventKind) {
                 json!(call_completion_rejected_reason_name(reason)),
             );
         }
+        RuntimeEventKind::CallCompletionAction {
+            call_id,
+            call_kind,
+            action,
+        } => {
+            insert_call_args(args, call_id, call_kind);
+            args.insert(
+                "action".into(),
+                json!(terminal_completion_action_name(action)),
+            );
+        }
         RuntimeEventKind::CallReplyRejected { call_id, reason } => {
             args.insert("call_id".into(), json!(call_id.get()));
             args.insert(
@@ -1064,6 +1076,7 @@ fn event_name(kind: RuntimeEventKind) -> &'static str {
         RuntimeEventKind::CallCompleted { .. } => "call_completed",
         RuntimeEventKind::CallFailed { .. } => "call_failed",
         RuntimeEventKind::CallCompletionRejected { .. } => "call_completion_rejected",
+        RuntimeEventKind::CallCompletionAction { .. } => "call_completion_action",
         RuntimeEventKind::CallReplyRejected { .. } => "call_reply_rejected",
         RuntimeEventKind::CallReplyAbandoned { .. } => "call_reply_abandoned",
         RuntimeEventKind::CallRejected { .. } => "call_rejected",
@@ -1093,6 +1106,7 @@ fn event_category(kind: RuntimeEventKind) -> &'static str {
         | RuntimeEventKind::CallCompleted { .. }
         | RuntimeEventKind::CallFailed { .. }
         | RuntimeEventKind::CallCompletionRejected { .. }
+        | RuntimeEventKind::CallCompletionAction { .. }
         | RuntimeEventKind::CallReplyRejected { .. }
         | RuntimeEventKind::CallReplyAbandoned { .. }
         | RuntimeEventKind::CallRejected { .. }

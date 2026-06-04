@@ -173,7 +173,7 @@ fn stop_requester_completion_stops_without_later_message() {
     assert!(
         has_event(&runtime, |kind| matches!(
             kind,
-            RuntimeEventKind::IsolateStopped { .. }
+            RuntimeEventKind::IsolateStopped
         )),
         "StopRequester must use the ordinary stop lifecycle"
     );
