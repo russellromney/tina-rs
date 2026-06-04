@@ -155,6 +155,11 @@ pub const DEFAULT_HOT_DRAIN_MAX_ROUNDS: usize = 4096;
 /// turn; exists only so a sustained hot shard re-checks commands periodically.
 pub const DEFAULT_HOT_DRAIN_MAX_ELAPSED: Duration = Duration::from_millis(50);
 
+/// How often (in drain rounds) the worker consults the wall clock for the
+/// elapsed cap. Reading the clock every round is a per-step syscall on the hot
+/// path; a short call finishes in far fewer rounds than this and so pays none.
+const HOT_DRAIN_ELAPSED_CHECK_ROUNDS: usize = 64;
+
 /// Per-shard default budget for draining lane workers after cancellation.
 pub const DEFAULT_SHUTDOWN_LANE_DRAIN_TIMEOUT: Duration = Duration::from_millis(100);
 
@@ -1602,8 +1607,13 @@ where
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => break 'worker,
                 Err(std::sync::mpsc::TryRecvError::Empty) => {}
             }
+            // Burst budget. The round cap is a cheap integer compare every
+            // round; the elapsed cap reads the clock only every
+            // HOT_DRAIN_ELAPSED_CHECK_ROUNDS so a short call (which never
+            // reaches that many rounds) pays no per-round clock syscall.
             if rounds >= config.hot_drain_max_rounds
-                || drain_start.elapsed() >= config.hot_drain_max_elapsed
+                || (rounds % HOT_DRAIN_ELAPSED_CHECK_ROUNDS == 0
+                    && drain_start.elapsed() >= config.hot_drain_max_elapsed)
             {
                 // Burst budget spent: yield to the outer loop, which re-polls
                 // commands and refreshes metrics before resuming the drain.

@@ -110,7 +110,45 @@ impl Echo {
     }
 }
 
+// --- a spinner that keeps the worker hot by self-sending forever.
+
+#[derive(Debug)]
+enum SpinMsg {
+    Start,
+    Tick,
+}
+
+struct Spinner {
+    ticks: Arc<std::sync::atomic::AtomicU64>,
+}
+
+#[tina_runtime::isolate(message = SpinMsg, send = Outbound<SpinMsg>, shard = TestShard)]
+impl Spinner {
+    fn handle(&mut self, msg: SpinMsg, ctx: &mut Context<'_, TestShard, ()>) -> Effect<Self> {
+        match msg {
+            SpinMsg::Start | SpinMsg::Tick => {
+                self.ticks
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                // Self-send keeps step() > 0 every round, holding the worker in
+                // a sustained hot-drain burst.
+                ctx.send_self(SpinMsg::Tick)
+            }
+        }
+    }
+}
+
 const CAP: usize = 64;
+
+fn wait_until<F: Fn() -> bool>(predicate: F, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if predicate() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    predicate()
+}
 
 fn config_with(
     idle_wait: Duration,
@@ -220,6 +258,97 @@ fn tiny_hot_drain_budget_still_completes_calls() {
     }
 
     runtime.shutdown().expect("shutdown");
+}
+
+/// A host command issued while the worker is in a sustained hot-drain burst
+/// must still be observed and serviced under a bounded latency. A `send_self`
+/// spinner holds the worker hot; an interleaved blocking call to a *different*
+/// isolate must still reply quickly — proving the per-round command poll inside
+/// the drain is not just structurally present but effective.
+#[test]
+fn command_serviced_during_self_send_storm() {
+    let ticks = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let runtime: ThreadedRuntime<TestShard, DefaultThreadedMailboxFactory> =
+        ThreadedRuntime::with_config(
+            TestShard,
+            DefaultThreadedMailboxFactory,
+            ThreadedRuntimeConfig::default(),
+        );
+    let spinner = runtime
+        .register_with_capacity::<_, SpinMsg>(
+            Spinner {
+                ticks: ticks.clone(),
+            },
+            CAP,
+        )
+        .expect("register spinner");
+    let echo = runtime
+        .register_with_capacity::<_, Infallible>(Echo, CAP)
+        .expect("register echo");
+
+    runtime
+        .send_and_observe(spinner, SpinMsg::Start)
+        .expect("start spinner");
+    // Confirm the storm is actually running (the worker is hot).
+    assert!(
+        wait_until(
+            || ticks.load(std::sync::atomic::Ordering::Relaxed) > 1_000,
+            Duration::from_secs(2)
+        ),
+        "spinner never got hot"
+    );
+
+    let started = Instant::now();
+    let outcome = runtime
+        .call_blocking(echo, EchoMsg::Ping, Duration::from_secs(2))
+        .expect("call during storm");
+    let elapsed = started.elapsed();
+    assert_eq!(outcome, CallOutcome::Replied(1));
+    assert!(
+        elapsed < Duration::from_millis(500),
+        "command starved by the hot-drain storm: {elapsed:?}"
+    );
+
+    runtime.shutdown().expect("shutdown");
+}
+
+/// Shutdown must be observed promptly even while the worker is in a sustained
+/// hot-drain burst — the inner-loop `try_recv` catches the Shutdown command.
+#[test]
+fn shutdown_observed_during_self_send_storm() {
+    let ticks = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let runtime: ThreadedRuntime<TestShard, DefaultThreadedMailboxFactory> =
+        ThreadedRuntime::with_config(
+            TestShard,
+            DefaultThreadedMailboxFactory,
+            ThreadedRuntimeConfig::default(),
+        );
+    let spinner = runtime
+        .register_with_capacity::<_, SpinMsg>(
+            Spinner {
+                ticks: ticks.clone(),
+            },
+            CAP,
+        )
+        .expect("register spinner");
+    runtime
+        .send_and_observe(spinner, SpinMsg::Start)
+        .expect("start spinner");
+    assert!(
+        wait_until(
+            || ticks.load(std::sync::atomic::Ordering::Relaxed) > 1_000,
+            Duration::from_secs(2)
+        ),
+        "spinner never got hot"
+    );
+
+    let started = Instant::now();
+    runtime.shutdown().expect("shutdown during storm");
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "shutdown starved by the hot-drain storm: {:?}",
+        started.elapsed()
+    );
 }
 
 #[test]
