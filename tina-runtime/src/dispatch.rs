@@ -82,6 +82,11 @@ where
         let driver_result = self.driver.cancel_pending(deadline);
         self.translators.clear();
         self.translator_indexes.clear();
+        // Undelivered carried completions reference in-flight calls that are
+        // about to be rejected as RequesterClosed; drop them so a later advance
+        // cannot try to deliver a completion for a call (and translator) that no
+        // longer exists.
+        self.pending_completions.clear();
 
         let in_flight_calls = std::mem::take(&mut self.in_flight_calls);
         self.in_flight_call_indexes.clear();
@@ -1948,25 +1953,50 @@ where
     /// when it is not. Does not include host mailbox messages, which a host
     /// `send`/`call` wakes the worker for through the command queue.
     pub(crate) fn has_pending_runtime_work(&self) -> bool {
-        self.driver.has_pending() || !self.pending_isolate_call_deadlines.is_empty()
+        self.driver.has_pending()
+            || !self.pending_isolate_call_deadlines.is_empty()
+            || !self.pending_completions.is_empty()
     }
 
     pub(crate) fn advance_driver(&mut self, now: Instant) {
+        // Harvest every completion the driver has ready this advance, but
+        // deliver at most `driver_completion_drain_budget` into mailboxes per
+        // step. Carried completions (`pending_completions`) are delivered
+        // first, in FIFO order, so completion order is deterministic across the
+        // budget boundary and nothing is dropped — the remainder simply waits
+        // for the next advance. `has_pending_runtime_work` reports a non-empty
+        // carry-over, so the worker keeps stepping (does not park) until it
+        // drains.
         let mut completed = std::mem::take(&mut self.driver_completions);
         completed.clear();
         self.driver.advance(now, &mut completed);
-        for op in completed.drain(..) {
+        self.pending_completions.extend(completed.drain(..));
+        self.driver_completions = completed;
+
+        let budget = self.driver_completion_drain_budget.max(1);
+        let mut delivered = 0;
+        while delivered < budget {
+            let Some(op) = self.pending_completions.pop_front() else {
+                break;
+            };
             self.deliver_completion(op.call_id, op.result);
+            delivered += 1;
         }
+
         // Some close-like operations complete during driver advancement
         // (for example terminal write-close) and cancel sibling pending
         // resource calls as they close. Drain those cancellations here just
         // like `dispatch_runtime_call` does for close calls that complete
-        // inline during submit.
+        // inline during submit. A lane resolves each call exactly once
+        // (close wins over a pending op), so a carried completion's call is
+        // never also cancelled; the `retain` purge is a cheap belt-and-braces
+        // guard that keeps `deliver_completion`'s unknown-call panic a true
+        // invariant even if a future lane breaks that rule.
         for cancelled in self.driver.take_cancelled_by_close() {
+            self.pending_completions
+                .retain(|op| op.call_id != cancelled);
             self.cancel_in_flight_call_for_resource_close(cancelled);
         }
-        self.driver_completions = completed;
     }
 
     pub(crate) fn deliver_completion(&mut self, call_id: CallId, result: CallOutput) {

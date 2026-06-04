@@ -163,6 +163,9 @@ where
         if config.idle_repoll_interval.is_zero() {
             panic!("ThreadedMultiShardRuntime requires idle_repoll_interval > 0");
         }
+        if config.driver_completion_drain_budget == 0 {
+            panic!("ThreadedMultiShardRuntime requires driver_completion_drain_budget > 0");
+        }
 
         let mut shards: Vec<S> = shards.into_iter().collect();
         if shards.is_empty() {
@@ -293,6 +296,9 @@ where
                         );
                         let mut runtime = runtime;
                         runtime.set_trace_retention(worker_config.trace_retention);
+                        runtime.set_driver_completion_drain_budget(
+                            worker_config.driver_completion_drain_budget,
+                        );
                         runtime.set_trace_observer(worker_observer);
                         threaded_worker_loop_with_remote(
                             runtime,

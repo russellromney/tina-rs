@@ -2840,6 +2840,127 @@ fn equal_deadline_timers_wake_in_request_order() {
     assert_eq!(fired_order, vec![first.isolate(), second.isolate()]);
 }
 
+fn count_sleep_completed<S, F>(runtime: &Runtime<S, F>) -> usize
+where
+    S: crate::Shard,
+    F: crate::MailboxFactory,
+{
+    runtime
+        .trace()
+        .iter()
+        .filter(|e| {
+            matches!(
+                e.kind(),
+                RuntimeEventKind::CallCompleted {
+                    call_kind: CallKind::Sleep,
+                    ..
+                }
+            )
+        })
+        .count()
+}
+
+fn sleep_completed_order<S, F>(runtime: &Runtime<S, F>) -> Vec<IsolateId>
+where
+    S: crate::Shard,
+    F: crate::MailboxFactory,
+{
+    runtime
+        .trace()
+        .iter()
+        .filter_map(|e| match e.kind() {
+            RuntimeEventKind::CallCompleted {
+                call_kind: CallKind::Sleep,
+                ..
+            } => Some(e.isolate()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Rock 3: with a drain budget of 1, four backend completions that are all
+/// ready at one advance must be delivered one-per-step, in deterministic
+/// submit (FIFO) order, with none dropped.
+#[test]
+fn bounded_completion_drain_delivers_one_per_step_in_fifo_order() {
+    let (mut runtime, clock) = new_manual_runtime();
+    runtime.set_driver_completion_drain_budget(1);
+
+    let sleepers: Vec<_> = (0..4)
+        .map(|_| {
+            runtime.register(
+                Sleeper {
+                    delay: Duration::from_millis(10),
+                },
+                TestMailbox::new(4),
+            )
+        })
+        .collect();
+    for s in &sleepers {
+        runtime.try_send(*s, TimerMsg::StartSleep).unwrap();
+    }
+    // One step runs all four StartSleep handlers (one message per isolate per
+    // round), registering four timers at the same deadline.
+    runtime.step();
+    // Cross the shared deadline: now all four completions are ready at the next
+    // advance, exercising the bounded batch drain.
+    clock.advance(Duration::from_millis(10));
+    assert_eq!(count_sleep_completed(&runtime), 0, "none delivered yet");
+
+    // Each subsequent step's advance delivers exactly one (the budget).
+    let mut prev = 0;
+    for step in 1..=4 {
+        runtime.step();
+        let now = count_sleep_completed(&runtime);
+        assert!(
+            now - prev <= 1,
+            "step {step} delivered {} completions, budget is 1",
+            now - prev
+        );
+        prev = now;
+    }
+
+    assert_eq!(
+        count_sleep_completed(&runtime),
+        4,
+        "all four completions delivered, none dropped"
+    );
+    assert_eq!(
+        sleep_completed_order(&runtime),
+        sleepers.iter().map(|s| s.isolate()).collect::<Vec<_>>(),
+        "completions delivered in deterministic FIFO submit order"
+    );
+}
+
+/// Rock 3: the default (large) budget delivers every ready completion in a
+/// single advance — bounding does not force unnecessary extra steps.
+#[test]
+fn default_budget_delivers_all_ready_completions_in_one_advance() {
+    let (mut runtime, clock) = new_manual_runtime();
+    // Default budget (64) >> 4 ready completions.
+    let sleepers: Vec<_> = (0..4)
+        .map(|_| {
+            runtime.register(
+                Sleeper {
+                    delay: Duration::from_millis(10),
+                },
+                TestMailbox::new(4),
+            )
+        })
+        .collect();
+    for s in &sleepers {
+        runtime.try_send(*s, TimerMsg::StartSleep).unwrap();
+    }
+    runtime.step(); // handlers register four timers
+    clock.advance(Duration::from_millis(10)); // all four deadlines cross
+    runtime.step(); // one advance delivers all four
+    assert_eq!(
+        count_sleep_completed(&runtime),
+        4,
+        "default budget delivers the whole ready batch in one advance"
+    );
+}
+
 #[test]
 fn pending_timer_completion_is_rejected_when_requester_stops() {
     let (mut runtime, clock) = new_manual_runtime();

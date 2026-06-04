@@ -116,6 +116,12 @@ pub struct ThreadedRuntimeConfig {
     /// monopolise its turn against command/shutdown for longer than this.
     pub hot_drain_max_elapsed: Duration,
 
+    /// Max backend (timer/TCP/storage/...) completions delivered into mailboxes
+    /// per driver advance. Bounds the per-step completion work; the remainder
+    /// carries over deterministically to the next step. Generous by default so
+    /// a normal warm turn delivers all its completions at once.
+    pub driver_completion_drain_budget: usize,
+
     /// Per-shard budget for draining lane workers after cancellation
     /// during shutdown. When the budget elapses, shutdown returns even if
     /// some lane work could not finish.
@@ -141,6 +147,7 @@ impl Default for ThreadedRuntimeConfig {
             idle_repoll_interval: Duration::from_millis(1),
             hot_drain_max_rounds: DEFAULT_HOT_DRAIN_MAX_ROUNDS,
             hot_drain_max_elapsed: DEFAULT_HOT_DRAIN_MAX_ELAPSED,
+            driver_completion_drain_budget: crate::DEFAULT_DRIVER_COMPLETION_DRAIN_BUDGET,
             shutdown_lane_drain_timeout: DEFAULT_SHUTDOWN_LANE_DRAIN_TIMEOUT,
         }
     }
@@ -334,6 +341,9 @@ where
         }
         if config.idle_repoll_interval.is_zero() {
             panic!("ThreadedRuntime requires idle_repoll_interval > 0");
+        }
+        if config.driver_completion_drain_budget == 0 {
+            panic!("ThreadedRuntime requires driver_completion_drain_budget > 0");
         }
 
         let (commands, receiver) = std::sync::mpsc::sync_channel(config.command_capacity);
@@ -1526,6 +1536,7 @@ where
         config.preallocation,
     );
     runtime.set_trace_retention(config.trace_retention);
+    runtime.set_driver_completion_drain_budget(config.driver_completion_drain_budget);
     // Wire the observer before any event records.
     runtime.set_trace_observer(observer);
 
