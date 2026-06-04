@@ -386,9 +386,16 @@ and reviews live under `.intent/phases/`.
   are done. Their remaining edges now mostly feed native AWS, pooled
   HTTP/2/gRPC clients, production soak/benchmark follow-ups, and public
   release cleanup.
+- Native performance evidence tranche: Phases 144-147 are now recorded in
+  `CHANGELOG.md`. Local native-vs-bounded-Tokio rows, hotpath stage probes,
+  process allocation rows, owned-buffer TCP/TLS calls, HTTP encoder
+  presizing, small-response coalescing, terminal TCP write-close, and an HTTP
+  body-pressure perf proof are done. Their remaining edges feed Phase 148:
+  structural HTTP turn cost, Linux/x86 rows, sharper whole-service soak, and
+  not pretending local alpha rows are production performance.
 
 These are recorded in `CHANGELOG.md`; the remaining near-term roadmap now
-starts with native AWS and the next performance slice below.
+starts with native AWS and Phase 148 below.
 
 ## Near-term roadmap
 
@@ -398,8 +405,7 @@ framework before public release-story work.
 | Phase | Purpose |
 |---|---|
 | **135 Native AWS first form** | Add a native Tina AWS battery for the smallest honest production shape: static SigV4 with explicit signing time, native S3 put/get/head/delete, native SQS send/receive/delete, native HTTP keepalive under Phase 131 endpoint/connect policy, bounded bodies/in-flight work, typed pressure/lifecycle reports, hermetic fake-AWS tests, and clear native-vs-SDK-bridge docs. Plan: `.intent/phases/135-native-aws-first-form/plan.md`. |
-| **147 HTTP turn and allocation cost** | In PR. Measure native HTTP/1 turn count and process allocations, remove remaining obvious small HTTP allocation waste, coalesce small terminal responses without lying about body pressure, and keep performance evidence local-machine/humble. Plan: `.intent/phases/147-http-turn-allocation-cost/plan.md`. |
-| **Next performance slice** | After Phase 147 lands, attack the remaining structural HTTP/runtime cost: too many turns per request, close/keepalive noise, Linux/x86 evidence, and any scheduling primitive that can reduce turns without hiding effect/cancel/capacity truth. |
+| **148 Native performance, Linux rows, and soak truth** | Attack the remaining structural HTTP/runtime cost after Phase 147: too many turns per request, close/keepalive noise, whole-process allocation cost, Linux/x86 evidence, and whole-service soak/perf proof through the existing `mini_saas_api` system. Plan: `.intent/phases/148-native-performance-linux-turn-soak/plan.md`. |
 | **Alpaca rename** | Before public launch, rename the project/crates/docs away from Tina to Alpaca so the lineage is respectful and clear: independently maintained Rust framework, inspired by Peter Mbanugo's Tina/Odin and Seastar, not an official Tina port. |
 | **Barend Biesheuvel visible flow ergonomics** | Optional high-level ergonomics only after the local runtime core feels boring: a `flow!`-style authoring surface that preserves named suspension points, visible failure policy, trace step names, and ordinary Tina message/effect expansion. No fake async, no hidden retries, no hidden queues. |
 
