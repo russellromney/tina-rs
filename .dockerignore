@@ -1,0 +1,9 @@
+# Keep the Fly/Depot build context small and the cargo cache authoritative.
+# Compiled artifacts must come from the builder's cache mount, never a stale
+# local target/ copied in.
+target/
+**/target/
+.git/
+.intent/
+data/
+*.log

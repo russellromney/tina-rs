@@ -1,0 +1,17 @@
+# Throwaway app for Linux/x86 perf evidence. Run from the repo root so the
+# build context is the whole worktree:
+#
+#   fly deploy . -c examples/systems/perf_native/fly/fly.toml --build-only --push
+#
+# then run a one-off machine from the pushed image (see run_perf_on_fly.sh).
+app = "tina-perf-150"
+primary_region = "iad"
+
+[build]
+  # Path is resolved relative to THIS config file's directory (flyctl quirk),
+  # while the build context is the repo root passed on the command line.
+  dockerfile = "Dockerfile"
+
+# Dedicated CPU so the perf rows are not shared-tenant noise.
+[[vm]]
+  size = "performance-2x"
