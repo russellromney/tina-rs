@@ -92,9 +92,29 @@ pub struct ThreadedRuntimeConfig {
     /// Trace retention for the worker-owned runtime.
     pub trace_retention: TraceRetention,
 
-    /// How long an idle worker may park before checking runtime-owned work
-    /// again.
+    /// How long a fully idle worker (no runtime-owned work pending) may park
+    /// before checking again. Upper bound on park time.
     pub idle_wait: Duration,
+
+    /// How long the worker may park when runtime-owned work *is* pending but
+    /// the worker cannot be signalled about it (a runtime timer deadline, or
+    /// lane I/O the worker only learns about by re-polling the driver). Bounds
+    /// the latency of that work. Must be `<= idle_wait`; defaults to `idle_wait`
+    /// so out-of-the-box behaviour is unchanged and operators opt in to a
+    /// tighter re-poll (lower timer/I/O latency, more idle wakeups).
+    pub idle_repoll_interval: Duration,
+
+    /// Max consecutive runtime steps the worker drains in one hot burst before
+    /// it must re-poll the command queue and restart the burst. A tiny local
+    /// call finishes in a handful of steps, so the default is generous; the cap
+    /// only exists so a pathological always-progressing workload cannot loop
+    /// here forever without observing commands.
+    pub hot_drain_max_rounds: usize,
+
+    /// Wall-clock cap on one hot-drain burst. When it elapses the worker
+    /// re-polls the command queue before continuing, so one hot shard cannot
+    /// monopolise its turn against command/shutdown for longer than this.
+    pub hot_drain_max_elapsed: Duration,
 
     /// Per-shard budget for draining lane workers after cancellation
     /// during shutdown. When the budget elapses, shutdown returns even if
@@ -117,10 +137,23 @@ impl Default for ThreadedRuntimeConfig {
             preallocation: PreallocationConfig::default(),
             trace_retention: TraceRetention::Full,
             idle_wait: Duration::from_millis(1),
+            // Default equals idle_wait: unchanged park behaviour out of the box.
+            idle_repoll_interval: Duration::from_millis(1),
+            hot_drain_max_rounds: DEFAULT_HOT_DRAIN_MAX_ROUNDS,
+            hot_drain_max_elapsed: DEFAULT_HOT_DRAIN_MAX_ELAPSED,
             shutdown_lane_drain_timeout: DEFAULT_SHUTDOWN_LANE_DRAIN_TIMEOUT,
         }
     }
 }
+
+/// Default hot-drain round cap: high enough that any single small local
+/// call/HTTP turn finishes without an artificial re-poll, low enough to bound a
+/// runaway always-progressing loop.
+pub const DEFAULT_HOT_DRAIN_MAX_ROUNDS: usize = 4096;
+
+/// Default hot-drain wall-clock cap. Generous so it never bites a normal warm
+/// turn; exists only so a sustained hot shard re-checks commands periodically.
+pub const DEFAULT_HOT_DRAIN_MAX_ELAPSED: Duration = Duration::from_millis(50);
 
 /// Per-shard default budget for draining lane workers after cancellation.
 pub const DEFAULT_SHUTDOWN_LANE_DRAIN_TIMEOUT: Duration = Duration::from_millis(100);
@@ -287,6 +320,15 @@ where
         }
         if config.remote_inbound_drain_budget == 0 {
             panic!("ThreadedRuntime requires remote inbound drain budget > 0");
+        }
+        if config.hot_drain_max_rounds == 0 {
+            panic!("ThreadedRuntime requires hot_drain_max_rounds > 0");
+        }
+        if config.hot_drain_max_elapsed.is_zero() {
+            panic!("ThreadedRuntime requires hot_drain_max_elapsed > 0");
+        }
+        if config.idle_repoll_interval.is_zero() {
+            panic!("ThreadedRuntime requires idle_repoll_interval > 0");
         }
 
         let (commands, receiver) = std::sync::mpsc::sync_channel(config.command_capacity);
@@ -1515,7 +1557,7 @@ where
     // every hot turn is the per-op tax this phase removes. Counts refresh again
     // as soon as the worker parks or runs a command (phase 145).
     let mut refresh_metrics = true;
-    loop {
+    'worker: loop {
         if refresh_metrics {
             metrics.set_resource_counts(runtime.resource_report());
         }
@@ -1533,26 +1575,59 @@ where
             Err(std::sync::mpsc::TryRecvError::Empty) => {}
         }
 
-        // Drain everything the shard can make progress on right now. A step
-        // that delivered handlers loops back immediately and steps again —
-        // no per-turn sleep tax. A tiny local call needs several runtime
-        // turns; throttling each turn by 1ms turned microseconds of work into
-        // milliseconds of latency (phase 145).
-        let delivered = runtime.step();
-        if delivered > 0 {
+        // Bounded hot-drain. Step while the shard makes progress so a tiny
+        // local call finishes without a per-turn sleep tax (phase 145), but
+        // cap the burst by rounds AND elapsed time and re-poll the command
+        // queue between steps so a flood of always-progressing local work
+        // cannot hide a Run/Shutdown or monopolise the turn unboundedly.
+        let drain_start = Instant::now();
+        let mut rounds = 0usize;
+        let mut drained_any = false;
+        loop {
+            if runtime.step() > 0 {
+                drained_any = true;
+                rounds += 1;
+            } else {
+                break;
+            }
+            // Observe commands between hot rounds, not only when the drain
+            // runs dry. A Run is executed inline and draining continues; a
+            // Shutdown leaves the hot path immediately.
+            match receiver.try_recv() {
+                Ok(ThreadedCommand::Run(command)) => command(&mut runtime),
+                Ok(ThreadedCommand::Shutdown) => {
+                    deliver_shutdown_signal_and_drain(&mut runtime);
+                    break 'worker;
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => break 'worker,
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            }
+            if rounds >= config.hot_drain_max_rounds
+                || drain_start.elapsed() >= config.hot_drain_max_elapsed
+            {
+                // Burst budget spent: yield to the outer loop, which re-polls
+                // commands and refreshes metrics before resuming the drain.
+                break;
+            }
+        }
+        if drained_any {
             refresh_metrics = false;
             continue;
         }
 
-        // Nothing was deliverable this turn. Park on the command queue so a
-        // new command (including shutdown) wakes the worker immediately. The
-        // bounded `idle_wait` timeout makes the worker re-poll the driver for
-        // runtime-owned work (timers, lane I/O completions, listeners) it
-        // cannot be signalled about, without hot-spinning the CPU. This single
-        // policy covers both "fully idle" and "waiting on a pending timer/I/O":
-        // in both cases the only honest move is to sleep until either a command
-        // arrives or it is time to re-poll the driver.
-        match receiver.recv_timeout(config.idle_wait) {
+        // Nothing was deliverable. Park until a command (including shutdown)
+        // wakes the worker. When runtime-owned work is pending but cannot
+        // signal the worker (a timer deadline, or lane I/O the worker only
+        // learns about by re-polling the driver), park for the shorter
+        // `idle_repoll_interval` so that work's latency stays bounded; when
+        // fully idle, park for `idle_wait`. Either way the worker sleeps — it
+        // does not hot-spin.
+        let park = if runtime.has_pending_runtime_work() {
+            config.idle_repoll_interval.min(config.idle_wait)
+        } else {
+            config.idle_wait
+        };
+        match receiver.recv_timeout(park) {
             Ok(ThreadedCommand::Run(command)) => command(&mut runtime),
             Ok(ThreadedCommand::Shutdown) => {
                 deliver_shutdown_signal_and_drain(&mut runtime);

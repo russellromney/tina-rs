@@ -154,6 +154,15 @@ where
         if config.remote_inbound_drain_budget == 0 {
             panic!("ThreadedMultiShardRuntime requires remote inbound drain budget > 0");
         }
+        if config.hot_drain_max_rounds == 0 {
+            panic!("ThreadedMultiShardRuntime requires hot_drain_max_rounds > 0");
+        }
+        if config.hot_drain_max_elapsed.is_zero() {
+            panic!("ThreadedMultiShardRuntime requires hot_drain_max_elapsed > 0");
+        }
+        if config.idle_repoll_interval.is_zero() {
+            panic!("ThreadedMultiShardRuntime requires idle_repoll_interval > 0");
+        }
 
         let mut shards: Vec<S> = shards.into_iter().collect();
         if shards.is_empty() {
@@ -1084,7 +1093,19 @@ where
         // core). A bounded park here instead would only add `idle_wait` latency
         // to a cross-shard reply for no benefit.
         if !runtime.has_in_flight_calls() {
-            match receiver.recv_timeout(config.idle_wait) {
+            // Same pending-work-aware park as the single-shard worker: a short
+            // re-poll when runtime-owned work (a timer deadline, lane I/O) is
+            // pending but cannot signal the worker, a longer idle park when
+            // fully idle. The in-flight branch below stays a yield because a
+            // pending cross-shard reply arrives through remote inbound, not the
+            // command queue, and the step blocks in the io_loop rather than
+            // hot-spinning (a bounded park there would only delay that reply).
+            let park = if runtime.has_pending_runtime_work() {
+                config.idle_repoll_interval.min(config.idle_wait)
+            } else {
+                config.idle_wait
+            };
+            match receiver.recv_timeout(park) {
                 Ok(ThreadedCommand::Run(command)) => command(&mut runtime),
                 Ok(ThreadedCommand::Shutdown) => {
                     deliver_shutdown_signal_and_drain(&mut runtime);

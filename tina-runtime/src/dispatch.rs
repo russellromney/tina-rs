@@ -1941,6 +1941,16 @@ where
         }
     }
 
+    /// True when the runtime owns work that can make progress on its own —
+    /// pending lane I/O, a runtime timer/signal, or an isolate-call deadline —
+    /// none of which signals a parked worker. The worker uses this to pick a
+    /// short re-poll park when such work is pending versus a longer idle park
+    /// when it is not. Does not include host mailbox messages, which a host
+    /// `send`/`call` wakes the worker for through the command queue.
+    pub(crate) fn has_pending_runtime_work(&self) -> bool {
+        self.driver.has_pending() || !self.pending_isolate_call_deadlines.is_empty()
+    }
+
     pub(crate) fn advance_driver(&mut self, now: Instant) {
         let mut completed = std::mem::take(&mut self.driver_completions);
         completed.clear();

@@ -141,6 +141,9 @@ impl LocalSystemConfig {
             trace_retention: self.trace_retention,
             idle_wait: self.idle_wait,
             shutdown_lane_drain_timeout: self.shutdown_lane_drain_timeout,
+            // Hot-drain bounds + idle re-poll are not part of the local-system
+            // builder surface yet; take the behaviour-preserving defaults.
+            ..ThreadedRuntimeConfig::default()
         }
     }
 }
