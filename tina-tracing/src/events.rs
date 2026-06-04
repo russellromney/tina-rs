@@ -682,6 +682,7 @@ pub fn call_kind_name(kind: CallKind) -> &'static str {
         CallKind::TcpConnect => "tcp_connect",
         CallKind::TcpRead => "tcp_read",
         CallKind::TcpWrite => "tcp_write",
+        CallKind::TcpWriteClose => "tcp_write_close",
         CallKind::TcpListenerClose => "tcp_listener_close",
         CallKind::TcpStreamClose => "tcp_stream_close",
         CallKind::UdpBind => "udp_bind",
