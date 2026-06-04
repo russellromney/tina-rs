@@ -117,9 +117,16 @@ emit_hotpath_lines() {
     rejected_completion_count=$(grep -oE 'rejected_completion_count=[0-9]+' <<< "$line" | head -1 | cut -d= -f2 || true)
     host_allocs=$(grep -oE 'host_allocations=[0-9]+' <<< "$line" | head -1 | cut -d= -f2 || true)
     process_allocs=$(grep -oE 'process_allocations=[0-9]+' <<< "$line" | head -1 | cut -d= -f2 || true)
+    # Tail fields (phase 150). Optional so old rows without them still record.
+    traced=$(grep -oE 'traced=(true|false)' <<< "$line" | head -1 | cut -d= -f2 || true)
+    p90=$(grep -oE ' p90_ns=[0-9]+' <<< "$line" | head -1 | cut -d= -f2 || true)
+    p99=$(grep -oE ' p99_ns=[0-9]+' <<< "$line" | head -1 | cut -d= -f2 || true)
+    gap_count=$(grep -oE 'scheduler_gap_count=[0-9]+' <<< "$line" | head -1 | cut -d= -f2 || true)
+    max_gap=$(grep -oE 'max_scheduler_gap_ns=[0-9]+' <<< "$line" | head -1 | cut -d= -f2 || true)
+    gap_threshold=$(grep -oE 'scheduler_gap_threshold_ns=[0-9]+' <<< "$line" | head -1 | cut -d= -f2 || true)
     if [[ -n $label && -n $p50 && -n $stage_count ]]; then
-      printf '{"kind":"hotpath","timestamp":"%s","git_sha":"%s","platform":"%s","arch":"%s","profile":"%s","label":"%s","p50_ns":%s,"stage_count":%s,"event_stage_count":%s,"handler_turn_count":%s,"runtime_call_count":%s,"service_call_count":%s,"completion_count":%s,"rejected_completion_count":%s,"host_allocations":%s,"process_allocations":%s}\n' \
-        "$timestamp" "$git_sha" "$platform" "$arch" "$profile" "$label" "$p50" "$stage_count" "${event_stage_count:-null}" "${handler_turn_count:-null}" "${runtime_call_count:-null}" "${service_call_count:-null}" "${completion_count:-null}" "${rejected_completion_count:-null}" "${host_allocs:-null}" "${process_allocs:-null}"
+      printf '{"kind":"hotpath","timestamp":"%s","git_sha":"%s","platform":"%s","arch":"%s","profile":"%s","label":"%s","traced":%s,"p50_ns":%s,"p90_ns":%s,"p99_ns":%s,"scheduler_gap_threshold_ns":%s,"scheduler_gap_count":%s,"max_scheduler_gap_ns":%s,"stage_count":%s,"event_stage_count":%s,"handler_turn_count":%s,"runtime_call_count":%s,"service_call_count":%s,"completion_count":%s,"rejected_completion_count":%s,"host_allocations":%s,"process_allocations":%s}\n' \
+        "$timestamp" "$git_sha" "$platform" "$arch" "$profile" "$label" "${traced:-null}" "$p50" "${p90:-null}" "${p99:-null}" "${gap_threshold:-null}" "${gap_count:-null}" "${max_gap:-null}" "$stage_count" "${event_stage_count:-null}" "${handler_turn_count:-null}" "${runtime_call_count:-null}" "${service_call_count:-null}" "${completion_count:-null}" "${rejected_completion_count:-null}" "${host_allocs:-null}" "${process_allocs:-null}"
     fi
   done < <(grep '^hotpath' <<< "$output" || true)
 }
