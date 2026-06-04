@@ -32,6 +32,9 @@ pub struct PressureSummary {
     pub completion_rejected_requester_closed: u64,
     /// User code closed the resource while the call was pending.
     pub completion_rejected_resource_closed: u64,
+    /// A failed backend call tried to use a terminal completion action instead
+    /// of returning an ordinary failure message.
+    pub completion_rejected_terminal_action_on_failure: u64,
     /// An isolate-call reply could not be matched against an
     /// outstanding pending call. Used as the fall-through when the
     /// recently-cancelled ring no longer holds the call_id; the
@@ -84,6 +87,9 @@ impl PressureSummary {
                     CallCompletionRejectedReason::ResourceClosed => {
                         summary.completion_rejected_resource_closed += 1;
                     }
+                    CallCompletionRejectedReason::TerminalActionOnFailure => {
+                        summary.completion_rejected_terminal_action_on_failure += 1;
+                    }
                 },
                 RuntimeEventKind::CallReplyRejected { reason, .. } => match reason {
                     CallReplyRejectedReason::NoPendingCall => {
@@ -123,6 +129,7 @@ impl PressureSummary {
         self.completion_rejected_mailbox_full > 0
             || self.completion_rejected_requester_closed > 0
             || self.completion_rejected_resource_closed > 0
+            || self.completion_rejected_terminal_action_on_failure > 0
             || self.reply_rejected_no_pending_call > 0
             || self.reply_rejected_caller_cancelled > 0
             || self.reply_rejected_caller_timed_out > 0
@@ -151,13 +158,14 @@ impl fmt::Display for PressureSummary {
         // offsets.
         write!(
             formatter,
-            "completion[mbox_full={} requester_closed={} resource_closed={}] \
+            "completion[mbox_full={} requester_closed={} resource_closed={} terminal_action_on_failure={}] \
              reply[no_pending={} path_full={} shard_closed={} \
              cancelled={} timed_out={} owner_stopped={} runtime_stopped={}] \
              send[full={} closed={}]",
             self.completion_rejected_mailbox_full,
             self.completion_rejected_requester_closed,
             self.completion_rejected_resource_closed,
+            self.completion_rejected_terminal_action_on_failure,
             self.reply_rejected_no_pending_call,
             self.reply_rejected_reply_path_full,
             self.reply_rejected_requester_shard_closed,

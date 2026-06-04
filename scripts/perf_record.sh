@@ -8,7 +8,7 @@
 #
 #   {"kind":"compare", "timestamp":..., "git_sha":..., "platform":..., "arch":..., "profile":"release", "label":..., "tina_p50_ns":..., "tina_p90_ns":..., "tina_p99_ns":..., "tina_allocations":..., "tina_allocated_bytes":...}
 #   {"kind":"process", "timestamp":..., "git_sha":..., "platform":..., "arch":..., "profile":"release", "label":..., "process_allocations":..., "process_allocated_bytes":..., "rss_delta_kb":...}
-#   {"kind":"hotpath", "timestamp":..., "git_sha":..., "platform":..., "arch":..., "profile":"release", "label":..., "p50_ns":..., "stage_count":..., "host_allocations":..., "process_allocations":...}
+#   {"kind":"hotpath", "timestamp":..., "git_sha":..., "platform":..., "arch":..., "profile":"release", "label":..., "p50_ns":..., "stage_count":..., "event_stage_count":..., "handler_turn_count":..., "runtime_call_count":..., "service_call_count":..., "completion_count":..., "rejected_completion_count":..., "host_allocations":..., "process_allocations":...}
 #
 # A `perf-compare` line stays the canonical "row" — `perf-process` lines are
 # extras emitted by HTTP rows (whole-process allocation + RSS delta).
@@ -20,7 +20,7 @@
 
 set -euo pipefail
 
-HISTORY_FILE="${TINA_PERF_HISTORY_FILE:-.intent/phases/148-native-performance-linux-turn-soak/perf_history.jsonl}"
+HISTORY_FILE="${TINA_PERF_HISTORY_FILE:-.intent/phases/149-structural-http-runtime-performance/perf_history.jsonl}"
 
 mode="record"
 input_file=""
@@ -109,11 +109,17 @@ emit_hotpath_lines() {
     label=$(grep -oE 'label=[a-zA-Z0-9_]+' <<< "$line" | head -1 | cut -d= -f2 || true)
     p50=$(grep -oE 'p50_ns=[0-9]+' <<< "$line" | head -1 | cut -d= -f2 || true)
     stage_count=$(grep -oE 'stage_count=[0-9]+' <<< "$line" | head -1 | cut -d= -f2 || true)
+    event_stage_count=$(grep -oE 'event_stage_count=[0-9]+' <<< "$line" | head -1 | cut -d= -f2 || true)
+    handler_turn_count=$(grep -oE 'handler_turn_count=[0-9]+' <<< "$line" | head -1 | cut -d= -f2 || true)
+    runtime_call_count=$(grep -oE 'runtime_call_count=[0-9]+' <<< "$line" | head -1 | cut -d= -f2 || true)
+    service_call_count=$(grep -oE 'service_call_count=[0-9]+' <<< "$line" | head -1 | cut -d= -f2 || true)
+    completion_count=$(grep -oE 'completion_count=[0-9]+' <<< "$line" | head -1 | cut -d= -f2 || true)
+    rejected_completion_count=$(grep -oE 'rejected_completion_count=[0-9]+' <<< "$line" | head -1 | cut -d= -f2 || true)
     host_allocs=$(grep -oE 'host_allocations=[0-9]+' <<< "$line" | head -1 | cut -d= -f2 || true)
     process_allocs=$(grep -oE 'process_allocations=[0-9]+' <<< "$line" | head -1 | cut -d= -f2 || true)
     if [[ -n $label && -n $p50 && -n $stage_count ]]; then
-      printf '{"kind":"hotpath","timestamp":"%s","git_sha":"%s","platform":"%s","arch":"%s","profile":"%s","label":"%s","p50_ns":%s,"stage_count":%s,"host_allocations":%s,"process_allocations":%s}\n' \
-        "$timestamp" "$git_sha" "$platform" "$arch" "$profile" "$label" "$p50" "$stage_count" "${host_allocs:-null}" "${process_allocs:-null}"
+      printf '{"kind":"hotpath","timestamp":"%s","git_sha":"%s","platform":"%s","arch":"%s","profile":"%s","label":"%s","p50_ns":%s,"stage_count":%s,"event_stage_count":%s,"handler_turn_count":%s,"runtime_call_count":%s,"service_call_count":%s,"completion_count":%s,"rejected_completion_count":%s,"host_allocations":%s,"process_allocations":%s}\n' \
+        "$timestamp" "$git_sha" "$platform" "$arch" "$profile" "$label" "$p50" "$stage_count" "${event_stage_count:-null}" "${handler_turn_count:-null}" "${runtime_call_count:-null}" "${service_call_count:-null}" "${completion_count:-null}" "${rejected_completion_count:-null}" "${host_allocs:-null}" "${process_allocs:-null}"
     fi
   done < <(grep '^hotpath' <<< "$output" || true)
 }

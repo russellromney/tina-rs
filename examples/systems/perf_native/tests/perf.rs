@@ -4,7 +4,7 @@ use tina_proof_harness::SemanticMatch;
 #[test]
 fn native_perf_comparison_rows_are_printable_and_bounded() {
     let reports = run_all().expect("run native perf comparisons");
-    assert_eq!(reports.len(), 7);
+    assert_eq!(reports.len(), 9);
     let labels: Vec<_> = reports.iter().map(|report| report.label).collect();
     assert_eq!(
         labels,
@@ -16,6 +16,8 @@ fn native_perf_comparison_rows_are_printable_and_bounded() {
             "http1_close_request",
             "http1_keepalive_sequential",
             "http1_fixed_body_close",
+            "http1_keepalive_steady_state_small",
+            "http1_keepalive_steady_state_fixed",
         ]
     );
     for report in reports {

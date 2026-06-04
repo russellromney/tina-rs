@@ -348,6 +348,32 @@ impl HotPathStage {
     }
 }
 
+/// Counts from the same instrumented trace window that produced the hot-path
+/// stage breakdown.
+///
+/// `event_stage_count` intentionally mirrors the old `stage_count` field. The
+/// other counters split out the facts users care about: handler turns, backend
+/// runtime calls, service calls, successful completions, and rejected
+/// completions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct HotPathCounters {
+    pub event_stage_count: usize,
+    pub handler_turn_count: usize,
+    pub runtime_call_count: usize,
+    pub service_call_count: usize,
+    pub completion_count: usize,
+    pub rejected_completion_count: usize,
+}
+
+impl HotPathCounters {
+    pub fn from_stage_count(event_stage_count: usize) -> Self {
+        Self {
+            event_stage_count,
+            ..Self::default()
+        }
+    }
+}
+
 /// A hot-path probe report: end-to-end latency over N iterations plus a
 /// single representative per-stage breakdown.
 ///
@@ -370,6 +396,8 @@ pub struct HotPathReport {
     /// Allocations the whole process makes per op: host thread + runtime
     /// worker thread + lane workers. This is the real per-op allocation cost.
     pub process_allocations: Option<u64>,
+    /// Counts derived from the same trace window as `stages`.
+    pub counters: HotPathCounters,
     pub env: PerfEnvironment,
 }
 
@@ -391,20 +419,47 @@ impl HotPathReport {
     /// caller's behalf, which the host-only count misses.
     pub fn from_samples_with_process_allocations(
         label: &'static str,
-        mut totals_ns: Vec<u64>,
+        totals_ns: Vec<u64>,
         stages: Vec<HotPathStage>,
         allocations: Option<u64>,
         process_allocations: Option<u64>,
+    ) -> Self {
+        let counters = HotPathCounters::from_stage_count(stages.len());
+        Self::from_samples_with_counters(
+            label,
+            totals_ns,
+            stages,
+            allocations,
+            process_allocations,
+            counters,
+        )
+    }
+
+    /// Builds a report including explicit trace counters from the same
+    /// instrumented window as `stages`.
+    pub fn from_samples_with_counters(
+        label: &'static str,
+        totals_ns: Vec<u64>,
+        stages: Vec<HotPathStage>,
+        allocations: Option<u64>,
+        process_allocations: Option<u64>,
+        counters: HotPathCounters,
     ) -> Self {
         assert!(
             !totals_ns.is_empty(),
             "hot-path report needs at least one timing sample"
         );
-        totals_ns.sort_unstable();
-        let iterations = totals_ns.len() as u64;
-        let p50_ns = totals_ns[totals_ns.len() / 2];
-        let min_ns = *totals_ns.first().expect("non-empty");
-        let max_ns = *totals_ns.last().expect("non-empty");
+        assert_eq!(
+            counters.event_stage_count,
+            stages.len(),
+            "event_stage_count must match stage_count"
+        );
+        let mut sorted_ns = totals_ns;
+        sorted_ns.sort_unstable();
+        let iterations = sorted_ns.len() as u64;
+        let p50_ns = sorted_ns[sorted_ns.len() / 2];
+        let min_ns = *sorted_ns.first().expect("non-empty");
+        let max_ns = *sorted_ns.last().expect("non-empty");
         Self {
             label,
             iterations,
@@ -414,6 +469,7 @@ impl HotPathReport {
             stages,
             allocations,
             process_allocations,
+            counters,
             env: PerfEnvironment::detect(),
         }
     }
@@ -423,14 +479,20 @@ impl HotPathReport {
     /// greppable.
     pub fn summary_line(&self) -> String {
         let mut line = format!(
-            "hotpath label={} iterations={} p50_us={} p50_ns={} min_ns={} max_ns={} stage_count={} host_allocations={} process_allocations={} {}",
+            "hotpath label={} iterations={} p50_us={} p50_ns={} min_ns={} max_ns={} stage_count={} event_stage_count={} handler_turn_count={} runtime_call_count={} service_call_count={} completion_count={} rejected_completion_count={} host_allocations={} process_allocations={} {}",
             report_value(self.label),
             self.iterations,
             self.p50_ns / 1_000,
             self.p50_ns,
             self.min_ns,
             self.max_ns,
-            self.stages.len(),
+            self.counters.event_stage_count,
+            self.counters.event_stage_count,
+            self.counters.handler_turn_count,
+            self.counters.runtime_call_count,
+            self.counters.service_call_count,
+            self.counters.completion_count,
+            self.counters.rejected_completion_count,
             self.allocations
                 .map(|value| value.to_string())
                 .unwrap_or_else(|| "unknown".to_string()),
@@ -467,13 +529,19 @@ impl HotPathReport {
         }
         stages.push('}');
         format!(
-            "{{\"schema\":\"tina.hotpath.v1\",\"label\":{},\"iterations\":{},\"p50_ns\":{},\"min_ns\":{},\"max_ns\":{},\"stage_count\":{},\"host_allocations\":{},\"process_allocations\":{},\"allocations\":{},\"platform\":{},\"arch\":{},\"profile\":{},\"git_sha\":{},\"stages\":{}}}",
+            "{{\"schema\":\"tina.hotpath.v1\",\"label\":{},\"iterations\":{},\"p50_ns\":{},\"min_ns\":{},\"max_ns\":{},\"stage_count\":{},\"event_stage_count\":{},\"handler_turn_count\":{},\"runtime_call_count\":{},\"service_call_count\":{},\"completion_count\":{},\"rejected_completion_count\":{},\"host_allocations\":{},\"process_allocations\":{},\"allocations\":{},\"platform\":{},\"arch\":{},\"profile\":{},\"git_sha\":{},\"stages\":{}}}",
             json_string(self.label),
             self.iterations,
             self.p50_ns,
             self.min_ns,
             self.max_ns,
-            self.stages.len(),
+            self.counters.event_stage_count,
+            self.counters.event_stage_count,
+            self.counters.handler_turn_count,
+            self.counters.runtime_call_count,
+            self.counters.service_call_count,
+            self.counters.completion_count,
+            self.counters.rejected_completion_count,
             self.allocations
                 .map(|value| value.to_string())
                 .unwrap_or_else(|| "null".to_string()),
@@ -696,6 +764,12 @@ mod tests {
         assert!(line.contains("min_ns=800"), "{line}");
         assert!(line.contains("max_ns=1200"), "{line}");
         assert!(line.contains("stage_count=2"), "{line}");
+        assert!(line.contains("event_stage_count=2"), "{line}");
+        assert!(line.contains("handler_turn_count=0"), "{line}");
+        assert!(line.contains("runtime_call_count=0"), "{line}");
+        assert!(line.contains("service_call_count=0"), "{line}");
+        assert!(line.contains("completion_count=0"), "{line}");
+        assert!(line.contains("rejected_completion_count=0"), "{line}");
         assert!(line.contains("allocations=7"), "{line}");
         assert!(
             line.contains("stage.host_submit_to_worker_pickup_ns=250"),
@@ -710,6 +784,8 @@ mod tests {
         assert!(json.contains("\"schema\":\"tina.hotpath.v1\""), "{json}");
         assert!(json.contains("\"p50_ns\":1000"), "{json}");
         assert!(json.contains("\"stage_count\":2"), "{json}");
+        assert!(json.contains("\"event_stage_count\":2"), "{json}");
+        assert!(json.contains("\"handler_turn_count\":0"), "{json}");
         assert!(
             json.contains("\"host_submit_to_worker_pickup\":250"),
             "{json}"

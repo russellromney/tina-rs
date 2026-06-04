@@ -337,6 +337,22 @@ pub enum CallCompletionRejectedReason {
     /// while this call was pending. The call is silently cancelled;
     /// the caller's continuation never fires.
     ResourceClosed,
+
+    /// A backend call failed, but its translator asked for a terminal
+    /// completion action (`Noop` or `StopRequester`) instead of producing an
+    /// ordinary failure message. The runtime records the failure and rejects
+    /// the terminal action so the failure does not disappear.
+    TerminalActionOnFailure,
+}
+
+/// Terminal action taken after a successful runtime-owned backend call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TerminalCompletionAction {
+    /// The runtime stopped the requester instead of delivering a completion
+    /// message.
+    StopRequester,
+    /// The runtime recorded completion and enqueued no message.
+    Noop,
 }
 
 /// Why a reply from a callee could not complete its original isolate call.
@@ -689,6 +705,19 @@ pub enum RuntimeEventKind {
 
         /// Why the completion could not be delivered.
         reason: CallCompletionRejectedReason,
+    },
+
+    /// The runtime completed a successful backend call through a terminal
+    /// action instead of delivering an ordinary continuation message.
+    CallCompletionAction {
+        /// The runtime-assigned identifier for the call.
+        call_id: CallId,
+
+        /// The trace-level kind of the call.
+        call_kind: CallKind,
+
+        /// The terminal action taken.
+        action: TerminalCompletionAction,
     },
 
     /// The runtime observed a reply from a callee, but the original
@@ -1518,6 +1547,7 @@ fn call_completion_rejected_tag(reason: CallCompletionRejectedReason) -> u8 {
         CallCompletionRejectedReason::MailboxFull => 1,
         CallCompletionRejectedReason::RequesterClosed => 2,
         CallCompletionRejectedReason::ResourceClosed => 3,
+        CallCompletionRejectedReason::TerminalActionOnFailure => 4,
     }
 }
 
@@ -1745,6 +1775,16 @@ fn write_kind_stable(kind: RuntimeEventKind, hasher: &mut StableHasher) {
             hasher.write_u8(call_kind_tag(call_kind));
             hasher.write_u8(call_completion_rejected_tag(reason));
         }
+        RuntimeEventKind::CallCompletionAction {
+            call_id,
+            call_kind,
+            action,
+        } => {
+            hasher.write_u8(44);
+            hasher.write_u64(call_id.get());
+            hasher.write_u8(call_kind_tag(call_kind));
+            hasher.write_u8(terminal_completion_action_tag(action));
+        }
         RuntimeEventKind::CallReplyRejected { call_id, reason } => {
             hasher.write_u8(21);
             hasher.write_u64(call_id.get());
@@ -1816,6 +1856,13 @@ fn write_kind_stable(kind: RuntimeEventKind, hasher: &mut StableHasher) {
             hasher.write_u8(36);
             runtime_fact_write(fact, hasher);
         }
+    }
+}
+
+fn terminal_completion_action_tag(action: TerminalCompletionAction) -> u8 {
+    match action {
+        TerminalCompletionAction::StopRequester => 1,
+        TerminalCompletionAction::Noop => 2,
     }
 }
 

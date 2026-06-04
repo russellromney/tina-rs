@@ -25,7 +25,8 @@ use tina::{
 };
 
 use crate::call::{
-    CallError, CallId, CallInput, CallOutcome, CallOutput, ErasedCall, IntoErasedCall, SendOutcome,
+    CallError, CallId, CallInput, CallOutcome, CallOutput, ErasedCall, ErasedRuntimeCallCompletion,
+    IntoErasedCall, SendOutcome,
 };
 use crate::driver::DriverShutdownError;
 use crate::fact::{IntoRuntimeFact, RuntimeFact};
@@ -38,6 +39,7 @@ use crate::trace::{
     CallCompletionRejectedReason, CallKind, CallReplyRejectedReason, CauseId,
     DeferredReplyRejectedReason, DeferredSlotId, EffectKind, EventId, RestartSkippedReason,
     RuntimeEvent, RuntimeEventKind, SendRejectedReason, SupervisionRejectedReason,
+    TerminalCompletionAction,
 };
 use crate::{
     CANCELLED_CALL_RING_CAPACITY, CallDispatchContext, DeliveredMessage,
@@ -1198,7 +1200,7 @@ where
         context: CallDispatchContext,
         call_kind: CallKind,
         request: CallInput,
-        translator: Box<dyn FnOnce(CallOutput) -> Box<dyn Any>>,
+        translator: Box<dyn FnOnce(CallOutput) -> ErasedRuntimeCallCompletion>,
     ) {
         let persistence = request.persistence_trace_info();
         if persistence == Some(call::PersistenceTraceInfo::Recovery) {
@@ -1979,10 +1981,7 @@ where
         // success or a failure). A failed call therefore emits at most
         // `CallFailed` plus, if delivery also fails, one
         // `CallCompletionRejected` — never `CallCompleted`.
-        let failure_reason = match &result {
-            CallOutput::Failed(reason) => Some(*reason),
-            _ => None,
-        };
+        let failure_reason = call_output_failure_reason(&result);
         if let Some(reason) = failure_reason {
             self.push_event(
                 in_flight.requester.isolate,
@@ -2037,7 +2036,21 @@ where
             ),
         }
 
-        let message = translator(result);
+        let completion = translator(result);
+        if failure_reason.is_some()
+            && !matches!(completion, ErasedRuntimeCallCompletion::Message(_))
+        {
+            self.push_event(
+                in_flight.requester.isolate,
+                Some(in_flight.cause),
+                RuntimeEventKind::CallCompletionRejected {
+                    call_id,
+                    call_kind: in_flight.call_kind,
+                    reason: CallCompletionRejectedReason::TerminalActionOnFailure,
+                },
+            );
+            return;
+        }
 
         let entry_index = self.entry_index(in_flight.requester);
         let Some(entry_index) = entry_index else {
@@ -2066,44 +2079,108 @@ where
             return;
         }
 
-        match self.enqueue_entry_message(entry_index, message, in_flight.continuation_context) {
-            Ok(()) => {
-                if failure_reason.is_none() {
-                    self.push_event(
-                        in_flight.requester.isolate,
-                        Some(in_flight.cause),
-                        RuntimeEventKind::CallCompleted {
-                            call_id,
-                            call_kind: in_flight.call_kind,
-                        },
-                    );
+        self.deliver_backend_completion_action(
+            entry_index,
+            in_flight,
+            call_id,
+            completion,
+            failure_reason,
+        );
+    }
+
+    fn deliver_backend_completion_action(
+        &mut self,
+        entry_index: usize,
+        in_flight: InFlightCall,
+        call_id: CallId,
+        completion: ErasedRuntimeCallCompletion,
+        failure_reason: Option<CallError>,
+    ) {
+        match completion {
+            ErasedRuntimeCallCompletion::Message(message) => {
+                match self.enqueue_entry_message(
+                    entry_index,
+                    message,
+                    in_flight.continuation_context,
+                ) {
+                    Ok(()) => {
+                        if failure_reason.is_none() {
+                            self.push_event(
+                                in_flight.requester.isolate,
+                                Some(in_flight.cause),
+                                RuntimeEventKind::CallCompleted {
+                                    call_id,
+                                    call_kind: in_flight.call_kind,
+                                },
+                            );
+                        }
+                        // For failed results we already emitted `CallFailed`
+                        // above; the translator's message reaching the mailbox
+                        // is the expected behavior and does not need a second
+                        // event.
+                    }
+                    Err(TrySendError::Full(_)) => {
+                        self.push_event(
+                            in_flight.requester.isolate,
+                            Some(in_flight.cause),
+                            RuntimeEventKind::CallCompletionRejected {
+                                call_id,
+                                call_kind: in_flight.call_kind,
+                                reason: CallCompletionRejectedReason::MailboxFull,
+                            },
+                        );
+                    }
+                    Err(TrySendError::Closed(_)) => {
+                        self.push_event(
+                            in_flight.requester.isolate,
+                            Some(in_flight.cause),
+                            RuntimeEventKind::CallCompletionRejected {
+                                call_id,
+                                call_kind: in_flight.call_kind,
+                                reason: CallCompletionRejectedReason::RequesterClosed,
+                            },
+                        );
+                    }
                 }
-                // For failed results we already emitted `CallFailed`
-                // above; the translator's message reaching the mailbox
-                // is the expected behavior and does not need a second
-                // event.
             }
-            Err(TrySendError::Full(_)) => {
+            ErasedRuntimeCallCompletion::Noop => {
                 self.push_event(
                     in_flight.requester.isolate,
                     Some(in_flight.cause),
-                    RuntimeEventKind::CallCompletionRejected {
+                    RuntimeEventKind::CallCompleted {
                         call_id,
                         call_kind: in_flight.call_kind,
-                        reason: CallCompletionRejectedReason::MailboxFull,
                     },
                 );
-            }
-            Err(TrySendError::Closed(_)) => {
                 self.push_event(
                     in_flight.requester.isolate,
                     Some(in_flight.cause),
-                    RuntimeEventKind::CallCompletionRejected {
+                    RuntimeEventKind::CallCompletionAction {
                         call_id,
                         call_kind: in_flight.call_kind,
-                        reason: CallCompletionRejectedReason::RequesterClosed,
+                        action: TerminalCompletionAction::Noop,
                     },
                 );
+            }
+            ErasedRuntimeCallCompletion::StopRequester => {
+                self.push_event(
+                    in_flight.requester.isolate,
+                    Some(in_flight.cause),
+                    RuntimeEventKind::CallCompleted {
+                        call_id,
+                        call_kind: in_flight.call_kind,
+                    },
+                );
+                let action = self.push_event(
+                    in_flight.requester.isolate,
+                    Some(in_flight.cause),
+                    RuntimeEventKind::CallCompletionAction {
+                        call_id,
+                        call_kind: in_flight.call_kind,
+                        action: TerminalCompletionAction::StopRequester,
+                    },
+                );
+                self.stop_entry(entry_index, in_flight.requester.isolate, action.into());
             }
         }
     }
@@ -3433,6 +3510,17 @@ where
         };
 
         erase_effect_sendable::<I, S, F, Outbound>(effect)
+    }
+}
+
+fn call_output_failure_reason(result: &CallOutput) -> Option<CallError> {
+    match result {
+        CallOutput::Failed(reason)
+        | CallOutput::TcpReadBufFailed { error: reason, .. }
+        | CallOutput::TcpWroteOwnedFailed { error: reason, .. }
+        | CallOutput::TlsReadBufFailed { error: reason, .. }
+        | CallOutput::TlsWroteOwnedFailed { error: reason, .. } => Some(*reason),
+        _ => None,
     }
 }
 

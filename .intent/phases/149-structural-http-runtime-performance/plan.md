@@ -2,9 +2,11 @@
 
 ## Status
 
-- Planned after Phase 148.
-- One PR if possible, but not tiny on purpose.
+- Implemented in one PR after Phase 148.
 - Builds on Phase 148 perf history, hotpath rows, Linux workflow, and long soak.
+- Outcome: sharper measurement, warmed keepalive rows, terminal completion
+  action, and an HTTP/1 close-after-write user. Not a production performance
+  claim; HTTP/2/WebSocket rows and repeated Linux evidence remain next work.
 
 ## Grug Truth
 

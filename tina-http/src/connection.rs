@@ -45,9 +45,10 @@ use http::StatusCode;
 use tina::prelude::*;
 use tina::{CallContext, RequestContext, reply_to_request};
 use tina_runtime::{
-    CallError, CallOutcome, TcpReadBufReply, TcpWriteOwnedCloseReply, TcpWriteOwnedReply,
-    TlsReadBufReply, TlsWriteOwnedReply, call, sleep, tcp_close_stream, tcp_read_buf,
-    tcp_write_owned, tcp_write_owned_close, tls_close, tls_read_buf, tls_write_owned,
+    CallError, CallInput, CallOutcome, CallOutput, RuntimeCall, RuntimeCallCompletion,
+    TcpReadBufReply, TcpWriteOwnedCloseReply, TcpWriteOwnedReply, TlsReadBufReply,
+    TlsWriteOwnedReply, call, sleep, tcp_close_stream, tcp_read_buf, tcp_write_owned, tls_close,
+    tls_read_buf, tls_write_owned,
 };
 
 use crate::body_metrics::BodyMetrics;
@@ -1253,8 +1254,21 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
     fn write_pending_close(&mut self) -> Effect<Self> {
         let bytes = std::mem::take(&mut self.pending_response);
         match self.transport {
-            HttpTransport::Tcp(stream) => tcp_write_owned_close(stream, bytes)
-                .then(|result| HttpConnectionMsg::WroteClose(result.map_err(|error| error.error))),
+            HttpTransport::Tcp(stream) => Effect::Call(RuntimeCall::new_with_completion(
+                CallInput::TcpWriteOwnedClose { stream, bytes },
+                |output| match output {
+                    CallOutput::TcpWroteOwnedClose {
+                        bytes,
+                        count,
+                        closed,
+                    } if count >= bytes.len() && closed => RuntimeCallCompletion::StopRequester,
+                    other => RuntimeCallCompletion::Message(HttpConnectionMsg::WroteClose(
+                        other
+                            .into_tcp_wrote_owned_close()
+                            .map_err(|error| error.error),
+                    )),
+                },
+            )),
             HttpTransport::Tls(_) => {
                 self.pending_response = bytes;
                 self.write_pending()

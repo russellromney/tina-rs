@@ -10,7 +10,7 @@
 
 set -euo pipefail
 
-HISTORY_FILE="${TINA_PERF_HISTORY_FILE:-.intent/phases/148-native-performance-linux-turn-soak/perf_history.jsonl}"
+HISTORY_FILE="${TINA_PERF_HISTORY_FILE:-.intent/phases/149-structural-http-runtime-performance/perf_history.jsonl}"
 WINDOW="${PERF_CHECK_WINDOW:-5}"
 THRESHOLD_PERCENT="${PERF_CHECK_THRESHOLD:-25}"
 ABS_TOLERANCE_NS="${PERF_CHECK_ABS_TOLERANCE_NS:-500000}"
@@ -116,9 +116,25 @@ fi
 for label in $hotpath_labels; do
   line=$(grep "^hotpath label=$label " <<< "$output" | head -1 || true)
   stage_count=$(grep -oE 'stage_count=[0-9]+' <<< "$line" | head -1 | cut -d= -f2 || true)
+  event_stage_count=$(grep -oE 'event_stage_count=[0-9]+' <<< "$line" | head -1 | cut -d= -f2 || true)
+  handler_turn_count=$(grep -oE 'handler_turn_count=[0-9]+' <<< "$line" | head -1 | cut -d= -f2 || true)
+  runtime_call_count=$(grep -oE 'runtime_call_count=[0-9]+' <<< "$line" | head -1 | cut -d= -f2 || true)
+  service_call_count=$(grep -oE 'service_call_count=[0-9]+' <<< "$line" | head -1 | cut -d= -f2 || true)
+  completion_count=$(grep -oE 'completion_count=[0-9]+' <<< "$line" | head -1 | cut -d= -f2 || true)
+  rejected_completion_count=$(grep -oE 'rejected_completion_count=[0-9]+' <<< "$line" | head -1 | cut -d= -f2 || true)
   process_allocs=$(grep -oE 'process_allocations=[0-9]+' <<< "$line" | head -1 | cut -d= -f2 || true)
   if [[ -z $stage_count ]]; then
     printf '%-40s %12s %12s %12s %8s %s\n' "$label" "?" "?" "${process_allocs:-?}" "?" "skipped (no stage_count)"
+    continue
+  fi
+  if [[ -z $event_stage_count || -z $handler_turn_count || -z $runtime_call_count || -z $service_call_count || -z $completion_count || -z $rejected_completion_count ]]; then
+    printf '%-40s %12s %12s %12s %8s %s\n' "$label" "$stage_count" "?" "${process_allocs:-?}" "?" "MISSING NEW COUNTERS"
+    fail=1
+    continue
+  fi
+  if (( event_stage_count != stage_count )); then
+    printf '%-40s %12s %12s %12s %8s %s\n' "$label" "$stage_count" "$event_stage_count" "${process_allocs:-?}" "?" "event_stage_count != stage_count"
+    fail=1
     continue
   fi
 

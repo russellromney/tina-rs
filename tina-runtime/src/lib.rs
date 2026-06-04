@@ -200,18 +200,18 @@ pub use call::{
     AdmitWorkError, CallError, CallId, CallInput, CallOutcome, CallOutput, CallReply,
     CancelableCall, CancelableWork, CancelableWorkSnapshot, DeferredCancelableCall,
     DeferredIsolateCall, DeferredObservedSend, DeferredTypedCall, DnsLookupReply, ErasedCall,
-    FileCloseReply, FileFsyncReply, FileId, FileOpenOptions, FileOpenReply, FileReadReply,
-    FileSizeReply, FileWriteReply, IntoErasedCall, IsolateCall, IsolateCallWithHandle,
-    JournalAppendReply, JournalRecord, JournalReplay, JournalReplayReply, JournalReplayWarning,
-    ListenerId, MkdirReply, PathKind, PathMetadata, PathMetadataReply, PendingCancelableCall,
-    PendingCancelableCallSet, PendingCancelableInsertError, PendingCancelableRemoveError,
-    PendingCancelableTicket, PersistenceTraceInfo, ProcessRunReply, ProcessRunResult,
-    ProcessStatus, ReadDirReply, RemoveFileReply, RenameReplaceReply,
+    ErasedRuntimeCallCompletion, FileCloseReply, FileFsyncReply, FileId, FileOpenOptions,
+    FileOpenReply, FileReadReply, FileSizeReply, FileWriteReply, IntoErasedCall, IsolateCall,
+    IsolateCallWithHandle, JournalAppendReply, JournalRecord, JournalReplay, JournalReplayReply,
+    JournalReplayWarning, ListenerId, MkdirReply, PathKind, PathMetadata, PathMetadataReply,
+    PendingCancelableCall, PendingCancelableCallSet, PendingCancelableInsertError,
+    PendingCancelableRemoveError, PendingCancelableTicket, PersistenceTraceInfo, ProcessRunReply,
+    ProcessRunResult, ProcessStatus, ReadDirReply, RemoveFileReply, RenameReplaceReply,
     RequestDeferredCancelableCall, RequestDeferredIsolateCall, RequestDeferredObservedSend,
-    RequestDeferredTypedCall, RuntimeCall, RuntimeCallParts, RuntimeCallable, SendOutcome,
-    SignalWaitReply, SleepCall, SleepReply, SnapshotCommitReply, SnapshotImage, SnapshotLoadReply,
-    StreamId, SyncParentReply, TcpAcceptReply, TcpBindReply, TcpConnectReply,
-    TcpListenerCloseReply, TcpReadBufReply, TcpReadReply, TcpStreamCloseReply,
+    RequestDeferredTypedCall, RuntimeCall, RuntimeCallCompletion, RuntimeCallParts,
+    RuntimeCallable, SendOutcome, SignalWaitReply, SleepCall, SleepReply, SnapshotCommitReply,
+    SnapshotImage, SnapshotLoadReply, StreamId, SyncParentReply, TcpAcceptReply, TcpBindReply,
+    TcpConnectReply, TcpListenerCloseReply, TcpReadBufReply, TcpReadReply, TcpStreamCloseReply,
     TcpWriteOwnedCloseReply, TcpWriteOwnedReply, TcpWriteReply, TlsAcceptReply, TlsBindReply,
     TlsCloseReply, TlsConnectReply, TlsListenerCloseReply, TlsListenerId, TlsReadBufReply,
     TlsReadReply, TlsStreamId, TlsWriteOwnedReply, TlsWriteReply, TypedCall, UdpBindReply,
@@ -312,7 +312,7 @@ pub use trace::{
     CallCompletionRejectedReason, CallKind, CallReplyRejectedReason, CauseId,
     DeferredReplyRejectedReason, DeferredSlotId, EffectKind, EventId, RestartSkippedReason,
     RuntimeEvent, RuntimeEventKind, RuntimeTraceExt, SendRejectedReason, SupervisionRejectedReason,
-    stable_trace_hash,
+    TerminalCompletionAction, stable_trace_hash,
 };
 pub use unix_loops::{UnixReadToEof, UnixWriteAll};
 pub use wait_list::{
@@ -477,7 +477,7 @@ pub(crate) struct CallDispatchContext {
     pub(crate) continuation_context: Option<MessageCallContext>,
 }
 
-pub(crate) type ErasedTranslator = Box<dyn FnOnce(CallOutput) -> Box<dyn Any>>;
+pub(crate) type ErasedTranslator = Box<dyn FnOnce(CallOutput) -> call::ErasedRuntimeCallCompletion>;
 pub(crate) type ErasedIsolateCallTranslator =
     Box<dyn FnOnce(CallOutcome<Box<dyn Any>>) -> Box<dyn Any>>;
 

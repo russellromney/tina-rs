@@ -66,7 +66,8 @@ pub(crate) struct IsolateCallDeliveryContext {
     pub(crate) visible_at_step: u64,
 }
 
-pub(crate) type ErasedTranslator = Box<dyn FnOnce(CallOutput) -> Box<dyn Any>>;
+pub(crate) type ErasedTranslator =
+    Box<dyn FnOnce(CallOutput) -> tina_runtime::ErasedRuntimeCallCompletion>;
 pub(crate) type ErasedIsolateCallTranslator =
     Box<dyn FnOnce(CallOutcome<Box<dyn Any>>) -> Box<dyn Any>>;
 pub(crate) type ErasedCancelCallTranslator = Box<dyn FnOnce(tina::CancelOutcome) -> Box<dyn Any>>;
@@ -670,8 +671,18 @@ where
                 } => ErasedCall {
                     kind: ErasedCallKind::Backend {
                         request,
-                        translator: Box::new(move |result| {
-                            Box::new(translator(result)) as Box<dyn Any>
+                        translator: Box::new(move |result| match translator(result) {
+                            tina_runtime::RuntimeCallCompletion::Message(message) => {
+                                tina_runtime::ErasedRuntimeCallCompletion::Message(
+                                    Box::new(message) as Box<dyn Any>,
+                                )
+                            }
+                            tina_runtime::RuntimeCallCompletion::StopRequester => {
+                                tina_runtime::ErasedRuntimeCallCompletion::StopRequester
+                            }
+                            tina_runtime::RuntimeCallCompletion::Noop => {
+                                tina_runtime::ErasedRuntimeCallCompletion::Noop
+                            }
                         }),
                     },
                 },

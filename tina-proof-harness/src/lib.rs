@@ -52,8 +52,8 @@ pub use load::{
     surface_plateaued_cleanly, timer_kept_firing,
 };
 pub use perf::{
-    HotPathReport, HotPathStage, PerfAllocationReport, PerfComparisonReport, PerfEnvironment,
-    PerfReport, SemanticMatch,
+    HotPathCounters, HotPathReport, HotPathStage, PerfAllocationReport, PerfComparisonReport,
+    PerfEnvironment, PerfReport, SemanticMatch,
 };
 pub use protocol_chaos::{
     ChaosField, PeerAction, ProtocolChaosCase, ProtocolChaosExpectation, ProtocolChaosFamily,

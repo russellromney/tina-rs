@@ -9,7 +9,7 @@ use std::cell::Cell;
 use std::convert::Infallible;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -96,6 +96,8 @@ pub fn run_all() -> anyhow::Result<Vec<PerfComparisonReport>> {
         http1_close_compare()?,
         http1_keepalive_compare()?,
         http1_fixed_body_compare()?,
+        http1_keepalive_steady_state_small_compare()?,
+        http1_keepalive_steady_state_fixed_compare()?,
     ])
 }
 
@@ -166,6 +168,26 @@ pub fn http1_fixed_body_compare() -> anyhow::Result<PerfComparisonReport> {
         tokio_http1_fixed_body_row,
         SemanticMatch::Partial,
         "same close-per-request client reads a fixed 4096-byte response body; native tina-http vs axum/hyper",
+    )
+}
+
+pub fn http1_keepalive_steady_state_small_compare() -> anyhow::Result<PerfComparisonReport> {
+    compare_samples(
+        "http1_keepalive_steady_state_small",
+        tina_http1_keepalive_steady_state_small_row,
+        tokio_http1_keepalive_steady_state_small_row,
+        SemanticMatch::Partial,
+        "same warmed keepalive stream per load worker; native tina-http vs axum/hyper",
+    )
+}
+
+pub fn http1_keepalive_steady_state_fixed_compare() -> anyhow::Result<PerfComparisonReport> {
+    compare_samples(
+        "http1_keepalive_steady_state_fixed",
+        tina_http1_keepalive_steady_state_fixed_row,
+        tokio_http1_keepalive_steady_state_fixed_row,
+        SemanticMatch::Partial,
+        "same warmed keepalive stream per load worker with 4096-byte body; native tina-http vs axum/hyper",
     )
 }
 
@@ -770,6 +792,38 @@ fn tokio_http1_fixed_body_row() -> anyhow::Result<PerfReport> {
     )
 }
 
+fn tina_http1_keepalive_steady_state_small_row() -> anyhow::Result<PerfReport> {
+    tina_http_steady_state_row(
+        "tina_http1_keepalive_steady_state_small",
+        "http1_keepalive_steady_state_small",
+        small_body(),
+    )
+}
+
+fn tokio_http1_keepalive_steady_state_small_row() -> anyhow::Result<PerfReport> {
+    tokio_http_steady_state_row(
+        "axum_http1_keepalive_steady_state_small",
+        "http1_keepalive_steady_state_small",
+        small_body(),
+    )
+}
+
+fn tina_http1_keepalive_steady_state_fixed_row() -> anyhow::Result<PerfReport> {
+    tina_http_steady_state_row(
+        "tina_http1_keepalive_steady_state_fixed",
+        "http1_keepalive_steady_state_fixed",
+        fixed_body(),
+    )
+}
+
+fn tokio_http1_keepalive_steady_state_fixed_row() -> anyhow::Result<PerfReport> {
+    tokio_http_steady_state_row(
+        "axum_http1_keepalive_steady_state_fixed",
+        "http1_keepalive_steady_state_fixed",
+        fixed_body(),
+    )
+}
+
 fn tina_http_row(
     label: &'static str,
     kind: &'static str,
@@ -830,6 +884,42 @@ fn tina_http_row(
         load,
         allocations,
     ))
+}
+
+fn tina_http_steady_state_row(
+    label: &'static str,
+    kind: &'static str,
+    body: Vec<u8>,
+) -> anyhow::Result<PerfReport> {
+    let runtime = new_runtime();
+    let expected_len = body.len();
+    let service = runtime
+        .register_with_capacity::<_, Infallible>(
+            BodyService {
+                body: Arc::new(body),
+            },
+            CAPACITY,
+        )
+        .map_err(|e| anyhow::anyhow!("register tina steady http service: {e:?}"))?;
+    let mut config = HttpServerConfig::dev();
+    config.limits.keepalive_idle_timeout = Some(Duration::from_secs(2));
+    let listener = runtime
+        .register_with_capacity::<_, Infallible>(
+            HttpListener::<SingleShard>::with_config("127.0.0.1:0".parse()?, service, config),
+            config.listener_mailbox_capacity,
+        )
+        .map_err(|e| anyhow::anyhow!("register tina steady http listener: {e:?}"))?;
+    let bound = runtime.observe_next_bound();
+    runtime
+        .try_send(listener, HttpListenerMsg::Start)
+        .map_err(|e| anyhow::anyhow!("start tina steady http listener: {e:?}"))?;
+    let addr = bound
+        .wait(Duration::from_secs(2))
+        .map_err(|e| anyhow::anyhow!("observe tina steady http bind: {e:?}"))?;
+    let report = http_steady_state_load(label, kind, addr, expected_len)?;
+    let _ = runtime.try_send(listener, HttpListenerMsg::Stop);
+    shutdown_runtime(runtime)?;
+    Ok(report)
 }
 
 fn tokio_http_row(
@@ -895,6 +985,50 @@ fn tokio_http_row(
         load,
         allocations,
     ))
+}
+
+fn tokio_http_steady_state_row(
+    label: &'static str,
+    kind: &'static str,
+    body: Vec<u8>,
+) -> anyhow::Result<PerfReport> {
+    let expected_len = body.len();
+    let body = Arc::new(body);
+    let (addr_tx, addr_rx) = std::sync::mpsc::channel::<SocketAddr>();
+    let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+    let (stop_tx, stop_rx) = oneshot::channel::<()>();
+    let handle = thread::spawn(move || {
+        let runtime = Builder::new_current_thread().enable_all().build().unwrap();
+        runtime.block_on(async move {
+            let app_body = Arc::clone(&body);
+            let app = Router::new().route(
+                "/",
+                get(move || {
+                    let body = Arc::clone(&app_body);
+                    async move { body.as_ref().clone() }
+                }),
+            );
+            let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind axum");
+            addr_tx
+                .send(listener.local_addr().expect("axum local addr"))
+                .expect("publish axum addr");
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async move {
+                    let _ = stop_rx.await;
+                })
+                .await
+                .expect("serve axum");
+            let _ = done_tx.send(());
+        });
+    });
+    let addr = addr_rx.recv_timeout(Duration::from_secs(2))?;
+    let report = http_steady_state_load(label, kind, addr, expected_len)?;
+    let _ = stop_tx.send(());
+    done_rx.recv_timeout(Duration::from_secs(2))?;
+    handle
+        .join()
+        .map_err(|_| anyhow::anyhow!("tokio steady http worker panicked"))?;
+    Ok(report)
 }
 
 fn register_counter(
@@ -1230,6 +1364,80 @@ fn http_get(
         read_one_response(&mut stream, expected_body_len)?;
     }
     Ok(())
+}
+
+fn http_steady_state_load(
+    label: &'static str,
+    kind: &'static str,
+    addr: SocketAddr,
+    expected_body_len: usize,
+) -> anyhow::Result<PerfReport> {
+    let mut streams = Vec::with_capacity(WORKERS);
+    for _ in 0..WORKERS {
+        let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(2))?;
+        stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+        http_get_on_stream(&mut stream, false, expected_body_len)?;
+        streams.push(Mutex::new(Some(stream)));
+    }
+    let streams = Arc::new(streams);
+    let process_before = ProcessSnapshot::now();
+    let (load, allocations) = {
+        let streams = Arc::clone(&streams);
+        run_counted(
+            LoadRun {
+                workers: WORKERS,
+                stop: LoadStop::ops(HTTP_OPS),
+                label,
+            },
+            move |worker_id| {
+                let Some(slot) = streams.get(worker_id) else {
+                    return OpOutcome::Err {
+                        kind: "missing_worker_stream",
+                    };
+                };
+                let mut guard = slot.lock().expect("steady stream lock");
+                let Some(stream) = guard.as_mut() else {
+                    return OpOutcome::Err {
+                        kind: "closed_worker_stream",
+                    };
+                };
+                match http_get_on_stream(stream, false, expected_body_len) {
+                    Ok(()) => OpOutcome::Ok,
+                    Err(_) => OpOutcome::Err { kind: "http_error" },
+                }
+            },
+            None::<fn() -> LoadObservation>,
+        )
+    };
+    let (allocs_delta, allocated_bytes_delta, rss_delta) =
+        ProcessSnapshot::now().delta_from(process_before);
+    print_process_metrics(label, allocs_delta, allocated_bytes_delta, rss_delta);
+    for slot in streams.iter() {
+        if let Some(mut stream) = slot.lock().expect("steady stream lock").take() {
+            let _ = http_get_on_stream(&mut stream, true, expected_body_len);
+        }
+    }
+    Ok(PerfReport::from_load_with_allocations(
+        label,
+        kind,
+        load,
+        allocations,
+    ))
+}
+
+fn http_get_on_stream(
+    stream: &mut TcpStream,
+    close: bool,
+    expected_body_len: usize,
+) -> anyhow::Result<()> {
+    let request = if close {
+        b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n".as_slice()
+    } else {
+        b"GET / HTTP/1.1\r\nHost: x\r\nConnection: keep-alive\r\n\r\n".as_slice()
+    };
+    stream.write_all(request)?;
+    stream.flush()?;
+    read_one_response(stream, expected_body_len)
 }
 
 fn http_post_declared_too_large(addr: SocketAddr, declared_len: usize) -> anyhow::Result<()> {

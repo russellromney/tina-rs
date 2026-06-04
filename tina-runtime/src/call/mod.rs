@@ -198,7 +198,7 @@ impl<M> RuntimeCallable for RuntimeCall<M> {}
 enum RuntimeCallKind<M> {
     Backend {
         request: CallInput,
-        translator: Box<dyn FnOnce(CallOutput) -> M>,
+        translator: Box<dyn FnOnce(CallOutput) -> RuntimeCallCompletion<M>>,
     },
     ObservedSend {
         target_shard: ShardId,
@@ -227,6 +227,29 @@ enum RuntimeCallKind<M> {
     },
 }
 
+/// What a backend runtime call should do when it completes.
+///
+/// Most calls produce an ordinary later-turn message. Terminal protocol code
+/// may use the narrower actions to avoid a handler turn when no user policy
+/// boundary is crossed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeCallCompletion<M> {
+    /// Deliver the message to the requesting isolate, which is the ordinary
+    /// Tina completion path.
+    Message(M),
+    /// Stop the requesting isolate after a successful backend completion.
+    StopRequester,
+    /// Record the successful backend completion and enqueue no message.
+    Noop,
+}
+
+#[doc(hidden)]
+pub enum ErasedRuntimeCallCompletion {
+    Message(Box<dyn Any>),
+    StopRequester,
+    Noop,
+}
+
 impl<M> RuntimeCall<M> {
     /// Creates a new runtime-owned call request.
     ///
@@ -238,6 +261,22 @@ impl<M> RuntimeCall<M> {
     pub fn new<F>(request: CallInput, translator: F) -> Self
     where
         F: FnOnce(CallOutput) -> M + 'static,
+    {
+        Self::new_with_completion(request, move |output| {
+            RuntimeCallCompletion::Message(translator(output))
+        })
+    }
+
+    /// Creates a runtime-owned call request with a terminal completion action.
+    ///
+    /// This is deliberately narrower than "run another effect". Use
+    /// [`RuntimeCallCompletion::Message`] for normal user-visible continuations.
+    /// `StopRequester` and `Noop` are for protocol-internal terminal work after
+    /// a successful backend completion; backend failures still use the ordinary
+    /// message path so failure truth cannot disappear.
+    pub fn new_with_completion<F>(request: CallInput, translator: F) -> Self
+    where
+        F: FnOnce(CallOutput) -> RuntimeCallCompletion<M> + 'static,
     {
         Self {
             kind: RuntimeCallKind::Backend {
@@ -383,12 +422,23 @@ impl<M> RuntimeCall<M> {
     }
 
     /// Splits the call into its request and translator.
-    pub fn into_parts(self) -> (CallInput, Box<dyn FnOnce(CallOutput) -> M>) {
+    pub fn into_parts(self) -> (CallInput, Box<dyn FnOnce(CallOutput) -> M>)
+    where
+        M: 'static,
+    {
         match self.kind {
             RuntimeCallKind::Backend {
                 request,
                 translator,
-            } => (request, translator),
+            } => (
+                request,
+                Box::new(move |output| match translator(output) {
+                    RuntimeCallCompletion::Message(message) => message,
+                    RuntimeCallCompletion::StopRequester | RuntimeCallCompletion::Noop => {
+                        panic!("RuntimeCall::into_parts cannot unwrap a terminal completion action")
+                    }
+                }),
+            ),
             RuntimeCallKind::ObservedSend { .. } => {
                 panic!("observed send does not carry backend call parts")
             }
@@ -471,7 +521,7 @@ pub enum RuntimeCallParts<M> {
         /// Concrete backend request.
         request: CallInput,
         /// Completion translator.
-        translator: Box<dyn FnOnce(CallOutput) -> M>,
+        translator: Box<dyn FnOnce(CallOutput) -> RuntimeCallCompletion<M>>,
     },
     /// Runtime-observed send request.
     ObservedSend {
@@ -549,7 +599,7 @@ pub(crate) enum ErasedCallKind {
         /// Concrete backend request.
         request: CallInput,
         /// Completion translator erased to `Any`.
-        translator: Box<dyn FnOnce(CallOutput) -> Box<dyn Any>>,
+        translator: Box<dyn FnOnce(CallOutput) -> ErasedRuntimeCallCompletion>,
     },
     /// Runtime-observed send attempt.
     ObservedSend {
@@ -630,8 +680,14 @@ where
             } => ErasedCall {
                 kind: ErasedCallKind::Backend {
                     request,
-                    translator: Box::new(move |result| {
-                        Box::new(translator(result)) as Box<dyn Any>
+                    translator: Box::new(move |result| match translator(result) {
+                        RuntimeCallCompletion::Message(message) => {
+                            ErasedRuntimeCallCompletion::Message(Box::new(message))
+                        }
+                        RuntimeCallCompletion::StopRequester => {
+                            ErasedRuntimeCallCompletion::StopRequester
+                        }
+                        RuntimeCallCompletion::Noop => ErasedRuntimeCallCompletion::Noop,
                     }),
                 },
             },

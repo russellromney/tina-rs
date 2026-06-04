@@ -4,6 +4,25 @@ This file records completed work.
 
 ## Unreleased
 
+### Structural HTTP/Runtime Performance
+
+- Moved perf history defaults to Phase 149 and added hotpath counters that
+  separate trace-event stages from handler turns, backend calls, service calls,
+  successful completions, and rejected completions.
+- Added steady-state HTTP/1 keepalive comparison and hotpath rows that reuse
+  warmed connections, so request cost after session setup is visible beside
+  connect/accept rows.
+- Added a narrow runtime terminal completion action for backend calls:
+  `Message`, `StopRequester`, and `Noop`. Native HTTP/1 uses it for successful
+  full TCP write-close completions, removing the extra `WroteClose` handler
+  turn while preserving partial-write and failure paths.
+- Added trace and pressure vocabulary for terminal completion actions and
+  terminal-action-on-failure rejection, with live and simulator delivery paths
+  preserving failure truth.
+- Extended `perf_native` rows to include steady-state keepalive small/fixed
+  HTTP/1 comparisons against Axum/hyper. Local macOS/aarch64 evidence remains
+  alpha evidence, not a production performance claim.
+
 ### Native Performance Rows And Soak Truth
 
 - Moved perf history to Phase 148 and taught `perf_record.sh` /

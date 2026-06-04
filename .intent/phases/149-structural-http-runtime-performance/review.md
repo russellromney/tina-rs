@@ -62,3 +62,49 @@ Decision:
 - Plan remains implementation-ready. The important shape is sharper now: reduce
   structural cost, but every fast path must preserve stop cleanup, completion
   truth, trace stability, pressure truth, and replay honesty.
+
+## Implementation Review
+
+Findings:
+
+- [P2] The terminal completion action must not hide backend failure. The live
+  and simulator dispatch paths now classify failed `CallOutput` first. If a
+  translator returns `StopRequester`/`Noop` for a failed backend call, the
+  runtime records `CallFailed` plus
+  `CallCompletionRejected(TerminalActionOnFailure)` and enqueues no terminal
+  action. `runtime_terminal_completion_action.rs` proves the bad-stream case,
+  and `tina-sim/tests/timer_semantics.rs` proves terminal stop/noop actions in
+  the simulator.
+- [P2] `StopRequester` must use ordinary stop truth. The implementation routes
+  through `stop_entry`, emits `CallCompleted` plus `CallCompletionAction`, and
+  tests that the isolate reaches the ordinary `IsolateStopped` path.
+- [P2] HTTP partial/failure write-close must stay on the old path. The HTTP/1
+  fast path only returns `StopRequester` for `TcpWroteOwnedClose` when the
+  backend wrote the full buffer and closed the stream. Partial writes and
+  failures still become `WroteClose`, so body pressure/retry/error behavior
+  stays in the handler.
+- [P2] A tempting single-shard worker-loop "yield while in-flight" change was
+  tested and rejected. It worsened local hotpath noise and pulled stale tail
+  facts into the measured window. It was removed.
+- [P3] Phase 149 did not finish HTTP/2/WebSocket equivalent workload rows or
+  Linux/x86 repeated evidence. Those remain next-performance-pass work, not
+  hidden as done.
+
+Evidence from local macOS/aarch64 release sample:
+
+- `hotpath_http1_fixed_body_close`: 26 event stages, 4 handler turns, 3 runtime
+  calls, 1 service call, 44 process allocations.
+- `hotpath_http1_keepalive_steady_state_small`: 16 event stages, 3 handler
+  turns, 1 runtime call, 1 service call, 44 process allocations.
+- `http1_keepalive_steady_state_small`: Tina p50 0.36 ms vs Axum p50 0.39 ms;
+  Tina p90/p99 remain much worse/noisier.
+- `http1_keepalive_steady_state_fixed`: Tina p50 0.37 ms vs Axum p50 0.42 ms;
+  Tina p90/p99 remain much worse/noisier.
+
+Decision:
+
+- This phase earns merge as a structural improvement and measurement cleanup,
+  not as a production performance claim. Tina HTTP/1 p50 is now in the same
+  neighborhood as Axum on these local rows, but tails are still bad enough
+  that the next pass should attack remaining turn/scheduling wobble and add
+  Linux/x86, HTTP/2, and WebSocket rows.
