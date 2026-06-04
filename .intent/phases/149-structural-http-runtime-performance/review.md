@@ -33,3 +33,32 @@ Decision:
   narrow: terminal completion action, not arbitrary continuation effects. The
   phase is not done unless at least one structural turn path improves and at
   least one process-allocation row improves.
+
+## Plan Review 2
+
+Findings:
+
+- [P2] `StopRequester` could accidentally become a special stop path. Plan now
+  requires it to use the same cleanup/trace path as normal `Effect::Stop`, with
+  fairness/load tests still passing.
+- [P2] `Noop` could hide failures. Plan now restricts `StopRequester`/`Noop` to
+  successful completions. Backend failures must still record `CallFailed` and
+  use the ordinary message path unless a typed terminal-failure action is added
+  and proved.
+- [P2] Terminal completion trace truth was underspecified. Plan now requires
+  successful terminal actions to still record `CallCompleted`, plus an
+  append-only terminal-action fact, and forbids renumbering stable tags.
+- [P2] Steady-state keepalive measurement can be polluted by warmup/tail events.
+  Plan now requires warmup/tail drain before the timed window.
+- [P3] Process allocation rows can lie under concurrent-client probes. Plan now
+  requires serial allocation measurement and treats concurrent rows as latency /
+  pressure rows unless the report explains cross-thread accounting.
+- [P3] Broader workload labels and baselines were too loose. Plan now pins row
+  labels, requires HTTP/1 Axum/hyper baselines, and requires review text for any
+  HTTP/2/WebSocket missing baseline.
+
+Decision:
+
+- Plan remains implementation-ready. The important shape is sharper now: reduce
+  structural cost, but every fast path must preserve stop cleanup, completion
+  truth, trace stability, pressure truth, and replay honesty.

@@ -115,6 +115,8 @@ Build:
 Proof:
 
 - hotpath test fails if any HTTP row omits the new counters;
+- hotpath tests assert loose ceilings for the new counters separately from
+  `event_stage_count`; do not use one fuzzy count as proof for all;
 - scripts parse sample rows with new fields;
 - README says which rows include connect/accept and which isolate request cost.
 
@@ -127,6 +129,7 @@ Build:
 - add a hotpath probe that:
   - opens one TCP connection;
   - warms with at least one keepalive request;
+  - drains warmup/tail trace events before the timed window;
   - measures N single requests over the same stream;
   - does not reconnect per op;
   - closes at the end;
@@ -139,8 +142,8 @@ Proof:
 - steady-state Tina row returns correct body for every measured request;
 - steady-state baseline row returns same body;
 - row labels are stable:
-  - `http1_keepalive_steady_state`
-  - `hotpath_http1_keepalive_steady_state`
+  - `http1_keepalive_steady_state_small`
+  - `hotpath_http1_keepalive_steady_state_small`
 - row docs say this is request cost after session setup, not connection setup.
 
 ## Rock 3: Terminal Completion Action Fast Path
@@ -151,12 +154,18 @@ Build this narrow runtime shape, not a fake async surface:
 
 - `RuntimeCallCompletion<M>`:
   - `Message(M)` — current behavior;
-  - `StopRequester` — stop the requester isolate after the backend completion;
-  - `Noop` — consume the completion and do nothing;
+  - `StopRequester` — after a successful backend completion, stop the
+    requester isolate through the same normal stop path as `Effect::Stop`;
+  - `Noop` — after a successful backend completion, record the completion and
+    enqueue no message;
 - `RuntimeCall::new_with_completion(request, translator)` where translator
   returns `RuntimeCallCompletion<M>`;
 - trace a new append-only event when `StopRequester` or `Noop` bypasses message
   delivery;
+- successful `StopRequester` / `Noop` still records `CallCompleted`;
+- failed backend work still records `CallFailed` and may not be hidden by
+  `StopRequester` / `Noop`; failures use the ordinary message path unless this
+  phase adds a typed terminal-failure action and proves it;
 - closed requester, missing requester, and fallback-message mailbox-full still
   record rejected truth;
 - no variant returns arbitrary `Effect<I>` in this phase.
@@ -174,6 +183,7 @@ Target first uses:
 Not allowed:
 
 - no hidden service response callback;
+- no user-isolate state mutation from the completion action;
 - no hidden retry;
 - no unbounded queue;
 - no body-pressure release outside the proven accounting path;
@@ -183,15 +193,22 @@ Proof:
 
 - unit tests for the new continuation shape:
   - success can stop requester without enqueuing a message;
+  - `StopRequester` runs the same cleanup/trace path as normal `stop()`;
   - success can noop without enqueuing a message;
+  - backend failure cannot be translated into silent noop;
   - fallback enqueues message;
   - requester closed records rejected truth;
   - mailbox full on fallback records rejected truth;
   - trace shows the terminal completion action as a real fact;
+- stable trace/effect/fact tags append only; no existing tag is renumbered;
 - HTTP tests prove small close response wire bytes still match;
 - HTTP hotpath row shows fewer handler turns or fewer event stages;
+- fairness/load report tests still pass; bypassing a completion message must not
+  create fake starvation or hide stopped-isolate truth;
 - `tina-http` body/keepalive/chunked/WebSocket upgrade tests still pass;
-- simulator/replay tests are updated only with append-only trace facts.
+- simulator/replay tests are updated only with append-only trace facts;
+- stale timeout/read completions after terminal stop stay visible as rejected
+  tail facts and do not leak resources.
 
 ## Rock 4: HTTP Allocation Cleanup With Real Wins
 
@@ -214,7 +231,8 @@ Allowed changes:
 - add `HttpResponse::with_static_body` or `HttpResponse::with_shared_body` only
   if the perf service can use it and a measured row improves;
 - a `Static`/`Shared` response body variant only if it reduces a measured row
-  and keeps write/body-pressure truth.
+  end-to-end, not merely moves a clone elsewhere, and keeps write/body-pressure
+  truth.
 
 Not allowed:
 
@@ -227,6 +245,9 @@ Not allowed:
 Proof:
 
 - at least one HTTP process-allocation row decreases materially;
+- process allocation rows are measured serially; concurrent-client rows must not
+  be used as allocation truth unless the report says how worker/background
+  allocations are counted;
 - exact-capacity encoder tests pass;
 - duplicate-header, many-header, malformed-header, body cap, chunked, and
   keepalive tests pass;
@@ -285,15 +306,29 @@ The current rows are too small to answer "can this be efficient?"
 
 Add these rows:
 
-- steady-state keepalive small response;
-- steady-state keepalive fixed body;
-- many concurrent keepalive clients against one listener;
-- HTTP/2 unary request through Tina client/server;
-- WebSocket echo round trip;
-- mini service `/health` hot row with capacity/report plumbing disabled.
+- steady-state keepalive small response:
+  `http1_keepalive_steady_state_small`;
+- steady-state keepalive fixed body:
+  `http1_keepalive_steady_state_fixed`;
+- many bounded concurrent keepalive clients against one listener:
+  `http1_keepalive_concurrent_clients`;
+- HTTP/2 unary request through Tina client/server:
+  `http2_unary_native`;
+- WebSocket echo round trip:
+  `websocket_echo_native`;
+- mini service `/health` hot row with capacity/report plumbing disabled:
+  `mini_saas_health_hot`.
 
 Each row must have an equivalent baseline or an explicit
 `comparison_baseline=none` field.
+
+Baseline rules:
+
+- HTTP/1 rows must have an Axum/hyper baseline.
+- HTTP/2 and WebSocket rows may use `comparison_baseline=none` only if
+  `review.md` names the skipped baseline and why it is not in this PR.
+- concurrent-client rows must use a service-owned cap, not request-sized
+  fanout.
 
 Proof:
 
