@@ -252,3 +252,51 @@ Decision:
   the one catastrophic failure mode (a missed mark-ready). The recv cost is now
   O(ready); the residual cheap O(entries) passes and the hot-path lookup are
   documented honestly and a Fly re-measure will confirm no hot-path regression.
+
+## Implementation Review — Rock 5 (hostile, self-adversarial)
+
+Reviewer goal: break the typed host-call command — lose a Full/Closed/Timeout/
+Rejected outcome, bypass mailbox capacity, mutate isolate state from the host,
+or special-case SingleShard.
+
+Findings:
+
+- [P1][verified] OUTCOME TRUTH THROUGH THE NEW PATH. Every `call_blocking` now
+  travels the `HostCall` variant, so the existing threaded_call_blocking (10)
+  and host_burst (5) suites — which cover Replied/Full/Closed/Timeout/Rejected,
+  host-wait timeout, command-full, and bounded multi-threaded burst — now
+  exercise the new path and pass. `run_host_call` routes through
+  `runtime.try_send` (bounded dispatcher mailbox) and converts Full/Closed into
+  the host-visible `CallOutcome::Full`/`Closed` via the begin task's sender, so
+  no reject is dropped and capacity is not bypassed.
+- [P2][verified] RUNS ON THE WORKER, NOT THE HOST. `run_host_call` is invoked
+  only from the worker-thread command loop (exactly where the old boxed closure
+  ran), so the host thread never touches isolate state. Both the single- and
+  multi-shard loops handle `HostCall` at every command site (top try_recv,
+  hot-drain inner try_recv, and the idle park recv_timeout), so it is not a
+  SingleShard special case and is observed mid-hot-drain like any command.
+- [P2][verified] MEASURED, NOT ASSUMED. perf_native shows host alloc 2 -> 1,
+  process 6 -> 5 on call_blocking/_tail/_tail_traced; the ceiling is pinned at 2
+  so a regression to the closure box fails the test.
+- [P3][accepted] ENUM GREW. `ThreadedCommand` now sizes to the `HostCall`
+  variant (an Address + a box) instead of one box. A few extra bytes per
+  command-queue slot; negligible against the per-call allocation saved.
+- [P3][accepted] `'static` BOUND ADDED to the enum so `dyn HostCallTaskBegin<S>`
+  is nameable. Every real `ThreadedCommand` user already has `S: Send + 'static`
+  (that is `ThreadedRuntime`'s bound), and the whole crate + test suite compiles
+  unchanged, so this restricts nothing in practice.
+- [P3][accepted] NO NEW EXPLICIT HOST-CALL COUNTERS. The plan listed per-stage
+  counters (command accepted, dispatcher started, target started, reply sent).
+  The existing trace already emits these as MailboxAccepted / HandlerStarted
+  (dispatcher) / HandlerStarted (target) / CallCompleted, and Rock 1's hotpath
+  row counts them (handler_turn_count = 2, completion_count, etc.). Adding
+  parallel counters would duplicate existing trace facts, so they were not
+  added; the path is already observable.
+
+Decision:
+
+- The big host-call allocation win (per-call isolate registration -> persistent
+  dispatcher pool, 17 -> 6) was phase 145; Rock 5 here takes the incremental
+  2 -> 1 host / 6 -> 5 process by removing the redundant command-closure box
+  with a typed command, preserving every bound and outcome. The last host
+  allocation (the type-erased begin box) is irreducible for a shared dispatcher.
