@@ -3,11 +3,12 @@
 #
 # The history file is plain JSONL (newline-delimited JSON), append-only, and
 # checked into the repo so reviewers can see how the rows have moved over
-# time. Each line covers ONE row from ONE `make perf` invocation. Two row
+# time. Each line covers ONE row from ONE `make perf` invocation. Three row
 # shapes are emitted today:
 #
 #   {"kind":"compare", "timestamp":..., "git_sha":..., "platform":..., "arch":..., "profile":"release", "label":..., "tina_p50_ns":..., "tina_p90_ns":..., "tina_p99_ns":..., "tina_allocations":..., "tina_allocated_bytes":...}
 #   {"kind":"process", "timestamp":..., "git_sha":..., "platform":..., "arch":..., "profile":"release", "label":..., "process_allocations":..., "process_allocated_bytes":..., "rss_delta_kb":...}
+#   {"kind":"hotpath", "timestamp":..., "git_sha":..., "platform":..., "arch":..., "profile":"release", "label":..., "p50_ns":..., "stage_count":..., "host_allocations":..., "process_allocations":...}
 #
 # A `perf-compare` line stays the canonical "row" — `perf-process` lines are
 # extras emitted by HTTP rows (whole-process allocation + RSS delta).
@@ -19,7 +20,7 @@
 
 set -euo pipefail
 
-HISTORY_FILE="${TINA_PERF_HISTORY_FILE:-.intent/phases/147-http-turn-allocation-cost/perf_history.jsonl}"
+HISTORY_FILE="${TINA_PERF_HISTORY_FILE:-.intent/phases/148-native-performance-linux-turn-soak/perf_history.jsonl}"
 
 mode="record"
 input_file=""
@@ -43,6 +44,12 @@ done
 
 timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 git_sha=$(git rev-parse --short HEAD)
+untracked=$(git ls-files --others --exclude-standard)
+if ! git diff --quiet --ignore-submodules -- . \
+  || ! git diff --cached --quiet --ignore-submodules -- . \
+  || [[ -n $untracked ]]; then
+  git_sha="${git_sha}-dirty"
+fi
 case "$(uname -s)" in
   Darwin) platform=macos ;;
   Linux) platform=linux ;;
@@ -96,9 +103,25 @@ emit_process_lines() {
   done < <(grep '^perf-process' <<< "$output" || true)
 }
 
+emit_hotpath_lines() {
+  while IFS= read -r line; do
+    [[ -z $line ]] && continue
+    label=$(grep -oE 'label=[a-zA-Z0-9_]+' <<< "$line" | head -1 | cut -d= -f2 || true)
+    p50=$(grep -oE 'p50_ns=[0-9]+' <<< "$line" | head -1 | cut -d= -f2 || true)
+    stage_count=$(grep -oE 'stage_count=[0-9]+' <<< "$line" | head -1 | cut -d= -f2 || true)
+    host_allocs=$(grep -oE 'host_allocations=[0-9]+' <<< "$line" | head -1 | cut -d= -f2 || true)
+    process_allocs=$(grep -oE 'process_allocations=[0-9]+' <<< "$line" | head -1 | cut -d= -f2 || true)
+    if [[ -n $label && -n $p50 && -n $stage_count ]]; then
+      printf '{"kind":"hotpath","timestamp":"%s","git_sha":"%s","platform":"%s","arch":"%s","profile":"%s","label":"%s","p50_ns":%s,"stage_count":%s,"host_allocations":%s,"process_allocations":%s}\n' \
+        "$timestamp" "$git_sha" "$platform" "$arch" "$profile" "$label" "$p50" "$stage_count" "${host_allocs:-null}" "${process_allocs:-null}"
+    fi
+  done < <(grep '^hotpath' <<< "$output" || true)
+}
+
 emit_all() {
   emit_compare_lines
   emit_process_lines
+  emit_hotpath_lines
 }
 
 if [[ $mode == "dry-run" ]]; then
@@ -108,5 +131,6 @@ else
   emit_all >> "$HISTORY_FILE"
   compare_count=$(grep -c '^perf-compare' <<< "$output" || true)
   process_count=$(grep -c '^perf-process' <<< "$output" || true)
-  echo "Appended ${compare_count} compare + ${process_count} process rows to $HISTORY_FILE (git_sha=$git_sha)"
+  hotpath_count=$(grep -c '^hotpath' <<< "$output" || true)
+  echo "Appended ${compare_count} compare + ${process_count} process + ${hotpath_count} hotpath rows to $HISTORY_FILE (git_sha=$git_sha)"
 fi

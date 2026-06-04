@@ -51,7 +51,10 @@ use tina_runtime::{
 };
 
 use crate::body_metrics::BodyMetrics;
-use crate::parse::{HttpRequestHead, ParseProgress, encode_response_head, parse_request_head};
+use crate::parse::{
+    HttpRequestHead, ParseProgress, encode_response_head, encode_response_head_with_extra_capacity,
+    parse_request_head,
+};
 use crate::streaming::{
     RequestChunkReply, RequestStream, ResponseChunkMsg, ResponseChunkReply, ResponseStream,
 };
@@ -1163,14 +1166,24 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
         // gone on the wire yet, making `current` lie.
         let connection_close =
             !matches!(response.body, HttpResponseBody::WebSocket(_)) && self.will_close;
-        let head_bytes = encode_response_head(&response, connection_close);
+        let coalesced_body_len = match &response.body {
+            HttpResponseBody::Buffered(body_bytes)
+                if self.metrics.is_none()
+                    && body_bytes.len() <= COALESCE_BUFFERED_RESPONSE_BODY_LIMIT =>
+            {
+                Some(body_bytes.len())
+            }
+            _ => None,
+        };
+        let head_bytes = if let Some(body_len) = coalesced_body_len {
+            encode_response_head_with_extra_capacity(&response, connection_close, body_len)
+        } else {
+            encode_response_head(&response, connection_close)
+        };
         match response.body {
             HttpResponseBody::Buffered(body_bytes) => {
-                let can_coalesce = self.metrics.is_none()
-                    && body_bytes.len() <= COALESCE_BUFFERED_RESPONSE_BODY_LIMIT;
-                if can_coalesce {
+                if coalesced_body_len.is_some() {
                     self.pending_response = head_bytes;
-                    self.pending_response.reserve_exact(body_bytes.len());
                     self.pending_response.extend_from_slice(&body_bytes);
                 } else if !body_bytes.is_empty() {
                     self.pending_response = head_bytes;

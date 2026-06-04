@@ -69,6 +69,11 @@ const CALL_PROCESS_ALLOCATIONS_CEILING: u64 = 10;
 const HTTP_HOTPATH_ITERS: usize = 32;
 const HTTP_HOTPATH_WARMUP: usize = 4;
 const HTTP_FIXED_BODY_BYTES: usize = 4096;
+// HTTP stage ceilings are intentionally loose. They catch a bad turn-count
+// regression while leaving timing and trace noise to perf history.
+const HTTP_CLOSE_STAGE_CEILING: usize = 48;
+const HTTP_KEEPALIVE_STAGE_CEILING: usize = 120;
+const HTTP_FIXED_BODY_STAGE_CEILING: usize = 48;
 
 type Runtime = ThreadedRuntime<SingleShard, DefaultThreadedMailboxFactory>;
 
@@ -655,6 +660,16 @@ fn parse_content_length(head: &str) -> anyhow::Result<usize> {
     anyhow::bail!("missing content-length")
 }
 
+fn assert_stage_count(report: &HotPathReport, ceiling: usize) {
+    assert!(
+        report.stages.len() <= ceiling,
+        "{} stage_count={} ceiling={ceiling} stages={:?}",
+        report.label,
+        report.stages.len(),
+        report.stages
+    );
+}
+
 #[test]
 fn hotpath_probes_report_and_stay_bounded() {
     let try_send = probe_try_send();
@@ -687,7 +702,16 @@ fn hotpath_probes_report_and_stay_bounded() {
             report.allocations.is_some(),
             "host allocation evidence present"
         );
+        assert!(
+            report.process_allocations.is_some(),
+            "process allocation evidence present for {}",
+            report.label
+        );
     }
+
+    assert_stage_count(&http_close, HTTP_CLOSE_STAGE_CEILING);
+    assert_stage_count(&http_keepalive, HTTP_KEEPALIVE_STAGE_CEILING);
+    assert_stage_count(&http_fixed_body, HTTP_FIXED_BODY_STAGE_CEILING);
 
     assert!(
         try_send.min_ns < HANDOFF_CEILING_NS,

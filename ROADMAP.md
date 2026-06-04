@@ -386,16 +386,19 @@ and reviews live under `.intent/phases/`.
   are done. Their remaining edges now mostly feed native AWS, pooled
   HTTP/2/gRPC clients, production soak/benchmark follow-ups, and public
   release cleanup.
-- Native performance evidence tranche: Phases 144-147 are now recorded in
+- Native performance evidence tranche: Phases 144-148 are now recorded in
   `CHANGELOG.md`. Local native-vs-bounded-Tokio rows, hotpath stage probes,
   process allocation rows, owned-buffer TCP/TLS calls, HTTP encoder
   presizing, small-response coalescing, terminal TCP write-close, and an HTTP
-  body-pressure perf proof are done. Their remaining edges feed Phase 148:
-  structural HTTP turn cost, Linux/x86 rows, sharper whole-service soak, and
-  not pretending local alpha rows are production performance.
+  body-pressure perf proof are done. Phase 148 added hotpath history rows,
+  a manual Linux/x86 perf workflow, direct whole-service notify/outbound-pool
+  soak facts, an opt-in long soak command, and one small HTTP/1 buffered
+  response allocation cleanup. Remaining edges are still real: structural HTTP
+  turn cost, repeated Linux/x86 evidence, broader equivalent-workload rows,
+  and no production-performance claim until evidence earns it.
 
 These are recorded in `CHANGELOG.md`; the remaining near-term roadmap now
-starts with native AWS and Phase 148 below.
+starts with native AWS and public release cleanup below.
 
 ## Near-term roadmap
 
@@ -405,7 +408,6 @@ framework before public release-story work.
 | Phase | Purpose |
 |---|---|
 | **135 Native AWS first form** | Add a native Tina AWS battery for the smallest honest production shape: static SigV4 with explicit signing time, native S3 put/get/head/delete, native SQS send/receive/delete, native HTTP keepalive under Phase 131 endpoint/connect policy, bounded bodies/in-flight work, typed pressure/lifecycle reports, hermetic fake-AWS tests, and clear native-vs-SDK-bridge docs. Plan: `.intent/phases/135-native-aws-first-form/plan.md`. |
-| **148 Native performance, Linux rows, and soak truth** | Attack the remaining structural HTTP/runtime cost after Phase 147: too many turns per request, close/keepalive noise, whole-process allocation cost, Linux/x86 evidence, and whole-service soak/perf proof through the existing `mini_saas_api` system. Plan: `.intent/phases/148-native-performance-linux-turn-soak/plan.md`. |
 | **Alpaca rename** | Before public launch, rename the project/crates/docs away from Tina to Alpaca so the lineage is respectful and clear: independently maintained Rust framework, inspired by Peter Mbanugo's Tina/Odin and Seastar, not an official Tina port. |
 | **Barend Biesheuvel visible flow ergonomics** | Optional high-level ergonomics only after the local runtime core feels boring: a `flow!`-style authoring surface that preserves named suspension points, visible failure policy, trace step names, and ordinary Tina message/effect expansion. No fake async, no hidden retries, no hidden queues. |
 
@@ -781,7 +783,7 @@ shape.
 | Broadcast/fanout primitive | Shipped: `BroadcastTargets`, `BroadcastTracker`, `BroadcastReport`, and `broadcast_observed` give room/session services a service-owned target cap, per-target `Accepted`/`Full`/`Closed` accounting, and an ordinary continuation-message path. Remaining: richer per-peer slow policy and room-manager helpers when another real service pulls on them. | Chat/WebSocket/realtime services get a copied Tina shape for broadcast without losing per-peer pressure truth. |
 | Pool maturity | Shipped: idle eviction, max lifetime, health checks, retire/reuse policy, shutdown reports, DB pressure alignment, and HTTP/1 keepalive retirement. Remaining: pooled HTTP/2/gRPC clients and cross-protocol session lifecycle polish. | Pools become production resources, not just first-form acquire/release examples. |
 | Async ecosystem boundary | Shipped: native-first capability reports, bridge-author vocabulary, extension smoke crates, open sync codec hooks, and docs separating native, bridge, and unsupported async paths. Remaining: decide whether a bounded Future/Stream bridge is worth building once a real workload proves it. | Users know which Tokio apps Tina can replace natively and where a bridge is the honest boundary. |
-| Benchmarks with humility | Shipped: Phases 144-147 add local release-mode native performance rows, bounded Tokio comparison rows, hot-path stage reports, perf history/check scripts, process allocation rows, HTTP body-pressure perf proof, and fixes for the worker-loop sleep tax plus obvious buffer/write allocation waste. Remaining: reduce HTTP turn/scheduling cost, add Linux/x86 rows, broaden equivalent-workload comparisons, and resist production-performance claims until repeated evidence earns them. | Performance claims do not outrun Tina's boundedness and correctness story. |
+| Benchmarks with humility | Shipped: Phases 144-148 add local release-mode native performance rows, bounded Tokio comparison rows, hot-path stage reports, perf history/check scripts, process allocation rows, HTTP body-pressure perf proof, manual Linux/x86 perf workflow, opt-in long soak, and fixes for the worker-loop sleep tax plus obvious buffer/write allocation waste. Remaining: reduce HTTP turn/scheduling cost further, collect repeated Linux/x86 rows, broaden equivalent-workload comparisons, and resist production-performance claims until repeated evidence earns them. | Performance claims do not outrun Tina's boundedness and correctness story. |
 | Ecosystem extension hooks | Shipped: bridge-author vocabulary, open sync codec and service-policy hooks, capacity surface/event-sink vocabulary, runtime capability report, and public-API-only extension smoke crates. Remaining: publication/semver proof and stronger author templates once third-party-shaped crates grow. | Tina can grow an ecosystem without every new capability landing in core or weakening bounded/DST truth. |
 | Whole-framework ergonomics | Shipped: one coherent copied path for a real service: prelude, config/budget manifest, public requests/internal events, defer/cancel/drain/report/shutdown, and replay hooks. Remaining: keep the skeleton current as AWS, pooled HTTP/2/gRPC, native database, and saga-shaped systems land. | A new developer or cheap model can build a correct bounded + replay-aware service without stitching ten specimens together. |
 

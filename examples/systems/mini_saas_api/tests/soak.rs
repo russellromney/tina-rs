@@ -13,7 +13,8 @@
 //! - the typed pressure summary on `LoadReport` agrees with the
 //!   per-kind tally,
 //! - the runtime shut down cleanly with no in-flight keepalive leaks,
-//! - the outbound pool was actually exercised (pool path coverage).
+//! - the notify/outbound-pool path was actually exercised by direct
+//!   service facts, not inferred from generic pressure.
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -108,27 +109,28 @@ fn small_steady_load_drains_cleanly_with_only_typed_pressure() {
     );
 
     // Pool path coverage: the third lane (`POST /items/1/notify`)
-    // must have exercised the outbound keepalive pool. We accept
-    // either `outbound.high_water_waiters > 0` (workers queued) or
-    // `outbound.full > 0` (workers got 503 from the cap) or
-    // `outbound.in_flight high_water indicator non-zero` — at least
-    // one of those must show the pool actually got work.
-    let outbound_in_flight_indicators = cap_u64(&cap, "outbound.high_water_waiters")
-        + cap_u64(&cap, "outbound.full")
-        + cap_u64(&cap, "outbound.cancel");
-    // Even if all notify ops happened serially, the load is large
-    // enough that at least one POST landed and the outbound pool
-    // acquired+released a lease. The `outbound.full` path may not
-    // fire on a small machine; we accept any of: an err observed, a
-    // recorded full, a recorded cancel, or recorded waiters. If none
-    // of those fire we did not exercise the pool — the soak proof
-    // is weaker than advertised.
-    let pool_exercised = outbound_in_flight_indicators > 0 || load.ops_err > 0;
+    // must have admitted notify work, acquired a keepalive lease, and
+    // returned/retired it. Pressure counters can be zero in a healthy
+    // serial run, so the proof uses direct service facts instead of
+    // "some error happened".
+    let notify_attempted = cap_u64(&cap, "notify.attempted");
+    let outbound_acquired = cap_u64(&cap, "outbound.acquired");
+    let outbound_terminal =
+        cap_u64(&cap, "outbound.released") + cap_u64(&cap, "outbound.retired");
     assert!(
-        pool_exercised,
-        "soak must exercise the outbound pool (notify lane); \
-         indicators={outbound_in_flight_indicators}, errs={}: {}",
-        load.ops_err, report.capacity_after_load_line,
+        notify_attempted > 0,
+        "soak must admit at least one notify op: {}",
+        report.capacity_after_load_line,
+    );
+    assert!(
+        outbound_acquired > 0,
+        "soak must acquire at least one outbound pool lease: {}",
+        report.capacity_after_load_line,
+    );
+    assert!(
+        outbound_terminal > 0,
+        "soak must release or retire at least one outbound pool lease: {}",
+        report.capacity_after_load_line,
     );
 
     assert!(

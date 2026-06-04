@@ -231,6 +231,10 @@ cargo test --manifest-path examples/systems/mini_saas_api/Cargo.toml --test smok
 # Load/soak proof (Phase 108) with typed capacity contract:
 cargo test --manifest-path examples/systems/mini_saas_api/Cargo.toml --test soak -- --nocapture
 
+# Opt-in long soak. Defaults to 10 minutes; use 3600 for one hour.
+make proof-long-soak
+TINA_LONG_SOAK_SECONDS=3600 make proof-long-soak
+
 # Local performance row for the repo-level `make perf` command:
 cargo test --release --manifest-path examples/systems/mini_saas_api/Cargo.toml --test perf -- --nocapture
 ```
@@ -255,6 +259,24 @@ typed `pressure` summary on the load report (rate, burst length,
 first error position, per-kind breakdown) lets specimens assert
 "pressure stayed under N per mille" or "no burst longer than K
 consecutive errors" without parsing the summary line.
+
+Phase 148 adds direct notify/outbound-pool facts to the capacity line:
+
+```text
+notify.attempted=33 outbound.acquired=21 outbound.released=21 outbound.retired=0
+```
+
+The soak proof now requires these fields. A healthy serial run can have
+`outbound.full=0` and `outbound.high_water_waiters=0`; that no longer lets the
+test guess whether the pool ran. The service must show at least one notify
+attempt, one acquired lease, and one released or retired lease.
+
+The long soak is deliberately ignored by default. It repeats the same public
+front-door load until the time budget expires, prints cumulative ops,
+max per-round p50/p99, `rss_delta_kb=unknown`, final-current-zero truth, and
+the last capacity/terminal report. It fails on transport timeouts and leaked
+final current. It is for local soak boxes and manual CI jobs, not ordinary
+`make verify`.
 
 The perf test is the same kind of work, tuned smaller and wrapped in
 `tina_proof_harness::PerfReport`. It prints a `perf ...` line and a

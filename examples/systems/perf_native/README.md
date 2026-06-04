@@ -188,3 +188,36 @@ zero.
 
 Current verdict: keep the evidence, keep optimizing, do not make a production
 performance claim yet.
+
+## Phase 148 performance rows
+
+Phase 148 moves the append-only perf history to
+`.intent/phases/148-native-performance-linux-turn-soak/perf_history.jsonl`.
+`scripts/perf_record.sh` now records three row families:
+
+- `perf-compare` rows: Tina-vs-baseline p50/p90/p99 and allocation counts.
+- `perf-process` rows: whole-process allocation count, allocated bytes, and
+  RSS delta for HTTP rows.
+- `hotpath` rows: p50, stage count, host allocations, and process allocations.
+
+Run and append local rows:
+
+```sh
+make perf-record
+```
+
+Check the current run against matching platform/arch/profile history:
+
+```sh
+make perf-check
+```
+
+Linux/x86 evidence is opt-in and manual for now. Maintainers can run the
+manual GitHub workflow named `perf` on Ubuntu, or run `make perf-record` on a
+Linux/x86_64 machine and keep the resulting JSONL rows with the review.
+
+Phase 148 also removes one small HTTP/1 allocation source: coalesced buffered
+responses reserve head + body capacity once instead of encoding the head and
+then growing the buffer when the body is appended. This is a real cleanup, not
+a production-speed claim. HTTP close/keepalive still spend many runtime turns,
+and Linux rows still need repeated evidence.
