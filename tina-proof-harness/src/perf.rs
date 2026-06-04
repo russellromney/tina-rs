@@ -386,8 +386,28 @@ pub struct HotPathReport {
     pub label: &'static str,
     pub iterations: u64,
     pub p50_ns: u64,
+    /// 90th percentile total. Tail shape, not the median, is what this phase
+    /// chases: a row can win p50 while p90/p99 stay messy.
+    pub p90_ns: u64,
+    /// 99th percentile total.
+    pub p99_ns: u64,
     pub min_ns: u64,
     pub max_ns: u64,
+    /// Whether this row was sampled with a live `TraceObserver` attached. The
+    /// untraced row is the honest headline; the traced row exposes observer
+    /// overhead. The two must never be confused, so the label is suffixed and
+    /// this flag is emitted on every line.
+    pub traced: bool,
+    /// Gap threshold used to count scheduler gaps in the instrumented run.
+    /// Carried as a field so a different platform can tune it without code
+    /// changes invalidating older history.
+    pub scheduler_gap_threshold_ns: u64,
+    /// Number of inter-event gaps in the instrumented timeline at or above
+    /// `scheduler_gap_threshold_ns`. A worker park between a ready completion
+    /// and the next handler turn shows up here.
+    pub scheduler_gap_count: usize,
+    /// Largest single inter-event gap in the instrumented timeline.
+    pub max_scheduler_gap_ns: u64,
     pub stages: Vec<HotPathStage>,
     /// Allocations the caller's host thread makes per op. Misses anything the
     /// runtime worker thread allocates on the caller's behalf — see
@@ -457,15 +477,23 @@ impl HotPathReport {
         let mut sorted_ns = totals_ns;
         sorted_ns.sort_unstable();
         let iterations = sorted_ns.len() as u64;
-        let p50_ns = sorted_ns[sorted_ns.len() / 2];
+        let p50_ns = percentile_ns(&sorted_ns, 50);
+        let p90_ns = percentile_ns(&sorted_ns, 90);
+        let p99_ns = percentile_ns(&sorted_ns, 99);
         let min_ns = *sorted_ns.first().expect("non-empty");
         let max_ns = *sorted_ns.last().expect("non-empty");
         Self {
             label,
             iterations,
             p50_ns,
+            p90_ns,
+            p99_ns,
             min_ns,
             max_ns,
+            traced: false,
+            scheduler_gap_threshold_ns: DEFAULT_SCHEDULER_GAP_THRESHOLD_NS,
+            scheduler_gap_count: 0,
+            max_scheduler_gap_ns: 0,
             stages,
             allocations,
             process_allocations,
@@ -474,18 +502,59 @@ impl HotPathReport {
         }
     }
 
+    /// Records scheduler-gap stats measured from the instrumented timeline.
+    /// `count` is the number of inter-event gaps at or above `threshold_ns`,
+    /// `max_ns` the largest single gap. Chainable on a freshly built report.
+    pub fn with_scheduler_gaps(mut self, threshold_ns: u64, count: usize, max_ns: u64) -> Self {
+        self.scheduler_gap_threshold_ns = threshold_ns;
+        self.scheduler_gap_count = count;
+        self.max_scheduler_gap_ns = max_ns;
+        self
+    }
+
+    /// Marks whether this row was sampled with a live trace observer attached.
+    pub fn with_traced(mut self, traced: bool) -> Self {
+        self.traced = traced;
+        self
+    }
+
+    /// `p90 / p50` in per-mille (1000 = p90 equals p50). Lower is tighter.
+    pub fn p90_over_p50_per_mille(&self) -> Option<u64> {
+        ratio_per_mille(self.p90_ns, self.p50_ns)
+    }
+
+    /// `p99 / p50` in per-mille. Lower is tighter.
+    pub fn p99_over_p50_per_mille(&self) -> Option<u64> {
+        ratio_per_mille(self.p99_ns, self.p50_ns)
+    }
+
+    /// `(max - min) / p50` in per-mille: how wide the whole sampled range is
+    /// relative to the median.
+    pub fn range_over_p50_per_mille(&self) -> Option<u64> {
+        ratio_per_mille(self.max_ns.saturating_sub(self.min_ns), self.p50_ns)
+    }
+
     /// One-line key=value shape for humans, CI logs, and grep. Each stage is
     /// its own `stage.<name>_ns=<v>` field so the line stays flat and
     /// greppable.
     pub fn summary_line(&self) -> String {
         let mut line = format!(
-            "hotpath label={} iterations={} p50_us={} p50_ns={} min_ns={} max_ns={} stage_count={} event_stage_count={} handler_turn_count={} runtime_call_count={} service_call_count={} completion_count={} rejected_completion_count={} host_allocations={} process_allocations={} {}",
+            "hotpath label={} iterations={} traced={} p50_us={} p50_ns={} p90_ns={} p99_ns={} min_ns={} max_ns={} p90_over_p50_per_mille={} p99_over_p50_per_mille={} range_over_p50_per_mille={} scheduler_gap_threshold_ns={} scheduler_gap_count={} max_scheduler_gap_ns={} stage_count={} event_stage_count={} handler_turn_count={} runtime_call_count={} service_call_count={} completion_count={} rejected_completion_count={} host_allocations={} process_allocations={} {}",
             report_value(self.label),
             self.iterations,
+            self.traced,
             self.p50_ns / 1_000,
             self.p50_ns,
+            self.p90_ns,
+            self.p99_ns,
             self.min_ns,
             self.max_ns,
+            per_mille_field(self.p90_over_p50_per_mille()),
+            per_mille_field(self.p99_over_p50_per_mille()),
+            per_mille_field(self.range_over_p50_per_mille()),
+            self.scheduler_gap_threshold_ns,
+            self.scheduler_gap_count,
+            self.max_scheduler_gap_ns,
             self.counters.event_stage_count,
             self.counters.event_stage_count,
             self.counters.handler_turn_count,
@@ -529,12 +598,21 @@ impl HotPathReport {
         }
         stages.push('}');
         format!(
-            "{{\"schema\":\"tina.hotpath.v1\",\"label\":{},\"iterations\":{},\"p50_ns\":{},\"min_ns\":{},\"max_ns\":{},\"stage_count\":{},\"event_stage_count\":{},\"handler_turn_count\":{},\"runtime_call_count\":{},\"service_call_count\":{},\"completion_count\":{},\"rejected_completion_count\":{},\"host_allocations\":{},\"process_allocations\":{},\"allocations\":{},\"platform\":{},\"arch\":{},\"profile\":{},\"git_sha\":{},\"stages\":{}}}",
+            "{{\"schema\":\"tina.hotpath.v2\",\"label\":{},\"iterations\":{},\"traced\":{},\"p50_ns\":{},\"p90_ns\":{},\"p99_ns\":{},\"min_ns\":{},\"max_ns\":{},\"p90_over_p50_per_mille\":{},\"p99_over_p50_per_mille\":{},\"range_over_p50_per_mille\":{},\"scheduler_gap_threshold_ns\":{},\"scheduler_gap_count\":{},\"max_scheduler_gap_ns\":{},\"stage_count\":{},\"event_stage_count\":{},\"handler_turn_count\":{},\"runtime_call_count\":{},\"service_call_count\":{},\"completion_count\":{},\"rejected_completion_count\":{},\"host_allocations\":{},\"process_allocations\":{},\"allocations\":{},\"platform\":{},\"arch\":{},\"profile\":{},\"git_sha\":{},\"stages\":{}}}",
             json_string(self.label),
             self.iterations,
+            self.traced,
             self.p50_ns,
+            self.p90_ns,
+            self.p99_ns,
             self.min_ns,
             self.max_ns,
+            per_mille_field(self.p90_over_p50_per_mille()),
+            per_mille_field(self.p99_over_p50_per_mille()),
+            per_mille_field(self.range_over_p50_per_mille()),
+            self.scheduler_gap_threshold_ns,
+            self.scheduler_gap_count,
+            self.max_scheduler_gap_ns,
             self.counters.event_stage_count,
             self.counters.event_stage_count,
             self.counters.handler_turn_count,
@@ -565,6 +643,30 @@ fn ratio_per_mille(a: u64, b: u64) -> Option<u64> {
         return None;
     }
     Some(a.saturating_mul(1000) / b)
+}
+
+/// Renders an optional per-mille ratio as the bare number, or `null` when p50
+/// is zero (sub-microsecond rows where a ratio is meaningless). The unquoted
+/// `null` is valid in both the flat summary line and the JSON shape.
+fn per_mille_field(value: Option<u64>) -> String {
+    value
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "null".to_string())
+}
+
+/// Default scheduler-gap threshold for local release rows: 100us. A gap above
+/// this between two trace events is a scheduling hiccup worth counting, not
+/// ordinary handler cost.
+pub const DEFAULT_SCHEDULER_GAP_THRESHOLD_NS: u64 = 100_000;
+
+/// Nearest-rank percentile over an already-sorted, non-empty slice. `p` is a
+/// whole percent (50, 90, 99). Matches the legacy p50 (`sorted[len/2]`) for
+/// p=50 so existing rows do not move.
+fn percentile_ns(sorted_ns: &[u64], p: usize) -> u64 {
+    debug_assert!(!sorted_ns.is_empty());
+    let len = sorted_ns.len();
+    let idx = (len * p / 100).min(len - 1);
+    sorted_ns[idx]
 }
 
 fn option_allocations(
@@ -763,6 +865,18 @@ mod tests {
         assert!(line.contains("p50_us=1"), "{line}");
         assert!(line.contains("min_ns=800"), "{line}");
         assert!(line.contains("max_ns=1200"), "{line}");
+        // Tail fields: p90/p99 and the ratio + scheduler-gap fields a tail row
+        // is judged on. p90/p99 here are the nearest-rank values over the five
+        // samples [800,900,1000,1100,1200].
+        assert!(line.contains("p90_ns=1200"), "{line}");
+        assert!(line.contains("p99_ns=1200"), "{line}");
+        assert!(line.contains("p90_over_p50_per_mille=1200"), "{line}");
+        assert!(line.contains("p99_over_p50_per_mille=1200"), "{line}");
+        assert!(line.contains("range_over_p50_per_mille=400"), "{line}");
+        assert!(line.contains("traced=false"), "{line}");
+        assert!(line.contains("scheduler_gap_threshold_ns=100000"), "{line}");
+        assert!(line.contains("scheduler_gap_count=0"), "{line}");
+        assert!(line.contains("max_scheduler_gap_ns=0"), "{line}");
         assert!(line.contains("stage_count=2"), "{line}");
         assert!(line.contains("event_stage_count=2"), "{line}");
         assert!(line.contains("handler_turn_count=0"), "{line}");
@@ -781,8 +895,13 @@ mod tests {
         );
 
         let json = report.json_line();
-        assert!(json.contains("\"schema\":\"tina.hotpath.v1\""), "{json}");
+        assert!(json.contains("\"schema\":\"tina.hotpath.v2\""), "{json}");
         assert!(json.contains("\"p50_ns\":1000"), "{json}");
+        assert!(json.contains("\"p90_ns\":1200"), "{json}");
+        assert!(json.contains("\"p99_ns\":1200"), "{json}");
+        assert!(json.contains("\"traced\":false"), "{json}");
+        assert!(json.contains("\"scheduler_gap_count\":0"), "{json}");
+        assert!(json.contains("\"max_scheduler_gap_ns\":0"), "{json}");
         assert!(json.contains("\"stage_count\":2"), "{json}");
         assert!(json.contains("\"event_stage_count\":2"), "{json}");
         assert!(json.contains("\"handler_turn_count\":0"), "{json}");
@@ -791,5 +910,52 @@ mod tests {
             "{json}"
         );
         assert!(json.contains("\"allocations\":7"), "{json}");
+    }
+
+    #[test]
+    fn hotpath_tail_builders_carry_traced_and_scheduler_gaps() {
+        // A traced row with measured scheduler gaps: the builders must surface
+        // both the `traced` label and the gap stats so an untraced headline is
+        // never confused with a traced one, and a worker park gap is visible.
+        let report = HotPathReport::from_samples(
+            "hotpath_call_blocking_tail",
+            vec![1_000, 1_000, 1_000, 1_000, 4_000],
+            vec![HotPathStage::new("host_submit_to_worker_pickup", 250)],
+            Some(2),
+        )
+        .with_traced(true)
+        .with_scheduler_gaps(DEFAULT_SCHEDULER_GAP_THRESHOLD_NS, 2, 350_000);
+
+        assert!(report.traced);
+        assert_eq!(report.scheduler_gap_count, 2);
+        assert_eq!(report.max_scheduler_gap_ns, 350_000);
+
+        let line = report.summary_line();
+        assert!(line.contains("traced=true"), "{line}");
+        assert!(line.contains("scheduler_gap_count=2"), "{line}");
+        assert!(line.contains("max_scheduler_gap_ns=350000"), "{line}");
+
+        let json = report.json_line();
+        assert!(json.contains("\"traced\":true"), "{json}");
+        assert!(json.contains("\"scheduler_gap_count\":2"), "{json}");
+        assert!(json.contains("\"max_scheduler_gap_ns\":350000"), "{json}");
+    }
+
+    #[test]
+    fn hotpath_ratio_fields_are_null_when_p50_is_zero() {
+        // Sub-microsecond rows can have a zero p50; the ratio fields must be
+        // `null`, not a divide-by-zero panic or a fake 0.
+        let report = HotPathReport::from_samples(
+            "hotpath_try_send",
+            vec![0, 0, 0, 0, 0],
+            vec![HotPathStage::new("host_submit_to_command_accepted", 0)],
+            Some(1),
+        );
+        assert_eq!(report.p50_ns, 0);
+        assert_eq!(report.p90_over_p50_per_mille(), None);
+        let line = report.summary_line();
+        assert!(line.contains("p90_over_p50_per_mille=null"), "{line}");
+        let json = report.json_line();
+        assert!(json.contains("\"p90_over_p50_per_mille\":null"), "{json}");
     }
 }
