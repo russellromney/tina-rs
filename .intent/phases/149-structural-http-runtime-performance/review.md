@@ -86,6 +86,20 @@ Findings:
 - [P2] A tempting single-shard worker-loop "yield while in-flight" change was
   tested and rejected. It worsened local hotpath noise and pulled stale tail
   facts into the measured window. It was removed.
+- [P2] The original implementation proved terminal actions, but did not prove
+  the ordinary message fallback stayed ordinary. Added live proof that
+  `RuntimeCallCompletion::Message` records `CallCompleted`, delivers through
+  the requester mailbox, and emits no terminal-action fact.
+- [P2] Simulator fallback failure pressure was under-proved. Added simulator
+  proof that a message fallback hitting a full requester mailbox records
+  `CallCompletionRejected(MailboxFull)` instead of dropping silently.
+- [P2] Simulator terminal failure truth was under-proved. Added simulator
+  proof that a malicious `Noop` translator on a failed backend call records
+  `TerminalActionOnFailure` and no terminal action.
+- [P3] `RuntimeCall::into_parts` became a trap for backend/test authors who
+  need terminal completions. Added `into_completion_parts`, documented the
+  message-only panic behavior of `into_parts`, and pinned preservation of
+  `StopRequester`/`Noop` with a unit test.
 - [P3] Phase 149 did not finish HTTP/2/WebSocket equivalent workload rows or
   Linux/x86 repeated evidence. Those remain next-performance-pass work, not
   hidden as done.

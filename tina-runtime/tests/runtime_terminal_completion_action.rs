@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use tina::prelude::*;
 use tina_runtime::{
-    CallCompletionRejectedReason, CallInput, CallOutput, DefaultThreadedMailboxFactory,
+    CallCompletionRejectedReason, CallInput, CallKind, CallOutput, DefaultThreadedMailboxFactory,
     RuntimeCall, RuntimeCallCompletion, RuntimeEventKind, StreamId, TerminalCompletionAction,
     ThreadedRuntime,
 };
@@ -125,6 +125,18 @@ fn has_event(
         .any(|event| pred(event.kind()))
 }
 
+fn count_events(
+    runtime: &ThreadedRuntime<SingleShard, DefaultThreadedMailboxFactory>,
+    pred: impl Fn(RuntimeEventKind) -> bool,
+) -> usize {
+    runtime
+        .trace()
+        .events()
+        .iter()
+        .filter(|event| pred(event.kind()))
+        .count()
+}
+
 #[test]
 fn stop_requester_completion_stops_without_later_message() {
     let runtime = runtime();
@@ -202,6 +214,46 @@ fn noop_completion_records_success_and_keeps_isolate_alive() {
         .try_send(probe, TerminalMsg::MessageOnTimer)
         .expect("probe remains alive after Noop");
     wait_until(&runtime, || delivered.load(Ordering::Relaxed) == 1);
+
+    let _ = runtime.shutdown();
+}
+
+#[test]
+fn message_completion_uses_normal_delivery_path() {
+    let runtime = runtime();
+    let delivered = Arc::new(AtomicUsize::new(0));
+    let probe = runtime
+        .register_with_capacity::<_, Infallible>(
+            TerminalProbe {
+                delivered: Arc::clone(&delivered),
+            },
+            8,
+        )
+        .expect("register probe");
+
+    runtime
+        .try_send(probe, TerminalMsg::MessageOnTimer)
+        .expect("start message completion");
+    wait_until(&runtime, || delivered.load(Ordering::Relaxed) == 1);
+
+    assert_eq!(
+        count_events(&runtime, |kind| matches!(
+            kind,
+            RuntimeEventKind::CallCompleted {
+                call_kind: CallKind::Sleep,
+                ..
+            }
+        )),
+        1,
+        "fallback message completion should still record the backend completion"
+    );
+    assert!(
+        !has_event(&runtime, |kind| matches!(
+            kind,
+            RuntimeEventKind::CallCompletionAction { .. }
+        )),
+        "fallback message completion must not claim a terminal action"
+    );
 
     let _ = runtime.shutdown();
 }

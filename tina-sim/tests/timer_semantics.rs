@@ -6,8 +6,8 @@ use std::time::Duration;
 use tina::{Context, Effect, Isolate, Outbound, Shard, ShardId, time::TimerInterval};
 use tina_runtime::{
     CallCompletionRejectedReason, CallInput, CallKind, CallOutput, RuntimeCall,
-    RuntimeCallCompletion, RuntimeEvent, RuntimeEventKind, SleepReply, TerminalCompletionAction,
-    sleep,
+    RuntimeCallCompletion, RuntimeEvent, RuntimeEventKind, SleepReply, StreamId,
+    TerminalCompletionAction, sleep,
 };
 use tina_sim::{Simulator, SimulatorConfig};
 
@@ -26,6 +26,7 @@ enum TimerMsg {
     StartAndStop,
     TerminalStop,
     TerminalNoop,
+    BadStreamNoop,
     Fired,
 }
 
@@ -86,6 +87,12 @@ impl Isolate for Sleeper {
                     CallOutput::TimerFired => RuntimeCallCompletion::Noop,
                     other => RuntimeCallCompletion::Message(unexpected_timer_completion(other)),
                 },
+            )),
+            TimerMsg::BadStreamNoop => Effect::Call(RuntimeCall::new_with_completion(
+                CallInput::TcpStreamClose {
+                    stream: StreamId::new(999_999),
+                },
+                |_| RuntimeCallCompletion::Noop,
             )),
             TimerMsg::Fired => {
                 self.observations.borrow_mut().push(TimerObservation::Fired);
@@ -289,6 +296,83 @@ fn terminal_noop_completion_records_action_and_keeps_isolate_alive_in_sim() {
     sim.advance_time(Duration::from_millis(10));
     drain(&mut sim);
     assert_eq!(observations.borrow().as_slice(), [TimerObservation::Fired]);
+}
+
+#[test]
+fn terminal_noop_cannot_hide_backend_failure_in_sim() {
+    let observations = Rc::new(RefCell::new(Vec::new()));
+    let mut sim = Simulator::new(
+        TestShard,
+        SimulatorConfig {
+            seed: 19,
+            ..Default::default()
+        },
+    );
+    let sleeper = sim.register(Sleeper {
+        delay: Duration::from_millis(10),
+        observations: Rc::clone(&observations),
+    });
+    sim.try_send(sleeper, TimerMsg::BadStreamNoop).unwrap();
+    drain(&mut sim);
+
+    assert!(observations.borrow().is_empty());
+    assert!(sim.trace().iter().any(|event| {
+        matches!(
+            event.kind(),
+            RuntimeEventKind::CallCompletionRejected {
+                call_kind: CallKind::TcpStreamClose,
+                reason: CallCompletionRejectedReason::TerminalActionOnFailure,
+                ..
+            }
+        )
+    }));
+    assert!(
+        !sim.trace()
+            .iter()
+            .any(|event| { matches!(event.kind(), RuntimeEventKind::CallCompletionAction { .. }) })
+    );
+}
+
+#[test]
+fn fallback_message_completion_reports_mailbox_full_in_sim() {
+    let observations = Rc::new(RefCell::new(Vec::new()));
+    let mut sim = Simulator::new(
+        TestShard,
+        SimulatorConfig {
+            seed: 23,
+            ..Default::default()
+        },
+    );
+    let sleeper = sim.register_with_mailbox_capacity(
+        Sleeper {
+            delay: Duration::from_millis(10),
+            observations: Rc::clone(&observations),
+        },
+        1,
+    );
+
+    sim.try_send(sleeper, TimerMsg::Start).unwrap();
+    assert_eq!(sim.step(), 1, "start message issues the sleep call");
+    sim.try_send(sleeper, TimerMsg::Fired)
+        .expect("queued filler should occupy the only mailbox slot");
+    sim.advance_time(Duration::from_millis(10));
+    drain(&mut sim);
+
+    assert_eq!(
+        observations.borrow().as_slice(),
+        [TimerObservation::Fired],
+        "only the queued filler message should run"
+    );
+    assert!(sim.trace().iter().any(|event| {
+        matches!(
+            event.kind(),
+            RuntimeEventKind::CallCompletionRejected {
+                call_kind: CallKind::Sleep,
+                reason: CallCompletionRejectedReason::MailboxFull,
+                ..
+            }
+        )
+    }));
 }
 
 #[test]

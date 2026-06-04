@@ -421,24 +421,55 @@ impl<M> RuntimeCall<M> {
         }
     }
 
-    /// Splits the call into its request and translator.
+    /// Splits the call into its request and message translator.
+    ///
+    /// This compatibility helper is only for ordinary message-producing
+    /// calls. Use [`Self::into_completion_parts`] when a backend or test
+    /// harness must preserve terminal completion actions.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the call is not a backend request, or when the completion
+    /// translator returns [`RuntimeCallCompletion::StopRequester`] or
+    /// [`RuntimeCallCompletion::Noop`].
     pub fn into_parts(self) -> (CallInput, Box<dyn FnOnce(CallOutput) -> M>)
     where
         M: 'static,
     {
+        let (request, translator) = self.into_completion_parts();
+        (
+            request,
+            Box::new(move |output| match translator(output) {
+                RuntimeCallCompletion::Message(message) => message,
+                RuntimeCallCompletion::StopRequester | RuntimeCallCompletion::Noop => {
+                    panic!("RuntimeCall::into_parts cannot unwrap a terminal completion action")
+                }
+            }),
+        )
+    }
+
+    /// Splits the call into its request and full completion translator.
+    ///
+    /// Runtime backends and tests that can see terminal actions should prefer
+    /// this over [`Self::into_parts`]. It preserves
+    /// [`RuntimeCallCompletion::StopRequester`] and
+    /// [`RuntimeCallCompletion::Noop`] instead of forcing them through the
+    /// ordinary message path.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the call is not a backend request.
+    pub fn into_completion_parts(
+        self,
+    ) -> (
+        CallInput,
+        Box<dyn FnOnce(CallOutput) -> RuntimeCallCompletion<M>>,
+    ) {
         match self.kind {
             RuntimeCallKind::Backend {
                 request,
                 translator,
-            } => (
-                request,
-                Box::new(move |output| match translator(output) {
-                    RuntimeCallCompletion::Message(message) => message,
-                    RuntimeCallCompletion::StopRequester | RuntimeCallCompletion::Noop => {
-                        panic!("RuntimeCall::into_parts cannot unwrap a terminal completion action")
-                    }
-                }),
-            ),
+            } => (request, translator),
             RuntimeCallKind::ObservedSend { .. } => {
                 panic!("observed send does not carry backend call parts")
             }
@@ -1944,6 +1975,31 @@ pub type UnixListenerCloseReply = CallReply<()>;
 
 /// Reply delivered by [`unix_close_stream`].
 pub type UnixStreamCloseReply = CallReply<()>;
+
+#[cfg(test)]
+mod runtime_call_tests {
+    use super::*;
+
+    #[test]
+    fn into_completion_parts_preserves_terminal_completion_actions() {
+        let call: RuntimeCall<()> = RuntimeCall::new_with_completion(
+            CallInput::Sleep {
+                after: Duration::from_millis(1),
+            },
+            |output| match output {
+                CallOutput::TimerFired => RuntimeCallCompletion::Noop,
+                other => panic!("unexpected output: {other:?}"),
+            },
+        );
+
+        let (request, translator) = call.into_completion_parts();
+        assert!(matches!(request, CallInput::Sleep { .. }));
+        assert!(matches!(
+            translator(CallOutput::TimerFired),
+            RuntimeCallCompletion::Noop,
+        ));
+    }
+}
 
 #[cfg(test)]
 mod pending_cancelable_call_set_tests {
