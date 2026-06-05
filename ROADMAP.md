@@ -398,9 +398,12 @@ and reviews live under `.intent/phases/`.
   successful protocol-local backend completions, and the first HTTP/1 user of
   that action. The scheduler/turn/tail pass added tail-aware rows (p90/p99,
   ratios, scheduler-gap counts, traced/untraced variants), a bounded worker
-  hot-drain, a bounded FIFO backend-completion drain, a behaviour-preserving
-  ready-isolate scheduler, and a host-call fast lane (one fewer allocation per
-  `call_blocking`); warmed `call_blocking` p50 improved on Linux/x86. That pass
+  hot-drain, a bounded FIFO backend-completion drain, and a host-call fast lane
+  (one fewer allocation per `call_blocking`); warmed `call_blocking` p50
+  improved on Linux/x86. (A ready-isolate scheduler was prototyped and reverted
+  — it assumed all ingress is runtime-mediated, which the explicit runtime's
+  direct-mailbox seam breaks; it needs a mailbox-driven ready signal and is
+  deferred to the readiness-park work.) That pass
   also isolated the dominant HTTP cost: the worker re-polls the I/O loop on a
   timer instead of waking on socket readiness (shrinking the interval cuts HTTP
   p50 ~5x). Remaining edges are still real: the readiness-driven worker park

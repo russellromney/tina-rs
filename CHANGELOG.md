@@ -22,12 +22,6 @@ This file records completed work.
   every ready completion in one unbounded batch. Completions are delivered in a
   deterministic FIFO up to a per-step budget; the remainder carries over,
   preserving order, failure truth, and accounting.
-- Ready-isolate scheduler: the step loop only touches isolates that actually
-  have a pending message (a generation-keyed ready queue + per-entry ready bit,
-  marked in the single enqueue path), instead of scanning every registered
-  isolate each round. Behaviour-preserving — delivery set and order are
-  unchanged, so the deterministic-replay fingerprint is byte-identical — with a
-  debug detector for any missed mark.
 - Host-call fast lane: `call_blocking` routes through a typed worker command
   instead of a boxed closure, cutting one host allocation per call (warmed
   `hotpath_call_blocking` host allocations 2 -> 1, process 6 -> 5) while

@@ -478,3 +478,40 @@ Two levers:
 - The phase's headline p50/p90 win is on the host/service path. HTTP p50 did not
   move in this phase because it is re-poll-gated, not scheduler-gated — that is
   the Phase 151 fix, with the idle_repoll knob as a shipped ~5x stopgap.
+
+## Implementation Review — Rock 4 REVERTED (CI caught an unsoundness)
+
+CI `make verify` (a test I did not run in my local sweeps,
+`tina-runtime/tests/address_liveness.rs`) failed four tests after the ready
+scheduler landed:
+`dispatched_send_trace_includes_target_generation`,
+`dispatched_send_to_wrong_generation_records_closed_rejection`,
+`runtime_ingress_to_stopped_address_returns_closed`,
+`repeated_runs_produce_identical_liveness_traces`.
+
+Root cause: Rock 4 assumed every mailbox enqueue funnels through
+`enqueue_entry_message` (which called `mark_entry_ready`). That holds for the
+live threaded worker and the simulator (so the 653 lib tests and the DST
+fingerprint passed), but NOT for the explicit `Runtime`'s direct-mailbox seam:
+those tests seed a mailbox via a held `mailbox.try_send(...)` handle, which
+bypasses `enqueue_entry_message` entirely. So the ready queue never learned the
+isolate had a message, the snapshot skipped it, and `step()` returned 0 instead
+of 1. The per-step `debug_assert` missed it too, because
+`first_unscheduled_nonempty_isolate` used `call_contexts` as the non-empty
+proxy — and a direct push populates the mailbox but not `call_contexts`.
+
+Decision: reverted Rock 4 (commit 085888e) cleanly. The full-scan snapshot is
+correct for all ingress paths, restores the four tests, and keeps the DST
+fingerprint identical (the scan was the baseline). The ready scheduler's
+benefit (quiet-isolate scan cost) was never actually measured — the warmed
+perf rows have ~3 isolates — so reverting loses no measured win while removing
+a real unsoundness. A correct version needs a mailbox-driven ready signal (the
+mailbox marks its entry ready on push, regardless of how the message arrives);
+that pairs naturally with the Phase 151 reactor/mailbox-wakeup work and is
+deferred there. The observable no-starvation / round-robin proofs were re-added
+as `tina-runtime/tests/scheduler_fairness.rs` (they hold under the scan).
+
+Process lesson: run the WHOLE workspace test (`cargo test --workspace`), not a
+hand-picked subset, before claiming a core-scheduler change is proven —
+behaviour-preservation has to be checked against every ingress seam, not the
+mediated one.
