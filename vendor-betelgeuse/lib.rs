@@ -24,7 +24,15 @@
 #![feature(coroutine_trait)]
 #![feature(stmt_expr_attributes)]
 
-use std::{alloc::Allocator, io as stdio, net::SocketAddr, path::Path, rc::Rc};
+use std::{
+    alloc::Allocator,
+    io as stdio,
+    net::SocketAddr,
+    path::Path,
+    rc::Rc,
+    sync::{Arc, Condvar, Mutex},
+    time::Duration,
+};
 
 pub mod completion;
 pub mod io;
@@ -55,7 +63,37 @@ pub trait IOLoop: IO {
     ///
     /// Returns `Ok(true)` when the backend submitted or completed at least one
     /// unit of work during this step, and `Ok(false)` when nothing progressed.
+    ///
+    /// This is the non-blocking drain: it submits queued work and harvests any
+    /// already-ready completions, then returns immediately. It never sleeps.
     fn step(&self) -> stdio::Result<bool>;
+
+    /// Advances the backend, then parks until work is ready or `timeout`.
+    ///
+    /// Same submit + harvest as [`step`](Self::step), but after submitting
+    /// queued work the backend may sleep up to `timeout` for a completion or a
+    /// doorbell wake (see [`waker`](Self::waker)). `Some(d)` caps the sleep at
+    /// `d`; `None` blocks until a real event.
+    ///
+    /// A `None` wait is only legal because the backend keeps a doorbell armed:
+    /// there is always a possible wake source (the doorbell), so `None` cannot
+    /// block forever with nothing able to wake it. Callers that pass `None`
+    /// must hold a [`waker`](Self::waker) and ring it (e.g. after admitting a
+    /// command) so the parked loop wakes promptly.
+    ///
+    /// The doorbell is coalescing: a `wake()` that lands just before the loop
+    /// parks is still observed (it does not sleep through it).
+    fn step_blocking(&self, timeout: Option<Duration>) -> stdio::Result<bool>;
+
+    /// Returns a thread-safe handle that wakes this loop from
+    /// [`step_blocking`](Self::step_blocking).
+    ///
+    /// The returned [`IOWaker`] is a **separate OS handle** (an eventfd on
+    /// Linux, an `EVFILT_USER` registration on macOS, a condvar on the
+    /// simulated backend), not a clone of the `Rc<dyn IOLoop>`. It is
+    /// `Send + Sync + Clone` so host threads may hold and ring it, but it can
+    /// only wake the loop — it never touches backend state.
+    fn waker(&self) -> IOWaker;
 
     /// Returns how many completion slots the backend still owns by pointer.
     ///
@@ -75,6 +113,101 @@ pub trait IOLoop: IO {
     /// [`IOLoop::pending_completion_count`] reaches zero.
     fn cancel_pending_completions(&self) -> stdio::Result<()> {
         Ok(())
+    }
+}
+
+/// Thread-safe handle that wakes a parked [`IOLoop::step_blocking`].
+///
+/// Cloneable and `Send + Sync`. A host thread holds one and calls
+/// [`wake`](IOWaker::wake) to interrupt a loop blocked in
+/// [`IOLoop::step_blocking`]. It owns only a doorbell (its own OS handle), so
+/// it cannot read or mutate any backend state.
+#[derive(Clone)]
+pub struct IOWaker {
+    doorbell: Arc<dyn Doorbell>,
+}
+
+impl IOWaker {
+    /// Constructs a waker around a backend-provided doorbell.
+    pub fn new(doorbell: Arc<dyn Doorbell>) -> Self {
+        Self { doorbell }
+    }
+
+    /// Wakes the associated loop if it is (or is about to be) parked.
+    ///
+    /// Coalescing: repeated `wake()`s collapse into a single observed wake, and
+    /// a `wake()` that races just ahead of the park is still observed.
+    pub fn wake(&self) {
+        self.doorbell.wake();
+    }
+}
+
+impl std::fmt::Debug for IOWaker {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("IOWaker")
+    }
+}
+
+/// Backend doorbell rung by an [`IOWaker`] from any thread.
+///
+/// Implementations own a single OS-level wake primitive (eventfd,
+/// `EVFILT_USER`, condvar). `wake()` must be safe to call from a thread other
+/// than the one driving the loop.
+pub trait Doorbell: Send + Sync {
+    /// Signals the loop to wake from a blocking park.
+    fn wake(&self);
+}
+
+/// A condvar-backed doorbell + coalescing flag.
+///
+/// Reusable wake primitive for backends without a kernel fd to block on (the
+/// simulated backend and test loops). The `rung` flag coalesces a wake that
+/// arrives before the park, so [`CondvarDoorbell::wait`] never sleeps through a
+/// signal it has not yet observed.
+pub struct CondvarDoorbell {
+    rung: Mutex<bool>,
+    cv: Condvar,
+}
+
+impl CondvarDoorbell {
+    /// Creates a shareable doorbell.
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            rung: Mutex::new(false),
+            cv: Condvar::new(),
+        })
+    }
+
+    /// Blocks until woken or `timeout` elapses, then clears the wake flag.
+    ///
+    /// Returns immediately if a wake is already pending (coalesced). `None`
+    /// blocks until a wake; callers that pass `None` must guarantee a `wake()`
+    /// will arrive.
+    pub fn wait(&self, timeout: Option<Duration>) {
+        let mut rung = self.rung.lock().expect("doorbell mutex poisoned");
+        if !*rung {
+            match timeout {
+                Some(d) => {
+                    let (guard, _) = self
+                        .cv
+                        .wait_timeout(rung, d)
+                        .expect("doorbell condvar poisoned");
+                    rung = guard;
+                }
+                None => {
+                    rung = self.cv.wait(rung).expect("doorbell condvar poisoned");
+                }
+            }
+        }
+        *rung = false;
+    }
+}
+
+impl Doorbell for CondvarDoorbell {
+    fn wake(&self) {
+        let mut rung = self.rung.lock().expect("doorbell mutex poisoned");
+        *rung = true;
+        self.cv.notify_all();
     }
 }
 
@@ -251,6 +384,14 @@ impl<A> IO for IOLoopHandle<A> {
 impl<A> IOLoop for IOLoopHandle<A> {
     fn step(&self) -> stdio::Result<bool> {
         self.inner.step()
+    }
+
+    fn step_blocking(&self, timeout: Option<Duration>) -> stdio::Result<bool> {
+        self.inner.step_blocking(timeout)
+    }
+
+    fn waker(&self) -> IOWaker {
+        self.inner.waker()
     }
 
     fn pending_completion_count(&self) -> usize {

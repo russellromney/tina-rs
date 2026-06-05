@@ -96,6 +96,20 @@ impl UnixLane {
         }
     }
 
+    /// Harvest-only reap (no substrate step). See [`BetelgeuseUnix::harvest`]
+    /// and the driver's final harvest pass.
+    pub(super) fn harvest(&mut self, completed: &mut Vec<DriverCompletion>) {
+        #[cfg(unix)]
+        {
+            let Self::Live(lane) = self;
+            lane.harvest(completed);
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = completed;
+        }
+    }
+
     pub(super) fn has_pending(&self) -> bool {
         #[cfg(unix)]
         {
@@ -396,7 +410,17 @@ mod imp {
             // One substrate tick. Errors here are non-fatal: pending ops still
             // hold their slots and will be checked anyway.
             let _ = self.io_loop.step();
+            self.harvest(completed);
+        }
 
+        /// Reaps every pending op whose backend completion now has a result,
+        /// with no substrate step. Split from [`advance`](Self::advance) so the
+        /// driver can run a final harvest after every lane has driven the
+        /// *shared* io_loop: a completion this lane's `poll` surfaced but a
+        /// sibling lane's `drain` executed would otherwise sit unharvested, and
+        /// Unix rides the zero-wakeup park (excluded from
+        /// `has_unsignaled_pending`), so nothing would re-poll to collect it.
+        pub(crate) fn harvest(&mut self, completed: &mut Vec<DriverCompletion>) {
             // Drain in submission order so completion ordering is stable
             // relative to submission ordering whenever Betelgeuse permits it.
             let mut index = 0;

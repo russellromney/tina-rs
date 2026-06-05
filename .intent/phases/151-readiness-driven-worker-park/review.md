@@ -48,3 +48,73 @@ Decision:
   Tina's bounded command truth. The important implementation constraints are
   now pinned: no blocking-send footgun, no fake sim spin, no `Rc` waker, no
   timeout CQE confusion, no enqueue-side ready scheduler.
+
+## Implementation finding: cross-lane harvest theft (the remaining missed-wakeup race)
+
+The rare missed-wakeup race (`grpc_streaming_peer_reset_cancels_response_source`,
+~1/80 alone, ~1/34 in the single-threaded suite) was not in the cancel/reset
+path. It was a latent harvest-ordering bug that the readiness park exposed.
+
+Root cause:
+
+- All socket/file lanes (tcp, unix, tls, storage) share ONE Betelgeuse io_loop
+  (cloned handles). `driver.advance` runs each lane in turn; each lane does
+  `io_loop.step()` (drain queued ops, then poll for readiness) and then harvests
+  its own completions.
+- `poll` only *surfaces* a ready event into the loop's queue — it does not
+  execute it. The `drain` that executes it (writing the typed result) can run
+  inside a *later* lane's `io_loop.step()`. That later lane harvests only its own
+  ops, so a completion surfaced by an earlier lane and executed by a later one is
+  left completed-but-unharvested for that turn.
+- Before this phase the worker re-polled every ~1ms, so the next tick's
+  `try_complete` reaped the stranded result. The readiness park blocks until an
+  io_loop event, and TCP/Unix are the only lanes excluded from
+  `has_unsignaled_pending` (they ride the zero-wakeup park), so nothing re-polls
+  to collect their result. The worker blocks forever on an unrelated armed op
+  (e.g. the listener accept) while the HTTP request sits read-but-undelivered.
+
+How it was found:
+
+- A low-overhead stall monitor (epoch counter + ring of block-forever park
+  snapshots, printed only when the epoch froze) caught the exact stall state:
+  `loop_armed=1 active=["accept:submitted", "readbuf:completed:res=true"]` — a
+  recv that had completed but was never harvested, with the worker parked
+  forever on the accept watch.
+
+Fix:
+
+- Split a harvest-only pass (no substrate step) out of the TCP and Unix lanes
+  and run it once at the end of `driver.advance`, after every lane has driven the
+  shared loop. It reaps any completion a sibling lane executed; it touches no
+  syscall. Anything still only *queued* (surfaced, not executed) keeps the loop
+  armed, so the park's own `step_blocking` drain executes it and the next step
+  reaps it. TLS/storage need no such pass — they are in `has_unsignaled_pending`,
+  so a pending op there already forces a capped re-poll.
+
+Second bug, same class (stale idle metrics):
+
+- The worker skips the O(pending) resource report on hot-delivery turns. A turn
+  that followed a burst and then found nothing to do would park on a stale
+  count; the old timer park refreshed within ~1ms, the readiness park never did.
+  `local_system_reports_live_owned_resources_and_shutdown_cleanup` and
+  `local_system_tls_failed_handshake_closes_listener_and_leaks_no_stream` failed
+  100% with the readiness park (pass on the pre-park baseline). Fixed by
+  publishing a fresh resource count once before parking (a park turn is never a
+  hot turn, so the hot-path savings stand).
+
+Test evidence:
+
+- `grpc_streaming_peer_reset_cancels_response_source`: 400/400 (was ~1/80
+  failing); full `grpc_live` suite single-threaded 80/80 (was ~1/34 failing).
+- `cargo test -p tina-runtime`: all pass (was 2 failing: the two local_system
+  tests above, 0/20 and similar before the metrics fix, 20/20 after).
+- `cargo test -p tina-http`: all 42 test binaries pass.
+- DST determinism: `dst_simulator` / `dst_parser` / `dst_keepalive` pass; live
+  replay regression passes (the simulator never uses the live blocking park).
+
+Residual:
+
+- A deterministic *unit* regression test for the harvest race is not feasible:
+  at the driver level a second `advance` always reaps the stolen completion, so
+  the failure only manifests at the worker block-forever park, which is
+  timing-dependent. The integration test above is the regression guard.

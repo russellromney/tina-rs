@@ -12,9 +12,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use betelgeuse::{
-    AcceptCompletion, AcceptOp, ConnectCompletion, IO, IOFile, IOLoop, IOLoopHandle, IOSocket,
-    OpenOptions, Operation, RecvBufCompletion, RecvCompletion, SendCompletion, SendOwnedCompletion,
-    io::simulated::SimulatedIO,
+    AcceptCompletion, AcceptOp, CondvarDoorbell, ConnectCompletion, IO, IOFile, IOLoop,
+    IOLoopHandle, IOSocket, IOWaker, OpenOptions, Operation, RecvBufCompletion, RecvCompletion,
+    SendCompletion, SendOwnedCompletion, io::simulated::SimulatedIO,
 };
 use tina::{CallContext, Mailbox, TrySendError, prelude::*};
 use tina_runtime::{
@@ -581,9 +581,19 @@ fn threaded_runtime_shutdown_rejects_outstanding_tcp_accept_completion() {
     }));
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 struct StuckReleaseIo {
     state: Arc<Mutex<StuckReleaseState>>,
+    doorbell: Arc<CondvarDoorbell>,
+}
+
+impl Default for StuckReleaseIo {
+    fn default() -> Self {
+        Self {
+            state: Arc::new(Mutex::new(StuckReleaseState::default())),
+            doorbell: CondvarDoorbell::new(),
+        }
+    }
 }
 
 #[derive(Default)]
@@ -722,6 +732,19 @@ impl IO for StuckReleaseIo {
 impl IOLoop for StuckReleaseIo {
     fn step(&self) -> io::Result<bool> {
         Ok(false)
+    }
+
+    fn step_blocking(&self, timeout: Option<Duration>) -> io::Result<bool> {
+        // This backend never makes progress on its own; park on the doorbell so
+        // the worker sleeps (no spin) and wakes on a host command (e.g.
+        // shutdown). Cap a `None` wait so the test cannot hang on a missed wake.
+        let park = timeout.unwrap_or(Duration::from_millis(1));
+        self.doorbell.wait(Some(park));
+        self.step()
+    }
+
+    fn waker(&self) -> IOWaker {
+        IOWaker::new(self.doorbell.clone())
     }
 
     fn pending_completion_count(&self) -> usize {

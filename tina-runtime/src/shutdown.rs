@@ -20,7 +20,7 @@
 
 use std::collections::BTreeMap;
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::mpsc::{SyncSender, TrySendError};
+use std::sync::mpsc::TrySendError;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -35,7 +35,7 @@ use crate::local_system::{
     LocalSystemState, LocalSystemTerminalReport, ThreadedWorkerExit, ThreadedWorkerJoin,
 };
 use crate::mailbox::MailboxFactory;
-use crate::threaded::ThreadedCommand;
+use crate::threaded::{CommandSender, ThreadedCommand};
 
 /// Cloneable handle that controls runtime-level shutdown without consuming
 /// the underlying runtime.
@@ -120,7 +120,7 @@ where
     F: MailboxFactory + Send + 'static,
 {
     pub(crate) shard: ShardId,
-    pub(crate) commands: SyncSender<ThreadedCommand<S, F>>,
+    pub(crate) commands: CommandSender<S, F>,
     pub(crate) handle: Option<ThreadedWorkerJoin>,
     pub(crate) metrics: Arc<LiveShardMetrics>,
     /// `true` once a `Shutdown` command has been admitted to this
@@ -219,7 +219,7 @@ where
         // The send happens without the lock so a saturated command queue
         // doesn't lock the runtime owner against handles that hold the
         // shared state's lock.
-        let pending: Vec<(usize, SyncSender<ThreadedCommand<S, F>>)> = {
+        let pending: Vec<(usize, CommandSender<S, F>)> = {
             let state = self.lock_state();
             state
                 .workers
@@ -630,6 +630,7 @@ mod tests {
     /// leaking the handle (not joining) leaves the metrics `RUNNING`.
     fn fake_worker(shard_id: u32) -> ShutdownWorker<TestShard, DefaultMailboxFactory> {
         let (commands, _rx) = sync_channel::<ThreadedCommand<TestShard, DefaultMailboxFactory>>(1);
+        let commands = CommandSender::new(commands, None);
         let shard = ShardId::new(shard_id);
         let metrics = Arc::new(LiveShardMetrics::new(
             shard,

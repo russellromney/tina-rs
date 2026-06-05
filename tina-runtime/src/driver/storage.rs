@@ -3033,6 +3033,17 @@ mod reactor_proofs {
     }
 
     impl IOLoop for FaultIo {
+        // Explicit-step storage test backend: it is always driven by direct
+        // `step()` calls, never parked on by a worker, so `step_blocking` just
+        // delegates and `waker` hands back an unused (but valid) doorbell.
+        fn step_blocking(&self, _timeout: Option<std::time::Duration>) -> io::Result<bool> {
+            self.step()
+        }
+
+        fn waker(&self) -> betelgeuse::IOWaker {
+            betelgeuse::IOWaker::new(betelgeuse::CondvarDoorbell::new())
+        }
+
         fn step(&self) -> io::Result<bool> {
             let mut st = self.state.borrow_mut();
             if st.config.never_complete {
