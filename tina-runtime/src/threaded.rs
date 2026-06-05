@@ -1320,6 +1320,16 @@ where
         self.call(|runtime| runtime.pressure_summary())
     }
 
+    /// Total blocking-park wakeups this worker has made.
+    ///
+    /// A fully idle worker blocks on the kernel until a real wake source fires
+    /// (I/O readiness, a timer/call deadline, or a host command), so this stays
+    /// flat while the worker is quiet. The idle-CPU proof samples it over a
+    /// window to show a quiet worker makes ~0 wakeups.
+    pub fn park_wakeups(&self) -> u64 {
+        self.metrics.park_wakeups()
+    }
+
     /// Returns whether the worker still has runtime-owned work pending.
     pub fn has_in_flight_calls(&self) -> Result<bool, ThreadedRuntimeError> {
         self.call(|runtime| runtime.has_in_flight_calls())
@@ -1804,6 +1814,9 @@ where
             // iteration drains commands and re-drives the runtime.
             thread::sleep(config.idle_repoll_interval);
         }
+        // One blocking-park wakeup. A fully idle worker blocks until a real wake
+        // source fires, so this stays flat at idle (the idle-CPU proof reads it).
+        metrics.record_park_wakeup();
         // Loop back: the top `try_recv` drains any command the doorbell woke us
         // for (and observes Disconnected), and the hot-drain delivers any I/O
         // completion the park harvested.

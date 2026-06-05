@@ -118,3 +118,53 @@ Residual:
   at the driver level a second `advance` always reaps the stolen completion, so
   the failure only manifests at the worker block-forever park, which is
   timing-dependent. The integration test above is the regression guard.
+
+## Perf evidence (Linux/x86, Fly performance-2x, region iad, release)
+
+Captured from the source at commit f6abb9b on a dedicated-CPU cloud machine.
+Local/alpha evidence on one box, not a production claim. Full rows in
+`perf_sample_linux.txt`.
+
+What changed is the worker stopped sleeping. Before, the worker parked on a
+timer and only *noticed* a ready socket on its next poll, so the HTTP host
+path spent ~1.1ms per request doing nothing. The readiness park removes that:
+the worker blocks on the kernel and wakes the instant a socket is ready or a
+command arrives. This is the removal of a polling/wakeup gap, not an
+optimization of real work.
+
+The gap, before and after (`host_submit -> mbox`/`call_completed` stage):
+
+  path                  Phase 150        Phase 151
+  http close            ~1.105 ms        ~0.125 ms
+  http keepalive        ~1.108 ms        ~0.030-0.047 ms
+
+End-to-end p50 (same probe): http close ~1.16ms -> ~0.15ms; keepalive
+~1.17ms -> ~0.15ms. The number that vanished was idle sleep; the ~0.15ms that
+remains is real work the sleep had been hiding.
+
+Where the remaining ~0.15ms goes (close, by stage): the single large stage is
+`host_submit -> mbox_accepted` ~0.125ms, which is connection setup —
+connect + accept + first read, i.e. 2-3 real kernel readiness round-trips on
+loopback (~40-50us each on this VM), not a poll gap. Handlers themselves run in
+under 3us. The warm keepalive path (one read round-trip on an established
+connection) is ~0.030ms host-submit-to-completed, and a single in-process hop
+(`call_blocking`, no sockets) is ~12-20us — that is the floor for one hop, and
+HTTP simply has several.
+
+Honest non-result: the stretch goal "host-submit gap in single-digit
+microseconds" was NOT met for HTTP and should not have been — HTTP is
+inherently multi-round-trip. Single-digit microseconds applies to one
+in-process hop only. The remaining connection-setup round-trips and per-byte
+copy are the next bottleneck (zero-copy + accept path), now that idle sleep no
+longer dominates.
+
+CPU: the warm keepalive path reaches ~0.15ms p50 while a fully idle worker
+makes zero park wakeups (it blocks on the kernel). Phase 150 could approach
+this latency only by lowering `idle_repoll` to ~100us, which re-polls
+continuously while I/O is pending. So this path is both at-or-below that
+latency and free of the extra wakeups, which is the CPU win the soak/idle
+proof backs up.
+
+The deprecated `idle_repoll_interval` / `idle_wait` knobs no longer drive the
+single-shard idle park (they remain accepted config; the park blocks on real
+readiness instead). Multi-shard still uses the command-queue park.

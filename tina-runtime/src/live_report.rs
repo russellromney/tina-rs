@@ -2,7 +2,7 @@
 //! snapshots that user code reads from a live runtime.
 
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use tina::ShardId;
@@ -161,6 +161,11 @@ pub(crate) struct LiveShardMetrics {
     owned_resource_count: AtomicUsize,
     worker_held_resource_count: AtomicUsize,
     pending_driver_call_count: AtomicUsize,
+    /// Times the worker returned from a blocking park. A fully idle worker
+    /// blocks on the kernel and so leaves this flat; the count rises only when a
+    /// real wake source fires (I/O readiness, a deadline, or a host command).
+    /// Used by the idle-CPU proof to show a quiet worker makes ~0 wakeups.
+    park_wakeups: AtomicU64,
 }
 
 impl LiveShardMetrics {
@@ -187,7 +192,18 @@ impl LiveShardMetrics {
             owned_resource_count: AtomicUsize::new(0),
             worker_held_resource_count: AtomicUsize::new(0),
             pending_driver_call_count: AtomicUsize::new(0),
+            park_wakeups: AtomicU64::new(0),
         }
+    }
+
+    /// Records one return from a blocking park.
+    pub(crate) fn record_park_wakeup(&self) {
+        self.park_wakeups.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Total blocking-park wakeups observed so far.
+    pub(crate) fn park_wakeups(&self) -> u64 {
+        self.park_wakeups.load(Ordering::Relaxed)
     }
 
     pub(crate) fn state(&self) -> LiveShardState {
