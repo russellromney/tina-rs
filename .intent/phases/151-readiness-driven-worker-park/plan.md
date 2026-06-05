@@ -76,8 +76,9 @@ Done means:
   bypass / HFT; not this);
 - no async/await, no executor inside Tina;
 - no zero-copy work (separate, complementary track — see Notes);
-- no change to the bounded hot-drain, ready scheduler, or completion-drain
-  rocks from Phase 150 — only the *park primitive* changes;
+- no change to bounded hot-drain or completion-drain semantics from Phase 150;
+- ready scheduling may change only through Rock 3's mailbox-owned readiness
+  proof; no enqueue-side ready mark is allowed;
 - no change to HTTP wire bytes or body-pressure accounting.
 
 ## Betelgeuse is a tina-maintained fork
@@ -94,21 +95,21 @@ So this phase extends a fork we already maintain. Upstreaming the blocking
 wait is optional and likely an uphill push (a `submit_and_wait`-with-timeout is
 more palatable to upstream than a "waker"; the doorbell can stay local).
 
-## Rock 0: Re-vendor Betelgeuse to latest, reconcile patches FIRST
+## Rock 0: Betelgeuse provenance marker, no broad re-vendor
 
-Do NOT build the reactor change on a drifted fork. First:
+Do NOT turn this performance fix into a giant vendored-dependency rewrite.
+There is no `vendor-betelgeuse/VENDOR.md` marker today. Add one, with:
 
-- snapshot upstream penberg/betelgeuse @ latest main into a scratch tree;
-- three-way diff: (a) tina-only patches vs upstream, (b) upstream changes we
-  lack, (c) tina patches that upstream has since SUPERSEDED (e.g. if upstream
-  added something our patch hand-rolled);
-- re-vendor from upstream latest and re-apply only the tina patches still
-  needed; drop superseded ones; record the upstream commit sha in a
-  `VENDOR.md` marker so future staleness checks are trivial;
-- prove the whole tina-rs workspace builds + the betelgeuse-touching tests
-  (`betelgeuse_substrate`, DST, the lane tests) pass on the reconciled base.
+- upstream repo URL and commit if known;
+- if unknown, say "unknown historical vendor point" honestly;
+- short list of tina-local patch families already present (Unix sockets,
+  native buffer reuse, completion-release hooks, parallel substrate,
+  F_FULLFSYNC, address introspection).
 
-Only then build Rocks 1-3 on the clean base.
+Do not re-vendor to latest unless the implementer can name a specific upstream
+change needed by this phase. If a re-vendor is required, split it into its own
+first commit and prove the workspace before adding the blocking wait. Normal
+path: keep the current fork, add the marker, then implement Rocks 1-3.
 
 ## Rock 1: Betelgeuse blocking wait + waker (additive)
 
@@ -116,31 +117,54 @@ Add two capabilities to the IOLoop, leaving `step()` and the op/completion
 machinery untouched:
 
 - `fn step_blocking(&self, timeout: Option<Duration>) -> Result<bool>`: same
-  drain as `step()`, but the backend wait actually sleeps up to `timeout`
-  (None = until something happens):
-  - macOS: pass the real `timespec` to `kevent` instead of `{0,0}`;
-  - Linux: `submit_and_wait(1)` + an `IORING_OP_TIMEOUT` SQE for the deadline
-    (or `submit_with_args` timeout on supporting kernels);
-  - simulated backend: no-op (returns immediately) — keeps DST deterministic.
-- `fn waker(&self) -> Waker` where `Waker: Send + Clone` with `wake()`,
-  registered in the backend so a `wake()` pops the blocking wait:
-  - Linux: an `eventfd`; arm a `POLL_ADD` on it in the ring; `wake()` writes 8
-    bytes; re-arm after each wake;
-  - macOS: an `EVFILT_USER` kevent; `wake()` = `kevent(NOTE_TRIGGER)`;
-  - simulated: a flag.
+  drain as `step()`, but after submitting queued work the backend may sleep up
+  to `timeout` for a completion or doorbell event. `None` means block until a
+  real event, but only after the backend has a doorbell/watch or in-flight work
+  armed; never call a kernel wait with no possible wake source.
+- `fn waker(&self) -> IOWaker` where `IOWaker: Send + Sync + Clone` with
+  `wake()`. It must be a separate OS handle, not a clone of the `Rc<dyn
+  IOLoop>`; host threads may use it, but must not touch backend state.
+- Linux:
+  - create one `eventfd` owned by the backend;
+  - keep a persistent poll/read interest for that eventfd in the ring, with
+    user_data reserved for "doorbell", never a completion pointer;
+  - `wake()` writes 8 bytes and coalesces `EAGAIN` as already-awake;
+  - `step_blocking(Some(t))` uses a real timeout path that does not leak timeout
+    CQEs or confuse timeout completions with operation completions;
+  - `step_blocking(None)` is legal only when eventfd/in-flight work can wake it.
+- macOS:
+  - register an `EVFILT_USER` doorbell with reserved `udata`;
+  - `wake()` = `kevent(NOTE_TRIGGER)`;
+  - blocking wait passes a real optional `timespec` to `kevent`;
+  - event `udata` is classified before casting to `CompletionInner`.
+- simulated Betelgeuse backend used by threaded tests:
+  - it must not spin if the worker calls `step_blocking(None)`;
+  - use a small condvar/doorbell or a bounded timeout path so a threaded runtime
+    over simulated I/O still sleeps and wakes on command;
+  - `tina-sim` deterministic replay remains unchanged because it does not use
+    the live threaded park.
 
 Rules:
 - no change to existing `step()` semantics (the non-blocking drain stays for
   the hot-drain inner loop);
-- the waker is level-triggered so a `wake()` before the block still wakes it;
+- the waker is level-triggered/coalescing so a `wake()` before the block still
+  wakes it;
+- a wake event is observable as "work happened" but is not a runtime trace
+  event and must not perturb replay hashes;
 - exposed on `IOLoopHandle` (and the `IOLoop` trait) so tina-runtime can hold
   the waker and call `step_blocking`.
 
 ## Rock 2: tina-runtime — block in the io_loop, doorbell on send
 
-- wrap the command `SyncSender` in `CommandSender { tx, waker }` whose `send`
-  does `tx.send(cmd)?; waker.wake();`. Every host path (call_blocking's
-  `HostCall`, send/observe, shutdown, cross-shard inbound) goes through it;
+- wrap the command `SyncSender` in `CommandSender { tx, waker }` with:
+  - `try_send(cmd)`: preserves today's bounded `Full` / `Disconnected` outcomes
+    and wakes only after successful admission;
+  - no new unbounded blocking send in hot paths. Existing blocking `call(...)`
+    helper either uses `try_send + CommandFull` or proves it cannot deadlock
+    with the worker asleep;
+  - shutdown uses `try_send` and wakes after admission, preserving retry-on-Full;
+  - every host path (`try_send`, send/observe, `call_blocking`, observation,
+    shutdown, cross-shard inbound) goes through the doorbell sender;
 - replace the worker park (`receiver.recv_timeout(park)`, both the single- and
   multi-shard loops) with:
   - `let deadline = self.next_wake_deadline();  // min(next timer, next call deadline); None = forever`
@@ -155,10 +179,13 @@ Rules:
   exactly as-is; only the park changes.
 
 Rules / correctness (the doorbell race):
-- `tx.send()` happens-before `waker.wake()`, and the worker always drains the
-  mpsc AFTER waking, so a command can never be enqueued-but-missed (standard
-  self-pipe argument; the level-triggered eventfd/EVFILT_USER guarantees a
-  pre-block wake is observed);
+- successful `try_send` happens-before `waker.wake()`, and the worker always
+  drains the mpsc AFTER waking, so a command can never be
+  enqueued-but-missed. The level-triggered/coalescing doorbell guarantees a
+  pre-block wake is observed;
+- a `Full` command queue must not rely on a wake to make progress: either an
+  earlier admitted command already rang the doorbell, or the path returns
+  typed `Full` immediately;
 - no host thread touches isolate state; the doorbell only wakes the worker;
 - shutdown is a command -> doorbell -> wake -> drain -> shutdown.
 
@@ -179,16 +206,19 @@ near-done PR.
 
 Plan:
 - extend `Mailbox<T>` (and `ErasedMailbox`) with a cheap readiness primitive —
-  either `is_empty()` (so the scan skips empty entries without `recv`) or a
-  push-time ready signal the runtime can collect. `is_empty()` is the smaller,
-  lower-risk change and is correct for EVERY ingress path (it reflects direct
-  pushes); prefer it unless the benchmark shows the per-entry iteration itself
-  (not the `recv`) is the cost;
+  prefer `is_empty()` first, because it is correct for EVERY ingress path
+  (mediated runtime sends and direct `mailbox.try_send` handles). It skips
+  expensive empty `recv_boxed` calls but still scans entries;
+- only build a true FIFO ready queue if the mailbox can notify the runtime on
+  empty -> non-empty transition for direct pushes too. Do not reintroduce an
+  enqueue-side ready mark owned only by the runtime;
 - thread the new method through every mailbox impl (default factory mailboxes,
   the threaded mailboxes, test mailboxes, any user-facing impls);
-- rebuild the O(ready)-or-skip-empty snapshot on that primitive; restore the
-  no-starvation / round-robin proofs and ADD a direct-`mailbox.try_send` test
-  so the seam that broke Rock 4 is covered;
+- rebuild the snapshot as "skip-empty scan" first; if benchmark proves the
+  remaining entry scan is the cost, add the mailbox-owned ready queue in the
+  same PR with direct-push proof. Restore the no-starvation / round-robin
+  proofs and ADD a direct-`mailbox.try_send` test so the seam that broke Rock 4
+  is covered;
 - prove DST byte-identical (behaviour-preserving) AND run the full
   `cargo test --workspace`, not a subset — the Phase 150 miss was trusting a
   hand-picked test set;
@@ -199,11 +229,12 @@ Plan:
 
 Rules:
 - correct for all ingress (mediated + direct mailbox push), proven by test;
-- no public `Mailbox<T>` behaviour change beyond the additive method (provide a
-  default impl where a sound one exists, so external impls do not silently
-  break);
-- only reland if the benchmark justifies it; otherwise keep the scan and record
-  that the scan was fast enough.
+- no public `Mailbox<T>` behaviour change beyond additive readiness methods.
+  Do not provide a default `is_empty() == false` that silently destroys the
+  optimization or hides missing impls; update all in-tree mailbox impls and
+  use compile errors as the rail;
+- only reland a true ready queue if the benchmark justifies it; otherwise keep
+  skip-empty scan and record that the remaining scan was fast enough.
 
 ## Proof
 
@@ -217,9 +248,16 @@ Rules:
   zero;
 - no missed command: a stress test hammering commands while the worker blocks;
   all observed within a bound;
+- command-full proof: when the command queue is full, `try_send`/shutdown still
+  return typed `Full` and do not block waiting for a doorbell;
+- pre-wake race proof: enqueue a command immediately before the worker enters
+  `step_blocking`; it must be observed without waiting for the timeout;
+- simulated threaded proof: a `ThreadedRuntime` built with Betelgeuse simulated
+  I/O does not spin and still wakes for host commands;
 - DST fingerprint unchanged (sim never blocks);
 - existing live tests (threaded_call_blocking, host_burst, multishard_fairness,
-  scheduler_turn_tail, ready_scheduler, the full tina-http suite) all pass;
+  scheduler_turn_tail, scheduler_fairness, address_liveness, the full
+  tina-http suite) all pass;
 - soak: warmed keepalive under load shows lower CPU than the Phase 150
   idle_repoll=100us config at the same latency.
 
@@ -238,5 +276,6 @@ Rules:
 - HTTP `host_submit` gap single-digit us, HTTP p50 ~150-200us on Linux;
 - no missed command, no fairness regression, no wire-byte / pressure change;
 - DST deterministic (sim unchanged);
-- `vendor-betelgeuse` re-vendored to a recorded upstream sha with a minimized,
-  reconciled tina patch set, plus the additive `step_blocking` + `waker`.
+- `vendor-betelgeuse/VENDOR.md` records provenance/patch families, and the
+  additive `step_blocking` + `waker` path is shipped without a broad re-vendor
+  unless a separate evidence-backed re-vendor commit was required.
