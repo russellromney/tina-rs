@@ -234,10 +234,19 @@ fn kind_label(kind: RuntimeEventKind) -> &'static str {
 }
 
 fn new_runtime(observer: Option<Arc<dyn TraceObserver>>) -> Runtime {
-    let config = ThreadedRuntimeConfig {
+    let mut config = ThreadedRuntimeConfig {
         command_capacity: CAP,
         ..ThreadedRuntimeConfig::default()
     };
+    // Opt-in sweep knob: `TINA_PERF_IDLE_REPOLL_US=N` sets the I/O re-poll park
+    // so an A/B can quantify how the worker's socket-readiness latency (the
+    // HTTP `host_submit -> mbox_accepted` gap) responds. Unset = default
+    // (idle_repoll == idle_wait), so normal runs are unchanged.
+    if let Ok(raw) = std::env::var("TINA_PERF_IDLE_REPOLL_US")
+        && let Ok(us) = raw.trim().parse::<u64>()
+    {
+        config.idle_repoll_interval = Duration::from_micros(us.max(1));
+    }
     match observer {
         Some(observer) => ThreadedRuntime::with_config_and_trace_observer(
             SingleShard,
