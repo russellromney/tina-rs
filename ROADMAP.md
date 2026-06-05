@@ -396,9 +396,17 @@ and reviews live under `.intent/phases/`.
   response allocation cleanup. Phase 149 added sharper hotpath counters,
   warmed keepalive steady-state rows, a narrow terminal completion action for
   successful protocol-local backend completions, and the first HTTP/1 user of
-  that action. Remaining edges are still real: HTTP/runtime turn cost,
-  repeated Linux/x86 evidence, HTTP/2/WebSocket equivalent workload rows, and
-  no production-performance claim until evidence earns it.
+  that action. The scheduler/turn/tail pass added tail-aware rows (p90/p99,
+  ratios, scheduler-gap counts, traced/untraced variants), a bounded worker
+  hot-drain, a bounded FIFO backend-completion drain, a behaviour-preserving
+  ready-isolate scheduler, and a host-call fast lane (one fewer allocation per
+  `call_blocking`); warmed `call_blocking` p50 improved on Linux/x86. That pass
+  also isolated the dominant HTTP cost: the worker re-polls the I/O loop on a
+  timer instead of waking on socket readiness (shrinking the interval cuts HTTP
+  p50 ~5x). Remaining edges are still real: the readiness-driven worker park
+  (the real fix for that re-poll gap), HTTP/2/WebSocket equivalent workload
+  rows, zero-copy on the byte path, and no production-performance claim until
+  evidence earns it.
 
 These are recorded in `CHANGELOG.md`; the remaining near-term roadmap now
 starts with the next performance pass and native AWS. Public release cleanup
@@ -411,7 +419,8 @@ framework before public release-story work.
 
 | Phase | Purpose |
 |---|---|
-| **Next performance pass** | Continue from Phase 149's evidence: reduce HTTP/runtime turn cost further, collect repeated Linux/x86 rows, add HTTP/2/WebSocket equivalent workload rows, and investigate the remaining p90/p99 wobble before any public performance claim. |
+| **Readiness-driven worker park** | The named next bottleneck after the scheduler/turn/tail pass. The worker parks on the command channel and re-polls the I/O loop on a timer, so a ready socket waits up to the park interval (~1ms) — the entire HTTP hot-path gap. Add a blocking submit-and-wait + a wakeup doorbell to the vendored Betelgeuse (io_uring/kqueue), block the worker in the I/O loop, and signal the doorbell on command send: zero idle wakeups, HTTP p50 to ~150-200us. First re-vendors Betelgeuse to upstream latest and reconciles the local patch set. Plan: `.intent/phases/151-readiness-driven-worker-park/plan.md`. |
+| **Later performance passes** | HTTP/2/WebSocket equivalent workload rows; zero-copy on the byte path (read-scratch and owned-bytes write paths) once the wakeup gap is closed; broader repeated Linux/x86 rows before any public performance claim. |
 | **135 Native AWS first form** | Add a native Tina AWS battery for the smallest honest production shape: static SigV4 with explicit signing time, native S3 put/get/head/delete, native SQS send/receive/delete, native HTTP keepalive under Phase 131 endpoint/connect policy, bounded bodies/in-flight work, typed pressure/lifecycle reports, hermetic fake-AWS tests, and clear native-vs-SDK-bridge docs. Plan: `.intent/phases/135-native-aws-first-form/plan.md`. |
 | **Alpaca rename** | Before public launch, rename the project/crates/docs away from Tina to Alpaca so the lineage is respectful and clear: independently maintained Rust framework, inspired by Peter Mbanugo's Tina/Odin and Seastar, not an official Tina port. |
 | **Barend Biesheuvel visible flow ergonomics** | Optional high-level ergonomics only after the local runtime core feels boring: a `flow!`-style authoring surface that preserves named suspension points, visible failure policy, trace step names, and ordinary Tina message/effect expansion. No fake async, no hidden retries, no hidden queues. |

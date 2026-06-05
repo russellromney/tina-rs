@@ -433,3 +433,48 @@ Two levers:
   wakes the instant a connection arrives — same ~100-200us HTTP latency with
   ZERO extra wakeups. A runtime + betelgeuse change, larger than any rock here;
   named as the phase's next bottleneck (Rock 9).
+
+## Implementation Review — Rock 8 (soak + CPU sanity)
+
+- `make proof-fast`: green (proof-harness + realtime-rooms bad_peer + live-replay
+  + scoped-request-tree smoke).
+- `make proof-soak`: green under the new scheduler:
+  - `mini_saas_api_soak` (4 workers, 240 ops): leak_clean=true,
+    shutdown_clean=true, http.request_body_current=0,
+    http.response_body_current=0 (body pressure returns to zero, no creep),
+    no runtime.send_full / completion_full / reply_path_full; the only errors
+    are 12 expected http_503 backpressure rejections under a capacity-1 DB.
+  - `protocol_chaos_soak` 500 iters / 11000 cases green.
+- CPU sanity: idle and pending-timer no-spin are structural — the worker parks
+  via `recv_timeout` (it sleeps; there is no sleepless loop), and
+  `scheduler_turn_tail.rs` exercises the park path (pending timer serviced at
+  idle_repoll, idle worker wakes only on a command). The soak adds the
+  no-resource-creep evidence under sustained load. The rigorous *wake-count*
+  idle-CPU proof (0 wakeups/sec) is cleanest after the readiness-driven park
+  lands (it makes "blocks until the kernel has work" directly measurable);
+  recorded honestly as Phase 151 work, not faked here.
+
+## Implementation Review — Rock 9 + Next Bottleneck
+
+- Docs updated: CHANGELOG "Scheduler, Turn, and Tail Performance" section,
+  ROADMAP perf tranche + a named "Readiness-driven worker park" near-term row
+  and a "Later performance passes" row (HTTP/2/WebSocket, zero-copy).
+- Verification run: see the per-rock reviews + proof-fast/proof-soak above and
+  the perf_native hotpath/perf rows.
+- NEXT BOTTLENECK (named, with a committed plan): the worker re-polls the I/O
+  loop on a timer instead of waking on socket readiness, which is the entire
+  HTTP hot-path gap (~1.1ms). The fix is the readiness-driven worker park —
+  a blocking submit-and-wait + a wakeup doorbell in the vendored Betelgeuse,
+  blocking the worker in the I/O loop. Planned as Phase 151
+  (`.intent/phases/151-readiness-driven-worker-park/plan.md`), kept separate
+  from 150 because it forks a third-party vendored dependency (different blast
+  radius). Zero-copy on the byte path is a separate later track.
+
+## Honest scope note (deferred sub-items)
+
+- `hotpath_service_request_reply_chain_tail` (a dedicated multi-hop service-
+  chain probe) was not added; `hotpath_call_blocking_tail` is the representative
+  host/service row and is the one that improved (p50 25.7us -> ~14us on Linux).
+- The phase's headline p50/p90 win is on the host/service path. HTTP p50 did not
+  move in this phase because it is re-poll-gated, not scheduler-gated — that is
+  the Phase 151 fix, with the idle_repoll knob as a shipped ~5x stopgap.
