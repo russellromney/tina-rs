@@ -364,7 +364,6 @@ where
             parent: None,
             stopped: Cell::new(false),
             stopped_event: Cell::new(None),
-            ready: Cell::new(false),
             mailbox: Box::new(AnyMailboxAdapter { mailbox }),
             call_contexts: RefCell::new(VecDeque::new()),
             handler: RefCell::new(Box::new(HandlerAdapter::<I, Outbound> {
@@ -466,28 +465,9 @@ where
                     .call_contexts
                     .borrow_mut()
                     .push_back(call_context);
-                // Every mailbox enqueue funnels through here (bootstrap, local
-                // send, call continuation, deferred reply, observed send, remote
-                // inbound, child lifecycle, terminal fallback), so marking the
-                // target ready here covers them all in one place.
-                self.mark_entry_ready(entry_index);
                 Ok(())
             }
             Err(error) => Err(error),
-        }
-    }
-
-    /// Adds `entry_index` to the ready queue if it is not already queued.
-    /// Keyed by (isolate id, generation) so a later gc/restart cannot make the
-    /// queued entry resolve to the wrong incarnation. Idempotent via the
-    /// per-entry `ready` bit.
-    pub(crate) fn mark_entry_ready(&self, entry_index: usize) {
-        let entry = &self.entries[entry_index];
-        if !entry.ready.get() {
-            entry.ready.set(true);
-            self.ready_queue
-                .borrow_mut()
-                .push_back((entry.id, entry.generation));
         }
     }
 
@@ -588,7 +568,6 @@ where
             parent,
             stopped: Cell::new(false),
             stopped_event: Cell::new(None),
-            ready: Cell::new(false),
             mailbox,
             call_contexts: RefCell::new(VecDeque::new()),
             handler: RefCell::new(Box::new(HandlerAdapter::<I, Outbound> {
@@ -792,7 +771,6 @@ where
             parent,
             stopped: Cell::new(false),
             stopped_event: Cell::new(None),
-            ready: Cell::new(false),
             mailbox,
             call_contexts: RefCell::new(VecDeque::new()),
             handler: RefCell::new(Box::new(SendableHandlerAdapter::<I, Outbound> {

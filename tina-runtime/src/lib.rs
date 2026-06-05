@@ -37,7 +37,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
-use tina::{AddressGeneration, DeferredSlotRegistry, IsolateId, Shard};
+use tina::{DeferredSlotRegistry, IsolateId, Shard};
 
 use betelgeuse::IOLoopHandle;
 
@@ -411,15 +411,6 @@ where
     pub(crate) remote_child_control_capacity: usize,
     pub(crate) remote_child_control_full: u64,
     pub(crate) round_messages: Vec<Option<DeliveredMessage>>,
-    /// FIFO queue of isolates that may have a pending mailbox message, keyed by
-    /// (isolate id, generation) — NOT by entry index, because `gc_stopped_entries`
-    /// compacts the entries Vec and shifts indexes. The generation is checked at
-    /// pop time, so a stale entry for a stopped/gc'd/restarted isolate is dropped
-    /// instead of delivering to the wrong incarnation. Paired with the per-entry
-    /// `ready` bit so each live isolate appears at most once. Lets the scheduler
-    /// recv only ready isolates instead of scanning every registered entry.
-    pub(crate) ready_queue:
-        std::cell::RefCell<std::collections::VecDeque<(IsolateId, AddressGeneration)>>,
     pub(crate) driver_completions: Vec<DriverCompletion>,
     /// Backend completions harvested from the driver but not yet delivered this
     /// step because the per-step drain budget was reached. Deterministic FIFO:
@@ -723,9 +714,6 @@ where
             remote_child_control_capacity: 64,
             remote_child_control_full: 0,
             round_messages: Vec::with_capacity(preallocation.round_scratch_capacity),
-            ready_queue: std::cell::RefCell::new(std::collections::VecDeque::with_capacity(
-                preallocation.round_scratch_capacity,
-            )),
             driver_completions: Vec::with_capacity(preallocation.call_capacity),
             pending_completions: std::collections::VecDeque::new(),
             driver_completion_drain_budget: DEFAULT_DRIVER_COMPLETION_DRAIN_BUDGET,

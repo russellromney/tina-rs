@@ -272,53 +272,13 @@ where
         let mut round_messages = std::mem::take(&mut self.round_messages);
         round_messages.clear();
         reserve_round_message_scratch(&mut round_messages, self.entries.len());
-        round_messages.resize_with(self.entries.len(), || None);
-
-        // Snapshot exactly the isolates that were ready at the start of this
-        // round, draining at most one message each. `round_messages` stays
-        // indexed by entry so the dispatch loop and the supervision/restart
-        // paths (which index it by entry) are unchanged; the only difference
-        // from the old full scan is that empty mailboxes are never recv'd. This
-        // is behaviour-preserving because every mailbox enqueue marks the target
-        // ready (see `enqueue_entry_message`), so the set and per-entry order of
-        // delivered messages is identical to scanning all entries. Isolates
-        // marked ready *during* dispatch are appended to the queue and wait for
-        // the next round (self-send stays a later turn).
-        let ready_now = self.ready_queue.borrow().len();
-        for _ in 0..ready_now {
-            let Some((isolate_id, generation)) = self.ready_queue.borrow_mut().pop_front() else {
-                break;
+        for index in 0..self.entries.len() {
+            let message = if self.entries[index].stopped.get() {
+                None
+            } else {
+                self.recv_entry_message(index)
             };
-            // Resolve (id, generation) to a live entry. A stale queue entry for
-            // a stopped / gc'd / restarted isolate fails this and is dropped, so
-            // a reused index can never deliver to the wrong incarnation.
-            let Some(index) = self.entry_indexes.get(&isolate_id).copied() else {
-                continue;
-            };
-            if self.entries[index].generation != generation || self.entries[index].stopped.get() {
-                if self.entries[index].generation == generation {
-                    self.entries[index].ready.set(false);
-                }
-                continue;
-            }
-            match self.recv_entry_message(index) {
-                Some(message) => {
-                    round_messages[index] = Some(message);
-                    // `call_contexts` is 1:1 with mailbox depth: non-empty means
-                    // more messages remain, so requeue (still ready); empty means
-                    // the mailbox drained, so clear the bit.
-                    if self.entries[index].call_contexts.borrow().is_empty() {
-                        self.entries[index].ready.set(false);
-                    } else {
-                        self.ready_queue
-                            .borrow_mut()
-                            .push_back((isolate_id, generation));
-                    }
-                }
-                None => {
-                    self.entries[index].ready.set(false);
-                }
-            }
+            round_messages.push(message);
         }
 
         let mut delivered = 0;
@@ -467,13 +427,6 @@ where
 
         self.sweep_dropped_deferred_slots();
         self.gc_stopped_entries();
-
-        debug_assert!(
-            self.first_unscheduled_nonempty_isolate().is_none(),
-            "ready-queue invariant violated: a live isolate has a non-empty mailbox but is not \
-             scheduled (an enqueue path missed mark_entry_ready): {:?}",
-            self.first_unscheduled_nonempty_isolate()
-        );
 
         delivered
     }
@@ -2005,19 +1958,6 @@ where
             || !self.pending_completions.is_empty()
     }
 
-    /// Debug/test fallback for the ready scheduler. Scans every entry and
-    /// returns the id of the first live isolate whose mailbox is non-empty
-    /// (`call_contexts` is 1:1 with mailbox depth) yet whose `ready` bit is
-    /// clear — i.e. a message that would never be scheduled. `None` means the
-    /// ready-queue invariant holds. O(entries); used by `debug_assert!` and the
-    /// `ready_scheduler` test, never on the release hot path.
-    pub(crate) fn first_unscheduled_nonempty_isolate(&self) -> Option<IsolateId> {
-        self.entries.iter().find_map(|entry| {
-            let nonempty = !entry.call_contexts.borrow().is_empty();
-            (nonempty && !entry.stopped.get() && !entry.ready.get()).then_some(entry.id)
-        })
-    }
-
     pub(crate) fn advance_driver(&mut self, now: Instant) {
         // Harvest every completion the driver has ready this advance, but
         // deliver at most `driver_completion_drain_budget` into mailboxes per
@@ -2398,10 +2338,6 @@ where
         }
 
         self.entries[index].stopped.set(true);
-        // A stopped isolate must not be scheduled. Any stale (id, generation)
-        // still sitting in the ready queue is dropped at pop time by the
-        // generation/stopped check; clearing the bit keeps the invariant tidy.
-        self.entries[index].ready.set(false);
         self.entries[index].mailbox.close();
         let stopped = self.push_event(isolate_id, Some(cause), RuntimeEventKind::IsolateStopped);
         self.entries[index].stopped_event.set(Some(stopped));
@@ -3747,10 +3683,6 @@ where
     pub(crate) parent: Option<IsolateId>,
     pub(crate) stopped: Cell<bool>,
     pub(crate) stopped_event: Cell<Option<EventId>>,
-    /// Set while this isolate is in the runtime's `ready_queue` (it may have a
-    /// pending mailbox message). Ensures the isolate is queued at most once.
-    /// Cleared when its mailbox drains or it stops; dies with the entry on gc.
-    pub(crate) ready: Cell<bool>,
     pub(crate) mailbox: Box<dyn ErasedMailbox>,
     pub(crate) call_contexts: RefCell<VecDeque<Option<MessageCallContext>>>,
     pub(crate) handler: RefCell<Box<dyn ErasedHandler<S, F>>>,

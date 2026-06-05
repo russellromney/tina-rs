@@ -2932,69 +2932,6 @@ fn bounded_completion_drain_delivers_one_per_step_in_fifo_order() {
     );
 }
 
-/// Rock 4: the ready queue holds only isolates that actually have a pending
-/// message, so the scheduler considers O(ready), not O(all registered). Fifty
-/// quiet isolates plus one hot one means a ready queue of exactly one.
-#[test]
-fn ready_queue_tracks_only_ready_isolates() {
-    let (mut runtime, _clock) = new_manual_runtime();
-    let _quiet: Vec<_> = (0..50)
-        .map(|_| {
-            runtime.register(
-                Sleeper {
-                    delay: Duration::from_millis(10),
-                },
-                TestMailbox::new(4),
-            )
-        })
-        .collect();
-    let hot = runtime.register(
-        Sleeper {
-            delay: Duration::from_millis(10),
-        },
-        TestMailbox::new(4),
-    );
-
-    runtime.try_send(hot, TimerMsg::StartSleep).unwrap();
-    assert_eq!(
-        runtime.ready_queue.borrow().len(),
-        1,
-        "only the one isolate with a pending message is scheduled, not all 51"
-    );
-    assert!(runtime.first_unscheduled_nonempty_isolate().is_none());
-
-    runtime.step();
-    assert!(
-        runtime.ready_queue.borrow().is_empty(),
-        "the hot isolate drained, so the ready queue empties"
-    );
-}
-
-/// Rock 4: the debug/test fallback detects a non-empty mailbox whose ready bit
-/// is clear — the failure mode of a missed mark-ready path (a stuck message).
-#[test]
-fn ready_invariant_detector_flags_an_unmarked_nonempty_mailbox() {
-    let (mut runtime, _clock) = new_manual_runtime();
-    let isolate = runtime.register(
-        Sleeper {
-            delay: Duration::from_millis(10),
-        },
-        TestMailbox::new(4),
-    );
-    runtime.try_send(isolate, TimerMsg::StartSleep).unwrap();
-    // Healthy: the enqueue marked it ready.
-    assert!(runtime.first_unscheduled_nonempty_isolate().is_none());
-
-    // Simulate a bug: a message in the mailbox with the ready bit cleared.
-    let index = *runtime.entry_indexes.get(&isolate.isolate()).unwrap();
-    runtime.entries[index].ready.set(false);
-    assert_eq!(
-        runtime.first_unscheduled_nonempty_isolate(),
-        Some(isolate.isolate()),
-        "the detector must catch a non-empty mailbox that is not scheduled"
-    );
-}
-
 /// Rock 3: the default (large) budget delivers every ready completion in a
 /// single advance — bounding does not force unnecessary extra steps.
 #[test]
