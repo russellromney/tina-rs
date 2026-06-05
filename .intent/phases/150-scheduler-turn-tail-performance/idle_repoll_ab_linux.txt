@@ -1,0 +1,10 @@
+2862ee4a7161e8 has been started
+=== A/B sweep (idle_repoll us) ===
+----- idle_repoll_us=1000000 -----
+hotpath_http1_close_request_tail p50_ns=1156791 host_submit__to__mbox_accepted_ns=1104981 hotpath_http1_keepalive_steady_state_tail p50_ns=1167461 host_submit__to__call_completed_ns=1108241 
+----- idle_repoll_us=200 -----
+hotpath_http1_close_request_tail p50_ns=327900 host_submit__to__mbox_accepted_ns=272941 hotpath_http1_keepalive_steady_state_tail p50_ns=340301 host_submit__to__call_completed_ns=306730 
+----- idle_repoll_us=100 -----
+hotpath_http1_close_request_tail p50_ns=234471 host_submit__to__mbox_accepted_ns=167480 hotpath_http1_keepalive_steady_state_tail p50_ns=294180 host_submit__to__call_completed_ns=171861 
+----- idle_repoll_us=50 -----
+hotpath_http1_close_request_tail p50_ns=299581 host_submit__to__mbox_accepted_ns=141780 hotpath_http1_keepalive_steady_state_tail p50_ns=249071 host_submit__to__call_completed_ns=108440 

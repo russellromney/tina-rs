@@ -397,3 +397,39 @@ Decision:
   (p50 and p90 improved on the host/service row; HTTP tails tight and
   unchanged). The deterministic Rock 5 alloc win is confirmed; the call p50/p90
   improvement is real with an honest cross-machine variance caveat.
+
+## Finding — HTTP latency is the worker I/O re-poll gap (idle_repoll A/B)
+
+The HTTP rows' ~1.17ms p50 is almost entirely one stage: `host_submit ->
+mbox_accepted` (close) / `host_submit -> call_completed` (keepalive) ~1.09ms.
+That is the worker discovering an incoming connection by RE-POLLING the
+betelgeuse io_loop at the park interval, not real work. `call_blocking`'s same
+stage is ~12us because a host command wakes the worker immediately; socket
+readiness does not send a command, so the worker only notices it on its next
+poll.
+
+Controlled A/B (one Fly performance-2x machine, same binary, `idle_repoll`
+swept via TINA_PERF_IDLE_REPOLL_US; zero cross-machine variance), saved to
+idle_repoll_ab_linux.txt:
+
+  idle_repoll  http_close p50   host_submit gap   keepalive p50
+  1ms (deflt)  1.157 ms         1.105 ms          1.167 ms
+  200us        0.328 ms         0.273 ms          0.340 ms
+  100us        0.234 ms         0.167 ms          0.294 ms
+  50us         0.300 ms         0.142 ms          0.249 ms
+
+The `host_submit` gap tracks `idle_repoll` almost exactly (1ms->1.1ms,
+100us->167us), proving the gap IS the re-poll latency. Lowering idle_repoll to
+100us cuts HTTP p50 ~5x (1.16ms -> 0.23ms), landing next to the ~150us of
+actual request work. 50us does not beat 100us — the floor is ~2x repoll
+(accept + read/write each wait one poll) plus work, so ~100us is the knee.
+
+Two levers:
+- LEVER 1 (shipped knob, Rock 2): lower `idle_repoll_interval`. ~5x HTTP win at
+  100us, at the cost of more wakeups WHILE I/O is pending (not while idle).
+  Making it the default needs the Rock 8 soak to confirm the CPU cost.
+- LEVER 2 (the next bottleneck): wire the betelgeuse io_loop's readiness fd into
+  the worker's park, so the worker blocks on (command OR socket readiness) and
+  wakes the instant a connection arrives — same ~100-200us HTTP latency with
+  ZERO extra wakeups. A runtime + betelgeuse change, larger than any rock here;
+  named as the phase's next bottleneck (Rock 9).
