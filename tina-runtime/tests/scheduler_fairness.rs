@@ -27,23 +27,53 @@ impl Shard for TestShard {
 #[derive(Debug)]
 enum SpinMsg {
     Start,
+    CheckStarted,
     Tick,
 }
 
 struct Spinner {
-    ticks: Arc<AtomicU64>,
+    index: usize,
+    ticks: Arc<Vec<AtomicU64>>,
+    started: Arc<AtomicU64>,
+    max_spread: Arc<AtomicU64>,
 }
 
 #[tina_runtime::isolate(message = SpinMsg, send = Outbound<SpinMsg>, shard = TestShard)]
 impl Spinner {
     fn handle(&mut self, msg: SpinMsg, ctx: &mut Context<'_, TestShard, ()>) -> Effect<Self> {
         match msg {
-            SpinMsg::Start | SpinMsg::Tick => {
-                self.ticks.fetch_add(1, Ordering::Relaxed);
+            SpinMsg::Start => {
+                self.started.fetch_add(1, Ordering::Relaxed);
+                ctx.send_self(SpinMsg::CheckStarted)
+            }
+            SpinMsg::CheckStarted => {
+                if self.started.load(Ordering::Relaxed) < self.ticks.len() as u64 {
+                    ctx.send_self(SpinMsg::CheckStarted)
+                } else {
+                    ctx.send_self(SpinMsg::Tick)
+                }
+            }
+            SpinMsg::Tick => {
+                self.ticks[self.index].fetch_add(1, Ordering::Relaxed);
+                record_spread(&self.ticks, &self.max_spread);
                 ctx.send_self(SpinMsg::Tick)
             }
         }
     }
+}
+
+fn record_spread(ticks: &[AtomicU64], max_spread: &AtomicU64) {
+    let mut min = u64::MAX;
+    let mut max = 0;
+    for tick in ticks {
+        let value = tick.load(Ordering::Relaxed);
+        min = min.min(value);
+        max = max.max(value);
+    }
+    let spread = max.saturating_sub(min);
+    let _ = max_spread.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        (spread > current).then_some(spread)
+    });
 }
 
 #[derive(Debug)]
@@ -80,12 +110,17 @@ fn equal_isolates_advance_in_lockstep_under_load() {
             DefaultThreadedMailboxFactory,
             ThreadedRuntimeConfig::default(),
         );
-    let counters: Vec<Arc<AtomicU64>> = (0..3).map(|_| Arc::new(AtomicU64::new(0))).collect();
-    for ticks in &counters {
+    let counters = Arc::new((0..3).map(|_| AtomicU64::new(0)).collect::<Vec<_>>());
+    let started = Arc::new(AtomicU64::new(0));
+    let max_spread = Arc::new(AtomicU64::new(0));
+    for index in 0..counters.len() {
         let spinner = runtime
             .register_with_capacity::<_, SpinMsg>(
                 Spinner {
-                    ticks: ticks.clone(),
+                    index,
+                    ticks: Arc::clone(&counters),
+                    started: Arc::clone(&started),
+                    max_spread: Arc::clone(&max_spread),
                 },
                 CAP,
             )
@@ -95,8 +130,20 @@ fn equal_isolates_advance_in_lockstep_under_load() {
             .expect("start spinner");
     }
 
-    std::thread::sleep(Duration::from_millis(100));
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let samples: Vec<u64> = counters.iter().map(|c| c.load(Ordering::Relaxed)).collect();
+        if samples.iter().all(|count| *count > 1_000) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "spinners should all make progress: {samples:?}"
+        );
+        std::thread::yield_now();
+    }
     let samples: Vec<u64> = counters.iter().map(|c| c.load(Ordering::Relaxed)).collect();
+    let observed_max_spread = max_spread.load(Ordering::Relaxed);
     runtime.shutdown().expect("shutdown");
 
     let min = *samples.iter().min().unwrap();
@@ -106,8 +153,8 @@ fn equal_isolates_advance_in_lockstep_under_load() {
         "spinners should have made real progress: {samples:?}"
     );
     assert!(
-        max - min <= 5,
-        "round-robin fairness: spinners must stay in lockstep, got {samples:?} (spread {})",
+        observed_max_spread <= 8,
+        "round-robin fairness: spinners must stay bounded at handler boundaries, got final {samples:?} (final spread {}, max observed spread {observed_max_spread})",
         max - min
     );
 }
@@ -121,11 +168,14 @@ fn cold_isolate_served_under_hot_flood() {
             DefaultThreadedMailboxFactory,
             ThreadedRuntimeConfig::default(),
         );
-    let hot_ticks = Arc::new(AtomicU64::new(0));
+    let hot_ticks = Arc::new(vec![AtomicU64::new(0)]);
     let hot = runtime
         .register_with_capacity::<_, SpinMsg>(
             Spinner {
-                ticks: hot_ticks.clone(),
+                index: 0,
+                ticks: Arc::clone(&hot_ticks),
+                started: Arc::new(AtomicU64::new(0)),
+                max_spread: Arc::new(AtomicU64::new(0)),
             },
             CAP,
         )
@@ -138,7 +188,7 @@ fn cold_isolate_served_under_hot_flood() {
         .expect("start hot");
 
     let deadline = Instant::now() + Duration::from_secs(2);
-    while hot_ticks.load(Ordering::Relaxed) < 1_000 {
+    while hot_ticks[0].load(Ordering::Relaxed) < 1_000 {
         assert!(Instant::now() < deadline, "hot isolate never got going");
         std::thread::yield_now();
     }
