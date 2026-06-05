@@ -357,3 +357,43 @@ Decision:
   and forcing the only remaining win (physical timer cancellation) would mean a
   runtime timer rewrite on security-relevant paths. The 40-binary matrix is the
   proof the scheduler rocks did not regress HTTP.
+
+## Implementation Review — Rock 7 (Linux/x86 evidence)
+
+Captured twice on Fly performance-2x (dedicated CPU), region iad, profile
+release, from commit 0612168 (Rocks 2-6). Baseline rows are commit 8d23be7
+(Rock 1, separate performance-2x host). Saved to perf_sample_linux.txt. This is
+local/alpha evidence on cloud machines, NOT a production performance claim.
+
+What the Linux rows show:
+
+- HOST/SERVICE ROW IMPROVED, p50 AND p90. `hotpath_call_blocking_tail`:
+  p50 25.7us -> 13.5-15.1us (two runs), p90 35.4us -> 25.5-36.0us,
+  scheduler_gap_count stays 0. The deterministic part is host allocations
+  2 -> 1 / process 6 -> 5 (Rock 5's typed HostCall command). The p50/p90 drop
+  is real and stable across two runs but is a cross-machine comparison (a
+  different physical performance-2x host than the baseline), so the magnitude
+  carries host variance; the direction and the alloc win are solid.
+- TRACED vs UNTRACED OVERHEAD stays tiny: call_blocking_tail untraced
+  13.5-15.1us vs traced 14.6us — the observer adds well under a microsecond,
+  so the runtime cost, not the observer, is what the row measures.
+- HTTP ROWS UNCHANGED, TAILS STAY TIGHT. http1_close_tail p50 ~1.16-1.18ms,
+  keepalive_steady_tail ~1.17ms, both with p90/p50 ~1.03-1.16x and
+  scheduler_gap_count 0-1. Same as baseline — expected, because the HTTP p50 is
+  one stage (host_submit -> mbox_accepted ~1.09ms = TCP connect/accept), not a
+  scheduler gap, and Rock 6 found no safe HTTP turn to cut.
+- SAME BOTTLENECK SHAPE AS MAC, MUCH QUIETER. Linux x86 has the same structure
+  (call dominated by the host->worker handoff + dispatcher round-trip; HTTP
+  dominated by TCP connect) but far tighter tails than the noisy laptop.
+
+Blocker note: the re-measure required a `fly deploy --build-only --push`
+approval (auto-mode blocks shipping the private repo to a registry and blocks
+self-granting the rule); the user approved it interactively. The exact command
+and harness live in examples/systems/perf_native/fly/README.md.
+
+Decision:
+
+- Linux/x86 evidence exists, captured twice, with distribution-shape discussion
+  (p50 and p90 improved on the host/service row; HTTP tails tight and
+  unchanged). The deterministic Rock 5 alloc win is confirmed; the call p50/p90
+  improvement is real with an honest cross-machine variance caveat.
