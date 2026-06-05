@@ -300,3 +300,60 @@ Decision:
   2 -> 1 host / 6 -> 5 process by removing the redundant command-closure box
   with a typed command, preserving every bound and outcome. The last host
   allocation (the type-erased begin box) is irreducible for a shared dispatcher.
+
+## Implementation Review — Rock 6 (HTTP protocol turn cleanup, investigation + verification)
+
+Goal: remove remaining HTTP/1 turns only where no user-policy boundary is
+crossed and no invariant (wire bytes, body pressure, partial-write/failure
+truth, slowloris/idle timeout) weakens. I mapped the connection state machine
+(tina-http/src/connection.rs) end to end before touching anything.
+
+Findings:
+
+- [verified] THE TURN CLEANUP WAS LARGELY DELIVERED BY PHASE 149. The terminal
+  close-after-write path (`write_pending_close` -> `RuntimeCallCompletion::
+  StopRequester` when `count >= bytes.len() && closed`, connection.rs ~1254)
+  already collapses the write+close into one terminal action. Partial writes
+  and write/close failures already stay on the ordinary message path
+  (`handle_wrote`/`handle_wrote_close` -> `begin_close`), and body pressure is
+  released before any terminal bypass (`release_response`, and
+  `release_request_all`/`release_response_all` in `begin_close`). The current
+  `RuntimeCallCompletion` is sufficient; no new narrow protocol-local action is
+  safely addable.
+- [verified] THE "STALE TAIL" IS NOT REAL LATENCY. In the `hotpath_http1_close`
+  trace, the trailing `call_completion_rejected` is the pending header-deadline
+  `sleep` being rejected when the isolate stops; it fires ~1.5us after
+  `isolate_stopped`, while the ~110us `->host_unblocked` gap is the test client
+  reading the response over loopback. The stale fact is visible and does not
+  dominate the host-observed window — exactly the plan's requirement. Nothing
+  to cut.
+- [investigated, runtime-scoped] STALE-DEADLINE ACCUMULATION IS A RUNTIME
+  LIMITATION, NOT A PROTOCOL ISSUE. Each request iteration arms `sleep(deadline)`
+  for the slowloris/idle guard and never physically cancels the previous one;
+  the connection tombstones stale fires via `request_generation` +
+  `head_deadline_armed`. Under sustained keepalive the physical timers
+  accumulate (age out at idle_timeout) and each fires one ignored (noop) turn.
+  But `tina-runtime`'s own `scope_timer` documents that plain `sleep` is NOT
+  `CallHandle`-cancelable — even `ScopedTimer` only tombstones the ticket, it
+  does not stop the physical timer. The HTTP connection already uses that exact
+  best-available pattern. Physically bounding the timers would require a
+  runtime-level cancelable-timer feature, which is outside Rock 6's
+  protocol-local scope and touches security-relevant slowloris/idle logic.
+  Recorded as a precise future item (runtime cancelable timers), not forced
+  here.
+- [verified] INVARIANTS HOLD UNDER THE NEW SCHEDULER. The full tina-http suite
+  — 40 test binaries (server_smoke, server_keepalive, body_lifecycle,
+  streaming_response/request, chunked, websocket_manager, pressure_503,
+  server_bad_input, dst_simulator fingerprint, ...) — passes under Rocks 2-5,
+  proving wire bytes, body high-water/current-to-zero, keepalive, partial/
+  failure, idle-timeout, and slowloris behaviour are preserved. The DST HTTP
+  fingerprint is unchanged.
+
+Decision:
+
+- Rock 6 is "already at its safe protocol-local limit + verified preserved".
+  The honest engineering outcome is no code change: phase 149 cut the close
+  turn, the connection already uses the runtime's best stale-deadline pattern,
+  and forcing the only remaining win (physical timer cancellation) would mean a
+  runtime timer rewrite on security-relevant paths. The 40-binary matrix is the
+  proof the scheduler rocks did not regress HTTP.
