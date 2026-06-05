@@ -99,9 +99,10 @@ pub struct ThreadedRuntimeConfig {
     /// How long the worker may park when runtime-owned work *is* pending but
     /// the worker cannot be signalled about it (a runtime timer deadline, or
     /// lane I/O the worker only learns about by re-polling the driver). Bounds
-    /// the latency of that work. Must be `<= idle_wait`; defaults to `idle_wait`
-    /// so out-of-the-box behaviour is unchanged and operators opt in to a
-    /// tighter re-poll (lower timer/I/O latency, more idle wakeups).
+    /// the latency of that work. Values above `idle_wait` are clamped to
+    /// `idle_wait` at the park site; the default equals `idle_wait` so
+    /// out-of-the-box behaviour is unchanged and operators opt in to a tighter
+    /// re-poll (lower timer/I/O latency, more idle wakeups).
     pub idle_repoll_interval: Duration,
 
     /// Max consecutive runtime steps the worker drains in one hot burst before
