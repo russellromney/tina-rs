@@ -108,7 +108,7 @@ Do NOT build the reactor change on a drifted fork. First:
 - prove the whole tina-rs workspace builds + the betelgeuse-touching tests
   (`betelgeuse_substrate`, DST, the lane tests) pass on the reconciled base.
 
-Only then build Rocks 1-2 on the clean base.
+Only then build Rocks 1-3 on the clean base.
 
 ## Rock 1: Betelgeuse blocking wait + waker (additive)
 
@@ -151,8 +151,8 @@ Rules:
   `pending_isolate_call_deadlines.first()` and a new
   `driver.next_timer_deadline()`; None -> block indefinitely (true zero-wakeup
   idle);
-- keep the Phase 150 bounds (hot-drain rounds/elapsed, ready scheduler,
-  completion-drain budget) exactly as-is; only the park changes.
+- keep the Phase 150 bounds (hot-drain rounds/elapsed, completion-drain budget)
+  exactly as-is; only the park changes.
 
 Rules / correctness (the doorbell race):
 - `tx.send()` happens-before `waker.wake()`, and the worker always drains the
@@ -161,6 +161,49 @@ Rules / correctness (the doorbell race):
   pre-block wake is observed);
 - no host thread touches isolate state; the doorbell only wakes the worker;
 - shutdown is a command -> doorbell -> wake -> drain -> shutdown.
+
+## Rock 3: Ready-isolate scheduler, done correctly (was Phase 150 Rock 4)
+
+Phase 150 prototyped a ready-isolate scheduler (replace the per-step
+`recv_boxed`-every-entry scan with an O(ready) snapshot) and REVERTED it: it
+marked readiness only in `enqueue_entry_message`, but the explicit `Runtime`'s
+direct `mailbox.try_send` seam bypasses that, so directly-seeded messages were
+never scheduled (caught by `tina-runtime/tests/address_liveness.rs`). The scan
+is correct precisely because `recv` reflects the real mailbox state regardless
+of how a message arrived; a separate enqueue-side mark cannot.
+
+The correct version needs the MAILBOX to be the readiness authority, which is a
+core `tina::Mailbox<T>` trait change — and this phase is already in the mailbox
+neighbourhood (the doorbell, the park), so it belongs here, not bolted onto a
+near-done PR.
+
+Plan:
+- extend `Mailbox<T>` (and `ErasedMailbox`) with a cheap readiness primitive —
+  either `is_empty()` (so the scan skips empty entries without `recv`) or a
+  push-time ready signal the runtime can collect. `is_empty()` is the smaller,
+  lower-risk change and is correct for EVERY ingress path (it reflects direct
+  pushes); prefer it unless the benchmark shows the per-entry iteration itself
+  (not the `recv`) is the cost;
+- thread the new method through every mailbox impl (default factory mailboxes,
+  the threaded mailboxes, test mailboxes, any user-facing impls);
+- rebuild the O(ready)-or-skip-empty snapshot on that primitive; restore the
+  no-starvation / round-robin proofs and ADD a direct-`mailbox.try_send` test
+  so the seam that broke Rock 4 is covered;
+- prove DST byte-identical (behaviour-preserving) AND run the full
+  `cargo test --workspace`, not a subset — the Phase 150 miss was trusting a
+  hand-picked test set;
+- BENCHMARK before claiming a win: a many-quiet-isolates workload (e.g. 1 hot +
+  N idle isolates, sweep N) showing the scan cost the optimization removes.
+  Phase 150 reverted partly because this win was never measured; do not reland
+  it without that row.
+
+Rules:
+- correct for all ingress (mediated + direct mailbox push), proven by test;
+- no public `Mailbox<T>` behaviour change beyond the additive method (provide a
+  default impl where a sound one exists, so external impls do not silently
+  break);
+- only reland if the benchmark justifies it; otherwise keep the scan and record
+  that the scan was fast enough.
 
 ## Proof
 
