@@ -4,6 +4,41 @@ This file records completed work.
 
 ## Unreleased
 
+### Protocol Perf Rows And Byte-Path Cost
+
+- `examples/systems/perf_native` gains Tina-only native protocol rows
+  (`comparison_baseline=none`): HTTP/2 h2c (`http2_h2c_close_request`,
+  `http2_h2c_keepalive_sequential`, `http2_h2c_steady_state_small`) and
+  WebSocket (`websocket_open_close`, `websocket_text_round_trip`,
+  `websocket_steady_state_small`). Each drives the real Tina server isolate over
+  a raw socket client, the same shape the HTTP/1 rows use. Rows carry a
+  setup-vs-reuse `kind` so connection setup cost is never silently folded into
+  steady-state service cost, and the perf test pins the label list and the
+  setup/reuse classes so a row cannot quietly disappear.
+- The buffered HTTP/2 response path now builds each DATA frame straight into the
+  outbound queue (a new `push_frame_header` writes the 9-byte header, then the
+  body slice is appended) instead of cloning each chunk into a `Frame` and
+  re-encoding it. A buffered response body chunk is copied once instead of
+  twice; measured at exactly one fewer allocation per response (3139 -> 3075
+  allocations over 64 warmed h2c responses on macOS/aarch64). The wire output is
+  unchanged and the per-frame bounded-queue admission is preserved, so no
+  replay-visible fact moves.
+- New proof: `http2_buffered_response_allocation_ceiling` pins the post-rewrite
+  allocation count, and
+  `http2_multi_frame_response_marks_end_stream_only_on_last_data_frame` asserts
+  multi-frame body integrity, a single terminal `END_STREAM`, and that HEADERS
+  does not claim `END_STREAM` while a body follows.
+- `websocket_capacity_fill_probe` is a deterministic capacity-fill pressure row:
+  an over-cap echo raises a typed `SessionPressure` on the connection and closes
+  the session without writing the frame. It proves typed pressure via the public
+  send/report path without sleeping on a slow client.
+- `scripts/perf_record.sh` records the new `native` row family and defaults its
+  history to `.intent/phases/152-protocol-perf-byte-path/perf_history.jsonl`.
+- Not a production performance claim: rows are local/alpha, the tails are wide
+  under one single-shard worker, and the buffered-response body clone, inbound
+  `data_payload` clone, streaming/chunked framing, and gRPC request body copies
+  are named as remaining cost rather than hidden.
+
 ### Readiness-Driven Worker Park
 
 - The live single-shard worker no longer polls the I/O loop on a timer. It

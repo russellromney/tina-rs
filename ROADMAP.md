@@ -410,10 +410,16 @@ and reviews live under `.intent/phases/`.
   — the single-shard worker blocks on the kernel I/O loop plus a wakeup
   doorbell, so a ready socket wakes it at kernel latency and a fully idle worker
   makes zero wakeups; the HTTP host-submit sleep is gone and what remains is the
-  real connection round-trips it had hidden. Remaining edges are still real:
-  HTTP/2/WebSocket equivalent workload rows, zero-copy on the byte path, the
-  connect/accept round-trips, and no production-performance claim until evidence
-  earns it.
+  real connection round-trips it had hidden. The next pass then added Tina-only
+  HTTP/2 h2c and WebSocket workload rows alongside the HTTP/1 ones, split
+  connection-setup rows from steady-state-reuse rows so setup cost is no longer
+  mixed into service cost, and removed one protocol-internal copy: the buffered
+  HTTP/2 response now frames each DATA chunk straight into the outbound queue
+  (one body copy instead of two, one fewer allocation per response, wire output
+  unchanged). Remaining edges are still real and named, not hidden: the buffered
+  response body clone, the inbound DATA payload clone, streaming/chunked and
+  gRPC request framing, wide tails under one single-shard worker, and no
+  production-performance claim until evidence earns it.
 
 These are recorded in `CHANGELOG.md`; the remaining near-term roadmap now
 starts with the next performance pass and native AWS. Public release cleanup
@@ -426,7 +432,6 @@ framework before public release-story work.
 
 | Phase | Purpose |
 |---|---|
-| **152 Protocol perf rows and byte-path cost** | The readiness-driven worker park shipped: the single-shard worker blocks on the kernel I/O loop plus a wakeup doorbell instead of re-polling on a timer, so the HTTP host path no longer sleeps between events and a fully idle worker makes zero wakeups. Phase 152 owns the next visible costs: HTTP/2/WebSocket equivalent workload rows, fewer-copy byte paths beyond migrated HTTP/1, and connection-setup round-trip rows now that idle sleep no longer dominates. Plan: `.intent/phases/152-protocol-perf-byte-path/plan.md`. |
 | **135 Native AWS first form** | Add a native Tina AWS battery for the smallest honest production shape: static SigV4 with explicit signing time, native S3 put/get/head/delete, native SQS send/receive/delete, native HTTP keepalive under Phase 131 endpoint/connect policy, bounded bodies/in-flight work, typed pressure/lifecycle reports, hermetic fake-AWS tests, and clear native-vs-SDK-bridge docs. Plan: `.intent/phases/135-native-aws-first-form/plan.md`. |
 | **Alpaca rename** | Before public launch, rename the project/crates/docs away from Tina to Alpaca so the lineage is respectful and clear: independently maintained Rust framework, inspired by Peter Mbanugo's Tina/Odin and Seastar, not an official Tina port. |
 | **Barend Biesheuvel visible flow ergonomics** | Optional high-level ergonomics only after the local runtime core feels boring: a `flow!`-style authoring surface that preserves named suspension points, visible failure policy, trace step names, and ordinary Tina message/effect expansion. No fake async, no hidden retries, no hidden queues. |

@@ -321,3 +321,109 @@ stretch is not met for HTTP and should not be — HTTP is multi-round-trip; that
 floor applies to one in-process hop, which `call_blocking` roughly hits at
 ~12-20 µs. The `TINA_PERF_IDLE_REPOLL_US` knob is now vestigial for the
 single-shard park. Local/alpha, single machine, not a production claim.
+
+## Phase 152 protocol rows and byte-path cost
+
+The worker is awake now (Phase 151). This pass measures HTTP/2 and WebSocket the
+way HTTP/1 is measured, separates connection setup from steady-state service
+cost, and removes one real protocol-internal copy.
+
+### Native protocol rows (`run_native_rows`)
+
+These are Tina-only rows (`comparison_baseline=none`). A fair hyper/tonic or
+tungstenite baseline would dwarf the row and make "equivalent workload" a lie,
+so the first form stays Tina-only and says so. Each row drives the *real* Tina
+server isolate (`Http2Listener`, or `HttpListener` + a WebSocket gateway) over a
+raw socket client — the same shape the HTTP/1 rows use, which keeps the measured
+cost on the server and out of the allocation counters.
+
+`kind` names the setup-vs-reuse class so connection setup is never silently mixed
+with steady-state service cost:
+
+| row | kind | what it includes |
+| --- | --- | --- |
+| `http2_h2c_close_request` | `connection_setup` | fresh h2c connection + preface/SETTINGS handshake + one request per op |
+| `http2_h2c_keepalive_sequential` | `connection_setup_amortized` | one fresh connection, four sequential requests per op |
+| `http2_h2c_steady_state_small` | `steady_state_reuse` | warmed reused connection, one request per op |
+| `websocket_open_close` | `connection_setup` | TCP connect + HTTP/1.1 upgrade + close handshake per op |
+| `websocket_text_round_trip` | `connection_setup` | connect + upgrade + one text echo + close per op |
+| `websocket_steady_state_small` | `steady_state_reuse` | warmed open session, one text echo per op |
+
+Local macOS/aarch64 sample (4 load workers, 32 ops, single run; HTTP/2 and
+WebSocket rows are noisy run-to-run, the steady-state rows least so):
+
+| row | p50 | p90 | p99 |
+| --- | --- | --- | --- |
+| `http2_h2c_close_request` | 6.66 ms | 12.9 ms | 13.7 ms |
+| `http2_h2c_keepalive_sequential` | 22.3 ms | 53.1 ms | 58.7 ms |
+| `http2_h2c_steady_state_small` | 1.36 ms | 16.2 ms | 17.5 ms |
+| `websocket_open_close` | 6.81 ms | 17.6 ms | 19.1 ms |
+| `websocket_text_round_trip` | 5.72 ms | 23.1 ms | 23.4 ms |
+| `websocket_steady_state_small` | 0.70 ms | 13.4 ms | 23.7 ms |
+
+Read these as setup-heavy vs reused, not as a speed claim: the `*_close` /
+`*_open_close` / `*_round_trip` rows pay connect/accept/handshake every op; the
+`*_steady_state_*` rows reuse a warmed connection and are the closest to
+per-request service cost. The tails are wide because four raw clients share one
+single-shard server worker. This is local/alpha evidence, not a production
+performance claim.
+
+### Deterministic WebSocket pressure row
+
+`websocket_capacity_fill_probe` replaces the timing-sensitive slow-peer row with
+a deterministic capacity-fill that uses the public send path and proves *typed*
+pressure without sleeping on a slow client. Each op opens a session and sends
+one `overfill` text; the echo reply is larger than the session's bounded
+`max_queued_outbound_bytes`, so the connection raises a typed `SessionPressure`
+to the app and closes without writing the over-cap frame. The row asserts two
+independent facts: the client sees the no-echo/closed signal (counted as `full`
+pressure), and the app's `SessionPressure` counter reaches one per op — the
+server-side typed pressure surface, proving the pressure was real and not a
+silently dropped frame.
+
+### Byte-path reduction: buffered HTTP/2 response framing
+
+The buffered HTTP/2 response path used to copy each body chunk twice: once into a
+`Frame`'s `payload` `Vec` (`chunk.to_vec()`), then again inside `Frame::encode`
+when it spliced the 9-byte header in front. The server now builds each DATA frame
+straight into the queued buffer — header bytes via a new `push_frame_header`
+helper, then `extend_from_slice(chunk)` — so a body chunk is copied once. The
+per-frame `ensure_outbound_slots(1)` admission is kept, so the bounded
+outbound-queue cap and the `connection_full` accounting are byte-for-byte
+identical; the wire output is unchanged, so no replay-visible fact moves.
+
+Measured by `http2_buffered_response_allocation_ceiling` (64 warmed h2c
+responses on one reused connection, whole-process allocations, deterministic
+across runs on macOS/aarch64):
+
+| | allocations / 64 responses | per response |
+| --- | --- | --- |
+| before | 3139 | 49.05 |
+| after | 3075 | 48.05 |
+
+Exactly one fewer allocation per buffered response. The ceiling test pins the
+post-rewrite value with headroom and fails if the copy is re-added.
+`http2_multi_frame_response_marks_end_stream_only_on_last_data_frame` is the
+adversarial guard for the exact edges the rewrite touches: a patterned body must
+reassemble byte-for-byte across several DATA frames, exactly one DATA frame (the
+last) carries `END_STREAM`, and the HEADERS frame does not claim `END_STREAM`
+while a body follows.
+
+### What still copies (named, not hidden)
+
+- The buffered response body is still `clone()`d once into `PendingResponse`
+  (`enqueue_response` borrows the response); moving it out is a wider
+  signature change left for a follow-up.
+- `data_payload` still clones each inbound DATA payload on the unpadded path.
+- The HTTP/2 streaming/chunked response path and the gRPC client request body
+  still go through `data_frame` + `encode`.
+- WebSocket control-frame payloads (ping/pong/close) are still cloned; that is
+  the control path, not the data hot path.
+
+### Rows that are platform-specific
+
+All Phase 152 numbers above are macOS/aarch64 local/alpha. The
+`http2_buffered_response_allocation_ceiling` ceiling is calibrated on
+macOS/aarch64 and is a regression guard, not a cross-platform constant. Linux/x86
+evidence for this phase is collected separately via the Fly/Ubuntu workflow and
+saved beside the phase plan.

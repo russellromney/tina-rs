@@ -63,3 +63,105 @@ Decision:
   but it no longer sends the implementer on an open-ended audit. The phase must
   produce rows, reduce or honestly localize byte cost, and prove protocol
   semantics did not regress.
+
+## Implementation Review 1
+
+### What changed
+
+- `examples/systems/perf_native` gains six Tina-only native protocol rows
+  (`run_native_rows`): `http2_h2c_close_request`,
+  `http2_h2c_keepalive_sequential`, `http2_h2c_steady_state_small`,
+  `websocket_open_close`, `websocket_text_round_trip`,
+  `websocket_steady_state_small`. Each drives the real server isolate
+  (`Http2Listener` / `HttpListener` + WebSocket gateway) over a raw socket
+  client, exactly as the HTTP/1 rows drive the real server over a raw
+  `TcpStream`. Rows carry a setup-vs-reuse `kind`.
+- `websocket_capacity_fill_probe`: deterministic typed-pressure row.
+- Byte-path reduction in `tina-http/src/http2/server.rs` +
+  `tina-http/src/http2/frame.rs`: the buffered HTTP/2 response builds each DATA
+  frame straight into the outbound queue via a new `push_frame_header`, removing
+  one body-sized allocation per DATA frame. `Frame::encode` is refactored onto
+  the same helper (no behaviour change).
+- Proof: `http2_multi_frame_response_marks_end_stream_only_on_last_data_frame`
+  (tina-http) and the `perf-h2-alloc` ceiling inside the hotpath test.
+- `scripts/perf_record.sh` learns the `native` row family; the phase
+  `perf_history.jsonl` is recorded.
+
+### What did not change
+
+- HTTP/1 rows and semantics. HTTP/2 flow-control / reset / GOAWAY / trailers /
+  stream-close. gRPC status. WebSocket close/ping/pressure. TLS half-duplex.
+  `Runtime::step()` nonblocking and the Phase 151 worker park. The HTTP/2 wire
+  output is byte-identical (only the allocation that builds it changed), so no
+  replay-visible fact moves; the 40-test `http2_live` suite and `proof-fast`
+  protocol-regression corpus are the guard.
+
+### Directly proved
+
+- `cargo test --release --test perf` and `--test hotpath` green; all six native
+  rows do 32/32 ok ops, zero err, zero timeout, leak-clean, with p50/p90/p99 and
+  allocation evidence; labels and setup/reuse classes asserted.
+- Byte-path win is exact and deterministic: 3139 -> 3075 process allocations
+  over 64 warmed h2c responses (one fewer per response), pinned by a ceiling.
+- `http2_live` 40/40 including the new multi-frame END_STREAM guard.
+
+### Hostile findings and resolutions
+
+- [FIXED, was P1] The allocation-ceiling test first lived in `perf.rs` and
+  failed in the full `make perf` run: whole-process allocation counting is
+  contaminated when cargo runs the other `perf.rs` tests on parallel threads. It
+  passed alone (3075) but inflated in parallel. Moved into the single-test
+  `hotpath.rs` binary, which runs sequentially in its own process, so the
+  process counter is clean — the same reason the existing host/process
+  allocation probes live there. Re-verified green inside `make perf`.
+- [P2 -> accepted] The HTTP/2 perf row's success check verifies reassembled
+  body length and absence of RST_STREAM, not a decoded `:status`. Decoding the
+  HPACK status in the raw client would couple the row to a specific HPACK
+  encoding and is fragile; full status/semantics are covered by the `http2_live`
+  suite. The perf row asserts "the server produced the expected body bytes with
+  no reset," which is sufficient for a throughput/allocation row and is the same
+  convention the existing live `read_response_body` helper uses. Named, not
+  hidden.
+- [P2 -> resolved] The native rows are Tina-only (`comparison_baseline=none`).
+  This is the plan-blessed honest form, not a benchmark-only shortcut: the rows
+  exercise the real public server isolate over a standard external client (raw
+  framing), the same shape as the HTTP/1 rows. The raw client is not a private
+  Tina fast path.
+- [P2 -> resolved] Allocation-ceiling portability. The counted value is the
+  number of Rust-level `alloc` calls on the steady-state path (one per `Vec`),
+  determined by the code, not the OS allocator; it is deterministic across runs.
+  The ceiling is a regression guard with the before/after recorded. The Linux
+  sample (below) will confirm the absolute value; if a platform legitimately
+  differs the ceiling is updated with a recorded before/after, as the existing
+  hotpath ceilings are.
+- [P3 -> accepted] `ws_send_close` returns `Ok` on a read error during the
+  close drain. That is the post-close handshake read only (EOF == clean close);
+  connect/upgrade/send failures surface earlier and fail the op. The setup rows
+  still report 32/32 ok with zero err.
+- [P3 -> resolved] No hidden unbounded queue in the harness: steady-state rows
+  reuse a bounded per-worker `Mutex<Option<stream>>`; the load runner is
+  op-bounded; HTTP/2 stream ids increase monotonically within the op budget and
+  stay under `max_concurrent_streams` because requests are sequential.
+- [P3 -> resolved] The `native` row family in `perf_record.sh` first also
+  matched the per-side `perf ` lines of the comparison rows. Restricted to the
+  setup/reuse `kind` allowlist so only the six protocol rows are recorded.
+
+### Remaining cost (named, not hidden)
+
+- Buffered response body is still `clone()`d once into `PendingResponse`
+  (`enqueue_response` borrows it); moving it out is a wider signature change.
+- `data_payload` still clones each inbound DATA payload on the unpadded path.
+- HTTP/2 streaming/chunked response framing and the gRPC client request body
+  still go through `data_frame` + `encode`.
+- WebSocket control-frame payloads (ping/pong/close) are still cloned (control
+  path, not the data hot path).
+- Native protocol rows have wide tails: four raw clients share one single-shard
+  server worker. These are local/alpha numbers, not a production claim.
+
+### Linux proof
+
+- Linux sample missing. This session runs on macOS/aarch64 and cannot produce a
+  Linux/x86 release sample without an outward Fly deploy. The PR is therefore
+  NOT final: the orchestrator (or a follow-up) must run the Fly/Ubuntu perf
+  workflow and save the sample beside this plan, and confirm the
+  `H2_BUFFERED_RESPONSE_ALLOC_CEILING` value holds on Linux/x86, before merge.
