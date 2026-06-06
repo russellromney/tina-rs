@@ -73,3 +73,21 @@ Decision:
 
 - Stronger. The phase now demands public-row improvement, direct byte-writer
   changes, no compatibility-tax default, and honest latency reporting.
+
+## Plan Review 3
+
+Findings:
+
+- [P3] The plan was strong but too wordy. Goal, Done, proof, and evidence
+  repeated the same contract in different words. The plan is now shorter and
+  uses one clear top-level rule: HTTP/2 steady-state, one gRPC row, one
+  WebSocket row, and one stage row must improve.
+- [P3] Several sections used soft phrases like "required shape" and long
+  explanatory paragraphs. They now use simple `Rules` / `Proof` blocks.
+- [P3] The plan buried the important grug line. It now says directly: rows are
+  not performance; faster code is performance.
+
+Decision:
+
+- Simpler without weakening the gates. The implementation work is still large,
+  but the plan now reads like a build checklist instead of a memo.
