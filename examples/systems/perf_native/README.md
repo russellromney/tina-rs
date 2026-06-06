@@ -307,3 +307,21 @@ doorbell, removing the re-poll entirely) is the named next performance pass.
 Current verdict: the host/service path improved on Linux and the allocation
 floor dropped; HTTP is gated by the re-poll wakeup gap, which is diagnosed,
 quantified, and queued — not a production performance claim.
+
+## The wakeup gap, removed (readiness-driven park)
+
+The re-poll gap above is now gone: the single-shard worker blocks on the
+Betelgeuse I/O loop plus a command doorbell instead of polling on a timer, so a
+ready socket wakes it at kernel latency and a fully idle worker makes zero
+wakeups. On Linux/x86 (Fly performance-2x; rows in `perf_sample_linux.txt`) the
+`host_submit -> mbox` / `call_completed` stage dropped from ~1.1 ms of worker
+sleep to ~0.03-0.13 ms of real connection round-trips, and
+`hotpath_http1_close` / `keepalive_steady_state` p50 are ~0.15 ms.
+
+This is the removal of idle sleep the timer park spent on the hot path, not a
+speedup of real work: the ~0.15 ms that remains is the connect/accept/read
+round-trips the sleep had hidden. The single-digit-microsecond host-submit
+stretch is not met for HTTP and should not be — HTTP is multi-round-trip; that
+floor applies to one in-process hop, which `call_blocking` roughly hits at
+~12-20 µs. The `TINA_PERF_IDLE_REPOLL_US` knob is now vestigial for the
+single-shard park. Local/alpha, single machine, not a production claim.
