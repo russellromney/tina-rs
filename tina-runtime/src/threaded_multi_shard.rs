@@ -413,6 +413,7 @@ where
                 Err(ThreadedRegisterBootstrapError::UnknownShard(s))
             }
             Err(ThreadedRuntimeError::DriverShutdownFailed)
+            | Err(ThreadedRuntimeError::DriverParkFailed)
             | Err(ThreadedRuntimeError::CommandFull)
             | Err(ThreadedRuntimeError::HostWaitTimeout) => {
                 // `call_on` is blocking-admission, so `CommandFull` is

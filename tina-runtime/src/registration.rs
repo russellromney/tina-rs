@@ -24,6 +24,7 @@ use std::any::Any;
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::marker::PhantomData;
+use std::sync::Arc;
 
 use tina::{
     Address, AddressGeneration, Isolate, IsolateId, Mailbox, Outbound as TinaOutbound, Shard,
@@ -49,6 +50,18 @@ where
     S: Shard,
     F: MailboxFactory,
 {
+    fn install_mailbox_wake_hook<T: 'static>(&self, mailbox: &dyn Mailbox<T>) {
+        if let Some(waker) = self.driver.wake_handle() {
+            mailbox.set_wake_hook(Some(Arc::new(move || waker.wake())));
+        }
+    }
+
+    fn create_mailbox<T: 'static>(&self, capacity: usize) -> Box<dyn Mailbox<T>> {
+        let mailbox = self.mailbox_factory.create::<T>(capacity);
+        self.install_mailbox_wake_hook(&*mailbox);
+        mailbox
+    }
+
     /// Registers one isolate and returns its typed address.
     ///
     /// Isolate identifiers are assigned in registration order, starting at `1`.
@@ -70,6 +83,7 @@ where
         Outbound: 'static,
         M: Mailbox<I::Message> + 'static,
     {
+        self.install_mailbox_wake_hook(&mailbox);
         let address = self.register_entry::<I, Outbound>(
             isolate,
             None,
@@ -104,9 +118,7 @@ where
             isolate,
             None,
             Box::new(AnyMailboxAdapter {
-                mailbox: self
-                    .mailbox_factory
-                    .create::<Box<dyn Any>>(mailbox_capacity),
+                mailbox: self.create_mailbox::<Box<dyn Any>>(mailbox_capacity),
             }),
         );
 
@@ -278,9 +290,7 @@ where
         I::Fact: IntoRuntimeFact + 'static,
         Outbound: 'static,
     {
-        let mailbox = self
-            .mailbox_factory
-            .create::<Box<dyn Any>>(mailbox_capacity);
+        let mailbox = self.create_mailbox::<Box<dyn Any>>(mailbox_capacity);
         let adapter = AnyMailboxAdapter { mailbox };
         let boxed: Box<dyn Any> = Box::new(bootstrap);
         if let Err(err) = adapter.try_send_boxed(boxed) {
@@ -349,9 +359,7 @@ where
             generation,
         );
 
-        let mailbox = self
-            .mailbox_factory
-            .create::<Box<dyn Any>>(mailbox_capacity);
+        let mailbox = self.create_mailbox::<Box<dyn Any>>(mailbox_capacity);
 
         // Constructor panic leaves an allocated id with no entry. id
         // allocator is monotonic so leaking one is harmless.
@@ -625,9 +633,7 @@ where
             isolate,
             local_parent,
             Box::new(AnyMailboxAdapter {
-                mailbox: self
-                    .mailbox_factory
-                    .create::<Box<dyn Any>>(mailbox_capacity),
+                mailbox: self.create_mailbox::<Box<dyn Any>>(mailbox_capacity),
             }),
         );
         let child_isolate = child.isolate;
@@ -693,9 +699,7 @@ where
             isolate,
             None,
             Box::new(AnyMailboxAdapter {
-                mailbox: self
-                    .mailbox_factory
-                    .create::<Box<dyn Any>>(mailbox_capacity),
+                mailbox: self.create_mailbox::<Box<dyn Any>>(mailbox_capacity),
             }),
         );
 
@@ -720,9 +724,7 @@ where
         I::Fact: IntoRuntimeFact + 'static,
         Outbound: Send + 'static,
     {
-        let mailbox = self
-            .mailbox_factory
-            .create::<Box<dyn Any>>(mailbox_capacity);
+        let mailbox = self.create_mailbox::<Box<dyn Any>>(mailbox_capacity);
         let adapter = AnyMailboxAdapter { mailbox };
         let boxed: Box<dyn Any> = Box::new(bootstrap);
         if let Err(err) = adapter.try_send_boxed(boxed) {
@@ -813,9 +815,7 @@ where
             isolate,
             Some(parent),
             Box::new(AnyMailboxAdapter {
-                mailbox: self
-                    .mailbox_factory
-                    .create::<Box<dyn Any>>(mailbox_capacity),
+                mailbox: self.create_mailbox::<Box<dyn Any>>(mailbox_capacity),
             }),
         );
 

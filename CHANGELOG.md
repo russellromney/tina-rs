@@ -34,8 +34,10 @@ This file records completed work.
 - The `idle_repoll_interval` / `idle_wait` knobs no longer drive the
   single-shard idle park (kept as accepted config). Multi-shard keeps its
   command-queue park.
-- Mailbox-owned readiness: `Mailbox` gains a required `is_empty()`, and the
-  per-step scheduler scan skips the expensive `recv` on quiet isolates. It
+- Mailbox-owned readiness: `Mailbox` gains a required `is_empty()` and an
+  optional wake hook for threaded/external-producer mailboxes. The per-step
+  scheduler scan skips expensive `recv` calls on quiet isolates, while direct
+  mailbox producers wake an idle worker on empty -> non-empty transitions. It
   reflects real mailbox state for every ingress path (mediated and direct
   `try_send`), so no message is missed; behaviour and the DST fingerprint are
   unchanged. Skip-empty removes the recv-on-empty cost; a true ready queue was

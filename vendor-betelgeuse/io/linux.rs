@@ -934,19 +934,34 @@ impl IoUringIO {
     }
 
     /// Arms the oneshot eventfd-doorbell poll if it is not already in flight.
-    fn arm_doorbell(state: &mut IoUringState, doorbell_fd: RawFd) {
+    ///
+    /// The doorbell is load-bearing for `step_blocking(None)`: host commands
+    /// wake only if this poll is actually submitted. If the SQ is full after
+    /// user ops were queued, submit once and retry instead of silently entering
+    /// a wait with no doorbell.
+    fn arm_doorbell(state: &mut IoUringState, doorbell_fd: RawFd) -> io::Result<bool> {
         if state.doorbell_armed {
-            return;
+            return Ok(false);
         }
         let entry = opcode::PollAdd::new(types::Fd(doorbell_fd), libc::POLLIN as u32)
             .build()
             .user_data(DOORBELL_USER_DATA);
-        let mut submission = state.ring.submission();
-        let pushed = unsafe { submission.push(&entry).is_ok() };
-        drop(submission);
-        if pushed {
-            state.doorbell_armed = true;
+        let mut submitted_to_make_room = false;
+        for _ in 0..2 {
+            let mut submission = state.ring.submission();
+            let pushed = unsafe { submission.push(&entry).is_ok() };
+            drop(submission);
+            if pushed {
+                state.doorbell_armed = true;
+                return Ok(submitted_to_make_room);
+            }
+            state.ring.submit()?;
+            submitted_to_make_room = true;
         }
+        Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "io_uring submission queue could not arm doorbell",
+        ))
     }
 
     /// Harvests ready CQEs into typed completions. `drain_doorbell` drains the
@@ -1046,7 +1061,9 @@ impl IOLoop for IoUringIO {
             // Keep the doorbell poll armed so a host wake can return us from the
             // blocking wait. There is always this one possible wake source, so a
             // `None` wait can never block with nothing able to wake it.
-            Self::arm_doorbell(&mut state, self.doorbell.fd);
+            if Self::arm_doorbell(&mut state, self.doorbell.fd)? {
+                progressed = true;
+            }
             // Don't block if we have inline Size work ready to dispatch.
             if size_ops.is_empty() {
                 match timeout {

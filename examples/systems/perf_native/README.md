@@ -291,22 +291,18 @@ Linux/x86 evidence (Fly performance-2x, dedicated CPU; saved in the phase dir
 25.7 µs -> 13.5-15.1 µs across two runs, host alloc 2 -> 1; HTTP rows steady at
 ~1.17 ms. Local/alpha, single machine, not a production claim.
 
-The dominant HTTP cost is a wakeup gap, not work. The
-`hotpath_http1_close_request` p50 (~1.17 ms) is almost entirely one stage,
-`host_submit -> mbox_accepted` (~1.09 ms): the worker re-polls the I/O loop on
-a timer instead of waking on socket readiness, so an incoming connection waits
-up to the park interval. `hotpath_call_blocking`'s same stage is ~12 µs,
-because a host command wakes the worker immediately. A controlled
+Phase 150 found the dominant old HTTP cost: a wakeup gap, not request work. The
+`hotpath_http1_close_request` p50 (~1.17 ms) was almost entirely one stage,
+`host_submit -> mbox_accepted` (~1.09 ms): the worker re-polled the I/O loop on
+a timer instead of waking on socket readiness, so an incoming connection waited
+up to the park interval. `hotpath_call_blocking`'s same stage was ~12 µs
+because a host command woke the worker immediately. A controlled
 single-machine sweep (the opt-in `TINA_PERF_IDLE_REPOLL_US` env knob on the
-hotpath probe; rows in `idle_repoll_ab_linux.txt`) shows the gap tracking the
+hotpath probe; rows in `idle_repoll_ab_linux.txt`) showed the gap tracking the
 park interval almost exactly — 1 ms -> http close p50 1.16 ms, 100 µs ->
-0.23 ms (~5x). Lowering `idle_repoll_interval` is a shipped stopgap; the real
-fix (a readiness-driven worker park that blocks on the I/O loop and a command
-doorbell, removing the re-poll entirely) is the named next performance pass.
+0.23 ms (~5x).
 
-Current verdict: the host/service path improved on Linux and the allocation
-floor dropped; HTTP is gated by the re-poll wakeup gap, which is diagnosed,
-quantified, and queued — not a production performance claim.
+That diagnosis led directly to Phase 151's readiness-driven worker park below.
 
 ## The wakeup gap, removed (readiness-driven park)
 

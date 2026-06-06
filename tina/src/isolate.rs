@@ -155,6 +155,17 @@ pub trait Mailbox<T> {
     /// Attempts to enqueue a message without blocking.
     fn try_send(&self, message: T) -> Result<(), TrySendError<T>>;
 
+    /// Installs a wake hook called when this mailbox transitions from empty to
+    /// non-empty.
+    ///
+    /// Live threaded runtimes use this to wake a worker parked on I/O
+    /// readiness when a message arrives through a direct mailbox handle rather
+    /// than through the runtime command queue. Custom mailboxes that can be
+    /// written by host/external threads should store this hook and invoke it
+    /// after a successful empty -> non-empty send. Mailboxes that are only ever
+    /// driven by an explicit-step runtime may ignore it.
+    fn set_wake_hook(&self, _wake: Option<std::sync::Arc<dyn Fn() + Send + Sync + 'static>>) {}
+
     /// Attempts to dequeue the next message without blocking.
     fn recv(&self) -> Option<T>;
 
@@ -179,6 +190,10 @@ impl<T> Mailbox<T> for Box<dyn Mailbox<T>> {
 
     fn try_send(&self, message: T) -> Result<(), TrySendError<T>> {
         (**self).try_send(message)
+    }
+
+    fn set_wake_hook(&self, wake: Option<std::sync::Arc<dyn Fn() + Send + Sync + 'static>>) {
+        (**self).set_wake_hook(wake)
     }
 
     fn recv(&self) -> Option<T> {

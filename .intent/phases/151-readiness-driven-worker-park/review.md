@@ -287,3 +287,31 @@ zero-idle-wakeup / block-on-the-kernel claim now holds on Linux, not only macOS.
 Tooling note: `cargo check --target x86_64-unknown-linux-gnu -p betelgeuse`
 type-checks the Linux io_uring path locally on macOS (betelgeuse has no C-build
 deps), so Linux-only compile errors no longer need a Fly round-trip.
+
+## Orchestrator adversarial fixes
+
+Findings fixed after a second Codex hostile review:
+
+- Direct mailbox ingress wake. Runtime-mediated sends rang the command
+  doorbell, but a direct mailbox producer (custom factory / held mailbox handle)
+  could push a message after the single-shard worker parked forever. The fix is
+  mailbox-owned wake truth: `Mailbox::set_wake_hook(...)` installs an
+  empty -> non-empty wake hook; the runtime installs it on registered mailboxes;
+  the blessed threaded mailbox and SPSC mailbox call it after publishing the
+  message. Regression:
+  `readiness_park::direct_mailbox_push_wakes_idle_worker`.
+- Linux SQ-full doorbell. `IoUringIO::arm_doorbell` used to silently fail if the
+  submission queue was full after user ops were queued, which could enter
+  `submit_and_wait` without an armed eventfd poll. The fix submits to make room,
+  retries, and returns an error instead of blocking with no command wake source.
+  `cargo check --target x86_64-unknown-linux-gnu -p betelgeuse` covers the Linux
+  shape locally; Fly io_uring validation remains the real runtime proof.
+- Park errors. A backend park error no longer becomes a quiet sleep/retry loop.
+  The worker now terminates with `ThreadedRuntimeError::DriverParkFailed` and
+  publishes failed terminal truth.
+- Scope honesty. The plan now says the readiness park is single-shard in this
+  phase. Multi-shard still uses its command-queue park because cross-shard
+  inbound queues are not io_loop wake sources yet.
+- Perf README stale text. Phase 150's wakeup-gap diagnosis and Phase 151's
+  shipped readiness park are separated so future agents do not copy "queued
+  next" after the fix has landed.

@@ -144,7 +144,9 @@ impl Default for ThreadedRuntimeConfig {
             preallocation: PreallocationConfig::default(),
             trace_retention: TraceRetention::Full,
             idle_wait: Duration::from_millis(1),
-            // Default equals idle_wait: unchanged park behaviour out of the box.
+            // Single-shard workers use this only as a cap when some pending
+            // work cannot wake the Betelgeuse park directly. Multi-shard keeps
+            // the command-queue park and still uses the regular idle wait.
             idle_repoll_interval: Duration::from_millis(1),
             hot_drain_max_rounds: DEFAULT_HOT_DRAIN_MAX_ROUNDS,
             hot_drain_max_elapsed: DEFAULT_HOT_DRAIN_MAX_ELAPSED,
@@ -688,6 +690,7 @@ where
                 Err(ThreadedRegisterBootstrapError::UnknownShard(shard))
             }
             Err(ThreadedRuntimeError::DriverShutdownFailed)
+            | Err(ThreadedRuntimeError::DriverParkFailed)
             | Err(ThreadedRuntimeError::CommandFull)
             | Err(ThreadedRuntimeError::HostWaitTimeout) => {
                 // `call` is blocking-admission, so `CommandFull` is
@@ -1785,10 +1788,9 @@ where
         metrics.set_resource_counts(runtime.resource_report());
 
         // Nothing was deliverable. Park ON THE IO LOOP, not on a timer: block
-        // until a socket/storage completion arrives, a host command rings the
-        // doorbell, or the earliest runtime deadline elapses. The worker sleeps
-        // on the kernel, so a ready socket wakes it at syscall latency instead
-        // of on the next re-poll, and a fully idle worker makes zero wakeups.
+        // until a Betelgeuse completion arrives, a host command rings the
+        // doorbell, or the earliest runtime deadline elapses. Fallback lanes
+        // that cannot wake the io_loop force a capped re-poll below.
         //
         // Teardown is always a `Shutdown` command (Drop -> shutdown_blocking),
         // which rings the doorbell, so a `None` (block-forever) park is woken on
@@ -1810,9 +1812,9 @@ where
             deadline.map(|d| d.saturating_duration_since(now))
         };
         if runtime.park_io(timeout).is_err() {
-            // Unexpected park failure: avoid a hot spin, then re-poll. The next
-            // iteration drains commands and re-drives the runtime.
-            thread::sleep(config.idle_repoll_interval);
+            metrics.set_state(LiveShardState::Failed);
+            let trace = runtime.trace().to_vec();
+            return ThreadedWorkerExit::failed(ThreadedRuntimeError::DriverParkFailed, trace);
         }
         // One blocking-park wakeup. A fully idle worker blocks until a real wake
         // source fires, so this stays flat at idle (the idle-CPU proof reads it).

@@ -13,13 +13,17 @@
 //! wake *policy* with the park-wakeup counter.
 
 use std::alloc::Global;
+use std::any::Any;
+use std::collections::VecDeque;
 use std::convert::Infallible;
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
 use betelgeuse::io::simulated::SimulatedIO;
-use tina::prelude::*;
+use tina::{Mailbox, TrySendError, prelude::*};
 use tina_runtime::{
-    CallOutcome, DefaultThreadedMailboxFactory, ThreadedRuntime, ThreadedRuntimeConfig,
+    CallOutcome, DefaultThreadedMailboxFactory, MailboxFactory, ThreadedRuntime,
+    ThreadedRuntimeConfig,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -34,26 +38,160 @@ impl Shard for TestShard {
 #[derive(Debug)]
 enum EchoMsg {
     Ping,
+    Notify,
 }
 
-struct Echo;
+struct Echo {
+    notify: Option<mpsc::Sender<()>>,
+}
 
 #[tina_runtime::isolate(message = EchoMsg, reply = u32, shard = TestShard)]
 impl Echo {
     fn handle(&mut self, msg: EchoMsg, _ctx: &mut Context<'_, TestShard, u32>) -> Effect<Self> {
         match msg {
             EchoMsg::Ping => reply(1),
+            EchoMsg::Notify => {
+                if let Some(tx) = self.notify.take() {
+                    let _ = tx.send(());
+                }
+                noop()
+            }
         }
     }
 
     fn handle_call(&mut self, msg: EchoMsg, call: CallContext<'_, Self>) -> Effect<Self> {
         match msg {
             EchoMsg::Ping => call.reply(1),
+            EchoMsg::Notify => call.reply(2),
         }
     }
 }
 
 const CAP: usize = 64;
+
+type ErasedAnyMailbox = CapturingMailbox<Box<dyn Any>>;
+type CapturedAnyMailbox = Arc<Mutex<Option<ErasedAnyMailbox>>>;
+
+#[derive(Clone, Default)]
+struct CapturingMailboxFactory {
+    last_any: CapturedAnyMailbox,
+}
+
+impl CapturingMailboxFactory {
+    fn last_any(&self) -> CapturingMailbox<Box<dyn Any>> {
+        self.last_any
+            .lock()
+            .expect("captured mailbox mutex")
+            .clone()
+            .expect("runtime created an erased mailbox")
+    }
+}
+
+impl MailboxFactory for CapturingMailboxFactory {
+    fn create<T: 'static>(&self, capacity: usize) -> Box<dyn Mailbox<T>> {
+        let mailbox = CapturingMailbox::new(capacity);
+        if std::any::TypeId::of::<T>() == std::any::TypeId::of::<Box<dyn Any>>() {
+            // Test-only: ThreadedRuntime stores isolate mailboxes erased as
+            // `Box<dyn Any>`. Keep a clone of the latest erased mailbox so the
+            // test can exercise the direct mailbox ingress seam.
+            let erased_inner: Arc<Mutex<CapturingMailboxInner<Box<dyn Any>>>> =
+                unsafe { std::mem::transmute(Arc::clone(&mailbox.inner)) };
+            let erased = CapturingMailbox {
+                capacity: mailbox.capacity,
+                inner: erased_inner,
+            };
+            *self.last_any.lock().expect("captured mailbox mutex") = Some(erased);
+        }
+        Box::new(mailbox)
+    }
+}
+
+struct CapturingMailbox<T> {
+    capacity: usize,
+    inner: Arc<Mutex<CapturingMailboxInner<T>>>,
+}
+
+struct CapturingMailboxInner<T> {
+    queue: VecDeque<T>,
+    closed: bool,
+    wake: Option<Arc<dyn Fn() + Send + Sync + 'static>>,
+}
+
+impl<T> Clone for CapturingMailbox<T> {
+    fn clone(&self) -> Self {
+        Self {
+            capacity: self.capacity,
+            inner: Arc::clone(&self.inner),
+        }
+    }
+}
+
+// Test-only mailbox: the runtime erases messages to `Box<dyn Any>`, and this
+// test only sends `EchoMsg` values through that queue. The unsafe impl keeps the
+// captured handle movable between the worker-creating factory and the host test.
+unsafe impl<T> Send for CapturingMailbox<T> {}
+unsafe impl<T> Sync for CapturingMailbox<T> {}
+
+impl<T> CapturingMailbox<T> {
+    fn new(capacity: usize) -> Self {
+        Self {
+            capacity,
+            inner: Arc::new(Mutex::new(CapturingMailboxInner {
+                queue: VecDeque::with_capacity(capacity),
+                closed: false,
+                wake: None,
+            })),
+        }
+    }
+}
+
+impl<T: 'static> Mailbox<T> for CapturingMailbox<T> {
+    fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    fn try_send(&self, message: T) -> Result<(), TrySendError<T>> {
+        let mut inner = self.inner.lock().expect("capturing mailbox mutex");
+        if inner.closed {
+            return Err(TrySendError::Closed(message));
+        }
+        if inner.queue.len() >= self.capacity {
+            return Err(TrySendError::Full(message));
+        }
+        let was_empty = inner.queue.is_empty();
+        inner.queue.push_back(message);
+        let wake = was_empty.then(|| inner.wake.clone()).flatten();
+        drop(inner);
+        if let Some(wake) = wake {
+            wake();
+        }
+        Ok(())
+    }
+
+    fn set_wake_hook(&self, wake: Option<Arc<dyn Fn() + Send + Sync + 'static>>) {
+        self.inner.lock().expect("capturing mailbox mutex").wake = wake;
+    }
+
+    fn recv(&self) -> Option<T> {
+        self.inner
+            .lock()
+            .expect("capturing mailbox mutex")
+            .queue
+            .pop_front()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.inner
+            .lock()
+            .expect("capturing mailbox mutex")
+            .queue
+            .is_empty()
+    }
+
+    fn close(&self) {
+        self.inner.lock().expect("capturing mailbox mutex").closed = true;
+    }
+}
 
 /// A fully idle worker blocks on the kernel and makes ~0 wakeups over a window.
 ///
@@ -66,7 +204,7 @@ fn idle_worker_makes_near_zero_wakeups() {
     let runtime: ThreadedRuntime<TestShard, DefaultThreadedMailboxFactory> =
         ThreadedRuntime::new(TestShard, DefaultThreadedMailboxFactory);
     let echo = runtime
-        .register_with_capacity::<_, Infallible>(Echo, CAP)
+        .register_with_capacity::<_, Infallible>(Echo { notify: None }, CAP)
         .expect("register echo");
 
     // Warm: one call so the worker has parked at least once after real work.
@@ -97,7 +235,7 @@ fn idle_blocked_worker_wakes_for_command() {
     let runtime: ThreadedRuntime<TestShard, DefaultThreadedMailboxFactory> =
         ThreadedRuntime::new(TestShard, DefaultThreadedMailboxFactory);
     let echo = runtime
-        .register_with_capacity::<_, Infallible>(Echo, CAP)
+        .register_with_capacity::<_, Infallible>(Echo { notify: None }, CAP)
         .expect("register echo");
 
     // Reach a quiet, block-forever park.
@@ -127,7 +265,7 @@ fn command_admitted_around_park_is_never_missed() {
     let runtime: ThreadedRuntime<TestShard, DefaultThreadedMailboxFactory> =
         ThreadedRuntime::new(TestShard, DefaultThreadedMailboxFactory);
     let echo = runtime
-        .register_with_capacity::<_, Infallible>(Echo, CAP)
+        .register_with_capacity::<_, Infallible>(Echo { notify: None }, CAP)
         .expect("register echo");
 
     for i in 0..200 {
@@ -141,6 +279,32 @@ fn command_admitted_around_park_is_never_missed() {
             .expect("call");
         assert_eq!(outcome, CallOutcome::Replied(1), "missed wake on iter {i}");
     }
+
+    runtime.shutdown().expect("shutdown");
+}
+
+/// A direct mailbox push (outside `ThreadedRuntime::try_send`) must wake an
+/// idle worker too. This is the seam custom mailbox factories expose: the
+/// mailbox, not only the runtime command queue, owns empty -> non-empty
+/// readiness truth.
+#[test]
+fn direct_mailbox_push_wakes_idle_worker() {
+    let factory = CapturingMailboxFactory::default();
+    let runtime: ThreadedRuntime<TestShard, CapturingMailboxFactory> =
+        ThreadedRuntime::new(TestShard, factory.clone());
+    let (tx, rx) = mpsc::channel();
+    let _echo = runtime
+        .register_with_capacity::<_, Infallible>(Echo { notify: Some(tx) }, CAP)
+        .expect("register echo");
+    let mailbox = factory.last_any();
+
+    std::thread::sleep(Duration::from_millis(50));
+    mailbox
+        .try_send(Box::new(EchoMsg::Notify) as Box<dyn Any>)
+        .expect("direct mailbox send accepted");
+
+    rx.recv_timeout(Duration::from_secs(1))
+        .expect("direct mailbox push woke worker and delivered message");
 
     runtime.shutdown().expect("shutdown");
 }
@@ -161,7 +325,7 @@ fn simulated_threaded_backend_no_spin_and_command_wake() {
             || SimulatedIO::new().loop_handle(Global),
         );
     let echo = runtime
-        .register_with_capacity::<_, Infallible>(Echo, CAP)
+        .register_with_capacity::<_, Infallible>(Echo { notify: None }, CAP)
         .expect("register echo");
 
     // Commands wake the simulated park.
