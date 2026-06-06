@@ -275,11 +275,16 @@ where
         round_messages.clear();
         reserve_round_message_scratch(&mut round_messages, self.entries.len());
         for index in 0..self.entries.len() {
-            let message = if self.entries[index].stopped.get() {
-                None
-            } else {
-                self.recv_entry_message(index)
-            };
+            // Skip-empty scan: a quiet mailbox answers `is_empty()` cheaply, so
+            // we avoid the expensive `recv` (virtual call + lock + context pop)
+            // on idle isolates. `is_empty()` reflects real mailbox state for
+            // every ingress path, so a directly-pushed message is never skipped.
+            let message =
+                if self.entries[index].stopped.get() || self.entries[index].mailbox.is_empty() {
+                    None
+                } else {
+                    self.recv_entry_message(index)
+                };
             round_messages.push(message);
         }
 
@@ -3239,6 +3244,9 @@ where
 pub(crate) trait ErasedMailbox {
     fn recv_boxed(&self) -> Option<Box<dyn Any>>;
     fn try_send_boxed(&self, message: Box<dyn Any>) -> Result<(), TrySendError<Box<dyn Any>>>;
+    /// Cheap readiness probe; lets the scheduler skip `recv_boxed` on quiet
+    /// isolates. Reflects real mailbox state for every ingress path.
+    fn is_empty(&self) -> bool;
     fn close(&self);
 }
 
@@ -3259,6 +3267,10 @@ where
         self.mailbox
             .recv()
             .map(|message| Box::new(message) as Box<dyn Any>)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.mailbox.is_empty()
     }
 
     fn try_send_boxed(&self, message: Box<dyn Any>) -> Result<(), TrySendError<Box<dyn Any>>> {
@@ -3289,6 +3301,10 @@ pub(crate) struct AnyMailboxAdapter {
 impl ErasedMailbox for AnyMailboxAdapter {
     fn recv_boxed(&self) -> Option<Box<dyn Any>> {
         self.mailbox.recv()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.mailbox.is_empty()
     }
 
     fn try_send_boxed(&self, message: Box<dyn Any>) -> Result<(), TrySendError<Box<dyn Any>>> {

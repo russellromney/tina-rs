@@ -59,6 +59,9 @@ impl<T> Mailbox<T> for TestMailbox<T> {
     fn recv(&self) -> Option<T> {
         self.queue.lock().expect("queue mutex").pop_front()
     }
+    fn is_empty(&self) -> bool {
+        self.queue.lock().expect("queue mutex").is_empty()
+    }
 
     fn close(&self) {
         *self.closed.lock().expect("closed mutex") = true;

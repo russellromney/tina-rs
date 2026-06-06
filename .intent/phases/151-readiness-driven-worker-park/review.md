@@ -168,3 +168,35 @@ proof backs up.
 The deprecated `idle_repoll_interval` / `idle_wait` knobs no longer drive the
 single-shard idle park (they remain accepted config; the park blocks on real
 readiness instead). Multi-shard still uses the command-queue park.
+
+## Mailbox-owned readiness (skip-empty scan)
+
+The per-step scheduler scan used to call `recv` on every isolate. It now probes
+`Mailbox::is_empty()` first and skips the `recv` (a virtual call + lock +
+context pop) on quiet isolates. `is_empty()` is a required trait method — no
+default — so every mailbox impl answers truthfully; a wrong `true` would
+silently drop scheduling. The method threads through `ErasedMailbox` and both
+adapters, the default factory mailboxes, the SPSC mailbox, and all in-tree test
+mailboxes (compile errors were the rail).
+
+Why this is correct where the prior attempt was not: the earlier ready-queue
+marked readiness only in the runtime's enqueue path, which the explicit
+runtime's direct `mailbox.try_send` seam bypassed, so directly-seeded messages
+were never scheduled. `is_empty()` queries the mailbox's real state, so it is
+correct for every ingress path — mediated sends and direct `try_send` alike.
+`address_liveness` (held-handle direct push) passes, and `mailbox_readiness`
+adds an at-scale guard (a hot isolate served promptly among 2000 idle ones, and
+a message to one of 500 idle isolates still scheduled).
+
+Behaviour-preserving: an empty mailbox yields `None` from the scan either way
+(skip vs `recv -> None`), so the delivered set and per-entry order are
+identical. DST is byte-identical — `sim_same_seed_replays_to_same_trace_fingerprint`
+and the saved replay cases pass unchanged.
+
+No true O(ready) ready queue was built. Skip-empty removes the only expensive
+per-quiet-isolate cost (the `recv`); what remains is an O(entries) pass of cheap
+`is_empty()` probes plus the existing entry-indexed dispatch loop (which the
+supervision/restart paths require). Building a mailbox-owned ready queue would
+need an empty->non-empty notification that is also correct for the direct-push
+seam, and the warmed hot paths have ~3 isolates, so there is no measured scan
+cost to justify it. Recorded as skip-empty-is-enough, per plan.

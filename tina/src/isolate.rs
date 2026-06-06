@@ -158,6 +158,14 @@ pub trait Mailbox<T> {
     /// Attempts to dequeue the next message without blocking.
     fn recv(&self) -> Option<T>;
 
+    /// Returns whether the mailbox holds no message right now.
+    ///
+    /// A cheap readiness probe: the runtime uses it to skip `recv` on quiet
+    /// isolates. It must reflect real state for every ingress path (mediated
+    /// sends and direct `try_send` alike), so no message is ever skipped. No
+    /// default on purpose — a wrong `true` would silently drop scheduling.
+    fn is_empty(&self) -> bool;
+
     /// Closes the mailbox so subsequent `try_send` calls return
     /// [`TrySendError::Closed`]. Idempotent. Already-buffered messages
     /// remain visible to `recv` until drained.
@@ -175,6 +183,10 @@ impl<T> Mailbox<T> for Box<dyn Mailbox<T>> {
 
     fn recv(&self) -> Option<T> {
         (**self).recv()
+    }
+
+    fn is_empty(&self) -> bool {
+        (**self).is_empty()
     }
 
     fn close(&self) {

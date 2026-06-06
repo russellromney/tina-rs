@@ -78,6 +78,10 @@ impl<T> Mailbox<T> for DefaultMailbox<T> {
         self.queue.borrow_mut().pop_front()
     }
 
+    fn is_empty(&self) -> bool {
+        self.queue.borrow().is_empty()
+    }
+
     fn close(&self) {
         self.closed.set(true);
     }
@@ -152,6 +156,14 @@ impl<T> Mailbox<T> for DefaultThreadedMailbox<T> {
             .lock()
             .expect("DefaultThreadedMailbox mutex poisoned");
         state.queue.pop_front()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.state
+            .lock()
+            .expect("DefaultThreadedMailbox mutex poisoned")
+            .queue
+            .is_empty()
     }
 
     fn close(&self) {

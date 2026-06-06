@@ -186,6 +186,12 @@ impl<T> Mailbox<T> for SpscMailbox<T> {
         Ok(())
     }
 
+    fn is_empty(&self) -> bool {
+        // Empty when head == tail. A read-only peek for the consumer (the
+        // runtime worker); matches `recv`'s emptiness check.
+        self.head.load(Relaxed) == self.tail.load(Acquire)
+    }
+
     fn recv(&self) -> Option<T> {
         let _consumer = Self::claim(&self.consumer_active, "consumer");
 
