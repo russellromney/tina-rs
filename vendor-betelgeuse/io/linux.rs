@@ -1071,8 +1071,12 @@ impl IOLoop for IoUringIO {
                         state.ring.submit_and_wait(1)?;
                     }
                     Some(d) => {
+                        // Park cap (~1 year): a raw huge timeout makes io_uring
+                        // reject the timespec; the real deadline still fires via
+                        // the runtime's timeout harvest.
+                        const MAX_PARK_SECS: u64 = 366 * 24 * 60 * 60;
                         let ts = types::Timespec::new()
-                            .sec(d.as_secs())
+                            .sec(d.as_secs().min(MAX_PARK_SECS))
                             .nsec(d.subsec_nanos());
                         let args = types::SubmitArgs::new().timespec(&ts);
                         match state.ring.submitter().submit_with_args(1, &args) {

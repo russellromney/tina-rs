@@ -104,9 +104,13 @@ impl Doorbell for DarwinDoorbell {
     }
 }
 
+/// Park cap (~1 year). A raw huge timeout overflows `time_t` and `kevent`
+/// rejects it; the real deadline still fires via the runtime's timeout harvest.
+const MAX_PARK_SECS: u64 = 366 * 24 * 60 * 60;
+
 fn timespec_from_duration(d: Duration) -> libc::timespec {
     libc::timespec {
-        tv_sec: d.as_secs().min(i64::MAX as u64) as libc::time_t,
+        tv_sec: d.as_secs().min(MAX_PARK_SECS) as libc::time_t,
         // subsec_nanos() is always < 1_000_000_000, so this widening is exact.
         tv_nsec: libc::c_long::from(d.subsec_nanos()),
     }
