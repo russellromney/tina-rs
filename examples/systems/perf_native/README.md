@@ -349,24 +349,25 @@ with steady-state service cost:
 | `websocket_text_round_trip` | `connection_setup` | connect + upgrade + one text echo + close per op |
 | `websocket_steady_state_small` | `steady_state_reuse` | warmed open session, one text echo per op |
 
-Local macOS/aarch64 sample (4 load workers, 32 ops, single run; HTTP/2 and
-WebSocket rows are noisy run-to-run, the steady-state rows least so):
+Each row is sampled like the comparison rows: one warmup run discarded, then the
+median-of-five by p50 (4 load workers, 32 ops per run). The absolute latencies
+vary heavily run-to-run and machine-to-machine — four raw clients share one
+single-shard server worker, so the tails are wide and a busy machine can shift
+the median several-fold. The recorded numbers live in
+`.intent/phases/152-protocol-perf-byte-path/perf_history.jsonl`; do not treat any
+single sample as a stable figure.
 
-| row | p50 | p90 | p99 |
-| --- | --- | --- | --- |
-| `http2_h2c_close_request` | 6.66 ms | 12.9 ms | 13.7 ms |
-| `http2_h2c_keepalive_sequential` | 22.3 ms | 53.1 ms | 58.7 ms |
-| `http2_h2c_steady_state_small` | 1.36 ms | 16.2 ms | 17.5 ms |
-| `websocket_open_close` | 6.81 ms | 17.6 ms | 19.1 ms |
-| `websocket_text_round_trip` | 5.72 ms | 23.1 ms | 23.4 ms |
-| `websocket_steady_state_small` | 0.70 ms | 13.4 ms | 23.7 ms |
+What the rows are *for* is the shape, not a speed claim:
 
-Read these as setup-heavy vs reused, not as a speed claim: the `*_close` /
-`*_open_close` / `*_round_trip` rows pay connect/accept/handshake every op; the
-`*_steady_state_*` rows reuse a warmed connection and are the closest to
-per-request service cost. The tails are wide because four raw clients share one
-single-shard server worker. This is local/alpha evidence, not a production
-performance claim.
+- the `*_close` / `*_open_close` / `*_round_trip` rows (`connection_setup`) pay
+  connect/accept/handshake on every op;
+- the `*_steady_state_*` rows (`steady_state_reuse`) reuse a warmed connection
+  and are the closest thing here to per-request service cost;
+- so a steady-state row's p50 being well under its setup sibling's is the
+  expected, honest result — connection setup is real kernel work, now measured
+  separately instead of mixed into service cost.
+
+This is local/alpha evidence, not a production performance claim.
 
 ### Deterministic WebSocket pressure row
 
@@ -392,9 +393,11 @@ per-frame `ensure_outbound_slots(1)` admission is kept, so the bounded
 outbound-queue cap and the `connection_full` accounting are byte-for-byte
 identical; the wire output is unchanged, so no replay-visible fact moves.
 
-Measured by `http2_buffered_response_allocation_ceiling` (64 warmed h2c
-responses on one reused connection, whole-process allocations, deterministic
-across runs on macOS/aarch64):
+Measured by the `perf-h2-alloc` check inside `hotpath_probes_report_and_stay_bounded`
+(it calls `http2_steady_state_response_process_allocations`; the ceiling lives in
+the single-test hotpath binary so whole-process counting is not contaminated by a
+parallel test thread). 64 warmed h2c responses on one reused connection, stable
+across runs on macOS/aarch64:
 
 | | allocations / 64 responses | per response |
 | --- | --- | --- |
@@ -423,7 +426,8 @@ while a body follows.
 ### Rows that are platform-specific
 
 All Phase 152 numbers above are macOS/aarch64 local/alpha. The
-`http2_buffered_response_allocation_ceiling` ceiling is calibrated on
-macOS/aarch64 and is a regression guard, not a cross-platform constant. Linux/x86
-evidence for this phase is collected separately via the Fly/Ubuntu workflow and
-saved beside the phase plan.
+`H2_BUFFERED_RESPONSE_ALLOC_CEILING` in the hotpath test is calibrated on
+macOS/aarch64 and is a regression guard (the regression is +64 over 64
+responses), not a cross-platform constant. Linux/x86 evidence for this phase is
+collected separately via the Fly/Ubuntu workflow and saved beside the phase
+plan.

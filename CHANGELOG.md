@@ -23,11 +23,12 @@ This file records completed work.
   allocations over 64 warmed h2c responses on macOS/aarch64). The wire output is
   unchanged and the per-frame bounded-queue admission is preserved, so no
   replay-visible fact moves.
-- New proof: `http2_buffered_response_allocation_ceiling` pins the post-rewrite
-  allocation count, and
-  `http2_multi_frame_response_marks_end_stream_only_on_last_data_frame` asserts
-  multi-frame body integrity, a single terminal `END_STREAM`, and that HEADERS
-  does not claim `END_STREAM` while a body follows.
+- New proof: the `perf-h2-alloc` ceiling inside `hotpath_probes_report_and_stay_bounded`
+  pins the post-rewrite allocation count (whole-process counting lives in the
+  single-test hotpath binary so a parallel test thread cannot contaminate it),
+  and `http2_multi_frame_response_marks_end_stream_only_on_last_data_frame`
+  asserts multi-frame body integrity, a single terminal `END_STREAM`, and that
+  HEADERS does not claim `END_STREAM` while a body follows.
 - `websocket_capacity_fill_probe` is a deterministic capacity-fill pressure row:
   an over-cap echo raises a typed `SessionPressure` on the connection and closes
   the session without writing the frame. It proves typed pressure via the public

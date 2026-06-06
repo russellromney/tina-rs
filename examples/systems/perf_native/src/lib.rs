@@ -1565,20 +1565,41 @@ fn shutdown_runtime(
 
 const PROTOCOL_OPS: u64 = HTTP_OPS;
 const H2_KEEPALIVE_REQUESTS_PER_CONN: usize = KEEPALIVE_REQUESTS_PER_CONN;
+// Generous client-side socket timeout for the native protocol rows. These rows
+// run four raw clients against one single-shard worker, so tails are wide; the
+// timeout only exists to fail a genuine hang, not to clip a slow-but-real op on
+// a contended machine. Kept well above the worst observed tail.
+const PROTOCOL_CLIENT_TIMEOUT: Duration = Duration::from_secs(5);
 
 type PerfRuntime = Arc<ThreadedRuntime<SingleShard, DefaultThreadedMailboxFactory>>;
 
 /// All Tina-only native protocol rows. Returned as `PerfReport`s (not
 /// comparisons): each prints a `perf ...` line with `comparison_baseline=none`.
+///
+/// Each row is sampled the same way the comparison rows are — one warmup run
+/// discarded, then the median-of-`SAMPLES` by p50 — so the reported row matches
+/// the suite's documented methodology instead of being a single noisy run.
 pub fn run_native_rows() -> anyhow::Result<Vec<PerfReport>> {
     Ok(vec![
-        http2_h2c_close_row()?,
-        http2_h2c_keepalive_row()?,
-        http2_h2c_steady_state_small_row()?,
-        websocket_open_close_row()?,
-        websocket_text_round_trip_row()?,
-        websocket_steady_state_small_row()?,
+        native_sampled(http2_h2c_close_row)?,
+        native_sampled(http2_h2c_keepalive_row)?,
+        native_sampled(http2_h2c_steady_state_small_row)?,
+        native_sampled(websocket_open_close_row)?,
+        native_sampled(websocket_text_round_trip_row)?,
+        native_sampled(websocket_steady_state_small_row)?,
     ])
+}
+
+/// Warmup-then-median-of-five for a native row, mirroring `compare_samples`.
+/// The warmup run lets one-time runtime/allocator setup happen before the
+/// measured samples; `median_report` then picks the median-p50 sample.
+fn native_sampled(row: fn() -> anyhow::Result<PerfReport>) -> anyhow::Result<PerfReport> {
+    let _ = row()?;
+    let mut reports = Vec::with_capacity(SAMPLES);
+    for _ in 0..SAMPLES {
+        reports.push(row()?);
+    }
+    Ok(median_report(reports))
 }
 
 // ---- HTTP/2 (h2c) ----------------------------------------------------------
@@ -1627,9 +1648,9 @@ fn start_h2_server(body: Vec<u8>) -> anyhow::Result<(PerfRuntime, Address<Http2L
 }
 
 fn h2c_connect(addr: SocketAddr) -> anyhow::Result<TcpStream> {
-    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(2))?;
-    stream.set_read_timeout(Some(Duration::from_secs(2)))?;
-    stream.set_write_timeout(Some(Duration::from_secs(2)))?;
+    let mut stream = TcpStream::connect_timeout(&addr, PROTOCOL_CLIENT_TIMEOUT)?;
+    stream.set_read_timeout(Some(PROTOCOL_CLIENT_TIMEOUT))?;
+    stream.set_write_timeout(Some(PROTOCOL_CLIENT_TIMEOUT))?;
     stream.write_all(H2_PREFACE)?;
     h2_write_frame(&mut stream, H2_FRAME_SETTINGS, 0, 0, &[])?;
     let mut saw_settings = false;
@@ -1727,6 +1748,8 @@ fn h2c_get(
         &block,
     )?;
     let mut body = 0usize;
+    let mut saw_headers = false;
+    let mut ended = false;
     for _ in 0..32 {
         let frame = h2_read_frame(stream)?;
         if frame.stream_id != stream_id {
@@ -1734,19 +1757,31 @@ fn h2c_get(
         }
         match frame.ty {
             H2_FRAME_HEADERS => {
+                saw_headers = true;
                 if frame.flags & H2_FLAG_END_STREAM != 0 {
+                    ended = true;
                     break;
                 }
             }
             H2_FRAME_DATA => {
                 body += frame.payload.len();
                 if frame.flags & H2_FLAG_END_STREAM != 0 {
+                    ended = true;
                     break;
                 }
             }
             H2_FRAME_RST_STREAM => anyhow::bail!("h2 stream {stream_id} reset"),
             _ => {}
         }
+    }
+    // A valid response must carry a HEADERS frame (the status block) and reach
+    // END_STREAM. Length-only checks would let a malformed/headerless or
+    // truncated response pass; require both.
+    if !saw_headers {
+        anyhow::bail!("h2 stream {stream_id} produced no HEADERS frame");
+    }
+    if !ended {
+        anyhow::bail!("h2 stream {stream_id} did not reach END_STREAM");
     }
     if body != expected_len {
         anyhow::bail!("unexpected h2 body len {body}, expected {expected_len}");
@@ -1956,7 +1991,11 @@ impl WsApp {
             WebSocketSessionMsg::Text(text) => WebSocketSessionOutcome::Text(text),
             WebSocketSessionMsg::Binary(bytes) => WebSocketSessionOutcome::Binary(bytes),
             WebSocketSessionMsg::Close(code, reason) => WebSocketSessionOutcome::Close(code, reason),
-            WebSocketSessionMsg::SessionPressure { .. } | WebSocketSessionMsg::Pressure(_) => {
+            // Count ONLY the typed `SessionPressure` surface, not the legacy
+            // `Pressure(_)` spelling: the probe must prove the typed event
+            // fires exactly once per op, and counting both would let a regression
+            // that doubled or renamed the event slip past an exact-count check.
+            WebSocketSessionMsg::SessionPressure { .. } => {
                 self.pressure_count.fetch_add(1, Ordering::Relaxed);
                 WebSocketSessionOutcome::None
             }
@@ -2001,9 +2040,9 @@ fn start_ws_server(
 }
 
 fn ws_connect(addr: SocketAddr) -> anyhow::Result<TcpStream> {
-    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(2))?;
-    stream.set_read_timeout(Some(Duration::from_secs(2)))?;
-    stream.set_write_timeout(Some(Duration::from_secs(2)))?;
+    let mut stream = TcpStream::connect_timeout(&addr, PROTOCOL_CLIENT_TIMEOUT)?;
+    stream.set_read_timeout(Some(PROTOCOL_CLIENT_TIMEOUT))?;
+    stream.set_write_timeout(Some(PROTOCOL_CLIENT_TIMEOUT))?;
     stream.write_all(
         b"GET /ws HTTP/1.1\r\n\
           Host: x\r\n\
@@ -2047,7 +2086,10 @@ fn ws_masked_frame(opcode: u8, payload: &[u8]) -> Vec<u8> {
     out
 }
 
-fn ws_read_frame(stream: &mut TcpStream) -> anyhow::Result<(u8, Vec<u8>)> {
+// Returns `io::Result` so callers can tell a clean peer EOF
+// (`UnexpectedEof` -> pressure close) apart from a read timeout or other I/O
+// error (a hang or transport failure, which must NOT be reported as pressure).
+fn ws_read_frame(stream: &mut TcpStream) -> std::io::Result<(u8, Vec<u8>)> {
     let mut head = [0u8; 2];
     stream.read_exact(&mut head)?;
     let opcode = head[0] & 0x0f;
@@ -2247,8 +2289,10 @@ pub fn websocket_capacity_fill_probe() -> anyhow::Result<LoadReport> {
             let pressure_count = Arc::clone(&pressure_count);
             move || {
                 // Wait (bounded) for the worker to deliver every typed pressure
-                // event to the app. leak_clean is true only if all of them
-                // arrived — no pressure event was lost or a session leaked.
+                // event to the app. leak_clean is true only if EXACTLY one typed
+                // SessionPressure arrived per op: too few means a pressure event
+                // was lost or a session leaked; more than one per op means the
+                // typed event double-fired. Either way the proof must fail.
                 let deadline = Instant::now() + Duration::from_secs(2);
                 while pressure_count.load(Ordering::Relaxed) < PRESSURE_OPS
                     && Instant::now() < deadline
@@ -2256,7 +2300,7 @@ pub fn websocket_capacity_fill_probe() -> anyhow::Result<LoadReport> {
                     thread::yield_now();
                 }
                 LoadObservation {
-                    leak_clean: pressure_count.load(Ordering::Relaxed) >= PRESSURE_OPS,
+                    leak_clean: pressure_count.load(Ordering::Relaxed) == PRESSURE_OPS,
                     ..LoadObservation::default()
                 }
             }
@@ -2309,6 +2353,12 @@ pub fn http2_steady_state_response_process_allocations(requests: usize) -> anyho
     Ok(process)
 }
 
+/// Returns `Ok(true)` when the server signalled pressure (a CLOSE frame, or a
+/// clean peer EOF — the connection drops the over-cap session without writing
+/// the frame), `Ok(false)` if the server actually echoed the over-cap text (no
+/// pressure), and `Err` for any real transport failure (connect/write error, a
+/// read timeout/hang, or a malformed frame). A hang must NOT masquerade as
+/// pressure, so only `UnexpectedEof` is treated as the pressure close.
 fn ws_overfill_op(addr: SocketAddr) -> anyhow::Result<bool> {
     let mut stream = ws_connect(addr)?;
     stream.write_all(&ws_masked_frame(WS_OPCODE_TEXT, b"overfill"))?;
@@ -2318,7 +2368,10 @@ fn ws_overfill_op(addr: SocketAddr) -> anyhow::Result<bool> {
             Ok((WS_OPCODE_TEXT, _)) => return Ok(false), // got echo, no pressure
             Ok((WS_OPCODE_CLOSE, _)) => return Ok(true), // server closed on pressure
             Ok(_) => continue,
-            Err(_) => return Ok(true), // EOF after pressure-triggered close
+            Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => {
+                return Ok(true); // clean EOF after pressure-triggered close
+            }
+            Err(err) => return Err(err.into()), // timeout/hang/other: a real failure
         }
     }
 }

@@ -165,3 +165,49 @@ Decision:
   NOT final: the orchestrator (or a follow-up) must run the Fly/Ubuntu perf
   workflow and save the sample beside this plan, and confirm the
   `H2_BUFFERED_RESPONSE_ALLOC_CEILING` value holds on Linux/x86, before merge.
+
+## Implementation Review 2 (adversarial pass + fixes)
+
+Two independent hostile reviewers re-read `origin/main..HEAD` (one on protocol
+correctness, one on benchmark honesty). Both confirmed the byte-path rewrite is
+byte-identical to the old path, the multi-frame END_STREAM test is a real guard,
+and there is no hidden unbounded queue. Findings fixed in this wave:
+
+- [P1] README claimed a "median of five samples after warmup" methodology, but
+  the native rows ran once, and the documented absolute latencies were an
+  unreproducible single-machine snapshot (a reviewer measured up to ~12x
+  different). Fixed: `run_native_rows` now warms once and takes the
+  median-of-`SAMPLES` per row via `native_sampled`, matching the comparison
+  rows. The README latency table is replaced with a shape description plus a
+  pointer to `perf_history.jsonl` and an explicit "varies heavily, not a stable
+  figure" caveat.
+- [P2] CHANGELOG/README named a proof `http2_buffered_response_allocation_ceiling`
+  that does not exist (the guard is the `perf-h2-alloc` assertion inside
+  `hotpath_probes_report_and_stay_bounded`). Docs now name the real location.
+- [P2] The WebSocket pressure proof counted both `SessionPressure` and the legacy
+  `Pressure(_)` spelling and used `>=`, so it did not specifically prove the
+  typed surface and could not catch a double-fire. Fixed: count only the typed
+  `SessionPressure`; `leak_clean` now requires `== PRESSURE_OPS` (exactly one
+  typed event per op).
+- [P2] `ws_overfill_op` mapped every read error — including a 2s read timeout /
+  hang — to the "pressure happened" outcome. Fixed: `ws_read_frame` now returns
+  `io::Result`, and only a clean `UnexpectedEof` (or a CLOSE frame) counts as
+  pressure; a timeout or other I/O error surfaces as a real failure.
+- [P2] `ops_err == 0` / `ops_timeout == 0` on a timing-bound path with 2s socket
+  timeouts could flake on a contended CI runner. Fixed: native protocol clients
+  now use a 5s `PROTOCOL_CLIENT_TIMEOUT`, well above the worst observed tail; the
+  zero-shed/zero-timeout assertions (the plan's requirement, and the existing
+  HTTP/1 convention) are kept.
+- [P3] `h2c_get` checked only reassembled body length. Now it also requires a
+  HEADERS frame and an END_STREAM terminator, so a headerless/truncated response
+  cannot pass. Decoding `:status` was deliberately left out (couples the row to
+  an HPACK encoding); full HTTP/2 semantics remain covered by `http2_live`.
+- [P3] The allocation-ceiling comment overstated "platform-stable". Reworded to
+  "stable across runs on this toolchain; regression guard, recalibrate
+  elsewhere" and the ceiling widened to 3130 (still inside the (3075, 3139)
+  window that catches the +64 regression) for toolchain/std headroom.
+
+Re-verified after the fixes: `make perf` (perf + hotpath, incl. median-of-five
+rows and the alloc ceiling), `cargo test -p tina-http --all-targets`,
+`cargo fmt --all --check`, `clippy -p tina-http -p tina-runtime`, `make proof-fast`
+all green on macOS/aarch64. Linux sample still missing — PR remains non-final.
