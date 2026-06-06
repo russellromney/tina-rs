@@ -367,6 +367,12 @@ impl IdSource {
     }
 }
 
+/// Default per-step backend completion drain budget. High enough that a normal
+/// warm turn (one or a few ready completions) delivers them all in the same
+/// step; low enough that a burst of ready completions cannot turn one step into
+/// an unbounded delivery loop. The remainder carries over to the next step.
+pub const DEFAULT_DRIVER_COMPLETION_DRAIN_BUDGET: usize = 64;
+
 /// Small deterministic single-shard runtime for the second Mariner slice.
 ///
 /// The runtime owns one shard value plus a private registry of isolates and
@@ -406,6 +412,16 @@ where
     pub(crate) remote_child_control_full: u64,
     pub(crate) round_messages: Vec<Option<DeliveredMessage>>,
     pub(crate) driver_completions: Vec<DriverCompletion>,
+    /// Backend completions harvested from the driver but not yet delivered this
+    /// step because the per-step drain budget was reached. Deterministic FIFO:
+    /// carried entries are delivered before fresh ones on the next advance, so
+    /// completion order is stable across the budget boundary. Drained until
+    /// empty, so no completion is dropped.
+    pub(crate) pending_completions: std::collections::VecDeque<DriverCompletion>,
+    /// Max backend completions delivered into mailboxes per driver-advance.
+    /// Bounds the per-step completion work so a burst of ready completions
+    /// cannot monopolise one turn; the remainder carries over.
+    pub(crate) driver_completion_drain_budget: usize,
     pub(crate) next_isolate_call_ordinal: u64,
     pub(crate) observation: observation::ObservationRegistry,
     /// Live trace observer. Fires before retention. See [`crate::TraceObserver`].
@@ -699,6 +715,8 @@ where
             remote_child_control_full: 0,
             round_messages: Vec::with_capacity(preallocation.round_scratch_capacity),
             driver_completions: Vec::with_capacity(preallocation.call_capacity),
+            pending_completions: std::collections::VecDeque::new(),
+            driver_completion_drain_budget: DEFAULT_DRIVER_COMPLETION_DRAIN_BUDGET,
             next_isolate_call_ordinal: 0,
             observation: observation::ObservationRegistry::new(),
             trace_observer: None,

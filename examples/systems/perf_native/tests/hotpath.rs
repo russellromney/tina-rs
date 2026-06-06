@@ -55,15 +55,19 @@ const CALL_CEILING_NS: u64 = 500_000; // 500us
 // dispatcher routing, in-flight-call entry, translator, etc.). The
 // process-wide number is the *real* per-op cost.
 //
-// Observed steady-state today (after Rock 5 + per-host-thread reply channel
-// pool — the dispatcher pool eliminates per-call `HostCallDriver`
-// registration, the reply pool eliminates the per-call `mpsc::channel()`):
+// Observed steady-state today. The persistent dispatcher pool eliminated the
+// per-call `HostCallDriver` registration, the reply pool eliminated the
+// per-call `mpsc::channel()`, and the typed `HostCall` command eliminated the
+// per-call command-closure box (so `call_blocking` host alloc dropped 2 -> 1,
+// process 6 -> 5):
 //   try_send         host=1  process=1
 //   send_and_observe host=4  process=5
-//   call_blocking    host=2  process=7  (4/17 pre-Rock-5, 5/11 post-Rock-5)
+//   call_blocking    host=1  process=5  (4/17 -> 5/11 -> 2/6 -> 1/5)
 const HANDOFF_HOST_ALLOCATIONS_CEILING: u64 = 2;
 const OBSERVED_HOST_ALLOCATIONS_CEILING: u64 = 6;
-const CALL_HOST_ALLOCATIONS_CEILING: u64 = 4;
+// One per-call allocation: the type-erased begin task box for the shared
+// dispatcher. Pinned at 2 so a regression back to the closure box is caught.
+const CALL_HOST_ALLOCATIONS_CEILING: u64 = 2;
 const HANDOFF_PROCESS_ALLOCATIONS_CEILING: u64 = 2;
 const OBSERVED_PROCESS_ALLOCATIONS_CEILING: u64 = 8;
 const CALL_PROCESS_ALLOCATIONS_CEILING: u64 = 10;
@@ -230,10 +234,19 @@ fn kind_label(kind: RuntimeEventKind) -> &'static str {
 }
 
 fn new_runtime(observer: Option<Arc<dyn TraceObserver>>) -> Runtime {
-    let config = ThreadedRuntimeConfig {
+    let mut config = ThreadedRuntimeConfig {
         command_capacity: CAP,
         ..ThreadedRuntimeConfig::default()
     };
+    // Opt-in sweep knob: `TINA_PERF_IDLE_REPOLL_US=N` sets the I/O re-poll park
+    // so an A/B can quantify how the worker's socket-readiness latency (the
+    // HTTP `host_submit -> mbox_accepted` gap) responds. Unset = default
+    // (idle_repoll == idle_wait), so normal runs are unchanged.
+    if let Ok(raw) = std::env::var("TINA_PERF_IDLE_REPOLL_US")
+        && let Ok(us) = raw.trim().parse::<u64>()
+    {
+        config.idle_repoll_interval = Duration::from_micros(us.max(1));
+    }
     match observer {
         Some(observer) => ThreadedRuntime::with_config_and_trace_observer(
             SingleShard,
@@ -552,6 +565,236 @@ fn instrumented_call_blocking() -> HotPathBreakdown {
     stages_from_timeline(t0, &events, t_end)
 }
 
+// Scheduler-gap threshold for the tail rows: a gap above 100us between two
+// instrumented trace events is a scheduling hiccup (a worker park between a
+// ready completion and the next handler turn), not ordinary handler cost.
+const GAP_THRESHOLD_NS: u64 = 100_000;
+
+/// Counts inter-event gaps at or above `threshold` and the largest single gap.
+/// The stages are exactly the inter-event gaps of one instrumented timeline,
+/// so this is the honest scheduler-gap source.
+fn gap_stats(stages: &[HotPathStage], threshold: u64) -> (usize, u64) {
+    let mut count = 0;
+    let mut max = 0;
+    for stage in stages {
+        if stage.nanos >= threshold {
+            count += 1;
+        }
+        max = max.max(stage.nanos);
+    }
+    (count, max)
+}
+
+/// Runs the warmed `call_blocking` timing loop, optionally with a live trace
+/// observer attached so the traced row's totals carry the observer's own cost.
+/// Returns (per-iter totals ns, host allocs, process allocs).
+fn call_blocking_totals(observer: Option<Arc<dyn TraceObserver>>) -> (Vec<u64>, u64, u64) {
+    let runtime = new_runtime(observer);
+    let ping = runtime
+        .register_with_capacity::<_, Infallible>(Ping, CAP)
+        .expect("register ping");
+    for _ in 0..WARMUP {
+        runtime
+            .call_blocking(ping, PingMsg::Ping, CALL_TIMEOUT)
+            .expect("warm call");
+    }
+    let mut totals = Vec::with_capacity(ITERS);
+    for _ in 0..ITERS {
+        let t0 = Instant::now();
+        let outcome = runtime
+            .call_blocking(ping, PingMsg::Ping, CALL_TIMEOUT)
+            .expect("call");
+        totals.push(t0.elapsed().as_nanos() as u64);
+        assert_eq!(outcome, CallOutcome::Replied(PingReply::Pong));
+    }
+    let (_outcome, host, process) =
+        count_all_allocations(|| runtime.call_blocking(ping, PingMsg::Ping, CALL_TIMEOUT));
+    shutdown(runtime);
+    (totals, host, process)
+}
+
+/// The `hotpath_call_blocking_tail` row in both flavors: untraced (the honest
+/// distribution headline) and traced (same path with the observer attached so
+/// its overhead is visible). Both carry scheduler-gap stats measured from one
+/// clean instrumented run; the p50 delta between them is the observer cost.
+fn probe_call_blocking_tail() -> (HotPathReport, HotPathReport) {
+    let breakdown = instrumented_call_blocking();
+    let (gap_count, gap_max) = gap_stats(&breakdown.stages, GAP_THRESHOLD_NS);
+
+    let (untraced_totals, u_host, u_proc) = call_blocking_totals(None);
+    let untraced = HotPathReport::from_samples_with_counters(
+        "hotpath_call_blocking_tail",
+        untraced_totals,
+        breakdown.stages.clone(),
+        Some(u_host),
+        Some(u_proc),
+        breakdown.counters,
+    )
+    .with_traced(false)
+    .with_scheduler_gaps(GAP_THRESHOLD_NS, gap_count, gap_max);
+
+    let timer = Arc::new(StageTimer::default());
+    let (traced_totals, t_host, t_proc) =
+        call_blocking_totals(Some(timer as Arc<dyn TraceObserver>));
+    let traced = HotPathReport::from_samples_with_counters(
+        "hotpath_call_blocking_tail_traced",
+        traced_totals,
+        breakdown.stages,
+        Some(t_host),
+        Some(t_proc),
+        breakdown.counters,
+    )
+    .with_traced(true)
+    .with_scheduler_gaps(GAP_THRESHOLD_NS, gap_count, gap_max);
+
+    (untraced, traced)
+}
+
+/// Runs the warmed steady-state keepalive timing loop, optionally with a live
+/// observer attached. Returns (totals ns, host allocs, process allocs).
+fn steady_state_totals(body: &[u8], observer: Option<Arc<dyn TraceObserver>>) -> (Vec<u64>, u64, u64) {
+    let (runtime, addr, _service) = start_http_runtime(observer, body.to_vec(), true);
+    for _ in 0..HTTP_HOTPATH_WARMUP {
+        http_get_reused(addr, 2, body.len()).expect("warm steady-state http request");
+    }
+    let mut totals = Vec::with_capacity(HTTP_HOTPATH_ITERS);
+    for _ in 0..HTTP_HOTPATH_ITERS {
+        let t0 = Instant::now();
+        http_get_reused(addr, 1, body.len()).expect("steady-state http hotpath op");
+        totals.push(t0.elapsed().as_nanos() as u64);
+    }
+    let (_outcome, host, process) =
+        count_all_allocations(|| http_get_reused(addr, 1, body.len()));
+    shutdown(runtime);
+    (totals, host, process)
+}
+
+/// The `hotpath_http1_keepalive_steady_state_tail` row, untraced + traced.
+fn probe_http1_keepalive_steady_state_tail() -> (HotPathReport, HotPathReport) {
+    let body = small_body();
+    let breakdown = instrumented_http1_steady_state(body.clone());
+    let (gap_count, gap_max) = gap_stats(&breakdown.stages, GAP_THRESHOLD_NS);
+
+    let (untraced_totals, u_host, u_proc) = steady_state_totals(&body, None);
+    let untraced = HotPathReport::from_samples_with_counters(
+        "hotpath_http1_keepalive_steady_state_tail",
+        untraced_totals,
+        breakdown.stages.clone(),
+        Some(u_host),
+        Some(u_proc),
+        breakdown.counters,
+    )
+    .with_traced(false)
+    .with_scheduler_gaps(GAP_THRESHOLD_NS, gap_count, gap_max);
+
+    let timer = Arc::new(StageTimer::default());
+    let (traced_totals, t_host, t_proc) =
+        steady_state_totals(&body, Some(timer as Arc<dyn TraceObserver>));
+    let traced = HotPathReport::from_samples_with_counters(
+        "hotpath_http1_keepalive_steady_state_tail_traced",
+        traced_totals,
+        breakdown.stages,
+        Some(t_host),
+        Some(t_proc),
+        breakdown.counters,
+    )
+    .with_traced(true)
+    .with_scheduler_gaps(GAP_THRESHOLD_NS, gap_count, gap_max);
+
+    (untraced, traced)
+}
+
+/// Runs the warmed close/keepalive HTTP timing loop, optionally with a live
+/// observer attached. Returns (totals ns, host allocs, process allocs).
+fn http1_totals(
+    body: &[u8],
+    keepalive: bool,
+    requests_per_op: usize,
+    expected_body_len: usize,
+    observer: Option<Arc<dyn TraceObserver>>,
+) -> (Vec<u64>, u64, u64) {
+    let (runtime, addr, _service) = start_http_runtime(observer, body.to_vec(), keepalive);
+    for _ in 0..HTTP_HOTPATH_WARMUP {
+        http_get(addr, keepalive, requests_per_op, expected_body_len).expect("warm http request");
+    }
+    let mut totals = Vec::with_capacity(HTTP_HOTPATH_ITERS);
+    for _ in 0..HTTP_HOTPATH_ITERS {
+        let t0 = Instant::now();
+        http_get(addr, keepalive, requests_per_op, expected_body_len).expect("http hotpath op");
+        totals.push(t0.elapsed().as_nanos() as u64);
+    }
+    let (_outcome, host, process) =
+        count_all_allocations(|| http_get(addr, keepalive, requests_per_op, expected_body_len));
+    shutdown(runtime);
+    (totals, host, process)
+}
+
+/// A close/fixed-body HTTP `*_tail` row pair (untraced + traced).
+fn probe_http1_tail(
+    label: &'static str,
+    traced_label: &'static str,
+    body: Vec<u8>,
+    requests_per_op: usize,
+    expected_body_len: usize,
+) -> (HotPathReport, HotPathReport) {
+    let breakdown = instrumented_http1(body.clone(), false, requests_per_op, expected_body_len);
+    let (gap_count, gap_max) = gap_stats(&breakdown.stages, GAP_THRESHOLD_NS);
+
+    let (untraced_totals, u_host, u_proc) =
+        http1_totals(&body, false, requests_per_op, expected_body_len, None);
+    let untraced = HotPathReport::from_samples_with_counters(
+        label,
+        untraced_totals,
+        breakdown.stages.clone(),
+        Some(u_host),
+        Some(u_proc),
+        breakdown.counters,
+    )
+    .with_traced(false)
+    .with_scheduler_gaps(GAP_THRESHOLD_NS, gap_count, gap_max);
+
+    let timer = Arc::new(StageTimer::default());
+    let (traced_totals, t_host, t_proc) = http1_totals(
+        &body,
+        false,
+        requests_per_op,
+        expected_body_len,
+        Some(timer as Arc<dyn TraceObserver>),
+    );
+    let traced = HotPathReport::from_samples_with_counters(
+        traced_label,
+        traced_totals,
+        breakdown.stages,
+        Some(t_host),
+        Some(t_proc),
+        breakdown.counters,
+    )
+    .with_traced(true)
+    .with_scheduler_gaps(GAP_THRESHOLD_NS, gap_count, gap_max);
+
+    (untraced, traced)
+}
+
+fn probe_http1_close_tail() -> (HotPathReport, HotPathReport) {
+    probe_http1_tail(
+        "hotpath_http1_close_request_tail",
+        "hotpath_http1_close_request_tail_traced",
+        small_body(),
+        1,
+        small_body().len(),
+    )
+}
+
+fn probe_http1_fixed_body_close_tail() -> (HotPathReport, HotPathReport) {
+    probe_http1_tail(
+        "hotpath_http1_fixed_body_close_tail",
+        "hotpath_http1_fixed_body_close_tail_traced",
+        vec![b'x'; HTTP_FIXED_BODY_BYTES],
+        1,
+        HTTP_FIXED_BODY_BYTES,
+    )
+}
+
 fn probe_http1_close() -> HotPathReport {
     probe_http1(
         "hotpath_http1_close_request",
@@ -845,6 +1088,53 @@ fn hotpath_probes_report_and_stay_bounded() {
     let http_keepalive = probe_http1_keepalive();
     let http_fixed_body = probe_http1_fixed_body();
     let http_steady = probe_http1_keepalive_steady_state();
+
+    // Tail rows: each key path in untraced + traced flavor. The untraced row is
+    // the honest distribution headline; the traced row carries the observer's
+    // own cost so the delta is visible. Same path, distinct labels + `traced`
+    // flag so the two can never be confused in history.
+    let (call_blocking_tail, call_blocking_tail_traced) = probe_call_blocking_tail();
+    let (http_close_tail, http_close_tail_traced) = probe_http1_close_tail();
+    let (http_fixed_tail, http_fixed_tail_traced) = probe_http1_fixed_body_close_tail();
+    let (http_steady_tail, http_steady_tail_traced) = probe_http1_keepalive_steady_state_tail();
+
+    let tail_rows = [
+        &call_blocking_tail,
+        &call_blocking_tail_traced,
+        &http_close_tail,
+        &http_close_tail_traced,
+        &http_fixed_tail,
+        &http_fixed_tail_traced,
+        &http_steady_tail,
+        &http_steady_tail_traced,
+    ];
+    for report in tail_rows {
+        println!("{}", report.summary_line());
+        println!("{}", report.json_line());
+        assert!(!report.stages.is_empty(), "tail stage breakdown present");
+        assert!(
+            report.scheduler_gap_threshold_ns == GAP_THRESHOLD_NS,
+            "tail row carries the gap threshold: {}",
+            report.label
+        );
+        assert!(report.p99_ns >= report.p50_ns, "p99 >= p50: {}", report.label);
+        assert!(report.p90_ns >= report.p50_ns, "p90 >= p50: {}", report.label);
+    }
+    // Traced and untraced rows for the same path must be distinguishable: both
+    // a distinct label and the `traced` flag.
+    for (untraced, traced) in [
+        (&call_blocking_tail, &call_blocking_tail_traced),
+        (&http_close_tail, &http_close_tail_traced),
+        (&http_fixed_tail, &http_fixed_tail_traced),
+        (&http_steady_tail, &http_steady_tail_traced),
+    ] {
+        assert!(!untraced.traced, "untraced flag: {}", untraced.label);
+        assert!(traced.traced, "traced flag: {}", traced.label);
+        assert_ne!(
+            untraced.label, traced.label,
+            "traced/untraced labels must differ"
+        );
+    }
 
     for report in [
         &try_send,

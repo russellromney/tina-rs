@@ -265,3 +265,45 @@ Current verdict:
 - process allocation rows are better than before but still not production
   proof;
 - Linux/x86 rows still need repeated evidence before public performance claims.
+
+## Phase 150 scheduler/turn/tail rows
+
+This pass measures distribution shape, not just the median, and chases
+scheduler cost rather than one more buffer reserve.
+
+Tail rows. Hotpath reports now carry `p90_ns`/`p99_ns`, the
+`p90_over_p50` / `p99_over_p50` / `range_over_p50` per-mille ratios, a
+`scheduler_gap_threshold_ns` / `scheduler_gap_count` / `max_scheduler_gap_ns`
+trio (gaps are inter-event stages above the threshold), and a `traced` flag.
+Each key path emits a traced and an untraced `*_tail` row, so the observer's
+own cost is visible and never folded into the headline. JSON schema is
+`tina.hotpath.v2`; every v1 field is retained.
+
+Host-call fast lane. `call_blocking` now travels a typed `ThreadedCommand`
+variant instead of a boxed worker closure, so warmed `hotpath_call_blocking`
+drops from host=2/process=6 to **host=1/process=5** allocations. The one
+remaining host allocation is the type-erased begin task for the shared
+dispatcher. `CALL_HOST_ALLOCATIONS_CEILING` is pinned at 2 to catch a
+regression.
+
+Linux/x86 evidence (Fly performance-2x, dedicated CPU; saved in the phase dir
+`perf_sample_linux.txt`). Warmed `hotpath_call_blocking_tail` p50 about
+25.7 µs -> 13.5-15.1 µs across two runs, host alloc 2 -> 1; HTTP rows steady at
+~1.17 ms. Local/alpha, single machine, not a production claim.
+
+The dominant HTTP cost is a wakeup gap, not work. The
+`hotpath_http1_close_request` p50 (~1.17 ms) is almost entirely one stage,
+`host_submit -> mbox_accepted` (~1.09 ms): the worker re-polls the I/O loop on
+a timer instead of waking on socket readiness, so an incoming connection waits
+up to the park interval. `hotpath_call_blocking`'s same stage is ~12 µs,
+because a host command wakes the worker immediately. A controlled
+single-machine sweep (the opt-in `TINA_PERF_IDLE_REPOLL_US` env knob on the
+hotpath probe; rows in `idle_repoll_ab_linux.txt`) shows the gap tracking the
+park interval almost exactly — 1 ms -> http close p50 1.16 ms, 100 µs ->
+0.23 ms (~5x). Lowering `idle_repoll_interval` is a shipped stopgap; the real
+fix (a readiness-driven worker park that blocks on the I/O loop and a command
+doorbell, removing the re-poll entirely) is the named next performance pass.
+
+Current verdict: the host/service path improved on Linux and the allocation
+floor dropped; HTTP is gated by the re-poll wakeup gap, which is diagnosed,
+quantified, and queued — not a production performance claim.

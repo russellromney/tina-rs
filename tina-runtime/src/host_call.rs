@@ -218,6 +218,13 @@ where
         self.trace_observer = observer;
     }
 
+    /// Sets the per-step backend completion drain budget (>= 1). The live
+    /// worker wires this from `ThreadedRuntimeConfig`; the explicit-step
+    /// runtime and the simulator keep the deterministic default.
+    pub fn set_driver_completion_drain_budget(&mut self, budget: usize) {
+        self.driver_completion_drain_budget = budget.max(1);
+    }
+
     /// Attempts to deliver `message` to a registered isolate.
     ///
     /// This is the runtime-side ingress surface for tests and later drivers.

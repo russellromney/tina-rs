@@ -4,6 +4,37 @@ This file records completed work.
 
 ## Unreleased
 
+### Scheduler, Turn, and Tail Performance
+
+- Tail-aware hotpath rows: reports now carry p90/p99 alongside p50, the
+  p90-over-p50 / p99-over-p50 / range-over-p50 per-mille ratios, a
+  scheduler-gap threshold/count and max gap, and a `traced` flag. Each key path
+  emits a traced and an untraced `*_tail` row so observer overhead is visible
+  and never confused with runtime cost. `perf_record.sh` records the new
+  fields; old rows still parse.
+- Bounded worker hot-drain: the shard worker drains in an explicit burst capped
+  by rounds and elapsed time, re-polling the command queue between bursts so a
+  flood of always-progressing local work cannot hide a command or shutdown. A
+  pending-work-aware park services a pending timer or I/O at a short re-poll
+  interval while a fully idle worker parks longer; defaults preserve prior
+  behaviour.
+- Bounded backend completion drain: the driver-advance layer no longer drains
+  every ready completion in one unbounded batch. Completions are delivered in a
+  deterministic FIFO up to a per-step budget; the remainder carries over,
+  preserving order, failure truth, and accounting.
+- Host-call fast lane: `call_blocking` routes through a typed worker command
+  instead of a boxed closure, cutting one host allocation per call (warmed
+  `hotpath_call_blocking` host allocations 2 -> 1, process 6 -> 5) while
+  preserving Full/Closed/Timeout/Rejected truth and bounded admission.
+- Linux/x86 evidence: warmed `call_blocking` p50 improved on a dedicated-CPU
+  cloud box (about 25.7us -> ~14us across runs), with HTTP rows steady. A
+  controlled single-machine sweep showed the HTTP hot path is dominated by the
+  worker re-polling the I/O loop on a timer rather than by request work —
+  shrinking that re-poll interval cuts HTTP p50 about 5x. The
+  readiness-driven worker park that removes the re-poll entirely is the named
+  next performance pass. All numbers are local/alpha evidence on a single
+  machine, not a production performance claim.
+
 ### Structural HTTP/Runtime Performance
 
 - Moved perf history defaults to Phase 149 and added hotpath counters that

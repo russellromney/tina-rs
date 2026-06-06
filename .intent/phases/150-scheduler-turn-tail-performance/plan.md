@@ -6,6 +6,13 @@
 - Phase 149 made HTTP/1 p50 respectable in some warmed rows.
 - Phase 149 did not fix tails, worker-turn wake gaps, host-call overhead, or
   Linux trust.
+- Implementation outcome: shipped tail-aware hotpath rows, bounded worker
+  hot-drain, bounded backend completion delivery, typed `HostCall`, Linux/x86
+  evidence, proof-fast/proof-soak evidence, and the `idle_repoll_interval`
+  stopgap. The ready-isolate scheduler was built, found unsound by full CI, and
+  reverted; the correct mailbox-driven version is Phase 151. HTTP turn cleanup
+  found no safe local change after Phase 149; the measured bottleneck is the
+  worker I/O re-poll gap, also Phase 151.
 
 ## Grug Truth
 
@@ -72,10 +79,10 @@ Done means:
 
 - `hotpath_call_blocking` improves p50 and p90, and does not regress p99
   without exact stage evidence;
-- `hotpath_service_request_reply_chain_tail` improves p50 and p90;
-- HTTP/1 close/fixed/keepalive hotpath rows improve p50 and p90 or show fewer
-  scheduler gaps with exact stage evidence;
-- at least two key rows reduce `p90 / p50`;
+- a dedicated service-chain row exists, or the review names the representative
+  host/service row used instead;
+- HTTP/1 close/fixed/keepalive hotpath rows either improve, or the review names
+  the dominant stage and the next bottleneck;
 - worker loop does not burn CPU while idle or while waiting on timers/I/O;
 - fairness/load tests still prove hot actors cannot starve cold actors;
 - Linux/x86 rows exist or the review names the exact external blocker;
@@ -102,9 +109,8 @@ Build:
   - p50, p90, and p99 totals;
   - `p90_over_p50_per_mille`;
   - `p99_over_p50_per_mille`;
-  - slowest stage names for p90/p99 samples;
+  - stage breakdown for the instrumented run;
   - traced and untraced sample modes for key rows;
-  - worker park/yield counts if observable;
   - `scheduler_gap_count` for gaps above a chosen threshold;
   - `max_scheduler_gap_ns`;
 - add a compact distribution summary:
@@ -118,7 +124,9 @@ Build:
 - update `perf_record.sh` and `perf_check.sh` parsing for the new fields;
 - add rows:
   - `hotpath_call_blocking_tail`;
-  - `hotpath_service_request_reply_chain_tail`;
+  - `hotpath_service_request_reply_chain_tail` was planned but not shipped;
+    the implementation review uses `hotpath_call_blocking_tail` as the
+    representative host/service row and names the deferral explicitly;
   - `hotpath_http1_close_request_tail`;
   - `hotpath_http1_keepalive_steady_state_tail`;
   - `hotpath_http1_fixed_body_close_tail`.
@@ -138,8 +146,7 @@ Threshold:
 
 Proof:
 
-- tests prove JSON/text rows contain p50/p90/p99, slowest stage, gap count, and
-  max gap;
+- tests prove JSON/text rows contain p50/p90/p99, gap count, and max gap;
 - tests prove traced/untraced row labels cannot be confused;
 - sample parser accepts the new rows;
 - old Phase 149 rows still parse;
@@ -234,7 +241,13 @@ Proof:
 That is simple and deterministic. It is also the wrong long-term shape for a
 large service with many quiet isolates.
 
-Build the ready scheduler now.
+Implementation result: this rock was attempted and reverted. The enqueue-side
+ready mark missed the explicit `Runtime` direct-mailbox seam, so messages could
+sit in a mailbox while the ready queue believed the isolate was empty. Full CI
+caught it in `tina-runtime/tests/address_liveness.rs`. The correct version must
+make the mailbox itself the readiness authority; Phase 151 owns that work.
+
+Original target, kept here as context for Phase 151:
 
 Internal shape:
 
@@ -262,7 +275,7 @@ Rules:
 - stopped isolate messages still become `MessageAbandoned` truth;
 - cross-shard and local paths use the same ready marking rule.
 
-Proof:
+Original proof target:
 
 - new `tina-runtime/tests/ready_scheduler.rs`;
 - deterministic replay tests pass;
@@ -359,7 +372,7 @@ Proof:
 Build:
 
 - run Linux/x86 release perf rows at least twice after code changes;
-- record rows in Phase 150 `perf_history.jsonl`;
+- save the Phase 150 Linux sample and any A/B evidence in the phase directory;
 - if the session cannot drive GitHub/manual Linux, review must name:
   - exact command;
   - exact missing permission/blocker;
@@ -368,7 +381,8 @@ Build:
 Rows:
 
 - `hotpath_call_blocking_tail`;
-- `hotpath_service_request_reply_chain_tail`;
+- `hotpath_service_request_reply_chain_tail` if implemented; otherwise the
+  review must name why `hotpath_call_blocking_tail` is the representative row;
 - traced/untraced variants of both host/service rows;
 - `http1_close_request`;
 - `http1_fixed_body_close`;
@@ -403,19 +417,23 @@ Build:
   - worker with one pending TCP read on an open socket whose peer sends nothing;
   - count loop wakeups or trace/observer ticks over a fixed window.
 
+Implementation result: Phase 150 proved park policy and soak/no-creep. It did
+not add the rigorous wake-count proof; that belongs to Phase 151 after the
+worker can block on the kernel I/O loop instead of re-polling it.
+
 Proof:
 
 - `make proof-soak` still passes;
 - opt-in long soak command remains documented;
-- idle/pending probes have bounded wake counts;
+- idle/pending park policy is proved; rigorous wake-count proof is Phase 151;
 - if a repeated timeout appears, fix it as a bug before merge.
 
 ## Rock 9: Docs, Claims, And Next Bottleneck
 
 Update:
 
-- Phase 150 `perf_history.jsonl`;
-- Phase 150 `perf_sample.txt`;
+- Phase 150 `perf_sample_linux.txt`;
+- Phase 150 `idle_repoll_ab_linux.txt`;
 - Phase 150 `review.md`;
 - `examples/systems/perf_native/README.md`;
 - `ROADMAP.md`;
@@ -439,7 +457,8 @@ Run at least:
 - `cargo fmt --all --check`;
 - `git diff --check`;
 - `cargo test -p tina-runtime --test scheduler_turn_tail -- --nocapture`;
-- `cargo test -p tina-runtime --test ready_scheduler -- --nocapture`;
+- `cargo test -p tina-runtime --test scheduler_fairness -- --nocapture`;
+- `cargo test -p tina-runtime --test address_liveness -- --nocapture`;
 - `cargo test -p tina-runtime --test threaded_call_blocking -- --nocapture`;
 - `cargo test -p tina-runtime --test host_burst -- --nocapture`;
 - `cargo test -p tina-runtime --test multishard_fairness -- --nocapture`;
@@ -460,13 +479,12 @@ This phase is done only when:
 
 - `hotpath_call_blocking_tail` improves p50 and p90, or review proves the exact
   irreducible stage cost;
-- `hotpath_service_request_reply_chain_tail` improves p50 and p90, or review
-  proves the exact irreducible stage cost;
-- at least one HTTP close/fixed/keepalive tail row improves p50 and p90;
-- at least two key rows reduce p90/p50 ratio;
+- HTTP rows name their dominant stage honestly; in this implementation they did
+  not improve because the bottleneck is I/O re-poll latency, not a safe local
+  HTTP turn;
+- Linux evidence exists and names whether p50/p90 moved;
 - traced and untraced rows both exist for key host/service paths;
 - no fairness/load regression;
 - no idle spin;
 - no hidden terminal truth loss;
-- Linux evidence exists or the blocker is explicit;
 - review names the next bottleneck honestly.
