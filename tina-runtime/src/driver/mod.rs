@@ -1454,6 +1454,7 @@ mod tests {
     mod unix_lane {
         use super::*;
         use crate::call::{UnixListenerId, UnixStreamId};
+        use std::os::unix;
         use std::sync::atomic::AtomicU64;
 
         fn unique_sock(label: &str) -> std::path::PathBuf {
@@ -1519,11 +1520,13 @@ mod tests {
             }
         }
 
-        /// Binds, accepts, and connects to produce a live server/client stream
-        /// pair through the substrate.
+        /// Binds, accepts, and connects an external peer to produce a live
+        /// server stream through the substrate. These close/read tests are
+        /// about server-stream lane behavior; UnixConnect has its own proof, so
+        /// the helper avoids coupling them to same-loop accept/connect ordering.
         fn connected_pair(
             driver: &mut BetelgeuseDriver,
-        ) -> (UnixListenerId, UnixStreamId, UnixStreamId) {
+        ) -> (UnixListenerId, UnixStreamId, unix::net::UnixStream) {
             let (listener, path) = bind_listener_with_path(driver, 100);
             assert!(
                 driver
@@ -1534,18 +1537,9 @@ mod tests {
                     )
                     .is_none()
             );
-            assert!(
-                driver
-                    .submit(
-                        CallId::new(102),
-                        CallInput::UnixConnect { path: path.clone() },
-                        Instant::now()
-                    )
-                    .is_none()
-            );
+            let client = unix::net::UnixStream::connect(&path).expect("connect external peer");
             let completed = advance_until(driver, |all| {
                 all.iter().any(|c| c.call_id == CallId::new(101))
-                    && all.iter().any(|c| c.call_id == CallId::new(102))
             });
             let server = completed
                 .iter()
@@ -1555,16 +1549,7 @@ mod tests {
                     }
                     _ => None,
                 })
-                .expect("accept produced a server stream");
-            let client = completed
-                .iter()
-                .find_map(|c| match (&c.call_id, &c.result) {
-                    (id, CallOutput::UnixConnected { stream }) if *id == CallId::new(102) => {
-                        Some(*stream)
-                    }
-                    _ => None,
-                })
-                .expect("connect produced a client stream");
+                .unwrap_or_else(|| panic!("accept produced no server stream: {completed:?}"));
             (listener, server, client)
         }
 
