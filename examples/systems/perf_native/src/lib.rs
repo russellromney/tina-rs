@@ -1600,7 +1600,7 @@ fn native_sampled(row: fn() -> anyhow::Result<PerfReport>) -> anyhow::Result<Per
     for _ in 0..SAMPLES {
         reports.push(row()?);
     }
-    Ok(median_report(reports))
+    Ok(median_report(reports).with_samples(SAMPLES, "median_p50_after_warmup"))
 }
 
 // ---- HTTP/2 (h2c) ----------------------------------------------------------

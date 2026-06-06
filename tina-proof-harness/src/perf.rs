@@ -59,6 +59,8 @@ pub struct PerfReport {
     pub load: LoadReport,
     pub allocation_scope: &'static str,
     pub allocations: Option<PerfAllocationReport>,
+    pub samples: usize,
+    pub sample_policy: &'static str,
 }
 
 impl PerfReport {
@@ -71,6 +73,8 @@ impl PerfReport {
             load,
             allocation_scope: "none",
             allocations: None,
+            samples: 1,
+            sample_policy: "single",
         }
     }
 
@@ -88,16 +92,26 @@ impl PerfReport {
             load,
             allocation_scope: allocations.scope,
             allocations: Some(allocations),
+            samples: 1,
+            sample_policy: "single",
         }
+    }
+
+    pub fn with_samples(mut self, samples: usize, sample_policy: &'static str) -> Self {
+        self.samples = samples;
+        self.sample_policy = sample_policy;
+        self
     }
 
     /// One-line key=value shape for humans, CI logs, and grep.
     pub fn summary_line(&self) -> String {
         format!(
-            "perf label={} kind={} comparison_baseline={} {} {} {}",
+            "perf label={} kind={} comparison_baseline={} samples={} sample_policy={} {} {} {}",
             report_value(self.label),
             report_value(self.kind),
             self.comparison_baseline,
+            self.samples,
+            report_value(self.sample_policy),
             self.env.summary_fields(),
             self.load.summary_line(),
             self.allocation_summary_fields(),
@@ -109,10 +123,12 @@ impl PerfReport {
     /// for alpha consumers.
     pub fn json_line(&self) -> String {
         format!(
-            "{{\"schema\":\"tina.perf_report.v1\",\"label\":{},\"kind\":{},\"comparison_baseline\":{},\"platform\":{},\"arch\":{},\"profile\":{},\"git_sha\":{},\"workers\":{},\"ops\":{},\"ok\":{},\"err\":{},\"timeout\":{},\"p50_us\":{},\"p90_us\":{},\"p99_us\":{},\"max_us\":{},\"p50_ns\":{},\"p90_ns\":{},\"p99_ns\":{},\"max_ns\":{},\"elapsed_ms\":{},\"leak_clean\":{},\"pressure_total\":{},\"pressure_rate_per_mille\":{},\"surfaces\":{},\"unavailable_surfaces\":{},\"allocation_scope\":{},\"allocations\":{},\"allocated_bytes\":{}}}",
+            "{{\"schema\":\"tina.perf_report.v1\",\"label\":{},\"kind\":{},\"comparison_baseline\":{},\"samples\":{},\"sample_policy\":{},\"platform\":{},\"arch\":{},\"profile\":{},\"git_sha\":{},\"workers\":{},\"ops\":{},\"ok\":{},\"err\":{},\"timeout\":{},\"p50_us\":{},\"p90_us\":{},\"p99_us\":{},\"max_us\":{},\"p50_ns\":{},\"p90_ns\":{},\"p99_ns\":{},\"max_ns\":{},\"elapsed_ms\":{},\"leak_clean\":{},\"pressure_total\":{},\"pressure_rate_per_mille\":{},\"surfaces\":{},\"unavailable_surfaces\":{},\"allocation_scope\":{},\"allocations\":{},\"allocated_bytes\":{}}}",
             json_string(self.label),
             json_string(self.kind),
             json_string(self.comparison_baseline),
+            self.samples,
+            json_string(self.sample_policy),
             json_string(self.env.platform),
             json_string(self.env.arch),
             json_string(&self.env.profile),
@@ -704,7 +720,37 @@ fn detect_git_sha() -> String {
     if !output.status.success() {
         return "unknown".to_string();
     }
-    String::from_utf8_lossy(&output.stdout).trim().to_string()
+    let mut sha = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if git_tree_is_dirty() {
+        sha.push_str("-dirty");
+    }
+    sha
+}
+
+fn git_tree_is_dirty() -> bool {
+    let dirty_worktree = Command::new("git")
+        .args(["diff", "--quiet", "--ignore-submodules", "--", "."])
+        .status()
+        .map(|status| !status.success())
+        .unwrap_or(false);
+    let dirty_index = Command::new("git")
+        .args([
+            "diff",
+            "--cached",
+            "--quiet",
+            "--ignore-submodules",
+            "--",
+            ".",
+        ])
+        .status()
+        .map(|status| !status.success())
+        .unwrap_or(false);
+    let has_untracked = Command::new("git")
+        .args(["ls-files", "--others", "--exclude-standard"])
+        .output()
+        .map(|output| !output.stdout.is_empty())
+        .unwrap_or(false);
+    dirty_worktree || dirty_index || has_untracked
 }
 
 fn report_value(value: &str) -> String {
@@ -759,6 +805,8 @@ mod tests {
         let line = report.summary_line();
         assert!(line.starts_with("perf "), "{line}");
         assert!(line.contains("comparison_baseline=none"), "{line}");
+        assert!(line.contains("samples=1"), "{line}");
+        assert!(line.contains("sample_policy=single"), "{line}");
         assert!(line.contains("p50_us="), "{line}");
         assert!(line.contains("pressure total=0"), "{line}");
         assert!(
@@ -786,6 +834,8 @@ mod tests {
         );
         assert!(json.contains("\"label\":\"needs quoting\""), "{json}");
         assert!(json.contains("\"comparison_baseline\":\"none\""), "{json}");
+        assert!(json.contains("\"samples\":1"), "{json}");
+        assert!(json.contains("\"sample_policy\":\"single\""), "{json}");
         assert!(json.contains("\"pressure_total\":2"), "{json}");
         assert!(json.contains("\"allocation_scope\":\"none\""), "{json}");
         assert!(json.contains("\"allocations\":null"), "{json}");

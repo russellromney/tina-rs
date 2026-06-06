@@ -18,7 +18,7 @@
 # field the row's flat line exposes) plus ops/ok and the per-op host allocation
 # count:
 #
-#   {"kind":"native", "timestamp":..., ..., "label":..., "row_kind":..., "p50_us":..., "p90_us":..., "p99_us":..., "ops":..., "ok":..., "allocations":..., "allocated_bytes":...}
+#   {"kind":"native", "timestamp":..., ..., "label":..., "row_kind":..., "samples":..., "sample_policy":..., "p50_us":..., "p90_us":..., "p99_us":..., "ops":..., "ok":..., "allocations":..., "allocated_bytes":...}
 #
 # Usage:
 #   ./scripts/perf_record.sh            # append latest run
@@ -143,6 +143,8 @@ emit_native_lines() {
     [[ -z $line ]] && continue
     label=$(grep -oE 'label=[a-z0-9_]+' <<< "$line" | head -1 | cut -d= -f2 || true)
     row_kind=$(grep -oE ' kind=[a-z_]+' <<< "$line" | head -1 | cut -d= -f2 || true)
+    samples=$(grep -oE ' samples=[0-9]+' <<< "$line" | head -1 | cut -d= -f2 || true)
+    sample_policy=$(grep -oE ' sample_policy=[a-zA-Z0-9_]+' <<< "$line" | head -1 | cut -d= -f2 || true)
     p50=$(grep -oE 'p50_us=[0-9]+' <<< "$line" | head -1 | cut -d= -f2 || true)
     p90=$(grep -oE 'p90_us=[0-9]+' <<< "$line" | head -1 | cut -d= -f2 || true)
     p99=$(grep -oE 'p99_us=[0-9]+' <<< "$line" | head -1 | cut -d= -f2 || true)
@@ -158,8 +160,8 @@ emit_native_lines() {
       *) continue ;;
     esac
     if [[ -n $label && -n $p50 ]]; then
-      printf '{"kind":"native","timestamp":"%s","git_sha":"%s","platform":"%s","arch":"%s","profile":"%s","label":"%s","row_kind":"%s","p50_us":%s,"p90_us":%s,"p99_us":%s,"ops":%s,"ok":%s,"allocations":%s,"allocated_bytes":%s}\n' \
-        "$timestamp" "$git_sha" "$platform" "$arch" "$profile" "$label" "${row_kind:-unknown}" "$p50" "${p90:-null}" "${p99:-null}" "${ops:-null}" "${ok:-null}" "${allocs:-null}" "${allocated_bytes:-null}"
+      printf '{"kind":"native","timestamp":"%s","git_sha":"%s","platform":"%s","arch":"%s","profile":"%s","label":"%s","row_kind":"%s","samples":%s,"sample_policy":"%s","p50_us":%s,"p90_us":%s,"p99_us":%s,"ops":%s,"ok":%s,"allocations":%s,"allocated_bytes":%s}\n' \
+        "$timestamp" "$git_sha" "$platform" "$arch" "$profile" "$label" "${row_kind:-unknown}" "${samples:-null}" "${sample_policy:-unknown}" "$p50" "${p90:-null}" "${p99:-null}" "${ops:-null}" "${ok:-null}" "${allocs:-null}" "${allocated_bytes:-null}"
     fi
   done < <(grep -E '^perf ' <<< "$output" || true)
 }

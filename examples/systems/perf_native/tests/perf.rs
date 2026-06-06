@@ -1,10 +1,20 @@
 use perf_native::{
     http_body_pressure_probe, run_all, run_native_rows, websocket_capacity_fill_probe,
 };
+use std::sync::{Mutex, MutexGuard};
 use tina_proof_harness::SemanticMatch;
+
+static PERF_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+fn perf_test_guard() -> MutexGuard<'static, ()> {
+    PERF_TEST_LOCK
+        .lock()
+        .expect("perf tests must serialize process-wide counters")
+}
 
 #[test]
 fn native_perf_comparison_rows_are_printable_and_bounded() {
+    let _guard = perf_test_guard();
     let reports = run_all().expect("run native perf comparisons");
     assert_eq!(reports.len(), 9);
     let labels: Vec<_> = reports.iter().map(|report| report.label).collect();
@@ -112,6 +122,7 @@ fn native_perf_comparison_rows_are_printable_and_bounded() {
 
 #[test]
 fn native_protocol_rows_are_printable_and_bounded() {
+    let _guard = perf_test_guard();
     let reports = run_native_rows().expect("run native protocol rows");
     let labels: Vec<_> = reports.iter().map(|report| report.label).collect();
     assert_eq!(
@@ -174,6 +185,21 @@ fn native_protocol_rows_are_printable_and_bounded() {
             "native row is Tina-only (no fake baseline): {}",
             report.label,
         );
+        assert_eq!(
+            report.samples, 5,
+            "native row reports median-of-five samples for {}",
+            report.label,
+        );
+        assert!(
+            line.contains("samples=5"),
+            "native row line carries sample count for {}",
+            report.label,
+        );
+        assert!(
+            line.contains("sample_policy=median_p50_after_warmup"),
+            "native row line carries sample policy for {}",
+            report.label,
+        );
         assert!(
             report.load.ops_ok > 0,
             "native row must do useful work: {}",
@@ -222,11 +248,22 @@ fn native_protocol_rows_are_printable_and_bounded() {
             "native row json schema: {}",
             report.label,
         );
+        assert!(
+            json.contains("\"samples\":5"),
+            "native row json carries sample count: {}",
+            report.label,
+        );
+        assert!(
+            json.contains("\"sample_policy\":\"median_p50_after_warmup\""),
+            "native row json carries sample policy: {}",
+            report.label,
+        );
     }
 }
 
 #[test]
 fn websocket_capacity_fill_probe_reports_typed_pressure() {
+    let _guard = perf_test_guard();
     let report = websocket_capacity_fill_probe().expect("run websocket capacity fill probe");
     println!("{}", report.summary_line());
 
@@ -248,6 +285,7 @@ fn websocket_capacity_fill_probe_reports_typed_pressure() {
 
 #[test]
 fn http_body_pressure_probe_reports_full_and_drained() {
+    let _guard = perf_test_guard();
     let report = http_body_pressure_probe().expect("run HTTP body pressure probe");
     println!("{}", report.summary_line());
     for surface in &report.surface_plateaus {

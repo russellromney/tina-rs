@@ -240,3 +240,34 @@ Status:
 
 - The PR is still not merge-ready by the Phase 152 plan because Linux/x86
   release evidence remains missing.
+
+## Implementation Review 4 (deeper performance-evidence pass)
+
+Findings fixed in this pass:
+
+- [P2] Native protocol rows were sampled with the same warmup +
+  median-of-five policy as comparison rows, but the emitted `perf` line and
+  JSON did not carry `samples` or `sample_policy`. That made the row evidence
+  depend on README prose rather than machine-readable output. Fixed:
+  `PerfReport` now carries `samples` / `sample_policy` with a default
+  `single`, `native_sampled` marks protocol rows as
+  `median_p50_after_warmup`, and `scripts/perf_record.sh` records those fields
+  for `native` rows.
+- [P3] `PerfReport::detect()` printed a clean `git_sha` even when the checkout
+  was dirty; `perf_record.sh` already appended `-dirty`. Direct test JSON could
+  therefore look cleaner than the exact tree that produced it. Fixed:
+  `PerfReport::detect()` now applies the same dirty-index/worktree/untracked
+  check, while still honoring `TINA_PERF_GIT_SHA` for explicit overrides.
+- [P2] The `examples/systems/perf_native` `perf.rs` test binary had four tests
+  that Rust could run concurrently. That contaminates the process-wide
+  allocation/RSS counters and can interleave native protocol rows with HTTP
+  comparison rows, turning the evidence into noise. Fixed: every perf test in
+  that binary takes one shared `Mutex` guard, so the public row assertions,
+  pressure probes, and native protocol rows run one at a time even under the
+  default parallel test harness.
+
+Proof after fixes:
+
+- `cargo test -p tina-proof-harness perf_report -- --nocapture`
+- `cargo test --release --manifest-path examples/systems/perf_native/Cargo.toml --test perf native_protocol_rows_are_printable_and_bounded -- --nocapture`
+- `cargo test --release --manifest-path examples/systems/perf_native/Cargo.toml --test perf -- --nocapture`
