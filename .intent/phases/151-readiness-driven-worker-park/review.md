@@ -200,3 +200,55 @@ supervision/restart paths require). Building a mailbox-owned ready queue would
 need an empty->non-empty notification that is also correct for the direct-push
 seam, and the warmed hot paths have ~3 isolates, so there is no measured scan
 cost to justify it. Recorded as skip-empty-is-enough, per plan.
+
+## Hostile self-review
+
+Attacked my own work for missed wakeups, hidden blocking, fake boundedness, DST
+drift, platform lies, and happy-path-only tests.
+
+- Missed wakeups. Three real races were found and fixed, each with a guard:
+  (1) macOS `drain_queued` completes loopback ops inline — the park must not
+  block when it made progress; (2) cross-lane harvest theft on the shared loop —
+  a completion surfaced by one lane and executed by another was left
+  unharvested, fixed by a harvest-only TCP/Unix pass at the end of `advance`;
+  (3) park-gating — the worker could block forever on pending work the loop
+  could not observe, fixed by `park_needs_repoll` forcing a re-poll when there
+  is pending work but no armed loop op and no deadline. Guards:
+  `command_admitted_around_park_is_never_missed`, the pending-read proof,
+  `grpc_streaming_peer_reset_cancels_response_source` (was ~1/80, now 400/400),
+  full `grpc_live` single-threaded.
+
+- Hidden blocking. The only blocking send is the control-plane `call()`
+  (register/supervise/observe), never the per-request hot path. It cannot
+  deadlock against a parked worker: the worker parks only with an empty command
+  queue, and every admitted command rings the coalescing doorbell, so the worker
+  always wakes and drains enough to free a slot. `try_send` / `call_blocking`
+  stay non-blocking and return typed `Full`/`Disconnected`.
+
+- Fake boundedness. The command queue is the same bounded `sync_channel`; the
+  doorbell adds no queue. `park_needs_repoll`'s catch-all caps at
+  `idle_repoll_interval` and is self-clearing (the next `step` harvests the
+  pending work), so it is a bounded re-poll, not a busy spin.
+
+- DST drift. The blocking park and doorbell are live-only; the simulator never
+  calls `step_blocking`. Skip-empty is byte-identical. Fingerprint + saved
+  replay cases pass unchanged.
+
+- Platform honesty. The Linux io_uring `step_blocking`/eventfd path cannot run
+  in the local macOS suite. It was exercised on real Linux/x86 by the Fly perf
+  binary, which drives the full HTTP path (connect/accept/read/write/close) over
+  the blocking io_uring park and produced correct rows — so the Linux park is
+  validated end-to-end for HTTP, though the full DST/test matrix on Linux is
+  CI's job, not this box's.
+
+- Happy-path. The proofs cover idle (~0 wakeups), pending read (~0 wakeups then
+  prompt), command stress, pre-wake race, simulated no-spin, skip-empty at
+  scale, cancel/reset, and DST. The one residual is the harvest race: it has no
+  deterministic unit test (a second `advance` always reaps it at the driver
+  level; it only manifests at the worker block-forever park), so the integration
+  tests are its guard.
+
+- Scope. Multi-shard keeps its command-queue park (its cross-shard inbound
+  arrives off the loop); the readiness park is single-shard this phase. The
+  `idle_repoll_interval` / `idle_wait` knobs are vestigial for the single-shard
+  park (kept as accepted config).
