@@ -319,6 +319,9 @@ impl<T> tina::Mailbox<T> for MatrixMailbox<T> {
     fn recv(&self) -> Option<T> {
         self.queue.lock().expect("queue lock").pop_front()
     }
+    fn is_empty(&self) -> bool {
+        self.queue.lock().expect("queue lock").is_empty()
+    }
 
     fn close(&self) {
         *self.closed.lock().expect("closed lock") = true;

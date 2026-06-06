@@ -38,7 +38,8 @@ use crate::observer::TraceObserver;
 use crate::sharded::ReplyAdapter;
 use crate::shutdown::{SharedShutdownState, ShutdownWorker, ThreadedShutdownHandle, handle_for};
 use crate::threaded::{
-    ThreadedCommand, ThreadedRuntimeConfig, deliver_shutdown_signal_and_drain, run_host_call,
+    CommandSender, ThreadedCommand, ThreadedRuntimeConfig, deliver_shutdown_signal_and_drain,
+    run_host_call,
 };
 use crate::trace::{RuntimeEvent, SendRejectedReason};
 use crate::{
@@ -58,7 +59,10 @@ where
     S: Shard + Send + 'static,
     F: MailboxFactory + Send + Clone + 'static,
 {
-    commands: BTreeMap<ShardId, std::sync::mpsc::SyncSender<ThreadedCommand<S, F>>>,
+    // Multi-shard workers park on their command queue (`recv_timeout`) and
+    // wake on the mpsc directly, so they carry no io_loop doorbell (`waker:
+    // None`). The readiness-driven io_loop park is single-shard only for now.
+    commands: BTreeMap<ShardId, CommandSender<S, F>>,
     shard_metrics: BTreeMap<ShardId, Arc<LiveShardMetrics>>,
     remote_metrics: BTreeMap<(ShardId, ShardId), Arc<LiveQueueMetrics>>,
     shutdown: Arc<SharedShutdownState<S, F>>,
@@ -192,7 +196,7 @@ where
                 ..config
             };
             let (sender, receiver) = std::sync::mpsc::sync_channel(config.command_capacity);
-            commands.insert(shard.id(), sender);
+            commands.insert(shard.id(), CommandSender::new(sender, None));
             shard_metrics.insert(
                 shard.id(),
                 Arc::new(LiveShardMetrics::new(
@@ -409,6 +413,7 @@ where
                 Err(ThreadedRegisterBootstrapError::UnknownShard(s))
             }
             Err(ThreadedRuntimeError::DriverShutdownFailed)
+            | Err(ThreadedRuntimeError::DriverParkFailed)
             | Err(ThreadedRuntimeError::CommandFull)
             | Err(ThreadedRuntimeError::HostWaitTimeout) => {
                 // `call_on` is blocking-admission, so `CommandFull` is
@@ -926,6 +931,7 @@ where
     F: MailboxFactory + 'static,
 {
     runtime.remote_child_control_capacity = config.shard_pair_capacity;
+    runtime.enable_blocking_socket_io_for_park();
     // Pin this shard worker (if requested and the platform can). The driver's
     // helper lanes were already spawned when `runtime` was built above, so they
     // inherit the unpinned mask; later per-op helper threads float off the pin.

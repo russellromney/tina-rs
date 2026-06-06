@@ -7,6 +7,8 @@ use std::sync::Arc;
 
 use tina::{Mailbox, TrySendError};
 
+type WakeHook = Arc<dyn Fn() + Send + Sync + 'static>;
+
 /// Runtime-owned mailbox factory for registered and spawned isolate mailboxes.
 ///
 /// The factory lives in `tina-runtime`, not in `tina`, because child
@@ -45,6 +47,7 @@ pub(crate) struct DefaultMailbox<T> {
     capacity: usize,
     queue: Rc<RefCell<VecDeque<T>>>,
     closed: Rc<Cell<bool>>,
+    wake_hook: Rc<RefCell<Option<WakeHook>>>,
 }
 
 impl<T> DefaultMailbox<T> {
@@ -53,6 +56,7 @@ impl<T> DefaultMailbox<T> {
             capacity,
             queue: Rc::new(RefCell::new(VecDeque::with_capacity(capacity))),
             closed: Rc::new(Cell::new(false)),
+            wake_hook: Rc::new(RefCell::new(None)),
         }
     }
 }
@@ -70,12 +74,27 @@ impl<T> Mailbox<T> for DefaultMailbox<T> {
         if queue.len() >= self.capacity {
             return Err(TrySendError::Full(message));
         }
+        let was_empty = queue.is_empty();
         queue.push_back(message);
+        drop(queue);
+        if was_empty {
+            if let Some(wake) = self.wake_hook.borrow().as_ref() {
+                wake();
+            }
+        }
         Ok(())
+    }
+
+    fn set_wake_hook(&self, wake: Option<WakeHook>) {
+        *self.wake_hook.borrow_mut() = wake;
     }
 
     fn recv(&self) -> Option<T> {
         self.queue.borrow_mut().pop_front()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.queue.borrow().is_empty()
     }
 
     fn close(&self) {
@@ -112,6 +131,7 @@ pub(crate) struct DefaultThreadedMailbox<T> {
 pub(crate) struct DefaultThreadedMailboxState<T> {
     queue: VecDeque<T>,
     closed: bool,
+    wake_hook: Option<WakeHook>,
 }
 
 impl<T> DefaultThreadedMailbox<T> {
@@ -121,6 +141,7 @@ impl<T> DefaultThreadedMailbox<T> {
             state: Arc::new(std::sync::Mutex::new(DefaultThreadedMailboxState {
                 queue: VecDeque::with_capacity(capacity),
                 closed: false,
+                wake_hook: None,
             })),
         }
     }
@@ -142,8 +163,21 @@ impl<T> Mailbox<T> for DefaultThreadedMailbox<T> {
         if state.queue.len() >= self.capacity {
             return Err(TrySendError::Full(message));
         }
+        let was_empty = state.queue.is_empty();
         state.queue.push_back(message);
+        let wake = was_empty.then(|| state.wake_hook.clone()).flatten();
+        drop(state);
+        if let Some(wake) = wake {
+            wake();
+        }
         Ok(())
+    }
+
+    fn set_wake_hook(&self, wake: Option<WakeHook>) {
+        self.state
+            .lock()
+            .expect("DefaultThreadedMailbox mutex poisoned")
+            .wake_hook = wake;
     }
 
     fn recv(&self) -> Option<T> {
@@ -152,6 +186,14 @@ impl<T> Mailbox<T> for DefaultThreadedMailbox<T> {
             .lock()
             .expect("DefaultThreadedMailbox mutex poisoned");
         state.queue.pop_front()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.state
+            .lock()
+            .expect("DefaultThreadedMailbox mutex poisoned")
+            .queue
+            .is_empty()
     }
 
     fn close(&self) {

@@ -17,13 +17,25 @@ use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::Path,
     sync::{Arc, Mutex},
+    time::Duration,
 };
 
 use crate::{
-    AcceptCompletion, AcceptOp, ConnectCompletion, ConnectOp, IO, IOFile, IOLoop, IOLoopHandle,
-    IOSocket, OpenOptions, Operation, RecvBufCompletion, RecvCompletion, RecvOp, SendCompletion,
-    SendOp, SendOwnedCompletion,
+    AcceptCompletion, AcceptOp, CondvarDoorbell, ConnectCompletion, ConnectOp, IO, IOFile, IOLoop,
+    IOLoopHandle, IOSocket, IOWaker, OpenOptions, Operation, RecvBufCompletion, RecvCompletion,
+    RecvOp, SendCompletion, SendOp, SendOwnedCompletion,
 };
+
+/// Upper bound on how long the simulated backend parks in `step_blocking`.
+///
+/// The simulated backend has no kernel fd to block on, and simulated I/O
+/// readiness (a test connecting a peer or pushing bytes) does not ring the
+/// doorbell — only host commands do. So a threaded runtime over simulated I/O
+/// re-polls at this cadence: it sleeps (no spin) and wakes either on a host
+/// command (the doorbell) or after this bound to pick up simulated readiness.
+/// `tina-sim` deterministic replay never calls `step_blocking`, so this does
+/// not affect replay determinism.
+const SIMULATED_PARK_CAP: Duration = Duration::from_millis(1);
 
 /// Deterministic simulated I/O backend configuration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -59,6 +71,7 @@ pub enum SimulatedDelay {
 #[derive(Clone)]
 pub struct SimulatedIO {
     state: Arc<Mutex<SimulatedState>>,
+    doorbell: Arc<CondvarDoorbell>,
 }
 
 impl SimulatedIO {
@@ -80,6 +93,7 @@ impl SimulatedIO {
                 listeners_by_addr: BTreeMap::new(),
                 pending: VecDeque::new(),
             })),
+            doorbell: CondvarDoorbell::new(),
         }
     }
 
@@ -649,6 +663,28 @@ impl IOLoop for SimulatedIO {
 
         state.pending = next_pending;
         Ok(progressed)
+    }
+
+    fn step_blocking(&self, timeout: Option<Duration>) -> io::Result<bool> {
+        // First drain anything already ready (mirrors the native backends: a
+        // blocking step still does the full non-blocking submit + harvest).
+        if self.step()? {
+            return Ok(true);
+        }
+        // Nothing ready: sleep (no spin) on the doorbell, capped so simulated
+        // I/O readiness driven by test code is still re-polled. A host command
+        // rings the doorbell and wakes us immediately; otherwise we wake after
+        // the cap and re-drain.
+        let park = match timeout {
+            Some(d) => d.min(SIMULATED_PARK_CAP),
+            None => SIMULATED_PARK_CAP,
+        };
+        self.doorbell.wait(Some(park));
+        self.step()
+    }
+
+    fn waker(&self) -> IOWaker {
+        IOWaker::new(self.doorbell.clone())
     }
 
     fn pending_completion_count(&self) -> usize {

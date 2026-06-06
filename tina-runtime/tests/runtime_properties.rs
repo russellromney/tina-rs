@@ -85,6 +85,9 @@ impl<T> Mailbox<T> for TestMailbox<T> {
     fn recv(&self) -> Option<T> {
         self.inner.borrow_mut().messages.pop_front()
     }
+    fn is_empty(&self) -> bool {
+        self.inner.borrow().messages.is_empty()
+    }
 
     fn close(&self) {
         self.inner.borrow_mut().closed = true;

@@ -47,21 +47,24 @@
 
 use std::fmt;
 use std::mem::MaybeUninit;
+use std::sync::Arc;
 
 use tina::{Mailbox, TrySendError};
 
 use crate::sync::Ordering::{AcqRel, Acquire, Relaxed, Release};
-use crate::sync::{AtomicBool, AtomicUsize, UnsafeCell};
+use crate::sync::{AtomicBool, AtomicUsize, Mutex, UnsafeCell};
 
 #[cfg(feature = "loom")]
 mod sync {
     pub(crate) use loom::cell::UnsafeCell;
+    pub(crate) use loom::sync::Mutex;
     pub(crate) use loom::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 }
 
 #[cfg(not(feature = "loom"))]
 mod sync {
     pub(crate) use std::cell::UnsafeCell;
+    pub(crate) use std::sync::Mutex;
     pub(crate) use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 }
 
@@ -82,6 +85,8 @@ pub struct SpscMailbox<T> {
     // it can stay as a separate guard instead of sharing the producer state
     // word.
     consumer_active: AtomicBool,
+    wake_hook_installed: AtomicBool,
+    wake_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync + 'static>>>,
 }
 
 const STATE_CLOSED: usize = 0b01;
@@ -116,6 +121,8 @@ impl<T> SpscMailbox<T> {
             tail: AtomicUsize::new(0),
             state: AtomicUsize::new(0),
             consumer_active: AtomicBool::new(false),
+            wake_hook_installed: AtomicBool::new(false),
+            wake_hook: Mutex::new(None),
         }
     }
 
@@ -174,6 +181,7 @@ impl<T> Mailbox<T> for SpscMailbox<T> {
         if tail.wrapping_sub(head) >= self.capacity {
             return Err(TrySendError::Full(message));
         }
+        let was_empty = tail == head;
 
         // Safety: the producer claim guarantees exclusive write access among
         // producers, and the queue is known not to be full, so this slot is not
@@ -182,8 +190,26 @@ impl<T> Mailbox<T> for SpscMailbox<T> {
             self.slot(tail).write(message);
         }
         self.tail.store(tail.wrapping_add(1), Release);
+        if was_empty && self.wake_hook_installed.load(Acquire) {
+            let wake = self.wake_hook.lock().expect("wake hook mutex").clone();
+            if let Some(wake) = wake {
+                wake();
+            }
+        }
 
         Ok(())
+    }
+
+    fn set_wake_hook(&self, wake: Option<Arc<dyn Fn() + Send + Sync + 'static>>) {
+        let installed = wake.is_some();
+        *self.wake_hook.lock().expect("wake hook mutex") = wake;
+        self.wake_hook_installed.store(installed, Release);
+    }
+
+    fn is_empty(&self) -> bool {
+        // Empty when head == tail. A read-only peek for the consumer (the
+        // runtime worker); matches `recv`'s emptiness check.
+        self.head.load(Relaxed) == self.tail.load(Acquire)
     }
 
     fn recv(&self) -> Option<T> {

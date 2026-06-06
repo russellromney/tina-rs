@@ -86,6 +86,10 @@ impl<T> Mailbox<T> for DemoMailbox<T> {
     fn recv(&self) -> Option<T> {
         self.queue.borrow_mut().pop_front()
     }
+
+    fn is_empty(&self) -> bool {
+        self.queue.borrow().is_empty()
+    }
     fn close(&self) {
         self.closed.set(true);
     }

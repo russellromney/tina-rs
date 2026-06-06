@@ -9,16 +9,112 @@ use std::{
     path::{Path, PathBuf},
     ptr::NonNull,
     rc::Rc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
 };
 
 use log::trace;
 
 use crate::{
-    AcceptCompletion, AcceptOp, CompletionInner, ConnectCompletion, ConnectOp, FsyncCompletion,
-    FsyncOp, IO, IOFile, IOLoop, IOSocket, MkdirCompletion, MkdirOp, OpenOptions, Operation,
-    PReadCompletion, PReadOp, PWriteCompletion, PWriteOp, RecvBufCompletion, RecvCompletion,
-    RecvOp, SendCompletion, SendOp, SendOwnedCompletion, SizeCompletion, SizeOp,
+    AcceptCompletion, AcceptOp, CompletionInner, ConnectCompletion, ConnectOp, Doorbell,
+    FsyncCompletion, FsyncOp, IO, IOFile, IOLoop, IOSocket, IOWaker, MkdirCompletion, MkdirOp,
+    OpenOptions, Operation, PReadCompletion, PReadOp, PWriteCompletion, PWriteOp,
+    RecvBufCompletion, RecvCompletion, RecvOp, SendCompletion, SendOp, SendOwnedCompletion,
+    SizeCompletion, SizeOp,
 };
+
+/// kqueue identifier for the `EVFILT_USER` doorbell. `EVFILT_USER` lives in its
+/// own filter namespace, so this never collides with fd-based read/write
+/// watches.
+const DOORBELL_IDENT: libc::uintptr_t = 0;
+
+/// Cross-thread doorbell for the kqueue backend.
+///
+/// Owns the kqueue fd (shared via `Arc` with the backend, so a held [`IOWaker`]
+/// keeps it open even after the loop drops). `pending` is the coalescing truth:
+/// only [`DarwinIO::step_blocking`] clears it; a non-blocking [`step`] may
+/// consume the `EVFILT_USER` kernel event but never touches `pending`, so a
+/// wake that lands during a non-blocking drain still wakes the next park.
+struct DarwinDoorbell {
+    kq: RawFd,
+    pending: AtomicBool,
+}
+
+impl DarwinDoorbell {
+    /// Registers the persistent `EVFILT_USER` doorbell on `kq`.
+    fn register(kq: RawFd) -> io::Result<Arc<Self>> {
+        let change = libc::kevent {
+            ident: DOORBELL_IDENT,
+            filter: libc::EVFILT_USER,
+            flags: libc::EV_ADD | libc::EV_CLEAR,
+            fflags: 0,
+            data: 0,
+            udata: std::ptr::null_mut(),
+        };
+        let rc = unsafe { libc::kevent(kq, &change, 1, std::ptr::null_mut(), 0, std::ptr::null()) };
+        if rc < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Arc::new(Self {
+            kq,
+            pending: AtomicBool::new(false),
+        }))
+    }
+}
+
+impl Drop for DarwinDoorbell {
+    fn drop(&mut self) {
+        // Doorbell owns the kqueue fd: close it once, when the last Arc (loop or
+        // any outstanding waker) is gone.
+        unsafe {
+            libc::close(self.kq);
+        }
+    }
+}
+
+impl Doorbell for DarwinDoorbell {
+    fn wake(&self) {
+        // Set the coalescing flag first so a parker that swaps after this store
+        // observes the wake; then trigger the kernel event to interrupt a kevent
+        // that is already blocked.
+        self.pending.store(true, Ordering::Release);
+        let trigger = libc::kevent {
+            ident: DOORBELL_IDENT,
+            filter: libc::EVFILT_USER,
+            flags: 0,
+            fflags: libc::NOTE_TRIGGER,
+            data: 0,
+            udata: std::ptr::null_mut(),
+        };
+        // Best effort: a failed trigger (e.g. closed kq during teardown) leaves
+        // `pending` set, so a not-yet-parked worker still observes the wake.
+        unsafe {
+            libc::kevent(
+                self.kq,
+                &trigger,
+                1,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null(),
+            );
+        }
+    }
+}
+
+/// Park cap (~1 year). A raw huge timeout overflows `time_t` and `kevent`
+/// rejects it; the real deadline still fires via the runtime's timeout harvest.
+const MAX_PARK_SECS: u64 = 366 * 24 * 60 * 60;
+
+fn timespec_from_duration(d: Duration) -> libc::timespec {
+    libc::timespec {
+        tv_sec: d.as_secs().min(MAX_PARK_SECS) as libc::time_t,
+        // subsec_nanos() is always < 1_000_000_000, so this widening is exact.
+        tv_nsec: libc::c_long::from(d.subsec_nanos()),
+    }
+}
 
 enum SocketKind {
     Listener,
@@ -49,17 +145,11 @@ impl Drop for OwnedFd {
 }
 
 struct DarwinState {
+    /// Cached kqueue fd. Ownership/close lives in [`DarwinDoorbell`] (shared via
+    /// `Arc`) so a held [`IOWaker`] keeps the fd valid after the loop drops.
     kq: RawFd,
     queued: VecDeque<NonNull<CompletionInner>>,
     watched: Vec<WatchedCompletion>,
-}
-
-impl Drop for DarwinState {
-    fn drop(&mut self) {
-        unsafe {
-            libc::close(self.kq);
-        }
-    }
 }
 
 #[derive(Clone, Copy)]
@@ -85,6 +175,7 @@ struct DarwinSocket {
 
 pub struct DarwinIO {
     state: Rc<RefCell<DarwinState>>,
+    doorbell: Arc<DarwinDoorbell>,
 }
 
 enum PollResult {
@@ -100,12 +191,22 @@ impl DarwinIO {
         if kq < 0 {
             return Err(io::Error::last_os_error());
         }
+        let doorbell = match DarwinDoorbell::register(kq) {
+            Ok(doorbell) => doorbell,
+            Err(err) => {
+                unsafe {
+                    libc::close(kq);
+                }
+                return Err(err);
+            }
+        };
         Ok(Self {
             state: Rc::new(RefCell::new(DarwinState {
                 kq,
                 queued: VecDeque::new(),
                 watched: Vec::new(),
             })),
+            doorbell,
         })
     }
 
@@ -682,10 +783,12 @@ impl IO for DarwinIO {
     }
 }
 
-impl IOLoop for DarwinIO {
-    fn step(&self) -> io::Result<bool> {
+impl DarwinIO {
+    /// Submits queued operations: executes each, watching the fd via kqueue when
+    /// it would block, retrying transient ones. Shared by `step` and
+    /// `step_blocking`. Returns whether any queued op progressed.
+    fn drain_queued(&self) -> io::Result<bool> {
         let mut progressed = false;
-
         let queued_len = self.state.borrow().queued.len();
         for _ in 0..queued_len {
             let completion_ptr = self
@@ -710,12 +813,18 @@ impl IOLoop for DarwinIO {
             }
             progressed = true;
         }
+        Ok(progressed)
+    }
 
+    /// Harvests ready kqueue events, blocking up to `timeout` (`None` blocks
+    /// until an event). Shared by `step` (zero timeout) and `step_blocking`.
+    fn poll_events(&self, timeout: Option<libc::timespec>) -> io::Result<bool> {
+        let mut progressed = false;
         let kq = self.state.borrow().kq;
         let mut events: [libc::kevent; 64] = unsafe { MaybeUninit::zeroed().assume_init() };
-        let timeout = libc::timespec {
-            tv_sec: 0,
-            tv_nsec: 0,
+        let timeout_ptr = match &timeout {
+            Some(ts) => ts as *const libc::timespec,
+            None => std::ptr::null(),
         };
         let n = unsafe {
             libc::kevent(
@@ -724,17 +833,29 @@ impl IOLoop for DarwinIO {
                 0,
                 events.as_mut_ptr(),
                 events.len() as i32,
-                &timeout,
+                timeout_ptr,
             )
         };
         if n < 0 {
-            return Err(io::Error::last_os_error());
+            let err = io::Error::last_os_error();
+            // A blocking kevent interrupted by a signal is a (spurious) wake, not
+            // a failure: return so the caller re-polls.
+            if err.raw_os_error() == Some(libc::EINTR) {
+                return Ok(progressed);
+            }
+            return Err(err);
         }
         if n > 0 {
             progressed = true;
         }
 
         for ev in events.iter().take(n as usize) {
+            // Classify before casting udata: the EVFILT_USER doorbell carries a
+            // null udata and is not a completion. Skip it (the wake itself is the
+            // signal; commands are drained by the caller's own queue).
+            if ev.filter == libc::EVFILT_USER {
+                continue;
+            }
             let Some(completion_ptr) = NonNull::new(ev.udata.cast::<CompletionInner>()) else {
                 continue;
             };
@@ -753,6 +874,44 @@ impl IOLoop for DarwinIO {
         }
 
         Ok(progressed)
+    }
+}
+
+impl IOLoop for DarwinIO {
+    fn step(&self) -> io::Result<bool> {
+        let queued = self.drain_queued()?;
+        let events = self.poll_events(Some(libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        }))?;
+        Ok(queued || events)
+    }
+
+    fn step_blocking(&self, timeout: Option<Duration>) -> io::Result<bool> {
+        let queued = self.drain_queued()?;
+        // Consume any pending wake up front. If one is set, do a non-blocking
+        // poll and return (a command is waiting); otherwise block up to the
+        // timeout. The EVFILT_USER trigger covers the race where a wake lands
+        // between this swap and the kevent: it interrupts the blocked kevent.
+        let was_pending = self.doorbell.pending.swap(false, Ordering::AcqRel);
+        // Do not block if `drain_queued` just made progress: it may have driven
+        // ops to completion whose result slots the caller still has to harvest
+        // (the lane's `try_complete` runs in `step()`, not here), and there may
+        // be cascading work. Only block when the loop is genuinely idle.
+        let ts = if was_pending || queued {
+            Some(libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            })
+        } else {
+            timeout.map(timespec_from_duration)
+        };
+        let events = self.poll_events(ts)?;
+        Ok(queued || events)
+    }
+
+    fn waker(&self) -> IOWaker {
+        IOWaker::new(self.doorbell.clone())
     }
 
     fn pending_completion_count(&self) -> usize {

@@ -24,6 +24,8 @@ use tina::{
     SpawnObservedError, StopResult, TrySendError,
 };
 
+use betelgeuse::IOWaker;
+
 use crate::call::{
     CallError, CallId, CallInput, CallOutcome, CallOutput, ErasedCall, ErasedRuntimeCallCompletion,
     IntoErasedCall, SendOutcome,
@@ -273,11 +275,16 @@ where
         round_messages.clear();
         reserve_round_message_scratch(&mut round_messages, self.entries.len());
         for index in 0..self.entries.len() {
-            let message = if self.entries[index].stopped.get() {
-                None
-            } else {
-                self.recv_entry_message(index)
-            };
+            // Skip-empty scan: a quiet mailbox answers `is_empty()` cheaply, so
+            // we avoid the expensive `recv` (virtual call + lock + context pop)
+            // on idle isolates. `is_empty()` reflects real mailbox state for
+            // every ingress path, so a directly-pushed message is never skipped.
+            let message =
+                if self.entries[index].stopped.get() || self.entries[index].mailbox.is_empty() {
+                    None
+                } else {
+                    self.recv_entry_message(index)
+                };
             round_messages.push(message);
         }
 
@@ -1958,6 +1965,63 @@ where
             || !self.pending_completions.is_empty()
     }
 
+    /// Doorbell that wakes this runtime's worker from a blocking park, if the
+    /// driver supports one. Held by the host command sender so a `try_send` /
+    /// `call` / shutdown wakes the parked worker.
+    pub(crate) fn io_waker(&self) -> Option<IOWaker> {
+        self.driver.wake_handle()
+    }
+
+    /// Opts the live driver into socket operations that are suitable for a
+    /// readiness-driven blocking park. Explicit-step runtimes must not call
+    /// this: their `step()` contract is non-blocking even with pending socket
+    /// reads/writes.
+    pub(crate) fn enable_blocking_socket_io_for_park(&mut self) {
+        self.driver.set_blocking_socket_io(true);
+    }
+
+    /// Parks the worker on the driver's I/O loop until readiness, a doorbell
+    /// wake, or `timeout` (`None` blocks until an event). Replaces the old
+    /// timer-poll park; the doorbell makes a `None` wait safe.
+    pub(crate) fn park_io(&mut self, timeout: Option<Duration>) -> std::io::Result<bool> {
+        self.driver.park(timeout)
+    }
+
+    /// Earliest instant the worker must wake for *timed* runtime work: the
+    /// soonest of any driver timer/signal deadline and any in-flight
+    /// isolate-call deadline. `None` means no timed work, so the worker may
+    /// block until the io_loop or doorbell wakes it. Socket/lane I/O readiness
+    /// is delivered by the park itself and is not a deadline here.
+    pub(crate) fn next_park_deadline(&self) -> Option<Instant> {
+        let driver = self.driver.next_deadline();
+        let call = self
+            .pending_isolate_call_deadlines
+            .keys()
+            .next()
+            .map(|(deadline, _)| *deadline);
+        match (driver, call) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (Some(a), None) => Some(a),
+            (None, b) => b,
+        }
+    }
+
+    pub(crate) fn park_needs_repoll(&self) -> bool {
+        self.driver.has_unsignaled_pending()
+            || !self.pending_completions.is_empty()
+            // Pending runtime work a blocking io_loop park cannot observe: there
+            // is work outstanding, but the loop has no armed op to wake on and
+            // there is no timer/call deadline to wake at (e.g. a driver op that
+            // completed inline during the park and is waiting to be harvested by
+            // the next `step`). Without this the worker would block forever on an
+            // empty loop while that work waits. Normal in-flight socket ops keep
+            // armed io_loop work, so this does not force a re-poll for them — they
+            // still wake at kernel latency.
+            || (self.has_pending_runtime_work()
+                && self.next_park_deadline().is_none()
+                && !self.driver.io_loop_has_armed_work())
+    }
+
     pub(crate) fn advance_driver(&mut self, now: Instant) {
         // Harvest every completion the driver has ready this advance, but
         // deliver at most `driver_completion_drain_budget` into mailboxes per
@@ -3188,6 +3252,9 @@ where
 pub(crate) trait ErasedMailbox {
     fn recv_boxed(&self) -> Option<Box<dyn Any>>;
     fn try_send_boxed(&self, message: Box<dyn Any>) -> Result<(), TrySendError<Box<dyn Any>>>;
+    /// Cheap readiness probe; lets the scheduler skip `recv_boxed` on quiet
+    /// isolates. Reflects real mailbox state for every ingress path.
+    fn is_empty(&self) -> bool;
     fn close(&self);
 }
 
@@ -3208,6 +3275,10 @@ where
         self.mailbox
             .recv()
             .map(|message| Box::new(message) as Box<dyn Any>)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.mailbox.is_empty()
     }
 
     fn try_send_boxed(&self, message: Box<dyn Any>) -> Result<(), TrySendError<Box<dyn Any>>> {
@@ -3238,6 +3309,10 @@ pub(crate) struct AnyMailboxAdapter {
 impl ErasedMailbox for AnyMailboxAdapter {
     fn recv_boxed(&self) -> Option<Box<dyn Any>> {
         self.mailbox.recv()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.mailbox.is_empty()
     }
 
     fn try_send_boxed(&self, message: Box<dyn Any>) -> Result<(), TrySendError<Box<dyn Any>>> {

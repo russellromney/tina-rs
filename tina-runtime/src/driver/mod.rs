@@ -48,8 +48,9 @@ use std::time::{Duration, Instant};
 
 use betelgeuse::{
     AcceptCompletion, ConnectCompletion, FsyncCompletion, IO, IOFile, IOLoop, IOLoopHandle,
-    IOSocket, MkdirCompletion, OpenOptions, PReadCompletion, PWriteCompletion, RecvBufCompletion,
-    RecvCompletion, SendCompletion, SendOwnedCompletion, SizeCompletion, io_loop,
+    IOSocket, IOWaker, MkdirCompletion, OpenOptions, PReadCompletion, PWriteCompletion,
+    RecvBufCompletion, RecvCompletion, SendCompletion, SendOwnedCompletion, SizeCompletion,
+    io_loop,
 };
 
 use crate::call::{
@@ -113,6 +114,63 @@ pub(crate) trait RuntimeDriver: std::fmt::Debug {
 
     /// Returns whether substrate completions are still pending.
     fn has_pending(&self) -> bool;
+
+    /// Blocks the worker on real readiness until I/O completes, the doorbell is
+    /// rung, or `timeout` elapses (`None` blocks until an event). Mirrors
+    /// [`advance`](Self::advance)'s drain but parks instead of returning
+    /// immediately.
+    ///
+    /// Default returns immediately: drivers without a blocking substrate (e.g.
+    /// the deterministic simulator) are never parked on, so they must not be
+    /// used behind a worker that calls this.
+    fn park(&mut self, _timeout: Option<Duration>) -> std::io::Result<bool> {
+        Ok(false)
+    }
+
+    /// Returns a thread-safe doorbell that wakes a [`park`](Self::park).
+    ///
+    /// `None` for drivers without a blocking park.
+    fn wake_handle(&self) -> Option<IOWaker> {
+        None
+    }
+
+    /// Enables socket operations that are friendly to a real blocking park.
+    ///
+    /// Threaded live runtimes opt in before submitting socket work. Explicit-step
+    /// runtimes leave this off so `Runtime::step()` remains a non-blocking drain
+    /// even while reads or writes are pending.
+    fn set_blocking_socket_io(&mut self, _enabled: bool) {}
+
+    /// Shared mailbox wake hook (rings the park doorbell), cloned into each
+    /// mailbox. `None` for drivers without a blocking park.
+    fn mailbox_wake_hook(&self) -> Option<Arc<dyn Fn() + Send + Sync>> {
+        None
+    }
+
+    /// Earliest runtime-owned deadline the worker must wake for (timers, signal
+    /// waits). `None` means no timed work pending. Lane/socket I/O readiness is
+    /// delivered by [`park`](Self::park) itself, so it is not a deadline here.
+    fn next_deadline(&self) -> Option<Instant> {
+        None
+    }
+
+    /// Whether the driver holds pending work a blocking [`park`](Self::park)
+    /// would NOT observe (channel-delivered lanes, OS-signal interest). When
+    /// true the worker must cap its park and re-poll instead of blocking
+    /// indefinitely. Default `true` is the safe choice for drivers never parked
+    /// on; [`BetelgeuseDriver`] overrides it precisely.
+    fn has_unsignaled_pending(&self) -> bool {
+        true
+    }
+
+    /// Whether the backing I/O loop currently has armed operations (submitted or
+    /// being watched). When true, a blocking [`park`](Self::park) will wake on
+    /// their completion; when false, the loop has nothing to wake it, so pending
+    /// runtime work (e.g. a completed-but-unharvested op) needs a re-poll rather
+    /// than an indefinite block. Default `false` for drivers without a loop.
+    fn io_loop_has_armed_work(&self) -> bool {
+        false
+    }
 
     /// Cancels pending substrate operations during runtime shutdown.
     ///
@@ -211,6 +269,14 @@ pub(crate) enum DriverShutdownError {
 /// library with caller-owned typed completion slots. That shape matches Tina's
 /// explicit-stepping, runtime-owned-effects discipline.
 pub(crate) struct BetelgeuseDriver {
+    /// Dedicated clone of the shared Betelgeuse loop handle, used to block the
+    /// worker on real readiness (`step_blocking`) and to mint the wake doorbell.
+    /// The TCP/TLS/Unix/storage lanes hold their own clones of the same loop.
+    io_loop: IOLoopHandle<Global>,
+    /// One shared "ring the doorbell" closure, built once from the loop's waker
+    /// and Arc-cloned into each mailbox's wake hook — so a direct mailbox send
+    /// wakes a parked worker without allocating a closure per registration.
+    mailbox_wake_hook: Option<Arc<dyn Fn() + Send + Sync>>,
     tcp: BetelgeuseTcp,
     storage: StorageLane,
     dns: DnsLane,
@@ -222,6 +288,11 @@ pub(crate) struct BetelgeuseDriver {
     timers: Vec<TimerEntry>,
     next_timer_ordinal: u64,
     os_signals: OsSignalDispatcher,
+}
+
+fn mailbox_wake_hook_from(io_loop: &IOLoopHandle<Global>) -> Option<Arc<dyn Fn() + Send + Sync>> {
+    let waker = io_loop.waker();
+    Some(Arc::new(move || waker.wake()))
 }
 
 /// One pending timer tracked by the driver.
@@ -248,6 +319,8 @@ impl BetelgeuseDriver {
 
     pub(crate) fn with_io_loop(io_loop: IOLoopHandle<Global>) -> Self {
         Self {
+            mailbox_wake_hook: mailbox_wake_hook_from(&io_loop),
+            io_loop: io_loop.clone(),
             // TLS rides the same Betelgeuse loop as plain TCP — a cloned
             // handle, not a second socket stack.
             tls: TlsLane::new(DEFAULT_TLS_LANE_CAPACITY, io_loop.clone()),
@@ -277,6 +350,8 @@ impl BetelgeuseDriver {
         signal_capacity: usize,
     ) -> Self {
         Self {
+            mailbox_wake_hook: mailbox_wake_hook_from(&io_loop),
+            io_loop: io_loop.clone(),
             tls: TlsLane::new(tls_lane_capacity, io_loop.clone()),
             unix: UnixLane::new(io_loop.clone()),
             tcp: BetelgeuseTcp::with_io_loop(io_loop.clone()),
@@ -464,6 +539,24 @@ impl RuntimeDriver for BetelgeuseDriver {
         self.poll_os_signals(completed);
         self.harvest_signals(now, completed);
         self.harvest_timers(now, completed);
+        // All socket/file lanes share one Betelgeuse io_loop. Each lane's
+        // `advance` does a substrate step (drain queued ops, then poll for
+        // readiness) and then harvests its own completions. But `poll` only
+        // surfaces a ready event into the loop's queue; the matching `drain`
+        // that executes it (writing the typed result) may run inside a *later*
+        // lane's step. That later lane harvests only its own ops, so a
+        // completion surfaced by an earlier lane and executed by a later one is
+        // left completed-but-unharvested for this turn. The old timer-poll park
+        // hid this (the next ~1ms re-poll harvested it); the readiness park does
+        // not, and TCP/Unix are the only lanes excluded from
+        // `has_unsignaled_pending`, so nothing re-polls to collect their result
+        // and the worker blocks forever. Re-harvest TCP and Unix once, after
+        // every lane has driven the shared loop. This touches no syscall (it
+        // only reaps slots that already hold a result), and anything still only
+        // *queued* (surfaced, not yet executed) keeps the loop armed, so the
+        // park's own `step_blocking` drain executes it and the next step reaps.
+        self.tcp.harvest(completed);
+        self.unix.harvest(completed);
     }
 
     fn take_cancelled_by_close(&mut self) -> Vec<CallId> {
@@ -481,6 +574,61 @@ impl RuntimeDriver for BetelgeuseDriver {
             || self.unix.has_pending()
             || self.signals.iter().any(|entry| !entry.cancelled)
             || !self.timers.is_empty()
+    }
+
+    fn park(&mut self, timeout: Option<Duration>) -> std::io::Result<bool> {
+        self.io_loop.step_blocking(timeout)
+    }
+
+    fn wake_handle(&self) -> Option<IOWaker> {
+        Some(self.io_loop.waker())
+    }
+
+    fn set_blocking_socket_io(&mut self, enabled: bool) {
+        self.io_loop.set_blocking_socket_io(enabled);
+    }
+
+    fn mailbox_wake_hook(&self) -> Option<Arc<dyn Fn() + Send + Sync>> {
+        self.mailbox_wake_hook.clone()
+    }
+
+    fn next_deadline(&self) -> Option<Instant> {
+        let mut earliest: Option<Instant> = None;
+        let mut consider = |deadline: Instant| {
+            earliest = Some(match earliest {
+                Some(current) => current.min(deadline),
+                None => deadline,
+            });
+        };
+        for timer in &self.timers {
+            consider(timer.deadline);
+        }
+        for signal in &self.signals {
+            if !signal.cancelled {
+                consider(signal.deadline);
+            }
+        }
+        earliest
+    }
+
+    fn io_loop_has_armed_work(&self) -> bool {
+        self.io_loop.pending_completion_count() > 0
+    }
+
+    fn has_unsignaled_pending(&self) -> bool {
+        // DNS / process / storage-fallback completions arrive on worker-thread
+        // channels; a TLS op's timeout is a runtime-side deadline checked in
+        // `advance`; OS-signal interest is delivered through an atomic flag. None
+        // of these are observed by a blocking io_loop park, so a worker holding
+        // any of them must cap its park and re-poll. Plain TCP/Unix sockets and
+        // storage durability ride the loop and ARE observed by the park, so they
+        // are deliberately excluded — storage is capped conservatively as a
+        // whole because it is off the latency-critical path.
+        self.dns.has_pending()
+            || self.process.has_pending()
+            || self.tls.has_pending()
+            || self.storage.has_pending()
+            || self.signals.iter().any(|entry| !entry.cancelled)
     }
 
     fn cancel_pending(&mut self, deadline: Instant) -> Result<(), DriverShutdownError> {

@@ -165,12 +165,14 @@ Rules:
   - shutdown uses `try_send` and wakes after admission, preserving retry-on-Full;
   - every host path (`try_send`, send/observe, `call_blocking`, observation,
     shutdown, cross-shard inbound) goes through the doorbell sender;
-- replace the worker park (`receiver.recv_timeout(park)`, both the single- and
-  multi-shard loops) with:
+- replace the single-shard worker park (`receiver.recv_timeout(park)`) with:
   - `let deadline = self.next_wake_deadline();  // min(next timer, next call deadline); None = forever`
   - `self.io_loop.step_blocking(deadline)?;`
   - then loop: drain commands (`try_recv` until Empty) + the existing bounded
     hot-drain (whose `step()` now finds the ready completions);
+- multi-shard is out of this phase's implementation scope. Its cross-shard
+  inbound queues are not io_loop wake sources yet, so it keeps the command-queue
+  park and remains a named follow-up rather than a hidden claim;
 - add `Runtime::next_wake_deadline()` = earliest of
   `pending_isolate_call_deadlines.first()` and a new
   `driver.next_timer_deadline()`; None -> block indefinitely (true zero-wakeup
@@ -229,10 +231,15 @@ Plan:
 
 Rules:
 - correct for all ingress (mediated + direct mailbox push), proven by test;
-- no public `Mailbox<T>` behaviour change beyond additive readiness methods.
-  Do not provide a default `is_empty() == false` that silently destroys the
-  optimization or hides missing impls; update all in-tree mailbox impls and
-  use compile errors as the rail;
+- public `Mailbox<T>` gains readiness hooks:
+  - required `is_empty()` (no default) so the scheduler can skip quiet mailboxes
+    without missing direct pushes;
+  - optional `set_wake_hook(...)` for threaded/external-producer mailboxes. The
+    blessed threaded and SPSC mailboxes must wake on empty -> non-empty. Custom
+    mailboxes that expose direct producer handles should do the same;
+- do not provide a default `is_empty() == false` that silently destroys the
+  optimization or hides missing impls; update all in-tree mailbox impls and use
+  compile errors as the rail;
 - only reland a true ready queue if the benchmark justifies it; otherwise keep
   skip-empty scan and record that the remaining scan was fast enough.
 
@@ -252,6 +259,8 @@ Rules:
   return typed `Full` and do not block waiting for a doorbell;
 - pre-wake race proof: enqueue a command immediately before the worker enters
   `step_blocking`; it must be observed without waiting for the timeout;
+- direct mailbox proof: a message pushed into a runtime-owned mailbox without
+  `ThreadedRuntime::try_send` wakes an idle worker and is delivered;
 - simulated threaded proof: a `ThreadedRuntime` built with Betelgeuse simulated
   I/O does not spin and still wakes for host commands;
 - DST fingerprint unchanged (sim never blocks);

@@ -547,7 +547,17 @@ impl BetelgeuseTcp {
         // One substrate tick. Errors here are non-fatal: pending ops still
         // hold their slots and will be checked anyway.
         let _ = self.io_loop.step();
+        self.harvest(completed);
+    }
 
+    /// Reaps every pending op whose backend completion now has a result, with
+    /// no substrate step. Split from [`advance`](Self::advance) so the driver
+    /// can run a final harvest after every lane has driven the *shared* io_loop:
+    /// a completion this lane's `poll` surfaced into the loop's queue but a
+    /// later sibling lane's `drain` executed would otherwise sit completed but
+    /// unharvested, and TCP rides the zero-wakeup park (it is excluded from
+    /// `has_unsignaled_pending`), so nothing would re-poll to collect it.
+    pub(super) fn harvest(&mut self, completed: &mut Vec<DriverCompletion>) {
         // Drain in submission order so completion ordering is stable
         // relative to submission ordering whenever Betelgeuse permits it.
         let mut index = 0;
