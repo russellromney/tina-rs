@@ -111,6 +111,10 @@ struct IoUringState {
     ring: IoUring,
     queued: VecDeque<NonNull<CompletionInner>>,
     inflight: HashSet<NonNull<CompletionInner>>,
+    /// Enables socket ops to park in the kernel for readiness. Threaded Tina
+    /// workers turn this on before using `step_blocking`; explicit-step
+    /// runtimes leave it off so `step()` stays non-blocking with pending reads.
+    blocking_socket_io: bool,
     /// Whether a oneshot eventfd-doorbell poll is currently in flight in the
     /// ring. Re-armed by `step_blocking`; cleared when the doorbell completion is
     /// harvested (oneshot is consumed by the kernel).
@@ -153,6 +157,7 @@ impl IoUringIO {
                             ring,
                             queued: VecDeque::new(),
                             inflight: HashSet::new(),
+                            blocking_socket_io: false,
                             doorbell_armed: false,
                         })),
                         doorbell,
@@ -680,13 +685,15 @@ impl IOSocket for IoUringSocket {
             }
         }
         let inner = c.inner_mut();
-        // No MSG_DONTWAIT: let io_uring fast-poll arm and complete when readable,
-        // so a worker parked in `step_blocking` blocks on the kernel instead of
-        // busy-retrying EAGAIN. A request with data ready still completes inline.
+        let flags = if self.state.borrow().blocking_socket_io {
+            0
+        } else {
+            libc::MSG_DONTWAIT
+        };
         inner.prepare(Operation::Recv(RecvOp {
             fd,
             buf: vec![0_u8; len],
-            flags: 0,
+            flags,
         }));
         queue(&self.state, inner);
         Ok(())
@@ -724,12 +731,15 @@ impl IOSocket for IoUringSocket {
         }
         buffer.resize(max_len, 0);
         let inner = c.inner_mut();
-        // No MSG_DONTWAIT: io_uring fast-polls and completes when readable, so
-        // the blocking park blocks on the kernel instead of busy-retrying EAGAIN.
+        let flags = if self.state.borrow().blocking_socket_io {
+            0
+        } else {
+            libc::MSG_DONTWAIT
+        };
         inner.prepare(Operation::RecvBuf(RecvOp {
             fd,
             buf: buffer,
-            flags: 0,
+            flags,
         }));
         queue(&self.state, inner);
         Ok(())
@@ -760,13 +770,12 @@ impl IOSocket for IoUringSocket {
             }
         }
         let inner = c.inner_mut();
-        // No MSG_DONTWAIT: a full send buffer fast-polls for writability instead
-        // of busy-retrying EAGAIN; a writable socket still completes inline.
-        inner.prepare(Operation::Send(SendOp {
-            fd,
-            buf,
-            flags: libc::MSG_NOSIGNAL,
-        }));
+        let flags = if self.state.borrow().blocking_socket_io {
+            libc::MSG_NOSIGNAL
+        } else {
+            libc::MSG_NOSIGNAL | libc::MSG_DONTWAIT
+        };
+        inner.prepare(Operation::Send(SendOp { fd, buf, flags }));
         queue(&self.state, inner);
         Ok(())
     }
@@ -801,12 +810,12 @@ impl IOSocket for IoUringSocket {
             }
         }
         let inner = c.inner_mut();
-        // No MSG_DONTWAIT: fast-poll for writability instead of busy-retrying.
-        inner.prepare(Operation::SendOwned(SendOp {
-            fd,
-            buf,
-            flags: libc::MSG_NOSIGNAL,
-        }));
+        let flags = if self.state.borrow().blocking_socket_io {
+            libc::MSG_NOSIGNAL
+        } else {
+            libc::MSG_NOSIGNAL | libc::MSG_DONTWAIT
+        };
+        inner.prepare(Operation::SendOwned(SendOp { fd, buf, flags }));
         queue(&self.state, inner);
         Ok(())
     }
@@ -1147,6 +1156,10 @@ impl IOLoop for IoUringIO {
         }
 
         Ok(())
+    }
+
+    fn set_blocking_socket_io(&self, enabled: bool) {
+        self.state.borrow_mut().blocking_socket_io = enabled;
     }
 }
 

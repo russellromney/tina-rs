@@ -1665,6 +1665,7 @@ where
     );
     runtime.set_trace_retention(config.trace_retention);
     runtime.set_driver_completion_drain_budget(config.driver_completion_drain_budget);
+    runtime.enable_blocking_socket_io_for_park();
     // Wire the observer before any event records.
     runtime.set_trace_observer(observer);
 

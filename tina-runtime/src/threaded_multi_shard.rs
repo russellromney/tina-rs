@@ -931,6 +931,7 @@ where
     F: MailboxFactory + 'static,
 {
     runtime.remote_child_control_capacity = config.shard_pair_capacity;
+    runtime.enable_blocking_socket_io_for_park();
     // Pin this shard worker (if requested and the platform can). The driver's
     // helper lanes were already spawned when `runtime` was built above, so they
     // inherit the unpinned mask; later per-op helper threads float off the pin.

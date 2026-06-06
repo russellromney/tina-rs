@@ -134,6 +134,13 @@ pub(crate) trait RuntimeDriver: std::fmt::Debug {
         None
     }
 
+    /// Enables socket operations that are friendly to a real blocking park.
+    ///
+    /// Threaded live runtimes opt in before submitting socket work. Explicit-step
+    /// runtimes leave this off so `Runtime::step()` remains a non-blocking drain
+    /// even while reads or writes are pending.
+    fn set_blocking_socket_io(&mut self, _enabled: bool) {}
+
     /// Shared mailbox wake hook (rings the park doorbell), cloned into each
     /// mailbox. `None` for drivers without a blocking park.
     fn mailbox_wake_hook(&self) -> Option<Arc<dyn Fn() + Send + Sync>> {
@@ -575,6 +582,10 @@ impl RuntimeDriver for BetelgeuseDriver {
 
     fn wake_handle(&self) -> Option<IOWaker> {
         Some(self.io_loop.waker())
+    }
+
+    fn set_blocking_socket_io(&mut self, enabled: bool) {
+        self.io_loop.set_blocking_socket_io(enabled);
     }
 
     fn mailbox_wake_hook(&self) -> Option<Arc<dyn Fn() + Send + Sync>> {

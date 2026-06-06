@@ -1972,6 +1972,14 @@ where
         self.driver.wake_handle()
     }
 
+    /// Opts the live driver into socket operations that are suitable for a
+    /// readiness-driven blocking park. Explicit-step runtimes must not call
+    /// this: their `step()` contract is non-blocking even with pending socket
+    /// reads/writes.
+    pub(crate) fn enable_blocking_socket_io_for_park(&mut self) {
+        self.driver.set_blocking_socket_io(true);
+    }
+
     /// Parks the worker on the driver's I/O loop until readiness, a doorbell
     /// wake, or `timeout` (`None` blocks until an event). Replaces the old
     /// timer-poll park; the doorbell makes a `None` wait safe.

@@ -272,17 +272,21 @@ correctly — which is why HTTP latency still looked fine (active requests have
 data ready and complete inline) while an idle/pending connection burned a core.
 This is the upstream always-busy-poll design; it defeats a blocking park.
 
-Fix: drop `MSG_DONTWAIT` from the socket read/write ops (keep `MSG_NOSIGNAL` on
-sends). io_uring then fast-polls them — a request with data ready still
-completes inline, and an idle/pending read parks on the kernel until readable.
-Linux-only change (`vendor-betelgeuse/io/linux.rs`); macOS/darwin uses kqueue
-watches and was already correct.
+Fix: make Linux socket fast-poll an explicit threaded-runtime mode, not a global
+Betelgeuse behavior change. Explicit-step runtimes keep `MSG_DONTWAIT` so
+`Runtime::step()` stays non-blocking with pending reads. Threaded Tina workers
+opt in before submitting socket work; their read/write ops omit `MSG_DONTWAIT`
+(while sends keep `MSG_NOSIGNAL`) so io_uring fast-polls and a parked worker
+wakes on readiness. macOS/darwin uses kqueue watches and was already correct.
 
 Validated on real Linux/x86 io_uring after the fix (all pass on the same
 machine that produced the perf rows): `pending_read_park` 1 (was the 58,672
 busy-spin), `readiness_park` 4, `mailbox_readiness` 2, `scheduler_turn_tail` 8,
 `betelgeuse_substrate` 19, `client_against_native` 1, `grpc_live` 34. So the
-zero-idle-wakeup / block-on-the-kernel claim now holds on Linux, not only macOS.
+zero-idle-wakeup / block-on-the-kernel claim holds on Linux for threaded workers,
+not only macOS. The follow-up explicit-step regression
+`call_dispatch::terminal_write_close_while_read_pending_cancels_read_and_closes`
+guards that the fast-poll mode does not leak into `Runtime::step()`.
 
 Tooling note: `cargo check --target x86_64-unknown-linux-gnu -p betelgeuse`
 type-checks the Linux io_uring path locally on macOS (betelgeuse has no C-build

@@ -114,6 +114,16 @@ pub trait IOLoop: IO {
     fn cancel_pending_completions(&self) -> stdio::Result<()> {
         Ok(())
     }
+
+    /// Controls whether socket read/write operations may arm kernel-side
+    /// readiness waits that are intended for [`step_blocking`](Self::step_blocking).
+    ///
+    /// The default is `false`: [`step`](Self::step) must remain a non-blocking
+    /// drain, so backends should submit socket operations in a non-blocking
+    /// form. Threaded runtimes that park on `step_blocking` enable this mode so
+    /// pending socket reads/writes wake the parked worker on readiness instead
+    /// of completing immediately with `WouldBlock` and requeueing.
+    fn set_blocking_socket_io(&self, _enabled: bool) {}
 }
 
 /// Thread-safe handle that wakes a parked [`IOLoop::step_blocking`].
@@ -400,6 +410,10 @@ impl<A> IOLoop for IOLoopHandle<A> {
 
     fn cancel_pending_completions(&self) -> stdio::Result<()> {
         self.inner.cancel_pending_completions()
+    }
+
+    fn set_blocking_socket_io(&self, enabled: bool) {
+        self.inner.set_blocking_socket_io(enabled);
     }
 }
 
