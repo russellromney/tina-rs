@@ -46,6 +46,12 @@ than pin a moving git dependency.
   is a **separate OS handle** (Linux `eventfd`, macOS `EVFILT_USER`, simulated
   condvar), not a clone of the `Rc<dyn IOLoop>`. A host thread may wake the loop
   but never touches backend state.
+- **Linux fast-poll reads/writes** — dropped `MSG_DONTWAIT` from the io_uring
+  `recv`/`recv_buf`/`send`/`send_owned` ops so io_uring fast-polls them (blocks
+  until ready) instead of returning `EAGAIN` for the upstream busy-retry loop. A
+  request with data ready still completes inline; an idle/pending read now parks
+  on the kernel instead of busy-spinning. Required for the blocking wait to
+  actually block on Linux (macOS/kqueue already arms a real `EVFILT` watch).
 - Doorbell coalescing truth is an `AtomicBool` that only `step_blocking` clears;
   the kernel interrupt (eventfd / `EVFILT_USER`) only unblocks a waiting kernel
   call. `step()` may observe and skip the doorbell event but never clears the

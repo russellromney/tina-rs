@@ -21,6 +21,10 @@ This file records completed work.
   preserving typed `Full`/`Disconnected` and never blocking a hot path. Lanes
   whose completions arrive off the I/O loop (DNS/process/TLS/storage/signals)
   cap the park and re-poll, so nothing is missed.
+- Linux io_uring reads/writes drop `MSG_DONTWAIT` so io_uring fast-polls them and
+  the worker truly blocks on a pending read instead of busy-retrying `EAGAIN`
+  (caught by running the park tests on real Linux/x86, where the prior flag made
+  an idle connection spin a core; macOS/kqueue was already correct).
 - Linux/x86 evidence (local/alpha, one cloud box): the HTTP host-submit gap was
   ~1.1ms of worker sleep before and is now ~0.03-0.13ms of real connection
   round-trips; the ~0.15ms that remains is the connection-setup and per-byte

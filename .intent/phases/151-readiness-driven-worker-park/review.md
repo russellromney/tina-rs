@@ -235,11 +235,12 @@ drift, platform lies, and happy-path-only tests.
   replay cases pass unchanged.
 
 - Platform honesty. The Linux io_uring `step_blocking`/eventfd path cannot run
-  in the local macOS suite. It was exercised on real Linux/x86 by the Fly perf
-  binary, which drives the full HTTP path (connect/accept/read/write/close) over
-  the blocking io_uring park and produced correct rows — so the Linux park is
-  validated end-to-end for HTTP, though the full DST/test matrix on Linux is
-  CI's job, not this box's.
+  in the local macOS suite, so the key park/wakeup tests were built into the Fly
+  image and run on real Linux/x86. That caught a Linux-only busy-spin
+  (`MSG_DONTWAIT`); after the fix, all seven validation binaries pass on Linux
+  (see "Linux busy-spin found and fixed"). The broad DST/test matrix on Linux is
+  still CI's job, but the readiness-park claims are now proven on real io_uring,
+  not inferred from macOS.
 
 - Happy-path. The proofs cover idle (~0 wakeups), pending read (~0 wakeups then
   prompt), command stress, pre-wake race, simulated no-spin, skip-empty at
@@ -252,3 +253,37 @@ drift, platform lies, and happy-path-only tests.
   arrives off the loop); the readiness park is single-shard this phase. The
   `idle_repoll_interval` / `idle_wait` knobs are vestigial for the single-shard
   park (kept as accepted config).
+
+## Linux busy-spin found and fixed (validated on real io_uring)
+
+Running the park/wakeup tests on a Fly Linux/x86 machine (kernel 6.12) — not
+only the perf binary — caught a platform-specific defect the macOS suite could
+not: with a pending TCP read and a silent peer, the worker made ~58,672 park
+"wakeups" in 250ms. It was busy-spinning, not blocking.
+
+Root cause (pinned with in-image io_uring instrumentation): the Betelgeuse Linux
+backend submitted `recv`/`recv_buf`/`send`/`send_owned` with `MSG_DONTWAIT`. With
+that flag io_uring honours the explicit non-blocking request and returns
+`-EAGAIN` instead of arming fast-poll; `should_retry` then re-queued the op, the
+worker re-submitted, and `submit_and_wait` returned instantly every time
+(measured `waited_us=1` against a 9.9s timeout, op discriminant = `RecvBuf`,
+result `-11`). `accept` has no such flag, so it fast-polled and blocked
+correctly — which is why HTTP latency still looked fine (active requests have
+data ready and complete inline) while an idle/pending connection burned a core.
+This is the upstream always-busy-poll design; it defeats a blocking park.
+
+Fix: drop `MSG_DONTWAIT` from the socket read/write ops (keep `MSG_NOSIGNAL` on
+sends). io_uring then fast-polls them — a request with data ready still
+completes inline, and an idle/pending read parks on the kernel until readable.
+Linux-only change (`vendor-betelgeuse/io/linux.rs`); macOS/darwin uses kqueue
+watches and was already correct.
+
+Validated on real Linux/x86 io_uring after the fix (all pass on the same
+machine that produced the perf rows): `pending_read_park` 1 (was the 58,672
+busy-spin), `readiness_park` 4, `mailbox_readiness` 2, `scheduler_turn_tail` 8,
+`betelgeuse_substrate` 19, `client_against_native` 1, `grpc_live` 34. So the
+zero-idle-wakeup / block-on-the-kernel claim now holds on Linux, not only macOS.
+
+Tooling note: `cargo check --target x86_64-unknown-linux-gnu -p betelgeuse`
+type-checks the Linux io_uring path locally on macOS (betelgeuse has no C-build
+deps), so Linux-only compile errors no longer need a Fly round-trip.

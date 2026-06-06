@@ -680,10 +680,13 @@ impl IOSocket for IoUringSocket {
             }
         }
         let inner = c.inner_mut();
+        // No MSG_DONTWAIT: let io_uring fast-poll arm and complete when readable,
+        // so a worker parked in `step_blocking` blocks on the kernel instead of
+        // busy-retrying EAGAIN. A request with data ready still completes inline.
         inner.prepare(Operation::Recv(RecvOp {
             fd,
             buf: vec![0_u8; len],
-            flags: libc::MSG_DONTWAIT,
+            flags: 0,
         }));
         queue(&self.state, inner);
         Ok(())
@@ -721,10 +724,12 @@ impl IOSocket for IoUringSocket {
         }
         buffer.resize(max_len, 0);
         let inner = c.inner_mut();
+        // No MSG_DONTWAIT: io_uring fast-polls and completes when readable, so
+        // the blocking park blocks on the kernel instead of busy-retrying EAGAIN.
         inner.prepare(Operation::RecvBuf(RecvOp {
             fd,
             buf: buffer,
-            flags: libc::MSG_DONTWAIT,
+            flags: 0,
         }));
         queue(&self.state, inner);
         Ok(())
@@ -755,10 +760,12 @@ impl IOSocket for IoUringSocket {
             }
         }
         let inner = c.inner_mut();
+        // No MSG_DONTWAIT: a full send buffer fast-polls for writability instead
+        // of busy-retrying EAGAIN; a writable socket still completes inline.
         inner.prepare(Operation::Send(SendOp {
             fd,
             buf,
-            flags: libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,
+            flags: libc::MSG_NOSIGNAL,
         }));
         queue(&self.state, inner);
         Ok(())
@@ -794,10 +801,11 @@ impl IOSocket for IoUringSocket {
             }
         }
         let inner = c.inner_mut();
+        // No MSG_DONTWAIT: fast-poll for writability instead of busy-retrying.
         inner.prepare(Operation::SendOwned(SendOp {
             fd,
             buf,
-            flags: libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,
+            flags: libc::MSG_NOSIGNAL,
         }));
         queue(&self.state, inner);
         Ok(())
