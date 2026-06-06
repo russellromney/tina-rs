@@ -36,3 +36,40 @@ Decision:
 
 - Implementation-ready. This is not a planning phase. It names the current hot
   paths, the changes to make, and the proof required to call them real.
+
+## Plan Review 2
+
+Findings:
+
+- [P2] "At least three changed protocol paths" was too easy to satisfy with
+  helper-level wins while the public rows stayed ugly. The Goal/Done sections
+  now require HTTP/2 steady-state, one gRPC row, and one WebSocket row to get
+  cheaper in public API use.
+- [P2] Rock 2 allowed an implementation to remove the response-body clone but
+  keep per-DATA-frame `Vec` allocation through a generic "move chunks" phrase.
+  The plan now requires a direct frame writer (`encode_frame_into` /
+  `push_data_frame` shape) for multi-frame responses.
+- [P2] The `VecDeque<u8>` replacement could keep huge consumed buffers resident
+  forever. Rock 3 now requires compaction/drop when a stream finishes, with
+  multi-frame POST proof.
+- [P2] WebSocket compatibility could keep the bad path as the default. The plan
+  now permits a breaking cleanup: one connection-owner event per wire event,
+  session-rich by default, no duplicate legacy emission.
+- [P2] Turn-count reduction could be faked in the perf harness. Rock 5 now says
+  the removed turn must be in runtime/protocol code or a canonical public
+  specimen path.
+- [P2] Allocation wins can hide latency regressions. Rock 6 now requires a
+  before/after table with process allocations, allocated bytes, p50/p90/p99,
+  and stage count; if latency worsens, the PR must fix it or mark the phase
+  incomplete.
+- [P2] The plan assumed a gRPC perf row exists. If Phase 152 did not land one,
+  that would let the implementer defer gRPC proof. Rock 3 now requires adding a
+  minimal public unary gRPC row first, recording it as the before row, and then
+  improving it in the same phase.
+- [P3] "Compile-time proof if possible" was soft. Rock 4 now requires a
+  compile/doctest-style proof for the session-rich WebSocket app path.
+
+Decision:
+
+- Stronger. The phase now demands public-row improvement, direct byte-writer
+  changes, no compatibility-tax default, and honest latency reporting.

@@ -28,8 +28,15 @@ Make native HTTP/2, gRPC-over-HTTP/2, and WebSocket public paths cheaper:
 4. reduce one real WebSocket public-path copy/allocation cost;
 5. pin before/after allocation and stage evidence on macOS and Linux/x86.
 
-Done means at least three changed protocol paths show lower allocation/copy
-cost in normal public API use. A harness-only improvement does not count.
+Done means the normal public protocol rows get cheaper, not just helper tests:
+
+- HTTP/2 steady-state process allocations or allocated bytes improve;
+- one gRPC-over-HTTP/2 row improves;
+- one WebSocket public session row improves;
+- at least one HTTP/2 or WebSocket stage row has fewer turns.
+
+Micro-tests may prove a clone site is gone, but they do not satisfy the phase
+unless the public rows move too.
 
 ## Non-Goals
 
@@ -40,8 +47,9 @@ cost in normal public API use. A harness-only improvement does not count.
   truth;
 - no weakening WebSocket close, ping/pong, pressure, stale-session, or slow-peer
   truth;
-- no public API churn unless it removes a real copy/allocation from normal user
-  code.
+- no unrelated public API churn;
+- no compatibility wrapper that keeps the old duplicate/allocation-heavy path
+  as the documented default.
 
 ## Starting Inventory
 
@@ -91,10 +99,16 @@ Use the owned helper in both:
 
 Proof:
 
+- a focused allocation/copy test proves unpadded DATA extraction does not
+  allocate beyond moving the already-owned payload;
 - unit tests for unpadded DATA, padded DATA, bad padding, empty DATA;
 - server/client integration tests still pass for request body, response body,
   flow-control credit, and DATA-before-HEADERS errors;
 - Phase 152 HTTP/2 rows show lower process allocation count or allocated bytes.
+
+Do not leave `data_payload(&Frame)` as the default helper for DATA handlers. If
+a borrowed helper remains for header tests or debug code, name it so handlers do
+not accidentally choose the cloning path.
 
 ## Rock 2: Send Buffered HTTP/2 Responses Without Body Clones
 
@@ -114,8 +128,10 @@ when it arrives:
 Then remove per-frame body copies:
 
 - do not call `chunk.to_vec()` for every DATA frame;
-- either encode DATA frames directly from body slices into the outbound write
-  buffer, or move chunks out of the body without copying;
+- add an `encode_frame_into` / `push_data_frame` helper that writes the frame
+  header plus payload bytes directly into the pending write buffer or queue;
+- use it for multi-frame buffered responses so there is no separate DATA
+  payload `Vec` per frame;
 - preserve frame splitting at `peer_max_frame_size`;
 - preserve trailers and END_STREAM rules.
 
@@ -127,6 +143,9 @@ Proof:
 - oversized response still resets with `EnhanceYourCalm`;
 - HTTP/2 steady-state response row has lower allocation count than Phase 152.
 
+This rock must improve a multi-frame response, not only the empty/small-body
+case where the old clone was cheap.
+
 ## Rock 3: Fix Streaming And gRPC DATA Copies
 
 Make the streaming/gRPC DATA paths use the same cheaper frame writer.
@@ -137,12 +156,18 @@ Targets:
 - client `flush_outbound_data`;
 - gRPC client/server paths that send DATA through HTTP/2.
 
+If Phase 152 did not land a gRPC perf row, add the smallest public unary gRPC
+row first, record it as the before row, then improve it in this same phase.
+Do not defer gRPC evidence just because the row was missing.
+
 Required shape:
 
 - stop using `VecDeque<u8>` for buffered request bodies if it causes per-byte
   pop/copy on every DATA frame;
-- store outbound body as a `Vec<u8>` plus cursor, or another bounded owned
-  buffer shape that moves/slices without per-byte work;
+- store outbound body as an owned byte buffer plus cursor/range, or another
+  bounded shape that slices without per-byte work;
+- compact/drop consumed large buffers when a stream finishes so a one-time huge
+  request does not become permanent resident memory;
 - build DATA frames into pending write storage without an extra payload `Vec`
   when possible;
 - keep streaming request sources bounded and cancelable.
@@ -152,7 +177,9 @@ Proof:
 - gRPC unary and streaming tests still pass;
 - HTTP/2 client buffered POST with a multi-frame body still sends all bytes;
 - flow-control blocked streams resume after `WINDOW_UPDATE`;
-- one gRPC or HTTP/2 client request row shows lower allocation/copy cost.
+- one gRPC row and one HTTP/2 client request row show lower allocation/copy
+  cost, or the PR includes exact evidence that they share the same changed
+  code path and only one row can move independently.
 
 ## Rock 4: Reduce One WebSocket Public-Path Copy
 
@@ -168,6 +195,9 @@ Implement this semantic cleanup:
   messages, but do not emit duplicate compatibility messages from the protocol
   owner;
 - update examples/specimens/tests to use the session-rich copied path.
+
+This is allowed to be a breaking cleanup. Tina has no stable public API yet;
+prefer one clear new-user path over a compatibility tax.
 
 Then reduce one additional WebSocket copy if it is still visible in the row:
 
@@ -187,6 +217,10 @@ Proof:
 - close handshake and stale-session truth still work;
 - WebSocket perf row shows lower allocation count or allocated bytes.
 
+Add one compile-time or doctest-style proof: new session apps compile using
+session-rich events only, without matching legacy `Text`/`Binary` variants
+emitted by the connection owner.
+
 ## Rock 5: Reduce One Turn Count Or Stage Gap
 
 Use the Phase 152 stage rows to remove at least one avoidable protocol turn or
@@ -199,6 +233,9 @@ Allowed examples:
 - avoid a needless read/write ping-pong when a queued write is already ready;
 - avoid an extra app-control message in the WebSocket perf service if the
   state transition can be represented by an existing typed event.
+
+The reduced turn must be in runtime/protocol code or the canonical public
+specimen path. A perf-harness-only shortcut does not count.
 
 Not allowed:
 
@@ -227,6 +264,18 @@ Add or tighten deterministic ceilings for changed paths:
 - allocation ceilings for changed protocol rows where stable;
 - stage ceilings for changed stage rows;
 - no latency ceiling so tight that shared CI gets flaky.
+
+Required evidence shape:
+
+- save the Phase 152 before rows used for comparison;
+- save the Phase 153 after rows;
+- compare before/after rows from the same machine class, release profile, and
+  sample policy;
+- include a short table in the PR body or phase notes with before/after for
+  process allocations, allocated bytes, p50, p90, p99, and stage count for each
+  changed row;
+- if latency gets worse while allocations improve, do not bury it. Explain it
+  and either fix it or mark the phase incomplete.
 
 ## Docs
 
@@ -266,7 +315,10 @@ Linux:
 
 ## Done
 
-- At least three real protocol code paths allocate/copy less.
+- HTTP/2 steady-state, one gRPC row, and one WebSocket row are cheaper in
+  public API use, measured with same-machine/same-policy before and after rows.
+- The exact clone/copy sites named in Starting Inventory are removed or have a
+  written code-level reason they cannot be removed safely in this phase.
 - At least one protocol stage row has fewer turns.
 - HTTP/2, gRPC, and WebSocket semantics are still proved end-to-end.
 - macOS and Linux release perf evidence are saved.
