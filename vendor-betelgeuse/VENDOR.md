@@ -46,12 +46,19 @@ than pin a moving git dependency.
   is a **separate OS handle** (Linux `eventfd`, macOS `EVFILT_USER`, simulated
   condvar), not a clone of the `Rc<dyn IOLoop>`. A host thread may wake the loop
   but never touches backend state.
-- **Linux fast-poll reads/writes** — dropped `MSG_DONTWAIT` from the io_uring
-  `recv`/`recv_buf`/`send`/`send_owned` ops so io_uring fast-polls them (blocks
-  until ready) instead of returning `EAGAIN` for the upstream busy-retry loop. A
-  request with data ready still completes inline; an idle/pending read now parks
-  on the kernel instead of busy-spinning. Required for the blocking wait to
-  actually block on Linux (macOS/kqueue already arms a real `EVFILT` watch).
+- **Linux reads/writes use io_uring's default fast-poll** — dropped
+  `MSG_DONTWAIT` from the `recv`/`recv_buf`/`send`/`send_owned` ops. This is a
+  workload choice, not a defect fix. Upstream sets `MSG_DONTWAIT` and retries on
+  `EAGAIN` — a busy-poll loop that is optimal for an *always-busy* server (the
+  parakernel/TigerBeetle target), where you never idle and never want to pay a
+  wakeup. tina is a general runtime that *idles* between requests, so it wants
+  io_uring's default async mode: omit `MSG_DONTWAIT` and let fast-poll arm the
+  poll. Crucially the two are **identical under load** — when data is ready the
+  recv completes inline either way; they only differ when there is no data, i.e.
+  at idle, where fast-poll lets the worker block on the kernel instead of
+  spinning. So this changes nothing in the regime upstream's design operates in;
+  it only defines the idle gap that upstream's always-busy target never enters.
+  (macOS/kqueue already arms a real `EVFILT` watch, so it is unaffected.)
 - Doorbell coalescing truth is an `AtomicBool` that only `step_blocking` clears;
   the kernel interrupt (eventfd / `EVFILT_USER`) only unblocks a waiting kernel
   call. `step()` may observe and skip the doorbell event but never clears the
