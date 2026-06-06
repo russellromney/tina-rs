@@ -1553,8 +1553,9 @@ fn shutdown_runtime(
 // the plan keeps the first form Tina-only. Each row drives the *real* Tina
 // server isolate (Http2Listener / HttpListener+WebSocket gateway) over a raw
 // socket client, exactly like the HTTP/1 rows drive the real server over a raw
-// `TcpStream`. The raw client keeps the measured cost on the server side and
-// out of the allocation counters.
+// `TcpStream`. Allocation counts include the raw client work inside the row
+// op; process rows include both client and server work. Treat them as
+// whole-operation evidence, not server-only allocation proof.
 //
 // `kind` carries the setup-vs-reuse class so connection setup cost is never
 // silently mixed with steady-state service cost:
@@ -2126,7 +2127,8 @@ fn ws_send_close(stream: &mut TcpStream) -> anyhow::Result<()> {
         match ws_read_frame(stream) {
             Ok((WS_OPCODE_CLOSE, _)) => return Ok(()),
             Ok(_) => continue,
-            Err(_) => return Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
+            Err(err) => return Err(err.into()),
         }
     }
 }
@@ -2373,5 +2375,51 @@ fn ws_overfill_op(addr: SocketAddr) -> anyhow::Result<bool> {
             }
             Err(err) => return Err(err.into()), // timeout/hang/other: a real failure
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::TcpListener;
+    use std::sync::mpsc;
+
+    #[test]
+    fn websocket_close_drain_does_not_treat_timeout_as_clean_close() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test listener");
+        let addr = listener.local_addr().expect("listener addr");
+        let (done_tx, done_rx) = mpsc::channel();
+
+        thread::spawn(move || {
+            let (mut peer, _) = listener.accept().expect("accept close test peer");
+            let mut buf = [0u8; 8];
+            let _ = peer.read(&mut buf);
+            // Keep the connection open without sending a close frame. The
+            // client helper must surface its read timeout as failure, not count
+            // it as a clean drain.
+            let _ = done_rx.recv_timeout(Duration::from_millis(250));
+        });
+
+        let mut stream = TcpStream::connect(addr).expect("connect close test peer");
+        stream
+            .set_read_timeout(Some(Duration::from_millis(25)))
+            .expect("set read timeout");
+        stream
+            .set_write_timeout(Some(Duration::from_millis(25)))
+            .expect("set write timeout");
+
+        let error = ws_send_close(&mut stream).expect_err("timeout is not clean close");
+        let io_error = error
+            .downcast_ref::<std::io::Error>()
+            .expect("close timeout remains an io error");
+        assert!(
+            matches!(
+                io_error.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+            ),
+            "unexpected timeout error kind: {:?}",
+            io_error.kind(),
+        );
+        let _ = done_tx.send(());
     }
 }

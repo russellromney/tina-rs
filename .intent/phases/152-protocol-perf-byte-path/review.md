@@ -211,3 +211,32 @@ Re-verified after the fixes: `make perf` (perf + hotpath, incl. median-of-five
 rows and the alloc ceiling), `cargo test -p tina-http --all-targets`,
 `cargo fmt --all --check`, `clippy -p tina-http -p tina-runtime`, `make proof-fast`
 all green on macOS/aarch64. Linux sample still missing — PR remains non-final.
+
+## Implementation Review 3 (Codex adversarial pass)
+
+Findings fixed in this pass:
+
+- [P2] `ws_send_close` treated every read error after sending CLOSE as a clean
+  drain. That let a read timeout or stuck peer count as `Ok`, so the
+  `websocket_open_close` / `websocket_text_round_trip` rows could pass even if
+  the server never completed the close handshake. Fixed: only an actual CLOSE
+  frame or clean `UnexpectedEof` is accepted; timeout/other I/O errors now fail
+  the op. Added
+  `websocket_close_drain_does_not_treat_timeout_as_clean_close`.
+- [P3] The native protocol row docs claimed the raw client kept measured cost on
+  the server and out of allocation counters. `run_counted` counts allocations in
+  the raw client op too, and process rows include client plus server. Fixed the
+  README and source comments to call these whole-operation allocation rows, not
+  server-only allocation proof.
+
+Proof after fixes:
+
+- `cargo test --manifest-path examples/systems/perf_native/Cargo.toml websocket_close_drain_does_not_treat_timeout_as_clean_close -- --nocapture`
+- `cargo fmt --all --check`
+- `cargo test --release --manifest-path examples/systems/perf_native/Cargo.toml --test perf -- --nocapture`
+- `cargo test --release --manifest-path examples/systems/perf_native/Cargo.toml --test hotpath -- --nocapture`
+
+Status:
+
+- The PR is still not merge-ready by the Phase 152 plan because Linux/x86
+  release evidence remains missing.

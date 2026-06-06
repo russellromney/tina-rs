@@ -334,8 +334,10 @@ These are Tina-only rows (`comparison_baseline=none`). A fair hyper/tonic or
 tungstenite baseline would dwarf the row and make "equivalent workload" a lie,
 so the first form stays Tina-only and says so. Each row drives the *real* Tina
 server isolate (`Http2Listener`, or `HttpListener` + a WebSocket gateway) over a
-raw socket client — the same shape the HTTP/1 rows use, which keeps the measured
-cost on the server and out of the allocation counters.
+raw socket client, the same shape the HTTP/1 rows use. Allocation counts include
+the raw client operation too, and process rows include both client and server
+work, so treat them as whole-operation evidence rather than server-only
+allocation proof.
 
 `kind` names the setup-vs-reuse class so connection setup is never silently mixed
 with steady-state service cost:
