@@ -134,6 +134,12 @@ pub(crate) trait RuntimeDriver: std::fmt::Debug {
         None
     }
 
+    /// Shared mailbox wake hook (rings the park doorbell), cloned into each
+    /// mailbox. `None` for drivers without a blocking park.
+    fn mailbox_wake_hook(&self) -> Option<Arc<dyn Fn() + Send + Sync>> {
+        None
+    }
+
     /// Earliest runtime-owned deadline the worker must wake for (timers, signal
     /// waits). `None` means no timed work pending. Lane/socket I/O readiness is
     /// delivered by [`park`](Self::park) itself, so it is not a deadline here.
@@ -260,6 +266,10 @@ pub(crate) struct BetelgeuseDriver {
     /// worker on real readiness (`step_blocking`) and to mint the wake doorbell.
     /// The TCP/TLS/Unix/storage lanes hold their own clones of the same loop.
     io_loop: IOLoopHandle<Global>,
+    /// One shared "ring the doorbell" closure, built once from the loop's waker
+    /// and Arc-cloned into each mailbox's wake hook — so a direct mailbox send
+    /// wakes a parked worker without allocating a closure per registration.
+    mailbox_wake_hook: Option<Arc<dyn Fn() + Send + Sync>>,
     tcp: BetelgeuseTcp,
     storage: StorageLane,
     dns: DnsLane,
@@ -271,6 +281,11 @@ pub(crate) struct BetelgeuseDriver {
     timers: Vec<TimerEntry>,
     next_timer_ordinal: u64,
     os_signals: OsSignalDispatcher,
+}
+
+fn mailbox_wake_hook_from(io_loop: &IOLoopHandle<Global>) -> Option<Arc<dyn Fn() + Send + Sync>> {
+    let waker = io_loop.waker();
+    Some(Arc::new(move || waker.wake()))
 }
 
 /// One pending timer tracked by the driver.
@@ -297,6 +312,7 @@ impl BetelgeuseDriver {
 
     pub(crate) fn with_io_loop(io_loop: IOLoopHandle<Global>) -> Self {
         Self {
+            mailbox_wake_hook: mailbox_wake_hook_from(&io_loop),
             io_loop: io_loop.clone(),
             // TLS rides the same Betelgeuse loop as plain TCP — a cloned
             // handle, not a second socket stack.
@@ -327,6 +343,7 @@ impl BetelgeuseDriver {
         signal_capacity: usize,
     ) -> Self {
         Self {
+            mailbox_wake_hook: mailbox_wake_hook_from(&io_loop),
             io_loop: io_loop.clone(),
             tls: TlsLane::new(tls_lane_capacity, io_loop.clone()),
             unix: UnixLane::new(io_loop.clone()),
@@ -558,6 +575,10 @@ impl RuntimeDriver for BetelgeuseDriver {
 
     fn wake_handle(&self) -> Option<IOWaker> {
         Some(self.io_loop.waker())
+    }
+
+    fn mailbox_wake_hook(&self) -> Option<Arc<dyn Fn() + Send + Sync>> {
+        self.mailbox_wake_hook.clone()
     }
 
     fn next_deadline(&self) -> Option<Instant> {

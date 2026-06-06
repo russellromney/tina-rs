@@ -24,7 +24,6 @@ use std::any::Any;
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::marker::PhantomData;
-use std::sync::Arc;
 
 use tina::{
     Address, AddressGeneration, Isolate, IsolateId, Mailbox, Outbound as TinaOutbound, Shard,
@@ -51,8 +50,10 @@ where
     F: MailboxFactory,
 {
     fn install_mailbox_wake_hook<T: 'static>(&self, mailbox: &dyn Mailbox<T>) {
-        if let Some(waker) = self.driver.wake_handle() {
-            mailbox.set_wake_hook(Some(Arc::new(move || waker.wake())));
+        // Clone the driver's one shared hook (an Arc refcount bump), not a fresh
+        // closure per mailbox — keeps the spawn/restart allocation count pinned.
+        if let Some(hook) = self.driver.mailbox_wake_hook() {
+            mailbox.set_wake_hook(Some(hook));
         }
     }
 
