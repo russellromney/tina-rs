@@ -222,3 +222,63 @@ pub(super) fn add_window(current: i32, increment: u32) -> Result<i32, Http2Proto
     }
     Ok(next as i32)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn into_data_payload_unpadded_moves_payload_and_reports_wire_len() {
+        let frame = Frame::new(FRAME_DATA, 0, 1, vec![10, 20, 30]);
+        let original = frame.payload.as_ptr();
+        let (payload, flow_len) = into_data_payload(frame).expect("unpadded DATA");
+        assert_eq!(payload, vec![10, 20, 30]);
+        // Unpadded DATA returns the same allocation it was given (a move, not a
+        // clone): the buffer pointer is unchanged.
+        assert_eq!(payload.as_ptr(), original);
+        assert_eq!(flow_len, 3, "wire length is the full payload length");
+    }
+
+    #[test]
+    fn into_data_payload_empty_unpadded_is_zero_len() {
+        let frame = Frame::new(FRAME_DATA, 0, 1, Vec::new());
+        let (payload, flow_len) = into_data_payload(frame).expect("empty DATA");
+        assert!(payload.is_empty());
+        assert_eq!(flow_len, 0);
+    }
+
+    #[test]
+    fn into_data_payload_padded_trims_and_keeps_wire_len() {
+        // payload = [pad_len=2][10,20,30][pad,pad]
+        let frame = Frame::new(FRAME_DATA, FLAG_PADDED, 1, vec![2, 10, 20, 30, 0, 0]);
+        let (payload, flow_len) = into_data_payload(frame).expect("padded DATA");
+        assert_eq!(
+            payload,
+            vec![10, 20, 30],
+            "only the unpadded body is returned"
+        );
+        assert_eq!(
+            flow_len, 6,
+            "flow-control wire length counts the pad-length byte and padding"
+        );
+    }
+
+    #[test]
+    fn into_data_payload_pad_longer_than_body_is_bad_frame() {
+        // pad_len=5 but only 2 bytes follow.
+        let frame = Frame::new(FRAME_DATA, FLAG_PADDED, 1, vec![5, 1, 2]);
+        assert!(matches!(
+            into_data_payload(frame),
+            Err(Http2ProtocolError::BadFrameLength)
+        ));
+    }
+
+    #[test]
+    fn into_data_payload_padded_with_empty_payload_is_bad_frame() {
+        let frame = Frame::new(FRAME_DATA, FLAG_PADDED, 1, Vec::new());
+        assert!(matches!(
+            into_data_payload(frame),
+            Err(Http2ProtocolError::BadFrameLength)
+        ));
+    }
+}

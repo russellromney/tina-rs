@@ -420,20 +420,6 @@ and reviews live under `.intent/phases/`.
   response body clone, the inbound DATA payload clone, streaming/chunked and
   gRPC request framing, wide tails under one single-shard worker, and no
   production-performance claim until evidence earns it.
-- The real protocol performance pass then changed the protocol code those rows
-  measured. HTTP/2 DATA payloads move out of the owned frame instead of cloning
-  (`into_data_payload`), buffered HTTP/2 responses are consumed by value (the
-  body is moved, not cloned) and framed straight into the outbound queue
-  (`push_data_frame`), the HTTP/2 client request body dropped its per-byte
-  `VecDeque<u8>` drain for an owned `Vec` + cursor, and the WebSocket connection
-  owner now delivers exactly one session-rich app event per wire event instead
-  of also emitting a legacy duplicate. Same-machine before/after (macOS/aarch64):
-  HTTP/2 buffered-response allocations 3075 -> 3011 (one fewer per response), a
-  new public unary gRPC row 5599 -> 5548 process allocations, the WebSocket text
-  round trip 4691 -> 3865, and a 64-message WebSocket session 133 -> 67
-  app-handler turns. Latency was flat-to-better, no row regressed. Linux/x86_64
-  evidence for this pass is still pending; it remains local/alpha, not a
-  production claim.
 
 These are recorded in `CHANGELOG.md`; the remaining near-term roadmap now
 starts with native AWS. Public release cleanup waits until Tina stops
