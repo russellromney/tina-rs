@@ -89,18 +89,20 @@ const HTTP_STEADY_STAGE_CEILING: usize = 36;
 // allocation counting must run with no other test thread allocating; this
 // binary has a single test, so the counter is clean.
 //
-// The Phase 152 buffered-response rewrite builds each DATA frame straight into
-// the outbound queue, removing one body-sized allocation per DATA frame. The
-// count is dominated by the Rust code path (one `alloc` per `Vec`) and was
-// stable across repeated runs on this toolchain:
-//   before: 3139 allocations (49.05/request)
-//   after:  3075 allocations (48.05/request)  -> exactly one fewer per response
-// The regression is +64 (one re-added copy per request), so any ceiling in
-// (3075, 3139) catches it. 3130 is chosen below the pre-rewrite value (re-adding
-// the copy fails) with headroom above the post-rewrite value for toolchain/std
-// drift. This is a regression guard, not a cross-platform invariant; recalibrate
-// with a recorded before/after if a platform's fixed baseline differs.
-const H2_BUFFERED_RESPONSE_ALLOC_CEILING: u64 = 3_130;
+// The count is dominated by the Rust code path (one `alloc` per `Vec`) and is
+// stable across repeated runs on this toolchain. The arc, on macOS/aarch64:
+//   Phase 152 (one fewer DATA copy):           3075 (48.05/request)
+//   Phase 153 leaf copies (body clone gone):   3011 (47.05/request)
+//   Phase 153 structural (this pass):          2626 (41.03/request)
+// The structural pass removed the inbound HEADERS frame-decode `Vec` (the read
+// loop now decodes from a borrowed buffer slice) and coalesced the response
+// HEADERS + DATA into one queued write (so the per-frame encode `Vec`s and a
+// write turn go away): ~7 fewer allocations per request, ~14.6% off the Phase
+// 152 baseline. The ceiling sits just above the measured 2626 so a regression
+// that re-adds a per-request structural allocation fails, with headroom for
+// toolchain/std drift. Regression guard, not a cross-platform invariant;
+// recalibrate with a recorded before/after if a platform's baseline differs.
+const H2_BUFFERED_RESPONSE_ALLOC_CEILING: u64 = 2_680;
 const H2_BUFFERED_RESPONSE_REQUESTS: usize = 64;
 // Rock 5 (fewer turns): a WebSocket session of N text round trips. The
 // duplicate-delivery removal means the connection owner emits one app event per
