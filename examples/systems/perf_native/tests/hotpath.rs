@@ -89,20 +89,23 @@ const HTTP_STEADY_STAGE_CEILING: usize = 36;
 // allocation counting must run with no other test thread allocating; this
 // binary has a single test, so the counter is clean.
 //
-// The count is dominated by the Rust code path (one `alloc` per `Vec`) and is
-// stable across repeated runs on this toolchain. The arc, on macOS/aarch64:
+// The count is dominated by the Rust code path (one `alloc` per `Vec`, and the
+// perf allocator counts each `Vec` growth realloc too) and is stable across
+// repeated runs on this toolchain. The arc, on macOS/aarch64:
 //   Phase 152 (one fewer DATA copy):           3075 (48.05/request)
 //   Phase 153 leaf copies (body clone gone):   3011 (47.05/request)
-//   Phase 153 structural (this pass):          2626 (41.03/request)
-// The structural pass removed the inbound HEADERS frame-decode `Vec` (the read
-// loop now decodes from a borrowed buffer slice) and coalesced the response
-// HEADERS + DATA into one queued write (so the per-frame encode `Vec`s and a
-// write turn go away): ~7 fewer allocations per request, ~14.6% off the Phase
-// 152 baseline. The ceiling sits just above the measured 2626 so a regression
-// that re-adds a per-request structural allocation fails, with headroom for
-// toolchain/std drift. Regression guard, not a cross-platform invariant;
-// recalibrate with a recorded before/after if a platform's baseline differs.
-const H2_BUFFERED_RESPONSE_ALLOC_CEILING: u64 = 2_680;
+//   Phase 153 structural (decode + coalesce):  2626 (41.03/request)
+//   Phase 153 header encode (presize + itoa):  2434 (38.03/request)
+// The structural work removed the inbound HEADERS frame-decode `Vec` (the read
+// loop decodes from a borrowed buffer slice), coalesced the response HEADERS +
+// DATA into one queued write (per-frame encode `Vec`s and a write turn gone),
+// and pre-sized the response header block while formatting content-length into
+// a stack buffer (no growth reallocs, no `String`): ~10 fewer allocations per
+// request, ~20.8% off the Phase 152 baseline. The ceiling sits just above the
+// measured 2434 so a regression that re-adds a per-request allocation fails,
+// with headroom for toolchain/std drift. Regression guard, not a cross-platform
+// invariant; recalibrate with a recorded before/after if a platform differs.
+const H2_BUFFERED_RESPONSE_ALLOC_CEILING: u64 = 2_480;
 const H2_BUFFERED_RESPONSE_REQUESTS: usize = 64;
 // Rock 5 (fewer turns): a WebSocket session of N text round trips. The
 // duplicate-delivery removal means the connection owner emits one app event per

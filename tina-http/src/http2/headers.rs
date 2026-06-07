@@ -194,10 +194,19 @@ pub(super) fn encode_response_headers_with_len(
     response: &HttpResponse,
     body_len: Option<usize>,
 ) -> Vec<u8> {
-    let mut block = Vec::new();
+    // Pre-size so a small header block does not pay several growth
+    // reallocations — each `Vec` realloc is a counted allocation under the perf
+    // allocator (the default `GlobalAlloc::realloc` calls `alloc`).
+    let mut block = Vec::with_capacity(96);
     encode_literal_header(":status", response.status.as_str(), &mut block);
     if let Some(body_len) = body_len {
-        encode_literal_header("content-length", &body_len.to_string(), &mut block);
+        // Format content-length into a stack buffer instead of a heap `String`.
+        let mut len_buf = [0u8; 20];
+        encode_literal_header(
+            "content-length",
+            format_usize(&mut len_buf, body_len),
+            &mut block,
+        );
     }
     for (name, value) in response.headers.iter() {
         if name.as_str().starts_with(':') {
@@ -217,9 +226,27 @@ pub(super) fn encode_response_headers_with_len(
     block
 }
 
+/// Format a `usize` as decimal ASCII into a stack buffer, returning a `&str`
+/// view — no heap `String`. The buffer must be at least 20 bytes (fits
+/// `usize::MAX`).
+fn format_usize(buf: &mut [u8; 20], mut n: usize) -> &str {
+    let mut i = buf.len();
+    if n == 0 {
+        i -= 1;
+        buf[i] = b'0';
+    }
+    while n > 0 {
+        i -= 1;
+        buf[i] = b'0' + (n % 10) as u8;
+        n /= 10;
+    }
+    // SAFETY-free: only ASCII digits were written into `buf[i..]`.
+    std::str::from_utf8(&buf[i..]).expect("ascii digits are valid utf-8")
+}
+
 pub(super) fn encode_trailers(headers: &HeaderMap) -> Option<Vec<u8>> {
     let status = headers.get("grpc-status")?;
-    let mut block = Vec::new();
+    let mut block = Vec::with_capacity(64);
     if let Ok(value) = status.to_str() {
         encode_literal_header("grpc-status", value, &mut block);
     }
