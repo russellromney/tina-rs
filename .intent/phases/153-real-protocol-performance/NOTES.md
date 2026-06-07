@@ -59,12 +59,15 @@ public unary gRPC path (`GrpcRouter` behind the real `Http2Listener`, driven by
 `grpc_unary_call_h2c_blocking`). The WebSocket rows improve from the
 single-event delivery (one app message + payload move instead of two).
 
-The Tina HTTP/2 *client* request path also dropped its per-byte
-`VecDeque<u8>` outbound-body drain for an owned `Vec` + cursor with direct DATA
-framing, and the inbound DATA clone is gone via `into_data_payload`. No current
-perf row drives the Tina HTTP/2 client (every row uses a raw-socket client), so
-that win is covered by the `tina-http` correctness suite (41 binaries green),
-not a headline row — stated plainly rather than implied.
+The Tina HTTP/2 *client* request path is now measured by
+`http2_h2c_client_steady_state_post`: one native `Http2ClientConnection`
+submits buffered POSTs to the native `Http2Listener` over a warmed h2c
+connection. With the row code copied onto the Phase 152 base, the row's
+whole-process allocations dropped from 4266 to **3643** and allocated bytes from
+2161066 to **1685168**. The row's load-worker allocation scope is unchanged
+(120 allocations) because request construction still allocates the submitted
+body; the useful signal is the process row that includes the client/server
+runtime path.
 
 ## Latency (median-of-5, noisy on a laptop — reported, not claimed)
 
@@ -141,17 +144,22 @@ sample policy.
 | --- | ---: | ---: | ---: |
 | `http2_h2c_steady_state_small` allocations | 1570 | **1249** | **−20.4%** |
 | `http2_h2c_steady_state_small` allocated_bytes | 426776 | **234072** | **−45.1%** |
+| `http2_h2c_client_steady_state_post` allocations | 4266 | **3643** | **−14.6%** |
+| `http2_h2c_client_steady_state_post` allocated_bytes | 2161066 | **1685168** | **−22.0%** |
 | `grpc_h2c_unary_close` allocations | 5599 | **4964** | **−11.3%** |
 
-gRPC rides the same server response path, so it improves too. Both HTTP/2
-steady-state and gRPC now drop by a double-digit / meaningful chunk, not one
-allocation.
+The native-client row proves the client path too: buffered POST bodies ride the
+client's owned-buffer/cursor DATA pacer, and response DATA is decoded through
+the owned payload path. gRPC rides the same server response path, so it improves
+too. HTTP/2 server, HTTP/2 client, and gRPC now drop by a double-digit /
+meaningful chunk, not one allocation.
 
 ### Latency (median-of-5)
 
 | row | kind | before p50 | after p50 | note |
 | --- | --- | ---: | ---: | --- |
 | `http2_h2c_steady_state_small` | reuse | 209 µs | **182 µs** | improved (warmed per-request signal) |
+| `http2_h2c_client_steady_state_post` | reuse | 1287 µs | **1051 µs** | improved; public native client + server path |
 | `grpc_h2c_unary_close` | setup | 829 µs | 911 µs | connect-bound; this is a per-op-connect row, so p50 swings 821–939 µs run-to-run on kernel connect/accept, not the changed code |
 | `websocket_steady_state_small` | reuse | 262 µs | 180 µs | improved |
 
@@ -182,9 +190,10 @@ framing work.
 
 ## Linux / x86_64
 
-**MISSING in this session.** No Linux/x86_64 sample was collected (this was a
-macOS/aarch64 build session). The PR is non-final until the Linux/Fly perf
-bundle is run and saved here. Expected: the deterministic allocation/turn wins
-(`perf-h2-alloc` 3075→3011, `perf-ws-turns` 133→67, per-row process-allocation
-deltas) are platform-independent and should reproduce; the latency rows will
-differ in absolute value.
+**MISSING in this session.** No Linux/x86_64 sample was collected. A local Fly
+attempt on 2026-06-07 was blocked before build by `fly apps list` reporting no
+access token. The PR is non-final until an authenticated session runs the
+Linux/Fly perf bundle and saves it here. Expected: the deterministic
+allocation/turn wins (`perf-h2-alloc` 3075→2434, `perf-ws-turns` 133→67,
+per-row process-allocation deltas) are platform-independent and should
+reproduce; the latency rows will differ in absolute value.

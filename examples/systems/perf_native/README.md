@@ -464,6 +464,14 @@ machine.
 - **HTTP/2 steady-state row** (`http2_h2c_steady_state_small`): whole-process
   allocations 1570 → **1249** (**−20.4%**), allocated bytes 426776 → **234072**
   (**−45%**), p50 209 → **182 µs**.
+- **Native HTTP/2 client row** (`http2_h2c_client_steady_state_post`): one
+  native `Http2ClientConnection` submits buffered POSTs to the native server over
+  a warmed h2c connection. With the row code copied onto the Phase 152 base,
+  whole-process allocations 4266 → **3643** (**−14.6%**), allocated bytes
+  2161066 → **1685168** (**−22%**), p50 1287 → **1051 µs**. The row's
+  load-worker allocation scope is unchanged because request construction still
+  allocates the submitted body; the process row is the useful client/server
+  signal.
 - **gRPC unary** (`grpc_h2c_unary_close`): the smallest public unary gRPC path
   (`GrpcRouter` behind the real `Http2Listener`, driven by
   `grpc_unary_call_h2c_blocking`). Whole-process allocations 5599 → **4964**
@@ -510,10 +518,11 @@ performance claim.
   length.
 - The HTTP/2 *client* request body is an owned `Vec` + cursor with direct DATA
   framing, replacing the per-byte `VecDeque<u8>` drain; consumed/finished
-  buffers are compacted/dropped. No perf row drives the Tina HTTP/2 client
-  (every row uses a raw-socket client), so this win is carried by the
-  `tina-http` correctness suite (incl. the 128 KB `large_upload_paces_through_real_window_updates`
-  flow-control test), not a headline row — stated plainly.
+  buffers are compacted/dropped. The
+  `http2_h2c_client_steady_state_post` row drives this public native-client path
+  directly, while the `tina-http` correctness suite still guards the protocol
+  edges (incl. the 128 KB `large_upload_paces_through_real_window_updates`
+  flow-control test).
 - WebSocket ping echoes its payload into the pong from a borrowed slice
   (`encode_server_frame_from`) and moves the owned payload into the app `Ping`
   notification — no clone.
@@ -540,5 +549,6 @@ request view — a separate, larger change, not more framing work.
 ### Platform
 
 macOS/aarch64 local/alpha. Linux/x86_64 evidence for this phase is **not yet
-collected** (see `NOTES.md`); the deterministic allocation/turn wins are
-expected to reproduce, the absolute latencies will differ.
+collected** (see `NOTES.md`; local Fly was blocked by a missing access token);
+the deterministic allocation/turn wins are expected to reproduce, the absolute
+latencies will differ.

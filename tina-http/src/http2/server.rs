@@ -67,7 +67,12 @@ pub struct Http2Limits {
     pub max_body_bytes: usize,
     /// Maximum buffered response body bytes for one stream.
     pub max_response_body_bytes: usize,
-    /// Bounded outbound frame queue length per connection.
+    /// Bounded outbound write-buffer queue length per connection.
+    ///
+    /// A queued buffer may contain one control frame, one streaming DATA frame,
+    /// or one coalesced buffered response (HEADERS + DATA frames + trailers).
+    /// Buffered response bytes are still bounded by
+    /// [`Http2Limits::max_response_body_bytes`].
     pub connection_outbound_queue_capacity: usize,
     /// Maximum bytes delivered to a service in one HTTP/2 request-body pull.
     pub request_stream_chunk_size: usize,

@@ -20,10 +20,12 @@ use tina::CallRejectedReason;
 use tina::capacity::{CapacityMode, CapacitySurfaceReport};
 use tina::prelude::*;
 use tina_http::{
-    BodyMetrics, GrpcLimits, GrpcRequest, GrpcResponse, GrpcRouter, GrpcRouterMsg, Http2Listener,
-    Http2ListenerMsg, Http2ServerConfig, HttpLimits, HttpListener, HttpListenerAddress,
-    HttpListenerMsg, HttpRequest, HttpResponse, HttpServerConfig, StatusCode, WebSocketLimits,
-    WebSocketSessionMsg, WebSocketSessionOutcome, grpc_unary_call_h2c_blocking, websocket_upgrade,
+    BodyMetrics, GrpcLimits, GrpcRequest, GrpcResponse, GrpcRouter, GrpcRouterMsg,
+    Http2ClientConnection, Http2ClientLimits, Http2ClientMsg, Http2ClientOutcome, Http2ClientReply,
+    Http2ClientRequest, Http2Listener, Http2ListenerMsg, Http2ServerConfig, Http2Target,
+    HttpLimits, HttpListener, HttpListenerAddress, HttpListenerMsg, HttpRequest, HttpResponse,
+    HttpServerConfig, StatusCode, WebSocketLimits, WebSocketSessionMsg, WebSocketSessionOutcome,
+    grpc_unary_call_h2c_blocking, websocket_upgrade,
 };
 use tina_proof_harness::{
     LoadObservation, LoadReport, LoadRun, LoadStop, OpOutcome, PerfAllocationReport,
@@ -1563,6 +1565,12 @@ fn shutdown_runtime(
 //   - `connection_setup`           one fresh connection per op
 //   - `connection_setup_amortized` one fresh connection, several requests
 //   - `steady_state_reuse`         warmed connection reused across ops
+//
+// Most HTTP/2 rows use a raw socket client to isolate the Tina server path. The
+// `http2_h2c_client_steady_state_post` row is the explicit Tina-client row: one
+// native `Http2ClientConnection` repeatedly submits buffered POSTs to the Tina
+// server over a warmed h2c connection, so client request-body pacing and
+// response DATA handling are measured too.
 // ---------------------------------------------------------------------------
 
 const PROTOCOL_OPS: u64 = HTTP_OPS;
@@ -1586,6 +1594,7 @@ pub fn run_native_rows() -> anyhow::Result<Vec<PerfReport>> {
         native_sampled(http2_h2c_close_row)?,
         native_sampled(http2_h2c_keepalive_row)?,
         native_sampled(http2_h2c_steady_state_small_row)?,
+        native_sampled(http2_h2c_client_steady_state_post_row)?,
         native_sampled(grpc_h2c_unary_close_row)?,
         native_sampled(websocket_open_close_row)?,
         native_sampled(websocket_text_round_trip_row)?,
@@ -1928,6 +1937,104 @@ fn http2_h2c_steady_state_small_row() -> anyhow::Result<PerfReport> {
     shutdown_runtime(runtime)?;
     Ok(PerfReport::from_load_with_allocations(
         "http2_h2c_steady_state_small",
+        "steady_state_reuse",
+        load,
+        allocations,
+    ))
+}
+
+fn start_h2_client(
+    runtime: &PerfRuntime,
+    addr: SocketAddr,
+) -> anyhow::Result<Address<Http2ClientMsg, Http2ClientReply>> {
+    let target = Http2Target::H2c {
+        authority: "localhost".to_string(),
+        addr,
+    };
+    let client = runtime
+        .register_with_capacity::<Http2ClientConnection<SingleShard>, _>(
+            Http2ClientConnection::new(target, Http2ClientLimits::default()),
+            CAPACITY,
+        )
+        .map_err(|e| anyhow::anyhow!("register tina http2 client: {e:?}"))?;
+    runtime
+        .try_send(client, Http2ClientMsg::Begin)
+        .map_err(|e| anyhow::anyhow!("start tina http2 client: {e:?}"))?;
+    Ok(client)
+}
+
+fn h2c_client_submit(
+    runtime: &PerfRuntime,
+    client: Address<Http2ClientMsg, Http2ClientReply>,
+    request_body: &[u8],
+    expected_response_len: usize,
+) -> anyhow::Result<()> {
+    let request = Http2ClientRequest::post("/", request_body.to_vec());
+    match runtime
+        .call_blocking(
+            client,
+            Http2ClientMsg::Submit(request),
+            PROTOCOL_CLIENT_TIMEOUT,
+        )
+        .map_err(|e| anyhow::anyhow!("h2 client submit call: {e:?}"))?
+    {
+        CallOutcome::Replied(Http2ClientReply::Outcome {
+            outcome: Http2ClientOutcome::Replied(response),
+            ..
+        }) => {
+            if response.status != StatusCode::OK {
+                anyhow::bail!("unexpected h2 client status {}", response.status);
+            }
+            if response.body.len() != expected_response_len {
+                anyhow::bail!(
+                    "unexpected h2 client response len {}, expected {expected_response_len}",
+                    response.body.len()
+                );
+            }
+            Ok(())
+        }
+        other => anyhow::bail!("unexpected h2 client outcome: {other:?}"),
+    }
+}
+
+fn http2_h2c_client_steady_state_post_row() -> anyhow::Result<PerfReport> {
+    let (runtime, listener, addr) = start_h2_server(small_body())?;
+    let client = start_h2_client(&runtime, addr)?;
+    let expected = small_body().len();
+    let request_body = Arc::new(vec![b'p'; FIXED_BODY_BYTES]);
+    h2c_client_submit(&runtime, client, &request_body, expected)?; // warm connect + stream state
+
+    let process_before = ProcessSnapshot::now();
+    let (load, allocations) = {
+        let runtime = Arc::clone(&runtime);
+        let request_body = Arc::clone(&request_body);
+        run_counted(
+            LoadRun {
+                workers: WORKERS,
+                stop: LoadStop::ops(PROTOCOL_OPS),
+                label: "tina_http2_h2c_client_steady_state_post",
+            },
+            move |_| match h2c_client_submit(&runtime, client, &request_body, expected) {
+                Ok(()) => OpOutcome::Ok,
+                Err(_) => OpOutcome::Err {
+                    kind: "http2_client_error",
+                },
+            },
+            None::<fn() -> LoadObservation>,
+        )
+    };
+    let (allocs, bytes, rss) = ProcessSnapshot::now().delta_from(process_before);
+    print_process_metrics(
+        "tina_http2_h2c_client_steady_state_post",
+        allocs,
+        bytes,
+        rss,
+    );
+    let _ = runtime.try_send(client, Http2ClientMsg::Stop);
+    let _ = runtime.try_send(listener, Http2ListenerMsg::Stop);
+    shutdown_runtime(runtime)?;
+    Ok(PerfReport::from_load_with_allocations(
+        "http2_h2c_client_steady_state_post",
         "steady_state_reuse",
         load,
         allocations,

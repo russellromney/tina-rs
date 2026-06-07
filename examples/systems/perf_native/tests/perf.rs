@@ -131,6 +131,7 @@ fn native_protocol_rows_are_printable_and_bounded() {
             "http2_h2c_close_request",
             "http2_h2c_keepalive_sequential",
             "http2_h2c_steady_state_small",
+            "http2_h2c_client_steady_state_post",
             "grpc_h2c_unary_close",
             "websocket_open_close",
             "websocket_text_round_trip",
