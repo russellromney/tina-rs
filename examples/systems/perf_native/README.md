@@ -433,3 +433,71 @@ macOS/aarch64 and is a regression guard (the regression is +64 over 64
 responses), not a cross-platform constant. Linux/x86 evidence for this phase is
 collected separately via the Fly/Ubuntu workflow and saved beside the phase
 plan.
+
+## Phase 153 real protocol performance
+
+Phase 152 measured the problem. Phase 153 changed the protocol code: move
+bytes instead of cloning them, allocate fewer things, take fewer turns — on the
+public paths users call. Before/after rows are same-machine (macOS/aarch64),
+same `--release` build, same rows, same sample policy; the full table and raw
+logs live in `.intent/phases/153-real-protocol-performance/`
+(`NOTES.md`, `perf_sample_macos_*`, `hotpath_sample_macos_*`).
+
+### What got cheaper
+
+- **HTTP/2 buffered response** (`perf-h2-alloc`, 64 warmed h2c responses):
+  process allocations 3075 → **3011** (48.05 → **47.05**/response). The
+  buffered body is now *moved* into `PendingResponse` — `enqueue_response`
+  consumes `HttpResponse` by value — instead of cloned, and a new
+  `push_data_frame` helper frames each chunk straight into the outbound queue.
+- **gRPC unary** (`grpc_h2c_unary_close`): a new row — the smallest public
+  unary gRPC path (`GrpcRouter` behind the real `Http2Listener`, driven by
+  `grpc_unary_call_h2c_blocking`). Whole-process allocations 5599 → **5548**
+  via the same server-side response path.
+- **WebSocket** (`websocket_text_round_trip` 4691 → **3865**,
+  `websocket_steady_state_small` 880 → **672** process allocations): the
+  connection owner now delivers exactly one session-rich app event per wire
+  event. It no longer also emits the legacy `Text`/`Binary`/`Close`/`Open`/
+  `Closed`/`Pressure` duplicate, so the payload is moved into a single delivery
+  instead of cloned.
+- **Fewer turns** (`perf-ws-turns`, 64 text round trips): app-handler turns for
+  the whole session 133 → **67** (2.08 → **1.05**/message). Removing the
+  duplicate delivery removes one app turn per wire event. The hotpath assertion
+  pins `app_turns < 2*N`; the Phase 152 code fails it, the new code passes.
+
+No row's latency regressed (gRPC was flat within run noise; the WebSocket rows
+improved). Latency on a laptop is noisy run-to-run, so the headline evidence is
+the deterministic allocation/turn counts; latency is reported in `NOTES.md`,
+not claimed. Still local/alpha, not a production performance claim.
+
+### Byte-path changes (the code, not the harness)
+
+- `into_data_payload(frame) -> (Vec<u8>, usize)` moves the unpadded DATA
+  payload out of the owned frame (server + client DATA handlers); the old
+  cloning `data_payload` is removed. Padded DATA still validates padding and
+  preserves the flow-control wire length.
+- The HTTP/2 *client* request body is an owned `Vec` + cursor with direct DATA
+  framing, replacing the per-byte `VecDeque<u8>` drain; consumed/finished
+  buffers are compacted/dropped. No perf row drives the Tina HTTP/2 client
+  (every row uses a raw-socket client), so this win is carried by the
+  `tina-http` correctness suite, not a headline row — stated plainly.
+- Server streaming `flush_response_stream` drains the consumed prefix straight
+  into the framed buffer (one copy, not two).
+- WebSocket ping echoes its payload into the pong from a borrowed slice
+  (`encode_server_frame_from`) and moves the owned payload into the app `Ping`
+  notification — no clone.
+
+### What still copies (named, not hidden)
+
+- gRPC messages still allocate the length-prefixed frame buffer
+  (`encode_grpc_message`) plus prost's internal encode.
+- `into_data_payload` still copies the trimmed bytes on the rarer *padded* DATA
+  path (the common unpadded path moves).
+- The WebSocket frame parse still copies the payload out of the reused read
+  buffer once; that is the minimum owned-payload copy, not a duplicate.
+
+### Platform
+
+macOS/aarch64 local/alpha. Linux/x86_64 evidence for this phase is **not yet
+collected** (see `NOTES.md`); the deterministic allocation/turn wins are
+expected to reproduce, the absolute latencies will differ.

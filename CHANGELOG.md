@@ -4,6 +4,46 @@ This file records completed work.
 
 ## Unreleased
 
+### Real Protocol Performance
+
+- HTTP/2 DATA payload ownership: a new `into_data_payload(frame) -> (Vec<u8>,
+  usize)` moves the unpadded payload out of the owned frame and returns the
+  flow-control wire length; the old cloning `data_payload` is removed so a
+  handler cannot pick it by accident. Server and client DATA handlers use the
+  owned path. Padded DATA still validates padding and preserves wire length;
+  flow-control accounting is unchanged.
+- HTTP/2 buffered responses are consumed by value: `enqueue_response` takes
+  `HttpResponse` by value and *moves* the buffered body into `PendingResponse`
+  instead of cloning it. `max_response_body_bytes` is still validated before the
+  body is stored or sent; Stream/ChunkedStream/WebSocket bodies are unchanged.
+  A new `push_data_frame` helper frames a DATA payload straight into the
+  outbound queue (header + slice), so a multi-frame buffered response copies
+  each chunk once. Measured: 3075 -> 3011 whole-process allocations over 64
+  warmed h2c responses (one fewer per response) on macOS/aarch64.
+- Streaming/gRPC DATA: server `flush_response_stream` drains the consumed prefix
+  straight into the framed buffer (one copy, not two). The HTTP/2 client request
+  body is an owned `Vec` + cursor with direct DATA framing, replacing the
+  per-byte `VecDeque<u8>` drain; consumed/finished buffers are compacted/dropped
+  so a long request body does not stay resident. A new public unary gRPC perf
+  row (`grpc_h2c_unary_close`, `GrpcRouter` behind the real `Http2Listener`)
+  improves through the same server-side path (5599 -> 5548 process allocations).
+- WebSocket single-event delivery: the connection owner now emits exactly one
+  session-rich app event per wire event (`SessionText`/`SessionBinary`/
+  `SessionClose`/`SessionClosed`/`SessionPressure`, `SessionOpen` +
+  `SessionAccepted` on open). It no longer also emits the legacy
+  `Text`/`Binary`/`Close`/`Open`/`Closed`/`Pressure` duplicate, so the payload
+  is moved into a single delivery instead of cloned. Ping echoes its payload
+  into the pong from a borrowed slice (`encode_server_frame_from`) and moves the
+  owned payload into the app `Ping` notification -- no clone. Examples,
+  specimens, and tests use the session-rich path. Measured: a 64-message
+  WebSocket session drops from 133 to 67 app-handler turns (2.08 -> 1.05 per
+  message), and `websocket_text_round_trip` from 4691 to 3865 process
+  allocations.
+- New proofs: `perf-ws-turns` (a hotpath probe asserting WebSocket app turns
+  stay below the pre-dedup `2*N`) and the `grpc_h2c_unary_close` perf row,
+  pinned in the perf test's label list. Not a production performance claim:
+  macOS/aarch64 local/alpha, Linux/x86_64 evidence still pending.
+
 ### Protocol Perf Rows And Byte-Path Cost
 
 - `examples/systems/perf_native` gains Tina-only native protocol rows

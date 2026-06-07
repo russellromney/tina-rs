@@ -420,10 +420,24 @@ and reviews live under `.intent/phases/`.
   response body clone, the inbound DATA payload clone, streaming/chunked and
   gRPC request framing, wide tails under one single-shard worker, and no
   production-performance claim until evidence earns it.
+- The real protocol performance pass then changed the protocol code those rows
+  measured. HTTP/2 DATA payloads move out of the owned frame instead of cloning
+  (`into_data_payload`), buffered HTTP/2 responses are consumed by value (the
+  body is moved, not cloned) and framed straight into the outbound queue
+  (`push_data_frame`), the HTTP/2 client request body dropped its per-byte
+  `VecDeque<u8>` drain for an owned `Vec` + cursor, and the WebSocket connection
+  owner now delivers exactly one session-rich app event per wire event instead
+  of also emitting a legacy duplicate. Same-machine before/after (macOS/aarch64):
+  HTTP/2 buffered-response allocations 3075 -> 3011 (one fewer per response), a
+  new public unary gRPC row 5599 -> 5548 process allocations, the WebSocket text
+  round trip 4691 -> 3865, and a 64-message WebSocket session 133 -> 67
+  app-handler turns. Latency was flat-to-better, no row regressed. Linux/x86_64
+  evidence for this pass is still pending; it remains local/alpha, not a
+  production claim.
 
 These are recorded in `CHANGELOG.md`; the remaining near-term roadmap now
-starts with the next performance pass and native AWS. Public release cleanup
-waits until Tina stops apologizing for the core HTTP/runtime hot path.
+starts with native AWS. Public release cleanup waits until Tina stops
+apologizing for the core HTTP/runtime hot path.
 
 ## Near-term roadmap
 
@@ -432,8 +446,6 @@ framework before public release-story work.
 
 | Phase | Purpose |
 |---|---|
-| **152 Protocol perf rows and byte-path cost** | Establish the honest protocol perf rows: HTTP/2/WebSocket equivalent workloads, connection setup versus steady-state split, allocation/process evidence, and the first small byte-path cleanup. This is the measuring stick for the real optimization pass; it is not enough by itself. Plan: `.intent/phases/152-protocol-perf-byte-path/plan.md`. |
-| **153 Real protocol performance** | Use the Phase 152 rows to make real protocol code cheaper: move HTTP/2 DATA payloads instead of cloning, consume buffered HTTP/2 responses without body clones, reduce streaming/gRPC DATA copies, remove duplicate WebSocket app delivery, reduce at least one protocol turn, and prove before/after macOS plus Linux/x86 evidence. Plan: `.intent/phases/153-real-protocol-performance/plan.md`. |
 | **135 Native AWS first form** | Add a native Tina AWS battery for the smallest honest production shape: static SigV4 with explicit signing time, native S3 put/get/head/delete, native SQS send/receive/delete, native HTTP keepalive under Phase 131 endpoint/connect policy, bounded bodies/in-flight work, typed pressure/lifecycle reports, hermetic fake-AWS tests, and clear native-vs-SDK-bridge docs. Plan: `.intent/phases/135-native-aws-first-form/plan.md`. |
 | **Alpaca rename** | Before public launch, rename the project/crates/docs away from Tina to Alpaca so the lineage is respectful and clear: independently maintained Rust framework, inspired by Peter Mbanugo's Tina/Odin and Seastar, not an official Tina port. |
 | **Barend Biesheuvel visible flow ergonomics** | Optional high-level ergonomics only after the local runtime core feels boring: a `flow!`-style authoring surface that preserves named suspension points, visible failure policy, trace step names, and ordinary Tina message/effect expansion. No fake async, no hidden retries, no hidden queues. |
