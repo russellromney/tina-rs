@@ -41,8 +41,29 @@ This file records completed work.
   allocations.
 - New proofs: `perf-ws-turns` (a hotpath probe asserting WebSocket app turns
   stay below the pre-dedup `2*N`) and the `grpc_h2c_unary_close` perf row,
-  pinned in the perf test's label list. Not a production performance claim:
-  macOS/aarch64 local/alpha, Linux/x86_64 evidence still pending.
+  pinned in the perf test's label list.
+- Structural HTTP/2 allocation pass (beyond the leaf copies above). Inbound
+  frames are decoded with a borrowed view (`try_decode_frame_meta` +
+  `data_payload_view` / `headers_payload_view`): the server read loop takes its
+  buffer out and processes DATA and HEADERS straight from a borrowed slice, with
+  no `Frame { payload: Vec }` per inbound frame (only a streaming chunk, which
+  must outlive the buffer, still copies; control frames keep a cheap owned
+  copy). The buffered response is coalesced — HEADERS + every DATA frame +
+  trailers are framed into one queued buffer, so a response is one outbound
+  slot and one TCP write instead of one per frame (frame boundaries, peer max
+  frame size, END_STREAM, and flow control unchanged on the wire). The response
+  header block is pre-sized and content-length is formatted into a stack buffer
+  (the perf allocator counts each `Vec` growth realloc). Measured on
+  macOS/aarch64: `perf-h2-alloc` 3075 -> 2434 (48.05 -> 38.03/request, ~20.8%);
+  `http2_h2c_steady_state_small` whole-process allocations 1570 -> 1249
+  (~20.4%) and allocated bytes 426776 -> 234072 (~45%); the `grpc_h2c_unary_close`
+  row rides the same server path (5599 -> 4964, ~11.3%). Steady-state p50
+  improved (209 -> 182 us); the `connection_setup` rows are connect-bound and
+  noisy, with allocation counts the trustworthy signal. The residual is now the
+  inbound HPACK request model and the per-request runtime service call, not
+  framing — documented in the phase notes.
+- Not a production performance claim: macOS/aarch64 local/alpha, Linux/x86_64
+  evidence still pending.
 
 ### Protocol Perf Rows And Byte-Path Cost
 

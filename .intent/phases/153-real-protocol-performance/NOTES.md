@@ -99,6 +99,87 @@ replies to each `SessionText` and the echo round-trips.
   reused read buffer, not a duplicate, so it was left.
 - Tails are still wide under one single-shard worker. Not a production claim.
 
+## Structural pass (attacking the real costs, not leaf copies)
+
+The leaf-copy pass above removed one clone out of ~48 allocations/request on
+HTTP/2 — too marginal. The structural pass attacks the dominant per-request
+costs the evidence surfaced. Same machine (macOS/aarch64), same rows, same
+sample policy.
+
+### What changed
+
+1. **Inbound frame decode without a per-frame `Vec`.** `try_decode_frame_meta`
+   decodes just the frame header; `data_payload_view` / `headers_payload_view`
+   return the unpadded payload as a borrowed sub-slice. The server read loop
+   takes the read buffer out (`std::mem::take`) and processes DATA and HEADERS
+   straight from a borrowed slice — no `Frame { payload: Vec }` per inbound
+   frame. Only a *streaming* request chunk (which must outlive the buffer) still
+   copies; control frames keep a cheap owned copy.
+2. **Coalesced outbound response.** `send_pending_response` builds HEADERS +
+   every DATA frame + optional trailers into one queued buffer: one
+   outbound-queue slot, one TCP write instead of one per frame. Frame
+   boundaries, peer max frame size, END_STREAM, and flow-control accounting are
+   preserved on the wire.
+3. **Header encode.** The response header block is pre-sized (the perf
+   allocator counts each `Vec` growth realloc) and content-length is formatted
+   into a stack buffer instead of a heap `String`.
+
+### perf-h2-alloc (64 warmed h2c buffered responses, whole-process; client byte-identical so the delta is all server-side)
+
+| stage | allocations / 64 | per response |
+| --- | ---: | ---: |
+| Phase 152 baseline | 3075 | 48.05 |
+| Phase 153 leaf copies | 3011 | 47.05 |
+| + structural (decode + coalesce) | 2626 | 41.03 |
+| + header encode (presize + itoa) | **2434** | **38.03** |
+
+**−20.8% off the Phase 152 baseline (~10 fewer allocations/request).**
+
+### Per-row whole-process allocations (Phase 152 → Phase 153 final)
+
+| row | before (152) | after (153) | delta |
+| --- | ---: | ---: | ---: |
+| `http2_h2c_steady_state_small` allocations | 1570 | **1249** | **−20.4%** |
+| `http2_h2c_steady_state_small` allocated_bytes | 426776 | **234072** | **−45.1%** |
+| `grpc_h2c_unary_close` allocations | 5599 | **4964** | **−11.3%** |
+
+gRPC rides the same server response path, so it improves too. Both HTTP/2
+steady-state and gRPC now drop by a double-digit / meaningful chunk, not one
+allocation.
+
+### Latency (median-of-5)
+
+| row | kind | before p50 | after p50 | note |
+| --- | --- | ---: | ---: | --- |
+| `http2_h2c_steady_state_small` | reuse | 209 µs | **182 µs** | improved (warmed per-request signal) |
+| `grpc_h2c_unary_close` | setup | 829 µs | 911 µs | connect-bound; this is a per-op-connect row, so p50 swings 821–939 µs run-to-run on kernel connect/accept, not the changed code |
+| `websocket_steady_state_small` | reuse | 262 µs | 180 µs | improved |
+
+The steady-state (reused-connection) rows — the clean per-request signal —
+improved or held. The `connection_setup` rows (gRPC, ws text) are dominated by
+TCP connect/accept latency and swing run-to-run; their deterministic allocation
+counts are the trustworthy signal, and those dropped. All rows `ok=32`,
+`timeout=0`, leak-clean.
+
+### What still dominates the residual (documented, not hidden)
+
+After framing was made lean, the remaining server per-request allocations are
+**not framing**:
+
+- The inbound HPACK decode that builds the typed `HttpRequest`: the hpack
+  crate's per-header name/value allocations, plus the `:path`/`:scheme`/
+  `:authority` strings and the `HeaderMap`, all consumed by the app handler.
+  The decoder itself is already reused per connection; the per-request header
+  *model* is intrinsic to handing a typed request to user code.
+- The per-request runtime call delivering the request to the service isolate
+  and returning the response (out of scope: no scheduler/runtime changes).
+- The raw-socket test client's own per-frame allocations (harness, not Tina).
+
+These are why the whole-process number is ~38/request rather than near zero:
+framing is no longer the cost. Reducing them further means a different HPACK
+header model or a borrowed request view — a separate, larger change, not more
+framing work.
+
 ## Linux / x86_64
 
 **MISSING in this session.** No Linux/x86_64 sample was collected (this was a

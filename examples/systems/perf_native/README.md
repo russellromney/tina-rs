@@ -443,18 +443,28 @@ same `--release` build, same rows, same sample policy; the full table and raw
 logs live in `.intent/phases/153-real-protocol-performance/`
 (`NOTES.md`, `perf_sample_macos_*`, `hotpath_sample_macos_*`).
 
+This landed in two passes: a leaf-copy pass (move payloads instead of cloning
+at named sites), then a structural pass that attacks the real per-request costs
+the evidence surfaced (the leaf copies alone were ~one allocation out of ~48 —
+too marginal). Numbers below are the Phase 152 baseline → Phase 153 final, same
+machine.
+
 ### What got cheaper
 
 - **HTTP/2 buffered response** (`perf-h2-alloc`, 64 warmed h2c responses):
-  process allocations 3075 → **3011** (48.05 → **47.05**/response). The
-  buffered body is now *moved* into `PendingResponse` — `enqueue_response`
-  consumes `HttpResponse` by value — instead of cloned, and a new
-  `push_data_frame` helper frames each chunk straight into the outbound queue.
-- **gRPC unary** (`grpc_h2c_unary_close`): a new row — the smallest public
-  unary gRPC path (`GrpcRouter` behind the real `Http2Listener`, driven by
-  `grpc_unary_call_h2c_blocking`). Whole-process allocations 5599 → **5548**
-  via the same server-side response path.
-- **WebSocket** (`websocket_text_round_trip` 4691 → **3865**,
+  process allocations 3075 → **2434** (48.05 → **38.03**/response, **−20.8%**).
+  The arc is 3075 → 3011 (body clone gone) → 2626 (borrowed inbound decode +
+  coalesced response write) → 2434 (pre-sized header block + stack-formatted
+  content-length). The client is byte-identical across the comparison, so the
+  whole drop is server-side.
+- **HTTP/2 steady-state row** (`http2_h2c_steady_state_small`): whole-process
+  allocations 1570 → **1249** (**−20.4%**), allocated bytes 426776 → **234072**
+  (**−45%**), p50 209 → **182 µs**.
+- **gRPC unary** (`grpc_h2c_unary_close`): the smallest public unary gRPC path
+  (`GrpcRouter` behind the real `Http2Listener`, driven by
+  `grpc_unary_call_h2c_blocking`). Whole-process allocations 5599 → **4964**
+  (**−11.3%**) via the same server response path.
+- **WebSocket** (`websocket_text_round_trip` 4691 → **3813**,
   `websocket_steady_state_small` 880 → **672** process allocations): the
   connection owner now delivers exactly one session-rich app event per wire
   event. It no longer also emits the legacy `Text`/`Binary`/`Close`/`Open`/
@@ -462,39 +472,66 @@ logs live in `.intent/phases/153-real-protocol-performance/`
   instead of cloned.
 - **Fewer turns** (`perf-ws-turns`, 64 text round trips): app-handler turns for
   the whole session 133 → **67** (2.08 → **1.05**/message). Removing the
-  duplicate delivery removes one app turn per wire event. The hotpath assertion
-  pins `app_turns < 2*N`; the Phase 152 code fails it, the new code passes.
+  duplicate delivery removes one app turn per wire event; the coalesced HTTP/2
+  response likewise drops a write turn (one write per response, not one per
+  frame). The hotpath assertion pins `app_turns < 2*N`; the Phase 152 code fails
+  it, the new code passes.
 
-No row's latency regressed (gRPC was flat within run noise; the WebSocket rows
-improved). Latency on a laptop is noisy run-to-run, so the headline evidence is
-the deterministic allocation/turn counts; latency is reported in `NOTES.md`,
-not claimed. Still local/alpha, not a production performance claim.
+Steady-state (reused-connection) rows improved or held. The `connection_setup`
+rows (gRPC, ws text) are dominated by TCP connect/accept latency and swing
+run-to-run, so their deterministic allocation counts are the trustworthy signal
+(and those dropped); per-op latency is reported in `NOTES.md`, not claimed. All
+rows `ok=32`, `timeout=0`, leak-clean. Still local/alpha, not a production
+performance claim.
 
 ### Byte-path changes (the code, not the harness)
 
-- `into_data_payload(frame) -> (Vec<u8>, usize)` moves the unpadded DATA
-  payload out of the owned frame (server + client DATA handlers); the old
-  cloning `data_payload` is removed. Padded DATA still validates padding and
-  preserves the flow-control wire length.
+- **Inbound frames decode with a borrowed view.** `try_decode_frame_meta`
+  decodes just the header; `data_payload_view` / `headers_payload_view` return
+  the unpadded payload as a sub-slice. The server read loop takes its buffer out
+  (`std::mem::take`) and handles DATA and HEADERS straight from a borrowed slice
+  — no `Frame { payload: Vec }` per inbound frame. Only a streaming request
+  chunk (which must outlive the buffer) copies; control frames keep a cheap
+  owned copy.
+- **Coalesced outbound response.** `send_pending_response` frames HEADERS +
+  every DATA frame + trailers into one queued buffer — one outbound slot, one
+  TCP write — instead of one `Vec`/write per frame. Wire frame boundaries, peer
+  max frame size, END_STREAM, and flow control are unchanged.
+- **Header encode.** The response header block is pre-sized (each `Vec` growth
+  realloc is a counted allocation) and content-length is formatted into a stack
+  buffer, not a heap `String`.
+- `into_data_payload(frame)` moves the unpadded DATA payload out of an owned
+  frame (used by the client DATA handler); the old cloning `data_payload` is
+  gone. Padded DATA still validates padding and preserves the flow-control wire
+  length.
 - The HTTP/2 *client* request body is an owned `Vec` + cursor with direct DATA
   framing, replacing the per-byte `VecDeque<u8>` drain; consumed/finished
   buffers are compacted/dropped. No perf row drives the Tina HTTP/2 client
   (every row uses a raw-socket client), so this win is carried by the
-  `tina-http` correctness suite, not a headline row — stated plainly.
-- Server streaming `flush_response_stream` drains the consumed prefix straight
-  into the framed buffer (one copy, not two).
+  `tina-http` correctness suite (incl. the 128 KB `large_upload_paces_through_real_window_updates`
+  flow-control test), not a headline row — stated plainly.
 - WebSocket ping echoes its payload into the pong from a borrowed slice
   (`encode_server_frame_from`) and moves the owned payload into the app `Ping`
   notification — no clone.
 
-### What still copies (named, not hidden)
+### What still dominates the residual (named, not hidden)
 
+Framing is no longer the cost; the whole-process ~38 allocations/request are now
+dominated by paths that are *not* framing:
+
+- The inbound HPACK decode that builds the typed `HttpRequest`: the hpack
+  crate's per-header name/value allocations, plus the `:path`/`:scheme`/
+  `:authority` strings and the `HeaderMap`, all consumed by the app handler. The
+  decoder is already reused per connection; the per-request header model is
+  intrinsic to handing a typed request to user code.
+- The per-request runtime call delivering the request to the service isolate and
+  returning the response (out of scope: no scheduler/runtime change).
+- The raw-socket test client's own per-frame allocations (harness, not Tina).
 - gRPC messages still allocate the length-prefixed frame buffer
   (`encode_grpc_message`) plus prost's internal encode.
-- `into_data_payload` still copies the trimmed bytes on the rarer *padded* DATA
-  path (the common unpadded path moves).
-- The WebSocket frame parse still copies the payload out of the reused read
-  buffer once; that is the minimum owned-payload copy, not a duplicate.
+
+Reducing the first two means a different HPACK header model or a borrowed
+request view — a separate, larger change, not more framing work.
 
 ### Platform
 
