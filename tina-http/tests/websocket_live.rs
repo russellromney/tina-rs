@@ -118,45 +118,49 @@ impl Isolate for WsEcho {
 
 impl WsEcho {
     fn outcome_for(msg: WebSocketSessionMsg) -> WebSocketSessionOutcome {
+        // The protocol owner now delivers one session-rich event per wire
+        // frame; wire text/binary/close arrive as `Session*`, not the legacy
+        // `Text`/`Binary`/`Close`.
         match msg {
-            WebSocketSessionMsg::Text(text) if text == "server-ping" => {
+            WebSocketSessionMsg::SessionText { text, .. } if text == "server-ping" => {
                 WebSocketSessionOutcome::Many(vec![WebSocketMessage::Ping(b"alive".to_vec())])
             }
-            WebSocketSessionMsg::Text(text) if text == "large-out" => {
+            WebSocketSessionMsg::SessionText { text, .. } if text == "large-out" => {
                 WebSocketSessionOutcome::Text("x".repeat(64))
             }
-            WebSocketSessionMsg::Text(text) if text == "burst-out" => {
+            WebSocketSessionMsg::SessionText { text, .. } if text == "burst-out" => {
                 WebSocketSessionOutcome::Many(vec![
                     WebSocketMessage::Text("one".to_owned()),
                     WebSocketMessage::Text("two".to_owned()),
                     WebSocketMessage::Text("three".to_owned()),
                 ])
             }
-            WebSocketSessionMsg::Text(text) if text == "server-close" => {
+            WebSocketSessionMsg::SessionText { text, .. } if text == "server-close" => {
                 WebSocketSessionOutcome::Close(Some(WebSocketCloseCode(1000)), b"bye".to_vec())
             }
-            WebSocketSessionMsg::Text(text) => WebSocketSessionOutcome::Text(text),
-            WebSocketSessionMsg::Binary(bytes) => WebSocketSessionOutcome::Binary(bytes),
+            WebSocketSessionMsg::SessionText { text, .. } => WebSocketSessionOutcome::Text(text),
+            WebSocketSessionMsg::SessionBinary { bytes, .. } => {
+                WebSocketSessionOutcome::Binary(bytes)
+            }
             WebSocketSessionMsg::Pong(bytes) => {
                 WebSocketSessionOutcome::Many(vec![WebSocketMessage::Text(format!(
                     "pong:{}",
                     bytes.len()
                 ))])
             }
-            WebSocketSessionMsg::Close(code, reason) => {
+            WebSocketSessionMsg::SessionClose { code, reason, .. } => {
                 WebSocketSessionOutcome::Close(code, reason)
             }
-            WebSocketSessionMsg::Pressure(_) | WebSocketSessionMsg::Closed(_) => {
-                WebSocketSessionOutcome::None
-            }
-            WebSocketSessionMsg::Open
+            WebSocketSessionMsg::SessionPressure { .. }
+            | WebSocketSessionMsg::SessionClosed { .. }
+            | WebSocketSessionMsg::Pressure(_)
+            | WebSocketSessionMsg::Closed(_)
+            | WebSocketSessionMsg::Text(_)
+            | WebSocketSessionMsg::Binary(_)
+            | WebSocketSessionMsg::Close(_, _)
+            | WebSocketSessionMsg::Open
             | WebSocketSessionMsg::SessionAccepted { .. }
             | WebSocketSessionMsg::SessionOpen { .. }
-            | WebSocketSessionMsg::SessionText { .. }
-            | WebSocketSessionMsg::SessionBinary { .. }
-            | WebSocketSessionMsg::SessionClose { .. }
-            | WebSocketSessionMsg::SessionPressure { .. }
-            | WebSocketSessionMsg::SessionClosed { .. }
             | WebSocketSessionMsg::SessionReport(_)
             | WebSocketSessionMsg::SendOutcome(_)
             | WebSocketSessionMsg::AppControl(_)

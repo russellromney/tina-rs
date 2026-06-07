@@ -931,6 +931,17 @@ pub(crate) fn encode_client_frame(
 }
 
 pub(crate) fn encode_server_frame(opcode: u8, payload: Vec<u8>) -> Result<Vec<u8>, WebSocketError> {
+    encode_server_frame_from(opcode, &payload)
+}
+
+/// Encode a server (unmasked) frame from a borrowed payload slice. Lets a
+/// caller that still needs the owned payload afterwards (e.g. echoing a ping
+/// payload into a pong *and* notifying the app) build the wire frame without
+/// cloning the payload.
+pub(crate) fn encode_server_frame_from(
+    opcode: u8,
+    payload: &[u8],
+) -> Result<Vec<u8>, WebSocketError> {
     if opcode >= 0x8 && payload.len() > 125 {
         return Err(WebSocketError::ControlFrameTooLarge);
     }
@@ -945,7 +956,7 @@ pub(crate) fn encode_server_frame(opcode: u8, payload: Vec<u8>) -> Result<Vec<u8
         out.push(127);
         out.extend_from_slice(&(payload.len() as u64).to_be_bytes());
     }
-    out.extend_from_slice(&payload);
+    out.extend_from_slice(payload);
     Ok(out)
 }
 

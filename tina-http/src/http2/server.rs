@@ -38,7 +38,7 @@ use super::frame::{
     FRAME_CONTINUATION, FRAME_DATA, FRAME_GOAWAY, FRAME_HEADER_LEN, FRAME_HEADERS, FRAME_PING,
     FRAME_PRIORITY, FRAME_PUSH_PROMISE, FRAME_RST_STREAM, FRAME_SETTINGS, FRAME_WINDOW_UPDATE,
     Frame, PRIORITY_PAYLOAD_LEN, READ_CHUNK, WINDOW_CREDIT_FLUSH_THRESHOLD, add_window, data_frame,
-    data_payload, goaway_frame, headers_frame, headers_payload, push_frame_header,
+    goaway_frame, headers_frame, headers_payload, into_data_payload, push_frame_header,
     rst_stream_frame, settings_frame, try_decode_frame, window_update_frame,
 };
 use super::headers::{
@@ -787,9 +787,12 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Http2Connection<
         if frame.stream_id == 0 {
             return Err(Http2ProtocolError::BadStreamId);
         }
-        let payload = data_payload(&frame)?;
+        // Take the unpadded payload out of the owned frame (moves it for the
+        // common unpadded case) and the flow-control wire length in one step.
+        let stream_id = frame.stream_id;
+        let end_stream = frame.flags & FLAG_END_STREAM != 0;
+        let (payload, flow_len) = into_data_payload(frame)?;
         let data_len = payload.len();
-        let flow_len = frame.payload.len();
         let flow_len_i32 = i32::try_from(flow_len).map_err(|_| Http2ProtocolError::FlowControl)?;
         if self.recv_window < flow_len_i32 {
             self.report.flow_control_blocked += 1;
@@ -804,15 +807,15 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Http2Connection<
             return Err(Http2ProtocolError::FlowControl);
         }
         let idx = self
-            .find_stream(frame.stream_id)
+            .find_stream(stream_id)
             .ok_or(Http2ProtocolError::StreamClosed)?;
         if self.streams[idx].state == Http2StreamState::Closed || self.streams[idx].reset {
-            self.enqueue_frame(rst_stream_frame(frame.stream_id, ERR_STREAM_CLOSED))?;
+            self.enqueue_frame(rst_stream_frame(stream_id, ERR_STREAM_CLOSED))?;
             self.emit_protocol_fact(
                 effects,
                 ProtocolFact::Http2StreamReset {
                     connection: self.connection_fact_id(),
-                    stream: Http2StreamId::new(frame.stream_id),
+                    stream: Http2StreamId::new(stream_id),
                     direction: ProtocolDirection::Outbound,
                     reason: Http2ResetReason::StreamClosed,
                 },
@@ -820,12 +823,12 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Http2Connection<
             return Ok(());
         }
         if self.streams[idx].request_eof {
-            self.enqueue_frame(rst_stream_frame(frame.stream_id, ERR_STREAM_CLOSED))?;
+            self.enqueue_frame(rst_stream_frame(stream_id, ERR_STREAM_CLOSED))?;
             self.emit_protocol_fact(
                 effects,
                 ProtocolFact::Http2StreamReset {
                     connection: self.connection_fact_id(),
-                    stream: Http2StreamId::new(frame.stream_id),
+                    stream: Http2StreamId::new(stream_id),
                     direction: ProtocolDirection::Outbound,
                     reason: Http2ResetReason::StreamClosed,
                 },
@@ -838,21 +841,21 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Http2Connection<
                 effects,
                 ProtocolFact::Http2FlowControlFull {
                     connection: self.connection_fact_id(),
-                    stream: Http2StreamId::new(frame.stream_id),
+                    stream: Http2StreamId::new(stream_id),
                     side: Http2FlowControlSide::StreamReceive,
                 },
             );
-            self.enqueue_frame(rst_stream_frame(frame.stream_id, ERR_FLOW_CONTROL_ERROR))?;
+            self.enqueue_frame(rst_stream_frame(stream_id, ERR_FLOW_CONTROL_ERROR))?;
             self.emit_protocol_fact(
                 effects,
                 ProtocolFact::Http2StreamReset {
                     connection: self.connection_fact_id(),
-                    stream: Http2StreamId::new(frame.stream_id),
+                    stream: Http2StreamId::new(stream_id),
                     direction: ProtocolDirection::Outbound,
                     reason: Http2ResetReason::FlowControlError,
                 },
             );
-            self.reset_active_stream_for_protocol(frame.stream_id, effects);
+            self.reset_active_stream_for_protocol(stream_id, effects);
             return Ok(());
         }
         if let Some(content_length) = self.streams[idx].request_content_length {
@@ -862,17 +865,17 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Http2Connection<
                 .ok_or(Http2ProtocolError::HeadersTooLarge)?;
             if received > content_length {
                 self.report.protocol_errors += 1;
-                self.enqueue_frame(rst_stream_frame(frame.stream_id, ERR_PROTOCOL_ERROR))?;
+                self.enqueue_frame(rst_stream_frame(stream_id, ERR_PROTOCOL_ERROR))?;
                 self.emit_protocol_fact(
                     effects,
                     ProtocolFact::Http2StreamReset {
                         connection: self.connection_fact_id(),
-                        stream: Http2StreamId::new(frame.stream_id),
+                        stream: Http2StreamId::new(stream_id),
                         direction: ProtocolDirection::Outbound,
                         reason: Http2ResetReason::ProtocolError,
                     },
                 );
-                self.reset_active_stream_for_protocol(frame.stream_id, effects);
+                self.reset_active_stream_for_protocol(stream_id, effects);
                 return Ok(());
             }
         }
@@ -886,12 +889,12 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Http2Connection<
             .ok_or(Http2ProtocolError::HeadersTooLarge)?;
         if new_len > self.limits.max_body_bytes {
             self.report.stream_full += 1;
-            self.enqueue_frame(rst_stream_frame(frame.stream_id, ERR_ENHANCE_YOUR_CALM))?;
+            self.enqueue_frame(rst_stream_frame(stream_id, ERR_ENHANCE_YOUR_CALM))?;
             self.emit_protocol_fact(
                 effects,
                 ProtocolFact::HttpBodyHighWater {
                     connection: self.connection_fact_id(),
-                    body_id: frame.stream_id as u64,
+                    body_id: stream_id as u64,
                     direction: ProtocolDirection::Inbound,
                     buffered_bytes: new_len as u64,
                     threshold_bytes: self.limits.max_body_bytes as u64,
@@ -901,12 +904,12 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Http2Connection<
                 effects,
                 ProtocolFact::Http2StreamReset {
                     connection: self.connection_fact_id(),
-                    stream: Http2StreamId::new(frame.stream_id),
+                    stream: Http2StreamId::new(stream_id),
                     direction: ProtocolDirection::Outbound,
                     reason: Http2ResetReason::EnhanceYourCalm,
                 },
             );
-            self.remove_stream(frame.stream_id);
+            self.remove_stream(stream_id);
             return Ok(());
         }
         self.recv_window -= flow_len_i32;
@@ -923,12 +926,12 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Http2Connection<
                     });
             } else if flow_len > 0 {
                 self.add_request_window_credit(idx, flow_len);
-                self.maybe_flush_request_window_credit(frame.stream_id, false)?;
+                self.maybe_flush_request_window_credit(stream_id, false)?;
             }
         } else {
             self.streams[idx].body.extend_from_slice(&payload);
         }
-        if frame.flags & FLAG_END_STREAM != 0 {
+        if end_stream {
             if self.streams[idx]
                 .request_content_length
                 .is_some_and(|content_length| {
@@ -936,28 +939,28 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Http2Connection<
                 })
             {
                 self.report.protocol_errors += 1;
-                self.enqueue_frame(rst_stream_frame(frame.stream_id, ERR_PROTOCOL_ERROR))?;
+                self.enqueue_frame(rst_stream_frame(stream_id, ERR_PROTOCOL_ERROR))?;
                 self.emit_protocol_fact(
                     effects,
                     ProtocolFact::Http2StreamReset {
                         connection: self.connection_fact_id(),
-                        stream: Http2StreamId::new(frame.stream_id),
+                        stream: Http2StreamId::new(stream_id),
                         direction: ProtocolDirection::Outbound,
                         reason: Http2ResetReason::ProtocolError,
                     },
                 );
-                self.reset_active_stream_for_protocol(frame.stream_id, effects);
+                self.reset_active_stream_for_protocol(stream_id, effects);
                 return Ok(());
             }
             self.streams[idx].request_eof = true;
             self.streams[idx].state = Http2StreamState::HalfClosedRemote;
             if self.streams[idx].request_dispatched_streaming {
-                effects.push(self.reply_pending_request_chunk(frame.stream_id)?);
+                effects.push(self.reply_pending_request_chunk(stream_id)?);
             } else {
-                self.dispatch_stream(frame.stream_id, effects)?;
+                self.dispatch_stream(stream_id, effects)?;
             }
         } else if self.streams[idx].request_dispatched_streaming {
-            effects.push(self.reply_pending_request_chunk(frame.stream_id)?);
+            effects.push(self.reply_pending_request_chunk(stream_id)?);
         }
         Ok(())
     }
@@ -1175,7 +1178,7 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Http2Connection<
         let mut effects = Vec::new();
         match outcome {
             CallOutcome::Replied(response) => {
-                if let Err(error) = self.enqueue_response(stream_id, &response, &mut effects) {
+                if let Err(error) = self.enqueue_response(stream_id, response, &mut effects) {
                     self.report.protocol_errors += 1;
                     let code = match error {
                         Http2ProtocolError::FlowControl => ERR_FLOW_CONTROL_ERROR,
@@ -1193,7 +1196,7 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Http2Connection<
                 } else {
                     HttpResponse::service_unavailable()
                 };
-                let _ = self.enqueue_response(stream_id, &response, &mut effects);
+                let _ = self.enqueue_response(stream_id, response, &mut effects);
             }
             CallOutcome::Closed | CallOutcome::Rejected(_) => {
                 let response = if grpc {
@@ -1203,7 +1206,7 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Http2Connection<
                 } else {
                     HttpResponse::internal_error()
                 };
-                let _ = self.enqueue_response(stream_id, &response, &mut effects);
+                let _ = self.enqueue_response(stream_id, response, &mut effects);
             }
             CallOutcome::Timeout => {
                 let response = if grpc {
@@ -1213,7 +1216,7 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Http2Connection<
                 } else {
                     HttpResponse::gateway_timeout()
                 };
-                let _ = self.enqueue_response(stream_id, &response, &mut effects);
+                let _ = self.enqueue_response(stream_id, response, &mut effects);
             }
         }
         if self.pending_write.is_empty() && !self.write_queue.is_empty() {
@@ -1232,10 +1235,14 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Http2Connection<
     fn enqueue_response(
         &mut self,
         stream_id: u32,
-        response: &HttpResponse,
+        response: HttpResponse,
         effects: &mut Vec<Effect<Self>>,
     ) -> Result<(), Http2ProtocolError> {
-        let body = match &response.body {
+        // Dispatch on the body kind while only borrowing, so the buffered
+        // bytes can be *moved* into `PendingResponse` below instead of cloned.
+        // `max_response_body_bytes` is validated here before the body is stored
+        // or sent. Stream/ChunkedStream/WebSocket bodies return early.
+        let body_len = match &response.body {
             HttpResponseBody::Buffered(bytes) => {
                 if bytes.len() > self.limits.max_response_body_bytes {
                     self.report.stream_full += 1;
@@ -1253,25 +1260,33 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Http2Connection<
                     );
                     return Ok(());
                 }
-                bytes.clone()
+                bytes.len()
             }
             HttpResponseBody::Stream(stream) => {
+                let source = stream.source;
+                let content_length = stream.content_length;
                 return self.begin_streaming_response(
                     stream_id,
-                    response,
-                    stream.source,
-                    Some(stream.content_length),
+                    &response,
+                    source,
+                    Some(content_length),
                 );
             }
             HttpResponseBody::ChunkedStream(stream) => {
-                return self.begin_streaming_response(stream_id, response, stream.source, None);
+                let source = stream.source;
+                return self.begin_streaming_response(stream_id, &response, source, None);
             }
             HttpResponseBody::WebSocket(_) => {
                 return Err(Http2ProtocolError::UnsupportedFrame(FRAME_DATA));
             }
         };
-        let block = encode_response_headers(response, body.len());
-        let trailers = encode_response_trailers(response);
+        let block = encode_response_headers(&response, body_len);
+        let trailers = encode_response_trailers(&response);
+        let body = match response.body {
+            HttpResponseBody::Buffered(bytes) => bytes,
+            // Stream/ChunkedStream/WebSocket all returned above.
+            _ => unreachable!("non-buffered response bodies handled above"),
+        };
         self.queue_or_send_response(
             stream_id,
             PendingResponse {
@@ -1385,22 +1400,9 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Http2Connection<
             self.streams[idx].send_window -= body_len_i32;
             for (chunk_index, chunk) in pending.body.chunks(frame_cap).enumerate() {
                 let end_stream = chunk_index + 1 == data_frames && pending.trailers.is_none();
-                // Build the DATA frame straight into the queued buffer: header
-                // bytes then the body slice. The body chunk is copied once here
-                // instead of once into a `Frame::payload` `Vec` and again in
-                // `Frame::encode`. Per-frame `ensure_outbound_slots(1)` keeps the
-                // bounded-queue admission identical to `enqueue_frame`.
-                self.ensure_outbound_slots(1)?;
-                let mut framed = Vec::with_capacity(FRAME_HEADER_LEN + chunk.len());
-                push_frame_header(
-                    &mut framed,
-                    FRAME_DATA,
-                    if end_stream { FLAG_END_STREAM } else { 0 },
-                    stream_id,
-                    chunk.len(),
-                );
-                framed.extend_from_slice(chunk);
-                self.write_queue.push_back(framed);
+                // One owned body lives in `pending.body`; each chunk is framed
+                // straight into the outbound queue. No per-frame payload `Vec`.
+                self.push_data_frame(stream_id, end_stream, chunk)?;
             }
         }
         if let Some(trailers) = pending.trailers {
@@ -1651,15 +1653,18 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Http2Connection<
                 self.report.flow_control_blocked += 1;
                 return Ok(());
             }
+            // Frame the next streamed chunk directly: header bytes, then drain
+            // the consumed prefix of the pending buffer straight into the
+            // framed `Vec`. The body is copied once (the drain) instead of once
+            // into a `chunk` `Vec` and again in `Frame::encode`.
             self.ensure_outbound_slots(1)?;
-            let chunk: Vec<u8> = self.streams[idx]
-                .response_pending_data
-                .drain(..allowed)
-                .collect();
+            let mut framed = Vec::with_capacity(FRAME_HEADER_LEN + allowed);
+            push_frame_header(&mut framed, FRAME_DATA, 0, stream_id, allowed);
+            framed.extend(self.streams[idx].response_pending_data.drain(..allowed));
+            self.write_queue.push_back(framed);
             self.send_window -= allowed as i32;
             self.streams[idx].send_window -= allowed as i32;
             self.streams[idx].response_bytes_sent += allowed;
-            self.enqueue_frame(data_frame(stream_id, false, chunk))?;
         }
     }
 
@@ -1917,6 +1922,32 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Http2Connection<
     fn enqueue_frame(&mut self, frame: Frame) -> Result<(), Http2ProtocolError> {
         self.ensure_outbound_slots(1)?;
         self.write_queue.push_back(frame.encode());
+        Ok(())
+    }
+
+    /// Frame a DATA payload straight into the outbound queue: the 9-byte
+    /// header then the payload slice. The body is copied exactly once here,
+    /// versus the old `data_frame(..).encode()` shape that copied it once
+    /// into a `Frame::payload` `Vec` and again in `Frame::encode`. Per-frame
+    /// `ensure_outbound_slots(1)` keeps bounded-queue admission identical to
+    /// `enqueue_frame`.
+    fn push_data_frame(
+        &mut self,
+        stream_id: u32,
+        end_stream: bool,
+        payload: &[u8],
+    ) -> Result<(), Http2ProtocolError> {
+        self.ensure_outbound_slots(1)?;
+        let mut framed = Vec::with_capacity(FRAME_HEADER_LEN + payload.len());
+        push_frame_header(
+            &mut framed,
+            FRAME_DATA,
+            if end_stream { FLAG_END_STREAM } else { 0 },
+            stream_id,
+            payload.len(),
+        );
+        framed.extend_from_slice(payload);
+        self.write_queue.push_back(framed);
         Ok(())
     }
 
@@ -2238,7 +2269,7 @@ mod tests {
         let mut effects: Vec<Effect<Http2Connection<UnitShard>>> = Vec::new();
         conn.enqueue_response(
             1,
-            &HttpResponse::with_body(StatusCode::OK, b"abc".to_vec()),
+            HttpResponse::with_body(StatusCode::OK, b"abc".to_vec()),
             &mut effects,
         )
         .expect("response cap maps to rst, not connection error");
@@ -2495,7 +2526,7 @@ mod tests {
         // Http2StreamClosed fact.
         let mut close_effects: Vec<Effect<Http2Connection<UnitShard>>> = Vec::new();
         let response = HttpResponse::text("ok");
-        conn.enqueue_response(1, &response, &mut close_effects)
+        conn.enqueue_response(1, response, &mut close_effects)
             .expect("reply accepted");
         let close_facts = collect_facts(&close_effects);
         assert!(

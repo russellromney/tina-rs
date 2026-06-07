@@ -9,8 +9,8 @@ use std::cell::Cell;
 use std::convert::Infallible;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -20,17 +20,18 @@ use tina::CallRejectedReason;
 use tina::capacity::{CapacityMode, CapacitySurfaceReport};
 use tina::prelude::*;
 use tina_http::{
-    BodyMetrics, Http2Listener, Http2ListenerMsg, Http2ServerConfig, HttpLimits, HttpListener,
-    HttpListenerAddress, HttpListenerMsg, HttpRequest, HttpResponse, HttpServerConfig, StatusCode,
-    WebSocketLimits, WebSocketSessionMsg, WebSocketSessionOutcome, websocket_upgrade,
+    BodyMetrics, GrpcLimits, GrpcRequest, GrpcResponse, GrpcRouter, GrpcRouterMsg, Http2Listener,
+    Http2ListenerMsg, Http2ServerConfig, HttpLimits, HttpListener, HttpListenerAddress,
+    HttpListenerMsg, HttpRequest, HttpResponse, HttpServerConfig, StatusCode, WebSocketLimits,
+    WebSocketSessionMsg, WebSocketSessionOutcome, grpc_unary_call_h2c_blocking, websocket_upgrade,
 };
 use tina_proof_harness::{
     LoadObservation, LoadReport, LoadRun, LoadStop, OpOutcome, PerfAllocationReport,
     PerfComparisonReport, PerfReport, SemanticMatch, SurfacePlateau, UnavailableSurface,
 };
 use tina_runtime::{
-    CallOutcome, DefaultThreadedMailboxFactory, ThreadedRuntime, ThreadedRuntimeConfig,
-    ServicePressureReport, ThreadedSendObservedError, call,
+    CallOutcome, DefaultThreadedMailboxFactory, ServicePressureReport, ThreadedRuntime,
+    ThreadedRuntimeConfig, ThreadedSendObservedError, call,
 };
 use tokio::net::TcpListener;
 use tokio::runtime::Builder;
@@ -198,7 +199,8 @@ pub fn http_body_pressure_probe() -> anyhow::Result<LoadReport> {
     const PRESSURE_OPS: u64 = 8;
 
     let runtime = new_runtime();
-    let metrics = BodyMetrics::with_body_capacity("perf.http.bodies", MAX_BODY_BYTES, MAX_BODY_BYTES);
+    let metrics =
+        BodyMetrics::with_body_capacity("perf.http.bodies", MAX_BODY_BYTES, MAX_BODY_BYTES);
     let service = runtime
         .register_with_capacity::<_, Infallible>(
             BodyService {
@@ -1291,8 +1293,7 @@ impl ProcessSnapshot {
     pub fn delta_from(&self, before: ProcessSnapshot) -> (u64, u64, i64) {
         (
             self.allocations.saturating_sub(before.allocations),
-            self.allocated_bytes
-                .saturating_sub(before.allocated_bytes),
+            self.allocated_bytes.saturating_sub(before.allocated_bytes),
             (self.rss_kb as i64) - (before.rss_kb as i64),
         )
     }
@@ -1585,6 +1586,7 @@ pub fn run_native_rows() -> anyhow::Result<Vec<PerfReport>> {
         native_sampled(http2_h2c_close_row)?,
         native_sampled(http2_h2c_keepalive_row)?,
         native_sampled(http2_h2c_steady_state_small_row)?,
+        native_sampled(grpc_h2c_unary_close_row)?,
         native_sampled(websocket_open_close_row)?,
         native_sampled(websocket_text_round_trip_row)?,
         native_sampled(websocket_steady_state_small_row)?,
@@ -1621,7 +1623,9 @@ struct H2Frame {
     payload: Vec<u8>,
 }
 
-fn start_h2_server(body: Vec<u8>) -> anyhow::Result<(PerfRuntime, Address<Http2ListenerMsg>, SocketAddr)> {
+fn start_h2_server(
+    body: Vec<u8>,
+) -> anyhow::Result<(PerfRuntime, Address<Http2ListenerMsg>, SocketAddr)> {
     let runtime = new_runtime();
     let service = runtime
         .register_with_capacity::<_, Infallible>(
@@ -1804,7 +1808,9 @@ fn http2_h2c_close_row() -> anyhow::Result<PerfReport> {
         },
         move |_| match h2c_one_request(addr, expected) {
             Ok(()) => OpOutcome::Ok,
-            Err(_) => OpOutcome::Err { kind: "http2_error" },
+            Err(_) => OpOutcome::Err {
+                kind: "http2_error",
+            },
         },
         None::<fn() -> LoadObservation>,
     );
@@ -1839,7 +1845,9 @@ fn http2_h2c_keepalive_row() -> anyhow::Result<PerfReport> {
         },
         move |_| match h2c_keepalive_op(addr, expected) {
             Ok(()) => OpOutcome::Ok,
-            Err(_) => OpOutcome::Err { kind: "http2_error" },
+            Err(_) => OpOutcome::Err {
+                kind: "http2_error",
+            },
         },
         None::<fn() -> LoadObservation>,
     );
@@ -1903,7 +1911,9 @@ fn http2_h2c_steady_state_small_row() -> anyhow::Result<PerfReport> {
                 *next_id += 2;
                 match h2c_get(stream, id, "/", expected) {
                     Ok(()) => OpOutcome::Ok,
-                    Err(_) => OpOutcome::Err { kind: "http2_error" },
+                    Err(_) => OpOutcome::Err {
+                        kind: "http2_error",
+                    },
                 }
             },
             None::<fn() -> LoadObservation>,
@@ -1919,6 +1929,113 @@ fn http2_h2c_steady_state_small_row() -> anyhow::Result<PerfReport> {
     Ok(PerfReport::from_load_with_allocations(
         "http2_h2c_steady_state_small",
         "steady_state_reuse",
+        load,
+        allocations,
+    ))
+}
+
+// ---- gRPC (h2c unary) ------------------------------------------------------
+//
+// The smallest public unary gRPC row: a `GrpcRouter` service behind the real
+// `Http2Listener`, driven by the public `grpc_unary_call_h2c_blocking` client.
+// It exercises gRPC request framing, the HTTP/2 server response path (the
+// by-value buffered-response writer this phase introduced), and gRPC trailer
+// status. `connection_setup` kind: one fresh h2c connection per op (the
+// blocking client is one-shot), so this is a setup row, not a steady-state one.
+
+#[derive(Clone, PartialEq, prost::Message)]
+struct GrpcPerfRequest {
+    #[prost(uint64, tag = "1")]
+    delta: u64,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+struct GrpcPerfReply {
+    #[prost(uint64, tag = "1")]
+    value: u64,
+}
+
+const GRPC_UNARY_PATH: &str = "/perf.Counter/Increment";
+
+fn start_grpc_server() -> anyhow::Result<(PerfRuntime, Address<Http2ListenerMsg>, SocketAddr)> {
+    let runtime = new_runtime();
+    let limits = GrpcLimits::default();
+    let router = GrpcRouter::<SingleShard>::new(limits).unary(
+        GRPC_UNARY_PATH,
+        |request: GrpcRequest<GrpcPerfRequest>| {
+            Ok(GrpcResponse::new(GrpcPerfReply {
+                value: request.message.delta + 1,
+            }))
+        },
+    );
+    let service = runtime
+        .register_with_capacity::<GrpcRouter<SingleShard>, _>(router, CAPACITY)
+        .map_err(|e| anyhow::anyhow!("register tina grpc router: {e:?}"))?;
+    let config = Http2ServerConfig::dev();
+    // The listener is generic over the service message type; the gRPC router
+    // accepts `GrpcRouterMsg: From<HttpRequest>`.
+    let listener = runtime
+        .register_with_capacity::<Http2Listener<SingleShard, GrpcRouterMsg>, _>(
+            Http2Listener::<SingleShard, GrpcRouterMsg>::new(
+                "127.0.0.1:0".parse()?,
+                service,
+                config,
+            ),
+            config.listener_mailbox_capacity,
+        )
+        .map_err(|e| anyhow::anyhow!("register tina grpc listener: {e:?}"))?;
+    let bound = runtime.observe_next_bound();
+    runtime
+        .try_send(listener, Http2ListenerMsg::Start)
+        .map_err(|e| anyhow::anyhow!("start tina grpc listener: {e:?}"))?;
+    let addr = bound
+        .wait(Duration::from_secs(2))
+        .map_err(|e| anyhow::anyhow!("observe tina grpc bind: {e:?}"))?;
+    Ok((runtime, listener, addr))
+}
+
+fn grpc_unary_op(addr: SocketAddr) -> anyhow::Result<()> {
+    let reply: GrpcPerfReply = grpc_unary_call_h2c_blocking(
+        addr,
+        GRPC_UNARY_PATH,
+        &GrpcPerfRequest { delta: 41 },
+        PROTOCOL_CLIENT_TIMEOUT,
+        GrpcLimits::default(),
+    )
+    .map_err(|e| anyhow::anyhow!("grpc unary call: {e:?}"))?;
+    // The status must be OK (a non-OK status surfaces as Err above) AND the
+    // decoded message must be the expected value — never a silently dropped
+    // status folded into a zero reply.
+    if reply.value != 42 {
+        anyhow::bail!("unexpected grpc reply value {}", reply.value);
+    }
+    Ok(())
+}
+
+fn grpc_h2c_unary_close_row() -> anyhow::Result<PerfReport> {
+    let (runtime, listener, addr) = start_grpc_server()?;
+    grpc_unary_op(addr)?; // warm one full connection + unary call
+
+    let process_before = ProcessSnapshot::now();
+    let (load, allocations) = run_counted(
+        LoadRun {
+            workers: WORKERS,
+            stop: LoadStop::ops(PROTOCOL_OPS),
+            label: "tina_grpc_h2c_unary_close",
+        },
+        move |_| match grpc_unary_op(addr) {
+            Ok(()) => OpOutcome::Ok,
+            Err(_) => OpOutcome::Err { kind: "grpc_error" },
+        },
+        None::<fn() -> LoadObservation>,
+    );
+    let (allocs, bytes, rss) = ProcessSnapshot::now().delta_from(process_before);
+    print_process_metrics("tina_grpc_h2c_unary_close", allocs, bytes, rss);
+    let _ = runtime.try_send(listener, Http2ListenerMsg::Stop);
+    shutdown_runtime(runtime)?;
+    Ok(PerfReport::from_load_with_allocations(
+        "grpc_h2c_unary_close",
+        "connection_setup",
         load,
         allocations,
     ))
@@ -1964,6 +2081,10 @@ impl WsGateway {
 struct WsApp {
     overfill_bytes: usize,
     pressure_count: Arc<AtomicU64>,
+    // Counts every app-handler delivery (one increment per message the
+    // connection owner delivers). Used by the Rock 5 turn-count probe to
+    // prove one app turn per wire event after the duplicate-delivery removal.
+    app_turns: Arc<AtomicU64>,
 }
 
 #[tina_runtime::isolate(message = WebSocketSessionMsg, reply = WebSocketSessionOutcome)]
@@ -1973,25 +2094,39 @@ impl WsApp {
         msg: WebSocketSessionMsg,
         _ctx: &mut Context<'_, SingleShard, Self::Reply>,
     ) -> Effect<Self> {
+        self.app_turns.fetch_add(1, Ordering::Relaxed);
         reply(self.outcome_for(msg))
     }
 
-    fn handle_call(&mut self, msg: WebSocketSessionMsg, call: CallContext<'_, Self>) -> Effect<Self> {
+    fn handle_call(
+        &mut self,
+        msg: WebSocketSessionMsg,
+        call: CallContext<'_, Self>,
+    ) -> Effect<Self> {
+        self.app_turns.fetch_add(1, Ordering::Relaxed);
         call.reply(self.outcome_for(msg))
     }
 }
 
 impl WsApp {
     fn outcome_for(&self, msg: WebSocketSessionMsg) -> WebSocketSessionOutcome {
+        // The protocol owner delivers one session-rich event per wire frame:
+        // wire text/binary/close arrive as `Session*`, echoed back here.
         match msg {
-            WebSocketSessionMsg::Text(text) if self.overfill_bytes > 0 && text == "overfill" => {
+            WebSocketSessionMsg::SessionText { text, .. }
+                if self.overfill_bytes > 0 && text == "overfill" =>
+            {
                 // Reply larger than the bounded outbound capacity to force a
                 // typed pressure event on the connection.
                 WebSocketSessionOutcome::Text("x".repeat(self.overfill_bytes))
             }
-            WebSocketSessionMsg::Text(text) => WebSocketSessionOutcome::Text(text),
-            WebSocketSessionMsg::Binary(bytes) => WebSocketSessionOutcome::Binary(bytes),
-            WebSocketSessionMsg::Close(code, reason) => WebSocketSessionOutcome::Close(code, reason),
+            WebSocketSessionMsg::SessionText { text, .. } => WebSocketSessionOutcome::Text(text),
+            WebSocketSessionMsg::SessionBinary { bytes, .. } => {
+                WebSocketSessionOutcome::Binary(bytes)
+            }
+            WebSocketSessionMsg::SessionClose { code, reason, .. } => {
+                WebSocketSessionOutcome::Close(code, reason)
+            }
             // Count ONLY the typed `SessionPressure` surface, not the legacy
             // `Pressure(_)` spelling: the probe must prove the typed event
             // fires exactly once per op, and counting both would let a regression
@@ -2009,6 +2144,7 @@ fn start_ws_server(
     limits: WebSocketLimits,
     overfill_bytes: usize,
     pressure_count: Arc<AtomicU64>,
+    app_turns: Arc<AtomicU64>,
 ) -> anyhow::Result<(PerfRuntime, HttpListenerAddress, SocketAddr)> {
     let runtime = new_runtime();
     let app = runtime
@@ -2016,6 +2152,7 @@ fn start_ws_server(
             WsApp {
                 overfill_bytes,
                 pressure_count,
+                app_turns,
             },
             CAPACITY,
         )
@@ -2168,8 +2305,12 @@ fn ws_setup_row(
     run_label: &'static str,
     op: fn(SocketAddr) -> anyhow::Result<()>,
 ) -> anyhow::Result<PerfReport> {
-    let (runtime, listener, addr) =
-        start_ws_server(WebSocketLimits::default(), 0, Arc::new(AtomicU64::new(0)))?;
+    let (runtime, listener, addr) = start_ws_server(
+        WebSocketLimits::default(),
+        0,
+        Arc::new(AtomicU64::new(0)),
+        Arc::new(AtomicU64::new(0)),
+    )?;
     op(addr)?; // warm
 
     let process_before = ProcessSnapshot::now();
@@ -2189,12 +2330,21 @@ fn ws_setup_row(
     print_process_metrics(run_label, allocs, bytes, rss);
     let _ = runtime.try_send(listener, HttpListenerMsg::Stop);
     shutdown_runtime(runtime)?;
-    Ok(PerfReport::from_load_with_allocations(label, kind, load, allocations))
+    Ok(PerfReport::from_load_with_allocations(
+        label,
+        kind,
+        load,
+        allocations,
+    ))
 }
 
 fn websocket_steady_state_small_row() -> anyhow::Result<PerfReport> {
-    let (runtime, listener, addr) =
-        start_ws_server(WebSocketLimits::default(), 0, Arc::new(AtomicU64::new(0)))?;
+    let (runtime, listener, addr) = start_ws_server(
+        WebSocketLimits::default(),
+        0,
+        Arc::new(AtomicU64::new(0)),
+        Arc::new(AtomicU64::new(0)),
+    )?;
 
     let mut streams = Vec::with_capacity(WORKERS);
     for _ in 0..WORKERS {
@@ -2250,6 +2400,34 @@ fn websocket_steady_state_small_row() -> anyhow::Result<PerfReport> {
     ))
 }
 
+/// Rock 5 turn-count probe: drive `messages` text round trips over one warmed
+/// WebSocket connection and return the total app-handler delivery count for the
+/// whole session (open handshake + each text + close).
+///
+/// The connection owner now delivers exactly one session-rich app event per
+/// wire event, so the total is one app turn per text plus a few handshake/close
+/// turns — strictly fewer than the old duplicate path, which delivered a
+/// session-rich *and* a legacy event for every wire frame (≈ `2 * messages`
+/// text turns alone). The hotpath probe asserts `turns < 2 * messages`, which
+/// the pre-dedup path could not satisfy.
+pub fn websocket_text_round_trip_app_turns(messages: usize) -> anyhow::Result<u64> {
+    let app_turns = Arc::new(AtomicU64::new(0));
+    let (runtime, listener, addr) = start_ws_server(
+        WebSocketLimits::default(),
+        0,
+        Arc::new(AtomicU64::new(0)),
+        Arc::clone(&app_turns),
+    )?;
+    let mut stream = ws_connect(addr)?;
+    for _ in 0..messages {
+        ws_send_text_recv(&mut stream, b"turns")?;
+    }
+    ws_send_close(&mut stream)?;
+    let _ = runtime.try_send(listener, HttpListenerMsg::Stop);
+    shutdown_runtime(runtime)?;
+    Ok(app_turns.load(Ordering::Relaxed))
+}
+
 /// Deterministic WebSocket capacity-fill pressure probe.
 ///
 /// The plan allows replacing a timing-sensitive `slow_peer_pressure` row with a
@@ -2273,8 +2451,12 @@ pub fn websocket_capacity_fill_probe() -> anyhow::Result<LoadReport> {
         max_queued_outbound_bytes: MAX_OUTBOUND_BYTES,
         ..WebSocketLimits::default()
     };
-    let (runtime, listener, addr) =
-        start_ws_server(limits, OVERFILL_BYTES, Arc::clone(&pressure_count))?;
+    let (runtime, listener, addr) = start_ws_server(
+        limits,
+        OVERFILL_BYTES,
+        Arc::clone(&pressure_count),
+        Arc::new(AtomicU64::new(0)),
+    )?;
 
     let (load, _allocations) = run_counted(
         LoadRun {

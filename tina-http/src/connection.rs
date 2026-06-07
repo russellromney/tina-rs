@@ -66,7 +66,8 @@ use crate::websocket::{
     WebSocketOutboundQueue, WebSocketReportRequest, WebSocketSend, WebSocketSendError,
     WebSocketSendOutcome, WebSocketSessionHandle, WebSocketSessionId, WebSocketSessionMsg,
     WebSocketSessionOutcome, WebSocketSessionReport, WebSocketSessionReportOutcome,
-    decode_close_payload, encode_server_message, outcome_messages, parse_client_frame,
+    decode_close_payload, encode_server_frame_from, encode_server_message, outcome_messages,
+    parse_client_frame,
 };
 
 /// Bytes the connection isolate asks for per `tcp_read`. Bounded so a
@@ -1648,13 +1649,14 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
             else {
                 return self.begin_close();
             };
+            // Session-rich open: the handle, then the accepted subprotocol.
+            // The legacy bare `Open` marker is no longer emitted alongside.
             return self.call_websocket_app_many(vec![
                 WebSocketSessionMsg::SessionOpen { session: handle },
                 WebSocketSessionMsg::SessionAccepted {
                     session_id,
                     selected_subprotocol,
                 },
-                WebSocketSessionMsg::Open,
             ]);
         }
 
@@ -1693,13 +1695,12 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
                     reason: tina_runtime::WebSocketCloseReason::GoingAway,
                     code: None,
                 }),
-                self.call_websocket_app_many(vec![
-                    WebSocketSessionMsg::SessionClosed {
-                        session_id,
-                        error: WebSocketError::PeerClosed,
-                    },
-                    WebSocketSessionMsg::Closed(WebSocketError::PeerClosed),
-                ]),
+                // One peer close becomes one session-rich `SessionClosed`;
+                // the legacy `Closed` is no longer emitted alongside it.
+                self.call_websocket_app(WebSocketSessionMsg::SessionClosed {
+                    session_id,
+                    error: WebSocketError::PeerClosed,
+                }),
                 self.begin_close(),
             ]);
         }
@@ -1761,26 +1762,31 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
                                     code: code.map(|code| code.0),
                                 },
                             ),
-                            self.call_websocket_app_many(vec![
-                                WebSocketSessionMsg::SessionClose {
-                                    session_id,
-                                    code,
-                                    reason: reason.clone(),
-                                },
-                                WebSocketSessionMsg::Close(code, reason),
-                            ]),
+                            // One close frame becomes one session-rich app
+                            // event; the legacy `Close` is no longer emitted
+                            // for the same frame, so `reason` is moved here.
+                            self.call_websocket_app(WebSocketSessionMsg::SessionClose {
+                                session_id,
+                                code,
+                                reason,
+                            }),
                             self.websocket_queue_or_write(bytes),
                         ])
                     }
                     Err(error) => self.websocket_protocol_close(error),
                 },
                 0x9 => {
-                    let ping = WebSocketSessionMsg::Ping(frame.payload.clone());
-                    if let Some(ws) = self.websocket.as_mut() {
-                        ws.post_write_app = Some(ping);
-                    }
-                    match encode_server_message(WebSocketMessage::Pong(frame.payload)) {
-                        Ok(bytes) => self.websocket_queue_or_write(bytes),
+                    // Echo the ping payload into the pong from a borrowed
+                    // slice, then move the owned payload into the app `Ping`
+                    // notification — one payload, no clone.
+                    match encode_server_frame_from(0xA, &frame.payload) {
+                        Ok(bytes) => {
+                            let ping = WebSocketSessionMsg::Ping(frame.payload);
+                            if let Some(ws) = self.websocket.as_mut() {
+                                ws.post_write_app = Some(ping);
+                            }
+                            self.websocket_queue_or_write(bytes)
+                        }
                         Err(error) => self.websocket_protocol_close(error),
                     }
                 }
@@ -1860,18 +1866,17 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
 
     fn deliver_websocket_message(&mut self, opcode: u8, payload: Vec<u8>) -> Effect<Self> {
         match opcode {
+            // One wire frame becomes exactly one session-rich app event. The
+            // protocol owner no longer also emits the legacy `Text`/`Binary`
+            // variant for the same frame, so the payload is moved into the
+            // single delivery instead of cloned, and the app sees one event
+            // (one handler turn) per message.
             0x1 => match String::from_utf8(payload) {
                 Ok(text) => {
                     let Some(session_id) = self.websocket.as_ref().map(|ws| ws.session_id) else {
                         return self.begin_close();
                     };
-                    self.call_websocket_app_many(vec![
-                        WebSocketSessionMsg::SessionText {
-                            session_id,
-                            text: text.clone(),
-                        },
-                        WebSocketSessionMsg::Text(text),
-                    ])
+                    self.call_websocket_app(WebSocketSessionMsg::SessionText { session_id, text })
                 }
                 Err(_) => self.websocket_protocol_close(WebSocketError::ProtocolError),
             },
@@ -1879,13 +1884,10 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
                 let Some(session_id) = self.websocket.as_ref().map(|ws| ws.session_id) else {
                     return self.begin_close();
                 };
-                self.call_websocket_app_many(vec![
-                    WebSocketSessionMsg::SessionBinary {
-                        session_id,
-                        bytes: payload.clone(),
-                    },
-                    WebSocketSessionMsg::Binary(payload),
-                ])
+                self.call_websocket_app(WebSocketSessionMsg::SessionBinary {
+                    session_id,
+                    bytes: payload,
+                })
             }
             _ => self.websocket_protocol_close(WebSocketError::ProtocolError),
         }
@@ -2192,13 +2194,12 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
             ws.last_pressure = Some(error.clone());
         }
         let notify = match self.websocket.as_ref().map(|ws| ws.session_id) {
-            Some(session_id) => self.call_websocket_app_many(vec![
-                WebSocketSessionMsg::SessionPressure {
-                    session_id,
-                    error: error.clone(),
-                },
-                WebSocketSessionMsg::Pressure(error),
-            ]),
+            // Session-rich pressure only; the legacy `Pressure` duplicate is
+            // dropped. The no-session fallback keeps the bare `Pressure` since
+            // there is no session id to address a session-rich event to.
+            Some(session_id) => {
+                self.call_websocket_app(WebSocketSessionMsg::SessionPressure { session_id, error })
+            }
             None => self.call_websocket_app(WebSocketSessionMsg::Pressure(error)),
         };
         match encode_server_message(WebSocketMessage::Close(
@@ -2223,13 +2224,12 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
             .as_ref()
             .map(|ws| (ws.session_id, ws.outbound.len(), ws.outbound.queued_bytes()));
         let notify = match session_snapshot.as_ref().map(|s| s.0) {
-            Some(session_id) => self.call_websocket_app_many(vec![
-                WebSocketSessionMsg::SessionPressure {
-                    session_id,
-                    error: error.clone(),
-                },
-                WebSocketSessionMsg::Pressure(error.clone()),
-            ]),
+            // Session-rich pressure only; the legacy `Pressure` duplicate is
+            // dropped. The no-session fallback keeps the bare `Pressure`.
+            Some(session_id) => self.call_websocket_app(WebSocketSessionMsg::SessionPressure {
+                session_id,
+                error: error.clone(),
+            }),
             None => self.call_websocket_app(WebSocketSessionMsg::Pressure(error.clone())),
         };
         let mut effects = vec![notify, self.begin_close()];

@@ -24,9 +24,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use perf_native::{count_all_allocations, http2_steady_state_response_process_allocations};
-use tina::prelude::*;
+use perf_native::{
+    count_all_allocations, http2_steady_state_response_process_allocations,
+    websocket_text_round_trip_app_turns,
+};
 use tina::IsolateId;
+use tina::prelude::*;
 use tina_http::{
     HttpListener, HttpListenerMsg, HttpRequest, HttpResponse, HttpServerConfig, StatusCode,
 };
@@ -99,6 +102,12 @@ const HTTP_STEADY_STAGE_CEILING: usize = 36;
 // with a recorded before/after if a platform's fixed baseline differs.
 const H2_BUFFERED_RESPONSE_ALLOC_CEILING: u64 = 3_130;
 const H2_BUFFERED_RESPONSE_REQUESTS: usize = 64;
+// Rock 5 (fewer turns): a WebSocket session of N text round trips. The
+// duplicate-delivery removal means the connection owner emits one app event per
+// wire event, so total app deliveries for the session are far below the old
+// `2 * N` text turns alone. The ceiling sits below `2 * N` so the pre-dedup
+// path (which delivered a session-rich AND a legacy event per frame) fails.
+const WS_TURN_PROBE_MESSAGES: usize = 64;
 
 type Runtime = ThreadedRuntime<SingleShard, DefaultThreadedMailboxFactory>;
 
@@ -217,12 +226,15 @@ struct HotPathBreakdown {
 impl TraceObserver for StageTimer {
     fn on_event(&self, event: &RuntimeEvent) {
         let label = kind_label(event.kind());
-        self.events.lock().expect("stage timer lock").push(TraceSample {
-            label,
-            isolate: event.isolate(),
-            kind: event.kind(),
-            at: Instant::now(),
-        });
+        self.events
+            .lock()
+            .expect("stage timer lock")
+            .push(TraceSample {
+                label,
+                isolate: event.isolate(),
+                kind: event.kind(),
+                at: Instant::now(),
+            });
     }
 }
 
@@ -313,11 +325,7 @@ fn wait_count(count: &AtomicU64, target: u64) {
 /// Turns one instrumented timeline into named stage gaps: host submit -> first
 /// worker event -> ... -> host unblock. Repeated boundaries get a numeric
 /// suffix so two inter-turn gaps stay distinct in the report.
-fn stages_from_timeline(
-    t0: Instant,
-    events: &[TraceSample],
-    t_end: Instant,
-) -> HotPathBreakdown {
+fn stages_from_timeline(t0: Instant, events: &[TraceSample], t_end: Instant) -> HotPathBreakdown {
     stages_from_filtered_timeline(t0, events, t_end, |_| true)
 }
 
@@ -379,7 +387,10 @@ fn dominant_connection_isolate(
         }
         *counts.entry(sample.isolate).or_insert(0) += 1;
     }
-    counts.into_iter().max_by_key(|(_isolate, count)| *count).map(|(isolate, _)| isolate)
+    counts
+        .into_iter()
+        .max_by_key(|(_isolate, count)| *count)
+        .map(|(isolate, _)| isolate)
 }
 
 fn stages_from_http_timeline(
@@ -671,7 +682,10 @@ fn probe_call_blocking_tail() -> (HotPathReport, HotPathReport) {
 
 /// Runs the warmed steady-state keepalive timing loop, optionally with a live
 /// observer attached. Returns (totals ns, host allocs, process allocs).
-fn steady_state_totals(body: &[u8], observer: Option<Arc<dyn TraceObserver>>) -> (Vec<u64>, u64, u64) {
+fn steady_state_totals(
+    body: &[u8],
+    observer: Option<Arc<dyn TraceObserver>>,
+) -> (Vec<u64>, u64, u64) {
     let (runtime, addr, _service) = start_http_runtime(observer, body.to_vec(), true);
     for _ in 0..HTTP_HOTPATH_WARMUP {
         http_get_reused(addr, 2, body.len()).expect("warm steady-state http request");
@@ -682,8 +696,7 @@ fn steady_state_totals(body: &[u8], observer: Option<Arc<dyn TraceObserver>>) ->
         http_get_reused(addr, 1, body.len()).expect("steady-state http hotpath op");
         totals.push(t0.elapsed().as_nanos() as u64);
     }
-    let (_outcome, host, process) =
-        count_all_allocations(|| http_get_reused(addr, 1, body.len()));
+    let (_outcome, host, process) = count_all_allocations(|| http_get_reused(addr, 1, body.len()));
     shutdown(runtime);
     (totals, host, process)
 }
@@ -888,9 +901,8 @@ fn probe_http1(
         http_get(addr, keepalive, requests_per_op, expected_body_len).expect("http hotpath op");
         totals.push(t0.elapsed().as_nanos() as u64);
     }
-    let (_outcome, host_allocations, process_allocations) = count_all_allocations(|| {
-        http_get(addr, keepalive, requests_per_op, expected_body_len)
-    });
+    let (_outcome, host_allocations, process_allocations) =
+        count_all_allocations(|| http_get(addr, keepalive, requests_per_op, expected_body_len));
     shutdown(runtime);
 
     let breakdown = instrumented_http1(body, keepalive, requests_per_op, expected_body_len);
@@ -970,7 +982,11 @@ fn start_http_runtime(
     }
     let listener = runtime
         .register_with_capacity::<_, Infallible>(
-            HttpListener::<SingleShard>::with_config("127.0.0.1:0".parse().unwrap(), service, config),
+            HttpListener::<SingleShard>::with_config(
+                "127.0.0.1:0".parse().unwrap(),
+                service,
+                config,
+            ),
             config.listener_mailbox_capacity,
         )
         .expect("register http listener");
@@ -1136,8 +1152,16 @@ fn hotpath_probes_report_and_stay_bounded() {
             "tail row carries the gap threshold: {}",
             report.label
         );
-        assert!(report.p99_ns >= report.p50_ns, "p99 >= p50: {}", report.label);
-        assert!(report.p90_ns >= report.p50_ns, "p90 >= p50: {}", report.label);
+        assert!(
+            report.p99_ns >= report.p50_ns,
+            "p99 >= p50: {}",
+            report.label
+        );
+        assert!(
+            report.p90_ns >= report.p50_ns,
+            "p90 >= p50: {}",
+            report.label
+        );
     }
     // Traced and untraced rows for the same path must be distinguishable: both
     // a distinct label and the `traced` flag.
@@ -1291,5 +1315,26 @@ fn hotpath_probes_report_and_stay_bounded() {
     assert!(
         h2_buffered_allocs <= H2_BUFFERED_RESPONSE_ALLOC_CEILING,
         "h2c buffered response allocations {h2_buffered_allocs} exceeded ceiling {H2_BUFFERED_RESPONSE_ALLOC_CEILING} ({per_request:.2}/request)",
+    );
+
+    // Rock 5: app-handler turns for a WebSocket session of N text round trips.
+    // With one session-rich event per wire event, the whole session (open +
+    // N texts + close) costs ~N+a-few app turns; the pre-dedup path delivered a
+    // session-rich AND a legacy event for every wire frame, so its text turns
+    // alone were 2*N. The ceiling at 2*N is the structural turn-reduction proof.
+    let ws_app_turns = websocket_text_round_trip_app_turns(WS_TURN_PROBE_MESSAGES)
+        .expect("measure websocket app-handler turns");
+    let turn_ceiling = (2 * WS_TURN_PROBE_MESSAGES) as u64;
+    let per_message = ws_app_turns as f64 / WS_TURN_PROBE_MESSAGES as f64;
+    println!(
+        "perf-ws-turns messages={WS_TURN_PROBE_MESSAGES} app_turns={ws_app_turns} per_message={per_message:.2}"
+    );
+    assert!(
+        ws_app_turns >= WS_TURN_PROBE_MESSAGES as u64,
+        "each wire text must reach the app at least once: app_turns {ws_app_turns} < messages {WS_TURN_PROBE_MESSAGES}",
+    );
+    assert!(
+        ws_app_turns < turn_ceiling,
+        "WebSocket app turns {ws_app_turns} not below the pre-dedup 2*N={turn_ceiling}; duplicate delivery may have returned",
     );
 }

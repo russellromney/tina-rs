@@ -49,10 +49,10 @@ use super::errors::{
 };
 use super::frame::{
     CLIENT_PREFACE, DEFAULT_WINDOW, FLAG_ACK, FLAG_END_HEADERS, FLAG_END_STREAM, FRAME_DATA,
-    FRAME_GOAWAY, FRAME_HEADERS, FRAME_PING, FRAME_RST_STREAM, FRAME_SETTINGS, FRAME_WINDOW_UPDATE,
-    Frame, READ_CHUNK, WINDOW_CREDIT_FLUSH_THRESHOLD, add_window, data_frame, data_payload,
-    goaway_frame, headers_frame, headers_payload, rst_stream_frame, settings_frame,
-    try_decode_frame, window_update_frame,
+    FRAME_GOAWAY, FRAME_HEADER_LEN, FRAME_HEADERS, FRAME_PING, FRAME_RST_STREAM, FRAME_SETTINGS,
+    FRAME_WINDOW_UPDATE, Frame, READ_CHUNK, WINDOW_CREDIT_FLUSH_THRESHOLD, add_window, data_frame,
+    goaway_frame, headers_frame, headers_payload, into_data_payload, push_frame_header,
+    rst_stream_frame, settings_frame, try_decode_frame, window_update_frame,
 };
 use super::headers::{
     DEFAULT_HEADER_TABLE_SIZE, HeaderBlock, MAX_MAX_FRAME_SIZE, MIN_MAX_FRAME_SIZE,
@@ -406,11 +406,16 @@ struct ActiveClientStream {
     send_window: i32,
     pending_recv_window_credit: u32,
     response_content_length: Option<usize>,
-    /// Bytes of request body still to send. Drained as DATA frames are
+    /// Bytes of request body still to send. Consumed as DATA frames are
     /// admitted under stream + connection flow-control credit. For a
     /// buffered request the whole body is here at admission; for a
-    /// streaming request, chunks are appended as they are pulled.
-    outbound_body: VecDeque<u8>,
+    /// streaming request, chunks are appended as they are pulled. An owned
+    /// `Vec` plus `outbound_cursor` (the offset of the first unsent byte)
+    /// replaces the old per-byte `VecDeque<u8>` drain; the sent prefix is
+    /// compacted/dropped so a long request body does not stay resident.
+    outbound_body: Vec<u8>,
+    /// Offset of the first not-yet-sent byte in `outbound_body`.
+    outbound_cursor: usize,
     /// Streaming request body source. `None` for a buffered request.
     /// The connection pulls chunks via `ResponseChunkMsg::Next`.
     request_source: Option<tina::Address<ResponseChunkMsg, ResponseChunkReply>>,
@@ -463,7 +468,8 @@ impl ActiveClientStream {
             send_window,
             pending_recv_window_credit: 0,
             response_content_length: None,
-            outbound_body: VecDeque::from(outbound_body),
+            outbound_body,
+            outbound_cursor: 0,
             // A buffered request has its whole body up front.
             request_source: None,
             request_complete: true,
@@ -488,6 +494,37 @@ impl ActiveClientStream {
         stream.request_source = Some(source);
         stream.request_complete = false;
         stream
+    }
+
+    /// Unsent request-body bytes remaining after `outbound_cursor`.
+    fn outbound_remaining(&self) -> usize {
+        self.outbound_body.len() - self.outbound_cursor
+    }
+
+    /// True while request-body bytes remain to be framed.
+    fn has_outbound(&self) -> bool {
+        self.outbound_cursor < self.outbound_body.len()
+    }
+
+    /// Append a streaming request-body chunk, compacting the already-sent
+    /// prefix first so a long streaming request does not keep sent bytes
+    /// resident.
+    fn append_outbound(&mut self, bytes: &[u8]) {
+        if self.outbound_cursor > 0 {
+            self.outbound_body.drain(..self.outbound_cursor);
+            self.outbound_cursor = 0;
+        }
+        self.outbound_body.extend_from_slice(bytes);
+    }
+
+    /// Mark `n` more request-body bytes consumed; drop the buffer once it is
+    /// fully drained so a finished request body does not stay resident.
+    fn advance_outbound(&mut self, n: usize) {
+        self.outbound_cursor += n;
+        if self.outbound_cursor >= self.outbound_body.len() {
+            self.outbound_body.clear();
+            self.outbound_cursor = 0;
+        }
     }
 }
 
@@ -877,7 +914,7 @@ impl<S: Shard + 'static> Http2ClientConnection<S> {
         self.streams[idx].request_pull_in_flight = false;
         match outcome {
             CallOutcome::Replied(ResponseChunkReply::Chunk(bytes)) => {
-                self.streams[idx].outbound_body.extend(bytes);
+                self.streams[idx].append_outbound(&bytes);
             }
             CallOutcome::Replied(ResponseChunkReply::Eof)
             | CallOutcome::Replied(ResponseChunkReply::GrpcStatus(_)) => {
@@ -1321,10 +1358,7 @@ impl<S: Shard + 'static> Http2ClientConnection<S> {
             let Some(source) = stream.request_source else {
                 continue;
             };
-            if stream.request_complete
-                || stream.request_pull_in_flight
-                || !stream.outbound_body.is_empty()
-            {
+            if stream.request_complete || stream.request_pull_in_flight || stream.has_outbound() {
                 continue;
             }
             stream.request_pull_in_flight = true;
@@ -1374,7 +1408,7 @@ impl<S: Shard + 'static> Http2ClientConnection<S> {
                     break;
                 }
                 let stream = &mut self.streams[idx];
-                if stream.outbound_body.is_empty() {
+                if !stream.has_outbound() {
                     continue;
                 }
                 if stream.send_window <= 0 {
@@ -1385,28 +1419,35 @@ impl<S: Shard + 'static> Http2ClientConnection<S> {
                     .send_window
                     .min(self.send_window)
                     .min(max_chunk as i32) as usize;
-                let credit = credit.min(stream.outbound_body.len());
+                let credit = credit.min(stream.outbound_remaining());
                 if credit == 0 {
                     continue;
                 }
-                let mut chunk = Vec::with_capacity(credit);
-                for _ in 0..credit {
-                    if let Some(byte) = stream.outbound_body.pop_front() {
-                        chunk.push(byte);
-                    }
-                }
                 // END_STREAM only once the whole request body is known
-                // (buffered, or a streaming source that hit `Eof`) and
-                // this chunk drains it.
-                let is_last = stream.outbound_body.is_empty() && stream.request_complete;
+                // (buffered, or a streaming source that hit `Eof`) and this
+                // chunk drains the remaining bytes.
+                let is_last = credit == stream.outbound_remaining() && stream.request_complete;
+                let start = stream.outbound_cursor;
+                // Frame the DATA payload directly: 9-byte header then the
+                // unsent body slice. One copy here, versus the old per-byte
+                // `pop_front` loop plus a re-encode in `Frame::encode`.
+                let mut framed = Vec::with_capacity(FRAME_HEADER_LEN + credit);
+                push_frame_header(
+                    &mut framed,
+                    FRAME_DATA,
+                    if is_last { FLAG_END_STREAM } else { 0 },
+                    stream.id,
+                    credit,
+                );
+                framed.extend_from_slice(&stream.outbound_body[start..start + credit]);
+                stream.advance_outbound(credit);
                 if is_last {
                     stream.request_end_sent = true;
                 }
-                let n = chunk.len() as i32;
+                let n = credit as i32;
                 stream.send_window -= n;
                 self.send_window -= n;
-                let stream_id = stream.id;
-                self.enqueue_frame(data_frame(stream_id, is_last, chunk));
+                self.enqueue_bytes(framed);
                 progressed = true;
             }
         }
@@ -1415,10 +1456,7 @@ impl<S: Shard + 'static> Http2ClientConnection<S> {
         // END_STREAM. Emit an empty DATA(END_STREAM) for those.
         let mut pending_end: Vec<u32> = Vec::new();
         for stream in &self.streams {
-            if stream.request_complete
-                && stream.outbound_body.is_empty()
-                && !stream.request_end_sent
-            {
+            if stream.request_complete && !stream.has_outbound() && !stream.request_end_sent {
                 pending_end.push(stream.id);
             }
         }
@@ -1714,7 +1752,12 @@ impl<S: Shard + 'static> Http2ClientConnection<S> {
         if frame.stream_id == 0 {
             return Err(Http2ProtocolError::BadStreamId);
         }
-        let payload = data_payload(&frame)?;
+        // Move the unpadded payload out of the owned frame instead of cloning
+        // it. The client keeps its existing connection/stream window
+        // accounting on the unpadded length it already used.
+        let stream_id = frame.stream_id;
+        let end_stream = frame.flags & FLAG_END_STREAM != 0;
+        let (payload, _flow_len) = into_data_payload(frame)?;
         let payload_len = payload.len();
         let len_i32 = i32::try_from(payload_len).map_err(|_| Http2ProtocolError::FlowControl)?;
         if self.recv_window < len_i32 {
@@ -1728,7 +1771,6 @@ impl<S: Shard + 'static> Http2ClientConnection<S> {
         self.pending_recv_window_credit = self
             .pending_recv_window_credit
             .saturating_add(payload_len as u32);
-        let stream_id = frame.stream_id;
         let Some(idx) = self.streams.iter().position(|s| s.id == stream_id) else {
             // DATA for an unknown / closed stream is a stream-level error,
             // not a connection-level one (RFC 9113 §6.9.1 / §5.1). Send
@@ -1759,7 +1801,7 @@ impl<S: Shard + 'static> Http2ClientConnection<S> {
             if !payload.is_empty() {
                 self.streams[idx].response_chunks.push_back(payload);
             }
-            if frame.flags & FLAG_END_STREAM != 0 {
+            if end_stream {
                 self.streams[idx].response_eof = true;
             }
             self.deliver_to_parked_pull(idx, effects);
@@ -1789,7 +1831,7 @@ impl<S: Shard + 'static> Http2ClientConnection<S> {
                 self.streams[idx].recv_window.saturating_add(credit as i32);
             self.enqueue_frame(window_update_frame(stream_id, credit));
         }
-        if frame.flags & FLAG_END_STREAM != 0 {
+        if end_stream {
             if let Some(declared) = self.streams[idx].response_content_length {
                 if declared != self.streams[idx].response_body.len() {
                     return Err(Http2ProtocolError::ContentLengthMismatch);
@@ -2046,10 +2088,15 @@ impl<S: Shard + 'static> Http2ClientConnection<S> {
     }
 
     fn enqueue_frame(&mut self, frame: Frame) {
-        let bytes = frame.encode();
-        // Only fill `pending_write` if it is empty AND we are not
-        // currently waiting on a write completion. Otherwise queue
-        // behind it so `write_in_flight` correctly gates re-entry.
+        self.enqueue_bytes(frame.encode());
+    }
+
+    /// Queue already-encoded frame bytes. Only fill `pending_write` if it is
+    /// empty AND we are not currently waiting on a write completion;
+    /// otherwise queue behind it so `write_in_flight` correctly gates
+    /// re-entry. Used by `flush_outbound_data` to push a DATA frame built
+    /// straight from the request-body slice without a `Frame` round-trip.
+    fn enqueue_bytes(&mut self, bytes: Vec<u8>) {
         if self.pending_write.is_empty() && !self.write_in_flight {
             self.pending_write = bytes;
         } else {

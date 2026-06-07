@@ -159,9 +159,17 @@ pub(super) fn data_frame(stream_id: u32, end_stream: bool, data: Vec<u8>) -> Fra
     )
 }
 
-pub(super) fn data_payload(frame: &Frame) -> Result<Vec<u8>, Http2ProtocolError> {
+/// Take the application DATA bytes out of an owned `Frame`, returning the
+/// unpadded payload plus the flow-control wire length (the full on-wire
+/// payload, padding included — RFC 9113 §6.9.1 counts padding against the
+/// window). The handler already owns the `Frame`, so the unpadded case moves
+/// `frame.payload` out instead of cloning it; only the rarer padded case has
+/// to allocate a trimmed copy. The old borrowing `data_payload` cloned even
+/// the unpadded payload, so handlers must take the owned path here.
+pub(super) fn into_data_payload(frame: Frame) -> Result<(Vec<u8>, usize), Http2ProtocolError> {
+    let flow_len = frame.payload.len();
     if frame.flags & FLAG_PADDED == 0 {
-        return Ok(frame.payload.clone());
+        return Ok((frame.payload, flow_len));
     }
     let Some((&pad_len, rest)) = frame.payload.split_first() else {
         return Err(Http2ProtocolError::BadFrameLength);
@@ -170,7 +178,7 @@ pub(super) fn data_payload(frame: &Frame) -> Result<Vec<u8>, Http2ProtocolError>
     if pad_len > rest.len() {
         return Err(Http2ProtocolError::BadFrameLength);
     }
-    Ok(rest[..rest.len() - pad_len].to_vec())
+    Ok((rest[..rest.len() - pad_len].to_vec(), flow_len))
 }
 
 pub(super) fn headers_payload(frame: &Frame) -> Result<&[u8], Http2ProtocolError> {
