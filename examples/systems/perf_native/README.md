@@ -390,10 +390,14 @@ The buffered HTTP/2 response path used to copy each body chunk twice: once into 
 `Frame`'s `payload` `Vec` (`chunk.to_vec()`), then again inside `Frame::encode`
 when it spliced the 9-byte header in front. The server now builds each DATA frame
 straight into the queued buffer — header bytes via a new `push_frame_header`
-helper, then `extend_from_slice(chunk)` — so a body chunk is copied once. The
-per-frame `ensure_outbound_slots(1)` admission is kept, so the bounded
-outbound-queue cap and the `connection_full` accounting are byte-for-byte
-identical; the wire output is unchanged, so no replay-visible fact moves.
+helper, then `extend_from_slice(chunk)` — so a body chunk is copied once. At this
+(Phase 152) step the per-frame `ensure_outbound_slots(1)` admission was kept, so
+the bounded outbound-queue cap and the `connection_full` accounting were
+byte-for-byte identical and the wire output unchanged. (Phase 153 below then
+coalesces the whole buffered response into a single queued write, so a buffered
+response now takes one outbound slot instead of one per frame — the queue-full
+guard still applies, but the per-frame-count admission bound is gone. See the
+Phase 153 section.)
 
 Measured by the `perf-h2-alloc` check inside `hotpath_probes_report_and_stay_bounded`
 (it calls `http2_steady_state_response_process_allocations`; the ceiling lives in

@@ -867,6 +867,60 @@ fn large_upload_paces_through_real_window_updates() {
 }
 
 #[test]
+fn padded_response_data_delivers_unpadded_body_only() {
+    // The peer answers with a PADDED DATA frame (pad-length byte + body +
+    // padding). The client must deliver ONLY the unpadded body, and count the
+    // full on-wire payload (padding included) against its flow-control windows
+    // per RFC 9113 §6.9.1 — so a padding-using peer is not starved. A
+    // flow-control miscount would surface here as a non-`Replied` outcome.
+    const FLAG_PADDED: u8 = 0x8;
+    let (addr, peer) = spawn_peer(|sock, stream_id| {
+        let mut block = Vec::new();
+        literal_header(":status", "200", &mut block);
+        write_frame(sock, FRAME_HEADERS, FLAG_END_HEADERS, stream_id, &block);
+        // Padded DATA: [pad_len=4]["hello"][4 pad bytes], END_STREAM.
+        let mut data = Vec::new();
+        data.push(4u8);
+        data.extend_from_slice(b"hello");
+        data.extend_from_slice(&[0u8; 4]);
+        write_frame(
+            sock,
+            FRAME_DATA,
+            FLAG_END_STREAM | FLAG_PADDED,
+            stream_id,
+            &data,
+        );
+    });
+    let (runtime, client) = run_client(addr);
+
+    let outcome = runtime
+        .call_blocking(
+            client,
+            Http2ClientMsg::Submit(Http2ClientRequest::get("/x")),
+            Duration::from_secs(5),
+        )
+        .expect("call returns outcome");
+    match outcome {
+        CallOutcome::Replied(Http2ClientReply::Outcome {
+            outcome: Http2ClientOutcome::Replied(response),
+            ..
+        }) => {
+            assert_eq!(response.status.as_u16(), 200);
+            assert_eq!(
+                response.body,
+                b"hello".to_vec(),
+                "only the unpadded body is delivered to the caller"
+            );
+        }
+        other => panic!("expected Replied with unpadded body, got {other:?}"),
+    }
+
+    let _ = runtime.try_send(client, Http2ClientMsg::Stop);
+    let _ = runtime.shutdown();
+    peer.join().expect("peer thread joins");
+}
+
+#[test]
 fn caller_cancel_returns_local_cancel_and_keeps_connection_alive() {
     // The peer accepts the request and holds it (never answers). The
     // caller's submit is admitted (stream 1); a separate thread sends

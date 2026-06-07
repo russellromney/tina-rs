@@ -573,6 +573,11 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Http2Connection<
         // read). DATA and HEADERS — the hot frames — are handled straight from
         // `buf` with no per-frame payload `Vec`; the rare, tiny control frames
         // take a cheap owned copy.
+        // `consumed` advances only after a frame is handled, so on a protocol
+        // error the failing frame is left in the restored buffer (rather than
+        // pre-drained as the old per-frame loop did). That is safe: the caller
+        // turns a `process_buffer` error into GOAWAY + `closing_after_write` and
+        // never arms another read, so the buffer is never reprocessed.
         let mut buf = std::mem::take(&mut self.read_buf);
         let mut consumed = 0usize;
         let result = self.process_frames(&buf, &mut consumed, effects);
@@ -596,6 +601,13 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Http2Connection<
                 FRAME_DATA => self.handle_data(meta.flags, meta.stream_id, payload, effects)?,
                 FRAME_HEADERS => {
                     self.handle_headers(meta.flags, meta.stream_id, payload, effects)?
+                }
+                // WINDOW_UPDATE is the frequent control frame on streaming /
+                // large-body connections; handle it from the borrowed slice too
+                // rather than paying an owned `Frame` copy per credit.
+                FRAME_WINDOW_UPDATE => {
+                    self.handle_window_update(meta.stream_id, payload, effects)?;
+                    self.push_ready_response_pulls(effects);
                 }
                 _ => self.handle_control_frame(
                     meta.ty,
@@ -625,11 +637,6 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Http2Connection<
         let frame = Frame::new(ty, flags, stream_id, payload.to_vec());
         match ty {
             FRAME_SETTINGS => self.handle_settings(frame, effects),
-            FRAME_WINDOW_UPDATE => {
-                self.handle_window_update(frame, effects)?;
-                self.push_ready_response_pulls(effects);
-                Ok(())
-            }
             FRAME_RST_STREAM => self.handle_rst_stream(frame, effects),
             FRAME_PING => self.handle_ping(frame),
             FRAME_GOAWAY => {
@@ -1037,38 +1044,50 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Http2Connection<
         Ok(())
     }
 
-    fn handle_window_update(
+    /// Test-only: dispatch an owned WINDOW_UPDATE `Frame` through the
+    /// borrowed-slice handler.
+    #[cfg(test)]
+    fn handle_window_update_frame(
         &mut self,
         frame: Frame,
         effects: &mut Vec<Effect<Self>>,
     ) -> Result<(), Http2ProtocolError> {
-        if frame.payload.len() != 4 {
+        self.handle_window_update(frame.stream_id, &frame.payload, effects)
+    }
+
+    fn handle_window_update(
+        &mut self,
+        stream_id: u32,
+        payload: &[u8],
+        effects: &mut Vec<Effect<Self>>,
+    ) -> Result<(), Http2ProtocolError> {
+        if payload.len() != 4 {
             return Err(Http2ProtocolError::BadFrameLength);
         }
         let mut bytes = [0_u8; 4];
-        bytes.copy_from_slice(&frame.payload);
+        bytes.copy_from_slice(payload);
         let increment = u32::from_be_bytes(bytes) & 0x7fff_ffff;
         if increment == 0 {
-            if frame.stream_id == 0 {
+            if stream_id == 0 {
                 return Err(Http2ProtocolError::WindowOverflow);
             }
             self.report.protocol_errors += 1;
-            self.enqueue_frame(rst_stream_frame(frame.stream_id, ERR_PROTOCOL_ERROR))?;
+            self.enqueue_frame(rst_stream_frame(stream_id, ERR_PROTOCOL_ERROR))?;
             self.emit_protocol_fact(
                 effects,
                 ProtocolFact::Http2StreamReset {
                     connection: self.connection_fact_id(),
-                    stream: Http2StreamId::new(frame.stream_id),
+                    stream: Http2StreamId::new(stream_id),
                     direction: ProtocolDirection::Outbound,
                     reason: Http2ResetReason::ProtocolError,
                 },
             );
-            self.reset_active_stream_for_protocol(frame.stream_id, effects);
+            self.reset_active_stream_for_protocol(stream_id, effects);
             return Ok(());
         }
-        if frame.stream_id == 0 {
+        if stream_id == 0 {
             self.send_window = add_window(self.send_window, increment)?;
-        } else if let Some(idx) = self.find_stream(frame.stream_id) {
+        } else if let Some(idx) = self.find_stream(stream_id) {
             self.streams[idx].send_window = add_window(self.streams[idx].send_window, increment)?;
         }
         self.flush_pending_responses(effects)?;
@@ -2280,7 +2299,7 @@ mod tests {
         let frame = Frame::new(FRAME_WINDOW_UPDATE, 0, 0, 0_u32.to_be_bytes().to_vec());
         let mut effects: Vec<Effect<Http2Connection<UnitShard>>> = Vec::new();
         assert_eq!(
-            conn.handle_window_update(frame, &mut effects),
+            conn.handle_window_update_frame(frame, &mut effects),
             Err(Http2ProtocolError::WindowOverflow)
         );
     }
@@ -2298,7 +2317,7 @@ mod tests {
         let frame = Frame::new(FRAME_WINDOW_UPDATE, 0, 1, 0_u32.to_be_bytes().to_vec());
         let mut effects: Vec<Effect<Http2Connection<UnitShard>>> = Vec::new();
 
-        conn.handle_window_update(frame, &mut effects)
+        conn.handle_window_update_frame(frame, &mut effects)
             .expect("stream zero WINDOW_UPDATE should not GOAWAY connection");
 
         assert!(conn.find_stream(1).is_none(), "bad stream is removed");

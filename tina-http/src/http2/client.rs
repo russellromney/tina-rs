@@ -1753,24 +1753,26 @@ impl<S: Shard + 'static> Http2ClientConnection<S> {
             return Err(Http2ProtocolError::BadStreamId);
         }
         // Move the unpadded payload out of the owned frame instead of cloning
-        // it. The client keeps its existing connection/stream window
-        // accounting on the unpadded length it already used.
+        // it. `flow_len` is the full on-wire payload length (pad-length byte +
+        // padding included); RFC 9113 §6.9.1 counts the *whole* DATA payload
+        // against both the connection and stream windows. `payload_len` is the
+        // unpadded application length, used for body caps and content-length.
         let stream_id = frame.stream_id;
         let end_stream = frame.flags & FLAG_END_STREAM != 0;
-        let (payload, _flow_len) = into_data_payload(frame)?;
+        let (payload, flow_len) = into_data_payload(frame)?;
         let payload_len = payload.len();
-        let len_i32 = i32::try_from(payload_len).map_err(|_| Http2ProtocolError::FlowControl)?;
-        if self.recv_window < len_i32 {
+        let flow_i32 = i32::try_from(flow_len).map_err(|_| Http2ProtocolError::FlowControl)?;
+        if self.recv_window < flow_i32 {
             self.report.flow_control_blocked += 1;
             return Err(Http2ProtocolError::FlowControl);
         }
-        // Always count DATA on the connection window per RFC 9113 §6.9.1,
-        // even for closed streams; we still pay the connection-level
-        // accounting and credit it back via WINDOW_UPDATE.
-        self.recv_window -= len_i32;
+        // Always count DATA on the connection window per RFC 9113 §6.9.1 by the
+        // full wire length, even for closed streams; the same amount is credited
+        // back (batched in handle_read).
+        self.recv_window -= flow_i32;
         self.pending_recv_window_credit = self
             .pending_recv_window_credit
-            .saturating_add(payload_len as u32);
+            .saturating_add(flow_len as u32);
         let Some(idx) = self.streams.iter().position(|s| s.id == stream_id) else {
             // DATA for an unknown / closed stream is a stream-level error,
             // not a connection-level one (RFC 9113 §6.9.1 / §5.1). Send
@@ -1783,11 +1785,22 @@ impl<S: Shard + 'static> Http2ClientConnection<S> {
         if !self.streams[idx].response_headers_seen {
             return Err(Http2ProtocolError::DataBeforeHeaders);
         }
-        if self.streams[idx].recv_window < len_i32 {
+        if self.streams[idx].recv_window < flow_i32 {
             self.report.flow_control_blocked += 1;
             return Err(Http2ProtocolError::FlowControl);
         }
-        self.streams[idx].recv_window -= len_i32;
+        self.streams[idx].recv_window -= flow_i32;
+        // Padding is consumed off the wire here and never handed to the caller,
+        // so return its stream-window credit to the peer immediately. Only the
+        // unpadded `payload_len` stays debited as the consumer-backpressure
+        // lever (returned on consume for streamed responses, or batched below
+        // for buffered ones). A no-op for the common unpadded frame.
+        let padding = flow_len - payload_len;
+        if padding > 0 {
+            self.streams[idx].recv_window =
+                self.streams[idx].recv_window.saturating_add(padding as i32);
+            self.enqueue_frame(window_update_frame(stream_id, padding as u32));
+        }
         // Streamed response: hold the per-stream credit (the backpressure
         // lever) and buffer the chunk for the caller to pull. There is no
         // total-body cap — the stream window bounds resident bytes, and
