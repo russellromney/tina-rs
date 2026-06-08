@@ -287,7 +287,6 @@ struct ActiveStream {
     request_eof: bool,
     request_content_length: Option<usize>,
     request_bytes_received: usize,
-    request_flow_bytes_received: usize,
     pending_recv_window_credit: u32,
     request_chunks: VecDeque<RequestDataChunk>,
     pending_request_body_reply: Option<tina::RequestContext<Http2ConnectionReply>>,
@@ -356,7 +355,6 @@ impl ActiveStream {
             request_eof: false,
             request_content_length: None,
             request_bytes_received: 0,
-            request_flow_bytes_received: 0,
             pending_recv_window_credit: 0,
             request_chunks: VecDeque::new(),
             pending_request_body_reply: None,
@@ -1088,7 +1086,6 @@ impl<S: Shard + 'static, M: Http2ServiceMessage> Http2Connection<S, M> {
         self.recv_window -= flow_len_i32;
         self.streams[idx].recv_window -= flow_len_i32;
         self.streams[idx].request_bytes_received += data_len;
-        self.streams[idx].request_flow_bytes_received += flow_len;
         if self.streams[idx].request_dispatched_streaming {
             if !data.is_empty() {
                 // A queued streaming chunk must outlive this read buffer, so it
@@ -1105,6 +1102,14 @@ impl<S: Shard + 'static, M: Http2ServiceMessage> Http2Connection<S, M> {
             }
         } else {
             self.streams[idx].body.extend_from_slice(data);
+            // The buffered body is retained immediately, so credit its flow
+            // bytes back mid-upload — mirroring the streaming path. Without
+            // this a buffered upload larger than the initial window exhausts
+            // the peer's send credit and deadlocks before END_STREAM.
+            if flow_len > 0 {
+                self.add_request_window_credit(idx, flow_len);
+                self.maybe_flush_request_window_credit(stream_id, false)?;
+            }
         }
         if end_stream {
             if self.streams[idx]
@@ -1276,19 +1281,12 @@ impl<S: Shard + 'static, M: Http2ServiceMessage> Http2Connection<S, M> {
             grpc_content_type: headers.grpc_content_type,
             grpc_encoding_unsupported: headers.grpc_encoding_unsupported,
         };
-        let consumed = match &parts.body {
-            HttpRequestBody::Buffered(_) => self.streams[idx].request_flow_bytes_received,
-            HttpRequestBody::Stream(_) | HttpRequestBody::Http2Stream(_) => 0,
-        };
-        if consumed > 0 {
-            self.recv_window = self.recv_window.saturating_add(consumed as i32);
-            if let Some(idx) = self.find_stream(stream_id) {
-                self.streams[idx].recv_window = self.streams[idx]
-                    .recv_window
-                    .saturating_add(consumed as i32);
-            }
-            self.enqueue_frame(window_update_frame(0, consumed as u32))?;
-            self.enqueue_frame(window_update_frame(stream_id, consumed as u32))?;
+        // The buffered body's flow bytes were already credited to the window
+        // mid-upload (see `handle_data`); flush any sub-threshold remainder
+        // now so the final credit reaches the peer. Streaming bodies credit
+        // on consume, not here.
+        if matches!(parts.body, HttpRequestBody::Buffered(_)) {
+            self.maybe_flush_request_window_credit(stream_id, true)?;
         }
         let (effect, handle) = call_cancelable(
             self.service,

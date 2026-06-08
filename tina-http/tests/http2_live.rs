@@ -529,6 +529,122 @@ fn http2_bad_data_padding_sends_protocol_goaway() {
 }
 
 #[test]
+fn http2_buffered_upload_larger_than_initial_window_completes() {
+    // A buffered (non-gRPC) upload in (64 KiB, max_body_bytes] must not
+    // deadlock: the peer fills the ~64 KiB initial windows, then needs a
+    // mid-upload WINDOW_UPDATE to send the rest. Without one the peer parks
+    // forever and END_STREAM never arrives, so the request never dispatches.
+    // Drive a 256 KiB upload respecting flow control; the small response
+    // proves the full body arrived and the stream dispatched.
+    let harness = Http2Harness::start(Http2ServerConfig::default());
+    let mut stream = connect_h2(harness.addr);
+    let total = 256 * 1024;
+    let body = vec![b'x'; total];
+
+    write_frame(
+        &mut stream,
+        FRAME_HEADERS,
+        FLAG_END_HEADERS,
+        1,
+        &request_headers("POST", "/counter"),
+    );
+
+    // Connection and stream windows both start at the 65535 default; a DATA
+    // frame debits both, so the usable budget is min(conn, stream). Track
+    // each and only send what credit allows, reading WINDOW_UPDATEs as the
+    // server consumes the buffered body mid-upload.
+    let mut conn_window: i64 = 65_535;
+    let mut stream_window: i64 = 65_535;
+    let mut sent = 0usize;
+    let max_chunk = 16 * 1024; // <= peer max_frame_size
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while sent < total {
+        let budget = conn_window.min(stream_window).max(0) as usize;
+        let want = (total - sent).min(max_chunk);
+        if budget >= want.max(1) && want > 0 {
+            let end_stream = sent + want >= total;
+            write_frame(
+                &mut stream,
+                FRAME_DATA,
+                if end_stream { FLAG_END_STREAM } else { 0 },
+                1,
+                &body[sent..sent + want],
+            );
+            sent += want;
+            conn_window -= want as i64;
+            stream_window -= want as i64;
+            continue;
+        }
+        // Out of credit: the server must replenish it mid-upload. A socket
+        // read timeout here means no WINDOW_UPDATE arrived — the deadlock.
+        assert!(
+            std::time::Instant::now() < deadline,
+            "buffered upload stalled waiting for mid-upload WINDOW_UPDATE at {sent}/{total} bytes"
+        );
+        let frame = match read_frame_result(&mut stream) {
+            Ok(frame) => frame,
+            // A 2s socket read timeout is not yet the deadlock — retry until
+            // the 10s deadline. Only a sustained absence of WINDOW_UPDATE is.
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => continue,
+            Err(error) => panic!("read frame failed: {error}"),
+        };
+        match frame.ty {
+            FRAME_WINDOW_UPDATE => {
+                let inc = window_update_increment(&frame) as i64;
+                if frame.stream_id == 0 {
+                    conn_window += inc;
+                } else if frame.stream_id == 1 {
+                    stream_window += inc;
+                }
+            }
+            FRAME_RST_STREAM => panic!("stream reset mid-upload: {frame:?}"),
+            FRAME_GOAWAY => panic!("connection GOAWAY mid-upload: {frame:?}"),
+            _ => {}
+        }
+    }
+
+    // The request dispatched only if END_STREAM arrived, which is only
+    // possible if the server replenished the receive window mid-upload.
+    // Read the (small) response to END_STREAM on stream 1.
+    let mut received = 0usize;
+    let resp_deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        assert!(
+            std::time::Instant::now() < resp_deadline,
+            "response stalled at {received} bytes (upload never dispatched)"
+        );
+        let frame = match read_frame_result(&mut stream) {
+            Ok(frame) => frame,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => continue,
+            Err(error) => panic!("read frame failed: {error}"),
+        };
+        if frame.stream_id != 1 {
+            continue;
+        }
+        match frame.ty {
+            FRAME_HEADERS => {
+                if frame.flags & FLAG_END_STREAM != 0 {
+                    break;
+                }
+            }
+            FRAME_DATA => {
+                received += frame.payload.len();
+                if frame.flags & FLAG_END_STREAM != 0 {
+                    break;
+                }
+            }
+            FRAME_RST_STREAM => panic!("response stream reset: {frame:?}"),
+            _ => {}
+        }
+    }
+    assert!(
+        received > 0,
+        "server response proves the full 256 KiB upload arrived and dispatched"
+    );
+    harness.shutdown();
+}
+
+#[test]
 fn http2_priority_headers_with_valid_hpack_succeeds() {
     let harness = Http2Harness::start(Http2ServerConfig::default());
     let mut stream = connect_h2(harness.addr);
