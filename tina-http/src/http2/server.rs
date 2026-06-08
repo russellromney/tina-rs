@@ -5,6 +5,7 @@
 //! Frame, HPACK, and protocol-error helpers live in sibling modules
 //! (`frame`, `headers`, `errors`) and are shared with the native client.
 
+use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::convert::Infallible;
 use std::marker::PhantomData;
@@ -421,6 +422,10 @@ pub struct Http2Connection<S: Shard, M: Http2ServiceMessage = HttpRequest> {
     hpack_decoder: hpack::Decoder<'static>,
     preface_seen: bool,
     streams: Vec<ActiveStream>,
+    /// stream-id → slot index in `streams`, kept in step with every push and
+    /// `swap_remove`. Turns the per-frame `find_stream` lookup (called several
+    /// times per frame) from O(open streams) into O(1).
+    stream_index: HashMap<u32, usize>,
     highest_client_stream_id: u32,
     recv_window: i32,
     pending_recv_window_credit: u32,
@@ -456,6 +461,7 @@ impl<S: Shard + 'static, M: Http2ServiceMessage> Http2Connection<S, M> {
             hpack_decoder: hpack::Decoder::new(),
             preface_seen: false,
             streams: Vec::with_capacity(limits.max_concurrent_streams),
+            stream_index: HashMap::with_capacity(limits.max_concurrent_streams),
             highest_client_stream_id: 0,
             recv_window: limits.initial_connection_window,
             pending_recv_window_credit: 0,
@@ -934,13 +940,13 @@ impl<S: Shard + 'static, M: Http2ServiceMessage> Http2Connection<S, M> {
         if end_stream {
             stream.request_eof = true;
             stream.state = Http2StreamState::HalfClosedRemote;
-            self.streams.push(stream);
+            self.push_stream(stream);
             self.dispatch_stream(stream_id, effects)?;
         } else if grpc {
-            self.streams.push(stream);
+            self.push_stream(stream);
             self.dispatch_streaming_request(stream_id, effects)?;
         } else {
-            self.streams.push(stream);
+            self.push_stream(stream);
         }
         Ok(())
     }
@@ -2190,12 +2196,25 @@ impl<S: Shard + 'static, M: Http2ServiceMessage> Http2Connection<S, M> {
     }
 
     fn find_stream(&self, stream_id: u32) -> Option<usize> {
-        self.streams.iter().position(|s| s.id == stream_id)
+        self.stream_index.get(&stream_id).copied()
+    }
+
+    /// Append a stream and record its slot in the index.
+    fn push_stream(&mut self, stream: ActiveStream) {
+        self.stream_index.insert(stream.id, self.streams.len());
+        self.streams.push(stream);
     }
 
     fn remove_stream(&mut self, stream_id: u32) -> Option<ActiveStream> {
         let idx = self.find_stream(stream_id)?;
-        Some(self.streams.swap_remove(idx))
+        self.stream_index.remove(&stream_id);
+        let removed = self.streams.swap_remove(idx);
+        // `swap_remove` moved the last element into `idx` (unless it *was* the
+        // last); re-point its index entry so the map stays consistent.
+        if let Some(moved) = self.streams.get(idx) {
+            self.stream_index.insert(moved.id, idx);
+        }
+        Some(removed)
     }
 }
 
@@ -2424,7 +2443,7 @@ mod tests {
     #[test]
     fn zero_stream_window_update_resets_only_that_stream() {
         let mut conn = unit_connection();
-        conn.streams.push(ActiveStream::new(
+        conn.push_stream(ActiveStream::new(
             1,
             HeaderBlock::default(),
             DEFAULT_WINDOW,
@@ -2462,6 +2481,48 @@ mod tests {
     }
 
     #[test]
+    fn stream_index_stays_consistent_across_swap_remove() {
+        // `find_stream` is O(1) via the id→slot index; it must agree with the
+        // Vec after a `swap_remove` moves the tail element into the hole.
+        let mut conn = unit_connection();
+        for id in [1u32, 3, 5, 7] {
+            conn.push_stream(ActiveStream::new(
+                id,
+                HeaderBlock::default(),
+                DEFAULT_WINDOW,
+                DEFAULT_WINDOW,
+                false,
+            ));
+        }
+        // Every id resolves to the slot the Vec actually holds.
+        for id in [1u32, 3, 5, 7] {
+            let idx = conn.find_stream(id).expect("stream present");
+            assert_eq!(conn.streams[idx].id, id);
+        }
+
+        // Remove a middle stream: `swap_remove` moves id 7 into its slot.
+        let removed = conn.remove_stream(3).expect("removed stream 3");
+        assert_eq!(removed.id, 3);
+        assert!(conn.find_stream(3).is_none(), "removed id is gone");
+        for id in [1u32, 5, 7] {
+            let idx = conn.find_stream(id).expect("survivor present");
+            assert_eq!(
+                conn.streams[idx].id, id,
+                "index must still point at the right slot after swap_remove"
+            );
+        }
+        assert_eq!(conn.streams.len(), 3);
+        assert_eq!(conn.stream_index.len(), 3);
+
+        // Remove the tail (no swap needed) and the head (swap moves tail in).
+        conn.remove_stream(7).expect("removed tail");
+        conn.remove_stream(1).expect("removed head");
+        assert_eq!(conn.find_stream(5).map(|i| conn.streams[i].id), Some(5));
+        assert_eq!(conn.streams.len(), 1);
+        assert_eq!(conn.stream_index.len(), 1);
+    }
+
+    #[test]
     fn pseudo_header_after_regular_header_is_rejected() {
         let mut block = Vec::new();
         encode_literal_header("x-test", "ok", &mut block);
@@ -2483,7 +2544,7 @@ mod tests {
     fn response_body_cap_resets_stream_and_reports_stream_full() {
         let mut conn = unit_connection();
         conn.limits.max_response_body_bytes = 2;
-        conn.streams.push(ActiveStream::new(
+        conn.push_stream(ActiveStream::new(
             1,
             HeaderBlock::default(),
             DEFAULT_WINDOW,
@@ -2529,7 +2590,7 @@ mod tests {
     #[test]
     fn rst_stream_emits_inbound_reset_and_close_protocol_facts() {
         let mut conn = unit_connection();
-        conn.streams.push(ActiveStream::new(
+        conn.push_stream(ActiveStream::new(
             5,
             HeaderBlock::default(),
             DEFAULT_WINDOW,
@@ -2816,7 +2877,7 @@ mod tests {
     fn streaming_response_body_cap_emits_high_water_and_reset_facts() {
         let mut conn = unit_connection();
         conn.limits.max_response_body_bytes = 2;
-        conn.streams.push(ActiveStream::new(
+        conn.push_stream(ActiveStream::new(
             1,
             HeaderBlock::default(),
             DEFAULT_WINDOW,
@@ -2887,7 +2948,7 @@ mod tests {
     fn stream_receive_window_full_resets_only_that_stream() {
         let mut conn = unit_connection();
         conn.recv_window = 100;
-        conn.streams.push(ActiveStream::new(
+        conn.push_stream(ActiveStream::new(
             1,
             HeaderBlock::default(),
             1,
@@ -2929,7 +2990,7 @@ mod tests {
         // so replay can pin a precise error code rather than silently
         // collapsing into a generic catch-all.
         let mut conn = unit_connection();
-        conn.streams.push(ActiveStream::new(
+        conn.push_stream(ActiveStream::new(
             3,
             HeaderBlock::default(),
             DEFAULT_WINDOW,
@@ -3004,7 +3065,7 @@ mod tests {
         // isolate will mirror for the received-status side.
         let mut conn = unit_connection();
         conn.self_isolate_id = Some(IsolateId::new(77));
-        conn.streams.push(ActiveStream::new(
+        conn.push_stream(ActiveStream::new(
             5,
             HeaderBlock::default(),
             DEFAULT_WINDOW,
