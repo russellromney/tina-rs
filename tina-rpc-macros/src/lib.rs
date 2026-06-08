@@ -209,10 +209,19 @@ struct MethodArg {
     ty: Type,
 }
 
-/// Parameter names the generated `<method>_request` constructor appends after
-/// the user's method args. A trait method arg sharing one of these names would
-/// collide; [`extract_method`] rejects it with a spanned diagnostic.
-const RESERVED_REQUEST_PARAMS: [&str; 4] = ["deadline", "correlator", "reply_to", "max_payload"];
+/// Names the generated client builder binds and would clobber a same-named
+/// trait arg. `deadline`/`correlator`/`reply_to`/`max_payload` are appended
+/// params (collide as E0415); `encoding`/`payload` are builder-body locals that
+/// *silently shadow* the user's arg, encoding the wrong value onto the wire.
+/// [`extract_method`] rejects all of them with a spanned diagnostic.
+const RESERVED_REQUEST_PARAMS: [&str; 6] = [
+    "deadline",
+    "correlator",
+    "reply_to",
+    "max_payload",
+    "encoding",
+    "payload",
+];
 
 fn extract_method(method: &TraitItemFn) -> Result<MethodSig> {
     if method.sig.asyncness.is_some() {
@@ -519,6 +528,12 @@ fn build_client_method(
     let decode_fn = &m.decode_reply_fn;
     let return_ty = &m.return_ty;
 
+    // Non-collidable local names: a trait arg called `encoding`/`payload` would
+    // otherwise shadow these builder locals and encode the wrong value. Reserved
+    // names reject such args, but keep the `__tina_` prefix as defense-in-depth.
+    let enc_local = format_ident!("__tina_encoding");
+    let payload_local = format_ident!("__tina_payload");
+
     let arg_decls: Vec<TokenStream2> = m
         .args
         .iter()
@@ -590,16 +605,16 @@ fn build_client_method(
         where
             #encoding_ty: #rpc_crate::Encoding + ::core::default::Default,
         {
-            let encoding = <#encoding_ty as ::core::default::Default>::default();
-            let payload = <#encoding_ty as #rpc_crate::Encoding>::encode(
-                &encoding,
+            let #enc_local = <#encoding_ty as ::core::default::Default>::default();
+            let #payload_local = <#encoding_ty as #rpc_crate::Encoding>::encode(
+                &#enc_local,
                 &#tuple_expr,
                 max_payload,
             )?;
             ::core::result::Result::Ok(#rpc_crate::ClientRequest {
                 service: ::std::string::String::from(Self::SERVICE_NAME),
                 method: ::std::string::String::from(#method_name_lit),
-                payload,
+                payload: #payload_local,
                 deadline,
                 correlator,
                 reply_to,

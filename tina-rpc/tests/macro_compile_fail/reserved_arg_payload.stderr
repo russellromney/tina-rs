@@ -1,0 +1,5 @@
+error: argument name `payload` is reserved by the generated `charge_request` constructor; rename this parameter
+ --> tests/macro_compile_fail/reserved_arg_payload.rs:8:26
+  |
+8 |     fn charge(&mut self, payload: u64) -> u64;
+  |                          ^^^^^^^
