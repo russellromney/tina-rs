@@ -342,10 +342,24 @@ pub(crate) struct DeliveredMessage {
     pub(crate) call_context: Option<MessageCallContext>,
 }
 
+/// Id source for one shard.
+///
+/// Event ids are **per-shard-local**: each shard counts its own events from
+/// 1. The shard owner is single-threaded, so its event sequence is
+/// deterministic regardless of how shard worker threads interleave. The
+/// `(shard, event_id)` pair is the stable per-event key the trace hash and
+/// the snapshot sort rely on. A single global atomic event counter shared
+/// across shards would hand the id of a given logical event to whichever
+/// thread won a `fetch_add` race, which made the multishard trace hash flap.
+///
+/// Call ids stay global: cross-shard call routing needs an id unique across
+/// every shard, so `next_call_id` is the shared counter.
 #[derive(Debug, Clone)]
 pub(crate) struct IdSource {
-    pub(crate) next_event_id: Arc<AtomicU64>,
-    pub(crate) next_call_id: Arc<AtomicU64>,
+    /// Per-shard event counter. Not shared across shards.
+    next_event_id: Arc<AtomicU64>,
+    /// Global call counter, shared across every shard.
+    next_call_id: Arc<AtomicU64>,
 }
 
 impl IdSource {
@@ -353,6 +367,17 @@ impl IdSource {
         Self {
             next_event_id: Arc::new(AtomicU64::new(1)),
             next_call_id: Arc::new(AtomicU64::new(1)),
+        }
+    }
+
+    /// Derives the id source for a sibling shard: a fresh per-shard event
+    /// counter, the same shared global call counter. Use this instead of
+    /// `clone()` when fanning one source out to multiple shards so each
+    /// shard's event ids stay independent and deterministic.
+    pub(crate) fn per_shard(&self) -> Self {
+        Self {
+            next_event_id: Arc::new(AtomicU64::new(1)),
+            next_call_id: Arc::clone(&self.next_call_id),
         }
     }
 

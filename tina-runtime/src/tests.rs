@@ -1724,6 +1724,11 @@ fn single_timer_wakes_after_deadline() {
 
 #[test]
 fn sibling_runtimes_can_share_global_event_and_call_id_sources() {
+    // Sequential explicit-step coordinators (MultiShardRuntime, the
+    // simulator) share one global counter via `clone()`: stepping is
+    // single-threaded in fixed order, so the global ids are deterministic
+    // and carry the cross-shard emission order. (The threaded runtime uses
+    // `per_shard()` instead because its workers race.)
     let ids = IdSource::new();
     let first_clock = Rc::new(ManualClock::new());
     let second_clock = Rc::new(ManualClock::new());
