@@ -1144,6 +1144,58 @@ mod replay_case_tests {
         );
     }
 
+    #[test]
+    #[should_panic(expected = "runner returned report.name")]
+    fn sweep_seeds_rejects_report_for_the_wrong_case() {
+        // sweep_seeds must run the same report-identity guard that
+        // discover_constants runs via observe_replay_case: a runner that
+        // returns a report for a different case must trip the panic, not get
+        // its constants pasted onto the failing case.
+        fn lying_runner(case: &ReplayCase<u32>) -> ReplayReport<u32> {
+            let events: Vec<RuntimeEvent> = (1..=3).map(fake_event).collect();
+            ReplayReport {
+                name: "some other case",
+                seed: case.seed,
+                config: case.config.clone(),
+                scenario: case.scenario,
+                event_count: events.len(),
+                trace_hash: stable_trace_hash(events.iter()),
+                output: 0,
+            }
+        }
+        let _ = sweep_seeds(
+            "fixture sweep",
+            0..1,
+            make_seeded_case,
+            lying_runner,
+            |_report| Ok(()),
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "runner returned report.seed")]
+    fn sweep_seeds_rejects_report_for_the_wrong_seed() {
+        fn wrong_seed_runner(case: &ReplayCase<u32>) -> ReplayReport<u32> {
+            let events: Vec<RuntimeEvent> = (1..=3).map(fake_event).collect();
+            ReplayReport {
+                name: case.name,
+                seed: case.seed.wrapping_add(1),
+                config: case.config.clone(),
+                scenario: case.scenario,
+                event_count: events.len(),
+                trace_hash: stable_trace_hash(events.iter()),
+                output: 0,
+            }
+        }
+        let _ = sweep_seeds(
+            "fixture sweep",
+            0..1,
+            make_seeded_case,
+            wrong_seed_runner,
+            |_report| Ok(()),
+        );
+    }
+
     fn run_full_history_case(case: &ReplayCase<u32>) -> ReplayReport<u32> {
         // Each operation contributes one fake event; sum is the projection.
         let events: Vec<RuntimeEvent> = (1..=case.history.len() as u64).map(fake_event).collect();
