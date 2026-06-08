@@ -14,8 +14,9 @@ use tina_http::{
     GrpcClientStreamingRequest, GrpcLimits, GrpcRawStreamingRequest, GrpcRawStreamingResponse,
     GrpcRequest, GrpcRequestStream, GrpcResponse, GrpcRouter, GrpcServerStreamingResponse,
     GrpcStatus, GrpcStatusCode, GrpcStreamReply, GrpcStreamingCall, GrpcStreamingResponse,
-    Http2Limits, Http2Listener, Http2ListenerMsg, Http2ServerConfig, HttpRequest, HttpResponse,
-    grpc_stream_finish, grpc_stream_message, grpc_unary_call_h2c_blocking,
+    Http2Limits, Http2Listener, Http2ListenerMsg, Http2ServerConfig, Http2ServiceMessage,
+    HttpRequest, HttpResponse, grpc_stream_finish, grpc_stream_message,
+    grpc_unary_call_h2c_blocking,
 };
 use tina_runtime::{
     DefaultThreadedMailboxFactory, RuntimeEvent, RuntimeEventKind, ThreadedRuntime,
@@ -176,7 +177,7 @@ impl GrpcHarness {
         config: Http2ServerConfig,
     ) -> Self
     where
-        M: From<HttpRequest> + Send + 'static,
+        M: Http2ServiceMessage,
     {
         let listener = runtime
             .register_with_capacity::<Http2Listener<TestShard, M>, _>(

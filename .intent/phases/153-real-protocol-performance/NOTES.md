@@ -193,6 +193,14 @@ wire buffer, borrows header name/value strings during decode, falls back to the
 full HPACK decoder for indexed/dynamic/Huffman blocks, and stores `:scheme` /
 `:authority` as validation facts instead of owned request strings.
 
+Built-in gRPC now also opts into compact HTTP/2 request parts through
+`Http2ServiceMessage`: the connection parses gRPC/content-encoding facts without
+populating a public `HeaderMap`, then still calls the `GrpcRouter` isolate with
+ordinary Tina call/reply semantics. This is the right API direction, but the
+fresh-connection gRPC row did not move materially beyond the HPACK/header decode
+win; the remaining gRPC cost is connection setup, protobuf frame/body work, and
+the real service isolate boundary.
+
 The remaining server per-request allocations are now mostly:
 
 - public `HttpRequest` materialization: `:path` plus the `HeaderMap` values
@@ -201,9 +209,11 @@ The remaining server per-request allocations are now mostly:
   and returning the response;
 - the raw-socket test client's own per-frame allocations (harness, not Tina).
 
-Reducing that further means a user-facing borrowed/compact request view or a
-specialized built-in gRPC/HTTP2 service path that can prove it does not hide a
-policy boundary. That is a bigger API decision, not another HPACK leaf fix.
+Reducing that further means either a user-facing borrowed/compact request view
+for normal services, or an explicit inline protocol-service mode that honestly
+says "the handler runs in the protocol isolate" instead of pretending the
+service boundary still exists. That is a bigger API decision, not another HPACK
+leaf fix.
 
 ## Linux / x86_64
 

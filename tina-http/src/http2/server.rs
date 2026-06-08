@@ -47,8 +47,8 @@ use super::headers::{
     DEFAULT_HEADER_TABLE_SIZE, HeaderBlock, MAX_MAX_FRAME_SIZE, MIN_MAX_FRAME_SIZE,
     SETTINGS_ENABLE_PUSH, SETTINGS_HEADER_TABLE_SIZE, SETTINGS_INITIAL_WINDOW_SIZE,
     SETTINGS_MAX_CONCURRENT_STREAMS, SETTINGS_MAX_FRAME_SIZE, SETTINGS_MAX_HEADER_LIST_SIZE,
-    decode_headers_block_with, encode_response_headers, encode_response_headers_with_len,
-    encode_response_trailers, validate_request_headers,
+    decode_headers_block_compact_with, decode_headers_block_with, encode_response_headers,
+    encode_response_headers_with_len, encode_response_trailers, validate_request_headers,
 };
 
 #[cfg(test)]
@@ -128,6 +128,60 @@ impl Http2ServerConfig {
 impl Default for Http2ServerConfig {
     fn default() -> Self {
         Self::dev()
+    }
+}
+
+/// Owned HTTP/2 request parts at the service boundary.
+///
+/// Most services receive a normal [`HttpRequest`]. Built-in protocol services
+/// can opt into these parts to avoid materializing public request fields they do
+/// not use, while still crossing the ordinary Tina service-call boundary.
+#[derive(Debug)]
+pub struct Http2RequestParts {
+    pub method: http::Method,
+    pub path: String,
+    pub headers: http::HeaderMap,
+    pub body: HttpRequestBody,
+    pub grpc_content_type: bool,
+    pub grpc_encoding_unsupported: bool,
+}
+
+impl Http2RequestParts {
+    pub fn into_http_request(self) -> HttpRequest {
+        HttpRequest {
+            method: self.method,
+            path: self.path,
+            version: Version::HTTP_2,
+            headers: self.headers,
+            body: self.body,
+        }
+    }
+}
+
+/// Converts HTTP/2 request parts into the service isolate's message type.
+///
+/// The blanket `From<HttpRequest>` impl keeps existing services on the public
+/// request shape. Special built-in services may return `true` from
+/// [`Http2ServiceMessage::compact_http2_headers`] and use
+/// [`Http2ServiceMessage::from_http2_parts`] to skip public header storage.
+pub trait Http2ServiceMessage: Sized + Send + 'static {
+    fn compact_http2_headers() -> bool {
+        false
+    }
+
+    fn from_http_request(request: HttpRequest) -> Self;
+
+    fn from_http2_parts(parts: Http2RequestParts) -> Self {
+        Self::from_http_request(parts.into_http_request())
+    }
+}
+
+impl<T> Http2ServiceMessage for T
+where
+    T: From<HttpRequest> + Send + 'static,
+{
+    fn from_http_request(request: HttpRequest) -> Self {
+        Self::from(request)
     }
 }
 
@@ -330,7 +384,7 @@ pub enum Http2ConnectionReply {
 }
 
 /// One HTTP/2 connection isolate over one TCP stream.
-pub struct Http2Connection<S: Shard, M: From<HttpRequest> + Send + 'static = HttpRequest> {
+pub struct Http2Connection<S: Shard, M: Http2ServiceMessage = HttpRequest> {
     stream: StreamId,
     service: Address<M, HttpResponse>,
     limits: Http2Limits,
@@ -358,7 +412,7 @@ pub struct Http2Connection<S: Shard, M: From<HttpRequest> + Send + 'static = Htt
     _shard: PhantomData<S>,
 }
 
-impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Http2Connection<S, M> {
+impl<S: Shard + 'static, M: Http2ServiceMessage> Http2Connection<S, M> {
     pub fn new(
         stream: StreamId,
         service: Address<M, HttpResponse>,
@@ -410,7 +464,7 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Http2Connection<
     }
 }
 
-impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Isolate for Http2Connection<S, M> {
+impl<S: Shard + 'static, M: Http2ServiceMessage> Isolate for Http2Connection<S, M> {
     tina::isolate_types! {
         message: Http2ConnectionMsg,
         reply: Http2ConnectionReply,
@@ -469,7 +523,7 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Isolate for Http
     }
 }
 
-impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Http2Connection<S, M> {
+impl<S: Shard + 'static, M: Http2ServiceMessage> Http2Connection<S, M> {
     fn read_more(&mut self) -> Effect<Self> {
         let buffer = std::mem::take(&mut self.read_scratch);
         tcp_read_buf(self.stream, buffer, READ_CHUNK)
@@ -808,17 +862,21 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Http2Connection<
         // Decode the HPACK block straight from the read buffer slice — no
         // per-frame payload `Vec`.
         let header_payload = headers_payload_view(flags, payload)?;
-        let headers = decode_headers_block_with(
-            &mut self.hpack_decoder,
-            header_payload,
-            self.limits.max_header_bytes,
-        )?;
+        let headers = if M::compact_http2_headers() {
+            decode_headers_block_compact_with(
+                &mut self.hpack_decoder,
+                header_payload,
+                self.limits.max_header_bytes,
+            )?
+        } else {
+            decode_headers_block_with(
+                &mut self.hpack_decoder,
+                header_payload,
+                self.limits.max_header_bytes,
+            )?
+        };
         validate_request_headers(&headers)?;
-        let grpc = headers
-            .headers
-            .get(http::header::CONTENT_TYPE)
-            .and_then(|value| value.to_str().ok())
-            .is_some_and(crate::grpc::is_grpc_content_type);
+        let grpc = headers.grpc_content_type;
         let end_stream = flags & FLAG_END_STREAM != 0;
         let declared_len = headers.content_length;
         // END_STREAM on HEADERS means zero DATA bytes will follow.
@@ -1173,18 +1231,19 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Http2Connection<
             .headers
             .take()
             .ok_or(Http2ProtocolError::InvalidPseudoHeaders)?;
-        let request = HttpRequest {
+        let parts = Http2RequestParts {
             method: headers
                 .method
                 .ok_or(Http2ProtocolError::InvalidPseudoHeaders)?,
             path: headers
                 .path
                 .ok_or(Http2ProtocolError::InvalidPseudoHeaders)?,
-            version: Version::HTTP_2,
             headers: headers.headers,
             body: HttpRequestBody::Buffered(std::mem::take(&mut self.streams[idx].body)),
+            grpc_content_type: headers.grpc_content_type,
+            grpc_encoding_unsupported: headers.grpc_encoding_unsupported,
         };
-        let consumed = match &request.body {
+        let consumed = match &parts.body {
             HttpRequestBody::Buffered(_) => self.streams[idx].request_flow_bytes_received,
             HttpRequestBody::Stream(_) | HttpRequestBody::Http2Stream(_) => 0,
         };
@@ -1198,9 +1257,12 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Http2Connection<
             self.enqueue_frame(window_update_frame(0, consumed as u32))?;
             self.enqueue_frame(window_update_frame(stream_id, consumed as u32))?;
         }
-        let (effect, handle) =
-            call_cancelable(self.service, M::from(request), self.service_call_timeout)
-                .then(move |outcome| Http2ConnectionMsg::ServiceReturned { stream_id, outcome });
+        let (effect, handle) = call_cancelable(
+            self.service,
+            M::from_http2_parts(parts),
+            self.service_call_timeout,
+        )
+        .then(move |outcome| Http2ConnectionMsg::ServiceReturned { stream_id, outcome });
         if let Some(idx) = self.find_stream(stream_id) {
             self.streams[idx].pending_call = Some(handle);
         }
@@ -1230,24 +1292,28 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Http2Connection<
             self.self_isolate_id.expect("isolate id captured"),
             tina::AddressGeneration::new(0),
         );
-        let request = HttpRequest {
+        let parts = Http2RequestParts {
             method: headers
                 .method
                 .ok_or(Http2ProtocolError::InvalidPseudoHeaders)?,
             path: headers
                 .path
                 .ok_or(Http2ProtocolError::InvalidPseudoHeaders)?,
-            version: Version::HTTP_2,
             headers: headers.headers,
             body: HttpRequestBody::Http2Stream(Http2RequestStream {
                 stream_id,
                 content_length,
                 source,
             }),
+            grpc_content_type: headers.grpc_content_type,
+            grpc_encoding_unsupported: headers.grpc_encoding_unsupported,
         };
-        let (effect, handle) =
-            call_cancelable(self.service, M::from(request), self.service_call_timeout)
-                .then(move |outcome| Http2ConnectionMsg::ServiceReturned { stream_id, outcome });
+        let (effect, handle) = call_cancelable(
+            self.service,
+            M::from_http2_parts(parts),
+            self.service_call_timeout,
+        )
+        .then(move |outcome| Http2ConnectionMsg::ServiceReturned { stream_id, outcome });
         if let Some(idx) = self.find_stream(stream_id) {
             self.streams[idx].pending_call = Some(handle);
         }
@@ -2098,7 +2164,7 @@ pub enum Http2ListenerMsg {
 }
 
 /// Prior-knowledge h2c listener.
-pub struct Http2Listener<S: Shard + 'static, M: From<HttpRequest> + Send + 'static = HttpRequest> {
+pub struct Http2Listener<S: Shard + 'static, M: Http2ServiceMessage = HttpRequest> {
     bind_addr: SocketAddr,
     service: Address<M, HttpResponse>,
     config: Http2ServerConfig,
@@ -2108,7 +2174,7 @@ pub struct Http2Listener<S: Shard + 'static, M: From<HttpRequest> + Send + 'stat
     _shard: PhantomData<S>,
 }
 
-impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Http2Listener<S, M> {
+impl<S: Shard + 'static, M: Http2ServiceMessage> Http2Listener<S, M> {
     pub fn new(
         bind_addr: SocketAddr,
         service: Address<M, HttpResponse>,
@@ -2126,7 +2192,7 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Http2Listener<S,
     }
 }
 
-impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Isolate for Http2Listener<S, M> {
+impl<S: Shard + 'static, M: Http2ServiceMessage> Isolate for Http2Listener<S, M> {
     tina::isolate_types! {
         message: Http2ListenerMsg,
         reply: (),

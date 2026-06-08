@@ -7,8 +7,8 @@ use std::time::Duration;
 use common::{Counter, TestShard};
 use tina::prelude::*;
 use tina_http::{
-    Http2Limits, Http2Listener, Http2ListenerMsg, Http2ServerConfig, HttpRequest, HttpResponse,
-    IterBodySource,
+    Http2Limits, Http2Listener, Http2ListenerMsg, Http2ServerConfig, Http2ServiceMessage,
+    HttpRequest, HttpResponse, IterBodySource,
 };
 use tina_runtime::{DefaultThreadedMailboxFactory, ThreadedRuntime, ThreadedRuntimeConfig};
 
@@ -75,7 +75,7 @@ impl Http2Harness {
         config: Http2ServerConfig,
     ) -> Self
     where
-        M: From<HttpRequest> + Send + 'static,
+        M: Http2ServiceMessage,
     {
         let listener = runtime
             .register_with_capacity::<Http2Listener<TestShard, M>, _>(

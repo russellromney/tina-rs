@@ -519,6 +519,10 @@ performance claim.
   Huffman HPACK still falls back to the full decoder. Request-only pseudo
   headers that are not public `HttpRequest` fields (`:scheme`, `:authority`) are
   kept as validation facts instead of owned strings.
+- **Compact built-in gRPC service messages.** `GrpcRouterMsg` opts into
+  `Http2ServiceMessage` compact parts, so the HTTP/2 connection carries
+  gRPC/content-encoding facts without populating a public `HeaderMap`, while
+  still calling the `GrpcRouter` isolate through normal Tina call/reply.
 - `into_data_payload(frame)` moves the unpadded DATA payload out of an owned
   frame (used by the client DATA handler); the old cloning `data_payload` is
   gone. Padded DATA still validates padding and preserves the flow-control wire
@@ -554,9 +558,10 @@ public request/application boundaries:
   construction is cheaper now, but protobuf payload construction is unchanged.
 
 Reducing the first two further means a user-facing borrowed/compact request
-view or a specialized built-in gRPC/HTTP2 service path that can prove it is not
-hiding a policy boundary. Reducing the raw-socket harness allocations means a
-different benchmark client. None of that is hidden as "protocol frame" work.
+view for normal services, or an explicit inline protocol-service mode that
+honestly says the handler runs in the protocol isolate. Reducing the raw-socket
+harness allocations means a different benchmark client. None of that is hidden
+as "protocol frame" work.
 
 ### Platform
 

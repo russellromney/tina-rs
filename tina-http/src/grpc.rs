@@ -20,8 +20,8 @@ use tina::reply_to_request;
 use tina_runtime::{CallOutcome, call};
 
 use crate::{
-    Http2ConnectionReply, Http2RequestStream, HttpRequest, HttpRequestBody, HttpResponse,
-    RequestChunkReply,
+    Http2ConnectionReply, Http2RequestParts, Http2RequestStream, Http2ServiceMessage, HttpRequest,
+    HttpRequestBody, HttpResponse, RequestChunkReply,
 };
 use crate::{IterBodySource, ResponseChunkMsg, ResponseChunkReply};
 
@@ -216,14 +216,17 @@ impl<T> GrpcResponse<T> {
 
 trait ErasedUnary: Send + Sync {
     fn call(&self, request: HttpRequest, limits: GrpcLimits) -> HttpResponse;
+    fn call_http2(&self, request: GrpcHttp2Request, limits: GrpcLimits) -> HttpResponse;
 }
 
 trait ErasedServerStreaming: Send + Sync {
     fn call(&self, request: HttpRequest, limits: GrpcLimits) -> HttpResponse;
+    fn call_http2(&self, request: GrpcHttp2Request, limits: GrpcLimits) -> HttpResponse;
 }
 
 trait ErasedClientStreaming: Send + Sync {
     fn call(&self, request: HttpRequest, limits: GrpcLimits) -> HttpResponse;
+    fn call_http2(&self, request: GrpcHttp2Request, limits: GrpcLimits) -> HttpResponse;
 }
 
 trait ErasedStreaming: Send + Sync {
@@ -253,6 +256,46 @@ where
             ..
         } = request;
         match decode_unary_parts::<Req>(&headers, &body, limits) {
+            Ok(message) => match (self.f)(GrpcRequest { path, message }) {
+                Ok(response) => match encode_grpc_message(&response.message, limits) {
+                    Ok(body) => grpc_http_response(body, GrpcStatus::ok()),
+                    Err(GrpcError::EncodeTooLarge { len, max }) => grpc_http_response(
+                        Vec::new(),
+                        GrpcStatus::with_message(
+                            GrpcStatusCode::ResourceExhausted,
+                            format!("response message {len} exceeds cap {max}"),
+                        ),
+                    ),
+                    Err(_) => {
+                        grpc_http_response(Vec::new(), GrpcStatus::new(GrpcStatusCode::Internal))
+                    }
+                },
+                Err(status) => grpc_http_response(Vec::new(), status),
+            },
+            Err(error) => grpc_http_response(Vec::new(), status_for_error(error)),
+        }
+    }
+
+    fn call_http2(&self, request: GrpcHttp2Request, limits: GrpcLimits) -> HttpResponse {
+        let GrpcHttp2Request {
+            path,
+            body,
+            content_type_ok,
+            unsupported_encoding,
+            ..
+        } = request;
+        let GrpcHttp2Body::Buffered(body) = body else {
+            return grpc_http_response(
+                Vec::new(),
+                GrpcStatus::new(GrpcStatusCode::InvalidArgument),
+            );
+        };
+        match decode_unary_body_with_flags::<Req>(
+            &body,
+            content_type_ok,
+            unsupported_encoding,
+            limits,
+        ) {
             Ok(message) => match (self.f)(GrpcRequest { path, message }) {
                 Ok(response) => match encode_grpc_message(&response.message, limits) {
                     Ok(body) => grpc_http_response(body, GrpcStatus::ok()),
@@ -586,6 +629,34 @@ where
             Err(error) => grpc_http_response(Vec::new(), status_for_error(error)),
         }
     }
+
+    fn call_http2(&self, request: GrpcHttp2Request, limits: GrpcLimits) -> HttpResponse {
+        let GrpcHttp2Request {
+            path,
+            body,
+            content_type_ok,
+            unsupported_encoding,
+            ..
+        } = request;
+        let GrpcHttp2Body::Buffered(body) = body else {
+            return grpc_http_response(
+                Vec::new(),
+                GrpcStatus::new(GrpcStatusCode::InvalidArgument),
+            );
+        };
+        match decode_unary_body_with_flags::<Req>(
+            &body,
+            content_type_ok,
+            unsupported_encoding,
+            limits,
+        ) {
+            Ok(message) => match (self.f)(GrpcRequest { path, message }) {
+                Ok(response) => grpc_streaming_http_response(response.source, GrpcStatus::ok()),
+                Err(status) => grpc_http_response(Vec::new(), status),
+            },
+            Err(error) => grpc_http_response(Vec::new(), status_for_error(error)),
+        }
+    }
 }
 
 /// Typed client-streaming request passed to user handlers.
@@ -612,6 +683,46 @@ where
             ..
         } = request;
         match decode_streaming_parts::<Req>(&headers, &body, limits) {
+            Ok(messages) => match (self.f)(GrpcClientStreamingRequest { path, messages }) {
+                Ok(response) => match encode_grpc_message(&response.message, limits) {
+                    Ok(body) => grpc_http_response(body, GrpcStatus::ok()),
+                    Err(GrpcError::EncodeTooLarge { len, max }) => grpc_http_response(
+                        Vec::new(),
+                        GrpcStatus::with_message(
+                            GrpcStatusCode::ResourceExhausted,
+                            format!("response message {len} exceeds cap {max}"),
+                        ),
+                    ),
+                    Err(_) => {
+                        grpc_http_response(Vec::new(), GrpcStatus::new(GrpcStatusCode::Internal))
+                    }
+                },
+                Err(status) => grpc_http_response(Vec::new(), status),
+            },
+            Err(error) => grpc_http_response(Vec::new(), status_for_error(error)),
+        }
+    }
+
+    fn call_http2(&self, request: GrpcHttp2Request, limits: GrpcLimits) -> HttpResponse {
+        let GrpcHttp2Request {
+            path,
+            body,
+            content_type_ok,
+            unsupported_encoding,
+            ..
+        } = request;
+        let GrpcHttp2Body::Buffered(body) = body else {
+            return grpc_http_response(
+                Vec::new(),
+                GrpcStatus::new(GrpcStatusCode::InvalidArgument),
+            );
+        };
+        match decode_streaming_body_with_flags::<Req>(
+            &body,
+            content_type_ok,
+            unsupported_encoding,
+            limits,
+        ) {
             Ok(messages) => match (self.f)(GrpcClientStreamingRequest { path, messages }) {
                 Ok(response) => match encode_grpc_message(&response.message, limits) {
                     Ok(body) => grpc_http_response(body, GrpcStatus::ok()),
@@ -708,15 +819,82 @@ pub struct GrpcRouter<S: Shard> {
 #[derive(Debug)]
 pub enum GrpcRouterMsg {
     Request(HttpRequest),
+    Http2Request(GrpcHttp2Request),
     RequestBodyChunk {
         id: u64,
         outcome: CallOutcome<Http2ConnectionReply>,
     },
 }
 
-impl From<HttpRequest> for GrpcRouterMsg {
-    fn from(request: HttpRequest) -> Self {
+#[derive(Debug)]
+pub struct GrpcHttp2Request {
+    method: Method,
+    path: String,
+    body: GrpcHttp2Body,
+    content_type_ok: bool,
+    unsupported_encoding: bool,
+}
+
+#[derive(Debug)]
+enum GrpcHttp2Body {
+    Buffered(Vec<u8>),
+    Http2Stream(Http2RequestStream),
+    Unsupported,
+}
+
+impl GrpcHttp2Request {
+    fn from_parts(parts: Http2RequestParts) -> Self {
+        let body = match parts.body {
+            HttpRequestBody::Buffered(bytes) => GrpcHttp2Body::Buffered(bytes),
+            HttpRequestBody::Http2Stream(stream) => GrpcHttp2Body::Http2Stream(stream),
+            HttpRequestBody::Stream(_) => GrpcHttp2Body::Unsupported,
+        };
+        Self {
+            method: parts.method,
+            path: parts.path,
+            body,
+            content_type_ok: parts.grpc_content_type,
+            unsupported_encoding: parts.grpc_encoding_unsupported,
+        }
+    }
+
+    fn into_http_request(self) -> HttpRequest {
+        let mut headers = HeaderMap::new();
+        if self.content_type_ok {
+            headers.insert(
+                http::header::CONTENT_TYPE,
+                HeaderValue::from_static("application/grpc"),
+            );
+        }
+        if self.unsupported_encoding {
+            headers.insert("grpc-encoding", HeaderValue::from_static("unsupported"));
+        }
+        let body = match self.body {
+            GrpcHttp2Body::Buffered(bytes) => HttpRequestBody::Buffered(bytes),
+            GrpcHttp2Body::Http2Stream(stream) => HttpRequestBody::Http2Stream(stream),
+            GrpcHttp2Body::Unsupported => HttpRequestBody::Buffered(Vec::new()),
+        };
+        HttpRequest {
+            method: self.method,
+            path: self.path,
+            version: http::Version::HTTP_2,
+            headers,
+            body,
+        }
+    }
+}
+
+impl Http2ServiceMessage for GrpcRouterMsg {
+    fn compact_http2_headers() -> bool {
+        true
+    }
+
+    fn from_http_request(request: HttpRequest) -> Self {
         Self::Request(request)
+    }
+
+    fn from_http2_parts(parts: Http2RequestParts) -> Self {
+        Self::Http2Request(GrpcHttp2Request::from_parts(parts))
     }
 }
 
@@ -853,6 +1031,27 @@ impl<S: Shard + 'static> GrpcRouter<S> {
         handler.call(request, self.limits)
     }
 
+    fn response_for_http2(&self, request: GrpcHttp2Request) -> HttpResponse {
+        if request.method != Method::POST {
+            return grpc_http_response(Vec::new(), GrpcStatus::new(GrpcStatusCode::Unimplemented));
+        }
+        if self.streaming.contains_key(&request.path)
+            || self.streaming_raw.contains_key(&request.path)
+        {
+            return self.response_for(request.into_http_request());
+        }
+        if let Some(handler) = self.unary.get(&request.path) {
+            return handler.call_http2(request, self.limits);
+        }
+        if let Some(handler) = self.client_streaming.get(&request.path) {
+            return handler.call_http2(request, self.limits);
+        }
+        let Some(handler) = self.server_streaming.get(&request.path) else {
+            return grpc_http_response(Vec::new(), GrpcStatus::new(GrpcStatusCode::Unimplemented));
+        };
+        handler.call_http2(request, self.limits)
+    }
+
     fn start_or_reply_request(
         &mut self,
         request: HttpRequest,
@@ -889,6 +1088,23 @@ impl<S: Shard + 'static> GrpcRouter<S> {
                     REQUEST_BODY_PULL_TIMEOUT,
                 )
                 .then(move |outcome| GrpcRouterMsg::RequestBodyChunk { id, outcome })
+            }
+        }
+    }
+
+    fn start_or_reply_http2_request(
+        &mut self,
+        request: GrpcHttp2Request,
+        call_ctx: tina::CallContext<'_, Self>,
+    ) -> Effect<Self> {
+        match &request.body {
+            GrpcHttp2Body::Buffered(_) => call_ctx.reply(self.response_for_http2(request)),
+            GrpcHttp2Body::Unsupported => call_ctx.reply(grpc_http_response(
+                Vec::new(),
+                GrpcStatus::new(GrpcStatusCode::InvalidArgument),
+            )),
+            GrpcHttp2Body::Http2Stream(_) => {
+                self.start_or_reply_request(request.into_http_request(), call_ctx)
             }
         }
     }
@@ -971,6 +1187,7 @@ impl<S: Shard + 'static> Isolate for GrpcRouter<S> {
     ) -> Effect<Self> {
         match msg {
             GrpcRouterMsg::Request(request) => reply(self.response_for(request)),
+            GrpcRouterMsg::Http2Request(request) => reply(self.response_for_http2(request)),
             GrpcRouterMsg::RequestBodyChunk { id, outcome } => {
                 self.handle_request_chunk(id, outcome)
             }
@@ -984,6 +1201,9 @@ impl<S: Shard + 'static> Isolate for GrpcRouter<S> {
     ) -> Effect<Self> {
         match msg {
             GrpcRouterMsg::Request(request) => self.start_or_reply_request(request, call),
+            GrpcRouterMsg::Http2Request(request) => {
+                self.start_or_reply_http2_request(request, call)
+            }
             GrpcRouterMsg::RequestBodyChunk { .. } => {
                 call.reject(tina::CallRejectedReason::UnsupportedMessage)
             }
@@ -1016,6 +1236,19 @@ fn validate_grpc_request_headers(headers: &HeaderMap) -> Result<(), GrpcError> {
     Ok(())
 }
 
+fn validate_grpc_header_flags(
+    content_type_ok: bool,
+    unsupported_encoding: bool,
+) -> Result<(), GrpcError> {
+    if !content_type_ok {
+        return Err(GrpcError::BadContentType);
+    }
+    if unsupported_encoding {
+        return Err(GrpcError::CompressedUnsupported);
+    }
+    Ok(())
+}
+
 fn decode_unary_parts<T: Message + Default>(
     headers: &HeaderMap,
     body: &HttpRequestBody,
@@ -1023,6 +1256,23 @@ fn decode_unary_parts<T: Message + Default>(
 ) -> Result<T, GrpcError> {
     validate_grpc_request_headers(headers)?;
     let body = body.as_buffered().ok_or(GrpcError::BadFrame)?;
+    decode_unary_body(body, limits)
+}
+
+fn decode_unary_body_with_flags<T: Message + Default>(
+    body: &[u8],
+    content_type_ok: bool,
+    unsupported_encoding: bool,
+    limits: GrpcLimits,
+) -> Result<T, GrpcError> {
+    validate_grpc_header_flags(content_type_ok, unsupported_encoding)?;
+    decode_unary_body(body, limits)
+}
+
+fn decode_unary_body<T: Message + Default>(
+    body: &[u8],
+    limits: GrpcLimits,
+) -> Result<T, GrpcError> {
     let mut cursor = 0;
     let message = decode_one_grpc_message::<T>(body, &mut cursor, limits)?;
     if cursor != body.len() {
@@ -1045,6 +1295,23 @@ fn decode_streaming_parts<T: Message + Default>(
 ) -> Result<Vec<T>, GrpcError> {
     validate_grpc_request_headers(headers)?;
     let body = body.as_buffered().ok_or(GrpcError::BadFrame)?;
+    decode_streaming_body(body, limits)
+}
+
+fn decode_streaming_body_with_flags<T: Message + Default>(
+    body: &[u8],
+    content_type_ok: bool,
+    unsupported_encoding: bool,
+    limits: GrpcLimits,
+) -> Result<Vec<T>, GrpcError> {
+    validate_grpc_header_flags(content_type_ok, unsupported_encoding)?;
+    decode_streaming_body(body, limits)
+}
+
+fn decode_streaming_body<T: Message + Default>(
+    body: &[u8],
+    limits: GrpcLimits,
+) -> Result<Vec<T>, GrpcError> {
     let mut cursor = 0;
     let mut messages = Vec::new();
     while cursor < body.len() {

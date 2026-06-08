@@ -29,6 +29,9 @@ pub(super) struct HeaderBlock {
     pub(super) headers: HeaderMap,
     pub(super) bytes: usize,
     pub(super) saw_regular: bool,
+    pub(super) host_non_empty: bool,
+    pub(super) grpc_content_type: bool,
+    pub(super) grpc_encoding_unsupported: bool,
     /// Declared request body length, parsed once during header validation.
     /// `None` when no `content-length` header was sent.
     pub(super) content_length: Option<usize>,
@@ -51,7 +54,26 @@ pub(super) fn decode_headers_block_with(
     block: &[u8],
     max_header_bytes: usize,
 ) -> Result<HeaderBlock, Http2ProtocolError> {
-    if let Some(headers) = decode_fast_literal_headers(block, max_header_bytes)? {
+    decode_headers_block_with_storage(decoder, block, max_header_bytes, true)
+}
+
+pub(super) fn decode_headers_block_compact_with(
+    decoder: &mut hpack::Decoder<'static>,
+    block: &[u8],
+    max_header_bytes: usize,
+) -> Result<HeaderBlock, Http2ProtocolError> {
+    decode_headers_block_with_storage(decoder, block, max_header_bytes, false)
+}
+
+fn decode_headers_block_with_storage(
+    decoder: &mut hpack::Decoder<'static>,
+    block: &[u8],
+    max_header_bytes: usize,
+    store_regular_headers: bool,
+) -> Result<HeaderBlock, Http2ProtocolError> {
+    if let Some(headers) =
+        decode_fast_literal_headers(block, max_header_bytes, store_regular_headers)?
+    {
         return Ok(headers);
     }
     let mut out = HeaderBlock::default();
@@ -62,7 +84,13 @@ pub(super) fn decode_headers_block_with(
         let name = std::str::from_utf8(&name).map_err(|_| Http2ProtocolError::HpackUnsupported)?;
         let value =
             std::str::from_utf8(&value).map_err(|_| Http2ProtocolError::HpackUnsupported)?;
-        add_header(&mut out, name, value, max_header_bytes)?;
+        add_header_with_storage(
+            &mut out,
+            name,
+            value,
+            max_header_bytes,
+            store_regular_headers,
+        )?;
     }
     Ok(out)
 }
@@ -77,6 +105,7 @@ pub(super) fn decode_headers_block_with(
 fn decode_fast_literal_headers(
     block: &[u8],
     max_header_bytes: usize,
+    store_regular_headers: bool,
 ) -> Result<Option<HeaderBlock>, Http2ProtocolError> {
     let mut out = HeaderBlock::default();
     let mut cursor = 0;
@@ -93,7 +122,13 @@ fn decode_fast_literal_headers(
             return Ok(None);
         };
         cursor += used;
-        add_header(&mut out, name, value, max_header_bytes)?;
+        add_header_with_storage(
+            &mut out,
+            name,
+            value,
+            max_header_bytes,
+            store_regular_headers,
+        )?;
     }
     Ok(Some(out))
 }
@@ -155,11 +190,22 @@ fn decode_hpack_integer_7(input: &[u8]) -> Result<(usize, usize), Http2ProtocolE
     }
 }
 
+#[cfg(test)]
 pub(super) fn add_header(
     out: &mut HeaderBlock,
     name: &str,
     value: &str,
     max_header_bytes: usize,
+) -> Result<(), Http2ProtocolError> {
+    add_header_with_storage(out, name, value, max_header_bytes, true)
+}
+
+fn add_header_with_storage(
+    out: &mut HeaderBlock,
+    name: &str,
+    value: &str,
+    max_header_bytes: usize,
+    store_regular_headers: bool,
 ) -> Result<(), Http2ProtocolError> {
     out.bytes = out
         .bytes
@@ -231,6 +277,15 @@ pub(super) fn add_header(
         .map_err(|_| Http2ProtocolError::InvalidPseudoHeaders)?;
     let header_value =
         HeaderValue::from_str(value).map_err(|_| Http2ProtocolError::InvalidPseudoHeaders)?;
+    if header_name == http::header::HOST {
+        out.host_non_empty = !value.is_empty();
+    }
+    if header_name == http::header::CONTENT_TYPE {
+        out.grpc_content_type = crate::grpc::is_grpc_content_type(value);
+    }
+    if name == "grpc-encoding" && !value.eq_ignore_ascii_case("identity") {
+        out.grpc_encoding_unsupported = true;
+    }
     if header_name == http::header::CONTENT_LENGTH {
         if out.saw_content_length {
             return Err(Http2ProtocolError::ContentLengthMismatch);
@@ -239,7 +294,9 @@ pub(super) fn add_header(
         out.content_length = Some(parsed);
         out.saw_content_length = true;
     }
-    out.headers.append(header_name, header_value);
+    if store_regular_headers {
+        out.headers.append(header_name, header_value);
+    }
     Ok(())
 }
 
@@ -367,12 +424,7 @@ pub(super) fn validate_request_headers(headers: &HeaderBlock) -> Result<(), Http
     if !is_valid_request_path(path) {
         return Err(Http2ProtocolError::InvalidPseudoHeaders);
     }
-    let has_authority = headers.authority_non_empty
-        || headers
-            .headers
-            .get(http::header::HOST)
-            .and_then(|v| v.to_str().ok())
-            .is_some_and(|v| !v.is_empty());
+    let has_authority = headers.authority_non_empty || headers.host_non_empty;
     if !has_authority {
         return Err(Http2ProtocolError::InvalidPseudoHeaders);
     }
@@ -493,6 +545,28 @@ mod tests {
         assert_eq!(decoded.path.as_deref(), Some("/"));
         assert!(decoded.saw_scheme);
         assert!(decoded.authority_non_empty);
+        validate_request_headers(&decoded).unwrap();
+    }
+
+    #[test]
+    fn compact_header_decode_keeps_facts_without_storing_public_headers() {
+        let mut block = Vec::new();
+        encode_literal_header(":method", "POST", &mut block);
+        encode_literal_header(":scheme", "http", &mut block);
+        encode_literal_header(":path", "/pkg.Service/Unary", &mut block);
+        encode_literal_header("host", "example.com", &mut block);
+        encode_literal_header("content-type", "application/grpc+proto", &mut block);
+        encode_literal_header("grpc-encoding", "gzip", &mut block);
+        encode_literal_header("content-length", "9", &mut block);
+
+        let mut decoder = hpack::Decoder::new();
+        let decoded = decode_headers_block_compact_with(&mut decoder, &block, 1024).unwrap();
+        assert_eq!(decoded.path.as_deref(), Some("/pkg.Service/Unary"));
+        assert!(decoded.host_non_empty);
+        assert!(decoded.grpc_content_type);
+        assert!(decoded.grpc_encoding_unsupported);
+        assert_eq!(decoded.content_length, Some(9));
+        assert!(decoded.headers.is_empty());
         validate_request_headers(&decoded).unwrap();
     }
 

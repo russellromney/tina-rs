@@ -205,7 +205,7 @@ pub use connect::{
 };
 pub use connection::{HttpConnection, HttpConnectionMsg, response_for_call_outcome};
 pub use grpc::{
-    GrpcClientStreamingRequest, GrpcError, GrpcLimits, GrpcRawStreamingRequest,
+    GrpcClientStreamingRequest, GrpcError, GrpcHttp2Request, GrpcLimits, GrpcRawStreamingRequest,
     GrpcRawStreamingResponse, GrpcRequest, GrpcRequestStream, GrpcResponse, GrpcRouter,
     GrpcRouterMsg, GrpcServerStreamingResponse, GrpcStatus, GrpcStatusCode, GrpcStreamReply,
     GrpcStreamingCall, GrpcStreamingResponse, decode_streaming_request, decode_unary_request,
@@ -220,8 +220,8 @@ pub use http2::{
     Http2ClientReply, Http2ClientReport, Http2ClientRequest, Http2ClientRequestBody,
     Http2ClientResponse, Http2ClientStreamCall, Http2ClientStreamingRequest, Http2Connection,
     Http2ConnectionMsg, Http2ConnectionReply, Http2ConnectionReport, Http2Limits, Http2Listener,
-    Http2ListenerMsg, Http2Outcome, Http2ProtocolError, Http2ResponseChunk, Http2ServerConfig,
-    Http2StreamReport, Http2StreamState, Http2Target,
+    Http2ListenerMsg, Http2Outcome, Http2ProtocolError, Http2RequestParts, Http2ResponseChunk,
+    Http2ServerConfig, Http2ServiceMessage, Http2StreamReport, Http2StreamState, Http2Target,
 };
 pub use keepalive::{
     KeepaliveConnAddr, KeepaliveConnection, KeepaliveConnectionMsg, KeepaliveConnectionStopFailure,

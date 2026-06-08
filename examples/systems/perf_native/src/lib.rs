@@ -2084,7 +2084,8 @@ fn start_grpc_server() -> anyhow::Result<(PerfRuntime, Address<Http2ListenerMsg>
         .map_err(|e| anyhow::anyhow!("register tina grpc router: {e:?}"))?;
     let config = Http2ServerConfig::dev();
     // The listener is generic over the service message type; the gRPC router
-    // accepts `GrpcRouterMsg: From<HttpRequest>`.
+    // opts into compact HTTP/2 request parts instead of materializing public
+    // headers it does not inspect.
     let listener = runtime
         .register_with_capacity::<Http2Listener<SingleShard, GrpcRouterMsg>, _>(
             Http2Listener::<SingleShard, GrpcRouterMsg>::new(
