@@ -48,7 +48,7 @@ use super::headers::{
     SETTINGS_ENABLE_PUSH, SETTINGS_HEADER_TABLE_SIZE, SETTINGS_INITIAL_WINDOW_SIZE,
     SETTINGS_MAX_CONCURRENT_STREAMS, SETTINGS_MAX_FRAME_SIZE, SETTINGS_MAX_HEADER_LIST_SIZE,
     decode_headers_block_with, encode_response_headers, encode_response_headers_with_len,
-    encode_response_trailers, encode_trailers, validate_request_headers,
+    encode_response_trailers, validate_request_headers,
 };
 
 #[cfg(test)]
@@ -1738,8 +1738,7 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Http2Connection<
             }
             CallOutcome::Replied(ResponseChunkReply::GrpcStatus(status)) => {
                 let grpc_status_code = crate::grpc::classify_grpc_status_code(&status);
-                let headers = crate::grpc::grpc_status_trailers(status);
-                let trailers = encode_trailers(&headers).expect("grpc status trailers encode");
+                let trailers = crate::grpc::grpc_status_trailers_block(status);
                 let _ = self.enqueue_frame(headers_frame(stream_id, true, trailers));
                 if let Some(idx) = self.find_stream(stream_id) {
                     self.streams[idx].state = Http2StreamState::Closed;

@@ -1093,19 +1093,25 @@ pub(crate) fn grpc_status_http_response(status: GrpcStatus) -> HttpResponse {
 
 pub fn grpc_status_trailers(status: GrpcStatus) -> http::HeaderMap {
     let mut headers = http::HeaderMap::new();
-    headers.insert(
-        http::HeaderName::from_static("grpc-status"),
-        HeaderValue::from_str(&status.code.as_u16().to_string())
-            .expect("numeric grpc status is header-safe"),
+    insert_grpc_status_headers(&mut headers, status);
+    headers
+}
+
+pub(crate) fn grpc_status_trailers_block(status: GrpcStatus) -> Vec<u8> {
+    let mut block = Vec::with_capacity(if status.message.is_some() { 64 } else { 16 });
+    literal(
+        "grpc-status",
+        grpc_status_header_str(status.code),
+        &mut block,
     );
     if let Some(message) = status.message {
-        headers.insert(
-            http::HeaderName::from_static("grpc-message"),
-            HeaderValue::from_str(&percent_encode_grpc_message(&message))
-                .unwrap_or_else(|_| HeaderValue::from_static("invalid")),
+        literal(
+            "grpc-message",
+            &percent_encode_grpc_message(&message),
+            &mut block,
         );
     }
-    headers
+    block
 }
 
 fn grpc_http_response(body: Vec<u8>, status: GrpcStatus) -> HttpResponse {
@@ -1114,9 +1120,7 @@ fn grpc_http_response(body: Vec<u8>, status: GrpcStatus) -> HttpResponse {
         http::header::CONTENT_TYPE,
         HeaderValue::from_static("application/grpc+proto"),
     );
-    for (name, value) in grpc_status_trailers(status).iter() {
-        response.headers.insert(name, value.clone());
-    }
+    insert_grpc_status_headers(&mut response.headers, status);
     response
 }
 
@@ -1129,19 +1133,48 @@ fn grpc_streaming_http_response(
         http::header::CONTENT_TYPE,
         HeaderValue::from_static("application/grpc+proto"),
     );
-    response.headers.insert(
+    insert_grpc_status_headers(&mut response.headers, status);
+    response
+}
+
+fn insert_grpc_status_headers(headers: &mut http::HeaderMap, status: GrpcStatus) {
+    headers.insert(
         http::HeaderName::from_static("grpc-status"),
-        HeaderValue::from_str(&status.code.as_u16().to_string())
-            .expect("numeric grpc status is header-safe"),
+        grpc_status_header_value(status.code),
     );
     if let Some(message) = status.message {
-        response.headers.insert(
+        headers.insert(
             http::HeaderName::from_static("grpc-message"),
             HeaderValue::from_str(&percent_encode_grpc_message(&message))
                 .unwrap_or_else(|_| HeaderValue::from_static("invalid")),
         );
     }
-    response
+}
+
+fn grpc_status_header_value(code: GrpcStatusCode) -> HeaderValue {
+    HeaderValue::from_static(grpc_status_header_str(code))
+}
+
+fn grpc_status_header_str(code: GrpcStatusCode) -> &'static str {
+    match code {
+        GrpcStatusCode::Ok => "0",
+        GrpcStatusCode::Cancelled => "1",
+        GrpcStatusCode::Unknown => "2",
+        GrpcStatusCode::InvalidArgument => "3",
+        GrpcStatusCode::DeadlineExceeded => "4",
+        GrpcStatusCode::NotFound => "5",
+        GrpcStatusCode::AlreadyExists => "6",
+        GrpcStatusCode::PermissionDenied => "7",
+        GrpcStatusCode::ResourceExhausted => "8",
+        GrpcStatusCode::FailedPrecondition => "9",
+        GrpcStatusCode::Aborted => "10",
+        GrpcStatusCode::OutOfRange => "11",
+        GrpcStatusCode::Unimplemented => "12",
+        GrpcStatusCode::Internal => "13",
+        GrpcStatusCode::Unavailable => "14",
+        GrpcStatusCode::DataLoss => "15",
+        GrpcStatusCode::Unauthenticated => "16",
+    }
 }
 
 fn status_for_error(error: GrpcError) -> GrpcStatus {
@@ -1437,22 +1470,63 @@ fn literal(name: &str, value: &str, out: &mut Vec<u8>) {
 }
 
 fn encode_hpack_string(value: &str, out: &mut Vec<u8>) {
-    assert!(value.len() < 127);
-    out.push(value.len() as u8);
+    encode_hpack_integer(value.len(), out);
     out.extend_from_slice(value.as_bytes());
+}
+
+fn encode_hpack_integer(mut value: usize, out: &mut Vec<u8>) {
+    if value < 127 {
+        out.push(value as u8);
+        return;
+    }
+    out.push(127);
+    value -= 127;
+    while value >= 128 {
+        out.push((value as u8 & 0x7f) | 0x80);
+        value >>= 7;
+    }
+    out.push(value as u8);
 }
 
 fn hpack_string(input: &[u8]) -> Result<(String, usize), GrpcError> {
     if input.is_empty() || input[0] & 0x80 != 0 {
         return Err(GrpcError::BadFrame);
     }
-    let len = input[0] as usize;
-    let end = 1 + len;
+    let (len, used) = hpack_integer(input)?;
+    let end = used.checked_add(len).ok_or(GrpcError::BadFrame)?;
     if input.len() < end {
         return Err(GrpcError::BadFrame);
     }
-    let value = std::str::from_utf8(&input[1..end]).map_err(|_| GrpcError::BadFrame)?;
+    let value = std::str::from_utf8(&input[used..end]).map_err(|_| GrpcError::BadFrame)?;
     Ok((value.to_owned(), end))
+}
+
+fn hpack_integer(input: &[u8]) -> Result<(usize, usize), GrpcError> {
+    if input.is_empty() || input[0] & 0x80 != 0 {
+        return Err(GrpcError::BadFrame);
+    }
+    let mut value = (input[0] & 0x7f) as usize;
+    if value < 127 {
+        return Ok((value, 1));
+    }
+    let mut shift = 0usize;
+    let mut used = 1usize;
+    loop {
+        let Some(byte) = input.get(used).copied() else {
+            return Err(GrpcError::BadFrame);
+        };
+        used += 1;
+        value = value
+            .checked_add(((byte & 0x7f) as usize) << shift)
+            .ok_or(GrpcError::BadFrame)?;
+        if byte & 0x80 == 0 {
+            return Ok((value, used));
+        }
+        shift = shift.checked_add(7).ok_or(GrpcError::BadFrame)?;
+        if shift >= usize::BITS as usize {
+            return Err(GrpcError::BadFrame);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1484,5 +1558,17 @@ mod tests {
         };
         let decoded = decode_unary_request::<Ping>(&request, GrpcLimits::default()).unwrap();
         assert_eq!(decoded.value, 7);
+    }
+
+    #[test]
+    fn grpc_status_trailers_block_handles_long_message() {
+        let message = "x".repeat(200);
+        let block = grpc_status_trailers_block(GrpcStatus::with_message(
+            GrpcStatusCode::ResourceExhausted,
+            message.clone(),
+        ));
+        let status = decode_grpc_status_trailers(&block).unwrap();
+        assert_eq!(status.code, GrpcStatusCode::ResourceExhausted);
+        assert_eq!(status.message.as_deref(), Some(message.as_str()));
     }
 }
