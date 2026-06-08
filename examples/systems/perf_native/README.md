@@ -478,6 +478,19 @@ machine.
   `grpc_unary_call_h2c_blocking`). Whole-process allocations 5599 → **~4220**
   (**−24.6%**) via the same server response/header path plus gRPC path
   ownership cleanup.
+- **gRPC steady-state rows**: the suite now separates fresh connection cost
+  from ordinary warmed service cost:
+  - `grpc_h2c_unary_close`: fresh h2c connection + unary call.
+  - `grpc_h2c_unary_warmed`: one warmed `GrpcClient` / HTTP/2 connection.
+  - `grpc_h2c_unary_pooled_concurrent`: fixed `GrpcClientPool`, one warmed
+    connection per worker, concurrent unary calls.
+  - `grpc_h2c_server_streaming_steady_state`: warmed server-streaming call,
+    bounded pre-registered response sources, three messages per RPC.
+  This is the honest comparison: fresh gRPC is a setup row, not "gRPC is slow."
+  The warmed rows also show the remaining truth: unary gRPC is still
+  allocation-heavy in steady state, so future work should target protobuf frame
+  reuse, client request construction, and runtime/protocol turn count rather
+  than more connection-setup fixes.
 - **WebSocket** (`websocket_text_round_trip` 4691 → **3813**,
   `websocket_steady_state_small` 880 → **672** process allocations): the
   connection owner now delivers exactly one session-rich app event per wire
@@ -588,6 +601,9 @@ Final Linux representative rows:
 | `http2_h2c_steady_state_small` | 144 µs | 190 µs | 216 µs | native server steady-state |
 | `http2_h2c_client_steady_state_post` | 399 µs | 555 µs | 664 µs | native client + native server warmed POST |
 | `grpc_h2c_unary_close` | 1095 µs | 1331 µs | 1378 µs | fresh h2c connection + unary call; no 88 ms floor |
+| `grpc_h2c_unary_warmed` | tbd Linux | tbd Linux | tbd Linux | warmed native `GrpcClient`; added after first Linux sample |
+| `grpc_h2c_unary_pooled_concurrent` | tbd Linux | tbd Linux | tbd Linux | fixed pool, one warmed connection per worker |
+| `grpc_h2c_server_streaming_steady_state` | tbd Linux | tbd Linux | tbd Linux | warmed streaming, three messages, bounded response sources |
 | `http2_h2c_close_request` | 908 µs | 1197 µs | 1880 µs | fresh h2c connection + one request |
 | `websocket_steady_state_small` | 66 µs | 178 µs | 1028 µs | reusable session path; p99 noisy |
 

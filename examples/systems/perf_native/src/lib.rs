@@ -20,10 +20,12 @@ use tina::CallRejectedReason;
 use tina::capacity::{CapacityMode, CapacitySurfaceReport};
 use tina::prelude::*;
 use tina_http::{
-    BodyMetrics, GrpcLimits, GrpcRequest, GrpcResponse, GrpcRouter, GrpcRouterMsg,
-    Http2ClientConnection, Http2ClientLimits, Http2ClientMsg, Http2ClientOutcome, Http2ClientReply,
-    Http2ClientRequest, Http2Listener, Http2ListenerMsg, Http2ServerConfig, Http2Target,
-    HttpLimits, HttpListener, HttpListenerAddress, HttpListenerMsg, HttpRequest, HttpResponse,
+    BodyMetrics, FixedEndpointPoolConfig, GrpcClient, GrpcClientPool, GrpcLimits, GrpcRequest,
+    GrpcResponse, GrpcRouter, GrpcRouterMsg, GrpcServerStreamingResponse, GrpcStatusCode,
+    GrpcStreamDecoder, GrpcStreamItem, GrpcTarget, GrpcUnaryOutcome, Http2ClientConnection,
+    Http2ClientLimits, Http2ClientMsg, Http2ClientOutcome, Http2ClientReply, Http2ClientRequest,
+    Http2Listener, Http2ListenerMsg, Http2PickOutcome, Http2ServerConfig, Http2Target, HttpLimits,
+    HttpListener, HttpListenerAddress, HttpListenerMsg, HttpRequest, HttpResponse,
     HttpServerConfig, StatusCode, WebSocketLimits, WebSocketSessionMsg, WebSocketSessionOutcome,
     grpc_unary_call_h2c_blocking, websocket_upgrade,
 };
@@ -1599,6 +1601,9 @@ pub fn run_native_rows() -> anyhow::Result<Vec<PerfReport>> {
         native_sampled(http2_h2c_steady_state_small_row)?,
         native_sampled(http2_h2c_client_steady_state_post_row)?,
         native_sampled(grpc_h2c_unary_close_row)?,
+        native_sampled(grpc_h2c_unary_warmed_row)?,
+        native_sampled(grpc_h2c_unary_pooled_concurrent_row)?,
+        native_sampled(grpc_h2c_server_streaming_steady_state_row)?,
         native_sampled(websocket_open_close_row)?,
         native_sampled(websocket_text_round_trip_row)?,
         native_sampled(websocket_steady_state_small_row)?,
@@ -2067,18 +2072,33 @@ struct GrpcPerfReply {
 }
 
 const GRPC_UNARY_PATH: &str = "/perf.Counter/Increment";
+const GRPC_STREAM_PATH: &str = "/perf.Counter/Watch";
+const GRPC_STREAM_MESSAGES: usize = 3;
+const GRPC_POOL_CONNECTIONS: usize = WORKERS;
+const GRPC_STREAM_CALLS_PER_ROW: usize = PROTOCOL_OPS as usize + 1;
 
 fn start_grpc_server() -> anyhow::Result<(PerfRuntime, Address<Http2ListenerMsg>, SocketAddr)> {
     let runtime = new_runtime();
     let limits = GrpcLimits::default();
-    let router = GrpcRouter::<SingleShard>::new(limits).unary(
+    let router = grpc_unary_router(limits);
+    start_grpc_server_with_router(runtime, router)
+}
+
+fn grpc_unary_router(limits: GrpcLimits) -> GrpcRouter<SingleShard> {
+    GrpcRouter::<SingleShard>::new(limits).unary(
         GRPC_UNARY_PATH,
         |request: GrpcRequest<GrpcPerfRequest>| {
             Ok(GrpcResponse::new(GrpcPerfReply {
                 value: request.message.delta + 1,
             }))
         },
-    );
+    )
+}
+
+fn start_grpc_server_with_router(
+    runtime: PerfRuntime,
+    router: GrpcRouter<SingleShard>,
+) -> anyhow::Result<(PerfRuntime, Address<Http2ListenerMsg>, SocketAddr)> {
     let service = runtime
         .register_with_capacity::<GrpcRouter<SingleShard>, _>(router, CAPACITY)
         .map_err(|e| anyhow::anyhow!("register tina grpc router: {e:?}"))?;
@@ -2104,6 +2124,33 @@ fn start_grpc_server() -> anyhow::Result<(PerfRuntime, Address<Http2ListenerMsg>
         .wait(Duration::from_secs(2))
         .map_err(|e| anyhow::anyhow!("observe tina grpc bind: {e:?}"))?;
     Ok((runtime, listener, addr))
+}
+
+fn start_grpc_streaming_server()
+    -> anyhow::Result<(PerfRuntime, Address<Http2ListenerMsg>, SocketAddr)>
+{
+    let runtime = new_runtime();
+    let limits = GrpcLimits::default();
+    let responses = Arc::new(Mutex::new(Vec::with_capacity(GRPC_STREAM_CALLS_PER_ROW)));
+    for _ in 0..GRPC_STREAM_CALLS_PER_ROW {
+        let messages = (0..GRPC_STREAM_MESSAGES).map(|i| GrpcPerfReply { value: 40 + i as u64 });
+        let response =
+            GrpcServerStreamingResponse::from_messages(&runtime, messages, limits, CAPACITY)
+                .map_err(|e| anyhow::anyhow!("register grpc stream response: {e:?}"))?;
+        responses.lock().expect("grpc stream responses").push(response);
+    }
+    let responses_for_route = Arc::clone(&responses);
+    let router = grpc_unary_router(limits).server_streaming(
+        GRPC_STREAM_PATH,
+        move |_request: GrpcRequest<GrpcPerfRequest>| {
+            responses_for_route
+                .lock()
+                .expect("grpc stream responses")
+                .pop()
+                .ok_or_else(|| tina_http::GrpcStatus::new(GrpcStatusCode::ResourceExhausted))
+        },
+    );
+    start_grpc_server_with_router(runtime, router)
 }
 
 fn grpc_unary_op(addr: SocketAddr) -> anyhow::Result<()> {
@@ -2148,6 +2195,281 @@ fn grpc_h2c_unary_close_row() -> anyhow::Result<PerfReport> {
     Ok(PerfReport::from_load_with_allocations(
         "grpc_h2c_unary_close",
         "connection_setup",
+        load,
+        allocations,
+    ))
+}
+
+fn start_grpc_client(runtime: &PerfRuntime, addr: SocketAddr) -> anyhow::Result<GrpcClient> {
+    let target = GrpcTarget::h2c("localhost", addr);
+    let conn = runtime
+        .register_with_capacity::<Http2ClientConnection<SingleShard>, _>(
+            target.http2_connection::<SingleShard>(),
+            CAPACITY,
+        )
+        .map_err(|e| anyhow::anyhow!("register tina grpc client: {e:?}"))?;
+    runtime
+        .try_send(conn, Http2ClientMsg::Begin)
+        .map_err(|e| anyhow::anyhow!("start tina grpc client: {e:?}"))?;
+    Ok(GrpcClient::new(conn, target.limits()))
+}
+
+fn grpc_unary_with_client(runtime: &PerfRuntime, client: &GrpcClient) -> anyhow::Result<()> {
+    let submit = client
+        .unary_request(GRPC_UNARY_PATH, &GrpcPerfRequest { delta: 41 })
+        .map_err(|e| anyhow::anyhow!("encode warmed grpc unary: {e:?}"))?;
+    let reply = runtime
+        .call_blocking(client.connection(), submit, PROTOCOL_CLIENT_TIMEOUT)
+        .map_err(|e| anyhow::anyhow!("warmed grpc unary call: {e:?}"))?;
+    let outcome = match reply {
+        CallOutcome::Replied(reply) => client.unary_outcome_from_reply::<GrpcPerfReply>(reply),
+        other => anyhow::bail!("unexpected warmed grpc call outcome: {other:?}"),
+    };
+    match outcome {
+        GrpcUnaryOutcome::Ok(reply) if reply.value == 42 => Ok(()),
+        other => anyhow::bail!("unexpected warmed grpc outcome: {other:?}"),
+    }
+}
+
+fn grpc_h2c_unary_warmed_row() -> anyhow::Result<PerfReport> {
+    let (runtime, listener, addr) = start_grpc_server()?;
+    let client = start_grpc_client(&runtime, addr)?;
+    grpc_unary_with_client(&runtime, &client)?; // warm connection + stream state
+
+    let process_before = ProcessSnapshot::now();
+    let (load, allocations) = {
+        let runtime = Arc::clone(&runtime);
+        let client = client.clone();
+        run_counted(
+            LoadRun {
+                workers: WORKERS,
+                stop: LoadStop::ops(PROTOCOL_OPS),
+                label: "tina_grpc_h2c_unary_warmed",
+            },
+            move |_| match grpc_unary_with_client(&runtime, &client) {
+                Ok(()) => OpOutcome::Ok,
+                Err(_) => OpOutcome::Err { kind: "grpc_error" },
+            },
+            None::<fn() -> LoadObservation>,
+        )
+    };
+    let (allocs, bytes, rss) = ProcessSnapshot::now().delta_from(process_before);
+    print_process_metrics("tina_grpc_h2c_unary_warmed", allocs, bytes, rss);
+    let _ = runtime.try_send(client.connection(), Http2ClientMsg::Stop);
+    let _ = runtime.try_send(listener, Http2ListenerMsg::Stop);
+    shutdown_runtime(runtime)?;
+    Ok(PerfReport::from_load_with_allocations(
+        "grpc_h2c_unary_warmed",
+        "steady_state_reuse",
+        load,
+        allocations,
+    ))
+}
+
+fn start_grpc_pool(
+    runtime: &PerfRuntime,
+    addr: SocketAddr,
+) -> anyhow::Result<(GrpcClientPool, Vec<GrpcClient>)> {
+    let targets: Vec<_> = (0..GRPC_POOL_CONNECTIONS)
+        .map(|i| GrpcTarget::h2c(format!("localhost-{i}"), addr))
+        .collect();
+    let mut conns = Vec::with_capacity(targets.len());
+    let mut clients = Vec::with_capacity(targets.len());
+    for target in &targets {
+        let conn = runtime
+            .register_with_capacity::<Http2ClientConnection<SingleShard>, _>(
+                target.http2_connection::<SingleShard>(),
+                CAPACITY,
+            )
+            .map_err(|e| anyhow::anyhow!("register pooled grpc client: {e:?}"))?;
+        runtime
+            .try_send(conn, Http2ClientMsg::Begin)
+            .map_err(|e| anyhow::anyhow!("start pooled grpc client: {e:?}"))?;
+        conns.push(conn);
+        clients.push(GrpcClient::new(conn, target.limits()));
+    }
+    let http2_targets: Vec<_> = targets.iter().map(|target| target.http2.clone()).collect();
+    let pool = GrpcClientPool::new(
+        &http2_targets,
+        conns,
+        FixedEndpointPoolConfig::balanced(),
+    )
+    .map_err(|e| anyhow::anyhow!("build grpc pool: {e:?}"))?;
+    Ok((pool, clients))
+}
+
+fn grpc_unary_with_pool(
+    runtime: &PerfRuntime,
+    pool: &Mutex<GrpcClientPool>,
+    clients: &[GrpcClient],
+) -> anyhow::Result<()> {
+    let (index, connection) = match pool.lock().expect("grpc pool mutex").pick() {
+        Http2PickOutcome::Picked { index, connection } => (index, connection),
+        other => anyhow::bail!("grpc pool pick failed: {other:?}"),
+    };
+    let client = &clients[index];
+    let submit = client
+        .unary_request(GRPC_UNARY_PATH, &GrpcPerfRequest { delta: 41 })
+        .map_err(|e| anyhow::anyhow!("encode pooled grpc unary: {e:?}"))?;
+    let reply = runtime
+        .call_blocking(connection, submit, PROTOCOL_CLIENT_TIMEOUT)
+        .map_err(|e| anyhow::anyhow!("pooled grpc unary call: {e:?}"))?;
+    let outcome = match reply {
+        CallOutcome::Replied(reply) => client.unary_outcome_from_reply::<GrpcPerfReply>(reply),
+        other => anyhow::bail!("unexpected pooled grpc call outcome: {other:?}"),
+    };
+    pool.lock()
+        .expect("grpc pool mutex")
+        .record_unary_outcome(index, &outcome);
+    match outcome {
+        GrpcUnaryOutcome::Ok(reply) if reply.value == 42 => Ok(()),
+        other => anyhow::bail!("unexpected pooled grpc outcome: {other:?}"),
+    }
+}
+
+fn grpc_h2c_unary_pooled_concurrent_row() -> anyhow::Result<PerfReport> {
+    let (runtime, listener, addr) = start_grpc_server()?;
+    let (pool, clients) = start_grpc_pool(&runtime, addr)?;
+    let pool = Arc::new(Mutex::new(pool));
+    grpc_unary_with_pool(&runtime, &pool, &clients)?; // warm one route
+
+    let process_before = ProcessSnapshot::now();
+    let (load, allocations) = {
+        let runtime = Arc::clone(&runtime);
+        let pool = Arc::clone(&pool);
+        let clients = Arc::new(clients.clone());
+        run_counted(
+            LoadRun {
+                workers: WORKERS,
+                stop: LoadStop::ops(PROTOCOL_OPS),
+                label: "tina_grpc_h2c_unary_pooled_concurrent",
+            },
+            move |_| match grpc_unary_with_pool(&runtime, &pool, &clients) {
+                Ok(()) => OpOutcome::Ok,
+                Err(_) => OpOutcome::Err { kind: "grpc_error" },
+            },
+            None::<fn() -> LoadObservation>,
+        )
+    };
+    let (allocs, bytes, rss) = ProcessSnapshot::now().delta_from(process_before);
+    print_process_metrics("tina_grpc_h2c_unary_pooled_concurrent", allocs, bytes, rss);
+    for client in &clients {
+        let _ = runtime.try_send(client.connection(), Http2ClientMsg::Stop);
+    }
+    let _ = runtime.try_send(listener, Http2ListenerMsg::Stop);
+    shutdown_runtime(runtime)?;
+    Ok(PerfReport::from_load_with_allocations(
+        "grpc_h2c_unary_pooled_concurrent",
+        "steady_state_reuse",
+        load,
+        allocations,
+    ))
+}
+
+fn grpc_server_streaming_with_client(
+    runtime: &PerfRuntime,
+    client: &GrpcClient,
+) -> anyhow::Result<()> {
+    let open = client
+        .server_streaming_request(GRPC_STREAM_PATH, &GrpcPerfRequest { delta: 40 })
+        .map_err(|e| anyhow::anyhow!("encode grpc stream request: {e:?}"))?;
+    let reply = runtime
+        .call_blocking(client.connection(), open, PROTOCOL_CLIENT_TIMEOUT)
+        .map_err(|e| anyhow::anyhow!("open grpc stream: {e:?}"))?;
+    let stream_id = match reply {
+        CallOutcome::Replied(Http2ClientReply::Outcome {
+            stream_id,
+            outcome:
+                Http2ClientOutcome::ResponseStreaming {
+                    status, headers, ..
+                },
+        }) => {
+            if status != StatusCode::OK {
+                anyhow::bail!("unexpected grpc stream head status {}", status);
+            }
+            if let Some(status) = client.stream_head_status(&headers) {
+                anyhow::bail!("unexpected trailers-only grpc stream status {status:?}");
+            }
+            stream_id
+        }
+        other => anyhow::bail!("unexpected grpc stream open outcome: {other:?}"),
+    };
+
+    let mut decoder = GrpcStreamDecoder::new(GrpcLimits::default());
+    let mut messages = 0usize;
+    loop {
+        let reply = runtime
+            .call_blocking(
+                client.connection(),
+                Http2ClientMsg::ResponseNext { stream_id },
+                PROTOCOL_CLIENT_TIMEOUT,
+            )
+            .map_err(|e| anyhow::anyhow!("pull grpc stream: {e:?}"))?;
+        let chunk = match reply {
+            CallOutcome::Replied(Http2ClientReply::ResponseChunk { chunk, .. }) => chunk,
+            other => anyhow::bail!("unexpected grpc stream chunk outcome: {other:?}"),
+        };
+        for item in client.decode_stream_chunk::<GrpcPerfReply>(&mut decoder, chunk) {
+            match item {
+                GrpcStreamItem::Message(message) => {
+                    let expected = 40 + messages as u64;
+                    if message.value != expected {
+                        anyhow::bail!(
+                            "unexpected grpc stream message {}, expected {expected}",
+                            message.value
+                        );
+                    }
+                    messages += 1;
+                }
+                GrpcStreamItem::Status(status) if status.code == GrpcStatusCode::Ok => {
+                    if messages != GRPC_STREAM_MESSAGES {
+                        anyhow::bail!(
+                            "grpc stream returned {messages} messages, expected {GRPC_STREAM_MESSAGES}"
+                        );
+                    }
+                    return Ok(());
+                }
+                other => anyhow::bail!("unexpected grpc stream item: {other:?}"),
+            }
+        }
+    }
+}
+
+fn grpc_h2c_server_streaming_steady_state_row() -> anyhow::Result<PerfReport> {
+    let (runtime, listener, addr) = start_grpc_streaming_server()?;
+    let client = start_grpc_client(&runtime, addr)?;
+    grpc_server_streaming_with_client(&runtime, &client)?; // warm connection + stream state
+
+    let process_before = ProcessSnapshot::now();
+    let (load, allocations) = {
+        let runtime = Arc::clone(&runtime);
+        let client = client.clone();
+        run_counted(
+            LoadRun {
+                workers: WORKERS,
+                stop: LoadStop::ops(PROTOCOL_OPS),
+                label: "tina_grpc_h2c_server_streaming_steady_state",
+            },
+            move |_| match grpc_server_streaming_with_client(&runtime, &client) {
+                Ok(()) => OpOutcome::Ok,
+                Err(_) => OpOutcome::Err { kind: "grpc_error" },
+            },
+            None::<fn() -> LoadObservation>,
+        )
+    };
+    let (allocs, bytes, rss) = ProcessSnapshot::now().delta_from(process_before);
+    print_process_metrics(
+        "tina_grpc_h2c_server_streaming_steady_state",
+        allocs,
+        bytes,
+        rss,
+    );
+    let _ = runtime.try_send(client.connection(), Http2ClientMsg::Stop);
+    let _ = runtime.try_send(listener, Http2ListenerMsg::Stop);
+    shutdown_runtime(runtime)?;
+    Ok(PerfReport::from_load_with_allocations(
+        "grpc_h2c_server_streaming_steady_state",
+        "steady_state_reuse",
         load,
         allocations,
     ))

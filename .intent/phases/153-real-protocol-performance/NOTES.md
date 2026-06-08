@@ -166,6 +166,39 @@ work. Final macOS whole-process samples for `tina_grpc_h2c_unary_close` sit
 around 4.19k-4.23k allocations per 32 ops, down from the Phase 152 baseline at
 5.6k.
 
+### gRPC setup vs warmed service truth
+
+The original gRPC row was too easy to misread: `grpc_h2c_unary_close` opens a
+fresh h2c connection for every unary call. That is useful as a setup row, but it
+does not answer "how does normal warmed gRPC behave?" This phase now pins four
+gRPC rows:
+
+| row | kind | what it measures |
+| --- | --- | --- |
+| `grpc_h2c_unary_close` | `connection_setup` | fresh h2c connection + unary call |
+| `grpc_h2c_unary_warmed` | `steady_state_reuse` | one warmed `GrpcClient` / HTTP2 connection |
+| `grpc_h2c_unary_pooled_concurrent` | `steady_state_reuse` | fixed `GrpcClientPool`, one warmed connection per worker |
+| `grpc_h2c_server_streaming_steady_state` | `steady_state_reuse` | warmed server-streaming RPC, three messages, bounded response-source pool |
+
+Representative macOS/aarch64 release rows from
+`perf_grpc_rows_macos_after.txt`:
+
+| row | p50 | p90 | process allocations / 32 ops | allocations / op |
+| --- | ---: | ---: | ---: | ---: |
+| `grpc_h2c_unary_close` | 1015 µs | 1125 µs | ~4.23k | ~132 |
+| `grpc_h2c_unary_warmed` | 1033 µs | 1131 µs | ~4.08k | ~128 |
+| `grpc_h2c_unary_pooled_concurrent` | 662 µs | 761 µs | ~4.05k | ~127 |
+| `grpc_h2c_server_streaming_steady_state` | 2655 µs | 2899 µs | ~8.95k | ~280 |
+
+So: fresh connection setup was a misleading proxy, but warmed unary gRPC is
+still not cheap. The next meaningful gRPC work is not another single clone
+removal; it is protobuf/frame buffer reuse, a cheaper public client request
+construction path, and reducing protocol/runtime turns where no policy
+boundary is crossed. The streaming row also proves a Tina-shaped pattern:
+response sources are admitted from a bounded pre-registered pool; registering a
+new source from inside the route handler would block/leak the runtime shape and
+is intentionally avoided.
+
 The native-client row proves the client path too: buffered POST bodies ride the
 client's owned-buffer/cursor DATA pacer, and response DATA is decoded through
 the owned payload path. gRPC rides the same server response path, so it improves
