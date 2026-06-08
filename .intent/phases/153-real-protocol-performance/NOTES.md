@@ -190,10 +190,41 @@ framing work.
 
 ## Linux / x86_64
 
-**MISSING in this session.** No Linux/x86_64 sample was collected. A local Fly
-attempt on 2026-06-07 was blocked before build by `fly apps list` reporting no
-access token. The PR is non-final until an authenticated session runs the
-Linux/Fly perf bundle and saves it here. Expected: the deterministic
-allocation/turn wins (`perf-h2-alloc` 3075→2434, `perf-ws-turns` 133→67,
-per-row process-allocation deltas) are platform-independent and should
-reproduce; the latency rows will differ in absolute value.
+Linux/x86_64 evidence is saved in `perf_sample_linux.txt`; Linux validation is
+saved in `linux_validation.txt`.
+
+Run:
+
+- Fly app: `tina-perf-150`
+- image: `registry.fly.io/tina-perf-150:deployment-01KTJ98DCX037BM9TT56GPD2NJ`
+- machine: `080d210b539578` (destroyed after capture)
+- VM: `performance-2x`, region `iad`
+
+Validation passed on Linux:
+
+- `betelgeuse_substrate`: 19/19
+- `cancel_call`: 5/5
+- `client_against_native`: 1/1
+- `grpc_live`: 34/34
+- `mailbox_readiness`: 2/2
+- `pending_read_park`: 1/1
+- `readiness_park`: 5/5
+- `scheduler_turn_tail`: 8/8
+
+Representative Linux rows:
+
+| Row | p50 | p90 | p99 | Allocations | Bytes | Notes |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| `hotpath_call_blocking_tail` | 14 µs | 20 µs | 113 µs | 1 | n/a | no scheduler-gap spikes |
+| `http2_h2c_steady_state_small` | 150 µs | 197 µs | 641 µs | 224 | 7072 | native server steady-state row is healthy |
+| `http2_h2c_client_steady_state_post` | **88000 µs** | 88068 µs | 88155 µs | 114 | 140992 | native client+server row surfaced a real Linux latency problem |
+| `grpc_h2c_unary_close` | **87951 µs** | 91580 µs | 92115 µs | 608 | 25696 | connect/setup row also shows the same ~88 ms Linux delay shape |
+| `websocket_steady_state_small` | 72 µs | 193 µs | 1076 µs | 96 | 352 | reusable session path is fast |
+
+The deterministic allocation wins reproduce on Linux, and the validation suite
+is green. The Linux latency evidence is not flattering: HTTP/2 client POST and
+gRPC close both show an ~88 ms floor. That is not caused by the Phase 153
+allocation work, and it is not present in the server-only HTTP/2 steady-state
+row. Treat this as the next performance finding: investigate Linux client-side
+HTTP/2/gRPC pacing, timers, or connection/read wakeups before making public
+HTTP/2/gRPC latency claims.

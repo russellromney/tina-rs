@@ -548,7 +548,14 @@ request view — a separate, larger change, not more framing work.
 
 ### Platform
 
-macOS/aarch64 local/alpha. Linux/x86_64 evidence for this phase is **not yet
-collected** (see `NOTES.md`; local Fly was blocked by a missing access token);
-the deterministic allocation/turn wins are expected to reproduce, the absolute
-latencies will differ.
+Phase 153 has both macOS/aarch64 and Linux/x86_64 evidence. Linux rows were
+captured on Fly `performance-2x` and saved in
+`.intent/phases/153-real-protocol-performance/perf_sample_linux.txt`; Linux
+validation output is saved beside it in `linux_validation.txt`.
+
+The Linux run reproduced the deterministic allocation wins, but also surfaced a
+real performance problem: the native HTTP/2 client POST row and the gRPC close
+row both show an ~88 ms p50 floor on Linux while the server-only HTTP/2
+steady-state row is about 150 us. Do not treat this phase as an HTTP/2/gRPC
+latency claim; the next performance pass should investigate Linux client-side
+HTTP/2/gRPC pacing, timers, and read/write wakeups.

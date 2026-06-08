@@ -1,0 +1,139 @@
+# Phase 153 Linux/x86_64 validation sample
+# Fly app: tina-perf-150
+# Machine: 080d210b539578
+# Image: registry.fly.io/tina-perf-150:deployment-01KTJ98DCX037BM9TT56GPD2NJ
+# VM: performance-2x, region iad
+# Captured: 2026-06-08T00:21:47Z
+
+Connecting to fdaa:1:220a:a7b:897:6e65:7e2c:2...
+##### TEST betelgeuse_substrate-c9b4d2b8e2f3838a #####
+
+running 19 tests
+test threaded_multishard_bad_remote_does_not_poison_good_remote_work ... ok
+test threaded_multishard_dispatcher_round_trips_between_worker_threads ... ok
+test threaded_multishard_isolate_call_round_trips_cross_shard_with_typed_outcome ... ok
+test threaded_multishard_rejects_zero_driver_lane_capacities ... ok
+test threaded_multishard_rejects_zero_storage_lane_capacity - should panic ... ok
+test threaded_multishard_remote_queue_full_is_visible_at_source ... ok
+test threaded_multishard_shutdown_report_keeps_trace_after_one_worker_fails ... ok
+test threaded_runtime_honors_bounded_trace_retention ... ok
+test threaded_runtime_local_mailbox_full_is_visible_in_trace ... ok
+test threaded_runtime_rejects_zero_driver_lane_capacities ... ok
+test threaded_runtime_rejects_zero_remote_inbound_drain_budget - should panic ... ok
+test threaded_runtime_shutdown_rejects_outstanding_tcp_accept_completion ... ok
+test threaded_runtime_shutdown_rejects_outstanding_timer_completion ... ok
+test threaded_runtime_shutdown_report_keeps_trace_on_driver_release_failure ... ok
+test threaded_runtime_shutdown_reports_driver_release_failure ... ok
+test threaded_runtime_shutdown_still_closes_resources_when_backend_cancel_fails ... ok
+test threaded_runtime_timer_retry_runs_without_manual_stepping ... ok
+test threaded_runtime_worker_panic_returns_typed_handle_error ... ok
+test tina_driver_runtime_contract_names_core_substrate_without_general_runtime_claim ... ok
+
+test result: ok. 19 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.33s
+
+
+##### TEST cancel_call-43ed472502dc6470 #####
+
+running 5 tests
+test cancel_after_reply_returns_already_completed ... ok
+test cancel_before_call_admit_returns_typed_outcome_and_runtime_continues ... ok
+test cancel_call_closes_pending_wait ... ok
+test huge_duration_call_deadline_saturates_instead_of_panicking ... ok
+test late_reply_after_cancel_surfaces_specifically_as_caller_cancelled ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.09s
+
+
+##### TEST client_against_native-36ec1d5bb783ce52 #####
+
+running 1 test
+test native_client_against_native_server_drives_counter ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+##### TEST grpc_live-fa5bf5cee4bc0e31 #####
+
+running 34 tests
+test grpc_bad_request_decode_path_is_invalid_argument ... ok
+test grpc_body_message_cap_is_resource_exhausted ... ok
+test grpc_client_streaming_declared_message_cap_fails_before_service ... ok
+test grpc_client_streaming_handles_many_small_messages ... ok
+test grpc_client_streaming_reads_multiple_request_messages ... ok
+test grpc_compressed_request_rejects_but_identity_encoding_is_ok ... ok
+test grpc_concurrent_stream_cap_uses_http2_reset ... ok
+test grpc_content_type_mismatch_rejects_as_invalid_argument ... ok
+test grpc_happy_unary_request_response ... ok
+test grpc_http2_body_cap_resets_before_service_decode ... ok
+test grpc_large_unary_request_splits_http2_data_frames ... ok
+test grpc_peer_reset_cancels_accepted_service_call ... ok
+test grpc_peer_reset_cancels_stream_without_killing_connection ... ok
+test grpc_request_trailers_are_rejected_not_treated_as_eof ... ok
+test grpc_response_message_cap_is_resource_exhausted ... ok
+test grpc_server_streaming_non_reading_peer_reset_cancels_blocked_source ... ok
+test grpc_server_streaming_peer_reset_cancels_response_source ... ok
+test grpc_server_streaming_route_works_more_than_once ... ok
+test grpc_server_streaming_sends_messages_then_status_trailers ... ok
+test grpc_streaming_concurrent_streams_do_not_cross_talk ... ok
+test grpc_streaming_declared_message_cap_sets_resource_exhausted ... ok
+test grpc_streaming_malformed_frame_sets_final_status ... ok
+test grpc_streaming_modes_share_one_http2_connection_without_cross_talk ... ok
+test grpc_streaming_peer_reset_cancels_response_source ... ok
+test grpc_streaming_raw_sends_response_before_request_eof ... ok
+test grpc_streaming_request_content_length_overrun_resets_stream ... ok
+test grpc_streaming_request_content_length_underrun_resets_stream ... ok
+test grpc_streaming_request_total_body_cap_counts_consumed_chunks ... ok
+test grpc_streaming_sends_response_before_request_eof ... ok
+test grpc_timeout_maps_to_deadline_exceeded ... ok
+test grpc_two_messages_on_unary_is_invalid_argument ... ok
+test grpc_typed_status_propagates_in_trailers ... ok
+test grpc_unknown_method_is_unimplemented ... ok
+test grpc_zero_message_body_is_invalid_argument ... ok
+
+test result: ok. 34 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.12s
+
+
+##### TEST mailbox_readiness-2898287e9c78ed1c #####
+
+running 2 tests
+test hot_isolate_served_with_many_idle_isolates ... ok
+test message_to_one_of_many_idle_isolates_is_scheduled ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.12s
+
+
+##### TEST pending_read_park-231c7f1a035a622f #####
+
+running 1 test
+test pending_tcp_read_parks_with_zero_wakeups_then_wakes_on_bytes ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.30s
+
+
+##### TEST readiness_park-f902d10d454d3218 #####
+
+running 5 tests
+test command_admitted_around_park_is_never_missed ... ok
+test direct_mailbox_push_wakes_idle_worker ... ok
+test idle_blocked_worker_wakes_for_command ... ok
+test idle_worker_makes_near_zero_wakeups ... ok
+test simulated_threaded_backend_no_spin_and_command_wake ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.61s
+
+
+##### TEST scheduler_turn_tail-3422711107eed0b7 #####
+
+running 8 tests
+test command_serviced_during_self_send_storm ... ok
+test idle_worker_wakes_immediately_for_a_command ... ok
+test pending_timer_serviced_at_idle_repoll_not_idle_wait ... ok
+test shutdown_observed_during_self_send_storm ... ok
+test tiny_hot_drain_budget_still_completes_calls ... ok
+test zero_hot_drain_elapsed_rejected - should panic ... ok
+test zero_hot_drain_rounds_rejected - should panic ... ok
+test zero_idle_repoll_rejected - should panic ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.09s
+
+
