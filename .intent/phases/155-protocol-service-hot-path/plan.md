@@ -21,6 +21,9 @@ Known code shape on `main`:
 - `GrpcRouter` converts those parts into `GrpcHttp2Request`, then routes through
   `response_for_http2`.
 - Streaming gRPC still falls back to `GrpcHttp2Request::into_http_request()`.
+- `GrpcRequest<T>` / streaming request types expose `path: String`, so a compact
+  transport request can still reallocate the method path before user code sees
+  it.
 - Unary and buffered server-streaming gRPC responses still build
   `HeaderMap`-shaped `HttpResponse`s and then convert those headers back into
   HPACK header/trailer blocks.
@@ -37,7 +40,7 @@ Add an internal request shape for built-in protocol services:
 ```text
 CompactHttp2Request {
     method,
-    path,
+    method_path,
     body,
     content_type_ok,
     grpc_encoding_unsupported,
@@ -50,6 +53,13 @@ Rules:
 - It is internal to `tina-http`; do not expose it as the normal service API.
 - It does not carry `HeaderMap`.
 - It carries only facts the gRPC router needs.
+- The method path must not allocate a new `String` on every warmed gRPC call.
+  Use a compact/shared method-path value such as `GrpcMethodPath` or an
+  equivalent bounded per-connection cache. If a cache is used, it must have an
+  explicit capacity and visible overflow behavior. No hidden unbounded path map.
+- It is OK to change public gRPC request structs from `path: String` to the new
+  method-path type. There is no stable API yet. Do not keep compatibility
+  wrappers that preserve the old allocation on the hot path.
 - Generic HTTP/2 services still get `HttpRequest` with real public headers.
 - Streaming gRPC gets a compact stream body too; do not rebuild a public
   `HttpRequest` just to preserve the stream source.
@@ -70,6 +80,13 @@ Replace the current `Http2RequestParts` fast path with two explicit paths:
 
 The public path must not regress. A user HTTP/2 service that reads a custom
 header must still see it.
+
+Add an observable proof hook:
+
+- `Http2ConnectionReport` counters, trace facts, or test-only instrumentation
+  must show compact request dispatch and public request dispatch separately.
+- Tests must prove the gRPC route used the compact path and the ordinary HTTP/2
+  route used the public path.
 
 ### 3. Keep gRPC status and caps on the compact path
 
@@ -121,6 +138,15 @@ body = owned/shared framed bytes
 
 Add an internal gRPC response path that carries exactly those facts and lets the
 HTTP/2 encoder write response HEADERS and trailers directly.
+
+Preferred shape for this repo:
+
+- keep `Http2Connection`'s public service reply as `HttpResponse`
+- add an internal response-body or response-extension variant that represents
+  gRPC wire facts without inserting fake entries into `HttpResponse.headers`
+- make HTTP/2 enqueue that variant directly into HPACK HEADERS/trailers
+- if HTTP/1 can receive it, serialize it correctly; otherwise make the type
+  private enough that only HTTP/2 gRPC can produce it
 
 Rules:
 
@@ -176,6 +202,17 @@ the warmed unary turn count, or show an event timeline proving every remaining
 turn is one of the policy boundaries above. If the latter happens, the phase
 must still ship the request/header/response allocation wins.
 
+Acceptance bar:
+
+- at least one warmed gRPC row must show a real turn-count reduction, or the PR
+  must stay draft and name the runtime primitive needed to reduce the remaining
+  policy-boundary turns
+- whole-process allocations for warmed gRPC unary must drop materially, not by
+  one token allocation; use 20% as the first target unless the before evidence
+  proves a different dominant allocator
+- if p50/p90 do not improve, the PR must include the measured next bottleneck
+  and the code path that owns it
+
 ### 7. Perf proof
 
 Update `examples/systems/perf_native` so the rows prove this exact work:
@@ -186,6 +223,7 @@ Update `examples/systems/perf_native` so the rows prove this exact work:
 - `http2_h2c_steady_state_small`
 - `perf-h2-alloc`
 - new warmed gRPC turn/allocation probe, printed as a stable line
+- compact/public dispatch counters or equivalent proof line
 
 Evidence required before merge:
 
@@ -205,6 +243,8 @@ enough unless the plan explains why the next dominant cost is now visible.
 - compact HPACK decode keeps gRPC facts without storing public headers
 - fallback HPACK decode still handles indexed/dynamic/Huffman-supported shapes
   exactly as before
+- compact/shared gRPC method path does not allocate per warmed call for the
+  ordinary static `/package.Service/Method` shape
 - compact request construction rejects malformed pseudo-headers and invalid
   content-length before service dispatch
 - response/trailer compact helpers preserve `grpc-status` and optional
@@ -216,6 +256,8 @@ enough unless the plan explains why the next dominant cost is now visible.
 
 - gRPC unary OK over native h2c uses the compact service path and returns the
   decoded message
+- warmed gRPC unary uses compact/shared method path; a route lookup must not
+  require allocating a new route `String`
 - gRPC server-streaming compact path works without rebuilding public
   `HttpRequest`
 - generic HTTP/2 service still sees custom request headers
@@ -227,11 +269,17 @@ enough unless the plan explains why the next dominant cost is now visible.
 - final gRPC status sent/received facts still appear in the trace
 - unary and buffered server-streaming responses use the compact response path
   without changing wire-visible status/trailers
+- compact/public dispatch proof is observable through report/fact/test
+  instrumentation, not only inferred from allocation counts
 
 ### E2E / Perf
 
 - `cargo test -p tina-http grpc -- --nocapture`
 - `cargo test -p tina-http http2 -- --nocapture`
+- raw HTTP/2 wire tests for malformed gRPC headers/body, so the negative proof
+  does not depend on the native client refusing to build bad input
+- update gRPC docs/tests/specimens that construct or inspect `GrpcRequest.path`
+  so the new method-path type is the copied public shape
 - `cargo test --release --manifest-path examples/systems/perf_native/Cargo.toml --test perf native_protocol_rows_are_printable_and_bounded -- --nocapture`
 - `cargo test --release --manifest-path examples/systems/perf_native/Cargo.toml --test hotpath -- --nocapture`
 - Linux/x86 perf bundle with the same rows
@@ -255,11 +303,15 @@ draft with macOS evidence and an explicit Linux blocker.
 
 - Warmed gRPC no longer materializes public `HttpRequest` / `HeaderMap` on the
   compact native path.
+- Warmed gRPC no longer allocates a new method-path `String` just to route a
+  static gRPC method.
 - Unary and buffered server-streaming gRPC no longer materialize public
   response `HeaderMap`s just to produce fixed gRPC headers/trailers.
 - Generic HTTP/2 still materializes public headers for user services.
-- Warmed gRPC turn count is measured and lower, or an event timeline proves the
-  remaining turns are all real policy boundaries.
+- Warmed gRPC turn count is measured and lower, or the PR stays draft with a
+  named runtime primitive needed to reduce the remaining policy-boundary turns.
 - HPACK/header allocation drops in the pinned rows.
+- Whole-process warmed gRPC unary allocation drops materially; one or two fewer
+  allocations per request is not enough for this phase.
 - macOS and Linux/x86 perf evidence are both in the PR.
 - Negative e2e tests prove caps/status/failure truth survived.
