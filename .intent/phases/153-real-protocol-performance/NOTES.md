@@ -12,7 +12,7 @@ public rows moved.
   `7b4cfea`) with this phase's *row code* copied in so the identical rows run
   against the old protocol code. Raw logs:
   `perf_sample_macos_before_152.txt`, `hotpath_sample_macos_before_152.txt`.
-- **after** = this phase (`af5043f`). Raw logs:
+- **after** = this phase branch after the final structural fixes. Raw logs:
   `perf_sample_macos_after.txt`, `hotpath_sample_macos_after.txt`.
 - Process-allocation rows are deterministic; latency on a laptop is noisy
   run-to-run, so the headline evidence is allocation/turn counts. Latency is
@@ -147,22 +147,24 @@ sample policy.
 | Phase 153 leaf copies | 3011 | 47.05 |
 | + structural (decode + coalesce) | 2626 | 41.03 |
 | + header encode (presize + itoa) | **2434** | **38.03** |
+| + literal HPACK fast path + compact pseudo-header facts | **1730** | **27.03** |
 
-**−20.8% off the Phase 152 baseline (~10 fewer allocations/request).**
+**−43.7% off the Phase 152 baseline (~21 fewer allocations/request).**
 
 ### Per-row whole-process allocations (Phase 152 → Phase 153 final)
 
 | row | before (152) | after (153) | delta |
 | --- | ---: | ---: | ---: |
-| `http2_h2c_steady_state_small` allocations | 1570 | **1249** | **−20.4%** |
-| `http2_h2c_steady_state_small` allocated_bytes | 426776 | **234072** | **−45.1%** |
+| `http2_h2c_steady_state_small` allocations | 1570 | **897** | **−42.9%** |
+| `http2_h2c_steady_state_small` allocated_bytes | 426776 | **226096** | **−47.0%** |
 | `http2_h2c_client_steady_state_post` allocations | 4266 | **3643** | **−14.6%** |
 | `http2_h2c_client_steady_state_post` allocated_bytes | 2161066 | **1685168** | **−22.0%** |
-| `grpc_h2c_unary_close` allocations | 5599 | **4964** | **−11.3%** |
+| `grpc_h2c_unary_close` allocations | 5599 | **~4220** | **−24.6%** |
 
-The direct gRPC status/trailer follow-up is smaller but real: final Linux
-whole-process samples for `tina_grpc_h2c_unary_close` sit around 4.85k-4.98k
-allocations per 32 ops, down from the earlier exact-code sample at ~5.08k.
+The direct gRPC status/trailer follow-up was smaller than the HPACK/header
+work. Final macOS whole-process samples for `tina_grpc_h2c_unary_close` sit
+around 4.19k-4.23k allocations per 32 ops, down from the Phase 152 baseline at
+5.6k.
 
 The native-client row proves the client path too: buffered POST bodies ride the
 client's owned-buffer/cursor DATA pacer, and response DATA is decoded through
@@ -174,35 +176,34 @@ meaningful chunk, not one allocation.
 
 | row | kind | before p50 | after p50 | note |
 | --- | --- | ---: | ---: | --- |
-| `http2_h2c_steady_state_small` | reuse | 209 µs | **182 µs** | improved (warmed per-request signal) |
-| `http2_h2c_client_steady_state_post` | reuse | 1287 µs | **1051 µs** | improved; public native client + server path |
-| `grpc_h2c_unary_close` | setup | 829 µs | 911 µs | connect-bound; this is a per-op-connect row, so p50 swings 821–939 µs run-to-run on kernel connect/accept, not the changed code |
-| `websocket_steady_state_small` | reuse | 262 µs | 180 µs | improved |
+| `http2_h2c_steady_state_small` | reuse | 209 µs | 259 µs | laptop-noisy; allocation drop is stable |
+| `http2_h2c_client_steady_state_post` | reuse | 1287 µs | **965 µs** | improved in refreshed sample |
+| `grpc_h2c_unary_close` | setup | 829 µs | 1206 µs | connect-bound; allocation drop is stable |
+| `websocket_steady_state_small` | reuse | 262 µs | **220 µs** | improved |
 
-The steady-state (reused-connection) rows — the clean per-request signal —
-improved or held. The `connection_setup` rows (gRPC, ws text) are dominated by
-TCP connect/accept latency and swing run-to-run; their deterministic allocation
-counts are the trustworthy signal, and those dropped. All rows `ok=32`,
-`timeout=0`, leak-clean.
+Latency on this laptop still swings run-to-run, especially connection-setup
+rows. The deterministic allocation counts are the trustworthy claim here, and
+those dropped. All rows `ok=32`, `timeout=0`, leak-clean.
 
-### What still dominates the residual (documented, not hidden)
+### Later structural header work (documented, not hidden)
 
-After framing was made lean, the remaining server per-request allocations are
-**not framing**:
+This phase removed the big generic-HPACK tax for Tina-native/plain-literal
+requests. The server now parses the common literal HPACK shape directly from the
+wire buffer, borrows header name/value strings during decode, falls back to the
+full HPACK decoder for indexed/dynamic/Huffman blocks, and stores `:scheme` /
+`:authority` as validation facts instead of owned request strings.
 
-- The inbound HPACK decode that builds the typed `HttpRequest`: the hpack
-  crate's per-header name/value allocations, plus the `:path`/`:scheme`/
-  `:authority` strings and the `HeaderMap`, all consumed by the app handler.
-  The decoder itself is already reused per connection; the per-request header
-  *model* is intrinsic to handing a typed request to user code.
-- The per-request runtime call delivering the request to the service isolate
-  and returning the response (out of scope: no scheduler/runtime changes).
-- The raw-socket test client's own per-frame allocations (harness, not Tina).
+The remaining server per-request allocations are now mostly:
 
-These are why the whole-process number is ~38/request rather than near zero:
-framing is no longer the cost. Reducing them further means a different HPACK
-header model or a borrowed request view — a separate, larger change, not more
-framing work.
+- public `HttpRequest` materialization: `:path` plus the `HeaderMap` values
+  that user code can inspect;
+- the per-request runtime call delivering the request to the service isolate
+  and returning the response;
+- the raw-socket test client's own per-frame allocations (harness, not Tina).
+
+Reducing that further means a user-facing borrowed/compact request view or a
+specialized built-in gRPC/HTTP2 service path that can prove it does not hide a
+policy boundary. That is a bigger API decision, not another HPACK leaf fix.
 
 ## Linux / x86_64
 

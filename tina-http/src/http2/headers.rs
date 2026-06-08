@@ -22,8 +22,9 @@ pub(super) const MAX_MAX_FRAME_SIZE: u32 = 16_777_215;
 pub(super) struct HeaderBlock {
     pub(super) method: Option<Method>,
     pub(super) path: Option<String>,
-    pub(super) scheme: Option<String>,
-    pub(super) authority: Option<String>,
+    pub(super) saw_scheme: bool,
+    pub(super) saw_authority: bool,
+    pub(super) authority_non_empty: bool,
     pub(super) status: Option<StatusCode>,
     pub(super) headers: HeaderMap,
     pub(super) bytes: usize,
@@ -50,6 +51,9 @@ pub(super) fn decode_headers_block_with(
     block: &[u8],
     max_header_bytes: usize,
 ) -> Result<HeaderBlock, Http2ProtocolError> {
+    if let Some(headers) = decode_fast_literal_headers(block, max_header_bytes)? {
+        return Ok(headers);
+    }
     let mut out = HeaderBlock::default();
     for (name, value) in decoder
         .decode(block)
@@ -61,6 +65,94 @@ pub(super) fn decode_headers_block_with(
         add_header(&mut out, name, value, max_header_bytes)?;
     }
     Ok(out)
+}
+
+/// Decode the common Tina/native-client HPACK shape without allocating one
+/// temporary `Vec<u8>` per header name/value.
+///
+/// This fast path intentionally accepts only "literal header field without
+/// indexing, new name" entries with plain (non-Huffman) strings — exactly what
+/// [`encode_literal_header`] emits. Any indexed/dynamic/Huffman form falls back
+/// to the full HPACK decoder above.
+fn decode_fast_literal_headers(
+    block: &[u8],
+    max_header_bytes: usize,
+) -> Result<Option<HeaderBlock>, Http2ProtocolError> {
+    let mut out = HeaderBlock::default();
+    let mut cursor = 0;
+    while cursor < block.len() {
+        if block[cursor] != 0 {
+            return Ok(None);
+        }
+        cursor += 1;
+        let Some((name, used)) = decode_plain_hpack_string(&block[cursor..])? else {
+            return Ok(None);
+        };
+        cursor += used;
+        let Some((value, used)) = decode_plain_hpack_string(&block[cursor..])? else {
+            return Ok(None);
+        };
+        cursor += used;
+        add_header(&mut out, name, value, max_header_bytes)?;
+    }
+    Ok(Some(out))
+}
+
+fn decode_plain_hpack_string(input: &[u8]) -> Result<Option<(&str, usize)>, Http2ProtocolError> {
+    let Some(first) = input.first().copied() else {
+        return Err(Http2ProtocolError::HpackUnsupported);
+    };
+    if first & 0x80 != 0 {
+        return Ok(None);
+    }
+    let (len, prefix_len) = decode_hpack_integer_7(input)?;
+    let start = prefix_len;
+    let end = start
+        .checked_add(len)
+        .ok_or(Http2ProtocolError::HpackUnsupported)?;
+    if end > input.len() {
+        return Err(Http2ProtocolError::HpackUnsupported);
+    }
+    let value = std::str::from_utf8(&input[start..end])
+        .map_err(|_| Http2ProtocolError::HpackUnsupported)?;
+    Ok(Some((value, end)))
+}
+
+fn decode_hpack_integer_7(input: &[u8]) -> Result<(usize, usize), Http2ProtocolError> {
+    let first = input
+        .first()
+        .copied()
+        .ok_or(Http2ProtocolError::HpackUnsupported)?
+        & 0x7f;
+    if first < 0x7f {
+        return Ok((first as usize, 1));
+    }
+    let mut value = 0x7f_usize;
+    let mut shift = 0usize;
+    let mut cursor = 1usize;
+    loop {
+        let byte = input
+            .get(cursor)
+            .copied()
+            .ok_or(Http2ProtocolError::HpackUnsupported)?;
+        cursor += 1;
+        let part = (byte & 0x7f) as usize;
+        value = value
+            .checked_add(
+                part.checked_shl(shift as u32)
+                    .ok_or(Http2ProtocolError::HpackUnsupported)?,
+            )
+            .ok_or(Http2ProtocolError::HpackUnsupported)?;
+        if byte & 0x80 == 0 {
+            return Ok((value, cursor));
+        }
+        shift = shift
+            .checked_add(7)
+            .ok_or(Http2ProtocolError::HpackUnsupported)?;
+        if shift >= usize::BITS as usize {
+            return Err(Http2ProtocolError::HpackUnsupported);
+        }
+    }
 }
 
 pub(super) fn add_header(
@@ -97,16 +189,17 @@ pub(super) fn add_header(
                 out.path = Some(value.to_owned());
             }
             ":scheme" => {
-                if out.scheme.is_some() {
+                if out.saw_scheme {
                     return Err(Http2ProtocolError::InvalidPseudoHeaders);
                 }
-                out.scheme = Some(value.to_owned());
+                out.saw_scheme = true;
             }
             ":authority" => {
-                if out.authority.is_some() {
+                if out.saw_authority {
                     return Err(Http2ProtocolError::InvalidPseudoHeaders);
                 }
-                out.authority = Some(value.to_owned());
+                out.saw_authority = true;
+                out.authority_non_empty = !value.is_empty();
             }
             ":status" => {
                 if out.status.is_some() {
@@ -265,7 +358,7 @@ pub(super) fn encode_response_trailers(response: &HttpResponse) -> Option<Vec<u8
 /// Validate the required pseudo-headers and authority/Host rule for an inbound
 /// HTTP/2 request. `:status` must not appear on requests.
 pub(super) fn validate_request_headers(headers: &HeaderBlock) -> Result<(), Http2ProtocolError> {
-    if headers.method.is_none() || headers.scheme.is_none() {
+    if headers.method.is_none() || !headers.saw_scheme {
         return Err(Http2ProtocolError::InvalidPseudoHeaders);
     }
     let Some(path) = headers.path.as_deref() else {
@@ -274,7 +367,7 @@ pub(super) fn validate_request_headers(headers: &HeaderBlock) -> Result<(), Http
     if !is_valid_request_path(path) {
         return Err(Http2ProtocolError::InvalidPseudoHeaders);
     }
-    let has_authority = headers.authority.as_deref().is_some_and(|v| !v.is_empty())
+    let has_authority = headers.authority_non_empty
         || headers
             .headers
             .get(http::header::HOST)
@@ -305,8 +398,8 @@ pub(super) fn validate_response_headers(headers: &HeaderBlock) -> Result<(), Htt
     }
     if headers.method.is_some()
         || headers.path.is_some()
-        || headers.scheme.is_some()
-        || headers.authority.is_some()
+        || headers.saw_scheme
+        || headers.saw_authority
     {
         return Err(Http2ProtocolError::InvalidPseudoHeaders);
     }
@@ -322,8 +415,8 @@ pub(super) fn validate_response_headers(headers: &HeaderBlock) -> Result<(), Htt
 pub(super) fn validate_trailer_block(headers: &HeaderBlock) -> Result<(), Http2ProtocolError> {
     if headers.method.is_some()
         || headers.path.is_some()
-        || headers.scheme.is_some()
-        || headers.authority.is_some()
+        || headers.saw_scheme
+        || headers.saw_authority
         || headers.status.is_some()
     {
         return Err(Http2ProtocolError::InvalidTrailerPseudoHeader);
@@ -345,6 +438,62 @@ mod tests {
         add_header(&mut headers, ":authority", "example.com", 1024).unwrap();
         add_header(&mut headers, ":path", path, 1024).unwrap();
         headers
+    }
+
+    #[test]
+    fn fast_literal_header_decode_matches_tina_encoder() {
+        let mut block = Vec::new();
+        encode_literal_header(":method", "POST", &mut block);
+        encode_literal_header(":scheme", "http", &mut block);
+        encode_literal_header(":authority", "example.com", &mut block);
+        encode_literal_header(":path", "/pkg.Service/Unary", &mut block);
+        encode_literal_header("content-type", "application/grpc", &mut block);
+        encode_literal_header("content-length", "9", &mut block);
+
+        let decoded = decode_headers_block(&block, 1024).unwrap();
+        assert_eq!(decoded.method, Some(Method::POST));
+        assert_eq!(decoded.path.as_deref(), Some("/pkg.Service/Unary"));
+        assert!(decoded.saw_scheme);
+        assert!(decoded.saw_authority);
+        assert!(decoded.authority_non_empty);
+        assert_eq!(decoded.content_length, Some(9));
+        assert_eq!(
+            decoded
+                .headers
+                .get(http::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("application/grpc")
+        );
+    }
+
+    #[test]
+    fn fast_literal_header_decode_handles_extended_string_lengths() {
+        let path = format!("/{}", "x".repeat(180));
+        let mut block = Vec::new();
+        encode_literal_header(":method", "GET", &mut block);
+        encode_literal_header(":scheme", "http", &mut block);
+        encode_literal_header(":authority", "example.com", &mut block);
+        encode_literal_header(":path", &path, &mut block);
+
+        let decoded = decode_headers_block(&block, 4096).unwrap();
+        assert_eq!(decoded.path.as_deref(), Some(path.as_str()));
+        validate_request_headers(&decoded).unwrap();
+    }
+
+    #[test]
+    fn indexed_header_block_falls_back_to_full_hpack_decoder() {
+        let mut block = Vec::new();
+        block.push(0x82); // static table: :method GET
+        block.push(0x86); // static table: :scheme http
+        block.push(0x84); // static table: :path /
+        encode_literal_header(":authority", "example.com", &mut block);
+
+        let decoded = decode_headers_block(&block, 1024).unwrap();
+        assert_eq!(decoded.method, Some(Method::GET));
+        assert_eq!(decoded.path.as_deref(), Some("/"));
+        assert!(decoded.saw_scheme);
+        assert!(decoded.authority_non_empty);
+        validate_request_headers(&decoded).unwrap();
     }
 
     #[test]

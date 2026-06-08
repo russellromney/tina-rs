@@ -13,7 +13,7 @@ use std::marker::PhantomData;
 use std::net::{SocketAddr, TcpStream};
 use std::time::Duration;
 
-use http::{HeaderValue, Method, StatusCode};
+use http::{HeaderMap, HeaderValue, Method, StatusCode};
 use prost::Message;
 use tina::prelude::*;
 use tina::reply_to_request;
@@ -246,8 +246,13 @@ where
     F: Fn(GrpcRequest<Req>) -> Result<GrpcResponse<Resp>, GrpcStatus> + Send + Sync + 'static,
 {
     fn call(&self, request: HttpRequest, limits: GrpcLimits) -> HttpResponse {
-        let path = request.path.clone();
-        match decode_unary_request::<Req>(&request, limits) {
+        let HttpRequest {
+            path,
+            headers,
+            body,
+            ..
+        } = request;
+        match decode_unary_parts::<Req>(&headers, &body, limits) {
             Ok(message) => match (self.f)(GrpcRequest { path, message }) {
                 Ok(response) => match encode_grpc_message(&response.message, limits) {
                     Ok(body) => grpc_http_response(body, GrpcStatus::ok()),
@@ -567,8 +572,13 @@ where
         + 'static,
 {
     fn call(&self, request: HttpRequest, limits: GrpcLimits) -> HttpResponse {
-        let path = request.path.clone();
-        match decode_unary_request::<Req>(&request, limits) {
+        let HttpRequest {
+            path,
+            headers,
+            body,
+            ..
+        } = request;
+        match decode_unary_parts::<Req>(&headers, &body, limits) {
             Ok(message) => match (self.f)(GrpcRequest { path, message }) {
                 Ok(response) => grpc_streaming_http_response(response.source, GrpcStatus::ok()),
                 Err(status) => grpc_http_response(Vec::new(), status),
@@ -595,8 +605,13 @@ where
         + 'static,
 {
     fn call(&self, request: HttpRequest, limits: GrpcLimits) -> HttpResponse {
-        let path = request.path.clone();
-        match decode_streaming_request::<Req>(&request, limits) {
+        let HttpRequest {
+            path,
+            headers,
+            body,
+            ..
+        } = request;
+        match decode_streaming_parts::<Req>(&headers, &body, limits) {
             Ok(messages) => match (self.f)(GrpcClientStreamingRequest { path, messages }) {
                 Ok(response) => match encode_grpc_message(&response.message, limits) {
                     Ok(body) => grpc_http_response(body, GrpcStatus::ok()),
@@ -628,8 +643,8 @@ where
         + 'static,
 {
     fn call(&self, request: HttpRequest, limits: GrpcLimits) -> HttpResponse {
-        let path = request.path.clone();
-        let HttpRequestBody::Http2Stream(stream) = request.body else {
+        let HttpRequest { path, body, .. } = request;
+        let HttpRequestBody::Http2Stream(stream) = body else {
             return grpc_http_response(
                 Vec::new(),
                 GrpcStatus::new(GrpcStatusCode::InvalidArgument),
@@ -655,8 +670,8 @@ where
         + 'static,
 {
     fn call(&self, request: HttpRequest, _limits: GrpcLimits) -> HttpResponse {
-        let path = request.path.clone();
-        let HttpRequestBody::Http2Stream(stream) = request.body else {
+        let HttpRequest { path, body, .. } = request;
+        let HttpRequestBody::Http2Stream(stream) = body else {
             return grpc_http_response(
                 Vec::new(),
                 GrpcStatus::new(GrpcStatusCode::InvalidArgument),
@@ -980,23 +995,34 @@ pub fn decode_unary_request<T: Message + Default>(
     request: &HttpRequest,
     limits: GrpcLimits,
 ) -> Result<T, GrpcError> {
-    let content_type = request
-        .headers
+    decode_unary_parts(&request.headers, &request.body, limits)
+}
+
+fn validate_grpc_request_headers(headers: &HeaderMap) -> Result<(), GrpcError> {
+    let content_type = headers
         .get(http::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .unwrap_or_default();
     if !is_grpc_content_type(content_type) {
         return Err(GrpcError::BadContentType);
     }
-    let unsupported_encoding = request
-        .headers
+    let unsupported_encoding = headers
         .get("grpc-encoding")
         .and_then(|value| value.to_str().ok())
         .is_some_and(|value| !value.eq_ignore_ascii_case("identity"));
     if unsupported_encoding {
         return Err(GrpcError::CompressedUnsupported);
     }
-    let body = request.body.as_buffered().ok_or(GrpcError::BadFrame)?;
+    Ok(())
+}
+
+fn decode_unary_parts<T: Message + Default>(
+    headers: &HeaderMap,
+    body: &HttpRequestBody,
+    limits: GrpcLimits,
+) -> Result<T, GrpcError> {
+    validate_grpc_request_headers(headers)?;
+    let body = body.as_buffered().ok_or(GrpcError::BadFrame)?;
     let mut cursor = 0;
     let message = decode_one_grpc_message::<T>(body, &mut cursor, limits)?;
     if cursor != body.len() {
@@ -1009,23 +1035,16 @@ pub fn decode_streaming_request<T: Message + Default>(
     request: &HttpRequest,
     limits: GrpcLimits,
 ) -> Result<Vec<T>, GrpcError> {
-    let content_type = request
-        .headers
-        .get(http::header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or_default();
-    if !is_grpc_content_type(content_type) {
-        return Err(GrpcError::BadContentType);
-    }
-    let unsupported_encoding = request
-        .headers
-        .get("grpc-encoding")
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| !value.eq_ignore_ascii_case("identity"));
-    if unsupported_encoding {
-        return Err(GrpcError::CompressedUnsupported);
-    }
-    let body = request.body.as_buffered().ok_or(GrpcError::BadFrame)?;
+    decode_streaming_parts(&request.headers, &request.body, limits)
+}
+
+fn decode_streaming_parts<T: Message + Default>(
+    headers: &HeaderMap,
+    body: &HttpRequestBody,
+    limits: GrpcLimits,
+) -> Result<Vec<T>, GrpcError> {
+    validate_grpc_request_headers(headers)?;
+    let body = body.as_buffered().ok_or(GrpcError::BadFrame)?;
     let mut cursor = 0;
     let mut messages = Vec::new();
     while cursor < body.len() {

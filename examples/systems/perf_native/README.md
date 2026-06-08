@@ -456,14 +456,15 @@ machine.
 ### What got cheaper
 
 - **HTTP/2 buffered response** (`perf-h2-alloc`, 64 warmed h2c responses):
-  process allocations 3075 → **2434** (48.05 → **38.03**/response, **−20.8%**).
+  process allocations 3075 → **1730** (48.05 → **27.03**/response, **−43.7%**).
   The arc is 3075 → 3011 (body clone gone) → 2626 (borrowed inbound decode +
   coalesced response write) → 2434 (pre-sized header block + stack-formatted
-  content-length). The client is byte-identical across the comparison, so the
-  whole drop is server-side.
+  content-length) → 1730 (literal HPACK fast path + compact pseudo-header
+  facts). The client is byte-identical across the comparison, so the whole drop
+  is server-side.
 - **HTTP/2 steady-state row** (`http2_h2c_steady_state_small`): whole-process
-  allocations 1570 → **1249** (**−20.4%**), allocated bytes 426776 → **234072**
-  (**−45%**), p50 209 → **182 µs**.
+  allocations 1570 → **897** (**−42.9%**), allocated bytes 426776 → **226096**
+  (**−47%**).
 - **Native HTTP/2 client row** (`http2_h2c_client_steady_state_post`): one
   native `Http2ClientConnection` submits buffered POSTs to the native server over
   a warmed h2c connection. With the row code copied onto the Phase 152 base,
@@ -474,8 +475,9 @@ machine.
   signal.
 - **gRPC unary** (`grpc_h2c_unary_close`): the smallest public unary gRPC path
   (`GrpcRouter` behind the real `Http2Listener`, driven by
-  `grpc_unary_call_h2c_blocking`). Whole-process allocations 5599 → **4964**
-  (**−11.3%**) via the same server response path.
+  `grpc_unary_call_h2c_blocking`). Whole-process allocations 5599 → **~4220**
+  (**−24.6%**) via the same server response/header path plus gRPC path
+  ownership cleanup.
 - **WebSocket** (`websocket_text_round_trip` 4691 → **3813**,
   `websocket_steady_state_small` 880 → **672** process allocations): the
   connection owner now delivers exactly one session-rich app event per wire
@@ -512,6 +514,11 @@ performance claim.
 - **Header encode.** The response header block is pre-sized (each `Vec` growth
   realloc is a counted allocation) and content-length is formatted into a stack
   buffer, not a heap `String`.
+- **Header decode.** Tina-native/plain-literal HPACK blocks are decoded from a
+  borrowed wire slice without temporary per-header `Vec`s. Indexed/dynamic/
+  Huffman HPACK still falls back to the full decoder. Request-only pseudo
+  headers that are not public `HttpRequest` fields (`:scheme`, `:authority`) are
+  kept as validation facts instead of owned strings.
 - `into_data_payload(frame)` moves the unpadded DATA payload out of an owned
   frame (used by the client DATA handler); the old cloning `data_payload` is
   gone. Padded DATA still validates padding and preserves the flow-control wire
@@ -533,14 +540,12 @@ performance claim.
 
 ### What still dominates the residual (named, not hidden)
 
-Framing is no longer the cost; the whole-process ~38 allocations/request are now
-dominated by paths that are *not* framing:
+Framing and Tina-native HPACK decode are no longer the big cost; the
+whole-process ~27 allocations/request are now dominated by paths that remain
+public request/application boundaries:
 
-- The inbound HPACK decode that builds the typed `HttpRequest`: the hpack
-  crate's per-header name/value allocations, plus the `:path`/`:scheme`/
-  `:authority` strings and the `HeaderMap`, all consumed by the app handler. The
-  decoder is already reused per connection; the per-request header model is
-  intrinsic to handing a typed request to user code.
+- Building the public typed `HttpRequest`: `:path` plus `HeaderMap` values that
+  user code can inspect.
 - The per-request runtime call delivering the request to the service isolate and
   returning the response (out of scope: no scheduler/runtime change).
 - The raw-socket test client's own per-frame allocations (harness, not Tina).
@@ -548,8 +553,10 @@ dominated by paths that are *not* framing:
   (`encode_grpc_message`) plus prost's internal encode. Status-header/trailer
   construction is cheaper now, but protobuf payload construction is unchanged.
 
-Reducing the first two means a different HPACK header model or a borrowed
-request view — a separate, larger change, not more framing work.
+Reducing the first two further means a user-facing borrowed/compact request
+view or a specialized built-in gRPC/HTTP2 service path that can prove it is not
+hiding a policy boundary. Reducing the raw-socket harness allocations means a
+different benchmark client. None of that is hidden as "protocol frame" work.
 
 ### Platform
 
