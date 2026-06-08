@@ -32,9 +32,9 @@ use common::TestShard;
 use http::{HeaderMap, Method};
 use tina::prelude::*;
 use tina_http::{
-    Http2ClientConnection, Http2ClientLimits, Http2ClientMsg, Http2ClientOutcome, Http2ClientReply,
-    Http2ClientRequest, Http2ClientRequestBody, Http2ClientStreamCall, Http2ProtocolError,
-    Http2ResponseChunk, Http2Target,
+    GrpcClient, GrpcLimits, Http2ClientConnection, Http2ClientLimits, Http2ClientMsg,
+    Http2ClientOutcome, Http2ClientReply, Http2ClientRequest, Http2ClientRequestBody,
+    Http2ClientStreamCall, Http2ProtocolError, Http2ResponseChunk, Http2Target,
 };
 use tina_runtime::{
     CallOutcome, DefaultThreadedMailboxFactory, Http2ResetReason, ProtocolDirection, ProtocolFact,
@@ -67,6 +67,9 @@ const FRAME_GOAWAY: u8 = 0x7;
 const FLAG_ACK: u8 = 0x1;
 const ERR_REFUSED_STREAM: u32 = 0x7;
 const ERR_NO_ERROR: u32 = 0x0;
+
+#[derive(Clone, PartialEq, prost::Message)]
+struct QueuedGrpcRequest {}
 
 #[derive(Debug)]
 struct RawFrame {
@@ -680,11 +683,11 @@ fn peer_max_concurrent_streams_one_yields_full_for_the_excess_submit() {
 
 #[test]
 fn pre_connect_queue_capacity_is_shared_across_request_shapes() {
-    // Before the TCP connect completes, Submit, OpenStream, and
-    // SubmitStreaming all wait in the same user-visible
+    // Before the TCP connect completes, Submit, SubmitGrpcUnary, and
+    // OpenStream all wait in the same user-visible
     // "pre-connect submit queue" budget. The cap is total, not one cap
     // per request shape; otherwise a service configured for two parked
-    // requests could silently park six.
+    // requests could silently park extra work.
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind peer");
     let addr = listener.local_addr().expect("peer addr");
     let peer = std::thread::spawn(move || {
@@ -724,13 +727,13 @@ fn pre_connect_queue_capacity_is_shared_across_request_shapes() {
     let outcomes = std::thread::scope(|scope| {
         let runtime_ref = &runtime;
         let submit = scope.spawn(move || {
+            let grpc_client = GrpcClient::new(client, GrpcLimits::default());
+            let msg = grpc_client
+                .unary_request("/queued.Service/Call", &QueuedGrpcRequest {})
+                .expect("compact gRPC user-facing request");
             runtime_ref
-                .call_blocking(
-                    client,
-                    Http2ClientMsg::Submit(Http2ClientRequest::get("/queued-submit")),
-                    Duration::from_secs(5),
-                )
-                .expect("queued submit returns")
+                .call_blocking(client, msg, Duration::from_secs(5))
+                .expect("queued compact gRPC submit returns")
         });
         let runtime_ref = &runtime;
         let open = scope.spawn(move || {
@@ -777,7 +780,7 @@ fn pre_connect_queue_capacity_is_shared_across_request_shapes() {
             outcome: Http2ClientOutcome::Replied(response),
             ..
         }) => assert_eq!(response.status.as_u16(), 200),
-        other => panic!("expected queued Submit to be Replied, got {other:?}"),
+        other => panic!("expected queued SubmitGrpcUnary to be Replied, got {other:?}"),
     }
     match outcomes.1 {
         CallOutcome::Replied(Http2ClientReply::Outcome {

@@ -144,8 +144,8 @@ Current local truth is still not a production claim:
   buffer reuse matters.
 
 Suggested next follow-ups:
-- Smaller HTTP request/response allocation shapes (`SmallVec` headers,
-  response body reuse) before making any public HTTP performance claim.
+- Smaller HTTP request/header allocation shapes (`SmallVec`/compact headers)
+  before making any public HTTP performance claim.
 - Reduce HTTP worker-turn/scheduling cost now that the obvious buffer waste is
   gone.
 - Add more repeated-run history before any public performance claim.
@@ -188,6 +188,40 @@ zero.
 
 Current verdict: keep the evidence, keep optimizing, do not make a production
 performance claim yet.
+
+## Phase 154 gRPC hot path
+
+Phase 153 made the problem visible: the original gRPC row was fresh-connection
+heavy, and the warmed rows still paid request/header/body allocation churn.
+Phase 154 adds the first real gRPC-specific hot path:
+
+- `GrpcClient::unary_request` now submits `Http2ClientMsg::SubmitGrpcUnary`.
+  The HTTP/2 client emits fixed gRPC headers directly instead of building a
+  generic `Http2ClientRequest` and `HeaderMap`.
+- `GrpcClient::unary_template(path)` stores a validated method path once.
+- `GrpcUnaryTemplate::preframed(&msg)` returns `GrpcPreframedUnary`, which
+  reuses a shared already length-prefixed gRPC body for fixed-payload hot calls.
+- `GrpcRouter::server_streaming_buffered` returns small finite
+  server-streaming responses without registering a response-source isolate per
+  call. `GrpcBufferedStreamLimits` makes the message count and framed response
+  byte cap explicit.
+- `HttpResponseBody::Shared(Arc<[u8]>)` lets fixed buffered response bytes stay
+  shared through HTTP/2 DATA framing.
+
+Final local macOS/aarch64 release sample:
+
+| row | p50 | p90 | load allocations / 32 ops |
+| --- | ---: | ---: | ---: |
+| `grpc_h2c_unary_close` | 1060 µs | 1191 µs | 608 |
+| `grpc_h2c_unary_warmed` | 1023 µs | 1166 µs | **56** |
+| `grpc_h2c_unary_pooled_concurrent` | **660 µs** | **793 µs** | **56** |
+| `grpc_h2c_server_streaming_steady_state` | 1271 µs | 1557 µs | 376 |
+
+This is materially better than the dynamic/wrapper path, especially for
+repeated fixed unary calls. It is still not production-fast. The `perf-process`
+rows for gRPC remain in the ~4k-5k allocation range for 32 ops because server
+and connection internals still allocate heavily. The next real work is protocol
+turn count plus server/client internal allocation shape, not more API wrappers.
 
 ## Phase 148 performance rows
 

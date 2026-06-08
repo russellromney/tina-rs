@@ -14,8 +14,7 @@ use http::{HeaderMap, Method, StatusCode, Version};
 use tina::prelude::*;
 use tina_http::{
     HttpClient, HttpClientConfig, HttpClientError, HttpConnectionPool, HttpPoolMsg, HttpRequest,
-    HttpRequestBody, HttpResponse, HttpResponseBody, HttpTarget, OutboundCall, PoolConfig,
-    TlsTrustRoots,
+    HttpRequestBody, HttpResponse, HttpTarget, OutboundCall, PoolConfig, TlsTrustRoots,
 };
 use tina_runtime::{
     CallOutcome, DefaultThreadedMailboxFactory, RuntimeCall, ThreadedRuntime,
@@ -304,12 +303,7 @@ fn pool_serial_admission_works_with_https_target() {
         .expect("driver delivers result")
         .expect("pool fetches over https");
     assert_eq!(result.status, StatusCode::OK);
-    let body = match &result.body {
-        HttpResponseBody::Buffered(b) => b.clone(),
-        HttpResponseBody::Stream(_)
-        | HttpResponseBody::ChunkedStream(_)
-        | HttpResponseBody::WebSocket(_) => Vec::new(),
-    };
+    let body = result.body.as_buffered().unwrap_or_default().to_vec();
     assert_eq!(body, b"pool-ok");
 
     let _ = runtime.shutdown();

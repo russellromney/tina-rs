@@ -12,7 +12,7 @@ use http::{HeaderValue, Method, StatusCode};
 use tina::prelude::*;
 use tina_http::{
     HttpClient, HttpClientConfig, HttpClientError, HttpClientMsg, HttpHostPolicy, HttpRequest,
-    HttpRequestBody, HttpResponse, HttpResponseBody, HttpTarget, HttpTransportPhase, TlsTrustRoots,
+    HttpRequestBody, HttpResponse, HttpTarget, HttpTransportPhase, TlsTrustRoots,
 };
 use tina_runtime::{
     CallError, CallOutcome, DefaultThreadedMailboxFactory, ThreadedRuntime, ThreadedRuntimeConfig,
@@ -137,12 +137,7 @@ fn run_one_fetch(
 }
 
 fn body_str(response: &HttpResponse) -> String {
-    let bytes = match &response.body {
-        HttpResponseBody::Buffered(b) => b.clone(),
-        HttpResponseBody::Stream(_)
-        | HttpResponseBody::ChunkedStream(_)
-        | HttpResponseBody::WebSocket(_) => Vec::new(),
-    };
+    let bytes = response.body.as_buffered().unwrap_or_default().to_vec();
     String::from_utf8(bytes).expect("utf8 body")
 }
 

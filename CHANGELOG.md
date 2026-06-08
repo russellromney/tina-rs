@@ -6,6 +6,30 @@ This file records completed work.
 
 ### Real Protocol Performance
 
+- gRPC hot path follow-through: native unary calls now use
+  `Http2ClientMsg::SubmitGrpcUnary`, a compact HTTP/2 client request shape that
+  emits fixed gRPC headers directly instead of rebuilding a public
+  `Http2ClientRequest` + `HeaderMap` per call. `GrpcClient::unary_template`
+  validates/stores the method path once, and `GrpcPreframedUnary` lets hot
+  repeated calls reuse an already length-prefixed request body through a shared
+  outbound body. The normal dynamic `unary_request` still encodes the protobuf
+  message per call; the preframed path is explicit for fixed-payload probes,
+  health checks, and command messages.
+- Finite gRPC server-streaming responses can now use
+  `GrpcRouter::server_streaming_buffered` with
+  `GrpcBufferedServerStreamingResponse`. Small fixed message streams are framed
+  once and returned as a shared buffered HTTP body, avoiding the old per-call
+  response-source isolate pool. `HttpResponseBody::Shared(Arc<[u8]>)` is a
+  first-class known-length body; HTTP/2 keeps it shared through response
+  admission and DATA framing.
+- Measured macOS/aarch64 release rows after the gRPC hot-path pass:
+  `grpc_h2c_unary_warmed` load-worker allocations are 56 / 32 ops
+  (down from 88 in the compact-only pass, and far below the old dynamic
+  request shape); `grpc_h2c_unary_pooled_concurrent` is also 56 / 32 ops with
+  p50/p90 around 660/793 µs in the final sample; finite server-streaming is
+  376 load-worker allocations / 32 ops with p50/p90 around 1271/1557 µs. The
+  whole-process gRPC rows still show thousands of allocations, so this is real
+  movement, not a production-performance claim.
 - HTTP/2 DATA payload ownership: a new `into_data_payload(frame) -> (Vec<u8>,
   usize)` moves the unpadded payload out of the owned frame and returns the
   flow-control wire length; the old cloning `data_payload` is removed so a

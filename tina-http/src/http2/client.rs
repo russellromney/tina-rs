@@ -28,6 +28,7 @@
 use std::collections::VecDeque;
 use std::convert::Infallible;
 use std::marker::PhantomData;
+use std::sync::Arc;
 use std::time::Duration;
 
 use http::{HeaderMap, Method, StatusCode};
@@ -235,6 +236,75 @@ impl Http2ClientRequest {
     }
 }
 
+/// One buffered gRPC unary request submitted to the client connection.
+///
+/// The connection emits the fixed gRPC request headers directly
+/// (`content-type: application/grpc+proto`, `te: trailers`) so warmed gRPC
+/// callers do not rebuild the same public `HeaderMap` on every call.
+#[derive(Debug, Clone)]
+pub struct Http2ClientGrpcUnaryRequest {
+    path: Arc<str>,
+    body: GrpcUnaryBody,
+}
+
+#[derive(Debug, Clone)]
+enum GrpcUnaryBody {
+    Owned(Vec<u8>),
+    Shared(Arc<[u8]>),
+}
+
+impl Http2ClientGrpcUnaryRequest {
+    pub(crate) fn owned(path: Arc<str>, body: Vec<u8>) -> Self {
+        Self {
+            path,
+            body: GrpcUnaryBody::Owned(body),
+        }
+    }
+
+    pub(crate) fn shared(path: Arc<str>, body: Arc<[u8]>) -> Self {
+        Self {
+            path,
+            body: GrpcUnaryBody::Shared(body),
+        }
+    }
+
+    pub fn body_len(&self) -> usize {
+        match &self.body {
+            GrpcUnaryBody::Owned(bytes) => bytes.len(),
+            GrpcUnaryBody::Shared(bytes) => bytes.len(),
+        }
+    }
+
+    pub fn body_is_shared(&self) -> bool {
+        matches!(self.body, GrpcUnaryBody::Shared(_))
+    }
+
+    pub fn path(&self) -> &str {
+        &self.path
+    }
+
+    #[cfg(test)]
+    pub(crate) fn path_arc(&self) -> &Arc<str> {
+        &self.path
+    }
+}
+
+impl GrpcUnaryBody {
+    fn is_empty(&self) -> bool {
+        match self {
+            Self::Owned(bytes) => bytes.is_empty(),
+            Self::Shared(bytes) => bytes.is_empty(),
+        }
+    }
+
+    fn into_outbound(self) -> OutboundBody {
+        match self {
+            Self::Owned(bytes) => OutboundBody::owned(bytes),
+            Self::Shared(bytes) => OutboundBody::shared(bytes),
+        }
+    }
+}
+
 /// A request whose body is streamed from a chunk source, rather than
 /// buffered up front. The connection sends HEADERS (without END_STREAM),
 /// then pulls body chunks from `source` via `ResponseChunkMsg::Next` —
@@ -326,6 +396,9 @@ pub enum Http2ClientMsg {
     /// captures the caller's request slot and replies later with one
     /// [`Http2ClientReply::Outcome`]. **Call-only** (see the type doc).
     Submit(Http2ClientRequest),
+    /// Submit a buffered gRPC unary request with fixed gRPC request headers.
+    /// **Call-only**.
+    SubmitGrpcUnary(Http2ClientGrpcUnaryRequest),
     /// Submit a request whose body is streamed from a chunk source. Like
     /// `Submit`, replies once with an [`Http2ClientReply::Outcome`] when
     /// the response completes. **Call-only**.
@@ -392,6 +465,81 @@ pub enum Http2ClientReply {
 }
 
 #[derive(Debug)]
+enum OutboundBody {
+    Owned { bytes: Vec<u8>, cursor: usize },
+    Shared { bytes: Arc<[u8]>, cursor: usize },
+}
+
+impl OutboundBody {
+    fn owned(bytes: Vec<u8>) -> Self {
+        Self::Owned { bytes, cursor: 0 }
+    }
+
+    fn shared(bytes: Arc<[u8]>) -> Self {
+        Self::Shared { bytes, cursor: 0 }
+    }
+
+    fn remaining(&self) -> usize {
+        match self {
+            Self::Owned { bytes, cursor } => bytes.len() - *cursor,
+            Self::Shared { bytes, cursor } => bytes.len() - *cursor,
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.remaining() == 0
+    }
+
+    fn slice(&self, len: usize) -> &[u8] {
+        match self {
+            Self::Owned { bytes, cursor } => &bytes[*cursor..*cursor + len],
+            Self::Shared { bytes, cursor } => &bytes[*cursor..*cursor + len],
+        }
+    }
+
+    fn append(&mut self, chunk: &[u8]) {
+        match self {
+            Self::Owned { bytes, cursor } => {
+                if *cursor > 0 {
+                    bytes.drain(..*cursor);
+                    *cursor = 0;
+                }
+                bytes.extend_from_slice(chunk);
+            }
+            Self::Shared { bytes, cursor } => {
+                let mut owned = bytes[*cursor..].to_vec();
+                owned.extend_from_slice(chunk);
+                *self = Self::Owned {
+                    bytes: owned,
+                    cursor: 0,
+                };
+            }
+        }
+    }
+
+    fn advance(&mut self, n: usize) {
+        match self {
+            Self::Owned { bytes, cursor } => {
+                *cursor += n;
+                if *cursor >= bytes.len() {
+                    bytes.clear();
+                    *cursor = 0;
+                }
+            }
+            Self::Shared { bytes, cursor } => {
+                *cursor += n;
+                if *cursor >= bytes.len() {
+                    *self = Self::Owned {
+                        bytes: Vec::new(),
+                        cursor: 0,
+                    };
+                }
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
 struct ActiveClientStream {
     id: u32,
     /// Caller awaiting the per-stream outcome. `Option` so we can take it
@@ -409,15 +557,12 @@ struct ActiveClientStream {
     pending_recv_window_credit: u32,
     response_content_length: Option<usize>,
     /// Bytes of request body still to send. Consumed as DATA frames are
-    /// admitted under stream + connection flow-control credit. For a
-    /// buffered request the whole body is here at admission; for a
-    /// streaming request, chunks are appended as they are pulled. An owned
-    /// `Vec` plus `outbound_cursor` (the offset of the first unsent byte)
-    /// replaces the old per-byte `VecDeque<u8>` drain; the sent prefix is
+    /// admitted under stream + connection flow-control credit. Ordinary
+    /// buffered/streaming requests use owned bytes; hot gRPC templates can use
+    /// shared preframed bytes without cloning the body per call. A cursor
+    /// replaces the old per-byte `VecDeque<u8>` drain; sent owned prefixes are
     /// compacted/dropped so a long request body does not stay resident.
-    outbound_body: Vec<u8>,
-    /// Offset of the first not-yet-sent byte in `outbound_body`.
-    outbound_cursor: usize,
+    outbound_body: OutboundBody,
     /// Streaming request body source. `None` for a buffered request.
     /// The connection pulls chunks via `ResponseChunkMsg::Next`.
     request_source: Option<tina::Address<ResponseChunkMsg, ResponseChunkReply>>,
@@ -456,7 +601,7 @@ impl ActiveClientStream {
         recv_window: i32,
         send_window: i32,
         waiter: tina::RequestContext<Http2ClientReply>,
-        outbound_body: Vec<u8>,
+        outbound_body: OutboundBody,
     ) -> Self {
         Self {
             id,
@@ -471,7 +616,6 @@ impl ActiveClientStream {
             pending_recv_window_credit: 0,
             response_content_length: None,
             outbound_body,
-            outbound_cursor: 0,
             // A buffered request has its whole body up front.
             request_source: None,
             request_complete: true,
@@ -492,41 +636,43 @@ impl ActiveClientStream {
         waiter: tina::RequestContext<Http2ClientReply>,
         source: tina::Address<ResponseChunkMsg, ResponseChunkReply>,
     ) -> Self {
-        let mut stream = Self::new(id, recv_window, send_window, waiter, Vec::new());
+        let mut stream = Self::new(
+            id,
+            recv_window,
+            send_window,
+            waiter,
+            OutboundBody::owned(Vec::new()),
+        );
         stream.request_source = Some(source);
         stream.request_complete = false;
         stream
     }
 
-    /// Unsent request-body bytes remaining after `outbound_cursor`.
+    /// Unsent request-body bytes remaining after the outbound cursor.
     fn outbound_remaining(&self) -> usize {
-        self.outbound_body.len() - self.outbound_cursor
+        self.outbound_body.remaining()
     }
 
     /// True while request-body bytes remain to be framed.
     fn has_outbound(&self) -> bool {
-        self.outbound_cursor < self.outbound_body.len()
+        !self.outbound_body.is_empty()
     }
 
     /// Append a streaming request-body chunk, compacting the already-sent
     /// prefix first so a long streaming request does not keep sent bytes
     /// resident.
     fn append_outbound(&mut self, bytes: &[u8]) {
-        if self.outbound_cursor > 0 {
-            self.outbound_body.drain(..self.outbound_cursor);
-            self.outbound_cursor = 0;
-        }
-        self.outbound_body.extend_from_slice(bytes);
+        self.outbound_body.append(bytes);
     }
 
     /// Mark `n` more request-body bytes consumed; drop the buffer once it is
     /// fully drained so a finished request body does not stay resident.
     fn advance_outbound(&mut self, n: usize) {
-        self.outbound_cursor += n;
-        if self.outbound_cursor >= self.outbound_body.len() {
-            self.outbound_body.clear();
-            self.outbound_cursor = 0;
-        }
+        self.outbound_body.advance(n);
+    }
+
+    fn outbound_slice(&self, len: usize) -> &[u8] {
+        self.outbound_body.slice(len)
     }
 }
 
@@ -540,6 +686,11 @@ pub struct Http2ClientConnection<S: Shard + 'static> {
     negotiated_alpn: Option<Vec<u8>>,
     /// Submits waiting for the connect + preface to flush.
     queued_submits: VecDeque<(Http2ClientRequest, tina::RequestContext<Http2ClientReply>)>,
+    /// Compact gRPC unary submits waiting for the connect + preface to flush.
+    queued_grpc_unary: VecDeque<(
+        Http2ClientGrpcUnaryRequest,
+        tina::RequestContext<Http2ClientReply>,
+    )>,
     /// Streaming submits waiting for the connect + preface to flush.
     queued_streaming: VecDeque<(
         Http2ClientStreamingRequest,
@@ -623,6 +774,7 @@ impl<S: Shard + 'static> Http2ClientConnection<S> {
             stream: None,
             negotiated_alpn: None,
             queued_submits: VecDeque::new(),
+            queued_grpc_unary: VecDeque::new(),
             queued_streaming: VecDeque::new(),
             queued_open: VecDeque::new(),
             streams: Vec::with_capacity(limits.max_concurrent_streams),
@@ -668,7 +820,10 @@ impl<S: Shard + 'static> Http2ClientConnection<S> {
     }
 
     fn queued_pre_connect_len(&self) -> usize {
-        self.queued_submits.len() + self.queued_streaming.len() + self.queued_open.len()
+        self.queued_submits.len()
+            + self.queued_grpc_unary.len()
+            + self.queued_streaming.len()
+            + self.queued_open.len()
     }
 
     fn pre_connect_queue_full(&self) -> bool {
@@ -721,6 +876,7 @@ impl<S: Shard + 'static> Isolate for Http2ClientConnection<S> {
             Http2ClientMsg::Stop => self.begin_goaway_shutdown(),
             Http2ClientMsg::Report
             | Http2ClientMsg::Submit(_)
+            | Http2ClientMsg::SubmitGrpcUnary(_)
             | Http2ClientMsg::SubmitStreaming(_)
             | Http2ClientMsg::OpenStream(_)
             | Http2ClientMsg::ResponseNext { .. } => self.wrong_lane_message(),
@@ -734,6 +890,7 @@ impl<S: Shard + 'static> Isolate for Http2ClientConnection<S> {
     ) -> Effect<Self> {
         match msg {
             Http2ClientMsg::Submit(req) => self.handle_submit(req, call),
+            Http2ClientMsg::SubmitGrpcUnary(req) => self.handle_submit_grpc_unary(req, call),
             Http2ClientMsg::SubmitStreaming(req) => self.handle_submit_streaming(req, call),
             Http2ClientMsg::OpenStream(req) => self.handle_open_stream(req, call),
             Http2ClientMsg::ResponseNext { stream_id } => {
@@ -833,6 +990,10 @@ impl<S: Shard + 'static> Http2ClientConnection<S> {
         for (req, waiter) in queued {
             self.admit_stream(req, waiter, &mut effects);
         }
+        let queued_grpc_unary = std::mem::take(&mut self.queued_grpc_unary);
+        for (req, waiter) in queued_grpc_unary {
+            self.admit_grpc_unary_stream(req, waiter, &mut effects);
+        }
         let queued_streaming = std::mem::take(&mut self.queued_streaming);
         for (req, waiter) in queued_streaming {
             self.admit_streaming_stream(req, waiter, &mut effects);
@@ -873,6 +1034,32 @@ impl<S: Shard + 'static> Http2ClientConnection<S> {
         }
         let mut effects: Vec<Effect<Self>> = Vec::new();
         self.admit_stream(req, waiter, &mut effects);
+        self.pump_io(&mut effects);
+        batch(effects)
+    }
+
+    fn handle_submit_grpc_unary(
+        &mut self,
+        req: Http2ClientGrpcUnaryRequest,
+        call: tina::CallContext<'_, Self>,
+    ) -> Effect<Self> {
+        let waiter = call.into_request_context();
+        if self.stream.is_none() {
+            if self.pre_connect_queue_full() {
+                self.report.admission_full += 1;
+                return reply_to_request::<Self>(
+                    waiter,
+                    Http2ClientReply::Outcome {
+                        stream_id: 0,
+                        outcome: Http2ClientOutcome::Full,
+                    },
+                );
+            }
+            self.queued_grpc_unary.push_back((req, waiter));
+            return noop();
+        }
+        let mut effects: Vec<Effect<Self>> = Vec::new();
+        self.admit_grpc_unary_stream(req, waiter, &mut effects);
         self.pump_io(&mut effects);
         batch(effects)
     }
@@ -1018,7 +1205,7 @@ impl<S: Shard + 'static> Http2ClientConnection<S> {
             self.limits.initial_stream_window,
             self.peer_initial_stream_window,
             waiter,
-            req.body,
+            OutboundBody::owned(req.body),
         );
         // An empty buffered body ended the request on the HEADERS frame.
         stream.request_end_sent = end_stream;
@@ -1032,6 +1219,80 @@ impl<S: Shard + 'static> Http2ClientConnection<S> {
         // The body bytes (if any) ride out as `flush_outbound_data` finds
         // stream + connection send-window credit. RFC 9113 §6.9: we must
         // not exceed either window.
+        self.flush_outbound_data();
+    }
+
+    fn admit_grpc_unary_stream(
+        &mut self,
+        req: Http2ClientGrpcUnaryRequest,
+        waiter: tina::RequestContext<Http2ClientReply>,
+        effects: &mut Vec<Effect<Self>>,
+    ) {
+        if self.goaway_received || self.closing_after_write {
+            self.report.admission_full += 1;
+            effects.push(reject_outcome(waiter, 0, Http2ClientOutcome::Closed));
+            return;
+        }
+        if self.stream_id_exhausted {
+            self.report.admission_full += 1;
+            effects.push(reject_outcome(
+                waiter,
+                0,
+                Http2ClientOutcome::ProtocolError(Http2ProtocolError::StreamIdExhausted),
+            ));
+            return;
+        }
+        if self.streams.len() >= self.limits.max_concurrent_streams {
+            self.report.admission_full += 1;
+            effects.push(reject_outcome(waiter, 0, Http2ClientOutcome::Full));
+            return;
+        }
+        if let Some(peer_cap) = self.peer_max_concurrent_streams {
+            if (self.streams.len() as u32) >= peer_cap {
+                self.report.admission_full += 1;
+                effects.push(reject_outcome(waiter, 0, Http2ClientOutcome::Full));
+                return;
+            }
+        }
+        if self.write_queue.len() >= self.limits.connection_outbound_queue_capacity {
+            self.report.outbound_queue_full += 1;
+            effects.push(reject_outcome(waiter, 0, Http2ClientOutcome::Full));
+            return;
+        }
+
+        let header_block = encode_grpc_unary_request_header_block(&self.target, &req.path);
+        if header_block.len() > self.peer_max_frame_size {
+            self.report.request_too_large += 1;
+            effects.push(reject_outcome(
+                waiter,
+                0,
+                Http2ClientOutcome::ProtocolError(Http2ProtocolError::OutboundHeadersTooLarge),
+            ));
+            return;
+        }
+
+        let stream_id = self.next_stream_id;
+        match self.next_stream_id.checked_add(2) {
+            Some(next) => self.next_stream_id = next,
+            None => self.stream_id_exhausted = true,
+        }
+        let end_stream = req.body.is_empty();
+        self.enqueue_frame(headers_frame(stream_id, end_stream, header_block));
+        let mut stream = ActiveClientStream::new(
+            stream_id,
+            self.limits.initial_stream_window,
+            self.peer_initial_stream_window,
+            waiter,
+            req.body.into_outbound(),
+        );
+        stream.request_end_sent = end_stream;
+        self.report.opened_streams += 1;
+        effects.push(emit_fact(ProtocolFact::Http2StreamOpened {
+            connection: self.connection_fact_id(),
+            stream: Http2StreamId::new(stream_id),
+            direction: ProtocolDirection::Outbound,
+        }));
+        self.streams.push(stream);
         self.flush_outbound_data();
     }
 
@@ -1193,7 +1454,7 @@ impl<S: Shard + 'static> Http2ClientConnection<S> {
                 self.limits.initial_stream_window,
                 self.peer_initial_stream_window,
                 waiter,
-                b,
+                OutboundBody::owned(b),
             ),
             Http2ClientRequestBody::Stream(source) => ActiveClientStream::new_streaming(
                 stream_id,
@@ -1429,7 +1690,6 @@ impl<S: Shard + 'static> Http2ClientConnection<S> {
                 // (buffered, or a streaming source that hit `Eof`) and this
                 // chunk drains the remaining bytes.
                 let is_last = credit == stream.outbound_remaining() && stream.request_complete;
-                let start = stream.outbound_cursor;
                 // Frame the DATA payload directly: 9-byte header then the
                 // unsent body slice. One copy here, versus the old per-byte
                 // `pop_front` loop plus a re-encode in `Frame::encode`.
@@ -1441,7 +1701,7 @@ impl<S: Shard + 'static> Http2ClientConnection<S> {
                     stream.id,
                     credit,
                 );
-                framed.extend_from_slice(&stream.outbound_body[start..start + credit]);
+                framed.extend_from_slice(stream.outbound_slice(credit));
                 stream.advance_outbound(credit);
                 if is_last {
                     stream.request_end_sent = true;
@@ -2024,6 +2284,16 @@ impl<S: Shard + 'static> Http2ClientConnection<S> {
                 },
             ));
         }
+        let queued_grpc_unary = std::mem::take(&mut self.queued_grpc_unary);
+        for (_, waiter) in queued_grpc_unary {
+            effects.push(reply_to_request::<Self>(
+                waiter,
+                Http2ClientReply::Outcome {
+                    stream_id: 0,
+                    outcome: outcome.clone(),
+                },
+            ));
+        }
         let queued_streaming = std::mem::take(&mut self.queued_streaming);
         for (_, waiter) in queued_streaming {
             effects.push(reply_to_request::<Self>(
@@ -2255,6 +2525,16 @@ impl<S: Shard + 'static> Http2ClientConnection<S> {
                 },
             ));
         }
+        let queued_grpc_unary = std::mem::take(&mut self.queued_grpc_unary);
+        for (_, waiter) in queued_grpc_unary {
+            effects.push(reply_to_request::<Self>(
+                waiter,
+                Http2ClientReply::Outcome {
+                    stream_id: 0,
+                    outcome: outcome.clone(),
+                },
+            ));
+        }
         let queued_streaming = std::mem::take(&mut self.queued_streaming);
         for (_, waiter) in queued_streaming {
             effects.push(reply_to_request::<Self>(
@@ -2327,6 +2607,18 @@ fn push_setting(out: &mut Vec<u8>, id: u16, value: u32) {
 
 fn encode_request_headers(target: &Http2Target, req: &Http2ClientRequest) -> Vec<u8> {
     encode_request_header_block(target, &req.method, &req.path, &req.headers)
+}
+
+fn encode_grpc_unary_request_header_block(target: &Http2Target, path: &str) -> Vec<u8> {
+    let mut block = Vec::new();
+    encode_literal_header(":method", Method::POST.as_str(), &mut block);
+    let scheme = if target.is_tls() { "https" } else { "http" };
+    encode_literal_header(":scheme", scheme, &mut block);
+    encode_literal_header(":path", path, &mut block);
+    encode_literal_header(":authority", target.authority(), &mut block);
+    encode_literal_header("content-type", "application/grpc+proto", &mut block);
+    encode_literal_header("te", "trailers", &mut block);
+    block
 }
 
 fn encode_request_header_block(
@@ -2562,6 +2854,16 @@ mod tests {
 
         assert_eq!(client.pending_write.len(), CLIENT_WRITE_COALESCE_LIMIT);
         assert_eq!(client.write_queue.len(), 1);
+    }
+
+    #[test]
+    fn outbound_body_append_preserves_unsent_prefix_after_cursor() {
+        let mut body = OutboundBody::owned(b"abcdef".to_vec());
+        body.advance(2);
+        body.append(b"gh");
+
+        assert_eq!(body.remaining(), 6);
+        assert_eq!(body.slice(6), b"cdefgh");
     }
 
     #[test]

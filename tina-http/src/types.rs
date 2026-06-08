@@ -2,8 +2,10 @@
 //! and service isolates.
 //!
 //! Wraps the `http` crate's `Method`, `StatusCode`, `HeaderMap`, and
-//! `Version` types. Bodies are either buffered (`Vec<u8>`) or streamed
-//! through a chunk-source isolate.
+//! `Version` types. Bodies are either buffered (`Vec<u8>` or shared bytes) or
+//! streamed through a chunk-source isolate.
+
+use std::sync::Arc;
 
 use http::{HeaderMap, Method, StatusCode, Version};
 
@@ -163,6 +165,8 @@ pub struct HttpResponse {
 pub enum HttpResponseBody {
     /// All response bytes built up-front by the service.
     Buffered(Vec<u8>),
+    /// Immutable built-up-front response bytes reusable across calls.
+    Shared(Arc<[u8]>),
     /// Streaming source with declared length. The connection isolate
     /// pulls chunks via `call(stream.source, ResponseChunkMsg::Next,
     /// t).then(...)` until `ResponseChunkReply::Eof`.
@@ -183,6 +187,7 @@ impl HttpResponseBody {
     pub fn as_buffered(&self) -> Option<&[u8]> {
         match self {
             Self::Buffered(bytes) => Some(bytes),
+            Self::Shared(bytes) => Some(bytes),
             Self::Stream(_) | Self::ChunkedStream(_) | Self::WebSocket(_) => None,
         }
     }
@@ -200,6 +205,7 @@ impl HttpResponseBody {
     pub fn declared_length(&self) -> Option<usize> {
         match self {
             Self::Buffered(bytes) => Some(bytes.len()),
+            Self::Shared(bytes) => Some(bytes.len()),
             Self::Stream(s) => Some(s.content_length),
             Self::ChunkedStream(_) | Self::WebSocket(_) => None,
         }
@@ -224,6 +230,7 @@ impl PartialEq<[u8]> for HttpResponseBody {
     fn eq(&self, other: &[u8]) -> bool {
         match self {
             Self::Buffered(bytes) => bytes == other,
+            Self::Shared(bytes) => bytes.as_ref() == other,
             Self::Stream(_) | Self::ChunkedStream(_) | Self::WebSocket(_) => false,
         }
     }
@@ -286,6 +293,14 @@ impl HttpResponse {
     pub fn with_body(status: StatusCode, body: Vec<u8>) -> Self {
         let mut response = Self::with_status(status);
         response.body = HttpResponseBody::Buffered(body);
+        response
+    }
+
+    /// Builds a response with immutable shared bytes as body. Caller is
+    /// responsible for setting `Content-Type` if relevant.
+    pub fn with_shared_body(status: StatusCode, body: Arc<[u8]>) -> Self {
+        let mut response = Self::with_status(status);
+        response.body = HttpResponseBody::Shared(body);
         response
     }
 

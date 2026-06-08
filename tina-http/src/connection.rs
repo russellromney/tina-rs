@@ -1175,6 +1175,12 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
             {
                 Some(body_bytes.len())
             }
+            HttpResponseBody::Shared(body_bytes)
+                if self.metrics.is_none()
+                    && body_bytes.len() <= COALESCE_BUFFERED_RESPONSE_BODY_LIMIT =>
+            {
+                Some(body_bytes.len())
+            }
             _ => None,
         };
         let head_bytes = if let Some(body_len) = coalesced_body_len {
@@ -1190,6 +1196,25 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
                 } else if !body_bytes.is_empty() {
                     self.pending_response = head_bytes;
                     self.pending_buffered_body = Some(body_bytes);
+                } else {
+                    self.pending_response = head_bytes;
+                }
+                if self.will_close
+                    && matches!(self.transport, HttpTransport::Tcp(_))
+                    && self.pending_buffered_body.is_none()
+                {
+                    self.write_pending_close()
+                } else {
+                    self.write_pending()
+                }
+            }
+            HttpResponseBody::Shared(body_bytes) => {
+                if coalesced_body_len.is_some() {
+                    self.pending_response = head_bytes;
+                    self.pending_response.extend_from_slice(&body_bytes);
+                } else if !body_bytes.is_empty() {
+                    self.pending_response = head_bytes;
+                    self.pending_buffered_body = Some(body_bytes.to_vec());
                 } else {
                     self.pending_response = head_bytes;
                 }

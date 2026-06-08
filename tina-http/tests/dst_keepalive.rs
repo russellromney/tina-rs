@@ -23,8 +23,8 @@ use http::StatusCode;
 use tina::ShardId;
 use tina::prelude::*;
 use tina_http::{
-    HttpClientConfig, HttpRequest, HttpResponseBody, HttpTarget, KeepaliveConnection,
-    KeepaliveConnectionMsg, KeepaliveOutcome,
+    HttpClientConfig, HttpRequest, HttpTarget, KeepaliveConnection, KeepaliveConnectionMsg,
+    KeepaliveOutcome,
 };
 use tina_runtime::{CallOutcome, RuntimeCall, call, stable_trace_hash};
 use tina_sim::{
@@ -180,12 +180,7 @@ fn keepalive_connection_replays_byte_identical() {
         } => {
             assert_eq!(response.status, StatusCode::OK);
             assert!(!must_retire, "scripted server did not signal close");
-            let body = match response.body {
-                HttpResponseBody::Buffered(b) => b,
-                HttpResponseBody::Stream(_) => Vec::new(),
-                HttpResponseBody::ChunkedStream(_) => Vec::new(),
-                HttpResponseBody::WebSocket(_) => Vec::new(),
-            };
+            let body = response.body.as_buffered().unwrap_or_default().to_vec();
             assert_eq!(body, b"hello");
         }
         other => panic!("expected successful request reply, got {other:?}"),

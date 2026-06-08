@@ -9,6 +9,7 @@ use std::collections::VecDeque;
 use std::convert::Infallible;
 use std::marker::PhantomData;
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Duration;
 
 use http::Version;
@@ -299,9 +300,35 @@ struct RequestDataChunk {
 }
 
 #[derive(Debug)]
+enum ResponseBytes {
+    Owned(Vec<u8>),
+    Shared(Arc<[u8]>),
+}
+
+impl ResponseBytes {
+    fn len(&self) -> usize {
+        match self {
+            Self::Owned(bytes) => bytes.len(),
+            Self::Shared(bytes) => bytes.len(),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    fn chunks(&self, chunk_size: usize) -> std::slice::Chunks<'_, u8> {
+        match self {
+            Self::Owned(bytes) => bytes.chunks(chunk_size),
+            Self::Shared(bytes) => bytes.chunks(chunk_size),
+        }
+    }
+}
+
+#[derive(Debug)]
 struct PendingResponse {
     header_block: Vec<u8>,
-    body: Vec<u8>,
+    body: ResponseBytes,
     trailers: Option<Vec<u8>>,
 }
 
@@ -1424,6 +1451,25 @@ impl<S: Shard + 'static, M: Http2ServiceMessage> Http2Connection<S, M> {
                 }
                 bytes.len()
             }
+            HttpResponseBody::Shared(bytes) => {
+                if bytes.len() > self.limits.max_response_body_bytes {
+                    self.report.stream_full += 1;
+                    self.enqueue_frame(rst_stream_frame(stream_id, ERR_ENHANCE_YOUR_CALM))?;
+                    self.remove_stream(stream_id);
+                    self.report.closed_streams += 1;
+                    self.emit_protocol_fact(
+                        effects,
+                        ProtocolFact::Http2StreamReset {
+                            connection: self.connection_fact_id(),
+                            stream: Http2StreamId::new(stream_id),
+                            direction: ProtocolDirection::Outbound,
+                            reason: Http2ResetReason::EnhanceYourCalm,
+                        },
+                    );
+                    return Ok(());
+                }
+                bytes.len()
+            }
             HttpResponseBody::Stream(stream) => {
                 let source = stream.source;
                 let content_length = stream.content_length;
@@ -1445,7 +1491,8 @@ impl<S: Shard + 'static, M: Http2ServiceMessage> Http2Connection<S, M> {
         let block = encode_response_headers(&response, body_len);
         let trailers = encode_response_trailers(&response);
         let body = match response.body {
-            HttpResponseBody::Buffered(bytes) => bytes,
+            HttpResponseBody::Buffered(bytes) => ResponseBytes::Owned(bytes),
+            HttpResponseBody::Shared(bytes) => ResponseBytes::Shared(bytes),
             // Stream/ChunkedStream/WebSocket all returned above.
             _ => unreachable!("non-buffered response bodies handled above"),
         };

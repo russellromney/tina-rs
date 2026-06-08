@@ -11,6 +11,7 @@ use std::convert::Infallible;
 use std::io::{Read, Write};
 use std::marker::PhantomData;
 use std::net::{SocketAddr, TcpStream};
+use std::sync::Arc;
 use std::time::Duration;
 
 use http::{HeaderMap, HeaderValue, Method, StatusCode};
@@ -48,6 +49,40 @@ impl Default for GrpcLimits {
     fn default() -> Self {
         Self {
             max_message_bytes: 512 * 1024,
+        }
+    }
+}
+
+/// Service-owned bounds for a finite buffered server-streaming response.
+///
+/// Use this only for small fixed streams. If the stream can grow with request
+/// input, use source-backed server streaming instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GrpcBufferedStreamLimits {
+    /// Per-message protobuf limit.
+    pub message: GrpcLimits,
+    /// Maximum number of messages to buffer.
+    pub max_messages: usize,
+    /// Maximum bytes in the final gRPC-framed response body.
+    pub max_body_bytes: usize,
+}
+
+impl GrpcBufferedStreamLimits {
+    pub fn new(message: GrpcLimits, max_messages: usize, max_body_bytes: usize) -> Self {
+        Self {
+            message,
+            max_messages,
+            max_body_bytes,
+        }
+    }
+}
+
+impl Default for GrpcBufferedStreamLimits {
+    fn default() -> Self {
+        Self {
+            message: GrpcLimits::default(),
+            max_messages: 64,
+            max_body_bytes: 512 * 1024,
         }
     }
 }
@@ -182,6 +217,7 @@ pub enum GrpcError {
     MessageTooLarge { len: usize, max: usize },
     Decode,
     EncodeTooLarge { len: usize, max: usize },
+    TooManyMessages { count: usize, max: usize },
     Io(String),
     MissingTrailers,
 }
@@ -220,6 +256,11 @@ trait ErasedUnary: Send + Sync {
 }
 
 trait ErasedServerStreaming: Send + Sync {
+    fn call(&self, request: HttpRequest, limits: GrpcLimits) -> HttpResponse;
+    fn call_http2(&self, request: GrpcHttp2Request, limits: GrpcLimits) -> HttpResponse;
+}
+
+trait ErasedBufferedServerStreaming: Send + Sync {
     fn call(&self, request: HttpRequest, limits: GrpcLimits) -> HttpResponse;
     fn call_http2(&self, request: GrpcHttp2Request, limits: GrpcLimits) -> HttpResponse;
 }
@@ -322,6 +363,11 @@ struct ServerStreamingHandler<Req, F> {
     _types: PhantomData<fn(Req)>,
 }
 
+struct BufferedServerStreamingHandler<Req, F> {
+    f: F,
+    _types: PhantomData<fn(Req)>,
+}
+
 struct ClientStreamingHandler<Req, Resp, F> {
     f: F,
     _types: PhantomData<fn(Req) -> Resp>,
@@ -372,6 +418,60 @@ impl GrpcServerStreamingResponse {
         let source = IterBodySource::<S>::register(runtime, chunks.into_iter(), mailbox_capacity)
             .map_err(|error| GrpcError::Io(format!("{error:?}")))?;
         Ok(Self { source })
+    }
+}
+
+/// Response returned by a finite buffered server-streaming gRPC handler.
+///
+/// Use this when the service already has a small fixed stream. It emits a
+/// normal gRPC response body with multiple length-prefixed messages and final
+/// OK trailers, without registering a response-source isolate for each call.
+#[derive(Debug, Clone)]
+pub struct GrpcBufferedServerStreamingResponse {
+    body: Arc<[u8]>,
+}
+
+impl GrpcBufferedServerStreamingResponse {
+    fn from_framed_body(body: Vec<u8>) -> Self {
+        Self {
+            body: Arc::from(body.into_boxed_slice()),
+        }
+    }
+
+    pub fn from_messages<T, I>(
+        messages: I,
+        limits: GrpcBufferedStreamLimits,
+    ) -> Result<Self, GrpcError>
+    where
+        T: Message,
+        I: IntoIterator<Item = T>,
+    {
+        let mut body = Vec::new();
+        for (idx, message) in messages.into_iter().enumerate() {
+            let count = idx + 1;
+            if count > limits.max_messages {
+                return Err(GrpcError::TooManyMessages {
+                    count,
+                    max: limits.max_messages,
+                });
+            }
+            let message_len = message.encoded_len();
+            let framed_len = GRPC_FRAME_HEADER_LEN
+                .checked_add(message_len)
+                .ok_or(GrpcError::BadFrame)?;
+            let next_len = body
+                .len()
+                .checked_add(framed_len)
+                .ok_or(GrpcError::BadFrame)?;
+            if next_len > limits.max_body_bytes {
+                return Err(GrpcError::EncodeTooLarge {
+                    len: next_len,
+                    max: limits.max_body_bytes,
+                });
+            }
+            append_grpc_message(&mut body, &message, limits.message)?;
+        }
+        Ok(Self::from_framed_body(body))
     }
 }
 
@@ -659,6 +759,59 @@ where
     }
 }
 
+impl<Req, F> ErasedBufferedServerStreaming for BufferedServerStreamingHandler<Req, F>
+where
+    Req: Message + Default + Send + Sync + 'static,
+    F: Fn(GrpcRequest<Req>) -> Result<GrpcBufferedServerStreamingResponse, GrpcStatus>
+        + Send
+        + Sync
+        + 'static,
+{
+    fn call(&self, request: HttpRequest, limits: GrpcLimits) -> HttpResponse {
+        let HttpRequest {
+            path,
+            headers,
+            body,
+            ..
+        } = request;
+        match decode_unary_parts::<Req>(&headers, &body, limits) {
+            Ok(message) => match (self.f)(GrpcRequest { path, message }) {
+                Ok(response) => grpc_http_response_shared(response.body, GrpcStatus::ok()),
+                Err(status) => grpc_http_response(Vec::new(), status),
+            },
+            Err(error) => grpc_http_response(Vec::new(), status_for_error(error)),
+        }
+    }
+
+    fn call_http2(&self, request: GrpcHttp2Request, limits: GrpcLimits) -> HttpResponse {
+        let GrpcHttp2Request {
+            path,
+            body,
+            content_type_ok,
+            unsupported_encoding,
+            ..
+        } = request;
+        let GrpcHttp2Body::Buffered(body) = body else {
+            return grpc_http_response(
+                Vec::new(),
+                GrpcStatus::new(GrpcStatusCode::InvalidArgument),
+            );
+        };
+        match decode_unary_body_with_flags::<Req>(
+            &body,
+            content_type_ok,
+            unsupported_encoding,
+            limits,
+        ) {
+            Ok(message) => match (self.f)(GrpcRequest { path, message }) {
+                Ok(response) => grpc_http_response_shared(response.body, GrpcStatus::ok()),
+                Err(status) => grpc_http_response(Vec::new(), status),
+            },
+            Err(error) => grpc_http_response(Vec::new(), status_for_error(error)),
+        }
+    }
+}
+
 /// Typed client-streaming request passed to user handlers.
 #[derive(Debug, Clone)]
 pub struct GrpcClientStreamingRequest<T> {
@@ -808,6 +961,7 @@ pub struct GrpcRouter<S: Shard> {
     limits: GrpcLimits,
     unary: BTreeMap<String, Box<dyn ErasedUnary>>,
     server_streaming: BTreeMap<String, Box<dyn ErasedServerStreaming>>,
+    buffered_server_streaming: BTreeMap<String, Box<dyn ErasedBufferedServerStreaming>>,
     client_streaming: BTreeMap<String, Box<dyn ErasedClientStreaming>>,
     streaming: BTreeMap<String, Box<dyn ErasedStreaming>>,
     streaming_raw: BTreeMap<String, Box<dyn ErasedStreamingRaw>>,
@@ -910,6 +1064,7 @@ impl<S: Shard + 'static> GrpcRouter<S> {
             limits,
             unary: BTreeMap::new(),
             server_streaming: BTreeMap::new(),
+            buffered_server_streaming: BTreeMap::new(),
             client_streaming: BTreeMap::new(),
             streaming: BTreeMap::new(),
             streaming_raw: BTreeMap::new(),
@@ -946,6 +1101,24 @@ impl<S: Shard + 'static> GrpcRouter<S> {
         self.server_streaming.insert(
             path.into(),
             Box::new(ServerStreamingHandler::<Req, F> {
+                f,
+                _types: PhantomData,
+            }),
+        );
+        self
+    }
+
+    pub fn server_streaming_buffered<Req, F>(mut self, path: impl Into<String>, f: F) -> Self
+    where
+        Req: Message + Default + Send + Sync + 'static,
+        F: Fn(GrpcRequest<Req>) -> Result<GrpcBufferedServerStreamingResponse, GrpcStatus>
+            + Send
+            + Sync
+            + 'static,
+    {
+        self.buffered_server_streaming.insert(
+            path.into(),
+            Box::new(BufferedServerStreamingHandler::<Req, F> {
                 f,
                 _types: PhantomData,
             }),
@@ -1025,6 +1198,9 @@ impl<S: Shard + 'static> GrpcRouter<S> {
         if let Some(handler) = self.streaming_raw.get(&request.path) {
             return handler.call(request, self.limits);
         }
+        if let Some(handler) = self.buffered_server_streaming.get(&request.path) {
+            return handler.call(request, self.limits);
+        }
         let Some(handler) = self.server_streaming.get(&request.path) else {
             return grpc_http_response(Vec::new(), GrpcStatus::new(GrpcStatusCode::Unimplemented));
         };
@@ -1044,6 +1220,9 @@ impl<S: Shard + 'static> GrpcRouter<S> {
             return handler.call_http2(request, self.limits);
         }
         if let Some(handler) = self.client_streaming.get(&request.path) {
+            return handler.call_http2(request, self.limits);
+        }
+        if let Some(handler) = self.buffered_server_streaming.get(&request.path) {
             return handler.call_http2(request, self.limits);
         }
         let Some(handler) = self.server_streaming.get(&request.path) else {
@@ -1338,6 +1517,24 @@ pub fn encode_grpc_message<T: Message>(
     Ok(out)
 }
 
+fn append_grpc_message<T: Message>(
+    out: &mut Vec<u8>,
+    message: &T,
+    limits: GrpcLimits,
+) -> Result<(), GrpcError> {
+    let len = message.encoded_len();
+    if len > limits.max_message_bytes {
+        return Err(GrpcError::EncodeTooLarge {
+            len,
+            max: limits.max_message_bytes,
+        });
+    }
+    out.reserve(GRPC_FRAME_HEADER_LEN + len);
+    out.push(0);
+    out.extend_from_slice(&(len as u32).to_be_bytes());
+    message.encode(out).map_err(|_| GrpcError::BadFrame)
+}
+
 pub(crate) fn decode_one_grpc_message<T: Message + Default>(
     body: &[u8],
     cursor: &mut usize,
@@ -1402,6 +1599,16 @@ pub(crate) fn grpc_status_trailers_block(status: GrpcStatus) -> Vec<u8> {
 
 fn grpc_http_response(body: Vec<u8>, status: GrpcStatus) -> HttpResponse {
     let mut response = HttpResponse::with_body(StatusCode::OK, body);
+    response.headers.insert(
+        http::header::CONTENT_TYPE,
+        HeaderValue::from_static("application/grpc+proto"),
+    );
+    insert_grpc_status_headers(&mut response.headers, status);
+    response
+}
+
+fn grpc_http_response_shared(body: Arc<[u8]>, status: GrpcStatus) -> HttpResponse {
+    let mut response = HttpResponse::with_shared_body(StatusCode::OK, body);
     response.headers.insert(
         http::header::CONTENT_TYPE,
         HeaderValue::from_static("application/grpc+proto"),
@@ -1476,7 +1683,9 @@ fn status_for_error(error: GrpcError) -> GrpcStatus {
             format!("request message {len} exceeds cap {max}"),
         ),
         GrpcError::BadFrame | GrpcError::Decode => GrpcStatus::new(GrpcStatusCode::InvalidArgument),
-        GrpcError::EncodeTooLarge { .. } => GrpcStatus::new(GrpcStatusCode::ResourceExhausted),
+        GrpcError::EncodeTooLarge { .. } | GrpcError::TooManyMessages { .. } => {
+            GrpcStatus::new(GrpcStatusCode::ResourceExhausted)
+        }
         GrpcError::Status(status) => status,
         GrpcError::Io(_) | GrpcError::MissingTrailers => GrpcStatus::new(GrpcStatusCode::Unknown),
     }
@@ -1856,5 +2065,45 @@ mod tests {
         let status = decode_grpc_status_trailers(&block).unwrap();
         assert_eq!(status.code, GrpcStatusCode::ResourceExhausted);
         assert_eq!(status.message.as_deref(), Some(message.as_str()));
+    }
+
+    #[test]
+    fn buffered_server_streaming_from_messages_rejects_oversized_message() {
+        let limits = GrpcBufferedStreamLimits::new(
+            GrpcLimits {
+                max_message_bytes: 1,
+            },
+            4,
+            1024,
+        );
+        let err =
+            GrpcBufferedServerStreamingResponse::from_messages([Ping { value: u64::MAX }], limits)
+                .expect_err("message exceeds cap");
+
+        assert!(matches!(err, GrpcError::EncodeTooLarge { max: 1, .. }));
+    }
+
+    #[test]
+    fn buffered_server_streaming_from_messages_rejects_too_many_messages() {
+        let limits = GrpcBufferedStreamLimits::new(GrpcLimits::default(), 1, 1024);
+        let err = GrpcBufferedServerStreamingResponse::from_messages(
+            [Ping { value: 1 }, Ping { value: 2 }],
+            limits,
+        )
+        .expect_err("too many messages");
+
+        assert!(matches!(
+            err,
+            GrpcError::TooManyMessages { count: 2, max: 1 }
+        ));
+    }
+
+    #[test]
+    fn buffered_server_streaming_from_messages_rejects_total_body_cap() {
+        let limits = GrpcBufferedStreamLimits::new(GrpcLimits::default(), 4, 4);
+        let err = GrpcBufferedServerStreamingResponse::from_messages([Ping { value: 1 }], limits)
+            .expect_err("framed body exceeds cap");
+
+        assert!(matches!(err, GrpcError::EncodeTooLarge { max: 4, .. }));
     }
 }

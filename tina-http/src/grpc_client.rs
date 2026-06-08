@@ -34,6 +34,8 @@
 //! [`decode_unary`]: GrpcClient::decode_unary
 //! [`frame`]: GrpcClient::frame
 
+use std::sync::Arc;
+
 use http::{HeaderMap, HeaderValue, Method, StatusCode};
 use prost::Message;
 use tina::{Address, Shard};
@@ -44,9 +46,9 @@ use crate::grpc::{
 };
 use crate::grpc::{encode_grpc_message, grpc_status_from_header_map};
 use crate::http2::{
-    Http2ClientConnection, Http2ClientLimits, Http2ClientMsg, Http2ClientOutcome, Http2ClientReply,
-    Http2ClientRequest, Http2ClientRequestBody, Http2ClientStreamCall, Http2ResponseChunk,
-    Http2Target,
+    Http2ClientConnection, Http2ClientGrpcUnaryRequest, Http2ClientLimits, Http2ClientMsg,
+    Http2ClientOutcome, Http2ClientReply, Http2ClientRequestBody, Http2ClientStreamCall,
+    Http2ResponseChunk, Http2Target,
 };
 use crate::streaming::{ResponseChunkMsg, ResponseChunkReply};
 
@@ -154,6 +156,53 @@ pub enum GrpcUnaryOutcome<Resp> {
     Malformed(GrpcError),
 }
 
+/// Reusable builder for one gRPC unary method path.
+///
+/// This validates and stores the method path once. Each request still
+/// encodes the protobuf message into a fresh gRPC frame, but it skips the
+/// per-call path allocation and public HTTP header map construction.
+#[derive(Debug, Clone)]
+pub struct GrpcUnaryTemplate {
+    path: Arc<str>,
+    limits: GrpcLimits,
+}
+
+impl GrpcUnaryTemplate {
+    pub fn request<Req: Message>(&self, message: &Req) -> Result<Http2ClientMsg, GrpcError> {
+        let body = encode_grpc_message(message, self.limits)?;
+        Ok(Http2ClientMsg::SubmitGrpcUnary(
+            Http2ClientGrpcUnaryRequest::owned(Arc::clone(&self.path), body),
+        ))
+    }
+
+    /// Pre-encode one request message for hot repeated unary calls with an
+    /// identical payload. This is useful for health checks, perf probes, and
+    /// fixed command messages; dynamic requests should use [`request`](Self::request).
+    pub fn preframed<Req: Message>(&self, message: &Req) -> Result<GrpcPreframedUnary, GrpcError> {
+        let body = encode_grpc_message(message, self.limits)?;
+        Ok(GrpcPreframedUnary {
+            path: Arc::clone(&self.path),
+            body: Arc::from(body.into_boxed_slice()),
+        })
+    }
+}
+
+/// A reusable already-framed gRPC unary request body.
+#[derive(Debug, Clone)]
+pub struct GrpcPreframedUnary {
+    path: Arc<str>,
+    body: Arc<[u8]>,
+}
+
+impl GrpcPreframedUnary {
+    pub fn request(&self) -> Http2ClientMsg {
+        Http2ClientMsg::SubmitGrpcUnary(Http2ClientGrpcUnaryRequest::shared(
+            Arc::clone(&self.path),
+            Arc::clone(&self.body),
+        ))
+    }
+}
+
 /// Native gRPC client over one HTTP/2 client connection.
 ///
 /// Holds the connection isolate address plus the gRPC limits. Stateless:
@@ -198,10 +247,10 @@ impl GrpcClient {
         self.connection
     }
 
-    /// Build the [`Http2ClientMsg::Submit`] for a unary call to
+    /// Build the [`Http2ClientMsg::SubmitGrpcUnary`] for a unary call to
     /// `full_method_path` (e.g. `"/pkg.Service/Method"`). The request
-    /// message is encoded as one length-prefixed gRPC frame; the gRPC
-    /// content-type and `te: trailers` headers are set.
+    /// message is encoded as one length-prefixed gRPC frame; the HTTP/2
+    /// connection emits the fixed gRPC headers directly.
     ///
     /// Returns [`GrpcError::EncodeTooLarge`] if the request exceeds the
     /// configured message cap, before anything reaches the wire.
@@ -210,14 +259,16 @@ impl GrpcClient {
         full_method_path: &str,
         message: &Req,
     ) -> Result<Http2ClientMsg, GrpcError> {
+        self.unary_template(full_method_path)?.request(message)
+    }
+
+    /// Reuse the validated method path for repeated unary calls.
+    pub fn unary_template(&self, full_method_path: &str) -> Result<GrpcUnaryTemplate, GrpcError> {
         validate_grpc_path(full_method_path)?;
-        let body = encode_grpc_message(message, self.limits)?;
-        Ok(Http2ClientMsg::Submit(Http2ClientRequest {
-            method: Method::POST,
-            path: full_method_path.to_owned(),
-            headers: grpc_headers(),
-            body,
-        }))
+        Ok(GrpcUnaryTemplate {
+            path: Arc::from(full_method_path),
+            limits: self.limits,
+        })
     }
 
     /// Decode a connection [`Http2ClientOutcome`] into a typed unary gRPC
@@ -677,5 +728,63 @@ mod tests {
             .bidi_request("pkg.Service/Chat", source)
             .expect_err("relative bidi path is invalid");
         assert!(matches!(err, GrpcError::InvalidPath(path) if path == "pkg.Service/Chat"));
+    }
+
+    #[test]
+    fn unary_request_uses_compact_grpc_http2_submit() {
+        let client = dummy_client();
+        let msg = client
+            .unary_request("/pkg.Service/Method", &Empty {})
+            .expect("valid unary request");
+
+        match msg {
+            Http2ClientMsg::SubmitGrpcUnary(req) => {
+                assert_eq!(req.path(), "/pkg.Service/Method");
+                assert_eq!(req.body_len(), GRPC_FRAME_HEADER_LEN);
+                assert!(!req.body_is_shared());
+            }
+            other => panic!("expected compact gRPC submit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unary_template_reuses_validated_path() {
+        let client = dummy_client();
+        let template = client
+            .unary_template("/pkg.Service/Method")
+            .expect("valid template");
+
+        let first = template.request(&Empty {}).expect("first request");
+        let second = template.request(&Empty {}).expect("second request");
+        match (first, second) {
+            (Http2ClientMsg::SubmitGrpcUnary(first), Http2ClientMsg::SubmitGrpcUnary(second)) => {
+                assert!(Arc::ptr_eq(first.path_arc(), second.path_arc()));
+                assert!(!first.body_is_shared());
+                assert!(!second.body_is_shared());
+            }
+            other => panic!("expected compact gRPC submits, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn preframed_unary_reuses_path_and_body() {
+        let client = dummy_client();
+        let template = client
+            .unary_template("/pkg.Service/Method")
+            .expect("valid template");
+        let preframed = template.preframed(&Empty {}).expect("preframe");
+
+        let first = preframed.request();
+        let second = preframed.request();
+        match (first, second) {
+            (Http2ClientMsg::SubmitGrpcUnary(first), Http2ClientMsg::SubmitGrpcUnary(second)) => {
+                assert!(Arc::ptr_eq(first.path_arc(), second.path_arc()));
+                assert_eq!(first.body_len(), GRPC_FRAME_HEADER_LEN);
+                assert_eq!(second.body_len(), GRPC_FRAME_HEADER_LEN);
+                assert!(first.body_is_shared());
+                assert!(second.body_is_shared());
+            }
+            other => panic!("expected preframed gRPC submits, got {other:?}"),
+        }
     }
 }
