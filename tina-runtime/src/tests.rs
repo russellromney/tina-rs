@@ -131,6 +131,65 @@ fn bounded_trace_retention_does_not_move_the_tail_on_every_event() {
     );
 }
 
+#[test]
+fn truncated_trace_is_detectable_and_refused_by_proof_accessor() {
+    // A bursting workload under bounded retention drops events. A proof
+    // helper that hashes/summarizes runtime.trace() must be able to tell it
+    // is reading a partial suffix, not the whole run.
+    let mut runtime = Runtime::with_clock_and_ids_and_driver(
+        TestShard,
+        TestMailboxFactory,
+        Box::new(MonotonicClock),
+        IdSource::new(),
+        Box::new(FakeDriver::new(Rc::new(RefCell::new(Vec::new())))),
+    );
+    runtime.set_trace_retention(TraceRetention::Bounded(3));
+    for _ in 0..100 {
+        runtime.push_event(
+            IsolateId::new(1),
+            None,
+            RuntimeEventKind::EffectObserved {
+                effect: EffectKind::Noop,
+            },
+        );
+    }
+
+    assert!(
+        runtime.trace_is_truncated(),
+        "bounded burst must flag the trace as truncated"
+    );
+    let err = runtime
+        .trace_for_proof()
+        .expect_err("proof accessor must refuse a truncated trace");
+    assert_eq!(err.dropped_events, 97);
+}
+
+#[test]
+fn full_retention_trace_is_not_truncated_and_proof_accessor_returns_it() {
+    let mut runtime = Runtime::with_clock_and_ids_and_driver(
+        TestShard,
+        TestMailboxFactory,
+        Box::new(MonotonicClock),
+        IdSource::new(),
+        Box::new(FakeDriver::new(Rc::new(RefCell::new(Vec::new())))),
+    );
+    // Default retention is Full.
+    for _ in 0..5 {
+        runtime.push_event(
+            IsolateId::new(1),
+            None,
+            RuntimeEventKind::EffectObserved {
+                effect: EffectKind::Noop,
+            },
+        );
+    }
+    assert!(!runtime.trace_is_truncated());
+    let events = runtime
+        .trace_for_proof()
+        .expect("full retention trace is provable");
+    assert_eq!(events.len(), 5);
+}
+
 #[derive(Debug, Default)]
 struct TestShard;
 

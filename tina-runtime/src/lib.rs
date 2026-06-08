@@ -778,7 +778,52 @@ where
     pub const fn trace_dropped(&self) -> u64 {
         self.trace_dropped
     }
+
+    /// Whether the retention policy has dropped any events.
+    ///
+    /// When true, [`trace`](Self::trace) returns only the retained suffix,
+    /// so hashing or summarizing it reflects a partial run. Proof helpers
+    /// should read [`trace_for_proof`](Self::trace_for_proof) instead.
+    pub const fn trace_is_truncated(&self) -> bool {
+        self.trace_dropped > 0
+    }
+
+    /// Returns the trace only when it is the whole run.
+    ///
+    /// Fails closed with [`TraceTruncated`] once the retention policy has
+    /// dropped events, so `stable_trace_hash` / `PressureSummary` cannot be
+    /// computed over a silent partial suffix. Under the default `Full`
+    /// retention this always returns the trace.
+    pub fn trace_for_proof(&self) -> Result<&[RuntimeEvent], TraceTruncated> {
+        if self.trace_dropped > 0 {
+            return Err(TraceTruncated {
+                dropped_events: self.trace_dropped,
+            });
+        }
+        Ok(self.trace())
+    }
 }
+
+/// The retention policy dropped trace events, so the in-memory trace is a
+/// partial suffix that must not back a hash or pressure summary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TraceTruncated {
+    /// How many events the retention policy dropped.
+    pub dropped_events: u64,
+}
+
+impl std::fmt::Display for TraceTruncated {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "trace retention dropped {} event(s); the in-memory trace is a partial suffix \
+             and cannot back a proof hash or pressure summary",
+            self.dropped_events
+        )
+    }
+}
+
+impl std::error::Error for TraceTruncated {}
 
 #[cfg(test)]
 mod tests;
