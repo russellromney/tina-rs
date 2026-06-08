@@ -1,10 +1,12 @@
 //! Mailbox capacity truth tests.
 //!
-//! These tests pin the rule that runtime-call replies, isolate-call
-//! replies, and observed-send replies all land in the requester's mailbox.
-//! When the requester's mailbox is full, the runtime emits
-//! `RuntimeEventKind::CallCompletionRejected { reason: MailboxFull }` so
-//! trace consumers can diagnose under-sized mailboxes deterministically.
+//! Two rules live here. Runtime-call continuations (Sleep, I/O loops) keep a
+//! held resource alive, so they are never dropped: when the mailbox is full
+//! the runtime parks them in a priority overflow (`CallContinuationOverflowed`)
+//! and still completes the call. Best-effort outcomes that do not gate a
+//! held resource — observed-send replies — still land in the bounded mailbox
+//! and surface `CallCompletionRejected { reason: MailboxFull }` when it is
+//! full, so trace consumers can diagnose under-sized mailboxes.
 //!
 //! See `docs/mailbox-capacity.md` for the user-facing doc that this test
 //! suite anchors.
@@ -20,9 +22,10 @@ use tina_runtime::{
 
 // Caller that fan-issues N simultaneous-completion sleep calls. All sleeps
 // share the same duration so they all complete on the same driver poll;
-// the runtime then enqueues N replies into the caller's mailbox in one
-// pass. With the mailbox size set lower than N, the late ones cannot
-// land and the runtime emits the CallCompletionRejected event we want.
+// the runtime then enqueues N continuations into the caller in one pass.
+// With the mailbox under-sized, the late ones cannot fit — the runtime
+// parks them in the overflow rather than dropping them, so every sleep
+// still completes.
 #[derive(Debug, Clone)]
 enum CallerMsg {
     Begin,
@@ -55,15 +58,16 @@ impl Caller {
 }
 
 #[test]
-fn under_sized_mailbox_emits_call_completion_rejected_mailbox_full() {
+fn under_sized_mailbox_overflows_runtime_call_continuations_without_dropping() {
+    let fanout = 6;
     let mut runtime = Runtime::new(SingleShard, DefaultMailboxFactory);
     let caller = runtime.register_with_capacity::<Caller, Infallible>(
-        Caller { fanout: 6 },
+        Caller { fanout },
         // Intentional under-sizing: 1 inbound slot only. The Begin message
-        // lands in this slot first and is handled in the first step (so
-        // the slot is empty when the sleeps fire), but only 1 of the 6
-        // sleep replies fits into the next step before the caller can
-        // drain.
+        // lands in this slot first and is handled in the first step (so the
+        // slot is empty when the sleeps fire), but only 1 of the 6 sleep
+        // continuations fits the mailbox before the caller can drain. The
+        // other 5 must overflow rather than drop.
         1,
     );
     runtime
@@ -79,6 +83,10 @@ fn under_sized_mailbox_emits_call_completion_rejected_mailbox_full() {
     }
 
     let trace = runtime.trace();
+    let kinds: Vec<_> = trace.iter().map(|e| e.kind()).collect();
+
+    // A held-resource continuation must never be dropped: no Sleep completion
+    // is ever rejected for a full mailbox.
     let rejected_full = trace
         .iter()
         .filter(|event| {
@@ -92,10 +100,45 @@ fn under_sized_mailbox_emits_call_completion_rejected_mailbox_full() {
             )
         })
         .count();
+    assert_eq!(
+        rejected_full, 0,
+        "a runtime-call continuation must never be dropped on a full mailbox; trace: {kinds:?}",
+    );
+
+    // The over-capacity continuations are parked in the overflow.
+    let overflowed = trace
+        .iter()
+        .filter(|event| {
+            matches!(
+                event.kind(),
+                RuntimeEventKind::CallContinuationOverflowed {
+                    call_kind: CallKind::Sleep,
+                    ..
+                }
+            )
+        })
+        .count();
     assert!(
-        rejected_full >= 1,
-        "expected at least one Sleep CallCompletionRejected MailboxFull event, got trace kinds: {:?}",
-        trace.iter().map(|e| e.kind()).collect::<Vec<_>>(),
+        overflowed >= 1,
+        "expected at least one Sleep continuation to overflow under a size-1 mailbox; trace: {kinds:?}",
+    );
+
+    // Every sleep still completes — none lost.
+    let completed = trace
+        .iter()
+        .filter(|event| {
+            matches!(
+                event.kind(),
+                RuntimeEventKind::CallCompleted {
+                    call_kind: CallKind::Sleep,
+                    ..
+                }
+            )
+        })
+        .count();
+    assert_eq!(
+        completed, fanout as usize,
+        "every sleep continuation must be delivered exactly once; trace: {kinds:?}",
     );
 }
 

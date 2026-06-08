@@ -445,6 +445,9 @@ fn push_runtime_events(timeline: &TraceTimeline, out: &mut Vec<EmittedEvent>, or
             | RuntimeEventKind::RecoveryStarted
             | RuntimeEventKind::RecoveryFinished
             | RuntimeEventKind::RecoveryFailed { .. }
+            // Mid-flight backpressure, not a terminal: the call still
+            // completes, so this does not close the call span.
+            | RuntimeEventKind::CallContinuationOverflowed { .. }
             | RuntimeEventKind::FactObserved { .. } => push_instant(event, None, out, order),
         }
     }
@@ -950,7 +953,8 @@ fn insert_kind_args(args: &mut Map<String, Value>, kind: RuntimeEventKind) {
             args.insert("capacity".into(), json!(capacity));
         }
         RuntimeEventKind::CallDispatchAttempted { call_id, call_kind }
-        | RuntimeEventKind::CallCompleted { call_id, call_kind } => {
+        | RuntimeEventKind::CallCompleted { call_id, call_kind }
+        | RuntimeEventKind::CallContinuationOverflowed { call_id, call_kind } => {
             insert_call_args(args, call_id, call_kind);
         }
         RuntimeEventKind::CallFailed {
@@ -1074,6 +1078,7 @@ fn event_name(kind: RuntimeEventKind) -> &'static str {
         RuntimeEventKind::MessageAbandoned => "message_abandoned",
         RuntimeEventKind::CallDispatchAttempted { .. } => "call_dispatch_attempted",
         RuntimeEventKind::CallCompleted { .. } => "call_completed",
+        RuntimeEventKind::CallContinuationOverflowed { .. } => "call_continuation_overflowed",
         RuntimeEventKind::CallFailed { .. } => "call_failed",
         RuntimeEventKind::CallCompletionRejected { .. } => "call_completion_rejected",
         RuntimeEventKind::CallCompletionAction { .. } => "call_completion_action",
@@ -1104,6 +1109,7 @@ fn event_category(kind: RuntimeEventKind) -> &'static str {
         | RuntimeEventKind::HandlerFinished { .. } => "handler",
         RuntimeEventKind::CallDispatchAttempted { .. }
         | RuntimeEventKind::CallCompleted { .. }
+        | RuntimeEventKind::CallContinuationOverflowed { .. }
         | RuntimeEventKind::CallFailed { .. }
         | RuntimeEventKind::CallCompletionRejected { .. }
         | RuntimeEventKind::CallCompletionAction { .. }

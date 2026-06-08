@@ -107,6 +107,8 @@ pub enum RuntimeEventKindName {
     CallRejected,
     /// [`RuntimeEventKind::CallCompleted`].
     CallCompleted,
+    /// [`RuntimeEventKind::CallContinuationOverflowed`].
+    CallContinuationOverflowed,
     /// [`RuntimeEventKind::CallFailed`].
     CallFailed,
     /// [`RuntimeEventKind::CallCompletionRejected`].
@@ -191,6 +193,9 @@ fn runtime_event_kind_name(kind: RuntimeEventKind) -> Option<RuntimeEventKindNam
         }
         RuntimeEventKind::CallRejected { .. } => RuntimeEventKindName::CallRejected,
         RuntimeEventKind::CallCompleted { .. } => RuntimeEventKindName::CallCompleted,
+        RuntimeEventKind::CallContinuationOverflowed { .. } => {
+            RuntimeEventKindName::CallContinuationOverflowed
+        }
         RuntimeEventKind::CallFailed { .. } => RuntimeEventKindName::CallFailed,
         RuntimeEventKind::CallCompletionRejected { .. } => {
             RuntimeEventKindName::CallCompletionRejected
@@ -353,6 +358,7 @@ fn every_kind_except(keep: &[RuntimeEventKindName]) -> Vec<RuntimeEventKindName>
         N::CallDispatchAttempted,
         N::CallRejected,
         N::CallCompleted,
+        N::CallContinuationOverflowed,
         N::CallFailed,
         N::CallCompletionRejected,
         N::CallReplyRejected,

@@ -54,14 +54,34 @@ What does **not** count:
 The `+1` slots are reserved for the isolate's own outstanding
 continuations — that's the load-bearing part.
 
+## Runtime-call continuations never drop
+
+A runtime call (`sleep`, TCP/TLS I/O, persistence, signals) keeps a *held
+resource* alive through its continuation — most sharply a bridge's poll loop,
+where the `sleep().then(Poll)` self-wakeup is the only thing that ever frees
+the leased slot. Dropping that continuation on a full mailbox would leak the
+slot forever and walk the bridge down to `Full` for everything.
+
+So the runtime never drops a runtime-call continuation. It tries the bounded
+mailbox first; if the mailbox is full it parks the continuation in a per-
+isolate **priority overflow** and emits
+`RuntimeEventKind::CallContinuationOverflowed { call_kind, ... }`. The
+overflow drains ahead of the mailbox, so the continuation arrives in order
+and the call still completes (`CallCompleted`). The overflow is bounded by the
+isolate's own outstanding runtime calls, so it cannot grow without bound.
+
+`CallContinuationOverflowed` is a backpressure signal, not a loss: seeing it
+means the mailbox is under-sized for the isolate's outstanding work, but no
+continuation was lost.
+
 ## Diagnosing under-capacity
 
-When the runtime cannot enqueue a reply because the requester's mailbox is
-full, it emits one of:
+When the runtime cannot enqueue a *best-effort* reply because the requester's
+mailbox is full, it emits one of:
 
 - `RuntimeEventKind::CallCompletionRejected { reason: MailboxFull, ... }`
-  — the requester's mailbox was full when the runtime tried to deliver a
-  call completion.
+  — an observed-send outcome (or isolate-call reply) could not land in a full
+  mailbox. (Runtime-call continuations overflow instead; see above.)
 - `RuntimeEventKind::CallCompletionRejected { reason: RequesterClosed, ... }`
   — the requester had already stopped or its incarnation was replaced.
 - `RuntimeEventKind::SendRejected { reason: SendRejectedReason::Full, ... }`
