@@ -806,7 +806,15 @@ impl<S: Shard + 'static> KeepaliveConnection<S> {
         } else if body_complete(in_flight) {
             // Honor the server's Connection header on the response.
             // `close` token anywhere in the value forbids reuse.
-            let must_retire = response_says_close(in_flight);
+            let mut must_retire = response_says_close(in_flight);
+            // Body-length truth: a non-chunked server that wrote MORE
+            // bytes than its declared Content-Length has desynced
+            // framing — the extra bytes are the start of the next
+            // response. Don't pool a desynced socket; retire it.
+            let body_end = in_flight.head_len + body_content_length(in_flight);
+            if in_flight.read_buf.len() > body_end {
+                must_retire = true;
+            }
             self.deliver_success(must_retire)
         } else {
             self.read_more()
@@ -908,6 +916,16 @@ fn body_complete(state: &InFlight) -> bool {
     };
     let needed = state.head_len + head.content_length;
     state.read_buf.len() >= needed
+}
+
+/// Declared body length of the parsed (non-chunked) response. 0 if no
+/// head is parsed yet.
+fn body_content_length(state: &InFlight) -> usize {
+    state
+        .parsed_head
+        .as_ref()
+        .map(|head| head.content_length)
+        .unwrap_or(0)
 }
 
 fn tls_read_reply_to_tcp(reply: TlsReadBufReply) -> TcpReadBufReply {
