@@ -1,11 +1,9 @@
-# Phase 153 Linux/x86_64 validation sample
-# Fly app: tina-perf-150
-# Machine: 080d210b539578
-# Image: registry.fly.io/tina-perf-150:deployment-01KTJ98DCX037BM9TT56GPD2NJ
-# VM: performance-2x, region iad
-# Captured: 2026-06-08T00:21:47Z
+# Phase 153 Linux/x86_64 validation sample after HTTP/2 client write coalescing, runtime TCP_NODELAY, std helper TCP_NODELAY, and owned Vec append coalescing
+# date=2026-06-08T00:49:04Z
+# image=registry.fly.io/tina-perf-150:deployment-01KTJB2YV7FC2KZGDV9DAW07KK
+# machine=2870667a3092e8
 
-Connecting to fdaa:1:220a:a7b:897:6e65:7e2c:2...
+Connecting to fdaa:1:220a:a7b:894:964e:3d00:2...
 ##### TEST betelgeuse_substrate-c9b4d2b8e2f3838a #####
 
 running 19 tests
@@ -49,7 +47,7 @@ test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fini
 running 1 test
 test native_client_against_native_server_drives_counter ... ok
 
-test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
 
 
 ##### TEST grpc_live-fa5bf5cee4bc0e31 #####
@@ -90,7 +88,7 @@ test grpc_typed_status_propagates_in_trailers ... ok
 test grpc_unknown_method_is_unimplemented ... ok
 test grpc_zero_message_body_is_invalid_argument ... ok
 
-test result: ok. 34 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.12s
+test result: ok. 34 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.20s
 
 
 ##### TEST mailbox_readiness-2898287e9c78ed1c #####

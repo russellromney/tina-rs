@@ -1353,6 +1353,7 @@ fn http_get(
     expected_body_len: usize,
 ) -> anyhow::Result<()> {
     let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(2))?;
+    stream.set_nodelay(true)?;
     stream.set_read_timeout(Some(Duration::from_secs(2)))?;
     let close_request = b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
     let keepalive_request = b"GET / HTTP/1.1\r\nHost: x\r\nConnection: keep-alive\r\n\r\n";
@@ -1379,6 +1380,7 @@ fn http_steady_state_load(
     let mut streams = Vec::with_capacity(WORKERS);
     for _ in 0..WORKERS {
         let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(2))?;
+        stream.set_nodelay(true)?;
         stream.set_read_timeout(Some(Duration::from_secs(2)))?;
         http_get_on_stream(&mut stream, false, expected_body_len)?;
         streams.push(Mutex::new(Some(stream)));
@@ -1446,6 +1448,7 @@ fn http_get_on_stream(
 
 fn http_post_declared_too_large(addr: SocketAddr, declared_len: usize) -> anyhow::Result<()> {
     let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(2))?;
+    stream.set_nodelay(true)?;
     stream.set_read_timeout(Some(Duration::from_secs(2)))?;
     let request = format!(
         "POST / HTTP/1.1\r\nHost: x\r\nConnection: close\r\nContent-Length: {declared_len}\r\n\r\n"
@@ -1663,6 +1666,7 @@ fn start_h2_server(
 
 fn h2c_connect(addr: SocketAddr) -> anyhow::Result<TcpStream> {
     let mut stream = TcpStream::connect_timeout(&addr, PROTOCOL_CLIENT_TIMEOUT)?;
+    stream.set_nodelay(true)?;
     stream.set_read_timeout(Some(PROTOCOL_CLIENT_TIMEOUT))?;
     stream.set_write_timeout(Some(PROTOCOL_CLIENT_TIMEOUT))?;
     stream.write_all(H2_PREFACE)?;
@@ -2286,6 +2290,7 @@ fn start_ws_server(
 
 fn ws_connect(addr: SocketAddr) -> anyhow::Result<TcpStream> {
     let mut stream = TcpStream::connect_timeout(&addr, PROTOCOL_CLIENT_TIMEOUT)?;
+    stream.set_nodelay(true)?;
     stream.set_read_timeout(Some(PROTOCOL_CLIENT_TIMEOUT))?;
     stream.set_write_timeout(Some(PROTOCOL_CLIENT_TIMEOUT))?;
     stream.write_all(

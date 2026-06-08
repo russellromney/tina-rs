@@ -73,6 +73,8 @@ enum ClientStream {
     Tls(TlsStreamId),
 }
 
+const CLIENT_WRITE_COALESCE_LIMIT: usize = 64 * 1024;
+
 fn tls_read_reply_to_tcp(reply: TlsReadBufReply) -> TcpReadBufReply {
     TcpReadBufReply {
         buffer: reply.buffer,
@@ -2091,9 +2093,7 @@ impl<S: Shard + 'static> Http2ClientConnection<S> {
         bytes.drain(..drain);
         self.pending_write = bytes;
         if self.pending_write.is_empty() {
-            if let Some(next) = self.write_queue.pop_front() {
-                self.pending_write = next;
-            }
+            self.promote_queued_write();
         }
         let mut effects: Vec<Effect<Self>> = Vec::new();
         self.pump_io(&mut effects);
@@ -2104,17 +2104,44 @@ impl<S: Shard + 'static> Http2ClientConnection<S> {
         self.enqueue_bytes(frame.encode());
     }
 
-    /// Queue already-encoded frame bytes. Only fill `pending_write` if it is
-    /// empty AND we are not currently waiting on a write completion;
-    /// otherwise queue behind it so `write_in_flight` correctly gates
-    /// re-entry. Used by `flush_outbound_data` to push a DATA frame built
-    /// straight from the request-body slice without a `Frame` round-trip.
-    fn enqueue_bytes(&mut self, bytes: Vec<u8>) {
-        if self.pending_write.is_empty() && !self.write_in_flight {
+    /// Queue already-encoded frame bytes.
+    ///
+    /// When no write is in flight, append to the current pending write buffer
+    /// instead of creating a second tiny TCP write. HTTP/2 frame boundaries are
+    /// preserved inside the byte stream, but buffered request HEADERS + DATA can
+    /// ride one kernel write. This matters on Linux: separate small writes can
+    /// trip delayed-ACK/Nagle pacing and add tens of milliseconds to otherwise
+    /// local requests.
+    fn enqueue_bytes(&mut self, mut bytes: Vec<u8>) {
+        if self.write_in_flight {
+            self.write_queue.push_back(bytes);
+        } else if self.pending_write.is_empty() {
             self.pending_write = bytes;
+        } else if self.pending_write.len() + bytes.len() <= CLIENT_WRITE_COALESCE_LIMIT {
+            self.pending_write.append(&mut bytes);
         } else {
             self.write_queue.push_back(bytes);
         }
+    }
+
+    fn promote_queued_write(&mut self) {
+        if !self.pending_write.is_empty() {
+            return;
+        }
+        let Some(mut next) = self.write_queue.pop_front() else {
+            return;
+        };
+        while matches!(
+            self.write_queue.front(),
+            Some(more) if next.len() + more.len() <= CLIENT_WRITE_COALESCE_LIMIT
+        ) {
+            let mut more = self
+                .write_queue
+                .pop_front()
+                .expect("front checked before pop");
+            next.append(&mut more);
+        }
+        self.pending_write = next;
     }
 
     fn full_duplex(&self) -> bool {
@@ -2163,9 +2190,7 @@ impl<S: Shard + 'static> Http2ClientConnection<S> {
             return noop();
         }
         if self.pending_write.is_empty() {
-            if let Some(next) = self.write_queue.pop_front() {
-                self.pending_write = next;
-            }
+            self.promote_queued_write();
         }
         let Some(stream) = self.stream else {
             return noop();
@@ -2452,6 +2477,91 @@ mod tests {
         let req = Http2ClientRequest::post("/x", b"hi".to_vec());
         assert_eq!(req.method, Method::POST);
         assert_eq!(req.body, b"hi");
+    }
+
+    #[test]
+    fn idle_client_coalesces_ready_frames_into_one_pending_write() {
+        let target = Http2Target::H2c {
+            authority: "x".into(),
+            addr: (Ipv4Addr::LOCALHOST, 80).into(),
+        };
+        let mut client =
+            Http2ClientConnection::<tina::SingleShard>::new(target, Http2ClientLimits::default());
+
+        client.enqueue_frame(headers_frame(1, false, b"headers".to_vec()));
+        client.enqueue_frame(data_frame(1, true, b"body".to_vec()));
+
+        assert!(
+            client.pending_write.len() > FRAME_HEADER_LEN * 2,
+            "coalesced write carries both frame headers and payloads"
+        );
+        assert!(
+            client.write_queue.is_empty(),
+            "idle HEADERS + DATA should not become two tiny TCP writes"
+        );
+        let (first, used) = try_decode_frame(&client.pending_write, client.limits.max_frame_size)
+            .expect("decode first frame")
+            .expect("first frame");
+        assert_eq!(first.ty, FRAME_HEADERS);
+        let (second, used2) =
+            try_decode_frame(&client.pending_write[used..], client.limits.max_frame_size)
+                .expect("decode second frame")
+                .expect("second frame");
+        assert_eq!(second.ty, FRAME_DATA);
+        assert_eq!(used + used2, client.pending_write.len());
+    }
+
+    #[test]
+    fn completed_write_promotes_queued_frames_as_one_buffer() {
+        let target = Http2Target::H2c {
+            authority: "x".into(),
+            addr: (Ipv4Addr::LOCALHOST, 80).into(),
+        };
+        let mut client =
+            Http2ClientConnection::<tina::SingleShard>::new(target, Http2ClientLimits::default());
+        client.write_in_flight = true;
+        client
+            .write_queue
+            .push_back(Frame::new(FRAME_SETTINGS, 0, 0, Vec::new()).encode());
+        client
+            .write_queue
+            .push_back(data_frame(1, true, b"body".to_vec()).encode());
+
+        let _ = client.handle_wrote(TcpWriteOwnedReply {
+            bytes: b"prior".to_vec(),
+            written: 5,
+        });
+
+        assert!(
+            client.write_queue.is_empty(),
+            "queued ready frames should be promoted together"
+        );
+        let (first, used) = try_decode_frame(&client.pending_write, client.limits.max_frame_size)
+            .expect("decode first frame")
+            .expect("first frame");
+        assert_eq!(first.ty, FRAME_SETTINGS);
+        let (second, used2) =
+            try_decode_frame(&client.pending_write[used..], client.limits.max_frame_size)
+                .expect("decode second frame")
+                .expect("second frame");
+        assert_eq!(second.ty, FRAME_DATA);
+        assert_eq!(used + used2, client.pending_write.len());
+    }
+
+    #[test]
+    fn coalescing_keeps_large_ready_write_queued() {
+        let target = Http2Target::H2c {
+            authority: "x".into(),
+            addr: (Ipv4Addr::LOCALHOST, 80).into(),
+        };
+        let mut client =
+            Http2ClientConnection::<tina::SingleShard>::new(target, Http2ClientLimits::default());
+
+        client.enqueue_bytes(vec![1; CLIENT_WRITE_COALESCE_LIMIT]);
+        client.enqueue_frame(data_frame(1, true, b"body".to_vec()));
+
+        assert_eq!(client.pending_write.len(), CLIENT_WRITE_COALESCE_LIMIT);
+        assert_eq!(client.write_queue.len(), 1);
     }
 
     #[test]

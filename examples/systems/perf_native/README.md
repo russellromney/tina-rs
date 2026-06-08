@@ -553,9 +553,23 @@ captured on Fly `performance-2x` and saved in
 `.intent/phases/153-real-protocol-performance/perf_sample_linux.txt`; Linux
 validation output is saved beside it in `linux_validation.txt`.
 
-The Linux run reproduced the deterministic allocation wins, but also surfaced a
-real performance problem: the native HTTP/2 client POST row and the gRPC close
-row both show an ~88 ms p50 floor on Linux while the server-only HTTP/2
-steady-state row is about 150 us. Do not treat this phase as an HTTP/2/gRPC
-latency claim; the next performance pass should investigate Linux client-side
-HTTP/2/gRPC pacing, timers, and read/write wakeups.
+The first Linux run reproduced the deterministic allocation wins but surfaced a
+real bug: native HTTP/2 client POST and gRPC close both showed an ~88 ms p50
+floor while the server-only HTTP/2 row was healthy. That was tiny HTTP/2 writes
+meeting Linux delayed ACK/Nagle behavior, not a scheduler or framing cost. The
+final Phase 153 code fixes it in three places:
+
+- runtime TCP accept/connect sockets set TCP_NODELAY;
+- the native HTTP/2 client coalesces already-ready frames into one pending
+  write;
+- the public blocking gRPC helper and raw perf clients set TCP_NODELAY too.
+
+Final Linux representative rows:
+
+| row | p50 | p90 | p99 | note |
+| --- | ---: | ---: | ---: | --- |
+| `http2_h2c_steady_state_small` | 80 µs | 163 µs | 1518 µs | native server steady-state; p99 noisy |
+| `http2_h2c_client_steady_state_post` | 434 µs | 535 µs | 591 µs | native client + native server warmed POST |
+| `grpc_h2c_unary_close` | 949 µs | 1465 µs | 4832 µs | fresh h2c connection + unary call |
+| `http2_h2c_close_request` | 859 µs | 1126 µs | 1543 µs | fresh h2c connection + one request |
+| `websocket_steady_state_small` | 129 µs | 212 µs | 356 µs | reusable session path |

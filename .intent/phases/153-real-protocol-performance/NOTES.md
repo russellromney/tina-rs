@@ -126,6 +126,13 @@ sample policy.
 3. **Header encode.** The response header block is pre-sized (the perf
    allocator counts each `Vec` growth realloc) and content-length is formatted
    into a stack buffer instead of a heap `String`.
+4. **Linux tiny-write pacing.** The first Linux run exposed ~88 ms p50 on the
+   native HTTP/2 client POST and gRPC close rows. That was not Tina scheduler
+   work; it was tiny HTTP/2 writes interacting with Linux delayed ACK/Nagle
+   behavior. The runtime TCP rail now enables TCP_NODELAY on accepted and
+   connected stream sockets, the HTTP/2 client coalesces ready frames into one
+   pending write, and the public blocking gRPC/perf client helpers also set
+   TCP_NODELAY.
 
 ### perf-h2-alloc (64 warmed h2c buffered responses, whole-process; client byte-identical so the delta is all server-side)
 
@@ -196,8 +203,8 @@ saved in `linux_validation.txt`.
 Run:
 
 - Fly app: `tina-perf-150`
-- image: `registry.fly.io/tina-perf-150:deployment-01KTJ98DCX037BM9TT56GPD2NJ`
-- machine: `080d210b539578` (destroyed after capture)
+- image: `registry.fly.io/tina-perf-150:deployment-01KTJB2YV7FC2KZGDV9DAW07KK`
+- machine: `2870667a3092e8` (destroyed after capture)
 - VM: `performance-2x`, region `iad`
 
 Validation passed on Linux:
@@ -215,16 +222,16 @@ Representative Linux rows:
 
 | Row | p50 | p90 | p99 | Allocations | Bytes | Notes |
 | --- | ---: | ---: | ---: | ---: | ---: | --- |
-| `hotpath_call_blocking_tail` | 14 µs | 20 µs | 113 µs | 1 | n/a | no scheduler-gap spikes |
-| `http2_h2c_steady_state_small` | 150 µs | 197 µs | 641 µs | 224 | 7072 | native server steady-state row is healthy |
-| `http2_h2c_client_steady_state_post` | **88000 µs** | 88068 µs | 88155 µs | 114 | 140992 | native client+server row surfaced a real Linux latency problem |
-| `grpc_h2c_unary_close` | **87951 µs** | 91580 µs | 92115 µs | 608 | 25696 | connect/setup row also shows the same ~88 ms Linux delay shape |
-| `websocket_steady_state_small` | 72 µs | 193 µs | 1076 µs | 96 | 352 | reusable session path is fast |
+| `hotpath_call_blocking_tail` | 28 µs | 31 µs | 76 µs | 1 | n/a | no scheduler-gap spikes |
+| `http2_h2c_steady_state_small` | 80 µs | 163 µs | 1518 µs | 224 | 7072 | native server steady-state row is healthy; p99 noisy |
+| `http2_h2c_client_steady_state_post` | 434 µs | 535 µs | 591 µs | 120 | 142768 | native client+server warmed POST path |
+| `grpc_h2c_unary_close` | 949 µs | 1465 µs | 4832 µs | 608 | 25696 | fresh connection + public blocking gRPC helper |
+| `http2_h2c_close_request` | 859 µs | 1126 µs | 1543 µs | 288 | 7648 | fresh h2c connection/preface/settings/request |
+| `http2_h2c_keepalive_sequential` | 1397 µs | 1759 µs | 2130 µs | 960 | 28864 | fresh h2c connection + four sequential requests |
+| `websocket_steady_state_small` | 129 µs | 212 µs | 356 µs | 96 | 352 | reusable session path is fast |
 
 The deterministic allocation wins reproduce on Linux, and the validation suite
-is green. The Linux latency evidence is not flattering: HTTP/2 client POST and
-gRPC close both show an ~88 ms floor. That is not caused by the Phase 153
-allocation work, and it is not present in the server-only HTTP/2 steady-state
-row. Treat this as the next performance finding: investigate Linux client-side
-HTTP/2/gRPC pacing, timers, or connection/read wakeups before making public
-HTTP/2/gRPC latency claims.
+is green. The first Linux run surfaced an ugly ~88 ms delayed-ACK/Nagle floor on
+the client/gRPC rows; the final run proves that bug is fixed by coalescing HTTP/2
+client writes and setting TCP_NODELAY on Tina runtime sockets plus the blocking
+std-client helpers used by gRPC/perf evidence.

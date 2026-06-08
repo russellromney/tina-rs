@@ -1200,6 +1200,9 @@ where
     let mut stream = TcpStream::connect_timeout(&target, timeout)
         .map_err(|error| GrpcError::Io(error.to_string()))?;
     stream
+        .set_nodelay(true)
+        .map_err(|error| GrpcError::Io(error.to_string()))?;
+    stream
         .set_read_timeout(Some(timeout))
         .map_err(|error| GrpcError::Io(error.to_string()))?;
     stream
