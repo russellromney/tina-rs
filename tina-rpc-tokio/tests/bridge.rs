@@ -117,6 +117,14 @@ enum StubBehavior {
     /// mailbox has capacity 2, so the real reply is dropped unless
     /// the bridge has an independent terminal backstop.
     FloodShimThenReply,
+    /// Models a connection-close `begin_close` fan-out: emits `strays`
+    /// stray `ConnectionClosed` notifications (unknown correlators, as if
+    /// for other in-flight client entries) in one turn, then the live
+    /// correlator's own `ConnectionClosed`. The burst is bounded by the
+    /// client's in-flight cap, not the bridge's; the shim must be sized to
+    /// absorb it or the live reply is dropped and the awaiter only settles
+    /// via the deadline backstop (Timeout), losing its true terminal.
+    CloseFanout { strays: u64 },
 }
 
 impl Isolate for ClientStub {
@@ -164,6 +172,29 @@ impl Isolate for ClientStub {
                                 },
                             )),
                         ]);
+                    }
+                    StubBehavior::CloseFanout { strays } => {
+                        // Stray notifications for other in-flight entries,
+                        // then the live correlator's own ConnectionClosed —
+                        // all in one turn, like begin_close.
+                        let mut effects = Vec::with_capacity(strays as usize + 1);
+                        for n in 0..strays {
+                            effects.push(Effect::Send(Outbound::new(
+                                req.reply_to,
+                                ClientResultMsg {
+                                    correlator: req.correlator + 1_000 + n,
+                                    result: ClientResult::ConnectionClosed,
+                                },
+                            )));
+                        }
+                        effects.push(Effect::Send(Outbound::new(
+                            req.reply_to,
+                            ClientResultMsg {
+                                correlator: req.correlator,
+                                result: ClientResult::ConnectionClosed,
+                            },
+                        )));
+                        return Effect::Batch(effects);
                     }
                 };
                 Effect::Send(Outbound::new(
@@ -215,7 +246,7 @@ fn register_stub(
 async fn typed_call_round_trips_through_bridge_and_macro() {
     let runtime = build_runtime();
     let stub = register_stub(&runtime, StubBehavior::Echo);
-    let bridge = BridgeClient::<SpecimenShard>::new(Arc::clone(&runtime), stub, 64).unwrap();
+    let bridge = BridgeClient::<SpecimenShard>::new(Arc::clone(&runtime), stub, 64, 64).unwrap();
 
     // The stub echoes payload bytes; the macro encoded the args
     // tuple `(3, 4)` as `[3, 4]`. The macro decoder for `add` is
@@ -243,7 +274,7 @@ async fn typed_call_round_trips_through_bridge_and_macro() {
 async fn server_full_surfaces_as_bridge_full() {
     let runtime = build_runtime();
     let stub = register_stub(&runtime, StubBehavior::AlwaysFull);
-    let bridge = BridgeClient::<SpecimenShard>::new(Arc::clone(&runtime), stub, 16).unwrap();
+    let bridge = BridgeClient::<SpecimenShard>::new(Arc::clone(&runtime), stub, 16, 64).unwrap();
 
     let outcome = bridge
         .call(
@@ -258,7 +289,7 @@ async fn server_full_surfaces_as_bridge_full() {
 async fn retry_policy_eventually_surfaces_persistent_full() {
     let runtime = build_runtime();
     let stub = register_stub(&runtime, StubBehavior::AlwaysFull);
-    let bridge = BridgeClient::<SpecimenShard>::new(Arc::clone(&runtime), stub, 16).unwrap();
+    let bridge = BridgeClient::<SpecimenShard>::new(Arc::clone(&runtime), stub, 16, 64).unwrap();
 
     let policy = RetryPolicy {
         attempts: 3,
@@ -293,7 +324,7 @@ async fn admission_full_returns_synchronously_no_hang() {
     // for a reply slot that will never free.
     let runtime = build_runtime();
     let stub = register_stub(&runtime, StubBehavior::NeverReply);
-    let bridge = BridgeClient::<SpecimenShard>::new(Arc::clone(&runtime), stub, 2).unwrap();
+    let bridge = BridgeClient::<SpecimenShard>::new(Arc::clone(&runtime), stub, 2, 64).unwrap();
 
     // Hold both admission slots with calls that will never complete.
     let bridge_a = bridge.clone();
@@ -357,7 +388,7 @@ async fn cancelled_call_releases_slot_after_terminal_backstop() {
     // deadline backstop fires.
     let runtime = build_runtime();
     let stub = register_stub(&runtime, StubBehavior::NeverReply);
-    let bridge = BridgeClient::<SpecimenShard>::new(Arc::clone(&runtime), stub, 1).unwrap();
+    let bridge = BridgeClient::<SpecimenShard>::new(Arc::clone(&runtime), stub, 1, 64).unwrap();
 
     let bridge_a = bridge.clone();
     let abandoned = tokio::spawn(async move {
@@ -399,7 +430,7 @@ async fn dropped_awaiter_holds_capacity_until_terminal_backstop() {
     // bridge handle.
     let runtime = build_runtime();
     let stub = register_stub(&runtime, StubBehavior::NeverReply);
-    let bridge = BridgeClient::<SpecimenShard>::new(Arc::clone(&runtime), stub, 1).unwrap();
+    let bridge = BridgeClient::<SpecimenShard>::new(Arc::clone(&runtime), stub, 1, 64).unwrap();
 
     let bridge_a = bridge.clone();
     let abandoned = tokio::spawn(async move {
@@ -456,7 +487,11 @@ async fn dropped_shim_reply_times_out_instead_of_hanging() {
     // The bridge still owes the awaiter a terminal result.
     let runtime = build_runtime();
     let stub = register_stub(&runtime, StubBehavior::FloodShimThenReply);
-    let bridge = BridgeClient::<SpecimenShard>::new(Arc::clone(&runtime), stub, 1).unwrap();
+    // client_max_in_flight = 1 → shim mailbox = 1 + 1 = 2. FloodShimThenReply
+    // sends 2 strays + 1 real = 3, so even the correctly-sized shim overflows
+    // here and the real reply is dropped — proving the deadline backstop still
+    // settles the awaiter when a reply is genuinely lost.
+    let bridge = BridgeClient::<SpecimenShard>::new(Arc::clone(&runtime), stub, 1, 1).unwrap();
 
     let outcome = tokio::time::timeout(
         Duration::from_secs(1),
@@ -475,10 +510,51 @@ async fn dropped_shim_reply_times_out_instead_of_hanging() {
 }
 
 #[tokio::test]
+async fn close_fanout_settles_live_call_with_true_terminal_not_timeout() {
+    // The underlying client's `begin_close` fans out one notification per
+    // in-flight entry at once — bounded by the *client's* in-flight cap
+    // (here 16), not the bridge's (here 1). The shim mailbox must be sized
+    // to that client cap, or the live reply at the tail of the burst is
+    // dropped and the awaiter settles only via the deadline backstop
+    // (Timeout), losing its true ConnectionClosed cause.
+    let client_cap = 16;
+    let runtime = build_runtime();
+    let stub = register_stub(&runtime, StubBehavior::CloseFanout { strays: client_cap });
+    let bridge =
+        BridgeClient::<SpecimenShard>::new(Arc::clone(&runtime), stub, 1, client_cap as usize)
+            .unwrap();
+
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(2),
+        bridge.call(
+            // Generous per-call deadline so the *only* way this settles as
+            // Timeout is a dropped reply, not the deadline firing first.
+            |corr, rt| {
+                EchoClient::say_request("live".into(), Duration::from_secs(5), corr, rt, 1024)
+            },
+            |bytes| EchoClient::say_decode_reply(bytes, 1024),
+        ),
+    )
+    .await
+    .expect("bridge must settle the live call without hanging");
+
+    assert_eq!(
+        outcome,
+        Err(BridgeError::ConnectionClosed),
+        "live reply must settle with its true terminal (ConnectionClosed), not a backstop Timeout"
+    );
+    assert_eq!(
+        bridge.available_slots(),
+        1,
+        "admission slot must be returned after the call settles"
+    );
+}
+
+#[tokio::test]
 async fn parallel_calls_demux_correctly() {
     let runtime = build_runtime();
     let stub = register_stub(&runtime, StubBehavior::Echo);
-    let bridge = BridgeClient::<SpecimenShard>::new(Arc::clone(&runtime), stub, 64).unwrap();
+    let bridge = BridgeClient::<SpecimenShard>::new(Arc::clone(&runtime), stub, 64, 64).unwrap();
 
     // Fire many parallel calls; each gets its own correlator and
     // its own oneshot. The shim must demux every reply correctly.
