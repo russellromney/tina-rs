@@ -1,0 +1,9 @@
+error: split `handle_request` must use caller authority `call`; reply, reject, or defer it
+  --> tests/safety_rails_compile_fail/split_request_call_in_string_literal.rs:31:29
+   |
+31 |       ) -> tina::Effect<Self> {
+   |  _____________________________^
+32 | |         let _note = "must answer the call somehow";
+33 | |         tina::noop()
+34 | |     }
+   | |_____^
