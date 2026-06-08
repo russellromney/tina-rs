@@ -152,6 +152,12 @@ pub(super) fn settings_frame(ack: bool) -> Frame {
     )
 }
 
+/// Append one 6-byte SETTINGS entry (2-byte id, 4-byte value).
+pub(super) fn push_setting(out: &mut Vec<u8>, id: u16, value: u32) {
+    out.extend_from_slice(&id.to_be_bytes());
+    out.extend_from_slice(&value.to_be_bytes());
+}
+
 pub(super) fn rst_stream_frame(stream_id: u32, error: u32) -> Frame {
     Frame::new(FRAME_RST_STREAM, 0, stream_id, error.to_be_bytes().to_vec())
 }

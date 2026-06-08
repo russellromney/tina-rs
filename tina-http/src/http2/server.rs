@@ -43,7 +43,7 @@ use super::frame::{
     FRAME_PRIORITY, FRAME_PUSH_PROMISE, FRAME_RST_STREAM, FRAME_SETTINGS, FRAME_WINDOW_UPDATE,
     Frame, PRIORITY_PAYLOAD_LEN, READ_CHUNK, WINDOW_CREDIT_FLUSH_THRESHOLD, add_window, data_frame,
     data_payload_view, goaway_frame, headers_frame, headers_payload_view, push_frame_header,
-    rst_stream_frame, settings_frame, try_decode_frame_meta, window_update_frame,
+    push_setting, rst_stream_frame, settings_frame, try_decode_frame_meta, window_update_frame,
 };
 use super::headers::{
     DEFAULT_HEADER_TABLE_SIZE, HeaderBlock, MAX_MAX_FRAME_SIZE, MIN_MAX_FRAME_SIZE,
@@ -654,7 +654,7 @@ impl<S: Shard + 'static, M: Http2ServiceMessage> Http2Connection<S, M> {
             }
             self.read_buf.drain(..CLIENT_PREFACE.len());
             self.preface_seen = true;
-            self.enqueue_frame(settings_frame(false))?;
+            self.enqueue_frame(self.initial_settings_frame())?;
         }
 
         // Process frames as borrowed slices of the read buffer. Take the
@@ -2175,6 +2175,31 @@ impl<S: Shard + 'static, M: Http2ServiceMessage> Http2Connection<S, M> {
         }
     }
 
+    /// Build the server's initial (non-ACK) SETTINGS from config. The peer
+    /// learns our caps only from this frame; an empty one leaves it on
+    /// protocol defaults (unlimited streams, 65535 window, 16384 frame).
+    /// Mirrors the client's advertisement.
+    fn initial_settings_frame(&self) -> Frame {
+        let mut payload = Vec::with_capacity(24);
+        push_setting(
+            &mut payload,
+            SETTINGS_MAX_CONCURRENT_STREAMS,
+            self.limits.max_concurrent_streams as u32,
+        );
+        push_setting(
+            &mut payload,
+            SETTINGS_INITIAL_WINDOW_SIZE,
+            self.limits.initial_stream_window as u32,
+        );
+        push_setting(
+            &mut payload,
+            SETTINGS_MAX_FRAME_SIZE,
+            self.limits.max_frame_size as u32,
+        );
+        push_setting(&mut payload, SETTINGS_ENABLE_PUSH, 0);
+        Frame::new(FRAME_SETTINGS, 0, 0, payload)
+    }
+
     fn enqueue_frame(&mut self, frame: Frame) -> Result<(), Http2ProtocolError> {
         self.ensure_outbound_slots(1)?;
         self.write_queue.push_back(frame.encode());
@@ -2419,6 +2444,66 @@ mod tests {
             decode_headers_block(&block, 4),
             Err(Http2ProtocolError::HeadersTooLarge)
         ));
+    }
+
+    fn decode_settings_payload(payload: &[u8]) -> Vec<(u16, u32)> {
+        assert_eq!(payload.len() % 6, 0, "SETTINGS payload must be a 6-byte multiple");
+        payload
+            .chunks_exact(6)
+            .map(|c| {
+                let id = u16::from_be_bytes([c[0], c[1]]);
+                let value = u32::from_be_bytes([c[2], c[3], c[4], c[5]]);
+                (id, value)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn server_initial_settings_advertises_configured_limits() {
+        // The server's initial (non-ACK) SETTINGS must tell the peer the
+        // configured caps; an empty payload leaves the peer on protocol
+        // defaults (unlimited concurrent streams, 65535 window, 16384 frame).
+        let mut conn = unit_connection();
+        conn.read_buf.extend_from_slice(CLIENT_PREFACE);
+        let mut effects: Vec<Effect<Http2Connection<UnitShard>>> = Vec::new();
+        conn.process_buffer(&mut effects)
+            .expect("preface processes cleanly");
+
+        let (settings, _) =
+            try_decode_frame(&conn.write_queue[0], conn.limits.max_frame_size)
+                .expect("complete queued frame")
+                .expect("queued SETTINGS decodes");
+        assert_eq!(settings.ty, FRAME_SETTINGS);
+        assert_eq!(settings.flags, 0, "initial SETTINGS is not an ACK");
+        let advertised = decode_settings_payload(&settings.payload);
+        let limits = Http2Limits::default();
+        assert!(
+            advertised
+                .iter()
+                .any(|&(id, v)| id == SETTINGS_MAX_CONCURRENT_STREAMS
+                    && v == limits.max_concurrent_streams as u32),
+            "SETTINGS must advertise MAX_CONCURRENT_STREAMS, got {advertised:?}"
+        );
+        assert!(
+            advertised
+                .iter()
+                .any(|&(id, v)| id == SETTINGS_INITIAL_WINDOW_SIZE
+                    && v == limits.initial_stream_window as u32),
+            "SETTINGS must advertise INITIAL_WINDOW_SIZE, got {advertised:?}"
+        );
+        assert!(
+            advertised
+                .iter()
+                .any(|&(id, v)| id == SETTINGS_MAX_FRAME_SIZE
+                    && v == limits.max_frame_size as u32),
+            "SETTINGS must advertise MAX_FRAME_SIZE, got {advertised:?}"
+        );
+        assert!(
+            advertised
+                .iter()
+                .any(|&(id, v)| id == SETTINGS_ENABLE_PUSH && v == 0),
+            "SETTINGS must disable server push, got {advertised:?}"
+        );
     }
 
     #[test]

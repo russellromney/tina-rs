@@ -54,7 +54,7 @@ use super::frame::{
     FRAME_GOAWAY, FRAME_HEADER_LEN, FRAME_HEADERS, FRAME_PING, FRAME_RST_STREAM, FRAME_SETTINGS,
     FRAME_WINDOW_UPDATE, Frame, READ_CHUNK, WINDOW_CREDIT_FLUSH_THRESHOLD, add_window, data_frame,
     goaway_frame, headers_frame, headers_payload, into_data_payload, push_frame_header,
-    rst_stream_frame, settings_frame, try_decode_frame, window_update_frame,
+    push_setting, rst_stream_frame, settings_frame, try_decode_frame, window_update_frame,
 };
 use super::headers::{
     DEFAULT_HEADER_TABLE_SIZE, HeaderBlock, MAX_MAX_FRAME_SIZE, MIN_MAX_FRAME_SIZE,
@@ -2654,11 +2654,6 @@ fn reject_outcome<S: Shard + 'static>(
         waiter,
         Http2ClientReply::Outcome { stream_id, outcome },
     )
-}
-
-fn push_setting(out: &mut Vec<u8>, id: u16, value: u32) {
-    out.extend_from_slice(&id.to_be_bytes());
-    out.extend_from_slice(&value.to_be_bytes());
 }
 
 fn encode_request_headers(target: &Http2Target, req: &Http2ClientRequest) -> Vec<u8> {
