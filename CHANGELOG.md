@@ -19,9 +19,11 @@ This file records completed work.
   `GrpcRouter::server_streaming_buffered` with
   `GrpcBufferedServerStreamingResponse`. Small fixed message streams are framed
   once and returned as a shared buffered HTTP body, avoiding the old per-call
-  response-source isolate pool. `HttpResponseBody::Shared(Arc<[u8]>)` is a
-  first-class known-length body; HTTP/2 keeps it shared through response
-  admission and DATA framing.
+  response-source isolate pool. `GrpcBufferedStreamLimits` makes the
+  service-owned message count and framed-body byte cap explicit, with
+  overflow returning `ResourceExhausted` instead of streaming partial messages.
+  `HttpResponseBody::Shared(Arc<[u8]>)` is a first-class known-length body;
+  HTTP/2 keeps it shared through response admission and DATA framing.
 - Measured macOS/aarch64 release rows after the gRPC hot-path pass:
   `grpc_h2c_unary_warmed` load-worker allocations are 56 / 32 ops
   (down from 88 in the compact-only pass, and far below the old dynamic
