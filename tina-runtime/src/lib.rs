@@ -344,10 +344,10 @@ pub(crate) struct DeliveredMessage {
 
 /// Id source for one shard.
 ///
-/// Event ids are **per-shard-local**: each shard counts its own events from
-/// 1. The shard owner is single-threaded, so its event sequence is
-/// deterministic regardless of how shard worker threads interleave. The
-/// `(shard, event_id)` pair is the stable per-event key the trace hash and
+/// Event ids are per-shard-local: each shard counts its own events starting
+/// at one. The shard owner is single-threaded, so its event sequence is
+/// deterministic regardless of how shard worker threads interleave, and the
+/// shard-plus-event-id pair is the stable per-event key the trace hash and
 /// the snapshot sort rely on. A single global atomic event counter shared
 /// across shards would hand the id of a given logical event to whichever
 /// thread won a `fetch_add` race, which made the multishard trace hash flap.
