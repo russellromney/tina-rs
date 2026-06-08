@@ -133,6 +133,11 @@ sample policy.
    connected stream sockets, the HTTP/2 client coalesces ready frames into one
    pending write, and the public blocking gRPC/perf client helpers also set
    TCP_NODELAY.
+5. **gRPC status response allocation.** Unary and streaming gRPC response
+   helpers now insert `grpc-status` directly into the response header map, and
+   the streaming final-status path writes the two-field HPACK trailer block
+   directly instead of building a temporary `HeaderMap` and running the generic
+   trailer encoder.
 
 ### perf-h2-alloc (64 warmed h2c buffered responses, whole-process; client byte-identical so the delta is all server-side)
 
@@ -154,6 +159,10 @@ sample policy.
 | `http2_h2c_client_steady_state_post` allocations | 4266 | **3643** | **−14.6%** |
 | `http2_h2c_client_steady_state_post` allocated_bytes | 2161066 | **1685168** | **−22.0%** |
 | `grpc_h2c_unary_close` allocations | 5599 | **4964** | **−11.3%** |
+
+The direct gRPC status/trailer follow-up is smaller but real: final Linux
+whole-process samples for `tina_grpc_h2c_unary_close` sit around 4.85k-4.98k
+allocations per 32 ops, down from the earlier exact-code sample at ~5.08k.
 
 The native-client row proves the client path too: buffered POST bodies ride the
 client's owned-buffer/cursor DATA pacer, and response DATA is decoded through
@@ -200,11 +209,11 @@ framing work.
 Linux/x86_64 evidence is saved in `perf_sample_linux.txt`; Linux validation is
 saved in `linux_validation.txt`.
 
-Run:
+Final run:
 
 - Fly app: `tina-perf-150`
-- image: `registry.fly.io/tina-perf-150:deployment-01KTJB2YV7FC2KZGDV9DAW07KK`
-- machine: `2870667a3092e8` (destroyed after capture)
+- image: `registry.fly.io/tina-perf-150:deployment-01KTJEHDDSWVEJ6GSQT3Q6430S`
+- machine: `86e124be233618` (destroyed after capture)
 - VM: `performance-2x`, region `iad`
 
 Validation passed on Linux:
@@ -222,16 +231,22 @@ Representative Linux rows:
 
 | Row | p50 | p90 | p99 | Allocations | Bytes | Notes |
 | --- | ---: | ---: | ---: | ---: | ---: | --- |
-| `hotpath_call_blocking_tail` | 28 µs | 31 µs | 76 µs | 1 | n/a | no scheduler-gap spikes |
-| `http2_h2c_steady_state_small` | 80 µs | 163 µs | 1518 µs | 224 | 7072 | native server steady-state row is healthy; p99 noisy |
-| `http2_h2c_client_steady_state_post` | 434 µs | 535 µs | 591 µs | 120 | 142768 | native client+server warmed POST path |
-| `grpc_h2c_unary_close` | 949 µs | 1465 µs | 4832 µs | 608 | 25696 | fresh connection + public blocking gRPC helper |
-| `http2_h2c_close_request` | 859 µs | 1126 µs | 1543 µs | 288 | 7648 | fresh h2c connection/preface/settings/request |
-| `http2_h2c_keepalive_sequential` | 1397 µs | 1759 µs | 2130 µs | 960 | 28864 | fresh h2c connection + four sequential requests |
-| `websocket_steady_state_small` | 129 µs | 212 µs | 356 µs | 96 | 352 | reusable session path is fast |
+| `hotpath_call_blocking_tail` | 16 µs | 24 µs | 52 µs | 1 | n/a | no scheduler-gap spikes |
+| `perf-h2-alloc` | n/a | n/a | n/a | 2561 process / 64 req | n/a | Linux ceiling is 2640; test passed |
+| `http2_h2c_steady_state_small` | 144 µs | 190 µs | 216 µs | 224 | 7072 | native server steady-state row is healthy |
+| `http2_h2c_client_steady_state_post` | 399 µs | 555 µs | 664 µs | 113 | 140696 | native client+server warmed POST path |
+| `grpc_h2c_unary_close` | 1095 µs | 1331 µs | 1378 µs | 608 | 25696 | fresh connection + public blocking gRPC helper; p50 noisy but no 88 ms floor |
+| `http2_h2c_close_request` | 908 µs | 1197 µs | 1880 µs | 288 | 7648 | fresh h2c connection/preface/settings/request |
+| `http2_h2c_keepalive_sequential` | 1241 µs | 1755 µs | 3935 µs | 960 | 28864 | fresh h2c connection + four sequential requests |
+| `websocket_steady_state_small` | 66 µs | 178 µs | 1028 µs | 96 | 352 | reusable session path is fast; p99 noisy |
 
 The deterministic allocation wins reproduce on Linux, and the validation suite
 is green. The first Linux run surfaced an ugly ~88 ms delayed-ACK/Nagle floor on
 the client/gRPC rows; the final run proves that bug is fixed by coalescing HTTP/2
 client writes and setting TCP_NODELAY on Tina runtime sockets plus the blocking
 std-client helpers used by gRPC/perf evidence.
+
+The final Fly run also exposed a test portability bug: `perf-h2-alloc` had one
+macOS/aarch64 allocation ceiling. Linux/x86_64 is stable but slightly higher
+(~2561/64 requests), so the hotpath test now uses named per-platform ceilings
+instead of a fake universal allocator count.

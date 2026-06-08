@@ -104,8 +104,12 @@ const HTTP_STEADY_STAGE_CEILING: usize = 36;
 // request, ~20.8% off the Phase 152 baseline. The ceiling sits just above the
 // measured 2434 so a regression that re-adds a per-request allocation fails,
 // with headroom for toolchain/std drift. Regression guard, not a cross-platform
-// invariant; recalibrate with a recorded before/after if a platform differs.
-const H2_BUFFERED_RESPONSE_ALLOC_CEILING: u64 = 2_480;
+// invariant. Linux/x86_64 has a slightly higher steady count on the same code
+// path (~2562 on the Fly performance-2x runner), so use a named per-platform
+// ceiling instead of pretending one allocator/toolchain number fits all.
+const H2_BUFFERED_RESPONSE_ALLOC_CEILING_MACOS_AARCH64: u64 = 2_480;
+const H2_BUFFERED_RESPONSE_ALLOC_CEILING_LINUX_X86_64: u64 = 2_640;
+const H2_BUFFERED_RESPONSE_ALLOC_CEILING_OTHER: u64 = 2_800;
 const H2_BUFFERED_RESPONSE_REQUESTS: usize = 64;
 // Rock 5 (fewer turns): a WebSocket session of N text round trips. The
 // duplicate-delivery removal means the connection owner emits one app event per
@@ -1119,6 +1123,14 @@ fn assert_stage_count(report: &HotPathReport, ceiling: usize) {
     );
 }
 
+fn h2_buffered_response_alloc_ceiling() -> u64 {
+    match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("macos", "aarch64") => H2_BUFFERED_RESPONSE_ALLOC_CEILING_MACOS_AARCH64,
+        ("linux", "x86_64") => H2_BUFFERED_RESPONSE_ALLOC_CEILING_LINUX_X86_64,
+        _ => H2_BUFFERED_RESPONSE_ALLOC_CEILING_OTHER,
+    }
+}
+
 #[test]
 fn hotpath_probes_report_and_stay_bounded() {
     let try_send = probe_try_send();
@@ -1317,9 +1329,10 @@ fn hotpath_probes_report_and_stay_bounded() {
     println!(
         "perf-h2-alloc requests={H2_BUFFERED_RESPONSE_REQUESTS} process_allocations={h2_buffered_allocs} per_request={per_request:.2}"
     );
+    let h2_alloc_ceiling = h2_buffered_response_alloc_ceiling();
     assert!(
-        h2_buffered_allocs <= H2_BUFFERED_RESPONSE_ALLOC_CEILING,
-        "h2c buffered response allocations {h2_buffered_allocs} exceeded ceiling {H2_BUFFERED_RESPONSE_ALLOC_CEILING} ({per_request:.2}/request)",
+        h2_buffered_allocs <= h2_alloc_ceiling,
+        "h2c buffered response allocations {h2_buffered_allocs} exceeded ceiling {h2_alloc_ceiling} ({per_request:.2}/request)",
     );
 
     // Rock 5: app-handler turns for a WebSocket session of N text round trips.

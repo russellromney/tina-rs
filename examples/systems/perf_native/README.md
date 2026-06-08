@@ -523,6 +523,10 @@ performance claim.
   directly, while the `tina-http` correctness suite still guards the protocol
   edges (incl. the 128 KB `large_upload_paces_through_real_window_updates`
   flow-control test).
+- gRPC status responses avoid temporary status maps/strings where the protocol
+  shape is fixed: unary/streaming helpers insert `grpc-status` directly into
+  the response headers, and the streaming final-status path writes the tiny
+  HPACK trailer block directly.
 - WebSocket ping echoes its payload into the pong from a borrowed slice
   (`encode_server_frame_from`) and moves the owned payload into the app `Ping`
   notification — no clone.
@@ -541,7 +545,8 @@ dominated by paths that are *not* framing:
   returning the response (out of scope: no scheduler/runtime change).
 - The raw-socket test client's own per-frame allocations (harness, not Tina).
 - gRPC messages still allocate the length-prefixed frame buffer
-  (`encode_grpc_message`) plus prost's internal encode.
+  (`encode_grpc_message`) plus prost's internal encode. Status-header/trailer
+  construction is cheaper now, but protobuf payload construction is unchanged.
 
 Reducing the first two means a different HPACK header model or a borrowed
 request view — a separate, larger change, not more framing work.
@@ -568,8 +573,14 @@ Final Linux representative rows:
 
 | row | p50 | p90 | p99 | note |
 | --- | ---: | ---: | ---: | --- |
-| `http2_h2c_steady_state_small` | 80 µs | 163 µs | 1518 µs | native server steady-state; p99 noisy |
-| `http2_h2c_client_steady_state_post` | 434 µs | 535 µs | 591 µs | native client + native server warmed POST |
-| `grpc_h2c_unary_close` | 949 µs | 1465 µs | 4832 µs | fresh h2c connection + unary call |
-| `http2_h2c_close_request` | 859 µs | 1126 µs | 1543 µs | fresh h2c connection + one request |
-| `websocket_steady_state_small` | 129 µs | 212 µs | 356 µs | reusable session path |
+| `http2_h2c_steady_state_small` | 144 µs | 190 µs | 216 µs | native server steady-state |
+| `http2_h2c_client_steady_state_post` | 399 µs | 555 µs | 664 µs | native client + native server warmed POST |
+| `grpc_h2c_unary_close` | 1095 µs | 1331 µs | 1378 µs | fresh h2c connection + unary call; no 88 ms floor |
+| `http2_h2c_close_request` | 908 µs | 1197 µs | 1880 µs | fresh h2c connection + one request |
+| `websocket_steady_state_small` | 66 µs | 178 µs | 1028 µs | reusable session path; p99 noisy |
+
+The Linux `perf-h2-alloc` hotpath assertion is platform-aware now:
+macOS/aarch64 remains pinned at 2480 allocations/64 requests, while Linux/x86_64
+allows 2640. The final Linux run measured 2561 and passed. This keeps the
+regression guard useful without pretending allocator/toolchain counts are
+identical across platforms.
