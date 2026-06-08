@@ -812,6 +812,102 @@ fn http2_peer_max_frame_size_splits_large_user_response() {
 }
 
 #[test]
+fn http2_multi_frame_response_marks_end_stream_only_on_last_data_frame() {
+    // Guards the Phase 152 buffered-response framing rewrite: the server now
+    // builds each DATA frame straight into the write queue (header bytes, then
+    // the borrowed body slice) instead of cloning each chunk into a `Frame`
+    // and re-encoding it. The exact edges that change could break: byte order,
+    // END_STREAM placement, and the HEADERS terminal flag.
+    let config = Http2ServerConfig {
+        limits: Http2Limits {
+            max_body_bytes: 60_000,
+            max_response_body_bytes: 60_000,
+            initial_connection_window: 60_000,
+            initial_stream_window: 60_000,
+            ..Http2Limits::default()
+        },
+        ..Http2ServerConfig::default()
+    };
+    let harness = Http2Harness::start(config);
+    let mut stream = connect_h2(harness.addr);
+    write_settings(&mut stream, &[(SETTINGS_MAX_FRAME_SIZE, 16_384)]);
+    let ack = read_frame(&mut stream);
+    assert_eq!(ack.ty, FRAME_SETTINGS);
+    assert_ne!(ack.flags & FLAG_ACK, 0);
+
+    // A distinct byte per position so a reorder, truncation, or duplication is
+    // caught; sized to force three outbound DATA frames at a 16384 frame size.
+    let body: Vec<u8> = (0..40_000u32).map(|i| (i % 251) as u8).collect();
+    write_frame(
+        &mut stream,
+        FRAME_HEADERS,
+        FLAG_END_HEADERS,
+        1,
+        &request_headers("POST", "/echo"),
+    );
+    write_data_chunks(&mut stream, 1, &body);
+
+    let mut received = Vec::new();
+    let mut data_frames = 0;
+    let mut end_stream_frames = 0;
+    let mut headers_end_stream = false;
+    let mut last_frame_had_end_stream = false;
+    for _ in 0..16 {
+        let frame = read_frame(&mut stream);
+        if frame.stream_id != 1 {
+            continue;
+        }
+        match frame.ty {
+            FRAME_HEADERS => {
+                if frame.flags & FLAG_END_STREAM != 0 {
+                    headers_end_stream = true;
+                }
+            }
+            FRAME_DATA => {
+                // No DATA frame after a terminal one may arrive.
+                assert!(
+                    !last_frame_had_end_stream,
+                    "a DATA frame followed one already marked END_STREAM"
+                );
+                data_frames += 1;
+                let this_end = frame.flags & FLAG_END_STREAM != 0;
+                last_frame_had_end_stream = this_end;
+                if this_end {
+                    end_stream_frames += 1;
+                }
+                received.extend_from_slice(&frame.payload);
+                if this_end {
+                    break;
+                }
+            }
+            FRAME_WINDOW_UPDATE => {}
+            other => panic!("unexpected frame {other}: {frame:?}"),
+        }
+    }
+    assert_eq!(
+        received, body,
+        "multi-frame body must reassemble byte-for-byte"
+    );
+    assert!(
+        data_frames >= 3,
+        "patterned body should split into >= 3 DATA frames; got {data_frames}"
+    );
+    assert_eq!(
+        end_stream_frames, 1,
+        "exactly one DATA frame carries END_STREAM"
+    );
+    assert!(
+        last_frame_had_end_stream,
+        "the final DATA frame must carry END_STREAM"
+    );
+    assert!(
+        !headers_end_stream,
+        "HEADERS must not claim END_STREAM while a body follows"
+    );
+    harness.shutdown();
+}
+
+#[test]
 fn http2_settings_initial_window_shrink_blocks_until_window_update() {
     let harness = Http2Harness::start(Http2ServerConfig::default());
     let mut stream = connect_h2(harness.addr);

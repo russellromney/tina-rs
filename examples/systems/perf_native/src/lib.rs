@@ -20,8 +20,9 @@ use tina::CallRejectedReason;
 use tina::capacity::{CapacityMode, CapacitySurfaceReport};
 use tina::prelude::*;
 use tina_http::{
-    BodyMetrics, HttpLimits, HttpListener, HttpListenerMsg, HttpRequest, HttpResponse,
-    HttpServerConfig, StatusCode,
+    BodyMetrics, Http2Listener, Http2ListenerMsg, Http2ServerConfig, HttpLimits, HttpListener,
+    HttpListenerAddress, HttpListenerMsg, HttpRequest, HttpResponse, HttpServerConfig, StatusCode,
+    WebSocketLimits, WebSocketSessionMsg, WebSocketSessionOutcome, websocket_upgrade,
 };
 use tina_proof_harness::{
     LoadObservation, LoadReport, LoadRun, LoadStop, OpOutcome, PerfAllocationReport,
@@ -1541,5 +1542,884 @@ fn shutdown_runtime(
             Ok(())
         }
         Err(_) => anyhow::bail!("runtime still shared after perf row"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Native protocol rows (HTTP/2 h2c, WebSocket).
+//
+// These are Tina-only rows (`comparison_baseline=none`): a fair hyper/tonic or
+// tungstenite baseline would dwarf the row and make semantic equality a lie, so
+// the plan keeps the first form Tina-only. Each row drives the *real* Tina
+// server isolate (Http2Listener / HttpListener+WebSocket gateway) over a raw
+// socket client, exactly like the HTTP/1 rows drive the real server over a raw
+// `TcpStream`. Allocation counts include the raw client work inside the row
+// op; process rows include both client and server work. Treat them as
+// whole-operation evidence, not server-only allocation proof.
+//
+// `kind` carries the setup-vs-reuse class so connection setup cost is never
+// silently mixed with steady-state service cost:
+//   - `connection_setup`           one fresh connection per op
+//   - `connection_setup_amortized` one fresh connection, several requests
+//   - `steady_state_reuse`         warmed connection reused across ops
+// ---------------------------------------------------------------------------
+
+const PROTOCOL_OPS: u64 = HTTP_OPS;
+const H2_KEEPALIVE_REQUESTS_PER_CONN: usize = KEEPALIVE_REQUESTS_PER_CONN;
+// Generous client-side socket timeout for the native protocol rows. These rows
+// run four raw clients against one single-shard worker, so tails are wide; the
+// timeout only exists to fail a genuine hang, not to clip a slow-but-real op on
+// a contended machine. Kept well above the worst observed tail.
+const PROTOCOL_CLIENT_TIMEOUT: Duration = Duration::from_secs(5);
+
+type PerfRuntime = Arc<ThreadedRuntime<SingleShard, DefaultThreadedMailboxFactory>>;
+
+/// All Tina-only native protocol rows. Returned as `PerfReport`s (not
+/// comparisons): each prints a `perf ...` line with `comparison_baseline=none`.
+///
+/// Each row is sampled the same way the comparison rows are — one warmup run
+/// discarded, then the median-of-`SAMPLES` by p50 — so the reported row matches
+/// the suite's documented methodology instead of being a single noisy run.
+pub fn run_native_rows() -> anyhow::Result<Vec<PerfReport>> {
+    Ok(vec![
+        native_sampled(http2_h2c_close_row)?,
+        native_sampled(http2_h2c_keepalive_row)?,
+        native_sampled(http2_h2c_steady_state_small_row)?,
+        native_sampled(websocket_open_close_row)?,
+        native_sampled(websocket_text_round_trip_row)?,
+        native_sampled(websocket_steady_state_small_row)?,
+    ])
+}
+
+/// Warmup-then-median-of-five for a native row, mirroring `compare_samples`.
+/// The warmup run lets one-time runtime/allocator setup happen before the
+/// measured samples; `median_report` then picks the median-p50 sample.
+fn native_sampled(row: fn() -> anyhow::Result<PerfReport>) -> anyhow::Result<PerfReport> {
+    let _ = row()?;
+    let mut reports = Vec::with_capacity(SAMPLES);
+    for _ in 0..SAMPLES {
+        reports.push(row()?);
+    }
+    Ok(median_report(reports).with_samples(SAMPLES, "median_p50_after_warmup"))
+}
+
+// ---- HTTP/2 (h2c) ----------------------------------------------------------
+
+const H2_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+const H2_FRAME_DATA: u8 = 0x0;
+const H2_FRAME_HEADERS: u8 = 0x1;
+const H2_FRAME_RST_STREAM: u8 = 0x3;
+const H2_FRAME_SETTINGS: u8 = 0x4;
+const H2_FLAG_ACK: u8 = 0x1;
+const H2_FLAG_END_STREAM: u8 = 0x1;
+const H2_FLAG_END_HEADERS: u8 = 0x4;
+
+struct H2Frame {
+    ty: u8,
+    flags: u8,
+    stream_id: u32,
+    payload: Vec<u8>,
+}
+
+fn start_h2_server(body: Vec<u8>) -> anyhow::Result<(PerfRuntime, Address<Http2ListenerMsg>, SocketAddr)> {
+    let runtime = new_runtime();
+    let service = runtime
+        .register_with_capacity::<_, Infallible>(
+            BodyService {
+                body: Arc::new(body),
+            },
+            CAPACITY,
+        )
+        .map_err(|e| anyhow::anyhow!("register tina http2 service: {e:?}"))?;
+    let config = Http2ServerConfig::dev();
+    let listener = runtime
+        .register_with_capacity::<Http2Listener<SingleShard>, _>(
+            Http2Listener::<SingleShard>::new("127.0.0.1:0".parse()?, service, config),
+            config.listener_mailbox_capacity,
+        )
+        .map_err(|e| anyhow::anyhow!("register tina http2 listener: {e:?}"))?;
+    let bound = runtime.observe_next_bound();
+    runtime
+        .try_send(listener, Http2ListenerMsg::Start)
+        .map_err(|e| anyhow::anyhow!("start tina http2 listener: {e:?}"))?;
+    let addr = bound
+        .wait(Duration::from_secs(2))
+        .map_err(|e| anyhow::anyhow!("observe tina http2 bind: {e:?}"))?;
+    Ok((runtime, listener, addr))
+}
+
+fn h2c_connect(addr: SocketAddr) -> anyhow::Result<TcpStream> {
+    let mut stream = TcpStream::connect_timeout(&addr, PROTOCOL_CLIENT_TIMEOUT)?;
+    stream.set_read_timeout(Some(PROTOCOL_CLIENT_TIMEOUT))?;
+    stream.set_write_timeout(Some(PROTOCOL_CLIENT_TIMEOUT))?;
+    stream.write_all(H2_PREFACE)?;
+    h2_write_frame(&mut stream, H2_FRAME_SETTINGS, 0, 0, &[])?;
+    let mut saw_settings = false;
+    let mut saw_ack = false;
+    for _ in 0..6 {
+        let frame = h2_read_frame(&mut stream)?;
+        if frame.ty == H2_FRAME_SETTINGS && frame.flags & H2_FLAG_ACK == 0 {
+            saw_settings = true;
+            h2_write_frame(&mut stream, H2_FRAME_SETTINGS, H2_FLAG_ACK, 0, &[])?;
+        } else if frame.ty == H2_FRAME_SETTINGS && frame.flags & H2_FLAG_ACK != 0 {
+            saw_ack = true;
+        }
+        if saw_settings && saw_ack {
+            return Ok(stream);
+        }
+    }
+    anyhow::bail!("h2c settings handshake did not complete")
+}
+
+fn h2_write_frame(
+    stream: &mut TcpStream,
+    ty: u8,
+    flags: u8,
+    stream_id: u32,
+    payload: &[u8],
+) -> anyhow::Result<()> {
+    let len = payload.len();
+    let mut out = Vec::with_capacity(9 + len);
+    out.push(((len >> 16) & 0xff) as u8);
+    out.push(((len >> 8) & 0xff) as u8);
+    out.push((len & 0xff) as u8);
+    out.push(ty);
+    out.push(flags);
+    out.extend_from_slice(&(stream_id & 0x7fff_ffff).to_be_bytes());
+    out.extend_from_slice(payload);
+    stream.write_all(&out)?;
+    stream.flush()?;
+    Ok(())
+}
+
+fn h2_read_frame(stream: &mut TcpStream) -> anyhow::Result<H2Frame> {
+    let mut head = [0u8; 9];
+    stream.read_exact(&mut head)?;
+    let len = ((head[0] as usize) << 16) | ((head[1] as usize) << 8) | head[2] as usize;
+    let mut payload = vec![0u8; len];
+    stream.read_exact(&mut payload)?;
+    let mut sid = [0u8; 4];
+    sid.copy_from_slice(&head[5..9]);
+    Ok(H2Frame {
+        ty: head[3],
+        flags: head[4],
+        stream_id: u32::from_be_bytes(sid) & 0x7fff_ffff,
+        payload,
+    })
+}
+
+fn h2_request_block(path: &str) -> Vec<u8> {
+    // Minimal literal-never-indexed HPACK block, the same shape the live h2c
+    // test client uses. Enough for the server's HPACK decoder; no dynamic table.
+    let mut block = Vec::new();
+    h2_literal(":method", "GET", &mut block);
+    h2_literal(":scheme", "http", &mut block);
+    h2_literal(":path", path, &mut block);
+    h2_literal(":authority", "localhost", &mut block);
+    block
+}
+
+fn h2_literal(name: &str, value: &str, out: &mut Vec<u8>) {
+    out.push(0);
+    h2_hpack_string(name, out);
+    h2_hpack_string(value, out);
+}
+
+fn h2_hpack_string(value: &str, out: &mut Vec<u8>) {
+    assert!(value.len() < 127);
+    out.push(value.len() as u8);
+    out.extend_from_slice(value.as_bytes());
+}
+
+/// One GET on an existing h2c connection: send HEADERS(END_STREAM), read frames
+/// for `stream_id` until END_STREAM, assert the reassembled body length matches
+/// and no RST_STREAM landed.
+fn h2c_get(
+    stream: &mut TcpStream,
+    stream_id: u32,
+    path: &str,
+    expected_len: usize,
+) -> anyhow::Result<()> {
+    let block = h2_request_block(path);
+    h2_write_frame(
+        stream,
+        H2_FRAME_HEADERS,
+        H2_FLAG_END_HEADERS | H2_FLAG_END_STREAM,
+        stream_id,
+        &block,
+    )?;
+    let mut body = 0usize;
+    let mut saw_headers = false;
+    let mut ended = false;
+    for _ in 0..32 {
+        let frame = h2_read_frame(stream)?;
+        if frame.stream_id != stream_id {
+            continue;
+        }
+        match frame.ty {
+            H2_FRAME_HEADERS => {
+                saw_headers = true;
+                if frame.flags & H2_FLAG_END_STREAM != 0 {
+                    ended = true;
+                    break;
+                }
+            }
+            H2_FRAME_DATA => {
+                body += frame.payload.len();
+                if frame.flags & H2_FLAG_END_STREAM != 0 {
+                    ended = true;
+                    break;
+                }
+            }
+            H2_FRAME_RST_STREAM => anyhow::bail!("h2 stream {stream_id} reset"),
+            _ => {}
+        }
+    }
+    // A valid response must carry a HEADERS frame (the status block) and reach
+    // END_STREAM. Length-only checks would let a malformed/headerless or
+    // truncated response pass; require both.
+    if !saw_headers {
+        anyhow::bail!("h2 stream {stream_id} produced no HEADERS frame");
+    }
+    if !ended {
+        anyhow::bail!("h2 stream {stream_id} did not reach END_STREAM");
+    }
+    if body != expected_len {
+        anyhow::bail!("unexpected h2 body len {body}, expected {expected_len}");
+    }
+    Ok(())
+}
+
+fn http2_h2c_close_row() -> anyhow::Result<PerfReport> {
+    let (runtime, listener, addr) = start_h2_server(small_body())?;
+    let expected = small_body().len();
+    h2c_one_request(addr, expected)?; // warm one full connection + request
+
+    let process_before = ProcessSnapshot::now();
+    let (load, allocations) = run_counted(
+        LoadRun {
+            workers: WORKERS,
+            stop: LoadStop::ops(PROTOCOL_OPS),
+            label: "tina_http2_h2c_close_request",
+        },
+        move |_| match h2c_one_request(addr, expected) {
+            Ok(()) => OpOutcome::Ok,
+            Err(_) => OpOutcome::Err { kind: "http2_error" },
+        },
+        None::<fn() -> LoadObservation>,
+    );
+    let (allocs, bytes, rss) = ProcessSnapshot::now().delta_from(process_before);
+    print_process_metrics("tina_http2_h2c_close_request", allocs, bytes, rss);
+    let _ = runtime.try_send(listener, Http2ListenerMsg::Stop);
+    shutdown_runtime(runtime)?;
+    Ok(PerfReport::from_load_with_allocations(
+        "http2_h2c_close_request",
+        "connection_setup",
+        load,
+        allocations,
+    ))
+}
+
+fn h2c_one_request(addr: SocketAddr, expected: usize) -> anyhow::Result<()> {
+    let mut stream = h2c_connect(addr)?;
+    h2c_get(&mut stream, 1, "/", expected)
+}
+
+fn http2_h2c_keepalive_row() -> anyhow::Result<PerfReport> {
+    let (runtime, listener, addr) = start_h2_server(small_body())?;
+    let expected = small_body().len();
+    h2c_keepalive_op(addr, expected)?; // warm
+
+    let process_before = ProcessSnapshot::now();
+    let (load, allocations) = run_counted(
+        LoadRun {
+            workers: WORKERS,
+            stop: LoadStop::ops(PROTOCOL_OPS),
+            label: "tina_http2_h2c_keepalive_sequential",
+        },
+        move |_| match h2c_keepalive_op(addr, expected) {
+            Ok(()) => OpOutcome::Ok,
+            Err(_) => OpOutcome::Err { kind: "http2_error" },
+        },
+        None::<fn() -> LoadObservation>,
+    );
+    let (allocs, bytes, rss) = ProcessSnapshot::now().delta_from(process_before);
+    print_process_metrics("tina_http2_h2c_keepalive_sequential", allocs, bytes, rss);
+    let _ = runtime.try_send(listener, Http2ListenerMsg::Stop);
+    shutdown_runtime(runtime)?;
+    Ok(PerfReport::from_load_with_allocations(
+        "http2_h2c_keepalive_sequential",
+        "connection_setup_amortized",
+        load,
+        allocations,
+    ))
+}
+
+fn h2c_keepalive_op(addr: SocketAddr, expected: usize) -> anyhow::Result<()> {
+    let mut stream = h2c_connect(addr)?;
+    for i in 0..H2_KEEPALIVE_REQUESTS_PER_CONN {
+        // HTTP/2 client streams use odd, strictly-increasing ids.
+        h2c_get(&mut stream, (1 + 2 * i) as u32, "/", expected)?;
+    }
+    Ok(())
+}
+
+fn http2_h2c_steady_state_small_row() -> anyhow::Result<PerfReport> {
+    let (runtime, listener, addr) = start_h2_server(small_body())?;
+    let expected = small_body().len();
+
+    // One warmed connection per load worker. Each carries its own next odd
+    // stream id so reuse across ops stays protocol-legal.
+    let mut conns = Vec::with_capacity(WORKERS);
+    for _ in 0..WORKERS {
+        let mut stream = h2c_connect(addr)?;
+        h2c_get(&mut stream, 1, "/", expected)?; // warm
+        conns.push(Mutex::new(Some((stream, 3u32))));
+    }
+    let conns = Arc::new(conns);
+
+    let process_before = ProcessSnapshot::now();
+    let (load, allocations) = {
+        let conns = Arc::clone(&conns);
+        run_counted(
+            LoadRun {
+                workers: WORKERS,
+                stop: LoadStop::ops(PROTOCOL_OPS),
+                label: "tina_http2_h2c_steady_state_small",
+            },
+            move |worker_id| {
+                let Some(slot) = conns.get(worker_id) else {
+                    return OpOutcome::Err {
+                        kind: "missing_worker_stream",
+                    };
+                };
+                let mut guard = slot.lock().expect("h2 steady lock");
+                let Some((stream, next_id)) = guard.as_mut() else {
+                    return OpOutcome::Err {
+                        kind: "closed_worker_stream",
+                    };
+                };
+                let id = *next_id;
+                *next_id += 2;
+                match h2c_get(stream, id, "/", expected) {
+                    Ok(()) => OpOutcome::Ok,
+                    Err(_) => OpOutcome::Err { kind: "http2_error" },
+                }
+            },
+            None::<fn() -> LoadObservation>,
+        )
+    };
+    let (allocs, bytes, rss) = ProcessSnapshot::now().delta_from(process_before);
+    print_process_metrics("tina_http2_h2c_steady_state_small", allocs, bytes, rss);
+    for slot in conns.iter() {
+        let _ = slot.lock().expect("h2 steady lock").take();
+    }
+    let _ = runtime.try_send(listener, Http2ListenerMsg::Stop);
+    shutdown_runtime(runtime)?;
+    Ok(PerfReport::from_load_with_allocations(
+        "http2_h2c_steady_state_small",
+        "steady_state_reuse",
+        load,
+        allocations,
+    ))
+}
+
+// ---- WebSocket -------------------------------------------------------------
+
+const WS_OPCODE_TEXT: u8 = 0x1;
+const WS_OPCODE_CLOSE: u8 = 0x8;
+const WS_CLOSE_NORMAL: [u8; 2] = [0x03, 0xe8]; // code 1000, big-endian
+
+#[derive(Debug)]
+struct WsGateway {
+    app: Address<WebSocketSessionMsg, WebSocketSessionOutcome>,
+    limits: WebSocketLimits,
+}
+
+#[tina_runtime::isolate(message = HttpRequest, reply = HttpResponse)]
+impl WsGateway {
+    fn handle(
+        &mut self,
+        _request: HttpRequest,
+        _ctx: &mut Context<'_, SingleShard, Self::Reply>,
+    ) -> Effect<Self> {
+        noop()
+    }
+
+    fn handle_call(&mut self, request: HttpRequest, call: CallContext<'_, Self>) -> Effect<Self> {
+        call.reply(self.response_for(request))
+    }
+}
+
+impl WsGateway {
+    fn response_for(&self, request: HttpRequest) -> HttpResponse {
+        match websocket_upgrade(&request, self.limits) {
+            Ok(upgrade) => HttpResponse::websocket(upgrade.accept(self.app, self.limits)),
+            Err(_) => HttpResponse::bad_request(),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct WsApp {
+    overfill_bytes: usize,
+    pressure_count: Arc<AtomicU64>,
+}
+
+#[tina_runtime::isolate(message = WebSocketSessionMsg, reply = WebSocketSessionOutcome)]
+impl WsApp {
+    fn handle(
+        &mut self,
+        msg: WebSocketSessionMsg,
+        _ctx: &mut Context<'_, SingleShard, Self::Reply>,
+    ) -> Effect<Self> {
+        reply(self.outcome_for(msg))
+    }
+
+    fn handle_call(&mut self, msg: WebSocketSessionMsg, call: CallContext<'_, Self>) -> Effect<Self> {
+        call.reply(self.outcome_for(msg))
+    }
+}
+
+impl WsApp {
+    fn outcome_for(&self, msg: WebSocketSessionMsg) -> WebSocketSessionOutcome {
+        match msg {
+            WebSocketSessionMsg::Text(text) if self.overfill_bytes > 0 && text == "overfill" => {
+                // Reply larger than the bounded outbound capacity to force a
+                // typed pressure event on the connection.
+                WebSocketSessionOutcome::Text("x".repeat(self.overfill_bytes))
+            }
+            WebSocketSessionMsg::Text(text) => WebSocketSessionOutcome::Text(text),
+            WebSocketSessionMsg::Binary(bytes) => WebSocketSessionOutcome::Binary(bytes),
+            WebSocketSessionMsg::Close(code, reason) => WebSocketSessionOutcome::Close(code, reason),
+            // Count ONLY the typed `SessionPressure` surface, not the legacy
+            // `Pressure(_)` spelling: the probe must prove the typed event
+            // fires exactly once per op, and counting both would let a regression
+            // that doubled or renamed the event slip past an exact-count check.
+            WebSocketSessionMsg::SessionPressure { .. } => {
+                self.pressure_count.fetch_add(1, Ordering::Relaxed);
+                WebSocketSessionOutcome::None
+            }
+            _ => WebSocketSessionOutcome::None,
+        }
+    }
+}
+
+fn start_ws_server(
+    limits: WebSocketLimits,
+    overfill_bytes: usize,
+    pressure_count: Arc<AtomicU64>,
+) -> anyhow::Result<(PerfRuntime, HttpListenerAddress, SocketAddr)> {
+    let runtime = new_runtime();
+    let app = runtime
+        .register_with_capacity::<_, Infallible>(
+            WsApp {
+                overfill_bytes,
+                pressure_count,
+            },
+            CAPACITY,
+        )
+        .map_err(|e| anyhow::anyhow!("register tina ws app: {e:?}"))?;
+    let gateway = runtime
+        .register_with_capacity::<_, Infallible>(WsGateway { app, limits }, CAPACITY)
+        .map_err(|e| anyhow::anyhow!("register tina ws gateway: {e:?}"))?;
+    let config = HttpServerConfig::dev();
+    let listener = runtime
+        .register_with_capacity::<_, Infallible>(
+            HttpListener::<SingleShard>::with_config("127.0.0.1:0".parse()?, gateway, config),
+            config.listener_mailbox_capacity,
+        )
+        .map_err(|e| anyhow::anyhow!("register tina ws listener: {e:?}"))?;
+    let bound = runtime.observe_next_bound();
+    runtime
+        .try_send(listener, HttpListenerMsg::Start)
+        .map_err(|e| anyhow::anyhow!("start tina ws listener: {e:?}"))?;
+    let addr = bound
+        .wait(Duration::from_secs(2))
+        .map_err(|e| anyhow::anyhow!("observe tina ws bind: {e:?}"))?;
+    Ok((runtime, listener, addr))
+}
+
+fn ws_connect(addr: SocketAddr) -> anyhow::Result<TcpStream> {
+    let mut stream = TcpStream::connect_timeout(&addr, PROTOCOL_CLIENT_TIMEOUT)?;
+    stream.set_read_timeout(Some(PROTOCOL_CLIENT_TIMEOUT))?;
+    stream.set_write_timeout(Some(PROTOCOL_CLIENT_TIMEOUT))?;
+    stream.write_all(
+        b"GET /ws HTTP/1.1\r\n\
+          Host: x\r\n\
+          Upgrade: websocket\r\n\
+          Connection: Upgrade\r\n\
+          Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+          Sec-WebSocket-Version: 13\r\n\r\n",
+    )?;
+    stream.flush()?;
+    let mut head = Vec::with_capacity(256);
+    let mut byte = [0u8; 1];
+    while !head.ends_with(b"\r\n\r\n") {
+        let n = stream.read(&mut byte)?;
+        if n == 0 {
+            anyhow::bail!("peer closed before websocket upgrade response");
+        }
+        head.push(byte[0]);
+        if head.len() > 64 * 1024 {
+            anyhow::bail!("websocket upgrade response head too large");
+        }
+    }
+    if !head.starts_with(b"HTTP/1.1 101") {
+        anyhow::bail!("unexpected websocket upgrade response");
+    }
+    Ok(stream)
+}
+
+fn ws_masked_frame(opcode: u8, payload: &[u8]) -> Vec<u8> {
+    let mask = [1u8, 2, 3, 4];
+    let mut out = vec![0x80 | opcode];
+    if payload.len() < 126 {
+        out.push(0x80 | payload.len() as u8);
+    } else {
+        out.push(0x80 | 126);
+        out.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+    }
+    out.extend_from_slice(&mask);
+    for (i, b) in payload.iter().enumerate() {
+        out.push(*b ^ mask[i % 4]);
+    }
+    out
+}
+
+// Returns `io::Result` so callers can tell a clean peer EOF
+// (`UnexpectedEof` -> pressure close) apart from a read timeout or other I/O
+// error (a hang or transport failure, which must NOT be reported as pressure).
+fn ws_read_frame(stream: &mut TcpStream) -> std::io::Result<(u8, Vec<u8>)> {
+    let mut head = [0u8; 2];
+    stream.read_exact(&mut head)?;
+    let opcode = head[0] & 0x0f;
+    let mut len = usize::from(head[1] & 0x7f);
+    if len == 126 {
+        let mut wide = [0u8; 2];
+        stream.read_exact(&mut wide)?;
+        len = usize::from(u16::from_be_bytes(wide));
+    } else if len == 127 {
+        let mut wide = [0u8; 8];
+        stream.read_exact(&mut wide)?;
+        len = u64::from_be_bytes(wide) as usize;
+    }
+    let mut payload = vec![0u8; len];
+    stream.read_exact(&mut payload)?;
+    Ok((opcode, payload))
+}
+
+fn ws_send_text_recv(stream: &mut TcpStream, text: &[u8]) -> anyhow::Result<()> {
+    stream.write_all(&ws_masked_frame(WS_OPCODE_TEXT, text))?;
+    stream.flush()?;
+    let (opcode, payload) = ws_read_frame(stream)?;
+    if opcode != WS_OPCODE_TEXT || payload != text {
+        anyhow::bail!("unexpected websocket echo opcode={opcode}");
+    }
+    Ok(())
+}
+
+fn ws_send_close(stream: &mut TcpStream) -> anyhow::Result<()> {
+    stream.write_all(&ws_masked_frame(WS_OPCODE_CLOSE, &WS_CLOSE_NORMAL))?;
+    stream.flush()?;
+    // Drain until a close frame or EOF; both are a clean close handshake end.
+    loop {
+        match ws_read_frame(stream) {
+            Ok((WS_OPCODE_CLOSE, _)) => return Ok(()),
+            Ok(_) => continue,
+            Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
+            Err(err) => return Err(err.into()),
+        }
+    }
+}
+
+fn ws_open_close_op(addr: SocketAddr) -> anyhow::Result<()> {
+    let mut stream = ws_connect(addr)?;
+    ws_send_close(&mut stream)
+}
+
+fn ws_text_round_trip_op(addr: SocketAddr) -> anyhow::Result<()> {
+    let mut stream = ws_connect(addr)?;
+    ws_send_text_recv(&mut stream, b"hello")?;
+    ws_send_close(&mut stream)
+}
+
+fn websocket_open_close_row() -> anyhow::Result<PerfReport> {
+    ws_setup_row(
+        "websocket_open_close",
+        "connection_setup",
+        "tina_websocket_open_close",
+        ws_open_close_op,
+    )
+}
+
+fn websocket_text_round_trip_row() -> anyhow::Result<PerfReport> {
+    ws_setup_row(
+        "websocket_text_round_trip",
+        "connection_setup",
+        "tina_websocket_text_round_trip",
+        ws_text_round_trip_op,
+    )
+}
+
+fn ws_setup_row(
+    label: &'static str,
+    kind: &'static str,
+    run_label: &'static str,
+    op: fn(SocketAddr) -> anyhow::Result<()>,
+) -> anyhow::Result<PerfReport> {
+    let (runtime, listener, addr) =
+        start_ws_server(WebSocketLimits::default(), 0, Arc::new(AtomicU64::new(0)))?;
+    op(addr)?; // warm
+
+    let process_before = ProcessSnapshot::now();
+    let (load, allocations) = run_counted(
+        LoadRun {
+            workers: WORKERS,
+            stop: LoadStop::ops(PROTOCOL_OPS),
+            label: run_label,
+        },
+        move |_| match op(addr) {
+            Ok(()) => OpOutcome::Ok,
+            Err(_) => OpOutcome::Err { kind: "ws_error" },
+        },
+        None::<fn() -> LoadObservation>,
+    );
+    let (allocs, bytes, rss) = ProcessSnapshot::now().delta_from(process_before);
+    print_process_metrics(run_label, allocs, bytes, rss);
+    let _ = runtime.try_send(listener, HttpListenerMsg::Stop);
+    shutdown_runtime(runtime)?;
+    Ok(PerfReport::from_load_with_allocations(label, kind, load, allocations))
+}
+
+fn websocket_steady_state_small_row() -> anyhow::Result<PerfReport> {
+    let (runtime, listener, addr) =
+        start_ws_server(WebSocketLimits::default(), 0, Arc::new(AtomicU64::new(0)))?;
+
+    let mut streams = Vec::with_capacity(WORKERS);
+    for _ in 0..WORKERS {
+        let mut stream = ws_connect(addr)?;
+        ws_send_text_recv(&mut stream, b"ok")?; // warm
+        streams.push(Mutex::new(Some(stream)));
+    }
+    let streams = Arc::new(streams);
+
+    let process_before = ProcessSnapshot::now();
+    let (load, allocations) = {
+        let streams = Arc::clone(&streams);
+        run_counted(
+            LoadRun {
+                workers: WORKERS,
+                stop: LoadStop::ops(PROTOCOL_OPS),
+                label: "tina_websocket_steady_state_small",
+            },
+            move |worker_id| {
+                let Some(slot) = streams.get(worker_id) else {
+                    return OpOutcome::Err {
+                        kind: "missing_worker_stream",
+                    };
+                };
+                let mut guard = slot.lock().expect("ws steady lock");
+                let Some(stream) = guard.as_mut() else {
+                    return OpOutcome::Err {
+                        kind: "closed_worker_stream",
+                    };
+                };
+                match ws_send_text_recv(stream, b"ok") {
+                    Ok(()) => OpOutcome::Ok,
+                    Err(_) => OpOutcome::Err { kind: "ws_error" },
+                }
+            },
+            None::<fn() -> LoadObservation>,
+        )
+    };
+    let (allocs, bytes, rss) = ProcessSnapshot::now().delta_from(process_before);
+    print_process_metrics("tina_websocket_steady_state_small", allocs, bytes, rss);
+    for slot in streams.iter() {
+        if let Some(mut stream) = slot.lock().expect("ws steady lock").take() {
+            let _ = ws_send_close(&mut stream);
+        }
+    }
+    let _ = runtime.try_send(listener, HttpListenerMsg::Stop);
+    shutdown_runtime(runtime)?;
+    Ok(PerfReport::from_load_with_allocations(
+        "websocket_steady_state_small",
+        "steady_state_reuse",
+        load,
+        allocations,
+    ))
+}
+
+/// Deterministic WebSocket capacity-fill pressure probe.
+///
+/// The plan allows replacing a timing-sensitive `slow_peer_pressure` row with a
+/// deterministic capacity-fill that uses the public send path and proves *typed*
+/// pressure without sleeping on a slow client. Each op opens a fresh session and
+/// sends one `overfill` text; the echo reply is larger than the session's
+/// bounded `max_queued_outbound_bytes`, so the connection raises a typed
+/// `SessionPressure` to the app and closes without writing the over-cap frame.
+///
+/// Two independent facts are asserted: the client sees the closed/no-echo signal
+/// (counted as `full` pressure in the load report), and the app's
+/// `SessionPressure` counter reaches one per op — the server-side *typed*
+/// pressure surface, proving the pressure was real and not just a dropped frame.
+pub fn websocket_capacity_fill_probe() -> anyhow::Result<LoadReport> {
+    const MAX_OUTBOUND_BYTES: usize = 8;
+    const OVERFILL_BYTES: usize = 64;
+    const PRESSURE_OPS: u64 = 8;
+
+    let pressure_count = Arc::new(AtomicU64::new(0));
+    let limits = WebSocketLimits {
+        max_queued_outbound_bytes: MAX_OUTBOUND_BYTES,
+        ..WebSocketLimits::default()
+    };
+    let (runtime, listener, addr) =
+        start_ws_server(limits, OVERFILL_BYTES, Arc::clone(&pressure_count))?;
+
+    let (load, _allocations) = run_counted(
+        LoadRun {
+            workers: 1,
+            stop: LoadStop::ops(PRESSURE_OPS),
+            label: "tina_websocket_capacity_fill",
+        },
+        move |_| match ws_overfill_op(addr) {
+            Ok(true) => OpOutcome::Err { kind: "full" },
+            Ok(false) => OpOutcome::Ok,
+            Err(_) => OpOutcome::Err { kind: "ws_error" },
+        },
+        Some({
+            let pressure_count = Arc::clone(&pressure_count);
+            move || {
+                // Wait (bounded) for the worker to deliver every typed pressure
+                // event to the app. leak_clean is true only if EXACTLY one typed
+                // SessionPressure arrived per op: too few means a pressure event
+                // was lost or a session leaked; more than one per op means the
+                // typed event double-fired. Either way the proof must fail.
+                let deadline = Instant::now() + Duration::from_secs(2);
+                while pressure_count.load(Ordering::Relaxed) < PRESSURE_OPS
+                    && Instant::now() < deadline
+                {
+                    thread::yield_now();
+                }
+                LoadObservation {
+                    leak_clean: pressure_count.load(Ordering::Relaxed) == PRESSURE_OPS,
+                    ..LoadObservation::default()
+                }
+            }
+        }),
+    );
+
+    println!(
+        "perf-ws-pressure label=tina_websocket_capacity_fill typed_session_pressure={} ops={}",
+        pressure_count.load(Ordering::Relaxed),
+        PRESSURE_OPS,
+    );
+    let _ = runtime.try_send(listener, HttpListenerMsg::Stop);
+    shutdown_runtime(runtime)?;
+    Ok(load)
+}
+
+/// Whole-process allocations for `requests` warmed h2c responses on one reused
+/// connection, measured with the counting global allocator.
+///
+/// The connection and HPACK state are warmed first, so the measured window is
+/// steady-state request/response work only — no listener startup, no first-time
+/// allocator growth. This isolates the server's per-response framing cost (plus
+/// the constant raw-client cost), which is what the Phase 152 buffered-response
+/// rewrite reduces: one fewer body-sized allocation per DATA frame.
+pub fn http2_steady_state_response_process_allocations(requests: usize) -> anyhow::Result<u64> {
+    let (runtime, listener, addr) = start_h2_server(small_body())?;
+    let expected = small_body().len();
+    let mut stream = h2c_connect(addr)?;
+    let mut next_id = 1u32;
+    for _ in 0..16 {
+        h2c_get(&mut stream, next_id, "/", expected)?;
+        next_id += 2;
+    }
+    let mut error: Option<anyhow::Error> = None;
+    let (_unit, process) = count_process_allocations(|| {
+        for _ in 0..requests {
+            if let Err(err) = h2c_get(&mut stream, next_id, "/", expected) {
+                error = Some(err);
+                break;
+            }
+            next_id += 2;
+        }
+    });
+    if let Some(err) = error {
+        return Err(err);
+    }
+    drop(stream);
+    let _ = runtime.try_send(listener, Http2ListenerMsg::Stop);
+    shutdown_runtime(runtime)?;
+    Ok(process)
+}
+
+/// Returns `Ok(true)` when the server signalled pressure (a CLOSE frame, or a
+/// clean peer EOF — the connection drops the over-cap session without writing
+/// the frame), `Ok(false)` if the server actually echoed the over-cap text (no
+/// pressure), and `Err` for any real transport failure (connect/write error, a
+/// read timeout/hang, or a malformed frame). A hang must NOT masquerade as
+/// pressure, so only `UnexpectedEof` is treated as the pressure close.
+fn ws_overfill_op(addr: SocketAddr) -> anyhow::Result<bool> {
+    let mut stream = ws_connect(addr)?;
+    stream.write_all(&ws_masked_frame(WS_OPCODE_TEXT, b"overfill"))?;
+    stream.flush()?;
+    loop {
+        match ws_read_frame(&mut stream) {
+            Ok((WS_OPCODE_TEXT, _)) => return Ok(false), // got echo, no pressure
+            Ok((WS_OPCODE_CLOSE, _)) => return Ok(true), // server closed on pressure
+            Ok(_) => continue,
+            Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => {
+                return Ok(true); // clean EOF after pressure-triggered close
+            }
+            Err(err) => return Err(err.into()), // timeout/hang/other: a real failure
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::TcpListener;
+    use std::sync::mpsc;
+
+    #[test]
+    fn websocket_close_drain_does_not_treat_timeout_as_clean_close() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test listener");
+        let addr = listener.local_addr().expect("listener addr");
+        let (done_tx, done_rx) = mpsc::channel();
+
+        thread::spawn(move || {
+            let (mut peer, _) = listener.accept().expect("accept close test peer");
+            let mut buf = [0u8; 8];
+            let _ = peer.read(&mut buf);
+            // Keep the connection open without sending a close frame. The
+            // client helper must surface its read timeout as failure, not count
+            // it as a clean drain.
+            let _ = done_rx.recv_timeout(Duration::from_millis(250));
+        });
+
+        let mut stream = TcpStream::connect(addr).expect("connect close test peer");
+        stream
+            .set_read_timeout(Some(Duration::from_millis(25)))
+            .expect("set read timeout");
+        stream
+            .set_write_timeout(Some(Duration::from_millis(25)))
+            .expect("set write timeout");
+
+        let error = ws_send_close(&mut stream).expect_err("timeout is not clean close");
+        let io_error = error
+            .downcast_ref::<std::io::Error>()
+            .expect("close timeout remains an io error");
+        assert!(
+            matches!(
+                io_error.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+            ),
+            "unexpected timeout error kind: {:?}",
+            io_error.kind(),
+        );
+        let _ = done_tx.send(());
     }
 }

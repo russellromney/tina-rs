@@ -1,8 +1,20 @@
-use perf_native::{http_body_pressure_probe, run_all};
+use perf_native::{
+    http_body_pressure_probe, run_all, run_native_rows, websocket_capacity_fill_probe,
+};
+use std::sync::{Mutex, MutexGuard};
 use tina_proof_harness::SemanticMatch;
+
+static PERF_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+fn perf_test_guard() -> MutexGuard<'static, ()> {
+    PERF_TEST_LOCK
+        .lock()
+        .expect("perf tests must serialize process-wide counters")
+}
 
 #[test]
 fn native_perf_comparison_rows_are_printable_and_bounded() {
+    let _guard = perf_test_guard();
     let reports = run_all().expect("run native perf comparisons");
     assert_eq!(reports.len(), 9);
     let labels: Vec<_> = reports.iter().map(|report| report.label).collect();
@@ -109,7 +121,171 @@ fn native_perf_comparison_rows_are_printable_and_bounded() {
 }
 
 #[test]
+fn native_protocol_rows_are_printable_and_bounded() {
+    let _guard = perf_test_guard();
+    let reports = run_native_rows().expect("run native protocol rows");
+    let labels: Vec<_> = reports.iter().map(|report| report.label).collect();
+    assert_eq!(
+        labels,
+        vec![
+            "http2_h2c_close_request",
+            "http2_h2c_keepalive_sequential",
+            "http2_h2c_steady_state_small",
+            "websocket_open_close",
+            "websocket_text_round_trip",
+            "websocket_steady_state_small",
+        ],
+        "native protocol row labels are pinned so a row cannot silently disappear",
+    );
+
+    // Rock 4: every native row declares its setup-vs-reuse class in `kind`, and
+    // both a connection-setup row and a steady-state-reuse row exist for each
+    // protocol so setup cost is never silently mixed with steady-state service.
+    let kinds: Vec<_> = reports
+        .iter()
+        .map(|report| (report.label, report.kind))
+        .collect();
+    for (label, kind) in &kinds {
+        assert!(
+            matches!(
+                *kind,
+                "connection_setup" | "connection_setup_amortized" | "steady_state_reuse"
+            ),
+            "row {label} declares a known setup-vs-reuse kind, got {kind}",
+        );
+    }
+    for protocol in ["http2_", "websocket_"] {
+        assert!(
+            kinds
+                .iter()
+                .any(|(label, kind)| label.starts_with(protocol) && *kind == "connection_setup"),
+            "{protocol} has an explicit connection-setup row",
+        );
+        assert!(
+            kinds
+                .iter()
+                .any(|(label, kind)| label.starts_with(protocol) && *kind == "steady_state_reuse"),
+            "{protocol} has an explicit steady-state-reuse row",
+        );
+    }
+
+    for report in &reports {
+        println!("{}", report.summary_line());
+        println!("{}", report.json_line());
+        let line = report.summary_line();
+        let json = report.json_line();
+
+        assert!(
+            line.starts_with("perf "),
+            "native row uses the stable perf line shape: {}",
+            report.label,
+        );
+        assert!(
+            line.contains("comparison_baseline=none"),
+            "native row is Tina-only (no fake baseline): {}",
+            report.label,
+        );
+        assert_eq!(
+            report.samples, 5,
+            "native row reports median-of-five samples for {}",
+            report.label,
+        );
+        assert!(
+            line.contains("samples=5"),
+            "native row line carries sample count for {}",
+            report.label,
+        );
+        assert!(
+            line.contains("sample_policy=median_p50_after_warmup"),
+            "native row line carries sample policy for {}",
+            report.label,
+        );
+        assert!(
+            report.load.ops_ok > 0,
+            "native row must do useful work: {}",
+            report.label,
+        );
+        assert_eq!(
+            report.load.ops_err, 0,
+            "native row should not shed work: {}",
+            report.label,
+        );
+        assert_eq!(
+            report.load.ops_timeout, 0,
+            "native row should not time out: {}",
+            report.label,
+        );
+        assert!(
+            report.load.leak_clean,
+            "native row must end clean: {}",
+            report.label,
+        );
+        assert!(
+            report.allocations.is_some(),
+            "native row must carry allocation evidence: {}",
+            report.label,
+        );
+        // p50/p90/p99 are present and ordered.
+        assert!(
+            report.load.latency_p99_ns >= report.load.latency_p50_ns,
+            "p99 >= p50 for {}",
+            report.label,
+        );
+        assert!(
+            report.load.latency_p90_ns >= report.load.latency_p50_ns,
+            "p90 >= p50 for {}",
+            report.label,
+        );
+        for field in ["p50_us\":", "p90_us\":", "p99_us\":"] {
+            assert!(
+                json.contains(field),
+                "native row json carries {field} for {}",
+                report.label,
+            );
+        }
+        assert!(
+            json.contains("\"schema\":\"tina.perf_report.v1\""),
+            "native row json schema: {}",
+            report.label,
+        );
+        assert!(
+            json.contains("\"samples\":5"),
+            "native row json carries sample count: {}",
+            report.label,
+        );
+        assert!(
+            json.contains("\"sample_policy\":\"median_p50_after_warmup\""),
+            "native row json carries sample policy: {}",
+            report.label,
+        );
+    }
+}
+
+#[test]
+fn websocket_capacity_fill_probe_reports_typed_pressure() {
+    let _guard = perf_test_guard();
+    let report = websocket_capacity_fill_probe().expect("run websocket capacity fill probe");
+    println!("{}", report.summary_line());
+
+    assert_eq!(report.label, "tina_websocket_capacity_fill");
+    assert_eq!(report.ops_attempted, 8);
+    assert_eq!(report.ops_ok, 0, "every overfill op must hit pressure");
+    assert_eq!(report.ops_err, 8);
+    assert_eq!(report.ops_timeout, 0);
+    assert_eq!(
+        report.pressure.by_kind,
+        vec![("full".to_string(), 8)],
+        "over-cap outbound stays typed as full pressure",
+    );
+    assert!(
+        report.leak_clean,
+        "every session raised one typed SessionPressure and closed clean",
+    );
+}
+
+#[test]
 fn http_body_pressure_probe_reports_full_and_drained() {
+    let _guard = perf_test_guard();
     let report = http_body_pressure_probe().expect("run HTTP body pressure probe");
     println!("{}", report.summary_line());
     for surface in &report.surface_plateaus {

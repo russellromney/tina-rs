@@ -49,19 +49,31 @@ impl Frame {
     }
 
     pub(super) fn encode(&self) -> Vec<u8> {
-        let len = self.payload.len();
-        assert!(len <= 0x00ff_ffff, "HTTP/2 frame payload too large");
-        let mut out = Vec::with_capacity(FRAME_HEADER_LEN + len);
-        out.push(((len >> 16) & 0xff) as u8);
-        out.push(((len >> 8) & 0xff) as u8);
-        out.push((len & 0xff) as u8);
-        out.push(self.ty);
-        out.push(self.flags);
-        let sid = self.stream_id & 0x7fff_ffff;
-        out.extend_from_slice(&sid.to_be_bytes());
+        let mut out = Vec::with_capacity(FRAME_HEADER_LEN + self.payload.len());
+        push_frame_header(
+            &mut out,
+            self.ty,
+            self.flags,
+            self.stream_id,
+            self.payload.len(),
+        );
         out.extend_from_slice(&self.payload);
         out
     }
+}
+
+/// Writes the 9-byte HTTP/2 frame header into `out`. Lets a caller build a
+/// framed buffer directly from a borrowed payload slice (header bytes, then
+/// `extend_from_slice(payload)`), so a body chunk is copied once instead of
+/// once into a `Frame::payload` `Vec` and again in [`Frame::encode`].
+pub(super) fn push_frame_header(out: &mut Vec<u8>, ty: u8, flags: u8, stream_id: u32, len: usize) {
+    assert!(len <= 0x00ff_ffff, "HTTP/2 frame payload too large");
+    out.push(((len >> 16) & 0xff) as u8);
+    out.push(((len >> 8) & 0xff) as u8);
+    out.push((len & 0xff) as u8);
+    out.push(ty);
+    out.push(flags);
+    out.extend_from_slice(&(stream_id & 0x7fff_ffff).to_be_bytes());
 }
 
 pub(super) fn try_decode_frame(

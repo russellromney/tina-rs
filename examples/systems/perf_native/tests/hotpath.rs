@@ -24,7 +24,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use perf_native::count_all_allocations;
+use perf_native::{count_all_allocations, http2_steady_state_response_process_allocations};
 use tina::prelude::*;
 use tina::IsolateId;
 use tina_http::{
@@ -80,6 +80,25 @@ const HTTP_CLOSE_STAGE_CEILING: usize = 48;
 const HTTP_KEEPALIVE_STAGE_CEILING: usize = 120;
 const HTTP_FIXED_BODY_STAGE_CEILING: usize = 48;
 const HTTP_STEADY_STAGE_CEILING: usize = 36;
+
+// Whole-process allocation ceiling for 64 warmed h2c buffered responses on one
+// reused connection. Lives in the hotpath binary because process-wide
+// allocation counting must run with no other test thread allocating; this
+// binary has a single test, so the counter is clean.
+//
+// The Phase 152 buffered-response rewrite builds each DATA frame straight into
+// the outbound queue, removing one body-sized allocation per DATA frame. The
+// count is dominated by the Rust code path (one `alloc` per `Vec`) and was
+// stable across repeated runs on this toolchain:
+//   before: 3139 allocations (49.05/request)
+//   after:  3075 allocations (48.05/request)  -> exactly one fewer per response
+// The regression is +64 (one re-added copy per request), so any ceiling in
+// (3075, 3139) catches it. 3130 is chosen below the pre-rewrite value (re-adding
+// the copy fails) with headroom above the post-rewrite value for toolchain/std
+// drift. This is a regression guard, not a cross-platform invariant; recalibrate
+// with a recorded before/after if a platform's fixed baseline differs.
+const H2_BUFFERED_RESPONSE_ALLOC_CEILING: u64 = 3_130;
+const H2_BUFFERED_RESPONSE_REQUESTS: usize = 64;
 
 type Runtime = ThreadedRuntime<SingleShard, DefaultThreadedMailboxFactory>;
 
@@ -1257,5 +1276,20 @@ fn hotpath_probes_report_and_stay_bounded() {
         "call_blocking process {} (ceiling {})",
         call_process,
         CALL_PROCESS_ALLOCATIONS_CEILING
+    );
+
+    // Phase 152 buffered-response framing: whole-process allocations for warmed
+    // h2c responses on a reused connection. Runs here (single-test binary) so
+    // the process counter is not contaminated by a parallel test thread.
+    let h2_buffered_allocs =
+        http2_steady_state_response_process_allocations(H2_BUFFERED_RESPONSE_REQUESTS)
+            .expect("measure h2c buffered response process allocations");
+    let per_request = h2_buffered_allocs as f64 / H2_BUFFERED_RESPONSE_REQUESTS as f64;
+    println!(
+        "perf-h2-alloc requests={H2_BUFFERED_RESPONSE_REQUESTS} process_allocations={h2_buffered_allocs} per_request={per_request:.2}"
+    );
+    assert!(
+        h2_buffered_allocs <= H2_BUFFERED_RESPONSE_ALLOC_CEILING,
+        "h2c buffered response allocations {h2_buffered_allocs} exceeded ceiling {H2_BUFFERED_RESPONSE_ALLOC_CEILING} ({per_request:.2}/request)",
     );
 }

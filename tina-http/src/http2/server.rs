@@ -35,11 +35,11 @@ use super::errors::{
 };
 use super::frame::{
     CLIENT_PREFACE, DEFAULT_WINDOW, FLAG_ACK, FLAG_END_HEADERS, FLAG_END_STREAM,
-    FRAME_CONTINUATION, FRAME_DATA, FRAME_GOAWAY, FRAME_HEADERS, FRAME_PING, FRAME_PRIORITY,
-    FRAME_PUSH_PROMISE, FRAME_RST_STREAM, FRAME_SETTINGS, FRAME_WINDOW_UPDATE, Frame,
-    PRIORITY_PAYLOAD_LEN, READ_CHUNK, WINDOW_CREDIT_FLUSH_THRESHOLD, add_window, data_frame,
-    data_payload, goaway_frame, headers_frame, headers_payload, rst_stream_frame, settings_frame,
-    try_decode_frame, window_update_frame,
+    FRAME_CONTINUATION, FRAME_DATA, FRAME_GOAWAY, FRAME_HEADER_LEN, FRAME_HEADERS, FRAME_PING,
+    FRAME_PRIORITY, FRAME_PUSH_PROMISE, FRAME_RST_STREAM, FRAME_SETTINGS, FRAME_WINDOW_UPDATE,
+    Frame, PRIORITY_PAYLOAD_LEN, READ_CHUNK, WINDOW_CREDIT_FLUSH_THRESHOLD, add_window, data_frame,
+    data_payload, goaway_frame, headers_frame, headers_payload, push_frame_header,
+    rst_stream_frame, settings_frame, try_decode_frame, window_update_frame,
 };
 use super::headers::{
     DEFAULT_HEADER_TABLE_SIZE, HeaderBlock, MAX_MAX_FRAME_SIZE, MIN_MAX_FRAME_SIZE,
@@ -49,8 +49,6 @@ use super::headers::{
     encode_response_trailers, encode_trailers, validate_request_headers,
 };
 
-#[cfg(test)]
-use super::frame::FRAME_HEADER_LEN;
 #[cfg(test)]
 use super::headers::{decode_headers_block, encode_literal_header};
 
@@ -1387,7 +1385,22 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Http2Connection<
             self.streams[idx].send_window -= body_len_i32;
             for (chunk_index, chunk) in pending.body.chunks(frame_cap).enumerate() {
                 let end_stream = chunk_index + 1 == data_frames && pending.trailers.is_none();
-                self.enqueue_frame(data_frame(stream_id, end_stream, chunk.to_vec()))?;
+                // Build the DATA frame straight into the queued buffer: header
+                // bytes then the body slice. The body chunk is copied once here
+                // instead of once into a `Frame::payload` `Vec` and again in
+                // `Frame::encode`. Per-frame `ensure_outbound_slots(1)` keeps the
+                // bounded-queue admission identical to `enqueue_frame`.
+                self.ensure_outbound_slots(1)?;
+                let mut framed = Vec::with_capacity(FRAME_HEADER_LEN + chunk.len());
+                push_frame_header(
+                    &mut framed,
+                    FRAME_DATA,
+                    if end_stream { FLAG_END_STREAM } else { 0 },
+                    stream_id,
+                    chunk.len(),
+                );
+                framed.extend_from_slice(chunk);
+                self.write_queue.push_back(framed);
             }
         }
         if let Some(trailers) = pending.trailers {

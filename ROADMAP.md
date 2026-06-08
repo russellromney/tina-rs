@@ -410,10 +410,16 @@ and reviews live under `.intent/phases/`.
   — the single-shard worker blocks on the kernel I/O loop plus a wakeup
   doorbell, so a ready socket wakes it at kernel latency and a fully idle worker
   makes zero wakeups; the HTTP host-submit sleep is gone and what remains is the
-  real connection round-trips it had hidden. Remaining edges are still real:
-  HTTP/2/WebSocket equivalent workload rows, zero-copy on the byte path, the
-  connect/accept round-trips, and no production-performance claim until evidence
-  earns it.
+  real connection round-trips it had hidden. The next pass then added Tina-only
+  HTTP/2 h2c and WebSocket workload rows alongside the HTTP/1 ones, split
+  connection-setup rows from steady-state-reuse rows so setup cost is no longer
+  mixed into service cost, and removed one protocol-internal copy: the buffered
+  HTTP/2 response now frames each DATA chunk straight into the outbound queue
+  (one body copy instead of two, one fewer allocation per response, wire output
+  unchanged). Remaining edges are still real and named, not hidden: the buffered
+  response body clone, the inbound DATA payload clone, streaming/chunked and
+  gRPC request framing, wide tails under one single-shard worker, and no
+  production-performance claim until evidence earns it.
 
 These are recorded in `CHANGELOG.md`; the remaining near-term roadmap now
 starts with the next performance pass and native AWS. Public release cleanup

@@ -13,6 +13,13 @@
 # A `perf-compare` line stays the canonical "row" — `perf-process` lines are
 # extras emitted by HTTP rows (whole-process allocation + RSS delta).
 #
+# `native` lines come from the Tina-only protocol rows (HTTP/2, WebSocket) that
+# carry no fair external baseline. They record p50/p90/p99 in microseconds (the
+# field the row's flat line exposes) plus ops/ok and the per-op host allocation
+# count:
+#
+#   {"kind":"native", "timestamp":..., ..., "label":..., "row_kind":..., "samples":..., "sample_policy":..., "p50_us":..., "p90_us":..., "p99_us":..., "ops":..., "ok":..., "allocations":..., "allocated_bytes":...}
+#
 # Usage:
 #   ./scripts/perf_record.sh            # append latest run
 #   ./scripts/perf_record.sh --dry-run  # print, don't append
@@ -20,7 +27,7 @@
 
 set -euo pipefail
 
-HISTORY_FILE="${TINA_PERF_HISTORY_FILE:-.intent/phases/149-structural-http-runtime-performance/perf_history.jsonl}"
+HISTORY_FILE="${TINA_PERF_HISTORY_FILE:-.intent/phases/152-protocol-perf-byte-path/perf_history.jsonl}"
 
 mode="record"
 input_file=""
@@ -131,10 +138,39 @@ emit_hotpath_lines() {
   done < <(grep '^hotpath' <<< "$output" || true)
 }
 
+emit_native_lines() {
+  while IFS= read -r line; do
+    [[ -z $line ]] && continue
+    label=$(grep -oE 'label=[a-z0-9_]+' <<< "$line" | head -1 | cut -d= -f2 || true)
+    row_kind=$(grep -oE ' kind=[a-z_]+' <<< "$line" | head -1 | cut -d= -f2 || true)
+    samples=$(grep -oE ' samples=[0-9]+' <<< "$line" | head -1 | cut -d= -f2 || true)
+    sample_policy=$(grep -oE ' sample_policy=[a-zA-Z0-9_]+' <<< "$line" | head -1 | cut -d= -f2 || true)
+    p50=$(grep -oE 'p50_us=[0-9]+' <<< "$line" | head -1 | cut -d= -f2 || true)
+    p90=$(grep -oE 'p90_us=[0-9]+' <<< "$line" | head -1 | cut -d= -f2 || true)
+    p99=$(grep -oE 'p99_us=[0-9]+' <<< "$line" | head -1 | cut -d= -f2 || true)
+    ops=$(grep -oE ' ops=[0-9]+' <<< "$line" | head -1 | cut -d= -f2 || true)
+    ok=$(grep -oE ' ok=[0-9]+' <<< "$line" | head -1 | cut -d= -f2 || true)
+    allocs=$(grep -oE ' allocations=[0-9]+' <<< "$line" | head -1 | cut -d= -f2 || true)
+    allocated_bytes=$(grep -oE ' allocated_bytes=[0-9]+' <<< "$line" | head -1 | cut -d= -f2 || true)
+    # Only the dedicated Tina-only protocol rows carry a setup-vs-reuse kind.
+    # Every per-side line of a `perf-compare` row is also a `perf ` line, so
+    # filter on the kind allowlist to keep those out of the native family.
+    case "$row_kind" in
+      connection_setup | connection_setup_amortized | steady_state_reuse) ;;
+      *) continue ;;
+    esac
+    if [[ -n $label && -n $p50 ]]; then
+      printf '{"kind":"native","timestamp":"%s","git_sha":"%s","platform":"%s","arch":"%s","profile":"%s","label":"%s","row_kind":"%s","samples":%s,"sample_policy":"%s","p50_us":%s,"p90_us":%s,"p99_us":%s,"ops":%s,"ok":%s,"allocations":%s,"allocated_bytes":%s}\n' \
+        "$timestamp" "$git_sha" "$platform" "$arch" "$profile" "$label" "${row_kind:-unknown}" "${samples:-null}" "${sample_policy:-unknown}" "$p50" "${p90:-null}" "${p99:-null}" "${ops:-null}" "${ok:-null}" "${allocs:-null}" "${allocated_bytes:-null}"
+    fi
+  done < <(grep -E '^perf ' <<< "$output" || true)
+}
+
 emit_all() {
   emit_compare_lines
   emit_process_lines
   emit_hotpath_lines
+  emit_native_lines
 }
 
 if [[ $mode == "dry-run" ]]; then
@@ -145,5 +181,6 @@ else
   compare_count=$(grep -c '^perf-compare' <<< "$output" || true)
   process_count=$(grep -c '^perf-process' <<< "$output" || true)
   hotpath_count=$(grep -c '^hotpath' <<< "$output" || true)
-  echo "Appended ${compare_count} compare + ${process_count} process + ${hotpath_count} hotpath rows to $HISTORY_FILE (git_sha=$git_sha)"
+  native_count=$(emit_native_lines | grep -c '"kind":"native"' || true)
+  echo "Appended ${compare_count} compare + ${process_count} process + ${hotpath_count} hotpath + ${native_count} native rows to $HISTORY_FILE (git_sha=$git_sha)"
 fi
