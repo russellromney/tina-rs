@@ -90,6 +90,7 @@ impl SpecimenServer {
             conn,
             GrpcLimits {
                 max_message_bytes: 1024,
+                ..Default::default()
             },
         );
 
@@ -372,6 +373,7 @@ pub fn start_server() -> Result<SpecimenServer, String> {
         &runtime,
         GrpcLimits {
             max_message_bytes: 1024,
+            ..Default::default()
         },
     )?;
     let streaming_sources_for_route = Arc::clone(&streaming_sources);
@@ -382,6 +384,7 @@ pub fn start_server() -> Result<SpecimenServer, String> {
             vec![CounterReply { value: 41 }, CounterReply { value: 42 }],
             GrpcLimits {
                 max_message_bytes: 1024,
+                ..Default::default()
             },
             16,
         )
@@ -394,6 +397,7 @@ pub fn start_server() -> Result<SpecimenServer, String> {
     let watch_responses_for_route = Arc::clone(&watch_responses);
     let router = GrpcRouter::<SpecimenShard>::new(GrpcLimits {
         max_message_bytes: 1024,
+        ..Default::default()
     })
     .unary(
         "/specimen.Counter/Increment",

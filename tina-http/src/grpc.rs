@@ -43,12 +43,16 @@ const REQUEST_BODY_PULL_TIMEOUT: Duration = Duration::from_secs(10);
 pub struct GrpcLimits {
     /// Maximum decoded protobuf message bytes for one gRPC message.
     pub max_message_bytes: usize,
+    /// Maximum number of messages in one client-streaming request body.
+    /// Bounds the decoded `Vec<Req>` count, not just its byte size.
+    pub max_messages: usize,
 }
 
 impl Default for GrpcLimits {
     fn default() -> Self {
         Self {
             max_message_bytes: 512 * 1024,
+            max_messages: 64,
         }
     }
 }
@@ -1494,6 +1498,14 @@ fn decode_streaming_body<T: Message + Default>(
     let mut cursor = 0;
     let mut messages = Vec::new();
     while cursor < body.len() {
+        // Bound the count, mirroring the encode side; a body of tiny frames
+        // would otherwise materialize an unbounded `Vec<Req>`.
+        if messages.len() >= limits.max_messages {
+            return Err(GrpcError::TooManyMessages {
+                count: messages.len() + 1,
+                max: limits.max_messages,
+            });
+        }
         messages.push(decode_one_grpc_message::<T>(body, &mut cursor, limits)?);
     }
     Ok(messages)
@@ -2056,6 +2068,39 @@ mod tests {
     }
 
     #[test]
+    fn decode_streaming_body_rejects_too_many_messages() {
+        // Client-streaming decode must bound the message COUNT, not just
+        // total bytes. A body packed with tiny empty frames overshoots the
+        // count cap even though each frame is well under the byte limit.
+        let limits = GrpcLimits::default();
+        let frames = limits.max_messages + 1;
+        let mut body = Vec::with_capacity(frames * GRPC_FRAME_HEADER_LEN);
+        for _ in 0..frames {
+            body.extend_from_slice(&[0u8, 0, 0, 0, 0]); // 5-byte empty gRPC frame
+        }
+        let request = HttpRequest {
+            method: Method::POST,
+            path: "/pkg.Ping/Stream".to_owned(),
+            version: http::Version::HTTP_2,
+            headers: {
+                let mut headers = http::HeaderMap::new();
+                headers.insert(
+                    http::header::CONTENT_TYPE,
+                    HeaderValue::from_static("application/grpc"),
+                );
+                headers
+            },
+            body: crate::HttpRequestBody::Buffered(body),
+        };
+        let err = decode_streaming_request::<Ping>(&request, limits)
+            .expect_err("count over cap must be rejected");
+        assert!(
+            matches!(err, GrpcError::TooManyMessages { max, .. } if max == limits.max_messages),
+            "expected TooManyMessages, got {err:?}"
+        );
+    }
+
+    #[test]
     fn grpc_status_trailers_block_handles_long_message() {
         let message = "x".repeat(200);
         let block = grpc_status_trailers_block(GrpcStatus::with_message(
@@ -2072,6 +2117,7 @@ mod tests {
         let limits = GrpcBufferedStreamLimits::new(
             GrpcLimits {
                 max_message_bytes: 1,
+                ..Default::default()
             },
             4,
             1024,

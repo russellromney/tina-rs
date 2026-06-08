@@ -1023,7 +1023,16 @@ fn grpc_client_streaming_reads_multiple_request_messages() {
 
 #[test]
 fn grpc_client_streaming_handles_many_small_messages() {
-    let harness = GrpcHarness::start_router(Http2ServerConfig::default(), GrpcLimits::default());
+    // The decode path now bounds the message count (default 64); an operator
+    // expecting many messages raises `max_messages`. Prove the many-message
+    // path still flows when the cap permits it.
+    let harness = GrpcHarness::start_router(
+        Http2ServerConfig::default(),
+        GrpcLimits {
+            max_messages: 1024,
+            ..Default::default()
+        },
+    );
     let mut stream = connect_h2(harness.addr);
     let mut body = Vec::new();
     let expected: u64 = (0..1000).sum();
@@ -1163,6 +1172,7 @@ fn grpc_streaming_declared_message_cap_sets_resource_exhausted() {
         Http2ServerConfig::default(),
         GrpcLimits {
             max_message_bytes: 4,
+            ..Default::default()
         },
     );
     let mut stream = connect_h2(harness.addr);
@@ -1305,6 +1315,7 @@ fn grpc_client_streaming_declared_message_cap_fails_before_service() {
     let calls_for_route = Arc::clone(&service_calls);
     let router = GrpcRouter::<TestShard>::new(GrpcLimits {
         max_message_bytes: 8,
+        ..Default::default()
     })
     .client_streaming(
         "/specimen.Counter/Sum",
@@ -1655,6 +1666,7 @@ fn grpc_body_message_cap_is_resource_exhausted() {
         Http2ServerConfig::default(),
         GrpcLimits {
             max_message_bytes: 1,
+            ..Default::default()
         },
     );
     let mut stream = connect_h2(harness.addr);
@@ -1675,6 +1687,7 @@ fn grpc_response_message_cap_is_resource_exhausted() {
         Http2ServerConfig::default(),
         GrpcLimits {
             max_message_bytes: 2,
+            ..Default::default()
         },
     );
     let error = grpc_unary_call_h2c_blocking::<_, CounterReply>(
@@ -1684,6 +1697,7 @@ fn grpc_response_message_cap_is_resource_exhausted() {
         Duration::from_secs(2),
         GrpcLimits {
             max_message_bytes: 32,
+            ..Default::default()
         },
     )
     .expect_err("response cap status");
