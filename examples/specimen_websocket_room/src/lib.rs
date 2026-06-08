@@ -9,8 +9,8 @@ use http::Method;
 use tina::CallContext;
 use tina::prelude::*;
 use tina_http::{
-    HttpListener, HttpListenerMsg, HttpsListener, HttpsListenerMsg, HttpsReady, HttpsServerConfig,
-    HttpsStartupError, HttpRequest, HttpResponse, TlsServerIdentity, WebSocketCloseCode,
+    HttpListener, HttpListenerMsg, HttpRequest, HttpResponse, HttpsListener, HttpsListenerMsg,
+    HttpsReady, HttpsServerConfig, HttpsStartupError, TlsServerIdentity, WebSocketCloseCode,
     WebSocketError, WebSocketLimits, WebSocketSendError, WebSocketSessionHandle,
     WebSocketSessionId, WebSocketSessionMsg, WebSocketSessionOutcome, websocket_upgrade,
 };
@@ -216,7 +216,10 @@ impl Gateway {
             }
             if !self.admission.origin_allowed(&request) {
                 self.report.update(|r| r.rejected_origin += 1);
-                return HttpResponse::with_body(http::StatusCode::FORBIDDEN, b"bad origin".to_vec());
+                return HttpResponse::with_body(
+                    http::StatusCode::FORBIDDEN,
+                    b"bad origin".to_vec(),
+                );
             }
             if !self.admission.auth_allowed(&request) {
                 self.report.update(|r| r.rejected_auth += 1);
@@ -496,8 +499,9 @@ impl Room {
                         {
                             let stale_session = stale.session_id();
                             self.pending_stale_probe = Some(stale_session);
-                            effects
-                                .push(stale.text_effect::<Room>("stale-proof", Duration::from_secs(1)));
+                            effects.push(
+                                stale.text_effect::<Room>("stale-proof", Duration::from_secs(1)),
+                            );
                         }
                     }
                     self.members.insert(session_id, session);
@@ -531,10 +535,12 @@ impl Room {
                 let mut effects = Vec::new();
                 for (target_id, handle) in self.members.iter() {
                     if *target_id != session_id {
-                        effects.push(handle.text_effect::<Room>(
-                            format!("room:{text}"),
-                            Duration::from_secs(1),
-                        ));
+                        effects.push(
+                            handle.text_effect::<Room>(
+                                format!("room:{text}"),
+                                Duration::from_secs(1),
+                            ),
+                        );
                     }
                 }
                 if effects.is_empty() {
@@ -558,7 +564,10 @@ impl Room {
                             r.broadcast_ok += 1;
                         }
                     }
-                    Err(WebSocketSendError::OutboundQueueFull | WebSocketSendError::OutboundBytesFull) => {
+                    Err(
+                        WebSocketSendError::OutboundQueueFull
+                        | WebSocketSendError::OutboundBytesFull,
+                    ) => {
                         if self.shutting_down {
                             r.shutdown_close_failed += 1;
                         } else if stale_probe {
@@ -571,7 +580,9 @@ impl Room {
                     Err(WebSocketSendError::Closed | WebSocketSendError::Stale) => {
                         if self.shutting_down {
                             r.shutdown_close_failed += 1;
-                        } else if stale_probe || matches!(outcome.result, Err(WebSocketSendError::Stale)) {
+                        } else if stale_probe
+                            || matches!(outcome.result, Err(WebSocketSendError::Stale))
+                        {
                             r.stale_handle_rejected = true;
                         } else {
                             r.broadcast_closed += 1;
@@ -726,15 +737,6 @@ impl Room {
                 });
                 reply(WebSocketSessionOutcome::None)
             }
-            WebSocketSessionMsg::Closed(WebSocketError::PeerClosed)
-            | WebSocketSessionMsg::Closed(WebSocketError::Closing)
-            | WebSocketSessionMsg::Pressure(WebSocketError::PeerClosed) => {
-                reply(WebSocketSessionOutcome::None)
-            }
-            WebSocketSessionMsg::Close(_, _) => {
-                self.report.update(|r| r.peer_close_seen = true);
-                reply(WebSocketSessionOutcome::None)
-            }
             WebSocketSessionMsg::Text(text) if text == ROOM_CREATE_CONTROL => {
                 self.shutting_down = false;
                 self.deleting = false;
@@ -753,13 +755,6 @@ impl Room {
                 }
                 reply(WebSocketSessionOutcome::None)
             }
-            WebSocketSessionMsg::Open
-            | WebSocketSessionMsg::Text(_)
-            | WebSocketSessionMsg::Ping(_)
-            | WebSocketSessionMsg::Pong(_)
-            | WebSocketSessionMsg::Pressure(_)
-            | WebSocketSessionMsg::Closed(_)
-            | WebSocketSessionMsg::AppControl(_) => reply(WebSocketSessionOutcome::None),
             WebSocketSessionMsg::SessionAccepted {
                 selected_subprotocol,
                 ..
@@ -769,8 +764,23 @@ impl Room {
                 }
                 reply(WebSocketSessionOutcome::None)
             }
-            WebSocketSessionMsg::SessionBinary { bytes, .. }
-            | WebSocketSessionMsg::Binary(bytes) => reply(WebSocketSessionOutcome::Binary(bytes)),
+            WebSocketSessionMsg::SessionBinary { bytes, .. } => {
+                reply(WebSocketSessionOutcome::Binary(bytes))
+            }
+            // The protocol owner now delivers one session-rich event per wire
+            // frame; the legacy `Open`/`Binary`/`Ping`/`Pong`/`Close`/
+            // `Pressure`/`Closed` variants are no longer emitted for wire
+            // events. The remaining legacy `Text` is only the app-local
+            // control path matched above. Ignore everything else.
+            WebSocketSessionMsg::Open
+            | WebSocketSessionMsg::Text(_)
+            | WebSocketSessionMsg::Binary(_)
+            | WebSocketSessionMsg::Ping(_)
+            | WebSocketSessionMsg::Pong(_)
+            | WebSocketSessionMsg::Close(_, _)
+            | WebSocketSessionMsg::Pressure(_)
+            | WebSocketSessionMsg::Closed(_)
+            | WebSocketSessionMsg::AppControl(_) => reply(WebSocketSessionOutcome::None),
         }
     }
 }
@@ -1088,7 +1098,9 @@ fn run_script(server: &RoomServer) {
     let mut c = Client::connect(server.addr);
     let _ = c.read_frame();
     a.write_text(&"x".repeat(2000));
-    let _ = server.wait_until(Duration::from_secs(2), |r| r.broadcast_full > 0 || r.left > 0);
+    let _ = server.wait_until(Duration::from_secs(2), |r| {
+        r.broadcast_full > 0 || r.left > 0
+    });
 
     let mut d = Client::connect(server.addr);
     let _ = d.read_frame();
@@ -1101,8 +1113,11 @@ struct Client {
 
 impl Client {
     fn connect(addr: SocketAddr) -> Self {
-        let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(2)).expect("connect");
-        stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let mut stream =
+            TcpStream::connect_timeout(&addr, Duration::from_secs(2)).expect("connect");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
         stream
             .write_all(
                 b"GET /room HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n",
@@ -1113,7 +1128,9 @@ impl Client {
     }
 
     fn write_text(&mut self, text: &str) {
-        self.stream.write_all(&masked_frame(0x1, text.as_bytes())).unwrap();
+        self.stream
+            .write_all(&masked_frame(0x1, text.as_bytes()))
+            .unwrap();
         self.stream.flush().unwrap();
     }
 
@@ -1183,7 +1200,9 @@ mod tests {
     static TEST_LOCK: Mutex<()> = Mutex::new(());
 
     fn test_guard() -> MutexGuard<'static, ()> {
-        TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+        TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     fn connect_room(url: &str) -> WebSocket<MaybeTlsStream<TcpStream>> {
@@ -1276,7 +1295,10 @@ mod tests {
             server.addr(),
             "Origin: https://allowed.example\r\nAuthorization: Bearer secret\r\nSec-WebSocket-Protocol: other.v1\r\n",
         );
-        assert!(bad_subprotocol.starts_with("HTTP/1.1 400"), "{bad_subprotocol}");
+        assert!(
+            bad_subprotocol.starts_with("HTTP/1.1 400"),
+            "{bad_subprotocol}"
+        );
 
         let ok = raw_upgrade(
             server.addr(),
@@ -1409,7 +1431,10 @@ mod tests {
         assert_eq!(report.shutdown_close_requested, 1, "{report:?}");
         assert_eq!(report.shutdown_close_ok, 1, "{report:?}");
         assert!(client.read().expect("close").is_close());
-        assert!(connect(url.as_str()).is_err(), "new upgrade after shutdown must fail");
+        assert!(
+            connect(url.as_str()).is_err(),
+            "new upgrade after shutdown must fail"
+        );
         let _ = server.stop();
     }
 
@@ -1428,7 +1453,10 @@ mod tests {
             r.active_rooms == 0 && r.live_members == 0
         });
         assert_eq!(report.active_rooms, 0, "{report:?}");
-        assert!(connect(url.as_str()).is_err(), "deleted room must reject upgrade");
+        assert!(
+            connect(url.as_str()).is_err(),
+            "deleted room must reject upgrade"
+        );
 
         let created = http_request(server.addr(), "POST", "/rooms/default");
         assert!(created.starts_with("HTTP/1.1 201"), "{created}");
@@ -1455,7 +1483,10 @@ mod tests {
         let report = server.wait_until(Duration::from_secs(2), |r| r.active_rooms == 0);
         assert_eq!(report.active_rooms, 0, "{report:?}");
 
-        assert!(connect(url.as_str()).is_err(), "expired room must reject upgrade");
+        assert!(
+            connect(url.as_str()).is_err(),
+            "expired room must reject upgrade"
+        );
         let created = http_request(server.addr(), "POST", "/rooms/default");
         assert!(created.starts_with("HTTP/1.1 201"), "{created}");
         let mut client = connect_room(url.as_str());
@@ -1477,7 +1508,10 @@ mod tests {
         a.send(Message::Text("before-shutdown".into()))
             .expect("send before shutdown");
         assert_eq!(
-            b.read().expect("broadcast before shutdown").into_text().expect("text"),
+            b.read()
+                .expect("broadcast before shutdown")
+                .into_text()
+                .expect("text"),
             "room:before-shutdown"
         );
 
@@ -1488,7 +1522,10 @@ mod tests {
             2,
             "{report:?}"
         );
-        assert!(connect(url.as_str()).is_err(), "post-shutdown connect must fail");
+        assert!(
+            connect(url.as_str()).is_err(),
+            "post-shutdown connect must fail"
+        );
         let _ = a.close(None);
         let _ = b.close(None);
         let _ = server.stop();
@@ -1508,7 +1545,10 @@ mod tests {
             let report = server.wait_until(Duration::from_secs(2), |r| r.live_members == 1);
             assert_eq!(report.live_members, 1, "{report:?}");
             let _ = client.close(None);
-            assert!(client.read().expect("close reply").is_close(), "index {index}");
+            assert!(
+                client.read().expect("close reply").is_close(),
+                "index {index}"
+            );
             let report = server.wait_until(Duration::from_secs(2), |r| r.live_members == 0);
             assert_eq!(report.live_members, 0, "{report:?}");
         }
@@ -1795,8 +1835,11 @@ mod tests {
     }
 
     fn http_request(addr: std::net::SocketAddr, method: &str, path: &str) -> String {
-        let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(2)).expect("connect");
-        stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let mut stream =
+            TcpStream::connect_timeout(&addr, Duration::from_secs(2)).expect("connect");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
         write!(
             stream,
             "{method} {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
@@ -1808,8 +1851,11 @@ mod tests {
     }
 
     fn raw_upgrade(addr: std::net::SocketAddr, extra_headers: &str) -> String {
-        let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(2)).expect("connect");
-        stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let mut stream =
+            TcpStream::connect_timeout(&addr, Duration::from_secs(2)).expect("connect");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
         write!(
             stream,
             "GET /room HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n{extra_headers}\r\n"

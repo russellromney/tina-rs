@@ -390,10 +390,14 @@ The buffered HTTP/2 response path used to copy each body chunk twice: once into 
 `Frame`'s `payload` `Vec` (`chunk.to_vec()`), then again inside `Frame::encode`
 when it spliced the 9-byte header in front. The server now builds each DATA frame
 straight into the queued buffer — header bytes via a new `push_frame_header`
-helper, then `extend_from_slice(chunk)` — so a body chunk is copied once. The
-per-frame `ensure_outbound_slots(1)` admission is kept, so the bounded
-outbound-queue cap and the `connection_full` accounting are byte-for-byte
-identical; the wire output is unchanged, so no replay-visible fact moves.
+helper, then `extend_from_slice(chunk)` — so a body chunk is copied once. At this
+(Phase 152) step the per-frame `ensure_outbound_slots(1)` admission was kept, so
+the bounded outbound-queue cap and the `connection_full` accounting were
+byte-for-byte identical and the wire output unchanged. (Phase 153 below then
+coalesces the whole buffered response into a single queued write, so a buffered
+response now takes one outbound slot instead of one per frame — the queue-full
+guard still applies, but the per-frame-count admission bound is gone. See the
+Phase 153 section.)
 
 Measured by the `perf-h2-alloc` check inside `hotpath_probes_report_and_stay_bounded`
 (it calls `http2_steady_state_response_process_allocations`; the ceiling lives in
@@ -433,3 +437,178 @@ macOS/aarch64 and is a regression guard (the regression is +64 over 64
 responses), not a cross-platform constant. Linux/x86 evidence for this phase is
 collected separately via the Fly/Ubuntu workflow and saved beside the phase
 plan.
+
+## Phase 153 real protocol performance
+
+Phase 152 measured the problem. Phase 153 changed the protocol code: move
+bytes instead of cloning them, allocate fewer things, take fewer turns — on the
+public paths users call. Before/after rows are same-machine (macOS/aarch64),
+same `--release` build, same rows, same sample policy; the full table and raw
+logs live in `.intent/phases/153-real-protocol-performance/`
+(`NOTES.md`, `perf_sample_macos_*`, `hotpath_sample_macos_*`).
+
+This landed in two passes: a leaf-copy pass (move payloads instead of cloning
+at named sites), then a structural pass that attacks the real per-request costs
+the evidence surfaced (the leaf copies alone were ~one allocation out of ~48 —
+too marginal). Numbers below are the Phase 152 baseline → Phase 153 final, same
+machine.
+
+### What got cheaper
+
+- **HTTP/2 buffered response** (`perf-h2-alloc`, 64 warmed h2c responses):
+  process allocations 3075 → **1730** (48.05 → **27.03**/response, **−43.7%**).
+  The arc is 3075 → 3011 (body clone gone) → 2626 (borrowed inbound decode +
+  coalesced response write) → 2434 (pre-sized header block + stack-formatted
+  content-length) → 1730 (literal HPACK fast path + compact pseudo-header
+  facts). The client is byte-identical across the comparison, so the whole drop
+  is server-side.
+- **HTTP/2 steady-state row** (`http2_h2c_steady_state_small`): whole-process
+  allocations 1570 → **897** (**−42.9%**), allocated bytes 426776 → **226096**
+  (**−47%**).
+- **Native HTTP/2 client row** (`http2_h2c_client_steady_state_post`): one
+  native `Http2ClientConnection` submits buffered POSTs to the native server over
+  a warmed h2c connection. With the row code copied onto the Phase 152 base,
+  whole-process allocations 4266 → **3643** (**−14.6%**), allocated bytes
+  2161066 → **1685168** (**−22%**), p50 1287 → **1051 µs**. The row's
+  load-worker allocation scope is unchanged because request construction still
+  allocates the submitted body; the process row is the useful client/server
+  signal.
+- **gRPC unary** (`grpc_h2c_unary_close`): the smallest public unary gRPC path
+  (`GrpcRouter` behind the real `Http2Listener`, driven by
+  `grpc_unary_call_h2c_blocking`). Whole-process allocations 5599 → **~4220**
+  (**−24.6%**) via the same server response/header path plus gRPC path
+  ownership cleanup.
+- **gRPC steady-state rows**: the suite now separates fresh connection cost
+  from ordinary warmed service cost:
+  - `grpc_h2c_unary_close`: fresh h2c connection + unary call.
+  - `grpc_h2c_unary_warmed`: one warmed `GrpcClient` / HTTP/2 connection.
+  - `grpc_h2c_unary_pooled_concurrent`: fixed `GrpcClientPool`, one warmed
+    connection per worker, concurrent unary calls.
+  - `grpc_h2c_server_streaming_steady_state`: warmed server-streaming call,
+    bounded pre-registered response sources, three messages per RPC.
+  This is the honest comparison: fresh gRPC is a setup row, not "gRPC is slow."
+  The warmed rows also show the remaining truth: unary gRPC is still
+  allocation-heavy in steady state, so future work should target protobuf frame
+  reuse, client request construction, and runtime/protocol turn count rather
+  than more connection-setup fixes.
+- **WebSocket** (`websocket_text_round_trip` 4691 → **3813**,
+  `websocket_steady_state_small` 880 → **672** process allocations): the
+  connection owner now delivers exactly one session-rich app event per wire
+  event. It no longer also emits the legacy `Text`/`Binary`/`Close`/`Open`/
+  `Closed`/`Pressure` duplicate, so the payload is moved into a single delivery
+  instead of cloned.
+- **Fewer turns** (`perf-ws-turns`, 64 text round trips): app-handler turns for
+  the whole session 133 → **67** (2.08 → **1.05**/message). Removing the
+  duplicate delivery removes one app turn per wire event; the coalesced HTTP/2
+  response likewise drops a write turn (one write per response, not one per
+  frame). The hotpath assertion pins `app_turns < 2*N`; the Phase 152 code fails
+  it, the new code passes.
+
+Steady-state (reused-connection) rows improved or held. The `connection_setup`
+rows (gRPC, ws text) are dominated by TCP connect/accept latency and swing
+run-to-run, so their deterministic allocation counts are the trustworthy signal
+(and those dropped); per-op latency is reported in `NOTES.md`, not claimed. All
+rows `ok=32`, `timeout=0`, leak-clean. Still local/alpha, not a production
+performance claim.
+
+### Byte-path changes (the code, not the harness)
+
+- **Inbound frames decode with a borrowed view.** `try_decode_frame_meta`
+  decodes just the header; `data_payload_view` / `headers_payload_view` return
+  the unpadded payload as a sub-slice. The server read loop takes its buffer out
+  (`std::mem::take`) and handles DATA and HEADERS straight from a borrowed slice
+  — no `Frame { payload: Vec }` per inbound frame. Only a streaming request
+  chunk (which must outlive the buffer) copies; control frames keep a cheap
+  owned copy.
+- **Coalesced outbound response.** `send_pending_response` frames HEADERS +
+  every DATA frame + trailers into one queued buffer — one outbound slot, one
+  TCP write — instead of one `Vec`/write per frame. Wire frame boundaries, peer
+  max frame size, END_STREAM, and flow control are unchanged.
+- **Header encode.** The response header block is pre-sized (each `Vec` growth
+  realloc is a counted allocation) and content-length is formatted into a stack
+  buffer, not a heap `String`.
+- **Header decode.** Tina-native/plain-literal HPACK blocks are decoded from a
+  borrowed wire slice without temporary per-header `Vec`s. Indexed/dynamic/
+  Huffman HPACK still falls back to the full decoder. Request-only pseudo
+  headers that are not public `HttpRequest` fields (`:scheme`, `:authority`) are
+  kept as validation facts instead of owned strings.
+- **Compact built-in gRPC service messages.** `GrpcRouterMsg` opts into
+  `Http2ServiceMessage` compact parts, so the HTTP/2 connection carries
+  gRPC/content-encoding facts without populating a public `HeaderMap`, while
+  still calling the `GrpcRouter` isolate through normal Tina call/reply.
+- `into_data_payload(frame)` moves the unpadded DATA payload out of an owned
+  frame (used by the client DATA handler); the old cloning `data_payload` is
+  gone. Padded DATA still validates padding and preserves the flow-control wire
+  length.
+- The HTTP/2 *client* request body is an owned `Vec` + cursor with direct DATA
+  framing, replacing the per-byte `VecDeque<u8>` drain; consumed/finished
+  buffers are compacted/dropped. The
+  `http2_h2c_client_steady_state_post` row drives this public native-client path
+  directly, while the `tina-http` correctness suite still guards the protocol
+  edges (incl. the 128 KB `large_upload_paces_through_real_window_updates`
+  flow-control test).
+- gRPC status responses avoid temporary status maps/strings where the protocol
+  shape is fixed: unary/streaming helpers insert `grpc-status` directly into
+  the response headers, and the streaming final-status path writes the tiny
+  HPACK trailer block directly.
+- WebSocket ping echoes its payload into the pong from a borrowed slice
+  (`encode_server_frame_from`) and moves the owned payload into the app `Ping`
+  notification — no clone.
+
+### What still dominates the residual (named, not hidden)
+
+Framing and Tina-native HPACK decode are no longer the big cost; the
+whole-process ~27 allocations/request are now dominated by paths that remain
+public request/application boundaries:
+
+- Building the public typed `HttpRequest`: `:path` plus `HeaderMap` values that
+  user code can inspect.
+- The per-request runtime call delivering the request to the service isolate and
+  returning the response (out of scope: no scheduler/runtime change).
+- The raw-socket test client's own per-frame allocations (harness, not Tina).
+- gRPC messages still allocate the length-prefixed frame buffer
+  (`encode_grpc_message`) plus prost's internal encode. Status-header/trailer
+  construction is cheaper now, but protobuf payload construction is unchanged.
+
+Reducing the first two further means a user-facing borrowed/compact request
+view for normal services, or an explicit inline protocol-service mode that
+honestly says the handler runs in the protocol isolate. Reducing the raw-socket
+harness allocations means a different benchmark client. None of that is hidden
+as "protocol frame" work.
+
+### Platform
+
+Phase 153 has both macOS/aarch64 and Linux/x86_64 evidence. Linux rows were
+captured on Fly `performance-2x` and saved in
+`.intent/phases/153-real-protocol-performance/perf_sample_linux.txt`; Linux
+validation output is saved beside it in `linux_validation.txt`.
+
+The first Linux run reproduced the deterministic allocation wins but surfaced a
+real bug: native HTTP/2 client POST and gRPC close both showed an ~88 ms p50
+floor while the server-only HTTP/2 row was healthy. That was tiny HTTP/2 writes
+meeting Linux delayed ACK/Nagle behavior, not a scheduler or framing cost. The
+final Phase 153 code fixes it in three places:
+
+- runtime TCP accept/connect sockets set TCP_NODELAY;
+- the native HTTP/2 client coalesces already-ready frames into one pending
+  write;
+- the public blocking gRPC helper and raw perf clients set TCP_NODELAY too.
+
+Final Linux representative rows:
+
+| row | p50 | p90 | p99 | note |
+| --- | ---: | ---: | ---: | --- |
+| `http2_h2c_steady_state_small` | 144 µs | 190 µs | 216 µs | native server steady-state |
+| `http2_h2c_client_steady_state_post` | 399 µs | 555 µs | 664 µs | native client + native server warmed POST |
+| `grpc_h2c_unary_close` | 1095 µs | 1331 µs | 1378 µs | fresh h2c connection + unary call; no 88 ms floor |
+| `grpc_h2c_unary_warmed` | tbd Linux | tbd Linux | tbd Linux | warmed native `GrpcClient`; added after first Linux sample |
+| `grpc_h2c_unary_pooled_concurrent` | tbd Linux | tbd Linux | tbd Linux | fixed pool, one warmed connection per worker |
+| `grpc_h2c_server_streaming_steady_state` | tbd Linux | tbd Linux | tbd Linux | warmed streaming, three messages, bounded response sources |
+| `http2_h2c_close_request` | 908 µs | 1197 µs | 1880 µs | fresh h2c connection + one request |
+| `websocket_steady_state_small` | 66 µs | 178 µs | 1028 µs | reusable session path; p99 noisy |
+
+The Linux `perf-h2-alloc` hotpath assertion is platform-aware now:
+macOS/aarch64 remains pinned at 2480 allocations/64 requests, while Linux/x86_64
+allows 2640. The final Linux run measured 2561 and passed. This keeps the
+regression guard useful without pretending allocator/toolchain counts are
+identical across platforms.

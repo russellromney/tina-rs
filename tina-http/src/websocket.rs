@@ -366,6 +366,32 @@ pub enum WebSocketSessionControl {
 }
 
 /// Inbound message delivered from a WebSocket session to an app isolate.
+///
+/// The connection owner delivers exactly **one session-rich event per wire
+/// event**: `SessionText` / `SessionBinary` for messages, `SessionClose` /
+/// `SessionClosed` for the close handshake or peer drop, `SessionPressure` for
+/// typed backpressure, and `SessionOpen` + `SessionAccepted` on open. It does
+/// not also emit the legacy `Text` / `Binary` / `Close` / `Open` / `Closed` /
+/// `Pressure` variants for the same wire event — those remain only for
+/// app-local messages an app sends to itself. A new app handles wire input with
+/// the session-rich variants alone:
+///
+/// ```
+/// use tina_http::{WebSocketSessionMsg, WebSocketSessionOutcome};
+///
+/// fn handle(msg: WebSocketSessionMsg) -> WebSocketSessionOutcome {
+///     match msg {
+///         WebSocketSessionMsg::SessionText { text, .. } => WebSocketSessionOutcome::Text(text),
+///         WebSocketSessionMsg::SessionBinary { bytes, .. } => WebSocketSessionOutcome::Binary(bytes),
+///         WebSocketSessionMsg::SessionClose { code, reason, .. } => {
+///             WebSocketSessionOutcome::Close(code, reason)
+///         }
+///         // SessionOpen / SessionAccepted / SessionPressure / SessionClosed
+///         // and everything else need no reply here.
+///         _ => WebSocketSessionOutcome::None,
+///     }
+/// }
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WebSocketSessionMsg {
     Open,
@@ -931,6 +957,17 @@ pub(crate) fn encode_client_frame(
 }
 
 pub(crate) fn encode_server_frame(opcode: u8, payload: Vec<u8>) -> Result<Vec<u8>, WebSocketError> {
+    encode_server_frame_from(opcode, &payload)
+}
+
+/// Encode a server (unmasked) frame from a borrowed payload slice. Lets a
+/// caller that still needs the owned payload afterwards (e.g. echoing a ping
+/// payload into a pong *and* notifying the app) build the wire frame without
+/// cloning the payload.
+pub(crate) fn encode_server_frame_from(
+    opcode: u8,
+    payload: &[u8],
+) -> Result<Vec<u8>, WebSocketError> {
     if opcode >= 0x8 && payload.len() > 125 {
         return Err(WebSocketError::ControlFrameTooLarge);
     }
@@ -945,7 +982,7 @@ pub(crate) fn encode_server_frame(opcode: u8, payload: Vec<u8>) -> Result<Vec<u8
         out.push(127);
         out.extend_from_slice(&(payload.len() as u64).to_be_bytes());
     }
-    out.extend_from_slice(&payload);
+    out.extend_from_slice(payload);
     Ok(out)
 }
 

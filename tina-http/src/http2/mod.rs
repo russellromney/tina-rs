@@ -22,7 +22,7 @@ pub use client::{
 pub use errors::Http2ProtocolError;
 pub use server::{
     Http2Connection, Http2ConnectionMsg, Http2ConnectionReply, Http2ConnectionReport, Http2Limits,
-    Http2Listener, Http2ListenerMsg, Http2Outcome, Http2ServerConfig, Http2StreamReport,
-    Http2StreamState,
+    Http2Listener, Http2ListenerMsg, Http2Outcome, Http2RequestParts, Http2ServerConfig,
+    Http2ServiceMessage, Http2StreamReport, Http2StreamState,
 };
 pub use target::{AlpnProtocols, Http2Target};

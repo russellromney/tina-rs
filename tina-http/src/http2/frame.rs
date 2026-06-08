@@ -76,10 +76,24 @@ pub(super) fn push_frame_header(out: &mut Vec<u8>, ty: u8, flags: u8, stream_id:
     out.extend_from_slice(&(stream_id & 0x7fff_ffff).to_be_bytes());
 }
 
-pub(super) fn try_decode_frame(
+/// Frame header fields plus the total on-wire frame length, decoded without
+/// copying the payload. Lets the read loop hand a handler a borrowed payload
+/// slice of its own buffer instead of allocating a `Frame { payload: Vec }`
+/// for every inbound frame.
+pub(super) struct FrameMeta {
+    pub(super) ty: u8,
+    pub(super) flags: u8,
+    pub(super) stream_id: u32,
+    /// Header (9 bytes) + payload length: the number of bytes to advance.
+    pub(super) total: usize,
+}
+
+/// Decode just the frame header. Returns `None` when the buffer does not yet
+/// hold the full frame. The payload is `buffer[FRAME_HEADER_LEN..total]`.
+pub(super) fn try_decode_frame_meta(
     buffer: &[u8],
     max_frame_size: usize,
-) -> Result<Option<(Frame, usize)>, Http2ProtocolError> {
+) -> Result<Option<FrameMeta>, Http2ProtocolError> {
     if buffer.len() < FRAME_HEADER_LEN {
         return Ok(None);
     }
@@ -99,20 +113,33 @@ pub(super) fn try_decode_frame(
     if buffer.len() < total {
         return Ok(None);
     }
-    let ty = buffer[3];
-    let flags = buffer[4];
     let mut sid_bytes = [0_u8; 4];
     sid_bytes.copy_from_slice(&buffer[5..9]);
     let stream_id = u32::from_be_bytes(sid_bytes) & 0x7fff_ffff;
-    let payload = buffer[9..total].to_vec();
+    Ok(Some(FrameMeta {
+        ty: buffer[3],
+        flags: buffer[4],
+        stream_id,
+        total,
+    }))
+}
+
+pub(super) fn try_decode_frame(
+    buffer: &[u8],
+    max_frame_size: usize,
+) -> Result<Option<(Frame, usize)>, Http2ProtocolError> {
+    let Some(meta) = try_decode_frame_meta(buffer, max_frame_size)? else {
+        return Ok(None);
+    };
+    let payload = buffer[FRAME_HEADER_LEN..meta.total].to_vec();
     Ok(Some((
         Frame {
-            ty,
-            flags,
-            stream_id,
+            ty: meta.ty,
+            flags: meta.flags,
+            stream_id: meta.stream_id,
             payload,
         },
-        total,
+        meta.total,
     )))
 }
 
@@ -159,49 +186,81 @@ pub(super) fn data_frame(stream_id: u32, end_stream: bool, data: Vec<u8>) -> Fra
     )
 }
 
-pub(super) fn data_payload(frame: &Frame) -> Result<Vec<u8>, Http2ProtocolError> {
+/// Take the application DATA bytes out of an owned `Frame`, returning the
+/// unpadded payload plus the flow-control wire length (the full on-wire
+/// payload, padding included — RFC 9113 §6.9.1 counts padding against the
+/// window). The handler already owns the `Frame`, so the unpadded case moves
+/// `frame.payload` out instead of cloning it; only the rarer padded case has
+/// to allocate a trimmed copy. The old borrowing `data_payload` cloned even
+/// the unpadded payload, so handlers must take the owned path here.
+pub(super) fn into_data_payload(frame: Frame) -> Result<(Vec<u8>, usize), Http2ProtocolError> {
+    let flow_len = frame.payload.len();
     if frame.flags & FLAG_PADDED == 0 {
-        return Ok(frame.payload.clone());
+        return Ok((frame.payload, flow_len));
     }
-    let Some((&pad_len, rest)) = frame.payload.split_first() else {
+    // Padded: validate and copy out only the unpadded bytes.
+    let (data, _) = data_payload_view(frame.flags, &frame.payload)?;
+    Ok((data.to_vec(), flow_len))
+}
+
+/// Borrowed counterpart of [`into_data_payload`]: return the unpadded DATA
+/// bytes as a sub-slice of `payload` (no allocation) plus the flow-control wire
+/// length (the full payload length, padding included). Used by the server read
+/// loop to process DATA straight from its read buffer.
+pub(super) fn data_payload_view(
+    flags: u8,
+    payload: &[u8],
+) -> Result<(&[u8], usize), Http2ProtocolError> {
+    let flow_len = payload.len();
+    if flags & FLAG_PADDED == 0 {
+        return Ok((payload, flow_len));
+    }
+    let Some((&pad_len, rest)) = payload.split_first() else {
         return Err(Http2ProtocolError::BadFrameLength);
     };
     let pad_len = usize::from(pad_len);
     if pad_len > rest.len() {
         return Err(Http2ProtocolError::BadFrameLength);
     }
-    Ok(rest[..rest.len() - pad_len].to_vec())
+    Ok((&rest[..rest.len() - pad_len], flow_len))
 }
 
 pub(super) fn headers_payload(frame: &Frame) -> Result<&[u8], Http2ProtocolError> {
+    headers_payload_view(frame.flags, &frame.payload)
+}
+
+/// Borrowed counterpart of [`headers_payload`]: strip the HEADERS pad-length
+/// byte, optional priority bytes, and trailing padding, returning the HPACK
+/// block as a sub-slice of `payload`. Used by the server read loop to decode
+/// headers straight from its read buffer.
+pub(super) fn headers_payload_view(flags: u8, payload: &[u8]) -> Result<&[u8], Http2ProtocolError> {
     let mut offset = 0usize;
     let mut pad_len = 0usize;
-    if frame.flags & FLAG_PADDED != 0 {
-        let Some((&pad, _)) = frame.payload.split_first() else {
+    if flags & FLAG_PADDED != 0 {
+        let Some((&pad, _)) = payload.split_first() else {
             return Err(Http2ProtocolError::BadFrameLength);
         };
         pad_len = usize::from(pad);
         offset = 1;
     }
-    if frame.flags & FLAG_PRIORITY != 0 {
+    if flags & FLAG_PRIORITY != 0 {
         let next = offset
             .checked_add(5)
             .ok_or(Http2ProtocolError::BadFrameLength)?;
-        if frame.payload.len() < next {
+        if payload.len() < next {
             return Err(Http2ProtocolError::BadFrameLength);
         }
         offset = next;
     }
-    let available = frame
-        .payload
+    let available = payload
         .len()
         .checked_sub(offset)
         .ok_or(Http2ProtocolError::BadFrameLength)?;
     if pad_len > available {
         return Err(Http2ProtocolError::BadFrameLength);
     }
-    let end = frame.payload.len() - pad_len;
-    Ok(&frame.payload[offset..end])
+    let end = payload.len() - pad_len;
+    Ok(&payload[offset..end])
 }
 
 /// Apply a positive `WINDOW_UPDATE` increment to a signed 32-bit window,
@@ -213,4 +272,64 @@ pub(super) fn add_window(current: i32, increment: u32) -> Result<i32, Http2Proto
         return Err(Http2ProtocolError::WindowOverflow);
     }
     Ok(next as i32)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn into_data_payload_unpadded_moves_payload_and_reports_wire_len() {
+        let frame = Frame::new(FRAME_DATA, 0, 1, vec![10, 20, 30]);
+        let original = frame.payload.as_ptr();
+        let (payload, flow_len) = into_data_payload(frame).expect("unpadded DATA");
+        assert_eq!(payload, vec![10, 20, 30]);
+        // Unpadded DATA returns the same allocation it was given (a move, not a
+        // clone): the buffer pointer is unchanged.
+        assert_eq!(payload.as_ptr(), original);
+        assert_eq!(flow_len, 3, "wire length is the full payload length");
+    }
+
+    #[test]
+    fn into_data_payload_empty_unpadded_is_zero_len() {
+        let frame = Frame::new(FRAME_DATA, 0, 1, Vec::new());
+        let (payload, flow_len) = into_data_payload(frame).expect("empty DATA");
+        assert!(payload.is_empty());
+        assert_eq!(flow_len, 0);
+    }
+
+    #[test]
+    fn into_data_payload_padded_trims_and_keeps_wire_len() {
+        // payload = [pad_len=2][10,20,30][pad,pad]
+        let frame = Frame::new(FRAME_DATA, FLAG_PADDED, 1, vec![2, 10, 20, 30, 0, 0]);
+        let (payload, flow_len) = into_data_payload(frame).expect("padded DATA");
+        assert_eq!(
+            payload,
+            vec![10, 20, 30],
+            "only the unpadded body is returned"
+        );
+        assert_eq!(
+            flow_len, 6,
+            "flow-control wire length counts the pad-length byte and padding"
+        );
+    }
+
+    #[test]
+    fn into_data_payload_pad_longer_than_body_is_bad_frame() {
+        // pad_len=5 but only 2 bytes follow.
+        let frame = Frame::new(FRAME_DATA, FLAG_PADDED, 1, vec![5, 1, 2]);
+        assert!(matches!(
+            into_data_payload(frame),
+            Err(Http2ProtocolError::BadFrameLength)
+        ));
+    }
+
+    #[test]
+    fn into_data_payload_padded_with_empty_payload_is_bad_frame() {
+        let frame = Frame::new(FRAME_DATA, FLAG_PADDED, 1, Vec::new());
+        assert!(matches!(
+            into_data_payload(frame),
+            Err(Http2ProtocolError::BadFrameLength)
+        ));
+    }
 }

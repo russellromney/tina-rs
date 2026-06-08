@@ -422,8 +422,8 @@ and reviews live under `.intent/phases/`.
   production-performance claim until evidence earns it.
 
 These are recorded in `CHANGELOG.md`; the remaining near-term roadmap now
-starts with the next performance pass and native AWS. Public release cleanup
-waits until Tina stops apologizing for the core HTTP/runtime hot path.
+starts with native AWS. Public release cleanup waits until Tina stops
+apologizing for the core HTTP/runtime hot path.
 
 ## Near-term roadmap
 
@@ -432,8 +432,6 @@ framework before public release-story work.
 
 | Phase | Purpose |
 |---|---|
-| **152 Protocol perf rows and byte-path cost** | Establish the honest protocol perf rows: HTTP/2/WebSocket equivalent workloads, connection setup versus steady-state split, allocation/process evidence, and the first small byte-path cleanup. This is the measuring stick for the real optimization pass; it is not enough by itself. Plan: `.intent/phases/152-protocol-perf-byte-path/plan.md`. |
-| **153 Real protocol performance** | Use the Phase 152 rows to make real protocol code cheaper: move HTTP/2 DATA payloads instead of cloning, consume buffered HTTP/2 responses without body clones, reduce streaming/gRPC DATA copies, remove duplicate WebSocket app delivery, reduce at least one protocol turn, and prove before/after macOS plus Linux/x86 evidence. Plan: `.intent/phases/153-real-protocol-performance/plan.md`. |
 | **135 Native AWS first form** | Add a native Tina AWS battery for the smallest honest production shape: static SigV4 with explicit signing time, native S3 put/get/head/delete, native SQS send/receive/delete, native HTTP keepalive under Phase 131 endpoint/connect policy, bounded bodies/in-flight work, typed pressure/lifecycle reports, hermetic fake-AWS tests, and clear native-vs-SDK-bridge docs. Plan: `.intent/phases/135-native-aws-first-form/plan.md`. |
 | **Alpaca rename** | Before public launch, rename the project/crates/docs away from Tina to Alpaca so the lineage is respectful and clear: independently maintained Rust framework, inspired by Peter Mbanugo's Tina/Odin and Seastar, not an official Tina port. |
 | **Barend Biesheuvel visible flow ergonomics** | Optional high-level ergonomics only after the local runtime core feels boring: a `flow!`-style authoring surface that preserves named suspension points, visible failure policy, trace step names, and ordinary Tina message/effect expansion. No fake async, no hidden retries, no hidden queues. |

@@ -704,6 +704,10 @@ impl BetelgeuseTcp {
                     .expect("accept completion advertised a result");
                 match result {
                     Ok(socket) => {
+                        if socket.set_nodelay(true).is_err() {
+                            socket.close();
+                            return Some(CallOutput::Failed(CallError::Io));
+                        }
                         let peer_addr = match socket.peer_addr() {
                             Ok(addr) => addr,
                             Err(_) => return Some(CallOutput::Failed(CallError::Io)),
@@ -732,6 +736,10 @@ impl BetelgeuseTcp {
                 match result {
                     Ok(()) => {
                         let socket = socket.take().expect("connected socket available");
+                        if socket.set_nodelay(true).is_err() {
+                            socket.close();
+                            return Some(CallOutput::Failed(CallError::Io));
+                        }
                         let local_addr = match socket.local_addr() {
                             Ok(addr) => addr,
                             Err(_) => return Some(CallOutput::Failed(CallError::Io)),
