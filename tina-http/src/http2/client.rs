@@ -594,6 +594,11 @@ struct ActiveClientStream {
     /// END_STREAM has been seen for the response. Once the buffered
     /// chunks drain, the next pull gets `End`.
     response_eof: bool,
+    /// Total received response body bytes on a streamed response, compared
+    /// against `response_content_length` at END_STREAM. The buffered path
+    /// uses `response_body.len()`; the streamed path drains its chunks, so it
+    /// needs its own running counter to tell the same content-length truth.
+    response_body_received: usize,
 }
 
 impl ActiveClientStream {
@@ -627,6 +632,7 @@ impl ActiveClientStream {
             response_chunks: VecDeque::new(),
             response_pull: None,
             response_eof: false,
+            response_body_received: 0,
         }
     }
 
@@ -1579,7 +1585,24 @@ impl<S: Shard + 'static> Http2ClientConnection<S> {
     /// slot. Called once the buffered body has drained and END_STREAM has
     /// been seen, with a pull parked.
     fn complete_streaming_stream(&mut self, idx: usize, effects: &mut Vec<Effect<Self>>) {
-        let mut stream = self.streams.swap_remove(idx);
+        // A declared content-length the body did not honor is a malformed
+        // response (RFC 9113 §8.1.1). Mirror the buffered branch's terminal
+        // cause: RST the peer and settle the parked pull as a protocol error
+        // instead of handing back a clean `End`.
+        if let Some(declared) = self.streams[idx].response_content_length {
+            if declared != self.streams[idx].response_body_received {
+                let stream_id = self.streams[idx].id;
+                self.enqueue_frame(rst_stream_frame(stream_id, ERR_PROTOCOL_ERROR));
+                self.fail_stream(
+                    idx,
+                    Http2ClientOutcome::ProtocolError(Http2ProtocolError::ContentLengthMismatch),
+                    Http2CloseReason::LocalCloseOnly,
+                    effects,
+                );
+                return;
+            }
+        }
+        let mut stream = self.swap_remove_stream_at(idx);
         let stream_id = stream.id;
         self.report.closed_streams += 1;
         if let Some(status) = grpc_status_from_headers(&stream.response_trailers)
@@ -2102,6 +2125,7 @@ impl<S: Shard + 'static> Http2ClientConnection<S> {
         // streams, so holding it would stall every other stream. A slow
         // consumer is bounded purely by this stream's window.
         if self.streams[idx].response_streamed {
+            self.streams[idx].response_body_received += payload_len;
             if !payload.is_empty() {
                 self.streams[idx].response_chunks.push_back(payload);
             }
