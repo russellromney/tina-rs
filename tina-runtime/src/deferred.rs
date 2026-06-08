@@ -50,6 +50,12 @@ impl PromotedSlots {
         self.slots.push(record);
     }
 
+    /// True when no slots are tracked. Lets the per-step sweep skip its
+    /// scan entirely on shards that hold no promoted deferred replies.
+    pub fn is_empty(&self) -> bool {
+        self.slots.is_empty()
+    }
+
     /// Pop and return the slot record matching the given shared handle.
     pub fn take_by_handle(
         &mut self,
@@ -59,7 +65,8 @@ impl PromotedSlots {
             .slots
             .iter()
             .position(|s| Arc::ptr_eq(&s.shared, shared))?;
-        Some(self.slots.remove(pos))
+        // swap_remove: order does not matter, slots are looked up by id.
+        Some(self.slots.swap_remove(pos))
     }
 
     /// Pop the slot tracking a given local call id.
@@ -75,7 +82,7 @@ impl PromotedSlots {
             .iter()
             .position(|s| matches!(s.routing, DeferredRouting::Local) && s.call_id == call_id)?;
         debug_assert!(matches!(self.slots[pos].routing, DeferredRouting::Local));
-        Some(self.slots.remove(pos))
+        Some(self.slots.swap_remove(pos))
     }
 
     /// Sweep slots whose only remaining strong reference is the
@@ -91,7 +98,8 @@ impl PromotedSlots {
         let mut i = 0;
         while i < self.slots.len() {
             if self.slots[i].capturing_isolate == isolate {
-                taken.push(self.slots.remove(i));
+                // swap_remove moves the tail into `i`; re-check that slot.
+                taken.push(self.slots.swap_remove(i));
             } else {
                 i += 1;
             }
@@ -107,7 +115,8 @@ impl PromotedSlots {
         let mut i = 0;
         while i < self.slots.len() {
             if Arc::strong_count(&self.slots[i].shared) <= 1 {
-                dropped.push(self.slots.remove(i));
+                // swap_remove moves the tail into `i`; re-check that slot.
+                dropped.push(self.slots.swap_remove(i));
             } else {
                 i += 1;
             }
@@ -1220,6 +1229,98 @@ mod pending_replies_tests {
             .take_by_handle(&remote_shared)
             .expect("remote-routed slot remains tracked");
         assert!(matches!(remaining.routing, DeferredRouting::Remote { .. }));
+    }
+
+    #[test]
+    fn promoted_slot_paths_do_not_shift_remove_inside_a_loop() {
+        let source = include_str!("deferred.rs");
+        // O(P^2): Vec::remove shifts the tail per drop. The promoted-slot
+        // paths must compact with swap_remove instead. Needle is built at
+        // runtime so this guard line does not match itself.
+        let needle = format!("self.slots.{}(", "remove");
+        assert!(
+            !source.contains(&needle),
+            "PromotedSlots must use swap_remove, not Vec::remove inside a loop"
+        );
+    }
+
+    #[test]
+    fn sweep_dropped_removes_exactly_dropped_and_keeps_live_resolvable() {
+        // Drop-wave shape: promote P slots, drop most in one sweep. Sweep
+        // must reclaim exactly the dropped ones and leave every live slot
+        // still resolvable by its handle. Live = an external Arc clone is
+        // held (strong_count > 1); dropped = only the record's Arc remains.
+        let mut slots = PromotedSlots::default();
+
+        const P: usize = 32;
+        let mut live_handles = Vec::new();
+        let mut live_slot_ids = Vec::new();
+        let mut dropped_slot_ids = Vec::new();
+        for i in 0..P as u64 {
+            let record = fake_promoted_record(i, i, DeferredRouting::Local);
+            if i % 4 == 0 {
+                // Keep an external strong ref: this slot stays live.
+                live_handles.push(std::sync::Arc::clone(&record.shared));
+                live_slot_ids.push(i);
+            } else {
+                dropped_slot_ids.push(i);
+            }
+            slots.push(record);
+        }
+
+        let dropped = slots.sweep_dropped();
+        let swept: std::collections::HashSet<u64> =
+            dropped.iter().map(|r| r.slot_id.get()).collect();
+        assert_eq!(
+            swept,
+            dropped_slot_ids.iter().copied().collect(),
+            "sweep must reclaim exactly the slots whose caller went away"
+        );
+
+        // Every live slot is still tracked and resolvable by its handle.
+        for handle in &live_handles {
+            let record = slots
+                .take_by_handle(handle)
+                .expect("live slot must remain resolvable after a drop wave");
+            assert!(live_slot_ids.contains(&record.slot_id.get()));
+        }
+        // After taking all live slots the table is empty.
+        let leftover = slots.sweep_dropped();
+        assert!(leftover.is_empty(), "no slots should remain after draining");
+    }
+
+    #[test]
+    fn take_by_isolate_drains_only_matching_and_keeps_others_resolvable() {
+        // swap_remove correctness for the isolate drain path: removing one
+        // slot must not orphan another. Two isolates' slots interleave.
+        let mut slots = PromotedSlots::default();
+        let target = IsolateId::new(9); // fake_promoted_record uses isolate 9
+        let mut target_handles = Vec::new();
+        let mut other_handles = Vec::new();
+        for i in 0..16u64 {
+            let mut record = fake_promoted_record(i, i, DeferredRouting::Local);
+            if i % 2 == 0 {
+                record.capturing_isolate = target;
+                target_handles.push(std::sync::Arc::clone(&record.shared));
+            } else {
+                record.capturing_isolate = IsolateId::new(99);
+                other_handles.push(std::sync::Arc::clone(&record.shared));
+            }
+            slots.push(record);
+        }
+
+        let drained = slots.take_by_isolate(target);
+        assert_eq!(drained.len(), target_handles.len());
+        for record in &drained {
+            assert_eq!(record.capturing_isolate, target);
+        }
+        // Other isolate's slots are untouched and still resolvable.
+        for handle in &other_handles {
+            assert!(
+                slots.take_by_handle(handle).is_some(),
+                "non-target slot must survive the isolate drain intact"
+            );
+        }
     }
 
     #[test]

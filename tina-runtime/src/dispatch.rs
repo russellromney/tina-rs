@@ -522,6 +522,11 @@ where
     }
 
     pub(crate) fn sweep_dropped_deferred_slots(&mut self) {
+        // Nothing promoted: skip the scan. Steady-state shards with no
+        // outstanding deferred replies pay nothing here.
+        if self.promoted_slots.is_empty() {
+            return;
+        }
         // Single pass: independent Rcs cannot cascade.
         let dropped = self.promoted_slots.sweep_dropped();
         for record in dropped {
