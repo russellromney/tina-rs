@@ -460,12 +460,16 @@ pub(crate) fn encode_response_head_with_extra_capacity(
 pub fn encode_response(response: &crate::types::HttpResponse, connection_close: bool) -> Vec<u8> {
     let extra_capacity = match &response.body {
         crate::types::HttpResponseBody::Buffered(bytes) => bytes.len(),
+        crate::types::HttpResponseBody::Shared(bytes) => bytes.len(),
         _ => 0,
     };
     let mut out =
         encode_response_head_with_extra_capacity(response, connection_close, extra_capacity);
     match &response.body {
         crate::types::HttpResponseBody::Buffered(bytes) => {
+            out.extend_from_slice(bytes);
+        }
+        crate::types::HttpResponseBody::Shared(bytes) => {
             out.extend_from_slice(bytes);
         }
         crate::types::HttpResponseBody::Stream(_)

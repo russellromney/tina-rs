@@ -178,6 +178,33 @@ gRPC rows:
 | `grpc_h2c_unary_close` | `connection_setup` | fresh h2c connection + unary call |
 | `grpc_h2c_unary_warmed` | `steady_state_reuse` | one warmed `GrpcClient` / HTTP2 connection |
 | `grpc_h2c_unary_pooled_concurrent` | `steady_state_reuse` | fixed `GrpcClientPool`, one warmed connection per worker |
+
+## Phase 154 follow-up: gRPC hot path
+
+Phase 154 turned the Phase 153 diagnosis into code:
+
+- compact `SubmitGrpcUnary` avoids per-call public `Http2ClientRequest` /
+  `HeaderMap` construction for unary gRPC;
+- `GrpcUnaryTemplate` validates and shares the method path;
+- `GrpcPreframedUnary` shares a fixed length-prefixed request body for hot
+  repeated calls;
+- `GrpcRouter::server_streaming_buffered` avoids a source-isolate pool for
+  small finite server-streaming responses;
+- `HttpResponseBody::Shared` keeps fixed response bytes shared through HTTP/2
+  response admission/framing.
+
+Final macOS/aarch64 release evidence is in
+`../154-grpc-hot-path/perf_macos_after.txt`. Headline rows:
+
+| row | p50 | p90 | load allocations / 32 ops |
+| --- | ---: | ---: | ---: |
+| `grpc_h2c_unary_warmed` | 1105 µs | 1217 µs | 56 |
+| `grpc_h2c_unary_pooled_concurrent` | 719 µs | 846 µs | 56 |
+| `grpc_h2c_server_streaming_steady_state` | 1296 µs | 1557 µs | 379 |
+
+The load-worker allocation count moved a lot. The whole-process gRPC rows are
+still high (~4k-5k allocations / 32 ops), so the next performance work should
+attack connection/server internals and turn count, not add another wrapper.
 | `grpc_h2c_server_streaming_steady_state` | `steady_state_reuse` | warmed server-streaming RPC, three messages, bounded response-source pool |
 
 Representative macOS/aarch64 release rows from

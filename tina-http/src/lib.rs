@@ -106,12 +106,15 @@
 //! client builds a request ([`GrpcClient::server_streaming_request`] /
 //! [`GrpcClient::client_streaming_request`] / [`GrpcClient::bidi_request`])
 //! and folds pulled response chunks through a [`GrpcStreamDecoder`] into
-//! [`GrpcStreamItem`]s. On every shape a non-OK status is the caller
-//! outcome (never hidden in a success) and the received status is a
-//! `GrpcFinalStatusReceived` protocol fact. Both reject compression and
-//! cap message bytes. The specimens prove tonic h2c interop for the
-//! core modes. Interceptors, reflection, load balancing, and
-//! production pooled clients are later slices.
+//! [`GrpcStreamItem`]s. Small fixed server-streaming responses can use
+//! [`GrpcBufferedServerStreamingResponse`] with explicit
+//! [`GrpcBufferedStreamLimits`] for message count and framed-body bytes; use
+//! source-backed streaming when the response size comes from the request. On
+//! every shape a non-OK status is the caller outcome (never hidden in a
+//! success) and the received status is a `GrpcFinalStatusReceived` protocol
+//! fact. Both reject compression and cap message bytes. The specimens prove
+//! tonic h2c interop for the core modes. Interceptors, reflection, load
+//! balancing, and production pooled clients are later slices.
 //!
 //! WebSocket: [`websocket_upgrade`] validates server-side HTTP/1.1
 //! upgrades for [`HttpListener`] and [`HttpsListener`]. After the
@@ -205,23 +208,25 @@ pub use connect::{
 };
 pub use connection::{HttpConnection, HttpConnectionMsg, response_for_call_outcome};
 pub use grpc::{
-    GrpcClientStreamingRequest, GrpcError, GrpcHttp2Request, GrpcLimits, GrpcRawStreamingRequest,
-    GrpcRawStreamingResponse, GrpcRequest, GrpcRequestStream, GrpcResponse, GrpcRouter,
-    GrpcRouterMsg, GrpcServerStreamingResponse, GrpcStatus, GrpcStatusCode, GrpcStreamReply,
-    GrpcStreamingCall, GrpcStreamingResponse, decode_streaming_request, decode_unary_request,
-    encode_grpc_message, grpc_status_trailers, grpc_stream_finish, grpc_stream_message,
-    grpc_unary_call_h2c_blocking,
+    GrpcBufferedServerStreamingResponse, GrpcBufferedStreamLimits, GrpcClientStreamingRequest,
+    GrpcError, GrpcHttp2Request, GrpcLimits, GrpcRawStreamingRequest, GrpcRawStreamingResponse,
+    GrpcRequest, GrpcRequestStream, GrpcResponse, GrpcRouter, GrpcRouterMsg,
+    GrpcServerStreamingResponse, GrpcStatus, GrpcStatusCode, GrpcStreamReply, GrpcStreamingCall,
+    GrpcStreamingResponse, decode_streaming_request, decode_unary_request, encode_grpc_message,
+    grpc_status_trailers, grpc_stream_finish, grpc_stream_message, grpc_unary_call_h2c_blocking,
 };
 pub use grpc_client::{
-    GrpcClient, GrpcStreamDecoder, GrpcStreamItem, GrpcTarget, GrpcUnaryOutcome,
+    GrpcClient, GrpcPreframedUnary, GrpcStreamDecoder, GrpcStreamItem, GrpcTarget,
+    GrpcUnaryOutcome, GrpcUnaryTemplate,
 };
 pub use http2::{
-    AlpnProtocols, Http2ClientConnection, Http2ClientLimits, Http2ClientMsg, Http2ClientOutcome,
-    Http2ClientReply, Http2ClientReport, Http2ClientRequest, Http2ClientRequestBody,
-    Http2ClientResponse, Http2ClientStreamCall, Http2ClientStreamingRequest, Http2Connection,
-    Http2ConnectionMsg, Http2ConnectionReply, Http2ConnectionReport, Http2Limits, Http2Listener,
-    Http2ListenerMsg, Http2Outcome, Http2ProtocolError, Http2RequestParts, Http2ResponseChunk,
-    Http2ServerConfig, Http2ServiceMessage, Http2StreamReport, Http2StreamState, Http2Target,
+    AlpnProtocols, Http2ClientConnection, Http2ClientGrpcUnaryRequest, Http2ClientLimits,
+    Http2ClientMsg, Http2ClientOutcome, Http2ClientReply, Http2ClientReport, Http2ClientRequest,
+    Http2ClientRequestBody, Http2ClientResponse, Http2ClientStreamCall,
+    Http2ClientStreamingRequest, Http2Connection, Http2ConnectionMsg, Http2ConnectionReply,
+    Http2ConnectionReport, Http2Limits, Http2Listener, Http2ListenerMsg, Http2Outcome,
+    Http2ProtocolError, Http2RequestParts, Http2ResponseChunk, Http2ServerConfig,
+    Http2ServiceMessage, Http2StreamReport, Http2StreamState, Http2Target,
 };
 pub use keepalive::{
     KeepaliveConnAddr, KeepaliveConnection, KeepaliveConnectionMsg, KeepaliveConnectionStopFailure,

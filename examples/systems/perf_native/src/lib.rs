@@ -20,14 +20,15 @@ use tina::CallRejectedReason;
 use tina::capacity::{CapacityMode, CapacitySurfaceReport};
 use tina::prelude::*;
 use tina_http::{
-    BodyMetrics, FixedEndpointPoolConfig, GrpcClient, GrpcClientPool, GrpcLimits, GrpcRequest,
-    GrpcResponse, GrpcRouter, GrpcRouterMsg, GrpcServerStreamingResponse, GrpcStatusCode,
-    GrpcStreamDecoder, GrpcStreamItem, GrpcTarget, GrpcUnaryOutcome, Http2ClientConnection,
-    Http2ClientLimits, Http2ClientMsg, Http2ClientOutcome, Http2ClientReply, Http2ClientRequest,
-    Http2Listener, Http2ListenerMsg, Http2PickOutcome, Http2ServerConfig, Http2Target, HttpLimits,
-    HttpListener, HttpListenerAddress, HttpListenerMsg, HttpRequest, HttpResponse,
-    HttpServerConfig, StatusCode, WebSocketLimits, WebSocketSessionMsg, WebSocketSessionOutcome,
-    grpc_unary_call_h2c_blocking, websocket_upgrade,
+    BodyMetrics, FixedEndpointPoolConfig, GrpcBufferedServerStreamingResponse, GrpcClient,
+    GrpcBufferedStreamLimits, GrpcClientPool, GrpcLimits, GrpcPreframedUnary, GrpcRequest,
+    GrpcResponse, GrpcRouter, GrpcRouterMsg, GrpcStatusCode, GrpcStreamDecoder, GrpcStreamItem,
+    GrpcTarget, GrpcUnaryOutcome, Http2ClientConnection, Http2ClientLimits, Http2ClientMsg,
+    Http2ClientOutcome, Http2ClientReply, Http2ClientRequest, Http2Listener, Http2ListenerMsg,
+    Http2PickOutcome, Http2ServerConfig, Http2Target, HttpLimits, HttpListener,
+    HttpListenerAddress, HttpListenerMsg, HttpRequest, HttpResponse, HttpServerConfig, StatusCode,
+    WebSocketLimits, WebSocketSessionMsg, WebSocketSessionOutcome, grpc_unary_call_h2c_blocking,
+    websocket_upgrade,
 };
 use tina_proof_harness::{
     LoadObservation, LoadReport, LoadRun, LoadStop, OpOutcome, PerfAllocationReport,
@@ -2075,7 +2076,6 @@ const GRPC_UNARY_PATH: &str = "/perf.Counter/Increment";
 const GRPC_STREAM_PATH: &str = "/perf.Counter/Watch";
 const GRPC_STREAM_MESSAGES: usize = 3;
 const GRPC_POOL_CONNECTIONS: usize = WORKERS;
-const GRPC_STREAM_CALLS_PER_ROW: usize = PROTOCOL_OPS as usize + 1;
 
 fn start_grpc_server() -> anyhow::Result<(PerfRuntime, Address<Http2ListenerMsg>, SocketAddr)> {
     let runtime = new_runtime();
@@ -2131,23 +2131,15 @@ fn start_grpc_streaming_server()
 {
     let runtime = new_runtime();
     let limits = GrpcLimits::default();
-    let responses = Arc::new(Mutex::new(Vec::with_capacity(GRPC_STREAM_CALLS_PER_ROW)));
-    for _ in 0..GRPC_STREAM_CALLS_PER_ROW {
-        let messages = (0..GRPC_STREAM_MESSAGES).map(|i| GrpcPerfReply { value: 40 + i as u64 });
-        let response =
-            GrpcServerStreamingResponse::from_messages(&runtime, messages, limits, CAPACITY)
-                .map_err(|e| anyhow::anyhow!("register grpc stream response: {e:?}"))?;
-        responses.lock().expect("grpc stream responses").push(response);
-    }
-    let responses_for_route = Arc::clone(&responses);
-    let router = grpc_unary_router(limits).server_streaming(
+    let buffered_limits = GrpcBufferedStreamLimits::new(limits, GRPC_STREAM_MESSAGES, 16 * 1024);
+    let messages = (0..GRPC_STREAM_MESSAGES).map(|i| GrpcPerfReply { value: 40 + i as u64 });
+    let buffered_response =
+        GrpcBufferedServerStreamingResponse::from_messages(messages, buffered_limits)
+            .map_err(|e| anyhow::anyhow!("build grpc buffered stream response: {e:?}"))?;
+    let router = grpc_unary_router(limits).server_streaming_buffered(
         GRPC_STREAM_PATH,
         move |_request: GrpcRequest<GrpcPerfRequest>| {
-            responses_for_route
-                .lock()
-                .expect("grpc stream responses")
-                .pop()
-                .ok_or_else(|| tina_http::GrpcStatus::new(GrpcStatusCode::ResourceExhausted))
+            Ok(buffered_response.clone())
         },
     );
     start_grpc_server_with_router(runtime, router)
@@ -2214,10 +2206,12 @@ fn start_grpc_client(runtime: &PerfRuntime, addr: SocketAddr) -> anyhow::Result<
     Ok(GrpcClient::new(conn, target.limits()))
 }
 
-fn grpc_unary_with_client(runtime: &PerfRuntime, client: &GrpcClient) -> anyhow::Result<()> {
-    let submit = client
-        .unary_request(GRPC_UNARY_PATH, &GrpcPerfRequest { delta: 41 })
-        .map_err(|e| anyhow::anyhow!("encode warmed grpc unary: {e:?}"))?;
+fn grpc_unary_with_client(
+    runtime: &PerfRuntime,
+    client: &GrpcClient,
+    preframed: &GrpcPreframedUnary,
+) -> anyhow::Result<()> {
+    let submit = preframed.request();
     let reply = runtime
         .call_blocking(client.connection(), submit, PROTOCOL_CLIENT_TIMEOUT)
         .map_err(|e| anyhow::anyhow!("warmed grpc unary call: {e:?}"))?;
@@ -2234,19 +2228,26 @@ fn grpc_unary_with_client(runtime: &PerfRuntime, client: &GrpcClient) -> anyhow:
 fn grpc_h2c_unary_warmed_row() -> anyhow::Result<PerfReport> {
     let (runtime, listener, addr) = start_grpc_server()?;
     let client = start_grpc_client(&runtime, addr)?;
-    grpc_unary_with_client(&runtime, &client)?; // warm connection + stream state
+    let template = client
+        .unary_template(GRPC_UNARY_PATH)
+        .map_err(|e| anyhow::anyhow!("build warmed grpc template: {e:?}"))?;
+    let preframed = template
+        .preframed(&GrpcPerfRequest { delta: 41 })
+        .map_err(|e| anyhow::anyhow!("preframe warmed grpc unary: {e:?}"))?;
+    grpc_unary_with_client(&runtime, &client, &preframed)?; // warm connection + stream state
 
     let process_before = ProcessSnapshot::now();
     let (load, allocations) = {
         let runtime = Arc::clone(&runtime);
         let client = client.clone();
+        let preframed = preframed.clone();
         run_counted(
             LoadRun {
                 workers: WORKERS,
                 stop: LoadStop::ops(PROTOCOL_OPS),
                 label: "tina_grpc_h2c_unary_warmed",
             },
-            move |_| match grpc_unary_with_client(&runtime, &client) {
+            move |_| match grpc_unary_with_client(&runtime, &client, &preframed) {
                 Ok(()) => OpOutcome::Ok,
                 Err(_) => OpOutcome::Err { kind: "grpc_error" },
             },
@@ -2302,15 +2303,14 @@ fn grpc_unary_with_pool(
     runtime: &PerfRuntime,
     pool: &Mutex<GrpcClientPool>,
     clients: &[GrpcClient],
+    preframed: &[GrpcPreframedUnary],
 ) -> anyhow::Result<()> {
     let (index, connection) = match pool.lock().expect("grpc pool mutex").pick() {
         Http2PickOutcome::Picked { index, connection } => (index, connection),
         other => anyhow::bail!("grpc pool pick failed: {other:?}"),
     };
     let client = &clients[index];
-    let submit = client
-        .unary_request(GRPC_UNARY_PATH, &GrpcPerfRequest { delta: 41 })
-        .map_err(|e| anyhow::anyhow!("encode pooled grpc unary: {e:?}"))?;
+    let submit = preframed[index].request();
     let reply = runtime
         .call_blocking(connection, submit, PROTOCOL_CLIENT_TIMEOUT)
         .map_err(|e| anyhow::anyhow!("pooled grpc unary call: {e:?}"))?;
@@ -2330,21 +2330,31 @@ fn grpc_unary_with_pool(
 fn grpc_h2c_unary_pooled_concurrent_row() -> anyhow::Result<PerfReport> {
     let (runtime, listener, addr) = start_grpc_server()?;
     let (pool, clients) = start_grpc_pool(&runtime, addr)?;
+    let preframed: Vec<_> = clients
+        .iter()
+        .map(|client| {
+            client
+                .unary_template(GRPC_UNARY_PATH)
+                .and_then(|template| template.preframed(&GrpcPerfRequest { delta: 41 }))
+        })
+        .collect::<Result<_, _>>()
+        .map_err(|e| anyhow::anyhow!("preframe pooled grpc unary: {e:?}"))?;
     let pool = Arc::new(Mutex::new(pool));
-    grpc_unary_with_pool(&runtime, &pool, &clients)?; // warm one route
+    grpc_unary_with_pool(&runtime, &pool, &clients, &preframed)?; // warm one route
 
     let process_before = ProcessSnapshot::now();
     let (load, allocations) = {
         let runtime = Arc::clone(&runtime);
         let pool = Arc::clone(&pool);
         let clients = Arc::new(clients.clone());
+        let preframed = Arc::new(preframed.clone());
         run_counted(
             LoadRun {
                 workers: WORKERS,
                 stop: LoadStop::ops(PROTOCOL_OPS),
                 label: "tina_grpc_h2c_unary_pooled_concurrent",
             },
-            move |_| match grpc_unary_with_pool(&runtime, &pool, &clients) {
+            move |_| match grpc_unary_with_pool(&runtime, &pool, &clients, &preframed) {
                 Ok(()) => OpOutcome::Ok,
                 Err(_) => OpOutcome::Err { kind: "grpc_error" },
             },

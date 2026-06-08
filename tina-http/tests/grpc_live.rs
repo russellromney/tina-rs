@@ -11,12 +11,12 @@ use common::TestShard;
 use prost::Message;
 use tina::prelude::*;
 use tina_http::{
-    GrpcClientStreamingRequest, GrpcLimits, GrpcRawStreamingRequest, GrpcRawStreamingResponse,
-    GrpcRequest, GrpcRequestStream, GrpcResponse, GrpcRouter, GrpcServerStreamingResponse,
-    GrpcStatus, GrpcStatusCode, GrpcStreamReply, GrpcStreamingCall, GrpcStreamingResponse,
-    Http2Limits, Http2Listener, Http2ListenerMsg, Http2ServerConfig, Http2ServiceMessage,
-    HttpRequest, HttpResponse, grpc_stream_finish, grpc_stream_message,
-    grpc_unary_call_h2c_blocking,
+    GrpcBufferedServerStreamingResponse, GrpcBufferedStreamLimits, GrpcClientStreamingRequest,
+    GrpcLimits, GrpcRawStreamingRequest, GrpcRawStreamingResponse, GrpcRequest, GrpcRequestStream,
+    GrpcResponse, GrpcRouter, GrpcServerStreamingResponse, GrpcStatus, GrpcStatusCode,
+    GrpcStreamReply, GrpcStreamingCall, GrpcStreamingResponse, Http2Limits, Http2Listener,
+    Http2ListenerMsg, Http2ServerConfig, Http2ServiceMessage, HttpRequest, HttpResponse,
+    grpc_stream_finish, grpc_stream_message, grpc_unary_call_h2c_blocking,
 };
 use tina_runtime::{
     DefaultThreadedMailboxFactory, RuntimeEvent, RuntimeEventKind, ThreadedRuntime,
@@ -80,6 +80,7 @@ impl GrpcHarness {
                 .push((stream_slot, source));
         }
         let streaming_sources_for_route = Arc::clone(&streaming_sources);
+        let buffered_limits = GrpcBufferedStreamLimits::new(limits, 4, 1024);
         let watch_responses = Arc::new(Mutex::new(Vec::new()));
         for _ in 0..8 {
             let watch_response = GrpcServerStreamingResponse::from_messages(
@@ -135,6 +136,16 @@ impl GrpcHarness {
                         .expect("watch responses")
                         .pop()
                         .ok_or_else(|| GrpcStatus::new(GrpcStatusCode::ResourceExhausted))
+                },
+            )
+            .server_streaming_buffered(
+                "/specimen.Counter/WatchBuffered",
+                move |_request: GrpcRequest<CounterRequest>| {
+                    GrpcBufferedServerStreamingResponse::from_messages(
+                        vec![CounterReply { value: 3 }, CounterReply { value: 4 }],
+                        buffered_limits,
+                    )
+                    .map_err(|_| GrpcStatus::new(GrpcStatusCode::Internal))
                 },
             )
             .client_streaming(
@@ -849,6 +860,33 @@ fn grpc_server_streaming_route_works_more_than_once() {
             vec![1, 2]
         );
     }
+    harness.shutdown();
+}
+
+#[test]
+fn grpc_buffered_server_streaming_sends_messages_then_status_trailers() {
+    let harness = GrpcHarness::start_router(Http2ServerConfig::default(), GrpcLimits::default());
+    let mut stream = connect_h2(harness.addr);
+    let body = grpc_body(&CounterRequest { delta: 0 });
+
+    write_frame(
+        &mut stream,
+        FRAME_HEADERS,
+        FLAG_END_HEADERS,
+        1,
+        &request_headers("/specimen.Counter/WatchBuffered", "application/grpc+proto"),
+    );
+    write_frame(&mut stream, FRAME_DATA, FLAG_END_STREAM, 1, &body);
+
+    let (body, status) = read_body_and_status(&mut stream, 1);
+    assert_eq!(status, GrpcStatusCode::Ok);
+    assert_eq!(
+        decode_grpc_replies(&body)
+            .iter()
+            .map(|reply| reply.value)
+            .collect::<Vec<_>>(),
+        vec![3, 4]
+    );
     harness.shutdown();
 }
 

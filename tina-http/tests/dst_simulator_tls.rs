@@ -13,7 +13,7 @@ use tina::ShardId;
 use tina::prelude::*;
 use tina_http::{
     HttpClient, HttpClientConfig, HttpClientError, HttpClientMsg, HttpRequest, HttpRequestBody,
-    HttpResponse, HttpResponseBody, HttpTarget, HttpTransportPhase, TlsTrustRoots, encode_request,
+    HttpResponse, HttpTarget, HttpTransportPhase, TlsTrustRoots, encode_request,
 };
 use tina_runtime::{CallError, CallOutcome, RuntimeCall, call, stable_trace_hash};
 use tina_sim::{
@@ -191,12 +191,7 @@ fn https_client_replays_through_scripted_tls() {
     let (_hash_a, _len_a, result) = run_dst();
     let response = result.expect("scripted https call returns a parsed response");
     assert_eq!(response.status, StatusCode::OK);
-    let body = match &response.body {
-        HttpResponseBody::Buffered(b) => b.clone(),
-        HttpResponseBody::Stream(_)
-        | HttpResponseBody::ChunkedStream(_)
-        | HttpResponseBody::WebSocket(_) => Vec::new(),
-    };
+    let body = response.body.as_buffered().unwrap_or_default().to_vec();
     assert_eq!(body, b"hello");
 }
 

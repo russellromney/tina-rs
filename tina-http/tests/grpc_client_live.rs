@@ -22,7 +22,8 @@ use prost::Message;
 use tina::prelude::*;
 use tina::{CallContext, reply_to_request};
 use tina_http::{
-    GrpcClient, GrpcClientStreamingRequest, GrpcError, GrpcLimits, GrpcRequest, GrpcRequestStream,
+    GrpcBufferedServerStreamingResponse, GrpcBufferedStreamLimits, GrpcClient,
+    GrpcClientStreamingRequest, GrpcError, GrpcLimits, GrpcRequest, GrpcRequestStream,
     GrpcResponse, GrpcRouter, GrpcServerStreamingResponse, GrpcStatus, GrpcStatusCode,
     GrpcStreamDecoder, GrpcStreamItem, GrpcStreamReply, GrpcStreamingCall, GrpcStreamingResponse,
     GrpcTarget, GrpcUnaryOutcome, Http2ClientConnection, Http2ClientLimits, Http2ClientMsg,
@@ -63,6 +64,8 @@ fn start_server(
     runtime: &ThreadedRuntime<TestShard, DefaultThreadedMailboxFactory>,
 ) -> (Address<Http2ListenerMsg>, SocketAddr) {
     let limits = GrpcLimits::default();
+    let buffered_limits = GrpcBufferedStreamLimits::new(limits, 4, 1024);
+    let one_message_buffered_limits = GrpcBufferedStreamLimits::new(limits, 1, 1024);
     // A small pool of server-streaming responses ("Watch" emits 1 then 2)
     // and bidi echo sources ("Chat" echoes each request +100), one
     // consumed per call.
@@ -123,6 +126,26 @@ fn start_server(
                     .unwrap()
                     .pop()
                     .ok_or_else(|| GrpcStatus::new(GrpcStatusCode::ResourceExhausted))
+            },
+        )
+        .server_streaming_buffered(
+            "/specimen.Counter/WatchBuffered",
+            move |_request: GrpcRequest<CounterRequest>| {
+                GrpcBufferedServerStreamingResponse::from_messages(
+                    vec![CounterReply { value: 3 }, CounterReply { value: 4 }],
+                    buffered_limits,
+                )
+                .map_err(|_| GrpcStatus::new(GrpcStatusCode::Internal))
+            },
+        )
+        .server_streaming_buffered(
+            "/specimen.Counter/WatchBufferedTooMany",
+            move |_request: GrpcRequest<CounterRequest>| {
+                GrpcBufferedServerStreamingResponse::from_messages(
+                    vec![CounterReply { value: 3 }, CounterReply { value: 4 }],
+                    one_message_buffered_limits,
+                )
+                .map_err(|_| GrpcStatus::new(GrpcStatusCode::ResourceExhausted))
             },
         )
         .client_streaming(
@@ -446,6 +469,71 @@ fn server_streaming_receives_all_messages_then_status() {
             .expect("server-streaming ends with a status")
             .code,
         GrpcStatusCode::Ok
+    );
+
+    let _ = runtime.try_send(listener, Http2ListenerMsg::Stop);
+    let _ = runtime.try_send(client.connection(), Http2ClientMsg::Stop);
+    let _ = runtime.shutdown();
+}
+
+#[test]
+fn buffered_server_streaming_receives_all_messages_then_status() {
+    let runtime = runtime();
+    let (listener, addr) = start_server(&runtime);
+    let client = make_grpc_client(&runtime, addr);
+
+    let open = client
+        .server_streaming_request(
+            "/specimen.Counter/WatchBuffered",
+            &CounterRequest { delta: 0 },
+        )
+        .expect("encode buffered server-streaming request");
+    let (stream_id, _head_status) = open_streamed(&runtime, &client, open);
+
+    let (messages, end_status): (Vec<CounterReply>, _) =
+        collect_grpc_stream(&runtime, &client, stream_id);
+    assert_eq!(
+        messages.iter().map(|m| m.value).collect::<Vec<_>>(),
+        vec![3, 4],
+        "all buffered server-streamed messages received in order"
+    );
+    assert_eq!(
+        end_status
+            .expect("buffered server-streaming ends with a status")
+            .code,
+        GrpcStatusCode::Ok
+    );
+
+    let _ = runtime.try_send(listener, Http2ListenerMsg::Stop);
+    let _ = runtime.try_send(client.connection(), Http2ClientMsg::Stop);
+    let _ = runtime.shutdown();
+}
+
+#[test]
+fn buffered_server_streaming_bound_failure_returns_resource_exhausted() {
+    let runtime = runtime();
+    let (listener, addr) = start_server(&runtime);
+    let client = make_grpc_client(&runtime, addr);
+
+    let open = client
+        .server_streaming_request(
+            "/specimen.Counter/WatchBufferedTooMany",
+            &CounterRequest { delta: 0 },
+        )
+        .expect("encode bounded buffered server-streaming request");
+    let (stream_id, _head_status) = open_streamed(&runtime, &client, open);
+
+    let (messages, end_status): (Vec<CounterReply>, _) =
+        collect_grpc_stream(&runtime, &client, stream_id);
+    assert!(
+        messages.is_empty(),
+        "bounded construction failure must not stream partial messages"
+    );
+    assert_eq!(
+        end_status
+            .expect("bounded construction failure returns a gRPC status")
+            .code,
+        GrpcStatusCode::ResourceExhausted
     );
 
     let _ = runtime.try_send(listener, Http2ListenerMsg::Stop);
