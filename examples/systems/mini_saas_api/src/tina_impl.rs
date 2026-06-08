@@ -2008,6 +2008,7 @@ fn load_observation_from_capacity_body(body: &str) -> tina_proof_harness::LoadOb
     ];
 
     LoadObservation {
+        leak_checked: true,
         leak_clean: surfaces.iter().all(|surface| surface.leak_clean),
         surface_plateaus: surfaces,
         unavailable_surfaces: Vec::new(),
