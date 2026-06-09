@@ -520,7 +520,10 @@ where
             }
         }
     }
-    events.sort_by_key(|e| e.id());
+    // Event ids are per-shard-local; group by shard, then local id. This is
+    // a stable grouping, not a cross-shard temporal order — a free-running
+    // multishard trace has no deterministic global event order.
+    events.sort_by_key(|e| (e.shard(), e.id()));
 
     let topology = build_topology(&shared);
     let report = match failure {

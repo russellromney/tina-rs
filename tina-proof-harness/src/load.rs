@@ -229,8 +229,16 @@ impl UnavailableSurface {
 }
 
 /// End-of-run observations supplied by the specimen.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `leak_checked` records whether a leak check actually ran. `leak_clean`
+/// is only meaningful when `leak_checked` is true; an unchecked run must
+/// not be read as clean.
+/// Default is "not checked", not "clean": every field defaults to its empty
+/// value, so a missing leak check never reads as a passing leak result.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct LoadObservation {
+    /// Whether the specimen actually ran a leak check.
+    pub leak_checked: bool,
     pub leak_clean: bool,
     pub surface_plateaus: Vec<SurfacePlateau>,
     pub unavailable_surfaces: Vec<UnavailableSurface>,
@@ -238,24 +246,13 @@ pub struct LoadObservation {
     pub late: u64,
 }
 
-impl Default for LoadObservation {
-    fn default() -> Self {
-        Self {
-            leak_clean: true,
-            surface_plateaus: Vec::new(),
-            unavailable_surfaces: Vec::new(),
-            trace_hash: None,
-            late: 0,
-        }
-    }
-}
-
 /// Summary of one [`LoadRun`].
 ///
-/// `leak_clean` is `true` when the optional `leak_check` was either not
-/// supplied or returned true. Latency is reported as min/p50/p99/max in
-/// nanoseconds for machine comparison and microseconds for compact human
-/// summaries.
+/// `leak_checked` records whether a leak check actually ran; `leak_clean`
+/// is only meaningful when it did. An unchecked run renders as
+/// `leak=unchecked`, never `leak_clean=true`. Latency is reported as
+/// min/p50/p99/max in nanoseconds for machine comparison and microseconds
+/// for compact human summaries.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LoadReport {
     pub label: &'static str,
@@ -279,6 +276,9 @@ pub struct LoadReport {
     pub latency_p99_us: u64,
     pub latency_max_us: u64,
     pub elapsed_ms: u64,
+    /// Whether a leak check actually ran. When `false`, `leak_clean` is not
+    /// a verified result and must not be read as one.
+    pub leak_checked: bool,
     pub leak_clean: bool,
     pub surface_plateaus: Vec<SurfacePlateau>,
     pub unavailable_surfaces: Vec<UnavailableSurface>,
@@ -347,9 +347,16 @@ impl PressureSummary {
 impl LoadReport {
     /// One-line summary, key=value, suitable for test output and grep.
     pub fn summary_line(&self) -> String {
+        // Render the honest leak state: `leak=unchecked` when no check ran,
+        // otherwise `leak_clean=<bool>`.
+        let leak = if self.leak_checked {
+            format!("leak_clean={}", self.leak_clean)
+        } else {
+            "leak=unchecked".to_string()
+        };
         format!(
             "load label={} workers={} ops={} ok={} err={} timeout={} \
-             min_us={} p50_us={} p90_us={} p99_us={} max_us={} elapsed_ms={} leak_clean={} late={} trace_hash={} surfaces={} unavailable_surfaces={} {}",
+             min_us={} p50_us={} p90_us={} p99_us={} max_us={} elapsed_ms={} {} late={} trace_hash={} surfaces={} unavailable_surfaces={} {}",
             report_value(self.label),
             self.workers,
             self.ops_attempted,
@@ -362,7 +369,7 @@ impl LoadReport {
             self.latency_p99_us,
             self.latency_max_us,
             self.elapsed_ms,
-            self.leak_clean,
+            leak,
             self.late,
             self.trace_hash
                 .map(|hash| hash.to_string())
@@ -435,6 +442,14 @@ pub fn surface_plateaued_cleanly(
 }
 
 pub fn no_leaked_capacity_at_shutdown(report: &LoadReport) -> Result<(), LoadAssertionFailure> {
+    // Fail closed when nothing was checked: an unchecked run cannot prove
+    // the absence of a leak.
+    if !report.leak_checked {
+        return Err(LoadAssertionFailure {
+            claim: "no leaked capacity at shutdown",
+            observed: format!("leak was never checked; report {}", report.summary_line()),
+        });
+    }
     if report.leak_clean
         && report
             .surface_plateaus
@@ -486,6 +501,7 @@ where
         op,
         leak_check.map(|check| {
             move || LoadObservation {
+                leak_checked: true,
                 leak_clean: check(),
                 ..LoadObservation::default()
             }
@@ -583,10 +599,9 @@ where
     }
     let elapsed = started.elapsed();
 
-    let observation = observation.map(|f| f()).unwrap_or_else(|| LoadObservation {
-        leak_clean: true,
-        ..LoadObservation::default()
-    });
+    // No observation closure means nothing was checked — including no leak
+    // check. The default is unchecked, not clean.
+    let observation = observation.map(|f| f()).unwrap_or_default();
 
     let mut latencies = combined.latencies_ns;
     latencies.sort_unstable();
@@ -633,6 +648,7 @@ where
         latency_p99_us: ns_to_us(p99_ns),
         latency_max_us: ns_to_us(max_ns),
         elapsed_ms: elapsed.as_millis() as u64,
+        leak_checked: observation.leak_checked,
         leak_clean: observation.leak_clean
             && observation
                 .surface_plateaus
@@ -758,7 +774,7 @@ mod tests {
         assert_eq!(report.ops_ok, 100);
         assert_eq!(report.ops_err, 0);
         assert_eq!(report.ops_timeout, 0);
-        assert!(report.leak_clean);
+        assert!(!report.leak_checked, "no leak check was supplied");
         assert_eq!(counter.load(Ordering::Relaxed), 100);
     }
 
@@ -841,7 +857,39 @@ mod tests {
             |_| OpOutcome::Ok,
             Some(|| false),
         );
+        assert!(
+            report.leak_checked,
+            "supplying a leak check marks it checked"
+        );
         assert!(!report.leak_clean);
+        assert!(report.summary_line().contains("leak_clean=false"));
+    }
+
+    #[test]
+    fn unchecked_run_reports_leak_as_unchecked_not_clean() {
+        // A run with no leak check must not masquerade as leak-clean: a
+        // reader has to be able to tell "verified no leak" from "never
+        // looked".
+        let report = run(
+            LoadRun {
+                workers: 1,
+                stop: LoadStop::ops(1),
+                label: "unchecked",
+            },
+            |_| OpOutcome::Ok,
+            None::<fn() -> bool>,
+        );
+        assert!(!report.leak_checked, "no leak check means unchecked");
+        assert!(
+            report.summary_line().contains("leak=unchecked"),
+            "summary must render unchecked, got: {}",
+            report.summary_line()
+        );
+        assert!(
+            !report.summary_line().contains("leak_clean=true"),
+            "an unchecked run must not print leak_clean=true: {}",
+            report.summary_line()
+        );
     }
 
     #[test]
@@ -854,6 +902,7 @@ mod tests {
             },
             |_| OpOutcome::Ok,
             Some(|| LoadObservation {
+                leak_checked: true,
                 leak_clean: true,
                 surface_plateaus: vec![SurfacePlateau {
                     name: "svc.mailbox".to_string(),
@@ -1113,6 +1162,8 @@ mod tests {
             },
             |_| OpOutcome::Ok,
             Some(|| LoadObservation {
+                leak_checked: true,
+                leak_clean: true,
                 surface_plateaus: vec![SurfacePlateau {
                     name: "svc.mailbox".to_string(),
                     kind: "mailbox",
@@ -1167,6 +1218,8 @@ mod tests {
             },
             |_| OpOutcome::Ok,
             Some(|| LoadObservation {
+                leak_checked: true,
+                leak_clean: true,
                 surface_plateaus: vec![SurfacePlateau {
                     name: "svc.mailbox".to_string(),
                     kind: "mailbox",

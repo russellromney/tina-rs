@@ -156,6 +156,10 @@ where
     }
 
     /// Returns the merged deterministic event record in global event-id order.
+    ///
+    /// The simulator's shared global event counter assigns ids in fixed
+    /// step order, so a global id sort is the deterministic cross-shard
+    /// emission order — the order the DST checkers expect.
     pub fn trace(&self) -> Vec<RuntimeEvent> {
         let mut events: Vec<_> = self
             .simulators

@@ -259,7 +259,7 @@ where
                 ..config
             };
             let factory = mailbox_factory.clone();
-            let ids = ids.clone();
+            let ids = ids.per_shard();
             let shard_id = shard.id();
             let remote_wiring = ThreadedRemoteWiring {
                 senders: remote_senders.clone(),
