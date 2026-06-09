@@ -238,7 +238,7 @@ pub(crate) fn is_grpc_content_type(value: &str) -> bool {
 /// Typed unary request passed to user handlers.
 #[derive(Debug, Clone)]
 pub struct GrpcRequest<T> {
-    pub path: String,
+    pub path: Arc<str>,
     pub message: T,
 }
 
@@ -302,6 +302,9 @@ where
             body,
             ..
         } = request;
+        // The public request shape owns a `String`; handlers take the interned
+        // `Arc<str>` path, so the generic entry pays one copy here.
+        let path: Arc<str> = Arc::from(path);
         match decode_unary_parts::<Req>(&headers, &body, limits) {
             Ok(message) => match (self.f)(GrpcRequest { path, message }) {
                 Ok(response) => match encode_grpc_message(&response.message, limits) {
@@ -489,7 +492,7 @@ impl GrpcBufferedServerStreamingResponse {
 /// response source.
 #[derive(Debug)]
 pub struct GrpcStreamingCall<Req, Resp> {
-    pub path: String,
+    pub path: Arc<str>,
     pub requests: GrpcRequestStream<Req>,
     _response: PhantomData<fn() -> Resp>,
 }
@@ -678,7 +681,7 @@ pub fn grpc_stream_finish(status: GrpcStatus) -> ResponseChunkReply {
 /// or test fixture that must work directly with HTTP/2 request chunks.
 #[derive(Debug, Clone)]
 pub struct GrpcRawStreamingRequest<T> {
-    pub path: String,
+    pub path: Arc<str>,
     pub stream: Http2RequestStream,
     _message: PhantomData<fn() -> T>,
 }
@@ -727,6 +730,9 @@ where
             body,
             ..
         } = request;
+        // The public request shape owns a `String`; handlers take the interned
+        // `Arc<str>` path, so the generic entry pays one copy here.
+        let path: Arc<str> = Arc::from(path);
         match decode_unary_parts::<Req>(&headers, &body, limits) {
             Ok(message) => match (self.f)(GrpcRequest { path, message }) {
                 Ok(response) => grpc_streaming_http_response(response.source, GrpcStatus::ok()),
@@ -780,6 +786,9 @@ where
             body,
             ..
         } = request;
+        // The public request shape owns a `String`; handlers take the interned
+        // `Arc<str>` path, so the generic entry pays one copy here.
+        let path: Arc<str> = Arc::from(path);
         match decode_unary_parts::<Req>(&headers, &body, limits) {
             Ok(message) => match (self.f)(GrpcRequest { path, message }) {
                 Ok(response) => grpc_http_response_shared(response.body, GrpcStatus::ok()),
@@ -821,7 +830,7 @@ where
 /// Typed client-streaming request passed to user handlers.
 #[derive(Debug, Clone)]
 pub struct GrpcClientStreamingRequest<T> {
-    pub path: String,
+    pub path: Arc<str>,
     pub messages: Vec<T>,
 }
 
@@ -841,6 +850,9 @@ where
             body,
             ..
         } = request;
+        // The public request shape owns a `String`; handlers take the interned
+        // `Arc<str>` path, so the generic entry pays one copy here.
+        let path: Arc<str> = Arc::from(path);
         match decode_streaming_parts::<Req>(&headers, &body, limits) {
             Ok(messages) => match (self.f)(GrpcClientStreamingRequest { path, messages }) {
                 Ok(response) => match encode_grpc_message(&response.message, limits) {
@@ -914,6 +926,7 @@ where
 {
     fn call(&self, request: HttpRequest, limits: GrpcLimits) -> HttpResponse {
         let HttpRequest { path, body, .. } = request;
+        let path: Arc<str> = Arc::from(path);
         let HttpRequestBody::Http2Stream(stream) = body else {
             return grpc_http_response(
                 Vec::new(),
@@ -962,6 +975,7 @@ where
 {
     fn call(&self, request: HttpRequest, _limits: GrpcLimits) -> HttpResponse {
         let HttpRequest { path, body, .. } = request;
+        let path: Arc<str> = Arc::from(path);
         let HttpRequestBody::Http2Stream(stream) = body else {
             return grpc_http_response(
                 Vec::new(),
@@ -1030,7 +1044,7 @@ pub enum GrpcRouterMsg {
 #[derive(Debug)]
 pub struct GrpcHttp2Request {
     method: Method,
-    path: String,
+    path: Arc<str>,
     body: GrpcHttp2Body,
     content_type_ok: bool,
     unsupported_encoding: bool,
@@ -1089,7 +1103,7 @@ enum PendingGrpcRequest {
     /// header facts, the request stream to pull from, and the accumulated body.
     Http2 {
         method: Method,
-        path: String,
+        path: Arc<str>,
         content_type_ok: bool,
         unsupported_encoding: bool,
         stream: Http2RequestStream,
@@ -1226,22 +1240,22 @@ impl<S: Shard + 'static> GrpcRouter<S> {
         if request.method != Method::POST {
             return grpc_http_response(Vec::new(), GrpcStatus::new(GrpcStatusCode::Unimplemented));
         }
-        if let Some(handler) = self.unary.get(&request.path) {
+        if let Some(handler) = self.unary.get(&*request.path) {
             return handler.call(request, self.limits);
         }
-        if let Some(handler) = self.client_streaming.get(&request.path) {
+        if let Some(handler) = self.client_streaming.get(&*request.path) {
             return handler.call(request, self.limits);
         }
-        if let Some(handler) = self.streaming.get(&request.path) {
+        if let Some(handler) = self.streaming.get(&*request.path) {
             return handler.call(request, self.limits);
         }
-        if let Some(handler) = self.streaming_raw.get(&request.path) {
+        if let Some(handler) = self.streaming_raw.get(&*request.path) {
             return handler.call(request, self.limits);
         }
-        if let Some(handler) = self.buffered_server_streaming.get(&request.path) {
+        if let Some(handler) = self.buffered_server_streaming.get(&*request.path) {
             return handler.call(request, self.limits);
         }
-        let Some(handler) = self.server_streaming.get(&request.path) else {
+        let Some(handler) = self.server_streaming.get(&*request.path) else {
             return grpc_http_response(Vec::new(), GrpcStatus::new(GrpcStatusCode::Unimplemented));
         };
         handler.call(request, self.limits)
@@ -1251,22 +1265,22 @@ impl<S: Shard + 'static> GrpcRouter<S> {
         if request.method != Method::POST {
             return grpc_http_response(Vec::new(), GrpcStatus::new(GrpcStatusCode::Unimplemented));
         }
-        if let Some(handler) = self.unary.get(&request.path) {
+        if let Some(handler) = self.unary.get(&*request.path) {
             return handler.call_http2(request, self.limits);
         }
-        if let Some(handler) = self.client_streaming.get(&request.path) {
+        if let Some(handler) = self.client_streaming.get(&*request.path) {
             return handler.call_http2(request, self.limits);
         }
-        if let Some(handler) = self.streaming.get(&request.path) {
+        if let Some(handler) = self.streaming.get(&*request.path) {
             return handler.call_http2(request, self.limits);
         }
-        if let Some(handler) = self.streaming_raw.get(&request.path) {
+        if let Some(handler) = self.streaming_raw.get(&*request.path) {
             return handler.call_http2(request, self.limits);
         }
-        if let Some(handler) = self.buffered_server_streaming.get(&request.path) {
+        if let Some(handler) = self.buffered_server_streaming.get(&*request.path) {
             return handler.call_http2(request, self.limits);
         }
-        let Some(handler) = self.server_streaming.get(&request.path) else {
+        let Some(handler) = self.server_streaming.get(&*request.path) else {
             return grpc_http_response(Vec::new(), GrpcStatus::new(GrpcStatusCode::Unimplemented));
         };
         handler.call_http2(request, self.limits)
@@ -1328,8 +1342,8 @@ impl<S: Shard + 'static> GrpcRouter<S> {
                 // directly and reply with a streaming response source. They do
                 // not accumulate the body, so dispatch them synchronously via
                 // the compact entry point — no public `HttpRequest` rebuild.
-                if self.streaming.contains_key(&request.path)
-                    || self.streaming_raw.contains_key(&request.path)
+                if self.streaming.contains_key(&*request.path)
+                    || self.streaming_raw.contains_key(&*request.path)
                 {
                     return call_ctx.reply(self.response_for_http2(request));
                 }

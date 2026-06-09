@@ -3,10 +3,69 @@
 //! Internal to the `http2` module: shared between the server isolate and
 //! the native client.
 
+use std::sync::Arc;
+
 use http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
 
 use super::errors::Http2ProtocolError;
 use crate::HttpResponse;
+
+/// Bounded request-path interner, one per server connection. Warmed routes
+/// repeat the same method path every call; interning hands back a cloned
+/// `Arc<str>` (a refcount bump, no allocation) instead of a fresh owned path.
+///
+/// The cache is explicitly capped: a peer that sends many distinct paths can
+/// fill it but cannot grow it without bound. Once full, new paths are still
+/// served — as a fresh `Arc<str>` that is simply not retained — and counted in
+/// `overflow` so the miss is visible, never silent.
+#[derive(Debug)]
+pub(super) struct PathInternCache {
+    entries: Vec<Arc<str>>,
+    cap: usize,
+    overflow: u64,
+}
+
+impl PathInternCache {
+    pub(super) fn with_capacity(cap: usize) -> Self {
+        Self {
+            entries: Vec::new(),
+            cap,
+            overflow: 0,
+        }
+    }
+
+    /// Number of distinct paths dropped because the cache was full. Surfaced in
+    /// the connection report so a saturated interner is observable.
+    pub(super) fn overflow(&self) -> u64 {
+        self.overflow
+    }
+
+    /// Return an owned `Arc<str>` for `path`, reusing the cached entry when the
+    /// path has been seen before on this connection. A small connection serves a
+    /// handful of routes, so a linear scan beats hashing here.
+    pub(super) fn intern(&mut self, path: &str) -> Arc<str> {
+        if let Some(found) = self.entries.iter().find(|entry| &***entry == path) {
+            return Arc::clone(found);
+        }
+        let interned: Arc<str> = Arc::from(path);
+        if self.entries.len() < self.cap {
+            self.entries.push(Arc::clone(&interned));
+        } else {
+            self.overflow = self.overflow.saturating_add(1);
+        }
+        interned
+    }
+}
+
+/// Build an owned request path, interning through `cache` when one is supplied
+/// (the server request path) and falling back to a fresh `Arc` otherwise (the
+/// client response path, which never carries `:path`).
+fn own_request_path(cache: Option<&mut PathInternCache>, value: &str) -> Arc<str> {
+    match cache {
+        Some(cache) => cache.intern(value),
+        None => Arc::from(value),
+    }
+}
 
 pub(super) const SETTINGS_HEADER_TABLE_SIZE: u16 = 0x1;
 pub(super) const SETTINGS_ENABLE_PUSH: u16 = 0x2;
@@ -21,7 +80,7 @@ pub(super) const MAX_MAX_FRAME_SIZE: u32 = 16_777_215;
 #[derive(Debug, Default)]
 pub(super) struct HeaderBlock {
     pub(super) method: Option<Method>,
-    pub(super) path: Option<String>,
+    pub(super) path: Option<Arc<str>>,
     pub(super) saw_scheme: bool,
     pub(super) saw_authority: bool,
     pub(super) authority_non_empty: bool,
@@ -53,23 +112,25 @@ pub(super) fn decode_headers_block(
     max_header_bytes: usize,
 ) -> Result<HeaderBlock, Http2ProtocolError> {
     let mut decoder = hpack::Decoder::new();
-    decode_headers_block_with(&mut decoder, block, max_header_bytes)
+    decode_headers_block_with(&mut decoder, block, max_header_bytes, None)
 }
 
 pub(super) fn decode_headers_block_with(
     decoder: &mut hpack::Decoder<'static>,
     block: &[u8],
     max_header_bytes: usize,
+    path_cache: Option<&mut PathInternCache>,
 ) -> Result<HeaderBlock, Http2ProtocolError> {
-    decode_headers_block_with_storage(decoder, block, max_header_bytes, true)
+    decode_headers_block_with_storage(decoder, block, max_header_bytes, true, path_cache)
 }
 
 pub(super) fn decode_headers_block_compact_with(
     decoder: &mut hpack::Decoder<'static>,
     block: &[u8],
     max_header_bytes: usize,
+    path_cache: Option<&mut PathInternCache>,
 ) -> Result<HeaderBlock, Http2ProtocolError> {
-    decode_headers_block_with_storage(decoder, block, max_header_bytes, false)
+    decode_headers_block_with_storage(decoder, block, max_header_bytes, false, path_cache)
 }
 
 fn decode_headers_block_with_storage(
@@ -77,10 +138,14 @@ fn decode_headers_block_with_storage(
     block: &[u8],
     max_header_bytes: usize,
     store_regular_headers: bool,
+    mut path_cache: Option<&mut PathInternCache>,
 ) -> Result<HeaderBlock, Http2ProtocolError> {
-    if let Some(headers) =
-        decode_fast_literal_headers(block, max_header_bytes, store_regular_headers)?
-    {
+    if let Some(headers) = decode_fast_literal_headers(
+        block,
+        max_header_bytes,
+        store_regular_headers,
+        path_cache.as_deref_mut(),
+    )? {
         return Ok(headers);
     }
     let mut out = HeaderBlock::default();
@@ -97,6 +162,7 @@ fn decode_headers_block_with_storage(
             value,
             max_header_bytes,
             store_regular_headers,
+            path_cache.as_deref_mut(),
         )?;
     }
     Ok(out)
@@ -113,6 +179,7 @@ fn decode_fast_literal_headers(
     block: &[u8],
     max_header_bytes: usize,
     store_regular_headers: bool,
+    mut path_cache: Option<&mut PathInternCache>,
 ) -> Result<Option<HeaderBlock>, Http2ProtocolError> {
     let mut out = HeaderBlock::default();
     let mut cursor = 0;
@@ -135,6 +202,7 @@ fn decode_fast_literal_headers(
             value,
             max_header_bytes,
             store_regular_headers,
+            path_cache.as_deref_mut(),
         )?;
     }
     Ok(Some(out))
@@ -204,7 +272,7 @@ pub(super) fn add_header(
     value: &str,
     max_header_bytes: usize,
 ) -> Result<(), Http2ProtocolError> {
-    add_header_with_storage(out, name, value, max_header_bytes, true)
+    add_header_with_storage(out, name, value, max_header_bytes, true, None)
 }
 
 fn add_header_with_storage(
@@ -213,6 +281,7 @@ fn add_header_with_storage(
     value: &str,
     max_header_bytes: usize,
     store_regular_headers: bool,
+    path_cache: Option<&mut PathInternCache>,
 ) -> Result<(), Http2ProtocolError> {
     out.bytes = out
         .bytes
@@ -239,7 +308,7 @@ fn add_header_with_storage(
                 if out.path.is_some() {
                     return Err(Http2ProtocolError::InvalidPseudoHeaders);
                 }
-                out.path = Some(value.to_owned());
+                out.path = Some(own_request_path(path_cache, value));
             }
             ":scheme" => {
                 if out.saw_scheme {
@@ -629,7 +698,7 @@ mod tests {
         encode_literal_header("content-length", "9", &mut block);
 
         let mut decoder = hpack::Decoder::new();
-        let decoded = decode_headers_block_compact_with(&mut decoder, &block, 1024).unwrap();
+        let decoded = decode_headers_block_compact_with(&mut decoder, &block, 1024, None).unwrap();
         assert_eq!(decoded.path.as_deref(), Some("/pkg.Service/Unary"));
         assert!(decoded.host_non_empty);
         assert!(decoded.grpc_content_type);
@@ -665,7 +734,8 @@ mod tests {
 
             PUBLIC_HEADER_CONSTRUCTIONS.with(|count| count.set(0));
             let mut decoder = hpack::Decoder::new();
-            let compact = decode_headers_block_compact_with(&mut decoder, &block, 4096).unwrap();
+            let compact =
+                decode_headers_block_compact_with(&mut decoder, &block, 4096, None).unwrap();
             let compact_built = PUBLIC_HEADER_CONSTRUCTIONS.with(|count| count.get());
             assert_eq!(
                 compact_built, 0,
@@ -680,7 +750,7 @@ mod tests {
 
             PUBLIC_HEADER_CONSTRUCTIONS.with(|count| count.set(0));
             let mut decoder = hpack::Decoder::new();
-            let public = decode_headers_block_with(&mut decoder, &block, 4096).unwrap();
+            let public = decode_headers_block_with(&mut decoder, &block, 4096, None).unwrap();
             let public_built = PUBLIC_HEADER_CONSTRUCTIONS.with(|count| count.get());
             // content-type, te, grpc-encoding, plus `extra` custom headers.
             assert_eq!(
@@ -695,10 +765,10 @@ mod tests {
 
     fn compact_and_public_agree(block: &[u8]) -> Result<(), Http2ProtocolError> {
         let mut compact_decoder = hpack::Decoder::new();
-        let compact = decode_headers_block_compact_with(&mut compact_decoder, block, 256)
+        let compact = decode_headers_block_compact_with(&mut compact_decoder, block, 256, None)
             .and_then(|h| validate_request_headers(&h).map(|()| h));
         let mut public_decoder = hpack::Decoder::new();
-        let public = decode_headers_block_with(&mut public_decoder, block, 256)
+        let public = decode_headers_block_with(&mut public_decoder, block, 256, None)
             .and_then(|h| validate_request_headers(&h).map(|()| h));
         assert_eq!(
             compact.as_ref().map(|_| ()),
@@ -793,5 +863,77 @@ mod tests {
             validate_request_headers(&headers),
             Err(Http2ProtocolError::InvalidPseudoHeaders)
         );
+    }
+
+    fn grpc_request_block(path: &str) -> Vec<u8> {
+        let mut block = Vec::new();
+        encode_literal_header(":method", "POST", &mut block);
+        encode_literal_header(":scheme", "http", &mut block);
+        encode_literal_header(":authority", "example.com", &mut block);
+        encode_literal_header(":path", path, &mut block);
+        encode_literal_header("content-type", "application/grpc", &mut block);
+        block
+    }
+
+    #[test]
+    fn path_intern_cache_reuses_one_arc_for_a_repeated_path() {
+        let mut cache = PathInternCache::with_capacity(8);
+        let first = cache.intern("/pkg.Service/Unary");
+        let second = cache.intern("/pkg.Service/Unary");
+        // The warmed call must reuse the cached allocation, not rebuild it. If
+        // interning regressed to a fresh owned path per call, these would be
+        // distinct allocations and `ptr_eq` would fail.
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(&*second, "/pkg.Service/Unary");
+        assert_eq!(cache.overflow(), 0);
+    }
+
+    #[test]
+    fn path_intern_cache_bounds_distinct_paths_and_counts_overflow() {
+        let mut cache = PathInternCache::with_capacity(2);
+        let a = cache.intern("/a");
+        let _b = cache.intern("/b");
+        // Third distinct path overflows the cap: it is still served correctly,
+        // just not retained, and the miss is counted — never silent, never
+        // unbounded growth.
+        let c = cache.intern("/c");
+        assert_eq!(&*c, "/c");
+        assert_eq!(cache.overflow(), 1);
+        // A cached path still reuses its slot after the overflow.
+        assert!(Arc::ptr_eq(&a, &cache.intern("/a")));
+        // The overflowed path was not retained, so it rebuilds (and counts again).
+        assert!(!Arc::ptr_eq(&c, &cache.intern("/c")));
+        assert_eq!(cache.overflow(), 2);
+    }
+
+    #[test]
+    fn compact_decode_interns_a_repeated_request_path() {
+        let block = grpc_request_block("/pkg.Service/Unary");
+        let mut cache = PathInternCache::with_capacity(8);
+        let mut decoder = hpack::Decoder::new();
+        let first = decode_headers_block_compact_with(&mut decoder, &block, 4096, Some(&mut cache))
+            .unwrap();
+        let mut decoder = hpack::Decoder::new();
+        let second =
+            decode_headers_block_compact_with(&mut decoder, &block, 4096, Some(&mut cache))
+                .unwrap();
+        let first_path = first.path.expect("first path");
+        let second_path = second.path.expect("second path");
+        assert_eq!(&*second_path, "/pkg.Service/Unary");
+        // The whole decode→intern seam reuses the allocation across calls on one
+        // connection. This is the hard seam the warmed-route requirement needs:
+        // it fails if the decode rebuilds a fresh owned path per request.
+        assert!(Arc::ptr_eq(&first_path, &second_path));
+        assert_eq!(cache.overflow(), 0);
+    }
+
+    #[test]
+    fn decode_without_cache_still_owns_the_path() {
+        // The client response path passes no cache; `:path` never appears there,
+        // but the fallback must still produce a valid owned path when it does.
+        let block = grpc_request_block("/pkg.Service/Unary");
+        let mut decoder = hpack::Decoder::new();
+        let decoded = decode_headers_block_compact_with(&mut decoder, &block, 4096, None).unwrap();
+        assert_eq!(decoded.path.as_deref(), Some("/pkg.Service/Unary"));
     }
 }

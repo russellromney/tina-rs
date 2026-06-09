@@ -47,10 +47,11 @@ use super::frame::{
 };
 use super::headers::{
     DEFAULT_HEADER_TABLE_SIZE, HeaderBlock, MAX_MAX_FRAME_SIZE, MIN_MAX_FRAME_SIZE,
-    SETTINGS_ENABLE_PUSH, SETTINGS_HEADER_TABLE_SIZE, SETTINGS_INITIAL_WINDOW_SIZE,
-    SETTINGS_MAX_CONCURRENT_STREAMS, SETTINGS_MAX_FRAME_SIZE, SETTINGS_MAX_HEADER_LIST_SIZE,
-    decode_headers_block_compact_with, decode_headers_block_with, encode_response_headers,
-    encode_response_headers_with_len, encode_response_trailers, validate_request_headers,
+    PathInternCache, SETTINGS_ENABLE_PUSH, SETTINGS_HEADER_TABLE_SIZE,
+    SETTINGS_INITIAL_WINDOW_SIZE, SETTINGS_MAX_CONCURRENT_STREAMS, SETTINGS_MAX_FRAME_SIZE,
+    SETTINGS_MAX_HEADER_LIST_SIZE, decode_headers_block_compact_with, decode_headers_block_with,
+    encode_response_headers, encode_response_headers_with_len, encode_response_trailers,
+    validate_request_headers,
 };
 
 #[cfg(test)]
@@ -141,7 +142,7 @@ impl Default for Http2ServerConfig {
 #[derive(Debug)]
 pub struct Http2RequestParts {
     pub method: http::Method,
-    pub path: String,
+    pub path: Arc<str>,
     pub headers: http::HeaderMap,
     pub body: HttpRequestBody,
     pub grpc_content_type: bool,
@@ -152,7 +153,10 @@ impl Http2RequestParts {
     pub fn into_http_request(self) -> HttpRequest {
         HttpRequest {
             method: self.method,
-            path: self.path,
+            // The generic request shape owns a `String` path; the interned
+            // `Arc<str>` is the compact gRPC shape, so only the public branch
+            // pays this copy (the compact branch keeps the `Arc`).
+            path: self.path.to_string(),
             version: Version::HTTP_2,
             headers: self.headers,
             body: self.body,
@@ -251,6 +255,10 @@ pub struct Http2ConnectionReport {
     pub goaway_sent: u64,
     pub late_replies_after_close: u64,
     pub rapid_reset_goaway: u64,
+    /// Distinct request paths dropped because the per-connection intern cache
+    /// was full. Non-zero means a peer sent more distinct paths than the cap;
+    /// those calls still ran, just without a cached path.
+    pub path_intern_overflow: u64,
 }
 
 /// Per-stream report snapshot.
@@ -403,6 +411,11 @@ impl Http2ConnectionMsg {
     }
 }
 
+/// Per-connection request-path interner capacity. A connection serves a small,
+/// fixed set of routes, so this is generous; a peer that floods distinct paths
+/// fills it and the overflow is counted, never grown without bound.
+const PATH_INTERN_CACHE_CAP: usize = 256;
+
 #[derive(Debug, Clone)]
 pub enum Http2ConnectionReply {
     RequestChunk(RequestChunkReply),
@@ -418,6 +431,7 @@ pub struct Http2Connection<S: Shard, M: Http2ServiceMessage = HttpRequest> {
     read_buf: Vec<u8>,
     read_scratch: Vec<u8>,
     hpack_decoder: hpack::Decoder<'static>,
+    path_cache: PathInternCache,
     preface_seen: bool,
     streams: Vec<ActiveStream>,
     /// stream-id → slot index in `streams`, kept in step with every push and
@@ -457,6 +471,7 @@ impl<S: Shard + 'static, M: Http2ServiceMessage> Http2Connection<S, M> {
             read_buf: Vec::new(),
             read_scratch: Vec::new(),
             hpack_decoder: hpack::Decoder::new(),
+            path_cache: PathInternCache::with_capacity(PATH_INTERN_CACHE_CAP),
             preface_seen: false,
             streams: Vec::with_capacity(limits.max_concurrent_streams),
             stream_index: HashMap::with_capacity(limits.max_concurrent_streams),
@@ -547,6 +562,8 @@ impl<S: Shard + 'static, M: Http2ServiceMessage> Isolate for Http2Connection<S, 
                 self.handle_request_body_next(stream_id, call)
             }
             Http2ConnectionMsg::Report => {
+                // Fold the live interner overflow into the report snapshot.
+                self.report.path_intern_overflow = self.path_cache.overflow();
                 call.reply(Http2ConnectionReply::Report(self.report.clone()))
             }
             _ => call.reject(tina::CallRejectedReason::UnsupportedMessage),
@@ -905,12 +922,14 @@ impl<S: Shard + 'static, M: Http2ServiceMessage> Http2Connection<S, M> {
                 &mut self.hpack_decoder,
                 header_payload,
                 self.limits.max_header_bytes,
+                Some(&mut self.path_cache),
             )?
         } else {
             decode_headers_block_with(
                 &mut self.hpack_decoder,
                 header_payload,
                 self.limits.max_header_bytes,
+                Some(&mut self.path_cache),
             )?
         };
         validate_request_headers(&headers)?;

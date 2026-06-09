@@ -456,3 +456,68 @@ hop re-add fails the probe.
 
 Full `tina-http` suite green (incl. flow-control, large-upload, streaming, and
 all gRPC suites); fmt + clippy (lib + perf example) clean; rustdoc clean.
+
+## Implementation Note 8 (Session B — item 3 landed; method-path interning)
+
+Note 1 (Session A) deferred item 3, correctly observing that converting the path
+to `Arc<str>` is a non-win on its own: the warmed path is already a single owned
+`String` moved (not cloned) to the handler, and `Arc::from(&str)` allocates the
+same as `String`. The missing piece was the bounded intern cache the plan
+permits — that is what turns the per-request allocation into a refcount bump.
+
+### What changed
+
+- `tina-http/src/http2/headers.rs`: new bounded `PathInternCache` (one per server
+  connection). `intern(&str) -> Arc<str>` returns a cloned cached `Arc` on a hit
+  (a refcount bump, no allocation), inserts on a miss while under cap, and on a
+  full cache serves a fresh non-retained `Arc` while counting `overflow` — an
+  explicit cap with a visible, never-silent overflow, not a growing path map.
+  `HeaderBlock.path` is now `Option<Arc<str>>`; the decode functions take an
+  `Option<&mut PathInternCache>` and intern `:path` directly from the borrowed
+  decode slice, so the compact gRPC path no longer allocates a per-request
+  `String` at decode time.
+- `tina-http/src/http2/server.rs`: `Http2Connection` owns a `PathInternCache`
+  (cap 256) and passes it to both the compact and public request decodes;
+  `Http2RequestParts.path` is `Arc<str>`. The generic request shape still owns a
+  `String`, paid as one `to_string()` in `into_http_request` — so generic HTTP/2
+  is unchanged. `Http2ConnectionReport` gained `path_intern_overflow`, folded
+  from the live cache when a report is requested.
+- `tina-http/src/grpc.rs`: `GrpcHttp2Request.path`, the public `GrpcRequest.path`,
+  `GrpcStreamingCall.path`, `GrpcRawStreamingRequest.path`, and
+  `GrpcClientStreamingRequest.path` are all `Arc<str>`, so the interned path
+  flows unmodified from decode to the handler on the compact path. The generic
+  (`HttpRequest`) entry points pay one `Arc::from` copy, matching the old
+  `String` cost. Route lookups use `&*request.path` (a `&str`), unchanged
+  matching against the `BTreeMap<String, _>` registries.
+- The native client passes `None` (responses never carry `:path`).
+
+### Why generic HTTP/2 does not regress
+
+The warmed `http2_h2c_steady_state_small` process-allocation count is unchanged
+(896-897 before and after) and `perf-h2-alloc` is unchanged at 1730. Generic
+HTTP/2 uses the public decode (interned hit = 0 alloc) plus one `to_string()` at
+`into_http_request` = one allocation per warmed request, the same as the old
+`to_owned()`. Only the compact gRPC path reaches the handler as `Arc<str>` with
+zero path allocation on a warmed route.
+
+### Proof (hard seam, not code inspection)
+
+- `path_intern_cache_reuses_one_arc_for_a_repeated_path`: two interns of the same
+  path are `Arc::ptr_eq` — fails if a fresh owned path is rebuilt per call.
+- `compact_decode_interns_a_repeated_request_path`: decoding the same gRPC request
+  block twice through one connection's cache yields `Arc::ptr_eq` paths — the
+  whole decode→intern seam reuses the allocation across warmed calls.
+- `path_intern_cache_bounds_distinct_paths_and_counts_overflow`: a cap-2 cache
+  serving 3 distinct paths counts the overflow, keeps serving correct paths, and
+  reuses cached slots — proving the bound and the visible-overflow contract.
+- `decode_without_cache_still_owns_the_path`: the `None` (client) fallback still
+  produces a valid owned path.
+
+### Measured (macOS/aarch64, native_protocol_rows process allocations)
+
+Warmed gRPC unary dropped to ~2870 (from ~3313 after items 1/2/4/5/6 + item 7),
+pooled-concurrent to ~2736, server-streaming to ~4690;
+`http2_h2c_steady_state_small` unchanged at 896-897. Warmed turn counts unchanged
+(13 / 11 / 21) — interning is an allocation change, not a turn change. Full
+`tina-http` suite green (incl. `grpc_live` 35, `grpc_client_live` 10,
+`http2_live` 41); fmt + clippy (lib + perf example) clean; rustdoc clean.

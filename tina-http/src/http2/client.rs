@@ -2029,17 +2029,20 @@ impl<S: Shard + 'static> Http2ClientConnection<S> {
         // A gRPC-unary stream decodes its response compactly: gRPC facts only,
         // no public `HeaderMap`. Every generic stream keeps the public decode.
         let grpc_unary = self.streams[idx].grpc_unary;
+        // Responses never carry `:path`, so the client needs no path interner.
         let header_block = if grpc_unary {
             decode_headers_block_compact_with(
                 &mut self.hpack_decoder,
                 payload,
                 self.limits.max_header_bytes,
+                None,
             )?
         } else {
             decode_headers_block_with(
                 &mut self.hpack_decoder,
                 payload,
                 self.limits.max_header_bytes,
+                None,
             )?
         };
         let end_stream = frame.flags & FLAG_END_STREAM != 0;
