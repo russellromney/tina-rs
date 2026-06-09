@@ -158,43 +158,70 @@ pub fn events_are_monotonic(events: &[RuntimeEvent]) -> Result<(), InvariantViol
 /// Checks that every cause points at an earlier event in the trace.
 ///
 /// A same-shard cause must point backward in that shard's local id stream.
-/// A cross-shard cause carries the *originating* shard's per-shard id, which
-/// can be numerically >= the caused event's local id and lives in another
-/// shard's stream; it is sound as long as it names an event present in the
-/// merged trace.
+/// A cross-shard cause carries only an event id today, not an origin shard.
+/// That is proof-grade only when the id names exactly one event in the
+/// merged trace. If multiple shards have the same id, the invariant fails
+/// closed instead of pretending it knows which event was meant.
 pub fn causes_point_backward(events: &[RuntimeEvent]) -> Result<(), InvariantViolation> {
     for event in events {
         let Some(cause) = event.cause() else {
             continue;
         };
-        let same_shard_cause = events.iter().find(|candidate| {
-            candidate.shard() == event.shard() && candidate.id() == cause.event()
-        });
-        if let Some(same_shard_cause) = same_shard_cause {
+        let candidates: Vec<_> = events
+            .iter()
+            .filter(|candidate| candidate.id() == cause.event())
+            .collect();
+        let [candidate] = candidates.as_slice() else {
+            let reason = if candidates.is_empty() {
+                format!("cause {:?} points at no event in trace", cause)
+            } else {
+                format!(
+                    "cause {:?} is ambiguous: event id appears on {} shards",
+                    cause,
+                    candidates.len()
+                )
+            };
+            return Err(InvariantViolation::new(
+                "causes_point_backward",
+                Some(event.id()),
+                reason,
+            ));
+        };
+        if candidate.shard() == event.shard() {
             // Same shard: the cause must be strictly earlier locally.
-            if same_shard_cause.id() >= event.id() {
+            if candidate.id() >= event.id() {
                 return Err(InvariantViolation::new(
                     "causes_point_backward",
                     Some(event.id()),
                     format!("same-shard cause {:?} does not point backward", cause),
                 ));
             }
-            continue;
-        }
-        // No same-shard match: accept a cross-shard cause that exists
-        // anywhere in the merged trace; reject a cause that names nothing.
-        if !events
-            .iter()
-            .any(|candidate| candidate.id() == cause.event())
-        {
-            return Err(InvariantViolation::new(
-                "causes_point_backward",
-                Some(event.id()),
-                format!("cause {:?} points at no event in trace", cause),
-            ));
         }
     }
     Ok(())
+}
+
+fn event_id_is_unique(events: &[RuntimeEvent], event: &RuntimeEvent) -> bool {
+    events
+        .iter()
+        .filter(|candidate| candidate.id() == event.id())
+        .take(2)
+        .count()
+        == 1
+}
+
+fn ambiguous_event_id_violation(
+    invariant: &'static str,
+    event: &RuntimeEvent,
+) -> InvariantViolation {
+    InvariantViolation::new(
+        invariant,
+        Some(event.id()),
+        format!(
+            "event id {} appears on multiple shards; CauseId does not carry an origin shard",
+            event.id().get()
+        ),
+    )
 }
 
 /// Checks that every send attempt has a same-target accepted or rejected
@@ -209,6 +236,9 @@ pub fn send_attempts_settle(events: &[RuntimeEvent]) -> Result<(), InvariantViol
         else {
             continue;
         };
+        if !event_id_is_unique(events, event) {
+            return Err(ambiguous_event_id_violation("send_attempts_settle", event));
+        }
         let cause = Some(CauseId::new(event.id()));
         if !events.iter().any(|candidate| {
             candidate.cause() == cause
@@ -266,6 +296,9 @@ pub fn call_attempts_settle(events: &[RuntimeEvent]) -> Result<(), InvariantViol
         let RuntimeEventKind::CallDispatchAttempted { call_id, .. } = event.kind() else {
             continue;
         };
+        if !event_id_is_unique(events, event) {
+            return Err(ambiguous_event_id_violation("call_attempts_settle", event));
+        }
         let cause = Some(CauseId::new(event.id()));
         if !events.iter().any(|candidate| {
             candidate.cause() == cause && call_outcome_matches(candidate.kind(), call_id)
@@ -418,6 +451,60 @@ mod tests {
         )
     }
 
+    fn send_attempt(shard: u32, id: u64, target_shard: u32) -> RuntimeEvent {
+        RuntimeEvent::new(
+            EventId::new(id),
+            None,
+            ShardId::new(shard),
+            IsolateId::new(1),
+            RuntimeEventKind::SendDispatchAttempted {
+                target_shard: ShardId::new(target_shard),
+                target_isolate: IsolateId::new(2),
+                target_generation: AddressGeneration::new(0),
+            },
+        )
+    }
+
+    fn send_accepted(shard: u32, id: u64, cause: u64, target_shard: u32) -> RuntimeEvent {
+        RuntimeEvent::new(
+            EventId::new(id),
+            Some(CauseId::new(EventId::new(cause))),
+            ShardId::new(shard),
+            IsolateId::new(2),
+            RuntimeEventKind::SendAccepted {
+                target_shard: ShardId::new(target_shard),
+                target_isolate: IsolateId::new(2),
+                target_generation: AddressGeneration::new(0),
+            },
+        )
+    }
+
+    fn call_attempt(shard: u32, id: u64, call_id: u64) -> RuntimeEvent {
+        RuntimeEvent::new(
+            EventId::new(id),
+            None,
+            ShardId::new(shard),
+            IsolateId::new(1),
+            RuntimeEventKind::CallDispatchAttempted {
+                call_id: CallId::new(call_id),
+                call_kind: tina_runtime::CallKind::Sleep,
+            },
+        )
+    }
+
+    fn call_completed(shard: u32, id: u64, cause: u64, call_id: u64) -> RuntimeEvent {
+        RuntimeEvent::new(
+            EventId::new(id),
+            Some(CauseId::new(EventId::new(cause))),
+            ShardId::new(shard),
+            IsolateId::new(1),
+            RuntimeEventKind::CallCompleted {
+                call_id: CallId::new(call_id),
+                call_kind: tina_runtime::CallKind::Sleep,
+            },
+        )
+    }
+
     #[test]
     fn monotonic_holds_per_shard_on_multishard_trace() {
         // Live multishard ids are per-shard-local: each shard counts from 1,
@@ -457,10 +544,9 @@ mod tests {
 
     #[test]
     fn causes_point_backward_accepts_cross_shard_cause() {
-        // A cross-shard cause carries the originating shard's per-shard id,
-        // which can be numerically >= the caused event's id and lives in a
-        // different shard's id stream. It must be accepted as long as it
-        // exists in the merged trace.
+        // A cross-shard cause carries only the originating event id, not the
+        // shard. It can be accepted only when that id is unique in the merged
+        // trace.
         let trace = [
             // shard 11 emits the cause (id 5).
             event(11, 5, None),
@@ -472,19 +558,58 @@ mod tests {
     }
 
     #[test]
+    fn causes_point_backward_rejects_ambiguous_cross_shard_cause() {
+        // With per-shard event ids, id 5 can exist on multiple shards. Since
+        // CauseId does not name the origin shard, proof-grade invariant code
+        // must fail closed instead of picking a convenient matching event.
+        let trace = [
+            event(11, 5, None),
+            event(33, 5, None),
+            event(22, 1, Some(5)),
+        ];
+        let violation = causes_point_backward(&trace)
+            .expect_err("ambiguous cross-shard cause must fail closed");
+        assert_eq!(violation.invariant(), "causes_point_backward");
+    }
+
+    #[test]
     fn causes_point_backward_rejects_same_shard_forward_cause() {
         // Within one shard a cause must still point at an earlier local id.
         let trace = [event(11, 1, Some(2)), event(11, 2, None)];
-        let violation = causes_point_backward(&trace)
-            .expect_err("a same-shard forward cause must fail");
+        let violation =
+            causes_point_backward(&trace).expect_err("a same-shard forward cause must fail");
         assert_eq!(violation.invariant(), "causes_point_backward");
     }
 
     #[test]
     fn causes_point_backward_rejects_missing_cause() {
         let trace = [event(11, 1, Some(99))];
-        let violation = causes_point_backward(&trace)
-            .expect_err("a cause pointing at no event must fail");
+        let violation =
+            causes_point_backward(&trace).expect_err("a cause pointing at no event must fail");
         assert_eq!(violation.invariant(), "causes_point_backward");
+    }
+
+    #[test]
+    fn send_settlement_rejects_ambiguous_attempt_event_id() {
+        let trace = [
+            send_attempt(11, 7, 22),
+            event(33, 7, None),
+            send_accepted(22, 1, 7, 22),
+        ];
+        let violation = send_attempts_settle(&trace)
+            .expect_err("duplicate event id makes causal settlement ambiguous");
+        assert_eq!(violation.invariant(), "send_attempts_settle");
+    }
+
+    #[test]
+    fn call_settlement_rejects_ambiguous_attempt_event_id() {
+        let trace = [
+            call_attempt(11, 9, 77),
+            event(33, 9, None),
+            call_completed(11, 10, 9, 77),
+        ];
+        let violation = call_attempts_settle(&trace)
+            .expect_err("duplicate event id makes call settlement ambiguous");
+        assert_eq!(violation.invariant(), "call_attempts_settle");
     }
 }

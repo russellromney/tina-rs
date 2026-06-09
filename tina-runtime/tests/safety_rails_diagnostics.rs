@@ -34,5 +34,7 @@ fn diagnostic_phrases_are_pinned() {
     cases.compile_fail("tests/safety_rails_compile_fail/split_private_internal_event.rs");
     cases.compile_fail("tests/safety_rails_compile_fail/split_request_on_event_lane.rs");
     cases.compile_fail("tests/safety_rails_compile_fail/split_event_on_request_lane.rs");
+    cases.compile_fail("tests/safety_rails_compile_fail/split_request_call_in_string_literal.rs");
     cases.pass("tests/safety_rails_compile_pass/split_request_arg_named_msg.rs");
+    cases.pass("tests/safety_rails_compile_pass/split_request_call_used_with_string.rs");
 }

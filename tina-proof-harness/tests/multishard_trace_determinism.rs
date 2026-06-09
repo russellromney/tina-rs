@@ -284,4 +284,3 @@ fn live_single_shard_trace_hash_is_stable_across_runs() {
         );
     }
 }
-

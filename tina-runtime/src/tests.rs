@@ -190,6 +190,116 @@ fn full_retention_trace_is_not_truncated_and_proof_accessor_returns_it() {
     assert_eq!(events.len(), 5);
 }
 
+#[test]
+fn stopped_entry_gc_compacts_a_burst_in_one_pass_and_keeps_indexes_consistent() {
+    // Mass-disconnect shape: many stopped isolates become collectable in
+    // one step. GC must remove exactly them, leave live entries intact,
+    // and keep the id->index map resolving every survivor.
+    let mut runtime = Runtime::new(TestShard, TestMailboxFactory);
+
+    const N: usize = 64;
+    let mut addrs = Vec::with_capacity(N);
+    for _ in 0..N {
+        addrs.push(runtime.register(new_root(), root_mailbox()));
+    }
+
+    // Stop every even-indexed isolate; odd ones stay live.
+    let mut stopped_ids = Vec::new();
+    let mut live_ids = Vec::new();
+    for (i, entry) in runtime.entries.iter().enumerate() {
+        if i % 2 == 0 {
+            entry.stopped.set(true);
+            stopped_ids.push(entry.id);
+        } else {
+            live_ids.push(entry.id);
+        }
+    }
+    // Real stops flip this through the dispatch path; mirror it here so the
+    // per-step skip does not short-circuit the GC under test.
+    runtime.has_stopped_entries = true;
+
+    // Pin one stopped isolate open with an in-flight call: it must NOT be
+    // collected while a call references it.
+    let pinned = stopped_ids[0];
+    let pinned_addr = RegisteredAddress {
+        shard: runtime.shard.id(),
+        isolate: pinned,
+        generation: runtime.entries[0].generation,
+    };
+    runtime.push_in_flight_call(InFlightCall {
+        call_id: CallId::new(1),
+        call_kind: CallKind::IsolateCall,
+        requester: pinned_addr,
+        cause: CauseId::new(EventId::new(1)),
+        persistence: None,
+        continuation_context: None,
+    });
+
+    runtime.gc_stopped_entries();
+
+    // Pinned stopped entry survives (blocked by the in-flight call); all
+    // other stopped entries are gone; every live entry remains.
+    let remaining: std::collections::HashSet<IsolateId> =
+        runtime.entries.iter().map(|e| e.id).collect();
+    assert!(
+        remaining.contains(&pinned),
+        "in-flight-pinned stop survives"
+    );
+    assert!(
+        runtime.has_stopped_entries,
+        "flag must stay set while a blocked stop remains"
+    );
+    for id in &live_ids {
+        assert!(remaining.contains(id), "live entry must survive GC");
+    }
+    for id in stopped_ids.iter().skip(1) {
+        assert!(!remaining.contains(id), "collectable stop must be removed");
+    }
+    assert_eq!(runtime.entries.len(), live_ids.len() + 1);
+
+    // Index map matches the compacted Vec exactly: same length, and every
+    // id resolves to a slot holding that id.
+    assert_eq!(runtime.entry_indexes.len(), runtime.entries.len());
+    for (idx, entry) in runtime.entries.iter().enumerate() {
+        assert_eq!(
+            runtime.entry_indexes.get(&entry.id).copied(),
+            Some(idx),
+            "id->index map must resolve every survivor to its slot"
+        );
+    }
+    for id in stopped_ids.iter().skip(1) {
+        assert!(
+            !runtime.entry_indexes.contains_key(id),
+            "removed entry must not linger in the index"
+        );
+    }
+
+    // entry_index() resolves a live address through the rebuilt map.
+    let live_addr = RegisteredAddress {
+        shard: runtime.shard.id(),
+        isolate: addrs[1].isolate(),
+        generation: runtime.entries[runtime.entry_indexes[&addrs[1].isolate()]].generation,
+    };
+    assert_eq!(
+        runtime.entry_index(live_addr),
+        runtime.entry_indexes.get(&addrs[1].isolate()).copied()
+    );
+
+    // Settle the pinned call; now the last stop is collectable too.
+    runtime.remove_in_flight_call(CallId::new(1));
+    runtime.gc_stopped_entries();
+    assert!(
+        !runtime.entries.iter().any(|e| e.id == pinned),
+        "pinned stop collected after its call settles"
+    );
+    assert_eq!(runtime.entries.len(), live_ids.len());
+    assert_eq!(runtime.entry_indexes.len(), runtime.entries.len());
+    assert!(
+        !runtime.has_stopped_entries,
+        "flag must clear once no stop remains, so later steps skip the scan"
+    );
+}
+
 #[derive(Debug, Default)]
 struct TestShard;
 

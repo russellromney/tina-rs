@@ -857,7 +857,10 @@ mod tests {
             |_| OpOutcome::Ok,
             Some(|| false),
         );
-        assert!(report.leak_checked, "supplying a leak check marks it checked");
+        assert!(
+            report.leak_checked,
+            "supplying a leak check marks it checked"
+        );
         assert!(!report.leak_clean);
         assert!(report.summary_line().contains("leak_clean=false"));
     }

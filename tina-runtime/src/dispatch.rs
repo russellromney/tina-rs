@@ -522,6 +522,11 @@ where
     }
 
     pub(crate) fn sweep_dropped_deferred_slots(&mut self) {
+        // Nothing promoted: skip the scan. Steady-state shards with no
+        // outstanding deferred replies pay nothing here.
+        if self.promoted_slots.is_empty() {
+            return;
+        }
         // Single pass: independent Rcs cannot cascade.
         let dropped = self.promoted_slots.sweep_dropped();
         for record in dropped {
@@ -2402,6 +2407,7 @@ where
         }
 
         self.entries[index].stopped.set(true);
+        self.has_stopped_entries = true;
         self.entries[index].mailbox.close();
         let stopped = self.push_event(isolate_id, Some(cause), RuntimeEventKind::IsolateStopped);
         self.entries[index].stopped_event.set(Some(stopped));
@@ -3193,17 +3199,32 @@ where
     }
 
     pub(crate) fn gc_stopped_entries(&mut self) {
+        // Skip the whole scan while no isolate is stopped. The flag is set
+        // when an entry stops and re-derived below, so steady-state live
+        // shards pay nothing here.
+        if !self.has_stopped_entries {
+            return;
+        }
+
+        // One pass: swap_remove collectable entries (O(1) each) and track
+        // whether any stopped-but-blocked entry remains. A burst compacts
+        // in O(N), not O(N^2); rebuild the id->index map once at the end.
         let mut index = 0;
         let mut removed_any = false;
+        let mut stopped_remaining = false;
         while index < self.entries.len() {
             if self.can_gc_stopped_entry(index) {
-                let removed = self.entries.remove(index);
-                self.entry_indexes.remove(&removed.id);
+                self.entries.swap_remove(index);
                 removed_any = true;
+                // swap_remove moved the tail entry into `index`; re-check it.
             } else {
+                if self.entries[index].stopped.get() {
+                    stopped_remaining = true;
+                }
                 index += 1;
             }
         }
+        self.has_stopped_entries = stopped_remaining;
         if removed_any {
             self.rebuild_entry_indexes();
         }
