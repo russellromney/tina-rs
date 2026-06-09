@@ -171,3 +171,66 @@ complete without the remaining items and the Linux evidence.
   The full macOS 3x3 and the Linux/x86 3x3 are not collected. Targets (≥20%
   warmed unary, ≥15% streaming) are not met and will not be until items 2/4/6/7
   land. PR stays draft.
+
+## Implementation Note 2 (Session A — item 2 landed)
+
+Item 2 is now done; it was listed as "not started" in Note 1 above. Append-only,
+so this corrects the record rather than editing Note 1.
+
+### What changed
+
+`tina-http/src/grpc.rs`: native gRPC streaming no longer falls back through a
+public `HttpRequest`.
+
+- `GrpcHttp2Request::into_http_request` is **deleted** — both callers are gone.
+- `ErasedStreaming` and `ErasedStreamingRaw` gained `call_http2`, taking the
+  HTTP/2 request stream straight from `GrpcHttp2Request` (no `HeaderMap`, no
+  `HttpRequest`).
+- `start_or_reply_http2_request` dispatches streaming/raw routes synchronously
+  through the compact path, and accumulates other streamed bodies into a new
+  `PendingGrpcRequest::Http2` enum variant holding compact gRPC state (method,
+  path, content-type/encoding flags, the request stream, accumulated body) —
+  not a public `HttpRequest`. At EOF it rebuilds a `GrpcHttp2Request` with a
+  buffered body and dispatches via `response_for_http2`.
+- `response_for_http2` now routes all six route kinds (unary, client-streaming,
+  streaming, streaming_raw, buffered-server-streaming, server-streaming) via
+  `call_http2`.
+- Body-pull outcome handling is shared via `classify_request_chunk`
+  (More / Eof / Failed) so the bounded, cancelable pull and the reply obligation
+  behave identically for both pending shapes. The generic `HttpRequest` path
+  (`PendingGrpcRequest::Public`) is unchanged for non-compact/direct-API use.
+
+### What is directly proved
+
+- All gRPC integration suites green, including the shapes whose dispatch changed:
+  `grpc_client_streaming_reads_multiple_request_messages` /
+  `..._handles_many_small_messages` (compact pending accumulation + EOF),
+  `grpc_streaming_sends_response_before_request_eof` /
+  `..._concurrent_streams_do_not_cross_talk` / `..._malformed_frame_sets_final_status`
+  (compact sync `call_http2`), `grpc_streaming_raw_sends_response_before_request_eof`
+  (raw compact path), `bidi_request_and_response_streams_progress_independently`,
+  and the peer-reset cancellation tests (bounded/cancelable pull preserved).
+- `grpc.rs` lib unit tests (26) green; full `tina-http` suite green; fmt + clippy
+  (`tina-http` and perf example) clean. The structural deletion of
+  `into_http_request` means the old rebuild cannot silently come back — it would
+  not compile.
+
+### What item 2 does NOT show
+
+The existing perf rows (`native_protocol_rows_are_printable_and_bounded`)
+exercise unary and buffered-server-streaming, not client-streaming / bidi / raw /
+true-streaming, so they do not quantify item 2's allocation win. The combined
+items-1+2+5 macOS sample in `perf_sample_macos_partial.txt` shows the row
+movement that items 1+5 produce, with no regression from item 2. A dedicated
+client-streaming/bidi allocation row would be needed to put a number on item 2;
+that is left for the perf-proof pass (item 8).
+
+### Pre-existing test failure observed (not from this work)
+
+On macOS, `native_protocol_rows_are_printable_and_bounded` panics at the
+`leak_clean` assertion (`tests/perf.rs:223`) for the `http2_h2c_close_request`
+connection-setup row, which reports `leak=unchecked`. This reproduces on pristine
+`main` (`f96160c`) with all Phase 156 changes stashed, so it predates this work
+and is unrelated to it (that row never touches `GrpcRouter`). The row data still
+prints before the panic. Flagged here so the perf-proof pass can decide whether
+to fix the macOS leak check separately.

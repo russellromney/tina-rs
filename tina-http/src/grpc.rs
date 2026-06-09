@@ -276,10 +276,12 @@ trait ErasedClientStreaming: Send + Sync {
 
 trait ErasedStreaming: Send + Sync {
     fn call(&self, request: HttpRequest, limits: GrpcLimits) -> HttpResponse;
+    fn call_http2(&self, request: GrpcHttp2Request, limits: GrpcLimits) -> HttpResponse;
 }
 
 trait ErasedStreamingRaw: Send + Sync {
     fn call(&self, request: HttpRequest, limits: GrpcLimits) -> HttpResponse;
+    fn call_http2(&self, request: GrpcHttp2Request, limits: GrpcLimits) -> HttpResponse;
 }
 
 struct UnaryHandler<Req, Resp, F> {
@@ -927,6 +929,27 @@ where
             Err(status) => grpc_http_response(Vec::new(), status),
         }
     }
+
+    fn call_http2(&self, request: GrpcHttp2Request, limits: GrpcLimits) -> HttpResponse {
+        // Take the HTTP/2 request body stream straight from the compact request
+        // — no public `HttpRequest`/`HeaderMap` rebuild. The handler only needs
+        // the method path and the request stream.
+        let GrpcHttp2Request { path, body, .. } = request;
+        let GrpcHttp2Body::Http2Stream(stream) = body else {
+            return grpc_http_response(
+                Vec::new(),
+                GrpcStatus::new(GrpcStatusCode::InvalidArgument),
+            );
+        };
+        match (self.f)(GrpcStreamingCall {
+            path,
+            requests: GrpcRequestStream::new(stream, limits),
+            _response: PhantomData,
+        }) {
+            Ok(response) => grpc_streaming_http_response(response.source, response.status),
+            Err(status) => grpc_http_response(Vec::new(), status),
+        }
+    }
 }
 
 impl<Req, F> ErasedStreamingRaw for StreamingRawHandler<Req, F>
@@ -940,6 +963,26 @@ where
     fn call(&self, request: HttpRequest, _limits: GrpcLimits) -> HttpResponse {
         let HttpRequest { path, body, .. } = request;
         let HttpRequestBody::Http2Stream(stream) = body else {
+            return grpc_http_response(
+                Vec::new(),
+                GrpcStatus::new(GrpcStatusCode::InvalidArgument),
+            );
+        };
+        match (self.f)(GrpcRawStreamingRequest {
+            path,
+            stream,
+            _message: PhantomData,
+        }) {
+            Ok(response) => grpc_streaming_http_response(response.source, response.status),
+            Err(status) => grpc_http_response(Vec::new(), status),
+        }
+    }
+
+    fn call_http2(&self, request: GrpcHttp2Request, _limits: GrpcLimits) -> HttpResponse {
+        // Compact entry point: hand the raw HTTP/2 request stream to the handler
+        // without building a public `HttpRequest`.
+        let GrpcHttp2Request { path, body, .. } = request;
+        let GrpcHttp2Body::Http2Stream(stream) = body else {
             return grpc_http_response(
                 Vec::new(),
                 GrpcStatus::new(GrpcStatusCode::InvalidArgument),
@@ -1015,31 +1058,6 @@ impl GrpcHttp2Request {
             unsupported_encoding: parts.grpc_encoding_unsupported,
         }
     }
-
-    fn into_http_request(self) -> HttpRequest {
-        let mut headers = HeaderMap::new();
-        if self.content_type_ok {
-            headers.insert(
-                http::header::CONTENT_TYPE,
-                HeaderValue::from_static("application/grpc"),
-            );
-        }
-        if self.unsupported_encoding {
-            headers.insert("grpc-encoding", HeaderValue::from_static("unsupported"));
-        }
-        let body = match self.body {
-            GrpcHttp2Body::Buffered(bytes) => HttpRequestBody::Buffered(bytes),
-            GrpcHttp2Body::Http2Stream(stream) => HttpRequestBody::Http2Stream(stream),
-            GrpcHttp2Body::Unsupported => HttpRequestBody::Buffered(Vec::new()),
-        };
-        HttpRequest {
-            method: self.method,
-            path: self.path,
-            version: http::Version::HTTP_2,
-            headers,
-            body,
-        }
-    }
 }
 
 impl Http2ServiceMessage for GrpcRouterMsg {
@@ -1056,10 +1074,28 @@ impl Http2ServiceMessage for GrpcRouterMsg {
     }
 }
 
-struct PendingGrpcRequest {
-    request: HttpRequest,
-    body: Vec<u8>,
-    call: tina::RequestContext<HttpResponse>,
+/// A streamed gRPC request whose body is being pulled chunk-by-chunk before
+/// the route can run. The HTTP/2 (`Http2`) variant keeps compact gRPC facts —
+/// not a public `HttpRequest`/`HeaderMap` — so the native streaming path never
+/// rebuilds the public request shape.
+enum PendingGrpcRequest {
+    /// Generic `HttpRequest` entry path (kept for non-compact / direct API use).
+    Public {
+        request: HttpRequest,
+        body: Vec<u8>,
+        call: tina::RequestContext<HttpResponse>,
+    },
+    /// Native compact HTTP/2 entry path. Stores the method path, the two gRPC
+    /// header facts, the request stream to pull from, and the accumulated body.
+    Http2 {
+        method: Method,
+        path: String,
+        content_type_ok: bool,
+        unsupported_encoding: bool,
+        stream: Http2RequestStream,
+        body: Vec<u8>,
+        call: tina::RequestContext<HttpResponse>,
+    },
 }
 
 impl<S: Shard + 'static> GrpcRouter<S> {
@@ -1215,15 +1251,16 @@ impl<S: Shard + 'static> GrpcRouter<S> {
         if request.method != Method::POST {
             return grpc_http_response(Vec::new(), GrpcStatus::new(GrpcStatusCode::Unimplemented));
         }
-        if self.streaming.contains_key(&request.path)
-            || self.streaming_raw.contains_key(&request.path)
-        {
-            return self.response_for(request.into_http_request());
-        }
         if let Some(handler) = self.unary.get(&request.path) {
             return handler.call_http2(request, self.limits);
         }
         if let Some(handler) = self.client_streaming.get(&request.path) {
+            return handler.call_http2(request, self.limits);
+        }
+        if let Some(handler) = self.streaming.get(&request.path) {
+            return handler.call_http2(request, self.limits);
+        }
+        if let Some(handler) = self.streaming_raw.get(&request.path) {
             return handler.call_http2(request, self.limits);
         }
         if let Some(handler) = self.buffered_server_streaming.get(&request.path) {
@@ -1259,7 +1296,7 @@ impl<S: Shard + 'static> GrpcRouter<S> {
                 let request_context = call_ctx.into_request_context();
                 self.pending.insert(
                     id,
-                    PendingGrpcRequest {
+                    PendingGrpcRequest::Public {
                         request,
                         body: Vec::new(),
                         call: request_context,
@@ -1287,7 +1324,55 @@ impl<S: Shard + 'static> GrpcRouter<S> {
                 GrpcStatus::new(GrpcStatusCode::InvalidArgument),
             )),
             GrpcHttp2Body::Http2Stream(_) => {
-                self.start_or_reply_request(request.into_http_request(), call_ctx)
+                // streaming / raw-streaming routes consume the request stream
+                // directly and reply with a streaming response source. They do
+                // not accumulate the body, so dispatch them synchronously via
+                // the compact entry point — no public `HttpRequest` rebuild.
+                if self.streaming.contains_key(&request.path)
+                    || self.streaming_raw.contains_key(&request.path)
+                {
+                    return call_ctx.reply(self.response_for_http2(request));
+                }
+                // Other routes over a streamed body (e.g. client-streaming)
+                // accumulate the framed body, then dispatch buffered. Keep the
+                // compact gRPC facts instead of a public `HttpRequest`.
+                let GrpcHttp2Request {
+                    method,
+                    path,
+                    body,
+                    content_type_ok,
+                    unsupported_encoding,
+                } = request;
+                let GrpcHttp2Body::Http2Stream(stream) = body else {
+                    // The outer match guarantees Http2Stream here.
+                    return call_ctx.reply(grpc_http_response(
+                        Vec::new(),
+                        GrpcStatus::new(GrpcStatusCode::Internal),
+                    ));
+                };
+                let id = self.next_pending_id;
+                self.next_pending_id = self.next_pending_id.saturating_add(1);
+                let source = stream.source;
+                let stream_id = stream.stream_id;
+                let request_context = call_ctx.into_request_context();
+                self.pending.insert(
+                    id,
+                    PendingGrpcRequest::Http2 {
+                        method,
+                        path,
+                        content_type_ok,
+                        unsupported_encoding,
+                        stream,
+                        body: Vec::new(),
+                        call: request_context,
+                    },
+                );
+                call(
+                    source,
+                    crate::Http2ConnectionMsg::body_next(stream_id),
+                    REQUEST_BODY_PULL_TIMEOUT,
+                )
+                .then(move |outcome| GrpcRouterMsg::RequestBodyChunk { id, outcome })
             }
         }
     }
@@ -1297,58 +1382,159 @@ impl<S: Shard + 'static> GrpcRouter<S> {
         id: u64,
         outcome: CallOutcome<Http2ConnectionReply>,
     ) -> Effect<Self> {
-        let Some(mut pending) = self.pending.remove(&id) else {
+        let Some(pending) = self.pending.remove(&id) else {
             return noop();
         };
-        let HttpRequestBody::Http2Stream(stream) = &pending.request.body else {
-            return reply_to_request(
-                pending.call,
-                grpc_http_response(Vec::new(), GrpcStatus::new(GrpcStatusCode::Internal)),
-            );
-        };
-        match outcome {
-            CallOutcome::Replied(Http2ConnectionReply::RequestChunk(RequestChunkReply::Chunk(
-                bytes,
-            ))) => {
-                pending.body.extend_from_slice(&bytes);
-                let source = stream.source;
-                let stream_id = stream.stream_id;
-                self.pending.insert(id, pending);
-                call(
-                    source,
-                    crate::Http2ConnectionMsg::body_next(stream_id),
-                    REQUEST_BODY_PULL_TIMEOUT,
-                )
-                .then(move |outcome| GrpcRouterMsg::RequestBodyChunk { id, outcome })
+        // Classify the chunk outcome once; both pending shapes share the same
+        // body-pull contract (more bytes, clean EOF, or a failure mapped to a
+        // gRPC status).
+        match classify_request_chunk(outcome) {
+            RequestChunkAction::More(bytes) => match pending {
+                PendingGrpcRequest::Public {
+                    request,
+                    mut body,
+                    call,
+                } => {
+                    let HttpRequestBody::Http2Stream(stream) = &request.body else {
+                        return reply_to_request(
+                            call,
+                            grpc_http_response(
+                                Vec::new(),
+                                GrpcStatus::new(GrpcStatusCode::Internal),
+                            ),
+                        );
+                    };
+                    let source = stream.source;
+                    let stream_id = stream.stream_id;
+                    body.extend_from_slice(&bytes);
+                    self.pending.insert(
+                        id,
+                        PendingGrpcRequest::Public {
+                            request,
+                            body,
+                            call,
+                        },
+                    );
+                    self.pull_next_chunk(id, source, stream_id)
+                }
+                PendingGrpcRequest::Http2 {
+                    method,
+                    path,
+                    content_type_ok,
+                    unsupported_encoding,
+                    stream,
+                    mut body,
+                    call,
+                } => {
+                    let source = stream.source;
+                    let stream_id = stream.stream_id;
+                    body.extend_from_slice(&bytes);
+                    self.pending.insert(
+                        id,
+                        PendingGrpcRequest::Http2 {
+                            method,
+                            path,
+                            content_type_ok,
+                            unsupported_encoding,
+                            stream,
+                            body,
+                            call,
+                        },
+                    );
+                    self.pull_next_chunk(id, source, stream_id)
+                }
+            },
+            RequestChunkAction::Eof => match pending {
+                PendingGrpcRequest::Public {
+                    mut request,
+                    body,
+                    call,
+                } => {
+                    request.body = HttpRequestBody::Buffered(body);
+                    reply_to_request(call, self.response_for(request))
+                }
+                PendingGrpcRequest::Http2 {
+                    method,
+                    path,
+                    content_type_ok,
+                    unsupported_encoding,
+                    body,
+                    call,
+                    ..
+                } => {
+                    let request = GrpcHttp2Request {
+                        method,
+                        path,
+                        body: GrpcHttp2Body::Buffered(body),
+                        content_type_ok,
+                        unsupported_encoding,
+                    };
+                    reply_to_request(call, self.response_for_http2(request))
+                }
+            },
+            RequestChunkAction::Failed(status) => {
+                reply_to_request(pending.into_call(), grpc_http_response(Vec::new(), status))
             }
-            CallOutcome::Replied(Http2ConnectionReply::RequestChunk(RequestChunkReply::Eof)) => {
-                pending.request.body = HttpRequestBody::Buffered(pending.body);
-                let response = self.response_for(pending.request);
-                reply_to_request(pending.call, response)
-            }
-            CallOutcome::Replied(Http2ConnectionReply::RequestChunk(RequestChunkReply::Error(
-                _,
-            )))
-            | CallOutcome::Replied(Http2ConnectionReply::Report(_))
-            | CallOutcome::Replied(Http2ConnectionReply::RequestChunk(
-                RequestChunkReply::WebSocketSend(_),
-            ))
-            | CallOutcome::Replied(Http2ConnectionReply::RequestChunk(
-                RequestChunkReply::WebSocketReport(_),
-            )) => reply_to_request(
-                pending.call,
-                grpc_http_response(Vec::new(), GrpcStatus::new(GrpcStatusCode::Internal)),
-            ),
-            CallOutcome::Full
-            | CallOutcome::Closed
-            | CallOutcome::Rejected(_)
-            | CallOutcome::Timeout => reply_to_request(
-                pending.call,
-                grpc_http_response(
-                    Vec::new(),
-                    GrpcStatus::new(GrpcStatusCode::DeadlineExceeded),
-                ),
-            ),
+        }
+    }
+
+    /// Pull the next request body chunk for a pending streamed request.
+    fn pull_next_chunk(
+        &self,
+        id: u64,
+        source: tina::Address<crate::Http2ConnectionMsg, crate::Http2ConnectionReply>,
+        stream_id: u32,
+    ) -> Effect<Self> {
+        call(
+            source,
+            crate::Http2ConnectionMsg::body_next(stream_id),
+            REQUEST_BODY_PULL_TIMEOUT,
+        )
+        .then(move |outcome| GrpcRouterMsg::RequestBodyChunk { id, outcome })
+    }
+}
+
+impl PendingGrpcRequest {
+    /// The reply obligation, regardless of which entry path produced it.
+    fn into_call(self) -> tina::RequestContext<HttpResponse> {
+        match self {
+            PendingGrpcRequest::Public { call, .. } => call,
+            PendingGrpcRequest::Http2 { call, .. } => call,
+        }
+    }
+}
+
+/// What a request-body-pull outcome means for an accumulating streamed request.
+enum RequestChunkAction {
+    /// More body bytes arrived; keep pulling.
+    More(Vec<u8>),
+    /// Clean end of the request body.
+    Eof,
+    /// The pull failed; reply with this gRPC status.
+    Failed(GrpcStatus),
+}
+
+fn classify_request_chunk(outcome: CallOutcome<Http2ConnectionReply>) -> RequestChunkAction {
+    match outcome {
+        CallOutcome::Replied(Http2ConnectionReply::RequestChunk(RequestChunkReply::Chunk(
+            bytes,
+        ))) => RequestChunkAction::More(bytes),
+        CallOutcome::Replied(Http2ConnectionReply::RequestChunk(RequestChunkReply::Eof)) => {
+            RequestChunkAction::Eof
+        }
+        CallOutcome::Replied(Http2ConnectionReply::RequestChunk(RequestChunkReply::Error(_)))
+        | CallOutcome::Replied(Http2ConnectionReply::Report(_))
+        | CallOutcome::Replied(Http2ConnectionReply::RequestChunk(
+            RequestChunkReply::WebSocketSend(_),
+        ))
+        | CallOutcome::Replied(Http2ConnectionReply::RequestChunk(
+            RequestChunkReply::WebSocketReport(_),
+        )) => RequestChunkAction::Failed(GrpcStatus::new(GrpcStatusCode::Internal)),
+        CallOutcome::Full
+        | CallOutcome::Closed
+        | CallOutcome::Rejected(_)
+        | CallOutcome::Timeout => {
+            RequestChunkAction::Failed(GrpcStatus::new(GrpcStatusCode::DeadlineExceeded))
         }
     }
 }
