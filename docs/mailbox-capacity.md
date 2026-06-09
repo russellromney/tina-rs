@@ -67,8 +67,11 @@ mailbox first; if the mailbox is full it parks the continuation in a per-
 isolate **priority overflow** and emits
 `RuntimeEventKind::CallContinuationOverflowed { call_kind, ... }`. The
 overflow drains ahead of the mailbox, so the continuation arrives in order
-and the call still completes (`CallCompleted`). The overflow is bounded by the
-isolate's own outstanding runtime calls, so it cannot grow without bound.
+with other overflowed continuations and the call still completes
+(`CallCompleted`). This is a priority lane, not FIFO with ordinary mailbox
+traffic: a runtime-owned liveness wakeup can run before older queued ingress
+when the mailbox is saturated. The overflow is bounded by the isolate's own
+outstanding runtime calls, so it cannot grow without bound.
 
 `CallContinuationOverflowed` is a backpressure signal, not a loss: seeing it
 means the mailbox is under-sized for the isolate's outstanding work, but no

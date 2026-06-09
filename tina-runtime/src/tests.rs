@@ -1382,6 +1382,7 @@ struct PollLoopBridge {
     in_flight: bool,
     /// Set true the moment the leased slot is freed by a delivered `Poll`.
     settled: Rc<Cell<bool>>,
+    seen: Rc<RefCell<Vec<BridgeMsg>>>,
 }
 
 impl Isolate for PollLoopBridge {
@@ -1399,6 +1400,7 @@ impl Isolate for PollLoopBridge {
         msg: Self::Message,
         _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
     ) -> Effect<Self> {
+        self.seen.borrow_mut().push(msg);
         match msg {
             BridgeMsg::Admit => {
                 if self.in_flight {
@@ -2818,6 +2820,7 @@ fn timer_fires_exactly_once() {
 fn poll_continuation_is_not_dropped_when_mailbox_is_saturated() {
     let (mut runtime, clock) = new_manual_runtime();
     let settled = Rc::new(Cell::new(false));
+    let seen = Rc::new(RefCell::new(Vec::new()));
 
     // Tiny mailbox so a small burst saturates it. Capacity 2 leaves no spare
     // slot for the Poll continuation once two Admits are queued.
@@ -2826,6 +2829,7 @@ fn poll_continuation_is_not_dropped_when_mailbox_is_saturated() {
         PollLoopBridge {
             in_flight: false,
             settled: Rc::clone(&settled),
+            seen: Rc::clone(&seen),
         },
         TestMailbox::new(mailbox_capacity),
     );
@@ -2861,8 +2865,46 @@ fn poll_continuation_is_not_dropped_when_mailbox_is_saturated() {
         "Poll continuation was dropped on a full mailbox: leased slot never freed (slot leak)"
     );
     assert!(
+        seen.borrow().contains(&BridgeMsg::Poll),
+        "overflowed continuation must be delivered exactly like a mailbox continuation"
+    );
+    assert!(
         !runtime.has_in_flight_calls(),
         "no sleep call should remain in flight once the slot is freed"
+    );
+}
+
+#[test]
+fn overflowed_call_continuation_is_priority_not_fifo_with_mailbox() {
+    let (mut runtime, clock) = new_manual_runtime();
+    let settled = Rc::new(Cell::new(false));
+    let seen = Rc::new(RefCell::new(Vec::new()));
+    let bridge = runtime.register(
+        PollLoopBridge {
+            in_flight: false,
+            settled,
+            seen: Rc::clone(&seen),
+        },
+        TestMailbox::new(2),
+    );
+
+    runtime.try_send(bridge, BridgeMsg::Admit).unwrap();
+    assert_eq!(runtime.step(), 1);
+
+    // Fill the ordinary mailbox before the sleep continuation becomes due.
+    runtime.try_send(bridge, BridgeMsg::Admit).unwrap();
+    runtime.try_send(bridge, BridgeMsg::Admit).unwrap();
+    clock.advance(Duration::from_millis(10));
+
+    // The due Poll cannot fit in the mailbox, so it parks in overflow. Overflow
+    // is a priority liveness lane: it is not FIFO with ordinary ingress.
+    runtime.step();
+    let seen = seen.borrow();
+    assert_eq!(seen[0], BridgeMsg::Admit);
+    assert_eq!(
+        seen[1],
+        BridgeMsg::Poll,
+        "overflowed runtime-call continuation must drain before older ordinary mailbox ingress"
     );
 }
 

@@ -491,9 +491,10 @@ where
     }
 
     pub(crate) fn recv_entry_message(&self, entry_index: usize) -> Option<DeliveredMessage> {
-        // Overflowed continuations drain first: they are older than anything in
-        // the mailbox (the mailbox was full when they arrived) and they keep a
-        // held resource alive, so they must not wait behind newer ingress.
+        // Overflowed continuations drain first. This is an explicit priority
+        // lane, not FIFO with the ordinary mailbox: the mailbox was full when
+        // the continuation arrived, and the continuation keeps a held resource
+        // alive, so liveness wins over ordinary queued ingress.
         if let Some(delivered) = self.entries[entry_index]
             .continuation_overflow
             .borrow_mut()

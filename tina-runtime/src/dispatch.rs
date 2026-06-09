@@ -3773,9 +3773,10 @@ where
     /// only while its `sleep().then(Poll)` self-continuation keeps firing; if
     /// that continuation is dropped on a full mailbox the slot leaks forever.
     /// The overflow takes such continuations instead of dropping them and is
-    /// drained ahead of the mailbox so order is preserved. It is bounded by
-    /// the isolate's own outstanding runtime calls, so it cannot grow without
-    /// bound.
+    /// drained ahead of the mailbox. This is intentionally a priority lane,
+    /// not FIFO with ordinary ingress: the continuation holds runtime-owned
+    /// liveness. It is bounded by the isolate's own outstanding runtime calls,
+    /// so it cannot grow without bound.
     pub(crate) continuation_overflow: RefCell<VecDeque<DeliveredMessage>>,
     pub(crate) handler: RefCell<Box<dyn ErasedHandler<S, F>>>,
 }
