@@ -922,6 +922,71 @@ prompts, and research notes for future remoting/clustering. Do not parallelize
 changes to driver semantics, call vocabulary, runtime capabilities, simulator
 resource semantics, or DST resource-history core.
 
+### Learning from Glommio
+
+Glommio is the closest Rust neighbor to Tina's live-runtime direction:
+thread-per-core, shard-local execution, `io_uring`, per-executor placement,
+task queues, scheduler shares, latency-sensitive work, direct-I/O emphasis, and
+stall detection. Tina should learn from those operator-facing surfaces without
+turning into a generic async task runtime. The Tina-shaped translation is
+"make shard CPU/I/O policy visible and configurable in terms of shards, lanes,
+effects, completions, pressure, and replay truth."
+
+This phase is a planning/evidence slice, not a rewrite. It should first name
+the existing controls and reports that already point this way:
+
+- `ThreadedRuntimeConfig` already has `remote_inbound_drain_budget`,
+  `driver_completion_drain_budget`, `hot_drain_max_rounds`,
+  `hot_drain_max_elapsed`, and `idle_repoll_interval`.
+- `LiveTopologyReport` already names shard workers, configured/observed cores,
+  affinity outcome, ingress queues, remote queues, and resource counts.
+- `FairnessReport` already folds trace progress counts, but does not yet expose
+  live ready-turn lag, handler wall-time stalls, or driver/completion stall
+  counters.
+- Reactor storage already moved the durability read/write/fsync/size path onto
+  the Betelgeuse file rail, leaving only named fallback ops on a bounded worker.
+- `make perf`, perf history, native rows, hot-path rows, allocation evidence,
+  and soak hooks already form the humble performance-proof spine.
+
+Possible implementation slices, in intended order:
+
+1. **SchedulerPolicy / SchedulerReport.** Wrap the existing live scheduling
+   knobs in one public policy/report vocabulary instead of scattering them
+   across config docs. Report, per shard, the configured local/remote/completion
+   drain budgets, hot-drain caps, idle repoll policy, and observed park wakeups.
+   Do not add service-class weights yet; first make the current policy legible.
+2. **Shard-locality ergonomics.** Extend topology/reporting so a live system can
+   answer: which services/isolate groups are on which shard, which remote edges
+   exist, which edges are seeing `Full`/`Closed`, and which resources each shard
+   owns. Add assertion helpers only after specimens need colocated or separated
+   placement. Do not expose arbitrary executor handles as the teaching path.
+3. **Storage visibility.** Split reports for completion-backed storage work and
+   fallback-worker work. Surface storage capacity, depth where honest,
+   accepted/full/closed counts, active write-path locks, fallback-worker usage,
+   durability capability, and direct-I/O/DMA alignment support as `NotClaimed`
+   until real support lands. Add storage perf rows for append/replay/snapshot
+   and file streaming before making storage-performance claims.
+4. **Stall detection.** Add an opt-in live `StallPolicy` for long handler turns,
+   long driver advances, and long completion drains. Emit/report typed stall
+   facts such as handler-stalled, driver-advance-stalled, and
+   completion-drain-stalled. This is the Tina equivalent of Glommio's stall
+   posture: one bad cooperative turn should be visible fast.
+5. **Boring performance evidence.** Expand perf rows so every claimed
+   thread-per-core/completion benefit carries backend, platform/kernel,
+   core-placement, trace mode, p50/p90/p99, allocation, timeout/full, resource
+   leak, and queue-pressure evidence. Keep "no production performance claim"
+   until repeated Linux/macOS rows on stable machines justify changing it.
+
+Explicit non-goals for this phase:
+
+- no generic `Future`/`Stream` runtime surface;
+- no Glommio-style task queues exposed directly to Tina application code;
+- no weighted scheduling before current local/remote/completion policy is
+  observable;
+- no Direct I/O claim without capability reporting, alignment rules, tests, and
+  perf rows;
+- no performance positioning that outruns measured rows.
+
 ## Later capability roadmap
 
 These are real Tina directions, but they should not be treated as launch
@@ -930,6 +995,7 @@ blockers for the first local-runtime story.
 | Phase | Purpose |
 |---|---|
 | **054 userspace TCP research door** | Name the future kernel-bypass/userspace TCP contract and the measurements that would justify it. This is deliberately not an implementation phase: no DPDK, no packet parser, no NIC driver, no launch promise. Kernel TCP plus Betelgeuse's Linux `io_uring` backend stays the real path until evidence says otherwise. |
+| **Learning from Glommio** | Turn Tina's existing thread-per-core/completion-runtime ingredients into explicit operator-facing policy and evidence: scheduler policy/reporting, shard-locality topology, storage visibility, stall detection, and boring perf rows, without adopting a generic async task runtime surface. |
 | **Jan Peter Balkenende remoting** | Tina runtime to Tina runtime over a network with typed, bounded, traceable remote outcomes. |
 | **Mark Rutte clustering** | Membership and placement after remoting is boring, without weakening local boundedness or stale-address semantics. |
 | **Gemini release story** | Prime-time readiness only after Tina is reasonably complete: guides, invariant docs, semver/publication decision, CI/proof gate, public positioning, and adoption story. |
