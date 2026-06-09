@@ -187,7 +187,8 @@ pub enum Http2ClientOutcome {
     /// decoded compactly into gRPC facts — no public `HeaderMap`. `grpc_status`
     /// is the raw wire code (from trailers, or from headers for a trailers-only
     /// response) and `grpc_message` is the still-percent-encoded message, if
-    /// any. Generic HTTP/2 callers keep the full-header [`Replied`] outcome.
+    /// any. Generic HTTP/2 callers keep the full-header [`Replied`](Self::Replied)
+    /// outcome.
     GrpcUnaryReplied {
         status: StatusCode,
         grpc_status: Option<u16>,
