@@ -9,6 +9,10 @@ pub(super) const CLIENT_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 pub(super) const FRAME_HEADER_LEN: usize = 9;
 pub(super) const DEFAULT_WINDOW: i32 = 65_535;
 pub(super) const READ_CHUNK: usize = 16 * 1024;
+
+/// Max queued bytes batched into one socket write. A frame that would overflow
+/// it rides the next write instead — nothing is dropped or reordered.
+pub(super) const WRITE_COALESCE_LIMIT: usize = 64 * 1024;
 pub(super) const WINDOW_CREDIT_FLUSH_THRESHOLD: u32 = 16 * 1024;
 
 pub(super) const FLAG_ACK: u8 = 0x1;

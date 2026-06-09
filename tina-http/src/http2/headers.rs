@@ -10,14 +10,14 @@ use http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
 use super::errors::Http2ProtocolError;
 use crate::HttpResponse;
 
-/// Bounded request-path interner, one per server connection. Warmed routes
-/// repeat the same method path every call; interning hands back a cloned
-/// `Arc<str>` (a refcount bump, no allocation) instead of a fresh owned path.
+/// Bounded request-path cache, one per server connection. Warmed routes repeat
+/// the same method path every call; a hit hands back a cloned `Arc<str>` (a
+/// refcount bump, no allocation) instead of a fresh owned path.
 ///
-/// The cache is explicitly capped: a peer that sends many distinct paths can
-/// fill it but cannot grow it without bound. Once full, new paths are still
-/// served — as a fresh `Arc<str>` that is simply not retained — and counted in
-/// `overflow` so the miss is visible, never silent.
+/// Decode only [`lookup`](Self::lookup)s (read-only); a path is [`remember`](
+/// Self::remember)ed only after its request validates, so a peer cannot fill the
+/// cache with unvalidated paths. The cache is capped: once full, new paths are
+/// still served (uncached) and counted in `overflow`, never grown without bound.
 #[derive(Debug)]
 pub(super) struct PathInternCache {
     entries: Vec<Arc<str>>,
@@ -34,35 +34,44 @@ impl PathInternCache {
         }
     }
 
-    /// Number of distinct paths dropped because the cache was full. Surfaced in
-    /// the connection report so a saturated interner is observable.
+    /// Number of distinct validated paths dropped because the cache was full.
+    /// Surfaced in the connection report so a saturated cache is observable.
     pub(super) fn overflow(&self) -> u64 {
         self.overflow
     }
 
-    /// Return an owned `Arc<str>` for `path`, reusing the cached entry when the
-    /// path has been seen before on this connection. A small connection serves a
-    /// handful of routes, so a linear scan beats hashing here.
-    pub(super) fn intern(&mut self, path: &str) -> Arc<str> {
-        if let Some(found) = self.entries.iter().find(|entry| &***entry == path) {
-            return Arc::clone(found);
+    /// Return the cached `Arc<str>` for `path`, or `None`. Read-only: decode
+    /// looks up without mutating, so an unvalidated request cannot poison the
+    /// cache. A connection serves a handful of routes, so a linear scan wins.
+    pub(super) fn lookup(&self, path: &str) -> Option<Arc<str>> {
+        self.entries
+            .iter()
+            .find(|entry| &***entry == path)
+            .map(Arc::clone)
+    }
+
+    /// Cache a validated request path so later warmed calls reuse it. No-op if
+    /// already present; counts `overflow` once the cap is reached.
+    pub(super) fn remember(&mut self, path: &Arc<str>) {
+        let path_str: &str = path;
+        if self.entries.iter().any(|entry| &**entry == path_str) {
+            return;
         }
-        let interned: Arc<str> = Arc::from(path);
         if self.entries.len() < self.cap {
-            self.entries.push(Arc::clone(&interned));
+            self.entries.push(Arc::clone(path));
         } else {
             self.overflow = self.overflow.saturating_add(1);
         }
-        interned
     }
 }
 
-/// Build an owned request path, interning through `cache` when one is supplied
-/// (the server request path) and falling back to a fresh `Arc` otherwise (the
-/// client response path, which never carries `:path`).
-fn own_request_path(cache: Option<&mut PathInternCache>, value: &str) -> Arc<str> {
+/// Build an owned request path, reusing the cached `Arc` on a hit and falling
+/// back to a fresh `Arc` on a miss (or when no cache is supplied — the client
+/// response path, which never carries `:path`). Never mutates the cache; the
+/// caller caches the path only after the request validates.
+fn own_request_path(cache: Option<&PathInternCache>, value: &str) -> Arc<str> {
     match cache {
-        Some(cache) => cache.intern(value),
+        Some(cache) => cache.lookup(value).unwrap_or_else(|| Arc::from(value)),
         None => Arc::from(value),
     }
 }
@@ -101,6 +110,9 @@ pub(super) struct HeaderBlock {
     /// the compact gRPC client response path can read the final status without
     /// building a public `HeaderMap`. `None` for non-gRPC blocks.
     pub(super) grpc_status: Option<u16>,
+    /// Set once a `grpc-status` header is seen, so duplicates keep the first
+    /// value — matching `HeaderMap::get` on the public path.
+    pub(super) saw_grpc_status: bool,
     /// Raw (still percent-encoded) `grpc-message`, if present. Only gRPC error
     /// responses carry this, so the `String` is allocated only on errors.
     pub(super) grpc_message: Option<String>,
@@ -119,7 +131,7 @@ pub(super) fn decode_headers_block_with(
     decoder: &mut hpack::Decoder<'static>,
     block: &[u8],
     max_header_bytes: usize,
-    path_cache: Option<&mut PathInternCache>,
+    path_cache: Option<&PathInternCache>,
 ) -> Result<HeaderBlock, Http2ProtocolError> {
     decode_headers_block_with_storage(decoder, block, max_header_bytes, true, path_cache)
 }
@@ -128,7 +140,7 @@ pub(super) fn decode_headers_block_compact_with(
     decoder: &mut hpack::Decoder<'static>,
     block: &[u8],
     max_header_bytes: usize,
-    path_cache: Option<&mut PathInternCache>,
+    path_cache: Option<&PathInternCache>,
 ) -> Result<HeaderBlock, Http2ProtocolError> {
     decode_headers_block_with_storage(decoder, block, max_header_bytes, false, path_cache)
 }
@@ -138,14 +150,11 @@ fn decode_headers_block_with_storage(
     block: &[u8],
     max_header_bytes: usize,
     store_regular_headers: bool,
-    mut path_cache: Option<&mut PathInternCache>,
+    path_cache: Option<&PathInternCache>,
 ) -> Result<HeaderBlock, Http2ProtocolError> {
-    if let Some(headers) = decode_fast_literal_headers(
-        block,
-        max_header_bytes,
-        store_regular_headers,
-        path_cache.as_deref_mut(),
-    )? {
+    if let Some(headers) =
+        decode_fast_literal_headers(block, max_header_bytes, store_regular_headers, path_cache)?
+    {
         return Ok(headers);
     }
     let mut out = HeaderBlock::default();
@@ -162,7 +171,7 @@ fn decode_headers_block_with_storage(
             value,
             max_header_bytes,
             store_regular_headers,
-            path_cache.as_deref_mut(),
+            path_cache,
         )?;
     }
     Ok(out)
@@ -179,7 +188,7 @@ fn decode_fast_literal_headers(
     block: &[u8],
     max_header_bytes: usize,
     store_regular_headers: bool,
-    mut path_cache: Option<&mut PathInternCache>,
+    path_cache: Option<&PathInternCache>,
 ) -> Result<Option<HeaderBlock>, Http2ProtocolError> {
     let mut out = HeaderBlock::default();
     let mut cursor = 0;
@@ -202,7 +211,7 @@ fn decode_fast_literal_headers(
             value,
             max_header_bytes,
             store_regular_headers,
-            path_cache.as_deref_mut(),
+            path_cache,
         )?;
     }
     Ok(Some(out))
@@ -281,7 +290,7 @@ fn add_header_with_storage(
     value: &str,
     max_header_bytes: usize,
     store_regular_headers: bool,
-    path_cache: Option<&mut PathInternCache>,
+    path_cache: Option<&PathInternCache>,
 ) -> Result<(), Http2ProtocolError> {
     out.bytes = out
         .bytes
@@ -377,8 +386,16 @@ fn add_header_with_storage(
         }
         // gRPC response facts: a string parse and (only on errors) one owned
         // message. Requests never carry these, so the server path pays nothing.
-        "grpc-status" => out.grpc_status = value.trim().parse::<u16>().ok(),
-        "grpc-message" => out.grpc_message = Some(value.to_owned()),
+        // First value wins, matching `HeaderMap::get` on the public path.
+        "grpc-status" => {
+            if !out.saw_grpc_status {
+                out.saw_grpc_status = true;
+                out.grpc_status = value.trim().parse::<u16>().ok();
+            }
+        }
+        "grpc-message" if out.grpc_message.is_none() => {
+            out.grpc_message = Some(value.to_owned());
+        }
         _ => {}
     }
     if store_regular_headers {
@@ -708,6 +725,34 @@ mod tests {
         validate_request_headers(&decoded).unwrap();
     }
 
+    #[test]
+    fn compact_and_public_agree_on_duplicate_grpc_status_and_message() {
+        // A response carrying duplicate gRPC status/message headers must decode
+        // the same on the compact (SubmitGrpcUnary) path and the public
+        // (Replied) path. The public path reads HeaderMap::get (first value), so
+        // the compact path must also take the first value, not the last.
+        let mut block = Vec::new();
+        encode_literal_header("grpc-status", "5", &mut block);
+        encode_literal_header("grpc-status", "0", &mut block);
+        encode_literal_header("grpc-message", "first", &mut block);
+        encode_literal_header("grpc-message", "second", &mut block);
+
+        let mut decoder = hpack::Decoder::new();
+        let compact = decode_headers_block_compact_with(&mut decoder, &block, 1024, None).unwrap();
+        assert_eq!(compact.grpc_status, Some(5));
+        assert_eq!(compact.grpc_message.as_deref(), Some("first"));
+
+        let mut decoder = hpack::Decoder::new();
+        let public = decode_headers_block_with(&mut decoder, &block, 1024, None).unwrap();
+        let compact_status = crate::grpc::grpc_status_from_compact(
+            compact.grpc_status.unwrap(),
+            compact.grpc_message.as_deref(),
+        );
+        let public_status = crate::grpc::grpc_status_from_header_map(&public.headers).unwrap();
+        assert_eq!(compact_status.code, public_status.code);
+        assert_eq!(compact_status.message, public_status.message);
+    }
+
     fn grpc_block_with_extra_metadata(extra: usize) -> Vec<u8> {
         let mut block = Vec::new();
         encode_literal_header(":method", "POST", &mut block);
@@ -876,54 +921,77 @@ mod tests {
     }
 
     #[test]
-    fn path_intern_cache_reuses_one_arc_for_a_repeated_path() {
+    fn path_cache_lookup_reuses_one_arc_after_remember() {
         let mut cache = PathInternCache::with_capacity(8);
-        let first = cache.intern("/pkg.Service/Unary");
-        let second = cache.intern("/pkg.Service/Unary");
-        // The warmed call must reuse the cached allocation, not rebuild it. If
-        // interning regressed to a fresh owned path per call, these would be
-        // distinct allocations and `ptr_eq` would fail.
-        assert!(Arc::ptr_eq(&first, &second));
-        assert_eq!(&*second, "/pkg.Service/Unary");
+        // A miss before remember; the path is not cached by lookup alone.
+        assert!(cache.lookup("/pkg.Service/Unary").is_none());
+        let arc: Arc<str> = Arc::from("/pkg.Service/Unary");
+        cache.remember(&arc);
+        let hit = cache
+            .lookup("/pkg.Service/Unary")
+            .expect("cached after remember");
+        // The warmed call reuses the cached allocation, not a fresh one.
+        assert!(Arc::ptr_eq(&arc, &hit));
         assert_eq!(cache.overflow(), 0);
     }
 
     #[test]
-    fn path_intern_cache_bounds_distinct_paths_and_counts_overflow() {
+    fn path_cache_bounds_remembered_paths_and_counts_overflow() {
         let mut cache = PathInternCache::with_capacity(2);
-        let a = cache.intern("/a");
-        let _b = cache.intern("/b");
-        // Third distinct path overflows the cap: it is still served correctly,
-        // just not retained, and the miss is counted — never silent, never
+        let a: Arc<str> = Arc::from("/a");
+        cache.remember(&a);
+        cache.remember(&Arc::from("/b"));
+        // Third distinct path overflows the cap: counted, not retained, never
         // unbounded growth.
-        let c = cache.intern("/c");
-        assert_eq!(&*c, "/c");
+        cache.remember(&Arc::from("/c"));
         assert_eq!(cache.overflow(), 1);
-        // A cached path still reuses its slot after the overflow.
-        assert!(Arc::ptr_eq(&a, &cache.intern("/a")));
-        // The overflowed path was not retained, so it rebuilds (and counts again).
-        assert!(!Arc::ptr_eq(&c, &cache.intern("/c")));
-        assert_eq!(cache.overflow(), 2);
+        assert!(cache.lookup("/a").is_some());
+        assert!(cache.lookup("/c").is_none());
+        // Remembering an already-cached path is a no-op.
+        cache.remember(&a);
+        assert_eq!(cache.overflow(), 1);
     }
 
     #[test]
-    fn compact_decode_interns_a_repeated_request_path() {
+    fn compact_decode_reuses_a_remembered_request_path() {
         let block = grpc_request_block("/pkg.Service/Unary");
         let mut cache = PathInternCache::with_capacity(8);
         let mut decoder = hpack::Decoder::new();
-        let first = decode_headers_block_compact_with(&mut decoder, &block, 4096, Some(&mut cache))
-            .unwrap();
+        let first =
+            decode_headers_block_compact_with(&mut decoder, &block, 4096, Some(&cache)).unwrap();
+        let first_path = first.path.expect("first path");
+        // Cache it as the connection does once the request validates.
+        cache.remember(&first_path);
         let mut decoder = hpack::Decoder::new();
         let second =
-            decode_headers_block_compact_with(&mut decoder, &block, 4096, Some(&mut cache))
-                .unwrap();
-        let first_path = first.path.expect("first path");
+            decode_headers_block_compact_with(&mut decoder, &block, 4096, Some(&cache)).unwrap();
         let second_path = second.path.expect("second path");
         assert_eq!(&*second_path, "/pkg.Service/Unary");
-        // The whole decode→intern seam reuses the allocation across calls on one
-        // connection. This is the hard seam the warmed-route requirement needs:
-        // it fails if the decode rebuilds a fresh owned path per request.
+        // The warmed decode reuses the remembered allocation. Fails if the decode
+        // rebuilds a fresh owned path per request.
         assert!(Arc::ptr_eq(&first_path, &second_path));
+        assert_eq!(cache.overflow(), 0);
+    }
+
+    #[test]
+    fn decode_does_not_cache_until_remembered() {
+        // Decode never inserts, so an unvalidated request cannot poison the
+        // cache: two decodes without remember are distinct allocations and the
+        // cache stays empty.
+        let block = grpc_request_block("/svc/M");
+        let cache = PathInternCache::with_capacity(8);
+        let mut decoder = hpack::Decoder::new();
+        let first = decode_headers_block_compact_with(&mut decoder, &block, 4096, Some(&cache))
+            .unwrap()
+            .path
+            .expect("first path");
+        let mut decoder = hpack::Decoder::new();
+        let second = decode_headers_block_compact_with(&mut decoder, &block, 4096, Some(&cache))
+            .unwrap()
+            .path
+            .expect("second path");
+        assert!(!Arc::ptr_eq(&first, &second));
+        assert!(cache.lookup("/svc/M").is_none());
         assert_eq!(cache.overflow(), 0);
     }
 

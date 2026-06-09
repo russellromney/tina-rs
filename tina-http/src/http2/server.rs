@@ -41,9 +41,10 @@ use super::frame::{
     CLIENT_PREFACE, DEFAULT_WINDOW, FLAG_ACK, FLAG_END_HEADERS, FLAG_END_STREAM,
     FRAME_CONTINUATION, FRAME_DATA, FRAME_GOAWAY, FRAME_HEADER_LEN, FRAME_HEADERS, FRAME_PING,
     FRAME_PRIORITY, FRAME_PUSH_PROMISE, FRAME_RST_STREAM, FRAME_SETTINGS, FRAME_WINDOW_UPDATE,
-    Frame, PRIORITY_PAYLOAD_LEN, READ_CHUNK, WINDOW_CREDIT_FLUSH_THRESHOLD, add_window, data_frame,
-    data_payload_view, goaway_frame, headers_frame, headers_payload_view, push_frame_header,
-    push_setting, rst_stream_frame, settings_frame, try_decode_frame_meta, window_update_frame,
+    Frame, PRIORITY_PAYLOAD_LEN, READ_CHUNK, WINDOW_CREDIT_FLUSH_THRESHOLD, WRITE_COALESCE_LIMIT,
+    add_window, data_frame, data_payload_view, goaway_frame, headers_frame, headers_payload_view,
+    push_frame_header, push_setting, rst_stream_frame, settings_frame, try_decode_frame_meta,
+    window_update_frame,
 };
 use super::headers::{
     DEFAULT_HEADER_TABLE_SIZE, HeaderBlock, MAX_MAX_FRAME_SIZE, MIN_MAX_FRAME_SIZE,
@@ -242,8 +243,10 @@ pub enum Http2Outcome {
     LocalCancel(u32),
 }
 
-/// Per-connection report counters.
+/// Per-connection report counters. `#[non_exhaustive]`: it is an output users
+/// read, so new counters can be added without breaking callers.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Http2ConnectionReport {
     pub opened_streams: u64,
     pub closed_streams: u64,
@@ -583,13 +586,16 @@ impl<S: Shard + 'static, M: Http2ServiceMessage> Http2Connection<S, M> {
             return noop();
         }
         if self.pending_write.is_empty() {
-            // Coalesce every queued frame into one socket write. A steady-state
-            // response and its connection window-update then leave in a single
-            // syscall and cost a single write-completion turn instead of two.
-            while let Some(next) = self.write_queue.pop_front() {
-                if self.pending_write.is_empty() {
-                    self.pending_write = next;
-                } else {
+            // Write the first queued buffer, then batch following frames into the
+            // same write while under the coalesce limit. Keeps a response and its
+            // window-update in one write without merging many large buffers.
+            if let Some(first) = self.write_queue.pop_front() {
+                self.pending_write = first;
+                while let Some(next) = self.write_queue.front() {
+                    if self.pending_write.len() + next.len() > WRITE_COALESCE_LIMIT {
+                        break;
+                    }
+                    let next = self.write_queue.pop_front().expect("front just peeked");
                     self.pending_write.extend_from_slice(&next);
                 }
             }
@@ -922,17 +928,22 @@ impl<S: Shard + 'static, M: Http2ServiceMessage> Http2Connection<S, M> {
                 &mut self.hpack_decoder,
                 header_payload,
                 self.limits.max_header_bytes,
-                Some(&mut self.path_cache),
+                Some(&self.path_cache),
             )?
         } else {
             decode_headers_block_with(
                 &mut self.hpack_decoder,
                 header_payload,
                 self.limits.max_header_bytes,
-                Some(&mut self.path_cache),
+                Some(&self.path_cache),
             )?
         };
         validate_request_headers(&headers)?;
+        // Cache the path only now that the request has validated, so a peer
+        // cannot fill the cache with unvalidated paths.
+        if let Some(path) = &headers.path {
+            self.path_cache.remember(path);
+        }
         let grpc = headers.grpc_content_type;
         let end_stream = flags & FLAG_END_STREAM != 0;
         let declared_len = headers.content_length;
@@ -2430,6 +2441,32 @@ mod tests {
             Http2Limits::default(),
             Duration::from_secs(1),
         )
+    }
+
+    #[test]
+    fn write_more_merges_small_frames_but_bounds_large_ones() {
+        // The hot path: a small response and its window-update coalesce into one
+        // write, draining the queue.
+        let mut conn = unit_connection();
+        conn.write_queue.push_back(vec![1u8; 200]);
+        conn.write_queue.push_back(vec![2u8; 13]);
+        let _ = conn.write_more();
+        assert!(
+            conn.write_queue.is_empty(),
+            "small frames coalesce into one write"
+        );
+
+        // The bound: large queued buffers are not all copied into one write.
+        let mut conn = unit_connection();
+        conn.write_queue.push_back(vec![1u8; WRITE_COALESCE_LIMIT]);
+        conn.write_queue.push_back(vec![2u8; 1024]);
+        conn.write_queue.push_back(vec![3u8; WRITE_COALESCE_LIMIT]);
+        let _ = conn.write_more();
+        assert_eq!(
+            conn.write_queue.len(),
+            2,
+            "only the first buffer is written; the rest stay queued"
+        );
     }
 
     #[test]
