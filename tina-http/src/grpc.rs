@@ -1770,20 +1770,18 @@ pub fn encode_grpc_message_into<T: Message>(
     limits: GrpcLimits,
 ) -> Result<(), GrpcError> {
     let len = message.encoded_len();
-    if len > limits.max_message_bytes {
-        return Err(GrpcError::EncodeTooLarge {
-            len,
-            max: limits.max_message_bytes,
-        });
+    // The gRPC length prefix is a 4-byte unsigned int, so the wire cap is
+    // u32::MAX no matter how large the configured limit is — checking only the
+    // configured cap would let an oversized message truncate its length on the
+    // wire. Enforce the smaller of the two.
+    let max = limits.max_message_bytes.min(u32::MAX as usize);
+    if len > max {
+        return Err(GrpcError::EncodeTooLarge { len, max });
     }
-    // Cap is satisfied; size the framed message and reserve only now, so no
-    // large buffer is allocated for an over-cap message.
-    let framed = GRPC_FRAME_HEADER_LEN
-        .checked_add(len)
-        .ok_or(GrpcError::EncodeTooLarge {
-            len,
-            max: limits.max_message_bytes,
-        })?;
+    // Cap is satisfied (len <= u32::MAX), so the length cast below is exact and
+    // the framed size cannot overflow. Reserve only now, so no large buffer is
+    // allocated for an over-cap message.
+    let framed = GRPC_FRAME_HEADER_LEN + len;
     out.reserve(framed);
     out.push(0);
     out.extend_from_slice(&(len as u32).to_be_bytes());
@@ -2408,6 +2406,49 @@ mod tests {
         let err = encode_grpc_message(&Ping { value: u64::MAX }, limits)
             .expect_err("message exceeds cap");
         assert!(matches!(err, GrpcError::EncodeTooLarge { max: 1, .. }));
+    }
+
+    // The gRPC length prefix is u32, so a message over u32::MAX cannot be framed
+    // even with a larger configured cap; it must be rejected, not truncated. The
+    // bug only exists where usize > u32, i.e. 64-bit targets.
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn encode_grpc_message_rejects_message_over_u32_wire_cap() {
+        #[derive(Debug, Default)]
+        struct HugeMessage;
+        impl Message for HugeMessage {
+            fn encode_raw(&self, _buf: &mut impl prost::bytes::BufMut) {
+                unreachable!("must be rejected before encoding");
+            }
+            fn merge_field(
+                &mut self,
+                _tag: u32,
+                _wire_type: prost::encoding::WireType,
+                _buf: &mut impl prost::bytes::Buf,
+                _ctx: prost::encoding::DecodeContext,
+            ) -> Result<(), prost::DecodeError> {
+                Ok(())
+            }
+            fn encoded_len(&self) -> usize {
+                (u32::MAX as usize) + 1
+            }
+            fn clear(&mut self) {}
+        }
+
+        // Configured cap is above the wire cap; the wire cap must still win.
+        let limits = GrpcLimits {
+            max_message_bytes: usize::MAX,
+            ..Default::default()
+        };
+        let mut out = Vec::new();
+        let err = encode_grpc_message_into(&mut out, &HugeMessage, limits)
+            .expect_err("message exceeds the u32 wire cap");
+        assert!(
+            matches!(err, GrpcError::EncodeTooLarge { max, .. } if max == u32::MAX as usize),
+            "must report the wire cap, got {err:?}"
+        );
+        assert!(out.is_empty());
+        assert_eq!(out.capacity(), 0, "must not allocate before rejecting");
     }
 
     #[test]
