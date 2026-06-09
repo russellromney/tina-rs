@@ -258,7 +258,8 @@ fn handle_connection(
                 // like a fake next response. The reusable client must
                 // detect the over-send and retire the socket.
                 response.extend_from_slice(b"Content-Length: 5\r\n\r\n");
-                response.extend_from_slice(b"helloHTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\nstale!");
+                response
+                    .extend_from_slice(b"helloHTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\nstale!");
             }
             _ => {
                 let body = b"ok";
