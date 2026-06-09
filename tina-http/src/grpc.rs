@@ -1719,8 +1719,9 @@ pub fn encode_grpc_message<T: Message>(
     message: &T,
     limits: GrpcLimits,
 ) -> Result<Vec<u8>, GrpcError> {
-    // The message length is known, so the buffer is sized exactly once.
-    let mut out = Vec::with_capacity(GRPC_FRAME_HEADER_LEN + message.encoded_len());
+    // Start empty so an over-cap message is rejected before any allocation;
+    // `encode_grpc_message_into` reserves the exact size after its cap check.
+    let mut out = Vec::new();
     encode_grpc_message_into(&mut out, message, limits)?;
     Ok(out)
 }
@@ -1749,7 +1750,15 @@ pub fn encode_grpc_message_into<T: Message>(
             max: limits.max_message_bytes,
         });
     }
-    out.reserve(GRPC_FRAME_HEADER_LEN + len);
+    // Cap is satisfied; size the framed message and reserve only now, so no
+    // large buffer is allocated for an over-cap message.
+    let framed = GRPC_FRAME_HEADER_LEN
+        .checked_add(len)
+        .ok_or(GrpcError::EncodeTooLarge {
+            len,
+            max: limits.max_message_bytes,
+        })?;
+    out.reserve(framed);
     out.push(0);
     out.extend_from_slice(&(len as u32).to_be_bytes());
     message.encode(out).map_err(|_| GrpcError::BadFrame)
@@ -2345,6 +2354,33 @@ mod tests {
             GrpcBufferedServerStreamingResponse::from_messages([Ping { value: u64::MAX }], limits)
                 .expect_err("message exceeds cap");
 
+        assert!(matches!(err, GrpcError::EncodeTooLarge { max: 1, .. }));
+    }
+
+    #[test]
+    fn encode_grpc_message_into_rejects_over_cap_before_allocating() {
+        let limits = GrpcLimits {
+            max_message_bytes: 1,
+            ..Default::default()
+        };
+        let mut out = Vec::new();
+        let err = encode_grpc_message_into(&mut out, &Ping { value: u64::MAX }, limits)
+            .expect_err("message exceeds cap");
+        assert!(matches!(err, GrpcError::EncodeTooLarge { max: 1, .. }));
+        // The cap must bound real work: nothing framed, and — the bug this
+        // guards — no buffer reserved before the check.
+        assert!(out.is_empty());
+        assert_eq!(out.capacity(), 0, "must not allocate before the cap check");
+    }
+
+    #[test]
+    fn encode_grpc_message_rejects_over_cap() {
+        let limits = GrpcLimits {
+            max_message_bytes: 1,
+            ..Default::default()
+        };
+        let err = encode_grpc_message(&Ping { value: u64::MAX }, limits)
+            .expect_err("message exceeds cap");
         assert!(matches!(err, GrpcError::EncodeTooLarge { max: 1, .. }));
     }
 

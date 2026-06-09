@@ -16,13 +16,14 @@ use crate::HttpResponse;
 ///
 /// Decode only [`lookup`](Self::lookup)s (read-only); a path is [`remember`](
 /// Self::remember)ed only after its request validates, so a peer cannot fill the
-/// cache with unvalidated paths. The cache is capped: once full, new paths are
-/// still served (uncached) and counted in `overflow`, never grown without bound.
+/// cache with unvalidated paths. The cache is capped and uses least-recently-used
+/// admission: once full it evicts the oldest entry, so a warmed route is still
+/// admitted under a flood of one-shot paths. `entries[0]` is most-recently-used.
 #[derive(Debug)]
 pub(super) struct PathInternCache {
     entries: Vec<Arc<str>>,
     cap: usize,
-    overflow: u64,
+    evictions: u64,
 }
 
 impl PathInternCache {
@@ -30,14 +31,14 @@ impl PathInternCache {
         Self {
             entries: Vec::new(),
             cap,
-            overflow: 0,
+            evictions: 0,
         }
     }
 
-    /// Number of distinct validated paths dropped because the cache was full.
-    /// Surfaced in the connection report so a saturated cache is observable.
-    pub(super) fn overflow(&self) -> u64 {
-        self.overflow
+    /// Number of cached paths evicted because the cache was full. Surfaced in
+    /// the connection report so a churning, saturated cache is observable.
+    pub(super) fn evictions(&self) -> u64 {
+        self.evictions
     }
 
     /// Return the cached `Arc<str>` for `path`, or `None`. Read-only: decode
@@ -50,18 +51,23 @@ impl PathInternCache {
             .map(Arc::clone)
     }
 
-    /// Cache a validated request path so later warmed calls reuse it. No-op if
-    /// already present; counts `overflow` once the cap is reached.
+    /// Cache a validated request path so later warmed calls reuse it. Already
+    /// present: mark it most-recently-used. Absent and full: evict the
+    /// least-recently-used entry so the warmed route is admitted.
     pub(super) fn remember(&mut self, path: &Arc<str>) {
         let path_str: &str = path;
-        if self.entries.iter().any(|entry| &**entry == path_str) {
+        if let Some(pos) = self.entries.iter().position(|entry| &**entry == path_str) {
+            if pos != 0 {
+                let entry = self.entries.remove(pos);
+                self.entries.insert(0, entry);
+            }
             return;
         }
-        if self.entries.len() < self.cap {
-            self.entries.push(Arc::clone(path));
-        } else {
-            self.overflow = self.overflow.saturating_add(1);
+        if self.entries.len() >= self.cap {
+            self.entries.pop();
+            self.evictions = self.evictions.saturating_add(1);
         }
+        self.entries.insert(0, Arc::clone(path));
     }
 }
 
@@ -932,24 +938,45 @@ mod tests {
             .expect("cached after remember");
         // The warmed call reuses the cached allocation, not a fresh one.
         assert!(Arc::ptr_eq(&arc, &hit));
-        assert_eq!(cache.overflow(), 0);
+        assert_eq!(cache.evictions(), 0);
     }
 
     #[test]
-    fn path_cache_bounds_remembered_paths_and_counts_overflow() {
+    fn path_cache_evicts_least_recently_used_when_full() {
         let mut cache = PathInternCache::with_capacity(2);
-        let a: Arc<str> = Arc::from("/a");
-        cache.remember(&a);
-        cache.remember(&Arc::from("/b"));
-        // Third distinct path overflows the cap: counted, not retained, never
-        // unbounded growth.
-        cache.remember(&Arc::from("/c"));
-        assert_eq!(cache.overflow(), 1);
-        assert!(cache.lookup("/a").is_some());
+        cache.remember(&Arc::from("/a")); // [a]
+        cache.remember(&Arc::from("/b")); // [b, a]
+        // Full: the next distinct path evicts the LRU entry (/a), not the new one.
+        cache.remember(&Arc::from("/c")); // evict a -> [c, b]
+        assert_eq!(cache.evictions(), 1);
+        assert!(cache.lookup("/a").is_none());
+        assert!(cache.lookup("/b").is_some());
+        assert!(cache.lookup("/c").is_some());
+        // Re-remembering /b marks it most-recently-used, so the next eviction
+        // takes /c instead.
+        cache.remember(&Arc::from("/b")); // [b, c]
+        cache.remember(&Arc::from("/d")); // evict c -> [d, b]
+        assert_eq!(cache.evictions(), 2);
         assert!(cache.lookup("/c").is_none());
-        // Remembering an already-cached path is a no-op.
-        cache.remember(&a);
-        assert_eq!(cache.overflow(), 1);
+        assert!(cache.lookup("/b").is_some());
+    }
+
+    #[test]
+    fn path_cache_admits_warmed_route_under_path_churn() {
+        // The adversarial case: a flood of distinct one-shot paths fills the
+        // cache, then a real warmed route arrives. LRU admission must still cache
+        // it so the next call reuses it — a full cache cannot lock it out.
+        let mut cache = PathInternCache::with_capacity(4);
+        for i in 0..4 {
+            cache.remember(&Arc::from(format!("/junk{i}").as_str()));
+        }
+        assert!(cache.lookup("/real").is_none());
+        let real: Arc<str> = Arc::from("/real");
+        cache.remember(&real);
+        let hit = cache
+            .lookup("/real")
+            .expect("warmed route admitted under churn");
+        assert!(Arc::ptr_eq(&real, &hit));
     }
 
     #[test]
@@ -970,7 +997,7 @@ mod tests {
         // The warmed decode reuses the remembered allocation. Fails if the decode
         // rebuilds a fresh owned path per request.
         assert!(Arc::ptr_eq(&first_path, &second_path));
-        assert_eq!(cache.overflow(), 0);
+        assert_eq!(cache.evictions(), 0);
     }
 
     #[test]
@@ -992,7 +1019,7 @@ mod tests {
             .expect("second path");
         assert!(!Arc::ptr_eq(&first, &second));
         assert!(cache.lookup("/svc/M").is_none());
-        assert_eq!(cache.overflow(), 0);
+        assert_eq!(cache.evictions(), 0);
     }
 
     #[test]

@@ -257,10 +257,10 @@ pub struct Http2ConnectionReport {
     pub goaway_sent: u64,
     pub late_replies_after_close: u64,
     pub rapid_reset_goaway: u64,
-    /// Distinct request paths dropped because the per-connection intern cache
-    /// was full. Non-zero means a peer sent more distinct paths than the cap;
-    /// those calls still ran, just without a cached path.
-    pub path_intern_overflow: u64,
+    /// Cached request paths evicted because the per-connection path cache was
+    /// full. Non-zero means more distinct paths than the cap churned through;
+    /// the calls still ran, the cache just evicted least-recently-used entries.
+    pub path_cache_evictions: u64,
 }
 
 /// Per-stream report snapshot.
@@ -564,8 +564,8 @@ impl<S: Shard + 'static, M: Http2ServiceMessage> Isolate for Http2Connection<S, 
                 self.handle_request_body_next(stream_id, call)
             }
             Http2ConnectionMsg::Report => {
-                // Fold the live interner overflow into the report snapshot.
-                self.report.path_intern_overflow = self.path_cache.overflow();
+                // Fold the live path-cache eviction count into the snapshot.
+                self.report.path_cache_evictions = self.path_cache.evictions();
                 call.reply(Http2ConnectionReply::Report(self.report.clone()))
             }
             _ => call.reject(tina::CallRejectedReason::UnsupportedMessage),
