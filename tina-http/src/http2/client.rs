@@ -2865,7 +2865,7 @@ mod tests {
     fn tls_target_route_key_distinguishes_distinct_root_sets() {
         // Two TLS targets with the same authority / server_name / alpn
         // but different trust roots must NOT collide on the route key.
-        // Without this property, Phase 119 pooling would share a
+        // Without this property, connection pooling would share a
         // connection across security boundaries.
         let mk = |roots: Vec<Vec<u8>>| Http2Target::Tls {
             authority: "x".into(),

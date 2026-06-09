@@ -1720,10 +1720,9 @@ pub fn encode_grpc_message<T: Message>(
 /// so an over-cap message fails with [`GrpcError::EncodeTooLarge`] and leaves
 /// `out` untouched.
 ///
-/// Note on hot paths: a single request/response body that is then *moved* into
-/// a message crossing an isolate boundary cannot be pool-reused — it travels
-/// with the message. The reuse benefit here is for multi-message framing and
-/// for caller-held scratch buffers, not for shrinking a single shipped body.
+/// The reuse helps for multi-message framing and caller-held scratch buffers. A
+/// single body that is moved into a message crossing an isolate boundary travels
+/// with the message and cannot be pool-reused.
 pub fn encode_grpc_message_into<T: Message>(
     out: &mut Vec<u8>,
     message: &T,

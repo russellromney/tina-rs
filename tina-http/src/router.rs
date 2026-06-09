@@ -24,8 +24,6 @@
 //! Stateless. No middleware. No path params. For stateful routes the
 //! user writes `match (request.method, request.path.as_str())` in
 //! their service handler — same shape, slightly more code per arm.
-//! For routes that forward to another isolate (e.g., upstream HTTP),
-//! see the connection-isolate service-shape note in the phase plan.
 
 use http::Method;
 

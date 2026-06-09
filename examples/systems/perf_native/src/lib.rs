@@ -2228,11 +2228,9 @@ fn grpc_unary_with_client(
 }
 
 /// Counts runtime turns for one warmed gRPC unary call. Armed only around the
-/// measured call, so warmup and teardown turns are excluded. The same trace
-/// events the runtime already emits drive the count, so "turn" means the same
-/// thing here as in every other hotpath probe: one delivered handler dispatch
-/// (`HandlerStarted`). Service-isolate calls (`CallKind::IsolateCall`) are the
-/// policy-boundary crossings.
+/// measured call, so warmup and teardown are excluded. A "turn" is one
+/// `HandlerStarted` event (as in every hotpath probe); a `CallKind::IsolateCall`
+/// is a policy-boundary crossing.
 struct GrpcUnaryTurnObserver {
     armed: AtomicBool,
     handler_turns: AtomicU64,
@@ -2649,8 +2647,8 @@ struct WsApp {
     overfill_bytes: usize,
     pressure_count: Arc<AtomicU64>,
     // Counts every app-handler delivery (one increment per message the
-    // connection owner delivers). Used by the Rock 5 turn-count probe to
-    // prove one app turn per wire event after the duplicate-delivery removal.
+    // connection owner delivers). Used by the turn-count probe to prove one app
+    // turn per wire event after the duplicate-delivery removal.
     app_turns: Arc<AtomicU64>,
 }
 
@@ -2968,7 +2966,7 @@ fn websocket_steady_state_small_row() -> anyhow::Result<PerfReport> {
     ))
 }
 
-/// Rock 5 turn-count probe: drive `messages` text round trips over one warmed
+/// Turn-count probe: drive `messages` text round trips over one warmed
 /// WebSocket connection and return the total app-handler delivery count for the
 /// whole session (open handshake + each text + close).
 ///
@@ -3076,8 +3074,8 @@ pub fn websocket_capacity_fill_probe() -> anyhow::Result<LoadReport> {
 /// The connection and HPACK state are warmed first, so the measured window is
 /// steady-state request/response work only — no listener startup, no first-time
 /// allocator growth. This isolates the server's per-response framing cost (plus
-/// the constant raw-client cost), which is what the Phase 152 buffered-response
-/// rewrite reduces: one fewer body-sized allocation per DATA frame.
+/// the constant raw-client cost), which the buffered-response framing reduces:
+/// one fewer body-sized allocation per DATA frame.
 pub fn http2_steady_state_response_process_allocations(requests: usize) -> anyhow::Result<u64> {
     let (runtime, listener, addr) = start_h2_server(small_body())?;
     let expected = small_body().len();

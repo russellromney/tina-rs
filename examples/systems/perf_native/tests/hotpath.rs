@@ -91,17 +91,18 @@ const HTTP_STEADY_STAGE_CEILING: usize = 36;
 //
 // The count is dominated by the Rust code path (one `alloc` per `Vec`, and the
 // perf allocator counts each `Vec` growth realloc too) and is stable across
-// repeated runs on this toolchain. The arc, on macOS/aarch64:
-//   Phase 152 (one fewer DATA copy):           3075 (48.05/request)
-//   Phase 153 leaf copies (body clone gone):   3011 (47.05/request)
-//   Phase 153 structural (decode + coalesce):  2626 (41.03/request)
-//   Phase 153 header encode (presize + itoa):  2434 (38.03/request)
+// repeated runs on this toolchain. The arc that brought it down, on
+// macOS/aarch64:
+//   one fewer DATA copy:           3075 (48.05/request)
+//   body clone gone:               3011 (47.05/request)
+//   borrowed decode + coalesce:    2626 (41.03/request)
+//   presized header encode + itoa: 2434 (38.03/request)
 // The structural work removed the inbound HEADERS frame-decode `Vec` (the read
 // loop decodes from a borrowed buffer slice), coalesced the response HEADERS +
 // DATA into one queued write (per-frame encode `Vec`s and a write turn gone),
 // and pre-sized the response header block while formatting content-length into
 // a stack buffer (no growth reallocs, no `String`): ~10 fewer allocations per
-// request, ~20.8% off the Phase 152 baseline. The ceiling sits just above the
+// request, ~20.8% off the starting point. The ceiling sits just above the
 // measured 2434 so a regression that re-adds a per-request allocation fails,
 // with headroom for toolchain/std drift. Regression guard, not a cross-platform
 // invariant. Linux/x86_64 has a slightly higher steady count on the same code
@@ -111,11 +112,11 @@ const H2_BUFFERED_RESPONSE_ALLOC_CEILING_MACOS_AARCH64: u64 = 2_480;
 const H2_BUFFERED_RESPONSE_ALLOC_CEILING_LINUX_X86_64: u64 = 2_640;
 const H2_BUFFERED_RESPONSE_ALLOC_CEILING_OTHER: u64 = 2_800;
 const H2_BUFFERED_RESPONSE_REQUESTS: usize = 64;
-// Rock 5 (fewer turns): a WebSocket session of N text round trips. The
-// duplicate-delivery removal means the connection owner emits one app event per
-// wire event, so total app deliveries for the session are far below the old
-// `2 * N` text turns alone. The ceiling sits below `2 * N` so the pre-dedup
-// path (which delivered a session-rich AND a legacy event per frame) fails.
+// Fewer turns: a WebSocket session of N text round trips. The duplicate-delivery
+// removal means the connection owner emits one app event per wire event, so
+// total app deliveries for the session are far below the old `2 * N` text turns
+// alone. The ceiling sits below `2 * N` so the pre-dedup path (which delivered a
+// session-rich AND a legacy event per frame) fails.
 const WS_TURN_PROBE_MESSAGES: usize = 64;
 
 type Runtime = ThreadedRuntime<SingleShard, DefaultThreadedMailboxFactory>;
@@ -1319,7 +1320,7 @@ fn hotpath_probes_report_and_stay_bounded() {
         CALL_PROCESS_ALLOCATIONS_CEILING
     );
 
-    // Phase 152 buffered-response framing: whole-process allocations for warmed
+    // Buffered-response framing: whole-process allocations for warmed
     // h2c responses on a reused connection. Runs here (single-test binary) so
     // the process counter is not contaminated by a parallel test thread.
     let h2_buffered_allocs =
@@ -1335,7 +1336,7 @@ fn hotpath_probes_report_and_stay_bounded() {
         "h2c buffered response allocations {h2_buffered_allocs} exceeded ceiling {h2_alloc_ceiling} ({per_request:.2}/request)",
     );
 
-    // Rock 5: app-handler turns for a WebSocket session of N text round trips.
+    // App-handler turns for a WebSocket session of N text round trips.
     // With one session-rich event per wire event, the whole session (open +
     // N texts + close) costs ~N+a-few app turns; the pre-dedup path delivered a
     // session-rich AND a legacy event for every wire frame, so its text turns
@@ -1356,11 +1357,9 @@ fn hotpath_probes_report_and_stay_bounded() {
         "WebSocket app turns {ws_app_turns} not below the pre-dedup 2*N={turn_ceiling}; duplicate delivery may have returned",
     );
 
-    // Warmed gRPC unary turn count: the runtime turns one steady-state unary
-    // call costs across client, server, and gRPC router (one shared runtime).
-    // The same `HandlerStarted` definition as every other hotpath row. This is
-    // the diagnostic baseline for the protocol-turn work; the saved timeline
-    // lives beside the phase plan.
+    // Runtime turns one warmed unary call costs across client, server, and the
+    // gRPC router (one shared runtime). Same `HandlerStarted` definition as
+    // every other hotpath row.
     let grpc_turns = grpc_unary_warmed_turn_report().expect("measure warmed grpc unary turns");
     println!(
         "perf-grpc-unary-turns handler_turns={} service_calls={}",
@@ -1369,16 +1368,14 @@ fn hotpath_probes_report_and_stay_bounded() {
     for line in &grpc_turns.timeline {
         println!("  {line}");
     }
-    // Four service-isolate calls are the policy boundaries (host->client
-    // connection, client->server I/O hops, server->gRPC router). They must stay.
+    // The four service-isolate calls are policy boundaries and must stay.
     assert!(
         grpc_turns.service_calls >= 4,
         "warmed gRPC unary must keep its policy-boundary service calls: {} < 4",
         grpc_turns.service_calls,
     );
-    // Regression guard on total turns. The measured baseline is 17; the ceiling
-    // catches a regression that adds protocol/runtime hops without pretending a
-    // single noisy run is exact.
+    // Ceiling on total turns: catches a change that adds protocol/runtime hops.
+    // The baseline is 17; the headroom allows for run-to-run noise.
     assert!(
         grpc_turns.handler_turns <= 20,
         "warmed gRPC unary handler turns {} exceeded the ceiling of 20",
