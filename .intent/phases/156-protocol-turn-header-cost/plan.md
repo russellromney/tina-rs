@@ -135,8 +135,9 @@ Required changes:
 Acceptance proof:
 
 - A warmed unary route and a warmed streaming route both use the compact path.
-- The test must fail if the route path is rebuilt into a fresh `String` for the
-  handler on each request.
+- Add a focused allocation probe around a warmed route dispatch. It must fail if
+  the handler request rebuilds the method path into a fresh owned `String` per
+  request. Do not prove this only by code inspection.
 
 ### 4. Reduce client response header allocation for gRPC
 
@@ -152,6 +153,8 @@ Required changes:
 - Add a compact gRPC response-head/trailer fact path for `GrpcClient` use.
 - Avoid cloning a full `HeaderMap` for unary gRPC when the caller only asks for
   `GrpcUnaryOutcome`.
+- The compact receive path should hang off gRPC-shaped client calls such as
+  `SubmitGrpcUnary`, not by weakening generic `Http2ClientOutcome`.
 - Keep generic `Http2ClientOutcome::Replied(Http2ClientResponse { headers, ... })`
   working unchanged for ordinary HTTP/2 users.
 - Keep streamed HTTP/2 response heads public when the user opens a generic
@@ -198,6 +201,8 @@ Required changes:
   - no response may borrow a scratch buffer after it is enqueued
   - if a response buffer leaves the isolate, the scratch slot must be replaced
     with an empty/reused buffer explicitly
+  - any reusable/pool storage must have an explicit service-owned cap and a
+    visible `Full` / `ResourceExhausted` path; no hidden growing response pool
 - Keep simple public helpers as wrappers over the reusable path, not separate
   hot paths.
 - Keep message-size caps enforced before committing unbounded allocation.
@@ -238,6 +243,15 @@ Bad targets:
 - bypassing service mailbox capacity
 - converting timeout/full/closed/rejected into one generic success/error
 
+Turn-count proof rules:
+
+- Count turns from stable runtime trace events or an existing hotpath probe that
+  records actual handler/protocol dispatches.
+- Save the before and after timeline text in this phase folder.
+- Do not change the definition of "turn" between before and after.
+- Do not count only the host thread. The worker/protocol/service side is the
+  cost being attacked.
+
 Done means:
 
 - at least one warmed protocol row has fewer protocol/app turns than before,
@@ -247,6 +261,8 @@ Done means:
   boundary, the PR must reduce turns in warmed gRPC streaming or HTTP/2 small
   steady-state instead, and must name the exact future runtime primitive needed
   for unary.
+- WebSocket turn wins do not count for this phase. The turn-count win must come
+  from HTTP/2 or gRPC.
 
 ### 8. Hard performance proof
 
@@ -284,6 +300,8 @@ Targets:
   workload
 - at least one protocol/app turn-count row must improve; otherwise the PR is not
   done
+- save raw output and parsed summaries under
+  `.intent/phases/156-protocol-turn-header-cost/`
 
 If Linux cannot run, leave the PR draft. Do not call Phase 156 complete.
 
@@ -326,6 +344,8 @@ If Linux cannot run, leave the PR draft. Do not call Phase 156 complete.
 - gRPC client compact receive path still reports status/trailer errors.
 - Raw wire tests cover malformed request headers; do not rely only on native
   clients, because native clients refuse to build some bad input.
+- Public docs/examples that mention `GrpcRequest.path` compile and show the new
+  copied shape if the type changes.
 
 ### Commands
 
@@ -350,8 +370,9 @@ Run full proof before merge:
 make proof-fast
 ```
 
-Run Linux/x86 perf evidence through the existing `examples/systems/perf_native`
-Linux workflow/Fly path and save the output in this phase folder.
+Run Linux/x86 perf evidence through `examples/systems/perf_native/fly/` or the
+manual Linux perf workflow. Save the raw command output and parsed rows in this
+phase folder.
 
 ## Files Likely To Change
 

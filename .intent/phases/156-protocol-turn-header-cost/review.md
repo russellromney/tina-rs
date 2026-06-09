@@ -54,3 +54,42 @@ without cheating by using only preframed fixed-payload rows.
 
 Plan updated. It is implementation-ready and grug enough: exact files, exact hot
 spots, hard proof, and no planning/audit work left inside the phase.
+
+## Plan Review 2
+
+Reviewer: Codex
+
+### [P2] Turn-count proof could be gamed by changing the definition
+
+The plan required a lower turn count but did not pin what counted as a turn.
+An implementation could add a new metric, count only the host thread, or change
+the probe between before/after. The plan now requires stable runtime trace or
+existing hotpath probe evidence, saved before/after timelines, and the same
+definition on both sides. WebSocket turn wins do not count for this HTTP/2/gRPC
+phase.
+
+### [P2] Method-path allocation proof was too hand-wavy
+
+"The test must fail if a String is rebuilt" is a wish unless the test observes
+allocation or a hard seam. The plan now requires a focused warmed route-dispatch
+allocation probe, not code inspection.
+
+### [P2] Dynamic response buffer reuse could hide an unbounded pool
+
+The first plan allowed a "bounded owned-buffer pool" phrase but did not require
+the cap or failure path. The plan now says any reusable/pool storage must have
+an explicit service-owned cap and visible `Full` / `ResourceExhausted` behavior.
+
+### [P3] Compact gRPC client receive could weaken generic HTTP/2 outcomes
+
+The client-header reduction could be implemented by deleting public headers from
+generic `Http2ClientOutcome`. The plan now pins the compact receive path to
+gRPC-shaped client calls such as `SubmitGrpcUnary`; generic HTTP/2 outcomes keep
+their public headers.
+
+### [P3] Linux evidence needed a concrete artifact home
+
+The first plan said "existing workflow/Fly path" without naming where proof
+lives. The plan now points at `examples/systems/perf_native/fly/` or the manual
+Linux perf workflow and requires raw output plus parsed summaries under the
+phase folder.
