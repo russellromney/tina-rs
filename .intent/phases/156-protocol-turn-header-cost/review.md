@@ -326,3 +326,44 @@ generic HTTP/2 is untouched. See `perf_sample_macos_partial.txt`.
 - Full `tina-http` suite green (592 tests); fmt + clippy clean (lib + perf
   example). The pool health classifier treats `GrpcUnaryReplied` as healthy, like
   `Replied`.
+
+## Implementation Note 5 (Session A — item 7 diagnostic; reduction is partial)
+
+### What changed
+
+Added a warmed gRPC unary **turn probe**: `grpc_unary_warmed_turn_report()` in
+the perf lib runs one steady-state unary call on a single runtime carrying the
+gRPC server, the gRPC router, and the native client, with a live `TraceObserver`
+armed only around the measured call. It counts `HandlerStarted` turns and
+`CallKind::IsolateCall` policy crossings — the same "turn" definition every other
+hotpath row uses. The `perf-grpc-unary-turns` hotpath row prints the count and
+per-event timeline and guards `service_calls >= 4` (policy boundaries stay) and
+`handler_turns <= 20` (regression ceiling on the measured baseline of 17). The
+full timeline + analysis is saved in `grpc_unary_turn_timeline.txt`.
+
+### What the timeline shows
+
+Warmed unary = **17 handler turns, 4 service-isolate calls**. The 4 service calls
+are the required policy boundaries (host->client connection, the I/O-hop calls,
+server->gRPC router). The remaining turns are genuine cross-thread **I/O hops**:
+the client (isolate 9) and server (isolate 12) connections alternate as TCP
+segments cross loopback, each readiness wake one worker turn. After item 2
+removed the public-`HttpRequest` rebuild, there is no shape-conversion
+continuation left to delete on the buffered unary path — the request is
+dispatched in the server read turn and the response framed in the router-reply
+turn.
+
+### Honest status: this item is NOT fully done
+
+The plan requires an **actual** turn reduction (unary preferred, else streaming
+or HTTP/2 steady-state). What is landed: the probe, the saved before timeline,
+and the analysis showing warmed unary is policy/I-O bound, plus the exact future
+runtime primitive that unary needs — a **same-worker co-located protocol-service
+call** (deliver the decoded request to the router and pull its reply within one
+worker turn when both live on the same shard, while still charging mailbox
+capacity, timeout, and the `IsolateCall` trace fact). That is a runtime scheduler
+primitive, not protocol code, so it is out of this phase's scope.
+
+What is NOT landed: an actual turn drop in warmed gRPC streaming or HTTP/2
+small steady-state. That is the remaining work for item 7, alongside the full
+macOS+Linux 3x3 perf for item 8. The PR stays a draft.

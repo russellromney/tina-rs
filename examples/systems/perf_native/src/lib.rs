@@ -9,7 +9,7 @@ use std::cell::Cell;
 use std::convert::Infallible;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -35,8 +35,9 @@ use tina_proof_harness::{
     PerfComparisonReport, PerfReport, SemanticMatch, SurfacePlateau, UnavailableSurface,
 };
 use tina_runtime::{
-    CallOutcome, DefaultThreadedMailboxFactory, ServicePressureReport, ThreadedRuntime,
-    ThreadedRuntimeConfig, ThreadedSendObservedError, call,
+    CallKind, CallOutcome, DefaultThreadedMailboxFactory, RuntimeEvent, RuntimeEventKind,
+    ServicePressureReport, ThreadedRuntime, ThreadedRuntimeConfig, ThreadedSendObservedError,
+    TraceObserver, call,
 };
 use tokio::net::TcpListener;
 use tokio::runtime::Builder;
@@ -2224,6 +2225,112 @@ fn grpc_unary_with_client(
         GrpcUnaryOutcome::Ok(reply) if reply.value == 42 => Ok(()),
         other => anyhow::bail!("unexpected warmed grpc outcome: {other:?}"),
     }
+}
+
+/// Counts runtime turns for one warmed gRPC unary call. Armed only around the
+/// measured call, so warmup and teardown turns are excluded. The same trace
+/// events the runtime already emits drive the count, so "turn" means the same
+/// thing here as in every other hotpath probe: one delivered handler dispatch
+/// (`HandlerStarted`). Service-isolate calls (`CallKind::IsolateCall`) are the
+/// policy-boundary crossings.
+struct GrpcUnaryTurnObserver {
+    armed: AtomicBool,
+    handler_turns: AtomicU64,
+    service_calls: AtomicU64,
+    timeline: Mutex<Vec<String>>,
+}
+
+impl GrpcUnaryTurnObserver {
+    fn new() -> Self {
+        Self {
+            armed: AtomicBool::new(false),
+            handler_turns: AtomicU64::new(0),
+            service_calls: AtomicU64::new(0),
+            timeline: Mutex::new(Vec::new()),
+        }
+    }
+}
+
+impl TraceObserver for GrpcUnaryTurnObserver {
+    fn on_event(&self, event: &RuntimeEvent) {
+        if !self.armed.load(Ordering::Relaxed) {
+            return;
+        }
+        match event.kind() {
+            RuntimeEventKind::HandlerStarted => {
+                self.handler_turns.fetch_add(1, Ordering::Relaxed);
+                self.timeline
+                    .lock()
+                    .expect("turn timeline")
+                    .push(format!("turn      isolate={:?}", event.isolate()));
+            }
+            RuntimeEventKind::CallDispatchAttempted {
+                call_kind: CallKind::IsolateCall,
+                ..
+            } => {
+                self.service_calls.fetch_add(1, Ordering::Relaxed);
+                self.timeline
+                    .lock()
+                    .expect("turn timeline")
+                    .push(format!("svc-call  isolate={:?}", event.isolate()));
+            }
+            _ => {}
+        }
+    }
+}
+
+/// The warmed gRPC unary turn report: total handler turns, service-isolate
+/// calls, and a per-event timeline for one warmed call.
+pub struct GrpcUnaryTurnReport {
+    pub handler_turns: u64,
+    pub service_calls: u64,
+    pub timeline: Vec<String>,
+}
+
+fn new_runtime_with_observer(observer: Arc<dyn TraceObserver>) -> PerfRuntime {
+    Arc::new(ThreadedRuntime::with_config_and_trace_observer(
+        SingleShard,
+        DefaultThreadedMailboxFactory,
+        ThreadedRuntimeConfig {
+            command_capacity: CAPACITY,
+            ..ThreadedRuntimeConfig::default()
+        },
+        observer,
+    ))
+}
+
+/// Run one warmed gRPC unary call under a live trace observer and report its
+/// runtime turn count. Server, client, and gRPC router all run on one runtime,
+/// so the count covers the whole warmed protocol round trip — not just the host
+/// thread.
+pub fn grpc_unary_warmed_turn_report() -> anyhow::Result<GrpcUnaryTurnReport> {
+    let observer = Arc::new(GrpcUnaryTurnObserver::new());
+    let runtime = new_runtime_with_observer(observer.clone() as Arc<dyn TraceObserver>);
+    let router = grpc_unary_router(GrpcLimits::default());
+    let (runtime, listener, addr) = start_grpc_server_with_router(runtime, router)?;
+    let client = start_grpc_client(&runtime, addr)?;
+    let template = client
+        .unary_template(GRPC_UNARY_PATH)
+        .map_err(|e| anyhow::anyhow!("build warmed grpc template: {e:?}"))?;
+    let preframed = template
+        .preframed(&GrpcPerfRequest { delta: 41 })
+        .map_err(|e| anyhow::anyhow!("preframe warmed grpc unary: {e:?}"))?;
+    // Warm the connection and stream state so the measured call is steady-state.
+    for _ in 0..8 {
+        grpc_unary_with_client(&runtime, &client, &preframed)?;
+    }
+    observer.armed.store(true, Ordering::Relaxed);
+    grpc_unary_with_client(&runtime, &client, &preframed)?;
+    observer.armed.store(false, Ordering::Relaxed);
+    let report = GrpcUnaryTurnReport {
+        handler_turns: observer.handler_turns.load(Ordering::Relaxed),
+        service_calls: observer.service_calls.load(Ordering::Relaxed),
+        timeline: observer.timeline.lock().expect("turn timeline").clone(),
+    };
+    let _ = runtime.try_send(client.connection(), Http2ClientMsg::Stop);
+    let _ = runtime.try_send(listener, Http2ListenerMsg::Stop);
+    shutdown_runtime(runtime)?;
+    Ok(report)
 }
 
 fn grpc_h2c_unary_warmed_row() -> anyhow::Result<PerfReport> {

@@ -25,8 +25,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use perf_native::{
-    count_all_allocations, http2_steady_state_response_process_allocations,
-    websocket_text_round_trip_app_turns,
+    count_all_allocations, grpc_unary_warmed_turn_report,
+    http2_steady_state_response_process_allocations, websocket_text_round_trip_app_turns,
 };
 use tina::IsolateId;
 use tina::prelude::*;
@@ -1354,5 +1354,34 @@ fn hotpath_probes_report_and_stay_bounded() {
     assert!(
         ws_app_turns < turn_ceiling,
         "WebSocket app turns {ws_app_turns} not below the pre-dedup 2*N={turn_ceiling}; duplicate delivery may have returned",
+    );
+
+    // Warmed gRPC unary turn count: the runtime turns one steady-state unary
+    // call costs across client, server, and gRPC router (one shared runtime).
+    // The same `HandlerStarted` definition as every other hotpath row. This is
+    // the diagnostic baseline for the protocol-turn work; the saved timeline
+    // lives beside the phase plan.
+    let grpc_turns = grpc_unary_warmed_turn_report().expect("measure warmed grpc unary turns");
+    println!(
+        "perf-grpc-unary-turns handler_turns={} service_calls={}",
+        grpc_turns.handler_turns, grpc_turns.service_calls
+    );
+    for line in &grpc_turns.timeline {
+        println!("  {line}");
+    }
+    // Four service-isolate calls are the policy boundaries (host->client
+    // connection, client->server I/O hops, server->gRPC router). They must stay.
+    assert!(
+        grpc_turns.service_calls >= 4,
+        "warmed gRPC unary must keep its policy-boundary service calls: {} < 4",
+        grpc_turns.service_calls,
+    );
+    // Regression guard on total turns. The measured baseline is 17; the ceiling
+    // catches a regression that adds protocol/runtime hops without pretending a
+    // single noisy run is exact.
+    assert!(
+        grpc_turns.handler_turns <= 20,
+        "warmed gRPC unary handler turns {} exceeded the ceiling of 20",
+        grpc_turns.handler_turns,
     );
 }
