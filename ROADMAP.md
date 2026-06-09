@@ -932,8 +932,9 @@ turning into a generic async task runtime. The Tina-shaped translation is
 "make shard CPU/I/O policy visible and configurable in terms of shards, lanes,
 effects, completions, pressure, and replay truth."
 
-This phase is a planning/evidence slice, not a rewrite. It should first name
-the existing controls and reports that already point this way:
+This is a roadmap note, not an IDD plan. Future IDD phases should turn pieces
+of it into implementation work only after choosing a concrete slice. Existing
+controls and reports already point this way:
 
 - `ThreadedRuntimeConfig` already has `remote_inbound_drain_budget`,
   `driver_completion_drain_budget`, `hot_drain_max_rounds`,
@@ -948,7 +949,7 @@ the existing controls and reports that already point this way:
 - `make perf`, perf history, native rows, hot-path rows, allocation evidence,
   and soak hooks already form the humble performance-proof spine.
 
-Possible implementation slices, in intended order:
+Possible implementation slices, in likely order:
 
 1. **SchedulerPolicy / SchedulerReport.** Wrap the existing live scheduling
    knobs in one public policy/report vocabulary instead of scattering them
@@ -956,10 +957,12 @@ Possible implementation slices, in intended order:
    drain budgets, hot-drain caps, idle repoll policy, and observed park wakeups.
    Do not add service-class weights yet; first make the current policy legible.
 2. **Shard-locality ergonomics.** Extend topology/reporting so a live system can
-   answer: which services/isolate groups are on which shard, which remote edges
-   exist, which edges are seeing `Full`/`Closed`, and which resources each shard
-   owns. Add assertion helpers only after specimens need colocated or separated
-   placement. Do not expose arbitrary executor handles as the teaching path.
+   answer: which named services or isolate groups are on which shard, which
+   remote edges exist, which edges are seeing `Full`/`Closed`, and which
+   resources each shard owns. Service/group names should be explicit labels at
+   registration or `LocalSystem` builder time, not guessed Rust type names. Add
+   assertion helpers only after specimens need colocated or separated placement.
+   Do not expose arbitrary executor handles as the teaching path.
 3. **Storage visibility.** Split reports for completion-backed storage work and
    fallback-worker work. Surface storage capacity, depth where honest,
    accepted/full/closed counts, active write-path locks, fallback-worker usage,
@@ -969,13 +972,21 @@ Possible implementation slices, in intended order:
 4. **Stall detection.** Add an opt-in live `StallPolicy` for long handler turns,
    long driver advances, and long completion drains. Emit/report typed stall
    facts such as handler-stalled, driver-advance-stalled, and
-   completion-drain-stalled. This is the Tina equivalent of Glommio's stall
-   posture: one bad cooperative turn should be visible fast.
+   completion-drain-stalled. This is live observability, not preemption and not
+   simulator replay truth. The simulator may record an unsupported/live-only
+   fact, but should not pretend wall-clock stalls replay deterministically.
+   This is the Tina equivalent of Glommio's stall posture: one bad cooperative
+   turn should be visible fast.
 5. **Boring performance evidence.** Expand perf rows so every claimed
    thread-per-core/completion benefit carries backend, platform/kernel,
    core-placement, trace mode, p50/p90/p99, allocation, timeout/full, resource
    leak, and queue-pressure evidence. Keep "no production performance claim"
    until repeated Linux/macOS rows on stable machines justify changing it.
+
+Future IDD plans from this note should include user-shaped proof: a live service
+with multiple labeled services on multiple shards, real topology/report
+assertions, a forced stall, a storage-lane report, and before/after perf rows.
+Unit tests alone are not enough for this direction.
 
 Explicit non-goals for this phase:
 
