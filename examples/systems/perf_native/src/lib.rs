@@ -2227,18 +2227,20 @@ fn grpc_unary_with_client(
     }
 }
 
-/// Counts runtime turns for one warmed gRPC unary call. Armed only around the
+/// Counts runtime turns for one warmed protocol call. Armed only around the
 /// measured call, so warmup and teardown are excluded. A "turn" is one
 /// `HandlerStarted` event (as in every hotpath probe); a `CallKind::IsolateCall`
-/// is a policy-boundary crossing.
-struct GrpcUnaryTurnObserver {
+/// is a policy-boundary crossing. Used by the warmed gRPC unary, warmed HTTP/2
+/// steady-state, and warmed gRPC server-streaming turn probes — same definition
+/// of "turn" for all three.
+struct ProtocolTurnObserver {
     armed: AtomicBool,
     handler_turns: AtomicU64,
     service_calls: AtomicU64,
     timeline: Mutex<Vec<String>>,
 }
 
-impl GrpcUnaryTurnObserver {
+impl ProtocolTurnObserver {
     fn new() -> Self {
         Self {
             armed: AtomicBool::new(false),
@@ -2247,9 +2249,17 @@ impl GrpcUnaryTurnObserver {
             timeline: Mutex::new(Vec::new()),
         }
     }
+
+    fn report(&self) -> ProtocolTurnReport {
+        ProtocolTurnReport {
+            handler_turns: self.handler_turns.load(Ordering::Relaxed),
+            service_calls: self.service_calls.load(Ordering::Relaxed),
+            timeline: self.timeline.lock().expect("turn timeline").clone(),
+        }
+    }
 }
 
-impl TraceObserver for GrpcUnaryTurnObserver {
+impl TraceObserver for ProtocolTurnObserver {
     fn on_event(&self, event: &RuntimeEvent) {
         if !self.armed.load(Ordering::Relaxed) {
             return;
@@ -2277,9 +2287,9 @@ impl TraceObserver for GrpcUnaryTurnObserver {
     }
 }
 
-/// The warmed gRPC unary turn report: total handler turns, service-isolate
-/// calls, and a per-event timeline for one warmed call.
-pub struct GrpcUnaryTurnReport {
+/// A warmed-protocol turn report: total handler turns, service-isolate calls,
+/// and a per-event timeline for one warmed call.
+pub struct ProtocolTurnReport {
     pub handler_turns: u64,
     pub service_calls: u64,
     pub timeline: Vec<String>,
@@ -2301,8 +2311,8 @@ fn new_runtime_with_observer(observer: Arc<dyn TraceObserver>) -> PerfRuntime {
 /// runtime turn count. Server, client, and gRPC router all run on one runtime,
 /// so the count covers the whole warmed protocol round trip — not just the host
 /// thread.
-pub fn grpc_unary_warmed_turn_report() -> anyhow::Result<GrpcUnaryTurnReport> {
-    let observer = Arc::new(GrpcUnaryTurnObserver::new());
+pub fn grpc_unary_warmed_turn_report() -> anyhow::Result<ProtocolTurnReport> {
+    let observer = Arc::new(ProtocolTurnObserver::new());
     let runtime = new_runtime_with_observer(observer.clone() as Arc<dyn TraceObserver>);
     let router = grpc_unary_router(GrpcLimits::default());
     let (runtime, listener, addr) = start_grpc_server_with_router(runtime, router)?;
@@ -2320,11 +2330,86 @@ pub fn grpc_unary_warmed_turn_report() -> anyhow::Result<GrpcUnaryTurnReport> {
     observer.armed.store(true, Ordering::Relaxed);
     grpc_unary_with_client(&runtime, &client, &preframed)?;
     observer.armed.store(false, Ordering::Relaxed);
-    let report = GrpcUnaryTurnReport {
-        handler_turns: observer.handler_turns.load(Ordering::Relaxed),
-        service_calls: observer.service_calls.load(Ordering::Relaxed),
-        timeline: observer.timeline.lock().expect("turn timeline").clone(),
-    };
+    let report = observer.report();
+    let _ = runtime.try_send(client.connection(), Http2ClientMsg::Stop);
+    let _ = runtime.try_send(listener, Http2ListenerMsg::Stop);
+    shutdown_runtime(runtime)?;
+    Ok(report)
+}
+
+/// Run one warmed HTTP/2 small-request steady-state call under a live trace
+/// observer and report its runtime turn count. The Tina HTTP/2 client and the
+/// HTTP/2 server both run on one runtime, so the count covers the whole warmed
+/// round trip, the same way the gRPC unary probe does.
+pub fn http2_steady_state_turn_report() -> anyhow::Result<ProtocolTurnReport> {
+    let observer = Arc::new(ProtocolTurnObserver::new());
+    let runtime = new_runtime_with_observer(observer.clone() as Arc<dyn TraceObserver>);
+    let body = small_body();
+    let service = runtime
+        .register_with_capacity::<_, Infallible>(
+            BodyService {
+                body: Arc::new(body.clone()),
+            },
+            CAPACITY,
+        )
+        .map_err(|e| anyhow::anyhow!("register tina http2 service: {e:?}"))?;
+    let config = Http2ServerConfig::dev();
+    let listener = runtime
+        .register_with_capacity::<Http2Listener<SingleShard>, _>(
+            Http2Listener::<SingleShard>::new("127.0.0.1:0".parse()?, service, config),
+            config.listener_mailbox_capacity,
+        )
+        .map_err(|e| anyhow::anyhow!("register tina http2 listener: {e:?}"))?;
+    let bound = runtime.observe_next_bound();
+    runtime
+        .try_send(listener, Http2ListenerMsg::Start)
+        .map_err(|e| anyhow::anyhow!("start tina http2 listener: {e:?}"))?;
+    let addr = bound
+        .wait(Duration::from_secs(2))
+        .map_err(|e| anyhow::anyhow!("observe tina http2 bind: {e:?}"))?;
+    let client = start_h2_client(&runtime, addr)?;
+    let expected = body.len();
+    // Warm the connection and stream state so the measured call is steady-state.
+    for _ in 0..8 {
+        h2c_client_submit(&runtime, client, &body, expected)?;
+    }
+    observer.armed.store(true, Ordering::Relaxed);
+    h2c_client_submit(&runtime, client, &body, expected)?;
+    observer.armed.store(false, Ordering::Relaxed);
+    let report = observer.report();
+    let _ = runtime.try_send(client, Http2ClientMsg::Stop);
+    let _ = runtime.try_send(listener, Http2ListenerMsg::Stop);
+    shutdown_runtime(runtime)?;
+    Ok(report)
+}
+
+/// Run one warmed gRPC server-streaming exchange under a live trace observer and
+/// report its runtime turn count. The native client, the HTTP/2 server, and the
+/// gRPC router all run on one runtime, so the count covers the whole warmed
+/// streamed round trip — open + every response pull + finish.
+pub fn grpc_server_streaming_turn_report() -> anyhow::Result<ProtocolTurnReport> {
+    let observer = Arc::new(ProtocolTurnObserver::new());
+    let runtime = new_runtime_with_observer(observer.clone() as Arc<dyn TraceObserver>);
+    let limits = GrpcLimits::default();
+    let buffered_limits = GrpcBufferedStreamLimits::new(limits, GRPC_STREAM_MESSAGES, 16 * 1024);
+    let messages = (0..GRPC_STREAM_MESSAGES).map(|i| GrpcPerfReply { value: 40 + i as u64 });
+    let buffered_response =
+        GrpcBufferedServerStreamingResponse::from_messages(messages, buffered_limits)
+            .map_err(|e| anyhow::anyhow!("build grpc buffered stream response: {e:?}"))?;
+    let router = grpc_unary_router(limits).server_streaming_buffered(
+        GRPC_STREAM_PATH,
+        move |_request: GrpcRequest<GrpcPerfRequest>| Ok(buffered_response.clone()),
+    );
+    let (runtime, listener, addr) = start_grpc_server_with_router(runtime, router)?;
+    let client = start_grpc_client(&runtime, addr)?;
+    // Warm the connection and stream state so the measured call is steady-state.
+    for _ in 0..8 {
+        grpc_server_streaming_with_client(&runtime, &client)?;
+    }
+    observer.armed.store(true, Ordering::Relaxed);
+    grpc_server_streaming_with_client(&runtime, &client)?;
+    observer.armed.store(false, Ordering::Relaxed);
+    let report = observer.report();
     let _ = runtime.try_send(client.connection(), Http2ClientMsg::Stop);
     let _ = runtime.try_send(listener, Http2ListenerMsg::Stop);
     shutdown_runtime(runtime)?;

@@ -396,3 +396,63 @@ Item 8 is still partial: this is one before/after batch (6 samples each) on one
 machine, not the full 3x3 repeated runs with tabulated p50/p90/p99 + RSS per row.
 The allocation wins are validated on both platforms; the latency distribution and
 item 7's turn reduction remain. PR stays a draft.
+
+## Implementation Note 7 (Session B — item 7 turn reduction landed)
+
+Note 5 (Session A) showed warmed unary at 17 turns and called it policy/I-O
+bound, deferring the actual reduction. That was incomplete: the second-largest
+turn cost was not a policy boundary, it was a deferred flush. This note records
+the real reduction.
+
+### The removable turn
+
+After the server writes a response, `handle_wrote` force-flushed the request's
+accumulated receive-window credit as a *separate* connection `WINDOW_UPDATE`
+write — a second `tcp_write_owned` and therefore a second write-completion turn,
+plus the I/O wake it triggered. For a warmed small request the body credit sits
+below `WINDOW_CREDIT_FLUSH_THRESHOLD`, so it is always deferred, so this extra
+write happens every steady-state call, on both the client and the server
+connection.
+
+### What changed (`tina-http/src/http2/server.rs`)
+
+- `handle_service_returned` flushes deferred request-window credit
+  (`flush_deferred_request_window_credit`) right before issuing the response
+  write, so the connection `WINDOW_UPDATE` is queued alongside the response.
+- `write_more` coalesces every queued frame into one socket write, so the
+  response and the window-update leave in a single syscall and a single
+  completion turn.
+- `handle_wrote` keeps the force-flush only as a fallback for credit that becomes
+  pending *after* the response left (streamed bodies), and now re-issues the
+  write of any short-write remainder before doing anything else — required
+  because coalesced writes are larger and a partial write must keep draining.
+
+This is same-turn protocol-local framing (the plan's named good target). No
+service-handler is called from the connection isolate; mailbox capacity, request
+caps, flow-control, timeout/cancel, and final gRPC status facts are untouched.
+The flow-control change is strictly more permissive: the peer's send window is
+replenished slightly sooner, never later.
+
+### Proof (warmed turn probes, macOS/aarch64)
+
+Extended the turn probe — reusing the Session-A `GrpcUnaryTurnObserver` (renamed
+`ProtocolTurnObserver`, same `HandlerStarted` turn definition) — to HTTP/2 small
+steady-state and gRPC server-streaming. Before/after, same probe, same
+definition:
+
+| row                          | turns BEFORE | turns AFTER | svc-calls |
+|------------------------------|-------------:|------------:|----------:|
+| grpc_h2c_unary_warmed        |           17 |          13 |  4 (kept) |
+| http2_h2c_steady_state_small |           13 |          11 |  2 (kept) |
+| grpc_h2c_server_streaming    |           25 |          21 |  6 (kept) |
+
+All three warmed protocol rows drop, including the plan's preferred warmed gRPC
+unary. Every policy-boundary `IsolateCall` is preserved. Full before/after
+per-event timelines saved in `turn_reduction_timelines.txt`. The hotpath
+regression guards were tightened to lock the wins in: warmed unary
+`handler_turns <= 15` (was 20), new `http2 steady <= 13`, new
+`server-streaming <= 23`, with the `service_calls` floors unchanged so a future
+hop re-add fails the probe.
+
+Full `tina-http` suite green (incl. flow-control, large-upload, streaming, and
+all gRPC suites); fmt + clippy (lib + perf example) clean; rustdoc clean.

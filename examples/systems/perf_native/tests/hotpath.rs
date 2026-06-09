@@ -25,8 +25,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use perf_native::{
-    count_all_allocations, grpc_unary_warmed_turn_report,
-    http2_steady_state_response_process_allocations, websocket_text_round_trip_app_turns,
+    count_all_allocations, grpc_server_streaming_turn_report, grpc_unary_warmed_turn_report,
+    http2_steady_state_response_process_allocations, http2_steady_state_turn_report,
+    websocket_text_round_trip_app_turns,
 };
 use tina::IsolateId;
 use tina::prelude::*;
@@ -1375,10 +1376,67 @@ fn hotpath_probes_report_and_stay_bounded() {
         grpc_turns.service_calls,
     );
     // Ceiling on total turns: catches a change that adds protocol/runtime hops.
-    // The baseline is 17; the headroom allows for run-to-run noise.
+    // Folding the post-response window-update into the response write dropped the
+    // warmed baseline from 17 to 13 (macOS) / ~12 (Linux); the ceiling locks that
+    // in while leaving headroom for the small cross-platform I/O-hop difference.
     assert!(
-        grpc_turns.handler_turns <= 20,
-        "warmed gRPC unary handler turns {} exceeded the ceiling of 20",
+        grpc_turns.handler_turns <= 15,
+        "warmed gRPC unary handler turns {} exceeded the ceiling of 15",
         grpc_turns.handler_turns,
     );
+
+    // Runtime turns one warmed HTTP/2 small steady-state call costs across the
+    // Tina client and the HTTP/2 server (one shared runtime). Same definition.
+    let http2_turns =
+        http2_steady_state_turn_report().expect("measure warmed http2 steady-state turns");
+    println!(
+        "perf-http2-steady-turns handler_turns={} service_calls={}",
+        http2_turns.handler_turns, http2_turns.service_calls
+    );
+    for line in &http2_turns.timeline {
+        println!("  {line}");
+    }
+    // The service-isolate call (server connection -> body service) is a policy
+    // boundary and must stay.
+    assert!(
+        http2_turns.service_calls >= 1,
+        "warmed HTTP/2 steady-state must keep its policy-boundary service call: {} < 1",
+        http2_turns.service_calls,
+    );
+    // Ceiling on total turns. After folding the post-response window-update flush
+    // into the response write, the warmed steady-state turn count dropped; this
+    // guard fails if a shape-conversion or deferred-flush hop is re-added.
+    assert!(
+        http2_turns.handler_turns <= HTTP2_STEADY_TURN_CEILING,
+        "warmed HTTP/2 steady-state handler turns {} exceeded the ceiling of {HTTP2_STEADY_TURN_CEILING}",
+        http2_turns.handler_turns,
+    );
+
+    // Runtime turns one warmed gRPC server-streaming exchange costs across the
+    // native client, the server, and the gRPC router (one shared runtime).
+    let stream_turns =
+        grpc_server_streaming_turn_report().expect("measure warmed grpc server-streaming turns");
+    println!(
+        "perf-grpc-server-streaming-turns handler_turns={} service_calls={}",
+        stream_turns.handler_turns, stream_turns.service_calls
+    );
+    for line in &stream_turns.timeline {
+        println!("  {line}");
+    }
+    assert!(
+        stream_turns.service_calls >= 1,
+        "warmed gRPC server-streaming must keep its policy-boundary service call: {} < 1",
+        stream_turns.service_calls,
+    );
+    assert!(
+        stream_turns.handler_turns <= GRPC_STREAM_TURN_CEILING,
+        "warmed gRPC server-streaming handler turns {} exceeded the ceiling of {GRPC_STREAM_TURN_CEILING}",
+        stream_turns.handler_turns,
+    );
 }
+
+// Turn ceilings for the warmed HTTP/2 / gRPC-streaming probes. Set with headroom
+// above the measured post-change baselines so run-to-run noise does not flake the
+// guard, but tight enough that re-adding a protocol/runtime hop fails the test.
+const HTTP2_STEADY_TURN_CEILING: u64 = 13;
+const GRPC_STREAM_TURN_CEILING: u64 = 23;

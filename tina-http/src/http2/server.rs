@@ -566,8 +566,15 @@ impl<S: Shard + 'static, M: Http2ServiceMessage> Http2Connection<S, M> {
             return noop();
         }
         if self.pending_write.is_empty() {
-            if let Some(next) = self.write_queue.pop_front() {
-                self.pending_write = next;
+            // Coalesce every queued frame into one socket write. A steady-state
+            // response and its connection window-update then leave in a single
+            // syscall and cost a single write-completion turn instead of two.
+            while let Some(next) = self.write_queue.pop_front() {
+                if self.pending_write.is_empty() {
+                    self.pending_write = next;
+                } else {
+                    self.pending_write.extend_from_slice(&next);
+                }
             }
         }
         if self.pending_write.is_empty() {
@@ -1412,6 +1419,11 @@ impl<S: Shard + 'static, M: Http2ServiceMessage> Http2Connection<S, M> {
                 let _ = self.enqueue_response(stream_id, response, &mut effects);
             }
         }
+        // Flush deferred request-window credit into the same write as the
+        // response. The connection window-update then rides the response write
+        // instead of forcing a second write (and a second completion turn)
+        // after it finishes.
+        self.flush_deferred_request_window_credit();
         if self.pending_write.is_empty() && !self.write_queue.is_empty() {
             effects.push(self.write_more());
         }
@@ -2126,17 +2138,23 @@ impl<S: Shard + 'static, M: Http2ServiceMessage> Http2Connection<S, M> {
         let drain = written.min(bytes.len());
         bytes.drain(..drain);
         self.pending_write = bytes;
-        if self.pending_write.is_empty() {
-            if !self.write_queue.is_empty() {
-                return self.write_more();
-            }
-            if self.closing_after_write {
-                return self.close_now();
-            }
-            self.flush_deferred_request_window_credit();
-            if !self.write_queue.is_empty() {
-                return self.write_more();
-            }
+        // A short write leaves a remainder; keep draining it before anything
+        // else. Coalesced writes are larger, so this guard must stay correct.
+        if !self.pending_write.is_empty() {
+            return self.write_more();
+        }
+        if !self.write_queue.is_empty() {
+            return self.write_more();
+        }
+        if self.closing_after_write {
+            return self.close_now();
+        }
+        // Fallback flush for credit that became pending after the response left
+        // (e.g. streamed bodies). The steady-state response path flushes credit
+        // into the response write itself, so this usually finds nothing.
+        self.flush_deferred_request_window_credit();
+        if !self.write_queue.is_empty() {
+            return self.write_more();
         }
         noop()
     }
