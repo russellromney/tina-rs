@@ -387,6 +387,92 @@ fn streamed_response_peer_rst_delivers_reset_to_parked_pull() {
     peer.join().expect("peer thread joins");
 }
 
+/// Drive a streamed-response stream whose head declares `content-length:
+/// declared` but whose body, ending with END_STREAM, is `body`. Returns the
+/// terminal chunk the parked pull receives after draining any DATA.
+fn streamed_content_length_terminal(declared: usize, body: Vec<u8>) -> Http2ResponseChunk {
+    let (addr, peer) = spawn_peer(move |sock, stream_id| {
+        // Streamed head: status + a content-length the body will violate.
+        let mut block = Vec::new();
+        literal_header(":status", "200", &mut block);
+        literal_header("content-length", &declared.to_string(), &mut block);
+        write_frame(sock, FRAME_HEADERS, FLAG_END_HEADERS, stream_id, &block);
+        // The whole (mis-sized) body in one DATA frame ending the stream.
+        write_frame(sock, FRAME_DATA, FLAG_END_STREAM, stream_id, &body);
+    });
+    let (runtime, client) = run_client(addr);
+
+    let head = runtime
+        .call_blocking(
+            client,
+            Http2ClientMsg::OpenStream(Http2ClientStreamCall {
+                method: Method::GET,
+                path: "/x".into(),
+                headers: HeaderMap::new(),
+                body: Http2ClientRequestBody::Buffered(Vec::new()),
+            }),
+            Duration::from_secs(5),
+        )
+        .expect("open returns");
+    let stream_id = match head {
+        CallOutcome::Replied(Http2ClientReply::Outcome {
+            stream_id,
+            outcome: Http2ClientOutcome::ResponseStreaming { .. },
+        }) => stream_id,
+        other => panic!("expected ResponseStreaming head, got {other:?}"),
+    };
+
+    // Pull until a terminal chunk (End / ProtocolError / Reset / Closed);
+    // skip any Data chunks the short/over body delivered first.
+    let terminal = loop {
+        let chunk = runtime
+            .call_blocking(
+                client,
+                Http2ClientMsg::ResponseNext { stream_id },
+                Duration::from_secs(5),
+            )
+            .expect("pull returns");
+        match chunk {
+            CallOutcome::Replied(Http2ClientReply::ResponseChunk {
+                chunk: Http2ResponseChunk::Data(_),
+                ..
+            }) => continue,
+            CallOutcome::Replied(Http2ClientReply::ResponseChunk { chunk, .. }) => break chunk,
+            other => panic!("expected ResponseChunk, got {other:?}"),
+        }
+    };
+
+    let _ = runtime.try_send(client, Http2ClientMsg::Stop);
+    let _ = runtime.shutdown();
+    peer.join().expect("peer thread joins");
+    terminal
+}
+
+#[test]
+fn streamed_response_short_body_vs_content_length_is_protocol_error() {
+    // Head declares content-length: 10, body sends 4 bytes + END_STREAM.
+    // The streamed path must NOT hand the caller a clean `End`; a declared
+    // length that the body violates is a malformed response (RFC 9113
+    // §8.1.1), exactly as the buffered path already enforces.
+    let terminal = streamed_content_length_terminal(10, b"abcd".to_vec());
+    match terminal {
+        Http2ResponseChunk::ProtocolError(Http2ProtocolError::ContentLengthMismatch)
+        | Http2ResponseChunk::Reset(_) => {}
+        other => panic!("expected ContentLengthMismatch / Reset, got {other:?}"),
+    }
+}
+
+#[test]
+fn streamed_response_over_body_vs_content_length_is_protocol_error() {
+    // Head declares content-length: 4, body sends 6 bytes + END_STREAM.
+    let terminal = streamed_content_length_terminal(4, b"abcdef".to_vec());
+    match terminal {
+        Http2ResponseChunk::ProtocolError(Http2ProtocolError::ContentLengthMismatch)
+        | Http2ResponseChunk::Reset(_) => {}
+        other => panic!("expected ContentLengthMismatch / Reset, got {other:?}"),
+    }
+}
+
 #[test]
 fn server_rst_stream_on_stream_zero_is_connection_protocol_error() {
     // RFC 9113 §6.4: RST_STREAM on stream 0x0 is a connection-level

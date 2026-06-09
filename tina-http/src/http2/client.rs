@@ -25,6 +25,7 @@
 //! [`Http2ClientOutcome::TlsAlpnMismatch`]. The client never silently
 //! downgrades a TLS target to h2c.
 
+use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::convert::Infallible;
 use std::marker::PhantomData;
@@ -53,7 +54,7 @@ use super::frame::{
     FRAME_GOAWAY, FRAME_HEADER_LEN, FRAME_HEADERS, FRAME_PING, FRAME_RST_STREAM, FRAME_SETTINGS,
     FRAME_WINDOW_UPDATE, Frame, READ_CHUNK, WINDOW_CREDIT_FLUSH_THRESHOLD, add_window, data_frame,
     goaway_frame, headers_frame, headers_payload, into_data_payload, push_frame_header,
-    rst_stream_frame, settings_frame, try_decode_frame, window_update_frame,
+    push_setting, rst_stream_frame, settings_frame, try_decode_frame, window_update_frame,
 };
 use super::headers::{
     DEFAULT_HEADER_TABLE_SIZE, HeaderBlock, MAX_MAX_FRAME_SIZE, MIN_MAX_FRAME_SIZE,
@@ -593,6 +594,11 @@ struct ActiveClientStream {
     /// END_STREAM has been seen for the response. Once the buffered
     /// chunks drain, the next pull gets `End`.
     response_eof: bool,
+    /// Total received response body bytes on a streamed response, compared
+    /// against `response_content_length` at END_STREAM. The buffered path
+    /// uses `response_body.len()`; the streamed path drains its chunks, so it
+    /// needs its own running counter to tell the same content-length truth.
+    response_body_received: usize,
 }
 
 impl ActiveClientStream {
@@ -626,6 +632,7 @@ impl ActiveClientStream {
             response_chunks: VecDeque::new(),
             response_pull: None,
             response_eof: false,
+            response_body_received: 0,
         }
     }
 
@@ -702,6 +709,10 @@ pub struct Http2ClientConnection<S: Shard + 'static> {
         tina::RequestContext<Http2ClientReply>,
     )>,
     streams: Vec<ActiveClientStream>,
+    /// stream-id → slot index in `streams`, kept in step with every push and
+    /// `swap_remove`. Turns the per-frame stream lookup (several per frame)
+    /// from O(open streams) into O(1), mirroring the server.
+    stream_index: HashMap<u32, usize>,
     next_stream_id: u32,
     read_buf: Vec<u8>,
     read_scratch: Vec<u8>,
@@ -778,6 +789,7 @@ impl<S: Shard + 'static> Http2ClientConnection<S> {
             queued_streaming: VecDeque::new(),
             queued_open: VecDeque::new(),
             streams: Vec::with_capacity(limits.max_concurrent_streams),
+            stream_index: HashMap::with_capacity(limits.max_concurrent_streams),
             next_stream_id: 1,
             read_buf: Vec::new(),
             read_scratch: Vec::new(),
@@ -1096,7 +1108,7 @@ impl<S: Shard + 'static> Http2ClientConnection<S> {
         stream_id: u32,
         outcome: CallOutcome<ResponseChunkReply>,
     ) -> Effect<Self> {
-        let Some(idx) = self.streams.iter().position(|s| s.id == stream_id) else {
+        let Some(idx) = self.find_stream(stream_id) else {
             // Stream gone (reset/cancelled/closed); drop the late chunk.
             return noop();
         };
@@ -1215,7 +1227,7 @@ impl<S: Shard + 'static> Http2ClientConnection<S> {
             stream: Http2StreamId::new(stream_id),
             direction: ProtocolDirection::Outbound,
         }));
-        self.streams.push(stream);
+        self.push_stream(stream);
         // The body bytes (if any) ride out as `flush_outbound_data` finds
         // stream + connection send-window credit. RFC 9113 §6.9: we must
         // not exceed either window.
@@ -1292,7 +1304,7 @@ impl<S: Shard + 'static> Http2ClientConnection<S> {
             stream: Http2StreamId::new(stream_id),
             direction: ProtocolDirection::Outbound,
         }));
-        self.streams.push(stream);
+        self.push_stream(stream);
         self.flush_outbound_data();
     }
 
@@ -1359,7 +1371,7 @@ impl<S: Shard + 'static> Http2ClientConnection<S> {
             stream: Http2StreamId::new(stream_id),
             direction: ProtocolDirection::Outbound,
         }));
-        self.streams.push(stream);
+        self.push_stream(stream);
         // Pull the first body chunk.
         self.pump_request_pulls(effects);
     }
@@ -1472,11 +1484,34 @@ impl<S: Shard + 'static> Http2ClientConnection<S> {
             stream: Http2StreamId::new(stream_id),
             direction: ProtocolDirection::Outbound,
         }));
-        self.streams.push(stream);
+        self.push_stream(stream);
         // Buffered body rides out under flow control; a streamed body is
         // pulled. Exactly one of these does work for a given stream.
         self.flush_outbound_data();
         self.pump_request_pulls(effects);
+    }
+
+    /// O(1) stream-id → slot lookup via the index.
+    fn find_stream(&self, stream_id: u32) -> Option<usize> {
+        self.stream_index.get(&stream_id).copied()
+    }
+
+    /// Append a stream and record its slot in the index.
+    fn push_stream(&mut self, stream: ActiveClientStream) {
+        self.stream_index.insert(stream.id, self.streams.len());
+        self.streams.push(stream);
+    }
+
+    /// Remove the stream at `idx` with `swap_remove`, keeping the index
+    /// consistent: drop the removed id and re-point the tail element the swap
+    /// moved into the hole.
+    fn swap_remove_stream_at(&mut self, idx: usize) -> ActiveClientStream {
+        let removed = self.streams.swap_remove(idx);
+        self.stream_index.remove(&removed.id);
+        if let Some(moved) = self.streams.get(idx) {
+            self.stream_index.insert(moved.id, idx);
+        }
+        removed
     }
 
     /// A caller pulled the next chunk of a streamed response. One pull is
@@ -1486,7 +1521,7 @@ impl<S: Shard + 'static> Http2ClientConnection<S> {
         stream_id: u32,
         call: tina::CallContext<'_, Self>,
     ) -> Effect<Self> {
-        let Some(idx) = self.streams.iter().position(|s| s.id == stream_id) else {
+        let Some(idx) = self.find_stream(stream_id) else {
             // Stream gone (completed, reset, or connection closed). The
             // terminal chunk was delivered to an earlier pull if one was
             // parked; a fresh pull gets `Closed`.
@@ -1550,7 +1585,24 @@ impl<S: Shard + 'static> Http2ClientConnection<S> {
     /// slot. Called once the buffered body has drained and END_STREAM has
     /// been seen, with a pull parked.
     fn complete_streaming_stream(&mut self, idx: usize, effects: &mut Vec<Effect<Self>>) {
-        let mut stream = self.streams.swap_remove(idx);
+        // A declared content-length the body did not honor is a malformed
+        // response (RFC 9113 §8.1.1). Mirror the buffered branch's terminal
+        // cause: RST the peer and settle the parked pull as a protocol error
+        // instead of handing back a clean `End`.
+        if let Some(declared) = self.streams[idx].response_content_length {
+            if declared != self.streams[idx].response_body_received {
+                let stream_id = self.streams[idx].id;
+                self.enqueue_frame(rst_stream_frame(stream_id, ERR_PROTOCOL_ERROR));
+                self.fail_stream(
+                    idx,
+                    Http2ClientOutcome::ProtocolError(Http2ProtocolError::ContentLengthMismatch),
+                    Http2CloseReason::LocalCloseOnly,
+                    effects,
+                );
+                return;
+            }
+        }
+        let mut stream = self.swap_remove_stream_at(idx);
         let stream_id = stream.id;
         self.report.closed_streams += 1;
         if let Some(status) = grpc_status_from_headers(&stream.response_trailers)
@@ -1733,11 +1785,11 @@ impl<S: Shard + 'static> Http2ClientConnection<S> {
     /// Locally cancel an admitted stream: send RST_STREAM(CANCEL), reply
     /// to the original submitter with `LocalCancel`, free the slot.
     fn handle_cancel(&mut self, stream_id: u32) -> Effect<Self> {
-        let Some(idx) = self.streams.iter().position(|s| s.id == stream_id) else {
+        let Some(idx) = self.find_stream(stream_id) else {
             return noop();
         };
         let mut effects: Vec<Effect<Self>> = Vec::new();
-        let mut stream = self.streams.swap_remove(idx);
+        let mut stream = self.swap_remove_stream_at(idx);
         self.cancel_request_source(&stream, &mut effects);
         self.enqueue_frame(rst_stream_frame(stream_id, ERR_CANCEL));
         self.report.locally_cancelled += 1;
@@ -1944,7 +1996,7 @@ impl<S: Shard + 'static> Http2ClientConnection<S> {
         if frame.flags & FLAG_END_HEADERS == 0 {
             return Err(Http2ProtocolError::HpackUnsupported);
         }
-        let Some(idx) = self.streams.iter().position(|s| s.id == frame.stream_id) else {
+        let Some(idx) = self.find_stream(frame.stream_id) else {
             return Err(Http2ProtocolError::BadStreamId);
         };
         let payload = headers_payload(&frame)?;
@@ -2035,7 +2087,7 @@ impl<S: Shard + 'static> Http2ClientConnection<S> {
         self.pending_recv_window_credit = self
             .pending_recv_window_credit
             .saturating_add(flow_len as u32);
-        let Some(idx) = self.streams.iter().position(|s| s.id == stream_id) else {
+        let Some(idx) = self.find_stream(stream_id) else {
             // DATA for an unknown / closed stream is a stream-level error,
             // not a connection-level one (RFC 9113 §6.9.1 / §5.1). Send
             // RST_STREAM and continue the connection.
@@ -2073,6 +2125,7 @@ impl<S: Shard + 'static> Http2ClientConnection<S> {
         // streams, so holding it would stall every other stream. A slow
         // consumer is bounded purely by this stream's window.
         if self.streams[idx].response_streamed {
+            self.streams[idx].response_body_received += payload_len;
             if !payload.is_empty() {
                 self.streams[idx].response_chunks.push_back(payload);
             }
@@ -2132,7 +2185,7 @@ impl<S: Shard + 'static> Http2ClientConnection<S> {
         }
         if frame.stream_id == 0 {
             self.send_window = add_window(self.send_window, increment)?;
-        } else if let Some(idx) = self.streams.iter().position(|s| s.id == frame.stream_id) {
+        } else if let Some(idx) = self.find_stream(frame.stream_id) {
             self.streams[idx].send_window = add_window(self.streams[idx].send_window, increment)?;
         }
         // New credit may unblock parked outbound DATA on any stream.
@@ -2159,7 +2212,7 @@ impl<S: Shard + 'static> Http2ClientConnection<S> {
             frame.payload[2],
             frame.payload[3],
         ]);
-        let Some(idx) = self.streams.iter().position(|s| s.id == frame.stream_id) else {
+        let Some(idx) = self.find_stream(frame.stream_id) else {
             // RST_STREAM for an already-closed stream is allowed; ignore.
             return Ok(());
         };
@@ -2209,7 +2262,7 @@ impl<S: Shard + 'static> Http2ClientConnection<S> {
     // either way — the receive-side mirror of the server's
     // `GrpcFinalStatusSent`.
     fn complete_stream(&mut self, idx: usize, effects: &mut Vec<Effect<Self>>) {
-        let mut stream = self.streams.swap_remove(idx);
+        let mut stream = self.swap_remove_stream_at(idx);
         let stream_id = stream.id;
         // The response is done. If this stream streamed its request body,
         // the source may still be alive (it returned `Eof`, or the peer
@@ -2260,7 +2313,7 @@ impl<S: Shard + 'static> Http2ClientConnection<S> {
         close_reason: Http2CloseReason,
         effects: &mut Vec<Effect<Self>>,
     ) {
-        let mut stream = self.streams.swap_remove(idx);
+        let mut stream = self.swap_remove_stream_at(idx);
         let stream_id = stream.id;
         self.cancel_request_source(&stream, effects);
         self.report.closed_streams += 1;
@@ -2315,6 +2368,7 @@ impl<S: Shard + 'static> Http2ClientConnection<S> {
             ));
         }
         let streams: Vec<_> = self.streams.drain(..).collect();
+        self.stream_index.clear();
         for mut stream in streams {
             self.cancel_request_source(&stream, &mut effects);
             self.settle_stream_terminal(&mut stream, outcome.clone(), &mut effects);
@@ -2339,6 +2393,7 @@ impl<S: Shard + 'static> Http2ClientConnection<S> {
         };
         self.enqueue_frame(goaway_frame(self.next_stream_id, code));
         let streams: Vec<_> = self.streams.drain(..).collect();
+        self.stream_index.clear();
         for mut stream in streams {
             self.cancel_request_source(&stream, &mut effects);
             self.settle_stream_terminal(
@@ -2511,6 +2566,7 @@ impl<S: Shard + 'static> Http2ClientConnection<S> {
     fn close_with(&mut self, outcome: Http2ClientOutcome) -> Effect<Self> {
         let mut effects: Vec<Effect<Self>> = Vec::new();
         let streams: Vec<_> = self.streams.drain(..).collect();
+        self.stream_index.clear();
         for mut stream in streams {
             self.cancel_request_source(&stream, &mut effects);
             self.settle_stream_terminal(&mut stream, outcome.clone(), &mut effects);
@@ -2598,11 +2654,6 @@ fn reject_outcome<S: Shard + 'static>(
         waiter,
         Http2ClientReply::Outcome { stream_id, outcome },
     )
-}
-
-fn push_setting(out: &mut Vec<u8>, id: u16, value: u32) {
-    out.extend_from_slice(&id.to_be_bytes());
-    out.extend_from_slice(&value.to_be_bytes());
 }
 
 fn encode_request_headers(target: &Http2Target, req: &Http2ClientRequest) -> Vec<u8> {

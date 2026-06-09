@@ -5,6 +5,7 @@
 //! Frame, HPACK, and protocol-error helpers live in sibling modules
 //! (`frame`, `headers`, `errors`) and are shared with the native client.
 
+use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::convert::Infallible;
 use std::marker::PhantomData;
@@ -42,7 +43,7 @@ use super::frame::{
     FRAME_PRIORITY, FRAME_PUSH_PROMISE, FRAME_RST_STREAM, FRAME_SETTINGS, FRAME_WINDOW_UPDATE,
     Frame, PRIORITY_PAYLOAD_LEN, READ_CHUNK, WINDOW_CREDIT_FLUSH_THRESHOLD, add_window, data_frame,
     data_payload_view, goaway_frame, headers_frame, headers_payload_view, push_frame_header,
-    rst_stream_frame, settings_frame, try_decode_frame_meta, window_update_frame,
+    push_setting, rst_stream_frame, settings_frame, try_decode_frame_meta, window_update_frame,
 };
 use super::headers::{
     DEFAULT_HEADER_TABLE_SIZE, HeaderBlock, MAX_MAX_FRAME_SIZE, MIN_MAX_FRAME_SIZE,
@@ -286,7 +287,6 @@ struct ActiveStream {
     request_eof: bool,
     request_content_length: Option<usize>,
     request_bytes_received: usize,
-    request_flow_bytes_received: usize,
     pending_recv_window_credit: u32,
     request_chunks: VecDeque<RequestDataChunk>,
     pending_request_body_reply: Option<tina::RequestContext<Http2ConnectionReply>>,
@@ -355,7 +355,6 @@ impl ActiveStream {
             request_eof: false,
             request_content_length: None,
             request_bytes_received: 0,
-            request_flow_bytes_received: 0,
             pending_recv_window_credit: 0,
             request_chunks: VecDeque::new(),
             pending_request_body_reply: None,
@@ -421,6 +420,10 @@ pub struct Http2Connection<S: Shard, M: Http2ServiceMessage = HttpRequest> {
     hpack_decoder: hpack::Decoder<'static>,
     preface_seen: bool,
     streams: Vec<ActiveStream>,
+    /// stream-id → slot index in `streams`, kept in step with every push and
+    /// `swap_remove`. Turns the per-frame `find_stream` lookup (called several
+    /// times per frame) from O(open streams) into O(1).
+    stream_index: HashMap<u32, usize>,
     highest_client_stream_id: u32,
     recv_window: i32,
     pending_recv_window_credit: u32,
@@ -456,6 +459,7 @@ impl<S: Shard + 'static, M: Http2ServiceMessage> Http2Connection<S, M> {
             hpack_decoder: hpack::Decoder::new(),
             preface_seen: false,
             streams: Vec::with_capacity(limits.max_concurrent_streams),
+            stream_index: HashMap::with_capacity(limits.max_concurrent_streams),
             highest_client_stream_id: 0,
             recv_window: limits.initial_connection_window,
             pending_recv_window_credit: 0,
@@ -648,7 +652,7 @@ impl<S: Shard + 'static, M: Http2ServiceMessage> Http2Connection<S, M> {
             }
             self.read_buf.drain(..CLIENT_PREFACE.len());
             self.preface_seen = true;
-            self.enqueue_frame(settings_frame(false))?;
+            self.enqueue_frame(self.initial_settings_frame())?;
         }
 
         // Process frames as borrowed slices of the read buffer. Take the
@@ -934,13 +938,13 @@ impl<S: Shard + 'static, M: Http2ServiceMessage> Http2Connection<S, M> {
         if end_stream {
             stream.request_eof = true;
             stream.state = Http2StreamState::HalfClosedRemote;
-            self.streams.push(stream);
+            self.push_stream(stream);
             self.dispatch_stream(stream_id, effects)?;
         } else if grpc {
-            self.streams.push(stream);
+            self.push_stream(stream);
             self.dispatch_streaming_request(stream_id, effects)?;
         } else {
-            self.streams.push(stream);
+            self.push_stream(stream);
         }
         Ok(())
     }
@@ -1082,7 +1086,6 @@ impl<S: Shard + 'static, M: Http2ServiceMessage> Http2Connection<S, M> {
         self.recv_window -= flow_len_i32;
         self.streams[idx].recv_window -= flow_len_i32;
         self.streams[idx].request_bytes_received += data_len;
-        self.streams[idx].request_flow_bytes_received += flow_len;
         if self.streams[idx].request_dispatched_streaming {
             if !data.is_empty() {
                 // A queued streaming chunk must outlive this read buffer, so it
@@ -1099,6 +1102,14 @@ impl<S: Shard + 'static, M: Http2ServiceMessage> Http2Connection<S, M> {
             }
         } else {
             self.streams[idx].body.extend_from_slice(data);
+            // The buffered body is retained immediately, so credit its flow
+            // bytes back mid-upload — mirroring the streaming path. Without
+            // this a buffered upload larger than the initial window exhausts
+            // the peer's send credit and deadlocks before END_STREAM.
+            if flow_len > 0 {
+                self.add_request_window_credit(idx, flow_len);
+                self.maybe_flush_request_window_credit(stream_id, false)?;
+            }
         }
         if end_stream {
             if self.streams[idx]
@@ -1270,19 +1281,12 @@ impl<S: Shard + 'static, M: Http2ServiceMessage> Http2Connection<S, M> {
             grpc_content_type: headers.grpc_content_type,
             grpc_encoding_unsupported: headers.grpc_encoding_unsupported,
         };
-        let consumed = match &parts.body {
-            HttpRequestBody::Buffered(_) => self.streams[idx].request_flow_bytes_received,
-            HttpRequestBody::Stream(_) | HttpRequestBody::Http2Stream(_) => 0,
-        };
-        if consumed > 0 {
-            self.recv_window = self.recv_window.saturating_add(consumed as i32);
-            if let Some(idx) = self.find_stream(stream_id) {
-                self.streams[idx].recv_window = self.streams[idx]
-                    .recv_window
-                    .saturating_add(consumed as i32);
-            }
-            self.enqueue_frame(window_update_frame(0, consumed as u32))?;
-            self.enqueue_frame(window_update_frame(stream_id, consumed as u32))?;
+        // The buffered body's flow bytes were already credited to the window
+        // mid-upload (see `handle_data`); flush any sub-threshold remainder
+        // now so the final credit reaches the peer. Streaming bodies credit
+        // on consume, not here.
+        if matches!(parts.body, HttpRequestBody::Buffered(_)) {
+            self.maybe_flush_request_window_credit(stream_id, true)?;
         }
         let (effect, handle) = call_cancelable(
             self.service,
@@ -2169,6 +2173,31 @@ impl<S: Shard + 'static, M: Http2ServiceMessage> Http2Connection<S, M> {
         }
     }
 
+    /// Build the server's initial (non-ACK) SETTINGS from config. The peer
+    /// learns our caps only from this frame; an empty one leaves it on
+    /// protocol defaults (unlimited streams, 65535 window, 16384 frame).
+    /// Mirrors the client's advertisement.
+    fn initial_settings_frame(&self) -> Frame {
+        let mut payload = Vec::with_capacity(24);
+        push_setting(
+            &mut payload,
+            SETTINGS_MAX_CONCURRENT_STREAMS,
+            self.limits.max_concurrent_streams as u32,
+        );
+        push_setting(
+            &mut payload,
+            SETTINGS_INITIAL_WINDOW_SIZE,
+            self.limits.initial_stream_window as u32,
+        );
+        push_setting(
+            &mut payload,
+            SETTINGS_MAX_FRAME_SIZE,
+            self.limits.max_frame_size as u32,
+        );
+        push_setting(&mut payload, SETTINGS_ENABLE_PUSH, 0);
+        Frame::new(FRAME_SETTINGS, 0, 0, payload)
+    }
+
     fn enqueue_frame(&mut self, frame: Frame) -> Result<(), Http2ProtocolError> {
         self.ensure_outbound_slots(1)?;
         self.write_queue.push_back(frame.encode());
@@ -2190,12 +2219,25 @@ impl<S: Shard + 'static, M: Http2ServiceMessage> Http2Connection<S, M> {
     }
 
     fn find_stream(&self, stream_id: u32) -> Option<usize> {
-        self.streams.iter().position(|s| s.id == stream_id)
+        self.stream_index.get(&stream_id).copied()
+    }
+
+    /// Append a stream and record its slot in the index.
+    fn push_stream(&mut self, stream: ActiveStream) {
+        self.stream_index.insert(stream.id, self.streams.len());
+        self.streams.push(stream);
     }
 
     fn remove_stream(&mut self, stream_id: u32) -> Option<ActiveStream> {
         let idx = self.find_stream(stream_id)?;
-        Some(self.streams.swap_remove(idx))
+        self.stream_index.remove(&stream_id);
+        let removed = self.streams.swap_remove(idx);
+        // `swap_remove` moved the last element into `idx` (unless it *was* the
+        // last); re-point its index entry so the map stays consistent.
+        if let Some(moved) = self.streams.get(idx) {
+            self.stream_index.insert(moved.id, idx);
+        }
+        Some(removed)
     }
 }
 
@@ -2402,6 +2444,68 @@ mod tests {
         ));
     }
 
+    fn decode_settings_payload(payload: &[u8]) -> Vec<(u16, u32)> {
+        assert_eq!(
+            payload.len() % 6,
+            0,
+            "SETTINGS payload must be a 6-byte multiple"
+        );
+        payload
+            .chunks_exact(6)
+            .map(|c| {
+                let id = u16::from_be_bytes([c[0], c[1]]);
+                let value = u32::from_be_bytes([c[2], c[3], c[4], c[5]]);
+                (id, value)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn server_initial_settings_advertises_configured_limits() {
+        // The server's initial (non-ACK) SETTINGS must tell the peer the
+        // configured caps; an empty payload leaves the peer on protocol
+        // defaults (unlimited concurrent streams, 65535 window, 16384 frame).
+        let mut conn = unit_connection();
+        conn.read_buf.extend_from_slice(CLIENT_PREFACE);
+        let mut effects: Vec<Effect<Http2Connection<UnitShard>>> = Vec::new();
+        conn.process_buffer(&mut effects)
+            .expect("preface processes cleanly");
+
+        let (settings, _) = try_decode_frame(&conn.write_queue[0], conn.limits.max_frame_size)
+            .expect("complete queued frame")
+            .expect("queued SETTINGS decodes");
+        assert_eq!(settings.ty, FRAME_SETTINGS);
+        assert_eq!(settings.flags, 0, "initial SETTINGS is not an ACK");
+        let advertised = decode_settings_payload(&settings.payload);
+        let limits = Http2Limits::default();
+        assert!(
+            advertised
+                .iter()
+                .any(|&(id, v)| id == SETTINGS_MAX_CONCURRENT_STREAMS
+                    && v == limits.max_concurrent_streams as u32),
+            "SETTINGS must advertise MAX_CONCURRENT_STREAMS, got {advertised:?}"
+        );
+        assert!(
+            advertised
+                .iter()
+                .any(|&(id, v)| id == SETTINGS_INITIAL_WINDOW_SIZE
+                    && v == limits.initial_stream_window as u32),
+            "SETTINGS must advertise INITIAL_WINDOW_SIZE, got {advertised:?}"
+        );
+        assert!(
+            advertised
+                .iter()
+                .any(|&(id, v)| id == SETTINGS_MAX_FRAME_SIZE && v == limits.max_frame_size as u32),
+            "SETTINGS must advertise MAX_FRAME_SIZE, got {advertised:?}"
+        );
+        assert!(
+            advertised
+                .iter()
+                .any(|&(id, v)| id == SETTINGS_ENABLE_PUSH && v == 0),
+            "SETTINGS must disable server push, got {advertised:?}"
+        );
+    }
+
     #[test]
     fn window_update_overflow_is_typed() {
         assert_eq!(
@@ -2424,7 +2528,7 @@ mod tests {
     #[test]
     fn zero_stream_window_update_resets_only_that_stream() {
         let mut conn = unit_connection();
-        conn.streams.push(ActiveStream::new(
+        conn.push_stream(ActiveStream::new(
             1,
             HeaderBlock::default(),
             DEFAULT_WINDOW,
@@ -2462,6 +2566,48 @@ mod tests {
     }
 
     #[test]
+    fn stream_index_stays_consistent_across_swap_remove() {
+        // `find_stream` is O(1) via the id→slot index; it must agree with the
+        // Vec after a `swap_remove` moves the tail element into the hole.
+        let mut conn = unit_connection();
+        for id in [1u32, 3, 5, 7] {
+            conn.push_stream(ActiveStream::new(
+                id,
+                HeaderBlock::default(),
+                DEFAULT_WINDOW,
+                DEFAULT_WINDOW,
+                false,
+            ));
+        }
+        // Every id resolves to the slot the Vec actually holds.
+        for id in [1u32, 3, 5, 7] {
+            let idx = conn.find_stream(id).expect("stream present");
+            assert_eq!(conn.streams[idx].id, id);
+        }
+
+        // Remove a middle stream: `swap_remove` moves id 7 into its slot.
+        let removed = conn.remove_stream(3).expect("removed stream 3");
+        assert_eq!(removed.id, 3);
+        assert!(conn.find_stream(3).is_none(), "removed id is gone");
+        for id in [1u32, 5, 7] {
+            let idx = conn.find_stream(id).expect("survivor present");
+            assert_eq!(
+                conn.streams[idx].id, id,
+                "index must still point at the right slot after swap_remove"
+            );
+        }
+        assert_eq!(conn.streams.len(), 3);
+        assert_eq!(conn.stream_index.len(), 3);
+
+        // Remove the tail (no swap needed) and the head (swap moves tail in).
+        conn.remove_stream(7).expect("removed tail");
+        conn.remove_stream(1).expect("removed head");
+        assert_eq!(conn.find_stream(5).map(|i| conn.streams[i].id), Some(5));
+        assert_eq!(conn.streams.len(), 1);
+        assert_eq!(conn.stream_index.len(), 1);
+    }
+
+    #[test]
     fn pseudo_header_after_regular_header_is_rejected() {
         let mut block = Vec::new();
         encode_literal_header("x-test", "ok", &mut block);
@@ -2483,7 +2629,7 @@ mod tests {
     fn response_body_cap_resets_stream_and_reports_stream_full() {
         let mut conn = unit_connection();
         conn.limits.max_response_body_bytes = 2;
-        conn.streams.push(ActiveStream::new(
+        conn.push_stream(ActiveStream::new(
             1,
             HeaderBlock::default(),
             DEFAULT_WINDOW,
@@ -2529,7 +2675,7 @@ mod tests {
     #[test]
     fn rst_stream_emits_inbound_reset_and_close_protocol_facts() {
         let mut conn = unit_connection();
-        conn.streams.push(ActiveStream::new(
+        conn.push_stream(ActiveStream::new(
             5,
             HeaderBlock::default(),
             DEFAULT_WINDOW,
@@ -2816,7 +2962,7 @@ mod tests {
     fn streaming_response_body_cap_emits_high_water_and_reset_facts() {
         let mut conn = unit_connection();
         conn.limits.max_response_body_bytes = 2;
-        conn.streams.push(ActiveStream::new(
+        conn.push_stream(ActiveStream::new(
             1,
             HeaderBlock::default(),
             DEFAULT_WINDOW,
@@ -2887,7 +3033,7 @@ mod tests {
     fn stream_receive_window_full_resets_only_that_stream() {
         let mut conn = unit_connection();
         conn.recv_window = 100;
-        conn.streams.push(ActiveStream::new(
+        conn.push_stream(ActiveStream::new(
             1,
             HeaderBlock::default(),
             1,
@@ -2929,7 +3075,7 @@ mod tests {
         // so replay can pin a precise error code rather than silently
         // collapsing into a generic catch-all.
         let mut conn = unit_connection();
-        conn.streams.push(ActiveStream::new(
+        conn.push_stream(ActiveStream::new(
             3,
             HeaderBlock::default(),
             DEFAULT_WINDOW,
@@ -3004,7 +3150,7 @@ mod tests {
         // isolate will mirror for the received-status side.
         let mut conn = unit_connection();
         conn.self_isolate_id = Some(IsolateId::new(77));
-        conn.streams.push(ActiveStream::new(
+        conn.push_stream(ActiveStream::new(
             5,
             HeaderBlock::default(),
             DEFAULT_WINDOW,

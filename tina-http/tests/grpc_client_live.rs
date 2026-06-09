@@ -370,6 +370,7 @@ fn oversized_request_is_rejected_before_the_wire() {
         conn,
         GrpcLimits {
             max_message_bytes: 1,
+            ..Default::default()
         },
     );
 
