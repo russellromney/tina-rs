@@ -340,11 +340,18 @@ where
     /// stays reserved until the client replies or the bridge deadline
     /// backstop fires. Must be `> 0`.
     ///
-    /// The shim's mailbox is sized to `max_in_flight * 2` so a burst
-    /// of ordinary late replies plus freshly-admitted replies fits
-    /// together in the common case. If a reply is still lost, the
-    /// bridge deadline backstop settles the awaiter with
-    /// [`BridgeError::Timeout`] instead of hanging forever.
+    /// `client_max_in_flight` is the underlying [`tina_rpc::Client`]'s
+    /// own `max_in_flight` (its [`tina_rpc::ClientConfig::max_in_flight`]).
+    /// It is a *different, larger* cap than the bridge's: on a connection
+    /// close the client's `begin_close` fans out one
+    /// [`ClientResultMsg`] per in-flight entry **at once**, bounded by
+    /// `client_max_in_flight` — not by the bridge's `max_in_flight`. The
+    /// shim's reply-demux mailbox is sized to absorb that whole burst plus
+    /// the bridge's own freshly-admitted replies
+    /// (`client_max_in_flight + max_in_flight`), so a live reply is never
+    /// dropped and every awaiter settles with its true terminal cause
+    /// (e.g. [`BridgeError::ConnectionClosed`]) instead of a backstop
+    /// [`BridgeError::Timeout`]. Must be `>= max_in_flight`.
     ///
     /// `runtime` is taken as `Arc<ThreadedRuntime<...>>` because
     /// the bridge's reply demux closure must outlive any single
@@ -355,6 +362,7 @@ where
         runtime: Arc<ThreadedRuntime<S, F>>,
         client_addr: Address<ClientMsg>,
         max_in_flight: usize,
+        client_max_in_flight: usize,
     ) -> Result<Self, BridgeError>
     where
         F: MailboxFactory + Send + Clone + 'static,
@@ -363,6 +371,10 @@ where
             max_in_flight > 0,
             "BridgeClient::new requires max_in_flight > 0",
         );
+        assert!(
+            client_max_in_flight >= max_in_flight,
+            "BridgeClient::new requires client_max_in_flight ({client_max_in_flight}) >= max_in_flight ({max_in_flight})",
+        );
         let pending: Arc<Mutex<PendingMap>> = Arc::new(Mutex::new(HashMap::new()));
         let slots = Arc::new(Semaphore::new(max_in_flight));
         let shim = ReplyShim::<S> {
@@ -370,9 +382,13 @@ where
             slots: Arc::clone(&slots),
             _shard: std::marker::PhantomData,
         };
-        let shim_mailbox = max_in_flight
-            .checked_mul(2)
-            .expect("BridgeClient::new max_in_flight * 2 overflows usize");
+        // Size against the *client's* in-flight cap (the begin_close
+        // fan-out bound), not the bridge's, plus headroom for the bridge's
+        // own admitted-in-flight replies. A full close burst can never
+        // overflow the shim and drop a live reply.
+        let shim_mailbox = client_max_in_flight
+            .checked_add(max_in_flight)
+            .expect("BridgeClient::new client_max_in_flight + max_in_flight overflows usize");
         let shim_addr = runtime
             .register_with_capacity::<ReplyShim<S>, Infallible>(shim, shim_mailbox)
             .map_err(|_| BridgeError::ClientUnavailable)?;

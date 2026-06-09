@@ -33,6 +33,7 @@ use crate::call::{
 use crate::driver::DriverShutdownError;
 use crate::fact::{IntoRuntimeFact, RuntimeFact};
 use crate::mailbox::MailboxFactory;
+use crate::registration::ContinuationDelivery;
 use crate::remote::{
     QueuedRemoteEnvelope, QueuedRemoteSend, RemoteCallOutcome, RemoteCallReply, RemoteChildRestart,
     RemoteChildRestarted, RemoteChildStop, RemoteSpawnCancel, RemoteSpawnRequest,
@@ -275,12 +276,13 @@ where
         round_messages.clear();
         reserve_round_message_scratch(&mut round_messages, self.entries.len());
         for index in 0..self.entries.len() {
-            // Skip-empty scan: a quiet mailbox answers `is_empty()` cheaply, so
-            // we avoid the expensive `recv` (virtual call + lock + context pop)
-            // on idle isolates. `is_empty()` reflects real mailbox state for
-            // every ingress path, so a directly-pushed message is never skipped.
+            // Skip-empty scan: a quiet entry answers cheaply, so we avoid the
+            // expensive `recv` (virtual call + lock + context pop) on idle
+            // isolates. The check covers both ingress paths — bounded mailbox
+            // and continuation overflow — so a parked continuation is never
+            // skipped.
             let message =
-                if self.entries[index].stopped.get() || self.entries[index].mailbox.is_empty() {
+                if self.entries[index].stopped.get() || !self.entry_has_pending_message(index) {
                     None
                 } else {
                     self.recv_entry_message(index)
@@ -2207,12 +2209,27 @@ where
     ) {
         match completion {
             ErasedRuntimeCallCompletion::Message(message) => {
-                match self.enqueue_entry_message(
+                // A runtime-call continuation keeps a held resource alive (a
+                // bridge poll loop, a read/write loop). It must never be
+                // dropped on a full mailbox, or the slot leaks forever. Deliver
+                // it through the non-droppable continuation path: mailbox first,
+                // priority overflow on Full.
+                match self.enqueue_call_continuation(
                     entry_index,
                     message,
                     in_flight.continuation_context,
                 ) {
-                    Ok(()) => {
+                    Ok(delivery) => {
+                        if matches!(delivery, ContinuationDelivery::Overflow) {
+                            self.push_event(
+                                in_flight.requester.isolate,
+                                Some(in_flight.cause),
+                                RuntimeEventKind::CallContinuationOverflowed {
+                                    call_id,
+                                    call_kind: in_flight.call_kind,
+                                },
+                            );
+                        }
                         if failure_reason.is_none() {
                             self.push_event(
                                 in_flight.requester.isolate,
@@ -2224,22 +2241,13 @@ where
                             );
                         }
                         // For failed results we already emitted `CallFailed`
-                        // above; the translator's message reaching the mailbox
+                        // above; the translator's message reaching the isolate
                         // is the expected behavior and does not need a second
                         // event.
                     }
-                    Err(TrySendError::Full(_)) => {
-                        self.push_event(
-                            in_flight.requester.isolate,
-                            Some(in_flight.cause),
-                            RuntimeEventKind::CallCompletionRejected {
-                                call_id,
-                                call_kind: in_flight.call_kind,
-                                reason: CallCompletionRejectedReason::MailboxFull,
-                            },
-                        );
-                    }
-                    Err(TrySendError::Closed(_)) => {
+                    Err(_closed) => {
+                        // Only a gone requester reaches here; overflow absorbs
+                        // a full mailbox.
                         self.push_event(
                             in_flight.requester.isolate,
                             Some(in_flight.cause),
@@ -3781,6 +3789,16 @@ where
     pub(crate) stopped_event: Cell<Option<EventId>>,
     pub(crate) mailbox: Box<dyn ErasedMailbox>,
     pub(crate) call_contexts: RefCell<VecDeque<Option<MessageCallContext>>>,
+    /// Priority queue for runtime-call continuations that did not fit in the
+    /// bounded mailbox. A held resource (a bridge's leased slot) stays alive
+    /// only while its `sleep().then(Poll)` self-continuation keeps firing; if
+    /// that continuation is dropped on a full mailbox the slot leaks forever.
+    /// The overflow takes such continuations instead of dropping them and is
+    /// drained ahead of the mailbox. This is intentionally a priority lane,
+    /// not FIFO with ordinary ingress: the continuation holds runtime-owned
+    /// liveness. It is bounded by the isolate's own outstanding runtime calls,
+    /// so it cannot grow without bound.
+    pub(crate) continuation_overflow: RefCell<VecDeque<DeliveredMessage>>,
     pub(crate) handler: RefCell<Box<dyn ErasedHandler<S, F>>>,
 }
 

@@ -31,6 +31,15 @@ use tina::{
 };
 use tina_supervisor::SupervisorConfig;
 
+/// Where a non-droppable continuation landed. Lets the caller record the
+/// honest trace (mailbox accept vs. overflow park) without changing terminal
+/// outcome — both mean "delivered."
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ContinuationDelivery {
+    Mailbox,
+    Overflow,
+}
+
 use crate::call::IntoErasedCall;
 use crate::dispatch::ErasedRestartRecipe;
 use crate::errors::{RegisterBootstrapError, SuperviseError};
@@ -375,6 +384,7 @@ where
             stopped_event: Cell::new(None),
             mailbox: Box::new(AnyMailboxAdapter { mailbox }),
             call_contexts: RefCell::new(VecDeque::new()),
+            continuation_overflow: RefCell::new(VecDeque::new()),
             handler: RefCell::new(Box::new(HandlerAdapter::<I, Outbound> {
                 isolate,
                 marker: PhantomData,
@@ -481,6 +491,17 @@ where
     }
 
     pub(crate) fn recv_entry_message(&self, entry_index: usize) -> Option<DeliveredMessage> {
+        // Overflowed continuations drain first. This is an explicit priority
+        // lane, not FIFO with the ordinary mailbox: the mailbox was full when
+        // the continuation arrived, and the continuation keeps a held resource
+        // alive, so liveness wins over ordinary queued ingress.
+        if let Some(delivered) = self.entries[entry_index]
+            .continuation_overflow
+            .borrow_mut()
+            .pop_front()
+        {
+            return Some(delivered);
+        }
         let message = self.entries[entry_index].mailbox.recv_boxed()?;
         let call_context = self.entries[entry_index]
             .call_contexts
@@ -491,6 +512,50 @@ where
             message,
             call_context,
         })
+    }
+
+    /// True when the entry has any deliverable message — overflowed
+    /// continuation or mailbox. Used by the skip-empty scan so an
+    /// overflow-only entry is never skipped.
+    pub(crate) fn entry_has_pending_message(&self, entry_index: usize) -> bool {
+        !self.entries[entry_index]
+            .continuation_overflow
+            .borrow()
+            .is_empty()
+            || !self.entries[entry_index].mailbox.is_empty()
+    }
+
+    /// Delivers a runtime-call continuation that must not be dropped. Tries
+    /// the bounded mailbox first; on `Full` it parks the message in the
+    /// entry's priority overflow rather than dropping it, so a held resource's
+    /// self-continuation always reaches the isolate. Returns `Err` only when
+    /// the requester is gone (`Closed`), which is a real terminal.
+    pub(crate) fn enqueue_call_continuation(
+        &self,
+        entry_index: usize,
+        message: Box<dyn Any>,
+        call_context: Option<MessageCallContext>,
+    ) -> Result<ContinuationDelivery, TrySendError<Box<dyn Any>>> {
+        match self.entries[entry_index].mailbox.try_send_boxed(message) {
+            Ok(()) => {
+                self.entries[entry_index]
+                    .call_contexts
+                    .borrow_mut()
+                    .push_back(call_context);
+                Ok(ContinuationDelivery::Mailbox)
+            }
+            Err(TrySendError::Full(message)) => {
+                self.entries[entry_index]
+                    .continuation_overflow
+                    .borrow_mut()
+                    .push_back(DeliveredMessage {
+                        message,
+                        call_context,
+                    });
+                Ok(ContinuationDelivery::Overflow)
+            }
+            Err(closed @ TrySendError::Closed(_)) => Err(closed),
+        }
     }
 
     pub(crate) fn entry_index(&self, address: RegisteredAddress) -> Option<usize> {
@@ -579,6 +644,7 @@ where
             stopped_event: Cell::new(None),
             mailbox,
             call_contexts: RefCell::new(VecDeque::new()),
+            continuation_overflow: RefCell::new(VecDeque::new()),
             handler: RefCell::new(Box::new(HandlerAdapter::<I, Outbound> {
                 isolate,
                 marker: PhantomData,
@@ -776,6 +842,7 @@ where
             stopped_event: Cell::new(None),
             mailbox,
             call_contexts: RefCell::new(VecDeque::new()),
+            continuation_overflow: RefCell::new(VecDeque::new()),
             handler: RefCell::new(Box::new(SendableHandlerAdapter::<I, Outbound> {
                 isolate,
                 marker: PhantomData,

@@ -936,6 +936,112 @@ fn install_fails_on_bad_path_with_open_variant() {
 }
 
 // ---------------------------------------------------------------------------
+// Slot conservation under mailbox saturation (max_in_flight = 1)
+// ---------------------------------------------------------------------------
+
+/// The sharp case from the bridge review: with `max_in_flight = 1` and a
+/// tiny mailbox, a burst of callers fills the mailbox at the moment the
+/// in-flight request's `sleep().then(Poll)` continuation is due. If that
+/// continuation is dropped, the single slot is never freed and the bridge
+/// wedges to `Full` forever — `admitted` stalls and `current_in_flight`
+/// never returns to 0.
+///
+/// This drives many sequential rounds through a capacity-1 mailbox: far
+/// more total requests than the mailbox can ever hold at once, so the Poll
+/// continuation repeatedly races a full mailbox. The bridge must keep
+/// admitting work (slot reclaimed every round) and every caller must settle.
+#[test]
+fn slot_is_conserved_under_mailbox_saturation() {
+    let runtime = make_runtime();
+    let bridge = install_bridge(
+        &runtime,
+        // Capacity 1: the Poll continuation has zero spare mailbox room the
+        // instant any caller queues a Request.
+        test_config()
+            .with_mailbox_capacity(1)
+            .with_poll_interval(Duration::from_millis(1)),
+    );
+    create_and_seed(bridge.address, &runtime);
+
+    // Seed left admitted at some baseline; capture it.
+    let baseline_admitted = bridge.metrics.snapshot().admitted;
+
+    let rounds: u32 = 12;
+    let callers_per_round: u32 = 6;
+    let mut settled = 0u32;
+    for round in 0..rounds {
+        let sink = Arc::new(Sink::default());
+        for c in 0..callers_per_round {
+            let caller = register_caller(
+                &runtime,
+                bridge.address,
+                Arc::clone(&sink),
+                Duration::from_secs(10),
+            );
+            runtime
+                .try_send(
+                    caller,
+                    CallerMsg::Run(SqliteRequest::Execute {
+                        sql: "INSERT INTO t (k, v) VALUES (?, ?)".into(),
+                        params: vec![
+                            SqliteValue::Integer((round * 100 + c) as i64 + 100),
+                            SqliteValue::Text(format!("sat-{round}-{c}")),
+                        ],
+                    }),
+                )
+                .expect("kick saturation caller");
+        }
+        // Every caller in this round must settle — never hang. Under capacity-1
+        // saturation a caller's call to the bridge mailbox can bounce as a
+        // runtime-level `CallOutcome::Full` (mailbox full at admission) or, once
+        // admitted, reply `SqliteError::Full`; both are honest non-hangs. A
+        // leaked slot would instead surface as `Timeout`/`Closed`, which still
+        // panics here. The slot-conservation proof is the admitted/in_flight
+        // asserts below, not the per-caller outcome.
+        let outcomes = sink.wait_n(callers_per_round as usize, Duration::from_secs(20));
+        for o in outcomes {
+            match o {
+                CallOutcome::Replied(Ok(SqliteResponse::Executed { .. }))
+                | CallOutcome::Replied(Err(SqliteError::Full))
+                | CallOutcome::Full => settled += 1,
+                other => panic!("unexpected saturation outcome: {other:?}"),
+            }
+        }
+    }
+
+    assert_eq!(
+        settled,
+        rounds * callers_per_round,
+        "every caller across all rounds must settle"
+    );
+
+    // The slot must be freed after each round, so the bridge keeps admitting
+    // real work round after round. A wedged bridge would admit at most one
+    // more after the baseline and then stall forever at Full.
+    let snap = bridge.metrics.snapshot();
+    assert!(
+        snap.admitted >= baseline_admitted + rounds as u64,
+        "bridge stopped admitting — slot leaked. admitted={}, baseline={}",
+        snap.admitted,
+        baseline_admitted,
+    );
+
+    // Drain to idle: the single slot must return to free.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while bridge.metrics.snapshot().current_in_flight != 0 {
+        if Instant::now() >= deadline {
+            panic!(
+                "in_flight never returned to 0: {:?}",
+                bridge.metrics.snapshot()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+
+    shutdown_runtime(runtime);
+}
+
+// ---------------------------------------------------------------------------
 // Mailbox burst: all 8 admissions resolve to Ok or Full
 // ---------------------------------------------------------------------------
 

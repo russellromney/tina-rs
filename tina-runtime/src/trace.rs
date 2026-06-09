@@ -680,6 +680,20 @@ pub enum RuntimeEventKind {
         call_kind: CallKind,
     },
 
+    /// A runtime-call continuation could not fit in the requester's bounded
+    /// mailbox, so the runtime parked it in the entry's priority overflow
+    /// instead of dropping it. The continuation is still delivered (overflow
+    /// drains ahead of the mailbox); this records the backpressure. Held-
+    /// resource self-continuations (a bridge's poll loop) rely on this to
+    /// never lose their liveness wakeup.
+    CallContinuationOverflowed {
+        /// The runtime-assigned identifier for the call.
+        call_id: CallId,
+
+        /// The trace-level kind of the call.
+        call_kind: CallKind,
+    },
+
     /// The runtime observed a failure outcome for a runtime-owned call.
     /// The translated failure result was still delivered to the
     /// requesting isolate; this event records the reason.
@@ -1752,6 +1766,11 @@ fn write_kind_stable(kind: RuntimeEventKind, hasher: &mut StableHasher) {
         }
         RuntimeEventKind::CallCompleted { call_id, call_kind } => {
             hasher.write_u8(18);
+            hasher.write_u64(call_id.get());
+            hasher.write_u8(call_kind_tag(call_kind));
+        }
+        RuntimeEventKind::CallContinuationOverflowed { call_id, call_kind } => {
+            hasher.write_u8(45);
             hasher.write_u64(call_id.get());
             hasher.write_u8(call_kind_tag(call_kind));
         }
