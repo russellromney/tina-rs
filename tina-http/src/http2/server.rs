@@ -2445,7 +2445,11 @@ mod tests {
     }
 
     fn decode_settings_payload(payload: &[u8]) -> Vec<(u16, u32)> {
-        assert_eq!(payload.len() % 6, 0, "SETTINGS payload must be a 6-byte multiple");
+        assert_eq!(
+            payload.len() % 6,
+            0,
+            "SETTINGS payload must be a 6-byte multiple"
+        );
         payload
             .chunks_exact(6)
             .map(|c| {
@@ -2467,10 +2471,9 @@ mod tests {
         conn.process_buffer(&mut effects)
             .expect("preface processes cleanly");
 
-        let (settings, _) =
-            try_decode_frame(&conn.write_queue[0], conn.limits.max_frame_size)
-                .expect("complete queued frame")
-                .expect("queued SETTINGS decodes");
+        let (settings, _) = try_decode_frame(&conn.write_queue[0], conn.limits.max_frame_size)
+            .expect("complete queued frame")
+            .expect("queued SETTINGS decodes");
         assert_eq!(settings.ty, FRAME_SETTINGS);
         assert_eq!(settings.flags, 0, "initial SETTINGS is not an ACK");
         let advertised = decode_settings_payload(&settings.payload);
@@ -2492,8 +2495,7 @@ mod tests {
         assert!(
             advertised
                 .iter()
-                .any(|&(id, v)| id == SETTINGS_MAX_FRAME_SIZE
-                    && v == limits.max_frame_size as u32),
+                .any(|&(id, v)| id == SETTINGS_MAX_FRAME_SIZE && v == limits.max_frame_size as u32),
             "SETTINGS must advertise MAX_FRAME_SIZE, got {advertised:?}"
         );
         assert!(

@@ -4,9 +4,13 @@
 use super::*;
 
 #[cfg(unix)]
+use std::os::fd::AsRawFd;
+#[cfg(unix)]
 use std::os::unix::process::CommandExt;
 
 const PROCESS_DRAIN_JOIN_TIMEOUT: Duration = Duration::from_millis(100);
+const PROCESS_DRAIN_CANCEL_JOIN_TIMEOUT: Duration = Duration::from_millis(20);
+const PROCESS_DRAIN_POLL_SLEEP: Duration = Duration::from_millis(1);
 
 /// Budget for reaping a child after we SIGKILL it. A reap that does not
 /// complete in this window (D-state child, or a kill that did not land) must
@@ -43,6 +47,11 @@ pub(super) struct ProcessCommand {
 struct ProcessCompletion {
     call_id: CallId,
     result: CallOutput,
+}
+
+struct DrainHandle {
+    handle: JoinHandle<(Vec<u8>, bool)>,
+    cancel: Arc<AtomicBool>,
 }
 
 impl ProcessLane {
@@ -335,8 +344,8 @@ fn execute_process_command(command: ProcessCommand) -> CallOutput {
 
 fn kill_and_reap(
     mut child: std::process::Child,
-    stdout: Option<JoinHandle<(Vec<u8>, bool)>>,
-    stderr: Option<JoinHandle<(Vec<u8>, bool)>>,
+    stdout: Option<DrainHandle>,
+    stderr: Option<DrainHandle>,
     fallback: CallError,
 ) -> CallOutput {
     // SIGKILL the leader directly first, while its pid is live. A process-
@@ -360,8 +369,11 @@ fn kill_and_reap(
         let process_group = child.id();
         return match child.try_wait() {
             Ok(Some(_)) => process_exited(child, stdout, stderr, process_group),
-            Ok(None) => CallOutput::Failed(CallError::KillUncertain),
-            Err(_) => CallOutput::Failed(fallback),
+            // Child still alive (kill and reap both failed). Spend the bounded
+            // drain budget so the drain threads observe EOF or time out instead
+            // of being detached forever and leaking a thread + pipe fd each.
+            Ok(None) => kill_uncertain(stdout, stderr),
+            Err(_) => kill_uncertain_with(stdout, stderr, fallback),
         };
     }
 
@@ -378,15 +390,40 @@ fn kill_and_reap(
             Ok(Some(_)) | Err(_) => break,
             Ok(None) => {
                 if Instant::now() >= reap_deadline {
-                    return CallOutput::Failed(CallError::KillUncertain);
+                    // Same leak hazard as above: bound the drains before giving up.
+                    return kill_uncertain(stdout, stderr);
                 }
                 thread::sleep(Duration::from_millis(1));
             }
         }
     }
+    drain_and_discard(stdout, stderr);
+    CallOutput::Failed(fallback)
+}
+
+/// Spend the bounded drain budget on the stdout/stderr handles, then report
+/// `KillUncertain`. Every `KillUncertain` exit must route through here (or
+/// `kill_uncertain_with`) so the drain threads are cancelled and joined rather
+/// than dropped. Dropping a `JoinHandle` detaches a thread that, with the child
+/// still alive, can block in `read()` forever and leak a pipe fd.
+fn kill_uncertain(stdout: Option<DrainHandle>, stderr: Option<DrainHandle>) -> CallOutput {
+    kill_uncertain_with(stdout, stderr, CallError::KillUncertain)
+}
+
+fn kill_uncertain_with(
+    stdout: Option<DrainHandle>,
+    stderr: Option<DrainHandle>,
+    error: CallError,
+) -> CallOutput {
+    drain_and_discard(stdout, stderr);
+    CallOutput::Failed(error)
+}
+
+/// Join both drain handles under the bounded budget and throw the bytes away.
+/// Used by the terminal failure paths, which report a typed error, not output.
+fn drain_and_discard(stdout: Option<DrainHandle>, stderr: Option<DrainHandle>) {
     let _ = join_drain_bounded(stdout, PROCESS_DRAIN_JOIN_TIMEOUT);
     let _ = join_drain_bounded(stderr, PROCESS_DRAIN_JOIN_TIMEOUT);
-    CallOutput::Failed(fallback)
 }
 
 fn spawn_process(command: &ProcessCommand) -> std::io::Result<std::process::Child> {
@@ -423,8 +460,8 @@ fn kill_process_group(pid: u32) -> std::io::Result<()> {
 
 fn process_exited(
     mut child: std::process::Child,
-    stdout: Option<JoinHandle<(Vec<u8>, bool)>>,
-    stderr: Option<JoinHandle<(Vec<u8>, bool)>>,
+    stdout: Option<DrainHandle>,
+    stderr: Option<DrainHandle>,
     process_group: u32,
 ) -> CallOutput {
     let (stdout, stdout_truncated) = join_drain_bounded(stdout, PROCESS_DRAIN_JOIN_TIMEOUT);
@@ -455,15 +492,64 @@ fn process_exited(
     }
 }
 
-fn spawn_drain_limited<R>(mut reader: R, limit: usize) -> JoinHandle<(Vec<u8>, bool)>
+#[cfg(unix)]
+#[allow(unsafe_code)]
+fn set_nonblocking_fd(fd: std::os::fd::RawFd) -> std::io::Result<()> {
+    // SAFETY: `fd` is borrowed from a live pipe/stream owned by the drain
+    // reader. `fcntl` does not take ownership.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: same borrowed fd; this only updates the descriptor flags.
+    let result = unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
+    if result < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn spawn_drain_limited<R>(reader: R, limit: usize) -> DrainHandle
+where
+    R: Read + AsRawFd + Send + 'static,
+{
+    if set_nonblocking_fd(reader.as_raw_fd()).is_err() {
+        return finished_drain(Vec::new(), true);
+    }
+    spawn_drain_thread(reader, limit)
+}
+
+#[cfg(not(unix))]
+fn spawn_drain_limited<R>(reader: R, limit: usize) -> DrainHandle
 where
     R: Read + Send + 'static,
 {
-    thread::spawn(move || {
+    spawn_drain_thread(reader, limit)
+}
+
+fn finished_drain(bytes: Vec<u8>, truncated: bool) -> DrainHandle {
+    DrainHandle {
+        handle: thread::spawn(move || (bytes, truncated)),
+        cancel: Arc::new(AtomicBool::new(false)),
+    }
+}
+
+fn spawn_drain_thread<R>(mut reader: R, limit: usize) -> DrainHandle
+where
+    R: Read + Send + 'static,
+{
+    let cancel = Arc::new(AtomicBool::new(false));
+    let thread_cancel = Arc::clone(&cancel);
+    let handle = thread::spawn(move || {
         let mut captured = Vec::with_capacity(limit.min(8192));
         let mut truncated = false;
         let mut buffer = [0_u8; 8192];
         loop {
+            if thread_cancel.load(Ordering::Acquire) {
+                truncated = true;
+                break;
+            }
             match reader.read(&mut buffer) {
                 Ok(0) => break,
                 Ok(count) => {
@@ -474,6 +560,14 @@ where
                         truncated = true;
                     }
                 }
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                    ) =>
+                {
+                    thread::sleep(PROCESS_DRAIN_POLL_SLEEP);
+                }
                 Err(_) => {
                     truncated = true;
                     break;
@@ -481,23 +575,116 @@ where
             }
         }
         (captured, truncated)
-    })
+    });
+    DrainHandle { handle, cancel }
 }
 
-fn join_drain_bounded(
-    handle: Option<JoinHandle<(Vec<u8>, bool)>>,
-    timeout: Duration,
-) -> (Vec<u8>, bool) {
+fn join_drain_bounded(handle: Option<DrainHandle>, timeout: Duration) -> (Vec<u8>, bool) {
     let Some(handle) = handle else {
         return (Vec::new(), false);
     };
     let deadline = Instant::now() + timeout;
     let mut handle = Some(handle);
     while Instant::now() < deadline {
-        if handle.as_ref().is_some_and(JoinHandle::is_finished) {
-            return handle.take().unwrap().join().unwrap_or_default();
+        if handle
+            .as_ref()
+            .is_some_and(|drain| drain.handle.is_finished())
+        {
+            return handle.take().unwrap().handle.join().unwrap_or_default();
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
+    let Some(drain) = handle.take() else {
+        return (Vec::new(), true);
+    };
+    drain.cancel.store(true, Ordering::Release);
+    let cancel_deadline = Instant::now() + PROCESS_DRAIN_CANCEL_JOIN_TIMEOUT;
+    let mut drain = Some(drain);
+    while Instant::now() < cancel_deadline {
+        if drain
+            .as_ref()
+            .is_some_and(|drain| drain.handle.is_finished())
+        {
+            return drain.take().unwrap().handle.join().unwrap_or_default();
         }
         thread::sleep(Duration::from_millis(1));
     }
     (Vec::new(), true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(unix)]
+    use std::os::unix::net::UnixStream;
+
+    #[cfg(unix)]
+    fn idle_pipe_drain() -> (DrainHandle, UnixStream) {
+        let (reader, writer) = UnixStream::pair().expect("unix stream pair");
+        (spawn_drain_limited(reader, 1024), writer)
+    }
+
+    // The KillUncertain path must cancel and join the stdout/stderr drains, not
+    // drop (detach) them. The writer stays open, so EOF never arrives; returning
+    // proves the drain observed cancellation and the thread was joined.
+    #[cfg(unix)]
+    #[test]
+    fn kill_uncertain_cancels_and_joins_idle_drains() {
+        let (stdout, _stdout_writer) = idle_pipe_drain();
+        let (stderr, _stderr_writer) = idle_pipe_drain();
+
+        let started = Instant::now();
+        let out = kill_uncertain(Some(stdout), Some(stderr));
+        let elapsed = started.elapsed();
+
+        assert!(matches!(out, CallOutput::Failed(CallError::KillUncertain)));
+        assert!(
+            elapsed >= PROCESS_DRAIN_JOIN_TIMEOUT,
+            "expected bounded join to spend the drain budget, took {elapsed:?}",
+        );
+        assert!(
+            elapsed < PROCESS_DRAIN_JOIN_TIMEOUT * 3,
+            "cancelled drains should join promptly, took {elapsed:?}",
+        );
+    }
+
+    // The typed-fallback uncertain path (try_wait Err with the child alive) must
+    // also cancel and join the drains rather than detach them.
+    #[cfg(unix)]
+    #[test]
+    fn kill_uncertain_with_fallback_cancels_and_joins_idle_drains() {
+        let (stdout, _stdout_writer) = idle_pipe_drain();
+        let (stderr, _stderr_writer) = idle_pipe_drain();
+
+        let started = Instant::now();
+        let out = kill_uncertain_with(Some(stdout), Some(stderr), CallError::Timeout);
+        let elapsed = started.elapsed();
+
+        assert!(matches!(out, CallOutput::Failed(CallError::Timeout)));
+        assert!(
+            elapsed >= PROCESS_DRAIN_JOIN_TIMEOUT,
+            "expected bounded join to spend the drain budget, took {elapsed:?}",
+        );
+        assert!(
+            elapsed < PROCESS_DRAIN_JOIN_TIMEOUT * 3,
+            "cancelled drains should join promptly, took {elapsed:?}",
+        );
+    }
+
+    // A finished drain handle is joined immediately and its bytes recovered —
+    // the bounded join is not a fixed sleep, it observes completion.
+    #[test]
+    fn finished_drain_joins_without_spending_full_budget() {
+        let handle = finished_drain(b"out".to_vec(), false);
+        // Give the thread a moment to finish so the join sees it ready.
+        while !handle.handle.is_finished() {
+            thread::sleep(Duration::from_millis(1));
+        }
+        let started = Instant::now();
+        let (bytes, truncated) = join_drain_bounded(Some(handle), PROCESS_DRAIN_JOIN_TIMEOUT);
+        assert_eq!(bytes, b"out");
+        assert!(!truncated);
+        assert!(started.elapsed() < PROCESS_DRAIN_JOIN_TIMEOUT);
+    }
 }

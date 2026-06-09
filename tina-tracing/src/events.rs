@@ -394,6 +394,17 @@ pub fn emit_event(event: &RuntimeEvent) {
             call_id = call_id.get(),
             call_kind = call_kind_name(call_kind),
         ),
+        RuntimeEventKind::CallContinuationOverflowed { call_id, call_kind } => event!(
+            target: RUNTIME_TRACE_TARGET,
+            Level::DEBUG,
+            kind = "call_continuation_overflowed",
+            event_id,
+            cause_id = ?cause_id,
+            shard,
+            isolate,
+            call_id = call_id.get(),
+            call_kind = call_kind_name(call_kind),
+        ),
         RuntimeEventKind::CallFailed {
             call_id,
             call_kind,

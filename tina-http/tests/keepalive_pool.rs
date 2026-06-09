@@ -69,6 +69,11 @@ enum ServerPolicy {
     /// Return a valid chunked body followed by bytes shaped like a
     /// second response that no Tina request issued.
     ChunkedSmugglingShape,
+    /// Over-declare framing: send MORE body bytes than the declared
+    /// `Content-Length` on a reusable connection. The extra bytes are
+    /// the leading bytes of a fake next response. The client must treat
+    /// this as a framing desync and retire the socket, not pool it.
+    ContentLengthOverSend,
 }
 
 struct ScriptedServer {
@@ -248,6 +253,14 @@ fn handle_connection(
                     b"5\r\nhello\r\n0\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\nstale!",
                 );
             }
+            ServerPolicy::ContentLengthOverSend => {
+                // Declares 5 bytes, sends "hello" + extra bytes shaped
+                // like a fake next response. The reusable client must
+                // detect the over-send and retire the socket.
+                response.extend_from_slice(b"Content-Length: 5\r\n\r\n");
+                response
+                    .extend_from_slice(b"helloHTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\nstale!");
+            }
             _ => {
                 let body = b"ok";
                 response.extend_from_slice(b"Content-Length: 2\r\n");
@@ -267,7 +280,7 @@ fn handle_connection(
         buf.drain(..body_end);
 
         match policy {
-            ServerPolicy::Keepalive => {}
+            ServerPolicy::Keepalive | ServerPolicy::ContentLengthOverSend => {}
             ServerPolicy::CloseAfterFirst
             | ServerPolicy::SilentlyCloseAfterFirst
             | ServerPolicy::ChunkedConnectionClose
@@ -1176,6 +1189,79 @@ fn chunked_smuggling_shape_is_retired_before_next_request() {
         server.accepts(),
         2,
         "stale fake response bytes after chunk terminator must die with socket 1"
+    );
+
+    rig.shutdown();
+    server.stop();
+}
+
+#[test]
+fn content_length_over_send_retires_connection() {
+    // Server declares Content-Length: 5 but writes more bytes (the
+    // leading bytes of a fake next response). The keepalive client must
+    // not silently drop the extra bytes and reuse the desynced socket;
+    // it must retire the connection. Proof: request 2 forces a fresh
+    // accept rather than parsing the stale fake response on socket 1.
+    let server = ScriptedServer::start(ServerPolicy::ContentLengthOverSend);
+    let rig = TestRig::start();
+    let pool = rig.build_pool(HttpTarget::http(server.addr), 1, 4);
+    let (driver, _state, rx) = rig.driver(&pool);
+
+    for id in 1..=2 {
+        let _ = rig.rt().try_send(
+            driver,
+            DriverMsg::Acquire {
+                id,
+                timeout: Duration::from_secs(2),
+            },
+        );
+        wait_for_event(
+            &rx,
+            |e| matches!(e, DriverEvent::Acquired { id: i, .. } if *i == id),
+        );
+        let _ = rig.rt().try_send(
+            driver,
+            DriverMsg::Request {
+                id,
+                request: req(),
+                request_timeout: Duration::from_secs(2),
+                call_timeout: Duration::from_secs(2),
+            },
+        );
+        let event = wait_for_event(
+            &rx,
+            |e| matches!(e, DriverEvent::Request { id: i, .. } if *i == id),
+        );
+        match event {
+            DriverEvent::Request {
+                body, must_retire, ..
+            } => {
+                assert_eq!(&body, b"hello", "body is exactly the declared length");
+                assert!(
+                    must_retire,
+                    "over-sent body desyncs framing; socket must retire"
+                );
+            }
+            other => panic!("unexpected event {other:?}"),
+        }
+        let _ = rig.rt().try_send(
+            driver,
+            DriverMsg::Release {
+                id,
+                disposition: ReleaseDisposition::Reuse,
+            },
+        );
+        wait_for_event(
+            &rx,
+            |e| matches!(e, DriverEvent::Released { id: i, .. } if *i == id),
+        );
+    }
+
+    assert_eq!(server.requests(), 2);
+    assert_eq!(
+        server.accepts(),
+        2,
+        "over-sent body must die with socket 1, forcing a reconnect for request 2"
     );
 
     rig.shutdown();

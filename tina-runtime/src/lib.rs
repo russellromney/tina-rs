@@ -387,6 +387,9 @@ where
     pub(crate) mailbox_factory: F,
     pub(crate) entries: Vec<RegisteredEntry<S, F>>,
     pub(crate) entry_indexes: HashMap<IsolateId, usize>,
+    /// Set when any entry is stopped; lets the per-step GC skip its full
+    /// scan entirely while every isolate is live. Re-derived by the GC.
+    pub(crate) has_stopped_entries: bool,
     pub(crate) child_records: Vec<ChildRecord<S, F>>,
     pub(crate) supervisors: Vec<SupervisorRecord>,
     pub(crate) next_isolate_id: u64,
@@ -692,6 +695,7 @@ where
             mailbox_factory,
             entries: Vec::with_capacity(preallocation.entry_capacity),
             entry_indexes: HashMap::with_capacity(preallocation.entry_capacity),
+            has_stopped_entries: false,
             child_records: Vec::with_capacity(preallocation.child_record_capacity),
             supervisors: Vec::with_capacity(preallocation.supervisor_capacity),
             next_isolate_id: 1,

@@ -6,7 +6,7 @@
 //! behavior explicit in the handler body.
 
 use proc_macro::TokenStream;
-use quote::{ToTokens, quote};
+use quote::quote;
 use syn::parse::{Parse, ParseStream};
 use syn::{
     Error, FnArg, Ident, ImplItem, ImplItemFn, ItemImpl, Pat, Path, Result, ReturnType, Token,
@@ -606,20 +606,40 @@ fn validate_call_handler(
     ))
 }
 
+/// Counts genuine *expression-position* uses of `call_name` in the handler body.
+///
+/// Walks the parsed AST instead of the token text: a path expression like
+/// `call`, `call.reply(...)`, or `helper(call)` counts; the identifier inside a
+/// string literal (`"answer the call"`) or a comment does not, because the
+/// visitor never reaches literal contents.
+struct CallAuthorityUse<'a> {
+    needle: &'a syn::Ident,
+    used: bool,
+}
+
+impl<'a, 'ast> syn::visit::Visit<'ast> for CallAuthorityUse<'a> {
+    fn visit_expr_path(&mut self, node: &'ast syn::ExprPath) {
+        if node.qself.is_none() && node.path.is_ident(self.needle) {
+            self.used = true;
+        }
+        syn::visit::visit_expr_path(self, node);
+    }
+}
+
 fn require_call_authority_mentioned(body: &syn::Block, call_name: &syn::Ident) -> Result<()> {
-    let needle = call_name.to_string();
-    let body_tokens = body.to_token_stream().to_string();
-    if body_tokens
-        .split(|ch: char| !(ch == '_' || ch.is_ascii_alphanumeric()))
-        .any(|token| token == needle)
-    {
+    let mut visitor = CallAuthorityUse {
+        needle: call_name,
+        used: false,
+    };
+    syn::visit::visit_block(&mut visitor, body);
+    if visitor.used {
         return Ok(());
     }
 
     Err(Error::new_spanned(
         body,
         format!(
-            "split `handle_request` must use caller authority `{needle}`; reply, reject, or defer it"
+            "split `handle_request` must use caller authority `{call_name}`; reply, reject, or defer it"
         ),
     ))
 }

@@ -131,6 +131,116 @@ fn bounded_trace_retention_does_not_move_the_tail_on_every_event() {
     );
 }
 
+#[test]
+fn stopped_entry_gc_compacts_a_burst_in_one_pass_and_keeps_indexes_consistent() {
+    // Mass-disconnect shape: many stopped isolates become collectable in
+    // one step. GC must remove exactly them, leave live entries intact,
+    // and keep the id->index map resolving every survivor.
+    let mut runtime = Runtime::new(TestShard, TestMailboxFactory);
+
+    const N: usize = 64;
+    let mut addrs = Vec::with_capacity(N);
+    for _ in 0..N {
+        addrs.push(runtime.register(new_root(), root_mailbox()));
+    }
+
+    // Stop every even-indexed isolate; odd ones stay live.
+    let mut stopped_ids = Vec::new();
+    let mut live_ids = Vec::new();
+    for (i, entry) in runtime.entries.iter().enumerate() {
+        if i % 2 == 0 {
+            entry.stopped.set(true);
+            stopped_ids.push(entry.id);
+        } else {
+            live_ids.push(entry.id);
+        }
+    }
+    // Real stops flip this through the dispatch path; mirror it here so the
+    // per-step skip does not short-circuit the GC under test.
+    runtime.has_stopped_entries = true;
+
+    // Pin one stopped isolate open with an in-flight call: it must NOT be
+    // collected while a call references it.
+    let pinned = stopped_ids[0];
+    let pinned_addr = RegisteredAddress {
+        shard: runtime.shard.id(),
+        isolate: pinned,
+        generation: runtime.entries[0].generation,
+    };
+    runtime.push_in_flight_call(InFlightCall {
+        call_id: CallId::new(1),
+        call_kind: CallKind::IsolateCall,
+        requester: pinned_addr,
+        cause: CauseId::new(EventId::new(1)),
+        persistence: None,
+        continuation_context: None,
+    });
+
+    runtime.gc_stopped_entries();
+
+    // Pinned stopped entry survives (blocked by the in-flight call); all
+    // other stopped entries are gone; every live entry remains.
+    let remaining: std::collections::HashSet<IsolateId> =
+        runtime.entries.iter().map(|e| e.id).collect();
+    assert!(
+        remaining.contains(&pinned),
+        "in-flight-pinned stop survives"
+    );
+    assert!(
+        runtime.has_stopped_entries,
+        "flag must stay set while a blocked stop remains"
+    );
+    for id in &live_ids {
+        assert!(remaining.contains(id), "live entry must survive GC");
+    }
+    for id in stopped_ids.iter().skip(1) {
+        assert!(!remaining.contains(id), "collectable stop must be removed");
+    }
+    assert_eq!(runtime.entries.len(), live_ids.len() + 1);
+
+    // Index map matches the compacted Vec exactly: same length, and every
+    // id resolves to a slot holding that id.
+    assert_eq!(runtime.entry_indexes.len(), runtime.entries.len());
+    for (idx, entry) in runtime.entries.iter().enumerate() {
+        assert_eq!(
+            runtime.entry_indexes.get(&entry.id).copied(),
+            Some(idx),
+            "id->index map must resolve every survivor to its slot"
+        );
+    }
+    for id in stopped_ids.iter().skip(1) {
+        assert!(
+            !runtime.entry_indexes.contains_key(id),
+            "removed entry must not linger in the index"
+        );
+    }
+
+    // entry_index() resolves a live address through the rebuilt map.
+    let live_addr = RegisteredAddress {
+        shard: runtime.shard.id(),
+        isolate: addrs[1].isolate(),
+        generation: runtime.entries[runtime.entry_indexes[&addrs[1].isolate()]].generation,
+    };
+    assert_eq!(
+        runtime.entry_index(live_addr),
+        runtime.entry_indexes.get(&addrs[1].isolate()).copied()
+    );
+
+    // Settle the pinned call; now the last stop is collectable too.
+    runtime.remove_in_flight_call(CallId::new(1));
+    runtime.gc_stopped_entries();
+    assert!(
+        !runtime.entries.iter().any(|e| e.id == pinned),
+        "pinned stop collected after its call settles"
+    );
+    assert_eq!(runtime.entries.len(), live_ids.len());
+    assert_eq!(runtime.entry_indexes.len(), runtime.entries.len());
+    assert!(
+        !runtime.has_stopped_entries,
+        "flag must clear once no stop remains, so later steps skip the scan"
+    );
+}
+
 #[derive(Debug, Default)]
 struct TestShard;
 
@@ -1364,6 +1474,69 @@ fn new_manual_runtime() -> (Runtime<TestShard, TestMailboxFactory>, Rc<ManualClo
     let clock = Rc::new(ManualClock::new());
     let runtime = Runtime::with_clock(TestShard, TestMailboxFactory, Box::new(Rc::clone(&clock)));
     (runtime, clock)
+}
+
+/// Models a poll-loop bridge with `max_in_flight = 1`. `Admit` leases the
+/// single slot and arms `sleep().then(Poll)`; the `Poll` continuation is the
+/// only thing that ever frees the slot. A burst of `Admit`s past the slot
+/// just bounces with `Full` but still fills the mailbox — the exact shape
+/// that races the self-continuation for a free mailbox slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BridgeMsg {
+    Admit,
+    Poll,
+}
+
+#[derive(Debug)]
+struct PollLoopBridge {
+    in_flight: bool,
+    /// Set true the moment the leased slot is freed by a delivered `Poll`.
+    settled: Rc<Cell<bool>>,
+    seen: Rc<RefCell<Vec<BridgeMsg>>>,
+}
+
+impl Isolate for PollLoopBridge {
+    type Message = BridgeMsg;
+    type Reply = ();
+    type Send = Outbound<NeverOutbound>;
+    type Spawn = Infallible;
+    type SpawnObserved = std::convert::Infallible;
+    type Call = RuntimeCall<BridgeMsg>;
+    type Fact = ::std::convert::Infallible;
+    type Shard = TestShard;
+
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
+        self.seen.borrow_mut().push(msg);
+        match msg {
+            BridgeMsg::Admit => {
+                if self.in_flight {
+                    // Slot busy: bounce like a real bridge's `Full`.
+                    return Effect::Noop;
+                }
+                self.in_flight = true;
+                Effect::Call(RuntimeCall::new(
+                    CallInput::Sleep {
+                        after: Duration::from_millis(10),
+                    },
+                    |result| match result {
+                        CallOutput::TimerFired => BridgeMsg::Poll,
+                        other => panic!("expected TimerFired, got {other:?}"),
+                    },
+                ))
+            }
+            BridgeMsg::Poll => {
+                // External work treated as done on the first poll: free the
+                // slot. If this continuation is ever dropped, the slot leaks.
+                self.in_flight = false;
+                self.settled.set(true);
+                Effect::Noop
+            }
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -2745,6 +2918,104 @@ fn timer_fires_exactly_once() {
         })
         .count();
     assert_eq!(fired_count, 1, "timer must fire exactly once");
+}
+
+/// Slot-conservation property for poll-loop bridges: a `sleep().then(Poll)`
+/// self-continuation must reach the isolate even when the bounded mailbox is
+/// saturated with incoming work at the instant the continuation is due.
+/// Otherwise the leased slot is never freed and `max_in_flight` is
+/// permanently reduced — the wedge that takes a `max_in_flight = 1` bridge
+/// (sqlite) offline forever.
+#[test]
+fn poll_continuation_is_not_dropped_when_mailbox_is_saturated() {
+    let (mut runtime, clock) = new_manual_runtime();
+    let settled = Rc::new(Cell::new(false));
+    let seen = Rc::new(RefCell::new(Vec::new()));
+
+    // Tiny mailbox so a small burst saturates it. Capacity 2 leaves no spare
+    // slot for the Poll continuation once two Admits are queued.
+    let mailbox_capacity = 2;
+    let bridge = runtime.register(
+        PollLoopBridge {
+            in_flight: false,
+            settled: Rc::clone(&settled),
+            seen: Rc::clone(&seen),
+        },
+        TestMailbox::new(mailbox_capacity),
+    );
+
+    // Lease the single slot and arm the sleep continuation.
+    runtime.try_send(bridge, BridgeMsg::Admit).unwrap();
+    assert_eq!(runtime.step(), 1);
+    assert!(
+        runtime.has_in_flight_calls(),
+        "sleep call must be in flight"
+    );
+
+    // Saturate the mailbox with Admits that will bounce (slot busy) but still
+    // occupy every mailbox slot. Sized to fill capacity exactly.
+    for _ in 0..mailbox_capacity {
+        runtime.try_send(bridge, BridgeMsg::Admit).unwrap();
+    }
+
+    // The sleep is now due. On this step the runtime tries to deliver the
+    // Poll continuation into the (full) mailbox.
+    clock.advance(Duration::from_millis(10));
+    runtime.step();
+
+    // Drain anything the bridge can still process; give the continuation
+    // every chance to land on later steps.
+    for _ in 0..8 {
+        clock.advance(Duration::from_millis(10));
+        runtime.step();
+    }
+
+    assert!(
+        settled.get(),
+        "Poll continuation was dropped on a full mailbox: leased slot never freed (slot leak)"
+    );
+    assert!(
+        seen.borrow().contains(&BridgeMsg::Poll),
+        "overflowed continuation must be delivered exactly like a mailbox continuation"
+    );
+    assert!(
+        !runtime.has_in_flight_calls(),
+        "no sleep call should remain in flight once the slot is freed"
+    );
+}
+
+#[test]
+fn overflowed_call_continuation_is_priority_not_fifo_with_mailbox() {
+    let (mut runtime, clock) = new_manual_runtime();
+    let settled = Rc::new(Cell::new(false));
+    let seen = Rc::new(RefCell::new(Vec::new()));
+    let bridge = runtime.register(
+        PollLoopBridge {
+            in_flight: false,
+            settled,
+            seen: Rc::clone(&seen),
+        },
+        TestMailbox::new(2),
+    );
+
+    runtime.try_send(bridge, BridgeMsg::Admit).unwrap();
+    assert_eq!(runtime.step(), 1);
+
+    // Fill the ordinary mailbox before the sleep continuation becomes due.
+    runtime.try_send(bridge, BridgeMsg::Admit).unwrap();
+    runtime.try_send(bridge, BridgeMsg::Admit).unwrap();
+    clock.advance(Duration::from_millis(10));
+
+    // The due Poll cannot fit in the mailbox, so it parks in overflow. Overflow
+    // is a priority liveness lane: it is not FIFO with ordinary ingress.
+    runtime.step();
+    let seen = seen.borrow();
+    assert_eq!(seen[0], BridgeMsg::Admit);
+    assert_eq!(
+        seen[1],
+        BridgeMsg::Poll,
+        "overflowed runtime-call continuation must drain before older ordinary mailbox ingress"
+    );
 }
 
 #[test]
