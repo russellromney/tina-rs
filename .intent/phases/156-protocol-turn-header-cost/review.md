@@ -556,3 +556,61 @@ primitive named for the unary turn floor in `grpc_unary_turn_timeline.txt`), the
 response-body pool becomes a natural, cheap follow-on; until then the reusable
 multi-message primitive is the honest answer and the single-shipped-body limit
 stands as documented.
+
+## Implementation Note 10 (Session B — item 8 full 3x3 evidence)
+
+The full before/after proof the plan requires: three before runs and three after
+runs on macOS/aarch64 and Linux/x86_64. Tabulated in `perf_3x3_before_after.txt`
+(raw Linux rows in `perf_linux_before_3x_raw.txt` / `perf_linux_after_3x_raw.txt`,
+macOS after in `perf_macos_after_3x.txt`).
+
+- BEFORE = pristine `main` (f96160c); before binaries carry only the item-8
+  test-print-reorder so the gRPC latency rows reach stdout (measured code is
+  pristine). Confirmed "really before" by warmed-unary allocs ~3953 macOS /
+  ~4070 Linux.
+- AFTER = branch @ item 3 (a17444d).
+- Linux ran on a Fly `performance-2x` dedicated-CPU machine (app `tina-perf-150`).
+
+### Headline numbers (process allocations, median of 3 runs)
+
+| row                       | macOS Δ | Linux Δ |
+|---------------------------|--------:|--------:|
+| grpc_h2c_unary_warmed     | -27.2%  | -29.0%  |
+| grpc_h2c_unary_pooled     | -31.2%  | -31.4%  |
+| grpc_h2c_server_streaming | -11.8%  | -11.4%  |
+| http2_h2c_client_post     | -15.0%  | -18.0%  |
+| http2_h2c_steady_small    |   0.0%  |   0.0%  |
+
+Warmed gRPC unary — the phase's named first target — drops 27-29% on both
+platforms, exceeding the 20% target. Generic HTTP/2 (`http2_h2c_steady_state_small`
+and `perf-h2-alloc`, 1730 macOS / 1857 Linux) is unchanged. Warmed-unary p50
+latency tracks the allocation drop (Linux 313 -> 179 us).
+
+### The one missed target, recorded honestly
+
+Server-streaming process allocations dropped 11.8% (macOS) / 11.4% (Linux),
+short of the plan's 15% target. The streaming allocation profile is dominated by
+the buffered multi-message response framing and the per-chunk client decode/pull;
+items 1 and 5 already attacked those, and items 3/7 (path intern, window-update
+fold) are a smaller share on the streaming path. Reaching 15% needs a fresh
+attack on the per-chunk client pull, beyond this phase's landed items. Reported as
+-12%, not reworded to look met.
+
+### Done-Means check
+
+- Protocol hot-path code changed (items 1-7). ✓
+- Compact HPACK decode cheaper, validation intact. ✓ (Note 1)
+- Native gRPC streaming no longer rebuilds public HttpRequest. ✓ (Note 2)
+- gRPC method paths do not allocate a fresh String per warmed request. ✓ (Note 8)
+- gRPC client unary avoids full public HeaderMap churn. ✓ (Note 4)
+- GrpcStreamDecoder reusable-output path used. ✓ (Note 1/5)
+- Dynamic gRPC framing reusable path used by a non-preframed row. ✓ (Note 3/9)
+- At least one warmed protocol turn-count row lower (preferred unary). ✓ (Note 7)
+- macOS + Linux repeated before/after rows saved. ✓ (this note)
+- p50/p90/p99 and process allocations pinned. ✓
+- Negative e2e tests prove caps/status/failure truth survive. ✓ (suites green)
+- Cannot pass with harness-only changes. ✓ (protocol code moved in every item)
+
+Every Done-Means bullet is met. Of the item-8 numeric targets, the warmed-unary
+20% is exceeded and the server-streaming 15% is the single miss (-12%), recorded
+above. PR can come out of draft; the streaming sub-target gap is the one caveat.
