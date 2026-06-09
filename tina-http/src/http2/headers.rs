@@ -273,31 +273,89 @@ fn add_header_with_storage(
         return Err(Http2ProtocolError::InvalidPseudoHeaders);
     }
     out.saw_regular = true;
-    let header_name = HeaderName::from_bytes(name.as_bytes())
-        .map_err(|_| Http2ProtocolError::InvalidPseudoHeaders)?;
-    let header_value =
-        HeaderValue::from_str(value).map_err(|_| Http2ProtocolError::InvalidPseudoHeaders)?;
-    if header_name == http::header::HOST {
-        out.host_non_empty = !value.is_empty();
+    // Validate the name/value bytes the same way in compact and public modes so
+    // both reject identical malformed input. The compact path must not allocate
+    // a public `HeaderName` / `HeaderValue` just to validate a header it will
+    // not store, so the byte rules live here instead of in `http`'s
+    // constructors. Public mode runs the same rules, then builds the typed
+    // pieces (which cannot fail after this check) only when it stores them.
+    if !is_valid_header_name(name) || !is_valid_header_value(value) {
+        return Err(Http2ProtocolError::InvalidPseudoHeaders);
     }
-    if header_name == http::header::CONTENT_TYPE {
-        out.grpc_content_type = crate::grpc::is_grpc_content_type(value);
-    }
-    if name == "grpc-encoding" && !value.eq_ignore_ascii_case("identity") {
-        out.grpc_encoding_unsupported = true;
-    }
-    if header_name == http::header::CONTENT_LENGTH {
-        if out.saw_content_length {
-            return Err(Http2ProtocolError::ContentLengthMismatch);
+    // Parse the admission/gRPC facts by string. Names are already lowercase
+    // (uppercase is rejected above), so a direct match is exact.
+    match name {
+        "host" => out.host_non_empty = !value.is_empty(),
+        "content-type" => out.grpc_content_type = crate::grpc::is_grpc_content_type(value),
+        "grpc-encoding" => {
+            if !value.eq_ignore_ascii_case("identity") {
+                out.grpc_encoding_unsupported = true;
+            }
         }
-        let parsed = parse_content_length(value)?;
-        out.content_length = Some(parsed);
-        out.saw_content_length = true;
+        "content-length" => {
+            if out.saw_content_length {
+                return Err(Http2ProtocolError::ContentLengthMismatch);
+            }
+            out.content_length = Some(parse_content_length(value)?);
+            out.saw_content_length = true;
+        }
+        _ => {}
     }
     if store_regular_headers {
+        // Only the storing path pays the public header allocation.
+        let header_name = HeaderName::from_bytes(name.as_bytes())
+            .map_err(|_| Http2ProtocolError::InvalidPseudoHeaders)?;
+        let header_value =
+            HeaderValue::from_str(value).map_err(|_| Http2ProtocolError::InvalidPseudoHeaders)?;
+        #[cfg(test)]
+        PUBLIC_HEADER_CONSTRUCTIONS.with(|count| count.set(count.get() + 1));
         out.headers.append(header_name, header_value);
     }
     Ok(())
+}
+
+/// RFC 9110 token bytes. HTTP/2 header names are already required to be
+/// lowercase (uppercase is rejected before this is called), so this mirrors
+/// what `http::HeaderName::from_bytes` accepts for the names that reach here.
+fn is_token_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric()
+        || matches!(
+            byte,
+            b'!' | b'#'
+                | b'$'
+                | b'%'
+                | b'&'
+                | b'\''
+                | b'*'
+                | b'+'
+                | b'-'
+                | b'.'
+                | b'^'
+                | b'_'
+                | b'`'
+                | b'|'
+                | b'~'
+        )
+}
+
+fn is_valid_header_name(name: &str) -> bool {
+    !name.is_empty() && name.bytes().all(is_token_byte)
+}
+
+/// Mirror `http::HeaderValue` byte rules: visible ASCII plus space, horizontal
+/// tab, and obs-text (`0x80..=0xFF`); reject other control bytes and DEL.
+fn is_valid_header_value(value: &str) -> bool {
+    value
+        .bytes()
+        .all(|byte| byte == b'\t' || (byte >= b' ' && byte != 0x7f))
+}
+
+// Test seam: counts how many public `HeaderName`/`HeaderValue` pairs the decode
+// builds. The compact path must leave this at zero for skipped regular headers.
+#[cfg(test)]
+thread_local! {
+    pub(super) static PUBLIC_HEADER_CONSTRUCTIONS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
 }
 
 pub(super) fn parse_content_length(value: &str) -> Result<usize, Http2ProtocolError> {
@@ -568,6 +626,132 @@ mod tests {
         assert_eq!(decoded.content_length, Some(9));
         assert!(decoded.headers.is_empty());
         validate_request_headers(&decoded).unwrap();
+    }
+
+    fn grpc_block_with_extra_metadata(extra: usize) -> Vec<u8> {
+        let mut block = Vec::new();
+        encode_literal_header(":method", "POST", &mut block);
+        encode_literal_header(":scheme", "http", &mut block);
+        encode_literal_header(":authority", "example.com", &mut block);
+        encode_literal_header(":path", "/pkg.Service/Unary", &mut block);
+        encode_literal_header("content-type", "application/grpc", &mut block);
+        encode_literal_header("te", "trailers", &mut block);
+        encode_literal_header("grpc-encoding", "identity", &mut block);
+        for i in 0..extra {
+            // Custom gRPC metadata headers: ordinary headers a service might see.
+            encode_literal_header(&format!("x-meta-{i}"), &format!("value-{i}"), &mut block);
+        }
+        block
+    }
+
+    #[test]
+    fn compact_decode_builds_no_public_headers_regardless_of_metadata_count() {
+        // The number of ordinary headers must not change the compact path's
+        // public-header construction count: it must stay zero. The public path
+        // builds exactly one per stored header.
+        for extra in [0usize, 4, 16] {
+            let block = grpc_block_with_extra_metadata(extra);
+
+            PUBLIC_HEADER_CONSTRUCTIONS.with(|count| count.set(0));
+            let mut decoder = hpack::Decoder::new();
+            let compact = decode_headers_block_compact_with(&mut decoder, &block, 4096).unwrap();
+            let compact_built = PUBLIC_HEADER_CONSTRUCTIONS.with(|count| count.get());
+            assert_eq!(
+                compact_built, 0,
+                "compact built public headers (extra={extra})"
+            );
+            assert!(compact.headers.is_empty());
+            // Facts still parsed from the same bytes.
+            assert!(compact.grpc_content_type);
+            assert!(!compact.grpc_encoding_unsupported);
+            assert!(compact.authority_non_empty);
+            validate_request_headers(&compact).unwrap();
+
+            PUBLIC_HEADER_CONSTRUCTIONS.with(|count| count.set(0));
+            let mut decoder = hpack::Decoder::new();
+            let public = decode_headers_block_with(&mut decoder, &block, 4096).unwrap();
+            let public_built = PUBLIC_HEADER_CONSTRUCTIONS.with(|count| count.get());
+            // content-type, te, grpc-encoding, plus `extra` custom headers.
+            assert_eq!(
+                public_built,
+                3 + extra,
+                "public build count (extra={extra})"
+            );
+            assert_eq!(public.headers.len(), 3 + extra);
+            assert!(public.grpc_content_type);
+        }
+    }
+
+    fn compact_and_public_agree(block: &[u8]) -> Result<(), Http2ProtocolError> {
+        let mut compact_decoder = hpack::Decoder::new();
+        let compact = decode_headers_block_compact_with(&mut compact_decoder, block, 256)
+            .and_then(|h| validate_request_headers(&h).map(|()| h));
+        let mut public_decoder = hpack::Decoder::new();
+        let public = decode_headers_block_with(&mut public_decoder, block, 256)
+            .and_then(|h| validate_request_headers(&h).map(|()| h));
+        assert_eq!(
+            compact.as_ref().map(|_| ()),
+            public.as_ref().map(|_| ()),
+            "compact/public disagree on accept/reject"
+        );
+        assert_eq!(
+            compact.as_ref().err(),
+            public.as_ref().err(),
+            "compact/public disagree on error kind"
+        );
+        compact.map(|_| ())
+    }
+
+    #[test]
+    fn compact_and_public_reject_identical_malformed_inputs() {
+        let base = |extra: &[(&str, &str)]| {
+            let mut block = Vec::new();
+            encode_literal_header(":method", "POST", &mut block);
+            encode_literal_header(":scheme", "http", &mut block);
+            encode_literal_header(":authority", "example.com", &mut block);
+            encode_literal_header(":path", "/svc/M", &mut block);
+            for (name, value) in extra {
+                encode_literal_header(name, value, &mut block);
+            }
+            block
+        };
+
+        // Well-formed: both accept.
+        assert!(compact_and_public_agree(&base(&[("content-type", "application/grpc")])).is_ok());
+
+        // Uppercase name.
+        assert!(compact_and_public_agree(&base(&[("X-Bad", "v")])).is_err());
+        // Invalid token byte in name (space).
+        assert!(compact_and_public_agree(&base(&[("bad name", "v")])).is_err());
+        // Invalid value byte (newline) — must reject before any storage decision.
+        assert!(compact_and_public_agree(&base(&[("x-meta", "bad\nvalue")])).is_err());
+        // Forbidden connection-control header.
+        assert!(compact_and_public_agree(&base(&[("connection", "keep-alive")])).is_err());
+        // Invalid `te`.
+        assert!(compact_and_public_agree(&base(&[("te", "gzip")])).is_err());
+        // Duplicate content-length.
+        assert!(
+            compact_and_public_agree(&base(&[("content-length", "1"), ("content-length", "1")]))
+                .is_err()
+        );
+        // Invalid content-length value.
+        assert!(compact_and_public_agree(&base(&[("content-length", "ten")])).is_err());
+    }
+
+    #[test]
+    fn compact_and_public_reject_identical_oversized_header_blocks() {
+        // Over the byte cap: both paths must fail closed at the same place.
+        let big = "a".repeat(512);
+        let mut block = Vec::new();
+        encode_literal_header(":method", "POST", &mut block);
+        encode_literal_header(":scheme", "http", &mut block);
+        encode_literal_header(":authority", "example.com", &mut block);
+        encode_literal_header(":path", "/svc/M", &mut block);
+        encode_literal_header("x-big", &big, &mut block);
+        assert_eq!(
+            compact_and_public_agree(&block),
+            Err(Http2ProtocolError::HeadersTooLarge)
+        );
     }
 
     #[test]

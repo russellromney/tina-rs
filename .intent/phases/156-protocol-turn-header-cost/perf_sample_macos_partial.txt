@@ -1,0 +1,40 @@
+# Phase 156 — partial macOS/aarch64 allocation sample
+
+Representative single-batch sample, not the full 3x3 before/after proof the
+plan requires. It measures the movement from the two build items landed so far
+(item 1: compact HPACK decode without public header construction; item 5:
+reusable `GrpcStreamDecoder::push_into` output). Items 2/3/4/6/7 are NOT in this
+sample, so it is well short of the plan's 20%/15% warmed-gRPC targets, which
+assume those structural items land too.
+
+Machine: macOS/aarch64 (Apple Silicon laptop), `--release`.
+Workload: `native_protocol_rows_are_printable_and_bounded`,
+WORKERS=4, PROTOCOL_OPS=32, median-of-five sampling per row.
+Counter: whole-process allocations (client + server) over the load run, so
+server-side decode savings are visible (unlike the client-side load-allocation
+count).
+
+BEFORE = current `main` (worktree stash of the phase changes).
+AFTER  = `main` + items 1 and 5.
+
+| row                                      | BEFORE (process allocs) | AFTER  | delta        |
+|------------------------------------------|------------------------:|-------:|-------------:|
+| grpc_h2c_unary_warmed                    | ~3949 (3936-3981)       | ~3889 (3888-3917) | -60  (-1.5%) |
+| grpc_h2c_server_streaming_steady_state   | ~5296 (5249-5333)       | ~5170 (5151-5215) | -126 (-2.4%) |
+| http2_h2c_steady_state_small             | 896 (895-897)           | 897 (896-897)     |  ~0 (no regression) |
+
+Per-op (PROTOCOL_OPS=32):
+- warmed unary:   ~1.9 fewer process allocations / op. The warmed gRPC request
+  carries two ordinary inbound headers (content-type, te); the compact decode
+  now builds zero public `HeaderName`/`HeaderValue` for them. The unit test
+  `compact_decode_builds_no_public_headers_regardless_of_metadata_count` proves
+  this stays at zero as metadata grows, so the win scales with header count.
+- server streaming: ~3.9 fewer / op. Inbound compact decode plus one reused
+  output `Vec` across response chunks instead of a fresh `Vec` per chunk.
+- http2_h2c_steady_state_small is unchanged: the plain HTTP/2 service path keeps
+  the public decode and builds its public `HeaderMap` as before. Good — item 1
+  must not silently drop generic HTTP/2 headers.
+
+This is local/alpha movement, in the right direction, with no regression. It is
+NOT a production performance claim and does NOT meet the phase's hard targets;
+those need the remaining build items and the macOS+Linux 3x3 evidence.

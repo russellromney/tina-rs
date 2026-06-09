@@ -480,20 +480,44 @@ impl GrpcStreamDecoder {
     }
 
     /// Feed received body bytes, draining every complete length-prefixed
-    /// message. A partial trailing frame stays buffered for the next
-    /// `push`. Rejects compression and over-cap message lengths before
-    /// allocating the message.
+    /// message into a fresh `Vec`. A partial trailing frame stays buffered
+    /// for the next `push`. Rejects compression and over-cap message lengths
+    /// before allocating the message.
+    ///
+    /// This is a convenience wrapper over [`push_into`](Self::push_into) for
+    /// callers that do not reuse output storage. Streaming loops that pull
+    /// many chunks should call `push_into` with one reused `Vec` instead, to
+    /// avoid a fresh output allocation per chunk.
     pub fn push<Resp: Message + Default>(&mut self, bytes: &[u8]) -> Result<Vec<Resp>, GrpcError> {
-        self.buf.extend_from_slice(bytes);
         let mut out = Vec::new();
+        self.push_into(bytes, &mut out)?;
+        Ok(out)
+    }
+
+    /// Feed received body bytes, appending every newly complete message to
+    /// `out`. The caller owns `out` and may reuse it across many chunks, so
+    /// a steady stream pays no per-chunk output `Vec` allocation.
+    ///
+    /// Caps and compression are still enforced before any message is
+    /// allocated. On error the bytes consumed so far are dropped from the
+    /// internal buffer and any messages decoded before the error stay in
+    /// `out`; a gRPC stream error is terminal, so those earlier messages are
+    /// valid and the error is final. ([`push`](Self::push) preserves the
+    /// all-or-nothing shape by discarding its private `Vec` on error.)
+    pub fn push_into<Resp: Message + Default>(
+        &mut self,
+        bytes: &[u8],
+        out: &mut Vec<Resp>,
+    ) -> Result<(), GrpcError> {
+        self.buf.extend_from_slice(bytes);
         let mut cursor = 0;
-        loop {
+        let result = loop {
             let remaining = self.buf.len() - cursor;
             if remaining < GRPC_FRAME_HEADER_LEN {
-                break;
+                break Ok(());
             }
             if self.buf[cursor] != 0 {
-                return Err(GrpcError::CompressedUnsupported);
+                break Err(GrpcError::CompressedUnsupported);
             }
             let len = u32::from_be_bytes([
                 self.buf[cursor + 1],
@@ -502,23 +526,26 @@ impl GrpcStreamDecoder {
                 self.buf[cursor + 4],
             ]) as usize;
             if len > self.limits.max_message_bytes {
-                return Err(GrpcError::MessageTooLarge {
+                break Err(GrpcError::MessageTooLarge {
                     len,
                     max: self.limits.max_message_bytes,
                 });
             }
             if remaining < GRPC_FRAME_HEADER_LEN + len {
                 // The frame is not all here yet — wait for more bytes.
-                break;
+                break Ok(());
             }
             let mut frame_cursor = cursor;
-            let message =
-                decode_one_grpc_message::<Resp>(&self.buf, &mut frame_cursor, self.limits)?;
-            cursor = frame_cursor;
-            out.push(message);
-        }
+            match decode_one_grpc_message::<Resp>(&self.buf, &mut frame_cursor, self.limits) {
+                Ok(message) => {
+                    cursor = frame_cursor;
+                    out.push(message);
+                }
+                Err(error) => break Err(error),
+            }
+        };
         self.buf.drain(..cursor);
-        Ok(out)
+        result
     }
 
     /// Assert the stream ended on a frame boundary. Leftover buffered
@@ -569,6 +596,93 @@ mod tests {
 
     #[derive(Clone, PartialEq, prost::Message)]
     struct Empty {}
+
+    #[derive(Clone, PartialEq, prost::Message)]
+    struct Reply {
+        #[prost(uint64, tag = "1")]
+        value: u64,
+    }
+
+    fn framed(value: u64) -> Vec<u8> {
+        encode_grpc_message(&Reply { value }, GrpcLimits::default()).expect("frame reply")
+    }
+
+    #[test]
+    fn push_into_reuses_one_output_buffer_across_chunks() {
+        let mut decoder = GrpcStreamDecoder::new(GrpcLimits::default());
+        let mut out: Vec<Reply> = Vec::new();
+
+        // First chunk: two complete messages at once.
+        let mut chunk = framed(1);
+        chunk.extend_from_slice(&framed(2));
+        decoder.push_into(&chunk, &mut out).expect("push two");
+        assert_eq!(out, vec![Reply { value: 1 }, Reply { value: 2 }]);
+
+        // Drain (keeps capacity) and reuse the same buffer for the next chunk.
+        out.clear();
+        let cap_after_first = out.capacity();
+        decoder.push_into(&framed(3), &mut out).expect("push one");
+        assert_eq!(out, vec![Reply { value: 3 }]);
+        // No reallocation was needed for the second, smaller chunk.
+        assert!(out.capacity() >= cap_after_first);
+    }
+
+    #[test]
+    fn push_into_buffers_partial_frame_across_chunks() {
+        let mut decoder = GrpcStreamDecoder::new(GrpcLimits::default());
+        let mut out: Vec<Reply> = Vec::new();
+
+        let whole = framed(7);
+        let split = whole.len() - 2;
+        decoder.push_into(&whole[..split], &mut out).expect("first");
+        assert!(out.is_empty(), "partial frame must not yield a message yet");
+        decoder.push_into(&whole[split..], &mut out).expect("rest");
+        assert_eq!(out, vec![Reply { value: 7 }]);
+    }
+
+    #[test]
+    fn push_into_rejects_compressed_frame() {
+        let mut decoder = GrpcStreamDecoder::new(GrpcLimits::default());
+        let mut out: Vec<Reply> = Vec::new();
+        let mut chunk = framed(1);
+        chunk[0] = 1; // compression flag set
+        assert!(matches!(
+            decoder.push_into(&chunk, &mut out),
+            Err(GrpcError::CompressedUnsupported)
+        ));
+    }
+
+    #[test]
+    fn push_into_rejects_over_cap_before_decoding() {
+        let limits = GrpcLimits {
+            max_message_bytes: 4,
+            ..GrpcLimits::default()
+        };
+        let mut decoder = GrpcStreamDecoder::new(limits);
+        let mut out: Vec<Reply> = Vec::new();
+        // Only the 5-byte frame header is present, declaring a len over the cap.
+        // The decoder must reject on the length alone, before any message body
+        // is read or allocated.
+        let header = [0u8, 0, 0, 0, 64];
+        assert!(matches!(
+            decoder.push_into(&header, &mut out),
+            Err(GrpcError::MessageTooLarge { len: 64, max: 4 })
+        ));
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn finish_rejects_truncated_trailing_frame() {
+        let mut decoder = GrpcStreamDecoder::new(GrpcLimits::default());
+        let mut out: Vec<Reply> = Vec::new();
+        let whole = framed(9);
+        // Feed all but the last byte: a frame is buffered but incomplete.
+        decoder
+            .push_into(&whole[..whole.len() - 1], &mut out)
+            .expect("partial");
+        assert!(out.is_empty());
+        assert!(matches!(decoder.finish(), Err(GrpcError::BadFrame)));
+    }
 
     fn dummy_client() -> GrpcClient {
         let connection = Address::new_with_generation(

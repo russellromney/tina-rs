@@ -22,10 +22,10 @@ use tina::prelude::*;
 use tina_http::{
     BodyMetrics, FixedEndpointPoolConfig, GrpcBufferedServerStreamingResponse, GrpcClient,
     GrpcBufferedStreamLimits, GrpcClientPool, GrpcLimits, GrpcPreframedUnary, GrpcRequest,
-    GrpcResponse, GrpcRouter, GrpcRouterMsg, GrpcStatusCode, GrpcStreamDecoder, GrpcStreamItem,
-    GrpcTarget, GrpcUnaryOutcome, Http2ClientConnection, Http2ClientLimits, Http2ClientMsg,
+    GrpcResponse, GrpcRouter, GrpcRouterMsg, GrpcStatusCode, GrpcStreamDecoder, GrpcTarget,
+    GrpcUnaryOutcome, Http2ClientConnection, Http2ClientLimits, Http2ClientMsg,
     Http2ClientOutcome, Http2ClientReply, Http2ClientRequest, Http2Listener, Http2ListenerMsg,
-    Http2PickOutcome, Http2ServerConfig, Http2Target, HttpLimits, HttpListener,
+    Http2PickOutcome, Http2ResponseChunk, Http2ServerConfig, Http2Target, HttpLimits, HttpListener,
     HttpListenerAddress, HttpListenerMsg, HttpRequest, HttpResponse, HttpServerConfig, StatusCode,
     WebSocketLimits, WebSocketSessionMsg, WebSocketSessionOutcome, grpc_unary_call_h2c_blocking,
     websocket_upgrade,
@@ -2408,6 +2408,10 @@ fn grpc_server_streaming_with_client(
 
     let mut decoder = GrpcStreamDecoder::new(GrpcLimits::default());
     let mut messages = 0usize;
+    // One reused output buffer for the whole stream: `push_into` appends each
+    // chunk's complete messages here and we drain it, so a steady stream pays
+    // no per-chunk output `Vec` allocation.
+    let mut decoded: Vec<GrpcPerfReply> = Vec::new();
     loop {
         let reply = runtime
             .call_blocking(
@@ -2420,9 +2424,12 @@ fn grpc_server_streaming_with_client(
             CallOutcome::Replied(Http2ClientReply::ResponseChunk { chunk, .. }) => chunk,
             other => anyhow::bail!("unexpected grpc stream chunk outcome: {other:?}"),
         };
-        for item in client.decode_stream_chunk::<GrpcPerfReply>(&mut decoder, chunk) {
-            match item {
-                GrpcStreamItem::Message(message) => {
+        match chunk {
+            Http2ResponseChunk::Data(bytes) => {
+                decoder
+                    .push_into::<GrpcPerfReply>(&bytes, &mut decoded)
+                    .map_err(|e| anyhow::anyhow!("grpc stream decode: {e:?}"))?;
+                for message in decoded.drain(..) {
                     let expected = 40 + messages as u64;
                     if message.value != expected {
                         anyhow::bail!(
@@ -2432,16 +2439,24 @@ fn grpc_server_streaming_with_client(
                     }
                     messages += 1;
                 }
-                GrpcStreamItem::Status(status) if status.code == GrpcStatusCode::Ok => {
-                    if messages != GRPC_STREAM_MESSAGES {
-                        anyhow::bail!(
-                            "grpc stream returned {messages} messages, expected {GRPC_STREAM_MESSAGES}"
-                        );
-                    }
-                    return Ok(());
-                }
-                other => anyhow::bail!("unexpected grpc stream item: {other:?}"),
             }
+            Http2ResponseChunk::End { trailers } => {
+                decoder
+                    .finish()
+                    .map_err(|e| anyhow::anyhow!("grpc stream finish: {e:?}"))?;
+                if let Some(status) = client.stream_head_status(&trailers) {
+                    if status.code != GrpcStatusCode::Ok {
+                        anyhow::bail!("unexpected grpc stream status {status:?}");
+                    }
+                }
+                if messages != GRPC_STREAM_MESSAGES {
+                    anyhow::bail!(
+                        "grpc stream returned {messages} messages, expected {GRPC_STREAM_MESSAGES}"
+                    );
+                }
+                return Ok(());
+            }
+            other => anyhow::bail!("unexpected grpc stream chunk: {other:?}"),
         }
     }
 }
