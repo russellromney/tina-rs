@@ -132,6 +132,65 @@ fn bounded_trace_retention_does_not_move_the_tail_on_every_event() {
 }
 
 #[test]
+fn truncated_trace_is_detectable_and_refused_by_proof_accessor() {
+    // A bursting workload under bounded retention drops events. A proof
+    // helper that hashes/summarizes runtime.trace() must be able to tell it
+    // is reading a partial suffix, not the whole run.
+    let mut runtime = Runtime::with_clock_and_ids_and_driver(
+        TestShard,
+        TestMailboxFactory,
+        Box::new(MonotonicClock),
+        IdSource::new(),
+        Box::new(FakeDriver::new(Rc::new(RefCell::new(Vec::new())))),
+    );
+    runtime.set_trace_retention(TraceRetention::Bounded(3));
+    for _ in 0..100 {
+        runtime.push_event(
+            IsolateId::new(1),
+            None,
+            RuntimeEventKind::EffectObserved {
+                effect: EffectKind::Noop,
+            },
+        );
+    }
+
+    assert!(
+        runtime.trace_is_truncated(),
+        "bounded burst must flag the trace as truncated"
+    );
+    let err = runtime
+        .trace_for_proof()
+        .expect_err("proof accessor must refuse a truncated trace");
+    assert_eq!(err.dropped_events, 97);
+}
+
+#[test]
+fn full_retention_trace_is_not_truncated_and_proof_accessor_returns_it() {
+    let mut runtime = Runtime::with_clock_and_ids_and_driver(
+        TestShard,
+        TestMailboxFactory,
+        Box::new(MonotonicClock),
+        IdSource::new(),
+        Box::new(FakeDriver::new(Rc::new(RefCell::new(Vec::new())))),
+    );
+    // Default retention is Full.
+    for _ in 0..5 {
+        runtime.push_event(
+            IsolateId::new(1),
+            None,
+            RuntimeEventKind::EffectObserved {
+                effect: EffectKind::Noop,
+            },
+        );
+    }
+    assert!(!runtime.trace_is_truncated());
+    let events = runtime
+        .trace_for_proof()
+        .expect("full retention trace is provable");
+    assert_eq!(events.len(), 5);
+}
+
+#[test]
 fn stopped_entry_gc_compacts_a_burst_in_one_pass_and_keeps_indexes_consistent() {
     // Mass-disconnect shape: many stopped isolates become collectable in
     // one step. GC must remove exactly them, leave live entries intact,
@@ -1897,6 +1956,11 @@ fn single_timer_wakes_after_deadline() {
 
 #[test]
 fn sibling_runtimes_can_share_global_event_and_call_id_sources() {
+    // Sequential explicit-step coordinators (MultiShardRuntime, the
+    // simulator) share one global counter via `clone()`: stepping is
+    // single-threaded in fixed order, so the global ids are deterministic
+    // and carry the cross-shard emission order. (The threaded runtime uses
+    // `per_shard()` instead because its workers race.)
     let ids = IdSource::new();
     let first_clock = Rc::new(ManualClock::new());
     let second_clock = Rc::new(ManualClock::new());

@@ -6,7 +6,7 @@
 
 use std::fmt::Debug;
 
-use super::{ReplayCase, ReplayReport};
+use super::{ReplayCase, ReplayReport, observe_replay_case};
 
 /// One pasteable failing case from a [`sweep_seeds`] run.
 ///
@@ -104,6 +104,7 @@ pub fn sweep_seeds<Op, Output, Seeds, MakeCase, Runner, Check>(
     mut check: Check,
 ) -> Result<SweepSuccess, Box<SweepFailure<Op, Output>>>
 where
+    Op: Clone,
     Seeds: IntoIterator<Item = u64>,
     MakeCase: FnMut(u64) -> ReplayCase<Op>,
     Runner: FnMut(&ReplayCase<Op>) -> ReplayReport<Output>,
@@ -125,7 +126,11 @@ where
             seed
         );
         seeds_examined += 1;
-        let report = runner(&case);
+        // Run through observe_replay_case so a runner that returns a report
+        // for a different case (wrong name/seed/scenario/config) trips the
+        // same identity/coherence guard discover_constants enforces, rather
+        // than pasting a mismatched run's constants onto the failing case.
+        let report = observe_replay_case(&case, &mut runner);
         if let Err(reason) = check(&report) {
             let mut failing_case = case;
             failing_case.expected_event_count = report.event_count;

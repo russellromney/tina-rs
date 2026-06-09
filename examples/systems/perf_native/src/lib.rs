@@ -285,6 +285,7 @@ fn body_pressure_observation(metrics: &BodyMetrics, max_body_bytes: usize) -> Lo
         );
     }
     LoadObservation {
+        leak_checked: true,
         leak_clean: snapshot.drained(),
         surface_plateaus: SurfacePlateau::from_service_pressure(&report),
         unavailable_surfaces: UnavailableSurface::from_service_pressure(&report),
@@ -2929,6 +2930,7 @@ pub fn websocket_capacity_fill_probe() -> anyhow::Result<LoadReport> {
                     thread::yield_now();
                 }
                 LoadObservation {
+                    leak_checked: true,
                     leak_clean: pressure_count.load(Ordering::Relaxed) == PRESSURE_OPS,
                     ..LoadObservation::default()
                 }

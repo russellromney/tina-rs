@@ -342,10 +342,24 @@ pub(crate) struct DeliveredMessage {
     pub(crate) call_context: Option<MessageCallContext>,
 }
 
+/// Id source for one shard.
+///
+/// Event ids are per-shard-local: each shard counts its own events starting
+/// at one. The shard owner is single-threaded, so its event sequence is
+/// deterministic regardless of how shard worker threads interleave, and the
+/// shard-plus-event-id pair is the stable per-event key the trace hash and
+/// the snapshot sort rely on. A single global atomic event counter shared
+/// across shards would hand the id of a given logical event to whichever
+/// thread won a `fetch_add` race, which made the multishard trace hash flap.
+///
+/// Call ids stay global: cross-shard call routing needs an id unique across
+/// every shard, so `next_call_id` is the shared counter.
 #[derive(Debug, Clone)]
 pub(crate) struct IdSource {
-    pub(crate) next_event_id: Arc<AtomicU64>,
-    pub(crate) next_call_id: Arc<AtomicU64>,
+    /// Per-shard event counter. Not shared across shards.
+    next_event_id: Arc<AtomicU64>,
+    /// Global call counter, shared across every shard.
+    next_call_id: Arc<AtomicU64>,
 }
 
 impl IdSource {
@@ -353,6 +367,17 @@ impl IdSource {
         Self {
             next_event_id: Arc::new(AtomicU64::new(1)),
             next_call_id: Arc::new(AtomicU64::new(1)),
+        }
+    }
+
+    /// Derives the id source for a sibling shard: a fresh per-shard event
+    /// counter, the same shared global call counter. Use this instead of
+    /// `clone()` when fanning one source out to multiple shards so each
+    /// shard's event ids stay independent and deterministic.
+    pub(crate) fn per_shard(&self) -> Self {
+        Self {
+            next_event_id: Arc::new(AtomicU64::new(1)),
+            next_call_id: Arc::clone(&self.next_call_id),
         }
     }
 
@@ -757,7 +782,52 @@ where
     pub const fn trace_dropped(&self) -> u64 {
         self.trace_dropped
     }
+
+    /// Whether the retention policy has dropped any events.
+    ///
+    /// When true, [`trace`](Self::trace) returns only the retained suffix,
+    /// so hashing or summarizing it reflects a partial run. Proof helpers
+    /// should read [`trace_for_proof`](Self::trace_for_proof) instead.
+    pub const fn trace_is_truncated(&self) -> bool {
+        self.trace_dropped > 0
+    }
+
+    /// Returns the trace only when it is the whole run.
+    ///
+    /// Fails closed with [`TraceTruncated`] once the retention policy has
+    /// dropped events, so `stable_trace_hash` / `PressureSummary` cannot be
+    /// computed over a silent partial suffix. Under the default `Full`
+    /// retention this always returns the trace.
+    pub fn trace_for_proof(&self) -> Result<&[RuntimeEvent], TraceTruncated> {
+        if self.trace_dropped > 0 {
+            return Err(TraceTruncated {
+                dropped_events: self.trace_dropped,
+            });
+        }
+        Ok(self.trace())
+    }
 }
+
+/// The retention policy dropped trace events, so the in-memory trace is a
+/// partial suffix that must not back a hash or pressure summary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TraceTruncated {
+    /// How many events the retention policy dropped.
+    pub dropped_events: u64,
+}
+
+impl std::fmt::Display for TraceTruncated {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "trace retention dropped {} event(s); the in-memory trace is a partial suffix \
+             and cannot back a proof hash or pressure summary",
+            self.dropped_events
+        )
+    }
+}
+
+impl std::error::Error for TraceTruncated {}
 
 #[cfg(test)]
 mod tests;

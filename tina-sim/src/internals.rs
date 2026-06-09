@@ -1025,6 +1025,14 @@ pub(crate) struct SupervisorRecord {
     pub(crate) budget_state: RestartBudgetState,
 }
 
+/// Id source for the deterministic simulator.
+///
+/// Unlike the live runtime, the multi-shard simulator drives every shard
+/// sequentially on one thread in a fixed step order, so a single shared
+/// global event counter assigns ids in a deterministic, cross-shard
+/// temporal order. The merged trace ordered by that global id is the order
+/// events were emitted, which the DST checkers rely on. (The live runtime
+/// has no such global order, which is why it namespaces ids per shard.)
 #[derive(Debug, Clone)]
 pub(crate) struct IdSource {
     pub(crate) next_event_id: Rc<Cell<u64>>,

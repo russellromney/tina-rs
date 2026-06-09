@@ -105,31 +105,66 @@ impl LiveTrace {
 
     /// Snapshot the current shape: (event_count, stable_trace_hash).
     ///
-    /// This is a diagnostic snapshot. If the trace reached `LiveTrace`
-    /// through a bounded buffer, use [`Self::snapshot_complete`] and pass
-    /// the buffer's dropped-event count before treating the hash as proof.
+    /// Events are ordered by `(shard, event_id)` before hashing. Event ids
+    /// are per-shard-local and deterministic, so for a **single-shard**
+    /// trace the hash is stable across runs of the same workload.
+    ///
+    /// This is a diagnostic snapshot, not proof. For a multishard trace the
+    /// hash is **not** stable: a free-running multishard runtime interleaves
+    /// each shard's inbound cross-shard deliveries with its local work by
+    /// wall-clock timing, so the per-shard event sequence differs between
+    /// runs. For proof use [`Self::snapshot_complete`], which fails closed
+    /// on a multishard or lossy trace.
     pub fn snapshot(&self) -> TraceShape {
         let guard = self.events.lock().expect("live trace lock");
         let mut events = guard.clone();
-        events.sort_by_key(|event| event.id());
+        // Order by `(shard, event_id)`. Event ids are per-shard-local, so a
+        // global id sort would collide across shards and depend on which
+        // worker thread won the capture race. The per-shard key is the same
+        // logical order on every run, so the hash is stable across runs.
+        events.sort_by_key(|event| (event.shard(), event.id()));
         TraceShape {
             event_count: events.len(),
             trace_hash: stable_trace_hash(events.iter()),
         }
     }
 
-    /// Snapshot a live trace only if the upstream capture path was lossless.
+    /// Distinct shard ids in the captured trace, ascending.
+    pub fn shards(&self) -> Vec<tina::ShardId> {
+        let guard = self.events.lock().expect("live trace lock");
+        let mut shards: Vec<_> = guard.iter().map(|event| event.shard()).collect();
+        shards.sort_unstable();
+        shards.dedup();
+        shards
+    }
+
+    /// Snapshot a live trace as proof material.
     ///
-    /// Pass `BufferedTraceObserver::dropped_count()` when the live trace is
-    /// fed through a buffered observer. Pass `0` when `LiveTrace::observer()`
-    /// is installed directly.
+    /// Fails closed in two cases the plain [`Self::snapshot`] hides:
+    ///
+    /// 1. The upstream capture path dropped events (pass
+    ///    `BufferedTraceObserver::dropped_count()`; pass `0` when
+    ///    `LiveTrace::observer()` is installed directly).
+    /// 2. The trace spans more than one shard. A free-running multishard
+    ///    runtime interleaves each shard's inbound cross-shard deliveries
+    ///    with its local handler work by real wall-clock timing, so the
+    ///    per-shard event *sequence* — not just the id assignment — differs
+    ///    between runs. The trace hash is therefore not a stable proof for
+    ///    live multishard. Capture per shard, or use the deterministic
+    ///    simulator for a multishard replay proof.
     pub fn snapshot_complete(
         &self,
         upstream_dropped_events: u64,
-    ) -> Result<TraceShape, LiveTraceLoss> {
+    ) -> Result<TraceShape, LiveTraceProofError> {
         if upstream_dropped_events != 0 {
-            return Err(LiveTraceLoss {
+            return Err(LiveTraceProofError::Lossy(LiveTraceLoss {
                 dropped_events: upstream_dropped_events,
+            }));
+        }
+        let shards = self.shards();
+        if shards.len() > 1 {
+            return Err(LiveTraceProofError::Multishard {
+                shards: shards.into_iter().map(|shard| shard.get()).collect(),
             });
         }
         Ok(self.snapshot())
@@ -174,14 +209,17 @@ impl LiveTrace {
         })
     }
 
-    /// Compare a saved live shape only if the upstream capture path was
-    /// lossless.
+    /// Compare a saved live shape as proof material.
+    ///
+    /// Fails closed for a lossy capture or a multishard trace, matching
+    /// [`Self::snapshot_complete`]: a live multishard trace hash is not a
+    /// stable regression baseline.
     pub fn compare_live_shape_complete(
         &self,
         expected: TraceShape,
         label: &'static str,
         upstream_dropped_events: u64,
-    ) -> Result<Option<LiveReplayMismatch>, LiveTraceLoss> {
+    ) -> Result<Option<LiveReplayMismatch>, LiveTraceProofError> {
         let actual = self.snapshot_complete(upstream_dropped_events)?;
         if actual == expected {
             return Ok(None);
@@ -221,6 +259,39 @@ impl std::fmt::Display for LiveTraceLoss {
 }
 
 impl std::error::Error for LiveTraceLoss {}
+
+/// Why a proof-grade snapshot refused the captured trace.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LiveTraceProofError {
+    /// The upstream capture path dropped events.
+    Lossy(LiveTraceLoss),
+    /// The trace spans more than one shard. A live multishard trace hash is
+    /// not a stable proof (the per-shard event sequence is timing-ordered).
+    Multishard { shards: Vec<u32> },
+}
+
+impl std::fmt::Display for LiveTraceProofError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Lossy(loss) => write!(f, "{loss}"),
+            Self::Multishard { shards } => write!(
+                f,
+                "live trace spans {} shards {:?}; a multishard live trace hash is not a stable \
+                 proof — capture per shard or use the simulator for a multishard replay proof",
+                shards.len(),
+                shards,
+            ),
+        }
+    }
+}
+
+impl std::error::Error for LiveTraceProofError {}
+
+impl From<LiveTraceLoss> for LiveTraceProofError {
+    fn from(loss: LiveTraceLoss) -> Self {
+        Self::Lossy(loss)
+    }
+}
 
 struct LiveTraceObserver {
     events: Arc<Mutex<Vec<RuntimeEvent>>>,
@@ -324,7 +395,7 @@ impl RunCapture {
         let observed = self
             .trace
             .snapshot_complete(inputs.upstream_dropped_events)
-            .map_err(RunCaptureFinishError::TraceLoss)?;
+            .map_err(RunCaptureFinishError::TraceNotProvable)?;
         if observed != inputs.expected {
             return Err(RunCaptureFinishError::ExpectedShapeMismatch {
                 expected: inputs.expected,
@@ -372,7 +443,9 @@ pub struct RunCaptureInputs<Op> {
 
 #[derive(Debug)]
 pub enum RunCaptureFinishError {
-    TraceLoss(LiveTraceLoss),
+    /// The captured trace cannot back a proof: it lost events or it spans
+    /// more than one shard.
+    TraceNotProvable(LiveTraceProofError),
     ExpectedShapeMismatch {
         expected: TraceShape,
         observed: TraceShape,
@@ -387,7 +460,7 @@ pub enum RunCaptureFinishError {
 impl std::fmt::Display for RunCaptureFinishError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::TraceLoss(loss) => write!(f, "{loss}"),
+            Self::TraceNotProvable(err) => write!(f, "{err}"),
             Self::ExpectedShapeMismatch { expected, observed } => write!(
                 f,
                 "capture expected trace shape events={} hash=0x{:016x}, observed events={} hash=0x{:016x}",
@@ -504,14 +577,50 @@ mod tests {
         let observer = trace.observer();
         observer.on_event(&sample_event(1));
 
-        let loss = trace
+        let err = trace
             .snapshot_complete(1)
             .expect_err("proof snapshot must reject dropped buffered events");
-        assert_eq!(loss.dropped_events, 1);
+        assert_eq!(
+            err,
+            LiveTraceProofError::Lossy(LiveTraceLoss { dropped_events: 1 })
+        );
     }
 
     #[test]
-    fn snapshot_hash_sorts_by_event_id_for_multishard_arrival_order() {
+    fn complete_snapshot_rejects_multishard_trace() {
+        // A live multishard trace hash is not a stable proof; the complete
+        // snapshot must fail closed rather than return a flapping hash.
+        let trace = LiveTrace::new();
+        let observer = trace.observer();
+        observer.on_event(&sample_event_on(11, 1));
+        observer.on_event(&sample_event_on(22, 1));
+
+        let err = trace
+            .snapshot_complete(0)
+            .expect_err("proof snapshot must reject a multishard trace");
+        assert!(
+            matches!(err, LiveTraceProofError::Multishard { ref shards } if shards == &[11, 22]),
+            "expected multishard rejection, got {err:?}"
+        );
+
+        // The plain diagnostic snapshot still works (not proof).
+        assert_eq!(trace.snapshot().event_count, 2);
+    }
+
+    fn sample_event_on(shard: u32, id: u64) -> RuntimeEvent {
+        RuntimeEvent::new(
+            EventId::new(id),
+            None,
+            ShardId::new(shard),
+            IsolateId::new(1),
+            RuntimeEventKind::HandlerStarted,
+        )
+    }
+
+    #[test]
+    fn snapshot_hash_ignores_capture_arrival_order_single_shard() {
+        // Within one shard the event ids are contiguous; the `(shard, id)`
+        // sort recovers the same order no matter what order events arrived.
         let ordered = LiveTrace::new();
         let ordered_observer = ordered.observer();
         ordered_observer.on_event(&sample_event(1));
@@ -525,6 +634,29 @@ mod tests {
         scrambled_observer.on_event(&sample_event(2));
 
         assert_eq!(ordered.snapshot(), arrival_scrambled.snapshot());
+    }
+
+    #[test]
+    fn snapshot_hash_ignores_cross_shard_arrival_order() {
+        // Event ids are per-shard-local, so two shards both use ids 1,2.
+        // The `(shard, id)` sort key keeps each shard's stream together and
+        // in local order, so the hash does not depend on which shard's
+        // worker thread captured first.
+        let shard_a_first = LiveTrace::new();
+        let a_first = shard_a_first.observer();
+        a_first.on_event(&sample_event_on(11, 1));
+        a_first.on_event(&sample_event_on(11, 2));
+        a_first.on_event(&sample_event_on(22, 1));
+        a_first.on_event(&sample_event_on(22, 2));
+
+        let interleaved = LiveTrace::new();
+        let mixed = interleaved.observer();
+        mixed.on_event(&sample_event_on(22, 1));
+        mixed.on_event(&sample_event_on(11, 1));
+        mixed.on_event(&sample_event_on(22, 2));
+        mixed.on_event(&sample_event_on(11, 2));
+
+        assert_eq!(shard_a_first.snapshot(), interleaved.snapshot());
     }
 
     #[test]
@@ -554,10 +686,13 @@ mod tests {
         assert!(mismatch.count_diverged());
         assert!(!mismatch.hash_diverged());
 
-        let loss = trace
+        let err = trace
             .compare_live_shape_complete(shape, "stub", 2)
             .expect_err("lossy capture must fail before comparing hashes");
-        assert_eq!(loss.dropped_events, 2);
+        assert_eq!(
+            err,
+            LiveTraceProofError::Lossy(LiveTraceLoss { dropped_events: 2 })
+        );
         assert_eq!(
             trace.compare_live_shape_complete(shape, "stub", 0),
             Ok(None)
@@ -669,7 +804,10 @@ mod tests {
                 unsupported_facts: Vec::new(),
             })
             .unwrap_err();
-        assert!(matches!(err, RunCaptureFinishError::TraceLoss(_)));
+        assert!(matches!(
+            err,
+            RunCaptureFinishError::TraceNotProvable(LiveTraceProofError::Lossy(_))
+        ));
     }
 
     #[test]
