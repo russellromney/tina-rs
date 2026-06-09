@@ -862,11 +862,12 @@ fn pre_connect_queue_capacity_is_shared_across_request_shapes() {
     });
 
     match outcomes.0 {
+        // A `SubmitGrpcUnary` completes through the compact gRPC receive path.
         CallOutcome::Replied(Http2ClientReply::Outcome {
-            outcome: Http2ClientOutcome::Replied(response),
+            outcome: Http2ClientOutcome::GrpcUnaryReplied { status, .. },
             ..
-        }) => assert_eq!(response.status.as_u16(), 200),
-        other => panic!("expected queued SubmitGrpcUnary to be Replied, got {other:?}"),
+        }) => assert_eq!(status.as_u16(), 200),
+        other => panic!("expected queued SubmitGrpcUnary to be GrpcUnaryReplied, got {other:?}"),
     }
     match outcomes.1 {
         CallOutcome::Replied(Http2ClientReply::Outcome {

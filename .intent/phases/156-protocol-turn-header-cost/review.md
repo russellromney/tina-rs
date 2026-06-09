@@ -277,3 +277,52 @@ response — a perf-exercised path — and caller-built client-streaming bodies)
 A true per-call response pool would need the framed body to be written to the
 wire from router-owned scratch without crossing back as an owned `Vec`, which is
 a runtime/protocol change out of this phase's scope.
+
+## Implementation Note 4 (Session A — item 4 landed, biggest measured win)
+
+### What changed
+
+The HTTP/2 client no longer builds public `HeaderMap`s for a unary gRPC response.
+
+- `tina-http/src/http2/headers.rs`: `HeaderBlock` gained `grpc_status: Option<u16>`
+  and `grpc_message: Option<String>` facts, captured during decode for the
+  `grpc-status` / `grpc-message` header names (requests never carry these, so the
+  server path pays nothing; the message `String` is allocated only on errors).
+- `tina-http/src/http2/client.rs`: a stream opened by `SubmitGrpcUnary` is marked
+  `grpc_unary`. Its response head and trailers are decoded with
+  `decode_headers_block_compact_with` and folded into compact facts
+  (`apply_grpc_response_head` / `apply_grpc_response_trailers`) — no
+  `response_headers` / `response_trailers` map, no per-header clone. It completes
+  with a new `Http2ClientOutcome::GrpcUnaryReplied { status, grpc_status,
+  grpc_message, body }`. The `GrpcFinalStatusReceived` protocol fact still fires
+  (from the compact status). Generic streams are untouched: the variant is gated
+  strictly on `grpc_unary`, and `Http2ClientOutcome::Replied` keeps its full
+  headers/trailers for every non-gRPC-unary caller.
+- `tina-http/src/grpc_client.rs`: `decode_unary` handles `GrpcUnaryReplied` via a
+  shared `finish_unary` helper (status precedence + body decode), so the compact
+  and public-header receive paths report identical status truth.
+  `grpc_status_from_compact` percent-decodes the message the same way the
+  header-map path does.
+
+### Measured win
+
+`grpc_h2c_unary_warmed` whole-process allocations: pristine `main` ~3949 →
+~3313 after items 1/2/4/5/6 = **-16.1%**, of which item 4 contributes the largest
+share (~3835 → ~3313). `http2_h2c_steady_state_small` unchanged (896 → 897):
+generic HTTP/2 is untouched. See `perf_sample_macos_partial.txt`.
+
+### What is directly proved
+
+- Unit (`grpc_client`): `compact_grpc_unary_outcome_decodes_ok_message`,
+  `..._surfaces_non_ok_status_with_message` (percent-decoded), `..._missing_status_on_200_is_malformed`,
+  `..._non_200_without_status_synthesizes` — the compact path matches the
+  public-header path's status truth on OK, non-OK+message, missing-status, and
+  proxy-failure cases.
+- The exhaustive in-crate `classify` test now covers `GrpcUnaryReplied`.
+- e2e: `grpc_client_live` (10) and `grpc_live` (35) drive `SubmitGrpcUnary`
+  through the real HTTP/2 client and stay green; `http2_client_adversarial`'s
+  pre-connect-queue test was updated to expect the new compact outcome for a
+  queued `SubmitGrpcUnary` (a correct behavior change, not a regression).
+- Full `tina-http` suite green (592 tests); fmt + clippy clean (lib + perf
+  example). The pool health classifier treats `GrpcUnaryReplied` as healthy, like
+  `Replied`.

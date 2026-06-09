@@ -38,6 +38,13 @@ pub(super) struct HeaderBlock {
     /// Set when any `content-length` header was observed during decoding,
     /// so duplicate occurrences fail closed even if the value parses.
     pub(super) saw_content_length: bool,
+    /// Raw `grpc-status` code, if the block carried one. Captured as a fact so
+    /// the compact gRPC client response path can read the final status without
+    /// building a public `HeaderMap`. `None` for non-gRPC blocks.
+    pub(super) grpc_status: Option<u16>,
+    /// Raw (still percent-encoded) `grpc-message`, if present. Only gRPC error
+    /// responses carry this, so the `String` is allocated only on errors.
+    pub(super) grpc_message: Option<String>,
 }
 
 #[cfg(test)]
@@ -299,6 +306,10 @@ fn add_header_with_storage(
             out.content_length = Some(parse_content_length(value)?);
             out.saw_content_length = true;
         }
+        // gRPC response facts: a string parse and (only on errors) one owned
+        // message. Requests never carry these, so the server path pays nothing.
+        "grpc-status" => out.grpc_status = value.trim().parse::<u16>().ok(),
+        "grpc-message" => out.grpc_message = Some(value.to_owned()),
         _ => {}
     }
     if store_regular_headers {

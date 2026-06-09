@@ -2108,6 +2108,17 @@ pub(crate) fn grpc_status_from_header_map(headers: &http::HeaderMap) -> Option<G
     Some(GrpcStatus { code, message })
 }
 
+/// Build a [`GrpcStatus`] from the compact wire facts captured by the HTTP/2
+/// client's gRPC-unary response path: a raw status code and the still
+/// percent-encoded message. The same percent-decode as the header-map path, so
+/// the compact and public client paths report identical status truth.
+pub(crate) fn grpc_status_from_compact(code: u16, raw_message: Option<&str>) -> GrpcStatus {
+    GrpcStatus {
+        code: GrpcStatusCode::from_u16(code),
+        message: raw_message.and_then(|m| percent_decode_grpc_message(m).ok()),
+    }
+}
+
 fn decode_grpc_status_trailers(block: &[u8]) -> Result<GrpcStatus, GrpcError> {
     let mut cursor = 0;
     let mut status = None;

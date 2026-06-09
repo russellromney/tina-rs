@@ -60,8 +60,8 @@ use super::headers::{
     DEFAULT_HEADER_TABLE_SIZE, HeaderBlock, MAX_MAX_FRAME_SIZE, MIN_MAX_FRAME_SIZE,
     SETTINGS_ENABLE_PUSH, SETTINGS_HEADER_TABLE_SIZE, SETTINGS_INITIAL_WINDOW_SIZE,
     SETTINGS_MAX_CONCURRENT_STREAMS, SETTINGS_MAX_FRAME_SIZE, SETTINGS_MAX_HEADER_LIST_SIZE,
-    decode_headers_block_with, encode_literal_header, validate_response_headers,
-    validate_trailer_block,
+    decode_headers_block_compact_with, decode_headers_block_with, encode_literal_header,
+    validate_response_headers, validate_trailer_block,
 };
 use super::target::Http2Target;
 
@@ -183,6 +183,17 @@ pub struct Http2ClientReport {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Http2ClientOutcome {
     Replied(Http2ClientResponse),
+    /// The buffered response to an [`Http2ClientMsg::SubmitGrpcUnary`] call,
+    /// decoded compactly into gRPC facts — no public `HeaderMap`. `grpc_status`
+    /// is the raw wire code (from trailers, or from headers for a trailers-only
+    /// response) and `grpc_message` is the still-percent-encoded message, if
+    /// any. Generic HTTP/2 callers keep the full-header [`Replied`] outcome.
+    GrpcUnaryReplied {
+        status: StatusCode,
+        grpc_status: Option<u16>,
+        grpc_message: Option<String>,
+        body: Vec<u8>,
+    },
     /// The response head of an [`Http2ClientMsg::OpenStream`] call: the
     /// stream opened and the response status + headers arrived. Pull the
     /// body with [`Http2ClientMsg::ResponseNext`] using `stream_id`.
@@ -599,6 +610,15 @@ struct ActiveClientStream {
     /// uses `response_body.len()`; the streamed path drains its chunks, so it
     /// needs its own running counter to tell the same content-length truth.
     response_body_received: usize,
+    /// True for a stream opened by [`Http2ClientMsg::SubmitGrpcUnary`]. Such a
+    /// stream decodes its response head/trailers compactly (gRPC facts only, no
+    /// public `HeaderMap`) and completes with
+    /// [`Http2ClientOutcome::GrpcUnaryReplied`].
+    grpc_unary: bool,
+    /// Compact gRPC response facts, captured for a `grpc_unary` stream instead
+    /// of building `response_headers`/`response_trailers`.
+    grpc_status: Option<u16>,
+    grpc_message: Option<String>,
 }
 
 impl ActiveClientStream {
@@ -633,6 +653,9 @@ impl ActiveClientStream {
             response_pull: None,
             response_eof: false,
             response_body_received: 0,
+            grpc_unary: false,
+            grpc_status: None,
+            grpc_message: None,
         }
     }
 
@@ -1298,6 +1321,8 @@ impl<S: Shard + 'static> Http2ClientConnection<S> {
             req.body.into_outbound(),
         );
         stream.request_end_sent = end_stream;
+        // Decode this stream's response compactly into gRPC facts.
+        stream.grpc_unary = true;
         self.report.opened_streams += 1;
         effects.push(emit_fact(ProtocolFact::Http2StreamOpened {
             connection: self.connection_fact_id(),
@@ -2000,18 +2025,34 @@ impl<S: Shard + 'static> Http2ClientConnection<S> {
             return Err(Http2ProtocolError::BadStreamId);
         };
         let payload = headers_payload(&frame)?;
-        let header_block = decode_headers_block_with(
-            &mut self.hpack_decoder,
-            payload,
-            self.limits.max_header_bytes,
-        )?;
+        // A gRPC-unary stream decodes its response compactly: gRPC facts only,
+        // no public `HeaderMap`. Every generic stream keeps the public decode.
+        let grpc_unary = self.streams[idx].grpc_unary;
+        let header_block = if grpc_unary {
+            decode_headers_block_compact_with(
+                &mut self.hpack_decoder,
+                payload,
+                self.limits.max_header_bytes,
+            )?
+        } else {
+            decode_headers_block_with(
+                &mut self.hpack_decoder,
+                payload,
+                self.limits.max_header_bytes,
+            )?
+        };
         let end_stream = frame.flags & FLAG_END_STREAM != 0;
         if !self.streams[idx].response_headers_seen {
             validate_response_headers(&header_block)?;
-            apply_response_headers(&mut self.streams[idx], header_block);
+            if grpc_unary {
+                apply_grpc_response_head(&mut self.streams[idx], header_block);
+            } else {
+                apply_response_headers(&mut self.streams[idx], header_block);
+            }
             self.streams[idx].response_headers_seen = true;
             // For a streamed response, deliver the head to the OpenStream
-            // waiter now; the body is pulled afterwards.
+            // waiter now; the body is pulled afterwards. gRPC-unary streams are
+            // buffered, so this never fires for them.
             if self.streams[idx].response_streamed && !self.streams[idx].response_head_sent {
                 self.send_response_head(idx, effects);
             }
@@ -2023,10 +2064,14 @@ impl<S: Shard + 'static> Http2ClientConnection<S> {
                 return Err(Http2ProtocolError::InvalidTrailerPseudoHeader);
             }
             validate_trailer_block(&header_block)?;
-            for (name, value) in header_block.headers.iter() {
-                self.streams[idx]
-                    .response_trailers
-                    .append(name.clone(), value.clone());
+            if grpc_unary {
+                apply_grpc_response_trailers(&mut self.streams[idx], header_block);
+            } else {
+                for (name, value) in header_block.headers.iter() {
+                    self.streams[idx]
+                        .response_trailers
+                        .append(name.clone(), value.clone());
+                }
             }
         }
         if end_stream {
@@ -2274,9 +2319,15 @@ impl<S: Shard + 'static> Http2ClientConnection<S> {
             stream: Http2StreamId::new(stream_id),
             reason: Http2CloseReason::EndStream,
         }));
-        if let Some(status) = grpc_status_from_headers(&stream.response_trailers)
-            .or_else(|| grpc_status_from_headers(&stream.response_headers))
-        {
+        // The final gRPC status fact comes from compact facts on a gRPC-unary
+        // stream, or from the public trailer/header maps otherwise.
+        let grpc_final = if stream.grpc_unary {
+            stream.grpc_status.map(grpc_status_code_from_wire)
+        } else {
+            grpc_status_from_headers(&stream.response_trailers)
+                .or_else(|| grpc_status_from_headers(&stream.response_headers))
+        };
+        if let Some(status) = grpc_final {
             effects.push(emit_fact(ProtocolFact::GrpcFinalStatusReceived {
                 connection: self.connection_fact_id(),
                 stream: tina_runtime::GrpcStreamId::new(stream_id as u64),
@@ -2284,6 +2335,12 @@ impl<S: Shard + 'static> Http2ClientConnection<S> {
             }));
         }
         let outcome = match stream.response_status {
+            Some(status) if stream.grpc_unary => Http2ClientOutcome::GrpcUnaryReplied {
+                status,
+                grpc_status: stream.grpc_status,
+                grpc_message: stream.grpc_message,
+                body: stream.response_body,
+            },
             Some(status) => Http2ClientOutcome::Replied(Http2ClientResponse {
                 status,
                 headers: stream.response_headers,
@@ -2709,6 +2766,31 @@ fn apply_response_headers(stream: &mut ActiveClientStream, header_block: HeaderB
     }
 }
 
+/// Apply a gRPC-unary response head from compact facts: HTTP status, declared
+/// length, and any `grpc-status`/`grpc-message` (a trailers-only error response
+/// carries the status here). The owned message is moved out of the block, so no
+/// public `HeaderMap` is built and the message is not cloned.
+fn apply_grpc_response_head(stream: &mut ActiveClientStream, header_block: HeaderBlock) {
+    stream.response_status = header_block.status;
+    stream.response_content_length = header_block.content_length;
+    if header_block.grpc_status.is_some() {
+        stream.grpc_status = header_block.grpc_status;
+    }
+    if header_block.grpc_message.is_some() {
+        stream.grpc_message = header_block.grpc_message;
+    }
+}
+
+/// Capture `grpc-status`/`grpc-message` facts from a gRPC-unary trailer block.
+fn apply_grpc_response_trailers(stream: &mut ActiveClientStream, header_block: HeaderBlock) {
+    if header_block.grpc_status.is_some() {
+        stream.grpc_status = header_block.grpc_status;
+    }
+    if header_block.grpc_message.is_some() {
+        stream.grpc_message = header_block.grpc_message;
+    }
+}
+
 fn emit_fact<S: Shard + 'static>(fact: ProtocolFact) -> Effect<Http2ClientConnection<S>> {
     tina::fact::<Http2ClientConnection<S>>(fact)
 }
@@ -2996,6 +3078,7 @@ mod tests {
         fn classify(o: &Http2ClientOutcome) -> &'static str {
             match o {
                 Http2ClientOutcome::Replied(_) => "replied",
+                Http2ClientOutcome::GrpcUnaryReplied { .. } => "grpc-unary-replied",
                 Http2ClientOutcome::ResponseStreaming { .. } => "response-streaming",
                 Http2ClientOutcome::Full => "full",
                 Http2ClientOutcome::Closed => "closed",
@@ -3010,6 +3093,15 @@ mod tests {
         assert_eq!(
             classify(&Http2ClientOutcome::TlsAlpnMismatch),
             "tls-alpn-mismatch"
+        );
+        assert_eq!(
+            classify(&Http2ClientOutcome::GrpcUnaryReplied {
+                status: StatusCode::OK,
+                grpc_status: Some(0),
+                grpc_message: None,
+                body: Vec::new(),
+            }),
+            "grpc-unary-replied"
         );
     }
 }

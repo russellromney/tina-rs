@@ -44,7 +44,10 @@ use crate::grpc::{
     GRPC_FRAME_HEADER_LEN, GrpcError, GrpcLimits, GrpcStatus, GrpcStatusCode,
     decode_one_grpc_message,
 };
-use crate::grpc::{encode_grpc_message, encode_grpc_message_into, grpc_status_from_header_map};
+use crate::grpc::{
+    encode_grpc_message, encode_grpc_message_into, grpc_status_from_compact,
+    grpc_status_from_header_map,
+};
 use crate::http2::{
     Http2ClientConnection, Http2ClientGrpcUnaryRequest, Http2ClientLimits, Http2ClientMsg,
     Http2ClientOutcome, Http2ClientReply, Http2ClientRequestBody, Http2ClientStreamCall,
@@ -283,27 +286,52 @@ impl GrpcClient {
         &self,
         outcome: Http2ClientOutcome,
     ) -> GrpcUnaryOutcome<Resp> {
-        let response = match outcome {
-            Http2ClientOutcome::Replied(response) => response,
+        match outcome {
+            Http2ClientOutcome::Replied(response) => {
+                // An explicit grpc-status wins regardless of HTTP status (gRPC
+                // servers always send HTTP 200 and put status in trailers, or in
+                // headers for a trailers-only response).
+                let status = grpc_status_from_header_map(&response.trailers)
+                    .or_else(|| grpc_status_from_header_map(&response.headers));
+                self.finish_unary(response.status, status, &response.body)
+            }
+            // The compact gRPC-unary path: the HTTP/2 client already parsed the
+            // status facts, so there is no `HeaderMap` to scan.
+            Http2ClientOutcome::GrpcUnaryReplied {
+                status,
+                grpc_status,
+                grpc_message,
+                body,
+            } => {
+                let parsed =
+                    grpc_status.map(|code| grpc_status_from_compact(code, grpc_message.as_deref()));
+                self.finish_unary(status, parsed, &body)
+            }
             // Anything that is not a completed HTTP response is a
             // transport-level failure, not a gRPC status.
-            transport => return GrpcUnaryOutcome::Transport(transport),
-        };
-        // An explicit grpc-status wins regardless of HTTP status (gRPC
-        // servers always send HTTP 200 and put status in trailers, or in
-        // headers for a trailers-only response).
-        let status = grpc_status_from_header_map(&response.trailers)
-            .or_else(|| grpc_status_from_header_map(&response.headers));
-        let status = match status {
+            transport => GrpcUnaryOutcome::Transport(transport),
+        }
+    }
+
+    /// Fold an HTTP status, an optional explicit gRPC status, and the response
+    /// body into a typed unary outcome. Shared by the public-header and compact
+    /// receive paths so both report identical status truth.
+    fn finish_unary<Resp: Message + Default>(
+        &self,
+        http_status: StatusCode,
+        grpc_status: Option<GrpcStatus>,
+        body: &[u8],
+    ) -> GrpcUnaryOutcome<Resp> {
+        let status = match grpc_status {
             Some(status) => status,
             None => {
-                return if response.status.as_u16() == 200 {
+                return if http_status.as_u16() == 200 {
                     // A 200 gRPC response MUST carry a grpc-status.
                     GrpcUnaryOutcome::Malformed(GrpcError::MissingTrailers)
                 } else {
                     // No grpc-status + non-200: a proxy/infra failure.
                     // Synthesize the status the gRPC spec prescribes.
-                    GrpcUnaryOutcome::Status(http_status_to_grpc_status(response.status))
+                    GrpcUnaryOutcome::Status(http_status_to_grpc_status(http_status))
                 };
             }
         };
@@ -312,8 +340,8 @@ impl GrpcClient {
         }
         // OK status: decode exactly one response message from the body.
         let mut cursor = 0;
-        match decode_one_grpc_message::<Resp>(&response.body, &mut cursor, self.limits) {
-            Ok(message) if cursor == response.body.len() => GrpcUnaryOutcome::Ok(message),
+        match decode_one_grpc_message::<Resp>(body, &mut cursor, self.limits) {
+            Ok(message) if cursor == body.len() => GrpcUnaryOutcome::Ok(message),
             Ok(_) => GrpcUnaryOutcome::Malformed(GrpcError::BadFrame),
             Err(error) => GrpcUnaryOutcome::Malformed(error),
         }
@@ -684,6 +712,75 @@ mod tests {
             Err(GrpcError::MessageTooLarge { len: 64, max: 4 })
         ));
         assert!(out.is_empty());
+    }
+
+    #[test]
+    fn compact_grpc_unary_outcome_decodes_ok_message() {
+        let client = dummy_client();
+        let body = framed(99);
+        let out: GrpcUnaryOutcome<Reply> =
+            client.decode_unary(Http2ClientOutcome::GrpcUnaryReplied {
+                status: StatusCode::OK,
+                grpc_status: Some(0),
+                grpc_message: None,
+                body,
+            });
+        assert_eq!(out, GrpcUnaryOutcome::Ok(Reply { value: 99 }));
+    }
+
+    #[test]
+    fn compact_grpc_unary_outcome_surfaces_non_ok_status_with_message() {
+        let client = dummy_client();
+        // grpc-message arrives percent-encoded on the wire; the compact path
+        // must decode it the same way the header-map path does.
+        let out: GrpcUnaryOutcome<Reply> =
+            client.decode_unary(Http2ClientOutcome::GrpcUnaryReplied {
+                status: StatusCode::OK,
+                grpc_status: Some(GrpcStatusCode::PermissionDenied.as_u16()),
+                grpc_message: Some("no%20access".to_owned()),
+                body: Vec::new(),
+            });
+        match out {
+            GrpcUnaryOutcome::Status(status) => {
+                assert_eq!(status.code, GrpcStatusCode::PermissionDenied);
+                assert_eq!(status.message.as_deref(), Some("no access"));
+            }
+            other => panic!("expected Status, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn compact_grpc_unary_outcome_missing_status_on_200_is_malformed() {
+        let client = dummy_client();
+        let out: GrpcUnaryOutcome<Reply> =
+            client.decode_unary(Http2ClientOutcome::GrpcUnaryReplied {
+                status: StatusCode::OK,
+                grpc_status: None,
+                grpc_message: None,
+                body: Vec::new(),
+            });
+        assert!(matches!(
+            out,
+            GrpcUnaryOutcome::Malformed(GrpcError::MissingTrailers)
+        ));
+    }
+
+    #[test]
+    fn compact_grpc_unary_outcome_non_200_without_status_synthesizes() {
+        let client = dummy_client();
+        let out: GrpcUnaryOutcome<Reply> =
+            client.decode_unary(Http2ClientOutcome::GrpcUnaryReplied {
+                status: StatusCode::NOT_FOUND,
+                grpc_status: None,
+                grpc_message: None,
+                body: Vec::new(),
+            });
+        match out {
+            GrpcUnaryOutcome::Status(status) => {
+                assert_eq!(status.code, GrpcStatusCode::Unimplemented);
+            }
+            other => panic!("expected synthesized Status, got {other:?}"),
+        }
     }
 
     #[test]
