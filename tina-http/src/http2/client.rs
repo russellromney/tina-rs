@@ -54,10 +54,9 @@ use super::frame::try_decode_frame;
 use super::frame::{
     CLIENT_PREFACE, DEFAULT_WINDOW, FLAG_ACK, FLAG_END_HEADERS, FLAG_END_STREAM, FRAME_DATA,
     FRAME_GOAWAY, FRAME_HEADER_LEN, FRAME_HEADERS, FRAME_PING, FRAME_RST_STREAM, FRAME_SETTINGS,
-    FRAME_WINDOW_UPDATE, Frame, READ_CHUNK, WINDOW_CREDIT_FLUSH_THRESHOLD, WRITE_COALESCE_LIMIT,
-    add_window, data_frame, goaway_frame, headers_frame, headers_payload_view, into_data_payload,
-    push_frame_header, push_setting, rst_stream_frame, settings_frame, try_decode_frame_meta,
-    window_update_frame,
+    FRAME_WINDOW_UPDATE, Frame, READ_CHUNK, WINDOW_CREDIT_FLUSH_THRESHOLD, add_window, data_frame,
+    goaway_frame, headers_frame, headers_payload_view, into_data_payload, push_frame_header,
+    push_setting, rst_stream_frame, settings_frame, try_decode_frame_meta, window_update_frame,
 };
 use super::headers::{
     DEFAULT_HEADER_TABLE_SIZE, HeaderBlock, MAX_MAX_FRAME_SIZE, MIN_MAX_FRAME_SIZE,
@@ -2542,7 +2541,7 @@ impl<S: Shard + 'static> Http2ClientConnection<S> {
             self.write_queue.push_back(bytes);
         } else if self.pending_write.is_empty() {
             self.pending_write = bytes;
-        } else if self.pending_write.len() + bytes.len() <= WRITE_COALESCE_LIMIT {
+        } else if self.pending_write.len() + bytes.len() <= self.peer_max_frame_size {
             self.pending_write.append(&mut bytes);
         } else {
             self.write_queue.push_back(bytes);
@@ -2558,7 +2557,7 @@ impl<S: Shard + 'static> Http2ClientConnection<S> {
         };
         while matches!(
             self.write_queue.front(),
-            Some(more) if next.len() + more.len() <= WRITE_COALESCE_LIMIT
+            Some(more) if next.len() + more.len() <= self.peer_max_frame_size
         ) {
             let mut more = self
                 .write_queue
@@ -3025,10 +3024,11 @@ mod tests {
         let mut client =
             Http2ClientConnection::<tina::SingleShard>::new(target, Http2ClientLimits::default());
 
-        client.enqueue_bytes(vec![1; WRITE_COALESCE_LIMIT]);
+        let frame_cap = client.peer_max_frame_size;
+        client.enqueue_bytes(vec![1; frame_cap]);
         client.enqueue_frame(data_frame(1, true, b"body".to_vec()));
 
-        assert_eq!(client.pending_write.len(), WRITE_COALESCE_LIMIT);
+        assert_eq!(client.pending_write.len(), frame_cap);
         assert_eq!(client.write_queue.len(), 1);
     }
 

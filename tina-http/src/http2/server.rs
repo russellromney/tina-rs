@@ -41,10 +41,9 @@ use super::frame::{
     CLIENT_PREFACE, DEFAULT_WINDOW, FLAG_ACK, FLAG_END_HEADERS, FLAG_END_STREAM,
     FRAME_CONTINUATION, FRAME_DATA, FRAME_GOAWAY, FRAME_HEADER_LEN, FRAME_HEADERS, FRAME_PING,
     FRAME_PRIORITY, FRAME_PUSH_PROMISE, FRAME_RST_STREAM, FRAME_SETTINGS, FRAME_WINDOW_UPDATE,
-    Frame, PRIORITY_PAYLOAD_LEN, READ_CHUNK, WINDOW_CREDIT_FLUSH_THRESHOLD, WRITE_COALESCE_LIMIT,
-    add_window, data_frame, data_payload_view, goaway_frame, headers_frame, headers_payload_view,
-    push_frame_header, push_setting, rst_stream_frame, settings_frame, try_decode_frame_meta,
-    window_update_frame,
+    Frame, PRIORITY_PAYLOAD_LEN, READ_CHUNK, WINDOW_CREDIT_FLUSH_THRESHOLD, add_window, data_frame,
+    data_payload_view, goaway_frame, headers_frame, headers_payload_view, push_frame_header,
+    push_setting, rst_stream_frame, settings_frame, try_decode_frame_meta, window_update_frame,
 };
 use super::headers::{
     DEFAULT_HEADER_TABLE_SIZE, HeaderBlock, MAX_MAX_FRAME_SIZE, MIN_MAX_FRAME_SIZE,
@@ -587,12 +586,12 @@ impl<S: Shard + 'static, M: Http2ServiceMessage> Http2Connection<S, M> {
         }
         if self.pending_write.is_empty() {
             // Write the first queued buffer, then batch following frames into the
-            // same write while under the coalesce limit. Keeps a response and its
-            // window-update in one write without merging many large buffers.
+            // same write while under one peer frame's worth. Keeps a response and
+            // its window-update in one write without merging many large buffers.
             if let Some(first) = self.write_queue.pop_front() {
                 self.pending_write = first;
                 while let Some(next) = self.write_queue.front() {
-                    if self.pending_write.len() + next.len() > WRITE_COALESCE_LIMIT {
+                    if self.pending_write.len() + next.len() > self.peer_max_frame_size {
                         break;
                     }
                     let next = self.write_queue.pop_front().expect("front just peeked");
@@ -2457,10 +2456,12 @@ mod tests {
         );
 
         // The bound: large queued buffers are not all copied into one write.
+        // A buffer at the peer frame size fills the write; the rest stay queued.
         let mut conn = unit_connection();
-        conn.write_queue.push_back(vec![1u8; WRITE_COALESCE_LIMIT]);
+        let frame_cap = conn.peer_max_frame_size;
+        conn.write_queue.push_back(vec![1u8; frame_cap]);
         conn.write_queue.push_back(vec![2u8; 1024]);
-        conn.write_queue.push_back(vec![3u8; WRITE_COALESCE_LIMIT]);
+        conn.write_queue.push_back(vec![3u8; frame_cap]);
         let _ = conn.write_more();
         assert_eq!(
             conn.write_queue.len(),
