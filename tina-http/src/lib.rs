@@ -213,7 +213,8 @@ pub use grpc::{
     GrpcRequest, GrpcRequestStream, GrpcResponse, GrpcRouter, GrpcRouterMsg,
     GrpcServerStreamingResponse, GrpcStatus, GrpcStatusCode, GrpcStreamReply, GrpcStreamingCall,
     GrpcStreamingResponse, decode_streaming_request, decode_unary_request, encode_grpc_message,
-    grpc_status_trailers, grpc_stream_finish, grpc_stream_message, grpc_unary_call_h2c_blocking,
+    encode_grpc_message_into, grpc_status_trailers, grpc_stream_finish, grpc_stream_message,
+    grpc_unary_call_h2c_blocking,
 };
 pub use grpc_client::{
     GrpcClient, GrpcPreframedUnary, GrpcStreamDecoder, GrpcStreamItem, GrpcTarget,

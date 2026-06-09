@@ -44,7 +44,7 @@ use crate::grpc::{
     GRPC_FRAME_HEADER_LEN, GrpcError, GrpcLimits, GrpcStatus, GrpcStatusCode,
     decode_one_grpc_message,
 };
-use crate::grpc::{encode_grpc_message, grpc_status_from_header_map};
+use crate::grpc::{encode_grpc_message, encode_grpc_message_into, grpc_status_from_header_map};
 use crate::http2::{
     Http2ClientConnection, Http2ClientGrpcUnaryRequest, Http2ClientLimits, Http2ClientMsg,
     Http2ClientOutcome, Http2ClientReply, Http2ClientRequestBody, Http2ClientStreamCall,
@@ -405,6 +405,21 @@ impl GrpcClient {
         encode_grpc_message(message, self.limits)
     }
 
+    /// Append one length-prefixed gRPC frame onto a caller-owned buffer — the
+    /// reusable form of [`frame`](Self::frame). A caller building a
+    /// client-streaming body from several messages can pack them into one
+    /// buffer (a valid concatenated gRPC body) instead of allocating a fresh
+    /// `Vec` per message. The configured message cap is enforced before any
+    /// bytes are written, so an over-cap message fails with
+    /// [`GrpcError::EncodeTooLarge`] and leaves `out` untouched.
+    pub fn frame_into<Req: Message>(
+        &self,
+        out: &mut Vec<u8>,
+        message: &Req,
+    ) -> Result<(), GrpcError> {
+        encode_grpc_message_into(out, message, self.limits)
+    }
+
     /// Read a final gRPC status from a streamed response **head's** header
     /// block. A trailers-only error response (END_STREAM on the HEADERS
     /// frame) carries `grpc-status` here, not in the `End` trailers.
@@ -669,6 +684,60 @@ mod tests {
             Err(GrpcError::MessageTooLarge { len: 64, max: 4 })
         ));
         assert!(out.is_empty());
+    }
+
+    #[test]
+    fn frame_into_packs_multiple_messages_into_one_buffer() {
+        let client = dummy_client();
+        // Frame three dynamic messages into one reused buffer — a valid
+        // concatenated gRPC body, not three separate Vecs.
+        let mut body = Vec::new();
+        for value in [10u64, 20, 30] {
+            client
+                .frame_into(&mut body, &Reply { value })
+                .expect("frame into shared buffer");
+        }
+        // The body decodes back to exactly those three messages.
+        let mut decoder = GrpcStreamDecoder::new(GrpcLimits::default());
+        let mut out: Vec<Reply> = Vec::new();
+        decoder
+            .push_into(&body, &mut out)
+            .expect("decode packed body");
+        assert_eq!(
+            out,
+            vec![
+                Reply { value: 10 },
+                Reply { value: 20 },
+                Reply { value: 30 }
+            ]
+        );
+    }
+
+    #[test]
+    fn frame_into_into_empty_buffer_matches_frame() {
+        let client = dummy_client();
+        let mut buf = Vec::new();
+        client
+            .frame_into(&mut buf, &Reply { value: 7 })
+            .expect("frame_into");
+        let direct = client.frame(&Reply { value: 7 }).expect("frame");
+        assert_eq!(buf, direct, "reusable framing matches the one-Vec form");
+    }
+
+    #[test]
+    fn frame_into_rejects_over_cap_before_writing() {
+        let limits = GrpcLimits {
+            max_message_bytes: 4,
+            ..GrpcLimits::default()
+        };
+        let client = GrpcClient::new(dummy_client().connection(), limits);
+        // Pre-seed the buffer so we can prove nothing was appended on failure.
+        let mut buf = vec![0xAAu8; 3];
+        let err = client
+            .frame_into(&mut buf, &Reply { value: u64::MAX })
+            .expect_err("over-cap message must fail before framing");
+        assert!(matches!(err, GrpcError::EncodeTooLarge { max: 4, .. }));
+        assert_eq!(buf, vec![0xAA, 0xAA, 0xAA], "buffer untouched on over-cap");
     }
 
     #[test]

@@ -234,3 +234,46 @@ connection-setup row, which reports `leak=unchecked`. This reproduces on pristin
 and is unrelated to it (that row never touches `GrpcRouter`). The row data still
 prints before the panic. Flagged here so the perf-proof pass can decide whether
 to fix the macOS leak check separately.
+
+## Implementation Note 3 (Session A — item 6, with an architectural limit)
+
+### What changed
+
+`tina-http/src/grpc.rs`: `encode_grpc_message_into(&mut Vec<u8>, message,
+limits)` is now the public, canonical reusable framing primitive (the old
+private `append_grpc_message`). `encode_grpc_message` is a thin wrapper that
+sizes one exact `Vec`. `GrpcBufferedServerStreamingResponse::from_messages`
+frames every message into one body through it (with explicit
+`max_messages` / `max_body_bytes` caps and `TooManyMessages` /
+`EncodeTooLarge` truth). `tina-http/src/grpc_client.rs`: added
+`GrpcClient::frame_into(&mut Vec<u8>, message)` — the reusable form of `frame`,
+for packing several messages into one client-streaming body. Re-exported
+`encode_grpc_message_into`.
+
+### What is directly proved
+
+- `frame_into_packs_multiple_messages_into_one_buffer`: three dynamic messages
+  framed into one buffer decode back to exactly those three (valid concatenated
+  body).
+- `frame_into_into_empty_buffer_matches_frame`: reusable form byte-matches the
+  one-`Vec` form.
+- `frame_into_rejects_over_cap_before_writing`: an over-cap message returns
+  `EncodeTooLarge` and leaves the buffer's existing bytes untouched (cap enforced
+  before any framing byte is written).
+- grpc lib units (29) green; gRPC integration suites green; fmt + clippy clean.
+
+### Architectural limit (honest, like item 3)
+
+The plan also named `GrpcUnaryTemplate::request_into` and a reusable server
+response buffer pool. A single request/response body that is **moved into a
+message crossing an isolate boundary** cannot be pool-reused — it travels with
+the message, and `std::mem::take`-ing a scratch buffer into it leaves the scratch
+empty, so there is no allocation-count win (the per-call body Vec is already
+sized exactly, one allocation). This is the same owned-body-ships wall as item 3.
+So `request_into` for a single shipped unary body is a non-win and was omitted on
+purpose; the reusable primitive is provided where it genuinely reduces
+allocations: multi-message framing into one buffer (buffered server-streaming
+response — a perf-exercised path — and caller-built client-streaming bodies).
+A true per-call response pool would need the framed body to be written to the
+wire from router-owned scratch without crossing back as an owned `Vec`, which is
+a runtime/protocol change out of this phase's scope.

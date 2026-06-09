@@ -475,7 +475,7 @@ impl GrpcBufferedServerStreamingResponse {
                     max: limits.max_body_bytes,
                 });
             }
-            append_grpc_message(&mut body, &message, limits.message)?;
+            encode_grpc_message_into(&mut body, &message, limits.message)?;
         }
         Ok(Self::from_framed_body(body))
     }
@@ -1697,25 +1697,34 @@ fn decode_streaming_body<T: Message + Default>(
     Ok(messages)
 }
 
+/// Frame one protobuf message as a length-prefixed gRPC message in a fresh
+/// `Vec`. A convenience wrapper over [`encode_grpc_message_into`]; callers that
+/// frame several messages, or that reuse a scratch buffer across calls, should
+/// use `encode_grpc_message_into` to append into storage they own.
 pub fn encode_grpc_message<T: Message>(
     message: &T,
     limits: GrpcLimits,
 ) -> Result<Vec<u8>, GrpcError> {
-    let len = message.encoded_len();
-    if len > limits.max_message_bytes {
-        return Err(GrpcError::EncodeTooLarge {
-            len,
-            max: limits.max_message_bytes,
-        });
-    }
-    let mut out = Vec::with_capacity(GRPC_FRAME_HEADER_LEN + len);
-    out.push(0);
-    out.extend_from_slice(&(len as u32).to_be_bytes());
-    message.encode(&mut out).map_err(|_| GrpcError::BadFrame)?;
+    // The message length is known, so the buffer is sized exactly once.
+    let mut out = Vec::with_capacity(GRPC_FRAME_HEADER_LEN + message.encoded_len());
+    encode_grpc_message_into(&mut out, message, limits)?;
     Ok(out)
 }
 
-fn append_grpc_message<T: Message>(
+/// Append one length-prefixed gRPC message onto `out`, the reusable framing
+/// primitive. The caller owns `out` and may reuse its capacity across calls or
+/// pack several messages into one buffer (e.g. a buffered server-streaming
+/// body, or a client-streaming source that batches messages).
+///
+/// The message-size cap is enforced **before** any framing bytes are written,
+/// so an over-cap message fails with [`GrpcError::EncodeTooLarge`] and leaves
+/// `out` untouched.
+///
+/// Note on hot paths: a single request/response body that is then *moved* into
+/// a message crossing an isolate boundary cannot be pool-reused — it travels
+/// with the message. The reuse benefit here is for multi-message framing and
+/// for caller-held scratch buffers, not for shrinking a single shipped body.
+pub fn encode_grpc_message_into<T: Message>(
     out: &mut Vec<u8>,
     message: &T,
     limits: GrpcLimits,
