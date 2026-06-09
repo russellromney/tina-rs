@@ -238,8 +238,15 @@ pub(crate) fn is_grpc_content_type(value: &str) -> bool {
 /// Typed unary request passed to user handlers.
 #[derive(Debug, Clone)]
 pub struct GrpcRequest<T> {
-    pub path: Arc<str>,
+    path: Arc<str>,
     pub message: T,
+}
+
+impl<T> GrpcRequest<T> {
+    /// The gRPC method path this request was routed to, e.g. `/pkg.Svc/Method`.
+    pub fn path(&self) -> &str {
+        &self.path
+    }
 }
 
 /// Typed unary response returned by user handlers.
@@ -492,9 +499,16 @@ impl GrpcBufferedServerStreamingResponse {
 /// response source.
 #[derive(Debug)]
 pub struct GrpcStreamingCall<Req, Resp> {
-    pub path: Arc<str>,
+    path: Arc<str>,
     pub requests: GrpcRequestStream<Req>,
     _response: PhantomData<fn() -> Resp>,
+}
+
+impl<Req, Resp> GrpcStreamingCall<Req, Resp> {
+    /// The gRPC method path this stream was routed to, e.g. `/pkg.Svc/Method`.
+    pub fn path(&self) -> &str {
+        &self.path
+    }
 }
 
 /// Typed gRPC request stream helper for streaming RPCs.
@@ -681,12 +695,17 @@ pub fn grpc_stream_finish(status: GrpcStatus) -> ResponseChunkReply {
 /// or test fixture that must work directly with HTTP/2 request chunks.
 #[derive(Debug, Clone)]
 pub struct GrpcRawStreamingRequest<T> {
-    pub path: Arc<str>,
+    path: Arc<str>,
     pub stream: Http2RequestStream,
     _message: PhantomData<fn() -> T>,
 }
 
 impl<T> GrpcRawStreamingRequest<T> {
+    /// The gRPC method path this request was routed to, e.g. `/pkg.Svc/Method`.
+    pub fn path(&self) -> &str {
+        &self.path
+    }
+
     pub fn message_type(&self) -> PhantomData<fn() -> T> {
         self._message
     }
@@ -830,8 +849,15 @@ where
 /// Typed client-streaming request passed to user handlers.
 #[derive(Debug, Clone)]
 pub struct GrpcClientStreamingRequest<T> {
-    pub path: Arc<str>,
+    path: Arc<str>,
     pub messages: Vec<T>,
+}
+
+impl<T> GrpcClientStreamingRequest<T> {
+    /// The gRPC method path this request was routed to, e.g. `/pkg.Svc/Method`.
+    pub fn path(&self) -> &str {
+        &self.path
+    }
 }
 
 impl<Req, Resp, F> ErasedClientStreaming for ClientStreamingHandler<Req, Resp, F>
