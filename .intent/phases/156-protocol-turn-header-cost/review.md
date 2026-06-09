@@ -614,3 +614,50 @@ attack on the per-chunk client pull, beyond this phase's landed items. Reported 
 Every Done-Means bullet is met. Of the item-8 numeric targets, the warmed-unary
 20% is exceeded and the server-streaming 15% is the single miss (-12%), recorded
 above. PR can come out of draft; the streaming sub-target gap is the one caveat.
+
+## Implementation Note 11 (Session B — item 8 follow-on: client inline-frame zero-copy)
+
+After the 3x3 showed server-streaming at -12% (short of the 15% target), one clean
+protocol-code lever remained: the native client read loop copied *every* inbound
+frame payload via `try_decode_frame` -> `.to_vec()`, when only DATA frames need
+owned bytes (they are queued for the caller to pull). HEADERS/SETTINGS/
+WINDOW_UPDATE/RST/PING/GOAWAY are decoded inline and discarded, so their per-frame
+copy was pure waste on every response head, every trailers block, and every
+control frame.
+
+### What changed (`tina-http/src/http2/client.rs`, `frame.rs`)
+
+- The client read loop now decodes the frame header (`try_decode_frame_meta`) and
+  splits: DATA keeps its owned-`Vec` path (unchanged), while inline frames are
+  copied once into a reused connection-owned `frame_scratch` buffer and dispatched
+  through a new `handle_inline_frame` from a borrowed `&[u8]`. The scratch keeps
+  its capacity across frames, so steady-state inline-frame decoding allocates
+  nothing.
+- The six non-DATA handlers now take `(flags, stream_id, payload: &[u8])` instead
+  of an owned `Frame`. `handle_headers` decodes via `headers_payload_view`. PING
+  (rare) copies its payload back for the ACK.
+- `try_decode_frame` and `headers_payload` became test-only / were removed; the
+  server already used the borrowed `headers_payload_view` path.
+
+This is the same zero-copy shape the server read loop already used; no behavior
+change, no isolation/cap/flow-control change. Full client/gRPC/HTTP2 suites green
+(`http2_client_live`, `grpc_client_live`, `grpc_live`, `http2_live`,
+`http2_client_adversarial`, `dst_http2_client`).
+
+### Measured (macOS/aarch64, process allocations, median)
+
+| row                       | before (main) | after items 1-7+3 | + this change | total Δ |
+|---------------------------|--------------:|------------------:|--------------:|--------:|
+| grpc_h2c_unary_warmed     |          3953 |              2879 |          2732 | -30.9%  |
+| grpc_h2c_unary_pooled     |          3977 |              2737 |          2612 | -34.3%  |
+| grpc_h2c_server_streaming |          5318 |              4690 |          4565 | -14.2%  |
+| http2_h2c_steady_small    |           897 |               897 |           897 |   0.0%  |
+
+Warmed unary improves further to -31%; server-streaming moves from -11.8% to
+-14.2% median (individual runs cross 15%: min 4478 = -15.8%). The streaming
+median still sits just under the 15% target — the residual is the per-pull
+`call_blocking` machinery (runtime, ~2 extra host round trips vs unary), not
+protocol framing. Closing the last point needs a runtime change to per-pull cost,
+the same class of wall as the unary turn-floor. Turn counts and `perf-h2-alloc`
+unchanged (allocation-only change). The 3x3 tables and Linux numbers are refreshed
+in `perf_3x3_before_after.txt`.
