@@ -521,3 +521,38 @@ pooled-concurrent to ~2736, server-streaming to ~4690;
 (13 / 11 / 21) — interning is an allocation change, not a turn change. Full
 `tina-http` suite green (incl. `grpc_live` 35, `grpc_client_live` 10,
 `http2_live` 41); fmt + clippy (lib + perf example) clean; rustdoc clean.
+
+## Implementation Note 9 (Session B — item 6 decision recorded)
+
+Item 6 has two halves. The reusable framing primitive is **done** (Note 3):
+`encode_grpc_message_into(&mut Vec<u8>, ...)` and `GrpcClient::frame_into` pack
+several messages into one buffer with explicit caps and `EncodeTooLarge` /
+`TooManyMessages` truth, and the buffered server-streaming response (a
+perf-exercised path) and caller-built client-streaming bodies use them. That is
+where reuse genuinely removes allocations.
+
+The remaining half — a reclaiming pool for the single unary request/response
+body — is **explicitly declined**, and this note is the call the plan asked for.
+
+### The decision: accept the documented limit, do not build the reclaiming pool
+
+A single unary body is *moved into the message that crosses the isolate
+boundary*. It travels with the message; `std::mem::take`-ing a scratch buffer
+into it leaves the scratch empty, so there is no allocation-count win — the
+per-call body `Vec` is already sized in exactly one allocation. A real pool would
+need the framed body written to the wire from router-owned scratch *without*
+crossing back as an owned `Vec`, then the buffer reclaimed after the write
+completes. That is a runtime/protocol change (terminal write returning the buffer
+to a connection-owned free list), out of this phase's protocol-code scope, and
+the plan itself rates the payoff as low.
+
+Building a bounded reclaiming pool now would add a cap, a `Full` /
+`ResourceExhausted` path, and a post-write reclaim hook for a single saved
+allocation per call that the interner and the write-coalescing already dwarf
+(items 3 and 7 together took warmed unary process allocations ~3949 -> ~2870).
+The cost/benefit does not justify the new failure surface. If a future phase adds
+the terminal-write buffer-reclaim runtime primitive (the same co-located
+primitive named for the unary turn floor in `grpc_unary_turn_timeline.txt`), the
+response-body pool becomes a natural, cheap follow-on; until then the reusable
+multi-message primitive is the honest answer and the single-shipped-body limit
+stands as documented.
