@@ -951,6 +951,12 @@ controls and reports already point this way:
 
 Possible implementation slices, in likely order:
 
+0. **Runtime-ops truth cleanup.** Fix stale substrate docs and reports before
+   adding new surfaces. Current code has places that still describe TLS as
+   worker-thread-backed even though native TLS now rides the Betelgeuse TCP rail
+   on the shard thread. Those comments make the thread-per-core story look worse
+   than the runtime is. Keep capability docs, live reports, and user-guide text
+   aligned with the real rail shape.
 1. **SchedulerPolicy / SchedulerReport.** Wrap the existing live scheduling
    knobs in one public policy/report vocabulary instead of scattering them
    across config docs. Report, per shard, the configured local/remote/completion
@@ -964,12 +970,18 @@ Possible implementation slices, in likely order:
    assertion helpers only after specimens need colocated or separated placement.
    Do not expose arbitrary executor handles as the teaching path.
 3. **Storage visibility.** Split reports for completion-backed storage work and
-   fallback-worker work. Surface storage capacity, depth where honest,
-   accepted/full/closed counts, active write-path locks, fallback-worker usage,
-   durability capability, and direct-I/O/DMA alignment support as `NotClaimed`
-   until real support lands. Add storage perf rows for append/replay/snapshot
-   and file streaming before making storage-performance claims.
-4. **Stall detection.** Add an opt-in live `StallPolicy` for long handler turns,
+   fallback-worker work. The capability report already distinguishes
+   `storage_lane` from `storage_metadata_fallback`; live reports should do the
+   same instead of reporting only unmeasured capacities. Surface storage
+   capacity, depth where honest, accepted/full/closed counts, active write-path
+   locks, fallback-worker usage, durability capability, and direct-I/O/DMA
+   alignment support as `NotClaimed` until real support lands. Add storage perf
+   rows for append/replay/snapshot and file streaming before making
+   storage-performance claims.
+4. **Stall detection.** Keep this separate from `FairnessReport`.
+   `FairnessReport` is trace-folded progress counts, not ready-turn lag, timer
+   lateness, or wall-clock stalls. Add an opt-in live `StallPolicy` for long
+   handler turns,
    long driver advances, and long completion drains. Emit/report typed stall
    facts such as handler-stalled, driver-advance-stalled, and
    completion-drain-stalled. This is live observability, not preemption and not
@@ -984,9 +996,10 @@ Possible implementation slices, in likely order:
    until repeated Linux/macOS rows on stable machines justify changing it.
 
 Future IDD plans from this note should include user-shaped proof: a live service
-with multiple labeled services on multiple shards, real topology/report
-assertions, a forced stall, a storage-lane report, and before/after perf rows.
-Unit tests alone are not enough for this direction.
+with multiple explicitly labeled services on multiple shards, real
+topology/report assertions, a forced stall, a storage-lane report, stale-TLS-doc
+cleanup proof, and before/after perf rows. Unit tests alone are not enough for
+this direction.
 
 Explicit non-goals for this phase:
 
