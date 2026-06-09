@@ -1,6 +1,17 @@
 # Phase 155: Protocol Service Hot Path
 
-Status: planned.
+Status: landed.
+
+Outcome: compact native gRPC dispatch no longer materializes the public
+`HttpRequest`/`HeaderMap` shape where the built-in gRPC path does not need it;
+unary requests use reusable method-path/template shapes; finite server-streaming
+can use a bounded buffered response; compact gRPC responses avoid generic header
+map churn; and perf rows plus e2e negative tests prove caps/status/failure truth
+still hold. Remaining performance work is deeper protocol/runtime turn-count
+and HPACK/header allocation, not this first compact-dispatch pass.
+
+The implementation plan below is historical. Do not treat the "Current Hot
+Path" section as current state after this phase landed.
 
 ## Goal
 

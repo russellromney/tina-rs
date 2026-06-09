@@ -4,6 +4,36 @@ This file records completed work.
 
 ## Unreleased
 
+### Adversarial Review Fix Wave
+
+- Recorded the 2026-06-08 adversarial review and per-track findings under
+  `.intent/review/`, then merged the full fix wave so the review record and
+  code state agree on `main`.
+- Fixed RPC macro arg hygiene for trait parameters named `encoding` or
+  `payload`, and tightened the split request-call safety rail so string
+  literals cannot hide forbidden call-authority use from compile-fail tests.
+- Removed remaining hot-path quadratic scans in runtime stopped-entry
+  collection and promoted-slot sweeping.
+- Made uncertain process-kill cleanup cancel and join stdout/stderr drain
+  threads instead of dropping blocked drain handles.
+- Hardened HTTP/1 keepalive client truth: a non-chunked response that sends
+  bytes beyond `Content-Length` now retires the pooled socket instead of
+  silently truncating and reusing a desynchronized connection.
+- Fixed bridge admission-slot leaks by reserving runtime-owned continuation
+  overflow delivery for bridge/self continuations when the ordinary bounded
+  mailbox is saturated. The docs now state the real priority semantics: FIFO
+  within the overflow lane, not FIFO relative to older ordinary ingress.
+- Hardened live multi-shard proof truth. Cross-shard trace invariants now fail
+  closed when an event id is ambiguous across shards instead of proving a cause
+  by id alone, and the proof harness has explicit ambiguity regressions.
+- Fixed HTTP/2 and gRPC symmetry gaps: streamed client responses now check
+  `Content-Length` at `END_STREAM`, client-streaming gRPC decode enforces the
+  service-owned message-count cap, the server's initial SETTINGS advertises
+  configured stream/window/frame caps and disables push, buffered uploads return
+  window credit during the upload instead of deadlocking above the initial
+  window, and client/server stream lookup uses bounded id-to-slot maps instead
+  of per-frame linear scans.
+
 ### Real Protocol Performance
 
 - gRPC hot path follow-through: native unary calls now use

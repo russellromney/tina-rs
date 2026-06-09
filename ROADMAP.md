@@ -386,7 +386,7 @@ and reviews live under `.intent/phases/`.
   are done. Their remaining edges now mostly feed native AWS, pooled
   HTTP/2/gRPC clients, production soak/benchmark follow-ups, and public
   release cleanup.
-- Native performance evidence tranche: Phases 144-154 are now recorded in
+- Native performance evidence tranche: Phases 144-155 are now recorded in
   `CHANGELOG.md`. Local native-vs-bounded-Tokio rows, hotpath stage probes,
   process allocation rows, owned-buffer TCP/TLS calls, HTTP encoder
   presizing, small-response coalescing, terminal TCP write-close, and an HTTP
@@ -420,11 +420,24 @@ and reviews live under `.intent/phases/`.
   gRPC request bodies to an owned/shared cursor path. The gRPC hot-path pass
   added compact unary submits, reusable method-path templates, preframed shared
   unary bodies, shared buffered response bodies, and bounded finite
-  server-streaming responses with explicit message-count/body-byte caps.
-  Remaining edges are still real and named, not hidden: protocol/runtime turn
-  count, inbound HPACK/header allocation, dynamic protobuf encode/decode cost,
-  wider tails under one single-shard worker, repeated Linux/x86 evidence, and
-  no production-performance claim until evidence earns it.
+  server-streaming responses with explicit message-count/body-byte caps. The
+  protocol-service hot-path pass then removed public `HttpRequest`/`HeaderMap`
+  materialization from compact gRPC dispatch where no generic HTTP policy
+  boundary needed it, added compact gRPC response framing, and pinned the
+  remaining turn/allocation cost with protocol rows.
+- Adversarial review fix wave: the 2026-06-08 review artifacts are now in
+  `.intent/review/`, and every live Medium-or-higher finding from that wave has
+  landed. The wave fixed RPC macro arg shadowing, split request-call compile
+  rails, process drain-handle leaks, HTTP/1 keepalive over-send reuse,
+  bridge/self-continuation slot leaks, multishard trace ambiguity, runtime
+  stopped/promoted-slot scan cost, and HTTP/2/gRPC length/cap/settings/window
+  truth. Future broad reviews should start from those artifacts instead of
+  refiling closed findings.
+- Remaining edges are still real and named, not hidden: deeper protocol/runtime
+  turn-count reduction, inbound HPACK/header allocation beyond compact gRPC,
+  dynamic protobuf encode/decode cost, wider tails under one single-shard
+  worker, repeated Linux/x86 evidence, and no production-performance claim
+  until evidence earns it.
 
 These are recorded in `CHANGELOG.md`; the remaining near-term roadmap now
 starts with native AWS. Public release cleanup waits until Tina stops
@@ -437,7 +450,6 @@ framework before public release-story work.
 
 | Phase | Purpose |
 |---|---|
-| **155 Protocol service hot path** | Make warmed HTTP/2 gRPC cheaper in the real protocol path: avoid public `HttpRequest`/`HeaderMap` materialization on compact native gRPC service dispatch, avoid per-request gRPC method-path `String` allocation, avoid response `HeaderMap` churn for fixed gRPC headers/trailers, reduce warmed unary service turns where no Tina policy boundary is crossed, reuse/compact HPACK/header decode storage, and prove macOS + Linux/x86 perf rows plus negative e2e caps/status/failure truth. Plan: `.intent/phases/155-protocol-service-hot-path/plan.md`. |
 | **135 Native AWS first form** | Add a native Tina AWS battery for the smallest honest production shape: static SigV4 with explicit signing time, native S3 put/get/head/delete, native SQS send/receive/delete, native HTTP keepalive under Phase 131 endpoint/connect policy, bounded bodies/in-flight work, typed pressure/lifecycle reports, hermetic fake-AWS tests, and clear native-vs-SDK-bridge docs. Plan: `.intent/phases/135-native-aws-first-form/plan.md`. |
 | **Alpaca rename** | Before public launch, rename the project/crates/docs away from Tina to Alpaca so the lineage is respectful and clear: independently maintained Rust framework, inspired by Peter Mbanugo's Tina/Odin and Seastar, not an official Tina port. |
 | **Barend Biesheuvel visible flow ergonomics** | Optional high-level ergonomics only after the local runtime core feels boring: a `flow!`-style authoring surface that preserves named suspension points, visible failure policy, trace step names, and ordinary Tina message/effect expansion. No fake async, no hidden retries, no hidden queues. |
@@ -814,7 +826,7 @@ shape.
 | Broadcast/fanout primitive | Shipped: `BroadcastTargets`, `BroadcastTracker`, `BroadcastReport`, and `broadcast_observed` give room/session services a service-owned target cap, per-target `Accepted`/`Full`/`Closed` accounting, and an ordinary continuation-message path. Remaining: richer per-peer slow policy and room-manager helpers when another real service pulls on them. | Chat/WebSocket/realtime services get a copied Tina shape for broadcast without losing per-peer pressure truth. |
 | Pool maturity | Shipped: idle eviction, max lifetime, health checks, retire/reuse policy, shutdown reports, DB pressure alignment, and HTTP/1 keepalive retirement. Remaining: pooled HTTP/2/gRPC clients and cross-protocol session lifecycle polish. | Pools become production resources, not just first-form acquire/release examples. |
 | Async ecosystem boundary | Shipped: native-first capability reports, bridge-author vocabulary, extension smoke crates, open sync codec hooks, and docs separating native, bridge, and unsupported async paths. Remaining: decide whether a bounded Future/Stream bridge is worth building once a real workload proves it. | Users know which Tokio apps Tina can replace natively and where a bridge is the honest boundary. |
-| Benchmarks with humility | Shipped: Phases 144-154 add local release-mode native performance rows, bounded Tokio comparison rows, hot-path stage reports, perf history/check scripts, process allocation rows, HTTP body-pressure perf proof, manual Linux/x86 perf workflow, opt-in long soak, readiness-driven worker park, HTTP/2/WebSocket/gRPC protocol rows, structural HTTP/2 byte-path reductions, duplicate WebSocket event removal, and gRPC compact/preframed/buffered hot paths. Remaining: reduce protocol/runtime turn count, reduce HPACK/header allocation, collect repeated Linux/x86 rows, broaden equivalent-workload comparisons, and resist production-performance claims until repeated evidence earns them. | Performance claims do not outrun Tina's boundedness and correctness story. |
+| Benchmarks with humility | Shipped: Phases 144-155 add local release-mode native performance rows, bounded Tokio comparison rows, hot-path stage reports, perf history/check scripts, process allocation rows, HTTP body-pressure perf proof, manual Linux/x86 perf workflow, opt-in long soak, readiness-driven worker park, HTTP/2/WebSocket/gRPC protocol rows, structural HTTP/2 byte-path reductions, duplicate WebSocket event removal, gRPC compact/preframed/buffered hot paths, and compact gRPC service dispatch/response framing. Remaining: reduce deeper protocol/runtime turn count, reduce inbound HPACK/header allocation beyond compact gRPC, collect repeated Linux/x86 rows, broaden equivalent-workload comparisons, and resist production-performance claims until repeated evidence earns them. | Performance claims do not outrun Tina's boundedness and correctness story. |
 | Ecosystem extension hooks | Shipped: bridge-author vocabulary, open sync codec and service-policy hooks, capacity surface/event-sink vocabulary, runtime capability report, and public-API-only extension smoke crates. Remaining: publication/semver proof and stronger author templates once third-party-shaped crates grow. | Tina can grow an ecosystem without every new capability landing in core or weakening bounded/DST truth. |
 | Whole-framework ergonomics | Shipped: one coherent copied path for a real service: prelude, config/budget manifest, public requests/internal events, defer/cancel/drain/report/shutdown, and replay hooks. Remaining: keep the skeleton current as AWS, pooled HTTP/2/gRPC, native database, and saga-shaped systems land. | A new developer or cheap model can build a correct bounded + replay-aware service without stitching ten specimens together. |
 
@@ -968,9 +980,10 @@ These still need answers, but each now has an intended phase home.
    with the same visible `Full`/`Closed`, FIFO rules, no hidden blocking, and
    no unbounded internal queue.
 6. **Zero-copy / lower-allocation transport.** The current cost model is
-   honest but not final. Phases 144-154 removed the first obvious runtime,
-   socket, HTTP/2, WebSocket, and gRPC waste. The next home is a performance
-   slice that reduces protocol/runtime turn count and HPACK/header churn, then
+   honest but not final. Phases 144-155 removed the first obvious runtime,
+   socket, HTTP/2, WebSocket, and gRPC waste, including compact gRPC request
+   and response paths. The next home is a deeper performance slice that reduces
+   remaining protocol/runtime turn count and inbound HPACK/header churn, then
    proves the result on Linux and macOS without hiding Tina's
    effect/cancel/capacity truth.
 7. **Sequential-looking workflow ergonomics.** The raw Tina state-machine form
