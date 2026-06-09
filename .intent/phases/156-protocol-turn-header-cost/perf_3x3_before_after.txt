@@ -20,13 +20,20 @@ dedicated CPU (app `tina-perf-150`). Counts below are medians across the 3 runs
 
 ## Process allocations (the deterministic signal)
 
+AFTER = branch with all items 1-7, item 3, and the item-8 client inline-frame
+zero-copy follow-on (commit 9e64b4c). Medians of 3 runs.
+
 | row                              | mac BEFORE | mac AFTER | Δ      | lin BEFORE | lin AFTER | Δ      |
 |----------------------------------|-----------:|----------:|-------:|-----------:|----------:|-------:|
-| grpc_h2c_unary_warmed            |       3953 |      2879 | -27.2% |       4070 |      2888 | -29.0% |
-| grpc_h2c_unary_pooled_concurrent |       3977 |      2737 | -31.2% |       4063 |      2786 | -31.4% |
-| grpc_h2c_server_streaming        |       5318 |      4690 | -11.8% |       5466 |      4842 | -11.4% |
+| grpc_h2c_unary_warmed            |       3953 |      2732 | -30.9% |       4070 |      2769 | -31.9% |
+| grpc_h2c_unary_pooled_concurrent |       3977 |      2612 | -34.3% |       4063 |      2659 | -34.6% |
+| grpc_h2c_server_streaming        |       5318 |      4565 | -14.2% |       5466 |      4719 | -13.7% |
 | http2_h2c_client_steady_state_post |     2785 |      2368 | -15.0% |       2939 |      2410 | -18.0% |
-| http2_h2c_steady_state_small     |        897 |       897 |   0.0% |        930 |       930 |   0.0% |
+| http2_h2c_steady_state_small     |        897 |       897 |   0.0% |        930 |       928 |   0.0% |
+
+(An earlier intermediate AFTER, before the client zero-copy, had warmed unary
+~2879/2888 and streaming ~4690/4842 = -11.8%/-11.4%; the client inline-frame
+zero-copy improved both rows another ~2-3 points on each platform.)
 
 ## Latency p50 / p90 / p99 (us), representative run per platform
 
@@ -57,15 +64,16 @@ flat on both platforms — items 3/4/7 do not touch generic HTTP/2 traffic.
 
 ## Targets
 
-- warmed gRPC unary process allocations >= 20% lower: **MET** (-27.2% macOS,
-  -29.0% Linux).
-- warmed gRPC server-streaming >= 15% lower: **MISSED** (-11.8% macOS, -11.4%
-  Linux). The streaming allocation profile is dominated by the buffered
-  multi-message response framing and per-chunk client decode/pull, which items 1
-  and 5 already addressed; items 3 and 7 add the path intern and the window-update
-  fold, but those are a smaller share on streaming. Pushing past 15% needs a new
-  attack on the per-chunk client pull path, beyond this phase's landed items.
-  Recorded honestly rather than reworded to look met.
+- warmed gRPC unary process allocations >= 20% lower: **MET** (-30.9% macOS,
+  -31.9% Linux).
+- warmed gRPC server-streaming >= 15% lower: **NARROWLY MISSED at the median**
+  (-14.2% macOS, -13.7% Linux). The client inline-frame zero-copy follow-on moved
+  this from -11.8%/-11.4% to within a point of target; individual macOS runs cross
+  15% (min 4478 = -15.8%). The remaining residual is the per-pull `call_blocking`
+  machinery (runtime — streaming pays ~2 extra host round trips vs unary), not
+  protocol framing. Closing the last point needs a runtime change to per-pull
+  cost, the same class of wall as the unary turn-floor. Recorded honestly rather
+  than reworded to look met.
 - HTTP/2 steady-state lower-or-equal, no regression: **MET** (0% both platforms).
 - p90/p99 within 10%: **MET** (after p50/p90/p99 at or below before on steady
   rows).
