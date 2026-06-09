@@ -1,0 +1,58 @@
+# Phase 156 — Linux/x86_64 allocation evidence (Fly performance-2x)
+
+Captured on a dedicated-CPU Linux/x86_64 Fly `performance-2x` machine (region
+iad), `--release`, via the `examples/systems/perf_native/fly/` image. Two images
+built on Fly's Depot builder:
+
+- BEFORE = pristine `main` (f96160c).
+- AFTER  = `main` + Phase 156 items 1/2/4/5/6.
+
+Workload: the `perf` binary's `native_protocol_rows_are_printable_and_bounded`,
+WORKERS=4, PROTOCOL_OPS=32, median-of-five sampling per row. Counter:
+whole-process allocations (client + server) over the load run. Six recorded
+samples per row; medians below. Raw lines saved in
+`perf_sample_linux_before_raw.txt` and `perf_sample_linux_after.txt`.
+
+| row                                      | BEFORE | AFTER | delta          |
+|------------------------------------------|-------:|------:|---------------:|
+| grpc_h2c_unary_warmed                    |   4068 |  3417 | **-651 (-16.0%)** |
+| grpc_h2c_unary_pooled_concurrent         |   4064 |  3421 | **-643 (-15.8%)** |
+| grpc_h2c_unary_close                     |   4411 |  4345 | -66 (-1.5%)    |
+| grpc_h2c_server_streaming_steady_state   |   5472 |  5267 | -205 (-3.7%)   |
+| http2_h2c_steady_state_small             |    933 |   933 | 0 (no regression) |
+
+## The headline: the win reproduces on Linux/x86
+
+Warmed gRPC unary process allocations drop **-16.0% on Linux**, matching the
+macOS/aarch64 **-16.1%** almost exactly. The pooled-concurrent unary row drops a
+matching -15.8%. Both are dominated by item 4 (the compact gRPC client unary
+response path — no response `HeaderMap`s). `http2_h2c_steady_state_small` is
+unchanged on Linux too: generic HTTP/2 traffic is untouched. Earlier perf phases
+warned that Linux behaved differently from macOS; here the allocation wins are
+the same shape on both platforms.
+
+Per the README, the connection-setup rows' *latency* swings run-to-run, so the
+deterministic allocation counts are the trustworthy signal (and those are what
+dropped). The `native_protocol_rows` test does not emit a parseable p50/p90/p99
+line for the gRPC rows — only the allocation rows — so latency is not tabulated
+here.
+
+## hotpath probe on Linux/x86 (same image)
+
+The `hotpath` binary passed on Linux (`test result: ok`):
+
+- `perf-h2-alloc` = 1858 allocations / 64 warmed h2c responses (29.03/response).
+  macOS/aarch64 is 1730 (27.03); the per-platform difference is allocator/
+  toolchain, consistent with the platform-aware ceiling Phase 153 established.
+- `perf-grpc-unary-turns` = **16 handler turns, 4 service calls** (macOS is
+  17/4). The warmed gRPC unary turn count and its 4 policy-boundary service
+  calls are platform-stable. The turn probe's regression guards
+  (`service_calls >= 4`, `handler_turns <= 20`) hold on Linux.
+
+## What is still incomplete for item 8
+
+This is a single before/after batch (6 samples each) on one cloud machine, not
+the plan's full 3x3 repeated runs with p50/p90/p99 and RSS deltas tabulated per
+row. The deterministic allocation wins are validated on both macOS/aarch64 and
+Linux/x86_64; the repeated-run latency distribution and the item-7 turn reduction
+remain. Local/alpha evidence, not a production performance claim.

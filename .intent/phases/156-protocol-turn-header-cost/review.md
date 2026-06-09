@@ -367,3 +367,32 @@ primitive, not protocol code, so it is out of this phase's scope.
 What is NOT landed: an actual turn drop in warmed gRPC streaming or HTTP/2
 small steady-state. That is the remaining work for item 7, alongside the full
 macOS+Linux 3x3 perf for item 8. The PR stays a draft.
+
+## Implementation Note 6 (Session A — Linux/x86 evidence; item 8 partial)
+
+Captured Linux/x86_64 before/after on a dedicated Fly `performance-2x` machine
+(both images built on Fly's Depot builder; saved in `perf_sample_linux.txt`,
+raw in `perf_sample_linux_before_raw.txt` / `perf_sample_linux_after.txt`).
+
+The win reproduces off-macOS:
+
+| row | Linux BEFORE | Linux AFTER | delta | (macOS delta) |
+|---|--:|--:|--:|--:|
+| grpc_h2c_unary_warmed | 4068 | 3417 | **-16.0%** | (-16.1%) |
+| grpc_h2c_unary_pooled_concurrent | 4064 | 3421 | -15.8% | — |
+| grpc_h2c_server_streaming_steady_state | 5472 | 5267 | -3.7% | (-3.7%) |
+| http2_h2c_steady_state_small | 933 | 933 | 0 | (~0) |
+
+Earlier phases warned Linux behaved differently from macOS; here the deterministic
+allocation wins are the same shape on both. The Linux `hotpath` binary passed:
+`perf-h2-alloc` 1858 (vs macOS 1730 — allocator/toolchain difference) and
+`perf-grpc-unary-turns` 16 turns / 4 service calls (macOS 17/4 — platform-stable).
+
+Also fixed a rustdoc intra-doc-link error (`[Replied]` -> `[Replied](Self::Replied)`)
+that the PR's cross-platform `verify` CI caught on both runners — a real defect
+from item 4's doc comment, now corrected.
+
+Item 8 is still partial: this is one before/after batch (6 samples each) on one
+machine, not the full 3x3 repeated runs with tabulated p50/p90/p99 + RSS per row.
+The allocation wins are validated on both platforms; the latency distribution and
+item 7's turn reduction remain. PR stays a draft.
