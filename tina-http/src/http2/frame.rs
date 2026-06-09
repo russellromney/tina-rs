@@ -124,6 +124,7 @@ pub(super) fn try_decode_frame_meta(
     }))
 }
 
+#[cfg(test)]
 pub(super) fn try_decode_frame(
     buffer: &[u8],
     max_frame_size: usize,
@@ -231,14 +232,9 @@ pub(super) fn data_payload_view(
     Ok((&rest[..rest.len() - pad_len], flow_len))
 }
 
-pub(super) fn headers_payload(frame: &Frame) -> Result<&[u8], Http2ProtocolError> {
-    headers_payload_view(frame.flags, &frame.payload)
-}
-
-/// Borrowed counterpart of [`headers_payload`]: strip the HEADERS pad-length
-/// byte, optional priority bytes, and trailing padding, returning the HPACK
-/// block as a sub-slice of `payload`. Used by the server read loop to decode
-/// headers straight from its read buffer.
+/// Strip the HEADERS pad-length byte, optional priority bytes, and trailing
+/// padding, returning the HPACK block as a sub-slice of `payload`. Used by both
+/// read loops to decode headers straight from their read buffer.
 pub(super) fn headers_payload_view(flags: u8, payload: &[u8]) -> Result<&[u8], Http2ProtocolError> {
     let mut offset = 0usize;
     let mut pad_len = 0usize;

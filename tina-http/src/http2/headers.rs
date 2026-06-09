@@ -3,10 +3,84 @@
 //! Internal to the `http2` module: shared between the server isolate and
 //! the native client.
 
+use std::sync::Arc;
+
 use http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
 
 use super::errors::Http2ProtocolError;
 use crate::HttpResponse;
+
+/// Bounded request-path cache, one per server connection. Warmed routes repeat
+/// the same method path every call; a hit hands back a cloned `Arc<str>` (a
+/// refcount bump, no allocation) instead of a fresh owned path.
+///
+/// Decode only [`lookup`](Self::lookup)s (read-only); a path is [`remember`](
+/// Self::remember)ed only after its request validates, so a peer cannot fill the
+/// cache with unvalidated paths. The cache is capped and uses least-recently-used
+/// admission: once full it evicts the oldest entry, so a warmed route is still
+/// admitted under a flood of one-shot paths. `entries[0]` is most-recently-used.
+#[derive(Debug)]
+pub(super) struct PathInternCache {
+    entries: Vec<Arc<str>>,
+    cap: usize,
+    evictions: u64,
+}
+
+impl PathInternCache {
+    pub(super) fn with_capacity(cap: usize) -> Self {
+        Self {
+            entries: Vec::new(),
+            cap,
+            evictions: 0,
+        }
+    }
+
+    /// Number of cached paths evicted because the cache was full. Surfaced in
+    /// the connection report so a churning, saturated cache is observable.
+    pub(super) fn evictions(&self) -> u64 {
+        self.evictions
+    }
+
+    /// Return the cached `Arc<str>` for `path`, or `None`. Read-only: decode
+    /// looks up without mutating, so an unvalidated request cannot poison the
+    /// cache. A connection serves a handful of routes, so a linear scan wins.
+    pub(super) fn lookup(&self, path: &str) -> Option<Arc<str>> {
+        self.entries
+            .iter()
+            .find(|entry| &***entry == path)
+            .map(Arc::clone)
+    }
+
+    /// Cache a validated request path so later warmed calls reuse it. Already
+    /// present: mark it most-recently-used. Absent and full: evict the
+    /// least-recently-used entry so the warmed route is admitted.
+    pub(super) fn remember(&mut self, path: &Arc<str>) {
+        let path_str: &str = path;
+        if let Some(pos) = self.entries.iter().position(|entry| &**entry == path_str) {
+            if pos != 0 {
+                let entry = self.entries.remove(pos);
+                self.entries.insert(0, entry);
+            }
+            return;
+        }
+        if self.entries.len() >= self.cap {
+            self.entries.pop();
+            self.evictions = self.evictions.saturating_add(1);
+        }
+        self.entries.insert(0, Arc::clone(path));
+    }
+}
+
+/// Build an owned request path, reusing the cached `Arc` on a hit and falling
+/// back to a fresh `Arc` on a miss (or when no cache is supplied — the client
+/// response path, which never carries `:path`). Never mutates the cache; the
+/// caller caches the path only after the request validates.
+fn own_request_path(cache: Option<&PathInternCache>, value: &str) -> Arc<str> {
+    match cache {
+        Some(cache) => cache.lookup(value).unwrap_or_else(|| Arc::from(value)),
+        None => Arc::from(value),
+    }
+}
 
 pub(super) const SETTINGS_HEADER_TABLE_SIZE: u16 = 0x1;
 pub(super) const SETTINGS_ENABLE_PUSH: u16 = 0x2;
@@ -21,7 +95,7 @@ pub(super) const MAX_MAX_FRAME_SIZE: u32 = 16_777_215;
 #[derive(Debug, Default)]
 pub(super) struct HeaderBlock {
     pub(super) method: Option<Method>,
-    pub(super) path: Option<String>,
+    pub(super) path: Option<Arc<str>>,
     pub(super) saw_scheme: bool,
     pub(super) saw_authority: bool,
     pub(super) authority_non_empty: bool,
@@ -38,6 +112,16 @@ pub(super) struct HeaderBlock {
     /// Set when any `content-length` header was observed during decoding,
     /// so duplicate occurrences fail closed even if the value parses.
     pub(super) saw_content_length: bool,
+    /// Raw `grpc-status` code, if the block carried one. Captured as a fact so
+    /// the compact gRPC client response path can read the final status without
+    /// building a public `HeaderMap`. `None` for non-gRPC blocks.
+    pub(super) grpc_status: Option<u16>,
+    /// Set once a `grpc-status` header is seen, so duplicates keep the first
+    /// value — matching `HeaderMap::get` on the public path.
+    pub(super) saw_grpc_status: bool,
+    /// Raw (still percent-encoded) `grpc-message`, if present. Only gRPC error
+    /// responses carry this, so the `String` is allocated only on errors.
+    pub(super) grpc_message: Option<String>,
 }
 
 #[cfg(test)]
@@ -46,23 +130,25 @@ pub(super) fn decode_headers_block(
     max_header_bytes: usize,
 ) -> Result<HeaderBlock, Http2ProtocolError> {
     let mut decoder = hpack::Decoder::new();
-    decode_headers_block_with(&mut decoder, block, max_header_bytes)
+    decode_headers_block_with(&mut decoder, block, max_header_bytes, None)
 }
 
 pub(super) fn decode_headers_block_with(
     decoder: &mut hpack::Decoder<'static>,
     block: &[u8],
     max_header_bytes: usize,
+    path_cache: Option<&PathInternCache>,
 ) -> Result<HeaderBlock, Http2ProtocolError> {
-    decode_headers_block_with_storage(decoder, block, max_header_bytes, true)
+    decode_headers_block_with_storage(decoder, block, max_header_bytes, true, path_cache)
 }
 
 pub(super) fn decode_headers_block_compact_with(
     decoder: &mut hpack::Decoder<'static>,
     block: &[u8],
     max_header_bytes: usize,
+    path_cache: Option<&PathInternCache>,
 ) -> Result<HeaderBlock, Http2ProtocolError> {
-    decode_headers_block_with_storage(decoder, block, max_header_bytes, false)
+    decode_headers_block_with_storage(decoder, block, max_header_bytes, false, path_cache)
 }
 
 fn decode_headers_block_with_storage(
@@ -70,9 +156,10 @@ fn decode_headers_block_with_storage(
     block: &[u8],
     max_header_bytes: usize,
     store_regular_headers: bool,
+    path_cache: Option<&PathInternCache>,
 ) -> Result<HeaderBlock, Http2ProtocolError> {
     if let Some(headers) =
-        decode_fast_literal_headers(block, max_header_bytes, store_regular_headers)?
+        decode_fast_literal_headers(block, max_header_bytes, store_regular_headers, path_cache)?
     {
         return Ok(headers);
     }
@@ -90,6 +177,7 @@ fn decode_headers_block_with_storage(
             value,
             max_header_bytes,
             store_regular_headers,
+            path_cache,
         )?;
     }
     Ok(out)
@@ -106,6 +194,7 @@ fn decode_fast_literal_headers(
     block: &[u8],
     max_header_bytes: usize,
     store_regular_headers: bool,
+    path_cache: Option<&PathInternCache>,
 ) -> Result<Option<HeaderBlock>, Http2ProtocolError> {
     let mut out = HeaderBlock::default();
     let mut cursor = 0;
@@ -128,6 +217,7 @@ fn decode_fast_literal_headers(
             value,
             max_header_bytes,
             store_regular_headers,
+            path_cache,
         )?;
     }
     Ok(Some(out))
@@ -197,7 +287,7 @@ pub(super) fn add_header(
     value: &str,
     max_header_bytes: usize,
 ) -> Result<(), Http2ProtocolError> {
-    add_header_with_storage(out, name, value, max_header_bytes, true)
+    add_header_with_storage(out, name, value, max_header_bytes, true, None)
 }
 
 fn add_header_with_storage(
@@ -206,6 +296,7 @@ fn add_header_with_storage(
     value: &str,
     max_header_bytes: usize,
     store_regular_headers: bool,
+    path_cache: Option<&PathInternCache>,
 ) -> Result<(), Http2ProtocolError> {
     out.bytes = out
         .bytes
@@ -232,7 +323,7 @@ fn add_header_with_storage(
                 if out.path.is_some() {
                     return Err(Http2ProtocolError::InvalidPseudoHeaders);
                 }
-                out.path = Some(value.to_owned());
+                out.path = Some(own_request_path(path_cache, value));
             }
             ":scheme" => {
                 if out.saw_scheme {
@@ -273,31 +364,101 @@ fn add_header_with_storage(
         return Err(Http2ProtocolError::InvalidPseudoHeaders);
     }
     out.saw_regular = true;
-    let header_name = HeaderName::from_bytes(name.as_bytes())
-        .map_err(|_| Http2ProtocolError::InvalidPseudoHeaders)?;
-    let header_value =
-        HeaderValue::from_str(value).map_err(|_| Http2ProtocolError::InvalidPseudoHeaders)?;
-    if header_name == http::header::HOST {
-        out.host_non_empty = !value.is_empty();
+    // Validate the name/value bytes the same way in compact and public modes so
+    // both reject identical malformed input. The compact path must not allocate
+    // a public `HeaderName` / `HeaderValue` just to validate a header it will
+    // not store, so the byte rules live here instead of in `http`'s
+    // constructors. Public mode runs the same rules, then builds the typed
+    // pieces (which cannot fail after this check) only when it stores them.
+    if !is_valid_header_name(name) || !is_valid_header_value(value) {
+        return Err(Http2ProtocolError::InvalidPseudoHeaders);
     }
-    if header_name == http::header::CONTENT_TYPE {
-        out.grpc_content_type = crate::grpc::is_grpc_content_type(value);
-    }
-    if name == "grpc-encoding" && !value.eq_ignore_ascii_case("identity") {
-        out.grpc_encoding_unsupported = true;
-    }
-    if header_name == http::header::CONTENT_LENGTH {
-        if out.saw_content_length {
-            return Err(Http2ProtocolError::ContentLengthMismatch);
+    // Parse the admission/gRPC facts by string. Names are already lowercase
+    // (uppercase is rejected above), so a direct match is exact.
+    match name {
+        "host" => out.host_non_empty = !value.is_empty(),
+        "content-type" => out.grpc_content_type = crate::grpc::is_grpc_content_type(value),
+        "grpc-encoding" => {
+            if !value.eq_ignore_ascii_case("identity") {
+                out.grpc_encoding_unsupported = true;
+            }
         }
-        let parsed = parse_content_length(value)?;
-        out.content_length = Some(parsed);
-        out.saw_content_length = true;
+        "content-length" => {
+            if out.saw_content_length {
+                return Err(Http2ProtocolError::ContentLengthMismatch);
+            }
+            out.content_length = Some(parse_content_length(value)?);
+            out.saw_content_length = true;
+        }
+        // gRPC response facts: a string parse and (only on errors) one owned
+        // message. Requests never carry these, so the server path pays nothing.
+        // First value wins, matching `HeaderMap::get` on the public path.
+        "grpc-status" => {
+            if !out.saw_grpc_status {
+                out.saw_grpc_status = true;
+                out.grpc_status = value.trim().parse::<u16>().ok();
+            }
+        }
+        "grpc-message" if out.grpc_message.is_none() => {
+            out.grpc_message = Some(value.to_owned());
+        }
+        _ => {}
     }
     if store_regular_headers {
+        // Only the storing path pays the public header allocation.
+        let header_name = HeaderName::from_bytes(name.as_bytes())
+            .map_err(|_| Http2ProtocolError::InvalidPseudoHeaders)?;
+        let header_value =
+            HeaderValue::from_str(value).map_err(|_| Http2ProtocolError::InvalidPseudoHeaders)?;
+        #[cfg(test)]
+        PUBLIC_HEADER_CONSTRUCTIONS.with(|count| count.set(count.get() + 1));
         out.headers.append(header_name, header_value);
     }
     Ok(())
+}
+
+/// RFC 9110 token bytes. HTTP/2 header names are already required to be
+/// lowercase (uppercase is rejected before this is called), so this mirrors
+/// what `http::HeaderName::from_bytes` accepts for the names that reach here.
+fn is_token_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric()
+        || matches!(
+            byte,
+            b'!' | b'#'
+                | b'$'
+                | b'%'
+                | b'&'
+                | b'\''
+                | b'*'
+                | b'+'
+                | b'-'
+                | b'.'
+                | b'^'
+                | b'_'
+                | b'`'
+                | b'|'
+                | b'~'
+        )
+}
+
+fn is_valid_header_name(name: &str) -> bool {
+    !name.is_empty() && name.bytes().all(is_token_byte)
+}
+
+/// Mirror `http::HeaderValue` byte rules: visible ASCII plus space, horizontal
+/// tab, and obs-text (`0x80..=0xFF`); reject other control bytes and DEL.
+fn is_valid_header_value(value: &str) -> bool {
+    value
+        .bytes()
+        .all(|byte| byte == b'\t' || (byte >= b' ' && byte != 0x7f))
+}
+
+// Test seam: counts how many public `HeaderName`/`HeaderValue` pairs the decode
+// builds. The compact path must leave this at zero for skipped regular headers.
+#[cfg(test)]
+thread_local! {
+    pub(super) static PUBLIC_HEADER_CONSTRUCTIONS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
 }
 
 pub(super) fn parse_content_length(value: &str) -> Result<usize, Http2ProtocolError> {
@@ -560,7 +721,7 @@ mod tests {
         encode_literal_header("content-length", "9", &mut block);
 
         let mut decoder = hpack::Decoder::new();
-        let decoded = decode_headers_block_compact_with(&mut decoder, &block, 1024).unwrap();
+        let decoded = decode_headers_block_compact_with(&mut decoder, &block, 1024, None).unwrap();
         assert_eq!(decoded.path.as_deref(), Some("/pkg.Service/Unary"));
         assert!(decoded.host_non_empty);
         assert!(decoded.grpc_content_type);
@@ -568,6 +729,161 @@ mod tests {
         assert_eq!(decoded.content_length, Some(9));
         assert!(decoded.headers.is_empty());
         validate_request_headers(&decoded).unwrap();
+    }
+
+    #[test]
+    fn compact_and_public_agree_on_duplicate_grpc_status_and_message() {
+        // A response carrying duplicate gRPC status/message headers must decode
+        // the same on the compact (SubmitGrpcUnary) path and the public
+        // (Replied) path. The public path reads HeaderMap::get (first value), so
+        // the compact path must also take the first value, not the last.
+        let mut block = Vec::new();
+        encode_literal_header("grpc-status", "5", &mut block);
+        encode_literal_header("grpc-status", "0", &mut block);
+        encode_literal_header("grpc-message", "first", &mut block);
+        encode_literal_header("grpc-message", "second", &mut block);
+
+        let mut decoder = hpack::Decoder::new();
+        let compact = decode_headers_block_compact_with(&mut decoder, &block, 1024, None).unwrap();
+        assert_eq!(compact.grpc_status, Some(5));
+        assert_eq!(compact.grpc_message.as_deref(), Some("first"));
+
+        let mut decoder = hpack::Decoder::new();
+        let public = decode_headers_block_with(&mut decoder, &block, 1024, None).unwrap();
+        let compact_status = crate::grpc::grpc_status_from_compact(
+            compact.grpc_status.unwrap(),
+            compact.grpc_message.as_deref(),
+        );
+        let public_status = crate::grpc::grpc_status_from_header_map(&public.headers).unwrap();
+        assert_eq!(compact_status.code, public_status.code);
+        assert_eq!(compact_status.message, public_status.message);
+    }
+
+    fn grpc_block_with_extra_metadata(extra: usize) -> Vec<u8> {
+        let mut block = Vec::new();
+        encode_literal_header(":method", "POST", &mut block);
+        encode_literal_header(":scheme", "http", &mut block);
+        encode_literal_header(":authority", "example.com", &mut block);
+        encode_literal_header(":path", "/pkg.Service/Unary", &mut block);
+        encode_literal_header("content-type", "application/grpc", &mut block);
+        encode_literal_header("te", "trailers", &mut block);
+        encode_literal_header("grpc-encoding", "identity", &mut block);
+        for i in 0..extra {
+            // Custom gRPC metadata headers: ordinary headers a service might see.
+            encode_literal_header(&format!("x-meta-{i}"), &format!("value-{i}"), &mut block);
+        }
+        block
+    }
+
+    #[test]
+    fn compact_decode_builds_no_public_headers_regardless_of_metadata_count() {
+        // The number of ordinary headers must not change the compact path's
+        // public-header construction count: it must stay zero. The public path
+        // builds exactly one per stored header.
+        for extra in [0usize, 4, 16] {
+            let block = grpc_block_with_extra_metadata(extra);
+
+            PUBLIC_HEADER_CONSTRUCTIONS.with(|count| count.set(0));
+            let mut decoder = hpack::Decoder::new();
+            let compact =
+                decode_headers_block_compact_with(&mut decoder, &block, 4096, None).unwrap();
+            let compact_built = PUBLIC_HEADER_CONSTRUCTIONS.with(|count| count.get());
+            assert_eq!(
+                compact_built, 0,
+                "compact built public headers (extra={extra})"
+            );
+            assert!(compact.headers.is_empty());
+            // Facts still parsed from the same bytes.
+            assert!(compact.grpc_content_type);
+            assert!(!compact.grpc_encoding_unsupported);
+            assert!(compact.authority_non_empty);
+            validate_request_headers(&compact).unwrap();
+
+            PUBLIC_HEADER_CONSTRUCTIONS.with(|count| count.set(0));
+            let mut decoder = hpack::Decoder::new();
+            let public = decode_headers_block_with(&mut decoder, &block, 4096, None).unwrap();
+            let public_built = PUBLIC_HEADER_CONSTRUCTIONS.with(|count| count.get());
+            // content-type, te, grpc-encoding, plus `extra` custom headers.
+            assert_eq!(
+                public_built,
+                3 + extra,
+                "public build count (extra={extra})"
+            );
+            assert_eq!(public.headers.len(), 3 + extra);
+            assert!(public.grpc_content_type);
+        }
+    }
+
+    fn compact_and_public_agree(block: &[u8]) -> Result<(), Http2ProtocolError> {
+        let mut compact_decoder = hpack::Decoder::new();
+        let compact = decode_headers_block_compact_with(&mut compact_decoder, block, 256, None)
+            .and_then(|h| validate_request_headers(&h).map(|()| h));
+        let mut public_decoder = hpack::Decoder::new();
+        let public = decode_headers_block_with(&mut public_decoder, block, 256, None)
+            .and_then(|h| validate_request_headers(&h).map(|()| h));
+        assert_eq!(
+            compact.as_ref().map(|_| ()),
+            public.as_ref().map(|_| ()),
+            "compact/public disagree on accept/reject"
+        );
+        assert_eq!(
+            compact.as_ref().err(),
+            public.as_ref().err(),
+            "compact/public disagree on error kind"
+        );
+        compact.map(|_| ())
+    }
+
+    #[test]
+    fn compact_and_public_reject_identical_malformed_inputs() {
+        let base = |extra: &[(&str, &str)]| {
+            let mut block = Vec::new();
+            encode_literal_header(":method", "POST", &mut block);
+            encode_literal_header(":scheme", "http", &mut block);
+            encode_literal_header(":authority", "example.com", &mut block);
+            encode_literal_header(":path", "/svc/M", &mut block);
+            for (name, value) in extra {
+                encode_literal_header(name, value, &mut block);
+            }
+            block
+        };
+
+        // Well-formed: both accept.
+        assert!(compact_and_public_agree(&base(&[("content-type", "application/grpc")])).is_ok());
+
+        // Uppercase name.
+        assert!(compact_and_public_agree(&base(&[("X-Bad", "v")])).is_err());
+        // Invalid token byte in name (space).
+        assert!(compact_and_public_agree(&base(&[("bad name", "v")])).is_err());
+        // Invalid value byte (newline) — must reject before any storage decision.
+        assert!(compact_and_public_agree(&base(&[("x-meta", "bad\nvalue")])).is_err());
+        // Forbidden connection-control header.
+        assert!(compact_and_public_agree(&base(&[("connection", "keep-alive")])).is_err());
+        // Invalid `te`.
+        assert!(compact_and_public_agree(&base(&[("te", "gzip")])).is_err());
+        // Duplicate content-length.
+        assert!(
+            compact_and_public_agree(&base(&[("content-length", "1"), ("content-length", "1")]))
+                .is_err()
+        );
+        // Invalid content-length value.
+        assert!(compact_and_public_agree(&base(&[("content-length", "ten")])).is_err());
+    }
+
+    #[test]
+    fn compact_and_public_reject_identical_oversized_header_blocks() {
+        // Over the byte cap: both paths must fail closed at the same place.
+        let big = "a".repeat(512);
+        let mut block = Vec::new();
+        encode_literal_header(":method", "POST", &mut block);
+        encode_literal_header(":scheme", "http", &mut block);
+        encode_literal_header(":authority", "example.com", &mut block);
+        encode_literal_header(":path", "/svc/M", &mut block);
+        encode_literal_header("x-big", &big, &mut block);
+        assert_eq!(
+            compact_and_public_agree(&block),
+            Err(Http2ProtocolError::HeadersTooLarge)
+        );
     }
 
     #[test]
@@ -598,5 +914,121 @@ mod tests {
             validate_request_headers(&headers),
             Err(Http2ProtocolError::InvalidPseudoHeaders)
         );
+    }
+
+    fn grpc_request_block(path: &str) -> Vec<u8> {
+        let mut block = Vec::new();
+        encode_literal_header(":method", "POST", &mut block);
+        encode_literal_header(":scheme", "http", &mut block);
+        encode_literal_header(":authority", "example.com", &mut block);
+        encode_literal_header(":path", path, &mut block);
+        encode_literal_header("content-type", "application/grpc", &mut block);
+        block
+    }
+
+    #[test]
+    fn path_cache_lookup_reuses_one_arc_after_remember() {
+        let mut cache = PathInternCache::with_capacity(8);
+        // A miss before remember; the path is not cached by lookup alone.
+        assert!(cache.lookup("/pkg.Service/Unary").is_none());
+        let arc: Arc<str> = Arc::from("/pkg.Service/Unary");
+        cache.remember(&arc);
+        let hit = cache
+            .lookup("/pkg.Service/Unary")
+            .expect("cached after remember");
+        // The warmed call reuses the cached allocation, not a fresh one.
+        assert!(Arc::ptr_eq(&arc, &hit));
+        assert_eq!(cache.evictions(), 0);
+    }
+
+    #[test]
+    fn path_cache_evicts_least_recently_used_when_full() {
+        let mut cache = PathInternCache::with_capacity(2);
+        cache.remember(&Arc::from("/a")); // [a]
+        cache.remember(&Arc::from("/b")); // [b, a]
+        // Full: the next distinct path evicts the LRU entry (/a), not the new one.
+        cache.remember(&Arc::from("/c")); // evict a -> [c, b]
+        assert_eq!(cache.evictions(), 1);
+        assert!(cache.lookup("/a").is_none());
+        assert!(cache.lookup("/b").is_some());
+        assert!(cache.lookup("/c").is_some());
+        // Re-remembering /b marks it most-recently-used, so the next eviction
+        // takes /c instead.
+        cache.remember(&Arc::from("/b")); // [b, c]
+        cache.remember(&Arc::from("/d")); // evict c -> [d, b]
+        assert_eq!(cache.evictions(), 2);
+        assert!(cache.lookup("/c").is_none());
+        assert!(cache.lookup("/b").is_some());
+    }
+
+    #[test]
+    fn path_cache_admits_warmed_route_under_path_churn() {
+        // The adversarial case: a flood of distinct one-shot paths fills the
+        // cache, then a real warmed route arrives. LRU admission must still cache
+        // it so the next call reuses it — a full cache cannot lock it out.
+        let mut cache = PathInternCache::with_capacity(4);
+        for i in 0..4 {
+            cache.remember(&Arc::from(format!("/junk{i}").as_str()));
+        }
+        assert!(cache.lookup("/real").is_none());
+        let real: Arc<str> = Arc::from("/real");
+        cache.remember(&real);
+        let hit = cache
+            .lookup("/real")
+            .expect("warmed route admitted under churn");
+        assert!(Arc::ptr_eq(&real, &hit));
+    }
+
+    #[test]
+    fn compact_decode_reuses_a_remembered_request_path() {
+        let block = grpc_request_block("/pkg.Service/Unary");
+        let mut cache = PathInternCache::with_capacity(8);
+        let mut decoder = hpack::Decoder::new();
+        let first =
+            decode_headers_block_compact_with(&mut decoder, &block, 4096, Some(&cache)).unwrap();
+        let first_path = first.path.expect("first path");
+        // Cache it as the connection does once the request validates.
+        cache.remember(&first_path);
+        let mut decoder = hpack::Decoder::new();
+        let second =
+            decode_headers_block_compact_with(&mut decoder, &block, 4096, Some(&cache)).unwrap();
+        let second_path = second.path.expect("second path");
+        assert_eq!(&*second_path, "/pkg.Service/Unary");
+        // The warmed decode reuses the remembered allocation. Fails if the decode
+        // rebuilds a fresh owned path per request.
+        assert!(Arc::ptr_eq(&first_path, &second_path));
+        assert_eq!(cache.evictions(), 0);
+    }
+
+    #[test]
+    fn decode_does_not_cache_until_remembered() {
+        // Decode never inserts, so an unvalidated request cannot poison the
+        // cache: two decodes without remember are distinct allocations and the
+        // cache stays empty.
+        let block = grpc_request_block("/svc/M");
+        let cache = PathInternCache::with_capacity(8);
+        let mut decoder = hpack::Decoder::new();
+        let first = decode_headers_block_compact_with(&mut decoder, &block, 4096, Some(&cache))
+            .unwrap()
+            .path
+            .expect("first path");
+        let mut decoder = hpack::Decoder::new();
+        let second = decode_headers_block_compact_with(&mut decoder, &block, 4096, Some(&cache))
+            .unwrap()
+            .path
+            .expect("second path");
+        assert!(!Arc::ptr_eq(&first, &second));
+        assert!(cache.lookup("/svc/M").is_none());
+        assert_eq!(cache.evictions(), 0);
+    }
+
+    #[test]
+    fn decode_without_cache_still_owns_the_path() {
+        // The client response path passes no cache; `:path` never appears there,
+        // but the fallback must still produce a valid owned path when it does.
+        let block = grpc_request_block("/pkg.Service/Unary");
+        let mut decoder = hpack::Decoder::new();
+        let decoded = decode_headers_block_compact_with(&mut decoder, &block, 4096, None).unwrap();
+        assert_eq!(decoded.path.as_deref(), Some("/pkg.Service/Unary"));
     }
 }

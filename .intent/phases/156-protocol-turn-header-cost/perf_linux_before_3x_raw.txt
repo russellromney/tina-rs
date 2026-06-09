@@ -1,0 +1,171 @@
+=== Linux BEFORE perf run 1 ===
+perf-process label=tina_http2_h2c_close_request process_allocations=2797 process_allocated_bytes=2651266 rss_delta_kb=0
+perf-process label=tina_http2_h2c_close_request process_allocations=2794 process_allocated_bytes=2655822 rss_delta_kb=0
+perf-process label=tina_http2_h2c_close_request process_allocations=2784 process_allocated_bytes=2655095 rss_delta_kb=0
+perf-process label=tina_http2_h2c_close_request process_allocations=2791 process_allocated_bytes=2654255 rss_delta_kb=0
+perf-process label=tina_http2_h2c_close_request process_allocations=2802 process_allocated_bytes=2653837 rss_delta_kb=0
+perf-process label=tina_http2_h2c_close_request process_allocations=2812 process_allocated_bytes=2649554 rss_delta_kb=0
+perf-process label=tina_http2_h2c_keepalive_sequential process_allocations=5504 process_allocated_bytes=3651883 rss_delta_kb=0
+perf-process label=tina_http2_h2c_keepalive_sequential process_allocations=5518 process_allocated_bytes=3654458 rss_delta_kb=0
+perf-process label=tina_http2_h2c_keepalive_sequential process_allocations=5518 process_allocated_bytes=3656771 rss_delta_kb=0
+perf-process label=tina_http2_h2c_keepalive_sequential process_allocations=5484 process_allocated_bytes=3651778 rss_delta_kb=0
+perf-process label=tina_http2_h2c_keepalive_sequential process_allocations=5533 process_allocated_bytes=3658801 rss_delta_kb=0
+perf-process label=tina_http2_h2c_keepalive_sequential process_allocations=5526 process_allocated_bytes=3651612 rss_delta_kb=0
+perf-process label=tina_http2_h2c_steady_state_small process_allocations=926 process_allocated_bytes=228008 rss_delta_kb=0
+perf-process label=tina_http2_h2c_steady_state_small process_allocations=927 process_allocated_bytes=228264 rss_delta_kb=0
+perf-process label=tina_http2_h2c_steady_state_small process_allocations=931 process_allocated_bytes=228464 rss_delta_kb=0
+perf-process label=tina_http2_h2c_steady_state_small process_allocations=931 process_allocated_bytes=228272 rss_delta_kb=0
+perf-process label=tina_http2_h2c_steady_state_small process_allocations=933 process_allocated_bytes=228488 rss_delta_kb=0
+perf-process label=tina_http2_h2c_steady_state_small process_allocations=929 process_allocated_bytes=228136 rss_delta_kb=0
+perf-process label=tina_http2_h2c_client_steady_state_post process_allocations=2932 process_allocated_bytes=1729051 rss_delta_kb=0
+perf-process label=tina_http2_h2c_client_steady_state_post process_allocations=2953 process_allocated_bytes=1719905 rss_delta_kb=0
+perf-process label=tina_http2_h2c_client_steady_state_post process_allocations=2952 process_allocated_bytes=1718057 rss_delta_kb=0
+perf-process label=tina_http2_h2c_client_steady_state_post process_allocations=2948 process_allocated_bytes=1717857 rss_delta_kb=0
+perf-process label=tina_http2_h2c_client_steady_state_post process_allocations=2939 process_allocated_bytes=1729795 rss_delta_kb=0
+perf-process label=tina_http2_h2c_client_steady_state_post process_allocations=2940 process_allocated_bytes=1733291 rss_delta_kb=0
+perf-process label=tina_grpc_h2c_unary_close process_allocations=4459 process_allocated_bytes=2832619 rss_delta_kb=0
+perf-process label=tina_grpc_h2c_unary_close process_allocations=4395 process_allocated_bytes=2824874 rss_delta_kb=0
+perf-process label=tina_grpc_h2c_unary_close process_allocations=4469 process_allocated_bytes=2833324 rss_delta_kb=0
+perf-process label=tina_grpc_h2c_unary_close process_allocations=4466 process_allocated_bytes=2837645 rss_delta_kb=0
+perf-process label=tina_grpc_h2c_unary_close process_allocations=4459 process_allocated_bytes=2834178 rss_delta_kb=0
+perf-process label=tina_grpc_h2c_unary_close process_allocations=4414 process_allocated_bytes=2823921 rss_delta_kb=0
+perf-process label=tina_grpc_h2c_unary_warmed process_allocations=4070 process_allocated_bytes=1388956 rss_delta_kb=0
+perf-process label=tina_grpc_h2c_unary_warmed process_allocations=4056 process_allocated_bytes=1386954 rss_delta_kb=0
+perf-process label=tina_grpc_h2c_unary_warmed process_allocations=4084 process_allocated_bytes=1393805 rss_delta_kb=0
+perf-process label=tina_grpc_h2c_unary_warmed process_allocations=4067 process_allocated_bytes=1390420 rss_delta_kb=0
+perf-process label=tina_grpc_h2c_unary_warmed process_allocations=4099 process_allocated_bytes=1394765 rss_delta_kb=0
+perf-process label=tina_grpc_h2c_unary_warmed process_allocations=4057 process_allocated_bytes=1387476 rss_delta_kb=0
+perf-process label=tina_grpc_h2c_unary_pooled_concurrent process_allocations=4063 process_allocated_bytes=1315033 rss_delta_kb=0
+perf-process label=tina_grpc_h2c_unary_pooled_concurrent process_allocations=4061 process_allocated_bytes=1315481 rss_delta_kb=0
+perf-process label=tina_grpc_h2c_unary_pooled_concurrent process_allocations=4065 process_allocated_bytes=1315241 rss_delta_kb=0
+perf-process label=tina_grpc_h2c_unary_pooled_concurrent process_allocations=4070 process_allocated_bytes=1316521 rss_delta_kb=0
+perf-process label=tina_grpc_h2c_unary_pooled_concurrent process_allocations=4060 process_allocated_bytes=1315401 rss_delta_kb=0
+perf-process label=tina_grpc_h2c_unary_pooled_concurrent process_allocations=4055 process_allocated_bytes=1314737 rss_delta_kb=0
+perf-process label=tina_grpc_h2c_server_streaming_steady_state process_allocations=5441 process_allocated_bytes=2396817 rss_delta_kb=0
+perf-process label=tina_grpc_h2c_server_streaming_steady_state process_allocations=5468 process_allocated_bytes=2405949 rss_delta_kb=0
+perf-process label=tina_grpc_h2c_server_streaming_steady_state process_allocations=5530 process_allocated_bytes=2428073 rss_delta_kb=0
+perf-process label=tina_grpc_h2c_server_streaming_steady_state process_allocations=5436 process_allocated_bytes=2408168 rss_delta_kb=0
+perf-process label=tina_grpc_h2c_server_streaming_steady_state process_allocations=5467 process_allocated_bytes=2409281 rss_delta_kb=0
+perf-process label=tina_grpc_h2c_server_streaming_steady_state process_allocations=5436 process_allocated_bytes=2400775 rss_delta_kb=0
+perf label=http2_h2c_close_request kind=connection_setup comparison_baseline=none samples=5 sample_policy=median_p50_after_warmup platform=linux arch=x86_64 profile=release git_sha=unknown load label=tina_http2_h2c_close_request workers=4 ops=32 ok=32 err=0 timeout=0 min_us=172 p50_us=481 p90_us=650 p99_us=803 max_us=803 elapsed_ms=4 leak=unchecked late=0 trace_hash=none surfaces=0 unavailable_surfaces=0 pressure total=0 rate_per_mille=0 max_consecutive=0 first_err_op=none by_kind=[] allocation_scope=load_worker_op allocations=320 allocated_bytes=8416
+perf label=http2_h2c_keepalive_sequential kind=connection_setup_amortized comparison_baseline=none samples=5 sample_policy=median_p50_after_warmup platform=linux arch=x86_64 profile=release git_sha=unknown load label=tina_http2_h2c_keepalive_sequential workers=4 ops=32 ok=32 err=0 timeout=0 min_us=385 p50_us=853 p90_us=1347 p99_us=2272 max_us=2272 elapsed_ms=7 leak=unchecked late=0 trace_hash=none surfaces=0 unavailable_surfaces=0 pressure total=0 rate_per_mille=0 max_consecutive=0 first_err_op=none by_kind=[] allocation_scope=load_worker_op allocations=992 allocated_bytes=29632
+perf label=http2_h2c_steady_state_small kind=steady_state_reuse comparison_baseline=none samples=5 sample_policy=median_p50_after_warmup platform=linux arch=x86_64 profile=release git_sha=unknown load label=tina_http2_h2c_steady_state_small workers=4 ops=32 ok=32 err=0 timeout=0 min_us=36 p50_us=72 p90_us=143 p99_us=485 max_us=485 elapsed_ms=0 leak=unchecked late=0 trace_hash=none surfaces=0 unavailable_surfaces=0 pressure total=0 rate_per_mille=0 max_consecutive=0 first_err_op=none by_kind=[] allocation_scope=load_worker_op allocations=224 allocated_bytes=7072
+perf label=http2_h2c_client_steady_state_post kind=steady_state_reuse comparison_baseline=none samples=5 sample_policy=median_p50_after_warmup platform=linux arch=x86_64 profile=release git_sha=unknown load label=tina_http2_h2c_client_steady_state_post workers=4 ops=32 ok=32 err=0 timeout=0 min_us=118 p50_us=259 p90_us=356 p99_us=370 max_us=370 elapsed_ms=2 leak=unchecked late=0 trace_hash=none surfaces=0 unavailable_surfaces=0 pressure total=0 rate_per_mille=0 max_consecutive=0 first_err_op=none by_kind=[] allocation_scope=load_worker_op allocations=113 allocated_bytes=140696
+perf label=grpc_h2c_unary_close kind=connection_setup comparison_baseline=none samples=5 sample_policy=median_p50_after_warmup platform=linux arch=x86_64 profile=release git_sha=unknown load label=tina_grpc_h2c_unary_close workers=4 ops=32 ok=32 err=0 timeout=0 min_us=186 p50_us=570 p90_us=962 p99_us=1125 max_us=1125 elapsed_ms=5 leak=unchecked late=0 trace_hash=none surfaces=0 unavailable_surfaces=0 pressure total=0 rate_per_mille=0 max_consecutive=0 first_err_op=none by_kind=[] allocation_scope=load_worker_op allocations=640 allocated_bytes=26464
+perf label=grpc_h2c_unary_warmed kind=steady_state_reuse comparison_baseline=none samples=5 sample_policy=median_p50_after_warmup platform=linux arch=x86_64 profile=release git_sha=unknown load label=tina_grpc_h2c_unary_warmed workers=4 ops=32 ok=32 err=0 timeout=0 min_us=286 p50_us=313 p90_us=500 p99_us=638 max_us=638 elapsed_ms=3 leak=unchecked late=0 trace_hash=none surfaces=0 unavailable_surfaces=0 pressure total=0 rate_per_mille=0 max_consecutive=0 first_err_op=none by_kind=[] allocation_scope=load_worker_op allocations=48 allocated_bytes=9296
+perf label=grpc_h2c_unary_pooled_concurrent kind=steady_state_reuse comparison_baseline=none samples=5 sample_policy=median_p50_after_warmup platform=linux arch=x86_64 profile=release git_sha=unknown load label=tina_grpc_h2c_unary_pooled_concurrent workers=4 ops=32 ok=32 err=0 timeout=0 min_us=157 p50_us=279 p90_us=388 p99_us=706 max_us=706 elapsed_ms=2 leak=unchecked late=0 trace_hash=none surfaces=0 unavailable_surfaces=0 pressure total=0 rate_per_mille=0 max_consecutive=0 first_err_op=none by_kind=[] allocation_scope=load_worker_op allocations=48 allocated_bytes=9296
+perf label=grpc_h2c_server_streaming_steady_state kind=steady_state_reuse comparison_baseline=none samples=5 sample_policy=median_p50_after_warmup platform=linux arch=x86_64 profile=release git_sha=unknown load label=tina_grpc_h2c_server_streaming_steady_state workers=4 ops=32 ok=32 err=0 timeout=0 min_us=271 p50_us=419 p90_us=646 p99_us=1008 max_us=1008 elapsed_ms=3 leak=unchecked late=0 trace_hash=none surfaces=0 unavailable_surfaces=0 pressure total=0 rate_per_mille=0 max_consecutive=0 first_err_op=none by_kind=[] allocation_scope=load_worker_op allocations=373 allocated_bytes=60920
+=== Linux BEFORE perf run 2 ===
+perf-process label=tina_http2_h2c_close_request process_allocations=2785 process_allocated_bytes=2653343 rss_delta_kb=0
+perf-process label=tina_http2_h2c_close_request process_allocations=2797 process_allocated_bytes=2649283 rss_delta_kb=0
+perf-process label=tina_http2_h2c_close_request process_allocations=2773 process_allocated_bytes=2644636 rss_delta_kb=0
+perf-process label=tina_http2_h2c_close_request process_allocations=2760 process_allocated_bytes=2645474 rss_delta_kb=0
+perf-process label=tina_http2_h2c_close_request process_allocations=2785 process_allocated_bytes=2648067 rss_delta_kb=0
+perf-process label=tina_http2_h2c_close_request process_allocations=2752 process_allocated_bytes=2647397 rss_delta_kb=0
+perf-process label=tina_http2_h2c_keepalive_sequential process_allocations=5484 process_allocated_bytes=3650833 rss_delta_kb=0
+perf-process label=tina_http2_h2c_keepalive_sequential process_allocations=5494 process_allocated_bytes=3647221 rss_delta_kb=0
+perf-process label=tina_http2_h2c_keepalive_sequential process_allocations=5533 process_allocated_bytes=3657681 rss_delta_kb=0
+perf-process label=tina_http2_h2c_keepalive_sequential process_allocations=5527 process_allocated_bytes=3655411 rss_delta_kb=0
+perf-process label=tina_http2_h2c_keepalive_sequential process_allocations=5508 process_allocated_bytes=3654117 rss_delta_kb=0
+perf-process label=tina_http2_h2c_keepalive_sequential process_allocations=5508 process_allocated_bytes=3654973 rss_delta_kb=0
+perf-process label=tina_http2_h2c_steady_state_small process_allocations=934 process_allocated_bytes=228608 rss_delta_kb=0
+perf-process label=tina_http2_h2c_steady_state_small process_allocations=932 process_allocated_bytes=228336 rss_delta_kb=0
+perf-process label=tina_http2_h2c_steady_state_small process_allocations=928 process_allocated_bytes=228776 rss_delta_kb=0
+perf-process label=tina_http2_h2c_steady_state_small process_allocations=931 process_allocated_bytes=228688 rss_delta_kb=0
+perf-process label=tina_http2_h2c_steady_state_small process_allocations=935 process_allocated_bytes=228744 rss_delta_kb=0
+perf-process label=tina_http2_h2c_steady_state_small process_allocations=931 process_allocated_bytes=228440 rss_delta_kb=0
+perf-process label=tina_http2_h2c_client_steady_state_post process_allocations=2933 process_allocated_bytes=1729115 rss_delta_kb=0
+perf-process label=tina_http2_h2c_client_steady_state_post process_allocations=2936 process_allocated_bytes=1732875 rss_delta_kb=0
+perf-process label=tina_http2_h2c_client_steady_state_post process_allocations=2933 process_allocated_bytes=1729115 rss_delta_kb=0
+perf-process label=tina_http2_h2c_client_steady_state_post process_allocations=2933 process_allocated_bytes=1729115 rss_delta_kb=0
+perf-process label=tina_http2_h2c_client_steady_state_post process_allocations=2955 process_allocated_bytes=1720169 rss_delta_kb=0
+perf-process label=tina_http2_h2c_client_steady_state_post process_allocations=2952 process_allocated_bytes=1720305 rss_delta_kb=0
+perf-process label=tina_grpc_h2c_unary_close process_allocations=4504 process_allocated_bytes=2829251 rss_delta_kb=0
+perf-process label=tina_grpc_h2c_unary_close process_allocations=4371 process_allocated_bytes=2822212 rss_delta_kb=0
+perf-process label=tina_grpc_h2c_unary_close process_allocations=4395 process_allocated_bytes=2821665 rss_delta_kb=0
+perf-process label=tina_grpc_h2c_unary_close process_allocations=4479 process_allocated_bytes=2827973 rss_delta_kb=0
+perf-process label=tina_grpc_h2c_unary_close process_allocations=4494 process_allocated_bytes=2828861 rss_delta_kb=0
+perf-process label=tina_grpc_h2c_unary_close process_allocations=4463 process_allocated_bytes=2827220 rss_delta_kb=0
+perf-process label=tina_grpc_h2c_unary_warmed process_allocations=4027 process_allocated_bytes=1383792 rss_delta_kb=0
+perf-process label=tina_grpc_h2c_unary_warmed process_allocations=4040 process_allocated_bytes=1382481 rss_delta_kb=0
+perf-process label=tina_grpc_h2c_unary_warmed process_allocations=4068 process_allocated_bytes=1391202 rss_delta_kb=0
+perf-process label=tina_grpc_h2c_unary_warmed process_allocations=4070 process_allocated_bytes=1390226 rss_delta_kb=0
+perf-process label=tina_grpc_h2c_unary_warmed process_allocations=4069 process_allocated_bytes=1390708 rss_delta_kb=0
+perf-process label=tina_grpc_h2c_unary_warmed process_allocations=4065 process_allocated_bytes=1388668 rss_delta_kb=0
+perf-process label=tina_grpc_h2c_unary_pooled_concurrent process_allocations=4063 process_allocated_bytes=1315673 rss_delta_kb=0
+perf-process label=tina_grpc_h2c_unary_pooled_concurrent process_allocations=4061 process_allocated_bytes=1315481 rss_delta_kb=0
+perf-process label=tina_grpc_h2c_unary_pooled_concurrent process_allocations=4063 process_allocated_bytes=1315457 rss_delta_kb=0
+perf-process label=tina_grpc_h2c_unary_pooled_concurrent process_allocations=4068 process_allocated_bytes=1317089 rss_delta_kb=0
+perf-process label=tina_grpc_h2c_unary_pooled_concurrent process_allocations=4060 process_allocated_bytes=1315881 rss_delta_kb=0
+perf-process label=tina_grpc_h2c_unary_pooled_concurrent process_allocations=4063 process_allocated_bytes=1315177 rss_delta_kb=0
+perf-process label=tina_grpc_h2c_server_streaming_steady_state process_allocations=5541 process_allocated_bytes=2416760 rss_delta_kb=0
+perf-process label=tina_grpc_h2c_server_streaming_steady_state process_allocations=5525 process_allocated_bytes=2419323 rss_delta_kb=0
+perf-process label=tina_grpc_h2c_server_streaming_steady_state process_allocations=5525 process_allocated_bytes=2413160 rss_delta_kb=0
+perf-process label=tina_grpc_h2c_server_streaming_steady_state process_allocations=5406 process_allocated_bytes=2392195 rss_delta_kb=0
+perf-process label=tina_grpc_h2c_server_streaming_steady_state process_allocations=5441 process_allocated_bytes=2398362 rss_delta_kb=0
+perf-process label=tina_grpc_h2c_server_streaming_steady_state process_allocations=5441 process_allocated_bytes=2407948 rss_delta_kb=0
+perf label=http2_h2c_close_request kind=connection_setup comparison_baseline=none samples=5 sample_policy=median_p50_after_warmup platform=linux arch=x86_64 profile=release git_sha=unknown load label=tina_http2_h2c_close_request workers=4 ops=32 ok=32 err=0 timeout=0 min_us=270 p50_us=569 p90_us=861 p99_us=1334 max_us=1334 elapsed_ms=5 leak=unchecked late=0 trace_hash=none surfaces=0 unavailable_surfaces=0 pressure total=0 rate_per_mille=0 max_consecutive=0 first_err_op=none by_kind=[] allocation_scope=load_worker_op allocations=320 allocated_bytes=8416
+perf label=http2_h2c_keepalive_sequential kind=connection_setup_amortized comparison_baseline=none samples=5 sample_policy=median_p50_after_warmup platform=linux arch=x86_64 profile=release git_sha=unknown load label=tina_http2_h2c_keepalive_sequential workers=4 ops=32 ok=32 err=0 timeout=0 min_us=511 p50_us=810 p90_us=1091 p99_us=1559 max_us=1559 elapsed_ms=7 leak=unchecked late=0 trace_hash=none surfaces=0 unavailable_surfaces=0 pressure total=0 rate_per_mille=0 max_consecutive=0 first_err_op=none by_kind=[] allocation_scope=load_worker_op allocations=992 allocated_bytes=29632
+perf label=http2_h2c_steady_state_small kind=steady_state_reuse comparison_baseline=none samples=5 sample_policy=median_p50_after_warmup platform=linux arch=x86_64 profile=release git_sha=unknown load label=tina_http2_h2c_steady_state_small workers=4 ops=32 ok=32 err=0 timeout=0 min_us=40 p50_us=83 p90_us=218 p99_us=503 max_us=503 elapsed_ms=1 leak=unchecked late=0 trace_hash=none surfaces=0 unavailable_surfaces=0 pressure total=0 rate_per_mille=0 max_consecutive=0 first_err_op=none by_kind=[] allocation_scope=load_worker_op allocations=224 allocated_bytes=7072
+perf label=http2_h2c_client_steady_state_post kind=steady_state_reuse comparison_baseline=none samples=5 sample_policy=median_p50_after_warmup platform=linux arch=x86_64 profile=release git_sha=unknown load label=tina_http2_h2c_client_steady_state_post workers=4 ops=32 ok=32 err=0 timeout=0 min_us=149 p50_us=250 p90_us=340 p99_us=475 max_us=475 elapsed_ms=2 leak=unchecked late=0 trace_hash=none surfaces=0 unavailable_surfaces=0 pressure total=0 rate_per_mille=0 max_consecutive=0 first_err_op=none by_kind=[] allocation_scope=load_worker_op allocations=113 allocated_bytes=140696
+perf label=grpc_h2c_unary_close kind=connection_setup comparison_baseline=none samples=5 sample_policy=median_p50_after_warmup platform=linux arch=x86_64 profile=release git_sha=unknown load label=tina_grpc_h2c_unary_close workers=4 ops=32 ok=32 err=0 timeout=0 min_us=292 p50_us=466 p90_us=889 p99_us=3736 max_us=3736 elapsed_ms=6 leak=unchecked late=0 trace_hash=none surfaces=0 unavailable_surfaces=0 pressure total=0 rate_per_mille=0 max_consecutive=0 first_err_op=none by_kind=[] allocation_scope=load_worker_op allocations=640 allocated_bytes=26464
+perf label=grpc_h2c_unary_warmed kind=steady_state_reuse comparison_baseline=none samples=5 sample_policy=median_p50_after_warmup platform=linux arch=x86_64 profile=release git_sha=unknown load label=tina_grpc_h2c_unary_warmed workers=4 ops=32 ok=32 err=0 timeout=0 min_us=130 p50_us=265 p90_us=451 p99_us=537 max_us=537 elapsed_ms=2 leak=unchecked late=0 trace_hash=none surfaces=0 unavailable_surfaces=0 pressure total=0 rate_per_mille=0 max_consecutive=0 first_err_op=none by_kind=[] allocation_scope=load_worker_op allocations=49 allocated_bytes=9592
+perf label=grpc_h2c_unary_pooled_concurrent kind=steady_state_reuse comparison_baseline=none samples=5 sample_policy=median_p50_after_warmup platform=linux arch=x86_64 profile=release git_sha=unknown load label=tina_grpc_h2c_unary_pooled_concurrent workers=4 ops=32 ok=32 err=0 timeout=0 min_us=172 p50_us=272 p90_us=329 p99_us=388 max_us=388 elapsed_ms=2 leak=unchecked late=0 trace_hash=none surfaces=0 unavailable_surfaces=0 pressure total=0 rate_per_mille=0 max_consecutive=0 first_err_op=none by_kind=[] allocation_scope=load_worker_op allocations=51 allocated_bytes=10184
+perf label=grpc_h2c_server_streaming_steady_state kind=steady_state_reuse comparison_baseline=none samples=5 sample_policy=median_p50_after_warmup platform=linux arch=x86_64 profile=release git_sha=unknown load label=tina_grpc_h2c_server_streaming_steady_state workers=4 ops=32 ok=32 err=0 timeout=0 min_us=131 p50_us=353 p90_us=595 p99_us=1039 max_us=1039 elapsed_ms=3 leak=unchecked late=0 trace_hash=none surfaces=0 unavailable_surfaces=0 pressure total=0 rate_per_mille=0 max_consecutive=0 first_err_op=none by_kind=[] allocation_scope=load_worker_op allocations=412 allocated_bytes=72464
+=== Linux BEFORE perf run 3 ===
+perf-process label=tina_http2_h2c_close_request process_allocations=2806 process_allocated_bytes=2653163 rss_delta_kb=0
+perf-process label=tina_http2_h2c_close_request process_allocations=2780 process_allocated_bytes=2646313 rss_delta_kb=0
+perf-process label=tina_http2_h2c_close_request process_allocations=2847 process_allocated_bytes=2656002 rss_delta_kb=0
+perf-process label=tina_http2_h2c_close_request process_allocations=2812 process_allocated_bytes=2650707 rss_delta_kb=0
+perf-process label=tina_http2_h2c_close_request process_allocations=2750 process_allocated_bytes=2643800 rss_delta_kb=0
+perf-process label=tina_http2_h2c_close_request process_allocations=2798 process_allocated_bytes=2651821 rss_delta_kb=0
+perf-process label=tina_http2_h2c_keepalive_sequential process_allocations=5506 process_allocated_bytes=3654439 rss_delta_kb=0
+perf-process label=tina_http2_h2c_keepalive_sequential process_allocations=5518 process_allocated_bytes=3649757 rss_delta_kb=0
+perf-process label=tina_http2_h2c_keepalive_sequential process_allocations=5536 process_allocated_bytes=3653627 rss_delta_kb=0
+perf-process label=tina_http2_h2c_keepalive_sequential process_allocations=5517 process_allocated_bytes=3657419 rss_delta_kb=0
+perf-process label=tina_http2_h2c_keepalive_sequential process_allocations=5528 process_allocated_bytes=3657181 rss_delta_kb=0
+perf-process label=tina_http2_h2c_keepalive_sequential process_allocations=5469 process_allocated_bytes=3648795 rss_delta_kb=0
+perf-process label=tina_http2_h2c_steady_state_small process_allocations=930 process_allocated_bytes=228264 rss_delta_kb=0
+perf-process label=tina_http2_h2c_steady_state_small process_allocations=927 process_allocated_bytes=228128 rss_delta_kb=0
+perf-process label=tina_http2_h2c_steady_state_small process_allocations=929 process_allocated_bytes=228560 rss_delta_kb=0
+perf-process label=tina_http2_h2c_steady_state_small process_allocations=930 process_allocated_bytes=228216 rss_delta_kb=0
+perf-process label=tina_http2_h2c_steady_state_small process_allocations=928 process_allocated_bytes=228000 rss_delta_kb=0
+perf-process label=tina_http2_h2c_steady_state_small process_allocations=929 process_allocated_bytes=228160 rss_delta_kb=0
+perf-process label=tina_http2_h2c_client_steady_state_post process_allocations=2938 process_allocated_bytes=1739843 rss_delta_kb=0
+perf-process label=tina_http2_h2c_client_steady_state_post process_allocations=2931 process_allocated_bytes=1728987 rss_delta_kb=0
+perf-process label=tina_http2_h2c_client_steady_state_post process_allocations=2951 process_allocated_bytes=1717993 rss_delta_kb=0
+perf-process label=tina_http2_h2c_client_steady_state_post process_allocations=2930 process_allocated_bytes=1727139 rss_delta_kb=0
+perf-process label=tina_http2_h2c_client_steady_state_post process_allocations=2931 process_allocated_bytes=1729043 rss_delta_kb=0
+perf-process label=tina_http2_h2c_client_steady_state_post process_allocations=2952 process_allocated_bytes=1721529 rss_delta_kb=0
+perf-process label=tina_grpc_h2c_unary_close process_allocations=4460 process_allocated_bytes=2827892 rss_delta_kb=0
+perf-process label=tina_grpc_h2c_unary_close process_allocations=4443 process_allocated_bytes=2829886 rss_delta_kb=0
+perf-process label=tina_grpc_h2c_unary_close process_allocations=4400 process_allocated_bytes=2828659 rss_delta_kb=0
+perf-process label=tina_grpc_h2c_unary_close process_allocations=4390 process_allocated_bytes=2825082 rss_delta_kb=0
+perf-process label=tina_grpc_h2c_unary_close process_allocations=4488 process_allocated_bytes=2829698 rss_delta_kb=0
+perf-process label=tina_grpc_h2c_unary_close process_allocations=4485 process_allocated_bytes=2838971 rss_delta_kb=0
+perf-process label=tina_grpc_h2c_unary_warmed process_allocations=4102 process_allocated_bytes=1394957 rss_delta_kb=0
+perf-process label=tina_grpc_h2c_unary_warmed process_allocations=4072 process_allocated_bytes=1389116 rss_delta_kb=0
+perf-process label=tina_grpc_h2c_unary_warmed process_allocations=4099 process_allocated_bytes=1394765 rss_delta_kb=0
+perf-process label=tina_grpc_h2c_unary_warmed process_allocations=4067 process_allocated_bytes=1389258 rss_delta_kb=0
+perf-process label=tina_grpc_h2c_unary_warmed process_allocations=4097 process_allocated_bytes=1394869 rss_delta_kb=0
+perf-process label=tina_grpc_h2c_unary_warmed process_allocations=4072 process_allocated_bytes=1389706 rss_delta_kb=0
+perf-process label=tina_grpc_h2c_unary_pooled_concurrent process_allocations=4065 process_allocated_bytes=1315513 rss_delta_kb=0
+perf-process label=tina_grpc_h2c_unary_pooled_concurrent process_allocations=4064 process_allocated_bytes=1315673 rss_delta_kb=0
+perf-process label=tina_grpc_h2c_unary_pooled_concurrent process_allocations=4061 process_allocated_bytes=1315417 rss_delta_kb=0
+perf-process label=tina_grpc_h2c_unary_pooled_concurrent process_allocations=4060 process_allocated_bytes=1315481 rss_delta_kb=0
+perf-process label=tina_grpc_h2c_unary_pooled_concurrent process_allocations=4064 process_allocated_bytes=1315673 rss_delta_kb=0
+perf-process label=tina_grpc_h2c_unary_pooled_concurrent process_allocations=4069 process_allocated_bytes=1315513 rss_delta_kb=0
+perf-process label=tina_grpc_h2c_server_streaming_steady_state process_allocations=5445 process_allocated_bytes=2395774 rss_delta_kb=0
+perf-process label=tina_grpc_h2c_server_streaming_steady_state process_allocations=5466 process_allocated_bytes=2394908 rss_delta_kb=0
+perf-process label=tina_grpc_h2c_server_streaming_steady_state process_allocations=5488 process_allocated_bytes=2412421 rss_delta_kb=0
+perf-process label=tina_grpc_h2c_server_streaming_steady_state process_allocations=5458 process_allocated_bytes=2413111 rss_delta_kb=0
+perf-process label=tina_grpc_h2c_server_streaming_steady_state process_allocations=5502 process_allocated_bytes=2417618 rss_delta_kb=0
+perf-process label=tina_grpc_h2c_server_streaming_steady_state process_allocations=5423 process_allocated_bytes=2397559 rss_delta_kb=0
+perf label=http2_h2c_close_request kind=connection_setup comparison_baseline=none samples=5 sample_policy=median_p50_after_warmup platform=linux arch=x86_64 profile=release git_sha=unknown load label=tina_http2_h2c_close_request workers=4 ops=32 ok=32 err=0 timeout=0 min_us=223 p50_us=495 p90_us=694 p99_us=994 max_us=994 elapsed_ms=4 leak=unchecked late=0 trace_hash=none surfaces=0 unavailable_surfaces=0 pressure total=0 rate_per_mille=0 max_consecutive=0 first_err_op=none by_kind=[] allocation_scope=load_worker_op allocations=320 allocated_bytes=8416
+perf label=http2_h2c_keepalive_sequential kind=connection_setup_amortized comparison_baseline=none samples=5 sample_policy=median_p50_after_warmup platform=linux arch=x86_64 profile=release git_sha=unknown load label=tina_http2_h2c_keepalive_sequential workers=4 ops=32 ok=32 err=0 timeout=0 min_us=481 p50_us=859 p90_us=1638 p99_us=1995 max_us=1995 elapsed_ms=8 leak=unchecked late=0 trace_hash=none surfaces=0 unavailable_surfaces=0 pressure total=0 rate_per_mille=0 max_consecutive=0 first_err_op=none by_kind=[] allocation_scope=load_worker_op allocations=992 allocated_bytes=29632
+perf label=http2_h2c_steady_state_small kind=steady_state_reuse comparison_baseline=none samples=5 sample_policy=median_p50_after_warmup platform=linux arch=x86_64 profile=release git_sha=unknown load label=tina_http2_h2c_steady_state_small workers=4 ops=32 ok=32 err=0 timeout=0 min_us=41 p50_us=86 p90_us=161 p99_us=406 max_us=406 elapsed_ms=1 leak=unchecked late=0 trace_hash=none surfaces=0 unavailable_surfaces=0 pressure total=0 rate_per_mille=0 max_consecutive=0 first_err_op=none by_kind=[] allocation_scope=load_worker_op allocations=224 allocated_bytes=7072
+perf label=http2_h2c_client_steady_state_post kind=steady_state_reuse comparison_baseline=none samples=5 sample_policy=median_p50_after_warmup platform=linux arch=x86_64 profile=release git_sha=unknown load label=tina_http2_h2c_client_steady_state_post workers=4 ops=32 ok=32 err=0 timeout=0 min_us=129 p50_us=247 p90_us=330 p99_us=719 max_us=719 elapsed_ms=2 leak=unchecked late=0 trace_hash=none surfaces=0 unavailable_surfaces=0 pressure total=0 rate_per_mille=0 max_consecutive=0 first_err_op=none by_kind=[] allocation_scope=load_worker_op allocations=113 allocated_bytes=140696
+perf label=grpc_h2c_unary_close kind=connection_setup comparison_baseline=none samples=5 sample_policy=median_p50_after_warmup platform=linux arch=x86_64 profile=release git_sha=unknown load label=tina_grpc_h2c_unary_close workers=4 ops=32 ok=32 err=0 timeout=0 min_us=405 p50_us=723 p90_us=941 p99_us=1416 max_us=1416 elapsed_ms=6 leak=unchecked late=0 trace_hash=none surfaces=0 unavailable_surfaces=0 pressure total=0 rate_per_mille=0 max_consecutive=0 first_err_op=none by_kind=[] allocation_scope=load_worker_op allocations=640 allocated_bytes=26464
+perf label=grpc_h2c_unary_warmed kind=steady_state_reuse comparison_baseline=none samples=5 sample_policy=median_p50_after_warmup platform=linux arch=x86_64 profile=release git_sha=unknown load label=tina_grpc_h2c_unary_warmed workers=4 ops=32 ok=32 err=0 timeout=0 min_us=190 p50_us=289 p90_us=395 p99_us=421 max_us=421 elapsed_ms=2 leak=unchecked late=0 trace_hash=none surfaces=0 unavailable_surfaces=0 pressure total=0 rate_per_mille=0 max_consecutive=0 first_err_op=none by_kind=[] allocation_scope=load_worker_op allocations=49 allocated_bytes=9592
+perf label=grpc_h2c_unary_pooled_concurrent kind=steady_state_reuse comparison_baseline=none samples=5 sample_policy=median_p50_after_warmup platform=linux arch=x86_64 profile=release git_sha=unknown load label=tina_grpc_h2c_unary_pooled_concurrent workers=4 ops=32 ok=32 err=0 timeout=0 min_us=225 p50_us=285 p90_us=359 p99_us=371 max_us=371 elapsed_ms=2 leak=unchecked late=0 trace_hash=none surfaces=0 unavailable_surfaces=0 pressure total=0 rate_per_mille=0 max_consecutive=0 first_err_op=none by_kind=[] allocation_scope=load_worker_op allocations=49 allocated_bytes=9592
+perf label=grpc_h2c_server_streaming_steady_state kind=steady_state_reuse comparison_baseline=none samples=5 sample_policy=median_p50_after_warmup platform=linux arch=x86_64 profile=release git_sha=unknown load label=tina_grpc_h2c_server_streaming_steady_state workers=4 ops=32 ok=32 err=0 timeout=0 min_us=264 p50_us=373 p90_us=529 p99_us=583 max_us=583 elapsed_ms=3 leak=unchecked late=0 trace_hash=none surfaces=0 unavailable_surfaces=0 pressure total=0 rate_per_mille=0 max_consecutive=0 first_err_op=none by_kind=[] allocation_scope=load_worker_op allocations=390 allocated_bytes=65952

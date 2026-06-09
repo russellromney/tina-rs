@@ -238,8 +238,15 @@ pub(crate) fn is_grpc_content_type(value: &str) -> bool {
 /// Typed unary request passed to user handlers.
 #[derive(Debug, Clone)]
 pub struct GrpcRequest<T> {
-    pub path: String,
+    path: Arc<str>,
     pub message: T,
+}
+
+impl<T> GrpcRequest<T> {
+    /// The gRPC method path this request was routed to, e.g. `/pkg.Svc/Method`.
+    pub fn path(&self) -> &str {
+        &self.path
+    }
 }
 
 /// Typed unary response returned by user handlers.
@@ -276,10 +283,12 @@ trait ErasedClientStreaming: Send + Sync {
 
 trait ErasedStreaming: Send + Sync {
     fn call(&self, request: HttpRequest, limits: GrpcLimits) -> HttpResponse;
+    fn call_http2(&self, request: GrpcHttp2Request, limits: GrpcLimits) -> HttpResponse;
 }
 
 trait ErasedStreamingRaw: Send + Sync {
     fn call(&self, request: HttpRequest, limits: GrpcLimits) -> HttpResponse;
+    fn call_http2(&self, request: GrpcHttp2Request, limits: GrpcLimits) -> HttpResponse;
 }
 
 struct UnaryHandler<Req, Resp, F> {
@@ -300,6 +309,9 @@ where
             body,
             ..
         } = request;
+        // The public request shape owns a `String`; handlers take the interned
+        // `Arc<str>` path, so the generic entry pays one copy here.
+        let path: Arc<str> = Arc::from(path);
         match decode_unary_parts::<Req>(&headers, &body, limits) {
             Ok(message) => match (self.f)(GrpcRequest { path, message }) {
                 Ok(response) => match encode_grpc_message(&response.message, limits) {
@@ -473,7 +485,7 @@ impl GrpcBufferedServerStreamingResponse {
                     max: limits.max_body_bytes,
                 });
             }
-            append_grpc_message(&mut body, &message, limits.message)?;
+            encode_grpc_message_into(&mut body, &message, limits.message)?;
         }
         Ok(Self::from_framed_body(body))
     }
@@ -487,9 +499,16 @@ impl GrpcBufferedServerStreamingResponse {
 /// response source.
 #[derive(Debug)]
 pub struct GrpcStreamingCall<Req, Resp> {
-    pub path: String,
+    path: Arc<str>,
     pub requests: GrpcRequestStream<Req>,
     _response: PhantomData<fn() -> Resp>,
+}
+
+impl<Req, Resp> GrpcStreamingCall<Req, Resp> {
+    /// The gRPC method path this stream was routed to, e.g. `/pkg.Svc/Method`.
+    pub fn path(&self) -> &str {
+        &self.path
+    }
 }
 
 /// Typed gRPC request stream helper for streaming RPCs.
@@ -676,12 +695,17 @@ pub fn grpc_stream_finish(status: GrpcStatus) -> ResponseChunkReply {
 /// or test fixture that must work directly with HTTP/2 request chunks.
 #[derive(Debug, Clone)]
 pub struct GrpcRawStreamingRequest<T> {
-    pub path: String,
+    path: Arc<str>,
     pub stream: Http2RequestStream,
     _message: PhantomData<fn() -> T>,
 }
 
 impl<T> GrpcRawStreamingRequest<T> {
+    /// The gRPC method path this request was routed to, e.g. `/pkg.Svc/Method`.
+    pub fn path(&self) -> &str {
+        &self.path
+    }
+
     pub fn message_type(&self) -> PhantomData<fn() -> T> {
         self._message
     }
@@ -725,6 +749,9 @@ where
             body,
             ..
         } = request;
+        // The public request shape owns a `String`; handlers take the interned
+        // `Arc<str>` path, so the generic entry pays one copy here.
+        let path: Arc<str> = Arc::from(path);
         match decode_unary_parts::<Req>(&headers, &body, limits) {
             Ok(message) => match (self.f)(GrpcRequest { path, message }) {
                 Ok(response) => grpc_streaming_http_response(response.source, GrpcStatus::ok()),
@@ -778,6 +805,9 @@ where
             body,
             ..
         } = request;
+        // The public request shape owns a `String`; handlers take the interned
+        // `Arc<str>` path, so the generic entry pays one copy here.
+        let path: Arc<str> = Arc::from(path);
         match decode_unary_parts::<Req>(&headers, &body, limits) {
             Ok(message) => match (self.f)(GrpcRequest { path, message }) {
                 Ok(response) => grpc_http_response_shared(response.body, GrpcStatus::ok()),
@@ -819,8 +849,15 @@ where
 /// Typed client-streaming request passed to user handlers.
 #[derive(Debug, Clone)]
 pub struct GrpcClientStreamingRequest<T> {
-    pub path: String,
+    path: Arc<str>,
     pub messages: Vec<T>,
+}
+
+impl<T> GrpcClientStreamingRequest<T> {
+    /// The gRPC method path this request was routed to, e.g. `/pkg.Svc/Method`.
+    pub fn path(&self) -> &str {
+        &self.path
+    }
 }
 
 impl<Req, Resp, F> ErasedClientStreaming for ClientStreamingHandler<Req, Resp, F>
@@ -839,6 +876,9 @@ where
             body,
             ..
         } = request;
+        // The public request shape owns a `String`; handlers take the interned
+        // `Arc<str>` path, so the generic entry pays one copy here.
+        let path: Arc<str> = Arc::from(path);
         match decode_streaming_parts::<Req>(&headers, &body, limits) {
             Ok(messages) => match (self.f)(GrpcClientStreamingRequest { path, messages }) {
                 Ok(response) => match encode_grpc_message(&response.message, limits) {
@@ -912,7 +952,29 @@ where
 {
     fn call(&self, request: HttpRequest, limits: GrpcLimits) -> HttpResponse {
         let HttpRequest { path, body, .. } = request;
+        let path: Arc<str> = Arc::from(path);
         let HttpRequestBody::Http2Stream(stream) = body else {
+            return grpc_http_response(
+                Vec::new(),
+                GrpcStatus::new(GrpcStatusCode::InvalidArgument),
+            );
+        };
+        match (self.f)(GrpcStreamingCall {
+            path,
+            requests: GrpcRequestStream::new(stream, limits),
+            _response: PhantomData,
+        }) {
+            Ok(response) => grpc_streaming_http_response(response.source, response.status),
+            Err(status) => grpc_http_response(Vec::new(), status),
+        }
+    }
+
+    fn call_http2(&self, request: GrpcHttp2Request, limits: GrpcLimits) -> HttpResponse {
+        // Take the HTTP/2 request body stream straight from the compact request
+        // — no public `HttpRequest`/`HeaderMap` rebuild. The handler only needs
+        // the method path and the request stream.
+        let GrpcHttp2Request { path, body, .. } = request;
+        let GrpcHttp2Body::Http2Stream(stream) = body else {
             return grpc_http_response(
                 Vec::new(),
                 GrpcStatus::new(GrpcStatusCode::InvalidArgument),
@@ -939,7 +1001,28 @@ where
 {
     fn call(&self, request: HttpRequest, _limits: GrpcLimits) -> HttpResponse {
         let HttpRequest { path, body, .. } = request;
+        let path: Arc<str> = Arc::from(path);
         let HttpRequestBody::Http2Stream(stream) = body else {
+            return grpc_http_response(
+                Vec::new(),
+                GrpcStatus::new(GrpcStatusCode::InvalidArgument),
+            );
+        };
+        match (self.f)(GrpcRawStreamingRequest {
+            path,
+            stream,
+            _message: PhantomData,
+        }) {
+            Ok(response) => grpc_streaming_http_response(response.source, response.status),
+            Err(status) => grpc_http_response(Vec::new(), status),
+        }
+    }
+
+    fn call_http2(&self, request: GrpcHttp2Request, _limits: GrpcLimits) -> HttpResponse {
+        // Compact entry point: hand the raw HTTP/2 request stream to the handler
+        // without building a public `HttpRequest`.
+        let GrpcHttp2Request { path, body, .. } = request;
+        let GrpcHttp2Body::Http2Stream(stream) = body else {
             return grpc_http_response(
                 Vec::new(),
                 GrpcStatus::new(GrpcStatusCode::InvalidArgument),
@@ -987,7 +1070,7 @@ pub enum GrpcRouterMsg {
 #[derive(Debug)]
 pub struct GrpcHttp2Request {
     method: Method,
-    path: String,
+    path: Arc<str>,
     body: GrpcHttp2Body,
     content_type_ok: bool,
     unsupported_encoding: bool,
@@ -1015,31 +1098,6 @@ impl GrpcHttp2Request {
             unsupported_encoding: parts.grpc_encoding_unsupported,
         }
     }
-
-    fn into_http_request(self) -> HttpRequest {
-        let mut headers = HeaderMap::new();
-        if self.content_type_ok {
-            headers.insert(
-                http::header::CONTENT_TYPE,
-                HeaderValue::from_static("application/grpc"),
-            );
-        }
-        if self.unsupported_encoding {
-            headers.insert("grpc-encoding", HeaderValue::from_static("unsupported"));
-        }
-        let body = match self.body {
-            GrpcHttp2Body::Buffered(bytes) => HttpRequestBody::Buffered(bytes),
-            GrpcHttp2Body::Http2Stream(stream) => HttpRequestBody::Http2Stream(stream),
-            GrpcHttp2Body::Unsupported => HttpRequestBody::Buffered(Vec::new()),
-        };
-        HttpRequest {
-            method: self.method,
-            path: self.path,
-            version: http::Version::HTTP_2,
-            headers,
-            body,
-        }
-    }
 }
 
 impl Http2ServiceMessage for GrpcRouterMsg {
@@ -1056,10 +1114,28 @@ impl Http2ServiceMessage for GrpcRouterMsg {
     }
 }
 
-struct PendingGrpcRequest {
-    request: HttpRequest,
-    body: Vec<u8>,
-    call: tina::RequestContext<HttpResponse>,
+/// A streamed gRPC request whose body is being pulled chunk-by-chunk before
+/// the route can run. The HTTP/2 (`Http2`) variant keeps compact gRPC facts —
+/// not a public `HttpRequest`/`HeaderMap` — so the native streaming path never
+/// rebuilds the public request shape.
+enum PendingGrpcRequest {
+    /// Generic `HttpRequest` entry path (kept for non-compact / direct API use).
+    Public {
+        request: HttpRequest,
+        body: Vec<u8>,
+        call: tina::RequestContext<HttpResponse>,
+    },
+    /// Native compact HTTP/2 entry path. Stores the method path, the two gRPC
+    /// header facts, the request stream to pull from, and the accumulated body.
+    Http2 {
+        method: Method,
+        path: Arc<str>,
+        content_type_ok: bool,
+        unsupported_encoding: bool,
+        stream: Http2RequestStream,
+        body: Vec<u8>,
+        call: tina::RequestContext<HttpResponse>,
+    },
 }
 
 impl<S: Shard + 'static> GrpcRouter<S> {
@@ -1190,22 +1266,22 @@ impl<S: Shard + 'static> GrpcRouter<S> {
         if request.method != Method::POST {
             return grpc_http_response(Vec::new(), GrpcStatus::new(GrpcStatusCode::Unimplemented));
         }
-        if let Some(handler) = self.unary.get(&request.path) {
+        if let Some(handler) = self.unary.get(&*request.path) {
             return handler.call(request, self.limits);
         }
-        if let Some(handler) = self.client_streaming.get(&request.path) {
+        if let Some(handler) = self.client_streaming.get(&*request.path) {
             return handler.call(request, self.limits);
         }
-        if let Some(handler) = self.streaming.get(&request.path) {
+        if let Some(handler) = self.streaming.get(&*request.path) {
             return handler.call(request, self.limits);
         }
-        if let Some(handler) = self.streaming_raw.get(&request.path) {
+        if let Some(handler) = self.streaming_raw.get(&*request.path) {
             return handler.call(request, self.limits);
         }
-        if let Some(handler) = self.buffered_server_streaming.get(&request.path) {
+        if let Some(handler) = self.buffered_server_streaming.get(&*request.path) {
             return handler.call(request, self.limits);
         }
-        let Some(handler) = self.server_streaming.get(&request.path) else {
+        let Some(handler) = self.server_streaming.get(&*request.path) else {
             return grpc_http_response(Vec::new(), GrpcStatus::new(GrpcStatusCode::Unimplemented));
         };
         handler.call(request, self.limits)
@@ -1215,21 +1291,22 @@ impl<S: Shard + 'static> GrpcRouter<S> {
         if request.method != Method::POST {
             return grpc_http_response(Vec::new(), GrpcStatus::new(GrpcStatusCode::Unimplemented));
         }
-        if self.streaming.contains_key(&request.path)
-            || self.streaming_raw.contains_key(&request.path)
-        {
-            return self.response_for(request.into_http_request());
-        }
-        if let Some(handler) = self.unary.get(&request.path) {
+        if let Some(handler) = self.unary.get(&*request.path) {
             return handler.call_http2(request, self.limits);
         }
-        if let Some(handler) = self.client_streaming.get(&request.path) {
+        if let Some(handler) = self.client_streaming.get(&*request.path) {
             return handler.call_http2(request, self.limits);
         }
-        if let Some(handler) = self.buffered_server_streaming.get(&request.path) {
+        if let Some(handler) = self.streaming.get(&*request.path) {
             return handler.call_http2(request, self.limits);
         }
-        let Some(handler) = self.server_streaming.get(&request.path) else {
+        if let Some(handler) = self.streaming_raw.get(&*request.path) {
+            return handler.call_http2(request, self.limits);
+        }
+        if let Some(handler) = self.buffered_server_streaming.get(&*request.path) {
+            return handler.call_http2(request, self.limits);
+        }
+        let Some(handler) = self.server_streaming.get(&*request.path) else {
             return grpc_http_response(Vec::new(), GrpcStatus::new(GrpcStatusCode::Unimplemented));
         };
         handler.call_http2(request, self.limits)
@@ -1259,7 +1336,7 @@ impl<S: Shard + 'static> GrpcRouter<S> {
                 let request_context = call_ctx.into_request_context();
                 self.pending.insert(
                     id,
-                    PendingGrpcRequest {
+                    PendingGrpcRequest::Public {
                         request,
                         body: Vec::new(),
                         call: request_context,
@@ -1287,7 +1364,55 @@ impl<S: Shard + 'static> GrpcRouter<S> {
                 GrpcStatus::new(GrpcStatusCode::InvalidArgument),
             )),
             GrpcHttp2Body::Http2Stream(_) => {
-                self.start_or_reply_request(request.into_http_request(), call_ctx)
+                // streaming / raw-streaming routes consume the request stream
+                // directly and reply with a streaming response source. They do
+                // not accumulate the body, so dispatch them synchronously via
+                // the compact entry point — no public `HttpRequest` rebuild.
+                if self.streaming.contains_key(&*request.path)
+                    || self.streaming_raw.contains_key(&*request.path)
+                {
+                    return call_ctx.reply(self.response_for_http2(request));
+                }
+                // Other routes over a streamed body (e.g. client-streaming)
+                // accumulate the framed body, then dispatch buffered. Keep the
+                // compact gRPC facts instead of a public `HttpRequest`.
+                let GrpcHttp2Request {
+                    method,
+                    path,
+                    body,
+                    content_type_ok,
+                    unsupported_encoding,
+                } = request;
+                let GrpcHttp2Body::Http2Stream(stream) = body else {
+                    // The outer match guarantees Http2Stream here.
+                    return call_ctx.reply(grpc_http_response(
+                        Vec::new(),
+                        GrpcStatus::new(GrpcStatusCode::Internal),
+                    ));
+                };
+                let id = self.next_pending_id;
+                self.next_pending_id = self.next_pending_id.saturating_add(1);
+                let source = stream.source;
+                let stream_id = stream.stream_id;
+                let request_context = call_ctx.into_request_context();
+                self.pending.insert(
+                    id,
+                    PendingGrpcRequest::Http2 {
+                        method,
+                        path,
+                        content_type_ok,
+                        unsupported_encoding,
+                        stream,
+                        body: Vec::new(),
+                        call: request_context,
+                    },
+                );
+                call(
+                    source,
+                    crate::Http2ConnectionMsg::body_next(stream_id),
+                    REQUEST_BODY_PULL_TIMEOUT,
+                )
+                .then(move |outcome| GrpcRouterMsg::RequestBodyChunk { id, outcome })
             }
         }
     }
@@ -1297,58 +1422,159 @@ impl<S: Shard + 'static> GrpcRouter<S> {
         id: u64,
         outcome: CallOutcome<Http2ConnectionReply>,
     ) -> Effect<Self> {
-        let Some(mut pending) = self.pending.remove(&id) else {
+        let Some(pending) = self.pending.remove(&id) else {
             return noop();
         };
-        let HttpRequestBody::Http2Stream(stream) = &pending.request.body else {
-            return reply_to_request(
-                pending.call,
-                grpc_http_response(Vec::new(), GrpcStatus::new(GrpcStatusCode::Internal)),
-            );
-        };
-        match outcome {
-            CallOutcome::Replied(Http2ConnectionReply::RequestChunk(RequestChunkReply::Chunk(
-                bytes,
-            ))) => {
-                pending.body.extend_from_slice(&bytes);
-                let source = stream.source;
-                let stream_id = stream.stream_id;
-                self.pending.insert(id, pending);
-                call(
-                    source,
-                    crate::Http2ConnectionMsg::body_next(stream_id),
-                    REQUEST_BODY_PULL_TIMEOUT,
-                )
-                .then(move |outcome| GrpcRouterMsg::RequestBodyChunk { id, outcome })
+        // Classify the chunk outcome once; both pending shapes share the same
+        // body-pull contract (more bytes, clean EOF, or a failure mapped to a
+        // gRPC status).
+        match classify_request_chunk(outcome) {
+            RequestChunkAction::More(bytes) => match pending {
+                PendingGrpcRequest::Public {
+                    request,
+                    mut body,
+                    call,
+                } => {
+                    let HttpRequestBody::Http2Stream(stream) = &request.body else {
+                        return reply_to_request(
+                            call,
+                            grpc_http_response(
+                                Vec::new(),
+                                GrpcStatus::new(GrpcStatusCode::Internal),
+                            ),
+                        );
+                    };
+                    let source = stream.source;
+                    let stream_id = stream.stream_id;
+                    body.extend_from_slice(&bytes);
+                    self.pending.insert(
+                        id,
+                        PendingGrpcRequest::Public {
+                            request,
+                            body,
+                            call,
+                        },
+                    );
+                    self.pull_next_chunk(id, source, stream_id)
+                }
+                PendingGrpcRequest::Http2 {
+                    method,
+                    path,
+                    content_type_ok,
+                    unsupported_encoding,
+                    stream,
+                    mut body,
+                    call,
+                } => {
+                    let source = stream.source;
+                    let stream_id = stream.stream_id;
+                    body.extend_from_slice(&bytes);
+                    self.pending.insert(
+                        id,
+                        PendingGrpcRequest::Http2 {
+                            method,
+                            path,
+                            content_type_ok,
+                            unsupported_encoding,
+                            stream,
+                            body,
+                            call,
+                        },
+                    );
+                    self.pull_next_chunk(id, source, stream_id)
+                }
+            },
+            RequestChunkAction::Eof => match pending {
+                PendingGrpcRequest::Public {
+                    mut request,
+                    body,
+                    call,
+                } => {
+                    request.body = HttpRequestBody::Buffered(body);
+                    reply_to_request(call, self.response_for(request))
+                }
+                PendingGrpcRequest::Http2 {
+                    method,
+                    path,
+                    content_type_ok,
+                    unsupported_encoding,
+                    body,
+                    call,
+                    ..
+                } => {
+                    let request = GrpcHttp2Request {
+                        method,
+                        path,
+                        body: GrpcHttp2Body::Buffered(body),
+                        content_type_ok,
+                        unsupported_encoding,
+                    };
+                    reply_to_request(call, self.response_for_http2(request))
+                }
+            },
+            RequestChunkAction::Failed(status) => {
+                reply_to_request(pending.into_call(), grpc_http_response(Vec::new(), status))
             }
-            CallOutcome::Replied(Http2ConnectionReply::RequestChunk(RequestChunkReply::Eof)) => {
-                pending.request.body = HttpRequestBody::Buffered(pending.body);
-                let response = self.response_for(pending.request);
-                reply_to_request(pending.call, response)
-            }
-            CallOutcome::Replied(Http2ConnectionReply::RequestChunk(RequestChunkReply::Error(
-                _,
-            )))
-            | CallOutcome::Replied(Http2ConnectionReply::Report(_))
-            | CallOutcome::Replied(Http2ConnectionReply::RequestChunk(
-                RequestChunkReply::WebSocketSend(_),
-            ))
-            | CallOutcome::Replied(Http2ConnectionReply::RequestChunk(
-                RequestChunkReply::WebSocketReport(_),
-            )) => reply_to_request(
-                pending.call,
-                grpc_http_response(Vec::new(), GrpcStatus::new(GrpcStatusCode::Internal)),
-            ),
-            CallOutcome::Full
-            | CallOutcome::Closed
-            | CallOutcome::Rejected(_)
-            | CallOutcome::Timeout => reply_to_request(
-                pending.call,
-                grpc_http_response(
-                    Vec::new(),
-                    GrpcStatus::new(GrpcStatusCode::DeadlineExceeded),
-                ),
-            ),
+        }
+    }
+
+    /// Pull the next request body chunk for a pending streamed request.
+    fn pull_next_chunk(
+        &self,
+        id: u64,
+        source: tina::Address<crate::Http2ConnectionMsg, crate::Http2ConnectionReply>,
+        stream_id: u32,
+    ) -> Effect<Self> {
+        call(
+            source,
+            crate::Http2ConnectionMsg::body_next(stream_id),
+            REQUEST_BODY_PULL_TIMEOUT,
+        )
+        .then(move |outcome| GrpcRouterMsg::RequestBodyChunk { id, outcome })
+    }
+}
+
+impl PendingGrpcRequest {
+    /// The reply obligation, regardless of which entry path produced it.
+    fn into_call(self) -> tina::RequestContext<HttpResponse> {
+        match self {
+            PendingGrpcRequest::Public { call, .. } => call,
+            PendingGrpcRequest::Http2 { call, .. } => call,
+        }
+    }
+}
+
+/// What a request-body-pull outcome means for an accumulating streamed request.
+enum RequestChunkAction {
+    /// More body bytes arrived; keep pulling.
+    More(Vec<u8>),
+    /// Clean end of the request body.
+    Eof,
+    /// The pull failed; reply with this gRPC status.
+    Failed(GrpcStatus),
+}
+
+fn classify_request_chunk(outcome: CallOutcome<Http2ConnectionReply>) -> RequestChunkAction {
+    match outcome {
+        CallOutcome::Replied(Http2ConnectionReply::RequestChunk(RequestChunkReply::Chunk(
+            bytes,
+        ))) => RequestChunkAction::More(bytes),
+        CallOutcome::Replied(Http2ConnectionReply::RequestChunk(RequestChunkReply::Eof)) => {
+            RequestChunkAction::Eof
+        }
+        CallOutcome::Replied(Http2ConnectionReply::RequestChunk(RequestChunkReply::Error(_)))
+        | CallOutcome::Replied(Http2ConnectionReply::Report(_))
+        | CallOutcome::Replied(Http2ConnectionReply::RequestChunk(
+            RequestChunkReply::WebSocketSend(_),
+        ))
+        | CallOutcome::Replied(Http2ConnectionReply::RequestChunk(
+            RequestChunkReply::WebSocketReport(_),
+        )) => RequestChunkAction::Failed(GrpcStatus::new(GrpcStatusCode::Internal)),
+        CallOutcome::Full
+        | CallOutcome::Closed
+        | CallOutcome::Rejected(_)
+        | CallOutcome::Timeout => {
+            RequestChunkAction::Failed(GrpcStatus::new(GrpcStatusCode::DeadlineExceeded))
         }
     }
 }
@@ -1511,37 +1737,52 @@ fn decode_streaming_body<T: Message + Default>(
     Ok(messages)
 }
 
+/// Frame one protobuf message as a length-prefixed gRPC message in a fresh
+/// `Vec`. A convenience wrapper over [`encode_grpc_message_into`]; callers that
+/// frame several messages, or that reuse a scratch buffer across calls, should
+/// use `encode_grpc_message_into` to append into storage they own.
 pub fn encode_grpc_message<T: Message>(
     message: &T,
     limits: GrpcLimits,
 ) -> Result<Vec<u8>, GrpcError> {
-    let len = message.encoded_len();
-    if len > limits.max_message_bytes {
-        return Err(GrpcError::EncodeTooLarge {
-            len,
-            max: limits.max_message_bytes,
-        });
-    }
-    let mut out = Vec::with_capacity(GRPC_FRAME_HEADER_LEN + len);
-    out.push(0);
-    out.extend_from_slice(&(len as u32).to_be_bytes());
-    message.encode(&mut out).map_err(|_| GrpcError::BadFrame)?;
+    // Start empty so an over-cap message is rejected before any allocation;
+    // `encode_grpc_message_into` reserves the exact size after its cap check.
+    let mut out = Vec::new();
+    encode_grpc_message_into(&mut out, message, limits)?;
     Ok(out)
 }
 
-fn append_grpc_message<T: Message>(
+/// Append one length-prefixed gRPC message onto `out`, the reusable framing
+/// primitive. The caller owns `out` and may reuse its capacity across calls or
+/// pack several messages into one buffer (e.g. a buffered server-streaming
+/// body, or a client-streaming source that batches messages).
+///
+/// The message-size cap is enforced **before** any framing bytes are written,
+/// so an over-cap message fails with [`GrpcError::EncodeTooLarge`] and leaves
+/// `out` untouched.
+///
+/// The reuse helps for multi-message framing and caller-held scratch buffers. A
+/// single body that is moved into a message crossing an isolate boundary travels
+/// with the message and cannot be pool-reused.
+pub fn encode_grpc_message_into<T: Message>(
     out: &mut Vec<u8>,
     message: &T,
     limits: GrpcLimits,
 ) -> Result<(), GrpcError> {
     let len = message.encoded_len();
-    if len > limits.max_message_bytes {
-        return Err(GrpcError::EncodeTooLarge {
-            len,
-            max: limits.max_message_bytes,
-        });
+    // The gRPC length prefix is a 4-byte unsigned int, so the wire cap is
+    // u32::MAX no matter how large the configured limit is — checking only the
+    // configured cap would let an oversized message truncate its length on the
+    // wire. Enforce the smaller of the two.
+    let max = limits.max_message_bytes.min(u32::MAX as usize);
+    if len > max {
+        return Err(GrpcError::EncodeTooLarge { len, max });
     }
-    out.reserve(GRPC_FRAME_HEADER_LEN + len);
+    // Cap is satisfied (len <= u32::MAX), so the length cast below is exact and
+    // the framed size cannot overflow. Reserve only now, so no large buffer is
+    // allocated for an over-cap message.
+    let framed = GRPC_FRAME_HEADER_LEN + len;
+    out.reserve(framed);
     out.push(0);
     out.extend_from_slice(&(len as u32).to_be_bytes());
     message.encode(out).map_err(|_| GrpcError::BadFrame)
@@ -1913,6 +2154,17 @@ pub(crate) fn grpc_status_from_header_map(headers: &http::HeaderMap) -> Option<G
     Some(GrpcStatus { code, message })
 }
 
+/// Build a [`GrpcStatus`] from the compact wire facts captured by the HTTP/2
+/// client's gRPC-unary response path: a raw status code and the still
+/// percent-encoded message. The same percent-decode as the header-map path, so
+/// the compact and public client paths report identical status truth.
+pub(crate) fn grpc_status_from_compact(code: u16, raw_message: Option<&str>) -> GrpcStatus {
+    GrpcStatus {
+        code: GrpcStatusCode::from_u16(code),
+        message: raw_message.and_then(|m| percent_decode_grpc_message(m).ok()),
+    }
+}
+
 fn decode_grpc_status_trailers(block: &[u8]) -> Result<GrpcStatus, GrpcError> {
     let mut cursor = 0;
     let mut status = None;
@@ -2127,6 +2379,76 @@ mod tests {
                 .expect_err("message exceeds cap");
 
         assert!(matches!(err, GrpcError::EncodeTooLarge { max: 1, .. }));
+    }
+
+    #[test]
+    fn encode_grpc_message_into_rejects_over_cap_before_allocating() {
+        let limits = GrpcLimits {
+            max_message_bytes: 1,
+            ..Default::default()
+        };
+        let mut out = Vec::new();
+        let err = encode_grpc_message_into(&mut out, &Ping { value: u64::MAX }, limits)
+            .expect_err("message exceeds cap");
+        assert!(matches!(err, GrpcError::EncodeTooLarge { max: 1, .. }));
+        // The cap must bound real work: nothing framed, and — the bug this
+        // guards — no buffer reserved before the check.
+        assert!(out.is_empty());
+        assert_eq!(out.capacity(), 0, "must not allocate before the cap check");
+    }
+
+    #[test]
+    fn encode_grpc_message_rejects_over_cap() {
+        let limits = GrpcLimits {
+            max_message_bytes: 1,
+            ..Default::default()
+        };
+        let err = encode_grpc_message(&Ping { value: u64::MAX }, limits)
+            .expect_err("message exceeds cap");
+        assert!(matches!(err, GrpcError::EncodeTooLarge { max: 1, .. }));
+    }
+
+    // The gRPC length prefix is u32, so a message over u32::MAX cannot be framed
+    // even with a larger configured cap; it must be rejected, not truncated. The
+    // bug only exists where usize > u32, i.e. 64-bit targets.
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn encode_grpc_message_rejects_message_over_u32_wire_cap() {
+        #[derive(Debug, Default)]
+        struct HugeMessage;
+        impl Message for HugeMessage {
+            fn encode_raw(&self, _buf: &mut impl prost::bytes::BufMut) {
+                unreachable!("must be rejected before encoding");
+            }
+            fn merge_field(
+                &mut self,
+                _tag: u32,
+                _wire_type: prost::encoding::WireType,
+                _buf: &mut impl prost::bytes::Buf,
+                _ctx: prost::encoding::DecodeContext,
+            ) -> Result<(), prost::DecodeError> {
+                Ok(())
+            }
+            fn encoded_len(&self) -> usize {
+                (u32::MAX as usize) + 1
+            }
+            fn clear(&mut self) {}
+        }
+
+        // Configured cap is above the wire cap; the wire cap must still win.
+        let limits = GrpcLimits {
+            max_message_bytes: usize::MAX,
+            ..Default::default()
+        };
+        let mut out = Vec::new();
+        let err = encode_grpc_message_into(&mut out, &HugeMessage, limits)
+            .expect_err("message exceeds the u32 wire cap");
+        assert!(
+            matches!(err, GrpcError::EncodeTooLarge { max, .. } if max == u32::MAX as usize),
+            "must report the wire cap, got {err:?}"
+        );
+        assert!(out.is_empty());
+        assert_eq!(out.capacity(), 0, "must not allocate before rejecting");
     }
 
     #[test]

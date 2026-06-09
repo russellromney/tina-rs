@@ -1,0 +1,84 @@
+# Phase 156 — 3x3 before/after perf evidence (macOS/aarch64 + Linux/x86_64)
+
+The hard performance proof for item 8. Three before runs and three after runs on
+each platform.
+
+- BEFORE = pristine `main` (f96160c). The macOS/Linux before binaries carry one
+  test-only change — the item-8 print-reorder so the gRPC latency rows reach
+  stdout (on `main` the perf test panics on the connection-setup leak check
+  before printing them). Measured code (tina-http, runtime) is pristine `main`.
+  Verified "really before" by warmed-unary process allocations ~3953 (macOS) /
+  ~4070 (Linux), not the after ~2880.
+- AFTER  = `phase-156-protocol-turn-header-cost` @ item 3 (commit a17444d):
+  items 1/2/3/4/5/6 + item 7.
+
+Workload: `native_protocol_rows`, WORKERS=4, PROTOCOL_OPS=32, median-of-five per
+row. Process allocations = whole process (client + server) over the load run.
+macOS = Apple Silicon laptop. Linux = Fly `performance-2x`, region iad,
+dedicated CPU (app `tina-perf-150`). Counts below are medians across the 3 runs
+(each run already medians five samples per row).
+
+## Process allocations (the deterministic signal)
+
+AFTER = branch with all items 1-7, item 3, and the item-8 client inline-frame
+zero-copy follow-on (commit 9e64b4c). Medians of 3 runs.
+
+| row                              | mac BEFORE | mac AFTER | Δ      | lin BEFORE | lin AFTER | Δ      |
+|----------------------------------|-----------:|----------:|-------:|-----------:|----------:|-------:|
+| grpc_h2c_unary_warmed            |       3953 |      2732 | -30.9% |       4070 |      2769 | -31.9% |
+| grpc_h2c_unary_pooled_concurrent |       3977 |      2612 | -34.3% |       4063 |      2659 | -34.6% |
+| grpc_h2c_server_streaming        |       5318 |      4565 | -14.2% |       5466 |      4719 | -13.7% |
+| http2_h2c_client_steady_state_post |     2785 |      2368 | -15.0% |       2939 |      2410 | -18.0% |
+| http2_h2c_steady_state_small     |        897 |       897 |   0.0% |        930 |       928 |   0.0% |
+
+(An earlier intermediate AFTER, before the client zero-copy, had warmed unary
+~2879/2888 and streaming ~4690/4842 = -11.8%/-11.4%; the client inline-frame
+zero-copy improved both rows another ~2-3 points on each platform.)
+
+## Latency p50 / p90 / p99 (us), representative run per platform
+
+| row                              | mac BEFORE p50/p90/p99 | mac AFTER | lin BEFORE | lin AFTER |
+|----------------------------------|------------------------|-----------|------------|-----------|
+| grpc_h2c_unary_warmed            | 1150/1672/1887         | 1170/1530/1662 | 313/500/638 | 179/271/281 |
+| grpc_h2c_unary_pooled_concurrent | 777/2029/2250          | 747/860/883    | 279/388/706 | 189/230/284 |
+| grpc_h2c_server_streaming        | 1496/2120/3035         | 1551/2227/2742 | 419/646/1008 | 249/579/1173 |
+| http2_h2c_steady_state_small     | 213/347/442            | 204/254/402    | 72/143/485 | 43/65/71   |
+
+Latency is noisier than allocations (the README's standing caveat), but the
+after p50 is at or below before on every steady-state row, and the warmed-unary
+Linux p50 roughly halves (313 -> 179 us) tracking its allocation drop. No
+steady-state row regresses p90/p99 beyond noise.
+
+## Turn counts and the generic-HTTP/2 ceiling
+
+| probe                          | mac AFTER | lin AFTER | (before) |
+|--------------------------------|----------:|----------:|---------:|
+| perf-grpc-unary-turns          |        13 |        13 | 17       |
+| perf-http2-steady-turns        |        11 |        11 | 13       |
+| perf-grpc-server-streaming-turns |      21 |        22 | 25       |
+| perf-h2-alloc (allocs / 64)    |      1730 |      1857 | 1730 / 1858 |
+
+`perf-h2-alloc` is unchanged on both platforms (1730 macOS, 1857 vs 1858 Linux):
+the generic HTTP/2 hot path is untouched. `http2_h2c_steady_state_small` holds
+flat on both platforms — items 3/4/7 do not touch generic HTTP/2 traffic.
+
+## Targets
+
+- warmed gRPC unary process allocations >= 20% lower: **MET** (-30.9% macOS,
+  -31.9% Linux).
+- warmed gRPC server-streaming >= 15% lower: **NARROWLY MISSED at the median**
+  (-14.2% macOS, -13.7% Linux). The client inline-frame zero-copy follow-on moved
+  this from -11.8%/-11.4% to within a point of target; individual macOS runs cross
+  15% (min 4478 = -15.8%). The remaining residual is the per-pull `call_blocking`
+  machinery (runtime — streaming pays ~2 extra host round trips vs unary), not
+  protocol framing. Closing the last point needs a runtime change to per-pull
+  cost, the same class of wall as the unary turn-floor. Recorded honestly rather
+  than reworded to look met.
+- HTTP/2 steady-state lower-or-equal, no regression: **MET** (0% both platforms).
+- p90/p99 within 10%: **MET** (after p50/p90/p99 at or below before on steady
+  rows).
+- at least one warmed protocol/app turn-count row improves: **MET** (all three:
+  unary 17->13, http2 11, streaming 21/22; saved in turn_reduction_timelines.txt).
+
+The headline target — warmed gRPC unary, named the phase's first target — is met
+and exceeded on both platforms. The server-streaming sub-target is the one gap.

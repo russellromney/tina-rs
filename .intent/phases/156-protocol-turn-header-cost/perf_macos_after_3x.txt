@@ -1,0 +1,39 @@
+# Phase 156 — macOS/aarch64 AFTER (branch) perf evidence, 3 runs
+
+Machine: macOS/aarch64 (Apple Silicon laptop), `--release`.
+Branch: phase-156-protocol-turn-header-cost @ item 3 (commit a17444d), i.e. all
+of items 1/2/3/4/5/6 + item 7. Workload: `native_protocol_rows`, WORKERS=4,
+PROTOCOL_OPS=32, median-of-five per row. Process allocations = whole process
+(client + server) over the load run; RSS delta from getrusage.
+
+The `perf` (latency) line and `perf-process` (allocation/RSS) line now both print
+for every row including the gRPC rows (item-8 harness fix: print before assert).
+
+## Latency p50/p90/p99 (us), per run
+
+| row                                | r1 p50/p90/p99 | r2 p50/p90/p99 | r3 p50/p90/p99 |
+|------------------------------------|----------------|----------------|----------------|
+| http2_h2c_steady_state_small       | 245/464/517    | 204/254/402    | 234/315/356    |
+| http2_h2c_client_steady_state_post | 691/1488/1588  | 1342/36272/45153 | 608/730/806  |
+| grpc_h2c_unary_warmed              | 1450/1782/1882 | 1170/1530/1662 | 839/1070/1414  |
+| grpc_h2c_unary_pooled_concurrent   | 799/1042/1218  | 747/860/883    | 559/999/1163   |
+| grpc_h2c_server_streaming          | 1644/2682/3851 | 1551/2227/2742 | 1133/1315/1437 |
+| grpc_h2c_unary_close               | 940/1117/1178  | 1508/1895/2472 | 968/1165/1297  |
+
+(Connection-setup / keepalive latency swings run-to-run, as the README notes;
+the deterministic allocation counts below are the trustworthy signal.)
+
+## Process allocations (representative per-row medians across the 3 runs)
+
+| row                                | AFTER process allocs | RSS delta (kb, steady) |
+|------------------------------------|---------------------:|------------------------:|
+| http2_h2c_steady_state_small       |                  897 | ~0                      |
+| http2_h2c_client_steady_state_post |                ~2368 | ~0                      |
+| grpc_h2c_unary_warmed              |                ~2879 | ~0                      |
+| grpc_h2c_unary_pooled_concurrent   |                ~2737 | ~0                      |
+| grpc_h2c_server_streaming          |                ~4690 | ~0                      |
+| grpc_h2c_unary_close               |                ~3820 | ~0                      |
+
+`http2_h2c_steady_state_small` holds at 897 (896-897) across all three runs:
+generic HTTP/2 is untouched by items 3/4/7. Warmed gRPC unary lands ~2879 vs the
+saved main baseline of ~3949 (Note 4) = about -27% from main.

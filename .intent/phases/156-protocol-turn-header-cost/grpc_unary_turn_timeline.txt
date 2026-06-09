@@ -1,0 +1,85 @@
+# Warmed gRPC unary — runtime turn timeline (baseline)
+
+Probe: `perf-grpc-unary-turns` in
+`examples/systems/perf_native/tests/hotpath.rs`, driven by
+`grpc_unary_warmed_turn_report()` in the perf lib. One shared `ThreadedRuntime`
+carries the gRPC server, the gRPC router, and the native client, with a live
+`TraceObserver` armed only around one warmed steady-state unary call. "turn" =
+one `HandlerStarted` event — the same definition every other hotpath row uses.
+"svc-call" = a `CallDispatchAttempted` with `CallKind::IsolateCall` (a
+policy-boundary crossing into another isolate).
+
+macOS/aarch64 baseline (current branch: items 1/2/4/5/6):
+
+    perf-grpc-unary-turns handler_turns=17 service_calls=4
+      turn      isolate=IsolateId(8)
+      turn      isolate=IsolateId(1)
+      svc-call  isolate=IsolateId(1)
+      turn      isolate=IsolateId(11)
+      turn      isolate=IsolateId(11)
+      turn      isolate=IsolateId(12)
+      svc-call  isolate=IsolateId(12)
+      turn      isolate=IsolateId(9)
+      svc-call  isolate=IsolateId(9)
+      turn      isolate=IsolateId(12)
+      turn      isolate=IsolateId(9)
+      svc-call  isolate=IsolateId(9)
+      turn      isolate=IsolateId(12)
+      turn      isolate=IsolateId(9)
+      turn      isolate=IsolateId(12)
+      turn      isolate=IsolateId(11)
+      turn      isolate=IsolateId(12)
+      turn      isolate=IsolateId(12)
+      turn      isolate=IsolateId(11)
+      turn      isolate=IsolateId(12)
+      turn      isolate=IsolateId(11)
+
+## Reading it
+
+Reserved system isolates 1..=8 are the host-call dispatcher pool
+(`HOST_CALL_DISPATCHER_POOL_SIZE`). IsolateId(1)/(8) turns are the host-call fast
+lane delivering the host's `call_blocking` into the client connection — a runtime
+mechanism shared by every host call, optimized in earlier phases and out of this
+phase's protocol scope.
+
+The user isolates:
+- IsolateId(9): the native HTTP/2 **client** connection.
+- IsolateId(11): the gRPC **router** service isolate.
+- IsolateId(12): the HTTP/2 **server** connection.
+
+The 4 `svc-call` boundaries are exactly the policy crossings the plan says must
+stay visible:
+- host -> client connection (isolate 1 dispatch),
+- client connection -> ... and server connection -> gRPC router (isolates 9/12),
+  i.e. the I/O-hop calls and the service-isolate call.
+
+## Turn analysis (policy vs. non-policy)
+
+Of the 17 turns, the unavoidable policy/I-O turns are: the host-call delivery,
+the client write turn, the server read+dispatch turn, the gRPC router turn, the
+server write turn, and the client read+deliver turn. The remainder are
+**cross-thread I/O hops**: the client and server connections alternate
+(9 <-> 12) as TCP segments cross the loopback, each readiness wake costing a
+worker turn. Those are real socket round trips, not shape-conversion turns — the
+worker is awake (Phase 151) and each turn moves bytes.
+
+So warmed gRPC **unary** is dominated by genuine policy + I/O turns. There is no
+"convert shapes" continuation left to delete on the unary buffered path after
+item 2 removed the public-`HttpRequest` rebuild: the request is dispatched in the
+server-connection read turn and the response is framed in the router-reply turn.
+
+## What a real unary turn reduction would need (named primitive)
+
+To drop unary turns further without bypassing Tina isolation, the runtime would
+need a **same-worker protocol-service fast path**: when the gRPC router and the
+HTTP/2 server connection live on the same shard worker, deliver the decoded
+request to the router and pull its reply within the *same* worker turn instead of
+crossing the mailbox boundary as a separate dispatch — while still charging
+mailbox capacity, timeout, and the trace `IsolateCall` fact. That is a runtime
+scheduler primitive (co-located same-turn isolate call), not a protocol-code
+change, so it is out of this phase's scope. Until it exists, the honest unary
+floor is "one policy turn per boundary + one I/O turn per socket round trip,"
+which is what this timeline shows.
+
+The regression guard (`handler_turns <= 20`, `service_calls >= 4`) pins this
+baseline so a future change that re-adds a shape-conversion hop fails the probe.

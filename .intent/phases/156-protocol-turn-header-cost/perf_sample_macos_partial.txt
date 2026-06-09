@@ -1,0 +1,67 @@
+# Phase 156 — partial macOS/aarch64 allocation sample
+
+Representative single-batch sample, not the full 3x3 before/after proof the
+plan requires. It measures the movement from the build items landed so far
+(item 1: compact HPACK decode without public header construction; item 2: native
+gRPC streaming no longer rebuilds a public `HttpRequest`; item 5: reusable
+`GrpcStreamDecoder::push_into` output). Items 3/4/6/7 are NOT in this sample, so
+it is well short of the plan's 20%/15% warmed-gRPC targets, which assume those
+items land too.
+
+Machine: macOS/aarch64 (Apple Silicon laptop), `--release`.
+Workload: `native_protocol_rows_are_printable_and_bounded`,
+WORKERS=4, PROTOCOL_OPS=32, median-of-five sampling per row.
+Counter: whole-process allocations (client + server) over the load run, so
+server-side decode savings are visible (unlike the client-side load-allocation
+count).
+
+BEFORE = pristine `main` (f96160c).
+AFTER  = `main` + items 1, 2, 4, 5, 6.
+
+| row                                      | BEFORE (process allocs) | AFTER  | delta         |
+|------------------------------------------|------------------------:|-------:|--------------:|
+| grpc_h2c_unary_warmed                    | ~3949 (3936-3981)       | ~3313 (3303-3341) | **-636 (-16.1%)** |
+| grpc_h2c_unary_close                     | ~4278 (4268-4284)       | ~4162 (4145-4177) | -116 (-2.7%)  |
+| grpc_h2c_server_streaming_steady_state   | ~5296 (5249-5333)       | ~5098 (5083-5134) | -198 (-3.7%)  |
+| http2_h2c_steady_state_small             | 896 (895-897)           | 897 (896-897)     |  ~0 (no regression) |
+
+(Intermediate: items 1+2+5 alone put warmed unary at ~3835; item 4 — the compact
+client response path — drops it the rest of the way to ~3313.)
+
+Where the warmed-unary win comes from, per-op (PROTOCOL_OPS=32, ~20 fewer
+allocations/op):
+- Item 4 (largest): the HTTP/2 client no longer builds `response_headers` /
+  `response_trailers` `HeaderMap`s for a `SubmitGrpcUnary` stream. It decodes the
+  response head/trailers compactly (`grpc-status`/`grpc-message`/status facts)
+  and completes with `Http2ClientOutcome::GrpcUnaryReplied`. That removes the
+  per-response head map, the trailer map, and the head double-clone
+  (`apply_response_headers` previously cloned each decoded header into a second
+  map).
+- Item 1: compact inbound header decode (server side) builds zero public
+  `HeaderName`/`HeaderValue` for content-type + te.
+- Item 5: one reused output `Vec` across server-streaming response chunks.
+- http2_h2c_steady_state_small is unchanged: the plain HTTP/2 service path keeps
+  the public decode and its `HeaderMap`. Required — items 1/4 must not touch
+  generic HTTP/2 traffic. Item 4 is gated strictly on `SubmitGrpcUnary` streams.
+
+Item 2 (native gRPC streaming no longer routes through a public `HttpRequest`)
+is NOT quantified by these rows: the existing perf rows exercise unary and
+buffered-server-streaming, not the client-streaming / bidi / raw / true-streaming
+shapes whose dispatch item 2 changed. Item 2's proof is structural and e2e: the
+`GrpcHttp2Request::into_http_request` rebuild is deleted, streaming/raw routes
+gained compact `call_http2` entry points, pending streamed requests now hold
+compact gRPC state (not an `HttpRequest`), and the full gRPC suite — incl.
+`grpc_client_streaming_*`, `grpc_streaming_*`, `grpc_streaming_raw_*`,
+`bidi_*` — stays green.
+
+Note (pre-existing, not from this work): on macOS the perf test
+`native_protocol_rows_are_printable_and_bounded` panics at the `leak_clean`
+assertion for the `http2_h2c_close_request` connection-setup row, which reports
+`leak=unchecked`. This reproduces on pristine `main` (f96160c) with all phase
+changes stashed, so it is a pre-existing macOS quirk of that row's leak check,
+unrelated to Phase 156. The per-row allocation/latency lines still print before
+the panic, which is where the numbers above come from.
+
+This is local/alpha movement, in the right direction, with no regression. It is
+NOT a production performance claim and does NOT meet the phase's hard targets;
+those need the remaining build items and the macOS+Linux 3x3 evidence.

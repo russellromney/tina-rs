@@ -1,0 +1,199 @@
+# Warmed protocol turn reduction — before/after timelines
+
+Probe: the `perf-grpc-unary-turns`, `perf-http2-steady-turns`, and
+`perf-grpc-server-streaming-turns` rows in
+`examples/systems/perf_native/tests/hotpath.rs`, driven by
+`grpc_unary_warmed_turn_report()`, `http2_steady_state_turn_report()`, and
+`grpc_server_streaming_turn_report()` in the perf lib. Each runs one warmed
+steady-state call on a single `ThreadedRuntime` carrying the server, the service
+(gRPC router or body service), and the native/Tina client, with a live
+`TraceObserver` armed only around the measured call.
+
+"turn" = one `HandlerStarted` event — the same definition every hotpath row and
+the original unary baseline use. "svc-call" = a `CallDispatchAttempted` with
+`CallKind::IsolateCall` (a policy-boundary crossing). The turn definition is
+identical on both sides of this before/after.
+
+The change measured here (in `tina-http/src/http2/server.rs`):
+- `handle_service_returned` now flushes deferred request-window credit into the
+  same write batch as the response, instead of leaving it for `handle_wrote`.
+- `write_more` coalesces every queued frame into one socket write.
+- `handle_wrote`'s force-flush became a fallback for credit that turns pending
+  only after the response left (streamed bodies).
+
+Result: the connection window-update no longer forces a second write (and a
+second write-completion turn) after the response write. Both the client and the
+server connection drop their post-response flush hop, and the I/O wakes those
+extra writes caused vanish too.
+
+macOS/aarch64:
+
+| row                              | turns BEFORE | turns AFTER | svc-calls |
+|----------------------------------|-------------:|------------:|----------:|
+| grpc_h2c_unary_warmed            |           17 |          13 |         4 |
+| http2_h2c_steady_state_small     |           13 |          11 |         2 |
+| grpc_h2c_server_streaming        |           25 |          21 |         6 |
+
+The 4 unary / 2 http2 / 6 streaming service-isolate calls are unchanged: every
+policy boundary the plan requires (host->client, server->service, the I/O-hop
+calls) still crosses the mailbox. No isolation boundary was bypassed.
+
+## gRPC unary — BEFORE (17 turns, 4 svc-calls)
+
+    turn      isolate=IsolateId(8)
+    turn      isolate=IsolateId(1)
+    svc-call  isolate=IsolateId(1)
+    turn      isolate=IsolateId(11)
+    turn      isolate=IsolateId(11)
+    turn      isolate=IsolateId(12)
+    svc-call  isolate=IsolateId(12)
+    turn      isolate=IsolateId(9)
+    svc-call  isolate=IsolateId(9)
+    turn      isolate=IsolateId(12)
+    turn      isolate=IsolateId(9)
+    svc-call  isolate=IsolateId(9)
+    turn      isolate=IsolateId(12)
+    turn      isolate=IsolateId(9)
+    turn      isolate=IsolateId(12)
+    turn      isolate=IsolateId(11)
+    turn      isolate=IsolateId(12)
+    turn      isolate=IsolateId(12)
+    turn      isolate=IsolateId(11)
+    turn      isolate=IsolateId(12)
+    turn      isolate=IsolateId(11)
+
+## gRPC unary — AFTER (13 turns, 4 svc-calls)
+
+    turn      isolate=IsolateId(8)
+    turn      isolate=IsolateId(1)
+    svc-call  isolate=IsolateId(1)
+    turn      isolate=IsolateId(11)
+    turn      isolate=IsolateId(11)
+    turn      isolate=IsolateId(12)
+    svc-call  isolate=IsolateId(12)
+    turn      isolate=IsolateId(9)
+    svc-call  isolate=IsolateId(9)
+    turn      isolate=IsolateId(12)
+    turn      isolate=IsolateId(9)
+    svc-call  isolate=IsolateId(9)
+    turn      isolate=IsolateId(12)
+    turn      isolate=IsolateId(9)
+    turn      isolate=IsolateId(12)
+    turn      isolate=IsolateId(11)
+    turn      isolate=IsolateId(12)
+
+## HTTP/2 small steady-state — BEFORE (13 turns, 2 svc-calls)
+
+    turn      isolate=IsolateId(8)
+    turn      isolate=IsolateId(1)
+    svc-call  isolate=IsolateId(1)
+    turn      isolate=IsolateId(11)
+    turn      isolate=IsolateId(11)
+    turn      isolate=IsolateId(12)
+    svc-call  isolate=IsolateId(12)
+    turn      isolate=IsolateId(9)
+    turn      isolate=IsolateId(11)
+    turn      isolate=IsolateId(12)
+    turn      isolate=IsolateId(11)
+    turn      isolate=IsolateId(12)
+    turn      isolate=IsolateId(12)
+    turn      isolate=IsolateId(11)
+    turn      isolate=IsolateId(12)
+
+## HTTP/2 small steady-state — AFTER (11 turns, 2 svc-calls)
+
+    turn      isolate=IsolateId(8)
+    turn      isolate=IsolateId(1)
+    svc-call  isolate=IsolateId(1)
+    turn      isolate=IsolateId(11)
+    turn      isolate=IsolateId(11)
+    turn      isolate=IsolateId(12)
+    svc-call  isolate=IsolateId(12)
+    turn      isolate=IsolateId(9)
+    turn      isolate=IsolateId(12)
+    turn      isolate=IsolateId(11)
+    turn      isolate=IsolateId(12)
+    turn      isolate=IsolateId(12)
+    turn      isolate=IsolateId(11)
+
+## gRPC server-streaming — BEFORE (25 turns, 6 svc-calls)
+
+    turn      isolate=IsolateId(8)
+    turn      isolate=IsolateId(1)
+    svc-call  isolate=IsolateId(1)
+    turn      isolate=IsolateId(11)
+    turn      isolate=IsolateId(11)
+    turn      isolate=IsolateId(12)
+    svc-call  isolate=IsolateId(12)
+    turn      isolate=IsolateId(9)
+    svc-call  isolate=IsolateId(9)
+    turn      isolate=IsolateId(12)
+    turn      isolate=IsolateId(9)
+    svc-call  isolate=IsolateId(9)
+    turn      isolate=IsolateId(12)
+    turn      isolate=IsolateId(9)
+    turn      isolate=IsolateId(12)
+    turn      isolate=IsolateId(11)
+    turn      isolate=IsolateId(12)
+    turn      isolate=IsolateId(11)
+    turn      isolate=IsolateId(12)
+    turn      isolate=IsolateId(11)
+    turn      isolate=IsolateId(12)
+    turn      isolate=IsolateId(1)
+    turn      isolate=IsolateId(2)
+    svc-call  isolate=IsolateId(2)
+    turn      isolate=IsolateId(11)
+    turn      isolate=IsolateId(2)
+    turn      isolate=IsolateId(11)
+    turn      isolate=IsolateId(12)
+    turn      isolate=IsolateId(3)
+    svc-call  isolate=IsolateId(3)
+    turn      isolate=IsolateId(11)
+
+## gRPC server-streaming — AFTER (21 turns, 6 svc-calls)
+
+    turn      isolate=IsolateId(8)
+    turn      isolate=IsolateId(1)
+    svc-call  isolate=IsolateId(1)
+    turn      isolate=IsolateId(11)
+    turn      isolate=IsolateId(11)
+    turn      isolate=IsolateId(12)
+    svc-call  isolate=IsolateId(12)
+    turn      isolate=IsolateId(9)
+    svc-call  isolate=IsolateId(9)
+    turn      isolate=IsolateId(12)
+    turn      isolate=IsolateId(9)
+    svc-call  isolate=IsolateId(9)
+    turn      isolate=IsolateId(12)
+    turn      isolate=IsolateId(9)
+    turn      isolate=IsolateId(12)
+    turn      isolate=IsolateId(11)
+    turn      isolate=IsolateId(12)
+    turn      isolate=IsolateId(1)
+    turn      isolate=IsolateId(2)
+    svc-call  isolate=IsolateId(2)
+    turn      isolate=IsolateId(11)
+    turn      isolate=IsolateId(2)
+    turn      isolate=IsolateId(11)
+    turn      isolate=IsolateId(3)
+    svc-call  isolate=IsolateId(3)
+    turn      isolate=IsolateId(12)
+    turn      isolate=IsolateId(11)
+
+## Reading it
+
+Isolates 1..=8 are the host-call dispatcher pool. User isolates:
+- IsolateId(9): the gRPC router / body service.
+- IsolateId(11): the client connection.
+- IsolateId(12): the HTTP/2 server connection.
+
+The dropped turns are the deferred connection window-update writes. Before, the
+server wrote the response, took a `Wrote` turn, force-flushed the small request
+window credit as a *separate* write, and took a second `Wrote` turn; the client
+mirrored this. After, the window-update rides the response write, so each side
+loses one write and the I/O wake it triggered.
+
+The regression guards (`grpc unary handler_turns <= 15`, `http2 steady <= 13`,
+`server-streaming <= 23`, and the unchanged `service_calls` floors) pin these
+post-change baselines so a future change that re-adds a write/flush hop fails the
+probe.

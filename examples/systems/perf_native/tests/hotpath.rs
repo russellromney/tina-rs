@@ -25,7 +25,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use perf_native::{
-    count_all_allocations, http2_steady_state_response_process_allocations,
+    count_all_allocations, grpc_server_streaming_turn_report, grpc_unary_warmed_turn_report,
+    http2_steady_state_response_process_allocations, http2_steady_state_turn_report,
     websocket_text_round_trip_app_turns,
 };
 use tina::IsolateId;
@@ -91,17 +92,18 @@ const HTTP_STEADY_STAGE_CEILING: usize = 36;
 //
 // The count is dominated by the Rust code path (one `alloc` per `Vec`, and the
 // perf allocator counts each `Vec` growth realloc too) and is stable across
-// repeated runs on this toolchain. The arc, on macOS/aarch64:
-//   Phase 152 (one fewer DATA copy):           3075 (48.05/request)
-//   Phase 153 leaf copies (body clone gone):   3011 (47.05/request)
-//   Phase 153 structural (decode + coalesce):  2626 (41.03/request)
-//   Phase 153 header encode (presize + itoa):  2434 (38.03/request)
+// repeated runs on this toolchain. The arc that brought it down, on
+// macOS/aarch64:
+//   one fewer DATA copy:           3075 (48.05/request)
+//   body clone gone:               3011 (47.05/request)
+//   borrowed decode + coalesce:    2626 (41.03/request)
+//   presized header encode + itoa: 2434 (38.03/request)
 // The structural work removed the inbound HEADERS frame-decode `Vec` (the read
 // loop decodes from a borrowed buffer slice), coalesced the response HEADERS +
 // DATA into one queued write (per-frame encode `Vec`s and a write turn gone),
 // and pre-sized the response header block while formatting content-length into
 // a stack buffer (no growth reallocs, no `String`): ~10 fewer allocations per
-// request, ~20.8% off the Phase 152 baseline. The ceiling sits just above the
+// request, ~20.8% off the starting point. The ceiling sits just above the
 // measured 2434 so a regression that re-adds a per-request allocation fails,
 // with headroom for toolchain/std drift. Regression guard, not a cross-platform
 // invariant. Linux/x86_64 has a slightly higher steady count on the same code
@@ -111,11 +113,11 @@ const H2_BUFFERED_RESPONSE_ALLOC_CEILING_MACOS_AARCH64: u64 = 2_480;
 const H2_BUFFERED_RESPONSE_ALLOC_CEILING_LINUX_X86_64: u64 = 2_640;
 const H2_BUFFERED_RESPONSE_ALLOC_CEILING_OTHER: u64 = 2_800;
 const H2_BUFFERED_RESPONSE_REQUESTS: usize = 64;
-// Rock 5 (fewer turns): a WebSocket session of N text round trips. The
-// duplicate-delivery removal means the connection owner emits one app event per
-// wire event, so total app deliveries for the session are far below the old
-// `2 * N` text turns alone. The ceiling sits below `2 * N` so the pre-dedup
-// path (which delivered a session-rich AND a legacy event per frame) fails.
+// Fewer turns: a WebSocket session of N text round trips. The duplicate-delivery
+// removal means the connection owner emits one app event per wire event, so
+// total app deliveries for the session are far below the old `2 * N` text turns
+// alone. The ceiling sits below `2 * N` so the pre-dedup path (which delivered a
+// session-rich AND a legacy event per frame) fails.
 const WS_TURN_PROBE_MESSAGES: usize = 64;
 
 type Runtime = ThreadedRuntime<SingleShard, DefaultThreadedMailboxFactory>;
@@ -1319,7 +1321,7 @@ fn hotpath_probes_report_and_stay_bounded() {
         CALL_PROCESS_ALLOCATIONS_CEILING
     );
 
-    // Phase 152 buffered-response framing: whole-process allocations for warmed
+    // Buffered-response framing: whole-process allocations for warmed
     // h2c responses on a reused connection. Runs here (single-test binary) so
     // the process counter is not contaminated by a parallel test thread.
     let h2_buffered_allocs =
@@ -1335,7 +1337,7 @@ fn hotpath_probes_report_and_stay_bounded() {
         "h2c buffered response allocations {h2_buffered_allocs} exceeded ceiling {h2_alloc_ceiling} ({per_request:.2}/request)",
     );
 
-    // Rock 5: app-handler turns for a WebSocket session of N text round trips.
+    // App-handler turns for a WebSocket session of N text round trips.
     // With one session-rich event per wire event, the whole session (open +
     // N texts + close) costs ~N+a-few app turns; the pre-dedup path delivered a
     // session-rich AND a legacy event for every wire frame, so its text turns
@@ -1355,4 +1357,86 @@ fn hotpath_probes_report_and_stay_bounded() {
         ws_app_turns < turn_ceiling,
         "WebSocket app turns {ws_app_turns} not below the pre-dedup 2*N={turn_ceiling}; duplicate delivery may have returned",
     );
+
+    // Runtime turns one warmed unary call costs across client, server, and the
+    // gRPC router (one shared runtime). Same `HandlerStarted` definition as
+    // every other hotpath row.
+    let grpc_turns = grpc_unary_warmed_turn_report().expect("measure warmed grpc unary turns");
+    println!(
+        "perf-grpc-unary-turns handler_turns={} service_calls={}",
+        grpc_turns.handler_turns, grpc_turns.service_calls
+    );
+    for line in &grpc_turns.timeline {
+        println!("  {line}");
+    }
+    // The four service-isolate calls are policy boundaries and must stay.
+    assert!(
+        grpc_turns.service_calls >= 4,
+        "warmed gRPC unary must keep its policy-boundary service calls: {} < 4",
+        grpc_turns.service_calls,
+    );
+    // Ceiling on total turns: catches a change that adds protocol/runtime hops.
+    // Folding the post-response window-update into the response write dropped the
+    // warmed baseline from 17 to 13 (macOS) / ~12 (Linux); the ceiling locks that
+    // in while leaving headroom for the small cross-platform I/O-hop difference.
+    assert!(
+        grpc_turns.handler_turns <= 15,
+        "warmed gRPC unary handler turns {} exceeded the ceiling of 15",
+        grpc_turns.handler_turns,
+    );
+
+    // Runtime turns one warmed HTTP/2 small steady-state call costs across the
+    // Tina client and the HTTP/2 server (one shared runtime). Same definition.
+    let http2_turns =
+        http2_steady_state_turn_report().expect("measure warmed http2 steady-state turns");
+    println!(
+        "perf-http2-steady-turns handler_turns={} service_calls={}",
+        http2_turns.handler_turns, http2_turns.service_calls
+    );
+    for line in &http2_turns.timeline {
+        println!("  {line}");
+    }
+    // The service-isolate call (server connection -> body service) is a policy
+    // boundary and must stay.
+    assert!(
+        http2_turns.service_calls >= 1,
+        "warmed HTTP/2 steady-state must keep its policy-boundary service call: {} < 1",
+        http2_turns.service_calls,
+    );
+    // Ceiling on total turns. After folding the post-response window-update flush
+    // into the response write, the warmed steady-state turn count dropped; this
+    // guard fails if a shape-conversion or deferred-flush hop is re-added.
+    assert!(
+        http2_turns.handler_turns <= HTTP2_STEADY_TURN_CEILING,
+        "warmed HTTP/2 steady-state handler turns {} exceeded the ceiling of {HTTP2_STEADY_TURN_CEILING}",
+        http2_turns.handler_turns,
+    );
+
+    // Runtime turns one warmed gRPC server-streaming exchange costs across the
+    // native client, the server, and the gRPC router (one shared runtime).
+    let stream_turns =
+        grpc_server_streaming_turn_report().expect("measure warmed grpc server-streaming turns");
+    println!(
+        "perf-grpc-server-streaming-turns handler_turns={} service_calls={}",
+        stream_turns.handler_turns, stream_turns.service_calls
+    );
+    for line in &stream_turns.timeline {
+        println!("  {line}");
+    }
+    assert!(
+        stream_turns.service_calls >= 1,
+        "warmed gRPC server-streaming must keep its policy-boundary service call: {} < 1",
+        stream_turns.service_calls,
+    );
+    assert!(
+        stream_turns.handler_turns <= GRPC_STREAM_TURN_CEILING,
+        "warmed gRPC server-streaming handler turns {} exceeded the ceiling of {GRPC_STREAM_TURN_CEILING}",
+        stream_turns.handler_turns,
+    );
 }
+
+// Turn ceilings for the warmed HTTP/2 / gRPC-streaming probes. Set with headroom
+// above the measured post-change baselines so run-to-run noise does not flake the
+// guard, but tight enough that re-adding a protocol/runtime hop fails the test.
+const HTTP2_STEADY_TURN_CEILING: u64 = 13;
+const GRPC_STREAM_TURN_CEILING: u64 = 23;

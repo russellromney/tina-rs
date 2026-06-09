@@ -49,19 +49,21 @@ use super::errors::{
     ERR_CANCEL, ERR_FLOW_CONTROL_ERROR, ERR_FRAME_SIZE_ERROR, ERR_NO_ERROR, ERR_PROTOCOL_ERROR,
     ERR_SETTINGS_ERROR, ERR_STREAM_CLOSED, Http2ProtocolError, classify_h2_reset,
 };
+#[cfg(test)]
+use super::frame::try_decode_frame;
 use super::frame::{
     CLIENT_PREFACE, DEFAULT_WINDOW, FLAG_ACK, FLAG_END_HEADERS, FLAG_END_STREAM, FRAME_DATA,
     FRAME_GOAWAY, FRAME_HEADER_LEN, FRAME_HEADERS, FRAME_PING, FRAME_RST_STREAM, FRAME_SETTINGS,
     FRAME_WINDOW_UPDATE, Frame, READ_CHUNK, WINDOW_CREDIT_FLUSH_THRESHOLD, add_window, data_frame,
-    goaway_frame, headers_frame, headers_payload, into_data_payload, push_frame_header,
-    push_setting, rst_stream_frame, settings_frame, try_decode_frame, window_update_frame,
+    goaway_frame, headers_frame, headers_payload_view, into_data_payload, push_frame_header,
+    push_setting, rst_stream_frame, settings_frame, try_decode_frame_meta, window_update_frame,
 };
 use super::headers::{
     DEFAULT_HEADER_TABLE_SIZE, HeaderBlock, MAX_MAX_FRAME_SIZE, MIN_MAX_FRAME_SIZE,
     SETTINGS_ENABLE_PUSH, SETTINGS_HEADER_TABLE_SIZE, SETTINGS_INITIAL_WINDOW_SIZE,
     SETTINGS_MAX_CONCURRENT_STREAMS, SETTINGS_MAX_FRAME_SIZE, SETTINGS_MAX_HEADER_LIST_SIZE,
-    decode_headers_block_with, encode_literal_header, validate_response_headers,
-    validate_trailer_block,
+    decode_headers_block_compact_with, decode_headers_block_with, encode_literal_header,
+    validate_response_headers, validate_trailer_block,
 };
 use super::target::Http2Target;
 
@@ -74,8 +76,6 @@ enum ClientStream {
     Tcp(StreamId),
     Tls(TlsStreamId),
 }
-
-const CLIENT_WRITE_COALESCE_LIMIT: usize = 64 * 1024;
 
 fn tls_read_reply_to_tcp(reply: TlsReadBufReply) -> TcpReadBufReply {
     TcpReadBufReply {
@@ -183,6 +183,18 @@ pub struct Http2ClientReport {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Http2ClientOutcome {
     Replied(Http2ClientResponse),
+    /// The buffered response to an [`Http2ClientMsg::SubmitGrpcUnary`] call,
+    /// decoded compactly into gRPC facts — no public `HeaderMap`. `grpc_status`
+    /// is the raw wire code (from trailers, or from headers for a trailers-only
+    /// response) and `grpc_message` is the still-percent-encoded message, if
+    /// any. Generic HTTP/2 callers keep the full-header [`Replied`](Self::Replied)
+    /// outcome.
+    GrpcUnaryReplied {
+        status: StatusCode,
+        grpc_status: Option<u16>,
+        grpc_message: Option<String>,
+        body: Vec<u8>,
+    },
     /// The response head of an [`Http2ClientMsg::OpenStream`] call: the
     /// stream opened and the response status + headers arrived. Pull the
     /// body with [`Http2ClientMsg::ResponseNext`] using `stream_id`.
@@ -599,6 +611,15 @@ struct ActiveClientStream {
     /// uses `response_body.len()`; the streamed path drains its chunks, so it
     /// needs its own running counter to tell the same content-length truth.
     response_body_received: usize,
+    /// True for a stream opened by [`Http2ClientMsg::SubmitGrpcUnary`]. Such a
+    /// stream decodes its response head/trailers compactly (gRPC facts only, no
+    /// public `HeaderMap`) and completes with
+    /// [`Http2ClientOutcome::GrpcUnaryReplied`].
+    grpc_unary: bool,
+    /// Compact gRPC response facts, captured for a `grpc_unary` stream instead
+    /// of building `response_headers`/`response_trailers`.
+    grpc_status: Option<u16>,
+    grpc_message: Option<String>,
 }
 
 impl ActiveClientStream {
@@ -633,6 +654,9 @@ impl ActiveClientStream {
             response_pull: None,
             response_eof: false,
             response_body_received: 0,
+            grpc_unary: false,
+            grpc_status: None,
+            grpc_message: None,
         }
     }
 
@@ -716,6 +740,11 @@ pub struct Http2ClientConnection<S: Shard + 'static> {
     next_stream_id: u32,
     read_buf: Vec<u8>,
     read_scratch: Vec<u8>,
+    /// Reused buffer for inline (non-DATA) inbound frame payloads, so decoding
+    /// HEADERS/SETTINGS/WINDOW_UPDATE/etc. does not allocate a fresh `Vec` per
+    /// frame. DATA frames keep their own owned buffer (they are queued for the
+    /// caller to pull and must outlive this scratch).
+    frame_scratch: Vec<u8>,
     hpack_decoder: hpack::Decoder<'static>,
     preface_sent: bool,
     peer_initial_stream_window: i32,
@@ -793,6 +822,7 @@ impl<S: Shard + 'static> Http2ClientConnection<S> {
             next_stream_id: 1,
             read_buf: Vec::new(),
             read_scratch: Vec::new(),
+            frame_scratch: Vec::new(),
             hpack_decoder: hpack::Decoder::new(),
             preface_sent: false,
             peer_initial_stream_window: DEFAULT_WINDOW,
@@ -1298,6 +1328,8 @@ impl<S: Shard + 'static> Http2ClientConnection<S> {
             req.body.into_outbound(),
         );
         stream.request_end_sent = end_stream;
+        // Decode this stream's response compactly into gRPC facts.
+        stream.grpc_unary = true;
         self.report.opened_streams += 1;
         effects.push(emit_fact(ProtocolFact::Http2StreamOpened {
             connection: self.connection_fact_id(),
@@ -1818,15 +1850,43 @@ impl<S: Shard + 'static> Http2ClientConnection<S> {
         let mut effects: Vec<Effect<Self>> = Vec::new();
         let max_frame_size = self.limits.max_frame_size;
         loop {
-            match try_decode_frame(&self.read_buf, max_frame_size) {
-                Ok(Some((frame, used))) => {
-                    self.read_buf.drain(..used);
-                    if let Err(err) = self.handle_frame(frame, &mut effects) {
-                        return self.protocol_error(err, effects);
-                    }
-                }
+            let meta = match try_decode_frame_meta(&self.read_buf, max_frame_size) {
+                Ok(Some(meta)) => meta,
                 Ok(None) => break,
                 Err(err) => return self.protocol_error(err, effects),
+            };
+            let body = FRAME_HEADER_LEN..meta.total;
+            let result = if meta.ty == FRAME_DATA {
+                // DATA is buffered for the caller to pull and must outlive the
+                // read buffer, so it owns a fresh payload `Vec`.
+                let payload = self.read_buf[body].to_vec();
+                self.read_buf.drain(..meta.total);
+                let frame = Frame {
+                    ty: meta.ty,
+                    flags: meta.flags,
+                    stream_id: meta.stream_id,
+                    payload,
+                };
+                self.handle_data(frame, &mut effects)
+            } else {
+                // Inline frames are decoded now and discarded, so they reuse one
+                // connection-owned scratch buffer instead of allocating per frame.
+                let mut scratch = std::mem::take(&mut self.frame_scratch);
+                scratch.clear();
+                scratch.extend_from_slice(&self.read_buf[body]);
+                self.read_buf.drain(..meta.total);
+                let result = self.handle_inline_frame(
+                    meta.ty,
+                    meta.flags,
+                    meta.stream_id,
+                    &scratch,
+                    &mut effects,
+                );
+                self.frame_scratch = scratch;
+                result
+            };
+            if let Err(err) = result {
+                return self.protocol_error(err, effects);
             }
         }
         if self.pending_recv_window_credit >= WINDOW_CREDIT_FLUSH_THRESHOLD {
@@ -1843,19 +1903,23 @@ impl<S: Shard + 'static> Http2ClientConnection<S> {
         batch(effects)
     }
 
-    fn handle_frame(
+    /// Dispatch an inline (non-DATA) frame from a borrowed payload. DATA is
+    /// handled separately on an owned path because it is queued for the caller.
+    fn handle_inline_frame(
         &mut self,
-        frame: Frame,
+        ty: u8,
+        flags: u8,
+        stream_id: u32,
+        payload: &[u8],
         effects: &mut Vec<Effect<Self>>,
     ) -> Result<(), Http2ProtocolError> {
-        match frame.ty {
-            FRAME_SETTINGS => self.handle_settings(frame),
-            FRAME_HEADERS => self.handle_headers(frame, effects),
-            FRAME_DATA => self.handle_data(frame, effects),
-            FRAME_WINDOW_UPDATE => self.handle_window_update(frame),
-            FRAME_RST_STREAM => self.handle_rst_stream(frame, effects),
-            FRAME_PING => self.handle_ping(frame),
-            FRAME_GOAWAY => self.handle_goaway(frame, effects),
+        match ty {
+            FRAME_SETTINGS => self.handle_settings(flags, stream_id, payload),
+            FRAME_HEADERS => self.handle_headers(flags, stream_id, payload, effects),
+            FRAME_WINDOW_UPDATE => self.handle_window_update(stream_id, payload),
+            FRAME_RST_STREAM => self.handle_rst_stream(stream_id, payload, effects),
+            FRAME_PING => self.handle_ping(flags, stream_id, payload),
+            FRAME_GOAWAY => self.handle_goaway(stream_id, payload, effects),
             _ => Ok(()),
         }
     }
@@ -1870,29 +1934,21 @@ impl<S: Shard + 'static> Http2ClientConnection<S> {
     /// already-processed streams settle.
     fn handle_goaway(
         &mut self,
-        frame: Frame,
+        stream_id: u32,
+        payload: &[u8],
         effects: &mut Vec<Effect<Self>>,
     ) -> Result<(), Http2ProtocolError> {
-        if frame.stream_id != 0 {
+        if stream_id != 0 {
             return Err(Http2ProtocolError::BadStreamId);
         }
         // last_stream_id (4) + error code (4); additional debug data is
         // allowed and ignored.
-        if frame.payload.len() < 8 {
+        if payload.len() < 8 {
             return Err(Http2ProtocolError::BadFrameLength);
         }
-        let last_stream_id = u32::from_be_bytes([
-            frame.payload[0] & 0x7f,
-            frame.payload[1],
-            frame.payload[2],
-            frame.payload[3],
-        ]);
-        let error_code = u32::from_be_bytes([
-            frame.payload[4],
-            frame.payload[5],
-            frame.payload[6],
-            frame.payload[7],
-        ]);
+        let last_stream_id =
+            u32::from_be_bytes([payload[0] & 0x7f, payload[1], payload[2], payload[3]]);
+        let error_code = u32::from_be_bytes([payload[4], payload[5], payload[6], payload[7]]);
         self.goaway_received = true;
         self.report.goaway_received += 1;
         // Fail every stream the peer did not process (id > last_stream_id).
@@ -1919,20 +1975,25 @@ impl<S: Shard + 'static> Http2ClientConnection<S> {
         Ok(())
     }
 
-    fn handle_settings(&mut self, frame: Frame) -> Result<(), Http2ProtocolError> {
-        if frame.stream_id != 0 {
+    fn handle_settings(
+        &mut self,
+        flags: u8,
+        stream_id: u32,
+        payload: &[u8],
+    ) -> Result<(), Http2ProtocolError> {
+        if stream_id != 0 {
             return Err(Http2ProtocolError::BadStreamId);
         }
-        if frame.flags & FLAG_ACK != 0 {
-            if !frame.payload.is_empty() {
+        if flags & FLAG_ACK != 0 {
+            if !payload.is_empty() {
                 return Err(Http2ProtocolError::BadFrameLength);
             }
             return Ok(());
         }
-        if frame.payload.len() % 6 != 0 {
+        if payload.len() % 6 != 0 {
             return Err(Http2ProtocolError::BadFrameLength);
         }
-        for setting in frame.payload.chunks_exact(6) {
+        for setting in payload.chunks_exact(6) {
             let id = u16::from_be_bytes([setting[0], setting[1]]);
             let value = u32::from_be_bytes([setting[2], setting[3], setting[4], setting[5]]);
             self.apply_setting(id, value)?;
@@ -1987,31 +2048,52 @@ impl<S: Shard + 'static> Http2ClientConnection<S> {
 
     fn handle_headers(
         &mut self,
-        frame: Frame,
+        flags: u8,
+        stream_id: u32,
+        frame_payload: &[u8],
         effects: &mut Vec<Effect<Self>>,
     ) -> Result<(), Http2ProtocolError> {
-        if frame.stream_id == 0 || frame.stream_id % 2 == 0 {
+        if stream_id == 0 || stream_id % 2 == 0 {
             return Err(Http2ProtocolError::BadStreamId);
         }
-        if frame.flags & FLAG_END_HEADERS == 0 {
+        if flags & FLAG_END_HEADERS == 0 {
             return Err(Http2ProtocolError::HpackUnsupported);
         }
-        let Some(idx) = self.find_stream(frame.stream_id) else {
+        let Some(idx) = self.find_stream(stream_id) else {
             return Err(Http2ProtocolError::BadStreamId);
         };
-        let payload = headers_payload(&frame)?;
-        let header_block = decode_headers_block_with(
-            &mut self.hpack_decoder,
-            payload,
-            self.limits.max_header_bytes,
-        )?;
-        let end_stream = frame.flags & FLAG_END_STREAM != 0;
+        let payload = headers_payload_view(flags, frame_payload)?;
+        // A gRPC-unary stream decodes its response compactly: gRPC facts only,
+        // no public `HeaderMap`. Every generic stream keeps the public decode.
+        let grpc_unary = self.streams[idx].grpc_unary;
+        // Responses never carry `:path`, so the client needs no path interner.
+        let header_block = if grpc_unary {
+            decode_headers_block_compact_with(
+                &mut self.hpack_decoder,
+                payload,
+                self.limits.max_header_bytes,
+                None,
+            )?
+        } else {
+            decode_headers_block_with(
+                &mut self.hpack_decoder,
+                payload,
+                self.limits.max_header_bytes,
+                None,
+            )?
+        };
+        let end_stream = flags & FLAG_END_STREAM != 0;
         if !self.streams[idx].response_headers_seen {
             validate_response_headers(&header_block)?;
-            apply_response_headers(&mut self.streams[idx], header_block);
+            if grpc_unary {
+                apply_grpc_response_head(&mut self.streams[idx], header_block);
+            } else {
+                apply_response_headers(&mut self.streams[idx], header_block);
+            }
             self.streams[idx].response_headers_seen = true;
             // For a streamed response, deliver the head to the OpenStream
-            // waiter now; the body is pulled afterwards.
+            // waiter now; the body is pulled afterwards. gRPC-unary streams are
+            // buffered, so this never fires for them.
             if self.streams[idx].response_streamed && !self.streams[idx].response_head_sent {
                 self.send_response_head(idx, effects);
             }
@@ -2023,10 +2105,14 @@ impl<S: Shard + 'static> Http2ClientConnection<S> {
                 return Err(Http2ProtocolError::InvalidTrailerPseudoHeader);
             }
             validate_trailer_block(&header_block)?;
-            for (name, value) in header_block.headers.iter() {
-                self.streams[idx]
-                    .response_trailers
-                    .append(name.clone(), value.clone());
+            if grpc_unary {
+                apply_grpc_response_trailers(&mut self.streams[idx], header_block);
+            } else {
+                for (name, value) in header_block.headers.iter() {
+                    self.streams[idx]
+                        .response_trailers
+                        .append(name.clone(), value.clone());
+                }
             }
         }
         if end_stream {
@@ -2170,22 +2256,21 @@ impl<S: Shard + 'static> Http2ClientConnection<S> {
         Ok(())
     }
 
-    fn handle_window_update(&mut self, frame: Frame) -> Result<(), Http2ProtocolError> {
-        if frame.payload.len() != 4 {
+    fn handle_window_update(
+        &mut self,
+        stream_id: u32,
+        payload: &[u8],
+    ) -> Result<(), Http2ProtocolError> {
+        if payload.len() != 4 {
             return Err(Http2ProtocolError::BadFrameLength);
         }
-        let increment = u32::from_be_bytes([
-            frame.payload[0] & 0x7f,
-            frame.payload[1],
-            frame.payload[2],
-            frame.payload[3],
-        ]);
+        let increment = u32::from_be_bytes([payload[0] & 0x7f, payload[1], payload[2], payload[3]]);
         if increment == 0 {
             return Err(Http2ProtocolError::WindowOverflow);
         }
-        if frame.stream_id == 0 {
+        if stream_id == 0 {
             self.send_window = add_window(self.send_window, increment)?;
-        } else if let Some(idx) = self.find_stream(frame.stream_id) {
+        } else if let Some(idx) = self.find_stream(stream_id) {
             self.streams[idx].send_window = add_window(self.streams[idx].send_window, increment)?;
         }
         // New credit may unblock parked outbound DATA on any stream.
@@ -2195,24 +2280,20 @@ impl<S: Shard + 'static> Http2ClientConnection<S> {
 
     fn handle_rst_stream(
         &mut self,
-        frame: Frame,
+        stream_id: u32,
+        payload: &[u8],
         effects: &mut Vec<Effect<Self>>,
     ) -> Result<(), Http2ProtocolError> {
         // RFC 9113 §6.4: RST_STREAM MUST be associated with a stream; a
         // RST_STREAM on stream 0x0 is a connection-level PROTOCOL_ERROR.
-        if frame.stream_id == 0 {
+        if stream_id == 0 {
             return Err(Http2ProtocolError::BadStreamId);
         }
-        if frame.payload.len() != 4 {
+        if payload.len() != 4 {
             return Err(Http2ProtocolError::BadFrameLength);
         }
-        let code = u32::from_be_bytes([
-            frame.payload[0],
-            frame.payload[1],
-            frame.payload[2],
-            frame.payload[3],
-        ]);
-        let Some(idx) = self.find_stream(frame.stream_id) else {
+        let code = u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
+        let Some(idx) = self.find_stream(stream_id) else {
             // RST_STREAM for an already-closed stream is allowed; ignore.
             return Ok(());
         };
@@ -2235,20 +2316,26 @@ impl<S: Shard + 'static> Http2ClientConnection<S> {
         Ok(())
     }
 
-    fn handle_ping(&mut self, frame: Frame) -> Result<(), Http2ProtocolError> {
+    fn handle_ping(
+        &mut self,
+        flags: u8,
+        stream_id: u32,
+        payload: &[u8],
+    ) -> Result<(), Http2ProtocolError> {
         // RFC 9113 §6.7: PING is sent on stream 0x0 (a non-zero stream id
         // is a connection-level PROTOCOL_ERROR) and carries exactly 8
         // octets of opaque data (any other length is FRAME_SIZE_ERROR).
         // Distinguish the two so replay/observability sees the right
         // cause rather than collapsing both into BadFrameLength.
-        if frame.stream_id != 0 {
+        if stream_id != 0 {
             return Err(Http2ProtocolError::BadStreamId);
         }
-        if frame.payload.len() != 8 {
+        if payload.len() != 8 {
             return Err(Http2ProtocolError::BadFrameLength);
         }
-        if frame.flags & FLAG_ACK == 0 {
-            self.enqueue_frame(Frame::new(FRAME_PING, FLAG_ACK, 0, frame.payload));
+        if flags & FLAG_ACK == 0 {
+            // Reflect the opaque data back; PING is rare, so this owns a copy.
+            self.enqueue_frame(Frame::new(FRAME_PING, FLAG_ACK, 0, payload.to_vec()));
         }
         Ok(())
     }
@@ -2274,9 +2361,15 @@ impl<S: Shard + 'static> Http2ClientConnection<S> {
             stream: Http2StreamId::new(stream_id),
             reason: Http2CloseReason::EndStream,
         }));
-        if let Some(status) = grpc_status_from_headers(&stream.response_trailers)
-            .or_else(|| grpc_status_from_headers(&stream.response_headers))
-        {
+        // The final gRPC status fact comes from compact facts on a gRPC-unary
+        // stream, or from the public trailer/header maps otherwise.
+        let grpc_final = if stream.grpc_unary {
+            stream.grpc_status.map(grpc_status_code_from_wire)
+        } else {
+            grpc_status_from_headers(&stream.response_trailers)
+                .or_else(|| grpc_status_from_headers(&stream.response_headers))
+        };
+        if let Some(status) = grpc_final {
             effects.push(emit_fact(ProtocolFact::GrpcFinalStatusReceived {
                 connection: self.connection_fact_id(),
                 stream: tina_runtime::GrpcStreamId::new(stream_id as u64),
@@ -2284,6 +2377,12 @@ impl<S: Shard + 'static> Http2ClientConnection<S> {
             }));
         }
         let outcome = match stream.response_status {
+            Some(status) if stream.grpc_unary => Http2ClientOutcome::GrpcUnaryReplied {
+                status,
+                grpc_status: stream.grpc_status,
+                grpc_message: stream.grpc_message,
+                body: stream.response_body,
+            },
             Some(status) => Http2ClientOutcome::Replied(Http2ClientResponse {
                 status,
                 headers: stream.response_headers,
@@ -2442,7 +2541,7 @@ impl<S: Shard + 'static> Http2ClientConnection<S> {
             self.write_queue.push_back(bytes);
         } else if self.pending_write.is_empty() {
             self.pending_write = bytes;
-        } else if self.pending_write.len() + bytes.len() <= CLIENT_WRITE_COALESCE_LIMIT {
+        } else if self.pending_write.len() + bytes.len() <= self.peer_max_frame_size {
             self.pending_write.append(&mut bytes);
         } else {
             self.write_queue.push_back(bytes);
@@ -2458,7 +2557,7 @@ impl<S: Shard + 'static> Http2ClientConnection<S> {
         };
         while matches!(
             self.write_queue.front(),
-            Some(more) if next.len() + more.len() <= CLIENT_WRITE_COALESCE_LIMIT
+            Some(more) if next.len() + more.len() <= self.peer_max_frame_size
         ) {
             let mut more = self
                 .write_queue
@@ -2709,6 +2808,31 @@ fn apply_response_headers(stream: &mut ActiveClientStream, header_block: HeaderB
     }
 }
 
+/// Apply a gRPC-unary response head from compact facts: HTTP status, declared
+/// length, and any `grpc-status`/`grpc-message` (a trailers-only error response
+/// carries the status here). The owned message is moved out of the block, so no
+/// public `HeaderMap` is built and the message is not cloned.
+fn apply_grpc_response_head(stream: &mut ActiveClientStream, header_block: HeaderBlock) {
+    stream.response_status = header_block.status;
+    stream.response_content_length = header_block.content_length;
+    if header_block.grpc_status.is_some() {
+        stream.grpc_status = header_block.grpc_status;
+    }
+    if header_block.grpc_message.is_some() {
+        stream.grpc_message = header_block.grpc_message;
+    }
+}
+
+/// Capture `grpc-status`/`grpc-message` facts from a gRPC-unary trailer block.
+fn apply_grpc_response_trailers(stream: &mut ActiveClientStream, header_block: HeaderBlock) {
+    if header_block.grpc_status.is_some() {
+        stream.grpc_status = header_block.grpc_status;
+    }
+    if header_block.grpc_message.is_some() {
+        stream.grpc_message = header_block.grpc_message;
+    }
+}
+
 fn emit_fact<S: Shard + 'static>(fact: ProtocolFact) -> Effect<Http2ClientConnection<S>> {
     tina::fact::<Http2ClientConnection<S>>(fact)
 }
@@ -2782,7 +2906,7 @@ mod tests {
     fn tls_target_route_key_distinguishes_distinct_root_sets() {
         // Two TLS targets with the same authority / server_name / alpn
         // but different trust roots must NOT collide on the route key.
-        // Without this property, Phase 119 pooling would share a
+        // Without this property, connection pooling would share a
         // connection across security boundaries.
         let mk = |roots: Vec<Vec<u8>>| Http2Target::Tls {
             authority: "x".into(),
@@ -2900,10 +3024,11 @@ mod tests {
         let mut client =
             Http2ClientConnection::<tina::SingleShard>::new(target, Http2ClientLimits::default());
 
-        client.enqueue_bytes(vec![1; CLIENT_WRITE_COALESCE_LIMIT]);
+        let frame_cap = client.peer_max_frame_size;
+        client.enqueue_bytes(vec![1; frame_cap]);
         client.enqueue_frame(data_frame(1, true, b"body".to_vec()));
 
-        assert_eq!(client.pending_write.len(), CLIENT_WRITE_COALESCE_LIMIT);
+        assert_eq!(client.pending_write.len(), frame_cap);
         assert_eq!(client.write_queue.len(), 1);
     }
 
@@ -2996,6 +3121,7 @@ mod tests {
         fn classify(o: &Http2ClientOutcome) -> &'static str {
             match o {
                 Http2ClientOutcome::Replied(_) => "replied",
+                Http2ClientOutcome::GrpcUnaryReplied { .. } => "grpc-unary-replied",
                 Http2ClientOutcome::ResponseStreaming { .. } => "response-streaming",
                 Http2ClientOutcome::Full => "full",
                 Http2ClientOutcome::Closed => "closed",
@@ -3010,6 +3136,15 @@ mod tests {
         assert_eq!(
             classify(&Http2ClientOutcome::TlsAlpnMismatch),
             "tls-alpn-mismatch"
+        );
+        assert_eq!(
+            classify(&Http2ClientOutcome::GrpcUnaryReplied {
+                status: StatusCode::OK,
+                grpc_status: Some(0),
+                grpc_message: None,
+                body: Vec::new(),
+            }),
+            "grpc-unary-replied"
         );
     }
 }

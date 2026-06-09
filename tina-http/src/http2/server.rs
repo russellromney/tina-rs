@@ -47,10 +47,11 @@ use super::frame::{
 };
 use super::headers::{
     DEFAULT_HEADER_TABLE_SIZE, HeaderBlock, MAX_MAX_FRAME_SIZE, MIN_MAX_FRAME_SIZE,
-    SETTINGS_ENABLE_PUSH, SETTINGS_HEADER_TABLE_SIZE, SETTINGS_INITIAL_WINDOW_SIZE,
-    SETTINGS_MAX_CONCURRENT_STREAMS, SETTINGS_MAX_FRAME_SIZE, SETTINGS_MAX_HEADER_LIST_SIZE,
-    decode_headers_block_compact_with, decode_headers_block_with, encode_response_headers,
-    encode_response_headers_with_len, encode_response_trailers, validate_request_headers,
+    PathInternCache, SETTINGS_ENABLE_PUSH, SETTINGS_HEADER_TABLE_SIZE,
+    SETTINGS_INITIAL_WINDOW_SIZE, SETTINGS_MAX_CONCURRENT_STREAMS, SETTINGS_MAX_FRAME_SIZE,
+    SETTINGS_MAX_HEADER_LIST_SIZE, decode_headers_block_compact_with, decode_headers_block_with,
+    encode_response_headers, encode_response_headers_with_len, encode_response_trailers,
+    validate_request_headers,
 };
 
 #[cfg(test)]
@@ -141,7 +142,7 @@ impl Default for Http2ServerConfig {
 #[derive(Debug)]
 pub struct Http2RequestParts {
     pub method: http::Method,
-    pub path: String,
+    pub path: Arc<str>,
     pub headers: http::HeaderMap,
     pub body: HttpRequestBody,
     pub grpc_content_type: bool,
@@ -152,7 +153,10 @@ impl Http2RequestParts {
     pub fn into_http_request(self) -> HttpRequest {
         HttpRequest {
             method: self.method,
-            path: self.path,
+            // The generic request shape owns a `String` path; the interned
+            // `Arc<str>` is the compact gRPC shape, so only the public branch
+            // pays this copy (the compact branch keeps the `Arc`).
+            path: self.path.to_string(),
             version: Version::HTTP_2,
             headers: self.headers,
             body: self.body,
@@ -238,8 +242,10 @@ pub enum Http2Outcome {
     LocalCancel(u32),
 }
 
-/// Per-connection report counters.
+/// Per-connection report counters. `#[non_exhaustive]`: it is an output users
+/// read, so new counters can be added without breaking callers.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Http2ConnectionReport {
     pub opened_streams: u64,
     pub closed_streams: u64,
@@ -251,6 +257,10 @@ pub struct Http2ConnectionReport {
     pub goaway_sent: u64,
     pub late_replies_after_close: u64,
     pub rapid_reset_goaway: u64,
+    /// Cached request paths evicted because the per-connection path cache was
+    /// full. Non-zero means more distinct paths than the cap churned through;
+    /// the calls still ran, the cache just evicted least-recently-used entries.
+    pub path_cache_evictions: u64,
 }
 
 /// Per-stream report snapshot.
@@ -403,6 +413,11 @@ impl Http2ConnectionMsg {
     }
 }
 
+/// Per-connection request-path interner capacity. A connection serves a small,
+/// fixed set of routes, so this is generous; a peer that floods distinct paths
+/// fills it and the overflow is counted, never grown without bound.
+const PATH_INTERN_CACHE_CAP: usize = 256;
+
 #[derive(Debug, Clone)]
 pub enum Http2ConnectionReply {
     RequestChunk(RequestChunkReply),
@@ -418,6 +433,7 @@ pub struct Http2Connection<S: Shard, M: Http2ServiceMessage = HttpRequest> {
     read_buf: Vec<u8>,
     read_scratch: Vec<u8>,
     hpack_decoder: hpack::Decoder<'static>,
+    path_cache: PathInternCache,
     preface_seen: bool,
     streams: Vec<ActiveStream>,
     /// stream-id → slot index in `streams`, kept in step with every push and
@@ -457,6 +473,7 @@ impl<S: Shard + 'static, M: Http2ServiceMessage> Http2Connection<S, M> {
             read_buf: Vec::new(),
             read_scratch: Vec::new(),
             hpack_decoder: hpack::Decoder::new(),
+            path_cache: PathInternCache::with_capacity(PATH_INTERN_CACHE_CAP),
             preface_seen: false,
             streams: Vec::with_capacity(limits.max_concurrent_streams),
             stream_index: HashMap::with_capacity(limits.max_concurrent_streams),
@@ -547,6 +564,8 @@ impl<S: Shard + 'static, M: Http2ServiceMessage> Isolate for Http2Connection<S, 
                 self.handle_request_body_next(stream_id, call)
             }
             Http2ConnectionMsg::Report => {
+                // Fold the live path-cache eviction count into the snapshot.
+                self.report.path_cache_evictions = self.path_cache.evictions();
                 call.reply(Http2ConnectionReply::Report(self.report.clone()))
             }
             _ => call.reject(tina::CallRejectedReason::UnsupportedMessage),
@@ -566,8 +585,18 @@ impl<S: Shard + 'static, M: Http2ServiceMessage> Http2Connection<S, M> {
             return noop();
         }
         if self.pending_write.is_empty() {
-            if let Some(next) = self.write_queue.pop_front() {
-                self.pending_write = next;
+            // Write the first queued buffer, then batch following frames into the
+            // same write while under one peer frame's worth. Keeps a response and
+            // its window-update in one write without merging many large buffers.
+            if let Some(first) = self.write_queue.pop_front() {
+                self.pending_write = first;
+                while let Some(next) = self.write_queue.front() {
+                    if self.pending_write.len() + next.len() > self.peer_max_frame_size {
+                        break;
+                    }
+                    let next = self.write_queue.pop_front().expect("front just peeked");
+                    self.pending_write.extend_from_slice(&next);
+                }
             }
         }
         if self.pending_write.is_empty() {
@@ -898,15 +927,22 @@ impl<S: Shard + 'static, M: Http2ServiceMessage> Http2Connection<S, M> {
                 &mut self.hpack_decoder,
                 header_payload,
                 self.limits.max_header_bytes,
+                Some(&self.path_cache),
             )?
         } else {
             decode_headers_block_with(
                 &mut self.hpack_decoder,
                 header_payload,
                 self.limits.max_header_bytes,
+                Some(&self.path_cache),
             )?
         };
         validate_request_headers(&headers)?;
+        // Cache the path only now that the request has validated, so a peer
+        // cannot fill the cache with unvalidated paths.
+        if let Some(path) = &headers.path {
+            self.path_cache.remember(path);
+        }
         let grpc = headers.grpc_content_type;
         let end_stream = flags & FLAG_END_STREAM != 0;
         let declared_len = headers.content_length;
@@ -1412,6 +1448,11 @@ impl<S: Shard + 'static, M: Http2ServiceMessage> Http2Connection<S, M> {
                 let _ = self.enqueue_response(stream_id, response, &mut effects);
             }
         }
+        // Flush deferred request-window credit into the same write as the
+        // response. The connection window-update then rides the response write
+        // instead of forcing a second write (and a second completion turn)
+        // after it finishes.
+        self.flush_deferred_request_window_credit();
         if self.pending_write.is_empty() && !self.write_queue.is_empty() {
             effects.push(self.write_more());
         }
@@ -2126,17 +2167,23 @@ impl<S: Shard + 'static, M: Http2ServiceMessage> Http2Connection<S, M> {
         let drain = written.min(bytes.len());
         bytes.drain(..drain);
         self.pending_write = bytes;
-        if self.pending_write.is_empty() {
-            if !self.write_queue.is_empty() {
-                return self.write_more();
-            }
-            if self.closing_after_write {
-                return self.close_now();
-            }
-            self.flush_deferred_request_window_credit();
-            if !self.write_queue.is_empty() {
-                return self.write_more();
-            }
+        // A short write leaves a remainder; keep draining it before anything
+        // else. Coalesced writes are larger, so this guard must stay correct.
+        if !self.pending_write.is_empty() {
+            return self.write_more();
+        }
+        if !self.write_queue.is_empty() {
+            return self.write_more();
+        }
+        if self.closing_after_write {
+            return self.close_now();
+        }
+        // Fallback flush for credit that became pending after the response left
+        // (e.g. streamed bodies). The steady-state response path flushes credit
+        // into the response write itself, so this usually finds nothing.
+        self.flush_deferred_request_window_credit();
+        if !self.write_queue.is_empty() {
+            return self.write_more();
         }
         noop()
     }
@@ -2393,6 +2440,34 @@ mod tests {
             Http2Limits::default(),
             Duration::from_secs(1),
         )
+    }
+
+    #[test]
+    fn write_more_merges_small_frames_but_bounds_large_ones() {
+        // The hot path: a small response and its window-update coalesce into one
+        // write, draining the queue.
+        let mut conn = unit_connection();
+        conn.write_queue.push_back(vec![1u8; 200]);
+        conn.write_queue.push_back(vec![2u8; 13]);
+        let _ = conn.write_more();
+        assert!(
+            conn.write_queue.is_empty(),
+            "small frames coalesce into one write"
+        );
+
+        // The bound: large queued buffers are not all copied into one write.
+        // A buffer at the peer frame size fills the write; the rest stay queued.
+        let mut conn = unit_connection();
+        let frame_cap = conn.peer_max_frame_size;
+        conn.write_queue.push_back(vec![1u8; frame_cap]);
+        conn.write_queue.push_back(vec![2u8; 1024]);
+        conn.write_queue.push_back(vec![3u8; frame_cap]);
+        let _ = conn.write_more();
+        assert_eq!(
+            conn.write_queue.len(),
+            2,
+            "only the first buffer is written; the rest stay queued"
+        );
     }
 
     #[test]

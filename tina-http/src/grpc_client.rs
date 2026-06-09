@@ -44,7 +44,10 @@ use crate::grpc::{
     GRPC_FRAME_HEADER_LEN, GrpcError, GrpcLimits, GrpcStatus, GrpcStatusCode,
     decode_one_grpc_message,
 };
-use crate::grpc::{encode_grpc_message, grpc_status_from_header_map};
+use crate::grpc::{
+    encode_grpc_message, encode_grpc_message_into, grpc_status_from_compact,
+    grpc_status_from_header_map,
+};
 use crate::http2::{
     Http2ClientConnection, Http2ClientGrpcUnaryRequest, Http2ClientLimits, Http2ClientMsg,
     Http2ClientOutcome, Http2ClientReply, Http2ClientRequestBody, Http2ClientStreamCall,
@@ -283,27 +286,52 @@ impl GrpcClient {
         &self,
         outcome: Http2ClientOutcome,
     ) -> GrpcUnaryOutcome<Resp> {
-        let response = match outcome {
-            Http2ClientOutcome::Replied(response) => response,
+        match outcome {
+            Http2ClientOutcome::Replied(response) => {
+                // An explicit grpc-status wins regardless of HTTP status (gRPC
+                // servers always send HTTP 200 and put status in trailers, or in
+                // headers for a trailers-only response).
+                let status = grpc_status_from_header_map(&response.trailers)
+                    .or_else(|| grpc_status_from_header_map(&response.headers));
+                self.finish_unary(response.status, status, &response.body)
+            }
+            // The compact gRPC-unary path: the HTTP/2 client already parsed the
+            // status facts, so there is no `HeaderMap` to scan.
+            Http2ClientOutcome::GrpcUnaryReplied {
+                status,
+                grpc_status,
+                grpc_message,
+                body,
+            } => {
+                let parsed =
+                    grpc_status.map(|code| grpc_status_from_compact(code, grpc_message.as_deref()));
+                self.finish_unary(status, parsed, &body)
+            }
             // Anything that is not a completed HTTP response is a
             // transport-level failure, not a gRPC status.
-            transport => return GrpcUnaryOutcome::Transport(transport),
-        };
-        // An explicit grpc-status wins regardless of HTTP status (gRPC
-        // servers always send HTTP 200 and put status in trailers, or in
-        // headers for a trailers-only response).
-        let status = grpc_status_from_header_map(&response.trailers)
-            .or_else(|| grpc_status_from_header_map(&response.headers));
-        let status = match status {
+            transport => GrpcUnaryOutcome::Transport(transport),
+        }
+    }
+
+    /// Fold an HTTP status, an optional explicit gRPC status, and the response
+    /// body into a typed unary outcome. Shared by the public-header and compact
+    /// receive paths so both report identical status truth.
+    fn finish_unary<Resp: Message + Default>(
+        &self,
+        http_status: StatusCode,
+        grpc_status: Option<GrpcStatus>,
+        body: &[u8],
+    ) -> GrpcUnaryOutcome<Resp> {
+        let status = match grpc_status {
             Some(status) => status,
             None => {
-                return if response.status.as_u16() == 200 {
+                return if http_status.as_u16() == 200 {
                     // A 200 gRPC response MUST carry a grpc-status.
                     GrpcUnaryOutcome::Malformed(GrpcError::MissingTrailers)
                 } else {
                     // No grpc-status + non-200: a proxy/infra failure.
                     // Synthesize the status the gRPC spec prescribes.
-                    GrpcUnaryOutcome::Status(http_status_to_grpc_status(response.status))
+                    GrpcUnaryOutcome::Status(http_status_to_grpc_status(http_status))
                 };
             }
         };
@@ -312,8 +340,8 @@ impl GrpcClient {
         }
         // OK status: decode exactly one response message from the body.
         let mut cursor = 0;
-        match decode_one_grpc_message::<Resp>(&response.body, &mut cursor, self.limits) {
-            Ok(message) if cursor == response.body.len() => GrpcUnaryOutcome::Ok(message),
+        match decode_one_grpc_message::<Resp>(body, &mut cursor, self.limits) {
+            Ok(message) if cursor == body.len() => GrpcUnaryOutcome::Ok(message),
             Ok(_) => GrpcUnaryOutcome::Malformed(GrpcError::BadFrame),
             Err(error) => GrpcUnaryOutcome::Malformed(error),
         }
@@ -405,6 +433,21 @@ impl GrpcClient {
         encode_grpc_message(message, self.limits)
     }
 
+    /// Append one length-prefixed gRPC frame onto a caller-owned buffer — the
+    /// reusable form of [`frame`](Self::frame). A caller building a
+    /// client-streaming body from several messages can pack them into one
+    /// buffer (a valid concatenated gRPC body) instead of allocating a fresh
+    /// `Vec` per message. The configured message cap is enforced before any
+    /// bytes are written, so an over-cap message fails with
+    /// [`GrpcError::EncodeTooLarge`] and leaves `out` untouched.
+    pub fn frame_into<Req: Message>(
+        &self,
+        out: &mut Vec<u8>,
+        message: &Req,
+    ) -> Result<(), GrpcError> {
+        encode_grpc_message_into(out, message, self.limits)
+    }
+
     /// Read a final gRPC status from a streamed response **head's** header
     /// block. A trailers-only error response (END_STREAM on the HEADERS
     /// frame) carries `grpc-status` here, not in the `End` trailers.
@@ -480,20 +523,44 @@ impl GrpcStreamDecoder {
     }
 
     /// Feed received body bytes, draining every complete length-prefixed
-    /// message. A partial trailing frame stays buffered for the next
-    /// `push`. Rejects compression and over-cap message lengths before
-    /// allocating the message.
+    /// message into a fresh `Vec`. A partial trailing frame stays buffered
+    /// for the next `push`. Rejects compression and over-cap message lengths
+    /// before allocating the message.
+    ///
+    /// This is a convenience wrapper over [`push_into`](Self::push_into) for
+    /// callers that do not reuse output storage. Streaming loops that pull
+    /// many chunks should call `push_into` with one reused `Vec` instead, to
+    /// avoid a fresh output allocation per chunk.
     pub fn push<Resp: Message + Default>(&mut self, bytes: &[u8]) -> Result<Vec<Resp>, GrpcError> {
-        self.buf.extend_from_slice(bytes);
         let mut out = Vec::new();
+        self.push_into(bytes, &mut out)?;
+        Ok(out)
+    }
+
+    /// Feed received body bytes, appending every newly complete message to
+    /// `out`. The caller owns `out` and may reuse it across many chunks, so
+    /// a steady stream pays no per-chunk output `Vec` allocation.
+    ///
+    /// Caps and compression are still enforced before any message is
+    /// allocated. On error the bytes consumed so far are dropped from the
+    /// internal buffer and any messages decoded before the error stay in
+    /// `out`; a gRPC stream error is terminal, so those earlier messages are
+    /// valid and the error is final. ([`push`](Self::push) preserves the
+    /// all-or-nothing shape by discarding its private `Vec` on error.)
+    pub fn push_into<Resp: Message + Default>(
+        &mut self,
+        bytes: &[u8],
+        out: &mut Vec<Resp>,
+    ) -> Result<(), GrpcError> {
+        self.buf.extend_from_slice(bytes);
         let mut cursor = 0;
-        loop {
+        let result = loop {
             let remaining = self.buf.len() - cursor;
             if remaining < GRPC_FRAME_HEADER_LEN {
-                break;
+                break Ok(());
             }
             if self.buf[cursor] != 0 {
-                return Err(GrpcError::CompressedUnsupported);
+                break Err(GrpcError::CompressedUnsupported);
             }
             let len = u32::from_be_bytes([
                 self.buf[cursor + 1],
@@ -502,23 +569,26 @@ impl GrpcStreamDecoder {
                 self.buf[cursor + 4],
             ]) as usize;
             if len > self.limits.max_message_bytes {
-                return Err(GrpcError::MessageTooLarge {
+                break Err(GrpcError::MessageTooLarge {
                     len,
                     max: self.limits.max_message_bytes,
                 });
             }
             if remaining < GRPC_FRAME_HEADER_LEN + len {
                 // The frame is not all here yet — wait for more bytes.
-                break;
+                break Ok(());
             }
             let mut frame_cursor = cursor;
-            let message =
-                decode_one_grpc_message::<Resp>(&self.buf, &mut frame_cursor, self.limits)?;
-            cursor = frame_cursor;
-            out.push(message);
-        }
+            match decode_one_grpc_message::<Resp>(&self.buf, &mut frame_cursor, self.limits) {
+                Ok(message) => {
+                    cursor = frame_cursor;
+                    out.push(message);
+                }
+                Err(error) => break Err(error),
+            }
+        };
         self.buf.drain(..cursor);
-        Ok(out)
+        result
     }
 
     /// Assert the stream ended on a frame boundary. Leftover buffered
@@ -569,6 +639,216 @@ mod tests {
 
     #[derive(Clone, PartialEq, prost::Message)]
     struct Empty {}
+
+    #[derive(Clone, PartialEq, prost::Message)]
+    struct Reply {
+        #[prost(uint64, tag = "1")]
+        value: u64,
+    }
+
+    fn framed(value: u64) -> Vec<u8> {
+        encode_grpc_message(&Reply { value }, GrpcLimits::default()).expect("frame reply")
+    }
+
+    #[test]
+    fn push_into_reuses_one_output_buffer_across_chunks() {
+        let mut decoder = GrpcStreamDecoder::new(GrpcLimits::default());
+        let mut out: Vec<Reply> = Vec::new();
+
+        // First chunk: two complete messages at once.
+        let mut chunk = framed(1);
+        chunk.extend_from_slice(&framed(2));
+        decoder.push_into(&chunk, &mut out).expect("push two");
+        assert_eq!(out, vec![Reply { value: 1 }, Reply { value: 2 }]);
+
+        // Drain (keeps capacity) and reuse the same buffer for the next chunk.
+        out.clear();
+        let cap_after_first = out.capacity();
+        decoder.push_into(&framed(3), &mut out).expect("push one");
+        assert_eq!(out, vec![Reply { value: 3 }]);
+        // No reallocation was needed for the second, smaller chunk.
+        assert!(out.capacity() >= cap_after_first);
+    }
+
+    #[test]
+    fn push_into_buffers_partial_frame_across_chunks() {
+        let mut decoder = GrpcStreamDecoder::new(GrpcLimits::default());
+        let mut out: Vec<Reply> = Vec::new();
+
+        let whole = framed(7);
+        let split = whole.len() - 2;
+        decoder.push_into(&whole[..split], &mut out).expect("first");
+        assert!(out.is_empty(), "partial frame must not yield a message yet");
+        decoder.push_into(&whole[split..], &mut out).expect("rest");
+        assert_eq!(out, vec![Reply { value: 7 }]);
+    }
+
+    #[test]
+    fn push_into_rejects_compressed_frame() {
+        let mut decoder = GrpcStreamDecoder::new(GrpcLimits::default());
+        let mut out: Vec<Reply> = Vec::new();
+        let mut chunk = framed(1);
+        chunk[0] = 1; // compression flag set
+        assert!(matches!(
+            decoder.push_into(&chunk, &mut out),
+            Err(GrpcError::CompressedUnsupported)
+        ));
+    }
+
+    #[test]
+    fn push_into_rejects_over_cap_before_decoding() {
+        let limits = GrpcLimits {
+            max_message_bytes: 4,
+            ..GrpcLimits::default()
+        };
+        let mut decoder = GrpcStreamDecoder::new(limits);
+        let mut out: Vec<Reply> = Vec::new();
+        // Only the 5-byte frame header is present, declaring a len over the cap.
+        // The decoder must reject on the length alone, before any message body
+        // is read or allocated.
+        let header = [0u8, 0, 0, 0, 64];
+        assert!(matches!(
+            decoder.push_into(&header, &mut out),
+            Err(GrpcError::MessageTooLarge { len: 64, max: 4 })
+        ));
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn compact_grpc_unary_outcome_decodes_ok_message() {
+        let client = dummy_client();
+        let body = framed(99);
+        let out: GrpcUnaryOutcome<Reply> =
+            client.decode_unary(Http2ClientOutcome::GrpcUnaryReplied {
+                status: StatusCode::OK,
+                grpc_status: Some(0),
+                grpc_message: None,
+                body,
+            });
+        assert_eq!(out, GrpcUnaryOutcome::Ok(Reply { value: 99 }));
+    }
+
+    #[test]
+    fn compact_grpc_unary_outcome_surfaces_non_ok_status_with_message() {
+        let client = dummy_client();
+        // grpc-message arrives percent-encoded on the wire; the compact path
+        // must decode it the same way the header-map path does.
+        let out: GrpcUnaryOutcome<Reply> =
+            client.decode_unary(Http2ClientOutcome::GrpcUnaryReplied {
+                status: StatusCode::OK,
+                grpc_status: Some(GrpcStatusCode::PermissionDenied.as_u16()),
+                grpc_message: Some("no%20access".to_owned()),
+                body: Vec::new(),
+            });
+        match out {
+            GrpcUnaryOutcome::Status(status) => {
+                assert_eq!(status.code, GrpcStatusCode::PermissionDenied);
+                assert_eq!(status.message.as_deref(), Some("no access"));
+            }
+            other => panic!("expected Status, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn compact_grpc_unary_outcome_missing_status_on_200_is_malformed() {
+        let client = dummy_client();
+        let out: GrpcUnaryOutcome<Reply> =
+            client.decode_unary(Http2ClientOutcome::GrpcUnaryReplied {
+                status: StatusCode::OK,
+                grpc_status: None,
+                grpc_message: None,
+                body: Vec::new(),
+            });
+        assert!(matches!(
+            out,
+            GrpcUnaryOutcome::Malformed(GrpcError::MissingTrailers)
+        ));
+    }
+
+    #[test]
+    fn compact_grpc_unary_outcome_non_200_without_status_synthesizes() {
+        let client = dummy_client();
+        let out: GrpcUnaryOutcome<Reply> =
+            client.decode_unary(Http2ClientOutcome::GrpcUnaryReplied {
+                status: StatusCode::NOT_FOUND,
+                grpc_status: None,
+                grpc_message: None,
+                body: Vec::new(),
+            });
+        match out {
+            GrpcUnaryOutcome::Status(status) => {
+                assert_eq!(status.code, GrpcStatusCode::Unimplemented);
+            }
+            other => panic!("expected synthesized Status, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn frame_into_packs_multiple_messages_into_one_buffer() {
+        let client = dummy_client();
+        // Frame three dynamic messages into one reused buffer — a valid
+        // concatenated gRPC body, not three separate Vecs.
+        let mut body = Vec::new();
+        for value in [10u64, 20, 30] {
+            client
+                .frame_into(&mut body, &Reply { value })
+                .expect("frame into shared buffer");
+        }
+        // The body decodes back to exactly those three messages.
+        let mut decoder = GrpcStreamDecoder::new(GrpcLimits::default());
+        let mut out: Vec<Reply> = Vec::new();
+        decoder
+            .push_into(&body, &mut out)
+            .expect("decode packed body");
+        assert_eq!(
+            out,
+            vec![
+                Reply { value: 10 },
+                Reply { value: 20 },
+                Reply { value: 30 }
+            ]
+        );
+    }
+
+    #[test]
+    fn frame_into_into_empty_buffer_matches_frame() {
+        let client = dummy_client();
+        let mut buf = Vec::new();
+        client
+            .frame_into(&mut buf, &Reply { value: 7 })
+            .expect("frame_into");
+        let direct = client.frame(&Reply { value: 7 }).expect("frame");
+        assert_eq!(buf, direct, "reusable framing matches the one-Vec form");
+    }
+
+    #[test]
+    fn frame_into_rejects_over_cap_before_writing() {
+        let limits = GrpcLimits {
+            max_message_bytes: 4,
+            ..GrpcLimits::default()
+        };
+        let client = GrpcClient::new(dummy_client().connection(), limits);
+        // Pre-seed the buffer so we can prove nothing was appended on failure.
+        let mut buf = vec![0xAAu8; 3];
+        let err = client
+            .frame_into(&mut buf, &Reply { value: u64::MAX })
+            .expect_err("over-cap message must fail before framing");
+        assert!(matches!(err, GrpcError::EncodeTooLarge { max: 4, .. }));
+        assert_eq!(buf, vec![0xAA, 0xAA, 0xAA], "buffer untouched on over-cap");
+    }
+
+    #[test]
+    fn finish_rejects_truncated_trailing_frame() {
+        let mut decoder = GrpcStreamDecoder::new(GrpcLimits::default());
+        let mut out: Vec<Reply> = Vec::new();
+        let whole = framed(9);
+        // Feed all but the last byte: a frame is buffered but incomplete.
+        decoder
+            .push_into(&whole[..whole.len() - 1], &mut out)
+            .expect("partial");
+        assert!(out.is_empty());
+        assert!(matches!(decoder.finish(), Err(GrpcError::BadFrame)));
+    }
 
     fn dummy_client() -> GrpcClient {
         let connection = Address::new_with_generation(

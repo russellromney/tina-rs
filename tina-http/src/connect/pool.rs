@@ -58,9 +58,9 @@ pub enum EndpointDownReason {
 /// (treated as healthy: the pool, not the peer, ended the stream).
 pub fn http2_health_signal(outcome: &Http2ClientOutcome) -> EndpointHealthSignal {
     match outcome {
-        Http2ClientOutcome::Replied(_) | Http2ClientOutcome::ResponseStreaming { .. } => {
-            EndpointHealthSignal::Healthy
-        }
+        Http2ClientOutcome::Replied(_)
+        | Http2ClientOutcome::GrpcUnaryReplied { .. }
+        | Http2ClientOutcome::ResponseStreaming { .. } => EndpointHealthSignal::Healthy,
         Http2ClientOutcome::LocalCancel => EndpointHealthSignal::Healthy,
         Http2ClientOutcome::Full => EndpointHealthSignal::Busy,
         Http2ClientOutcome::Closed => EndpointHealthSignal::Unhealthy(EndpointDownReason::Closed),
