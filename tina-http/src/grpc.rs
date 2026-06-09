@@ -1570,10 +1570,13 @@ fn classify_request_chunk(outcome: CallOutcome<Http2ConnectionReply>) -> Request
         | CallOutcome::Replied(Http2ConnectionReply::RequestChunk(
             RequestChunkReply::WebSocketReport(_),
         )) => RequestChunkAction::Failed(GrpcStatus::new(GrpcStatusCode::Internal)),
-        CallOutcome::Full
-        | CallOutcome::Closed
-        | CallOutcome::Rejected(_)
-        | CallOutcome::Timeout => {
+        CallOutcome::Full => {
+            RequestChunkAction::Failed(GrpcStatus::new(GrpcStatusCode::ResourceExhausted))
+        }
+        CallOutcome::Closed | CallOutcome::Rejected(_) => {
+            RequestChunkAction::Failed(GrpcStatus::new(GrpcStatusCode::Cancelled))
+        }
+        CallOutcome::Timeout => {
             RequestChunkAction::Failed(GrpcStatus::new(GrpcStatusCode::DeadlineExceeded))
         }
     }
@@ -2362,6 +2365,39 @@ mod tests {
         let status = decode_grpc_status_trailers(&block).unwrap();
         assert_eq!(status.code, GrpcStatusCode::ResourceExhausted);
         assert_eq!(status.message.as_deref(), Some(message.as_str()));
+    }
+
+    fn classified_request_chunk_status(
+        outcome: CallOutcome<Http2ConnectionReply>,
+    ) -> GrpcStatusCode {
+        match classify_request_chunk(outcome) {
+            RequestChunkAction::Failed(status) => status.code,
+            RequestChunkAction::More(_) | RequestChunkAction::Eof => {
+                panic!("expected failed request chunk action")
+            }
+        }
+    }
+
+    #[test]
+    fn request_chunk_outcome_taxonomy_keeps_runtime_causes_distinct() {
+        assert_eq!(
+            classified_request_chunk_status(CallOutcome::Full),
+            GrpcStatusCode::ResourceExhausted
+        );
+        assert_eq!(
+            classified_request_chunk_status(CallOutcome::Closed),
+            GrpcStatusCode::Cancelled
+        );
+        assert_eq!(
+            classified_request_chunk_status(CallOutcome::Rejected(
+                tina::CallRejectedReason::UnsupportedMessage
+            )),
+            GrpcStatusCode::Cancelled
+        );
+        assert_eq!(
+            classified_request_chunk_status(CallOutcome::Timeout),
+            GrpcStatusCode::DeadlineExceeded
+        );
     }
 
     #[test]
