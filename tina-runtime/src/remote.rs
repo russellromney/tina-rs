@@ -48,6 +48,32 @@ impl QueuedRemoteEnvelope {
             Self::ChildRestarted(restarted) => restarted.owner.shard,
         }
     }
+
+    pub(crate) fn is_terminal(&self) -> bool {
+        matches!(
+            self,
+            Self::CallReply(_)
+                | Self::SpawnReply(_)
+                | Self::ChildStopped(_)
+                | Self::ChildRestarted(_)
+        )
+    }
+
+    pub(crate) fn reserves_terminal_response(&self) -> bool {
+        match self {
+            Self::Send(send) => {
+                matches!(send.call_context, Some(MessageCallContext::Remote { .. }))
+            }
+            Self::SpawnRequest(_)
+            | Self::SpawnCancel(_)
+            | Self::ChildStop(_)
+            | Self::ChildRestart(_) => true,
+            Self::CallReply(_)
+            | Self::SpawnReply(_)
+            | Self::ChildStopped(_)
+            | Self::ChildRestarted(_) => false,
+        }
+    }
 }
 
 /// A cross-shard `spawn_observed(...).on_shard(B)` request. The `payload` is a

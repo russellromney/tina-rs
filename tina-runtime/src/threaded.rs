@@ -692,7 +692,8 @@ where
             Err(ThreadedRuntimeError::DriverShutdownFailed)
             | Err(ThreadedRuntimeError::DriverParkFailed)
             | Err(ThreadedRuntimeError::CommandFull)
-            | Err(ThreadedRuntimeError::HostWaitTimeout) => {
+            | Err(ThreadedRuntimeError::HostWaitTimeout)
+            | Err(ThreadedRuntimeError::TerminalRouteOverflow) => {
                 // `call` is blocking-admission, so `CommandFull` is
                 // unreachable today. Map defensively in case the inner
                 // helper is ever migrated.

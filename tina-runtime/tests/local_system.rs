@@ -2262,6 +2262,103 @@ fn live_cross_shard_terminal_replies_do_not_degrade_to_timeout_under_reply_queue
 }
 
 #[test]
+fn live_cross_shard_terminal_credit_rejects_before_hidden_overflow() {
+    let outcomes = Arc::new(Mutex::new(Vec::new()));
+    let held_count = Arc::new(Mutex::new(0_usize));
+    let app = LocalSystem::<AppShard, AppMailboxFactory>::multi_shard(AppMailboxFactory)
+        .shard(AppShard(147))
+        .shard(AppShard(148))
+        .ingress_capacity(1)
+        .shard_pair_capacity(1)
+        .trace_retention(TraceRetention::Bounded(512))
+        .build();
+
+    let worker = app
+        .register_root_on::<CrossShardCallWorker, Infallible>(
+            ShardId::new(148),
+            CrossShardCallWorker {
+                held: Vec::new(),
+                held_count: Some(Arc::clone(&held_count)),
+            },
+            8,
+        )
+        .expect("register terminal-credit worker");
+    let client = app
+        .register_root_on::<CrossShardCallClient, Infallible>(
+            ShardId::new(147),
+            CrossShardCallClient {
+                outcomes: Arc::clone(&outcomes),
+            },
+            8,
+        )
+        .expect("register terminal-credit client");
+
+    for id in 0..2 {
+        app.try_send(client, CrossShardCallClientMsg::StartHeldOne(worker, id))
+            .expect("start held call inside terminal credit");
+        wait_until_debug(
+            || *held_count.lock().expect("held count") == usize::from(id) + 1,
+            || format!("held={}", *held_count.lock().expect("held count")),
+        );
+    }
+
+    app.try_send(client, CrossShardCallClientMsg::StartHeldOne(worker, 2))
+        .expect("start over-credit call");
+    wait_until_debug(
+        || {
+            outcomes
+                .lock()
+                .expect("outcomes")
+                .iter()
+                .any(|outcome| matches!(outcome, CallOutcome::Full))
+        },
+        || format!("outcomes={:?}", outcomes.lock().expect("outcomes")),
+    );
+    assert_eq!(
+        *held_count.lock().expect("held count"),
+        2,
+        "over-credit call must be rejected before creating another held terminal obligation"
+    );
+
+    app.try_send(worker, CrossShardCallWorkerMsg::ReleaseHeld)
+        .expect("release held calls");
+    wait_until_debug(
+        || outcomes.lock().expect("outcomes").len() == 3,
+        || format!("outcomes={:?}", outcomes.lock().expect("outcomes")),
+    );
+    let got = outcomes.lock().expect("outcomes").clone();
+    assert!(
+        got.iter()
+            .any(|outcome| matches!(outcome, CallOutcome::Full)),
+        "terminal-credit exhaustion must surface as typed Full backpressure"
+    );
+    let mut replied = got
+        .into_iter()
+        .filter_map(|outcome| match outcome {
+            CallOutcome::Replied(CrossShardCallReply(bytes)) => Some(bytes),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    replied.sort();
+    assert_eq!(replied, vec![vec![0], vec![1]]);
+
+    let terminal = app
+        .shutdown()
+        .drain()
+        .join()
+        .expect("shutdown terminal-credit app");
+    assert!(!terminal.trace().iter().any(|event| {
+        matches!(
+            event.kind(),
+            RuntimeEventKind::CallReplyRejected {
+                reason: tina_runtime::CallReplyRejectedReason::ReplyPathFull,
+                ..
+            }
+        )
+    }));
+}
+
+#[test]
 fn local_system_capabilities_name_supported_and_unsupported_resource_families() {
     let config = LocalSystemConfig {
         storage_lane_capacity: 7,

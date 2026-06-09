@@ -26,6 +26,10 @@ pub enum ThreadedRuntimeError {
     /// outcome arrived. The target call remains governed by its own call
     /// deadline.
     HostWaitTimeout,
+    /// A reserved terminal reply route exceeded its bounded emergency queue.
+    /// This is an internal backpressure invariant failure: the worker stops
+    /// rather than hiding terminal truth in an unbounded buffer.
+    TerminalRouteOverflow,
 }
 
 impl fmt::Display for ThreadedRuntimeError {
@@ -64,6 +68,9 @@ impl fmt::Display for ThreadedRuntimeError {
                     f,
                     "host wait budget elapsed before target call outcome was delivered"
                 )
+            }
+            Self::TerminalRouteOverflow => {
+                write!(f, "terminal reply route exceeded bounded overflow capacity")
             }
         }
     }
@@ -370,6 +377,10 @@ mod tests {
         assert_error(ThreadedRuntimeError::DriverParkFailed, "readiness park");
         assert_error(ThreadedRuntimeError::CommandFull, "command queue is full");
         assert_error(ThreadedRuntimeError::HostWaitTimeout, "host wait budget");
+        assert_error(
+            ThreadedRuntimeError::TerminalRouteOverflow,
+            "terminal reply route",
+        );
     }
 
     #[test]

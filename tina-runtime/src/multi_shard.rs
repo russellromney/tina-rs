@@ -43,6 +43,9 @@ where
     terminal_remote_queues: RemoteQueues,
     next_terminal_remote_queues: RemoteQueues,
     terminal_overflow_queues: RemoteQueues,
+    terminal_credits: Vec<usize>,
+    terminal_credit_capacity: usize,
+    terminal_overflow_capacity: usize,
 }
 
 /// Bounded coordinator config for additive multi-shard runtime shells.
@@ -127,6 +130,11 @@ where
             build_remote_queue_storage(&shard_ids, config.shard_pair_capacity);
         let terminal_overflow_queues =
             build_remote_queue_storage(&shard_ids, config.shard_pair_capacity);
+        let terminal_credits = vec![0; remote_queue_indexes.len()];
+        let terminal_overflow_capacity = config.shard_pair_capacity;
+        let terminal_credit_capacity = config
+            .shard_pair_capacity
+            .saturating_add(terminal_overflow_capacity);
 
         Self {
             runtimes,
@@ -139,6 +147,9 @@ where
             terminal_remote_queues,
             next_terminal_remote_queues,
             terminal_overflow_queues,
+            terminal_credits,
+            terminal_credit_capacity,
+            terminal_overflow_capacity,
         }
     }
 
@@ -339,6 +350,7 @@ where
         let terminal_remote_queues = &mut self.terminal_remote_queues;
         let next_terminal_remote_queues = &mut self.next_terminal_remote_queues;
         let terminal_overflow_queues = &mut self.terminal_overflow_queues;
+        let terminal_credits = &mut self.terminal_credits;
         let runtimes = &mut self.runtimes;
 
         flush_terminal_overflow_queues(
@@ -351,6 +363,9 @@ where
             next_remote: next_remote_queues,
             next_terminal: next_terminal_remote_queues,
             terminal_overflow: terminal_overflow_queues,
+            terminal_credits,
+            terminal_credit_capacity: self.terminal_credit_capacity,
+            terminal_overflow_capacity: self.terminal_overflow_capacity,
             shard_pair_capacity: config.shard_pair_capacity,
             label: "multi-shard runtime",
         };
@@ -375,6 +390,7 @@ where
                     )
                 });
                 while let Some(queued) = terminal_remote_queues[queue_index].pop_front() {
+                    release_terminal_credit(&mut remote_buffers, queue_index);
                     if let Some(outbound) = runtimes[index].harvest_remote_envelope(queued) {
                         let _ = enqueue_remote_envelope_preserving_terminal(
                             destination,
@@ -435,6 +451,9 @@ struct RemoteQueueBuffers<'a> {
     next_remote: &'a mut RemoteQueues,
     next_terminal: &'a mut RemoteQueues,
     terminal_overflow: &'a mut RemoteQueues,
+    terminal_credits: &'a mut Vec<usize>,
+    terminal_credit_capacity: usize,
+    terminal_overflow_capacity: usize,
     shard_pair_capacity: usize,
     label: &'static str,
 }
@@ -454,13 +473,29 @@ fn enqueue_remote_envelope_preserving_terminal(
             target_shard.get()
         )
     });
-    let terminal = matches!(
-        envelope,
-        QueuedRemoteEnvelope::CallReply(_)
-            | QueuedRemoteEnvelope::SpawnReply(_)
-            | QueuedRemoteEnvelope::ChildStopped(_)
-            | QueuedRemoteEnvelope::ChildRestarted(_)
-    );
+    let terminal = envelope.is_terminal();
+    let reserved_terminal_credit = if !terminal && envelope.reserves_terminal_response() {
+        let terminal_key = (target_shard, source_shard);
+        let terminal_queue_index =
+            buffers
+                .indexes
+                .get(&terminal_key)
+                .copied()
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{} missing terminal-credit queue from shard {} to shard {}",
+                        buffers.label,
+                        target_shard.get(),
+                        source_shard.get()
+                    )
+                });
+        if !try_reserve_terminal_credit(buffers, terminal_queue_index) {
+            return Err(SendRejectedReason::Full);
+        }
+        Some(terminal_queue_index)
+    } else {
+        None
+    };
     let queue = if terminal {
         &mut buffers.next_terminal[queue_index]
     } else {
@@ -470,11 +505,39 @@ fn enqueue_remote_envelope_preserving_terminal(
         queue.push_back(envelope);
         return Ok(());
     }
+    if let Some(terminal_queue_index) = reserved_terminal_credit {
+        release_terminal_credit(buffers, terminal_queue_index);
+    }
     if terminal {
+        if buffers.terminal_overflow[queue_index].len() >= buffers.terminal_overflow_capacity {
+            panic!(
+                "{} terminal overflow exceeded capacity {} from shard {} to shard {}",
+                buffers.label,
+                buffers.terminal_overflow_capacity,
+                source_shard.get(),
+                target_shard.get()
+            );
+        }
         buffers.terminal_overflow[queue_index].push_back(envelope);
         Ok(())
     } else {
         Err(SendRejectedReason::Full)
+    }
+}
+
+fn try_reserve_terminal_credit(buffers: &mut RemoteQueueBuffers<'_>, queue_index: usize) -> bool {
+    if buffers.terminal_credits[queue_index] >= buffers.terminal_credit_capacity {
+        return false;
+    }
+    buffers.terminal_credits[queue_index] += 1;
+    true
+}
+
+fn release_terminal_credit(buffers: &mut RemoteQueueBuffers<'_>, queue_index: usize) {
+    let credit = &mut buffers.terminal_credits[queue_index];
+    debug_assert!(*credit > 0, "terminal credit underflow for shard pair");
+    if *credit > 0 {
+        *credit -= 1;
     }
 }
 
@@ -526,4 +589,85 @@ fn build_remote_queue_storage(shard_ids: &[ShardId], shard_pair_capacity: usize)
         queues.push(VecDeque::with_capacity(shard_pair_capacity));
     }
     queues
+}
+
+#[cfg(test)]
+mod tests {
+    use tina::{AddressGeneration, IsolateId};
+
+    use super::*;
+    use crate::RegisteredAddress;
+    use crate::call::CallId;
+    use crate::remote::RemoteSpawnRequest;
+    use crate::trace::{CauseId, EventId};
+
+    fn spawn_request(id: u64, source: ShardId, target: ShardId) -> QueuedRemoteEnvelope {
+        QueuedRemoteEnvelope::SpawnRequest(RemoteSpawnRequest {
+            request_id: CallId::new(id),
+            target_shard: target,
+            owner: RegisteredAddress {
+                shard: source,
+                isolate: IsolateId::new(1),
+                generation: AddressGeneration::new(0),
+            },
+            child_ordinal: 0,
+            payload: Box::new(()),
+            cause: CauseId::new(EventId::new(1)),
+        })
+    }
+
+    #[test]
+    fn terminal_credit_rejects_before_explicit_overflow_debt() {
+        let source = ShardId::new(11);
+        let target = ShardId::new(22);
+        let shard_ids = [source, target];
+        let (indexes, mut next_remote) = build_remote_queues(&shard_ids, 8);
+        let mut next_terminal = build_remote_queue_storage(&shard_ids, 8);
+        let mut terminal_overflow = build_remote_queue_storage(&shard_ids, 1);
+        let mut terminal_credits = vec![0; indexes.len()];
+        let reverse_index = indexes[&(target, source)];
+
+        let mut buffers = RemoteQueueBuffers {
+            indexes: &indexes,
+            next_remote: &mut next_remote,
+            next_terminal: &mut next_terminal,
+            terminal_overflow: &mut terminal_overflow,
+            terminal_credits: &mut terminal_credits,
+            terminal_credit_capacity: 2,
+            terminal_overflow_capacity: 1,
+            shard_pair_capacity: 8,
+            label: "test",
+        };
+
+        enqueue_remote_envelope_preserving_terminal(
+            source,
+            spawn_request(1, source, target),
+            &mut buffers,
+        )
+        .expect("first terminal obligation fits");
+        enqueue_remote_envelope_preserving_terminal(
+            source,
+            spawn_request(2, source, target),
+            &mut buffers,
+        )
+        .expect("second terminal obligation fits");
+        assert_eq!(buffers.terminal_credits[reverse_index], 2);
+
+        assert_eq!(
+            enqueue_remote_envelope_preserving_terminal(
+                source,
+                spawn_request(3, source, target),
+                &mut buffers,
+            ),
+            Err(SendRejectedReason::Full)
+        );
+        assert_eq!(
+            buffers.terminal_credits[reverse_index], 2,
+            "failed admission must not leak terminal credit"
+        );
+        assert!(
+            buffers.terminal_overflow[reverse_index].is_empty(),
+            "terminal credit rejection happens before hidden overflow debt is created"
+        );
+    }
 }

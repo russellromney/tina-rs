@@ -10,6 +10,7 @@ use std::alloc::Global;
 use std::collections::{BTreeMap, VecDeque};
 use std::convert::Infallible;
 use std::marker::PhantomData;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -83,6 +84,9 @@ struct ThreadedRemoteWiring {
     )>,
     queue_metrics: BTreeMap<(ShardId, ShardId), Arc<LiveQueueMetrics>>,
     shard_metrics: BTreeMap<ShardId, Arc<LiveShardMetrics>>,
+    terminal_credits: BTreeMap<(ShardId, ShardId), Arc<AtomicUsize>>,
+    terminal_credit_capacity: usize,
+    terminal_overflow_capacity: usize,
 }
 
 impl<S, F> ThreadedMultiShardRuntime<S, F>
@@ -210,6 +214,11 @@ where
         let mut remote_metrics = BTreeMap::new();
         let mut remote_senders = BTreeMap::new();
         let mut terminal_remote_senders = BTreeMap::new();
+        let mut terminal_credits = BTreeMap::new();
+        let terminal_overflow_capacity = config.command_capacity.max(config.shard_pair_capacity);
+        let terminal_credit_capacity = config
+            .shard_pair_capacity
+            .saturating_add(terminal_overflow_capacity);
         let mut remote_receivers: BTreeMap<
             ShardId,
             Vec<(
@@ -245,6 +254,8 @@ where
                         (source.id(), target.id()),
                         Arc::new(LiveQueueMetrics::new(config.shard_pair_capacity)),
                     );
+                    terminal_credits
+                        .insert((source.id(), target.id()), Arc::new(AtomicUsize::new(0)));
                 }
             }
         }
@@ -270,6 +281,9 @@ where
                     .unwrap_or_default(),
                 queue_metrics: remote_metrics.clone(),
                 shard_metrics: shard_metrics.clone(),
+                terminal_credits: terminal_credits.clone(),
+                terminal_credit_capacity,
+                terminal_overflow_capacity,
             };
             let shard_metrics_for_worker = Arc::clone(
                 shard_metrics
@@ -415,7 +429,8 @@ where
             Err(ThreadedRuntimeError::DriverShutdownFailed)
             | Err(ThreadedRuntimeError::DriverParkFailed)
             | Err(ThreadedRuntimeError::CommandFull)
-            | Err(ThreadedRuntimeError::HostWaitTimeout) => {
+            | Err(ThreadedRuntimeError::HostWaitTimeout)
+            | Err(ThreadedRuntimeError::TerminalRouteOverflow) => {
                 // `call_on` is blocking-admission, so `CommandFull` is
                 // unreachable today. Map defensively in case the inner
                 // helper is ever migrated.
@@ -940,7 +955,7 @@ where
     let affinity = crate::affinity::apply(config.configured_core);
     shard_metrics.publish_worker_start(format!("{:?}", thread::current().id()), affinity);
     let source_shard = runtime.shard().id();
-    let mut terminal_overflow = VecDeque::new();
+    let mut terminal_overflow = TerminalOverflow::new(remote_wiring.terminal_overflow_capacity);
     let mut terminal_remote_drain_start = 0;
     let mut ordinary_remote_drain_start = 0;
     // Terminal replies and ordinary sends are separate inbound classes.
@@ -958,73 +973,103 @@ where
             shard_metrics.set_resource_counts(runtime.resource_report());
         }
         refresh_metrics = true;
-        let route_remote_lossless =
-            |envelope: QueuedRemoteEnvelope| -> Result<(), Box<RemoteRouteFailure>> {
-                let target_shard = envelope.target_shard();
-                let terminal = matches!(
+        let route_remote_lossless = |envelope: QueuedRemoteEnvelope,
+                                     record_full: bool|
+         -> Result<(), Box<RemoteRouteFailure>> {
+            let target_shard = envelope.target_shard();
+            let terminal = envelope.is_terminal();
+            let metrics = remote_wiring
+                .queue_metrics
+                .get(&(source_shard, target_shard));
+            if remote_wiring
+                .shard_metrics
+                .get(&target_shard)
+                .is_some_and(|metrics| metrics.state() == LiveShardState::Failed)
+            {
+                if let Some(metrics) = metrics {
+                    metrics.rejected_closed();
+                }
+                return Err(Box::new(RemoteRouteFailure {
+                    reason: SendRejectedReason::Closed,
                     envelope,
-                    QueuedRemoteEnvelope::CallReply(_)
-                        | QueuedRemoteEnvelope::SpawnReply(_)
-                        | QueuedRemoteEnvelope::ChildStopped(_)
-                        | QueuedRemoteEnvelope::ChildRestarted(_)
-                );
-                let metrics = remote_wiring
-                    .queue_metrics
-                    .get(&(source_shard, target_shard));
-                if remote_wiring
-                    .shard_metrics
-                    .get(&target_shard)
-                    .is_some_and(|metrics| metrics.state() == LiveShardState::Failed)
-                {
+                }));
+            }
+            let reserved_terminal_credit = if !terminal && envelope.reserves_terminal_response() {
+                let terminal_key = (target_shard, source_shard);
+                let Some(credit) = remote_wiring.terminal_credits.get(&terminal_key) else {
+                    panic!(
+                        "ThreadedMultiShardRuntime missing terminal credit from shard {} to shard {}",
+                        target_shard.get(),
+                        source_shard.get()
+                    );
+                };
+                if !try_reserve_terminal_credit(credit, remote_wiring.terminal_credit_capacity) {
                     if let Some(metrics) = metrics {
-                        metrics.rejected_closed();
+                        metrics.rejected_full();
                     }
                     return Err(Box::new(RemoteRouteFailure {
-                        reason: SendRejectedReason::Closed,
+                        reason: SendRejectedReason::Full,
                         envelope,
                     }));
                 }
-                let senders = if terminal {
-                    &remote_wiring.terminal_senders
-                } else {
-                    &remote_wiring.senders
-                };
-                let Some(sender) = senders.get(&(source_shard, target_shard)) else {
-                    panic!(
-                        "ThreadedMultiShardRuntime targeted unknown destination shard {}",
-                        target_shard.get()
-                    );
-                };
-                let envelope = SendableQueuedRemoteEnvelope::new(envelope);
-                match sender.try_send(envelope) {
-                    Ok(()) => {
-                        if let Some(metrics) = metrics {
-                            metrics.accepted();
-                        }
-                        Ok(())
+                Some(terminal_key)
+            } else {
+                None
+            };
+            let senders = if terminal {
+                &remote_wiring.terminal_senders
+            } else {
+                &remote_wiring.senders
+            };
+            let Some(sender) = senders.get(&(source_shard, target_shard)) else {
+                panic!(
+                    "ThreadedMultiShardRuntime targeted unknown destination shard {}",
+                    target_shard.get()
+                );
+            };
+            let envelope = SendableQueuedRemoteEnvelope::new(envelope);
+            match sender.try_send(envelope) {
+                Ok(()) => {
+                    if let Some(metrics) = metrics {
+                        metrics.accepted();
                     }
-                    Err(std::sync::mpsc::TrySendError::Full(envelope)) => {
+                    Ok(())
+                }
+                Err(std::sync::mpsc::TrySendError::Full(envelope)) => {
+                    if let Some(terminal_key) = reserved_terminal_credit {
+                        release_terminal_credit(&remote_wiring.terminal_credits, terminal_key);
+                    }
+                    if record_full {
                         if let Some(metrics) = metrics {
                             metrics.rejected_full();
                         }
-                        Err(Box::new(RemoteRouteFailure {
-                            reason: SendRejectedReason::Full,
-                            envelope: envelope.into_queued_remote_envelope(),
-                        }))
                     }
-                    Err(std::sync::mpsc::TrySendError::Disconnected(envelope)) => {
-                        if let Some(metrics) = metrics {
-                            metrics.rejected_closed();
-                        }
-                        Err(Box::new(RemoteRouteFailure {
-                            reason: SendRejectedReason::Closed,
-                            envelope: envelope.into_queued_remote_envelope(),
-                        }))
-                    }
+                    Err(Box::new(RemoteRouteFailure {
+                        reason: SendRejectedReason::Full,
+                        envelope: envelope.into_queued_remote_envelope(),
+                    }))
                 }
-            };
+                Err(std::sync::mpsc::TrySendError::Disconnected(envelope)) => {
+                    if let Some(terminal_key) = reserved_terminal_credit {
+                        release_terminal_credit(&remote_wiring.terminal_credits, terminal_key);
+                    }
+                    if let Some(metrics) = metrics {
+                        metrics.rejected_closed();
+                    }
+                    Err(Box::new(RemoteRouteFailure {
+                        reason: SendRejectedReason::Closed,
+                        envelope: envelope.into_queued_remote_envelope(),
+                    }))
+                }
+            }
+        };
         let overflow_delivered =
             drain_terminal_overflow(&mut terminal_overflow, &route_remote_lossless);
+        if terminal_overflow.exhausted() {
+            shard_metrics.set_resource_counts(runtime.resource_report());
+            let trace = runtime.trace().to_vec();
+            return ThreadedWorkerExit::failed(ThreadedRuntimeError::TerminalRouteOverflow, trace);
+        }
         let mut route_remote = |envelope: QueuedRemoteEnvelope| -> Result<(), SendRejectedReason> {
             route_remote_preserving_terminal(
                 envelope,
@@ -1040,6 +1085,7 @@ where
                     &mut route_remote,
                     config.remote_inbound_drain_budget,
                     &mut terminal_remote_drain_start,
+                    Some(&remote_wiring.terminal_credits),
                 );
                 let ordinary_budget = config
                     .remote_inbound_drain_budget
@@ -1051,6 +1097,7 @@ where
                         &mut route_remote,
                         ordinary_budget,
                         &mut ordinary_remote_drain_start,
+                        None,
                     )
             } else {
                 let ordinary_delivered = drain_remote_inbound(
@@ -1059,6 +1106,7 @@ where
                     &mut route_remote,
                     config.remote_inbound_drain_budget,
                     &mut ordinary_remote_drain_start,
+                    None,
                 );
                 let terminal_budget = config
                     .remote_inbound_drain_budget
@@ -1070,6 +1118,7 @@ where
                         &mut route_remote,
                         terminal_budget,
                         &mut terminal_remote_drain_start,
+                        Some(&remote_wiring.terminal_credits),
                     )
             };
         drain_terminal_first = !drain_terminal_first;
@@ -1096,9 +1145,30 @@ where
         }
 
         let delivered = runtime.step_with_remote(&mut |_, envelope| route_remote(envelope));
+        if terminal_overflow.exhausted() {
+            shard_metrics.set_resource_counts(runtime.resource_report());
+            let trace = runtime.trace().to_vec();
+            return ThreadedWorkerExit::failed(ThreadedRuntimeError::TerminalRouteOverflow, trace);
+        }
 
-        if delivered > 0 || remote_delivered > 0 || !terminal_overflow.is_empty() {
+        if delivered > 0 || remote_delivered > 0 {
             refresh_metrics = false;
+            continue;
+        }
+        if !terminal_overflow.is_empty() {
+            refresh_metrics = false;
+            match receiver.recv_timeout(config.idle_repoll_interval.min(config.idle_wait)) {
+                Ok(ThreadedCommand::Run(command)) => command(&mut runtime),
+                Ok(ThreadedCommand::HostCall { dispatcher, begin }) => {
+                    run_host_call(&mut runtime, dispatcher, begin)
+                }
+                Ok(ThreadedCommand::Shutdown) => {
+                    deliver_shutdown_signal_and_drain(&mut runtime);
+                    break;
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            }
             continue;
         }
 
@@ -1155,22 +1225,80 @@ struct RemoteRouteFailure {
     envelope: QueuedRemoteEnvelope,
 }
 
+struct TerminalOverflow {
+    queue: VecDeque<QueuedRemoteEnvelope>,
+    capacity: usize,
+    exhausted: bool,
+}
+
+impl TerminalOverflow {
+    fn new(capacity: usize) -> Self {
+        Self {
+            queue: VecDeque::with_capacity(capacity),
+            capacity,
+            exhausted: false,
+        }
+    }
+
+    fn push_back(&mut self, envelope: QueuedRemoteEnvelope) {
+        if self.queue.len() < self.capacity {
+            self.queue.push_back(envelope);
+        } else {
+            self.exhausted = true;
+        }
+    }
+
+    fn push_front(&mut self, envelope: QueuedRemoteEnvelope) {
+        self.queue.push_front(envelope);
+    }
+
+    fn pop_front(&mut self) -> Option<QueuedRemoteEnvelope> {
+        self.queue.pop_front()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.queue.is_empty()
+    }
+
+    fn exhausted(&self) -> bool {
+        self.exhausted
+    }
+}
+
+fn try_reserve_terminal_credit(credit: &AtomicUsize, capacity: usize) -> bool {
+    credit
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            (current < capacity).then_some(current + 1)
+        })
+        .is_ok()
+}
+
+fn release_terminal_credit(
+    credits: &BTreeMap<(ShardId, ShardId), Arc<AtomicUsize>>,
+    key: (ShardId, ShardId),
+) {
+    let Some(credit) = credits.get(&key) else {
+        panic!(
+            "ThreadedMultiShardRuntime missing terminal credit from shard {} to shard {}",
+            key.0.get(),
+            key.1.get()
+        );
+    };
+    let released = credit.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        (current > 0).then_some(current - 1)
+    });
+    debug_assert!(released.is_ok(), "terminal credit underflow for shard pair");
+}
+
 fn route_remote_preserving_terminal(
     envelope: QueuedRemoteEnvelope,
-    terminal_overflow: &mut VecDeque<QueuedRemoteEnvelope>,
-    route_remote: &impl Fn(QueuedRemoteEnvelope) -> Result<(), Box<RemoteRouteFailure>>,
+    terminal_overflow: &mut TerminalOverflow,
+    route_remote: &impl Fn(QueuedRemoteEnvelope, bool) -> Result<(), Box<RemoteRouteFailure>>,
 ) -> Result<(), SendRejectedReason> {
-    match route_remote(envelope) {
+    match route_remote(envelope, true) {
         Ok(()) => Ok(()),
         Err(failure)
-            if failure.reason == SendRejectedReason::Full
-                && matches!(
-                    failure.envelope,
-                    QueuedRemoteEnvelope::CallReply(_)
-                        | QueuedRemoteEnvelope::SpawnReply(_)
-                        | QueuedRemoteEnvelope::ChildStopped(_)
-                        | QueuedRemoteEnvelope::ChildRestarted(_)
-                ) =>
+            if failure.reason == SendRejectedReason::Full && failure.envelope.is_terminal() =>
         {
             terminal_overflow.push_back(failure.envelope);
             Ok(())
@@ -1180,22 +1308,15 @@ fn route_remote_preserving_terminal(
 }
 
 fn drain_terminal_overflow(
-    terminal_overflow: &mut VecDeque<QueuedRemoteEnvelope>,
-    route_remote: &impl Fn(QueuedRemoteEnvelope) -> Result<(), Box<RemoteRouteFailure>>,
+    terminal_overflow: &mut TerminalOverflow,
+    route_remote: &impl Fn(QueuedRemoteEnvelope, bool) -> Result<(), Box<RemoteRouteFailure>>,
 ) -> usize {
     let mut delivered = 0;
     while let Some(envelope) = terminal_overflow.pop_front() {
-        match route_remote(envelope) {
+        match route_remote(envelope, false) {
             Ok(()) => delivered += 1,
             Err(failure)
-                if failure.reason == SendRejectedReason::Full
-                    && matches!(
-                        failure.envelope,
-                        QueuedRemoteEnvelope::CallReply(_)
-                            | QueuedRemoteEnvelope::SpawnReply(_)
-                            | QueuedRemoteEnvelope::ChildStopped(_)
-                            | QueuedRemoteEnvelope::ChildRestarted(_)
-                    ) =>
+                if failure.reason == SendRejectedReason::Full && failure.envelope.is_terminal() =>
             {
                 terminal_overflow.push_front(failure.envelope);
                 break;
@@ -1217,6 +1338,7 @@ fn drain_remote_inbound<S, F>(
     route_remote: &mut impl FnMut(QueuedRemoteEnvelope) -> Result<(), SendRejectedReason>,
     budget: usize,
     next_start: &mut usize,
+    terminal_credits: Option<&BTreeMap<(ShardId, ShardId), Arc<AtomicUsize>>>,
 ) -> usize
 where
     S: Shard + 'static,
@@ -1230,7 +1352,7 @@ where
     let mut last_delivered_index = None;
     for offset in 0..remote_receivers.len() {
         let index = (*next_start + offset) % remote_receivers.len();
-        let (_, receiver) = &remote_receivers[index];
+        let (source_shard, receiver) = &remote_receivers[index];
         loop {
             if delivered >= budget {
                 *next_start = (index + 1) % remote_receivers.len();
@@ -1240,6 +1362,9 @@ where
                 Ok(envelope) => {
                     delivered += 1;
                     last_delivered_index = Some(index);
+                    if let Some(credits) = terminal_credits {
+                        release_terminal_credit(credits, (*source_shard, runtime.shard().id()));
+                    }
                     if let Some(outbound) =
                         runtime.harvest_remote_envelope(envelope.into_queued_remote_envelope())
                     {
