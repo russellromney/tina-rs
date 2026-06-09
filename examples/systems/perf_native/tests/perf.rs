@@ -174,9 +174,16 @@ fn native_protocol_rows_are_printable_and_bounded() {
         );
     }
 
+    // Print every row's evidence first, before any bounds assertion. A later
+    // assertion that fails (e.g. the macOS-only `leak=unchecked` on the
+    // connection-setup row) must not hide the p50/p90/p99 + allocation line of
+    // the rows after it, so the gRPC latency rows always reach stdout.
     for report in &reports {
         println!("{}", report.summary_line());
         println!("{}", report.json_line());
+    }
+
+    for report in &reports {
         let line = report.summary_line();
         let json = report.json_line();
 
