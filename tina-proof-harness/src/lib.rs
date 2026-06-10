@@ -31,6 +31,7 @@ pub use bad_peer::{BadPeerOutcome, BadPeerScenario};
 pub use byte_replay::{
     ByteReplayDirection, ByteReplayField, ProtocolByteReplayCase, ProtocolByteReplayIoError,
     ProtocolByteReplayMismatch, ProtocolByteReplayReport, ProtocolByteReplayShrink,
+    ProtocolByteReplayShrinkError,
 };
 pub use grpc::{
     GrpcLimits, GrpcOutcome, GrpcProbe, GrpcProbeMismatch, GrpcRun, decode_grpc_response,

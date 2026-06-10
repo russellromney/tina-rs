@@ -604,8 +604,7 @@ fn capture_builder_rejects_upstream_partial_live_trace() {
         .with_history(case.history.operations().to_vec())
         .with_invariant(case.invariant)
         .with_source_metadata(
-            CaptureSource::new("partial live")
-                .with_trace_completeness(TraceCompleteness::Partial),
+            CaptureSource::new("partial live").with_trace_completeness(TraceCompleteness::Partial),
         )
         .with_trace(&events)
         .finish()
@@ -820,7 +819,8 @@ fn live_replay_shrink_refreshes_constants_for_live_derived_case() {
         "at least one full rejection remains",
         run_burst_overflow_case,
         |report| report.output.full_rejections >= 1,
-    );
+    )
+    .expect("original reproduces");
     assert_eq!(
         report.shrunk_case.expected_event_count,
         report.shrunk_report.event_count
@@ -829,6 +829,21 @@ fn live_replay_shrink_refreshes_constants_for_live_derived_case() {
         report.shrunk_case.expected_trace_hash,
         report.shrunk_report.trace_hash
     );
+}
+
+#[test]
+fn shrink_captured_replay_rejects_non_reproducing_original() {
+    let capture = capture_burst_overflow();
+    let err = shrink_captured_replay(
+        &capture,
+        ShrinkConfig::default(),
+        "impossible predicate",
+        run_burst_overflow_live_replay,
+        |_report| false,
+    )
+    .expect_err("green original must not shrink");
+
+    assert_eq!(err, ShrinkCapturedReplayError::NotReproducing);
 }
 
 #[test]
