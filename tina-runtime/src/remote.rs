@@ -324,11 +324,7 @@ where
             );
         }
 
-        let Some(entry_index) = self
-            .entries
-            .iter()
-            .position(|entry| entry.id == send.target_isolate)
-        else {
+        let Some(&entry_index) = self.entry_indexes.get(&send.target_isolate) else {
             return Err(SendRejectedReason::Closed);
         };
         let entry = &self.entries[entry_index];
@@ -596,11 +592,7 @@ where
         // What we record here is destination-local harvest outcome, not a
         // retroactive change to the source-side send result.
         let send = queued.send;
-        let Some(entry_index) = self
-            .entries
-            .iter()
-            .position(|entry| entry.id == send.target_isolate)
-        else {
+        let Some(&entry_index) = self.entry_indexes.get(&send.target_isolate) else {
             self.push_event(
                 send.target_isolate,
                 Some(queued.cause),

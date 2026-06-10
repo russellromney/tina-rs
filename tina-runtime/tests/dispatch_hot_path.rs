@@ -13,6 +13,20 @@ fn completion_delivery_does_not_scan_registered_entries_by_id() {
 }
 
 #[test]
+fn local_remote_ingress_does_not_scan_registered_entries_by_id() {
+    let remote = include_str!("../src/remote.rs");
+
+    assert!(
+        !remote.contains("entries.iter().position(|entry|"),
+        "local send/call ingress must use the isolate-id index instead of scanning every registered entry"
+    );
+    assert!(
+        !remote.contains("entries\n            .iter()\n            .position(|entry|"),
+        "local send/call ingress must use the isolate-id index instead of scanning every registered entry"
+    );
+}
+
+#[test]
 fn stopped_entry_gc_does_not_shift_remove_inside_a_loop() {
     let dispatch = include_str!("../src/dispatch.rs");
 
