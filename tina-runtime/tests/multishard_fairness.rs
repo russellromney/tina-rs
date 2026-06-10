@@ -338,12 +338,8 @@ fn shard_park_wakeups(
     shard: ShardId,
 ) -> u64 {
     runtime
-        .topology()
-        .shards()
-        .iter()
-        .find(|report| report.shard() == shard)
-        .expect("shard report")
-        .park_wakeups()
+        .park_wakeups_on(shard)
+        .expect("shard park wakeup metric")
 }
 
 const FLOOD_TICKS: usize = 100_000;

@@ -636,6 +636,14 @@ where
         LiveTopologyReport::new(shards, remote_queues)
     }
 
+    /// Total blocking-park wakeups observed by one worker shard.
+    pub fn park_wakeups_on(&self, shard: ShardId) -> Result<u64, ThreadedRuntimeError> {
+        self.shard_metrics
+            .get(&shard)
+            .map(|metrics| metrics.park_wakeups())
+            .ok_or(ThreadedRuntimeError::UnknownShard(shard))
+    }
+
     /// Returns the live runtime capability table shared by each worker.
     pub fn capabilities(&self) -> RuntimeCapabilities {
         let config = self

@@ -641,6 +641,20 @@ fn supervisor_events(trace: &[RuntimeEvent]) -> Vec<RuntimeEventKind> {
 }
 
 #[test]
+fn bootstrap_registration_pairs_message_with_empty_call_context() {
+    let mut runtime = Runtime::new(TestShard, TestMailboxFactory);
+    let root = runtime
+        .register_with_capacity_and_bootstrap::<_, NeverOutbound>(new_root(), 2, LineageMsg::Stop)
+        .expect("bootstrap admitted");
+    let entry_index = runtime.entry_indexes[&root.isolate()];
+    let entry = &runtime.entries[entry_index];
+
+    let contexts = entry.call_contexts.borrow();
+    assert_eq!(contexts.len(), 1);
+    assert!(contexts.front().expect("bootstrap context slot").is_none());
+}
+
+#[test]
 fn root_registered_isolates_have_no_parent() {
     let mut runtime = Runtime::new(TestShard, TestMailboxFactory);
 
