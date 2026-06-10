@@ -313,3 +313,64 @@ clean.
 | Carve-out: tracing | shutdown flush, install/live | CT-1 (High), CT-2, CT-3 (Med) |
 | Carve-out: process+aws | non-unix, slot audit | clean; AWS-Q2-A, Q1-a/b (Low/Info) |
 | Verification | refute every Med+ | 23/23 confirmed, 0 refuted; E2 High→Med; I-NEW-3 magnitude corrected |
+
+## Resolution log — 2026-06-10 fix wave
+
+Append-only record for the five 2026-06-09 fix-wave PRs opened from branches
+off reviewed `origin/main` `0cd6a31`. All orchestrator verification below was
+rerun after cleaning the touched packages from the shared
+`CARGO_TARGET_DIR=/Users/russellromney/Documents/Github/tina-rs-adv/target`,
+because a first runtime probe exposed that shared target directories can reuse
+test binaries from a sibling worktree.
+
+| Finding(s) | Status | PR | Key proving tests / checks | Honest caveats |
+|---|---|---|---|---|
+| C-1 | Fixed | #238 | `cargo test -p tina-runtime`; `readiness_park::idle_worker_makes_near_zero_wakeups`; runtime C-1 park wakeup plumbing | Uses bounded repoll rather than a cross-shard doorbell; quiet cross-shard delivery can still wait up to the idle repoll cap. No retained platform CPU-time assertion. |
+| C-5 | Fixed | #238 | `dispatch_hot_path::local_remote_ingress_does_not_scan_registered_entries_by_id`; existing send/call delivery tests | None beyond ordinary branch review. |
+| CT-1 | Fixed | #238 | `multishard_fairness::shutdown_under_remote_flood_completes_bounded` | Finite active-flood test; sustained infinite flood latency remains a separate stress concern. |
+| C-3 | Fixed | #238 | `tests::spawn_stop_churn_gcs_non_restartable_children`; `tests::supervision::supervised_restart_skips_selected_non_restartable_child` | None beyond ordinary branch review. |
+| C-2 | Fixed | #238 | `register_with_capacity_and_bootstrap::bootstrap_can_call_back_through_runtime_and_was_delivered_first`; bootstrap queue/context coverage | None beyond ordinary branch review. |
+| C-4 | Fixed | #238 | `multishard_cross_shard_spawn::cross_shard_child_ownership_cancel_pressure_does_not_orphan_admitted_children`; `cross_shard_child_ownership_stop_children_stops_remote_child_and_lifecycle_report_records_it` | None beyond ordinary branch review. |
+| E5 | Partial | #238 | `cargo test -p tina-runtime`; local queued call-context close coverage | Local drained call contexts at callee stop now close promptly; remote queued call contexts still need follow-up coverage/fix. |
+| D-4 | Fixed | #238 | `cancel_call::cancel_call_closes_pending_wait` | None beyond ordinary branch review. |
+| SP-A, SP-C, B11, B8-residual, SP-E, SP-F, B9 | Fixed | #239 | `cargo test -p tina-http`; `http2_live::http2_streaming_response_source_cancelled_on_client_disconnect`; `http2_streaming_response_reset_cancels_source`; `http2_data_after_completed_stream_resets_stream_and_keeps_connection`; `http2_data_consumption_returns_window_credit`; reset/fact unit tests | The fix is one coupled teardown-funnel commit rather than one commit per finding, because the obligations share the same stream removal/reset surface. |
+| E1 | Fixed | #240 | `keepalive::tests::stale_connected_does_not_install_transport_or_consume_request_bytes`; `stale_read_continuation_does_not_reach_next_request_buffer` | None beyond ordinary branch review. |
+| E3 | Fixed | #240 | `client::tests::stale_deadline_does_not_timeout_next_request`; `stale_connected_does_not_install_transport`; `stale_read_does_not_reach_next_request_buffer` | None beyond ordinary branch review. |
+| A1 | Fixed | #240 | `websocket_live::native_websocket_client_reassembles_fragmented_text_with_interleaved_ping`; `native_websocket_client_rejects_oversized_fragmented_message` | A local unstaged edit in the clients worktree after push changed the FIN guard to a tautology; it was not included in PR #240. |
+| CH-1 | Fixed | #240 | `http2_client_adversarial::abandoned_streamed_response_is_cancelled_and_slot_reused` | None beyond ordinary branch review. |
+| SP-D | Fixed | #240 | `grpc_client::tests::stream_end_without_grpc_status_is_malformed` | None beyond ordinary branch review. |
+| I-NEW-3 | Deferred | #240 | Existing `cargo test -p tina-http` / `cargo clippy -p tina-http` stayed green | Not fixed in this wave; cursor rewrite spans HTTP/2 client, WebSocket parser users, and gRPC buffering. |
+| E2 | Fixed | #241 | `spsc_semantics::wake_hook_runs_after_every_successful_send_while_installed`; loom model `producer_publish_racing_consumer_drain_cannot_leave_parked_message`; `tina` doctests | Loom test is behind the existing loom test target shape; direct in-tree ingress still does not use spsc. |
+| CT-2 | Fixed | #241 | `observer::tests::buffered_observer_flush_delivers_accepted_events_before_snapshot`; live replay gate tests | None beyond ordinary branch review. |
+| CT-3 | Fixed | #241 | `trace_observer::threaded_topology_reports_trace_drops_after_bounded_overflow`; `tina-tracing::live_emit_snapshot_reports_trace_dropped_after_bounded_overflow` | Runtime source changes stayed inside the prompt-approved single-shard/accessor surface. |
+| TG-1 | Fixed | #241 | `saved_replay_cases::capture_builder_rejects_multishard_live_trace`; `capture_builder_rejects_upstream_partial_live_trace` | None beyond ordinary branch review. |
+| TG-2 | Fixed with caveat | #241 | `threaded_topology_reports_trace_drops_after_bounded_overflow`; proof/accessor tests | Did not broaden the sibling-owned `threaded_multi_shard.rs` mirror path in this PR. |
+| TG-3 | Fixed | #241 | `shrink_replay_case_rejects_non_reproducing_original`; `shrink_captured_replay_rejects_non_reproducing_original`; `byte_replay::tests::shrink_rejects_non_reproducing_original` | None beyond ordinary branch review. |
+| TG-4 | Fixed | #241 | `byte_replay::tests::load_rejects_non_ascii_hex_without_panicking` | None beyond ordinary branch review. |
+| TG-5 | Fixed | #241 | `timeline::deferred_spans_are_keyed_by_shard_and_slot`; `duplicate_call_and_deferred_begins_do_not_drop_partial_truth` | None beyond ordinary branch review. |
+| TG-6 | Fixed | #241 | `perf::tests::perf_report_json_carries_tool_fields` | None beyond ordinary branch review. |
+| DST exactly-once | Added | #241 | `dst_randomized::dst_cross_shard_fan_in_under_pressure_settles_each_call_once` | New regression coverage, not tied to a single 06-09 finding row. |
+| D-1 | Fixed | #242 | `cargo check -p tina-sqlx-bridge --features tracing`; CI `verify.yml` feature check | None beyond ordinary branch review. |
+| AWS-Q2-A | Fixed as coverage | #242 | SNS/DynamoDB/Secrets `max_in_flight_rejects_full_and_pressure_reports`, `close_and_drain_reports_remaining_then_drained`, `timeout_after_admission_counts_late_result_when_sdk_finishes` | Five-worker dedup refactor intentionally left as follow-up. |
+| D-3 | Fixed | #242 | `tina-tokio-bridge::tests::bridge_error_send_rejection_mapping_keeps_timeout_distinct` | Public conversion now avoids silent Timeout->Closed conversion; callers that need a send-rejection reason use the explicit helper. |
+| D-5 | Fixed | #242 | `axum_bridge::bridge_does_not_count_preflight_cancel_as_closed_after_caller_timeout` | None beyond ordinary branch review. |
+| D-6 | Documented minimum | #242 | `cargo test -p tina-aws-bridge`; docs on shared helper and closers | Host-thread-only contract documented; cooperative drain/debug shard-thread detection remains future work. |
+| H11 | Fixed | #242 | `safety_rails_diagnostics` fixture `split_request_early_return` | None beyond ordinary branch review. |
+| H9 | Fixed | #242 | `macro_compile_fail::reserved_arg_raw_name` | None beyond ordinary branch review. |
+| H10 | Fixed | #242 | `macro_service::generated_encoding_local_does_not_shadow_user_argument` | None beyond ordinary branch review. |
+| H16 | Fixed | #242 | `macro_service::raw_identifier_method_uses_unraw_wire_name` | None beyond ordinary branch review. |
+| F-A | Fixed | #242 | `local_system::local_system_process_run_captures_truncates_and_times_out`; full `cargo test -p tina-runtime` in #242 orchestrator pass | Unix-only direct `libc::killpg`; non-unix process-drain caveats from the review remain out of scope. |
+| H12, H14 | Deferred optional lows | #242 | Not run | Optional prompt items not attempted. |
+
+Orchestrator verification summary:
+
+- #238 runtime: `cargo test -p tina-runtime`; `cargo clippy -p tina-runtime`.
+- #239 HTTP/2 server: `cargo test -p tina-http`; `cargo clippy -p tina-http`.
+- #240 HTTP clients: `cargo test -p tina-http`; `cargo clippy -p tina-http`.
+- #241 proofs/trace: `cargo test -p tina -p tina-sim -p tina-proof-harness -p tina-tracing -p tina-mailbox-spsc`; targeted `tina-runtime` trace observer tests; clippy on touched crates.
+- #242 bridges/macros/process: `cargo test -p tina-sqlx-bridge -p tina-tokio-bridge -p tina-aws-bridge -p tina-rpc -p tina-macros -p tina-rpc-macros -p tina-runtime`; `cargo check -p tina-sqlx-bridge --features tracing`; clippy on touched crates.
+
+Disk note: the shared target directory grew enough to trigger false confidence
+risk from stale sibling-worktree binaries, not ENOSPC. Cleaning touched packages
+before each orchestrator verification restored ~29 GiB free and made each test
+binary compile from its own branch checkout.
