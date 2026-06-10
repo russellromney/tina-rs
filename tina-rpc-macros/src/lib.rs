@@ -124,7 +124,9 @@ impl Parse for ServiceArgs {
 
 fn expand(args: ServiceArgs, item: ItemTrait) -> Result<TokenStream2> {
     let trait_ident = item.ident.clone();
-    let service_name_lit = args.name.unwrap_or_else(|| trait_ident.to_string());
+    let service_name_lit = args
+        .name
+        .unwrap_or_else(|| trait_ident.unraw().to_string());
     let tina_crate = args.tina_crate.unwrap_or_else(|| syn::parse_quote!(::tina));
     let rpc_crate = args
         .rpc_crate
@@ -262,7 +264,7 @@ fn extract_method(method: &TraitItemFn) -> Result<MethodSig> {
     // MAX_METHOD_LEN (255 bytes). Catching this at compile time
     // turns an `EncodeError::MethodTooLong` runtime error into a
     // clear macro diagnostic.
-    let name_str = method.sig.ident.to_string();
+    let name_str = method.sig.ident.unraw().to_string();
     if name_str.len() > 255 {
         return Err(Error::new_spanned(
             &method.sig.ident,
@@ -343,7 +345,7 @@ fn extract_method(method: &TraitItemFn) -> Result<MethodSig> {
     };
 
     let name = method.sig.ident.clone();
-    let name_str = name.to_string();
+    let name_str = name.unraw().to_string();
     let request_fn = format_ident!("{}_request", name);
     let decode_reply_fn = format_ident!("{}_decode_reply", name);
 

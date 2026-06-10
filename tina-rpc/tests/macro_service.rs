@@ -500,3 +500,23 @@ fn multi_arg_payload_is_a_json_array() {
         .payload;
     assert_eq!(zero, b"null");
 }
+
+#[test]
+fn raw_identifier_method_uses_unraw_wire_name() {
+    #[service(name = "KeywordOps")]
+    #[allow(dead_code)]
+    pub trait KeywordOps {
+        fn r#move(&mut self, value: u8) -> u8;
+    }
+
+    let request = KeywordOpsClient::move_request(
+        9,
+        Duration::from_secs(1),
+        1,
+        fake_reply_to(),
+        1024,
+    )
+    .unwrap();
+    assert_eq!(request.service, "KeywordOps");
+    assert_eq!(request.method, "move");
+}
