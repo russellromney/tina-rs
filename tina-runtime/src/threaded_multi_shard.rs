@@ -973,6 +973,8 @@ where
                     envelope,
                     QueuedRemoteEnvelope::CallReply(_)
                         | QueuedRemoteEnvelope::SpawnReply(_)
+                        | QueuedRemoteEnvelope::SpawnCancel(_)
+                        | QueuedRemoteEnvelope::ChildStop(_)
                         | QueuedRemoteEnvelope::ChildStopped(_)
                         | QueuedRemoteEnvelope::ChildRestarted(_)
                 );
@@ -1183,6 +1185,8 @@ fn route_remote_preserving_terminal(
                     failure.envelope,
                     QueuedRemoteEnvelope::CallReply(_)
                         | QueuedRemoteEnvelope::SpawnReply(_)
+                        | QueuedRemoteEnvelope::SpawnCancel(_)
+                        | QueuedRemoteEnvelope::ChildStop(_)
                         | QueuedRemoteEnvelope::ChildStopped(_)
                         | QueuedRemoteEnvelope::ChildRestarted(_)
                 ) =>
@@ -1208,6 +1212,8 @@ fn drain_terminal_overflow(
                         failure.envelope,
                         QueuedRemoteEnvelope::CallReply(_)
                             | QueuedRemoteEnvelope::SpawnReply(_)
+                            | QueuedRemoteEnvelope::SpawnCancel(_)
+                            | QueuedRemoteEnvelope::ChildStop(_)
                             | QueuedRemoteEnvelope::ChildStopped(_)
                             | QueuedRemoteEnvelope::ChildRestarted(_)
                     ) =>

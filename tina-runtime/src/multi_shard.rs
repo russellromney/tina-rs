@@ -458,6 +458,8 @@ fn enqueue_remote_envelope_preserving_terminal(
         envelope,
         QueuedRemoteEnvelope::CallReply(_)
             | QueuedRemoteEnvelope::SpawnReply(_)
+            | QueuedRemoteEnvelope::SpawnCancel(_)
+            | QueuedRemoteEnvelope::ChildStop(_)
             | QueuedRemoteEnvelope::ChildStopped(_)
             | QueuedRemoteEnvelope::ChildRestarted(_)
     );
