@@ -244,7 +244,10 @@ fn build_trace_events(timeline: &TraceTimeline, options: &TraceTimelineOptions) 
     push_metadata(timeline, options, &mut out, &mut order);
     push_runtime_events(timeline, &mut out, &mut order);
     push_reports(timeline, &mut out, &mut order);
-    out.sort_by_key(|event| (event.ts, event.event_id, event.order));
+    out.sort_by_key(|event| {
+        let shard = event.value["args"]["shard"].as_u64().unwrap_or(0);
+        (event.ts, shard, event.event_id, event.order)
+    });
     out.into_iter().map(|event| event.value).collect()
 }
 
@@ -334,9 +337,9 @@ fn push_metadata(
 fn push_runtime_events(timeline: &TraceTimeline, out: &mut Vec<EmittedEvent>, order: &mut u64) {
     let mut handler_starts: HashMap<(ShardId, IsolateId), Vec<SpanStart>> = HashMap::new();
     let mut call_starts: BTreeMap<CallId, SpanStart> = BTreeMap::new();
-    let mut deferred_starts: BTreeMap<u64, SpanStart> = BTreeMap::new();
+    let mut deferred_starts: BTreeMap<(ShardId, u64), SpanStart> = BTreeMap::new();
     let mut events = timeline.events.clone();
-    events.sort_by_key(|event| event.id().get());
+    events.sort_by_key(|event| (event.shard(), event.id()));
 
     for event in events {
         match event.kind() {
@@ -391,7 +394,7 @@ fn push_runtime_events(timeline: &TraceTimeline, out: &mut Vec<EmittedEvent>, or
             }
             RuntimeEventKind::DeferredReplyCaptured { slot_id, .. } => {
                 if let Some(previous) = deferred_starts.insert(
-                    slot_id.get(),
+                    (event.shard(), slot_id.get()),
                     SpanStart {
                         event,
                         order: *order,
@@ -410,7 +413,7 @@ fn push_runtime_events(timeline: &TraceTimeline, out: &mut Vec<EmittedEvent>, or
             RuntimeEventKind::DeferredReplySent { slot_id, .. }
             | RuntimeEventKind::DeferredReplyRejected { slot_id, .. }
             | RuntimeEventKind::DeferredReplyDropped { slot_id, .. } => {
-                if let Some(start) = deferred_starts.remove(&slot_id.get()) {
+                if let Some(start) = deferred_starts.remove(&(event.shard(), slot_id.get())) {
                     push_deferred_span(start, event, out, order);
                 } else {
                     push_instant(event, Some("missing_begin"), out, order);
@@ -789,6 +792,7 @@ fn base_args(event: &RuntimeEvent) -> Map<String, Value> {
     args.insert("event_id".into(), json!(event.id().get()));
     if let Some(cause) = event.cause() {
         args.insert("cause_id".into(), json!(cause.event().get()));
+        args.insert("cause_shard".into(), json!(event.shard().get()));
     }
     args.insert("shard".into(), json!(event.shard().get()));
     args.insert("isolate".into(), json!(event.isolate().get()));
@@ -801,6 +805,7 @@ fn insert_end_args(args: &mut Map<String, Value>, end: &RuntimeEvent) {
     args.insert("terminal_kind".into(), json!(event_name(end.kind())));
     if let Some(cause) = end.cause() {
         args.insert("end_cause_id".into(), json!(cause.event().get()));
+        args.insert("end_cause_shard".into(), json!(end.shard().get()));
     }
 }
 
