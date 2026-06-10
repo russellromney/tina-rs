@@ -192,6 +192,11 @@ struct PendingConnect {
     reply_to: Option<RequestContext<WebSocketClientReply>>,
 }
 
+struct ClientFragment {
+    opcode: u8,
+    payload: Vec<u8>,
+}
+
 pub struct WebSocketClientConnection<S: Shard + 'static> {
     limits: WebSocketLimits,
     http_limits: HttpLimits,
@@ -200,6 +205,7 @@ pub struct WebSocketClientConnection<S: Shard + 'static> {
     pending_connect: Option<PendingConnect>,
     pending_receive: Option<RequestContext<WebSocketClientReply>>,
     read_buf: Vec<u8>,
+    fragmented_message: Option<ClientFragment>,
     read_scratch: Vec<u8>,
     pending_write: Vec<u8>,
     write_queue: VecDeque<Vec<u8>>,
@@ -225,6 +231,7 @@ impl<S: Shard + 'static> WebSocketClientConnection<S> {
             pending_connect: None,
             pending_receive: None,
             read_buf: Vec::new(),
+            fragmented_message: None,
             read_scratch: Vec::new(),
             pending_write: Vec::new(),
             write_queue: VecDeque::new(),
@@ -529,11 +536,53 @@ impl<S: Shard + 'static> WebSocketClientConnection<S> {
                 FrameParse::NeedMore => break,
                 FrameParse::Error(error) => return self.fail_protocol(error),
                 FrameParse::Frame(frame) => match frame.opcode {
-                    0x1 => match String::from_utf8(frame.payload) {
-                        Ok(text) => self.push_event(WebSocketClientEvent::Text(text)),
-                        Err(_) => return self.fail_protocol(WebSocketError::ProtocolError),
-                    },
-                    0x2 => self.push_event(WebSocketClientEvent::Binary(frame.payload)),
+                    0x1 | 0x2 if frame.fin => {
+                        if self.fragmented_message.is_some() {
+                            return self.fail_protocol(WebSocketError::ProtocolError);
+                        }
+                        if let Err(error) = self.push_data_message(frame.opcode, frame.payload) {
+                            return self.fail_protocol(error);
+                        }
+                    }
+                    0x1 | 0x2 => {
+                        if self.fragmented_message.is_some() {
+                            return self.fail_protocol(WebSocketError::ProtocolError);
+                        }
+                        self.fragmented_message = Some(ClientFragment {
+                            opcode: frame.opcode,
+                            payload: frame.payload,
+                        });
+                    }
+                    0x0 => {
+                        let complete = {
+                            let Some(fragment) = self.fragmented_message.as_mut() else {
+                                return self.fail_protocol(WebSocketError::ProtocolError);
+                            };
+                            let next_len =
+                                match fragment.payload.len().checked_add(frame.payload.len()) {
+                                    Some(len) => len,
+                                    None => {
+                                        return self.fail_protocol(WebSocketError::MessageTooLarge);
+                                    }
+                                };
+                            if next_len > self.limits.max_message_bytes {
+                                return self.fail_protocol(WebSocketError::MessageTooLarge);
+                            }
+                            fragment.payload.extend_from_slice(&frame.payload);
+                            if frame.fin {
+                                self.fragmented_message
+                                    .take()
+                                    .map(|fragment| (fragment.opcode, fragment.payload))
+                            } else {
+                                None
+                            }
+                        };
+                        if let Some((opcode, payload)) = complete {
+                            if let Err(error) = self.push_data_message(opcode, payload) {
+                                return self.fail_protocol(error);
+                            }
+                        }
+                    }
                     0x8 => {
                         self.close_received = true;
                         self.report.close_received = true;
@@ -570,6 +619,23 @@ impl<S: Shard + 'static> WebSocketClientConnection<S> {
         }
         effects.push(self.deliver_or_read_more());
         batch(effects)
+    }
+
+    fn push_data_message(&mut self, opcode: u8, payload: Vec<u8>) -> Result<(), WebSocketError> {
+        match opcode {
+            0x1 => match String::from_utf8(payload) {
+                Ok(text) => {
+                    self.push_event(WebSocketClientEvent::Text(text));
+                    Ok(())
+                }
+                Err(_) => Err(WebSocketError::ProtocolError),
+            },
+            0x2 => {
+                self.push_event(WebSocketClientEvent::Binary(payload));
+                Ok(())
+            }
+            _ => Err(WebSocketError::ProtocolError),
+        }
     }
 
     fn push_event(&mut self, event: WebSocketClientEvent) {
@@ -875,6 +941,14 @@ fn is_subprotocol_token(token: &str) -> bool {
 mod tests {
     use super::*;
 
+    fn server_frame(fin: bool, opcode: u8, payload: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(2 + payload.len());
+        out.push(if fin { 0x80 | opcode } else { opcode });
+        out.push(payload.len() as u8);
+        out.extend_from_slice(payload);
+        out
+    }
+
     #[test]
     fn wrong_lane_message_is_counted_in_release_path() {
         let mut client =
@@ -884,5 +958,71 @@ mod tests {
         let _ = client.wrong_lane_message();
 
         assert_eq!(client.snapshot().wrong_lane_messages, 2);
+    }
+
+    #[test]
+    fn fragmented_text_reassembles_with_interleaved_ping() {
+        let mut client =
+            WebSocketClientConnection::<tina::SingleShard>::new(WebSocketLimits::default());
+        client.state = WebSocketClientState::Open;
+        client
+            .read_buf
+            .extend_from_slice(&server_frame(false, 0x1, b"hel"));
+        client
+            .read_buf
+            .extend_from_slice(&server_frame(true, 0x9, b"p"));
+        client
+            .read_buf
+            .extend_from_slice(&server_frame(false, 0x0, b"lo"));
+        client
+            .read_buf
+            .extend_from_slice(&server_frame(true, 0x0, b"!"));
+
+        let _ = client.drain_frames();
+
+        assert_eq!(client.state, WebSocketClientState::Open);
+        assert!(client.fragmented_message.is_none());
+        let text_events = client
+            .events
+            .iter()
+            .filter(|event| matches!(event, WebSocketClientEvent::Text(_)))
+            .count();
+        assert_eq!(text_events, 1, "fragments produce one text message");
+        assert!(matches!(
+            client.events.pop_front(),
+            Some(WebSocketClientEvent::Ping(bytes)) if bytes == b"p"
+        ));
+        assert!(matches!(
+            client.events.pop_front(),
+            Some(WebSocketClientEvent::Text(text)) if text == "hello!"
+        ));
+    }
+
+    #[test]
+    fn oversized_fragmented_message_is_protocol_error() {
+        let limits = WebSocketLimits {
+            max_message_bytes: 4,
+            ..WebSocketLimits::default()
+        };
+        let mut client = WebSocketClientConnection::<tina::SingleShard>::new(limits);
+        client.state = WebSocketClientState::Open;
+        client
+            .read_buf
+            .extend_from_slice(&server_frame(false, 0x1, b"hel"));
+        client
+            .read_buf
+            .extend_from_slice(&server_frame(true, 0x0, b"lo"));
+
+        let _ = client.drain_frames();
+
+        assert_eq!(client.state, WebSocketClientState::Closed);
+        assert_eq!(client.snapshot().protocol_errors, 1);
+        assert!(matches!(
+            client.events.pop_front(),
+            Some(WebSocketClientEvent::Close {
+                code: Some(WebSocketCloseCode(1002)),
+                ..
+            })
+        ));
     }
 }
