@@ -2446,19 +2446,23 @@ where
             self.entries[index].generation,
             stopped.into(),
         );
-        if precollected.is_some() {
-            self.push_event(
-                isolate_id,
-                Some(stopped.into()),
-                RuntimeEventKind::MessageAbandoned,
-            );
+        if let Some(message) = precollected {
+            if !self.close_drained_local_call_context(isolate_id, stopped.into(), message) {
+                self.push_event(
+                    isolate_id,
+                    Some(stopped.into()),
+                    RuntimeEventKind::MessageAbandoned,
+                );
+            }
         }
-        while self.recv_entry_message(index).is_some() {
-            self.push_event(
-                isolate_id,
-                Some(stopped.into()),
-                RuntimeEventKind::MessageAbandoned,
-            );
+        while let Some(message) = self.recv_entry_message(index) {
+            if !self.close_drained_local_call_context(isolate_id, stopped.into(), message) {
+                self.push_event(
+                    isolate_id,
+                    Some(stopped.into()),
+                    RuntimeEventKind::MessageAbandoned,
+                );
+            }
         }
         // Result delivery happens last so the host only wakes after every
         // lifecycle/trace fact is recorded. With no value, drain any
@@ -2486,6 +2490,27 @@ where
                 || record.remote_restartable
                 || supervised_parents.contains(&record.parent)
         });
+    }
+
+    fn close_drained_local_call_context(
+        &mut self,
+        isolate_id: IsolateId,
+        cause: CauseId,
+        message: DeliveredMessage,
+    ) -> bool {
+        let Some(MessageCallContext::Local { call_id }) = message.call_context else {
+            return false;
+        };
+        self.push_event(
+            isolate_id,
+            Some(cause),
+            RuntimeEventKind::CallFailed {
+                call_id,
+                call_kind: CallKind::IsolateCall,
+                reason: CallError::TargetClosed,
+            },
+        );
+        self.complete_isolate_call(call_id, cause, CallOutcome::Closed)
     }
 
     pub(crate) fn restart_children(
