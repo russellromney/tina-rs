@@ -520,3 +520,22 @@ fn raw_identifier_method_uses_unraw_wire_name() {
     assert_eq!(request.service, "KeywordOps");
     assert_eq!(request.method, "move");
 }
+
+#[test]
+fn generated_encoding_local_does_not_shadow_user_argument() {
+    #[service(name = "Collision")]
+    #[allow(dead_code)]
+    pub trait Collision {
+        fn echo(&self, __tina_encoding: u8) -> u8;
+    }
+
+    let request = CollisionClient::echo_request(
+        7,
+        Duration::from_secs(1),
+        1,
+        fake_reply_to(),
+        1024,
+    )
+    .unwrap();
+    assert_eq!(request.payload, b"[7]");
+}

@@ -7,7 +7,7 @@
 //! directly.
 
 use proc_macro::TokenStream;
-use proc_macro2::TokenStream as TokenStream2;
+use proc_macro2::{Span, TokenStream as TokenStream2};
 use quote::{format_ident, quote};
 use syn::ext::IdentExt;
 use syn::parse::{Parse, ParseStream};
@@ -536,8 +536,8 @@ fn build_client_method(
     // Non-collidable local names: a trait arg called `encoding`/`payload` would
     // otherwise shadow these builder locals and encode the wrong value. Reserved
     // names reject such args, but keep the `__tina_` prefix as defense-in-depth.
-    let enc_local = format_ident!("__tina_encoding");
-    let payload_local = format_ident!("__tina_payload");
+    let enc_local = Ident::new("__tina_encoding", Span::mixed_site());
+    let payload_local = Ident::new("__tina_payload", Span::mixed_site());
 
     let arg_decls: Vec<TokenStream2> = m
         .args
