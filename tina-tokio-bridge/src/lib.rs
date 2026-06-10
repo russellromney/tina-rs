@@ -162,6 +162,36 @@ impl std::fmt::Display for BridgeError {
 
 impl std::error::Error for BridgeError {}
 
+impl BridgeError {
+    /// Converts only the bridge errors that are true send-rejection reasons.
+    pub fn send_rejected_reason(self) -> Option<SendRejectedReason> {
+        match self {
+            Self::Full => Some(SendRejectedReason::Full),
+            Self::Closed => Some(SendRejectedReason::Closed),
+            Self::Timeout => None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bridge_error_send_rejection_mapping_keeps_timeout_distinct() {
+        assert_eq!(
+            BridgeError::Full.send_rejected_reason(),
+            Some(SendRejectedReason::Full)
+        );
+        assert_eq!(
+            BridgeError::Closed.send_rejected_reason(),
+            Some(SendRejectedReason::Closed)
+        );
+        assert_eq!(BridgeError::Timeout.send_rejected_reason(), None);
+        assert_eq!(CallError::from(BridgeError::Timeout), CallError::Timeout);
+    }
+}
+
 /// Capability status for the Tokio bridge compared with Tina core semantics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CapabilityStatus {
@@ -478,15 +508,6 @@ impl From<BridgeError> for CallError {
             BridgeError::Full => Self::TargetFull,
             BridgeError::Closed => Self::TargetClosed,
             BridgeError::Timeout => Self::Timeout,
-        }
-    }
-}
-
-impl From<BridgeError> for SendRejectedReason {
-    fn from(error: BridgeError) -> Self {
-        match error {
-            BridgeError::Full => Self::Full,
-            BridgeError::Closed | BridgeError::Timeout => Self::Closed,
         }
     }
 }
