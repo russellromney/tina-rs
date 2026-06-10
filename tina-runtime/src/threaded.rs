@@ -1289,16 +1289,9 @@ where
 
     /// Returns retained trace without failing the observability path.
     pub fn trace(&self) -> TraceSnapshot {
-        match self.complete_trace() {
-            Ok(events) => TraceSnapshot::complete(events),
-            Err(ThreadedRuntimeError::WorkerStopped) => TraceSnapshot::partial(
-                Vec::new(),
-                self.topology()
-                    .shards()
-                    .iter()
-                    .map(|shard| shard.shard())
-                    .collect(),
-            ),
+        match self.call(|runtime| (runtime.trace().to_vec(), runtime.trace_dropped())) {
+            Ok((events, 0)) => TraceSnapshot::complete(events),
+            Ok((events, dropped_events)) => TraceSnapshot::retained_suffix(events, dropped_events),
             Err(_) => TraceSnapshot::partial(
                 Vec::new(),
                 self.topology()
@@ -1310,9 +1303,16 @@ where
         }
     }
 
-    /// Returns complete trace, failing if the worker can no longer report.
+    /// Returns complete trace, failing if the worker can no longer report or
+    /// retention already dropped a prefix.
     pub fn complete_trace(&self) -> Result<Vec<RuntimeEvent>, ThreadedRuntimeError> {
-        self.call(|runtime| runtime.trace().to_vec())
+        self.call(|runtime| {
+            runtime
+                .trace_for_proof()
+                .map(|trace| trace.to_vec())
+                .map_err(|_| ())
+        })?
+        .map_err(|()| ThreadedRuntimeError::WorkerStopped)
     }
 
     /// Returns the number of trace events dropped by the retention policy.

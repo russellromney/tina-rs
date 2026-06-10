@@ -18,7 +18,8 @@ use std::time::{Duration, Instant};
 use tina::prelude::*;
 use tina_runtime::{
     DefaultMailboxFactory, DefaultThreadedMailboxFactory, Runtime, RuntimeEvent, RuntimeEventKind,
-    ThreadedRuntime, ThreadedRuntimeConfig, TraceObserver, TraceRetention, sleep,
+    ThreadedRuntime, ThreadedRuntimeConfig, ThreadedRuntimeError, TraceObserver, TraceRetention,
+    sleep,
 };
 
 #[derive(Debug, Default)]
@@ -170,7 +171,7 @@ fn threaded_topology_reports_trace_drops_after_bounded_overflow() {
     runtime.try_send(addr, Msg::Begin).expect("kick tiny");
 
     let deadline = Instant::now() + Duration::from_secs(2);
-    let dropped = loop {
+    let _ = loop {
         let dropped = runtime.trace_dropped().expect("worker reports trace drops");
         if dropped > 0 {
             break dropped;
@@ -181,10 +182,35 @@ fn threaded_topology_reports_trace_drops_after_bounded_overflow() {
         );
         thread::sleep(Duration::from_millis(10));
     };
+    while runtime
+        .has_in_flight_calls()
+        .expect("worker reports in-flight calls")
+    {
+        assert!(
+            Instant::now() < deadline,
+            "worker did not settle tiny workload"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    let dropped = runtime.trace_dropped().expect("worker reports trace drops");
 
     let topology = runtime.topology();
     let shard = topology.shards().first().expect("single shard report");
     assert_eq!(shard.trace_dropped(), Some(dropped));
+
+    assert_eq!(
+        runtime.complete_trace(),
+        Err(ThreadedRuntimeError::WorkerStopped)
+    );
+    let trace = runtime.trace();
+    assert!(!trace.is_complete());
+    assert!(trace.is_partial());
+    assert_eq!(trace.dropped_events(), dropped);
+    assert_eq!(
+        trace.clone().complete_events(),
+        Err(ThreadedRuntimeError::WorkerStopped)
+    );
+    assert!(!trace.events().is_empty(), "diagnostic suffix remains visible");
 
     let _ = runtime.shutdown();
 }

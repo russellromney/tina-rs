@@ -457,6 +457,7 @@ pub struct LocalSystemTerminalSummary {
 pub struct TraceSnapshot {
     events: Vec<RuntimeEvent>,
     missing_shards: Vec<ShardId>,
+    dropped_events: u64,
 }
 
 impl TraceSnapshot {
@@ -464,6 +465,7 @@ impl TraceSnapshot {
         Self {
             events,
             missing_shards: Vec::new(),
+            dropped_events: 0,
         }
     }
 
@@ -471,6 +473,15 @@ impl TraceSnapshot {
         Self {
             events,
             missing_shards,
+            dropped_events: 0,
+        }
+    }
+
+    pub(crate) fn retained_suffix(events: Vec<RuntimeEvent>, dropped_events: u64) -> Self {
+        Self {
+            events,
+            missing_shards: Vec::new(),
+            dropped_events,
         }
     }
 
@@ -479,12 +490,14 @@ impl TraceSnapshot {
         &self.events
     }
 
-    /// Whether every shard reported trace successfully.
+    /// Whether every shard reported trace successfully and no retained prefix
+    /// was dropped by trace retention.
     pub fn is_complete(&self) -> bool {
-        self.missing_shards.is_empty()
+        self.missing_shards.is_empty() && self.dropped_events == 0
     }
 
-    /// Whether at least one shard could not report trace.
+    /// Whether at least one shard could not report trace, or retention already
+    /// dropped events.
     pub fn is_partial(&self) -> bool {
         !self.is_complete()
     }
@@ -494,13 +507,21 @@ impl TraceSnapshot {
         &self.missing_shards
     }
 
-    /// Returns complete trace events, or a typed error if any shard was missing.
+    /// Number of events dropped by retention before this retained suffix.
+    pub const fn dropped_events(&self) -> u64 {
+        self.dropped_events
+    }
+
+    /// Returns complete trace events, or a typed error if any shard was missing
+    /// or retention already dropped a prefix.
     pub fn complete_events(self) -> Result<Vec<RuntimeEvent>, ThreadedRuntimeError> {
-        if self.is_complete() {
-            Ok(self.events)
-        } else {
-            Err(ThreadedRuntimeError::WorkerStopped)
+        if !self.missing_shards.is_empty() {
+            return Err(ThreadedRuntimeError::WorkerStopped);
         }
+        if self.dropped_events != 0 {
+            return Err(ThreadedRuntimeError::WorkerStopped);
+        }
+        Ok(self.events)
     }
 
     /// Consumes the snapshot and returns whatever events could be collected.
