@@ -23,11 +23,13 @@ pub(crate) struct DrainResult {
     pub in_flight_kinds: Vec<(&'static str, u64)>,
 }
 
-/// Wait up to `timeout` for the in-flight count to reach zero. Polls
-/// every millisecond. When the deadline fires while there is still
-/// in-flight work, the caller-supplied `in_flight_kinds` thunk is
-/// invoked exactly once to capture a per-kind snapshot for the drain
-/// report.
+/// Wait up to `timeout` for the in-flight count to reach zero.
+///
+/// This is a blocking host-thread helper: it polls with `thread::sleep`
+/// and must not run from a Tina shard handler that needs to make the
+/// in-flight work progress. When the deadline fires while there is still
+/// in-flight work, the caller-supplied `in_flight_kinds` thunk is invoked
+/// exactly once to capture a per-kind snapshot for the drain report.
 pub(crate) fn await_drain<K>(
     in_flight: &AtomicU64,
     in_flight_kinds: K,

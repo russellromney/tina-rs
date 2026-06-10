@@ -100,8 +100,11 @@ impl DynamoCloser {
         self.closed.load(Ordering::Acquire)
     }
 
-    /// Close admission and wait up to `timeout` for already accepted
-    /// SDK work to leave the bridge's in-flight set.
+    /// Close admission and block this host thread up to `timeout` for already
+    /// accepted SDK work to leave the bridge's in-flight set.
+    ///
+    /// Do not call this from a Tina shard handler for this bridge; the shard
+    /// must keep running to poll completions and release in-flight slots.
     pub fn close_and_drain(&self, timeout: Duration) -> DynamoDrainReport {
         self.close();
         let result = crate::core::await_drain(
