@@ -480,19 +480,27 @@ fn shutdown_under_remote_flood_completes_bounded() {
         .expect("register sink");
 
     let running = Arc::new(std::sync::atomic::AtomicBool::new(true));
-    register_flood(&runtime, sink, &running, FLOOD_SOURCES, FLOOD_TICKS);
+    register_flood(&runtime, sink, &running, FLOOD_SOURCES, 128);
 
     // Wait until the flood is actively in flight.
-    std::thread::sleep(Duration::from_millis(50));
+    std::thread::sleep(Duration::from_millis(10));
     assert!(hits.load(Ordering::Relaxed) > 0, "flood must be in flight");
 
     let start = Instant::now();
-    // Stop the source first so shutdown-time `runtime.step()` does not
-    // try to route cross-shard sends (that path lacks a remote handler
-    // and panics — separate pre-existing failure mode, not A12).
-    running.store(false, Ordering::Relaxed);
-    let _report = runtime.shutdown();
+    let trace = runtime.shutdown().expect("shutdown under remote flood");
     let shutdown_latency = start.elapsed();
+    assert!(
+        trace
+            .iter()
+            .any(|event| event.shard() == ShardId::new(11)),
+        "source shard trace should be present after shutdown"
+    );
+    assert!(
+        trace
+            .iter()
+            .any(|event| event.shard() == ShardId::new(22)),
+        "sink shard trace should be present after shutdown"
+    );
     assert!(
         shutdown_latency < Duration::from_secs(3),
         "shutdown starved by remote flood (took {:?})",

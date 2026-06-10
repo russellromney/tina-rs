@@ -14,7 +14,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use betelgeuse::{IOLoopHandle, IOWaker, io_loop};
-use tina::{Address, Isolate, Outbound as TinaOutbound, Shard, TrySendError};
+use tina::{Address, Isolate, Outbound as TinaOutbound, Shard, ShardId, TrySendError};
 use tina_supervisor::SupervisorConfig;
 
 use crate::call::{CallOutcome, IntoErasedCall};
@@ -38,10 +38,11 @@ use crate::mailbox::MailboxFactory;
 use crate::observation::{self, BoundAddressWaiter};
 use crate::observer::TraceObserver;
 use crate::shutdown::{SharedShutdownState, ShutdownWorker, ThreadedShutdownHandle, handle_for};
-use crate::trace::{CallKind, RuntimeEvent};
+use crate::trace::{CallKind, RuntimeEvent, SendRejectedReason};
 use crate::{
     ChildLifecycleReport, IdSource, IntoErasedSpawn, IntoErasedSpawnObserved,
-    IntoSendErasedSpawnObserved, PreallocationConfig, Runtime, TraceRetention,
+    IntoSendErasedSpawnObserved, PreallocationConfig, QueuedRemoteEnvelope, Runtime,
+    TraceRetention,
 };
 
 /// Configuration for [`ThreadedRuntime`].
@@ -1843,6 +1844,22 @@ where
     runtime.notify_signal("shutdown");
     for _ in 0..1024 {
         if runtime.step() == 0 {
+            break;
+        }
+    }
+}
+
+pub(crate) fn deliver_shutdown_signal_and_drain_with_remote<S, F, FR>(
+    runtime: &mut Runtime<S, F>,
+    route_remote: &mut FR,
+) where
+    S: Shard + 'static,
+    F: MailboxFactory + 'static,
+    FR: FnMut(ShardId, QueuedRemoteEnvelope) -> Result<(), SendRejectedReason>,
+{
+    runtime.notify_signal("shutdown");
+    for _ in 0..1024 {
+        if runtime.step_with_remote(route_remote) == 0 {
             break;
         }
     }

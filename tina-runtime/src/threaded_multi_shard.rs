@@ -38,8 +38,8 @@ use crate::observer::TraceObserver;
 use crate::sharded::ReplyAdapter;
 use crate::shutdown::{SharedShutdownState, ShutdownWorker, ThreadedShutdownHandle, handle_for};
 use crate::threaded::{
-    CommandSender, ThreadedCommand, ThreadedRuntimeConfig, deliver_shutdown_signal_and_drain,
-    run_host_call,
+    CommandSender, ThreadedCommand, ThreadedRuntimeConfig,
+    deliver_shutdown_signal_and_drain_with_remote, run_host_call,
 };
 use crate::trace::{RuntimeEvent, SendRejectedReason};
 use crate::{
@@ -1088,7 +1088,13 @@ where
                 continue;
             }
             Ok(ThreadedCommand::Shutdown) => {
-                deliver_shutdown_signal_and_drain(&mut runtime);
+                deliver_shutdown_signal_and_drain_with_remote(&mut runtime, &mut |_, envelope| {
+                    route_remote_preserving_terminal(
+                        envelope,
+                        &mut terminal_overflow,
+                        &route_remote_lossless,
+                    )
+                });
                 break;
             }
             Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
@@ -1127,7 +1133,13 @@ where
                 run_host_call(&mut runtime, dispatcher, begin)
             }
             Ok(ThreadedCommand::Shutdown) => {
-                deliver_shutdown_signal_and_drain(&mut runtime);
+                deliver_shutdown_signal_and_drain_with_remote(&mut runtime, &mut |_, envelope| {
+                    route_remote_preserving_terminal(
+                        envelope,
+                        &mut terminal_overflow,
+                        &route_remote_lossless,
+                    )
+                });
                 break;
             }
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
