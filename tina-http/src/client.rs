@@ -56,12 +56,27 @@ pub struct OutboundCall {
 #[derive(Debug, Clone)]
 pub enum HttpClientMsg {
     Call(Box<OutboundCall>),
-    Connected(Result<(StreamId, SocketAddr, SocketAddr), CallError>),
-    TlsConnected(Result<TlsStreamId, CallError>),
-    Wrote(Result<TcpWriteOwnedReply, CallError>),
-    Read(Result<TcpReadBufReply, CallError>),
+    Connected {
+        generation: u64,
+        result: Result<(StreamId, SocketAddr, SocketAddr), CallError>,
+    },
+    TlsConnected {
+        generation: u64,
+        result: Result<TlsStreamId, CallError>,
+    },
+    Wrote {
+        generation: u64,
+        result: Result<TcpWriteOwnedReply, CallError>,
+    },
+    Read {
+        generation: u64,
+        result: Result<TcpReadBufReply, CallError>,
+    },
     Closed(Result<(), CallError>),
-    Deadline(Result<(), CallError>),
+    Deadline {
+        generation: u64,
+        result: Result<(), CallError>,
+    },
 }
 
 impl HttpClientMsg {
@@ -81,11 +96,13 @@ impl HttpClientMsg {
 pub struct HttpClient<S: Shard + 'static> {
     config: HttpClientConfig,
     state: Option<ActiveCall>,
+    request_generation: u64,
     _shard: PhantomData<S>,
 }
 
 /// State for one in-flight call. Cleared at terminal.
 struct ActiveCall {
+    generation: u64,
     request_bytes: Vec<u8>,
     transport: Option<HttpTransport>,
     pending_write: Vec<u8>,
@@ -110,6 +127,7 @@ impl<S: Shard + 'static> HttpClient<S> {
         Self {
             config,
             state: None,
+            request_generation: 0,
             _shard: PhantomData,
         }
     }
@@ -140,7 +158,13 @@ impl<S: Shard + 'static> Isolate for HttpClient<S> {
         match msg {
             HttpClientMsg::Call(call) => self.handle_outbound_call(*call, None),
 
-            HttpClientMsg::Connected(Ok((stream, _local, _peer))) => {
+            HttpClientMsg::Connected {
+                generation,
+                result: Ok((stream, _local, _peer)),
+            } => {
+                if !self.is_current_generation(generation) {
+                    return tcp_close_stream(stream).then(HttpClientMsg::Closed);
+                }
                 let Some(state) = self.state.as_mut() else {
                     // Previous call already ended; close the dangling stream.
                     return tcp_close_stream(stream).then(HttpClientMsg::Closed);
@@ -149,9 +173,25 @@ impl<S: Shard + 'static> Isolate for HttpClient<S> {
                 state.pending_write = std::mem::take(&mut state.request_bytes);
                 self.write_more()
             }
-            HttpClientMsg::Connected(Err(_)) => self.fail(HttpClientError::Connect),
+            HttpClientMsg::Connected {
+                generation,
+                result: Err(_),
+            } => {
+                if self.is_current_generation(generation) {
+                    self.fail(HttpClientError::Connect)
+                } else {
+                    noop()
+                }
+            }
 
-            HttpClientMsg::TlsConnected(Ok(stream)) => {
+            HttpClientMsg::TlsConnected {
+                generation,
+                result: Ok(stream),
+            } => {
+                if !self.is_current_generation(generation) {
+                    return tls_close(stream, self.config.request_timeout)
+                        .then(HttpClientMsg::Closed);
+                }
                 let Some(state) = self.state.as_mut() else {
                     return tls_close(stream, self.config.request_timeout)
                         .then(HttpClientMsg::Closed);
@@ -160,27 +200,72 @@ impl<S: Shard + 'static> Isolate for HttpClient<S> {
                 state.pending_write = std::mem::take(&mut state.request_bytes);
                 self.write_more()
             }
-            HttpClientMsg::TlsConnected(Err(source)) => self.fail(HttpClientError::Transport {
-                phase: HttpTransportPhase::Connect,
-                source,
-            }),
+            HttpClientMsg::TlsConnected {
+                generation,
+                result: Err(source),
+            } => {
+                if self.is_current_generation(generation) {
+                    self.fail(HttpClientError::Transport {
+                        phase: HttpTransportPhase::Connect,
+                        source,
+                    })
+                } else {
+                    noop()
+                }
+            }
 
-            HttpClientMsg::Wrote(Ok(reply)) => self.handle_wrote(reply),
-            HttpClientMsg::Wrote(Err(source)) => self.fail(self.transport_or_flat_error(
-                HttpTransportPhase::Write,
-                source,
-                HttpClientError::Write,
-            )),
+            HttpClientMsg::Wrote {
+                generation,
+                result: Ok(reply),
+            } => {
+                if self.is_current_generation(generation) {
+                    self.handle_wrote(reply)
+                } else {
+                    noop()
+                }
+            }
+            HttpClientMsg::Wrote {
+                generation,
+                result: Err(source),
+            } => {
+                if self.is_current_generation(generation) {
+                    self.fail(self.transport_or_flat_error(
+                        HttpTransportPhase::Write,
+                        source,
+                        HttpClientError::Write,
+                    ))
+                } else {
+                    noop()
+                }
+            }
 
-            HttpClientMsg::Read(Ok(reply)) => self.handle_read_reply(reply),
-            HttpClientMsg::Read(Err(source)) => self.fail(self.transport_or_flat_error(
-                HttpTransportPhase::Read,
-                source,
-                HttpClientError::Read,
-            )),
+            HttpClientMsg::Read {
+                generation,
+                result: Ok(reply),
+            } => {
+                if self.is_current_generation(generation) {
+                    self.handle_read_reply(reply)
+                } else {
+                    noop()
+                }
+            }
+            HttpClientMsg::Read {
+                generation,
+                result: Err(source),
+            } => {
+                if self.is_current_generation(generation) {
+                    self.fail(self.transport_or_flat_error(
+                        HttpTransportPhase::Read,
+                        source,
+                        HttpClientError::Read,
+                    ))
+                } else {
+                    noop()
+                }
+            }
 
-            HttpClientMsg::Deadline(_) => {
-                if self.state.is_some() {
+            HttpClientMsg::Deadline { generation, .. } => {
+                if self.is_current_generation(generation) {
                     self.fail(HttpClientError::Timeout)
                 } else {
                     noop()
@@ -228,7 +313,13 @@ impl<S: Shard + 'static> HttpClient<S> {
             }
         };
         let request_bytes = encode_request(&request);
+        self.request_generation = self
+            .request_generation
+            .checked_add(1)
+            .expect("HttpClient request_generation overflowed u64");
+        let generation = self.request_generation;
         self.state = Some(ActiveCall {
+            generation,
             request_bytes,
             transport: None,
             pending_write: Vec::new(),
@@ -241,7 +332,8 @@ impl<S: Shard + 'static> HttpClient<S> {
             reply_to,
         });
         let connect_effect: Effect<Self> = match target {
-            HttpTarget::Http { addr, .. } => tcp_connect(addr).then(HttpClientMsg::Connected),
+            HttpTarget::Http { addr, .. } => tcp_connect(addr)
+                .then(move |result| HttpClientMsg::Connected { generation, result }),
             HttpTarget::Https {
                 addr,
                 server_name,
@@ -253,10 +345,10 @@ impl<S: Shard + 'static> HttpClient<S> {
                 trust_roots.root_certificates_der,
                 self.config.request_timeout,
             )
-            .then(HttpClientMsg::TlsConnected),
+            .then(move |result| HttpClientMsg::TlsConnected { generation, result }),
         };
-        let deadline_effect: Effect<Self> =
-            sleep(self.config.request_timeout).then(HttpClientMsg::Deadline);
+        let deadline_effect: Effect<Self> = sleep(self.config.request_timeout)
+            .then(move |result| HttpClientMsg::Deadline { generation, result });
         batch(vec![connect_effect, deadline_effect])
     }
 
@@ -274,20 +366,33 @@ impl<S: Shard + 'static> HttpClient<S> {
         }
     }
 
+    fn is_current_generation(&self, generation: u64) -> bool {
+        self.state
+            .as_ref()
+            .is_some_and(|state| state.generation == generation)
+    }
+
     fn write_more(&mut self) -> Effect<Self> {
         let state = self.state.as_mut().expect("state present during write");
         let transport = state.transport.expect("transport set before write");
         let bytes = std::mem::take(&mut state.pending_write);
         match transport {
-            HttpTransport::Tcp(stream) => tcp_write_owned(stream, bytes)
-                .then(|result| HttpClientMsg::Wrote(result.map_err(|error| error.error))),
+            HttpTransport::Tcp(stream) => {
+                let generation = state.generation;
+                tcp_write_owned(stream, bytes).then(move |result| HttpClientMsg::Wrote {
+                    generation,
+                    result: result.map_err(|error| error.error),
+                })
+            }
             HttpTransport::Tls(stream) => {
-                tls_write_owned(stream, bytes, self.config.request_timeout).then(|result| {
-                    HttpClientMsg::Wrote(
-                        result
+                let generation = state.generation;
+                tls_write_owned(stream, bytes, self.config.request_timeout).then(move |result| {
+                    HttpClientMsg::Wrote {
+                        generation,
+                        result: result
                             .map(tls_write_reply_to_tcp)
                             .map_err(|error| error.error),
-                    )
+                    }
                 })
             }
         }
@@ -319,16 +424,21 @@ impl<S: Shard + 'static> HttpClient<S> {
         let transport = state.transport.expect("transport set before read");
         let buffer = std::mem::take(&mut state.read_scratch);
         match transport {
-            HttpTransport::Tcp(stream) => tcp_read_buf(stream, buffer, READ_CHUNK)
-                .then(|result| HttpClientMsg::Read(result.map_err(|error| error.error))),
+            HttpTransport::Tcp(stream) => {
+                let generation = state.generation;
+                tcp_read_buf(stream, buffer, READ_CHUNK).then(move |result| HttpClientMsg::Read {
+                    generation,
+                    result: result.map_err(|error| error.error),
+                })
+            }
             HttpTransport::Tls(stream) => {
+                let generation = state.generation;
                 tls_read_buf(stream, buffer, READ_CHUNK, self.config.request_timeout).then(
-                    |result| {
-                        HttpClientMsg::Read(
-                            result
-                                .map(tls_read_reply_to_tcp)
-                                .map_err(|error| error.error),
-                        )
+                    move |result| HttpClientMsg::Read {
+                        generation,
+                        result: result
+                            .map(tls_read_reply_to_tcp)
+                            .map_err(|error| error.error),
                     },
                 )
             }
@@ -479,6 +589,123 @@ fn tls_write_reply_to_tcp(reply: TlsWriteOwnedReply) -> TcpWriteOwnedReply {
     TcpWriteOwnedReply {
         bytes: reply.bytes,
         written: reply.written,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tina::Isolate;
+    use tina::{IsolateId, ShardId};
+    use tina_runtime::StreamId;
+
+    #[derive(Debug, Default)]
+    struct TestShard;
+
+    impl Shard for TestShard {
+        fn id(&self) -> ShardId {
+            ShardId::new(77)
+        }
+    }
+
+    fn client() -> HttpClient<TestShard> {
+        HttpClient::new(HttpClientConfig::dev())
+    }
+
+    fn active_call(generation: u64) -> ActiveCall {
+        ActiveCall {
+            generation,
+            request_bytes: b"GET / HTTP/1.1\r\nHost: x\r\n\r\n".to_vec(),
+            transport: None,
+            pending_write: Vec::new(),
+            read_scratch: Vec::new(),
+            read_buf: Vec::new(),
+            parsed_head: None,
+            head_len: 0,
+            chunked_decoder: None,
+            body_buf: Vec::new(),
+            reply_to: None,
+        }
+    }
+
+    fn context<'a>(
+        shard: &'a mut TestShard,
+    ) -> Context<'a, TestShard, Result<HttpResponse, HttpClientError>> {
+        Context::new_typed(shard, IsolateId::new(1))
+    }
+
+    #[test]
+    fn stale_deadline_does_not_timeout_next_request() {
+        let mut client = client();
+        client.state = Some(active_call(2));
+        let mut shard = TestShard;
+        let mut ctx = context(&mut shard);
+
+        let _ = client.handle(
+            HttpClientMsg::Deadline {
+                generation: 1,
+                result: Ok(()),
+            },
+            &mut ctx,
+        );
+
+        assert!(client.state.is_some(), "current request must stay active");
+    }
+
+    #[test]
+    fn stale_read_does_not_reach_next_request_buffer() {
+        let mut client = client();
+        client.state = Some(active_call(2));
+        let mut shard = TestShard;
+        let mut ctx = context(&mut shard);
+        let bytes = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nstale".to_vec();
+
+        let _ = client.handle(
+            HttpClientMsg::Read {
+                generation: 1,
+                result: Ok(TcpReadBufReply {
+                    len: bytes.len(),
+                    buffer: bytes,
+                }),
+            },
+            &mut ctx,
+        );
+
+        let active = client.state.as_ref().expect("current request remains");
+        assert!(
+            active.read_buf.is_empty(),
+            "stale bytes must not cross requests"
+        );
+    }
+
+    #[test]
+    fn stale_connected_does_not_install_transport() {
+        let mut client = client();
+        client.state = Some(active_call(2));
+        let mut shard = TestShard;
+        let mut ctx = context(&mut shard);
+
+        let _ = client.handle(
+            HttpClientMsg::Connected {
+                generation: 1,
+                result: Ok((
+                    StreamId::new(44),
+                    "127.0.0.1:12345".parse().unwrap(),
+                    "127.0.0.1:80".parse().unwrap(),
+                )),
+            },
+            &mut ctx,
+        );
+
+        let active = client.state.as_ref().expect("current request remains");
+        assert!(
+            active.transport.is_none(),
+            "stale stream must not become current"
+        );
+        assert!(
+            !active.request_bytes.is_empty(),
+            "current request bytes must remain pending for its own connect"
+        );
     }
 }
 
