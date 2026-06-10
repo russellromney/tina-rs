@@ -1666,25 +1666,25 @@ where
             );
             return;
         }
-        match self.enqueue_entry_message(entry_index, message_any, context.continuation_context) {
-            Ok(()) => {
+        match self.enqueue_call_continuation(entry_index, message_any, context.continuation_context)
+        {
+            Ok(delivery) => {
+                if matches!(delivery, ContinuationDelivery::Overflow) {
+                    self.push_event(
+                        context.requester.isolate,
+                        Some(context.cause),
+                        RuntimeEventKind::CallContinuationOverflowed {
+                            call_id: context.call_id,
+                            call_kind: trace::CallKind::CancelCall,
+                        },
+                    );
+                }
                 self.push_event(
                     context.requester.isolate,
                     Some(context.cause),
                     RuntimeEventKind::CallCompleted {
                         call_id: context.call_id,
                         call_kind: trace::CallKind::CancelCall,
-                    },
-                );
-            }
-            Err(TrySendError::Full(_)) => {
-                self.push_event(
-                    context.requester.isolate,
-                    Some(context.cause),
-                    RuntimeEventKind::CallCompletionRejected {
-                        call_id: context.call_id,
-                        call_kind: trace::CallKind::CancelCall,
-                        reason: trace::CallCompletionRejectedReason::MailboxFull,
                     },
                 );
             }
@@ -1699,6 +1699,9 @@ where
                     },
                 );
             }
+            Err(TrySendError::Full(_)) => unreachable!(
+                "enqueue_call_continuation converts full mailboxes into continuation overflow"
+            ),
         }
     }
 
