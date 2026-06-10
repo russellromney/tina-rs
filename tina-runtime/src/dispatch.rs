@@ -2422,6 +2422,12 @@ where
         let generation = self.entries[index].generation;
         self.observation
             .notify_isolate_stopped(isolate_id, generation);
+        let address = RegisteredAddress {
+            shard: self.shard.id(),
+            isolate: isolate_id,
+            generation,
+        };
+        self.prune_terminal_child_records(address);
 
         // Drain any deferred reply slots this isolate captured. The
         // isolate's state (and its DeferredReply Rcs) is not freed
@@ -2466,6 +2472,20 @@ where
                 .notify_isolate_stopped_without_result(isolate_id, generation),
         }
         stopped
+    }
+
+    fn prune_terminal_child_records(&mut self, stopped: RegisteredAddress) {
+        let supervised_parents: Vec<_> = self
+            .supervisors
+            .iter()
+            .map(|record| record.parent.isolate)
+            .collect();
+        self.child_records.retain(|record| {
+            record.child != stopped
+                || record.restart_recipe.is_some()
+                || record.remote_restartable
+                || supervised_parents.contains(&record.parent)
+        });
     }
 
     pub(crate) fn restart_children(

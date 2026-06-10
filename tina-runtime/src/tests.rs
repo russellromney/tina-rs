@@ -784,7 +784,7 @@ fn child_lineage_survives_when_parent_panics() {
 }
 
 #[test]
-fn child_record_survives_when_child_stops_or_panics() {
+fn non_restartable_child_record_is_pruned_when_child_stops_or_panics() {
     let mut runtime = Runtime::new(TestShard, TestMailboxFactory);
     let root = runtime.register(new_root(), root_mailbox());
 
@@ -806,13 +806,27 @@ fn child_record_survives_when_child_stops_or_panics() {
     );
     assert_eq!(runtime.step(), 2);
 
-    assert_eq!(
-        runtime.child_record_snapshot(),
-        vec![
-            child_record(root.isolate(), stopping_child, 0, 2, false),
-            child_record(root.isolate(), panicking_child, 1, 2, false),
-        ]
-    );
+    assert_eq!(runtime.child_record_snapshot(), Vec::new());
+}
+
+#[test]
+fn spawn_stop_churn_gcs_non_restartable_children() {
+    let mut runtime = Runtime::new(TestShard, TestMailboxFactory);
+    let root = runtime.register(new_root(), root_mailbox());
+
+    for _ in 0..64 {
+        assert_eq!(runtime.try_send(root, LineageMsg::SpawnChild), Ok(()));
+        assert_eq!(runtime.step(), 1);
+        let child = last_spawned_child(runtime.trace());
+
+        assert_eq!(runtime.try_send(lineage_address(child), LineageMsg::Stop), Ok(()));
+        assert_eq!(runtime.step(), 1);
+        runtime.gc_stopped_entries();
+
+        assert_eq!(runtime.child_record_snapshot(), Vec::new());
+        assert_eq!(runtime.entry_count(), 1);
+        assert!(!runtime.has_stopped_entries);
+    }
 }
 
 #[test]
