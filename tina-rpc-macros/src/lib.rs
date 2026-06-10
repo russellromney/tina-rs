@@ -9,6 +9,7 @@
 use proc_macro::TokenStream;
 use proc_macro2::TokenStream as TokenStream2;
 use quote::{format_ident, quote};
+use syn::ext::IdentExt;
 use syn::parse::{Parse, ParseStream};
 use syn::{
     Error, FnArg, Ident, ItemTrait, Pat, Path, Result, ReturnType, Token, TraitItem, TraitItemFn,
@@ -318,11 +319,13 @@ fn extract_method(method: &TraitItemFn) -> Result<MethodSig> {
         // reserved parameters after the user's args. A method arg with one
         // of these names collides (E0415 duplicate parameter) deep inside
         // generated code; reject it here with a clear, spanned diagnostic.
-        if RESERVED_REQUEST_PARAMS.contains(&name.to_string().as_str()) {
+        let unraw_name = name.unraw();
+        let unraw_name_str = unraw_name.to_string();
+        if RESERVED_REQUEST_PARAMS.contains(&unraw_name_str.as_str()) {
             return Err(Error::new_spanned(
                 &name,
                 format!(
-                    "argument name `{name}` is reserved by the generated \
+                    "argument name `{unraw_name_str}` is reserved by the generated \
                      `{}_request` constructor; rename this parameter",
                     method.sig.ident
                 ),
