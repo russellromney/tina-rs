@@ -239,6 +239,13 @@ impl LiveShardMetrics {
     }
 
     pub(crate) fn report(&self) -> LiveShardReport {
+        self.report_with_trace_dropped(None)
+    }
+
+    pub(crate) fn report_with_trace_dropped(
+        &self,
+        trace_dropped: Option<u64>,
+    ) -> LiveShardReport {
         let (worker_thread_id, affinity_status, observed_core) = {
             let startup = self.startup.lock().expect("worker startup lock poisoned");
             (
@@ -265,7 +272,7 @@ impl LiveShardMetrics {
             process_lane: LiveQueueReport::unmeasured(self.config.process_lane_capacity),
             signal_lane: LiveQueueReport::unmeasured(self.config.signal_capacity),
             trace_retention: self.trace_retention,
-            trace_dropped: None,
+            trace_dropped,
             owned_resource_count: self.owned_resource_count.load(Ordering::Acquire),
             worker_held_resource_count: self.worker_held_resource_count.load(Ordering::Acquire),
             pending_driver_call_count: self.pending_driver_call_count.load(Ordering::Acquire),

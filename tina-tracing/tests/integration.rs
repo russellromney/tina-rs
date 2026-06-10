@@ -764,6 +764,78 @@ fn live_emit_snapshot_walks_a_real_running_topology() {
     );
 }
 
+#[test]
+fn live_emit_snapshot_reports_trace_dropped_after_bounded_overflow() {
+    use std::convert::Infallible;
+    use std::time::{Duration, Instant};
+    use tina::prelude::*;
+    use tina_runtime::{
+        DefaultThreadedMailboxFactory, ThreadedRuntime, ThreadedRuntimeConfig, sleep,
+    };
+
+    #[derive(Debug, Clone)]
+    enum Msg {
+        Begin,
+        Done,
+    }
+
+    struct Tiny;
+
+    #[tina_runtime::isolate(message = Msg)]
+    impl Tiny {
+        fn handle(
+            &mut self,
+            msg: Msg,
+            _ctx: &mut Context<'_, SingleShard, Self::Reply>,
+        ) -> Effect<Self> {
+            match msg {
+                Msg::Begin => sleep(Duration::ZERO).then(|_| Msg::Done),
+                Msg::Done => stop(),
+            }
+        }
+    }
+
+    let runtime = ThreadedRuntime::with_config(
+        SingleShard,
+        DefaultThreadedMailboxFactory,
+        ThreadedRuntimeConfig {
+            trace_retention: TraceRetention::Bounded(1),
+            ..ThreadedRuntimeConfig::default()
+        },
+    );
+    let addr = runtime
+        .register_with_capacity::<Tiny, Infallible>(Tiny, 4)
+        .expect("register tiny");
+    runtime.try_send(addr, Msg::Begin).expect("kick tiny");
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let dropped = loop {
+        let dropped = runtime.trace_dropped().expect("worker reports trace drops");
+        if dropped > 0 {
+            break dropped;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "worker did not overflow bounded trace retention"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let topology = runtime.topology();
+
+    let captured = with_capture(|cap| {
+        tina_tracing::live::emit_snapshot(&topology);
+        cap.events()
+    });
+    let _ = runtime.shutdown();
+
+    let shard = captured
+        .iter()
+        .find(|event| event.kind() == Some("live_shard"))
+        .expect("live shard event");
+    let expected = dropped.to_string();
+    assert_eq!(shard.field("trace_dropped"), Some(expected.as_str()));
+}
+
 // ---------------------------------------------------------------------------
 // Live observer wiring
 // ---------------------------------------------------------------------------

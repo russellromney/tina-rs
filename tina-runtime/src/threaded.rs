@@ -1315,6 +1315,11 @@ where
         self.call(|runtime| runtime.trace().to_vec())
     }
 
+    /// Returns the number of trace events dropped by the retention policy.
+    pub fn trace_dropped(&self) -> Result<u64, ThreadedRuntimeError> {
+        self.call(|runtime| runtime.trace_dropped())
+    }
+
     /// Returns a counted summary of pressure-shaped trace events.
     /// See [`Runtime::pressure_summary`].
     pub fn pressure_summary(
@@ -1338,9 +1343,13 @@ where
         self.call(|runtime| runtime.has_in_flight_calls())
     }
 
-    /// Returns a handle-owned topology snapshot without probing the worker.
+    /// Returns a handle-owned topology snapshot with live trace-drop truth when
+    /// the worker can report it.
     pub fn topology(&self) -> LiveTopologyReport {
-        LiveTopologyReport::single(self.metrics.report())
+        LiveTopologyReport::single(
+            self.metrics
+                .report_with_trace_dropped(self.trace_dropped().ok()),
+        )
     }
 
     /// Performs one typed isolate call from the host thread and waits for its
