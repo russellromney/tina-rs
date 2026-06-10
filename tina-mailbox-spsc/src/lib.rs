@@ -181,8 +181,6 @@ impl<T> Mailbox<T> for SpscMailbox<T> {
         if tail.wrapping_sub(head) >= self.capacity {
             return Err(TrySendError::Full(message));
         }
-        let was_empty = tail == head;
-
         // Safety: the producer claim guarantees exclusive write access among
         // producers, and the queue is known not to be full, so this slot is not
         // concurrently owned by the consumer.
@@ -190,7 +188,7 @@ impl<T> Mailbox<T> for SpscMailbox<T> {
             self.slot(tail).write(message);
         }
         self.tail.store(tail.wrapping_add(1), Release);
-        if was_empty && self.wake_hook_installed.load(Acquire) {
+        if self.wake_hook_installed.load(Acquire) {
             let wake = self.wake_hook.lock().expect("wake hook mutex").clone();
             if let Some(wake) = wake {
                 wake();

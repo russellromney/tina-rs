@@ -1,6 +1,9 @@
 #![cfg(feature = "loom")]
 
+use std::sync::Arc as StdArc;
+
 use loom::sync::Arc;
+use loom::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use loom::thread;
 use tina::{Mailbox, TrySendError};
 use tina_mailbox_spsc::SpscMailbox;
@@ -13,6 +16,49 @@ where
     builder.max_threads = 3;
     builder.preemption_bound = Some(3);
     builder.check(f);
+}
+
+#[test]
+fn producer_publish_racing_consumer_drain_cannot_leave_parked_message() {
+    bounded_model(|| {
+        let mailbox = Arc::new(SpscMailbox::new(2));
+        assert_eq!(mailbox.try_send(1usize), Ok(()));
+
+        let wakes = Arc::new(AtomicUsize::new(0));
+        let wakes_for_hook = Arc::clone(&wakes);
+        mailbox.set_wake_hook(Some(StdArc::new(move || {
+            wakes_for_hook.fetch_add(1, Ordering::Relaxed);
+        })));
+
+        let parked = Arc::new(AtomicBool::new(false));
+        let producer_mailbox = Arc::clone(&mailbox);
+        let consumer_mailbox = Arc::clone(&mailbox);
+        let parked_for_consumer = Arc::clone(&parked);
+
+        let producer = thread::spawn(move || producer_mailbox.try_send(2usize));
+        let consumer = thread::spawn(move || {
+            assert_eq!(consumer_mailbox.recv(), Some(1));
+            if consumer_mailbox.is_empty() {
+                parked_for_consumer.store(true, Ordering::Relaxed);
+            }
+        });
+
+        producer
+            .join()
+            .expect("producer thread should finish cleanly")
+            .expect("producer should publish into spare capacity");
+        consumer
+            .join()
+            .expect("consumer thread should finish cleanly");
+
+        let queued_after_park_decision = mailbox.recv().is_some();
+        assert!(
+            !queued_after_park_decision
+                || !parked.load(Ordering::Relaxed)
+                || wakes.load(Ordering::Relaxed) > 0,
+            "consumer parked with a message queued and no wake"
+        );
+    });
 }
 
 #[test]

@@ -59,7 +59,7 @@ fn close_rejects_future_sends_but_drains_buffered_messages() {
 }
 
 #[test]
-fn wake_hook_runs_only_on_empty_to_nonempty_transition() {
+fn wake_hook_runs_after_every_successful_send_while_installed() {
     let mailbox = SpscMailbox::new(4);
     let wakes = Arc::new(AtomicUsize::new(0));
     let wakes_for_hook = Arc::clone(&wakes);
@@ -69,17 +69,17 @@ fn wake_hook_runs_only_on_empty_to_nonempty_transition() {
 
     assert_eq!(mailbox.try_send("first"), Ok(()));
     assert_eq!(mailbox.try_send("second"), Ok(()));
-    assert_eq!(wakes.load(Ordering::Relaxed), 1);
+    assert_eq!(wakes.load(Ordering::Relaxed), 2);
 
     assert_eq!(mailbox.recv(), Some("first"));
     assert_eq!(mailbox.try_send("third"), Ok(()));
-    assert_eq!(wakes.load(Ordering::Relaxed), 1);
+    assert_eq!(wakes.load(Ordering::Relaxed), 3);
 
     assert_eq!(mailbox.recv(), Some("second"));
     assert_eq!(mailbox.recv(), Some("third"));
     assert_eq!(mailbox.recv(), None);
     assert_eq!(mailbox.try_send("fourth"), Ok(()));
-    assert_eq!(wakes.load(Ordering::Relaxed), 2);
+    assert_eq!(wakes.load(Ordering::Relaxed), 4);
 }
 
 #[test]

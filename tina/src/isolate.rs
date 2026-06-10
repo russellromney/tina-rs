@@ -155,14 +155,18 @@ pub trait Mailbox<T> {
     /// Attempts to enqueue a message without blocking.
     fn try_send(&self, message: T) -> Result<(), TrySendError<T>>;
 
-    /// Installs a wake hook called when this mailbox transitions from empty to
-    /// non-empty.
+    /// Installs a wake hook called after successful sends that may make a
+    /// parked consumer runnable.
     ///
     /// Live threaded runtimes use this to wake a worker parked on I/O
     /// readiness when a message arrives through a direct mailbox handle rather
     /// than through the runtime command queue. Custom mailboxes that can be
     /// written by host/external threads should store this hook and invoke it
-    /// after a successful empty -> non-empty send. Mailboxes that are only ever
+    /// after every successful send while the hook is installed, or use an
+    /// equivalent consumer-visible park protocol that cannot miss a producer
+    /// racing a drain-to-empty decision. A producer-side pre-publish
+    /// empty-check is not sufficient: a consumer can drain the old message and
+    /// park before the new tail is published. Mailboxes that are only ever
     /// driven by an explicit-step runtime may ignore it.
     fn set_wake_hook(&self, _wake: Option<std::sync::Arc<dyn Fn() + Send + Sync + 'static>>) {}
 
