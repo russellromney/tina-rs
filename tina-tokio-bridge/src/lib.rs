@@ -1051,6 +1051,8 @@ where
         let (reply_tx, reply_rx) = oneshot::channel();
         let (observed_tx, observed_rx) = oneshot::channel();
         let state = Arc::clone(&self.state);
+        let preflight_cancelled = Arc::new(AtomicBool::new(false));
+        let preflight_cancelled_for_worker = Arc::clone(&preflight_cancelled);
         let request =
             BridgeRequest::with_metrics(message, reply_tx, Arc::clone(&self.state), cancelled);
         let message = (self.into_message)(request);
@@ -1058,12 +1060,24 @@ where
             .try_send_and_observe_with_preflight(
                 self.address,
                 message,
-                |message| {
-                    message
-                        .bridge_cancelled()
-                        .then_some(ThreadedSendObservedError::MailboxClosed)
+                move |message| {
+                    if message.bridge_cancelled() {
+                        preflight_cancelled_for_worker.store(true, Ordering::Release);
+                        Some(ThreadedSendObservedError::MailboxClosed)
+                    } else {
+                        None
+                    }
                 },
                 move |result| {
+                    let skipped_cancelled = matches!(
+                        result,
+                        Err(ThreadedSendObservedError::MailboxClosed)
+                    ) && preflight_cancelled.load(Ordering::Acquire);
+                    if skipped_cancelled {
+                        let _ = observed_tx.send(Err(BridgeError::Timeout));
+                        return;
+                    }
+
                     let result = result.map_err(BridgeError::from);
                     match result {
                         Ok(()) => {
