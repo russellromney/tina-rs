@@ -477,6 +477,15 @@ fn emit_replied(result: &PgResult, request_kind: &'static str) {
                 failed_at = *failed_at as u64,
                 detail = %error,
             ),
+            PgTransactionOutcome::CommitAmbiguous { completed, error } => event!(
+                target: TRACE_TARGET_CALL,
+                Level::WARN,
+                kind = "replied",
+                outcome = "tx_commit_ambiguous",
+                request_kind,
+                step_count = completed.len() as u64,
+                detail = %error,
+            ),
         },
         Err(err) => {
             let reason = pg_error_reason(err);

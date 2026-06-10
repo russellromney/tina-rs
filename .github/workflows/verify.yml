@@ -34,6 +34,9 @@ jobs:
           cargo test -p tina-runtime --test betelgeuse_backend_ci
           cargo test -p tina-runtime --test tcp_echo threaded_runtime_tcp_echo_round_trips_reference_workload
 
+      - name: Bridge feature checks
+        run: cargo check -p tina-sqlx-bridge --features tracing
+
       - name: Verify workspace
         run: make verify
 
