@@ -16,7 +16,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, TrySendError};
-use std::thread;
+use std::thread::{self, JoinHandle};
 
 use crate::trace::RuntimeEvent;
 
@@ -40,11 +40,48 @@ pub(crate) type StoredObserver = Option<Arc<dyn TraceObserver>>;
 ///
 /// This adapter is useful for production-style observation where blocking the
 /// shard is worse than losing an event. Do not feed a proof/replay hash from a
-/// buffered observer unless the proof path first checks `dropped_count() == 0`.
+/// buffered observer unless the proof path first completes `flush()` or
+/// `shutdown()` and uses the returned drain token.
 pub struct BufferedTraceObserver {
-    sender: mpsc::SyncSender<RuntimeEvent>,
+    sender: std::sync::Mutex<Option<mpsc::SyncSender<ObserverWork>>>,
+    drain_thread: std::sync::Mutex<Option<JoinHandle<()>>>,
     dropped: AtomicU64,
 }
+
+enum ObserverWork {
+    Event(RuntimeEvent),
+    Flush(mpsc::SyncSender<()>),
+}
+
+/// Proof-grade result of draining a [`BufferedTraceObserver`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BufferedTraceDrain {
+    dropped_events: u64,
+}
+
+impl BufferedTraceDrain {
+    /// Number of events dropped before the drain barrier completed.
+    pub const fn dropped_events(&self) -> u64 {
+        self.dropped_events
+    }
+}
+
+/// A buffered trace observer could not complete a drain barrier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BufferedTraceDrainError {
+    /// The drain thread is already gone.
+    Disconnected,
+}
+
+impl std::fmt::Display for BufferedTraceDrainError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Disconnected => f.write_str("buffered trace observer drain thread disconnected"),
+        }
+    }
+}
+
+impl std::error::Error for BufferedTraceDrainError {}
 
 impl std::fmt::Debug for BufferedTraceObserver {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -63,29 +100,90 @@ impl BufferedTraceObserver {
     /// accidentally produce an always-dropping observer.
     pub fn new(capacity: usize, observer: Arc<dyn TraceObserver>) -> Self {
         let (sender, receiver) = mpsc::sync_channel(capacity.max(1));
-        thread::Builder::new()
+        let drain_thread = thread::Builder::new()
             .name("tina-trace-observer".to_string())
             .spawn(move || {
-                while let Ok(event) = receiver.recv() {
-                    observer.on_event(&event);
+                while let Ok(work) = receiver.recv() {
+                    match work {
+                        ObserverWork::Event(event) => observer.on_event(&event),
+                        ObserverWork::Flush(ack) => {
+                            let _ = ack.send(());
+                        }
+                    }
                 }
             })
             .expect("failed to spawn tina trace observer thread");
         Self {
-            sender,
+            sender: std::sync::Mutex::new(Some(sender)),
+            drain_thread: std::sync::Mutex::new(Some(drain_thread)),
             dropped: AtomicU64::new(0),
         }
     }
 
     /// Number of events dropped because the buffer was full or closed.
+    ///
+    /// This is a diagnostic counter only. Proof snapshots need a drain barrier:
+    /// call [`flush`](Self::flush) or [`shutdown`](Self::shutdown) and pass the
+    /// returned [`BufferedTraceDrain`] to the proof layer.
     pub fn dropped_count(&self) -> u64 {
         self.dropped.load(Ordering::Relaxed)
+    }
+
+    /// Blocks until every event accepted before this call has reached the
+    /// wrapped observer, then returns a proof-grade dropped-event count.
+    pub fn flush(&self) -> Result<BufferedTraceDrain, BufferedTraceDrainError> {
+        let (ack_tx, ack_rx) = mpsc::sync_channel(0);
+        let sender = self.sender.lock().expect("buffered observer sender lock");
+        let Some(sender) = sender.as_ref() else {
+            return Err(BufferedTraceDrainError::Disconnected);
+        };
+        sender
+            .send(ObserverWork::Flush(ack_tx))
+            .map_err(|_| BufferedTraceDrainError::Disconnected)?;
+        ack_rx
+            .recv()
+            .map_err(|_| BufferedTraceDrainError::Disconnected)?;
+        Ok(BufferedTraceDrain {
+            dropped_events: self.dropped_count(),
+        })
+    }
+
+    /// Closes the queue, joins the drain thread, and returns the final
+    /// dropped-event count.
+    pub fn shutdown(&self) -> Result<BufferedTraceDrain, BufferedTraceDrainError> {
+        let sender = self.sender.lock().expect("buffered observer sender lock").take();
+        drop(sender);
+
+        if let Some(handle) = self
+            .drain_thread
+            .lock()
+            .expect("buffered observer thread lock")
+            .take()
+        {
+            handle
+                .join()
+                .map_err(|_| BufferedTraceDrainError::Disconnected)?;
+        }
+
+        Ok(BufferedTraceDrain {
+            dropped_events: self.dropped_count(),
+        })
     }
 }
 
 impl TraceObserver for BufferedTraceObserver {
     fn on_event(&self, event: &RuntimeEvent) {
-        match self.sender.try_send(*event) {
+        let Some(sender) = self
+            .sender
+            .lock()
+            .expect("buffered observer sender lock")
+            .as_ref()
+            .cloned()
+        else {
+            self.dropped.fetch_add(1, Ordering::Relaxed);
+            return;
+        };
+        match sender.try_send(ObserverWork::Event(*event)) {
             Ok(()) => {}
             Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => {
                 self.dropped.fetch_add(1, Ordering::Relaxed);
@@ -203,5 +301,50 @@ mod tests {
             "full buffer should drop visibly instead of blocking the shard"
         );
         let _ = release_tx.send(());
+    }
+
+    #[test]
+    fn buffered_observer_flush_delivers_accepted_events_before_snapshot() {
+        struct Collector(Mutex<Vec<RuntimeEvent>>);
+
+        impl TraceObserver for Collector {
+            fn on_event(&self, event: &RuntimeEvent) {
+                self.0.lock().expect("collector lock").push(*event);
+            }
+        }
+
+        let collector = Arc::new(Collector(Mutex::new(Vec::new())));
+        let downstream: Arc<dyn TraceObserver> = collector.clone();
+        let buffered = BufferedTraceObserver::new(8, downstream);
+
+        let events: Vec<_> = (1..=4)
+            .map(|id| {
+                RuntimeEvent::new(
+                    EventId::new(id),
+                    None,
+                    ShardId::new(0),
+                    IsolateId::new(3),
+                    RuntimeEventKind::HandlerStarted,
+                )
+            })
+            .collect();
+        for event in &events {
+            buffered.on_event(event);
+        }
+
+        let drain = buffered.flush().expect("flush should drain accepted events");
+        assert_eq!(drain.dropped_events(), 0);
+        assert_eq!(*collector.0.lock().expect("collector lock"), events);
+
+        let final_drain = buffered.shutdown().expect("shutdown joins drain thread");
+        assert_eq!(final_drain.dropped_events(), 0);
+        buffered.on_event(&RuntimeEvent::new(
+            EventId::new(99),
+            None,
+            ShardId::new(0),
+            IsolateId::new(3),
+            RuntimeEventKind::HandlerStarted,
+        ));
+        assert_eq!(buffered.dropped_count(), 1);
     }
 }

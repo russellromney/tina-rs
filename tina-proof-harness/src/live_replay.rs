@@ -22,10 +22,11 @@
 //! 1. The observer never blocks. It pushes into a `Mutex<Vec<_>>` and
 //!    returns; if the user wants async drain, they pull events out.
 //! 2. The complete snapshot refuses to hash a lossy buffered capture.
-//!    If you install `BufferedTraceObserver`, pass its `dropped_count()`
-//!    to [`LiveTrace::snapshot_complete`] or
-//!    [`LiveTrace::compare_live_shape_complete`]. Plain
-//!    [`LiveTrace::snapshot`] remains available for diagnostics, not proof.
+//!    If you install `BufferedTraceObserver`, first call its `flush()` or
+//!    `shutdown()` drain barrier and pass the resulting token through
+//!    [`LiveTraceDrain::from_buffered`] to [`LiveTrace::snapshot_complete`] or
+//!    [`LiveTrace::compare_live_shape_complete`]. Plain [`LiveTrace::snapshot`]
+//!    remains available for diagnostics, not proof.
 //! 3. The snapshot computes the trace hash using the same
 //!    [`tina_runtime::stable_trace_hash`] the sim side uses. The hash is
 //!    a fingerprint of this live trace, not a claim that the live event
@@ -35,7 +36,9 @@ use std::sync::{Arc, Mutex};
 
 use std::collections::BTreeSet;
 use std::path::Path;
-use tina_runtime::{PressureSummary, RuntimeEvent, TraceObserver, stable_trace_hash};
+use tina_runtime::{
+    BufferedTraceDrain, PressureSummary, RuntimeEvent, TraceObserver, stable_trace_hash,
+};
 
 use tina_sim::dst::{
     CaptureSource, LiveReplayCapture, LiveReplayCaptureBuildError, LiveReplayCaptureBuilder,
@@ -143,8 +146,9 @@ impl LiveTrace {
     /// Fails closed in two cases the plain [`Self::snapshot`] hides:
     ///
     /// 1. The upstream capture path dropped events (pass
-    ///    `BufferedTraceObserver::dropped_count()`; pass `0` when
-    ///    `LiveTrace::observer()` is installed directly).
+    ///    `LiveTraceDrain::from_buffered(buffered.flush()?)`; pass
+    ///    `LiveTraceDrain::direct()` when `LiveTrace::observer()` is installed
+    ///    directly).
     /// 2. The trace spans more than one shard. A free-running multishard
     ///    runtime interleaves each shard's inbound cross-shard deliveries
     ///    with its local handler work by real wall-clock timing, so the
@@ -154,11 +158,11 @@ impl LiveTrace {
     ///    simulator for a multishard replay proof.
     pub fn snapshot_complete(
         &self,
-        upstream_dropped_events: u64,
+        drain: LiveTraceDrain,
     ) -> Result<TraceShape, LiveTraceProofError> {
-        if upstream_dropped_events != 0 {
+        if drain.upstream_dropped_events != 0 {
             return Err(LiveTraceProofError::Lossy(LiveTraceLoss {
-                dropped_events: upstream_dropped_events,
+                dropped_events: drain.upstream_dropped_events,
             }));
         }
         let shards = self.shards();
@@ -218,9 +222,9 @@ impl LiveTrace {
         &self,
         expected: TraceShape,
         label: &'static str,
-        upstream_dropped_events: u64,
+        drain: LiveTraceDrain,
     ) -> Result<Option<LiveReplayMismatch>, LiveTraceProofError> {
-        let actual = self.snapshot_complete(upstream_dropped_events)?;
+        let actual = self.snapshot_complete(drain)?;
         if actual == expected {
             return Ok(None);
         }
@@ -240,6 +244,35 @@ impl LiveTrace {
 pub struct LiveTraceHandle {
     pub trace: LiveTrace,
     pub observer: Arc<dyn TraceObserver>,
+}
+
+/// Proof-grade evidence that the live trace capture path has been drained.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LiveTraceDrain {
+    upstream_dropped_events: u64,
+}
+
+impl LiveTraceDrain {
+    /// The trace observer is synchronous and has no upstream buffer to drain.
+    pub const fn direct() -> Self {
+        Self {
+            upstream_dropped_events: 0,
+        }
+    }
+
+    /// Builds proof evidence from a completed buffered-observer drain barrier.
+    pub const fn from_buffered(drain: BufferedTraceDrain) -> Self {
+        Self {
+            upstream_dropped_events: drain.dropped_events(),
+        }
+    }
+
+    #[cfg(test)]
+    const fn lossy_for_test(dropped_events: u64) -> Self {
+        Self {
+            upstream_dropped_events: dropped_events,
+        }
+    }
 }
 
 /// The live trace capture path lost events before the proof snapshot.
@@ -394,7 +427,7 @@ impl RunCapture {
         }
         let observed = self
             .trace
-            .snapshot_complete(inputs.upstream_dropped_events)
+            .snapshot_complete(inputs.trace_drain)
             .map_err(RunCaptureFinishError::TraceNotProvable)?;
         if observed != inputs.expected {
             return Err(RunCaptureFinishError::ExpectedShapeMismatch {
@@ -436,7 +469,7 @@ pub struct RunCaptureInputs<Op> {
     pub source: &'static str,
     pub source_metadata: CaptureSource,
     pub projection: TraceProjection,
-    pub upstream_dropped_events: u64,
+    pub trace_drain: LiveTraceDrain,
     pub live_facts: Vec<LiveReplayFact>,
     pub unsupported_facts: Vec<UnsupportedLiveFact>,
 }
@@ -568,7 +601,7 @@ mod tests {
         let shape = trace.snapshot();
         assert_eq!(shape.event_count, 3);
         assert_ne!(shape.trace_hash, 0);
-        assert_eq!(trace.snapshot_complete(0), Ok(shape));
+        assert_eq!(trace.snapshot_complete(LiveTraceDrain::direct()), Ok(shape));
     }
 
     #[test]
@@ -578,7 +611,7 @@ mod tests {
         observer.on_event(&sample_event(1));
 
         let err = trace
-            .snapshot_complete(1)
+            .snapshot_complete(LiveTraceDrain::lossy_for_test(1))
             .expect_err("proof snapshot must reject dropped buffered events");
         assert_eq!(
             err,
@@ -596,7 +629,7 @@ mod tests {
         observer.on_event(&sample_event_on(22, 1));
 
         let err = trace
-            .snapshot_complete(0)
+            .snapshot_complete(LiveTraceDrain::direct())
             .expect_err("proof snapshot must reject a multishard trace");
         assert!(
             matches!(err, LiveTraceProofError::Multishard { ref shards } if shards == &[11, 22]),
@@ -687,14 +720,14 @@ mod tests {
         assert!(!mismatch.hash_diverged());
 
         let err = trace
-            .compare_live_shape_complete(shape, "stub", 2)
+            .compare_live_shape_complete(shape, "stub", LiveTraceDrain::lossy_for_test(2))
             .expect_err("lossy capture must fail before comparing hashes");
         assert_eq!(
             err,
             LiveTraceProofError::Lossy(LiveTraceLoss { dropped_events: 2 })
         );
         assert_eq!(
-            trace.compare_live_shape_complete(shape, "stub", 0),
+            trace.compare_live_shape_complete(shape, "stub", LiveTraceDrain::direct()),
             Ok(None)
         );
     }
@@ -746,7 +779,7 @@ mod tests {
                 source: "unit test",
                 source_metadata: CaptureSource::new("unit test").runtime_kind("local-system"),
                 projection: TraceProjection::Exact,
-                upstream_dropped_events: 0,
+                trace_drain: LiveTraceDrain::direct(),
                 live_facts: Vec::new(),
                 unsupported_facts: Vec::new(),
             })
@@ -774,7 +807,7 @@ mod tests {
                 source: "unit test",
                 source_metadata: CaptureSource::new("unit test"),
                 projection: TraceProjection::Exact,
-                upstream_dropped_events: 0,
+                trace_drain: LiveTraceDrain::direct(),
                 live_facts: Vec::new(),
                 unsupported_facts: Vec::new(),
             })
@@ -799,7 +832,7 @@ mod tests {
                 source: "unit test",
                 source_metadata: CaptureSource::new("unit test"),
                 projection: TraceProjection::Exact,
-                upstream_dropped_events: 1,
+                trace_drain: LiveTraceDrain::lossy_for_test(1),
                 live_facts: Vec::new(),
                 unsupported_facts: Vec::new(),
             })
@@ -828,7 +861,7 @@ mod tests {
                 source: "unit test",
                 source_metadata: CaptureSource::new("unit test"),
                 projection: TraceProjection::Exact,
-                upstream_dropped_events: 0,
+                trace_drain: LiveTraceDrain::direct(),
                 live_facts: Vec::new(),
                 unsupported_facts: Vec::new(),
             })
@@ -858,7 +891,7 @@ mod tests {
                 source: "unit test",
                 source_metadata: CaptureSource::new("unit test"),
                 projection: TraceProjection::Exact,
-                upstream_dropped_events: 0,
+                trace_drain: LiveTraceDrain::direct(),
                 live_facts: Vec::new(),
                 unsupported_facts: Vec::new(),
             })

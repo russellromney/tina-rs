@@ -41,7 +41,7 @@ pub use http2::{
     http2_probe_suite,
 };
 pub use live_replay::{
-    LiveTrace, LiveTraceHandle, LiveTraceLoss, LiveTraceProofError, RunCapture,
+    LiveTrace, LiveTraceDrain, LiveTraceHandle, LiveTraceLoss, LiveTraceProofError, RunCapture,
     RunCaptureFinishError, RunCaptureInputs, capture_run, replay_bug, save_bug, shrink_bug,
 };
 pub use load::{
