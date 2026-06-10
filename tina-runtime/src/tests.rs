@@ -3684,6 +3684,7 @@ fn make_shard_report(
         signal_lane: LiveQueueReport::unmeasured(8),
         trace_retention: TraceRetention::Full,
         trace_dropped: None,
+        park_wakeups: 0,
         owned_resource_count: owned,
         worker_held_resource_count: worker_held,
         pending_driver_call_count: pending,

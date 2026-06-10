@@ -23,7 +23,7 @@ use std::time::{Duration, Instant};
 use tina::{Address, Mailbox, TrySendError, prelude::*};
 use tina_runtime::{
     CallOutcome, MailboxFactory, RuntimeCall, ThreadedMultiShardRuntime, ThreadedRuntimeConfig,
-    call,
+    call, sleep,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -217,6 +217,28 @@ impl Isolate for ProbeSource {
 }
 
 #[derive(Debug)]
+enum TimerMsg {
+    Start,
+    Done,
+}
+
+struct LongTimer;
+
+#[tina_runtime::isolate(message = TimerMsg, shard = AppShard)]
+impl LongTimer {
+    fn handle(
+        &mut self,
+        msg: TimerMsg,
+        _ctx: &mut Context<'_, AppShard, Self::Reply>,
+    ) -> Effect<Self> {
+        match msg {
+            TimerMsg::Start => sleep(Duration::from_secs(30)).then_event(|| TimerMsg::Done),
+            TimerMsg::Done => noop(),
+        }
+    }
+}
+
+#[derive(Debug)]
 enum ReplyFloodMsg {
     Start,
     Returned(CallOutcome<ReplyFloodReply>),
@@ -311,6 +333,19 @@ fn make_runtime_with_config<const N: usize>(
     ThreadedMultiShardRuntime::with_config(shards, WorkerMailboxFactory, config)
 }
 
+fn shard_park_wakeups(
+    runtime: &ThreadedMultiShardRuntime<AppShard, WorkerMailboxFactory>,
+    shard: ShardId,
+) -> u64 {
+    runtime
+        .topology()
+        .shards()
+        .iter()
+        .find(|report| report.shard() == shard)
+        .expect("shard report")
+        .park_wakeups()
+}
+
 const FLOOD_TICKS: usize = 100_000;
 const FANOUT_PER_TICK: usize = 512;
 /// Number of independent flood sources on shard 11. With several in
@@ -341,6 +376,35 @@ fn register_flood(
             .try_send(source, FloodMsg::Tick { remaining: ticks })
             .expect("kick flood");
     }
+}
+
+#[test]
+fn pending_timer_parks_multishard_worker_instead_of_spinning() {
+    let config = ThreadedRuntimeConfig {
+        idle_wait: Duration::from_secs(1),
+        idle_repoll_interval: Duration::from_millis(10),
+        ..ThreadedRuntimeConfig::default()
+    };
+    let runtime = make_runtime_with_config([AppShard(11), AppShard(22)], config);
+    let timer = runtime
+        .register_with_capacity_on::<LongTimer, _>(ShardId::new(11), LongTimer, 8)
+        .expect("register timer");
+
+    runtime
+        .try_send(timer, TimerMsg::Start)
+        .expect("start long timer");
+
+    std::thread::sleep(Duration::from_millis(30));
+    let before = shard_park_wakeups(&runtime, ShardId::new(11));
+    std::thread::sleep(Duration::from_millis(180));
+    let delta = shard_park_wakeups(&runtime, ShardId::new(11)) - before;
+
+    assert!(
+        (5..=40).contains(&delta),
+        "pending timer should use bounded parks, not spin or sleep forever: {delta} wakeups"
+    );
+
+    runtime.shutdown().expect("shutdown");
 }
 
 /// Required test (Rock 4, bullet 1): a sustained cross-shard inbound
