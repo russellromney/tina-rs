@@ -688,6 +688,12 @@ fn encode_hex(bytes: &[u8]) -> String {
 }
 
 fn decode_hex(value: &str, line: usize) -> Result<Vec<u8>, ProtocolByteReplayIoError> {
+    if !value.is_ascii() {
+        return Err(ProtocolByteReplayIoError::Decode {
+            line,
+            reason: "hex chunk must contain only ASCII hex digits".to_owned(),
+        });
+    }
     if value.len() % 2 != 0 {
         return Err(ProtocolByteReplayIoError::Decode {
             line,
@@ -1032,6 +1038,23 @@ mod tests {
         std::fs::write(&corrupt, body).expect("write");
         let err = ProtocolByteReplayCase::load(&corrupt, "x")
             .expect_err("odd-length hex chunk must fail to decode");
+        assert!(matches!(err, ProtocolByteReplayIoError::Decode { .. }));
+        let _ = std::fs::remove_file(&corrupt);
+    }
+
+    #[test]
+    fn load_rejects_non_ascii_hex_without_panicking() {
+        let corrupt =
+            std::env::temp_dir().join(format!("tina-byte-nonascii-{}.case", std::process::id()));
+        let body = "tina-protocol-byte-replay-v1\n\
+            name=x\nfamily=websocket\ndirection=client-to-server\n\
+            max_message_bytes=16\nmax_frame_payload=16\nmax_frames=16\n\
+            max_bytes=16\nmax_chunks=4\nexpected_app_deliveries=0\n\
+            expected_close=none\nexpected_fact_count=0\n\
+            expected_fact_hash=0x0\nchunk=aéa\n";
+        std::fs::write(&corrupt, body).expect("write");
+        let err = ProtocolByteReplayCase::load(&corrupt, "x")
+            .expect_err("non-ASCII hex chunk must fail to decode");
         assert!(matches!(err, ProtocolByteReplayIoError::Decode { .. }));
         let _ = std::fs::remove_file(&corrupt);
     }
