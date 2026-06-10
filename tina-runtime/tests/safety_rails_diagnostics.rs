@@ -30,6 +30,7 @@ fn diagnostic_phrases_are_pinned() {
     cases.compile_fail("tests/safety_rails_compile_fail/split_request_partial_branch.rs");
     cases.compile_fail("tests/safety_rails_compile_fail/split_request_double_consume.rs");
     cases.compile_fail("tests/safety_rails_compile_fail/split_request_forged_effect.rs");
+    cases.compile_fail("tests/safety_rails_compile_fail/split_request_early_return.rs");
     cases.compile_fail("tests/safety_rails_compile_fail/runtime_internal_forge_needs_unsafe.rs");
     cases.compile_fail("tests/safety_rails_compile_fail/split_private_internal_event.rs");
     cases.compile_fail("tests/safety_rails_compile_fail/split_request_on_event_lane.rs");

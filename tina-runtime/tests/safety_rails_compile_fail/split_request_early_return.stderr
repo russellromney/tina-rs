@@ -1,0 +1,11 @@
+error[E0308]: mismatched types
+  --> tests/safety_rails_compile_fail/split_request_early_return.rs:41:20
+   |
+23 | #[tina_runtime::isolate(event = Event, request = Request, reply = Reply)]
+   | ------------------------------------------------------------------------- expected `RequestEffect<Service>` because of return type
+...
+41 |             return noop();
+   |                    ^^^^^^ expected `RequestEffect<Service>`, found `Effect<_>`
+   |
+   = note: expected struct `RequestEffect<Service>`
+                found enum `Effect<_>`
