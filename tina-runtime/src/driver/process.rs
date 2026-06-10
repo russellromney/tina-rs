@@ -443,18 +443,15 @@ fn spawn_process(command: &ProcessCommand) -> std::io::Result<std::process::Chil
 }
 
 #[cfg(unix)]
+#[allow(unsafe_code)]
 fn kill_process_group(pid: u32) -> std::io::Result<()> {
-    let status = Command::new("kill")
-        .arg("-KILL")
-        .arg(format!("-{pid}"))
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()?;
-    if status.success() {
+    let pgid = libc::pid_t::try_from(pid)
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "pid overflow"))?;
+    let result = unsafe { libc::killpg(pgid, libc::SIGKILL) };
+    if result == 0 {
         Ok(())
     } else {
-        Err(std::io::Error::other("kill process group failed"))
+        Err(std::io::Error::last_os_error())
     }
 }
 
