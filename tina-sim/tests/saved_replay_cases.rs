@@ -30,10 +30,14 @@ const SOURCE_ROLE: &str = "source";
 const SINK_ROLE: &str = "sink";
 
 fn fake_event(id: u64, kind: RuntimeEventKind) -> RuntimeEvent {
+    fake_event_on(0, id, kind)
+}
+
+fn fake_event_on(shard: u32, id: u64, kind: RuntimeEventKind) -> RuntimeEvent {
     RuntimeEvent::new(
         EventId::new(id),
         None,
-        ShardId::new(0),
+        ShardId::new(shard),
         IsolateId::new(1),
         kind,
     )
@@ -560,6 +564,59 @@ fn capture_live_run_builder_records_metadata_and_facts() {
     assert_eq!(capture.source_metadata.label, "builder live smoke");
     assert_eq!(capture.live_facts.len(), 1);
     assert!(capture.summary().to_string().contains(case.name));
+}
+
+#[test]
+fn capture_builder_rejects_multishard_live_trace() {
+    let case = burst_overflow_case();
+    let events = vec![
+        fake_event_on(0, 1, RuntimeEventKind::HandlerStarted),
+        fake_event_on(1, 1, RuntimeEventKind::MailboxAccepted),
+    ];
+
+    let err = capture_live_run(case.name)
+        .with_seed(case.seed)
+        .with_config(case.config.clone())
+        .with_scenario(case.scenario)
+        .with_history(case.history.operations().to_vec())
+        .with_invariant(case.invariant)
+        .with_source("multishard live")
+        .with_trace(&events)
+        .finish()
+        .expect_err("multishard live traces must not pin a proof hash");
+
+    assert!(matches!(
+        err,
+        tina_sim::dst::LiveReplayCaptureBuildError::MultishardTrace { ref shards }
+            if shards == &[0, 1]
+    ));
+}
+
+#[test]
+fn capture_builder_rejects_upstream_partial_live_trace() {
+    let case = burst_overflow_case();
+    let events = vec![fake_event(1, RuntimeEventKind::HandlerStarted)];
+
+    let err = capture_live_run(case.name)
+        .with_seed(case.seed)
+        .with_config(case.config.clone())
+        .with_scenario(case.scenario)
+        .with_history(case.history.operations().to_vec())
+        .with_invariant(case.invariant)
+        .with_source_metadata(
+            CaptureSource::new("partial live")
+                .with_trace_completeness(TraceCompleteness::Partial),
+        )
+        .with_trace(&events)
+        .finish()
+        .expect_err("partial live traces must not pin a proof hash");
+
+    assert!(matches!(
+        err,
+        tina_sim::dst::LiveReplayCaptureBuildError::LossyTrace {
+            completeness: TraceCompleteness::Partial
+        }
+    ));
 }
 
 #[test]
