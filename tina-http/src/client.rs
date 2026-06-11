@@ -592,6 +592,50 @@ fn tls_write_reply_to_tcp(reply: TlsWriteOwnedReply) -> TcpWriteOwnedReply {
     }
 }
 
+/// Resolves the wire `Host:` from the target's host policy.
+///
+/// - `Http { host: None }` leaves the request untouched.
+/// - `Http { host: Some(v) }` inserts `v` (or errors on duplicate).
+/// - `Https { host: UseServerName }` inserts `server_name`.
+/// - `Https { host: Explicit(v) }` inserts `v`.
+fn apply_host_policy(
+    mut request: HttpRequest,
+    target: &HttpTarget,
+) -> Result<HttpRequest, HttpClientError> {
+    if !is_valid_origin_form_request_target(&request.path) {
+        return Err(HttpClientError::InvalidRequestTarget);
+    }
+    let policy_value: Option<&str> = match target {
+        HttpTarget::Http { host: None, .. } => None,
+        HttpTarget::Http { host: Some(v), .. } => Some(v.as_str()),
+        HttpTarget::Https {
+            server_name,
+            host: HttpHostPolicy::UseServerName,
+            ..
+        } => Some(server_name.as_str()),
+        HttpTarget::Https {
+            host: HttpHostPolicy::Explicit(v),
+            ..
+        } => Some(v.as_str()),
+    };
+    let Some(policy_value) = policy_value else {
+        return Ok(request);
+    };
+    // Empty host is a valid `HeaderValue` byte string but produces
+    // `Host: \r\n` on the wire — silently surprising. Reject so the
+    // user picks `host: None` if that was the intent.
+    if policy_value.is_empty() {
+        return Err(HttpClientError::InvalidHostHeaderValue);
+    }
+    if request.headers.contains_key(HOST) {
+        return Err(HttpClientError::DuplicateHostHeader);
+    }
+    let value =
+        HeaderValue::from_str(policy_value).map_err(|_| HttpClientError::InvalidHostHeaderValue)?;
+    request.headers.insert(HOST, value);
+    Ok(request)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -707,48 +751,4 @@ mod tests {
             "current request bytes must remain pending for its own connect"
         );
     }
-}
-
-/// Resolves the wire `Host:` from the target's host policy.
-///
-/// - `Http { host: None }` leaves the request untouched.
-/// - `Http { host: Some(v) }` inserts `v` (or errors on duplicate).
-/// - `Https { host: UseServerName }` inserts `server_name`.
-/// - `Https { host: Explicit(v) }` inserts `v`.
-fn apply_host_policy(
-    mut request: HttpRequest,
-    target: &HttpTarget,
-) -> Result<HttpRequest, HttpClientError> {
-    if !is_valid_origin_form_request_target(&request.path) {
-        return Err(HttpClientError::InvalidRequestTarget);
-    }
-    let policy_value: Option<&str> = match target {
-        HttpTarget::Http { host: None, .. } => None,
-        HttpTarget::Http { host: Some(v), .. } => Some(v.as_str()),
-        HttpTarget::Https {
-            server_name,
-            host: HttpHostPolicy::UseServerName,
-            ..
-        } => Some(server_name.as_str()),
-        HttpTarget::Https {
-            host: HttpHostPolicy::Explicit(v),
-            ..
-        } => Some(v.as_str()),
-    };
-    let Some(policy_value) = policy_value else {
-        return Ok(request);
-    };
-    // Empty host is a valid `HeaderValue` byte string but produces
-    // `Host: \r\n` on the wire — silently surprising. Reject so the
-    // user picks `host: None` if that was the intent.
-    if policy_value.is_empty() {
-        return Err(HttpClientError::InvalidHostHeaderValue);
-    }
-    if request.headers.contains_key(HOST) {
-        return Err(HttpClientError::DuplicateHostHeader);
-    }
-    let value =
-        HeaderValue::from_str(policy_value).map_err(|_| HttpClientError::InvalidHostHeaderValue)?;
-    request.headers.insert(HOST, value);
-    Ok(request)
 }
