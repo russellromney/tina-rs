@@ -374,3 +374,32 @@ Disk note: the shared target directory grew enough to trigger false confidence
 risk from stale sibling-worktree binaries, not ENOSPC. Cleaning touched packages
 before each orchestrator verification restored ~29 GiB free and made each test
 binary compile from its own branch checkout.
+
+## Resolution log — 2026-06-11 follow-up pass
+
+Append-only follow-up for the adversarial review of PRs #238-#242 after the
+second review wave. Each branch received one cohesive follow-up commit because
+the evidence and implementation changes were coupled within that PR's area.
+All commands used the shared
+`CARGO_TARGET_DIR=/Users/russellromney/Documents/Github/tina-rs-adv/target`.
+
+| Finding(s) | Status | PR | Follow-up commit | Key proving tests / checks | Honest caveats |
+|---|---|---|---|---|---|
+| C-1 | Evidence restored | #238 | `1adbfd9` | `cargo test -p tina-runtime`; restored `pending_timer_parks_multishard_worker_instead_of_spinning` in `multishard_fairness` | Behavioral wake/park evidence, not a platform CPU-time assertion. |
+| E5 | Local stopped-call race fixed deeper | #238 | `1adbfd9` | `stop_children_closes_precollected_call_once_without_abandoning_waiter`; full `cargo test -p tina-runtime`; `cargo clippy -p tina-runtime -- -D warnings` | Covers local queued/precollected call contexts; remote queued call-context coverage remains a separate follow-up. |
+| C-4 | Terminal classification completed | #238 | `1adbfd9` | Shared terminal helper now includes `ChildRestart`; deterministic `multi_shard` terminal queue path covered by runtime tests | Did not add a separate exact full-pressure remote-restart harness. |
+| C-3 | Retained stopped-child truth narrowed | #238 | `1adbfd9` | `spawn_stop_churn_gcs_non_restartable_children`; `supervised_restart_budget_exhaustion_is_visible_and_creates_no_replacement`; `supervised_restart_skips_selected_non_restartable_child`; full runtime tests | Retains stopped lifecycle truth only for meaningful retained child records; ordinary one-shot stopped children are still pruned. |
+| D-4 | Cancel continuation overflow pinned | #238 | `1adbfd9` | `under_sized_mailbox_overflows_cancel_call_continuations_without_dropping`; full runtime tests | Low-priority shutdown drain terminal-overflow/drop accounting remains future cleanup. |
+| B11 | DATA reject credit conservation broadened | #239 | `c132bda` | `data_reject_paths_return_connection_window_credit`; full `cargo test -p tina-http`; `cargo clippy -p tina-http -- -D warnings` | Covers six concrete reject paths; broader property testing remains useful future work. |
+| B9 | Idle PRIORITY law fixed | #239 | `c132bda` | `malformed_priority_resets_open_stream_but_ignores_idle_stream`; full HTTP tests/clippy | Open streams still reset with FRAME_SIZE_ERROR; idle nonzero streams are ignored without synthetic fact. |
+| SP-A / teardown disclosure | Documented | #239 | `c132bda` | Changelog disclosure plus full HTTP tests/clippy | Disclosure only; no new teardown implementation beyond the existing PR fix. |
+| CH-1 | EOF abandonment reaper fixed | #240 | `cda8311` | `abandoned_streamed_response_after_end_stream_is_reaped_without_reset_and_slot_reused`; full `cargo test -p tina-http`; `cargo clippy -p tina-http -- -D warnings` | Idle abandonment before EOF still sends RST(CANCEL); after END_STREAM it reaps without reset. |
+| Client streaming semantics | Documented | #240 | `cda8311` | Changelog disclosure plus full HTTP tests/clippy | Per-frame drain/cursor rewrite remains deferred as I-NEW-3. |
+| TG-6 | Schema stragglers fixed | #241 | `ca2d865` | `cargo test --manifest-path examples/systems/mini_saas_api/Cargo.toml --test perf`; `rg` found no remaining `tina.perf_report.v1` references | `perf_native` still fails locally on an existing clean-run assertion, not on schema. |
+| Timeline cause fields | Misleading fields removed | #241 | `ca2d865` | `cargo test -p tina-tracing`; timeline tests assert `end_cause_shard` absence | Event `shard` and typed cause id remain. |
+| Proof runtime observer truth | Still aligned | #241 | `ca2d865` | `cargo test -p tina-runtime --test trace_observer`; `cargo test -p tina-sim --test dst_randomized`; `cargo clippy -p tina-tracing -p tina-runtime -p tina-sim -- -D warnings` | `cargo test --manifest-path examples/systems/perf_native/Cargo.toml --test perf` fails: `both sides must end clean for host_enqueue`, then the process-wide perf mutex poisons sibling tests. |
+| H9 fixture hygiene | Review-id leakage removed | #242 | `71fba5f` | Cleared trybuild scratch; `cargo test -p tina-runtime --test safety_rails_diagnostics`; `cargo test -p tina-rpc --test macro_compile_fail`; `cargo clippy -p tina-rpc-macros -p tina-rpc -p tina-tokio-bridge -- -D warnings` | Comment-only cleanup on top of the existing macro/bridge PR. |
+
+Follow-up PR bodies were updated on #238, #239, #240, #241, and #242 with the
+new commit ids, commands, and caveats. All five branch worktrees were clean
+after commit and push.
