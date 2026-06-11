@@ -629,6 +629,111 @@ fn restart_child_events(trace: &[RuntimeEvent]) -> Vec<RuntimeEventKind> {
         .collect()
 }
 
+#[derive(Debug)]
+enum StopRaceParentMsg {
+    SpawnChild,
+    StopChildren,
+}
+
+#[derive(Debug)]
+struct StopRaceParent;
+
+impl Isolate for StopRaceParent {
+    type Message = StopRaceParentMsg;
+    type Reply = ();
+    type Send = Outbound<NeverOutbound>;
+    type Spawn = tina::ChildDefinition<StopRaceChild>;
+    type SpawnObserved = std::convert::Infallible;
+    type Call = std::convert::Infallible;
+    type Fact = ::std::convert::Infallible;
+    type Shard = TestShard;
+
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
+        match msg {
+            StopRaceParentMsg::SpawnChild => {
+                Effect::Spawn(tina::ChildDefinition::new(StopRaceChild, 8))
+            }
+            StopRaceParentMsg::StopChildren => Effect::StopChildren,
+        }
+    }
+}
+
+#[derive(Debug)]
+enum StopRaceChildMsg {
+    Ping,
+}
+
+#[derive(Debug)]
+struct StopRaceChild;
+
+impl Isolate for StopRaceChild {
+    type Message = StopRaceChildMsg;
+    type Reply = ();
+    type Send = Outbound<NeverOutbound>;
+    type Spawn = std::convert::Infallible;
+    type SpawnObserved = std::convert::Infallible;
+    type Call = std::convert::Infallible;
+    type Fact = ::std::convert::Infallible;
+    type Shard = TestShard;
+
+    fn handle(
+        &mut self,
+        _msg: Self::Message,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
+        noop()
+    }
+
+    fn handle_call(&mut self, _msg: Self::Message, call: CallContext<'_, Self>) -> Effect<Self> {
+        call.reply(())
+    }
+}
+
+#[derive(Debug)]
+enum StopRaceCallerMsg {
+    Start(Address<StopRaceChildMsg>),
+    Returned(CallOutcome<()>),
+}
+
+#[derive(Debug)]
+struct StopRaceCaller {
+    outcomes: Rc<RefCell<Vec<CallOutcome<()>>>>,
+}
+
+impl Isolate for StopRaceCaller {
+    type Message = StopRaceCallerMsg;
+    type Reply = ();
+    type Send = Outbound<NeverOutbound>;
+    type Spawn = std::convert::Infallible;
+    type SpawnObserved = std::convert::Infallible;
+    type Call = RuntimeCall<StopRaceCallerMsg>;
+    type Fact = ::std::convert::Infallible;
+    type Shard = TestShard;
+
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
+        match msg {
+            StopRaceCallerMsg::Start(target) => Effect::Call(RuntimeCall::isolate_call(
+                target,
+                StopRaceChildMsg::Ping,
+                Duration::from_secs(5),
+                StopRaceCallerMsg::Returned,
+            )),
+            StopRaceCallerMsg::Returned(outcome) => {
+                self.outcomes.borrow_mut().push(outcome);
+                noop()
+            }
+        }
+    }
+}
+
 fn supervisor_events(trace: &[RuntimeEvent]) -> Vec<RuntimeEventKind> {
     trace
         .iter()
@@ -833,7 +938,10 @@ fn spawn_stop_churn_gcs_non_restartable_children() {
         assert_eq!(runtime.step(), 1);
         let child = last_spawned_child(runtime.trace());
 
-        assert_eq!(runtime.try_send(lineage_address(child), LineageMsg::Stop), Ok(()));
+        assert_eq!(
+            runtime.try_send(lineage_address(child), LineageMsg::Stop),
+            Ok(())
+        );
         assert_eq!(runtime.step(), 1);
         runtime.gc_stopped_entries();
 
@@ -1102,6 +1210,69 @@ fn restart_children_skips_non_restartable_children_with_trace() {
             } if *old_isolate == child && *old_generation == AddressGeneration::new(0)
         )
     }));
+}
+
+#[test]
+fn stop_children_closes_precollected_call_once_without_abandoning_waiter() {
+    let mut runtime = Runtime::new(TestShard, TestMailboxFactory);
+    let parent = runtime.register(StopRaceParent, TestMailbox::new(8));
+    let outcomes = Rc::new(RefCell::new(Vec::new()));
+    let caller = runtime.register(
+        StopRaceCaller {
+            outcomes: Rc::clone(&outcomes),
+        },
+        TestMailbox::new(8),
+    );
+
+    runtime
+        .try_send(parent, StopRaceParentMsg::SpawnChild)
+        .expect("spawn child");
+    assert_eq!(runtime.step(), 1);
+    let child = match runtime.trace().last().expect("spawned child").kind() {
+        RuntimeEventKind::Spawned { child_isolate } => {
+            Address::<StopRaceChildMsg>::new(ShardId::new(3), child_isolate)
+        }
+        other => panic!("expected child spawn, got {other:?}"),
+    };
+
+    runtime
+        .try_send(caller, StopRaceCallerMsg::Start(child))
+        .expect("start call");
+    assert_eq!(runtime.step(), 1);
+    assert!(
+        outcomes.borrow().is_empty(),
+        "call should be queued on the child before the parent stops it"
+    );
+
+    runtime
+        .try_send(parent, StopRaceParentMsg::StopChildren)
+        .expect("stop children");
+    for _ in 0..8 {
+        runtime.step();
+        if !outcomes.borrow().is_empty() {
+            break;
+        }
+    }
+    assert_eq!(outcomes.borrow().as_slice(), [CallOutcome::Closed]);
+
+    let closed_failures = runtime
+        .trace()
+        .iter()
+        .filter(|event| {
+            matches!(
+                event.kind(),
+                RuntimeEventKind::CallFailed {
+                    call_kind: CallKind::IsolateCall,
+                    reason: CallError::TargetClosed,
+                    ..
+                }
+            )
+        })
+        .count();
+    assert_eq!(
+        closed_failures, 1,
+        "precollected stopped-child call should emit one terminal failure"
+    );
 }
 
 #[test]

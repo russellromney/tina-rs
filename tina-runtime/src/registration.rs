@@ -302,10 +302,11 @@ where
     {
         let mailbox = self.create_mailbox::<Box<dyn Any>>(mailbox_capacity);
         let boxed: Box<dyn Any> = Box::new(bootstrap);
-        let address =
-            self.register_entry::<I, Outbound>(isolate, None, Box::new(AnyMailboxAdapter {
-                mailbox,
-            }));
+        let address = self.register_entry::<I, Outbound>(
+            isolate,
+            None,
+            Box::new(AnyMailboxAdapter { mailbox }),
+        );
         let entry_index = self
             .entry_indexes
             .get(&address.isolate)
@@ -731,6 +732,7 @@ where
                     remote_request_id: None,
                     remote_owner: None,
                     remote_restartable: false,
+                    terminal: false,
                 });
                 parent
             }
@@ -744,6 +746,7 @@ where
                     remote_request_id,
                     remote_owner,
                     remote_restartable: false,
+                    terminal: false,
                 });
                 child_isolate
             }
@@ -938,6 +941,7 @@ where
             remote_request_id: None,
             remote_owner: None,
             remote_restartable: false,
+            terminal: false,
         });
     }
 
@@ -965,6 +969,7 @@ where
             remote_request_id: None,
             remote_owner: None,
             remote_restartable,
+            terminal: false,
         });
     }
 }

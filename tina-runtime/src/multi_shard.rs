@@ -461,6 +461,7 @@ fn enqueue_remote_envelope_preserving_terminal(
             | QueuedRemoteEnvelope::SpawnCancel(_)
             | QueuedRemoteEnvelope::ChildStop(_)
             | QueuedRemoteEnvelope::ChildStopped(_)
+            | QueuedRemoteEnvelope::ChildRestart(_)
             | QueuedRemoteEnvelope::ChildRestarted(_)
     );
     let queue = if terminal {

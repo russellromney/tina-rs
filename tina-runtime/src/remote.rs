@@ -548,6 +548,7 @@ where
         match restarted.outcome {
             Ok(new_child) => {
                 self.child_records[record_index].child = new_child;
+                self.child_records[record_index].terminal = false;
                 self.push_event(
                     restarted.owner.isolate,
                     Some(restarted.cause),

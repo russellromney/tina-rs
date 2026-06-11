@@ -109,10 +109,11 @@ impl ChildLifecycleReport {
                     last_restart_skipped: None,
                 };
                 apply_trace(runtime.trace().iter(), parent.isolate, &mut child);
-                if child.shard == runtime.shard.id()
-                    && runtime
-                        .entry_index(record.child)
-                        .is_some_and(|idx| runtime.entries[idx].stopped.get())
+                if record.terminal
+                    || (child.shard == runtime.shard.id()
+                        && runtime
+                            .entry_index(record.child)
+                            .is_some_and(|idx| runtime.entries[idx].stopped.get()))
                 {
                     child.state = ChildLifecycleState::Stopped;
                 }
