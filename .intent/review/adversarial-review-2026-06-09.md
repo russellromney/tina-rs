@@ -415,3 +415,41 @@ Append-only follow-up for CI after the second-pass pushes.
 
 PR #241 was updated with the CI-fix commit id, root cause, verification, and
 caveat.
+
+## Resolution log — 2026-06-10 fix-wave review + fixes
+
+Append-only record for the adversarial review of PRs #238-#242 and the fixes
+or verification added after that review. The review found mostly already-fixed
+branch tips, plus one documentation straggler and two missing mutation
+verification transcripts. All commands used
+`CARGO_TARGET_DIR=/Users/russellromney/Documents/Github/tina-rs-adv/target`.
+
+| Finding(s) | Review verdict | Fix / verification | Key test | Caveats / deferrals |
+|---|---|---|---|---|
+| C-1 | Original evidence had been deleted; now restored on #238. | Existing commit `1adbfd9`. | `pending_timer_parks_multishard_worker_instead_of_spinning`; full runtime tests from #238 pass. | Evidence is behavioral/park-wakeup based. |
+| E5 | Duplicate terminal event and stopped/precollected local call race fixed on #238. | Existing commit `1adbfd9`. | `stop_children_closes_precollected_call_once_without_abandoning_waiter`. | Remote queued call-context coverage remains follow-up. |
+| C-4 | `ChildRestart` terminal envelope preservation fixed on #238. | Existing commit `1adbfd9`. | Runtime C-4 coverage plus full runtime tests. | Separate exact full-pressure remote-restart harness still not added. |
+| D-4 | Cancel-call continuation overflow test added on #238. | Existing commit `1adbfd9`. | `under_sized_mailbox_overflows_cancel_call_continuations_without_dropping`. | Shutdown terminal-overflow/drop accounting remains follow-up. |
+| C-3 | Chose explicit retained-record contract: meaningful terminal records retained for report truth; ordinary one-shot stopped children pruned. | Existing commit `1adbfd9`. | `spawn_stop_churn_gcs_non_restartable_children`; supervised restart report tests. | Local/remote consistency is through retained meaningful records, not permanent one-shot retention. |
+| B11 | Coverage existed but lacked mutation transcript. | Mutation-verified on #239: removing content-length-overrun credit makes `data_reject_paths_return_connection_window_credit` fail with missing credit (`left: 0`, `right: 2`); restored and reran green. | `cargo test -p tina-http data_reject_paths_return_connection_window_credit`; full `cargo test -p tina-http`; clippy. | Broader property fuzzing still useful. |
+| B9 | Idle PRIORITY fix existed but lacked mutation transcript. | Mutation-verified on #239: reverting the idle guard makes `malformed_priority_resets_open_stream_but_ignores_idle_stream` fail with fabricated RST on idle stream; restored and reran green. | `cargo test -p tina-http malformed_priority_resets_open_stream_but_ignores_idle_stream`; full `cargo test -p tina-http`; clippy. | Idle malformed PRIORITY is ignored, matching this codebase's existing idle-id convention. |
+| H2 semantic disclosure | Successful response completion cancels owned response sources. | Already disclosed in #239 body/CHANGELOG; #239 body updated with mutation evidence. | Full `tina-http` suite. | Late `ServiceReturned` after stream removal and counter taxonomy nits remain recorded follow-ups. |
+| CH-1 | EOF-abandoned streamed response slot leak fixed on #240. | Existing commits `cda8311`, CI layout fix `e120edd`. | `abandoned_streamed_response_after_end_stream_is_reaped_without_reset_and_slot_reused`; `cargo clippy -p tina-http --tests`; `cargo test -p tina-http`. | Parked `response_pull` whose caller already timed out remains honestly recorded if not covered by current reaper path. I-NEW-3 cursor/drain rewrite remains deferred. |
+| TG-6 | Two test pins were bumped; README still pinned v1. | New commit `5c17384` on #241 updates `examples/systems/mini_saas_api/README.md` to `tina.perf_report.v2`. | `rg "tina\\.perf_report\\.v1" examples/systems/mini_saas_api examples/systems/perf_native`; mini SaaS perf test. | `perf_native` still fails locally on existing clean-run assertion, but emitted JSON is schema v2. |
+| cause_shard misattribution | Misleading timeline cause-shard fields removed on #241. | Existing commit `ca2d865`. | `cargo test -p tina-tracing`; timeline tests assert absence. | Event shard and typed cause id remain. |
+| Truncation honesty | Single-shard/threaded truncation truth improved on #241. | Existing commits `ca2d865`, `4cf8880`. | `threaded_topology_reports_trace_drops_after_bounded_overflow`; `threaded_runtime_honors_bounded_trace_retention`. | `complete_events()` still maps truncation to `WorkerStopped`; multi-shard trace honesty remains separate owner-needed work. |
+| H9 fixture hygiene | Finding id removed from compile-fail fixture. | Existing commit `71fba5f`. | Fresh trybuild runs from #242. | None. |
+| D-6 / D-5 / H12 / H14 / D-3 | Review decisions recorded, no new code in this pass. | #242 body/log caveats preserved. | Bridge tests and clippy from #242. | D-6 remains docs-only; D-5 cancelled-before-admission counter remains future metric; H12/H14 optional lows remain open; D-3 public conversion removal is a semver note. |
+
+Recorded deferrals that should not silently disappear:
+
+- I-NEW-3: per-frame drain/cursor rewrite across HTTP/2 client, WebSocket
+  parser users, and gRPC buffering.
+- Multi-shard trace honesty: `ThreadedMultiShardRuntime::{complete_trace,
+  topology}` still need explicit ownership for truncated-trace truth and
+  `trace_dropped` reporting.
+- h2-server late `ServiceReturned` after stream removal can still strand a
+  streamed body source; counter taxonomy nits remain follow-up.
+- H12/H14 optional macro lows remain open.
+- D-6 docs-only host-thread contract and D-5 cancelled-before-admission metric
+  remain accepted-but-visible decisions.
