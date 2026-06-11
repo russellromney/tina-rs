@@ -280,7 +280,7 @@ final current. It is for local soak boxes and manual CI jobs, not ordinary
 
 The perf test is the same kind of work, tuned smaller and wrapped in
 `tina_proof_harness::PerfReport`. It prints a `perf ...` line and a
-`{"schema":"tina.perf_report.v1", ...}` line with local-machine timing,
+`{"schema":"tina.perf_report.v2", ...}` line with local-machine timing,
 pressure, capacity-surface count, and `comparison_baseline=none`. It is local
 release-mode performance evidence for this checkout; Tokio/hyper comparison
 comes later through equivalent-workload baselines.
