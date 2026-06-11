@@ -362,9 +362,15 @@ fn deferred_spans_are_keyed_by_shard_and_slot() {
     assert!(shard_call_pairs.contains(&(1, 10)));
     assert!(shard_call_pairs.contains(&(2, 20)));
     assert_eq!(spans[0]["args"]["shard"], 1);
-    assert_eq!(spans[0]["args"]["end_cause_shard"], 1);
+    assert!(
+        spans[0]["args"].get("end_cause_shard").is_none(),
+        "timeline must not invent a shard for an end-cause id"
+    );
     assert_eq!(spans[1]["args"]["shard"], 2);
-    assert_eq!(spans[1]["args"]["end_cause_shard"], 2);
+    assert!(
+        spans[1]["args"].get("end_cause_shard").is_none(),
+        "timeline must not invent a shard for an end-cause id"
+    );
 }
 
 #[test]

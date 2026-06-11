@@ -151,7 +151,11 @@ impl BufferedTraceObserver {
     /// Closes the queue, joins the drain thread, and returns the final
     /// dropped-event count.
     pub fn shutdown(&self) -> Result<BufferedTraceDrain, BufferedTraceDrainError> {
-        let sender = self.sender.lock().expect("buffered observer sender lock").take();
+        let sender = self
+            .sender
+            .lock()
+            .expect("buffered observer sender lock")
+            .take();
         drop(sender);
 
         if let Some(handle) = self
@@ -332,7 +336,9 @@ mod tests {
             buffered.on_event(event);
         }
 
-        let drain = buffered.flush().expect("flush should drain accepted events");
+        let drain = buffered
+            .flush()
+            .expect("flush should drain accepted events");
         assert_eq!(drain.dropped_events(), 0);
         assert_eq!(*collector.0.lock().expect("collector lock"), events);
 

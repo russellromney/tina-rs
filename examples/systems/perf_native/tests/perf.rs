@@ -256,7 +256,7 @@ fn native_protocol_rows_are_printable_and_bounded() {
             );
         }
         assert!(
-            json.contains("\"schema\":\"tina.perf_report.v1\""),
+            json.contains("\"schema\":\"tina.perf_report.v2\""),
             "native row json schema: {}",
             report.label,
         );

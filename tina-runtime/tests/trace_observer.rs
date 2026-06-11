@@ -210,7 +210,10 @@ fn threaded_topology_reports_trace_drops_after_bounded_overflow() {
         trace.clone().complete_events(),
         Err(ThreadedRuntimeError::WorkerStopped)
     );
-    assert!(!trace.events().is_empty(), "diagnostic suffix remains visible");
+    assert!(
+        !trace.events().is_empty(),
+        "diagnostic suffix remains visible"
+    );
 
     let _ = runtime.shutdown();
 }

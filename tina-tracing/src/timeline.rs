@@ -792,7 +792,6 @@ fn base_args(event: &RuntimeEvent) -> Map<String, Value> {
     args.insert("event_id".into(), json!(event.id().get()));
     if let Some(cause) = event.cause() {
         args.insert("cause_id".into(), json!(cause.event().get()));
-        args.insert("cause_shard".into(), json!(event.shard().get()));
     }
     args.insert("shard".into(), json!(event.shard().get()));
     args.insert("isolate".into(), json!(event.isolate().get()));
@@ -805,7 +804,6 @@ fn insert_end_args(args: &mut Map<String, Value>, end: &RuntimeEvent) {
     args.insert("terminal_kind".into(), json!(event_name(end.kind())));
     if let Some(cause) = end.cause() {
         args.insert("end_cause_id".into(), json!(cause.event().get()));
-        args.insert("end_cause_shard".into(), json!(end.shard().get()));
     }
 }
 

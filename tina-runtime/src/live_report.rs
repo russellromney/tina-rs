@@ -242,10 +242,7 @@ impl LiveShardMetrics {
         self.report_with_trace_dropped(None)
     }
 
-    pub(crate) fn report_with_trace_dropped(
-        &self,
-        trace_dropped: Option<u64>,
-    ) -> LiveShardReport {
+    pub(crate) fn report_with_trace_dropped(&self, trace_dropped: Option<u64>) -> LiveShardReport {
         let (worker_thread_id, affinity_status, observed_core) = {
             let startup = self.startup.lock().expect("worker startup lock poisoned");
             (

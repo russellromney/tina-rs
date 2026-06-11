@@ -460,7 +460,9 @@ impl FanInWorker {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum FanInCallerMsg {
-    Burst { first_call: u16 },
+    Burst {
+        first_call: u16,
+    },
     Returned {
         call_id: u16,
         outcome: CallOutcome<FanInReply>,
