@@ -33,6 +33,12 @@ This file records completed work.
   window credit during the upload instead of deadlocking above the initial
   window, and client/server stream lookup uses bounded id-to-slot maps instead
   of per-frame linear scans.
+- HTTP/2 streamed-response abandonment is explicit: if the caller leaves a
+  stream open between pulls, the idle timer sends local `RST_STREAM(CANCEL)`;
+  if the peer has already sent `END_STREAM`, the same timer reaps the local
+  stream slot without sending a reset. Each delivered body chunk arms at most
+  one no-op idle timer, and gRPC trailers-only responses continue to surface
+  their final status from the response header block.
 
 ### Real Protocol Performance
 

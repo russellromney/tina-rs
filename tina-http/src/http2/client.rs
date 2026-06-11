@@ -962,11 +962,15 @@ impl<S: Shard + 'static> Http2ClientConnection<S> {
         if !self.streams[idx].response_streamed
             || !self.streams[idx].response_head_sent
             || self.streams[idx].response_pull.is_some()
-            || self.streams[idx].response_eof
         {
             return noop();
         }
         let mut effects = Vec::new();
+        if self.streams[idx].response_eof {
+            self.complete_streaming_stream(idx, &mut effects);
+            self.pump_io(&mut effects);
+            return batch(effects);
+        }
         let mut stream = self.swap_remove_stream_at(idx);
         self.cancel_request_source(&stream, &mut effects);
         self.enqueue_frame(rst_stream_frame(stream_id, ERR_CANCEL));
