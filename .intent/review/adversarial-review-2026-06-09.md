@@ -410,6 +410,7 @@ Append-only follow-up for CI after the second-pass pushes.
 
 | Finding(s) | Status | PR | CI fix commit | Key proving tests / checks | Honest caveats |
 |---|---|---|---|---|---|
+| E1 / E3 client clippy layout | CI clippy fixed | #240 | `e120edd` | `cargo clippy -p tina-http --tests -- -D warnings`; `cargo test -p tina-http` | CI runs clippy with test targets, which caught `items_after_test_module` in `tina-http/src/client.rs`; fix is a test-module move only, no semantic code change. |
 | TG-2 / bounded trace truth | CI assertion fixed | #241 | `4cf8880` | `cargo clean -p tina-runtime`; `cargo test -p tina-runtime --test betelgeuse_substrate threaded_runtime_honors_bounded_trace_retention -- --nocapture`; `cargo test -p tina-runtime --test betelgeuse_substrate`; `cargo clippy -p tina-runtime --tests -- -D warnings` | The failed macOS CI assertion was stale: bounded retention had dropped a prefix, so `ThreadedRuntime::trace()` correctly returns a partial retained suffix. The test now asserts partial truth, nonzero dropped events, fail-closed `complete_events()`, and retained suffix length/order. |
 
 PR #241 was updated with the CI-fix commit id, root cause, verification, and
