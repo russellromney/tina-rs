@@ -124,9 +124,7 @@ impl Parse for ServiceArgs {
 
 fn expand(args: ServiceArgs, item: ItemTrait) -> Result<TokenStream2> {
     let trait_ident = item.ident.clone();
-    let service_name_lit = args
-        .name
-        .unwrap_or_else(|| trait_ident.unraw().to_string());
+    let service_name_lit = args.name.unwrap_or_else(|| trait_ident.unraw().to_string());
     let tina_crate = args.tina_crate.unwrap_or_else(|| syn::parse_quote!(::tina));
     let rpc_crate = args
         .rpc_crate

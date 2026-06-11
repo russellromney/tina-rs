@@ -509,14 +509,9 @@ fn raw_identifier_method_uses_unraw_wire_name() {
         fn r#move(&mut self, value: u8) -> u8;
     }
 
-    let request = KeywordOpsClient::move_request(
-        9,
-        Duration::from_secs(1),
-        1,
-        fake_reply_to(),
-        1024,
-    )
-    .unwrap();
+    let request =
+        KeywordOpsClient::move_request(9, Duration::from_secs(1), 1, fake_reply_to(), 1024)
+            .unwrap();
     assert_eq!(request.service, "KeywordOps");
     assert_eq!(request.method, "move");
 }
@@ -529,13 +524,7 @@ fn generated_encoding_local_does_not_shadow_user_argument() {
         fn echo(&self, __tina_encoding: u8) -> u8;
     }
 
-    let request = CollisionClient::echo_request(
-        7,
-        Duration::from_secs(1),
-        1,
-        fake_reply_to(),
-        1024,
-    )
-    .unwrap();
+    let request =
+        CollisionClient::echo_request(7, Duration::from_secs(1), 1, fake_reply_to(), 1024).unwrap();
     assert_eq!(request.payload, b"[7]");
 }

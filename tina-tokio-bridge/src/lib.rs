@@ -1069,10 +1069,9 @@ where
                     }
                 },
                 move |result| {
-                    let skipped_cancelled = matches!(
-                        result,
-                        Err(ThreadedSendObservedError::MailboxClosed)
-                    ) && preflight_cancelled.load(Ordering::Acquire);
+                    let skipped_cancelled =
+                        matches!(result, Err(ThreadedSendObservedError::MailboxClosed))
+                            && preflight_cancelled.load(Ordering::Acquire);
                     if skipped_cancelled {
                         let _ = observed_tx.send(Err(BridgeError::Timeout));
                         return;

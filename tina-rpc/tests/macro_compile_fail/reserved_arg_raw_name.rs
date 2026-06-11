@@ -1,5 +1,5 @@
-//! H9: raw-ident spelling of a reserved generated request parameter must be
-//! rejected by the macro, not by opaque generated duplicate-binding errors.
+//! Raw-ident spelling of a reserved generated request parameter must be
+//! rejected directly by the macro, not by opaque duplicate-binding errors.
 
 use tina_rpc::service;
 
