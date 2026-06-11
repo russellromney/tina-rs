@@ -784,12 +784,14 @@ impl<S: Shard + 'static, M: Http2ServiceMessage> Http2Connection<S, M> {
             return Err(Http2ProtocolError::BadStreamId);
         }
         if frame.payload.len() != PRIORITY_PAYLOAD_LEN {
-            self.reset_active_stream_for_protocol(
-                frame.stream_id,
-                ERR_FRAME_SIZE_ERROR,
-                Http2ResetReason::FrameSizeError,
-                effects,
-            );
+            if self.find_stream(frame.stream_id).is_some() {
+                self.reset_active_stream_for_protocol(
+                    frame.stream_id,
+                    ERR_FRAME_SIZE_ERROR,
+                    Http2ResetReason::FrameSizeError,
+                    effects,
+                );
+            }
             return Ok(());
         }
         Ok(())
@@ -2888,6 +2890,161 @@ mod tests {
                 u32::from_be_bytes(buf) & 0x7fff_ffff
             })
             .unwrap_or(0)
+    }
+
+    fn assert_data_reject_returns_connection_credit(
+        label: &str,
+        conn: &mut Http2Connection<UnitShard>,
+        stream_id: u32,
+        payload: &[u8],
+    ) {
+        let mut effects: Vec<Effect<Http2Connection<UnitShard>>> = Vec::new();
+        conn.handle_data_frame(
+            Frame::new(FRAME_DATA, 0, stream_id, payload.to_vec()),
+            &mut effects,
+        )
+        .unwrap_or_else(|err| panic!("{label}: DATA reject should stay stream-scoped: {err:?}"));
+        assert_eq!(
+            queued_window_update_increment(conn, 0),
+            payload.len() as u32,
+            "{label}: rejected DATA must return consumed connection credit"
+        );
+    }
+
+    #[test]
+    fn data_reject_paths_return_connection_window_credit() {
+        {
+            let mut conn = unit_connection();
+            conn.highest_client_stream_id = 1;
+            assert_data_reject_returns_connection_credit(
+                "closed stream missing from table",
+                &mut conn,
+                1,
+                b"abc",
+            );
+        }
+        {
+            let mut conn = unit_connection();
+            let mut stream = ActiveStream::new(
+                1,
+                HeaderBlock::default(),
+                DEFAULT_WINDOW,
+                DEFAULT_WINDOW,
+                false,
+            );
+            stream.state = Http2StreamState::Closed;
+            conn.push_stream(stream);
+            assert_data_reject_returns_connection_credit(
+                "closed stream state",
+                &mut conn,
+                1,
+                b"abc",
+            );
+        }
+        {
+            let mut conn = unit_connection();
+            let mut stream = ActiveStream::new(
+                1,
+                HeaderBlock::default(),
+                DEFAULT_WINDOW,
+                DEFAULT_WINDOW,
+                false,
+            );
+            stream.request_eof = true;
+            conn.push_stream(stream);
+            assert_data_reject_returns_connection_credit(
+                "DATA after request EOF",
+                &mut conn,
+                1,
+                b"abc",
+            );
+        }
+        {
+            let mut conn = unit_connection();
+            conn.recv_window = DEFAULT_WINDOW;
+            conn.push_stream(ActiveStream::new(
+                1,
+                HeaderBlock::default(),
+                1,
+                DEFAULT_WINDOW,
+                false,
+            ));
+            assert_data_reject_returns_connection_credit(
+                "stream receive window exceeded",
+                &mut conn,
+                1,
+                b"abc",
+            );
+        }
+        {
+            let mut conn = unit_connection();
+            let mut stream = ActiveStream::new(
+                1,
+                HeaderBlock::default(),
+                DEFAULT_WINDOW,
+                DEFAULT_WINDOW,
+                false,
+            );
+            stream.request_content_length = Some(2);
+            stream.request_bytes_received = 1;
+            conn.push_stream(stream);
+            assert_data_reject_returns_connection_credit(
+                "content-length overrun",
+                &mut conn,
+                1,
+                b"ab",
+            );
+        }
+        {
+            let mut conn = unit_connection();
+            conn.limits.max_body_bytes = 1;
+            conn.push_stream(ActiveStream::new(
+                1,
+                HeaderBlock::default(),
+                DEFAULT_WINDOW,
+                DEFAULT_WINDOW,
+                false,
+            ));
+            assert_data_reject_returns_connection_credit("body cap exceeded", &mut conn, 1, b"ab");
+        }
+    }
+
+    #[test]
+    fn malformed_priority_resets_open_stream_but_ignores_idle_stream() {
+        let mut conn = unit_connection();
+        conn.push_stream(ActiveStream::new(
+            1,
+            HeaderBlock::default(),
+            DEFAULT_WINDOW,
+            DEFAULT_WINDOW,
+            false,
+        ));
+        let mut effects: Vec<Effect<Http2Connection<UnitShard>>> = Vec::new();
+        conn.handle_priority(Frame::new(FRAME_PRIORITY, 0, 1, vec![0, 1]), &mut effects)
+            .expect("malformed PRIORITY on open stream is stream-scoped");
+        assert_eq!(conn.write_queue.len(), 1);
+        let facts = collect_facts(&effects);
+        assert!(facts.iter().any(|fact| matches!(
+            fact,
+            ProtocolFact::Http2StreamReset {
+                reason: Http2ResetReason::FrameSizeError,
+                direction: ProtocolDirection::Outbound,
+                ..
+            }
+        )));
+
+        let mut conn = unit_connection();
+        let mut effects: Vec<Effect<Http2Connection<UnitShard>>> = Vec::new();
+        conn.handle_priority(Frame::new(FRAME_PRIORITY, 0, 3, vec![0, 1]), &mut effects)
+            .expect("malformed PRIORITY on idle stream is ignored");
+        assert!(
+            conn.write_queue.is_empty(),
+            "idle PRIORITY must not fabricate RST_STREAM"
+        );
+        assert!(
+            collect_facts(&effects).is_empty(),
+            "idle PRIORITY must not emit reset facts"
+        );
     }
 
     #[test]
