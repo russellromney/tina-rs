@@ -1098,41 +1098,27 @@ where
             continue;
         }
 
-        // Nothing local, remote, or overflow was deliverable. With no in-flight
-        // work, park on the command queue with the bounded `idle_wait` and
-        // re-poll remote inbound each tick. With work in flight, yield: the
-        // runtime step blocks inside the betelgeuse io_loop while a timer or
-        // lane op is pending, so this yield does not hot-spin (verified: a held
-        // call or pending timer with nothing else to deliver does not burn a
-        // core). A bounded park here instead would only add `idle_wait` latency
-        // to a cross-shard reply for no benefit.
-        if !runtime.has_in_flight_calls() {
-            // Same pending-work-aware park as the single-shard worker: a short
-            // re-poll when runtime-owned work (a timer deadline, lane I/O) is
-            // pending but cannot signal the worker, a longer idle park when
-            // fully idle. The in-flight branch below stays a yield because a
-            // pending cross-shard reply arrives through remote inbound, not the
-            // command queue, and the step blocks in the io_loop rather than
-            // hot-spinning (a bounded park there would only delay that reply).
-            let park = if runtime.has_pending_runtime_work() {
-                config.idle_repoll_interval.min(config.idle_wait)
-            } else {
-                config.idle_wait
-            };
-            match receiver.recv_timeout(park) {
-                Ok(ThreadedCommand::Run(command)) => command(&mut runtime),
-                Ok(ThreadedCommand::HostCall { dispatcher, begin }) => {
-                    run_host_call(&mut runtime, dispatcher, begin)
-                }
-                Ok(ThreadedCommand::Shutdown) => {
-                    deliver_shutdown_signal_and_drain(&mut runtime);
-                    break;
-                }
-                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-            }
+        // Nothing local, remote, or overflow was deliverable. Park on the
+        // command queue, then explicitly re-poll remote inbound and step the
+        // runtime. Runtime-owned work and pending cross-shard replies cannot
+        // wake this queue, so they use the short bounded re-poll; a fully idle
+        // shard uses the longer idle wait.
+        let park = if runtime.has_in_flight_calls() || runtime.has_pending_runtime_work() {
+            config.idle_repoll_interval.min(config.idle_wait)
         } else {
-            thread::yield_now();
+            config.idle_wait
+        };
+        match receiver.recv_timeout(park) {
+            Ok(ThreadedCommand::Run(command)) => command(&mut runtime),
+            Ok(ThreadedCommand::HostCall { dispatcher, begin }) => {
+                run_host_call(&mut runtime, dispatcher, begin)
+            }
+            Ok(ThreadedCommand::Shutdown) => {
+                deliver_shutdown_signal_and_drain(&mut runtime);
+                break;
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
         }
     }
 

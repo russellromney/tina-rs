@@ -16,7 +16,9 @@ pub enum ThreadedRuntimeError {
     /// The worker could not prove backend completion-slot ownership was
     /// released during shutdown.
     DriverShutdownFailed,
-    /// The worker's live I/O park failed while waiting for readiness.
+    /// A worker park path failed while waiting for work.
+    ///
+    /// Kept for API compatibility with the removed readiness-driven park path.
     DriverParkFailed,
     /// The bounded worker command queue could not accept the host-control
     /// command immediately. The host call did not block and no work was
@@ -50,9 +52,7 @@ impl fmt::Display for ThreadedRuntimeError {
                     "driver shutdown failed: completion-slot ownership not released"
                 )
             }
-            Self::DriverParkFailed => {
-                write!(f, "driver readiness park failed while waiting for work")
-            }
+            Self::DriverParkFailed => write!(f, "worker park failed while waiting for work"),
             Self::CommandFull => {
                 write!(
                     f,
@@ -367,7 +367,7 @@ mod tests {
             ThreadedRuntimeError::DriverShutdownFailed,
             "driver shutdown",
         );
-        assert_error(ThreadedRuntimeError::DriverParkFailed, "readiness park");
+        assert_error(ThreadedRuntimeError::DriverParkFailed, "worker park");
         assert_error(ThreadedRuntimeError::CommandFull, "command queue is full");
         assert_error(ThreadedRuntimeError::HostWaitTimeout, "host wait budget");
     }

@@ -1287,12 +1287,11 @@ where
         self.call(|runtime| runtime.pressure_summary())
     }
 
-    /// Total blocking-park wakeups this worker has made.
+    /// Total bounded worker-park returns this worker has made.
     ///
-    /// A fully idle worker blocks on the kernel until a real wake source fires
-    /// (I/O readiness, a timer/call deadline, or a host command), so this stays
-    /// flat while the worker is quiet. The idle-CPU proof samples it over a
-    /// window to show a quiet worker makes ~0 wakeups.
+    /// Under explicit-step I/O this rises for timeout-driven re-polls as well
+    /// as command arrivals. It is retained as a live scheduling counter, not as
+    /// proof of kernel-readiness wakeups.
     pub fn park_wakeups(&self) -> u64 {
         self.metrics.park_wakeups()
     }
