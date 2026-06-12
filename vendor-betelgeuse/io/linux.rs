@@ -9,75 +9,17 @@ use std::{
     path::{Path, PathBuf},
     ptr::NonNull,
     rc::Rc,
-    sync::Arc,
-    time::Duration,
 };
 
 use io_uring::{IoUring, opcode, squeue, types};
 use log::trace;
 
 use crate::{
-    AcceptCompletion, AcceptOp, CompletionInner, ConnectCompletion, ConnectOp, Doorbell,
-    FsyncCompletion, FsyncOp, IO, IOFile, IOLoop, IOSocket, IOWaker, MkdirCompletion, MkdirOp,
-    OpenOptions, Operation, PReadCompletion, PReadOp, PWriteCompletion, PWriteOp,
-    RecvBufCompletion, RecvCompletion, RecvOp, SendCompletion, SendOp, SendOwnedCompletion,
-    SizeCompletion, SizeOp,
+    AcceptCompletion, AcceptOp, CompletionInner, ConnectCompletion, ConnectOp, FsyncCompletion,
+    FsyncOp, IO, IOFile, IOLoop, IOSocket, MkdirCompletion, MkdirOp, OpenOptions, Operation,
+    PReadCompletion, PReadOp, PWriteCompletion, PWriteOp, RecvBufCompletion, RecvCompletion,
+    RecvOp, SendCompletion, SendOp, SendOwnedCompletion, SizeCompletion, SizeOp,
 };
-
-/// Reserved `user_data` for the eventfd doorbell poll. `u64::MAX` is never a
-/// valid `&mut CompletionInner` pointer (user-space heap pointers on supported
-/// targets are far below it), so the harvest can classify it before any cast.
-/// `0` stays reserved as the backend's existing "ignore" marker.
-const DOORBELL_USER_DATA: u64 = u64::MAX;
-
-/// Cross-thread doorbell for the io_uring backend.
-///
-/// Owns an `eventfd` (shared via `Arc` with the backend, so a held [`IOWaker`]
-/// keeps it open after the loop drops). The eventfd counter is the coalescing
-/// truth: `wake()` makes it readable; a oneshot poll armed by
-/// [`IoUringIO::step_blocking`] completes when it is readable. `step()` may
-/// observe the doorbell completion but never drains the eventfd, so a wake that
-/// lands during a non-blocking drain still fires the next park's re-armed poll.
-struct EventfdDoorbell {
-    fd: RawFd,
-}
-
-impl EventfdDoorbell {
-    fn new() -> io::Result<Arc<Self>> {
-        let fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
-        if fd < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(Arc::new(Self { fd }))
-    }
-
-    /// Resets the eventfd counter so a freshly re-armed poll does not fire on a
-    /// stale count. Called by `step_blocking` after it consumes a doorbell
-    /// completion.
-    fn drain(&self) {
-        let mut buf = [0u8; 8];
-        // One read clears the whole counter; EAGAIN means already clear.
-        let _ = unsafe { libc::read(self.fd, buf.as_mut_ptr().cast(), buf.len()) };
-    }
-}
-
-impl Drop for EventfdDoorbell {
-    fn drop(&mut self) {
-        unsafe {
-            libc::close(self.fd);
-        }
-    }
-}
-
-impl Doorbell for EventfdDoorbell {
-    fn wake(&self) {
-        let val: u64 = 1;
-        // Writing to a non-semaphore eventfd adds to the counter, making it
-        // readable. EAGAIN (counter saturated near u64::MAX) means it is already
-        // signaled — coalesced, nothing more to do.
-        let _ = unsafe { libc::write(self.fd, (&val as *const u64).cast(), mem::size_of::<u64>()) };
-    }
-}
 
 enum SocketKind {
     Listener,
@@ -111,14 +53,6 @@ struct IoUringState {
     ring: IoUring,
     queued: VecDeque<NonNull<CompletionInner>>,
     inflight: HashSet<NonNull<CompletionInner>>,
-    /// Enables socket ops to park in the kernel for readiness. Threaded Tina
-    /// workers turn this on before using `step_blocking`; explicit-step
-    /// runtimes leave it off so `step()` stays non-blocking with pending reads.
-    blocking_socket_io: bool,
-    /// Whether a oneshot eventfd-doorbell poll is currently in flight in the
-    /// ring. Re-armed by `step_blocking`; cleared when the doorbell completion is
-    /// harvested (oneshot is consumed by the kernel).
-    doorbell_armed: bool,
 }
 
 struct IoUringFile {
@@ -137,7 +71,6 @@ struct IoUringSocket {
 
 pub struct IoUringIO {
     state: Rc<RefCell<IoUringState>>,
-    doorbell: Arc<EventfdDoorbell>,
 }
 
 impl IoUringIO {
@@ -151,16 +84,12 @@ impl IoUringIO {
             trace!("create io_uring ring entries={entries}");
             match IoUring::new(entries) {
                 Ok(ring) => {
-                    let doorbell = EventfdDoorbell::new()?;
                     return Ok(Self {
                         state: Rc::new(RefCell::new(IoUringState {
                             ring,
                             queued: VecDeque::new(),
                             inflight: HashSet::new(),
-                            blocking_socket_io: false,
-                            doorbell_armed: false,
                         })),
-                        doorbell,
                     });
                 }
                 Err(err)
@@ -685,15 +614,10 @@ impl IOSocket for IoUringSocket {
             }
         }
         let inner = c.inner_mut();
-        let flags = if self.state.borrow().blocking_socket_io {
-            0
-        } else {
-            libc::MSG_DONTWAIT
-        };
         inner.prepare(Operation::Recv(RecvOp {
             fd,
             buf: vec![0_u8; len],
-            flags,
+            flags: libc::MSG_DONTWAIT,
         }));
         queue(&self.state, inner);
         Ok(())
@@ -731,15 +655,10 @@ impl IOSocket for IoUringSocket {
         }
         buffer.resize(max_len, 0);
         let inner = c.inner_mut();
-        let flags = if self.state.borrow().blocking_socket_io {
-            0
-        } else {
-            libc::MSG_DONTWAIT
-        };
         inner.prepare(Operation::RecvBuf(RecvOp {
             fd,
             buf: buffer,
-            flags,
+            flags: libc::MSG_DONTWAIT,
         }));
         queue(&self.state, inner);
         Ok(())
@@ -770,11 +689,7 @@ impl IOSocket for IoUringSocket {
             }
         }
         let inner = c.inner_mut();
-        let flags = if self.state.borrow().blocking_socket_io {
-            libc::MSG_NOSIGNAL
-        } else {
-            libc::MSG_NOSIGNAL | libc::MSG_DONTWAIT
-        };
+        let flags = libc::MSG_NOSIGNAL | libc::MSG_DONTWAIT;
         inner.prepare(Operation::Send(SendOp { fd, buf, flags }));
         queue(&self.state, inner);
         Ok(())
@@ -810,11 +725,7 @@ impl IOSocket for IoUringSocket {
             }
         }
         let inner = c.inner_mut();
-        let flags = if self.state.borrow().blocking_socket_io {
-            libc::MSG_NOSIGNAL
-        } else {
-            libc::MSG_NOSIGNAL | libc::MSG_DONTWAIT
-        };
+        let flags = libc::MSG_NOSIGNAL | libc::MSG_DONTWAIT;
         inner.prepare(Operation::SendOwned(SendOp { fd, buf, flags }));
         queue(&self.state, inner);
         Ok(())
@@ -906,7 +817,7 @@ impl IO for IoUringIO {
 impl IoUringIO {
     /// Pushes queued ops into the submission queue (without calling `submit`).
     /// Returns the inline `Size` ops to dispatch and whether any op was pushed.
-    /// Shared by `step` and `step_blocking`.
+    /// Shared by `step` and shutdown cancellation.
     fn fill_submission(state: &mut IoUringState) -> (Vec<NonNull<CompletionInner>>, bool) {
         let mut size_ops = Vec::new();
         let mut submitted = false;
@@ -942,45 +853,10 @@ impl IoUringIO {
         (size_ops, submitted)
     }
 
-    /// Arms the oneshot eventfd-doorbell poll if it is not already in flight.
-    ///
-    /// The doorbell is load-bearing for `step_blocking(None)`: host commands
-    /// wake only if this poll is actually submitted. If the SQ is full after
-    /// user ops were queued, submit once and retry instead of silently entering
-    /// a wait with no doorbell.
-    fn arm_doorbell(state: &mut IoUringState, doorbell_fd: RawFd) -> io::Result<bool> {
-        if state.doorbell_armed {
-            return Ok(false);
-        }
-        let entry = opcode::PollAdd::new(types::Fd(doorbell_fd), libc::POLLIN as u32)
-            .build()
-            .user_data(DOORBELL_USER_DATA);
-        let mut submitted_to_make_room = false;
-        for _ in 0..2 {
-            let mut submission = state.ring.submission();
-            let pushed = unsafe { submission.push(&entry).is_ok() };
-            drop(submission);
-            if pushed {
-                state.doorbell_armed = true;
-                return Ok(submitted_to_make_room);
-            }
-            state.ring.submit()?;
-            submitted_to_make_room = true;
-        }
-        Err(io::Error::new(
-            io::ErrorKind::WouldBlock,
-            "io_uring submission queue could not arm doorbell",
-        ))
-    }
-
-    /// Harvests ready CQEs into typed completions. `drain_doorbell` drains the
-    /// eventfd after consuming a doorbell completion (only `step_blocking` does
-    /// this, so a wake observed during a non-blocking `step` survives to the
-    /// next park). Returns whether anything progressed.
-    fn harvest(&self, drain_doorbell: bool) -> io::Result<bool> {
+    /// Harvests ready CQEs into typed completions. Returns whether anything progressed.
+    fn harvest(&self) -> io::Result<bool> {
         let mut progressed = false;
         let mut completed = Vec::new();
-        let mut doorbell_fired = false;
         {
             let mut state = self.state.borrow_mut();
             let len = state.ring.completion().len();
@@ -992,14 +868,6 @@ impl IoUringIO {
                     .expect("completion length checked above");
                 let user_data = cqe.user_data();
                 if user_data == 0 {
-                    progressed = true;
-                    continue;
-                }
-                if user_data == DOORBELL_USER_DATA {
-                    // Doorbell poll fired (oneshot, consumed by the kernel).
-                    // Classify before any cast: this is never a completion ptr.
-                    state.doorbell_armed = false;
-                    doorbell_fired = true;
                     progressed = true;
                     continue;
                 }
@@ -1018,10 +886,6 @@ impl IoUringIO {
                 completed.push((completion_ptr, cqe.result()));
                 progressed = true;
             }
-        }
-
-        if drain_doorbell && doorbell_fired {
-            self.doorbell.drain();
         }
 
         for (completion_ptr, result) in completed {
@@ -1053,67 +917,8 @@ impl IOLoop for IoUringIO {
             progressed = true;
         }
 
-        let harvested = self.harvest(false)?;
+        let harvested = self.harvest()?;
         Ok(progressed || harvested)
-    }
-
-    fn step_blocking(&self, timeout: Option<Duration>) -> io::Result<bool> {
-        let mut progressed = false;
-        let size_ops;
-        {
-            let mut state = self.state.borrow_mut();
-            let (ops, submitted) = Self::fill_submission(&mut state);
-            size_ops = ops;
-            if submitted {
-                progressed = true;
-            }
-            // Keep the doorbell poll armed so a host wake can return us from the
-            // blocking wait. There is always this one possible wake source, so a
-            // `None` wait can never block with nothing able to wake it.
-            if Self::arm_doorbell(&mut state, self.doorbell.fd)? {
-                progressed = true;
-            }
-            // Don't block if we have inline Size work ready to dispatch.
-            if size_ops.is_empty() {
-                match timeout {
-                    None => {
-                        state.ring.submit_and_wait(1)?;
-                    }
-                    Some(d) => {
-                        // Park cap (~1 year): a raw huge timeout makes io_uring
-                        // reject the timespec; the real deadline still fires via
-                        // the runtime's timeout harvest.
-                        const MAX_PARK_SECS: u64 = 366 * 24 * 60 * 60;
-                        let ts = types::Timespec::new()
-                            .sec(d.as_secs().min(MAX_PARK_SECS))
-                            .nsec(d.subsec_nanos());
-                        let args = types::SubmitArgs::new().timespec(&ts);
-                        match state.ring.submitter().submit_with_args(1, &args) {
-                            Ok(_) => {}
-                            // ETIME: the wait timed out with no completion. Not an
-                            // error — fall through to a (possibly empty) harvest.
-                            Err(err) if err.raw_os_error() == Some(libc::ETIME) => {}
-                            Err(err) => return Err(err),
-                        }
-                    }
-                }
-            } else {
-                state.ring.submit()?;
-            }
-        }
-
-        for completion_ptr in size_ops {
-            let completion = unsafe { completion_ptr.as_ptr().as_mut().expect("non-null") };
-            Self::dispatch_complete(&self.state, completion, 0);
-            progressed = true;
-        }
-
-        let harvested = self.harvest(true)?;
-        Ok(progressed || harvested)
-    }
-
-    fn waker(&self) -> IOWaker {
-        IOWaker::new(self.doorbell.clone())
     }
 
     fn pending_completion_count(&self) -> usize {
@@ -1156,10 +961,6 @@ impl IOLoop for IoUringIO {
         }
 
         Ok(())
-    }
-
-    fn set_blocking_socket_io(&self, enabled: bool) {
-        self.state.borrow_mut().blocking_socket_io = enabled;
     }
 }
 

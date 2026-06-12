@@ -1,8 +1,9 @@
-//! Pending-TCP-read proof for the readiness-driven worker park.
+//! Pending-TCP-read proof for explicit-step I/O.
 //!
 //! A connected peer that sends nothing leaves the server's `recv` pending. The
-//! worker must park on the kernel (zero wakeups while no bytes arrive) and then
-//! service the read promptly the instant bytes do arrive — not on a poll timer.
+//! worker observes that read by repeatedly calling the explicit runtime
+//! `step()` after a bounded idle sleep. This intentionally accepts the Phase 150
+//! style latency/CPU tradeoff instead of using an out-of-band readiness wake.
 
 mod common;
 
@@ -13,7 +14,7 @@ use std::time::{Duration, Instant};
 use common::TestHarness;
 
 #[test]
-fn pending_tcp_read_parks_with_zero_wakeups_then_wakes_on_bytes() {
+fn pending_tcp_read_is_serviced_by_bounded_explicit_repoll() {
     let harness = TestHarness::start();
     let addr = harness.addr;
 
@@ -24,21 +25,22 @@ fn pending_tcp_read_parks_with_zero_wakeups_then_wakes_on_bytes() {
         .set_read_timeout(Some(Duration::from_secs(2)))
         .expect("read timeout");
 
-    // Let the accept settle so the worker is parked on the pending recv.
+    // Let the accept settle so the worker is idling with a pending recv.
     std::thread::sleep(Duration::from_millis(50));
 
-    // While the peer is silent the worker must be asleep on the kernel: ~0
-    // wakeups across the window. A timer-poll park would wake ~250 times here.
+    // While the peer is silent the worker re-polls explicitly. This is the
+    // intended Phase 157 behavior: the pending read is not serviced by a hidden
+    // cross-thread I/O wake channel.
     let before = harness.runtime_handle().park_wakeups();
-    std::thread::sleep(Duration::from_millis(250));
+    std::thread::sleep(Duration::from_millis(80));
     let idle_wakeups = harness.runtime_handle().park_wakeups() - before;
     assert!(
-        idle_wakeups <= 3,
-        "worker woke {idle_wakeups} times with a pending read and no bytes; the park is not blocking on the kernel"
+        idle_wakeups > 0,
+        "worker did not perform bounded explicit re-polls while a read was pending"
     );
 
-    // Now send the request. The worker must wake at kernel-readiness latency and
-    // serve the response promptly (well under the 2s read timeout).
+    // Now send the request. The worker should serve it within the bounded
+    // re-poll policy, not wait for the long socket read timeout.
     let started = Instant::now();
     stream
         .write_all(b"GET /counter HTTP/1.1\r\nHost: x\r\n\r\n")
@@ -55,7 +57,7 @@ fn pending_tcp_read_parks_with_zero_wakeups_then_wakes_on_bytes() {
     );
     assert!(
         elapsed < Duration::from_millis(500),
-        "pending read serviced slowly ({elapsed:?}); not waking on kernel readiness"
+        "pending read serviced too slowly ({elapsed:?}); bounded re-poll is not advancing I/O"
     );
 
     harness.shutdown();

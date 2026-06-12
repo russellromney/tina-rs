@@ -633,7 +633,7 @@ mod tests {
     /// leaking the handle (not joining) leaves the metrics `RUNNING`.
     fn fake_worker(shard_id: u32) -> ShutdownWorker<TestShard, DefaultMailboxFactory> {
         let (commands, _rx) = sync_channel::<ThreadedCommand<TestShard, DefaultMailboxFactory>>(1);
-        let commands = CommandSender::new(commands, None);
+        let commands = CommandSender::new(commands);
         let shard = ShardId::new(shard_id);
         let metrics = Arc::new(LiveShardMetrics::new(
             shard,

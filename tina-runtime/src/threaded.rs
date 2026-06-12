@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use betelgeuse::{IOLoopHandle, IOWaker, io_loop};
+use betelgeuse::{IOLoopHandle, io_loop};
 use tina::{Address, Isolate, Outbound as TinaOutbound, Shard, TrySendError};
 use tina_supervisor::SupervisorConfig;
 
@@ -195,26 +195,13 @@ pub const HOST_CALL_DISPATCHER_POOL_SIZE: usize = 8;
 /// `CallOutcome::Timeout` instead of racing the host wait timer.
 pub const DEFAULT_HOST_CALL_DELIVERY_GRACE: Duration = Duration::from_millis(100);
 
-/// Bounded command sender wrapped with the worker's wake doorbell.
-///
-/// Every successful admission (`try_send`/`send`) rings the doorbell *after*
-/// the command is in the queue, so a worker parked in `step_blocking` wakes and
-/// drains it. The doorbell is coalescing/level-triggered, so a wake that races
-/// just ahead of the park is still observed — no command is ever enqueued but
-/// missed. `Full`/`Disconnected` outcomes are preserved exactly: the doorbell is
-/// only rung on success, and a `Full` queue returns immediately without ever
-/// waiting on a wake.
-///
-/// `waker` is `None` only for runtimes whose worker does not block on the
-/// io_loop (the multi-shard worker, which parks on its command queue and so
-/// wakes on the mpsc directly); ringing is then a no-op.
+/// Bounded command sender for the worker's explicit command queue.
 pub(crate) struct CommandSender<S, F>
 where
     S: Shard + 'static,
     F: MailboxFactory,
 {
     tx: std::sync::mpsc::SyncSender<ThreadedCommand<S, F>>,
-    waker: Option<IOWaker>,
 }
 
 impl<S, F> Clone for CommandSender<S, F>
@@ -225,7 +212,6 @@ where
     fn clone(&self) -> Self {
         Self {
             tx: self.tx.clone(),
-            waker: self.waker.clone(),
         }
     }
 }
@@ -235,56 +221,35 @@ where
     S: Shard + 'static,
     F: MailboxFactory,
 {
-    pub(crate) fn new(
-        tx: std::sync::mpsc::SyncSender<ThreadedCommand<S, F>>,
-        waker: Option<IOWaker>,
-    ) -> Self {
-        Self { tx, waker }
+    pub(crate) fn new(tx: std::sync::mpsc::SyncSender<ThreadedCommand<S, F>>) -> Self {
+        Self { tx }
     }
 
-    fn ring(&self) {
-        if let Some(waker) = &self.waker {
-            waker.wake();
-        }
-    }
-
-    /// Non-blocking bounded admission. Rings the doorbell only on success.
+    /// Non-blocking bounded admission.
     pub(crate) fn try_send(
         &self,
         command: ThreadedCommand<S, F>,
     ) -> Result<(), std::sync::mpsc::TrySendError<ThreadedCommand<S, F>>> {
-        let result = self.tx.try_send(command);
-        if result.is_ok() {
-            self.ring();
-        }
-        result
+        self.tx.try_send(command)
     }
 
     /// Blocking bounded admission (used by control-plane `call`/shutdown, never
-    /// the per-request hot path). Cannot deadlock against a parked worker: the
-    /// worker only parks with an empty queue, and every prior admitted command
-    /// has already rung the doorbell, so the worker always wakes and drains
-    /// enough to free a slot. Rings the doorbell only on success.
+    /// the per-request hot path).
     pub(crate) fn send(
         &self,
         command: ThreadedCommand<S, F>,
     ) -> Result<(), std::sync::mpsc::SendError<ThreadedCommand<S, F>>> {
-        let result = self.tx.send(command);
-        if result.is_ok() {
-            self.ring();
-        }
-        result
+        self.tx.send(command)
     }
 }
 
-/// Worker -> host startup handshake: the io_loop wake doorbell plus the
-/// registered host-call dispatcher pool. Published once after the worker builds
-/// its runtime; the host blocks briefly on it during construction.
+/// Worker -> host startup handshake: the registered host-call dispatcher pool.
+/// Published once after the worker builds its runtime; the host blocks briefly
+/// on it during construction.
 pub(crate) struct WorkerHandshake<S>
 where
     S: Shard + 'static,
 {
-    waker: Option<IOWaker>,
     dispatchers: Vec<Address<DispatcherMsg<S>, ()>>,
 }
 
@@ -484,10 +449,9 @@ where
         let io_loop_factory: ThreadedIoLoopFactory = Box::new(io_loop_factory);
         let worker_metrics = Arc::clone(&metrics);
         let worker_observer = observer;
-        // One-shot channel for the worker to publish (a) the io_loop wake
-        // doorbell and (b) the persistent host-call dispatcher pool's addresses
-        // back to the host once the runtime is built and registered. We block
-        // briefly on construction so the command sender carries the doorbell and
+        // One-shot channel for the worker to publish the persistent host-call
+        // dispatcher pool's addresses back to the host once the runtime is
+        // built and registered. We block briefly on construction so
         // `call_blocking` can use the addresses immediately.
         let (dispatcher_tx, dispatcher_rx) = std::sync::mpsc::channel::<WorkerHandshake<S>>();
         let handle = thread::Builder::new()
@@ -510,14 +474,14 @@ where
         // `WorkerStopped`, don't panic the constructor. `Timeout` means the
         // worker is stuck (registration normally takes microseconds); 5s is
         // far past any plausible setup time, so panic in that case.
-        let (waker, dispatchers) = match dispatcher_rx.recv_timeout(Duration::from_secs(5)) {
-            Ok(handshake) => (handshake.waker, Arc::new(handshake.dispatchers)),
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => (None, Arc::new(Vec::new())),
+        let dispatchers = match dispatcher_rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(handshake) => Arc::new(handshake.dispatchers),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Arc::new(Vec::new()),
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                 panic!("worker failed to publish host-call dispatcher pool in 5s");
             }
         };
-        let commands = CommandSender::new(commands, waker);
+        let commands = CommandSender::new(commands);
         let dispatcher_next = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
         let shutdown = Arc::new(SharedShutdownState::single_shard(ShutdownWorker {
@@ -1665,7 +1629,6 @@ where
     );
     runtime.set_trace_retention(config.trace_retention);
     runtime.set_driver_completion_drain_budget(config.driver_completion_drain_budget);
-    runtime.enable_blocking_socket_io_for_park();
     // Wire the observer before any event records.
     runtime.set_trace_observer(observer);
 
@@ -1684,16 +1647,10 @@ where
         );
         dispatcher_addrs.push(addr);
     }
-    // Mint the wake doorbell from this worker's io_loop and publish it with the
-    // dispatcher pool. The doorbell is the only way a host command (or shutdown)
-    // wakes the worker once it parks in `step_blocking`; it is a separate OS
-    // handle, safe to hold across threads.
-    let waker = runtime.io_waker();
     // If the host hung up between spawn and registration we just drop the
     // handshake; the worker continues to run normally and the host will
     // surface its own panic via the recv_timeout on its side.
     let _ = dispatcher_tx.send(WorkerHandshake {
-        waker,
         dispatchers: dispatcher_addrs,
     });
     drop(dispatcher_tx);
@@ -1781,48 +1738,36 @@ where
         }
 
         // About to go idle. Hot-delivery turns skip the O(pending) resource
-        // report (`refresh_metrics = false` above), so a turn that follows a
-        // burst and then finds nothing to do would park on a stale count. The
-        // readiness park can block forever, so that stale count would never
-        // correct itself. Publish the fresh count once before parking — a park
-        // turn is never a hot turn, so the hot-path savings are preserved.
+        // report (`refresh_metrics = false` above), so publish the fresh count
+        // once before parking. A park turn is never a hot turn, so the hot-path
+        // savings are preserved.
         metrics.set_resource_counts(runtime.resource_report());
 
-        // Nothing was deliverable. Park ON THE IO LOOP, not on a timer: block
-        // until a Betelgeuse completion arrives, a host command rings the
-        // doorbell, or the earliest runtime deadline elapses. Fallback lanes
-        // that cannot wake the io_loop force a capped re-poll below.
-        //
-        // Teardown is always a `Shutdown` command (Drop -> shutdown_blocking),
-        // which rings the doorbell, so a `None` (block-forever) park is woken on
-        // shutdown — the worker never relies on noticing a raw channel
-        // disconnect while parked.
-        let timeout = {
-            let now = Instant::now();
-            let mut deadline = runtime.next_park_deadline();
-            if runtime.park_needs_repoll() {
-                // Work a blocking io_loop park can't observe (channel-delivered
-                // DNS/process/storage lanes, OS-signal interest) or carried
-                // completions still to drain: cap the park and re-poll instead
-                // of blocking indefinitely.
-                let cap = now + config.idle_repoll_interval;
-                deadline = Some(deadline.map_or(cap, |d| d.min(cap)));
-            }
-            // `None` => block until the io_loop or the doorbell wakes us (true
-            // zero-wakeup idle). A future deadline => wake by then at the latest.
-            deadline.map(|d| d.saturating_duration_since(now))
+        // Nothing was deliverable. Park on the bounded command queue and
+        // explicitly re-step the runtime after a bounded sleep. Runtime-owned
+        // I/O, timers, signal waits, and carried completions cannot wake this
+        // queue, so pending work uses `idle_repoll_interval`; a fully idle worker
+        // uses the longer `idle_wait`.
+        let park = if runtime.has_pending_runtime_work() {
+            config.idle_repoll_interval.min(config.idle_wait)
+        } else {
+            config.idle_wait
         };
-        if runtime.park_io(timeout).is_err() {
-            metrics.set_state(LiveShardState::Failed);
-            let trace = runtime.trace().to_vec();
-            return ThreadedWorkerExit::failed(ThreadedRuntimeError::DriverParkFailed, trace);
+        match receiver.recv_timeout(park) {
+            Ok(ThreadedCommand::Run(command)) => command(&mut runtime),
+            Ok(ThreadedCommand::HostCall { dispatcher, begin }) => {
+                run_host_call(&mut runtime, dispatcher, begin)
+            }
+            Ok(ThreadedCommand::Shutdown) => {
+                deliver_shutdown_signal_and_drain(&mut runtime);
+                break;
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
         }
-        // One blocking-park wakeup. A fully idle worker blocks until a real wake
-        // source fires, so this stays flat at idle (the idle-CPU proof reads it).
         metrics.record_park_wakeup();
-        // Loop back: the top `try_recv` drains any command the doorbell woke us
-        // for (and observes Disconnected), and the hot-drain delivers any I/O
-        // completion the park harvested.
+        // Loop back: the hot-drain explicitly steps I/O and delivers any
+        // completions observed after the bounded park.
     }
 
     let shutdown_deadline = Instant::now() + config.shutdown_lane_drain_timeout;

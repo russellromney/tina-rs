@@ -59,9 +59,6 @@ where
     S: Shard + Send + 'static,
     F: MailboxFactory + Send + Clone + 'static,
 {
-    // Multi-shard workers park on their command queue (`recv_timeout`) and
-    // wake on the mpsc directly, so they carry no io_loop doorbell (`waker:
-    // None`). The readiness-driven io_loop park is single-shard only for now.
     commands: BTreeMap<ShardId, CommandSender<S, F>>,
     shard_metrics: BTreeMap<ShardId, Arc<LiveShardMetrics>>,
     remote_metrics: BTreeMap<(ShardId, ShardId), Arc<LiveQueueMetrics>>,
@@ -196,7 +193,7 @@ where
                 ..config
             };
             let (sender, receiver) = std::sync::mpsc::sync_channel(config.command_capacity);
-            commands.insert(shard.id(), CommandSender::new(sender, None));
+            commands.insert(shard.id(), CommandSender::new(sender));
             shard_metrics.insert(
                 shard.id(),
                 Arc::new(LiveShardMetrics::new(
@@ -931,7 +928,6 @@ where
     F: MailboxFactory + 'static,
 {
     runtime.remote_child_control_capacity = config.shard_pair_capacity;
-    runtime.enable_blocking_socket_io_for_park();
     // Pin this shard worker (if requested and the platform can). The driver's
     // helper lanes were already spawned when `runtime` was built above, so they
     // inherit the unpinned mask; later per-op helper threads float off the pin.

@@ -157,44 +157,22 @@ This file records completed work.
   `data_payload` clone, streaming/chunked framing, and gRPC request body copies
   are named as remaining cost rather than hidden.
 
-### Readiness-Driven Worker Park
+### Explicit-Step I/O Purity
 
-- The live single-shard worker no longer polls the I/O loop on a timer. It
-  blocks on the kernel and wakes the instant a socket is ready, a timer/call
-  deadline elapses, or a host command arrives. This removes the polling/wakeup
-  gap that left the worker asleep between events — not an optimization of real
-  work, but the removal of idle sleep that the old timer park spent on the hot
-  path. A fully idle worker now makes zero park wakeups.
-- Betelgeuse gains an additive `step_blocking(timeout)` and a separate
-  `Send + Sync + Clone` `IOWaker` doorbell (eventfd on Linux, `EVFILT_USER` on
-  macOS, a condvar on the simulated backend). `step()` and the completion
-  machinery are unchanged. Provenance and the local patch set are recorded in
-  `vendor-betelgeuse/VENDOR.md`.
-- The bounded command sender rings the doorbell after each successful admission,
-  preserving typed `Full`/`Disconnected` and never blocking a hot path. Lanes
-  whose completions arrive off the I/O loop (DNS/process/TLS/storage/signals)
-  cap the park and re-poll, so nothing is missed.
-- Linux io_uring reads/writes drop `MSG_DONTWAIT` so io_uring fast-polls them and
-  the worker truly blocks on a pending read instead of busy-retrying `EAGAIN`
-  (caught by running the park tests on real Linux/x86, where the prior flag made
-  an idle connection spin a core; macOS/kqueue was already correct).
-- Linux/x86 evidence (local/alpha, one cloud box): the HTTP host-submit gap was
-  ~1.1ms of worker sleep before and is now ~0.03-0.13ms of real connection
-  round-trips; the ~0.15ms that remains is the connection-setup and per-byte
-  work the sleep had been hiding, not a regression. The single-digit-microsecond
-  host-submit stretch was not met for HTTP and should not be — HTTP is
-  inherently multi-round-trip; that applies to one in-process hop only.
-- The `idle_repoll_interval` / `idle_wait` knobs no longer drive the
-  single-shard idle park (kept as accepted config). Multi-shard keeps its
-  command-queue park.
-- Mailbox-owned readiness: `Mailbox` gains a required `is_empty()` and an
-  optional wake hook for threaded/external-producer mailboxes. The per-step
-  scheduler scan skips expensive `recv` calls on quiet isolates, while direct
-  mailbox producers wake an idle worker on empty -> non-empty transitions. It
-  reflects real mailbox state for every ingress path (mediated and direct
-  `try_send`), so no message is missed; behaviour and the DST fingerprint are
-  unchanged. Skip-empty removes the recv-on-empty cost; a true ready queue was
-  not built (no measured scan cost justifies it).
+- The Phase 151 readiness-driven worker park has been removed. Betelgeuse is
+  back to one progress primitive, `step()`, and Tina's live workers again use
+  explicit stepping plus bounded idle re-poll. This preserves the
+  completion/event architecture at the cost of the known HTTP tail regression.
+- Linux io_uring socket reads/writes again use `MSG_DONTWAIT`; send paths still
+  include `MSG_NOSIGNAL`. There is no hidden cross-thread I/O wake channel in
+  the threaded runtime.
+- `idle_repoll_interval` / `idle_wait` once again drive the single-shard idle
+  park policy: pending runtime-owned work gets the shorter bounded re-poll, and
+  fully idle workers use the longer wait.
+- Mailbox-owned readiness remains as the safe part of Phase 151: `Mailbox`
+  still has required `is_empty()`, and the scheduler scan skips expensive
+  `recv` calls on quiet isolates. The empty-to-nonempty wake hook experiment was
+  removed with the I/O park.
 
 ### Scheduler, Turn, and Tail Performance
 
@@ -222,10 +200,9 @@ This file records completed work.
   cloud box (about 25.7us -> ~14us across runs), with HTTP rows steady. A
   controlled single-machine sweep showed the HTTP hot path is dominated by the
   worker re-polling the I/O loop on a timer rather than by request work —
-  shrinking that re-poll interval cuts HTTP p50 about 5x. The
-  readiness-driven worker park that removes the re-poll entirely is the named
-  next performance pass. All numbers are local/alpha evidence on a single
-  machine, not a production performance claim.
+  shrinking that re-poll interval cuts HTTP p50 about 5x. Phase 157 keeps the
+  explicit re-poll architecture despite that cost. All numbers are local/alpha
+  evidence on a single machine, not a production performance claim.
 
 ### Structural HTTP/Runtime Performance
 

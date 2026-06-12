@@ -58,18 +58,8 @@ where
     S: Shard,
     F: MailboxFactory,
 {
-    fn install_mailbox_wake_hook<T: 'static>(&self, mailbox: &dyn Mailbox<T>) {
-        // Clone the driver's one shared hook (an Arc refcount bump), not a fresh
-        // closure per mailbox — keeps the spawn/restart allocation count pinned.
-        if let Some(hook) = self.driver.mailbox_wake_hook() {
-            mailbox.set_wake_hook(Some(hook));
-        }
-    }
-
     fn create_mailbox<T: 'static>(&self, capacity: usize) -> Box<dyn Mailbox<T>> {
-        let mailbox = self.mailbox_factory.create::<T>(capacity);
-        self.install_mailbox_wake_hook(&*mailbox);
-        mailbox
+        self.mailbox_factory.create::<T>(capacity)
     }
 
     /// Registers one isolate and returns its typed address.
@@ -93,7 +83,6 @@ where
         Outbound: 'static,
         M: Mailbox<I::Message> + 'static,
     {
-        self.install_mailbox_wake_hook(&mailbox);
         let address = self.register_entry::<I, Outbound>(
             isolate,
             None,

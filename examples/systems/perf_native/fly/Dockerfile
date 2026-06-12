@@ -28,22 +28,22 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     ls -la /app
 
 # Build the Linux validation test binaries from the main workspace too, so the
-# io_uring step_blocking + eventfd doorbell path is exercised under the actual
-# test suite on real Linux/x86 (not only the perf probes). Separate target +
-# cache mount from the perf_native workspace above.
+# explicit-step socket path is exercised under the actual test suite on real
+# Linux/x86 (not only the perf probes). Separate target + cache mount from the
+# perf_native workspace above.
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/src/target,sharing=locked \
     set -eux; \
     mkdir -p /app/tests; \
     cargo test --release --no-run --message-format=json \
-        -p tina-runtime --test readiness_park --test mailbox_readiness \
+        -p tina-runtime --test mailbox_readiness \
         --test scheduler_turn_tail --test betelgeuse_substrate --test cancel_call \
         -p tina-http --test pending_read_park --test client_against_native \
         --test grpc_live \
       | grep -oE '"executable":"[^"]+"' \
       | sed 's/.*"executable":"//; s/"$//' \
-      | grep -E '/deps/(readiness_park|mailbox_readiness|scheduler_turn_tail|betelgeuse_substrate|cancel_call|pending_read_park|client_against_native|grpc_live)-[0-9a-f]+$' > /tmp/tbins.txt; \
+      | grep -E '/deps/(mailbox_readiness|scheduler_turn_tail|betelgeuse_substrate|cancel_call|pending_read_park|client_against_native|grpc_live)-[0-9a-f]+$' > /tmp/tbins.txt; \
     while read -r b; do [ -n "$b" ] && cp "$b" /app/tests/; done < /tmp/tbins.txt; \
     ls -la /app/tests
 
