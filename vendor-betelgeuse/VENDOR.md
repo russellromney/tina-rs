@@ -35,35 +35,16 @@ than pin a moving git dependency.
 - **`F_FULLFSYNC`** on Darwin file sync (durability).
 - **Honest socket address introspection** — `local_addr` / `peer_addr`.
 
-## Phase 151 patch family (this change)
+## Phase 157 explicit-step I/O purity
 
-- **`IOLoop::step_blocking(timeout)`** — additive blocking drain. `step()` and
-  the op/completion machinery are unchanged; `step_blocking` submits the same
-  queued work, then the backend may sleep up to `timeout` for a completion or a
-  doorbell wake (`None` blocks until a real event, safe because a doorbell is
-  always armed).
-- **`IOLoop::waker() -> IOWaker`** — a `Send + Sync + Clone` doorbell handle that
-  is a **separate OS handle** (Linux `eventfd`, macOS `EVFILT_USER`, simulated
-  condvar), not a clone of the `Rc<dyn IOLoop>`. A host thread may wake the loop
-  but never touches backend state.
-- **Linux socket ops can opt into io_uring's default fast-poll** — explicit-step
-  loops keep upstream's `MSG_DONTWAIT` behavior so `step()` remains a
-  non-blocking drain. Tina's threaded live workers opt in before parking; their
-  `recv`/`recv_buf`/`send`/`send_owned` ops omit `MSG_DONTWAIT` so io_uring can
-  arm readiness and wake `step_blocking` instead of busy-retrying `EAGAIN`.
-  This is a workload choice, not a defect fix. Upstream's always-busy
-  parakernel/TigerBeetle target wants polling; Tina services often idle between
-  requests and need the kernel to wake a parked worker. Under load, ready
-  sockets still complete inline either way. (macOS/kqueue already arms a real
-  `EVFILT` watch, so it is unaffected.)
-- Doorbell coalescing truth is an `AtomicBool` that only `step_blocking` clears;
-  the kernel interrupt (eventfd / `EVFILT_USER`) only unblocks a waiting kernel
-  call. `step()` may observe and skip the doorbell event but never clears the
-  coalescing flag, so a wake that arrives during a non-blocking drain still wakes
-  the next `step_blocking` (no lost wakeup).
+Phase 151 briefly added a readiness-driven worker park to this fork. Phase 157
+removed that experiment and restored Betelgeuse's explicit completion loop:
+`IOLoop::step()` is the only progress primitive, and it never sleeps.
 
-No broad re-vendor was performed for Phase 151: the blocking wait and waker are
-additive to the existing fork.
+Linux socket ops again always use `MSG_DONTWAIT` for `recv`, `recv_buf`, `send`,
+and `send_owned`; send paths continue to include `MSG_NOSIGNAL`. Threaded Tina
+workers observe I/O completion by explicitly stepping and using their bounded
+idle re-poll policy.
 
 ## Re-vendoring
 

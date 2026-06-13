@@ -336,25 +336,11 @@ hotpath probe; rows in `idle_repoll_ab_linux.txt`) showed the gap tracking the
 park interval almost exactly — 1 ms -> http close p50 1.16 ms, 100 µs ->
 0.23 ms (~5x).
 
-That diagnosis led directly to Phase 151's readiness-driven worker park below.
-
-## The wakeup gap, removed (readiness-driven park)
-
-The re-poll gap above is now gone: the single-shard worker blocks on the
-Betelgeuse I/O loop plus a command doorbell instead of polling on a timer, so a
-ready socket wakes it at kernel latency and a fully idle worker makes zero
-wakeups. On Linux/x86 (Fly performance-2x; rows in `perf_sample_linux.txt`) the
-`host_submit -> mbox` / `call_completed` stage dropped from ~1.1 ms of worker
-sleep to ~0.03-0.13 ms of real connection round-trips, and
-`hotpath_http1_close` / `keepalive_steady_state` p50 are ~0.15 ms.
-
-This is the removal of idle sleep the timer park spent on the hot path, not a
-speedup of real work: the ~0.15 ms that remains is the connect/accept/read
-round-trips the sleep had hidden. The single-digit-microsecond host-submit
-stretch is not met for HTTP and should not be — HTTP is multi-round-trip; that
-floor applies to one in-process hop, which `call_blocking` roughly hits at
-~12-20 µs. The `TINA_PERF_IDLE_REPOLL_US` knob is now vestigial for the
-single-shard park. Local/alpha, single machine, not a production claim.
+Phase 151 briefly removed this gap by parking on kernel readiness, but Phase 157
+reverted that path to preserve Tina's explicit completion/event architecture.
+The diagnosis still matters: HTTP latency tracks the bounded re-poll interval.
+The `TINA_PERF_IDLE_REPOLL_US` knob remains the probe for that tradeoff, not a
+production tuning recommendation.
 
 ## Phase 152 protocol rows and byte-path cost
 

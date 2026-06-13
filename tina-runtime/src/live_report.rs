@@ -161,10 +161,10 @@ pub(crate) struct LiveShardMetrics {
     owned_resource_count: AtomicUsize,
     worker_held_resource_count: AtomicUsize,
     pending_driver_call_count: AtomicUsize,
-    /// Times the worker returned from a blocking park. A fully idle worker
-    /// blocks on the kernel and so leaves this flat; the count rises only when a
-    /// real wake source fires (I/O readiness, a deadline, or a host command).
-    /// Used by the idle-CPU proof to show a quiet worker makes ~0 wakeups.
+    /// Times the worker returned from its bounded command-queue park.
+    ///
+    /// Under explicit-step I/O this includes timeout-driven re-polls, so it is
+    /// a park-return counter rather than a kernel-readiness wakeup counter.
     park_wakeups: AtomicU64,
 }
 
@@ -196,12 +196,12 @@ impl LiveShardMetrics {
         }
     }
 
-    /// Records one return from a blocking park.
+    /// Records one return from a bounded worker park.
     pub(crate) fn record_park_wakeup(&self) {
         self.park_wakeups.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Total blocking-park wakeups observed so far.
+    /// Total bounded worker-park returns observed so far.
     pub(crate) fn park_wakeups(&self) -> u64 {
         self.park_wakeups.load(Ordering::Relaxed)
     }

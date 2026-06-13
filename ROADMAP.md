@@ -402,15 +402,17 @@ and reviews live under `.intent/phases/`.
   (one fewer allocation per `call_blocking`); warmed `call_blocking` p50
   improved on Linux/x86. (A ready-isolate scheduler was prototyped and reverted
   — it assumed all ingress is runtime-mediated, which the explicit runtime's
-  direct-mailbox seam breaks; it needs a mailbox-driven ready signal and is
-  deferred to the readiness-park work.) That pass
+  direct-mailbox seam breaks; it needs a mailbox-driven ready signal that does
+  not punch through the completion/event model.) That pass
   also isolated the dominant HTTP cost: the worker re-polled the I/O loop on a
   timer instead of waking on socket readiness, so the host path slept ~1ms
-  between events. The readiness-driven worker park then fixed that at the source
-  — the single-shard worker blocks on the kernel I/O loop plus a wakeup
-  doorbell, so a ready socket wakes it at kernel latency and a fully idle worker
-  makes zero wakeups; the HTTP host-submit sleep is gone and what remains is the
-  real connection round-trips it had hidden. The protocol rows pass then added
+  between events. Phase 151 proved the performance upside of a readiness-driven
+  park, but it did so by adding a non-completion wake side channel
+  (`step_blocking`/`IOWaker`) to the Tina-facing substrate. Phase 157 removes
+  that experiment and restores explicit-step I/O purity: live workers observe
+  I/O by calling `step()` after a bounded re-poll sleep, accepting the known
+  idle-wakeup and HTTP-latency tradeoff until an efficient path can be modeled
+  as ordinary completion/event work. The protocol rows pass then added
   Tina-only HTTP/2 h2c and WebSocket workload rows alongside the HTTP/1 ones,
   split connection-setup rows from steady-state-reuse rows so setup cost is no
   longer mixed into service cost, and started removing protocol-internal copies.
@@ -827,7 +829,7 @@ shape.
 | Broadcast/fanout primitive | Shipped: `BroadcastTargets`, `BroadcastTracker`, `BroadcastReport`, and `broadcast_observed` give room/session services a service-owned target cap, per-target `Accepted`/`Full`/`Closed` accounting, and an ordinary continuation-message path. Remaining: richer per-peer slow policy and room-manager helpers when another real service pulls on them. | Chat/WebSocket/realtime services get a copied Tina shape for broadcast without losing per-peer pressure truth. |
 | Pool maturity | Shipped: idle eviction, max lifetime, health checks, retire/reuse policy, shutdown reports, DB pressure alignment, and HTTP/1 keepalive retirement. Remaining: pooled HTTP/2/gRPC clients and cross-protocol session lifecycle polish. | Pools become production resources, not just first-form acquire/release examples. |
 | Async ecosystem boundary | Shipped: native-first capability reports, bridge-author vocabulary, extension smoke crates, open sync codec hooks, and docs separating native, bridge, and unsupported async paths. Remaining: decide whether a bounded Future/Stream bridge is worth building once a real workload proves it. | Users know which Tokio apps Tina can replace natively and where a bridge is the honest boundary. |
-| Benchmarks with humility | Shipped: Phases 144-155 add local release-mode native performance rows, bounded Tokio comparison rows, hot-path stage reports, perf history/check scripts, process allocation rows, HTTP body-pressure perf proof, manual Linux/x86 perf workflow, opt-in long soak, readiness-driven worker park, HTTP/2/WebSocket/gRPC protocol rows, structural HTTP/2 byte-path reductions, duplicate WebSocket event removal, gRPC compact/preframed/buffered hot paths, and compact gRPC service dispatch/response framing. Remaining: reduce deeper protocol/runtime turn count, reduce inbound HPACK/header allocation beyond compact gRPC, collect repeated Linux/x86 rows, broaden equivalent-workload comparisons, and resist production-performance claims until repeated evidence earns them. | Performance claims do not outrun Tina's boundedness and correctness story. |
+| Benchmarks with humility | Shipped: Phases 144-155 add local release-mode native performance rows, bounded Tokio comparison rows, hot-path stage reports, perf history/check scripts, process allocation rows, HTTP body-pressure perf proof, manual Linux/x86 perf workflow, opt-in long soak, a now-removed readiness-driven worker-park experiment, HTTP/2/WebSocket/gRPC protocol rows, structural HTTP/2 byte-path reductions, duplicate WebSocket event removal, gRPC compact/preframed/buffered hot paths, compact gRPC service dispatch/response framing, and Phase 157's return to explicit-step I/O. Remaining: reduce deeper protocol/runtime turn count, reduce inbound HPACK/header allocation beyond compact gRPC, collect repeated Linux/x86 rows, broaden equivalent-workload comparisons, and resist production-performance claims until repeated evidence earns them. | Performance claims do not outrun Tina's boundedness and correctness story. |
 | Ecosystem extension hooks | Shipped: bridge-author vocabulary, open sync codec and service-policy hooks, capacity surface/event-sink vocabulary, runtime capability report, and public-API-only extension smoke crates. Remaining: publication/semver proof and stronger author templates once third-party-shaped crates grow. | Tina can grow an ecosystem without every new capability landing in core or weakening bounded/DST truth. |
 | Whole-framework ergonomics | Shipped: one coherent copied path for a real service: prelude, config/budget manifest, public requests/internal events, defer/cancel/drain/report/shutdown, and replay hooks. Remaining: keep the skeleton current as AWS, pooled HTTP/2/gRPC, native database, and saga-shaped systems land. | A new developer or cheap model can build a correct bounded + replay-aware service without stitching ten specimens together. |
 

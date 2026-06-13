@@ -1,5 +1,4 @@
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 
 use tina::{Mailbox, TrySendError};
@@ -56,30 +55,6 @@ fn close_rejects_future_sends_but_drains_buffered_messages() {
     );
     assert_eq!(mailbox.recv(), Some("buffered"));
     assert_eq!(mailbox.recv(), None);
-}
-
-#[test]
-fn wake_hook_runs_only_on_empty_to_nonempty_transition() {
-    let mailbox = SpscMailbox::new(4);
-    let wakes = Arc::new(AtomicUsize::new(0));
-    let wakes_for_hook = Arc::clone(&wakes);
-    mailbox.set_wake_hook(Some(Arc::new(move || {
-        wakes_for_hook.fetch_add(1, Ordering::Relaxed);
-    })));
-
-    assert_eq!(mailbox.try_send("first"), Ok(()));
-    assert_eq!(mailbox.try_send("second"), Ok(()));
-    assert_eq!(wakes.load(Ordering::Relaxed), 1);
-
-    assert_eq!(mailbox.recv(), Some("first"));
-    assert_eq!(mailbox.try_send("third"), Ok(()));
-    assert_eq!(wakes.load(Ordering::Relaxed), 1);
-
-    assert_eq!(mailbox.recv(), Some("second"));
-    assert_eq!(mailbox.recv(), Some("third"));
-    assert_eq!(mailbox.recv(), None);
-    assert_eq!(mailbox.try_send("fourth"), Ok(()));
-    assert_eq!(wakes.load(Ordering::Relaxed), 2);
 }
 
 #[test]

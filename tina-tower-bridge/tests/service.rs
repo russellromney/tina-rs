@@ -1,7 +1,7 @@
 //! End-to-end tests for `tina-tower-bridge`.
 
 use std::convert::Infallible;
-use std::task::{Context, Poll, Waker};
+use std::task::Poll;
 use std::time::Duration;
 
 use tina::prelude::*;
@@ -147,12 +147,9 @@ async fn poll_ready_returns_ready_ok_when_accepting() {
         )
         .expect("register");
     let mut svc = TinaTowerService::new(bridge);
-    let waker = Waker::noop();
-    let mut cx = Context::from_waker(waker);
-    match svc.poll_ready(&mut cx) {
-        Poll::Ready(Ok(())) => {}
-        other => panic!("expected Ready(Ok), got {other:?}"),
-    }
+    std::future::poll_fn(|cx| svc.poll_ready(cx))
+        .await
+        .expect("expected Ready(Ok)");
 }
 
 #[test]
@@ -193,12 +190,8 @@ async fn poll_ready_returns_ready_err_after_close() {
         .expect("register");
     let mut svc = TinaTowerService::new(bridge);
     svc.close();
-    let waker = Waker::noop();
-    let mut cx = Context::from_waker(waker);
-    match svc.poll_ready(&mut cx) {
-        Poll::Ready(Err(BridgeError::Closed)) => {}
-        other => panic!("expected Ready(Err(Closed)), got {other:?}"),
-    }
+    let result = std::future::poll_fn(|cx| svc.poll_ready(cx)).await;
+    assert!(matches!(result, Err(BridgeError::Closed)));
 }
 
 #[tokio::test]
@@ -224,9 +217,7 @@ async fn poll_ready_does_not_reflect_in_flight_count() {
     tokio::time::sleep(Duration::from_millis(20)).await;
 
     let mut svc_b = svc.clone();
-    let waker = Waker::noop();
-    let mut cx = Context::from_waker(waker);
-    let polled = svc_b.poll_ready(&mut cx);
+    let polled = std::future::poll_fn(|cx| Poll::Ready(svc_b.poll_ready(cx))).await;
     assert!(
         matches!(polled, Poll::Ready(Ok(()))),
         "poll_ready must never be Pending: got {polled:?}"

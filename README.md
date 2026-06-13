@@ -216,7 +216,7 @@ pressure, typed terminal outcomes, trace events, or replayable state.
 
 ```
 ┌──────────────────────────────────────┐  ┌──────────────────────────────────────┐
-│           SHARD 0 (one core)         │  │           SHARD 1 (one core)         │
+│           SHARD 0 WORKER             │  │           SHARD 1 WORKER             │
 │                                      │  │                                      │
 │  Mailbox ─→ Isolate ─→ Effect        │  │  Mailbox ─→ Isolate ─→ Effect        │
 │     ↑           │          │         │  │     ↑           │          │         │
@@ -236,9 +236,9 @@ pressure, typed terminal outcomes, trace events, or replayable state.
 A **shard** owns one lane of service work: its isolates, their mailboxes, the
 runtime's driver rails for time and I/O, supervision records, and the
 shard-pair queues that connect it to other shards. The design is
-thread-per-core-shaped and shared-nothing; hard OS pinning and the remaining
-substrate-alignment work are active roadmap items, so the README does not claim
-that every helper lane is already pinned to a core.
+thread-per-core-inspired and shared-nothing, but worker/core affinity is an
+explicit capability rather than a blanket guarantee; hard OS pinning and the
+remaining substrate-alignment work are active roadmap items.
 
 An **isolate** is a typed struct with a synchronous `handle` method that
 returns an `Effect`. Isolates are referenced through typed `Address<M, R>`
@@ -431,7 +431,7 @@ Not yet:
 
 * pooled/reconnecting native WebSocket client managers, HTTP/2 mTLS, gRPC reflection/interceptors/load balancing, and pooled production gRPC clients;
 * native database wire clients (PG wire / SQLite-native runtime rail); current paths are `tina-sqlite-bridge` over `rusqlite` and `tina-sqlx-bridge` over SQLx/Postgres;
-* full thread-per-core substrate alignment: shard-local execution is the design, but optional hard pinning and moving remaining TLS/storage/Unix bypass lanes fully onto the substrate are active work;
+* full thread-per-core substrate alignment: shard-local execution is the design, but hard pinning remains an explicit capability and moving remaining TLS/storage/Unix bypass lanes fully onto the substrate is active work;
 * broad Linux performance claim; Linux already uses Betelgeuse's native backend;
 * remoting or clustering;
 * production performance claim;
