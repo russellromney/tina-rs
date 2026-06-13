@@ -4,6 +4,19 @@ This file records completed work.
 
 ## Unreleased
 
+### Post-157 Architecture Sweep
+
+- Tightened the public I/O/determinism framing: Tina is deterministic over its
+  explicit-step I/O model, live kernel drivers stay below that boundary, and
+  progress must surface as completion/event work rather than a hidden wake
+  side-channel.
+- Added planned Phase 158 for a modeled readiness/completion adapter: regain
+  efficient kernel waiting only if readiness is represented in the simulator
+  and observed by Tina as bounded runtime-owned event/completion work.
+- Added planned Phase 159 for CI dependency hygiene: commit a workspace
+  lockfile, run normal CI with `--locked`, and keep fresh dependency resolution
+  as a separate scheduled canary.
+
 ### Adversarial Review Fix Wave
 
 - Recorded the 2026-06-08 adversarial review and per-track findings under

@@ -44,7 +44,9 @@ removed that experiment and restored Betelgeuse's explicit completion loop:
 Linux socket ops again always use `MSG_DONTWAIT` for `recv`, `recv_buf`, `send`,
 and `send_owned`; send paths continue to include `MSG_NOSIGNAL`. Threaded Tina
 workers observe I/O completion by explicitly stepping and using their bounded
-idle re-poll policy.
+idle re-poll policy. Do not reintroduce a wake callback, doorbell, blocking
+`step`, or readiness park here unless the readiness observation is first modeled
+as ordinary completion/event work in Tina and the simulator.
 
 ## Re-vendoring
 

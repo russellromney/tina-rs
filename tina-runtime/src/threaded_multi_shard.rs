@@ -1100,9 +1100,9 @@ where
 
         // Nothing local, remote, or overflow was deliverable. Park on the
         // command queue, then explicitly re-poll remote inbound and step the
-        // runtime. Runtime-owned work and pending cross-shard replies cannot
-        // wake this queue, so they use the short bounded re-poll; a fully idle
-        // shard uses the longer idle wait.
+        // runtime. Runtime-owned work and pending cross-shard replies do not
+        // arrive through this queue, so they use the short bounded re-poll; a
+        // fully idle shard uses the longer idle wait.
         let park = if runtime.has_in_flight_calls() || runtime.has_pending_runtime_work() {
             config.idle_repoll_interval.min(config.idle_wait)
         } else {

@@ -147,9 +147,11 @@ Tina is aimed at services where these constraints are useful:
 * **Bounded mailboxes and visible overload.** Every important queue has a
   capacity. `Full`, `Closed`, and `Timeout` are normal outcomes, not
   exceptions.
-* **Runtime-owned I/O.** TCP, UDP, DNS, TLS, file I/O, snapshot/journal
-  persistence, signals, and process execution flow through typed runtime
-  calls. Continuations come back as ordinary messages.
+* **Runtime-owned explicit-step I/O.** TCP, UDP, DNS, TLS, file I/O,
+  snapshot/journal persistence, signals, and process execution flow through
+  typed runtime calls. Substrate progress is advanced by the Tina runner,
+  continuations come back as ordinary messages, and there is no hidden wake
+  side-channel outside the completion/event model.
 * **Visible cancellation, supervision, and shutdown.** Parent isolates can
   restart children under bounded policy. Calls time out. Late replies,
   cancellations, and terminal shutdown facts are recorded in the runtime trace.
@@ -330,6 +332,12 @@ different seed exercises different timer-wake ordering, send delivery
 order, and TCP completion order under bounded fault models. Live and
 simulated runs share the same handler code; the difference is the driver
 underneath.
+
+The determinism boundary is the Tina I/O model: messages, timers, typed runtime
+calls, completions, pressure, cancellation, and seeded substrate faults. Live
+kernel drivers are tested separately, but they must present progress to Tina as
+explicit-step completion/event work, not as executor tasks or wake callbacks
+that bypass the model.
 
 See [`tina-sim/tests/`](tina-sim/tests/) and
 [`docs/tina-user-guide/08-simulation-and-dst.md`](docs/tina-user-guide/08-simulation-and-dst.md)
