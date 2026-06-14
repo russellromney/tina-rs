@@ -3,9 +3,6 @@
 target/
 **/target/
 
-# Local Cargo lockfile for this library workspace.
-Cargo.lock
-
 # Rust compiler backup files.
 **/*.rs.bk
 

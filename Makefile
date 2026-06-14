@@ -12,14 +12,14 @@ fmt-check:
 	cargo fmt --all --check
 
 check:
-	cargo check --workspace
+	cargo check --workspace --locked
 
 test:
-	cargo test --workspace
+	cargo test --workspace --locked
 
 loom:
-	cargo test -p tina-mailbox-spsc --features loom --test loom_spsc
-	cargo test -p tina-runtime --features loom --test loom_shared_scope
+	cargo test --locked -p tina-mailbox-spsc --features loom --test loom_spsc
+	cargo test --locked -p tina-runtime --features loom --test loom_shared_scope
 
 # Race-surface guard: fail if a new shared-memory synchronization primitive
 # (UnsafeCell / unsafe impl Send|Sync / atomic) appears in core-crate code
@@ -38,19 +38,20 @@ rail-inventory-guard:
 	./scripts/rail_inventory_guard.sh
 
 miri:
-	cargo +nightly miri test -p tina-mailbox-spsc --test miri_spsc
+	cargo +nightly miri test --locked -p tina-mailbox-spsc --test miri_spsc
 
 doc:
-	RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
+	RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --locked
 
 clippy:
-	cargo clippy --workspace --all-targets -- -D warnings
+	cargo clippy --locked --workspace --all-targets -- -D warnings
 
 # Walks examples/*/Cargo.toml and the extension smoke crates under
 # examples/extensions/*/Cargo.toml (each is its own cargo workspace,
 # excluded from the main one). Builds + tests each so a workspace-only
-# change can't silently break a downstream specimen or extension crate.
-# Stops on first failure.
+# change can't silently break a downstream specimen or extension crate. These
+# example workspaces intentionally remain unlocked until each one has an
+# explicit lockfile policy. Stops on first failure.
 verify-examples:
 	@set -e; \
 	for manifest in examples/*/Cargo.toml examples/extensions/*/Cargo.toml; do \
@@ -60,14 +61,14 @@ verify-examples:
 	done
 
 portable-runtime-cost:
-	cargo run -p tina-runtime --example portable_runtime_cost
+	cargo run --locked -p tina-runtime --example portable_runtime_cost
 
 # Local performance evidence. Release mode, local machine. Prints timing plus
 # boundedness truth: pressure, capacity surfaces, leak/shutdown facts, and
 # native Tina-vs-bounded-Tokio comparison rows where semantics are explicit.
 perf:
-	cargo run --release -p tina-runtime --example portable_runtime_cost
-	cargo test --release -p tina-proof-harness perf_report -- --nocapture
+	cargo run --locked --release -p tina-runtime --example portable_runtime_cost
+	cargo test --locked --release -p tina-proof-harness perf_report -- --nocapture
 	cargo test --release --manifest-path examples/systems/perf_native/Cargo.toml --test perf -- --nocapture
 	cargo test --release --manifest-path examples/systems/perf_native/Cargo.toml --test hotpath -- --nocapture
 	cargo test --release --manifest-path examples/systems/mini_saas_api/Cargo.toml --test perf -- --nocapture
@@ -98,7 +99,7 @@ perf-check:
 # its own short timeout; the whole target should finish in well under
 # a minute on a developer machine.
 proof-fast:
-	cargo test -p tina-proof-harness
+	cargo test --locked -p tina-proof-harness
 	cargo test --manifest-path examples/systems/system_realtime_rooms/Cargo.toml --test bad_peer
 	cargo test --manifest-path examples/systems/system_live_replay_bugbox/Cargo.toml --test smoke
 	cargo test --manifest-path examples/systems/system_scoped_request_tree/Cargo.toml --test smoke
@@ -109,7 +110,7 @@ proof-fast:
 # gate, just more reps; finishes in seconds and is safe for a nightly cron.
 proof-soak:
 	cargo test --manifest-path examples/systems/mini_saas_api/Cargo.toml --test soak -- --nocapture
-	TINA_PROTOCOL_SOAK_ITERS=500 cargo test -p tina-proof-harness --test protocol_regression protocol_chaos_soak -- --nocapture
+	TINA_PROTOCOL_SOAK_ITERS=500 cargo test --locked -p tina-proof-harness --test protocol_regression protocol_chaos_soak -- --nocapture
 
 # Opt-in long soak. Not a normal PR gate. Default is 10 minutes; set
 # TINA_LONG_SOAK_SECONDS=3600 for the one-hour run.
@@ -120,8 +121,8 @@ proof-long-soak:
 # bad-peer scenarios with `--nocapture` so the typed BadPeerOutcome and
 # ProtocolChaosReport lines are visible.
 proof-bad-peer:
-	cargo test -p tina-proof-harness -- --nocapture
-	cargo test -p tina-proof-harness --test protocol_regression print_typed_protocol_chaos_reports -- --nocapture
+	cargo test --locked -p tina-proof-harness -- --nocapture
+	cargo test --locked -p tina-proof-harness --test protocol_regression print_typed_protocol_chaos_reports -- --nocapture
 	cargo test --manifest-path examples/systems/system_realtime_rooms/Cargo.toml --test bad_peer -- --nocapture
 
 # Replay regression: re-run the saved-seed sim cases. A mismatch fails
@@ -131,7 +132,7 @@ proof-replay-regression:
 	cargo test --manifest-path examples/systems/system_live_replay_bugbox/Cargo.toml --test smoke
 
 verify: fmt-check check test loom race-surface-guard rail-inventory-guard doc clippy
-	cargo run -p tina-runtime --example portable_runtime_cost | tee /tmp/tina-verify-cost.txt
+	cargo run --locked -p tina-runtime --example portable_runtime_cost | tee /tmp/tina-verify-cost.txt
 	grep -E "cost rows / local_machine comparison_baseline=none" /tmp/tina-verify-cost.txt
 	grep -E "mailbox local push/pop|local send|live ingress|cross-shard send|isolate call|timer|TCP loopback|TLS loopback|file read/write|journal append|bridge call" /tmp/tina-verify-cost.txt
 	grep -E "measured-local-cost" /tmp/tina-verify-cost.txt
