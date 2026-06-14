@@ -38,8 +38,8 @@ use crate::observer::TraceObserver;
 use crate::sharded::ReplyAdapter;
 use crate::shutdown::{SharedShutdownState, ShutdownWorker, ThreadedShutdownHandle, handle_for};
 use crate::threaded::{
-    CommandSender, ThreadedCommand, ThreadedRuntimeConfig, deliver_shutdown_signal_and_drain,
-    run_host_call,
+    CommandSender, ThreadedCommand, ThreadedRuntimeConfig,
+    deliver_shutdown_signal_and_drain_with_remote, run_host_call,
 };
 use crate::trace::{RuntimeEvent, SendRejectedReason};
 use crate::{
@@ -633,6 +633,14 @@ where
         LiveTopologyReport::new(shards, remote_queues)
     }
 
+    /// Total blocking-park wakeups observed by one worker shard.
+    pub fn park_wakeups_on(&self, shard: ShardId) -> Result<u64, ThreadedRuntimeError> {
+        self.shard_metrics
+            .get(&shard)
+            .map(|metrics| metrics.park_wakeups())
+            .ok_or(ThreadedRuntimeError::UnknownShard(shard))
+    }
+
     /// Returns the live runtime capability table shared by each worker.
     pub fn capabilities(&self) -> RuntimeCapabilities {
         let config = self
@@ -957,13 +965,7 @@ where
         let route_remote_lossless =
             |envelope: QueuedRemoteEnvelope| -> Result<(), Box<RemoteRouteFailure>> {
                 let target_shard = envelope.target_shard();
-                let terminal = matches!(
-                    envelope,
-                    QueuedRemoteEnvelope::CallReply(_)
-                        | QueuedRemoteEnvelope::SpawnReply(_)
-                        | QueuedRemoteEnvelope::ChildStopped(_)
-                        | QueuedRemoteEnvelope::ChildRestarted(_)
-                );
+                let terminal = is_terminal_remote_envelope(&envelope);
                 let metrics = remote_wiring
                     .queue_metrics
                     .get(&(source_shard, target_shard));
@@ -1084,7 +1086,13 @@ where
                 continue;
             }
             Ok(ThreadedCommand::Shutdown) => {
-                deliver_shutdown_signal_and_drain(&mut runtime);
+                deliver_shutdown_signal_and_drain_with_remote(&mut runtime, &mut |_, envelope| {
+                    route_remote_preserving_terminal(
+                        envelope,
+                        &mut terminal_overflow,
+                        &route_remote_lossless,
+                    )
+                });
                 break;
             }
             Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
@@ -1093,28 +1101,43 @@ where
 
         let delivered = runtime.step_with_remote(&mut |_, envelope| route_remote(envelope));
 
-        if delivered > 0 || remote_delivered > 0 || !terminal_overflow.is_empty() {
+        if delivered > 0 || remote_delivered > 0 {
             refresh_metrics = false;
             continue;
         }
 
         // Nothing local, remote, or overflow was deliverable. Park on the
         // command queue, then explicitly re-poll remote inbound and step the
-        // runtime. Runtime-owned work and pending cross-shard replies cannot
-        // wake this queue, so they use the short bounded re-poll; a fully idle
-        // shard uses the longer idle wait.
-        let park = if runtime.has_in_flight_calls() || runtime.has_pending_runtime_work() {
+        // runtime. Runtime-owned work, pending cross-shard replies, and
+        // terminal overflow do not arrive through this queue, so they use the
+        // short bounded re-poll; a fully idle shard uses the longer idle wait.
+        let now = Instant::now();
+        let mut park = if runtime.has_in_flight_calls()
+            || runtime.has_pending_runtime_work()
+            || !terminal_overflow.is_empty()
+        {
             config.idle_repoll_interval.min(config.idle_wait)
         } else {
             config.idle_wait
         };
-        match receiver.recv_timeout(park) {
+        if let Some(deadline) = runtime.next_park_deadline() {
+            park = park.min(deadline.saturating_duration_since(now));
+        }
+        let park_result = receiver.recv_timeout(park);
+        shard_metrics.record_park_wakeup();
+        match park_result {
             Ok(ThreadedCommand::Run(command)) => command(&mut runtime),
             Ok(ThreadedCommand::HostCall { dispatcher, begin }) => {
                 run_host_call(&mut runtime, dispatcher, begin)
             }
             Ok(ThreadedCommand::Shutdown) => {
-                deliver_shutdown_signal_and_drain(&mut runtime);
+                deliver_shutdown_signal_and_drain_with_remote(&mut runtime, &mut |_, envelope| {
+                    route_remote_preserving_terminal(
+                        envelope,
+                        &mut terminal_overflow,
+                        &route_remote_lossless,
+                    )
+                });
                 break;
             }
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
@@ -1146,13 +1169,7 @@ fn route_remote_preserving_terminal(
         Ok(()) => Ok(()),
         Err(failure)
             if failure.reason == SendRejectedReason::Full
-                && matches!(
-                    failure.envelope,
-                    QueuedRemoteEnvelope::CallReply(_)
-                        | QueuedRemoteEnvelope::SpawnReply(_)
-                        | QueuedRemoteEnvelope::ChildStopped(_)
-                        | QueuedRemoteEnvelope::ChildRestarted(_)
-                ) =>
+                && is_terminal_remote_envelope(&failure.envelope) =>
         {
             terminal_overflow.push_back(failure.envelope);
             Ok(())
@@ -1171,13 +1188,7 @@ fn drain_terminal_overflow(
             Ok(()) => delivered += 1,
             Err(failure)
                 if failure.reason == SendRejectedReason::Full
-                    && matches!(
-                        failure.envelope,
-                        QueuedRemoteEnvelope::CallReply(_)
-                            | QueuedRemoteEnvelope::SpawnReply(_)
-                            | QueuedRemoteEnvelope::ChildStopped(_)
-                            | QueuedRemoteEnvelope::ChildRestarted(_)
-                    ) =>
+                    && is_terminal_remote_envelope(&failure.envelope) =>
             {
                 terminal_overflow.push_front(failure.envelope);
                 break;
@@ -1188,6 +1199,19 @@ fn drain_terminal_overflow(
         }
     }
     delivered
+}
+
+fn is_terminal_remote_envelope(envelope: &QueuedRemoteEnvelope) -> bool {
+    matches!(
+        envelope,
+        QueuedRemoteEnvelope::CallReply(_)
+            | QueuedRemoteEnvelope::SpawnReply(_)
+            | QueuedRemoteEnvelope::SpawnCancel(_)
+            | QueuedRemoteEnvelope::ChildStop(_)
+            | QueuedRemoteEnvelope::ChildStopped(_)
+            | QueuedRemoteEnvelope::ChildRestart(_)
+            | QueuedRemoteEnvelope::ChildRestarted(_)
+    )
 }
 
 fn drain_remote_inbound<S, F>(

@@ -17,7 +17,7 @@ use std::time::Duration;
 use tina::prelude::*;
 use tina_runtime::{
     CallCompletionRejectedReason, CallKind, CallOutcome, DefaultMailboxFactory, Runtime,
-    RuntimeEventKind, send_observed, sleep,
+    RuntimeEventKind, call_cancelable, cancel_call, send_observed, sleep,
 };
 
 // Caller that fan-issues N simultaneous-completion sleep calls. All sleeps
@@ -139,6 +139,159 @@ fn under_sized_mailbox_overflows_runtime_call_continuations_without_dropping() {
     assert_eq!(
         completed, fanout as usize,
         "every sleep continuation must be delivered exactly once; trace: {kinds:?}",
+    );
+}
+
+#[derive(Debug)]
+enum CancelPressureMsg {
+    Begin,
+    Returned(CallOutcome<CancelPressureReply>),
+    Cancelled(CancelOutcome),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CancelPressureReply;
+
+#[derive(Debug)]
+struct CancelPressureCaller {
+    target: Address<CancelPressureTargetMsg, CancelPressureReply>,
+    fanout: u32,
+}
+
+#[tina_runtime::isolate(message = CancelPressureMsg, send = Outbound<CancelPressureTargetMsg>)]
+impl CancelPressureCaller {
+    fn handle(
+        &mut self,
+        msg: CancelPressureMsg,
+        _ctx: &mut Context<'_, SingleShard, Self::Reply>,
+    ) -> Effect<Self> {
+        match msg {
+            CancelPressureMsg::Begin => {
+                let mut effects: Vec<Effect<Self>> = Vec::with_capacity(self.fanout as usize * 2);
+                for _ in 0..self.fanout {
+                    let (effect, handle) = call_cancelable(
+                        self.target,
+                        CancelPressureTargetMsg::Hold,
+                        Duration::from_secs(60),
+                    )
+                    .then(CancelPressureMsg::Returned);
+                    effects.push(effect);
+                    effects.push(cancel_call(handle).then(CancelPressureMsg::Cancelled));
+                }
+                batch(effects)
+            }
+            CancelPressureMsg::Returned(outcome) => {
+                let _ = outcome;
+                noop()
+            }
+            CancelPressureMsg::Cancelled(outcome) => {
+                let _ = outcome;
+                noop()
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+enum CancelPressureTargetMsg {
+    Hold,
+}
+
+#[derive(Debug, Default)]
+struct CancelPressureTarget;
+
+#[tina_runtime::isolate(message = CancelPressureTargetMsg, reply = CancelPressureReply)]
+impl CancelPressureTarget {
+    fn handle(
+        &mut self,
+        _msg: CancelPressureTargetMsg,
+        _ctx: &mut Context<'_, SingleShard, Self::Reply>,
+    ) -> Effect<Self> {
+        noop()
+    }
+
+    fn handle_call(
+        &mut self,
+        _msg: CancelPressureTargetMsg,
+        _call: CallContext<'_, Self>,
+    ) -> Effect<Self> {
+        noop()
+    }
+}
+
+#[test]
+fn under_sized_mailbox_overflows_cancel_call_continuations_without_dropping() {
+    let fanout = 6;
+    let mut runtime = Runtime::new(SingleShard, DefaultMailboxFactory);
+    let target = runtime
+        .register_with_capacity::<CancelPressureTarget, Infallible>(CancelPressureTarget, 16);
+    let caller = runtime.register_with_capacity::<CancelPressureCaller, CancelPressureTargetMsg>(
+        CancelPressureCaller { target, fanout },
+        1,
+    );
+    runtime
+        .try_send(caller, CancelPressureMsg::Begin)
+        .expect("kick caller");
+
+    for _ in 0..256 {
+        runtime.step();
+        if !runtime.has_in_flight_calls() {
+            break;
+        }
+    }
+
+    let trace = runtime.trace();
+    let kinds: Vec<_> = trace.iter().map(|e| e.kind()).collect();
+    let rejected_full = trace
+        .iter()
+        .filter(|event| {
+            matches!(
+                event.kind(),
+                RuntimeEventKind::CallCompletionRejected {
+                    reason: CallCompletionRejectedReason::MailboxFull,
+                    call_kind: CallKind::CancelCall,
+                    ..
+                }
+            )
+        })
+        .count();
+    assert_eq!(
+        rejected_full, 0,
+        "cancel completion delivery must not be dropped on a full requester mailbox; trace: {kinds:?}",
+    );
+
+    let overflowed = trace
+        .iter()
+        .filter(|event| {
+            matches!(
+                event.kind(),
+                RuntimeEventKind::CallContinuationOverflowed {
+                    call_kind: CallKind::CancelCall,
+                    ..
+                }
+            )
+        })
+        .count();
+    assert!(
+        overflowed >= 1,
+        "expected at least one cancel-call continuation overflow under a size-1 mailbox; trace: {kinds:?}",
+    );
+
+    let completed = trace
+        .iter()
+        .filter(|event| {
+            matches!(
+                event.kind(),
+                RuntimeEventKind::CallCompleted {
+                    call_kind: CallKind::CancelCall,
+                    ..
+                }
+            )
+        })
+        .count();
+    assert_eq!(
+        completed, fanout as usize,
+        "every cancel call must complete exactly once; trace: {kinds:?}",
     );
 }
 

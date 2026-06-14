@@ -290,9 +290,24 @@ where
         Outbound: 'static,
     {
         let mailbox = self.create_mailbox::<Box<dyn Any>>(mailbox_capacity);
-        let adapter = AnyMailboxAdapter { mailbox };
         let boxed: Box<dyn Any> = Box::new(bootstrap);
-        if let Err(err) = adapter.try_send_boxed(boxed) {
+        let address = self.register_entry::<I, Outbound>(
+            isolate,
+            None,
+            Box::new(AnyMailboxAdapter { mailbox }),
+        );
+        let entry_index = self
+            .entry_indexes
+            .get(&address.isolate)
+            .copied()
+            .expect("newly registered entry is indexed");
+        if let Err(err) = self.enqueue_entry_message(entry_index, boxed, None) {
+            let removed = self
+                .entries
+                .pop()
+                .expect("newly registered bootstrap entry exists");
+            debug_assert_eq!(removed.id, address.isolate);
+            self.entry_indexes.remove(&address.isolate);
             let recover = |b: Box<dyn Any>| {
                 *b.downcast::<I::Message>()
                     .expect("bootstrap message type recovered from boxed Any")
@@ -302,7 +317,6 @@ where
                 TrySendError::Closed(b) => RegisterBootstrapError::Closed(recover(b)),
             });
         }
-        let address = self.register_entry::<I, Outbound>(isolate, None, Box::new(adapter));
         Ok(Address::new_with_generation(
             address.shard,
             address.isolate,
@@ -707,6 +721,7 @@ where
                     remote_request_id: None,
                     remote_owner: None,
                     remote_restartable: false,
+                    terminal: false,
                 });
                 parent
             }
@@ -720,6 +735,7 @@ where
                     remote_request_id,
                     remote_owner,
                     remote_restartable: false,
+                    terminal: false,
                 });
                 child_isolate
             }
@@ -781,9 +797,24 @@ where
         Outbound: Send + 'static,
     {
         let mailbox = self.create_mailbox::<Box<dyn Any>>(mailbox_capacity);
-        let adapter = AnyMailboxAdapter { mailbox };
         let boxed: Box<dyn Any> = Box::new(bootstrap);
-        if let Err(err) = adapter.try_send_boxed(boxed) {
+        let address = self.register_sendable_entry::<I, Outbound>(
+            isolate,
+            None,
+            Box::new(AnyMailboxAdapter { mailbox }),
+        );
+        let entry_index = self
+            .entry_indexes
+            .get(&address.isolate)
+            .copied()
+            .expect("newly registered entry is indexed");
+        if let Err(err) = self.enqueue_entry_message(entry_index, boxed, None) {
+            let removed = self
+                .entries
+                .pop()
+                .expect("newly registered bootstrap entry exists");
+            debug_assert_eq!(removed.id, address.isolate);
+            self.entry_indexes.remove(&address.isolate);
             let recover = |b: Box<dyn Any>| {
                 *b.downcast::<I::Message>()
                     .expect("bootstrap message type recovered from boxed Any")
@@ -793,7 +824,6 @@ where
                 TrySendError::Closed(b) => RegisterBootstrapError::Closed(recover(b)),
             });
         }
-        let address = self.register_sendable_entry::<I, Outbound>(isolate, None, Box::new(adapter));
         Ok(Address::new_with_generation(
             address.shard,
             address.isolate,
@@ -900,6 +930,7 @@ where
             remote_request_id: None,
             remote_owner: None,
             remote_restartable: false,
+            terminal: false,
         });
     }
 
@@ -927,6 +958,7 @@ where
             remote_request_id: None,
             remote_owner: None,
             remote_restartable,
+            terminal: false,
         });
     }
 }

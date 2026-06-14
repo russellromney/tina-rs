@@ -296,7 +296,9 @@ where
             };
 
             if self.entries[index].stopped.get() {
-                if let Some(stopped) = self.entries[index].stopped_event.get() {
+                if let Some(stopped) = self.entries[index].stopped_event.get()
+                    && !self.close_drained_local_call_context(stopped.into(), message)
+                {
                     self.push_event(
                         self.entries[index].id,
                         Some(stopped.into()),
@@ -1664,25 +1666,25 @@ where
             );
             return;
         }
-        match self.enqueue_entry_message(entry_index, message_any, context.continuation_context) {
-            Ok(()) => {
+        match self.enqueue_call_continuation(entry_index, message_any, context.continuation_context)
+        {
+            Ok(delivery) => {
+                if matches!(delivery, ContinuationDelivery::Overflow) {
+                    self.push_event(
+                        context.requester.isolate,
+                        Some(context.cause),
+                        RuntimeEventKind::CallContinuationOverflowed {
+                            call_id: context.call_id,
+                            call_kind: trace::CallKind::CancelCall,
+                        },
+                    );
+                }
                 self.push_event(
                     context.requester.isolate,
                     Some(context.cause),
                     RuntimeEventKind::CallCompleted {
                         call_id: context.call_id,
                         call_kind: trace::CallKind::CancelCall,
-                    },
-                );
-            }
-            Err(TrySendError::Full(_)) => {
-                self.push_event(
-                    context.requester.isolate,
-                    Some(context.cause),
-                    RuntimeEventKind::CallCompletionRejected {
-                        call_id: context.call_id,
-                        call_kind: trace::CallKind::CancelCall,
-                        reason: trace::CallCompletionRejectedReason::MailboxFull,
                     },
                 );
             }
@@ -1697,6 +1699,9 @@ where
                     },
                 );
             }
+            Err(TrySendError::Full(_)) => unreachable!(
+                "enqueue_call_continuation converts full mailboxes into continuation overflow"
+            ),
         }
     }
 
@@ -2343,7 +2348,9 @@ where
                 .stopped_event
                 .get()
                 .unwrap_or_else(|| panic!("stopped isolate has no stopped event"));
-            if precollected.is_some() {
+            if let Some(message) = precollected
+                && !self.close_drained_local_call_context(stopped.into(), message)
+            {
                 self.push_event(
                     isolate_id,
                     Some(stopped.into()),
@@ -2363,6 +2370,12 @@ where
         let generation = self.entries[index].generation;
         self.observation
             .notify_isolate_stopped(isolate_id, generation);
+        let address = RegisteredAddress {
+            shard: self.shard.id(),
+            isolate: isolate_id,
+            generation,
+        };
+        self.prune_terminal_child_records(address);
 
         // Drain any deferred reply slots this isolate captured. The
         // isolate's state (and its DeferredReply Rcs) is not freed
@@ -2381,19 +2394,23 @@ where
             self.entries[index].generation,
             stopped.into(),
         );
-        if precollected.is_some() {
-            self.push_event(
-                isolate_id,
-                Some(stopped.into()),
-                RuntimeEventKind::MessageAbandoned,
-            );
+        if let Some(message) = precollected {
+            if !self.close_drained_local_call_context(stopped.into(), message) {
+                self.push_event(
+                    isolate_id,
+                    Some(stopped.into()),
+                    RuntimeEventKind::MessageAbandoned,
+                );
+            }
         }
-        while self.recv_entry_message(index).is_some() {
-            self.push_event(
-                isolate_id,
-                Some(stopped.into()),
-                RuntimeEventKind::MessageAbandoned,
-            );
+        while let Some(message) = self.recv_entry_message(index) {
+            if !self.close_drained_local_call_context(stopped.into(), message) {
+                self.push_event(
+                    isolate_id,
+                    Some(stopped.into()),
+                    RuntimeEventKind::MessageAbandoned,
+                );
+            }
         }
         // Result delivery happens last so the host only wakes after every
         // lifecycle/trace fact is recorded. With no value, drain any
@@ -2407,6 +2424,44 @@ where
                 .notify_isolate_stopped_without_result(isolate_id, generation),
         }
         stopped
+    }
+
+    fn prune_terminal_child_records(&mut self, stopped: RegisteredAddress) {
+        let supervised_parents: Vec<_> = self
+            .supervisors
+            .iter()
+            .map(|record| record.parent.isolate)
+            .collect();
+        for record in self
+            .child_records
+            .iter_mut()
+            .filter(|record| record.child == stopped)
+        {
+            record.terminal = true;
+            if record.restart_recipe.is_none()
+                && !record.remote_restartable
+                && !supervised_parents.contains(&record.parent)
+            {
+                record.remote_request_id = None;
+            }
+        }
+        self.child_records.retain(|record| {
+            record.child != stopped
+                || record.restart_recipe.is_some()
+                || record.remote_restartable
+                || supervised_parents.contains(&record.parent)
+        });
+    }
+
+    fn close_drained_local_call_context(
+        &mut self,
+        cause: CauseId,
+        message: DeliveredMessage,
+    ) -> bool {
+        let Some(MessageCallContext::Local { call_id }) = message.call_context else {
+            return false;
+        };
+        self.complete_isolate_call(call_id, cause, CallOutcome::Closed)
     }
 
     pub(crate) fn restart_children(
@@ -2812,6 +2867,7 @@ where
         self.child_records[record_index].restart_recipe = Some(recipe);
         self.child_records[record_index].remote_request_id = None;
         self.child_records[record_index].remote_owner = Some(owner);
+        self.child_records[record_index].terminal = false;
 
         if let Some(message) = bootstrap_message {
             self.enqueue_bootstrap_message(new_child, message, cause);
@@ -3037,6 +3093,7 @@ where
         let bootstrap_message = outcome.bootstrap_message;
         self.child_records[child_record_index].child = new_child;
         self.child_records[child_record_index].mailbox_capacity = outcome.mailbox_capacity;
+        self.child_records[child_record_index].terminal = false;
         // Rebind the same restart recipe so this child slot remains
         // restartable after the first replacement.
         self.child_records[child_record_index].restart_recipe = Some(recipe);
@@ -3335,6 +3392,7 @@ where
     pub(crate) remote_request_id: Option<CallId>,
     pub(crate) remote_owner: Option<RegisteredAddress>,
     pub(crate) remote_restartable: bool,
+    pub(crate) terminal: bool,
 }
 
 pub(crate) struct SupervisorRecord {

@@ -266,6 +266,7 @@ impl LiveShardMetrics {
             signal_lane: LiveQueueReport::unmeasured(self.config.signal_capacity),
             trace_retention: self.trace_retention,
             trace_dropped: None,
+            park_wakeups: self.park_wakeups.load(Ordering::Acquire),
             owned_resource_count: self.owned_resource_count.load(Ordering::Acquire),
             worker_held_resource_count: self.worker_held_resource_count.load(Ordering::Acquire),
             pending_driver_call_count: self.pending_driver_call_count.load(Ordering::Acquire),
@@ -333,6 +334,7 @@ pub struct LiveShardReport {
     pub(crate) signal_lane: LiveQueueReport,
     pub(crate) trace_retention: TraceRetention,
     pub(crate) trace_dropped: Option<u64>,
+    pub(crate) park_wakeups: u64,
     pub(crate) owned_resource_count: usize,
     pub(crate) worker_held_resource_count: usize,
     pub(crate) pending_driver_call_count: usize,
@@ -435,6 +437,11 @@ impl LiveShardReport {
     /// Dropped trace count when available without probing the worker.
     pub const fn trace_dropped(&self) -> Option<u64> {
         self.trace_dropped
+    }
+
+    /// Times this worker returned from a blocking park.
+    pub const fn park_wakeups(&self) -> u64 {
+        self.park_wakeups
     }
 
     /// Live table-owned driver resource handles known to this worker.
