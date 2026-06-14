@@ -847,13 +847,24 @@ impl<Op> LiveReplayCaptureBuilder<Op> {
         let events = self
             .events
             .ok_or(LiveReplayCaptureBuildError::Missing("trace"))?;
+        let mut source_metadata = self
+            .source_metadata
+            .unwrap_or_else(|| CaptureSource::new(source));
+        if source_metadata.trace_completeness != TraceCompleteness::Complete {
+            return Err(LiveReplayCaptureBuildError::LossyTrace {
+                completeness: source_metadata.trace_completeness,
+            });
+        }
+        let mut shards: Vec<_> = events.iter().map(|event| event.shard().get()).collect();
+        shards.sort_unstable();
+        shards.dedup();
+        if shards.len() > 1 {
+            return Err(LiveReplayCaptureBuildError::MultishardTrace { shards });
+        }
         let expected = project_trace_shape(&events, &self.projection)
             .map_err(LiveReplayCaptureBuildError::Projection)?;
         let config_hash = replay_config_hash(&config);
         let topology_roles = config.mailboxes.keys().copied().collect();
-        let mut source_metadata = self
-            .source_metadata
-            .unwrap_or_else(|| CaptureSource::new(source));
         if self.truncated {
             source_metadata.trace_completeness = TraceCompleteness::Truncated;
             self.unsupported_facts.push(UnsupportedLiveFact::new(
@@ -898,6 +909,17 @@ fn truncate_string(mut value: String, max: usize) -> String {
 pub enum LiveReplayCaptureBuildError {
     /// A required field was absent.
     Missing(&'static str),
+    /// The supplied live trace was declared incomplete before capture build.
+    LossyTrace {
+        /// Upstream completeness state.
+        completeness: TraceCompleteness,
+    },
+    /// The supplied live trace spans multiple shards and has no stable proof
+    /// hash.
+    MultishardTrace {
+        /// Distinct shard ids present in the trace.
+        shards: Vec<u32>,
+    },
     /// The selected projection rejected the supplied trace.
     Projection(TraceProjectionError),
 }
@@ -906,6 +928,16 @@ impl std::fmt::Display for LiveReplayCaptureBuildError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Missing(field) => write!(f, "live replay capture missing `{field}`"),
+            Self::LossyTrace { completeness } => write!(
+                f,
+                "live replay capture trace is not complete ({completeness:?}); drain buffered observers before building proof material"
+            ),
+            Self::MultishardTrace { shards } => write!(
+                f,
+                "live replay capture spans {} shards {:?}; live multishard trace hashes are not stable proof material",
+                shards.len(),
+                shards
+            ),
             Self::Projection(error) => write!(f, "live replay capture projection failed: {error}"),
         }
     }

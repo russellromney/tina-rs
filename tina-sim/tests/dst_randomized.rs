@@ -1,4 +1,5 @@
 use std::cell::RefCell;
+use std::collections::BTreeMap;
 use std::convert::Infallible;
 use std::rc::Rc;
 use std::time::Duration;
@@ -419,6 +420,99 @@ impl CrossCallClient {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FanInReply {
+    call_id: u16,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FanInWorkerMsg {
+    Work { call_id: u16 },
+}
+
+#[derive(Debug)]
+struct FanInWorker;
+
+#[tina_runtime::isolate(
+    message = FanInWorkerMsg,
+    reply = FanInReply,
+    shard = RandomShard
+)]
+impl FanInWorker {
+    fn handle_call(
+        &mut self,
+        msg: FanInWorkerMsg,
+        call: tina::CallContext<'_, Self>,
+    ) -> Effect<Self> {
+        match msg {
+            FanInWorkerMsg::Work { call_id } => call.reply(FanInReply { call_id }),
+        }
+    }
+
+    fn handle(
+        &mut self,
+        _msg: FanInWorkerMsg,
+        _ctx: &mut Context<'_, RandomShard, Self::Reply>,
+    ) -> Effect<Self> {
+        noop()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum FanInCallerMsg {
+    Burst {
+        first_call: u16,
+    },
+    Returned {
+        call_id: u16,
+        outcome: CallOutcome<FanInReply>,
+    },
+}
+
+type FanInTerminals = Vec<(u16, CallOutcome<FanInReply>)>;
+
+#[derive(Debug)]
+struct FanInCaller {
+    worker: Address<FanInWorkerMsg, FanInReply>,
+    outcomes: Rc<RefCell<FanInTerminals>>,
+}
+
+#[tina_runtime::isolate(
+    message = FanInCallerMsg,
+    send = Outbound<FanInWorkerMsg>,
+    shard = RandomShard
+)]
+impl FanInCaller {
+    fn handle(
+        &mut self,
+        msg: FanInCallerMsg,
+        _ctx: &mut Context<'_, RandomShard, Self::Reply>,
+    ) -> Effect<Self> {
+        match msg {
+            FanInCallerMsg::Burst { first_call } => batch([
+                self.call_worker(first_call),
+                self.call_worker(first_call + 1),
+                self.call_worker(first_call + 2),
+            ]),
+            FanInCallerMsg::Returned { call_id, outcome } => {
+                self.outcomes.borrow_mut().push((call_id, outcome));
+                noop()
+            }
+        }
+    }
+}
+
+impl FanInCaller {
+    fn call_worker(&self, call_id: u16) -> Effect<Self> {
+        call(
+            self.worker,
+            FanInWorkerMsg::Work { call_id },
+            Duration::from_millis(8),
+        )
+        .then(move |outcome| FanInCallerMsg::Returned { call_id, outcome })
+    }
+}
+
 #[derive(Debug)]
 struct RemoteWorker;
 
@@ -459,6 +553,12 @@ enum CrossCallOp {
     NoReply(u8),
     StopWorker,
     Step,
+    RunUntilIdle,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FanInOp {
+    Burst { source: usize, first_call: u16 },
     RunUntilIdle,
 }
 
@@ -625,6 +725,86 @@ fn run_random_cross_shard_call_history(
                 sim.step();
             }
             CrossCallOp::RunUntilIdle => {
+                sim.run_until_quiescent();
+            }
+        }
+    }
+    sim.run_until_quiescent();
+
+    DstRun::new(outcomes.borrow().clone(), sim.replay_artifact())
+}
+
+fn run_cross_shard_fan_in_history(
+    seed: u64,
+    ops: &[FanInOp],
+) -> DstRun<FanInTerminals, MultiShardReplayArtifact> {
+    let outcomes = Rc::new(RefCell::new(Vec::new()));
+    let mut sim = MultiShardSimulator::with_config(
+        [
+            RandomShard(381),
+            RandomShard(382),
+            RandomShard(383),
+            RandomShard(384),
+        ],
+        SimulatorConfig {
+            seed,
+            faults: FaultConfig {
+                local_send: LocalSendFaultMode::DelayByRounds {
+                    one_in: 2,
+                    rounds: 1,
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        MultiShardSimulatorConfig {
+            shard_pair_capacity: 1,
+        },
+    );
+    let worker = sim
+        .register_with_capacity_on::<FanInWorker, FanInWorkerMsg, Infallible>(
+            ShardId::new(383),
+            FanInWorker,
+            1,
+        )
+        .with_reply::<FanInReply>();
+    let callers = [
+        sim.register_with_capacity_on::<FanInCaller, FanInCallerMsg, FanInWorkerMsg>(
+            ShardId::new(381),
+            FanInCaller {
+                worker,
+                outcomes: Rc::clone(&outcomes),
+            },
+            4,
+        ),
+        sim.register_with_capacity_on::<FanInCaller, FanInCallerMsg, FanInWorkerMsg>(
+            ShardId::new(382),
+            FanInCaller {
+                worker,
+                outcomes: Rc::clone(&outcomes),
+            },
+            4,
+        ),
+        sim.register_with_capacity_on::<FanInCaller, FanInCallerMsg, FanInWorkerMsg>(
+            ShardId::new(384),
+            FanInCaller {
+                worker,
+                outcomes: Rc::clone(&outcomes),
+            },
+            4,
+        ),
+    ];
+
+    for op in ops {
+        match *op {
+            FanInOp::Burst { source, first_call } => {
+                sim.try_send(
+                    callers[source % callers.len()],
+                    FanInCallerMsg::Burst { first_call },
+                )
+                .unwrap();
+            }
+            FanInOp::RunUntilIdle => {
                 sim.run_until_quiescent();
             }
         }
@@ -898,6 +1078,59 @@ fn dst_cross_shard_call_history_combines_timeout_remote_full_and_closed() {
             .any(|outcome| matches!(outcome, CallOutcome::Closed)),
         "history must include closed failed-target outcome"
     );
+}
+
+#[test]
+fn dst_cross_shard_fan_in_under_pressure_settles_each_call_once() {
+    let history = History::new(
+        "cross-shard fan-in exactly once under pressure",
+        61917,
+        vec![
+            FanInOp::Burst {
+                source: 0,
+                first_call: 100,
+            },
+            FanInOp::Burst {
+                source: 1,
+                first_call: 200,
+            },
+            FanInOp::Burst {
+                source: 2,
+                first_call: 300,
+            },
+            FanInOp::RunUntilIdle,
+        ],
+    );
+    let run = assert_replays(&history, |history| {
+        run_cross_shard_fan_in_history(history.seed(), history.operations())
+    });
+    InvariantSuite::standard().assert(run.artifact().event_record());
+
+    let mut expected = BTreeMap::new();
+    for op in history.operations() {
+        if let FanInOp::Burst { first_call, .. } = *op {
+            expected.insert(first_call, 1usize);
+            expected.insert(first_call + 1, 1);
+            expected.insert(first_call + 2, 1);
+        }
+    }
+
+    let mut observed = BTreeMap::new();
+    let mut saw_full = false;
+    for (call_id, outcome) in run.output() {
+        *observed.entry(*call_id).or_insert(0usize) += 1;
+        match outcome {
+            CallOutcome::Replied(reply) => assert_eq!(reply.call_id, *call_id),
+            CallOutcome::Full => saw_full = true,
+            CallOutcome::Timeout | CallOutcome::Closed | CallOutcome::Rejected(_) => {}
+        }
+    }
+
+    assert_eq!(
+        observed, expected,
+        "every submitted cross-shard fan-in call must settle exactly once"
+    );
+    assert!(saw_full, "capacity-1 fan-in should exercise typed Full");
 }
 
 #[test]

@@ -227,10 +227,17 @@ impl ProtocolByteReplayCase {
     /// bug the case is about (e.g. "still closes with a protocol-error fact").
     /// The returned case is itself replayable: its expectations are refreshed
     /// from its final, smaller run, so a stale fact never lingers.
-    pub fn shrink<F>(&self, mut still_fails: F) -> ProtocolByteReplayShrink
+    pub fn shrink<F>(
+        &self,
+        mut still_fails: F,
+    ) -> Result<ProtocolByteReplayShrink, ProtocolByteReplayShrinkError>
     where
         F: FnMut(&ProtocolByteReplayReport) -> bool,
     {
+        let original_report = self.observe();
+        if !still_fails(&original_report) {
+            return Err(ProtocolByteReplayShrinkError::NotReproducing);
+        }
         let original_len = self.chunks.len();
         let mut chunks = self.chunks.clone();
         let mut changed = true;
@@ -256,12 +263,12 @@ impl ProtocolByteReplayCase {
         shrunk.max_bytes = shrunk.total_bytes().max(1);
         shrunk.max_chunks = shrunk.chunks.len().max(1);
         shrunk.pin_from_observation();
-        ProtocolByteReplayShrink {
+        Ok(ProtocolByteReplayShrink {
             original_len,
             shrunk_len: shrunk.chunks.len(),
             shrunk_report: shrunk.observe(),
             shrunk_case: shrunk,
-        }
+        })
     }
 
     fn with_chunks(&self, chunks: Vec<Vec<u8>>) -> Self {
@@ -515,6 +522,23 @@ pub struct ProtocolByteReplayShrink {
     pub shrunk_report: ProtocolByteReplayReport,
 }
 
+/// Error returned when byte-replay shrinking cannot safely start.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProtocolByteReplayShrinkError {
+    /// The original case did not reproduce the bug predicate.
+    NotReproducing,
+}
+
+impl std::fmt::Display for ProtocolByteReplayShrinkError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotReproducing => f.write_str("byte replay shrink original did not reproduce"),
+        }
+    }
+}
+
+impl std::error::Error for ProtocolByteReplayShrinkError {}
+
 /// Which expectation field diverged on replay.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ByteReplayField {
@@ -664,6 +688,12 @@ fn encode_hex(bytes: &[u8]) -> String {
 }
 
 fn decode_hex(value: &str, line: usize) -> Result<Vec<u8>, ProtocolByteReplayIoError> {
+    if !value.is_ascii() {
+        return Err(ProtocolByteReplayIoError::Decode {
+            line,
+            reason: "hex chunk must contain only ASCII hex digits".to_owned(),
+        });
+    }
     if value.len() % 2 != 0 {
         return Err(ProtocolByteReplayIoError::Decode {
             line,
@@ -824,10 +854,12 @@ mod tests {
         let original_close = case.expected_close;
         // The original delivers the valid "ok" text before the bad frame.
         assert_eq!(case.expected_app_deliveries, 1);
-        let shrink = case.shrink(|report| {
-            // The bug is "session closes with a protocol-error fact".
-            report.close == Some((Some(1002), WebSocketCloseReason::ProtocolError))
-        });
+        let shrink = case
+            .shrink(|report| {
+                // The bug is "session closes with a protocol-error fact".
+                report.close == Some((Some(1002), WebSocketCloseReason::ProtocolError))
+            })
+            .expect("original reproduces");
         assert!(shrink.shrunk_len < shrink.original_len, "{shrink:?}");
         // The shrunk case is self-consistent and still reproduces.
         let report = shrink
@@ -848,6 +880,15 @@ mod tests {
             shrink.shrunk_case.expected_app_deliveries,
             report.app_deliveries
         );
+    }
+
+    #[test]
+    fn shrink_rejects_non_reproducing_original() {
+        let case = bad_frame_case();
+        let err = case
+            .shrink(|report| report.close == Some((Some(1000), WebSocketCloseReason::Normal)))
+            .expect_err("green original must not shrink");
+        assert_eq!(err, ProtocolByteReplayShrinkError::NotReproducing);
     }
 
     #[test]
@@ -997,6 +1038,23 @@ mod tests {
         std::fs::write(&corrupt, body).expect("write");
         let err = ProtocolByteReplayCase::load(&corrupt, "x")
             .expect_err("odd-length hex chunk must fail to decode");
+        assert!(matches!(err, ProtocolByteReplayIoError::Decode { .. }));
+        let _ = std::fs::remove_file(&corrupt);
+    }
+
+    #[test]
+    fn load_rejects_non_ascii_hex_without_panicking() {
+        let corrupt =
+            std::env::temp_dir().join(format!("tina-byte-nonascii-{}.case", std::process::id()));
+        let body = "tina-protocol-byte-replay-v1\n\
+            name=x\nfamily=websocket\ndirection=client-to-server\n\
+            max_message_bytes=16\nmax_frame_payload=16\nmax_frames=16\n\
+            max_bytes=16\nmax_chunks=4\nexpected_app_deliveries=0\n\
+            expected_close=none\nexpected_fact_count=0\n\
+            expected_fact_hash=0x0\nchunk=aéa\n";
+        std::fs::write(&corrupt, body).expect("write");
+        let err = ProtocolByteReplayCase::load(&corrupt, "x")
+            .expect_err("non-ASCII hex chunk must fail to decode");
         assert!(matches!(err, ProtocolByteReplayIoError::Decode { .. }));
         let _ = std::fs::remove_file(&corrupt);
     }

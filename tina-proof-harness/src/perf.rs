@@ -123,7 +123,7 @@ impl PerfReport {
     /// for alpha consumers.
     pub fn json_line(&self) -> String {
         format!(
-            "{{\"schema\":\"tina.perf_report.v1\",\"label\":{},\"kind\":{},\"comparison_baseline\":{},\"samples\":{},\"sample_policy\":{},\"platform\":{},\"arch\":{},\"profile\":{},\"git_sha\":{},\"workers\":{},\"ops\":{},\"ok\":{},\"err\":{},\"timeout\":{},\"p50_us\":{},\"p90_us\":{},\"p99_us\":{},\"max_us\":{},\"p50_ns\":{},\"p90_ns\":{},\"p99_ns\":{},\"max_ns\":{},\"elapsed_ms\":{},\"leak_clean\":{},\"pressure_total\":{},\"pressure_rate_per_mille\":{},\"surfaces\":{},\"unavailable_surfaces\":{},\"allocation_scope\":{},\"allocations\":{},\"allocated_bytes\":{}}}",
+            "{{\"schema\":\"tina.perf_report.v2\",\"label\":{},\"kind\":{},\"comparison_baseline\":{},\"samples\":{},\"sample_policy\":{},\"platform\":{},\"arch\":{},\"profile\":{},\"git_sha\":{},\"workers\":{},\"ops\":{},\"ok\":{},\"err\":{},\"timeout\":{},\"p50_us\":{},\"p90_us\":{},\"p99_us\":{},\"max_us\":{},\"p50_ns\":{},\"p90_ns\":{},\"p99_ns\":{},\"max_ns\":{},\"elapsed_ms\":{},\"leak_checked\":{},\"leak_clean\":{},\"pressure_total\":{},\"pressure_rate_per_mille\":{},\"surfaces\":{},\"unavailable_surfaces\":{},\"allocation_scope\":{},\"allocations\":{},\"allocated_bytes\":{}}}",
             json_string(self.label),
             json_string(self.kind),
             json_string(self.comparison_baseline),
@@ -147,6 +147,7 @@ impl PerfReport {
             self.load.latency_p99_ns,
             self.load.latency_max_ns,
             self.load.elapsed_ms,
+            self.load.leak_checked,
             self.load.leak_clean,
             self.load.pressure.total,
             self.load.pressure.rate_per_mille,
@@ -829,7 +830,7 @@ mod tests {
         let report = PerfReport::from_load("needs quoting", "whole service", load);
         let json = report.json_line();
         assert!(
-            json.contains("\"schema\":\"tina.perf_report.v1\""),
+            json.contains("\"schema\":\"tina.perf_report.v2\""),
             "{json}"
         );
         assert!(json.contains("\"label\":\"needs quoting\""), "{json}");
@@ -837,6 +838,8 @@ mod tests {
         assert!(json.contains("\"samples\":1"), "{json}");
         assert!(json.contains("\"sample_policy\":\"single\""), "{json}");
         assert!(json.contains("\"pressure_total\":2"), "{json}");
+        assert!(json.contains("\"leak_checked\":"), "{json}");
+        assert!(json.contains("\"leak_clean\":"), "{json}");
         assert!(json.contains("\"allocation_scope\":\"none\""), "{json}");
         assert!(json.contains("\"allocations\":null"), "{json}");
         assert!(json.contains("\"allocated_bytes\":null"), "{json}");

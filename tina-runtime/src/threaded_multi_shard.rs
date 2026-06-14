@@ -960,6 +960,7 @@ where
     loop {
         if refresh_metrics {
             shard_metrics.set_resource_counts(runtime.resource_report());
+            shard_metrics.set_trace_dropped(runtime.trace_dropped());
         }
         refresh_metrics = true;
         let route_remote_lossless =
@@ -1111,8 +1112,7 @@ where
         // runtime. Runtime-owned work, pending cross-shard replies, and
         // terminal overflow do not arrive through this queue, so they use the
         // short bounded re-poll; a fully idle shard uses the longer idle wait.
-        let now = Instant::now();
-        let mut park = if runtime.has_in_flight_calls()
+        let park = if runtime.has_in_flight_calls()
             || runtime.has_pending_runtime_work()
             || !terminal_overflow.is_empty()
         {
@@ -1120,9 +1120,6 @@ where
         } else {
             config.idle_wait
         };
-        if let Some(deadline) = runtime.next_park_deadline() {
-            park = park.min(deadline.saturating_duration_since(now));
-        }
         let park_result = receiver.recv_timeout(park);
         shard_metrics.record_park_wakeup();
         match park_result {
@@ -1148,6 +1145,7 @@ where
     let shutdown_deadline = Instant::now() + config.shutdown_lane_drain_timeout;
     let shutdown_result = runtime.cancel_in_flight_calls_for_shutdown(shutdown_deadline);
     shard_metrics.set_resource_counts(runtime.resource_report());
+    shard_metrics.set_trace_dropped(runtime.trace_dropped());
     let trace = runtime.trace().to_vec();
     if shutdown_result.is_err() {
         return ThreadedWorkerExit::failed(ThreadedRuntimeError::DriverShutdownFailed, trace);

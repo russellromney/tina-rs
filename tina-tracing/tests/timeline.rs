@@ -22,12 +22,16 @@ use tina_runtime::{
 use tina_tracing::{TraceTimeline, to_chrome_trace_json_string, write_chrome_trace_json};
 
 fn evt(id: u64, kind: RuntimeEventKind) -> RuntimeEvent {
+    evt_on(1, id, kind)
+}
+
+fn evt_on(shard: u32, id: u64, kind: RuntimeEventKind) -> RuntimeEvent {
     RuntimeEvent::new(
         EventId::new(id),
         id.checked_sub(1)
             .filter(|previous| *previous > 0)
             .map(|previous| CauseId::new(EventId::new(previous))),
-        ShardId::new(1),
+        ShardId::new(shard),
         IsolateId::new(7),
         kind,
     )
@@ -301,6 +305,71 @@ fn deferred_capture_terminals_keep_slot_and_call_ids() {
     assert_eq!(
         first_named(&root, "deferred_reply_dropped")["args"]["unmatched"],
         "missing_begin"
+    );
+}
+
+#[test]
+fn deferred_spans_are_keyed_by_shard_and_slot() {
+    let root = export(&[
+        evt_on(
+            2,
+            1,
+            RuntimeEventKind::DeferredReplyCaptured {
+                slot_id: DeferredSlotId::new(7),
+                call_id: CallId::new(20),
+            },
+        ),
+        evt_on(
+            1,
+            1,
+            RuntimeEventKind::DeferredReplyCaptured {
+                slot_id: DeferredSlotId::new(7),
+                call_id: CallId::new(10),
+            },
+        ),
+        evt_on(
+            1,
+            2,
+            RuntimeEventKind::DeferredReplySent {
+                slot_id: DeferredSlotId::new(7),
+                call_id: CallId::new(10),
+            },
+        ),
+        evt_on(
+            2,
+            2,
+            RuntimeEventKind::DeferredReplyDropped {
+                slot_id: DeferredSlotId::new(7),
+                call_id: CallId::new(20),
+            },
+        ),
+    ]);
+
+    let spans: Vec<&Value> = trace_events(&root)
+        .iter()
+        .filter(|event| event["name"] == "deferred_reply")
+        .collect();
+    assert_eq!(spans.len(), 2);
+    let shard_call_pairs: Vec<(u64, u64)> = spans
+        .iter()
+        .map(|event| {
+            (
+                event["args"]["shard"].as_u64().unwrap(),
+                event["args"]["call_id"].as_u64().unwrap(),
+            )
+        })
+        .collect();
+    assert!(shard_call_pairs.contains(&(1, 10)));
+    assert!(shard_call_pairs.contains(&(2, 20)));
+    assert_eq!(spans[0]["args"]["shard"], 1);
+    assert!(
+        spans[0]["args"].get("end_cause_shard").is_none(),
+        "timeline must not invent a shard for an end-cause id"
+    );
+    assert_eq!(spans[1]["args"]["shard"], 2);
+    assert!(
+        spans[1]["args"].get("end_cause_shard").is_none(),
+        "timeline must not invent a shard for an end-cause id"
     );
 }
 

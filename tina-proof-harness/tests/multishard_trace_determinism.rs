@@ -23,7 +23,7 @@ use std::convert::Infallible;
 use std::time::{Duration, Instant};
 
 use tina::{Address, Mailbox, TrySendError, prelude::*};
-use tina_proof_harness::{LiveTrace, LiveTraceProofError};
+use tina_proof_harness::{LiveTrace, LiveTraceDrain, LiveTraceProofError};
 use tina_runtime::{MailboxFactory, RuntimeCall, ThreadedMultiShardRuntime, ThreadedRuntimeConfig};
 
 #[derive(Debug, Clone, Copy)]
@@ -258,7 +258,7 @@ fn live_multishard_proof_snapshot_fails_closed() {
         let trace = run_multishard();
         assert!(trace.shards().len() >= 2, "workload must span both shards");
         let err = trace
-            .snapshot_complete(0)
+            .snapshot_complete(LiveTraceDrain::direct())
             .expect_err("multishard proof snapshot must fail closed");
         assert!(
             matches!(err, LiveTraceProofError::Multishard { .. }),
@@ -272,11 +272,11 @@ fn live_single_shard_trace_hash_is_stable_across_runs() {
     // The contrast: one shard, one worker thread, so the event sequence is
     // deterministic and the proof snapshot is stable across runs.
     let first = run_single_shard()
-        .snapshot_complete(0)
+        .snapshot_complete(LiveTraceDrain::direct())
         .expect("single-shard proof snapshot");
     for iteration in 0..20 {
         let again = run_single_shard()
-            .snapshot_complete(0)
+            .snapshot_complete(LiveTraceDrain::direct())
             .expect("single-shard proof snapshot");
         assert_eq!(
             first, again,

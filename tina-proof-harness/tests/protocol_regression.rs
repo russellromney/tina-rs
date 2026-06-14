@@ -209,7 +209,8 @@ fn byte_replay_reproduces_and_shrinks_one_saved_bad_frame_case() {
     // Shrinks to a smaller chunk set that still closes with a protocol error,
     // and the smaller case is self-consistent.
     let shrink = loaded
-        .shrink(|report| report.close == Some((Some(1002), WebSocketCloseReason::ProtocolError)));
+        .shrink(|report| report.close == Some((Some(1002), WebSocketCloseReason::ProtocolError)))
+        .expect("original reproduces");
     assert!(shrink.shrunk_len < shrink.original_len);
     shrink.shrunk_case.replay().expect("shrunk case reproduces");
 }

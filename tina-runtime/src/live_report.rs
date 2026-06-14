@@ -161,6 +161,7 @@ pub(crate) struct LiveShardMetrics {
     owned_resource_count: AtomicUsize,
     worker_held_resource_count: AtomicUsize,
     pending_driver_call_count: AtomicUsize,
+    trace_dropped: AtomicU64,
     /// Times the worker returned from its bounded command-queue park.
     ///
     /// Under explicit-step I/O this includes timeout-driven re-polls, so it is
@@ -192,6 +193,7 @@ impl LiveShardMetrics {
             owned_resource_count: AtomicUsize::new(0),
             worker_held_resource_count: AtomicUsize::new(0),
             pending_driver_call_count: AtomicUsize::new(0),
+            trace_dropped: AtomicU64::new(0),
             park_wakeups: AtomicU64::new(0),
         }
     }
@@ -228,6 +230,10 @@ impl LiveShardMetrics {
             .store(report.pending_driver_call_count(), Ordering::Release);
     }
 
+    pub(crate) fn set_trace_dropped(&self, dropped: u64) {
+        self.trace_dropped.store(dropped, Ordering::Release);
+    }
+
     /// Records the worker's thread id and its proven pin outcome together, so
     /// any report that names the worker thread also carries that worker's final
     /// affinity status and observed core.
@@ -239,6 +245,10 @@ impl LiveShardMetrics {
     }
 
     pub(crate) fn report(&self) -> LiveShardReport {
+        self.report_with_trace_dropped(Some(self.trace_dropped.load(Ordering::Acquire)))
+    }
+
+    pub(crate) fn report_with_trace_dropped(&self, trace_dropped: Option<u64>) -> LiveShardReport {
         let (worker_thread_id, affinity_status, observed_core) = {
             let startup = self.startup.lock().expect("worker startup lock poisoned");
             (
@@ -265,7 +275,7 @@ impl LiveShardMetrics {
             process_lane: LiveQueueReport::unmeasured(self.config.process_lane_capacity),
             signal_lane: LiveQueueReport::unmeasured(self.config.signal_capacity),
             trace_retention: self.trace_retention,
-            trace_dropped: None,
+            trace_dropped,
             park_wakeups: self.park_wakeups.load(Ordering::Acquire),
             owned_resource_count: self.owned_resource_count.load(Ordering::Acquire),
             worker_held_resource_count: self.worker_held_resource_count.load(Ordering::Acquire),

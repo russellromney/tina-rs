@@ -180,7 +180,6 @@ impl<T> Mailbox<T> for SpscMailbox<T> {
             self.slot(tail).write(message);
         }
         self.tail.store(tail.wrapping_add(1), Release);
-
         Ok(())
     }
 

@@ -1254,16 +1254,15 @@ where
 
     /// Returns retained trace without failing the observability path.
     pub fn trace(&self) -> TraceSnapshot {
-        match self.complete_trace() {
-            Ok(events) => TraceSnapshot::complete(events),
-            Err(ThreadedRuntimeError::WorkerStopped) => TraceSnapshot::partial(
-                Vec::new(),
-                self.topology()
-                    .shards()
-                    .iter()
-                    .map(|shard| shard.shard())
-                    .collect(),
-            ),
+        match self.call(|runtime| (runtime.trace().to_vec(), runtime.trace_dropped())) {
+            Ok((events, 0)) => {
+                self.metrics.set_trace_dropped(0);
+                TraceSnapshot::complete(events)
+            }
+            Ok((events, dropped_events)) => {
+                self.metrics.set_trace_dropped(dropped_events);
+                TraceSnapshot::retained_suffix(events, dropped_events)
+            }
             Err(_) => TraceSnapshot::partial(
                 Vec::new(),
                 self.topology()
@@ -1275,9 +1274,23 @@ where
         }
     }
 
-    /// Returns complete trace, failing if the worker can no longer report.
+    /// Returns complete trace, failing if the worker can no longer report or
+    /// retention already dropped a prefix.
     pub fn complete_trace(&self) -> Result<Vec<RuntimeEvent>, ThreadedRuntimeError> {
-        self.call(|runtime| runtime.trace().to_vec())
+        self.call(|runtime| {
+            runtime
+                .trace_for_proof()
+                .map(|trace| trace.to_vec())
+                .map_err(|_| ())
+        })?
+        .map_err(|()| ThreadedRuntimeError::WorkerStopped)
+    }
+
+    /// Returns the number of trace events dropped by the retention policy.
+    pub fn trace_dropped(&self) -> Result<u64, ThreadedRuntimeError> {
+        let dropped = self.call(|runtime| runtime.trace_dropped())?;
+        self.metrics.set_trace_dropped(dropped);
+        Ok(dropped)
     }
 
     /// Returns a counted summary of pressure-shaped trace events.
@@ -1670,6 +1683,7 @@ where
     'worker: loop {
         if refresh_metrics {
             metrics.set_resource_counts(runtime.resource_report());
+            metrics.set_trace_dropped(runtime.trace_dropped());
         }
         refresh_metrics = true;
         match receiver.try_recv() {
@@ -1742,6 +1756,7 @@ where
         // once before parking. A park turn is never a hot turn, so the hot-path
         // savings are preserved.
         metrics.set_resource_counts(runtime.resource_report());
+        metrics.set_trace_dropped(runtime.trace_dropped());
 
         // Nothing was deliverable. Park on the bounded command queue and
         // explicitly re-step the runtime after a bounded sleep. Runtime-owned
@@ -1773,6 +1788,7 @@ where
     let shutdown_deadline = Instant::now() + config.shutdown_lane_drain_timeout;
     let shutdown_result = runtime.cancel_in_flight_calls_for_shutdown(shutdown_deadline);
     metrics.set_resource_counts(runtime.resource_report());
+    metrics.set_trace_dropped(runtime.trace_dropped());
     let trace = runtime.trace().to_vec();
     if shutdown_result.is_err() {
         return ThreadedWorkerExit::failed(ThreadedRuntimeError::DriverShutdownFailed, trace);

@@ -12,12 +12,14 @@
 use std::convert::Infallible;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use tina::prelude::*;
 use tina_runtime::{
     DefaultMailboxFactory, DefaultThreadedMailboxFactory, Runtime, RuntimeEvent, RuntimeEventKind,
-    ThreadedRuntime, ThreadedRuntimeConfig, TraceObserver, TraceRetention, sleep,
+    ThreadedRuntime, ThreadedRuntimeConfig, ThreadedRuntimeError, TraceObserver, TraceRetention,
+    sleep,
 };
 
 #[derive(Debug, Default)]
@@ -151,4 +153,67 @@ fn threaded_runtime_observer_fires_on_worker_thread() {
             .any(|e| matches!(e.kind(), RuntimeEventKind::HandlerStarted)),
         "observer saw handler start",
     );
+}
+
+#[test]
+fn threaded_topology_reports_trace_drops_after_bounded_overflow() {
+    let runtime = ThreadedRuntime::with_config(
+        SingleShard,
+        DefaultThreadedMailboxFactory,
+        ThreadedRuntimeConfig {
+            trace_retention: TraceRetention::Bounded(1),
+            ..ThreadedRuntimeConfig::default()
+        },
+    );
+    let addr = runtime
+        .register_with_capacity::<Tiny, Infallible>(Tiny, 4)
+        .expect("register tiny");
+    runtime.try_send(addr, Msg::Begin).expect("kick tiny");
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let _ = loop {
+        let dropped = runtime.trace_dropped().expect("worker reports trace drops");
+        if dropped > 0 {
+            break dropped;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "worker did not overflow bounded trace retention"
+        );
+        thread::sleep(Duration::from_millis(10));
+    };
+    while runtime
+        .has_in_flight_calls()
+        .expect("worker reports in-flight calls")
+    {
+        assert!(
+            Instant::now() < deadline,
+            "worker did not settle tiny workload"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    let dropped = runtime.trace_dropped().expect("worker reports trace drops");
+
+    let topology = runtime.topology();
+    let shard = topology.shards().first().expect("single shard report");
+    assert_eq!(shard.trace_dropped(), Some(dropped));
+
+    assert_eq!(
+        runtime.complete_trace(),
+        Err(ThreadedRuntimeError::WorkerStopped)
+    );
+    let trace = runtime.trace();
+    assert!(!trace.is_complete());
+    assert!(trace.is_partial());
+    assert_eq!(trace.dropped_events(), dropped);
+    assert_eq!(
+        trace.clone().complete_events(),
+        Err(ThreadedRuntimeError::WorkerStopped)
+    );
+    assert!(
+        !trace.events().is_empty(),
+        "diagnostic suffix remains visible"
+    );
+
+    let _ = runtime.shutdown();
 }

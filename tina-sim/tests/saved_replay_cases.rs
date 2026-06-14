@@ -30,10 +30,14 @@ const SOURCE_ROLE: &str = "source";
 const SINK_ROLE: &str = "sink";
 
 fn fake_event(id: u64, kind: RuntimeEventKind) -> RuntimeEvent {
+    fake_event_on(0, id, kind)
+}
+
+fn fake_event_on(shard: u32, id: u64, kind: RuntimeEventKind) -> RuntimeEvent {
     RuntimeEvent::new(
         EventId::new(id),
         None,
-        ShardId::new(0),
+        ShardId::new(shard),
         IsolateId::new(1),
         kind,
     )
@@ -563,6 +567,58 @@ fn capture_live_run_builder_records_metadata_and_facts() {
 }
 
 #[test]
+fn capture_builder_rejects_multishard_live_trace() {
+    let case = burst_overflow_case();
+    let events = vec![
+        fake_event_on(0, 1, RuntimeEventKind::HandlerStarted),
+        fake_event_on(1, 1, RuntimeEventKind::MailboxAccepted),
+    ];
+
+    let err = capture_live_run(case.name)
+        .with_seed(case.seed)
+        .with_config(case.config.clone())
+        .with_scenario(case.scenario)
+        .with_history(case.history.operations().to_vec())
+        .with_invariant(case.invariant)
+        .with_source("multishard live")
+        .with_trace(&events)
+        .finish()
+        .expect_err("multishard live traces must not pin a proof hash");
+
+    assert!(matches!(
+        err,
+        tina_sim::dst::LiveReplayCaptureBuildError::MultishardTrace { ref shards }
+            if shards == &[0, 1]
+    ));
+}
+
+#[test]
+fn capture_builder_rejects_upstream_partial_live_trace() {
+    let case = burst_overflow_case();
+    let events = vec![fake_event(1, RuntimeEventKind::HandlerStarted)];
+
+    let err = capture_live_run(case.name)
+        .with_seed(case.seed)
+        .with_config(case.config.clone())
+        .with_scenario(case.scenario)
+        .with_history(case.history.operations().to_vec())
+        .with_invariant(case.invariant)
+        .with_source_metadata(
+            CaptureSource::new("partial live").with_trace_completeness(TraceCompleteness::Partial),
+        )
+        .with_trace(&events)
+        .finish()
+        .expect_err("partial live traces must not pin a proof hash");
+
+    assert!(matches!(
+        err,
+        tina_sim::dst::LiveReplayCaptureBuildError::LossyTrace {
+            completeness: TraceCompleteness::Partial
+        }
+    ));
+}
+
+#[test]
 fn bounded_capture_adds_explicit_truncation_truth_and_fails_closed() {
     let case = burst_overflow_case();
     let events = vec![
@@ -763,7 +819,8 @@ fn live_replay_shrink_refreshes_constants_for_live_derived_case() {
         "at least one full rejection remains",
         run_burst_overflow_case,
         |report| report.output.full_rejections >= 1,
-    );
+    )
+    .expect("original reproduces");
     assert_eq!(
         report.shrunk_case.expected_event_count,
         report.shrunk_report.event_count
@@ -772,6 +829,21 @@ fn live_replay_shrink_refreshes_constants_for_live_derived_case() {
         report.shrunk_case.expected_trace_hash,
         report.shrunk_report.trace_hash
     );
+}
+
+#[test]
+fn shrink_captured_replay_rejects_non_reproducing_original() {
+    let capture = capture_burst_overflow();
+    let err = shrink_captured_replay(
+        &capture,
+        ShrinkConfig::default(),
+        "impossible predicate",
+        run_burst_overflow_live_replay,
+        |_report| false,
+    )
+    .expect_err("green original must not shrink");
+
+    assert_eq!(err, ShrinkCapturedReplayError::NotReproducing);
 }
 
 #[test]

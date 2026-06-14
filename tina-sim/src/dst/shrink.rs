@@ -115,6 +115,23 @@ pub struct ShrinkReport<Op, Output> {
     pub shrunk_report: ReplayReport<Output>,
 }
 
+/// Error returned when a replay case shrink cannot safely start.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ShrinkReplayCaseError {
+    /// The original case did not reproduce the bug predicate.
+    NotReproducing,
+}
+
+impl std::fmt::Display for ShrinkReplayCaseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotReproducing => f.write_str("replay case shrink original did not reproduce"),
+        }
+    }
+}
+
+impl std::error::Error for ShrinkReplayCaseError {}
+
 impl<Op, Output> std::fmt::Display for ShrinkReport<Op, Output>
 where
     Op: Debug,
@@ -175,7 +192,7 @@ pub fn shrink_replay_case<Op, Output, Runner, StillFails>(
     reason: impl Into<String>,
     mut runner: Runner,
     mut still_fails: StillFails,
-) -> ShrinkReport<Op, Output>
+) -> Result<ShrinkReport<Op, Output>, ShrinkReplayCaseError>
 where
     Op: Clone,
     Runner: FnMut(&ReplayCase<Op>) -> ReplayReport<Output>,
@@ -184,6 +201,9 @@ where
     let original_len = case.history.len();
     let mut current_case = case.clone();
     let mut current_report = runner(&current_case);
+    if !still_fails(&current_report) {
+        return Err(ShrinkReplayCaseError::NotReproducing);
+    }
     let mut index = 0;
     let mut attempts = 0;
     while index < current_case.history.len() && attempts < config.max_attempts {
@@ -214,14 +234,14 @@ where
     current_case.expected_event_count = current_report.event_count;
     current_case.expected_trace_hash = current_report.trace_hash;
 
-    ShrinkReport {
+    Ok(ShrinkReport {
         original_len,
         shrunk_len: current_case.history.len(),
         attempts,
         reason: reason.into(),
         shrunk_case: current_case,
         shrunk_report: current_report,
-    }
+    })
 }
 
 /// One shrunk live-derived replay capture.
@@ -259,6 +279,8 @@ pub struct FactSetDelta {
 pub enum ShrinkCapturedReplayError {
     /// The runner could not apply the capture projection.
     Projection(TraceProjectionError),
+    /// The original capture did not reproduce the bug predicate.
+    NotReproducing,
     /// The initial or candidate run changed the proving fact set.
     FactSetChanged {
         /// Context for the fact-set drift.
@@ -275,6 +297,9 @@ impl std::fmt::Display for ShrinkCapturedReplayError {
         match self {
             Self::Projection(error) => {
                 write!(f, "captured replay shrink projection failed: {error}")
+            }
+            Self::NotReproducing => {
+                write!(f, "captured replay shrink original did not reproduce")
             }
             Self::FactSetChanged {
                 phase,
@@ -361,6 +386,9 @@ where
     let mut current_capture = capture.clone();
     let expected_facts = capture.live_facts.clone();
     let mut current_report = runner(&current_capture.to_replay_case())?;
+    if !still_fails(&current_report) {
+        return Err(ShrinkCapturedReplayError::NotReproducing);
+    }
     if !same_fact_set(&expected_facts, &current_report.live_facts) {
         return Err(ShrinkCapturedReplayError::FactSetChanged {
             phase: "initial replay",

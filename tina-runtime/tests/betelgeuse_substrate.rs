@@ -363,11 +363,17 @@ fn threaded_runtime_honors_bounded_trace_retention() {
     });
 
     let trace = runtime.trace();
-    assert!(trace.is_complete());
-    let trace = trace.events();
-    assert_eq!(trace.len(), 5);
-    assert!(trace.first().expect("retained first event").id().get() > 1);
-    assert!(trace.windows(2).all(|pair| pair[0].id() < pair[1].id()));
+    assert!(trace.is_partial());
+    assert!(!trace.is_complete());
+    assert!(trace.dropped_events() > 0);
+    assert_eq!(
+        trace.clone().complete_events(),
+        Err(ThreadedRuntimeError::WorkerStopped)
+    );
+    let events = trace.events();
+    assert_eq!(events.len(), 5);
+    assert!(events.first().expect("retained first event").id().get() > 1);
+    assert!(events.windows(2).all(|pair| pair[0].id() < pair[1].id()));
     let _ = runtime.shutdown().expect("runtime shutdown");
 }
 

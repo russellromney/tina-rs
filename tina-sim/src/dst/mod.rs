@@ -1230,7 +1230,8 @@ mod replay_case_tests {
             "sum stays >= 5",
             run_full_history_case,
             |report| report.output >= 5,
-        );
+        )
+        .expect("original reproduces");
 
         assert!(report.shrunk_len <= report.original_len);
         assert_eq!(report.shrunk_case.history.operations(), &[5]);
@@ -1271,10 +1272,34 @@ mod replay_case_tests {
             ShrinkConfig { max_attempts: 3 },
             "no op is droppable",
             run_full_history_case,
-            |_report| false,
-        );
+            |report| report.output == 16,
+        )
+        .expect("original reproduces");
         assert_eq!(report.attempts, 3);
         assert_eq!(report.shrunk_len, report.original_len);
+    }
+
+    #[test]
+    fn shrink_replay_case_rejects_non_reproducing_original() {
+        let case = ReplayCase {
+            name: "green original",
+            seed: 0,
+            config: ReplayConfig::new(),
+            scenario: "original is green",
+            history: History::new("green original", 0, vec![1, 1]),
+            expected_event_count: 0,
+            expected_trace_hash: 0,
+            invariant: "must reproduce before shrinking",
+        };
+        let err = shrink_replay_case(
+            &case,
+            ShrinkConfig::default(),
+            "sum is impossible",
+            run_full_history_case,
+            |report| report.output >= 10,
+        )
+        .expect_err("green original must not shrink");
+        assert_eq!(err, ShrinkReplayCaseError::NotReproducing);
     }
 
     fn ws_close_fact() -> tina_runtime::ProtocolFact {
