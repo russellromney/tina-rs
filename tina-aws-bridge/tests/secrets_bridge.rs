@@ -146,6 +146,22 @@ fn secrets_config(endpoint_url: String) -> SecretsConfig {
         .with_default_timeout(Duration::from_secs(2))
 }
 
+fn ok_behavior(secret_string: impl Into<String>) -> FakeBehavior {
+    FakeBehavior {
+        secret_string: Some(secret_string.into()),
+        not_found: false,
+        throttling: false,
+    }
+}
+
+fn get_secret_request(secret_id: &str) -> SecretsRequest {
+    SecretsRequest::GetSecretValue(SecretsGetSecretValue {
+        secret_id: secret_id.into(),
+        version_id: None,
+        version_stage: None,
+    })
+}
+
 #[derive(Clone)]
 struct FakeBehavior {
     secret_string: Option<String>,
@@ -157,6 +173,7 @@ struct FakeBehavior {
 struct FakeState {
     inner: Arc<Mutex<FakeStateInner>>,
     behavior: Arc<Mutex<FakeBehavior>>,
+    delay: Duration,
 }
 
 #[derive(Default)]
@@ -174,6 +191,10 @@ struct FakeSecrets {
 
 impl FakeSecrets {
     fn spawn(behavior: FakeBehavior) -> Self {
+        Self::spawn_with_delay(behavior, Duration::ZERO)
+    }
+
+    fn spawn_with_delay(behavior: FakeBehavior, delay: Duration) -> Self {
         let runtime = Arc::new(
             tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
@@ -184,6 +205,7 @@ impl FakeSecrets {
         let state = FakeState {
             inner: Arc::new(Mutex::new(FakeStateInner::default())),
             behavior: Arc::new(Mutex::new(behavior)),
+            delay,
         };
         let state_for_test = state.clone();
         let (addr_tx, addr_rx) = oneshot::channel::<SocketAddr>();
@@ -264,6 +286,9 @@ async fn handle_secrets(req: HyperRequest<Incoming>, state: FakeState) -> HyperR
     let payload: Value = serde_json::from_slice(&body).expect("secrets json request");
     {
         state.inner.lock().expect("state lock").request_count += 1;
+    }
+    if !state.delay.is_zero() {
+        tokio::time::sleep(state.delay).await;
     }
     if target != "secretsmanager.GetSecretValue" {
         return error_response(
@@ -492,6 +517,144 @@ fn throttling_classifies_via_error_code_not_http_status() {
         ),
         "expected Throttled, got {outcome:?}"
     );
+
+    if let Ok(rt) = Arc::try_unwrap(runtime) {
+        let _ = rt.shutdown();
+    }
+}
+
+#[test]
+fn max_in_flight_rejects_full_and_pressure_reports() {
+    let fake = FakeSecrets::spawn_with_delay(ok_behavior("secret"), Duration::from_millis(250));
+    let runtime = make_runtime();
+    let bridge = install_bridge(
+        &runtime,
+        secrets_config(fake.endpoint_url()).with_max_in_flight(1),
+    );
+    let first_sink = Arc::new(Sink::default());
+    let second_sink = Arc::new(Sink::default());
+    let first = register_caller(
+        &runtime,
+        bridge.address,
+        Arc::clone(&first_sink),
+        Duration::from_secs(2),
+    );
+    let second = register_caller(
+        &runtime,
+        bridge.address,
+        Arc::clone(&second_sink),
+        Duration::from_secs(2),
+    );
+
+    runtime
+        .try_send(first, CallerMsg::Run(get_secret_request("first")))
+        .expect("first");
+    std::thread::sleep(Duration::from_millis(25));
+    runtime
+        .try_send(second, CallerMsg::Run(get_secret_request("second")))
+        .expect("second");
+
+    match second_sink.wait(Duration::from_secs(5)) {
+        tina_runtime::CallOutcome::Replied(Err(SecretsError::Full)) => {}
+        other => panic!("expected worker Full, got {other:?}"),
+    }
+    match first_sink.wait(Duration::from_secs(5)) {
+        tina_runtime::CallOutcome::Replied(Ok(SecretsResponse::SecretValue(_))) => {}
+        other => panic!("expected first success, got {other:?}"),
+    }
+    let pressure = bridge.metrics.pressure_report();
+    assert_eq!(pressure.capacity, 1);
+    assert_eq!(pressure.full_count, 1);
+    assert_eq!(pressure.high_water, 1);
+
+    if let Ok(rt) = Arc::try_unwrap(runtime) {
+        let _ = rt.shutdown();
+    }
+}
+
+#[test]
+fn close_and_drain_reports_remaining_then_drained() {
+    let fake = FakeSecrets::spawn_with_delay(ok_behavior("secret"), Duration::from_millis(180));
+    let runtime = make_runtime();
+    let bridge = install_bridge(
+        &runtime,
+        secrets_config(fake.endpoint_url()).with_max_in_flight(1),
+    );
+    let sink = Arc::new(Sink::default());
+    let caller = register_caller(
+        &runtime,
+        bridge.address,
+        Arc::clone(&sink),
+        Duration::from_secs(2),
+    );
+
+    runtime
+        .try_send(caller, CallerMsg::Run(get_secret_request("drain")))
+        .expect("send");
+    std::thread::sleep(Duration::from_millis(20));
+
+    let first = bridge.closer.close_and_drain(Duration::from_millis(10));
+    assert!(first.closed);
+    assert!(!first.drained);
+    assert_eq!(first.in_flight_remaining, 1);
+    assert_eq!(first.in_flight_kinds, vec![("secrets_get_secret_value", 1)]);
+
+    match sink.wait(Duration::from_secs(5)) {
+        tina_runtime::CallOutcome::Replied(Ok(SecretsResponse::SecretValue(_))) => {}
+        other => panic!("expected accepted request to finish, got {other:?}"),
+    }
+    let second = bridge.closer.close_and_drain(Duration::from_millis(10));
+    assert!(second.drained);
+    assert_eq!(second.in_flight_remaining, 0);
+    assert!(second.in_flight_kinds.is_empty());
+
+    if let Ok(rt) = Arc::try_unwrap(runtime) {
+        let _ = rt.shutdown();
+    }
+}
+
+#[test]
+fn timeout_after_admission_counts_late_result_when_sdk_finishes() {
+    let fake = FakeSecrets::spawn_with_delay(ok_behavior("secret"), Duration::from_millis(250));
+    let runtime = make_runtime();
+    let bridge = install_bridge(
+        &runtime,
+        secrets_config(fake.endpoint_url())
+            .with_default_timeout(Duration::from_millis(40))
+            .with_poll_interval(Duration::from_millis(2)),
+    );
+    let sink = Arc::new(Sink::default());
+    let caller = register_caller(
+        &runtime,
+        bridge.address,
+        Arc::clone(&sink),
+        Duration::from_secs(2),
+    );
+
+    runtime
+        .try_send(caller, CallerMsg::Run(get_secret_request("timeout")))
+        .expect("send");
+    match sink.wait(Duration::from_secs(5)) {
+        tina_runtime::CallOutcome::Replied(Err(SecretsError::Timeout)) => {}
+        other => panic!("expected worker timeout, got {other:?}"),
+    }
+    assert_eq!(
+        bridge.metrics.snapshot().in_flight_current,
+        1,
+        "timed-out SDK work still occupies the bounded slot until it reports terminal truth"
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let snap = bridge.metrics.snapshot();
+        if snap.late_results == 1 && snap.responses == 1 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "late result was not counted: {snap:?}"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
 
     if let Ok(rt) = Arc::try_unwrap(runtime) {
         let _ = rt.shutdown();

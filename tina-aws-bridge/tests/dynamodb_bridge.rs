@@ -150,6 +150,7 @@ fn dynamo_config(endpoint_url: String) -> DynamoConfig {
 #[derive(Clone, Default)]
 struct FakeState {
     inner: Arc<Mutex<FakeStateInner>>,
+    delay: Duration,
 }
 
 #[derive(Default)]
@@ -169,6 +170,10 @@ struct FakeDynamoDb {
 
 impl FakeDynamoDb {
     fn spawn() -> Self {
+        Self::spawn_with_delay(Duration::ZERO)
+    }
+
+    fn spawn_with_delay(delay: Duration) -> Self {
         let runtime = Arc::new(
             tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
@@ -176,7 +181,10 @@ impl FakeDynamoDb {
                 .build()
                 .expect("test runtime"),
         );
-        let state = FakeState::default();
+        let state = FakeState {
+            inner: Arc::new(Mutex::new(FakeStateInner::default())),
+            delay,
+        };
         let state_for_test = state.clone();
         let (addr_tx, addr_rx) = oneshot::channel::<SocketAddr>();
         let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
@@ -263,6 +271,9 @@ async fn handle_dynamo(req: HyperRequest<Incoming>, state: FakeState) -> HyperRe
         let mut guard = state.inner.lock().expect("state lock");
         guard.request_count += 1;
         guard.seen_targets.push(target.clone());
+    }
+    if !state.delay.is_zero() {
+        tokio::time::sleep(state.delay).await;
     }
     match target.as_str() {
         "DynamoDB_20120810.PutItem" => {
@@ -353,6 +364,14 @@ fn make_key(value: &str) -> DynamoItem {
     let mut key = HashMap::new();
     key.insert("pk".to_string(), DynamoValue::S(value.to_string()));
     key
+}
+
+fn get_request(value: &str) -> DynamoRequest {
+    DynamoRequest::GetItem(DynamoGetItem {
+        table_name: "kv".into(),
+        key: make_key(value),
+        consistency: DynamoConsistency::Eventual,
+    })
 }
 
 #[test]
@@ -480,6 +499,144 @@ fn item_size_cap_rejects_request_before_sdk() {
     let metrics = bridge.metrics.snapshot();
     assert!(metrics.item_too_large >= 1);
     assert_eq!(metrics.admitted, 0);
+
+    if let Ok(rt) = Arc::try_unwrap(runtime) {
+        let _ = rt.shutdown();
+    }
+}
+
+#[test]
+fn max_in_flight_rejects_full_and_pressure_reports() {
+    let fake = FakeDynamoDb::spawn_with_delay(Duration::from_millis(250));
+    let runtime = make_runtime();
+    let bridge = install_bridge(
+        &runtime,
+        dynamo_config(fake.endpoint_url()).with_max_in_flight(1),
+    );
+    let first_sink = Arc::new(Sink::default());
+    let second_sink = Arc::new(Sink::default());
+    let first = register_caller(
+        &runtime,
+        bridge.address,
+        Arc::clone(&first_sink),
+        Duration::from_secs(2),
+    );
+    let second = register_caller(
+        &runtime,
+        bridge.address,
+        Arc::clone(&second_sink),
+        Duration::from_secs(2),
+    );
+
+    runtime
+        .try_send(first, CallerMsg::Run(get_request("first")))
+        .expect("first");
+    std::thread::sleep(Duration::from_millis(25));
+    runtime
+        .try_send(second, CallerMsg::Run(get_request("second")))
+        .expect("second");
+
+    match second_sink.wait(Duration::from_secs(5)) {
+        tina_runtime::CallOutcome::Replied(Err(DynamoError::Full)) => {}
+        other => panic!("expected worker Full, got {other:?}"),
+    }
+    match first_sink.wait(Duration::from_secs(5)) {
+        tina_runtime::CallOutcome::Replied(Ok(DynamoResponse::GetItem(_))) => {}
+        other => panic!("expected first success, got {other:?}"),
+    }
+    let pressure = bridge.metrics.pressure_report();
+    assert_eq!(pressure.capacity, 1);
+    assert_eq!(pressure.full_count, 1);
+    assert_eq!(pressure.high_water, 1);
+
+    if let Ok(rt) = Arc::try_unwrap(runtime) {
+        let _ = rt.shutdown();
+    }
+}
+
+#[test]
+fn close_and_drain_reports_remaining_then_drained() {
+    let fake = FakeDynamoDb::spawn_with_delay(Duration::from_millis(180));
+    let runtime = make_runtime();
+    let bridge = install_bridge(
+        &runtime,
+        dynamo_config(fake.endpoint_url()).with_max_in_flight(1),
+    );
+    let sink = Arc::new(Sink::default());
+    let caller = register_caller(
+        &runtime,
+        bridge.address,
+        Arc::clone(&sink),
+        Duration::from_secs(2),
+    );
+
+    runtime
+        .try_send(caller, CallerMsg::Run(get_request("drain")))
+        .expect("send");
+    std::thread::sleep(Duration::from_millis(20));
+
+    let first = bridge.closer.close_and_drain(Duration::from_millis(10));
+    assert!(first.closed);
+    assert!(!first.drained);
+    assert_eq!(first.in_flight_remaining, 1);
+    assert_eq!(first.in_flight_kinds, vec![("dynamodb_get_item", 1)]);
+
+    match sink.wait(Duration::from_secs(5)) {
+        tina_runtime::CallOutcome::Replied(Ok(DynamoResponse::GetItem(_))) => {}
+        other => panic!("expected accepted request to finish, got {other:?}"),
+    }
+    let second = bridge.closer.close_and_drain(Duration::from_millis(10));
+    assert!(second.drained);
+    assert_eq!(second.in_flight_remaining, 0);
+    assert!(second.in_flight_kinds.is_empty());
+
+    if let Ok(rt) = Arc::try_unwrap(runtime) {
+        let _ = rt.shutdown();
+    }
+}
+
+#[test]
+fn timeout_after_admission_counts_late_result_when_sdk_finishes() {
+    let fake = FakeDynamoDb::spawn_with_delay(Duration::from_millis(250));
+    let runtime = make_runtime();
+    let bridge = install_bridge(
+        &runtime,
+        dynamo_config(fake.endpoint_url())
+            .with_default_timeout(Duration::from_millis(40))
+            .with_poll_interval(Duration::from_millis(2)),
+    );
+    let sink = Arc::new(Sink::default());
+    let caller = register_caller(
+        &runtime,
+        bridge.address,
+        Arc::clone(&sink),
+        Duration::from_secs(2),
+    );
+
+    runtime
+        .try_send(caller, CallerMsg::Run(get_request("timeout")))
+        .expect("send");
+    match sink.wait(Duration::from_secs(5)) {
+        tina_runtime::CallOutcome::Replied(Err(DynamoError::Timeout)) => {}
+        other => panic!("expected worker timeout, got {other:?}"),
+    }
+    assert_eq!(
+        bridge.metrics.snapshot().in_flight_current,
+        1,
+        "timed-out SDK work still occupies the bounded slot until it reports terminal truth"
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let snap = bridge.metrics.snapshot();
+        if snap.late_results == 1 && snap.responses == 1 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "late result was not counted: {snap:?}"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
 
     if let Ok(rt) = Arc::try_unwrap(runtime) {
         let _ = rt.shutdown();

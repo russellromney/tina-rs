@@ -9,6 +9,7 @@
 fn service_macro_diagnostics_are_pinned() {
     let cases = trybuild::TestCases::new();
     cases.compile_fail("tests/macro_compile_fail/reserved_arg_name.rs");
+    cases.compile_fail("tests/macro_compile_fail/reserved_arg_raw_name.rs");
     cases.compile_fail("tests/macro_compile_fail/reserved_arg_encoding.rs");
     cases.compile_fail("tests/macro_compile_fail/reserved_arg_payload.rs");
 }

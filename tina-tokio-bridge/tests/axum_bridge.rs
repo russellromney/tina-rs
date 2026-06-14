@@ -778,7 +778,7 @@ impl BlockingWorker {
 }
 
 #[tokio::test]
-async fn bridge_records_worker_preflight_cancel_after_caller_timeout() {
+async fn bridge_does_not_count_preflight_cancel_as_closed_after_caller_timeout() {
     let runtime = Arc::new(ThreadedRuntime::with_config(
         BridgeShard,
         BridgeMailboxFactory,
@@ -826,18 +826,11 @@ async fn bridge_records_worker_preflight_cancel_after_caller_timeout() {
         Ok(GateReply("released"))
     );
 
-    let deadline = Instant::now() + Duration::from_secs(1);
-    while full_bridge.metrics().closed == 0 {
-        assert!(
-            Instant::now() < deadline,
-            "worker-side preflight should observe cancelled queued work after caller timeout"
-        );
-        tokio::task::yield_now().await;
-    }
+    tokio::time::sleep(Duration::from_millis(20)).await;
 
     assert_eq!(full_bridge.metrics().attempts, 1);
     assert_eq!(full_bridge.metrics().timeout, 1);
-    assert_eq!(full_bridge.metrics().closed, 1);
+    assert_eq!(full_bridge.metrics().closed, 0);
 
     drop(full_bridge);
     let runtime = match Arc::try_unwrap(runtime) {

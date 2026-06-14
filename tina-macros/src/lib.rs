@@ -338,7 +338,8 @@ fn build_isolate(
                 let #call_name = #tina_crate::RequestCall::new(#call_name);
                 match #service_message_name {
                     #tina_crate::ServiceMessage::Request(#request_name) => {
-                        let request_effect: #tina_crate::RequestEffect<Self> = #request_body;
+                        let request_effect: #tina_crate::RequestEffect<Self> =
+                            (|| -> #tina_crate::RequestEffect<Self> #request_body)();
                         request_effect.into_effect()
                     }
                     #tina_crate::ServiceMessage::Event(_) => {

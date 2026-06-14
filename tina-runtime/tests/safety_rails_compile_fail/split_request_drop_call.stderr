@@ -1,6 +1,9 @@
 error[E0308]: mismatched types
   --> tests/safety_rails_compile_fail/split_request_drop_call.rs:31:9
    |
+15 | #[tina_runtime::isolate(event = Event, request = Request, reply = ())]
+   | ---------------------------------------------------------------------- expected `RequestEffect<Service>` because of return type
+...
 31 |         tina::noop()
    |         ^^^^^^^^^^^^ expected `RequestEffect<Service>`, found `Effect<_>`
    |

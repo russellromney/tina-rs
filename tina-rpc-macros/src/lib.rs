@@ -7,8 +7,9 @@
 //! directly.
 
 use proc_macro::TokenStream;
-use proc_macro2::TokenStream as TokenStream2;
+use proc_macro2::{Span, TokenStream as TokenStream2};
 use quote::{format_ident, quote};
+use syn::ext::IdentExt;
 use syn::parse::{Parse, ParseStream};
 use syn::{
     Error, FnArg, Ident, ItemTrait, Pat, Path, Result, ReturnType, Token, TraitItem, TraitItemFn,
@@ -123,7 +124,7 @@ impl Parse for ServiceArgs {
 
 fn expand(args: ServiceArgs, item: ItemTrait) -> Result<TokenStream2> {
     let trait_ident = item.ident.clone();
-    let service_name_lit = args.name.unwrap_or_else(|| trait_ident.to_string());
+    let service_name_lit = args.name.unwrap_or_else(|| trait_ident.unraw().to_string());
     let tina_crate = args.tina_crate.unwrap_or_else(|| syn::parse_quote!(::tina));
     let rpc_crate = args
         .rpc_crate
@@ -261,7 +262,7 @@ fn extract_method(method: &TraitItemFn) -> Result<MethodSig> {
     // MAX_METHOD_LEN (255 bytes). Catching this at compile time
     // turns an `EncodeError::MethodTooLong` runtime error into a
     // clear macro diagnostic.
-    let name_str = method.sig.ident.to_string();
+    let name_str = method.sig.ident.unraw().to_string();
     if name_str.len() > 255 {
         return Err(Error::new_spanned(
             &method.sig.ident,
@@ -318,11 +319,13 @@ fn extract_method(method: &TraitItemFn) -> Result<MethodSig> {
         // reserved parameters after the user's args. A method arg with one
         // of these names collides (E0415 duplicate parameter) deep inside
         // generated code; reject it here with a clear, spanned diagnostic.
-        if RESERVED_REQUEST_PARAMS.contains(&name.to_string().as_str()) {
+        let unraw_name = name.unraw();
+        let unraw_name_str = unraw_name.to_string();
+        if RESERVED_REQUEST_PARAMS.contains(&unraw_name_str.as_str()) {
             return Err(Error::new_spanned(
                 &name,
                 format!(
-                    "argument name `{name}` is reserved by the generated \
+                    "argument name `{unraw_name_str}` is reserved by the generated \
                      `{}_request` constructor; rename this parameter",
                     method.sig.ident
                 ),
@@ -340,7 +343,7 @@ fn extract_method(method: &TraitItemFn) -> Result<MethodSig> {
     };
 
     let name = method.sig.ident.clone();
-    let name_str = name.to_string();
+    let name_str = name.unraw().to_string();
     let request_fn = format_ident!("{}_request", name);
     let decode_reply_fn = format_ident!("{}_decode_reply", name);
 
@@ -531,8 +534,8 @@ fn build_client_method(
     // Non-collidable local names: a trait arg called `encoding`/`payload` would
     // otherwise shadow these builder locals and encode the wrong value. Reserved
     // names reject such args, but keep the `__tina_` prefix as defense-in-depth.
-    let enc_local = format_ident!("__tina_encoding");
-    let payload_local = format_ident!("__tina_payload");
+    let enc_local = Ident::new("__tina_encoding", Span::mixed_site());
+    let payload_local = Ident::new("__tina_payload", Span::mixed_site());
 
     let arg_decls: Vec<TokenStream2> = m
         .args

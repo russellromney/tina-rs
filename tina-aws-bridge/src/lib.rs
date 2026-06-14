@@ -29,8 +29,8 @@
 //!   caller-built SDK client and Tokio runtime handle;
 //! - `send_xxx(addr, request, timeout)` builds the `call(...)` effect;
 //! - `XxxCloser::close()` flags admission closed; `close_and_drain`
-//!   waits a bounded time for already admitted SDK work to leave the
-//!   in-flight set;
+//!   is a blocking host-thread shutdown helper that waits a bounded
+//!   time for already admitted SDK work to leave the in-flight set;
 //! - `XxxMetrics` + `XxxPressureReport` expose the configured capacity
 //!   and live in-flight pressure;
 //! - `XxxOutcomeExt::classify(...)` sorts each outcome into the small
@@ -133,6 +133,16 @@
 //!
 //! The bridge does not retry, auto-delete after receive, or infer
 //! idempotency. It only bounds and observes admitted SDK work.
+//!
+//! # Shutdown drain
+//!
+//! `XxxCloser::close_and_drain` is for host-side shutdown code after
+//! the caller has stopped submitting new work. It blocks the calling
+//! thread with a short sleep/poll loop until the in-flight counter
+//! reaches zero or the supplied timeout elapses. Do not call it from a
+//! Tina shard handler for the same bridge: that handler would block the
+//! shard that must poll completions and decrement the in-flight counter.
+//! From isolate code, call `close()` and arrange host-side drain instead.
 //!
 //! # DynamoDB truth
 //!
