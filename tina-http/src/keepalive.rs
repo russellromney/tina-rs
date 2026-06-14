@@ -211,10 +211,22 @@ pub enum KeepaliveConnectionMsg {
         max_idle: Duration,
     },
 
-    Connected(Result<(tina_runtime::StreamId, SocketAddr, SocketAddr), CallError>),
-    TlsConnected(Result<tina_runtime::TlsStreamId, CallError>),
-    Wrote(Result<TcpWriteOwnedReply, CallError>),
-    Read(Result<TcpReadBufReply, CallError>),
+    Connected {
+        generation: u64,
+        result: Result<(tina_runtime::StreamId, SocketAddr, SocketAddr), CallError>,
+    },
+    TlsConnected {
+        generation: u64,
+        result: Result<tina_runtime::TlsStreamId, CallError>,
+    },
+    Wrote {
+        generation: u64,
+        result: Result<TcpWriteOwnedReply, CallError>,
+    },
+    Read {
+        generation: u64,
+        result: Result<TcpReadBufReply, CallError>,
+    },
     Closed(Result<(), CallError>),
     /// `generation` distinguishes the deadline for *this* request
     /// from stale deadlines scheduled by prior requests on the same
@@ -381,8 +393,11 @@ impl<S: Shard + 'static> Isolate for KeepaliveConnection<S> {
                 self.handle_maintain(now, max_idle, None)
             }
 
-            KeepaliveConnectionMsg::Connected(Ok((stream, _local, _peer))) => {
-                if self.in_flight.is_none() {
+            KeepaliveConnectionMsg::Connected {
+                generation,
+                result: Ok((stream, _local, _peer)),
+            } => {
+                if !self.is_current_generation(generation) {
                     return tcp_close_stream(stream).then(KeepaliveConnectionMsg::Closed);
                 }
                 self.transport = Some(HttpTransport::Tcp(stream));
@@ -396,12 +411,22 @@ impl<S: Shard + 'static> Isolate for KeepaliveConnection<S> {
                     .pending_write = bytes;
                 self.write_more()
             }
-            KeepaliveConnectionMsg::Connected(Err(_)) => {
-                self.fail_request(HttpClientError::Connect, true)
+            KeepaliveConnectionMsg::Connected {
+                generation,
+                result: Err(_),
+            } => {
+                if self.is_current_generation(generation) {
+                    self.fail_request(HttpClientError::Connect, true)
+                } else {
+                    noop()
+                }
             }
 
-            KeepaliveConnectionMsg::TlsConnected(Ok(stream)) => {
-                if self.in_flight.is_none() {
+            KeepaliveConnectionMsg::TlsConnected {
+                generation,
+                result: Ok(stream),
+            } => {
+                if !self.is_current_generation(generation) {
                     return tls_close(stream, self.config.request_timeout)
                         .then(KeepaliveConnectionMsg::Closed);
                 }
@@ -416,13 +441,34 @@ impl<S: Shard + 'static> Isolate for KeepaliveConnection<S> {
                     .pending_write = bytes;
                 self.write_more()
             }
-            KeepaliveConnectionMsg::TlsConnected(Err(source)) => {
+            KeepaliveConnectionMsg::TlsConnected {
+                generation,
+                result: Err(source),
+            } => {
+                if !self.is_current_generation(generation) {
+                    return noop();
+                }
                 let phase = HttpTransportPhase::Connect;
                 self.fail_request(HttpClientError::Transport { phase, source }, true)
             }
 
-            KeepaliveConnectionMsg::Wrote(Ok(reply)) => self.handle_wrote(reply),
-            KeepaliveConnectionMsg::Wrote(Err(source)) => {
+            KeepaliveConnectionMsg::Wrote {
+                generation,
+                result: Ok(reply),
+            } => {
+                if self.is_current_generation(generation) {
+                    self.handle_wrote(reply)
+                } else {
+                    noop()
+                }
+            }
+            KeepaliveConnectionMsg::Wrote {
+                generation,
+                result: Err(source),
+            } => {
+                if !self.is_current_generation(generation) {
+                    return noop();
+                }
                 let error = self.transport_or_flat_error(
                     HttpTransportPhase::Write,
                     source,
@@ -431,8 +477,23 @@ impl<S: Shard + 'static> Isolate for KeepaliveConnection<S> {
                 self.fail_request(error, true)
             }
 
-            KeepaliveConnectionMsg::Read(Ok(reply)) => self.handle_read_reply(reply),
-            KeepaliveConnectionMsg::Read(Err(source)) => {
+            KeepaliveConnectionMsg::Read {
+                generation,
+                result: Ok(reply),
+            } => {
+                if self.is_current_generation(generation) {
+                    self.handle_read_reply(reply)
+                } else {
+                    noop()
+                }
+            }
+            KeepaliveConnectionMsg::Read {
+                generation,
+                result: Err(source),
+            } => {
+                if !self.is_current_generation(generation) {
+                    return noop();
+                }
                 let error = self.transport_or_flat_error(
                     HttpTransportPhase::Read,
                     source,
@@ -559,9 +620,8 @@ impl<S: Shard + 'static> KeepaliveConnection<S> {
             // installs the transport and starts writing.
             self.pending_connect_bytes = Some(request_bytes);
             let connect_effect: Effect<Self> = match &self.target {
-                HttpTarget::Http { addr, .. } => {
-                    tcp_connect(*addr).then(KeepaliveConnectionMsg::Connected)
-                }
+                HttpTarget::Http { addr, .. } => tcp_connect(*addr)
+                    .then(move |result| KeepaliveConnectionMsg::Connected { generation, result }),
                 HttpTarget::Https {
                     addr,
                     server_name,
@@ -573,7 +633,7 @@ impl<S: Shard + 'static> KeepaliveConnection<S> {
                     trust_roots.root_certificates_der.clone(),
                     request_timeout,
                 )
-                .then(KeepaliveConnectionMsg::TlsConnected),
+                .then(move |result| KeepaliveConnectionMsg::TlsConnected { generation, result }),
             };
             batch(vec![connect_effect, deadline_effect])
         }
@@ -657,20 +717,33 @@ impl<S: Shard + 'static> KeepaliveConnection<S> {
         }
     }
 
+    fn is_current_generation(&self, generation: u64) -> bool {
+        self.in_flight
+            .as_ref()
+            .is_some_and(|in_flight| in_flight.generation == generation)
+    }
+
     fn write_more(&mut self) -> Effect<Self> {
         let in_flight = self.in_flight.as_mut().expect("in_flight present");
         let transport = self.transport.expect("transport set before write");
         let bytes = std::mem::take(&mut in_flight.pending_write);
         match transport {
-            HttpTransport::Tcp(stream) => tcp_write_owned(stream, bytes)
-                .then(|result| KeepaliveConnectionMsg::Wrote(result.map_err(|error| error.error))),
+            HttpTransport::Tcp(stream) => {
+                let generation = in_flight.generation;
+                tcp_write_owned(stream, bytes).then(move |result| KeepaliveConnectionMsg::Wrote {
+                    generation,
+                    result: result.map_err(|error| error.error),
+                })
+            }
             HttpTransport::Tls(stream) => {
-                tls_write_owned(stream, bytes, self.config.request_timeout).then(|result| {
-                    KeepaliveConnectionMsg::Wrote(
-                        result
+                let generation = in_flight.generation;
+                tls_write_owned(stream, bytes, self.config.request_timeout).then(move |result| {
+                    KeepaliveConnectionMsg::Wrote {
+                        generation,
+                        result: result
                             .map(tls_write_reply_to_tcp)
                             .map_err(|error| error.error),
-                    )
+                    }
                 })
             }
         }
@@ -702,16 +775,23 @@ impl<S: Shard + 'static> KeepaliveConnection<S> {
         let in_flight = self.in_flight.as_mut().expect("in_flight present");
         let buffer = std::mem::take(&mut in_flight.read_scratch);
         match transport {
-            HttpTransport::Tcp(stream) => tcp_read_buf(stream, buffer, READ_CHUNK)
-                .then(|result| KeepaliveConnectionMsg::Read(result.map_err(|error| error.error))),
+            HttpTransport::Tcp(stream) => {
+                let generation = in_flight.generation;
+                tcp_read_buf(stream, buffer, READ_CHUNK).then(move |result| {
+                    KeepaliveConnectionMsg::Read {
+                        generation,
+                        result: result.map_err(|error| error.error),
+                    }
+                })
+            }
             HttpTransport::Tls(stream) => {
+                let generation = in_flight.generation;
                 tls_read_buf(stream, buffer, READ_CHUNK, self.config.request_timeout).then(
-                    |result| {
-                        KeepaliveConnectionMsg::Read(
-                            result
-                                .map(tls_read_reply_to_tcp)
-                                .map_err(|error| error.error),
-                        )
+                    move |result| KeepaliveConnectionMsg::Read {
+                        generation,
+                        result: result
+                            .map(tls_read_reply_to_tcp)
+                            .map_err(|error| error.error),
                     },
                 )
             }
@@ -1345,5 +1425,100 @@ where
         if !nap.is_zero() {
             thread::sleep(nap);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tina::Isolate;
+    use tina::IsolateId;
+    use tina_runtime::StreamId;
+
+    #[derive(Debug, Default)]
+    struct TestShard;
+
+    impl Shard for TestShard {
+        fn id(&self) -> ShardId {
+            ShardId::new(99)
+        }
+    }
+
+    fn test_connection() -> KeepaliveConnection<TestShard> {
+        KeepaliveConnection::new(
+            HttpTarget::http_with_host("127.0.0.1:80".parse().unwrap(), "x"),
+            HttpClientConfig::dev(),
+        )
+    }
+
+    fn in_flight(generation: u64) -> InFlight {
+        InFlight {
+            generation,
+            pending_write: Vec::new(),
+            read_scratch: Vec::new(),
+            read_buf: Vec::new(),
+            decoded_chunked_body: Vec::new(),
+            chunked_decoder: None,
+            chunked_raw_consumed: 0,
+            parsed_head: None,
+            head_len: 0,
+            reply_to: None,
+        }
+    }
+
+    #[test]
+    fn stale_read_continuation_does_not_reach_next_request_buffer() {
+        let mut conn = test_connection();
+        conn.in_flight = Some(in_flight(2));
+        let mut shard = TestShard;
+        let mut ctx = Context::<_, KeepaliveOutcome>::new_typed(&mut shard, IsolateId::new(1));
+        let bytes = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nstale".to_vec();
+
+        let _ = conn.handle(
+            KeepaliveConnectionMsg::Read {
+                generation: 1,
+                result: Ok(TcpReadBufReply {
+                    len: bytes.len(),
+                    buffer: bytes,
+                }),
+            },
+            &mut ctx,
+        );
+
+        let active = conn.in_flight.as_ref().expect("current request remains");
+        assert!(
+            active.read_buf.is_empty(),
+            "stale bytes must not cross requests"
+        );
+    }
+
+    #[test]
+    fn stale_connected_does_not_install_transport_or_consume_request_bytes() {
+        let mut conn = test_connection();
+        conn.in_flight = Some(in_flight(2));
+        conn.pending_connect_bytes = Some(b"GET / HTTP/1.1\r\n\r\n".to_vec());
+        let mut shard = TestShard;
+        let mut ctx = Context::<_, KeepaliveOutcome>::new_typed(&mut shard, IsolateId::new(1));
+
+        let _ = conn.handle(
+            KeepaliveConnectionMsg::Connected {
+                generation: 1,
+                result: Ok((
+                    StreamId::new(77),
+                    "127.0.0.1:12345".parse().unwrap(),
+                    "127.0.0.1:80".parse().unwrap(),
+                )),
+            },
+            &mut ctx,
+        );
+
+        assert!(
+            conn.transport.is_none(),
+            "stale stream must not become current"
+        );
+        assert!(
+            conn.pending_connect_bytes.is_some(),
+            "current request bytes must stay with the active connect"
+        );
     }
 }

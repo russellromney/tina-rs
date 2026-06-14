@@ -332,7 +332,16 @@ fn masked_fragment(fin: bool, opcode: u8, payload: &[u8]) -> Vec<u8> {
 }
 
 fn unmasked_frame(opcode: u8, payload: &[u8]) -> Vec<u8> {
-    let mut out = vec![0x80 | opcode];
+    unmasked_frame_with_first_byte(0x80 | opcode, payload)
+}
+
+fn unmasked_fragment(fin: bool, opcode: u8, payload: &[u8]) -> Vec<u8> {
+    let first = if fin { 0x80 | opcode } else { opcode };
+    unmasked_frame_with_first_byte(first, payload)
+}
+
+fn unmasked_frame_with_first_byte(first: u8, payload: &[u8]) -> Vec<u8> {
+    let mut out = vec![first];
     if payload.len() < 126 {
         out.push(payload.len() as u8);
     } else {
@@ -1051,6 +1060,175 @@ fn native_websocket_client_bad_peer_masked_server_frame_is_protocol_error() {
         other => panic!("expected report, got {other:?}"),
     }
     server.join().expect("bad peer thread");
+    let _ = runtime.shutdown();
+}
+
+#[test]
+fn native_websocket_client_reassembles_fragmented_text_with_interleaved_ping() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind fragmenting peer");
+    let addr = listener.local_addr().expect("local addr");
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("read timeout");
+        let request = read_upgrade_head(&mut stream);
+        let key = sec_websocket_key_from_request(&request);
+        let accept = websocket_accept_for_key(&key);
+        write!(
+            stream,
+            "HTTP/1.1 101 Switching Protocols\r\n\
+             Upgrade: websocket\r\n\
+             Connection: Upgrade\r\n\
+             Sec-WebSocket-Accept: {accept}\r\n\r\n"
+        )
+        .expect("write upgrade");
+        stream
+            .write_all(&unmasked_fragment(false, 0x1, b"hel"))
+            .expect("write first text fragment");
+        stream
+            .write_all(&unmasked_frame(0x9, b"mid"))
+            .expect("write interleaved ping");
+        stream
+            .write_all(&unmasked_fragment(false, 0x0, b"lo"))
+            .expect("write continuation");
+        stream
+            .write_all(&unmasked_fragment(true, 0x0, b"!"))
+            .expect("write final continuation");
+        std::thread::sleep(Duration::from_millis(100));
+    });
+
+    let runtime = ThreadedRuntime::with_config(
+        TestShard,
+        DefaultThreadedMailboxFactory,
+        ThreadedRuntimeConfig {
+            command_capacity: 64,
+            idle_wait: Duration::from_millis(1),
+            ..Default::default()
+        },
+    );
+    let client = runtime
+        .register_with_capacity::<WebSocketClientConnection<TestShard>, Infallible>(
+            WebSocketClientConnection::new(WebSocketLimits::default()),
+            16,
+        )
+        .expect("register websocket client");
+    assert!(matches!(
+        runtime
+            .call_blocking(
+                client,
+                WebSocketClientMsg::Connect {
+                    target: WebSocketTarget::ws(addr, "localhost", "/ws"),
+                    subprotocols: Vec::new(),
+                },
+                Duration::from_secs(5),
+            )
+            .expect("connect call"),
+        CallOutcome::Replied(WebSocketClientReply::Connected(Ok(_)))
+    ));
+    match runtime
+        .call_blocking(client, WebSocketClientMsg::Receive, Duration::from_secs(5))
+        .expect("receive ping")
+    {
+        CallOutcome::Replied(WebSocketClientReply::Event(Ok(WebSocketClientEvent::Ping(
+            bytes,
+        )))) => {
+            assert_eq!(bytes, b"mid");
+        }
+        other => panic!("expected interleaved ping event, got {other:?}"),
+    }
+    match runtime
+        .call_blocking(client, WebSocketClientMsg::Receive, Duration::from_secs(5))
+        .expect("receive text")
+    {
+        CallOutcome::Replied(WebSocketClientReply::Event(Ok(WebSocketClientEvent::Text(text)))) => {
+            assert_eq!(text, "hello!");
+        }
+        other => panic!("expected one reassembled text event, got {other:?}"),
+    }
+    server.join().expect("fragmenting peer thread");
+    let _ = runtime.shutdown();
+}
+
+#[test]
+fn native_websocket_client_rejects_oversized_fragmented_message() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind oversized peer");
+    let addr = listener.local_addr().expect("local addr");
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("read timeout");
+        let request = read_upgrade_head(&mut stream);
+        let key = sec_websocket_key_from_request(&request);
+        let accept = websocket_accept_for_key(&key);
+        write!(
+            stream,
+            "HTTP/1.1 101 Switching Protocols\r\n\
+             Upgrade: websocket\r\n\
+             Connection: Upgrade\r\n\
+             Sec-WebSocket-Accept: {accept}\r\n\r\n"
+        )
+        .expect("write upgrade");
+        stream
+            .write_all(&unmasked_fragment(false, 0x1, b"hel"))
+            .expect("write first fragment");
+        stream
+            .write_all(&unmasked_fragment(true, 0x0, b"lo"))
+            .expect("write oversized continuation");
+        std::thread::sleep(Duration::from_millis(100));
+    });
+
+    let runtime = ThreadedRuntime::with_config(
+        TestShard,
+        DefaultThreadedMailboxFactory,
+        ThreadedRuntimeConfig {
+            command_capacity: 64,
+            idle_wait: Duration::from_millis(1),
+            ..Default::default()
+        },
+    );
+    let limits = WebSocketLimits {
+        max_message_bytes: 4,
+        ..WebSocketLimits::default()
+    };
+    let client = runtime
+        .register_with_capacity::<WebSocketClientConnection<TestShard>, Infallible>(
+            WebSocketClientConnection::new(limits),
+            16,
+        )
+        .expect("register websocket client");
+    assert!(matches!(
+        runtime
+            .call_blocking(
+                client,
+                WebSocketClientMsg::Connect {
+                    target: WebSocketTarget::ws(addr, "localhost", "/ws"),
+                    subprotocols: Vec::new(),
+                },
+                Duration::from_secs(5),
+            )
+            .expect("connect call"),
+        CallOutcome::Replied(WebSocketClientReply::Connected(Ok(_)))
+    ));
+    match runtime
+        .call_blocking(client, WebSocketClientMsg::Receive, Duration::from_secs(5))
+        .expect("receive close")
+    {
+        CallOutcome::Replied(WebSocketClientReply::Event(Ok(WebSocketClientEvent::Close {
+            code,
+            reason,
+        }))) => {
+            assert_eq!(code, Some(WebSocketCloseCode(1002)));
+            assert!(
+                String::from_utf8(reason)
+                    .expect("reason utf8")
+                    .contains("MessageTooLarge")
+            );
+        }
+        other => panic!("expected protocol close event, got {other:?}"),
+    }
+    server.join().expect("oversized peer thread");
     let _ = runtime.shutdown();
 }
 

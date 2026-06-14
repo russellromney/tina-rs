@@ -38,9 +38,9 @@ use tina::reply_to_request;
 use tina_runtime::{
     CallError, CallOutcome, Http2CloseReason, Http2ResetReason, Http2StreamId,
     ProtocolConnectionId, ProtocolDirection, ProtocolFact, StreamId, TcpReadBufReply,
-    TcpWriteOwnedReply, TlsReadBufReply, TlsStreamId, TlsWriteOwnedReply, call, tcp_close_stream,
-    tcp_connect, tcp_read_buf, tcp_write_owned, tls_close, tls_connect_alpn, tls_read_buf,
-    tls_write_owned,
+    TcpWriteOwnedReply, TlsReadBufReply, TlsStreamId, TlsWriteOwnedReply, call, sleep,
+    tcp_close_stream, tcp_connect, tcp_read_buf, tcp_write_owned, tls_close, tls_connect_alpn,
+    tls_read_buf, tls_write_owned,
 };
 
 use crate::streaming::{ResponseChunkMsg, ResponseChunkReply};
@@ -117,6 +117,9 @@ pub struct Http2ClientLimits {
     /// deadline-less in this runtime.) Also bounds the TLS connect +
     /// handshake.
     pub tls_io_timeout: Duration,
+    /// Streamed responses whose caller stops pulling are cancelled after
+    /// this idle period so they cannot pin a connection stream slot forever.
+    pub response_stream_idle_timeout: Duration,
 }
 
 impl Default for Http2ClientLimits {
@@ -131,6 +134,7 @@ impl Default for Http2ClientLimits {
             initial_connection_window: DEFAULT_WINDOW,
             initial_stream_window: DEFAULT_WINDOW,
             tls_io_timeout: Duration::from_secs(30),
+            response_stream_idle_timeout: Duration::from_secs(30),
         }
     }
 }
@@ -439,6 +443,9 @@ pub enum Http2ClientMsg {
     /// streaming request source completed. Absorbed and ignored — the
     /// stream is already gone; the cancel only released the source.
     RequestSourceCancelled,
+    /// Internal: a streamed response has had no caller pull for the
+    /// configured idle period.
+    ResponseIdleTimeout { stream_id: u32 },
     /// Snapshot the per-connection report.
     Report,
     /// Begin graceful shutdown (GOAWAY) and stop the isolate.
@@ -915,6 +922,9 @@ impl<S: Shard + 'static> Isolate for Http2ClientConnection<S> {
                 self.handle_request_chunk(stream_id, outcome)
             }
             Http2ClientMsg::RequestSourceCancelled => noop(),
+            Http2ClientMsg::ResponseIdleTimeout { stream_id } => {
+                self.handle_response_idle_timeout(stream_id)
+            }
             Http2ClientMsg::Stop => self.begin_goaway_shutdown(),
             Http2ClientMsg::Report
             | Http2ClientMsg::Submit(_)
@@ -945,6 +955,38 @@ impl<S: Shard + 'static> Isolate for Http2ClientConnection<S> {
 }
 
 impl<S: Shard + 'static> Http2ClientConnection<S> {
+    fn handle_response_idle_timeout(&mut self, stream_id: u32) -> Effect<Self> {
+        let Some(idx) = self.find_stream(stream_id) else {
+            return noop();
+        };
+        if !self.streams[idx].response_streamed
+            || !self.streams[idx].response_head_sent
+            || self.streams[idx].response_pull.is_some()
+        {
+            return noop();
+        }
+        let mut effects = Vec::new();
+        if self.streams[idx].response_eof {
+            self.complete_streaming_stream(idx, &mut effects);
+            self.pump_io(&mut effects);
+            return batch(effects);
+        }
+        let mut stream = self.swap_remove_stream_at(idx);
+        self.cancel_request_source(&stream, &mut effects);
+        self.enqueue_frame(rst_stream_frame(stream_id, ERR_CANCEL));
+        self.report.locally_cancelled += 1;
+        self.report.closed_streams += 1;
+        effects.push(emit_fact(ProtocolFact::Http2StreamReset {
+            connection: self.connection_fact_id(),
+            stream: Http2StreamId::new(stream_id),
+            direction: ProtocolDirection::Outbound,
+            reason: Http2ResetReason::Cancel,
+        }));
+        self.settle_stream_terminal(&mut stream, Http2ClientOutcome::LocalCancel, &mut effects);
+        self.pump_io(&mut effects);
+        batch(effects)
+    }
+
     fn begin_connect(&mut self) -> Effect<Self> {
         if self.preface_sent || self.stream.is_some() {
             return noop();
@@ -1604,11 +1646,19 @@ impl<S: Shard + 'static> Http2ClientConnection<S> {
                     chunk: Http2ResponseChunk::Data(bytes),
                 },
             ));
+            self.arm_response_idle_timeout(stream_id, effects);
             return;
         }
         if self.streams[idx].response_eof {
             self.complete_streaming_stream(idx, effects);
         }
+    }
+
+    fn arm_response_idle_timeout(&self, stream_id: u32, effects: &mut Vec<Effect<Self>>) {
+        effects.push(
+            sleep(self.limits.response_stream_idle_timeout)
+                .then(move |_| Http2ClientMsg::ResponseIdleTimeout { stream_id }),
+        );
     }
 
     /// Deliver the terminal `End` chunk of a streamed response and close
@@ -2142,6 +2192,7 @@ impl<S: Shard + 'static> Http2ClientConnection<S> {
                 },
             ));
         }
+        self.arm_response_idle_timeout(stream_id, effects);
     }
 
     fn handle_data(

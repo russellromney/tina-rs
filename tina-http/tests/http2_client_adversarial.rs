@@ -768,6 +768,209 @@ fn peer_max_concurrent_streams_one_yields_full_for_the_excess_submit() {
 }
 
 #[test]
+fn abandoned_streamed_response_is_cancelled_and_slot_reused() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind peer");
+    let addr = listener.local_addr().expect("peer addr");
+    let peer = std::thread::spawn(move || {
+        let (mut sock, _) = listener.accept().expect("accept");
+        complete_handshake_with(&mut sock, &[(SETTINGS_MAX_CONCURRENT_STREAMS, 1)]);
+
+        let first = next_headers(&mut sock);
+        let mut block = Vec::new();
+        literal_header(":status", "200", &mut block);
+        write_frame(&mut sock, FRAME_HEADERS, FLAG_END_HEADERS, first, &block);
+
+        loop {
+            let frame = read_frame(&mut sock).expect("client cancels abandoned stream");
+            if frame.ty == FRAME_RST_STREAM {
+                assert_eq!(frame.stream_id, first);
+                break;
+            }
+        }
+
+        let second = next_headers(&mut sock);
+        send_response(&mut sock, second, "200", b"ok");
+        std::thread::sleep(Duration::from_millis(50));
+    });
+
+    let runtime = ThreadedRuntime::with_config(
+        TestShard,
+        DefaultThreadedMailboxFactory,
+        ThreadedRuntimeConfig {
+            command_capacity: 64,
+            idle_wait: Duration::from_millis(1),
+            ..Default::default()
+        },
+    );
+    let target = Http2Target::H2c {
+        authority: "peer".into(),
+        addr,
+    };
+    let limits = Http2ClientLimits {
+        max_concurrent_streams: 1,
+        response_stream_idle_timeout: Duration::from_millis(25),
+        ..Http2ClientLimits::default()
+    };
+    let client = runtime
+        .register_with_capacity::<Http2ClientConnection<TestShard>, _>(
+            Http2ClientConnection::<TestShard>::new(target, limits),
+            32,
+        )
+        .expect("register client");
+    runtime
+        .try_send(client, Http2ClientMsg::Begin)
+        .expect("begin");
+
+    let head = runtime
+        .call_blocking(
+            client,
+            Http2ClientMsg::OpenStream(Http2ClientStreamCall {
+                method: Method::GET,
+                path: "/stream".into(),
+                headers: HeaderMap::new(),
+                body: Http2ClientRequestBody::Buffered(Vec::new()),
+            }),
+            Duration::from_secs(5),
+        )
+        .expect("open stream returns head");
+    assert!(matches!(
+        head,
+        CallOutcome::Replied(Http2ClientReply::Outcome {
+            outcome: Http2ClientOutcome::ResponseStreaming { .. },
+            ..
+        })
+    ));
+
+    std::thread::sleep(Duration::from_millis(100));
+
+    let outcome = runtime
+        .call_blocking(
+            client,
+            Http2ClientMsg::Submit(Http2ClientRequest::get("/after-abandon")),
+            Duration::from_secs(5),
+        )
+        .expect("second request admitted");
+    match outcome {
+        CallOutcome::Replied(Http2ClientReply::Outcome {
+            outcome: Http2ClientOutcome::Replied(response),
+            ..
+        }) => {
+            assert_eq!(response.status, http::StatusCode::OK);
+            assert_eq!(response.body, b"ok");
+        }
+        other => panic!("expected second request to reuse freed slot, got {other:?}"),
+    }
+
+    let _ = runtime.try_send(client, Http2ClientMsg::Stop);
+    let _ = runtime.shutdown();
+    peer.join().expect("peer thread joins");
+}
+
+#[test]
+fn abandoned_streamed_response_after_end_stream_is_reaped_without_reset_and_slot_reused() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind peer");
+    let addr = listener.local_addr().expect("peer addr");
+    let peer = std::thread::spawn(move || {
+        let (mut sock, _) = listener.accept().expect("accept");
+        sock.set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("set timeout");
+        complete_handshake_with(&mut sock, &[(SETTINGS_MAX_CONCURRENT_STREAMS, 1)]);
+
+        let first = next_headers(&mut sock);
+        let mut block = Vec::new();
+        literal_header(":status", "200", &mut block);
+        literal_header("content-length", "4", &mut block);
+        write_frame(&mut sock, FRAME_HEADERS, FLAG_END_HEADERS, first, &block);
+        write_frame(&mut sock, FRAME_DATA, FLAG_END_STREAM, first, b"done");
+
+        let second = loop {
+            let frame = read_frame(&mut sock).expect("second request or control frame");
+            match frame.ty {
+                FRAME_RST_STREAM if frame.stream_id == first => {
+                    panic!("client must not reset an already-ended abandoned stream")
+                }
+                FRAME_HEADERS => break frame.stream_id,
+                _ => continue,
+            }
+        };
+        send_response(&mut sock, second, "200", b"ok");
+        std::thread::sleep(Duration::from_millis(50));
+    });
+
+    let runtime = ThreadedRuntime::with_config(
+        TestShard,
+        DefaultThreadedMailboxFactory,
+        ThreadedRuntimeConfig {
+            command_capacity: 64,
+            idle_wait: Duration::from_millis(1),
+            ..Default::default()
+        },
+    );
+    let target = Http2Target::H2c {
+        authority: "peer".into(),
+        addr,
+    };
+    let limits = Http2ClientLimits {
+        max_concurrent_streams: 1,
+        response_stream_idle_timeout: Duration::from_millis(25),
+        ..Http2ClientLimits::default()
+    };
+    let client = runtime
+        .register_with_capacity::<Http2ClientConnection<TestShard>, _>(
+            Http2ClientConnection::<TestShard>::new(target, limits),
+            32,
+        )
+        .expect("register client");
+    runtime
+        .try_send(client, Http2ClientMsg::Begin)
+        .expect("begin");
+
+    let head = runtime
+        .call_blocking(
+            client,
+            Http2ClientMsg::OpenStream(Http2ClientStreamCall {
+                method: Method::GET,
+                path: "/stream".into(),
+                headers: HeaderMap::new(),
+                body: Http2ClientRequestBody::Buffered(Vec::new()),
+            }),
+            Duration::from_secs(5),
+        )
+        .expect("open stream returns head");
+    assert!(matches!(
+        head,
+        CallOutcome::Replied(Http2ClientReply::Outcome {
+            outcome: Http2ClientOutcome::ResponseStreaming { .. },
+            ..
+        })
+    ));
+
+    std::thread::sleep(Duration::from_millis(100));
+
+    let outcome = runtime
+        .call_blocking(
+            client,
+            Http2ClientMsg::Submit(Http2ClientRequest::get("/after-eof-abandon")),
+            Duration::from_secs(5),
+        )
+        .expect("second request admitted");
+    match outcome {
+        CallOutcome::Replied(Http2ClientReply::Outcome {
+            outcome: Http2ClientOutcome::Replied(response),
+            ..
+        }) => {
+            assert_eq!(response.status, http::StatusCode::OK);
+            assert_eq!(response.body, b"ok");
+        }
+        other => panic!("expected second request to reuse freed slot, got {other:?}"),
+    }
+
+    let _ = runtime.try_send(client, Http2ClientMsg::Stop);
+    let _ = runtime.shutdown();
+    peer.join().expect("peer thread joins");
+}
+
+#[test]
 fn pre_connect_queue_capacity_is_shared_across_request_shapes() {
     // Before the TCP connect completes, Submit, SubmitGrpcUnary, and
     // OpenStream all wait in the same user-visible

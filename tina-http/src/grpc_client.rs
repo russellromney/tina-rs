@@ -458,9 +458,9 @@ impl GrpcClient {
     /// Fold one streamed-response [`Http2ResponseChunk`] into typed gRPC
     /// stream items, draining any newly complete messages from `decoder`.
     /// `Data` yields zero or more [`GrpcStreamItem::Message`]s; `End`
-    /// yields a [`GrpcStreamItem::Status`] (from the trailers, defaulting
-    /// to `Ok` when END_STREAM carries none — the head may have carried
-    /// it); a transport teardown yields [`GrpcStreamItem::Transport`].
+    /// yields a [`GrpcStreamItem::Status`] from `grpc-status` trailers,
+    /// or [`GrpcStreamItem::Malformed`] when the trailers omit it; a
+    /// transport teardown yields [`GrpcStreamItem::Transport`].
     pub fn decode_stream_chunk<Resp: Message + Default>(
         &self,
         decoder: &mut GrpcStreamDecoder,
@@ -481,9 +481,10 @@ impl GrpcClient {
                 if let Err(error) = decoder.finish() {
                     return vec![GrpcStreamItem::Malformed(error)];
                 }
-                let status = grpc_status_from_header_map(&trailers)
-                    .unwrap_or_else(|| GrpcStatus::new(GrpcStatusCode::Ok));
-                vec![GrpcStreamItem::Status(status)]
+                match grpc_status_from_header_map(&trailers) {
+                    Some(status) => vec![GrpcStreamItem::Status(status)],
+                    None => vec![GrpcStreamItem::Malformed(GrpcError::MissingTrailers)],
+                }
             }
             // Reset / Closed / ProtocolError — the stream died before a
             // gRPC status. Surface it as a transport item, not a status.
@@ -848,6 +849,23 @@ mod tests {
             .expect("partial");
         assert!(out.is_empty());
         assert!(matches!(decoder.finish(), Err(GrpcError::BadFrame)));
+    }
+
+    #[test]
+    fn stream_end_without_grpc_status_is_malformed() {
+        let client = dummy_client();
+        let mut decoder = GrpcStreamDecoder::new(GrpcLimits::default());
+        let items: Vec<GrpcStreamItem<Reply>> = client.decode_stream_chunk(
+            &mut decoder,
+            Http2ResponseChunk::End {
+                trailers: HeaderMap::new(),
+            },
+        );
+
+        assert_eq!(
+            items,
+            vec![GrpcStreamItem::Malformed(GrpcError::MissingTrailers)]
+        );
     }
 
     fn dummy_client() -> GrpcClient {

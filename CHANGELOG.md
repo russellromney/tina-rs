@@ -47,6 +47,12 @@ This file records completed work.
 - HTTP/2 server request/response funnel teardown now cancels owned body sources
   after successful completion as well as reset/error paths, so no source
   isolate is left running after the stream has terminally resolved.
+- HTTP/2 streamed-response abandonment is explicit: if the caller leaves a
+  stream open between pulls, the idle timer sends local `RST_STREAM(CANCEL)`;
+  if the peer has already sent `END_STREAM`, the same timer reaps the local
+  stream slot without sending a reset. Each delivered body chunk arms at most
+  one no-op idle timer, and gRPC trailers-only responses continue to surface
+  their final status from the response header block.
 
 ### Real Protocol Performance
 
