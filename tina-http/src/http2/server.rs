@@ -300,7 +300,6 @@ struct ActiveStream {
     pending_recv_window_credit: u32,
     request_chunks: VecDeque<RequestDataChunk>,
     pending_request_body_reply: Option<tina::RequestContext<Http2ConnectionReply>>,
-    reset: bool,
 }
 
 #[derive(Debug)]
@@ -368,7 +367,6 @@ impl ActiveStream {
             pending_recv_window_credit: 0,
             request_chunks: VecDeque::new(),
             pending_request_body_reply: None,
-            reset: false,
         }
     }
 }
@@ -612,15 +610,20 @@ impl<S: Shard + 'static, M: Http2ServiceMessage> Http2Connection<S, M> {
     }
 
     fn close_now(&mut self) -> Effect<Self> {
-        tcp_close_stream(self.stream).then(Http2ConnectionMsg::Closed)
+        let mut effects = Vec::new();
+        self.drain_streams_for_connection_close(&mut effects);
+        effects.push(tcp_close_stream(self.stream).then(Http2ConnectionMsg::Closed));
+        batch(effects)
     }
 
     fn begin_goaway_shutdown(&mut self) -> Effect<Self> {
         self.goaway = true;
+        let mut effects = Vec::new();
+        self.drain_streams_for_connection_close(&mut effects);
         let _ = self.enqueue_frame(goaway_frame(self.highest_client_stream_id, ERR_NO_ERROR));
         self.report.goaway_sent += 1;
         self.closing_after_write = true;
-        if self.write_in_flight {
+        let next = if self.write_in_flight {
             noop()
         } else if self.pending_write.is_empty() && !self.write_queue.is_empty() {
             self.write_more()
@@ -628,7 +631,9 @@ impl<S: Shard + 'static, M: Http2ServiceMessage> Http2Connection<S, M> {
             self.close_now()
         } else {
             noop()
-        }
+        };
+        effects.push(next);
+        batch(effects)
     }
 
     fn handle_read(&mut self, reply: TcpReadBufReply) -> Effect<Self> {
@@ -653,6 +658,7 @@ impl<S: Shard + 'static, M: Http2ServiceMessage> Http2Connection<S, M> {
             let _ = self.enqueue_frame(goaway_frame(self.highest_client_stream_id, code));
             self.report.goaway_sent += 1;
             self.closing_after_write = true;
+            self.drain_streams_for_connection_close(&mut effects);
         }
         if self.pending_write.is_empty() && !self.write_queue.is_empty() {
             effects.push(self.write_more());
@@ -762,19 +768,31 @@ impl<S: Shard + 'static, M: Http2ServiceMessage> Http2Connection<S, M> {
                 self.goaway = true;
                 Ok(())
             }
-            FRAME_PRIORITY => self.handle_priority(frame),
+            FRAME_PRIORITY => self.handle_priority(frame, effects),
             FRAME_PUSH_PROMISE => Err(Http2ProtocolError::UnsupportedFrame(FRAME_PUSH_PROMISE)),
             FRAME_CONTINUATION => Err(Http2ProtocolError::UnexpectedContinuation),
             _ => Ok(()),
         }
     }
 
-    fn handle_priority(&mut self, frame: Frame) -> Result<(), Http2ProtocolError> {
+    fn handle_priority(
+        &mut self,
+        frame: Frame,
+        effects: &mut Vec<Effect<Self>>,
+    ) -> Result<(), Http2ProtocolError> {
         if frame.stream_id == 0 {
             return Err(Http2ProtocolError::BadStreamId);
         }
         if frame.payload.len() != PRIORITY_PAYLOAD_LEN {
-            return Err(Http2ProtocolError::BadFrameLength);
+            if self.find_stream(frame.stream_id).is_some() {
+                self.reset_active_stream_for_protocol(
+                    frame.stream_id,
+                    ERR_FRAME_SIZE_ERROR,
+                    Http2ResetReason::FrameSizeError,
+                    effects,
+                );
+            }
+            return Ok(());
         }
         Ok(())
     }
@@ -897,8 +915,12 @@ impl<S: Shard + 'static, M: Http2ServiceMessage> Http2Connection<S, M> {
             return Ok(());
         }
         if self.find_stream(stream_id).is_some() {
-            self.enqueue_frame(rst_stream_frame(stream_id, ERR_PROTOCOL_ERROR))?;
-            self.reset_active_stream_for_protocol(stream_id, effects);
+            self.reset_active_stream_for_protocol(
+                stream_id,
+                ERR_PROTOCOL_ERROR,
+                Http2ResetReason::ProtocolError,
+                effects,
+            );
             return Ok(());
         }
         if stream_id <= self.highest_client_stream_id {
@@ -1013,33 +1035,45 @@ impl<S: Shard + 'static, M: Http2ServiceMessage> Http2Connection<S, M> {
             );
             return Err(Http2ProtocolError::FlowControl);
         }
-        let idx = self
-            .find_stream(stream_id)
-            .ok_or(Http2ProtocolError::StreamClosed)?;
-        if self.streams[idx].state == Http2StreamState::Closed || self.streams[idx].reset {
-            self.enqueue_frame(rst_stream_frame(stream_id, ERR_STREAM_CLOSED))?;
-            self.emit_protocol_fact(
+        let idx = match self.find_stream(stream_id) {
+            Some(idx) => idx,
+            None => {
+                if stream_id > self.highest_client_stream_id {
+                    return Err(Http2ProtocolError::StreamClosed);
+                }
+                self.add_connection_window_credit(flow_len);
+                self.reset_missing_stream(
+                    stream_id,
+                    ERR_STREAM_CLOSED,
+                    Http2ResetReason::StreamClosed,
+                    effects,
+                );
+                self.maybe_flush_request_window_credit(stream_id, true)?;
+                return Ok(());
+            }
+        };
+        if self.streams[idx].state == Http2StreamState::Closed {
+            self.add_connection_window_credit(flow_len);
+            self.reset_stream_with_cleanup(
+                stream_id,
+                ERR_STREAM_CLOSED,
+                Http2ResetReason::StreamClosed,
                 effects,
-                ProtocolFact::Http2StreamReset {
-                    connection: self.connection_fact_id(),
-                    stream: Http2StreamId::new(stream_id),
-                    direction: ProtocolDirection::Outbound,
-                    reason: Http2ResetReason::StreamClosed,
-                },
+                CallError::TargetClosed,
             );
+            self.maybe_flush_request_window_credit(stream_id, true)?;
             return Ok(());
         }
         if self.streams[idx].request_eof {
-            self.enqueue_frame(rst_stream_frame(stream_id, ERR_STREAM_CLOSED))?;
-            self.emit_protocol_fact(
+            self.add_connection_window_credit(flow_len);
+            self.reset_stream_with_cleanup(
+                stream_id,
+                ERR_STREAM_CLOSED,
+                Http2ResetReason::StreamClosed,
                 effects,
-                ProtocolFact::Http2StreamReset {
-                    connection: self.connection_fact_id(),
-                    stream: Http2StreamId::new(stream_id),
-                    direction: ProtocolDirection::Outbound,
-                    reason: Http2ResetReason::StreamClosed,
-                },
+                CallError::TargetClosed,
             );
+            self.maybe_flush_request_window_credit(stream_id, true)?;
             return Ok(());
         }
         if self.streams[idx].recv_window < flow_len_i32 {
@@ -1052,17 +1086,14 @@ impl<S: Shard + 'static, M: Http2ServiceMessage> Http2Connection<S, M> {
                     side: Http2FlowControlSide::StreamReceive,
                 },
             );
-            self.enqueue_frame(rst_stream_frame(stream_id, ERR_FLOW_CONTROL_ERROR))?;
-            self.emit_protocol_fact(
+            self.add_connection_window_credit(flow_len);
+            self.reset_active_stream_for_protocol(
+                stream_id,
+                ERR_FLOW_CONTROL_ERROR,
+                Http2ResetReason::FlowControlError,
                 effects,
-                ProtocolFact::Http2StreamReset {
-                    connection: self.connection_fact_id(),
-                    stream: Http2StreamId::new(stream_id),
-                    direction: ProtocolDirection::Outbound,
-                    reason: Http2ResetReason::FlowControlError,
-                },
             );
-            self.reset_active_stream_for_protocol(stream_id, effects);
+            self.maybe_flush_request_window_credit(stream_id, true)?;
             return Ok(());
         }
         if let Some(content_length) = self.streams[idx].request_content_length {
@@ -1072,17 +1103,14 @@ impl<S: Shard + 'static, M: Http2ServiceMessage> Http2Connection<S, M> {
                 .ok_or(Http2ProtocolError::HeadersTooLarge)?;
             if received > content_length {
                 self.report.protocol_errors += 1;
-                self.enqueue_frame(rst_stream_frame(stream_id, ERR_PROTOCOL_ERROR))?;
-                self.emit_protocol_fact(
+                self.add_connection_window_credit(flow_len);
+                self.reset_active_stream_for_protocol(
+                    stream_id,
+                    ERR_PROTOCOL_ERROR,
+                    Http2ResetReason::ProtocolError,
                     effects,
-                    ProtocolFact::Http2StreamReset {
-                        connection: self.connection_fact_id(),
-                        stream: Http2StreamId::new(stream_id),
-                        direction: ProtocolDirection::Outbound,
-                        reason: Http2ResetReason::ProtocolError,
-                    },
                 );
-                self.reset_active_stream_for_protocol(stream_id, effects);
+                self.maybe_flush_request_window_credit(stream_id, true)?;
                 return Ok(());
             }
         }
@@ -1096,7 +1124,6 @@ impl<S: Shard + 'static, M: Http2ServiceMessage> Http2Connection<S, M> {
             .ok_or(Http2ProtocolError::HeadersTooLarge)?;
         if new_len > self.limits.max_body_bytes {
             self.report.stream_full += 1;
-            self.enqueue_frame(rst_stream_frame(stream_id, ERR_ENHANCE_YOUR_CALM))?;
             self.emit_protocol_fact(
                 effects,
                 ProtocolFact::HttpBodyHighWater {
@@ -1107,16 +1134,14 @@ impl<S: Shard + 'static, M: Http2ServiceMessage> Http2Connection<S, M> {
                     threshold_bytes: self.limits.max_body_bytes as u64,
                 },
             );
-            self.emit_protocol_fact(
+            self.add_connection_window_credit(flow_len);
+            self.reset_active_stream_for_protocol(
+                stream_id,
+                ERR_ENHANCE_YOUR_CALM,
+                Http2ResetReason::EnhanceYourCalm,
                 effects,
-                ProtocolFact::Http2StreamReset {
-                    connection: self.connection_fact_id(),
-                    stream: Http2StreamId::new(stream_id),
-                    direction: ProtocolDirection::Outbound,
-                    reason: Http2ResetReason::EnhanceYourCalm,
-                },
             );
-            self.remove_stream(stream_id);
+            self.maybe_flush_request_window_credit(stream_id, true)?;
             return Ok(());
         }
         self.recv_window -= flow_len_i32;
@@ -1155,17 +1180,12 @@ impl<S: Shard + 'static, M: Http2ServiceMessage> Http2Connection<S, M> {
                 })
             {
                 self.report.protocol_errors += 1;
-                self.enqueue_frame(rst_stream_frame(stream_id, ERR_PROTOCOL_ERROR))?;
-                self.emit_protocol_fact(
+                self.reset_active_stream_for_protocol(
+                    stream_id,
+                    ERR_PROTOCOL_ERROR,
+                    Http2ResetReason::ProtocolError,
                     effects,
-                    ProtocolFact::Http2StreamReset {
-                        connection: self.connection_fact_id(),
-                        stream: Http2StreamId::new(stream_id),
-                        direction: ProtocolDirection::Outbound,
-                        reason: Http2ResetReason::ProtocolError,
-                    },
                 );
-                self.reset_active_stream_for_protocol(stream_id, effects);
                 return Ok(());
             }
             self.streams[idx].request_eof = true;
@@ -1209,17 +1229,12 @@ impl<S: Shard + 'static, M: Http2ServiceMessage> Http2Connection<S, M> {
                 return Err(Http2ProtocolError::WindowOverflow);
             }
             self.report.protocol_errors += 1;
-            self.enqueue_frame(rst_stream_frame(stream_id, ERR_PROTOCOL_ERROR))?;
-            self.emit_protocol_fact(
+            self.reset_active_stream_for_protocol(
+                stream_id,
+                ERR_PROTOCOL_ERROR,
+                Http2ResetReason::ProtocolError,
                 effects,
-                ProtocolFact::Http2StreamReset {
-                    connection: self.connection_fact_id(),
-                    stream: Http2StreamId::new(stream_id),
-                    direction: ProtocolDirection::Outbound,
-                    reason: Http2ResetReason::ProtocolError,
-                },
             );
-            self.reset_active_stream_for_protocol(stream_id, effects);
             return Ok(());
         }
         if stream_id == 0 {
@@ -1252,9 +1267,13 @@ impl<S: Shard + 'static, M: Http2ServiceMessage> Http2Connection<S, M> {
             self.report.goaway_sent += 1;
             self.goaway = true;
             self.closing_after_write = true;
+            self.drain_streams_for_connection_close(effects);
             return Ok(());
         }
-        if let Some(mut stream) = self.remove_stream(frame.stream_id) {
+        if self
+            .remove_stream(frame.stream_id, effects, CallError::TargetClosed)
+            .is_some()
+        {
             self.report.reset_streams += 1;
             self.report.closed_streams += 1;
             self.emit_protocol_fact(
@@ -1274,21 +1293,7 @@ impl<S: Shard + 'static, M: Http2ServiceMessage> Http2Connection<S, M> {
                     reason: Http2CloseReason::EndStream,
                 },
             );
-            if let Some(call) = stream.pending_request_body_reply.take() {
-                effects.push(reply_to_request(
-                    call,
-                    Http2ConnectionReply::RequestChunk(RequestChunkReply::Error(
-                        CallError::TargetClosed,
-                    )),
-                ));
-            }
-            if let Some(handle) = stream.pending_call.take() {
-                let stream_id = frame.stream_id;
-                effects.push(cancel_call(handle).then(move |outcome| {
-                    Http2ConnectionMsg::ServiceCancelled { stream_id, outcome }
-                }));
-            }
-            self.cancel_response_source(frame.stream_id, &mut stream, effects);
+            self.flush_deferred_request_window_credit();
         }
         Ok(())
     }
@@ -1480,17 +1485,11 @@ impl<S: Shard + 'static, M: Http2ServiceMessage> Http2Connection<S, M> {
             HttpResponseBody::Buffered(bytes) => {
                 if bytes.len() > self.limits.max_response_body_bytes {
                     self.report.stream_full += 1;
-                    self.enqueue_frame(rst_stream_frame(stream_id, ERR_ENHANCE_YOUR_CALM))?;
-                    self.remove_stream(stream_id);
-                    self.report.closed_streams += 1;
-                    self.emit_protocol_fact(
+                    self.reset_active_stream_for_protocol(
+                        stream_id,
+                        ERR_ENHANCE_YOUR_CALM,
+                        Http2ResetReason::EnhanceYourCalm,
                         effects,
-                        ProtocolFact::Http2StreamReset {
-                            connection: self.connection_fact_id(),
-                            stream: Http2StreamId::new(stream_id),
-                            direction: ProtocolDirection::Outbound,
-                            reason: Http2ResetReason::EnhanceYourCalm,
-                        },
                     );
                     return Ok(());
                 }
@@ -1499,17 +1498,11 @@ impl<S: Shard + 'static, M: Http2ServiceMessage> Http2Connection<S, M> {
             HttpResponseBody::Shared(bytes) => {
                 if bytes.len() > self.limits.max_response_body_bytes {
                     self.report.stream_full += 1;
-                    self.enqueue_frame(rst_stream_frame(stream_id, ERR_ENHANCE_YOUR_CALM))?;
-                    self.remove_stream(stream_id);
-                    self.report.closed_streams += 1;
-                    self.emit_protocol_fact(
+                    self.reset_active_stream_for_protocol(
+                        stream_id,
+                        ERR_ENHANCE_YOUR_CALM,
+                        Http2ResetReason::EnhanceYourCalm,
                         effects,
-                        ProtocolFact::Http2StreamReset {
-                            connection: self.connection_fact_id(),
-                            stream: Http2StreamId::new(stream_id),
-                            direction: ProtocolDirection::Outbound,
-                            reason: Http2ResetReason::EnhanceYourCalm,
-                        },
                     );
                     return Ok(());
                 }
@@ -1705,15 +1698,11 @@ impl<S: Shard + 'static, M: Http2ServiceMessage> Http2Connection<S, M> {
         }
         self.write_queue.push_back(out);
         self.streams[idx].state = Http2StreamState::Closed;
-        self.remove_stream(stream_id);
-        self.report.closed_streams += 1;
-        self.emit_protocol_fact(
+        self.close_stream_with_cleanup(
+            stream_id,
+            Http2CloseReason::EndStream,
             effects,
-            ProtocolFact::Http2StreamClosed {
-                connection: self.connection_fact_id(),
-                stream: Http2StreamId::new(stream_id),
-                reason: Http2CloseReason::EndStream,
-            },
+            CallError::TargetClosed,
         );
         Ok(())
     }
@@ -1796,10 +1785,15 @@ impl<S: Shard + 'static, M: Http2ServiceMessage> Http2Connection<S, M> {
                     .is_some_and(|remaining| bytes.len() > remaining);
                 if overrun {
                     self.report.protocol_errors += 1;
-                    let _ = self.enqueue_frame(rst_stream_frame(stream_id, ERR_PROTOCOL_ERROR));
-                    self.remove_stream(stream_id);
-                    self.report.closed_streams += 1;
-                    return self.maybe_write_effect();
+                    let mut effects = Vec::new();
+                    self.reset_active_stream_for_protocol(
+                        stream_id,
+                        ERR_PROTOCOL_ERROR,
+                        Http2ResetReason::ProtocolError,
+                        &mut effects,
+                    );
+                    effects.push(self.maybe_write_effect());
+                    return batch(effects);
                 }
                 let projected = self
                     .find_stream(stream_id)
@@ -1811,22 +1805,21 @@ impl<S: Shard + 'static, M: Http2ServiceMessage> Http2Connection<S, M> {
                     .unwrap_or(usize::MAX);
                 if projected > self.limits.max_response_body_bytes {
                     self.report.stream_full += 1;
-                    let high_water_fact = tina::fact::<Self>(ProtocolFact::HttpBodyHighWater {
+                    let mut effects = vec![tina::fact::<Self>(ProtocolFact::HttpBodyHighWater {
                         connection: self.connection_fact_id(),
                         body_id: stream_id as u64,
                         direction: ProtocolDirection::Outbound,
                         buffered_bytes: projected as u64,
                         threshold_bytes: self.limits.max_response_body_bytes as u64,
-                    });
-                    let reset_fact = tina::fact::<Self>(ProtocolFact::Http2StreamReset {
-                        connection: self.connection_fact_id(),
-                        stream: Http2StreamId::new(stream_id),
-                        direction: ProtocolDirection::Outbound,
-                        reason: Http2ResetReason::EnhanceYourCalm,
-                    });
-                    let _ = self.enqueue_frame(rst_stream_frame(stream_id, ERR_ENHANCE_YOUR_CALM));
-                    self.remove_stream(stream_id);
-                    return batch(vec![high_water_fact, reset_fact, self.maybe_write_effect()]);
+                    })];
+                    self.reset_active_stream_for_protocol(
+                        stream_id,
+                        ERR_ENHANCE_YOUR_CALM,
+                        Http2ResetReason::EnhanceYourCalm,
+                        &mut effects,
+                    );
+                    effects.push(self.maybe_write_effect());
+                    return batch(effects);
                 }
                 if let Some(idx) = self.find_stream(stream_id) {
                     self.streams[idx]
@@ -1838,13 +1831,8 @@ impl<S: Shard + 'static, M: Http2ServiceMessage> Http2Connection<S, M> {
                         *remaining -= bytes.len();
                     }
                 }
-                if let Err(error) = self.flush_response_stream(stream_id) {
-                    self.report.protocol_errors += 1;
-                    let code = match error {
-                        Http2ProtocolError::FlowControl => ERR_FLOW_CONTROL_ERROR,
-                        _ => ERR_PROTOCOL_ERROR,
-                    };
-                    let _ = self.enqueue_frame(rst_stream_frame(stream_id, code));
+                if self.flush_response_stream(stream_id).is_err() {
+                    self.report.flow_control_blocked += 1;
                 }
                 let mut effects = Vec::new();
                 if self.pending_write.is_empty() && !self.write_queue.is_empty() {
@@ -1869,10 +1857,15 @@ impl<S: Shard + 'static, M: Http2ServiceMessage> Http2Connection<S, M> {
                     .is_some_and(|remaining| remaining > 0);
                 if short_source {
                     self.report.protocol_errors += 1;
-                    let _ = self.enqueue_frame(rst_stream_frame(stream_id, ERR_PROTOCOL_ERROR));
-                    self.remove_stream(stream_id);
-                    self.report.closed_streams += 1;
-                    return self.maybe_write_effect();
+                    let mut effects = Vec::new();
+                    self.reset_active_stream_for_protocol(
+                        stream_id,
+                        ERR_PROTOCOL_ERROR,
+                        Http2ResetReason::ProtocolError,
+                        &mut effects,
+                    );
+                    effects.push(self.maybe_write_effect());
+                    return batch(effects);
                 }
                 let trailers = self
                     .find_stream(stream_id)
@@ -1885,14 +1878,15 @@ impl<S: Shard + 'static, M: Http2ServiceMessage> Http2Connection<S, M> {
                 if let Some(idx) = self.find_stream(stream_id) {
                     self.streams[idx].state = Http2StreamState::Closed;
                 }
-                self.remove_stream(stream_id);
-                self.report.closed_streams += 1;
-                let close_fact = tina::fact::<Self>(ProtocolFact::Http2StreamClosed {
-                    connection: self.connection_fact_id(),
-                    stream: Http2StreamId::new(stream_id),
-                    reason: Http2CloseReason::EndStream,
-                });
-                batch(vec![close_fact, self.maybe_write_effect()])
+                let mut effects = Vec::new();
+                self.close_stream_with_cleanup(
+                    stream_id,
+                    Http2CloseReason::EndStream,
+                    &mut effects,
+                    CallError::TargetClosed,
+                );
+                effects.push(self.maybe_write_effect());
+                batch(effects)
             }
             CallOutcome::Replied(ResponseChunkReply::GrpcStatus(status)) => {
                 let grpc_status_code = crate::grpc::classify_grpc_status_code(&status);
@@ -1901,28 +1895,35 @@ impl<S: Shard + 'static, M: Http2ServiceMessage> Http2Connection<S, M> {
                 if let Some(idx) = self.find_stream(stream_id) {
                     self.streams[idx].state = Http2StreamState::Closed;
                 }
-                self.remove_stream(stream_id);
-                self.report.closed_streams += 1;
                 let status_fact = tina::fact::<Self>(ProtocolFact::GrpcFinalStatusSent {
                     connection: self.connection_fact_id(),
                     stream: tina_runtime::GrpcStreamId::new(stream_id as u64),
                     status: grpc_status_code,
                 });
-                let close_fact = tina::fact::<Self>(ProtocolFact::Http2StreamClosed {
-                    connection: self.connection_fact_id(),
-                    stream: Http2StreamId::new(stream_id),
-                    reason: Http2CloseReason::EndStream,
-                });
-                batch(vec![status_fact, close_fact, self.maybe_write_effect()])
+                let mut effects = vec![status_fact];
+                self.close_stream_with_cleanup(
+                    stream_id,
+                    Http2CloseReason::EndStream,
+                    &mut effects,
+                    CallError::TargetClosed,
+                );
+                effects.push(self.maybe_write_effect());
+                batch(effects)
             }
             CallOutcome::Full
             | CallOutcome::Closed
             | CallOutcome::Rejected(_)
             | CallOutcome::Timeout => {
                 self.report.stream_full += 1;
-                let _ = self.enqueue_frame(rst_stream_frame(stream_id, ERR_PROTOCOL_ERROR));
-                self.remove_stream(stream_id);
-                self.maybe_write_effect()
+                let mut effects = Vec::new();
+                self.reset_active_stream_for_protocol(
+                    stream_id,
+                    ERR_PROTOCOL_ERROR,
+                    Http2ResetReason::ProtocolError,
+                    &mut effects,
+                );
+                effects.push(self.maybe_write_effect());
+                batch(effects)
             }
         }
     }
@@ -1998,23 +1999,92 @@ impl<S: Shard + 'static, M: Http2ServiceMessage> Http2Connection<S, M> {
     fn reset_active_stream_for_protocol(
         &mut self,
         stream_id: u32,
+        code: u32,
+        reason: Http2ResetReason,
         effects: &mut Vec<Effect<Self>>,
     ) {
-        if let Some(mut stream) = self.remove_stream(stream_id) {
-            self.report.reset_streams += 1;
+        self.reset_stream_with_cleanup(stream_id, code, reason, effects, CallError::Io);
+    }
+
+    fn reset_stream_with_cleanup(
+        &mut self,
+        stream_id: u32,
+        code: u32,
+        reason: Http2ResetReason,
+        effects: &mut Vec<Effect<Self>>,
+        request_error: CallError,
+    ) {
+        let _ = self.enqueue_frame(rst_stream_frame(stream_id, code));
+        self.report.reset_streams += 1;
+        self.emit_protocol_fact(
+            effects,
+            ProtocolFact::Http2StreamReset {
+                connection: self.connection_fact_id(),
+                stream: Http2StreamId::new(stream_id),
+                direction: ProtocolDirection::Outbound,
+                reason,
+            },
+        );
+        self.close_stream_with_cleanup(
+            stream_id,
+            Http2CloseReason::EndStream,
+            effects,
+            request_error,
+        );
+    }
+
+    fn reset_missing_stream(
+        &mut self,
+        stream_id: u32,
+        code: u32,
+        reason: Http2ResetReason,
+        effects: &mut Vec<Effect<Self>>,
+    ) {
+        let _ = self.enqueue_frame(rst_stream_frame(stream_id, code));
+        self.report.reset_streams += 1;
+        self.emit_protocol_fact(
+            effects,
+            ProtocolFact::Http2StreamReset {
+                connection: self.connection_fact_id(),
+                stream: Http2StreamId::new(stream_id),
+                direction: ProtocolDirection::Outbound,
+                reason,
+            },
+        );
+    }
+
+    fn close_stream_with_cleanup(
+        &mut self,
+        stream_id: u32,
+        reason: Http2CloseReason,
+        effects: &mut Vec<Effect<Self>>,
+        request_error: CallError,
+    ) {
+        if self
+            .remove_stream(stream_id, effects, request_error)
+            .is_some()
+        {
             self.report.closed_streams += 1;
-            if let Some(call) = stream.pending_request_body_reply.take() {
-                effects.push(reply_to_request(
-                    call,
-                    Http2ConnectionReply::RequestChunk(RequestChunkReply::Error(CallError::Io)),
-                ));
-            }
-            if let Some(handle) = stream.pending_call.take() {
-                effects.push(cancel_call(handle).then(move |outcome| {
-                    Http2ConnectionMsg::ServiceCancelled { stream_id, outcome }
-                }));
-            }
-            self.cancel_response_source(stream_id, &mut stream, effects);
+            self.emit_protocol_fact(
+                effects,
+                ProtocolFact::Http2StreamClosed {
+                    connection: self.connection_fact_id(),
+                    stream: Http2StreamId::new(stream_id),
+                    reason,
+                },
+            );
+        }
+    }
+
+    fn drain_streams_for_connection_close(&mut self, effects: &mut Vec<Effect<Self>>) {
+        let ids: Vec<u32> = self.streams.iter().map(|stream| stream.id).collect();
+        for stream_id in ids {
+            self.close_stream_with_cleanup(
+                stream_id,
+                Http2CloseReason::GoAway,
+                effects,
+                CallError::TargetClosed,
+            );
         }
     }
 
@@ -2102,6 +2172,25 @@ impl<S: Shard + 'static, M: Http2ServiceMessage> Http2Connection<S, M> {
             .saturating_add(credit_u32);
     }
 
+    fn add_connection_window_credit(&mut self, credit: usize) {
+        let credit_u32 = u32::try_from(credit).unwrap_or(u32::MAX);
+        self.pending_recv_window_credit =
+            self.pending_recv_window_credit.saturating_add(credit_u32);
+    }
+
+    fn return_dropped_request_credit(&mut self, stream: &mut ActiveStream) {
+        let credit = stream
+            .request_chunks
+            .drain(..)
+            .fold(0usize, |sum, chunk| sum.saturating_add(chunk.flow_credit));
+        if credit == 0 {
+            return;
+        }
+        let credit_i32 = i32::try_from(credit).unwrap_or(i32::MAX);
+        self.recv_window = self.recv_window.saturating_add(credit_i32);
+        self.add_connection_window_credit(credit);
+    }
+
     fn maybe_write_effect(&mut self) -> Effect<Self> {
         if self.pending_write.is_empty() && !self.write_queue.is_empty() {
             self.write_more()
@@ -2115,11 +2204,11 @@ impl<S: Shard + 'static, M: Http2ServiceMessage> Http2Connection<S, M> {
         stream_id: u32,
         force: bool,
     ) -> Result<(), Http2ProtocolError> {
-        let Some(idx) = self.find_stream(stream_id) else {
-            return Ok(());
-        };
+        let stream_index = self.find_stream(stream_id);
         let conn_credit = self.pending_recv_window_credit;
-        let stream_credit = self.streams[idx].pending_recv_window_credit;
+        let stream_credit = stream_index
+            .map(|idx| self.streams[idx].pending_recv_window_credit)
+            .unwrap_or(0);
         let send_conn = conn_credit > 0 && (force || conn_credit >= WINDOW_CREDIT_FLUSH_THRESHOLD);
         let send_stream =
             stream_credit > 0 && (force || stream_credit >= WINDOW_CREDIT_FLUSH_THRESHOLD);
@@ -2137,7 +2226,7 @@ impl<S: Shard + 'static, M: Http2ServiceMessage> Http2Connection<S, M> {
             self.enqueue_frame(window_update_frame(0, conn_credit))?;
         }
         if send_stream {
-            if let Some(idx) = self.find_stream(stream_id) {
+            if let Some(idx) = stream_index {
                 self.streams[idx].pending_recv_window_credit = 0;
             }
             self.enqueue_frame(window_update_frame(stream_id, stream_credit))?;
@@ -2182,10 +2271,14 @@ impl<S: Shard + 'static, M: Http2ServiceMessage> Http2Connection<S, M> {
         // (e.g. streamed bodies). The steady-state response path flushes credit
         // into the response write itself, so this usually finds nothing.
         self.flush_deferred_request_window_credit();
-        if !self.write_queue.is_empty() {
-            return self.write_more();
+        let mut effects = Vec::new();
+        if self.flush_pending_responses(&mut effects).is_err() {
+            self.report.protocol_errors += 1;
         }
-        noop()
+        if !self.write_queue.is_empty() {
+            effects.push(self.write_more());
+        }
+        batch(effects)
     }
 
     fn flush_deferred_request_window_credit(&mut self) {
@@ -2198,12 +2291,19 @@ impl<S: Shard + 'static, M: Http2ServiceMessage> Http2Connection<S, M> {
             return;
         }
 
+        if self.pending_recv_window_credit > 0 {
+            if self.maybe_flush_request_window_credit(0, true).is_err() {
+                self.report.protocol_errors += 1;
+                return;
+            }
+            if self.write_queue.len() >= self.limits.connection_outbound_queue_capacity {
+                return;
+            }
+        }
         let stream_ids: Vec<u32> = self
             .streams
             .iter()
-            .filter(|stream| {
-                self.pending_recv_window_credit > 0 || stream.pending_recv_window_credit > 0
-            })
+            .filter(|stream| stream.pending_recv_window_credit > 0)
             .map(|stream| stream.id)
             .collect();
         for stream_id in stream_ids {
@@ -2275,7 +2375,33 @@ impl<S: Shard + 'static, M: Http2ServiceMessage> Http2Connection<S, M> {
         self.streams.push(stream);
     }
 
-    fn remove_stream(&mut self, stream_id: u32) -> Option<ActiveStream> {
+    fn remove_stream(
+        &mut self,
+        stream_id: u32,
+        effects: &mut Vec<Effect<Self>>,
+        request_error: CallError,
+    ) -> Option<ActiveStream> {
+        let mut stream = self.remove_stream_from_table(stream_id)?;
+        self.return_dropped_request_credit(&mut stream);
+        if let Some(call) = stream.pending_request_body_reply.take() {
+            effects.push(reply_to_request(
+                call,
+                Http2ConnectionReply::RequestChunk(RequestChunkReply::Error(request_error)),
+            ));
+        }
+        if let Some(handle) = stream.pending_call.take() {
+            effects.push(
+                cancel_call(handle).then(move |outcome| Http2ConnectionMsg::ServiceCancelled {
+                    stream_id,
+                    outcome,
+                }),
+            );
+        }
+        self.cancel_response_source(stream_id, &mut stream, effects);
+        Some(stream)
+    }
+
+    fn remove_stream_from_table(&mut self, stream_id: u32) -> Option<ActiveStream> {
         let idx = self.find_stream(stream_id)?;
         self.stream_index.remove(&stream_id);
         let removed = self.streams.swap_remove(idx);
@@ -2468,6 +2594,40 @@ mod tests {
             2,
             "only the first buffer is written; the rest stay queued"
         );
+
+        let mut conn = unit_connection();
+        conn.limits.connection_outbound_queue_capacity = 1;
+        conn.write_in_flight = true;
+        conn.write_queue.push_back(vec![0; FRAME_HEADER_LEN]);
+        conn.push_stream(ActiveStream::new(
+            1,
+            HeaderBlock::default(),
+            DEFAULT_WINDOW,
+            DEFAULT_WINDOW,
+            false,
+        ));
+        let _ = conn.handle_stream_chunk(
+            1,
+            CallOutcome::Replied(ResponseChunkReply::Chunk(b"abc".to_vec())),
+        );
+        assert!(
+            conn.find_stream(1)
+                .is_some_and(|idx| conn.streams[idx].response_pending_data == b"abc"),
+            "queue-cap flush failure parks the chunk instead of dropping it"
+        );
+        let _ = conn.handle_wrote(TcpWriteOwnedReply {
+            bytes: Vec::new(),
+            written: 0,
+        });
+        let bytes = std::mem::take(&mut conn.pending_write);
+        let written = bytes.len();
+        let _ = conn.handle_wrote(TcpWriteOwnedReply { bytes, written });
+        assert!(
+            conn.find_stream(1)
+                .is_some_and(|idx| conn.streams[idx].response_pending_data.is_empty()),
+            "write drain should retry and drain parked streamed response DATA"
+        );
+        assert!(conn.write_in_flight, "retry should arm a TCP write");
     }
 
     #[test]
@@ -2661,7 +2821,7 @@ mod tests {
         }
 
         // Remove a middle stream: `swap_remove` moves id 7 into its slot.
-        let removed = conn.remove_stream(3).expect("removed stream 3");
+        let removed = conn.remove_stream_from_table(3).expect("removed stream 3");
         assert_eq!(removed.id, 3);
         assert!(conn.find_stream(3).is_none(), "removed id is gone");
         for id in [1u32, 5, 7] {
@@ -2675,11 +2835,216 @@ mod tests {
         assert_eq!(conn.stream_index.len(), 3);
 
         // Remove the tail (no swap needed) and the head (swap moves tail in).
-        conn.remove_stream(7).expect("removed tail");
-        conn.remove_stream(1).expect("removed head");
+        conn.remove_stream_from_table(7).expect("removed tail");
+        conn.remove_stream_from_table(1).expect("removed head");
         assert_eq!(conn.find_stream(5).map(|i| conn.streams[i].id), Some(5));
         assert_eq!(conn.streams.len(), 1);
         assert_eq!(conn.stream_index.len(), 1);
+
+        let mut conn = unit_connection();
+        conn.preface_seen = true;
+        conn.highest_client_stream_id = 1;
+        conn.push_stream(ActiveStream::new(
+            1,
+            HeaderBlock::default(),
+            DEFAULT_WINDOW,
+            DEFAULT_WINDOW,
+            false,
+        ));
+        conn.remove_stream_from_table(1).expect("stream removed");
+        let mut effects: Vec<Effect<Http2Connection<UnitShard>>> = Vec::new();
+
+        conn.handle_data_frame(Frame::new(FRAME_DATA, 0, 1, b"abc".to_vec()), &mut effects)
+            .expect("late DATA on a closed stream is stream-scoped");
+        assert_eq!(
+            queued_window_update_increment(&conn, 0),
+            3,
+            "discarded DATA must return connection credit"
+        );
+        let facts = collect_facts(&effects);
+        assert!(
+            facts.iter().any(|f| matches!(
+                f,
+                ProtocolFact::Http2StreamReset {
+                    reason: Http2ResetReason::StreamClosed,
+                    direction: ProtocolDirection::Outbound,
+                    ..
+                }
+            )),
+            "expected outbound stream-closed reset fact, got {facts:?}",
+        );
+    }
+
+    fn queued_window_update_increment(conn: &Http2Connection<UnitShard>, stream_id: u32) -> u32 {
+        conn.write_queue
+            .iter()
+            .filter_map(|bytes| {
+                try_decode_frame(bytes, conn.limits.max_frame_size)
+                    .expect("queued frame decodes")
+                    .map(|(frame, _)| frame)
+            })
+            .find(|frame| frame.ty == FRAME_WINDOW_UPDATE && frame.stream_id == stream_id)
+            .map(|frame| {
+                let mut buf = [0_u8; 4];
+                buf.copy_from_slice(&frame.payload);
+                u32::from_be_bytes(buf) & 0x7fff_ffff
+            })
+            .unwrap_or(0)
+    }
+
+    fn assert_data_reject_returns_connection_credit(
+        label: &str,
+        conn: &mut Http2Connection<UnitShard>,
+        stream_id: u32,
+        payload: &[u8],
+    ) {
+        let mut effects: Vec<Effect<Http2Connection<UnitShard>>> = Vec::new();
+        conn.handle_data_frame(
+            Frame::new(FRAME_DATA, 0, stream_id, payload.to_vec()),
+            &mut effects,
+        )
+        .unwrap_or_else(|err| panic!("{label}: DATA reject should stay stream-scoped: {err:?}"));
+        assert_eq!(
+            queued_window_update_increment(conn, 0),
+            payload.len() as u32,
+            "{label}: rejected DATA must return consumed connection credit"
+        );
+    }
+
+    #[test]
+    fn data_reject_paths_return_connection_window_credit() {
+        {
+            let mut conn = unit_connection();
+            conn.highest_client_stream_id = 1;
+            assert_data_reject_returns_connection_credit(
+                "closed stream missing from table",
+                &mut conn,
+                1,
+                b"abc",
+            );
+        }
+        {
+            let mut conn = unit_connection();
+            let mut stream = ActiveStream::new(
+                1,
+                HeaderBlock::default(),
+                DEFAULT_WINDOW,
+                DEFAULT_WINDOW,
+                false,
+            );
+            stream.state = Http2StreamState::Closed;
+            conn.push_stream(stream);
+            assert_data_reject_returns_connection_credit(
+                "closed stream state",
+                &mut conn,
+                1,
+                b"abc",
+            );
+        }
+        {
+            let mut conn = unit_connection();
+            let mut stream = ActiveStream::new(
+                1,
+                HeaderBlock::default(),
+                DEFAULT_WINDOW,
+                DEFAULT_WINDOW,
+                false,
+            );
+            stream.request_eof = true;
+            conn.push_stream(stream);
+            assert_data_reject_returns_connection_credit(
+                "DATA after request EOF",
+                &mut conn,
+                1,
+                b"abc",
+            );
+        }
+        {
+            let mut conn = unit_connection();
+            conn.recv_window = DEFAULT_WINDOW;
+            conn.push_stream(ActiveStream::new(
+                1,
+                HeaderBlock::default(),
+                1,
+                DEFAULT_WINDOW,
+                false,
+            ));
+            assert_data_reject_returns_connection_credit(
+                "stream receive window exceeded",
+                &mut conn,
+                1,
+                b"abc",
+            );
+        }
+        {
+            let mut conn = unit_connection();
+            let mut stream = ActiveStream::new(
+                1,
+                HeaderBlock::default(),
+                DEFAULT_WINDOW,
+                DEFAULT_WINDOW,
+                false,
+            );
+            stream.request_content_length = Some(2);
+            stream.request_bytes_received = 1;
+            conn.push_stream(stream);
+            assert_data_reject_returns_connection_credit(
+                "content-length overrun",
+                &mut conn,
+                1,
+                b"ab",
+            );
+        }
+        {
+            let mut conn = unit_connection();
+            conn.limits.max_body_bytes = 1;
+            conn.push_stream(ActiveStream::new(
+                1,
+                HeaderBlock::default(),
+                DEFAULT_WINDOW,
+                DEFAULT_WINDOW,
+                false,
+            ));
+            assert_data_reject_returns_connection_credit("body cap exceeded", &mut conn, 1, b"ab");
+        }
+    }
+
+    #[test]
+    fn malformed_priority_resets_open_stream_but_ignores_idle_stream() {
+        let mut conn = unit_connection();
+        conn.push_stream(ActiveStream::new(
+            1,
+            HeaderBlock::default(),
+            DEFAULT_WINDOW,
+            DEFAULT_WINDOW,
+            false,
+        ));
+        let mut effects: Vec<Effect<Http2Connection<UnitShard>>> = Vec::new();
+        conn.handle_priority(Frame::new(FRAME_PRIORITY, 0, 1, vec![0, 1]), &mut effects)
+            .expect("malformed PRIORITY on open stream is stream-scoped");
+        assert_eq!(conn.write_queue.len(), 1);
+        let facts = collect_facts(&effects);
+        assert!(facts.iter().any(|fact| matches!(
+            fact,
+            ProtocolFact::Http2StreamReset {
+                reason: Http2ResetReason::FrameSizeError,
+                direction: ProtocolDirection::Outbound,
+                ..
+            }
+        )));
+
+        let mut conn = unit_connection();
+        let mut effects: Vec<Effect<Http2Connection<UnitShard>>> = Vec::new();
+        conn.handle_priority(Frame::new(FRAME_PRIORITY, 0, 3, vec![0, 1]), &mut effects)
+            .expect("malformed PRIORITY on idle stream is ignored");
+        assert!(
+            conn.write_queue.is_empty(),
+            "idle PRIORITY must not fabricate RST_STREAM"
+        );
+        assert!(
+            collect_facts(&effects).is_empty(),
+            "idle PRIORITY must not emit reset facts"
+        );
     }
 
     #[test]
@@ -2750,17 +3115,34 @@ mod tests {
     #[test]
     fn rst_stream_emits_inbound_reset_and_close_protocol_facts() {
         let mut conn = unit_connection();
-        conn.push_stream(ActiveStream::new(
+        let mut stream = ActiveStream::new(
             5,
             HeaderBlock::default(),
-            DEFAULT_WINDOW,
+            DEFAULT_WINDOW - 6,
             DEFAULT_WINDOW,
             false,
-        ));
+        );
+        stream.request_dispatched_streaming = true;
+        stream.request_chunks.push_back(RequestDataChunk {
+            data: b"abcdef".to_vec(),
+            flow_credit: 6,
+        });
+        conn.recv_window = DEFAULT_WINDOW - 6;
+        conn.push_stream(stream);
         let mut effects: Vec<Effect<Http2Connection<UnitShard>>> = Vec::new();
         let rst_frame = Frame::new(FRAME_RST_STREAM, 0, 5, 0x8_u32.to_be_bytes().to_vec());
         conn.handle_rst_stream(rst_frame, &mut effects)
             .expect("handle_rst_stream accepts a well-formed RST");
+        conn.flush_deferred_request_window_credit();
+        assert_eq!(
+            conn.recv_window, DEFAULT_WINDOW,
+            "dropped request chunks must restore the connection receive window"
+        );
+        assert_eq!(
+            queued_window_update_increment(&conn, 0),
+            6,
+            "dropped request chunks must be credited back to the peer"
+        );
         // Two protocol facts: a reset (with `Cancel` reason from wire code 8)
         // followed by a clean close. The test pins both presence and order.
         let facts: Vec<&ProtocolFact> = effects
@@ -3031,6 +3413,11 @@ mod tests {
             )),
             "expected EnhanceYourCalm outbound reset fact, got {facts:?}",
         );
+        assert_eq!(
+            queued_window_update_increment(&conn, 0),
+            5,
+            "rejected DATA still consumes peer connection credit"
+        );
     }
 
     #[test]
@@ -3075,6 +3462,52 @@ mod tests {
                 }
             )),
             "expected outbound EnhanceYourCalm reset fact, got {facts:?}",
+        );
+
+        let mut conn = unit_connection();
+        let mut stream = ActiveStream::new(
+            3,
+            HeaderBlock::default(),
+            DEFAULT_WINDOW,
+            DEFAULT_WINDOW,
+            false,
+        );
+        stream.response_remaining_content_length = Some(4);
+        conn.push_stream(stream);
+        let effect = conn.handle_stream_chunk(3, CallOutcome::Replied(ResponseChunkReply::Eof));
+        let facts = collect_facts_from_one(&effect);
+        assert!(
+            facts.iter().any(|f| matches!(
+                f,
+                ProtocolFact::Http2StreamReset {
+                    reason: Http2ResetReason::ProtocolError,
+                    direction: ProtocolDirection::Outbound,
+                    ..
+                }
+            )),
+            "expected short-source protocol reset fact, got {facts:?}",
+        );
+
+        let mut conn = unit_connection();
+        conn.push_stream(ActiveStream::new(
+            5,
+            HeaderBlock::default(),
+            DEFAULT_WINDOW,
+            DEFAULT_WINDOW,
+            false,
+        ));
+        let effect = conn.handle_stream_chunk(5, CallOutcome::Timeout);
+        let facts = collect_facts_from_one(&effect);
+        assert!(
+            facts.iter().any(|f| matches!(
+                f,
+                ProtocolFact::Http2StreamReset {
+                    reason: Http2ResetReason::ProtocolError,
+                    direction: ProtocolDirection::Outbound,
+                    ..
+                }
+            )),
+            "expected pull-failure protocol reset fact, got {facts:?}",
         );
     }
 
@@ -3122,15 +3555,29 @@ mod tests {
             .expect("stream receive overrun should not GOAWAY connection");
 
         assert!(conn.find_stream(1).is_none(), "bad stream is removed");
-        assert_eq!(conn.write_queue.len(), 1);
-        let (queued, _) = try_decode_frame(&conn.write_queue[0], conn.limits.max_frame_size)
-            .expect("complete queued frame")
+        let queued: Vec<Frame> = conn
+            .write_queue
+            .iter()
+            .filter_map(|bytes| {
+                try_decode_frame(bytes, conn.limits.max_frame_size)
+                    .expect("complete queued frame")
+                    .map(|(frame, _)| frame)
+            })
+            .collect();
+        let queued = queued
+            .iter()
+            .find(|frame| frame.ty == FRAME_RST_STREAM)
             .expect("queued RST decodes");
         assert_eq!(queued.ty, FRAME_RST_STREAM);
         assert_eq!(queued.stream_id, 1);
         let mut code = [0_u8; 4];
         code.copy_from_slice(&queued.payload);
         assert_eq!(u32::from_be_bytes(code), ERR_FLOW_CONTROL_ERROR);
+        assert_eq!(
+            queued_window_update_increment(&conn, 0),
+            3,
+            "stream-level rejects still return connection credit"
+        );
         let facts = collect_facts(&effects);
         assert!(
             facts.iter().any(|f| matches!(

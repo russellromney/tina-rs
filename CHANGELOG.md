@@ -33,6 +33,9 @@ This file records completed work.
   window credit during the upload instead of deadlocking above the initial
   window, and client/server stream lookup uses bounded id-to-slot maps instead
   of per-frame linear scans.
+- HTTP/2 server request/response funnel teardown now cancels owned body sources
+  after successful completion as well as reset/error paths, so no source
+  isolate is left running after the stream has terminally resolved.
 
 ### Real Protocol Performance
 

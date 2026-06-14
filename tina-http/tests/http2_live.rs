@@ -2,13 +2,17 @@ mod common;
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
 use std::time::Duration;
 
 use common::{Counter, TestShard};
 use tina::prelude::*;
 use tina_http::{
     Http2Limits, Http2Listener, Http2ListenerMsg, Http2ServerConfig, Http2ServiceMessage,
-    HttpRequest, HttpResponse, IterBodySource,
+    HttpRequest, HttpResponse, IterBodySource, ResponseChunkMsg, ResponseChunkReply,
 };
 use tina_runtime::{DefaultThreadedMailboxFactory, ThreadedRuntime, ThreadedRuntimeConfig};
 
@@ -232,6 +236,12 @@ fn request_headers_without_authority(method: &str, path: &str) -> Vec<u8> {
     block
 }
 
+fn grpc_request_headers(method: &str, path: &str) -> Vec<u8> {
+    let mut block = request_headers(method, path);
+    literal("content-type", "application/grpc", &mut block);
+    block
+}
+
 fn literal(name: &str, value: &str, out: &mut Vec<u8>) {
     out.push(0);
     hpack_string(name, out);
@@ -295,6 +305,7 @@ fn read_until_goaway(stream: &mut TcpStream) -> TestFrame {
 const ERR_PROTOCOL_ERROR: u32 = 0x1;
 const ERR_FLOW_CONTROL_ERROR: u32 = 0x3;
 const ERR_SETTINGS_ERROR: u32 = 0x4;
+const ERR_STREAM_CLOSED: u32 = 0x5;
 const ERR_FRAME_SIZE_ERROR: u32 = 0x6;
 const ERR_REFUSED_STREAM: u32 = 0x7;
 const ERR_ENHANCE_YOUR_CALM: u32 = 0xb;
@@ -344,6 +355,74 @@ struct StreamingResponseService {
 
 struct MixedResponseService {
     source: Address<tina_http::ResponseChunkMsg, tina_http::ResponseChunkReply>,
+}
+
+struct RecordingResponseSource {
+    chunks: std::vec::IntoIter<Vec<u8>>,
+    repeat: Option<Vec<u8>>,
+    cancels: Arc<AtomicUsize>,
+}
+
+impl Isolate for RecordingResponseSource {
+    tina::isolate_types! {
+        message: ResponseChunkMsg,
+        reply: ResponseChunkReply,
+        send: tina::Outbound<std::convert::Infallible>,
+        spawn: std::convert::Infallible,
+        call: tina_runtime::RuntimeCall<ResponseChunkMsg>,
+        shard: TestShard,
+    }
+
+    fn handle(
+        &mut self,
+        msg: ResponseChunkMsg,
+        _ctx: &mut Context<'_, TestShard, Self::Reply>,
+    ) -> Effect<Self> {
+        match msg {
+            ResponseChunkMsg::Cancel => {
+                self.cancels.fetch_add(1, Ordering::SeqCst);
+                stop()
+            }
+            _ => reply(self.next_chunk()),
+        }
+    }
+
+    fn handle_call(
+        &mut self,
+        msg: ResponseChunkMsg,
+        call: tina::CallContext<'_, Self>,
+    ) -> Effect<Self> {
+        match msg {
+            ResponseChunkMsg::Cancel => {
+                self.cancels.fetch_add(1, Ordering::SeqCst);
+                stop()
+            }
+            _ => call.reply(self.next_chunk()),
+        }
+    }
+}
+
+impl RecordingResponseSource {
+    fn next_chunk(&mut self) -> ResponseChunkReply {
+        if let Some(bytes) = self.chunks.next() {
+            return ResponseChunkReply::Chunk(bytes);
+        }
+        if let Some(bytes) = self.repeat.clone() {
+            return ResponseChunkReply::Chunk(bytes);
+        }
+        ResponseChunkReply::Eof
+    }
+}
+
+fn wait_for_cancel(cancels: &AtomicUsize) -> usize {
+    for _ in 0..400 {
+        let count = cancels.load(Ordering::SeqCst);
+        if count > 0 {
+            return count;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    cancels.load(Ordering::SeqCst)
 }
 
 impl Isolate for StreamingResponseService {
@@ -1228,6 +1307,122 @@ fn http2_streaming_response_sends_multiple_data_frames() {
 }
 
 #[test]
+fn http2_streaming_response_source_cancelled_on_client_disconnect() {
+    let runtime = ThreadedRuntime::with_config(
+        TestShard,
+        DefaultThreadedMailboxFactory,
+        ThreadedRuntimeConfig {
+            command_capacity: 64,
+            idle_wait: Duration::from_millis(1),
+            ..Default::default()
+        },
+    );
+    let cancels = Arc::new(AtomicUsize::new(0));
+    let source = runtime
+        .register_with_capacity::<RecordingResponseSource, std::convert::Infallible>(
+            RecordingResponseSource {
+                chunks: Vec::new().into_iter(),
+                repeat: Some(vec![b'x'; 16 * 1024]),
+                cancels: cancels.clone(),
+            },
+            16,
+        )
+        .expect("register recording source");
+    let service = runtime
+        .register_with_capacity::<StreamingResponseService, std::convert::Infallible>(
+            StreamingResponseService { source },
+            16,
+        )
+        .expect("register service");
+    let harness = Http2Harness::start_with_service(runtime, service, Http2ServerConfig::default());
+    let mut stream = connect_h2(harness.addr);
+
+    write_frame(
+        &mut stream,
+        FRAME_HEADERS,
+        FLAG_END_HEADERS | FLAG_END_STREAM,
+        1,
+        &request_headers("GET", "/stream"),
+    );
+    let mut saw_data = false;
+    for _ in 0..8 {
+        let frame = read_frame(&mut stream);
+        if frame.ty == FRAME_DATA && frame.stream_id == 1 {
+            saw_data = true;
+            break;
+        }
+    }
+    assert!(
+        saw_data,
+        "streaming response should send DATA before disconnect"
+    );
+    drop(stream);
+
+    assert_eq!(
+        wait_for_cancel(&cancels),
+        1,
+        "client disconnect must cancel the response source"
+    );
+    harness.shutdown();
+}
+
+#[test]
+fn http2_streaming_response_reset_cancels_source() {
+    let runtime = ThreadedRuntime::with_config(
+        TestShard,
+        DefaultThreadedMailboxFactory,
+        ThreadedRuntimeConfig {
+            command_capacity: 64,
+            idle_wait: Duration::from_millis(1),
+            ..Default::default()
+        },
+    );
+    let cancels = Arc::new(AtomicUsize::new(0));
+    let source = runtime
+        .register_with_capacity::<RecordingResponseSource, std::convert::Infallible>(
+            RecordingResponseSource {
+                chunks: vec![b"abc".to_vec()].into_iter(),
+                repeat: None,
+                cancels: cancels.clone(),
+            },
+            16,
+        )
+        .expect("register recording source");
+    let service = runtime
+        .register_with_capacity::<StreamingResponseService, std::convert::Infallible>(
+            StreamingResponseService { source },
+            16,
+        )
+        .expect("register service");
+    let config = Http2ServerConfig {
+        limits: Http2Limits {
+            max_response_body_bytes: 2,
+            ..Http2Limits::default()
+        },
+        ..Http2ServerConfig::default()
+    };
+    let harness = Http2Harness::start_with_service(runtime, service, config);
+    let mut stream = connect_h2(harness.addr);
+
+    write_frame(
+        &mut stream,
+        FRAME_HEADERS,
+        FLAG_END_HEADERS | FLAG_END_STREAM,
+        1,
+        &request_headers("GET", "/stream"),
+    );
+    let frame = read_until_rst(&mut stream, 1);
+    assert_eq!(rst_stream_error_code(&frame), ERR_ENHANCE_YOUR_CALM);
+
+    assert_eq!(
+        wait_for_cancel(&cancels),
+        1,
+        "server-initiated streaming reset must cancel the response source"
+    );
+    harness.shutdown();
+}
+
+#[test]
 fn http2_bad_preface_closes_connection() {
     let harness = Http2Harness::start(Http2ServerConfig::default());
     let mut stream =
@@ -1345,6 +1540,53 @@ fn http2_oversized_body_resets_stream_without_connection_close() {
 
     let frame = read_until_rst(&mut stream, 1);
     assert_eq!(frame.stream_id, 1);
+
+    write_frame(
+        &mut stream,
+        FRAME_HEADERS,
+        FLAG_END_HEADERS | FLAG_END_STREAM,
+        3,
+        &request_headers("GET", "/counter"),
+    );
+    assert_eq!(read_response_body(&mut stream, 3), b"0");
+    harness.shutdown();
+}
+
+#[test]
+fn http2_data_after_completed_stream_resets_stream_and_keeps_connection() {
+    let runtime = ThreadedRuntime::with_config(
+        TestShard,
+        DefaultThreadedMailboxFactory,
+        ThreadedRuntimeConfig {
+            command_capacity: 64,
+            idle_wait: Duration::from_millis(1),
+            ..Default::default()
+        },
+    );
+    let source =
+        IterBodySource::<TestShard>::register(&runtime, Vec::<Vec<u8>>::new().into_iter(), 16)
+            .expect("register source");
+    let service = runtime
+        .register_with_capacity::<MixedResponseService, std::convert::Infallible>(
+            MixedResponseService { source },
+            16,
+        )
+        .expect("register service");
+    let harness = Http2Harness::start_with_service(runtime, service, Http2ServerConfig::default());
+    let mut stream = connect_h2(harness.addr);
+
+    write_frame(
+        &mut stream,
+        FRAME_HEADERS,
+        FLAG_END_HEADERS,
+        1,
+        &grpc_request_headers("POST", "/counter"),
+    );
+    assert_eq!(read_response_body(&mut stream, 1), b"0");
+
+    write_frame(&mut stream, FRAME_DATA, 0, 1, b"late");
+    let frame = read_until_rst(&mut stream, 1);
+    assert_eq!(rst_stream_error_code(&frame), ERR_STREAM_CLOSED);
 
     write_frame(
         &mut stream,
