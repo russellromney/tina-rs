@@ -4,6 +4,17 @@ This file records completed work.
 
 ## Unreleased
 
+### CI Dependency Hygiene
+
+- Committed the root workspace `Cargo.lock` and switched normal workspace CI
+  commands to `--locked`, so pull-request failures are tied to Tina changes
+  instead of surprise dependency resolution drift.
+- Kept independent example workspaces unlocked for now and documented that
+  policy at the local `verify-examples` sweep.
+- Added a weekly/manual fresh-resolution canary that deliberately removes the
+  lockfile, resolves current crates.io state, and checks the workspace so
+  ecosystem drift is still visible on purpose.
+
 ### Adversarial Review Fix Wave
 
 - Recorded the 2026-06-08 adversarial review and per-track findings under

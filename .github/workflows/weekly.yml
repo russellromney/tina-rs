@@ -27,6 +27,19 @@ jobs:
   # phase moves a subset of crates to stable-compatible status,
   # add a scoped check (a positive list, not `--workspace`).
 
+  fresh-dependency-resolution:
+    name: fresh dependency resolution
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust nightly
+        run: rustup toolchain install nightly --profile minimal
+      - name: Check workspace against a fresh resolve
+        run: |
+          rm Cargo.lock
+          cargo update
+          cargo check --workspace
+
   miri:
     name: miri (tina-mailbox-spsc)
     runs-on: ubuntu-latest

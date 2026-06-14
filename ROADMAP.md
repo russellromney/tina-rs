@@ -435,14 +435,14 @@ and reviews live under `.intent/phases/`.
   stopped/promoted-slot scan cost, and HTTP/2/gRPC length/cap/settings/window
   truth. Future broad reviews should start from those artifacts instead of
   refiling closed findings.
-- Remaining edges are still real and named, not hidden: Phase 156 attacks
-  deeper protocol/runtime turn-count reduction, inbound HPACK/header allocation
-  beyond compact gRPC, dynamic protobuf encode/decode cost, and repeated
-  Linux/x86 evidence. Wider tails under one single-shard worker and
-  production-performance claims remain blocked until evidence earns them.
+- Remaining edges are still real and named, not hidden: after Phase 156's
+  protocol turn/header pass and Phase 157's return to explicit-step I/O,
+  wider tails under one single-shard worker, modeled efficient waiting, native
+  AWS, broader equivalent-workload comparisons, and production-performance
+  claims remain blocked until evidence earns them.
 
 These are recorded in `CHANGELOG.md`; the remaining near-term roadmap now
-starts with protocol performance follow-through, then native AWS. Public release
+starts with modeled readiness/completion work and native AWS. Public release
 cleanup waits until Tina stops apologizing for the core HTTP/runtime hot path.
 
 ## Near-term roadmap
@@ -452,7 +452,7 @@ framework before public release-story work.
 
 | Phase | Purpose |
 |---|---|
-| **156 Protocol turn and header cost** | Move the real HTTP/2/gRPC hot path again: compact HPACK/header decode without public-header work, remove the remaining gRPC streaming fallback through public `HttpRequest`, reduce gRPC method-path/header churn, reuse dynamic gRPC framing/stream decoder buffers, reduce warmed gRPC turns where no policy boundary exists, and prove it with repeated macOS and Linux/x86 p50/p90/p99 plus process-allocation rows. This phase cannot pass with benchmark-only changes. Plan: `.intent/phases/156-protocol-turn-header-cost/plan.md`. |
+| **Modeled readiness completion adapter** | Recover kernel-efficient idle waiting without bringing back a wake side-channel. Readiness may be used only if Tina observes it as runtime-owned completion/event work with a deterministic simulator model, bounded ordering rules, explicit cancellation/shutdown truth, and measured idle-CPU/HTTP-latency evidence against the current bounded re-poll baseline. |
 | **135 Native AWS first form** | Add a native Tina AWS battery for the smallest honest production shape: static SigV4 with explicit signing time, native S3 put/get/head/delete, native SQS send/receive/delete, native HTTP keepalive under Phase 131 endpoint/connect policy, bounded bodies/in-flight work, typed pressure/lifecycle reports, hermetic fake-AWS tests, and clear native-vs-SDK-bridge docs. Plan: `.intent/phases/135-native-aws-first-form/plan.md`. |
 | **Alpaca rename** | Before public launch, rename the project/crates/docs away from Tina to Alpaca so the lineage is respectful and clear: independently maintained Rust framework, inspired by Peter Mbanugo's Tina/Odin and Seastar, not an official Tina port. |
 | **Barend Biesheuvel visible flow ergonomics** | Optional high-level ergonomics only after the local runtime core feels boring: a `flow!`-style authoring surface that preserves named suspension points, visible failure policy, trace step names, and ordinary Tina message/effect expansion. No fake async, no hidden retries, no hidden queues. |
