@@ -23,7 +23,7 @@ enum StoreMsg {
 
 struct Store {
     work: Duration,
-    /// the single-call gate invariant: names the "one Tick in flight, plus N
+    /// The single-call gate invariant names the "one Tick in flight, plus N
     /// queued" invariant.
     gate: SingleCallGate,
     processed: u32,

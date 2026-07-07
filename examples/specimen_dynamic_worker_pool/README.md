@@ -141,5 +141,5 @@ future variant of this specimen could:
 - emit a `Report` with `results_collected < expected`.
 
 That requires FINDINGS finding 14 (spawn API surfaces child's
-address); the self-address half of finding 3 already shipped in
-the self-address constructor path and is used here.
+address); the self-address half of finding 3 already shipped as
+the `register_with_capacity_using` constructor and is used here.

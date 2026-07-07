@@ -1,7 +1,7 @@
 //! Bounded, caller-owned retry against a flaky downstream — with
 //! idempotency named in the message, not inferred by a helper.
 //!
-//! This is the small companion to the admission policy layer (the admission policy layer):
+//! This is the small companion to the admission policy layer:
 //! when a downstream replies `Full`, the relay does **not** retry on its
 //! own. It consults an explicit [`tina_runtime::FullHandling`] budget
 //! built from a [`tina::time::Backoff`], and only because the *caller*

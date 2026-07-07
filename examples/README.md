@@ -16,7 +16,7 @@ Larger app-shaped probes live in [`systems/`](systems/). These
 "system specimens" combine several Tina parts at once so cheap model
 work can pull on rough edges before they become design debt.
 
-the cross-shard child ownership's cross-shard child ownership specimen lives at
+The cross-shard child ownership specimen lives at
 [`specimen_cross_shard_child_ownership/`](specimen_cross_shard_child_ownership/).
 It prints:
 

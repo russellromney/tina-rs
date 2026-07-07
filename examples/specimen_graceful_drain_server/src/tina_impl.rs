@@ -11,7 +11,7 @@
 //! - Shutdown is a message. No `select!`, no `oneshot`, no second
 //!   channel; the same mailbox carries jobs and shutdown.
 //! - "In flight" and "pending in queue" are one number, named by
-//!   `SingleCallGate` (the single-call gate invariant). Drain truth is local: the
+//!   `SingleCallGate`. Drain truth is local: the
 //!   gate becomes idle.
 //! - Final `Report` reaches the host via `observe_result`. No
 //!   `Arc<Mutex>`, no mpsc.
@@ -41,7 +41,7 @@ enum WorkerMsg {
 
 struct Worker {
     work: Duration,
-    /// the single-call gate invariant: names the "one Tick in flight, plus N
+    /// The single-call gate invariant names the "one Tick in flight, plus N
     /// queued" invariant.
     gate: SingleCallGate,
     processed: u32,

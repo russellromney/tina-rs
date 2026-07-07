@@ -99,7 +99,7 @@ producer side uses `try_send_outcome` + `HostBurstOutcomes`
 (the host burst outcome helpers) so the per-shard admit / mailbox-full /
 ingress-full counts come back as a typed snapshot, no observer
 closure. The Worker's "one Tick in flight, plus N queued"
-invariant is `SingleCallGate` (the single-call gate invariant).
+invariant is `SingleCallGate`.
 
 ## Discussion
 
@@ -114,8 +114,8 @@ What feels better:
   state machine where "drain mode" is invisible to the rest of the
   isolate.
 - **The final report reaches the host without an mpsc.**
-  `stop_with(report)` + `observe_result` is the blessed the typed stop-result
-  path path.
+  `stop_with(report)` + `observe_result` is the blessed typed stop-result
+  path.
 
 What feels worse:
 
