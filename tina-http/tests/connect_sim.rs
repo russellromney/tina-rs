@@ -66,7 +66,7 @@ impl Isolate for DnsProbe {
     type Send = Outbound<Infallible>;
     type Spawn = Infallible;
     type SpawnObserved = Infallible;
-    type Call = RuntimeCall<ProbeMsg>;
+    type Io = RuntimeCall<ProbeMsg>;
     type Fact = Infallible;
     type Shard = TestShard;
 

@@ -296,10 +296,10 @@ match call_ctx
 {
     Ok(effect) => effect,
     Err(PendingCancelableInsertError::Full { token }) => {
-        reply_to_request(token.into_request_context(), Reply::Busy)
+        reply_to(token.into_request_context(), Reply::Busy)
     }
     Err(PendingCancelableInsertError::DuplicateKey { token }) => {
-        reply_to_request(token.into_request_context(), Reply::Duplicate)
+        reply_to(token.into_request_context(), Reply::Duplicate)
     }
 }
 ```

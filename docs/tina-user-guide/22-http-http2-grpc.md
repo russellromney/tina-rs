@@ -186,7 +186,7 @@ TCP timing, so some live-only physics has no sim counterpart.
 ## Stable tags
 
 The trace encodes effect kinds, runtime event kinds, and protocol fact
-families with stable single-byte tags. Phase 112 adds:
+families with stable single-byte tags:
 
 - `EffectKind::Fact` = 13
 - `RuntimeEventKind::FactObserved` event tag = 36

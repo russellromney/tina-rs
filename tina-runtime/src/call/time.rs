@@ -17,7 +17,7 @@ use super::{
 /// This is the small common path for "wait, then continue" state machines.
 pub fn sleep_then<I, M>(after: Duration, message: M) -> tina::Effect<I>
 where
-    I: tina::Isolate<Message = M, Call = RuntimeCall<M>>,
+    I: tina::Isolate<Message = M, Io = RuntimeCall<M>>,
     M: 'static,
 {
     sleep(after).then(move |_| message)
@@ -65,7 +65,7 @@ impl<T, E> TypedCall<T, E> {
     )]
     pub fn reply<I, F, M>(self, translator: F) -> tina::Effect<I>
     where
-        I: tina::Isolate<Message = M, Call = RuntimeCall<M>>,
+        I: tina::Isolate<Message = M, Io = RuntimeCall<M>>,
         F: FnOnce(Result<T, E>) -> M + 'static,
         T: 'static,
         E: 'static,
@@ -76,13 +76,13 @@ impl<T, E> TypedCall<T, E> {
     /// Turns this prepared runtime-owned call into one ordinary later message.
     pub fn then<I, F, M>(self, translator: F) -> tina::Effect<I>
     where
-        I: tina::Isolate<Message = M, Call = RuntimeCall<M>>,
+        I: tina::Isolate<Message = M, Io = RuntimeCall<M>>,
         F: FnOnce(Result<T, E>) -> M + 'static,
         T: 'static,
         E: 'static,
     {
         let decode = self.decode;
-        tina::Effect::Call(RuntimeCall::new(self.request, move |output| {
+        tina::Effect::Io(RuntimeCall::new(self.request, move |output| {
             translator(decode(output))
         }))
     }
@@ -99,7 +99,7 @@ impl<T, E> TypedCall<T, E> {
         translator: F,
     ) -> tina::Effect<I>
     where
-        I: tina::Isolate<Message = M, Call = RuntimeCall<M>>,
+        I: tina::Isolate<Message = M, Io = RuntimeCall<M>>,
         F: FnOnce(tina::RequestContext<Q>, Result<T, E>) -> M + 'static,
         T: 'static,
         E: 'static,
@@ -117,7 +117,7 @@ impl<T, E> TypedCall<T, E> {
         translator: F,
     ) -> tina::Effect<I>
     where
-        I: tina::Isolate<Message = M, Call = RuntimeCall<M>>,
+        I: tina::Isolate<Message = M, Io = RuntimeCall<M>>,
         F: FnOnce(tina::RequestContext<Q>, Result<T, E>) -> M + 'static,
         T: 'static,
         E: 'static,
@@ -125,7 +125,7 @@ impl<T, E> TypedCall<T, E> {
         Q: 'static,
     {
         let decode = self.decode;
-        tina::Effect::Call(RuntimeCall::new(self.request, move |output| {
+        tina::Effect::Io(RuntimeCall::new(self.request, move |output| {
             translator(req, decode(output))
         }))
     }
@@ -141,10 +141,10 @@ where
     ///
     /// This does not reply to the caller by itself. The generated message must
     /// later consume the [`RequestContext`](tina::RequestContext) with
-    /// `reply_to_request`.
+    /// `reply_to`.
     pub fn reply<I, F, M>(self, translator: F) -> tina::Effect<I>
     where
-        I: tina::Isolate<Message = M, Reply = Q, Call = RuntimeCall<M>>,
+        I: tina::Isolate<Message = M, Reply = Q, Io = RuntimeCall<M>>,
         F: FnOnce(tina::RequestContext<Q>, Result<T, E>) -> M + 'static,
         M: 'static,
     {
@@ -161,7 +161,7 @@ where
     /// Builds a request effect whose continuation carries caller authority.
     pub fn reply<I, F, M>(self, translator: F) -> tina::RequestEffect<I>
     where
-        I: tina::Isolate<Message = M, Reply = Q, Call = RuntimeCall<M>>,
+        I: tina::Isolate<Message = M, Reply = Q, Io = RuntimeCall<M>>,
         F: FnOnce(tina::RequestContext<Q>, Result<T, E>) -> M + 'static,
         M: 'static,
     {
@@ -235,7 +235,7 @@ impl SleepCall {
     /// [`TypedCall::then`] for the timer payload.
     pub fn then<I, F, M>(self, translator: F) -> tina::Effect<I>
     where
-        I: tina::Isolate<Message = M, Call = RuntimeCall<M>>,
+        I: tina::Isolate<Message = M, Io = RuntimeCall<M>>,
         F: FnOnce(Result<(), CallError>) -> M + 'static,
     {
         self.inner.then(translator)
@@ -248,7 +248,7 @@ impl SleepCall {
         translator: F,
     ) -> tina::Effect<I>
     where
-        I: tina::Isolate<Message = M, Call = RuntimeCall<M>>,
+        I: tina::Isolate<Message = M, Io = RuntimeCall<M>>,
         F: FnOnce(tina::RequestContext<Q>, Result<(), CallError>) -> M + 'static,
         M: 'static,
         Q: 'static,
@@ -282,7 +282,7 @@ impl SleepCall {
     /// #     type Send = tina::Outbound<Infallible>;
     /// #     type Spawn = Infallible;
     /// #     type SpawnObserved = Infallible;
-    /// #     type Call = RuntimeCall<Msg>;
+    /// #     type Io = RuntimeCall<Msg>;
     /// #     type Fact = Infallible;
     /// #     type Shard = tina::SingleShard;
     /// #     fn handle(&mut self, _m: Msg, _ctx: &mut Context<'_, Self::Shard, ()>) -> Effect<Self> {
@@ -310,7 +310,7 @@ impl SleepCall {
     /// #     type Send = tina::Outbound<Infallible>;
     /// #     type Spawn = Infallible;
     /// #     type SpawnObserved = Infallible;
-    /// #     type Call = RuntimeCall<Msg>;
+    /// #     type Io = RuntimeCall<Msg>;
     /// #     type Shard = tina::SingleShard;
     /// #     fn handle(&mut self, _m: Msg, _ctx: &mut Context<'_, Self::Shard, ()>) -> Effect<Self> {
     /// #         tina::noop()
@@ -337,7 +337,7 @@ impl SleepCall {
     /// #     type Send = tina::Outbound<Infallible>;
     /// #     type Spawn = Infallible;
     /// #     type SpawnObserved = Infallible;
-    /// #     type Call = RuntimeCall<Msg>;
+    /// #     type Io = RuntimeCall<Msg>;
     /// #     type Shard = tina::SingleShard;
     /// #     fn handle(&mut self, _m: Msg, _ctx: &mut Context<'_, Self::Shard, ()>) -> Effect<Self> {
     /// #         tina::noop()
@@ -349,7 +349,7 @@ impl SleepCall {
     /// ```
     pub fn then_event<I, F, M>(self, event: F) -> tina::Effect<I>
     where
-        I: tina::Isolate<Message = M, Call = RuntimeCall<M>>,
+        I: tina::Isolate<Message = M, Io = RuntimeCall<M>>,
         F: FnOnce() -> M + 'static,
         M: 'static,
     {

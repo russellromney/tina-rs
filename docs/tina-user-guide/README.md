@@ -62,8 +62,8 @@ understand Tina core.
 
 For runnable specimens, see repo-root `examples/`.
 
-If Tina feels awkward, record the paper cut in `examples/FINDINGS.md` or the
-next phase plan. Docs explain the current blessed shape. Docs are not the
+If Tina feels awkward, record the paper cut in `examples/FINDINGS.md` or a
+focused design note. Docs explain the current blessed shape. Docs are not the
 paper-cut inbox.
 
 The docs are intentionally plain. When in doubt, prefer a boring message enum,

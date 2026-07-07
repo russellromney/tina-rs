@@ -140,7 +140,7 @@ impl Isolate for OrderIsolate {
     type Send = Outbound<NeverOutbound>;
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
-    type Call = Infallible;
+    type Io = Infallible;
     type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 
@@ -165,7 +165,7 @@ impl Isolate for StopIsolate {
     type Send = Outbound<NeverOutbound>;
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
-    type Call = Infallible;
+    type Io = Infallible;
     type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 
@@ -196,7 +196,7 @@ impl Isolate for StopAndAudit {
     type Send = Outbound<NeverOutbound>;
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
-    type Call = Infallible;
+    type Io = Infallible;
     type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 
@@ -226,7 +226,7 @@ impl Isolate for StopSender {
     type Send = Outbound<StopAuditMsg>;
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
-    type Call = Infallible;
+    type Io = Infallible;
     type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 

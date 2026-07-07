@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use http::StatusCode;
 use tina::prelude::*;
-use tina::{CallContext, RequestContext, reply_to_request};
+use tina::{CallContext, RequestContext, reply_to};
 use tina_http::{
     BodyMetrics, HttpConnectionMsg, HttpLimits, HttpListener, HttpListenerMsg, HttpRequest,
     HttpRequestBody, HttpResponse, RequestChunkReply, ResponseChunkMsg, ResponseChunkReply,
@@ -40,7 +40,7 @@ impl Isolate for EchoLen {
         reply: HttpResponse,
         send: tina::Outbound<Infallible>,
         spawn: Infallible,
-        call: Infallible,
+        io: Infallible,
         shard: TestShard,
     }
 
@@ -297,7 +297,7 @@ impl Isolate for BigBufferedResponse {
         reply: HttpResponse,
         send: tina::Outbound<Infallible>,
         spawn: Infallible,
-        call: Infallible,
+        io: Infallible,
         shard: TestShard,
     }
 
@@ -445,7 +445,7 @@ impl Isolate for StreamingConsumer {
         reply: HttpResponse,
         send: tina::Outbound<Infallible>,
         spawn: Infallible,
-        call: RuntimeCall<StreamMsg>,
+        io: RuntimeCall<StreamMsg>,
         shard: TestShard,
     }
 
@@ -480,7 +480,7 @@ impl Isolate for StreamingConsumer {
                 }
                 CallOutcome::Replied(RequestChunkReply::Eof) => {
                     self.pending_source = None;
-                    reply_to_request(
+                    reply_to(
                         request,
                         HttpResponse::with_text(StatusCode::OK, self.total.to_string()),
                     )
@@ -493,7 +493,7 @@ impl Isolate for StreamingConsumer {
                 | CallOutcome::Rejected(_)
                 | CallOutcome::Timeout => {
                     self.pending_source = None;
-                    reply_to_request(request, HttpResponse::internal_error())
+                    reply_to(request, HttpResponse::internal_error())
                 }
             },
         }
@@ -747,7 +747,7 @@ impl Isolate for ChunkProducer {
         reply: ResponseChunkReply,
         send: tina::Outbound<Infallible>,
         spawn: Infallible,
-        call: Infallible,
+        io: Infallible,
         shard: TestShard,
     }
 
@@ -786,7 +786,7 @@ impl Isolate for StreamingService {
         reply: HttpResponse,
         send: tina::Outbound<Infallible>,
         spawn: Infallible,
-        call: Infallible,
+        io: Infallible,
         shard: TestShard,
     }
 

@@ -1,4 +1,4 @@
-//! Multi-shard explicit-step simulator extracted from lib.rs (phase 055).
+//! Multi-shard explicit-step simulator extracted from lib.rs.
 //!
 //! Houses `MultiShardSimulator`, `MultiShardSimulatorConfig` impls, the
 //! `RemoteQueueIndexes` / `RemoteQueues` type aliases, and the
@@ -184,13 +184,9 @@ where
         isolate: I,
     ) -> Address<Msg, I::Reply>
     where
-        I: Isolate<
-                Message = Msg,
-                Shard = S,
-                Send = TinaOutbound<Outbound>,
-                Call = RuntimeCall<Msg>,
-            > + 'static,
-        I::Call: RuntimeCallable,
+        I: Isolate<Message = Msg, Shard = S, Send = TinaOutbound<Outbound>, Io = RuntimeCall<Msg>>
+            + 'static,
+        I::Io: RuntimeCallable,
         I::Spawn: IntoErasedSpawn<S> + 'static,
         I::SpawnObserved: IntoErasedSpawnObserved<S, I::Message> + 'static,
         I::SpawnObservedRemote: IntoSimRemoteSpawnObserved<S, I::Message> + 'static,
@@ -213,13 +209,9 @@ where
         mailbox_capacity: usize,
     ) -> Address<Msg, I::Reply>
     where
-        I: Isolate<
-                Message = Msg,
-                Shard = S,
-                Send = TinaOutbound<Outbound>,
-                Call = RuntimeCall<Msg>,
-            > + 'static,
-        I::Call: RuntimeCallable,
+        I: Isolate<Message = Msg, Shard = S, Send = TinaOutbound<Outbound>, Io = RuntimeCall<Msg>>
+            + 'static,
+        I::Io: RuntimeCallable,
         I::Spawn: IntoErasedSpawn<S> + 'static,
         I::SpawnObserved: IntoErasedSpawnObserved<S, I::Message> + 'static,
         I::SpawnObservedRemote: IntoSimRemoteSpawnObserved<S, I::Message> + 'static,

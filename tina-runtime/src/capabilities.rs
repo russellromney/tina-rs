@@ -411,10 +411,9 @@ const PROCESS_LANE_JUSTIFICATION: &str = "fork/exec/wait/reap are OS process lif
 
 /// Substrate posture for one runtime-owned rail.
 ///
-/// This is the Phase 140 question made machine-readable: does this rail ride
-/// the per-shard Betelgeuse completion substrate, or is it a bounded
-/// blocking/fallback lane that stays off the substrate for a written reason?
-/// Every Tina-owned rail must answer with exactly one of these.
+/// Whether this rail rides the per-shard Betelgeuse completion substrate or is
+/// a bounded blocking/fallback lane that stays off the substrate for a written
+/// reason. Every Tina-owned rail must answer with exactly one of these.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RailClass {
     /// Rides the per-shard Betelgeuse completion substrate on the shard
@@ -469,7 +468,7 @@ impl RailClass {
 /// ("is this supported? sim-backed? cancel-backed? drain-backed?")
 /// against one stable vocabulary instead of matching four enums by hand.
 ///
-/// [`RailClass`] answers the Phase 140 substrate question, and
+/// [`RailClass`] answers the substrate posture question, and
 /// [`Self::justification`] carries the written reason for any rail that is a
 /// bounded blocking or fallback lane rather than substrate-backed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

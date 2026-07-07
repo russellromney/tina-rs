@@ -1,4 +1,4 @@
-//! Admission and rate policy types (Phase 118).
+//! Admission and rate policy types.
 //!
 //! User-facing pressure policies built on top of the existing
 //! [`LocalPermitGate`], [`SharedCapacityScope`], [`crate::FullHandling`], and

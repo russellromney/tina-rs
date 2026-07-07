@@ -62,6 +62,10 @@ enum ServerPolicy {
     ChunkedThenContentLength,
     /// Return a malformed chunked body.
     MalformedChunked,
+    /// Return a partial chunked body, then close the socket.
+    PartialChunkedThenClose,
+    /// Return a complete chunked body, then close the socket.
+    CompleteChunkedThenClose,
     /// Return a chunked body larger than the client body cap.
     LargeChunked,
     /// Return a valid chunked body plus `Connection: close`.
@@ -238,6 +242,14 @@ fn handle_connection(
                 response.extend_from_slice(b"Transfer-Encoding: chunked\r\n\r\n");
                 response.extend_from_slice(b"5\r\nhelloX\r\n0\r\n\r\n");
             }
+            ServerPolicy::PartialChunkedThenClose => {
+                response.extend_from_slice(b"Transfer-Encoding: chunked\r\n\r\n");
+                response.extend_from_slice(b"5\r\nhe");
+            }
+            ServerPolicy::CompleteChunkedThenClose => {
+                response.extend_from_slice(b"Transfer-Encoding: chunked\r\n\r\n");
+                response.extend_from_slice(b"5\r\nhello\r\n0\r\n\r\n");
+            }
             ServerPolicy::LargeChunked => {
                 response.extend_from_slice(b"Transfer-Encoding: chunked\r\n\r\n");
                 response.extend_from_slice(b"20\r\n01234567890123456789012345678901\r\n0\r\n\r\n");
@@ -284,6 +296,8 @@ fn handle_connection(
             ServerPolicy::CloseAfterFirst
             | ServerPolicy::SilentlyCloseAfterFirst
             | ServerPolicy::ChunkedConnectionClose
+            | ServerPolicy::PartialChunkedThenClose
+            | ServerPolicy::CompleteChunkedThenClose
             | ServerPolicy::ChunkedSmugglingShape => return,
             ServerPolicy::Chunked
             | ServerPolicy::ChunkedThenContentLength
@@ -470,7 +484,7 @@ impl Isolate for Driver {
         reply: (),
         send: tina::Outbound<Infallible>,
         spawn: Infallible,
-        call: RuntimeCall<DriverMsg>,
+        io: RuntimeCall<DriverMsg>,
         shard: TestShard,
     }
 
@@ -684,7 +698,7 @@ impl Isolate for RejectingPool {
         reply: WorkerPoolReply<KeepaliveConnAddr>,
         send: tina::Outbound<Infallible>,
         spawn: Infallible,
-        call: RuntimeCall<WorkerPoolMsg<KeepaliveConnAddr>>,
+        io: RuntimeCall<WorkerPoolMsg<KeepaliveConnAddr>>,
         shard: TestShard,
     }
 
@@ -1039,6 +1053,112 @@ fn malformed_chunked_response_errors_and_retires() {
         DriverEvent::RequestErr { message, .. } => {
             assert!(message.contains("MalformedChunkedBody"), "{message}");
             assert!(message.contains("must_retire=true"), "{message}");
+        }
+        other => panic!("unexpected event {other:?}"),
+    }
+
+    rig.shutdown();
+    server.stop();
+}
+
+#[test]
+fn partial_chunked_peer_close_errors_and_retires() {
+    let server = ScriptedServer::start(ServerPolicy::PartialChunkedThenClose);
+    let rig = TestRig::start();
+    let pool = rig.build_pool(HttpTarget::http(server.addr), 1, 4);
+    let (driver, _state, rx) = rig.driver(&pool);
+
+    for id in 1..=2 {
+        let _ = rig.rt().try_send(
+            driver,
+            DriverMsg::Acquire {
+                id,
+                timeout: Duration::from_secs(2),
+            },
+        );
+        wait_for_event(
+            &rx,
+            |e| matches!(e, DriverEvent::Acquired { id: i, .. } if *i == id),
+        );
+        let _ = rig.rt().try_send(
+            driver,
+            DriverMsg::Request {
+                id,
+                request: req(),
+                request_timeout: Duration::from_secs(2),
+                call_timeout: Duration::from_secs(2),
+            },
+        );
+        let event = wait_for_event(
+            &rx,
+            |e| matches!(e, DriverEvent::RequestErr { id: i, .. } if *i == id),
+        );
+        match event {
+            DriverEvent::RequestErr { message, .. } => {
+                assert!(message.contains("Closed"), "{message}");
+                assert!(message.contains("must_retire=true"), "{message}");
+            }
+            other => panic!("unexpected event {other:?}"),
+        }
+        let _ = rig.rt().try_send(
+            driver,
+            DriverMsg::Release {
+                id,
+                disposition: ReleaseDisposition::Reuse,
+            },
+        );
+        wait_for_event(
+            &rx,
+            |e| matches!(e, DriverEvent::Released { id: i, .. } if *i == id),
+        );
+    }
+
+    assert_eq!(server.requests(), 2);
+    assert_eq!(
+        server.accepts(),
+        2,
+        "truncated chunked close must retire before the next request"
+    );
+
+    rig.shutdown();
+    server.stop();
+}
+
+#[test]
+fn complete_chunked_peer_close_decodes_and_retires() {
+    let server = ScriptedServer::start(ServerPolicy::CompleteChunkedThenClose);
+    let rig = TestRig::start();
+    let pool = rig.build_pool(HttpTarget::http(server.addr), 1, 4);
+    let (driver, _state, rx) = rig.driver(&pool);
+
+    let _ = rig.rt().try_send(
+        driver,
+        DriverMsg::Acquire {
+            id: 1,
+            timeout: Duration::from_secs(2),
+        },
+    );
+    wait_for_event(&rx, |e| matches!(e, DriverEvent::Acquired { id: 1, .. }));
+    let _ = rig.rt().try_send(
+        driver,
+        DriverMsg::Request {
+            id: 1,
+            request: req(),
+            request_timeout: Duration::from_secs(2),
+            call_timeout: Duration::from_secs(2),
+        },
+    );
+    let event = wait_for_event(&rx, |e| matches!(e, DriverEvent::Request { id: 1, .. }));
+    match event {
+        DriverEvent::Request {
+            status,
+            body,
+            must_retire,
+            ..
+        } => {
+            assert_eq!(status, 200);
+            assert_eq!(&body, b"hello");
+            assert!(must_retire);
         }
         other => panic!("unexpected event {other:?}"),
     }

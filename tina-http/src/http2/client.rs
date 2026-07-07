@@ -34,7 +34,7 @@ use std::time::Duration;
 
 use http::{HeaderMap, Method, StatusCode};
 use tina::prelude::*;
-use tina::reply_to_request;
+use tina::reply_to;
 use tina_runtime::{
     CallError, CallOutcome, Http2CloseReason, Http2ResetReason, Http2StreamId,
     ProtocolConnectionId, ProtocolDirection, ProtocolFact, StreamId, TcpReadBufReply,
@@ -886,7 +886,7 @@ impl<S: Shard + 'static> Isolate for Http2ClientConnection<S> {
         reply: Http2ClientReply,
         send: tina::Outbound<Infallible>,
         spawn: Infallible,
-        call: tina_runtime::RuntimeCall<Http2ClientMsg>,
+        io: tina_runtime::RuntimeCall<Http2ClientMsg>,
         fact: ProtocolFact,
         shard: S,
     }
@@ -1105,7 +1105,7 @@ impl<S: Shard + 'static> Http2ClientConnection<S> {
         if self.stream.is_none() {
             if self.pre_connect_queue_full() {
                 self.report.admission_full += 1;
-                return reply_to_request::<Self>(
+                return reply_to::<Self>(
                     waiter,
                     Http2ClientReply::Outcome {
                         stream_id: 0,
@@ -1131,7 +1131,7 @@ impl<S: Shard + 'static> Http2ClientConnection<S> {
         if self.stream.is_none() {
             if self.pre_connect_queue_full() {
                 self.report.admission_full += 1;
-                return reply_to_request::<Self>(
+                return reply_to::<Self>(
                     waiter,
                     Http2ClientReply::Outcome {
                         stream_id: 0,
@@ -1157,7 +1157,7 @@ impl<S: Shard + 'static> Http2ClientConnection<S> {
         if self.stream.is_none() {
             if self.pre_connect_queue_full() {
                 self.report.admission_full += 1;
-                return reply_to_request::<Self>(
+                return reply_to::<Self>(
                     waiter,
                     Http2ClientReply::Outcome {
                         stream_id: 0,
@@ -1459,7 +1459,7 @@ impl<S: Shard + 'static> Http2ClientConnection<S> {
         if self.stream.is_none() {
             if self.pre_connect_queue_full() {
                 self.report.admission_full += 1;
-                return reply_to_request::<Self>(
+                return reply_to::<Self>(
                     waiter,
                     Http2ClientReply::Outcome {
                         stream_id: 0,
@@ -1639,7 +1639,7 @@ impl<S: Shard + 'static> Http2ClientConnection<S> {
                 .response_pull
                 .take()
                 .expect("pull present");
-            effects.push(reply_to_request::<Self>(
+            effects.push(reply_to::<Self>(
                 pull,
                 Http2ClientReply::ResponseChunk {
                     stream_id,
@@ -1702,7 +1702,7 @@ impl<S: Shard + 'static> Http2ClientConnection<S> {
             reason: Http2CloseReason::EndStream,
         }));
         if let Some(pull) = stream.response_pull.take() {
-            effects.push(reply_to_request::<Self>(
+            effects.push(reply_to::<Self>(
                 pull,
                 Http2ClientReply::ResponseChunk {
                     stream_id,
@@ -1731,12 +1731,12 @@ impl<S: Shard + 'static> Http2ClientConnection<S> {
     ) {
         let stream_id = stream.id;
         if let Some(waiter) = stream.waiter.take() {
-            effects.push(reply_to_request::<Self>(
+            effects.push(reply_to::<Self>(
                 waiter,
                 Http2ClientReply::Outcome { stream_id, outcome },
             ));
         } else if let Some(pull) = stream.response_pull.take() {
-            effects.push(reply_to_request::<Self>(
+            effects.push(reply_to::<Self>(
                 pull,
                 Http2ClientReply::ResponseChunk {
                     stream_id,
@@ -2184,7 +2184,7 @@ impl<S: Shard + 'static> Http2ClientConnection<S> {
         let headers = self.streams[idx].response_headers.clone();
         self.streams[idx].response_head_sent = true;
         if let Some(waiter) = self.streams[idx].waiter.take() {
-            effects.push(reply_to_request::<Self>(
+            effects.push(reply_to::<Self>(
                 waiter,
                 Http2ClientReply::Outcome {
                     stream_id,
@@ -2443,7 +2443,7 @@ impl<S: Shard + 'static> Http2ClientConnection<S> {
             None => Http2ClientOutcome::ProtocolError(Http2ProtocolError::InvalidPseudoHeaders),
         };
         if let Some(waiter) = stream.waiter.take() {
-            effects.push(reply_to_request::<Self>(
+            effects.push(reply_to::<Self>(
                 waiter,
                 Http2ClientReply::Outcome { stream_id, outcome },
             ));
@@ -2479,7 +2479,7 @@ impl<S: Shard + 'static> Http2ClientConnection<S> {
         let mut effects: Vec<Effect<Self>> = Vec::new();
         let queued = std::mem::take(&mut self.queued_submits);
         for (_, waiter) in queued {
-            effects.push(reply_to_request::<Self>(
+            effects.push(reply_to::<Self>(
                 waiter,
                 Http2ClientReply::Outcome {
                     stream_id: 0,
@@ -2489,7 +2489,7 @@ impl<S: Shard + 'static> Http2ClientConnection<S> {
         }
         let queued_grpc_unary = std::mem::take(&mut self.queued_grpc_unary);
         for (_, waiter) in queued_grpc_unary {
-            effects.push(reply_to_request::<Self>(
+            effects.push(reply_to::<Self>(
                 waiter,
                 Http2ClientReply::Outcome {
                     stream_id: 0,
@@ -2499,7 +2499,7 @@ impl<S: Shard + 'static> Http2ClientConnection<S> {
         }
         let queued_streaming = std::mem::take(&mut self.queued_streaming);
         for (_, waiter) in queued_streaming {
-            effects.push(reply_to_request::<Self>(
+            effects.push(reply_to::<Self>(
                 waiter,
                 Http2ClientReply::Outcome {
                     stream_id: 0,
@@ -2509,7 +2509,7 @@ impl<S: Shard + 'static> Http2ClientConnection<S> {
         }
         let queued_open = std::mem::take(&mut self.queued_open);
         for (_, waiter) in queued_open {
-            effects.push(reply_to_request::<Self>(
+            effects.push(reply_to::<Self>(
                 waiter,
                 Http2ClientReply::Outcome {
                     stream_id: 0,
@@ -2517,7 +2517,7 @@ impl<S: Shard + 'static> Http2ClientConnection<S> {
                 },
             ));
         }
-        let streams: Vec<_> = self.streams.drain(..).collect();
+        let streams: Vec<_> = std::mem::take(&mut self.streams);
         self.stream_index.clear();
         for mut stream in streams {
             self.cancel_request_source(&stream, &mut effects);
@@ -2542,7 +2542,7 @@ impl<S: Shard + 'static> Http2ClientConnection<S> {
             _ => ERR_PROTOCOL_ERROR,
         };
         self.enqueue_frame(goaway_frame(self.next_stream_id, code));
-        let streams: Vec<_> = self.streams.drain(..).collect();
+        let streams: Vec<_> = std::mem::take(&mut self.streams);
         self.stream_index.clear();
         for mut stream in streams {
             self.cancel_request_source(&stream, &mut effects);
@@ -2715,7 +2715,7 @@ impl<S: Shard + 'static> Http2ClientConnection<S> {
 
     fn close_with(&mut self, outcome: Http2ClientOutcome) -> Effect<Self> {
         let mut effects: Vec<Effect<Self>> = Vec::new();
-        let streams: Vec<_> = self.streams.drain(..).collect();
+        let streams: Vec<_> = std::mem::take(&mut self.streams);
         self.stream_index.clear();
         for mut stream in streams {
             self.cancel_request_source(&stream, &mut effects);
@@ -2723,7 +2723,7 @@ impl<S: Shard + 'static> Http2ClientConnection<S> {
         }
         let queued = std::mem::take(&mut self.queued_submits);
         for (_, waiter) in queued {
-            effects.push(reply_to_request::<Self>(
+            effects.push(reply_to::<Self>(
                 waiter,
                 Http2ClientReply::Outcome {
                     stream_id: 0,
@@ -2733,7 +2733,7 @@ impl<S: Shard + 'static> Http2ClientConnection<S> {
         }
         let queued_grpc_unary = std::mem::take(&mut self.queued_grpc_unary);
         for (_, waiter) in queued_grpc_unary {
-            effects.push(reply_to_request::<Self>(
+            effects.push(reply_to::<Self>(
                 waiter,
                 Http2ClientReply::Outcome {
                     stream_id: 0,
@@ -2743,7 +2743,7 @@ impl<S: Shard + 'static> Http2ClientConnection<S> {
         }
         let queued_streaming = std::mem::take(&mut self.queued_streaming);
         for (_, waiter) in queued_streaming {
-            effects.push(reply_to_request::<Self>(
+            effects.push(reply_to::<Self>(
                 waiter,
                 Http2ClientReply::Outcome {
                     stream_id: 0,
@@ -2753,7 +2753,7 @@ impl<S: Shard + 'static> Http2ClientConnection<S> {
         }
         let queued_open = std::mem::take(&mut self.queued_open);
         for (_, waiter) in queued_open {
-            effects.push(reply_to_request::<Self>(
+            effects.push(reply_to::<Self>(
                 waiter,
                 Http2ClientReply::Outcome {
                     stream_id: 0,
@@ -2800,10 +2800,7 @@ fn reject_outcome<S: Shard + 'static>(
     stream_id: u32,
     outcome: Http2ClientOutcome,
 ) -> Effect<Http2ClientConnection<S>> {
-    reply_to_request::<Http2ClientConnection<S>>(
-        waiter,
-        Http2ClientReply::Outcome { stream_id, outcome },
-    )
+    reply_to::<Http2ClientConnection<S>>(waiter, Http2ClientReply::Outcome { stream_id, outcome })
 }
 
 fn encode_request_headers(target: &Http2Target, req: &Http2ClientRequest) -> Vec<u8> {

@@ -32,7 +32,7 @@ renamed_tina::flow! {
     message = DriverMsg,
     reply = u32,
     send = Outbound<Infallible>,
-    call = renamed_tina_runtime::RuntimeCall<DriverMsg>
+    io = renamed_tina_runtime::RuntimeCall<DriverMsg>
 )]
 impl Driver {
     fn handle(

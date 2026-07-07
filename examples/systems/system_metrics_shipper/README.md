@@ -134,9 +134,9 @@ What felt rough (with the planned roadmap row that already names the fix):
   admission, `flush_tick.clear()` invalidates pending timer
   continuations, the `Stop` handler stashes its `RequestContext`, and
   the next `FlushDone` calls `DrainState::finish()` and answers via
-  `reply_to_request`. Ordering is visible, no hidden close.
+  `reply_to`. Ordering is visible, no hidden close.
 
-Closed by Phase 106 (lifecycle, health, topology):
+Closed by the lifecycle/health/topology pass (lifecycle, health, topology):
 - The host shutdown sequence now runs through
   `tina_runtime::lifecycle::ShutdownChoreography`. Each step (`DrainInFlight`
   for the shipper's own Stop handshake, `CloseResource sink.isolate`,
@@ -149,7 +149,7 @@ Closed by Phase 106 (lifecycle, health, topology):
   `Lifecycle::{Ready,Draining,Stopped}` so a non-HTTP service reports
   state in the same words as `mini_saas_api`.
 
-Closed by Phase 102 (host-control ergonomics):
+Closed by the host-control ergonomics pass (host-control ergonomics):
 - `Arc::try_unwrap(runtime)` is gone from this specimen. The host now
   takes a cloneable `ThreadedShutdownHandle` from
   `runtime.shutdown_handle()`, calls `request_shutdown()` (nonblocking,
@@ -174,7 +174,7 @@ Tina capability pulled:
 - Runtime-owned timers via `sleep(...).then(...)`.
 - `call(addr, msg, timeout).then(...)` for single-flight downstream
   fan-out with a typed `CallOutcome`.
-- `reply_to_request` for deferred replies held across a continuation.
+- `reply_to` for deferred replies held across a continuation.
 
 Suggested follow-up:
 - The roadmap already names the four primitives that would erase the

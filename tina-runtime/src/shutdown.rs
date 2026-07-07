@@ -1,4 +1,4 @@
-//! Non-consuming shutdown shape for threaded runtimes (phase 102).
+//! Non-consuming shutdown shape for threaded runtimes.
 //!
 //! Both [`crate::ThreadedRuntime`] and [`crate::ThreadedMultiShardRuntime`]
 //! own a [`SharedShutdownState`] behind an `Arc`. The runtime owner controls
@@ -46,9 +46,8 @@ use crate::threaded::{CommandSender, ThreadedCommand};
 ///
 /// This is host-control ergonomics, not a service-drain framework. A
 /// service that needs a graceful application drain still exposes its own
-/// `Stop` / `Drain` protocol (for example a Phase 101
-/// [`crate::DrainState`]); this handle only asks the runtime/control plane
-/// to begin shutdown.
+/// `Stop` / `Drain` protocol (for example [`crate::DrainState`]); this handle
+/// only asks the runtime/control plane to begin shutdown.
 #[derive(Clone)]
 pub struct ThreadedShutdownHandle {
     inner: Arc<dyn ShutdownInner>,

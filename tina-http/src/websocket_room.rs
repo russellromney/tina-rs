@@ -191,7 +191,7 @@ impl WebSocketMemberTable {
         I: Isolate<
                 Message = WebSocketSessionMsg,
                 Send = Outbound<HttpConnectionMsg>,
-                Call = RuntimeCall<WebSocketSessionMsg>,
+                Io = RuntimeCall<WebSocketSessionMsg>,
             >,
         F: Fn(WebSocketSessionHandle) -> HttpConnectionMsg,
     {
@@ -215,7 +215,7 @@ impl WebSocketMemberTable {
         I: Isolate<
                 Message = WebSocketSessionMsg,
                 Send = Outbound<HttpConnectionMsg>,
-                Call = RuntimeCall<WebSocketSessionMsg>,
+                Io = RuntimeCall<WebSocketSessionMsg>,
             >,
     {
         let text = text.into();
@@ -232,7 +232,7 @@ impl WebSocketMemberTable {
         I: Isolate<
                 Message = WebSocketSessionMsg,
                 Send = Outbound<HttpConnectionMsg>,
-                Call = RuntimeCall<WebSocketSessionMsg>,
+                Io = RuntimeCall<WebSocketSessionMsg>,
             >,
     {
         let bytes = bytes.into();
@@ -252,7 +252,7 @@ impl WebSocketMemberTable {
         I: Isolate<
                 Message = WebSocketSessionMsg,
                 Send = Outbound<HttpConnectionMsg>,
-                Call = RuntimeCall<WebSocketSessionMsg>,
+                Io = RuntimeCall<WebSocketSessionMsg>,
             >,
     {
         let reason = reason.into();
@@ -639,7 +639,7 @@ mod tests {
             reply: crate::websocket::WebSocketSessionOutcome,
             send: tina::Outbound<HttpConnectionMsg>,
             spawn: std::convert::Infallible,
-            call: RuntimeCall<WebSocketSessionMsg>,
+            io: RuntimeCall<WebSocketSessionMsg>,
             shard: DummyShard,
         }
 

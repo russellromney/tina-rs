@@ -7,7 +7,7 @@
 //! limiter's deterministic `retry_after`.
 //!
 //! The producer fires non-blocking `try_send_outcome(...)` against a
-//! shared `HostBurstOutcomes` (Phase 062 Rocks 3 & 4). The worker
+//! shared `HostBurstOutcomes` (the host burst outcome helpers). The worker
 //! drains the whole command burst before stepping the isolate, so
 //! jobs past the cap come back as `MailboxFull` /
 //! `IngressFull` in the typed snapshot — both visible at submit.
@@ -208,7 +208,7 @@ pub fn run() -> anyhow::Result<Report> {
     // up to `QUEUE_CAPACITY` and every send past that surfaces
     // `MailboxFull` through the per-send observer the helper installs.
     //
-    // Phase-062 Rock 3: `try_send_outcome` + `HostBurstOutcomes`
+    // the host burst outcome helper: `try_send_outcome` + `HostBurstOutcomes`
     // replace the hand-rolled per-send closure / atomics / observed
     // barrier. The accumulator preserves every truth-typed outcome
     // (admitted, mailbox_full, mailbox_closed, ingress_full,
@@ -228,7 +228,7 @@ pub fn run() -> anyhow::Result<Report> {
     // per `RATE_WINDOW`, so retry until a slot opens. Worst-case wait
     // is `QUEUE_CAPACITY * RATE_WINDOW`, plus jitter.
     //
-    // Phase-062 Rock 4: `send_observed_until` is the BurstClosed-style
+    // the observed-send retry helper: `send_observed_until` is the BurstClosed-style
     // helper. It retries on Full/IngressFull until the deadline and
     // returns typed Closed / WorkerStopped / Timeout. No hidden queue;
     // the control message rides the same bounded data mailbox.

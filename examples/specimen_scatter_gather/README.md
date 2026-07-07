@@ -62,7 +62,7 @@ Each admitted query becomes:
 
 ```rust
 Effect::Batch(workers.iter().map(|w| {
-    Effect::Call(RuntimeCall::isolate_call(
+    Effect::Io(RuntimeCall::isolate_call(
         *w,
         WorkerMsg::Do(payload),
         QUERY_TIMEOUT,

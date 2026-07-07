@@ -2,7 +2,7 @@
 
 Edge-service rate limiter where every tenant owns its own token bucket.
 
-The specimen proves two truths Phase 118 cares about:
+The specimen proves two truths the admission policy layer cares about:
 
 1. **Replay determinism.** `retry_after` is a pure function of `(rate,
    burst, now, key history)`. Two runs over the same script produce

@@ -1,7 +1,5 @@
 # Mailbox Capacity Truth
 
-Phase 047 Rock 2.
-
 This page is the load-bearing rule for sizing isolate mailboxes in Tina:
 
 > **Runtime-call replies, isolate-call replies, and observed-send replies
@@ -36,7 +34,7 @@ For an isolate `A` with mailbox capacity `cap`:
 What does **not** count:
 
 - Effects `A` returns to the runtime (`Effect::Send`, `Effect::Spawn`,
-  `Effect::Call`, ...). Those are interpreted by the runtime; they do not
+  `Effect::Io`, ...). Those are interpreted by the runtime; they do not
   re-enter `A`'s own mailbox.
 - Messages `A` sends to *other* isolates. They go in the *target's*
   mailbox.
@@ -94,8 +92,8 @@ These events are deterministically ordered by `EventId`, so trace consumers
 can ask exact questions like "did this isolate ever lose a reply?" without
 ambiguity.
 
-The `RuntimeEvent::stable_hash` method (Phase 047 Rock 3) produces a
-content-defined fingerprint that includes these rejection reasons, so
+The `RuntimeEvent::stable_hash` method produces a content-defined fingerprint
+that includes these rejection reasons, so
 two replays of the same workload are guaranteed to produce the same
 fingerprint when no overload happens, and a different fingerprint if any
 rejection appears.

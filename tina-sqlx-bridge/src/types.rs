@@ -1060,11 +1060,11 @@ impl std::error::Error for PgConfigError {}
 
 /// Sidecar cancel-pool settings.
 ///
-/// Compatibility-only in Phase 123. The old sidecar path fired
-/// `pg_cancel_backend(pid)` by captured backend PID; that can race
-/// connection reuse unless the exact connection is quarantined. The
-/// bridge still accepts and validates this shape so existing config
-/// files parse, but it does not build a sidecar or send DB cancels.
+/// Compatibility-only. The old sidecar path fired `pg_cancel_backend(pid)` by
+/// captured backend PID; that can race connection reuse unless the exact
+/// connection is quarantined. The bridge still accepts and validates this shape
+/// so existing config files parse, but it does not build a sidecar or send DB
+/// cancels.
 #[derive(Debug, Clone)]
 pub struct PgCancelConfig {
     /// Sidecar pool size. Tiny by default — cancel calls are short
@@ -1195,11 +1195,10 @@ pub struct PgConfig {
     /// further capped to this value, so a caller cannot ask for
     /// `usize::MAX` and force unbounded buffering.
     pub max_response_rows: usize,
-    /// Compatibility field for the disabled DB-side cancel sidecar.
-    /// Phase 123 stopped firing `pg_cancel_backend(pid)` because the
-    /// old implementation could race PID reuse and cancel a later
-    /// query. Default `None`; `Some` validates but is not honored
-    /// until a future quarantine-based cancel path exists.
+    /// Compatibility field for the disabled DB-side cancel sidecar. The old
+    /// implementation could race PID reuse and cancel a later query. Default
+    /// `None`; `Some` validates but is not honored until a quarantine-based
+    /// cancel path exists.
     ///
     /// **Only honored on [`crate::PgWorker::install`].** The
     /// supplied-pool path ([`crate::PgWorker::install_with_pool`])
@@ -1207,8 +1206,8 @@ pub struct PgConfig {
     /// sidecar pool without an owned URL, and the caller already
     /// owns connection lifetimes.
     ///
-    /// `db_cancels_sent` remains zero in Phase 123. Tina-side timeout
-    /// means "stop waiting"; Postgres may keep running.
+    /// `db_cancels_sent` remains zero. Tina-side timeout means "stop
+    /// waiting"; Postgres may keep running.
     pub cancel: Option<PgCancelConfig>,
 }
 
@@ -1283,11 +1282,10 @@ impl PgConfig {
         self
     }
 
-    /// Records a future DB-side cancellation preference. In Phase
-    /// 123 this is a compatibility no-op: the bridge validates the
-    /// config but does not fire `pg_cancel_backend(pid)` because the
-    /// old sidecar path could cancel a later query on a reused
-    /// backend PID.
+    /// Records a future DB-side cancellation preference. This is a
+    /// compatibility no-op: the bridge validates the config but does not fire
+    /// `pg_cancel_backend(pid)` because the old sidecar path could cancel a
+    /// later query on a reused backend PID.
     ///
     /// Tina-side timeout still settles the caller promptly, while
     /// the SQLx slot remains occupied until physical terminal.

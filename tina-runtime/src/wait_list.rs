@@ -1,15 +1,14 @@
 //! Many-callers-wait-for-one-key helper (mechanism name).
 //!
-//! New code should reach for [`crate::SharedWork`] first: it is the
-//! user-facing wrapper for "many callers wait for one result" and reads
-//! the way the user describes the job. `WaitList` stays public for call
-//! sites that read better under the lower-level name.
+//! New code should reach for [`crate::SharedWork`]: it is the public wrapper
+//! for "many callers wait for one result" and reads the way the user describes
+//! the job. `WaitList` is the private backing mechanism.
 //!
 //! Quick map:
 //!
 //! - many callers wait for one result → [`crate::SharedWork`];
 //! - one caller owns one reply slot by id → [`crate::PendingReplies`];
-//! - lower-level "wait list" name → [`WaitList`].
+//! - lower-level backing mechanism → [`WaitList`].
 //!
 //! A `WaitList<K, R>` parks multiple callers keyed by some natural value
 //! (a cache key, a job id, a room name). When the key resolves, the
@@ -80,22 +79,6 @@ impl<K> std::fmt::Debug for WaitTicket<K> {
             .field("generation", &self.generation)
             .finish()
     }
-}
-
-/// Build a request-lane effect after caller authority has been consumed
-/// by [`WaitList::park`] or [`WaitList::park_call`].
-///
-/// The ticket is a proof that admission happened. Its fields are
-/// private, so copied app code cannot manufacture a `RequestEffect` from
-/// plain `noop()` without first parking the caller.
-pub fn request_effect_after_wait_park<I, K>(
-    _ticket: &WaitTicket<K>,
-    effect: tina::Effect<I>,
-) -> tina::RequestEffect<I>
-where
-    I: tina::Isolate,
-{
-    crate::call::request_effect_from_consumed_effect(effect)
 }
 
 struct WaitEntry<K, R> {
@@ -690,7 +673,7 @@ mod tests {
         type Send = tina::Outbound<std::convert::Infallible>;
         type Spawn = std::convert::Infallible;
         type SpawnObserved = std::convert::Infallible;
-        type Call = std::convert::Infallible;
+        type Io = std::convert::Infallible;
         type Fact = std::convert::Infallible;
         type Shard = tina::SingleShard;
 

@@ -91,8 +91,8 @@ impl Worker {
     ) -> Effect<Self> {
         match msg {
             WorkerMsg::Hold => {
-                let slot = ctx.take_reply_slot().expect("slot");
-                self.held = Some(slot);
+                let slot = ctx.take_request_context().expect("slot");
+                self.held = Some(slot.into());
                 noop()
             }
             WorkerMsg::Release => {

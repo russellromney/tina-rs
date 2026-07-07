@@ -411,7 +411,7 @@ impl<S: Shard + 'static> SecretsWorker<S> {
         result: SecretsResult,
     ) -> Effect<Self> {
         match request_context {
-            Some(request) => reply_to_request(request, result),
+            Some(request) => reply_to(request, result),
             None => reply::<Self>(result),
         }
     }
@@ -422,7 +422,7 @@ impl<S: Shard + 'static> SecretsWorker<S> {
         result: SecretsResult,
     ) -> Effect<Self> {
         match request_context {
-            Some(request) => reply_to_request(request, result),
+            Some(request) => reply_to(request, result),
             None if reply_plain => reply::<Self>(result),
             None => noop(),
         }
@@ -481,7 +481,7 @@ impl<S: Shard + 'static> Isolate for SecretsWorker<S> {
         reply: SecretsResult,
         send: tina::Outbound<Infallible>,
         spawn: Infallible,
-        call: RuntimeCall<SecretsMsg>,
+        io: RuntimeCall<SecretsMsg>,
         shard: S,
     }
 

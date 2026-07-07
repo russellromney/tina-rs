@@ -17,7 +17,7 @@ use http::Version;
 #[cfg(test)]
 use http::{Method, StatusCode};
 use tina::prelude::*;
-use tina::reply_to_request;
+use tina::reply_to;
 use tina_runtime::{
     CallError, CallOutcome, Http2CloseReason, Http2FlowControlSide, Http2ResetReason,
     Http2StreamId, ListenerId, ProtocolConnectionId, ProtocolDirection, ProtocolFact, StreamId,
@@ -516,7 +516,7 @@ impl<S: Shard + 'static, M: Http2ServiceMessage> Isolate for Http2Connection<S, 
         reply: Http2ConnectionReply,
         send: tina::Outbound<Infallible>,
         spawn: Infallible,
-        call: tina_runtime::RuntimeCall<Http2ConnectionMsg>,
+        io: tina_runtime::RuntimeCall<Http2ConnectionMsg>,
         fact: ProtocolFact,
         shard: S,
     }
@@ -1983,7 +1983,7 @@ impl<S: Shard + 'static, M: Http2ServiceMessage> Http2Connection<S, M> {
             Err(_) => {
                 if let Some(idx) = self.find_stream(stream_id) {
                     if let Some(call) = self.streams[idx].pending_request_body_reply.take() {
-                        return reply_to_request(
+                        return reply_to(
                             call,
                             Http2ConnectionReply::RequestChunk(RequestChunkReply::Error(
                                 CallError::Io,
@@ -2141,14 +2141,14 @@ impl<S: Shard + 'static, M: Http2ServiceMessage> Http2Connection<S, M> {
             let data = chunk.data;
             self.add_request_window_credit(idx, credit);
             self.maybe_flush_request_window_credit(stream_id, false)?;
-            return Ok(reply_to_request(
+            return Ok(reply_to(
                 call,
                 Http2ConnectionReply::RequestChunk(RequestChunkReply::Chunk(data)),
             ));
         }
         if self.streams[idx].request_eof {
             self.maybe_flush_request_window_credit(stream_id, true)?;
-            Ok(reply_to_request(
+            Ok(reply_to(
                 call,
                 Http2ConnectionReply::RequestChunk(RequestChunkReply::Eof),
             ))
@@ -2384,7 +2384,7 @@ impl<S: Shard + 'static, M: Http2ServiceMessage> Http2Connection<S, M> {
         let mut stream = self.remove_stream_from_table(stream_id)?;
         self.return_dropped_request_credit(&mut stream);
         if let Some(call) = stream.pending_request_body_reply.take() {
-            effects.push(reply_to_request(
+            effects.push(reply_to(
                 call,
                 Http2ConnectionReply::RequestChunk(RequestChunkReply::Error(request_error)),
             ));
@@ -2460,7 +2460,7 @@ impl<S: Shard + 'static, M: Http2ServiceMessage> Isolate for Http2Listener<S, M>
         reply: (),
         send: tina::Outbound<Infallible>,
         spawn: ChildDefinition<Http2Connection<S, M>>,
-        call: tina_runtime::RuntimeCall<Http2ListenerMsg>,
+        io: tina_runtime::RuntimeCall<Http2ListenerMsg>,
         shard: S,
     }
 

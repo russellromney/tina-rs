@@ -74,7 +74,7 @@ tina::flow! {
     message = DriverMsg,
     reply = u32,
     send = Outbound<Infallible>,
-    call = RuntimeCall<DriverMsg>
+    io = RuntimeCall<DriverMsg>
 )]
 impl Driver {
     fn handle(
@@ -175,7 +175,7 @@ tina::flow! {
     message = ErrorDriverMsg,
     reply = u32,
     send = Outbound<Infallible>,
-    call = RuntimeCall<ErrorDriverMsg>
+    io = RuntimeCall<ErrorDriverMsg>
 )]
 impl ErrorDriver {
     fn handle(

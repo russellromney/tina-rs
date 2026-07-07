@@ -2,7 +2,7 @@
 //! parser, the read buffer, and the arrival log all live behind the
 //! same mailbox — no shared `HashMap`, no oneshot per request, no
 //! `Arc<Mutex<...>>` for the result. The isolate publishes its final
-//! `Vec<u32>` of arrivals via `stop_with` (Phase 059 Rock 1) and the
+//! `Vec<u32>` of arrivals via `stop_with` (the typed stop-result path) and the
 //! host receives it through `observe_result`.
 
 use std::convert::Infallible;

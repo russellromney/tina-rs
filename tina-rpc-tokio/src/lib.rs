@@ -179,7 +179,7 @@ where
     type Send = Outbound<Infallible>;
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
-    type Call = RuntimeCall<ClientResultMsg>;
+    type Io = RuntimeCall<ClientResultMsg>;
     type Fact = Infallible;
     type Shard = S;
 

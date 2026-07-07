@@ -11,7 +11,7 @@
 //! - Shutdown is a message. No `select!`, no `oneshot`, no second
 //!   channel; the same mailbox carries jobs and shutdown.
 //! - "In flight" and "pending in queue" are one number, named by
-//!   `SingleCallGate` (Phase 062 Rock 5). Drain truth is local: the
+//!   `SingleCallGate`. Drain truth is local: the
 //!   gate becomes idle.
 //! - Final `Report` reaches the host via `observe_result`. No
 //!   `Arc<Mutex>`, no mpsc.
@@ -41,7 +41,7 @@ enum WorkerMsg {
 
 struct Worker {
     work: Duration,
-    /// Phase 062 Rock 5: names the "one Tick in flight, plus N
+    /// The single-call gate invariant names the "one Tick in flight, plus N
     /// queued" invariant.
     gate: SingleCallGate,
     processed: u32,
@@ -132,7 +132,7 @@ pub fn run() -> anyhow::Result<Report> {
         .map_err(|e| anyhow::anyhow!("observe_result: {e:?}"))?;
 
     // Producer: non-blocking burst with `try_send_outcome` /
-    // `HostBurstOutcomes` (Phase 062 Rocks 3 & 4).
+    // `HostBurstOutcomes` (the host burst outcome helpers).
     let outcomes = HostBurstOutcomes::new();
     for n in 0..BURST_JOBS {
         let _ = runtime.try_send_outcome(worker_addr, WorkerMsg::Submit(n), &outcomes);

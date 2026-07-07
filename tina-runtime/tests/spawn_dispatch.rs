@@ -132,7 +132,7 @@ impl Isolate for Child {
         reply: (),
         send: Outbound<NeverOutbound>,
         spawn: Infallible,
-        call: Infallible,
+        io: Infallible,
         shard: TestShard,
     }
 
@@ -174,7 +174,7 @@ impl Isolate for ObservedParent {
         send: Outbound<ChildEvent>,
         spawn: ChildDefinition<Child>,
         spawn_observed: tina::SpawnObserved<ChildDefinition<Child>, ObservedParentEvent, ChildEvent>,
-        call: Infallible,
+        io: Infallible,
         shard: TestShard,
     }
 
@@ -225,7 +225,7 @@ impl Isolate for FullParent {
     type Send = Outbound<FullParentEvent>;
     type Spawn = ChildDefinition<Child>;
     type SpawnObserved = tina::SpawnObserved<Self::Spawn, Self::Message, ChildEvent, ()>;
-    type Call = Infallible;
+    type Io = Infallible;
     type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 
@@ -262,7 +262,7 @@ impl Isolate for Parent {
         reply: (),
         send: Outbound<NeverOutbound>,
         spawn: ChildDefinition<Child>,
-        call: Infallible,
+        io: Infallible,
         shard: TestShard,
     }
 
@@ -295,7 +295,7 @@ impl Isolate for OrderIsolate {
         reply: (),
         send: Outbound<NeverOutbound>,
         spawn: Infallible,
-        call: Infallible,
+        io: Infallible,
         shard: TestShard,
     }
 

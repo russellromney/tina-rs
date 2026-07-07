@@ -168,7 +168,7 @@ impl Isolate for Probe {
     type Send = Outbound<NeverOutbound>;
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
-    type Call = RuntimeCall<ProbeMsg>;
+    type Io = RuntimeCall<ProbeMsg>;
     type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 
@@ -178,7 +178,7 @@ impl Isolate for Probe {
         _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
     ) -> Effect<Self> {
         match msg {
-            ProbeMsg::StartInvalidAccept => Effect::Call(RuntimeCall::new(
+            ProbeMsg::StartInvalidAccept => Effect::Io(RuntimeCall::new(
                 CallInput::TcpAccept {
                     listener: ListenerId::new(9999),
                 },
@@ -187,7 +187,7 @@ impl Isolate for Probe {
                     other => panic!("expected accept failure, got {other:?}"),
                 },
             )),
-            ProbeMsg::StartInvalidRead => Effect::Call(RuntimeCall::new(
+            ProbeMsg::StartInvalidRead => Effect::Io(RuntimeCall::new(
                 CallInput::TcpRead {
                     stream: StreamId::new(9999),
                     max_len: 64,
@@ -220,7 +220,7 @@ impl Isolate for Binder {
     type Send = Outbound<NeverOutbound>;
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
-    type Call = RuntimeCall<BinderMsg>;
+    type Io = RuntimeCall<BinderMsg>;
     type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 
@@ -232,7 +232,7 @@ impl Isolate for Binder {
         match msg {
             BinderMsg::StartBind => {
                 let addr = self.bind_addr;
-                Effect::Call(RuntimeCall::new(
+                Effect::Io(RuntimeCall::new(
                     CallInput::TcpBind { addr },
                     move |result| match result {
                         CallOutput::TcpBound {
@@ -297,7 +297,7 @@ impl Isolate for Waiter {
     type Send = Outbound<NeverOutbound>;
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
-    type Call = RuntimeCall<WaiterMsg>;
+    type Io = RuntimeCall<WaiterMsg>;
     type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 
@@ -307,7 +307,7 @@ impl Isolate for Waiter {
         _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
     ) -> Effect<Self> {
         match msg {
-            WaiterMsg::StartAccept => Effect::Call(RuntimeCall::new(
+            WaiterMsg::StartAccept => Effect::Io(RuntimeCall::new(
                 CallInput::TcpAccept {
                     listener: self.listener,
                 },
@@ -341,7 +341,7 @@ impl Isolate for StreamAcceptor {
     type Send = Outbound<NeverOutbound>;
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
-    type Call = RuntimeCall<AcceptStreamMsg>;
+    type Io = RuntimeCall<AcceptStreamMsg>;
     type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 
@@ -351,7 +351,7 @@ impl Isolate for StreamAcceptor {
         _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
     ) -> Effect<Self> {
         match msg {
-            AcceptStreamMsg::StartAccept => Effect::Call(RuntimeCall::new(
+            AcceptStreamMsg::StartAccept => Effect::Io(RuntimeCall::new(
                 CallInput::TcpAccept {
                     listener: self.listener,
                 },
@@ -376,7 +376,7 @@ impl Isolate for Reader {
     type Send = Outbound<NeverOutbound>;
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
-    type Call = RuntimeCall<ReaderMsg>;
+    type Io = RuntimeCall<ReaderMsg>;
     type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 
@@ -386,7 +386,7 @@ impl Isolate for Reader {
         _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
     ) -> Effect<Self> {
         match msg {
-            ReaderMsg::StartRead => Effect::Call(RuntimeCall::new(
+            ReaderMsg::StartRead => Effect::Io(RuntimeCall::new(
                 CallInput::TcpRead {
                     stream: self.stream,
                     max_len: 64,
@@ -416,7 +416,7 @@ impl Isolate for Writer {
     type Send = Outbound<NeverOutbound>;
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
-    type Call = RuntimeCall<WriterMsg>;
+    type Io = RuntimeCall<WriterMsg>;
     type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 
@@ -426,7 +426,7 @@ impl Isolate for Writer {
         _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
     ) -> Effect<Self> {
         match msg {
-            WriterMsg::StartWrite => Effect::Call(RuntimeCall::new(
+            WriterMsg::StartWrite => Effect::Io(RuntimeCall::new(
                 CallInput::TcpWrite {
                     stream: self.stream,
                     bytes: b"cancel me before completion".to_vec(),
@@ -456,7 +456,7 @@ impl Isolate for TerminalWriter {
     type Send = Outbound<NeverOutbound>;
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
-    type Call = RuntimeCall<WriterMsg>;
+    type Io = RuntimeCall<WriterMsg>;
     type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 
@@ -466,7 +466,7 @@ impl Isolate for TerminalWriter {
         _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
     ) -> Effect<Self> {
         match msg {
-            WriterMsg::StartWrite => Effect::Call(RuntimeCall::new(
+            WriterMsg::StartWrite => Effect::Io(RuntimeCall::new(
                 CallInput::TcpWriteOwnedClose {
                     stream: self.stream,
                     bytes: b"terminal close".to_vec(),
@@ -498,7 +498,7 @@ impl Isolate for Closer {
     type Send = Outbound<NeverOutbound>;
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
-    type Call = RuntimeCall<CloserMsg>;
+    type Io = RuntimeCall<CloserMsg>;
     type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 
@@ -508,7 +508,7 @@ impl Isolate for Closer {
         _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
     ) -> Effect<Self> {
         match msg {
-            CloserMsg::CloseStream(stream) => Effect::Call(RuntimeCall::new(
+            CloserMsg::CloseStream(stream) => Effect::Io(RuntimeCall::new(
                 CallInput::TcpStreamClose { stream },
                 |result| match result {
                     CallOutput::TcpStreamClosed => CloserMsg::ClosedObserved,
@@ -556,7 +556,7 @@ fn invalid_listener_id_surfaces_failure_to_isolate_and_trace() {
         .try_send(probe, ProbeMsg::StartInvalidAccept)
         .expect("ingress accepts StartInvalidAccept");
 
-    // Step once to dispatch the handler that returns Effect::Call. The
+    // Step once to dispatch the handler that returns Effect::Io. The
     // backend resolves invalid-resource synchronously, so the translator
     // runs on the same step and the next step delivers the message.
     runtime.step();
@@ -1814,7 +1814,7 @@ fn call_id_increments_in_submission_order() {
 fn isolate_without_call_effects_compiles_with_infallible() {
     // Compile-only smoke: an isolate that never issues call effects keeps
     // the tina/tina-runtime pre-012 ergonomics by setting
-    // `type Call = Infallible`.
+    // `type Io = Infallible`.
     #[derive(Debug)]
     struct Quiet;
 
@@ -1824,7 +1824,7 @@ fn isolate_without_call_effects_compiles_with_infallible() {
         type Send = Outbound<NeverOutbound>;
         type Spawn = Infallible;
         type SpawnObserved = std::convert::Infallible;
-        type Call = Infallible;
+        type Io = Infallible;
         type Fact = ::std::convert::Infallible;
         type Shard = TestShard;
 

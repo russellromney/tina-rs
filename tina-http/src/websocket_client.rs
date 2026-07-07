@@ -15,7 +15,7 @@ use base64::Engine;
 use http::StatusCode;
 use http::header::{SEC_WEBSOCKET_ACCEPT, SEC_WEBSOCKET_PROTOCOL};
 use tina::prelude::*;
-use tina::{CallContext, RequestContext, reply_to_request};
+use tina::{CallContext, RequestContext, reply_to};
 use tina_runtime::{
     CallError, ProtocolFact, StreamId, TcpReadBufReply, TcpWriteOwnedReply, TlsReadBufReply,
     TlsStreamId, TlsWriteOwnedReply, WebSocketCloseReason, tcp_close_stream, tcp_connect,
@@ -255,7 +255,7 @@ impl<S: Shard + 'static> Isolate for WebSocketClientConnection<S> {
         reply: WebSocketClientReply,
         send: tina::Outbound<Infallible>,
         spawn: Infallible,
-        call: tina_runtime::RuntimeCall<WebSocketClientMsg>,
+        io: tina_runtime::RuntimeCall<WebSocketClientMsg>,
         fact: ProtocolFact,
         shard: S,
     }
@@ -648,7 +648,7 @@ impl<S: Shard + 'static> WebSocketClientConnection<S> {
     fn deliver_or_read_more(&mut self) -> Effect<Self> {
         if let Some(pending) = self.pending_receive.take() {
             if let Some(event) = self.events.pop_front() {
-                return reply_to_request(pending, WebSocketClientReply::Event(Ok(event)));
+                return reply_to(pending, WebSocketClientReply::Event(Ok(event)));
             }
             self.pending_receive = Some(pending);
         }
@@ -794,7 +794,7 @@ impl<S: Shard + 'static> WebSocketClientConnection<S> {
         self.state = WebSocketClientState::Closed;
         self.report.state = self.state;
         let event_reply = self.pending_receive.take().map(|pending| {
-            reply_to_request(
+            reply_to(
                 pending,
                 WebSocketClientReply::Event(Err(WebSocketClientError::Closed)),
             )
@@ -860,7 +860,7 @@ fn reply_to_ws<S: Shard + 'static>(
     reply_msg: WebSocketClientReply,
 ) -> Effect<WebSocketClientConnection<S>> {
     match request {
-        Some(request) => reply_to_request(request, reply_msg),
+        Some(request) => reply_to(request, reply_msg),
         None => reply(reply_msg),
     }
 }

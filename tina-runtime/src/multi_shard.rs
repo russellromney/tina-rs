@@ -1,4 +1,4 @@
-//! Multi-shard explicit-step coordinator extracted from lib.rs (phase 055).
+//! Multi-shard explicit-step coordinator extracted from lib.rs.
 //!
 //! Houses `MultiShardRuntime`, `MultiShardRuntimeConfig`, and the remote-queue
 //! plumbing helpers (`RemoteQueueIndexes`, `RemoteQueues`,
@@ -178,7 +178,7 @@ where
         I::Spawn: IntoErasedSpawn<S, F> + 'static,
         I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
         I::SpawnObservedRemote: IntoSendErasedSpawnObserved<S, F, I::Message> + 'static,
-        I::Call: IntoErasedCall<I::Message> + 'static,
+        I::Io: IntoErasedCall<I::Message> + 'static,
         I::Fact: crate::fact::IntoRuntimeFact + 'static,
         Outbound: 'static,
         M: Mailbox<I::Message> + 'static,
@@ -203,7 +203,7 @@ where
         I::Spawn: IntoErasedSpawn<S, F> + 'static,
         I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
         I::SpawnObservedRemote: IntoSendErasedSpawnObserved<S, F, I::Message> + 'static,
-        I::Call: IntoErasedCall<I::Message> + 'static,
+        I::Io: IntoErasedCall<I::Message> + 'static,
         I::Fact: crate::fact::IntoRuntimeFact + 'static,
         Outbound: 'static,
     {
@@ -227,7 +227,7 @@ where
         I::Spawn: IntoErasedSpawn<S, F> + 'static,
         I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
         I::SpawnObservedRemote: IntoSendErasedSpawnObserved<S, F, I::Message> + 'static,
-        I::Call: IntoErasedCall<I::Message> + 'static,
+        I::Io: IntoErasedCall<I::Message> + 'static,
         I::Fact: crate::fact::IntoRuntimeFact + 'static,
         Outbound: 'static,
     {

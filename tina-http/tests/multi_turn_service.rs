@@ -17,7 +17,7 @@ use std::convert::Infallible;
 use std::time::Duration;
 
 use tina::prelude::*;
-use tina::{CallContext, RequestContext, reply_to_request};
+use tina::{CallContext, RequestContext, reply_to};
 use tina_http::{
     HttpClient, HttpClientConfig, HttpClientError, HttpClientMsg, HttpLimits, HttpListener,
     HttpListenerMsg, HttpRequest, HttpResponse,
@@ -63,7 +63,7 @@ impl Isolate for Proxy {
         reply: HttpResponse,
         send: tina::Outbound<Infallible>,
         spawn: Infallible,
-        call: RuntimeCall<ProxyMsg>,
+        io: RuntimeCall<ProxyMsg>,
         shard: TestShard,
     }
 
@@ -75,7 +75,7 @@ impl Isolate for Proxy {
         match msg {
             ProxyMsg::Inbound(_) => reply(HttpResponse::internal_error()),
             ProxyMsg::ClientReturned(request, outcome) => {
-                reply_to_request(request, Self::response_for_client_outcome(outcome))
+                reply_to(request, Self::response_for_client_outcome(outcome))
             }
         }
     }

@@ -66,15 +66,15 @@ cargo run --manifest-path examples/specimen_axum_counter/Cargo.toml -- tina
 ### What was awkward
 
 - ~~Forty more lines of `BridgeMailbox` + `BridgeMailboxFactory`
-  boilerplate before any service code can run.~~ **Resolved in phase 047:**
+  boilerplate before any service code can run.~~ **Resolved:**
   the example uses `DefaultThreadedMailboxFactory`.
 - ~~The runtime + bridge wiring is verbose: build `ThreadedRuntime` →
   `register_with_capacity::<Counter, Infallible>` → `BridgeHandle::new` →
-  pass `Arc` clones around.~~ **Mostly resolved in phase 047:** `BridgeHost`
+  pass `Arc` clones around.~~ **Mostly resolved:** `BridgeHost`
   owns the runtime and registers the bridge handle in one place. There is
   still setup, but it now reads like one bridge-hosted service shape.
 - ~~Shutdown of the Tina runtime requires unwrapping the `Arc` and calling
-  `shutdown()` only when no clones remain.~~ **Resolved in phase 047:**
+  `shutdown()` only when no clones remain.~~ **Resolved:**
   `BridgeHost::drain_and_shutdown(...)` waits for handle clones to drain,
   returns a structured report, and leaves the host retryable on timeout.
 - Both sides need a `tokio::runtime` to host axum, so the Tina side ends

@@ -171,14 +171,14 @@ HTTP call -> Controller CallContext
   -> call(...).then_with_request(req, NotifyAcquired)   // outbound pool acquire
   -> call(...).then_with_request(req, NotifySent)       // keepalive request
   -> call(...).then_with_request(req, NotifyReleased)   // pool release
-  -> reply_to_request(req, ...)                          // final HttpResponse
+  -> reply_to(req, ...)                          // final HttpResponse
 ```
 
 The first hop uses `call_ctx.defer(work).reply(...)` to consume caller
 authority and carry it into the next continuation as `RequestContext<R>`.
 Each follow-on hop calls `then_with_request(req, ...)` to keep that context
 moving across messages. The final turn settles the caller with
-`reply_to_request`. There is no hidden caller context preservation; `Full`,
+`reply_to`. There is no hidden caller context preservation; `Full`,
 `Closed`, and `Timeout` remain distinct in the route bodies at every hop.
 
 ### Request Scope On The Notify Path
@@ -228,7 +228,7 @@ Run the system smoke from the repo root:
 # Full system smoke (scripted scenarios + capacity assertions):
 cargo test --manifest-path examples/systems/mini_saas_api/Cargo.toml --test smoke
 
-# Load/soak proof (Phase 108) with typed capacity contract:
+# Load/soak proof (the proof) with typed capacity contract:
 cargo test --manifest-path examples/systems/mini_saas_api/Cargo.toml --test soak -- --nocapture
 
 # Opt-in long soak. Defaults to 10 minutes; use 3600 for one hour.
@@ -260,7 +260,7 @@ first error position, per-kind breakdown) lets specimens assert
 "pressure stayed under N per mille" or "no burst longer than K
 consecutive errors" without parsing the summary line.
 
-Phase 148 adds direct notify/outbound-pool facts to the capacity line:
+The capacity line includes direct notify/outbound-pool facts:
 
 ```text
 notify.attempted=33 outbound.acquired=21 outbound.released=21 outbound.retired=0

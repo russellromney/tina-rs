@@ -3,7 +3,10 @@ use std::convert::Infallible;
 use std::rc::Rc;
 use std::time::Duration;
 
-use tina::{Context, Effect, Isolate, Outbound, Shard, ShardId, time::TimerInterval};
+use tina::{
+    Context, Effect, Isolate, Outbound, Shard, ShardId,
+    time::{RecurringTick, RecurringTickDecision, RecurringTickToken},
+};
 use tina_runtime::{
     CallCompletionRejectedReason, CallInput, CallKind, CallOutput, RuntimeCall,
     RuntimeCallCompletion, RuntimeEvent, RuntimeEventKind, SleepReply, StreamId,
@@ -47,7 +50,7 @@ impl Isolate for Sleeper {
     type Send = Outbound<TimerMsg>;
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
-    type Call = RuntimeCall<TimerMsg>;
+    type Io = RuntimeCall<TimerMsg>;
     type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 
@@ -57,7 +60,7 @@ impl Isolate for Sleeper {
         _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
     ) -> Effect<Self> {
         match msg {
-            TimerMsg::Start => Effect::Call(RuntimeCall::new(
+            TimerMsg::Start => Effect::Io(RuntimeCall::new(
                 CallInput::Sleep { after: self.delay },
                 |result| match result {
                     CallOutput::TimerFired => TimerMsg::Fired,
@@ -65,7 +68,7 @@ impl Isolate for Sleeper {
                 },
             )),
             TimerMsg::StartAndStop => Effect::Batch(vec![
-                Effect::Call(RuntimeCall::new(
+                Effect::Io(RuntimeCall::new(
                     CallInput::Sleep { after: self.delay },
                     |result| match result {
                         CallOutput::TimerFired => TimerMsg::Fired,
@@ -74,21 +77,21 @@ impl Isolate for Sleeper {
                 )),
                 Effect::Stop,
             ]),
-            TimerMsg::TerminalStop => Effect::Call(RuntimeCall::new_with_completion(
+            TimerMsg::TerminalStop => Effect::Io(RuntimeCall::new_with_completion(
                 CallInput::Sleep { after: self.delay },
                 |result| match result {
                     CallOutput::TimerFired => RuntimeCallCompletion::StopRequester,
                     other => RuntimeCallCompletion::Message(unexpected_timer_completion(other)),
                 },
             )),
-            TimerMsg::TerminalNoop => Effect::Call(RuntimeCall::new_with_completion(
+            TimerMsg::TerminalNoop => Effect::Io(RuntimeCall::new_with_completion(
                 CallInput::Sleep { after: self.delay },
                 |result| match result {
                     CallOutput::TimerFired => RuntimeCallCompletion::Noop,
                     other => RuntimeCallCompletion::Message(unexpected_timer_completion(other)),
                 },
             )),
-            TimerMsg::BadStreamNoop => Effect::Call(RuntimeCall::new_with_completion(
+            TimerMsg::BadStreamNoop => Effect::Io(RuntimeCall::new_with_completion(
                 CallInput::TcpStreamClose {
                     stream: StreamId::new(999_999),
                 },
@@ -121,7 +124,7 @@ impl Isolate for OrderingSleeper {
     type Send = Outbound<OrderingMsg>;
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
-    type Call = RuntimeCall<OrderingMsg>;
+    type Io = RuntimeCall<OrderingMsg>;
     type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 
@@ -133,7 +136,7 @@ impl Isolate for OrderingSleeper {
         match msg {
             OrderingMsg::Start => {
                 let label = self.label;
-                Effect::Call(RuntimeCall::new(
+                Effect::Io(RuntimeCall::new(
                     CallInput::Sleep { after: self.delay },
                     move |_| OrderingMsg::Fired(label),
                 ))
@@ -545,31 +548,31 @@ fn same_config_reproduces_same_event_record() {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum HelperIntervalMsg {
+enum HelperRecurringMsg {
     Start,
-    Tick(u64, SleepReply),
+    Tick(RecurringTickToken, u64, SleepReply),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct HelperIntervalObservation {
+struct HelperRecurringObservation {
     tick_number: u64,
     scheduled_after: Duration,
     fired: bool,
 }
 
 #[derive(Debug)]
-struct HelperIntervalSleeper {
-    interval: TimerInterval,
-    observations: Rc<RefCell<Vec<HelperIntervalObservation>>>,
+struct HelperRecurringSleeper {
+    interval: RecurringTick,
+    observations: Rc<RefCell<Vec<HelperRecurringObservation>>>,
 }
 
-impl Isolate for HelperIntervalSleeper {
-    type Message = HelperIntervalMsg;
+impl Isolate for HelperRecurringSleeper {
+    type Message = HelperRecurringMsg;
     type Reply = ();
-    type Send = Outbound<HelperIntervalMsg>;
+    type Send = Outbound<HelperRecurringMsg>;
     type Spawn = Infallible;
     type SpawnObserved = Infallible;
-    type Call = RuntimeCall<HelperIntervalMsg>;
+    type Io = RuntimeCall<HelperRecurringMsg>;
     type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 
@@ -579,27 +582,38 @@ impl Isolate for HelperIntervalSleeper {
         ctx: &mut Context<'_, Self::Shard, Self::Reply>,
     ) -> Effect<Self> {
         match msg {
-            HelperIntervalMsg::Start => {
+            HelperRecurringMsg::Start => {
                 let now = ctx.now();
-                let decision = self.interval.next_delay(now);
-                let tick_number = decision.tick_number();
-                self.observations
-                    .borrow_mut()
-                    .push(HelperIntervalObservation {
-                        tick_number,
-                        scheduled_after: decision
-                            .scheduled_at()
-                            .saturating_duration_since(decision.observed_at()),
-                        fired: false,
-                    });
-                sleep(decision.delay())
-                    .then(move |reply| HelperIntervalMsg::Tick(tick_number, reply))
+                match self.interval.next(now) {
+                    RecurringTickDecision::Sleep {
+                        delay,
+                        token,
+                        report,
+                    } => {
+                        let tick_number = report.tick_number;
+                        self.observations
+                            .borrow_mut()
+                            .push(HelperRecurringObservation {
+                                tick_number,
+                                scheduled_after: report
+                                    .scheduled_at
+                                    .saturating_duration_since(report.observed_at),
+                                fired: false,
+                            });
+                        sleep(delay)
+                            .then(move |reply| HelperRecurringMsg::Tick(token, tick_number, reply))
+                    }
+                    RecurringTickDecision::Skip(report) => {
+                        panic!("first recurring tick should sleep, got skip {report:?}")
+                    }
+                }
             }
-            HelperIntervalMsg::Tick(tick_number, reply) => {
+            HelperRecurringMsg::Tick(token, tick_number, reply) => {
                 reply.expect("sim sleep should fire");
+                let _ = self.interval.validate(token).expect("fresh tick token");
                 self.observations
                     .borrow_mut()
-                    .push(HelperIntervalObservation {
+                    .push(HelperRecurringObservation {
                         tick_number,
                         scheduled_after: Duration::ZERO,
                         fired: true,
@@ -611,7 +625,7 @@ impl Isolate for HelperIntervalSleeper {
 }
 
 #[test]
-fn timer_interval_helper_runs_through_sim_sleep_path() {
+fn recurring_tick_helper_runs_through_sim_sleep_path() {
     let observations = Rc::new(RefCell::new(Vec::new()));
     let mut sim = Simulator::new(
         TestShard,
@@ -620,16 +634,16 @@ fn timer_interval_helper_runs_through_sim_sleep_path() {
             ..Default::default()
         },
     );
-    let sleeper = sim.register(HelperIntervalSleeper {
-        interval: TimerInterval::every(Duration::from_millis(10)).unwrap(),
+    let sleeper = sim.register(HelperRecurringSleeper {
+        interval: RecurringTick::every(Duration::from_millis(10)).unwrap(),
         observations: Rc::clone(&observations),
     });
 
-    sim.try_send(sleeper, HelperIntervalMsg::Start).unwrap();
+    sim.try_send(sleeper, HelperRecurringMsg::Start).unwrap();
     assert_eq!(sim.step(), 1);
     assert_eq!(
         observations.borrow().as_slice(),
-        [HelperIntervalObservation {
+        [HelperRecurringObservation {
             tick_number: 1,
             scheduled_after: Duration::from_millis(10),
             fired: false,
@@ -641,7 +655,7 @@ fn timer_interval_helper_runs_through_sim_sleep_path() {
     assert_eq!(count_call_completed(sim.trace(), CallKind::Sleep), 1);
     assert_eq!(
         observations.borrow()[1],
-        HelperIntervalObservation {
+        HelperRecurringObservation {
             tick_number: 1,
             scheduled_after: Duration::ZERO,
             fired: true,

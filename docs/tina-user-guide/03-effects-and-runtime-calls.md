@@ -80,7 +80,7 @@ call_ctx
 ```
 
 The continuation message still carries `RequestContext<StoreReply>`, and the
-later handler turn must consume it with `reply_to_request(...)`. Tina does not
+later handler turn must consume it with `reply_to(...)`. Tina does not
 create a hidden async stack or a hidden final reply.
 
 Grug warning:

@@ -1,4 +1,4 @@
-//! Local system app owners extracted from lib.rs (phase 055).
+//! Local system app owners extracted from lib.rs.
 //!
 //! Houses `LocalSystem`, `LocalMultiShardSystem`, their builders/shutdown
 //! handles, the bounded-shape `LocalSystemConfig`, terminal report types,
@@ -738,7 +738,7 @@ where
         I::Spawn: IntoErasedSpawn<S, F> + 'static,
         I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
         I::SpawnObservedRemote: IntoSendErasedSpawnObserved<S, F, I::Message> + 'static,
-        I::Call: IntoErasedCall<I::Message> + 'static,
+        I::Io: IntoErasedCall<I::Message> + 'static,
         I::Fact: crate::fact::IntoRuntimeFact + 'static,
         Outbound: 'static,
     {
@@ -1163,7 +1163,7 @@ where
         I::Spawn: IntoErasedSpawn<S, F> + 'static,
         I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
         I::SpawnObservedRemote: IntoSendErasedSpawnObserved<S, F, I::Message> + 'static,
-        I::Call: IntoErasedCall<I::Message> + 'static,
+        I::Io: IntoErasedCall<I::Message> + 'static,
         I::Fact: crate::fact::IntoRuntimeFact + 'static,
         Outbound: Send + 'static,
     {

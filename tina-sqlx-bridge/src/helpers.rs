@@ -151,7 +151,7 @@ impl ExecuteCall {
     #[deprecated(since = "0.1.0", note = "use `.then(...)` for ordinary continuations")]
     pub fn reply<I, F, M>(self, translator: F) -> Effect<I>
     where
-        I: Isolate<Message = M, Call = RuntimeCall<M>>,
+        I: Isolate<Message = M, Io = RuntimeCall<M>>,
         F: FnOnce(PgExecutedOutcome) -> M + 'static,
         M: 'static,
     {
@@ -161,7 +161,7 @@ impl ExecuteCall {
     /// Turn this prepared call into one continuation message.
     pub fn then<I, F, M>(self, translator: F) -> Effect<I>
     where
-        I: Isolate<Message = M, Call = RuntimeCall<M>>,
+        I: Isolate<Message = M, Io = RuntimeCall<M>>,
         F: FnOnce(PgExecutedOutcome) -> M + 'static,
         M: 'static,
     {
@@ -186,7 +186,7 @@ impl FetchManyCall {
     #[deprecated(since = "0.1.0", note = "use `.then(...)` for ordinary continuations")]
     pub fn reply<I, F, M>(self, translator: F) -> Effect<I>
     where
-        I: Isolate<Message = M, Call = RuntimeCall<M>>,
+        I: Isolate<Message = M, Io = RuntimeCall<M>>,
         F: FnOnce(PgFetchManyOutcome) -> M + 'static,
         M: 'static,
     {
@@ -196,7 +196,7 @@ impl FetchManyCall {
     /// Turn this prepared call into one continuation message.
     pub fn then<I, F, M>(self, translator: F) -> Effect<I>
     where
-        I: Isolate<Message = M, Call = RuntimeCall<M>>,
+        I: Isolate<Message = M, Io = RuntimeCall<M>>,
         F: FnOnce(PgFetchManyOutcome) -> M + 'static,
         M: 'static,
     {
@@ -221,7 +221,7 @@ impl FetchOneCall {
     #[deprecated(since = "0.1.0", note = "use `.then(...)` for ordinary continuations")]
     pub fn reply<I, F, M>(self, translator: F) -> Effect<I>
     where
-        I: Isolate<Message = M, Call = RuntimeCall<M>>,
+        I: Isolate<Message = M, Io = RuntimeCall<M>>,
         F: FnOnce(PgFetchOneOutcome) -> M + 'static,
         M: 'static,
     {
@@ -231,7 +231,7 @@ impl FetchOneCall {
     /// Turn this prepared call into one continuation message.
     pub fn then<I, F, M>(self, translator: F) -> Effect<I>
     where
-        I: Isolate<Message = M, Call = RuntimeCall<M>>,
+        I: Isolate<Message = M, Io = RuntimeCall<M>>,
         F: FnOnce(PgFetchOneOutcome) -> M + 'static,
         M: 'static,
     {
@@ -319,7 +319,7 @@ impl TransactionCall {
     #[deprecated(since = "0.1.0", note = "use `.then(...)` for ordinary continuations")]
     pub fn reply<I, F, M>(self, translator: F) -> Effect<I>
     where
-        I: Isolate<Message = M, Call = RuntimeCall<M>>,
+        I: Isolate<Message = M, Io = RuntimeCall<M>>,
         F: FnOnce(PgTransactionCallOutcome) -> M + 'static,
         M: 'static,
     {
@@ -329,7 +329,7 @@ impl TransactionCall {
     /// Turn this prepared call into one continuation message.
     pub fn then<I, F, M>(self, translator: F) -> Effect<I>
     where
-        I: Isolate<Message = M, Call = RuntimeCall<M>>,
+        I: Isolate<Message = M, Io = RuntimeCall<M>>,
         F: FnOnce(PgTransactionCallOutcome) -> M + 'static,
         M: 'static,
     {

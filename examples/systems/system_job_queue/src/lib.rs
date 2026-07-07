@@ -220,7 +220,7 @@ struct Queue {
     message = QueueMsg,
     reply = QueueReply,
     send = tina::Outbound<WorkerMsg>,
-    call = tina_runtime::RuntimeCall<QueueMsg>,
+    io = tina_runtime::RuntimeCall<QueueMsg>,
     spawn_observed = tina::SpawnObserved<ChildDefinition<Worker>, QueueMsg, WorkerMsg, WorkerReply>,
 )]
 impl Queue {
@@ -234,7 +234,7 @@ impl Queue {
             }
             QueueMsg::ParkedCallerCancelled { id, req } => {
                 self.stats.jobs_cancelled += 1;
-                reply_to_request::<Self>(req, QueueReply::Done(JobOutcome::Cancelled { id }))
+                reply_to::<Self>(req, QueueReply::Done(JobOutcome::Cancelled { id }))
             }
         }
     }
@@ -358,11 +358,11 @@ impl Queue {
                 // worker_busy accounting is correct. Surface it loudly via
                 // the stats counter and reply Busy.
                 self.stats.jobs_busy_rejected += 1;
-                reply_to_request::<Self>(token.into_request_context(), QueueReply::Busy)
+                reply_to::<Self>(token.into_request_context(), QueueReply::Busy)
             }
             Err(PendingCancelableInsertError::DuplicateKey { token }) => {
                 // Monotonic ids — a duplicate is a queue accounting bug.
-                reply_to_request::<Self>(
+                reply_to::<Self>(
                     token.into_request_context(),
                     QueueReply::Done(JobOutcome::Failed {
                         id,
@@ -473,7 +473,7 @@ impl Queue {
             None
         };
 
-        let reply = reply_to_request::<Self>(req, QueueReply::Done(final_outcome));
+        let reply = reply_to::<Self>(req, QueueReply::Done(final_outcome));
         match respawn_effect {
             Some(spawn) => batch(vec![reply, spawn]),
             None => reply,

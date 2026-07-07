@@ -112,7 +112,7 @@ impl Isolate for Target {
     type Send = Outbound<DriverMsg>;
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
-    type Call = Infallible;
+    type Io = Infallible;
     type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 
@@ -146,7 +146,7 @@ impl Isolate for Driver {
     type Send = Outbound<TargetMsg>;
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
-    type Call = Infallible;
+    type Io = Infallible;
     type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 
@@ -169,7 +169,7 @@ impl Isolate for RestartParent {
     type Send = Outbound<TargetMsg>;
     type Spawn = tina::RestartableChildDefinition<RestartChild>;
     type SpawnObserved = std::convert::Infallible;
-    type Call = Infallible;
+    type Io = Infallible;
     type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 
@@ -193,7 +193,7 @@ impl Isolate for RestartChild {
     type Send = Outbound<TargetMsg>;
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
-    type Call = Infallible;
+    type Io = Infallible;
     type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 
@@ -525,7 +525,7 @@ impl Isolate for DispatcherWorker {
     type Send = Outbound<DriverMsg>;
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
-    type Call = Infallible;
+    type Io = Infallible;
     type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 
@@ -550,7 +550,7 @@ impl Isolate for DispatcherParent {
     type Send = Outbound<RegistryMsg>;
     type Spawn = tina::RestartableChildDefinition<DispatcherWorker>;
     type SpawnObserved = std::convert::Infallible;
-    type Call = Infallible;
+    type Io = Infallible;
     type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 
@@ -583,7 +583,7 @@ impl Isolate for DispatcherRegistry {
     type Send = Outbound<DispatcherWorkerMsg>;
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
-    type Call = Infallible;
+    type Io = Infallible;
     type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 

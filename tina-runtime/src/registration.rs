@@ -78,7 +78,7 @@ where
         I::Spawn: IntoErasedSpawn<S, F> + 'static,
         I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
         I::SpawnObservedRemote: IntoSendErasedSpawnObserved<S, F, I::Message> + 'static,
-        I::Call: IntoErasedCall<I::Message> + 'static,
+        I::Io: IntoErasedCall<I::Message> + 'static,
         I::Fact: IntoRuntimeFact + 'static,
         Outbound: 'static,
         M: Mailbox<I::Message> + 'static,
@@ -109,7 +109,7 @@ where
         I::Spawn: IntoErasedSpawn<S, F> + 'static,
         I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
         I::SpawnObservedRemote: IntoSendErasedSpawnObserved<S, F, I::Message> + 'static,
-        I::Call: IntoErasedCall<I::Message> + 'static,
+        I::Io: IntoErasedCall<I::Message> + 'static,
         I::Fact: IntoRuntimeFact + 'static,
         Outbound: 'static,
     {
@@ -188,7 +188,7 @@ where
         I::Spawn: IntoErasedSpawn<S, F> + 'static,
         I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
         I::SpawnObservedRemote: IntoSendErasedSpawnObserved<S, F, I::Message> + 'static,
-        I::Call: IntoErasedCall<I::Message> + 'static,
+        I::Io: IntoErasedCall<I::Message> + 'static,
         I::Fact: IntoRuntimeFact + 'static,
         Outbound: 'static,
     {
@@ -214,7 +214,7 @@ where
         I::Spawn: IntoErasedSpawn<S, F> + 'static,
         I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
         I::SpawnObservedRemote: IntoSendErasedSpawnObserved<S, F, I::Message> + 'static,
-        I::Call: IntoErasedCall<I::Message> + 'static,
+        I::Io: IntoErasedCall<I::Message> + 'static,
         I::Fact: IntoRuntimeFact + 'static,
         Outbound: 'static,
     {
@@ -250,7 +250,7 @@ where
         I::Spawn: IntoErasedSpawn<S, F> + 'static,
         I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
         I::SpawnObservedRemote: IntoSendErasedSpawnObserved<S, F, I::Message> + 'static,
-        I::Call: IntoErasedCall<I::Message> + 'static,
+        I::Io: IntoErasedCall<I::Message> + 'static,
         I::Fact: IntoRuntimeFact + 'static,
         Outbound: 'static,
     {
@@ -285,7 +285,7 @@ where
         I::Spawn: IntoErasedSpawn<S, F> + 'static,
         I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
         I::SpawnObservedRemote: IntoSendErasedSpawnObserved<S, F, I::Message> + 'static,
-        I::Call: IntoErasedCall<I::Message> + 'static,
+        I::Io: IntoErasedCall<I::Message> + 'static,
         I::Fact: IntoRuntimeFact + 'static,
         Outbound: 'static,
     {
@@ -358,7 +358,7 @@ where
         I::Spawn: IntoErasedSpawn<S, F> + 'static,
         I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
         I::SpawnObservedRemote: IntoSendErasedSpawnObserved<S, F, I::Message> + 'static,
-        I::Call: IntoErasedCall<I::Message> + 'static,
+        I::Io: IntoErasedCall<I::Message> + 'static,
         I::Fact: IntoRuntimeFact + 'static,
         Outbound: 'static,
         Ctor: FnOnce(Address<I::Message, I::Reply>) -> I,
@@ -630,7 +630,7 @@ where
         I::Spawn: IntoErasedSpawn<S, F> + 'static,
         I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
         I::SpawnObservedRemote: IntoSendErasedSpawnObserved<S, F, I::Message> + 'static,
-        I::Call: IntoErasedCall<I::Message> + 'static,
+        I::Io: IntoErasedCall<I::Message> + 'static,
         I::Fact: IntoRuntimeFact + 'static,
         Outbound: 'static,
     {
@@ -694,7 +694,7 @@ where
         I::Spawn: IntoErasedSpawn<S, F> + 'static,
         I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
         I::SpawnObservedRemote: IntoSendErasedSpawnObserved<S, F, I::Message> + 'static,
-        I::Call: IntoErasedCall<I::Message> + 'static,
+        I::Io: IntoErasedCall<I::Message> + 'static,
         I::Fact: IntoRuntimeFact + 'static,
         Outbound: 'static,
     {
@@ -763,7 +763,7 @@ where
         I::Spawn: IntoErasedSpawn<S, F> + 'static,
         I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
         I::SpawnObservedRemote: IntoSendErasedSpawnObserved<S, F, I::Message> + 'static,
-        I::Call: IntoErasedCall<I::Message> + 'static,
+        I::Io: IntoErasedCall<I::Message> + 'static,
         I::Fact: IntoRuntimeFact + 'static,
         Outbound: Send + 'static,
     {
@@ -792,7 +792,7 @@ where
         I::Spawn: IntoErasedSpawn<S, F> + 'static,
         I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
         I::SpawnObservedRemote: IntoSendErasedSpawnObserved<S, F, I::Message> + 'static,
-        I::Call: IntoErasedCall<I::Message> + 'static,
+        I::Io: IntoErasedCall<I::Message> + 'static,
         I::Fact: IntoRuntimeFact + 'static,
         Outbound: Send + 'static,
     {
@@ -844,7 +844,7 @@ where
         I::Spawn: IntoErasedSpawn<S, F> + 'static,
         I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
         I::SpawnObservedRemote: IntoSendErasedSpawnObserved<S, F, I::Message> + 'static,
-        I::Call: IntoErasedCall<I::Message> + 'static,
+        I::Io: IntoErasedCall<I::Message> + 'static,
         I::Fact: IntoRuntimeFact + 'static,
         Outbound: Send + 'static,
     {
@@ -890,7 +890,7 @@ where
         I::Spawn: IntoErasedSpawn<S, F> + 'static,
         I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
         I::SpawnObservedRemote: IntoSendErasedSpawnObserved<S, F, I::Message> + 'static,
-        I::Call: IntoErasedCall<I::Message> + 'static,
+        I::Io: IntoErasedCall<I::Message> + 'static,
         I::Fact: IntoRuntimeFact + 'static,
         Outbound: 'static,
     {

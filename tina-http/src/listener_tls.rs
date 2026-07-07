@@ -10,7 +10,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use tina::prelude::*;
-use tina::{CallContext, RequestContext, reply_to_request};
+use tina::{CallContext, RequestContext, reply_to};
 use tina_runtime::{
     CallError, TlsListenerId, TlsStreamId, tls_accept, tls_bind, tls_close, tls_close_listener,
 };
@@ -182,7 +182,7 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Isolate for Http
         reply: Result<HttpsReady, HttpsStartupError>,
         send: tina::Outbound<std::convert::Infallible>,
         spawn: ChildDefinition<HttpConnection<S, M>>,
-        call: tina_runtime::RuntimeCall<HttpsListenerMsg>,
+        io: tina_runtime::RuntimeCall<HttpsListenerMsg>,
         shard: S,
     }
 
@@ -215,7 +215,7 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Isolate for Http
                     let close = tls_close_listener(listener).then(HttpsListenerMsg::ListenerClosed);
                     return match self.pending_start_reply.take() {
                         Some(request) => batch(vec![
-                            reply_to_request(request, Err(HttpsStartupError::AlreadyStarted)),
+                            reply_to(request, Err(HttpsStartupError::AlreadyStarted)),
                             close,
                         ]),
                         None => close,
@@ -223,7 +223,7 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Isolate for Http
                 }
                 let ready = Ok(HttpsReady { local_addr });
                 let ready_effect: Effect<Self> = match self.pending_start_reply.take() {
-                    Some(request) => reply_to_request(request, ready),
+                    Some(request) => reply_to(request, ready),
                     None => reply(ready),
                 };
                 let accept_effect: Effect<Self> =
@@ -233,7 +233,7 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Isolate for Http
             HttpsListenerMsg::Bound(Err(source)) => {
                 let error = Err(HttpsStartupError::Bind { source });
                 let reply_effect = match self.pending_start_reply.take() {
-                    Some(request) => reply_to_request(request, error),
+                    Some(request) => reply_to(request, error),
                     None => reply(error),
                 };
                 batch(vec![reply_effect, stop()])

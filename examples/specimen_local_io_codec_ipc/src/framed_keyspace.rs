@@ -53,7 +53,7 @@ impl Isolate for KeyspaceServer {
     type Send = Outbound<Infallible>;
     type Spawn = Infallible;
     type SpawnObserved = Infallible;
-    type Call = RuntimeCall<ServerMsg>;
+    type Io = RuntimeCall<ServerMsg>;
     type Fact = Infallible;
     type Shard = KeyspaceShard;
 
@@ -157,7 +157,7 @@ impl Isolate for KeyspaceClient {
     type Send = Outbound<Infallible>;
     type Spawn = Infallible;
     type SpawnObserved = Infallible;
-    type Call = RuntimeCall<ClientMsg>;
+    type Io = RuntimeCall<ClientMsg>;
     type Fact = Infallible;
     type Shard = KeyspaceShard;
 

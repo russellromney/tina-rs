@@ -7,7 +7,10 @@
 mod common;
 
 use std::convert::Infallible;
+use std::io::{Read, Write};
 use std::net::SocketAddr;
+use std::net::TcpListener;
+use std::thread;
 use std::time::Duration;
 
 use http::StatusCode;
@@ -33,7 +36,7 @@ impl Isolate for ChunkedEchoService {
         reply: HttpResponse,
         send: tina::Outbound<Infallible>,
         spawn: Infallible,
-        call: Infallible,
+        io: Infallible,
         shard: TestShard,
     }
 
@@ -70,6 +73,60 @@ fn map_outcome(
         CallOutcome::Timeout => Err(HttpClientError::Timeout),
         CallOutcome::Rejected(_) => Err(HttpClientError::Closed),
     }
+}
+
+fn run_client_against_raw_peer(response: &'static [u8]) -> Result<HttpResponse, HttpClientError> {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind raw peer");
+    let addr = listener.local_addr().expect("peer addr");
+    let peer = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept client");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("read timeout");
+        stream
+            .set_write_timeout(Some(Duration::from_secs(2)))
+            .expect("write timeout");
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 1024];
+        while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+            let n = stream.read(&mut chunk).expect("read request");
+            if n == 0 {
+                return;
+            }
+            buf.extend_from_slice(&chunk[..n]);
+        }
+        stream.write_all(response).expect("write response");
+        let _ = stream.flush();
+    });
+
+    let runtime = ThreadedRuntime::with_config(
+        TestShard,
+        DefaultThreadedMailboxFactory,
+        ThreadedRuntimeConfig {
+            command_capacity: 64,
+            idle_wait: Duration::from_millis(1),
+            ..Default::default()
+        },
+    );
+    let client = runtime
+        .register_with_capacity::<HttpClient<TestShard>, Infallible>(
+            HttpClient::<TestShard>::new(HttpClientConfig::dev()),
+            16,
+        )
+        .expect("register client");
+    let request = HttpRequest::get("/chunked").header("Host", "x").build();
+    let result = map_outcome(
+        runtime
+            .call_blocking(
+                client,
+                HttpClientMsg::call(addr, request),
+                Duration::from_secs(5),
+            )
+            .expect("call runs"),
+    );
+    let _ = runtime.shutdown();
+    peer.join().expect("peer joins");
+    result
 }
 
 #[test]
@@ -206,4 +263,24 @@ fn client_decodes_chunked_response_with_split_terminator() {
     let response = result.expect("client must succeed on split terminator");
     assert_eq!(response.status, StatusCode::OK);
     assert_eq!(response.body.as_buffered(), Some(expected.as_slice()));
+}
+
+#[test]
+fn client_partial_chunked_peer_close_errors() {
+    let result = run_client_against_raw_peer(
+        b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhe",
+    );
+
+    assert!(matches!(result, Err(HttpClientError::Closed)), "{result:?}");
+}
+
+#[test]
+fn client_complete_chunked_peer_close_decodes() {
+    let result = run_client_against_raw_peer(
+        b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n",
+    );
+
+    let response = result.expect("client must decode complete chunked body");
+    assert_eq!(response.status, StatusCode::OK);
+    assert_eq!(response.body.as_buffered(), Some(b"hello".as_slice()));
 }

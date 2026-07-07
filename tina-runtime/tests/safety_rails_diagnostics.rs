@@ -1,4 +1,4 @@
-//! Diagnostic-phrase pinning for the Phase 100 safety rails.
+//! Diagnostic-phrase pinning for compile-time safety rails.
 //!
 //! Compile-fail doctests (see `tina-runtime/src/registration.rs` and
 //! `src/call/`)

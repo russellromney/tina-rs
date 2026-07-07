@@ -36,7 +36,7 @@ impl Isolate for Noop {
         reply: Infallible,
         send: tina::Outbound<Infallible>,
         spawn: Infallible,
-        call: Infallible,
+        io: Infallible,
         shard: SingleShard,
     }
 

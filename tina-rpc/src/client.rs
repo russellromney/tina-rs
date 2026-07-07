@@ -422,7 +422,7 @@ where
     Self: tina::Isolate<
             Message = ClientMsg,
             Send = Outbound<ClientResultMsg>,
-            Call = RuntimeCall<ClientMsg>,
+            Io = RuntimeCall<ClientMsg>,
         >,
 {
     fn frame_limits(&self) -> FrameLimits {
@@ -820,7 +820,7 @@ where
     type Send = Outbound<ClientResultMsg>;
     type Spawn = std::convert::Infallible;
     type SpawnObserved = std::convert::Infallible;
-    type Call = RuntimeCall<ClientMsg>;
+    type Io = RuntimeCall<ClientMsg>;
     type Fact = ::std::convert::Infallible;
     type Shard = S;
 
@@ -955,7 +955,7 @@ mod tests {
         // First Begin: dispatches tcp_connect.
         let first = dispatch(&mut client, ClientMsg::Begin);
         assert!(
-            matches!(first, Effect::Call(_)),
+            matches!(first, Effect::Io(_)),
             "first Begin must dispatch the connect"
         );
         assert!(client.connect_dispatched);
@@ -976,7 +976,7 @@ mod tests {
     fn deadline_fire_emits_only_send_no_wire_write() {
         // Wire-error invariant: a local timeout produces a user
         // notification (Effect::Send) but never a wire frame
-        // (Effect::Call(tcp_write...)).
+        // (Effect::Io(tcp_write...)).
         let mut client = make_client(small_config());
         let _ = dispatch(&mut client, ClientMsg::Begin);
         let _ = dispatch(&mut client, ClientMsg::Request(make_request(99, 50)));
@@ -987,7 +987,7 @@ mod tests {
         fn count<I: tina::Isolate>(eff: &Effect<I>, sends: &mut usize, calls: &mut usize) {
             match eff {
                 Effect::Send(_) => *sends += 1,
-                Effect::Call(_) => *calls += 1,
+                Effect::Io(_) => *calls += 1,
                 Effect::Batch(items) => items.iter().for_each(|e| count(e, sends, calls)),
                 _ => {}
             }

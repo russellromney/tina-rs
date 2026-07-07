@@ -126,7 +126,7 @@ impl Isolate for Coordinator {
         reply: (),
         send: Outbound<WorkerEvent>,
         spawn: Infallible,
-        call: Infallible,
+        io: Infallible,
         shard: WorkShard,
     }
 
@@ -207,7 +207,7 @@ impl Isolate for Worker {
         reply: (),
         send: Outbound<CoordinatorEvent>,
         spawn: Infallible,
-        call: Infallible,
+        io: Infallible,
         shard: WorkShard,
     }
 

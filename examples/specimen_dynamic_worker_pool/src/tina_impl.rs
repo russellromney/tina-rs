@@ -46,9 +46,9 @@ impl Worker {
 
 #[derive(Debug, Clone)]
 pub enum CoordMsg {
-    /// Host kicks off the fanout. Phase 064 Rock 3 removed the old
-    /// `Begin { self_addr }` ceremony — the coord now learns its own
-    /// address at registration via `register_with_capacity_using`.
+    /// Host kicks off the fanout. No `Begin { self_addr }` ceremony:
+    /// the coord learns its own address at registration via
+    /// `register_with_capacity_using`.
     Start,
     /// One child finished. Carries its partial sum.
     WorkerDone(u64),

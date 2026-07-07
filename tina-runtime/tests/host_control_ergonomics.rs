@@ -14,7 +14,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use tina::prelude::*;
-use tina::{CallRejectedReason, RequestContext, reply_to_request};
+use tina::{CallRejectedReason, RequestContext, reply_to};
 use tina_runtime::{
     CallOutcome, DefaultThreadedMailboxFactory, ShutdownRequestError, ShutdownWaitError,
     ThreadedMultiShardRuntime, ThreadedRuntime, ThreadedRuntimeConfig, ThreadedRuntimeError, sleep,
@@ -66,7 +66,7 @@ struct SilentMS;
 impl SilentMS {
     fn handle(&mut self, msg: SilentMsg, _ctx: &mut Context<'_, TestShard, u32>) -> Effect<Self> {
         match msg {
-            SilentMsg::Done(req) => reply_to_request(req, 0),
+            SilentMsg::Done(req) => reply_to(req, 0),
             SilentMsg::Hold => noop(),
         }
     }

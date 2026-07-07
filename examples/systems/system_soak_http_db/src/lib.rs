@@ -376,7 +376,7 @@ pub fn run(config: RunConfig) -> anyhow::Result<RunReport> {
         }
     }
 
-    // Aggregate everything into a ServicePressureReport (Rock 1).
+    // Aggregate everything into a ServicePressureReport .
     let mut summary = ServicePressureReport::new("soak_http_db");
     summary.add_surface(ServicePressureSurface::measured(
         "soak.http.in_flight",

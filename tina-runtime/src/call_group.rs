@@ -418,7 +418,7 @@ where
         translator: F,
     ) -> Result<tina::Effect<I>, CallGroupStartError<K>>
     where
-        I: tina::Isolate<Message = M, Call = RuntimeCall<M>>,
+        I: tina::Isolate<Message = M, Io = RuntimeCall<M>>,
         F: FnOnce(K, CallGroupToken, CallOutcome<R>) -> M + 'static,
         K: Clone + 'static,
         M: 'static,
@@ -972,7 +972,7 @@ where
         translator: F,
     ) -> Result<tina::Effect<I>, CallSetStartError<K>>
     where
-        I: tina::Isolate<Message = M, Call = RuntimeCall<M>>,
+        I: tina::Isolate<Message = M, Io = RuntimeCall<M>>,
         F: FnOnce(K, CallGroupToken, CallOutcome<R>) -> M + 'static,
         K: Clone + 'static,
         M: 'static,
@@ -1244,7 +1244,7 @@ where
         translator: F,
     ) -> Result<tina::Effect<I>, CallSetStartError<K>>
     where
-        I: tina::Isolate<Message = M, Call = RuntimeCall<M>>,
+        I: tina::Isolate<Message = M, Io = RuntimeCall<M>>,
         F: FnOnce(K, CallGroupToken, CallOutcome<R>) -> M + 'static,
         K: Clone + 'static,
         M: 'static,

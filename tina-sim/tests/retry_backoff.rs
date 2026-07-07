@@ -43,7 +43,7 @@ impl Isolate for RetryWorker {
         reply: (),
         send: Outbound<RetryEvent>,
         spawn: Infallible,
-        call: RuntimeCall<RetryEvent>,
+        io: RuntimeCall<RetryEvent>,
         shard: TestShard,
     }
 

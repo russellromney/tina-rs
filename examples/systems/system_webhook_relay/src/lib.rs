@@ -276,7 +276,7 @@ impl Isolate for Relay {
         reply: RelayReply,
         send: tina::Outbound<Infallible>,
         spawn: Infallible,
-        call: RuntimeCall<RelayMsg>,
+        io: RuntimeCall<RelayMsg>,
         shard: SingleShard,
     }
 
@@ -289,11 +289,11 @@ impl Isolate for Relay {
             RelayMsg::Deliver(_) | RelayMsg::Stats => noop(),
             RelayMsg::FakeFinished { request, outcome } => {
                 let reply = self.classify_and_tally(outcome);
-                reply_to_request(request, reply)
+                reply_to(request, reply)
             }
             RelayMsg::SqsFinished { request, outcome } => {
                 let reply = self.classify_and_tally(map_sqs_outcome(outcome));
-                reply_to_request(request, reply)
+                reply_to(request, reply)
             }
         }
     }

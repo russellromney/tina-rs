@@ -43,7 +43,7 @@ callers settling.
 - `Shutdown` rides the same bounded mailbox as the regular
   `Submit` traffic. With six in-flight callers and a 64-slot
   frontend mailbox there is plenty of room; the host calls
-  `runtime.send_observed_until(...)` (Phase 062 Rock 4) which
+  `runtime.send_observed_until(...)` (the observed-send retry helper) which
   retries `MailboxFull` / `IngressFull` up to a deadline. The
   hand-rolled retry loop is gone, but the underlying shape (a
   control message rides the data mailbox) is the same one in

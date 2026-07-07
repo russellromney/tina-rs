@@ -410,9 +410,9 @@ impl ChainService {
         match msg {
             ChainMsg::Run => noop(),
             ChainMsg::PingReturned(request, CallOutcome::Replied(PingReply::Pong)) => {
-                reply_to_request(request, ChainReply::Done)
+                reply_to(request, ChainReply::Done)
             }
-            ChainMsg::PingReturned(request, _) => reply_to_request(request, ChainReply::Done),
+            ChainMsg::PingReturned(request, _) => reply_to(request, ChainReply::Done),
         }
     }
 
@@ -2058,7 +2058,7 @@ fn http2_h2c_client_steady_state_post_row() -> anyhow::Result<PerfReport> {
 // The smallest public unary gRPC row: a `GrpcRouter` service behind the real
 // `Http2Listener`, driven by the public `grpc_unary_call_h2c_blocking` client.
 // It exercises gRPC request framing, the HTTP/2 server response path (the
-// by-value buffered-response writer this phase introduced), and gRPC trailer
+// by-value buffered-response writer), and gRPC trailer
 // status. `connection_setup` kind: one fresh h2c connection per op (the
 // blocking client is one-shot), so this is a setup row, not a steady-state one.
 

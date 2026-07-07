@@ -410,7 +410,7 @@ impl<S: Shard + 'static> SnsWorker<S> {
         result: SnsResult,
     ) -> Effect<Self> {
         match request_context {
-            Some(request) => reply_to_request(request, result),
+            Some(request) => reply_to(request, result),
             None => reply::<Self>(result),
         }
     }
@@ -421,7 +421,7 @@ impl<S: Shard + 'static> SnsWorker<S> {
         result: SnsResult,
     ) -> Effect<Self> {
         match request_context {
-            Some(request) => reply_to_request(request, result),
+            Some(request) => reply_to(request, result),
             None if reply_plain => reply::<Self>(result),
             None => noop(),
         }
@@ -480,7 +480,7 @@ impl<S: Shard + 'static> Isolate for SnsWorker<S> {
         reply: SnsResult,
         send: tina::Outbound<Infallible>,
         spawn: Infallible,
-        call: RuntimeCall<SnsMsg>,
+        io: RuntimeCall<SnsMsg>,
         shard: S,
     }
 

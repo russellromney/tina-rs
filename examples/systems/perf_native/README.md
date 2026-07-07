@@ -54,7 +54,7 @@ bounded Tokio design did the same job in microseconds:
 | `http1_keepalive_sequential` | 38.88 ms | 2.16 ms | 1.99 ms |
 
 (Local release run, Apple Silicon. HTTP rows vary run-to-run; the host
-send/call rows are stable. Saved evidence lives beside the phase plan.)
+send/call rows are stable. Saved evidence lives beside the perf notes.)
 
 The probes named the cause exactly. `hotpath_try_send` was 42 ns before and
 after — the first queue handoff was never the problem. `hotpath_call_blocking`
@@ -96,7 +96,7 @@ What is still bad (named, not hidden):
 - The HTTP rows now have whole-process allocation rows. Tina HTTP still
   allocates roughly 1.45-1.8x the Axum comparison row on the same request.
 
-**Rock 5 landed**: the per-call `HostCallDriver` registration is gone,
+**Host-call dispatcher pool**: the per-call `HostCallDriver` registration is gone,
 replaced by a pool of `HOST_CALL_DISPATCHER_POOL_SIZE = 8` long-lived
 dispatcher isolates per worker, round-robin selected via a wrapping atomic
 counter. Each `call_blocking` now pushes a `Box<dyn HostCallTaskBegin<S>>`
@@ -120,7 +120,7 @@ Measured before/after the host-call dispatcher pool and reply channel pool:
 | probe p50 (single host thread)      | ~190 µs | ~198 µs |
 | perf row p50 (4 concurrent threads) | ~210 µs | ~205 µs |
 
-## Phase 146 owned-buffer pass
+## Owned-buffer pass
 
 The next pass added Tina-shaped owned-buffer calls:
 
@@ -151,15 +151,15 @@ Suggested next follow-ups:
 - Add more repeated-run history before any public performance claim.
 - Verify Linux/x86_64 perf behavior; these rows were measured on macOS aarch64.
 
-## Phase 147 HTTP turn/allocation pass
+## HTTP turn/allocation pass
 
-Phase 146 also left two evidence holes:
+The owned-buffer pass also left two evidence holes:
 
 - `perf-process` rows counted allocations but not allocated bytes;
 - checked-in history rows did not carry platform/arch/profile, so macOS and
   Linux could be mixed accidentally.
 
-Phase 147 fixes those first. The default history now lives at
+The HTTP turn/allocation pass fixes those first. The default history now lives at
 `.intent/phases/147-http-turn-allocation-cost/perf_history.jsonl`, and rows
 carry `platform`, `arch`, and `profile`.
 
@@ -189,11 +189,11 @@ zero.
 Current verdict: keep the evidence, keep optimizing, do not make a production
 performance claim yet.
 
-## Phase 154 gRPC hot path
+## gRPC hot path
 
-Phase 153 made the problem visible: the original gRPC row was fresh-connection
+Earlier protocol measurements made the problem visible: the original gRPC row was fresh-connection
 heavy, and the warmed rows still paid request/header/body allocation churn.
-Phase 154 adds the first real gRPC-specific hot path:
+The gRPC hot path adds the first real gRPC-specific hot path:
 
 - `GrpcClient::unary_request` now submits `Http2ClientMsg::SubmitGrpcUnary`.
   The HTTP/2 client emits fixed gRPC headers directly instead of building a
@@ -223,9 +223,9 @@ rows for gRPC remain in the ~4k-5k allocation range for 32 ops because server
 and connection internals still allocate heavily. The next real work is protocol
 turn count plus server/client internal allocation shape, not more API wrappers.
 
-## Phase 148 performance rows
+## Performance rows
 
-Phase 148 moves the append-only perf history to
+The performance-row tooling moves the append-only perf history to
 `.intent/phases/148-native-performance-linux-turn-soak/perf_history.jsonl`.
 `scripts/perf_record.sh` now records three row families:
 
@@ -250,15 +250,15 @@ Linux/x86 evidence is opt-in and manual for now. Maintainers can run the
 manual GitHub workflow named `perf` on Ubuntu, or run `make perf-record` on a
 Linux/x86_64 machine and keep the resulting JSONL rows with the review.
 
-Phase 148 also removes one small HTTP/1 allocation source: coalesced buffered
+The performance-row pass also removes one small HTTP/1 allocation source: coalesced buffered
 responses reserve head + body capacity once instead of encoding the head and
 then growing the buffer when the body is appended. This is a real cleanup, not
 a production-speed claim. HTTP close/keepalive still spend many runtime turns,
 and Linux rows still need repeated evidence.
 
-## Phase 149 structural rows
+## Structural rows
 
-Phase 149 keeps the same humility but measures sharper things:
+The structural row pass keeps the same humility but measures sharper things:
 
 - hotpath rows now print `event_stage_count`, `handler_turn_count`,
   `runtime_call_count`, `service_call_count`, `completion_count`, and
@@ -270,7 +270,7 @@ Phase 149 keeps the same humility but measures sharper things:
   removing the `WroteClose` handler turn only when the TCP rail reports a full
   successful write and close.
 
-Local macOS/aarch64 sample from the Phase 149 branch:
+Local macOS/aarch64 sample from the structural row branch:
 
 | row | Tina p50 | Axum p50 | note |
 | --- | --- | --- | --- |
@@ -300,7 +300,7 @@ Current verdict:
   proof;
 - Linux/x86 rows still need repeated evidence before public performance claims.
 
-## Phase 150 scheduler/turn/tail rows
+## Scheduler/turn/tail rows
 
 This pass measures distribution shape, not just the median, and chases
 scheduler cost rather than one more buffer reserve.
@@ -320,12 +320,12 @@ remaining host allocation is the type-erased begin task for the shared
 dispatcher. `CALL_HOST_ALLOCATIONS_CEILING` is pinned at 2 to catch a
 regression.
 
-Linux/x86 evidence (Fly performance-2x, dedicated CPU; saved in the phase dir
+Linux/x86 evidence (Fly performance-2x, dedicated CPU; saved in the perf note dir
 `perf_sample_linux.txt`). Warmed `hotpath_call_blocking_tail` p50 about
 25.7 µs -> 13.5-15.1 µs across two runs, host alloc 2 -> 1; HTTP rows steady at
 ~1.17 ms. Local/alpha, single machine, not a production claim.
 
-Phase 150 found the dominant old HTTP cost: a wakeup gap, not request work. The
+The scheduler/tail pass found the dominant old HTTP cost: a wakeup gap, not request work. The
 `hotpath_http1_close_request` p50 (~1.17 ms) was almost entirely one stage,
 `host_submit -> mbox_accepted` (~1.09 ms): the worker re-polled the I/O loop on
 a timer instead of waking on socket readiness, so an incoming connection waited
@@ -336,15 +336,15 @@ hotpath probe; rows in `idle_repoll_ab_linux.txt`) showed the gap tracking the
 park interval almost exactly — 1 ms -> http close p50 1.16 ms, 100 µs ->
 0.23 ms (~5x).
 
-Phase 151 briefly removed this gap by parking on kernel readiness, but Phase 157
-reverted that path to preserve Tina's explicit completion/event architecture.
+The kernel-readiness experiment briefly removed this gap by parking on kernel readiness,
+but that path was reverted to preserve Tina's explicit completion/event architecture.
 The diagnosis still matters: HTTP latency tracks the bounded re-poll interval.
 The `TINA_PERF_IDLE_REPOLL_US` knob remains the probe for that tradeoff, not a
 production tuning recommendation.
 
-## Phase 152 protocol rows and byte-path cost
+## Protocol rows and byte-path cost
 
-The worker is awake now (Phase 151). This pass measures HTTP/2 and WebSocket the
+The worker-readiness path is measurable now. This pass measures HTTP/2 and WebSocket the
 way HTTP/1 is measured, separates connection setup from steady-state service
 cost, and removes one real protocol-internal copy.
 
@@ -411,13 +411,13 @@ The buffered HTTP/2 response path used to copy each body chunk twice: once into 
 when it spliced the 9-byte header in front. The server now builds each DATA frame
 straight into the queued buffer — header bytes via a new `push_frame_header`
 helper, then `extend_from_slice(chunk)` — so a body chunk is copied once. At this
-(Phase 152) step the per-frame `ensure_outbound_slots(1)` admission was kept, so
+protocol-row step the per-frame `ensure_outbound_slots(1)` admission was kept, so
 the bounded outbound-queue cap and the `connection_full` accounting were
-byte-for-byte identical and the wire output unchanged. (Phase 153 below then
+byte-for-byte identical and the wire output unchanged. (the real protocol performance section below then
 coalesces the whole buffered response into a single queued write, so a buffered
 response now takes one outbound slot instead of one per frame — the queue-full
 guard still applies, but the per-frame-count admission bound is gone. See the
-Phase 153 section.)
+real protocol performance section.)
 
 Measured by the `perf-h2-alloc` check inside `hotpath_probes_report_and_stay_bounded`
 (it calls `http2_steady_state_response_process_allocations`; the ceiling lives in
@@ -451,16 +451,16 @@ while a body follows.
 
 ### Rows that are platform-specific
 
-All Phase 152 numbers above are macOS/aarch64 local/alpha. The
+All protocol-row numbers above are macOS/aarch64 local/alpha. The
 `H2_BUFFERED_RESPONSE_ALLOC_CEILING` in the hotpath test is calibrated on
 macOS/aarch64 and is a regression guard (the regression is +64 over 64
-responses), not a cross-platform constant. Linux/x86 evidence for this phase is
-collected separately via the Fly/Ubuntu workflow and saved beside the phase
-plan.
+responses), not a cross-platform constant. Linux/x86 evidence for this protocol
+row set is collected separately via the Fly/Ubuntu workflow and saved beside the
+perf notes.
 
-## Phase 153 real protocol performance
+## Real protocol performance
 
-Phase 152 measured the problem. Phase 153 changed the protocol code: move
+Protocol rows measured the problem. The protocol code now moves
 bytes instead of cloning them, allocate fewer things, take fewer turns — on the
 public paths users call. Before/after rows are same-machine (macOS/aarch64),
 same `--release` build, same rows, same sample policy; the full table and raw
@@ -470,7 +470,7 @@ logs live in `.intent/phases/153-real-protocol-performance/`
 This landed in two passes: a leaf-copy pass (move payloads instead of cloning
 at named sites), then a structural pass that attacks the real per-request costs
 the evidence surfaced (the leaf copies alone were ~one allocation out of ~48 —
-too marginal). Numbers below are the Phase 152 baseline → Phase 153 final, same
+too marginal). Numbers below are the protocol-row baseline -> final optimized path, same
 machine.
 
 ### What got cheaper
@@ -487,7 +487,7 @@ machine.
   (**−47%**).
 - **Native HTTP/2 client row** (`http2_h2c_client_steady_state_post`): one
   native `Http2ClientConnection` submits buffered POSTs to the native server over
-  a warmed h2c connection. With the row code copied onto the Phase 152 base,
+  a warmed h2c connection. With the row code copied onto the protocol-row base,
   whole-process allocations 4266 → **3643** (**−14.6%**), allocated bytes
   2161066 → **1685168** (**−22%**), p50 1287 → **1051 µs**. The row's
   load-worker allocation scope is unchanged because request construction still
@@ -521,7 +521,7 @@ machine.
   the whole session 133 → **67** (2.08 → **1.05**/message). Removing the
   duplicate delivery removes one app turn per wire event; the coalesced HTTP/2
   response likewise drops a write turn (one write per response, not one per
-  frame). The hotpath assertion pins `app_turns < 2*N`; the Phase 152 code fails
+  frame). The hotpath assertion pins `app_turns < 2*N`; the protocol-row baseline fails
   it, the new code passes.
 
 Steady-state (reused-connection) rows improved or held. The `connection_setup`
@@ -598,7 +598,7 @@ as "protocol frame" work.
 
 ### Platform
 
-Phase 153 has both macOS/aarch64 and Linux/x86_64 evidence. Linux rows were
+The real protocol performance pass has both macOS/aarch64 and Linux/x86_64 evidence. Linux rows were
 captured on Fly `performance-2x` and saved in
 `.intent/phases/153-real-protocol-performance/perf_sample_linux.txt`; Linux
 validation output is saved beside it in `linux_validation.txt`.
@@ -607,7 +607,7 @@ The first Linux run reproduced the deterministic allocation wins but surfaced a
 real bug: native HTTP/2 client POST and gRPC close both showed an ~88 ms p50
 floor while the server-only HTTP/2 row was healthy. That was tiny HTTP/2 writes
 meeting Linux delayed ACK/Nagle behavior, not a scheduler or framing cost. The
-final Phase 153 code fixes it in three places:
+final protocol code fixes it in three places:
 
 - runtime TCP accept/connect sockets set TCP_NODELAY;
 - the native HTTP/2 client coalesces already-ready frames into one pending

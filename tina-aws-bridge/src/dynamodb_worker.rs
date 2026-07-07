@@ -428,7 +428,7 @@ impl<S: Shard + 'static> DynamoWorker<S> {
         result: DynamoResult,
     ) -> Effect<Self> {
         match request_context {
-            Some(request) => reply_to_request(request, result),
+            Some(request) => reply_to(request, result),
             None => reply::<Self>(result),
         }
     }
@@ -439,7 +439,7 @@ impl<S: Shard + 'static> DynamoWorker<S> {
         result: DynamoResult,
     ) -> Effect<Self> {
         match request_context {
-            Some(request) => reply_to_request(request, result),
+            Some(request) => reply_to(request, result),
             None if reply_plain => reply::<Self>(result),
             None => noop(),
         }
@@ -498,7 +498,7 @@ impl<S: Shard + 'static> Isolate for DynamoWorker<S> {
         reply: DynamoResult,
         send: tina::Outbound<Infallible>,
         spawn: Infallible,
-        call: RuntimeCall<DynamoMsg>,
+        io: RuntimeCall<DynamoMsg>,
         shard: S,
     }
 

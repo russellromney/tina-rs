@@ -97,7 +97,7 @@ impl Isolate for Caller {
         reply: (),
         send: tina::Outbound<Infallible>,
         spawn: Infallible,
-        call: RuntimeCall<CallerMsg>,
+        io: RuntimeCall<CallerMsg>,
         shard: SingleShard,
     }
 
@@ -183,7 +183,7 @@ impl Isolate for QueryCaller {
         reply: (),
         send: tina::Outbound<Infallible>,
         spawn: Infallible,
-        call: RuntimeCall<QueryCallerMsg>,
+        io: RuntimeCall<QueryCallerMsg>,
         shard: SingleShard,
     }
 

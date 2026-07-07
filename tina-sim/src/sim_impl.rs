@@ -70,13 +70,9 @@ where
     #[allow(private_bounds)]
     pub fn register<I, Msg, Outbound>(&mut self, isolate: I) -> Address<Msg, I::Reply>
     where
-        I: Isolate<
-                Message = Msg,
-                Shard = S,
-                Send = TinaOutbound<Outbound>,
-                Call = RuntimeCall<Msg>,
-            > + 'static,
-        I::Call: RuntimeCallable,
+        I: Isolate<Message = Msg, Shard = S, Send = TinaOutbound<Outbound>, Io = RuntimeCall<Msg>>
+            + 'static,
+        I::Io: RuntimeCallable,
         I::Spawn: IntoErasedSpawn<S> + 'static,
         I::SpawnObserved: IntoErasedSpawnObserved<S, I::Message> + 'static,
         I::SpawnObservedRemote: IntoSimRemoteSpawnObserved<S, I::Message> + 'static,
@@ -91,11 +87,11 @@ where
 
     /// Registers one isolate with an explicit simulator mailbox capacity.
     ///
-    /// The redundant `I::Call: RuntimeCallable` bound
+    /// The redundant `I::Io: RuntimeCallable` bound
     /// surfaces a targeted compile diagnostic when an isolate authored
-    /// with `#[tina::isolate(...)]` (which defaults `Call = Infallible`)
+    /// with `#[tina::isolate(...)]` (which defaults `Io = Infallible`)
     /// is registered with the simulator: instead of an opaque
-    /// `Call = RuntimeCall<...>` mismatch, Rust also reports that
+    /// `Io = RuntimeCall<...>` mismatch, Rust also reports that
     /// `Infallible: RuntimeCallable` is not satisfied, and the trait's
     /// `#[diagnostic::on_unimplemented]` note points at the
     /// `#[tina_runtime::isolate(...)]` fix.
@@ -106,13 +102,9 @@ where
         mailbox_capacity: usize,
     ) -> Address<Msg, I::Reply>
     where
-        I: Isolate<
-                Message = Msg,
-                Shard = S,
-                Send = TinaOutbound<Outbound>,
-                Call = RuntimeCall<Msg>,
-            > + 'static,
-        I::Call: RuntimeCallable,
+        I: Isolate<Message = Msg, Shard = S, Send = TinaOutbound<Outbound>, Io = RuntimeCall<Msg>>
+            + 'static,
+        I::Io: RuntimeCallable,
         I::Spawn: IntoErasedSpawn<S> + 'static,
         I::SpawnObserved: IntoErasedSpawnObserved<S, I::Message> + 'static,
         I::SpawnObservedRemote: IntoSimRemoteSpawnObserved<S, I::Message> + 'static,
@@ -746,7 +738,7 @@ where
                 }
                 false
             }
-            ErasedEffect::Call(call) => {
+            ErasedEffect::Io(call) => {
                 let requester = RegisteredAddress {
                     shard: self.shard.id(),
                     isolate: isolate_id,
@@ -1072,12 +1064,8 @@ where
         mailbox_capacity: usize,
     ) -> RegisteredAddress
     where
-        I: Isolate<
-                Message = Msg,
-                Shard = S,
-                Send = TinaOutbound<Outbound>,
-                Call = RuntimeCall<Msg>,
-            > + 'static,
+        I: Isolate<Message = Msg, Shard = S, Send = TinaOutbound<Outbound>, Io = RuntimeCall<Msg>>
+            + 'static,
         I::Spawn: IntoErasedSpawn<S> + 'static,
         I::SpawnObserved: IntoErasedSpawnObserved<S, I::Message> + 'static,
         I::SpawnObservedRemote: IntoSimRemoteSpawnObserved<S, I::Message> + 'static,
@@ -1123,12 +1111,8 @@ where
         cause: tina_runtime::CauseId,
     ) -> RegisteredAddress
     where
-        I: Isolate<
-                Message = Msg,
-                Shard = S,
-                Send = TinaOutbound<Outbound>,
-                Call = RuntimeCall<Msg>,
-            > + 'static,
+        I: Isolate<Message = Msg, Shard = S, Send = TinaOutbound<Outbound>, Io = RuntimeCall<Msg>>
+            + 'static,
         I::Spawn: IntoErasedSpawn<S> + 'static,
         I::SpawnObserved: IntoErasedSpawnObserved<S, I::Message> + 'static,
         I::SpawnObservedRemote: IntoSimRemoteSpawnObserved<S, I::Message> + 'static,
@@ -1178,12 +1162,8 @@ where
         bootstrap_message: Option<Msg>,
     ) -> SpawnOutcome<S>
     where
-        I: Isolate<
-                Message = Msg,
-                Shard = S,
-                Send = TinaOutbound<Outbound>,
-                Call = RuntimeCall<Msg>,
-            > + 'static,
+        I: Isolate<Message = Msg, Shard = S, Send = TinaOutbound<Outbound>, Io = RuntimeCall<Msg>>
+            + 'static,
         I::Spawn: IntoErasedSpawn<S> + 'static,
         I::SpawnObserved: IntoErasedSpawnObserved<S, I::Message> + 'static,
         I::SpawnObservedRemote: IntoSimRemoteSpawnObserved<S, I::Message> + 'static,
@@ -6220,7 +6200,7 @@ where
 
 impl<I, S, Msg, Outbound> ErasedSpawn<S> for SpawnAdapter<I, Outbound>
 where
-    I: Isolate<Message = Msg, Shard = S, Send = TinaOutbound<Outbound>, Call = RuntimeCall<Msg>>
+    I: Isolate<Message = Msg, Shard = S, Send = TinaOutbound<Outbound>, Io = RuntimeCall<Msg>>
         + 'static,
     I::Spawn: IntoErasedSpawn<S> + 'static,
     I::SpawnObserved: IntoErasedSpawnObserved<S, I::Message> + 'static,
@@ -6254,7 +6234,7 @@ where
 
 impl<I, S, Msg, Outbound> IntoErasedSpawn<S> for ChildDefinition<I>
 where
-    I: Isolate<Message = Msg, Shard = S, Send = TinaOutbound<Outbound>, Call = RuntimeCall<Msg>>
+    I: Isolate<Message = Msg, Shard = S, Send = TinaOutbound<Outbound>, Io = RuntimeCall<Msg>>
         + 'static,
     I::Spawn: IntoErasedSpawn<S> + 'static,
     I::SpawnObserved: IntoErasedSpawnObserved<S, I::Message> + 'static,
@@ -6290,7 +6270,7 @@ where
 
 impl<I, S, Msg, Outbound> SimRemoteSpawn<S> for SimRemoteSpawnAdapter<I, Outbound>
 where
-    I: Isolate<Message = Msg, Shard = S, Send = TinaOutbound<Outbound>, Call = RuntimeCall<Msg>>
+    I: Isolate<Message = Msg, Shard = S, Send = TinaOutbound<Outbound>, Io = RuntimeCall<Msg>>
         + 'static,
     I::Spawn: IntoErasedSpawn<S> + 'static,
     I::SpawnObserved: IntoErasedSpawnObserved<S, I::Message> + 'static,
@@ -6322,7 +6302,7 @@ where
 
 impl<I, S, Msg, Outbound> IntoSimRemoteSpawn<S> for ChildDefinition<I>
 where
-    I: Isolate<Message = Msg, Shard = S, Send = TinaOutbound<Outbound>, Call = RuntimeCall<Msg>>
+    I: Isolate<Message = Msg, Shard = S, Send = TinaOutbound<Outbound>, Io = RuntimeCall<Msg>>
         + 'static,
     I::Spawn: IntoErasedSpawn<S> + 'static,
     I::SpawnObserved: IntoErasedSpawnObserved<S, I::Message> + 'static,
@@ -6405,7 +6385,7 @@ where
 
 impl<I, S, Msg, Outbound> ErasedSpawn<S> for RestartableSpawnAdapter<I, Outbound>
 where
-    I: Isolate<Message = Msg, Shard = S, Send = TinaOutbound<Outbound>, Call = RuntimeCall<Msg>>
+    I: Isolate<Message = Msg, Shard = S, Send = TinaOutbound<Outbound>, Io = RuntimeCall<Msg>>
         + 'static,
     I::Spawn: IntoErasedSpawn<S> + 'static,
     I::SpawnObserved: IntoErasedSpawnObserved<S, I::Message> + 'static,
@@ -6445,7 +6425,7 @@ where
 
 impl<I, S, Msg, Outbound> ErasedRestartRecipe<S> for RestartableSpawnAdapter<I, Outbound>
 where
-    I: Isolate<Message = Msg, Shard = S, Send = TinaOutbound<Outbound>, Call = RuntimeCall<Msg>>
+    I: Isolate<Message = Msg, Shard = S, Send = TinaOutbound<Outbound>, Io = RuntimeCall<Msg>>
         + 'static,
     I::Spawn: IntoErasedSpawn<S> + 'static,
     I::SpawnObserved: IntoErasedSpawnObserved<S, I::Message> + 'static,
@@ -6470,7 +6450,7 @@ where
 
 impl<I, S, Msg, Outbound> IntoErasedSpawn<S> for RestartableChildDefinition<I>
 where
-    I: Isolate<Message = Msg, Shard = S, Send = TinaOutbound<Outbound>, Call = RuntimeCall<Msg>>
+    I: Isolate<Message = Msg, Shard = S, Send = TinaOutbound<Outbound>, Io = RuntimeCall<Msg>>
         + 'static,
     I::Spawn: IntoErasedSpawn<S> + 'static,
     I::SpawnObserved: IntoErasedSpawnObserved<S, I::Message> + 'static,

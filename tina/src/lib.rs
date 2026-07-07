@@ -14,14 +14,13 @@
 //!
 //! # Effect Shape
 //!
-//! Phase Sputnik resolves the roadmap's first open question in favor of a
-//! **closed** [`Effect`] enum rather than a per-isolate associated effect type.
+//! Tina uses a **closed** [`Effect`] enum rather than a per-isolate associated
+//! effect type.
 //!
-//! This keeps the dispatcher contract small and uniform: every isolate can only
-//! ask for the same handful of verbs (`Reply`, `Send`, `Spawn`, `Stop`,
-//! `RestartChildren`, `Call`, and ordered `Batch`). That simplicity matters
-//! for the runtime crates we add in later phases, because they can switch on
-//! one shared enum instead of handling an open-ended effect language for every
+//! This keeps the dispatcher contract small and uniform: every isolate asks
+//! for runtime work through the same enum. The enum has an explicit variant for
+//! each supported runtime action; runtime crates can switch on one shared
+//! envelope instead of handling an open-ended effect language for every
 //! isolate.
 //!
 //! The tradeoff is that the effect *payloads* stay per-isolate via associated
@@ -29,7 +28,7 @@
 //! packages an outbound send, and what data is needed to request a spawn, while
 //! the dispatcher still sees one common envelope. The downside is that adding a
 //! brand-new verb means changing this crate, not just defining a new associated
-//! type. That is a deliberate Sputnik constraint.
+//! type.
 //!
 //! # Example
 //!
@@ -181,7 +180,7 @@ pub use tina_macros::flow;
 pub use tina_macros::isolate;
 
 // ---------------------------------------------------------------------------
-// Module map (Phase 115 reorg)
+// Module map
 // ---------------------------------------------------------------------------
 //
 // The `tina` trait crate is being split into module homes so future agents
@@ -228,7 +227,7 @@ pub use isolate::*;
 ///         reply: (),
 ///         send: tina::Outbound<std::convert::Infallible>,
 ///         spawn: std::convert::Infallible,
-///         call: std::convert::Infallible,
+///         io: std::convert::Infallible,
 ///         shard: DemoShard,
 ///     }
 ///
@@ -256,7 +255,7 @@ macro_rules! isolate_types {
         spawn: $spawn:ty,
         spawn_observed: $spawn_observed:ty,
         spawn_observed_remote: $spawn_observed_remote:ty,
-        call: $call:ty,
+        io: $io:ty,
         fact: $fact:ty,
         shard: $shard:ty $(,)?
     ) => {
@@ -266,7 +265,7 @@ macro_rules! isolate_types {
         type Spawn = $spawn;
         type SpawnObserved = $spawn_observed;
         type SpawnObservedRemote = $spawn_observed_remote;
-        type Call = $call;
+        type Io = $io;
         type Fact = $fact;
         type Shard = $shard;
     };
@@ -276,7 +275,7 @@ macro_rules! isolate_types {
         send: $send:ty,
         spawn: $spawn:ty,
         spawn_observed: $spawn_observed:ty,
-        call: $call:ty,
+        io: $io:ty,
         fact: $fact:ty,
         shard: $shard:ty $(,)?
     ) => {
@@ -285,7 +284,7 @@ macro_rules! isolate_types {
         type Send = $send;
         type Spawn = $spawn;
         type SpawnObserved = $spawn_observed;
-        type Call = $call;
+        type Io = $io;
         type Fact = $fact;
         type Shard = $shard;
     };
@@ -295,7 +294,7 @@ macro_rules! isolate_types {
         send: $send:ty,
         spawn: $spawn:ty,
         spawn_observed: $spawn_observed:ty,
-        call: $call:ty,
+        io: $io:ty,
         shard: $shard:ty $(,)?
     ) => {
         $crate::isolate_types! {
@@ -304,7 +303,7 @@ macro_rules! isolate_types {
             send: $send,
             spawn: $spawn,
             spawn_observed: $spawn_observed,
-            call: $call,
+            io: $io,
             fact: ::core::convert::Infallible,
             shard: $shard,
         }
@@ -314,7 +313,7 @@ macro_rules! isolate_types {
         reply: $reply:ty,
         send: $send:ty,
         spawn: $spawn:ty,
-        call: $call:ty,
+        io: $io:ty,
         fact: $fact:ty,
         shard: $shard:ty $(,)?
     ) => {
@@ -324,7 +323,7 @@ macro_rules! isolate_types {
             send: $send,
             spawn: $spawn,
             spawn_observed: ::core::convert::Infallible,
-            call: $call,
+            io: $io,
             fact: $fact,
             shard: $shard,
         }
@@ -334,7 +333,7 @@ macro_rules! isolate_types {
         reply: $reply:ty,
         send: $send:ty,
         spawn: $spawn:ty,
-        call: $call:ty,
+        io: $io:ty,
         shard: $shard:ty $(,)?
     ) => {
         $crate::isolate_types! {
@@ -343,7 +342,7 @@ macro_rules! isolate_types {
             send: $send,
             spawn: $spawn,
             spawn_observed: ::core::convert::Infallible,
-            call: $call,
+            io: $io,
             fact: ::core::convert::Infallible,
             shard: $shard,
         }
@@ -389,7 +388,7 @@ pub mod runtime_internal {
     }
 
     /// Wrap a handle into a typed slot. Used internally by
-    /// [`crate::Context::take_reply_slot`]; runtime crates do not
+    /// [`crate::Context::take_request_context`]; runtime crates do not
     /// normally need this.
     pub fn deferred_from_handle<R>(handle: DeferredReplyHandle) -> DeferredReply<R> {
         DeferredReply {
@@ -486,12 +485,11 @@ pub mod prelude {
         PendingCallSetInsertError, RequestCall, RequestContext, RequestDeferCancelableThrough,
         RequestDeferThrough, RequestEffect, RestartableChildDefinition, Shard, ShardId,
         SingleShard, SpawnObservedError, batch, fail, isolate, isolate_types, noop, reply,
-        reply_to, reply_to_request, restart_children, send, sequence, spawn, spawn_observed, stop,
-        stop_children, stop_with,
+        reply_to, restart_children, send, spawn, spawn_observed, stop, stop_children, stop_with,
         time::{
-            Backoff, BackoffDelay, IntervalDelay, MissedTickPolicy, RecurringCatchUp,
-            RecurringTick, RecurringTickDecision, RecurringTickReport, RecurringTickStale,
-            RecurringTickToken, TimerConfigError, TimerDecision, TimerInterval,
+            Backoff, BackoffDelay, RecurringCatchUp, RecurringTick, RecurringTickDecision,
+            RecurringTickReport, RecurringTickStale, RecurringTickToken, TimerConfigError,
+            TimerDecision,
         },
     };
 }

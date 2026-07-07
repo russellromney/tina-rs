@@ -163,7 +163,7 @@ impl Isolate for Gateway {
         reply: HttpResponse,
         send: tina::Outbound<WebSocketSessionMsg>,
         spawn: Infallible,
-        call: RuntimeCall<HttpRequest>,
+        io: RuntimeCall<HttpRequest>,
         shard: DemoShard,
     }
 
@@ -422,7 +422,7 @@ impl Isolate for Room {
         reply: WebSocketSessionOutcome,
         send: tina::Outbound<Infallible>,
         spawn: Infallible,
-        call: RuntimeCall<WebSocketSessionMsg>,
+        io: RuntimeCall<WebSocketSessionMsg>,
         shard: DemoShard,
     }
 

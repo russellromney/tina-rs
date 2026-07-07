@@ -57,7 +57,7 @@ pub mod api {
         message = DriverMsg,
         reply = u32,
         send = Outbound<Infallible>,
-        call = tina_runtime::RuntimeCall<DriverMsg>
+        io = tina_runtime::RuntimeCall<DriverMsg>
     )]
     impl Driver {
         fn handle(

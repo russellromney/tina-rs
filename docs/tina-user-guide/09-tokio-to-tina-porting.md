@@ -16,7 +16,7 @@ queueing component.
 | unbounded channel | usually a bug or explicit adapter |
 | `select!` | state machine plus runtime call replies |
 | `sleep().await` | `sleep(...).then(...)` |
-| `tokio::time::interval` | `TimerInterval` state plus `sleep(delay).then(...)` |
+| `tokio::time::interval` | `RecurringTick` state plus `sleep(delay).then(...)` |
 | socket read/write | `tcp_read` / `tcp_write` effects |
 | request task then await answer | `call(..., timeout).then(...)` |
 | retry loop | message state plus `Backoff` and timer |

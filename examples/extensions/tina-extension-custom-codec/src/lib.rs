@@ -156,7 +156,7 @@ impl Isolate for CodecServer {
     type Send = Outbound<Infallible>;
     type Spawn = Infallible;
     type SpawnObserved = Infallible;
-    type Call = RuntimeCall<ServerMsg>;
+    type Io = RuntimeCall<ServerMsg>;
     type Fact = Infallible;
     type Shard = CodecShard;
 
@@ -287,7 +287,7 @@ impl Isolate for CodecClient {
     type Send = Outbound<Infallible>;
     type Spawn = Infallible;
     type SpawnObserved = Infallible;
-    type Call = RuntimeCall<ClientMsg>;
+    type Io = RuntimeCall<ClientMsg>;
     type Fact = Infallible;
     type Shard = CodecShard;
 

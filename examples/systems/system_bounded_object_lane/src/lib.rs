@@ -134,10 +134,10 @@ impl ObjectLane {
                 match result {
                     Ok(()) => {
                         self.completed += 1;
-                        reply_to_request(request, LaneReply::Stored(key))
+                        reply_to(request, LaneReply::Stored(key))
                     }
                     Err(error) => {
-                        reply_to_request(request, LaneReply::Failed(format!("{error:?}")))
+                        reply_to(request, LaneReply::Failed(format!("{error:?}")))
                     }
                 }
             }

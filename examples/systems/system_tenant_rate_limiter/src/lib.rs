@@ -1,4 +1,4 @@
-//! Per-tenant rate-limit specimen for the Phase 118 admission layer.
+//! Per-tenant rate-limit specimen for the admission policy layer.
 //!
 //! A single ingress isolate serves requests for many tenants. Each tenant
 //! gets its own token bucket. A hot tenant fills its bucket and the next

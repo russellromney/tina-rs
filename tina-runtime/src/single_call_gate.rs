@@ -1,4 +1,4 @@
-//! Single-in-flight gate for timer-driven workers (Phase 062 Rock 5).
+//! Single-in-flight gate for timer-driven workers.
 //!
 //! The pattern in `specimen_rate_limited_worker` and any
 //! `sleep(window).then(Tick)` rate-limited isolate is:

@@ -120,7 +120,7 @@ impl Isolate for FloodSource {
         reply: (),
         send: Outbound<FloodMsg>,
         spawn: Infallible,
-        call: RuntimeCall<FloodMsg>,
+        io: RuntimeCall<FloodMsg>,
         shard: AppShard,
     }
 
@@ -167,7 +167,7 @@ impl Isolate for Sink {
         reply: (),
         send: Outbound<FloodMsg>,
         spawn: Infallible,
-        call: RuntimeCall<FloodMsg>,
+        io: RuntimeCall<FloodMsg>,
         shard: AppShard,
     }
 
@@ -200,7 +200,7 @@ impl Isolate for ProbeSource {
         reply: (),
         send: Outbound<FloodMsg>,
         spawn: Infallible,
-        call: RuntimeCall<FloodMsg>,
+        io: RuntimeCall<FloodMsg>,
         shard: AppShard,
     }
 

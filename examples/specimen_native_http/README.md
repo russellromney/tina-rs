@@ -49,7 +49,7 @@ The listener owns the bind + accept dance and dispatches each
 parsed request to the counter.
 
 The counter handler dispatches the request through a
-`StatefulRouter<Counter>` (Phase 059 Rock 6) —
+`StatefulRouter<Counter>` (the stateful router helper) —
 `.get("/counter", get_counter).post("/counter", post_counter).method_not_allowed()`
 — and returns the response the matched handler produces. The
 runtime hands the response back to the connection isolate, which

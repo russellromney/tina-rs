@@ -11,7 +11,7 @@ use std::marker::PhantomData;
 use std::net::SocketAddr;
 
 use tina::prelude::*;
-use tina::{Address, CallContext, CancelOutcome, RequestContext, Shard, reply_to_request};
+use tina::{Address, CallContext, CancelOutcome, RequestContext, Shard, reply_to};
 use tina_runtime::{
     CallError, CallGroupToken, CallOutcome, ProtocolFact, RuntimeCall, ThreadedRuntime,
     ThreadedRuntimeError, call, call_cancelable, cancel_call, dns_lookup, sleep,
@@ -291,7 +291,7 @@ impl<S: Shard + 'static> Isolate for WebSocketClientManager<S> {
         reply: WebSocketManagerReply,
         send: tina::Outbound<WebSocketClientMsg>,
         spawn: Infallible,
-        call: RuntimeCall<WebSocketManagerMsg>,
+        io: RuntimeCall<WebSocketManagerMsg>,
         fact: ProtocolFact,
         shard: S,
     }
@@ -608,7 +608,7 @@ impl<S: Shard + 'static> WebSocketClientManager<S> {
         };
         let report = connect.into_report();
         match self.pending_connect.take() {
-            Some(req) => reply_to_request(
+            Some(req) => reply_to(
                 req,
                 WebSocketManagerReply::Connect(WebSocketConnectOutcome::Connected(report)),
             ),
@@ -637,7 +637,7 @@ impl<S: Shard + 'static> WebSocketClientManager<S> {
             WebSocketConnectOutcome::ConnectFailed(report)
         };
         match self.pending_connect.take() {
-            Some(req) => reply_to_request(req, WebSocketManagerReply::Connect(outcome)),
+            Some(req) => reply_to(req, WebSocketManagerReply::Connect(outcome)),
             None => noop(),
         }
     }
@@ -707,7 +707,7 @@ impl<S: Shard + 'static> WebSocketClientManager<S> {
 
     fn reply_send(&mut self, result: Result<(), WebSocketSessionError>) -> Effect<Self> {
         match self.pending_send.take() {
-            Some(req) => reply_to_request(req, WebSocketManagerReply::Sent(result)),
+            Some(req) => reply_to(req, WebSocketManagerReply::Sent(result)),
             None => noop(),
         }
     }
@@ -781,7 +781,7 @@ impl<S: Shard + 'static> WebSocketClientManager<S> {
         result: Result<WebSocketClientEvent, WebSocketSessionError>,
     ) -> Effect<Self> {
         match self.pending_receive.take() {
-            Some(req) => reply_to_request(req, WebSocketManagerReply::Event(result)),
+            Some(req) => reply_to(req, WebSocketManagerReply::Event(result)),
             None => noop(),
         }
     }
@@ -817,7 +817,7 @@ impl<S: Shard + 'static> WebSocketClientManager<S> {
             self.state.record_pressure(generation, report);
         }
         match self.pending_report.take() {
-            Some(req) => reply_to_request(req, WebSocketManagerReply::Report(self.state.report())),
+            Some(req) => reply_to(req, WebSocketManagerReply::Report(self.state.report())),
             None => noop(),
         }
     }
@@ -865,7 +865,7 @@ impl<S: Shard + 'static> WebSocketClientManager<S> {
                 .as_ref()
                 .map(ConnectAttempts::report)
                 .unwrap_or_else(|| self.no_dial_report());
-            effects.push(reply_to_request(
+            effects.push(reply_to(
                 req,
                 WebSocketManagerReply::Connect(WebSocketConnectOutcome::Closed(report)),
             ));
@@ -875,19 +875,19 @@ impl<S: Shard + 'static> WebSocketClientManager<S> {
             self.state.retire_current(SessionEndReason::ClosedLocal);
         }
         if let Some(req) = self.pending_send.take() {
-            effects.push(reply_to_request(
+            effects.push(reply_to(
                 req,
                 WebSocketManagerReply::Sent(Err(WebSocketSessionError::Closed)),
             ));
         }
         if let Some(req) = self.pending_receive.take() {
-            effects.push(reply_to_request(
+            effects.push(reply_to(
                 req,
                 WebSocketManagerReply::Event(Err(WebSocketSessionError::Closed)),
             ));
         }
         if let Some(req) = self.pending_report.take() {
-            effects.push(reply_to_request(
+            effects.push(reply_to(
                 req,
                 WebSocketManagerReply::Report(self.state.report()),
             ));

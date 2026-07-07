@@ -43,7 +43,7 @@ use std::time::Duration;
 
 use http::StatusCode;
 use tina::prelude::*;
-use tina::{CallContext, RequestContext, reply_to_request};
+use tina::{CallContext, RequestContext, reply_to};
 use tina_runtime::{
     CallError, CallInput, CallOutcome, CallOutput, RuntimeCall, RuntimeCallCompletion,
     TcpReadBufReply, TcpWriteOwnedCloseReply, TcpWriteOwnedReply, TlsReadBufReply,
@@ -452,7 +452,7 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Isolate for Http
         reply: RequestChunkReply,
         send: tina::Outbound<std::convert::Infallible>,
         spawn: std::convert::Infallible,
-        call: tina_runtime::RuntimeCall<HttpConnectionMsg>,
+        io: tina_runtime::RuntimeCall<HttpConnectionMsg>,
         fact: tina_runtime::ProtocolFact,
         shard: S,
     }
@@ -1137,7 +1137,7 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
 
     fn reply_request_body_chunk(&mut self, chunk: RequestChunkReply) -> Effect<Self> {
         match self.pending_request_body_reply.take() {
-            Some(request) => reply_to_request(request, chunk),
+            Some(request) => reply_to(request, chunk),
             None => reply(chunk),
         }
     }
@@ -1280,7 +1280,7 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
     fn write_pending_close(&mut self) -> Effect<Self> {
         let bytes = std::mem::take(&mut self.pending_response);
         match self.transport {
-            HttpTransport::Tcp(stream) => Effect::Call(RuntimeCall::new_with_completion(
+            HttpTransport::Tcp(stream) => Effect::Io(RuntimeCall::new_with_completion(
                 CallInput::TcpWriteOwnedClose { stream, bytes },
                 |output| match output {
                     CallOutput::TcpWroteOwnedClose {

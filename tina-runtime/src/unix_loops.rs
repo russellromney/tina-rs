@@ -35,7 +35,7 @@ impl UnixWriteAll {
     /// the loop has nothing left to send.
     pub fn next_effect<I, M, F>(&self, on_progress: F) -> Option<tina::Effect<I>>
     where
-        I: Isolate<Message = M, Call = RuntimeCall<M>>,
+        I: Isolate<Message = M, Io = RuntimeCall<M>>,
         F: FnOnce(UnixWriteReply) -> M + Send + 'static,
         M: 'static,
     {
@@ -52,7 +52,7 @@ impl UnixWriteAll {
     /// `Failed(CallError::Io)` instead of re-issuing the same write forever.
     pub fn advance<I, M, F>(&mut self, reply: UnixWriteReply, on_progress: F) -> LoopStep<I, usize>
     where
-        I: Isolate<Message = M, Call = RuntimeCall<M>>,
+        I: Isolate<Message = M, Io = RuntimeCall<M>>,
         F: FnOnce(UnixWriteReply) -> M + Send + 'static,
         M: 'static,
     {
@@ -118,7 +118,7 @@ impl UnixReadToEof {
     /// already at the cap.
     pub fn next_effect<I, M, F>(&self, on_progress: F) -> Option<tina::Effect<I>>
     where
-        I: Isolate<Message = M, Call = RuntimeCall<M>>,
+        I: Isolate<Message = M, Io = RuntimeCall<M>>,
         F: FnOnce(UnixReadReply) -> M + Send + 'static,
         M: 'static,
     {
@@ -134,7 +134,7 @@ impl UnixReadToEof {
     /// loop with whatever was accumulated.
     pub fn advance<I, M, F>(&mut self, reply: UnixReadReply, on_progress: F) -> LoopStep<I, Vec<u8>>
     where
-        I: Isolate<Message = M, Call = RuntimeCall<M>>,
+        I: Isolate<Message = M, Io = RuntimeCall<M>>,
         F: FnOnce(UnixReadReply) -> M + Send + 'static,
         M: 'static,
     {
@@ -175,7 +175,7 @@ mod tests {
         type Send = ();
         type Spawn = std::convert::Infallible;
         type SpawnObserved = std::convert::Infallible;
-        type Call = RuntimeCall<Msg>;
+        type Io = RuntimeCall<Msg>;
         type Fact = std::convert::Infallible;
         type Shard = tina::SingleShard;
 

@@ -369,7 +369,7 @@ impl Isolate for RecordingResponseSource {
         reply: ResponseChunkReply,
         send: tina::Outbound<std::convert::Infallible>,
         spawn: std::convert::Infallible,
-        call: tina_runtime::RuntimeCall<ResponseChunkMsg>,
+        io: tina_runtime::RuntimeCall<ResponseChunkMsg>,
         shard: TestShard,
     }
 
@@ -431,7 +431,7 @@ impl Isolate for StreamingResponseService {
         reply: HttpResponse,
         send: tina::Outbound<std::convert::Infallible>,
         spawn: std::convert::Infallible,
-        call: std::convert::Infallible,
+        io: std::convert::Infallible,
         shard: TestShard,
     }
 
@@ -464,7 +464,7 @@ impl Isolate for MixedResponseService {
         reply: HttpResponse,
         send: tina::Outbound<std::convert::Infallible>,
         spawn: std::convert::Infallible,
-        call: std::convert::Infallible,
+        io: std::convert::Infallible,
         shard: TestShard,
     }
 

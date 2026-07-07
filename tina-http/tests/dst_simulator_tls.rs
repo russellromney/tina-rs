@@ -54,7 +54,7 @@ impl Isolate for Driver {
         reply: (),
         send: tina::Outbound<Infallible>,
         spawn: Infallible,
-        call: RuntimeCall<DriverMsg>,
+        io: RuntimeCall<DriverMsg>,
         shard: SimShard,
     }
 

@@ -98,7 +98,7 @@ impl TcpWriteAll {
     /// `None` if the loop has nothing left to send.
     pub fn next_effect<I, M, F>(&self, on_progress: F) -> Option<tina::Effect<I>>
     where
-        I: Isolate<Message = M, Call = RuntimeCall<M>>,
+        I: Isolate<Message = M, Io = RuntimeCall<M>>,
         F: FnOnce(TcpWriteReply) -> M + Send + 'static,
         M: 'static,
     {
@@ -119,7 +119,7 @@ impl TcpWriteAll {
     /// re-issuing the write.
     pub fn advance<I, M, F>(&mut self, reply: TcpWriteReply, on_progress: F) -> LoopStep<I, usize>
     where
-        I: Isolate<Message = M, Call = RuntimeCall<M>>,
+        I: Isolate<Message = M, Io = RuntimeCall<M>>,
         F: FnOnce(TcpWriteReply) -> M + Send + 'static,
         M: 'static,
     {
@@ -177,7 +177,7 @@ impl TcpReadExact {
     /// the buffer is full.
     pub fn next_effect<I, M, F>(&self, on_progress: F) -> Option<tina::Effect<I>>
     where
-        I: Isolate<Message = M, Call = RuntimeCall<M>>,
+        I: Isolate<Message = M, Io = RuntimeCall<M>>,
         F: FnOnce(TcpReadReply) -> M + Send + 'static,
         M: 'static,
     {
@@ -194,7 +194,7 @@ impl TcpReadExact {
     /// do with it.
     pub fn advance<I, M, F>(&mut self, reply: TcpReadReply, on_progress: F) -> ReadExactStep<I>
     where
-        I: Isolate<Message = M, Call = RuntimeCall<M>>,
+        I: Isolate<Message = M, Io = RuntimeCall<M>>,
         F: FnOnce(TcpReadReply) -> M + Send + 'static,
         M: 'static,
     {
@@ -264,7 +264,7 @@ impl TcpReadToEof {
     /// already at the cap.
     pub fn next_effect<I, M, F>(&self, on_progress: F) -> Option<tina::Effect<I>>
     where
-        I: Isolate<Message = M, Call = RuntimeCall<M>>,
+        I: Isolate<Message = M, Io = RuntimeCall<M>>,
         F: FnOnce(TcpReadReply) -> M + Send + 'static,
         M: 'static,
     {
@@ -280,7 +280,7 @@ impl TcpReadToEof {
     /// finishes the loop with whatever was accumulated.
     pub fn advance<I, M, F>(&mut self, reply: TcpReadReply, on_progress: F) -> LoopStep<I, Vec<u8>>
     where
-        I: Isolate<Message = M, Call = RuntimeCall<M>>,
+        I: Isolate<Message = M, Io = RuntimeCall<M>>,
         F: FnOnce(TcpReadReply) -> M + Send + 'static,
         M: 'static,
     {
@@ -325,7 +325,7 @@ mod tests {
         type Send = ();
         type Spawn = std::convert::Infallible;
         type SpawnObserved = std::convert::Infallible;
-        type Call = RuntimeCall<Msg>;
+        type Io = RuntimeCall<Msg>;
         type Fact = ::std::convert::Infallible;
         type Shard = tina::SingleShard;
 

@@ -182,7 +182,7 @@ impl Isolate for Worker {
         reply: (),
         send: Outbound<NeverOutbound>,
         spawn: Infallible,
-        call: Infallible,
+        io: Infallible,
         shard: TestShard,
     }
 
@@ -224,7 +224,7 @@ impl Isolate for Dispatcher {
         reply: (),
         send: Outbound<RegistryEvent>,
         spawn: RestartableChildDefinition<Worker>,
-        call: Infallible,
+        io: Infallible,
         shard: TestShard,
     }
 
@@ -279,7 +279,7 @@ impl Isolate for Registry {
         reply: (),
         send: Outbound<WorkerEvent>,
         spawn: Infallible,
-        call: Infallible,
+        io: Infallible,
         shard: TestShard,
     }
 

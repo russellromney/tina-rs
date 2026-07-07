@@ -226,7 +226,7 @@ where
     type Send = Outbound<Infallible>;
     type Spawn = Infallible;
     type SpawnObserved = Infallible;
-    type Call = RuntimeCall<ServiceCall>;
+    type Io = RuntimeCall<ServiceCall>;
     type Fact = ::std::convert::Infallible;
     type Shard = S;
 
@@ -290,8 +290,7 @@ where
 /// their own per-call backpressure: the frontend's `IsolateCall`
 /// to a saturated worker resolves as `CallOutcome::Full`. Whether
 /// the frontend re-routes to a different worker or surfaces that
-/// as a registry `Full` of its own is a deliberate choice the
-/// implementation phase will make.
+/// as a registry `Full` of its own is a deliberate implementation choice.
 pub struct PooledService<H, S>
 where
     H: ServiceHandler<S>,
@@ -528,7 +527,7 @@ mod tests {
     #[test]
     fn single_service_emits_only_reply_no_call_or_send() {
         // Lock the contract: SingleService must return Effect::Reply
-        // and never an Effect::Call (which would mean a runtime hop)
+        // and never an Effect::Io (which would mean a runtime hop)
         // or Effect::Send (which would route bytes elsewhere). A
         // future change that makes handlers async-capable should
         // change this test deliberately, not silently.

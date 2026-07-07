@@ -1,4 +1,4 @@
-//! Three side-by-side specimens for Phase 117 local I/O / codec / IPC parity:
+//! Three side-by-side specimens for the local I/O, codec, and IPC parity specimen local I/O / codec / IPC parity:
 //!
 //! - [`file_ingest`] — bounded file streaming via the new
 //!   `tina_runtime::FileReadChunks` and `FileWriteAll` helpers.

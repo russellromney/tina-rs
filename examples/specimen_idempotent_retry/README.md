@@ -3,7 +3,7 @@
 A tiny outbound-edge relay that shows **bounded, caller-owned retry** with
 **idempotency named in the message**.
 
-The point Phase 118 cares about: when a downstream replies `Full`, the
+The point: when a downstream replies `Full`, the
 relay does not retry on its own. It consults an explicit
 `tina_runtime::FullHandling` budget (built from a `tina::time::Backoff`),
 and retry is only safe because the request carries an `idempotency_key`

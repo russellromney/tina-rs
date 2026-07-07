@@ -327,7 +327,7 @@ mod tests {
             reply: (),
             send: Outbound<Msg>,
             spawn: Infallible,
-            call: Infallible,
+            io: Infallible,
             shard: tina::SingleShard,
         }
 

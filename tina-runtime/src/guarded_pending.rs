@@ -650,7 +650,7 @@ mod tests {
         type Send = tina::Outbound<std::convert::Infallible>;
         type Spawn = std::convert::Infallible;
         type SpawnObserved = std::convert::Infallible;
-        type Call = std::convert::Infallible;
+        type Io = std::convert::Infallible;
         type Fact = std::convert::Infallible;
         type Shard = tina::SingleShard;
 

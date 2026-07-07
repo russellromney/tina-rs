@@ -6,7 +6,7 @@
 //! `SpawnObserved` family, `RestartableChildDefinition`), and the
 //! `StopResult` envelope. Re-exported from the crate root.
 //!
-//! ## Module map (Phase 115 reorg)
+//! ## Module map
 //!
 //! New isolate-shape vocabulary belongs here. The closed [`Effect`]
 //! enum and effect constructors live in `mod effect`; address types
@@ -62,18 +62,18 @@ pub trait Isolate: Sized {
     /// hand-written impl.
     type SpawnObservedRemote = core::convert::Infallible;
 
-    /// The payload produced by [`Effect::Call`].
+    /// The payload produced by [`Effect::Io`].
     ///
-    /// A call describes one runtime-owned external operation (TCP I/O,
+    /// I/O describes one runtime-owned external operation (TCP,
     /// timers, future file I/O, child-process spawn, etc.) plus the
     /// information needed to turn the runtime's later result back into one
     /// ordinary [`Self::Message`] for this isolate. The trait crate stays
     /// substrate-neutral here: concrete request and result vocabularies
     /// belong to runtime crates, not to `tina`.
     ///
-    /// Use [`std::convert::Infallible`] when an isolate never issues call
+    /// Use [`std::convert::Infallible`] when an isolate never issues I/O
     /// effects.
-    type Call;
+    type Io;
 
     /// The payload produced by [`Effect::Fact`].
     ///
@@ -120,8 +120,7 @@ pub trait Isolate: Sized {
 /// The default `handle_call` on [`Isolate`] always rejects with
 /// `CallRejectedReason::UnsupportedMessage`. Registering such an isolate
 /// through the callable lane would create a service whose every call returns
-/// a runtime rejection — exactly the silent failure Phase 100 moves to the
-/// compile boundary. `CallableIsolate` is the type-level "this isolate's
+/// a runtime rejection. `CallableIsolate` is the type-level "this isolate's
 /// `handle_call` is intentional" stamp.
 ///
 /// The `#[tina::isolate]` and `#[tina_runtime::isolate]` macros emit
@@ -140,8 +139,7 @@ pub trait Isolate: Sized {
 pub trait CallableIsolate: Isolate {}
 
 /// `recv` takes `&self` because real SPSC implementations rely on interior
-/// mutability (atomics over a ring buffer). Phase Pioneer may revisit this
-/// with a `Sender`/`Receiver` split — see ROADMAP "Open questions".
+/// mutability (atomics over a ring buffer).
 ///
 /// Concrete implementations may enforce concurrency contracts at runtime rather
 /// than in the type system. For example, an SPSC mailbox may panic if more than
@@ -482,9 +480,8 @@ mod restart_budget_tests {
 
 /// Executor-per-core abstraction.
 ///
-/// Runtime crates will implement this trait for their shard type. Sputnik keeps
-/// the surface deliberately small: a shard knows its identifier and can mint
-/// typed addresses on that shard.
+/// Runtime crates implement this trait for their shard type. A shard knows its
+/// identifier and can mint typed addresses on that shard.
 pub trait Shard {
     /// Returns the logical shard identifier.
     fn id(&self) -> ShardId;
@@ -526,7 +523,7 @@ impl Shard for SingleShard {
     }
 }
 
-/// A minimal spawn request for Sputnik.
+/// A minimal spawn request.
 ///
 /// The runtime owns what "spawn" means operationally. This type only carries
 /// the state machine to construct and the requested mailbox capacity.
@@ -545,10 +542,8 @@ impl<I> ChildDefinition<I>
 where
     I: Isolate,
 {
-    /// Creates a new spawn request.
-    ///
-    /// TODO: Phase Pioneer adds supervision metadata once the supervisor layer
-    /// exists. Sputnik intentionally keeps spawn requests minimal.
+    /// Creates a spawn request without supervision metadata. Restartable
+    /// children use [`RestartableChildDefinition`].
     pub fn new(isolate: I, mailbox_capacity: usize) -> Self {
         Self {
             isolate,
@@ -667,19 +662,6 @@ impl<S, M, R> SpawnObservedBuilder<S, M, R> {
             spawn,
             marker: PhantomData,
         }
-    }
-
-    /// Maps the runtime's later child-start result into a parent message.
-    #[deprecated(
-        since = "0.1.0",
-        note = "use `.then(...)` for ordinary continuations; use `call_ctx.defer(work).reply(...)` in handle_call when preserving caller authority"
-    )]
-    pub fn reply<I, P, F>(self, continuation: F) -> Effect<I>
-    where
-        I: Isolate<Message = P, SpawnObserved = SpawnObserved<S, P, M, R>>,
-        F: FnOnce(SpawnObservedResult<M, R>) -> P + 'static,
-    {
-        self.then(continuation)
     }
 
     /// Maps the runtime's later child-start result into an ordinary parent

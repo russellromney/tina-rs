@@ -409,9 +409,9 @@ positional NULL into a non-INT8 column without a SQL cast),
 — sends a NULL with the right wire type oid. Decode always lands
 in `PgValue::Null` regardless of how the NULL was bound.
 
-Non-goals: generic `sqlx::Database`, ORM, migrations, struct
-mapping, a transaction *handle* (vs. atomic script). See the
-phase plan for the why.
+Non-goals: generic `sqlx::Database`, ORM, migrations, struct mapping, and a
+transaction *handle* (vs. atomic script). The bridge stays a small typed worker
+boundary, not a general SQLx facade.
 
 ### `tina-aws-bridge` — Tina → AWS SDK S3/SQS
 

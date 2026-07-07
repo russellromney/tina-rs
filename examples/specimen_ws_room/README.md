@@ -48,9 +48,9 @@ cargo run --manifest-path examples/specimen_ws_room/Cargo.toml -- tina
 ### What was awkward
 
 - ~~Bridge mailbox + factory boilerplate again. Fourth copy.~~
-  **Resolved in phase 047:** the room uses `DefaultThreadedMailboxFactory`.
+  **Resolved:** the room uses `DefaultThreadedMailboxFactory`.
 - ~~The macro would not let me omit `shard = RoomShard` even for a
-  one-isolate service.~~ **Resolved in phase 047:** omitted `shard = ...`
+  one-isolate service.~~ **Resolved:** omitted `shard = ...`
   defaults to `SingleShard`, so this comparison no longer declares a
   throwaway shard.
 - Connection plumbing still happens in tokio code (axum WS upgrade), and

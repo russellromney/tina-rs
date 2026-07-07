@@ -15,8 +15,25 @@ This file records completed work.
 - Ported the mini SaaS `POST /items/{id}/notify` path to the generated flow
   surface while keeping the old continuation variants as compatibility
   forwards, and documented the pattern in the user guide.
+### Vocabulary Consolidation
 
+- Renamed `Effect::Call` to `Effect::Io` for runtime-owned I/O effects.
+- Renamed `Isolate::Call` to `Isolate::Io` for runtime-owned I/O effects.
+- Renamed the isolate macro `call = ...` option and `isolate_types!` `call:` key
+  to `io`.
+- Removed `sequence()`; use `batch()`.
+- Removed `reply_to_request()`; use `reply_to()` with `RequestContext::into_deferred`.
+- Removed public `Context::take_reply_slot()`; use `Context::take_request_context()`.
+- Removed deprecated `SpawnObservedBuilder::reply()`; use `SpawnObservedBuilder::then()`.
+- Removed `TimerInterval`, `MissedTickPolicy`, and `IntervalDelay`; use `RecurringTick` and `RecurringCatchUp`.
+- Removed public `tina_runtime::wait_list::WaitList`; use `SharedWork`.
+- Renamed `request_effect_after_wait_park` to `request_effect_after_shared_wait`.
 ### CI Dependency Hygiene
+
+- Fixed nightly toolchain drift: replaced same-type `drain(..).collect()`
+  with `mem::take` (runtime scope teardown, HTTP/2 client teardown) and an
+  atomic max `fetch_update` loop with `fetch_max`, so the unpinned nightly
+  clippy gate is green again.
 
 - Committed the root workspace `Cargo.lock` and switched normal workspace CI
   commands to `--locked`, so pull-request failures are tied to Tina changes
@@ -42,6 +59,8 @@ This file records completed work.
 - Hardened HTTP/1 keepalive client truth: a non-chunked response that sends
   bytes beyond `Content-Length` now retires the pooled socket instead of
   silently truncating and reusing a desynchronized connection.
+- Fixed HTTP/1 keepalive chunked peer-close handling so truncated chunked
+  responses now fail with `Closed` instead of succeeding with partial body data.
 - Fixed bridge admission-slot leaks by reserving runtime-owned continuation
   overflow delivery for bridge/self continuations when the ordinary bounded
   mailbox is saturated. The docs now state the real priority semantics: FIFO

@@ -175,9 +175,7 @@ impl CrossShardCallWorker {
                 let effects = self
                     .held
                     .drain(..)
-                    .map(|(reply_to, bytes)| {
-                        tina::reply_to_request(reply_to, CrossShardCallReply(bytes))
-                    })
+                    .map(|(reply_to, bytes)| tina::reply_to(reply_to, CrossShardCallReply(bytes)))
                     .collect::<Vec<_>>();
                 batch(effects)
             }
@@ -4093,7 +4091,7 @@ fn local_system_config_manifest_rejects_zero_capacities_before_start() {
 }
 
 #[test]
-fn live_cross_shard_isolate_call_round_trips_reply_to_requester_shard() {
+fn live_cross_shard_isolate_call_round_trips_reply_toer_shard() {
     let outcomes = Arc::new(Mutex::new(Vec::new()));
     let app = LocalSystem::<AppShard, AppMailboxFactory>::multi_shard(AppMailboxFactory)
         .shard(AppShard(45))

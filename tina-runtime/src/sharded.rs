@@ -1,4 +1,4 @@
-//! Sharded service contracts (phase 053).
+//! Sharded service contracts.
 //!
 //! Small Seastar-shaped local multi-shard primitives. These helpers are
 //! contracts only: a deterministic key-to-shard map, a typed `ShardId ->
@@ -976,7 +976,7 @@ where
     // and `ThreadedMultiShardRuntime` without per-runtime variants. The
     // adapter never actually issues a runtime call; the channel exists to
     // satisfy the simulator's `RuntimeCallable` bound.
-    type Call = RuntimeCall<M>;
+    type Io = RuntimeCall<M>;
     type Fact = Infallible;
     type Shard = S;
 

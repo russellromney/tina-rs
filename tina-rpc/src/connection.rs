@@ -439,7 +439,7 @@ where
     Self: tina::Isolate<
             Message = ConnectionMsg,
             Send = Outbound<CloseReason>,
-            Call = RuntimeCall<ConnectionMsg>,
+            Io = RuntimeCall<ConnectionMsg>,
         >,
 {
     fn frame_limits(&self) -> FrameLimits {
@@ -837,7 +837,7 @@ where
     type Send = Outbound<CloseReason>;
     type Spawn = std::convert::Infallible;
     type SpawnObserved = std::convert::Infallible;
-    type Call = RuntimeCall<ConnectionMsg>;
+    type Io = RuntimeCall<ConnectionMsg>;
     type Fact = ::std::convert::Infallible;
     type Shard = S;
 
@@ -937,7 +937,7 @@ mod tests {
             Effect::StopWith(_) => shape.stop_with += 1,
             Effect::RestartChildren => shape.restart += 1,
             Effect::StopChildren => shape.restart += 1,
-            Effect::Call(_) => shape.call += 1,
+            Effect::Io(_) => shape.call += 1,
             Effect::Batch(items) => {
                 for item in items {
                     walk(item, shape);
@@ -973,7 +973,7 @@ mod tests {
         let mut conn = make_connection(small_config());
         let effect = dispatch(&mut conn, ConnectionMsg::Begin);
         let shape = count_effect_leaves(&effect);
-        // tcp_read + sleep_then both come back as Effect::Call.
+        // tcp_read + sleep_then both come back as Effect::Io.
         assert_eq!(shape.call, 2, "begin should emit two runtime calls");
         assert_eq!(conn.in_flight, 0);
         assert!(conn.closing.is_none());

@@ -10,7 +10,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use tina::prelude::*;
-use tina::{CallContext, RequestContext, reply_to_request};
+use tina::{CallContext, RequestContext, reply_to};
 use tina_runtime::{
     CallError, ListenerId, StreamId, tcp_accept, tcp_bind, tcp_close_listener, tcp_close_stream,
 };
@@ -157,7 +157,7 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Isolate for Http
         reply: Result<HttpReady, HttpStartupError>,
         send: tina::Outbound<std::convert::Infallible>,
         spawn: ChildDefinition<HttpConnection<S, M>>,
-        call: tina_runtime::RuntimeCall<HttpListenerMsg>,
+        io: tina_runtime::RuntimeCall<HttpListenerMsg>,
         shard: S,
     }
 
@@ -190,7 +190,7 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Isolate for Http
                     let close = tcp_close_listener(listener).then(HttpListenerMsg::ListenerClosed);
                     return match self.pending_start_reply.take() {
                         Some(request) => batch(vec![
-                            reply_to_request(request, Err(HttpStartupError::Stopped)),
+                            reply_to(request, Err(HttpStartupError::Stopped)),
                             close,
                         ]),
                         None => close,
@@ -199,7 +199,7 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Isolate for Http
                 let accept = tcp_accept(listener).then(HttpListenerMsg::Accepted);
                 match self.pending_start_reply.take() {
                     Some(request) => batch(vec![
-                        reply_to_request(request, Ok(HttpReady { local_addr })),
+                        reply_to(request, Ok(HttpReady { local_addr })),
                         accept,
                     ]),
                     None => accept,
@@ -207,7 +207,7 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Isolate for Http
             }
             HttpListenerMsg::Bound(Err(source)) => match self.pending_start_reply.take() {
                 Some(request) => batch(vec![
-                    reply_to_request(request, Err(HttpStartupError::Bind { source })),
+                    reply_to(request, Err(HttpStartupError::Bind { source })),
                     stop(),
                 ]),
                 None => stop(),

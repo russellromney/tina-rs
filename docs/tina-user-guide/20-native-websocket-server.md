@@ -172,7 +172,7 @@ fn send_room_text<I>(
     timeout: Duration,
 ) -> tina::Effect<I>
 where
-    I: Isolate<Message = WebSocketSessionMsg, Call = RuntimeCall<WebSocketSessionMsg>>,
+    I: Isolate<Message = WebSocketSessionMsg, Io = RuntimeCall<WebSocketSessionMsg>>,
 {
     handle.text_effect::<I>(text, timeout)
 }

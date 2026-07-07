@@ -1,4 +1,4 @@
-//! Isolate-local in-flight permit gate (Phase 101 Rock 3).
+//! Isolate-local in-flight permit gate.
 //!
 //! Several services keep a `bool` or counter that means "this isolate admitted
 //! local work that has not settled yet." [`LocalPermitGate`] names that shape

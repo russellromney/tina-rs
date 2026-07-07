@@ -23,7 +23,7 @@ tina::flow! {
     message = DriverMsg,
     reply = u32,
     send = Outbound<std::convert::Infallible>,
-    call = RuntimeCall<DriverMsg>
+    io = RuntimeCall<DriverMsg>
 )]
 impl Driver {
     fn handle(

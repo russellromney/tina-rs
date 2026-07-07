@@ -142,7 +142,7 @@ impl Isolate for Connection {
         reply: (),
         send: Outbound<Infallible>,
         spawn: Infallible,
-        call: RuntimeCall<ConnectionEvent>,
+        io: RuntimeCall<ConnectionEvent>,
         shard: TestShard,
     }
 
@@ -223,7 +223,7 @@ impl Isolate for OutboundClient {
         reply: (),
         send: Outbound<Infallible>,
         spawn: Infallible,
-        call: RuntimeCall<OutboundClientEvent>,
+        io: RuntimeCall<OutboundClientEvent>,
         shard: TestShard,
     }
 
@@ -298,7 +298,7 @@ impl Isolate for OwnedBufferClient {
         reply: (),
         send: Outbound<Infallible>,
         spawn: Infallible,
-        call: RuntimeCall<OwnedClientEvent>,
+        io: RuntimeCall<OwnedClientEvent>,
         shard: TestShard,
     }
 
@@ -385,7 +385,7 @@ impl Isolate for FileClient {
         reply: (),
         send: Outbound<Infallible>,
         spawn: Infallible,
-        call: RuntimeCall<FileClientEvent>,
+        io: RuntimeCall<FileClientEvent>,
         shard: TestShard,
     }
 
@@ -474,7 +474,7 @@ impl Isolate for Listener {
         reply: (),
         send: Outbound<ListenerEvent>,
         spawn: RestartableChildDefinition<Connection>,
-        call: RuntimeCall<ListenerEvent>,
+        io: RuntimeCall<ListenerEvent>,
         shard: TestShard,
     }
 
@@ -1156,7 +1156,7 @@ fn owned_buffer_client_retries_partial_owned_write_with_returned_bytes() {
         })),
         &mut ctx,
     );
-    let Effect::Call(second_write) = effect else {
+    let Effect::Io(second_write) = effect else {
         panic!("expected retry write call");
     };
     assert!(matches!(
@@ -1176,7 +1176,7 @@ fn owned_buffer_client_retries_partial_owned_write_with_returned_bytes() {
         })),
         &mut ctx,
     );
-    let Effect::Call(next_read) = effect else {
+    let Effect::Io(next_read) = effect else {
         panic!("expected read after remaining bytes drain");
     };
     assert!(matches!(
@@ -1525,7 +1525,7 @@ impl Isolate for BlockingIsolate {
         reply: (),
         send: Outbound<Infallible>,
         spawn: Infallible,
-        call: RuntimeCall<BlockingMsg>,
+        io: RuntimeCall<BlockingMsg>,
         shard: TestShard,
     }
 
@@ -1606,7 +1606,7 @@ fn connection_retries_partial_write_before_reading_again() {
     let mut ctx = Context::new(&mut shard, IsolateId::new(42));
 
     let effect = connection.handle(ConnectionEvent::Read(b"hello".to_vec()), &mut ctx);
-    let Effect::Call(first_write) = effect else {
+    let Effect::Io(first_write) = effect else {
         panic!("expected first write call");
     };
     assert!(matches!(
@@ -1615,7 +1615,7 @@ fn connection_retries_partial_write_before_reading_again() {
     ));
 
     let effect = connection.handle(ConnectionEvent::Wrote(2), &mut ctx);
-    let Effect::Call(second_write) = effect else {
+    let Effect::Io(second_write) = effect else {
         panic!("expected retry write call");
     };
     assert!(matches!(
@@ -1624,7 +1624,7 @@ fn connection_retries_partial_write_before_reading_again() {
     ));
 
     let effect = connection.handle(ConnectionEvent::Wrote(3), &mut ctx);
-    let Effect::Call(next_read) = effect else {
+    let Effect::Io(next_read) = effect else {
         panic!("expected next read call");
     };
     assert!(matches!(next_read.request(), CallInput::TcpRead { .. }));
