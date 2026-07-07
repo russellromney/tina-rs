@@ -267,7 +267,8 @@ pub enum RecurringCatchUp {
     /// [`Sleep`](RecurringTickDecision::Sleep) with a zero delay (fire-now)
     /// and consumes one catch-up budget. Ticks beyond the budget are dropped
     /// and counted in the first catch-up `Sleep`'s `missed_ticks`; this skips
-    /// tick numbers for the dropped portion of the burst.
+    /// tick numbers for the dropped portion of the burst. Queued catch-up fires
+    /// report `missed_ticks = 1` and advance tick numbers by two per fire.
     Bounded(u32),
     /// Drift forward: schedule the next tick `period` after the observed
     /// `now`. No catch-up; missed ticks become zero.

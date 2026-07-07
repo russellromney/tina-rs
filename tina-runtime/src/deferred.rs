@@ -513,7 +513,7 @@ where
     /// #     type Message=(); type Reply=u32;
     /// #     type Send=Outbound<std::convert::Infallible>;
     /// #     type Spawn=std::convert::Infallible;
-    /// #     type Io =std::convert::Infallible;
+    /// #     type Io = std::convert::Infallible;
     /// #     type Shard=SingleShard;
     /// #     fn handle(&mut self, _:(), _:&mut Context<'_,Self::Shard,Self::Reply>) -> Effect<Self> { noop() }
     /// # }
@@ -521,7 +521,7 @@ where
     /// #     type Message=(); type Reply=u64;  // !! u64 not u32
     /// #     type Send=Outbound<std::convert::Infallible>;
     /// #     type Spawn=std::convert::Infallible;
-    /// #     type Io =std::convert::Infallible;
+    /// #     type Io = std::convert::Infallible;
     /// #     type Shard=SingleShard;
     /// #     fn handle(&mut self, _:(), _:&mut Context<'_,Self::Shard,Self::Reply>) -> Effect<Self> { noop() }
     /// # }
@@ -564,7 +564,7 @@ where
     /// #     type Message=(); type Reply=u64;
     /// #     type Send=Outbound<std::convert::Infallible>;
     /// #     type Spawn=std::convert::Infallible;
-    /// #     type Io =std::convert::Infallible;
+    /// #     type Io = std::convert::Infallible;
     /// #     type Shard=SingleShard;
     /// #     fn handle(&mut self, _:(), _:&mut Context<'_,Self::Shard,Self::Reply>) -> Effect<Self> { noop() }
     /// # }
@@ -597,7 +597,7 @@ where
     /// #     type Message=(); type Reply=u64;
     /// #     type Send=Outbound<std::convert::Infallible>;
     /// #     type Spawn=std::convert::Infallible;
-    /// #     type Io =std::convert::Infallible;
+    /// #     type Io = std::convert::Infallible;
     /// #     type Shard=SingleShard;
     /// #     fn handle(&mut self, _:(), _:&mut Context<'_,Self::Shard,Self::Reply>) -> Effect<Self> { noop() }
     /// # }
@@ -635,7 +635,7 @@ where
     /// #     type Message=(); type Reply=u64;
     /// #     type Send=Outbound<std::convert::Infallible>;
     /// #     type Spawn=std::convert::Infallible;
-    /// #     type Io =std::convert::Infallible;
+    /// #     type Io = std::convert::Infallible;
     /// #     type Shard=SingleShard;
     /// #     fn handle(&mut self, _:(), _:&mut Context<'_,Self::Shard,Self::Reply>) -> Effect<Self> { noop() }
     /// # }
@@ -667,7 +667,7 @@ where
     /// #     type Message=(); type Reply=u64;
     /// #     type Send=Outbound<std::convert::Infallible>;
     /// #     type Spawn=std::convert::Infallible;
-    /// #     type Io =std::convert::Infallible;
+    /// #     type Io = std::convert::Infallible;
     /// #     type Shard=SingleShard;
     /// #     fn handle(&mut self, _:(), _:&mut Context<'_,Self::Shard,Self::Reply>) -> Effect<Self> { noop() }
     /// # }
@@ -700,7 +700,7 @@ where
     /// #     type Message=(); type Reply=u64;
     /// #     type Send=Outbound<std::convert::Infallible>;
     /// #     type Spawn=std::convert::Infallible;
-    /// #     type Io =std::convert::Infallible;
+    /// #     type Io = std::convert::Infallible;
     /// #     type Shard=SingleShard;
     /// #     fn handle(&mut self, _:(), _:&mut Context<'_,Self::Shard,Self::Reply>) -> Effect<Self> { noop() }
     /// # }
