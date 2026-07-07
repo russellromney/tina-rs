@@ -46,14 +46,22 @@ tina::flow! {
                     let request = HttpRequest::post("/notify")
                         .text_body(format!("id={id}&name={name}"))
                         .build();
-                    call(
+                    // The outbound request call is the request's cancelable
+                    // child: register it into the scope so a scope cancel
+                    // closes the parked wait.
+                    let (effect, handle) = call_cancelable(
                         *lease.handle(),
                         KeepaliveConnectionMsg::request(request, REQUEST_TIMEOUT),
-                        REQUEST_TIMEOUT,
+                        REQUEST_TIMEOUT + Duration::from_secs(1),
                     )
                     .then(move |outcome| {
                         ControllerMsg::Notify(NotifyFlow::Sent(req, scope_id, lease, outcome))
-                    })
+                    });
+                    if let Some(scope) = self.notify_scopes.get(&scope_id) {
+                        scope.register("outbound_request", handle)
+                            .expect("fresh notify scope has room for the single outbound child rail");
+                    }
+                    effect
                 }
                 other => reply_to_request(req, pool_acquire_error_response(other)),
             }
@@ -108,13 +116,15 @@ impl Controller {
 
 Step names become enum variant names. Captured state is exactly the field list
 you wrote. `req` is always the first field and `outcome` is always the last
-field.
+field. The generated handler has the same visibility as the flow enum.
 
 ## Rules
 
 - Each step body must mention `req`. Reply with it, thread it into the next
   step, or explicitly drop it. A `req` binding introduced inside a closure,
   match arm, or local pattern does not satisfy this rule.
+- Step bodies use the caller crate's normal lint level. The macro does not
+  upgrade unused user locals or captures to hard errors.
 - Match `CallOutcome<T>` in the step body. `Full`, `Closed`, `Timeout`,
   `Rejected`, and domain errors inside `Replied(...)` are still application
   decisions.

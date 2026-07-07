@@ -364,8 +364,7 @@ fn build_flow(flow: FlowInput) -> Result<proc_macro2::TokenStream> {
         }
 
         impl #isolate {
-            #[deny(unused_variables)]
-            fn #handler(&mut self, msg: #flow_name) -> #tina_crate::Effect<Self> {
+            #visibility fn #handler(&mut self, msg: #flow_name) -> #tina_crate::Effect<Self> {
                 match msg {
                     #(#arms,)*
                 }
@@ -376,9 +375,15 @@ fn build_flow(flow: FlowInput) -> Result<proc_macro2::TokenStream> {
 
 fn ident_to_snake(ident: &Ident) -> String {
     let mut out = String::new();
-    for (idx, ch) in ident.to_string().chars().enumerate() {
+    let chars: Vec<_> = ident.to_string().chars().collect();
+    for (idx, ch) in chars.iter().copied().enumerate() {
         if ch.is_uppercase() {
-            if idx > 0 {
+            let prev = idx.checked_sub(1).and_then(|prev| chars.get(prev));
+            let next = chars.get(idx + 1);
+            if idx > 0
+                && (prev.is_some_and(|prev| prev.is_lowercase() || prev.is_ascii_digit())
+                    || next.is_some_and(|next| next.is_lowercase()))
+            {
                 out.push('_');
             }
             for lower in ch.to_lowercase() {
@@ -429,6 +434,16 @@ fn pat_contains_ident(pat: &Pat, ident: &str) -> bool {
 }
 
 fn block_mentions_unshadowed_ident(block: &syn::Block, ident: &str) -> bool {
+    fn token_stream_mentions_ident(tokens: &proc_macro2::TokenStream, ident: &str) -> bool {
+        tokens.clone().into_iter().any(|token| match token {
+            proc_macro2::TokenTree::Ident(candidate) => ident_is(&candidate, ident),
+            proc_macro2::TokenTree::Group(group) => {
+                token_stream_mentions_ident(&group.stream(), ident)
+            }
+            proc_macro2::TokenTree::Punct(_) | proc_macro2::TokenTree::Literal(_) => false,
+        })
+    }
+
     struct Finder<'a> {
         ident: &'a str,
         found: bool,
@@ -467,6 +482,17 @@ fn block_mentions_unshadowed_ident(block: &syn::Block, ident: &str) -> bool {
                 self.found = true;
             }
             syn::visit::visit_expr_path(self, node);
+        }
+
+        fn visit_macro(&mut self, node: &'ast syn::Macro) {
+            // Macro bodies are opaque to `syn::Visit`. When no Rust binding
+            // has shadowed the caller authority, a raw token hit is enough:
+            // false accepts still fail later by move semantics, while false
+            // rejects block valid helper-macro adoption.
+            if self.shadowed == 0 && token_stream_mentions_ident(&node.tokens, self.ident) {
+                self.found = true;
+            }
+            syn::visit::visit_macro(self, node);
         }
 
         fn visit_expr_closure(&mut self, node: &'ast syn::ExprClosure) {

@@ -61,6 +61,9 @@ tina::flow! {
                         format!("id={id}&name={name}")
                     };
                     let request = HttpRequest::post("/notify").text_body(body).build();
+                    // The outbound request call is the request's cancelable
+                    // child: register it into the scope so a scope cancel
+                    // closes the parked wait.
                     let (effect, handle) = call_cancelable(
                         *lease.handle(),
                         KeepaliveConnectionMsg::request(request, REQUEST_TIMEOUT),
