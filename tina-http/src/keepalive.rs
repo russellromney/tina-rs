@@ -994,8 +994,13 @@ fn body_complete(state: &InFlight) -> bool {
     let Some(head) = state.parsed_head.as_ref() else {
         return false;
     };
-    let needed = state.head_len + head.content_length;
-    state.read_buf.len() >= needed
+    if head.chunked {
+        // Chunked completeness comes from the decoder, never length math.
+        false
+    } else {
+        let needed = state.head_len + head.content_length;
+        state.read_buf.len() >= needed
+    }
 }
 
 /// Declared body length of the parsed (non-chunked) response. 0 if no
