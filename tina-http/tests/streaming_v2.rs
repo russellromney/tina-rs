@@ -44,7 +44,7 @@ impl Isolate for StreamRouter {
         reply: HttpResponse,
         send: tina::Outbound<Infallible>,
         spawn: Infallible,
-        call: Infallible,
+        io: Infallible,
         shard: TestShard,
     }
 
@@ -553,7 +553,7 @@ impl Isolate for CancelRecordingSource {
         reply: tina_http::ResponseChunkReply,
         send: tina::Outbound<Infallible>,
         spawn: Infallible,
-        call: Infallible,
+        io: Infallible,
         shard: TestShard,
     }
 
@@ -859,7 +859,7 @@ fn known_length_zero_does_not_pull_source() {
             reply: tina_http::ResponseChunkReply,
             send: tina::Outbound<Infallible>,
             spawn: Infallible,
-            call: Infallible,
+            io: Infallible,
             shard: TestShard,
         }
         fn handle(
@@ -968,7 +968,7 @@ fn chunked_source_timeout_records_both_timeout_and_io_error() {
             reply: tina_http::ResponseChunkReply,
             send: tina::Outbound<Infallible>,
             spawn: Infallible,
-            call: Infallible,
+            io: Infallible,
             shard: TestShard,
         }
         fn handle(

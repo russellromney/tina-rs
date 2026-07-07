@@ -285,7 +285,7 @@ impl Isolate for CancelRecordingSource {
         reply: tina_http::ResponseChunkReply,
         send: tina::Outbound<Infallible>,
         spawn: Infallible,
-        call: Infallible,
+        io: Infallible,
         shard: TestShard,
     }
 
@@ -384,25 +384,21 @@ impl StreamingEchoSource {
         reply: GrpcStreamReply<CounterRequest>,
     ) -> Effect<Self> {
         match reply {
-            GrpcStreamReply::Message(request) => {
-                reply_to_request(pending, self.reply_for_message(request))
-            }
+            GrpcStreamReply::Message(request) => reply_to(pending, self.reply_for_message(request)),
             GrpcStreamReply::NeedMore => {
                 self.pending = Some(pending);
                 self.pull_request()
             }
             GrpcStreamReply::Eof => {
                 self.eof = true;
-                reply_to_request(pending, tina_http::ResponseChunkReply::Eof)
+                reply_to(pending, tina_http::ResponseChunkReply::Eof)
             }
-            GrpcStreamReply::Status(status) => {
-                reply_to_request(pending, self.finish_with_status(status))
-            }
-            GrpcStreamReply::Cancelled => reply_to_request(
+            GrpcStreamReply::Status(status) => reply_to(pending, self.finish_with_status(status)),
+            GrpcStreamReply::Cancelled => reply_to(
                 pending,
                 self.finish_with_status(GrpcStatus::new(GrpcStatusCode::Cancelled)),
             ),
-            GrpcStreamReply::DeadlineExceeded => reply_to_request(
+            GrpcStreamReply::DeadlineExceeded => reply_to(
                 pending,
                 self.finish_with_status(GrpcStatus::new(GrpcStatusCode::DeadlineExceeded)),
             ),
@@ -416,7 +412,7 @@ impl Isolate for StreamingEchoSource {
         reply: tina_http::ResponseChunkReply,
         send: tina::Outbound<Infallible>,
         spawn: Infallible,
-        call: tina_runtime::RuntimeCall<tina_http::ResponseChunkMsg>,
+        io: tina_runtime::RuntimeCall<tina_http::ResponseChunkMsg>,
         shard: TestShard,
     }
 
@@ -483,7 +479,7 @@ impl Isolate for HangingGrpc {
         reply: HttpResponse,
         send: tina::Outbound<Infallible>,
         spawn: Infallible,
-        call: tina_runtime::RuntimeCall<HangingMsg>,
+        io: tina_runtime::RuntimeCall<HangingMsg>,
         shard: TestShard,
     }
 
@@ -494,7 +490,7 @@ impl Isolate for HangingGrpc {
     ) -> Effect<Self> {
         match msg {
             HangingMsg::Request => noop(),
-            HangingMsg::Done(request) => reply_to_request(request, HttpResponse::ok()),
+            HangingMsg::Done(request) => reply_to(request, HttpResponse::ok()),
         }
     }
 

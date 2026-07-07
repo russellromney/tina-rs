@@ -384,13 +384,13 @@ is rejected as `TakeParkedError::StaleTicket`.
 The lower-level key-only form still works as an escape hatch:
 
 ```rust
-let slot: DeferredReply<MyReply> = ctx.take_reply_slot()?;
+let slot: DeferredReply<MyReply> = ctx.take_request_context()?;
 self.pending.try_insert(req_id, slot)?;
 let slot = self.pending.take(&req_id).expect("slot for id");
 return reply_to(slot, MyReply::Ok(value));
 ```
 
-One-shot. After `take_reply_slot`, a stray `Effect::Reply` in the same
+One-shot. After `take_request_context`, a stray `Effect::Reply` in the same
 turn is a no-op for that caller.
 
 ### Pending box needs a cap
@@ -461,7 +461,7 @@ ProbeResult(RequestContext<MyReply>, CallOutcome<ProbeReply>)
 ```
 
 The caller timeout still governs. The service still answers later with
-`reply_to_request(req, MyReply)`. There is no hidden state preservation and no
+`reply_to(req, MyReply)`. There is no hidden state preservation and no
 async-looking sugar.
 
 When the expanded authority move reads better, spell it out:
@@ -572,8 +572,6 @@ match shared.wait(key.clone(), call) {
   the upstream call/timer, retry policy.
 - What not to use: hand-rolled `HashMap<key, VecDeque<id>>` next to
   `PendingReplies`. That is exactly what `SharedWork` exists to replace.
-  `WaitList` is still public for code that reads better under the
-  mechanism name.
 
 ### One active cancelable request per key → `PendingCancelableCallSet`
 
@@ -590,7 +588,7 @@ match pending.try_insert(token) {
     Err(PendingCancelableInsertError::Full { token })
     | Err(PendingCancelableInsertError::DuplicateKey { token }) => {
         let request = token.into_request_context();
-        reply_to_request(request, JobReply::Busy)
+        reply_to(request, JobReply::Busy)
     }
 }
 ```
@@ -619,7 +617,7 @@ match work.admit(token) {
     Ok((ticket, request_effect)) => request_effect,
     Err(AdmitWorkError::Full { token }) | Err(AdmitWorkError::KeyFull { token }) => {
         let request = token.into_request_context();
-        reply_to_request(request, JobReply::Busy)
+        reply_to(request, JobReply::Busy)
     }
 }
 ```

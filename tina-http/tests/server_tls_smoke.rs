@@ -40,7 +40,7 @@ impl Isolate for Counter {
         reply: HttpResponse,
         send: tina::Outbound<Infallible>,
         spawn: Infallible,
-        call: Infallible,
+        io: Infallible,
         shard: TestShard,
     }
 

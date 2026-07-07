@@ -3,7 +3,7 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use tina::{
-    Address, CallContext, Context, Effect, Isolate, RequestContext, noop, reply_to_request,
+    Address, CallContext, Context, Effect, Isolate, RequestContext, noop, reply_to,
 };
 use tina_runtime::{CallOutcome, RuntimeCall, call, sleep};
 use tina_sim::{Simulator, SimulatorConfig};
@@ -38,7 +38,7 @@ impl Isolate for Probe {
     type Send = tina::Outbound<std::convert::Infallible>;
     type Spawn = std::convert::Infallible;
     type SpawnObserved = std::convert::Infallible;
-    type Call = RuntimeCall<ProbeMsg>;
+    type Io = RuntimeCall<ProbeMsg>;
     type Fact = std::convert::Infallible;
     type Shard = tina::SingleShard;
 
@@ -51,7 +51,7 @@ impl Isolate for Probe {
             ProbeMsg::Request => {
                 noop()
             }
-            ProbeMsg::SleepDone(req) => reply_to_request(req, ProbeReply),
+            ProbeMsg::SleepDone(req) => reply_to(req, ProbeReply),
         }
     }
 
@@ -85,7 +85,7 @@ impl Isolate for Db {
     type Send = tina::Outbound<std::convert::Infallible>;
     type Spawn = std::convert::Infallible;
     type SpawnObserved = std::convert::Infallible;
-    type Call = RuntimeCall<DbMsg>;
+    type Io = RuntimeCall<DbMsg>;
     type Fact = std::convert::Infallible;
     type Shard = tina::SingleShard;
 
@@ -98,7 +98,7 @@ impl Isolate for Db {
             DbMsg::Request => {
                 noop()
             }
-            DbMsg::SleepDone(req) => reply_to_request(req, DbReply),
+            DbMsg::SleepDone(req) => reply_to(req, DbReply),
         }
     }
 
@@ -137,7 +137,7 @@ impl Isolate for Service {
     type Send = tina::Outbound<std::convert::Infallible>;
     type Spawn = std::convert::Infallible;
     type SpawnObserved = std::convert::Infallible;
-    type Call = RuntimeCall<ServiceMsg>;
+    type Io = RuntimeCall<ServiceMsg>;
     type Fact = std::convert::Infallible;
     type Shard = tina::SingleShard;
 
@@ -152,11 +152,11 @@ impl Isolate for Service {
                 call(self.db, DbMsg::Request, Duration::from_millis(50))
                     .then_with_request(req, ServiceMsg::DbResult)
             }
-            ServiceMsg::ProbeResult(req, _) => reply_to_request(req, ServiceReply::NotReady),
+            ServiceMsg::ProbeResult(req, _) => reply_to(req, ServiceReply::NotReady),
             ServiceMsg::DbResult(req, CallOutcome::Replied(_)) => {
-                reply_to_request(req, ServiceReply::Ready)
+                reply_to(req, ServiceReply::Ready)
             }
-            ServiceMsg::DbResult(req, _) => reply_to_request(req, ServiceReply::NotReady),
+            ServiceMsg::DbResult(req, _) => reply_to(req, ServiceReply::NotReady),
         }
     }
 
@@ -196,7 +196,7 @@ impl Isolate for Client {
     type Send = tina::Outbound<std::convert::Infallible>;
     type Spawn = std::convert::Infallible;
     type SpawnObserved = std::convert::Infallible;
-    type Call = RuntimeCall<ClientMsg>;
+    type Io = RuntimeCall<ClientMsg>;
     type Fact = std::convert::Infallible;
     type Shard = tina::SingleShard;
 

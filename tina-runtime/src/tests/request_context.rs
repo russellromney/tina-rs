@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use tina::{
     Address, CallContext, CancelOutcome, Context, Effect, Isolate, Outbound, RequestContext, batch,
-    noop, reply_to_request,
+    noop, reply_to,
 };
 
 use super::*;
@@ -67,7 +67,7 @@ impl Isolate for Probe {
     type Send = Outbound<Infallible>;
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
-    type Call = Infallible;
+    type Io = Infallible;
     type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 
@@ -115,7 +115,7 @@ impl Isolate for Svc {
     type Send = Outbound<Infallible>;
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
-    type Call = RuntimeCall<SvcMsg>;
+    type Io = RuntimeCall<SvcMsg>;
     type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 
@@ -129,9 +129,9 @@ impl Isolate for Svc {
             SvcMsg::Unsupported => noop(),
             SvcMsg::ProbeResult(req, outcome) => match outcome {
                 CallOutcome::Replied(ProbeReply(val)) if val >= 10 => {
-                    reply_to_request(req, SvcReply::Ready)
+                    reply_to(req, SvcReply::Ready)
                 }
-                _ => reply_to_request(req, SvcReply::NotReady),
+                _ => reply_to(req, SvcReply::NotReady),
             },
         }
     }
@@ -166,7 +166,7 @@ impl Isolate for Client {
     type Send = Outbound<Infallible>;
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
-    type Call = RuntimeCall<ClientMsg>;
+    type Io = RuntimeCall<ClientMsg>;
     type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 
@@ -176,13 +176,13 @@ impl Isolate for Client {
         _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
     ) -> Effect<Self> {
         match msg {
-            ClientMsg::Start(svc) => Effect::Call(RuntimeCall::isolate_call(
+            ClientMsg::Start(svc) => Effect::Io(RuntimeCall::isolate_call(
                 svc,
                 SvcMsg::Start,
                 Duration::from_millis(100),
                 ClientMsg::Returned,
             )),
-            ClientMsg::StartUnsupported(svc) => Effect::Call(RuntimeCall::isolate_call(
+            ClientMsg::StartUnsupported(svc) => Effect::Io(RuntimeCall::isolate_call(
                 svc,
                 SvcMsg::Unsupported,
                 Duration::from_secs(60),
@@ -293,7 +293,7 @@ impl Isolate for ClosedProbe {
     type Send = Outbound<Infallible>;
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
-    type Call = Infallible;
+    type Io = Infallible;
     type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 
@@ -333,7 +333,7 @@ impl Isolate for ClosedSvc {
     type Send = Outbound<Infallible>;
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
-    type Call = RuntimeCall<ClosedSvcMsg>;
+    type Io = RuntimeCall<ClosedSvcMsg>;
     type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 
@@ -345,9 +345,9 @@ impl Isolate for ClosedSvc {
         match msg {
             ClosedSvcMsg::Start => noop(),
             ClosedSvcMsg::ProbeResult(req, CallOutcome::Closed) => {
-                reply_to_request(req, SvcReply::NotReady)
+                reply_to(req, SvcReply::NotReady)
             }
-            ClosedSvcMsg::ProbeResult(req, _) => reply_to_request(req, SvcReply::Ready),
+            ClosedSvcMsg::ProbeResult(req, _) => reply_to(req, SvcReply::Ready),
         }
     }
 
@@ -394,7 +394,7 @@ fn current_request_defer_preserves_caller_on_child_call_closed() {
         type Send = Outbound<Infallible>;
         type Spawn = Infallible;
         type SpawnObserved = std::convert::Infallible;
-        type Call = RuntimeCall<ClosedClientMsg>;
+        type Io = RuntimeCall<ClosedClientMsg>;
         type Fact = ::std::convert::Infallible;
         type Shard = TestShard;
 
@@ -404,7 +404,7 @@ fn current_request_defer_preserves_caller_on_child_call_closed() {
             _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
         ) -> Effect<Self> {
             match msg {
-                ClosedClientMsg::Start(svc) => Effect::Call(RuntimeCall::isolate_call(
+                ClosedClientMsg::Start(svc) => Effect::Io(RuntimeCall::isolate_call(
                     svc,
                     ClosedSvcMsg::Start,
                     Duration::from_millis(100),
@@ -450,7 +450,7 @@ impl Isolate for HoldingProbe {
     type Send = Outbound<Infallible>;
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
-    type Call = Infallible;
+    type Io = Infallible;
     type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 
@@ -485,7 +485,7 @@ impl Isolate for TimeoutSvc {
     type Send = Outbound<Infallible>;
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
-    type Call = RuntimeCall<TimeoutSvcMsg>;
+    type Io = RuntimeCall<TimeoutSvcMsg>;
     type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 
@@ -497,9 +497,9 @@ impl Isolate for TimeoutSvc {
         match msg {
             TimeoutSvcMsg::Start => noop(),
             TimeoutSvcMsg::ProbeResult(req, CallOutcome::Timeout) => {
-                reply_to_request(req, SvcReply::NotReady)
+                reply_to(req, SvcReply::NotReady)
             }
-            TimeoutSvcMsg::ProbeResult(req, _) => reply_to_request(req, SvcReply::Ready),
+            TimeoutSvcMsg::ProbeResult(req, _) => reply_to(req, SvcReply::Ready),
         }
     }
 
@@ -545,7 +545,7 @@ fn current_request_defer_preserves_caller_on_child_call_timeout() {
         type Send = Outbound<Infallible>;
         type Spawn = Infallible;
         type SpawnObserved = std::convert::Infallible;
-        type Call = RuntimeCall<TimeoutClientMsg>;
+        type Io = RuntimeCall<TimeoutClientMsg>;
         type Fact = ::std::convert::Infallible;
         type Shard = TestShard;
 
@@ -555,7 +555,7 @@ fn current_request_defer_preserves_caller_on_child_call_timeout() {
             _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
         ) -> Effect<Self> {
             match msg {
-                TimeoutClientMsg::Start(svc) => Effect::Call(RuntimeCall::isolate_call(
+                TimeoutClientMsg::Start(svc) => Effect::Io(RuntimeCall::isolate_call(
                     svc,
                     TimeoutSvcMsg::Start,
                     Duration::from_millis(100),
@@ -630,7 +630,7 @@ fn current_request_defer_respects_original_caller_timeout() {
         type Send = Outbound<Infallible>;
         type Spawn = Infallible;
         type SpawnObserved = std::convert::Infallible;
-        type Call = RuntimeCall<OuterTimeoutClientMsg>;
+        type Io = RuntimeCall<OuterTimeoutClientMsg>;
         type Fact = ::std::convert::Infallible;
         type Shard = TestShard;
 
@@ -640,7 +640,7 @@ fn current_request_defer_respects_original_caller_timeout() {
             _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
         ) -> Effect<Self> {
             match msg {
-                OuterTimeoutClientMsg::Start(svc) => Effect::Call(RuntimeCall::isolate_call(
+                OuterTimeoutClientMsg::Start(svc) => Effect::Io(RuntimeCall::isolate_call(
                     svc,
                     TimeoutSvcMsg::Start,
                     Duration::from_millis(5),
@@ -766,7 +766,7 @@ impl Isolate for PlainSvc {
     type Send = Outbound<Infallible>;
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
-    type Call = RuntimeCall<PlainSvcMsg>;
+    type Io = RuntimeCall<PlainSvcMsg>;
     type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 
@@ -817,7 +817,7 @@ impl Isolate for PlainClient {
     type Send = Outbound<Infallible>;
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
-    type Call = RuntimeCall<PlainClientMsg>;
+    type Io = RuntimeCall<PlainClientMsg>;
     type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 
@@ -827,7 +827,7 @@ impl Isolate for PlainClient {
         _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
     ) -> Effect<Self> {
         match msg {
-            PlainClientMsg::Start(svc) => Effect::Call(RuntimeCall::isolate_call(
+            PlainClientMsg::Start(svc) => Effect::Io(RuntimeCall::isolate_call(
                 svc,
                 PlainSvcMsg::Start,
                 Duration::from_secs(60),
@@ -927,7 +927,7 @@ impl Isolate for HandleSvc {
     type Send = Outbound<Infallible>;
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
-    type Call = RuntimeCall<HandleSvcMsg>;
+    type Io = RuntimeCall<HandleSvcMsg>;
     type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 
@@ -957,17 +957,17 @@ impl Isolate for HandleSvc {
                         let req = pending.into_request_context();
                         match outcome {
                             CallOutcome::Replied(ProbeReply(val)) if val >= 10 => {
-                                reply_to_request(req, SvcReply::Ready)
+                                reply_to(req, SvcReply::Ready)
                             }
-                            _ => reply_to_request(req, SvcReply::NotReady),
+                            _ => reply_to(req, SvcReply::NotReady),
                         }
                     }
                     Err(PendingCancelableRemoveError::MissingKey)
                     | Err(PendingCancelableRemoveError::StaleTicket) => noop(),
                 }
             }
-            HandleSvcMsg::Cancelled(req, _outcome) => reply_to_request(req, SvcReply::NotReady),
-            HandleSvcMsg::OwnerStopped(req, _outcome) => reply_to_request(req, SvcReply::Stopped),
+            HandleSvcMsg::Cancelled(req, _outcome) => reply_to(req, SvcReply::NotReady),
+            HandleSvcMsg::OwnerStopped(req, _outcome) => reply_to(req, SvcReply::Stopped),
         }
     }
 
@@ -1000,11 +1000,11 @@ impl HandleSvc {
             Ok(effect) => effect,
             Err(PendingCancelableInsertError::Full { token }) => {
                 let req = token.into_request_context();
-                reply_to_request(req, SvcReply::Busy)
+                reply_to(req, SvcReply::Busy)
             }
             Err(PendingCancelableInsertError::DuplicateKey { token }) => {
                 let req = token.into_request_context();
-                reply_to_request(req, SvcReply::Duplicate)
+                reply_to(req, SvcReply::Duplicate)
             }
         }
     }
@@ -1051,7 +1051,7 @@ fn isolate_call_cancelable_defer_replies_to_original_caller() {
         type Send = Outbound<Infallible>;
         type Spawn = Infallible;
         type SpawnObserved = std::convert::Infallible;
-        type Call = RuntimeCall<HClientMsg>;
+        type Io = RuntimeCall<HClientMsg>;
         type Fact = ::std::convert::Infallible;
         type Shard = TestShard;
 
@@ -1061,7 +1061,7 @@ fn isolate_call_cancelable_defer_replies_to_original_caller() {
             _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
         ) -> Effect<Self> {
             match msg {
-                HClientMsg::Start(svc) => Effect::Call(RuntimeCall::isolate_call(
+                HClientMsg::Start(svc) => Effect::Io(RuntimeCall::isolate_call(
                     svc,
                     HandleSvcMsg::Start,
                     Duration::from_millis(100),
@@ -1103,7 +1103,7 @@ impl Isolate for CancelHoldingProbe {
     type Send = Outbound<Infallible>;
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
-    type Call = Infallible;
+    type Io = Infallible;
     type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 
@@ -1152,7 +1152,7 @@ fn isolate_call_cancelable_defer_cancel_path_answers_original_caller() {
         type Send = Outbound<Infallible>;
         type Spawn = Infallible;
         type SpawnObserved = std::convert::Infallible;
-        type Call = RuntimeCall<HClientMsg>;
+        type Io = RuntimeCall<HClientMsg>;
         type Fact = ::std::convert::Infallible;
         type Shard = TestShard;
 
@@ -1162,7 +1162,7 @@ fn isolate_call_cancelable_defer_cancel_path_answers_original_caller() {
             _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
         ) -> Effect<Self> {
             match msg {
-                HClientMsg::Start(svc) => Effect::Call(RuntimeCall::isolate_call(
+                HClientMsg::Start(svc) => Effect::Io(RuntimeCall::isolate_call(
                     svc,
                     HandleSvcMsg::Start,
                     Duration::from_millis(100),
@@ -1253,7 +1253,7 @@ fn isolate_call_cancelable_defer_admits_before_dispatch_and_drains_on_owner_stop
         type Send = Outbound<Infallible>;
         type Spawn = Infallible;
         type SpawnObserved = std::convert::Infallible;
-        type Call = RuntimeCall<HClientMsg>;
+        type Io = RuntimeCall<HClientMsg>;
         type Fact = ::std::convert::Infallible;
         type Shard = TestShard;
 
@@ -1263,7 +1263,7 @@ fn isolate_call_cancelable_defer_admits_before_dispatch_and_drains_on_owner_stop
             _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
         ) -> Effect<Self> {
             match msg {
-                HClientMsg::Start { key, svc } => Effect::Call(RuntimeCall::isolate_call(
+                HClientMsg::Start { key, svc } => Effect::Io(RuntimeCall::isolate_call(
                     svc,
                     HandleSvcMsg::StartKey(key),
                     Duration::from_millis(100),
@@ -1444,7 +1444,7 @@ impl Isolate for AbandonSvc {
     type Send = Outbound<Infallible>;
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
-    type Call = Infallible;
+    type Io = Infallible;
     type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 
@@ -1478,7 +1478,7 @@ impl Isolate for AbandonClient {
     type Send = Outbound<Infallible>;
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
-    type Call = RuntimeCall<AbandonClientMsg>;
+    type Io = RuntimeCall<AbandonClientMsg>;
     type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 
@@ -1488,7 +1488,7 @@ impl Isolate for AbandonClient {
         _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
     ) -> Effect<Self> {
         match msg {
-            AbandonClientMsg::Start(svc) => Effect::Call(RuntimeCall::isolate_call(
+            AbandonClientMsg::Start(svc) => Effect::Io(RuntimeCall::isolate_call(
                 svc,
                 AbandonMsg::Noop,
                 Duration::from_secs(60),
@@ -1566,7 +1566,7 @@ impl Isolate for ImmediateSvc {
     type Send = Outbound<Infallible>;
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
-    type Call = Infallible;
+    type Io = Infallible;
     type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 
@@ -1600,7 +1600,7 @@ impl Isolate for ImmClient {
     type Send = Outbound<Infallible>;
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
-    type Call = RuntimeCall<ImmClientMsg>;
+    type Io = RuntimeCall<ImmClientMsg>;
     type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 
@@ -1610,7 +1610,7 @@ impl Isolate for ImmClient {
         _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
     ) -> Effect<Self> {
         match msg {
-            ImmClientMsg::Start(svc) => Effect::Call(RuntimeCall::isolate_call(
+            ImmClientMsg::Start(svc) => Effect::Io(RuntimeCall::isolate_call(
                 svc,
                 ImmediateMsg::Ping,
                 Duration::from_secs(60),
@@ -1670,7 +1670,7 @@ impl Isolate for Audit {
     type Send = Outbound<Infallible>;
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
-    type Call = Infallible;
+    type Io = Infallible;
     type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 
@@ -1708,7 +1708,7 @@ impl Isolate for BatchSvc {
     type Send = Outbound<AuditMsg>;
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
-    type Call = Infallible;
+    type Io = Infallible;
     type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 
@@ -1753,7 +1753,7 @@ impl Isolate for BatchClient {
     type Send = Outbound<Infallible>;
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
-    type Call = RuntimeCall<BatchClientMsg>;
+    type Io = RuntimeCall<BatchClientMsg>;
     type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 
@@ -1763,7 +1763,7 @@ impl Isolate for BatchClient {
         _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
     ) -> Effect<Self> {
         match msg {
-            BatchClientMsg::Start(svc, request) => Effect::Call(RuntimeCall::isolate_call(
+            BatchClientMsg::Start(svc, request) => Effect::Io(RuntimeCall::isolate_call(
                 svc,
                 request,
                 Duration::from_secs(60),
@@ -1963,7 +1963,7 @@ impl Isolate for Sink {
     type Send = Outbound<Infallible>;
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
-    type Call = Infallible;
+    type Io = Infallible;
     type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 
@@ -1993,7 +1993,7 @@ impl Isolate for ObsSvc {
     type Send = Outbound<Infallible>;
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
-    type Call = RuntimeCall<ObsSvcMsg>;
+    type Io = RuntimeCall<ObsSvcMsg>;
     type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 
@@ -2005,8 +2005,8 @@ impl Isolate for ObsSvc {
         match msg {
             ObsSvcMsg::Start => noop(),
             ObsSvcMsg::SendResult(req, outcome) => match outcome {
-                SendOutcome::Accepted => reply_to_request(req, SvcReply::Ready),
-                _ => reply_to_request(req, SvcReply::NotReady),
+                SendOutcome::Accepted => reply_to(req, SvcReply::Ready),
+                _ => reply_to(req, SvcReply::NotReady),
             },
         }
     }
@@ -2047,7 +2047,7 @@ fn observed_send_defer_carries_request_context() {
         type Send = Outbound<Infallible>;
         type Spawn = Infallible;
         type SpawnObserved = std::convert::Infallible;
-        type Call = RuntimeCall<OClientMsg>;
+        type Io = RuntimeCall<OClientMsg>;
         type Fact = ::std::convert::Infallible;
         type Shard = TestShard;
 
@@ -2057,7 +2057,7 @@ fn observed_send_defer_carries_request_context() {
             _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
         ) -> Effect<Self> {
             match msg {
-                OClientMsg::Start(svc) => Effect::Call(RuntimeCall::isolate_call(
+                OClientMsg::Start(svc) => Effect::Io(RuntimeCall::isolate_call(
                     svc,
                     ObsSvcMsg::Start,
                     Duration::from_millis(100),
@@ -2111,7 +2111,7 @@ fn observed_send_defer_carries_request_context_on_full() {
         type Send = Outbound<Infallible>;
         type Spawn = Infallible;
         type SpawnObserved = std::convert::Infallible;
-        type Call = RuntimeCall<OClientMsg>;
+        type Io = RuntimeCall<OClientMsg>;
         type Fact = ::std::convert::Infallible;
         type Shard = TestShard;
 
@@ -2121,7 +2121,7 @@ fn observed_send_defer_carries_request_context_on_full() {
             _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
         ) -> Effect<Self> {
             match msg {
-                OClientMsg::Start(svc) => Effect::Call(RuntimeCall::isolate_call(
+                OClientMsg::Start(svc) => Effect::Io(RuntimeCall::isolate_call(
                     svc,
                     ObsSvcMsg::Start,
                     Duration::from_millis(100),
@@ -2178,7 +2178,7 @@ impl Isolate for TimerSvc {
     type Send = Outbound<Infallible>;
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
-    type Call = RuntimeCall<TimerSvcMsg>;
+    type Io = RuntimeCall<TimerSvcMsg>;
     type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 
@@ -2189,8 +2189,8 @@ impl Isolate for TimerSvc {
     ) -> Effect<Self> {
         match msg {
             TimerSvcMsg::Start => noop(),
-            TimerSvcMsg::Fired(req, Ok(())) => reply_to_request(req, SvcReply::Ready),
-            TimerSvcMsg::Fired(req, Err(_)) => reply_to_request(req, SvcReply::NotReady),
+            TimerSvcMsg::Fired(req, Ok(())) => reply_to(req, SvcReply::Ready),
+            TimerSvcMsg::Fired(req, Err(_)) => reply_to(req, SvcReply::NotReady),
         }
     }
 
@@ -2227,7 +2227,7 @@ fn typed_runtime_call_defer_carries_request_context() {
         type Send = Outbound<Infallible>;
         type Spawn = Infallible;
         type SpawnObserved = std::convert::Infallible;
-        type Call = RuntimeCall<TClientMsg>;
+        type Io = RuntimeCall<TClientMsg>;
         type Fact = ::std::convert::Infallible;
         type Shard = TestShard;
 
@@ -2237,7 +2237,7 @@ fn typed_runtime_call_defer_carries_request_context() {
             _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
         ) -> Effect<Self> {
             match msg {
-                TClientMsg::Start(svc) => Effect::Call(RuntimeCall::isolate_call(
+                TClientMsg::Start(svc) => Effect::Io(RuntimeCall::isolate_call(
                     svc,
                     TimerSvcMsg::Start,
                     Duration::from_millis(100),
@@ -2283,14 +2283,14 @@ fn typed_runtime_call_defer_carries_request_context() {
 ///     type Send = Outbound<std::convert::Infallible>;
 ///     type Spawn = std::convert::Infallible;
 ///     type SpawnObserved = std::convert::Infallible;
-///     type Call = std::convert::Infallible;
+///     type Io = std::convert::Infallible;
 ///     type Shard = tina::SingleShard;
 ///     fn handle(&mut self, _: (), _: &mut tina::Context<'_, Self::Shard, Self::Reply>) -> Effect<Self> {
 ///         tina::noop()
 ///     }
 /// }
 /// fn _double_reply(req: RequestContext<u32>) -> (Effect<S>, Effect<S>) {
-///     (tina::reply_to_request(req, 1), tina::reply_to_request(req, 2))
+///     (tina::reply_to(req, 1), tina::reply_to(req, 2))
 /// }
 /// ```
 #[allow(dead_code)]

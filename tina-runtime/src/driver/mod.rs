@@ -156,7 +156,7 @@ pub(crate) trait RuntimeDriver: std::fmt::Debug {
 
 /// Driver-owned resource inventory.
 ///
-/// Three independent count vocabularies, per Phase 043 plan:
+/// Three independent count vocabularies:
 ///
 /// * **Table-owned resources** (`listeners`, `streams`, `tls_streams`,
 ///   `udp_sockets`, `files`): runtime-table ids handed back to user code.

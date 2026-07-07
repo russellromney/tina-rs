@@ -11,7 +11,7 @@ use tina::pool::{
     ReleaseOutcome,
 };
 use tina::prelude::*;
-use tina::{CallContext, RequestContext, reply_to_request};
+use tina::{CallContext, RequestContext, reply_to};
 use tina_http::{
     BodyMetrics, BodyPressureReport, HttpClientConfig, HttpListener, HttpListenerMsg, HttpRequest,
     HttpRequestBody, HttpResponse, HttpResponseBody, HttpServerConfig, HttpTarget,
@@ -918,7 +918,7 @@ impl Isolate for NotifySink {
         reply: HttpResponse,
         send: tina::Outbound<Infallible>,
         spawn: Infallible,
-        call: RuntimeCall<NotifyMsg>,
+        io: RuntimeCall<NotifyMsg>,
         shard: SingleShard,
     }
 
@@ -931,7 +931,7 @@ impl Isolate for NotifySink {
             NotifyMsg::Request(_) => noop(),
             NotifyMsg::Delayed(req) => {
                 self.accepted += 1;
-                reply_to_request(req, text(StatusCode::OK, "accepted\n"))
+                reply_to(req, text(StatusCode::OK, "accepted\n"))
             }
         }
     }
@@ -1158,7 +1158,7 @@ impl Isolate for Controller {
         reply: HttpResponse,
         send: tina::Outbound<Infallible>,
         spawn: Infallible,
-        call: RuntimeCall<ControllerMsg>,
+        io: RuntimeCall<ControllerMsg>,
         shard: SingleShard,
     }
 
@@ -1182,7 +1182,7 @@ impl Isolate for Controller {
                 .then_with_request(req, move |req, outcome| {
                     ControllerMsg::ReadyPool(req, ingress_stopped, outcome)
                 }),
-                other => reply_to_request(
+                other => reply_to(
                     req,
                     readiness_response(&build_readiness(ingress_stopped, Some(db_reason(&other)))),
                 ),
@@ -1199,7 +1199,7 @@ impl Isolate for Controller {
                     }
                     _ => Some(ReadinessReason::DependencyClosed("outbound")),
                 };
-                reply_to_request(
+                reply_to(
                     req,
                     readiness_response(&build_readiness(ingress_stopped, dep)),
                 )
@@ -1207,15 +1207,15 @@ impl Isolate for Controller {
             ControllerMsg::Created(req, id, name, outcome) => match outcome {
                 CallOutcome::Replied(Ok(SqliteResponse::Executed { .. })) => {
                     self.live_items.insert(id, name);
-                    reply_to_request(req, text(StatusCode::CREATED, format!("id={id}\n")))
+                    reply_to(req, text(StatusCode::CREATED, format!("id={id}\n")))
                 }
                 CallOutcome::Replied(Err(SqliteError::Constraint(_))) => {
-                    reply_to_request(req, text(StatusCode::CONFLICT, "db_constraint\n"))
+                    reply_to(req, text(StatusCode::CONFLICT, "db_constraint\n"))
                 }
-                other => reply_to_request(req, db_error_response(other)),
+                other => reply_to(req, db_error_response(other)),
             },
             ControllerMsg::Loaded(req, id, outcome) => {
-                reply_to_request(req, item_response(id, outcome))
+                reply_to(req, item_response(id, outcome))
             }
             ControllerMsg::NotifyLoaded(req, scope_id, id, slow, outcome) => {
                 match item_from_rows(id, outcome) {
@@ -1229,11 +1229,11 @@ impl Isolate for Controller {
                     }
                     Ok(None) => {
                         self.retire_scope(scope_id);
-                        reply_to_request(req, text(StatusCode::NOT_FOUND, "not_found\n"))
+                        reply_to(req, text(StatusCode::NOT_FOUND, "not_found\n"))
                     }
                     Err(response) => {
                         self.retire_scope(scope_id);
-                        reply_to_request(req, *response)
+                        reply_to(req, *response)
                     }
                 }
             }
@@ -1269,7 +1269,7 @@ impl Isolate for Controller {
                     }
                     other => {
                         self.retire_scope(scope_id);
-                        reply_to_request(req, pool_acquire_error_response(other))
+                        reply_to(req, pool_acquire_error_response(other))
                     }
                 }
             }
@@ -1305,13 +1305,13 @@ impl Isolate for Controller {
                     CallOutcome::Replied(WorkerPoolReply::Release(ReleaseOutcome::Released))
                         if ok =>
                     {
-                        reply_to_request(req, text(StatusCode::OK, "notified\n"))
+                        reply_to(req, text(StatusCode::OK, "notified\n"))
                     }
-                    CallOutcome::Replied(WorkerPoolReply::Release(_)) if ok => reply_to_request(
+                    CallOutcome::Replied(WorkerPoolReply::Release(_)) if ok => reply_to(
                         req,
                         text(StatusCode::SERVICE_UNAVAILABLE, "outbound_release\n"),
                     ),
-                    _ => reply_to_request(req, text(StatusCode::BAD_GATEWAY, "notify_failed\n")),
+                    _ => reply_to(req, text(StatusCode::BAD_GATEWAY, "notify_failed\n")),
                 }
             }
             ControllerMsg::CapacityPool(req, outcome) => {
@@ -1321,7 +1321,7 @@ impl Isolate for Controller {
                     CallOutcome::Replied(WorkerPoolReply::Pressure(report)) => report,
                     _ => PoolPressureReport::default(),
                 };
-                reply_to_request(
+                reply_to(
                     req,
                     text(
                         StatusCode::OK,
@@ -1804,9 +1804,8 @@ pub fn run_soak(config: crate::SoakConfig) -> anyhow::Result<crate::SoakReport> 
     //   worker % 3 == 1 -> GET /items/1       (HTTP + SQLite bridge)
     //   worker % 3 == 2 -> POST /items/1/notify (HTTP + bridge + outbound pool)
     //
-    // The third lane is what proves Rock 1's "bridge/pool path" line
-    // item — without it the keepalive outbound pool is never exercised
-    // and the soak only proves the HTTP+DB shape.
+    // The third lane proves the bridge/pool path: without it the keepalive
+    // outbound pool is never exercised and the soak only proves HTTP+DB.
     let op_addr = addr;
     let timeout = config.connect_timeout;
     let observe_addr = addr;
@@ -2296,7 +2295,7 @@ fn build_startup_summary(
     // Build the typed `ServiceTopology` covering every started component
     // and the pressure surfaces. The legacy `summary_line` /
     // `discovery_lines` strings stay byte-identical for compatibility;
-    // the typed report is the structured proof Phase 106 adds.
+    // the typed report is the structured lifecycle/health/topology proof.
     let mut topology = ServiceTopology::new("mini_saas_api", Lifecycle::Ready);
     topology
         .push_component(

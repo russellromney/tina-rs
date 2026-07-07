@@ -37,7 +37,7 @@ returns `Err` collapses into a `failed += 1`.
 
 ## Tina shape
 
-A `Fetcher` isolate with a state machine. Phase 059 Rocks 1+3 own
+A `Fetcher` isolate with a state machine. Typed results and TCP loop helpers own
 the loops:
 
 - `Begin → tcp_connect.then(Connected)`.
@@ -58,8 +58,8 @@ let outcome = result.wait(Duration::from_secs(5))?;
 ```
 
 The isolate owns its `FetchOutcome` (plain `u32`/`usize` fields) and
-publishes the final value via `stop_with(self.outcome.clone())`. Phase
-059 Rock 1 — no `Arc`, no atomics, no side channel.
+publishes the final value via `stop_with(self.outcome.clone())`: no
+`Arc`, no atomics, no side channel.
 
 ## Discussion
 
@@ -74,7 +74,7 @@ What feels better:
   is a typed runtime event. `complete_trace()` is a real audit log
   for what happened on the wire.
 
-What 059 Rock 3 already closed:
+What the TCP loop helpers already closed:
 
 - **No hand-rolled partial-write or read-until-EOF loops.** The
   `TcpWriteAll`, `TcpReadExact`, and `TcpReadToEof` helpers in

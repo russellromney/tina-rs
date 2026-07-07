@@ -18,7 +18,7 @@ use std::net::SocketAddr;
 use http::HeaderValue;
 use http::header::HOST;
 use tina::prelude::*;
-use tina::{CallContext, RequestContext, reply_to_request};
+use tina::{CallContext, RequestContext};
 use tina_runtime::{
     CallError, StreamId, TcpReadBufReply, TcpWriteOwnedReply, TlsReadBufReply, TlsStreamId,
     TlsWriteOwnedReply, sleep, tcp_close_stream, tcp_connect, tcp_read_buf, tcp_write_owned,
@@ -146,7 +146,7 @@ impl<S: Shard + 'static> Isolate for HttpClient<S> {
         reply: Result<HttpResponse, HttpClientError>,
         send: tina::Outbound<std::convert::Infallible>,
         spawn: std::convert::Infallible,
-        call: tina_runtime::RuntimeCall<HttpClientMsg>,
+        io: tina_runtime::RuntimeCall<HttpClientMsg>,
         shard: S,
     }
 
@@ -298,7 +298,7 @@ impl<S: Shard + 'static> HttpClient<S> {
     ) -> Effect<Self> {
         if self.state.is_some() {
             return match reply_to {
-                Some(request) => reply_to_request(request, Err(HttpClientError::Busy)),
+                Some(request) => tina::reply_to(request, Err(HttpClientError::Busy)),
                 None => reply(Err(HttpClientError::Busy)),
             };
         }
@@ -307,7 +307,7 @@ impl<S: Shard + 'static> HttpClient<S> {
             Ok(request) => request,
             Err(error) => {
                 return match reply_to {
-                    Some(request) => reply_to_request(request, Err(error)),
+                    Some(request) => tina::reply_to(request, Err(error)),
                     None => reply(Err(error)),
                 };
             }
@@ -550,7 +550,7 @@ impl<S: Shard + 'static> HttpClient<S> {
         reply_to: Option<RequestContext<Result<HttpResponse, HttpClientError>>>,
     ) -> Effect<Self> {
         let reply_effect: Effect<Self> = match reply_to {
-            Some(request) => reply_to_request(request, result),
+            Some(request) => tina::reply_to(request, result),
             None => reply(result),
         };
         let Some(transport) = transport else {

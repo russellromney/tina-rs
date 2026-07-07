@@ -236,7 +236,7 @@ impl Isolate for RetryWorker {
         reply: (),
         send: Outbound<RetryMsg>,
         spawn: Infallible,
-        call: RuntimeCall<RetryMsg>,
+        io: RuntimeCall<RetryMsg>,
         shard: TestShard,
     }
 
@@ -392,7 +392,7 @@ impl Isolate for LongTimer {
         reply: (),
         send: Outbound<Infallible>,
         spawn: Infallible,
-        call: RuntimeCall<LongTimerMsg>,
+        io: RuntimeCall<LongTimerMsg>,
         shard: TestShard,
     }
 
@@ -473,7 +473,7 @@ impl Isolate for TcpAcceptWorker {
         reply: (),
         send: Outbound<Infallible>,
         spawn: Infallible,
-        call: RuntimeCall<TcpAcceptMsg>,
+        io: RuntimeCall<TcpAcceptMsg>,
         shard: TestShard,
     }
 
@@ -483,7 +483,7 @@ impl Isolate for TcpAcceptWorker {
         _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
     ) -> Effect<Self> {
         match msg {
-            TcpAcceptMsg::Bind => Effect::Call(RuntimeCall::new(
+            TcpAcceptMsg::Bind => Effect::Io(RuntimeCall::new(
                 CallInput::TcpBind {
                     addr: self.bind_addr,
                 },
@@ -503,7 +503,7 @@ impl Isolate for TcpAcceptWorker {
                 *self.published.lock().expect("published addr mutex") = Some(addr);
                 noop()
             }
-            TcpAcceptMsg::StartAccept => Effect::Call(RuntimeCall::new(
+            TcpAcceptMsg::StartAccept => Effect::Io(RuntimeCall::new(
                 CallInput::TcpAccept {
                     listener: self.listener.expect("listener bound before accept"),
                 },
@@ -978,7 +978,7 @@ impl Isolate for Driver {
         reply: (),
         send: Outbound<SinkMsg>,
         spawn: Infallible,
-        call: RuntimeCall<DriverMsg>,
+        io: RuntimeCall<DriverMsg>,
         shard: TestShard,
     }
 
@@ -1004,7 +1004,7 @@ impl Isolate for Sink {
         reply: (),
         send: Outbound<Infallible>,
         spawn: Infallible,
-        call: RuntimeCall<SinkMsg>,
+        io: RuntimeCall<SinkMsg>,
         shard: TestShard,
     }
 
@@ -1096,7 +1096,7 @@ impl Isolate for Coordinator {
         reply: (),
         send: Outbound<WorkerMsg>,
         spawn: Infallible,
-        call: RuntimeCall<CoordinatorMsg>,
+        io: RuntimeCall<CoordinatorMsg>,
         shard: WorkShard,
     }
 
@@ -1152,7 +1152,7 @@ impl Isolate for Worker {
         reply: (),
         send: Outbound<CoordinatorMsg>,
         spawn: Infallible,
-        call: RuntimeCall<WorkerMsg>,
+        io: RuntimeCall<WorkerMsg>,
         shard: WorkShard,
     }
 
@@ -1186,7 +1186,7 @@ impl Isolate for WorkSink {
         reply: (),
         send: Outbound<Infallible>,
         spawn: Infallible,
-        call: RuntimeCall<SinkMsg>,
+        io: RuntimeCall<SinkMsg>,
         shard: WorkShard,
     }
 
@@ -1467,7 +1467,7 @@ impl Isolate for CallTarget {
         reply: CallReply,
         send: Outbound<Infallible>,
         spawn: Infallible,
-        call: RuntimeCall<CallTargetMsg>,
+        io: RuntimeCall<CallTargetMsg>,
         shard: WorkShard,
     }
 
@@ -1521,7 +1521,7 @@ impl Isolate for CallClient {
         reply: (),
         send: Outbound<Infallible>,
         spawn: Infallible,
-        call: RuntimeCall<CallClientMsg>,
+        io: RuntimeCall<CallClientMsg>,
         shard: WorkShard,
     }
 
@@ -1631,7 +1631,7 @@ impl Isolate for ParkWorker {
         reply: (),
         send: Outbound<Infallible>,
         spawn: Infallible,
-        call: RuntimeCall<ParkMsg>,
+        io: RuntimeCall<ParkMsg>,
         shard: WorkShard,
     }
 
@@ -1669,7 +1669,7 @@ impl Isolate for RemoteBurst {
         reply: (),
         send: Outbound<SinkMsg>,
         spawn: Infallible,
-        call: RuntimeCall<BurstMsg>,
+        io: RuntimeCall<BurstMsg>,
         shard: WorkShard,
     }
 

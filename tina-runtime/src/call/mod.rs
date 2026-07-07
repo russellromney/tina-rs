@@ -1,10 +1,9 @@
 //! Runtime-owned external call vocabulary for `tina-runtime`.
 //!
-//! `tina` only owns the [`Effect::Call`](tina::Effect::Call) slot and the
-//! `Isolate::Call` associated type. The concrete request and result types
-//! live here so the trait crate stays substrate-neutral. A future
-//! Mariner runtime crate (a different completion-driven backend, a
-//! deterministic simulator, …) can implement the same `Effect::Call`
+//! `tina` only owns the [`Effect::Io`](tina::Effect::Io) slot and the
+//! `Isolate::Io` associated type. The concrete request and result types
+//! live here so the trait crate stays substrate-neutral. A different
+//! completion-driven backend or deterministic simulator can implement the same `Effect::Io`
 //! slot with its own request/result vocabulary without touching `tina`.
 //!
 //! The first shipped call family is backed by Betelgeuse on nightly Rust and
@@ -29,7 +28,7 @@
 //!   opaque ids inside its own message vocabulary.
 
 // ---------------------------------------------------------------------------
-// Module map (Phase 115 reorg)
+// Module map
 // ---------------------------------------------------------------------------
 //
 // Rail constructors live in per-rail submodules so adding or reading one
@@ -161,14 +160,14 @@ mod runtime_callable_sealed {
     pub trait Sealed {}
 }
 
-/// Marker trait identifying `Isolate::Call` types accepted by simulator-
+/// Marker trait identifying `Isolate::Io` types accepted by simulator-
 /// driven and runtime-call-aware contexts.
 ///
 /// This trait is implemented only for [`RuntimeCall`].
 /// Surfaces in simulator and runtime-call bounds get a clearer compile
-/// error than the previous `Call = RuntimeCall<...>` equality mismatch
+/// error than the previous `Io = RuntimeCall<...>` equality mismatch
 /// when an isolate is authored with `#[tina::isolate]` (which defaults
-/// `Call = Infallible`).
+/// `Io = Infallible`).
 ///
 /// `RuntimeCall` satisfies the bound:
 ///
@@ -186,9 +185,9 @@ mod runtime_callable_sealed {
 /// assert_callable::<std::convert::Infallible>();
 /// ```
 #[diagnostic::on_unimplemented(
-    message = "`{Self}` is not a Tina runtime call channel",
+    message = "`{Self}` is not a Tina runtime I/O payload",
     label = "this isolate's `Call` is not `RuntimeCall<...>`",
-    note = "`#[tina::isolate(...)]` defaults `Call = std::convert::Infallible`, which simulator-driven and runtime-call-aware paths cannot drive. Switch the attribute to `#[tina_runtime::isolate(...)]`, or supply `call = ::tina_runtime::RuntimeCall<YourMessage>` explicitly."
+    note = "`#[tina::isolate(...)]` defaults `Io = std::convert::Infallible`, which simulator-driven and runtime-call-aware paths cannot drive. Switch the attribute to `#[tina_runtime::isolate(...)]`, or supply `io = ::tina_runtime::RuntimeCall<YourMessage>` explicitly."
 )]
 pub trait RuntimeCallable: runtime_callable_sealed::Sealed {}
 
@@ -1433,7 +1432,7 @@ where
     )]
     pub fn reply<I, F, M>(self, translator: F) -> tina::Effect<I>
     where
-        I: tina::Isolate<Message = M, Call = RuntimeCall<M>>,
+        I: tina::Isolate<Message = M, Io = RuntimeCall<M>>,
         F: FnOnce(SendOutcome) -> M + 'static,
         M: 'static,
     {
@@ -1443,11 +1442,11 @@ where
     /// Turns this prepared observed send into one ordinary later message.
     pub fn then<I, F, M>(self, translator: F) -> tina::Effect<I>
     where
-        I: tina::Isolate<Message = M, Call = RuntimeCall<M>>,
+        I: tina::Isolate<Message = M, Io = RuntimeCall<M>>,
         F: FnOnce(SendOutcome) -> M + 'static,
         M: 'static,
     {
-        tina::Effect::Call(RuntimeCall::observed_send(
+        tina::Effect::Io(RuntimeCall::observed_send(
             self.destination,
             self.message,
             translator,
@@ -1468,7 +1467,7 @@ where
         translator: F,
     ) -> tina::Effect<I>
     where
-        I: tina::Isolate<Message = M, Call = RuntimeCall<M>>,
+        I: tina::Isolate<Message = M, Io = RuntimeCall<M>>,
         F: FnOnce(tina::RequestContext<Q>, SendOutcome) -> M + 'static,
         M: 'static,
         Q: 'static,
@@ -1484,12 +1483,12 @@ where
         translator: F,
     ) -> tina::Effect<I>
     where
-        I: tina::Isolate<Message = M, Call = RuntimeCall<M>>,
+        I: tina::Isolate<Message = M, Io = RuntimeCall<M>>,
         F: FnOnce(tina::RequestContext<Q>, SendOutcome) -> M + 'static,
         M: 'static,
         Q: 'static,
     {
-        tina::Effect::Call(RuntimeCall::observed_send(
+        tina::Effect::Io(RuntimeCall::observed_send(
             self.destination,
             self.message,
             move |outcome| translator(req, outcome),
@@ -1506,10 +1505,10 @@ where
     ///
     /// This does not reply to the caller by itself. The generated message must
     /// later consume the [`RequestContext`](tina::RequestContext) with
-    /// `reply_to_request`.
+    /// `reply_to`.
     pub fn reply<I, F, M>(self, translator: F) -> tina::Effect<I>
     where
-        I: tina::Isolate<Message = M, Reply = Q, Call = RuntimeCall<M>>,
+        I: tina::Isolate<Message = M, Reply = Q, Io = RuntimeCall<M>>,
         F: FnOnce(tina::RequestContext<Q>, SendOutcome) -> M + 'static,
         M: 'static,
     {
@@ -1525,7 +1524,7 @@ where
     /// Builds a request effect whose continuation carries caller authority.
     pub fn reply<I, F, M>(self, translator: F) -> tina::RequestEffect<I>
     where
-        I: tina::Isolate<Message = M, Reply = Q, Call = RuntimeCall<M>>,
+        I: tina::Isolate<Message = M, Reply = Q, Io = RuntimeCall<M>>,
         F: FnOnce(tina::RequestContext<Q>, SendOutcome) -> M + 'static,
         M: 'static,
     {
@@ -1599,7 +1598,7 @@ where
     )]
     pub fn reply<I, F, M>(self, translator: F) -> tina::Effect<I>
     where
-        I: tina::Isolate<Message = M, Call = RuntimeCall<M>>,
+        I: tina::Isolate<Message = M, Io = RuntimeCall<M>>,
         F: FnOnce(CallOutcome<R>) -> M + 'static,
         M: 'static,
     {
@@ -1609,11 +1608,11 @@ where
     /// Turns this prepared call into one ordinary later message.
     pub fn then<I, F, M>(self, translator: F) -> tina::Effect<I>
     where
-        I: tina::Isolate<Message = M, Call = RuntimeCall<M>>,
+        I: tina::Isolate<Message = M, Io = RuntimeCall<M>>,
         F: FnOnce(CallOutcome<R>) -> M + 'static,
         M: 'static,
     {
-        tina::Effect::Call(RuntimeCall::isolate_call(
+        tina::Effect::Io(RuntimeCall::isolate_call(
             self.destination,
             self.message,
             self.timeout,
@@ -1635,7 +1634,7 @@ where
         translator: F,
     ) -> tina::Effect<I>
     where
-        I: tina::Isolate<Message = M, Call = RuntimeCall<M>>,
+        I: tina::Isolate<Message = M, Io = RuntimeCall<M>>,
         F: FnOnce(tina::RequestContext<Q>, CallOutcome<R>) -> M + 'static,
         M: 'static,
         Q: 'static,
@@ -1651,12 +1650,12 @@ where
         translator: F,
     ) -> tina::Effect<I>
     where
-        I: tina::Isolate<Message = M, Call = RuntimeCall<M>>,
+        I: tina::Isolate<Message = M, Io = RuntimeCall<M>>,
         F: FnOnce(tina::RequestContext<Q>, CallOutcome<R>) -> M + 'static,
         M: 'static,
         Q: 'static,
     {
-        tina::Effect::Call(RuntimeCall::isolate_call(
+        tina::Effect::Io(RuntimeCall::isolate_call(
             self.destination,
             self.message,
             self.timeout,
@@ -1675,10 +1674,10 @@ where
     ///
     /// This does not reply to the caller by itself. The generated message must
     /// later consume the [`RequestContext`](tina::RequestContext) with
-    /// `reply_to_request`.
+    /// `reply_to`.
     pub fn reply<I, F, M>(self, translator: F) -> tina::Effect<I>
     where
-        I: tina::Isolate<Message = M, Reply = Q, Call = RuntimeCall<M>>,
+        I: tina::Isolate<Message = M, Reply = Q, Io = RuntimeCall<M>>,
         F: FnOnce(tina::RequestContext<Q>, CallOutcome<R>) -> M + 'static,
         M: 'static,
     {
@@ -1695,7 +1694,7 @@ where
     /// Builds a request effect whose continuation carries caller authority.
     pub fn reply<I, F, M>(self, translator: F) -> tina::RequestEffect<I>
     where
-        I: tina::Isolate<Message = M, Reply = Q, Call = RuntimeCall<M>>,
+        I: tina::Isolate<Message = M, Reply = Q, Io = RuntimeCall<M>>,
         F: FnOnce(tina::RequestContext<Q>, CallOutcome<R>) -> M + 'static,
         M: 'static,
     {

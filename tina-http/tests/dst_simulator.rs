@@ -55,7 +55,7 @@ impl Isolate for Counter {
         reply: HttpResponse,
         send: tina::Outbound<Infallible>,
         spawn: Infallible,
-        call: tina_runtime::RuntimeCall<HttpRequest>,
+        io: tina_runtime::RuntimeCall<HttpRequest>,
         shard: SimShard,
     }
 
@@ -501,7 +501,7 @@ impl Isolate for ChunkedDemoService {
         reply: HttpResponse,
         send: tina::Outbound<Infallible>,
         spawn: Infallible,
-        call: tina_runtime::RuntimeCall<HttpRequest>,
+        io: tina_runtime::RuntimeCall<HttpRequest>,
         shard: SimShard,
     }
     fn handle(

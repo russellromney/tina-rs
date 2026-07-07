@@ -33,7 +33,7 @@ use std::time::{Duration, Instant};
 use http::StatusCode;
 use tina::capacity::{CapacityMode, CapacitySurfaceReport};
 use tina::prelude::*;
-use tina::{CallContext, RequestContext, reply_to_request};
+use tina::{CallContext, RequestContext, reply_to};
 use tina_http::{
     HttpConnectionMsg, HttpLimits, HttpListener, HttpListenerMsg, HttpRequest, HttpRequestBody,
     HttpResponse, RequestChunkReply,
@@ -230,7 +230,7 @@ impl Isolate for Tree {
         reply: HttpResponse,
         send: tina::Outbound<Infallible>,
         spawn: Infallible,
-        call: RuntimeCall<TreeMsg>,
+        io: RuntimeCall<TreeMsg>,
         shard: SingleShard,
     }
 
@@ -421,7 +421,7 @@ impl Tree {
         let _ = self.scopes.remove(&id);
         self.obs.lock().expect("obs").clean_completions += 1;
         match tree.req.take() {
-            Some(req) => reply_to_request(req, text(StatusCode::OK, "tree_ok\n")),
+            Some(req) => reply_to(req, text(StatusCode::OK, "tree_ok\n")),
             None => noop(),
         }
     }
@@ -458,7 +458,7 @@ impl Tree {
         // Answer the caller if we still owe a reply (timeout path); a
         // disconnected caller is gone, so the request context is dropped.
         let answer = match (reply, tree.req.take()) {
-            (Some(response), Some(req)) => reply_to_request(req, response),
+            (Some(response), Some(req)) => reply_to(req, response),
             _ => noop(),
         };
         batch(vec![cancel_effect, answer])

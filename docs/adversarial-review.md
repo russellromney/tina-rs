@@ -16,11 +16,11 @@ be the canonical review artifact.
 File paths are relative to the repo root. Line numbers reflect the
 `worktree-adversarial-review` snapshot at the time of review.
 
-## Phase 123 First-Pass Coverage Status
+## First-Pass Coverage Status
 
-Phase 123's PR fixes or explicitly proves every first-pass finding in the
+The hardening PR fixes or explicitly proves every first-pass finding in the
 coverage map. The later A8-A12 second-pass findings remain preserved in this
-file and are assigned to Phase 124 by the phase plan.
+file as follow-up hardening work.
 
 | Rock | Findings | Status |
 |---|---|---|
@@ -38,12 +38,12 @@ file and are assigned to Phase 124 by the phase plan.
 | 12 | M9, M10, M15, M18, M19, M20, L17, L18 | Fixed or proven with tests in this PR. |
 | 13 | M4, M17 | Fixed in this PR. |
 
-## Phase 123 Fixed Finding Details
+## Fixed Finding Details
 
 The original findings below are preserved for history. Fixed items record
 the implementation proof and regression test names.
 
-| Finding | Phase 123 status |
+| Finding | Status |
 |---|---|
 | C1 | Fixed. `KeepaliveConnection` now decodes `Transfer-Encoding: chunked` response bodies with `ChunkedDecoder`, returns the decoded buffered body, and retires the connection after every chunked response. Tests: `keepalive_decodes_chunked_response_and_retires_connection`, `chunked_then_content_length_requests_do_not_cross_contaminate`, `malformed_chunked_response_errors_and_retires`, `over_cap_chunked_response_errors_and_retires`, `chunked_connection_close_decodes_and_retires`, `chunked_smuggling_shape_is_retired_before_next_request`. |
 | H14 | Fixed. The chunked decoder rejects SP/HT before the chunk-size digits. Test: `rejects_leading_whitespace_before_chunk_size`. |
@@ -51,7 +51,7 @@ the implementation proof and regression test names.
 | A6 | Fixed. Chunk-size/body accounting uses checked arithmetic around decoded totals and overflow-shaped size lines. Tests: `rejects_body_too_large_after_prior_decoded_bytes`, `rejects_chunk_size_that_overflows_usize`. |
 | M1 | Fixed. WebSocket client frames reject non-minimal 126/127 length encodings and 127-form high-bit lengths. Tests: `client_frame_rejects_non_minimal_126_length`, `client_frame_rejects_non_minimal_127_length`, `client_frame_rejects_127_length_high_bit`. |
 | A7 | Fixed. WebSocket frame-end calculations use checked offsets and reject huge frame lengths before drain/decode. Test: `client_frame_rejects_huge_frame_before_end_offset_overflow`. |
-| M6 | Already fixed in the connection delivery path; Phase 123 added a live regression proving invalid fragmented text is closed before app echo/delivery. Test: `websocket_fragmented_text_invalid_utf8_rejects_before_app_delivery`. |
+| M6 | Already fixed in the connection delivery path; a live regression proves invalid fragmented text is closed before app echo/delivery. Test: `websocket_fragmented_text_invalid_utf8_rejects_before_app_delivery`. |
 | L14 | Fixed. HTTP/1 origin-form parsing rejects protocol-relative targets (`//host/path`). Test: `protocol_relative_target_is_not_origin_form`. |
 | C2 | Fixed. HTTP/2 DATA strips PADDED bytes before body accounting, and HEADERS strips PADDED plus PRIORITY bytes before HPACK. Tests: `http2_padded_data_delivers_only_unpadded_body`, `http2_bad_data_padding_sends_protocol_goaway`, `http2_priority_headers_with_valid_hpack_succeeds`, `http2_padded_priority_headers_with_valid_hpack_succeeds`, `http2_malformed_padded_priority_headers_rejects`. |
 | C3 | Fixed. SETTINGS frames are parsed and applied before ACK: peer `INITIAL_WINDOW_SIZE` updates open/new stream send windows, peer `MAX_FRAME_SIZE` controls outbound DATA splitting, invalid values reject, and unsupported non-default `HEADER_TABLE_SIZE` sends SETTINGS_ERROR. Tests: `http2_settings_initial_window_shrink_blocks_until_window_update`, `http2_settings_max_frame_size_controls_outbound_splitting`, `http2_invalid_settings_value_sends_goaway`, `http2_invalid_enable_push_value_sends_protocol_error`, `http2_non_default_header_table_size_sends_settings_error`. |
@@ -512,7 +512,7 @@ one serial worker. The cap remains `tls_lane_capacity`.
   during header validation, rejecting invalid/conflicting duplicates, and
   enforcing exact length for buffered and streaming request paths.
   `tina-http/src/http2.rs:1062-1084,1120-1127,1780-1788`.
-  Fixed (Phase 124). Content-length is parsed once during HPACK header
+  Fixed. Content-length is parsed once during HPACK header
   decode (`add_header` → `parse_content_length`), stored on the
   `HeaderBlock` and propagated onto the stream before dispatch. Any
   duplicate `content-length` (equal or conflicting), non-decimal value,
@@ -540,7 +540,7 @@ one serial worker. The cap remains `tls_lane_capacity`.
   per-stream remaining declared byte count, decrementing on DATA, and
   resetting/cancelling on early EOF or overrun.
   `tina-http/src/http2.rs:1274-1285,1392-1459,1490-1520`.
-  Fixed (Phase 124). `ActiveStream` now carries
+  Fixed. `ActiveStream` now carries
   `response_remaining_content_length: Option<usize>`, set when
   `begin_streaming_response` records a declared length and `None` for
   chunked/unknown-length sources. Each `Chunk` outcome decrements the
@@ -561,7 +561,7 @@ one serial worker. The cap remains `tls_lane_capacity`.
   violates the HTTP/2 malformed-request rules. Fix by rejecting any
   repeated pseudo-header before assignment.
   `tina-http/src/http2.rs:366-410,1780-1788`.
-  Fixed (Phase 124). Each pseudo-header arm in `add_header` checks the
+  Fixed. Each pseudo-header arm in `add_header` checks the
   destination `Option` is `None` before assignment and returns
   `InvalidPseudoHeaders` otherwise. Tests:
   `http2_duplicate_method_rejects_before_assignment`,
@@ -575,7 +575,7 @@ one serial worker. The cap remains `tls_lane_capacity`.
   explicitly rejecting unsupported CONTINUATION state and validating
   PRIORITY frame shape.
   `tina-http/src/http2.rs:796-820`.
-  Fixed (Phase 124). `FRAME_CONTINUATION` (`0x9`) is named and any
+  Fixed. `FRAME_CONTINUATION` (`0x9`) is named and any
   occurrence returns `UnexpectedContinuation` (full continuation support
   is not implemented; any `CONTINUATION` is therefore a connection-level
   protocol error). `FRAME_PRIORITY` now routes through `handle_priority`
@@ -596,7 +596,7 @@ one serial worker. The cap remains `tls_lane_capacity`.
   scheduling: after each bounded remote drain pass, service at least one
   local command, and prioritize shutdown over ordinary remote work.
   `tina-runtime/src/threaded_multi_shard.rs:868-903,916-950`.
-  Fixed (Phase 124). `threaded_worker_loop_with_remote` polls
+  Fixed. `threaded_worker_loop_with_remote` polls
   `receiver.try_recv()` after every bounded `drain_remote_inbound` pass,
   not only when `remote_delivered == 0`. `Run` runs the command and
   continues; `Shutdown` is honored immediately. The idle `recv_timeout`

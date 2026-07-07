@@ -710,7 +710,7 @@ impl<S: Shard + 'static> ReqwestWorker<S> {
         result: ReqwestResult,
     ) -> Effect<Self> {
         match request_context {
-            Some(request) => reply_to_request(request, result),
+            Some(request) => reply_to(request, result),
             None => reply::<Self>(result),
         }
     }
@@ -807,7 +807,7 @@ impl<S: Shard + 'static> Isolate for ReqwestWorker<S> {
         reply: Result<ReqwestResponse, ReqwestError>,
         send: tina::Outbound<Infallible>,
         spawn: Infallible,
-        call: RuntimeCall<ReqwestMsg>,
+        io: RuntimeCall<ReqwestMsg>,
         shard: S,
     }
 

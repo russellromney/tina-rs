@@ -52,7 +52,7 @@ impl Echo {
     ) -> Effect<Self> {
         match msg {
             EchoMsg::Start(_) => noop(),
-            EchoMsg::Finished(req, value, Ok(())) => tina::reply_to_request(req, EchoReply(value)),
+            EchoMsg::Finished(req, value, Ok(())) => tina::reply_to(req, EchoReply(value)),
             EchoMsg::Finished(_, _, Err(_)) => noop(),
         }
     }

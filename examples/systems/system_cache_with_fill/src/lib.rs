@@ -231,7 +231,7 @@ impl Cache {
         call.capture(|request| {
             let mut effects = self.waiters.close_all_clone::<Self>(&key, CacheReply::Stale);
             self.stale_replies += effects.len();
-            effects.push(reply_to_request::<Self>(request, CacheReply::Invalidated));
+            effects.push(reply_to::<Self>(request, CacheReply::Invalidated));
             Effect::Batch(effects)
         })
     }

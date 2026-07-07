@@ -88,8 +88,8 @@ this list, that gap belongs in the table.
   bridge worker, but the queue between the worker and the caller stays
   bounded and visible.
 - A battery is not a place to invent new core semantics. New runtime
-  primitives belong in `tina-runtime` behind a real phase plan, not inside a
-  battery crate.
+  primitives belong in `tina-runtime` with their own design and tests, not
+  inside a battery crate.
 
 When in doubt, write the smallest battery that still passes the checklist
 above, then come back later to add ergonomics. Tina batteries should feel

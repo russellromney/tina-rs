@@ -166,7 +166,7 @@ impl Isolate for Caller {
         reply: (),
         send: tina::Outbound<Infallible>,
         spawn: Infallible,
-        call: RuntimeCall<CallerMsg>,
+        io: RuntimeCall<CallerMsg>,
         shard: SingleShard,
     }
 

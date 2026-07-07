@@ -136,11 +136,9 @@ impl Http2Target {
 
     /// Returns the route key used for client-connection reuse.
     ///
-    /// Reuse is "one connection isolate carries many admitted streams"
-    /// (Phase 116 first form). Idle eviction, max lifetime, and health
-    /// policy are Phase 119. The route key folds authority and the
-    /// TLS/root/ALPN policy so two configurations that differ in trust
-    /// roots do not share a connection.
+    /// Reuse is "one connection isolate carries many admitted streams". The
+    /// route key folds authority and the TLS/root/ALPN policy so two
+    /// configurations that differ in trust roots do not share a connection.
     ///
     /// `trust_roots` is hashed (DefaultHasher is sufficient for sharding;
     /// the key is never used as a security boundary on its own — the TLS

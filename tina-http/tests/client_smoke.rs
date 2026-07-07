@@ -64,7 +64,7 @@ impl Isolate for BackgroundDriver {
         reply: (),
         send: tina::Outbound<Infallible>,
         spawn: Infallible,
-        call: RuntimeCall<BackgroundDriverMsg>,
+        io: RuntimeCall<BackgroundDriverMsg>,
         shard: SingleShard,
     }
 

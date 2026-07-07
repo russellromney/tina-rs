@@ -44,7 +44,7 @@ impl Isolate for SlowChunkProducer {
         reply: ResponseChunkReply,
         send: tina::Outbound<Infallible>,
         spawn: Infallible,
-        call: Infallible,
+        io: Infallible,
         shard: TestShard,
     }
 
@@ -105,7 +105,7 @@ impl Isolate for StreamingService {
         reply: HttpResponse,
         send: tina::Outbound<Infallible>,
         spawn: Infallible,
-        call: Infallible,
+        io: Infallible,
         shard: TestShard,
     }
 

@@ -37,7 +37,7 @@ impl Isolate for Driver {
     type Send = Outbound<SimMsg>;
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
-    type Call = RuntimeCall<SimMsg>;
+    type Io = RuntimeCall<SimMsg>;
     type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 
@@ -67,7 +67,7 @@ impl Isolate for Protocol {
     type Send = Outbound<SimMsg>;
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
-    type Call = RuntimeCall<SimMsg>;
+    type Io = RuntimeCall<SimMsg>;
     type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 
@@ -94,7 +94,7 @@ impl Isolate for Trigger {
     type Send = Outbound<SimMsg>;
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
-    type Call = RuntimeCall<SimMsg>;
+    type Io = RuntimeCall<SimMsg>;
     type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 
@@ -123,7 +123,7 @@ impl Isolate for Watcher {
     type Send = Outbound<SimMsg>;
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
-    type Call = RuntimeCall<SimMsg>;
+    type Io = RuntimeCall<SimMsg>;
     type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 
@@ -159,7 +159,7 @@ impl Isolate for Sink {
     type Send = Outbound<SimMsg>;
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
-    type Call = RuntimeCall<SimMsg>;
+    type Io = RuntimeCall<SimMsg>;
     type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 

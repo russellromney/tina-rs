@@ -23,7 +23,7 @@ impl CancelCallBuilder {
     #[deprecated(since = "0.1.0", note = "use `.then(...)` for ordinary continuations")]
     pub fn reply<I, F, M>(self, translator: F) -> tina::Effect<I>
     where
-        I: tina::Isolate<Message = M, Call = RuntimeCall<M>>,
+        I: tina::Isolate<Message = M, Io = RuntimeCall<M>>,
         F: FnOnce(CancelOutcome) -> M + 'static,
         M: 'static,
     {
@@ -34,12 +34,12 @@ impl CancelCallBuilder {
     /// ordinary continuation message.
     pub fn then<I, F, M>(self, translator: F) -> tina::Effect<I>
     where
-        I: tina::Isolate<Message = M, Call = RuntimeCall<M>>,
+        I: tina::Isolate<Message = M, Io = RuntimeCall<M>>,
         F: FnOnce(CancelOutcome) -> M + 'static,
         M: 'static,
     {
         let shared = tina::runtime_internal::call_handle_inner_into_shared(self.inner);
-        tina::Effect::Call(RuntimeCall::cancel_call_with_handle(shared, translator))
+        tina::Effect::Io(RuntimeCall::cancel_call_with_handle(shared, translator))
     }
 }
 

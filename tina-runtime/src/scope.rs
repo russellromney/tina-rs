@@ -366,7 +366,7 @@ impl RequestScope {
         translator: F,
     ) -> (ScopeCancelReport, Vec<Effect<I>>)
     where
-        I: Isolate<Message = M, Call = RuntimeCall<M>>,
+        I: Isolate<Message = M, Io = RuntimeCall<M>>,
         F: Fn(RequestScopeId, &'static str, CancelOutcome) -> M + Clone + Send + 'static,
         M: 'static,
     {
@@ -389,7 +389,7 @@ impl RequestScope {
                 state_at_cancel,
             });
             let translator_for_child = translator.clone();
-            effects.push(Effect::Call(RuntimeCall::cancel_call_with_handle(
+            effects.push(Effect::Io(RuntimeCall::cancel_call_with_handle(
                 shared,
                 move |outcome: CancelOutcome| translator_for_child(scope_id, label, outcome),
             )));
@@ -418,7 +418,7 @@ impl RequestScope {
         translator: F,
     ) -> (ScopeCancelReport, Effect<I>)
     where
-        I: Isolate<Message = M, Call = RuntimeCall<M>>,
+        I: Isolate<Message = M, Io = RuntimeCall<M>>,
         F: Fn(RequestScopeId, &'static str, CancelOutcome) -> M + Clone + Send + 'static,
         M: 'static,
     {
@@ -985,7 +985,7 @@ where
         translator: F,
     ) -> Result<Effect<I>, ScopedAdmitError<K, Q, R>>
     where
-        I: Isolate<Message = M, Reply = Q, Call = RuntimeCall<M>>,
+        I: Isolate<Message = M, Reply = Q, Io = RuntimeCall<M>>,
         F: FnOnce(K, PendingCancelableTicket, CallOutcome<R>) -> M + 'static,
         K: Clone + PartialEq + 'static,
         M: 'static,
@@ -1058,7 +1058,7 @@ where
         translator: F,
     ) -> Result<(PendingCancelableCall<K, Q, R>, Effect<I>), ScopedReplyError<K, Q, R>>
     where
-        I: Isolate<Message = M, Reply = Q, Call = RuntimeCall<M>>,
+        I: Isolate<Message = M, Reply = Q, Io = RuntimeCall<M>>,
         F: FnOnce(K, PendingCancelableTicket, CallOutcome<R>) -> M + 'static,
         K: Clone + 'static,
         M: 'static,

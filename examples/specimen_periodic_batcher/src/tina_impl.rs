@@ -8,8 +8,8 @@
 //!
 //! Cancellation of a stale timer is still explicit: Tina has no API to
 //! abort an in-flight `sleep`, so each `sleep(...).then(...)` carries
-//! the interval tick number chosen by `TimerInterval`. The handler
-//! ignores any `Tick` that does not match the pending tick.
+//! the token chosen by `RecurringTick`. The handler validates the token
+//! and ignores stale ticks.
 
 use std::convert::Infallible;
 use std::sync::Arc;
@@ -27,24 +27,23 @@ use crate::{
 enum BatcherMsg {
     /// One item from the producer.
     Submit(u32),
-    /// Interval timer fired. The `u64` is the helper-assigned tick
-    /// number. If it does not match the pending tick, a size flush
-    /// already invalidated it and the tick is ignored.
-    Tick(u64, SleepReply),
+    /// Interval timer fired. If the token is stale, a size flush already
+    /// invalidated it and the tick is ignored.
+    Tick(RecurringTickToken, SleepReply),
     /// Producer has closed the burst. Flush any remaining items as a
     /// final timer-style flush, then `stop_with(report)`.
     BurstClosed,
 }
 
 struct Batcher {
-    interval: TimerInterval,
+    interval: RecurringTick,
     /// Buffer of item indices, drained on every flush. Stored so the
     /// `Submit(u32)` payload is read deliberately rather than ignored.
     buffer: Vec<u32>,
-    /// `Some(tick_number)` when a timer for that interval tick is in flight.
+    /// `Some(token)` when a timer for that recurring tick is in flight.
     /// `None` when no timer is scheduled (buffer is empty or a size
     /// flush invalidated the previous one).
-    pending_tick: Option<u64>,
+    pending_tick: Option<RecurringTickToken>,
     report: Report,
 }
 
@@ -66,27 +65,30 @@ impl Batcher {
                     return noop();
                 }
                 if self.pending_tick.is_none() {
-                    let decision = self.interval.next_delay(ctx.now());
-                    let tick = decision.tick_number();
-                    self.pending_tick = Some(tick);
-                    sleep(decision.delay()).then(move |reply| BatcherMsg::Tick(tick, reply))
+                    match self.interval.next(ctx.now()) {
+                        RecurringTickDecision::Sleep { delay, token, .. } => {
+                            self.pending_tick = Some(token);
+                            sleep(delay).then(move |reply| BatcherMsg::Tick(token, reply))
+                        }
+                        RecurringTickDecision::Skip(_) => noop(),
+                    }
                 } else {
                     noop()
                 }
             }
-            BatcherMsg::Tick(tick, reply) => {
+            BatcherMsg::Tick(token, reply) => {
                 if reply.is_err() {
                     // Sleep was cancelled (runtime shutdown). Treat as
                     // "no flush"; the burst-closed path handles
                     // anything still in the buffer.
-                    if self.pending_tick == Some(tick) {
+                    if self.pending_tick == Some(token) {
                         self.pending_tick = None;
                     }
                     return noop();
                 }
-                if self.pending_tick != Some(tick) {
+                if self.pending_tick != Some(token) || self.interval.validate(token).is_err() {
                     // Stale tick; a size flush invalidated this
-                    // interval tick. Ignore.
+                    // recurring tick. Ignore.
                     return noop();
                 }
                 self.pending_tick = None;
@@ -115,7 +117,7 @@ pub fn run() -> anyhow::Result<Report> {
     ));
 
     let batcher = Batcher {
-        interval: TimerInterval::every(Duration::from_millis(BATCH_INTERVAL_MS))
+        interval: RecurringTick::every(Duration::from_millis(BATCH_INTERVAL_MS))
             .map_err(|e| anyhow::anyhow!("configure interval: {e:?}"))?,
         buffer: Vec::with_capacity(BATCH_SIZE),
         pending_tick: None,

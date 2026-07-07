@@ -1,4 +1,4 @@
-//! Threaded single-shard runtime extracted from lib.rs (phase 055).
+//! Threaded single-shard runtime extracted from lib.rs.
 //!
 //! Houses `ThreadedRuntimeConfig`, the `ThreadedRuntime` worker handle,
 //! `ThreadedCommand`, `threaded_worker_loop`,
@@ -516,7 +516,7 @@ where
         I::Spawn: IntoErasedSpawn<S, F> + 'static,
         I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
         I::SpawnObservedRemote: IntoSendErasedSpawnObserved<S, F, I::Message> + 'static,
-        I::Call: IntoErasedCall<I::Message> + 'static,
+        I::Io: IntoErasedCall<I::Message> + 'static,
         I::Fact: crate::fact::IntoRuntimeFact + 'static,
         Outbound: 'static,
     {
@@ -548,7 +548,7 @@ where
         I::Spawn: IntoErasedSpawn<S, F> + 'static,
         I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
         I::SpawnObservedRemote: IntoSendErasedSpawnObserved<S, F, I::Message> + 'static,
-        I::Call: IntoErasedCall<I::Message> + 'static,
+        I::Io: IntoErasedCall<I::Message> + 'static,
         I::Fact: crate::fact::IntoRuntimeFact + 'static,
         Outbound: 'static,
     {
@@ -574,7 +574,7 @@ where
         I::Spawn: IntoErasedSpawn<S, F> + 'static,
         I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
         I::SpawnObservedRemote: IntoSendErasedSpawnObserved<S, F, I::Message> + 'static,
-        I::Call: IntoErasedCall<I::Message> + 'static,
+        I::Io: IntoErasedCall<I::Message> + 'static,
         I::Fact: crate::fact::IntoRuntimeFact + 'static,
         Outbound: 'static,
     {
@@ -606,7 +606,7 @@ where
         I::Spawn: IntoErasedSpawn<S, F> + 'static,
         I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
         I::SpawnObservedRemote: IntoSendErasedSpawnObserved<S, F, I::Message> + 'static,
-        I::Call: IntoErasedCall<I::Message> + 'static,
+        I::Io: IntoErasedCall<I::Message> + 'static,
         I::Fact: crate::fact::IntoRuntimeFact + 'static,
         Outbound: 'static,
     {
@@ -635,7 +635,7 @@ where
         I::Spawn: IntoErasedSpawn<S, F> + 'static,
         I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
         I::SpawnObservedRemote: IntoSendErasedSpawnObserved<S, F, I::Message> + 'static,
-        I::Call: IntoErasedCall<I::Message> + 'static,
+        I::Io: IntoErasedCall<I::Message> + 'static,
         I::Fact: crate::fact::IntoRuntimeFact + 'static,
         Outbound: 'static,
     {
@@ -686,7 +686,7 @@ where
         I::Spawn: IntoErasedSpawn<S, F> + 'static,
         I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
         I::SpawnObservedRemote: IntoSendErasedSpawnObserved<S, F, I::Message> + 'static,
-        I::Call: IntoErasedCall<I::Message> + 'static,
+        I::Io: IntoErasedCall<I::Message> + 'static,
         I::Fact: crate::fact::IntoRuntimeFact + 'static,
         Outbound: 'static,
         Ctor: FnOnce(Address<I::Message, I::Reply>) -> I + Send + 'static,
@@ -1009,7 +1009,7 @@ where
 
     /// Retries [`send_and_observe`](Self::send_and_observe) on
     /// `MailboxFull` / `IngressFull` until the message lands or the
-    /// deadline elapses (Phase 062 Rock 4).
+    /// deadline elapses.
     ///
     /// Convention: this is the host-side helper for "control" messages
     /// like `BurstClosed(n)` that travel through the same bounded
@@ -1145,7 +1145,7 @@ where
     }
 
     /// Attempts one typed ingress send and accumulates the outcome into a
-    /// shared [`HostBurstOutcomes`] counter (Phase 062 Rock 3).
+    /// shared [`HostBurstOutcomes`] counter.
     ///
     /// Convenience over [`try_send_and_observe_with`](Self::try_send_and_observe_with):
     /// hides the per-send observer closure, the Arc-cloned counters, and the

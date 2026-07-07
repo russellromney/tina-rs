@@ -1,15 +1,14 @@
 #![deny(unsafe_code)]
 #![deny(missing_docs)]
 #![deny(rustdoc::broken_intra_doc_links)]
-// Phase Mariner 012 substrate is Betelgeuse, which exposes its
-// `IOLoopHandle<A: Allocator>` over the unstable `allocator_api`. We
-// commit to nightly Rust for `tina-runtime` per the reopened
-// 012 plan; the feature gate is scoped to this crate.
+// Betelgeuse exposes `IOLoopHandle<A: Allocator>` over the unstable
+// `allocator_api`, so `tina-runtime` remains nightly-only. The feature gate is
+// scoped to this crate.
 #![feature(allocator_api)]
 
 //! Small deterministic single-shard runtime core for `tina-rs`.
 //!
-//! This crate starts Mariner with the narrowest useful runtime surface:
+//! This crate starts with the narrowest useful runtime surface:
 //!
 //! - deterministic runtime event IDs
 //! - causal links between runtime events
@@ -94,7 +93,7 @@ mod threaded;
 mod threaded_multi_shard;
 mod trace;
 pub mod unix_loops;
-pub mod wait_list;
+mod wait_list;
 
 pub use admission::{
     AdmissionDecision, AdmissionFailure, AdmissionReport, ConcurrencyLimit, ConcurrencyPermit,
@@ -251,6 +250,8 @@ pub use deferred::{
     request_effect_after_park,
 };
 use driver::DriverCompletion;
+pub use driver::os_signal_capture_supported;
+use driver::{BetelgeuseDriver, RuntimeDriver};
 pub use event_sink::{
     BoundedEventSink, DropPolicy, EventSinkDrain, EventSinkReport, EventSinkSurface,
 };
@@ -297,7 +298,7 @@ pub use shared_work::{
 };
 pub use supervision_report::{ChildSupervision, SupervisorHalt, SupervisorReport};
 pub use tcp_loops::{LoopStep, ReadExactStep, TcpReadExact, TcpReadToEof, TcpWriteAll};
-/// Declares a Tina isolate whose call channel defaults to [`RuntimeCall<Message>`](RuntimeCall).
+/// Declares a Tina isolate whose I/O payload defaults to [`RuntimeCall<Message>`](RuntimeCall).
 ///
 /// This is the preferred runtime authoring path. It keeps the handler as normal
 /// Rust code and only fills the repetitive [`tina::Isolate`] associated types.
@@ -305,7 +306,7 @@ pub use tcp_loops::{LoopStep, ReadExactStep, TcpReadExact, TcpReadToEof, TcpWrit
 /// **The expansion is rooted at `::tina`.** The generated impl names
 /// `::tina::Isolate`, `::tina::Effect`, `::tina::Context`, and friends, so the
 /// crate using this macro must depend on `tina` and have it reachable as
-/// `::tina` (the default crate name). Only the call channel is rooted at
+/// `::tina` (the default crate name). Only the I/O payload is rooted at
 /// `::tina_runtime`. A crate that depends on `tina-runtime` alone will fail to
 /// compile with `unresolved import ::tina`; add `tina` as a direct dependency,
 /// or override the root with `#[tina_runtime::isolate(.., tina_crate = ::your_path)]`.
@@ -317,14 +318,6 @@ pub use trace::{
     TerminalCompletionAction, stable_trace_hash,
 };
 pub use unix_loops::{UnixReadToEof, UnixWriteAll};
-pub use wait_list::{
-    WaitCallError as WaitListCallError, WaitError as WaitListError, WaitList,
-    WaitReplyError as WaitListReplyError, WaitSnapshot as WaitListSnapshot, WaitTicket,
-    request_effect_after_wait_park,
-};
-
-pub use driver::os_signal_capture_supported;
-use driver::{BetelgeuseDriver, RuntimeDriver};
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum MessageCallContext {
@@ -400,7 +393,7 @@ impl IdSource {
 /// an unbounded delivery loop. The remainder carries over to the next step.
 pub const DEFAULT_DRIVER_COMPLETION_DRAIN_BUDGET: usize = 64;
 
-/// Small deterministic single-shard runtime for the second Mariner slice.
+/// Small deterministic single-shard runtime.
 ///
 /// The runtime owns one shard value plus a private registry of isolates and
 /// mailboxes. [`step`](Self::step) walks registered isolates in registration

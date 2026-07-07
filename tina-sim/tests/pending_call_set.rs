@@ -101,7 +101,7 @@ impl Worker {
             WorkerMsg::Do => sleep(Duration::from_millis(self.sleep_ms)).then(WorkerMsg::Done),
             WorkerMsg::Done(Ok(())) => reply(WorkerReply),
             WorkerMsg::Done(Err(_)) => stop(),
-            WorkerMsg::DoneForCall(req, Ok(())) => tina::reply_to_request(req, WorkerReply),
+            WorkerMsg::DoneForCall(req, Ok(())) => tina::reply_to(req, WorkerReply),
             WorkerMsg::DoneForCall(_, Err(_)) => stop(),
         }
     }

@@ -59,7 +59,7 @@ The handler is one match per variant:
 - Everything else is fatal: finish immediately.
 
 The host reads the final `Report` via `runtime.observe_result::<Report>(caller_addr)`
-(Phase 059 Rock 1). The Caller ends with `stop_with(self.report)` —
+(the typed stop-result path). The Caller ends with `stop_with(self.report)` —
 no `mpsc`, no atomics, no shared state.
 
 ## Discussion
@@ -98,10 +98,10 @@ What this suggests:
   with this backoff, call this address, classify, finish". That
   would still keep one trace event per attempt and leave idempotency
   / budget choices in caller code, so it doesn't cross into the
-  Phase 062 non-goal of hidden retry. Punt until a real caller
+  runtime non-goal of hidden retry. Punt until a real caller
   outside this pedagogical specimen flinches at the variant trio.
 
-What Phase 062 Rock 6 changed:
+What the retry classifier changed:
 
 - **The six-arm classifier is gone.** `outcome.classify()` returns a
   three-way `ReqwestOutcomeClass::{Succeeded, Transient, Fatal}` that

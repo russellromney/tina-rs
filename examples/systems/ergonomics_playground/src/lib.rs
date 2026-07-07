@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use tina::{
     Address, CallContext, CancelOutcome, Context, Effect, Isolate, RequestContext, SingleShard,
-    noop, reply_to_request, send,
+    noop, reply_to, send,
 };
 use tina_runtime::{
     CallGroup, CallGroupToken, CallOutcome, CallReplyRejectedReason, DeferredReplyRejectedReason,
@@ -56,7 +56,7 @@ impl Isolate for Provider {
     type Send = tina::Outbound<std::convert::Infallible>;
     type Spawn = std::convert::Infallible;
     type SpawnObserved = std::convert::Infallible;
-    type Call = RuntimeCall<ProviderMsg>;
+    type Io = RuntimeCall<ProviderMsg>;
     type Fact = std::convert::Infallible;
     type Shard = SingleShard;
 
@@ -67,7 +67,7 @@ impl Isolate for Provider {
     ) -> Effect<Self> {
         match msg {
             ProviderMsg::Quote => noop(),
-            ProviderMsg::Done(req, Ok(())) => reply_to_request(req, self.quote),
+            ProviderMsg::Done(req, Ok(())) => reply_to(req, self.quote),
             ProviderMsg::Done(_, Err(_)) => noop(),
         }
     }
@@ -160,7 +160,7 @@ impl Isolate for QuoteGateway {
     type Spawn = std::convert::Infallible;
     type SpawnObserved = std::convert::Infallible;
     type Fact = std::convert::Infallible;
-    type Call = RuntimeCall<QuoteGatewayMsg>;
+    type Io = RuntimeCall<QuoteGatewayMsg>;
     type Shard = SingleShard;
 
     fn handle(
@@ -193,11 +193,11 @@ impl Isolate for QuoteGateway {
                 let mut effects = Self::cancel_effects(step.cancel_losers);
                 if let Some(reply) = winner {
                     if let Some(request) = pending.request.take() {
-                        effects.insert(0, reply_to_request(request, reply));
+                        effects.insert(0, reply_to(request, reply));
                     }
                 } else if step.report_ready {
                     if let Some(request) = pending.request.take() {
-                        effects.insert(0, reply_to_request(request, QuoteReply::Unavailable));
+                        effects.insert(0, reply_to(request, QuoteReply::Unavailable));
                     }
                     self.pending = None;
                 }
@@ -263,7 +263,7 @@ impl Isolate for QuoteClient {
     type Spawn = std::convert::Infallible;
     type Fact = std::convert::Infallible;
     type SpawnObserved = std::convert::Infallible;
-    type Call = RuntimeCall<QuoteClientMsg>;
+    type Io = RuntimeCall<QuoteClientMsg>;
     type Shard = SingleShard;
 
     fn handle(
@@ -416,7 +416,7 @@ impl Isolate for Batcher {
     type Fact = std::convert::Infallible;
     type Spawn = std::convert::Infallible;
     type SpawnObserved = std::convert::Infallible;
-    type Call = RuntimeCall<BatcherMsg>;
+    type Io = RuntimeCall<BatcherMsg>;
     type Shard = SingleShard;
 
     fn handle(
@@ -509,7 +509,7 @@ impl Isolate for BatchClient {
     type Send = tina::Outbound<BatcherMsg>;
     type Spawn = std::convert::Infallible;
     type SpawnObserved = std::convert::Infallible;
-    type Call = RuntimeCall<BatchClientMsg>;
+    type Io = RuntimeCall<BatchClientMsg>;
     type Shard = SingleShard;
 
     fn handle(
@@ -681,7 +681,7 @@ impl Isolate for Upstream {
     type Send = tina::Outbound<std::convert::Infallible>;
     type Spawn = std::convert::Infallible;
     type SpawnObserved = std::convert::Infallible;
-    type Call = RuntimeCall<UpstreamMsg>;
+    type Io = RuntimeCall<UpstreamMsg>;
     type Shard = SingleShard;
 
     fn handle(
@@ -691,7 +691,7 @@ impl Isolate for Upstream {
     ) -> Effect<Self> {
         match msg {
             UpstreamMsg::Fetch => noop(),
-            UpstreamMsg::Done(req, Ok(())) => reply_to_request(req, FillReply(self.value)),
+            UpstreamMsg::Done(req, Ok(())) => reply_to(req, FillReply(self.value)),
             UpstreamMsg::Done(_, Err(_)) => noop(),
         }
     }
@@ -729,7 +729,7 @@ impl Isolate for Cache {
     type Send = tina::Outbound<std::convert::Infallible>;
     type Spawn = std::convert::Infallible;
     type SpawnObserved = std::convert::Infallible;
-    type Call = RuntimeCall<CacheMsg>;
+    type Io = RuntimeCall<CacheMsg>;
     type Shard = SingleShard;
 
     fn handle(
@@ -810,7 +810,7 @@ impl Isolate for CacheClient {
     type Send = tina::Outbound<std::convert::Infallible>;
     type Spawn = std::convert::Infallible;
     type SpawnObserved = std::convert::Infallible;
-    type Call = RuntimeCall<CacheClientMsg>;
+    type Io = RuntimeCall<CacheClientMsg>;
     type Fact = std::convert::Infallible;
     type Shard = SingleShard;
 

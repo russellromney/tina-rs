@@ -9,7 +9,7 @@ If you're reading older code that does not use these, treat that as
 debt rather than precedent.
 
 This page is the "use this, not that" checklist for new code. Live paper cuts
-belong in `examples/FINDINGS.md` or the next phase plan, not in the user guide.
+belong in `examples/FINDINGS.md` or a focused design note, not in the user guide.
 
 ## Use this, not that
 
@@ -105,7 +105,7 @@ shutdown call site.
 
 Use `call_ctx.defer(work).reply(|req, outcome| Msg::Done { req, outcome })`
 to consume the caller authority, run one visible runtime call, and answer
-later from the continuation handler via `reply_to_request(req, value)`.
+later from the continuation handler via `reply_to(req, value)`.
 
 ```rust
 call_ctx
@@ -537,14 +537,14 @@ labels.
 
 Use `#[tina_runtime::isolate(message = M)]` if your `handle` calls
 `call(...)` against another isolate. The runtime path infers
-`Call = RuntimeCall<M>` from the body.
+`Io = RuntimeCall<M>` from the body.
 
 Use `#[tina::isolate(message = M, ...)]` for pure
-message/reply/spawn isolates. The `tina` path defaults `Call =
+message/reply/spawn isolates. The `tina` path defaults `Io =
 Infallible`, so `call(...).then(...)` will not type-check there.
 
 Do not fall back to a hand-written `impl Isolate` with
-`tina::isolate_types! { call: RuntimeCall<M>, ... }` just to use
+`tina::isolate_types! { io: RuntimeCall<M>, ... }` just to use
 `call(...)` — the runtime macro already does that for you.
 
 ### Registering isolates
@@ -672,7 +672,7 @@ See [Bridge Crates](18-bridge-crates.md) for the contract.
 
 ### Ordered effects
 
-Use `tina::sequence(...)` for "do these effects one after another."
+Use `tina::batch(...)` for "do these effects one after another."
 Use `Effect::Batch` only for genuinely-independent effects (and read
 its docstring — same-stream batches have a caveat).
 
@@ -680,12 +680,12 @@ Do not concatenate three writes into one buffer to avoid a batch.
 
 ### Deferred reply slots
 
-Use `ctx.take_reply_slot()` and `tina::reply_to(slot, value)` to
+Use `ctx.take_request_context()` and `tina::reply_to(slot, value)` to
 answer a caller from a later turn (pool frontend, sharded frontend,
 fanout, bridge worker).
 
 ```rust
-let slot: DeferredReply<MyReply> = ctx.take_reply_slot()?;
+let slot: DeferredReply<MyReply> = ctx.take_request_context()?;
 self.pending.try_insert(req_id, slot)?;
 // later:
 return tina::reply_to(self.pending.take(&req_id).unwrap(), MyReply::Ok(v));
@@ -810,7 +810,7 @@ match shared.wait(key.clone(), call) {
 `request_effect_after_shared_wait(&ticket, effect)` is the only path
 that produces a `RequestEffect` after the caller is parked. The ticket
 is move-only and its fields are crate-private, so a `RequestEffect` from
-`noop()` cannot escape admission. Lower-level name: `WaitList`.
+`noop()` cannot escape admission. Lower-level name: `SharedWork`.
 
 ### Bounded pending replies
 
@@ -904,10 +904,10 @@ match call_ctx
 {
     Ok(effect) => effect,
     Err(PendingCancelableInsertError::Full { token }) => {
-        reply_to_request(token.into_request_context(), Reply::Busy)
+        reply_to(token.into_request_context(), Reply::Busy)
     }
     Err(PendingCancelableInsertError::DuplicateKey { token }) => {
-        reply_to_request(token.into_request_context(), Reply::Duplicate)
+        reply_to(token.into_request_context(), Reply::Duplicate)
     }
 }
 ```
@@ -1059,7 +1059,7 @@ live in crate tests.
 ## Adding to this checklist
 
 If a new ergonomics primitive lands, add a "Use this, not that"
-entry here, link the deep-dive doc if there is one, and remove or
-mark the matching paper cut in `examples/FINDINGS.md` or the next phase plan.
+entry here, link the deep-dive doc if there is one, and remove or mark the
+matching paper cut in `examples/FINDINGS.md` or the matching design note.
 
 Keep entries one paragraph. Detail goes in the deep-dive doc.

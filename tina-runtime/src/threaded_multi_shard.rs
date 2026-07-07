@@ -1,4 +1,4 @@
-//! Threaded multi-shard runtime extracted from lib.rs (phase 055).
+//! Threaded multi-shard runtime extracted from lib.rs.
 //!
 //! Houses `ThreadedMultiShardRuntime`, the cross-shard worker loop
 //! `threaded_worker_loop_with_remote`, and the remote-inbound drain helper
@@ -364,7 +364,7 @@ where
         I::Spawn: IntoErasedSpawn<S, F> + 'static,
         I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
         I::SpawnObservedRemote: IntoSendErasedSpawnObserved<S, F, I::Message> + 'static,
-        I::Call: IntoErasedCall<I::Message> + 'static,
+        I::Io: IntoErasedCall<I::Message> + 'static,
         I::Fact: crate::fact::IntoRuntimeFact + 'static,
         Outbound: Send + 'static,
     {
@@ -390,7 +390,7 @@ where
         I::Spawn: IntoErasedSpawn<S, F> + 'static,
         I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
         I::SpawnObservedRemote: IntoSendErasedSpawnObserved<S, F, I::Message> + 'static,
-        I::Call: IntoErasedCall<I::Message> + 'static,
+        I::Io: IntoErasedCall<I::Message> + 'static,
         I::Fact: crate::fact::IntoRuntimeFact + 'static,
         Outbound: Send + 'static,
     {
@@ -901,7 +901,7 @@ where
         reply: (),
         send: TinaOutbound<Infallible>,
         spawn: Infallible,
-        call: RuntimeCall<HostCallMsg<M, R>>,
+        io: RuntimeCall<HostCallMsg<M, R>>,
         shard: S,
     }
 

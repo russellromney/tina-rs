@@ -5,9 +5,9 @@ next worker round-robin, replies through the matching slot when the
 worker finishes. Workers have varied work times so replies arrive
 out of order.
 
-Phase-061 primitives used:
+Primitives used:
 
-- `Context::take_reply_slot` / `PendingReplies::try_capture` —
+- `Context::take_request_context` / `PendingReplies::try_capture` —
   capture the original caller as a one-shot deferred slot.
 - `PendingReplies::take(qid)` — pull the slot back when the worker
   reply matches.

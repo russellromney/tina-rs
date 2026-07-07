@@ -39,7 +39,7 @@
 //! // From the worker thread, deliver the completion into the isolate
 //! // that is waiting on it. `address` comes from
 //! // `ThreadedRuntime::register_with_capacity`; the isolate then
-//! // replies to the original caller with `reply_to_request(..)`.
+//! // replies to the original caller with `reply_to(..)`.
 //! runtime.try_send(address, Msg::Completed { id, output })?;
 //! ```
 //!

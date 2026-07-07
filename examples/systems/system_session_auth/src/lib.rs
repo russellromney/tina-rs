@@ -1,5 +1,5 @@
 //! `system_session_auth` — sharded session table with a recurring expiry
-//! sweep, hosted on a real `ThreadedMultiShardRuntime` (phase 102).
+//! sweep, hosted on a real `ThreadedMultiShardRuntime`.
 //!
 //! What this specimen pulls on:
 //!

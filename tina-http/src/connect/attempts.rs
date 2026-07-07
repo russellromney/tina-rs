@@ -236,7 +236,7 @@ impl<R> ConnectAttempts<R> {
         translate: F,
     ) -> Result<Effect<I>, ConnectAttemptsError>
     where
-        I: Isolate<Message = M, Call = RuntimeCall<M>>,
+        I: Isolate<Message = M, Io = RuntimeCall<M>>,
         F: FnOnce(SocketAddr, CallGroupToken, CallOutcome<R>) -> M + 'static,
         M: 'static,
         T: Send + 'static,
@@ -510,7 +510,7 @@ mod tests {
             reply: (),
             send: tina::Outbound<std::convert::Infallible>,
             spawn: std::convert::Infallible,
-            call: RuntimeCall<TestMsg>,
+            io: RuntimeCall<TestMsg>,
             shard: tina::SingleShard,
         }
         fn handle(

@@ -128,7 +128,7 @@ struct DurableWorker {
 #[tina_runtime::isolate(
     message = WorkerMsg,
     reply = WorkerReply,
-    call = tina_runtime::RuntimeCall<WorkerMsg>,
+    io = tina_runtime::RuntimeCall<WorkerMsg>,
     shard = ServiceShard
 )]
 impl DurableWorker {
@@ -165,7 +165,7 @@ impl DurableWorker {
                     .lock()
                     .expect("worker observed lock")
                     .push(ServiceObservation::WorkerStored(request.key));
-                tina::reply_to_request(
+                tina::reply_to(
                     req,
                     WorkerReply::Stored {
                         key: request.key,
@@ -174,7 +174,7 @@ impl DurableWorker {
                 )
             }
             WorkerMsg::JournaledForCall(req, Err(error), _, _) => {
-                tina::reply_to_request(req, WorkerReply::DurableFailure(error))
+                tina::reply_to(req, WorkerReply::DurableFailure(error))
             }
         }
     }
@@ -216,7 +216,7 @@ struct Router {
 
 #[tina_runtime::isolate(
     message = RouterMsg,
-    call = tina_runtime::RuntimeCall<RouterMsg>,
+    io = tina_runtime::RuntimeCall<RouterMsg>,
     shard = ServiceShard
 )]
 impl Router {
@@ -393,7 +393,7 @@ const READINESS_MAX_FRAME: usize = 64;
 
 #[tina_runtime::isolate(
     message = ReadinessMsg,
-    call = tina_runtime::RuntimeCall<ReadinessMsg>,
+    io = tina_runtime::RuntimeCall<ReadinessMsg>,
     shard = ServiceShard
 )]
 impl ReadinessService {
@@ -668,7 +668,7 @@ struct AuditedWorker {
 #[tina_runtime::isolate(
     message = AuditedWorkerMsg,
     reply = WorkerReply,
-    call = tina_runtime::RuntimeCall<AuditedWorkerMsg>,
+    io = tina_runtime::RuntimeCall<AuditedWorkerMsg>,
     shard = ServiceShard
 )]
 impl AuditedWorker {
@@ -703,7 +703,7 @@ impl AuditedWorker {
                     .lock()
                     .expect("audited worker observed lock")
                     .push(ServiceObservation::WorkerStored(request.key));
-                tina::reply_to_request(
+                tina::reply_to(
                     req,
                     WorkerReply::Stored {
                         key: request.key,
@@ -712,10 +712,10 @@ impl AuditedWorker {
                 )
             }
             AuditedWorkerMsg::AuditResultForCall(req, _, SendOutcome::Full) => {
-                tina::reply_to_request(req, WorkerReply::DurableFailure(CallError::TargetFull))
+                tina::reply_to(req, WorkerReply::DurableFailure(CallError::TargetFull))
             }
             AuditedWorkerMsg::AuditResultForCall(req, _, SendOutcome::Closed) => {
-                tina::reply_to_request(req, WorkerReply::DurableFailure(CallError::TargetClosed))
+                tina::reply_to(req, WorkerReply::DurableFailure(CallError::TargetClosed))
             }
         }
     }
@@ -753,7 +753,7 @@ struct AuditedClient {
 
 #[tina_runtime::isolate(
     message = AuditedClientMsg,
-    call = tina_runtime::RuntimeCall<AuditedClientMsg>,
+    io = tina_runtime::RuntimeCall<AuditedClientMsg>,
     shard = ServiceShard
 )]
 impl AuditedClient {

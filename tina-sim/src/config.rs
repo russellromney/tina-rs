@@ -1,5 +1,5 @@
 //! Public configuration, scripted resource configs, replay artifacts, and
-//! checker surface extracted from lib.rs (phase 055).
+//! checker surface extracted from lib.rs.
 //!
 //! This module groups the public data types that callers configure or observe
 //! around a `Simulator` run: `SimulatorConfig`, `FaultConfig`, the scripted

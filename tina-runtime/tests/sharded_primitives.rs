@@ -155,7 +155,7 @@ impl Isolate for ShardedCounter {
         reply: (),
         send: Outbound<CounterCoordMsg>,
         spawn: Infallible,
-        call: Infallible,
+        io: Infallible,
         shard: AppShard,
     }
 
@@ -209,7 +209,7 @@ impl Isolate for CounterTracker {
         reply: (),
         send: Outbound<Infallible>,
         spawn: Infallible,
-        call: Infallible,
+        io: Infallible,
         shard: AppShard,
     }
 
@@ -406,7 +406,7 @@ impl Isolate for ShardedMap {
         reply: (),
         send: Outbound<MapCoordMsg>,
         spawn: Infallible,
-        call: Infallible,
+        io: Infallible,
         shard: AppShard,
     }
 
@@ -480,7 +480,7 @@ impl Isolate for MapTracker {
         reply: (),
         send: Outbound<Infallible>,
         spawn: Infallible,
-        call: Infallible,
+        io: Infallible,
         shard: AppShard,
     }
 
@@ -765,7 +765,7 @@ impl Isolate for ScatterCoord {
         reply: (),
         send: Outbound<CounterMsg>,
         spawn: Infallible,
-        call: Infallible,
+        io: Infallible,
         shard: AppShard,
     }
 
@@ -1205,7 +1205,7 @@ impl Isolate for ScatterCoordObs {
         reply: (),
         send: Outbound<CounterMsg>,
         spawn: Infallible,
-        call: RuntimeCall<ScatterCoordObsMsg>,
+        io: RuntimeCall<ScatterCoordObsMsg>,
         shard: AppShard,
     }
 
@@ -1643,7 +1643,7 @@ impl Isolate for AddSink {
         reply: (),
         send: Outbound<Infallible>,
         spawn: Infallible,
-        call: RuntimeCall<SinkMsg>,
+        io: RuntimeCall<SinkMsg>,
         shard: AppShard,
     }
     fn handle(&mut self, msg: SinkMsg, _ctx: &mut Context<'_, AppShard>) -> Effect<Self> {

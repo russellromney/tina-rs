@@ -303,8 +303,7 @@ where
 impl<S> Registry<S>
 where
     S: tina::Shard,
-    Self:
-        tina::Isolate<Message = RegistryMsg, Reply = RouterReply, Call = RuntimeCall<RegistryMsg>>,
+    Self: tina::Isolate<Message = RegistryMsg, Reply = RouterReply, Io = RuntimeCall<RegistryMsg>>,
 {
     fn route(&mut self, request: RouterRequest) -> Effect<Self> {
         let RouterRequest {
@@ -351,7 +350,7 @@ where
     type Send = Outbound<std::convert::Infallible>;
     type Spawn = std::convert::Infallible;
     type SpawnObserved = std::convert::Infallible;
-    type Call = RuntimeCall<RegistryMsg>;
+    type Io = RuntimeCall<RegistryMsg>;
     type Fact = ::std::convert::Infallible;
     type Shard = S;
 
@@ -419,8 +418,8 @@ mod tests {
         let mut registry = Registry::<TestShard>::new(RegistryConfig::default());
         registry.register("svc", service_addr(7));
         let effect = dispatch(&mut registry, RegistryMsg::Route(make_request("svc", "m")));
-        // Should be Effect::Call (an isolate-call to the service).
-        assert!(matches!(effect, Effect::Call(_)));
+        // Should be Effect::Io (an isolate-call to the service).
+        assert!(matches!(effect, Effect::Io(_)));
     }
 
     #[test]

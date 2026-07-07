@@ -14,7 +14,7 @@ use std::time::Duration;
 use http::StatusCode;
 use rustls::pki_types::ServerName;
 use tina::prelude::*;
-use tina::{CallContext, RequestContext, reply_to_request};
+use tina::{CallContext, RequestContext, reply_to};
 use tina_http::{
     BodyMetrics, HttpConnectionMsg, HttpRequest, HttpRequestBody, HttpResponse, HttpsListener,
     HttpsListenerMsg, HttpsReady, HttpsServerConfig, HttpsStartupError, IterBodySource,
@@ -46,7 +46,7 @@ impl Isolate for ChunkProducer {
         reply: ResponseChunkReply,
         send: tina::Outbound<Infallible>,
         spawn: Infallible,
-        call: Infallible,
+        io: Infallible,
         shard: TestShard,
     }
 
@@ -85,7 +85,7 @@ impl Isolate for StreamingService {
         reply: HttpResponse,
         send: tina::Outbound<Infallible>,
         spawn: Infallible,
-        call: Infallible,
+        io: Infallible,
         shard: TestShard,
     }
 
@@ -266,7 +266,7 @@ impl Isolate for ChunkedService {
         reply: HttpResponse,
         send: tina::Outbound<Infallible>,
         spawn: Infallible,
-        call: Infallible,
+        io: Infallible,
         shard: TestShard,
     }
 
@@ -466,7 +466,7 @@ impl Isolate for ChunkedRequestConsumer {
         reply: HttpResponse,
         send: tina::Outbound<Infallible>,
         spawn: Infallible,
-        call: RuntimeCall<ChunkedRequestMsg>,
+        io: RuntimeCall<ChunkedRequestMsg>,
         shard: TestShard,
     }
 
@@ -503,7 +503,7 @@ impl Isolate for ChunkedRequestConsumer {
                     let total = self.accumulated.len();
                     self.pending_source = None;
                     self.accumulated.clear();
-                    reply_to_request(
+                    reply_to(
                         request,
                         HttpResponse::with_text(StatusCode::OK, format!("stream:{total}")),
                     )
@@ -516,7 +516,7 @@ impl Isolate for ChunkedRequestConsumer {
                 | CallOutcome::Rejected(_)
                 | CallOutcome::Timeout => {
                     self.pending_source = None;
-                    reply_to_request(request, HttpResponse::internal_error())
+                    reply_to(request, HttpResponse::internal_error())
                 }
             },
         }

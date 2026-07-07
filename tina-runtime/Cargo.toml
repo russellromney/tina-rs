@@ -20,7 +20,7 @@ loom = ["dep:loom"]
 tina = { path = "../tina" }
 tina-macros = { path = "../tina-macros" }
 tina-supervisor = { path = "../tina-supervisor" }
-# Phase Mariner substrate target. Vendored from Pekka Enberg's Betelgeuse with
+# Runtime substrate target. Vendored from Pekka Enberg's Betelgeuse with
 # a tiny local address-introspection patch (`local_addr` / `peer_addr`) so the
 # TCP call family can report socket addresses honestly.
 betelgeuse = { path = "../vendor-betelgeuse" }
@@ -29,7 +29,7 @@ rustls = { version = "0.23", default-features = false, features = ["std", "ring"
 loom = { version = "0.7.2", optional = true }
 
 [target.'cfg(unix)'.dependencies]
-# Phase Sadie's-Ward (043) live signal capture. Used only for installing
+# Live signal capture. Used only for installing
 # flag-based handlers for SIGINT / SIGTERM. No async signal task, no
 # Tokio dependency, no custom unsafe handler.
 signal-hook = { version = "0.3", default-features = false }
@@ -40,7 +40,7 @@ libc = "0.2"
 [dev-dependencies]
 proptest = { version = "1.6.0", default-features = false, features = ["std"] }
 rcgen = "0.13"
-# Phase 100 safety-rails proof matrix: pin the diagnostic phrase emitted by
+# Safety-rails proof matrix: pin the diagnostic phrase emitted by
 # `tina::CallableIsolate`'s `#[diagnostic::on_unimplemented]`. Plain
 # `compile_fail` doctests pin compilation failure but not the message, so a
 # regression that weakened the diagnostic to trait-soup would slip through.

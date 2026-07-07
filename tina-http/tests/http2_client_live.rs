@@ -648,7 +648,7 @@ impl Isolate for RecordingSource {
         reply: ResponseChunkReply,
         send: tina::Outbound<Infallible>,
         spawn: Infallible,
-        call: tina_runtime::RuntimeCall<ResponseChunkMsg>,
+        io: tina_runtime::RuntimeCall<ResponseChunkMsg>,
         shard: TestShard,
     }
 

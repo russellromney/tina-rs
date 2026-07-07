@@ -120,7 +120,7 @@ impl Isolate for Audit {
         reply: (),
         send: Outbound<NeverOutbound>,
         spawn: Infallible,
-        call: Infallible,
+        io: Infallible,
         shard: TestShard,
     }
 
@@ -144,7 +144,7 @@ impl Isolate for Worker {
         reply: (),
         send: Outbound<NeverOutbound>,
         spawn: Infallible,
-        call: Infallible,
+        io: Infallible,
         shard: TestShard,
     }
 
@@ -168,7 +168,7 @@ impl Isolate for Driver {
         reply: (),
         send: Outbound<AuditEvent>,
         spawn: ChildDefinition<Worker>,
-        call: RuntimeCall<DriverEvent>,
+        io: RuntimeCall<DriverEvent>,
         shard: TestShard,
     }
 
@@ -189,7 +189,7 @@ impl Isolate for Driver {
             DriverEvent::StopThenSend => batch([stop(), send(self.audit, AuditEvent::Record(7))]),
             DriverEvent::SendThenBind => batch([
                 send(self.audit, AuditEvent::Record(3)),
-                Effect::Call(RuntimeCall::new(
+                Effect::Io(RuntimeCall::new(
                     CallInput::TcpBind {
                         addr: "127.0.0.1:0".parse::<SocketAddr>().expect("loopback parse"),
                     },
@@ -201,7 +201,7 @@ impl Isolate for Driver {
             ]),
             DriverEvent::BindObserved => send(self.audit, AuditEvent::Record(4)),
             DriverEvent::FailReadThenSend => batch([
-                Effect::Call(RuntimeCall::new(
+                Effect::Io(RuntimeCall::new(
                     CallInput::TcpRead {
                         stream: StreamId::new(9999),
                         max_len: 8,

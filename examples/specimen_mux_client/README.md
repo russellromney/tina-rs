@@ -82,7 +82,7 @@ What 059 already closed:
   the `Vec<u32>` directly and publishes it via `stop_with(...)` when
   the connection closes. The host receives the typed value through
   `runtime.observe_result::<Vec<u32>, _, _>(address)?.wait(...)`.
-  Phase 059 Rock 1.
+  the typed stop-result path.
 
 What feels worse:
 

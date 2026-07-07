@@ -393,7 +393,7 @@ pub fn broadcast_observed<I, K, M, P, MakeMessage, Continue>(
     continuation: Continue,
 ) -> Effect<I>
 where
-    I: Isolate<Message = P, Call = RuntimeCall<P>>,
+    I: Isolate<Message = P, Io = RuntimeCall<P>>,
     K: 'static,
     M: Send + 'static,
     P: 'static,

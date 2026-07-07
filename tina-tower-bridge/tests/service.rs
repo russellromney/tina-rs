@@ -82,7 +82,7 @@ impl Isolate for SlowIsolate {
         reply: u32,
         send: tina::Outbound<Infallible>,
         spawn: Infallible,
-        call: tina_runtime::RuntimeCall<SlowMsg>,
+        io: tina_runtime::RuntimeCall<SlowMsg>,
         shard: SingleShard,
     }
 

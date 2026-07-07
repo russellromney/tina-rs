@@ -17,7 +17,7 @@ impl Isolate for NoTicket {
     type Send = tina::Outbound<Infallible>;
     type Spawn = Infallible;
     type SpawnObserved = Infallible;
-    type Call = Infallible;
+    type Io = Infallible;
     type Fact = Infallible;
     type Shard = SingleShard;
 

@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use tina::{
     Address, CallContext, Context, Effect, Isolate, Outbound, RequestContext, Shard, batch, noop,
-    reply_to_request,
+    reply_to,
 };
 use tina_runtime::{CallOutcome, RuntimeCall, RuntimeEventKind};
 use tina_sim::{MultiShardSimulator, MultiShardSimulatorConfig, Simulator, SimulatorConfig};
@@ -48,7 +48,7 @@ impl Isolate for Probe {
     type Send = Outbound<Infallible>;
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
-    type Call = RuntimeCall<ProbeMsg>;
+    type Io = RuntimeCall<ProbeMsg>;
     type Fact = ::std::convert::Infallible;
     type Shard = DefShard;
 
@@ -88,7 +88,7 @@ impl Isolate for Svc {
     type Send = Outbound<Infallible>;
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
-    type Call = RuntimeCall<SvcMsg>;
+    type Io = RuntimeCall<SvcMsg>;
     type Fact = ::std::convert::Infallible;
     type Shard = DefShard;
 
@@ -101,9 +101,9 @@ impl Isolate for Svc {
             SvcMsg::Start => noop(),
             SvcMsg::ProbeResult(req, outcome) => match outcome {
                 CallOutcome::Replied(ProbeReply(val)) if val >= 10 => {
-                    reply_to_request(req, SvcReply::Ready)
+                    reply_to(req, SvcReply::Ready)
                 }
-                _ => reply_to_request(req, SvcReply::NotReady),
+                _ => reply_to(req, SvcReply::NotReady),
             },
         }
     }
@@ -139,7 +139,7 @@ impl Isolate for Client {
     type Send = Outbound<Infallible>;
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
-    type Call = RuntimeCall<ClientMsg>;
+    type Io = RuntimeCall<ClientMsg>;
     type Fact = ::std::convert::Infallible;
     type Shard = DefShard;
 
@@ -149,7 +149,7 @@ impl Isolate for Client {
         _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
     ) -> Effect<Self> {
         match msg {
-            ClientMsg::Start(svc) => Effect::Call(RuntimeCall::isolate_call(
+            ClientMsg::Start(svc) => Effect::Io(RuntimeCall::isolate_call(
                 svc,
                 SvcMsg::Start,
                 Duration::from_millis(100),
@@ -225,7 +225,7 @@ impl Isolate for AbandonSvc {
     type Send = Outbound<Infallible>;
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
-    type Call = RuntimeCall<AbandonMsg>;
+    type Io = RuntimeCall<AbandonMsg>;
     type Fact = ::std::convert::Infallible;
     type Shard = DefShard;
 
@@ -259,7 +259,7 @@ impl Isolate for AbandonClient {
     type Send = Outbound<Infallible>;
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
-    type Call = RuntimeCall<AbandonClientMsg>;
+    type Io = RuntimeCall<AbandonClientMsg>;
     type Fact = ::std::convert::Infallible;
     type Shard = DefShard;
 
@@ -269,7 +269,7 @@ impl Isolate for AbandonClient {
         _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
     ) -> Effect<Self> {
         match msg {
-            AbandonClientMsg::Start(svc) => Effect::Call(RuntimeCall::isolate_call(
+            AbandonClientMsg::Start(svc) => Effect::Io(RuntimeCall::isolate_call(
                 svc,
                 AbandonMsg::Noop,
                 Duration::from_secs(60),
@@ -334,7 +334,7 @@ impl Isolate for ImmSvc {
     type Send = Outbound<Infallible>;
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
-    type Call = RuntimeCall<ImmMsg>;
+    type Io = RuntimeCall<ImmMsg>;
     type Fact = ::std::convert::Infallible;
     type Shard = DefShard;
 
@@ -368,7 +368,7 @@ impl Isolate for ImmClient {
     type Send = Outbound<Infallible>;
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
-    type Call = RuntimeCall<ImmClientMsg>;
+    type Io = RuntimeCall<ImmClientMsg>;
     type Fact = ::std::convert::Infallible;
     type Shard = DefShard;
 
@@ -378,7 +378,7 @@ impl Isolate for ImmClient {
         _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
     ) -> Effect<Self> {
         match msg {
-            ImmClientMsg::Start(svc) => Effect::Call(RuntimeCall::isolate_call(
+            ImmClientMsg::Start(svc) => Effect::Io(RuntimeCall::isolate_call(
                 svc,
                 ImmMsg::Ping,
                 Duration::from_secs(60),
@@ -436,7 +436,7 @@ impl Isolate for Audit {
     type Send = Outbound<Infallible>;
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
-    type Call = RuntimeCall<AuditMsg>;
+    type Io = RuntimeCall<AuditMsg>;
     type Fact = ::std::convert::Infallible;
     type Shard = DefShard;
 
@@ -474,7 +474,7 @@ impl Isolate for BatchSvc {
     type Send = Outbound<AuditMsg>;
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
-    type Call = RuntimeCall<BatchMsg>;
+    type Io = RuntimeCall<BatchMsg>;
     type Fact = ::std::convert::Infallible;
     type Shard = DefShard;
 
@@ -519,7 +519,7 @@ impl Isolate for BatchClient {
     type Send = Outbound<Infallible>;
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
-    type Call = RuntimeCall<BatchClientMsg>;
+    type Io = RuntimeCall<BatchClientMsg>;
     type Fact = ::std::convert::Infallible;
     type Shard = DefShard;
 
@@ -529,7 +529,7 @@ impl Isolate for BatchClient {
         _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
     ) -> Effect<Self> {
         match msg {
-            BatchClientMsg::Start(svc, request) => Effect::Call(RuntimeCall::isolate_call(
+            BatchClientMsg::Start(svc, request) => Effect::Io(RuntimeCall::isolate_call(
                 svc,
                 request,
                 Duration::from_secs(60),
@@ -703,7 +703,7 @@ impl Isolate for CrossProbe {
     type Send = Outbound<Infallible>;
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
-    type Call = RuntimeCall<CrossProbeMsg>;
+    type Io = RuntimeCall<CrossProbeMsg>;
     type Fact = ::std::convert::Infallible;
     type Shard = NumberedShard;
 
@@ -743,7 +743,7 @@ impl Isolate for CrossSvc {
     type Send = Outbound<Infallible>;
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
-    type Call = RuntimeCall<CrossSvcMsg>;
+    type Io = RuntimeCall<CrossSvcMsg>;
     type Fact = ::std::convert::Infallible;
     type Shard = NumberedShard;
 
@@ -756,9 +756,9 @@ impl Isolate for CrossSvc {
             CrossSvcMsg::Start => noop(),
             CrossSvcMsg::RejectNow => noop(),
             CrossSvcMsg::ProbeResult(req, CallOutcome::Replied(CrossProbeReply(42))) => {
-                reply_to_request(req, CrossSvcReply::Ready)
+                reply_to(req, CrossSvcReply::Ready)
             }
-            CrossSvcMsg::ProbeResult(req, _) => reply_to_request(req, CrossSvcReply::Ready),
+            CrossSvcMsg::ProbeResult(req, _) => reply_to(req, CrossSvcReply::Ready),
         }
     }
 
@@ -795,7 +795,7 @@ impl Isolate for CrossClient {
     type Send = Outbound<Infallible>;
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
-    type Call = RuntimeCall<CrossClientMsg>;
+    type Io = RuntimeCall<CrossClientMsg>;
     type Fact = ::std::convert::Infallible;
     type Shard = NumberedShard;
 
@@ -805,13 +805,13 @@ impl Isolate for CrossClient {
         _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
     ) -> Effect<Self> {
         match msg {
-            CrossClientMsg::Start(svc) => Effect::Call(RuntimeCall::isolate_call(
+            CrossClientMsg::Start(svc) => Effect::Io(RuntimeCall::isolate_call(
                 svc,
                 CrossSvcMsg::Start,
                 Duration::from_millis(100),
                 CrossClientMsg::Returned,
             )),
-            CrossClientMsg::StartWith(svc, request) => Effect::Call(RuntimeCall::isolate_call(
+            CrossClientMsg::StartWith(svc, request) => Effect::Io(RuntimeCall::isolate_call(
                 svc,
                 request,
                 Duration::from_millis(100),

@@ -83,8 +83,8 @@
 //!
 //! Generic `sqlx::Database` support, user-struct row mapping, an
 //! ORM, migrations, and a transaction *handle* (vs. atomic script)
-//! are explicit non-goals. See the phase plan for the declined set
-//! and the rationale.
+//! are explicit non-goals because the bridge is intentionally a small typed
+//! worker boundary, not a general SQLx facade.
 //!
 //! # Use
 //!
@@ -114,7 +114,7 @@
 //!         reply: (),
 //!         send: tina::Outbound<Infallible>,
 //!         spawn: Infallible,
-//!         call: RuntimeCall<AppMsg>,
+//!         io: RuntimeCall<AppMsg>,
 //!         shard: SingleShard,
 //!     }
 //!
@@ -206,8 +206,8 @@
 //!   completes. The connection stays held until then. Treat
 //!   `PgError::Timeout` as "Tina stopped waiting," not "the database
 //!   stopped working."
-//! - [`PgConfig::with_cancel_on_timeout`] is a compatibility no-op in
-//!   Phase 123. The previous sidecar `pg_cancel_backend(pid)` path
+//! - [`PgConfig::with_cancel_on_timeout`] is a compatibility no-op. The
+//!   previous sidecar `pg_cancel_backend(pid)` path
 //!   could race connection reuse and cancel a later query. Until the
 //!   bridge can quarantine the exact connection being cancelled,
 //!   `db_cancels_sent` remains zero and Tina-side timeout means
@@ -258,8 +258,8 @@
 //! - Deterministic replay: SQLx network IO is not deterministic and
 //!   is not observed by `tina-sim`. Replay parity is best-effort at
 //!   the bridge boundary only.
-//! - Cancellation precision: DB-side cancel-on-timeout is disabled in
-//!   Phase 123. Postgres keeps executing past the bridge's deadline,
+//! - Cancellation precision: DB-side cancel-on-timeout is disabled. Postgres
+//!   keeps executing past the bridge's deadline,
 //!   and late completions are tallied in `late_results`.
 //! - Polling latency: the bridge wakes via Tina's `sleep` to
 //!   re-check the result channel each `poll_interval`. That is

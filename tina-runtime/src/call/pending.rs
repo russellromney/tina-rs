@@ -250,7 +250,7 @@ where
     )]
     pub fn reply<I, F, M>(self, translator: F) -> (tina::Effect<I>, tina::CallHandle<R>)
     where
-        I: tina::Isolate<Message = M, Call = RuntimeCall<M>>,
+        I: tina::Isolate<Message = M, Io = RuntimeCall<M>>,
         F: FnOnce(CallOutcome<R>) -> M + 'static,
         M: 'static,
     {
@@ -262,12 +262,12 @@ where
     /// on dispatch.
     pub fn then<I, F, M>(self, translator: F) -> (tina::Effect<I>, tina::CallHandle<R>)
     where
-        I: tina::Isolate<Message = M, Call = RuntimeCall<M>>,
+        I: tina::Isolate<Message = M, Io = RuntimeCall<M>>,
         F: FnOnce(CallOutcome<R>) -> M + 'static,
         M: 'static,
     {
         let shared = Arc::new(CallHandleShared::new(std::any::TypeId::of::<R>()));
-        let effect = tina::Effect::Call(RuntimeCall::isolate_call_with_handle(
+        let effect = tina::Effect::Io(RuntimeCall::isolate_call_with_handle(
             self.destination,
             self.message,
             self.timeout,
@@ -290,7 +290,7 @@ where
         translator: F,
     ) -> (tina::Effect<I>, tina::CallHandle<R>)
     where
-        I: tina::Isolate<Message = M, Call = RuntimeCall<M>>,
+        I: tina::Isolate<Message = M, Io = RuntimeCall<M>>,
         F: FnOnce(tina::RequestContext<Q>, CallOutcome<R>) -> M + 'static,
         M: 'static,
         Q: 'static,
@@ -315,7 +315,7 @@ where
         translator: F,
     ) -> (tina::Effect<I>, tina::CallHandle<R>)
     where
-        I: tina::Isolate<Message = M, Call = RuntimeCall<M>>,
+        I: tina::Isolate<Message = M, Io = RuntimeCall<M>>,
         F: FnOnce(tina::RequestContext<Q>, CallOutcome<R>) -> M + 'static,
         M: 'static,
         Q: 'static,
@@ -329,13 +329,13 @@ where
         translator: F,
     ) -> (tina::Effect<I>, tina::CallHandle<R>)
     where
-        I: tina::Isolate<Message = M, Call = RuntimeCall<M>>,
+        I: tina::Isolate<Message = M, Io = RuntimeCall<M>>,
         F: FnOnce(tina::RequestContext<Q>, CallOutcome<R>) -> M + 'static,
         M: 'static,
         Q: 'static,
     {
         let shared = Arc::new(CallHandleShared::new(std::any::TypeId::of::<R>()));
-        let effect = tina::Effect::Call(RuntimeCall::isolate_call_with_handle(
+        let effect = tina::Effect::Io(RuntimeCall::isolate_call_with_handle(
             self.destination,
             self.message,
             self.timeout,
@@ -368,7 +368,7 @@ where
         translator: F,
     ) -> (PendingCancelableCall<K, Q, R>, tina::Effect<I>)
     where
-        I: tina::Isolate<Message = M, Reply = Q, Call = RuntimeCall<M>>,
+        I: tina::Isolate<Message = M, Reply = Q, Io = RuntimeCall<M>>,
         F: FnOnce(K, PendingCancelableTicket, CallOutcome<R>) -> M + 'static,
         K: Clone + 'static,
         M: 'static,
@@ -389,7 +389,7 @@ where
         translator: F,
     ) -> (PendingCancelableCall<K, Q, R>, tina::Effect<I>)
     where
-        I: tina::Isolate<Message = M, Reply = Q, Call = RuntimeCall<M>>,
+        I: tina::Isolate<Message = M, Reply = Q, Io = RuntimeCall<M>>,
         F: FnOnce(K, PendingCancelableTicket, CallOutcome<R>) -> M + 'static,
         K: Clone + 'static,
         M: 'static,
@@ -424,7 +424,7 @@ where
         translator: F,
     ) -> Result<tina::Effect<I>, PendingCancelableInsertError<K, Q, R>>
     where
-        I: tina::Isolate<Message = M, Reply = Q, Call = RuntimeCall<M>>,
+        I: tina::Isolate<Message = M, Reply = Q, Io = RuntimeCall<M>>,
         F: FnOnce(K, PendingCancelableTicket, CallOutcome<R>) -> M + 'static,
         K: Clone + PartialEq + 'static,
         M: 'static,
@@ -450,7 +450,7 @@ where
         translator: F,
     ) -> (PendingCancelableCall<K, Q, R>, tina::RequestEffect<I>)
     where
-        I: tina::Isolate<Message = M, Reply = Q, Call = RuntimeCall<M>>,
+        I: tina::Isolate<Message = M, Reply = Q, Io = RuntimeCall<M>>,
         F: FnOnce(K, PendingCancelableTicket, CallOutcome<R>) -> M + 'static,
         K: Clone + 'static,
         M: 'static,
@@ -471,7 +471,7 @@ where
         translator: F,
     ) -> Result<tina::RequestEffect<I>, PendingCancelableInsertError<K, Q, R>>
     where
-        I: tina::Isolate<Message = M, Reply = Q, Call = RuntimeCall<M>>,
+        I: tina::Isolate<Message = M, Reply = Q, Io = RuntimeCall<M>>,
         F: FnOnce(K, PendingCancelableTicket, CallOutcome<R>) -> M + 'static,
         K: Clone + PartialEq + 'static,
         M: 'static,
@@ -553,7 +553,7 @@ where
     /// continuation so the service can explicitly answer its caller.
     pub fn cancel<I, F, M>(self, translator: F) -> tina::Effect<I>
     where
-        I: tina::Isolate<Message = M, Call = RuntimeCall<M>>,
+        I: tina::Isolate<Message = M, Io = RuntimeCall<M>>,
         F: FnOnce(K, tina::RequestContext<Q>, CancelOutcome) -> M + 'static,
         M: 'static,
     {

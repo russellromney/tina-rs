@@ -126,10 +126,10 @@ fn handle(&mut self, msg: SvcMsg, _ctx: &mut Context<'_, SingleShard>) -> Effect
     match msg {
         SvcMsg::Start => noop(),
         SvcMsg::ProbeResult(req, CallOutcome::Replied(ProbeReply(v))) if v >= 10 => {
-            reply_to_request(req, SvcReply::Ready)
+            reply_to(req, SvcReply::Ready)
         }
         SvcMsg::ProbeResult(req, _) => {
-            reply_to_request(req, SvcReply::NotReady)
+            reply_to(req, SvcReply::NotReady)
         }
     }
 }
@@ -141,7 +141,7 @@ Rules:
   `into_request_context`;
 - `.reply(...)` on the deferred builder boxes the translator so the
   continuation message carries `RequestContext` back to the service;
-- `reply_to_request` consumes the context and delivers the final reply;
+- `reply_to` consumes the context and delivers the final reply;
 - the caller timeout still governs; the runtime still records `Timeout`
   or `Closed` if the service forgets to reply.
 
@@ -196,8 +196,8 @@ impl Worker {
 Why this shape:
 
 - one runtime call per iteration → one trace event per iteration;
-- the host receives the summary via `observe_result::<Summary>(addr)`
-  (Phase 059 Rock 1) — no shared `Arc<...>` for the result;
+- the host receives the summary via `observe_result::<Summary>(addr)` — no
+  shared `Arc<...>` for the result;
 - "stop on first error" or "skip and continue" are local choices in
   `record`, not framework decisions.
 

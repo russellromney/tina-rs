@@ -1,17 +1,5 @@
-error[E0451]: field `inner` of struct `SharedWorkTicket` is private
-  --> tests/shared_work_compile_fail/shared_work_ticket_forged.rs:13:61
+error: cannot construct `SharedWorkTicket<_>` with struct literal syntax due to private fields
+  --> tests/shared_work_compile_fail/shared_work_ticket_forged.rs:10:42
    |
-13 |     let _forged: SharedWorkTicket<u32> = SharedWorkTicket { inner: forbidden() };
-   |                                                             ^^^^^ private field
-
-error[E0451]: fields `slot`, `generation` and `_key` of struct `WaitTicket` are private
-  --> tests/shared_work_compile_fail/shared_work_ticket_forged.rs:19:9
-   |
-18 |     tina_runtime::WaitTicket {
-   |     ------------------------ in this type
-19 |         slot: 0,
-   |         ^^^^ private field
-20 |         generation: 0,
-   |         ^^^^^^^^^^ private field
-21 |         _key: std::marker::PhantomData,
-   |         ^^^^ private field
+10 |     let _forged: SharedWorkTicket<u32> = SharedWorkTicket {};
+   |                                          ^^^^^^^^^^^^^^^^

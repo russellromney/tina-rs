@@ -4,7 +4,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use tina::prelude::*;
-use tina::{RequestContext, reply_to_request};
+use tina::{RequestContext, reply_to};
 use tina_runtime::{
     CallOutcome, DefaultThreadedMailboxFactory, RuntimeCall, ThreadedRuntime,
     ThreadedRuntimeConfig, ThreadedRuntimeError,
@@ -54,7 +54,7 @@ impl Silent {
     fn handle(&mut self, msg: SilentMsg, _ctx: &mut Context<'_, TestShard, u32>) -> Effect<Self> {
         match msg {
             SilentMsg::Start => noop(),
-            SilentMsg::Done(req) => reply_to_request(req, 1),
+            SilentMsg::Done(req) => reply_to(req, 1),
         }
     }
 
@@ -105,7 +105,7 @@ struct AsyncBridge;
 #[tina_runtime::isolate(
     message = AsyncBridgeMsg,
     reply = u32,
-    call = RuntimeCall<AsyncBridgeMsg>,
+    io = RuntimeCall<AsyncBridgeMsg>,
     shard = TestShard
 )]
 impl AsyncBridge {
@@ -116,7 +116,7 @@ impl AsyncBridge {
     ) -> Effect<Self> {
         match msg {
             AsyncBridgeMsg::Send(_) => noop(),
-            AsyncBridgeMsg::Poll(req, value) => reply_to_request(req, value + 1),
+            AsyncBridgeMsg::Poll(req, value) => reply_to(req, value + 1),
         }
     }
 
@@ -145,17 +145,15 @@ struct Relay {
 #[tina_runtime::isolate(
     message = RelayMsg,
     reply = u32,
-    call = RuntimeCall<RelayMsg>,
+    io = RuntimeCall<RelayMsg>,
     shard = TestShard
 )]
 impl Relay {
     fn handle(&mut self, msg: RelayMsg, _ctx: &mut Context<'_, TestShard, u32>) -> Effect<Self> {
         match msg {
             RelayMsg::Start(_) => noop(),
-            RelayMsg::BridgeDone(req, CallOutcome::Replied(value)) => {
-                reply_to_request(req, value + 1)
-            }
-            RelayMsg::BridgeDone(req, _) => reply_to_request(req, 0),
+            RelayMsg::BridgeDone(req, CallOutcome::Replied(value)) => reply_to(req, value + 1),
+            RelayMsg::BridgeDone(req, _) => reply_to(req, 0),
         }
     }
 

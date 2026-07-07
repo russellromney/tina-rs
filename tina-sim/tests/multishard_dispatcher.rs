@@ -70,7 +70,7 @@ impl Isolate for Coordinator {
         reply: (),
         send: Outbound<WorkerEvent>,
         spawn: Infallible,
-        call: RuntimeCall<CoordinatorEvent>,
+        io: RuntimeCall<CoordinatorEvent>,
         shard: WorkShard,
     }
 
@@ -151,7 +151,7 @@ impl Isolate for Worker {
         reply: (),
         send: Outbound<CoordinatorEvent>,
         spawn: Infallible,
-        call: RuntimeCall<WorkerEvent>,
+        io: RuntimeCall<WorkerEvent>,
         shard: WorkShard,
     }
 
@@ -296,7 +296,7 @@ impl Isolate for TimedCoordinator {
         reply: (),
         send: Outbound<TimedWorkerEvent>,
         spawn: Infallible,
-        call: RuntimeCall<TimedCoordinatorEvent>,
+        io: RuntimeCall<TimedCoordinatorEvent>,
         shard: WorkShard,
     }
 
@@ -334,7 +334,7 @@ impl Isolate for TimedWorker {
         reply: (),
         send: Outbound<TimedCoordinatorEvent>,
         spawn: Infallible,
-        call: RuntimeCall<TimedWorkerEvent>,
+        io: RuntimeCall<TimedWorkerEvent>,
         shard: WorkShard,
     }
 
@@ -388,7 +388,7 @@ impl Isolate for SupervisorObserver {
         reply: (),
         send: Outbound<Infallible>,
         spawn: Infallible,
-        call: RuntimeCall<SupervisorObservation>,
+        io: RuntimeCall<SupervisorObservation>,
         shard: WorkShard,
     }
 
@@ -413,7 +413,7 @@ impl Isolate for RestartableWorker {
         reply: (),
         send: Outbound<SupervisorObservation>,
         spawn: Infallible,
-        call: RuntimeCall<RestartableWorkerEvent>,
+        io: RuntimeCall<RestartableWorkerEvent>,
         shard: WorkShard,
     }
 
@@ -447,7 +447,7 @@ impl Isolate for SupervisedParent {
         reply: (),
         send: Outbound<Infallible>,
         spawn: RestartableChildDefinition<RestartableWorker>,
-        call: RuntimeCall<SupervisorEvent>,
+        io: RuntimeCall<SupervisorEvent>,
         shard: WorkShard,
     }
 
@@ -492,7 +492,7 @@ impl Isolate for TcpEchoConnection {
         reply: (),
         send: Outbound<Infallible>,
         spawn: Infallible,
-        call: RuntimeCall<TcpConnectionEvent>,
+        io: RuntimeCall<TcpConnectionEvent>,
         shard: WorkShard,
     }
 
@@ -526,7 +526,7 @@ impl Isolate for TcpEchoConnection {
 }
 
 fn tcp_read_call(stream: StreamId) -> Effect<TcpEchoConnection> {
-    Effect::Call(RuntimeCall::new(
+    Effect::Io(RuntimeCall::new(
         CallInput::TcpRead {
             stream,
             max_len: 64,
@@ -540,7 +540,7 @@ fn tcp_read_call(stream: StreamId) -> Effect<TcpEchoConnection> {
 }
 
 fn tcp_write_call(stream: StreamId, bytes: Vec<u8>) -> Effect<TcpEchoConnection> {
-    Effect::Call(RuntimeCall::new(
+    Effect::Io(RuntimeCall::new(
         CallInput::TcpWrite { stream, bytes },
         |result| match result {
             CallOutput::TcpWrote { count } => TcpConnectionEvent::WriteCompleted { count },
@@ -551,7 +551,7 @@ fn tcp_write_call(stream: StreamId, bytes: Vec<u8>) -> Effect<TcpEchoConnection>
 }
 
 fn tcp_close_stream_call(stream: StreamId) -> Effect<TcpEchoConnection> {
-    Effect::Call(RuntimeCall::new(
+    Effect::Io(RuntimeCall::new(
         CallInput::TcpStreamClose { stream },
         |result| match result {
             CallOutput::TcpStreamClosed => TcpConnectionEvent::StreamClosed,
@@ -588,7 +588,7 @@ impl Isolate for TcpEchoListener {
         reply: (),
         send: Outbound<TcpControlEvent>,
         spawn: RestartableChildDefinition<TcpEchoConnection>,
-        call: RuntimeCall<TcpControlEvent>,
+        io: RuntimeCall<TcpControlEvent>,
         shard: WorkShard,
     }
 
@@ -600,7 +600,7 @@ impl Isolate for TcpEchoListener {
         match msg {
             TcpControlEvent::Bootstrap => {
                 let addr = self.bind_addr;
-                Effect::Call(RuntimeCall::new(
+                Effect::Io(RuntimeCall::new(
                     CallInput::TcpBind { addr },
                     |result| match result {
                         CallOutput::TcpBound { listener, .. } => {
@@ -613,7 +613,7 @@ impl Isolate for TcpEchoListener {
             }
             TcpControlEvent::Bound { listener } => {
                 self.listener = Some(listener);
-                Effect::Call(RuntimeCall::new(
+                Effect::Io(RuntimeCall::new(
                     CallInput::TcpAccept { listener },
                     |result| match result {
                         CallOutput::TcpAccepted { stream, .. } => {
@@ -626,7 +626,7 @@ impl Isolate for TcpEchoListener {
             }
             TcpControlEvent::ReArmAccept => {
                 let listener = self.listener.expect("listener stored before re-arm");
-                Effect::Call(RuntimeCall::new(
+                Effect::Io(RuntimeCall::new(
                     CallInput::TcpAccept { listener },
                     |result| match result {
                         CallOutput::TcpAccepted { stream, .. } => {
@@ -658,7 +658,7 @@ impl Isolate for TcpEchoListener {
             }
             TcpControlEvent::CloseListener => {
                 let listener = self.listener.expect("listener stored before close");
-                Effect::Call(RuntimeCall::new(
+                Effect::Io(RuntimeCall::new(
                     CallInput::TcpListenerClose { listener },
                     |result| match result {
                         CallOutput::TcpListenerClosed => TcpControlEvent::ListenerClosed,
@@ -687,7 +687,7 @@ impl Isolate for TcpCoordinator {
         reply: (),
         send: Outbound<Infallible>,
         spawn: Infallible,
-        call: RuntimeCall<TcpControlEvent>,
+        io: RuntimeCall<TcpControlEvent>,
         shard: WorkShard,
     }
 
@@ -733,7 +733,7 @@ impl Isolate for DurableTcpFrontend {
         reply: (),
         send: Outbound<DurableStoreMsg>,
         spawn: Infallible,
-        call: RuntimeCall<DurableTcpFrontendMsg>,
+        io: RuntimeCall<DurableTcpFrontendMsg>,
         shard: WorkShard,
     }
 
@@ -743,7 +743,7 @@ impl Isolate for DurableTcpFrontend {
         ctx: &mut Context<'_, Self::Shard, Self::Reply>,
     ) -> Effect<Self> {
         match msg {
-            DurableTcpFrontendMsg::Start => Effect::Call(RuntimeCall::new(
+            DurableTcpFrontendMsg::Start => Effect::Io(RuntimeCall::new(
                 CallInput::TcpBind {
                     addr: self.bind_addr,
                 },
@@ -757,7 +757,7 @@ impl Isolate for DurableTcpFrontend {
             )),
             DurableTcpFrontendMsg::Bound { listener } => {
                 self.listener = Some(listener);
-                Effect::Call(RuntimeCall::new(
+                Effect::Io(RuntimeCall::new(
                     CallInput::TcpAccept { listener },
                     |result| match result {
                         CallOutput::TcpAccepted { stream, .. } => {
@@ -770,7 +770,7 @@ impl Isolate for DurableTcpFrontend {
             }
             DurableTcpFrontendMsg::Accepted { stream } => {
                 self.active_stream = Some(stream);
-                Effect::Call(RuntimeCall::new(
+                Effect::Io(RuntimeCall::new(
                     CallInput::TcpRead {
                         stream,
                         max_len: 64,
@@ -787,7 +787,7 @@ impl Isolate for DurableTcpFrontend {
                 ))
             }
             DurableTcpFrontendMsg::Read(Ok(bytes), stream) if bytes.is_empty() => {
-                Effect::Call(RuntimeCall::new(
+                Effect::Io(RuntimeCall::new(
                     CallInput::TcpStreamClose { stream },
                     |result| match result {
                         CallOutput::TcpStreamClosed => DurableTcpFrontendMsg::StreamClosed(Ok(())),
@@ -815,7 +815,7 @@ impl Isolate for DurableTcpFrontend {
                     .expect("stream stored before durable ack");
                 let mut reply = b"stored:".to_vec();
                 reply.extend_from_slice(&bytes);
-                Effect::Call(RuntimeCall::new(
+                Effect::Io(RuntimeCall::new(
                     CallInput::TcpWrite {
                         stream,
                         bytes: reply,
@@ -831,7 +831,7 @@ impl Isolate for DurableTcpFrontend {
                     },
                 ))
             }
-            DurableTcpFrontendMsg::Wrote(Ok(_), stream) => Effect::Call(RuntimeCall::new(
+            DurableTcpFrontendMsg::Wrote(Ok(_), stream) => Effect::Io(RuntimeCall::new(
                 CallInput::TcpStreamClose { stream },
                 |result| match result {
                     CallOutput::TcpStreamClosed => DurableTcpFrontendMsg::StreamClosed(Ok(())),
@@ -841,7 +841,7 @@ impl Isolate for DurableTcpFrontend {
             )),
             DurableTcpFrontendMsg::StreamClosed(Ok(())) => {
                 let listener = self.listener.expect("listener stored before close");
-                Effect::Call(RuntimeCall::new(
+                Effect::Io(RuntimeCall::new(
                     CallInput::TcpListenerClose { listener },
                     |result| match result {
                         CallOutput::TcpListenerClosed => {
@@ -890,7 +890,7 @@ impl Isolate for DurableStore {
         reply: (),
         send: Outbound<DurableTcpFrontendMsg>,
         spawn: Infallible,
-        call: RuntimeCall<DurableStoreMsg>,
+        io: RuntimeCall<DurableStoreMsg>,
         shard: WorkShard,
     }
 
@@ -939,7 +939,7 @@ impl Isolate for DurableBatchListener {
         reply: (),
         send: Outbound<DurableBatchListenerMsg>,
         spawn: RestartableChildDefinition<DurableBatchConnection>,
-        call: RuntimeCall<DurableBatchListenerMsg>,
+        io: RuntimeCall<DurableBatchListenerMsg>,
         shard: WorkShard,
     }
 
@@ -949,7 +949,7 @@ impl Isolate for DurableBatchListener {
         ctx: &mut Context<'_, Self::Shard, Self::Reply>,
     ) -> Effect<Self> {
         match msg {
-            DurableBatchListenerMsg::Start => Effect::Call(RuntimeCall::new(
+            DurableBatchListenerMsg::Start => Effect::Io(RuntimeCall::new(
                 CallInput::TcpBind {
                     addr: self.bind_addr,
                 },
@@ -991,7 +991,7 @@ impl Isolate for DurableBatchListener {
             }
             DurableBatchListenerMsg::CloseListener => {
                 let listener = self.listener.expect("listener stored before close");
-                Effect::Call(RuntimeCall::new(
+                Effect::Io(RuntimeCall::new(
                     CallInput::TcpListenerClose { listener },
                     |result| match result {
                         CallOutput::TcpListenerClosed => {
@@ -1013,7 +1013,7 @@ impl Isolate for DurableBatchListener {
 }
 
 fn tcp_accept_batch_call(listener: ListenerId) -> Effect<DurableBatchListener> {
-    Effect::Call(RuntimeCall::new(
+    Effect::Io(RuntimeCall::new(
         CallInput::TcpAccept { listener },
         |result| match result {
             CallOutput::TcpAccepted { stream, .. } => DurableBatchListenerMsg::Accepted { stream },
@@ -1045,7 +1045,7 @@ impl Isolate for DurableBatchConnection {
         reply: (),
         send: Outbound<DurableBatchStoreMsg>,
         spawn: Infallible,
-        call: RuntimeCall<DurableBatchConnectionMsg>,
+        io: RuntimeCall<DurableBatchConnectionMsg>,
         shard: WorkShard,
     }
 
@@ -1090,7 +1090,7 @@ impl Isolate for DurableBatchConnection {
 }
 
 fn durable_batch_read_call(stream: StreamId) -> Effect<DurableBatchConnection> {
-    Effect::Call(RuntimeCall::new(
+    Effect::Io(RuntimeCall::new(
         CallInput::TcpRead {
             stream,
             max_len: 64,
@@ -1104,7 +1104,7 @@ fn durable_batch_read_call(stream: StreamId) -> Effect<DurableBatchConnection> {
 }
 
 fn durable_batch_write_call(stream: StreamId, bytes: Vec<u8>) -> Effect<DurableBatchConnection> {
-    Effect::Call(RuntimeCall::new(
+    Effect::Io(RuntimeCall::new(
         CallInput::TcpWrite { stream, bytes },
         |result| match result {
             CallOutput::TcpWrote { count } => DurableBatchConnectionMsg::Wrote(Ok(count)),
@@ -1115,7 +1115,7 @@ fn durable_batch_write_call(stream: StreamId, bytes: Vec<u8>) -> Effect<DurableB
 }
 
 fn durable_batch_close_call(stream: StreamId) -> Effect<DurableBatchConnection> {
-    Effect::Call(RuntimeCall::new(
+    Effect::Io(RuntimeCall::new(
         CallInput::TcpStreamClose { stream },
         |result| match result {
             CallOutput::TcpStreamClosed => DurableBatchConnectionMsg::StreamClosed(Ok(())),
@@ -1150,7 +1150,7 @@ impl Isolate for DurableBatchStore {
         reply: (),
         send: Outbound<DurableBatchConnectionMsg>,
         spawn: Infallible,
-        call: RuntimeCall<DurableBatchStoreMsg>,
+        io: RuntimeCall<DurableBatchStoreMsg>,
         shard: WorkShard,
     }
 

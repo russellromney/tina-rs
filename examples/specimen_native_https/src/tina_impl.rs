@@ -1,7 +1,7 @@
 //! All-Tina HTTPS counter specimen: a `tina_http::HttpsListener` server **and**
 //! a `tina_http::HttpClient` HTTPS client share one runtime, on one shard. The
 //! client scripts `GET /counter → POST × 3 → GET /counter → GET /missing`
-//! against the server. Before Phase 136 this was impossible — the single TLS
+//! against the server. Before the TLS listener/client split this was impossible — the single TLS
 //! worker deadlocked both sides of one handshake — so the client lived in a
 //! separate stdlib-rustls process. Now TLS rides the TCP rail and both ends are
 //! Tina.

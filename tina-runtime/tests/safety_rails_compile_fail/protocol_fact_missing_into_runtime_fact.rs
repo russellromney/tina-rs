@@ -28,7 +28,7 @@ impl tina::Isolate for BadFactIsolate {
     type Send = tina::Outbound<Infallible>;
     type Spawn = Infallible;
     type SpawnObserved = Infallible;
-    type Call = Infallible;
+    type Io = Infallible;
     type Fact = UnregisterableFact;
     type Shard = SingleShard;
 

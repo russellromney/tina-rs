@@ -1,4 +1,4 @@
-//! User-shape proofs for Phase 100 compile-time safety rails.
+//! User-shape proofs for compile-time safety rails.
 //!
 //! Positive fixtures: a callable service registered through
 //! [`Runtime::register_service`] and a send-only worker registered through

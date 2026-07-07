@@ -57,7 +57,7 @@ impl Worker {
             // same shape rather than panic.
             WorkerMsg::Done(Ok(())) => reply(WorkerReply),
             WorkerMsg::Done(Err(_)) => stop(),
-            WorkerMsg::DoneForCall(request, Ok(())) => tina::reply_to_request(request, WorkerReply),
+            WorkerMsg::DoneForCall(request, Ok(())) => tina::reply_to(request, WorkerReply),
             WorkerMsg::DoneForCall(_, Err(_)) => stop(),
         }
     }

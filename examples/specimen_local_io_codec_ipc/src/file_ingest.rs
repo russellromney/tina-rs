@@ -50,7 +50,7 @@ impl Isolate for Ingest {
     type Send = Outbound<Infallible>;
     type Spawn = Infallible;
     type SpawnObserved = Infallible;
-    type Call = RuntimeCall<IngestMsg>;
+    type Io = RuntimeCall<IngestMsg>;
     type Fact = Infallible;
     type Shard = IngestShard;
 
@@ -166,7 +166,7 @@ fn seed_file(sim: &mut Simulator<IngestShard>, path: &std::path::Path, bytes: Ve
         type Send = Outbound<Infallible>;
         type Spawn = Infallible;
         type SpawnObserved = Infallible;
-        type Call = RuntimeCall<SeederMsg>;
+        type Io = RuntimeCall<SeederMsg>;
         type Fact = Infallible;
         type Shard = IngestShard;
 
@@ -334,7 +334,7 @@ impl Isolate for CopyPump {
     type Send = Outbound<Infallible>;
     type Spawn = Infallible;
     type SpawnObserved = Infallible;
-    type Call = RuntimeCall<CopyMsg>;
+    type Io = RuntimeCall<CopyMsg>;
     type Fact = Infallible;
     type Shard = IngestShard;
 

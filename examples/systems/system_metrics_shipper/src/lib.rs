@@ -17,7 +17,7 @@ use std::thread;
 use std::time::Duration;
 
 use tina::time::{RecurringCatchUp, RecurringTick, RecurringTickDecision, RecurringTickToken};
-use tina::{CallContext, RequestContext, prelude::*, reply_to_request};
+use tina::{CallContext, RequestContext, prelude::*, reply_to};
 use tina_runtime::lifecycle::{
     CloseAdmission, Health, Lifecycle, ResourceCloseReport, ResourceKind, ServiceShutdownReport,
     ServiceTopology, ShutdownChoreography, ShutdownStep, StepOutcome, TopologyComponent,
@@ -228,7 +228,7 @@ struct Shipper {
     /// rejected when the tick continuation lands.
     flush_tick: RecurringTick,
     /// Drain bookkeeping: who is waiting on the Stop reply, and the typed
-    /// admission/completion counters used by Tina's Phase 101 helper.
+    /// admission/completion counters used by Tina's capacity-aware registration helper.
     drain: DrainState,
     pending_stop: Option<RequestContext<ShipperReply>>,
     drained_events: usize,
@@ -410,7 +410,7 @@ impl Shipper {
                     flushed_on_drain: self.drained_events,
                     drained_batches: self.drained_batches,
                 };
-                return reply_to_request(req, reply);
+                return reply_to(req, reply);
             }
             return noop();
         }
@@ -547,10 +547,10 @@ impl Sink {
         let should_fail = self.fail_every > 0 && self.received as usize % self.fail_every == 0;
         if should_fail {
             self.failures += 1;
-            return reply_to_request(req, SinkReply::Failed);
+            return reply_to(req, SinkReply::Failed);
         }
         self.events += batch.len() as u64;
-        reply_to_request(req, SinkReply::Ack)
+        reply_to(req, SinkReply::Ack)
     }
 }
 

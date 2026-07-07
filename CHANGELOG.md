@@ -4,6 +4,20 @@ This file records completed work.
 
 ## Unreleased
 
+### Vocabulary Consolidation
+
+- Renamed `Effect::Call` to `Effect::Io` for runtime-owned I/O effects.
+- Renamed `Isolate::Call` to `Isolate::Io` for runtime-owned I/O effects.
+- Renamed the isolate macro `call = ...` option and `isolate_types!` `call:` key
+  to `io`.
+- Removed `sequence()`; use `batch()`.
+- Removed `reply_to_request()`; use `reply_to()` with `RequestContext::into_deferred`.
+- Removed public `Context::take_reply_slot()`; use `Context::take_request_context()`.
+- Removed deprecated `SpawnObservedBuilder::reply()`; use `SpawnObservedBuilder::then()`.
+- Removed `TimerInterval`, `MissedTickPolicy`, and `IntervalDelay`; use `RecurringTick` and `RecurringCatchUp`.
+- Removed public `tina_runtime::wait_list::WaitList`; use `SharedWork`.
+- Renamed `request_effect_after_wait_park` to `request_effect_after_shared_wait`.
+
 ### CI Dependency Hygiene
 
 - Fixed nightly toolchain drift: replaced same-type `drain(..).collect()`

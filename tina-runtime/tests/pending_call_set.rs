@@ -94,7 +94,7 @@ impl Worker {
             WorkerMsg::Do => sleep(Duration::from_millis(WORK_MS)).then(WorkerMsg::Done),
             WorkerMsg::Done(Ok(())) => reply(WorkerReply),
             WorkerMsg::Done(Err(_)) => stop(),
-            WorkerMsg::DoneForCall(req, Ok(())) => tina::reply_to_request(req, WorkerReply),
+            WorkerMsg::DoneForCall(req, Ok(())) => tina::reply_to(req, WorkerReply),
             WorkerMsg::DoneForCall(_, Err(_)) => stop(),
         }
     }
@@ -367,7 +367,7 @@ impl SlowWorker {
             WorkerMsg::Do => sleep(Duration::from_millis(SLOW_WORK_MS)).then(WorkerMsg::Done),
             WorkerMsg::Done(Ok(())) => reply(WorkerReply),
             WorkerMsg::Done(Err(_)) => stop(),
-            WorkerMsg::DoneForCall(req, Ok(())) => tina::reply_to_request(req, WorkerReply),
+            WorkerMsg::DoneForCall(req, Ok(())) => tina::reply_to(req, WorkerReply),
             WorkerMsg::DoneForCall(_, Err(_)) => stop(),
         }
     }
@@ -399,7 +399,7 @@ impl FastWorker {
             WorkerMsg::Do => sleep(Duration::from_millis(5)).then(WorkerMsg::Done),
             WorkerMsg::Done(Ok(())) => reply(WorkerReply),
             WorkerMsg::Done(Err(_)) => stop(),
-            WorkerMsg::DoneForCall(req, Ok(())) => tina::reply_to_request(req, WorkerReply),
+            WorkerMsg::DoneForCall(req, Ok(())) => tina::reply_to(req, WorkerReply),
             WorkerMsg::DoneForCall(_, Err(_)) => stop(),
         }
     }

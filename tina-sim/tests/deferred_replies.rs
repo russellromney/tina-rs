@@ -50,7 +50,7 @@ impl Isolate for DeferredSvc {
     type Send = Outbound<Infallible>;
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
-    type Call = RuntimeCall<SvcMsg>;
+    type Io = RuntimeCall<SvcMsg>;
     type Fact = ::std::convert::Infallible;
     type Shard = DefShard;
 
@@ -107,7 +107,7 @@ impl Isolate for Caller {
     type Send = Outbound<Infallible>;
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
-    type Call = RuntimeCall<CallerMsg>;
+    type Io = RuntimeCall<CallerMsg>;
     type Fact = ::std::convert::Infallible;
     type Shard = DefShard;
 
@@ -117,7 +117,7 @@ impl Isolate for Caller {
         _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
     ) -> Effect<Self> {
         match msg {
-            CallerMsg::Start(svc) => Effect::Call(RuntimeCall::isolate_call(
+            CallerMsg::Start(svc) => Effect::Io(RuntimeCall::isolate_call(
                 svc,
                 SvcMsg::Capture,
                 self.timeout,
@@ -252,7 +252,7 @@ fn sim_panic_after_capture_drops_slot_and_closes_caller() {
         type Send = Outbound<Infallible>;
         type Spawn = Infallible;
         type SpawnObserved = std::convert::Infallible;
-        type Call = RuntimeCall<SvcMsg>;
+        type Io = RuntimeCall<SvcMsg>;
         type Fact = ::std::convert::Infallible;
         type Shard = DefShard;
 
@@ -324,7 +324,7 @@ fn sim_frontend_stop_drops_pending_promises_visibly() {
         type Send = Outbound<Infallible>;
         type Spawn = Infallible;
         type SpawnObserved = std::convert::Infallible;
-        type Call = RuntimeCall<HaltMsg>;
+        type Io = RuntimeCall<HaltMsg>;
         type Fact = ::std::convert::Infallible;
         type Shard = DefShard;
 
@@ -370,7 +370,7 @@ fn sim_frontend_stop_drops_pending_promises_visibly() {
         type Send = Outbound<Infallible>;
         type Spawn = Infallible;
         type SpawnObserved = std::convert::Infallible;
-        type Call = RuntimeCall<HCallerMsg>;
+        type Io = RuntimeCall<HCallerMsg>;
         type Fact = ::std::convert::Infallible;
         type Shard = DefShard;
         fn handle(
@@ -379,7 +379,7 @@ fn sim_frontend_stop_drops_pending_promises_visibly() {
             _: &mut Context<'_, Self::Shard, Self::Reply>,
         ) -> Effect<Self> {
             match msg {
-                HCallerMsg::Start(s) => Effect::Call(RuntimeCall::isolate_call(
+                HCallerMsg::Start(s) => Effect::Io(RuntimeCall::isolate_call(
                     s,
                     HaltMsg::Capture,
                     Duration::from_secs(60),

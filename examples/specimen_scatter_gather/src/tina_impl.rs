@@ -134,7 +134,7 @@ impl Coordinator {
                             .workers
                             .iter()
                             .map(|w| {
-                                Effect::Call(RuntimeCall::isolate_call(
+                                Effect::Io(RuntimeCall::isolate_call(
                                     *w,
                                     WorkerMsg::Do(payload),
                                     QUERY_TIMEOUT,
@@ -199,7 +199,7 @@ impl Driver {
                     .copied()
                     .enumerate()
                     .map(|(i, payload)| {
-                        Effect::Call(RuntimeCall::isolate_call(
+                        Effect::Io(RuntimeCall::isolate_call(
                             coord,
                             CoordMsg::Query(payload),
                             QUERY_TIMEOUT,

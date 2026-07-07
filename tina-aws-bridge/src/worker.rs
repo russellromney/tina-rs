@@ -422,7 +422,7 @@ impl<S: Shard + 'static> S3Worker<S> {
         result: S3Result,
     ) -> Effect<Self> {
         match request_context {
-            Some(request) => reply_to_request(request, result),
+            Some(request) => reply_to(request, result),
             None => reply::<Self>(result),
         }
     }
@@ -433,7 +433,7 @@ impl<S: Shard + 'static> S3Worker<S> {
         result: S3Result,
     ) -> Effect<Self> {
         match request_context {
-            Some(request) => reply_to_request(request, result),
+            Some(request) => reply_to(request, result),
             None if reply_plain => reply::<Self>(result),
             None => noop(),
         }
@@ -492,7 +492,7 @@ impl<S: Shard + 'static> Isolate for S3Worker<S> {
         reply: S3Result,
         send: tina::Outbound<Infallible>,
         spawn: Infallible,
-        call: RuntimeCall<S3Msg>,
+        io: RuntimeCall<S3Msg>,
         shard: S,
     }
 

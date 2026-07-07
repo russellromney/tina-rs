@@ -55,7 +55,7 @@ holds it together.
 The worker is one isolate with mailbox capacity `QUEUE_CAPACITY`.
 There is no separate queue; the mailbox *is* the queue. The rate
 limit lives in the worker's own state machine: each `Submit` returns
-`sleep(RATE_WINDOW).then(Tick)`. A `SingleCallGate` (Phase-062 Rock 5)
+`sleep(RATE_WINDOW).then(Tick)`. A `SingleCallGate` (the single-call gate invariant)
 keeps at most one `sleep` in flight; the matching `Tick` increments
 `processed`. The host closes the burst with a normal Tina message:
 `BurstClosed(admitted)`.
@@ -79,7 +79,7 @@ WorkerMsg::BurstClosed(admitted) => {
 }
 ```
 
-The host uses Phase-062 Rock 3's `try_send_outcome` plus a shared
+The host uses the host burst outcome helper's `try_send_outcome` plus a shared
 `HostBurstOutcomes` accumulator. That keeps the burst non-blocking and
 preserves every typed outcome (admitted / mailbox_full / mailbox_closed
 / ingress_full / worker_stopped) without per-send observer ceremony:
@@ -94,7 +94,7 @@ let snap = outcomes.snapshot();
 ```
 
 After every observer fires, the host sends `BurstClosed(admitted)`
-through Phase-062 Rock 4's `send_observed_until` retry helper. If the
+through the observed-send retry helper's `send_observed_until` retry helper. If the
 mailbox is full of admitted `Submit`s, the helper retries until a slot
 opens or the deadline elapses; the typed `Closed` / `Timeout` /
 `WorkerStopped` outcomes stay distinct. That is deliberate: "done

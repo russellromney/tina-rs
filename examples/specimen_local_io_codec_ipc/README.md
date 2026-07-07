@@ -1,6 +1,6 @@
 # specimen-local-io-codec-ipc
 
-Specimen for Phase 117 (Local I/O, Codec, and IPC Parity).
+Specimen for the local I/O, codec, and IPC parity specimen (Local I/O, Codec, and IPC Parity).
 
 Flows, one binary:
 

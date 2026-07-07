@@ -630,6 +630,8 @@ that produces a `RequestEffect` after admission.
 the mechanism name. `system_cache_with_fill` and the
 `ergonomics_playground` single-flight cache probe both copy from
 `SharedWork` now.
+*(Update: `WaitList` has since been made private; `SharedWork` is the
+only public name.)*
 
 *(Historical finding kept below for context.)*
 

@@ -47,7 +47,7 @@ impl Isolate for EchoConnection {
     type Send = Outbound<Infallible>;
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
-    type Call = RuntimeCall<ConnectionMsg>;
+    type Io = RuntimeCall<ConnectionMsg>;
     type Fact = ::std::convert::Infallible;
     type Shard = ConsumerShard;
 
@@ -81,7 +81,7 @@ impl Isolate for EchoConnection {
 }
 
 fn read_call(stream: StreamId) -> Effect<EchoConnection> {
-    Effect::Call(RuntimeCall::new(
+    Effect::Io(RuntimeCall::new(
         CallInput::TcpRead {
             stream,
             max_len: 64,
@@ -95,7 +95,7 @@ fn read_call(stream: StreamId) -> Effect<EchoConnection> {
 }
 
 fn write_call(stream: StreamId, bytes: Vec<u8>) -> Effect<EchoConnection> {
-    Effect::Call(RuntimeCall::new(
+    Effect::Io(RuntimeCall::new(
         CallInput::TcpWrite { stream, bytes },
         |result| match result {
             CallOutput::TcpWrote { count } => ConnectionMsg::WriteCompleted { count },
@@ -106,7 +106,7 @@ fn write_call(stream: StreamId, bytes: Vec<u8>) -> Effect<EchoConnection> {
 }
 
 fn close_call(stream: StreamId) -> Effect<EchoConnection> {
-    Effect::Call(RuntimeCall::new(
+    Effect::Io(RuntimeCall::new(
         CallInput::TcpStreamClose { stream },
         |result| match result {
             CallOutput::TcpStreamClosed => ConnectionMsg::StreamClosed,
@@ -148,7 +148,7 @@ impl Isolate for EchoListener {
     type Send = Outbound<ListenerMsg>;
     type Spawn = RestartableChildDefinition<EchoConnection>;
     type SpawnObserved = std::convert::Infallible;
-    type Call = RuntimeCall<ListenerMsg>;
+    type Io = RuntimeCall<ListenerMsg>;
     type Fact = ::std::convert::Infallible;
     type Shard = ConsumerShard;
 
@@ -161,7 +161,7 @@ impl Isolate for EchoListener {
             ListenerMsg::Bootstrap => {
                 self.self_addr = Some(ctx.me());
                 let addr = self.bind_addr;
-                Effect::Call(RuntimeCall::new(
+                Effect::Io(RuntimeCall::new(
                     CallInput::TcpBind { addr },
                     |result| match result {
                         CallOutput::TcpBound {
@@ -182,7 +182,7 @@ impl Isolate for EchoListener {
             } => {
                 self.listener = Some(listener);
                 *self.bound_addr.lock().expect("bound addr mutex") = Some(local_addr);
-                Effect::Call(RuntimeCall::new(
+                Effect::Io(RuntimeCall::new(
                     CallInput::TcpAccept { listener },
                     |result| match result {
                         CallOutput::TcpAccepted { stream, .. } => ListenerMsg::Accepted { stream },
@@ -193,7 +193,7 @@ impl Isolate for EchoListener {
             }
             ListenerMsg::ReArmAccept => {
                 let listener = self.listener.expect("listener stored before re-arm");
-                Effect::Call(RuntimeCall::new(
+                Effect::Io(RuntimeCall::new(
                     CallInput::TcpAccept { listener },
                     |result| match result {
                         CallOutput::TcpAccepted { stream, .. } => ListenerMsg::Accepted { stream },
@@ -227,7 +227,7 @@ impl Isolate for EchoListener {
             }
             ListenerMsg::CloseListener => {
                 let listener = self.listener.expect("listener stored before close");
-                Effect::Call(RuntimeCall::new(
+                Effect::Io(RuntimeCall::new(
                     CallInput::TcpListenerClose { listener },
                     |result| match result {
                         CallOutput::TcpListenerClosed => ListenerMsg::ListenerClosed,
@@ -333,7 +333,7 @@ impl Isolate for ObservedTarget {
     type Send = Outbound<Infallible>;
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
-    type Call = RuntimeCall<ObservedTargetMsg>;
+    type Io = RuntimeCall<ObservedTargetMsg>;
     type Fact = ::std::convert::Infallible;
     type Shard = ConsumerShard;
 
@@ -366,7 +366,7 @@ impl Isolate for ObservedSender {
     type Send = Outbound<Infallible>;
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
-    type Call = RuntimeCall<ObservedSenderMsg>;
+    type Io = RuntimeCall<ObservedSenderMsg>;
     type Fact = ::std::convert::Infallible;
     type Shard = ConsumerShard;
 
@@ -461,7 +461,7 @@ impl Isolate for ReplyWorker {
     type Send = Outbound<Infallible>;
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
-    type Call = RuntimeCall<WorkerRequest>;
+    type Io = RuntimeCall<WorkerRequest>;
     type Fact = ::std::convert::Infallible;
     type Shard = ConsumerShard;
 
@@ -519,7 +519,7 @@ impl Isolate for CallerWorker {
     type Send = Outbound<Infallible>;
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
-    type Call = RuntimeCall<CallerMsg>;
+    type Io = RuntimeCall<CallerMsg>;
     type Fact = ::std::convert::Infallible;
     type Shard = ConsumerShard;
 

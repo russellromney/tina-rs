@@ -59,7 +59,7 @@ impl Worker {
             WorkerMsg::Done(Ok(())) => reply(WorkerReply { score: self.score }),
             WorkerMsg::Done(Err(_)) => stop(),
             WorkerMsg::DoneForCall(request, Ok(())) => {
-                tina::reply_to_request(request, WorkerReply { score: self.score })
+                tina::reply_to(request, WorkerReply { score: self.score })
             }
             WorkerMsg::DoneForCall(_, Err(_)) => stop(),
         }
@@ -194,7 +194,7 @@ impl Svc {
             _ => SvcReply::NotReady,
         };
         let request = self.request.take().expect("request");
-        tina::reply_to_request(request, reply)
+        tina::reply_to(request, reply)
     }
 }
 

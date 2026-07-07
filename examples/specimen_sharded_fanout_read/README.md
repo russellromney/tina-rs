@@ -1,6 +1,6 @@
 # specimen_sharded_fanout_read
 
-Tokio-vs-Tina sharded fanout read using the phase-053 sharded
+Tokio-vs-Tina sharded fanout read using the sharded service
 primitives.
 
 Three shards each own a `u64` counter, seeded with `[100, 200, 300]`.
@@ -125,7 +125,7 @@ What feels worse:
 ## What this is not
 
 This example is in-process — not a database, not remoting, not a
-distributed keyspace. See the phase plan
+distributed keyspace. See the sharded-service primitive notes
 (`.intent/phases/053-sharded-service-primitives/plan.md`) for the
 non-goals. The richer pressure scenarios (one shard `Full`, one
 shard `Closed`, aggregate timeout, hot-key retry) are proven in

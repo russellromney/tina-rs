@@ -12,7 +12,7 @@ impl Isolate for PanickingRestartFactoryRoot {
     type Send = Outbound<NeverOutbound>;
     type Spawn = tina::RestartableChildDefinition<ChildIsolate>;
     type SpawnObserved = std::convert::Infallible;
-    type Call = std::convert::Infallible;
+    type Io = std::convert::Infallible;
     type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 

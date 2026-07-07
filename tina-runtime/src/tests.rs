@@ -400,7 +400,7 @@ impl Isolate for RootIsolate {
     type Send = Outbound<NeverOutbound>;
     type Spawn = tina::ChildDefinition<ChildIsolate>;
     type SpawnObserved = std::convert::Infallible;
-    type Call = std::convert::Infallible;
+    type Io = std::convert::Infallible;
     type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 
@@ -432,7 +432,7 @@ impl Isolate for RestartableRootIsolate {
     type Send = Outbound<NeverOutbound>;
     type Spawn = tina::RestartableChildDefinition<ChildIsolate>;
     type SpawnObserved = std::convert::Infallible;
-    type Call = std::convert::Infallible;
+    type Io = std::convert::Infallible;
     type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 
@@ -471,7 +471,7 @@ impl Isolate for ChildIsolate {
     type Send = Outbound<NeverOutbound>;
     type Spawn = tina::ChildDefinition<LeafIsolate>;
     type SpawnObserved = std::convert::Infallible;
-    type Call = std::convert::Infallible;
+    type Io = std::convert::Infallible;
     type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 
@@ -500,7 +500,7 @@ impl Isolate for LeafIsolate {
     type Send = Outbound<NeverOutbound>;
     type Spawn = std::convert::Infallible;
     type SpawnObserved = std::convert::Infallible;
-    type Call = std::convert::Infallible;
+    type Io = std::convert::Infallible;
     type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 
@@ -644,7 +644,7 @@ impl Isolate for StopRaceParent {
     type Send = Outbound<NeverOutbound>;
     type Spawn = tina::ChildDefinition<StopRaceChild>;
     type SpawnObserved = std::convert::Infallible;
-    type Call = std::convert::Infallible;
+    type Io = std::convert::Infallible;
     type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 
@@ -676,7 +676,7 @@ impl Isolate for StopRaceChild {
     type Send = Outbound<NeverOutbound>;
     type Spawn = std::convert::Infallible;
     type SpawnObserved = std::convert::Infallible;
-    type Call = std::convert::Infallible;
+    type Io = std::convert::Infallible;
     type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 
@@ -710,7 +710,7 @@ impl Isolate for StopRaceCaller {
     type Send = Outbound<NeverOutbound>;
     type Spawn = std::convert::Infallible;
     type SpawnObserved = std::convert::Infallible;
-    type Call = RuntimeCall<StopRaceCallerMsg>;
+    type Io = RuntimeCall<StopRaceCallerMsg>;
     type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 
@@ -720,7 +720,7 @@ impl Isolate for StopRaceCaller {
         _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
     ) -> Effect<Self> {
         match msg {
-            StopRaceCallerMsg::Start(target) => Effect::Call(RuntimeCall::isolate_call(
+            StopRaceCallerMsg::Start(target) => Effect::Io(RuntimeCall::isolate_call(
                 target,
                 StopRaceChildMsg::Ping,
                 Duration::from_secs(5),
@@ -1394,7 +1394,7 @@ impl Isolate for OverlapAcceptor {
     type Send = Outbound<NeverOutbound>;
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
-    type Call = RuntimeCall<OverlapAcceptorMsg>;
+    type Io = RuntimeCall<OverlapAcceptorMsg>;
     type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 
@@ -1406,7 +1406,7 @@ impl Isolate for OverlapAcceptor {
         match msg {
             OverlapAcceptorMsg::Bootstrap => {
                 let addr = self.bind_addr;
-                Effect::Call(RuntimeCall::new(
+                Effect::Io(RuntimeCall::new(
                     CallInput::TcpBind { addr },
                     move |result| match result {
                         CallOutput::TcpBound {
@@ -1424,7 +1424,7 @@ impl Isolate for OverlapAcceptor {
             OverlapAcceptorMsg::Bound { listener, addr } => {
                 self.listener = Some(listener);
                 *self.bound_addr_slot.lock().expect("bound addr mutex") = Some(addr);
-                Effect::Call(RuntimeCall::new(
+                Effect::Io(RuntimeCall::new(
                     CallInput::TcpAccept { listener },
                     |result| match result {
                         CallOutput::TcpAccepted { stream, .. } => {
@@ -1440,7 +1440,7 @@ impl Isolate for OverlapAcceptor {
                 accepted.push(stream);
                 if accepted.len() < 2 {
                     let listener = self.listener.expect("listener stored before re-arm");
-                    Effect::Call(RuntimeCall::new(
+                    Effect::Io(RuntimeCall::new(
                         CallInput::TcpAccept { listener },
                         |result| match result {
                             CallOutput::TcpAccepted { stream, .. } => {
@@ -1477,7 +1477,7 @@ impl Isolate for Reader {
     type Send = Outbound<NeverOutbound>;
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
-    type Call = RuntimeCall<ReaderMsg>;
+    type Io = RuntimeCall<ReaderMsg>;
     type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 
@@ -1487,7 +1487,7 @@ impl Isolate for Reader {
         _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
     ) -> Effect<Self> {
         match msg {
-            ReaderMsg::Start => Effect::Call(RuntimeCall::new(
+            ReaderMsg::Start => Effect::Io(RuntimeCall::new(
                 CallInput::TcpRead {
                     stream: self.stream,
                     max_len: 16,
@@ -1605,7 +1605,7 @@ impl Isolate for CooperativeFairness {
     type Send = Outbound<FairMsg>;
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
-    type Call = Infallible;
+    type Io = Infallible;
     type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 
@@ -1635,7 +1635,7 @@ impl Isolate for Sleeper {
     type Send = Outbound<NeverOutbound>;
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
-    type Call = RuntimeCall<TimerMsg>;
+    type Io = RuntimeCall<TimerMsg>;
     type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 
@@ -1645,7 +1645,7 @@ impl Isolate for Sleeper {
         _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
     ) -> Effect<Self> {
         match msg {
-            TimerMsg::StartSleep => Effect::Call(RuntimeCall::new(
+            TimerMsg::StartSleep => Effect::Io(RuntimeCall::new(
                 CallInput::Sleep { after: self.delay },
                 |result| match result {
                     CallOutput::TimerFired => TimerMsg::Fired,
@@ -1673,7 +1673,7 @@ impl Isolate for SelfFlooder {
     type Send = Outbound<FairMsg>;
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
-    type Call = Infallible;
+    type Io = Infallible;
     type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 
@@ -1706,7 +1706,7 @@ impl Isolate for RecurringSleeper {
     type Send = Outbound<NeverOutbound>;
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
-    type Call = RuntimeCall<TimerMsg>;
+    type Io = RuntimeCall<TimerMsg>;
     type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 
@@ -1716,7 +1716,7 @@ impl Isolate for RecurringSleeper {
         _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
     ) -> Effect<Self> {
         match msg {
-            TimerMsg::StartSleep | TimerMsg::Fired => Effect::Call(RuntimeCall::new(
+            TimerMsg::StartSleep | TimerMsg::Fired => Effect::Io(RuntimeCall::new(
                 CallInput::Sleep { after: self.delay },
                 |result| match result {
                     CallOutput::TimerFired => TimerMsg::Fired,
@@ -1759,7 +1759,7 @@ impl Isolate for PollLoopBridge {
     type Send = Outbound<NeverOutbound>;
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
-    type Call = RuntimeCall<BridgeMsg>;
+    type Io = RuntimeCall<BridgeMsg>;
     type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 
@@ -1776,7 +1776,7 @@ impl Isolate for PollLoopBridge {
                     return Effect::Noop;
                 }
                 self.in_flight = true;
-                Effect::Call(RuntimeCall::new(
+                Effect::Io(RuntimeCall::new(
                     CallInput::Sleep {
                         after: Duration::from_millis(10),
                     },
@@ -1952,7 +1952,7 @@ where
     type Send = Outbound<NeverOutbound>;
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
-    type Call = Infallible;
+    type Io = Infallible;
     type Fact = ::std::convert::Infallible;
     type Shard = S;
 
@@ -1976,7 +1976,7 @@ where
     type Send = Outbound<RemoteEvent>;
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
-    type Call = Infallible;
+    type Io = Infallible;
     type Fact = ::std::convert::Infallible;
     type Shard = S;
 
@@ -2011,7 +2011,7 @@ where
     type Send = Outbound<NeverOutbound>;
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
-    type Call = Infallible;
+    type Io = Infallible;
     type Fact = ::std::convert::Infallible;
     type Shard = S;
 
@@ -2039,7 +2039,7 @@ where
     type Send = Outbound<NeverOutbound>;
     type Spawn = tina::RestartableChildDefinition<ShardLocalChild<S>>;
     type SpawnObserved = std::convert::Infallible;
-    type Call = Infallible;
+    type Io = Infallible;
     type Fact = ::std::convert::Infallible;
     type Shard = S;
 
@@ -2070,7 +2070,7 @@ where
     type Send = Outbound<NeverOutbound>;
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
-    type Call = Infallible;
+    type Io = Infallible;
     type Fact = ::std::convert::Infallible;
     type Shard = S;
 
@@ -2095,7 +2095,7 @@ where
     type Send = Outbound<NeverOutbound>;
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
-    type Call = RuntimeCall<TimerMsg>;
+    type Io = RuntimeCall<TimerMsg>;
     type Fact = ::std::convert::Infallible;
     type Shard = S;
 
@@ -2105,7 +2105,7 @@ where
         _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
     ) -> Effect<Self> {
         match msg {
-            TimerMsg::StartSleep => Effect::Call(RuntimeCall::new(
+            TimerMsg::StartSleep => Effect::Io(RuntimeCall::new(
                 CallInput::Sleep { after: self.delay },
                 |result| match result {
                     CallOutput::TimerFired => TimerMsg::Fired,
@@ -3560,7 +3560,7 @@ impl Isolate for ManualCallTarget {
     type Send = Outbound<NeverOutbound>;
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
-    type Call = Infallible;
+    type Io = Infallible;
     type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 
@@ -3575,7 +3575,7 @@ impl Isolate for ManualCallTarget {
                 // pending. The abandoned-caller guard closes uncaptured
                 // callers immediately; keeping the slot alive is the
                 // legitimate way to defer a reply.
-                self.slot = Some(ctx.take_reply_slot().unwrap());
+                self.slot = Some(ctx.take_request_context().unwrap().into_deferred());
                 noop()
             }
         }
@@ -3614,7 +3614,7 @@ impl Isolate for ManualCallCaller {
     type Send = Outbound<NeverOutbound>;
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
-    type Call = RuntimeCall<ManualCallCallerMsg>;
+    type Io = RuntimeCall<ManualCallCallerMsg>;
     type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 
@@ -3624,7 +3624,7 @@ impl Isolate for ManualCallCaller {
         _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
     ) -> Effect<Self> {
         match msg {
-            ManualCallCallerMsg::Start(target) => Effect::Call(RuntimeCall::isolate_call(
+            ManualCallCallerMsg::Start(target) => Effect::Io(RuntimeCall::isolate_call(
                 target,
                 ManualCallRequest::NoReply,
                 Duration::from_millis(10),
@@ -3722,7 +3722,7 @@ impl Isolate for RetryWorker {
     type Send = Outbound<RetryMsg>;
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
-    type Call = RuntimeCall<RetryMsg>;
+    type Io = RuntimeCall<RetryMsg>;
     type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 
@@ -3741,7 +3741,7 @@ impl Isolate for RetryWorker {
                     self.observations
                         .borrow_mut()
                         .push(RetryObservation::Failed(self.attempts));
-                    Effect::Call(RuntimeCall::new(
+                    Effect::Io(RuntimeCall::new(
                         CallInput::Sleep {
                             after: self.backoff,
                         },

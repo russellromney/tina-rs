@@ -91,8 +91,8 @@ pub enum EffectKind {
     /// The handler returned [`tina::Effect::StopChildren`].
     StopChildren,
 
-    /// The handler returned [`tina::Effect::Call`].
-    Call,
+    /// The handler returned [`tina::Effect::Io`].
+    Io,
 
     /// The handler returned [`tina::Effect::Batch`].
     Batch,
@@ -1200,7 +1200,7 @@ fn effect_kind_tag(effect: EffectKind) -> u8 {
         EffectKind::Spawn => 4,
         EffectKind::Stop => 5,
         EffectKind::RestartChildren => 6,
-        EffectKind::Call => 7,
+        EffectKind::Io => 7,
         EffectKind::Batch => 8,
         EffectKind::StopWith => 9,
         EffectKind::ReplyTo => 10,
@@ -2128,7 +2128,7 @@ mod stable_hash_tests {
         assert_eq!(effect_kind_tag(EffectKind::Spawn), 4);
         assert_eq!(effect_kind_tag(EffectKind::Stop), 5);
         assert_eq!(effect_kind_tag(EffectKind::RestartChildren), 6);
-        assert_eq!(effect_kind_tag(EffectKind::Call), 7);
+        assert_eq!(effect_kind_tag(EffectKind::Io), 7);
         assert_eq!(effect_kind_tag(EffectKind::Batch), 8);
         assert_eq!(effect_kind_tag(EffectKind::StopWith), 9);
         assert_eq!(effect_kind_tag(EffectKind::ReplyTo), 10);

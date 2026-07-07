@@ -17,7 +17,7 @@ use std::time::Duration;
 use http::{HeaderMap, HeaderValue, Method, StatusCode};
 use prost::Message;
 use tina::prelude::*;
-use tina::reply_to_request;
+use tina::reply_to;
 use tina_runtime::{CallOutcome, call};
 
 use crate::{
@@ -553,7 +553,7 @@ where
 
     pub fn pull_next_effect<I>(&self, timeout: Duration) -> Effect<I>
     where
-        I: Isolate<Message = ResponseChunkMsg, Call = tina_runtime::RuntimeCall<ResponseChunkMsg>>,
+        I: Isolate<Message = ResponseChunkMsg, Io = tina_runtime::RuntimeCall<ResponseChunkMsg>>,
     {
         call(
             self.stream.source,
@@ -1436,7 +1436,7 @@ impl<S: Shard + 'static> GrpcRouter<S> {
                     call,
                 } => {
                     let HttpRequestBody::Http2Stream(stream) = &request.body else {
-                        return reply_to_request(
+                        return reply_to(
                             call,
                             grpc_http_response(
                                 Vec::new(),
@@ -1491,7 +1491,7 @@ impl<S: Shard + 'static> GrpcRouter<S> {
                     call,
                 } => {
                     request.body = HttpRequestBody::Buffered(body);
-                    reply_to_request(call, self.response_for(request))
+                    reply_to(call, self.response_for(request))
                 }
                 PendingGrpcRequest::Http2 {
                     method,
@@ -1509,11 +1509,11 @@ impl<S: Shard + 'static> GrpcRouter<S> {
                         content_type_ok,
                         unsupported_encoding,
                     };
-                    reply_to_request(call, self.response_for_http2(request))
+                    reply_to(call, self.response_for_http2(request))
                 }
             },
             RequestChunkAction::Failed(status) => {
-                reply_to_request(pending.into_call(), grpc_http_response(Vec::new(), status))
+                reply_to(pending.into_call(), grpc_http_response(Vec::new(), status))
             }
         }
     }
@@ -1588,7 +1588,7 @@ impl<S: Shard + 'static> Isolate for GrpcRouter<S> {
         reply: HttpResponse,
         send: tina::Outbound<Infallible>,
         spawn: Infallible,
-        call: tina_runtime::RuntimeCall<GrpcRouterMsg>,
+        io: tina_runtime::RuntimeCall<GrpcRouterMsg>,
         shard: S,
     }
 

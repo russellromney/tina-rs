@@ -45,7 +45,7 @@ impl Isolate for Gateway {
         reply: HttpResponse,
         send: tina::Outbound<Infallible>,
         spawn: Infallible,
-        call: Infallible,
+        io: Infallible,
         shard: TestShard,
     }
 
@@ -95,7 +95,7 @@ impl Isolate for WsEcho {
         reply: WebSocketSessionOutcome,
         send: tina::Outbound<Infallible>,
         spawn: Infallible,
-        call: Infallible,
+        io: Infallible,
         shard: TestShard,
     }
 

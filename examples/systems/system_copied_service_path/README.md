@@ -1,6 +1,6 @@
 # system_copied_service_path
 
-Canonical copied Tina service skeleton for Phase 120.
+Canonical copied Tina service skeleton for the copied-service-path pass.
 
 Copy this shape when building a normal service. The point is not that this
 crate is a complete product; the point is that the normal service path names

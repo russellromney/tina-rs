@@ -43,7 +43,7 @@ impl Isolate for ProtocolIsolate {
     type Send = tina::Outbound<Infallible>;
     type Spawn = Infallible;
     type SpawnObserved = Infallible;
-    type Call = RuntimeCall<HostMsg>;
+    type Io = RuntimeCall<HostMsg>;
     type Fact = ProtocolFact;
     type Shard = SimShard;
 
@@ -180,7 +180,7 @@ impl Isolate for MixedProtocolIsolate {
     type Send = tina::Outbound<Infallible>;
     type Spawn = Infallible;
     type SpawnObserved = Infallible;
-    type Call = RuntimeCall<MixedMsg>;
+    type Io = RuntimeCall<MixedMsg>;
     type Fact = ProtocolFact;
     type Shard = SimShard;
 

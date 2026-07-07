@@ -15,7 +15,7 @@ Both sides produce `delivered=2 unavailable=1 timed_out=1 other=0`.
 
 ## What feels good (Tina)
 
-- `ReqwestOutcomeExt::classify` (Phase 062 Rock 6) collapses the
+- `ReqwestOutcomeExt::classify` (the retry classifier) collapses the
   two-layer outcome into three buckets — `Succeeded(resp)`,
   `Transient(reason)`, `Fatal(reason)` — with typed reasons that
   still name *which* layer failed. The dispatcher's bucketer is
@@ -34,7 +34,7 @@ Both sides produce `delivered=2 unavailable=1 timed_out=1 other=0`.
   when all are done" would replace the bookkeeping; in the meantime
   this is the canonical shape.
 
-## Phase-061 note
+## Shape note
 
 This specimen does *not* use `PendingReplies` because the
 dispatcher is host-driven (`stop_with(report)` + `observe_result`)

@@ -1,6 +1,6 @@
 # Tokio + Tina Bridge Composition
 
-Phase 047 Rock 7. Companion to [mailbox-capacity.md](mailbox-capacity.md).
+Companion to [mailbox-capacity.md](mailbox-capacity.md).
 
 The Tokio bridge (`tina-tokio-bridge`) is for small, gradual adoption inside
 existing Tokio apps. Tokio owns the edge; Tina owns isolate state. The
@@ -54,7 +54,7 @@ runtimes — but the bridge is the place most users hit it.
 
 ## Footgun #2: `Arc::try_unwrap` shutdown dance
 
-Before Phase 047, examples ended with:
+Older examples ended with:
 
 ```rust,ignore
 match Arc::try_unwrap(runtime) {
@@ -101,7 +101,7 @@ because it surfaces signals as ordinary later messages and integrates
 with the runtime's shutdown report. Document the choice loudly.
 
 There is no public API to query "which handlers are registered" or
-"tear down my registrations." Phase 047 does not change this.
+"tear down my registrations."
 
 ## Capability table
 

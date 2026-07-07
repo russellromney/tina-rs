@@ -97,7 +97,7 @@ use http::HeaderValue;
 use http::header::HOST;
 use tina::pool::{CloseMode, PoolConfig};
 use tina::prelude::*;
-use tina::{CallContext, RequestContext, reply_to_request};
+use tina::{CallContext, RequestContext};
 use tina_runtime::pool::{WorkerPool, WorkerPoolMsg, WorkerPoolReply};
 use tina_runtime::{
     CallError, CallOutcome, TcpReadBufReply, TcpWriteOwnedReply, ThreadedRuntime,
@@ -372,7 +372,7 @@ impl<S: Shard + 'static> Isolate for KeepaliveConnection<S> {
         reply: KeepaliveOutcome,
         send: tina::Outbound<Infallible>,
         spawn: Infallible,
-        call: tina_runtime::RuntimeCall<KeepaliveConnectionMsg>,
+        io: tina_runtime::RuntimeCall<KeepaliveConnectionMsg>,
         shard: S,
     }
 
@@ -1032,7 +1032,7 @@ fn reply_keepalive_outcome<S: Shard + 'static>(
     outcome: KeepaliveOutcome,
 ) -> Effect<KeepaliveConnection<S>> {
     match reply_to {
-        Some(request) => reply_to_request(request, outcome),
+        Some(request) => tina::reply_to(request, outcome),
         None => reply(outcome),
     }
 }

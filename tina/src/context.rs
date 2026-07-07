@@ -5,7 +5,7 @@
 //! [`CallHandle`] cancellation authority, [`Deadline`], [`CallRouting`],
 //! and [`MessageCaller`]. Re-exported from the crate root.
 //!
-//! ## Module map (Phase 115 reorg)
+//! ## Module map
 //!
 //! Most handler-side ergonomics types belong here. Address types live
 //! in `mod address`; effects live in `mod effect`; isolate-shape
@@ -84,7 +84,7 @@ where
     /// Attach the current message's caller. Runtime-only constructor.
     ///
     /// Used by runtime crates so handlers can capture the caller as a
-    /// deferred reply slot via [`take_reply_slot`](Self::take_reply_slot).
+    /// request context via [`take_request_context`](Self::take_request_context).
     /// Ordinary application code does not call this.
     #[doc(hidden)]
     pub fn with_caller(mut self, caller: MessageCaller) -> Self {
@@ -108,41 +108,8 @@ where
     }
 
     /// Captures the current caller as a one-shot deferred reply slot.
-    ///
-    /// On success, returns a typed [`DeferredReply<R>`] that the handler
-    /// (or a later handler turn on the same isolate) may pass to
-    /// [`crate::reply_to`] to answer the original caller.
-    ///
-    /// Errors:
-    ///
-    /// - [`TakeReplySlotError::NoCaller`]: the current message was a
-    ///   plain send, or the slot was already taken on this turn.
-    ///
-    /// Capturing is irreversible: once taken, the runtime will not also
-    /// honor an [`Effect::Reply`] for the same call. Returning
-    /// `Effect::Reply` after `take_reply_slot` is a no-op against the
-    /// original caller.
-    ///
-    /// The reply type comes from the context, not from the caller. The
-    /// old "name the isolate again" shape does not compile:
-    ///
-    /// ```compile_fail
-    /// # use tina::{Context, DeferredReply, IsolateId, SingleShard};
-    /// let mut shard = SingleShard;
-    /// let mut ctx = Context::<_, u32>::new_typed(&mut shard, IsolateId::new(1));
-    /// let _slot: Result<DeferredReply<u32>, _> = ctx.take_reply_slot::<()>();
-    /// ```
-    ///
-    /// The correct shape lets Rust infer the slot payload from
-    /// `Context<'_, S, R>`:
-    ///
-    /// ```
-    /// # use tina::{Context, DeferredReply, IsolateId, SingleShard};
-    /// let mut shard = SingleShard;
-    /// let mut ctx = Context::<_, u32>::new_typed(&mut shard, IsolateId::new(1));
-    /// let _slot: Result<DeferredReply<u32>, _> = ctx.take_reply_slot();
-    /// ```
-    pub fn take_reply_slot(&mut self) -> Result<DeferredReply<R>, TakeReplySlotError>
+    /// Internal primitive behind [`Self::take_request_context`].
+    pub(crate) fn take_reply_slot(&mut self) -> Result<DeferredReply<R>, TakeReplySlotError>
     where
         R: 'static,
     {
@@ -159,9 +126,8 @@ where
 
     /// Captures the current caller as a [`RequestContext<R>`].
     ///
-    /// This is the blessed app-facing name for the same primitive as
-    /// [`take_reply_slot`](Self::take_reply_slot). The name signals
-    /// intent: "I will reply later through a multi-turn workflow."
+    /// This is the app-facing capture primitive. The name signals intent:
+    /// "I will reply later through a multi-turn workflow."
     ///
     /// The return type is a [`RequestContext`] so callers who see the
     /// type know the handler means to carry the promise across turns.
@@ -595,8 +561,8 @@ impl CallRejectedReason {
 
 /// One-shot typed handle for replying to a captured caller later.
 ///
-/// A `DeferredReply<R>` is created by
-/// [`Context::take_reply_slot`]. The handler may store it in isolate
+/// A `DeferredReply<R>` is usually obtained through
+/// [`RequestContext::into_deferred`]. The handler may store it in isolate
 /// state and use [`crate::reply_to`] from a later turn to answer the original
 /// caller. The slot is one-shot: each `reply_to` consumes the slot.
 ///
@@ -647,16 +613,14 @@ impl<R> DeferredReply<R> {
 /// request/reply workflows. It is a thin newtype over
 /// [`DeferredReply<R>`] so the type system teaches the pattern: a
 /// handler that must reply later takes `RequestContext`, stores it in
-/// isolate state, and eventually passes it to [`crate::reply_to_request`] or
+/// isolate state, and eventually passes it to [`crate::reply_to`] or
 /// carries it into a continuation message.
 ///
 /// Like [`DeferredReply`], it is move-only (`!Clone`). It does not
 /// auto-reply, auto-retry, or hide effects. It is typed so the reply
 /// payload must match the original caller's expected type.
 ///
-/// Capture via [`Context::take_request_context`] (the app-facing name)
-/// or keep using [`Context::take_reply_slot`] for the same underlying
-/// slot. Both return the same primitive; the name signals intent.
+/// Capture via [`Context::take_request_context`].
 ///
 #[must_use = "a RequestContext must eventually be replied to or intentionally dropped"]
 #[derive(Debug)]
@@ -679,6 +643,12 @@ impl<R> RequestContext<R> {
     /// [`DeferredReply`] and does not want to change.
     pub fn into_deferred(self) -> DeferredReply<R> {
         self.0
+    }
+}
+
+impl<R> From<RequestContext<R>> for DeferredReply<R> {
+    fn from(value: RequestContext<R>) -> Self {
+        value.into_deferred()
     }
 }
 
@@ -713,12 +683,10 @@ impl DeferredReplyHandle {
 /// the runtime registry. The runtime mutates `state` to record caller
 /// liveness.
 ///
-/// State is an `AtomicU8` so `DeferredSlotShared` is `Sync` and
-/// `Arc<DeferredSlotShared>` is `Send`. The user-side handle then
-/// satisfies `Send + 'static` for `ThreadedRuntime` registration.
-/// Atomic ordering is `Relaxed` because the slot is always handled on
-/// one shard thread; the atomic is the cheapest type the borrow
-/// checker accepts in `Send + Sync` form.
+/// **Concurrency invariant.** All writes happen on the shard thread that owns
+/// the deferred slot registry. Reads can come from another thread through a
+/// host-held handle or moved isolate state. Writers use `Release`, readers use
+/// `Acquire`, so observers see a consistent terminal transition.
 #[derive(Debug)]
 pub struct DeferredSlotShared {
     slot_id: u64,
@@ -726,7 +694,7 @@ pub struct DeferredSlotShared {
     /// `TypeId` of the original caller's expected reply payload. The
     /// runtime sets this from the dispatching `Address<_, R>`'s `R`.
     /// Normal handlers cannot choose a different deferred reply type
-    /// because [`Context::take_reply_slot`] derives it from the current
+    /// because [`Context::take_request_context`] derives it from the current
     /// isolate. The runtime still checks erased payloads against this
     /// id before invoking the original caller's translator, so hidden
     /// runtime-internal misuse surfaces as a typed trace fact rather
@@ -761,7 +729,7 @@ impl DeferredSlotShared {
 
     /// Reads the current state.
     pub fn state(&self) -> DeferredSlotState {
-        match self.state.load(Ordering::Relaxed) {
+        match self.state.load(Ordering::Acquire) {
             SLOT_STATE_OPEN => DeferredSlotState::Open,
             SLOT_STATE_REPLIED => DeferredSlotState::Replied,
             SLOT_STATE_CLOSED => DeferredSlotState::Closed,
@@ -777,7 +745,7 @@ impl DeferredSlotShared {
             DeferredSlotState::Replied => SLOT_STATE_REPLIED,
             DeferredSlotState::Closed => SLOT_STATE_CLOSED,
         };
-        self.state.store(byte, Ordering::Relaxed);
+        self.state.store(byte, Ordering::Release);
     }
 }
 
@@ -826,7 +794,7 @@ pub enum DeferredSlotState {
 /// #     type Send = Outbound<std::convert::Infallible>;
 /// #     type Spawn = std::convert::Infallible;
 /// #     type SpawnObserved = std::convert::Infallible;
-/// #     type Call = std::convert::Infallible;
+/// #     type Io = std::convert::Infallible;
 /// #     type Shard = tina::SingleShard;
 /// #     fn handle(&mut self, _: (), _: &mut tina::Context<'_, Self::Shard, Self::Reply>) -> Effect<Self> {
 /// #         tina::noop()
@@ -1181,7 +1149,7 @@ impl Deadline {
     }
 }
 
-/// Reasons [`Context::take_reply_slot`] may refuse a capture.
+/// Reasons [`Context::take_request_context`] may refuse a capture.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TakeReplySlotError {
     /// The current message has no caller, or the slot was already taken
@@ -1195,7 +1163,7 @@ pub enum TakeReplySlotError {
 /// Runtime-supplied capture hook attached to a [`Context`].
 ///
 /// Constructed by runtimes when delivering a call message; consumed by
-/// the first call to [`Context::take_reply_slot`]. Holds primitives
+/// the first call to [`Context::take_request_context`]. Holds primitives
 /// inline plus an `Rc` to the runtime's slot registry — no per-call
 /// boxed closure.
 #[derive(Debug)]

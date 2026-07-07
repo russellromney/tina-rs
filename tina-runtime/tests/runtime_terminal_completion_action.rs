@@ -38,7 +38,7 @@ impl TerminalProbe {
         _ctx: &mut Context<'_, SingleShard, Self::Reply>,
     ) -> Effect<Self> {
         match msg {
-            TerminalMsg::StopOnTimer => Effect::Call(RuntimeCall::new_with_completion(
+            TerminalMsg::StopOnTimer => Effect::Io(RuntimeCall::new_with_completion(
                 CallInput::Sleep {
                     after: Duration::from_millis(5),
                 },
@@ -48,7 +48,7 @@ impl TerminalProbe {
                 },
             )),
             TerminalMsg::StopBeforeTimer => batch(vec![
-                Effect::Call(RuntimeCall::new_with_completion(
+                Effect::Io(RuntimeCall::new_with_completion(
                     CallInput::Sleep {
                         after: Duration::from_millis(20),
                     },
@@ -59,7 +59,7 @@ impl TerminalProbe {
                 )),
                 stop(),
             ]),
-            TerminalMsg::NoopOnTimer => Effect::Call(RuntimeCall::new_with_completion(
+            TerminalMsg::NoopOnTimer => Effect::Io(RuntimeCall::new_with_completion(
                 CallInput::Sleep {
                     after: Duration::from_millis(5),
                 },
@@ -68,7 +68,7 @@ impl TerminalProbe {
                     other => RuntimeCallCompletion::Message(unexpected_completion(other)),
                 },
             )),
-            TerminalMsg::MessageOnTimer => Effect::Call(RuntimeCall::new_with_completion(
+            TerminalMsg::MessageOnTimer => Effect::Io(RuntimeCall::new_with_completion(
                 CallInput::Sleep {
                     after: Duration::from_millis(5),
                 },
@@ -77,7 +77,7 @@ impl TerminalProbe {
                     other => RuntimeCallCompletion::Message(unexpected_completion(other)),
                 },
             )),
-            TerminalMsg::BadStreamNoop => Effect::Call(RuntimeCall::new_with_completion(
+            TerminalMsg::BadStreamNoop => Effect::Io(RuntimeCall::new_with_completion(
                 CallInput::TcpStreamClose {
                     stream: StreamId::new(999_999),
                 },

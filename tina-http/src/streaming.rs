@@ -290,7 +290,7 @@ impl<S: Shard + 'static> Isolate for IterBodySource<S> {
         // on both the threaded runtime and the deterministic
         // simulator. We never make outbound calls; the channel is
         // there only to satisfy the simulator's bound.
-        call: tina_runtime::RuntimeCall<ResponseChunkMsg>,
+        io: tina_runtime::RuntimeCall<ResponseChunkMsg>,
         shard: S,
     }
 
