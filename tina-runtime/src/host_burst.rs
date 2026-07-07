@@ -1,4 +1,4 @@
-//! Host-side burst send accumulator (Phase 062 Rock 3).
+//! Host-side burst send accumulator.
 //!
 //! Wraps the per-send observer ceremony of
 //! [`crate::ThreadedRuntime::try_send_and_observe_with`] in a tiny

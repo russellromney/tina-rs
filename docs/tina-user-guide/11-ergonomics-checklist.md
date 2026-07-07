@@ -9,7 +9,7 @@ If you're reading older code that does not use these, treat that as
 debt rather than precedent.
 
 This page is the "use this, not that" checklist for new code. Live paper cuts
-belong in `examples/FINDINGS.md` or the next phase plan, not in the user guide.
+belong in `examples/FINDINGS.md` or a focused design note, not in the user guide.
 
 ## Use this, not that
 
@@ -1059,7 +1059,7 @@ live in crate tests.
 ## Adding to this checklist
 
 If a new ergonomics primitive lands, add a "Use this, not that"
-entry here, link the deep-dive doc if there is one, and remove or
-mark the matching paper cut in `examples/FINDINGS.md` or the next phase plan.
+entry here, link the deep-dive doc if there is one, and remove or mark the
+matching paper cut in `examples/FINDINGS.md` or the matching design note.
 
 Keep entries one paragraph. Detail goes in the deep-dive doc.

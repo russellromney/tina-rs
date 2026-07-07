@@ -5,7 +5,7 @@
 //! re-exported from the crate root for backwards compatibility (see
 //! `lib.rs`).
 //!
-//! ## Module map (Phase 115 reorg)
+//! ## Module map
 //!
 //! - [`Address`] / [`SendAddress`] / [`CallAddress`] — typed addresses for
 //!   sends and calls.

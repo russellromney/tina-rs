@@ -434,8 +434,8 @@ fn check_limits_for_encode(limits: &FrameLimits) -> Result<(), EncodeError> {
 ///
 /// This is the entry point for streaming decoders: read four bytes from the
 /// transport, call this function, then read exactly `body_len` more bytes
-/// before calling [`decode_body`]. Allocating only after this check satisfies
-/// the "decode before allocate" rule from the phase plan.
+/// before calling [`decode_body`]. Allocating only after this check enforces
+/// the "decode before allocate" invariant.
 pub fn parse_length_prefix(
     prefix: [u8; LENGTH_PREFIX_SIZE],
     limits: &FrameLimits,

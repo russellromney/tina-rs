@@ -1,4 +1,4 @@
-//! Local system app owners extracted from lib.rs (phase 055).
+//! Local system app owners extracted from lib.rs.
 //!
 //! Houses `LocalSystem`, `LocalMultiShardSystem`, their builders/shutdown
 //! handles, the bounded-shape `LocalSystemConfig`, terminal report types,

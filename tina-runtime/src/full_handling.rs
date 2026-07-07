@@ -1,4 +1,4 @@
-//! Explicit Full-handling policy state (Phase 101 Rock 6).
+//! Explicit Full-handling policy state.
 //!
 //! Several services need the same boring "on Full, shed or retry-with-backoff"
 //! shape. [`FullHandling`] records the policy and returns a decision; it does

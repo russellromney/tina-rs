@@ -2540,7 +2540,7 @@ Hostile-review fixes:
 - Migrated system/specimen code including metrics shipping, bounded object
   lanes, and service shutdown paths to the copied helper shapes.
 
-### Phase 100 Compile-Time Safety Rails
+### Compile-Time Safety Rails
 
 - Added capability-typed addresses `tina::SendAddress<M>` and
   `tina::CallAddress<M, R>` so the wrong path becomes a compile error instead
@@ -3995,7 +3995,7 @@ API additions:
 - Rewrote the README into a shorter Tina-as-concurrency-primitive story with
   explicit inspiration links and current non-claims.
 
-### Phase Sputnik
+### Initial Trait Surface
 
 - Added the `tina` trait crate as the shared vocabulary layer.
 - Added `Isolate`, `Effect`, `Mailbox`, `Shard`, `Context`, `Address`,
@@ -4004,7 +4004,7 @@ API additions:
 - Added docs, compile-fail tests, and downstream-style integration tests for
   the trait surface.
 
-### Phase Pioneer
+### Supervision Vocabulary And Bounded SPSC Mailbox
 
 - Added shared supervision policy types in `tina`, including restart policy,
   restart-budget accounting, and child restart classification.
@@ -4018,7 +4018,7 @@ API additions:
   narrow and evidence-backed.
 - Documented the DST boundary and the runtime-enforced SPSC contract.
 
-### Phase Mariner
+### Initial Single-Shard Runtime
 
 - Added `tina-runtime`, a small in-progress runtime with a deterministic
   event trace and causal links.

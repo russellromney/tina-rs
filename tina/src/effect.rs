@@ -4,7 +4,7 @@
 //! and every effect constructor (`reply`, `send`, `call`, `spawn`,
 //! `batch`, `stop`, ...). Re-exported from the crate root.
 //!
-//! ## Module map (Phase 115 reorg)
+//! ## Module map
 //!
 //! Constructors stay near `Effect` so a future agent adding a verb has
 //! one file to edit. New verbs must also be added to `Isolate`-related

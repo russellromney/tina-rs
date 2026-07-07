@@ -736,9 +736,9 @@ impl Default for PoolConfig {
     }
 }
 
-/// Phase tag inside [`HttpClientError::Transport`]. `Bind` and
-/// `Accept` exist for symmetry; the client only ever emits
-/// `Connect`, `Read`, `Write`, `Close`.
+/// Operation tag inside [`HttpClientError::Transport`]. `Bind` and `Accept`
+/// exist for symmetry; the client only ever emits `Connect`, `Read`, `Write`,
+/// `Close`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HttpTransportPhase {
     Connect,

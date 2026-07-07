@@ -2,9 +2,8 @@
 //!
 //! `tina` only owns the [`Effect::Io`](tina::Effect::Io) slot and the
 //! `Isolate::Io` associated type. The concrete request and result types
-//! live here so the trait crate stays substrate-neutral. A future
-//! Mariner runtime crate (a different completion-driven backend, a
-//! deterministic simulator, …) can implement the same `Effect::Io`
+//! live here so the trait crate stays substrate-neutral. A different
+//! completion-driven backend or deterministic simulator can implement the same `Effect::Io`
 //! slot with its own request/result vocabulary without touching `tina`.
 //!
 //! The first shipped call family is backed by Betelgeuse on nightly Rust and
@@ -29,7 +28,7 @@
 //!   opaque ids inside its own message vocabulary.
 
 // ---------------------------------------------------------------------------
-// Module map (Phase 115 reorg)
+// Module map
 // ---------------------------------------------------------------------------
 //
 // Rail constructors live in per-rail submodules so adding or reading one

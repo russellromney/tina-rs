@@ -1,4 +1,4 @@
-//! Multi-shard explicit-step coordinator extracted from lib.rs (phase 055).
+//! Multi-shard explicit-step coordinator extracted from lib.rs.
 //!
 //! Houses `MultiShardRuntime`, `MultiShardRuntimeConfig`, and the remote-queue
 //! plumbing helpers (`RemoteQueueIndexes`, `RemoteQueues`,

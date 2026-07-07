@@ -1,4 +1,4 @@
-//! Threaded multi-shard runtime extracted from lib.rs (phase 055).
+//! Threaded multi-shard runtime extracted from lib.rs.
 //!
 //! Houses `ThreadedMultiShardRuntime`, the cross-shard worker loop
 //! `threaded_worker_loop_with_remote`, and the remote-inbound drain helper

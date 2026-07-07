@@ -1,4 +1,4 @@
-//! Multi-shard explicit-step simulator extracted from lib.rs (phase 055).
+//! Multi-shard explicit-step simulator extracted from lib.rs.
 //!
 //! Houses `MultiShardSimulator`, `MultiShardSimulatorConfig` impls, the
 //! `RemoteQueueIndexes` / `RemoteQueues` type aliases, and the

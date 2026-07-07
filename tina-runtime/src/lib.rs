@@ -1,15 +1,14 @@
 #![deny(unsafe_code)]
 #![deny(missing_docs)]
 #![deny(rustdoc::broken_intra_doc_links)]
-// Phase Mariner 012 substrate is Betelgeuse, which exposes its
-// `IOLoopHandle<A: Allocator>` over the unstable `allocator_api`. We
-// commit to nightly Rust for `tina-runtime` per the reopened
-// 012 plan; the feature gate is scoped to this crate.
+// Betelgeuse exposes `IOLoopHandle<A: Allocator>` over the unstable
+// `allocator_api`, so `tina-runtime` remains nightly-only. The feature gate is
+// scoped to this crate.
 #![feature(allocator_api)]
 
 //! Small deterministic single-shard runtime core for `tina-rs`.
 //!
-//! This crate starts Mariner with the narrowest useful runtime surface:
+//! This crate starts with the narrowest useful runtime surface:
 //!
 //! - deterministic runtime event IDs
 //! - causal links between runtime events
@@ -394,7 +393,7 @@ impl IdSource {
 /// an unbounded delivery loop. The remainder carries over to the next step.
 pub const DEFAULT_DRIVER_COMPLETION_DRAIN_BUDGET: usize = 64;
 
-/// Small deterministic single-shard runtime for the second Mariner slice.
+/// Small deterministic single-shard runtime.
 ///
 /// The runtime owns one shard value plus a private registry of isolates and
 /// mailboxes. [`step`](Self::step) walks registered isolates in registration

@@ -1,6 +1,6 @@
 //! Internal state and handler-erasure machinery for the simulator.
 //!
-//! Extracted from lib.rs (phase 055). Houses the private state types
+//! Extracted from lib.rs. Houses the private state types
 //! (`RegisteredAddress`, `InFlightCall`, the TCP/UDP/TLS/file/process state
 //! structs, `LocalInbox`, …), the `ErasedHandler` / `ErasedSpawn` /
 //! `ErasedRestartRecipe` / `IntoErasedSpawn` trait family and their

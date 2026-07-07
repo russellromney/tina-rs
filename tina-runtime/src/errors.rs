@@ -1,4 +1,4 @@
-//! Threaded runtime and supervise error types extracted from lib.rs (phase 055).
+//! Threaded runtime and supervise error types extracted from lib.rs.
 
 use std::error::Error;
 use std::fmt;
@@ -238,11 +238,10 @@ impl Error for ThreadedSendObservedError {}
 
 /// Error returned by [`crate::ThreadedRuntime::send_observed_until`].
 ///
-/// Phase 062 Rock 4 retry helper. The helper retries on `MailboxFull`
-/// and `IngressFull` until the caller-supplied deadline; a deadline
-/// miss surfaces as [`Self::Timeout`]. `Closed` and `WorkerStopped`
-/// are returned eagerly — the helper does not retry those because the
-/// target/worker is no longer accepting at all.
+/// Retry helper. Retries on `MailboxFull` and `IngressFull` until the
+/// caller-supplied deadline; a deadline miss surfaces as [`Self::Timeout`].
+/// `Closed` and `WorkerStopped` are returned eagerly because the target/worker
+/// is no longer accepting at all.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SendObservedUntilError {
     /// Deadline elapsed while still racing the mailbox/ingress for a slot.

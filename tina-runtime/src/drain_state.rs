@@ -1,4 +1,4 @@
-//! Explicit drain state for service shutdown (Phase 101 Rock 4).
+//! Explicit drain state for service shutdown.
 //!
 //! `DrainState` is small state plus a small report. It does not close any
 //! resource, send any message, or pick the ordering. The service still:

@@ -1,4 +1,4 @@
-//! Persistent host-call dispatcher (phase 145 / Rock 5).
+//! Persistent host-call dispatcher.
 //!
 //! One long-lived isolate per worker shard handles every `call_blocking` from
 //! the host. The old `HostCallDriver` registered a fresh isolate per call —

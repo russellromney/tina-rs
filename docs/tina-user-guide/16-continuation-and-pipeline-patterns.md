@@ -196,8 +196,8 @@ impl Worker {
 Why this shape:
 
 - one runtime call per iteration → one trace event per iteration;
-- the host receives the summary via `observe_result::<Summary>(addr)`
-  (Phase 059 Rock 1) — no shared `Arc<...>` for the result;
+- the host receives the summary via `observe_result::<Summary>(addr)` — no
+  shared `Arc<...>` for the result;
 - "stop on first error" or "skip and continue" are local choices in
   `record`, not framework decisions.
 

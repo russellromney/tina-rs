@@ -1,4 +1,4 @@
-//! Sharded service contracts (phase 053).
+//! Sharded service contracts.
 //!
 //! Small Seastar-shaped local multi-shard primitives. These helpers are
 //! contracts only: a deterministic key-to-shard map, a typed `ShardId ->

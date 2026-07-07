@@ -6,7 +6,7 @@
 //! `SpawnObserved` family, `RestartableChildDefinition`), and the
 //! `StopResult` envelope. Re-exported from the crate root.
 //!
-//! ## Module map (Phase 115 reorg)
+//! ## Module map
 //!
 //! New isolate-shape vocabulary belongs here. The closed [`Effect`]
 //! enum and effect constructors live in `mod effect`; address types
@@ -120,8 +120,7 @@ pub trait Isolate: Sized {
 /// The default `handle_call` on [`Isolate`] always rejects with
 /// `CallRejectedReason::UnsupportedMessage`. Registering such an isolate
 /// through the callable lane would create a service whose every call returns
-/// a runtime rejection — exactly the silent failure Phase 100 moves to the
-/// compile boundary. `CallableIsolate` is the type-level "this isolate's
+/// a runtime rejection. `CallableIsolate` is the type-level "this isolate's
 /// `handle_call` is intentional" stamp.
 ///
 /// The `#[tina::isolate]` and `#[tina_runtime::isolate]` macros emit
@@ -140,8 +139,7 @@ pub trait Isolate: Sized {
 pub trait CallableIsolate: Isolate {}
 
 /// `recv` takes `&self` because real SPSC implementations rely on interior
-/// mutability (atomics over a ring buffer). Phase Pioneer may revisit this
-/// with a `Sender`/`Receiver` split — see ROADMAP "Open questions".
+/// mutability (atomics over a ring buffer).
 ///
 /// Concrete implementations may enforce concurrency contracts at runtime rather
 /// than in the type system. For example, an SPSC mailbox may panic if more than
@@ -482,9 +480,8 @@ mod restart_budget_tests {
 
 /// Executor-per-core abstraction.
 ///
-/// Runtime crates will implement this trait for their shard type. Sputnik keeps
-/// the surface deliberately small: a shard knows its identifier and can mint
-/// typed addresses on that shard.
+/// Runtime crates implement this trait for their shard type. A shard knows its
+/// identifier and can mint typed addresses on that shard.
 pub trait Shard {
     /// Returns the logical shard identifier.
     fn id(&self) -> ShardId;
@@ -526,7 +523,7 @@ impl Shard for SingleShard {
     }
 }
 
-/// A minimal spawn request for Sputnik.
+/// A minimal spawn request.
 ///
 /// The runtime owns what "spawn" means operationally. This type only carries
 /// the state machine to construct and the requested mailbox capacity.
@@ -545,10 +542,8 @@ impl<I> ChildDefinition<I>
 where
     I: Isolate,
 {
-    /// Creates a new spawn request.
-    ///
-    /// TODO: Phase Pioneer adds supervision metadata once the supervisor layer
-    /// exists. Sputnik intentionally keeps spawn requests minimal.
+    /// Creates a spawn request without supervision metadata. Restartable
+    /// children use [`RestartableChildDefinition`].
     pub fn new(isolate: I, mailbox_capacity: usize) -> Self {
         Self {
             isolate,

@@ -538,8 +538,8 @@ enum GoneReason {
 struct Gateway {
     // Capability-typed callable handle: the gateway only ever calls the room
     // (via the HTTP connection's later send-outcome / inbound delivery path),
-    // never directly sends. Phase 100's `CallAddress` enforces that contract
-    // at the type boundary instead of through the runtime-level
+    // never directly sends. `CallAddress` enforces that contract at the type
+    // boundary instead of through the runtime-level
     // `UnsupportedMessage` rejection that used to land here when an internal
     // continuation reached `handle_call` by mistake.
     room: tina::CallAddress<WebSocketSessionMsg, WebSocketSessionOutcome>,

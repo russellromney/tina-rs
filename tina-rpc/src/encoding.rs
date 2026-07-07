@@ -2,9 +2,9 @@
 //!
 //! The frame envelope (see [`crate::frame`]) carries an opaque payload.
 //! Application types (request/response structs, primitives, etc.) are
-//! converted to and from those bytes by an [`Encoding`] implementation. First
-//! form ships [`Json`]; postcard, bincode, and others may follow as separate
-//! adapters in later phases.
+//! converted to and from those bytes by an [`Encoding`] implementation. The
+//! crate ships [`Json`]; postcard, bincode, and others can be added as
+//! separate adapters.
 //!
 //! # `max_size` semantics
 //!

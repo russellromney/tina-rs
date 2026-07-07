@@ -14,14 +14,12 @@
 //!
 //! # Effect Shape
 //!
-//! Phase Sputnik resolves the roadmap's first open question in favor of a
-//! **closed** [`Effect`] enum rather than a per-isolate associated effect type.
+//! Tina uses a **closed** [`Effect`] enum rather than a per-isolate associated
+//! effect type.
 //!
-//! This keeps the dispatcher contract small and uniform: every isolate can only
-//! ask for the same handful of verbs (`Reply`, `Send`, `Spawn`, `Stop`,
-//! `RestartChildren`, `Call`, and ordered `Batch`). That simplicity matters
-//! for the runtime crates we add in later phases, because they can switch on
-//! one shared enum instead of handling an open-ended effect language for every
+//! This keeps the dispatcher contract small and uniform: every isolate asks
+//! for runtime work through the same enum. Runtime crates can switch on one
+//! shared envelope instead of handling an open-ended effect language for every
 //! isolate.
 //!
 //! The tradeoff is that the effect *payloads* stay per-isolate via associated
@@ -29,7 +27,7 @@
 //! packages an outbound send, and what data is needed to request a spawn, while
 //! the dispatcher still sees one common envelope. The downside is that adding a
 //! brand-new verb means changing this crate, not just defining a new associated
-//! type. That is a deliberate Sputnik constraint.
+//! type.
 //!
 //! # Example
 //!
@@ -176,7 +174,7 @@ impl fmt::Debug for StopResult {
 pub use tina_macros::isolate;
 
 // ---------------------------------------------------------------------------
-// Module map (Phase 115 reorg)
+// Module map
 // ---------------------------------------------------------------------------
 //
 // The `tina` trait crate is being split into module homes so future agents

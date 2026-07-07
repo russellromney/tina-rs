@@ -4,7 +4,7 @@
 //! history-as-data runs, replay checks, deletion shrinking, and trace
 //! invariants without becoming a general property-testing framework.
 //!
-//! ## Module map (Phase 115 reorg)
+//! ## Module map
 //!
 //! The `dst` module is split into submodules so future agents can find
 //! where new code belongs without scanning the old oversized file. Submodule

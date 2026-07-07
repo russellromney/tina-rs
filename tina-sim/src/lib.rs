@@ -4,20 +4,20 @@
 
 //! Single-shard virtual-time simulator for `tina-rs`.
 //!
-//! Phase 016 started Voyager with the narrowest honest simulator slice:
+//! The simulator starts with a narrow deterministic slice:
 //!
 //! - one shard
 //! - virtual monotonic time
 //! - the shipped `Sleep { after }` / `TimerFired` contract
 //! - deterministic replay artifacts
 //!
-//! Phase 017 widens that slice just enough to make replayed divergence useful:
+//! Seeded perturbation makes replayed divergence useful:
 //!
 //! - seeded perturbation over local-send and timer-wake delivery
 //! - a small checker surface that can halt a run with a structured reason
 //! - replay artifacts that preserve checker failures alongside the event record
 //!
-//! Phase 018 adds single-shard spawn and supervision replay:
+//! Single-shard spawn and supervision replay are modeled:
 //!
 //! - public `ChildDefinition` / `RestartableChildDefinition` execution
 //! - runtime-owned direct parent-child lineage and restartable child records
@@ -25,7 +25,7 @@
 //! - bootstrap re-delivery, stale identity rejection, and budget exhaustion
 //!   through the live runtime event vocabulary
 //!
-//! Phase 019 adds scripted single-shard TCP simulation:
+//! Scripted single-shard TCP simulation covers:
 //!
 //! - bind, accept, read, write, listener close, and stream close
 //! - replayable peer-visible output

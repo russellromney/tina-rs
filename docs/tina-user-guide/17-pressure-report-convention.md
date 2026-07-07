@@ -1,10 +1,9 @@
 # Pressure Report Convention
 
-A small key=value line a pressure-capable specimen *may* print at the
-end of a run. Phase 059 Rock 9 ships this as a **convention**, not a
-framework: there is no shared driver and no schema enforcement. A
-specimen that doesn't opt in keeps printing whatever it printed
-before.
+A small key=value line a pressure-capable specimen *may* print at the end of a
+run. This is a **convention**, not a framework: there is no shared driver and
+no schema enforcement. A specimen that doesn't opt in keeps printing whatever
+it printed before.
 
 ## Shape
 

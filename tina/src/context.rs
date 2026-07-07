@@ -5,7 +5,7 @@
 //! [`CallHandle`] cancellation authority, [`Deadline`], [`CallRouting`],
 //! and [`MessageCaller`]. Re-exported from the crate root.
 //!
-//! ## Module map (Phase 115 reorg)
+//! ## Module map
 //!
 //! Most handler-side ergonomics types belong here. Address types live
 //! in `mod address`; effects live in `mod effect`; isolate-shape

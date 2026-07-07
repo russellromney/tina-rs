@@ -290,8 +290,7 @@ where
 /// their own per-call backpressure: the frontend's `IsolateCall`
 /// to a saturated worker resolves as `CallOutcome::Full`. Whether
 /// the frontend re-routes to a different worker or surfaces that
-/// as a registry `Full` of its own is a deliberate choice the
-/// implementation phase will make.
+/// as a registry `Full` of its own is a deliberate implementation choice.
 pub struct PooledService<H, S>
 where
     H: ServiceHandler<S>,
