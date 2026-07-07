@@ -30,6 +30,8 @@ This file records completed work.
 - Hardened HTTP/1 keepalive client truth: a non-chunked response that sends
   bytes beyond `Content-Length` now retires the pooled socket instead of
   silently truncating and reusing a desynchronized connection.
+- Fixed HTTP/1 keepalive chunked peer-close handling so truncated chunked
+  responses now fail with `Closed` instead of succeeding with partial body data.
 - Fixed bridge admission-slot leaks by reserving runtime-owned continuation
   overflow delivery for bridge/self continuations when the ordinary bounded
   mailbox is saturated. The docs now state the real priority semantics: FIFO
