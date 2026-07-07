@@ -6,6 +6,11 @@ This file records completed work.
 
 ### CI Dependency Hygiene
 
+- Fixed nightly toolchain drift: replaced same-type `drain(..).collect()`
+  with `mem::take` (runtime scope teardown, HTTP/2 client teardown) and an
+  atomic max `fetch_update` loop with `fetch_max`, so the unpinned nightly
+  clippy gate is green again.
+
 - Committed the root workspace `Cargo.lock` and switched normal workspace CI
   commands to `--locked`, so pull-request failures are tied to Tina changes
   instead of surprise dependency resolution drift.

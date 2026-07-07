@@ -376,7 +376,7 @@ impl RequestScope {
         }
         let registered_cause = state.cancelled.expect("just set above if it was None");
         let scope_id = self.inner.id;
-        let drained: Vec<RegisteredChild> = state.children.drain(..).collect();
+        let drained: Vec<RegisteredChild> = std::mem::take(&mut state.children);
         drop(state);
 
         let mut rows = Vec::with_capacity(drained.len());
