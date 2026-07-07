@@ -393,7 +393,7 @@ collapse independent ops into one buffer or chain them sequentially via
 continuation messages — Tokio's "spawn N tasks that each `.await` on the
 same connection" has no clean analogue.
 
-**Phase 047 replacement:** `tina::batch(...)` is documented sugar for
+**Phase 047 replacement:** `tina::sequence(...)` is documented sugar for
 ordered effect lists; `Effect::Batch` now names the same-stream caveat
 explicitly in its docstring; `docs/tcp-loops.md` ships canonical
 write-all and read-to-eof patterns plus the "do these writes one after
@@ -681,14 +681,14 @@ marker trait implemented only for `RuntimeCall<M>`, decorated with
 `#[diagnostic::on_unimplemented]` that names the fix
 ("switch the attribute to `#[tina_runtime::isolate(...)]`"). Simulator
 registration surfaces (`Simulator::register*`,
-`MultiShardSimulator::register*_on`) carry the bound, so a `Io =
+`MultiShardSimulator::register*_on`) carry the bound, so a `Call =
 Infallible` isolate now produces a clear "the trait `RuntimeCallable` is
 not implemented for `Infallible`" diagnostic.
 
 
 
-`#[tina::isolate(...)]` wires `Io = Infallible`. `#[tina_runtime::isolate(...)]`
-wires `Io = RuntimeCall<Msg>`. The simulator requires the latter,
+`#[tina::isolate(...)]` wires `Call = Infallible`. `#[tina_runtime::isolate(...)]`
+wires `Call = RuntimeCall<Msg>`. The simulator requires the latter,
 and the failure mode is a generic-bound mismatch in the type checker,
 not a comprehensible diagnostic.
 
@@ -858,7 +858,7 @@ reflect the current state, with style-only resolutions noted where
    *Two comparisons.* `next_effect()` recursive helper in
    keyspace; the wedge that hit `specimen_mux_client` when batching
    same-stream writes alongside a read. **Partly resolved:**
-   `tina::batch(...)` documented; same-stream caveat called out
+   `tina::sequence(...)` documented; same-stream caveat called out
    on `Effect::Batch`. Still no combinator for "for each command,
    call store, accumulate."
 

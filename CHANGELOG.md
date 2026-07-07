@@ -1955,7 +1955,7 @@ No-behavior module splits:
   `mod effect` (closed `Effect` enum and every constructor: `noop`,
   `fact`, `reply`, `reject`, `send`, `send_to`/`send_event`,
   `spawn`/`spawn_observed`, `stop`/`stop_with`, `restart_children`,
-  `batch`/`sequence`, `reply_to`/`reply_to`), and
+  `batch`/`sequence`, `reply_to`/`reply_to_request`), and
   `mod isolate` (`Isolate`/`CallableIsolate`,
   `Mailbox`/`TrySendError`, `RestartPolicy`/`ChildRelation`/
   `RestartDecision`/`RestartBudget` family, `Shard`/`SingleShard`,
@@ -2195,8 +2195,8 @@ be silently dropped):
   HashMap<K, Guard>` sidecar pattern and proves the guard is dropped
   exactly once on normal reply, drain, caller-gone sweep, and failed
   admission.
-- `SharedWork<K, R>` is the new many-callers-per-key parking lot in
-  `tina_runtime::SharedWork`. Hard global cap, optional per-key cap, FIFO
+- `WaitList<K, R>` is the new many-callers-per-key parking lot in
+  `tina_runtime::wait_list`. Hard global cap, optional per-key cap, FIFO
   per key, ticketed `reply_one`, and `reply_all_clone` /
   `reply_all_with` / `close_all_clone` / `close_all_with` /
   `drain_all_with` for multi-waiter replies.
@@ -2554,7 +2554,7 @@ Hostile-review fixes:
 - Migrated system/specimen code including metrics shipping, bounded object
   lanes, and service shutdown paths to the copied helper shapes.
 
-### Compile-Time Safety Rails
+### Phase 100 Compile-Time Safety Rails
 
 - Added capability-typed addresses `tina::SendAddress<M>` and
   `tina::CallAddress<M, R>` so the wrong path becomes a compile error instead
@@ -2806,7 +2806,7 @@ Hostile-review fixes:
 - Migrated runtime, simulator, bridge crates, docs, and specimens to the new
   call-shaped service dispatch. Multi-turn services now carry
   `RequestContext` deliberately through continuation messages and finish with
-  `reply_to(...)`.
+  `reply_to_request(...)`.
 - Updated request/reply docs with the blessed multi-turn pattern so readers do
   not copy the old "runtime magically keeps caller context" bug.
 
@@ -4009,7 +4009,7 @@ API additions:
 - Rewrote the README into a shorter Tina-as-concurrency-primitive story with
   explicit inspiration links and current non-claims.
 
-### Initial Trait Surface
+### Phase Sputnik
 
 - Added the `tina` trait crate as the shared vocabulary layer.
 - Added `Isolate`, `Effect`, `Mailbox`, `Shard`, `Context`, `Address`,
@@ -4018,7 +4018,7 @@ API additions:
 - Added docs, compile-fail tests, and downstream-style integration tests for
   the trait surface.
 
-### Supervision Vocabulary And Bounded SPSC Mailbox
+### Phase Pioneer
 
 - Added shared supervision policy types in `tina`, including restart policy,
   restart-budget accounting, and child restart classification.
@@ -4032,7 +4032,7 @@ API additions:
   narrow and evidence-backed.
 - Documented the DST boundary and the runtime-enforced SPSC contract.
 
-### Initial Single-Shard Runtime
+### Phase Mariner
 
 - Added `tina-runtime`, a small in-progress runtime with a deterministic
   event trace and causal links.
@@ -4087,7 +4087,7 @@ API additions:
 - Added focused Miri coverage for the SPSC mailbox unsafe slot paths and a
   `make miri` target.
 - Added a runtime-owned call effect family at the `tina` boundary:
-  `Isolate::Io` associated type and `Effect::Io(I::Io)` variant.
+  `Isolate::Call` associated type and `Effect::Call(I::Call)` variant.
   Trait surface stays substrate-neutral; concrete request/result
   vocabulary lives in runtime crates.
 - Added runtime-owned child bootstrap on `ChildDefinition` and
@@ -4114,7 +4114,7 @@ API additions:
 - Added focused tests for the call effect path covering invalid resource
   ids and call-id monotonicity, plus a "no call effect" compile-only smoke
   test that shows existing isolates remain ergonomic with
-  `type Io = Infallible`.
+  `type Call = Infallible`.
 - Added an assertion-backed live `tcp_echo` integration test: listener
   isolate supervises a restartable connection-handler child spawned via
   `RestartableChildDefinition::with_initial_message`; bytes round-trip end-to-end on
