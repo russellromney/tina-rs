@@ -91,7 +91,7 @@ impl Isolate for Worker {
         reply: WorkerReply,
         send: Outbound<Infallible>,
         spawn: Infallible,
-        call: Infallible,
+        io: Infallible,
         shard: DemoShard,
     }
 
@@ -125,7 +125,7 @@ impl Isolate for Driver {
         reply: (),
         send: Outbound<Infallible>,
         spawn: Infallible,
-        call: RuntimeCall<DriverMsg>,
+        io: RuntimeCall<DriverMsg>,
         shard: DemoShard,
     }
 

@@ -544,7 +544,7 @@ message/reply/spawn isolates. The `tina` path defaults `Io =
 Infallible`, so `call(...).then(...)` will not type-check there.
 
 Do not fall back to a hand-written `impl Isolate` with
-`tina::isolate_types! { call: RuntimeCall<M>, ... }` just to use
+`tina::isolate_types! { io: RuntimeCall<M>, ... }` just to use
 `call(...)` — the runtime macro already does that for you.
 
 ### Registering isolates

@@ -110,7 +110,7 @@ impl Isolate for Pinger {
         reply: (),
         send: Outbound<PingMsg>,
         spawn: Infallible,
-        call: RuntimeCall<PingMsg>,
+        io: RuntimeCall<PingMsg>,
         shard: AppShard,
     }
 
