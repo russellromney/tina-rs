@@ -38,7 +38,7 @@ impl Isolate for Tiny {
     type Send = Outbound<Infallible>;
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
-    type Call = RuntimeCall<Msg>;
+    type Io = RuntimeCall<Msg>;
     type Fact = ::std::convert::Infallible;
     type Shard = ParityShard;
 

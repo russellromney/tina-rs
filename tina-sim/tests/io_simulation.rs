@@ -63,7 +63,7 @@ impl Isolate for Connection {
     type Send = Outbound<Infallible>;
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
-    type Call = RuntimeCall<ConnectionMsg>;
+    type Io = RuntimeCall<ConnectionMsg>;
     type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 
@@ -119,7 +119,7 @@ impl Isolate for Client {
     type Send = Outbound<Infallible>;
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
-    type Call = RuntimeCall<ClientMsg>;
+    type Io = RuntimeCall<ClientMsg>;
     type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 
@@ -129,7 +129,7 @@ impl Isolate for Client {
         _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
     ) -> Effect<Self> {
         match msg {
-            ClientMsg::Start(addr) => Effect::Call(RuntimeCall::new(
+            ClientMsg::Start(addr) => Effect::Io(RuntimeCall::new(
                 CallInput::TcpConnect { addr },
                 |result| match result {
                     CallOutput::TcpConnected {
@@ -144,7 +144,7 @@ impl Isolate for Client {
             ClientMsg::Connected(Ok((stream, _local_addr, _peer_addr))) => {
                 self.stream = Some(stream);
                 self.pending_write = std::mem::take(&mut self.payload);
-                Effect::Call(RuntimeCall::new(
+                Effect::Io(RuntimeCall::new(
                     CallInput::TcpWriteOwned {
                         stream,
                         bytes: std::mem::take(&mut self.pending_write),
@@ -161,7 +161,7 @@ impl Isolate for Client {
             ClientMsg::Wrote(Ok((mut bytes, count))) => {
                 let stream = self.stream.expect("stream set after connect");
                 if count >= bytes.len() {
-                    Effect::Call(RuntimeCall::new(
+                    Effect::Io(RuntimeCall::new(
                         CallInput::TcpReadBuf {
                             stream,
                             buffer: Vec::with_capacity(16),
@@ -177,7 +177,7 @@ impl Isolate for Client {
                     ))
                 } else {
                     bytes.drain(..count);
-                    Effect::Call(RuntimeCall::new(
+                    Effect::Io(RuntimeCall::new(
                         CallInput::TcpWriteOwned { stream, bytes },
                         |result| match result {
                             CallOutput::TcpWroteOwned { bytes, count } => {
@@ -192,7 +192,7 @@ impl Isolate for Client {
             ClientMsg::Read(Ok((buffer, len))) => {
                 *self.observed.lock().expect("observed mutex") = Some(buffer[..len].to_vec());
                 let stream = self.stream.expect("stream set after connect");
-                Effect::Call(RuntimeCall::new(
+                Effect::Io(RuntimeCall::new(
                     CallInput::TcpStreamClose { stream },
                     |result| match result {
                         CallOutput::TcpStreamClosed => ClientMsg::Closed(Ok(())),
@@ -236,7 +236,7 @@ impl Isolate for FileClient {
     type Send = Outbound<Infallible>;
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
-    type Call = RuntimeCall<FileClientMsg>;
+    type Io = RuntimeCall<FileClientMsg>;
     type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 
@@ -246,7 +246,7 @@ impl Isolate for FileClient {
         _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
     ) -> Effect<Self> {
         match msg {
-            FileClientMsg::Start { dir, path } => Effect::Call(RuntimeCall::new(
+            FileClientMsg::Start { dir, path } => Effect::Io(RuntimeCall::new(
                 CallInput::Mkdir {
                     path: dir,
                     mode: 0o755,
@@ -257,7 +257,7 @@ impl Isolate for FileClient {
                     other => panic!("unexpected mkdir result {other:?}"),
                 },
             )),
-            FileClientMsg::DirectoryMade(Ok(()), path) => Effect::Call(RuntimeCall::new(
+            FileClientMsg::DirectoryMade(Ok(()), path) => Effect::Io(RuntimeCall::new(
                 CallInput::FileOpen {
                     path,
                     options: FileOpenOptions {
@@ -275,7 +275,7 @@ impl Isolate for FileClient {
             )),
             FileClientMsg::Opened(Ok(file)) => {
                 self.file = Some(file);
-                Effect::Call(RuntimeCall::new(
+                Effect::Io(RuntimeCall::new(
                     CallInput::FileWriteAt {
                         file,
                         bytes: self.payload.clone(),
@@ -290,7 +290,7 @@ impl Isolate for FileClient {
             }
             FileClientMsg::Wrote(Ok(_)) => {
                 let file = self.file.expect("file set after open");
-                Effect::Call(RuntimeCall::new(
+                Effect::Io(RuntimeCall::new(
                     CallInput::FileFsync { file },
                     |result| match result {
                         CallOutput::FileSynced => FileClientMsg::Synced(Ok(())),
@@ -301,7 +301,7 @@ impl Isolate for FileClient {
             }
             FileClientMsg::Synced(Ok(())) => {
                 let file = self.file.expect("file set after open");
-                Effect::Call(RuntimeCall::new(
+                Effect::Io(RuntimeCall::new(
                     CallInput::FileSize { file },
                     |result| match result {
                         CallOutput::FileSize { size } => FileClientMsg::Sized(Ok(size)),
@@ -313,7 +313,7 @@ impl Isolate for FileClient {
             FileClientMsg::Sized(Ok(size)) => {
                 self.size = Some(size);
                 let file = self.file.expect("file set after open");
-                Effect::Call(RuntimeCall::new(
+                Effect::Io(RuntimeCall::new(
                     CallInput::FileReadAt {
                         file,
                         len: size as usize,
@@ -330,7 +330,7 @@ impl Isolate for FileClient {
                 let size = self.size.expect("size set before read");
                 *self.observed.lock().expect("file observed mutex") = Some((size, bytes));
                 let file = self.file.expect("file set after open");
-                Effect::Call(RuntimeCall::new(
+                Effect::Io(RuntimeCall::new(
                     CallInput::FileClose { file },
                     |result| match result {
                         CallOutput::FileClosed => FileClientMsg::Closed(Ok(())),
@@ -376,7 +376,7 @@ impl Isolate for UdpClient {
     type Send = Outbound<Infallible>;
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
-    type Call = RuntimeCall<UdpClientMsg>;
+    type Io = RuntimeCall<UdpClientMsg>;
     type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 
@@ -459,7 +459,7 @@ impl Isolate for DnsProbe {
     type Send = Outbound<Infallible>;
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
-    type Call = RuntimeCall<DnsProbeMsg>;
+    type Io = RuntimeCall<DnsProbeMsg>;
     type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 
@@ -520,7 +520,7 @@ impl Isolate for TlsProbe {
     type Send = Outbound<Infallible>;
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
-    type Call = RuntimeCall<TlsProbeMsg>;
+    type Io = RuntimeCall<TlsProbeMsg>;
     type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 
@@ -607,7 +607,7 @@ impl Isolate for TlsServerProbe {
     type Send = Outbound<Infallible>;
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
-    type Call = RuntimeCall<TlsServerProbeMsg>;
+    type Io = RuntimeCall<TlsServerProbeMsg>;
     type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 
@@ -681,7 +681,7 @@ impl Isolate for PathProbe {
     type Send = Outbound<Infallible>;
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
-    type Call = RuntimeCall<PathProbeMsg>;
+    type Io = RuntimeCall<PathProbeMsg>;
     type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 
@@ -771,7 +771,7 @@ impl Isolate for SignalProbe {
     type Send = Outbound<Infallible>;
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
-    type Call = RuntimeCall<SignalProbeMsg>;
+    type Io = RuntimeCall<SignalProbeMsg>;
     type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 
@@ -822,7 +822,7 @@ impl Isolate for ProcessProbe {
     type Send = Outbound<Infallible>;
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
-    type Call = RuntimeCall<ProcessProbeMsg>;
+    type Io = RuntimeCall<ProcessProbeMsg>;
     type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 
@@ -872,7 +872,7 @@ impl Isolate for UdpProbe {
     type Send = Outbound<Infallible>;
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
-    type Call = RuntimeCall<UdpProbeMsg>;
+    type Io = RuntimeCall<UdpProbeMsg>;
     type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 
@@ -930,7 +930,7 @@ impl Isolate for UdpProbe {
 }
 
 fn read_call(stream: StreamId, max_len: usize) -> Effect<Connection> {
-    Effect::Call(RuntimeCall::new(
+    Effect::Io(RuntimeCall::new(
         CallInput::TcpRead { stream, max_len },
         |result| match result {
             CallOutput::TcpRead { bytes } => ConnectionMsg::ReadCompleted(bytes),
@@ -941,7 +941,7 @@ fn read_call(stream: StreamId, max_len: usize) -> Effect<Connection> {
 }
 
 fn write_call(stream: StreamId, bytes: Vec<u8>) -> Effect<Connection> {
-    Effect::Call(RuntimeCall::new(
+    Effect::Io(RuntimeCall::new(
         CallInput::TcpWrite { stream, bytes },
         |result| match result {
             CallOutput::TcpWrote { count } => ConnectionMsg::WriteCompleted { count },
@@ -952,7 +952,7 @@ fn write_call(stream: StreamId, bytes: Vec<u8>) -> Effect<Connection> {
 }
 
 fn close_call(stream: StreamId) -> Effect<Connection> {
-    Effect::Call(RuntimeCall::new(
+    Effect::Io(RuntimeCall::new(
         CallInput::TcpStreamClose { stream },
         |result| match result {
             CallOutput::TcpStreamClosed => ConnectionMsg::StreamClosed,
@@ -995,7 +995,7 @@ impl Isolate for Listener {
     type Send = Outbound<ListenerMsg>;
     type Spawn = RestartableChildDefinition<Connection>;
     type SpawnObserved = std::convert::Infallible;
-    type Call = RuntimeCall<ListenerMsg>;
+    type Io = RuntimeCall<ListenerMsg>;
     type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 
@@ -1008,7 +1008,7 @@ impl Isolate for Listener {
             ListenerMsg::Bootstrap => {
                 self.self_addr = Some(ctx.me());
                 let addr = self.bind_addr;
-                Effect::Call(RuntimeCall::new(
+                Effect::Io(RuntimeCall::new(
                     CallInput::TcpBind { addr },
                     move |result| match result {
                         CallOutput::TcpBound {
@@ -1026,7 +1026,7 @@ impl Isolate for Listener {
             ListenerMsg::Bound { listener, addr } => {
                 self.listener = Some(listener);
                 *self.bound_addr_slot.lock().expect("bound addr mutex") = Some(addr);
-                Effect::Call(RuntimeCall::new(
+                Effect::Io(RuntimeCall::new(
                     CallInput::TcpAccept { listener },
                     |result| match result {
                         CallOutput::TcpAccepted { stream, .. } => ListenerMsg::Accepted { stream },
@@ -1037,7 +1037,7 @@ impl Isolate for Listener {
             }
             ListenerMsg::ReArmAccept => {
                 let listener = self.listener.expect("listener stored before re-arm");
-                Effect::Call(RuntimeCall::new(
+                Effect::Io(RuntimeCall::new(
                     CallInput::TcpAccept { listener },
                     |result| match result {
                         CallOutput::TcpAccepted { stream, .. } => ListenerMsg::Accepted { stream },
@@ -1073,7 +1073,7 @@ impl Isolate for Listener {
             }
             ListenerMsg::CloseListener => {
                 let listener = self.listener.expect("listener stored before close");
-                Effect::Call(RuntimeCall::new(
+                Effect::Io(RuntimeCall::new(
                     CallInput::TcpListenerClose { listener },
                     |result| match result {
                         CallOutput::TcpListenerClosed => ListenerMsg::ListenerClosed,
@@ -1110,7 +1110,7 @@ impl Isolate for Binder {
     type Send = Outbound<Infallible>;
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
-    type Call = RuntimeCall<BinderMsg>;
+    type Io = RuntimeCall<BinderMsg>;
     type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 
@@ -1122,7 +1122,7 @@ impl Isolate for Binder {
         match msg {
             BinderMsg::StartBind => {
                 let addr = self.bind_addr;
-                Effect::Call(RuntimeCall::new(
+                Effect::Io(RuntimeCall::new(
                     CallInput::TcpBind { addr },
                     move |result| match result {
                         CallOutput::TcpBound {
@@ -1165,7 +1165,7 @@ impl Isolate for Probe {
     type Send = Outbound<Infallible>;
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
-    type Call = RuntimeCall<ProbeMsg>;
+    type Io = RuntimeCall<ProbeMsg>;
     type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 
@@ -1175,7 +1175,7 @@ impl Isolate for Probe {
         _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
     ) -> Effect<Self> {
         match msg {
-            ProbeMsg::StartInvalidAccept => Effect::Call(RuntimeCall::new(
+            ProbeMsg::StartInvalidAccept => Effect::Io(RuntimeCall::new(
                 CallInput::TcpAccept {
                     listener: ListenerId::new(999),
                 },
@@ -1186,7 +1186,7 @@ impl Isolate for Probe {
                     other => panic!("expected invalid accept failure, got {other:?}"),
                 },
             )),
-            ProbeMsg::StartInvalidRead => Effect::Call(RuntimeCall::new(
+            ProbeMsg::StartInvalidRead => Effect::Io(RuntimeCall::new(
                 CallInput::TcpRead {
                     stream: StreamId::new(999),
                     max_len: 8,
@@ -1198,7 +1198,7 @@ impl Isolate for Probe {
                     other => panic!("expected invalid read failure, got {other:?}"),
                 },
             )),
-            ProbeMsg::StartInvalidFileOpen => Effect::Call(RuntimeCall::new(
+            ProbeMsg::StartInvalidFileOpen => Effect::Io(RuntimeCall::new(
                 CallInput::FileOpen {
                     path: PathBuf::from("/tmp/tina-sim-invalid-open.txt"),
                     options: FileOpenOptions {
@@ -1248,7 +1248,7 @@ impl Isolate for Waiter {
     type Send = Outbound<Infallible>;
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
-    type Call = RuntimeCall<WaiterMsg>;
+    type Io = RuntimeCall<WaiterMsg>;
     type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 
@@ -1258,7 +1258,7 @@ impl Isolate for Waiter {
         _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
     ) -> Effect<Self> {
         match msg {
-            WaiterMsg::StartAccept => Effect::Call(RuntimeCall::new(
+            WaiterMsg::StartAccept => Effect::Io(RuntimeCall::new(
                 CallInput::TcpAccept {
                     listener: self.listener,
                 },
@@ -1305,7 +1305,7 @@ impl Isolate for PeerAwareAcceptor {
     type Send = Outbound<Infallible>;
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
-    type Call = RuntimeCall<PeerAwareAcceptMsg>;
+    type Io = RuntimeCall<PeerAwareAcceptMsg>;
     type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 
@@ -1315,7 +1315,7 @@ impl Isolate for PeerAwareAcceptor {
         _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
     ) -> Effect<Self> {
         match msg {
-            PeerAwareAcceptMsg::StartAccept => Effect::Call(RuntimeCall::new(
+            PeerAwareAcceptMsg::StartAccept => Effect::Io(RuntimeCall::new(
                 CallInput::TcpAccept {
                     listener: self.listener,
                 },
@@ -1358,7 +1358,7 @@ impl Isolate for ReadProbe {
     type Send = Outbound<Infallible>;
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
-    type Call = RuntimeCall<ReadProbeMsg>;
+    type Io = RuntimeCall<ReadProbeMsg>;
     type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 
@@ -1368,7 +1368,7 @@ impl Isolate for ReadProbe {
         _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
     ) -> Effect<Self> {
         match msg {
-            ReadProbeMsg::StartRead => Effect::Call(RuntimeCall::new(
+            ReadProbeMsg::StartRead => Effect::Io(RuntimeCall::new(
                 CallInput::TcpRead {
                     stream: self.stream,
                     max_len: self.max_len,
@@ -1415,7 +1415,7 @@ impl Isolate for WriteProbe {
     type Send = Outbound<Infallible>;
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
-    type Call = RuntimeCall<WriteProbeMsg>;
+    type Io = RuntimeCall<WriteProbeMsg>;
     type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 
@@ -1425,7 +1425,7 @@ impl Isolate for WriteProbe {
         _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
     ) -> Effect<Self> {
         match msg {
-            WriteProbeMsg::StartWrite => Effect::Call(RuntimeCall::new(
+            WriteProbeMsg::StartWrite => Effect::Io(RuntimeCall::new(
                 CallInput::TcpWrite {
                     stream: self.stream,
                     bytes: self.bytes.clone(),
@@ -1469,7 +1469,7 @@ impl Isolate for ListenerCloser {
     type Send = Outbound<Infallible>;
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
-    type Call = RuntimeCall<CloserMsg>;
+    type Io = RuntimeCall<CloserMsg>;
     type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 
@@ -1479,7 +1479,7 @@ impl Isolate for ListenerCloser {
         _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
     ) -> Effect<Self> {
         match msg {
-            CloserMsg::CloseListener => Effect::Call(RuntimeCall::new(
+            CloserMsg::CloseListener => Effect::Io(RuntimeCall::new(
                 CallInput::TcpListenerClose {
                     listener: self.listener,
                 },
@@ -1508,7 +1508,7 @@ impl Isolate for StreamCloser {
     type Send = Outbound<Infallible>;
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
-    type Call = RuntimeCall<CloserMsg>;
+    type Io = RuntimeCall<CloserMsg>;
     type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 
@@ -1518,7 +1518,7 @@ impl Isolate for StreamCloser {
         _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
     ) -> Effect<Self> {
         match msg {
-            CloserMsg::CloseStream => Effect::Call(RuntimeCall::new(
+            CloserMsg::CloseStream => Effect::Io(RuntimeCall::new(
                 CallInput::TcpStreamClose {
                     stream: self.stream,
                 },

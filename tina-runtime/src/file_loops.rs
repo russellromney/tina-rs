@@ -121,7 +121,7 @@ impl FileReadChunks {
     /// `None` once the cap is reached.
     pub fn next_effect<I, M, F>(&self, on_progress: F) -> Option<tina::Effect<I>>
     where
-        I: Isolate<Message = M, Call = RuntimeCall<M>>,
+        I: Isolate<Message = M, Io = RuntimeCall<M>>,
         F: FnOnce(FileReadReply) -> M + Send + 'static,
         M: 'static,
     {
@@ -142,7 +142,7 @@ impl FileReadChunks {
         on_progress: F,
     ) -> FileLoopStep<I, Vec<u8>>
     where
-        I: Isolate<Message = M, Call = RuntimeCall<M>>,
+        I: Isolate<Message = M, Io = RuntimeCall<M>>,
         F: FnOnce(FileReadReply) -> M + Send + 'static,
         M: 'static,
     {
@@ -253,7 +253,7 @@ impl FileWriteAll {
     /// nothing is left to send.
     pub fn next_effect<I, M, F>(&self, on_progress: F) -> Option<tina::Effect<I>>
     where
-        I: Isolate<Message = M, Call = RuntimeCall<M>>,
+        I: Isolate<Message = M, Io = RuntimeCall<M>>,
         F: FnOnce(FileWriteReply) -> M + Send + 'static,
         M: 'static,
     {
@@ -268,7 +268,7 @@ impl FileWriteAll {
     /// non-empty buffer is treated as a stuck write.
     pub fn advance<I, M, F>(&mut self, reply: FileWriteReply, on_progress: F) -> FileLoopStep<I, ()>
     where
-        I: Isolate<Message = M, Call = RuntimeCall<M>>,
+        I: Isolate<Message = M, Io = RuntimeCall<M>>,
         F: FnOnce(FileWriteReply) -> M + Send + 'static,
         M: 'static,
     {
@@ -445,7 +445,7 @@ impl FileCopyBounded {
     /// [`CopyLeg::Read`]. Returns `None` otherwise.
     pub fn next_effect_read<I, M, F>(&self, on_progress: F) -> Option<tina::Effect<I>>
     where
-        I: Isolate<Message = M, Call = RuntimeCall<M>>,
+        I: Isolate<Message = M, Io = RuntimeCall<M>>,
         F: FnOnce(FileReadReply) -> M + Send + 'static,
         M: 'static,
     {
@@ -461,7 +461,7 @@ impl FileCopyBounded {
     /// is [`CopyLeg::Write`]. Returns `None` otherwise.
     pub fn next_effect_write<I, M, F>(&self, on_progress: F) -> Option<tina::Effect<I>>
     where
-        I: Isolate<Message = M, Call = RuntimeCall<M>>,
+        I: Isolate<Message = M, Io = RuntimeCall<M>>,
         F: FnOnce(FileWriteReply) -> M + Send + 'static,
         M: 'static,
     {
@@ -477,7 +477,7 @@ impl FileCopyBounded {
     /// when a service wants to branch manually.
     pub fn next_effect<I, M, FR, FW>(&self, on_read: FR, on_write: FW) -> Option<tina::Effect<I>>
     where
-        I: Isolate<Message = M, Call = RuntimeCall<M>>,
+        I: Isolate<Message = M, Io = RuntimeCall<M>>,
         FR: FnOnce(FileReadReply) -> M + Send + 'static,
         FW: FnOnce(FileWriteReply) -> M + Send + 'static,
         M: 'static,
@@ -498,7 +498,7 @@ impl FileCopyBounded {
         on_write: FW,
     ) -> FileCopyStep<I>
     where
-        I: Isolate<Message = M, Call = RuntimeCall<M>>,
+        I: Isolate<Message = M, Io = RuntimeCall<M>>,
         FR: FnOnce(FileReadReply) -> M + Send + 'static,
         FW: FnOnce(FileWriteReply) -> M + Send + 'static,
         M: 'static,
@@ -633,7 +633,7 @@ mod tests {
         type Send = ();
         type Spawn = std::convert::Infallible;
         type SpawnObserved = std::convert::Infallible;
-        type Call = RuntimeCall<Msg>;
+        type Io = RuntimeCall<Msg>;
         type Fact = ::std::convert::Infallible;
         type Shard = tina::SingleShard;
 

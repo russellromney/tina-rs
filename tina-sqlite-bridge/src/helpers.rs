@@ -185,7 +185,7 @@ impl ExecuteCall {
     #[deprecated(since = "0.1.0", note = "use `.then(...)` for ordinary continuations")]
     pub fn reply<I, F, M>(self, translator: F) -> Effect<I>
     where
-        I: Isolate<Message = M, Call = RuntimeCall<M>>,
+        I: Isolate<Message = M, Io = RuntimeCall<M>>,
         F: FnOnce(SqliteExecutedOutcome) -> M + 'static,
         M: 'static,
     {
@@ -195,7 +195,7 @@ impl ExecuteCall {
     /// Turn this prepared call into one continuation message.
     pub fn then<I, F, M>(self, translator: F) -> Effect<I>
     where
-        I: Isolate<Message = M, Call = RuntimeCall<M>>,
+        I: Isolate<Message = M, Io = RuntimeCall<M>>,
         F: FnOnce(SqliteExecutedOutcome) -> M + 'static,
         M: 'static,
     {
@@ -220,7 +220,7 @@ impl QueryCall {
     #[deprecated(since = "0.1.0", note = "use `.then(...)` for ordinary continuations")]
     pub fn reply<I, F, M>(self, translator: F) -> Effect<I>
     where
-        I: Isolate<Message = M, Call = RuntimeCall<M>>,
+        I: Isolate<Message = M, Io = RuntimeCall<M>>,
         F: FnOnce(SqliteRowsOutcome) -> M + 'static,
         M: 'static,
     {
@@ -230,7 +230,7 @@ impl QueryCall {
     /// Turn this prepared call into one continuation message.
     pub fn then<I, F, M>(self, translator: F) -> Effect<I>
     where
-        I: Isolate<Message = M, Call = RuntimeCall<M>>,
+        I: Isolate<Message = M, Io = RuntimeCall<M>>,
         F: FnOnce(SqliteRowsOutcome) -> M + 'static,
         M: 'static,
     {

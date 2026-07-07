@@ -20,7 +20,7 @@ impl Isolate for Sink {
     type Send = Outbound<SinkMsg>;
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
-    type Call = Infallible;
+    type Io = Infallible;
     type Fact = Infallible;
     type Shard = SingleShard;
 

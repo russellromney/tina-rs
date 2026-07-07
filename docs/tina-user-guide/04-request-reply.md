@@ -388,7 +388,7 @@ return admit; // child effect runs only after admission succeeded
 
 When the request dies (client disconnect, per-request deadline, owner
 stop), call `scope.cancel_into_effect(cause, translator)`. It returns a
-synchronous `ScopeCancelReport` and one batched `Effect::Call` cancel —
+synchronous `ScopeCancelReport` and one batched `Effect::Io` cancel —
 return it from the handler. Wrap that report, the post-removal
 `RequestScopeSetCapacityReport`, and any late-result / ignored-timer
 counts in a `ScopedRequestReport` so the request-level teardown is one

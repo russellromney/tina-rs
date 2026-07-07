@@ -257,7 +257,7 @@ struct PingClient {
 
 #[tina_runtime::isolate(
     message = ClientMsg,
-    call = tina_runtime::RuntimeCall<ClientMsg>,
+    io = tina_runtime::RuntimeCall<ClientMsg>,
     shard = CostShard
 )]
 impl PingClient {
@@ -301,7 +301,7 @@ struct TcpCostService {
 
 #[tina_runtime::isolate(
     message = TcpCostMsg,
-    call = tina_runtime::RuntimeCall<TcpCostMsg>,
+    io = tina_runtime::RuntimeCall<TcpCostMsg>,
     shard = CostShard
 )]
 impl TcpCostService {

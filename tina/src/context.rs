@@ -826,7 +826,7 @@ pub enum DeferredSlotState {
 /// #     type Send = Outbound<std::convert::Infallible>;
 /// #     type Spawn = std::convert::Infallible;
 /// #     type SpawnObserved = std::convert::Infallible;
-/// #     type Call = std::convert::Infallible;
+/// #     type Io = std::convert::Infallible;
 /// #     type Shard = tina::SingleShard;
 /// #     fn handle(&mut self, _: (), _: &mut tina::Context<'_, Self::Shard, Self::Reply>) -> Effect<Self> {
 /// #         tina::noop()

@@ -483,7 +483,7 @@ impl Isolate for TcpAcceptWorker {
         _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
     ) -> Effect<Self> {
         match msg {
-            TcpAcceptMsg::Bind => Effect::Call(RuntimeCall::new(
+            TcpAcceptMsg::Bind => Effect::Io(RuntimeCall::new(
                 CallInput::TcpBind {
                     addr: self.bind_addr,
                 },
@@ -503,7 +503,7 @@ impl Isolate for TcpAcceptWorker {
                 *self.published.lock().expect("published addr mutex") = Some(addr);
                 noop()
             }
-            TcpAcceptMsg::StartAccept => Effect::Call(RuntimeCall::new(
+            TcpAcceptMsg::StartAccept => Effect::Io(RuntimeCall::new(
                 CallInput::TcpAccept {
                     listener: self.listener.expect("listener bound before accept"),
                 },

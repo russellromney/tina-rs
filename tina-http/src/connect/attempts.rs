@@ -236,7 +236,7 @@ impl<R> ConnectAttempts<R> {
         translate: F,
     ) -> Result<Effect<I>, ConnectAttemptsError>
     where
-        I: Isolate<Message = M, Call = RuntimeCall<M>>,
+        I: Isolate<Message = M, Io = RuntimeCall<M>>,
         F: FnOnce(SocketAddr, CallGroupToken, CallOutcome<R>) -> M + 'static,
         M: 'static,
         T: Send + 'static,

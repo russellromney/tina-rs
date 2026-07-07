@@ -191,7 +191,7 @@ impl WebSocketMemberTable {
         I: Isolate<
                 Message = WebSocketSessionMsg,
                 Send = Outbound<HttpConnectionMsg>,
-                Call = RuntimeCall<WebSocketSessionMsg>,
+                Io = RuntimeCall<WebSocketSessionMsg>,
             >,
         F: Fn(WebSocketSessionHandle) -> HttpConnectionMsg,
     {
@@ -215,7 +215,7 @@ impl WebSocketMemberTable {
         I: Isolate<
                 Message = WebSocketSessionMsg,
                 Send = Outbound<HttpConnectionMsg>,
-                Call = RuntimeCall<WebSocketSessionMsg>,
+                Io = RuntimeCall<WebSocketSessionMsg>,
             >,
     {
         let text = text.into();
@@ -232,7 +232,7 @@ impl WebSocketMemberTable {
         I: Isolate<
                 Message = WebSocketSessionMsg,
                 Send = Outbound<HttpConnectionMsg>,
-                Call = RuntimeCall<WebSocketSessionMsg>,
+                Io = RuntimeCall<WebSocketSessionMsg>,
             >,
     {
         let bytes = bytes.into();
@@ -252,7 +252,7 @@ impl WebSocketMemberTable {
         I: Isolate<
                 Message = WebSocketSessionMsg,
                 Send = Outbound<HttpConnectionMsg>,
-                Call = RuntimeCall<WebSocketSessionMsg>,
+                Io = RuntimeCall<WebSocketSessionMsg>,
             >,
     {
         let reason = reason.into();

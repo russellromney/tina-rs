@@ -22,7 +22,7 @@ struct IsolateArgs {
     spawn: Option<Type>,
     spawn_observed: Option<Type>,
     spawn_observed_remote: Option<Type>,
-    call: Option<Type>,
+    io: Option<Type>,
     fact: Option<Type>,
     shard: Option<Type>,
     tina_crate: Option<Path>,
@@ -41,7 +41,7 @@ impl Parse for IsolateArgs {
             spawn: None,
             spawn_observed: None,
             spawn_observed_remote: None,
-            call: None,
+            io: None,
             fact: None,
             shard: None,
             tina_crate: None,
@@ -102,13 +102,13 @@ impl Parse for IsolateArgs {
                         value,
                         "spawn_observed_remote",
                     )?,
-                    "call" => set_once(&mut args.call, value, "call")?,
+                    "io" => set_once(&mut args.io, value, "io")?,
                     "fact" => set_once(&mut args.fact, value, "fact")?,
                     "shard" => set_once(&mut args.shard, value, "shard")?,
                     _ => {
                         return Err(Error::new_spanned(
                             key,
-                            "expected one of: message, event, request, reply, send, spawn, spawn_observed, spawn_observed_remote, call, fact, shard, tina_crate, runtime_crate, send_only",
+                            "expected one of: message, event, request, reply, send, spawn, spawn_observed, spawn_observed_remote, io, fact, shard, tina_crate, runtime_crate, send_only",
                         ));
                     }
                 }
@@ -149,31 +149,31 @@ fn set_once_path(slot: &mut Option<Path>, value: Path, name: &str) -> Result<()>
 
 #[proc_macro_attribute]
 pub fn isolate(args: TokenStream, input: TokenStream) -> TokenStream {
-    expand_isolate(args, input, CallDefault::Infallible)
+    expand_isolate(args, input, IoDefault::Infallible)
 }
 
-/// Like [`isolate`], but the call channel defaults to `RuntimeCall<Message>`.
+/// Like [`isolate`], but the I/O payload defaults to `RuntimeCall<Message>`.
 ///
 /// The expansion still roots the rest of the authoring vocabulary
 /// (`Isolate`, `Effect`, `Context`, ...) at `::tina`, so the using crate must
-/// depend on `tina` and have it reachable as `::tina`. Only the call channel
+/// depend on `tina` and have it reachable as `::tina`. Only the I/O payload
 /// is rooted at `::tina_runtime`. Override with `tina_crate = ...` /
 /// `runtime_crate = ...` when the crate names differ.
 #[proc_macro_attribute]
 pub fn runtime_isolate(args: TokenStream, input: TokenStream) -> TokenStream {
-    expand_isolate(args, input, CallDefault::RuntimeCall)
+    expand_isolate(args, input, IoDefault::RuntimeCall)
 }
 
-enum CallDefault {
+enum IoDefault {
     Infallible,
     RuntimeCall,
 }
 
-fn expand_isolate(args: TokenStream, input: TokenStream, call_default: CallDefault) -> TokenStream {
+fn expand_isolate(args: TokenStream, input: TokenStream, io_default: IoDefault) -> TokenStream {
     let args = parse_macro_input!(args as IsolateArgs);
     let mut item = parse_macro_input!(input as ItemImpl);
 
-    match build_isolate(&mut item, args, call_default) {
+    match build_isolate(&mut item, args, io_default) {
         Ok(tokens) => tokens.into(),
         Err(error) => error.into_compile_error().into(),
     }
@@ -182,7 +182,7 @@ fn expand_isolate(args: TokenStream, input: TokenStream, call_default: CallDefau
 fn build_isolate(
     item: &mut ItemImpl,
     args: IsolateArgs,
-    call_default: CallDefault,
+    io_default: IoDefault,
 ) -> Result<proc_macro2::TokenStream> {
     if item.trait_.is_some() {
         return Err(Error::new_spanned(
@@ -251,10 +251,10 @@ fn build_isolate(
                 "`send_only` isolates must not declare a `reply` (the reply type is forced to `()`)",
             ));
         }
-        if args.call.is_some() {
+        if args.io.is_some() {
             return Err(Error::new_spanned(
                 send_only,
-                "`send_only` isolates must not declare a `call` channel",
+                "`send_only` isolates must not declare an `io` channel",
             ));
         }
     }
@@ -272,11 +272,11 @@ fn build_isolate(
     let spawn_observed_remote = args
         .spawn_observed_remote
         .unwrap_or_else(|| syn::parse_quote!(::core::convert::Infallible));
-    let call = match args.call {
-        Some(call) => call,
-        None => match call_default {
-            CallDefault::Infallible => syn::parse_quote!(::core::convert::Infallible),
-            CallDefault::RuntimeCall => syn::parse_quote!(#runtime_crate::RuntimeCall<#message>),
+    let io = match args.io {
+        Some(io) => io,
+        None => match io_default {
+            IoDefault::Infallible => syn::parse_quote!(::core::convert::Infallible),
+            IoDefault::RuntimeCall => syn::parse_quote!(#runtime_crate::RuntimeCall<#message>),
         },
     };
     let fact = args
@@ -446,7 +446,7 @@ fn build_isolate(
             type Spawn = #spawn;
             type SpawnObserved = #spawn_observed;
             type SpawnObservedRemote = #spawn_observed_remote;
-            type Call = #call;
+            type Io = #io;
             type Fact = #fact;
             type Shard = #shard;
 

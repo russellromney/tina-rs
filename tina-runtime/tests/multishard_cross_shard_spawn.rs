@@ -44,7 +44,7 @@ impl Isolate for CrossChild {
     type Send = Outbound<Infallible>;
     type Spawn = Infallible;
     type SpawnObserved = Infallible;
-    type Call = RuntimeCall<Self::Message>;
+    type Io = RuntimeCall<Self::Message>;
     type Fact = Infallible;
     type Shard = CrossShard;
 

@@ -34,7 +34,7 @@ enum SessionCallOutput {
 }
 
 /// Backend-shape Call type a downstream consumer might define inside a runtime
-/// crate. The trait crate only requires `Isolate::Call` to exist; the shape
+/// crate. The trait crate only requires `Isolate::Io` to exist; the shape
 /// here exercises the "translator inside the call payload" design.
 struct SessionCall {
     request: SessionCallInput,
@@ -136,7 +136,7 @@ impl Isolate for Session {
             SessionEvent::Stop => stop(),
             SessionEvent::RestartWorkers => restart_children(),
             SessionEvent::Ignore => noop(),
-            SessionEvent::StartIo(request) => Effect::Call(SessionCall {
+            SessionEvent::StartIo(request) => Effect::Io(SessionCall {
                 request,
                 translator: Box::new(SessionEvent::IoCompleted),
             }),
@@ -276,7 +276,7 @@ fn downstream_consumer_can_define_isolates_and_observe_all_effect_kinds() {
     // message" design without making the handler async.
     let call_request = SessionCallInput::Greet("hello".to_owned());
     match session.handle(SessionEvent::StartIo(call_request.clone()), &mut ctx) {
-        Effect::Call(call) => {
+        Effect::Io(call) => {
             assert_eq!(call.request, call_request);
             let later = (call.translator)(SessionCallOutput::Greeted("hello back".to_owned()));
             assert_eq!(

@@ -226,7 +226,7 @@ where
     type Send = Outbound<Infallible>;
     type Spawn = Infallible;
     type SpawnObserved = Infallible;
-    type Call = RuntimeCall<ServiceCall>;
+    type Io = RuntimeCall<ServiceCall>;
     type Fact = ::std::convert::Infallible;
     type Shard = S;
 
@@ -528,7 +528,7 @@ mod tests {
     #[test]
     fn single_service_emits_only_reply_no_call_or_send() {
         // Lock the contract: SingleService must return Effect::Reply
-        // and never an Effect::Call (which would mean a runtime hop)
+        // and never an Effect::Io (which would mean a runtime hop)
         // or Effect::Send (which would route bytes elsewhere). A
         // future change that makes handlers async-capable should
         // change this test deliberately, not silently.

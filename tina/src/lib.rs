@@ -261,7 +261,7 @@ macro_rules! isolate_types {
         type Spawn = $spawn;
         type SpawnObserved = $spawn_observed;
         type SpawnObservedRemote = $spawn_observed_remote;
-        type Call = $call;
+        type Io = $call;
         type Fact = $fact;
         type Shard = $shard;
     };
@@ -280,7 +280,7 @@ macro_rules! isolate_types {
         type Send = $send;
         type Spawn = $spawn;
         type SpawnObserved = $spawn_observed;
-        type Call = $call;
+        type Io = $call;
         type Fact = $fact;
         type Shard = $shard;
     };

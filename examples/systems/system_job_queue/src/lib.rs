@@ -220,7 +220,7 @@ struct Queue {
     message = QueueMsg,
     reply = QueueReply,
     send = tina::Outbound<WorkerMsg>,
-    call = tina_runtime::RuntimeCall<QueueMsg>,
+    io = tina_runtime::RuntimeCall<QueueMsg>,
     spawn_observed = tina::SpawnObserved<ChildDefinition<Worker>, QueueMsg, WorkerMsg, WorkerReply>,
 )]
 impl Queue {

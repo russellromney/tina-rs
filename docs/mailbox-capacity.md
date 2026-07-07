@@ -36,7 +36,7 @@ For an isolate `A` with mailbox capacity `cap`:
 What does **not** count:
 
 - Effects `A` returns to the runtime (`Effect::Send`, `Effect::Spawn`,
-  `Effect::Call`, ...). Those are interpreted by the runtime; they do not
+  `Effect::Io`, ...). Those are interpreted by the runtime; they do not
   re-enter `A`'s own mailbox.
 - Messages `A` sends to *other* isolates. They go in the *target's*
   mailbox.

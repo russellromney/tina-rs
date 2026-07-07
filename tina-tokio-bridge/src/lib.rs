@@ -436,7 +436,7 @@ where
     type Send = I::Send;
     type Spawn = I::Spawn;
     type SpawnObserved = std::convert::Infallible;
-    type Call = I::Call;
+    type Io = I::Io;
     type Fact = I::Fact;
     type Shard = I::Shard;
 
@@ -471,7 +471,7 @@ where
         tina::Effect::StopWith(result) => tina::Effect::StopWith(result),
         tina::Effect::RestartChildren => tina::Effect::RestartChildren,
         tina::Effect::StopChildren => tina::Effect::StopChildren,
-        tina::Effect::Call(call) => tina::Effect::Call(call),
+        tina::Effect::Io(call) => tina::Effect::Io(call),
         tina::Effect::Batch(effects) => {
             tina::Effect::Batch(effects.into_iter().map(remap_effect).collect())
         }
@@ -680,7 +680,7 @@ where
             + 'static,
         I::Message: BridgeMessage + From<BridgeRequest<M, R>> + Send + 'static,
         I::Reply: Send + 'static,
-        I::Call: IntoErasedCall<I::Message> + 'static,
+        I::Io: IntoErasedCall<I::Message> + 'static,
         I::Fact: tina_runtime::IntoRuntimeFact + 'static,
         M: Send + 'static,
         R: Send + 'static,

@@ -693,7 +693,7 @@ pub fn effect_kind_name(kind: EffectKind) -> &'static str {
         EffectKind::SpawnObservedOn => "spawn_observed_on",
         EffectKind::StopWith => "stop_with",
         EffectKind::RestartChildren => "restart_children",
-        EffectKind::Call => "call",
+        EffectKind::Io => "io",
         EffectKind::Batch => "batch",
         EffectKind::ReplyTo => "reply_to",
         EffectKind::Reject => "reject",

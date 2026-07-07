@@ -67,7 +67,7 @@ impl Isolate for AdminServer {
     type Send = Outbound<Infallible>;
     type Spawn = Infallible;
     type SpawnObserved = Infallible;
-    type Call = RuntimeCall<ServerMsg>;
+    type Io = RuntimeCall<ServerMsg>;
     type Fact = Infallible;
     type Shard = AdminShard;
 
@@ -197,7 +197,7 @@ impl Isolate for AdminClient {
     type Send = Outbound<Infallible>;
     type Spawn = Infallible;
     type SpawnObserved = Infallible;
-    type Call = RuntimeCall<ClientMsg>;
+    type Io = RuntimeCall<ClientMsg>;
     type Fact = Infallible;
     type Shard = AdminShard;
 

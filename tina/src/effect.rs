@@ -102,7 +102,7 @@ where
     /// isolate only ever sees opaque ids inside its own message vocabulary.
     /// Completion is delivered as a regular later-turn `Message`, never as
     /// a second handler entry point.
-    Call(I::Call),
+    Io(I::Io),
 
     /// Execute several existing effects in deterministic left-to-right order.
     ///
@@ -349,7 +349,7 @@ where
 /// #     type Send = Outbound<std::convert::Infallible>;
 /// #     type Spawn = std::convert::Infallible;
 /// #     type SpawnObserved = std::convert::Infallible;
-/// #     type Call = std::convert::Infallible;
+/// #     type Io = std::convert::Infallible;
 /// #     type Shard = tina::SingleShard;
 /// #     fn handle(&mut self, _: (), _: &mut tina::Context<'_, Self::Shard, Self::Reply>) -> Effect<Self> {
 /// #         tina::noop()

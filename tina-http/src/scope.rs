@@ -87,7 +87,7 @@ pub fn scoped_operation<I, M, R, Msg, F>(
     on_outcome: F,
 ) -> Result<Effect<I>, ScopedRailRejected>
 where
-    I: Isolate<Message = Msg, Call = RuntimeCall<Msg>>,
+    I: Isolate<Message = Msg, Io = RuntimeCall<Msg>>,
     M: Send + 'static,
     R: 'static,
     F: FnOnce(CallOutcome<R>) -> Msg + 'static,
@@ -127,7 +127,7 @@ pub fn scoped_request_body_pull<I, Msg, F>(
     on_chunk: F,
 ) -> Result<Effect<I>, ScopedRailRejected>
 where
-    I: Isolate<Message = Msg, Call = RuntimeCall<Msg>>,
+    I: Isolate<Message = Msg, Io = RuntimeCall<Msg>>,
     F: FnOnce(CallOutcome<RequestChunkReply>) -> Msg + 'static,
     Msg: 'static,
 {
@@ -152,7 +152,7 @@ pub fn scoped_websocket_send<I, Msg, F>(
     on_outcome: F,
 ) -> Result<Effect<I>, ScopedRailRejected>
 where
-    I: Isolate<Message = Msg, Call = RuntimeCall<Msg>>,
+    I: Isolate<Message = Msg, Io = RuntimeCall<Msg>>,
     F: FnOnce(CallOutcome<RequestChunkReply>) -> Msg + 'static,
     Msg: 'static,
 {
@@ -176,7 +176,7 @@ pub fn scoped_websocket_report<I, Msg, F>(
     on_outcome: F,
 ) -> Result<Effect<I>, ScopedRailRejected>
 where
-    I: Isolate<Message = Msg, Call = RuntimeCall<Msg>>,
+    I: Isolate<Message = Msg, Io = RuntimeCall<Msg>>,
     F: FnOnce(CallOutcome<RequestChunkReply>) -> Msg + 'static,
     Msg: 'static,
 {
@@ -203,7 +203,7 @@ pub fn scoped_websocket_close<I, Msg, F>(
     on_outcome: F,
 ) -> Result<Effect<I>, ScopedRailRejected>
 where
-    I: Isolate<Message = Msg, Call = RuntimeCall<Msg>>,
+    I: Isolate<Message = Msg, Io = RuntimeCall<Msg>>,
     F: FnOnce(CallOutcome<RequestChunkReply>) -> Msg + 'static,
     Msg: 'static,
 {
@@ -230,7 +230,7 @@ pub fn scoped_grpc_unary<I, Msg, F>(
     on_outcome: F,
 ) -> Result<Effect<I>, ScopedRailRejected>
 where
-    I: Isolate<Message = Msg, Call = RuntimeCall<Msg>>,
+    I: Isolate<Message = Msg, Io = RuntimeCall<Msg>>,
     F: FnOnce(CallOutcome<Http2ClientReply>) -> Msg + 'static,
     Msg: 'static,
 {
@@ -251,7 +251,7 @@ pub fn cancel_response_source<I, F, M>(
     translator: F,
 ) -> Effect<I>
 where
-    I: Isolate<Message = M, Call = RuntimeCall<M>>,
+    I: Isolate<Message = M, Io = RuntimeCall<M>>,
     F: FnOnce(CallOutcome<ResponseChunkReply>) -> M + 'static,
     M: 'static,
 {

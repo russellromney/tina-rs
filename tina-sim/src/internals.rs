@@ -565,7 +565,7 @@ where
 
 impl<I, S, Msg, Outbound> ErasedHandler<S> for HandlerAdapter<I, Outbound>
 where
-    I: Isolate<Message = Msg, Shard = S, Send = TinaOutbound<Outbound>, Call = RuntimeCall<Msg>>
+    I: Isolate<Message = Msg, Shard = S, Send = TinaOutbound<Outbound>, Io = RuntimeCall<Msg>>
         + 'static,
     I::Spawn: IntoErasedSpawn<S> + 'static,
     I::SpawnObserved: IntoErasedSpawnObserved<S, I::Message> + 'static,
@@ -624,7 +624,7 @@ where
 
 pub(crate) fn erase_effect<I, S, Msg, Outbound>(effect: Effect<I>) -> ErasedEffect<S>
 where
-    I: Isolate<Message = Msg, Shard = S, Send = TinaOutbound<Outbound>, Call = RuntimeCall<Msg>>
+    I: Isolate<Message = Msg, Shard = S, Send = TinaOutbound<Outbound>, Io = RuntimeCall<Msg>>
         + 'static,
     I::Spawn: IntoErasedSpawn<S> + 'static,
     I::SpawnObserved: IntoErasedSpawnObserved<S, I::Message> + 'static,
@@ -663,8 +663,8 @@ where
         Effect::StopWith(_) => ErasedEffect::StopWith,
         Effect::RestartChildren => ErasedEffect::RestartChildren,
         Effect::StopChildren => ErasedEffect::StopChildren,
-        Effect::Call(call) => {
-            let call = match call.into_runtime_parts() {
+        Effect::Io(call) => {
+            let io = match call.into_runtime_parts() {
                 RuntimeCallParts::Backend {
                     request,
                     translator,
@@ -742,7 +742,7 @@ where
                     },
                 },
             };
-            ErasedEffect::Call(call)
+            ErasedEffect::Io(io)
         }
         Effect::Batch(effects) => ErasedEffect::Batch(
             effects
@@ -805,7 +805,7 @@ where
     StopWith,
     RestartChildren,
     StopChildren,
-    Call(ErasedCall),
+    Io(ErasedCall),
     Batch(Vec<ErasedEffect<S>>),
     ReplyTo {
         handle: DeferredReplyHandle,
@@ -832,7 +832,7 @@ where
             Self::StopWith => EffectKind::StopWith,
             Self::RestartChildren => EffectKind::RestartChildren,
             Self::StopChildren => EffectKind::StopChildren,
-            Self::Call(_) => EffectKind::Call,
+            Self::Io(_) => EffectKind::Io,
             Self::Batch(_) => EffectKind::Batch,
             Self::ReplyTo { .. } => EffectKind::ReplyTo,
             Self::Fact(_) => EffectKind::Fact,

@@ -681,14 +681,14 @@ marker trait implemented only for `RuntimeCall<M>`, decorated with
 `#[diagnostic::on_unimplemented]` that names the fix
 ("switch the attribute to `#[tina_runtime::isolate(...)]`"). Simulator
 registration surfaces (`Simulator::register*`,
-`MultiShardSimulator::register*_on`) carry the bound, so a `Call =
+`MultiShardSimulator::register*_on`) carry the bound, so a `Io =
 Infallible` isolate now produces a clear "the trait `RuntimeCallable` is
 not implemented for `Infallible`" diagnostic.
 
 
 
-`#[tina::isolate(...)]` wires `Call = Infallible`. `#[tina_runtime::isolate(...)]`
-wires `Call = RuntimeCall<Msg>`. The simulator requires the latter,
+`#[tina::isolate(...)]` wires `Io = Infallible`. `#[tina_runtime::isolate(...)]`
+wires `Io = RuntimeCall<Msg>`. The simulator requires the latter,
 and the failure mode is a generic-bound mismatch in the type checker,
 not a comprehensible diagnostic.
 

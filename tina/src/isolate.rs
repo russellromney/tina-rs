@@ -62,18 +62,18 @@ pub trait Isolate: Sized {
     /// hand-written impl.
     type SpawnObservedRemote = core::convert::Infallible;
 
-    /// The payload produced by [`Effect::Call`].
+    /// The payload produced by [`Effect::Io`].
     ///
-    /// A call describes one runtime-owned external operation (TCP I/O,
+    /// I/O describes one runtime-owned external operation (TCP,
     /// timers, future file I/O, child-process spawn, etc.) plus the
     /// information needed to turn the runtime's later result back into one
     /// ordinary [`Self::Message`] for this isolate. The trait crate stays
     /// substrate-neutral here: concrete request and result vocabularies
     /// belong to runtime crates, not to `tina`.
     ///
-    /// Use [`std::convert::Infallible`] when an isolate never issues call
+    /// Use [`std::convert::Infallible`] when an isolate never issues I/O
     /// effects.
-    type Call;
+    type Io;
 
     /// The payload produced by [`Effect::Fact`].
     ///

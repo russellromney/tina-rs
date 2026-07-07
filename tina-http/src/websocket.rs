@@ -186,7 +186,7 @@ impl WebSocketSessionHandle {
     /// stream and translates runtime `Full` / `Closed` / `Timeout` plus
     /// session-owner admission into [`WebSocketSessionMsg::SendOutcome`].
     pub fn send_effect<
-        I: Isolate<Message = WebSocketSessionMsg, Call = RuntimeCall<WebSocketSessionMsg>>,
+        I: Isolate<Message = WebSocketSessionMsg, Io = RuntimeCall<WebSocketSessionMsg>>,
     >(
         self,
         message: WebSocketMessage,
@@ -201,7 +201,7 @@ impl WebSocketSessionHandle {
     }
 
     pub fn text_effect<
-        I: Isolate<Message = WebSocketSessionMsg, Call = RuntimeCall<WebSocketSessionMsg>>,
+        I: Isolate<Message = WebSocketSessionMsg, Io = RuntimeCall<WebSocketSessionMsg>>,
     >(
         self,
         text: impl Into<String>,
@@ -211,7 +211,7 @@ impl WebSocketSessionHandle {
     }
 
     pub fn binary_effect<
-        I: Isolate<Message = WebSocketSessionMsg, Call = RuntimeCall<WebSocketSessionMsg>>,
+        I: Isolate<Message = WebSocketSessionMsg, Io = RuntimeCall<WebSocketSessionMsg>>,
     >(
         self,
         bytes: impl Into<Vec<u8>>,
@@ -221,7 +221,7 @@ impl WebSocketSessionHandle {
     }
 
     pub fn close_effect<
-        I: Isolate<Message = WebSocketSessionMsg, Call = RuntimeCall<WebSocketSessionMsg>>,
+        I: Isolate<Message = WebSocketSessionMsg, Io = RuntimeCall<WebSocketSessionMsg>>,
     >(
         self,
         code: Option<WebSocketCloseCode>,
@@ -238,7 +238,7 @@ impl WebSocketSessionHandle {
     /// queued outbound pressure. The returned snapshot is intentionally narrow:
     /// it is not a metrics feed, room report, or event log.
     pub fn report_effect<
-        I: Isolate<Message = WebSocketSessionMsg, Call = RuntimeCall<WebSocketSessionMsg>>,
+        I: Isolate<Message = WebSocketSessionMsg, Io = RuntimeCall<WebSocketSessionMsg>>,
     >(
         self,
         timeout: Duration,

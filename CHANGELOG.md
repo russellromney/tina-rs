@@ -4073,7 +4073,7 @@ API additions:
 - Added focused Miri coverage for the SPSC mailbox unsafe slot paths and a
   `make miri` target.
 - Added a runtime-owned call effect family at the `tina` boundary:
-  `Isolate::Call` associated type and `Effect::Call(I::Call)` variant.
+  `Isolate::Io` associated type and `Effect::Io(I::Io)` variant.
   Trait surface stays substrate-neutral; concrete request/result
   vocabulary lives in runtime crates.
 - Added runtime-owned child bootstrap on `ChildDefinition` and
@@ -4100,7 +4100,7 @@ API additions:
 - Added focused tests for the call effect path covering invalid resource
   ids and call-id monotonicity, plus a "no call effect" compile-only smoke
   test that shows existing isolates remain ergonomic with
-  `type Call = Infallible`.
+  `type Io = Infallible`.
 - Added an assertion-backed live `tcp_echo` integration test: listener
   isolate supervises a restartable connection-handler child spawned via
   `RestartableChildDefinition::with_initial_message`; bytes round-trip end-to-end on

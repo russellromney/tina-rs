@@ -47,7 +47,7 @@ impl Isolate for Sleeper {
     type Send = Outbound<TimerMsg>;
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
-    type Call = RuntimeCall<TimerMsg>;
+    type Io = RuntimeCall<TimerMsg>;
     type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 
@@ -57,7 +57,7 @@ impl Isolate for Sleeper {
         _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
     ) -> Effect<Self> {
         match msg {
-            TimerMsg::Start => Effect::Call(RuntimeCall::new(
+            TimerMsg::Start => Effect::Io(RuntimeCall::new(
                 CallInput::Sleep { after: self.delay },
                 |result| match result {
                     CallOutput::TimerFired => TimerMsg::Fired,
@@ -65,7 +65,7 @@ impl Isolate for Sleeper {
                 },
             )),
             TimerMsg::StartAndStop => Effect::Batch(vec![
-                Effect::Call(RuntimeCall::new(
+                Effect::Io(RuntimeCall::new(
                     CallInput::Sleep { after: self.delay },
                     |result| match result {
                         CallOutput::TimerFired => TimerMsg::Fired,
@@ -74,21 +74,21 @@ impl Isolate for Sleeper {
                 )),
                 Effect::Stop,
             ]),
-            TimerMsg::TerminalStop => Effect::Call(RuntimeCall::new_with_completion(
+            TimerMsg::TerminalStop => Effect::Io(RuntimeCall::new_with_completion(
                 CallInput::Sleep { after: self.delay },
                 |result| match result {
                     CallOutput::TimerFired => RuntimeCallCompletion::StopRequester,
                     other => RuntimeCallCompletion::Message(unexpected_timer_completion(other)),
                 },
             )),
-            TimerMsg::TerminalNoop => Effect::Call(RuntimeCall::new_with_completion(
+            TimerMsg::TerminalNoop => Effect::Io(RuntimeCall::new_with_completion(
                 CallInput::Sleep { after: self.delay },
                 |result| match result {
                     CallOutput::TimerFired => RuntimeCallCompletion::Noop,
                     other => RuntimeCallCompletion::Message(unexpected_timer_completion(other)),
                 },
             )),
-            TimerMsg::BadStreamNoop => Effect::Call(RuntimeCall::new_with_completion(
+            TimerMsg::BadStreamNoop => Effect::Io(RuntimeCall::new_with_completion(
                 CallInput::TcpStreamClose {
                     stream: StreamId::new(999_999),
                 },
@@ -121,7 +121,7 @@ impl Isolate for OrderingSleeper {
     type Send = Outbound<OrderingMsg>;
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
-    type Call = RuntimeCall<OrderingMsg>;
+    type Io = RuntimeCall<OrderingMsg>;
     type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 
@@ -133,7 +133,7 @@ impl Isolate for OrderingSleeper {
         match msg {
             OrderingMsg::Start => {
                 let label = self.label;
-                Effect::Call(RuntimeCall::new(
+                Effect::Io(RuntimeCall::new(
                     CallInput::Sleep { after: self.delay },
                     move |_| OrderingMsg::Fired(label),
                 ))
@@ -569,7 +569,7 @@ impl Isolate for HelperIntervalSleeper {
     type Send = Outbound<HelperIntervalMsg>;
     type Spawn = Infallible;
     type SpawnObserved = Infallible;
-    type Call = RuntimeCall<HelperIntervalMsg>;
+    type Io = RuntimeCall<HelperIntervalMsg>;
     type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 

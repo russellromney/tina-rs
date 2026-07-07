@@ -73,7 +73,7 @@ struct Worker {
 #[tina_runtime::isolate(
     message = WorkerMsg,
     reply = WorkerReply,
-    call = tina_runtime::RuntimeCall<WorkerMsg>,
+    io = tina_runtime::RuntimeCall<WorkerMsg>,
     shard = DstShard
 )]
 impl Worker {
@@ -192,7 +192,7 @@ struct Router {
 
 #[tina_runtime::isolate(
     message = RouterMsg,
-    call = tina_runtime::RuntimeCall<RouterMsg>,
+    io = tina_runtime::RuntimeCall<RouterMsg>,
     shard = DstShard
 )]
 impl Router {

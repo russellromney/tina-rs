@@ -681,7 +681,7 @@ impl Isolate for LowLevelWorker {
         _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
     ) -> Effect<Self> {
         match msg {
-            LowLevelEvent::Start => Effect::Call(RuntimeCall::map_result(
+            LowLevelEvent::Start => Effect::Io(RuntimeCall::map_result(
                 CallInput::Sleep {
                     after: Duration::from_millis(3),
                 },

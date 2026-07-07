@@ -480,7 +480,7 @@ impl Isolate for TimerClient {
         _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
     ) -> Effect<Self> {
         match msg {
-            TimerMsg::Start => Effect::Call(RuntimeCall::new(
+            TimerMsg::Start => Effect::Io(RuntimeCall::new(
                 CallInput::Sleep {
                     after: Duration::ZERO,
                 },
@@ -510,7 +510,7 @@ impl Isolate for TcpCostClient {
         _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
     ) -> Effect<Self> {
         match msg {
-            TcpCostMsg::Bind => Effect::Call(RuntimeCall::new(
+            TcpCostMsg::Bind => Effect::Io(RuntimeCall::new(
                 CallInput::TcpBind {
                     addr: self.bind_addr,
                 },
@@ -530,7 +530,7 @@ impl Isolate for TcpCostClient {
                 *self.addr_slot.borrow_mut() = Some(addr);
                 noop()
             }
-            TcpCostMsg::Accept => Effect::Call(RuntimeCall::new(
+            TcpCostMsg::Accept => Effect::Io(RuntimeCall::new(
                 CallInput::TcpAccept {
                     listener: self.listener.expect("listener bound before accept"),
                 },
@@ -544,7 +544,7 @@ impl Isolate for TcpCostClient {
                 self.stream_slot.set(Some(stream));
                 noop()
             }
-            TcpCostMsg::Read => Effect::Call(RuntimeCall::new(
+            TcpCostMsg::Read => Effect::Io(RuntimeCall::new(
                 CallInput::TcpRead {
                     stream: self.stream.expect("stream accepted before read"),
                     max_len: 16,
@@ -558,7 +558,7 @@ impl Isolate for TcpCostClient {
                 self.log.borrow_mut().push(msg);
                 noop()
             }
-            TcpCostMsg::Write => Effect::Call(RuntimeCall::new(
+            TcpCostMsg::Write => Effect::Io(RuntimeCall::new(
                 CallInput::TcpWrite {
                     stream: self.stream.expect("stream accepted before write"),
                     bytes: b"cost".to_vec(),

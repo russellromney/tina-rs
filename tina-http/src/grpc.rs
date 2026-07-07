@@ -553,7 +553,7 @@ where
 
     pub fn pull_next_effect<I>(&self, timeout: Duration) -> Effect<I>
     where
-        I: Isolate<Message = ResponseChunkMsg, Call = tina_runtime::RuntimeCall<ResponseChunkMsg>>,
+        I: Isolate<Message = ResponseChunkMsg, Io = tina_runtime::RuntimeCall<ResponseChunkMsg>>,
     {
         call(
             self.stream.source,

@@ -29,7 +29,7 @@ impl Isolate for Worker {
     type Spawn = Infallible;
     type SpawnObserved = Infallible;
     type SpawnObservedRemote = Infallible;
-    type Call = RuntimeCall<Self::Message>;
+    type Io = RuntimeCall<Self::Message>;
     type Fact = Infallible;
     type Shard = DemoShard;
 

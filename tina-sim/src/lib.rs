@@ -522,7 +522,7 @@ mod tests {
         type Send = Outbound<Infallible>;
         type Spawn = Infallible;
         type SpawnObserved = Infallible;
-        type Call = RuntimeCall<Self::Message>;
+        type Io = RuntimeCall<Self::Message>;
         type Fact = ::std::convert::Infallible;
         type Shard = NumberedShard;
 
@@ -554,7 +554,7 @@ mod tests {
         type Spawn = ChildDefinition<SimObservedChild>;
         type SpawnObserved =
             tina::SpawnObserved<Self::Spawn, Self::Message, SimObservedChildMsg, ()>;
-        type Call = RuntimeCall<Self::Message>;
+        type Io = RuntimeCall<Self::Message>;
         type Fact = ::std::convert::Infallible;
         type Shard = NumberedShard;
 
@@ -607,7 +607,7 @@ mod tests {
         type Send = Outbound<Infallible>;
         type Spawn = Infallible;
         type SpawnObserved = Infallible;
-        type Call = RuntimeCall<Self::Message>;
+        type Io = RuntimeCall<Self::Message>;
         type Fact = ::std::convert::Infallible;
         type Shard = NumberedShard;
 
@@ -645,7 +645,7 @@ mod tests {
             SimCrossChildMsg,
             (),
         >;
-        type Call = RuntimeCall<Self::Message>;
+        type Io = RuntimeCall<Self::Message>;
         type Fact = ::std::convert::Infallible;
         type Shard = NumberedShard;
 
@@ -679,7 +679,7 @@ mod tests {
         type Send = Outbound<Infallible>;
         type Spawn = Infallible;
         type SpawnObserved = std::convert::Infallible;
-        type Call = RuntimeCall<SimTimerMsg>;
+        type Io = RuntimeCall<SimTimerMsg>;
         type Fact = ::std::convert::Infallible;
         type Shard = S;
 
@@ -689,7 +689,7 @@ mod tests {
             _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
         ) -> Effect<Self> {
             match msg {
-                SimTimerMsg::Start => Effect::Call(RuntimeCall::new(
+                SimTimerMsg::Start => Effect::Io(RuntimeCall::new(
                     CallInput::Sleep { after: self.delay },
                     |result| match result {
                         CallOutput::TimerFired => SimTimerMsg::Fired,
@@ -710,7 +710,7 @@ mod tests {
         type Send = Outbound<Infallible>;
         type Spawn = Infallible;
         type SpawnObserved = std::convert::Infallible;
-        type Call = RuntimeCall<SimStepEvent>;
+        type Io = RuntimeCall<SimStepEvent>;
         type Fact = ::std::convert::Infallible;
         type Shard = S;
 
@@ -734,7 +734,7 @@ mod tests {
         type Send = Outbound<SimRemoteEvent>;
         type Spawn = Infallible;
         type SpawnObserved = std::convert::Infallible;
-        type Call = RuntimeCall<SimRemoteEvent>;
+        type Io = RuntimeCall<SimRemoteEvent>;
         type Fact = ::std::convert::Infallible;
         type Shard = S;
 
@@ -769,7 +769,7 @@ mod tests {
         type Send = Outbound<Infallible>;
         type Spawn = Infallible;
         type SpawnObserved = std::convert::Infallible;
-        type Call = RuntimeCall<SimRemoteEvent>;
+        type Io = RuntimeCall<SimRemoteEvent>;
         type Fact = ::std::convert::Infallible;
         type Shard = S;
 
@@ -797,7 +797,7 @@ mod tests {
         type Send = Outbound<Infallible>;
         type Spawn = tina::RestartableChildDefinition<SimShardLocalChild<S>>;
         type SpawnObserved = std::convert::Infallible;
-        type Call = RuntimeCall<SimShardLocalSupervisionEvent>;
+        type Io = RuntimeCall<SimShardLocalSupervisionEvent>;
         type Fact = ::std::convert::Infallible;
         type Shard = S;
 
@@ -832,7 +832,7 @@ mod tests {
         type Send = Outbound<Infallible>;
         type Spawn = Infallible;
         type SpawnObserved = std::convert::Infallible;
-        type Call = RuntimeCall<SimShardLocalSupervisionEvent>;
+        type Io = RuntimeCall<SimShardLocalSupervisionEvent>;
         type Fact = ::std::convert::Infallible;
         type Shard = S;
 

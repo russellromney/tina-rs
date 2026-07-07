@@ -65,7 +65,7 @@ impl Isolate for DeferredSvc {
     type Send = Outbound<NeverOutbound>;
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
-    type Call = Infallible;
+    type Io = Infallible;
     type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 
@@ -135,7 +135,7 @@ impl Isolate for DeferredCaller {
     type Send = Outbound<NeverOutbound>;
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
-    type Call = RuntimeCall<CallerMsg>;
+    type Io = RuntimeCall<CallerMsg>;
     type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 
@@ -145,7 +145,7 @@ impl Isolate for DeferredCaller {
         _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
     ) -> Effect<Self> {
         match msg {
-            CallerMsg::Start(svc, payload) => Effect::Call(RuntimeCall::isolate_call(
+            CallerMsg::Start(svc, payload) => Effect::Io(RuntimeCall::isolate_call(
                 svc,
                 SvcRequest::Capture(payload),
                 self.timeout,
@@ -293,7 +293,7 @@ fn panic_after_capture_drops_slot_and_closes_caller() {
         type Send = Outbound<NeverOutbound>;
         type Spawn = Infallible;
         type SpawnObserved = std::convert::Infallible;
-        type Call = Infallible;
+        type Io = Infallible;
         type Fact = ::std::convert::Infallible;
         type Shard = TestShard;
 
@@ -420,7 +420,7 @@ fn capture_supersedes_subsequent_effect_reply_in_same_handler_turn() {
         type Send = Outbound<NeverOutbound>;
         type Spawn = Infallible;
         type SpawnObserved = std::convert::Infallible;
-        type Call = Infallible;
+        type Io = Infallible;
         type Fact = ::std::convert::Infallible;
         type Shard = TestShard;
 
@@ -466,7 +466,7 @@ fn capture_supersedes_subsequent_effect_reply_in_same_handler_turn() {
         type Send = Outbound<NeverOutbound>;
         type Spawn = Infallible;
         type SpawnObserved = std::convert::Infallible;
-        type Call = RuntimeCall<LocalCallerMsg>;
+        type Io = RuntimeCall<LocalCallerMsg>;
         type Fact = ::std::convert::Infallible;
         type Shard = TestShard;
 
@@ -476,7 +476,7 @@ fn capture_supersedes_subsequent_effect_reply_in_same_handler_turn() {
             _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
         ) -> Effect<Self> {
             match msg {
-                LocalCallerMsg::Start(svc) => Effect::Call(RuntimeCall::isolate_call(
+                LocalCallerMsg::Start(svc) => Effect::Io(RuntimeCall::isolate_call(
                     svc,
                     (),
                     Duration::from_millis(20),
@@ -547,7 +547,7 @@ fn pending_box_reclaims_slots_after_caller_timeouts_and_admits_new_callers() {
         type Send = Outbound<NeverOutbound>;
         type Spawn = Infallible;
         type SpawnObserved = std::convert::Infallible;
-        type Call = Infallible;
+        type Io = Infallible;
         type Fact = ::std::convert::Infallible;
         type Shard = TestShard;
 
@@ -611,7 +611,7 @@ fn pending_box_reclaims_slots_after_caller_timeouts_and_admits_new_callers() {
         type Send = Outbound<NeverOutbound>;
         type Spawn = Infallible;
         type SpawnObserved = std::convert::Infallible;
-        type Call = RuntimeCall<FCallerMsg>;
+        type Io = RuntimeCall<FCallerMsg>;
         type Fact = ::std::convert::Infallible;
         type Shard = TestShard;
 
@@ -621,7 +621,7 @@ fn pending_box_reclaims_slots_after_caller_timeouts_and_admits_new_callers() {
             _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
         ) -> Effect<Self> {
             match msg {
-                FCallerMsg::Start(svc, k) => Effect::Call(RuntimeCall::isolate_call(
+                FCallerMsg::Start(svc, k) => Effect::Io(RuntimeCall::isolate_call(
                     svc,
                     FrontendMsg::Capture(k),
                     self.timeout,
@@ -723,7 +723,7 @@ fn lifo_drain_routes_each_reply_to_its_original_caller_by_call_id() {
         type Send = Outbound<NeverOutbound>;
         type Spawn = Infallible;
         type SpawnObserved = std::convert::Infallible;
-        type Call = Infallible;
+        type Io = Infallible;
         type Fact = ::std::convert::Infallible;
         type Shard = TestShard;
 
@@ -792,7 +792,7 @@ fn lifo_drain_routes_each_reply_to_its_original_caller_by_call_id() {
         type Send = Outbound<NeverOutbound>;
         type Spawn = Infallible;
         type SpawnObserved = std::convert::Infallible;
-        type Call = RuntimeCall<FanCallerMsg>;
+        type Io = RuntimeCall<FanCallerMsg>;
         type Fact = ::std::convert::Infallible;
         type Shard = TestShard;
 
@@ -802,7 +802,7 @@ fn lifo_drain_routes_each_reply_to_its_original_caller_by_call_id() {
             _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
         ) -> Effect<Self> {
             match msg {
-                FanCallerMsg::Start(svc) => Effect::Call(RuntimeCall::isolate_call(
+                FanCallerMsg::Start(svc) => Effect::Io(RuntimeCall::isolate_call(
                     svc,
                     FanSvcMsg::Capture,
                     Duration::from_millis(200),
@@ -892,7 +892,7 @@ impl Isolate for Worker {
     type Send = Outbound<NeverOutbound>;
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
-    type Call = Infallible;
+    type Io = Infallible;
     type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 
@@ -942,7 +942,7 @@ impl Isolate for PoolFrontend {
     type Send = Outbound<NeverOutbound>;
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
-    type Call = RuntimeCall<FrontendMsg>;
+    type Io = RuntimeCall<FrontendMsg>;
     type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 
@@ -967,7 +967,7 @@ impl Isolate for PoolFrontend {
                     .unwrap_or_else(|_| panic!("admission must succeed after sweep"));
                 let worker_idx = self.next_worker % self.workers.len();
                 self.next_worker += 1;
-                Effect::Call(RuntimeCall::isolate_call(
+                Effect::Io(RuntimeCall::isolate_call(
                     self.workers[worker_idx],
                     WorkerMsg::Do(req_id, payload),
                     self.config.worker_call_timeout,
@@ -1005,7 +1005,7 @@ impl Isolate for PoolFrontend {
                     .unwrap_or_else(|_| panic!("admission must succeed after sweep"));
                 let worker_idx = self.next_worker % self.workers.len();
                 self.next_worker += 1;
-                Effect::Call(RuntimeCall::isolate_call(
+                Effect::Io(RuntimeCall::isolate_call(
                     self.workers[worker_idx],
                     WorkerMsg::Do(req_id, payload),
                     self.config.worker_call_timeout,
@@ -1037,7 +1037,7 @@ impl Isolate for PoolCaller {
     type Send = Outbound<NeverOutbound>;
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
-    type Call = RuntimeCall<PoolCallerMsg>;
+    type Io = RuntimeCall<PoolCallerMsg>;
     type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 
@@ -1047,7 +1047,7 @@ impl Isolate for PoolCaller {
         _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
     ) -> Effect<Self> {
         match msg {
-            PoolCallerMsg::Start(svc, payload) => Effect::Call(RuntimeCall::isolate_call(
+            PoolCallerMsg::Start(svc, payload) => Effect::Io(RuntimeCall::isolate_call(
                 svc,
                 FrontendMsg::Client(payload),
                 self.timeout,
@@ -1158,7 +1158,7 @@ impl Isolate for FanoutTarget {
     type Send = Outbound<NeverOutbound>;
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
-    type Call = Infallible;
+    type Io = Infallible;
     type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 
@@ -1214,7 +1214,7 @@ impl Isolate for Coordinator {
     type Send = Outbound<NeverOutbound>;
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
-    type Call = RuntimeCall<CoordMsg>;
+    type Io = RuntimeCall<CoordMsg>;
     type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 
@@ -1230,7 +1230,7 @@ impl Isolate for Coordinator {
                 self.remaining = self.targets.len();
                 let mut subcalls = Vec::with_capacity(self.targets.len());
                 for (idx, target) in self.targets.iter().enumerate() {
-                    subcalls.push(Effect::Call(RuntimeCall::isolate_call(
+                    subcalls.push(Effect::Io(RuntimeCall::isolate_call(
                         *target,
                         FanoutTargetMsg::Echo(payload + idx as u64),
                         self.target_timeout,
@@ -1276,7 +1276,7 @@ impl Isolate for Coordinator {
                 self.remaining = self.targets.len();
                 let mut subcalls = Vec::with_capacity(self.targets.len());
                 for (idx, target) in self.targets.iter().enumerate() {
-                    subcalls.push(Effect::Call(RuntimeCall::isolate_call(
+                    subcalls.push(Effect::Io(RuntimeCall::isolate_call(
                         *target,
                         FanoutTargetMsg::Echo(payload + idx as u64),
                         self.target_timeout,
@@ -1308,7 +1308,7 @@ impl Isolate for FanoutCaller {
     type Send = Outbound<NeverOutbound>;
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
-    type Call = RuntimeCall<FanoutCallerMsg>;
+    type Io = RuntimeCall<FanoutCallerMsg>;
     type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 
@@ -1318,7 +1318,7 @@ impl Isolate for FanoutCaller {
         _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
     ) -> Effect<Self> {
         match msg {
-            FanoutCallerMsg::Start(svc, p) => Effect::Call(RuntimeCall::isolate_call(
+            FanoutCallerMsg::Start(svc, p) => Effect::Io(RuntimeCall::isolate_call(
                 svc,
                 CoordMsg::Start(p),
                 self.timeout,
@@ -1396,7 +1396,7 @@ fn pooled_frontend_returns_full_when_pending_box_is_at_cap() {
         type Send = Outbound<NeverOutbound>;
         type Spawn = Infallible;
         type SpawnObserved = std::convert::Infallible;
-        type Call = Infallible;
+        type Io = Infallible;
         type Fact = ::std::convert::Infallible;
         type Shard = TestShard;
         fn handle(
@@ -1503,7 +1503,7 @@ fn service_stop_drops_pending_promises_visibly() {
         type Send = Outbound<NeverOutbound>;
         type Spawn = Infallible;
         type SpawnObserved = std::convert::Infallible;
-        type Call = Infallible;
+        type Io = Infallible;
         type Fact = ::std::convert::Infallible;
         type Shard = TestShard;
 
@@ -1552,7 +1552,7 @@ fn service_stop_drops_pending_promises_visibly() {
         type Send = Outbound<NeverOutbound>;
         type Spawn = Infallible;
         type SpawnObserved = std::convert::Infallible;
-        type Call = RuntimeCall<CallerStopMsg>;
+        type Io = RuntimeCall<CallerStopMsg>;
         type Fact = ::std::convert::Infallible;
         type Shard = TestShard;
 
@@ -1562,7 +1562,7 @@ fn service_stop_drops_pending_promises_visibly() {
             _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
         ) -> Effect<Self> {
             match msg {
-                CallerStopMsg::Start(s) => Effect::Call(RuntimeCall::isolate_call(
+                CallerStopMsg::Start(s) => Effect::Io(RuntimeCall::isolate_call(
                     s,
                     SvcStopMsg::Capture,
                     Duration::from_secs(60),
@@ -1702,7 +1702,7 @@ fn try_capture_helper_succeeds_admits_and_rejects_full() {
         type Send = Outbound<NeverOutbound>;
         type Spawn = Infallible;
         type SpawnObserved = std::convert::Infallible;
-        type Call = Infallible;
+        type Io = Infallible;
         type Fact = ::std::convert::Infallible;
         type Shard = TestShard;
 
@@ -1769,7 +1769,7 @@ fn try_capture_helper_succeeds_admits_and_rejects_full() {
         type Send = Outbound<NeverOutbound>;
         type Spawn = Infallible;
         type SpawnObserved = std::convert::Infallible;
-        type Call = RuntimeCall<HelpCallerMsg>;
+        type Io = RuntimeCall<HelpCallerMsg>;
         type Fact = ::std::convert::Infallible;
         type Shard = TestShard;
 
@@ -1779,7 +1779,7 @@ fn try_capture_helper_succeeds_admits_and_rejects_full() {
             _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
         ) -> Effect<Self> {
             match msg {
-                HelpCallerMsg::Start(s, id) => Effect::Call(RuntimeCall::isolate_call(
+                HelpCallerMsg::Start(s, id) => Effect::Io(RuntimeCall::isolate_call(
                     s,
                     HelpMsg::Capture(id),
                     Duration::from_secs(60),
@@ -1844,7 +1844,7 @@ impl Isolate for BridgeWorker {
     type Send = Outbound<NeverOutbound>;
     type Spawn = Infallible;
     type SpawnObserved = std::convert::Infallible;
-    type Call = Infallible;
+    type Io = Infallible;
     type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 
@@ -1920,7 +1920,7 @@ fn bridge_worker_routes_out_of_order_external_completions_to_callers() {
         type Send = Outbound<NeverOutbound>;
         type Spawn = Infallible;
         type SpawnObserved = std::convert::Infallible;
-        type Call = RuntimeCall<BCallerMsg>;
+        type Io = RuntimeCall<BCallerMsg>;
         type Fact = ::std::convert::Infallible;
         type Shard = TestShard;
         fn handle(
@@ -1929,7 +1929,7 @@ fn bridge_worker_routes_out_of_order_external_completions_to_callers() {
             _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
         ) -> Effect<Self> {
             match msg {
-                BCallerMsg::Start(b, id) => Effect::Call(RuntimeCall::isolate_call(
+                BCallerMsg::Start(b, id) => Effect::Io(RuntimeCall::isolate_call(
                     b,
                     BridgeMsg::Submit(id),
                     Duration::from_secs(60),
@@ -2008,7 +2008,7 @@ fn bridge_worker_cancelled_caller_does_not_leak_slot() {
         type Send = Outbound<NeverOutbound>;
         type Spawn = Infallible;
         type SpawnObserved = std::convert::Infallible;
-        type Call = RuntimeCall<BCallerMsg2>;
+        type Io = RuntimeCall<BCallerMsg2>;
         type Fact = ::std::convert::Infallible;
         type Shard = TestShard;
         fn handle(
@@ -2017,7 +2017,7 @@ fn bridge_worker_cancelled_caller_does_not_leak_slot() {
             _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
         ) -> Effect<Self> {
             match msg {
-                BCallerMsg2::Start(b) => Effect::Call(RuntimeCall::isolate_call(
+                BCallerMsg2::Start(b) => Effect::Io(RuntimeCall::isolate_call(
                     b,
                     BridgeMsg::Submit(42),
                     Duration::from_millis(20),
@@ -2105,7 +2105,7 @@ fn wrong_reply_type_via_runtime_internal_surfaces_typemismatch() {
         type Send = Outbound<NeverOutbound>;
         type Spawn = Infallible;
         type SpawnObserved = std::convert::Infallible;
-        type Call = Infallible;
+        type Io = Infallible;
         type Fact = ::std::convert::Infallible;
         type Shard = TestShard;
 
@@ -2185,7 +2185,7 @@ fn wrong_reply_type_via_runtime_internal_surfaces_typemismatch() {
         type Send = Outbound<NeverOutbound>;
         type Spawn = Infallible;
         type SpawnObserved = std::convert::Infallible;
-        type Call = RuntimeCall<WrongCallerMsg>;
+        type Io = RuntimeCall<WrongCallerMsg>;
         type Fact = ::std::convert::Infallible;
         type Shard = TestShard;
         fn handle(
@@ -2194,7 +2194,7 @@ fn wrong_reply_type_via_runtime_internal_surfaces_typemismatch() {
             _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
         ) -> Effect<Self> {
             match msg {
-                WrongCallerMsg::Start(s) => Effect::Call(RuntimeCall::isolate_call(
+                WrongCallerMsg::Start(s) => Effect::Io(RuntimeCall::isolate_call(
                     s,
                     WrongMsg::Capture,
                     Duration::from_millis(50),

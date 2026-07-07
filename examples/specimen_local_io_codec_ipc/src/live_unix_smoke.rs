@@ -103,7 +103,7 @@ impl Isolate for Probe {
     type Send = Outbound<Infallible>;
     type Spawn = Infallible;
     type SpawnObserved = Infallible;
-    type Call = RuntimeCall<Msg>;
+    type Io = RuntimeCall<Msg>;
     type Fact = Infallible;
     type Shard = ProbeShard;
 

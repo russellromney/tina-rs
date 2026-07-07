@@ -105,7 +105,7 @@ struct AsyncBridge;
 #[tina_runtime::isolate(
     message = AsyncBridgeMsg,
     reply = u32,
-    call = RuntimeCall<AsyncBridgeMsg>,
+    io = RuntimeCall<AsyncBridgeMsg>,
     shard = TestShard
 )]
 impl AsyncBridge {
@@ -145,7 +145,7 @@ struct Relay {
 #[tina_runtime::isolate(
     message = RelayMsg,
     reply = u32,
-    call = RuntimeCall<RelayMsg>,
+    io = RuntimeCall<RelayMsg>,
     shard = TestShard
 )]
 impl Relay {

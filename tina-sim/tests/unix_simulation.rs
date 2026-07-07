@@ -63,7 +63,7 @@ impl Isolate for EchoServer {
     type Send = Outbound<Infallible>;
     type Spawn = Infallible;
     type SpawnObserved = Infallible;
-    type Call = RuntimeCall<EchoServerMsg>;
+    type Io = RuntimeCall<EchoServerMsg>;
     type Fact = Infallible;
     type Shard = UnixShard;
 
@@ -142,7 +142,7 @@ impl Isolate for EchoClient {
     type Send = Outbound<Infallible>;
     type Spawn = Infallible;
     type SpawnObserved = Infallible;
-    type Call = RuntimeCall<EchoClientMsg>;
+    type Io = RuntimeCall<EchoClientMsg>;
     type Fact = Infallible;
     type Shard = UnixShard;
 
@@ -246,7 +246,7 @@ impl Isolate for WrongResource {
     type Send = Outbound<Infallible>;
     type Spawn = Infallible;
     type SpawnObserved = Infallible;
-    type Call = RuntimeCall<WrongResourceMsg>;
+    type Io = RuntimeCall<WrongResourceMsg>;
     type Fact = Infallible;
     type Shard = UnixShard;
 
@@ -314,7 +314,7 @@ impl Isolate for PeerCloseServer {
     type Send = Outbound<Infallible>;
     type Spawn = Infallible;
     type SpawnObserved = Infallible;
-    type Call = RuntimeCall<PeerCloseServerMsg>;
+    type Io = RuntimeCall<PeerCloseServerMsg>;
     type Fact = Infallible;
     type Shard = UnixShard;
 
@@ -363,7 +363,7 @@ impl Isolate for CloserClient {
     type Send = Outbound<Infallible>;
     type Spawn = Infallible;
     type SpawnObserved = Infallible;
-    type Call = RuntimeCall<CloserClientMsg>;
+    type Io = RuntimeCall<CloserClientMsg>;
     type Fact = Infallible;
     type Shard = UnixShard;
 
@@ -434,7 +434,7 @@ impl Isolate for RefuseServer {
     type Send = Outbound<Infallible>;
     type Spawn = Infallible;
     type SpawnObserved = Infallible;
-    type Call = RuntimeCall<RefuseServerMsg>;
+    type Io = RuntimeCall<RefuseServerMsg>;
     type Fact = Infallible;
     type Shard = UnixShard;
 

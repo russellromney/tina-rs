@@ -297,7 +297,7 @@ pub use shared_work::{
 };
 pub use supervision_report::{ChildSupervision, SupervisorHalt, SupervisorReport};
 pub use tcp_loops::{LoopStep, ReadExactStep, TcpReadExact, TcpReadToEof, TcpWriteAll};
-/// Declares a Tina isolate whose call channel defaults to [`RuntimeCall<Message>`](RuntimeCall).
+/// Declares a Tina isolate whose I/O payload defaults to [`RuntimeCall<Message>`](RuntimeCall).
 ///
 /// This is the preferred runtime authoring path. It keeps the handler as normal
 /// Rust code and only fills the repetitive [`tina::Isolate`] associated types.
@@ -305,7 +305,7 @@ pub use tcp_loops::{LoopStep, ReadExactStep, TcpReadExact, TcpReadToEof, TcpWrit
 /// **The expansion is rooted at `::tina`.** The generated impl names
 /// `::tina::Isolate`, `::tina::Effect`, `::tina::Context`, and friends, so the
 /// crate using this macro must depend on `tina` and have it reachable as
-/// `::tina` (the default crate name). Only the call channel is rooted at
+/// `::tina` (the default crate name). Only the I/O payload is rooted at
 /// `::tina_runtime`. A crate that depends on `tina-runtime` alone will fail to
 /// compile with `unresolved import ::tina`; add `tina` as a direct dependency,
 /// or override the root with `#[tina_runtime::isolate(.., tina_crate = ::your_path)]`.

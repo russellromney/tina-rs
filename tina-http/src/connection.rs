@@ -1280,7 +1280,7 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
     fn write_pending_close(&mut self) -> Effect<Self> {
         let bytes = std::mem::take(&mut self.pending_response);
         match self.transport {
-            HttpTransport::Tcp(stream) => Effect::Call(RuntimeCall::new_with_completion(
+            HttpTransport::Tcp(stream) => Effect::Io(RuntimeCall::new_with_completion(
                 CallInput::TcpWriteOwnedClose { stream, bytes },
                 |output| match output {
                     CallOutput::TcpWroteOwnedClose {

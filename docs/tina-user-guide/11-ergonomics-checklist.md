@@ -537,10 +537,10 @@ labels.
 
 Use `#[tina_runtime::isolate(message = M)]` if your `handle` calls
 `call(...)` against another isolate. The runtime path infers
-`Call = RuntimeCall<M>` from the body.
+`Io = RuntimeCall<M>` from the body.
 
 Use `#[tina::isolate(message = M, ...)]` for pure
-message/reply/spawn isolates. The `tina` path defaults `Call =
+message/reply/spawn isolates. The `tina` path defaults `Io =
 Infallible`, so `call(...).then(...)` will not type-check there.
 
 Do not fall back to a hand-written `impl Isolate` with

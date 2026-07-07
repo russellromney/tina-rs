@@ -38,7 +38,7 @@ impl Isolate for Probe {
     type Send = tina::Outbound<std::convert::Infallible>;
     type Spawn = std::convert::Infallible;
     type SpawnObserved = std::convert::Infallible;
-    type Call = RuntimeCall<ProbeMsg>;
+    type Io = RuntimeCall<ProbeMsg>;
     type Fact = std::convert::Infallible;
     type Shard = tina::SingleShard;
 
@@ -85,7 +85,7 @@ impl Isolate for Db {
     type Send = tina::Outbound<std::convert::Infallible>;
     type Spawn = std::convert::Infallible;
     type SpawnObserved = std::convert::Infallible;
-    type Call = RuntimeCall<DbMsg>;
+    type Io = RuntimeCall<DbMsg>;
     type Fact = std::convert::Infallible;
     type Shard = tina::SingleShard;
 
@@ -137,7 +137,7 @@ impl Isolate for Service {
     type Send = tina::Outbound<std::convert::Infallible>;
     type Spawn = std::convert::Infallible;
     type SpawnObserved = std::convert::Infallible;
-    type Call = RuntimeCall<ServiceMsg>;
+    type Io = RuntimeCall<ServiceMsg>;
     type Fact = std::convert::Infallible;
     type Shard = tina::SingleShard;
 
@@ -196,7 +196,7 @@ impl Isolate for Client {
     type Send = tina::Outbound<std::convert::Infallible>;
     type Spawn = std::convert::Infallible;
     type SpawnObserved = std::convert::Infallible;
-    type Call = RuntimeCall<ClientMsg>;
+    type Io = RuntimeCall<ClientMsg>;
     type Fact = std::convert::Infallible;
     type Shard = tina::SingleShard;
 

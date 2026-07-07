@@ -95,7 +95,7 @@ impl Isolate for FactIsolate {
     type Send = tina::Outbound<Infallible>;
     type Spawn = Infallible;
     type SpawnObserved = Infallible;
-    type Call = RuntimeCall<FactDriver>;
+    type Io = RuntimeCall<FactDriver>;
     type Fact = ProtocolFact;
     type Shard = LocalShard;
 
@@ -175,7 +175,7 @@ fn protocol_fact_safety_rails_default_runtime_compiles() {
         type Send = tina::Outbound<Infallible>;
         type Spawn = Infallible;
         type SpawnObserved = Infallible;
-        type Call = RuntimeCall<()>;
+        type Io = RuntimeCall<()>;
         type Fact = Infallible;
         type Shard = LocalShard;
         fn handle(

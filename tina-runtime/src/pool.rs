@@ -892,7 +892,7 @@ pub fn acquire_effect<I, H, F, M>(
 ) -> Effect<I>
 where
     H: Send + 'static,
-    I: Isolate<Message = M, Call = RuntimeCall<M>>,
+    I: Isolate<Message = M, Io = RuntimeCall<M>>,
     F: FnOnce(crate::call::CallOutcome<WorkerPoolReply<H>>) -> M + 'static,
     M: 'static,
 {
@@ -918,7 +918,7 @@ pub fn acquire_result_effect<I, H, F, M>(
 ) -> Effect<I>
 where
     H: Send + 'static,
-    I: Isolate<Message = M, Call = RuntimeCall<M>>,
+    I: Isolate<Message = M, Io = RuntimeCall<M>>,
     F: FnOnce(Result<PoolLease<H>, AcquireFailure>) -> M + 'static,
     M: 'static,
 {
@@ -939,7 +939,7 @@ pub fn acquire_with_handle_effect<I, H, F, M>(
 ) -> (Effect<I>, tina::CallHandle<WorkerPoolReply<H>>)
 where
     H: Send + 'static,
-    I: Isolate<Message = M, Call = RuntimeCall<M>>,
+    I: Isolate<Message = M, Io = RuntimeCall<M>>,
     F: FnOnce(crate::call::CallOutcome<WorkerPoolReply<H>>) -> M + 'static,
     M: 'static,
 {
@@ -964,7 +964,7 @@ pub fn release_effect<I, H, F, M>(
 ) -> Effect<I>
 where
     H: Send + 'static,
-    I: Isolate<Message = M, Call = RuntimeCall<M>>,
+    I: Isolate<Message = M, Io = RuntimeCall<M>>,
     F: FnOnce(crate::call::CallOutcome<WorkerPoolReply<H>>) -> M + 'static,
     M: 'static,
 {
@@ -992,7 +992,7 @@ pub fn release_result_effect<I, H, F, M>(
 ) -> Effect<I>
 where
     H: Send + 'static,
-    I: Isolate<Message = M, Call = RuntimeCall<M>>,
+    I: Isolate<Message = M, Io = RuntimeCall<M>>,
     F: FnOnce(Result<(), ReleaseFailure>) -> M + 'static,
     M: 'static,
 {
@@ -1009,7 +1009,7 @@ pub fn pressure_effect<I, H, F, M>(
 ) -> Effect<I>
 where
     H: Send + 'static,
-    I: Isolate<Message = M, Call = RuntimeCall<M>>,
+    I: Isolate<Message = M, Io = RuntimeCall<M>>,
     F: FnOnce(crate::call::CallOutcome<WorkerPoolReply<H>>) -> M + 'static,
     M: 'static,
 {
@@ -1093,7 +1093,7 @@ pub fn close_effect<I, H, F, M>(
 ) -> Effect<I>
 where
     H: Send + 'static,
-    I: Isolate<Message = M, Call = RuntimeCall<M>>,
+    I: Isolate<Message = M, Io = RuntimeCall<M>>,
     F: FnOnce(crate::call::CallOutcome<WorkerPoolReply<H>>) -> M + 'static,
     M: 'static,
 {
@@ -1113,7 +1113,7 @@ pub fn maintain_effect<I, H, F, M>(
 ) -> Effect<I>
 where
     H: Send + 'static,
-    I: Isolate<Message = M, Call = RuntimeCall<M>>,
+    I: Isolate<Message = M, Io = RuntimeCall<M>>,
     F: FnOnce(crate::call::CallOutcome<WorkerPoolReply<H>>) -> M + 'static,
     M: 'static,
 {
@@ -1134,7 +1134,7 @@ pub fn refill_effect<I, H, F, M>(
 ) -> Effect<I>
 where
     H: Send + 'static,
-    I: Isolate<Message = M, Call = RuntimeCall<M>>,
+    I: Isolate<Message = M, Io = RuntimeCall<M>>,
     F: FnOnce(crate::call::CallOutcome<WorkerPoolReply<H>>) -> M + 'static,
     M: 'static,
 {
@@ -1162,7 +1162,7 @@ where
     type Send = Outbound<Infallible>;
     type Spawn = Infallible;
     type SpawnObserved = Infallible;
-    type Call = RuntimeCall<WorkerPoolMsg<H>>;
+    type Io = RuntimeCall<WorkerPoolMsg<H>>;
     type Fact = Infallible;
     type Shard = S;
 

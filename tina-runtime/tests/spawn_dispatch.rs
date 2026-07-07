@@ -225,7 +225,7 @@ impl Isolate for FullParent {
     type Send = Outbound<FullParentEvent>;
     type Spawn = ChildDefinition<Child>;
     type SpawnObserved = tina::SpawnObserved<Self::Spawn, Self::Message, ChildEvent, ()>;
-    type Call = Infallible;
+    type Io = Infallible;
     type Fact = ::std::convert::Infallible;
     type Shard = TestShard;
 
