@@ -25,7 +25,7 @@ fn soak_emits_grep_friendly_discovery_lines() {
         "expected at least one Full reply (report={report:?})",
     );
 
-    // Three required discovery line kinds (Rock 4: grep-friendly).
+    // Three required discovery line kinds, kept grep-friendly.
     let has_http = report
         .discovery_lines
         .iter()

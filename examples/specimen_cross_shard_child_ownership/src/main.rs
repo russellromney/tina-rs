@@ -109,7 +109,7 @@ fn main() {
     let live = runtime.child_lifecycle_report(supervisor).unwrap();
     let shards: Vec<_> = live.children.iter().map(|child| child.shard.get()).collect();
     println!(
-        "child_lifecycle phase=129 parent={} children={} shards={:?} state=live",
+        "child_lifecycle specimen=cross_shard_child_ownership parent={} children={} shards={:?} state=live",
         live.parent.get(),
         live.children.len(),
         shards
@@ -124,7 +124,7 @@ fn main() {
 
     let stopped = runtime.child_lifecycle_report(supervisor).unwrap();
     println!(
-        "child_lifecycle phase=129 parent={} stopped={} pending_remote_control={}",
+        "child_lifecycle specimen=cross_shard_child_ownership parent={} stopped={} pending_remote_control={}",
         stopped.parent.get(),
         stopped
             .children

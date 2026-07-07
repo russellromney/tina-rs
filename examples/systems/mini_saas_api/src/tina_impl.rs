@@ -1804,9 +1804,8 @@ pub fn run_soak(config: crate::SoakConfig) -> anyhow::Result<crate::SoakReport> 
     //   worker % 3 == 1 -> GET /items/1       (HTTP + SQLite bridge)
     //   worker % 3 == 2 -> POST /items/1/notify (HTTP + bridge + outbound pool)
     //
-    // The third lane is what proves Rock 1's "bridge/pool path" line
-    // item — without it the keepalive outbound pool is never exercised
-    // and the soak only proves the HTTP+DB shape.
+    // The third lane proves the bridge/pool path: without it the keepalive
+    // outbound pool is never exercised and the soak only proves HTTP+DB.
     let op_addr = addr;
     let timeout = config.connect_timeout;
     let observe_addr = addr;
@@ -2296,7 +2295,7 @@ fn build_startup_summary(
     // Build the typed `ServiceTopology` covering every started component
     // and the pressure surfaces. The legacy `summary_line` /
     // `discovery_lines` strings stay byte-identical for compatibility;
-    // the typed report is the structured proof Phase 106 adds.
+    // the typed report is the structured lifecycle/health/topology proof.
     let mut topology = ServiceTopology::new("mini_saas_api", Lifecycle::Ready);
     topology
         .push_component(

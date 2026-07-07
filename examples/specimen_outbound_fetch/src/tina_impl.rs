@@ -1,6 +1,5 @@
 //! Tina: a `Fetcher` isolate that walks `tcp_connect → write_all →
-//! read_to_eof → tcp_close_stream` for each iteration. Phase 059
-//! Rocks 1+3:
+//! read_to_eof → tcp_close_stream` for each iteration:
 //!
 //! - the partial-write loop and the read-until-EOF loop are owned by
 //!   client-side helpers (`TcpWriteAll`, `TcpReadToEof`) so the

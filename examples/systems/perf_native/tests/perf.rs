@@ -143,7 +143,7 @@ fn native_protocol_rows_are_printable_and_bounded() {
         "native protocol row labels are pinned so a row cannot silently disappear",
     );
 
-    // Rock 4: every native row declares its setup-vs-reuse class in `kind`, and
+    // Every native row declares its setup-vs-reuse class in `kind`, and
     // both a connection-setup row and a steady-state-reuse row exist for each
     // protocol so setup cost is never silently mixed with steady-state service.
     let kinds: Vec<_> = reports

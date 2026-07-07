@@ -46,7 +46,7 @@ impl Worker {
 
 #[derive(Debug, Clone)]
 pub enum CoordMsg {
-    /// Host kicks off the fanout. Phase 064 Rock 3 removed the old
+    /// Host kicks off the fanout. the self-address constructor path removed the old
     /// `Begin { self_addr }` ceremony — the coord now learns its own
     /// address at registration via `register_with_capacity_using`.
     Start,

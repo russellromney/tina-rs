@@ -278,8 +278,8 @@ pub fn run() -> anyhow::Result<Report> {
         )
         .map_err(|e| anyhow::anyhow!("register driver: {e:?}"))?;
 
-    // Phase-062 Rock 1: typed result waiter on the multi-shard runtime.
-    // No `Arc<Mutex<Option<Report>>>` polling.
+    // Typed result waiter on the multi-shard runtime. No
+    // `Arc<Mutex<Option<Report>>>` polling.
     let waiter = runtime
         .observe_result::<Report, _, _>(driver)
         .map_err(|e| anyhow::anyhow!("observe_result: {e:?}"))?;

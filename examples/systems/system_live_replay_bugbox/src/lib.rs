@@ -70,7 +70,7 @@ const SINK_ROLE: &str = "sink";
 pub struct BugboxReport {
     pub live_received: usize,
     pub live_trace_shape: TraceShape,
-    /// Pressure summary from the live trace (Rock 3 "pressure facts
+    /// Pressure summary from the live trace (Pressure facts
     /// visible"). A clean run has `non_zero() == false`.
     pub live_pressure: tina_runtime::PressureSummary,
     pub sim_pinned: SavedCase,

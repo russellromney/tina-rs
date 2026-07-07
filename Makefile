@@ -31,7 +31,7 @@ race-surface-guard:
 
 # Rail-inventory guard: fail if a runtime-owned rail adds a worker thread,
 # blocking std socket, or blocking std::fs work outside the reviewed inventory
-# (.intent/runtime-rail-inventory.txt). Enforces the Phase 140 rule that every
+# (.intent/runtime-rail-inventory.txt). Enforces the runtime rail invariant that every
 # rail rides the Betelgeuse substrate or is an inventoried blocking/fallback
 # lane with a written reason.
 rail-inventory-guard:
@@ -87,7 +87,7 @@ perf-record:
 perf-check:
 	./scripts/perf_check.sh
 
-# Phase 108 proof targets. Each one is copy-pasteable into a PR check.
+# Proof targets. Each one is copy-pasteable into a PR check.
 # `proof-fast` is the PR gate. The other three are local / nightly /
 # regression slots.
 

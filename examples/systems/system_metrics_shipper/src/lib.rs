@@ -228,7 +228,7 @@ struct Shipper {
     /// rejected when the tick continuation lands.
     flush_tick: RecurringTick,
     /// Drain bookkeeping: who is waiting on the Stop reply, and the typed
-    /// admission/completion counters used by Tina's Phase 101 helper.
+    /// admission/completion counters used by Tina's capacity-aware registration helper.
     drain: DrainState,
     pending_stop: Option<RequestContext<ShipperReply>>,
     drained_events: usize,

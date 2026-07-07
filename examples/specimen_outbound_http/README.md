@@ -43,7 +43,7 @@ Three first-class HTTP pieces, driven from the host:
 
 - **`Counter`** — `#[isolate(message = HttpRequest, reply =
   HttpResponse)]`. The handler dispatches through a
-  `StatefulRouter<Counter>` (Phase 059 Rock 6) and returns an
+  `StatefulRouter<Counter>` (the stateful router helper) and returns an
   `HttpResponse`. `.method_not_allowed()` distinguishes 405 from 404.
 - **`HttpListener<SingleShard>`** — bound with
   `HttpServerConfig::dev()` plus

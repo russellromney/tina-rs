@@ -145,7 +145,7 @@ impl Caller {
     }
 
     fn absorb(&mut self, outcome: ReqwestCallOutcome) -> Effect<Self> {
-        // Phase-062 Rock 6: the classifier collapses the six-arm
+        // the retry classifier: the classifier collapses the six-arm
         // pattern over the layered ReqwestCallOutcome into three
         // typed buckets without losing the layered shape — the raw
         // `outcome` is consumed only after classify() decides which

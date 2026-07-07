@@ -94,8 +94,8 @@ What feels better:
   no `select!` between joins and other work — if the coord also
   needs to handle a shutdown signal, that's just another variant in
   `CoordMsg`.
-- **Final `Report` via `stop_with`.** Same pattern as Round 1's Rock
-  1 land. The host gets one typed value back; no mpsc, no atomics.
+- **Final `Report` via `stop_with`.** The host gets one typed value
+  back; no mpsc, no atomics.
 
 What feels worse:
 
@@ -111,8 +111,8 @@ What feels worse:
   would let the coord notice missing partials as a typed
   `WorkerStopped` rather than a deadlock.
 - **Mailbox sizing for the coord must account for every child's
-  `WorkerDone` reply.** The `incoming + replies` rule (Phase 059
-  Rock 4) bites here: with 4 workers, the coord's mailbox holds
+  `WorkerDone` reply.** The `incoming + replies` rule (the mailbox-capacity
+  rule) bites here: with 4 workers, the coord's mailbox holds
   `Start + 4 × WorkerDone = 5` outstanding, plus headroom. Easy to
   miscount under pressure (more workers, more reply slots).
 
@@ -130,7 +130,7 @@ What got better:
 
 This specimen exercises the happy path: every worker finishes and
 sends. `specimen_cancellation_chain` and the sharded scatter/gather
-report from Phase 053 cover the typed partial-aggregate shape. A
+report from the earlier scatter/gather specimens cover the typed partial-aggregate shape. A
 future variant of this specimen could:
 
 - give one worker a slice that triggers a panic;
@@ -142,4 +142,4 @@ future variant of this specimen could:
 
 That requires FINDINGS finding 14 (spawn API surfaces child's
 address); the self-address half of finding 3 already shipped in
-Phase 064 Rock 3 and is used here.
+the self-address constructor path and is used here.

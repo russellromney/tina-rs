@@ -114,7 +114,7 @@ fn run_target(binary: &PathBuf, spinner_count: usize) -> RunResult {
 
     let started = Instant::now();
     // Capture stdout so the runner can intercept any `pressure ...`
-    // lines (Phase 059 Rock 9 convention). Other lines pass through
+    // lines (the canonical key=value convention convention). Other lines pass through
     // verbatim so specimens that don't emit pressure summaries stay
     // untouched.
     let output = Command::new(binary)

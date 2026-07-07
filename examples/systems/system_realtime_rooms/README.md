@@ -44,7 +44,7 @@ slow-peer handling, explicit shutdown, and member-table pressure.
 # Smoke (join + tick, overflow, shutdown):
 cargo test --manifest-path examples/systems/system_realtime_rooms/Cargo.toml --test smoke
 
-# Bad-peer + slow-reader proof (Phase 108):
+# Bad-peer + slow-reader proof (the proof):
 cargo test --manifest-path examples/systems/system_realtime_rooms/Cargo.toml --test bad_peer -- --nocapture
 
 # Lint:
@@ -101,14 +101,14 @@ What felt good:
   bounded, fan-out room without touching `HttpConnection` internals.
 - `register_with_capacity` plus one `try_send(addr, Bootstrap)` from the
   host is a small, explicit pattern that maps cleanly to the "startup
-  bootstrap message" idea Phase 101 is formalising.
+  bootstrap message" idea capacity-aware registration formalizes.
 - The `sleep_then(d, msg)` self-reschedule pattern reads like ordinary
   state-machine code; no hidden cancellation or callbacks were needed.
 
 What felt rough:
 
 - ~~Internal control messages are encoded as `WebSocketSessionMsg::Text`
-  with magic prefixes (`__bootstrap__`, `__tick:N`).~~ Phase 120 replaced
+  with magic prefixes (`__bootstrap__`, `__tick:N`).~~ the copied-service-path pass replaced
   this with `WebSocketSessionMsg::AppControl(WebSocketSessionControl::...)`.
   Control remains an ordinary bounded app message, but it is no longer peer
   text.
@@ -151,7 +151,7 @@ Suggested follow-up:
   third specimen run that has paid the "be careful which entry point a
   `.then` chain originates from" tax (`system_cache_with_fill`,
   `system_job_queue`, now `system_realtime_rooms`).
-- Promote the bootstrap-on-register pattern (already on the Phase 101
+- Promote the bootstrap-on-register pattern (already on the capacity-aware registration
   list as `register_and_bootstrap`).
 - Consider an app-injectable typed variant on `WebSocketSessionMsg` so
   recurring app-level messages do not have to ride on `Text("__...")`

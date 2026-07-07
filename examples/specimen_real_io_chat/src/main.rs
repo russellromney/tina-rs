@@ -42,7 +42,7 @@ fn print_side(side: &str, config: RunConfig, report: Report) {
         report.delivered,
         report.buffered,
     );
-    // Phase 059 Rock 9: print the canonical key=value line so a
+    // the canonical key=value convention: print the canonical key=value line so a
     // pressure runner can intercept and surface it.
     println!(
         "{}",

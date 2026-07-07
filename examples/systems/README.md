@@ -139,7 +139,7 @@ Recent work has already built the first wave of small systems:
 `system_metrics_shipper`, `system_realtime_rooms`, `system_live_replay_bugbox`,
 `system_api_gateway_limits`, `system_soak_http_db`, `system_cache_with_fill`,
 `system_lock_manager`, `system_session_auth`, `system_tenant_rate_limiter`,
-`system_webhook_relay`, and the Phase 120 copied service path trio. Their repeated pain is summarized in
+`system_webhook_relay`, and the copied service path trio. Their repeated pain is summarized in
 [`../FINDINGS.md`](../FINDINGS.md).
 
 Start with small systems that pull hard:

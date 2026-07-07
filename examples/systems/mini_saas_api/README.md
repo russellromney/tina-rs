@@ -228,7 +228,7 @@ Run the system smoke from the repo root:
 # Full system smoke (scripted scenarios + capacity assertions):
 cargo test --manifest-path examples/systems/mini_saas_api/Cargo.toml --test smoke
 
-# Load/soak proof (Phase 108) with typed capacity contract:
+# Load/soak proof (the proof) with typed capacity contract:
 cargo test --manifest-path examples/systems/mini_saas_api/Cargo.toml --test soak -- --nocapture
 
 # Opt-in long soak. Defaults to 10 minutes; use 3600 for one hour.
@@ -260,7 +260,7 @@ first error position, per-kind breakdown) lets specimens assert
 "pressure stayed under N per mille" or "no burst longer than K
 consecutive errors" without parsing the summary line.
 
-Phase 148 adds direct notify/outbound-pool facts to the capacity line:
+The capacity line includes direct notify/outbound-pool facts:
 
 ```text
 notify.attempted=33 outbound.acquired=21 outbound.released=21 outbound.retired=0

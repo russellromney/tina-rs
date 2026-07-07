@@ -167,10 +167,9 @@ impl Isolate for ScatterCoord {
                         config: self.config,
                         outcomes,
                     };
-                    // Phase-062 Rock 1: the host reads the typed
-                    // `ScatterGatherReport<u64>` via
-                    // `runtime.observe_result::<...>` instead of polling
-                    // an `Arc<Mutex<Option<_>>>` slot.
+                    // Host reads the typed `ScatterGatherReport<u64>` via
+                    // `runtime.observe_result::<...>` instead of polling an
+                    // `Arc<Mutex<Option<_>>>` slot.
                     return stop_with(report);
                 }
                 noop()
@@ -252,9 +251,8 @@ pub fn run() -> anyhow::Result<Report> {
         )
         .map_err(|e| anyhow::anyhow!("register reply adapter: {e:?}"))?;
 
-    // Phase-062 Rock 1: typed result waiter on the multi-shard runtime.
-    // The coord publishes its `ScatterGatherReport<u64>` via
-    // `stop_with(report)`; no shared mutex.
+    // Typed result waiter on the multi-shard runtime. The coord publishes its
+    // `ScatterGatherReport<u64>` via `stop_with(report)`; no shared mutex.
     let waiter = runtime
         .observe_result::<ScatterGatherReport<u64>, _, _>(coord)
         .map_err(|e| anyhow::anyhow!("observe_result: {e:?}"))?;

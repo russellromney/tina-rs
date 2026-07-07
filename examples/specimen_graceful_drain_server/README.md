@@ -93,13 +93,13 @@ The host delivers `Drain` through the same bounded mailbox the
 submits went through. The mailbox may still hold queued admissions
 when shutdown is requested (the worker drains at one per
 `JOB_WORK_MS`); the host calls
-`runtime.send_observed_until(...)` (Phase 062 Rock 4) which
+`runtime.send_observed_until(...)` (the observed-send retry helper) which
 retries `MailboxFull` / `IngressFull` up to a deadline. The
 producer side uses `try_send_outcome` + `HostBurstOutcomes`
-(Phase 062 Rocks 3 & 4) so the per-shard admit / mailbox-full /
+(the host burst outcome helpers) so the per-shard admit / mailbox-full /
 ingress-full counts come back as a typed snapshot, no observer
 closure. The Worker's "one Tick in flight, plus N queued"
-invariant is `SingleCallGate` (Phase 062 Rock 5).
+invariant is `SingleCallGate` (the single-call gate invariant).
 
 ## Discussion
 
@@ -114,8 +114,8 @@ What feels better:
   state machine where "drain mode" is invisible to the rest of the
   isolate.
 - **The final report reaches the host without an mpsc.**
-  `stop_with(report)` + `observe_result` is the blessed Phase 059
-  Rock 1 path.
+  `stop_with(report)` + `observe_result` is the blessed the typed stop-result
+  path path.
 
 What feels worse:
 
