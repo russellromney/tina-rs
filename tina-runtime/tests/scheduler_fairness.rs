@@ -71,9 +71,7 @@ fn record_spread(ticks: &[AtomicU64], max_spread: &AtomicU64) {
         max = max.max(value);
     }
     let spread = max.saturating_sub(min);
-    let _ = max_spread.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-        (spread > current).then_some(spread)
-    });
+    max_spread.fetch_max(spread, Ordering::Relaxed);
 }
 
 #[derive(Debug)]

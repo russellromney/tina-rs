@@ -2517,7 +2517,7 @@ impl<S: Shard + 'static> Http2ClientConnection<S> {
                 },
             ));
         }
-        let streams: Vec<_> = self.streams.drain(..).collect();
+        let streams: Vec<_> = std::mem::take(&mut self.streams);
         self.stream_index.clear();
         for mut stream in streams {
             self.cancel_request_source(&stream, &mut effects);
@@ -2542,7 +2542,7 @@ impl<S: Shard + 'static> Http2ClientConnection<S> {
             _ => ERR_PROTOCOL_ERROR,
         };
         self.enqueue_frame(goaway_frame(self.next_stream_id, code));
-        let streams: Vec<_> = self.streams.drain(..).collect();
+        let streams: Vec<_> = std::mem::take(&mut self.streams);
         self.stream_index.clear();
         for mut stream in streams {
             self.cancel_request_source(&stream, &mut effects);
@@ -2715,7 +2715,7 @@ impl<S: Shard + 'static> Http2ClientConnection<S> {
 
     fn close_with(&mut self, outcome: Http2ClientOutcome) -> Effect<Self> {
         let mut effects: Vec<Effect<Self>> = Vec::new();
-        let streams: Vec<_> = self.streams.drain(..).collect();
+        let streams: Vec<_> = std::mem::take(&mut self.streams);
         self.stream_index.clear();
         for mut stream in streams {
             self.cancel_request_source(&stream, &mut effects);
