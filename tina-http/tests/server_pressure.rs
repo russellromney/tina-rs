@@ -277,7 +277,7 @@ fn service_call_timeout_returns_504_on_the_wire() {
             reply: HttpResponse,
             send: tina::Outbound<Infallible>,
             spawn: Infallible,
-            call: Infallible,
+            io: Infallible,
             shard: TimeoutShard,
         }
         fn handle(

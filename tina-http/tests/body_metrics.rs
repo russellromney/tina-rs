@@ -40,7 +40,7 @@ impl Isolate for EchoLen {
         reply: HttpResponse,
         send: tina::Outbound<Infallible>,
         spawn: Infallible,
-        call: Infallible,
+        io: Infallible,
         shard: TestShard,
     }
 
@@ -297,7 +297,7 @@ impl Isolate for BigBufferedResponse {
         reply: HttpResponse,
         send: tina::Outbound<Infallible>,
         spawn: Infallible,
-        call: Infallible,
+        io: Infallible,
         shard: TestShard,
     }
 
@@ -445,7 +445,7 @@ impl Isolate for StreamingConsumer {
         reply: HttpResponse,
         send: tina::Outbound<Infallible>,
         spawn: Infallible,
-        call: RuntimeCall<StreamMsg>,
+        io: RuntimeCall<StreamMsg>,
         shard: TestShard,
     }
 
@@ -747,7 +747,7 @@ impl Isolate for ChunkProducer {
         reply: ResponseChunkReply,
         send: tina::Outbound<Infallible>,
         spawn: Infallible,
-        call: Infallible,
+        io: Infallible,
         shard: TestShard,
     }
 
@@ -786,7 +786,7 @@ impl Isolate for StreamingService {
         reply: HttpResponse,
         send: tina::Outbound<Infallible>,
         spawn: Infallible,
-        call: Infallible,
+        io: Infallible,
         shard: TestShard,
     }
 

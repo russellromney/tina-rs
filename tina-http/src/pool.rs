@@ -90,7 +90,7 @@ impl<S: Shard + 'static> Isolate for HttpConnectionPool<S> {
         reply: Result<HttpResponse, HttpClientError>,
         send: tina::Outbound<std::convert::Infallible>,
         spawn: std::convert::Infallible,
-        call: RuntimeCall<HttpPoolMsg>,
+        io: RuntimeCall<HttpPoolMsg>,
         shard: S,
     }
 

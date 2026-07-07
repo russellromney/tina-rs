@@ -470,7 +470,7 @@ impl Isolate for Driver {
         reply: (),
         send: tina::Outbound<Infallible>,
         spawn: Infallible,
-        call: RuntimeCall<DriverMsg>,
+        io: RuntimeCall<DriverMsg>,
         shard: TestShard,
     }
 
@@ -684,7 +684,7 @@ impl Isolate for RejectingPool {
         reply: WorkerPoolReply<KeepaliveConnAddr>,
         send: tina::Outbound<Infallible>,
         spawn: Infallible,
-        call: RuntimeCall<WorkerPoolMsg<KeepaliveConnAddr>>,
+        io: RuntimeCall<WorkerPoolMsg<KeepaliveConnAddr>>,
         shard: TestShard,
     }
 

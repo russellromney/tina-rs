@@ -918,7 +918,7 @@ impl Isolate for NotifySink {
         reply: HttpResponse,
         send: tina::Outbound<Infallible>,
         spawn: Infallible,
-        call: RuntimeCall<NotifyMsg>,
+        io: RuntimeCall<NotifyMsg>,
         shard: SingleShard,
     }
 
@@ -1158,7 +1158,7 @@ impl Isolate for Controller {
         reply: HttpResponse,
         send: tina::Outbound<Infallible>,
         spawn: Infallible,
-        call: RuntimeCall<ControllerMsg>,
+        io: RuntimeCall<ControllerMsg>,
         shard: SingleShard,
     }
 

@@ -146,7 +146,7 @@ impl<S: Shard + 'static> Isolate for HttpClient<S> {
         reply: Result<HttpResponse, HttpClientError>,
         send: tina::Outbound<std::convert::Infallible>,
         spawn: std::convert::Infallible,
-        call: tina_runtime::RuntimeCall<HttpClientMsg>,
+        io: tina_runtime::RuntimeCall<HttpClientMsg>,
         shard: S,
     }
 

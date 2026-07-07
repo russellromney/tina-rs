@@ -122,7 +122,7 @@ impl Isolate for OrderIsolate {
         reply: (),
         send: Outbound<NeverOutbound>,
         spawn: Infallible,
-        call: Infallible,
+        io: Infallible,
         shard: TestShard,
     }
 
@@ -148,7 +148,7 @@ impl Isolate for Driver {
         reply: (),
         send: Outbound<AuditEvent>,
         spawn: Infallible,
-        call: Infallible,
+        io: Infallible,
         shard: TestShard,
     }
 
@@ -177,7 +177,7 @@ impl Isolate for Audit {
         reply: (),
         send: Outbound<NeverOutbound>,
         spawn: Infallible,
-        call: Infallible,
+        io: Infallible,
         shard: TestShard,
     }
 
@@ -201,7 +201,7 @@ impl Isolate for ObservedIsolate {
         reply: u8,
         send: Outbound<NeverOutbound>,
         spawn: Infallible,
-        call: Infallible,
+        io: Infallible,
         shard: TestShard,
     }
 

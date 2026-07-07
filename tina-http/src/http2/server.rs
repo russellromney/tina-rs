@@ -516,7 +516,7 @@ impl<S: Shard + 'static, M: Http2ServiceMessage> Isolate for Http2Connection<S, 
         reply: Http2ConnectionReply,
         send: tina::Outbound<Infallible>,
         spawn: Infallible,
-        call: tina_runtime::RuntimeCall<Http2ConnectionMsg>,
+        io: tina_runtime::RuntimeCall<Http2ConnectionMsg>,
         fact: ProtocolFact,
         shard: S,
     }
@@ -2460,7 +2460,7 @@ impl<S: Shard + 'static, M: Http2ServiceMessage> Isolate for Http2Listener<S, M>
         reply: (),
         send: tina::Outbound<Infallible>,
         spawn: ChildDefinition<Http2Connection<S, M>>,
-        call: tina_runtime::RuntimeCall<Http2ListenerMsg>,
+        io: tina_runtime::RuntimeCall<Http2ListenerMsg>,
         shard: S,
     }
 

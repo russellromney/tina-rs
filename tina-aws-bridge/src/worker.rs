@@ -492,7 +492,7 @@ impl<S: Shard + 'static> Isolate for S3Worker<S> {
         reply: S3Result,
         send: tina::Outbound<Infallible>,
         spawn: Infallible,
-        call: RuntimeCall<S3Msg>,
+        io: RuntimeCall<S3Msg>,
         shard: S,
     }
 

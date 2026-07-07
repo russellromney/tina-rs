@@ -142,7 +142,7 @@ impl Isolate for Connection {
         reply: (),
         send: Outbound<Infallible>,
         spawn: Infallible,
-        call: RuntimeCall<ConnectionEvent>,
+        io: RuntimeCall<ConnectionEvent>,
         shard: TestShard,
     }
 
@@ -223,7 +223,7 @@ impl Isolate for OutboundClient {
         reply: (),
         send: Outbound<Infallible>,
         spawn: Infallible,
-        call: RuntimeCall<OutboundClientEvent>,
+        io: RuntimeCall<OutboundClientEvent>,
         shard: TestShard,
     }
 
@@ -298,7 +298,7 @@ impl Isolate for OwnedBufferClient {
         reply: (),
         send: Outbound<Infallible>,
         spawn: Infallible,
-        call: RuntimeCall<OwnedClientEvent>,
+        io: RuntimeCall<OwnedClientEvent>,
         shard: TestShard,
     }
 
@@ -385,7 +385,7 @@ impl Isolate for FileClient {
         reply: (),
         send: Outbound<Infallible>,
         spawn: Infallible,
-        call: RuntimeCall<FileClientEvent>,
+        io: RuntimeCall<FileClientEvent>,
         shard: TestShard,
     }
 
@@ -474,7 +474,7 @@ impl Isolate for Listener {
         reply: (),
         send: Outbound<ListenerEvent>,
         spawn: RestartableChildDefinition<Connection>,
-        call: RuntimeCall<ListenerEvent>,
+        io: RuntimeCall<ListenerEvent>,
         shard: TestShard,
     }
 
@@ -1525,7 +1525,7 @@ impl Isolate for BlockingIsolate {
         reply: (),
         send: Outbound<Infallible>,
         spawn: Infallible,
-        call: RuntimeCall<BlockingMsg>,
+        io: RuntimeCall<BlockingMsg>,
         shard: TestShard,
     }
 

@@ -276,7 +276,7 @@ impl Isolate for Relay {
         reply: RelayReply,
         send: tina::Outbound<Infallible>,
         spawn: Infallible,
-        call: RuntimeCall<RelayMsg>,
+        io: RuntimeCall<RelayMsg>,
         shard: SingleShard,
     }
 

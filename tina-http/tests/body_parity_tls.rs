@@ -46,7 +46,7 @@ impl Isolate for ChunkProducer {
         reply: ResponseChunkReply,
         send: tina::Outbound<Infallible>,
         spawn: Infallible,
-        call: Infallible,
+        io: Infallible,
         shard: TestShard,
     }
 
@@ -85,7 +85,7 @@ impl Isolate for StreamingService {
         reply: HttpResponse,
         send: tina::Outbound<Infallible>,
         spawn: Infallible,
-        call: Infallible,
+        io: Infallible,
         shard: TestShard,
     }
 
@@ -266,7 +266,7 @@ impl Isolate for ChunkedService {
         reply: HttpResponse,
         send: tina::Outbound<Infallible>,
         spawn: Infallible,
-        call: Infallible,
+        io: Infallible,
         shard: TestShard,
     }
 
@@ -466,7 +466,7 @@ impl Isolate for ChunkedRequestConsumer {
         reply: HttpResponse,
         send: tina::Outbound<Infallible>,
         spawn: Infallible,
-        call: RuntimeCall<ChunkedRequestMsg>,
+        io: RuntimeCall<ChunkedRequestMsg>,
         shard: TestShard,
     }
 

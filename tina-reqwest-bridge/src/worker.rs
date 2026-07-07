@@ -807,7 +807,7 @@ impl<S: Shard + 'static> Isolate for ReqwestWorker<S> {
         reply: Result<ReqwestResponse, ReqwestError>,
         send: tina::Outbound<Infallible>,
         spawn: Infallible,
-        call: RuntimeCall<ReqwestMsg>,
+        io: RuntimeCall<ReqwestMsg>,
         shard: S,
     }
 

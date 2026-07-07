@@ -120,7 +120,7 @@ impl Isolate for Audit {
         reply: (),
         send: Outbound<NeverOutbound>,
         spawn: Infallible,
-        call: Infallible,
+        io: Infallible,
         shard: TestShard,
     }
 
@@ -144,7 +144,7 @@ impl Isolate for Worker {
         reply: (),
         send: Outbound<NeverOutbound>,
         spawn: Infallible,
-        call: Infallible,
+        io: Infallible,
         shard: TestShard,
     }
 
@@ -168,7 +168,7 @@ impl Isolate for Driver {
         reply: (),
         send: Outbound<AuditEvent>,
         spawn: ChildDefinition<Worker>,
-        call: RuntimeCall<DriverEvent>,
+        io: RuntimeCall<DriverEvent>,
         shard: TestShard,
     }
 

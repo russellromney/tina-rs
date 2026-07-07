@@ -222,7 +222,7 @@ pub use isolate::*;
 ///         reply: (),
 ///         send: tina::Outbound<std::convert::Infallible>,
 ///         spawn: std::convert::Infallible,
-///         call: std::convert::Infallible,
+///         io: std::convert::Infallible,
 ///         shard: DemoShard,
 ///     }
 ///
@@ -250,7 +250,7 @@ macro_rules! isolate_types {
         spawn: $spawn:ty,
         spawn_observed: $spawn_observed:ty,
         spawn_observed_remote: $spawn_observed_remote:ty,
-        call: $call:ty,
+        io: $io:ty,
         fact: $fact:ty,
         shard: $shard:ty $(,)?
     ) => {
@@ -260,7 +260,7 @@ macro_rules! isolate_types {
         type Spawn = $spawn;
         type SpawnObserved = $spawn_observed;
         type SpawnObservedRemote = $spawn_observed_remote;
-        type Io = $call;
+        type Io = $io;
         type Fact = $fact;
         type Shard = $shard;
     };
@@ -270,7 +270,7 @@ macro_rules! isolate_types {
         send: $send:ty,
         spawn: $spawn:ty,
         spawn_observed: $spawn_observed:ty,
-        call: $call:ty,
+        io: $io:ty,
         fact: $fact:ty,
         shard: $shard:ty $(,)?
     ) => {
@@ -279,7 +279,7 @@ macro_rules! isolate_types {
         type Send = $send;
         type Spawn = $spawn;
         type SpawnObserved = $spawn_observed;
-        type Io = $call;
+        type Io = $io;
         type Fact = $fact;
         type Shard = $shard;
     };
@@ -289,7 +289,7 @@ macro_rules! isolate_types {
         send: $send:ty,
         spawn: $spawn:ty,
         spawn_observed: $spawn_observed:ty,
-        call: $call:ty,
+        io: $io:ty,
         shard: $shard:ty $(,)?
     ) => {
         $crate::isolate_types! {
@@ -298,7 +298,7 @@ macro_rules! isolate_types {
             send: $send,
             spawn: $spawn,
             spawn_observed: $spawn_observed,
-            call: $call,
+            io: $io,
             fact: ::core::convert::Infallible,
             shard: $shard,
         }
@@ -308,7 +308,7 @@ macro_rules! isolate_types {
         reply: $reply:ty,
         send: $send:ty,
         spawn: $spawn:ty,
-        call: $call:ty,
+        io: $io:ty,
         fact: $fact:ty,
         shard: $shard:ty $(,)?
     ) => {
@@ -318,7 +318,7 @@ macro_rules! isolate_types {
             send: $send,
             spawn: $spawn,
             spawn_observed: ::core::convert::Infallible,
-            call: $call,
+            io: $io,
             fact: $fact,
             shard: $shard,
         }
@@ -328,7 +328,7 @@ macro_rules! isolate_types {
         reply: $reply:ty,
         send: $send:ty,
         spawn: $spawn:ty,
-        call: $call:ty,
+        io: $io:ty,
         shard: $shard:ty $(,)?
     ) => {
         $crate::isolate_types! {
@@ -337,7 +337,7 @@ macro_rules! isolate_types {
             send: $send,
             spawn: $spawn,
             spawn_observed: ::core::convert::Infallible,
-            call: $call,
+            io: $io,
             fact: ::core::convert::Infallible,
             shard: $shard,
         }

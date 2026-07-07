@@ -452,7 +452,7 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Isolate for Http
         reply: RequestChunkReply,
         send: tina::Outbound<std::convert::Infallible>,
         spawn: std::convert::Infallible,
-        call: tina_runtime::RuntimeCall<HttpConnectionMsg>,
+        io: tina_runtime::RuntimeCall<HttpConnectionMsg>,
         fact: tina_runtime::ProtocolFact,
         shard: S,
     }

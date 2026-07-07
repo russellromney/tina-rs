@@ -68,7 +68,7 @@ impl Isolate for ShardCounter {
         reply: (),
         send: Outbound<ShardCounterReply>,
         spawn: Infallible,
-        call: RuntimeCall<ShardCounterMsg>,
+        io: RuntimeCall<ShardCounterMsg>,
         shard: AppShard,
     }
 
@@ -119,7 +119,7 @@ impl Isolate for ScatterCoord {
         reply: (),
         send: Outbound<ShardCounterMsg>,
         spawn: Infallible,
-        call: Infallible,
+        io: Infallible,
         shard: AppShard,
     }
 

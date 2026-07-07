@@ -498,7 +498,7 @@ impl<S: Shard + 'static> Isolate for DynamoWorker<S> {
         reply: DynamoResult,
         send: tina::Outbound<Infallible>,
         spawn: Infallible,
-        call: RuntimeCall<DynamoMsg>,
+        io: RuntimeCall<DynamoMsg>,
         shard: S,
     }
 

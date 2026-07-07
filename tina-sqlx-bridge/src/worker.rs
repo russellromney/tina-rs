@@ -628,7 +628,7 @@ impl<S: Shard + 'static> Isolate for PgWorker<S> {
         reply: PgResult,
         send: tina::Outbound<Infallible>,
         spawn: Infallible,
-        call: RuntimeCall<PgMsg>,
+        io: RuntimeCall<PgMsg>,
         shard: S,
     }
 

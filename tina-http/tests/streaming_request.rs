@@ -52,7 +52,7 @@ impl Isolate for Consumer {
         reply: HttpResponse,
         send: tina::Outbound<Infallible>,
         spawn: Infallible,
-        call: RuntimeCall<ConsumerMsg>,
+        io: RuntimeCall<ConsumerMsg>,
         shard: TestShard,
     }
 
@@ -536,7 +536,7 @@ impl Isolate for NotifyingConsumer {
         reply: HttpResponse,
         send: tina::Outbound<Infallible>,
         spawn: Infallible,
-        call: RuntimeCall<NotifyingMsg>,
+        io: RuntimeCall<NotifyingMsg>,
         shard: TestShard,
     }
 

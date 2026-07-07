@@ -510,7 +510,7 @@ mod tests {
             reply: (),
             send: tina::Outbound<std::convert::Infallible>,
             spawn: std::convert::Infallible,
-            call: RuntimeCall<TestMsg>,
+            io: RuntimeCall<TestMsg>,
             shard: tina::SingleShard,
         }
         fn handle(

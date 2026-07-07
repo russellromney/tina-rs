@@ -484,7 +484,7 @@ impl<S: Shard + 'static> Isolate for SqsWorker<S> {
         reply: SqsResult,
         send: tina::Outbound<Infallible>,
         spawn: Infallible,
-        call: RuntimeCall<SqsMsg>,
+        io: RuntimeCall<SqsMsg>,
         shard: S,
     }
 

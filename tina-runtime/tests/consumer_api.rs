@@ -187,7 +187,7 @@ impl Isolate for TimerWorker {
         reply: (),
         send: Outbound<Infallible>,
         spawn: Infallible,
-        call: RuntimeCall<TimerEvent>,
+        io: RuntimeCall<TimerEvent>,
         shard: ConsumerShard,
     }
 
@@ -243,7 +243,7 @@ impl Isolate for ObservedTarget {
         reply: (),
         send: Outbound<Infallible>,
         spawn: Infallible,
-        call: Infallible,
+        io: Infallible,
         shard: ConsumerShard,
     }
 
@@ -276,7 +276,7 @@ impl Isolate for ObservedSender {
         reply: (),
         send: Outbound<Infallible>,
         spawn: Infallible,
-        call: RuntimeCall<ObservedSenderEvent>,
+        io: RuntimeCall<ObservedSenderEvent>,
         shard: ConsumerShard,
     }
 
@@ -354,7 +354,7 @@ impl Isolate for ReplyWorker {
         reply: WorkerReply,
         send: Outbound<Infallible>,
         spawn: Infallible,
-        call: Infallible,
+        io: Infallible,
         shard: ConsumerShard,
     }
 
@@ -405,7 +405,7 @@ impl Isolate for CallerWorker {
         reply: (),
         send: Outbound<Infallible>,
         spawn: Infallible,
-        call: RuntimeCall<CallerEvent>,
+        io: RuntimeCall<CallerEvent>,
         shard: ConsumerShard,
     }
 
@@ -446,7 +446,7 @@ impl Isolate for FillerWorker {
         reply: (),
         send: Outbound<CallerEvent>,
         spawn: Infallible,
-        call: Infallible,
+        io: Infallible,
         shard: ConsumerShard,
     }
 
@@ -671,7 +671,7 @@ impl Isolate for LowLevelWorker {
         reply: (),
         send: Outbound<Infallible>,
         spawn: Infallible,
-        call: RuntimeCall<LowLevelEvent>,
+        io: RuntimeCall<LowLevelEvent>,
         shard: ConsumerShard,
     }
 
@@ -733,7 +733,7 @@ impl Isolate for ChildWorker {
         reply: (),
         send: Outbound<Infallible>,
         spawn: Infallible,
-        call: Infallible,
+        io: Infallible,
         shard: ConsumerShard,
     }
 
@@ -767,7 +767,7 @@ impl Isolate for ParentWorker {
         reply: (),
         send: Outbound<Infallible>,
         spawn: RestartableChildDefinition<ChildWorker>,
-        call: Infallible,
+        io: Infallible,
         shard: ConsumerShard,
     }
 

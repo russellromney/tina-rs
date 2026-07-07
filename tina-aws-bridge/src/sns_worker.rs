@@ -480,7 +480,7 @@ impl<S: Shard + 'static> Isolate for SnsWorker<S> {
         reply: SnsResult,
         send: tina::Outbound<Infallible>,
         spawn: Infallible,
-        call: RuntimeCall<SnsMsg>,
+        io: RuntimeCall<SnsMsg>,
         shard: S,
     }
 

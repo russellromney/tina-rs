@@ -254,7 +254,7 @@ impl Isolate for AllocationSender {
         reply: (),
         send: Outbound<AllocationEvent>,
         spawn: Infallible,
-        call: Infallible,
+        io: Infallible,
         shard: AllocationShard,
     }
 
@@ -276,7 +276,7 @@ impl Isolate for AllocationSink {
         reply: (),
         send: Outbound<Infallible>,
         spawn: Infallible,
-        call: Infallible,
+        io: Infallible,
         shard: AllocationShard,
     }
 
@@ -295,7 +295,7 @@ impl Isolate for BatchSender {
         reply: (),
         send: Outbound<AllocationEvent>,
         spawn: Infallible,
-        call: Infallible,
+        io: Infallible,
         shard: AllocationShard,
     }
 
@@ -320,7 +320,7 @@ impl Isolate for SpawnCostParent {
         reply: (),
         send: Outbound<Infallible>,
         spawn: RestartableChildDefinition<SpawnCostChild>,
-        call: Infallible,
+        io: Infallible,
         shard: AllocationShard,
     }
 
@@ -342,7 +342,7 @@ impl Isolate for SpawnCostChild {
         reply: (),
         send: Outbound<Infallible>,
         spawn: ChildDefinition<AllocationSink>,
-        call: Infallible,
+        io: Infallible,
         shard: AllocationShard,
     }
 
@@ -424,7 +424,7 @@ impl Isolate for CallTarget {
         reply: CallReply,
         send: Outbound<Infallible>,
         spawn: Infallible,
-        call: RuntimeCall<CallRequest>,
+        io: RuntimeCall<CallRequest>,
         shard: AllocationShard,
     }
 
@@ -443,7 +443,7 @@ impl Isolate for CallClient {
         reply: (),
         send: Outbound<Infallible>,
         spawn: Infallible,
-        call: RuntimeCall<CallClientMsg>,
+        io: RuntimeCall<CallClientMsg>,
         shard: AllocationShard,
     }
 
@@ -470,7 +470,7 @@ impl Isolate for TimerClient {
         reply: (),
         send: Outbound<Infallible>,
         spawn: Infallible,
-        call: RuntimeCall<TimerMsg>,
+        io: RuntimeCall<TimerMsg>,
         shard: AllocationShard,
     }
 
@@ -500,7 +500,7 @@ impl Isolate for TcpCostClient {
         reply: (),
         send: Outbound<Infallible>,
         spawn: Infallible,
-        call: RuntimeCall<TcpCostMsg>,
+        io: RuntimeCall<TcpCostMsg>,
         shard: AllocationShard,
     }
 

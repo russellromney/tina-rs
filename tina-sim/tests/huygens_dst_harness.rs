@@ -54,7 +54,7 @@ impl Isolate for Parent {
         reply: (),
         send: Outbound<ChildMsg>,
         spawn: RestartableChildDefinition<Child>,
-        call: RuntimeCall<ParentMsg>,
+        io: RuntimeCall<ParentMsg>,
         shard: HarnessShard,
     }
 
@@ -107,7 +107,7 @@ impl Isolate for Child {
         reply: (),
         send: Outbound<ParentMsg>,
         spawn: std::convert::Infallible,
-        call: RuntimeCall<ChildMsg>,
+        io: RuntimeCall<ChildMsg>,
         shard: HarnessShard,
     }
 
@@ -316,7 +316,7 @@ fn dst_harness_keeps_remote_full_pressure_visible_on_oracle() {
             reply: (),
             send: Outbound<SinkMsg>,
             spawn: Infallible,
-            call: RuntimeCall<SenderMsg>,
+            io: RuntimeCall<SenderMsg>,
             shard: RemoteShard,
         }
 
@@ -342,7 +342,7 @@ fn dst_harness_keeps_remote_full_pressure_visible_on_oracle() {
             reply: (),
             send: Outbound<Infallible>,
             spawn: Infallible,
-            call: RuntimeCall<SinkMsg>,
+            io: RuntimeCall<SinkMsg>,
             shard: RemoteShard,
         }
 

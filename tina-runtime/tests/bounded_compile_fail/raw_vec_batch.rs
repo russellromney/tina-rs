@@ -16,7 +16,7 @@ impl Isolate for Owner {
         reply: (),
         send: Infallible,
         spawn: Infallible,
-        call: Infallible,
+        io: Infallible,
         shard: SingleShard,
     }
 

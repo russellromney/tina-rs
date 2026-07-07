@@ -288,7 +288,7 @@ mod tests {
             reply: RequestChunkReply,
             send: tina::Outbound<Infallible>,
             spawn: Infallible,
-            call: RuntimeCall<HttpConnectionMsg>,
+            io: RuntimeCall<HttpConnectionMsg>,
             shard: SingleShard,
         }
 
@@ -326,7 +326,7 @@ mod tests {
             reply: (),
             send: tina::Outbound<Infallible>,
             spawn: Infallible,
-            call: RuntimeCall<SvcMsg>,
+            io: RuntimeCall<SvcMsg>,
             shard: SingleShard,
         }
 
@@ -423,7 +423,7 @@ mod tests {
             reply: Http2ClientReply,
             send: tina::Outbound<Infallible>,
             spawn: Infallible,
-            call: RuntimeCall<Http2ClientMsg>,
+            io: RuntimeCall<Http2ClientMsg>,
             shard: SingleShard,
         }
 

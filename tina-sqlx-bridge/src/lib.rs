@@ -114,7 +114,7 @@
 //!         reply: (),
 //!         send: tina::Outbound<Infallible>,
 //!         spawn: Infallible,
-//!         call: RuntimeCall<AppMsg>,
+//!         io: RuntimeCall<AppMsg>,
 //!         shard: SingleShard,
 //!     }
 //!

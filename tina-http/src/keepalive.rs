@@ -372,7 +372,7 @@ impl<S: Shard + 'static> Isolate for KeepaliveConnection<S> {
         reply: KeepaliveOutcome,
         send: tina::Outbound<Infallible>,
         spawn: Infallible,
-        call: tina_runtime::RuntimeCall<KeepaliveConnectionMsg>,
+        io: tina_runtime::RuntimeCall<KeepaliveConnectionMsg>,
         shard: S,
     }
 

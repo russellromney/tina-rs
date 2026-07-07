@@ -639,7 +639,7 @@ mod tests {
             reply: crate::websocket::WebSocketSessionOutcome,
             send: tina::Outbound<HttpConnectionMsg>,
             spawn: std::convert::Infallible,
-            call: RuntimeCall<WebSocketSessionMsg>,
+            io: RuntimeCall<WebSocketSessionMsg>,
             shard: DummyShard,
         }
 

@@ -114,7 +114,7 @@ impl Isolate for ShardedCounter {
         reply: (),
         send: Outbound<TrackerMsg>,
         spawn: Infallible,
-        call: RuntimeCall<CounterMsg>,
+        io: RuntimeCall<CounterMsg>,
         shard: AppShard,
     }
 
@@ -170,7 +170,7 @@ impl Isolate for Tracker {
         reply: (),
         send: Outbound<Infallible>,
         spawn: Infallible,
-        call: RuntimeCall<TrackerMsg>,
+        io: RuntimeCall<TrackerMsg>,
         shard: AppShard,
     }
 
@@ -312,7 +312,7 @@ impl Isolate for Worker {
         reply: (),
         send: Outbound<Infallible>,
         spawn: Infallible,
-        call: RuntimeCall<WorkerMsg>,
+        io: RuntimeCall<WorkerMsg>,
         shard: AppShard,
     }
 

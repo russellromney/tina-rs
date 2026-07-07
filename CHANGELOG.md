@@ -8,7 +8,8 @@ This file records completed work.
 
 - Renamed `Effect::Call` to `Effect::Io` for runtime-owned I/O effects.
 - Renamed `Isolate::Call` to `Isolate::Io` for runtime-owned I/O effects.
-- Renamed the isolate macro `call = ...` option to `io = ...`.
+- Renamed the isolate macro `call = ...` option and `isolate_types!` `call:` key
+  to `io`.
 - Removed `sequence()`; use `batch()`.
 - Removed `reply_to_request()`; use `reply_to()` with `RequestContext::into_deferred`.
 - Removed public `Context::take_reply_slot()`; use `Context::take_request_context()`.

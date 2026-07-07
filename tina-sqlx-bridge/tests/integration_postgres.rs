@@ -95,7 +95,7 @@ impl Isolate for CallerIsolate {
         reply: (),
         send: tina::Outbound<Infallible>,
         spawn: Infallible,
-        call: RuntimeCall<CallerMsg>,
+        io: RuntimeCall<CallerMsg>,
         shard: SingleShard,
     }
 
@@ -486,7 +486,7 @@ fn fetch_many_typed_helper_returns_pgrows() {
             reply: (),
             send: tina::Outbound<Infallible>,
             spawn: Infallible,
-            call: RuntimeCall<HelperMsg>,
+            io: RuntimeCall<HelperMsg>,
             shard: SingleShard,
         }
         fn handle(
@@ -977,7 +977,7 @@ fn transaction_typed_helper_returns_outcome() {
             reply: (),
             send: tina::Outbound<Infallible>,
             spawn: Infallible,
-            call: RuntimeCall<HelperMsg>,
+            io: RuntimeCall<HelperMsg>,
             shard: SingleShard,
         }
         fn handle(

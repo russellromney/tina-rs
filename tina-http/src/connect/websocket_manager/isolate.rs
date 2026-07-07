@@ -291,7 +291,7 @@ impl<S: Shard + 'static> Isolate for WebSocketClientManager<S> {
         reply: WebSocketManagerReply,
         send: tina::Outbound<WebSocketClientMsg>,
         spawn: Infallible,
-        call: RuntimeCall<WebSocketManagerMsg>,
+        io: RuntimeCall<WebSocketManagerMsg>,
         fact: ProtocolFact,
         shard: S,
     }

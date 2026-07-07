@@ -114,7 +114,7 @@ impl<S: Shard + 'static> Isolate for HostCallDispatcher<S> {
         reply: (),
         send: TinaOutbound<Infallible>,
         spawn: Infallible,
-        call: RuntimeCall<DispatcherMsg<S>>,
+        io: RuntimeCall<DispatcherMsg<S>>,
         shard: S,
     }
 

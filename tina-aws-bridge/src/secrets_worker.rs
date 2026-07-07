@@ -481,7 +481,7 @@ impl<S: Shard + 'static> Isolate for SecretsWorker<S> {
         reply: SecretsResult,
         send: tina::Outbound<Infallible>,
         spawn: Infallible,
-        call: RuntimeCall<SecretsMsg>,
+        io: RuntimeCall<SecretsMsg>,
         shard: S,
     }
 

@@ -63,7 +63,7 @@ impl Isolate for Proxy {
         reply: HttpResponse,
         send: tina::Outbound<Infallible>,
         spawn: Infallible,
-        call: RuntimeCall<ProxyMsg>,
+        io: RuntimeCall<ProxyMsg>,
         shard: TestShard,
     }
 

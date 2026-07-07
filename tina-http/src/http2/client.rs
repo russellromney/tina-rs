@@ -886,7 +886,7 @@ impl<S: Shard + 'static> Isolate for Http2ClientConnection<S> {
         reply: Http2ClientReply,
         send: tina::Outbound<Infallible>,
         spawn: Infallible,
-        call: tina_runtime::RuntimeCall<Http2ClientMsg>,
+        io: tina_runtime::RuntimeCall<Http2ClientMsg>,
         fact: ProtocolFact,
         shard: S,
     }

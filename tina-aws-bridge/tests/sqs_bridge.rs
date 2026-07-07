@@ -89,7 +89,7 @@ impl Isolate for SqsRelay {
         reply: &'static str,
         send: tina::Outbound<Infallible>,
         spawn: Infallible,
-        call: RuntimeCall<SqsRelayMsg>,
+        io: RuntimeCall<SqsRelayMsg>,
         shard: SingleShard,
     }
 
@@ -136,7 +136,7 @@ impl Isolate for CallerIsolate {
         reply: (),
         send: tina::Outbound<Infallible>,
         spawn: Infallible,
-        call: RuntimeCall<CallerMsg>,
+        io: RuntimeCall<CallerMsg>,
         shard: SingleShard,
     }
 

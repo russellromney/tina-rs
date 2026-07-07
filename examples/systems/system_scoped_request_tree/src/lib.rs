@@ -230,7 +230,7 @@ impl Isolate for Tree {
         reply: HttpResponse,
         send: tina::Outbound<Infallible>,
         spawn: Infallible,
-        call: RuntimeCall<TreeMsg>,
+        io: RuntimeCall<TreeMsg>,
         shard: SingleShard,
     }
 

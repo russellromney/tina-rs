@@ -92,7 +92,7 @@ impl Isolate for S3Relay {
         reply: &'static str,
         send: tina::Outbound<Infallible>,
         spawn: Infallible,
-        call: RuntimeCall<S3RelayMsg>,
+        io: RuntimeCall<S3RelayMsg>,
         shard: SingleShard,
     }
 
@@ -137,7 +137,7 @@ impl Isolate for CallerIsolate {
         reply: (),
         send: tina::Outbound<Infallible>,
         spawn: Infallible,
-        call: RuntimeCall<CallerMsg>,
+        io: RuntimeCall<CallerMsg>,
         shard: SingleShard,
     }
 

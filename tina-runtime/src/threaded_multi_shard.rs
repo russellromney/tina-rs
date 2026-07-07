@@ -901,7 +901,7 @@ where
         reply: (),
         send: TinaOutbound<Infallible>,
         spawn: Infallible,
-        call: RuntimeCall<HostCallMsg<M, R>>,
+        io: RuntimeCall<HostCallMsg<M, R>>,
         shard: S,
     }
 

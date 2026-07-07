@@ -92,7 +92,7 @@ impl Isolate for Worker {
         reply: (),
         send: Outbound<WorkerEvent>,
         spawn: ChildDefinition<Self>,
-        call: Infallible,
+        io: Infallible,
         shard: InlineShard,
     }
 
@@ -113,7 +113,7 @@ impl Isolate for Session {
         reply: Vec<String>,
         send: Outbound<AuditEvent>,
         spawn: ChildDefinition<Worker>,
-        call: SessionCall,
+        io: SessionCall,
         shard: InlineShard,
     }
 

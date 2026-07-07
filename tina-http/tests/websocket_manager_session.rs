@@ -53,7 +53,7 @@ impl Isolate for StubConn {
         reply: WebSocketClientReply,
         send: tina::Outbound<Infallible>,
         spawn: Infallible,
-        call: Infallible,
+        io: Infallible,
         shard: TestShard,
     }
 
@@ -135,7 +135,7 @@ impl Isolate for Driver {
         reply: (),
         send: tina::Outbound<Infallible>,
         spawn: Infallible,
-        call: RuntimeCall<DriverMsg>,
+        io: RuntimeCall<DriverMsg>,
         shard: TestShard,
     }
 

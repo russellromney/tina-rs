@@ -502,7 +502,7 @@ impl<S: Shard + 'static> Isolate for SqliteWorker<S> {
         reply: SqliteResult,
         send: tina::Outbound<Infallible>,
         spawn: Infallible,
-        call: RuntimeCall<SqliteMsg>,
+        io: RuntimeCall<SqliteMsg>,
         shard: S,
     }
 

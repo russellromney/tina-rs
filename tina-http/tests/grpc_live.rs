@@ -285,7 +285,7 @@ impl Isolate for CancelRecordingSource {
         reply: tina_http::ResponseChunkReply,
         send: tina::Outbound<Infallible>,
         spawn: Infallible,
-        call: Infallible,
+        io: Infallible,
         shard: TestShard,
     }
 
@@ -412,7 +412,7 @@ impl Isolate for StreamingEchoSource {
         reply: tina_http::ResponseChunkReply,
         send: tina::Outbound<Infallible>,
         spawn: Infallible,
-        call: tina_runtime::RuntimeCall<tina_http::ResponseChunkMsg>,
+        io: tina_runtime::RuntimeCall<tina_http::ResponseChunkMsg>,
         shard: TestShard,
     }
 
@@ -479,7 +479,7 @@ impl Isolate for HangingGrpc {
         reply: HttpResponse,
         send: tina::Outbound<Infallible>,
         spawn: Infallible,
-        call: tina_runtime::RuntimeCall<HangingMsg>,
+        io: tina_runtime::RuntimeCall<HangingMsg>,
         shard: TestShard,
     }
 

@@ -70,7 +70,7 @@ impl Isolate for Coordinator {
         reply: (),
         send: Outbound<WorkerEvent>,
         spawn: Infallible,
-        call: RuntimeCall<CoordinatorEvent>,
+        io: RuntimeCall<CoordinatorEvent>,
         shard: WorkShard,
     }
 
@@ -151,7 +151,7 @@ impl Isolate for Worker {
         reply: (),
         send: Outbound<CoordinatorEvent>,
         spawn: Infallible,
-        call: RuntimeCall<WorkerEvent>,
+        io: RuntimeCall<WorkerEvent>,
         shard: WorkShard,
     }
 
@@ -296,7 +296,7 @@ impl Isolate for TimedCoordinator {
         reply: (),
         send: Outbound<TimedWorkerEvent>,
         spawn: Infallible,
-        call: RuntimeCall<TimedCoordinatorEvent>,
+        io: RuntimeCall<TimedCoordinatorEvent>,
         shard: WorkShard,
     }
 
@@ -334,7 +334,7 @@ impl Isolate for TimedWorker {
         reply: (),
         send: Outbound<TimedCoordinatorEvent>,
         spawn: Infallible,
-        call: RuntimeCall<TimedWorkerEvent>,
+        io: RuntimeCall<TimedWorkerEvent>,
         shard: WorkShard,
     }
 
@@ -388,7 +388,7 @@ impl Isolate for SupervisorObserver {
         reply: (),
         send: Outbound<Infallible>,
         spawn: Infallible,
-        call: RuntimeCall<SupervisorObservation>,
+        io: RuntimeCall<SupervisorObservation>,
         shard: WorkShard,
     }
 
@@ -413,7 +413,7 @@ impl Isolate for RestartableWorker {
         reply: (),
         send: Outbound<SupervisorObservation>,
         spawn: Infallible,
-        call: RuntimeCall<RestartableWorkerEvent>,
+        io: RuntimeCall<RestartableWorkerEvent>,
         shard: WorkShard,
     }
 
@@ -447,7 +447,7 @@ impl Isolate for SupervisedParent {
         reply: (),
         send: Outbound<Infallible>,
         spawn: RestartableChildDefinition<RestartableWorker>,
-        call: RuntimeCall<SupervisorEvent>,
+        io: RuntimeCall<SupervisorEvent>,
         shard: WorkShard,
     }
 
@@ -492,7 +492,7 @@ impl Isolate for TcpEchoConnection {
         reply: (),
         send: Outbound<Infallible>,
         spawn: Infallible,
-        call: RuntimeCall<TcpConnectionEvent>,
+        io: RuntimeCall<TcpConnectionEvent>,
         shard: WorkShard,
     }
 
@@ -588,7 +588,7 @@ impl Isolate for TcpEchoListener {
         reply: (),
         send: Outbound<TcpControlEvent>,
         spawn: RestartableChildDefinition<TcpEchoConnection>,
-        call: RuntimeCall<TcpControlEvent>,
+        io: RuntimeCall<TcpControlEvent>,
         shard: WorkShard,
     }
 
@@ -687,7 +687,7 @@ impl Isolate for TcpCoordinator {
         reply: (),
         send: Outbound<Infallible>,
         spawn: Infallible,
-        call: RuntimeCall<TcpControlEvent>,
+        io: RuntimeCall<TcpControlEvent>,
         shard: WorkShard,
     }
 
@@ -733,7 +733,7 @@ impl Isolate for DurableTcpFrontend {
         reply: (),
         send: Outbound<DurableStoreMsg>,
         spawn: Infallible,
-        call: RuntimeCall<DurableTcpFrontendMsg>,
+        io: RuntimeCall<DurableTcpFrontendMsg>,
         shard: WorkShard,
     }
 
@@ -890,7 +890,7 @@ impl Isolate for DurableStore {
         reply: (),
         send: Outbound<DurableTcpFrontendMsg>,
         spawn: Infallible,
-        call: RuntimeCall<DurableStoreMsg>,
+        io: RuntimeCall<DurableStoreMsg>,
         shard: WorkShard,
     }
 
@@ -939,7 +939,7 @@ impl Isolate for DurableBatchListener {
         reply: (),
         send: Outbound<DurableBatchListenerMsg>,
         spawn: RestartableChildDefinition<DurableBatchConnection>,
-        call: RuntimeCall<DurableBatchListenerMsg>,
+        io: RuntimeCall<DurableBatchListenerMsg>,
         shard: WorkShard,
     }
 
@@ -1045,7 +1045,7 @@ impl Isolate for DurableBatchConnection {
         reply: (),
         send: Outbound<DurableBatchStoreMsg>,
         spawn: Infallible,
-        call: RuntimeCall<DurableBatchConnectionMsg>,
+        io: RuntimeCall<DurableBatchConnectionMsg>,
         shard: WorkShard,
     }
 
@@ -1150,7 +1150,7 @@ impl Isolate for DurableBatchStore {
         reply: (),
         send: Outbound<DurableBatchConnectionMsg>,
         spawn: Infallible,
-        call: RuntimeCall<DurableBatchStoreMsg>,
+        io: RuntimeCall<DurableBatchStoreMsg>,
         shard: WorkShard,
     }
 

@@ -1588,7 +1588,7 @@ impl<S: Shard + 'static> Isolate for GrpcRouter<S> {
         reply: HttpResponse,
         send: tina::Outbound<Infallible>,
         spawn: Infallible,
-        call: tina_runtime::RuntimeCall<GrpcRouterMsg>,
+        io: tina_runtime::RuntimeCall<GrpcRouterMsg>,
         shard: S,
     }
 
