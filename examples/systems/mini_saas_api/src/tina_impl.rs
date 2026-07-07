@@ -1087,6 +1087,7 @@ impl Controller {
 enum ControllerMsg {
     Http(HttpRequest),
     CloseIngress,
+    Notify(NotifyFlow),
     ReadyDb(
         RequestContext<HttpResponse>,
         bool,
@@ -1104,6 +1105,7 @@ enum ControllerMsg {
         CallOutcome<SqliteResult>,
     ),
     Loaded(RequestContext<HttpResponse>, i64, CallOutcome<SqliteResult>),
+    #[allow(dead_code)]
     NotifyLoaded(
         RequestContext<HttpResponse>,
         u64,
@@ -1111,6 +1113,7 @@ enum ControllerMsg {
         bool,
         CallOutcome<SqliteResult>,
     ),
+    #[allow(dead_code)]
     NotifyAcquired(
         RequestContext<HttpResponse>,
         u64,
@@ -1119,12 +1122,14 @@ enum ControllerMsg {
         bool,
         CallOutcome<WorkerPoolReply<KeepaliveConnAddr>>,
     ),
+    #[allow(dead_code)]
     NotifySent(
         RequestContext<HttpResponse>,
         u64,
         PoolLease<KeepaliveConnAddr>,
         CallOutcome<KeepaliveOutcome>,
     ),
+    #[allow(dead_code)]
     NotifyReleased(
         RequestContext<HttpResponse>,
         u64,
@@ -1152,6 +1157,115 @@ impl From<HttpRequest> for ControllerMsg {
     }
 }
 
+tina::flow! {
+    flow NotifyFlow for Controller {
+        reply HttpResponse;
+
+        step Loaded(scope_id: u64, id: i64, slow: bool) -> SqliteResult {
+            match item_from_rows(id, outcome) {
+                Ok(Some(name)) => {
+                    call(self.outbound_pool, WorkerPoolMsg::Acquire, REQUEST_TIMEOUT)
+                        .then_with_request(req, move |req, outcome| {
+                            ControllerMsg::Notify(NotifyFlow::Acquired(
+                                req, scope_id, id, name, slow, outcome,
+                            ))
+                        })
+                }
+                Ok(None) => {
+                    self.retire_scope(scope_id);
+                    reply_to_request(req, text(StatusCode::NOT_FOUND, "not_found\n"))
+                }
+                Err(response) => {
+                    self.retire_scope(scope_id);
+                    reply_to_request(req, *response)
+                }
+            }
+        }
+
+        step Acquired(scope_id: u64, id: i64, name: String, slow: bool)
+            -> WorkerPoolReply<KeepaliveConnAddr>
+        {
+            match outcome {
+                CallOutcome::Replied(WorkerPoolReply::Acquire(AcquireOutcome::Acquired(
+                    lease,
+                ))) => {
+                    self.outbound_acquired += 1;
+                    let body = if slow {
+                        format!("id={id}&name={name}&slow=true")
+                    } else {
+                        format!("id={id}&name={name}")
+                    };
+                    let request = HttpRequest::post("/notify").text_body(body).build();
+                    // The outbound request call is the request's cancelable
+                    // child: register it into the scope so a scope cancel
+                    // closes the parked wait.
+                    let (effect, handle) = call_cancelable(
+                        *lease.handle(),
+                        KeepaliveConnectionMsg::request(request, REQUEST_TIMEOUT),
+                        REQUEST_TIMEOUT + Duration::from_secs(1),
+                    )
+                    .then(move |outcome| {
+                        ControllerMsg::Notify(NotifyFlow::Sent(req, scope_id, lease, outcome))
+                    });
+                    if let Some(scope) = self.notify_scopes.get(&scope_id) {
+                        scope.register("outbound_request", handle).expect(
+                            "fresh notify scope has room for the single outbound child rail",
+                        );
+                    }
+                    effect
+                }
+                other => {
+                    self.retire_scope(scope_id);
+                    reply_to_request(req, pool_acquire_error_response(other))
+                }
+            }
+        }
+
+        step Sent(scope_id: u64, lease: PoolLease<KeepaliveConnAddr>) -> KeepaliveOutcome {
+            let (ok, disposition) = match &outcome {
+                CallOutcome::Replied(KeepaliveOutcome::Request {
+                    result: Ok(response),
+                    ..
+                }) => (response.status.is_success(), ReleaseDisposition::Reuse),
+                _ => (false, ReleaseDisposition::Retire),
+            };
+            call(
+                self.outbound_pool,
+                WorkerPoolMsg::Release { lease, disposition },
+                REQUEST_TIMEOUT,
+            )
+            .then_with_request(req, move |req, release| {
+                ControllerMsg::Notify(NotifyFlow::Released(req, scope_id, ok, release))
+            })
+        }
+
+        step Released(scope_id: u64, ok: bool) -> WorkerPoolReply<KeepaliveConnAddr> {
+            self.retire_scope(scope_id);
+            match &outcome {
+                CallOutcome::Replied(WorkerPoolReply::Release(ReleaseOutcome::Released)) => {
+                    self.outbound_released += 1;
+                }
+                CallOutcome::Replied(WorkerPoolReply::Release(ReleaseOutcome::Retired)) => {
+                    self.outbound_retired += 1;
+                }
+                _ => {}
+            }
+            match outcome {
+                CallOutcome::Replied(WorkerPoolReply::Release(ReleaseOutcome::Released))
+                    if ok =>
+                {
+                    reply_to_request(req, text(StatusCode::OK, "notified\n"))
+                }
+                CallOutcome::Replied(WorkerPoolReply::Release(_)) if ok => reply_to_request(
+                    req,
+                    text(StatusCode::SERVICE_UNAVAILABLE, "outbound_release\n"),
+                ),
+                _ => reply_to_request(req, text(StatusCode::BAD_GATEWAY, "notify_failed\n")),
+            }
+        }
+    }
+}
+
 impl Isolate for Controller {
     tina::isolate_types! {
         message: ControllerMsg,
@@ -1173,6 +1287,7 @@ impl Isolate for Controller {
                 self.drain.begin();
                 noop()
             }
+            ControllerMsg::Notify(flow) => self.handle_notify_flow(flow),
             ControllerMsg::ReadyDb(req, ingress_stopped, outcome) => match outcome {
                 CallOutcome::Replied(Ok(_)) => call(
                     self.outbound_pool,
@@ -1217,102 +1332,18 @@ impl Isolate for Controller {
             ControllerMsg::Loaded(req, id, outcome) => {
                 reply_to_request(req, item_response(id, outcome))
             }
-            ControllerMsg::NotifyLoaded(req, scope_id, id, slow, outcome) => {
-                match item_from_rows(id, outcome) {
-                    Ok(Some(name)) => {
-                        call(self.outbound_pool, WorkerPoolMsg::Acquire, REQUEST_TIMEOUT)
-                            .then_with_request(req, move |req, outcome| {
-                                ControllerMsg::NotifyAcquired(
-                                    req, scope_id, id, name, slow, outcome,
-                                )
-                            })
-                    }
-                    Ok(None) => {
-                        self.retire_scope(scope_id);
-                        reply_to_request(req, text(StatusCode::NOT_FOUND, "not_found\n"))
-                    }
-                    Err(response) => {
-                        self.retire_scope(scope_id);
-                        reply_to_request(req, *response)
-                    }
-                }
-            }
+            ControllerMsg::NotifyLoaded(req, scope_id, id, slow, outcome) => self
+                .handle_notify_flow(NotifyFlow::Loaded(req, scope_id, id, slow, outcome)),
             ControllerMsg::NotifyAcquired(req, scope_id, id, name, slow, outcome) => {
-                match outcome {
-                    CallOutcome::Replied(WorkerPoolReply::Acquire(AcquireOutcome::Acquired(
-                        lease,
-                    ))) => {
-                        self.outbound_acquired += 1;
-                        let body = if slow {
-                            format!("id={id}&name={name}&slow=true")
-                        } else {
-                            format!("id={id}&name={name}")
-                        };
-                        let request = HttpRequest::post("/notify").text_body(body).build();
-                        // The outbound request call is the request's cancelable
-                        // child: register it into the scope so a scope cancel
-                        // (owner stop, request abort) closes the parked wait.
-                        let (effect, handle) = call_cancelable(
-                            *lease.handle(),
-                            KeepaliveConnectionMsg::request(request, REQUEST_TIMEOUT),
-                            REQUEST_TIMEOUT + Duration::from_secs(1),
-                        )
-                        .then(move |outcome| {
-                            ControllerMsg::NotifySent(req, scope_id, lease, outcome)
-                        });
-                        if let Some(scope) = self.notify_scopes.get(&scope_id) {
-                            scope.register("outbound_request", handle).expect(
-                                "fresh notify scope has room for the single outbound child rail",
-                            );
-                        }
-                        effect
-                    }
-                    other => {
-                        self.retire_scope(scope_id);
-                        reply_to_request(req, pool_acquire_error_response(other))
-                    }
-                }
+                self.handle_notify_flow(NotifyFlow::Acquired(
+                    req, scope_id, id, name, slow, outcome,
+                ))
             }
             ControllerMsg::NotifySent(req, scope_id, lease, outcome) => {
-                let (ok, disposition) = match &outcome {
-                    CallOutcome::Replied(KeepaliveOutcome::Request {
-                        result: Ok(response),
-                        ..
-                    }) => (response.status.is_success(), ReleaseDisposition::Reuse),
-                    _ => (false, ReleaseDisposition::Retire),
-                };
-                call(
-                    self.outbound_pool,
-                    WorkerPoolMsg::Release { lease, disposition },
-                    REQUEST_TIMEOUT,
-                )
-                .then_with_request(req, move |req, release| {
-                    ControllerMsg::NotifyReleased(req, scope_id, ok, release)
-                })
+                self.handle_notify_flow(NotifyFlow::Sent(req, scope_id, lease, outcome))
             }
             ControllerMsg::NotifyReleased(req, scope_id, ok, release) => {
-                self.retire_scope(scope_id);
-                match &release {
-                    CallOutcome::Replied(WorkerPoolReply::Release(ReleaseOutcome::Released)) => {
-                        self.outbound_released += 1;
-                    }
-                    CallOutcome::Replied(WorkerPoolReply::Release(ReleaseOutcome::Retired)) => {
-                        self.outbound_retired += 1;
-                    }
-                    _ => {}
-                }
-                match release {
-                    CallOutcome::Replied(WorkerPoolReply::Release(ReleaseOutcome::Released))
-                        if ok =>
-                    {
-                        reply_to_request(req, text(StatusCode::OK, "notified\n"))
-                    }
-                    CallOutcome::Replied(WorkerPoolReply::Release(_)) if ok => reply_to_request(
-                        req,
-                        text(StatusCode::SERVICE_UNAVAILABLE, "outbound_release\n"),
-                    ),
-                    _ => reply_to_request(req, text(StatusCode::BAD_GATEWAY, "notify_failed\n")),
-                }
+                self.handle_notify_flow(NotifyFlow::Released(req, scope_id, ok, release))
             }
             ControllerMsg::CapacityPool(req, outcome) => {
                 let body = self.body_metrics.snapshot();
@@ -1465,7 +1496,7 @@ impl Controller {
                     REQUEST_TIMEOUT,
                 ))
                 .reply(move |req, outcome| {
-                    ControllerMsg::NotifyLoaded(req, scope_id, id, slow, outcome)
+                    ControllerMsg::Notify(NotifyFlow::Loaded(req, scope_id, id, slow, outcome))
                 })
             }
             _ => call.reply(text(StatusCode::METHOD_NOT_ALLOWED, "method_not_allowed\n")),

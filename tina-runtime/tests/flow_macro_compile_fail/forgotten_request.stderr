@@ -1,0 +1,5 @@
+error: flow step body must mention `req` so caller authority is explicitly replied, threaded, or intentionally dropped
+ --> tests/flow_macro_compile_fail/forgotten_request.rs:9:14
+  |
+9 |         step Done() -> u32 {
+  |              ^^^^

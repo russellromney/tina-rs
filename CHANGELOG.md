@@ -4,6 +4,17 @@ This file records completed work.
 
 ## Unreleased
 
+### Continuation Flow Authoring
+
+- Added `tina::flow!`, which generates explicit continuation enums and
+  dispatch methods for fixed multi-step request handlers without changing the
+  runtime effect contract.
+- Added authority-focused compile-fail coverage and a live runtime test for a
+  generated flow carrying `RequestContext` through `CallOutcome`.
+- Ported the mini SaaS `POST /items/{id}/notify` path to the generated flow
+  surface while keeping the old continuation variants as compatibility
+  forwards, and documented the pattern in the user guide.
+
 ### CI Dependency Hygiene
 
 - Committed the root workspace `Cargo.lock` and switched normal workspace CI

@@ -108,6 +108,10 @@ Do not:
 
 ## Multi-turn reply through RequestContext
 
+For a fixed linear request workflow, prefer `tina::flow!`; see
+[Continuation Flows](29-continuation-flows.md). The manual pattern below is the
+expanded form and is still useful when the workflow branches heavily.
+
 When a service must reply after several turns, the caller's promise can be
 carried as `RequestContext<R>`. This is the same primitive as `DeferredReply`
 but the type name signals the multi-turn intent.

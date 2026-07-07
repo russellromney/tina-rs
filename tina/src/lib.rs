@@ -144,6 +144,11 @@ impl fmt::Debug for StopResult {
     }
 }
 
+/// Generates a continuation enum and dispatcher for multi-step request flows.
+///
+/// The expansion carries `RequestContext<Reply>` and `CallOutcome<T>` through
+/// ordinary messages; it does not add runtime behavior.
+pub use tina_macros::flow;
 /// Declares a Tina isolate from an inherent `impl` block.
 ///
 /// This is the preferred authoring path for ordinary Tina code. Only `message`

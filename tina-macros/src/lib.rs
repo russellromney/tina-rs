@@ -6,11 +6,12 @@
 //! behavior explicit in the handler body.
 
 use proc_macro::TokenStream;
-use quote::quote;
+use quote::{format_ident, quote};
 use syn::parse::{Parse, ParseStream};
+use syn::visit::Visit;
 use syn::{
     Error, FnArg, Ident, ImplItem, ImplItemFn, ItemImpl, Pat, Path, Result, ReturnType, Token,
-    Type, parse_macro_input,
+    Type, Visibility, braced, parenthesized, parse_macro_input,
 };
 
 struct IsolateArgs {
@@ -162,6 +163,204 @@ pub fn isolate(args: TokenStream, input: TokenStream) -> TokenStream {
 #[proc_macro_attribute]
 pub fn runtime_isolate(args: TokenStream, input: TokenStream) -> TokenStream {
     expand_isolate(args, input, CallDefault::RuntimeCall)
+}
+
+/// Generates an explicit continuation enum and dispatcher for a linear flow.
+///
+/// The macro does not add runtime behavior. Each `step` expands to one enum
+/// variant carrying `RequestContext<Reply>`, explicit captured fields, and a
+/// `CallOutcome<T>`, plus one `match` arm in `handle_<flow>`.
+#[proc_macro]
+pub fn flow(input: TokenStream) -> TokenStream {
+    let flow = parse_macro_input!(input as FlowInput);
+    match build_flow(flow) {
+        Ok(tokens) => tokens.into(),
+        Err(error) => error.into_compile_error().into(),
+    }
+}
+
+mod flow_kw {
+    syn::custom_keyword!(flow);
+    syn::custom_keyword!(reply);
+    syn::custom_keyword!(step);
+}
+
+struct FlowInput {
+    visibility: Visibility,
+    name: Ident,
+    isolate: Type,
+    reply: Type,
+    steps: Vec<FlowStep>,
+}
+
+struct FlowStep {
+    name: Ident,
+    captures: Vec<FlowCapture>,
+    outcome: Type,
+    body: Box<syn::Block>,
+}
+
+struct FlowCapture {
+    name: Ident,
+    ty: Type,
+}
+
+impl Parse for FlowInput {
+    fn parse(input: ParseStream<'_>) -> Result<Self> {
+        let visibility: Visibility = input.parse()?;
+        input.parse::<flow_kw::flow>()?;
+        let name: Ident = input.parse()?;
+        input.parse::<Token![for]>()?;
+        let isolate: Type = input.parse()?;
+
+        let content;
+        braced!(content in input);
+
+        content.parse::<flow_kw::reply>()?;
+        let reply: Type = content.parse()?;
+        content.parse::<Token![;]>()?;
+
+        let mut steps = Vec::new();
+        while !content.is_empty() {
+            content.parse::<flow_kw::step>()?;
+            let step_name: Ident = content.parse()?;
+
+            let fields;
+            parenthesized!(fields in content);
+            let mut captures = Vec::new();
+            while !fields.is_empty() {
+                let field_name: Ident = fields.parse()?;
+                fields.parse::<Token![:]>()?;
+                let field_ty: Type = fields.parse()?;
+                captures.push(FlowCapture {
+                    name: field_name,
+                    ty: field_ty,
+                });
+                if fields.peek(Token![,]) {
+                    fields.parse::<Token![,]>()?;
+                }
+            }
+
+            content.parse::<Token![->]>()?;
+            let outcome: Type = content.parse()?;
+            let body: syn::Block = content.parse()?;
+            steps.push(FlowStep {
+                name: step_name,
+                captures,
+                outcome,
+                body: Box::new(body),
+            });
+        }
+
+        if steps.is_empty() {
+            return Err(Error::new_spanned(
+                name,
+                "`tina::flow!` needs at least one `step`",
+            ));
+        }
+
+        Ok(Self {
+            visibility,
+            name,
+            isolate,
+            reply,
+            steps,
+        })
+    }
+}
+
+fn build_flow(flow: FlowInput) -> Result<proc_macro2::TokenStream> {
+    let visibility = &flow.visibility;
+    let flow_name = &flow.name;
+    let isolate = &flow.isolate;
+    let reply = &flow.reply;
+    let handler = format_ident!("handle_{}", ident_to_snake(&flow.name));
+
+    for step in &flow.steps {
+        if !block_mentions_ident(&step.body, "req") {
+            return Err(Error::new_spanned(
+                &step.name,
+                "flow step body must mention `req` so caller authority is explicitly replied, threaded, or intentionally dropped",
+            ));
+        }
+    }
+
+    let variants = flow.steps.iter().map(|step| {
+        let step_name = &step.name;
+        let capture_types = step.captures.iter().map(|capture| &capture.ty);
+        let outcome = &step.outcome;
+        quote! {
+            #step_name(
+                ::tina::RequestContext<#reply>,
+                #(#capture_types,)*
+                ::tina_runtime::CallOutcome<#outcome>,
+            )
+        }
+    });
+
+    let arms = flow.steps.iter().map(|step| {
+        let step_name = &step.name;
+        let capture_names = step.captures.iter().map(|capture| &capture.name);
+        let body = &step.body;
+        quote! {
+            #flow_name::#step_name(req, #(#capture_names,)* outcome) => #body
+        }
+    });
+
+    Ok(quote! {
+        #visibility enum #flow_name {
+            #(#variants,)*
+        }
+
+        impl #isolate {
+            #[deny(unused_variables)]
+            fn #handler(&mut self, msg: #flow_name) -> ::tina::Effect<Self> {
+                match msg {
+                    #(#arms,)*
+                }
+            }
+        }
+    })
+}
+
+fn ident_to_snake(ident: &Ident) -> String {
+    let mut out = String::new();
+    for (idx, ch) in ident.to_string().chars().enumerate() {
+        if ch.is_uppercase() {
+            if idx > 0 {
+                out.push('_');
+            }
+            for lower in ch.to_lowercase() {
+                out.push(lower);
+            }
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+fn block_mentions_ident(block: &syn::Block, ident: &str) -> bool {
+    struct Finder<'a> {
+        ident: &'a str,
+        found: bool,
+    }
+
+    impl<'ast> Visit<'ast> for Finder<'_> {
+        fn visit_expr_path(&mut self, node: &'ast syn::ExprPath) {
+            if node.path.is_ident(self.ident) {
+                self.found = true;
+            }
+            syn::visit::visit_expr_path(self, node);
+        }
+    }
+
+    let mut finder = Finder {
+        ident,
+        found: false,
+    };
+    finder.visit_block(block);
+    finder.found
 }
 
 enum CallDefault {
