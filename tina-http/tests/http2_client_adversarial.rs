@@ -912,7 +912,12 @@ fn abandoned_streamed_response_after_end_stream_is_reaped_without_reset_and_slot
     };
     let limits = Http2ClientLimits {
         max_concurrent_streams: 1,
-        response_stream_idle_timeout: Duration::from_millis(25),
+        // The peer's END_STREAM arrives right behind the streaming head,
+        // but the idle timer arms at head delivery. The timeout must
+        // dwarf frame-processing jitter on a loaded runner, or the timer
+        // fires before the client has read the END_STREAM and sends the
+        // RST this test asserts never happens.
+        response_stream_idle_timeout: Duration::from_millis(300),
         ..Http2ClientLimits::default()
     };
     let client = runtime
@@ -945,7 +950,7 @@ fn abandoned_streamed_response_after_end_stream_is_reaped_without_reset_and_slot
         })
     ));
 
-    std::thread::sleep(Duration::from_millis(100));
+    std::thread::sleep(Duration::from_millis(900));
 
     let outcome = runtime
         .call_blocking(
