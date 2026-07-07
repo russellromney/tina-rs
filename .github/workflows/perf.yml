@@ -13,8 +13,8 @@ jobs:
       - name: Install zsh
         run: sudo apt-get update && sudo apt-get install -y zsh
 
-      - name: Install Rust nightly
-        run: rustup toolchain install nightly --profile minimal
+      - name: Install pinned Rust toolchain
+        run: rustup show
 
       - name: Record perf rows
         run: make perf-record

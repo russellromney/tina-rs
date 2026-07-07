@@ -35,6 +35,10 @@ jobs:
       - name: Install Rust nightly
         run: rustup toolchain install nightly --profile minimal
       - name: Check workspace against a fresh resolve
+        # RUSTUP_TOOLCHAIN overrides the repo pin: this job is the drift
+        # canary for both fresh dependencies and the latest nightly.
+        env:
+          RUSTUP_TOOLCHAIN: nightly
         run: |
           rm Cargo.lock
           cargo update
