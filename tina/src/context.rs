@@ -683,12 +683,10 @@ impl DeferredReplyHandle {
 /// the runtime registry. The runtime mutates `state` to record caller
 /// liveness.
 ///
-/// State is an `AtomicU8` so `DeferredSlotShared` is `Sync` and
-/// `Arc<DeferredSlotShared>` is `Send`. The user-side handle then
-/// satisfies `Send + 'static` for `ThreadedRuntime` registration.
-/// Atomic ordering is `Relaxed` because the slot is always handled on
-/// one shard thread; the atomic is the cheapest type the borrow
-/// checker accepts in `Send + Sync` form.
+/// **Concurrency invariant.** All writes happen on the shard thread that owns
+/// the deferred slot registry. Reads can come from another thread through a
+/// host-held handle or moved isolate state. Writers use `Release`, readers use
+/// `Acquire`, so observers see a consistent terminal transition.
 #[derive(Debug)]
 pub struct DeferredSlotShared {
     slot_id: u64,
@@ -731,7 +729,7 @@ impl DeferredSlotShared {
 
     /// Reads the current state.
     pub fn state(&self) -> DeferredSlotState {
-        match self.state.load(Ordering::Relaxed) {
+        match self.state.load(Ordering::Acquire) {
             SLOT_STATE_OPEN => DeferredSlotState::Open,
             SLOT_STATE_REPLIED => DeferredSlotState::Replied,
             SLOT_STATE_CLOSED => DeferredSlotState::Closed,
@@ -747,7 +745,7 @@ impl DeferredSlotShared {
             DeferredSlotState::Replied => SLOT_STATE_REPLIED,
             DeferredSlotState::Closed => SLOT_STATE_CLOSED,
         };
-        self.state.store(byte, Ordering::Relaxed);
+        self.state.store(byte, Ordering::Release);
     }
 }
 

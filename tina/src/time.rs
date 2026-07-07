@@ -265,9 +265,9 @@ pub enum RecurringCatchUp {
     Skip,
     /// Allow at most `n` immediate catch-up ticks. Each one resolves as a
     /// [`Sleep`](RecurringTickDecision::Sleep) with a zero delay (fire-now)
-    /// and consumes one catch-up budget. After the budget is exhausted, the
-    /// remaining missed ticks are dropped and counted in the first catch-up
-    /// `Sleep`'s `missed_ticks`.
+    /// and consumes one catch-up budget. Ticks beyond the budget are dropped
+    /// and counted in the first catch-up `Sleep`'s `missed_ticks`; this skips
+    /// tick numbers for the dropped portion of the burst.
     Bounded(u32),
     /// Drift forward: schedule the next tick `period` after the observed
     /// `now`. No catch-up; missed ticks become zero.
@@ -302,8 +302,9 @@ pub struct RecurringTickReport {
     /// `now` the caller supplied to produce this decision.
     pub observed_at: Instant,
     /// Number of missed periods coalesced into this decision. Zero when on
-    /// time. Non-zero on [`RecurringTickDecision::Skip`] and on the first
-    /// `Sleep` after a `Skip`.
+    /// time. Non-zero on [`RecurringTickDecision::Skip`], on the first bounded
+    /// catch-up `Sleep` that reports dropped overflow, and on queued bounded
+    /// catch-ups that each represent one overdue tick.
     pub missed_ticks: u64,
     /// How many bounded catch-up ticks remain on this run.
     pub catch_up_remaining: u32,
@@ -535,8 +536,8 @@ impl RecurringTick {
             RecurringCatchUp::Bounded(budget) => {
                 // Fire at most `budget` immediate ticks. Anything past the
                 // budget is dropped, and the count of dropped ticks is carried
-                // visibly on the first Sleep(0) via `missed_ticks`. Subsequent
-                // queued catch-ups report `missed_ticks = 0`.
+                // visibly on the first Sleep(0) via `missed_ticks`. Queued
+                // catch-ups report one missed tick per immediate fire.
                 if budget == 0 {
                     let missed = elapsed_periods.saturating_sub(1);
                     let advance = duration_mul_saturating(self.period, u128::from(elapsed_periods));

@@ -18,8 +18,9 @@
 //! effect type.
 //!
 //! This keeps the dispatcher contract small and uniform: every isolate asks
-//! for runtime work through the same enum. Runtime crates can switch on one
-//! shared envelope instead of handling an open-ended effect language for every
+//! for runtime work through the same enum. The enum has an explicit variant for
+//! each supported runtime action; runtime crates can switch on one shared
+//! envelope instead of handling an open-ended effect language for every
 //! isolate.
 //!
 //! The tradeoff is that the effect *payloads* stay per-isolate via associated
