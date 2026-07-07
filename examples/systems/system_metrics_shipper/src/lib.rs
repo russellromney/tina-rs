@@ -17,7 +17,7 @@ use std::thread;
 use std::time::Duration;
 
 use tina::time::{RecurringCatchUp, RecurringTick, RecurringTickDecision, RecurringTickToken};
-use tina::{CallContext, RequestContext, prelude::*, reply_to_request};
+use tina::{CallContext, RequestContext, prelude::*, reply_to};
 use tina_runtime::lifecycle::{
     CloseAdmission, Health, Lifecycle, ResourceCloseReport, ResourceKind, ServiceShutdownReport,
     ServiceTopology, ShutdownChoreography, ShutdownStep, StepOutcome, TopologyComponent,
@@ -410,7 +410,7 @@ impl Shipper {
                     flushed_on_drain: self.drained_events,
                     drained_batches: self.drained_batches,
                 };
-                return reply_to_request(req, reply);
+                return reply_to(req, reply);
             }
             return noop();
         }
@@ -547,10 +547,10 @@ impl Sink {
         let should_fail = self.fail_every > 0 && self.received as usize % self.fail_every == 0;
         if should_fail {
             self.failures += 1;
-            return reply_to_request(req, SinkReply::Failed);
+            return reply_to(req, SinkReply::Failed);
         }
         self.events += batch.len() as u64;
-        reply_to_request(req, SinkReply::Ack)
+        reply_to(req, SinkReply::Ack)
     }
 }
 

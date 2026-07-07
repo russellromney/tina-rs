@@ -14,7 +14,7 @@ use hyper::service::service_fn;
 use hyper::{Method, Request as HyperRequest, Response as HyperResponse, StatusCode};
 use hyper_util::rt::TokioIo;
 use tina::prelude::*;
-use tina::{CallContext, RequestContext, reply_to_request};
+use tina::{CallContext, RequestContext, reply_to};
 use tina_aws_bridge::{
     InstalledS3Bridge, S3Address, S3CallOutcome, S3Config, S3Credentials, S3DeleteObject, S3Error,
     S3GetObject, S3HeadObject, S3Object, S3PutObject, S3Request, S3Response, S3Worker,
@@ -105,9 +105,9 @@ impl Isolate for S3Relay {
             S3RelayMsg::Put { .. } => noop(),
             S3RelayMsg::PutDone(req, outcome) => match outcome {
                 tina_runtime::CallOutcome::Replied(Ok(S3Response::PutObject(_))) => {
-                    reply_to_request(req, "stored")
+                    reply_to(req, "stored")
                 }
-                _ => reply_to_request(req, "failed"),
+                _ => reply_to(req, "failed"),
             },
         }
     }

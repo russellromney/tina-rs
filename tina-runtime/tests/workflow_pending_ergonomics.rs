@@ -1,4 +1,4 @@
-//! Phase 110 — end-to-end tests for the workflow pending helpers.
+//! End-to-end tests for the workflow pending helpers.
 //!
 //! Unit tests cover the storage layer directly. These tests exercise
 //! the real call path through `ThreadedRuntime` so the user-visible
@@ -16,7 +16,8 @@ use tina::prelude::*;
 use tina::{CallRejectedReason, reply_to};
 use tina_runtime::{
     CallOutcome, CancelableWork, DefaultThreadedMailboxFactory, GuardedParkCallError,
-    GuardedPendingReplies, ParkCallError, PendingReplies, ThreadedRuntime, WaitList, sleep,
+    GuardedPendingReplies, ParkCallError, PendingReplies, SharedWork, SharedWorkCallError,
+    ThreadedRuntime, sleep,
 };
 
 // ---------------------------------------------------------------------------
@@ -407,7 +408,7 @@ fn guarded_park_full_returns_guard_back_for_drop() {
 }
 
 // ---------------------------------------------------------------------------
-// WaitList: many callers wait for one key, single resolution unblocks all.
+// SharedWork: many callers wait for one key, single resolution unblocks all.
 // ---------------------------------------------------------------------------
 
 #[derive(Debug)]
@@ -417,7 +418,7 @@ enum WaitSvcMsg {
 }
 
 struct WaitSvc {
-    waiters: WaitList<u32, u64>,
+    waiters: SharedWork<u32, u64>,
     armed: bool,
 }
 
@@ -444,7 +445,7 @@ impl WaitSvc {
 
     fn handle_call(&mut self, msg: WaitSvcMsg, call: CallContext<'_, Self>) -> Effect<Self> {
         match msg {
-            WaitSvcMsg::Get => match self.waiters.park_call(1u32, call) {
+            WaitSvcMsg::Get => match self.waiters.wait_call(1u32, call) {
                 Ok(_ticket) => {
                     if self.armed {
                         noop()
@@ -453,14 +454,14 @@ impl WaitSvc {
                         sleep(Duration::from_millis(20)).then_event(|| WaitSvcMsg::Resolve)
                     }
                 }
-                Err(tina_runtime::wait_list::WaitCallError::Full { call, .. }) => call.reply(0),
-                Err(tina_runtime::wait_list::WaitCallError::KeyFull { call, .. }) => call.reply(0),
-                Err(tina_runtime::wait_list::WaitCallError::NoCaller { call, .. }) => {
+                Err(SharedWorkCallError::Full { call, .. }) => call.reply(0),
+                Err(SharedWorkCallError::KeyFull { call, .. }) => call.reply(0),
+                Err(SharedWorkCallError::NoCaller { call, .. }) => {
                     call.reject(CallRejectedReason::UnsupportedMessage)
                 }
-                Err(tina_runtime::wait_list::WaitCallError::CrossShardUnsupported {
-                    call, ..
-                }) => call.reject(CallRejectedReason::UnsupportedMessage),
+                Err(SharedWorkCallError::CrossShardUnsupported { call, .. }) => {
+                    call.reject(CallRejectedReason::UnsupportedMessage)
+                }
             },
             WaitSvcMsg::Resolve => call.reject(CallRejectedReason::UnsupportedMessage),
         }
@@ -468,7 +469,7 @@ impl WaitSvc {
 }
 
 #[test]
-fn waitlist_e2e_three_callers_get_same_reply_on_resolution() {
+fn shared_work_e2e_three_callers_get_same_reply_on_resolution() {
     let runtime = Arc::new(ThreadedRuntime::new(
         SingleShard,
         DefaultThreadedMailboxFactory,
@@ -476,7 +477,7 @@ fn waitlist_e2e_three_callers_get_same_reply_on_resolution() {
     let svc = runtime
         .register_service::<_, Infallible>(
             WaitSvc {
-                waiters: WaitList::with_capacity(8).named("wait.e2e"),
+                waiters: SharedWork::with_capacity(8).named("wait.e2e"),
                 armed: false,
             },
             16,
@@ -510,7 +511,7 @@ fn waitlist_e2e_three_callers_get_same_reply_on_resolution() {
 }
 
 // ---------------------------------------------------------------------------
-// WaitList: per-key cap full returns typed KeyFull reply.
+// SharedWork: per-key cap full returns typed KeyFull reply.
 // ---------------------------------------------------------------------------
 
 #[derive(Debug)]
@@ -519,7 +520,7 @@ enum WaitFullMsg {
 }
 
 struct WaitFullSvc {
-    waiters: WaitList<u32, u64>,
+    waiters: SharedWork<u32, u64>,
 }
 
 #[tina_runtime::isolate(message = WaitFullMsg, reply = u64)]
@@ -533,14 +534,14 @@ impl WaitFullSvc {
     }
 
     fn handle_call(&mut self, _msg: WaitFullMsg, call: CallContext<'_, Self>) -> Effect<Self> {
-        match self.waiters.park_call(1u32, call) {
+        match self.waiters.wait_call(1u32, call) {
             Ok(_ticket) => noop(),
-            Err(tina_runtime::wait_list::WaitCallError::KeyFull { call, .. }) => call.reply(11),
-            Err(tina_runtime::wait_list::WaitCallError::Full { call, .. }) => call.reply(22),
-            Err(tina_runtime::wait_list::WaitCallError::NoCaller { call, .. }) => {
+            Err(SharedWorkCallError::KeyFull { call, .. }) => call.reply(11),
+            Err(SharedWorkCallError::Full { call, .. }) => call.reply(22),
+            Err(SharedWorkCallError::NoCaller { call, .. }) => {
                 call.reject(CallRejectedReason::UnsupportedMessage)
             }
-            Err(tina_runtime::wait_list::WaitCallError::CrossShardUnsupported { call, .. }) => {
+            Err(SharedWorkCallError::CrossShardUnsupported { call, .. }) => {
                 call.reject(CallRejectedReason::UnsupportedMessage)
             }
         }
@@ -548,7 +549,7 @@ impl WaitFullSvc {
 }
 
 #[test]
-fn waitlist_per_key_full_returns_typed_keyfull_reply() {
+fn shared_work_per_key_full_returns_typed_keyfull_reply() {
     let runtime = Arc::new(ThreadedRuntime::new(
         SingleShard,
         DefaultThreadedMailboxFactory,
@@ -556,7 +557,7 @@ fn waitlist_per_key_full_returns_typed_keyfull_reply() {
     let svc = runtime
         .register_service::<_, Infallible>(
             WaitFullSvc {
-                waiters: WaitList::with_key_limit(8, 2).named("wait.keyfull"),
+                waiters: SharedWork::with_key_limit(8, 2).named("wait.keyfull"),
             },
             16,
         )
@@ -661,7 +662,7 @@ fn capacity_reports_have_named_helper_lines() {
     let g = GuardedPendingReplies::<u32, u32, DropCounter>::with_capacity(4).named("svc.guarded");
     assert_eq!(g.capacity_report().name, "svc.guarded");
 
-    let w = WaitList::<u32, u32>::with_capacity(4).named("svc.waiters");
+    let w = SharedWork::<u32, u32>::with_capacity(4).named("svc.waiters");
     assert_eq!(w.capacity_report().name, "svc.waiters");
 
     let cw =
@@ -680,15 +681,15 @@ fn guarded_pending_replies_zero_capacity_panics() {
 }
 
 #[test]
-#[should_panic(expected = "WaitList capacity must be positive")]
-fn waitlist_zero_capacity_panics() {
-    let _: WaitList<u32, u32> = WaitList::with_capacity(0);
+#[should_panic(expected = "SharedWork capacity must be positive")]
+fn shared_work_zero_capacity_panics() {
+    let _: SharedWork<u32, u32> = SharedWork::with_capacity(0);
 }
 
 #[test]
-#[should_panic(expected = "WaitList per-key limit must be positive")]
-fn waitlist_zero_per_key_limit_panics() {
-    let _: WaitList<u32, u32> = WaitList::with_key_limit(8, 0);
+#[should_panic(expected = "SharedWork per-key limit must be positive")]
+fn shared_work_zero_per_key_limit_panics() {
+    let _: SharedWork<u32, u32> = SharedWork::with_key_limit(8, 0);
 }
 
 #[test]

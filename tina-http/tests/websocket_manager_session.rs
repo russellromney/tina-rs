@@ -16,7 +16,7 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 use tina::prelude::*;
-use tina::{Address, CallContext, reply_to_request};
+use tina::{Address, CallContext, reply_to};
 use tina_http::{
     AddressFamilyPolicy, ConnectPolicy, WebSocketClientConnected, WebSocketClientEvent,
     WebSocketClientManager, WebSocketClientMsg, WebSocketClientReply, WebSocketClientReport,
@@ -66,7 +66,7 @@ impl Isolate for StubConn {
             WebSocketClientMsg::Stop => {
                 let mut effects = Vec::new();
                 while let Some(req) = self.held_connects.pop() {
-                    effects.push(reply_to_request(
+                    effects.push(reply_to(
                         req,
                         WebSocketClientReply::Connected(Err(
                             tina_http::WebSocketClientError::Closed,

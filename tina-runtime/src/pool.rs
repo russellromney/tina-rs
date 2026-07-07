@@ -552,8 +552,8 @@ where
         // deferred slot so the in-flight tracker can observe the
         // delivery and recover the resource if the caller cancels.
         // `reply()` (immediate) gives no observable slot. So always
-        // take_reply_slot first; classify the outcome after.
-        let slot = match ctx.take_reply_slot() {
+        // take_request_context first; classify the outcome after.
+        let slot = match ctx.take_request_context() {
             Ok(s) => s,
             Err(tina::TakeReplySlotError::NoCaller) => {
                 self.counters.no_caller_drops += 1;
@@ -569,7 +569,7 @@ where
             }
         };
 
-        self.handle_acquire_slot(slot)
+        self.handle_acquire_slot(slot.into())
     }
 
     fn handle_acquire_slot(&mut self, slot: DeferredReply<WorkerPoolReply<H>>) -> Effect<Self> {

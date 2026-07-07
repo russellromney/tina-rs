@@ -410,9 +410,9 @@ impl ChainService {
         match msg {
             ChainMsg::Run => noop(),
             ChainMsg::PingReturned(request, CallOutcome::Replied(PingReply::Pong)) => {
-                reply_to_request(request, ChainReply::Done)
+                reply_to(request, ChainReply::Done)
             }
-            ChainMsg::PingReturned(request, _) => reply_to_request(request, ChainReply::Done),
+            ChainMsg::PingReturned(request, _) => reply_to(request, ChainReply::Done),
         }
     }
 

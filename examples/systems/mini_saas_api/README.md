@@ -171,14 +171,14 @@ HTTP call -> Controller CallContext
   -> call(...).then_with_request(req, NotifyAcquired)   // outbound pool acquire
   -> call(...).then_with_request(req, NotifySent)       // keepalive request
   -> call(...).then_with_request(req, NotifyReleased)   // pool release
-  -> reply_to_request(req, ...)                          // final HttpResponse
+  -> reply_to(req, ...)                          // final HttpResponse
 ```
 
 The first hop uses `call_ctx.defer(work).reply(...)` to consume caller
 authority and carry it into the next continuation as `RequestContext<R>`.
 Each follow-on hop calls `then_with_request(req, ...)` to keep that context
 moving across messages. The final turn settles the caller with
-`reply_to_request`. There is no hidden caller context preservation; `Full`,
+`reply_to`. There is no hidden caller context preservation; `Full`,
 `Closed`, and `Timeout` remain distinct in the route bodies at every hop.
 
 ### Request Scope On The Notify Path

@@ -77,7 +77,7 @@ impl Isolate for DeferredSvc {
         match msg {
             SvcRequest::Capture(payload) => {
                 self.payload = payload;
-                self.slot = Some(ctx.take_reply_slot().unwrap());
+                self.slot = Some(ctx.take_request_context().unwrap().into_deferred());
                 noop()
             }
             SvcRequest::ReplyStored => {
@@ -89,7 +89,7 @@ impl Isolate for DeferredSvc {
                 noop()
             }
             SvcRequest::TakeWithoutCaller => {
-                match ctx.take_reply_slot() {
+                match ctx.take_request_context() {
                     Err(TakeReplySlotError::NoCaller) => {
                         self.probe.borrow_mut().take_no_caller_errors += 1;
                     }
@@ -241,7 +241,7 @@ fn deferred_reply_capture_and_send_routes_to_original_caller() {
 }
 
 #[test]
-fn take_reply_slot_without_caller_errors_visibly() {
+fn take_request_context_without_caller_errors_visibly() {
     let (mut runtime, _clock, svc, _caller, _outcomes, probe) = build_world();
 
     // Plain send — no caller.
@@ -302,7 +302,7 @@ fn panic_after_capture_drops_slot_and_closes_caller() {
             _msg: Self::Message,
             ctx: &mut Context<'_, Self::Shard, Self::Reply>,
         ) -> Effect<Self> {
-            let _slot = ctx.take_reply_slot().unwrap();
+            let _slot = ctx.take_request_context().unwrap();
             panic!("boom after deferred capture");
         }
 
@@ -429,7 +429,7 @@ fn capture_supersedes_subsequent_effect_reply_in_same_handler_turn() {
             _msg: Self::Message,
             ctx: &mut Context<'_, Self::Shard, Self::Reply>,
         ) -> Effect<Self> {
-            let _slot = ctx.take_reply_slot().unwrap();
+            let _slot = ctx.take_request_context().unwrap();
             // Drop the slot immediately and try to reply normally —
             // the captured slot's Drop will surface as Dropped event,
             // and Effect::Reply has no caller anymore.
@@ -558,8 +558,8 @@ fn pending_box_reclaims_slots_after_caller_timeouts_and_admits_new_callers() {
         ) -> Effect<Self> {
             match msg {
                 FrontendMsg::Capture(key) => {
-                    let slot = ctx.take_reply_slot().unwrap();
-                    if let Err(err) = self.pending.try_insert(key, slot) {
+                    let slot = ctx.take_request_context().unwrap();
+                    if let Err(err) = self.pending.try_insert(key, slot.into()) {
                         // Slot drops on err; surfaces as Dropped event.
                         let _ = err;
                     }
@@ -736,8 +736,8 @@ fn lifo_drain_routes_each_reply_to_its_original_caller_by_call_id() {
                 FanSvcMsg::Capture => {
                     self.next_id += 1;
                     self.ids.push(self.next_id);
-                    let slot = ctx.take_reply_slot().unwrap();
-                    self.slots.push(slot);
+                    let slot = ctx.take_request_context().unwrap();
+                    self.slots.push(slot.into());
                     noop()
                 }
                 FanSvcMsg::Drain => {
@@ -959,11 +959,11 @@ impl Isolate for PoolFrontend {
                     // capturing the slot.
                     return tina::reply(FrontendReply::Full);
                 }
-                let slot = ctx.take_reply_slot().unwrap();
+                let slot = ctx.take_request_context().unwrap();
                 let req_id = self.next_req;
                 self.next_req += 1;
                 self.pending
-                    .try_insert(req_id, slot)
+                    .try_insert(req_id, slot.into())
                     .unwrap_or_else(|_| panic!("admission must succeed after sweep"));
                 let worker_idx = self.next_worker % self.workers.len();
                 self.next_worker += 1;
@@ -1225,7 +1225,7 @@ impl Isolate for Coordinator {
     ) -> Effect<Self> {
         match msg {
             CoordMsg::Start(payload) => {
-                self.slot = Some(ctx.take_reply_slot().unwrap());
+                self.slot = Some(ctx.take_request_context().unwrap().into_deferred());
                 self.collected = vec![None; self.targets.len()];
                 self.remaining = self.targets.len();
                 let mut subcalls = Vec::with_capacity(self.targets.len());
@@ -1408,7 +1408,8 @@ fn pooled_frontend_returns_full_when_pending_box_is_at_cap() {
             // pending. The abandoned-caller guard closes uncaptured
             // callers immediately; keeping the slot alive is the
             // legitimate way to defer a reply.
-            self.held.push(ctx.take_reply_slot().unwrap());
+            self.held
+                .push(ctx.take_request_context().unwrap().into_deferred());
             noop()
         }
 
@@ -1514,7 +1515,8 @@ fn service_stop_drops_pending_promises_visibly() {
         ) -> Effect<Self> {
             match msg {
                 SvcStopMsg::Capture => {
-                    self.slots.push(ctx.take_reply_slot().unwrap());
+                    self.slots
+                        .push(ctx.take_request_context().unwrap().into_deferred());
                     noop()
                 }
                 SvcStopMsg::Halt => Effect::Stop,
@@ -2116,12 +2118,12 @@ fn wrong_reply_type_via_runtime_internal_surfaces_typemismatch() {
         ) -> Effect<Self> {
             match msg {
                 WrongMsg::Capture => {
-                    // Capture for ActualReply via take_reply_slot.
-                    let real = ctx.take_reply_slot().unwrap();
+                    // Capture for ActualReply via take_request_context.
+                    let real = ctx.take_request_context().unwrap();
                     // Escape via runtime_internal: rebuild as
                     // DeferredReply<WrongReply>. This is exactly the
                     // pattern codex called out.
-                    let handle = tina::runtime_internal::deferred_into_handle(real);
+                    let handle = tina::runtime_internal::deferred_into_handle(real.into());
                     let bad: DeferredReply<WrongReply> =
                         tina::runtime_internal::deferred_from_handle(handle);
                     self.bad_slot = Some(bad);

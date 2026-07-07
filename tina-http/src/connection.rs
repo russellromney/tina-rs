@@ -43,7 +43,7 @@ use std::time::Duration;
 
 use http::StatusCode;
 use tina::prelude::*;
-use tina::{CallContext, RequestContext, reply_to_request};
+use tina::{CallContext, RequestContext, reply_to};
 use tina_runtime::{
     CallError, CallInput, CallOutcome, CallOutput, RuntimeCall, RuntimeCallCompletion,
     TcpReadBufReply, TcpWriteOwnedCloseReply, TcpWriteOwnedReply, TlsReadBufReply,
@@ -1137,7 +1137,7 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
 
     fn reply_request_body_chunk(&mut self, chunk: RequestChunkReply) -> Effect<Self> {
         match self.pending_request_body_reply.take() {
-            Some(request) => reply_to_request(request, chunk),
+            Some(request) => reply_to(request, chunk),
             None => reply(chunk),
         }
     }

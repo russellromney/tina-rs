@@ -139,26 +139,24 @@ impl Driver {
                 match admission {
                     Ok(effect) => effect,
                     Err(ScopedAdmitError::ScopeCancelled { cause, token }) => {
-                        tina::reply_to_request::<Self>(
+                        tina::reply_to::<Self>(
                             token.into_request_context(),
                             DriverReply::ScopeCancelled(cause),
                         )
                     }
-                    Err(ScopedAdmitError::ScopeFull { cap, token }) => {
-                        tina::reply_to_request::<Self>(
-                            token.into_request_context(),
-                            DriverReply::ScopeFull { cap },
-                        )
-                    }
+                    Err(ScopedAdmitError::ScopeFull { cap, token }) => tina::reply_to::<Self>(
+                        token.into_request_context(),
+                        DriverReply::ScopeFull { cap },
+                    ),
                     Err(ScopedAdmitError::Pending(PendingCancelableInsertError::Full {
                         token,
-                    })) => tina::reply_to_request::<Self>(
+                    })) => tina::reply_to::<Self>(
                         token.into_request_context(),
                         DriverReply::PendingFull,
                     ),
                     Err(ScopedAdmitError::Pending(
                         PendingCancelableInsertError::DuplicateKey { token },
-                    )) => tina::reply_to_request::<Self>(
+                    )) => tina::reply_to::<Self>(
                         token.into_request_context(),
                         DriverReply::PendingDuplicate,
                     ),

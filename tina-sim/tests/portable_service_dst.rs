@@ -126,10 +126,10 @@ impl Worker {
                 .then(move |result| WorkerMsg::DurableForCall(req, result, request, index))
             }
             WorkerMsg::AuditedForCall(req, SendOutcome::Full, _) => {
-                tina::reply_to_request(req, WorkerReply::DurableFailure(CallError::TargetFull))
+                tina::reply_to(req, WorkerReply::DurableFailure(CallError::TargetFull))
             }
             WorkerMsg::AuditedForCall(req, SendOutcome::Closed, _) => {
-                tina::reply_to_request(req, WorkerReply::DurableFailure(CallError::TargetClosed))
+                tina::reply_to(req, WorkerReply::DurableFailure(CallError::TargetClosed))
             }
             WorkerMsg::Durable(Ok(()), request, index) => {
                 self.next_index = index + 1;
@@ -138,10 +138,10 @@ impl Worker {
             WorkerMsg::Durable(Err(error), _, _) => reply(WorkerReply::DurableFailure(error)),
             WorkerMsg::DurableForCall(req, Ok(()), request, index) => {
                 self.next_index = index + 1;
-                tina::reply_to_request(req, WorkerReply::Stored(request.key))
+                tina::reply_to(req, WorkerReply::Stored(request.key))
             }
             WorkerMsg::DurableForCall(req, Err(error), _, _) => {
-                tina::reply_to_request(req, WorkerReply::DurableFailure(error))
+                tina::reply_to(req, WorkerReply::DurableFailure(error))
             }
             WorkerMsg::Stop => stop(),
             WorkerMsg::Panic => panic!("baobab dst worker panic"),

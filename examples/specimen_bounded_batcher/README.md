@@ -10,7 +10,7 @@ replies to all of them with the batch total when either:
 ## Phase-061 primitives used
 
 - `PendingReplies::with_capacity(MAX_PENDING)` — bounded promise box.
-- `Context::take_reply_slot` via `try_capture` — capture each
+- `Context::take_request_context` via `try_capture` — capture each
   caller as a deferred slot.
 - `take(qid)` + `reply_to(slot, BatcherReply::Batched(total))` —
   flush the batch in one effect batch.

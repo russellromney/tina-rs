@@ -20,7 +20,7 @@ use std::time::Duration;
 use common::TestShard;
 use prost::Message;
 use tina::prelude::*;
-use tina::{CallContext, reply_to_request};
+use tina::{CallContext, reply_to};
 use tina_http::{
     GrpcBufferedServerStreamingResponse, GrpcBufferedStreamLimits, GrpcClient,
     GrpcClientStreamingRequest, GrpcError, GrpcLimits, GrpcRequest, GrpcRequestStream,
@@ -677,25 +677,21 @@ impl StreamingEchoSource {
         reply: GrpcStreamReply<CounterRequest>,
     ) -> Effect<Self> {
         match reply {
-            GrpcStreamReply::Message(request) => {
-                reply_to_request(pending, self.reply_for_message(request))
-            }
+            GrpcStreamReply::Message(request) => reply_to(pending, self.reply_for_message(request)),
             GrpcStreamReply::NeedMore => {
                 self.pending = Some(pending);
                 self.pull_request()
             }
             GrpcStreamReply::Eof => {
                 self.eof = true;
-                reply_to_request(pending, ResponseChunkReply::Eof)
+                reply_to(pending, ResponseChunkReply::Eof)
             }
-            GrpcStreamReply::Status(status) => {
-                reply_to_request(pending, self.finish_with_status(status))
-            }
-            GrpcStreamReply::Cancelled => reply_to_request(
+            GrpcStreamReply::Status(status) => reply_to(pending, self.finish_with_status(status)),
+            GrpcStreamReply::Cancelled => reply_to(
                 pending,
                 self.finish_with_status(GrpcStatus::new(GrpcStatusCode::Cancelled)),
             ),
-            GrpcStreamReply::DeadlineExceeded => reply_to_request(
+            GrpcStreamReply::DeadlineExceeded => reply_to(
                 pending,
                 self.finish_with_status(GrpcStatus::new(GrpcStatusCode::DeadlineExceeded)),
             ),

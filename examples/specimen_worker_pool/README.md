@@ -7,7 +7,7 @@ out of order.
 
 Phase-061 primitives used:
 
-- `Context::take_reply_slot` / `PendingReplies::try_capture` —
+- `Context::take_request_context` / `PendingReplies::try_capture` —
   capture the original caller as a one-shot deferred slot.
 - `PendingReplies::take(qid)` — pull the slot back when the worker
   reply matches.

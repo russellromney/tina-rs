@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use tina::{
     Address, CallContext, Context, Effect, Isolate, Outbound, RequestContext, Shard, batch, noop,
-    reply_to_request,
+    reply_to,
 };
 use tina_runtime::{CallOutcome, RuntimeCall, RuntimeEventKind};
 use tina_sim::{MultiShardSimulator, MultiShardSimulatorConfig, Simulator, SimulatorConfig};
@@ -101,9 +101,9 @@ impl Isolate for Svc {
             SvcMsg::Start => noop(),
             SvcMsg::ProbeResult(req, outcome) => match outcome {
                 CallOutcome::Replied(ProbeReply(val)) if val >= 10 => {
-                    reply_to_request(req, SvcReply::Ready)
+                    reply_to(req, SvcReply::Ready)
                 }
-                _ => reply_to_request(req, SvcReply::NotReady),
+                _ => reply_to(req, SvcReply::NotReady),
             },
         }
     }
@@ -756,9 +756,9 @@ impl Isolate for CrossSvc {
             CrossSvcMsg::Start => noop(),
             CrossSvcMsg::RejectNow => noop(),
             CrossSvcMsg::ProbeResult(req, CallOutcome::Replied(CrossProbeReply(42))) => {
-                reply_to_request(req, CrossSvcReply::Ready)
+                reply_to(req, CrossSvcReply::Ready)
             }
-            CrossSvcMsg::ProbeResult(req, _) => reply_to_request(req, CrossSvcReply::Ready),
+            CrossSvcMsg::ProbeResult(req, _) => reply_to(req, CrossSvcReply::Ready),
         }
     }
 

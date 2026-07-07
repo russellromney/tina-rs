@@ -40,9 +40,9 @@ impl Worker {
         match msg {
             WorkerMsg::Do(_) => noop(),
             WorkerMsg::Done(req, Ok(()), result) => {
-                reply_to_request(req, WorkerReply::Result(result))
+                reply_to(req, WorkerReply::Result(result))
             }
-            WorkerMsg::Done(req, Err(_), _) => reply_to_request(req, WorkerReply::TimerFailed),
+            WorkerMsg::Done(req, Err(_), _) => reply_to(req, WorkerReply::TimerFailed),
         }
     }
 

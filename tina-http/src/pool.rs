@@ -28,7 +28,7 @@
 use std::marker::PhantomData;
 
 use tina::prelude::*;
-use tina::{CallContext, RequestContext, reply_to_request};
+use tina::{CallContext, RequestContext, reply_to};
 use tina_runtime::{CallOutcome, RuntimeCall, call};
 
 use crate::client::{HttpClientMsg, OutboundCall};
@@ -106,7 +106,7 @@ impl<S: Shard + 'static> Isolate for HttpConnectionPool<S> {
                     CallOutcome::Timeout => Err(HttpClientError::Timeout),
                     CallOutcome::Rejected(_) => Err(HttpClientError::Closed),
                 };
-                reply_to_request(request, result)
+                reply_to(request, result)
             }
         }
     }

@@ -384,7 +384,7 @@ pub mod runtime_internal {
     }
 
     /// Wrap a handle into a typed slot. Used internally by
-    /// [`crate::Context::take_reply_slot`]; runtime crates do not
+    /// [`crate::Context::take_request_context`]; runtime crates do not
     /// normally need this.
     pub fn deferred_from_handle<R>(handle: DeferredReplyHandle) -> DeferredReply<R> {
         DeferredReply {
@@ -481,12 +481,11 @@ pub mod prelude {
         PendingCallSetInsertError, RequestCall, RequestContext, RequestDeferCancelableThrough,
         RequestDeferThrough, RequestEffect, RestartableChildDefinition, Shard, ShardId,
         SingleShard, SpawnObservedError, batch, fail, isolate, isolate_types, noop, reply,
-        reply_to, reply_to_request, restart_children, send, sequence, spawn, spawn_observed, stop,
-        stop_children, stop_with,
+        reply_to, restart_children, send, spawn, spawn_observed, stop, stop_children, stop_with,
         time::{
-            Backoff, BackoffDelay, IntervalDelay, MissedTickPolicy, RecurringCatchUp,
-            RecurringTick, RecurringTickDecision, RecurringTickReport, RecurringTickStale,
-            RecurringTickToken, TimerConfigError, TimerDecision, TimerInterval,
+            Backoff, BackoffDelay, RecurringCatchUp, RecurringTick, RecurringTickDecision,
+            RecurringTickReport, RecurringTickStale, RecurringTickToken, TimerConfigError,
+            TimerDecision,
         },
     };
 }

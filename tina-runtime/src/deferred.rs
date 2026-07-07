@@ -410,7 +410,7 @@ where
 
     /// Capture the current caller in one call, sweeping first.
     ///
-    /// Composes [`tina::Context::take_reply_slot`] with
+    /// Composes [`tina::Context::take_request_context`] with
     /// [`try_insert`](Self::try_insert): sweeps abandoned slots, checks
     /// admission, captures the caller only if the box can hold the
     /// new entry, and returns a typed error otherwise. The original
@@ -418,7 +418,7 @@ where
     /// still return `Effect::Reply` with a Full marker.
     ///
     /// Use this instead of hand-rolling
-    /// `sweep` / `len < cap` / `take_reply_slot` / `try_insert`.
+    /// `sweep` / `len < cap` / `take_request_context` / `try_insert`.
     pub fn try_capture<S>(
         &mut self,
         ctx: &mut tina::Context<'_, S, R>,
@@ -443,7 +443,7 @@ where
             return Err(TryCaptureError::Full);
         }
 
-        let slot = match ctx.take_reply_slot() {
+        let slot = match ctx.take_request_context() {
             Ok(slot) => slot,
             Err(tina::TakeReplySlotError::NoCaller) => return Err(TryCaptureError::NoCaller),
             Err(tina::TakeReplySlotError::CrossShardUnsupported) => {
@@ -453,7 +453,10 @@ where
 
         if let Some(idx) = self.slots.iter().position(|s| s.is_none()) {
             self.generations[idx] = self.generations[idx].wrapping_add(1);
-            self.slots[idx] = Some(PendingReplyEntry { key, reply: slot });
+            self.slots[idx] = Some(PendingReplyEntry {
+                key,
+                reply: slot.into(),
+            });
             let cur = self.len();
             if cur > self.high_water {
                 self.high_water = cur;

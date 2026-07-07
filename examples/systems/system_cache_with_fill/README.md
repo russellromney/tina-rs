@@ -25,8 +25,7 @@ keyed by a cache key. `SharedWork::wait(key, call)` consumes the caller's
 authority and returns a move-only ticket; `request_effect_after_shared_wait(&ticket, fill_effect)`
 proves admission happened before the upstream fill is scheduled.
 `SharedWork::reply_all_with(&key, ...)` settles every parked caller when
-the fill returns. The lower-level name `WaitList` is still public; copied
-service code should reach for `SharedWork` first.
+the fill returns.
 
 What got shorter or safer:
 

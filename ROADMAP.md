@@ -759,7 +759,7 @@ once they hit `DuplicateKey`.
 - one outstanding op per key, key chosen externally →
   `CancelableWork` with a per-key cap of 1
 - multiple parked callers per key, no cancel handle needed →
-  `WaitList`
+  `SharedWork`
 - multiple parked callers per key WITH cancel handles → we need to
   use `CancelableWork`
 
@@ -784,7 +784,7 @@ waiter shape:
 - handoff loops pop ids until one still has a live deferred reply;
 - per-key caps and global caps are reported separately by handwritten code.
 
-Phase 110 owns this as `WaitList<K, R>`. The helper must own both caps, return
+Phase 110 owns this as `SharedWork<K, R>`. The helper must own both caps, return
 typed global `Full` vs per-key `KeyFull`, recover the caller on failed
 admission, and make skip-reclaimed-slot behavior explicit. No hidden per-key
 unbounded queues.

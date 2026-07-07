@@ -393,7 +393,7 @@ collapse independent ops into one buffer or chain them sequentially via
 continuation messages — Tokio's "spawn N tasks that each `.await` on the
 same connection" has no clean analogue.
 
-**Phase 047 replacement:** `tina::sequence(...)` is documented sugar for
+**Phase 047 replacement:** `tina::batch(...)` is documented sugar for
 ordered effect lists; `Effect::Batch` now names the same-stream caveat
 explicitly in its docstring; `docs/tcp-loops.md` ships canonical
 write-all and read-to-eof patterns plus the "do these writes one after
@@ -858,7 +858,7 @@ reflect the current state, with style-only resolutions noted where
    *Two comparisons.* `next_effect()` recursive helper in
    keyspace; the wedge that hit `specimen_mux_client` when batching
    same-stream writes alongside a read. **Partly resolved:**
-   `tina::sequence(...)` documented; same-stream caveat called out
+   `tina::batch(...)` documented; same-stream caveat called out
    on `Effect::Batch`. Still no combinator for "for each command,
    call store, accumulate."
 

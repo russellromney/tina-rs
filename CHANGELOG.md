@@ -1941,7 +1941,7 @@ No-behavior module splits:
   `mod effect` (closed `Effect` enum and every constructor: `noop`,
   `fact`, `reply`, `reject`, `send`, `send_to`/`send_event`,
   `spawn`/`spawn_observed`, `stop`/`stop_with`, `restart_children`,
-  `batch`/`sequence`, `reply_to`/`reply_to_request`), and
+  `batch`/`sequence`, `reply_to`/`reply_to`), and
   `mod isolate` (`Isolate`/`CallableIsolate`,
   `Mailbox`/`TrySendError`, `RestartPolicy`/`ChildRelation`/
   `RestartDecision`/`RestartBudget` family, `Shard`/`SingleShard`,
@@ -2181,8 +2181,8 @@ be silently dropped):
   HashMap<K, Guard>` sidecar pattern and proves the guard is dropped
   exactly once on normal reply, drain, caller-gone sweep, and failed
   admission.
-- `WaitList<K, R>` is the new many-callers-per-key parking lot in
-  `tina_runtime::wait_list`. Hard global cap, optional per-key cap, FIFO
+- `SharedWork<K, R>` is the new many-callers-per-key parking lot in
+  `tina_runtime::SharedWork`. Hard global cap, optional per-key cap, FIFO
   per key, ticketed `reply_one`, and `reply_all_clone` /
   `reply_all_with` / `close_all_clone` / `close_all_with` /
   `drain_all_with` for multi-waiter replies.
@@ -2792,7 +2792,7 @@ Hostile-review fixes:
 - Migrated runtime, simulator, bridge crates, docs, and specimens to the new
   call-shaped service dispatch. Multi-turn services now carry
   `RequestContext` deliberately through continuation messages and finish with
-  `reply_to_request(...)`.
+  `reply_to(...)`.
 - Updated request/reply docs with the blessed multi-turn pattern so readers do
   not copy the old "runtime magically keeps caller context" bug.
 

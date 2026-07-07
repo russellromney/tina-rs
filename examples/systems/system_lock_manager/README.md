@@ -74,7 +74,7 @@ What felt rough:
 - Per-key wait queue length is a hand-rolled `VecDeque<u64>` next to a
   global `PendingReplies`, including the "skip waiters whose slot was
   reclaimed" loop. Same shape as `system_cache_with_fill`. Promoted to
-  `examples/FINDINGS.md` as a `WaitList` helper candidate.
+  `examples/FINDINGS.md` as a `SharedWork` helper candidate.
 - Lease bookkeeping is two unrelated `u64`s (`holder_id`,
   `expiry_token`) that have to be bumped in lockstep at the right
   times (new acquire, renew, hand-off). Easy to mis-pair if a future

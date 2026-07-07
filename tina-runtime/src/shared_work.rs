@@ -1,8 +1,8 @@
 //! Many callers wait for one result — user-facing name.
 //!
-//! `SharedWork<K, R>` is a thin wrapper around [`crate::WaitList`] that
-//! names the user's job: "many callers asked for the same key; when the
-//! result lands, reply every parked waiter with one value."
+//! `SharedWork<K, R>` names the user's job: "many callers asked for the
+//! same key; when the result lands, reply every parked waiter with one
+//! value."
 //!
 //! Use `SharedWork` when:
 //!
@@ -13,9 +13,6 @@
 //!
 //! Use [`crate::PendingReplies`] when reply slots are owned by id and
 //! unrelated to each other (no per-key coalescing).
-//!
-//! Use [`crate::WaitList`] only when the lower-level name is what reads
-//! better at the call site (rare).
 //!
 //! `SharedWork` does not own the upstream fill. The service still owns:
 //!
@@ -46,15 +43,11 @@ use crate::wait_list::{
 /// agree on the key type at compile time.
 ///
 /// Compile-fail: ticket field is `pub(crate)`, so user code cannot name
-/// or construct one. Combined with [`WaitTicket`]'s private fields, there
-/// is no path to forge a ticket outside the crate.
+/// or construct one.
 ///
 /// ```compile_fail
-/// use std::marker::PhantomData;
-/// use tina_runtime::{SharedWorkTicket, WaitTicket};
-/// let _forged: SharedWorkTicket<u32> = SharedWorkTicket {
-///     inner: WaitTicket { slot: 0, generation: 0, _key: PhantomData },
-/// };
+/// use tina_runtime::SharedWorkTicket;
+/// let _forged: SharedWorkTicket<u32> = SharedWorkTicket {};
 /// ```
 pub struct SharedWorkTicket<K> {
     pub(crate) inner: WaitTicket<K>,
@@ -158,10 +151,7 @@ where
 /// Why [`SharedWork::reply_one`] could not settle a ticket.
 pub type SharedWorkReplyError<K, R> = WaitReplyError<K, R>;
 
-/// User-facing parking lot for "many callers wait for one result."
-///
-/// Wraps [`WaitList`] one-to-one. See module docs for the user-shaped
-/// description; see [`WaitList`] for the underlying mechanism.
+/// User-facing parking table. See module docs for the service invariant.
 pub struct SharedWork<K, R> {
     inner: WaitList<K, R>,
 }
@@ -180,6 +170,7 @@ where
 {
     /// Build a shared-work table with one global capacity.
     pub fn with_capacity(capacity: usize) -> Self {
+        assert!(capacity > 0, "SharedWork capacity must be positive");
         Self {
             inner: WaitList::with_capacity(capacity),
         }
@@ -188,6 +179,8 @@ where
     /// Build a shared-work table with both a global capacity and a
     /// per-key cap.
     pub fn with_key_limit(capacity: usize, per_key: usize) -> Self {
+        assert!(capacity > 0, "SharedWork capacity must be positive");
+        assert!(per_key > 0, "SharedWork per-key limit must be positive");
         Self {
             inner: WaitList::with_key_limit(capacity, per_key),
         }
@@ -406,9 +399,6 @@ where
 /// The ticket is a proof that admission happened. Its fields are private
 /// to the crate, so user code cannot manufacture a `RequestEffect` from
 /// plain `noop()` without first parking the caller.
-///
-/// Mirrors [`crate::request_effect_after_wait_park`] for the user-facing
-/// shared-work name.
 pub fn request_effect_after_shared_wait<I, K>(
     _ticket: &SharedWorkTicket<K>,
     effect: tina::Effect<I>,
@@ -582,13 +572,13 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "WaitList capacity must be positive")]
+    #[should_panic(expected = "SharedWork capacity must be positive")]
     fn zero_capacity_panics() {
         let _ = SharedWork::<u32, u32>::with_capacity(0);
     }
 
     #[test]
-    #[should_panic(expected = "WaitList per-key limit must be positive")]
+    #[should_panic(expected = "SharedWork per-key limit must be positive")]
     fn zero_per_key_panics() {
         let _ = SharedWork::<u32, u32>::with_key_limit(4, 0);
     }

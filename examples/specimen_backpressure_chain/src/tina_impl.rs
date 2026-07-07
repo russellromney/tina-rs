@@ -51,8 +51,8 @@ impl ServiceC {
     fn handle(&mut self, msg: CMsg, _ctx: &mut Context<'_, SingleShard>) -> Effect<Self> {
         match msg {
             CMsg::Compute { .. } => noop(),
-            CMsg::Done(req, Ok(())) => reply_to_request(req, ()),
-            CMsg::Done(req, Err(_)) => reply_to_request(req, ()),
+            CMsg::Done(req, Ok(())) => reply_to(req, ()),
+            CMsg::Done(req, Err(_)) => reply_to(req, ()),
         }
     }
 
@@ -99,10 +99,10 @@ impl ServiceB {
         match msg {
             BMsg::Forward { .. } => noop(),
             BMsg::CDone(req, outcome) => match outcome {
-                CallOutcome::Replied(()) => reply_to_request(req, BReply::Ok),
-                CallOutcome::Timeout => reply_to_request(req, BReply::CTimedOut),
+                CallOutcome::Replied(()) => reply_to(req, BReply::Ok),
+                CallOutcome::Timeout => reply_to(req, BReply::CTimedOut),
                 CallOutcome::Full | CallOutcome::Closed | CallOutcome::Rejected(_) => {
-                    reply_to_request(req, BReply::Error)
+                    reply_to(req, BReply::Error)
                 }
             },
         }
@@ -153,12 +153,12 @@ impl ServiceA {
         match msg {
             AMsg::Submit { .. } => noop(),
             AMsg::BDone(req, outcome) => match outcome {
-                CallOutcome::Replied(BReply::Ok) => reply_to_request(req, AReply::Success),
-                CallOutcome::Replied(BReply::CTimedOut) => reply_to_request(req, AReply::CTimedOut),
-                CallOutcome::Replied(BReply::Error) => reply_to_request(req, AReply::Error),
-                CallOutcome::Timeout => reply_to_request(req, AReply::ATimedOut),
+                CallOutcome::Replied(BReply::Ok) => reply_to(req, AReply::Success),
+                CallOutcome::Replied(BReply::CTimedOut) => reply_to(req, AReply::CTimedOut),
+                CallOutcome::Replied(BReply::Error) => reply_to(req, AReply::Error),
+                CallOutcome::Timeout => reply_to(req, AReply::ATimedOut),
                 CallOutcome::Full | CallOutcome::Closed | CallOutcome::Rejected(_) => {
-                    reply_to_request(req, AReply::Error)
+                    reply_to(req, AReply::Error)
                 }
             },
         }

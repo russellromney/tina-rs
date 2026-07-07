@@ -625,11 +625,8 @@ tickets are rejected; tickets are move-only with crate-private fields.
 `request_effect_after_shared_wait(&ticket, effect)` is the only path
 that produces a `RequestEffect` after admission.
 
-`SharedWork` is a thin wrapper over `WaitList`; the lower-level
-`WaitList` name remains public for call sites that read better under
-the mechanism name. `system_cache_with_fill` and the
-`ergonomics_playground` single-flight cache probe both copy from
-`SharedWork` now.
+`system_cache_with_fill` and the `ergonomics_playground`
+single-flight cache probe both copy from `SharedWork` now.
 
 *(Historical finding kept below for context.)*
 
@@ -651,7 +648,7 @@ The cap accounting splits awkwardly: the global cap lives on
 `PendingReplies`; the per-bucket cap lives in handler code; the
 "skip reclaimed" loop is repeated.
 
-**Build:** a small `WaitList<K, R>` (or `KeyedPendingReplies<K, R>`)
+**Build:** a small `SharedWork<K, R>` (or `KeyedPendingReplies<K, R>`)
 helper that owns both caps, takes the inbound `CallContext`, and
 exposes a single `pop_next(&K) -> Option<DeferredReply<R>>` that walks
 past reclaimed slots. Must keep typed admission errors
@@ -1066,7 +1063,7 @@ runtime-owned call effect (`sleep(...).then_with_request(req, ...)` in
 the regression, but applies to any `.then` continuation), the
 completion arrives as an ordinary internal-event message at `handle`,
 not back at `handle_call`. The original caller receives the deferred
-reply through `reply_to_request`, and the trace records no
+reply through `reply_to`, and the trace records no
 `CallRejected { UnsupportedMessage }` event for the continuation.
 
 This is the path `system_realtime_rooms` would have wanted: send-shaped

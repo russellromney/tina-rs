@@ -1506,7 +1506,7 @@ where
     ///
     /// This does not reply to the caller by itself. The generated message must
     /// later consume the [`RequestContext`](tina::RequestContext) with
-    /// `reply_to_request`.
+    /// `reply_to`.
     pub fn reply<I, F, M>(self, translator: F) -> tina::Effect<I>
     where
         I: tina::Isolate<Message = M, Reply = Q, Io = RuntimeCall<M>>,
@@ -1675,7 +1675,7 @@ where
     ///
     /// This does not reply to the caller by itself. The generated message must
     /// later consume the [`RequestContext`](tina::RequestContext) with
-    /// `reply_to_request`.
+    /// `reply_to`.
     pub fn reply<I, F, M>(self, translator: F) -> tina::Effect<I>
     where
         I: tina::Isolate<Message = M, Reply = Q, Io = RuntimeCall<M>>,

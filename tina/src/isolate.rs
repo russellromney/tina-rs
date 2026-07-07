@@ -669,19 +669,6 @@ impl<S, M, R> SpawnObservedBuilder<S, M, R> {
         }
     }
 
-    /// Maps the runtime's later child-start result into a parent message.
-    #[deprecated(
-        since = "0.1.0",
-        note = "use `.then(...)` for ordinary continuations; use `call_ctx.defer(work).reply(...)` in handle_call when preserving caller authority"
-    )]
-    pub fn reply<I, P, F>(self, continuation: F) -> Effect<I>
-    where
-        I: Isolate<Message = P, SpawnObserved = SpawnObserved<S, P, M, R>>,
-        F: FnOnce(SpawnObservedResult<M, R>) -> P + 'static,
-    {
-        self.then(continuation)
-    }
-
     /// Maps the runtime's later child-start result into an ordinary parent
     /// continuation message.
     pub fn then<I, P, F>(self, continuation: F) -> Effect<I>

@@ -94,7 +94,7 @@ mod threaded;
 mod threaded_multi_shard;
 mod trace;
 pub mod unix_loops;
-pub mod wait_list;
+mod wait_list;
 
 pub use admission::{
     AdmissionDecision, AdmissionFailure, AdmissionReport, ConcurrencyLimit, ConcurrencyPermit,
@@ -251,6 +251,8 @@ pub use deferred::{
     request_effect_after_park,
 };
 use driver::DriverCompletion;
+pub use driver::os_signal_capture_supported;
+use driver::{BetelgeuseDriver, RuntimeDriver};
 pub use event_sink::{
     BoundedEventSink, DropPolicy, EventSinkDrain, EventSinkReport, EventSinkSurface,
 };
@@ -317,14 +319,6 @@ pub use trace::{
     TerminalCompletionAction, stable_trace_hash,
 };
 pub use unix_loops::{UnixReadToEof, UnixWriteAll};
-pub use wait_list::{
-    WaitCallError as WaitListCallError, WaitError as WaitListError, WaitList,
-    WaitReplyError as WaitListReplyError, WaitSnapshot as WaitListSnapshot, WaitTicket,
-    request_effect_after_wait_park,
-};
-
-pub use driver::os_signal_capture_supported;
-use driver::{BetelgeuseDriver, RuntimeDriver};
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum MessageCallContext {

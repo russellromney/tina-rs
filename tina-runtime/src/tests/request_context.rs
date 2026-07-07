@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use tina::{
     Address, CallContext, CancelOutcome, Context, Effect, Isolate, Outbound, RequestContext, batch,
-    noop, reply_to_request,
+    noop, reply_to,
 };
 
 use super::*;
@@ -129,9 +129,9 @@ impl Isolate for Svc {
             SvcMsg::Unsupported => noop(),
             SvcMsg::ProbeResult(req, outcome) => match outcome {
                 CallOutcome::Replied(ProbeReply(val)) if val >= 10 => {
-                    reply_to_request(req, SvcReply::Ready)
+                    reply_to(req, SvcReply::Ready)
                 }
-                _ => reply_to_request(req, SvcReply::NotReady),
+                _ => reply_to(req, SvcReply::NotReady),
             },
         }
     }
@@ -345,9 +345,9 @@ impl Isolate for ClosedSvc {
         match msg {
             ClosedSvcMsg::Start => noop(),
             ClosedSvcMsg::ProbeResult(req, CallOutcome::Closed) => {
-                reply_to_request(req, SvcReply::NotReady)
+                reply_to(req, SvcReply::NotReady)
             }
-            ClosedSvcMsg::ProbeResult(req, _) => reply_to_request(req, SvcReply::Ready),
+            ClosedSvcMsg::ProbeResult(req, _) => reply_to(req, SvcReply::Ready),
         }
     }
 
@@ -497,9 +497,9 @@ impl Isolate for TimeoutSvc {
         match msg {
             TimeoutSvcMsg::Start => noop(),
             TimeoutSvcMsg::ProbeResult(req, CallOutcome::Timeout) => {
-                reply_to_request(req, SvcReply::NotReady)
+                reply_to(req, SvcReply::NotReady)
             }
-            TimeoutSvcMsg::ProbeResult(req, _) => reply_to_request(req, SvcReply::Ready),
+            TimeoutSvcMsg::ProbeResult(req, _) => reply_to(req, SvcReply::Ready),
         }
     }
 
@@ -957,17 +957,17 @@ impl Isolate for HandleSvc {
                         let req = pending.into_request_context();
                         match outcome {
                             CallOutcome::Replied(ProbeReply(val)) if val >= 10 => {
-                                reply_to_request(req, SvcReply::Ready)
+                                reply_to(req, SvcReply::Ready)
                             }
-                            _ => reply_to_request(req, SvcReply::NotReady),
+                            _ => reply_to(req, SvcReply::NotReady),
                         }
                     }
                     Err(PendingCancelableRemoveError::MissingKey)
                     | Err(PendingCancelableRemoveError::StaleTicket) => noop(),
                 }
             }
-            HandleSvcMsg::Cancelled(req, _outcome) => reply_to_request(req, SvcReply::NotReady),
-            HandleSvcMsg::OwnerStopped(req, _outcome) => reply_to_request(req, SvcReply::Stopped),
+            HandleSvcMsg::Cancelled(req, _outcome) => reply_to(req, SvcReply::NotReady),
+            HandleSvcMsg::OwnerStopped(req, _outcome) => reply_to(req, SvcReply::Stopped),
         }
     }
 
@@ -1000,11 +1000,11 @@ impl HandleSvc {
             Ok(effect) => effect,
             Err(PendingCancelableInsertError::Full { token }) => {
                 let req = token.into_request_context();
-                reply_to_request(req, SvcReply::Busy)
+                reply_to(req, SvcReply::Busy)
             }
             Err(PendingCancelableInsertError::DuplicateKey { token }) => {
                 let req = token.into_request_context();
-                reply_to_request(req, SvcReply::Duplicate)
+                reply_to(req, SvcReply::Duplicate)
             }
         }
     }
@@ -2005,8 +2005,8 @@ impl Isolate for ObsSvc {
         match msg {
             ObsSvcMsg::Start => noop(),
             ObsSvcMsg::SendResult(req, outcome) => match outcome {
-                SendOutcome::Accepted => reply_to_request(req, SvcReply::Ready),
-                _ => reply_to_request(req, SvcReply::NotReady),
+                SendOutcome::Accepted => reply_to(req, SvcReply::Ready),
+                _ => reply_to(req, SvcReply::NotReady),
             },
         }
     }
@@ -2189,8 +2189,8 @@ impl Isolate for TimerSvc {
     ) -> Effect<Self> {
         match msg {
             TimerSvcMsg::Start => noop(),
-            TimerSvcMsg::Fired(req, Ok(())) => reply_to_request(req, SvcReply::Ready),
-            TimerSvcMsg::Fired(req, Err(_)) => reply_to_request(req, SvcReply::NotReady),
+            TimerSvcMsg::Fired(req, Ok(())) => reply_to(req, SvcReply::Ready),
+            TimerSvcMsg::Fired(req, Err(_)) => reply_to(req, SvcReply::NotReady),
         }
     }
 
@@ -2290,7 +2290,7 @@ fn typed_runtime_call_defer_carries_request_context() {
 ///     }
 /// }
 /// fn _double_reply(req: RequestContext<u32>) -> (Effect<S>, Effect<S>) {
-///     (tina::reply_to_request(req, 1), tina::reply_to_request(req, 2))
+///     (tina::reply_to(req, 1), tina::reply_to(req, 2))
 /// }
 /// ```
 #[allow(dead_code)]

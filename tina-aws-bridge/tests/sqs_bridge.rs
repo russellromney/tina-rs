@@ -15,7 +15,7 @@ use hyper::{Method, Request as HyperRequest, Response as HyperResponse, StatusCo
 use hyper_util::rt::TokioIo;
 use serde_json::{Value, json};
 use tina::prelude::*;
-use tina::{CallContext, RequestContext, reply_to_request};
+use tina::{CallContext, RequestContext, reply_to};
 use tina_aws_bridge::{
     InstalledSqsBridge, SqsAddress, SqsCallOutcome, SqsConfig, SqsCredentials, SqsDeleteMessage,
     SqsDeletedMessage, SqsError, SqsMessage, SqsReceiveMessage, SqsReceivedMessages, SqsRequest,
@@ -102,9 +102,9 @@ impl Isolate for SqsRelay {
             SqsRelayMsg::Send { .. } => noop(),
             SqsRelayMsg::SendDone(req, outcome) => match outcome {
                 tina_runtime::CallOutcome::Replied(Ok(SqsResponse::SentMessage(_))) => {
-                    reply_to_request(req, "sent")
+                    reply_to(req, "sent")
                 }
-                _ => reply_to_request(req, "failed"),
+                _ => reply_to(req, "failed"),
             },
         }
     }

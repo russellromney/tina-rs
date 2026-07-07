@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use tina::{
     Address, CallContext, CancelOutcome, Context, Effect, Isolate, RequestContext, SingleShard,
-    noop, reply_to_request, send,
+    noop, reply_to, send,
 };
 use tina_runtime::{
     CallGroup, CallGroupToken, CallOutcome, CallReplyRejectedReason, DeferredReplyRejectedReason,
@@ -67,7 +67,7 @@ impl Isolate for Provider {
     ) -> Effect<Self> {
         match msg {
             ProviderMsg::Quote => noop(),
-            ProviderMsg::Done(req, Ok(())) => reply_to_request(req, self.quote),
+            ProviderMsg::Done(req, Ok(())) => reply_to(req, self.quote),
             ProviderMsg::Done(_, Err(_)) => noop(),
         }
     }
@@ -193,11 +193,11 @@ impl Isolate for QuoteGateway {
                 let mut effects = Self::cancel_effects(step.cancel_losers);
                 if let Some(reply) = winner {
                     if let Some(request) = pending.request.take() {
-                        effects.insert(0, reply_to_request(request, reply));
+                        effects.insert(0, reply_to(request, reply));
                     }
                 } else if step.report_ready {
                     if let Some(request) = pending.request.take() {
-                        effects.insert(0, reply_to_request(request, QuoteReply::Unavailable));
+                        effects.insert(0, reply_to(request, QuoteReply::Unavailable));
                     }
                     self.pending = None;
                 }
@@ -691,7 +691,7 @@ impl Isolate for Upstream {
     ) -> Effect<Self> {
         match msg {
             UpstreamMsg::Fetch => noop(),
-            UpstreamMsg::Done(req, Ok(())) => reply_to_request(req, FillReply(self.value)),
+            UpstreamMsg::Done(req, Ok(())) => reply_to(req, FillReply(self.value)),
             UpstreamMsg::Done(_, Err(_)) => noop(),
         }
     }

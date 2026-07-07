@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use http::StatusCode;
 use tina::prelude::*;
-use tina::{CallContext, RequestContext, reply_to_request};
+use tina::{CallContext, RequestContext, reply_to};
 use tina_http::{
     HttpConnectionMsg, HttpLimits, HttpListener, HttpListenerMsg, HttpRequest, HttpRequestBody,
     HttpResponse, RequestChunkReply,
@@ -94,20 +94,20 @@ impl Isolate for Consumer {
                     let body = format!("stream:{}:{}", total, checksum);
                     self.pending_source = None;
                     self.accumulated.clear();
-                    reply_to_request(request, HttpResponse::with_text(StatusCode::OK, body))
+                    reply_to(request, HttpResponse::with_text(StatusCode::OK, body))
                 }
                 CallOutcome::Replied(RequestChunkReply::Error(_))
                 | CallOutcome::Replied(RequestChunkReply::WebSocketSend(_))
                 | CallOutcome::Replied(RequestChunkReply::WebSocketReport(_)) => {
                     self.pending_source = None;
-                    reply_to_request(request, HttpResponse::internal_error())
+                    reply_to(request, HttpResponse::internal_error())
                 }
                 CallOutcome::Full
                 | CallOutcome::Closed
                 | CallOutcome::Rejected(_)
                 | CallOutcome::Timeout => {
                     self.pending_source = None;
-                    reply_to_request(request, HttpResponse::internal_error())
+                    reply_to(request, HttpResponse::internal_error())
                 }
             },
         }
@@ -579,20 +579,20 @@ impl Isolate for NotifyingConsumer {
                     let body = format!("stream:{total}:{checksum}");
                     self.pending_source = None;
                     self.accumulated.clear();
-                    reply_to_request(request, HttpResponse::with_text(StatusCode::OK, body))
+                    reply_to(request, HttpResponse::with_text(StatusCode::OK, body))
                 }
                 CallOutcome::Replied(RequestChunkReply::Error(_))
                 | CallOutcome::Replied(RequestChunkReply::WebSocketSend(_))
                 | CallOutcome::Replied(RequestChunkReply::WebSocketReport(_)) => {
                     self.pending_source = None;
-                    reply_to_request(request, HttpResponse::internal_error())
+                    reply_to(request, HttpResponse::internal_error())
                 }
                 CallOutcome::Full
                 | CallOutcome::Closed
                 | CallOutcome::Rejected(_)
                 | CallOutcome::Timeout => {
                     self.pending_source = None;
-                    reply_to_request(request, HttpResponse::internal_error())
+                    reply_to(request, HttpResponse::internal_error())
                 }
             },
         }

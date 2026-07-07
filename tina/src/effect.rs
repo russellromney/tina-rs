@@ -12,7 +12,7 @@
 //! to `mod isolate` in a follow-up commit).
 
 use crate::{
-    Address, CallRejectedReason, DeferredReply, Isolate, Outbound, RequestContext, SendAddress,
+    Address, CallRejectedReason, DeferredReply, Isolate, Outbound, SendAddress,
     ServiceEventAddress, ServiceMessage, SpawnAddress, SpawnObservedBuilder, StopResult,
 };
 
@@ -359,44 +359,9 @@ where
 ///     (reply_to(slot, 1), reply_to(slot, 2)) // borrow of moved value
 /// }
 /// ```
-pub fn reply_to<I>(slot: DeferredReply<I::Reply>, value: I::Reply) -> Effect<I>
+pub fn reply_to<I>(slot: impl Into<DeferredReply<I::Reply>>, value: I::Reply) -> Effect<I>
 where
     I: Isolate,
 {
-    Effect::ReplyTo(slot, value)
-}
-
-/// Replies to the caller through a [`RequestContext`].
-///
-/// This is the [`RequestContext`] spelling of [`reply_to`]. It consumes
-/// the context and produces a [`Effect::ReplyTo`] just like the
-/// underlying [`DeferredReply`] form.
-pub fn reply_to_request<I>(req: RequestContext<I::Reply>, value: I::Reply) -> Effect<I>
-where
-    I: Isolate,
-{
-    let slot = req.into_deferred();
-    Effect::ReplyTo(slot, value)
-}
-
-/// Documented sugar for ordered runtime-call sequences.
-///
-/// `sequence(...)` is equivalent to [`batch`]: the runtime executes the
-/// contained effects in source order, a [`Stop`](Effect::Stop) short-
-/// circuits the rest, and an empty input is [`Noop`](Effect::Noop). The
-/// difference is *intent*: use `sequence` when the items are runtime calls
-/// or sends that should happen left-to-right, and use [`batch`] when the
-/// items happen to be a small list of unrelated effects.
-///
-/// The same caveat applies as for [`batch`]: items targeting the same I/O
-/// resource (e.g. multiple `tcp_write` calls on the same stream) still
-/// return `CallError::ResourceBusy` for the second-and-later calls. For
-/// "write, then read, then write again" patterns on a single stream,
-/// continue using continuation messages from the isolate's handler.
-pub fn sequence<I, T>(effects: T) -> Effect<I>
-where
-    I: Isolate,
-    T: IntoIterator<Item = Effect<I>>,
-{
-    Effect::Batch(effects.into_iter().collect())
+    Effect::ReplyTo(slot.into(), value)
 }

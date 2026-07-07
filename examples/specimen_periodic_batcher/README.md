@@ -113,7 +113,7 @@ What feels better:
 What feels worse:
 
 - **Stale timer filtering is still user state.** Tina's `sleep(...)`
-  has no cancel API: an in-flight timer always fires. `TimerInterval`
+  has no cancel API: an in-flight timer always fires. `RecurringTick`
   removes the local generation arithmetic, but `pending_tick` is still
   explicit because invisible dropped work would lie.
 - **Timer `Tick` carries `(u64, SleepReply)`.** Two unrelated
@@ -123,7 +123,7 @@ What feels worse:
 
 ## What this suggests
 
-`TimerInterval` names the repeated-delay state, missed-tick policy,
+`RecurringTick` names the repeated-delay state, missed-tick policy,
 and tick numbering. It deliberately does not cancel a runtime sleep or
 queue work. This specimen still keeps `pending_tick` explicit so a
 size-triggered flush can invalidate the already-returned sleep without

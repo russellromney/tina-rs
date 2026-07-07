@@ -134,7 +134,7 @@ What felt rough (with the planned roadmap row that already names the fix):
   admission, `flush_tick.clear()` invalidates pending timer
   continuations, the `Stop` handler stashes its `RequestContext`, and
   the next `FlushDone` calls `DrainState::finish()` and answers via
-  `reply_to_request`. Ordering is visible, no hidden close.
+  `reply_to`. Ordering is visible, no hidden close.
 
 Closed by Phase 106 (lifecycle, health, topology):
 - The host shutdown sequence now runs through
@@ -174,7 +174,7 @@ Tina capability pulled:
 - Runtime-owned timers via `sleep(...).then(...)`.
 - `call(addr, msg, timeout).then(...)` for single-flight downstream
   fan-out with a typed `CallOutcome`.
-- `reply_to_request` for deferred replies held across a continuation.
+- `reply_to` for deferred replies held across a continuation.
 
 Suggested follow-up:
 - The roadmap already names the four primitives that would erase the

@@ -100,7 +100,7 @@ impl Worker {
                 // timeout. The abandoned-caller guard closes uncaptured
                 // callers immediately; keeping the slot alive is the
                 // legitimate way to defer a reply indefinitely.
-                self.held = Some(ctx.take_reply_slot().unwrap());
+                self.held = Some(ctx.take_request_context().unwrap().into_deferred());
                 noop()
             }
         }

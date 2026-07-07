@@ -76,7 +76,7 @@ important rules live somewhere else." The numbers cut against it:
 The clearest symptom is the bounded-pending-helper family. A user holding "I
 have outstanding work to remember" must currently choose among
 **`PendingReplies`, `PendingCallSet`, `PendingCancelableCallSet`,
-`CancelableWork`, `WaitList`, `SharedWork`, `GuardedPendingReplies`** — and the
+`CancelableWork`, `SharedWork`, `SharedWork`, `GuardedPendingReplies`** — and the
 ROADMAP itself ends with a four-way decision tree for which to pick. FINDINGS
 documents the same fragmentation in admission: a 7-variant `AdmissionDecision`,
 plus the `ConcurrencyPermit`-doesn't-drop-but-`SharedLease`-does mismatch that

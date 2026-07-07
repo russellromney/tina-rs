@@ -309,7 +309,7 @@ impl<S: Shard + 'static> SqliteWorker<S> {
                 reason = "Closed",
                 request_kind,
             );
-            return tina::reply_to_request(reply_to, Err(SqliteError::Closed));
+            return tina::reply_to(reply_to, Err(SqliteError::Closed));
         }
 
         if let Err(err) = validate_request(&request, &self.config) {
@@ -323,7 +323,7 @@ impl<S: Shard + 'static> SqliteWorker<S> {
                 request_kind,
                 detail = %err,
             );
-            return tina::reply_to_request(reply_to, Err(err));
+            return tina::reply_to(reply_to, Err(err));
         }
 
         if self.in_flight.is_some() {
@@ -336,7 +336,7 @@ impl<S: Shard + 'static> SqliteWorker<S> {
                 reason = "Full",
                 request_kind,
             );
-            return tina::reply_to_request(reply_to, Err(SqliteError::Full));
+            return tina::reply_to(reply_to, Err(SqliteError::Full));
         }
 
         let max_rows_for_request = match &request {
@@ -366,7 +366,7 @@ impl<S: Shard + 'static> SqliteWorker<S> {
                 request_kind,
                 detail = "worker thread unavailable",
             );
-            return tina::reply_to_request(
+            return tina::reply_to(
                 reply_to,
                 Err(SqliteError::Internal("worker thread unavailable".into())),
             );
@@ -410,7 +410,7 @@ impl<S: Shard + 'static> SqliteWorker<S> {
                 #[cfg(not(feature = "tracing"))]
                 let _ = request_kind;
                 if let Some(reply_to) = in_flight.reply_to {
-                    tina::reply_to_request(reply_to, result)
+                    tina::reply_to(reply_to, result)
                 } else {
                     noop()
                 }
@@ -439,7 +439,7 @@ impl<S: Shard + 'static> SqliteWorker<S> {
                     let reply_to = in_flight.reply_to.take().expect("reply_to checked above");
                     self.in_flight = Some(in_flight);
                     return batch(vec![
-                        tina::reply_to_request(reply_to, Err(SqliteError::Timeout)),
+                        tina::reply_to(reply_to, Err(SqliteError::Timeout)),
                         sleep(self.config.poll_interval).then(|_| SqliteMsg::Poll),
                     ]);
                 }
@@ -458,7 +458,7 @@ impl<S: Shard + 'static> SqliteWorker<S> {
                     detail = "worker thread terminated mid-request",
                 );
                 if let Some(reply_to) = in_flight.reply_to {
-                    tina::reply_to_request(
+                    tina::reply_to(
                         reply_to,
                         Err(SqliteError::Internal(
                             "worker thread terminated mid-request".into(),

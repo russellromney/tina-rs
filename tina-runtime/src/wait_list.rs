@@ -82,22 +82,6 @@ impl<K> std::fmt::Debug for WaitTicket<K> {
     }
 }
 
-/// Build a request-lane effect after caller authority has been consumed
-/// by [`WaitList::park`] or [`WaitList::park_call`].
-///
-/// The ticket is a proof that admission happened. Its fields are
-/// private, so copied app code cannot manufacture a `RequestEffect` from
-/// plain `noop()` without first parking the caller.
-pub fn request_effect_after_wait_park<I, K>(
-    _ticket: &WaitTicket<K>,
-    effect: tina::Effect<I>,
-) -> tina::RequestEffect<I>
-where
-    I: tina::Isolate,
-{
-    crate::call::request_effect_from_consumed_effect(effect)
-}
-
 struct WaitEntry<K, R> {
     key: K,
     reply: DeferredReply<R>,

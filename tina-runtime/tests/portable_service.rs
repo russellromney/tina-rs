@@ -165,7 +165,7 @@ impl DurableWorker {
                     .lock()
                     .expect("worker observed lock")
                     .push(ServiceObservation::WorkerStored(request.key));
-                tina::reply_to_request(
+                tina::reply_to(
                     req,
                     WorkerReply::Stored {
                         key: request.key,
@@ -174,7 +174,7 @@ impl DurableWorker {
                 )
             }
             WorkerMsg::JournaledForCall(req, Err(error), _, _) => {
-                tina::reply_to_request(req, WorkerReply::DurableFailure(error))
+                tina::reply_to(req, WorkerReply::DurableFailure(error))
             }
         }
     }
@@ -703,7 +703,7 @@ impl AuditedWorker {
                     .lock()
                     .expect("audited worker observed lock")
                     .push(ServiceObservation::WorkerStored(request.key));
-                tina::reply_to_request(
+                tina::reply_to(
                     req,
                     WorkerReply::Stored {
                         key: request.key,
@@ -712,10 +712,10 @@ impl AuditedWorker {
                 )
             }
             AuditedWorkerMsg::AuditResultForCall(req, _, SendOutcome::Full) => {
-                tina::reply_to_request(req, WorkerReply::DurableFailure(CallError::TargetFull))
+                tina::reply_to(req, WorkerReply::DurableFailure(CallError::TargetFull))
             }
             AuditedWorkerMsg::AuditResultForCall(req, _, SendOutcome::Closed) => {
-                tina::reply_to_request(req, WorkerReply::DurableFailure(CallError::TargetClosed))
+                tina::reply_to(req, WorkerReply::DurableFailure(CallError::TargetClosed))
             }
         }
     }

@@ -249,7 +249,7 @@ impl<S: Shard + 'static> PgWorker<S> {
                 reason = "Closed",
                 request_kind,
             );
-            return tina::reply_to_request(reply_to, Err(PgError::Closed));
+            return tina::reply_to(reply_to, Err(PgError::Closed));
         }
 
         if let Err(err) = validate_request(&request, &self.config) {
@@ -263,7 +263,7 @@ impl<S: Shard + 'static> PgWorker<S> {
                 request_kind,
                 detail = %err,
             );
-            return tina::reply_to_request(reply_to, Err(err));
+            return tina::reply_to(reply_to, Err(err));
         }
 
         if self.in_flight.len() >= self.config.max_in_flight {
@@ -276,7 +276,7 @@ impl<S: Shard + 'static> PgWorker<S> {
                 reason = "Full",
                 request_kind,
             );
-            return tina::reply_to_request(reply_to, Err(PgError::Full));
+            return tina::reply_to(reply_to, Err(PgError::Full));
         }
 
         let id = self.next_id;
@@ -348,7 +348,7 @@ impl<S: Shard + 'static> PgWorker<S> {
                 #[cfg(not(feature = "tracing"))]
                 let _ = request_kind;
                 match reply_to {
-                    Some(reply_to) => tina::reply_to_request(reply_to, result),
+                    Some(reply_to) => tina::reply_to(reply_to, result),
                     None => noop(),
                 }
             }
@@ -380,7 +380,7 @@ impl<S: Shard + 'static> PgWorker<S> {
                         .expect("timeout only while caller authority is present");
                     self.in_flight.insert(id, in_flight);
                     return tina::batch([
-                        tina::reply_to_request(reply_to, Err(PgError::Timeout)),
+                        tina::reply_to(reply_to, Err(PgError::Timeout)),
                         sleep(self.config.poll_interval).then(move |_| PgMsg::Poll(id)),
                     ]);
                 }
@@ -405,7 +405,7 @@ impl<S: Shard + 'static> PgWorker<S> {
                     detail = "spawned task ended without result",
                 );
                 match reply_to {
-                    Some(reply_to) => tina::reply_to_request(
+                    Some(reply_to) => tina::reply_to(
                         reply_to,
                         Err(PgError::Internal(
                             "spawned task ended without result".into(),

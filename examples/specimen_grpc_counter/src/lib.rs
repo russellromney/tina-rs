@@ -220,7 +220,7 @@ impl StreamingEchoSource {
     ) -> Effect<Self> {
         match reply {
             GrpcStreamReply::Message(request) => {
-                reply_to_request(pending, self.reply_for_message(request))
+                reply_to(pending, self.reply_for_message(request))
             }
             GrpcStreamReply::NeedMore => {
                 self.pending = Some(pending);
@@ -228,16 +228,16 @@ impl StreamingEchoSource {
             }
             GrpcStreamReply::Eof => {
                 self.eof = true;
-                reply_to_request(pending, ResponseChunkReply::Eof)
+                reply_to(pending, ResponseChunkReply::Eof)
             }
             GrpcStreamReply::Status(status) => {
-                reply_to_request(pending, self.finish_with_status(status))
+                reply_to(pending, self.finish_with_status(status))
             }
-            GrpcStreamReply::Cancelled => reply_to_request(
+            GrpcStreamReply::Cancelled => reply_to(
                 pending,
                 self.finish_with_status(GrpcStatus::new(GrpcStatusCode::Cancelled)),
             ),
-            GrpcStreamReply::DeadlineExceeded => reply_to_request(
+            GrpcStreamReply::DeadlineExceeded => reply_to(
                 pending,
                 self.finish_with_status(GrpcStatus::new(GrpcStatusCode::DeadlineExceeded)),
             ),

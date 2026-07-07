@@ -93,7 +93,7 @@ caller handles timeout
 >
 > ```rust
 > ServiceMsg::WorkerReturned(request, CallOutcome::Replied(reply)) => {
->     reply_to_request(request, ServiceReply::Done(reply))
+>     reply_to(request, ServiceReply::Done(reply))
 > }
 > ```
 >
@@ -195,7 +195,7 @@ A service can reply after more than one handler turn.
 Common shape:
 
 ```rust
-use tina::{CallContext, CallRejectedReason, RequestContext, noop, reply_to_request};
+use tina::{CallContext, CallRejectedReason, RequestContext, noop, reply_to};
 
 #[derive(Debug, Clone)]
 enum ServiceMsg {
@@ -211,11 +211,11 @@ impl StoreService {
 
             ServiceMsg::Journaled(request, Ok(()), req) => {
                 self.apply(req);
-                reply_to_request(request, StoreReply::Stored)
+                reply_to(request, StoreReply::Stored)
             }
 
             ServiceMsg::Journaled(request, Err(_), _req) => {
-                reply_to_request(request, StoreReply::Failed)
+                reply_to(request, StoreReply::Failed)
             }
         }
     }
@@ -256,7 +256,7 @@ It is the same primitive as `DeferredReply` but the type name tells readers
 what to expect.
 
 ```rust
-use tina::{CallContext, CallRejectedReason, Context, Effect, Isolate, noop, reply_to_request};
+use tina::{CallContext, CallRejectedReason, Context, Effect, Isolate, noop, reply_to};
 use tina_runtime::{call, CallOutcome};
 
 #[derive(Debug, Clone)]
@@ -274,8 +274,8 @@ enum SvcMsg {
 #       SvcMsg::Start => noop(),
 #       SvcMsg::ProbeResult(req, outcome) => {
 #         match outcome {
-#           CallOutcome::Replied(ProbeReply(v)) if v >= 10 => reply_to_request(req, SvcReply::Ready),
-#           _ => reply_to_request(req, SvcReply::NotReady),
+#           CallOutcome::Replied(ProbeReply(v)) if v >= 10 => reply_to(req, SvcReply::Ready),
+#           _ => reply_to(req, SvcReply::NotReady),
 #         }
 #       }
 #     }
@@ -312,10 +312,10 @@ application reply by itself.
 > {
 >     Ok(effect) => effect,
 >     Err(PendingCancelableInsertError::Full { token }) => {
->         reply_to_request(token.into_request_context(), ServiceReply::Busy)
+>         reply_to(token.into_request_context(), ServiceReply::Busy)
 >     }
 >     Err(PendingCancelableInsertError::DuplicateKey { token }) => {
->         reply_to_request(token.into_request_context(), ServiceReply::Duplicate)
+>         reply_to(token.into_request_context(), ServiceReply::Duplicate)
 >     }
 > }
 > ```
@@ -347,7 +347,7 @@ If a call handler returns `then(...)` without consuming its `CallContext`, Tina
 rejects the caller with `ReplyAbandoned` immediately while the ordinary
 continuation still runs.
 
-`RequestContext` is a real newtype over `DeferredReply`; `reply_to_request`
+`RequestContext` is a real newtype over `DeferredReply`; `reply_to`
 consumes it and delegates to `reply_to`. There is no hidden caller context
 preservation.
 

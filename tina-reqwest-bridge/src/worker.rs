@@ -710,7 +710,7 @@ impl<S: Shard + 'static> ReqwestWorker<S> {
         result: ReqwestResult,
     ) -> Effect<Self> {
         match request_context {
-            Some(request) => reply_to_request(request, result),
+            Some(request) => reply_to(request, result),
             None => reply::<Self>(result),
         }
     }
