@@ -30,6 +30,10 @@ This file records completed work.
 - Renamed `request_effect_after_wait_park` to `request_effect_after_shared_wait`.
 ### CI Dependency Hygiene
 
+- Pinned the nightly toolchain in `rust-toolchain.toml` (with rustfmt and
+  clippy components) so upstream nightly changes cannot fail CI under
+  unrelated PRs; the weekly fresh-resolve canary now also runs the latest
+  nightly so toolchain drift is still caught on purpose.
 - Fixed nightly toolchain drift: replaced same-type `drain(..).collect()`
   with `mem::take` (runtime scope teardown, HTTP/2 client teardown) and an
   atomic max `fetch_update` loop with `fetch_max`, so the unpinned nightly

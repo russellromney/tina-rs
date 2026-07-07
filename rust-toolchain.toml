@@ -1,2 +1,6 @@
 [toolchain]
-channel = "nightly"
+# Pinned so an upstream nightly change (new clippy lints, deprecations)
+# cannot redden CI underneath unrelated PRs. The weekly workflow still
+# canaries the latest nightly on purpose; bump this pin when it passes.
+channel = "nightly-2026-07-07"
+components = ["rustfmt", "clippy"]

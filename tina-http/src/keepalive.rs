@@ -82,8 +82,9 @@
 //! - No hidden retry. A `must_retire` reply is the consumer's signal
 //!   to choose whether to acquire another lease and retry, or
 //!   surface the failure.
-//! - No HTTP/2, no chunked transfer, no expect-100-continue. Same
-//!   contract as [`crate::HttpClient`].
+//! - No HTTP/2, no chunked request bodies, no expect-100-continue.
+//!   Chunked response bodies are decoded; completeness comes from the
+//!   decoder, never length math. Same contract as [`crate::HttpClient`].
 //! - No HTTP `Upgrade` (e.g., to WebSocket). The connection assumes
 //!   the response framing remains HTTP/1.1.
 
