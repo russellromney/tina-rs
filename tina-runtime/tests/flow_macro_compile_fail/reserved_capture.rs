@@ -5,7 +5,7 @@ tina::flow! {
         reply u32;
 
         step Done(req: u32) -> u32 {
-            ::tina::reply_to_request(req, req)
+            ::tina::reply_to(req, req)
         }
     }
 }

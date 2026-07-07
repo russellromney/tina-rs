@@ -2,7 +2,7 @@ use std::convert::Infallible;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use tina::{Outbound, noop, reply_to_request};
+use tina::{Outbound, noop, reply_to};
 use tina_runtime::{
     CallOutcome, DefaultThreadedMailboxFactory, RuntimeCall, ThreadedRuntime,
     ThreadedRuntimeConfig, call,
@@ -60,11 +60,11 @@ tina::flow! {
 
         step WorkerReturned(original: u32) -> u32 {
             match outcome {
-                CallOutcome::Replied(value) => reply_to_request(req, original + value),
+                CallOutcome::Replied(value) => reply_to(req, original + value),
                 CallOutcome::Full
                 | CallOutcome::Closed
                 | CallOutcome::Timeout
-                | CallOutcome::Rejected(_) => reply_to_request(req, 0),
+                | CallOutcome::Rejected(_) => reply_to(req, 0),
             }
         }
     }
@@ -149,7 +149,7 @@ tina::flow! {
                 CallOutcome::Full
                 | CallOutcome::Closed
                 | CallOutcome::Timeout
-                | CallOutcome::Rejected(_) => reply_to_request(req, 0),
+                | CallOutcome::Rejected(_) => reply_to(req, 0),
             }
         }
 
@@ -157,15 +157,15 @@ tina::flow! {
             match outcome {
                 CallOutcome::Timeout => {
                     self.errors.lock().expect("errors").push(mode);
-                    reply_to_request(req, 10)
+                    reply_to(req, 10)
                 }
                 CallOutcome::Full => {
                     self.errors.lock().expect("errors").push(mode);
-                    reply_to_request(req, 20)
+                    reply_to(req, 20)
                 }
                 CallOutcome::Replied(_)
                 | CallOutcome::Closed
-                | CallOutcome::Rejected(_) => reply_to_request(req, 0),
+                | CallOutcome::Rejected(_) => reply_to(req, 0),
             }
         }
     }

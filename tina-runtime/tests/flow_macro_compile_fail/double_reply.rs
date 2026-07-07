@@ -1,4 +1,4 @@
-use tina::{Outbound, noop, reply_to_request};
+use tina::{Outbound, noop, reply_to};
 use tina_runtime::{CallOutcome, RuntimeCall};
 
 struct Driver;
@@ -12,8 +12,8 @@ tina::flow! {
         reply u32;
 
         step Done() -> u32 {
-            let first = reply_to_request(req, 1);
-            let second = reply_to_request(req, 2);
+            let first = reply_to(req, 1);
+            let second = reply_to(req, 2);
             tina::batch(vec![first, second])
         }
     }

@@ -20,9 +20,9 @@ renamed_tina::flow! {
         step Done(original: u32) -> u32 {
             match outcome {
                 ::renamed_tina_runtime::CallOutcome::Replied(value) => {
-                    ::renamed_tina::reply_to_request(req, original + value)
+                    ::renamed_tina::reply_to(req, original + value)
                 }
-                _ => ::renamed_tina::reply_to_request(req, 0),
+                _ => ::renamed_tina::reply_to(req, 0),
             }
         }
     }

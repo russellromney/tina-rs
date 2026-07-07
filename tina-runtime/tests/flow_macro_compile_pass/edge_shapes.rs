@@ -1,11 +1,11 @@
 use std::convert::Infallible;
 
-use tina::{Outbound, noop, reply_to_request};
+use tina::{Outbound, noop, reply_to};
 use tina_runtime::CallOutcome;
 
 macro_rules! respond {
     ($req:expr) => {
-        reply_to_request($req, 1)
+        reply_to($req, 1)
     };
 }
 
@@ -25,7 +25,7 @@ pub mod api {
             step Done() -> u32 {
                 let _scratch = 5u32;
                 let _ = outcome;
-                reply_to_request(req, 2)
+                reply_to(req, 2)
             }
         }
     }
@@ -48,7 +48,7 @@ pub mod api {
             step Done() -> u32 {
                 let scratch = 5u32;
                 let _ = outcome;
-                reply_to_request(req, 3)
+                reply_to(req, 3)
             }
         }
     }

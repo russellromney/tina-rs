@@ -33,8 +33,8 @@ tina::flow! {
                             req, scope_id, id, name, slow, outcome,
                         ))
                     }),
-                Ok(None) => reply_to_request(req, text(StatusCode::NOT_FOUND, "not_found\n")),
-                Err(response) => reply_to_request(req, *response),
+                Ok(None) => reply_to(req, text(StatusCode::NOT_FOUND, "not_found\n")),
+                Err(response) => reply_to(req, *response),
             }
         }
 
@@ -63,7 +63,7 @@ tina::flow! {
                     }
                     effect
                 }
-                other => reply_to_request(req, pool_acquire_error_response(other)),
+                other => reply_to(req, pool_acquire_error_response(other)),
             }
         }
     }

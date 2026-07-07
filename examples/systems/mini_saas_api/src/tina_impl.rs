@@ -1173,11 +1173,11 @@ tina::flow! {
                 }
                 Ok(None) => {
                     self.retire_scope(scope_id);
-                    reply_to_request(req, text(StatusCode::NOT_FOUND, "not_found\n"))
+                    reply_to(req, text(StatusCode::NOT_FOUND, "not_found\n"))
                 }
                 Err(response) => {
                     self.retire_scope(scope_id);
-                    reply_to_request(req, *response)
+                    reply_to(req, *response)
                 }
             }
         }
@@ -1216,7 +1216,7 @@ tina::flow! {
                 }
                 other => {
                     self.retire_scope(scope_id);
-                    reply_to_request(req, pool_acquire_error_response(other))
+                    reply_to(req, pool_acquire_error_response(other))
                 }
             }
         }
@@ -1254,13 +1254,13 @@ tina::flow! {
                 CallOutcome::Replied(WorkerPoolReply::Release(ReleaseOutcome::Released))
                     if ok =>
                 {
-                    reply_to_request(req, text(StatusCode::OK, "notified\n"))
+                    reply_to(req, text(StatusCode::OK, "notified\n"))
                 }
-                CallOutcome::Replied(WorkerPoolReply::Release(_)) if ok => reply_to_request(
+                CallOutcome::Replied(WorkerPoolReply::Release(_)) if ok => reply_to(
                     req,
                     text(StatusCode::SERVICE_UNAVAILABLE, "outbound_release\n"),
                 ),
-                _ => reply_to_request(req, text(StatusCode::BAD_GATEWAY, "notify_failed\n")),
+                _ => reply_to(req, text(StatusCode::BAD_GATEWAY, "notify_failed\n")),
             }
         }
     }
