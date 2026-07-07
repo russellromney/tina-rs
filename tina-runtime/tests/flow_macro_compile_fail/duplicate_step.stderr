@@ -1,0 +1,5 @@
+error: duplicate flow step name
+  --> tests/flow_macro_compile_fail/duplicate_step.rs:11:14
+   |
+11 |         step Done() -> u32 {
+   |              ^^^^

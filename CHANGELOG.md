@@ -4,6 +4,17 @@ This file records completed work.
 
 ## Unreleased
 
+### Continuation Flow Authoring
+
+- Added `tina::flow!`, which generates explicit continuation enums and
+  dispatch methods for fixed multi-step request handlers without changing the
+  runtime effect contract.
+- Added authority-focused compile-fail coverage and a live runtime test for a
+  generated flow carrying `RequestContext` through `CallOutcome`, including
+  shadowed-request, duplicate-name, and renamed-crate expansion coverage.
+- Ported the mini SaaS `POST /items/{id}/notify` path to the generated flow
+  surface while keeping the old continuation variants as compatibility
+  forwards, and documented the pattern in the user guide.
 ### Vocabulary Consolidation
 
 - Renamed `Effect::Call` to `Effect::Io` for runtime-owned I/O effects.
@@ -17,7 +28,6 @@ This file records completed work.
 - Removed `TimerInterval`, `MissedTickPolicy`, and `IntervalDelay`; use `RecurringTick` and `RecurringCatchUp`.
 - Removed public `tina_runtime::wait_list::WaitList`; use `SharedWork`.
 - Renamed `request_effect_after_wait_park` to `request_effect_after_shared_wait`.
-
 ### CI Dependency Hygiene
 
 - Fixed nightly toolchain drift: replaced same-type `drain(..).collect()`

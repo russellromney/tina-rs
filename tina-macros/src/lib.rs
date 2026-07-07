@@ -6,11 +6,12 @@
 //! behavior explicit in the handler body.
 
 use proc_macro::TokenStream;
-use quote::quote;
+use quote::{format_ident, quote};
 use syn::parse::{Parse, ParseStream};
+use syn::visit::Visit;
 use syn::{
     Error, FnArg, Ident, ImplItem, ImplItemFn, ItemImpl, Pat, Path, Result, ReturnType, Token,
-    Type, parse_macro_input,
+    Type, Visibility, braced, parenthesized, parse_macro_input,
 };
 
 struct IsolateArgs {
@@ -162,6 +163,424 @@ pub fn isolate(args: TokenStream, input: TokenStream) -> TokenStream {
 #[proc_macro_attribute]
 pub fn runtime_isolate(args: TokenStream, input: TokenStream) -> TokenStream {
     expand_isolate(args, input, IoDefault::RuntimeCall)
+}
+
+/// Generates an explicit continuation enum and dispatcher for a linear flow.
+///
+/// The macro does not add runtime behavior. Each `step` expands to one enum
+/// variant carrying `RequestContext<Reply>`, explicit captured fields, and a
+/// `CallOutcome<T>`, plus one `match` arm in `handle_<flow>`.
+#[proc_macro]
+pub fn flow(input: TokenStream) -> TokenStream {
+    let flow = parse_macro_input!(input as FlowInput);
+    match build_flow(flow) {
+        Ok(tokens) => tokens.into(),
+        Err(error) => error.into_compile_error().into(),
+    }
+}
+
+mod flow_kw {
+    syn::custom_keyword!(flow);
+    syn::custom_keyword!(reply);
+    syn::custom_keyword!(runtime_crate);
+    syn::custom_keyword!(step);
+    syn::custom_keyword!(tina_crate);
+}
+
+struct FlowInput {
+    visibility: Visibility,
+    name: Ident,
+    isolate: Type,
+    reply: Type,
+    tina_crate: Option<Path>,
+    runtime_crate: Option<Path>,
+    steps: Vec<FlowStep>,
+}
+
+struct FlowStep {
+    name: Ident,
+    captures: Vec<FlowCapture>,
+    outcome: Type,
+    body: Box<syn::Block>,
+}
+
+struct FlowCapture {
+    name: Ident,
+    ty: Type,
+}
+
+impl Parse for FlowInput {
+    fn parse(input: ParseStream<'_>) -> Result<Self> {
+        let visibility: Visibility = input.parse()?;
+        input.parse::<flow_kw::flow>()?;
+        let name: Ident = input.parse()?;
+        input.parse::<Token![for]>()?;
+        let isolate: Type = input.parse()?;
+
+        let content;
+        braced!(content in input);
+
+        let mut tina_crate = None;
+        let mut runtime_crate = None;
+        loop {
+            if content.peek(flow_kw::tina_crate) {
+                content.parse::<flow_kw::tina_crate>()?;
+                content.parse::<Token![=]>()?;
+                let value: Path = content.parse()?;
+                set_once_path(&mut tina_crate, value, "tina_crate")?;
+                content.parse::<Token![;]>()?;
+            } else if content.peek(flow_kw::runtime_crate) {
+                content.parse::<flow_kw::runtime_crate>()?;
+                content.parse::<Token![=]>()?;
+                let value: Path = content.parse()?;
+                set_once_path(&mut runtime_crate, value, "runtime_crate")?;
+                content.parse::<Token![;]>()?;
+            } else {
+                break;
+            }
+        }
+
+        content.parse::<flow_kw::reply>()?;
+        let reply: Type = content.parse()?;
+        content.parse::<Token![;]>()?;
+
+        let mut steps = Vec::new();
+        let mut step_names = std::collections::BTreeSet::new();
+        while !content.is_empty() {
+            content.parse::<flow_kw::step>()?;
+            let step_name: Ident = content.parse()?;
+            if !step_names.insert(ident_key(&step_name)) {
+                return Err(Error::new_spanned(step_name, "duplicate flow step name"));
+            }
+
+            let fields;
+            parenthesized!(fields in content);
+            let mut captures = Vec::new();
+            let mut capture_names = std::collections::BTreeSet::new();
+            while !fields.is_empty() {
+                let field_name: Ident = fields.parse()?;
+                if ident_is(&field_name, "req") || ident_is(&field_name, "outcome") {
+                    return Err(Error::new_spanned(
+                        field_name,
+                        "flow capture name is reserved; use a name other than `req` or `outcome`",
+                    ));
+                }
+                if !capture_names.insert(ident_key(&field_name)) {
+                    return Err(Error::new_spanned(
+                        field_name,
+                        "duplicate flow capture name",
+                    ));
+                }
+                fields.parse::<Token![:]>()?;
+                let field_ty: Type = fields.parse()?;
+                captures.push(FlowCapture {
+                    name: field_name,
+                    ty: field_ty,
+                });
+                if fields.peek(Token![,]) {
+                    fields.parse::<Token![,]>()?;
+                }
+            }
+
+            content.parse::<Token![->]>()?;
+            let outcome: Type = content.parse()?;
+            let body: syn::Block = content.parse()?;
+            steps.push(FlowStep {
+                name: step_name,
+                captures,
+                outcome,
+                body: Box::new(body),
+            });
+        }
+
+        if steps.is_empty() {
+            return Err(Error::new_spanned(
+                name,
+                "`tina::flow!` needs at least one `step`",
+            ));
+        }
+
+        Ok(Self {
+            visibility,
+            name,
+            isolate,
+            reply,
+            tina_crate,
+            runtime_crate,
+            steps,
+        })
+    }
+}
+
+fn build_flow(flow: FlowInput) -> Result<proc_macro2::TokenStream> {
+    let visibility = &flow.visibility;
+    let flow_name = &flow.name;
+    let isolate = &flow.isolate;
+    let reply = &flow.reply;
+    let tina_crate = flow
+        .tina_crate
+        .clone()
+        .unwrap_or_else(|| syn::parse_quote!(::tina));
+    let runtime_crate = flow
+        .runtime_crate
+        .clone()
+        .unwrap_or_else(|| syn::parse_quote!(::tina_runtime));
+    let handler = format_ident!("handle_{}", ident_to_snake(&flow.name));
+
+    for step in &flow.steps {
+        if !block_mentions_unshadowed_ident(&step.body, "req") {
+            return Err(Error::new_spanned(
+                &step.name,
+                "flow step body must mention `req` so caller authority is explicitly replied, threaded, or intentionally dropped",
+            ));
+        }
+    }
+
+    let variants = flow.steps.iter().map(|step| {
+        let step_name = &step.name;
+        let capture_types = step.captures.iter().map(|capture| &capture.ty);
+        let outcome = &step.outcome;
+        quote! {
+            #step_name(
+                #tina_crate::RequestContext<#reply>,
+                #(#capture_types,)*
+                #runtime_crate::CallOutcome<#outcome>,
+            )
+        }
+    });
+
+    let arms = flow.steps.iter().map(|step| {
+        let step_name = &step.name;
+        let capture_names = step.captures.iter().map(|capture| &capture.name);
+        let body = &step.body;
+        quote! {
+            #flow_name::#step_name(req, #(#capture_names,)* outcome) => #body
+        }
+    });
+
+    Ok(quote! {
+        #visibility enum #flow_name {
+            #(#variants,)*
+        }
+
+        impl #isolate {
+            #visibility fn #handler(&mut self, msg: #flow_name) -> #tina_crate::Effect<Self> {
+                match msg {
+                    #(#arms,)*
+                }
+            }
+        }
+    })
+}
+
+fn ident_to_snake(ident: &Ident) -> String {
+    let mut out = String::new();
+    let chars: Vec<_> = ident.to_string().chars().collect();
+    for (idx, ch) in chars.iter().copied().enumerate() {
+        if ch.is_uppercase() {
+            let prev = idx.checked_sub(1).and_then(|prev| chars.get(prev));
+            let next = chars.get(idx + 1);
+            if idx > 0
+                && (prev.is_some_and(|prev| prev.is_lowercase() || prev.is_ascii_digit())
+                    || next.is_some_and(|next| next.is_lowercase()))
+            {
+                out.push('_');
+            }
+            for lower in ch.to_lowercase() {
+                out.push(lower);
+            }
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+fn ident_is(ident: &Ident, expected: &str) -> bool {
+    ident_key(ident) == expected
+}
+
+fn ident_key(ident: &Ident) -> String {
+    ident.to_string().trim_start_matches("r#").to_owned()
+}
+
+fn path_is_ident(path: &Path, expected: &str) -> bool {
+    path.leading_colon.is_none()
+        && path.segments.len() == 1
+        && ident_is(&path.segments[0].ident, expected)
+}
+
+fn pat_contains_ident(pat: &Pat, ident: &str) -> bool {
+    struct Finder<'a> {
+        ident: &'a str,
+        found: bool,
+    }
+
+    impl<'ast> Visit<'ast> for Finder<'_> {
+        fn visit_pat_ident(&mut self, node: &'ast syn::PatIdent) {
+            if ident_is(&node.ident, self.ident) {
+                self.found = true;
+            }
+            syn::visit::visit_pat_ident(self, node);
+        }
+    }
+
+    let mut finder = Finder {
+        ident,
+        found: false,
+    };
+    finder.visit_pat(pat);
+    finder.found
+}
+
+fn block_mentions_unshadowed_ident(block: &syn::Block, ident: &str) -> bool {
+    fn token_stream_mentions_ident(tokens: &proc_macro2::TokenStream, ident: &str) -> bool {
+        tokens.clone().into_iter().any(|token| match token {
+            proc_macro2::TokenTree::Ident(candidate) => ident_is(&candidate, ident),
+            proc_macro2::TokenTree::Group(group) => {
+                token_stream_mentions_ident(&group.stream(), ident)
+            }
+            proc_macro2::TokenTree::Punct(_) | proc_macro2::TokenTree::Literal(_) => false,
+        })
+    }
+
+    struct Finder<'a> {
+        ident: &'a str,
+        found: bool,
+        shadowed: usize,
+    }
+
+    impl<'ast> Visit<'ast> for Finder<'_> {
+        fn visit_block(&mut self, node: &'ast syn::Block) {
+            let shadowed_at_entry = self.shadowed;
+            for stmt in &node.stmts {
+                match stmt {
+                    syn::Stmt::Local(local) => {
+                        if let Some(init) = &local.init {
+                            self.visit_expr(&init.expr);
+                            if let Some((_, diverge)) = &init.diverge {
+                                self.visit_expr(diverge);
+                            }
+                        }
+                        if pat_contains_ident(&local.pat, self.ident) {
+                            self.shadowed += 1;
+                        }
+                    }
+                    syn::Stmt::Item(_) => {}
+                    other => self.visit_stmt(other),
+                }
+
+                if self.found {
+                    break;
+                }
+            }
+            self.shadowed = shadowed_at_entry;
+        }
+
+        fn visit_expr_path(&mut self, node: &'ast syn::ExprPath) {
+            if self.shadowed == 0 && node.qself.is_none() && path_is_ident(&node.path, self.ident) {
+                self.found = true;
+            }
+            syn::visit::visit_expr_path(self, node);
+        }
+
+        fn visit_macro(&mut self, node: &'ast syn::Macro) {
+            // Macro bodies are opaque to `syn::Visit`. When no Rust binding
+            // has shadowed the caller authority, a raw token hit is enough:
+            // false accepts still fail later by move semantics, while false
+            // rejects block valid helper-macro adoption.
+            if self.shadowed == 0 && token_stream_mentions_ident(&node.tokens, self.ident) {
+                self.found = true;
+            }
+            syn::visit::visit_macro(self, node);
+        }
+
+        fn visit_expr_closure(&mut self, node: &'ast syn::ExprClosure) {
+            let shadows = node
+                .inputs
+                .iter()
+                .any(|input| pat_contains_ident(input, self.ident));
+            if shadows {
+                self.shadowed += 1;
+            }
+            self.visit_expr(&node.body);
+            if shadows {
+                self.shadowed -= 1;
+            }
+        }
+
+        fn visit_expr_for_loop(&mut self, node: &'ast syn::ExprForLoop) {
+            self.visit_expr(&node.expr);
+            let shadows = pat_contains_ident(&node.pat, self.ident);
+            if shadows {
+                self.shadowed += 1;
+            }
+            self.visit_block(&node.body);
+            if shadows {
+                self.shadowed -= 1;
+            }
+        }
+
+        fn visit_expr_if(&mut self, node: &'ast syn::ExprIf) {
+            if let syn::Expr::Let(expr_let) = node.cond.as_ref() {
+                self.visit_expr(&expr_let.expr);
+                let shadows = pat_contains_ident(&expr_let.pat, self.ident);
+                if shadows {
+                    self.shadowed += 1;
+                }
+                self.visit_block(&node.then_branch);
+                if shadows {
+                    self.shadowed -= 1;
+                }
+            } else {
+                self.visit_expr(&node.cond);
+                self.visit_block(&node.then_branch);
+            }
+
+            if let Some((_, else_branch)) = &node.else_branch {
+                self.visit_expr(else_branch);
+            }
+        }
+
+        fn visit_expr_while(&mut self, node: &'ast syn::ExprWhile) {
+            if let syn::Expr::Let(expr_let) = node.cond.as_ref() {
+                self.visit_expr(&expr_let.expr);
+                let shadows = pat_contains_ident(&expr_let.pat, self.ident);
+                if shadows {
+                    self.shadowed += 1;
+                }
+                self.visit_block(&node.body);
+                if shadows {
+                    self.shadowed -= 1;
+                }
+            } else {
+                self.visit_expr(&node.cond);
+                self.visit_block(&node.body);
+            }
+        }
+
+        fn visit_arm(&mut self, node: &'ast syn::Arm) {
+            let shadows = pat_contains_ident(&node.pat, self.ident);
+            if shadows {
+                self.shadowed += 1;
+            }
+            if let Some((_, guard)) = &node.guard {
+                self.visit_expr(guard);
+            }
+            self.visit_expr(&node.body);
+            if shadows {
+                self.shadowed -= 1;
+            }
+        }
+    }
+
+    let mut finder = Finder {
+        ident,
+        found: false,
+        shadowed: 0,
+    };
+    finder.visit_block(block);
+    finder.found
 }
 
 enum IoDefault {

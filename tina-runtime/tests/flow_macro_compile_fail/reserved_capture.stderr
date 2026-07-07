@@ -1,0 +1,5 @@
+error: flow capture name is reserved; use a name other than `req` or `outcome`
+ --> tests/flow_macro_compile_fail/reserved_capture.rs:7:19
+  |
+7 |         step Done(req: u32) -> u32 {
+  |                   ^^^

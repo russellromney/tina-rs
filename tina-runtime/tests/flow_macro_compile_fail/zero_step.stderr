@@ -1,0 +1,5 @@
+error: `tina::flow!` needs at least one `step`
+ --> tests/flow_macro_compile_fail/zero_step.rs:4:10
+  |
+4 |     flow EmptyFlow for Driver {
+  |          ^^^^^^^^^
