@@ -183,6 +183,23 @@ Reasons:
 - The start site still consumes `CallContext` through `defer(...).reply(...)`,
   preserving the existing authority rules.
 
+Crate paths may be overridden before `reply` when a crate depends on Tina under
+renamed packages or exposes crate-root aliases:
+
+```rust
+tina::flow! {
+    flow NotifyFlow for Controller {
+        tina_crate = ::renamed_tina;
+        runtime_crate = ::renamed_tina_runtime;
+        reply HttpResponse;
+
+        step Loaded(scope_id: u64) -> SqliteResult {
+            /* body */
+        }
+    }
+}
+```
+
 ## Generated Code
 
 For each step:
@@ -255,6 +272,8 @@ The initial form is noisier but avoids hiding Tina's overload vocabulary.
   combine calls.
 - Automatic final replies. The final step must call `reply_to_request` or
   otherwise intentionally consume/drop the `RequestContext`.
+- Branch-local binding rewrites. A local, closure, or match binding named
+  `req` is treated as shadowing and does not satisfy the authority check.
 
 ## Reviewable Diff Strategy
 

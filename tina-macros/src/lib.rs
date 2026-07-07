@@ -182,7 +182,9 @@ pub fn flow(input: TokenStream) -> TokenStream {
 mod flow_kw {
     syn::custom_keyword!(flow);
     syn::custom_keyword!(reply);
+    syn::custom_keyword!(runtime_crate);
     syn::custom_keyword!(step);
+    syn::custom_keyword!(tina_crate);
 }
 
 struct FlowInput {
@@ -190,6 +192,8 @@ struct FlowInput {
     name: Ident,
     isolate: Type,
     reply: Type,
+    tina_crate: Option<Path>,
+    runtime_crate: Option<Path>,
     steps: Vec<FlowStep>,
 }
 
@@ -216,20 +220,57 @@ impl Parse for FlowInput {
         let content;
         braced!(content in input);
 
+        let mut tina_crate = None;
+        let mut runtime_crate = None;
+        loop {
+            if content.peek(flow_kw::tina_crate) {
+                content.parse::<flow_kw::tina_crate>()?;
+                content.parse::<Token![=]>()?;
+                let value: Path = content.parse()?;
+                set_once_path(&mut tina_crate, value, "tina_crate")?;
+                content.parse::<Token![;]>()?;
+            } else if content.peek(flow_kw::runtime_crate) {
+                content.parse::<flow_kw::runtime_crate>()?;
+                content.parse::<Token![=]>()?;
+                let value: Path = content.parse()?;
+                set_once_path(&mut runtime_crate, value, "runtime_crate")?;
+                content.parse::<Token![;]>()?;
+            } else {
+                break;
+            }
+        }
+
         content.parse::<flow_kw::reply>()?;
         let reply: Type = content.parse()?;
         content.parse::<Token![;]>()?;
 
         let mut steps = Vec::new();
+        let mut step_names = std::collections::BTreeSet::new();
         while !content.is_empty() {
             content.parse::<flow_kw::step>()?;
             let step_name: Ident = content.parse()?;
+            if !step_names.insert(ident_key(&step_name)) {
+                return Err(Error::new_spanned(step_name, "duplicate flow step name"));
+            }
 
             let fields;
             parenthesized!(fields in content);
             let mut captures = Vec::new();
+            let mut capture_names = std::collections::BTreeSet::new();
             while !fields.is_empty() {
                 let field_name: Ident = fields.parse()?;
+                if ident_is(&field_name, "req") || ident_is(&field_name, "outcome") {
+                    return Err(Error::new_spanned(
+                        field_name,
+                        "flow capture name is reserved; use a name other than `req` or `outcome`",
+                    ));
+                }
+                if !capture_names.insert(ident_key(&field_name)) {
+                    return Err(Error::new_spanned(
+                        field_name,
+                        "duplicate flow capture name",
+                    ));
+                }
                 fields.parse::<Token![:]>()?;
                 let field_ty: Type = fields.parse()?;
                 captures.push(FlowCapture {
@@ -264,6 +305,8 @@ impl Parse for FlowInput {
             name,
             isolate,
             reply,
+            tina_crate,
+            runtime_crate,
             steps,
         })
     }
@@ -274,10 +317,18 @@ fn build_flow(flow: FlowInput) -> Result<proc_macro2::TokenStream> {
     let flow_name = &flow.name;
     let isolate = &flow.isolate;
     let reply = &flow.reply;
+    let tina_crate = flow
+        .tina_crate
+        .clone()
+        .unwrap_or_else(|| syn::parse_quote!(::tina));
+    let runtime_crate = flow
+        .runtime_crate
+        .clone()
+        .unwrap_or_else(|| syn::parse_quote!(::tina_runtime));
     let handler = format_ident!("handle_{}", ident_to_snake(&flow.name));
 
     for step in &flow.steps {
-        if !block_mentions_ident(&step.body, "req") {
+        if !block_mentions_unshadowed_ident(&step.body, "req") {
             return Err(Error::new_spanned(
                 &step.name,
                 "flow step body must mention `req` so caller authority is explicitly replied, threaded, or intentionally dropped",
@@ -291,9 +342,9 @@ fn build_flow(flow: FlowInput) -> Result<proc_macro2::TokenStream> {
         let outcome = &step.outcome;
         quote! {
             #step_name(
-                ::tina::RequestContext<#reply>,
+                #tina_crate::RequestContext<#reply>,
                 #(#capture_types,)*
-                ::tina_runtime::CallOutcome<#outcome>,
+                #runtime_crate::CallOutcome<#outcome>,
             )
         }
     });
@@ -314,7 +365,7 @@ fn build_flow(flow: FlowInput) -> Result<proc_macro2::TokenStream> {
 
         impl #isolate {
             #[deny(unused_variables)]
-            fn #handler(&mut self, msg: #flow_name) -> ::tina::Effect<Self> {
+            fn #handler(&mut self, msg: #flow_name) -> #tina_crate::Effect<Self> {
                 match msg {
                     #(#arms,)*
                 }
@@ -340,24 +391,167 @@ fn ident_to_snake(ident: &Ident) -> String {
     out
 }
 
-fn block_mentions_ident(block: &syn::Block, ident: &str) -> bool {
+fn ident_is(ident: &Ident, expected: &str) -> bool {
+    ident_key(ident) == expected
+}
+
+fn ident_key(ident: &Ident) -> String {
+    ident.to_string().trim_start_matches("r#").to_owned()
+}
+
+fn path_is_ident(path: &Path, expected: &str) -> bool {
+    path.leading_colon.is_none()
+        && path.segments.len() == 1
+        && ident_is(&path.segments[0].ident, expected)
+}
+
+fn pat_contains_ident(pat: &Pat, ident: &str) -> bool {
     struct Finder<'a> {
         ident: &'a str,
         found: bool,
     }
 
     impl<'ast> Visit<'ast> for Finder<'_> {
-        fn visit_expr_path(&mut self, node: &'ast syn::ExprPath) {
-            if node.path.is_ident(self.ident) {
+        fn visit_pat_ident(&mut self, node: &'ast syn::PatIdent) {
+            if ident_is(&node.ident, self.ident) {
                 self.found = true;
             }
-            syn::visit::visit_expr_path(self, node);
+            syn::visit::visit_pat_ident(self, node);
         }
     }
 
     let mut finder = Finder {
         ident,
         found: false,
+    };
+    finder.visit_pat(pat);
+    finder.found
+}
+
+fn block_mentions_unshadowed_ident(block: &syn::Block, ident: &str) -> bool {
+    struct Finder<'a> {
+        ident: &'a str,
+        found: bool,
+        shadowed: usize,
+    }
+
+    impl<'ast> Visit<'ast> for Finder<'_> {
+        fn visit_block(&mut self, node: &'ast syn::Block) {
+            let shadowed_at_entry = self.shadowed;
+            for stmt in &node.stmts {
+                match stmt {
+                    syn::Stmt::Local(local) => {
+                        if let Some(init) = &local.init {
+                            self.visit_expr(&init.expr);
+                            if let Some((_, diverge)) = &init.diverge {
+                                self.visit_expr(diverge);
+                            }
+                        }
+                        if pat_contains_ident(&local.pat, self.ident) {
+                            self.shadowed += 1;
+                        }
+                    }
+                    syn::Stmt::Item(_) => {}
+                    other => self.visit_stmt(other),
+                }
+
+                if self.found {
+                    break;
+                }
+            }
+            self.shadowed = shadowed_at_entry;
+        }
+
+        fn visit_expr_path(&mut self, node: &'ast syn::ExprPath) {
+            if self.shadowed == 0 && node.qself.is_none() && path_is_ident(&node.path, self.ident) {
+                self.found = true;
+            }
+            syn::visit::visit_expr_path(self, node);
+        }
+
+        fn visit_expr_closure(&mut self, node: &'ast syn::ExprClosure) {
+            let shadows = node
+                .inputs
+                .iter()
+                .any(|input| pat_contains_ident(input, self.ident));
+            if shadows {
+                self.shadowed += 1;
+            }
+            self.visit_expr(&node.body);
+            if shadows {
+                self.shadowed -= 1;
+            }
+        }
+
+        fn visit_expr_for_loop(&mut self, node: &'ast syn::ExprForLoop) {
+            self.visit_expr(&node.expr);
+            let shadows = pat_contains_ident(&node.pat, self.ident);
+            if shadows {
+                self.shadowed += 1;
+            }
+            self.visit_block(&node.body);
+            if shadows {
+                self.shadowed -= 1;
+            }
+        }
+
+        fn visit_expr_if(&mut self, node: &'ast syn::ExprIf) {
+            if let syn::Expr::Let(expr_let) = node.cond.as_ref() {
+                self.visit_expr(&expr_let.expr);
+                let shadows = pat_contains_ident(&expr_let.pat, self.ident);
+                if shadows {
+                    self.shadowed += 1;
+                }
+                self.visit_block(&node.then_branch);
+                if shadows {
+                    self.shadowed -= 1;
+                }
+            } else {
+                self.visit_expr(&node.cond);
+                self.visit_block(&node.then_branch);
+            }
+
+            if let Some((_, else_branch)) = &node.else_branch {
+                self.visit_expr(else_branch);
+            }
+        }
+
+        fn visit_expr_while(&mut self, node: &'ast syn::ExprWhile) {
+            if let syn::Expr::Let(expr_let) = node.cond.as_ref() {
+                self.visit_expr(&expr_let.expr);
+                let shadows = pat_contains_ident(&expr_let.pat, self.ident);
+                if shadows {
+                    self.shadowed += 1;
+                }
+                self.visit_block(&node.body);
+                if shadows {
+                    self.shadowed -= 1;
+                }
+            } else {
+                self.visit_expr(&node.cond);
+                self.visit_block(&node.body);
+            }
+        }
+
+        fn visit_arm(&mut self, node: &'ast syn::Arm) {
+            let shadows = pat_contains_ident(&node.pat, self.ident);
+            if shadows {
+                self.shadowed += 1;
+            }
+            if let Some((_, guard)) = &node.guard {
+                self.visit_expr(guard);
+            }
+            self.visit_expr(&node.body);
+            if shadows {
+                self.shadowed -= 1;
+            }
+        }
+    }
+
+    let mut finder = Finder {
+        ident,
+        found: false,
+        shadowed: 0,
     };
     finder.visit_block(block);
     finder.found

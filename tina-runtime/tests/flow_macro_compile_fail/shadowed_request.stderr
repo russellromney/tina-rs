@@ -1,0 +1,5 @@
+error: flow step body must mention `req` so caller authority is explicitly replied, threaded, or intentionally dropped
+ --> tests/flow_macro_compile_fail/shadowed_request.rs:7:14
+  |
+7 |         step Done() -> u32 {
+  |              ^^^^

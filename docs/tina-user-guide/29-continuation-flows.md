@@ -43,8 +43,17 @@ tina::flow! {
         {
             match outcome {
                 CallOutcome::Replied(WorkerPoolReply::Acquire(AcquireOutcome::Acquired(lease))) => {
-                    /* dispatch next runtime call */
-                    todo!()
+                    let request = HttpRequest::post("/notify")
+                        .text_body(format!("id={id}&name={name}"))
+                        .build();
+                    call(
+                        *lease.handle(),
+                        KeepaliveConnectionMsg::request(request, REQUEST_TIMEOUT),
+                        REQUEST_TIMEOUT,
+                    )
+                    .then(move |outcome| {
+                        ControllerMsg::Notify(NotifyFlow::Sent(req, scope_id, lease, outcome))
+                    })
                 }
                 other => reply_to_request(req, pool_acquire_error_response(other)),
             }
@@ -104,7 +113,8 @@ field.
 ## Rules
 
 - Each step body must mention `req`. Reply with it, thread it into the next
-  step, or explicitly drop it.
+  step, or explicitly drop it. A `req` binding introduced inside a closure,
+  match arm, or local pattern does not satisfy this rule.
 - Match `CallOutcome<T>` in the step body. `Full`, `Closed`, `Timeout`,
   `Rejected`, and domain errors inside `Replied(...)` are still application
   decisions.
@@ -114,6 +124,23 @@ field.
   `CallGroup`, or a hand-written state machine.
 - Do not batch multiple calls against the same runtime-owned resource in one
   step.
+
+If the using crate depends on Tina under different crate names or exposes
+crate-root aliases, configure the generated paths before `reply`:
+
+```rust
+tina::flow! {
+    flow NotifyFlow for Controller {
+        tina_crate = ::my_tina;
+        runtime_crate = ::my_tina_runtime;
+        reply HttpResponse;
+
+        step Loaded(id: i64) -> SqliteResult {
+            /* ... */
+        }
+    }
+}
+```
 
 ## When To Hand-Write
 

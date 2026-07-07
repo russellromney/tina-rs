@@ -1,0 +1,5 @@
+error: duplicate flow capture name
+ --> tests/flow_macro_compile_fail/duplicate_capture.rs:7:31
+  |
+7 |         step Done(value: u32, value: u32) -> u32 {
+  |                               ^^^^^

@@ -70,8 +70,9 @@ expressiveness.
 The generated enum stores `RequestContext<Reply>` as the first field of every
 step. The generated dispatcher moves it into the step body as `req`.
 `RequestContext` remains non-`Clone`, so double reply is still a type error.
-Forgotten reply remains the same safety level as manual continuation code:
-`RequestContext` is `#[must_use]`, and the runtime records dropped slots.
+The macro rejects a step body that does not mention the generated `req`, and
+the check is shadow-aware so a closure or match binding named `req` does not
+count as caller authority.
 
 Failure mode: a user can intentionally drop `req`. That is an existing Tina
 escape hatch, not a macro escape hatch. The guide should tell users the final

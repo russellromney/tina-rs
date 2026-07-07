@@ -10,7 +10,8 @@ This file records completed work.
   dispatch methods for fixed multi-step request handlers without changing the
   runtime effect contract.
 - Added authority-focused compile-fail coverage and a live runtime test for a
-  generated flow carrying `RequestContext` through `CallOutcome`.
+  generated flow carrying `RequestContext` through `CallOutcome`, including
+  shadowed-request, duplicate-name, and renamed-crate expansion coverage.
 - Ported the mini SaaS `POST /items/{id}/notify` path to the generated flow
   surface while keeping the old continuation variants as compatibility
   forwards, and documented the pattern in the user guide.
