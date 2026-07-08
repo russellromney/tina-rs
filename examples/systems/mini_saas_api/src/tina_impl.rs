@@ -1105,37 +1105,6 @@ enum ControllerMsg {
         CallOutcome<SqliteResult>,
     ),
     Loaded(RequestContext<HttpResponse>, i64, CallOutcome<SqliteResult>),
-    #[allow(dead_code)]
-    NotifyLoaded(
-        RequestContext<HttpResponse>,
-        u64,
-        i64,
-        bool,
-        CallOutcome<SqliteResult>,
-    ),
-    #[allow(dead_code)]
-    NotifyAcquired(
-        RequestContext<HttpResponse>,
-        u64,
-        i64,
-        String,
-        bool,
-        CallOutcome<WorkerPoolReply<KeepaliveConnAddr>>,
-    ),
-    #[allow(dead_code)]
-    NotifySent(
-        RequestContext<HttpResponse>,
-        u64,
-        PoolLease<KeepaliveConnAddr>,
-        CallOutcome<KeepaliveOutcome>,
-    ),
-    #[allow(dead_code)]
-    NotifyReleased(
-        RequestContext<HttpResponse>,
-        u64,
-        bool,
-        CallOutcome<WorkerPoolReply<KeepaliveConnAddr>>,
-    ),
     CapacityPool(
         RequestContext<HttpResponse>,
         CallOutcome<WorkerPoolReply<KeepaliveConnAddr>>,
@@ -1331,19 +1300,6 @@ impl Isolate for Controller {
             },
             ControllerMsg::Loaded(req, id, outcome) => {
                 reply_to(req, item_response(id, outcome))
-            }
-            ControllerMsg::NotifyLoaded(req, scope_id, id, slow, outcome) => self
-                .handle_notify_flow(NotifyFlow::Loaded(req, scope_id, id, slow, outcome)),
-            ControllerMsg::NotifyAcquired(req, scope_id, id, name, slow, outcome) => {
-                self.handle_notify_flow(NotifyFlow::Acquired(
-                    req, scope_id, id, name, slow, outcome,
-                ))
-            }
-            ControllerMsg::NotifySent(req, scope_id, lease, outcome) => {
-                self.handle_notify_flow(NotifyFlow::Sent(req, scope_id, lease, outcome))
-            }
-            ControllerMsg::NotifyReleased(req, scope_id, ok, release) => {
-                self.handle_notify_flow(NotifyFlow::Released(req, scope_id, ok, release))
             }
             ControllerMsg::CapacityPool(req, outcome) => {
                 let body = self.body_metrics.snapshot();
