@@ -5285,8 +5285,7 @@ where
         }
 
         let entry_index = self.entries.iter().position(|entry| {
-            entry.id == head.requester.isolate
-                && entry.generation == head.requester.generation
+            entry.id == head.requester.isolate && entry.generation == head.requester.generation
         });
         let Some(entry_index) = entry_index else {
             self.push_event(

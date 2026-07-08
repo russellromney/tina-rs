@@ -43,10 +43,10 @@ use crate::trace::{
     TerminalCompletionAction,
 };
 use crate::{
-    CANCELLED_CALL_RING_CAPACITY, CallDispatchContext, DeliveredMessage, DriverCall, DriverCallHead,
-    ErasedIsolateCallTranslator, PendingIsolateCall, MessageCallContext, Runtime, TraceRetention, call,
-    call_reply_reason_for_cause, deferred, deferred_reply_reason_for_cause, observation,
-    reserve_round_message_scratch, trace,
+    CANCELLED_CALL_RING_CAPACITY, CallDispatchContext, DeliveredMessage, DriverCall,
+    DriverCallHead, ErasedIsolateCallTranslator, MessageCallContext, PendingIsolateCall, Runtime,
+    TraceRetention, call, call_reply_reason_for_cause, deferred, deferred_reply_reason_for_cause,
+    observation, reserve_round_message_scratch, trace,
 };
 use tina_supervisor::SupervisorConfig;
 
