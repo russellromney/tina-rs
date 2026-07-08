@@ -194,6 +194,132 @@ fn carried_completion_for_stopped_requester_is_dropped_not_quarantined() {
     assert!(runtime.pending_completions.is_empty(), "completion purged");
 }
 
+/// Test driver that emits exactly one completion for a call the runtime never
+/// admitted — a genuine driver accounting bug surfaced through the real
+/// `advance` sink rather than a direct `deliver_completion` call.
+#[derive(Debug)]
+struct UnknownCompletionDriver {
+    emit: Option<DriverCompletion>,
+}
+
+impl RuntimeDriver for UnknownCompletionDriver {
+    fn submit(
+        &mut self,
+        _call_id: CallId,
+        _request: CallInput,
+        _now: Instant,
+    ) -> Option<DriverCompletion> {
+        None
+    }
+
+    fn advance(&mut self, _now: Instant, completed: &mut Vec<DriverCompletion>) {
+        if let Some(completion) = self.emit.take() {
+            completed.push(completion);
+        }
+    }
+
+    fn has_pending(&self) -> bool {
+        self.emit.is_some()
+    }
+
+    fn cancel_pending(&mut self, _deadline: Instant) -> Result<(), DriverShutdownError> {
+        Ok(())
+    }
+
+    fn cancel(&mut self, _call_id: CallId) -> bool {
+        false
+    }
+}
+
+#[test]
+fn unknown_completion_from_real_advance_sink_is_quarantined_and_shard_survives() {
+    // The existing quarantine test calls `deliver_completion` directly with a
+    // fabricated id. This drives a genuinely-unknown completion through the
+    // real sink: `advance_driver` harvests `driver.advance` into
+    // `pending_completions`, then delivers it into `deliver_completion`, which
+    // must quarantine (trace + drop) instead of panicking.
+    let mut runtime = Runtime::with_clock_and_ids_and_driver(
+        TestShard,
+        TestMailboxFactory,
+        Box::new(MonotonicClock),
+        IdSource::new(),
+        Box::new(UnknownCompletionDriver {
+            emit: Some(DriverCompletion {
+                call_id: CallId::new(9999),
+                result: CallOutput::TcpListenerClosed,
+            }),
+        }),
+    );
+    runtime.register(new_root(), root_mailbox());
+
+    runtime.advance_driver(runtime.clock.now());
+
+    let quarantined = runtime
+        .trace()
+        .iter()
+        .filter(|event| {
+            matches!(
+                event.kind(),
+                RuntimeEventKind::DriverCompletionQuarantined { call_id }
+                    if call_id == CallId::new(9999)
+            )
+        })
+        .count();
+    assert_eq!(
+        quarantined, 1,
+        "an unknown completion through the real advance sink must quarantine exactly once"
+    );
+    assert!(runtime.pending_completions.is_empty(), "completion drained");
+    // The shard survived: no in-flight calls, isolate still registered.
+    assert!(
+        !runtime.has_in_flight_calls(),
+        "shard survived the quarantine"
+    );
+    assert_eq!(runtime.entries.len(), 1, "registered isolate is intact");
+}
+
+#[test]
+fn pending_driver_timer_reports_pending_runtime_work_for_the_repoll_park() {
+    // Mechanism behind `pending_timer_parks_multishard_worker_instead_of_spinning`:
+    // the worker picks the short `idle_repoll_interval` park (versus the long
+    // `idle_wait`) precisely when `has_pending_runtime_work()` is true. A pending
+    // driver timer must make it true; a fully idle runtime must make it false.
+    // This is the deterministic core; the live test only smoke-checks that the
+    // repoll park actually fires on a real worker thread.
+    let (mut runtime, clock) = new_manual_runtime();
+    assert!(
+        !runtime.has_pending_runtime_work(),
+        "a fresh idle runtime owns no self-driving work"
+    );
+
+    let bridge = runtime.register(
+        PollLoopBridge {
+            in_flight: false,
+            settled: Rc::new(Cell::new(false)),
+            seen: Rc::new(RefCell::new(Vec::new())),
+        },
+        TestMailbox::new(4),
+    );
+    runtime.try_send(bridge, BridgeMsg::Admit).expect("admit");
+    runtime.step();
+
+    assert!(
+        runtime.has_pending_runtime_work(),
+        "a pending driver timer must report pending runtime work so the worker \
+         chooses the short repoll park, not the long idle wait"
+    );
+
+    // Fire the timer; the work drains and the runtime reports idle again.
+    clock.advance(Duration::from_millis(50));
+    for _ in 0..4 {
+        runtime.step();
+    }
+    assert!(
+        !runtime.has_pending_runtime_work(),
+        "after the timer fires and drains, the runtime owns no pending work"
+    );
+}
+
 #[test]
 fn bounded_trace_retention_does_not_move_the_tail_on_every_event() {
     let mut runtime = Runtime::with_clock_and_ids_and_driver(

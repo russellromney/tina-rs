@@ -974,8 +974,39 @@ where
                 RuntimeEventKind::CallRejected { call_id, reason }
             }
         };
+        if matches!(reason, CallRejectedReason::UnsupportedMessage) {
+            self.note_unsupported_message_rejection(isolate_id, call_id);
+        }
         self.push_event(isolate_id, Some(cause), kind);
     }
+
+    /// Debug tripwire for the "answers `call()` but only implements `handle`"
+    /// bug class. `UnsupportedMessage` is the default `handle_call`'s reject
+    /// reason, so a call resolving that way is a candidate for a target that
+    /// never defined `handle_call`. Bumps a debug-only counter tests can assert
+    /// on (`unsupported_message_rejections()`) so that class of bug surfaces.
+    ///
+    /// PRECISION CAVEAT: this counts EVERY `UnsupportedMessage` reject — the
+    /// default handler's auto-reject AND a handler that deliberately calls
+    /// `call.reject(UnsupportedMessage)`. The runtime cannot distinguish them
+    /// (both are just `handle_call` returning the same effect), so a nonzero
+    /// count means "investigate", not "definitely a missing `handle_call`". Use
+    /// it in a controlled per-test runtime with known traffic; do NOT wire a
+    /// global "count == 0" gate — it would false-fire on every isolate that
+    /// legitimately rejects unsupported messages.
+    ///
+    /// Deliberately allocation-free and trace-free: it is a bare scalar bump on
+    /// an already-cold reject path, so it perturbs neither the allocation pins
+    /// nor golden trace hashes. Compiled out entirely in release for zero cost.
+    #[cfg(debug_assertions)]
+    #[inline]
+    fn note_unsupported_message_rejection(&mut self, _isolate_id: IsolateId, _call_id: CallId) {
+        self.unsupported_message_rejections += 1;
+    }
+
+    #[cfg(not(debug_assertions))]
+    #[inline(always)]
+    fn note_unsupported_message_rejection(&mut self, _isolate_id: IsolateId, _call_id: CallId) {}
 
     pub(crate) fn execute_reply_to(
         &mut self,
@@ -1200,8 +1231,18 @@ where
 
         // Driver cancelled some pending calls because their resource
         // closed. Drop matching runtime state, or `has_in_flight_calls`
-        // stays true forever.
+        // stays true forever. Mirror `advance_driver`'s belt-and-braces
+        // purge at its twin site: drop any carried completion for a call
+        // this close just cancelled, so a later advance cannot deliver a
+        // completion for a call whose entry is gone (which would trip
+        // `deliver_completion`'s unknown-call quarantine). Safe without it
+        // under the driver contract — a lane resolves each call once, so a
+        // cancelled-by-close call is never also carried — but kept symmetric
+        // with `advance_driver` so the invariant holds even if a future lane
+        // breaks that rule.
         for cancelled in self.driver.take_cancelled_by_close() {
+            self.pending_completions
+                .retain(|op| op.call_id != cancelled);
             self.cancel_in_flight_call_for_resource_close(cancelled);
         }
     }

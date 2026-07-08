@@ -344,6 +344,47 @@ mod tests {
     }
 
     #[test]
+    fn unknown_completion_through_real_timer_harvest_is_quarantined_not_panicked() {
+        // Stronger than the direct-`deliver_completion` test above: a timer
+        // whose call the table never tracked (a driver accounting bug) fires
+        // through the REAL `step -> harvest_timers -> deliver_completion_at`
+        // sink. The simulator must quarantine (trace + drop) and survive.
+        let mut sim = Simulator::new(NumberedShard(0), SimulatorConfig::default());
+        sim.timers.push(crate::internals::TimerEntry {
+            call_id: CallId::new(4242),
+            deadline: std::time::Duration::from_millis(10),
+            insertion_order: 0,
+        });
+
+        sim.advance_time(std::time::Duration::from_millis(20));
+        sim.step();
+
+        let quarantined = sim
+            .trace()
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event.kind(),
+                    RuntimeEventKind::DriverCompletionQuarantined { call_id }
+                        if call_id == CallId::new(4242)
+                )
+            })
+            .count();
+        assert_eq!(
+            quarantined, 1,
+            "an unknown timer through the real harvest sink must quarantine exactly once"
+        );
+        assert!(
+            sim.timers.is_empty(),
+            "the fired timer is removed from the queue"
+        );
+        assert!(
+            !sim.has_in_flight_calls(),
+            "simulator survived the quarantine"
+        );
+    }
+
+    #[test]
     fn fault_selector_mixes_tag_into_first_ordinal() {
         assert_ne!(
             fault_selector(7, 0xAA, 0, 17),
