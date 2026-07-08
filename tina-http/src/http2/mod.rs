@@ -27,3 +27,23 @@ pub use server::{
     Http2ServiceMessage, Http2StreamReport, Http2StreamState,
 };
 pub use target::{AlpnProtocols, Http2Target};
+
+/// Pure decode entry points for the out-of-workspace fuzz harness.
+///
+/// `frame` and `headers` internals are `pub(super)` on purpose; this
+/// module is the only sanctioned way past that boundary and exists only
+/// under the `fuzzing` feature.
+#[cfg(feature = "fuzzing")]
+#[doc(hidden)]
+pub mod fuzzing {
+    use super::errors::Http2ProtocolError;
+
+    /// Decodes one frame header + length check, as the read loop does.
+    pub fn fuzz_decode_frame_meta(
+        buffer: &[u8],
+        max_frame_size: usize,
+    ) -> Result<Option<(u8, u8, u32, usize)>, Http2ProtocolError> {
+        Ok(super::frame::try_decode_frame_meta(buffer, max_frame_size)?
+            .map(|meta| (meta.ty, meta.flags, meta.stream_id, meta.total)))
+    }
+}

@@ -163,11 +163,18 @@ fn decode_headers_block_with_storage(
     {
         return Ok(headers);
     }
-    let mut out = HeaderBlock::default();
-    for (name, value) in decoder
-        .decode(block)
+    // The `hpack` crate `.ok().unwrap()`s a failed varint decode in its
+    // dynamic-table-size-update path, so a truncated size-update block
+    // panics inside `decode` rather than returning `Err`. That input is
+    // attacker-controlled; contain the panic and treat it as any other
+    // unsupported/malformed block. The decoder is torn down with the
+    // connection on this error, so its post-panic state is never reused.
+    let decoded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| decoder.decode(block)))
         .map_err(|_| Http2ProtocolError::HpackUnsupported)?
-    {
+        .map_err(|_| Http2ProtocolError::HpackUnsupported)?;
+
+    let mut out = HeaderBlock::default();
+    for (name, value) in decoded {
         let name = std::str::from_utf8(&name).map_err(|_| Http2ProtocolError::HpackUnsupported)?;
         let value =
             std::str::from_utf8(&value).map_err(|_| Http2ProtocolError::HpackUnsupported)?;
@@ -1030,5 +1037,16 @@ mod tests {
         let mut decoder = hpack::Decoder::new();
         let decoded = decode_headers_block_compact_with(&mut decoder, &block, 4096, None).unwrap();
         assert_eq!(decoded.path.as_deref(), Some("/pkg.Service/Unary"));
+    }
+
+    #[test]
+    fn truncated_dynamic_table_size_update_is_typed_error_not_panic() {
+        // Fuzz-found: `0x2c` opens a dynamic-table-size-update whose varint
+        // runs off the end of the block. The `hpack` crate unwraps the
+        // failed integer decode and panics; the block is attacker-supplied,
+        // so it must surface as a protocol error instead.
+        let mut decoder = hpack::Decoder::new();
+        let result = decode_headers_block(&[0x2c, 0xc1, 0x3f], 4096);
+        assert!(matches!(result, Err(Http2ProtocolError::HpackUnsupported)));
     }
 }

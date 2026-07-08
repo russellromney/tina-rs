@@ -21,6 +21,7 @@ members = [
     "tina-aws-bridge",
 ]
 exclude = [
+    "fuzz",
     "examples/specimen_real_io_chat",
     "examples/specimen_rpc",
     "examples/specimen_mini_keyspace",

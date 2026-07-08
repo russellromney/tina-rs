@@ -28,6 +28,16 @@ This file records completed work.
 - Removed `TimerInterval`, `MissedTickPolicy`, and `IntervalDelay`; use `RecurringTick` and `RecurringCatchUp`.
 - Removed public `tina_runtime::wait_list::WaitList`; use `SharedWork`.
 - Renamed `request_effect_after_wait_park` to `request_effect_after_shared_wait`.
+### Fuzzing
+
+- Added a `fuzz/` crate (excluded from the workspace) with coverage-guided
+  targets for the hand-rolled decoders: chunked bodies, HTTP/1 request and
+  response heads, the RPC frame codec, and HTTP/2 frame headers.
+- Contained an attacker-reachable panic in HTTP/2 HPACK decoding: a truncated
+  dynamic-table-size update made the `hpack` crate unwrap a failed integer
+  decode and panic; the header decode now maps that to a protocol error on the
+  default unwind build. See `fuzz/README.md` for the residual panic=abort caveat.
+
 ### CI Dependency Hygiene
 
 - Pinned the nightly toolchain in `rust-toolchain.toml` (with rustfmt and
