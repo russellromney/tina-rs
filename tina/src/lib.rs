@@ -152,7 +152,7 @@ pub use tina_macros::flow;
 ///
 /// This is the preferred authoring path for ordinary Tina code. Only `message`
 /// is required for single-shard isolates: omitted `shard = ...` defaults to
-/// [`SingleShard`]. `reply`, `send`, `spawn`, and `call` default to the
+/// [`SingleShard`]. `reply`, `send`, `spawn`, and `io` default to the
 /// no-reply/no-send/no-spawn/no-runtime-call shape.
 ///
 /// ```compile_fail
