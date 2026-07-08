@@ -18,7 +18,11 @@ http = { version = "1", default-features = false, features = ["std"] }
 base64 = { version = "0.22", default-features = false, features = ["std"] }
 sha1 = { version = "0.10", default-features = false }
 prost = { version = "0.13", default-features = false, features = ["derive"] }
-hpack = "0.3"
+# Pinned exactly: the HPACK soundness walker in http2::headers mirrors this
+# version's `decode_integer` internals (5-octet ceiling, size-update panic
+# site) byte-for-byte. A different 0.3.x could change that behavior and
+# silently invalidate the walker, so bumps must re-verify the walker + fuzzer.
+hpack = "=0.3.0"
 
 [dev-dependencies]
 tina-sim = { path = "../tina-sim" }

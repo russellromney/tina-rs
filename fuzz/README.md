@@ -39,6 +39,13 @@ strategy.
 
 This target mirrors the production guard: it decodes only when the walker
 accepts. Under the fuzzer's `panic = "abort"` it crashes precisely when the
-walker is unsound (admits a block that panics `decode`), so a clean run is
-evidence the walker is complete. The seed corpus pins the three panic inputs
-(truncated, unterminated, and over-long size updates).
+walker is *unsound* (admits a block that panics `decode`), so a clean run is
+evidence of soundness — the security property. It is one-sided: it cannot see
+a walker that over-*rejects* a valid block. Completeness (no false rejects) is
+covered by `walker_gates_every_short_block_against_the_real_decoder` in
+`tina-http`, an exhaustive differential unit test over all 1- and 2-byte blocks
+that runs under `panic = "unwind"` and checks both directions.
+
+The seed corpus for this target holds three genuine panic inputs (truncated,
+unterminated, and over-long size updates) plus one well-formed block; the other
+five targets ship no seeds.

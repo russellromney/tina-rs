@@ -38,8 +38,9 @@ This file records completed work.
   crate unwrap a failed decode and panic inside `decode` — a process abort on
   `panic = "abort"` builds, i.e. a remote DoS. The decoder is now gated behind
   a structural soundness walker that rejects exactly the inputs `hpack` would
-  fault on, under every panic strategy; a differential fuzz target proves the
-  walker never admits a panicking block.
+  fault on, under every panic strategy. A fuzz target proves the walker never
+  admits a panicking block, and an exhaustive unit test over all short blocks
+  checks the walker agrees with the real decoder in both directions.
 
 ### CI Dependency Hygiene
 

@@ -1135,12 +1135,16 @@ mod tests {
 
     #[test]
     fn truncated_dynamic_table_size_update_is_typed_error_not_panic() {
-        // Fuzz-found: `0x2c` opens a dynamic-table-size-update whose varint
-        // runs off the end of the block. The `hpack` crate unwraps the
-        // failed integer decode and panics; the block is attacker-supplied,
-        // so it must surface as a protocol error instead.
+        // `0x3f` opens a dynamic-table-size-update (prefix-5 value 31 == the
+        // prefix max) that promises continuation octets the block does not
+        // carry. Un-patched, `hpack` unwraps the failed integer decode and
+        // panics; the block is attacker-supplied, so the gated path must
+        // surface a protocol error instead. (This exact block panics
+        // `hpack::Decoder::decode`; the earlier `2c c1 3f` did not — `0xc1`
+        // is an out-of-range index that errors gracefully before the decoder
+        // ever reaches the trailing byte.)
         let mut decoder = hpack::Decoder::new();
-        let result = decode_headers_block(&[0x2c, 0xc1, 0x3f], 4096);
+        let result = decode_headers_block(&[0x3f], 4096);
         assert!(matches!(result, Err(Http2ProtocolError::HpackUnsupported)));
     }
 
@@ -1170,5 +1174,44 @@ mod tests {
         // Literal-without-indexing, new name (index 0), name length 4 but only
         // one octet present: the string runs off the end.
         assert!(!hpack_block_is_sound(&[0x00, 0x04, b'a']));
+    }
+
+    #[test]
+    fn walker_gates_every_short_block_against_the_real_decoder() {
+        // Exhaustive differential check over all 1- and 2-byte blocks, run
+        // under the test binary's `panic = "unwind"` so a panicking `decode`
+        // is observable (the fuzzer's `panic = "abort"` cannot see it). Two
+        // directions: the walker must never admit a block that panics `decode`
+        // (soundness — the security property), and it must never reject a block
+        // `decode` accepts cleanly (completeness — no interop breakage).
+        fn decode_outcome(block: &[u8]) -> Result<bool, ()> {
+            // Ok(true) = decoded cleanly, Ok(false) = graceful decode error,
+            // Err(()) = panicked.
+            std::panic::catch_unwind(|| {
+                let mut decoder = hpack::Decoder::new();
+                decoder.decode(block).is_ok()
+            })
+            .map_err(|_| ())
+        }
+        let mut blocks: Vec<Vec<u8>> = (0u16..=255).map(|b| vec![b as u8]).collect();
+        for hi in 0u16..=255 {
+            for lo in 0u16..=255 {
+                blocks.push(vec![hi as u8, lo as u8]);
+            }
+        }
+        for block in blocks {
+            let sound = hpack_block_is_sound(&block);
+            match decode_outcome(&block) {
+                Err(()) => assert!(
+                    !sound,
+                    "walker admitted a block that panics decode: {block:02x?}"
+                ),
+                Ok(true) => assert!(
+                    sound,
+                    "walker rejected a block decode accepts: {block:02x?}"
+                ),
+                Ok(false) => {} // graceful decode error: walker may accept or reject.
+            }
+        }
     }
 }
