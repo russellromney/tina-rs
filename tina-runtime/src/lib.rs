@@ -472,7 +472,7 @@ where
     /// whole bug class shipped invisibly once. Incremented only in debug builds;
     /// never in release, so it is zero-cost there and the accessor reads a
     /// constant 0.
-    pub(crate) default_handle_call_rejections: u64,
+    pub(crate) unsupported_message_rejections: u64,
 }
 
 /// Capacity of the per-runtime recently-cancelled-calls ring. The sim
@@ -906,7 +906,7 @@ where
                 CANCELLED_CALL_RING_CAPACITY,
             ),
             cancelled_call_cause_evictions: 0,
-            default_handle_call_rejections: 0,
+            unsupported_message_rejections: 0,
         }
     }
 
@@ -938,8 +938,8 @@ where
     /// A non-zero count in a debug build almost always means a target answers
     /// calls but only implements `handle`. Always 0 in release builds (the
     /// increment is compiled out for zero cost).
-    pub const fn default_handle_call_rejections(&self) -> u64 {
-        self.default_handle_call_rejections
+    pub const fn unsupported_message_rejections(&self) -> u64 {
+        self.unsupported_message_rejections
     }
 
     /// Returns the number of trace events dropped by the retention policy.

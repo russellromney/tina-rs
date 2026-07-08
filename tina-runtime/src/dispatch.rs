@@ -975,30 +975,38 @@ where
             }
         };
         if matches!(reason, CallRejectedReason::UnsupportedMessage) {
-            self.note_default_handle_call_rejection(isolate_id, call_id);
+            self.note_unsupported_message_rejection(isolate_id, call_id);
         }
         self.push_event(isolate_id, Some(cause), kind);
     }
 
     /// Debug tripwire for the "answers `call()` but only implements `handle`"
     /// bug class. `UnsupportedMessage` is the default `handle_call`'s reject
-    /// reason, so a call resolving that way almost always means the target
-    /// never defined `handle_call`. Bumps a debug-only counter that tests and CI
-    /// can assert on (`default_handle_call_rejections()`), so the next
-    /// occurrence surfaces without an e2e test having to exist first.
+    /// reason, so a call resolving that way is a candidate for a target that
+    /// never defined `handle_call`. Bumps a debug-only counter tests can assert
+    /// on (`unsupported_message_rejections()`) so that class of bug surfaces.
+    ///
+    /// PRECISION CAVEAT: this counts EVERY `UnsupportedMessage` reject — the
+    /// default handler's auto-reject AND a handler that deliberately calls
+    /// `call.reject(UnsupportedMessage)`. The runtime cannot distinguish them
+    /// (both are just `handle_call` returning the same effect), so a nonzero
+    /// count means "investigate", not "definitely a missing `handle_call`". Use
+    /// it in a controlled per-test runtime with known traffic; do NOT wire a
+    /// global "count == 0" gate — it would false-fire on every isolate that
+    /// legitimately rejects unsupported messages.
     ///
     /// Deliberately allocation-free and trace-free: it is a bare scalar bump on
     /// an already-cold reject path, so it perturbs neither the allocation pins
     /// nor golden trace hashes. Compiled out entirely in release for zero cost.
     #[cfg(debug_assertions)]
     #[inline]
-    fn note_default_handle_call_rejection(&mut self, _isolate_id: IsolateId, _call_id: CallId) {
-        self.default_handle_call_rejections += 1;
+    fn note_unsupported_message_rejection(&mut self, _isolate_id: IsolateId, _call_id: CallId) {
+        self.unsupported_message_rejections += 1;
     }
 
     #[cfg(not(debug_assertions))]
     #[inline(always)]
-    fn note_default_handle_call_rejection(&mut self, _isolate_id: IsolateId, _call_id: CallId) {}
+    fn note_unsupported_message_rejection(&mut self, _isolate_id: IsolateId, _call_id: CallId) {}
 
     pub(crate) fn execute_reply_to(
         &mut self,

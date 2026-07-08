@@ -170,7 +170,7 @@ where
     }
 
     let recorded = outcomes.borrow().clone();
-    (recorded, runtime.default_handle_call_rejections())
+    (recorded, runtime.unsupported_message_rejections())
 }
 
 #[test]
