@@ -1,103 +1,35 @@
 //! Runnable TCP echo demonstration.
 //!
-//! Mirrors the workload shape of `tests/tcp_echo.rs`: a listener isolate
-//! is the supervised parent, the accepted connection becomes a
-//! restartable child handler isolate, and the new runtime-owned call
-//! contract drives bind/accept/read/write/close. The example doubles as
-//! a smoke test by asserting on its own outcomes — per the package's
-//! "do not let the echo example become the only proof" guardrail, the
-//! semantic surface still lives in the integration test and the
-//! focused call-dispatch tests.
+//! A listener isolate is the supervised parent, each accepted connection
+//! becomes a restartable child handler isolate, and the runtime-owned call
+//! contract drives bind/accept/read/write/close.
+//!
+//! The `ThreadedRuntime` worker thread performs the I/O; `main` is just a
+//! client. It starts the runtime, registers the listener, connects three
+//! times, checks each echo, and shuts down. No manual `step()` pumping and no
+//! hand-rolled mailbox.
 //!
 //! Run with:
 //! ```bash
 //! cargo run -p tina-runtime --example tcp_echo
 //! ```
 //!
-//! Binds to `127.0.0.1:0` and relies on the runtime to report the actual
-//! bound address through `CallOutput::TcpBound { local_addr }`, then
-//! accepts exactly three client connections, closes the listener
-//! cleanly, and exits.
+//! Binds to `127.0.0.1:0`; the listener publishes the actual bound address
+//! through its shared slot. A deterministic trace-shape proof lives in the
+//! `#[test]` at the bottom, which uses the explicit-step runtime.
 
-use std::cell::{Cell, RefCell};
-use std::collections::VecDeque;
 use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpStream};
-use std::rc::Rc;
+use std::net::{Shutdown, SocketAddr, TcpStream};
 use std::sync::{Arc, Mutex};
-use std::thread::{self, JoinHandle};
+use std::thread;
 use std::time::{Duration, Instant};
 
-use tina::{Mailbox, RestartBudget, RestartPolicy, TrySendError, prelude::*};
+use tina::{RestartBudget, RestartPolicy, prelude::*};
 use tina_runtime::{
-    CallKind, ListenerId, MailboxFactory, Runtime, RuntimeEvent, RuntimeEventKind, StreamId,
-    tcp_accept, tcp_bind, tcp_close_listener, tcp_close_stream, tcp_read, tcp_write,
+    DefaultThreadedMailboxFactory, ListenerId, StreamId, ThreadedRuntime, tcp_accept, tcp_bind,
+    tcp_close_listener, tcp_close_stream, tcp_read, tcp_write,
 };
 use tina_supervisor::SupervisorConfig;
-
-#[derive(Debug, Default)]
-struct ExampleShard;
-
-impl Shard for ExampleShard {
-    fn id(&self) -> ShardId {
-        ShardId::new(1)
-    }
-}
-
-struct ExampleMailbox<T> {
-    capacity: usize,
-    queue: Rc<RefCell<VecDeque<T>>>,
-    closed: Rc<Cell<bool>>,
-}
-
-impl<T> ExampleMailbox<T> {
-    fn new(capacity: usize) -> Self {
-        Self {
-            capacity,
-            queue: Rc::new(RefCell::new(VecDeque::new())),
-            closed: Rc::new(Cell::new(false)),
-        }
-    }
-}
-
-impl<T> Mailbox<T> for ExampleMailbox<T> {
-    fn capacity(&self) -> usize {
-        self.capacity
-    }
-
-    fn try_send(&self, message: T) -> Result<(), TrySendError<T>> {
-        if self.closed.get() {
-            return Err(TrySendError::Closed(message));
-        }
-        let mut queue = self.queue.borrow_mut();
-        if queue.len() >= self.capacity {
-            return Err(TrySendError::Full(message));
-        }
-        queue.push_back(message);
-        Ok(())
-    }
-
-    fn recv(&self) -> Option<T> {
-        self.queue.borrow_mut().pop_front()
-    }
-
-    fn is_empty(&self) -> bool {
-        self.queue.borrow().is_empty()
-    }
-
-    fn close(&self) {
-        self.closed.set(true);
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-struct ExampleMailboxFactory;
-
-impl MailboxFactory for ExampleMailboxFactory {
-    fn create<T: 'static>(&self, capacity: usize) -> Box<dyn Mailbox<T>> {
-        Box::new(ExampleMailbox::new(capacity))
-    }
-}
 
 type BoundAddr = Arc<Mutex<Option<SocketAddr>>>;
 
@@ -117,12 +49,12 @@ struct Connection {
     pending_write: Vec<u8>,
 }
 
-#[tina_runtime::isolate(message = ConnectionEvent, shard = ExampleShard)]
+#[tina_runtime::isolate(message = ConnectionEvent)]
 impl Connection {
     fn handle(
         &mut self,
         msg: ConnectionEvent,
-        _ctx: &mut Context<'_, ExampleShard, Self::Reply>,
+        _ctx: &mut Context<'_, SingleShard, Self::Reply>,
     ) -> Effect<Self> {
         match msg {
             ConnectionEvent::Begin => read_call(self.stream, self.max_chunk),
@@ -199,13 +131,12 @@ struct Listener {
     message = ListenerEvent,
     send = Outbound<ListenerEvent>,
     spawn = RestartableChildDefinition<Connection>,
-    shard = ExampleShard
 )]
 impl Listener {
     fn handle(
         &mut self,
         msg: ListenerEvent,
-        ctx: &mut Context<'_, ExampleShard, Self::Reply>,
+        ctx: &mut Context<'_, SingleShard, Self::Reply>,
     ) -> Effect<Self> {
         match msg {
             ListenerEvent::Start => {
@@ -270,91 +201,35 @@ impl Listener {
     }
 }
 
-fn step_until<F>(
-    runtime: &mut Runtime<ExampleShard, ExampleMailboxFactory>,
-    timeout: Duration,
-    label: &str,
-    predicate: F,
-) where
-    F: Fn(&Runtime<ExampleShard, ExampleMailboxFactory>) -> bool,
-{
-    let deadline = Instant::now() + timeout;
-    while !predicate(runtime) {
-        if Instant::now() > deadline {
-            panic!("step_until({label}): predicate not satisfied within timeout");
+/// Connects, sends `payload`, half-closes, and reads the echo until EOF.
+fn echo_roundtrip(addr: SocketAddr, payload: &[u8]) -> Vec<u8> {
+    let mut stream = TcpStream::connect(addr).expect("connect");
+    stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
+    stream.write_all(payload).expect("write");
+    stream.shutdown(Shutdown::Write).expect("write shutdown");
+    let mut received = Vec::new();
+    let mut buf = [0u8; 256];
+    loop {
+        match stream.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => received.extend_from_slice(&buf[..n]),
+            Err(error) => panic!("client read error: {error}"),
         }
-        runtime.step();
-        thread::sleep(Duration::from_millis(2));
     }
+    received
 }
 
-fn count_call_completed(trace: &[RuntimeEvent], kind: CallKind) -> usize {
-    trace
-        .iter()
-        .filter(|event| {
-            matches!(
-                event.kind(),
-                RuntimeEventKind::CallCompleted { call_kind, .. } if call_kind == kind
-            )
-        })
-        .count()
-}
-
-fn count_spawned(trace: &[RuntimeEvent]) -> usize {
-    trace
-        .iter()
-        .filter(|event| matches!(event.kind(), RuntimeEventKind::Spawned { .. }))
-        .count()
-}
-
-fn count_handler_finished(trace: &[RuntimeEvent], effect: tina_runtime::EffectKind) -> usize {
-    trace
-        .iter()
-        .filter(|event| {
-            matches!(
-                event.kind(),
-                RuntimeEventKind::HandlerFinished { effect: actual } if actual == effect
-            )
-        })
-        .count()
-}
-
-struct ClientRun {
-    done: Arc<Mutex<bool>>,
-    echoed: Arc<Mutex<Vec<u8>>>,
-    handle: JoinHandle<()>,
-}
-
-fn spawn_client(local_addr: SocketAddr, payload: Vec<u8>) -> ClientRun {
-    let done = Arc::new(Mutex::new(false));
-    let echoed: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
-    let done_for_client = Arc::clone(&done);
-    let echoed_for_client = Arc::clone(&echoed);
-
-    let handle = thread::spawn(move || {
-        let mut stream = TcpStream::connect(local_addr).expect("connect");
-        stream.set_read_timeout(Some(Duration::from_secs(3))).ok();
-        stream.write_all(&payload).expect("write");
-        stream
-            .shutdown(std::net::Shutdown::Write)
-            .expect("write shutdown");
-        let mut received = Vec::new();
-        let mut buf = [0u8; 256];
-        loop {
-            match stream.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => received.extend_from_slice(&buf[..n]),
-                Err(error) => panic!("client read error: {error}"),
-            }
+/// Polls `probe` until it yields a value or the timeout elapses.
+fn wait_for<T>(timeout: Duration, mut probe: impl FnMut() -> Option<T>) -> Option<T> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(value) = probe() {
+            return Some(value);
         }
-        *echoed_for_client.lock().expect("mutex") = received;
-        *done_for_client.lock().expect("mutex") = true;
-    });
-
-    ClientRun {
-        done,
-        echoed,
-        handle,
+        if Instant::now() > deadline {
+            return None;
+        }
+        thread::sleep(Duration::from_millis(2));
     }
 }
 
@@ -362,7 +237,7 @@ fn main() {
     let bind_addr: SocketAddr = "127.0.0.1:0".parse().expect("loopback parse");
     let bound: BoundAddr = Arc::new(Mutex::new(None));
 
-    let mut runtime = Runtime::new(ExampleShard, ExampleMailboxFactory);
+    let runtime = ThreadedRuntime::new(SingleShard, DefaultThreadedMailboxFactory);
 
     let payloads = vec![
         b"hello from the tina-rs echo example".to_vec(),
@@ -370,97 +245,169 @@ fn main() {
         b"third client proves graceful shutdown".to_vec(),
     ];
 
-    let listener_addr = runtime.register(
-        Listener {
-            bind_addr,
-            bound_addr_slot: Arc::clone(&bound),
-            max_chunk: 256,
-            target_accepts: payloads.len(),
-            accepted_count: 0,
-            listener: None,
-        },
-        ExampleMailbox::new(8),
-    );
-
-    runtime.supervise(
-        listener_addr,
-        SupervisorConfig::new(RestartPolicy::OneForOne, RestartBudget::new(4)),
-    );
+    let listener = runtime
+        .register_with_capacity::<Listener, ListenerEvent>(
+            Listener {
+                bind_addr,
+                bound_addr_slot: Arc::clone(&bound),
+                max_chunk: 256,
+                target_accepts: payloads.len(),
+                accepted_count: 0,
+                listener: None,
+            },
+            8,
+        )
+        .expect("register listener");
 
     runtime
-        .try_send(listener_addr, ListenerEvent::Start)
-        .expect("bootstrap accepts");
+        .supervise(
+            listener,
+            SupervisorConfig::new(RestartPolicy::OneForOne, RestartBudget::new(4)),
+        )
+        .expect("supervise listener");
 
-    step_until(&mut runtime, Duration::from_secs(2), "bind", |_| {
-        bound.lock().expect("mutex").is_some()
-    });
-    let local_addr = bound
-        .lock()
-        .expect("mutex")
-        .expect("listener published address");
+    runtime
+        .try_send(listener, ListenerEvent::Start)
+        .expect("start listener");
+
+    let local_addr = wait_for(Duration::from_secs(2), || {
+        *bound.lock().expect("bound lock")
+    })
+    .expect("listener published its bound address");
     println!("listening on {local_addr}");
 
-    let mut clients = Vec::new();
-    for payload in payloads.clone() {
-        let client = spawn_client(local_addr, payload);
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while !*client.done.lock().expect("mutex") {
-            runtime.step();
-            if Instant::now() > deadline {
-                panic!("example timed out waiting for client completion");
-            }
-            thread::sleep(Duration::from_millis(2));
-        }
-        clients.push(client);
-    }
+    // Register the stop waiter before the listener can close itself.
+    let listener_stopped = runtime.observe_isolate_complete(listener);
 
-    step_until(
-        &mut runtime,
-        Duration::from_secs(5),
-        "listener stop",
-        |runtime| {
-            !runtime.has_in_flight_calls()
-                && runtime.trace().iter().any(|event| {
-                    event.isolate() == listener_addr.isolate()
-                        && matches!(event.kind(), RuntimeEventKind::IsolateStopped)
-                })
-        },
-    );
-
-    let mut echoed = Vec::new();
-    for client in clients {
-        client.handle.join().expect("client thread");
-        echoed.push(client.echoed.lock().expect("mutex").clone());
-    }
-
+    let echoed: Vec<Vec<u8>> = payloads
+        .iter()
+        .map(|payload| echo_roundtrip(local_addr, payload))
+        .collect();
     assert_eq!(echoed, payloads, "echoed bytes must match sent payloads");
 
-    let trace = runtime.trace();
-    assert_eq!(count_call_completed(trace, CallKind::TcpBind), 1);
-    assert_eq!(count_call_completed(trace, CallKind::TcpAccept), 3);
-    assert!(count_call_completed(trace, CallKind::TcpRead) >= 6);
-    assert_eq!(count_call_completed(trace, CallKind::TcpWrite), 3);
-    assert_eq!(count_call_completed(trace, CallKind::TcpStreamClose), 3);
-    assert_eq!(count_call_completed(trace, CallKind::TcpListenerClose), 1);
-    assert_eq!(count_spawned(trace), 3);
-    assert_eq!(
-        count_handler_finished(trace, tina_runtime::EffectKind::Batch),
-        3
+    // The listener closes itself after the last accept.
+    listener_stopped
+        .wait(Duration::from_secs(5))
+        .expect("listener stops cleanly");
+
+    println!(
+        "echoed {} payloads through the runtime call contract",
+        echoed.len()
     );
-    assert_eq!(
+
+    runtime.shutdown().expect("clean shutdown");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use tina_runtime::{CallKind, DefaultMailboxFactory, Runtime, RuntimeEvent, RuntimeEventKind};
+
+    fn count_call_completed(trace: &[RuntimeEvent], kind: CallKind) -> usize {
         trace
             .iter()
             .filter(|event| {
-                event.isolate() == listener_addr.isolate()
-                    && matches!(event.kind(), RuntimeEventKind::IsolateStopped)
+                matches!(
+                    event.kind(),
+                    RuntimeEventKind::CallCompleted { call_kind, .. } if call_kind == kind
+                )
             })
-            .count(),
-        1
-    );
+            .count()
+    }
 
-    println!(
-        "echoed {} payloads through the runtime call contract; trace had {} events",
-        echoed.len(),
-        trace.len()
-    );
+    fn count_spawned(trace: &[RuntimeEvent]) -> usize {
+        trace
+            .iter()
+            .filter(|event| matches!(event.kind(), RuntimeEventKind::Spawned { .. }))
+            .count()
+    }
+
+    fn step_until<F>(
+        runtime: &mut Runtime<SingleShard, DefaultMailboxFactory>,
+        timeout: Duration,
+        label: &str,
+        predicate: F,
+    ) where
+        F: Fn(&Runtime<SingleShard, DefaultMailboxFactory>) -> bool,
+    {
+        let deadline = Instant::now() + timeout;
+        while !predicate(runtime) {
+            if Instant::now() > deadline {
+                panic!("step_until({label}): predicate not satisfied within timeout");
+            }
+            runtime.step();
+            thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    // The explicit-step runtime is the semantic oracle: it makes the trace
+    // shape deterministic, so this is where the bind/accept/spawn/stop counts
+    // are asserted. `main` proves the live behavior; this proves the shape.
+    #[test]
+    fn trace_shows_bind_accept_spawn_and_graceful_stop() {
+        let bind_addr: SocketAddr = "127.0.0.1:0".parse().expect("loopback parse");
+        let bound: BoundAddr = Arc::new(Mutex::new(None));
+        let payload = b"deterministic echo proof".to_vec();
+
+        let mut runtime = Runtime::new(SingleShard, DefaultMailboxFactory);
+        let listener = runtime.register_with_capacity::<Listener, ListenerEvent>(
+            Listener {
+                bind_addr,
+                bound_addr_slot: Arc::clone(&bound),
+                max_chunk: 256,
+                target_accepts: 1,
+                accepted_count: 0,
+                listener: None,
+            },
+            8,
+        );
+        runtime.supervise(
+            listener,
+            SupervisorConfig::new(RestartPolicy::OneForOne, RestartBudget::new(4)),
+        );
+        runtime
+            .try_send(listener, ListenerEvent::Start)
+            .expect("start listener");
+
+        step_until(&mut runtime, Duration::from_secs(2), "bind", |_| {
+            bound.lock().expect("bound lock").is_some()
+        });
+        let local_addr = bound.lock().expect("bound lock").expect("bound addr");
+
+        let handle = thread::spawn(move || echo_roundtrip(local_addr, &payload));
+
+        step_until(
+            &mut runtime,
+            Duration::from_secs(5),
+            "listener stop",
+            |runtime| {
+                !runtime.has_in_flight_calls()
+                    && runtime.trace().iter().any(|event| {
+                        event.isolate() == listener.isolate()
+                            && matches!(event.kind(), RuntimeEventKind::IsolateStopped)
+                    })
+            },
+        );
+
+        let echoed = handle.join().expect("client thread");
+        assert_eq!(echoed, b"deterministic echo proof");
+
+        let trace = runtime.trace();
+        assert_eq!(count_call_completed(trace, CallKind::TcpBind), 1);
+        assert_eq!(count_call_completed(trace, CallKind::TcpAccept), 1);
+        assert_eq!(count_call_completed(trace, CallKind::TcpWrite), 1);
+        assert_eq!(count_call_completed(trace, CallKind::TcpListenerClose), 1);
+        assert_eq!(count_spawned(trace), 1);
+        assert_eq!(
+            trace
+                .iter()
+                .filter(|event| {
+                    event.isolate() == listener.isolate()
+                        && matches!(event.kind(), RuntimeEventKind::IsolateStopped)
+                })
+                .count(),
+            1
+        );
+    }
 }
