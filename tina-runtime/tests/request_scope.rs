@@ -1,4 +1,4 @@
-//! Live-runtime proof for `RequestScope` (Phase 105).
+//! Live-runtime proof for `RequestScope`.
 //!
 //! Mirrors the deterministic proofs in `tina-sim/tests/request_scope.rs`
 //! against the threaded runtime so we know the same invariants survive

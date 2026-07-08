@@ -2,7 +2,7 @@
 //!
 //! A connected peer that sends nothing leaves the server's `recv` pending. The
 //! worker observes that read by repeatedly calling the explicit runtime
-//! `step()` after a bounded idle sleep. This intentionally accepts the Phase 150
+//! `step()` after a bounded idle sleep. This intentionally accepts the explicit-step
 //! style latency/CPU tradeoff instead of using an out-of-band readiness wake.
 
 mod common;

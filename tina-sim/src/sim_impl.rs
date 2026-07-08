@@ -413,7 +413,6 @@ where
     /// When no messages are ready but timers remain pending, the simulator
     /// advances virtual time to the earliest pending deadline and keeps
     /// stepping. This is the simplest honest driver for the first replayable
-    /// Voyager slice.
     pub fn run_until_quiescent(&mut self) -> usize
     where
         S: 'static,

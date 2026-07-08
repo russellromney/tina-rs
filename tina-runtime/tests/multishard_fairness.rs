@@ -1,4 +1,4 @@
-//! Phase 124 Rock 4 — multi-shard local-command fairness under sustained
+//! Multi-shard local-command fairness under sustained
 //! remote inbound pressure.
 //!
 //! The threaded multi-shard worker loop drains a bounded number of

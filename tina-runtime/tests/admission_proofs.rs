@@ -1,4 +1,4 @@
-//! Integration proofs for the Phase 118 admission and rate policy layer.
+//! Integration proofs for the admission and rate policy layer.
 //!
 //! These tests stay independent of the rest of the runtime — admission
 //! policies are plain state. They prove three load-bearing claims:

@@ -1,4 +1,4 @@
-//! Compile-fail proofs for Phase 118 admission types.
+//! Compile-fail proofs for the admission types.
 //!
 //! - [`KeyedPermit`] is move-only and cannot be released twice. The second
 //!   `release(...)` after the first must not compile because the permit

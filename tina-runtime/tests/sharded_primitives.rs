@@ -1,4 +1,4 @@
-//! Phase 053: integration tests for `tina_runtime::sharded`.
+//! Integration tests for `tina_runtime::sharded`.
 //!
 //! Drives the explicit-step `MultiShardRuntime` so the contracts can be
 //! proved end-to-end:

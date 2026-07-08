@@ -1,6 +1,6 @@
 //! WorkerPool resource-lifetime, health, and refill tests.
 //!
-//! User-shaped proofs for Phase 119 resource maturity:
+//! User-shaped proofs for resource lifecycle maturity:
 //!
 //! - an idle resource retires and the report names *why*,
 //! - a max-lifetime retire never hands the stale resource to a new

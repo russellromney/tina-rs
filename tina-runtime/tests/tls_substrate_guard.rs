@@ -1,4 +1,4 @@
-//! Substrate guard for Phase 136: the live TLS driver must ride Tina's
+//! Substrate guard: the live TLS driver must ride Tina's
 //! Betelgeuse TCP rail with rustls in sans-I/O mode — no private socket stack
 //! and no per-op worker thread. This grep guard is the portable, decisive
 //! "no `tina-tls-*` worker thread is spawned" proof: you cannot spawn a worker

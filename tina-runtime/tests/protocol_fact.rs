@@ -1,4 +1,4 @@
-//! End-to-end runtime proof for Phase 112 protocol facts.
+//! End-to-end runtime proof for protocol facts.
 //!
 //! Drives an isolate whose `Fact = ProtocolFact` and confirms that:
 //!
