@@ -1,4 +1,4 @@
-//! Worker-loop progress properties (phase 145).
+//! Worker-loop progress properties.
 //!
 //! These pin the behavior the hot-path fix is responsible for:
 //!

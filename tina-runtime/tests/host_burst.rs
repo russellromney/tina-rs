@@ -1,4 +1,4 @@
-//! Phase 062 Rock 3: `try_send_outcome` + `HostBurstOutcomes`.
+//! `try_send_outcome` + `HostBurstOutcomes`.
 //!
 //! Proves the burst accumulator counts each typed outcome distinctly:
 //! `admitted`, `mailbox_full`, `mailbox_closed`, `ingress_full`, and

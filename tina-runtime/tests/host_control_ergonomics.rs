@@ -1,4 +1,4 @@
-//! Phase 102 — host-control ergonomics tests.
+//! Host-control ergonomics tests.
 //!
 //! Covers:
 //!

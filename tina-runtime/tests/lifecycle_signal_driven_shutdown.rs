@@ -1,4 +1,4 @@
-//! Phase 106 — signal-driven shutdown composes through
+//! Signal-driven shutdown composes through
 //! `ShutdownChoreography`.
 //!
 //! The plan requires "signal-driven shutdown works in live runtime." The
@@ -8,7 +8,7 @@
 //! thread, which is the signal-handler shape.
 //!
 //! This test uses `ThreadedShutdownHandle` (the cloneable, cross-thread
-//! shutdown trigger introduced by Phase 102) as the signal-handler
+//! shutdown trigger) as the signal-handler
 //! stand-in. A spawned thread sleeps briefly to simulate the signal
 //! arrival, then calls `request_shutdown`. The main thread observes the
 //! trigger, runs an ordered `ShutdownChoreography`, calls the runtime

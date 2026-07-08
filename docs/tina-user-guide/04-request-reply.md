@@ -273,8 +273,8 @@ rejects the caller with `ReplyAbandoned` immediately while the ordinary
 continuation still runs.
 
 `RequestContext` is a real newtype over `DeferredReply`; `reply_to`
-consumes it and delegates to `reply_to`. There is no hidden caller context
-preservation.
+consumes it (via `Into<DeferredReply>`) and answers through the underlying
+`DeferredReply`. There is no hidden caller context preservation.
 
 ### Cancelable Deferred Calls: Admit Before Dispatch
 

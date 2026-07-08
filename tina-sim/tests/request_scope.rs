@@ -1,7 +1,7 @@
 //! Deterministic proofs for `RequestScope` and `RequestScopeSet`
-//! (Phase 105: request-scoped cancellation).
+//! (request-scoped cancellation).
 //!
-//! Coverage map (kept in lockstep with the phase plan's "Required
+//! Coverage map (kept in lockstep with the "Required
 //! Proof" list):
 //!
 //! - **Cancel before delivery.** A scope-registered child is cancelled

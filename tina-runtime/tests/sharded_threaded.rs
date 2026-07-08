@@ -1,4 +1,4 @@
-//! Phase 053 live smoke: sharded counter driven by `ThreadedMultiShardRuntime`.
+//! Live smoke: sharded counter driven by `ThreadedMultiShardRuntime`.
 //!
 //! Cross-shard request/reply over Betelgeuse worker threads (not the
 //! explicit-step in-process runtime). Drives a sharded counter to prove

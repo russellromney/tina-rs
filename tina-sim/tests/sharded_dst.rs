@@ -1,4 +1,4 @@
-//! Phase 053 DST: sharded service primitives under seeded reorder.
+//! DST: sharded service primitives under seeded reorder.
 //!
 //! Goals (narrow, first-form):
 //!

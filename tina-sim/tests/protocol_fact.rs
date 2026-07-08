@@ -1,4 +1,4 @@
-//! Phase 112 saved-replay proof: protocol facts ride the sim trace through
+//! Saved-replay proof: protocol facts ride the sim trace through
 //! `Effect::Fact` and project the same way the runtime would project them.
 //!
 //! The proof uses a synthetic protocol isolate that emits one

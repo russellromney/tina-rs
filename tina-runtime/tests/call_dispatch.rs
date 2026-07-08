@@ -7,14 +7,14 @@
 //! happens when a requesting isolate stops before its completion arrives,
 //! and call-id monotonicity.
 //!
-//! They are the primary semantic surface for slice 012's call dispatch
+//! They are the primary semantic surface for the runtime's call dispatch
 //! contract; the live TCP echo integration test in `tcp_echo.rs` is a
 //! higher-level proof built on the same machinery.
 //!
 //! Why this lives in its own file: per the package's "do not let echo
 //! become the only proof" trap, the call-dispatch behavior must be
 //! provable without depending on a successful real socket round-trip.
-//! Phase 012 is TCP-first, so we drive these scenarios through the same
+//! The call path is TCP-first, so we drive these scenarios through the same
 //! TCP call vocabulary the echo test uses.
 
 use std::alloc::Global;
