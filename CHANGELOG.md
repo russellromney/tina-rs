@@ -78,6 +78,12 @@ This file records completed work.
 - Renamed `request_effect_after_wait_park` to `request_effect_after_shared_wait`.
 ### Fuzzing
 
+- Added `ws_frame` and `h2_payload` fuzz targets covering the hand-rolled
+  WebSocket frame parser and HTTP/2 DATA/HEADERS padding/priority stripping —
+  two wire-facing parsers previously only covered by inspection. Both ran
+  millions of executions clean. The gRPC frame reassembler stays covered by
+  inspection (length-guarded, decode delegates to prost); see fuzz/README.md.
+
 - Added a `fuzz/` crate (excluded from the workspace) with coverage-guided
   targets for the hand-rolled decoders: chunked bodies, HTTP/1 request and
   response heads, the RPC frame codec, and HTTP/2 frame headers.

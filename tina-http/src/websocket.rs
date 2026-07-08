@@ -1141,3 +1141,21 @@ mod tests {
         );
     }
 }
+
+/// Pure parse entry points for the out-of-workspace fuzz harness. The frame
+/// parser is `pub(crate)`; this is the only sanctioned way past that boundary
+/// and exists only under the `fuzzing` feature.
+#[cfg(feature = "fuzzing")]
+#[doc(hidden)]
+pub mod fuzzing {
+    /// Feed bytes to the client- and server-side frame parsers under the
+    /// default limits. Returns nothing: the harness asserts only that neither
+    /// parser panics on arbitrary input.
+    pub fn fuzz_parse_frames(bytes: &[u8]) {
+        let limits = super::WebSocketLimits::default();
+        let mut client_buf = bytes.to_vec();
+        let _ = super::parse_client_frame(&mut client_buf, limits);
+        let mut server_buf = bytes.to_vec();
+        let _ = super::parse_server_frame(&mut server_buf, limits);
+    }
+}

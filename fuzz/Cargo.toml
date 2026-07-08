@@ -54,4 +54,18 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "ws_frame"
+path = "fuzz_targets/ws_frame.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "h2_payload"
+path = "fuzz_targets/h2_payload.rs"
+test = false
+doc = false
+bench = false
+
 [workspace]

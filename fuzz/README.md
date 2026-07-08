@@ -20,11 +20,25 @@ cargo +nightly fuzz run <target> -- -max_total_time=60
 | `http1_response_head` | `parse_response_head` under default limits. |
 | `rpc_frame` | `decode` (full frame, default limits) and `decode_body` (trusts the length prefix). |
 | `h2_frame_meta` | HTTP/2 frame-header decode + max-frame-size rejection. |
+| `h2_payload` | HTTP/2 DATA/HEADERS padding + priority stripping (`data_payload_view` / `headers_payload_view`). |
 | `hpack_headers` | The HPACK soundness walker vs `hpack::Decoder::decode` — see below. |
+| `ws_frame` | Hand-rolled WebSocket frame parser (client + server framing: 7/16/64-bit lengths, mask XOR, buffer draining). |
 
-`h2_frame_meta` and `hpack_headers` reach `pub(super)` internals through the
-`fuzzing` feature on `tina-http` (`http2::fuzzing`), never enabled in
-production.
+`h2_frame_meta`, `h2_payload`, `hpack_headers`, and `ws_frame` reach
+`pub(super)`/`pub(crate)` internals through the `fuzzing` feature on `tina-http`
+(`http2::fuzzing`, `websocket::fuzzing`), never enabled in production.
+
+## Not fuzzed, covered by inspection
+
+The gRPC length-prefixed frame reassembler (`GrpcRequestStream::next_buffered_message`
+in `grpc.rs`) is hand-rolled but has no target: its constructor requires a
+runtime-coupled `Http2RequestStream`, and its only decode work delegates to
+`prost` (fuzzed upstream). The tina-specific framing is fully length-guarded —
+`buffer.len() < GRPC_FRAME_HEADER_LEN` and `< end` early-returns, a
+`max_message_bytes` cap, and a `drain(..end)` bounded by the checked `end` — so
+it is panic-safe by construction. Extracting the pure framing into a
+standalone function so it can be fuzzed (and unit-tested) directly is a tracked
+follow-up.
 
 ## The `hpack_headers` target
 
