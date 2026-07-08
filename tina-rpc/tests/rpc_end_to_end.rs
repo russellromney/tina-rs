@@ -138,6 +138,65 @@ fn registry_internal_error_propagates() {
     let _ = runtime.shutdown();
 }
 
+/// A registered service that captures the caller's authority and never
+/// answers. The registry's downstream `call` to it therefore times out —
+/// the only way to drive a downstream failure through the registry's live
+/// `defer(...) -> reply_to` path (the synchronous unknown-method/service
+/// arms never reach it).
+#[derive(Default)]
+struct BlackHole {
+    held: Vec<RequestContext<ServiceReply>>,
+}
+
+#[tina_runtime::isolate(message = ServiceCall, reply = ServiceReply)]
+impl BlackHole {
+    fn handle(
+        &mut self,
+        _msg: ServiceCall,
+        _ctx: &mut Context<'_, SingleShard, Self::Reply>,
+    ) -> Effect<Self> {
+        noop()
+    }
+
+    fn handle_call(&mut self, _msg: ServiceCall, call: CallContext<'_, Self>) -> Effect<Self> {
+        // Hold the authority so the caller never gets an answer and its call
+        // reaches the deadline.
+        self.held.push(call.into_request_context());
+        noop()
+    }
+}
+
+#[test]
+fn registry_downstream_timeout_maps_to_internal_through_deferred_reply() {
+    // Exercises the deferred branch the synchronous error arms skip: registry
+    // handle_call -> defer(call(service)) -> [downstream timeout] -> continuation
+    // -> reply_to(caller, Internal). A regression that broke this plumbing while
+    // leaving the pure mapping table correct would slip past the unit tests but
+    // fail here.
+    let runtime = ThreadedRuntime::new(SingleShard, DefaultThreadedMailboxFactory);
+    let blackhole = runtime
+        .register_with_capacity::<_, Infallible>(BlackHole::default(), 16)
+        .expect("register black-hole service");
+    let registry_state = Registry::<SingleShard>::builder()
+        .timeout(Duration::from_millis(150))
+        .service("void", blackhole)
+        .build();
+    let registry = runtime
+        .register_with_capacity::<_, Infallible>(registry_state, 16)
+        .expect("register registry");
+
+    let outcome = runtime
+        .call_blocking(registry, route("void", "ping", b"x"), TIMEOUT)
+        .expect("registry answers the caller even when the service never does");
+    assert_eq!(
+        outcome,
+        CallOutcome::Replied(RouterReply::Internal),
+        "a downstream service that never replies must time out and map to \
+         Internal through the deferred reply path — not hang the caller"
+    );
+    let _ = runtime.shutdown();
+}
+
 // ---------------------------------------------------------------------------
 // Full TCP roundtrip: client → Connection → Registry → SingleService → reply.
 // ---------------------------------------------------------------------------
