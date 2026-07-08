@@ -9,6 +9,10 @@
 use tina_http::chunked_decoder::{ChunkedDecoder, FeedAllResult};
 use tina_rpc::{DecodeError, FrameLimits, LENGTH_PREFIX_SIZE, decode, decode_body};
 
+/// Mirrors `tina_rpc::frame::MIN_BODY_SIZE` (not re-exported): the shortest body
+/// `decode_body` accepts. Anything shorter is a typed error.
+const MIN_BODY_SIZE: usize = 13;
+
 /// `chunked_decoder` target: the decoded-length cap must hold across a split
 /// feed. Feed a body larger than the cap in two pieces and assert the
 /// accumulator never exceeds the cap after either feed, and the decoder fails
@@ -89,13 +93,18 @@ fn rpc_frame_decode_contains_truncated_length_prefix() {
         "a declared body larger than the input must report truncation"
     );
 
-    // Body-only decoder trusts the caller's length: a short body must still be a
-    // typed error, not a panic or out-of-bounds slice.
-    for len in 0..16usize {
+    // Body-only decoder trusts the caller's length: a body shorter than
+    // MIN_BODY_SIZE must be a typed error, and a longer all-zero body must
+    // still never panic or slice out of bounds.
+    for len in 0..(MIN_BODY_SIZE + 3) {
         let body = vec![0u8; len];
-        assert!(
-            decode_body(&body).is_err() || len >= 13,
-            "short body of {len} bytes must be a typed error"
-        );
+        let result = decode_body(&body);
+        if len < MIN_BODY_SIZE {
+            assert!(
+                result.is_err(),
+                "body of {len} bytes (< MIN_BODY_SIZE {MIN_BODY_SIZE}) must be a typed error"
+            );
+        }
+        // len >= MIN_BODY_SIZE: reaching here without a panic is the property.
     }
 }
