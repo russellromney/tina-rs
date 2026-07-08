@@ -283,12 +283,11 @@ where
             .simulators
             .iter()
             .flat_map(|simulator| {
-                simulator.timers.iter().map(|entry| entry.deadline).chain(
-                    simulator
-                        .pending_isolate_calls
-                        .iter()
-                        .map(|entry| entry.deadline),
-                )
+                simulator
+                    .timers
+                    .iter()
+                    .map(|entry| entry.deadline)
+                    .chain(simulator.call_table.min_isolate_deadline())
             })
             .min()
         else {

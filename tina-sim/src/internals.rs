@@ -10,7 +10,7 @@
 
 use std::any::Any;
 use std::cell::{Cell, RefCell};
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::marker::PhantomData;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -39,14 +39,32 @@ pub(crate) struct RegisteredAddress {
     pub(crate) generation: AddressGeneration,
 }
 
-#[derive(Debug)]
-pub(crate) struct InFlightCall {
+/// Copy-able descriptor of a driver/host backend call, separate from its
+/// (non-Copy) translator. Mirrors the runtime's `DriverCallHead`.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct DriverCallHead {
     pub(crate) call_id: CallId,
     pub(crate) call_kind: CallKind,
     pub(crate) requester: RegisteredAddress,
     pub(crate) cause: tina_runtime::CauseId,
     pub(crate) persistence: Option<PersistenceTraceInfo>,
     pub(crate) continuation_context: Option<MessageCallContext>,
+}
+
+/// A driver/host backend call awaiting completion. Translator stored inline, so
+/// a present-entry/missing-translator split cannot arise. Mirrors the runtime.
+pub(crate) struct DriverCall {
+    pub(crate) head: DriverCallHead,
+    pub(crate) translator: ErasedTranslator,
+}
+
+impl std::fmt::Debug for DriverCall {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DriverCall")
+            .field("head", &self.head)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -89,19 +107,6 @@ pub(crate) fn reserve_round_message_scratch(
     }
 }
 
-pub(crate) struct StoredTranslator {
-    pub(crate) call_id: CallId,
-    pub(crate) translator: Option<ErasedTranslator>,
-}
-
-impl std::fmt::Debug for StoredTranslator {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("StoredTranslator")
-            .field("call_id", &self.call_id)
-            .finish_non_exhaustive()
-    }
-}
 
 #[derive(Debug)]
 pub(crate) struct TimerEntry {
@@ -128,6 +133,9 @@ pub(crate) struct DeliveredMessage {
     pub(crate) call_context: Option<MessageCallContext>,
 }
 
+/// An isolate-to-isolate call awaiting reply or timeout. Translator inline
+/// (non-Option) so an "already consumed" state cannot arise. Mirrors the
+/// runtime; deadline is virtual-time `Duration` here instead of `Instant`.
 pub(crate) struct PendingIsolateCall {
     pub(crate) call_id: CallId,
     pub(crate) requester: RegisteredAddress,
@@ -135,9 +143,121 @@ pub(crate) struct PendingIsolateCall {
     pub(crate) deadline: Duration,
     pub(crate) insertion_order: u64,
     pub(crate) continuation_context: Option<MessageCallContext>,
-    pub(crate) translator: Option<ErasedIsolateCallTranslator>,
+    pub(crate) translator: ErasedIsolateCallTranslator,
     pub(crate) expected_reply_type_id: std::any::TypeId,
     pub(crate) handle_shared: Option<std::sync::Arc<tina::CallHandleShared>>,
+}
+
+/// Single owner of all in-flight call bookkeeping, keyed by `CallId`. Mirrors
+/// `tina_runtime::CallTable`: two ascending-call-id `BTreeMap`s (== insertion
+/// order, since call ids are monotonic) plus the isolate deadline index. The
+/// simulator is the parity oracle, so storage and iteration order match the
+/// runtime exactly.
+pub(crate) struct CallTable {
+    driver: BTreeMap<CallId, DriverCall>,
+    isolate: BTreeMap<CallId, PendingIsolateCall>,
+    isolate_deadlines: BTreeMap<(Duration, u64), CallId>,
+}
+
+impl CallTable {
+    pub(crate) fn new() -> Self {
+        Self {
+            driver: BTreeMap::new(),
+            isolate: BTreeMap::new(),
+            isolate_deadlines: BTreeMap::new(),
+        }
+    }
+
+    // --- driver/host backend calls ---
+
+    pub(crate) fn insert_driver(&mut self, call: DriverCall) {
+        let call_id = call.head.call_id;
+        let previous = self.driver.insert(call_id, call);
+        assert!(previous.is_none(), "duplicate in-flight call id {call_id:?}");
+    }
+
+    pub(crate) fn remove_driver(&mut self, call_id: CallId) -> Option<DriverCall> {
+        self.driver.remove(&call_id)
+    }
+
+    pub(crate) fn driver_call_ids_for_requester(&self, requester: RegisteredAddress) -> Vec<CallId> {
+        self.driver
+            .iter()
+            .filter(|(_, call)| call.head.requester == requester)
+            .map(|(id, _)| *id)
+            .collect()
+    }
+
+    pub(crate) fn driver_requester(&self, call_id: CallId) -> Option<RegisteredAddress> {
+        self.driver.get(&call_id).map(|call| call.head.requester)
+    }
+
+    pub(crate) fn has_driver_calls(&self) -> bool {
+        !self.driver.is_empty()
+    }
+
+    // --- isolate-to-isolate calls ---
+
+    pub(crate) fn insert_isolate(&mut self, call: PendingIsolateCall) {
+        let call_id = call.call_id;
+        self.isolate_deadlines
+            .insert((call.deadline, call.insertion_order), call_id);
+        let previous = self.isolate.insert(call_id, call);
+        assert!(previous.is_none(), "duplicate pending isolate call {call_id:?}");
+    }
+
+    pub(crate) fn remove_isolate(&mut self, call_id: CallId) -> Option<PendingIsolateCall> {
+        let removed = self.isolate.remove(&call_id)?;
+        self.isolate_deadlines
+            .remove(&(removed.deadline, removed.insertion_order));
+        Some(removed)
+    }
+
+    /// The earliest-deadline isolate call due at or before `now`, if any.
+    pub(crate) fn next_due_isolate(&self, now: Duration) -> Option<CallId> {
+        self.isolate_deadlines
+            .first_key_value()
+            .and_then(|(&(deadline, _), &call_id)| (deadline <= now).then_some(call_id))
+    }
+
+    /// Earliest isolate-call deadline, for the next-timer advance.
+    pub(crate) fn min_isolate_deadline(&self) -> Option<Duration> {
+        self.isolate_deadlines
+            .first_key_value()
+            .map(|(&(deadline, _), _)| deadline)
+    }
+
+    pub(crate) fn isolate_expected_reply_type_id(
+        &self,
+        call_id: CallId,
+    ) -> Option<std::any::TypeId> {
+        self.isolate.get(&call_id).map(|c| c.expected_reply_type_id)
+    }
+
+    /// Removes and returns every isolate call owned by `owner`, ascending call
+    /// id (== insertion order).
+    pub(crate) fn take_isolate_calls_for_owner(
+        &mut self,
+        owner_isolate: IsolateId,
+        owner_generation: AddressGeneration,
+    ) -> Vec<PendingIsolateCall> {
+        let ids: Vec<CallId> = self
+            .isolate
+            .iter()
+            .filter(|(_, call)| {
+                call.requester.isolate == owner_isolate
+                    && call.requester.generation == owner_generation
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        ids.into_iter()
+            .map(|id| self.remove_isolate(id).expect("indexed isolate call exists"))
+            .collect()
+    }
+
+    pub(crate) fn has_isolate_calls(&self) -> bool {
+        !self.isolate.is_empty()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
