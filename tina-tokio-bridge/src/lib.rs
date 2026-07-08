@@ -404,6 +404,19 @@ pub trait BridgeMessage {
     fn bridge_cancelled(&self) -> bool;
 }
 
+/// Send-only wrapper. The bridge registers the inner isolate through
+/// `register_with_capacity` (not `register_service`) and delivers every
+/// bridge request as a plain `try_send`; replies ride a per-call oneshot
+/// carried inside [`BridgeRequest`], never a Tina reply slot. So this guard
+/// only needs to delegate [`Isolate::handle`].
+///
+/// It deliberately does *not* override `handle_call`, inheriting the default
+/// rejecting one. That is safe **only** because a `BridgeGuard` is never a
+/// `call()` target: a clean `handle_call` passthrough is not expressible here
+/// (the inner isolate's `CallContext<'_, I>` cannot be reconstructed from
+/// `CallContext<'_, BridgeGuard<I>>` — the inner `Context` is not extractable),
+/// so a call would silently reject the inner isolate's own `handle_call`. Do
+/// not register a `BridgeGuard` on the callable lane or `call()` it.
 struct BridgeGuard<I> {
     inner: I,
 }
