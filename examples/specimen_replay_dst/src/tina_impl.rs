@@ -19,8 +19,8 @@ use std::rc::Rc;
 
 use tina::prelude::*;
 use tina_sim::dst::{
-    ReplayCase, ReplayConfig, ReplayReport, ShrinkConfig, ShrinkReport, SweepFailure,
-    SweepSuccess, assert_replay_case, shrink_replay_case, sweep_seeds,
+    ReplayCase, ReplayConfig, ReplayReport, ShrinkConfig, ShrinkReport, SweepFailure, SweepSuccess,
+    assert_replay_case, shrink_replay_case, sweep_seeds,
 };
 use tina_sim::{FaultConfig, LocalSendFaultMode, Simulator};
 
@@ -172,11 +172,7 @@ pub fn run_case(case: &ReplayCase<Op>) -> ReplayReport<Output> {
     sim.run_until_quiescent();
 
     let messages_received = received.borrow().len();
-    ReplayReport::from_case_and_events(
-        case,
-        sim.trace(),
-        Output { messages_received },
-    )
+    ReplayReport::from_case_and_events(case, sim.trace(), Output { messages_received })
 }
 
 /// Demonstrates the full DST loop: assert the saved case, sweep a few
@@ -227,13 +223,16 @@ pub fn run() -> anyhow::Result<Demo> {
     // Deletion shrink while the bug invariant ("at least one tick is
     // received") still holds. Starts from the saved case so the demo
     // stays small.
+    // `shrink_replay_case` fails closed if the starting case does not
+    // reproduce; the saved bug does, so a shrink error here is a real defect.
     let shrink = shrink_replay_case(
         &case(),
         ShrinkConfig::default(),
         "at least one tick reaches the sink",
         run_case,
         |report| report.output.messages_received >= 1,
-    );
+    )
+    .map_err(|e| anyhow::anyhow!("shrink_replay_case: {e}"))?;
 
     Ok(Demo {
         saved,
