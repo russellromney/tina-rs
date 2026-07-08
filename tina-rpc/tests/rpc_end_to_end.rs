@@ -10,13 +10,16 @@
 //! `UnsupportedMessage`; every assertion below would fail with
 //! `CallOutcome::Rejected` / a wire `Error(Internal)`.
 
+use std::collections::VecDeque;
 use std::convert::Infallible;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
+use std::sync::Mutex;
 use std::thread;
 use std::time::Duration;
 
 use tina::prelude::*;
+use tina::{Mailbox, TrySendError};
 use tina_rpc::{
     Connection, ConnectionConfig, ConnectionInit, ConnectionMsg, Frame, FrameError, FrameKind,
     FrameLimits, LENGTH_PREFIX_SIZE, Registry, RegistryMsg, RouterReply, RouterRequest,
@@ -24,8 +27,8 @@ use tina_rpc::{
     parse_length_prefix,
 };
 use tina_runtime::{
-    CallOutcome, DefaultThreadedMailboxFactory, ListenerId, TcpAcceptReply, TcpBindReply,
-    TcpListenerCloseReply, ThreadedRuntime, tcp_accept, tcp_bind, tcp_close_listener,
+    CallOutcome, DefaultThreadedMailboxFactory, ListenerId, MailboxFactory, TcpAcceptReply,
+    TcpBindReply, TcpListenerCloseReply, ThreadedRuntime, tcp_accept, tcp_bind, tcp_close_listener,
 };
 
 const TIMEOUT: Duration = Duration::from_secs(5);
@@ -193,6 +196,176 @@ fn registry_downstream_timeout_maps_to_internal_through_deferred_reply() {
         CallOutcome::Replied(RouterReply::Internal),
         "a downstream service that never replies must time out and map to \
          Internal through the deferred reply path — not hang the caller"
+    );
+    let _ = runtime.shutdown();
+}
+
+/// A registered service that abandons the caller authority and stops on the
+/// first call. Dropping the promoted reply slot resolves the registry's
+/// downstream `IsolateCall` as `CallOutcome::Closed`, which the registry maps
+/// to `RouterReply::Internal`. Drives the live "service gone" arm of the
+/// deferred path — the timeout test above only drives the Timeout arm.
+#[derive(Default)]
+struct SelfStopService;
+
+#[tina_runtime::isolate(message = ServiceCall, reply = ServiceReply)]
+impl SelfStopService {
+    fn handle(
+        &mut self,
+        _msg: ServiceCall,
+        _ctx: &mut Context<'_, SingleShard, Self::Reply>,
+    ) -> Effect<Self> {
+        noop()
+    }
+
+    fn handle_call(&mut self, _msg: ServiceCall, call: CallContext<'_, Self>) -> Effect<Self> {
+        // Promote and drop the caller authority, then stop. The dropped reply
+        // slot completes the registry's downstream call as Closed.
+        let abandoned = call.into_request_context();
+        drop(abandoned);
+        stop()
+    }
+}
+
+#[test]
+fn registry_downstream_closed_maps_to_internal_through_deferred_reply() {
+    // Registry handle_call -> defer(call(service)) -> [service stops without
+    // replying -> Closed] -> continuation -> reply_to(caller, Internal). The
+    // pure-mapping unit test covers Closed -> Internal in isolation; this drives
+    // it through the live deferred plumbing.
+    let runtime = ThreadedRuntime::new(SingleShard, DefaultThreadedMailboxFactory);
+    let service = runtime
+        .register_with_capacity::<_, Infallible>(SelfStopService, 16)
+        .expect("register self-stop service");
+    let registry_state = Registry::<SingleShard>::builder()
+        // Long timeout: a real Closed returns immediately. If the plumbing ever
+        // regressed into a hang, the outer call_blocking deadline (TIMEOUT)
+        // fails the test loudly instead of masking Closed behind a slow Timeout
+        // (both map to Internal, but only Closed is fast).
+        .timeout(Duration::from_secs(30))
+        .service("gone", service)
+        .build();
+    let registry = runtime
+        .register_with_capacity::<_, Infallible>(registry_state, 16)
+        .expect("register registry");
+
+    let outcome = runtime
+        .call_blocking(registry, route("gone", "ping", b"x"), TIMEOUT)
+        .expect("registry answers the caller when the service stops mid-call");
+    assert_eq!(
+        outcome,
+        CallOutcome::Replied(RouterReply::Internal),
+        "a downstream service that stops without replying must map to Internal \
+         through the deferred reply path"
+    );
+    let _ = runtime.shutdown();
+}
+
+/// Sentinel capacity [`ClogFactory`] maps to an always-full mailbox.
+const CLOG_CAPACITY: usize = usize::MAX;
+
+struct ClogState<T> {
+    queue: VecDeque<T>,
+    closed: bool,
+}
+
+/// A `Send` mailbox that either behaves normally or rejects every send with
+/// `Full`. The always-full variant lets a test drive a real
+/// `CallOutcome::Full`: the registry's mediated send into a service whose
+/// mailbox is saturated is rejected `Full`, which the deferred path maps to
+/// `RouterReply::Full`.
+struct ClogMailbox<T> {
+    capacity: usize,
+    always_full: bool,
+    state: Mutex<ClogState<T>>,
+}
+
+impl<T> Mailbox<T> for ClogMailbox<T> {
+    fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    fn try_send(&self, message: T) -> Result<(), TrySendError<T>> {
+        let mut state = self.state.lock().expect("clog mailbox mutex");
+        if state.closed {
+            return Err(TrySendError::Closed(message));
+        }
+        if self.always_full || state.queue.len() >= self.capacity {
+            return Err(TrySendError::Full(message));
+        }
+        state.queue.push_back(message);
+        Ok(())
+    }
+
+    fn recv(&self) -> Option<T> {
+        self.state
+            .lock()
+            .expect("clog mailbox mutex")
+            .queue
+            .pop_front()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.state
+            .lock()
+            .expect("clog mailbox mutex")
+            .queue
+            .is_empty()
+    }
+
+    fn close(&self) {
+        self.state.lock().expect("clog mailbox mutex").closed = true;
+    }
+}
+
+/// Threaded factory yielding an always-full mailbox for [`CLOG_CAPACITY`] and
+/// ordinary bounded mailboxes for every other capacity.
+#[derive(Clone, Copy)]
+struct ClogFactory;
+
+impl MailboxFactory for ClogFactory {
+    fn create<T: 'static>(&self, capacity: usize) -> Box<dyn Mailbox<T>> {
+        let always_full = capacity == CLOG_CAPACITY;
+        Box::new(ClogMailbox {
+            capacity: if always_full { 1 } else { capacity },
+            always_full,
+            state: Mutex::new(ClogState {
+                queue: VecDeque::new(),
+                closed: false,
+            }),
+        })
+    }
+}
+
+#[test]
+fn registry_downstream_full_maps_to_full_through_deferred_reply() {
+    // Registry handle_call -> defer(call(service)) -> [service mailbox rejects
+    // the mediated send with Full] -> continuation -> reply_to(caller, Full).
+    // Distinct from Closed/Timeout: Full is the only downstream outcome that
+    // does NOT collapse to Internal, so this pins the mapping through the live
+    // path, not just the pure table.
+    let runtime = ThreadedRuntime::new(SingleShard, ClogFactory);
+    // Sentinel capacity => the service mailbox rejects every send with Full.
+    // The service body never runs; it only exists to own a saturated mailbox.
+    let service = runtime
+        .register_with_capacity::<_, Infallible>(SingleService::new(EchoHandler), CLOG_CAPACITY)
+        .expect("register saturated service");
+    let registry_state = Registry::<SingleShard>::builder()
+        .timeout(Duration::from_secs(30))
+        .service("busy", service)
+        .build();
+    let registry = runtime
+        .register_with_capacity::<_, Infallible>(registry_state, 16)
+        .expect("register registry");
+
+    let outcome = runtime
+        .call_blocking(registry, route("busy", "ping", b"x"), TIMEOUT)
+        .expect("registry answers the caller when the service mailbox is full");
+    assert_eq!(
+        outcome,
+        CallOutcome::Replied(RouterReply::Full),
+        "a downstream service whose mailbox rejects the call with Full must map \
+         to RouterReply::Full through the deferred reply path"
     );
     let _ = runtime.shutdown();
 }
