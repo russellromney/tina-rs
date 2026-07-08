@@ -22,16 +22,18 @@
 //!
 //! Tina's `IsolateCall` requires the issuing isolate's translator to produce
 //! the issuer's own `Self::Message` type. The registry both *receives*
-//! external `RouterRequest`s and *receives* internal continuation messages
-//! (the service-call results). They share the registry's mailbox, so its
-//! message vocabulary is an envelope:
+//! external `RouterRequest`s (as `call()` traffic, on `handle_call`) and
+//! *receives* internal continuation messages (the service-call results, on
+//! `handle`). They share the registry's mailbox, so its message vocabulary is
+//! an envelope:
 //!
 //! - `RegistryMsg::Route(RouterRequest)` — external entrypoint from a
-//!   connection isolate.
-//! - `RegistryMsg::ServiceResult(CallOutcome<ServiceReply>)` — internal
-//!   continuation, the translator output for a service `IsolateCall`.
+//!   connection isolate, answered through the caller's `RequestContext`.
+//! - `RegistryMsg::ServiceResult(RequestContext<RouterReply>,
+//!   CallOutcome<ServiceReply>)` — internal continuation carrying the original
+//!   caller's captured reply authority plus the service `IsolateCall` outcome.
 //!
-//! The connection sends only `Route(...)`. `ServiceResult` is an
+//! The connection calls only `Route(...)`. `ServiceResult` is an
 //! implementation detail of the registry's deferred-reply mechanism.
 //!
 //! # Wire-error invariant
@@ -47,6 +49,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use tina::prelude::*;
+use tina::{CallContext, CallRejectedReason, CallableIsolate};
 use tina_runtime::{CallOutcome, RuntimeCall, call};
 
 use crate::connection::{RouterReply, RouterRequest};
@@ -89,25 +92,29 @@ pub enum ServiceReply {
 ///
 /// Constructing a [`RegistryMsg::ServiceResult`] from outside the registry
 /// and routing it into the registry mailbox does *not* let an attacker
-/// hijack a victim's pending reply: the runtime pairs replies with the
-/// per-call `call_context`, not with anything in the message. A spoofed
-/// `ServiceResult` either rides a fresh `IsolateCall` (in which case the
-/// reply lands at the spoofer's own pending slot) or rides a `send` (in
-/// which case the runtime logs the stray `Effect::Reply` and drops it).
-/// Misbehavior is contained to the misbehaving isolate.
-#[derive(Debug, Clone)]
+/// hijack a victim's pending reply: the carried [`RequestContext`] is a
+/// move-only, non-forgeable capture of the *original* caller's reply slot,
+/// minted by the runtime when the `Route` call was delivered. An in-process
+/// actor cannot construct one for a victim's call.
+///
+/// Not `Clone`: the `ServiceResult` continuation owns a one-shot
+/// [`RequestContext`], which is move-only by design.
+#[derive(Debug)]
 pub enum RegistryMsg {
-    /// External request from a connection isolate.
+    /// External request from a connection isolate. Delivered as a `call()`,
+    /// so it is answered through [`RequestContext`] (captured in
+    /// `handle_call`), never through an implicit reply slot.
     Route(RouterRequest),
     /// Internal continuation: a service `IsolateCall` completed.
     ///
-    /// The variant carries only the outcome; the request id and service
-    /// name needed to re-form a reply are already implied by the runtime's
-    /// `call_context` machinery, so storing them on the wire-side
-    /// continuation message would be redundant and would expose extra
-    /// fields a hostile in-process actor could attempt to manipulate.
+    /// Carries the original caller's captured [`RequestContext`] plus the
+    /// downstream call outcome. The registry maps the outcome to a
+    /// [`RouterReply`] and answers the original caller with
+    /// [`tina::reply_to`]. Produced only by the registry's own deferred-call
+    /// continuation and delivered back through `handle`. It cannot be forged:
+    /// a [`RequestContext`] is minted only by the runtime for a real caller.
     #[doc(hidden)]
-    ServiceResult(CallOutcome<ServiceReply>),
+    ServiceResult(RequestContext<RouterReply>, CallOutcome<ServiceReply>),
 }
 
 /// Registry configuration.
@@ -305,7 +312,11 @@ where
     S: tina::Shard,
     Self: tina::Isolate<Message = RegistryMsg, Reply = RouterReply, Io = RuntimeCall<RegistryMsg>>,
 {
-    fn route(&mut self, request: RouterRequest) -> Effect<Self> {
+    /// Handles a `Route` call: look up the service, then either answer the
+    /// caller now (unknown service) or defer the answer through the downstream
+    /// service `IsolateCall`, carrying the caller's [`RequestContext`] into the
+    /// [`RegistryMsg::ServiceResult`] continuation.
+    fn route(&mut self, request: RouterRequest, call_ctx: CallContext<'_, Self>) -> Effect<Self> {
         let RouterRequest {
             request_id: _,
             service,
@@ -313,31 +324,44 @@ where
             payload,
         } = request;
         let Some(service_addr) = self.services.get(&service).copied() else {
-            return reply::<Self>(RouterReply::UnknownService);
+            return call_ctx.reply(RouterReply::UnknownService);
         };
-        call(
-            service_addr,
-            ServiceCall { method, payload },
-            self.config.service_call_timeout,
-        )
-        .then(RegistryMsg::ServiceResult)
+        call_ctx
+            .defer(call(
+                service_addr,
+                ServiceCall { method, payload },
+                self.config.service_call_timeout,
+            ))
+            .reply(RegistryMsg::ServiceResult)
     }
 
-    fn finish(&mut self, outcome: CallOutcome<ServiceReply>) -> Effect<Self> {
-        let mapped = match outcome {
-            CallOutcome::Replied(ServiceReply::Ok(bytes)) => RouterReply::Ok(bytes),
-            CallOutcome::Replied(ServiceReply::UnknownMethod) => RouterReply::UnknownMethod,
-            CallOutcome::Replied(ServiceReply::Decode) => RouterReply::Decode,
-            CallOutcome::Replied(ServiceReply::Internal) => RouterReply::Internal,
-            CallOutcome::Full => RouterReply::Full,
-            CallOutcome::Closed => RouterReply::Internal,
-            CallOutcome::Rejected(_) => RouterReply::Internal,
-            // Wire-error invariant: server-side service timeout maps to
-            // Internal on the wire, not Timeout. Timeout is a
-            // client-observed condition only.
-            CallOutcome::Timeout => RouterReply::Internal,
-        };
-        reply::<Self>(mapped)
+    /// Maps a downstream service outcome to a [`RouterReply`] and answers the
+    /// original caller through its captured [`RequestContext`].
+    fn finish(
+        &mut self,
+        req: RequestContext<RouterReply>,
+        outcome: CallOutcome<ServiceReply>,
+    ) -> Effect<Self> {
+        reply_to(req, outcome_to_router_reply(outcome))
+    }
+}
+
+/// Maps a downstream service `IsolateCall` outcome to the wire-facing
+/// [`RouterReply`]. Pure so the mapping table is unit-testable without a
+/// runtime; see the module tests.
+fn outcome_to_router_reply(outcome: CallOutcome<ServiceReply>) -> RouterReply {
+    match outcome {
+        CallOutcome::Replied(ServiceReply::Ok(bytes)) => RouterReply::Ok(bytes),
+        CallOutcome::Replied(ServiceReply::UnknownMethod) => RouterReply::UnknownMethod,
+        CallOutcome::Replied(ServiceReply::Decode) => RouterReply::Decode,
+        CallOutcome::Replied(ServiceReply::Internal) => RouterReply::Internal,
+        CallOutcome::Full => RouterReply::Full,
+        CallOutcome::Closed => RouterReply::Internal,
+        CallOutcome::Rejected(_) => RouterReply::Internal,
+        // Wire-error invariant: server-side service timeout maps to
+        // Internal on the wire, not Timeout. Timeout is a
+        // client-observed condition only.
+        CallOutcome::Timeout => RouterReply::Internal,
     }
 }
 
@@ -354,13 +378,29 @@ where
     type Fact = ::std::convert::Infallible;
     type Shard = S;
 
+    // Connections reach the registry with `call()`, so the caller authority
+    // lives here. `Route` is the only externally-issued variant.
+    fn handle_call(&mut self, msg: RegistryMsg, call: CallContext<'_, Self>) -> Effect<Self> {
+        match msg {
+            RegistryMsg::Route(request) => self.route(request, call),
+            // The continuation is a self-delivered send, never a call. A caller
+            // that sends `ServiceResult` as a call gets a clean rejection.
+            RegistryMsg::ServiceResult(..) => call.reject(CallRejectedReason::UnsupportedMessage),
+        }
+    }
+
     fn handle(&mut self, msg: RegistryMsg, _ctx: &mut Context<'_, S, Self::Reply>) -> Effect<Self> {
         match msg {
-            RegistryMsg::Route(request) => self.route(request),
-            RegistryMsg::ServiceResult(outcome) => self.finish(outcome),
+            // A plain send of `Route` carries no caller authority, so there is
+            // nothing to answer. Connections always `call()`.
+            RegistryMsg::Route(_) => noop(),
+            RegistryMsg::ServiceResult(req, outcome) => self.finish(req, outcome),
         }
     }
 }
+
+// `handle_call` is the intentional callee surface for connection traffic.
+impl<S> CallableIsolate for Registry<S> where S: tina::Shard {}
 
 #[cfg(test)]
 mod tests {
@@ -382,115 +422,79 @@ mod tests {
             .with_reply::<ServiceReply>()
     }
 
-    fn dispatch(
-        registry: &mut Registry<TestShard>,
-        msg: RegistryMsg,
-    ) -> Effect<Registry<TestShard>> {
-        let mut shard = TestShard;
-        let mut ctx = Context::<_, RouterReply>::new_typed(&mut shard, IsolateId::new(99));
-        registry.handle(msg, &mut ctx)
-    }
-
-    fn make_request(service: &str, method: &str) -> RouterRequest {
-        RouterRequest {
-            request_id: 1,
-            service: service.into(),
-            method: method.into(),
-            payload: Vec::new(),
-        }
-    }
-
-    #[test]
-    fn unknown_service_replies_unknown_service() {
-        let mut registry = Registry::<TestShard>::new(RegistryConfig::default());
-        let effect = dispatch(
-            &mut registry,
-            RegistryMsg::Route(make_request("missing", "m")),
-        );
-        match effect {
-            Effect::Reply(RouterReply::UnknownService) => {}
-            other => panic!("expected Reply(UnknownService), got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn known_service_emits_isolate_call_continuation() {
-        let mut registry = Registry::<TestShard>::new(RegistryConfig::default());
-        registry.register("svc", service_addr(7));
-        let effect = dispatch(&mut registry, RegistryMsg::Route(make_request("svc", "m")));
-        // Should be Effect::Io (an isolate-call to the service).
-        assert!(matches!(effect, Effect::Io(_)));
-    }
+    // The `Route → reply` and deferred `ServiceResult → reply_to` paths run
+    // through the runtime `call()` machinery (caller authority cannot be
+    // hand-built here), so they are exercised end-to-end in
+    // `tests/rpc_end_to_end.rs`. These unit tests cover the pure mapping table
+    // and the service-lookup bookkeeping.
 
     #[test]
     fn service_ok_maps_to_router_reply_ok() {
-        let mut registry = Registry::<TestShard>::new(RegistryConfig::default());
-        registry.register("svc", service_addr(1));
-        let effect = dispatch(
-            &mut registry,
-            RegistryMsg::ServiceResult(CallOutcome::Replied(ServiceReply::Ok(b"hi".to_vec()))),
-        );
-        match effect {
-            Effect::Reply(RouterReply::Ok(bytes)) => assert_eq!(bytes, b"hi"),
-            other => panic!("expected Reply(Ok), got {other:?}"),
-        }
+        let mapped =
+            outcome_to_router_reply(CallOutcome::Replied(ServiceReply::Ok(b"hi".to_vec())));
+        assert_eq!(mapped, RouterReply::Ok(b"hi".to_vec()));
     }
 
     #[test]
     fn service_unknown_method_propagates() {
-        let mut registry = Registry::<TestShard>::new(RegistryConfig::default());
-        let effect = dispatch(
-            &mut registry,
-            RegistryMsg::ServiceResult(CallOutcome::Replied(ServiceReply::UnknownMethod)),
-        );
-        assert!(matches!(effect, Effect::Reply(RouterReply::UnknownMethod)));
+        let mapped = outcome_to_router_reply(CallOutcome::Replied(ServiceReply::UnknownMethod));
+        assert_eq!(mapped, RouterReply::UnknownMethod);
     }
 
     #[test]
     fn service_decode_propagates() {
-        let mut registry = Registry::<TestShard>::new(RegistryConfig::default());
-        let effect = dispatch(
-            &mut registry,
-            RegistryMsg::ServiceResult(CallOutcome::Replied(ServiceReply::Decode)),
-        );
-        assert!(matches!(effect, Effect::Reply(RouterReply::Decode)));
+        let mapped = outcome_to_router_reply(CallOutcome::Replied(ServiceReply::Decode));
+        assert_eq!(mapped, RouterReply::Decode);
     }
 
     #[test]
     fn service_internal_propagates() {
-        let mut registry = Registry::<TestShard>::new(RegistryConfig::default());
-        let effect = dispatch(
-            &mut registry,
-            RegistryMsg::ServiceResult(CallOutcome::Replied(ServiceReply::Internal)),
-        );
-        assert!(matches!(effect, Effect::Reply(RouterReply::Internal)));
+        let mapped = outcome_to_router_reply(CallOutcome::Replied(ServiceReply::Internal));
+        assert_eq!(mapped, RouterReply::Internal);
     }
 
     #[test]
     fn service_full_maps_to_router_reply_full() {
-        let mut registry = Registry::<TestShard>::new(RegistryConfig::default());
-        let effect = dispatch(&mut registry, RegistryMsg::ServiceResult(CallOutcome::Full));
-        assert!(matches!(effect, Effect::Reply(RouterReply::Full)));
+        assert_eq!(
+            outcome_to_router_reply(CallOutcome::Full),
+            RouterReply::Full
+        );
     }
 
     #[test]
     fn service_closed_maps_to_internal() {
-        let mut registry = Registry::<TestShard>::new(RegistryConfig::default());
-        let effect = dispatch(
-            &mut registry,
-            RegistryMsg::ServiceResult(CallOutcome::Closed),
+        assert_eq!(
+            outcome_to_router_reply(CallOutcome::Closed),
+            RouterReply::Internal
         );
-        assert!(matches!(effect, Effect::Reply(RouterReply::Internal)));
     }
 
     #[test]
     fn service_timeout_maps_to_internal_not_wire_timeout() {
-        let mut registry = Registry::<TestShard>::new(RegistryConfig::default());
-        let effect = dispatch(
-            &mut registry,
-            RegistryMsg::ServiceResult(CallOutcome::Timeout),
+        assert_eq!(
+            outcome_to_router_reply(CallOutcome::Timeout),
+            RouterReply::Internal
         );
-        assert!(matches!(effect, Effect::Reply(RouterReply::Internal)));
+    }
+
+    #[test]
+    fn service_rejected_maps_to_internal() {
+        assert_eq!(
+            outcome_to_router_reply(CallOutcome::Rejected(
+                tina::CallRejectedReason::UnsupportedMessage
+            )),
+            RouterReply::Internal
+        );
+    }
+
+    #[test]
+    fn lookup_reports_registered_service() {
+        let mut registry = Registry::<TestShard>::new(RegistryConfig::default());
+        assert!(registry.is_empty());
+        registry.register("svc", service_addr(7));
+        assert_eq!(registry.len(), 1);
+        assert!(registry.services.contains_key("svc"));
+        assert!(!registry.services.contains_key("missing"));
     }
 
     #[test]
@@ -501,9 +505,7 @@ mod tests {
         let removed = registry.deregister("svc");
         assert!(removed.is_some());
         assert!(registry.is_empty());
-        // Re-route should now report unknown service.
-        let effect = dispatch(&mut registry, RegistryMsg::Route(make_request("svc", "m")));
-        assert!(matches!(effect, Effect::Reply(RouterReply::UnknownService)));
+        assert!(!registry.services.contains_key("svc"));
     }
 
     #[test]
