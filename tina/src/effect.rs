@@ -1,8 +1,8 @@
 //! Effect language for the tina core.
 //!
 //! Owns the closed [`Effect`] enum, the small [`RequestEffect`] helper,
-//! and every effect constructor (`reply`, `send`, `call`, `spawn`,
-//! `batch`, `stop`, ...). Re-exported from the crate root.
+//! and every effect constructor (`reply`, `send`, `spawn`, `batch`,
+//! `stop`, ...). Re-exported from the crate root.
 //!
 //! ## Module map
 //!
