@@ -3514,6 +3514,7 @@ dependencies = [
  "rustls-pki-types",
  "sha1 0.10.6",
  "tina",
+ "tina-rpc",
  "tina-runtime",
  "tina-sim",
 ]

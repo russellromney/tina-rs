@@ -104,6 +104,8 @@ pub(super) fn try_decode_frame_meta(
             max: max_frame_size,
         });
     }
+    // `len` is a 24-bit field, so `FRAME_HEADER_LEN + len` never overflows;
+    // this arm is defensive-only and unreachable in practice.
     let total = FRAME_HEADER_LEN
         .checked_add(len)
         .ok_or(Http2ProtocolError::FrameTooLarge {
@@ -331,6 +333,57 @@ mod tests {
         let frame = Frame::new(FRAME_DATA, FLAG_PADDED, 1, Vec::new());
         assert!(matches!(
             into_data_payload(frame),
+            Err(Http2ProtocolError::BadFrameLength)
+        ));
+    }
+
+    #[test]
+    fn payload_views_contain_padded_and_truncated_inputs() {
+        // Deterministic version of the `h2_payload` fuzz target: the borrowed
+        // DATA/HEADERS views strip pad/priority bytes straight off a read
+        // buffer, so a lying pad length or missing priority bytes must fail
+        // closed with a typed error, never panic or slice out of bounds.
+
+        // Unpadded DATA returns the whole payload as the view.
+        assert_eq!(
+            data_payload_view(0, &[1, 2, 3]).expect("unpadded DATA"),
+            (&[1, 2, 3][..], 3)
+        );
+        // Padded DATA: first byte is pad length; trailing pad bytes are trimmed.
+        assert_eq!(
+            data_payload_view(FLAG_PADDED, &[2, 9, 9, 0, 0]).expect("padded DATA"),
+            (&[9, 9][..], 5)
+        );
+        // Pad length overruns the payload: typed error, not a panic.
+        assert!(matches!(
+            data_payload_view(FLAG_PADDED, &[5, 1, 2]),
+            Err(Http2ProtocolError::BadFrameLength)
+        ));
+        // Padded flag set but empty payload: no pad-length byte to read.
+        assert!(matches!(
+            data_payload_view(FLAG_PADDED, &[]),
+            Err(Http2ProtocolError::BadFrameLength)
+        ));
+
+        // HEADERS view: unpadded, no priority — the whole payload is the block.
+        assert_eq!(
+            headers_payload_view(0, &[0xaa, 0xbb]).expect("plain HEADERS"),
+            &[0xaa, 0xbb][..]
+        );
+        // Padded + priority: strip pad-length byte, 5 priority bytes, trailing pad.
+        assert_eq!(
+            headers_payload_view(FLAG_PADDED | FLAG_PRIORITY, &[1, 0, 0, 0, 0, 0, 0x42, 0])
+                .expect("padded+priority HEADERS"),
+            &[0x42][..]
+        );
+        // Priority flag set but fewer than 5 priority bytes: typed error.
+        assert!(matches!(
+            headers_payload_view(FLAG_PRIORITY, &[0, 0, 0]),
+            Err(Http2ProtocolError::BadFrameLength)
+        ));
+        // Pad length larger than the bytes after the prefix: typed error.
+        assert!(matches!(
+            headers_payload_view(FLAG_PADDED, &[9, 1, 2]),
             Err(Http2ProtocolError::BadFrameLength)
         ));
     }
