@@ -4,6 +4,23 @@ This file records completed work.
 
 ## Unreleased
 
+### Docs On-Ramp
+
+- Added `tina-runtime/examples/hello_world.rs`: the smallest runnable program —
+  one isolate on `ThreadedRuntime`, a blocking call, a reply, and shutdown. The
+  first-isolate guide chapter now ends with the same program so a newcomer can
+  run something on page one.
+- Rewrote `task_dispatcher` and `tcp_echo` onto `ThreadedRuntime` +
+  `DefaultThreadedMailboxFactory`, removing the hand-rolled mailboxes and manual
+  `step()` pumping. `task_dispatcher` now learns a spawned worker's address with
+  `spawn_observed(...).then(...)` instead of parsing runtime trace events. The
+  deterministic trace-shape proof for `tcp_echo` moved into an in-file `#[test]`
+  on the explicit-step runtime.
+- Restructured the request/reply chapter to lead with the default reply shapes
+  (`reply`, `defer(work).reply`, `tina::flow!`) before the lower-level tools.
+- Added glossary entries for `rail`, `first-form`, `fact`, `battery`, and
+  `specimen`, and pointed the README quickstart at `hello_world` first.
+
 ### Continuation Flow Authoring
 
 - Added `tina::flow!`, which generates explicit continuation enums and

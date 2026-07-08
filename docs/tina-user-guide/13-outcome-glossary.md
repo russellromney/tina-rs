@@ -131,6 +131,44 @@ and shutdown rails. It is not the same as `CallOutcome`.
 | many cancelable attempts grouped by key | `CancelableWork<K, Q, R>` (`Full` / `KeyFull`) |
 | reply later to current caller | `call.defer(effect).reply(...)` |
 
+## Project Vocabulary
+
+A few words recur across these docs and the code. They are Tina jargon, not
+standard Rust terms.
+
+### rail
+
+A runtime-owned lane for one class of work: a TCP rail, file rail, DNS rail,
+TLS rail, storage rail, timer rail. Effects like `tcp_read` or `journal_append`
+flow through a rail and return as ordinary continuation messages. Rails are
+bounded and report their own pressure.
+
+### first-form
+
+The first shipped version of a feature: proven and honest, but minimal. A
+first-form implementation does the core job and states what it does not do yet,
+instead of pretending to be the hardened final version. "No transactions in
+first form" means the feature works, but that capability is not there yet.
+
+### fact
+
+A typed value the runtime records instead of leaving behavior implicit.
+Overload, timeout, cancellation, a stopped child, capacity, a replayed run —
+each is a fact in the trace or a typed return, not a log line or a convention.
+Facts are the thing you assert on.
+
+### battery
+
+A blessed-but-optional crate on top of core Tina: HTTP, gRPC, SQLite, AWS, and
+the bridge crates. Batteries depend on core, never the other way. You can learn
+and use core Tina without reaching for any battery.
+
+### specimen
+
+A paired Tokio-vs-Tina example of one service shape, kept for comparing shape
+and behavior. Specimens are not a shared framework and not a release artifact;
+they exist to find rough edges. They live under `examples/`.
+
 ## Rule
 
 Do not flatten these too early.
