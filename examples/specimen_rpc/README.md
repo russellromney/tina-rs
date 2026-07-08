@@ -27,6 +27,19 @@ comparison=specimen_rpc side=tina  burst=4 ok=1 full=3 other=0
 `Error(Full)` frames. `other` covers anything unexpected so totals
 never silently shrink.
 
+> **KNOWN BUG (tina-rpc):** the Tina line above is the *target*. Today
+> it actually prints `ok=0 full=3 other=1` — the first request comes
+> back as `Error(Internal)` instead of `Reply`. The cause is in the
+> library, not this specimen: `Registry` and `SingleService` answer
+> calls via `handle` returning `Effect::Reply` (the old
+> implicit-reply-slot model), but the runtime now delivers `call()`
+> traffic to `handle_call`, whose default rejects with
+> `UnsupportedMessage`. The connection sees `CallOutcome::Rejected` and
+> maps it to `Internal`. Every tina-rpc unit test drives these isolates
+> by calling `handle` directly, so nothing caught it; this specimen is
+> the only end-to-end exerciser. Fix is a tina-rpc migration onto
+> `handle_call` + `RequestContext`, tracked separately.
+
 ## Read
 
 - [`src/tokio_impl.rs`](src/tokio_impl.rs)
@@ -54,12 +67,12 @@ Tina uses the `#[tina_rpc::service]` macro to define the service:
 ```rust
 #[service]
 trait Echo {
-    fn ping(&mut self, payload: Vec<u8>) -> Vec<u8>;
+    fn ping(&mut self, body: Vec<u8>) -> Vec<u8>;
 }
 
 impl Echo for EchoState {
-    fn ping(&mut self, payload: Vec<u8>) -> Vec<u8> {
-        payload
+    fn ping(&mut self, body: Vec<u8>) -> Vec<u8> {
+        body
     }
 }
 ```
@@ -73,9 +86,10 @@ isolate that wraps the TCP stream. Over-cap requests come back as
 wire `Error(Full)` frames immediately. The client sees them on the
 read side of the same socket.
 
-When you run it, `full=N-1` always. The first request grabs the
-slot, gets a `Reply`. The next N-1 come back as `Error(Full)`. The
-overload is on the wire.
+When you run it, `full=N-1` always: the over-cap requests come back
+as `Error(Full)` on the wire. The first request is meant to grab the
+slot and get a `Reply` — see the KNOWN BUG note above for why it does
+not today.
 
 ## Discussion
 
@@ -99,13 +113,13 @@ What feels worse:
 - **Tina's setup has more pieces.** A Listener isolate that walks
   `Bound → Accepted → spawn(Connection)`, a Registry that maps
   wire service name to dispatch isolate, the `SingleService`
-  adapter wrapping `Dispatch`. Each piece is small (047 retired
-  the mailbox-factory and per-shard-type boilerplate, and
-  `runtime.observe_next_bound()` retired the
-  `Arc<Mutex<Option<SocketAddr>>>` side channel) but there are
+  adapter wrapping `Dispatch`. Each piece is small (the default
+  mailbox factory and single-shard default retired the
+  per-shard-type boilerplate, and `runtime.observe_next_bound()`
+  retired the `Arc<Mutex<Option<SocketAddr>>>` side channel) but there are
   more of them. The Tokio side is `bind / accept / spawn`.
 - **The wire shape is JSON-tuple-encoded.** The macro decodes
-  `fn ping(payload: Vec<u8>)` from a JSON `[<bytes>]`. Clients
+  `fn ping(body: Vec<u8>)` from a JSON `[<bytes>]`. Clients
   must produce that shape. Positional tuples are not additive —
   adding an arg changes the JSON array length and silently
   breaks old clients.

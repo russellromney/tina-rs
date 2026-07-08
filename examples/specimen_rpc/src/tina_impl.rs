@@ -1,9 +1,21 @@
 //! Tina framed RPC, typed server via the `#[service]` macro.
 //!
 //! `Connection::tiny_pressure()` enforces `max_in_flight = 1` per
-//! connection. The first request grabs the slot, gets a `Reply`.
-//! The next N-1 arrive while that one is in flight and come back as
-//! wire `Error(Full)` — overload becomes a frame, not a stuck queue.
+//! connection. The first request grabs the slot; the next N-1 arrive
+//! while that one is in flight and come back as wire `Error(Full)` —
+//! overload becomes a frame, not a stuck queue.
+//!
+//! KNOWN BUG (tina-rpc): the first request should grab the slot and get
+//! a `Reply`, but it currently comes back as `Error(Internal)`, so the
+//! Tina side prints `ok=0 full=N-1 other=1` instead of the target
+//! `ok=1 full=N-1 other=0`. Root cause is in the library, not this
+//! specimen: `Registry` and `SingleService` answer via `handle`
+//! returning `Effect::Reply` (the old implicit-reply-slot model), but
+//! the runtime delivers `call()` traffic to `handle_call`, whose
+//! default rejects with `UnsupportedMessage`. The connection observes
+//! that as `CallOutcome::Rejected` and maps it to `Internal`. tina-rpc
+//! needs to migrate these isolates onto `handle_call` +
+//! `RequestContext`; tracked separately.
 
 use std::convert::Infallible;
 use std::io::{Read, Write};
