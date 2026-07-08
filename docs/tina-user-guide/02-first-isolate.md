@@ -55,6 +55,11 @@ That is the core.
 
 No task. No async trait. No shared state.
 
+This first sketch replies straight from `handle` to show the shape. A
+fire-and-forget send has no caller to answer, though, so in the runnable
+program at the end of the chapter `Read` replies from `handle_call` — where a
+blocking `call` carries a caller. Same split, spelled out below.
+
 ## Effect Types
 
 The macro needs to know what the isolate may do.

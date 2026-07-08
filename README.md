@@ -346,7 +346,7 @@ make verify
 Run the smallest program — one isolate, one call, one reply:
 
 ```bash
-cargo run -p tina-runtime --example hello_world
+cargo run --example hello_world -p tina-runtime
 ```
 
 Then the smallest service-shaped example — a supervised dispatcher that
