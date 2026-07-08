@@ -4,6 +4,20 @@ This file records completed work.
 
 ## Unreleased
 
+### Service Skeleton
+
+- Added a `serve` mode to the mini SaaS example: `-- serve [--addr HOST:PORT]`
+  binds the HTTP server, prints one startup line (bind address, shard count,
+  capacity summary), and runs until SIGINT/SIGTERM on the runtime's
+  `signal_wait` rail, then drains through the existing shutdown choreography
+  and exits `0`. This is the copyable run-forever entrypoint; the
+  `smoke`/`pressure`/`soak` modes are the verification harness.
+- Removed the mini SaaS controller's compatibility-forward continuation
+  variants left over from the `tina::flow!` port; the flow continuations are
+  now the only notify path.
+- Split the example's `tina_impl.rs` into focused modules (controller,
+  harness, serve, shutdown) with no behavior change.
+
 ### Continuation Flow Authoring
 
 - Added `tina::flow!`, which generates explicit continuation enums and
