@@ -142,6 +142,13 @@ where
                 .remove_driver(call_id)
                 .expect("indexed in-flight call exists");
             self.driver.cancel(call.head.call_id);
+            // A completion already harvested for this call but carried past the
+            // per-step drain budget would otherwise be delivered after the entry
+            // is gone. That is NOT a driver bug — the requester just stopped — so
+            // drop the carried completion here instead of letting it fall
+            // through to `deliver_completion`'s quarantine path. `RequesterClosed`
+            // below is the completion's observable settlement.
+            self.pending_completions.retain(|op| op.call_id != call_id);
             self.push_event(
                 call.head.requester.isolate,
                 Some(call.head.cause),

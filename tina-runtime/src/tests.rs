@@ -122,6 +122,79 @@ fn driver_completion_for_unknown_call_is_quarantined_not_panicked() {
 }
 
 #[test]
+fn carried_completion_for_stopped_requester_is_dropped_not_quarantined() {
+    // A completion harvested from the driver but carried past the per-step
+    // drain budget, whose requester then stops, is a NORMAL race — not a driver
+    // bug. It must be dropped and settle as RequesterClosed, never surface as a
+    // quarantine (which would falsely accuse the driver).
+    let mut runtime = Runtime::new(TestShard, TestMailboxFactory);
+    runtime.register(new_root(), root_mailbox());
+    let requester = RegisteredAddress {
+        shard: runtime.shard.id(),
+        isolate: runtime.entries[0].id,
+        generation: runtime.entries[0].generation,
+    };
+    let call_id = CallId::new(7);
+    runtime.call_table.insert_driver(crate::DriverCall {
+        head: crate::DriverCallHead {
+            call_id,
+            call_kind: CallKind::IsolateCall,
+            requester,
+            cause: CauseId::new(EventId::new(1)),
+            persistence: None,
+            continuation_context: None,
+        },
+        translator: Box::new(|_| crate::call::ErasedRuntimeCallCompletion::Noop),
+    });
+    // A completion for this call was already harvested and is waiting behind the
+    // drain budget.
+    runtime
+        .pending_completions
+        .push_back(crate::driver::DriverCompletion {
+            call_id,
+            result: CallOutput::TcpListenerClosed,
+        });
+
+    // The requester stops.
+    runtime.cancel_driver_calls_for_requester(requester);
+
+    // A later driver advance must not re-surface the carried completion.
+    let now = runtime.clock.now();
+    runtime.advance_driver(now);
+
+    let quarantined = runtime
+        .trace()
+        .iter()
+        .filter(|event| {
+            matches!(
+                event.kind(),
+                RuntimeEventKind::DriverCompletionQuarantined { .. }
+            )
+        })
+        .count();
+    assert_eq!(
+        quarantined, 0,
+        "a carried completion for a stopped requester must not quarantine"
+    );
+    let rejected = runtime
+        .trace()
+        .iter()
+        .filter(|event| {
+            matches!(
+                event.kind(),
+                RuntimeEventKind::CallCompletionRejected {
+                    call_id: c,
+                    reason: crate::trace::CallCompletionRejectedReason::RequesterClosed,
+                    ..
+                } if c == call_id
+            )
+        })
+        .count();
+    assert_eq!(rejected, 1, "carried completion settles as RequesterClosed");
+    assert!(runtime.pending_completions.is_empty(), "completion purged");
+}
+
+#[test]
 fn bounded_trace_retention_does_not_move_the_tail_on_every_event() {
     let mut runtime = Runtime::with_clock_and_ids_and_driver(
         TestShard,

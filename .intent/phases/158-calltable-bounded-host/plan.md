@@ -112,6 +112,25 @@ driver bug, no existing scenario emits it and no pinned `*_TRACE_HASH` moves.
   `cancel_in_flight_call_for_resource_close`. With quarantine, even if that purge
   regressed, a stale carried completion would quarantine (drop) instead of
   panicking — strictly safer.
+- **Carried completion + requester stop (found in adversarial review).** A
+  driver completion harvested but carried past the per-step drain budget, whose
+  requester then STOPS, gets its `DriverCall` removed by
+  `cancel_driver_calls_for_requester` (called from `stop_entry`). The carried
+  `pending_completions` entry would then reach `deliver_completion` with no
+  tracked call and be *spuriously* quarantined — this is a normal race, not a
+  driver bug (the old code would have PANICKED here). Fix:
+  `cancel_driver_calls_for_requester` now purges `pending_completions` for each
+  removed call, exactly like the close-cancel sibling. The completion settles as
+  the `RequesterClosed` the cancel already emits; quarantine stays reserved for
+  genuine driver-contract violations. Covered by a runtime unit test. The sim
+  has no budget-carry structure — it purges scheduled completions via
+  `cancel_pending_backend_work` on the same cancel — so it reaches the same
+  observable outcome (RequesterClosed, no quarantine) with no code change; the
+  DST oracle covers the parity.
+- **Late isolate reply after timeout/cancel.** Isolate-call replies never go
+  through the driver quarantine path: `complete_isolate_call` returns `false`
+  for an unknown call (benign), and a late callee reply settles as
+  `CallReplyRejected` via the recently-cancelled ring. Unchanged.
 - **Cross-shard terminal replies.** Untouched. Remote spawn/child-control tables
   are separate fields, not folded into CallTable.
 - **Duplicate id.** `insert_driver` / `insert_isolate` keep the duplicate-id
