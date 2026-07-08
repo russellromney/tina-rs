@@ -6,16 +6,69 @@
 //! `try_send_and_observe_with` shape; nothing about that contract
 //! changes.
 
+use std::collections::VecDeque;
 use std::convert::Infallible;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use tina::prelude::*;
+use tina::{Mailbox, TrySendError};
 use tina_runtime::{
-    DefaultThreadedMailboxFactory, HostBurstOutcomes, HostBurstWaitError, SendObservedUntilError,
-    ThreadedRuntime, ThreadedRuntimeConfig,
+    DefaultThreadedMailboxFactory, HostBurstOutcomes, HostBurstWaitError, MailboxFactory,
+    SendObservedUntilError, ThreadedRuntime, ThreadedRuntimeConfig,
 };
+
+/// A mailbox that accepts up to `capacity` and then never yields anything: it
+/// reports empty (so the worker never schedules the isolate) and `recv` is a
+/// no-op. Once filled it stays full forever, making mailbox overflow provable
+/// and deterministic instead of racing the worker's drain.
+struct NonDrainingMailbox<T> {
+    capacity: usize,
+    queue: Mutex<VecDeque<T>>,
+    closed: Mutex<bool>,
+}
+
+impl<T> Mailbox<T> for NonDrainingMailbox<T> {
+    fn capacity(&self) -> usize {
+        self.capacity
+    }
+    fn try_send(&self, message: T) -> Result<(), TrySendError<T>> {
+        if *self.closed.lock().expect("closed") {
+            return Err(TrySendError::Closed(message));
+        }
+        let mut queue = self.queue.lock().expect("queue");
+        if queue.len() >= self.capacity {
+            return Err(TrySendError::Full(message));
+        }
+        queue.push_back(message);
+        Ok(())
+    }
+    fn recv(&self) -> Option<T> {
+        None
+    }
+    fn is_empty(&self) -> bool {
+        // Reports empty so the worker never steps this isolate: the mailbox
+        // provably fills and never drains.
+        true
+    }
+    fn close(&self) {
+        *self.closed.lock().expect("closed") = true;
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct NonDrainingMailboxFactory;
+
+impl MailboxFactory for NonDrainingMailboxFactory {
+    fn create<T: 'static>(&self, capacity: usize) -> Box<dyn Mailbox<T>> {
+        Box::new(NonDrainingMailbox {
+            capacity,
+            queue: Mutex::new(VecDeque::new()),
+            closed: Mutex::new(false),
+        })
+    }
+}
 
 #[derive(Debug, Clone, Copy)]
 struct TestShard;
@@ -100,19 +153,27 @@ fn try_send_outcome_admits_full_burst_when_mailbox_has_room() {
 
 #[test]
 fn try_send_outcome_overflow_marks_mailbox_full() {
-    let runtime = make_runtime();
+    // Deterministic overflow: the target's mailbox never drains (see
+    // `NonDrainingMailbox`), so a burst past its capacity provably overflows.
+    // No wall-clock race against the worker's drain — the counts below are
+    // fixed by capacity, not timing.
+    let capacity = 4usize;
+    let runtime = ThreadedRuntime::with_config(
+        TestShard,
+        NonDrainingMailboxFactory,
+        ThreadedRuntimeConfig {
+            command_capacity: 256,
+            idle_wait: Duration::from_millis(1),
+            ..Default::default()
+        },
+    );
     let processed = Arc::new(AtomicU32::new(0));
     let worker = runtime
         .register_with_capacity::<Slow, Infallible>(
             Slow {
                 processed: Arc::clone(&processed),
             },
-            // Tiny mailbox so a tight burst of commands fills before
-            // the worker can step the isolate. The threaded worker
-            // drains the entire command queue (each Run command is
-            // followed by `continue`) before stepping, so the mailbox
-            // fills with admitted messages before any get processed.
-            4,
+            capacity,
         )
         .expect("register slow");
 
@@ -128,10 +189,19 @@ fn try_send_outcome_overflow_marks_mailbox_full() {
     let snap = outcomes.snapshot();
     assert_eq!(snap.submitted, burst);
     assert_eq!(snap.observed, burst);
-    assert!(
-        snap.mailbox_full > 0,
-        "burst of {burst} into cap=4 must hit MailboxFull at least once; snapshot={snap:?}"
+    // The mailbox never drains, so exactly `capacity` admit and the rest
+    // overflow — deterministically, every run.
+    assert_eq!(
+        snap.admitted, capacity as u32,
+        "exactly capacity sends admit into a non-draining mailbox; snapshot={snap:?}"
     );
+    assert_eq!(
+        snap.mailbox_full,
+        burst - capacity as u32,
+        "every send past capacity overflows as MailboxFull; snapshot={snap:?}"
+    );
+    assert_eq!(snap.mailbox_closed, 0);
+    assert_eq!(snap.worker_stopped, 0);
     assert_eq!(
         snap.admitted
             + snap.mailbox_full
@@ -141,6 +211,8 @@ fn try_send_outcome_overflow_marks_mailbox_full() {
         burst,
         "every send must show up in exactly one outcome bucket"
     );
+    // The isolate never ran (its mailbox reports empty): drain never happened.
+    assert_eq!(processed.load(Ordering::Acquire), 0);
 
     let _ = runtime.shutdown();
 }
