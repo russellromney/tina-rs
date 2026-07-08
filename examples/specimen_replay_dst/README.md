@@ -55,7 +55,7 @@ ReplayCase {
     scenario: "history-driven ticks fan out into a sink under seeded delivery delays",
     history: History::new("...", 42, vec![Op::Tick(0), ..., Op::Drain]),
     expected_event_count: 54,
-    expected_trace_hash: 0xc878_d2a4_3912_9480,
+    expected_trace_hash: 0xb968_e0f8_3f76_56b4,
     invariant: "every Tick op produces one SinkMsg::Got(value) in trace order",
 }
 ```
@@ -79,7 +79,7 @@ Replay case:
 - invariant:            every Tick op produces one SinkMsg::Got(value) in trace order
 - history (8 ops):      Tick(0), Tick(1), Tick(2), Drain, Tick(3), Tick(4), Tick(5), Drain
 - expected events:      54
-- expected hash:        0xc878d2a439129480
+- expected hash:        0xb968e0f83f7656b4
 - command:              cargo test --manifest-path examples/specimen_replay_dst/Cargo.toml
 ```
 
