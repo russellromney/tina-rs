@@ -18,7 +18,7 @@ mod shutdown;
 // Entrypoints exposed to the crate root / `main`. Submodules reach shared
 // helpers and each other's isolates through `super::` / sibling paths.
 pub use harness::{prove_drain_cancels_active_scope, run, run_soak};
-pub use serve::serve;
+pub use serve::{prove_graceful_drain_completes_in_flight, serve};
 
 // Caps are declared once in `crate::budget`; the startup summary reads the
 // two consts the manifest is built from (a test ties them to the rows).

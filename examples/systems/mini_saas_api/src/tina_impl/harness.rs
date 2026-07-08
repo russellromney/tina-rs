@@ -779,7 +779,7 @@ fn check_live_replay_case(
     check_captured_replay(&capture, &capture.to_replay_case(), runner).map(|_| ())
 }
 
-fn wait_for_capacity(
+pub(crate) fn wait_for_capacity(
     addr: std::net::SocketAddr,
     needle: &str,
     timeout: Duration,
