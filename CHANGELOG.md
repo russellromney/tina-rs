@@ -4,6 +4,55 @@ This file records completed work.
 
 ## Unreleased
 
+### Test Hardening
+
+- Drove the registry's deferred `Closed` and `Full` downstream outcomes through
+  the live `handle_call → defer(call(service)) → continuation → reply_to` path,
+  not just the pure outcome-to-reply mapping table. A service that stops mid-call
+  yields `Closed → RouterReply::Internal`; a service whose mailbox rejects the
+  mediated send yields `Full → RouterReply::Full`. Only the timeout arm had live
+  coverage before.
+- Added a real-path bridge e2e (`tina-rpc-tokio`): the tokio bridge drives the
+  production `tina_rpc::Client` isolate against a real `tina-rpc` server over a
+  loopback TCP socket and awaits a byte-exact reply. The existing bridge suite
+  substitutes a `ClientStub`, so the production client isolate was never
+  exercised over the wire.
+- Documented `BridgeGuard` in `tina-tokio-bridge` as send-only: it delegates
+  only `handle` and must never be a `call()` target. A clean `handle_call`
+  passthrough is not expressible (the inner isolate's `CallContext` cannot be
+  reconstructed from the guard's), so the invariant is stated rather than
+  silently relied upon.
+- Switched the streaming length-prefix math in the tina-rpc connection and
+  client read loops to `checked_add`, matching the sibling `frame::decode`.
+  Defense-in-depth parity: `body_len` is already capped at `max_frame_size`, so
+  no overflow is reachable on 64-bit.
+- Corrected the stale `expected_trace_hash` in the `specimen_replay_dst` README
+  to match the code constant and the actual run.
+- Made the HPACK panic-containment gate load-bearing. The `hpack_block_is_sound`
+  gate in front of `hpack::Decoder::decode` closes a pre-auth remote DoS, but
+  its wiring was untested: under the test profile's `panic = "unwind"` the
+  surrounding `catch_unwind` produced the same error a gate rejection does, so
+  deleting the gate left every test green while silently reintroducing the abort
+  under `panic = "abort"`. Two fixes: the `hpack_headers` fuzz target now drives
+  the real production decode entry instead of a private copy of the gate, so
+  removing the gate aborts the process under the fuzzer (and the fast-literal
+  path, which runs first on every inbound block, finally gets coverage); and a
+  deterministic unit test asserts the panic shapes are rejected *before* decode
+  via a gate-wiring counter that moves only when `catch_unwind` actually catches
+  a panic. Deleting the gate now fails a normal `cargo test`.
+- Folded the fuzz seed corpus and documented panic shapes into deterministic
+  unit tests so the panic-containment property has per-PR regression coverage:
+  the HPACK panic inputs through `decode_headers_block`, the chunked-decoder cap
+  invariant across every split feed, the h2 DATA/HEADERS payload views on
+  padded/truncated input, and the rpc frame decode on a truncated length prefix.
+- Extended the HPACK soundness differential past 2 bytes to all 3-byte
+  size-update blocks plus deterministic deep-continuation anchors — where the
+  real panic trigger lives — asserting walker-accepts implies decode-no-panic
+  and walker-rejects on the panic shapes.
+- Added a weekly (and manual) CI job that builds every fuzz target and runs each
+  for 60 s, so the fuzzers get continuous execution without gating each PR; the
+  per-PR shim check is now `--locked`.
+
 ### RPC Dispatch Fix
 
 - Fixed tina-rpc request/reply dispatch, which was broken end-to-end: every

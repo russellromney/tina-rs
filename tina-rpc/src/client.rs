@@ -679,7 +679,16 @@ where
             let mut prefix = [0u8; LENGTH_PREFIX_SIZE];
             prefix.copy_from_slice(&self.inbound[..LENGTH_PREFIX_SIZE]);
             let body_len = parse_length_prefix(prefix, &self.frame_limits())?;
-            let total = LENGTH_PREFIX_SIZE + body_len;
+            // checked_add mirrors frame::decode. body_len is capped at
+            // max_frame_size above, so this cannot overflow on 64-bit — keep the
+            // math explicit for parity with the sibling decode path.
+            let total =
+                LENGTH_PREFIX_SIZE
+                    .checked_add(body_len)
+                    .ok_or(DecodeError::BodyTooLarge {
+                        len: body_len,
+                        max: self.config.max_frame_size,
+                    })?;
             if self.inbound.len() < total {
                 return Ok(effects);
             }
