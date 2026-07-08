@@ -4475,8 +4475,8 @@ where
                 }
             }
             let registration_index = self.requester_registration_index(completion.call_id);
-            if let Some(previous) = last_registration_index {
-                if registration_index <= previous {
+            if let (Some(previous), Some(current)) = (last_registration_index, registration_index) {
+                if current <= previous {
                     batch_offset += 1;
                 }
             }
@@ -4485,7 +4485,7 @@ where
                 completion.result,
                 self.step_ordinal + batch_offset,
             );
-            last_registration_index = Some(registration_index);
+            last_registration_index = registration_index;
         }
     }
 
@@ -4662,8 +4662,8 @@ where
         {
             let entry = self.timers.remove(index);
             let registration_index = self.requester_registration_index(entry.call_id);
-            if let Some(previous) = last_registration_index {
-                if registration_index <= previous {
+            if let (Some(previous), Some(current)) = (last_registration_index, registration_index) {
+                if current <= previous {
                     batch_offset += 1;
                 }
             }
@@ -4672,7 +4672,7 @@ where
                 CallOutput::TimerFired,
                 self.step_ordinal + batch_offset,
             );
-            last_registration_index = Some(registration_index);
+            last_registration_index = registration_index;
         }
     }
 
@@ -5974,17 +5974,20 @@ where
             .collect()
     }
 
-    pub(crate) fn requester_registration_index(&self, call_id: CallId) -> usize {
-        let requester = self
-            .call_table
-            .driver_requester(call_id)
-            .unwrap_or_else(|| panic!("missing in-flight requester for call {call_id:?}"));
-        self.entries
-            .iter()
-            .position(|entry| {
-                entry.id == requester.isolate && entry.generation == requester.generation
-            })
-            .unwrap_or_else(|| panic!("missing registered requester for timer call {call_id:?}"))
+    /// Registration index of the isolate that owns `call_id`'s driver call,
+    /// used only to order batched completions deterministically.
+    ///
+    /// Returns `None` when the call is no longer tracked or its requester is
+    /// gone — a driver accounting inconsistency. The caller must not panic on
+    /// `None`: the completion still flows to `deliver_completion_at`, whose
+    /// quarantine path traces and drops it (parity with the live runtime, which
+    /// never kills a shard over a stray completion). A `None` call simply does
+    /// not participate in the batch-ordering bump.
+    pub(crate) fn requester_registration_index(&self, call_id: CallId) -> Option<usize> {
+        let requester = self.call_table.driver_requester(call_id)?;
+        self.entries.iter().position(|entry| {
+            entry.id == requester.isolate && entry.generation == requester.generation
+        })
     }
 }
 
