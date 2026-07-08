@@ -26,6 +26,9 @@ hpack = "=0.3.0"
 
 [dev-dependencies]
 tina-sim = { path = "../tina-sim" }
+# Fold the `rpc_frame` fuzz target's panic-containment property into the per-PR
+# suite: an integration test drives the shipped `decode`/`decode_body` directly.
+tina-rpc = { path = "../tina-rpc" }
 rustls = { version = "0.23", default-features = false, features = ["std", "ring"] }
 rustls-pki-types = "1"
 rcgen = "0.13"

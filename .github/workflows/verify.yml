@@ -5,10 +5,19 @@ on:
   push:
     branches:
       - main
+  # Weekly fuzz run (see the `fuzz` job) and a manual trigger. Per-PR fuzzing
+  # is too slow to gate on; the seed corpus is folded into deterministic unit
+  # tests (`tina-http` `fuzz_corpus_regression` + `http2` lib tests) so every
+  # PR still exercises the panic-containment property.
+  schedule:
+    - cron: "0 7 * * 1"
+  workflow_dispatch:
 
 jobs:
   verify:
     name: make verify (${{ matrix.os }})
+    # Per-PR / push gate only; the scheduled trigger runs the fuzz job instead.
+    if: github.event_name == 'pull_request' || github.event_name == 'push'
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -42,10 +51,47 @@ jobs:
       - name: Fuzz shim compiles
         # The `fuzzing` feature exposes decoder internals to the out-of-workspace
         # fuzz crate; nothing else in CI builds it, so guard against shim rot.
-        run: cargo check -p tina-http --features fuzzing
+        # `--locked` so a drifted lockfile fails here instead of silently.
+        run: cargo check -p tina-http --features fuzzing --locked
 
       - name: Verify workspace
         run: make verify
+
+  fuzz:
+    name: fuzz targets (60s each)
+    # Weekly + manual only: gives the coverage-guided fuzzers SOME continuous
+    # execution without gating every PR on them. This also compiles every
+    # `fuzz/fuzz_targets/*.rs` (the per-PR shim check only compiles the library
+    # feature, so a target itself can bit-rot silently otherwise).
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install pinned Rust toolchain
+        # The pin in rust-toolchain.toml is already nightly, which cargo-fuzz
+        # requires; rustup show syncs it.
+        run: rustup show
+
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+
+      - name: Build all fuzz targets
+        # Compile every target so a bit-rotted target fails the job even if its
+        # short run finds nothing.
+        working-directory: fuzz
+        run: cargo fuzz build
+
+      - name: Run each fuzz target for 60s
+        working-directory: fuzz
+        run: |
+          set -euo pipefail
+          for target in $(cargo fuzz list); do
+            echo "::group::fuzz $target"
+            cargo fuzz run "$target" -- -max_total_time=60
+            echo "::endgroup::"
+          done
 
   # `make verify-examples` lives in the Makefile for local sweeps but
   # is intentionally not a per-PR gate: 35+ independent example crates ×

@@ -124,7 +124,10 @@ pub(super) struct HeaderBlock {
     pub(super) grpc_message: Option<String>,
 }
 
-#[cfg(test)]
+// Exposed to the fuzz harness too (not just unit tests): the `hpack_headers`
+// fuzz target drives this REAL entry so the shipped gate is load-bearing under
+// `panic = "abort"` and the first-run fast-literal path gets coverage.
+#[cfg(any(test, feature = "fuzzing"))]
 pub(super) fn decode_headers_block(
     block: &[u8],
     max_header_bytes: usize,
@@ -264,7 +267,18 @@ fn decode_headers_block_with_storage(
         return Err(Http2ProtocolError::HpackUnsupported);
     }
     let decoded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| decoder.decode(block)))
-        .map_err(|_| Http2ProtocolError::HpackUnsupported)?
+        .map_err(|_| {
+            // Gate-wiring guard: this arm fires ONLY when `decode` actually
+            // panicked and `catch_unwind` contained it — i.e. the `hpack_block_is_sound`
+            // gate above let a panic input through. With the gate in place this
+            // is unreachable for every input; the counter must stay 0. A test
+            // feeds the known panic shapes and asserts the count does NOT move,
+            // so deleting the gate (letting the panic reach `catch_unwind`)
+            // makes that test fail instead of silently passing under
+            // `panic = "unwind"`.
+            record_hpack_catch_unwind_hit();
+            Http2ProtocolError::HpackUnsupported
+        })?
         .map_err(|_| Http2ProtocolError::HpackUnsupported)?;
 
     let mut out = HeaderBlock::default();
@@ -561,6 +575,28 @@ thread_local! {
     pub(super) static PUBLIC_HEADER_CONSTRUCTIONS: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
 }
+
+// Gate-wiring guard: process-global count of caught HPACK decode panics. Only
+// the `catch_unwind` Err arm bumps it, so with the soundness gate in place it
+// stays 0 for every input. A test asserts it does not move while decoding the
+// known panic shapes — proving the gate rejected them, not `catch_unwind`.
+#[cfg(test)]
+static HPACK_CATCH_UNWIND_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(test)]
+fn record_hpack_catch_unwind_hit() {
+    HPACK_CATCH_UNWIND_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(test)]
+fn hpack_catch_unwind_hits() -> u64 {
+    HPACK_CATCH_UNWIND_HITS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+// No-op in non-test builds: the guard has no production cost.
+#[cfg(not(test))]
+#[inline(always)]
+fn record_hpack_catch_unwind_hit() {}
 
 pub(super) fn parse_content_length(value: &str) -> Result<usize, Http2ProtocolError> {
     // RFC 9110 §8.6: content-length is a single nonnegative decimal integer.
@@ -1147,6 +1183,95 @@ mod tests {
         assert!(matches!(result, Err(Http2ProtocolError::HpackUnsupported)));
     }
 
+    // The three genuine `hpack` panic shapes, matching the fuzz seed corpus
+    // (`fuzz/corpus/hpack_headers/seed-*`): a size-update opener with no
+    // continuation, an unterminated continuation, and an over-long (>5 octet)
+    // integer. Each panics `hpack::Decoder::decode` un-gated.
+    const HPACK_PANIC_SHAPES: [&[u8]; 3] = [
+        &[0x3f],                               // seed-truncated-size-update
+        &[0x3f, 0x85],                         // seed-unterminated-size-update
+        &[0x3f, 0xff, 0xff, 0xff, 0xff, 0xff], // seed-toolong-size-update
+    ];
+
+    #[test]
+    fn hpack_gate_rejects_before_decode_not_via_catch_unwind() {
+        // The gate's whole value lives under `panic = "abort"`, where
+        // `catch_unwind` cannot save the process. Under the test profile
+        // (`panic = "unwind"`) a removed gate is invisible through the result
+        // alone: `catch_unwind` still turns the panic into the same
+        // `Err(HpackUnsupported)` a gate rejection produces. So assert on the
+        // gate-wiring counter instead: it moves only when `catch_unwind`
+        // actually caught a panic. With the gate present it must stay put while
+        // decoding every panic shape — proving the gate rejected the block
+        // *before* the decoder ran. Delete the `hpack_block_is_sound` gate and
+        // this test fails (the counter moves); restore it and it passes.
+        let before = hpack_catch_unwind_hits();
+        for shape in HPACK_PANIC_SHAPES {
+            let result = decode_headers_block(shape, 4096);
+            assert!(
+                matches!(result, Err(Http2ProtocolError::HpackUnsupported)),
+                "panic shape {shape:02x?} must surface a typed error"
+            );
+        }
+        assert_eq!(
+            hpack_catch_unwind_hits(),
+            before,
+            "the gate must reject the panic shapes before decode; catch_unwind must not fire"
+        );
+    }
+
+    #[test]
+    fn hpack_seed_corpus_decodes_to_expected_outcomes() {
+        // Fold the fuzz seed corpus into a deterministic regression: the three
+        // panic shapes surface a typed error through the REAL decode entry, and
+        // the one well-formed seed (`seed-indexed-ok`, indexed `:method: GET`)
+        // decodes cleanly. This gives the per-PR suite the containment coverage
+        // the unscheduled fuzzer otherwise provides.
+        for shape in HPACK_PANIC_SHAPES {
+            assert!(
+                matches!(
+                    decode_headers_block(shape, 4096),
+                    Err(Http2ProtocolError::HpackUnsupported)
+                ),
+                "panic shape {shape:02x?} must not panic and must be a typed error"
+            );
+        }
+        let decoded = decode_headers_block(&[0x82], 4096).expect("indexed :method GET decodes");
+        assert_eq!(decoded.method, Some(Method::GET));
+    }
+
+    #[test]
+    fn fast_literal_path_contains_wellformed_and_malformed_inputs() {
+        // The fast-literal path (`decode_fast_literal_headers` →
+        // `decode_plain_hpack_string` → `decode_hpack_integer_7`) runs first on
+        // every inbound block and is pre-auth. Feed both a well-formed literal
+        // block and malformed variants through the REAL entry: the good one
+        // decodes, the bad ones surface a typed error, none panic.
+        let mut good = Vec::new();
+        encode_literal_header(":method", "GET", &mut good);
+        encode_literal_header(":path", "/x", &mut good);
+        encode_literal_header("host", "example.com", &mut good);
+        let decoded = decode_headers_block(&good, 4096).expect("well-formed literal block decodes");
+        assert_eq!(decoded.method, Some(Method::GET));
+        assert_eq!(decoded.path.as_deref(), Some("/x"));
+
+        let malformed: [&[u8]; 4] = [
+            &[0x00],                   // literal opener, no name string
+            &[0x00, 0x04, b'a'],       // name length 4, only one octet present
+            &[0x00, 0x01, b'a', 0x02], // value length 2, zero octets present
+            &[
+                0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+            ], // overlong length int
+        ];
+        for block in malformed {
+            let result = decode_headers_block(block, 4096);
+            assert!(
+                result.is_err(),
+                "malformed fast-literal block {block:02x?} must be a typed error, not a panic"
+            );
+        }
+    }
+
     #[test]
     fn soundness_walker_rejects_the_size_update_panic_inputs() {
         // The two shapes that make `hpack`'s size-update path unwrap an
@@ -1212,5 +1337,74 @@ mod tests {
                 Ok(false) => {} // graceful decode error: walker may accept or reject.
             }
         }
+    }
+
+    #[test]
+    fn walker_gates_deep_size_update_continuations_against_the_real_decoder() {
+        // The real panic trigger is a dynamic-table-size-update (opener `0x3f`,
+        // prefix-5 value 31) with a continuation that never terminates or runs
+        // past `hpack`'s 5-octet ceiling — a >=3-byte shape the 1-/2-byte
+        // exhaustive sweep cannot reach. Exhaustive differential over `0x3f`
+        // followed by every 1- and 2-byte continuation tail (all 3-byte
+        // size-update blocks): the walker must never admit a block that panics
+        // `decode` (soundness) and never reject one `decode` accepts cleanly
+        // (completeness). Depth is capped at 2 continuation bytes so the sweep
+        // stays a fast per-PR test; the >=4-byte panic shapes are pinned as
+        // deterministic anchors in the sibling test.
+        fn decode_outcome(block: &[u8]) -> Result<bool, ()> {
+            std::panic::catch_unwind(|| {
+                let mut decoder = hpack::Decoder::new();
+                decoder.decode(block).is_ok()
+            })
+            .map_err(|_| ())
+        }
+        let mut blocks: Vec<Vec<u8>> = Vec::new();
+        for len in 1u32..=2 {
+            let combos = 1u32 << (8 * len);
+            for n in 0..combos {
+                let mut block = vec![0x3f];
+                block.extend_from_slice(&n.to_le_bytes()[..len as usize]);
+                blocks.push(block);
+            }
+        }
+        // The documented over-long shape plus a few deep unterminated runs.
+        blocks.push(vec![0x3f, 0xff, 0xff, 0xff, 0xff, 0xff]);
+        blocks.push(vec![0x3f, 0x80, 0x80, 0x80, 0x80]);
+        for block in blocks {
+            let sound = hpack_block_is_sound(&block);
+            match decode_outcome(&block) {
+                Err(()) => assert!(
+                    !sound,
+                    "walker admitted a size-update block that panics decode: {block:02x?}"
+                ),
+                Ok(true) => assert!(
+                    sound,
+                    "walker rejected a size-update block decode accepts: {block:02x?}"
+                ),
+                Ok(false) => {}
+            }
+        }
+    }
+
+    #[test]
+    fn walker_rejects_deep_continuation_panic_shapes_and_accepts_terminated_ones() {
+        // Deterministic anchors for the sweep above: the panic shapes the walker
+        // must reject, and a well-terminated deep continuation it must accept and
+        // `decode` must not panic on.
+        assert!(!hpack_block_is_sound(&[0x3f, 0x80, 0x80])); // unterminated, 3 bytes
+        assert!(!hpack_block_is_sound(&[0x3f, 0x80, 0x80, 0x80, 0x80])); // >5 octets
+        assert!(!hpack_block_is_sound(&[0x3f, 0xff, 0xff, 0xff, 0xff, 0xff])); // over-long
+        // A terminated size-update (continuation high bit clear): sound, and
+        // `decode` handles it without panicking.
+        let terminated = [0x3f, 0x00];
+        assert!(hpack_block_is_sound(&terminated));
+        assert!(
+            std::panic::catch_unwind(|| {
+                let mut decoder = hpack::Decoder::new();
+                decoder.decode(&terminated)
+            })
+            .is_ok(),
+            "terminated size-update must not panic decode"
+        );
     }
 }

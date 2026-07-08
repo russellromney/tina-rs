@@ -4,6 +4,33 @@ This file records completed work.
 
 ## Unreleased
 
+### Test Hardening
+
+- Made the HPACK panic-containment gate load-bearing. The `hpack_block_is_sound`
+  gate in front of `hpack::Decoder::decode` closes a pre-auth remote DoS, but
+  its wiring was untested: under the test profile's `panic = "unwind"` the
+  surrounding `catch_unwind` produced the same error a gate rejection does, so
+  deleting the gate left every test green while silently reintroducing the abort
+  under `panic = "abort"`. Two fixes: the `hpack_headers` fuzz target now drives
+  the real production decode entry instead of a private copy of the gate, so
+  removing the gate aborts the process under the fuzzer (and the fast-literal
+  path, which runs first on every inbound block, finally gets coverage); and a
+  deterministic unit test asserts the panic shapes are rejected *before* decode
+  via a gate-wiring counter that moves only when `catch_unwind` actually catches
+  a panic. Deleting the gate now fails a normal `cargo test`.
+- Folded the fuzz seed corpus and documented panic shapes into deterministic
+  unit tests so the panic-containment property has per-PR regression coverage:
+  the HPACK panic inputs through `decode_headers_block`, the chunked-decoder cap
+  invariant across every split feed, the h2 DATA/HEADERS payload views on
+  padded/truncated input, and the rpc frame decode on a truncated length prefix.
+- Extended the HPACK soundness differential past 2 bytes to all 3-byte
+  size-update blocks plus deterministic deep-continuation anchors — where the
+  real panic trigger lives — asserting walker-accepts implies decode-no-panic
+  and walker-rejects on the panic shapes.
+- Added a weekly (and manual) CI job that builds every fuzz target and runs each
+  for 60 s, so the fuzzers get continuous execution without gating each PR; the
+  per-PR shim check is now `--locked`.
+
 ### RPC Dispatch Fix
 
 - Fixed tina-rpc request/reply dispatch, which was broken end-to-end: every
