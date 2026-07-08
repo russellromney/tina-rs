@@ -62,6 +62,14 @@ impl ShutdownTrip {
         self.signalled.notify_all();
     }
 
+    /// Whether a signal has already tripped the switch.
+    fn is_tripped(&self) -> bool {
+        self.state
+            .lock()
+            .expect("shutdown trip mutex poisoned")
+            .is_some()
+    }
+
     /// Park until a signal trips the switch; returns the signal name.
     fn wait(&self) -> &'static str {
         let mut state = self.state.lock().expect("shutdown trip mutex poisoned");
@@ -81,9 +89,11 @@ enum SignalMsg {
     Received(&'static str, SignalWaitReply),
 }
 
-/// Waits on SIGINT / SIGTERM through the runtime's `signal_wait` rail and
-/// trips [`ShutdownTrip`] on the first delivery. Re-arms on timeout; a
-/// re-armed wait outstanding at teardown is cancelled with the runtime.
+/// Waits on SIGINT / SIGTERM through the runtime's `signal_wait` rail. The
+/// first delivery trips [`ShutdownTrip`] to start the graceful drain; a
+/// second delivery force-exits (double Ctrl-C). Re-arms on timeout and after
+/// the first signal; a re-armed wait outstanding at teardown is cancelled
+/// with the runtime.
 struct SignalWatcher {
     trip: Arc<ShutdownTrip>,
 }
@@ -99,8 +109,21 @@ impl SignalWatcher {
             SignalMsg::Arm(name) => signal_wait(name, SIGNAL_REARM_TIMEOUT)
                 .then(move |reply| SignalMsg::Received(name, reply)),
             SignalMsg::Received(name, Ok(_)) => {
+                if self.trip.is_tripped() {
+                    // Second signal while the first drain is already running on
+                    // the main thread (double Ctrl-C): operators expect this to
+                    // stop now, so force-exit rather than finish the bounded
+                    // drain. 130 = 128 + SIGINT, the conventional interrupted
+                    // exit code.
+                    eprintln!("serve: second signal ({name}); forcing immediate exit");
+                    std::process::exit(130);
+                }
                 self.trip.trip(name);
-                noop()
+                // Re-arm this signal so a *repeat* of it (the first delivery of
+                // the other signal is already parked) reaches the force-exit
+                // branch above.
+                signal_wait(name, SIGNAL_REARM_TIMEOUT)
+                    .then(move |reply| SignalMsg::Received(name, reply))
             }
             // Timeout re-arm. `signal-hook` latches a pending signal in a
             // persistent `AtomicBool`, so a signal that arrives during the
@@ -294,16 +317,31 @@ impl ServiceInstance {
             }
         }
 
-        // Bounded drain-wait. The notify scope set is the only in-flight path
-        // that holds an outbound pool lease, so waiting its `in_use` down to
-        // zero lets each admitted notify run its flow to the `Released` step —
-        // sending the real response and returning the lease. Poll, do not
-        // cancel: cancelling here would strand the lease.
+        // Bounded drain-wait: let already-admitted work finish on its own
+        // before tearing anything down. Poll, do not cancel — cancelling here
+        // is what stranded the pool lease.
+        //
+        // Two in-flight shapes matter:
+        //   * A notify request holds a cross-turn *resource* — an outbound
+        //     keepalive lease returned only when its flow reaches `Released`.
+        //     Its scope stays in the set for that whole window, so
+        //     `notify.in_use` is the signal that it (and its lease) is done.
+        //   * A plain GET/POST/`/ready` holds no cross-turn resource; it only
+        //     has a SQLite query in flight. `db.leased` (0/1 on the serial
+        //     worker) is the signal that query is still executing.
+        // Waiting both to zero means the bridge is idle and no lease is out,
+        // so the teardown below closes nothing out from under live work.
+        //
+        // Residual (bounded, clean): a request whose SQLite op is still queued
+        // in the bridge mailbox — not yet `leased` — when the deadline fires
+        // sheds with a typed `503 db_closed`, never a 500 or a silent drop.
+        // The runtime shutdown reclaims any such pending call without leaking.
         let t_drain = Instant::now();
         let deadline = Instant::now() + drain_deadline;
         loop {
             let (_, in_use, _, _) = self.scope_metrics.snapshot();
-            if in_use == 0 {
+            let db_leased = self.sqlite.metrics.pressure_report().leased;
+            if in_use == 0 && db_leased == 0 {
                 choreo.record(
                     ShutdownStep::DrainInFlight,
                     "drain_in_flight",
@@ -318,7 +356,9 @@ impl ServiceInstance {
                     "drain_in_flight",
                     t_drain.elapsed(),
                     StepOutcome::Failed {
-                        reason: format!("{in_use} notify scope(s) still in flight at deadline"),
+                        reason: format!(
+                            "still in flight at deadline: notify_scopes={in_use} db_leased={db_leased}"
+                        ),
                     },
                 );
                 break;
