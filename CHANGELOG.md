@@ -4,6 +4,31 @@ This file records completed work.
 
 ## Unreleased
 
+### Test Hardening
+
+- Drove the registry's deferred `Closed` and `Full` downstream outcomes through
+  the live `handle_call → defer(call(service)) → continuation → reply_to` path,
+  not just the pure outcome-to-reply mapping table. A service that stops mid-call
+  yields `Closed → RouterReply::Internal`; a service whose mailbox rejects the
+  mediated send yields `Full → RouterReply::Full`. Only the timeout arm had live
+  coverage before.
+- Added a real-path bridge e2e (`tina-rpc-tokio`): the tokio bridge drives the
+  production `tina_rpc::Client` isolate against a real `tina-rpc` server over a
+  loopback TCP socket and awaits a byte-exact reply. The existing bridge suite
+  substitutes a `ClientStub`, so the production client isolate was never
+  exercised over the wire.
+- Documented `BridgeGuard` in `tina-tokio-bridge` as send-only: it delegates
+  only `handle` and must never be a `call()` target. A clean `handle_call`
+  passthrough is not expressible (the inner isolate's `CallContext` cannot be
+  reconstructed from the guard's), so the invariant is stated rather than
+  silently relied upon.
+- Switched the streaming length-prefix math in the tina-rpc connection and
+  client read loops to `checked_add`, matching the sibling `frame::decode`.
+  Defense-in-depth parity: `body_len` is already capped at `max_frame_size`, so
+  no overflow is reachable on 64-bit.
+- Corrected the stale `expected_trace_hash` in the `specimen_replay_dst` README
+  to match the code constant and the actual run.
+
 ### RPC Dispatch Fix
 
 - Fixed tina-rpc request/reply dispatch, which was broken end-to-end: every
