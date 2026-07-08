@@ -626,6 +626,16 @@ pub fn emit_event(event: &RuntimeEvent) {
             isolate,
             fact = ?fact,
         ),
+        RuntimeEventKind::DriverCompletionQuarantined { call_id } => event!(
+            target: RUNTIME_TRACE_TARGET,
+            Level::WARN,
+            kind = "driver_completion_quarantined",
+            event_id,
+            cause_id = ?cause_id,
+            shard,
+            isolate,
+            call_id = call_id.get(),
+        ),
     }
 }
 

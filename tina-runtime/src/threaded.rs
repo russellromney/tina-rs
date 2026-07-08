@@ -128,6 +128,14 @@ pub struct ThreadedRuntimeConfig {
     /// during shutdown. When the budget elapses, shutdown returns even if
     /// some lane work could not finish.
     pub shutdown_lane_drain_timeout: Duration,
+
+    /// Upper bound on how long a host-control command
+    /// ([`ThreadedRuntime`] introspection/setup) may wait for the worker to
+    /// answer before returning [`ThreadedRuntimeError::WorkerUnresponsive`].
+    /// Bounds the blast radius of a wedged or runaway user handler: without it a
+    /// single handler that never returns wedges every host thread forever.
+    /// Generous by default so it never bites a healthy but busy worker.
+    pub control_call_timeout: Duration,
 }
 
 impl Default for ThreadedRuntimeConfig {
@@ -153,9 +161,16 @@ impl Default for ThreadedRuntimeConfig {
             hot_drain_max_elapsed: DEFAULT_HOT_DRAIN_MAX_ELAPSED,
             driver_completion_drain_budget: crate::DEFAULT_DRIVER_COMPLETION_DRAIN_BUDGET,
             shutdown_lane_drain_timeout: DEFAULT_SHUTDOWN_LANE_DRAIN_TIMEOUT,
+            control_call_timeout: DEFAULT_CONTROL_CALL_TIMEOUT,
         }
     }
 }
+
+/// Default host-control-call timeout. Generous so a healthy but busy worker is
+/// never cut off; low enough that a wedged handler surfaces as
+/// [`ThreadedRuntimeError::WorkerUnresponsive`] in tens of seconds instead of
+/// hanging the host forever.
+pub const DEFAULT_CONTROL_CALL_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Default hot-drain round cap: high enough that any single small local
 /// call/HTTP turn finishes without an artificial re-poll, low enough to bound a
@@ -333,6 +348,8 @@ where
     dispatcher_next: Arc<std::sync::atomic::AtomicUsize>,
     metrics: Arc<LiveShardMetrics>,
     shutdown: Arc<SharedShutdownState<S, F>>,
+    /// Upper bound on a host-control `call` awaiting the worker's reply.
+    control_call_timeout: Duration,
 }
 
 impl<S, F> ThreadedRuntime<S, F>
@@ -499,6 +516,7 @@ where
             dispatcher_next,
             metrics,
             shutdown,
+            control_call_timeout: config.control_call_timeout,
         }
     }
 
@@ -657,10 +675,13 @@ where
             Err(ThreadedRuntimeError::DriverShutdownFailed)
             | Err(ThreadedRuntimeError::DriverParkFailed)
             | Err(ThreadedRuntimeError::CommandFull)
-            | Err(ThreadedRuntimeError::HostWaitTimeout) => {
+            | Err(ThreadedRuntimeError::HostWaitTimeout)
+            | Err(ThreadedRuntimeError::WorkerUnresponsive) => {
                 // `call` is blocking-admission, so `CommandFull` is
-                // unreachable today. Map defensively in case the inner
-                // helper is ever migrated.
+                // unreachable today. `WorkerUnresponsive` means the worker
+                // accepted the register command but never answered — from the
+                // caller's view the isolate is not usable, same as stopped.
+                // Map defensively in case the inner helper is ever migrated.
                 Err(ThreadedRegisterBootstrapError::WorkerStopped)
             }
         }
@@ -1590,10 +1611,22 @@ where
                 self.metrics.set_state(LiveShardState::Failed);
                 ThreadedRuntimeError::WorkerStopped
             })?;
-        reply_rx.recv().map_err(|_| {
-            self.metrics.set_state(LiveShardState::Failed);
-            ThreadedRuntimeError::WorkerStopped
-        })
+        // Bounded wait: a wedged or runaway handler must not hang the host
+        // thread forever. RecvError means the worker dropped the sender
+        // (stopped); Timeout means it accepted the command but did not answer
+        // in time. Both mark the shard Failed, but only the latter leaves the
+        // command potentially still running on the worker.
+        match reply_rx.recv_timeout(self.control_call_timeout) {
+            Ok(reply) => Ok(reply),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                self.metrics.set_state(LiveShardState::Failed);
+                Err(ThreadedRuntimeError::WorkerUnresponsive)
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                self.metrics.set_state(LiveShardState::Failed);
+                Err(ThreadedRuntimeError::WorkerStopped)
+            }
+        }
     }
 }
 

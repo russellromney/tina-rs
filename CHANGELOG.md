@@ -21,6 +21,25 @@ This file records completed work.
 - Added glossary entries for `rail`, `first-form`, `fact`, `battery`, and
   `specimen`, and pointed the README quickstart at `hello_world` first.
 
+### Runtime Hardening
+
+- Folded the runtime's three parallel in-flight-call structures (in-flight
+  calls, translators, pending isolate calls) and their index maps into one
+  `CallTable` keyed by call id, with each call's translator stored inline. This
+  removes the "missing translator" / "already consumed" panics that a driver
+  accounting bug could trip to kill the whole shard thread.
+- A driver completion for a call the runtime no longer tracks is now quarantined
+  — traced as a new event and dropped — instead of panicking, so one buggy
+  driver can no longer tear down unrelated isolates on the same shard.
+  Wrong-message-type delivery still panics, since continuing past type confusion
+  is worse than aborting. The simulator mirrors both the storage and the
+  quarantine behavior so replay parity holds.
+- Bounded the host control plane: `ThreadedRuntime` host calls (and the
+  multi-shard equivalents) now wait at most a configurable `control_call_timeout`
+  (default 30s) for the worker to answer, returning the new
+  `ThreadedRuntimeError::WorkerUnresponsive` instead of hanging forever behind a
+  wedged or runaway handler.
+
 ### Continuation Flow Authoring
 
 - Added `tina::flow!`, which generates explicit continuation enums and

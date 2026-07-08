@@ -63,6 +63,8 @@ where
     shard_metrics: BTreeMap<ShardId, Arc<LiveShardMetrics>>,
     remote_metrics: BTreeMap<(ShardId, ShardId), Arc<LiveQueueMetrics>>,
     shutdown: Arc<SharedShutdownState<S, F>>,
+    /// Upper bound on a per-shard host-control `call_on` awaiting the reply.
+    control_call_timeout: Duration,
 }
 
 struct ThreadedRemoteWiring {
@@ -346,6 +348,7 @@ where
             shard_metrics,
             remote_metrics,
             shutdown,
+            control_call_timeout: config.control_call_timeout,
         }
     }
 
@@ -412,10 +415,13 @@ where
             Err(ThreadedRuntimeError::DriverShutdownFailed)
             | Err(ThreadedRuntimeError::DriverParkFailed)
             | Err(ThreadedRuntimeError::CommandFull)
-            | Err(ThreadedRuntimeError::HostWaitTimeout) => {
+            | Err(ThreadedRuntimeError::HostWaitTimeout)
+            | Err(ThreadedRuntimeError::WorkerUnresponsive) => {
                 // `call_on` is blocking-admission, so `CommandFull` is
-                // unreachable today. Map defensively in case the inner
-                // helper is ever migrated.
+                // unreachable today. `WorkerUnresponsive` means the shard
+                // accepted the register command but never answered — the
+                // isolate is unusable, same as stopped. Map defensively in case
+                // the inner helper is ever migrated.
                 Err(ThreadedRegisterBootstrapError::WorkerStopped)
             }
         }
@@ -849,12 +855,22 @@ where
                 }
                 ThreadedRuntimeError::WorkerStopped
             })?;
-        reply_rx.recv().map_err(|_| {
-            if let Some(metrics) = self.shard_metrics.get(&shard) {
-                metrics.set_state(LiveShardState::Failed);
+        // Bounded wait: a wedged handler on one shard must not hang the host.
+        match reply_rx.recv_timeout(self.control_call_timeout) {
+            Ok(reply) => Ok(reply),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                if let Some(metrics) = self.shard_metrics.get(&shard) {
+                    metrics.set_state(LiveShardState::Failed);
+                }
+                Err(ThreadedRuntimeError::WorkerUnresponsive)
             }
-            ThreadedRuntimeError::WorkerStopped
-        })
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                if let Some(metrics) = self.shard_metrics.get(&shard) {
+                    metrics.set_state(LiveShardState::Failed);
+                }
+                Err(ThreadedRuntimeError::WorkerStopped)
+            }
+        }
     }
 }
 

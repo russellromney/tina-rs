@@ -28,6 +28,11 @@ pub enum ThreadedRuntimeError {
     /// outcome arrived. The target call remains governed by its own call
     /// deadline.
     HostWaitTimeout,
+    /// The worker accepted a host-control command but did not answer it within
+    /// the control-call timeout — a wedged or runaway handler is monopolising
+    /// the shard thread. The shard is marked `Failed`; the command may still be
+    /// running on the worker.
+    WorkerUnresponsive,
 }
 
 impl fmt::Display for ThreadedRuntimeError {
@@ -63,6 +68,12 @@ impl fmt::Display for ThreadedRuntimeError {
                 write!(
                     f,
                     "host wait budget elapsed before target call outcome was delivered"
+                )
+            }
+            Self::WorkerUnresponsive => {
+                write!(
+                    f,
+                    "worker did not answer a host-control command within the control-call timeout"
                 )
             }
         }
@@ -369,6 +380,10 @@ mod tests {
         assert_error(ThreadedRuntimeError::DriverParkFailed, "worker park");
         assert_error(ThreadedRuntimeError::CommandFull, "command queue is full");
         assert_error(ThreadedRuntimeError::HostWaitTimeout, "host wait budget");
+        assert_error(
+            ThreadedRuntimeError::WorkerUnresponsive,
+            "control-call timeout",
+        );
     }
 
     #[test]
