@@ -33,10 +33,13 @@ This file records completed work.
 - Added a `fuzz/` crate (excluded from the workspace) with coverage-guided
   targets for the hand-rolled decoders: chunked bodies, HTTP/1 request and
   response heads, the RPC frame codec, and HTTP/2 frame headers.
-- Contained an attacker-reachable panic in HTTP/2 HPACK decoding: a truncated
-  dynamic-table-size update made the `hpack` crate unwrap a failed integer
-  decode and panic; the header decode now maps that to a protocol error on the
-  default unwind build. See `fuzz/README.md` for the residual panic=abort caveat.
+- Closed an attacker-reachable, pre-auth panic in HTTP/2 HPACK decoding. A
+  truncated or over-long dynamic-table-size-update integer made the `hpack`
+  crate unwrap a failed decode and panic inside `decode` — a process abort on
+  `panic = "abort"` builds, i.e. a remote DoS. The decoder is now gated behind
+  a structural soundness walker that rejects exactly the inputs `hpack` would
+  fault on, under every panic strategy; a differential fuzz target proves the
+  walker never admits a panicking block.
 
 ### CI Dependency Hygiene
 

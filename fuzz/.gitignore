@@ -1,0 +1,7 @@
+# Build output and crash artifacts.
+/target
+/artifacts
+
+# Generated corpus: only the named seed-* files are tracked.
+/corpus/*/*
+!/corpus/*/seed-*

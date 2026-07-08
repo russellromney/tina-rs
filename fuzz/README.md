@@ -20,17 +20,25 @@ cargo +nightly fuzz run <target> -- -max_total_time=60
 | `http1_response_head` | `parse_response_head` under default limits. |
 | `rpc_frame` | `decode` (full frame, default limits) and `decode_body` (trusts the length prefix). |
 | `h2_frame_meta` | HTTP/2 frame-header decode + max-frame-size rejection. |
+| `hpack_headers` | The HPACK soundness walker vs `hpack::Decoder::decode` — see below. |
 
-`h2_frame_meta` reaches `pub(super)` internals through the `fuzzing` feature
-on `tina-http` (`http2::fuzzing`), which is never enabled in production.
+`h2_frame_meta` and `hpack_headers` reach `pub(super)` internals through the
+`fuzzing` feature on `tina-http` (`http2::fuzzing`), never enabled in
+production.
 
-## Known finding, not yet covered here
+## The `hpack_headers` target
 
-An HPACK header-block target is intentionally absent. Fuzzing found that the
-third-party `hpack` crate `.ok().unwrap()`s a truncated dynamic-table-size
-update and panics inside `decode`. `decode_headers_block_with_storage` now
-contains that panic with `catch_unwind` and maps it to a protocol error, so
-the default (`panic = "unwind"`) build returns a clean error — but a service
-built with `panic = "abort"` would still abort on that input. The complete
-fix (replace or pre-validate ahead of `hpack`) is tracked separately; the
-target returns once the decode path is panic-free under both strategies.
+The third-party `hpack` crate `.ok().unwrap()`s a failed integer decode in its
+dynamic-table-size-update path, so a truncated or over-long size-update integer
+panics *inside* `decode` — attacker-reachable and pre-auth. `catch_unwind` only
+contains that on `panic = "unwind"` builds; under `panic = "abort"` it aborts
+the process. So `tina-http` gates the decoder behind `hpack_block_is_sound`, a
+structural walker that rejects exactly the inputs that would make `hpack`'s
+`decode_integer` return `Err` (the only panic trigger), under every panic
+strategy.
+
+This target mirrors the production guard: it decodes only when the walker
+accepts. Under the fuzzer's `panic = "abort"` it crashes precisely when the
+walker is unsound (admits a block that panics `decode`), so a clean run is
+evidence the walker is complete. The seed corpus pins the three panic inputs
+(truncated, unterminated, and over-long size updates).

@@ -41,6 +41,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "hpack_headers"
+path = "fuzz_targets/hpack_headers.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "h2_frame_meta"
 path = "fuzz_targets/h2_frame_meta.rs"
 test = false

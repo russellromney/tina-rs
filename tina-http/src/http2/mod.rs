@@ -38,6 +38,18 @@ pub use target::{AlpnProtocols, Http2Target};
 pub mod fuzzing {
     use super::errors::Http2ProtocolError;
 
+    /// Mirrors the production guard: feed a block to `hpack::Decoder::decode`
+    /// only when the soundness walker accepts it. Under the fuzzer's
+    /// `panic = "abort"`, this aborts the process — a fuzzer-visible crash —
+    /// exactly when the walker wrongly admits a block that panics `decode`.
+    /// A walker that is complete never crashes here regardless of input.
+    pub fn fuzz_hpack_guarded_decode(block: &[u8]) {
+        if super::headers::hpack_block_is_sound(block) {
+            let mut decoder = hpack::Decoder::new();
+            let _ = decoder.decode(block);
+        }
+    }
+
     /// Decodes one frame header + length check, as the read loop does.
     pub fn fuzz_decode_frame_meta(
         buffer: &[u8],

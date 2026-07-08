@@ -151,6 +151,91 @@ pub(super) fn decode_headers_block_compact_with(
     decode_headers_block_with_storage(decoder, block, max_header_bytes, false, path_cache)
 }
 
+/// HPACK integer decode (RFC 7541 §5.1) mirroring `hpack`'s own
+/// `decode_integer`, including its 5-octet ceiling. Returns `(value, consumed)`
+/// on success, or `None` for the exact inputs that make `hpack` return `Err`:
+/// an empty buffer, an unterminated continuation, or a too-long encoding.
+fn hpack_take_integer(buf: &[u8], prefix_bits: u8) -> Option<(usize, usize)> {
+    const OCTET_LIMIT: usize = 5;
+    let &first = buf.first()?;
+    let mask = (1usize << prefix_bits) - 1;
+    let mut value = usize::from(first) & mask;
+    if value < mask {
+        return Some((value, 1));
+    }
+    let mut total = 1;
+    let mut shift = 0u32;
+    for &b in &buf[1..] {
+        total += 1;
+        value = value.checked_add(usize::from(b & 0x7f).checked_shl(shift)?)?;
+        shift += 7;
+        if b & 0x80 == 0 {
+            return Some((value, total));
+        }
+        if total == OCTET_LIMIT {
+            // Too many octets: `hpack` returns `Err` here, which its
+            // size-update path then unwraps into a panic.
+            return None;
+        }
+    }
+    None
+}
+
+/// Advances past one HPACK string: a length integer (7-bit prefix) followed by
+/// that many raw octets. Returns the remaining buffer, or `None` if the length
+/// integer or the octets run past the end.
+fn hpack_skip_string(buf: &[u8]) -> Option<&[u8]> {
+    let (len, consumed) = hpack_take_integer(buf, 7)?;
+    let total = consumed.checked_add(len)?;
+    if total > buf.len() {
+        return None;
+    }
+    Some(&buf[total..])
+}
+
+/// Walks an HPACK header block the same way `hpack::Decoder::decode` does,
+/// verifying every representation's integers and string lengths are complete
+/// and in-bounds. A `true` result guarantees `decode` cannot hit the
+/// `.ok().unwrap()` panic in its size-update path; a `false` result covers
+/// exactly the malformed inputs `decode` would reject or panic on. Structural
+/// only — it does not validate table indices or Huffman content, which
+/// `decode` already reports as ordinary errors.
+pub(super) fn hpack_block_is_sound(mut buf: &[u8]) -> bool {
+    while let Some(&first) = buf.first() {
+        // Representation dispatch matches `hpack`'s `FieldRepresentation::new`.
+        let (prefix_bits, is_literal) = if first & 0x80 != 0 {
+            (7, false) // Indexed.
+        } else if first & 0x40 != 0 {
+            (6, true) // Literal, incremental indexing.
+        } else if first & 0x20 != 0 {
+            (5, false) // Dynamic table size update.
+        } else {
+            (4, true) // Literal without indexing / never indexed.
+        };
+
+        let Some((index, int_consumed)) = hpack_take_integer(buf, prefix_bits) else {
+            return false;
+        };
+        buf = &buf[int_consumed..];
+
+        if is_literal {
+            // A zero table index means the name is a literal string; otherwise
+            // the name is taken from the table and only the value follows.
+            if index == 0 {
+                buf = match hpack_skip_string(buf) {
+                    Some(rest) => rest,
+                    None => return false,
+                };
+            }
+            buf = match hpack_skip_string(buf) {
+                Some(rest) => rest,
+                None => return false,
+            };
+        }
+    }
+    true
+}
+
 fn decode_headers_block_with_storage(
     decoder: &mut hpack::Decoder<'static>,
     block: &[u8],
@@ -163,12 +248,21 @@ fn decode_headers_block_with_storage(
     {
         return Ok(headers);
     }
-    // The `hpack` crate `.ok().unwrap()`s a failed varint decode in its
-    // dynamic-table-size-update path, so a truncated size-update block
-    // panics inside `decode` rather than returning `Err`. That input is
-    // attacker-controlled; contain the panic and treat it as any other
-    // unsupported/malformed block. The decoder is torn down with the
-    // connection on this error, so its post-panic state is never reused.
+    // The `hpack` crate `.ok().unwrap()`s a failed integer decode in its
+    // dynamic-table-size-update path, so a truncated or over-long
+    // size-update integer panics inside `decode` rather than returning
+    // `Err`. That input is attacker-controlled and pre-auth. `catch_unwind`
+    // only contains it on `panic = "unwind"` builds; a `panic = "abort"`
+    // service would abort the process. So reject any block that is not
+    // structurally sound *before* the decoder sees it — `hpack_block_is_sound`
+    // walks the same representations `hpack` does and fails on exactly the
+    // inputs that would make `decode_integer` return `Err`, which is the only
+    // panic trigger. `catch_unwind` stays as defense in depth. The decoder is
+    // torn down with the connection on this error, so its post-panic state is
+    // never reused.
+    if !hpack_block_is_sound(block) {
+        return Err(Http2ProtocolError::HpackUnsupported);
+    }
     let decoded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| decoder.decode(block)))
         .map_err(|_| Http2ProtocolError::HpackUnsupported)?
         .map_err(|_| Http2ProtocolError::HpackUnsupported)?;
@@ -1048,5 +1142,33 @@ mod tests {
         let mut decoder = hpack::Decoder::new();
         let result = decode_headers_block(&[0x2c, 0xc1, 0x3f], 4096);
         assert!(matches!(result, Err(Http2ProtocolError::HpackUnsupported)));
+    }
+
+    #[test]
+    fn soundness_walker_rejects_the_size_update_panic_inputs() {
+        // The two shapes that make `hpack`'s size-update path unwrap an
+        // `Err`: a truncated continuation and a too-long (>5 octet) integer.
+        assert!(!hpack_block_is_sound(&[0x2c, 0xc1, 0x3f])); // truncated
+        assert!(!hpack_block_is_sound(&[0x3f, 0xff, 0xff, 0xff, 0xff, 0xff])); // too long
+        assert!(!hpack_block_is_sound(&[0x3f])); // size-update prefix, no continuation
+    }
+
+    #[test]
+    fn soundness_walker_accepts_well_formed_blocks() {
+        // Indexed field `:method: GET` (static index 2) is a single sound byte.
+        assert!(hpack_block_is_sound(&[0x82]));
+        assert!(hpack_block_is_sound(&[])); // empty block is trivially sound
+        // A real tina-encoded literal block round-trips through the walker.
+        let mut block = Vec::new();
+        encode_literal_header(":path", "/x", &mut block);
+        encode_literal_header("host", "example.com", &mut block);
+        assert!(hpack_block_is_sound(&block));
+    }
+
+    #[test]
+    fn soundness_walker_rejects_truncated_literal_string() {
+        // Literal-without-indexing, new name (index 0), name length 4 but only
+        // one octet present: the string runs off the end.
+        assert!(!hpack_block_is_sound(&[0x00, 0x04, b'a']));
     }
 }
