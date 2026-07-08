@@ -125,9 +125,9 @@ What feels worse:
 ## What this is not
 
 This example is in-process — not a database, not remoting, not a
-distributed keyspace. See the sharded-service primitive notes
-(`.intent/phases/053-sharded-service-primitives/plan.md`) for the
-non-goals. The richer pressure scenarios (one shard `Full`, one
-shard `Closed`, aggregate timeout, hot-key retry) are proven in
+distributed keyspace. It exercises the sharded-service primitives
+(per-shard placement, cross-shard fan-in) in the small. The richer
+pressure scenarios (one shard `Full`, one shard `Closed`, aggregate
+timeout, hot-key retry) are proven in
 `tina-runtime/tests/sharded_primitives.rs` and `tina-sim/tests/
 sharded_dst.rs`.

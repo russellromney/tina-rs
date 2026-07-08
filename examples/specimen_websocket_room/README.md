@@ -6,9 +6,9 @@ upgrade path.
 The HTTP listener owns TCP accept and request parsing. A `GET /room`
 upgrade returns `HttpResponse::websocket(...)`, after which the
 connection isolate becomes the WebSocket session owner. The room app
-receives both the 087 echo-style events (`Open`, `Text`, `Binary`,
-`Ping`, `Pong`, `Close`, `Pressure`, `Closed`) and the 094
-handle-bearing events (`SessionOpen`, `SessionText`, `SessionBinary`).
+receives both the echo-style events (`Open`, `Text`, `Binary`,
+`Ping`, `Pong`, `Close`, `Pressure`, `Closed`) and the handle-bearing
+events (`SessionOpen`, `SessionText`, `SessionBinary`).
 
 The specimen serves:
 

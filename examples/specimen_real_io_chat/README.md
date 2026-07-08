@@ -98,7 +98,7 @@ What feels worse:
   callback, and it is also the traceable Tina truth.
 - **The connection mailbox sizing rule.** Each `send_observed` reply
   lands in the Connection's mailbox, so the Connection's capacity must
-  be `max_broadcast_targets + slack`. This is documented (047, see
+  be `max_broadcast_targets + slack`. This is documented (see
   `docs/mailbox-capacity.md`) but it's still a number you have to size
   correctly per workload.
 

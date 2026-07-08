@@ -123,15 +123,15 @@ What feels worse:
   but each suspension point and each `Full` / `Closed` / `Timeout`
   edge stays named.
 
-## What changed in 072
+## Deadline propagation, not a fixed budget
 
-The 067 form of this specimen passed `budget: Duration` through the
+An earlier form of this specimen passed `budget: Duration` through the
 chain. The budget was the *original* budget at every hop: B's call
 to C used the full `TOTAL_DEADLINE` even though A's hop had already
 consumed some of it. This worked because the work happens to be
 short, but it is not honest.
 
-The 072 form propagates a `Deadline` instead. Each hop reads
+This form propagates a `Deadline` instead. Each hop reads
 `deadline.remaining_or_zero(ctx.now())` against its own
 runtime/sim-stamped `now`, so the budget actually shrinks across
 hops. The same shape works under live and simulator runtimes —

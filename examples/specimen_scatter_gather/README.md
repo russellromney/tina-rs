@@ -114,7 +114,7 @@ What Tina costs you here:
   isolate, keyed by an integer you assigned. Plenty of room for
   off-by-one if the partial-state vec and the pending box drift.
 
-What 061 closed:
+What Tina closes here:
 
 - **No `Arc<Mutex<HashMap<RequestId, OneShot>>>`.** The pending box
   is a single named container with a hard cap, sweep, and visible

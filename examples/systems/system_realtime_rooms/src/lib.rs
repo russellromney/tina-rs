@@ -269,7 +269,7 @@ impl Room {
             }
             WebSocketSessionMsg::SendOutcome(outcome) => self.on_send_outcome(outcome),
             WebSocketSessionMsg::Shutdown { code, reason } => self.on_shutdown(code, reason),
-            // ---- legacy 087 echo path is unused here; ignore quietly ------
+            // ---- legacy echo path is unused here; ignore quietly ------
             WebSocketSessionMsg::Open
             | WebSocketSessionMsg::Text(_)
             | WebSocketSessionMsg::Binary(_)

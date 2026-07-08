@@ -88,8 +88,9 @@ What feels worse:
 
 - **Three isolates for a single connection.** Tokio is one async
   block. Tina has Store + Connection + Listener. Each piece is small
-  (047 retired the mailbox-factory, per-shard-type, and bound-address
-  side channels) but there are more of them.
+  (the default mailbox factory, single-shard default, and
+  `observe_next_bound()` retired the mailbox-factory, per-shard-type,
+  and bound-address side channels) but there are more of them.
 - **"Process the next command" is hand-rolled.** The Connection's
   `next_effect()` helper pops a command off the queue and tail-calls
   itself through self-sent messages. There is no built-in iteration
