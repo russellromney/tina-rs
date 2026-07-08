@@ -107,7 +107,6 @@ pub(crate) fn reserve_round_message_scratch(
     }
 }
 
-
 #[derive(Debug)]
 pub(crate) struct TimerEntry {
     pub(crate) call_id: CallId,
@@ -173,14 +172,20 @@ impl CallTable {
     pub(crate) fn insert_driver(&mut self, call: DriverCall) {
         let call_id = call.head.call_id;
         let previous = self.driver.insert(call_id, call);
-        assert!(previous.is_none(), "duplicate in-flight call id {call_id:?}");
+        assert!(
+            previous.is_none(),
+            "duplicate in-flight call id {call_id:?}"
+        );
     }
 
     pub(crate) fn remove_driver(&mut self, call_id: CallId) -> Option<DriverCall> {
         self.driver.remove(&call_id)
     }
 
-    pub(crate) fn driver_call_ids_for_requester(&self, requester: RegisteredAddress) -> Vec<CallId> {
+    pub(crate) fn driver_call_ids_for_requester(
+        &self,
+        requester: RegisteredAddress,
+    ) -> Vec<CallId> {
         self.driver
             .iter()
             .filter(|(_, call)| call.head.requester == requester)
@@ -203,7 +208,10 @@ impl CallTable {
         self.isolate_deadlines
             .insert((call.deadline, call.insertion_order), call_id);
         let previous = self.isolate.insert(call_id, call);
-        assert!(previous.is_none(), "duplicate pending isolate call {call_id:?}");
+        assert!(
+            previous.is_none(),
+            "duplicate pending isolate call {call_id:?}"
+        );
     }
 
     pub(crate) fn remove_isolate(&mut self, call_id: CallId) -> Option<PendingIsolateCall> {
@@ -251,7 +259,10 @@ impl CallTable {
             .map(|(id, _)| *id)
             .collect();
         ids.into_iter()
-            .map(|id| self.remove_isolate(id).expect("indexed isolate call exists"))
+            .map(|id| {
+                self.remove_isolate(id)
+                    .expect("indexed isolate call exists")
+            })
             .collect()
     }
 

@@ -60,7 +60,12 @@ fn host_call_returns_worker_unresponsive_when_handler_wedges() {
 
     let (started_tx, started_rx) = mpsc::channel();
     let blocker = runtime
-        .register_with_capacity::<Blocker, Infallible>(Blocker { started: started_tx }, 4)
+        .register_with_capacity::<Blocker, Infallible>(
+            Blocker {
+                started: started_tx,
+            },
+            4,
+        )
         .expect("register blocker");
 
     // Wedge the worker and wait until the handler is actually running, so the
