@@ -11,6 +11,21 @@ cargo install cargo-fuzz
 cargo +nightly fuzz run <target> -- -max_total_time=60
 ```
 
+## Cadence
+
+CI does not fuzz per-PR (too slow to gate on). Instead:
+
+- **Per PR**: `cargo check -p tina-http --features fuzzing --locked` guards the
+  shim signatures, and the seed corpus + documented panic shapes are folded
+  into deterministic unit tests that run in the normal suite — the HPACK panic
+  inputs through `decode_headers_block`, the chunked-decoder cap invariant, the
+  h2 payload views, and the rpc frame decode (`tina-http` lib `http2` tests +
+  the `fuzz_corpus_regression` integration test). So every PR exercises the
+  panic-containment property on the real production functions.
+- **Weekly + manual** (`verify.yml` `fuzz` job): installs `cargo-fuzz`, builds
+  every target (catching target bit-rot the shim check cannot see), and runs
+  each for `-max_total_time=60`. Trigger on demand via *workflow_dispatch*.
+
 ## Targets
 
 | Target | Exercises |
@@ -51,14 +66,25 @@ structural walker that rejects exactly the inputs that would make `hpack`'s
 `decode_integer` return `Err` (the only panic trigger), under every panic
 strategy.
 
-This target mirrors the production guard: it decodes only when the walker
-accepts. Under the fuzzer's `panic = "abort"` it crashes precisely when the
-walker is *unsound* (admits a block that panics `decode`), so a clean run is
-evidence of soundness — the security property. It is one-sided: it cannot see
-a walker that over-*rejects* a valid block. Completeness (no false rejects) is
-covered by `walker_gates_every_short_block_against_the_real_decoder` in
-`tina-http`, an exhaustive differential unit test over all 1- and 2-byte blocks
-that runs under `panic = "unwind"` and checks both directions.
+This target drives the **real** production decode entry
+(`http2::headers::decode_headers_block`) — the shipped gate, the fast-literal
+path, and the `catch_unwind`, not a private copy of the gate. Under the
+fuzzer's `panic = "abort"` it crashes precisely when the gate lets a panic
+input reach `decode` (e.g. if someone deletes `hpack_block_is_sound`), so a
+clean run is evidence the shipped entry contains every input — the security
+property, made load-bearing under `abort`. Driving production also gives the
+fast-literal path (`decode_fast_literal_headers`, which runs first on every
+inbound block) its only fuzz coverage.
+
+It is one-sided: it cannot see a walker that over-*rejects* a valid block.
+Completeness (no false rejects) is covered by
+`walker_gates_every_short_block_against_the_real_decoder` and
+`walker_gates_deep_size_update_continuations_against_the_real_decoder` in
+`tina-http` — exhaustive differential unit tests over all 1-/2-byte blocks and
+all 3-byte size-update blocks, run under `panic = "unwind"`, checking both
+directions. The `panic = "unwind"` regression that the gate is load-bearing
+(deleting it makes a test fail rather than silently pass) lives in
+`hpack_gate_rejects_before_decode_not_via_catch_unwind`.
 
 The seed corpus for this target holds three genuine panic inputs (truncated,
 unterminated, and over-long size updates) plus one well-formed block; the other

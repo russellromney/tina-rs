@@ -179,9 +179,11 @@ async fn bridge_drives_real_client_against_real_server_over_tcp() {
     );
 
     // Also assert an unknown method surfaces the server's typed error through
-    // the same real path.
-    let unknown = bridge
-        .call(
+    // the same real path. Bounded like the first call: a "connection alive but
+    // no reply" regression must fail the test, not hang it forever.
+    let unknown = tokio::time::timeout(
+        Duration::from_secs(5),
+        bridge.call(
             |corr, reply_to| {
                 Ok::<_, EncodingError>(ClientRequest {
                     service: "echo".into(),
@@ -193,8 +195,10 @@ async fn bridge_drives_real_client_against_real_server_over_tcp() {
                 })
             },
             |bytes: &[u8]| Ok::<_, EncodingError>(bytes.to_vec()),
-        )
-        .await;
+        ),
+    )
+    .await
+    .expect("unknown-method call must not hang against a live server");
     assert!(
         matches!(unknown, Err(BridgeError::Server(_))),
         "unknown method must surface as a server error over the real path, got {unknown:?}",

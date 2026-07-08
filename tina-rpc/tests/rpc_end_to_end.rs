@@ -233,6 +233,13 @@ fn registry_downstream_closed_maps_to_internal_through_deferred_reply() {
     // replying -> Closed] -> continuation -> reply_to(caller, Internal). The
     // pure-mapping unit test covers Closed -> Internal in isolation; this drives
     // it through the live deferred plumbing.
+    //
+    // What this assertion pins: a fast Internal reaches the caller through the
+    // deferred path. Closed, Rejected, and a fast Timeout all map to Internal on
+    // the wire, so `== Internal` cannot distinguish them — the guarantee here is
+    // "the deferred path answers with Internal, quickly (no hang)", not "the
+    // outcome was specifically Closed". The Closed *scenario* is what's driven;
+    // the wire distinction is not observable from the caller.
     let runtime = ThreadedRuntime::new(SingleShard, DefaultThreadedMailboxFactory);
     let service = runtime
         .register_with_capacity::<_, Infallible>(SelfStopService, 16)
