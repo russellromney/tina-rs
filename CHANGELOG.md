@@ -4,7 +4,18 @@ This file records completed work.
 
 ## Unreleased
 
-### Service Skeleton
+### Examples Sweep
+
+- Compiled every out-of-workspace example crate (specimens, systems,
+  extensions) against current main and fixed the two that had drifted:
+  `specimen_replay_dst` now propagates the `Result` that `shrink_replay_case`
+  returns, and `specimen_rpc` renames its `#[service]` method argument off the
+  `payload` name the generated request constructor now reserves.
+- Ported `specimen_multi_turn_request_context`'s readiness service to
+  `tina::flow!`: the probe-then-db chain is the one hand-written linear
+  multi-step `RequestContext` continuation left in the example corpus, so the
+  macro now writes the continuation enum and dispatcher it used to spell out by
+  hand. Behavior is unchanged (`ready` / `not_ready` on every timeout path).
 
 - Added a `serve` mode to the mini SaaS example: `-- serve [--addr HOST:PORT]`
   binds the HTTP server, prints one startup line (bind address, shard count,

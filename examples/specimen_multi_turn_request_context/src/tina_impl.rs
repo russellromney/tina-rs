@@ -2,9 +2,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::time::Duration;
 
-use tina::{
-    Address, CallContext, Context, Effect, Isolate, RequestContext, noop, reply_to,
-};
+use tina::{Address, CallContext, Context, Effect, Isolate, RequestContext, noop, reply_to};
 use tina_runtime::{CallOutcome, RuntimeCall, call, sleep};
 use tina_sim::{Simulator, SimulatorConfig};
 
@@ -48,9 +46,7 @@ impl Isolate for Probe {
         _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
     ) -> Effect<Self> {
         match msg {
-            ProbeMsg::Request => {
-                noop()
-            }
+            ProbeMsg::Request => noop(),
             ProbeMsg::SleepDone(req) => reply_to(req, ProbeReply),
         }
     }
@@ -95,9 +91,7 @@ impl Isolate for Db {
         _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
     ) -> Effect<Self> {
         match msg {
-            DbMsg::Request => {
-                noop()
-            }
+            DbMsg::Request => noop(),
             DbMsg::SleepDone(req) => reply_to(req, DbReply),
         }
     }
@@ -121,8 +115,45 @@ enum ServiceReply {
 #[derive(Debug)]
 enum ServiceMsg {
     Start,
-    ProbeResult(RequestContext<ServiceReply>, CallOutcome<ProbeReply>),
-    DbResult(RequestContext<ServiceReply>, CallOutcome<DbReply>),
+    Readiness(ReadinessFlow),
+}
+
+// Linear two-step readiness check: probe, then db. `tina::flow!` writes the
+// continuation enum + dispatcher a hand-written state machine would spell out;
+// each step still receives the full `CallOutcome` and threads the caller's
+// `RequestContext` explicitly.
+tina::flow! {
+    flow ReadinessFlow for Service {
+        reply ServiceReply;
+
+        step Probed() -> ProbeReply {
+            match outcome {
+                CallOutcome::Replied(_) => call(self.db, DbMsg::Request, Duration::from_millis(50))
+                    .then_with_request(req, |req, outcome| {
+                        ServiceMsg::Readiness(ReadinessFlow::Dbed(req, outcome))
+                    }),
+                _ => reply_to(req, ServiceReply::NotReady),
+            }
+        }
+
+        step Dbed() -> DbReply {
+            match outcome {
+                CallOutcome::Replied(_) => reply_to(req, ServiceReply::Ready),
+                _ => reply_to(req, ServiceReply::NotReady),
+            }
+        }
+    }
+}
+
+// `flow!` does not derive `Debug`; `ServiceMsg` needs it because a peer holds
+// `Address<ServiceMsg, _>` in a `Debug` enum. Print the outcome, skip `req`.
+impl std::fmt::Debug for ReadinessFlow {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ReadinessFlow::Probed(_, outcome) => f.debug_tuple("Probed").field(outcome).finish(),
+            ReadinessFlow::Dbed(_, outcome) => f.debug_tuple("Dbed").field(outcome).finish(),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -148,15 +179,7 @@ impl Isolate for Service {
     ) -> Effect<Self> {
         match msg {
             ServiceMsg::Start => noop(),
-            ServiceMsg::ProbeResult(req, CallOutcome::Replied(_)) => {
-                call(self.db, DbMsg::Request, Duration::from_millis(50))
-                    .then_with_request(req, ServiceMsg::DbResult)
-            }
-            ServiceMsg::ProbeResult(req, _) => reply_to(req, ServiceReply::NotReady),
-            ServiceMsg::DbResult(req, CallOutcome::Replied(_)) => {
-                reply_to(req, ServiceReply::Ready)
-            }
-            ServiceMsg::DbResult(req, _) => reply_to(req, ServiceReply::NotReady),
+            ServiceMsg::Readiness(flow) => self.handle_readiness_flow(flow),
         }
     }
 
@@ -168,8 +191,8 @@ impl Isolate for Service {
                     ProbeMsg::Request,
                     Duration::from_millis(50),
                 ))
-                .reply(ServiceMsg::ProbeResult),
-            ServiceMsg::ProbeResult(_, _) | ServiceMsg::DbResult(_, _) => {
+                .reply(|req, outcome| ServiceMsg::Readiness(ReadinessFlow::Probed(req, outcome))),
+            ServiceMsg::Readiness(_) => {
                 call_ctx.reject(tina::CallRejectedReason::UnsupportedMessage)
             }
         }
@@ -207,8 +230,7 @@ impl Isolate for Client {
     ) -> Effect<Self> {
         match msg {
             ClientMsg::Start(svc) => {
-                call(svc, ServiceMsg::Start, Duration::from_millis(100))
-                    .then(ClientMsg::Returned)
+                call(svc, ServiceMsg::Start, Duration::from_millis(100)).then(ClientMsg::Returned)
             }
             ClientMsg::Returned(CallOutcome::Replied(ServiceReply::Ready)) => {
                 self.replies.borrow_mut().push(String::from("ready"));

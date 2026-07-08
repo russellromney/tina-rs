@@ -1,4 +1,4 @@
-use specimen_multi_turn_request_context::{tina_run, tokio_run, TinaConfig, TokioConfig};
+use specimen_multi_turn_request_context::{TinaConfig, TokioConfig, tina_run, tokio_run};
 
 #[tokio::main]
 async fn main() {
