@@ -50,6 +50,14 @@ pub mod fuzzing {
         }
     }
 
+    /// Strips DATA/HEADERS frame padding (and HEADERS priority bytes) the way
+    /// the read loops do, over arbitrary flags+payload bytes. The harness
+    /// asserts neither view panics.
+    pub fn fuzz_payload_views(flags: u8, payload: &[u8]) {
+        let _ = super::frame::data_payload_view(flags, payload);
+        let _ = super::frame::headers_payload_view(flags, payload);
+    }
+
     /// Decodes one frame header + length check, as the read loop does.
     pub fn fuzz_decode_frame_meta(
         buffer: &[u8],
