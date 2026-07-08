@@ -3,6 +3,33 @@
 Copy this when you need a production-shaped Tina service skeleton, not a web
 framework.
 
+## Copyable Entrypoint
+
+`serve` is the run-forever `main()` an adopter copies:
+
+```sh
+# Bind 127.0.0.1:8080 and run until Ctrl-C:
+cargo run --manifest-path examples/systems/mini_saas_api/Cargo.toml -- serve
+
+# Bind an explicit address:
+cargo run --manifest-path examples/systems/mini_saas_api/Cargo.toml -- serve --addr 0.0.0.0:8080
+```
+
+It binds the HTTP server, prints one startup line (bind address, shard
+count, and the same capacity summary the scripted modes print), then parks
+until SIGINT/SIGTERM on the runtime's `signal_wait` rail. On a signal it
+drives the graceful drain choreography — close ingress, owner-stop scope
+sweep, close the SQLite bridge, drain the outbound keepalive pool, stop both
+listeners, stop the runtime — prints the terminal shutdown report, and exits
+`0`. It wires the same controller, SQLite bridge, keepalive pool, and
+health/readiness/capacity routes the scripted modes use; there is nothing new
+to learn to stand it up.
+
+The `smoke`, `pressure`, and `soak` modes are the verification harness: each
+is a scripted, self-asserting run that drives the service through its
+scenarios and exits. Use `serve` to run the service; use the harness to prove
+it.
+
 ## Architecture
 
 ```mermaid
@@ -163,15 +190,18 @@ isolate.
 
 ## Multi-Turn Replies
 
-`POST /items/{id}/notify` proves the current request pattern:
+`POST /items/{id}/notify` proves the current request pattern. The four
+continuations are expressed with the `tina::flow!` macro as `NotifyFlow`, so
+the linear step chain is one declaration instead of a hand-rolled message
+enum plus dispatch arms:
 
 ```text
 HTTP call -> Controller CallContext
-  -> call_ctx.defer(SQLite query).reply(NotifyLoaded)
-  -> call(...).then_with_request(req, NotifyAcquired)   // outbound pool acquire
-  -> call(...).then_with_request(req, NotifySent)       // keepalive request
-  -> call(...).then_with_request(req, NotifyReleased)   // pool release
-  -> reply_to(req, ...)                          // final HttpResponse
+  -> call_ctx.defer(SQLite query).reply(NotifyFlow::Loaded)
+  -> call(...).then_with_request(req, NotifyFlow::Acquired)  // outbound pool acquire
+  -> call(...).then(NotifyFlow::Sent)                        // keepalive request
+  -> call(...).then_with_request(req, NotifyFlow::Released)  // pool release
+  -> reply_to(req, ...)                                      // final HttpResponse
 ```
 
 The first hop uses `call_ctx.defer(work).reply(...)` to consume caller
@@ -220,7 +250,13 @@ This is intentionally small: the operation is explicit, the fact is checked via
 cap/status mismatch fails the smoke run instead of being inferred from raw log
 text.
 
-## Commands
+## Verification Harness
+
+`serve` (above) is how you run the service. Everything below is the
+verification harness: scripted, self-asserting runs that stand the service
+up, drive it through a fixed scenario, assert the user-visible answers and
+capacity contract, then exit. They are the proof the copyable entrypoint
+works, not a second way to deploy it.
 
 Run the system smoke from the repo root:
 

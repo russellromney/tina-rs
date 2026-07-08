@@ -134,6 +134,41 @@ pub fn run(mode: RunMode) -> anyhow::Result<RunReport> {
     tina_impl::run(mode)
 }
 
+/// Bind the HTTP server on `addr` and run until SIGINT/SIGTERM, then drain
+/// gracefully and return. The copyable run-forever entrypoint: same service
+/// assembly and shutdown choreography as [`run`], with no scripted traffic.
+pub fn serve(addr: SocketAddr) -> anyhow::Result<()> {
+    tina_impl::serve(addr)
+}
+
+/// Typed outcome of [`prove_graceful_drain_completes_in_flight`].
+#[derive(Debug, Clone)]
+pub struct GracefulDrainProof {
+    /// Status the held-mid-flight notify request received once the drain ran.
+    pub in_flight_status: u16,
+    /// Its trimmed response body.
+    pub in_flight_body: String,
+    /// `true` when the in-flight request completed with its real `notified`
+    /// answer — i.e. the drain let it finish instead of dropping it.
+    pub in_flight_notified: bool,
+    /// `true` when the whole drain (including the outbound pool) closed clean.
+    pub shutdown_clean: bool,
+    /// Terminal shutdown line (same shape as `RunReport::terminal_line`).
+    pub terminal_line: String,
+    /// Owner-stop sweep line the drain reported.
+    pub scopes_drain_line: String,
+}
+
+/// Hold one notify request mid-outbound, then run the graceful drain with
+/// `drain_deadline`. A deadline longer than the in-flight work proves the
+/// request completes and its pool lease is released; a shorter one proves the
+/// straggler is force-cancelled (unclean). Regression witness for the drain.
+pub fn prove_graceful_drain_completes_in_flight(
+    drain_deadline: std::time::Duration,
+) -> anyhow::Result<GracefulDrainProof> {
+    tina_impl::prove_graceful_drain_completes_in_flight(drain_deadline)
+}
+
 /// Typed outcome of [`prove_drain_cancels_active_scope`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DrainActiveReport {
