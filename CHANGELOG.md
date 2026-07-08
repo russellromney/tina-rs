@@ -27,8 +27,7 @@ This file records completed work.
   generated flow carrying `RequestContext` through `CallOutcome`, including
   shadowed-request, duplicate-name, and renamed-crate expansion coverage.
 - Ported the mini SaaS `POST /items/{id}/notify` path to the generated flow
-  surface while keeping the old continuation variants as compatibility
-  forwards, and documented the pattern in the user guide.
+  surface, and documented the pattern in the user guide.
 ### Vocabulary Consolidation
 
 - Renamed `Effect::Call` to `Effect::Io` for runtime-owned I/O effects.

@@ -707,6 +707,9 @@ fn build_readiness(ingress_stopped: bool, dep: Option<ReadinessReason>) -> Readi
     }
 }
 
+// One flat `/debug/capacity` line joins every live surface; the args are the
+// snapshots, kept positional so the format string reads as the wire format.
+#[allow(clippy::too_many_arguments)]
 fn capacity_body(
     body: BodyPressureReport,
     db: SqlitePressureReport,
