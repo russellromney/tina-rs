@@ -974,8 +974,31 @@ where
                 RuntimeEventKind::CallRejected { call_id, reason }
             }
         };
+        if matches!(reason, CallRejectedReason::UnsupportedMessage) {
+            self.note_default_handle_call_rejection(isolate_id, call_id);
+        }
         self.push_event(isolate_id, Some(cause), kind);
     }
+
+    /// Debug tripwire for the "answers `call()` but only implements `handle`"
+    /// bug class. `UnsupportedMessage` is the default `handle_call`'s reject
+    /// reason, so a call resolving that way almost always means the target
+    /// never defined `handle_call`. Bumps a debug-only counter that tests and CI
+    /// can assert on (`default_handle_call_rejections()`), so the next
+    /// occurrence surfaces without an e2e test having to exist first.
+    ///
+    /// Deliberately allocation-free and trace-free: it is a bare scalar bump on
+    /// an already-cold reject path, so it perturbs neither the allocation pins
+    /// nor golden trace hashes. Compiled out entirely in release for zero cost.
+    #[cfg(debug_assertions)]
+    #[inline]
+    fn note_default_handle_call_rejection(&mut self, _isolate_id: IsolateId, _call_id: CallId) {
+        self.default_handle_call_rejections += 1;
+    }
+
+    #[cfg(not(debug_assertions))]
+    #[inline(always)]
+    fn note_default_handle_call_rejection(&mut self, _isolate_id: IsolateId, _call_id: CallId) {}
 
     pub(crate) fn execute_reply_to(
         &mut self,
@@ -1200,8 +1223,18 @@ where
 
         // Driver cancelled some pending calls because their resource
         // closed. Drop matching runtime state, or `has_in_flight_calls`
-        // stays true forever.
+        // stays true forever. Mirror `advance_driver`'s belt-and-braces
+        // purge at its twin site: drop any carried completion for a call
+        // this close just cancelled, so a later advance cannot deliver a
+        // completion for a call whose entry is gone (which would trip
+        // `deliver_completion`'s unknown-call quarantine). Safe without it
+        // under the driver contract — a lane resolves each call once, so a
+        // cancelled-by-close call is never also carried — but kept symmetric
+        // with `advance_driver` so the invariant holds even if a future lane
+        // breaks that rule.
         for cancelled in self.driver.take_cancelled_by_close() {
+            self.pending_completions
+                .retain(|op| op.call_id != cancelled);
             self.cancel_in_flight_call_for_resource_close(cancelled);
         }
     }

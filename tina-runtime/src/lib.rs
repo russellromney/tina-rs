@@ -465,6 +465,14 @@ where
     /// Single-writer (this shard's runtime); no concurrent access.
     pub(crate) cancelled_calls: std::collections::VecDeque<(CallId, tina::CancelCause)>,
     pub(crate) cancelled_call_cause_evictions: u64,
+    /// Debug tripwire: counts call rejections that resolve as
+    /// `UnsupportedMessage` — the signature of the default `handle_call`.
+    /// An isolate that answers `call()` traffic but only implements `handle`
+    /// keeps the default `handle_call`, which auto-rejects every call. That
+    /// whole bug class shipped invisibly once. Incremented only in debug builds;
+    /// never in release, so it is zero-cost there and the accessor reads a
+    /// constant 0.
+    pub(crate) default_handle_call_rejections: u64,
 }
 
 /// Capacity of the per-runtime recently-cancelled-calls ring. The sim
@@ -898,6 +906,7 @@ where
                 CANCELLED_CALL_RING_CAPACITY,
             ),
             cancelled_call_cause_evictions: 0,
+            default_handle_call_rejections: 0,
         }
     }
 
@@ -919,6 +928,18 @@ where
     /// the exact cancellation cause is no longer retained.
     pub const fn cancelled_call_cause_evictions(&self) -> u64 {
         self.cancelled_call_cause_evictions
+    }
+
+    /// Debug tripwire count: how many `call()` messages this shard has
+    /// rejected as `UnsupportedMessage`.
+    ///
+    /// `UnsupportedMessage` is the default `handle_call`'s signature — an
+    /// isolate that receives `call()` traffic but never defined `handle_call`.
+    /// A non-zero count in a debug build almost always means a target answers
+    /// calls but only implements `handle`. Always 0 in release builds (the
+    /// increment is compiled out for zero cost).
+    pub const fn default_handle_call_rejections(&self) -> u64 {
+        self.default_handle_call_rejections
     }
 
     /// Returns the number of trace events dropped by the retention policy.
