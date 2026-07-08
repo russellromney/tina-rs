@@ -1,0 +1,57 @@
+[package]
+name = "tina-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+tina-http = { path = "../tina-http", features = ["fuzzing"] }
+tina-rpc = { path = "../tina-rpc" }
+
+[[bin]]
+name = "chunked_decoder"
+path = "fuzz_targets/chunked_decoder.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "http1_request_head"
+path = "fuzz_targets/http1_request_head.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "http1_response_head"
+path = "fuzz_targets/http1_response_head.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "rpc_frame"
+path = "fuzz_targets/rpc_frame.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "hpack_headers"
+path = "fuzz_targets/hpack_headers.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "h2_frame_meta"
+path = "fuzz_targets/h2_frame_meta.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]

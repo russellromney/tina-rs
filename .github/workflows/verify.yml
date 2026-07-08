@@ -39,6 +39,11 @@ jobs:
       - name: Bridge feature checks
         run: cargo check -p tina-sqlx-bridge --features tracing
 
+      - name: Fuzz shim compiles
+        # The `fuzzing` feature exposes decoder internals to the out-of-workspace
+        # fuzz crate; nothing else in CI builds it, so guard against shim rot.
+        run: cargo check -p tina-http --features fuzzing
+
       - name: Verify workspace
         run: make verify
 
