@@ -973,7 +973,7 @@ where
     ///
     /// # Intentionally unbounded
     ///
-    /// Unlike [`call`](Self::call) (and the host-control calls it backs), the
+    /// Unlike the bounded host-control `call` path, the
     /// wait here is an unbounded [`recv`](std::sync::mpsc::Receiver::recv), not
     /// a `recv_timeout`. A worker wedged in a user handler never answers the
     /// command, so this call **can block the host thread indefinitely**. That is
