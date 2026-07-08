@@ -45,9 +45,9 @@ where
     /// yet been delivered. Tests use this to know when stepping further
     /// can produce more I/O completions.
     pub fn has_in_flight_calls(&self) -> bool {
-        !self.in_flight_calls.is_empty()
+        self.call_table.has_driver_calls()
             || self.driver.has_pending()
-            || !self.pending_isolate_calls.is_empty()
+            || self.call_table.has_isolate_calls()
     }
 
     #[cfg(test)]

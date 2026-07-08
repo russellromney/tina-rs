@@ -863,6 +863,18 @@ pub enum RuntimeEventKind {
         /// The replay-visible fact.
         fact: RuntimeFact,
     },
+
+    /// The driver handed back a completion for a call id the runtime no longer
+    /// tracks — already settled, cancelled, or never admitted: a driver
+    /// accounting bug. The completion is dropped and the shard keeps running;
+    /// a buggy driver must not tear down unrelated isolates. Replaces a former
+    /// panic in the completion path. Attributed to the shard sentinel isolate
+    /// (`IsolateId::new(0)`) with no cause, since the offending call has no
+    /// tracked requester.
+    DriverCompletionQuarantined {
+        /// The call id the driver reported a completion for.
+        call_id: CallId,
+    },
 }
 
 /// Stable identifier for one runtime-issued deferred reply slot.
@@ -1874,6 +1886,10 @@ fn write_kind_stable(kind: RuntimeEventKind, hasher: &mut StableHasher) {
         RuntimeEventKind::FactObserved { fact } => {
             hasher.write_u8(36);
             runtime_fact_write(fact, hasher);
+        }
+        RuntimeEventKind::DriverCompletionQuarantined { call_id } => {
+            hasher.write_u8(46);
+            hasher.write_u64(call_id.get());
         }
     }
 }
