@@ -52,6 +52,48 @@ This file records completed work.
 - Added a weekly (and manual) CI job that builds every fuzz target and runs each
   for 60 s, so the fuzzers get continuous execution without gating each PR; the
   per-PR shim check is now `--locked`.
+- Pinned the requester-stop cancel ordering on both engines. When a requester
+  with several in-flight driver calls stops, the runtime cancels them in
+  ascending call-id (insertion) order; a `Runtime`↔`Simulator` parity test
+  creates four concurrent in-flight sleeps, stops the requester, and asserts
+  both engines emit `CallCompletionRejected{RequesterClosed}` strictly ascending
+  and agree. The prior `swap_remove` sweep emitted `1, 4, 3, 2` — the test fails
+  if reverted to it.
+- Hardened the simulator's timer harvest against a completion for a call the
+  table no longer tracks: it panicked in `requester_registration_index` before
+  reaching `deliver_completion_at`'s quarantine, unlike the live runtime. The
+  lookup now returns `Option` and an untracked completion flows to quarantine
+  (trace + drop) so the shard survives. Known-call ordering is unchanged, so no
+  golden or DST hash moves. A sim unit test drives an unknown timer through the
+  real `step → harvest_timers → deliver_completion_at` sink.
+- Added a runtime unit test that drives a genuinely-unknown completion through
+  the real `advance_driver → pending_completions → deliver_completion` sink
+  (stronger than the existing direct-`deliver_completion` call) and a sim
+  analogue for the carried-completion purge: a stopped requester's pending timer
+  is purged, not quarantined.
+- Added a multi-shard `WorkerUnresponsive` test: a wedged handler on one shard
+  makes a host-control call return `WorkerUnresponsive`, asserting only the
+  deterministic lower bound (`elapsed >= control_call_timeout`); the healthy
+  shard still answers.
+- Documented `ThreadedRuntime::send_and_observe`'s intentionally-unbounded
+  `recv()` (a wedged worker can hang the host thread, by design) and pinned it
+  with a test that proves it stays blocked past the control-call timeout, then a
+  gate release lets it finish.
+- Added a debug-only tripwire counting `call()` rejections that resolve as
+  `UnsupportedMessage` — the signature of the default `handle_call` — so the
+  "answers `call()` but only implements `handle`" bug class surfaces without an
+  e2e test. Allocation-free and trace-free (no golden-hash or allocation-pin
+  movement); compiled out in release. A test confirms it fires for a handle-only
+  target and not for a proper `handle_call` isolate.
+- Deflaked three timing tests by replacing wall-clock races with deterministic
+  mechanism checks rather than widening budgets. The `host_burst` overflow test
+  uses a non-draining mailbox so a burst past capacity provably overflows
+  (exactly capacity admit, the rest `MailboxFull`, every run). The multi-shard
+  park test widens `idle_wait` to 10 s against a 10 ms repoll so a pending timer
+  must produce a repoll wakeup (the choice, not a rate), with the determinism
+  proven in a `has_pending_runtime_work` unit test. The shutdown-under-flood
+  test asserts completion via a watchdog thread (a regression deadlocks, not
+  runs slow) instead of a 3 s stopwatch.
 
 ### RPC Dispatch Fix
 
