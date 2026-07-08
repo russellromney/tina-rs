@@ -134,6 +134,13 @@ pub fn run(mode: RunMode) -> anyhow::Result<RunReport> {
     tina_impl::run(mode)
 }
 
+/// Bind the HTTP server on `addr` and run until SIGINT/SIGTERM, then drain
+/// gracefully and return. The copyable run-forever entrypoint: same service
+/// assembly and shutdown choreography as [`run`], with no scripted traffic.
+pub fn serve(addr: SocketAddr) -> anyhow::Result<()> {
+    tina_impl::serve(addr)
+}
+
 /// Typed outcome of [`prove_drain_cancels_active_scope`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DrainActiveReport {
