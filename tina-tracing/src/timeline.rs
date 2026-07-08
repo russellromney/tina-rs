@@ -451,7 +451,12 @@ fn push_runtime_events(timeline: &TraceTimeline, out: &mut Vec<EmittedEvent>, or
             // Mid-flight backpressure, not a terminal: the call still
             // completes, so this does not close the call span.
             | RuntimeEventKind::CallContinuationOverflowed { .. }
-            | RuntimeEventKind::FactObserved { .. } => push_instant(event, None, out, order),
+            | RuntimeEventKind::FactObserved { .. }
+            // Driver accounting bug, not tied to any call span: a standalone
+            // instant marker.
+            | RuntimeEventKind::DriverCompletionQuarantined { .. } => {
+                push_instant(event, None, out, order)
+            }
         }
     }
 
@@ -1051,6 +1056,9 @@ fn insert_kind_args(args: &mut Map<String, Value>, kind: RuntimeEventKind) {
                 );
             }
         }
+        RuntimeEventKind::DriverCompletionQuarantined { call_id } => {
+            args.insert("call_id".into(), json!(call_id.get()));
+        }
     }
 }
 
@@ -1101,6 +1109,7 @@ fn event_name(kind: RuntimeEventKind) -> &'static str {
         RuntimeEventKind::DeferredReplyRejected { .. } => "deferred_reply_rejected",
         RuntimeEventKind::DeferredReplyDropped { .. } => "deferred_reply_dropped",
         RuntimeEventKind::FactObserved { .. } => "fact_observed",
+        RuntimeEventKind::DriverCompletionQuarantined { .. } => "driver_completion_quarantined",
     }
 }
 
@@ -1149,7 +1158,9 @@ fn event_category(kind: RuntimeEventKind) -> &'static str {
         | RuntimeEventKind::RecoveryStarted
         | RuntimeEventKind::RecoveryFinished
         | RuntimeEventKind::RecoveryFailed { .. } => "persistence",
-        RuntimeEventKind::MailboxAccepted | RuntimeEventKind::EffectObserved { .. } => "runtime",
+        RuntimeEventKind::MailboxAccepted
+        | RuntimeEventKind::EffectObserved { .. }
+        | RuntimeEventKind::DriverCompletionQuarantined { .. } => "runtime",
     }
 }
 

@@ -74,9 +74,8 @@ fn runtime_preallocation_config_reserves_runtime_owned_metadata() {
     assert!(runtime.child_records.capacity() >= preallocation.child_record_capacity);
     assert!(runtime.supervisors.capacity() >= preallocation.supervisor_capacity);
     assert!(runtime.trace.capacity() >= preallocation.trace_capacity);
-    assert!(runtime.in_flight_calls.capacity() >= preallocation.call_capacity);
-    assert!(runtime.translators.capacity() >= preallocation.call_capacity);
-    assert!(runtime.pending_isolate_calls.capacity() >= preallocation.call_capacity);
+    // The call table is a map keyed by CallId (no pre-reserve); it starts empty.
+    assert!(!runtime.has_in_flight_calls());
     assert!(runtime.driver_completions.capacity() >= preallocation.call_capacity);
     assert!(runtime.round_messages.capacity() >= preallocation.round_scratch_capacity);
 }
@@ -95,6 +94,104 @@ fn cancelled_call_cause_ring_overflow_is_visible() {
         runtime.recently_cancelled_cause(CallId::new(CANCELLED_CALL_RING_CAPACITY as u64 + 2)),
         Some(tina::CancelCause::CallerCancelled)
     );
+}
+
+#[test]
+fn driver_completion_for_unknown_call_is_quarantined_not_panicked() {
+    // A driver accounting bug (completion for a call the table no longer
+    // tracks) must not kill the shard. It is quarantined: one event, dropped
+    // result, runtime stays usable.
+    let mut runtime = Runtime::new(TestShard, TestMailboxFactory);
+
+    runtime.deliver_completion(CallId::new(4242), CallOutput::TcpListenerClosed);
+
+    let quarantined: Vec<_> = runtime
+        .trace()
+        .iter()
+        .filter(|event| {
+            matches!(
+                event.kind(),
+                RuntimeEventKind::DriverCompletionQuarantined { call_id }
+                    if call_id == CallId::new(4242)
+            )
+        })
+        .collect();
+    assert_eq!(quarantined.len(), 1, "exactly one quarantine event");
+    // The shard survived: it still answers control introspection.
+    assert!(!runtime.has_in_flight_calls());
+}
+
+#[test]
+fn carried_completion_for_stopped_requester_is_dropped_not_quarantined() {
+    // A completion harvested from the driver but carried past the per-step
+    // drain budget, whose requester then stops, is a NORMAL race — not a driver
+    // bug. It must be dropped and settle as RequesterClosed, never surface as a
+    // quarantine (which would falsely accuse the driver).
+    let mut runtime = Runtime::new(TestShard, TestMailboxFactory);
+    runtime.register(new_root(), root_mailbox());
+    let requester = RegisteredAddress {
+        shard: runtime.shard.id(),
+        isolate: runtime.entries[0].id,
+        generation: runtime.entries[0].generation,
+    };
+    let call_id = CallId::new(7);
+    runtime.call_table.insert_driver(crate::DriverCall {
+        head: crate::DriverCallHead {
+            call_id,
+            call_kind: CallKind::IsolateCall,
+            requester,
+            cause: CauseId::new(EventId::new(1)),
+            persistence: None,
+            continuation_context: None,
+        },
+        translator: Box::new(|_| crate::call::ErasedRuntimeCallCompletion::Noop),
+    });
+    // A completion for this call was already harvested and is waiting behind the
+    // drain budget.
+    runtime
+        .pending_completions
+        .push_back(crate::driver::DriverCompletion {
+            call_id,
+            result: CallOutput::TcpListenerClosed,
+        });
+
+    // The requester stops.
+    runtime.cancel_driver_calls_for_requester(requester);
+
+    // A later driver advance must not re-surface the carried completion.
+    let now = runtime.clock.now();
+    runtime.advance_driver(now);
+
+    let quarantined = runtime
+        .trace()
+        .iter()
+        .filter(|event| {
+            matches!(
+                event.kind(),
+                RuntimeEventKind::DriverCompletionQuarantined { .. }
+            )
+        })
+        .count();
+    assert_eq!(
+        quarantined, 0,
+        "a carried completion for a stopped requester must not quarantine"
+    );
+    let rejected = runtime
+        .trace()
+        .iter()
+        .filter(|event| {
+            matches!(
+                event.kind(),
+                RuntimeEventKind::CallCompletionRejected {
+                    call_id: c,
+                    reason: crate::trace::CallCompletionRejectedReason::RequesterClosed,
+                    ..
+                } if c == call_id
+            )
+        })
+        .count();
+    assert_eq!(rejected, 1, "carried completion settles as RequesterClosed");
+    assert!(runtime.pending_completions.is_empty(), "completion purged");
 }
 
 #[test]
@@ -226,13 +323,16 @@ fn stopped_entry_gc_compacts_a_burst_in_one_pass_and_keeps_indexes_consistent() 
         isolate: pinned,
         generation: runtime.entries[0].generation,
     };
-    runtime.push_in_flight_call(InFlightCall {
-        call_id: CallId::new(1),
-        call_kind: CallKind::IsolateCall,
-        requester: pinned_addr,
-        cause: CauseId::new(EventId::new(1)),
-        persistence: None,
-        continuation_context: None,
+    runtime.call_table.insert_driver(crate::DriverCall {
+        head: crate::DriverCallHead {
+            call_id: CallId::new(1),
+            call_kind: CallKind::IsolateCall,
+            requester: pinned_addr,
+            cause: CauseId::new(EventId::new(1)),
+            persistence: None,
+            continuation_context: None,
+        },
+        translator: Box::new(|_| crate::call::ErasedRuntimeCallCompletion::Noop),
     });
 
     runtime.gc_stopped_entries();
@@ -286,7 +386,7 @@ fn stopped_entry_gc_compacts_a_burst_in_one_pass_and_keeps_indexes_consistent() 
     );
 
     // Settle the pinned call; now the last stop is collectable too.
-    runtime.remove_in_flight_call(CallId::new(1));
+    runtime.call_table.remove_driver(CallId::new(1));
     runtime.gc_stopped_entries();
     assert!(
         !runtime.entries.iter().any(|e| e.id == pinned),

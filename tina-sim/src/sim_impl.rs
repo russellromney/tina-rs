@@ -199,11 +199,7 @@ where
             .timers
             .iter()
             .map(|entry| entry.deadline)
-            .chain(
-                self.pending_isolate_calls
-                    .iter()
-                    .map(|entry| entry.deadline),
-            )
+            .chain(self.call_table.min_isolate_deadline())
             .min()
         else {
             return false;
@@ -1629,17 +1625,16 @@ where
                 RuntimeEventKind::RecoveryStarted,
             );
         }
-        self.in_flight_calls.push(InFlightCall {
-            call_id: context.call_id,
-            call_kind,
-            requester: context.requester,
-            cause: context.cause,
-            persistence,
-            continuation_context: context.continuation_context,
-        });
-        self.translators.push(StoredTranslator {
-            call_id: context.call_id,
-            translator: Some(translator),
+        self.call_table.insert_driver(DriverCall {
+            head: DriverCallHead {
+                call_id: context.call_id,
+                call_kind,
+                requester: context.requester,
+                cause: context.cause,
+                persistence,
+                continuation_context: context.continuation_context,
+            },
+            translator,
         });
 
         let call_id = context.call_id;
@@ -1925,14 +1920,14 @@ where
                         shared.set_call_id(context.call_id.get());
                         shared.set_shard_id(self.shard.id().get());
                     }
-                    self.pending_isolate_calls.push(PendingIsolateCall {
+                    self.call_table.insert_isolate(PendingIsolateCall {
                         call_id: context.call_id,
                         requester: context.requester,
                         cause: context.cause,
                         deadline: self.virtual_now + timeout,
                         insertion_order,
                         continuation_context: context.continuation_context,
-                        translator: Some(translator),
+                        translator,
                         expected_reply_type_id,
                         handle_shared,
                     });
@@ -1997,14 +1992,14 @@ where
                     shared.set_call_id(context.call_id.get());
                     shared.set_shard_id(self.shard.id().get());
                 }
-                self.pending_isolate_calls.push(PendingIsolateCall {
+                self.call_table.insert_isolate(PendingIsolateCall {
                     call_id: context.call_id,
                     requester: context.requester,
                     cause: context.cause,
                     deadline: self.virtual_now + timeout,
                     insertion_order,
                     continuation_context: context.continuation_context,
-                    translator: Some(translator),
+                    translator,
                     expected_reply_type_id,
                     handle_shared,
                 });
@@ -4683,22 +4678,11 @@ where
     }
 
     pub(crate) fn harvest_isolate_call_timeouts(&mut self, now: Duration) {
-        while let Some(index) = self
-            .pending_isolate_calls
-            .iter()
-            .enumerate()
-            .filter(|(_, entry)| entry.deadline <= now)
-            .min_by(|(_, left), (_, right)| {
-                left.deadline
-                    .cmp(&right.deadline)
-                    .then_with(|| left.insertion_order.cmp(&right.insertion_order))
-            })
-            .map(|(index, _)| index)
-        {
-            let mut entry = self.pending_isolate_calls.remove(index);
-            let translator = entry.translator.take().unwrap_or_else(|| {
-                panic!("translator for call {:?} already consumed", entry.call_id)
-            });
+        while let Some(call_id) = self.call_table.next_due_isolate(now) {
+            let Some(entry) = self.call_table.remove_isolate(call_id) else {
+                continue;
+            };
+            let translator = entry.translator;
             if let Some(shared) = &entry.handle_shared {
                 shared.set_state(tina::CallHandleState::Settled);
             }
@@ -4747,19 +4731,17 @@ where
         owner_generation: AddressGeneration,
         _stopped_cause: tina_runtime::CauseId,
     ) {
-        // Single-pass partition: O(n) over pending calls.
-        let original = std::mem::take(&mut self.pending_isolate_calls);
-        let (mut owned, kept): (Vec<_>, Vec<_>) = original.into_iter().partition(|entry| {
-            entry.requester.isolate == owner_isolate
-                && entry.requester.generation == owner_generation
-        });
-        self.pending_isolate_calls = kept;
-        for entry in owned.iter_mut() {
+        // Ascending call-id (== insertion) order; record all cancellations
+        // before emitting events, matching the runtime.
+        let owned = self
+            .call_table
+            .take_isolate_calls_for_owner(owner_isolate, owner_generation);
+        for entry in owned.iter() {
             self.record_cancelled_call(entry.call_id, tina::CancelCause::OwnerStopped);
         }
-        for mut entry in owned {
+        for entry in owned {
             let original_cause = entry.cause;
-            let _ = entry.translator.take();
+            // Dropping `entry` drops its translator; the continuation never fires.
             if let Some(shared) = &entry.handle_shared {
                 shared.set_state(tina::CallHandleState::Cancelled);
             }
@@ -4817,15 +4799,10 @@ where
                         tina::CancelOutcome::WrongShard
                     } else {
                         let call_id = CallId::new(raw_call_id);
-                        match self
-                            .pending_isolate_calls
-                            .iter()
-                            .position(|entry| entry.call_id == call_id)
-                        {
-                            Some(index) => {
-                                let mut entry = self.pending_isolate_calls.remove(index);
+                        match self.call_table.remove_isolate(call_id) {
+                            Some(entry) => {
+                                // Dropping `entry` drops its translator.
                                 let original_cause = entry.cause;
-                                let _ = entry.translator.take();
                                 handle_shared.set_state(tina::CallHandleState::Cancelled);
                                 self.record_cancelled_call(
                                     call_id,
@@ -4946,10 +4923,8 @@ where
         };
         let expected_reply_type_id = match routing {
             CallRouting::Local => self
-                .pending_isolate_calls
-                .iter()
-                .find(|p| p.call_id == call_id)
-                .map(|p| p.expected_reply_type_id)
+                .call_table
+                .isolate_expected_reply_type_id(call_id)
                 .unwrap_or_else(std::any::TypeId::of::<()>),
             CallRouting::Remote { .. } => remote_expected_reply_type_id
                 .expect("remote call context carries the expected reply type"),
@@ -5143,18 +5118,9 @@ where
         cause: tina_runtime::CauseId,
         outcome: CallOutcome<Box<dyn Any>>,
     ) -> bool {
-        let Some(index) = self
-            .pending_isolate_calls
-            .iter()
-            .position(|entry| entry.call_id == call_id)
-        else {
+        let Some(pending) = self.call_table.remove_isolate(call_id) else {
             return false;
         };
-        let mut pending = self.pending_isolate_calls.remove(index);
-        let translator = pending
-            .translator
-            .take()
-            .unwrap_or_else(|| panic!("translator for call {call_id:?} already consumed"));
         if let Some(shared) = &pending.handle_shared {
             shared.set_state(tina::CallHandleState::Settled);
         }
@@ -5167,7 +5133,7 @@ where
                 visible_at_step: self.step_ordinal,
             },
             outcome,
-            translator,
+            pending.translator,
         );
         true
     }
@@ -5276,50 +5242,42 @@ where
         result: CallOutput,
         visible_at_step: u64,
     ) {
-        let in_flight_index = self
-            .in_flight_calls
-            .iter()
-            .position(|entry| entry.call_id == call_id)
-            .unwrap_or_else(|| {
-                panic!("simulator produced completion for unknown call {call_id:?}")
-            });
-        let in_flight = self.in_flight_calls.remove(in_flight_index);
-
-        let translator_index = self
-            .translators
-            .iter()
-            .position(|entry| entry.call_id == call_id)
-            .unwrap_or_else(|| panic!("missing simulator translator for call {call_id:?}"));
-        let mut stored = self.translators.remove(translator_index);
-        let translator = stored
-            .translator
-            .take()
-            .unwrap_or_else(|| panic!("translator for call {call_id:?} already consumed"));
+        // Mirror of the runtime: a completion for a call the table no longer
+        // tracks is quarantined (traced, dropped), not panicked. Keeps the
+        // simulator's observable behavior identical to the live shard's.
+        let Some(DriverCall { head, translator }) = self.call_table.remove_driver(call_id) else {
+            self.push_event(
+                IsolateId::new(0),
+                None,
+                RuntimeEventKind::DriverCompletionQuarantined { call_id },
+            );
+            return;
+        };
 
         let failure_reason = call_output_failure_reason(&result);
         if let Some(reason) = failure_reason {
             self.push_event(
-                in_flight.requester.isolate,
-                Some(in_flight.cause),
+                head.requester.isolate,
+                Some(head.cause),
                 RuntimeEventKind::CallFailed {
                     call_id,
-                    call_kind: in_flight.call_kind,
+                    call_kind: head.call_kind,
                     reason,
                 },
             );
         }
-        self.push_persistence_completion_events(&in_flight, &result, failure_reason);
+        self.push_persistence_completion_events(head, &result, failure_reason);
 
         let completion = translator(result);
         if failure_reason.is_some()
             && !matches!(completion, ErasedRuntimeCallCompletion::Message(_))
         {
             self.push_event(
-                in_flight.requester.isolate,
-                Some(in_flight.cause),
+                head.requester.isolate,
+                Some(head.cause),
                 RuntimeEventKind::CallCompletionRejected {
                     call_id,
-                    call_kind: in_flight.call_kind,
+                    call_kind: head.call_kind,
                     reason: CallCompletionRejectedReason::TerminalActionOnFailure,
                 },
             );
@@ -5327,16 +5285,16 @@ where
         }
 
         let entry_index = self.entries.iter().position(|entry| {
-            entry.id == in_flight.requester.isolate
-                && entry.generation == in_flight.requester.generation
+            entry.id == head.requester.isolate
+                && entry.generation == head.requester.generation
         });
         let Some(entry_index) = entry_index else {
             self.push_event(
-                in_flight.requester.isolate,
-                Some(in_flight.cause),
+                head.requester.isolate,
+                Some(head.cause),
                 RuntimeEventKind::CallCompletionRejected {
                     call_id,
-                    call_kind: in_flight.call_kind,
+                    call_kind: head.call_kind,
                     reason: CallCompletionRejectedReason::RequesterClosed,
                 },
             );
@@ -5345,11 +5303,11 @@ where
 
         if self.entries[entry_index].stopped.get() {
             self.push_event(
-                in_flight.requester.isolate,
-                Some(in_flight.cause),
+                head.requester.isolate,
+                Some(head.cause),
                 RuntimeEventKind::CallCompletionRejected {
                     call_id,
-                    call_kind: in_flight.call_kind,
+                    call_kind: head.call_kind,
                     reason: CallCompletionRejectedReason::RequesterClosed,
                 },
             );
@@ -5358,7 +5316,7 @@ where
 
         self.deliver_backend_completion_action_at(
             entry_index,
-            in_flight,
+            head,
             call_id,
             completion,
             failure_reason,
@@ -5369,7 +5327,7 @@ where
     fn deliver_backend_completion_action_at(
         &mut self,
         entry_index: usize,
-        in_flight: InFlightCall,
+        head: DriverCallHead,
         call_id: CallId,
         completion: ErasedRuntimeCallCompletion,
         failure_reason: Option<CallError>,
@@ -5380,38 +5338,38 @@ where
                 match self.entries[entry_index].inbox.push(
                     message,
                     visible_at_step,
-                    in_flight.continuation_context,
+                    head.continuation_context,
                 ) {
                     Ok(()) => {
                         if failure_reason.is_none() {
                             self.push_event(
-                                in_flight.requester.isolate,
-                                Some(in_flight.cause),
+                                head.requester.isolate,
+                                Some(head.cause),
                                 RuntimeEventKind::CallCompleted {
                                     call_id,
-                                    call_kind: in_flight.call_kind,
+                                    call_kind: head.call_kind,
                                 },
                             );
                         }
                     }
                     Err(TrySendError::Full(_)) => {
                         self.push_event(
-                            in_flight.requester.isolate,
-                            Some(in_flight.cause),
+                            head.requester.isolate,
+                            Some(head.cause),
                             RuntimeEventKind::CallCompletionRejected {
                                 call_id,
-                                call_kind: in_flight.call_kind,
+                                call_kind: head.call_kind,
                                 reason: CallCompletionRejectedReason::MailboxFull,
                             },
                         );
                     }
                     Err(TrySendError::Closed(_)) => {
                         self.push_event(
-                            in_flight.requester.isolate,
-                            Some(in_flight.cause),
+                            head.requester.isolate,
+                            Some(head.cause),
                             RuntimeEventKind::CallCompletionRejected {
                                 call_id,
-                                call_kind: in_flight.call_kind,
+                                call_kind: head.call_kind,
                                 reason: CallCompletionRejectedReason::RequesterClosed,
                             },
                         );
@@ -5420,81 +5378,81 @@ where
             }
             ErasedRuntimeCallCompletion::Noop => {
                 self.push_event(
-                    in_flight.requester.isolate,
-                    Some(in_flight.cause),
+                    head.requester.isolate,
+                    Some(head.cause),
                     RuntimeEventKind::CallCompleted {
                         call_id,
-                        call_kind: in_flight.call_kind,
+                        call_kind: head.call_kind,
                     },
                 );
                 self.push_event(
-                    in_flight.requester.isolate,
-                    Some(in_flight.cause),
+                    head.requester.isolate,
+                    Some(head.cause),
                     RuntimeEventKind::CallCompletionAction {
                         call_id,
-                        call_kind: in_flight.call_kind,
+                        call_kind: head.call_kind,
                         action: TerminalCompletionAction::Noop,
                     },
                 );
             }
             ErasedRuntimeCallCompletion::StopRequester => {
                 self.push_event(
-                    in_flight.requester.isolate,
-                    Some(in_flight.cause),
+                    head.requester.isolate,
+                    Some(head.cause),
                     RuntimeEventKind::CallCompleted {
                         call_id,
-                        call_kind: in_flight.call_kind,
+                        call_kind: head.call_kind,
                     },
                 );
                 let action = self.push_event(
-                    in_flight.requester.isolate,
-                    Some(in_flight.cause),
+                    head.requester.isolate,
+                    Some(head.cause),
                     RuntimeEventKind::CallCompletionAction {
                         call_id,
-                        call_kind: in_flight.call_kind,
+                        call_kind: head.call_kind,
                         action: TerminalCompletionAction::StopRequester,
                     },
                 );
-                self.stop_entry(entry_index, in_flight.requester.isolate, action.into());
+                self.stop_entry(entry_index, head.requester.isolate, action.into());
             }
         }
     }
 
     pub(crate) fn push_persistence_completion_events(
         &mut self,
-        in_flight: &InFlightCall,
+        head: DriverCallHead,
         result: &CallOutput,
         failure_reason: Option<CallError>,
     ) {
-        let Some(persistence) = in_flight.persistence else {
+        let Some(persistence) = head.persistence else {
             return;
         };
         match (persistence, failure_reason, result) {
             (PersistenceTraceInfo::SnapshotCommit, None, _) => {
                 self.push_event(
-                    in_flight.requester.isolate,
-                    Some(in_flight.cause),
+                    head.requester.isolate,
+                    Some(head.cause),
                     RuntimeEventKind::SnapshotCommitted,
                 );
             }
             (PersistenceTraceInfo::SnapshotCommit, Some(reason), _) => {
                 self.push_event(
-                    in_flight.requester.isolate,
-                    Some(in_flight.cause),
+                    head.requester.isolate,
+                    Some(head.cause),
                     RuntimeEventKind::SnapshotCommitFailed { reason },
                 );
             }
             (PersistenceTraceInfo::JournalAppend { record_index }, None, _) => {
                 self.push_event(
-                    in_flight.requester.isolate,
-                    Some(in_flight.cause),
+                    head.requester.isolate,
+                    Some(head.cause),
                     RuntimeEventKind::JournalAppended { record_index },
                 );
             }
             (PersistenceTraceInfo::JournalAppend { record_index }, Some(reason), _) => {
                 self.push_event(
-                    in_flight.requester.isolate,
-                    Some(in_flight.cause),
+                    head.requester.isolate,
+                    Some(head.cause),
                     RuntimeEventKind::JournalAppendFailed {
                         record_index,
                         reason,
@@ -5503,15 +5461,15 @@ where
             }
             (PersistenceTraceInfo::Recovery, None, _) => {
                 self.push_event(
-                    in_flight.requester.isolate,
-                    Some(in_flight.cause),
+                    head.requester.isolate,
+                    Some(head.cause),
                     RuntimeEventKind::RecoveryFinished,
                 );
             }
             (PersistenceTraceInfo::Recovery, Some(reason), _) => {
                 self.push_event(
-                    in_flight.requester.isolate,
-                    Some(in_flight.cause),
+                    head.requester.isolate,
+                    Some(head.cause),
                     RuntimeEventKind::RecoveryFailed { reason },
                 );
             }
@@ -5931,19 +5889,14 @@ where
                 .retain(|pending| pending.call_id != call_id);
 
             // Drop simulator call state too, or quiescence never arrives.
-            let in_flight_index = self
-                .in_flight_calls
-                .iter()
-                .position(|entry| entry.call_id == call_id);
-            if let Some(index) = in_flight_index {
-                let call = self.in_flight_calls.remove(index);
-                self.translators.retain(|stored| stored.call_id != call_id);
+            // Removing the driver entry drops its translator.
+            if let Some(call) = self.call_table.remove_driver(call_id) {
                 self.push_event(
-                    call.requester.isolate,
-                    Some(call.cause),
+                    call.head.requester.isolate,
+                    Some(call.head.cause),
                     RuntimeEventKind::CallCompletionRejected {
-                        call_id: call.call_id,
-                        call_kind: call.call_kind,
+                        call_id: call.head.call_id,
+                        call_kind: call.head.call_kind,
                         reason: CallCompletionRejectedReason::ResourceClosed,
                     },
                 );
@@ -5952,22 +5905,19 @@ where
     }
 
     pub(crate) fn cancel_backend_calls_for_requester(&mut self, requester: RegisteredAddress) {
-        let mut index = 0;
-        while index < self.in_flight_calls.len() {
-            if self.in_flight_calls[index].requester != requester {
-                index += 1;
-                continue;
-            }
-
-            let call = self.in_flight_calls.remove(index);
-            self.cancel_pending_backend_work(call.call_id);
-            self.remove_backend_translator(call.call_id);
+        // Ascending call-id order (== insertion order); matches the runtime.
+        for call_id in self.call_table.driver_call_ids_for_requester(requester) {
+            let call = self
+                .call_table
+                .remove_driver(call_id)
+                .expect("indexed in-flight call exists");
+            self.cancel_pending_backend_work(call.head.call_id);
             self.push_event(
-                call.requester.isolate,
-                Some(call.cause),
+                call.head.requester.isolate,
+                Some(call.head.cause),
                 RuntimeEventKind::CallCompletionRejected {
-                    call_id: call.call_id,
-                    call_kind: call.call_kind,
+                    call_id: call.head.call_id,
+                    call_kind: call.head.call_kind,
                     reason: CallCompletionRejectedReason::RequesterClosed,
                 },
             );
@@ -5992,15 +5942,6 @@ where
             .retain(|stream| stream.pending_connect_call != Some(call_id));
         self.pending_tcp_completions
             .retain(|completion| completion.call_id != call_id);
-    }
-
-    pub(crate) fn remove_backend_translator(&mut self, call_id: CallId) {
-        let translator_index = self
-            .translators
-            .iter()
-            .position(|entry| entry.call_id == call_id)
-            .unwrap_or_else(|| panic!("missing simulator translator for call {call_id:?}"));
-        self.translators.remove(translator_index);
     }
 
     pub(crate) fn push_event(
@@ -6037,10 +5978,8 @@ where
 
     pub(crate) fn requester_registration_index(&self, call_id: CallId) -> usize {
         let requester = self
-            .in_flight_calls
-            .iter()
-            .find(|entry| entry.call_id == call_id)
-            .map(|entry| entry.requester)
+            .call_table
+            .driver_requester(call_id)
             .unwrap_or_else(|| panic!("missing in-flight requester for call {call_id:?}"));
         self.entries
             .iter()

@@ -145,6 +145,8 @@ pub enum RuntimeEventKindName {
     DeferredReplyDropped,
     /// [`RuntimeEventKind::FactObserved`].
     FactObserved,
+    /// [`RuntimeEventKind::DriverCompletionQuarantined`].
+    DriverCompletionQuarantined,
 }
 
 fn runtime_event_kind_name(kind: RuntimeEventKind) -> Option<RuntimeEventKindName> {
@@ -220,6 +222,9 @@ fn runtime_event_kind_name(kind: RuntimeEventKind) -> Option<RuntimeEventKindNam
         }
         RuntimeEventKind::DeferredReplyDropped { .. } => RuntimeEventKindName::DeferredReplyDropped,
         RuntimeEventKind::FactObserved { .. } => RuntimeEventKindName::FactObserved,
+        RuntimeEventKind::DriverCompletionQuarantined { .. } => {
+            RuntimeEventKindName::DriverCompletionQuarantined
+        }
     })
 }
 

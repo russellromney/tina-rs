@@ -142,9 +142,10 @@ where
     pub(crate) pending_connects: Vec<PendingConnect>,
     pub(crate) pending_udp_recvs: Vec<PendingUdpRecv>,
     pub(crate) pending_tcp_completions: Vec<PendingTcpCompletion>,
-    pub(crate) in_flight_calls: Vec<InFlightCall>,
-    pub(crate) translators: Vec<StoredTranslator>,
-    pub(crate) pending_isolate_calls: Vec<PendingIsolateCall>,
+    /// Single owner of in-flight call bookkeeping, keyed by `CallId`. Mirrors
+    /// `tina_runtime::CallTable`; folds the former parallel
+    /// `in_flight_calls`/`translators`/`pending_isolate_calls` Vecs.
+    pub(crate) call_table: CallTable,
     pub(crate) pending_remote_spawns: Vec<PendingRemoteSpawn>,
     pub(crate) round_messages: Vec<Option<DeliveredMessage>>,
     pub(crate) next_isolate_call_ordinal: u64,
@@ -226,9 +227,7 @@ where
             pending_connects: Vec::with_capacity(INITIAL_CALL_CAPACITY),
             pending_udp_recvs: Vec::with_capacity(INITIAL_CALL_CAPACITY),
             pending_tcp_completions: Vec::with_capacity(INITIAL_CALL_CAPACITY),
-            in_flight_calls: Vec::with_capacity(INITIAL_CALL_CAPACITY),
-            translators: Vec::with_capacity(INITIAL_CALL_CAPACITY),
-            pending_isolate_calls: Vec::with_capacity(INITIAL_CALL_CAPACITY),
+            call_table: CallTable::new(),
             pending_remote_spawns: Vec::new(),
             round_messages: Vec::with_capacity(INITIAL_ENTRY_CAPACITY),
             next_isolate_call_ordinal: 0,
@@ -278,13 +277,13 @@ where
     /// Returns whether the simulator still has pending timers or undelivered
     /// call completions.
     pub fn has_in_flight_calls(&self) -> bool {
-        !self.in_flight_calls.is_empty()
+        self.call_table.has_driver_calls()
             || !self.timers.is_empty()
             || !self.pending_tcp_completions.is_empty()
             || !self.pending_accepts.is_empty()
             || !self.pending_connects.is_empty()
             || !self.pending_udp_recvs.is_empty()
-            || !self.pending_isolate_calls.is_empty()
+            || self.call_table.has_isolate_calls()
             || !self.pending_unix_accepts.is_empty()
             || !self.pending_unix_connects.is_empty()
             || !self.pending_unix_reads.is_empty()
@@ -319,6 +318,29 @@ mod tests {
             first, other_tag,
             "different fault tags should not share a trivially correlated stream"
         );
+    }
+
+    #[test]
+    fn driver_completion_for_unknown_call_is_quarantined_not_panicked() {
+        // Parity mirror of the runtime: a completion for a call the table no
+        // longer tracks is quarantined (traced, dropped), not panicked.
+        let mut sim = Simulator::new(NumberedShard(0), SimulatorConfig::default());
+
+        sim.deliver_completion(CallId::new(4242), CallOutput::TcpListenerClosed);
+
+        let quarantined = sim
+            .trace()
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event.kind(),
+                    RuntimeEventKind::DriverCompletionQuarantined { call_id }
+                        if call_id == CallId::new(4242)
+                )
+            })
+            .count();
+        assert_eq!(quarantined, 1, "exactly one quarantine event");
+        assert!(!sim.has_in_flight_calls(), "simulator survived and is idle");
     }
 
     #[test]
