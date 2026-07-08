@@ -343,7 +343,14 @@ cd tina-rs
 make verify
 ```
 
-Run the smallest service-shaped example:
+Run the smallest program — one isolate, one call, one reply:
+
+```bash
+cargo run --example hello_world -p tina-runtime
+```
+
+Then the smallest service-shaped example — a supervised dispatcher that
+replaces a crashed worker:
 
 ```bash
 cargo run -p tina-runtime --example task_dispatcher
@@ -387,9 +394,10 @@ cargo run --manifest-path examples/specimen_supervised_worker/Cargo.toml -- comp
 
 | Example | What it shows |
 |---|---|
+| [`tina-runtime/examples/hello_world.rs`](tina-runtime/examples/hello_world.rs) | Smallest runnable program: one isolate on `ThreadedRuntime`, a blocking call, a reply, shutdown. Start here. |
 | [`examples/systems/system_copied_service_path`](examples/systems/system_copied_service_path/) | Current copied service skeleton: request entry, limits, durable state, session control, fairness/load proof, live capture, replay, join/select helpers. |
 | [`examples/systems/mini_saas_api`](examples/systems/mini_saas_api/) | Larger service-shaped system with native HTTP, SQLite bridge, outbound keepalive pool, readiness, shutdown, capacity reporting, and live-replay fact. |
-| [`tina-runtime/examples/task_dispatcher.rs`](tina-runtime/examples/task_dispatcher.rs) | Smallest complete service: dispatcher isolate, worker isolates, supervision. Recommended starting point. |
+| [`tina-runtime/examples/task_dispatcher.rs`](tina-runtime/examples/task_dispatcher.rs) | Smallest complete service: dispatcher isolate, worker isolates, supervision, and `spawn_observed` for learning a child's address. |
 | [`tina-runtime/examples/tcp_echo.rs`](tina-runtime/examples/tcp_echo.rs) | Runtime-owned TCP from listener through connection close, including bounded multi-client overlap. |
 | [`tina-tokio-bridge/examples/llama_bridge.rs`](tina-tokio-bridge/examples/llama_bridge.rs) | Bridging an existing Tokio/axum app into a Tina-supervised core. |
 

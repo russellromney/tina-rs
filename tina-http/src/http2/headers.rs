@@ -1143,7 +1143,6 @@ mod tests {
         // `hpack::Decoder::decode`; the earlier `2c c1 3f` did not — `0xc1`
         // is an out-of-range index that errors gracefully before the decoder
         // ever reaches the trailing byte.)
-        let mut decoder = hpack::Decoder::new();
         let result = decode_headers_block(&[0x3f], 4096);
         assert!(matches!(result, Err(Http2ProtocolError::HpackUnsupported)));
     }
