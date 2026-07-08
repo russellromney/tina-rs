@@ -65,6 +65,7 @@ use std::convert::Infallible;
 use std::marker::PhantomData;
 
 use tina::prelude::*;
+use tina::{CallContext, CallableIsolate};
 use tina_runtime::RuntimeCall;
 
 use crate::registry::{ServiceCall, ServiceReply};
@@ -230,9 +231,26 @@ where
     type Fact = ::std::convert::Infallible;
     type Shard = S;
 
+    // Registry traffic arrives as `call()`, so the callee authority lives on
+    // `handle_call`, not `handle`. Dispatch is synchronous (decode → invoke →
+    // encode), so we answer the caller directly with no deferred slot.
+    fn handle_call(&mut self, msg: ServiceCall, call: CallContext<'_, Self>) -> Effect<Self> {
+        call.reply(self.handler.dispatch(msg))
+    }
+
+    // A plain send has no caller to answer; the reply is produced and dropped
+    // by the runtime. `SingleService` is only ever reached via `call()`.
     fn handle(&mut self, msg: ServiceCall, _ctx: &mut Context<'_, S, Self::Reply>) -> Effect<Self> {
         reply::<Self>(self.handler.dispatch(msg))
     }
+}
+
+// `handle_call` is the intentional callee surface: the registry always calls.
+impl<H, S> CallableIsolate for SingleService<H, S>
+where
+    H: ServiceHandler<S>,
+    S: tina::Shard,
+{
 }
 
 // ---------------------------------------------------------------------------

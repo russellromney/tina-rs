@@ -27,18 +27,8 @@ comparison=specimen_rpc side=tina  burst=4 ok=1 full=3 other=0
 `Error(Full)` frames. `other` covers anything unexpected so totals
 never silently shrink.
 
-> **KNOWN BUG (tina-rpc):** the Tina line above is the *target*. Today
-> it actually prints `ok=0 full=3 other=1` — the first request comes
-> back as `Error(Internal)` instead of `Reply`. The cause is in the
-> library, not this specimen: `Registry` and `SingleService` answer
-> calls via `handle` returning `Effect::Reply` (the old
-> implicit-reply-slot model), but the runtime now delivers `call()`
-> traffic to `handle_call`, whose default rejects with
-> `UnsupportedMessage`. The connection sees `CallOutcome::Rejected` and
-> maps it to `Internal`. Every tina-rpc unit test drives these isolates
-> by calling `handle` directly, so nothing caught it; this specimen is
-> the only end-to-end exerciser. Fix is a tina-rpc migration onto
-> `handle_call` + `RequestContext`, tracked separately.
+The Tina side grabs the one in-flight slot with the first request
+(`ok=1`) and sheds the rest as wire `Error(Full)` (`full=N-1`).
 
 ## Read
 
@@ -87,9 +77,8 @@ wire `Error(Full)` frames immediately. The client sees them on the
 read side of the same socket.
 
 When you run it, `full=N-1` always: the over-cap requests come back
-as `Error(Full)` on the wire. The first request is meant to grab the
-slot and get a `Reply` — see the KNOWN BUG note above for why it does
-not today.
+as `Error(Full)` on the wire. The first request grabs the slot and
+gets a `Reply`, so `ok=1`.
 
 ## Discussion
 
