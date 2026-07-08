@@ -4,6 +4,19 @@ This file records completed work.
 
 ## Unreleased
 
+### Service Skeleton
+
+- Added a `serve` mode to the mini SaaS example: `-- serve [--addr HOST:PORT]`
+  binds the HTTP server, prints one startup line (bind address, shard count,
+  capacity summary), and runs until SIGINT/SIGTERM on the runtime's
+  `signal_wait` rail, then drains through the existing shutdown choreography
+  and exits `0`. This is the copyable run-forever entrypoint; the
+  `smoke`/`pressure`/`soak` modes are the verification harness.
+- Removed the mini SaaS controller's compatibility-forward continuation
+  variants left over from the `tina::flow!` port; the flow continuations are
+  now the only notify path.
+- Split the example's `tina_impl.rs` into focused modules (controller,
+  harness, serve, shutdown) with no behavior change.
 ### Docs On-Ramp
 
 - Added `tina-runtime/examples/hello_world.rs`: the smallest runnable program —
@@ -20,7 +33,6 @@ This file records completed work.
   (`reply`, `defer(work).reply`, `tina::flow!`) before the lower-level tools.
 - Added glossary entries for `rail`, `first-form`, `fact`, `battery`, and
   `specimen`, and pointed the README quickstart at `hello_world` first.
-
 ### Continuation Flow Authoring
 
 - Added `tina::flow!`, which generates explicit continuation enums and
@@ -30,8 +42,7 @@ This file records completed work.
   generated flow carrying `RequestContext` through `CallOutcome`, including
   shadowed-request, duplicate-name, and renamed-crate expansion coverage.
 - Ported the mini SaaS `POST /items/{id}/notify` path to the generated flow
-  surface while keeping the old continuation variants as compatibility
-  forwards, and documented the pattern in the user guide.
+  surface, and documented the pattern in the user guide.
 ### Vocabulary Consolidation
 
 - Renamed `Effect::Call` to `Effect::Io` for runtime-owned I/O effects.
