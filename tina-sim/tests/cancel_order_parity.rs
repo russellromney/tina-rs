@@ -235,3 +235,53 @@ fn runtime_and_simulator_agree_on_cancel_ordering() {
         "runtime and simulator must emit the same cancel ordering"
     );
 }
+
+/// Trace-shape differential across both engines for the requester-stop
+/// workload: cancel ordering plus the carried-completion-purge property (no
+/// quarantine). A stopped requester's in-flight driver calls are exactly the
+/// "carried completions" the #255 self-review worried about; neither engine may
+/// let one leak into `deliver_completion`'s quarantine.
+#[test]
+fn runtime_and_simulator_agree_on_cancel_shape_without_quarantine() {
+    let oracle_trace = oracle_trace();
+    let sim_trace = simulator_trace();
+
+    // Same ordered outcome shape.
+    assert_eq!(
+        requester_closed_call_ids(&oracle_trace),
+        requester_closed_call_ids(&sim_trace),
+        "runtime and simulator must emit the same requester-stop cancel shape"
+    );
+    // Neither engine quarantines a stopped requester's pending completion.
+    assert_eq!(
+        quarantine_count(&oracle_trace),
+        0,
+        "runtime must not quarantine a stopped requester's carried completions"
+    );
+    assert_eq!(
+        quarantine_count(&sim_trace),
+        0,
+        "simulator must not quarantine a stopped requester's carried completions"
+    );
+}
+
+fn oracle_trace() -> Vec<RuntimeEvent> {
+    let mut runtime = Runtime::new(TestShard, TestMailboxFactory);
+    let fleet = runtime.register_with_capacity::<SleepFleet, Infallible>(SleepFleet, 8);
+    runtime.try_send(fleet, FleetMsg::Setup).expect("setup");
+    runtime.step();
+    runtime.try_send(fleet, FleetMsg::Stop).expect("stop");
+    runtime.step();
+    runtime.trace().to_vec()
+}
+
+fn simulator_trace() -> Vec<RuntimeEvent> {
+    let mut sim = Simulator::new(TestShard, SimulatorConfig::default());
+    let fleet =
+        sim.register_with_mailbox_capacity::<SleepFleet, FleetMsg, Infallible>(SleepFleet, 8);
+    sim.try_send(fleet, FleetMsg::Setup).expect("setup");
+    sim.step();
+    sim.try_send(fleet, FleetMsg::Stop).expect("stop");
+    sim.step();
+    sim.trace().to_vec()
+}
