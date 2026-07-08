@@ -970,6 +970,21 @@ where
     /// This is a synchronous control path for tests and setup code that need to
     /// distinguish mailbox `Full` from `Closed`. Ordinary ingress should prefer
     /// [`try_send`](Self::try_send), which only proves bounded handoff.
+    ///
+    /// # Intentionally unbounded
+    ///
+    /// Unlike [`call`](Self::call) (and the host-control calls it backs), the
+    /// wait here is an unbounded [`recv`](std::sync::mpsc::Receiver::recv), not
+    /// a `recv_timeout`. A worker wedged in a user handler never answers the
+    /// command, so this call **can block the host thread indefinitely**. That is
+    /// deliberate: `send_and_observe` is a setup/test convenience whose whole
+    /// contract is "report the exact mailbox outcome", and a bounded wait would
+    /// have to invent a timeout outcome that is neither `Full` nor `Closed`.
+    /// Callers who must not hang on a wedged worker should use
+    /// [`try_send`](Self::try_send) (nonblocking) or
+    /// [`send_observed_until`](Self::send_observed_until) (deadline-bounded)
+    /// instead. See the `send_and_observe_blocks_indefinitely_on_wedged_worker`
+    /// test, which pins this behavior.
     pub fn send_and_observe<M: Send + 'static, R: 'static>(
         &self,
         address: Address<M, R>,
