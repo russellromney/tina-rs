@@ -4,6 +4,26 @@ This file records completed work.
 
 ## Unreleased
 
+### RPC Dispatch Fix
+
+- Fixed tina-rpc request/reply dispatch, which was broken end-to-end: every
+  routed service call came back as a wire `Error(Internal)` instead of a
+  `Reply`. The runtime delivers `call()` traffic to `handle_call`, but
+  `Registry` and `SingleService` implemented only `handle` (the old
+  implicit-reply-slot model), so calls hit the default `handle_call` and were
+  rejected with `UnsupportedMessage`. `SingleService` now answers synchronously
+  through `handle_call`; `Registry` captures the caller's `RequestContext`,
+  defers through the downstream service call, and answers on completion via
+  `reply_to`. The wire protocol, outcome mapping, and backpressure are
+  unchanged.
+- Added end-to-end coverage that drives real `call()` traffic through the
+  runtime — host-call to registry and service, plus a full TCP roundtrip
+  through the connection isolate — asserting a `Reply` comes back. Every
+  existing tina-rpc unit test drove isolates via `handle` directly, which never
+  exercised `handle_call`; that gap is what let dispatch regress unnoticed.
+- `RegistryMsg` is no longer `Clone`: its internal continuation now carries a
+  move-only `RequestContext`.
+
 ### Examples Sweep
 
 - Compiled every out-of-workspace example crate (specimens, systems,
@@ -22,9 +42,8 @@ This file records completed work.
   returning `Effect::Reply` (the old implicit-reply-slot model) but the runtime
   now delivers `call()` traffic to `handle_call`, whose default rejects with
   `UnsupportedMessage`. Every tina-rpc unit test drives these isolates by
-  calling `handle` directly, so nothing caught it. The specimen's docs now name
-  the bug honestly (target `ok=1`, current `ok=0 ... other=1`) rather than
-  claiming a reply it does not deliver; the library fix is tracked separately.
+  calling `handle` directly, so nothing caught it. (The library fix landed in
+  the RPC Dispatch Fix above; the specimen now round-trips `ok=1`.)
 - Swept phase-number scars (bare `0NN` phase tags and `.intent/phases/…`
   narrative pointers) out of example READMEs and one source comment, restating
   each as the design fact instead.
