@@ -37,7 +37,7 @@ cargo test --manifest-path examples/specimen_cancellation_chain/Cargo.toml
   `JoinSet::abort_all()` analogue — and there will not be: explicit
   drain-and-cancel keeps each per-call outcome typed.
 
-## What changed in 072
+## Bounded cancel storage
 
 The driver used to keep a `Vec<CallHandle<WorkerReply>>` and
 `drain(..)` it on cancel. It now uses

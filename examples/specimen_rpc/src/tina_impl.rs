@@ -1,9 +1,21 @@
 //! Tina framed RPC, typed server via the `#[service]` macro.
 //!
 //! `Connection::tiny_pressure()` enforces `max_in_flight = 1` per
-//! connection. The first request grabs the slot, gets a `Reply`.
-//! The next N-1 arrive while that one is in flight and come back as
-//! wire `Error(Full)` — overload becomes a frame, not a stuck queue.
+//! connection. The first request grabs the slot; the next N-1 arrive
+//! while that one is in flight and come back as wire `Error(Full)` —
+//! overload becomes a frame, not a stuck queue.
+//!
+//! KNOWN BUG (tina-rpc): the first request should grab the slot and get
+//! a `Reply`, but it currently comes back as `Error(Internal)`, so the
+//! Tina side prints `ok=0 full=N-1 other=1` instead of the target
+//! `ok=1 full=N-1 other=0`. Root cause is in the library, not this
+//! specimen: `Registry` and `SingleService` answer via `handle`
+//! returning `Effect::Reply` (the old implicit-reply-slot model), but
+//! the runtime delivers `call()` traffic to `handle_call`, whose
+//! default rejects with `UnsupportedMessage`. The connection observes
+//! that as `CallOutcome::Rejected` and maps it to `Internal`. tina-rpc
+//! needs to migrate these isolates onto `handle_call` +
+//! `RequestContext`; tracked separately.
 
 use std::convert::Infallible;
 use std::io::{Read, Write};
@@ -32,14 +44,16 @@ use crate::{Report, RunConfig};
 
 #[service]
 trait Echo {
-    fn ping(&mut self, payload: Vec<u8>) -> Vec<u8>;
+    // `payload` is reserved by the generated `ping_request` constructor, so
+    // the method argument is named `body`.
+    fn ping(&mut self, body: Vec<u8>) -> Vec<u8>;
 }
 
 struct EchoState;
 
 impl Echo for EchoState {
-    fn ping(&mut self, payload: Vec<u8>) -> Vec<u8> {
-        payload
+    fn ping(&mut self, body: Vec<u8>) -> Vec<u8> {
+        body
     }
 }
 
@@ -67,7 +81,11 @@ struct Listener {
     spawn = ChildDefinition<Connection<SingleShard>>,
 )]
 impl Listener {
-    fn handle(&mut self, msg: ListenerMsg, _ctx: &mut Context<'_, SingleShard, Self::Reply>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: ListenerMsg,
+        _ctx: &mut Context<'_, SingleShard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             ListenerMsg::Start => tcp_bind(self.bind_addr).then(ListenerMsg::Bound),
             ListenerMsg::Bound(Ok((listener, _local_addr))) => {
@@ -164,7 +182,7 @@ fn drive_client(addr: SocketAddr, burst: usize) -> anyhow::Result<Report> {
     stream.set_read_timeout(Some(Duration::from_secs(5)))?;
     stream.set_write_timeout(Some(Duration::from_secs(5)))?;
 
-    // The macro's args decoder for `fn ping(payload: Vec<u8>)` is
+    // The macro's args decoder for `fn ping(body: Vec<u8>)` is
     // `(Vec<u8>,)` — a JSON array with one element. Encode it via
     // the same `Encoding::encode` the macro uses on the server, so
     // there's no separate "what does the wire expect" question.

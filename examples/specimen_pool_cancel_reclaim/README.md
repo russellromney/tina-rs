@@ -1,7 +1,7 @@
 # specimen_pool_cancel_reclaim
 
 Cancel a wave of in-flight pool acquires and prove the pool admits new
-acquires immediately afterward. The headline 067 capability: caller
+acquires immediately afterward. The headline capability: caller
 cancellation reclaims waiter capacity without a separate
 `CancelWaiter` ping.
 

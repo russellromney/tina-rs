@@ -76,7 +76,7 @@ What feels better:
   parses lines, increments a counter. There is nothing to "match
   up" because the client never blocked on a specific id.
 
-What 059 already closed:
+What Tina already closes here:
 
 - **No `Arc<Mutex<Vec<u32>>>` for the arrival log.** The isolate owns
   the `Vec<u32>` directly and publishes it via `stop_with(...)` when

@@ -68,7 +68,7 @@ What feels better:
   dance, no axum extractors.
 - **`HttpServerConfig::dev()` is one knob, not five.** Limits,
   service-call timeout, connection mailbox capacity all preset.
-  `pressure()` is the cap-matters preset. (047 / new checklist.)
+  `pressure()` is the cap-matters preset.
 - **Bound-address waiter is typed.** `runtime.observe_next_bound()`
   returns the address as a typed `BoundAddressWaiter`; no
   `Arc<Mutex<Option<SocketAddr>>>`.
@@ -78,8 +78,8 @@ What feels worse:
 - **Routing is a `match`.** Tokio's `Router::route("/counter",
   get(...).post(...))` is shorter than the Tina handler's `match
   (request.method, request.path)` arms. A small routing helper
-  would close the gap (047 / new checklist mentions a "tiny routing
-  shape" as deferred — `Router::new().get(...)` style).
+  would close the gap (a "tiny routing shape" —
+  `Router::new().get(...)` style — is a deferred idea).
 - **Handler return is `reply(HttpResponse)`.** `axum`'s
   `IntoResponse` trait collapses `String → 200 OK`, `StatusCode →
   empty body`, etc.; Tina's `HttpResponse::text(...)` /

@@ -87,7 +87,7 @@ What this suggests:
   step-shaped (`next_effect` / `advance`) so they shrink real code
   without hiding per-step trace events.
 
-What 059 already closed:
+What Tina already closes here:
 
 - The shared `Arc<Outcome>` with three atomics is gone. The isolate
   owns plain fields and publishes the final value with `stop_with`;

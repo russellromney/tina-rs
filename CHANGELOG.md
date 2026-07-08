@@ -4,7 +4,32 @@ This file records completed work.
 
 ## Unreleased
 
-### Service Skeleton
+### Examples Sweep
+
+- Compiled every out-of-workspace example crate (specimens, systems,
+  extensions) against current main and fixed the two that had drifted:
+  `specimen_replay_dst` now propagates the `Result` that `shrink_replay_case`
+  returns, and `specimen_rpc` renames its `#[service]` method argument off the
+  `payload` name the generated request constructor now reserves.
+- Ported `specimen_multi_turn_request_context`'s readiness service to
+  `tina::flow!`: the probe-then-db chain is the one hand-written linear
+  multi-step `RequestContext` continuation left in the example corpus, so the
+  macro now writes the continuation enum and dispatcher it used to spell out by
+  hand. Behavior is unchanged (`ready` / `not_ready` on every timeout path).
+- Documented a tina-rpc bug that `specimen_rpc` surfaces end-to-end: a
+  registry-routed service call comes back as wire `Error(Internal)` instead of
+  a `Reply`, because `Registry` and `SingleService` answer via `handle`
+  returning `Effect::Reply` (the old implicit-reply-slot model) but the runtime
+  now delivers `call()` traffic to `handle_call`, whose default rejects with
+  `UnsupportedMessage`. Every tina-rpc unit test drives these isolates by
+  calling `handle` directly, so nothing caught it. The specimen's docs now name
+  the bug honestly (target `ok=1`, current `ok=0 ... other=1`) rather than
+  claiming a reply it does not deliver; the library fix is tracked separately.
+- Swept phase-number scars (bare `0NN` phase tags and `.intent/phases/…`
+  narrative pointers) out of example READMEs and one source comment, restating
+  each as the design fact instead.
+- Removed the dead `examples/eiffel_outbound_fetch/` directory, a rename
+  leftover that held only a stale `Cargo.lock` (no manifest, no source).
 
 - Added a `serve` mode to the mini SaaS example: `-- serve [--addr HOST:PORT]`
   binds the HTTP server, prints one startup line (bind address, shard count,

@@ -42,7 +42,10 @@ fn print_tina(demo: tina_impl::Demo) {
         ),
         Err(failure) => println!("  sweep failure (paste this):\n{failure}"),
     }
-    println!("  shrink (paste this if it shrunk smaller):\n{}", demo.shrink);
+    println!(
+        "  shrink (paste this if it shrunk smaller):\n{}",
+        demo.shrink
+    );
 }
 
 fn print_tokio(report: tokio_impl::Report) {

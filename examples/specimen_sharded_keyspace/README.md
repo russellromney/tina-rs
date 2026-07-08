@@ -70,6 +70,5 @@ cargo test -p specimen-sharded-keyspace
 ## What this is not
 
 This example is in-process for clarity — not a database, not remoting,
-not a distributed keyspace. See the sharded-service primitive notes
-(`.intent/phases/053-sharded-service-primitives/plan.md`) for the
-non-goals.
+not a distributed keyspace. It exercises the sharded-service
+primitives (per-shard placement, cross-shard fan-in) in the small.
