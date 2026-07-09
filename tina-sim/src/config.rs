@@ -230,6 +230,29 @@ pub struct FaultConfig {
     pub timer_wake: FaultMode,
     /// Perturbation applied to ready TCP completions.
     pub tcp_completion: TcpCompletionFaultMode,
+    /// Perturbation applied to the within-round isolate dispatch order.
+    ///
+    /// This is the seed's scheduler dimension: the order ready isolates
+    /// handle their messages inside one `step()` round. The other three
+    /// knobs shift completion/delivery *timing*; this one shifts the
+    /// logical *interleaving* the fixed registration order otherwise
+    /// pins. Default `None` keeps registration order so existing traces
+    /// are byte-identical.
+    pub scheduler: SchedulerFaultMode,
+}
+
+/// One seeded within-round dispatch-order perturbation mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum SchedulerFaultMode {
+    /// Dispatch ready isolates in registration order (no perturbation).
+    #[default]
+    None,
+
+    /// Deterministically permute the within-round dispatch order of the
+    /// ready isolates using the run seed. Same `(seed, shard, step)` =>
+    /// same permutation, so replay stays byte-identical. A zero seed
+    /// still yields registration order.
+    PermuteReadyOrder,
 }
 
 /// One narrow seeded local-send fault mode.

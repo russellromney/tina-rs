@@ -271,9 +271,26 @@ where
             round_messages.push(message);
         }
 
+        // Seeded logical-interleaving perturbation. `None`/seed-0/len<2
+        // keep registration order (identity), so pinned golden traces are
+        // byte-identical. A non-zero seed under `PermuteReadyOrder` permutes
+        // this round's dispatch order over the fixed registration-order base
+        // enumeration. Visibility was already decided above, so this only
+        // reorders handling of already-popped messages — never causal
+        // delivery inside the round.
+        let mut dispatch_order = std::mem::take(&mut self.dispatch_order);
+        fill_dispatch_order(
+            &mut dispatch_order,
+            self.config.faults.scheduler,
+            self.config.seed,
+            u64::from(self.shard.id().get()),
+            self.step_ordinal,
+            round_messages.len(),
+        );
+
         let mut delivered = 0;
 
-        for index in 0..round_messages.len() {
+        for &index in &dispatch_order {
             let Some(message) = round_messages[index].take() else {
                 continue;
             };
@@ -402,6 +419,8 @@ where
 
         round_messages.clear();
         self.round_messages = round_messages;
+        dispatch_order.clear();
+        self.dispatch_order = dispatch_order;
 
         self.sweep_dropped_deferred_slots();
 
@@ -6415,6 +6434,49 @@ where
 pub(crate) fn fault_selector(seed: u64, tag: u64, ordinal: u64, modulus: u64) -> u64 {
     debug_assert!(modulus > 0);
     splitmix64(seed ^ tag.rotate_left(17) ^ ordinal.wrapping_mul(0x9E37_79B9_7F4A_7C15)) % modulus
+}
+
+/// Writes this round's isolate dispatch order over the fixed
+/// registration-order base enumeration `0..len` into `out`.
+///
+/// `SchedulerFaultMode::None`, a zero seed, or `len < 2` yield the
+/// identity order `0..len`, so pinned golden traces stay byte-identical.
+/// `PermuteReadyOrder` with a non-zero seed Fisher-Yates shuffles the base
+/// order using a counter-based [`splitmix64`] stream keyed by
+/// `(seed, shard, step_ordinal, swap_position)`. Same inputs => same
+/// permutation => byte-identical replay. Reuses `out`'s capacity.
+pub(crate) fn fill_dispatch_order(
+    out: &mut Vec<usize>,
+    mode: SchedulerFaultMode,
+    seed: u64,
+    shard: u64,
+    step_ordinal: u64,
+    len: usize,
+) {
+    out.clear();
+    out.extend(0..len);
+    if !matches!(mode, SchedulerFaultMode::PermuteReadyOrder) || seed == 0 || len < 2 {
+        return;
+    }
+    // Fisher-Yates: for each i from the top, swap with a seeded draw in
+    // `0..=i`. `swap_position = i` keeps each draw distinct.
+    for i in (1..len).rev() {
+        let bound = (i as u64) + 1;
+        let j = (scheduler_draw(seed, shard, step_ordinal, i as u64) % bound) as usize;
+        out.swap(i, j);
+    }
+}
+
+/// One seeded scheduler draw. Distinct mixing from [`fault_selector`] so
+/// scheduler choices do not trivially correlate with fault-knob draws that
+/// share the same run seed.
+fn scheduler_draw(seed: u64, shard: u64, step_ordinal: u64, swap_position: u64) -> u64 {
+    splitmix64(
+        seed.rotate_left(31)
+            ^ shard.wrapping_mul(0xD1B5_4A32_D192_ED03)
+            ^ step_ordinal.wrapping_mul(0xD6E8_FEB8_6659_FD93)
+            ^ swap_position.wrapping_mul(0x9E37_79B9_7F4A_7C15),
+    )
 }
 
 fn splitmix64(mut value: u64) -> u64 {

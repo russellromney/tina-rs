@@ -64,13 +64,13 @@ use internals::*;
 pub use config::{
     Checker, CheckerDecision, CheckerFailure, DurableImage, FaultConfig, FaultMode,
     LocalSendFaultMode, MultiShardReplayArtifact, ObservedPeerOutput, ReplayArtifact,
-    ScriptedDnsConfig, ScriptedDnsLookupConfig, ScriptedDnsResult, ScriptedListenerConfig,
-    ScriptedPeerConfig, ScriptedProcessConfig, ScriptedProcessResult, ScriptedProcessRunConfig,
-    ScriptedSignalConfig, ScriptedSignalEventConfig, ScriptedSignalResult,
-    ScriptedStorageFaultConfig, ScriptedTcpConfig, ScriptedTlsConfig, ScriptedTlsConnectConfig,
-    ScriptedTlsConnectResult, ScriptedTlsReadResult, ScriptedTlsWriteResult, ScriptedUdpConfig,
-    ScriptedUdpDatagramConfig, ScriptedUdpSocketConfig, SimulatorConfig, TcpCompletionFaultMode,
-    UnixSimConfig,
+    SchedulerFaultMode, ScriptedDnsConfig, ScriptedDnsLookupConfig, ScriptedDnsResult,
+    ScriptedListenerConfig, ScriptedPeerConfig, ScriptedProcessConfig, ScriptedProcessResult,
+    ScriptedProcessRunConfig, ScriptedSignalConfig, ScriptedSignalEventConfig,
+    ScriptedSignalResult, ScriptedStorageFaultConfig, ScriptedTcpConfig, ScriptedTlsConfig,
+    ScriptedTlsConnectConfig, ScriptedTlsConnectResult, ScriptedTlsReadResult,
+    ScriptedTlsWriteResult, ScriptedUdpConfig, ScriptedUdpDatagramConfig, ScriptedUdpSocketConfig,
+    SimulatorConfig, TcpCompletionFaultMode, UnixSimConfig,
 };
 pub use multi_shard::{MultiShardSimulator, MultiShardSimulatorConfig};
 
@@ -78,7 +78,7 @@ pub mod dst;
 mod sim_impl;
 
 #[cfg(test)]
-use sim_impl::fault_selector;
+use sim_impl::{fault_selector, fill_dispatch_order};
 
 /// Narrow single-shard simulator for timer-driven `tina-rs` workloads.
 pub struct Simulator<S>
@@ -148,6 +148,12 @@ where
     pub(crate) call_table: CallTable,
     pub(crate) pending_remote_spawns: Vec<PendingRemoteSpawn>,
     pub(crate) round_messages: Vec<Option<DeliveredMessage>>,
+    /// Reusable scratch holding this round's isolate dispatch order over
+    /// the fixed registration-order base enumeration. Seed-driven when
+    /// `FaultConfig::scheduler` is `PermuteReadyOrder`; identity
+    /// otherwise. Reused across rounds like `round_messages` so the
+    /// default path allocates once, not per step.
+    pub(crate) dispatch_order: Vec<usize>,
     pub(crate) next_isolate_call_ordinal: u64,
     pub(crate) last_checker_failure: Option<CheckerFailure>,
     pub(crate) deferred_registry: std::rc::Rc<DeferredSlotRegistry>,
@@ -230,6 +236,7 @@ where
             call_table: CallTable::new(),
             pending_remote_spawns: Vec::new(),
             round_messages: Vec::with_capacity(INITIAL_ENTRY_CAPACITY),
+            dispatch_order: Vec::with_capacity(INITIAL_ENTRY_CAPACITY),
             next_isolate_call_ordinal: 0,
             last_checker_failure: None,
             deferred_registry: std::rc::Rc::new(DeferredSlotRegistry::new()),
@@ -382,6 +389,72 @@ mod tests {
             !sim.has_in_flight_calls(),
             "simulator survived the quarantine"
         );
+    }
+
+    #[test]
+    fn dispatch_order_is_a_deterministic_permutation() {
+        use config::SchedulerFaultMode;
+
+        let mut order = Vec::new();
+
+        // Mode off => identity, regardless of seed. This is the property
+        // that keeps every pinned golden trace byte-identical.
+        for seed in [0u64, 7, 0xC0FFEE, u64::MAX] {
+            fill_dispatch_order(&mut order, SchedulerFaultMode::None, seed, 3, 5, 8);
+            assert_eq!(order, (0..8).collect::<Vec<_>>());
+        }
+
+        // Perturb on but seed 0 => still identity.
+        fill_dispatch_order(
+            &mut order,
+            SchedulerFaultMode::PermuteReadyOrder,
+            0,
+            3,
+            5,
+            8,
+        );
+        assert_eq!(order, (0..8).collect::<Vec<_>>());
+
+        // Perturb on, non-zero seed => a valid permutation (bijection over
+        // 0..len: every dispatch slot appears exactly once, so no isolate
+        // loses its turn and none is dispatched twice).
+        fill_dispatch_order(
+            &mut order,
+            SchedulerFaultMode::PermuteReadyOrder,
+            42,
+            3,
+            5,
+            8,
+        );
+        let mut sorted = order.clone();
+        sorted.sort_unstable();
+        assert_eq!(sorted, (0..8).collect::<Vec<_>>());
+        assert_ne!(order, (0..8).collect::<Vec<_>>(), "seed 42 reorders");
+
+        // Deterministic: same (mode, seed, shard, step, len) => same order.
+        let mut again = Vec::new();
+        fill_dispatch_order(
+            &mut again,
+            SchedulerFaultMode::PermuteReadyOrder,
+            42,
+            3,
+            5,
+            8,
+        );
+        assert_eq!(order, again);
+
+        // Distinct step ordinals give distinct streams (round-to-round
+        // interleaving actually moves, not one fixed shuffle).
+        let mut next_round = Vec::new();
+        fill_dispatch_order(
+            &mut next_round,
+            SchedulerFaultMode::PermuteReadyOrder,
+            42,
+            3,
+            6,
+            8,
+        );
+        assert_ne!(order, next_round);
     }
 
     #[test]
