@@ -4,6 +4,37 @@ This file records completed work.
 
 ## Unreleased
 
+### CI
+
+- Cut `make verify` CI time via layered caching and a faster test runner:
+  `Swatinem/rust-cache` (target/registry cache keyed on `Cargo.lock` +
+  rustc, exact hit under `--locked`) plus `sccache` via the GitHub Actions
+  cache backend (per-compilation-unit cache that survives lockfile bumps;
+  requires `CARGO_INCREMENTAL=0`, since sccache doesn't cache incremental
+  artifacts). Expected: warm runs drop from ~10-17 min to ~2-4 min.
+- Dropped the standalone `check` step from `verify` -- `cargo clippy
+  --all-targets` already type-checks everything `check` did, so running both
+  back-to-back recompiled the workspace twice for no extra coverage.
+- Switched `make test` to `cargo nextest run` (per-test-binary isolation,
+  parallel by default) plus a separate `cargo test --workspace --doc`
+  pass, since nextest cannot execute doctests. Nextest's isolation also
+  fixes the aggregate-run flakiness the trybuild compile-fail suites
+  (`admission_compile_fail`, `flow_macro_compile_fail`) saw under a single
+  `cargo test` process.
+- Split the `verify` CI job into parallel jobs -- `static` (fmt, doc;
+  ubuntu-only), `clippy` (both OSes), `test` (nextest + doctests; both
+  OSes), `guards` (loom, race-surface-guard, rail-inventory-guard, cost
+  smoke; both OSes) -- backed by new `verify-static` / `verify-guards`
+  Makefile targets so wall-clock is the slowest single job instead of the
+  sum. clippy keeps its own both-OS matrix because it only lints code it
+  compiles for the target, and the workspace has macOS-only cfg blocks.
+  `main` has no branch protection rule today, so this rename can't break an
+  existing required check; if branch protection is added later the gating
+  job names are listed in `verify.yml`.
+- Documented the local sccache setup (`RUSTC_WRAPPER=sccache
+  CARGO_INCREMENTAL=0`) in the Makefile header for developers who want the
+  same compile cache locally.
+
 ### Test Hardening
 
 - Drove the registry's deferred `Closed` and `Full` downstream outcomes through
