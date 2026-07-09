@@ -53,6 +53,30 @@ pub mod api {
         }
     }
 
+    // Exercises the `-> raw T` arrow next to a `-> T` call step in one flow.
+    // A raw step carries only its captures and `T` verbatim (no
+    // `RequestContext` slot, no `CallOutcome` wrap) and its body need not
+    // mention `req`; the call step keeps the original shape. The variant
+    // shapes are pinned by `assert_call_step_shape` / `assert_raw_step_shape`
+    // below, so a codegen regression that wrapped a raw step in
+    // `RequestContext`/`CallOutcome` would fail to compile here.
+    tina::flow! {
+        pub flow MixedArrowFlow for Driver {
+            reply u32;
+
+            step Called(seed: u32) -> u32 {
+                let _ = (seed, outcome);
+                reply_to(req, 1)
+            }
+
+            step Woke(seed: u32) -> raw u32 {
+                // No `req` in scope; the body compiles without mentioning it.
+                let _ = (seed, outcome);
+                noop()
+            }
+        }
+    }
+
     #[tina_runtime::isolate(
         message = DriverMsg,
         reply = u32,
@@ -86,8 +110,26 @@ fn assert_acronym_variant(
     api::PublicHTTPFlow::Done(req, outcome)
 }
 
+// A call step's variant is `(RequestContext, captures.., CallOutcome<T>)`.
+fn assert_call_step_shape(
+    req: tina::RequestContext<u32>,
+    seed: u32,
+    outcome: CallOutcome<u32>,
+) -> api::MixedArrowFlow {
+    api::MixedArrowFlow::Called(req, seed, outcome)
+}
+
+// A raw step's variant is `(captures.., T)` — no `RequestContext`, no
+// `CallOutcome` wrap. This will not compile if raw codegen regresses to the
+// call shape.
+fn assert_raw_step_shape(seed: u32, woke: u32) -> api::MixedArrowFlow {
+    api::MixedArrowFlow::Woke(seed, woke)
+}
+
 fn main() {
     let _ = noop::<api::Driver>();
     let _ = dispatch_public;
     let _ = assert_acronym_variant;
+    let _ = assert_call_step_shape;
+    let _ = assert_raw_step_shape;
 }
