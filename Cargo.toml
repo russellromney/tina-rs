@@ -76,3 +76,14 @@ resolver = "2"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT OR Apache-2.0"
+
+# CI/test build speed: the workspace crates and their ~220 test binaries
+# recompile on every PR (source always changes), so the dominant CI cost is
+# codegen + link of those, which no compile cache can avoid. Full debuginfo is
+# the biggest single contributor to that link time (and to the 17G target dir).
+# `line-tables-only` keeps file:line in panic/backtrace output — so a failing CI
+# test is still debuggable — while dropping the variable/type debuginfo that
+# balloons link time. Applies to dev + test builds (test inherits dev); release
+# profiles are untouched, so `make perf` measurements are unaffected.
+[profile.dev]
+debug = "line-tables-only"
