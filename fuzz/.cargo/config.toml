@@ -1,0 +1,6 @@
+# Opt the fuzz workspace out of the repo-root mold linker flag. cargo-fuzz
+# already drives its own sanitizer-instrumented link, and the weekly fuzz job
+# does not install mold; a deeper config's `target.<triple>.rustflags` replaces
+# the parent's, so this restores the default linker for fuzz builds only.
+[target.x86_64-unknown-linux-gnu]
+rustflags = []
