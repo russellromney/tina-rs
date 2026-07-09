@@ -178,6 +178,19 @@ jobs:
         # matches plain `cargo test --workspace`.
         run: make test
 
+      - name: sccache stats (diagnostic)
+        # Temporary instrumentation for the CI cache investigation: report the
+        # sccache hit-rate and on-disk sizes right after the compile-heavy
+        # `make test` step so the numbers reflect the dominant compile, not an
+        # empty warm-up run. Remove once the cache strategy is decided.
+        if: always()
+        run: |
+          echo "--- sccache --show-stats ---"
+          sccache --show-stats || true
+          echo "--- du -sh ~/.cargo target ---"
+          du -sh ~/.cargo 2>/dev/null || true
+          du -sh target 2>/dev/null || true
+
   guards:
     name: guards (loom, race-surface, rail-inventory, cost) (${{ matrix.os }})
     if: github.event_name == 'pull_request' || github.event_name == 'push'
