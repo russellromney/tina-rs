@@ -24,6 +24,15 @@ on:
 #     required alongside it -- sccache does not cache incremental artifacts,
 #     so leaving incremental on on top of sccache just adds overhead for no
 #     benefit. See the Makefile header for the local-dev equivalent.
+#
+# Caching keeps *compilation* warm (sccache hits ~76%), but linking the ~220
+# test binaries is not cacheable and dominates the test job once warm. Two
+# link-time levers attack that, configured outside this file:
+#   - .cargo/config.toml points rustc at `mold` on Linux (installed per Linux
+#     job via rui314/setup-mold); the fuzz workspace opts out.
+#   - Cargo.toml's [profile.dev] uses line-tables-only debuginfo +
+#     split-debuginfo=unpacked, cutting codegen/link weight on both OSes and
+#     skipping macOS `dsymutil`.
 env:
   RUSTC_WRAPPER: sccache
   CARGO_INCREMENTAL: "0"
@@ -75,6 +84,14 @@ jobs:
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y zsh
 
+      - name: Set up mold linker (Linux)
+        # `.cargo/config.toml` points rustc at mold for the Linux target to cut
+        # test-binary link time; every Linux job that compiles needs it on PATH.
+        # macOS is untouched (target-scoped flag). The weekly fuzz job opts out
+        # via fuzz/.cargo/config.toml, so it needs no mold.
+        if: runner.os == 'Linux'
+        uses: rui314/setup-mold@v1
+
       - name: Install pinned Rust toolchain
         # rustup show syncs the toolchain + components pinned in
         # rust-toolchain.toml, so the pin is the single source of truth.
@@ -112,6 +129,14 @@ jobs:
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y zsh
 
+      - name: Set up mold linker (Linux)
+        # `.cargo/config.toml` points rustc at mold for the Linux target to cut
+        # test-binary link time; every Linux job that compiles needs it on PATH.
+        # macOS is untouched (target-scoped flag). The weekly fuzz job opts out
+        # via fuzz/.cargo/config.toml, so it needs no mold.
+        if: runner.os == 'Linux'
+        uses: rui314/setup-mold@v1
+
       - name: Install pinned Rust toolchain
         run: rustup show
 
@@ -143,6 +168,14 @@ jobs:
       - name: Install zsh on Linux
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y zsh
+
+      - name: Set up mold linker (Linux)
+        # `.cargo/config.toml` points rustc at mold for the Linux target to cut
+        # test-binary link time; every Linux job that compiles needs it on PATH.
+        # macOS is untouched (target-scoped flag). The weekly fuzz job opts out
+        # via fuzz/.cargo/config.toml, so it needs no mold.
+        if: runner.os == 'Linux'
+        uses: rui314/setup-mold@v1
 
       - name: Install pinned Rust toolchain
         run: rustup show
@@ -178,6 +211,13 @@ jobs:
         # matches plain `cargo test --workspace`.
         run: make test
 
+      - name: sccache stats
+        # Ongoing signal: the sccache hit-rate right after the compile-heavy
+        # `make test` step. A sudden drop here (e.g. a toolchain bump or a
+        # rustflags change invalidating the cache) explains a slow run.
+        if: always()
+        run: sccache --show-stats || true
+
   guards:
     name: guards (loom, race-surface, rail-inventory, cost) (${{ matrix.os }})
     if: github.event_name == 'pull_request' || github.event_name == 'push'
@@ -195,6 +235,14 @@ jobs:
       - name: Install zsh on Linux
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y zsh
+
+      - name: Set up mold linker (Linux)
+        # `.cargo/config.toml` points rustc at mold for the Linux target to cut
+        # test-binary link time; every Linux job that compiles needs it on PATH.
+        # macOS is untouched (target-scoped flag). The weekly fuzz job opts out
+        # via fuzz/.cargo/config.toml, so it needs no mold.
+        if: runner.os == 'Linux'
+        uses: rui314/setup-mold@v1
 
       - name: Install pinned Rust toolchain
         run: rustup show

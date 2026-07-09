@@ -233,8 +233,14 @@ fn settle_pending(
     let entry = pending.lock().ok().and_then(|mut p| p.remove(&correlator));
     if let Some(entry) = entry {
         let _ = entry.deadline_cancel.send(());
-        let _ = entry.tx.send(result);
+        // Release the admission slot BEFORE waking the awaiter. `tx.send`
+        // resumes the caller's `call().await` on the Tokio thread while this
+        // runs on tina's worker thread; if `add_permits` trailed the send,
+        // the caller could observe its outcome with the slot still held, and
+        // a back-to-back call at capacity could be spuriously rejected. This
+        // ordering makes "call returned => slot already back" a real invariant.
         slots.add_permits(1);
+        let _ = entry.tx.send(result);
         true
     } else {
         false
