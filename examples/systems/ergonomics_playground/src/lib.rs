@@ -7,10 +7,10 @@ use tina::{
     send,
 };
 use tina_runtime::{
-    CallGroup, CallGroupToken, CallOutcome, CallReplyRejectedReason, DeferredReplyRejectedReason,
-    PendingReplies, RuntimeCall, RuntimeEventKind, SharedWork, SharedWorkError, SleepReply, call,
-    call_cancelable, cancel_call, request_effect_after_park, request_effect_after_shared_wait,
-    sleep,
+    CallGroupToken, CallOutcome, CallReplyRejectedReason, CallSelectSet,
+    DeferredReplyRejectedReason, PendingReplies, RuntimeCall, RuntimeEventKind, SharedWork,
+    SharedWorkError, SleepReply, call, call_cancelable, cancel_call, request_effect_after_park,
+    request_effect_after_shared_wait, sleep,
 };
 use tina_sim::{Simulator, SimulatorConfig};
 
@@ -103,7 +103,11 @@ enum QuoteRequest {
 #[derive(Debug)]
 struct PendingQuote {
     request: Option<RequestContext<QuoteReply>>,
-    group: CallGroup<u32, ProviderQuote>,
+    // `CallSelectSet` + `record_classified_reply(.., |q| q.available)`
+    // gives the same first-success-wins-and-cancels-losers race
+    // `CallGroup` provided, using the `q.available` business classifier
+    // instead of "first reply wins".
+    set: CallSelectSet<u32, ProviderQuote>,
 }
 
 #[derive(Debug)]
@@ -115,12 +119,12 @@ struct QuoteGateway {
 
 impl QuoteGateway {
     fn start_race(&mut self, request: RequestContext<QuoteReply>) -> Effect<Self> {
-        let mut group = CallGroup::with_capacity(self.providers.len());
+        let mut set = CallSelectSet::with_capacity(self.providers.len());
         let mut effects = Vec::with_capacity(self.providers.len());
 
         for (idx, provider) in self.providers.iter().copied().enumerate() {
             let key = idx as u32;
-            let effect = group
+            let effect = set
                 .start_cancelable(
                     key,
                     call_cancelable(
@@ -136,19 +140,19 @@ impl QuoteGateway {
                         })
                     },
                 )
-                .expect("fresh group accepts each provider");
+                .expect("fresh set accepts each provider");
             effects.push(effect);
         }
 
         self.pending = Some(PendingQuote {
             request: Some(request),
-            group,
+            set,
         });
         Effect::Batch(effects)
     }
 
     fn cancel_effects(
-        requests: Vec<tina_runtime::CallGroupCancelRequest<u32, ProviderQuote>>,
+        requests: Vec<tina_runtime::CallSetCancelRequest<u32, ProviderQuote>>,
     ) -> Vec<Effect<Self>> {
         requests
             .into_iter()
@@ -190,16 +194,16 @@ impl QuoteGateway {
                     _ => None,
                 };
                 let step = pending
-                    .group
-                    .record_reply(key, token, outcome, |q| q.available)
-                    .expect("continuation carries a live CallGroup token");
+                    .set
+                    .record_classified_reply(key, token, outcome, |q| q.available)
+                    .expect("continuation carries a live CallSelectSet token");
 
                 let mut effects = Self::cancel_effects(step.cancel_losers);
                 if let Some(reply) = winner {
                     if let Some(request) = pending.request.take() {
                         effects.insert(0, reply_to(request, reply));
                     }
-                } else if step.report_ready {
+                } else if pending.set.report_ready() {
                     if let Some(request) = pending.request.take() {
                         effects.insert(0, reply_to(request, QuoteReply::Unavailable));
                     }
@@ -221,11 +225,11 @@ impl QuoteGateway {
                 let Some(pending) = self.pending.as_mut() else {
                     return noop();
                 };
-                let ready = pending
-                    .group
+                let _ = pending
+                    .set
                     .record_cancel(key, token, outcome)
-                    .expect("cancel continuation carries a live CallGroup token");
-                if ready && pending.request.is_none() {
+                    .expect("cancel continuation carries a live CallSelectSet token");
+                if pending.set.report_ready() && pending.request.is_none() {
                     self.pending = None;
                 }
                 noop()

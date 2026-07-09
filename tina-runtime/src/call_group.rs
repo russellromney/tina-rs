@@ -698,6 +698,13 @@ pub struct CallSetBranchOutcome<K, R> {
     pub token: CallGroupToken,
     /// Runtime call outcome returned by the branch.
     pub outcome: CallOutcome<R>,
+    /// Whether a business-success classifier accepted this reply.
+    ///
+    /// [`CallJoinSet::record_reply`] always sets this to `true` (any
+    /// reply completes the branch; join-all does not filter). Use
+    /// [`CallJoinSet::record_classified_reply`] to apply a predicate on
+    /// `CallOutcome::Replied` payloads instead.
+    pub classified_success: bool,
 }
 
 /// One named cancel outcome observed by join/select helpers.
@@ -999,6 +1006,11 @@ where
     }
 
     /// Records one terminal branch outcome.
+    ///
+    /// Any terminal outcome (reply, timeout, rejection, ...) completes
+    /// the branch; there is no business-success filtering. Use
+    /// [`record_classified_reply`](Self::record_classified_reply) when a
+    /// branch should also be tagged against a business predicate.
     pub fn record_reply(
         &mut self,
         key: K,
@@ -1008,7 +1020,51 @@ where
     where
         K: Clone,
     {
-        let branch = self.take_branch_for_reply(key, token, outcome)?;
+        self.record_reply_with_classification(key, token, outcome, true)
+    }
+
+    /// Records one terminal branch outcome tagged by a business-success
+    /// classifier.
+    ///
+    /// `is_success` is called only for `CallOutcome::Replied`; every
+    /// other outcome is tagged `classified_success: false`. Mirrors
+    /// [`CallGroup::record_reply`]'s classifier, but `CallJoinSet` never
+    /// cancels sibling branches on success: join-all still waits for
+    /// every branch's terminal truth. Inspect
+    /// [`CallSetBranchOutcome::classified_success`] on the finished
+    /// report to find the business winner, if any.
+    pub fn record_classified_reply<F>(
+        &mut self,
+        key: K,
+        token: CallGroupToken,
+        outcome: CallOutcome<R>,
+        is_success: F,
+    ) -> Result<bool, CallSetRecordReplyError<K, R>>
+    where
+        K: Clone,
+        F: FnOnce(&R) -> bool,
+    {
+        let classified_success = match &outcome {
+            CallOutcome::Replied(reply) => is_success(reply),
+            CallOutcome::Full
+            | CallOutcome::Closed
+            | CallOutcome::Timeout
+            | CallOutcome::Rejected(_) => false,
+        };
+        self.record_reply_with_classification(key, token, outcome, classified_success)
+    }
+
+    fn record_reply_with_classification(
+        &mut self,
+        key: K,
+        token: CallGroupToken,
+        outcome: CallOutcome<R>,
+        classified_success: bool,
+    ) -> Result<bool, CallSetRecordReplyError<K, R>>
+    where
+        K: Clone,
+    {
+        let branch = self.take_branch_for_reply(key, token, outcome, classified_success)?;
         if self.branch_outcomes.len() >= self.capacity {
             return Err(CallSetRecordReplyError::StorageFull {
                 key: branch.key,
@@ -1081,6 +1137,7 @@ where
         key: K,
         token: CallGroupToken,
         outcome: CallOutcome<R>,
+        classified_success: bool,
     ) -> Result<CallSetBranchOutcome<K, R>, CallSetRecordReplyError<K, R>>
     where
         K: Clone,
@@ -1098,6 +1155,7 @@ where
                 key: entry.key,
                 token,
                 outcome,
+                classified_success,
             });
         }
         if self
@@ -1113,6 +1171,7 @@ where
                 key,
                 token,
                 outcome,
+                classified_success,
             });
         }
         Err(CallSetRecordReplyError::UnknownToken {
@@ -1154,6 +1213,20 @@ pub struct CallSelectReport<K, R> {
     pub pending: usize,
     /// Whether every branch has terminal truth.
     pub complete: bool,
+}
+
+/// Result of [`CallSelectSet::record_classified_reply`].
+#[derive(Debug)]
+pub struct CallSelectClassifiedStep<K, R> {
+    /// The branch just recorded, whether or not it classified as a win.
+    pub selected: SelectedCall<K, R>,
+    /// Whether the caller's classifier accepted this reply as the race
+    /// winner.
+    pub classified_success: bool,
+    /// Every other still-live branch, drained for cancellation because
+    /// `selected` was the classified winner. Always empty unless
+    /// `classified_success` is true.
+    pub cancel_losers: Vec<CallSetCancelRequest<K, R>>,
 }
 
 /// Fixed-capacity named set for finite "select next completed call" workflows.
@@ -1331,6 +1404,56 @@ where
         }
         self.selected.push(selected.clone());
         Ok(selected)
+    }
+
+    /// Records one terminal branch outcome under a business-success
+    /// classifier, mirroring [`CallGroup::record_reply`]'s race
+    /// semantics.
+    ///
+    /// `is_success` is called only for `CallOutcome::Replied`. When it
+    /// returns `true`, this branch is the race winner: every other live
+    /// branch is drained via
+    /// [`drain_pending_for_cancel`](Self::drain_pending_for_cancel) and
+    /// returned as `cancel_losers` for the caller to cancel explicitly —
+    /// the same shape `CallGroup::record_reply` returns on a classified
+    /// win. When it returns `false` (or the outcome is not a reply), the
+    /// branch is recorded like a plain
+    /// [`record_reply`](Self::record_reply) call and no sibling branch
+    /// is touched; call this again for the next completion.
+    ///
+    /// [`record_reply`](Self::record_reply) keeps its existing "any
+    /// reply completes the branch, nothing else is cancelled" behavior
+    /// unchanged — this method is strictly additive and opt-in.
+    pub fn record_classified_reply<F>(
+        &mut self,
+        key: K,
+        token: CallGroupToken,
+        outcome: CallOutcome<R>,
+        is_success: F,
+    ) -> Result<CallSelectClassifiedStep<K, R>, CallSetRecordReplyError<K, R>>
+    where
+        K: Clone,
+        R: Clone,
+        F: FnOnce(&R) -> bool,
+    {
+        let classified_success = match &outcome {
+            CallOutcome::Replied(reply) => is_success(reply),
+            CallOutcome::Full
+            | CallOutcome::Closed
+            | CallOutcome::Timeout
+            | CallOutcome::Rejected(_) => false,
+        };
+        let selected = self.record_reply(key, token, outcome)?;
+        let cancel_losers = if classified_success {
+            self.drain_pending_for_cancel()
+        } else {
+            Vec::new()
+        };
+        Ok(CallSelectClassifiedStep {
+            selected,
+            classified_success,
+            cancel_losers,
+        })
     }
 
     /// Drains every live branch for explicit owner-stop cancellation.
@@ -1919,6 +2042,76 @@ mod tests {
     }
 
     #[test]
+    fn join_set_record_reply_tags_every_branch_classified_success() {
+        let mut set: CallJoinSet<u8, Reply> = CallJoinSet::with_capacity(1);
+        let token = set.insert(1, make_handle()).unwrap();
+
+        assert!(
+            set.record_reply(1, token, CallOutcome::Timeout).unwrap(),
+            "single branch completes the join"
+        );
+        let report = set.into_report();
+        assert_eq!(report.branch_outcomes.len(), 1);
+        assert!(
+            report.branch_outcomes[0].classified_success,
+            "plain record_reply keeps the any-reply-completes default"
+        );
+    }
+
+    #[test]
+    fn join_set_record_classified_reply_only_tags_matching_replies() {
+        let mut set: CallJoinSet<u8, Reply> = CallJoinSet::with_capacity(2);
+        let low = set.insert(1, make_handle()).unwrap();
+        let high = set.insert(2, make_handle()).unwrap();
+
+        assert!(
+            !set.record_classified_reply(1, low, CallOutcome::Replied(Reply(1)), |reply| {
+                reply.0 >= 10
+            })
+            .unwrap()
+        );
+        assert!(
+            set.record_classified_reply(2, high, CallOutcome::Replied(Reply(10)), |reply| {
+                reply.0 >= 10
+            })
+            .unwrap()
+        );
+
+        let report = set.into_report();
+        assert!(report.complete);
+        let low_outcome = report
+            .branch_outcomes
+            .iter()
+            .find(|outcome| outcome.key == 1)
+            .unwrap();
+        let high_outcome = report
+            .branch_outcomes
+            .iter()
+            .find(|outcome| outcome.key == 2)
+            .unwrap();
+        assert!(
+            !low_outcome.classified_success,
+            "non-matching reply must not be tagged classified_success"
+        );
+        assert!(
+            high_outcome.classified_success,
+            "matching reply must be tagged classified_success"
+        );
+
+        // Non-reply outcomes never classify as success, even if the
+        // predicate is written to ignore its input.
+        let mut timeout_set: CallJoinSet<u8, Reply> = CallJoinSet::with_capacity(1);
+        let timeout_token = timeout_set.insert(9, make_handle()).unwrap();
+        assert!(
+            timeout_set
+                .record_classified_reply(9, timeout_token, CallOutcome::Timeout, |_| true)
+                .unwrap()
+        );
+        let timeout_report = timeout_set.into_report();
+        assert!(!timeout_report.branch_outcomes[0].classified_success);
+    }
+
+    #[test]
     fn join_set_report_pending_counts_reserved_tokens() {
         let mut set: CallJoinSet<&'static str, Reply> = CallJoinSet::with_capacity(2);
         let _reserved = set.reserve_token().unwrap();
@@ -2038,5 +2231,87 @@ mod tests {
         let report = set.into_report();
         assert_eq!(report.pending, 1);
         assert!(!report.complete);
+    }
+
+    #[test]
+    fn classified_reply_non_matching_reply_is_not_selected_as_winner() {
+        let mut set: CallSelectSet<u8, Reply> = CallSelectSet::with_capacity(2);
+        let slow = set.insert(1, make_handle()).unwrap();
+        let fast = set.insert(2, make_handle()).unwrap();
+
+        // "fast" arrives first but fails the business predicate: it
+        // must not win, and no sibling should be cancelled.
+        let step = set
+            .record_classified_reply(2, fast, CallOutcome::Replied(Reply(0)), |reply| {
+                reply.0 >= 10
+            })
+            .unwrap();
+        assert!(!step.classified_success);
+        assert!(
+            step.cancel_losers.is_empty(),
+            "a non-matching reply must not drain siblings"
+        );
+        assert_eq!(set.len(), 1, "the other branch is still live");
+
+        // "slow" arrives second and matches: it is the winner.
+        let step = set
+            .record_classified_reply(1, slow, CallOutcome::Replied(Reply(10)), |reply| {
+                reply.0 >= 10
+            })
+            .unwrap();
+        assert!(step.classified_success);
+        assert_eq!(step.selected.key, 1);
+        assert!(
+            step.cancel_losers.is_empty(),
+            "no siblings remain once both branches have replied"
+        );
+    }
+
+    #[test]
+    fn classified_reply_matching_reply_wins_and_drains_siblings() {
+        let mut set: CallSelectSet<u8, Reply> = CallSelectSet::with_capacity(2);
+        let winner_token = set.insert(1, make_handle()).unwrap();
+        let loser_token = set.insert(2, make_handle()).unwrap();
+
+        let step = set
+            .record_classified_reply(1, winner_token, CallOutcome::Replied(Reply(10)), |reply| {
+                reply.0 >= 10
+            })
+            .unwrap();
+        assert!(step.classified_success);
+        assert_eq!(step.selected.key, 1);
+        assert_eq!(step.cancel_losers.len(), 1);
+        let (loser_key, drained_token, _handle) =
+            step.cancel_losers.into_iter().next().unwrap().into_parts();
+        assert_eq!(loser_key, 2);
+        assert_eq!(drained_token, loser_token);
+        assert!(set.is_empty(), "the loser was drained out of live entries");
+        assert!(!set.report_ready(), "still waiting on the loser cancel");
+
+        let cancel = set
+            .record_cancel(2, loser_token, CancelOutcome::Cancelled)
+            .unwrap();
+        assert!(matches!(
+            cancel.outcome,
+            SelectedCallOutcome::Cancel(CancelOutcome::Cancelled)
+        ));
+        let report = set.into_report();
+        assert!(report.complete);
+        assert_eq!(report.selected.len(), 2);
+        assert_eq!(report.cancel_outcomes.len(), 1);
+    }
+
+    #[test]
+    fn classified_reply_ignores_non_reply_outcomes() {
+        // A predicate that always returns true must still not classify
+        // Timeout/Full/Closed/Rejected outcomes as a win: `is_success`
+        // is only consulted for `CallOutcome::Replied`.
+        let mut set: CallSelectSet<u8, Reply> = CallSelectSet::with_capacity(1);
+        let token = set.insert(1, make_handle()).unwrap();
+        let step = set
+            .record_classified_reply(1, token, CallOutcome::Timeout, |_| true)
+            .unwrap();
+        assert!(!step.classified_success);
+        assert!(step.cancel_losers.is_empty());
     }
 }
