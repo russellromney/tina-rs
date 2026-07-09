@@ -33,14 +33,14 @@ use std::time::{Duration, Instant};
 use http::StatusCode;
 use tina::capacity::{CapacityMode, CapacitySurfaceReport};
 use tina::prelude::*;
-use tina::{CallContext, RequestContext, reply_to};
+use tina::{RequestContext, reply_to};
 use tina_http::{
     HttpConnectionMsg, HttpLimits, HttpListener, HttpListenerMsg, HttpRequest, HttpRequestBody,
     HttpResponse, RequestChunkReply,
 };
 use tina_runtime::{
     CallOutcome, DefaultThreadedMailboxFactory, EventId, RequestScope, RequestScopeId,
-    RequestScopeSet, RuntimeCall, RuntimeEvent, ScopeCancelCause, ScopedRequestReport, ScopedTimer,
+    RequestScopeSet, RuntimeEvent, ScopeCancelCause, ScopedRequestReport, ScopedTimer,
     ScopedTimerFire, ScopedTimerId, ScopedTimerSet, ThreadedRuntime, ThreadedRuntimeConfig, call,
     call_cancelable, sleep,
 };
@@ -200,19 +200,31 @@ struct PendingTree {
     enrich_done: bool,
 }
 
-enum TreeMsg {
-    Inbound(HttpRequest),
+/// Split-service request: the only inbound authority this tree ever sees
+/// is one HTTP request. `TreeRequest` is local to this crate, so
+/// `From<HttpRequest>` on it is an ordinary, orphan-legal impl — unlike
+/// `tina::ServiceMessage<TreeEvent, TreeRequest>`, which is foreign on
+/// both sides (defined in `tina`, built from `tina_http::HttpRequest`) and
+/// could never be `impl From<HttpRequest> for ..` here. `tina_http`
+/// supplies that half generically (see `FromHttpRequest`), so
+/// `HttpListener<SingleShard, ServiceMessage<TreeEvent, TreeRequest>>`
+/// only needs this plain impl below to wire up.
+struct TreeRequest(HttpRequest);
+
+impl From<HttpRequest> for TreeRequest {
+    fn from(request: HttpRequest) -> Self {
+        Self(request)
+    }
+}
+
+/// Split-service events: every async continuation the tree reports to
+/// itself. None of these carry caller authority.
+enum TreeEvent {
     Chunk(RequestId, CallOutcome<RequestChunkReply>),
     EnrichDone(RequestId, CallOutcome<EnrichReply>),
     EnrichReleased,
     Deadline(RequestId, ScopedTimerId),
     ChildCancelled(&'static str, CancelOutcome),
-}
-
-impl From<HttpRequest> for TreeMsg {
-    fn from(request: HttpRequest) -> Self {
-        Self::Inbound(request)
-    }
 }
 
 struct Tree {
@@ -224,28 +236,19 @@ struct Tree {
     obs: Arc<Mutex<TreeObs>>,
 }
 
-impl Isolate for Tree {
-    tina::isolate_types! {
-        message: TreeMsg,
-        reply: HttpResponse,
-        send: tina::Outbound<Infallible>,
-        spawn: Infallible,
-        io: RuntimeCall<TreeMsg>,
-        shard: SingleShard,
-    }
-
-    fn handle(
+#[tina_runtime::isolate(event = TreeEvent, request = TreeRequest, reply = HttpResponse)]
+impl Tree {
+    fn handle_event(
         &mut self,
-        msg: TreeMsg,
+        event: TreeEvent,
         _ctx: &mut Context<'_, SingleShard, Self::Reply>,
     ) -> Effect<Self> {
-        match msg {
-            TreeMsg::Inbound(_) => noop(),
-            TreeMsg::Chunk(id, outcome) => self.on_chunk(id, outcome),
-            TreeMsg::EnrichDone(id, outcome) => self.on_enrich_done(id, outcome),
-            TreeMsg::EnrichReleased => noop(),
-            TreeMsg::Deadline(id, timer_id) => self.on_deadline(id, timer_id),
-            TreeMsg::ChildCancelled(label, outcome) => {
+        match event {
+            TreeEvent::Chunk(id, outcome) => self.on_chunk(id, outcome),
+            TreeEvent::EnrichDone(id, outcome) => self.on_enrich_done(id, outcome),
+            TreeEvent::EnrichReleased => noop(),
+            TreeEvent::Deadline(id, timer_id) => self.on_deadline(id, timer_id),
+            TreeEvent::ChildCancelled(label, outcome) => {
                 self.obs
                     .lock()
                     .expect("obs")
@@ -256,11 +259,12 @@ impl Isolate for Tree {
         }
     }
 
-    fn handle_call(&mut self, msg: TreeMsg, call: CallContext<'_, Self>) -> Effect<Self> {
-        match msg {
-            TreeMsg::Inbound(request) => self.on_inbound(request, call),
-            _ => call.reject(tina::CallRejectedReason::UnsupportedMessage),
-        }
+    fn handle_request(
+        &mut self,
+        request: TreeRequest,
+        call: RequestCall<'_, Self>,
+    ) -> RequestEffect<Self> {
+        self.on_inbound(request.0, call)
     }
 }
 
@@ -268,8 +272,8 @@ impl Tree {
     fn on_inbound(
         &mut self,
         request: HttpRequest,
-        call_ctx: CallContext<'_, Self>,
-    ) -> Effect<Self> {
+        call_ctx: RequestCall<'_, Self>,
+    ) -> RequestEffect<Self> {
         if request.method != http::Method::POST || request.path != "/upload" {
             return call_ctx.reply(text(StatusCode::NOT_FOUND, "not_found\n"));
         }
@@ -296,7 +300,7 @@ impl Tree {
 
         // Start the cancelable enrich child and register it into the scope.
         let (enrich_effect, handle) = call_cancelable(self.enrich, EnrichMsg::Work, CHILD_TIMEOUT)
-            .then(move |outcome| TreeMsg::EnrichDone(id, outcome));
+            .then(move |outcome| tina::ServiceMessage::Event(TreeEvent::EnrichDone(id, outcome)));
         if scope.register("enrich", handle).is_err() {
             // Child cap is sized for exactly this rail; a failure is a bug.
             let _ = self.scopes.remove(&id);
@@ -308,28 +312,31 @@ impl Tree {
         }
 
         let timer_id = timer.id();
-        let deadline_effect: Effect<Self> =
-            sleep(REQUEST_DEADLINE).then(move |_| TreeMsg::Deadline(id, timer_id));
+        let deadline_effect: Effect<Self> = sleep(REQUEST_DEADLINE)
+            .then(move |_| tina::ServiceMessage::Event(TreeEvent::Deadline(id, timer_id)));
 
         let source = stream.source;
+        let expected = stream.content_length;
         let pull = call(source, HttpConnectionMsg::body_next(), CHILD_TIMEOUT)
-            .then(move |outcome| TreeMsg::Chunk(id, outcome));
+            .then(move |outcome| tina::ServiceMessage::Event(TreeEvent::Chunk(id, outcome)));
 
-        self.pending.insert(
-            id,
-            PendingTree {
-                req: Some(call_ctx.into_request_context()),
-                scope,
-                timer,
-                source,
-                expected: stream.content_length,
-                accumulated: 0,
-                body_done: false,
-                enrich_done: false,
-            },
-        );
+        call_ctx.capture(move |req_ctx| {
+            self.pending.insert(
+                id,
+                PendingTree {
+                    req: Some(req_ctx),
+                    scope,
+                    timer,
+                    source,
+                    expected,
+                    accumulated: 0,
+                    body_done: false,
+                    enrich_done: false,
+                },
+            );
 
-        batch(vec![enrich_effect, deadline_effect, pull])
+            batch(vec![enrich_effect, deadline_effect, pull])
+        })
     }
 
     fn on_chunk(&mut self, id: RequestId, outcome: CallOutcome<RequestChunkReply>) -> Effect<Self> {
@@ -341,7 +348,7 @@ impl Tree {
                 tree.accumulated += bytes.len();
                 let source = tree.source;
                 call(source, HttpConnectionMsg::body_next(), CHILD_TIMEOUT)
-                    .then(move |outcome| TreeMsg::Chunk(id, outcome))
+                    .then(move |outcome| tina::ServiceMessage::Event(TreeEvent::Chunk(id, outcome)))
             }
             CallOutcome::Replied(RequestChunkReply::Eof) => {
                 if tree.accumulated < tree.expected {
@@ -355,7 +362,7 @@ impl Tree {
                     // ignored; the real completion is the `EnrichDone`
                     // worker-return.
                     call(enrich, EnrichMsg::Release, CHILD_TIMEOUT)
-                        .then(|_| TreeMsg::EnrichReleased)
+                        .then(|_| tina::ServiceMessage::Event(TreeEvent::EnrichReleased))
                 }
             }
             CallOutcome::Replied(RequestChunkReply::Error(_)) => {
@@ -438,11 +445,11 @@ impl Tree {
         };
         // Tombstone the deadline timer (a real sleep may still fire late).
         let _ = self.timers.cancel(tree.timer.id());
-        let (cancel_report, cancel_effect) = tree
-            .scope
-            .cancel_into_effect::<Self, _, _>(cause, move |_scope, label, outcome| {
-                TreeMsg::ChildCancelled(label, outcome)
-            });
+        let (cancel_report, cancel_effect) =
+            tree.scope
+                .cancel_into_effect::<Self, _, _>(cause, move |_scope, label, outcome| {
+                    tina::ServiceMessage::Event(TreeEvent::ChildCancelled(label, outcome))
+                });
         // Remove from the set, then snapshot capacity so the report shows
         // the slot reclaimed.
         let _ = self.scopes.remove(&id);
@@ -510,9 +517,10 @@ pub fn run() -> anyhow::Result<ScopedTreeReport> {
         ..HttpLimits::default()
     };
     let bind: SocketAddr = "127.0.0.1:0".parse()?;
+    type TreeMessage = tina::ServiceMessage<TreeEvent, TreeRequest>;
     let listener = runtime
-        .register_with_capacity::<HttpListener<SingleShard, TreeMsg>, _>(
-            HttpListener::<SingleShard, TreeMsg>::new(
+        .register_with_capacity::<HttpListener<SingleShard, TreeMessage>, _>(
+            HttpListener::<SingleShard, TreeMessage>::new(
                 bind,
                 controller,
                 limits,

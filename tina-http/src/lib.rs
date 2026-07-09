@@ -270,9 +270,9 @@ pub use streaming::{
 pub use target::{HttpHostPolicy, HttpTarget, TlsTrustRoots};
 pub use transport::HttpTransport;
 pub use types::{
-    HttpClientConfig, HttpClientError, HttpLimits, HttpRequest, HttpRequestBody, HttpResponse,
-    HttpResponseBody, HttpServerConfig, HttpTransportPhase, PoolConfig, RequestParseError,
-    ResponseParseError,
+    FromHttpRequest, HttpClientConfig, HttpClientError, HttpLimits, HttpRequest, HttpRequestBody,
+    HttpResponse, HttpResponseBody, HttpServerConfig, HttpTransportPhase, PoolConfig,
+    RequestParseError, ResponseParseError,
 };
 pub use websocket::{
     WebSocketAccept, WebSocketCloseCode, WebSocketError, WebSocketLimits, WebSocketMessage,

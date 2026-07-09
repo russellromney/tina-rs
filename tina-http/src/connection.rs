@@ -60,7 +60,9 @@ use crate::streaming::{
     RequestChunkReply, RequestStream, ResponseChunkMsg, ResponseChunkReply, ResponseStream,
 };
 use crate::transport::HttpTransport;
-use crate::types::{HttpLimits, HttpRequest, HttpResponse, HttpResponseBody, RequestParseError};
+use crate::types::{
+    FromHttpRequest, HttpLimits, HttpRequest, HttpResponse, HttpResponseBody, RequestParseError,
+};
 use crate::websocket::{
     FrameParse, WebSocketAccept, WebSocketCloseCode, WebSocketError, WebSocketMessage,
     WebSocketOutboundQueue, WebSocketReportRequest, WebSocketSend, WebSocketSendError,
@@ -223,11 +225,11 @@ impl HttpConnectionMsg {
 
 /// Per-connection isolate.
 ///
-/// Generic over the user's `Shard` type and the service's message
-/// type `M`. `M` defaults to `HttpRequest` for sync-reply services;
-/// multi-turn services declare an enum that wraps `HttpRequest` and
-/// supply `From<HttpRequest>`.
-pub struct HttpConnection<S: Shard, M: From<HttpRequest> + Send + 'static = HttpRequest> {
+/// Generic over the user's `Shard` type and the service's message type
+/// `M`, which must implement [`FromHttpRequest`] — see
+/// [`crate::HttpListener`] for how that bound is satisfied, including for
+/// split-service `ServiceMessage<Event, Request>` message types.
+pub struct HttpConnection<S: Shard, M: FromHttpRequest + Send + 'static = HttpRequest> {
     transport: HttpTransport,
     /// Per-call deadline passed to TLS lane reads/writes/closes. Ignored
     /// on the TCP transport (TCP reads/writes have no per-call deadline
@@ -350,7 +352,7 @@ pub struct HttpConnection<S: Shard, M: From<HttpRequest> + Send + 'static = Http
     _shard: std::marker::PhantomData<S>,
 }
 
-impl<S: Shard, M: From<HttpRequest> + Send + 'static> HttpConnection<S, M> {
+impl<S: Shard, M: FromHttpRequest + Send + 'static> HttpConnection<S, M> {
     /// Builds a new connection isolate over a TCP transport. Convenience
     /// for the plain-HTTP path.
     pub fn new(
@@ -446,7 +448,7 @@ impl<S: Shard, M: From<HttpRequest> + Send + 'static> HttpConnection<S, M> {
 // The `#[tina_runtime::isolate]` macro requires a concrete shard type; we
 // write the `Isolate` impl by hand so a single `HttpConnection`
 // implementation works for any user-chosen shard.
-impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Isolate for HttpConnection<S, M> {
+impl<S: Shard + 'static, M: FromHttpRequest + Send + 'static> Isolate for HttpConnection<S, M> {
     tina::isolate_types! {
         message: HttpConnectionMsg,
         reply: RequestChunkReply,
@@ -596,7 +598,7 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Isolate for Http
     }
 }
 
-impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S, M> {
+impl<S: Shard + 'static, M: FromHttpRequest + Send + 'static> HttpConnection<S, M> {
     /// First-effect hook. Issues both the initial `tcp_read` and the
     /// slow-loris deadline `sleep` in one batch so they race the
     /// client's bytes against the configured timeout.
@@ -914,8 +916,12 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
                 head.into_request(buf)
             }
         };
-        call(self.service, M::from(request), self.service_call_timeout)
-            .then(HttpConnectionMsg::ServiceReturned)
+        call(
+            self.service,
+            M::from_http_request(request),
+            self.service_call_timeout,
+        )
+        .then(HttpConnectionMsg::ServiceReturned)
     }
 
     /// Returns the shard id for self. The dispatch path needs this to
@@ -2428,7 +2434,7 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpConnection<S
 // (panic, runtime stop, force-close). Without this, an isolate
 // dropped mid-body would leave its charge resident in the shared
 // metrics forever, breaking the "drained()" terminal assertion.
-impl<S: Shard, M: From<HttpRequest> + Send + 'static> Drop for HttpConnection<S, M> {
+impl<S: Shard, M: FromHttpRequest + Send + 'static> Drop for HttpConnection<S, M> {
     fn drop(&mut self) {
         if let Some(metrics) = &self.metrics {
             if self.metrics_request_charge > 0 {
