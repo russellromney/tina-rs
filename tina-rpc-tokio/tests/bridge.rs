@@ -551,6 +551,58 @@ async fn close_fanout_settles_live_call_with_true_terminal_not_timeout() {
 }
 
 #[tokio::test]
+async fn back_to_back_calls_at_capacity_one_never_spuriously_full() {
+    // User-perspective e2e liveness at the #271 capacity edge.
+    //
+    // Bridge capacity is exactly 1. Each call is awaited to completion, then
+    // the next is issued immediately, 2000 times against the same single-slot
+    // edge. This proves the settle -> release -> re-admit cycle stays live
+    // end-to-end and the slot is always back after a settled call.
+    //
+    // NOTE: this is coverage, not the #271 ordering regression proof. With
+    // this synchronous stub the worker thread runs `settle_pending` to
+    // completion (including the trailing `add_permits`) before the Tokio
+    // awaiter is rescheduled, so the "permit still held at the wake instant"
+    // race does not manifest here -- this test passes under BOTH slot
+    // orderings. The genuine, disable-provable regression guard for the
+    // ordering is `settle_returns_permit_before_reply_is_observable` in the
+    // crate's unit tests, which pins the permit state at the exact
+    // pre-`tx.send` instant.
+    let runtime = build_runtime();
+    let stub = register_stub(&runtime, StubBehavior::Echo);
+    let bridge = BridgeClient::<SpecimenShard>::new(Arc::clone(&runtime), stub, 1, 64).unwrap();
+
+    for i in 0..2_000i64 {
+        let outcome: Result<(i64, i64), BridgeError> = bridge
+            .call(
+                |corr, rt| {
+                    EchoClient::add_request(i, i + 1, Duration::from_secs(5), corr, rt, 1024)
+                },
+                |bytes| {
+                    serde_json::from_slice(bytes).map_err(|_| tina_rpc::EncodingError::Decode {
+                        encoder: "json",
+                        kind: tina_rpc::EncodingErrorKind::Syntax,
+                    })
+                },
+            )
+            .await;
+        assert_eq!(
+            outcome,
+            Ok((i, i + 1)),
+            "back-to-back call at capacity 1 (iteration {i}) must be admitted and succeed, \
+             never spuriously Full",
+        );
+    }
+
+    // After the last settle the single permit must be back.
+    assert_eq!(
+        bridge.available_slots(),
+        1,
+        "admission slot must be returned after every settled call",
+    );
+}
+
+#[tokio::test]
 async fn parallel_calls_demux_correctly() {
     let runtime = build_runtime();
     let stub = register_stub(&runtime, StubBehavior::Echo);

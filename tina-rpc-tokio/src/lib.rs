@@ -224,6 +224,39 @@ fn fire_observer_err(
     // first. Do not double-release.
 }
 
+/// Deterministic test hook fired inside [`settle_pending`] at the exact
+/// instant the reply becomes observable to the awaiter (immediately before
+/// `tx.send`). Tests install a closure that inspects the admission semaphore
+/// to prove the permit-return-before-wake invariant without a cross-thread
+/// timing race. Never compiled into release builds.
+#[cfg(test)]
+mod settle_race_hook {
+    use std::sync::Mutex;
+
+    use tokio::sync::Semaphore;
+
+    type Hook = Box<dyn Fn(&Semaphore) + Send + Sync>;
+
+    static HOOK: Mutex<Option<Hook>> = Mutex::new(None);
+
+    /// Installs the hook fired at the pre-`tx.send` point.
+    pub(super) fn set(hook: Hook) {
+        *HOOK.lock().expect("settle race hook mutex") = Some(hook);
+    }
+
+    /// Removes any installed hook.
+    pub(super) fn clear() {
+        *HOOK.lock().expect("settle race hook mutex") = None;
+    }
+
+    /// Fires the installed hook, if any, with the live admission semaphore.
+    pub(super) fn fire(slots: &Semaphore) {
+        if let Some(hook) = HOOK.lock().expect("settle race hook mutex").as_ref() {
+            hook(slots);
+        }
+    }
+}
+
 fn settle_pending(
     pending: &Mutex<PendingMap>,
     slots: &Semaphore,
@@ -240,6 +273,13 @@ fn settle_pending(
         // a back-to-back call at capacity could be spuriously rejected. This
         // ordering makes "call returned => slot already back" a real invariant.
         slots.add_permits(1);
+        // Deterministic race hook, anchored to the instant the reply becomes
+        // observable (the `tx.send` on the next line). A test can inspect the
+        // slot state here to prove the permit is already back BEFORE the
+        // awaiter can observe the outcome. If someone reorders `add_permits`
+        // to trail `tx.send`, this observation flips and the guard test fails.
+        #[cfg(test)]
+        settle_race_hook::fire(slots);
         let _ = entry.tx.send(result);
         true
     } else {
@@ -1063,6 +1103,99 @@ mod tests {
             slots.available_permits(),
             1,
             "stale release must not inflate permits above max"
+        );
+    }
+
+    // The settle-race hook is a process-global static. Serialize every
+    // test that installs it so parallel test threads never clobber each
+    // other's hook. Any hook-using test takes this lock for its whole body.
+    static HOOK_GUARD: Mutex<()> = Mutex::new(());
+
+    fn insert_pending(
+        pending: &Mutex<PendingMap>,
+        correlator: u64,
+    ) -> oneshot::Receiver<ClientResult> {
+        let (tx, rx) = oneshot::channel::<ClientResult>();
+        let (deadline_cancel, _deadline_cancel_rx) = oneshot::channel::<()>();
+        pending.lock().unwrap().insert(
+            correlator,
+            PendingCall {
+                tx,
+                deadline_cancel,
+            },
+        );
+        rx
+    }
+
+    // DETERMINISTIC regression guard for the #271 admission-slot ordering.
+    //
+    // Invariant: when `settle_pending` makes a reply observable to the
+    // awaiter (`entry.tx.send`), the admission permit is ALREADY back, so a
+    // back-to-back `call()` at capacity is admitted rather than spuriously
+    // rejected with `Full`. The hook fires at the exact pre-`tx.send` instant
+    // and, standing in for the woken awaiter, attempts the very same
+    // `try_acquire` that `BridgeClient::call` runs first.
+    //
+    // Fixed order (`add_permits` then `tx.send`): the hook sees a free permit
+    // and admission succeeds -> passes. Old order (`tx.send` then
+    // `add_permits`): the permit is still held at the pre-send point,
+    // admission fails -> this test fails. Disable-the-fix proof: move
+    // `slots.add_permits(1)` below the `entry.tx.send(result)` line and this
+    // test flips to red.
+    #[test]
+    fn settle_returns_permit_before_reply_is_observable() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let _guard = HOOK_GUARD.lock().unwrap();
+
+        let pending: Arc<Mutex<PendingMap>> = Arc::new(Mutex::new(HashMap::new()));
+        // max_in_flight = 1, fully saturated: the in-flight call holds the
+        // only permit, exactly the capacity edge where the race bites.
+        let slots = Arc::new(Semaphore::new(1));
+        Arc::clone(&slots)
+            .try_acquire_owned()
+            .expect("admission")
+            .forget();
+        assert_eq!(slots.available_permits(), 0, "at capacity before settle");
+
+        let _rx = insert_pending(&pending, 7);
+
+        // The hook models the woken awaiter's immediate back-to-back
+        // `call()`: at the instant the reply is observable, does the next
+        // `try_acquire` (admission) succeed?
+        let admitted = Arc::new(AtomicBool::new(false));
+        let admitted_hook = Arc::clone(&admitted);
+        settle_race_hook::set(Box::new(move |s: &Semaphore| {
+            admitted_hook.store(s.try_acquire().is_ok(), Ordering::SeqCst);
+        }));
+
+        let settled = settle_pending(&pending, &slots, 7, ClientResult::Ok(b"ok".to_vec()));
+        settle_race_hook::clear();
+
+        assert!(settled, "settle_pending removed the live entry");
+        assert!(
+            admitted.load(Ordering::SeqCst),
+            "back-to-back admission at the reply-observable instant must succeed: \
+             the permit must be returned BEFORE tx.send wakes the awaiter",
+        );
+    }
+
+    // NEGATIVE twin: while GENUINELY at capacity with nothing settling, the
+    // admission `try_acquire` must fail (the user's back-to-back `call()`
+    // correctly gets `Full`). Guards against an over-correction that would
+    // hand out phantom permits. No settle occurs here, so the fix ordering is
+    // irrelevant — this pins the other side of the invariant.
+    #[test]
+    fn admission_fails_while_genuinely_at_capacity() {
+        let slots = Arc::new(Semaphore::new(1));
+        Arc::clone(&slots)
+            .try_acquire_owned()
+            .expect("admission")
+            .forget();
+        assert_eq!(slots.available_permits(), 0);
+        assert!(
+            slots.try_acquire().is_err(),
+            "no permit is free while an in-flight call still holds it",
         );
     }
 
