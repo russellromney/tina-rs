@@ -385,10 +385,10 @@ cargo run --manifest-path examples/specimen_supervised_worker/Cargo.toml -- comp
 
 | Command | Purpose |
 |---|---|
-| `make verify` | Full project gate: fmt, clippy, tests, miri, simulator, cost smoke. |
+| `make verify` | Full project gate: fmt, clippy, tests, miri, simulator, cost smoke. CI runs it as four parallel jobs (`static`, `clippy`, `test`, `guards`); locally it's still one command. |
 | `make portable-runtime-cost` | Optional local cost-smoke rows. Not a benchmark. |
 | `make miri` | Focused unsafe-memory checks for `tina-mailbox-spsc`. |
-| `make fmt` / `make check` / `make test` / `make clippy` / `make doc` | Individual targets. |
+| `make fmt` / `make check` / `make test` / `make clippy` / `make doc` | Individual targets. `make test` runs [`cargo nextest`](https://nexte.st/) plus a doctest pass (nextest can't run doctests). |
 
 ## Examples
 

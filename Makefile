@@ -1,9 +1,17 @@
 SHELL := /bin/zsh
 EXAMPLES_TARGET_DIR ?= $(CURDIR)/target/verify-examples
 
+# Local sccache (optional, mirrors CI's compile cache): install sccache
+# (`cargo install sccache --locked` or `brew install sccache`), then
+#   export RUSTC_WRAPPER=sccache CARGO_INCREMENTAL=0
+# before running any `make` target. CARGO_INCREMENTAL=0 is required —
+# sccache does not cache incremental artifacts, so leaving incremental on
+# just adds overhead with no cache benefit. `sccache --show-stats` reports
+# hit rate.
+
 .PHONY: fmt fmt-check check test loom miri doc clippy portable-runtime-cost perf \
-	perf-compare verify verify-examples proof-fast proof-soak proof-long-soak proof-bad-peer \
-	proof-replay-regression race-surface-guard rail-inventory-guard
+	perf-compare verify verify-static verify-guards verify-examples proof-fast proof-soak \
+	proof-long-soak proof-bad-peer proof-replay-regression race-surface-guard rail-inventory-guard
 
 fmt:
 	cargo fmt --all
@@ -11,11 +19,21 @@ fmt:
 fmt-check:
 	cargo fmt --all --check
 
+# Not a `verify` prerequisite: `cargo clippy --all-targets` already type-checks
+# everything `cargo check` does, so running both back-to-back double-compiles
+# the whole workspace for no extra coverage. Kept as a standalone target for a
+# quick local check-only loop (faster than clippy, no lints).
 check:
 	cargo check --workspace --locked
 
+# nextest runs everything except doctests (it can't execute them), so the
+# doctest pass below is required for parity with plain `cargo test`. nextest's
+# per-test-binary isolation also fixes the aggregate-run flakiness the
+# trybuild compile-fail suites (admission_compile_fail, flow_macro_compile_fail)
+# see under a single `cargo test` process.
 test:
-	cargo test --workspace --locked
+	cargo nextest run --workspace --locked
+	cargo test --workspace --doc --locked
 
 loom:
 	cargo test --locked -p tina-mailbox-spsc --features loom --test loom_spsc
@@ -131,9 +149,24 @@ proof-bad-peer:
 proof-replay-regression:
 	cargo test --manifest-path examples/systems/system_live_replay_bugbox/Cargo.toml --test smoke
 
-verify: fmt-check check test loom race-surface-guard rail-inventory-guard doc clippy
+# Split of `verify` into independent groups, so CI can run them as concurrent
+# jobs (wall-clock = slowest group, not the sum). Each group is also a valid
+# standalone local target.
+#
+# `clippy` is intentionally NOT folded in here: it must run per-platform
+# (clippy only lints code it compiles for the target, and this workspace has
+# macOS-only cfg blocks), so CI matrixes the standalone `clippy` target over
+# both OSes. fmt-check and doc are platform-independent, so this group runs
+# ubuntu-only.
+verify-static: fmt-check doc
+
+verify-guards: loom race-surface-guard rail-inventory-guard
 	cargo run --locked -p tina-runtime --example portable_runtime_cost | tee /tmp/tina-verify-cost.txt
 	grep -E "cost rows / local_machine comparison_baseline=none" /tmp/tina-verify-cost.txt
 	grep -E "mailbox local push/pop|local send|live ingress|cross-shard send|isolate call|timer|TCP loopback|TLS loopback|file read/write|journal append|bridge call" /tmp/tina-verify-cost.txt
 	grep -E "measured-local-cost" /tmp/tina-verify-cost.txt
 	grep -E "not-measured:" /tmp/tina-verify-cost.txt
+
+# Full sequential gate, for a single local command. CI runs the groups above
+# (plus a per-platform `clippy`) as parallel jobs instead of this target.
+verify: verify-static clippy test verify-guards

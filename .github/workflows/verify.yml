@@ -13,10 +13,50 @@ on:
     - cron: "0 7 * * 1"
   workflow_dispatch:
 
+# Compile-cache wiring shared by every build job below:
+#   - Swatinem/rust-cache restores ~/.cargo (registry/git) + target/, keyed on
+#     Cargo.lock + rustc version. Since the workspace builds --locked, the key
+#     is exact: a cache hit means zero recompilation.
+#   - sccache sits behind that as a second, finer-grained layer: it caches
+#     individual compilation units (via the GitHub Actions cache backend), so
+#     even a Cargo.lock bump or a new job/OS combination still gets warm
+#     per-crate hits instead of a from-scratch rebuild. CARGO_INCREMENTAL=0 is
+#     required alongside it -- sccache does not cache incremental artifacts,
+#     so leaving incremental on on top of sccache just adds overhead for no
+#     benefit. See the Makefile header for the local-dev equivalent.
+env:
+  RUSTC_WRAPPER: sccache
+  CARGO_INCREMENTAL: "0"
+  SCCACHE_GHA_ENABLED: "true"
+
 jobs:
-  verify:
-    name: make verify (${{ matrix.os }})
-    # Per-PR / push gate only; the scheduled trigger runs the fuzz job instead.
+  # Tier 4 split of the old single `verify` job: fmt/doc, clippy, the test
+  # suite, and the loom/guard/cost checks now run as independent jobs so
+  # wall-clock is the slowest group, not their sum.
+  #
+  # Platform coverage: fmt and doc are platform-independent, so `static` runs
+  # ubuntu-only to save macOS minutes. clippy is NOT platform-independent --
+  # it only lints code it compiles for the target, and this workspace has
+  # macOS-only cfg blocks (fullfsync, signal handling) -- so the old
+  # both-OS clippy coverage is preserved by matrixing the dedicated `clippy`
+  # job over ubuntu + macos. test + guards also keep the full OS matrix since
+  # both cover platform-specific runtime behavior.
+  #
+  # NOTE for branch protection: `main` currently has NO branch protection
+  # rule configured (verified via `gh api repos/.../branches/main/protection`
+  # -> 404 "Branch not protected"), so there is no existing required-check
+  # name this rename could break. If branch protection is added later, the
+  # per-PR gate is these job names (all matrixed ubuntu + macos):
+  # "static checks (fmt, doc) (ubuntu-latest)" / "(macos-latest)",
+  # "clippy (ubuntu-latest)" / "(macos-latest)",
+  # "test (nextest + doctests) (ubuntu-latest)" / "(macos-latest)",
+  # "guards (loom, race-surface, rail-inventory, cost) (ubuntu-latest)" / "(macos-latest)".
+  static:
+    name: static checks (fmt, doc) (${{ matrix.os }})
+    # Both OSes: fmt is platform-independent, but `doc` is not — the workspace
+    # has macOS-only `cfg` blocks (fullfsync/signal handling) whose rustdoc
+    # `-D warnings` lints are only gated when doc runs on macOS too, matching
+    # the old single `make verify` job.
     if: github.event_name == 'pull_request' || github.event_name == 'push'
     runs-on: ${{ matrix.os }}
     strategy:
@@ -25,7 +65,45 @@ jobs:
         os:
           - ubuntu-latest
           - macos-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
 
+      - name: Install zsh on Linux
+        # Makefile SHELL is zsh (matches macOS's default); Linux runners need
+        # it installed explicitly.
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y zsh
+
+      - name: Install pinned Rust toolchain
+        # rustup show syncs the toolchain + components pinned in
+        # rust-toolchain.toml, so the pin is the single source of truth.
+        run: rustup show
+
+      - name: Cache cargo + target
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: "true"
+
+      - name: Set up sccache
+        uses: mozilla-actions/sccache-action@v0.0.10
+
+      - name: fmt-check + doc
+        run: make verify-static
+
+  clippy:
+    # Matrixed over both OSes on purpose: clippy only lints code compiled for
+    # the active target, and macOS-only cfg blocks would otherwise never be
+    # linted per-PR. Preserves the old single job's both-platform clippy.
+    name: clippy (${{ matrix.os }})
+    if: github.event_name == 'pull_request' || github.event_name == 'push'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -35,9 +113,50 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y zsh
 
       - name: Install pinned Rust toolchain
-        # rustup show syncs the toolchain + components pinned in
-        # rust-toolchain.toml, so the pin is the single source of truth.
         run: rustup show
+
+      - name: Cache cargo + target
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: "true"
+
+      - name: Set up sccache
+        uses: mozilla-actions/sccache-action@v0.0.10
+
+      - name: clippy
+        run: make clippy
+
+  test:
+    name: test (nextest + doctests) (${{ matrix.os }})
+    if: github.event_name == 'pull_request' || github.event_name == 'push'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install zsh on Linux
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y zsh
+
+      - name: Install pinned Rust toolchain
+        run: rustup show
+
+      - name: Cache cargo + target
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: "true"
+
+      - name: Set up sccache
+        uses: mozilla-actions/sccache-action@v0.0.10
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
 
       - name: Betelgeuse Linux backend smoke
         if: runner.os == 'Linux'
@@ -54,8 +173,42 @@ jobs:
         # `--locked` so a drifted lockfile fails here instead of silently.
         run: cargo check -p tina-http --features fuzzing --locked
 
-      - name: Verify workspace
-        run: make verify
+      - name: nextest + doctests
+        # nextest does not run doctests; `make test` runs both so coverage
+        # matches plain `cargo test --workspace`.
+        run: make test
+
+  guards:
+    name: guards (loom, race-surface, rail-inventory, cost) (${{ matrix.os }})
+    if: github.event_name == 'pull_request' || github.event_name == 'push'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install zsh on Linux
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y zsh
+
+      - name: Install pinned Rust toolchain
+        run: rustup show
+
+      - name: Cache cargo + target
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: "true"
+
+      - name: Set up sccache
+        uses: mozilla-actions/sccache-action@v0.0.10
+
+      - name: loom + race-surface-guard + rail-inventory-guard + cost
+        run: make verify-guards
 
   fuzz:
     name: fuzz targets (60s each)
@@ -65,6 +218,12 @@ jobs:
     # feature, so a target itself can bit-rot silently otherwise).
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
+    # Override the workflow-level sccache wrapper: this job has no
+    # sccache-action step (cargo-fuzz's sanitizer-instrumented build isn't
+    # worth wrapping), so inheriting RUSTC_WRAPPER=sccache would invoke a
+    # binary that isn't installed and fail `cargo install cargo-fuzz`.
+    env:
+      RUSTC_WRAPPER: ""
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -73,6 +232,17 @@ jobs:
         # The pin in rust-toolchain.toml is already nightly, which cargo-fuzz
         # requires; rustup show syncs it.
         run: rustup show
+
+      - name: Cache cargo + target
+        # Same lock-keyed cache as the verify jobs; a weekly job benefits the
+        # most from a warm registry/target since it otherwise always starts
+        # cold. No sccache here: cargo-fuzz's sanitizer-instrumented build
+        # uses non-standard rustc flags that aren't worth the extra moving
+        # part on a job that already isn't a PR gate.
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: "true"
+          workspaces: "fuzz -> target"
 
       - name: Install cargo-fuzz
         run: cargo install cargo-fuzz --locked
