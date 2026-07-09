@@ -86,10 +86,7 @@ pub struct SlowEvent {
 }
 
 pub enum SoakMsg {
-    Request {
-        worker_id: usize,
-        request_id: usize,
-    },
+    Request { worker_id: usize, request_id: usize },
     Flow(SoakFlow),
 }
 
@@ -231,11 +228,7 @@ impl Soak {
                 let fake = self.fake_http;
                 sleep(fake).then(move |result| {
                     SoakMsg::Flow(SoakFlow::HttpReleased(
-                        qid,
-                        worker_id,
-                        request_id,
-                        started_ms,
-                        result,
+                        qid, worker_id, request_id, started_ms, result,
                     ))
                 })
             }
@@ -283,11 +276,7 @@ impl Soak {
         let fake = self.fake_db;
         sleep(fake).then(move |result| {
             SoakMsg::Flow(SoakFlow::DbReleased(
-                qid,
-                worker_id,
-                request_id,
-                started_ms,
-                result,
+                qid, worker_id, request_id, started_ms, result,
             ))
         })
     }
