@@ -68,4 +68,11 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "grpc_frame"
+path = "fuzz_targets/grpc_frame.rs"
+test = false
+doc = false
+bench = false
+
 [workspace]

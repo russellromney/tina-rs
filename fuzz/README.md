@@ -38,22 +38,32 @@ CI does not fuzz per-PR (too slow to gate on). Instead:
 | `h2_payload` | HTTP/2 DATA/HEADERS padding + priority stripping (`data_payload_view` / `headers_payload_view`). |
 | `hpack_headers` | The HPACK soundness walker vs `hpack::Decoder::decode` — see below. |
 | `ws_frame` | Hand-rolled WebSocket frame parser (client + server framing: 7/16/64-bit lengths, mask XOR, buffer draining). |
+| `grpc_frame` | Hand-rolled gRPC length-prefix reassembler (`next_grpc_frame_boundary` in `grpc.rs`) — header check, `max_message_bytes` cap, boundary/drain math. Never touches `prost` decode. |
 
-`h2_frame_meta`, `h2_payload`, `hpack_headers`, and `ws_frame` reach
-`pub(super)`/`pub(crate)` internals through the `fuzzing` feature on `tina-http`
-(`http2::fuzzing`, `websocket::fuzzing`), never enabled in production.
+`h2_frame_meta`, `h2_payload`, `hpack_headers`, `ws_frame`, and `grpc_frame`
+reach `pub(super)`/`pub(crate)` internals through the `fuzzing` feature on
+`tina-http` (`http2::fuzzing`, `websocket::fuzzing`, `grpc::fuzzing`), never
+enabled in production.
 
-## Not fuzzed, covered by inspection
+## The `grpc_frame` target
 
-The gRPC length-prefixed frame reassembler (`GrpcRequestStream::next_buffered_message`
-in `grpc.rs`) is hand-rolled but has no target: its constructor requires a
-runtime-coupled `Http2RequestStream`, and its only decode work delegates to
-`prost` (fuzzed upstream). The tina-specific framing is fully length-guarded —
-`buffer.len() < GRPC_FRAME_HEADER_LEN` and `< end` early-returns, a
-`max_message_bytes` cap, and a `drain(..end)` bounded by the checked `end` — so
-it is panic-safe by construction. Extracting the pure framing into a
-standalone function so it can be fuzzed (and unit-tested) directly is a tracked
-follow-up.
+`GrpcRequestStream::next_buffered_message` used to be untestable in isolation:
+its constructor requires a runtime-coupled `Http2RequestStream`, and its
+decode step delegates to `prost` (fuzzed upstream, not our concern). The pure
+length-prefix state machine — the 5-byte header check, the `max_message_bytes`
+cap on the declared length, and the `drain`-bounded end offset — is now
+extracted into `next_grpc_frame_boundary`, a free function taking `&mut
+Vec<u8>` and a cap with no connection coupling. `next_buffered_message` calls
+it and only owns the `T::decode` / `GrpcStatus` mapping on top.
+
+The target (`grpc::fuzzing::fuzz_grpc_frame_reassembly`) feeds arbitrary bytes
+through the boundary function in a loop — draining each `Ready` boundary and
+re-running it, so one input can exercise several concatenated frames — and
+asserts only that no boundary offset ever exceeds the buffer length. The seed
+corpus (`fuzz/corpus/grpc_frame/`) covers a truncated header, a declared
+length over the cap, a declared length near `u32::MAX` with a short body, two
+concatenated messages, and a zero-length message; the same shapes are also
+deterministic unit tests in `grpc.rs` (`grpc::tests::frame_boundary_*`).
 
 ## The `hpack_headers` target
 
@@ -87,5 +97,5 @@ directions. The `panic = "unwind"` regression that the gate is load-bearing
 `hpack_gate_rejects_before_decode_not_via_catch_unwind`.
 
 The seed corpus for this target holds three genuine panic inputs (truncated,
-unterminated, and over-long size updates) plus one well-formed block; the other
-five targets ship no seeds.
+unterminated, and over-long size updates) plus one well-formed block. The
+other targets ship no seeds, except `grpc_frame` (see above).

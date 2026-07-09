@@ -537,6 +537,96 @@ pub enum GrpcStreamReply<T> {
     DeadlineExceeded,
 }
 
+/// Outcome of one length-prefix reassembly step over a gRPC frame buffer.
+///
+/// This is the pure part of [`GrpcRequestStream::next_buffered_message`],
+/// extracted so it can be unit-tested and fuzzed with no `Http2RequestStream`
+/// coupling: it never touches the runtime, only the byte buffer and the
+/// configured cap. See `fuzz/fuzz_targets/grpc_frame.rs`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GrpcFrameBoundary {
+    /// Fewer than one full frame is buffered; the buffer is untouched.
+    NeedMore,
+    /// The buffered frame is malformed (unsupported compression flag or a
+    /// declared length over the cap); the buffer has already been cleared.
+    Malformed(GrpcFrameError),
+    /// One full frame — the 5-byte header plus its declared payload — sits at
+    /// `buffer[..end]`, not yet drained.
+    Ready { end: usize },
+}
+
+/// Why [`GrpcFrameBoundary::Malformed`] rejected the buffered frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GrpcFrameError {
+    /// The reserved compression-flag byte was non-zero; only identity
+    /// (uncompressed) frames are supported.
+    UnsupportedCompression,
+    /// The declared payload length exceeds `max_message_bytes`.
+    MessageTooLarge { len: usize, max: usize },
+}
+
+/// Advance the length-prefix reassembly state machine by exactly one step.
+///
+/// Preserves the original guards byte-for-byte: the 5-byte header check, the
+/// `max_message_bytes` cap on the declared length (checked before the
+/// buffered-bytes-available check, so an oversized declared length is
+/// rejected without waiting for the body to arrive), and an `end` offset that
+/// is always `<= buffer.len()` before it is used to slice or drain — no
+/// allocation is ever sized directly from attacker-supplied bytes without
+/// first passing the cap.
+pub(crate) fn next_grpc_frame_boundary(
+    buffer: &mut Vec<u8>,
+    max_message_bytes: usize,
+) -> GrpcFrameBoundary {
+    if buffer.len() < GRPC_FRAME_HEADER_LEN {
+        return GrpcFrameBoundary::NeedMore;
+    }
+    if buffer[0] != 0 {
+        buffer.clear();
+        return GrpcFrameBoundary::Malformed(GrpcFrameError::UnsupportedCompression);
+    }
+    let len = u32::from_be_bytes([buffer[1], buffer[2], buffer[3], buffer[4]]) as usize;
+    if len > max_message_bytes {
+        buffer.clear();
+        return GrpcFrameBoundary::Malformed(GrpcFrameError::MessageTooLarge {
+            len,
+            max: max_message_bytes,
+        });
+    }
+    let end = GRPC_FRAME_HEADER_LEN + len;
+    if buffer.len() < end {
+        return GrpcFrameBoundary::NeedMore;
+    }
+    GrpcFrameBoundary::Ready { end }
+}
+
+/// Pure entry points for the out-of-workspace fuzz harness. The reassembler
+/// is `pub(crate)`; this is the only sanctioned way past that boundary and
+/// exists only under the `fuzzing` feature.
+#[cfg(feature = "fuzzing")]
+#[doc(hidden)]
+pub mod fuzzing {
+    /// Feed arbitrary bytes through the length-prefix reassembler under the
+    /// default `max_message_bytes` cap, draining and re-running boundary
+    /// lookup so concatenated frames in one input get exercised too. Only
+    /// asserts panic-freedom and that every boundary stays within the
+    /// buffer — never calls into `prost` decode.
+    pub fn fuzz_grpc_frame_reassembly(bytes: &[u8]) {
+        let max_message_bytes = super::GrpcLimits::default().max_message_bytes;
+        let mut buffer = bytes.to_vec();
+        loop {
+            match super::next_grpc_frame_boundary(&mut buffer, max_message_bytes) {
+                super::GrpcFrameBoundary::NeedMore => break,
+                super::GrpcFrameBoundary::Malformed(_) => break,
+                super::GrpcFrameBoundary::Ready { end } => {
+                    assert!(end <= buffer.len(), "boundary must stay within the buffer");
+                    let _frame: Vec<u8> = buffer.drain(..end).collect();
+                }
+            }
+        }
+    }
+}
+
 impl<T> GrpcRequestStream<T>
 where
     T: Message + Default,
@@ -611,40 +701,29 @@ where
     }
 
     fn next_buffered_message(&mut self) -> GrpcStreamReply<T> {
-        if self.buffer.len() < GRPC_FRAME_HEADER_LEN {
-            return GrpcStreamReply::NeedMore;
-        }
-        if self.buffer[0] != 0 {
-            self.buffer.clear();
-            return GrpcStreamReply::Status(GrpcStatus::with_message(
-                GrpcStatusCode::Unimplemented,
-                "compression unsupported",
-            ));
-        }
-        let len = u32::from_be_bytes([
-            self.buffer[1],
-            self.buffer[2],
-            self.buffer[3],
-            self.buffer[4],
-        ]) as usize;
-        if len > self.limits.max_message_bytes {
-            self.buffer.clear();
-            return GrpcStreamReply::Status(GrpcStatus::with_message(
-                GrpcStatusCode::ResourceExhausted,
-                format!(
-                    "request message {len} exceeds cap {}",
-                    self.limits.max_message_bytes
-                ),
-            ));
-        }
-        let end = GRPC_FRAME_HEADER_LEN + len;
-        if self.buffer.len() < end {
-            return GrpcStreamReply::NeedMore;
-        }
-        let frame: Vec<u8> = self.buffer.drain(..end).collect();
-        match T::decode(&frame[GRPC_FRAME_HEADER_LEN..]) {
-            Ok(message) => GrpcStreamReply::Message(message),
-            Err(_) => GrpcStreamReply::Status(GrpcStatus::new(GrpcStatusCode::InvalidArgument)),
+        match next_grpc_frame_boundary(&mut self.buffer, self.limits.max_message_bytes) {
+            GrpcFrameBoundary::NeedMore => GrpcStreamReply::NeedMore,
+            GrpcFrameBoundary::Malformed(GrpcFrameError::UnsupportedCompression) => {
+                GrpcStreamReply::Status(GrpcStatus::with_message(
+                    GrpcStatusCode::Unimplemented,
+                    "compression unsupported",
+                ))
+            }
+            GrpcFrameBoundary::Malformed(GrpcFrameError::MessageTooLarge { len, max }) => {
+                GrpcStreamReply::Status(GrpcStatus::with_message(
+                    GrpcStatusCode::ResourceExhausted,
+                    format!("request message {len} exceeds cap {max}"),
+                ))
+            }
+            GrpcFrameBoundary::Ready { end } => {
+                let frame: Vec<u8> = self.buffer.drain(..end).collect();
+                match T::decode(&frame[GRPC_FRAME_HEADER_LEN..]) {
+                    Ok(message) => GrpcStreamReply::Message(message),
+                    Err(_) => {
+                        GrpcStreamReply::Status(GrpcStatus::new(GrpcStatusCode::InvalidArgument))
+                    }
+                }
+            }
         }
     }
 }
@@ -2509,5 +2588,132 @@ mod tests {
             .expect_err("framed body exceeds cap");
 
         assert!(matches!(err, GrpcError::EncodeTooLarge { max: 4, .. }));
+    }
+
+    // -- next_grpc_frame_boundary: the extracted pure framing state machine --
+    // (fuzzed directly in fuzz/fuzz_targets/grpc_frame.rs; these cover the
+    // seed-corpus shapes plus the boundary math as deterministic unit tests.)
+
+    #[test]
+    fn frame_boundary_need_more_on_truncated_header() {
+        // Fewer than 5 header bytes: must wait, must not touch the buffer.
+        let mut buf = vec![0u8; GRPC_FRAME_HEADER_LEN - 1];
+        let boundary = next_grpc_frame_boundary(&mut buf, GrpcLimits::default().max_message_bytes);
+        assert_eq!(boundary, GrpcFrameBoundary::NeedMore);
+        assert_eq!(
+            buf.len(),
+            GRPC_FRAME_HEADER_LEN - 1,
+            "must not mutate the buffer while awaiting more header bytes"
+        );
+    }
+
+    #[test]
+    fn frame_boundary_rejects_length_over_cap() {
+        // Header declares len=10 against a cap of 5: reject immediately, do
+        // not wait for the (attacker-controlled) body to show up.
+        let mut buf = vec![0u8, 0, 0, 0, 10];
+        let boundary = next_grpc_frame_boundary(&mut buf, 5);
+        assert_eq!(
+            boundary,
+            GrpcFrameBoundary::Malformed(GrpcFrameError::MessageTooLarge { len: 10, max: 5 })
+        );
+        assert!(
+            buf.is_empty(),
+            "oversized declared length must clear the buffer"
+        );
+    }
+
+    #[test]
+    fn frame_boundary_rejects_length_over_cap_disabled_guard_would_fail_here() {
+        // Same shape as above, phrased as the guard-disabled regression: if
+        // the `len > max_message_bytes` check were ever deleted, this frame
+        // would fall through to `Ready` with an `end` computed from a fully
+        // attacker-controlled `len`, which is exactly the unbounded
+        // allocation this cap exists to prevent.
+        let mut buf = vec![0u8, 0, 0, 1, 0]; // len = 256
+        let boundary = next_grpc_frame_boundary(&mut buf, 4);
+        assert!(
+            matches!(
+                boundary,
+                GrpcFrameBoundary::Malformed(GrpcFrameError::MessageTooLarge { len: 256, max: 4 })
+            ),
+            "expected the cap to reject len=256 against max=4, got {boundary:?}"
+        );
+    }
+
+    #[test]
+    fn frame_boundary_need_more_on_huge_length_short_body() {
+        // Header declares the maximum possible u32 length but only the
+        // 5-byte header itself has arrived. With no cap in effect this must
+        // still be NeedMore (not a crash, not an allocation of 4GiB) — the
+        // boundary check is `buffer.len() < end`, never an eager allocation
+        // sized from the declared length.
+        let mut buf = vec![0u8, 0xFF, 0xFF, 0xFF, 0xFF];
+        let boundary = next_grpc_frame_boundary(&mut buf, usize::MAX);
+        assert_eq!(boundary, GrpcFrameBoundary::NeedMore);
+        assert_eq!(
+            buf.len(),
+            GRPC_FRAME_HEADER_LEN,
+            "must not mutate the buffer while awaiting body bytes"
+        );
+    }
+
+    #[test]
+    fn frame_boundary_finds_first_of_several_concatenated_messages() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&[0, 0, 0, 0, 2]); // message 1: len=2
+        buf.extend_from_slice(&[0xAA, 0xBB]);
+        buf.extend_from_slice(&[0, 0, 0, 0, 3]); // message 2: len=3
+        buf.extend_from_slice(&[1, 2, 3]);
+        let max = GrpcLimits::default().max_message_bytes;
+
+        let first = next_grpc_frame_boundary(&mut buf, max);
+        assert_eq!(
+            first,
+            GrpcFrameBoundary::Ready {
+                end: GRPC_FRAME_HEADER_LEN + 2
+            }
+        );
+        let frame: Vec<u8> = buf.drain(..GRPC_FRAME_HEADER_LEN + 2).collect();
+        assert_eq!(&frame[GRPC_FRAME_HEADER_LEN..], &[0xAA, 0xBB]);
+
+        let second = next_grpc_frame_boundary(&mut buf, max);
+        assert_eq!(
+            second,
+            GrpcFrameBoundary::Ready {
+                end: GRPC_FRAME_HEADER_LEN + 3
+            }
+        );
+        let frame: Vec<u8> = buf.drain(..GRPC_FRAME_HEADER_LEN + 3).collect();
+        assert_eq!(&frame[GRPC_FRAME_HEADER_LEN..], &[1, 2, 3]);
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn frame_boundary_accepts_zero_length_message() {
+        let mut buf = vec![0u8, 0, 0, 0, 0];
+        let boundary = next_grpc_frame_boundary(&mut buf, GrpcLimits::default().max_message_bytes);
+        assert_eq!(
+            boundary,
+            GrpcFrameBoundary::Ready {
+                end: GRPC_FRAME_HEADER_LEN
+            }
+        );
+        assert_eq!(
+            buf.len(),
+            GRPC_FRAME_HEADER_LEN,
+            "boundary lookup must not drain; the caller drains"
+        );
+    }
+
+    #[test]
+    fn frame_boundary_rejects_nonzero_compression_flag_and_clears_buffer() {
+        let mut buf = vec![1u8, 0, 0, 0, 0];
+        let boundary = next_grpc_frame_boundary(&mut buf, GrpcLimits::default().max_message_bytes);
+        assert_eq!(
+            boundary,
+            GrpcFrameBoundary::Malformed(GrpcFrameError::UnsupportedCompression)
+        );
+        assert!(buf.is_empty());
     }
 }
