@@ -191,6 +191,34 @@ where
     }
 }
 
+/// Split-service messages: `ServiceMessage<Event, Request>` never
+/// implements `From<HttpRequest>`, and never legally could — see
+/// [`crate::FromHttpRequest`] for the full orphan-rule argument (defined
+/// there for the HTTP/1 rail; it applies identically here, since
+/// `ServiceMessage` and `HttpRequest` are the same two foreign/local
+/// types either way). So it cannot ride the blanket above and needs this
+/// mirror impl to close the same gap on the HTTP/2 rail. It wraps the
+/// inbound request as `ServiceMessage::Request` — split-service listeners
+/// never see raw wire events, only caller-authorized requests — and
+/// otherwise inherits the trait's default `compact_http2_headers`
+/// (`false`) and `from_http2_parts` (routes through `from_http_request`)
+/// behavior, so no HTTP/2-specific header handling is lost or stubbed.
+///
+/// Does not overlap the blanket: nothing, in any crate, can implement
+/// `From<HttpRequest> for ServiceMessage<Event, Request>` (the orphan rule
+/// blocks it everywhere, since neither type is local to a crate that could
+/// also name the other), so the compiler can prove these two impls never
+/// apply to the same concrete type.
+impl<Event, Request> Http2ServiceMessage for tina::ServiceMessage<Event, Request>
+where
+    Event: Send + 'static,
+    Request: From<HttpRequest> + Send + 'static,
+{
+    fn from_http_request(request: HttpRequest) -> Self {
+        tina::ServiceMessage::Request(Request::from(request))
+    }
+}
+
 /// Stream lifecycle tracked by the bounded connection table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Http2StreamState {
