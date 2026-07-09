@@ -168,8 +168,19 @@ pub fn runtime_isolate(args: TokenStream, input: TokenStream) -> TokenStream {
 /// Generates an explicit continuation enum and dispatcher for a linear flow.
 ///
 /// The macro does not add runtime behavior. Each `step` expands to one enum
-/// variant carrying `RequestContext<Reply>`, explicit captured fields, and a
-/// `CallOutcome<T>`, plus one `match` arm in `handle_<flow>`.
+/// variant plus one `match` arm in `handle_<flow>`. A step is one of two
+/// shapes, chosen by its arrow:
+///
+/// - `step Name(captures) -> T { .. }` — a runtime-call continuation. The
+///   variant carries `RequestContext<Reply>`, the captures, and
+///   `CallOutcome<T>`; the body must mention `req` so caller authority is
+///   explicitly replied, threaded, or intentionally dropped.
+/// - `step Name(captures) -> raw T { .. }` — an ordinary (non-call)
+///   continuation, e.g. a `sleep(..).then(..)` timer wake-up. The variant
+///   carries only the captures and `T` verbatim (no `CallOutcome` wrap, no
+///   `RequestContext` slot); use this when the step's caller authority, if
+///   any, is parked elsewhere and resumed by an explicit key rather than
+///   carried in the message.
 #[proc_macro]
 pub fn flow(input: TokenStream) -> TokenStream {
     let flow = parse_macro_input!(input as FlowInput);
@@ -181,6 +192,7 @@ pub fn flow(input: TokenStream) -> TokenStream {
 
 mod flow_kw {
     syn::custom_keyword!(flow);
+    syn::custom_keyword!(raw);
     syn::custom_keyword!(reply);
     syn::custom_keyword!(runtime_crate);
     syn::custom_keyword!(step);
@@ -200,8 +212,23 @@ struct FlowInput {
 struct FlowStep {
     name: Ident,
     captures: Vec<FlowCapture>,
-    outcome: Type,
+    outcome: StepOutcome,
     body: Box<syn::Block>,
+}
+
+/// Shape of a step's final tuple field.
+///
+/// `Call(T)` is the original shape: the step is a runtime-call
+/// continuation, so the variant carries caller authority
+/// (`RequestContext<Reply>`) and the field is wrapped as
+/// `CallOutcome<T>`. `Raw(T)` is a non-call continuation (e.g. a
+/// `sleep(..).then(..)` timer wake-up): the field is `T` verbatim, with
+/// no `RequestContext` slot and no requirement that the body mention
+/// `req`. Use `Raw` when the step's caller authority (if any) is parked
+/// elsewhere and resumed by an explicit key, not carried in the message.
+enum StepOutcome {
+    Call(Type),
+    Raw(Type),
 }
 
 struct FlowCapture {
@@ -283,7 +310,12 @@ impl Parse for FlowInput {
             }
 
             content.parse::<Token![->]>()?;
-            let outcome: Type = content.parse()?;
+            let outcome = if content.peek(flow_kw::raw) {
+                content.parse::<flow_kw::raw>()?;
+                StepOutcome::Raw(content.parse()?)
+            } else {
+                StepOutcome::Call(content.parse()?)
+            };
             let body: syn::Block = content.parse()?;
             steps.push(FlowStep {
                 name: step_name,
@@ -328,7 +360,12 @@ fn build_flow(flow: FlowInput) -> Result<proc_macro2::TokenStream> {
     let handler = format_ident!("handle_{}", ident_to_snake(&flow.name));
 
     for step in &flow.steps {
-        if !block_mentions_unshadowed_ident(&step.body, "req") {
+        // Raw steps carry no `RequestContext` slot (their caller authority,
+        // if any, is parked elsewhere and resumed by an explicit key), so
+        // there is nothing for `req` to name and no policy to enforce here.
+        if matches!(step.outcome, StepOutcome::Call(_))
+            && !block_mentions_unshadowed_ident(&step.body, "req")
+        {
             return Err(Error::new_spanned(
                 &step.name,
                 "flow step body must mention `req` so caller authority is explicitly replied, threaded, or intentionally dropped",
@@ -339,13 +376,20 @@ fn build_flow(flow: FlowInput) -> Result<proc_macro2::TokenStream> {
     let variants = flow.steps.iter().map(|step| {
         let step_name = &step.name;
         let capture_types = step.captures.iter().map(|capture| &capture.ty);
-        let outcome = &step.outcome;
-        quote! {
-            #step_name(
-                #tina_crate::RequestContext<#reply>,
-                #(#capture_types,)*
-                #runtime_crate::CallOutcome<#outcome>,
-            )
+        match &step.outcome {
+            StepOutcome::Call(outcome) => quote! {
+                #step_name(
+                    #tina_crate::RequestContext<#reply>,
+                    #(#capture_types,)*
+                    #runtime_crate::CallOutcome<#outcome>,
+                )
+            },
+            StepOutcome::Raw(outcome) => quote! {
+                #step_name(
+                    #(#capture_types,)*
+                    #outcome,
+                )
+            },
         }
     });
 
@@ -353,8 +397,13 @@ fn build_flow(flow: FlowInput) -> Result<proc_macro2::TokenStream> {
         let step_name = &step.name;
         let capture_names = step.captures.iter().map(|capture| &capture.name);
         let body = &step.body;
-        quote! {
-            #flow_name::#step_name(req, #(#capture_names,)* outcome) => #body
+        match &step.outcome {
+            StepOutcome::Call(_) => quote! {
+                #flow_name::#step_name(req, #(#capture_names,)* outcome) => #body
+            },
+            StepOutcome::Raw(_) => quote! {
+                #flow_name::#step_name(#(#capture_names,)* outcome) => #body
+            },
         }
     });
 

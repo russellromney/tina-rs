@@ -85,26 +85,12 @@ pub struct SlowEvent {
     pub took_ms: u64,
 }
 
-#[derive(Debug)]
 pub enum SoakMsg {
     Request {
         worker_id: usize,
         request_id: usize,
     },
-    HttpReleased {
-        qid: u64,
-        worker_id: usize,
-        request_id: usize,
-        started_ms: u64,
-        result: SleepReply,
-    },
-    DbReleased {
-        qid: u64,
-        worker_id: usize,
-        request_id: usize,
-        started_ms: u64,
-        result: SleepReply,
-    },
+    Flow(SoakFlow),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -143,6 +129,31 @@ struct Soak {
     next_qid: u64,
 }
 
+// Both steps are timer wake-ups, not runtime calls: the caller's authority
+// stays parked in `self.pending` keyed by `qid` (see `dispatch`/
+// `http_released`), swapped from the http lease to the db lease between
+// steps. Neither step carries a `RequestContext` in the message, so each
+// uses `-> raw SleepReply` instead of the call-shaped `-> T` arrow: the
+// field is `SleepReply` verbatim (no `CallOutcome` wrap), and the body has
+// no `req` to thread.
+tina::flow! {
+    pub flow SoakFlow for Soak {
+        reply SoakReply;
+
+        step HttpReleased(qid: u64, worker_id: usize, request_id: usize, started_ms: u64) -> raw SleepReply {
+            // The timer payload carries no information (sleep cannot fail
+            // short of runtime shutdown); the pre-flow code ignored it too.
+            let _ = outcome;
+            self.http_released(qid, worker_id, request_id, started_ms)
+        }
+
+        step DbReleased(qid: u64, worker_id: usize, request_id: usize, started_ms: u64) -> raw SleepReply {
+            let _ = outcome;
+            self.db_released(qid, worker_id, request_id, started_ms)
+        }
+    }
+}
+
 #[tina_runtime::isolate(message = SoakMsg, reply = SoakReply)]
 impl Soak {
     fn handle(
@@ -152,20 +163,7 @@ impl Soak {
     ) -> Effect<Self> {
         match msg {
             SoakMsg::Request { .. } => noop(),
-            SoakMsg::HttpReleased {
-                qid,
-                worker_id,
-                request_id,
-                started_ms,
-                ..
-            } => self.http_released(qid, worker_id, request_id, started_ms),
-            SoakMsg::DbReleased {
-                qid,
-                worker_id,
-                request_id,
-                started_ms,
-                ..
-            } => self.db_released(qid, worker_id, request_id, started_ms),
+            SoakMsg::Flow(flow) => self.handle_soak_flow(flow),
         }
     }
 
@@ -231,12 +229,14 @@ impl Soak {
                 self.next_qid = next_qid;
                 let started_ms = self.now_ms();
                 let fake = self.fake_http;
-                sleep(fake).then(move |result| SoakMsg::HttpReleased {
-                    qid,
-                    worker_id,
-                    request_id,
-                    started_ms,
-                    result,
+                sleep(fake).then(move |result| {
+                    SoakMsg::Flow(SoakFlow::HttpReleased(
+                        qid,
+                        worker_id,
+                        request_id,
+                        started_ms,
+                        result,
+                    ))
                 })
             }
             Err(tina_runtime::GuardedParkCallError::Full { call, .. }) => {
@@ -281,12 +281,14 @@ impl Soak {
             .map_err(|_| ())
             .expect("re-admission after take cannot fail");
         let fake = self.fake_db;
-        sleep(fake).then(move |result| SoakMsg::DbReleased {
-            qid,
-            worker_id,
-            request_id,
-            started_ms,
-            result,
+        sleep(fake).then(move |result| {
+            SoakMsg::Flow(SoakFlow::DbReleased(
+                qid,
+                worker_id,
+                request_id,
+                started_ms,
+                result,
+            ))
         })
     }
 
