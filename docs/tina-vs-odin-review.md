@@ -34,7 +34,7 @@ multi-shard model**, not pinned parallel execution (`.intent/SYSTEM.md`
 multi-shard section).
 
 Net: the model is preserved well; the *surface* has drifted toward the breadth
-Tina was a reaction against. The highest-value work before the Alpaca launch is
+Tina was a reaction against. The highest-value work before the Tinio launch is
 subtraction and honest positioning, not more features.
 
 ## Comparison table
@@ -167,7 +167,7 @@ Watch this, don't panic.
    ergonomics)* This is the #1 threat to the "copyable local pattern" promise.
    The decision tree already exists (`ROADMAP.md`); turn it into either one
    generic type with type-params or a single one-page chooser, and deprecate the
-   overlap. Do this before the Alpaca rename so the launch surface is the
+   overlap. Do this before the Tinio rename so the launch surface is the
    trimmed one.
 
 2. **Freeze the battery and AWS surface; gate new bridges on evidence.**

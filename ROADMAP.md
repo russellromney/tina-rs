@@ -454,7 +454,7 @@ framework before public release-story work.
 |---|---|
 | **Modeled readiness completion adapter** | Recover kernel-efficient idle waiting without bringing back a wake side-channel. Readiness may be used only if Tina observes it as runtime-owned completion/event work with a deterministic simulator model, bounded ordering rules, explicit cancellation/shutdown truth, and measured idle-CPU/HTTP-latency evidence against the current bounded re-poll baseline. |
 | **Native AWS first form** | Add a native Tina AWS battery for the smallest honest production shape: static SigV4 with explicit signing time, native S3 put/get/head/delete, native SQS send/receive/delete, native HTTP keepalive under endpoint/connect policy, bounded bodies/in-flight work, typed pressure/lifecycle reports, hermetic fake-AWS tests, and clear native-vs-SDK-bridge docs. Plan: `.intent/phases/135-native-aws-first-form/plan.md`. |
-| **Alpaca rename** | Before public launch, rename the project/crates/docs away from Tina to Alpaca so the lineage is respectful and clear: independently maintained Rust framework, inspired by Peter Mbanugo's Tina/Odin and Seastar, not an official Tina port. |
+| **Tinio rename** | Before public launch, rename the public project/crates/docs from Tina to Tinio. Tinio keeps the Tina lineage in the name and reads as a Rust I/O runtime (in the tokio/monoio/glommio family). Docs stay explicit: independently maintained Rust framework, inspired by Peter Mbanugo's Tina/Odin and Seastar, not an official Tina port. |
 | **Barend Biesheuvel visible flow ergonomics** | Optional high-level ergonomics only after the local runtime core feels boring: a `flow!`-style authoring surface that preserves named suspension points, visible failure policy, trace step names, and ordinary Tina message/effect expansion. No fake async, no hidden retries, no hidden queues. |
 
 ### Post-109 capability backlog
@@ -1031,9 +1031,9 @@ blockers for the first local-runtime story.
 These should be resolved before public release or broad adoption claims:
 
 - **Decide the Peter Mbanugo / Tina-Odin public-positioning question early.**
-  Preferred path: rename public project identity to Alpaca before launch, then
+  Preferred path: rename public project identity to Tinio before launch, then
   reach out before public publish and coordinate if practical. Docs must be
-  explicit that Alpaca is an independently maintained Rust project inspired by
+  explicit that Tinio is an independently maintained Rust project inspired by
   Tina-Odin, not an official port or implied endorsement. Local design
   exploration is not blocked on this, but public positioning and any publish
   decision should not outrun an explicit decision.
