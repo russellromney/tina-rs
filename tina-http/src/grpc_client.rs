@@ -868,6 +868,158 @@ mod tests {
         );
     }
 
+    // -- Wire-negative coverage at the user's stream-decode surface --------
+    //
+    // A streaming caller folds each pulled `Http2ResponseChunk` through
+    // `decode_stream_chunk` and matches the returned `GrpcStreamItem`s
+    // (Message / Status / Transport / Malformed) — exactly what
+    // `collect_grpc_stream` does in the live tests. These cases feed the
+    // malformed / edge chunks a hostile or dying peer can put on the wire and
+    // assert the user-visible typed item, never a panic.
+
+    fn empty_framed() -> Vec<u8> {
+        // A well-formed frame carrying a zero-length message body.
+        encode_grpc_message(&Empty {}, GrpcLimits::default()).expect("frame empty")
+    }
+
+    #[test]
+    fn stream_nonzero_compression_flag_is_malformed_item() {
+        let client = dummy_client();
+        let mut decoder = GrpcStreamDecoder::new(GrpcLimits::default());
+        let mut chunk = framed(5);
+        chunk[0] = 1; // reserved compression flag set — identity only supported
+        let items: Vec<GrpcStreamItem<Reply>> =
+            client.decode_stream_chunk(&mut decoder, Http2ResponseChunk::Data(chunk));
+        assert_eq!(
+            items,
+            vec![GrpcStreamItem::Malformed(GrpcError::CompressedUnsupported)],
+            "a compressed response frame must surface as a typed Malformed item",
+        );
+    }
+
+    #[test]
+    fn stream_over_cap_length_is_malformed_item() {
+        let limits = GrpcLimits {
+            max_message_bytes: 4,
+            ..GrpcLimits::default()
+        };
+        let client = GrpcClient::new(dummy_client().connection(), limits);
+        let mut decoder = GrpcStreamDecoder::new(limits);
+        // Frame header alone declares a body length over the cap. The decoder
+        // must reject on the declared length before buffering/allocating.
+        let header = vec![0u8, 0, 0, 0, 64];
+        let items: Vec<GrpcStreamItem<Reply>> =
+            client.decode_stream_chunk(&mut decoder, Http2ResponseChunk::Data(header));
+        assert_eq!(
+            items,
+            vec![GrpcStreamItem::Malformed(GrpcError::MessageTooLarge {
+                len: 64,
+                max: 4
+            })],
+            "an oversized declared length must surface as a typed Malformed item",
+        );
+    }
+
+    #[test]
+    fn stream_truncated_frame_at_end_is_malformed_item() {
+        let client = dummy_client();
+        let mut decoder = GrpcStreamDecoder::new(GrpcLimits::default());
+        let whole = framed(9);
+        // Deliver all but the final body byte, then END_STREAM: a frame is
+        // still buffered, so the stream ended mid-message.
+        let partial = whole[..whole.len() - 1].to_vec();
+        let data_items: Vec<GrpcStreamItem<Reply>> =
+            client.decode_stream_chunk(&mut decoder, Http2ResponseChunk::Data(partial));
+        assert!(
+            data_items.is_empty(),
+            "a partial frame must not yield a message yet"
+        );
+        let end_items: Vec<GrpcStreamItem<Reply>> = client.decode_stream_chunk(
+            &mut decoder,
+            Http2ResponseChunk::End {
+                trailers: HeaderMap::new(),
+            },
+        );
+        assert_eq!(
+            end_items,
+            vec![GrpcStreamItem::Malformed(GrpcError::BadFrame)],
+            "a truncated trailing frame at END_STREAM must surface as Malformed, not a clean Status",
+        );
+    }
+
+    #[test]
+    fn stream_closed_mid_stream_is_transport_item_not_status() {
+        let client = dummy_client();
+        let mut decoder = GrpcStreamDecoder::new(GrpcLimits::default());
+        // One clean message, then the connection dies before END_STREAM.
+        let msg_items: Vec<GrpcStreamItem<Reply>> =
+            client.decode_stream_chunk(&mut decoder, Http2ResponseChunk::Data(framed(1)));
+        assert_eq!(msg_items, vec![GrpcStreamItem::Message(Reply { value: 1 })]);
+        let closed_items: Vec<GrpcStreamItem<Reply>> =
+            client.decode_stream_chunk(&mut decoder, Http2ResponseChunk::Closed);
+        assert_eq!(
+            closed_items,
+            vec![GrpcStreamItem::Transport(Http2ResponseChunk::Closed)],
+            "a connection closed before a gRPC status must surface as Transport, not a fabricated status",
+        );
+    }
+
+    #[test]
+    fn stream_multiple_concatenated_messages_yield_all_in_order() {
+        let client = dummy_client();
+        let mut decoder = GrpcStreamDecoder::new(GrpcLimits::default());
+        // Three complete frames packed into one DATA chunk.
+        let mut chunk = framed(1);
+        chunk.extend_from_slice(&framed(2));
+        chunk.extend_from_slice(&framed(3));
+        let items: Vec<GrpcStreamItem<Reply>> =
+            client.decode_stream_chunk(&mut decoder, Http2ResponseChunk::Data(chunk));
+        assert_eq!(
+            items,
+            vec![
+                GrpcStreamItem::Message(Reply { value: 1 }),
+                GrpcStreamItem::Message(Reply { value: 2 }),
+                GrpcStreamItem::Message(Reply { value: 3 }),
+            ],
+            "a chunk carrying several messages must yield each as its own Message item, in order",
+        );
+    }
+
+    #[test]
+    fn stream_zero_length_message_decodes_to_default() {
+        let client = dummy_client();
+        let mut decoder = GrpcStreamDecoder::new(GrpcLimits::default());
+        let items: Vec<GrpcStreamItem<Empty>> =
+            client.decode_stream_chunk(&mut decoder, Http2ResponseChunk::Data(empty_framed()));
+        assert_eq!(
+            items,
+            vec![GrpcStreamItem::Message(Empty {})],
+            "a valid zero-length message frame must decode to a default message, not be dropped",
+        );
+    }
+
+    #[test]
+    fn stream_truncated_header_buffers_then_completes() {
+        let client = dummy_client();
+        let mut decoder = GrpcStreamDecoder::new(GrpcLimits::default());
+        let whole = framed(7);
+        // First deliver only 3 bytes: less than the 5-byte frame header. The
+        // decoder must buffer and yield nothing, never mis-read the length.
+        let head_items: Vec<GrpcStreamItem<Reply>> =
+            client.decode_stream_chunk(&mut decoder, Http2ResponseChunk::Data(whole[..3].to_vec()));
+        assert!(
+            head_items.is_empty(),
+            "a truncated frame header must buffer, not yield or panic"
+        );
+        // The rest arrives and completes exactly one message.
+        let rest_items: Vec<GrpcStreamItem<Reply>> =
+            client.decode_stream_chunk(&mut decoder, Http2ResponseChunk::Data(whole[3..].to_vec()));
+        assert_eq!(
+            rest_items,
+            vec![GrpcStreamItem::Message(Reply { value: 7 })]
+        );
+    }
+
     fn dummy_client() -> GrpcClient {
         let connection = Address::new_with_generation(
             ShardId::new(1),
