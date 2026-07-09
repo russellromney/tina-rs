@@ -349,6 +349,16 @@ boilerplate that a helper can delete plumbing while keeping every
 stage, timeout, and partial-progress fact visible. The raw
 match-state-machine form remains semantic truth.
 
+**Update (verified on this audit):** `tina::flow!` (`tina-macros/src/lib.rs`)
+now generates exactly this shape — a named continuation enum + dispatcher
+per linear step, with no runtime behavior added (each step is still an
+ordinary ` .then_with_request` continuation) — and ships in `mini_saas_api`
+and `specimen_multi_turn_request_context`. It plausibly satisfies the
+revisit condition above, but `specimen_two_stage_pipeline` — the specimen
+that surfaced this finding — still hand-writes `PipelineMsg` by hand
+(`examples/specimen_two_stage_pipeline/src/tina_impl.rs`). Not closing
+until that specimen (or an equivalent) is migrated and proves the fit.
+
 ### 12. Rust footgun replication: shared receiver in worker pool
 
 **Surfaced by:** `specimen_graceful_pool_shutdown` (Tokio side).
@@ -367,34 +377,6 @@ container, and shutdown is one effect away.
 This is a positive observation about Tina's model. The build is
 documentation, not new product work — call it out in the user
 guide's lifecycle chapter as a contrast with the Tokio shape.
-
-### 13. Tina-owned database client (`tina-sqlx-bridge`)
-
-**Surfaced by:** `specimen_sqlite_counter`.
-
-There is no native or bridged path for "Tina service talks to a
-database" today. The honest first-form shape used in the specimen
-is one isolate that owns a `rusqlite::Connection` and runs each
-query inline in `handle`. SQLite operations are fast, so this works
-for a single-shard adoption-grade example, but it blocks the shard
-thread for the duration of every query. For a remote DB
-(Postgres) where queries take milliseconds, the same shape would
-violate the bounded-handler-turn contract that makes Tina's other
-patterns honest.
-
-**Build:** `tina-sqlx-bridge` (or first-form `tina-rusqlite-bridge`
-for the sync path) shaped like `tina-reqwest-bridge`:
-
-- Tokio-owned blocking-pool runtime for the actual rusqlite/SQLx
-  calls;
-- bounded ingress (`mailbox_capacity`);
-- typed `SqliteError::*` variants with `Closed` / `Busy` / `IoError`
-  / `Decode` / `Constraint` / `Internal` shapes;
-- visible `Full` / `Closed` / `Timeout`;
-- metrics handle comparable to `ReqwestMetricsHandle`.
-
-ROADMAP phase 063 names this work; this finding is the per-specimen
-witness.
 
 ### 14. Spawn API surfaces the child's address
 
@@ -450,86 +432,6 @@ either need a new field on `Spawned` (a runtime-event change)
 or a caller-asserted `M` (not honest under the LLM rule). Pick
 the typed-event vs. continuation form when the supervisor/spawn
 API gets revisited.
-
-### 17. Private Unix-domain socket worker thread — closed
-
-**Surfaced by:** `specimen_local_io_codec_ipc` (`live_unix_smoke`, `admin_socket`),
-`tina-runtime/tests/local_system.rs` (`unix_live_echo`).
-
-**Closed.** Unix-domain sockets no longer run on a private worker thread over
-`std::os::unix::net`. The runtime drives bind/accept/connect/read/write/close on
-the shard thread as completions on the same per-shard Betelgeuse loop TCP and TLS
-already ride — Unix sockets are sockets, so they follow the same substrate rule.
-The narrow Unix addressing the substrate lacked (`bind_unix` / `connect_unix` and
-the socket-file unlink lifecycle) was added to vendored Betelgeuse rather than
-left in a hidden worker. The lane keeps TCP's discipline: one accept/read/write
-lane each, `ResourceBusy` on duplicates, close-wins cancellation, tombstoned
-shutdown. The capability report now classifies it completion-backed, and the
-rail-inventory guard (`scripts/rail_inventory_guard.sh`) fails the build if a
-worker thread or blocking std socket reappears in a runtime rail off-inventory.
-
-**Still true:** DNS (platform resolver) and process spawn/wait stay bounded
-blocking lanes on purpose — they are OS lifecycle / library calls with no
-portable completion opcode, and the capability report carries their written
-reason. A narrow rename/remove/readdir/metadata storage fallback is the only
-remaining off-shard storage worker.
-
-### 16. Multi-worker TLS lane (or split accept/stream lanes) — closed
-
-**Surfaced by:** `specimen_native_https`, `tina-http/tests/client_tls_smoke.rs`.
-
-**Closed.** TLS no longer runs on worker threads at all. The runtime owns a
-rustls connection (sans-I/O) per `TlsStreamId` and drives the
-handshake/read/write/close state machine on the shard thread as Betelgeuse
-harvests TCP completions — TLS is a layer over the runtime's own TCP rail, not a
-second socket stack. The single TLS worker that head-of-line-blocked accepts and
-deadlocked a same-runtime client+server is gone. `local_system_tls_quiet_stream_does_not_block_second_connection`
-still pins the quiet-stream story, and `local_system_tls_client_and_server_share_one_runtime`
-runs a Tina TLS client and server on one shard in one runtime — the exact case
-this finding called impossible. The substrate guard
-(`tina-runtime/tests/tls_substrate_guard.rs`) pins the absence of any
-`tina-tls-*` worker thread or private socket stack.
-
-**Still true:** `tls_lane_capacity` is a hard cap — now the shard-total count of
-in-flight TLS ops, not magic unbounded concurrency. Handshake asymmetric crypto
-runs on the shard thread, an accepted tradeoff: visible and boundable by accept
-rate rather than hidden on a serial worker that deadlocks.
-
-### 15. Deadline as first-class context
-
-**Surfaced by:** `specimen_backpressure_chain`.
-
-A multi-hop chain has to thread a deadline (or a remaining-budget
-duration) through every call. Today this is `Duration` in the
-request struct + a matching `IsolateCall` timeout, and the outer
-hop's call timeout must be slightly longer than the inner's so the
-typed downstream timeout reaches the caller before the outer
-times out. With N hops, the slack accumulates and there is no
-helper that names the "outer = innermost + slack" pattern.
-
-**Decision:** do not freeze a wall-clock `Deadline` API. Deadline is
-really a clock-truth problem. A live-only helper could exist later,
-but it must say it has no simulator/replay claim. A replayable
-deadline waited for the runtime/simulator clock model.
-
-**Resolved (Tina deadline phase):** [`Deadline`](../tina/src/lib.rs)
-ships with the explicit-`now` constructor
-`Deadline::from_instant(now, after)` plus
-`Context::now()` / `Context::deadline_after(after)` as the
-runtime/sim-aware sugar. The runtime stamps `Context::now()` from its
-monotonic `Clock` before each handler turn; the simulator stamps it
-from a stable virtual-clock anchor + `virtual_now`. There is no
-`Deadline::after(Duration)` shortcut: it would have to call
-`Instant::now()` internally and silently break DST/replay.
-
-`Deadline` is a budget value: it does not retry, does not extend,
-and does not cancel work. `remaining(now)` returns `Option<Duration>`,
-`remaining_or_zero(now)` returns the duration suitable for use as a
-call timeout (zero -> "do not wait"). Honest under both runtimes —
-proved by `tina-runtime/tests/deadline.rs` (live) and
-`tina-sim/tests/deadline.rs` (deterministic virtual time).
-`specimen_backpressure_chain` propagates a `Deadline` through A → B
-so each hop sees the *remaining* budget against its own `now`.
 
 ### 19. Pool consumer ergonomics — host-side acquire and scenario runner
 
@@ -589,225 +491,30 @@ in this slice:
   `HttpResponse::stream_chunked`) make the call site name the
   framing; a chunked response is `Transfer-Encoding: chunked` on
   the wire with the connection writing the terminator on `Eof`.
+- **Cancel signal from connection back to source — closed.** Verified
+  on this audit: `ResponseChunkMsg::Cancel` ships
+  (`tina-http/src/streaming.rs`), the connection sends it on abandon
+  (`tina-http/src/connection.rs`, `tina-http/src/http2/server.rs`,
+  `tina-http/src/http2/client.rs`), and `cancel_response_source`
+  (`tina-http/src/scope.rs`) is the scoped host-side helper.
 
 What still needs work but is deferred:
 
-- **Cancel signal from connection back to source.** When the wire
-  fails mid-stream the source isolate is left idle. `body_io_error_count`
-  records the failure visibly, but the source itself has no
-  notification — fine for stateless iterators, awkward for
-  sources that hold resources (file handles, downstream RPCs).
-  Adding `ResponseChunkMsg::Cancel` plus the connection's
-  `Outbound` capability needs more design; recorded as a
-  follow-up.
 - **Live metrics ticks.** `BodyMetrics::snapshot()` is callable
   from any thread at any time (the counter is `Arc`-backed), but
   there is no built-in periodic emit. A `runtime.metrics_tick(D)`-
   shaped helper or a generic capacity-tick channel belongs in the
   observability slice, not here.
 - **Chunked decoding on the HTTP/1 client.** Server can emit
-  chunked; the client still rejects chunked responses as
-  `UnsupportedTransferEncoding`. Symmetric support is a separate
-  slice with its own decoder + tests.
+  chunked; the client still rejects real chunked bodies. Verified on
+  this audit: `tina-http/src/parse.rs`'s response parser still treats
+  `transfer_encoding_chunked` as `content_length = 0` (a body-forbidden
+  shape), it does not decode a chunked body. Symmetric support is a
+  separate slice with its own decoder + tests.
 
 **Status:** shipped (server-side chunked emit, `IterBodySource`,
 loud-API constructors, `body_io_error_count` proves mid-stream
-client close).
-
-### 21. Per-bucket FIFO wait list next to a global `PendingReplies` — shipped
-
-`tina_runtime::SharedWork<K, R>` is now the user-facing copy path:
-"many callers wait for one result", one global cap, optional per-key
-cap (`with_key_limit`), FIFO per key, ticketed `reply_one`, and
-`reply_all_clone` / `reply_all_with` / `close_all_clone` /
-`close_all_with` / `drain_all_with` for multi-waiter replies. Stale
-tickets are rejected; tickets are move-only with crate-private fields.
-`request_effect_after_shared_wait(&ticket, effect)` is the only path
-that produces a `RequestEffect` after admission.
-
-`SharedWork` is a thin wrapper over `WaitList`; the lower-level
-`WaitList` name remains public for call sites that read better under
-the mechanism name. `system_cache_with_fill` and the
-`ergonomics_playground` single-flight cache probe both copy from
-`SharedWork` now.
-*(Update: `WaitList` has since been made private; `SharedWork` is the
-only public name.)*
-
-*(Historical finding kept below for context.)*
-
-### 21-historical. Per-bucket FIFO wait list next to a global `PendingReplies`
-
-**Surfaced by:** `system_cache_with_fill`, `system_lock_manager`.
-
-Both specimens want "one bounded global pending box, plus a FIFO
-wait list per cache key / lock key, plus a hand-off loop that skips
-slots whose caller went away." Each writes the same shape by hand:
-
-- `pending: PendingReplies<u64, Reply>` keyed by a monotonic waiter id;
-- per-bucket `VecDeque<u64>` of waiter ids inside the bucket's state;
-- on hand-off / fill-done, pop a waiter id from the queue, `take` from
-  pending, and if the slot is gone (caller cancelled / timed out) loop
-  to the next id.
-
-The cap accounting splits awkwardly: the global cap lives on
-`PendingReplies`; the per-bucket cap lives in handler code; the
-"skip reclaimed" loop is repeated.
-
-**Build:** a small `WaitList<K, R>` (or `KeyedPendingReplies<K, R>`)
-helper that owns both caps, takes the inbound `CallContext`, and
-exposes a single `pop_next(&K) -> Option<DeferredReply<R>>` that walks
-past reclaimed slots. Must keep typed admission errors
-(`Full` / `BucketFull`) so callers can reply `Busy` distinctly.
-Revisit only after a third specimen needs the same shape so the helper
-shape is informed by three call sites, not two.
-
-### 23. Mailbox-first service ergonomics — Phase 101 shipped
-
-**Surfaced by:** `system_metrics_shipper`, `system_bounded_object_lane`,
-the recurring-tick / single-flight / drain / Full-handling repetition
-across system specimens.
-
-Shipped helpers:
-
-- `tina::time::RecurringTick` — fixed-period service ticks with
-  `Skip` / `Bounded(n)` / `Delay` catch-up policies; explicit
-  `RecurringTickToken` for stale-tick detection. `system_metrics_shipper`
-  now uses it for time-window flushes.
-- `tina_runtime::LocalPermitGate` — fixed-capacity, move-only `Permit`,
-  explicit release/retire; reports
-  capacity/current/full_count/high_water/retired_count/completed_count/
-  invalid_release_count. `system_bounded_object_lane` and the metrics
-  shipper's single-flight flush slot both run on it.
-- `tina_runtime::DrainState` — small admit/complete/cancel/drop
-  counter state plus `begin/finish/can_stop`. Late completions counted
-  separately. Resource close still belongs to the service.
-- `runtime.register_with_capacity_and_bootstrap[_on]` — prefills the
-  mailbox with the bootstrap message before inserting the isolate entry.
-  No cleanup-after-registration path; typed `RegisterBootstrapError` on
-  prefill refusal. Available on `Runtime`, `ThreadedRuntime`,
-  `MultiShardRuntime`, `ThreadedMultiShardRuntime`.
-- `tina_runtime::FullHandling` — decision-only state for the
-  "on Full, shed or retry-with-backoff" shape; the service still
-  schedules the visible Tina sleep.
-
-Out of scope here: lifecycle `on_start` callbacks (not shipped,
-register-and-bootstrap covers the common footgun without breaking
-mailbox truth), broad retry frameworks (FullHandling is the only one).
-
-### 22. Internal-event variants need a `handle_call` rejection arm
-
-**Surfaced by:** `system_cache_with_fill`, `system_lock_manager`.
-
-Specimens that mix caller-authority messages (`Acquire`, `Get`) with
-runtime-owned continuations (`LeaseExpired`, `FillDone`) end up writing
-a `handle_call` arm whose only job is
-`call.reject(CallRejectedReason::UnsupportedMessage)` for every
-internal variant. The split between `handle` and `handle_call` is
-correct — caller authority should be visible at the type boundary —
-but the rejection ceremony repeats once per internal variant and per
-isolate.
-
-**Build:** either a derive / macro that generates the rejection arm
-from a "this variant is internal" attribute, or a typed split where
-`Self::Message` is an enum-of-enums (`Caller(...) | Internal(...)`)
-so the runtime never delivers an `Internal` variant through
-`handle_call` at all. The second shape is cleaner but a bigger ask.
-Hold until a third specimen pays the same toll.
-
-### 23. Host-side `call_blocking` on `ThreadedMultiShardRuntime` *(closed by phase 102)*
-
-`ThreadedMultiShardRuntime::call_blocking(addr, msg, timeout)` now
-ships and routes by `addr.shard()` — same convention as `try_send` and
-`observe_result`. Bounded admission: a full worker command queue
-surfaces as `ThreadedRuntimeError::CommandFull` instead of a host
-hang. Single-shard `ThreadedRuntime::call_blocking` got the same
-bounded-admission treatment. `system_session_auth` was migrated to
-real multi-shard placement (one bucket isolate per shard, host routes
-by `ShardPlacement`); the in-isolate fallback note is gone.
-
-No `call_blocking_on(shard, addr, ...)` ships — passing the shard
-twice is a place to introduce a mismatch bug. A future host-to-shard
-variant only earns its place when a real caller needs "call as if
-from shard A into target shard B" and has a remote-path proof.
-
-### 24. Register-and-bootstrap helper for start-up effects
-
-**Surfaced by:** `system_job_queue`, `system_session_auth`.
-
-Both specimens have a startup effect (job_queue spawns N worker children;
-session_auth schedules the first sweep timer). The current ceremony in
-both cases:
-
-1. Define a public `Msg::Bootstrap` variant on the message enum.
-2. Handle it in `handle` to emit the startup effect.
-3. After `register_with_capacity`, have the host remember to
-   `try_send(addr, Msg::Bootstrap)`.
-
-Forgetting step 3 produces a quiet service that accepts requests but
-never runs the startup effect — no workers spawn, no sweep timer fires.
-The failure mode is "silent and looks healthy," which is the worst
-shape. The public `Bootstrap` variant is also a small lie: it is in the
-message enum because the macro needs every public op there, but no host
-should ever send it after the first time.
-
-**Build:** Phase 101's `register_with_capacity_and_bootstrap(...)`
-helper. It should prefill the mailbox with `Bootstrap` before inserting
-the isolate entry, return the address only after the bootstrap message
-is admitted, and keep startup as an ordinary mailbox turn. No hidden
-`on_start` callback.
-
-### 25. Request/reply variants in `handle` compile but reject at runtime
-
-**Surfaced by:** `system_cache_with_fill`, `system_job_queue` (Worker
-isolate).
-
-A request/reply isolate routes incoming messages through `handle` for
-fire-and-forget variants and `handle_call` for variants that carry caller
-authority. Both handlers receive the same `Message` type. The split is by
-*entry point*, not by *variant*: putting `Submit { .. }` in `handle`
-compiles cleanly, but if a host actually calls that variant the runtime
-rejects it as `CallRejectedReason::UnsupportedMessage`. The author has to
-remember which variants belong on which side and route the other arms by
-hand (`call.reject(UnsupportedMessage)` in `handle_call`, `noop()` in
-`handle`). Both specimens have the same `match msg { ... =>
-call.reject(UnsupportedMessage), ... }` boilerplate, with the same
-opportunity to forget an arm and either silently drop a request or panic.
-
-**Build:** make the split unrepresentable at the type level. The current
-roadmap proposal in `ROADMAP.md` (added by PR #95) sketches an opt-in
-shape where the isolate macro takes separate `event` and `request` types,
-e.g. `#[tina_runtime::isolate(event = CacheEvent, request = CacheRequest,
-reply = CacheReply)]`. The desired property: events are mailbox facts,
-requests are caller-authority facts, runtime work returns as events, and
-the compiler refuses if a request variant is matched in the event handler
-or vice versa. Closing this finding probably means landing some form of
-that proposal.
-
-### 27. Lease handoff into a `PendingReplies` slot — Phase 110 shipped
-
-`tina_runtime::GuardedPendingReplies<K, R, G>` pairs the parked caller
-with one RAII `G` guard, drops it exactly once on reply / drain /
-caller-gone sweep, and returns it back to the caller on failed
-admission. `system_api_gateway_limits` now parks a
-`SharedCapacityReservation` directly in the slot, so there is no
-sidecar charge table.
-
-*(Historical finding kept below for context.)*
-
-### 27-historical. Lease handoff into a `PendingReplies` slot
-
-**Surfaced by:** `system_api_gateway_limits`, `system_soak_http_db`.
-
-A request that admits against a `SharedCapacityScope` and then parks
-its reply in `PendingReplies` has to carry the `SharedLease` in a
-sidecar `HashMap<qid, SharedLease>` so the lease outlives the
-post-sleep handler. Both new specimens do this manually. The mapping
-between "this qid" and "this lease" is invariant under the slot
-lifecycle and would compose cleanly into the slot itself.
-
-**Build:** a slot variant — `PendingReplies::try_insert_with_lease(qid,
-slot, lease)` — or a generic `SharedLease`-carrying wrapper that
-`reply_to` consumes. Either form removes the parallel map.
+client close, cancel signal to source).
 
 ### 28. Service-level scope registry mirroring `register_with_capacity`
 
@@ -838,6 +545,16 @@ Today every system rebuilds the variants by hand.
 &mut Self| this.start_db(...))` that wires the message envelope and
 the post-wake state mutation in one place.
 
+**Update (verified on this audit):** `tina::flow!` (`tina-macros/src/lib.rs`)
+now generates a continuation enum + dispatcher for a named linear step
+sequence and ships in `mini_saas_api` (`tina_impl/controller.rs`) and
+`specimen_multi_turn_request_context`. It looks like the answer to this
+finding's shape, but `system_soak_http_db` — the specimen that actually
+surfaced this pain — still hand-rolls `HttpReleased` / `DbReleased`
+(`examples/systems/system_soak_http_db/src/lib.rs`). Not closing until a
+migrated `system_soak_http_db` (or an equivalent multi-hop-with-timers
+case) proves `flow!` covers this exact shape.
+
 ### 30. DST adapter for `SharedCapacityScope` / `BoundedEventSink`
 
 **Surfaced by:** `system_api_gateway_limits`, `system_soak_http_db`,
@@ -856,36 +573,6 @@ counters into the trace at well-defined points (admit, release,
 drop, push, drain) so a replay can reconstruct `assert_no_full`
 semantics. Or expose the snapshots as `LiveReplayFact` entries so
 they ride alongside the existing fact stream.
-
-### 31. `SleepReply` leaks into user-defined message variants — Phase 110 shipped
-
-`tina_runtime::sleep(d).then_event(move || Msg::Wake { id })` is the
-sleep-only sugar: the user enum has no `SleepReply` field, and the
-helper does not exist on non-timer `TypedCall<()>` so file/process/TCP
-close errors stay visible. The phase still ships `sleep_then(d, m)` and
-`sleep(d).then(...)` for the cases that *do* want the timer reply.
-
-*(Historical finding kept below for context.)*
-
-### 31-historical. `SleepReply` leaks into user-defined message variants
-
-**Surfaced by:** `system_api_gateway_limits`, `system_soak_http_db`.
-
-Every variant a specimen builds for a post-sleep wake-up carries
-`result: SleepReply` even when the handler never inspects it. The
-gateway's `HoldDone { qid, route, result: SleepReply }` and the
-soak's `HttpReleased { qid, ..., result: SleepReply }` are both
-shaped this way. The field is dead weight in the user's message
-enum, but the `sleep(d).then(move |r| Msg { result: r, ... })`
-signature requires it.
-
-**Build:** either (a) accept `then(move |_| Msg { ... })` without
-the placeholder field as the blessed shape and add a `then_no_result`
-variant, or (b) drop the `Result` from `SleepReply` for the
-infallible-sleep case so the carrying variant is a unit. The wider
-form is right for cancellation-aware sleeps; for the typical "wake
-me up later, I don't care if you were nudged" the unit form would
-keep the user's enum clean.
 
 ### 32. AWS bridge surface duplication across services
 
@@ -915,37 +602,6 @@ Reference: the canonical bridge shape now lives in
 Any internal AWS refactor must keep those eight steps user-visible —
 no hidden queues, no hidden classifier collapse, no late-result
 silent rollup.
-
-### 33. Bridge classifier vocabulary lives in `tina-aws-bridge` — shipped
-
-`tina_runtime::bridge::BridgeOutcomeClass` (with
-`BridgeRetryable` / `BridgeUnavailable` / `BridgeFatal`) is the shared
-shape every bridge classifier projects onto. Each per-bridge
-classifier (reqwest, AWS workers) is still free to expose richer
-per-bridge reasons, but the shared `bridge_class()` projection makes
-mixed-bridge classification a typed fold instead of caller-private
-re-mapping. The bridge-author copy path in
-[`docs/tina-user-guide/30-bridge-author-kit.md`](../docs/tina-user-guide/30-bridge-author-kit.md)
-step 7 names this contract.
-
-*(Historical finding kept below for context.)*
-
-### 33-historical. Bridge classifier vocabulary lives in `tina-aws-bridge`
-
-**Surfaced by:** `system_webhook_relay`, classifier extension traits.
-
-`BridgeOutcomeClass` / `TransientReason` / `FatalReason` were useful
-outside AWS too — the reqwest bridge already has `ReqwestOutcomeClass`
-with its own per-bridge vocabulary. A relay or retry-driver needs
-*both* shapes to classify mixed outcomes (one outbound HTTP, one SQS)
-the same way, so callers re-classify into a private enum.
-
-**Build:** decide whether the bridge classifier should be in
-`tina-runtime` (shared by all bridges) or whether each bridge keeps
-its own private vocabulary and callers map at the boundary. The plan
-forbids a shared bridge crate, but the *classifier vocabulary* is
-plain data and could live alongside `CallOutcome` without coupling
-the bridges themselves.
 
 ### 35. Local I/O / codec / IPC rails feel low-level next to the file loops (Phase 117)
 
@@ -1004,6 +660,418 @@ What felt rough — each is a `Build`:
 
 Findings shipped by recent phases. Numbers are kept stable so
 existing README references stay valid.
+
+### 13. Tina-owned database client (`tina-sqlx-bridge`) — closed
+
+**Surfaced by:** `specimen_sqlite_counter`.
+
+There was no native or bridged path for "Tina service talks to a
+database." The honest first-form shape used in the specimen was one
+isolate that owns a `rusqlite::Connection` and runs each query inline
+in `handle`, which blocks the shard thread for the query's duration —
+fine for SQLite, dishonest for a remote DB with millisecond latency.
+
+**Closed. Verified on this audit:** both requested shapes ship as full
+crates. `tina-sqlx-bridge` (`tina-sqlx-bridge/src/{lib,worker,helpers,
+metrics,types}.rs`) covers the async/remote-DB path with a
+Tokio-owned worker, bounded ingress, and a `PgMetricsHandle`.
+`tina-sqlite-bridge` (`tina-sqlite-bridge/src/{lib,worker,helpers,
+metrics,types,budget}.rs`) covers the sync path with `SqliteError::*`
+variants and `SqliteMetricsHandle`. `specimen_postgres_counter` and
+`specimen_sqlite_counter` use them directly.
+
+### 15. Deadline as first-class context — closed
+
+**Surfaced by:** `specimen_backpressure_chain`.
+
+A multi-hop chain had to thread a deadline (or remaining-budget
+duration) through every call by hand, with the outer hop's call
+timeout kept slightly longer than the inner's so slack didn't
+accumulate silently.
+
+**Closed. Verified on this audit:** [`Deadline`](../tina/src/context.rs)
+ships with the explicit-`now` constructor `Deadline::from_instant(now,
+after)` plus `Context::now()` / `Context::deadline_after(after)` as the
+runtime/sim-aware sugar (`tina/src/context.rs`). The runtime stamps
+`Context::now()` from its monotonic `Clock` before each handler turn;
+the simulator stamps it from a stable virtual-clock anchor. There is no
+`Deadline::after(Duration)` shortcut, since it would call
+`Instant::now()` internally and silently break DST/replay.
+
+`Deadline` is a budget value: it does not retry, extend, or cancel
+work. `remaining(now)` returns `Option<Duration>`, `remaining_or_zero
+(now)` returns the duration for use as a call timeout. Proved live in
+`tina-runtime/tests/deadline.rs` and deterministically in
+`tina-sim/tests/deadline.rs`. `specimen_backpressure_chain` propagates
+a `Deadline` through A -> B so each hop sees the remaining budget
+against its own `now`.
+
+### 16. Multi-worker TLS lane (or split accept/stream lanes) — closed
+
+**Surfaced by:** `specimen_native_https`, `tina-http/tests/client_tls_smoke.rs`.
+
+**Closed.** TLS no longer runs on worker threads at all. The runtime owns a
+rustls connection (sans-I/O) per `TlsStreamId` and drives the
+handshake/read/write/close state machine on the shard thread as Betelgeuse
+harvests TCP completions — TLS is a layer over the runtime's own TCP rail, not a
+second socket stack. The single TLS worker that head-of-line-blocked accepts and
+deadlocked a same-runtime client+server is gone. `local_system_tls_quiet_stream_does_not_block_second_connection`
+still pins the quiet-stream story, and `local_system_tls_client_and_server_share_one_runtime`
+runs a Tina TLS client and server on one shard in one runtime — the exact case
+this finding called impossible. The substrate guard
+(`tina-runtime/tests/tls_substrate_guard.rs`) pins the absence of any
+`tina-tls-*` worker thread or private socket stack.
+
+**Still true:** `tls_lane_capacity` is a hard cap — now the shard-total count of
+in-flight TLS ops, not magic unbounded concurrency. Handshake asymmetric crypto
+runs on the shard thread, an accepted tradeoff: visible and boundable by accept
+rate rather than hidden on a serial worker that deadlocks.
+
+**Verified on this audit:** `TlsStreamId` and the driver/call TLS state
+machine live in `tina-runtime/src/driver/tls.rs` and
+`tina-runtime/src/call/tls.rs`; `tina-runtime/tests/tls_substrate_guard.rs`
+exists and is exactly the guard test named above.
+
+### 17. Private Unix-domain socket worker thread — closed
+
+**Note:** this shares finding number 17 with "Host-thread `call_blocking`"
+below — a pre-existing duplicate in the ledger's numbering, not introduced
+by this pass. Flagged for a human to renumber; left as-is here since
+inventing a new number was out of scope for this audit.
+
+**Surfaced by:** `specimen_local_io_codec_ipc` (`live_unix_smoke`, `admin_socket`),
+`tina-runtime/tests/local_system.rs` (`unix_live_echo`).
+
+**Closed.** Unix-domain sockets no longer run on a private worker thread over
+`std::os::unix::net`. The runtime drives bind/accept/connect/read/write/close on
+the shard thread as completions on the same per-shard Betelgeuse loop TCP and TLS
+already ride — Unix sockets are sockets, so they follow the same substrate rule.
+The narrow Unix addressing the substrate lacked (`bind_unix` / `connect_unix` and
+the socket-file unlink lifecycle) was added to vendored Betelgeuse rather than
+left in a hidden worker. The lane keeps TCP's discipline: one accept/read/write
+lane each, `ResourceBusy` on duplicates, close-wins cancellation, tombstoned
+shutdown. The capability report now classifies it completion-backed, and the
+rail-inventory guard (`scripts/rail_inventory_guard.sh`) fails the build if a
+worker thread or blocking std socket reappears in a runtime rail off-inventory.
+
+**Still true:** DNS (platform resolver) and process spawn/wait stay bounded
+blocking lanes on purpose — they are OS lifecycle / library calls with no
+portable completion opcode, and the capability report carries their written
+reason. A narrow rename/remove/readdir/metadata storage fallback is the only
+remaining off-shard storage worker.
+
+**Verified on this audit:** `scripts/rail_inventory_guard.sh` exists and
+greps `tina-runtime/src/driver` for `thread::spawn` / `os::unix::net` /
+blocking `std::fs` calls against a written inventory
+(`.intent/runtime-rail-inventory.txt`); the only live
+`std::os::unix::net` hit left in `tina-runtime/src/driver` is the
+documented process-spawn exception in `driver/process.rs`.
+`UnixWriteAll` / `UnixReadToEof` ship in `tina-runtime/src/unix_loops.rs`.
+
+### 21. Per-bucket FIFO wait list next to a global `PendingReplies` — closed
+
+`tina_runtime::SharedWork<K, R>` is now the user-facing copy path:
+"many callers wait for one result", one global cap, optional per-key
+cap (`with_key_limit`), FIFO per key, ticketed `reply_one`, and
+`reply_all_clone` / `reply_all_with` / `close_all_clone` /
+`close_all_with` / `drain_all_with` for multi-waiter replies. Stale
+tickets are rejected; tickets are move-only with crate-private fields.
+`request_effect_after_shared_wait(&ticket, effect)` is the only path
+that produces a `RequestEffect` after admission.
+
+`SharedWork` is a thin wrapper over `WaitList`; the lower-level
+`WaitList` name remains public for call sites that read better under
+the mechanism name. `system_cache_with_fill` and the
+`ergonomics_playground` single-flight cache probe both copy from
+`SharedWork` now.
+*(Update: `WaitList` has since been made private; `SharedWork` is the
+only public name.)*
+
+**Verified on this audit:** `SharedWork<K, R>` is defined in
+`tina-runtime/src/shared_work.rs`; no remaining ask from the
+historical finding below is open.
+
+*(Historical finding kept below for context.)*
+
+### 21-historical. Per-bucket FIFO wait list next to a global `PendingReplies`
+
+**Surfaced by:** `system_cache_with_fill`, `system_lock_manager`.
+
+Both specimens want "one bounded global pending box, plus a FIFO
+wait list per cache key / lock key, plus a hand-off loop that skips
+slots whose caller went away." Each writes the same shape by hand:
+
+- `pending: PendingReplies<u64, Reply>` keyed by a monotonic waiter id;
+- per-bucket `VecDeque<u64>` of waiter ids inside the bucket's state;
+- on hand-off / fill-done, pop a waiter id from the queue, `take` from
+  pending, and if the slot is gone (caller cancelled / timed out) loop
+  to the next id.
+
+The cap accounting splits awkwardly: the global cap lives on
+`PendingReplies`; the per-bucket cap lives in handler code; the
+"skip reclaimed" loop is repeated.
+
+**Build:** a small `WaitList<K, R>` (or `KeyedPendingReplies<K, R>`)
+helper that owns both caps, takes the inbound `CallContext`, and
+exposes a single `pop_next(&K) -> Option<DeferredReply<R>>` that walks
+past reclaimed slots. Must keep typed admission errors
+(`Full` / `BucketFull`) so callers can reply `Busy` distinctly.
+Revisit only after a third specimen needs the same shape so the helper
+shape is informed by three call sites, not two.
+
+### 22. Internal-event variants need a `handle_call` rejection arm — closed
+
+**Surfaced by:** `system_cache_with_fill`, `system_lock_manager`.
+
+Specimens that mix caller-authority messages (`Acquire`, `Get`) with
+runtime-owned continuations (`LeaseExpired`, `FillDone`) used to write
+a `handle_call` arm whose only job was
+`call.reject(CallRejectedReason::UnsupportedMessage)` for every
+internal variant, repeated per isolate.
+
+**Closed. Verified on this audit:** the `#[tina_runtime::isolate(event =
+Event, request = Request, reply = Reply)]` split-service form
+(`tina-macros/src/lib.rs`, `build_isolate`) generates `ServiceMessage
+<Event, Request>` (`tina/src/address.rs`) and auto-generates the
+rejection arm on both sides — an `Event` delivered to the generated
+`handle_call` is rejected with `UnsupportedMessage` and a `Request`
+delivered to `handle` is rejected the same way, with no user-written
+match arm. Compile-fail fixtures pin the type-level half
+(`tina-runtime/tests/safety_rails_compile_fail/split_event_on_request_lane.rs`);
+the live test `split_service_routes_events_and_requests_on_separate_capabilities`
+in `tina-runtime/tests/safety_rails.rs` passes (verified: `cargo test -p
+tina-runtime --test safety_rails`, 10/10 ok). `system_cache_with_fill`
+and `system_lock_manager` — the two specimens that surfaced this
+finding — both use the split form today with no hand-written rejection
+arm left in either file.
+
+### 23. Mailbox-first service ergonomics — Phase 101 shipped — closed
+
+**Note:** this shares finding number 23 with "Host-side `call_blocking`"
+below — a pre-existing duplicate in the ledger's numbering, not
+introduced by this pass. Flagged for a human to renumber.
+
+**Surfaced by:** `system_metrics_shipper`, `system_bounded_object_lane`,
+the recurring-tick / single-flight / drain / Full-handling repetition
+across system specimens.
+
+Shipped helpers:
+
+- `tina::time::RecurringTick` — fixed-period service ticks with
+  `Skip` / `Bounded(n)` / `Delay` catch-up policies; explicit
+  `RecurringTickToken` for stale-tick detection. `system_metrics_shipper`
+  now uses it for time-window flushes.
+- `tina_runtime::LocalPermitGate` — fixed-capacity, move-only `Permit`,
+  explicit release/retire; reports
+  capacity/current/full_count/high_water/retired_count/completed_count/
+  invalid_release_count. `system_bounded_object_lane` and the metrics
+  shipper's single-flight flush slot both run on it.
+- `tina_runtime::DrainState` — small admit/complete/cancel/drop
+  counter state plus `begin/finish/can_stop`. Late completions counted
+  separately. Resource close still belongs to the service.
+- `runtime.register_with_capacity_and_bootstrap[_on]` — prefills the
+  mailbox with the bootstrap message before inserting the isolate entry.
+  No cleanup-after-registration path; typed `RegisterBootstrapError` on
+  prefill refusal. Available on `Runtime`, `ThreadedRuntime`,
+  `MultiShardRuntime`, `ThreadedMultiShardRuntime`.
+- `tina_runtime::FullHandling` — decision-only state for the
+  "on Full, shed or retry-with-backoff" shape; the service still
+  schedules the visible Tina sleep.
+
+Out of scope here: lifecycle `on_start` callbacks (not shipped,
+register-and-bootstrap covers the common footgun without breaking
+mailbox truth), broad retry frameworks (FullHandling is the only one).
+
+**Verified on this audit:** `RecurringTick` in `tina/src/time.rs`;
+`LocalPermitGate` in `tina-runtime/src/local_permit.rs`; `DrainState`
+in `tina-runtime/src/drain_state.rs`; `FullHandling` in
+`tina-runtime/src/full_handling.rs`. `system_bounded_object_lane` and
+`system_metrics_shipper` both import and use `LocalPermitGate` /
+`DrainState` directly. `register_with_capacity_and_bootstrap` exists in
+`tina-runtime/src/{registration,threaded,multi_shard,
+threaded_multi_shard}.rs`, though see finding 24 below for the caveat
+that neither surfacing example has migrated onto it yet.
+
+### 23. Host-side `call_blocking` on `ThreadedMultiShardRuntime` *(closed by phase 102)*
+
+`ThreadedMultiShardRuntime::call_blocking(addr, msg, timeout)` now
+ships and routes by `addr.shard()` — same convention as `try_send` and
+`observe_result`. Bounded admission: a full worker command queue
+surfaces as `ThreadedRuntimeError::CommandFull` instead of a host
+hang. Single-shard `ThreadedRuntime::call_blocking` got the same
+bounded-admission treatment. `system_session_auth` was migrated to
+real multi-shard placement (one bucket isolate per shard, host routes
+by `ShardPlacement`); the in-isolate fallback note is gone.
+
+No `call_blocking_on(shard, addr, ...)` ships — passing the shard
+twice is a place to introduce a mismatch bug. A future host-to-shard
+variant only earns its place when a real caller needs "call as if
+from shard A into target shard B" and has a remote-path proof.
+
+**Verified on this audit:** `call_blocking` exists on both
+`tina-runtime/src/threaded.rs` (single-shard) and
+`tina-runtime/src/threaded_multi_shard.rs` (multi-shard), each routed
+by `addr.shard()`; no `call_blocking_on` exists anywhere in
+`tina-runtime/src`, matching the "no host-to-shard variant" claim.
+
+### 24. Register-and-bootstrap helper for start-up effects — closed (library); examples not yet migrated
+
+**Surfaced by:** `system_job_queue`, `system_session_auth`.
+
+Both specimens have a startup effect (job_queue spawns N worker children;
+session_auth schedules the first sweep timer). The ceremony this finding
+complained about: define a public `Msg::Bootstrap` variant, handle it in
+`handle`, and after `register_with_capacity` remember a separate
+`try_send(addr, Msg::Bootstrap)` — forgettable, and the failure mode is
+silent.
+
+**Closed at the library level. Verified on this audit:**
+`register_with_capacity_and_bootstrap` (and `_on` / `_using` siblings)
+ship in `tina-runtime/src/registration.rs`,
+`tina-runtime/src/threaded.rs`, `tina-runtime/src/multi_shard.rs`, and
+`tina-runtime/src/threaded_multi_shard.rs`, prefilling the mailbox with
+the bootstrap message before the address is returned, with a typed
+`RegisterBootstrapError` on prefill refusal (`tina-runtime/src/errors.rs`).
+
+**Not yet closed at the example level:** neither surfacing specimen has
+adopted it. `system_job_queue` and `system_session_auth`
+(`examples/systems/{system_job_queue,system_session_auth}/src/lib.rs`)
+still call `register_with_capacity_using` followed by a separate
+`.try_send(address, ...Bootstrap)` — the exact two-step pattern this
+finding asked to remove. This is an examples-freshness gap, not a
+runtime gap; recorded here rather than as a separate finding.
+
+### 25. Request/reply variants in `handle` compile but reject at runtime — closed
+
+**Surfaced by:** `system_cache_with_fill`, `system_job_queue` (Worker
+isolate).
+
+A request/reply isolate used to route incoming messages through
+`handle` for fire-and-forget variants and `handle_call` for
+caller-authority variants, with both handlers sharing the same
+`Message` type — a variant belonged on one side by convention only,
+and putting it on the wrong side compiled cleanly but rejected at
+runtime.
+
+**Closed. Verified on this audit:** the isolate macro accepts
+`event = Event, request = Request` in place of `message = Message`
+(`tina-macros/src/lib.rs`, keys parsed at line ~93-94, `split_service`
+branch in `build_isolate`) and expands to `ServiceMessage<Event,
+Request>` (`tina/src/address.rs`). This makes the split
+unrepresentable at the type level exactly as the finding's `Build`
+section asked: an `Event` can never reach the generated `handle_call`
+match, a `Request` can never reach `handle`, and the compile-fail
+fixture `split_event_on_request_lane.rs` pins a real `E0308`
+diagnostic (`expected Request, found Event`) at the call site, not a
+runtime rejection. Live coverage: `cargo test -p tina-runtime --test
+safety_rails` passes 10/10, including
+`split_service_routes_events_and_requests_on_separate_capabilities`.
+`system_cache_with_fill` and `system_lock_manager` both use the split
+form today. **Not yet migrated:** `system_job_queue`'s `Worker`
+isolate (`examples/systems/system_job_queue/src/lib.rs`) still uses
+`message = WorkerMsg` with a hand-written `call.reject(UnsupportedMessage)`
+arm — one of the two specimens this finding named has not adopted the
+fix. Examples-freshness gap, not a runtime gap.
+
+### 27. Lease handoff into a `PendingReplies` slot — Phase 110 shipped — closed
+
+`tina_runtime::GuardedPendingReplies<K, R, G>` pairs the parked caller
+with one RAII `G` guard, drops it exactly once on reply / drain /
+caller-gone sweep, and returns it back to the caller on failed
+admission. `system_api_gateway_limits` now parks a
+`SharedCapacityReservation` directly in the slot, so there is no
+sidecar charge table.
+
+**Verified on this audit:** `GuardedPendingReplies` is defined in
+`tina-runtime/src/guarded_pending.rs`;
+`examples/systems/system_api_gateway_limits/src/lib.rs` declares
+`pending: GuardedPendingReplies<u64, GatewayReply,
+SharedCapacityReservation>` directly — no sidecar lease map.
+
+*(Historical finding kept below for context.)*
+
+### 27-historical. Lease handoff into a `PendingReplies` slot
+
+**Surfaced by:** `system_api_gateway_limits`, `system_soak_http_db`.
+
+A request that admits against a `SharedCapacityScope` and then parks
+its reply in `PendingReplies` has to carry the `SharedLease` in a
+sidecar `HashMap<qid, SharedLease>` so the lease outlives the
+post-sleep handler. Both new specimens do this manually. The mapping
+between "this qid" and "this lease" is invariant under the slot
+lifecycle and would compose cleanly into the slot itself.
+
+**Build:** a slot variant — `PendingReplies::try_insert_with_lease(qid,
+slot, lease)` — or a generic `SharedLease`-carrying wrapper that
+`reply_to` consumes. Either form removes the parallel map.
+
+### 31. `SleepReply` leaks into user-defined message variants — Phase 110 shipped — closed
+
+`tina_runtime::sleep(d).then_event(move || Msg::Wake { id })` is the
+sleep-only sugar: the user enum has no `SleepReply` field, and the
+helper does not exist on non-timer `TypedCall<()>` so file/process/TCP
+close errors stay visible. The phase still ships `sleep_then(d, m)` and
+`sleep(d).then(...)` for the cases that *do* want the timer reply.
+
+**Verified on this audit:** `then_event` is defined in
+`tina-runtime/src/call/time.rs`.
+
+*(Historical finding kept below for context.)*
+
+### 31-historical. `SleepReply` leaks into user-defined message variants
+
+**Surfaced by:** `system_api_gateway_limits`, `system_soak_http_db`.
+
+Every variant a specimen builds for a post-sleep wake-up carries
+`result: SleepReply` even when the handler never inspects it. The
+gateway's `HoldDone { qid, route, result: SleepReply }` and the
+soak's `HttpReleased { qid, ..., result: SleepReply }` are both
+shaped this way. The field is dead weight in the user's message
+enum, but the `sleep(d).then(move |r| Msg { result: r, ... })`
+signature requires it.
+
+**Build:** either (a) accept `then(move |_| Msg { ... })` without
+the placeholder field as the blessed shape and add a `then_no_result`
+variant, or (b) drop the `Result` from `SleepReply` for the
+infallible-sleep case so the carrying variant is a unit. The wider
+form is right for cancellation-aware sleeps; for the typical "wake
+me up later, I don't care if you were nudged" the unit form would
+keep the user's enum clean.
+
+### 33. Bridge classifier vocabulary lives in `tina-aws-bridge` — shipped — closed
+
+`tina_runtime::bridge::BridgeOutcomeClass` (with
+`BridgeRetryable` / `BridgeUnavailable` / `BridgeFatal`) is the shared
+shape every bridge classifier projects onto. Each per-bridge
+classifier (reqwest, AWS workers) is still free to expose richer
+per-bridge reasons, but the shared `bridge_class()` projection makes
+mixed-bridge classification a typed fold instead of caller-private
+re-mapping. The bridge-author copy path in
+[`docs/tina-user-guide/30-bridge-author-kit.md`](../docs/tina-user-guide/30-bridge-author-kit.md)
+step 7 names this contract.
+
+**Verified on this audit:** `BridgeOutcomeClass` is defined in
+`tina-runtime/src/bridge.rs`; `bridge_class()` projections exist in
+`tina-aws-bridge/src/classifier.rs` and `tina-reqwest-bridge`.
+
+*(Historical finding kept below for context.)*
+
+### 33-historical. Bridge classifier vocabulary lives in `tina-aws-bridge`
+
+**Surfaced by:** `system_webhook_relay`, classifier extension traits.
+
+`BridgeOutcomeClass` / `TransientReason` / `FatalReason` were useful
+outside AWS too — the reqwest bridge already has `ReqwestOutcomeClass`
+with its own per-bridge vocabulary. A relay or retry-driver needs
+*both* shapes to classify mixed outcomes (one outbound HTTP, one SQS)
+the same way, so callers re-classify into a private enum.
+
+**Build:** decide whether the bridge classifier should be in
+`tina-runtime` (shared by all bridges) or whether each bridge keeps
+its own private vocabulary and callers map at the boundary. The plan
+forbids a shared bridge crate, but the *classifier vocabulary* is
+plain data and could live alongside `CallOutcome` without coupling
+the bridges themselves.
 
 ### 36. Whole-service copied path — Phase 120 shipped
 
