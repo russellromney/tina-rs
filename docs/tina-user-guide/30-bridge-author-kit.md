@@ -41,7 +41,7 @@ let config = XxxConfig::new(...)
     .mailbox_capacity(64)
     .max_in_flight(8)
     .per_request_timeout(Duration::from_secs(10));
-config.validate().map_err(InstallError::Invalid)?;
+config.validate().map_err(InstallError::Config)?;
 ```
 
 ## Step 2 — Install starts the worker
@@ -60,11 +60,10 @@ pub trait BridgeInstall {
 }
 ```
 
-Callers send typed requests to the bridge-specific typed address
-(`install.address()`, `install.s3()`, `install.sqs()`, etc.) — never
-to a raw worker. Address access stays bridge-specific because bridge
-address shapes differ. The shared trait standardizes the closer and
-metrics handles.
+Callers send typed requests to the install's public `address` field —
+never to a raw worker. The address *type* stays bridge-specific because
+address shapes differ per bridge, while the shared `BridgeInstall` trait
+standardizes the closer and metrics handles.
 
 The bridge never registers itself on the user's runtime implicitly;
 the user passes the runtime explicitly, exactly once.
@@ -98,9 +97,11 @@ a typed `XxxDrainReport`:
 
 ```rust
 let report = closer.close_and_drain(Duration::from_secs(30));
-match report.outcome() {
-    DrainOutcome::Drained => /* clean stop */,
-    DrainOutcome::TimedOut(kinds) => /* still in flight; log and proceed */,
+if report.drained {
+    // clean stop: every in-flight request settled before the deadline
+} else {
+    // still in flight; `report.in_flight_remaining` and
+    // `report.in_flight_kinds` name what's left — log and proceed
 }
 ```
 
@@ -144,9 +145,11 @@ the closed type prevents that.
 
 ## Step 7 — Classifier names retry / fatal / success
 
-Every bridge ships `XxxOutcomeExt::classify(outcome)` (or
-`outcome.bridge_class()`) that returns
-[`tina_runtime::bridge::BridgeOutcomeClass`](../../tina-runtime/src/bridge.rs):
+The AWS and SQLite bridges ship `XxxOutcomeExt::classify(&outcome)`
+returning
+[`tina_runtime::bridge::BridgeOutcomeClass`](../../tina-runtime/src/bridge.rs);
+the reqwest bridge exposes its own richer `ReqwestOutcomeClass`. The
+shared `BridgeOutcomeClass` shape is:
 
 - `Succeeded`;
 - `Retryable(BridgeRetryable)` — caller decides under their own

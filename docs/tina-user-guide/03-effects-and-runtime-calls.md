@@ -66,9 +66,8 @@ journal_append(self.path.clone(), request.bytes.clone())
 ```
 
 `then(...)` does not reply to a caller and does not preserve caller authority.
-It is the ordinary message-continuation vocabulary. The older `.then(...)`
-builder spelling remains as a compatibility alias, but new docs should prefer
-`then(...)` when no caller is being answered.
+It is the ordinary message-continuation vocabulary — use it when no caller is
+being answered.
 
 When a call handler must answer its caller after visible work, root the
 expression at `CallContext`:

@@ -384,7 +384,7 @@ is rejected as `TakeParkedError::StaleTicket`.
 The lower-level key-only form still works as an escape hatch:
 
 ```rust
-let slot: DeferredReply<MyReply> = ctx.take_request_context()?;
+let slot: DeferredReply<MyReply> = ctx.take_request_context()?.into_deferred();
 self.pending.try_insert(req_id, slot)?;
 let slot = self.pending.take(&req_id).expect("slot for id");
 return reply_to(slot, MyReply::Ok(value));

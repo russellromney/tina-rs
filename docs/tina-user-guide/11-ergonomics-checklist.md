@@ -685,7 +685,7 @@ answer a caller from a later turn (pool frontend, sharded frontend,
 fanout, bridge worker).
 
 ```rust
-let slot: DeferredReply<MyReply> = ctx.take_request_context()?;
+let slot: DeferredReply<MyReply> = ctx.take_request_context()?.into_deferred();
 self.pending.try_insert(req_id, slot)?;
 // later:
 return tina::reply_to(self.pending.take(&req_id).unwrap(), MyReply::Ok(v));
