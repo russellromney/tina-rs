@@ -22,17 +22,28 @@ One async fn per request. The `?` operator handles short-circuit.
 
 ## Tina shape
 
-The `Pipeline` isolate captures a `DeferredReply` per request, walks
-through `Parse`, `Validate`, `Execute` calls (each is an
-`IsolateCall` continuation), and replies through the slot at the
-end:
+The `Pipeline` isolate uses `tina::flow!` to declare the three-step chain.
+`Submit` captures caller authority, dispatches the parse call, and hands the
+`RequestContext` into the flow; each step matches the prior stage's
+`CallOutcome`, dispatches the next call (threading `req` through via
+`.then_with_request`), or replies with the terminal outcome:
 
 ```rust
-PipelineMsg::Submit(input)         // capture slot, dispatch parse
-PipelineMsg::Parsed(qid, outcome)  // dispatch validate or bail
-PipelineMsg::Validated(qid, outcome) // dispatch execute or bail
-PipelineMsg::Executed(qid, outcome)  // reply_to(slot, Completed)
+tina::flow! {
+    flow PipelineFlow for Pipeline {
+        reply PipelineReply;
+        step Parsed() -> ParseReply { /* dispatch validate, or reply */ }
+        step Validated() -> ValidateReply { /* dispatch execute, or reply */ }
+        step Executed() -> ExecuteReply { /* reply Completed or Failed */ }
+    }
+}
 ```
+
+`tina::flow!` generates the `PipelineFlow` continuation enum and its
+dispatcher (`handle_pipeline_flow`) — the same shape this specimen used to
+hand-roll as `PipelineMsg::{Parsed,Validated,Executed}`. Caller authority now
+threads through `req: RequestContext<PipelineReply>` directly, so the
+qid-keyed `PendingReplies` table this specimen previously needed is gone too.
 
 ## Discussion
 
@@ -40,30 +51,21 @@ What feels good:
 
 - Each stage is its own `Isolate`, with its own message type, reply
   type, and bounded mailbox. Adding a fourth stage adds one isolate
-  and one continuation arm, no other plumbing.
-- Out-of-order completion across requests is invisible at the call
-  sites. The `qid` on each continuation correlates the reply.
+  and one flow step, no other plumbing.
+- `req` threading replaces the qid/`PendingReplies` indirection: one fewer
+  keyed table, one fewer failure mode (`Full`/`DuplicateKey` on park).
+- The generated dispatcher still names each stage as its own variant, and
+  every suspension point (`call(...).then_with_request(...)`) stays
+  trace-visible — `flow!` only deletes the boilerplate, not the shape.
 
-What feels worse:
+What still doesn't disappear:
 
-- The `PipelineMsg` enum has one variant per stage. Three stages =
-  four variants (Submit + 3 continuations). For an N-stage pipeline
-  the variant count grows linearly. The `parsed → validated →
-  executed` async-fn version reads nicer.
-- The `bail` helper (closes the slot with the right error variant)
-  is small but shows up at the bottom of every match arm; an
-  `Effect::Result` style helper that maps `Outcome -> next` could
-  shrink the boilerplate.
 - The deferred reply slot survives across three stages, but caller
   timeout truth is now distributed across three `IsolateCall`
   timeouts. If the *original* caller times out at `STAGE_TIMEOUT`,
   every downstream call also has its own. There is no single
-  deadline that propagates.
-
-A pipeline DSL that compresses the four variants into one was
-considered and rejected. Every shape short enough to pay for the
-helper hides one of: the named stage in the variant; the
-trace-visible suspension at each `call(...).then(...)`; the
-per-stage `Full` / `Closed` / `Timeout` outcome; or partial
-progress data when a middle stage fails. The raw match-state-
-machine form is the semantic truth on purpose.
+  deadline that propagates. `flow!` does not solve this — it is a
+  continuation-boilerplate helper, not a deadline-propagation helper.
+- `flow!` is deliberately linear-only: no fan-out, no joins, no loops. A
+  pipeline stage that needs to fan out to N children still hand-writes
+  its own continuation enum.

@@ -28,50 +28,67 @@ use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tina::CallRejectedReason;
 use tina::prelude::*;
 use tina_runtime::{
-    CallOutcome, DefaultThreadedMailboxFactory, SleepReply, ThreadedRuntime, call, sleep,
+    CallOutcome, DefaultThreadedMailboxFactory, SleepReply, ThreadedRuntime, call, call_request,
+    sleep,
 };
 
 use crate::{FAST_C_MS, REQUEST_COUNT, Report, SLOW_C_MS, TOTAL_DEADLINE_MS, c_is_slow};
 
 // ---------- Service C: does the slow work ----------
 
+/// Caller-authority request: the only thing an outside caller can ask.
 #[derive(Debug)]
-enum CMsg {
+enum CRequest {
     Compute { iteration: u32 },
+}
+
+/// Internal event: the sleep continuation for a call in flight.
+#[derive(Debug)]
+enum CEvent {
     Done(RequestContext<()>, SleepReply),
 }
 
 struct ServiceC;
 
-#[tina_runtime::isolate(message = CMsg)]
+#[tina_runtime::isolate(event = CEvent, request = CRequest, reply = ())]
 impl ServiceC {
-    fn handle(&mut self, msg: CMsg, _ctx: &mut Context<'_, SingleShard>) -> Effect<Self> {
-        match msg {
-            CMsg::Compute { .. } => noop(),
-            CMsg::Done(req, Ok(())) => reply_to(req, ()),
-            CMsg::Done(req, Err(_)) => reply_to(req, ()),
+    fn handle_event(&mut self, event: CEvent, _ctx: &mut Context<'_, SingleShard, Self::Reply>) -> Effect<Self> {
+        match event {
+            CEvent::Done(req, Ok(())) => reply_to(req, ()),
+            CEvent::Done(req, Err(_)) => reply_to(req, ()),
         }
     }
 
-    fn handle_call(&mut self, msg: CMsg, call_ctx: CallContext<'_, Self>) -> Effect<Self> {
-        match msg {
-            CMsg::Compute { iteration } => {
+    fn handle_request(
+        &mut self,
+        request: CRequest,
+        call: RequestCall<'_, Self>,
+    ) -> RequestEffect<Self> {
+        match request {
+            CRequest::Compute { iteration } => {
                 let work = if c_is_slow(iteration) {
                     Duration::from_millis(SLOW_C_MS)
                 } else {
                     Duration::from_millis(FAST_C_MS)
                 };
-                call_ctx.defer(sleep(work)).reply(CMsg::Done)
+                call.defer(sleep(work))
+                    .reply(|req, result| tina::ServiceMessage::Event(CEvent::Done(req, result)))
             }
-            CMsg::Done(_, _) => call_ctx.reject(CallRejectedReason::UnsupportedMessage),
         }
     }
 }
 
 // ---------- Service B: forwards to C with remaining budget ----------
+//
+// B keeps the manual `handle`/`handle_call` split (not the split-service
+// macro) because the deadline math needs `CallContext::now()` before
+// deferring the call to C, and `RequestCall` (the split-service request
+// wrapper) does not expose a `now()` accessor — only `CallContext` does.
+// Forcing the macro form here would strand the deadline read with no
+// sanctioned way to get the current time before `.defer(...)` consumes
+// the caller authority.
 
 #[derive(Debug)]
 enum BMsg {
@@ -90,7 +107,7 @@ enum BReply {
 }
 
 struct ServiceB {
-    c_addr: Address<CMsg, ()>,
+    c_addr: tina::ServiceRequestAddress<CEvent, CRequest, ()>,
 }
 
 #[tina_runtime::isolate(message = BMsg, reply = BReply)]
@@ -118,15 +135,18 @@ impl ServiceB {
                 // surfaces as `CallOutcome::Timeout`.
                 let timeout = deadline.remaining_or_zero(call_ctx.now());
                 call_ctx
-                    .defer(call(self.c_addr, CMsg::Compute { iteration }, timeout))
+                    .defer(call_request(self.c_addr, CRequest::Compute { iteration }, timeout))
                     .reply(BMsg::CDone)
             }
-            BMsg::CDone(_, _) => call_ctx.reject(CallRejectedReason::UnsupportedMessage),
+            BMsg::CDone(_, _) => call_ctx.reject(tina::CallRejectedReason::UnsupportedMessage),
         }
     }
 }
 
 // ---------- Service A: entry point ----------
+//
+// Same reason as B: `Deadline::from_instant` needs `CallContext::now()`,
+// which `RequestCall` does not expose, so A keeps the manual dispatch too.
 
 #[derive(Debug)]
 enum AMsg {
@@ -186,7 +206,7 @@ impl ServiceA {
                     ))
                     .reply(AMsg::BDone)
             }
-            AMsg::BDone(_, _) => call_ctx.reject(CallRejectedReason::UnsupportedMessage),
+            AMsg::BDone(_, _) => call_ctx.reject(tina::CallRejectedReason::UnsupportedMessage),
         }
     }
 }
@@ -257,8 +277,9 @@ pub fn run() -> anyhow::Result<Report> {
     ));
 
     let c_addr = runtime
-        .register_with_capacity::<_, Infallible>(ServiceC, 8)
-        .map_err(|e| anyhow::anyhow!("register C: {e:?}"))?;
+        .register_split_service::<ServiceC, CEvent, CRequest, Infallible>(ServiceC, 8)
+        .map_err(|e| anyhow::anyhow!("register C: {e:?}"))?
+        .requests;
     let b_addr = runtime
         .register_with_capacity::<_, Infallible>(ServiceB { c_addr }, 8)
         .map_err(|e| anyhow::anyhow!("register B: {e:?}"))?;

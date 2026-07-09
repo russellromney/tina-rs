@@ -64,10 +64,12 @@ What felt rough:
   the right behavior, but it means a `WorkerMsg::Cancel` send to nudge
   the worker is purely best-effort — there is no place to confirm the
   worker stopped early.
-- Bootstrap-message ceremony is still required. The queue cannot spawn
-  its workers from its constructor; the host has to send a one-shot
-  `QueueMsg::Bootstrap` after registration so the `spawn_observed`
-  effects can return from `handle`.
+- A bootstrap message is still required — the queue cannot spawn its
+  workers from its constructor, since only `handle`/`handle_call` can
+  return effects. `register_with_capacity_and_bootstrap` removes the
+  ceremony this README used to flag (a separate `try_send` the host had
+  to remember after registration): the mailbox is now prefilled with
+  `QueueMsg::Bootstrap` atomically as part of registration itself.
 - There is still no in-isolate hook for "my child stopped." The queue
   detects a dead worker through `CallOutcome::Closed` on the in-flight
   call. That works for jobs in flight; a worker that dies *between* jobs

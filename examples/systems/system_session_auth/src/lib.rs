@@ -334,15 +334,13 @@ impl AuthWorld {
         let mut addrs_by_shard = BTreeMap::new();
         for shard_id in &shard_ids {
             let addr = runtime
-                .register_with_capacity_on::<SessionBucket, Infallible>(
+                .register_with_capacity_and_bootstrap_on::<SessionBucket, Infallible>(
                     *shard_id,
                     SessionBucket::new(config),
                     config.session_mailbox,
+                    SessionAuthMsg::Bootstrap,
                 )
                 .map_err(|e| anyhow::anyhow!("register on shard {}: {e:?}", shard_id.get()))?;
-            runtime
-                .try_send(addr, SessionAuthMsg::Bootstrap)
-                .map_err(|e| anyhow::anyhow!("bootstrap on shard {}: {e:?}", shard_id.get()))?;
             addrs_by_shard.insert(*shard_id, addr);
         }
         Ok(Self {

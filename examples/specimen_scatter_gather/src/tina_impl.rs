@@ -14,8 +14,8 @@ use std::time::Duration;
 
 use tina::prelude::*;
 use tina_runtime::{
-    CallOutcome, DefaultThreadedMailboxFactory, ParkCallError, PendingReplies, RuntimeCall,
-    ThreadedRuntime,
+    CallOutcome, DefaultThreadedMailboxFactory, ParkError, PendingReplies,
+    request_effect_after_park, RuntimeCall, ThreadedRuntime, call_request,
 };
 
 use crate::{CLIENTS, MAX_IN_FLIGHT, Report, WORKERS, expected_aggregate};
@@ -61,10 +61,16 @@ impl Worker {
 
 // --- Coordinator ----------------------------------------------------------
 
+/// Internal event: one worker's per-query reply, never caller authority.
 #[derive(Debug)]
-enum CoordMsg {
-    Query(u64),
+enum CoordEvent {
     WorkerDone(u64, CallOutcome<WorkerReply>),
+}
+
+/// Caller-authority request: the only thing an outside caller can ask.
+#[derive(Debug)]
+enum CoordRequest {
+    Query(u64),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -89,16 +95,15 @@ struct Coordinator {
     partials: Vec<PartialQuery>,
 }
 
-#[tina_runtime::isolate(message = CoordMsg, reply = AggregateReply)]
+#[tina_runtime::isolate(event = CoordEvent, request = CoordRequest, reply = AggregateReply)]
 impl Coordinator {
-    fn handle(
+    fn handle_event(
         &mut self,
-        msg: CoordMsg,
+        event: CoordEvent,
         _ctx: &mut Context<'_, SingleShard, Self::Reply>,
     ) -> Effect<Self> {
-        match msg {
-            CoordMsg::Query(_) => noop(),
-            CoordMsg::WorkerDone(qid, outcome) => {
+        match event {
+            CoordEvent::WorkerDone(qid, outcome) => {
                 let Some(idx) = self.partials.iter().position(|p| p.qid == qid) else {
                     return noop();
                 };
@@ -118,13 +123,17 @@ impl Coordinator {
         }
     }
 
-    fn handle_call(&mut self, msg: CoordMsg, call_ctx: CallContext<'_, Self>) -> Effect<Self> {
-        match msg {
-            CoordMsg::Query(payload) => {
+    fn handle_request(
+        &mut self,
+        request: CoordRequest,
+        call: RequestCall<'_, Self>,
+    ) -> RequestEffect<Self> {
+        match request {
+            CoordRequest::Query(payload) => {
                 let qid = self.next_qid;
                 self.next_qid += 1;
-                match self.pending.park_call(qid, call_ctx) {
-                    Ok(_ticket) => {
+                match self.pending.park_request(qid, call) {
+                    Ok(ticket) => {
                         self.partials.push(PartialQuery {
                             qid,
                             sum: 0,
@@ -138,24 +147,22 @@ impl Coordinator {
                                     *w,
                                     WorkerMsg::Do(payload),
                                     QUERY_TIMEOUT,
-                                    move |outcome| CoordMsg::WorkerDone(qid, outcome),
+                                    move |outcome| {
+                                        tina::ServiceMessage::Event(CoordEvent::WorkerDone(
+                                            qid, outcome,
+                                        ))
+                                    },
                                 ))
                             })
                             .collect();
-                        Effect::Batch(calls)
+                        request_effect_after_park(&ticket, Effect::Batch(calls))
                     }
                     // Pending box full: reply Full to the caller
                     // without capturing. The caller observes a typed
                     // overload distinct from a successful aggregate.
-                    Err(ParkCallError::Full { call, .. }) => call.reply(AggregateReply::Full),
-                    Err(ParkCallError::DuplicateKey { call, .. }) => {
-                        call.reply(AggregateReply::Full)
-                    }
-                    Err(other) => panic!("park_call: {other:?}"),
+                    Err(ParkError::Full { call, .. }) => call.reply(AggregateReply::Full),
+                    Err(ParkError::DuplicateKey { call, .. }) => call.reply(AggregateReply::Full),
                 }
-            }
-            CoordMsg::WorkerDone(_, _) => {
-                call_ctx.reject(tina::CallRejectedReason::UnsupportedMessage)
             }
         }
     }
@@ -177,7 +184,7 @@ enum DriverMsg {
 }
 
 struct Driver {
-    coord: Address<CoordMsg, AggregateReply>,
+    coord: tina::ServiceRequestAddress<CoordEvent, CoordRequest, AggregateReply>,
     payloads: Vec<u64>,
     remaining: usize,
     outcome: DriverOutcome,
@@ -199,12 +206,8 @@ impl Driver {
                     .copied()
                     .enumerate()
                     .map(|(i, payload)| {
-                        Effect::Io(RuntimeCall::isolate_call(
-                            coord,
-                            CoordMsg::Query(payload),
-                            QUERY_TIMEOUT,
-                            move |outcome| DriverMsg::Returned(i, outcome),
-                        ))
+                        call_request(coord, CoordRequest::Query(payload), QUERY_TIMEOUT)
+                            .then(move |outcome| DriverMsg::Returned(i, outcome))
                     })
                     .collect();
                 Effect::Batch(calls)
@@ -246,7 +249,7 @@ pub fn run() -> anyhow::Result<Report> {
     }
 
     let coord = runtime
-        .register_with_capacity::<_, Infallible>(
+        .register_split_service::<Coordinator, CoordEvent, CoordRequest, Infallible>(
             Coordinator {
                 workers,
                 pending: PendingReplies::with_capacity(MAX_IN_FLIGHT),
@@ -255,7 +258,8 @@ pub fn run() -> anyhow::Result<Report> {
             },
             32,
         )
-        .map_err(|e| anyhow::anyhow!("register coordinator: {e:?}"))?;
+        .map_err(|e| anyhow::anyhow!("register coordinator: {e:?}"))?
+        .requests;
 
     let payloads: Vec<u64> = (0..CLIENTS as u64)
         .map(|c| c.wrapping_mul(7).wrapping_add(11))

@@ -9,9 +9,10 @@
 //! - Recurring liveness tick: a single `sleep_then` self-reschedules the room
 //!   every `presence_tick`, broadcasts a heartbeat to every live member, and
 //!   evicts members whose last broadcast was older than `idle_evict`.
-//! - Explicit bootstrap control: the host sends `AppControl(Start)` after
-//!   register so the recurring tick starts. Forgetting this produces a
-//!   quiet room (Finding 22 in `examples/FINDINGS.md`).
+//! - Explicit bootstrap control: `register_with_capacity_and_bootstrap`
+//!   prefills the room's mailbox with `AppControl(Start)` atomically at
+//!   registration so the recurring tick always starts. Forgetting this
+//!   produces a quiet room (Finding 22 in `examples/FINDINGS.md`).
 //! - Graceful shutdown via the public `WebSocketSessionMsg::Shutdown` variant,
 //!   which the room translates into bounded `handle.close_effect::<Room>`
 //!   calls — no second writer, no hidden queue.
@@ -667,7 +668,7 @@ impl RoomServer {
         };
 
         let room = runtime
-            .register_service::<Room, HttpConnectionMsg>(
+            .register_with_capacity_and_bootstrap::<Room, HttpConnectionMsg>(
                 Room {
                     members: WebSocketMemberTable::new(config.member_capacity),
                     last_seen: BTreeMap::new(),
@@ -680,7 +681,9 @@ impl RoomServer {
                     _shard: PhantomData,
                 },
                 config.room_mailbox_capacity,
+                WebSocketSessionMsg::AppControl(WebSocketSessionControl::Start),
             )
+            .map(tina_runtime::ServiceHandle::from_address)
             .expect("register room");
 
         let gateway = runtime
@@ -717,15 +720,6 @@ impl RoomServer {
             .try_send(listener, HttpListenerMsg::Start)
             .expect("start listener");
         let addr = bound.wait(Duration::from_secs(2)).expect("bound address");
-
-        // Bootstrap the room's recurring tick through the typed app-control
-        // lane. It is still an ordinary bounded message to the room.
-        runtime
-            .try_send(
-                room.send.address(),
-                WebSocketSessionMsg::AppControl(WebSocketSessionControl::Start),
-            )
-            .expect("bootstrap");
 
         Self {
             addr,

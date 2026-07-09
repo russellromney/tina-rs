@@ -22,13 +22,12 @@ use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tina::CallContext;
 use tina::prelude::*;
 use tina_aws_bridge::{
     BridgeFatal, BridgeOutcomeClass, BridgeRetryable, BridgeUnavailable, SqsAddress, SqsError,
     SqsRequest, SqsResponse, SqsSendMessage, send_sqs,
 };
-use tina_runtime::{CallOutcome, DefaultThreadedMailboxFactory, RuntimeCall, ThreadedRuntime};
+use tina_runtime::{CallOutcome, DefaultThreadedMailboxFactory, ThreadedRuntime};
 
 /// Outbound port the relay calls. Mirrors the bridge two-layer shape.
 pub type OutboundOutcome = CallOutcome<Result<OutboundReply, OutboundError>>;
@@ -122,7 +121,7 @@ pub enum RelayReply {
     Retry { reason: BridgeRetryable },
     /// Will not succeed without input/setup change.
     DeadLetter { reason: DeadLetterReason },
-    /// Reply to a `RelayMsg::Stats` call: typed counter snapshot.
+    /// Reply to a `RelayRequest::Stats` call: typed counter snapshot.
     Stats(RelayStats),
 }
 
@@ -137,13 +136,11 @@ pub struct RelayStats {
     pub dead_letter: u64,
 }
 
-/// Messages handled by the relay.
+/// Internal completions the relay's outbound port reports back. Never
+/// part of the caller-facing request surface.
 #[derive(Debug)]
-pub enum RelayMsg {
-    /// Caller asks the relay to deliver one event.
-    Deliver(Event),
+enum RelayEvent {
     /// Internal: the fake outbound replied.
-    #[doc(hidden)]
     FakeFinished {
         /// Original caller request context.
         request: RequestContext<RelayReply>,
@@ -152,7 +149,6 @@ pub enum RelayMsg {
         outcome: OutboundOutcome,
     },
     /// Internal: the SQS bridge replied.
-    #[doc(hidden)]
     SqsFinished {
         /// Original caller request context.
         request: RequestContext<RelayReply>,
@@ -160,6 +156,13 @@ pub enum RelayMsg {
         /// handler entry.
         outcome: CallOutcome<Result<SqsResponse, SqsError>>,
     },
+}
+
+/// Caller-authority requests handled by the relay.
+#[derive(Debug)]
+enum RelayRequest {
+    /// Caller asks the relay to deliver one event.
+    Deliver(Event),
     /// Caller asks for relay-side counters.
     Stats,
 }
@@ -219,7 +222,7 @@ pub enum OutboundPort {
 
 /// Webhook relay isolate. Forwards events to its outbound port and
 /// classifies each outcome.
-pub struct Relay {
+struct Relay {
     outbound: OutboundPort,
     timeout: Duration,
     stats: RelayStats,
@@ -238,8 +241,39 @@ impl Relay {
     }
 }
 
+#[tina_runtime::isolate(event = RelayEvent, request = RelayRequest, reply = RelayReply)]
 impl Relay {
-    fn issue(&mut self, event: Event, call: CallContext<'_, Self>) -> Effect<Self> {
+    fn handle_event(
+        &mut self,
+        event: RelayEvent,
+        _ctx: &mut Context<'_, SingleShard, Self::Reply>,
+    ) -> Effect<Self> {
+        match event {
+            RelayEvent::FakeFinished { request, outcome } => {
+                let reply = self.classify_and_tally(outcome);
+                reply_to(request, reply)
+            }
+            RelayEvent::SqsFinished { request, outcome } => {
+                let reply = self.classify_and_tally(map_sqs_outcome(outcome));
+                reply_to(request, reply)
+            }
+        }
+    }
+
+    fn handle_request(
+        &mut self,
+        request: RelayRequest,
+        call: RequestCall<'_, Self>,
+    ) -> RequestEffect<Self> {
+        match request {
+            RelayRequest::Deliver(event) => self.issue(event, call),
+            RelayRequest::Stats => call.reply(RelayReply::Stats(self.stats)),
+        }
+    }
+}
+
+impl Relay {
+    fn issue(&mut self, event: Event, call: RequestCall<'_, Self>) -> RequestEffect<Self> {
         let timeout = self.timeout;
         match &self.outbound {
             OutboundPort::Fake(addr) => call
@@ -248,7 +282,9 @@ impl Relay {
                     FakeOutboundMsg::Send(event),
                     timeout,
                 ))
-                .reply(|request, outcome| RelayMsg::FakeFinished { request, outcome }),
+                .reply(|request, outcome| {
+                    tina::ServiceMessage::Event(RelayEvent::FakeFinished { request, outcome })
+                }),
             OutboundPort::Sqs(sqs) => {
                 let address = sqs.address;
                 let queue_url = sqs.queue_url.clone();
@@ -263,47 +299,9 @@ impl Relay {
                     }),
                     bridge_timeout,
                 );
-                call.defer(issued)
-                    .reply(|request, outcome| RelayMsg::SqsFinished { request, outcome })
-            }
-        }
-    }
-}
-
-impl Isolate for Relay {
-    tina::isolate_types! {
-        message: RelayMsg,
-        reply: RelayReply,
-        send: tina::Outbound<Infallible>,
-        spawn: Infallible,
-        io: RuntimeCall<RelayMsg>,
-        shard: SingleShard,
-    }
-
-    fn handle(
-        &mut self,
-        msg: RelayMsg,
-        _ctx: &mut Context<'_, SingleShard, Self::Reply>,
-    ) -> Effect<Self> {
-        match msg {
-            RelayMsg::Deliver(_) | RelayMsg::Stats => noop(),
-            RelayMsg::FakeFinished { request, outcome } => {
-                let reply = self.classify_and_tally(outcome);
-                reply_to(request, reply)
-            }
-            RelayMsg::SqsFinished { request, outcome } => {
-                let reply = self.classify_and_tally(map_sqs_outcome(outcome));
-                reply_to(request, reply)
-            }
-        }
-    }
-
-    fn handle_call(&mut self, msg: RelayMsg, call: CallContext<'_, Self>) -> Effect<Self> {
-        match msg {
-            RelayMsg::Deliver(event) => self.issue(event, call),
-            RelayMsg::Stats => call.reply(RelayReply::Stats(self.stats)),
-            RelayMsg::FakeFinished { .. } | RelayMsg::SqsFinished { .. } => {
-                call.reject(tina::CallRejectedReason::UnsupportedMessage)
+                call.defer(issued).reply(|request, outcome| {
+                    tina::ServiceMessage::Event(RelayEvent::SqsFinished { request, outcome })
+                })
             }
         }
     }
@@ -473,8 +471,8 @@ pub fn run(config: RunConfig) -> anyhow::Result<RunReport> {
         )
         .map_err(|e| anyhow::anyhow!("register fake outbound: {e:?}"))?;
 
-    let relay_addr = runtime
-        .register_with_capacity::<_, Infallible>(
+    let relay = runtime
+        .register_split_service::<Relay, RelayEvent, RelayRequest, Infallible>(
             Relay {
                 outbound: OutboundPort::Fake(outbound_addr),
                 timeout: Duration::from_millis(config.call_timeout_ms),
@@ -484,7 +482,7 @@ pub fn run(config: RunConfig) -> anyhow::Result<RunReport> {
         )
         .map_err(|e| anyhow::anyhow!("register relay: {e:?}"))?;
 
-    drive_relay(&runtime, relay_addr, config.events, config.call_timeout_ms)
+    drive_relay(&runtime, relay.requests, config.events, config.call_timeout_ms)
 }
 
 /// Run the relay against a `tina-aws-bridge` SQS worker. The caller
@@ -508,8 +506,8 @@ pub fn run_against_sqs(
         DefaultThreadedMailboxFactory,
     ));
 
-    let relay_addr = runtime
-        .register_with_capacity::<_, Infallible>(
+    let relay = runtime
+        .register_split_service::<Relay, RelayEvent, RelayRequest, Infallible>(
             Relay::new(
                 OutboundPort::Sqs(SqsOutbound {
                     address: sqs_address,
@@ -522,12 +520,12 @@ pub fn run_against_sqs(
         )
         .map_err(|e| anyhow::anyhow!("register relay: {e:?}"))?;
 
-    drive_relay(&runtime, relay_addr, events, call_timeout_ms)
+    drive_relay(&runtime, relay.requests, events, call_timeout_ms)
 }
 
 fn drive_relay(
     runtime: &Arc<ThreadedRuntime<SingleShard, DefaultThreadedMailboxFactory>>,
-    relay_addr: Address<RelayMsg, RelayReply>,
+    relay_requests: tina::ServiceRequestAddress<RelayEvent, RelayRequest, RelayReply>,
     events: usize,
     call_timeout_ms: u64,
 ) -> anyhow::Result<RunReport> {
@@ -537,9 +535,9 @@ fn drive_relay(
     let call_timeout = Duration::from_millis(call_timeout_ms);
     let mut replies = Vec::with_capacity(events);
     for n in 0..events {
-        let outcome = runtime.call_blocking(
-            relay_addr,
-            RelayMsg::Deliver(Event {
+        let outcome = runtime.call_blocking_request(
+            relay_requests,
+            RelayRequest::Deliver(Event {
                 event_id: format!("evt-{n}"),
                 body: format!("body-{n}"),
             }),
@@ -557,7 +555,7 @@ fn drive_relay(
     }
 
     let stats = match runtime
-        .call_blocking(relay_addr, RelayMsg::Stats, Duration::from_secs(1))
+        .call_blocking_request(relay_requests, RelayRequest::Stats, Duration::from_secs(1))
         .map_err(|e| anyhow::anyhow!("stats call: {e:?}"))?
     {
         CallOutcome::Replied(RelayReply::Stats(stats)) => stats,
@@ -566,10 +564,3 @@ fn drive_relay(
 
     Ok(RunReport { replies, stats })
 }
-
-// Wire `RuntimeCall<RelayMsg>` to the macro-generated isolate types.
-const _: fn() = || {
-    fn _check<T: tina::Isolate>() {}
-    _check::<Relay>();
-    let _ = std::marker::PhantomData::<RuntimeCall<RelayMsg>>;
-};

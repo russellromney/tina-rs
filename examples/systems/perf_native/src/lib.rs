@@ -1964,14 +1964,12 @@ fn start_h2_client(
         addr,
     };
     let client = runtime
-        .register_with_capacity::<Http2ClientConnection<SingleShard>, _>(
+        .register_with_capacity_and_bootstrap::<Http2ClientConnection<SingleShard>, _>(
             Http2ClientConnection::new(target, Http2ClientLimits::default()),
             CAPACITY,
+            Http2ClientMsg::Begin,
         )
-        .map_err(|e| anyhow::anyhow!("register tina http2 client: {e:?}"))?;
-    runtime
-        .try_send(client, Http2ClientMsg::Begin)
-        .map_err(|e| anyhow::anyhow!("start tina http2 client: {e:?}"))?;
+        .map_err(|e| anyhow::anyhow!("register+start tina http2 client: {e:?}"))?;
     Ok(client)
 }
 
@@ -2197,14 +2195,12 @@ fn grpc_h2c_unary_close_row() -> anyhow::Result<PerfReport> {
 fn start_grpc_client(runtime: &PerfRuntime, addr: SocketAddr) -> anyhow::Result<GrpcClient> {
     let target = GrpcTarget::h2c("localhost", addr);
     let conn = runtime
-        .register_with_capacity::<Http2ClientConnection<SingleShard>, _>(
+        .register_with_capacity_and_bootstrap::<Http2ClientConnection<SingleShard>, _>(
             target.http2_connection::<SingleShard>(),
             CAPACITY,
+            Http2ClientMsg::Begin,
         )
-        .map_err(|e| anyhow::anyhow!("register tina grpc client: {e:?}"))?;
-    runtime
-        .try_send(conn, Http2ClientMsg::Begin)
-        .map_err(|e| anyhow::anyhow!("start tina grpc client: {e:?}"))?;
+        .map_err(|e| anyhow::anyhow!("register+start tina grpc client: {e:?}"))?;
     Ok(GrpcClient::new(conn, target.limits()))
 }
 
@@ -2469,14 +2465,12 @@ fn start_grpc_pool(
     let mut clients = Vec::with_capacity(targets.len());
     for target in &targets {
         let conn = runtime
-            .register_with_capacity::<Http2ClientConnection<SingleShard>, _>(
+            .register_with_capacity_and_bootstrap::<Http2ClientConnection<SingleShard>, _>(
                 target.http2_connection::<SingleShard>(),
                 CAPACITY,
+                Http2ClientMsg::Begin,
             )
-            .map_err(|e| anyhow::anyhow!("register pooled grpc client: {e:?}"))?;
-        runtime
-            .try_send(conn, Http2ClientMsg::Begin)
-            .map_err(|e| anyhow::anyhow!("start pooled grpc client: {e:?}"))?;
+            .map_err(|e| anyhow::anyhow!("register+start pooled grpc client: {e:?}"))?;
         conns.push(conn);
         clients.push(GrpcClient::new(conn, target.limits()));
     }

@@ -3,20 +3,25 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use tina::CallRejectedReason;
 use tina::prelude::*;
 use tina_runtime::{
-    CallOutcome, DefaultThreadedMailboxFactory, ParkCallError, PendingReplies, SleepReply,
-    ThreadedRuntime, call, sleep,
+    CallOutcome, DefaultThreadedMailboxFactory, ParkError, PendingReplies,
+    request_effect_after_park, SleepReply, ThreadedRuntime, call_request, sleep,
 };
 
 use crate::{BATCH_SIZE, BATCH_TIMEOUT_MS, CALLERS, MAX_PENDING, Report};
 
 const CALL_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Caller-authority request: the only thing an outside caller can ask.
 #[derive(Debug)]
-enum BatcherMsg {
+enum BatcherRequest {
     Submit(u64),
+}
+
+/// Internal event: the batch timer's continuation.
+#[derive(Debug)]
+enum BatcherEvent {
     Tick(u64, SleepReply),
 }
 
@@ -38,16 +43,15 @@ struct Batcher {
     timer_flushes: Arc<AtomicUsize>,
 }
 
-#[tina_runtime::isolate(message = BatcherMsg, reply = BatcherReply)]
+#[tina_runtime::isolate(event = BatcherEvent, request = BatcherRequest, reply = BatcherReply)]
 impl Batcher {
-    fn handle(
+    fn handle_event(
         &mut self,
-        msg: BatcherMsg,
+        event: BatcherEvent,
         _ctx: &mut Context<'_, SingleShard, Self::Reply>,
     ) -> Effect<Self> {
-        match msg {
-            BatcherMsg::Submit(_) => noop(),
-            BatcherMsg::Tick(g, reply) => {
+        match event {
+            BatcherEvent::Tick(g, reply) => {
                 if reply.is_err() || self.pending_timer_gen != Some(g) {
                     return noop();
                 }
@@ -61,38 +65,41 @@ impl Batcher {
         }
     }
 
-    fn handle_call(&mut self, msg: BatcherMsg, call_ctx: CallContext<'_, Self>) -> Effect<Self> {
-        match msg {
-            BatcherMsg::Submit(item) => {
+    fn handle_request(
+        &mut self,
+        request: BatcherRequest,
+        call: RequestCall<'_, Self>,
+    ) -> RequestEffect<Self> {
+        match request {
+            BatcherRequest::Submit(item) => {
                 let qid = self.next_qid;
                 self.next_qid += 1;
-                match self.pending.park_call(qid, call_ctx) {
-                    Ok(_ticket) => {
+                match self.pending.park_request(qid, call) {
+                    Ok(ticket) => {
                         self.items.push(item);
                         self.qids.push(qid);
                         if self.items.len() >= BATCH_SIZE {
                             self.size_flushes.fetch_add(1, Ordering::Release);
                             self.timer_gen += 1;
                             self.pending_timer_gen = None;
-                            return self.flush();
+                            let flush_effect = self.flush();
+                            return request_effect_after_park(&ticket, flush_effect);
                         }
                         if self.pending_timer_gen.is_none() {
                             self.timer_gen += 1;
                             let g = self.timer_gen;
                             self.pending_timer_gen = Some(g);
-                            return sleep(self.interval)
-                                .then(move |reply| BatcherMsg::Tick(g, reply));
+                            let tick_effect = sleep(self.interval).then(move |reply| {
+                                tina::ServiceMessage::Event(BatcherEvent::Tick(g, reply))
+                            });
+                            return request_effect_after_park(&ticket, tick_effect);
                         }
-                        noop()
+                        request_effect_after_park(&ticket, noop())
                     }
-                    Err(ParkCallError::Full { call, .. }) => call.reply(BatcherReply::Full),
-                    Err(ParkCallError::DuplicateKey { call, .. }) => {
-                        call.reply(BatcherReply::Full)
-                    }
-                    Err(other) => panic!("park_call: {other:?}"),
+                    Err(ParkError::Full { call, .. }) => call.reply(BatcherReply::Full),
+                    Err(ParkError::DuplicateKey { call, .. }) => call.reply(BatcherReply::Full),
                 }
             }
-            BatcherMsg::Tick(_, _) => call_ctx.reject(CallRejectedReason::UnsupportedMessage),
         }
     }
 }
@@ -127,7 +134,7 @@ enum DriverMsg {
 }
 
 struct Driver {
-    batcher: Address<BatcherMsg, BatcherReply>,
+    batcher: tina::ServiceRequestAddress<BatcherEvent, BatcherRequest, BatcherReply>,
     items: Vec<u64>,
     remaining: usize,
     outcome: DriverOutcome,
@@ -149,7 +156,7 @@ impl Driver {
                     .copied()
                     .enumerate()
                     .map(|(i, item)| {
-                        call(batcher, BatcherMsg::Submit(item), CALL_TIMEOUT)
+                        call_request(batcher, BatcherRequest::Submit(item), CALL_TIMEOUT)
                             .then(move |outcome| DriverMsg::Returned(i, outcome))
                     })
                     .collect();
@@ -179,7 +186,7 @@ pub fn run() -> anyhow::Result<Report> {
     let timer_flushes = Arc::new(AtomicUsize::new(0));
 
     let batcher = runtime
-        .register_with_capacity::<_, Infallible>(
+        .register_split_service::<Batcher, BatcherEvent, BatcherRequest, Infallible>(
             Batcher {
                 pending: PendingReplies::with_capacity(MAX_PENDING),
                 interval: Duration::from_millis(BATCH_TIMEOUT_MS),
@@ -193,7 +200,8 @@ pub fn run() -> anyhow::Result<Report> {
             },
             64,
         )
-        .map_err(|e| anyhow::anyhow!("register batcher: {e:?}"))?;
+        .map_err(|e| anyhow::anyhow!("register batcher: {e:?}"))?
+        .requests;
 
     let items: Vec<u64> = (0..CALLERS as u64).map(|c| c + 1).collect();
     let driver = runtime

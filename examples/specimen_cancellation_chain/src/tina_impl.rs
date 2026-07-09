@@ -24,14 +24,18 @@ const CALL_TIMEOUT: Duration = Duration::from_secs(2);
 
 // --- Worker ---------------------------------------------------------------
 
+/// Internal event: the sleep continuation for a call in flight.
 #[derive(Debug)]
-enum WorkerMsg {
-    /// Kick off the slow work for this iteration.
-    Do,
-    /// Sleep continuation; reply to the caller now.
-    Done(SleepReply),
+enum WorkerEvent {
     /// Sleep continuation carrying a call request context.
     DoneForCall(RequestContext<WorkerReply>, SleepReply),
+}
+
+/// Caller-authority request: the only thing an outside caller can ask.
+#[derive(Debug)]
+enum WorkerRequest {
+    /// Kick off the slow work for this iteration.
+    Do,
 }
 
 /// Worker reply payload. Unit-sized — the specimen counts arrivals,
@@ -43,33 +47,28 @@ struct Worker {
     work: Duration,
 }
 
-#[tina_runtime::isolate(message = WorkerMsg, reply = WorkerReply)]
+#[tina_runtime::isolate(event = WorkerEvent, request = WorkerRequest, reply = WorkerReply)]
 impl Worker {
-    fn handle(
+    fn handle_event(
         &mut self,
-        msg: WorkerMsg,
+        event: WorkerEvent,
         _ctx: &mut Context<'_, SingleShard, Self::Reply>,
     ) -> Effect<Self> {
-        match msg {
-            WorkerMsg::Do => sleep(self.work).then(WorkerMsg::Done),
-            // Pattern-match the SleepReply alias so a cancelled
-            // sleep (runtime shutdown) becomes a reply with the
-            // same shape rather than panic.
-            WorkerMsg::Done(Ok(())) => reply(WorkerReply),
-            WorkerMsg::Done(Err(_)) => stop(),
-            WorkerMsg::DoneForCall(request, Ok(())) => tina::reply_to(request, WorkerReply),
-            WorkerMsg::DoneForCall(_, Err(_)) => stop(),
+        match event {
+            WorkerEvent::DoneForCall(request, Ok(())) => tina::reply_to(request, WorkerReply),
+            WorkerEvent::DoneForCall(_, Err(_)) => stop(),
         }
     }
 
-    fn handle_call(&mut self, msg: WorkerMsg, call: CallContext<'_, Self>) -> Effect<Self> {
-        match msg {
-            WorkerMsg::Do => call
-                .defer(sleep(self.work))
-                .reply(WorkerMsg::DoneForCall),
-            WorkerMsg::Done(_) | WorkerMsg::DoneForCall(_, _) => {
-                call.reject(tina::CallRejectedReason::UnsupportedMessage)
-            }
+    fn handle_request(
+        &mut self,
+        request: WorkerRequest,
+        call: RequestCall<'_, Self>,
+    ) -> RequestEffect<Self> {
+        match request {
+            WorkerRequest::Do => call.defer(sleep(self.work)).reply(|req, result| {
+                tina::ServiceMessage::Event(WorkerEvent::DoneForCall(req, result))
+            }),
         }
     }
 }
@@ -103,7 +102,7 @@ enum DriverMsg {
 }
 
 struct Driver {
-    workers: Vec<Address<WorkerMsg, WorkerReply>>,
+    workers: Vec<tina::ServiceRequestAddress<WorkerEvent, WorkerRequest, WorkerReply>>,
     /// Bounded named wait group: one entry per worker, keyed by worker
     /// index. `with_capacity(FANOUT)` rejects extra inserts as `Full`
     /// rather than growing — a known-size fan-out fits exactly.
@@ -125,11 +124,19 @@ impl Driver {
                 let mut effects = Vec::with_capacity(self.workers.len());
                 for (idx, worker) in self.workers.iter().enumerate() {
                     let key = idx as u32;
+                    // No `call_request_cancelable` helper exists for split-
+                    // service request addresses, so the request is wrapped
+                    // through the documented `CallAddress`/`Address` escape
+                    // hatch rather than a bespoke translator.
                     let effect = self
                         .group
                         .start_cancelable(
                             key,
-                            call_cancelable(*worker, WorkerMsg::Do, CALL_TIMEOUT),
+                            call_cancelable(
+                                worker.address().address(),
+                                tina::ServiceMessage::Request(WorkerRequest::Do),
+                                CALL_TIMEOUT,
+                            ),
                             |worker, token, outcome| DriverMsg::Returned {
                                 worker,
                                 token,
@@ -212,13 +219,14 @@ pub fn run() -> anyhow::Result<Report> {
     for _ in 0..FANOUT {
         workers.push(
             runtime
-                .register_with_capacity::<_, Infallible>(
+                .register_split_service::<Worker, WorkerEvent, WorkerRequest, Infallible>(
                     Worker {
                         work: Duration::from_millis(WORK_MS),
                     },
                     8,
                 )
-                .map_err(|e| anyhow::anyhow!("register worker: {e:?}"))?,
+                .map_err(|e| anyhow::anyhow!("register worker: {e:?}"))?
+                .requests,
         );
     }
 
@@ -264,8 +272,9 @@ pub fn run() -> anyhow::Result<Report> {
         .wait(Duration::from_secs(5))
         .map_err(|e| anyhow::anyhow!("driver did not produce a report: {e:?}"))?;
 
-    // Wait for the worker isolates to drain their late `WorkerMsg::Done`
-    // continuations and bounce them through the runtime as typed
+    // Wait for the worker isolates to drain their late
+    // `WorkerEvent::DoneForCall` sleep continuations and bounce them
+    // through the runtime as typed
     // rejection events before snapshotting the trace. Without this,
     // a thermally throttled CI runner can race: `result.wait` returns
     // when the *driver* stops, but the workers' SleepReply firings

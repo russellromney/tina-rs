@@ -14,6 +14,64 @@ valid; the long-form history lives in
 Finding numbers are stable across phases — when a finding closes it
 moves to the [Closed](#closed) section below with the same number.
 
+### 2026-07-09 Examples Canonicalization Pass
+
+Swept the example crates to the current canonical Tina shapes. Every
+touched crate still builds `--tests --offline` and its existing
+tests/goldens pass unchanged (canonicalization must not change observed
+behavior). What moved, and what was deliberately left:
+
+**Canonicalized:**
+
+- **`tina::flow!`** — `specimen_two_stage_pipeline` (closes finding 11;
+  also deleted the qid/`PendingReplies` correlation table).
+- **Split-service `#[isolate(event=.., request=.., reply=..)]`** —
+  `system_job_queue` (Worker; closes finding 25),
+  `system_metrics_shipper`, `system_webhook_relay`,
+  `system_api_gateway_limits`, `system_bounded_object_lane`,
+  `ergonomics_playground` (5 isolates), and specimens
+  `specimen_cancellation_chain`, `specimen_scatter_gather`,
+  `specimen_bounded_batcher`, `specimen_worker_pool`, and `ServiceC` in
+  `specimen_backpressure_chain`.
+- **`register_with_capacity_and_bootstrap[_on]`** — `system_job_queue`,
+  `system_session_auth` (closes finding 24), `perf_native` (3 h2 client
+  sites), `system_realtime_rooms`.
+
+**Deliberately left (reason):**
+
+- `system_soak_http_db` — `flow!` cannot type its `sleep().then()`
+  continuations (finding 29, negative result recorded there).
+- `system_scoped_request_tree` — split-service breaks its generic
+  `HttpListener<S, TreeMsg>` ingress: the `From<HttpRequest>` impl the
+  listener needs would land on the foreign `ServiceMessage<..>` alias
+  (orphan rule, E0117). Migrating re-architects the inbound path.
+- `system_tenant_rate_limiter`, `specimen_rate_limited_worker`,
+  `specimen_idempotent_retry`, `system_live_replay_bugbox` — all-request
+  or single-variant message sets; no event/request split to make, and
+  the reject arm (where present) documents a real policy invariant.
+- `ServiceB`/`ServiceA` in `specimen_backpressure_chain` — blocked by
+  finding 36 (`RequestCall` has no `now()`).
+- `QuoteGateway` race in `ergonomics_playground` — stays on `CallGroup`;
+  it needs a business-success classifier (`|q| q.available`) that
+  `CallJoinSet`/`CallSelectSet` cannot carry.
+- `specimen_sharded_fanout_read` (Bind/Start is open runtime gap,
+  finding 3), `specimen_dynamic_worker_pool` /
+  `specimen_supervised_worker` (already canonical: self-address ctor /
+  `spawn_observed`), `specimen_pool_cancel_reclaim` /
+  `specimen_cancellation_chain` pending shape (already on
+  `PendingCallSet`, finding 8), `specimen_graceful_pool_shutdown` /
+  `specimen_graceful_drain_server` / `specimen_webhook_publisher`
+  (README frames the manual shape as the lesson, or register→observe
+  ordering is load-bearing).
+
+**New rough edge:** finding 36 — `RequestCall::now()` is missing.
+
+**Not swept this pass (follow-up):** the ~30 remaining `specimen_*`
+crates and `examples/extensions/*` were triaged (no split/bootstrap
+anti-patterns found via grep) but not each individually migrated;
+`examples/extensions/tina-extension-custom-codec` has two raw
+`impl Isolate` blocks a future pass could look at.
+
 ### 2026-05-23 Status Pass
 
 The recent Wave A / post-122 / Phase 120 work closed a lot of old pain:
@@ -65,6 +123,36 @@ What is still active after reading the specimens and systems:
 Some older entries below are partly historical and say "shipped" inside the
 section. Keep their numbers stable until the next cleanup pass moves those
 paragraphs to `FINDINGS_HISTORY.md`.
+
+### 36. `RequestCall` has no `now()`, blocking split-service migration for time-reading request handlers
+
+**Surfaced by:** `specimen_backpressure_chain` (2026-07 examples
+canonicalization pass).
+
+`RequestCall<'a, I>` — the split-service (`event = .. request = ..`)
+caller-authority wrapper — exposes `reply` / `reply_and` / `reject` /
+`capture` / `try_capture` / `defer` / `defer_cancelable` /
+`into_call_context`, but no `now()` accessor. `CallContext` has `now()`.
+A request handler that must read the current time *before* handing the
+caller to `.defer(...)` — deadline math (`deadline.remaining_or_zero(now)`,
+`Deadline::from_instant(now, after)`), rate-limit window checks — has no
+sanctioned path on the split form: `into_call_context()` *consumes* the
+`RequestCall`, and the only way back to `RequestEffect` from a
+`CallContext`-produced `Effect` is the crate-private
+`RequestEffect::from_consumed_effect`.
+
+Concretely: `specimen_backpressure_chain` migrated its leaf `ServiceC`
+(no time read) to the split form, but `ServiceB` and `ServiceA` both
+compute a remaining budget from `call_ctx.now()` before deferring the
+downstream call, so both stayed on the manual `handle` / `handle_call`
+pair with a hand-written `UnsupportedMessage` reject arm. This is the
+exact boilerplate the split form removes — it just cannot be applied here.
+
+**Build (pick one):** add `RequestCall::now()` delegating to the inner
+`CallContext::now()` (smallest, matches the other borrow-only accessors),
+or make `RequestEffect::from_consumed_effect` a public sanctioned
+conversion so `into_call_context()` composes back. The first is narrower
+and keeps the "you must answer the caller" `RequestEffect` guard intact.
 
 ### Admission and rate policy ergonomics
 
@@ -359,6 +447,21 @@ that surfaced this finding — still hand-writes `PipelineMsg` by hand
 (`examples/specimen_two_stage_pipeline/src/tina_impl.rs`). Not closing
 until that specimen (or an equivalent) is migrated and proves the fit.
 
+**Closed (2026-07 examples canonicalization pass):**
+`specimen_two_stage_pipeline` now declares `PipelineFlow` with
+`tina::flow!` for its `Parsed` / `Validated` / `Executed` steps. The
+migration proves more than the boilerplate deletion this finding asked
+for: threading `req: RequestContext<PipelineReply>` directly through each
+step also removed the `qid`-keyed `PendingReplies<u64, PipelineReply>`
+table the hand-written version needed purely to correlate a continuation
+back to its caller — `flow!`'s req-threading makes that correlation table
+unnecessary, not just its dispatch boilerplate. Both existing smoke tests
+(`tina_smoke`, `tokio_smoke`) pass unchanged, including the exact
+completed/parse-failed/validate-failed counts `assert_report_invariants`
+checks. `flow!` is still linear-only by design (see finding 29's negative
+result below for the sleep-driven shape it does not cover); an N-stage
+fan-out pipeline remains hand-written by design.
+
 ### 12. Rust footgun replication: shared receiver in worker pool
 
 **Surfaced by:** `specimen_graceful_pool_shutdown` (Tokio side).
@@ -554,6 +657,28 @@ surfaced this pain — still hand-rolls `HttpReleased` / `DbReleased`
 (`examples/systems/system_soak_http_db/src/lib.rs`). Not closing until a
 migrated `system_soak_http_db` (or an equivalent multi-hop-with-timers
 case) proves `flow!` covers this exact shape.
+
+**Checked (2026-07 examples canonicalization pass): `flow!` does not cover
+this shape, and forcing it would be dishonest.** Every `flow!` step is
+generated as `(RequestContext<Reply>, ..captures.., CallOutcome<T>)` —
+the outcome slot is hard-coded to `tina_runtime::CallOutcome<T>`, the type
+an isolate-to-isolate `call(...)` returns. `system_soak_http_db`'s
+`HttpReleased` / `DbReleased` continuations are not isolate calls; they are
+runtime-owned `sleep(d).then_with_request(req, ...)` wake-ups, which yield
+`Result<(), CallError>` — a different, narrower outcome type with no `Full`
+/ `Closed`/`Rejected` variants a real dependency call would have. The two
+shapes are not interchangeable: writing a `flow!` step for a sleep wake-up
+would need a hand-written `Result<(), CallError> -> CallOutcome<()>` shim at
+every step, which reintroduces the exact boilerplate `flow!` exists to
+remove. Replacing the sleeps with fake isolate calls to make the macro fit
+was considered and rejected — it would invent architecture (two dummy
+worker isolates) that does not exist in the real "admit, wait, release"
+shape this specimen demonstrates, just to satisfy a macro's type signature.
+`system_soak_http_db` is left on its hand-rolled `SoakMsg::{HttpReleased,
+DbReleased}` form. **Revised build:** `flow!` (or a sibling macro) would
+need a second outcome shape — a timer-wake step whose outcome slot is
+`Result<(), CallError>` instead of `CallOutcome<T>` — before this finding
+can close through the macro path. No such macro exists today.
 
 ### 30. DST adapter for `SharedCapacityScope` / `BoundedEventSink`
 
@@ -914,7 +1039,7 @@ from shard A into target shard B" and has a remote-path proof.
 by `addr.shard()`; no `call_blocking_on` exists anywhere in
 `tina-runtime/src`, matching the "no host-to-shard variant" claim.
 
-### 24. Register-and-bootstrap helper for start-up effects — closed (library); examples not yet migrated
+### 24. Register-and-bootstrap helper for start-up effects — closed
 
 **Surfaced by:** `system_job_queue`, `system_session_auth`.
 
@@ -933,13 +1058,19 @@ ship in `tina-runtime/src/registration.rs`,
 the bootstrap message before the address is returned, with a typed
 `RegisterBootstrapError` on prefill refusal (`tina-runtime/src/errors.rs`).
 
-**Not yet closed at the example level:** neither surfacing specimen has
-adopted it. `system_job_queue` and `system_session_auth`
-(`examples/systems/{system_job_queue,system_session_auth}/src/lib.rs`)
-still call `register_with_capacity_using` followed by a separate
-`.try_send(address, ...Bootstrap)` — the exact two-step pattern this
-finding asked to remove. This is an examples-freshness gap, not a
-runtime gap; recorded here rather than as a separate finding.
+**Closed at the example level (2026-07 examples canonicalization pass):**
+both surfacing specimens now use the bootstrap-prefill form.
+`system_job_queue` registers its `Queue` isolate with
+`register_with_capacity_and_bootstrap::<Queue, WorkerMsg>(Queue::new(...),
+mailbox, QueueMsg::Bootstrap)` — this also let the `Queue::self_addr` field
+(dead code; it fed the old `register_with_capacity_using` closure and was
+never read) drop out entirely. `system_session_auth` registers each
+per-shard `SessionBucket` with
+`register_with_capacity_and_bootstrap_on::<SessionBucket,
+Infallible>(shard_id, ..., SessionAuthMsg::Bootstrap)`. Both crates'
+existing smoke tests pass unchanged (`system_job_queue`: 4/4;
+`system_session_auth`: 1/1), proving the prefill-then-register ordering
+does not change observable behavior.
 
 ### 25. Request/reply variants in `handle` compile but reject at runtime — closed
 
@@ -967,11 +1098,20 @@ runtime rejection. Live coverage: `cargo test -p tina-runtime --test
 safety_rails` passes 10/10, including
 `split_service_routes_events_and_requests_on_separate_capabilities`.
 `system_cache_with_fill` and `system_lock_manager` both use the split
-form today. **Not yet migrated:** `system_job_queue`'s `Worker`
-isolate (`examples/systems/system_job_queue/src/lib.rs`) still uses
-`message = WorkerMsg` with a hand-written `call.reject(UnsupportedMessage)`
-arm — one of the two specimens this finding named has not adopted the
-fix. Examples-freshness gap, not a runtime gap.
+form today. **Migrated (2026-07 examples canonicalization pass):**
+`system_job_queue`'s `Worker` isolate
+(`examples/systems/system_job_queue/src/lib.rs`) now uses `event =
+WorkerEvent, request = WorkerRequest, reply = WorkerReply` — `WorkerEvent`
+carries `Cancel`/`Wake` (fire-and-forget), `WorkerRequest` carries the one
+caller-authority `Process` message — with no hand-written rejection arm on
+either side. The queue-side call sites wrap messages explicitly
+(`tina::ServiceMessage::Request(WorkerRequest::Process { .. })` for
+`call_cancelable`, `tina::ServiceMessage::Event(WorkerEvent::Cancel(id))`
+for the opportunistic wake send), since `send`/`call_cancelable` take a
+plain `Address<M, R>` and the split form's `M` is
+`ServiceMessage<Event, Request>` — there is no split-service-typed
+`call_cancelable` helper today, only `send_event` for the send side. All
+4 existing smoke tests still pass unchanged.
 
 ### 27. Lease handoff into a `PendingReplies` slot — Phase 110 shipped — closed
 

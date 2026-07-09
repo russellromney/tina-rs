@@ -14,11 +14,11 @@ use std::sync::{Arc, Barrier, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use tina::{CallContext, prelude::*};
+use tina::prelude::*;
 use tina_runtime::{
     CallOutcome, CapacitySummary, DefaultThreadedMailboxFactory, GuardedPendingReplies,
-    ServiceHandle, SharedCapacityReservation, SharedCapacityScope, SleepReply, ThreadedRuntime,
-    format_assertion_failure, format_discovery_line, sleep,
+    SharedCapacityReservation, SharedCapacityScope, SleepReply, SplitServiceHandle,
+    ThreadedRuntime, format_assertion_failure, format_discovery_line, sleep,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -104,16 +104,17 @@ impl Route {
 }
 
 #[derive(Debug)]
-pub enum GatewayMsg {
-    Request {
-        route: Route,
-        hold: Duration,
-    },
+pub enum GatewayEvent {
     HoldDone {
         qid: u64,
         route: Route,
         result: SleepReply,
     },
+}
+
+#[derive(Debug)]
+pub enum GatewayRequest {
+    Request { route: Route, hold: Duration },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -140,25 +141,25 @@ struct Gateway {
     next_qid: u64,
 }
 
-#[tina_runtime::isolate(message = GatewayMsg, reply = GatewayReply)]
+#[tina_runtime::isolate(event = GatewayEvent, request = GatewayRequest, reply = GatewayReply)]
 impl Gateway {
-    fn handle(
+    fn handle_event(
         &mut self,
-        msg: GatewayMsg,
+        event: GatewayEvent,
         _ctx: &mut Context<'_, SingleShard, Self::Reply>,
     ) -> Effect<Self> {
-        match msg {
-            GatewayMsg::Request { .. } => noop(),
-            GatewayMsg::HoldDone { qid, route, result } => self.hold_done(qid, route, result),
+        match event {
+            GatewayEvent::HoldDone { qid, route, result } => self.hold_done(qid, route, result),
         }
     }
 
-    fn handle_call(&mut self, msg: GatewayMsg, call: CallContext<'_, Self>) -> Effect<Self> {
-        match msg {
-            GatewayMsg::Request { route, hold } => self.dispatch(route, hold, call),
-            GatewayMsg::HoldDone { .. } => {
-                call.reject(tina::CallRejectedReason::UnsupportedMessage)
-            }
+    fn handle_request(
+        &mut self,
+        request: GatewayRequest,
+        call: RequestCall<'_, Self>,
+    ) -> RequestEffect<Self> {
+        match request {
+            GatewayRequest::Request { route, hold } => self.dispatch(route, hold, call),
         }
     }
 }
@@ -205,8 +206,8 @@ impl Gateway {
         &mut self,
         route: Route,
         hold: Duration,
-        call: CallContext<'_, Self>,
-    ) -> Effect<Self> {
+        call: RequestCall<'_, Self>,
+    ) -> RequestEffect<Self> {
         let weight = self.weight_for(route);
         let body_bytes = self.body_for(route);
         let charge = match SharedCapacityReservation::try_reserve([
@@ -225,32 +226,43 @@ impl Gateway {
         };
 
         let qid = self.next_qid;
-        let next_qid = qid + 1;
-        match self.pending.park_call_guarded(qid, call, charge) {
-            Ok(_ticket) => {
-                self.next_qid = next_qid;
-                sleep(hold).then(move |result| GatewayMsg::HoldDone { qid, route, result })
+        call.capture(|request| {
+            match self
+                .pending
+                .insert_deferred_guarded(qid, request.into_deferred(), charge)
+            {
+                Ok(_ticket) => {
+                    self.next_qid = qid + 1;
+                    sleep(hold).then(move |result| {
+                        tina::ServiceMessage::Event(GatewayEvent::HoldDone { qid, route, result })
+                    })
+                }
+                Err(tina_runtime::GuardedInsertError::Full { reply, .. }) => {
+                    // Lease drops automatically when the error is consumed.
+                    let cap = self.pending.capacity();
+                    reply_to::<Self>(
+                        reply,
+                        GatewayReply::Full {
+                            filled: "gateway.pending".into(),
+                            requested: 1,
+                            current: cap,
+                            max: cap,
+                        },
+                    )
+                }
+                Err(tina_runtime::GuardedInsertError::DuplicateKey { reply, .. }) => {
+                    reply_to::<Self>(
+                        reply,
+                        GatewayReply::Full {
+                            filled: "gateway.duplicate".into(),
+                            requested: 1,
+                            current: 0,
+                            max: 0,
+                        },
+                    )
+                }
             }
-            Err(tina_runtime::GuardedParkCallError::Full { call, .. }) => {
-                // Lease drops automatically when the error is consumed.
-                let cap = self.pending.capacity();
-                call.reply(GatewayReply::Full {
-                    filled: "gateway.pending".into(),
-                    requested: 1,
-                    current: cap,
-                    max: cap,
-                })
-            }
-            Err(tina_runtime::GuardedParkCallError::DuplicateKey { call, .. })
-            | Err(tina_runtime::GuardedParkCallError::NoCaller { call, .. })
-            | Err(tina_runtime::GuardedParkCallError::CrossShardUnsupported { call, .. }) => call
-                .reply(GatewayReply::Full {
-                    filled: "gateway.duplicate".into(),
-                    requested: 1,
-                    current: 0,
-                    max: 0,
-                }),
-        }
+        })
     }
 
     fn hold_done(&mut self, qid: u64, route: Route, _result: SleepReply) -> Effect<Self> {
@@ -275,8 +287,8 @@ pub fn run(config: RunConfig) -> anyhow::Result<RunReport> {
     ));
     let scope = SharedCapacityScope::new("gateway.in_flight", "weight", config.shared_cap);
     let body_scope = SharedCapacityScope::new("gateway.body_bytes", "bytes", config.body_cap);
-    let gateway: ServiceHandle<GatewayMsg, GatewayReply> = runtime
-        .register_service::<_, Infallible>(
+    let gateway: SplitServiceHandle<GatewayEvent, GatewayRequest, GatewayReply> = runtime
+        .register_split_service::<Gateway, GatewayEvent, GatewayRequest, Infallible>(
             Gateway::new(
                 scope.clone(),
                 body_scope.clone(),
@@ -304,12 +316,12 @@ pub fn run(config: RunConfig) -> anyhow::Result<RunReport> {
         let gate = Arc::clone(&barrier);
         let out = Arc::clone(&outcomes);
         let hold = Duration::from_millis(config.upload_hold_ms);
-        let addr = gateway.call;
+        let addr = gateway.requests;
         threads.push(thread::spawn(move || {
             gate.wait();
-            let r = rt.call_blocking_typed(
+            let r = rt.call_blocking_request(
                 addr,
-                GatewayMsg::Request {
+                GatewayRequest::Request {
                     route: Route::Upload,
                     hold,
                 },
@@ -323,12 +335,12 @@ pub fn run(config: RunConfig) -> anyhow::Result<RunReport> {
         let gate = Arc::clone(&barrier);
         let out = Arc::clone(&outcomes);
         let hold = Duration::from_millis(config.list_hold_ms);
-        let addr = gateway.call;
+        let addr = gateway.requests;
         threads.push(thread::spawn(move || {
             gate.wait();
-            let r = rt.call_blocking_typed(
+            let r = rt.call_blocking_request(
                 addr,
-                GatewayMsg::Request {
+                GatewayRequest::Request {
                     route: Route::List,
                     hold,
                 },

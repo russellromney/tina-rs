@@ -3,8 +3,8 @@ use std::time::Duration;
 
 use tina::prelude::*;
 use tina_runtime::{
-    CallOutcome, DefaultThreadedMailboxFactory, ParkCallError, PendingReplies, SleepReply,
-    ThreadedRuntime, call, sleep,
+    CallOutcome, DefaultThreadedMailboxFactory, ParkError, PendingReplies,
+    request_effect_after_park, SleepReply, ThreadedRuntime, call_request, sleep,
 };
 
 use crate::{CLIENTS, MAX_PENDING, Report, WORKERS, expected_for};
@@ -13,9 +13,15 @@ const CALL_TIMEOUT: Duration = Duration::from_secs(5);
 
 // --- Worker -------------------------------------------------------------
 
+/// Caller-authority request: the only thing an outside caller can ask.
 #[derive(Debug)]
-enum WorkerMsg {
+enum WorkerRequest {
     Do(u64),
+}
+
+/// Internal event: the work-timer continuation.
+#[derive(Debug)]
+enum WorkerEvent {
     Done(RequestContext<WorkerReply>, SleepReply, u64),
 }
 
@@ -30,33 +36,31 @@ struct Worker {
     work: Duration,
 }
 
-#[tina_runtime::isolate(message = WorkerMsg, reply = WorkerReply)]
+#[tina_runtime::isolate(event = WorkerEvent, request = WorkerRequest, reply = WorkerReply)]
 impl Worker {
-    fn handle(
+    fn handle_event(
         &mut self,
-        msg: WorkerMsg,
+        event: WorkerEvent,
         _ctx: &mut Context<'_, SingleShard, Self::Reply>,
     ) -> Effect<Self> {
-        match msg {
-            WorkerMsg::Do(_) => noop(),
-            WorkerMsg::Done(req, Ok(()), result) => {
-                reply_to(req, WorkerReply::Result(result))
-            }
-            WorkerMsg::Done(req, Err(_), _) => reply_to(req, WorkerReply::TimerFailed),
+        match event {
+            WorkerEvent::Done(req, Ok(()), result) => reply_to(req, WorkerReply::Result(result)),
+            WorkerEvent::Done(req, Err(_), _) => reply_to(req, WorkerReply::TimerFailed),
         }
     }
 
-    fn handle_call(&mut self, msg: WorkerMsg, call_ctx: CallContext<'_, Self>) -> Effect<Self> {
-        match msg {
+    fn handle_request(
+        &mut self,
+        request: WorkerRequest,
+        call: RequestCall<'_, Self>,
+    ) -> RequestEffect<Self> {
+        match request {
             // Vary the wait by id so replies arrive out of dispatch order.
-            WorkerMsg::Do(payload) => {
+            WorkerRequest::Do(payload) => {
                 let id = self.id;
-                call_ctx
-                    .defer(sleep(self.work))
-                    .reply(move |req, reply| WorkerMsg::Done(req, reply, payload + id))
-            }
-            WorkerMsg::Done(_, _, _) => {
-                call_ctx.reject(tina::CallRejectedReason::UnsupportedMessage)
+                call.defer(sleep(self.work)).reply(move |req, reply| {
+                    tina::ServiceMessage::Event(WorkerEvent::Done(req, reply, payload + id))
+                })
             }
         }
     }
@@ -64,9 +68,15 @@ impl Worker {
 
 // --- Frontend -----------------------------------------------------------
 
+/// Caller-authority request: the only thing an outside caller can ask.
 #[derive(Debug)]
-enum FrontendMsg {
+enum FrontendRequest {
     Submit(u64),
+}
+
+/// Internal event: one worker's call outcome landing back at the frontend.
+#[derive(Debug)]
+enum FrontendEvent {
     WorkerDone(u64, CallOutcome<WorkerReply>),
 }
 
@@ -78,44 +88,46 @@ pub enum FrontendReply {
 }
 
 struct Frontend {
-    workers: Vec<Address<WorkerMsg, WorkerReply>>,
+    workers: Vec<tina::ServiceRequestAddress<WorkerEvent, WorkerRequest, WorkerReply>>,
     pending: PendingReplies<u64, FrontendReply>,
     next_qid: u64,
     next_worker: usize,
 }
 
-#[tina_runtime::isolate(message = FrontendMsg, reply = FrontendReply)]
+#[tina_runtime::isolate(event = FrontendEvent, request = FrontendRequest, reply = FrontendReply)]
 impl Frontend {
-    fn handle(
+    fn handle_event(
         &mut self,
-        msg: FrontendMsg,
+        event: FrontendEvent,
         _ctx: &mut Context<'_, SingleShard, Self::Reply>,
     ) -> Effect<Self> {
-        match msg {
-            FrontendMsg::Submit(_) => noop(),
-            FrontendMsg::WorkerDone(qid, outcome) => self.on_worker_done(qid, outcome),
+        match event {
+            FrontendEvent::WorkerDone(qid, outcome) => self.on_worker_done(qid, outcome),
         }
     }
 
-    fn handle_call(&mut self, msg: FrontendMsg, call_ctx: CallContext<'_, Self>) -> Effect<Self> {
-        match msg {
-            FrontendMsg::Submit(payload) => {
+    fn handle_request(
+        &mut self,
+        request: FrontendRequest,
+        call: RequestCall<'_, Self>,
+    ) -> RequestEffect<Self> {
+        match request {
+            FrontendRequest::Submit(payload) => {
                 let qid = self.next_qid;
                 self.next_qid += 1;
-                match self.pending.park_call(qid, call_ctx) {
-                    Ok(_ticket) => {
+                match self.pending.park_request(qid, call) {
+                    Ok(ticket) => {
                         let worker = self.workers[self.next_worker];
                         self.next_worker = (self.next_worker + 1) % self.workers.len();
-                        call(worker, WorkerMsg::Do(payload), CALL_TIMEOUT)
-                            .then(move |outcome| FrontendMsg::WorkerDone(qid, outcome))
+                        let dispatch_effect = call_request(worker, WorkerRequest::Do(payload), CALL_TIMEOUT)
+                            .then(move |outcome| {
+                                tina::ServiceMessage::Event(FrontendEvent::WorkerDone(qid, outcome))
+                            });
+                        request_effect_after_park(&ticket, dispatch_effect)
                     }
-                    Err(ParkCallError::Full { call, .. }) => call.reply(FrontendReply::Full),
-                    Err(ParkCallError::DuplicateKey { call, .. }) => call.reply(FrontendReply::Full),
-                    Err(other) => panic!("try_capture: {other:?}"),
+                    Err(ParkError::Full { call, .. }) => call.reply(FrontendReply::Full),
+                    Err(ParkError::DuplicateKey { call, .. }) => call.reply(FrontendReply::Full),
                 }
-            }
-            FrontendMsg::WorkerDone(_, _) => {
-                call_ctx.reject(tina::CallRejectedReason::UnsupportedMessage)
             }
         }
     }
@@ -152,7 +164,7 @@ enum DriverMsg {
 }
 
 struct Driver {
-    frontend: Address<FrontendMsg, FrontendReply>,
+    frontend: tina::ServiceRequestAddress<FrontendEvent, FrontendRequest, FrontendReply>,
     payloads: Vec<u64>,
     remaining: usize,
     outcome: DriverOutcome,
@@ -174,7 +186,7 @@ impl Driver {
                     .copied()
                     .enumerate()
                     .map(|(i, payload)| {
-                        call(frontend, FrontendMsg::Submit(payload), CALL_TIMEOUT)
+                        call_request(frontend, FrontendRequest::Submit(payload), CALL_TIMEOUT)
                             .then(move |outcome| DriverMsg::Returned(i, outcome))
                     })
                     .collect();
@@ -212,13 +224,17 @@ pub fn run() -> anyhow::Result<Report> {
         let work = Duration::from_millis(5 + (w * 7) % 20);
         workers.push(
             runtime
-                .register_with_capacity::<_, Infallible>(Worker { id: w, work }, 16)
-                .map_err(|e| anyhow::anyhow!("register worker: {e:?}"))?,
+                .register_split_service::<Worker, WorkerEvent, WorkerRequest, Infallible>(
+                    Worker { id: w, work },
+                    16,
+                )
+                .map_err(|e| anyhow::anyhow!("register worker: {e:?}"))?
+                .requests,
         );
     }
 
     let frontend = runtime
-        .register_with_capacity::<_, Infallible>(
+        .register_split_service::<Frontend, FrontendEvent, FrontendRequest, Infallible>(
             Frontend {
                 workers,
                 pending: PendingReplies::with_capacity(MAX_PENDING),
@@ -227,7 +243,8 @@ pub fn run() -> anyhow::Result<Report> {
             },
             32,
         )
-        .map_err(|e| anyhow::anyhow!("register frontend: {e:?}"))?;
+        .map_err(|e| anyhow::anyhow!("register frontend: {e:?}"))?
+        .requests;
 
     let payloads: Vec<u64> = (0..CLIENTS as u64)
         .map(|c| c.wrapping_mul(11) + 1)

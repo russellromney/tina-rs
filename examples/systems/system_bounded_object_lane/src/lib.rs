@@ -68,16 +68,18 @@ pub enum LaneReply {
 }
 
 #[derive(Debug)]
-enum LaneMsg {
-    Put {
-        key: String,
-    },
+enum LaneEvent {
     PutFinished {
         request: RequestContext<LaneReply>,
         key: String,
         permit: Permit,
         result: WorkResult,
     },
+}
+
+#[derive(Debug)]
+enum LaneRequest {
+    Put { key: String },
     Stats,
 }
 
@@ -112,16 +114,15 @@ struct ObjectLane {
     completed: usize,
 }
 
-#[tina_runtime::isolate(message = LaneMsg, reply = LaneReply)]
+#[tina_runtime::isolate(event = LaneEvent, request = LaneRequest, reply = LaneReply)]
 impl ObjectLane {
-    fn handle(
+    fn handle_event(
         &mut self,
-        msg: LaneMsg,
+        event: LaneEvent,
         _ctx: &mut Context<'_, SingleShard, Self::Reply>,
     ) -> Effect<Self> {
-        match msg {
-            LaneMsg::Put { .. } | LaneMsg::Stats => noop(),
-            LaneMsg::PutFinished {
+        match event {
+            LaneEvent::PutFinished {
                 request,
                 key,
                 permit,
@@ -144,9 +145,13 @@ impl ObjectLane {
         }
     }
 
-    fn handle_call(&mut self, msg: LaneMsg, call: CallContext<'_, Self>) -> Effect<Self> {
-        match msg {
-            LaneMsg::Put { key } => match self.gate.try_admit() {
+    fn handle_request(
+        &mut self,
+        request: LaneRequest,
+        call: RequestCall<'_, Self>,
+    ) -> RequestEffect<Self> {
+        match request {
+            LaneRequest::Put { key } => match self.gate.try_admit() {
                 Err(full) => {
                     self.busy += 1;
                     let report = full.report();
@@ -160,12 +165,12 @@ impl ObjectLane {
                     match &self.backend {
                         WorkBackend::FakeSleep { work } => {
                             call.defer(sleep(*work)).reply(move |request, result| {
-                                LaneMsg::PutFinished {
+                                tina::ServiceMessage::Event(LaneEvent::PutFinished {
                                     request,
                                     key,
                                     permit,
                                     result: sleep_to_work_result(result),
-                                }
+                                })
                             })
                         }
                         WorkBackend::AwsS3 {
@@ -187,18 +192,19 @@ impl ObjectLane {
                                 ),
                                 *timeout,
                             );
-                            call.defer(issued)
-                                .reply(move |request, outcome| LaneMsg::PutFinished {
+                            call.defer(issued).reply(move |request, outcome| {
+                                tina::ServiceMessage::Event(LaneEvent::PutFinished {
                                     request,
                                     key,
                                     permit,
                                     result: s3_outcome_to_work_result(outcome),
                                 })
+                            })
                         }
                     }
                 }
             },
-            LaneMsg::Stats => {
+            LaneRequest::Stats => {
                 let report = self.gate.report();
                 call.reply(LaneReply::Stats(LaneStats {
                     accepted: self.accepted,
@@ -206,9 +212,6 @@ impl ObjectLane {
                     completed: self.completed,
                     in_flight: report.current,
                 }))
-            }
-            LaneMsg::PutFinished { .. } => {
-                call.reject(tina::CallRejectedReason::UnsupportedMessage)
             }
         }
     }
@@ -238,7 +241,7 @@ pub fn run_against_s3(
         DefaultThreadedMailboxFactory,
     ));
     let lane = runtime
-        .register_with_capacity::<_, std::convert::Infallible>(
+        .register_split_service::<ObjectLane, LaneEvent, LaneRequest, std::convert::Infallible>(
             ObjectLane {
                 gate: LocalPermitGate::with_capacity(config.lane_in_flight)
                     .named(LocalPermitName("object_lane")),
@@ -256,7 +259,7 @@ pub fn run_against_s3(
         )
         .map_err(|e| anyhow::anyhow!("register lane: {e:?}"))?;
 
-    let report = drive_callers(&runtime, lane, config)?;
+    let report = drive_callers(&runtime, lane.requests, config)?;
 
     if let Ok(rt) = Arc::try_unwrap(runtime) {
         let _ = rt.shutdown();
@@ -271,7 +274,7 @@ pub fn run(config: RunConfig) -> anyhow::Result<RunReport> {
         DefaultThreadedMailboxFactory,
     ));
     let lane = runtime
-        .register_with_capacity::<_, std::convert::Infallible>(
+        .register_split_service::<ObjectLane, LaneEvent, LaneRequest, std::convert::Infallible>(
             ObjectLane {
                 gate: LocalPermitGate::with_capacity(config.lane_in_flight)
                     .named(LocalPermitName("object_lane")),
@@ -286,7 +289,7 @@ pub fn run(config: RunConfig) -> anyhow::Result<RunReport> {
         )
         .map_err(|e| anyhow::anyhow!("register lane: {e:?}"))?;
 
-    let report = drive_callers(&runtime, lane, config)?;
+    let report = drive_callers(&runtime, lane.requests, config)?;
 
     if let Ok(rt) = Arc::try_unwrap(runtime) {
         let _ = rt.shutdown();
@@ -297,7 +300,7 @@ pub fn run(config: RunConfig) -> anyhow::Result<RunReport> {
 
 fn drive_callers(
     runtime: &Arc<ThreadedRuntime<SingleShard, DefaultThreadedMailboxFactory>>,
-    lane: Address<LaneMsg, LaneReply>,
+    lane: tina::ServiceRequestAddress<LaneEvent, LaneRequest, LaneReply>,
     config: RunConfig,
 ) -> anyhow::Result<RunReport> {
     let barrier = Arc::new(Barrier::new(config.callers + 1));
@@ -311,9 +314,9 @@ fn drive_callers(
         let out = Arc::clone(&outcomes);
         threads.push(thread::spawn(move || {
             gate.wait();
-            let outcome = rt.call_blocking(
+            let outcome = rt.call_blocking_request(
                 lane,
-                LaneMsg::Put {
+                LaneRequest::Put {
                     key: format!("object-{n}"),
                 },
                 call_timeout,
@@ -338,7 +341,7 @@ fn drive_callers(
         }
     }
 
-    let stats = match runtime.call_blocking(lane, LaneMsg::Stats, Duration::from_secs(1))? {
+    let stats = match runtime.call_blocking_request(lane, LaneRequest::Stats, Duration::from_secs(1))? {
         CallOutcome::Replied(LaneReply::Stats(stats)) => stats,
         other => anyhow::bail!("stats call failed: {other:?}"),
     };
