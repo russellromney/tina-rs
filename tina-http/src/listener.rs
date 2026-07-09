@@ -18,7 +18,7 @@ use tina_runtime::{
 use crate::body_metrics::BodyMetrics;
 use crate::connection::{HttpConnection, HttpConnectionMsg};
 use crate::transport::HttpTransport;
-use crate::types::{HttpLimits, HttpRequest, HttpResponse, HttpServerConfig};
+use crate::types::{FromHttpRequest, HttpLimits, HttpRequest, HttpResponse, HttpServerConfig};
 
 /// Inbound message variants for [`HttpListener`].
 #[derive(Debug, Clone)]
@@ -66,11 +66,25 @@ pub enum HttpStartupError {
 
 /// Listener isolate.
 ///
-/// Generic over the user's `Shard` and the service's message type
-/// `M`. `M` defaults to `HttpRequest` for sync-reply services;
-/// multi-turn services declare an enum that wraps `HttpRequest` and
-/// supply `From<HttpRequest>`.
-pub struct HttpListener<S: Shard + 'static, M: From<HttpRequest> + Send + 'static = HttpRequest> {
+/// Generic over the user's `Shard` and the service's message type `M`,
+/// which must implement [`FromHttpRequest`]. `M` defaults to `HttpRequest`
+/// for sync-reply services (covered via `HttpRequest: From<HttpRequest>`,
+/// the standard reflexive impl). Multi-turn services declare their own
+/// enum and implement `From<HttpRequest>` on it; a blanket impl in this
+/// crate lifts that into `FromHttpRequest` automatically.
+///
+/// Split-service isolates (`#[isolate(event = .., request = ..)]`) use
+/// `M = tina::ServiceMessage<Event, Request>`. Implement plain
+/// `From<HttpRequest>` on your own `Request` type; this crate provides
+/// `ServiceMessage<Event, Request>: FromHttpRequest` whenever `Request:
+/// From<HttpRequest>` holds. Callers cannot write that impl themselves —
+/// `impl From<HttpRequest> for ServiceMessage<Event, Request>` is
+/// orphan-illegal in any downstream crate, since neither `HttpRequest` nor
+/// `ServiceMessage` is local to it. `FromHttpRequest` exists (instead of
+/// requiring plain `From<HttpRequest>` on `M` directly) so this crate,
+/// which is the one place that can name both types, can supply that
+/// blanket without colliding with `core`'s reflexive `From<T> for T`.
+pub struct HttpListener<S: Shard + 'static, M: FromHttpRequest + Send + 'static = HttpRequest> {
     bind_addr: SocketAddr,
     service: Address<M, HttpResponse>,
     limits: HttpLimits,
@@ -88,7 +102,7 @@ pub struct HttpListener<S: Shard + 'static, M: From<HttpRequest> + Send + 'stati
     _shard: PhantomData<S>,
 }
 
-impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpListener<S, M> {
+impl<S: Shard + 'static, M: FromHttpRequest + Send + 'static> HttpListener<S, M> {
     /// Builds a listener that will bind to `bind_addr`, dispatch every
     /// parsed request to `service`, and spawn one connection isolate
     /// per accept.
@@ -151,7 +165,7 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpListener<S, 
 
 // Hand-rolled `Isolate` impl: the macro requires a concrete shard type;
 // we want this generic so callers can pick their own shard.
-impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Isolate for HttpListener<S, M> {
+impl<S: Shard + 'static, M: FromHttpRequest + Send + 'static> Isolate for HttpListener<S, M> {
     tina::isolate_types! {
         message: HttpListenerMsg,
         reply: Result<HttpReady, HttpStartupError>,
@@ -302,7 +316,7 @@ impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> Isolate for Http
     }
 }
 
-impl<S: Shard + 'static, M: From<HttpRequest> + Send + 'static> HttpListener<S, M> {
+impl<S: Shard + 'static, M: FromHttpRequest + Send + 'static> HttpListener<S, M> {
     fn build_connection_child(&self, stream: StreamId) -> ChildDefinition<HttpConnection<S, M>> {
         ChildDefinition::new(
             HttpConnection::<S, M>::with_transport_and_metrics(

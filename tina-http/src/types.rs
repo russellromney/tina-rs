@@ -440,6 +440,57 @@ impl HttpRequest {
     }
 }
 
+/// Builds a listener/connection ingress message from a parsed
+/// [`HttpRequest`].
+///
+/// [`crate::HttpListener`] and [`crate::HttpConnection`] are generic over
+/// the service's message type `M` and require `M: FromHttpRequest` to turn
+/// each parsed request into that message. This trait exists (instead of
+/// requiring plain `std::convert::From<HttpRequest>` on `M` directly) so
+/// this crate can supply the [`tina::ServiceMessage`] blanket impl below in
+/// addition to the general `From<HttpRequest>` blanket: `ServiceMessage<
+/// Event, Request>` is defined in the `tina` crate and `HttpRequest` is
+/// defined here, so `impl From<HttpRequest> for ServiceMessage<Event,
+/// Request>` is orphan-illegal everywhere (neither crate owns both halves
+/// plus `From`, and `tina` cannot name `HttpRequest` without an illegal
+/// dependency cycle back onto this crate). A local trait sidesteps that:
+/// the two impls below live in the one crate that can name both types, and
+/// a split-service author never writes either — they implement plain
+/// `From<HttpRequest>` on their own `Request` type, which is always legal
+/// because that type is local to them.
+pub trait FromHttpRequest: Sized {
+    /// Converts one parsed request into `Self`.
+    fn from_http_request(request: HttpRequest) -> Self;
+}
+
+/// Ordinary services (including the `HttpRequest` identity default):
+/// `From<HttpRequest>` is already the doc'd extension point, so this
+/// blanket lifts it into `FromHttpRequest` for free.
+impl<M: From<HttpRequest>> FromHttpRequest for M {
+    fn from_http_request(request: HttpRequest) -> Self {
+        M::from(request)
+    }
+}
+
+/// Split-service messages: `ServiceMessage<Event, Request>` never
+/// implements `From<HttpRequest>` itself (see above), so it needs its own
+/// impl here rather than riding the blanket. Split-service listeners never
+/// see raw events from the wire, so wrapping as `Request` is the only
+/// sound choice.
+///
+/// This does not overlap with the blanket above: nothing in this crate (or
+/// any crate, per the orphan rule) implements `From<HttpRequest> for
+/// ServiceMessage<Event, Request>`, so the compiler can prove the two
+/// impls never apply to the same concrete type.
+impl<Event, Request> FromHttpRequest for tina::ServiceMessage<Event, Request>
+where
+    Request: From<HttpRequest>,
+{
+    fn from_http_request(request: HttpRequest) -> Self {
+        tina::ServiceMessage::Request(Request::from(request))
+    }
+}
+
 /// Reasons response parsing rejected an inbound response.
 ///
 /// Mirror of the request-side errors. Each maps to an
