@@ -75,6 +75,14 @@ jobs:
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y zsh
 
+      - name: Set up mold linker (Linux)
+        # `.cargo/config.toml` points rustc at mold for the Linux target to cut
+        # test-binary link time; every Linux job that compiles needs it on PATH.
+        # macOS is untouched (target-scoped flag). The weekly fuzz job opts out
+        # via fuzz/.cargo/config.toml, so it needs no mold.
+        if: runner.os == 'Linux'
+        uses: rui314/setup-mold@v1
+
       - name: Install pinned Rust toolchain
         # rustup show syncs the toolchain + components pinned in
         # rust-toolchain.toml, so the pin is the single source of truth.
@@ -112,6 +120,14 @@ jobs:
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y zsh
 
+      - name: Set up mold linker (Linux)
+        # `.cargo/config.toml` points rustc at mold for the Linux target to cut
+        # test-binary link time; every Linux job that compiles needs it on PATH.
+        # macOS is untouched (target-scoped flag). The weekly fuzz job opts out
+        # via fuzz/.cargo/config.toml, so it needs no mold.
+        if: runner.os == 'Linux'
+        uses: rui314/setup-mold@v1
+
       - name: Install pinned Rust toolchain
         run: rustup show
 
@@ -143,6 +159,14 @@ jobs:
       - name: Install zsh on Linux
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y zsh
+
+      - name: Set up mold linker (Linux)
+        # `.cargo/config.toml` points rustc at mold for the Linux target to cut
+        # test-binary link time; every Linux job that compiles needs it on PATH.
+        # macOS is untouched (target-scoped flag). The weekly fuzz job opts out
+        # via fuzz/.cargo/config.toml, so it needs no mold.
+        if: runner.os == 'Linux'
+        uses: rui314/setup-mold@v1
 
       - name: Install pinned Rust toolchain
         run: rustup show
@@ -208,6 +232,14 @@ jobs:
       - name: Install zsh on Linux
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y zsh
+
+      - name: Set up mold linker (Linux)
+        # `.cargo/config.toml` points rustc at mold for the Linux target to cut
+        # test-binary link time; every Linux job that compiles needs it on PATH.
+        # macOS is untouched (target-scoped flag). The weekly fuzz job opts out
+        # via fuzz/.cargo/config.toml, so it needs no mold.
+        if: runner.os == 'Linux'
+        uses: rui314/setup-mold@v1
 
       - name: Install pinned Rust toolchain
         run: rustup show

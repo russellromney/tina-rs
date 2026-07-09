@@ -1,0 +1,11 @@
+# Linux link speedup for CI (and local dev on Linux). The test build links
+# ~220 test binaries; the default GNU `ld` is the bottleneck once compilation
+# is cache-warm. `mold` links the same binaries several times faster. This is
+# target-scoped, so macOS builds (aarch64-apple-darwin) are untouched -- mold's
+# Mach-O support is immature, and macOS link time is handled instead by the
+# `split-debuginfo`/`debug` profile settings in the root Cargo.toml.
+#
+# Requires `mold` on PATH: CI installs it via `rui314/setup-mold` in every
+# Linux job; locally, `apt-get install mold` (Linux) -- macOS devs need nothing.
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "link-arg=-fuse-ld=mold"]

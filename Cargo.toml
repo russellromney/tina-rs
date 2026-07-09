@@ -85,5 +85,11 @@ license = "MIT OR Apache-2.0"
 # test is still debuggable — while dropping the variable/type debuginfo that
 # balloons link time. Applies to dev + test builds (test inherits dev); release
 # profiles are untouched, so `make perf` measurements are unaffected.
+#
+# split-debuginfo = "unpacked" leaves debuginfo beside the object files instead
+# of copying/packing it into each binary. On macOS this skips the slow
+# `dsymutil` step that otherwise dominates test-binary link time; on Linux it
+# keeps debuginfo out of the linked image so mold has less to write.
 [profile.dev]
 debug = "line-tables-only"
+split-debuginfo = "unpacked"
