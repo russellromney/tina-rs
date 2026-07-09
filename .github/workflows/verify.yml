@@ -24,6 +24,15 @@ on:
 #     required alongside it -- sccache does not cache incremental artifacts,
 #     so leaving incremental on on top of sccache just adds overhead for no
 #     benefit. See the Makefile header for the local-dev equivalent.
+#
+# Caching keeps *compilation* warm (sccache hits ~76%), but linking the ~220
+# test binaries is not cacheable and dominates the test job once warm. Two
+# link-time levers attack that, configured outside this file:
+#   - .cargo/config.toml points rustc at `mold` on Linux (installed per Linux
+#     job via rui314/setup-mold); the fuzz workspace opts out.
+#   - Cargo.toml's [profile.dev] uses line-tables-only debuginfo +
+#     split-debuginfo=unpacked, cutting codegen/link weight on both OSes and
+#     skipping macOS `dsymutil`.
 env:
   RUSTC_WRAPPER: sccache
   CARGO_INCREMENTAL: "0"
@@ -202,18 +211,12 @@ jobs:
         # matches plain `cargo test --workspace`.
         run: make test
 
-      - name: sccache stats (diagnostic)
-        # Temporary instrumentation for the CI cache investigation: report the
-        # sccache hit-rate and on-disk sizes right after the compile-heavy
-        # `make test` step so the numbers reflect the dominant compile, not an
-        # empty warm-up run. Remove once the cache strategy is decided.
+      - name: sccache stats
+        # Ongoing signal: the sccache hit-rate right after the compile-heavy
+        # `make test` step. A sudden drop here (e.g. a toolchain bump or a
+        # rustflags change invalidating the cache) explains a slow run.
         if: always()
-        run: |
-          echo "--- sccache --show-stats ---"
-          sccache --show-stats || true
-          echo "--- du -sh ~/.cargo target ---"
-          du -sh ~/.cargo 2>/dev/null || true
-          du -sh target 2>/dev/null || true
+        run: sccache --show-stats || true
 
   guards:
     name: guards (loom, race-surface, rail-inventory, cost) (${{ matrix.os }})
