@@ -14,7 +14,9 @@ use tina_http::{
     Http2Limits, Http2Listener, Http2ListenerMsg, Http2ServerConfig, Http2ServiceMessage,
     HttpRequest, HttpResponse, IterBodySource, ResponseChunkMsg, ResponseChunkReply,
 };
-use tina_runtime::{DefaultThreadedMailboxFactory, ThreadedRuntime, ThreadedRuntimeConfig};
+use tina_runtime::{
+    DefaultThreadedMailboxFactory, SplitServiceHandle, ThreadedRuntime, ThreadedRuntimeConfig,
+};
 
 const CLIENT_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 const FRAME_DATA: u8 = 0x0;
@@ -2042,5 +2044,105 @@ fn http2_padded_data_returns_window_credit_for_full_payload() {
         "flow credit includes pad length"
     );
     assert_eq!(stream_credit, Some(6), "flow credit includes padding bytes");
+    harness.shutdown();
+}
+
+// ---------------------------------------------------------------------------
+// #38: a split-service isolate (`#[tina_runtime::isolate(event = .., request
+// = .., reply = ..)]`) must be able to serve over HTTP/2, the same way #277
+// unblocked it for the HTTP/1 rail. `Http2SplitService`'s message type is
+// `tina::ServiceMessage<Http2SplitEvent, Http2SplitRequest>`, which only
+// implements `Http2ServiceMessage` because of the dedicated impl added
+// alongside the blanket in `tina-http/src/http2/server.rs`. Delete that impl
+// and `Http2Listener<TestShard, _>::new(.., handle.address(), ..)` below
+// stops compiling with E0277 ("the trait bound .. is not satisfied") — the
+// load-bearing half of this test.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug)]
+enum Http2SplitEvent {
+    Seed(u64),
+}
+
+#[derive(Debug)]
+struct Http2SplitRequest(HttpRequest);
+
+impl From<HttpRequest> for Http2SplitRequest {
+    fn from(request: HttpRequest) -> Self {
+        Self(request)
+    }
+}
+
+struct Http2SplitService {
+    seen: u64,
+}
+
+#[tina_runtime::isolate(
+    event = Http2SplitEvent,
+    request = Http2SplitRequest,
+    reply = HttpResponse,
+    shard = TestShard
+)]
+impl Http2SplitService {
+    fn handle_event(
+        &mut self,
+        event: Http2SplitEvent,
+        _ctx: &mut Context<'_, TestShard, Self::Reply>,
+    ) -> Effect<Self> {
+        match event {
+            Http2SplitEvent::Seed(value) => {
+                self.seen = value;
+                noop()
+            }
+        }
+    }
+
+    fn handle_request(
+        &mut self,
+        request: Http2SplitRequest,
+        call: RequestCall<'_, Self>,
+    ) -> RequestEffect<Self> {
+        let body = format!("{} {} seen={}", request.0.method, request.0.path, self.seen);
+        call.reply(HttpResponse::text(body))
+    }
+}
+
+#[test]
+fn http2_split_service_isolate_serves_request() {
+    let runtime = ThreadedRuntime::with_config(
+        TestShard,
+        DefaultThreadedMailboxFactory,
+        ThreadedRuntimeConfig {
+            command_capacity: 64,
+            idle_wait: Duration::from_millis(1),
+            ..Default::default()
+        },
+    );
+    let handle: SplitServiceHandle<Http2SplitEvent, Http2SplitRequest, HttpResponse> = runtime
+        .register_split_service::<Http2SplitService, Http2SplitEvent, Http2SplitRequest, std::convert::Infallible>(
+            Http2SplitService { seen: 0 },
+            16,
+        )
+        .expect("register split service");
+    // Seed state through the event lane — proves the event and request
+    // lanes are genuinely separate channels into the same isolate, not
+    // just one HttpRequest-shaped message in disguise.
+    runtime
+        .try_send_event(handle.events, Http2SplitEvent::Seed(42))
+        .expect("seed event accepted");
+
+    let harness =
+        Http2Harness::start_with_service(runtime, handle.address(), Http2ServerConfig::default());
+    let mut stream = connect_h2(harness.addr);
+
+    write_frame(
+        &mut stream,
+        FRAME_HEADERS,
+        FLAG_END_HEADERS | FLAG_END_STREAM,
+        1,
+        &request_headers("GET", "/split"),
+    );
+
+    assert_eq!(read_response_body(&mut stream, 1), b"GET /split seen=42");
     harness.shutdown();
 }
