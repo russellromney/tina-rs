@@ -334,6 +334,16 @@ where
         work.defer_cancelable_request_through(self)
     }
 
+    /// Returns the runtime's current observed time. Mirrors
+    /// [`CallContext::now`] so handlers can read the clock — for deadline
+    /// math or rate-window checks — before handing the caller off to
+    /// [`defer`](Self::defer) or [`defer_cancelable`](Self::defer_cancelable).
+    /// Borrows rather than consumes, so the [`RequestCall`] is still usable
+    /// afterwards.
+    pub fn now(&self) -> std::time::Instant {
+        self.inner.now()
+    }
+
     /// Explicit escape hatch back to raw [`CallContext`].
     ///
     /// Prefer the narrower methods above. If this is used, the normal runtime

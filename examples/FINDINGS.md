@@ -124,36 +124,6 @@ Some older entries below are partly historical and say "shipped" inside the
 section. Keep their numbers stable until the next cleanup pass moves those
 paragraphs to `FINDINGS_HISTORY.md`.
 
-### 36. `RequestCall` has no `now()`, blocking split-service migration for time-reading request handlers
-
-**Surfaced by:** `specimen_backpressure_chain` (2026-07 examples
-canonicalization pass).
-
-`RequestCall<'a, I>` — the split-service (`event = .. request = ..`)
-caller-authority wrapper — exposes `reply` / `reply_and` / `reject` /
-`capture` / `try_capture` / `defer` / `defer_cancelable` /
-`into_call_context`, but no `now()` accessor. `CallContext` has `now()`.
-A request handler that must read the current time *before* handing the
-caller to `.defer(...)` — deadline math (`deadline.remaining_or_zero(now)`,
-`Deadline::from_instant(now, after)`), rate-limit window checks — has no
-sanctioned path on the split form: `into_call_context()` *consumes* the
-`RequestCall`, and the only way back to `RequestEffect` from a
-`CallContext`-produced `Effect` is the crate-private
-`RequestEffect::from_consumed_effect`.
-
-Concretely: `specimen_backpressure_chain` migrated its leaf `ServiceC`
-(no time read) to the split form, but `ServiceB` and `ServiceA` both
-compute a remaining budget from `call_ctx.now()` before deferring the
-downstream call, so both stayed on the manual `handle` / `handle_call`
-pair with a hand-written `UnsupportedMessage` reject arm. This is the
-exact boilerplate the split form removes — it just cannot be applied here.
-
-**Build (pick one):** add `RequestCall::now()` delegating to the inner
-`CallContext::now()` (smallest, matches the other borrow-only accessors),
-or make `RequestEffect::from_consumed_effect` a public sanctioned
-conversion so `into_call_context()` composes back. The first is narrower
-and keeps the "you must answer the caller" `RequestEffect` guard intact.
-
 ### Admission and rate policy ergonomics
 
 **Surfaced by:** `system_tenant_rate_limiter`, `system_api_gateway_limits`,
@@ -1246,6 +1216,24 @@ there; `tests/budget.rs` proves the documented caps are exactly the manifest
 rows and that every live surface has a row. Still deliberately manual: time
 deadlines and retry-budget *durations* (the unit vocabulary is count and weight,
 not time) and per-isolate mailbox depth the runtime does not sample.
+
+### 36. `RequestCall` has no `now()`, blocking split-service migration for time-reading request handlers — closed
+
+**Note:** shares finding number 36 with "Whole-service copied path" above —
+a pre-existing duplicate in the ledger's numbering, not a re-use by this
+entry.
+
+**Closed.** `RequestCall::now()` (`tina/src/context.rs`) now delegates to
+the inner `CallContext::now()`, borrow-only (`&self`), so a handler can
+read the clock for deadline math ahead of `.defer(...)` without losing
+caller authority. `specimen_backpressure_chain`'s `ServiceB` and `ServiceA`
+are now on the split `#[tina_runtime::isolate(event = .., request = ..,
+reply = ..)]` form (`examples/specimen_backpressure_chain/src/tina_impl.rs`),
+each reading `call.now()` before `call.defer(...)`, dropping the manual
+`handle`/`handle_call` pair and its hand-written `UnsupportedMessage`
+reject arm. `cargo test -p tina --test request_call_now` proves the
+accessor's value and borrow behavior; `cargo build --tests` +
+`cargo test` on the specimen pass unchanged (2/2).
 
 ### 37. Accept-loop bad-peer survivability — Phase 120 hostile review
 
