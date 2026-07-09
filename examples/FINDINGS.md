@@ -68,7 +68,9 @@ behavior). What moved, and what was deliberately left:
 fixed). Finding 38 — the HTTP/2 rail's `Http2ServiceMessage` lacks the twin
 `FromHttpRequest for ServiceMessage` impl, so a split-service isolate cannot
 yet serve over HTTP/2 (surfaced migrating `system_scoped_request_tree` over
-HTTP/1; PR #277 fixed the HTTP/1 `HttpListener` path only). Open follow-up.
+HTTP/1; PR #277 fixed the HTTP/1 `HttpListener` path only). CLOSED (PR #279):
+the twin `Http2ServiceMessage for ServiceMessage` impl landed with an
+e2e split-service-over-h2 test.
 
 **API-gap fixes landed (2026-07-09):** the four crates left above were all
 unblocked and migrated to canonical form:
