@@ -551,6 +551,51 @@ async fn close_fanout_settles_live_call_with_true_terminal_not_timeout() {
 }
 
 #[tokio::test]
+async fn back_to_back_calls_at_capacity_one_never_spuriously_full() {
+    // User-perspective e2e for the #271 admission-slot ordering.
+    //
+    // Bridge capacity is exactly 1. Each call is awaited to completion, then
+    // the next is issued immediately. The reply settles on tina's worker
+    // thread while the awaiter resumes on the Tokio thread; if the slot were
+    // returned AFTER waking the awaiter, this back-to-back `call()` could
+    // observe its predecessor's success with the permit still held and be
+    // spuriously rejected with `Full`. Every call here targets the same live
+    // capacity edge, so a single spurious `Full` fails the test.
+    let runtime = build_runtime();
+    let stub = register_stub(&runtime, StubBehavior::Echo);
+    let bridge = BridgeClient::<SpecimenShard>::new(Arc::clone(&runtime), stub, 1, 64).unwrap();
+
+    for i in 0..2_000i64 {
+        let outcome: Result<(i64, i64), BridgeError> = bridge
+            .call(
+                |corr, rt| {
+                    EchoClient::add_request(i, i + 1, Duration::from_secs(5), corr, rt, 1024)
+                },
+                |bytes| {
+                    serde_json::from_slice(bytes).map_err(|_| tina_rpc::EncodingError::Decode {
+                        encoder: "json",
+                        kind: tina_rpc::EncodingErrorKind::Syntax,
+                    })
+                },
+            )
+            .await;
+        assert_eq!(
+            outcome,
+            Ok((i, i + 1)),
+            "back-to-back call at capacity 1 (iteration {i}) must be admitted and succeed, \
+             never spuriously Full",
+        );
+    }
+
+    // After the last settle the single permit must be back.
+    assert_eq!(
+        bridge.available_slots(),
+        1,
+        "admission slot must be returned after every settled call",
+    );
+}
+
+#[tokio::test]
 async fn parallel_calls_demux_correctly() {
     let runtime = build_runtime();
     let stub = register_stub(&runtime, StubBehavior::Echo);
