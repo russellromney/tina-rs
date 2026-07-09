@@ -64,7 +64,22 @@ behavior). What moved, and what was deliberately left:
   (README frames the manual shape as the lesson, or register→observe
   ordering is load-bearing).
 
-**New rough edge:** finding 36 — `RequestCall::now()` is missing.
+**New rough edges:** finding 36 — `RequestCall::now()` is missing (now
+fixed). Finding 38 — the HTTP/2 rail's `Http2ServiceMessage` lacks the twin
+`FromHttpRequest for ServiceMessage` impl, so a split-service isolate cannot
+yet serve over HTTP/2 (surfaced migrating `system_scoped_request_tree` over
+HTTP/1; PR #277 fixed the HTTP/1 `HttpListener` path only). Open follow-up.
+
+**API-gap fixes landed (2026-07-09):** the four crates left above were all
+unblocked and migrated to canonical form:
+- `system_soak_http_db` → `flow!` now has `-> raw T` steps for non-call
+  continuations (PR #276, closes finding 29).
+- `system_scoped_request_tree` → `tina-http`'s new `FromHttpRequest` trait
+  routes around the orphan rule (PR #277).
+- `ServiceB`/`ServiceA` in `specimen_backpressure_chain` → `RequestCall::now()`
+  added (PR #275, closes finding 36).
+- `QuoteGateway` in `ergonomics_playground` → `record_classified_reply` on
+  `CallSelectSet` carries a business-success predicate (PR #278).
 
 **Not swept this pass (follow-up):** the ~30 remaining `specimen_*`
 crates and `examples/extensions/*` were triaged (no split/bootstrap
@@ -605,6 +620,11 @@ register/get/snapshot. Reuse the existing `CapacitySummary` shape so
 the runtime can produce one merged discovery line per shard.
 
 ### 29. Effect chaining over multiple runtime calls inside one logical request
+
+**CLOSED (2026-07-09, PR #276):** `flow!` gained `-> raw T` steps that carry a
+non-call continuation (e.g. a `sleep().then()` timer wake-up yielding `Result`);
+`system_soak_http_db` is migrated onto it. Kept here (not yet moved to
+FINDINGS_HISTORY) per the ledger's stable-number convention.
 
 **Surfaced by:** `system_soak_http_db`.
 
