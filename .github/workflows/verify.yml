@@ -46,16 +46,25 @@ jobs:
   # rule configured (verified via `gh api repos/.../branches/main/protection`
   # -> 404 "Branch not protected"), so there is no existing required-check
   # name this rename could break. If branch protection is added later, the
-  # per-PR gate is these job names: "static checks (fmt, doc)",
-  # "clippy (ubuntu-latest)", "clippy (macos-latest)",
-  # "test (nextest + doctests) (ubuntu-latest)",
-  # "test (nextest + doctests) (macos-latest)",
-  # "guards (loom, race-surface, rail-inventory, cost) (ubuntu-latest)",
-  # "guards (loom, race-surface, rail-inventory, cost) (macos-latest)".
+  # per-PR gate is these job names (all matrixed ubuntu + macos):
+  # "static checks (fmt, doc) (ubuntu-latest)" / "(macos-latest)",
+  # "clippy (ubuntu-latest)" / "(macos-latest)",
+  # "test (nextest + doctests) (ubuntu-latest)" / "(macos-latest)",
+  # "guards (loom, race-surface, rail-inventory, cost) (ubuntu-latest)" / "(macos-latest)".
   static:
-    name: static checks (fmt, doc)
+    name: static checks (fmt, doc) (${{ matrix.os }})
+    # Both OSes: fmt is platform-independent, but `doc` is not — the workspace
+    # has macOS-only `cfg` blocks (fullfsync/signal handling) whose rustdoc
+    # `-D warnings` lints are only gated when doc runs on macOS too, matching
+    # the old single `make verify` job.
     if: github.event_name == 'pull_request' || github.event_name == 'push'
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -63,6 +72,7 @@ jobs:
       - name: Install zsh on Linux
         # Makefile SHELL is zsh (matches macOS's default); Linux runners need
         # it installed explicitly.
+        if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y zsh
 
       - name: Install pinned Rust toolchain
