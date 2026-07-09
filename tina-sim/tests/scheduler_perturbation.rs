@@ -6,7 +6,9 @@
 //! default (`SchedulerFaultMode::None`) is exactly registration order so
 //! every pinned golden trace is untouched.
 
+use std::cell::RefCell;
 use std::convert::Infallible;
+use std::rc::Rc;
 
 use tina::{Address, Context, Effect, Isolate, Outbound, Shard, ShardId, noop};
 use tina_runtime::{RuntimeCall, RuntimeEvent, RuntimeEventKind, stable_trace_hash};
@@ -154,6 +156,125 @@ fn default_mode_is_exactly_registration_order_for_every_seed() {
             "SchedulerFaultMode::None must ignore the seed's scheduler dimension",
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// DST exploration: an ordering-sensitive OUTCOME the axis must discover.
+//
+// The tests above prove determinism of the axis. This one proves it is
+// *useful*: two isolates apply non-commutative updates to one shared cell, so
+// the final value depends on which runs first. Registration order pins one
+// result forever; only by exploring interleavings across seeds does the other,
+// bug-shaped result appear — and once found, the seed reproduces it. That is
+// the DST value: the perturbation axis finds a state registration order alone
+// never reaches.
+// ---------------------------------------------------------------------------
+
+/// Multiplies the shared cell by 2 on `Tick`. Registered first, so under
+/// registration order it always runs before [`Adder`].
+struct Doubler {
+    value: Rc<RefCell<i64>>,
+}
+
+/// Adds 1 to the shared cell on `Tick`. Registered second.
+struct Adder {
+    value: Rc<RefCell<i64>>,
+}
+
+macro_rules! shared_state_isolate {
+    ($name:ty, $op:expr) => {
+        impl Isolate for $name {
+            type Message = Msg;
+            type Reply = ();
+            type Send = Outbound<Infallible>;
+            type Spawn = Infallible;
+            type SpawnObserved = Infallible;
+            type Io = RuntimeCall<Msg>;
+            type Fact = Infallible;
+            type Shard = TestShard;
+
+            fn handle(
+                &mut self,
+                msg: Msg,
+                _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+            ) -> Effect<Self> {
+                match msg {
+                    Msg::Tick => {
+                        let op: fn(i64) -> i64 = $op;
+                        let mut cell = self.value.borrow_mut();
+                        *cell = op(*cell);
+                        noop()
+                    }
+                }
+            }
+        }
+    };
+}
+
+shared_state_isolate!(Doubler, |v| v * 2);
+shared_state_isolate!(Adder, |v| v + 1);
+
+/// Runs the non-commutative workload once and returns the final shared value.
+/// `Doubler` is registered first (`* 2`), `Adder` second (`+ 1`); both are
+/// ready in the same round, so the scheduler's dispatch order alone decides
+/// the outcome. Start value 3: Doubler-first yields 7, Adder-first yields 8.
+fn run_non_commutative(seed: u64, mode: SchedulerFaultMode) -> i64 {
+    let value = Rc::new(RefCell::new(3i64));
+    let mut sim = Simulator::new(TestShard, config(seed, mode));
+    let doubler = sim.register(Doubler {
+        value: Rc::clone(&value),
+    });
+    let adder = sim.register(Adder {
+        value: Rc::clone(&value),
+    });
+    sim.try_send(doubler, Msg::Tick).unwrap();
+    sim.try_send(adder, Msg::Tick).unwrap();
+    sim.run_until_quiescent();
+    *value.borrow()
+}
+
+const DOUBLER_FIRST: i64 = 7; // (3 * 2) + 1
+const ADDER_FIRST: i64 = 8; // (3 + 1) * 2
+
+#[test]
+fn permute_axis_discovers_ordering_sensitive_outcome_and_reproduces_it() {
+    // Baseline: with the axis OFF, the outcome is registration order for every
+    // seed — Doubler always runs first, so the alternate result never appears.
+    // This is exactly the blind spot a default (axis-off) sweep has.
+    for seed in [0u64, 1, 7, 42, 0xC0FFEE, u64::MAX] {
+        assert_eq!(
+            run_non_commutative(seed, SchedulerFaultMode::None),
+            DOUBLER_FIRST,
+            "axis off must always yield the registration-order outcome",
+        );
+    }
+
+    // Explore: sweep seeds under PermuteReadyOrder until one drives the
+    // Adder-first interleaving. Registration order alone would never reach it.
+    let discovered = (1..2_000u64).find(|&seed| {
+        run_non_commutative(seed, SchedulerFaultMode::PermuteReadyOrder) == ADDER_FIRST
+    });
+    let seed = discovered.expect(
+        "PermuteReadyOrder must explore the Adder-first interleaving that registration order \
+         never reaches",
+    );
+
+    // Reproduce: the discovered seed replays the same ordering-sensitive
+    // outcome, deterministically — the whole point of a seeded DST axis.
+    assert_eq!(
+        run_non_commutative(seed, SchedulerFaultMode::PermuteReadyOrder),
+        ADDER_FIRST,
+        "the discovered seed must reproduce the interleaving-sensitive outcome",
+    );
+
+    // And the same seed with the axis OFF collapses back to the registration
+    // outcome: the alternate result is genuinely an interleaving the default
+    // sweep would miss, not a property of the workload or the seed alone.
+    assert_eq!(
+        run_non_commutative(seed, SchedulerFaultMode::None),
+        DOUBLER_FIRST,
+        "with the axis off, the discovered seed yields the registration-order outcome",
+    );
 }
 
 #[test]
