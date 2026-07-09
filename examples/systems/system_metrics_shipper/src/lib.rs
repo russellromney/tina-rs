@@ -24,7 +24,8 @@ use tina_runtime::lifecycle::{
 };
 use tina_runtime::{
     AdmitDecision, CallOutcome, DefaultThreadedMailboxFactory, DrainStage, DrainState,
-    LocalPermitGate, LocalPermitName, Permit, ThreadedRuntime, ThreadedShutdownHandle, call, sleep,
+    LocalPermitGate, LocalPermitName, Permit, ThreadedRuntime, ThreadedShutdownHandle,
+    call_request, sleep,
 };
 
 /// One submitted metric event. Payload is opaque; the specimen only cares
@@ -192,16 +193,21 @@ pub enum ShipperReply {
     },
 }
 
+/// Fire-and-forget fact the sink accepts: its own deferred-flush
+/// completion. Never sent by a caller.
 #[derive(Debug)]
-pub enum SinkMsg {
-    Flush {
-        batch: Vec<Event>,
-    },
-    Stats,
+pub enum SinkEvent {
     Complete {
         req: RequestContext<SinkReply>,
         batch: Vec<Event>,
     },
+}
+
+/// The two caller-authority requests the sink accepts.
+#[derive(Debug)]
+pub enum SinkRequest {
+    Flush { batch: Vec<Event> },
+    Stats,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -212,7 +218,7 @@ pub enum SinkReply {
 }
 
 type ShipperAddr = Address<ShipperMsg, ShipperReply>;
-type SinkAddr = Address<SinkMsg, SinkReply>;
+type SinkAddr = tina::ServiceRequestAddress<SinkEvent, SinkRequest, SinkReply>;
 
 struct Shipper {
     sink: SinkAddr,
@@ -441,14 +447,17 @@ impl Shipper {
         // Any tick currently sleeping cannot satisfy a future flush because
         // `flush_tick.clear()` advances the helper's armed ordinal.
         self.flush_tick.clear();
-        call::<SinkMsg, SinkReply>(self.sink, SinkMsg::Flush { batch }, self.flush_timeout).then(
-            move |outcome| ShipperMsg::FlushDone {
-                kind,
-                count,
-                permit,
-                outcome,
-            },
+        call_request::<SinkEvent, SinkRequest, SinkReply>(
+            self.sink,
+            SinkRequest::Flush { batch },
+            self.flush_timeout,
         )
+        .then(move |outcome| ShipperMsg::FlushDone {
+            kind,
+            count,
+            permit,
+            outcome,
+        })
     }
 
     fn arm_tick(&mut self, now: std::time::Instant) -> Effect<Self> {
@@ -486,35 +495,38 @@ struct Sink {
     flush_delay: Duration,
 }
 
-#[tina_runtime::isolate(message = SinkMsg, reply = SinkReply)]
+#[tina_runtime::isolate(event = SinkEvent, request = SinkRequest, reply = SinkReply)]
 impl Sink {
-    fn handle(
+    fn handle_event(
         &mut self,
-        msg: SinkMsg,
+        event: SinkEvent,
         _ctx: &mut Context<'_, SingleShard, Self::Reply>,
     ) -> Effect<Self> {
-        match msg {
-            SinkMsg::Complete { req, batch } => self.complete(req, batch),
-            SinkMsg::Flush { .. } | SinkMsg::Stats => noop(),
+        match event {
+            SinkEvent::Complete { req, batch } => self.complete(req, batch),
         }
     }
 
-    fn handle_call(&mut self, msg: SinkMsg, call: CallContext<'_, Self>) -> Effect<Self> {
-        match msg {
-            SinkMsg::Flush { batch } => {
+    fn handle_request(
+        &mut self,
+        request: SinkRequest,
+        call: RequestCall<'_, Self>,
+    ) -> RequestEffect<Self> {
+        match request {
+            SinkRequest::Flush { batch } => {
                 if self.flush_delay.is_zero() {
                     return self.reply_for_batch(call, batch);
                 }
-                call.defer(sleep(self.flush_delay))
-                    .reply(move |req, _| SinkMsg::Complete { req, batch })
+                call.defer(sleep(self.flush_delay)).reply(move |req, _| {
+                    tina::ServiceMessage::Event(SinkEvent::Complete { req, batch })
+                })
             }
-            SinkMsg::Stats => call.reply(SinkReply::Stats(SinkStats {
+            SinkRequest::Stats => call.reply(SinkReply::Stats(SinkStats {
                 mailbox_capacity: self.mailbox_capacity,
                 batches_received: self.received,
                 events_received: self.events,
                 failures_injected: self.failures,
             })),
-            SinkMsg::Complete { .. } => call.reject(tina::CallRejectedReason::UnsupportedMessage),
         }
     }
 }
@@ -531,7 +543,11 @@ impl Sink {
         }
     }
 
-    fn reply_for_batch(&mut self, call: CallContext<'_, Self>, batch: Vec<Event>) -> Effect<Self> {
+    fn reply_for_batch(
+        &mut self,
+        call: RequestCall<'_, Self>,
+        batch: Vec<Event>,
+    ) -> RequestEffect<Self> {
         self.received += 1;
         let should_fail = self.fail_every > 0 && self.received as usize % self.fail_every == 0;
         if should_fail {
@@ -936,7 +952,7 @@ impl World {
             DefaultThreadedMailboxFactory,
         ));
         let sink = runtime
-            .register_with_capacity::<_, Infallible>(
+            .register_split_service::<Sink, SinkEvent, SinkRequest, Infallible>(
                 Sink::new(
                     config.sink_mailbox,
                     config.sink_fail_every,
@@ -944,7 +960,8 @@ impl World {
                 ),
                 config.sink_mailbox,
             )
-            .map_err(|e| anyhow::anyhow!("register sink: {e:?}"))?;
+            .map_err(|e| anyhow::anyhow!("register sink: {e:?}"))?
+            .requests;
         let shipper = runtime
             .register_with_capacity::<_, Infallible>(
                 Shipper::new(sink, config),
@@ -1039,7 +1056,7 @@ impl World {
     fn sink_stats(&self) -> anyhow::Result<SinkStats> {
         match self
             .runtime
-            .call_blocking(self.sink, SinkMsg::Stats, self.call_timeout)?
+            .call_blocking_request(self.sink, SinkRequest::Stats, self.call_timeout)?
         {
             CallOutcome::Replied(SinkReply::Stats(stats)) => Ok(stats),
             other => anyhow::bail!("expected sink Stats reply, got {other:?}"),

@@ -2,12 +2,9 @@ use std::convert::Infallible;
 use std::time::Duration;
 
 use tina::prelude::*;
-use tina_runtime::{
-    CallOutcome, DefaultThreadedMailboxFactory, ParkCallError, PendingReplies, ThreadedRuntime,
-    call,
-};
+use tina_runtime::{CallOutcome, DefaultThreadedMailboxFactory, ThreadedRuntime, call};
 
-use crate::{MAX_PENDING, REQUESTS, Report, Stage, classify};
+use crate::{REQUESTS, Report, Stage, classify};
 
 const STAGE_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -129,20 +126,63 @@ pub enum PipelineReply {
     Failed,
 }
 
-#[derive(Debug)]
 enum PipelineMsg {
     Submit(usize),
-    Parsed(u64, CallOutcome<ParseReply>),
-    Validated(u64, CallOutcome<ValidateReply>),
-    Executed(u64, CallOutcome<ExecuteReply>),
+    Stage(PipelineFlow),
 }
 
 struct Pipeline {
     parse: Address<ParseInput, ParseReply>,
     validate: Address<ValidateInput, ValidateReply>,
     execute: Address<ExecuteInput, ExecuteReply>,
-    pending: PendingReplies<u64, PipelineReply>,
-    next_qid: u64,
+}
+
+// One step per pipeline stage. `tina::flow!` writes the continuation enum
+// (`PipelineFlow`) and its dispatcher (`handle_pipeline_flow`) that this
+// crate used to hand-roll as `PipelineMsg::{Parsed,Validated,Executed}` plus
+// a `qid`-keyed `PendingReplies` table. The caller's `RequestContext` now
+// threads through `req` directly, so the qid indirection is gone too.
+tina::flow! {
+    flow PipelineFlow for Pipeline {
+        reply PipelineReply;
+
+        step Parsed() -> ParseReply {
+            match outcome {
+                CallOutcome::Replied(ParseReply::Ok(v)) => {
+                    call(self.validate, ValidateInput(v), STAGE_TIMEOUT)
+                        .then_with_request(req, move |req, outcome| {
+                            PipelineMsg::Stage(PipelineFlow::Validated(req, outcome))
+                        })
+                }
+                CallOutcome::Replied(ParseReply::Failed) => {
+                    reply_to(req, PipelineReply::ParseFailed)
+                }
+                _ => reply_to(req, PipelineReply::Failed),
+            }
+        }
+
+        step Validated() -> ValidateReply {
+            match outcome {
+                CallOutcome::Replied(ValidateReply::Ok(v)) => {
+                    call(self.execute, ExecuteInput(v), STAGE_TIMEOUT)
+                        .then_with_request(req, move |req, outcome| {
+                            PipelineMsg::Stage(PipelineFlow::Executed(req, outcome))
+                        })
+                }
+                CallOutcome::Replied(ValidateReply::Failed) => {
+                    reply_to(req, PipelineReply::ValidateFailed)
+                }
+                _ => reply_to(req, PipelineReply::Failed),
+            }
+        }
+
+        step Executed() -> ExecuteReply {
+            match outcome {
+                CallOutcome::Replied(ExecuteReply) => reply_to(req, PipelineReply::Completed),
+                _ => reply_to(req, PipelineReply::Failed),
+            }
+        }
+    }
 }
 
 #[tina_runtime::isolate(message = PipelineMsg, reply = PipelineReply)]
@@ -154,68 +194,18 @@ impl Pipeline {
     ) -> Effect<Self> {
         match msg {
             PipelineMsg::Submit(_) => noop(),
-            PipelineMsg::Parsed(qid, outcome) => self.on_parsed(qid, outcome),
-            PipelineMsg::Validated(qid, outcome) => self.on_validated(qid, outcome),
-            PipelineMsg::Executed(qid, outcome) => self.on_executed(qid, outcome),
+            PipelineMsg::Stage(flow) => self.handle_pipeline_flow(flow),
         }
     }
 
     fn handle_call(&mut self, msg: PipelineMsg, call_ctx: CallContext<'_, Self>) -> Effect<Self> {
         match msg {
-            PipelineMsg::Submit(input) => {
-                let qid = self.next_qid;
-                self.next_qid += 1;
-                match self.pending.park_call(qid, call_ctx) {
-                    Ok(_ticket) => call(self.parse, ParseInput(input), STAGE_TIMEOUT)
-                        .then(move |outcome| PipelineMsg::Parsed(qid, outcome)),
-                    Err(ParkCallError::Full { call, .. }) => call.reply(PipelineReply::Failed),
-                    Err(ParkCallError::DuplicateKey { call, .. }) => {
-                        call.reply(PipelineReply::Failed)
-                    }
-                    Err(other) => panic!("try_capture: {other:?}"),
-                }
-            }
-            PipelineMsg::Parsed(_, _)
-            | PipelineMsg::Validated(_, _)
-            | PipelineMsg::Executed(_, _) => {
-                call_ctx.reject(tina::CallRejectedReason::UnsupportedMessage)
-            }
-        }
-    }
-}
-
-impl Pipeline {
-    fn on_parsed(&mut self, qid: u64, outcome: CallOutcome<ParseReply>) -> Effect<Self> {
-        match outcome {
-            CallOutcome::Replied(ParseReply::Ok(v)) => call(self.validate, ValidateInput(v), STAGE_TIMEOUT)
-                .then(move |outcome| PipelineMsg::Validated(qid, outcome)),
-            CallOutcome::Replied(ParseReply::Failed) => self.bail(qid, PipelineReply::ParseFailed),
-            _ => self.bail(qid, PipelineReply::Failed),
-        }
-    }
-
-    fn on_validated(&mut self, qid: u64, outcome: CallOutcome<ValidateReply>) -> Effect<Self> {
-        match outcome {
-            CallOutcome::Replied(ValidateReply::Ok(v)) => call(self.execute, ExecuteInput(v), STAGE_TIMEOUT)
-                .then(move |outcome| PipelineMsg::Executed(qid, outcome)),
-            CallOutcome::Replied(ValidateReply::Failed) => {
-                self.bail(qid, PipelineReply::ValidateFailed)
-            }
-            _ => self.bail(qid, PipelineReply::Failed),
-        }
-    }
-
-    fn on_executed(&mut self, qid: u64, outcome: CallOutcome<ExecuteReply>) -> Effect<Self> {
-        match outcome {
-            CallOutcome::Replied(ExecuteReply) => self.bail(qid, PipelineReply::Completed),
-            _ => self.bail(qid, PipelineReply::Failed),
-        }
-    }
-
-    fn bail(&mut self, qid: u64, value: PipelineReply) -> Effect<Self> {
-        match self.pending.take(&qid) {
-            Some(slot) => reply_to(slot, value),
-            None => noop(),
+            PipelineMsg::Submit(input) => call_ctx
+                .defer(call(self.parse, ParseInput(input), STAGE_TIMEOUT))
+                .reply(move |req, outcome| {
+                    PipelineMsg::Stage(PipelineFlow::Parsed(req, outcome))
+                }),
+            PipelineMsg::Stage(_) => call_ctx.reject(tina::CallRejectedReason::UnsupportedMessage),
         }
     }
 }
@@ -300,8 +290,6 @@ pub fn run() -> anyhow::Result<Report> {
                 parse,
                 validate,
                 execute,
-                pending: PendingReplies::with_capacity(MAX_PENDING),
-                next_qid: 1,
             },
             64,
         )

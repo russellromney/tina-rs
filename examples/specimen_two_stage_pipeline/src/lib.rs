@@ -12,7 +12,6 @@ pub mod tokio_impl;
 pub const REQUESTS: usize = 8;
 pub const PARSE_FAILURES: usize = 2;
 pub const VALIDATE_FAILURES: usize = 1;
-pub const MAX_PENDING: usize = 16;
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct Report {

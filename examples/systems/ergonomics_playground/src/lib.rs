@@ -3,13 +3,14 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use tina::{
-    Address, CallContext, CancelOutcome, Context, Effect, Isolate, RequestContext, SingleShard,
-    noop, reply_to, send,
+    Address, CancelOutcome, Context, Effect, Isolate, RequestContext, SingleShard, noop, reply_to,
+    send,
 };
 use tina_runtime::{
     CallGroup, CallGroupToken, CallOutcome, CallReplyRejectedReason, DeferredReplyRejectedReason,
-    PendingReplies, RuntimeCall, RuntimeEventKind, SharedWork, SharedWorkCallError, SleepReply,
-    call, call_cancelable, cancel_call, request_effect_after_shared_wait, sleep,
+    PendingReplies, RuntimeCall, RuntimeEventKind, SharedWork, SharedWorkError, SleepReply, call,
+    call_cancelable, cancel_call, request_effect_after_park, request_effect_after_shared_wait,
+    sleep,
 };
 use tina_sim::{Simulator, SimulatorConfig};
 
@@ -39,9 +40,13 @@ struct ProviderQuote {
 }
 
 #[derive(Debug)]
-enum ProviderMsg {
-    Quote,
+enum ProviderEvent {
     Done(RequestContext<ProviderQuote>, SleepReply),
+}
+
+#[derive(Debug)]
+enum ProviderRequest {
+    Quote,
 }
 
 #[derive(Debug)]
@@ -50,39 +55,34 @@ struct Provider {
     delay: Duration,
 }
 
-impl Isolate for Provider {
-    type Message = ProviderMsg;
-    type Reply = ProviderQuote;
-    type Send = tina::Outbound<std::convert::Infallible>;
-    type Spawn = std::convert::Infallible;
-    type SpawnObserved = std::convert::Infallible;
-    type Io = RuntimeCall<ProviderMsg>;
-    type Fact = std::convert::Infallible;
-    type Shard = SingleShard;
-
-    fn handle(
+#[tina_runtime::isolate(event = ProviderEvent, request = ProviderRequest, reply = ProviderQuote)]
+impl Provider {
+    fn handle_event(
         &mut self,
-        msg: Self::Message,
-        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+        event: ProviderEvent,
+        _ctx: &mut Context<'_, SingleShard, Self::Reply>,
     ) -> Effect<Self> {
-        match msg {
-            ProviderMsg::Quote => noop(),
-            ProviderMsg::Done(req, Ok(())) => reply_to(req, self.quote),
-            ProviderMsg::Done(_, Err(_)) => noop(),
+        match event {
+            ProviderEvent::Done(req, Ok(())) => reply_to(req, self.quote),
+            ProviderEvent::Done(_, Err(_)) => noop(),
         }
     }
 
-    fn handle_call(&mut self, msg: Self::Message, call: CallContext<'_, Self>) -> Effect<Self> {
-        match msg {
-            ProviderMsg::Quote => call.defer(sleep(self.delay)).reply(ProviderMsg::Done),
-            ProviderMsg::Done(_, _) => call.reject(tina::CallRejectedReason::UnsupportedMessage),
+    fn handle_request(
+        &mut self,
+        request: ProviderRequest,
+        call: RequestCall<'_, Self>,
+    ) -> RequestEffect<Self> {
+        match request {
+            ProviderRequest::Quote => call
+                .defer(sleep(self.delay))
+                .reply(|req, result| tina::ServiceMessage::Event(ProviderEvent::Done(req, result))),
         }
     }
 }
 
 #[derive(Debug)]
-enum QuoteGatewayMsg {
-    GetQuote,
+enum QuoteEvent {
     ProviderReturned {
         key: u32,
         token: CallGroupToken,
@@ -96,6 +96,11 @@ enum QuoteGatewayMsg {
 }
 
 #[derive(Debug)]
+enum QuoteRequest {
+    GetQuote,
+}
+
+#[derive(Debug)]
 struct PendingQuote {
     request: Option<RequestContext<QuoteReply>>,
     group: CallGroup<u32, ProviderQuote>,
@@ -103,7 +108,7 @@ struct PendingQuote {
 
 #[derive(Debug)]
 struct QuoteGateway {
-    providers: [Address<ProviderMsg, ProviderQuote>; 2],
+    providers: [Address<tina::ServiceMessage<ProviderEvent, ProviderRequest>, ProviderQuote>; 2],
     pending: Option<PendingQuote>,
     cancel_outcomes: Rc<RefCell<usize>>,
 }
@@ -118,11 +123,17 @@ impl QuoteGateway {
             let effect = group
                 .start_cancelable(
                     key,
-                    call_cancelable(provider, ProviderMsg::Quote, CALL_TIMEOUT),
-                    |key, token, outcome| QuoteGatewayMsg::ProviderReturned {
-                        key,
-                        token,
-                        outcome,
+                    call_cancelable(
+                        provider,
+                        tina::ServiceMessage::Request(ProviderRequest::Quote),
+                        CALL_TIMEOUT,
+                    ),
+                    |key, token, outcome| {
+                        tina::ServiceMessage::Event(QuoteEvent::ProviderReturned {
+                            key,
+                            token,
+                            outcome,
+                        })
                     },
                 )
                 .expect("fresh group accepts each provider");
@@ -143,34 +154,27 @@ impl QuoteGateway {
             .into_iter()
             .map(|request| {
                 let (key, token, handle) = request.into_parts();
-                cancel_call(handle).then(move |outcome| QuoteGatewayMsg::Cancelled {
-                    key,
-                    token,
-                    outcome,
+                cancel_call(handle).then(move |outcome| {
+                    tina::ServiceMessage::Event(QuoteEvent::Cancelled {
+                        key,
+                        token,
+                        outcome,
+                    })
                 })
             })
             .collect()
     }
 }
 
-impl Isolate for QuoteGateway {
-    type Message = QuoteGatewayMsg;
-    type Reply = QuoteReply;
-    type Send = tina::Outbound<std::convert::Infallible>;
-    type Spawn = std::convert::Infallible;
-    type SpawnObserved = std::convert::Infallible;
-    type Fact = std::convert::Infallible;
-    type Io = RuntimeCall<QuoteGatewayMsg>;
-    type Shard = SingleShard;
-
-    fn handle(
+#[tina_runtime::isolate(event = QuoteEvent, request = QuoteRequest, reply = QuoteReply)]
+impl QuoteGateway {
+    fn handle_event(
         &mut self,
-        msg: Self::Message,
-        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+        event: QuoteEvent,
+        _ctx: &mut Context<'_, SingleShard, Self::Reply>,
     ) -> Effect<Self> {
-        match msg {
-            QuoteGatewayMsg::GetQuote => noop(),
-            QuoteGatewayMsg::ProviderReturned {
+        match event {
+            QuoteEvent::ProviderReturned {
                 key,
                 token,
                 outcome,
@@ -208,7 +212,7 @@ impl Isolate for QuoteGateway {
                     Effect::Batch(effects)
                 }
             }
-            QuoteGatewayMsg::Cancelled {
+            QuoteEvent::Cancelled {
                 key,
                 token,
                 outcome,
@@ -229,17 +233,18 @@ impl Isolate for QuoteGateway {
         }
     }
 
-    fn handle_call(&mut self, msg: Self::Message, call: CallContext<'_, Self>) -> Effect<Self> {
-        match msg {
-            QuoteGatewayMsg::GetQuote => {
+    fn handle_request(
+        &mut self,
+        request: QuoteRequest,
+        call: RequestCall<'_, Self>,
+    ) -> RequestEffect<Self> {
+        match request {
+            QuoteRequest::GetQuote => {
                 if self.pending.is_some() {
                     call.reply(QuoteReply::Busy)
                 } else {
-                    self.start_race(call.into_request_context())
+                    call.capture(|request| self.start_race(request))
                 }
-            }
-            QuoteGatewayMsg::ProviderReturned { .. } | QuoteGatewayMsg::Cancelled { .. } => {
-                call.reject(tina::CallRejectedReason::UnsupportedMessage)
             }
         }
     }
@@ -247,7 +252,7 @@ impl Isolate for QuoteGateway {
 
 #[derive(Debug)]
 enum QuoteClientMsg {
-    Begin(Address<QuoteGatewayMsg, QuoteReply>),
+    Begin(Address<tina::ServiceMessage<QuoteEvent, QuoteRequest>, QuoteReply>),
     Returned(CallOutcome<QuoteReply>),
 }
 
@@ -273,8 +278,12 @@ impl Isolate for QuoteClient {
     ) -> Effect<Self> {
         match msg {
             QuoteClientMsg::Begin(gateway) => {
-                call(gateway, QuoteGatewayMsg::GetQuote, CALL_TIMEOUT)
-                    .then(QuoteClientMsg::Returned)
+                call(
+                    gateway,
+                    tina::ServiceMessage::Request(QuoteRequest::GetQuote),
+                    CALL_TIMEOUT,
+                )
+                .then(QuoteClientMsg::Returned)
             }
             QuoteClientMsg::Returned(CallOutcome::Replied(reply)) => {
                 self.replies.borrow_mut().push(reply);
@@ -392,10 +401,14 @@ pub enum BatchReply {
 }
 
 #[derive(Debug)]
-enum BatcherMsg {
-    Submit(u64),
+enum BatcherEvent {
     Drain,
     Flush(SleepReply),
+}
+
+#[derive(Debug)]
+enum BatcherRequest {
+    Submit(u64),
 }
 
 #[derive(Debug)]
@@ -409,30 +422,21 @@ struct Batcher {
     window: Duration,
 }
 
-impl Isolate for Batcher {
-    type Message = BatcherMsg;
-    type Reply = BatchReply;
-    type Send = tina::Outbound<std::convert::Infallible>;
-    type Fact = std::convert::Infallible;
-    type Spawn = std::convert::Infallible;
-    type SpawnObserved = std::convert::Infallible;
-    type Io = RuntimeCall<BatcherMsg>;
-    type Shard = SingleShard;
-
-    fn handle(
+#[tina_runtime::isolate(event = BatcherEvent, request = BatcherRequest, reply = BatchReply)]
+impl Batcher {
+    fn handle_event(
         &mut self,
-        msg: Self::Message,
-        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+        event: BatcherEvent,
+        _ctx: &mut Context<'_, SingleShard, Self::Reply>,
     ) -> Effect<Self> {
-        match msg {
-            BatcherMsg::Submit(_) => noop(),
-            BatcherMsg::Drain => {
+        match event {
+            BatcherEvent::Drain => {
                 self.closed = true;
                 self.timer_armed = false;
                 self.values.clear();
                 self.pending.drain_replies_into_effect(BatchReply::Closed)
             }
-            BatcherMsg::Flush(Ok(())) => {
+            BatcherEvent::Flush(Ok(())) => {
                 self.timer_armed = false;
                 let size = self.values.len();
                 let sum = self.values.iter().map(|(_, value)| *value).sum();
@@ -446,44 +450,42 @@ impl Isolate for Batcher {
                         sum,
                     })
             }
-            BatcherMsg::Flush(Err(_)) => self.pending.drain_replies_into_effect(BatchReply::Full),
+            BatcherEvent::Flush(Err(_)) => self.pending.drain_replies_into_effect(BatchReply::Full),
         }
     }
 
-    fn handle_call(&mut self, msg: Self::Message, call: CallContext<'_, Self>) -> Effect<Self> {
-        match msg {
-            BatcherMsg::Submit(value) => {
+    fn handle_request(
+        &mut self,
+        request: BatcherRequest,
+        call: RequestCall<'_, Self>,
+    ) -> RequestEffect<Self> {
+        match request {
+            BatcherRequest::Submit(value) => {
                 if self.closed {
                     return call.reply(BatchReply::Closed);
                 }
                 let qid = self.next_qid;
                 let next_qid = qid + 1;
-                match self.pending.park_call(qid, call) {
-                    Ok(_ticket) => {
+                match self.pending.park_request(qid, call) {
+                    Ok(ticket) => {
                         self.next_qid = next_qid;
                         self.values.push((qid, value));
-                        if self.timer_armed {
+                        let effect = if self.timer_armed {
                             noop()
                         } else {
                             self.timer_armed = true;
-                            sleep(self.window).then(BatcherMsg::Flush)
-                        }
+                            sleep(self.window).then(|result| {
+                                tina::ServiceMessage::Event(BatcherEvent::Flush(result))
+                            })
+                        };
+                        request_effect_after_park(&ticket, effect)
                     }
-                    Err(tina_runtime::ParkCallError::Full { call, .. }) => {
-                        call.reply(BatchReply::Full)
-                    }
-                    Err(tina_runtime::ParkCallError::DuplicateKey { call, .. }) => {
+                    Err(tina_runtime::ParkError::Full { call, .. }) => call.reply(BatchReply::Full),
+                    Err(tina_runtime::ParkError::DuplicateKey { call, .. }) => {
                         // qid is monotonic so duplicate is unreachable.
                         call.reject(tina::CallRejectedReason::UnsupportedMessage)
                     }
-                    Err(tina_runtime::ParkCallError::NoCaller { call, .. })
-                    | Err(tina_runtime::ParkCallError::CrossShardUnsupported { call, .. }) => {
-                        call.reject(tina::CallRejectedReason::UnsupportedMessage)
-                    }
                 }
-            }
-            BatcherMsg::Drain | BatcherMsg::Flush(_) => {
-                call.reject(tina::CallRejectedReason::UnsupportedMessage)
             }
         }
     }
@@ -491,7 +493,7 @@ impl Isolate for Batcher {
 
 #[derive(Debug)]
 enum BatchClientMsg {
-    Begin(Address<BatcherMsg, BatchReply>),
+    Begin(Address<tina::ServiceMessage<BatcherEvent, BatcherRequest>, BatchReply>),
     Returned(CallOutcome<BatchReply>),
 }
 
@@ -506,7 +508,7 @@ impl Isolate for BatchClient {
     type Message = BatchClientMsg;
     type Reply = ();
     type Fact = std::convert::Infallible;
-    type Send = tina::Outbound<BatcherMsg>;
+    type Send = tina::Outbound<tina::ServiceMessage<BatcherEvent, BatcherRequest>>;
     type Spawn = std::convert::Infallible;
     type SpawnObserved = std::convert::Infallible;
     type Io = RuntimeCall<BatchClientMsg>;
@@ -524,12 +526,16 @@ impl Isolate for BatchClient {
                     .iter()
                     .copied()
                     .map(|value| {
-                        call(batcher, BatcherMsg::Submit(value), CALL_TIMEOUT)
-                            .then(BatchClientMsg::Returned)
+                        call(
+                            batcher,
+                            tina::ServiceMessage::Request(BatcherRequest::Submit(value)),
+                            CALL_TIMEOUT,
+                        )
+                        .then(BatchClientMsg::Returned)
                     })
                     .collect();
                 if self.drain_after_submit {
-                    calls.push(send(batcher, BatcherMsg::Drain));
+                    calls.push(send(batcher, tina::ServiceMessage::Event(BatcherEvent::Drain)));
                 }
                 Effect::Batch(calls)
             }
@@ -662,9 +668,13 @@ pub enum CacheReply {
 struct FillReply(u64);
 
 #[derive(Debug)]
-enum UpstreamMsg {
-    Fetch,
+enum UpstreamEvent {
     Done(RequestContext<FillReply>, SleepReply),
+}
+
+#[derive(Debug)]
+enum UpstreamRequest {
+    Fetch,
 }
 
 #[derive(Debug)]
@@ -674,43 +684,43 @@ struct Upstream {
     calls: Rc<RefCell<usize>>,
 }
 
-impl Isolate for Upstream {
-    type Message = UpstreamMsg;
-    type Fact = std::convert::Infallible;
-    type Reply = FillReply;
-    type Send = tina::Outbound<std::convert::Infallible>;
-    type Spawn = std::convert::Infallible;
-    type SpawnObserved = std::convert::Infallible;
-    type Io = RuntimeCall<UpstreamMsg>;
-    type Shard = SingleShard;
-
-    fn handle(
+#[tina_runtime::isolate(event = UpstreamEvent, request = UpstreamRequest, reply = FillReply)]
+impl Upstream {
+    fn handle_event(
         &mut self,
-        msg: Self::Message,
-        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+        event: UpstreamEvent,
+        _ctx: &mut Context<'_, SingleShard, Self::Reply>,
     ) -> Effect<Self> {
-        match msg {
-            UpstreamMsg::Fetch => noop(),
-            UpstreamMsg::Done(req, Ok(())) => reply_to(req, FillReply(self.value)),
-            UpstreamMsg::Done(_, Err(_)) => noop(),
+        match event {
+            UpstreamEvent::Done(req, Ok(())) => reply_to(req, FillReply(self.value)),
+            UpstreamEvent::Done(_, Err(_)) => noop(),
         }
     }
 
-    fn handle_call(&mut self, msg: Self::Message, call: CallContext<'_, Self>) -> Effect<Self> {
-        match msg {
-            UpstreamMsg::Fetch => {
+    fn handle_request(
+        &mut self,
+        request: UpstreamRequest,
+        call: RequestCall<'_, Self>,
+    ) -> RequestEffect<Self> {
+        match request {
+            UpstreamRequest::Fetch => {
                 *self.calls.borrow_mut() += 1;
-                call.defer(sleep(self.delay)).reply(UpstreamMsg::Done)
+                call.defer(sleep(self.delay)).reply(|req, result| {
+                    tina::ServiceMessage::Event(UpstreamEvent::Done(req, result))
+                })
             }
-            UpstreamMsg::Done(_, _) => call.reject(tina::CallRejectedReason::UnsupportedMessage),
         }
     }
 }
 
 #[derive(Debug)]
-enum CacheMsg {
-    Get(&'static str),
+enum CacheEvent {
     FillReturned(CallOutcome<FillReply>),
+}
+
+#[derive(Debug)]
+enum CacheRequest {
+    Get(&'static str),
 }
 
 #[derive(Debug)]
@@ -719,27 +729,18 @@ struct Cache {
     cached: Option<u64>,
     filling: bool,
     waiters: SharedWork<&'static str, CacheReply>,
-    upstream: Address<UpstreamMsg, FillReply>,
+    upstream: Address<tina::ServiceMessage<UpstreamEvent, UpstreamRequest>, FillReply>,
 }
 
-impl Isolate for Cache {
-    type Fact = std::convert::Infallible;
-    type Message = CacheMsg;
-    type Reply = CacheReply;
-    type Send = tina::Outbound<std::convert::Infallible>;
-    type Spawn = std::convert::Infallible;
-    type SpawnObserved = std::convert::Infallible;
-    type Io = RuntimeCall<CacheMsg>;
-    type Shard = SingleShard;
-
-    fn handle(
+#[tina_runtime::isolate(event = CacheEvent, request = CacheRequest, reply = CacheReply)]
+impl Cache {
+    fn handle_event(
         &mut self,
-        msg: Self::Message,
-        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+        event: CacheEvent,
+        _ctx: &mut Context<'_, SingleShard, Self::Reply>,
     ) -> Effect<Self> {
-        match msg {
-            CacheMsg::Get(_) => noop(),
-            CacheMsg::FillReturned(CallOutcome::Replied(FillReply(value))) => {
+        match event {
+            CacheEvent::FillReturned(CallOutcome::Replied(FillReply(value))) => {
                 self.filling = false;
                 self.cached = Some(value);
                 Effect::Batch(
@@ -747,7 +748,7 @@ impl Isolate for Cache {
                         .reply_all_with::<Self, _>(&self.key, || CacheReply::Hit(value)),
                 )
             }
-            CacheMsg::FillReturned(_) => {
+            CacheEvent::FillReturned(_) => {
                 self.filling = false;
                 Effect::Batch(
                     self.waiters
@@ -757,36 +758,37 @@ impl Isolate for Cache {
         }
     }
 
-    fn handle_call(&mut self, msg: Self::Message, call_ctx: CallContext<'_, Self>) -> Effect<Self> {
-        match msg {
-            CacheMsg::Get(key) if key != self.key => call_ctx.reply(CacheReply::Full),
-            CacheMsg::Get(_) => {
+    fn handle_request(
+        &mut self,
+        request: CacheRequest,
+        call_ctx: RequestCall<'_, Self>,
+    ) -> RequestEffect<Self> {
+        match request {
+            CacheRequest::Get(key) if key != self.key => call_ctx.reply(CacheReply::Full),
+            CacheRequest::Get(_) => {
                 if let Some(value) = self.cached {
                     return call_ctx.reply(CacheReply::Hit(value));
                 }
-                match self.waiters.wait_call(self.key, call_ctx) {
+                match self.waiters.wait(self.key, call_ctx) {
                     Ok(ticket) => {
                         if self.filling {
-                            request_effect_after_shared_wait(&ticket, noop()).into_effect()
+                            request_effect_after_shared_wait(&ticket, noop())
                         } else {
                             self.filling = true;
-                            let effect = call(self.upstream, UpstreamMsg::Fetch, CALL_TIMEOUT)
-                                .then(CacheMsg::FillReturned);
-                            request_effect_after_shared_wait(&ticket, effect).into_effect()
+                            let effect = call(
+                                self.upstream,
+                                tina::ServiceMessage::Request(UpstreamRequest::Fetch),
+                                CALL_TIMEOUT,
+                            )
+                            .then(|outcome| {
+                                tina::ServiceMessage::Event(CacheEvent::FillReturned(outcome))
+                            });
+                            request_effect_after_shared_wait(&ticket, effect)
                         }
                     }
-                    Err(SharedWorkCallError::Full { call, .. })
-                    | Err(SharedWorkCallError::KeyFull { call, .. }) => {
-                        call.reply(CacheReply::Full)
-                    }
-                    Err(SharedWorkCallError::NoCaller { call, .. })
-                    | Err(SharedWorkCallError::CrossShardUnsupported { call, .. }) => {
-                        call.reject(tina::CallRejectedReason::UnsupportedMessage)
-                    }
+                    Err(SharedWorkError::Full { call, .. })
+                    | Err(SharedWorkError::KeyFull { call, .. }) => call.reply(CacheReply::Full),
                 }
-            }
-            CacheMsg::FillReturned(_) => {
-                call_ctx.reject(tina::CallRejectedReason::UnsupportedMessage)
             }
         }
     }
@@ -794,7 +796,7 @@ impl Isolate for Cache {
 
 #[derive(Debug)]
 enum CacheClientMsg {
-    Begin(Address<CacheMsg, CacheReply>),
+    Begin(Address<tina::ServiceMessage<CacheEvent, CacheRequest>, CacheReply>),
     Returned(CallOutcome<CacheReply>),
 }
 
@@ -823,8 +825,12 @@ impl Isolate for CacheClient {
             CacheClientMsg::Begin(cache) => {
                 let calls = (0..self.callers)
                     .map(|_| {
-                        call(cache, CacheMsg::Get("price:alpaca"), CALL_TIMEOUT)
-                            .then(CacheClientMsg::Returned)
+                        call(
+                            cache,
+                            tina::ServiceMessage::Request(CacheRequest::Get("price:alpaca")),
+                            CALL_TIMEOUT,
+                        )
+                        .then(CacheClientMsg::Returned)
                     })
                     .collect();
                 Effect::Batch(calls)

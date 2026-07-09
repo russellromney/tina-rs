@@ -19,6 +19,14 @@
 //!   the cancel continuation.
 //! - `spawn_observed(ChildDefinition::new(...))` for typed child refs.
 //! - Runtime-owned `sleep` as the worker's only async surface.
+//! - The `Worker` isolate uses the `event = .. request = ..` split-service
+//!   macro form: `WorkerEvent` (`Cancel`, `Wake`) is fire-and-forget,
+//!   `WorkerRequest` (`Process`) is the one caller-authority message. The
+//!   macro generates both rejection arms, so neither `handle_event` nor
+//!   `handle_request` writes one by hand.
+//! - `register_with_capacity_and_bootstrap` registers the `Queue` isolate
+//!   with its startup `Bootstrap` message prefilled atomically, instead of
+//!   a separate post-register `try_send`.
 
 use std::sync::{Arc, Barrier, Mutex};
 use std::thread;
@@ -130,14 +138,25 @@ pub enum WorkerReply {
     Cancelled,
 }
 
-/// Messages a worker accepts.
+/// Fire-and-forget facts a worker accepts: cancel-while-running and the
+/// runtime-owned sleep wake-up. Neither carries caller authority.
 #[derive(Debug, Clone)]
-pub enum WorkerMsg {
-    Process { id: JobId, payload: Payload, sleep_ms: u64 },
+pub enum WorkerEvent {
     Cancel(JobId),
     /// Internal: the runtime-owned sleep finished.
     Wake { id: JobId, result: SleepReply },
 }
+
+/// The one caller-authority request a worker accepts.
+#[derive(Debug, Clone)]
+pub enum WorkerRequest {
+    Process { id: JobId, payload: Payload, sleep_ms: u64 },
+}
+
+/// Split-service envelope for [`Worker`]. The `event = .. request = ..`
+/// isolate macro form generates the caller-authority rejection arms, so
+/// neither `handle_event` nor `handle_request` writes one by hand.
+type WorkerMsg = tina::ServiceMessage<WorkerEvent, WorkerRequest>;
 
 // ---------- Worker isolate ----------
 
@@ -152,12 +171,15 @@ struct WorkerCurrent {
     slot: tina::DeferredReply<WorkerReply>,
 }
 
-#[tina_runtime::isolate(message = WorkerMsg, reply = WorkerReply)]
+#[tina_runtime::isolate(event = WorkerEvent, request = WorkerRequest, reply = WorkerReply)]
 impl Worker {
-    fn handle(&mut self, msg: WorkerMsg, _ctx: &mut Context<'_, SingleShard, Self::Reply>) -> Effect<Self> {
-        match msg {
-            WorkerMsg::Process { .. } => noop(),
-            WorkerMsg::Cancel(id) => {
+    fn handle_event(
+        &mut self,
+        event: WorkerEvent,
+        _ctx: &mut Context<'_, SingleShard, Self::Reply>,
+    ) -> Effect<Self> {
+        match event {
+            WorkerEvent::Cancel(id) => {
                 if let Some(current) = self.current.as_mut() {
                     if current.id == id {
                         current.cancelled = true;
@@ -165,7 +187,7 @@ impl Worker {
                 }
                 noop()
             }
-            WorkerMsg::Wake { id, result: _ } => {
+            WorkerEvent::Wake { id, result: _ } => {
                 let Some(current) = self.current.take() else { return noop(); };
                 if current.id != id {
                     return noop();
@@ -183,19 +205,23 @@ impl Worker {
         }
     }
 
-    fn handle_call(&mut self, msg: WorkerMsg, call: CallContext<'_, Self>) -> Effect<Self> {
-        match msg {
-            WorkerMsg::Process { id, payload, sleep_ms } => {
+    fn handle_request(
+        &mut self,
+        request: WorkerRequest,
+        call: RequestCall<'_, Self>,
+    ) -> RequestEffect<Self> {
+        match request {
+            WorkerRequest::Process { id, payload, sleep_ms } => {
                 if self.current.is_some() {
                     return call.reject(tina::CallRejectedReason::ReplyAbandoned);
                 }
-                let slot = call.into_request_context().into_deferred();
-                self.current = Some(WorkerCurrent { id, payload, cancelled: false, slot });
-                sleep(Duration::from_millis(sleep_ms))
-                    .then(move |result| WorkerMsg::Wake { id, result })
-            }
-            WorkerMsg::Cancel(_) | WorkerMsg::Wake { .. } => {
-                call.reject(tina::CallRejectedReason::UnsupportedMessage)
+                call.capture(move |req| {
+                    let slot = req.into_deferred();
+                    self.current = Some(WorkerCurrent { id, payload, cancelled: false, slot });
+                    sleep(Duration::from_millis(sleep_ms)).then(move |result| {
+                        tina::ServiceMessage::Event(WorkerEvent::Wake { id, result })
+                    })
+                })
             }
         }
     }
@@ -204,8 +230,6 @@ impl Worker {
 // ---------- Queue isolate ----------
 
 struct Queue {
-    #[allow(dead_code)]
-    self_addr: Address<QueueMsg, QueueReply>,
     config: RunConfig,
     pending: PendingCancelableCallSet<JobId, QueueReply, WorkerReply>,
     workers: Vec<Option<Address<WorkerMsg, WorkerReply>>>,
@@ -255,9 +279,8 @@ impl Queue {
 }
 
 impl Queue {
-    fn new(self_addr: Address<QueueMsg, QueueReply>, config: RunConfig, ready: Arc<ReadyGate>) -> Self {
+    fn new(config: RunConfig, ready: Arc<ReadyGate>) -> Self {
         Self {
-            self_addr,
             config,
             pending: PendingCancelableCallSet::with_capacity(config.workers.max(1)),
             workers: vec![None; config.workers],
@@ -333,7 +356,7 @@ impl Queue {
         let admission = call
             .defer_cancelable(call_cancelable(
                 worker,
-                WorkerMsg::Process { id, payload, sleep_ms },
+                WorkerMsg::Request(WorkerRequest::Process { id, payload, sleep_ms }),
                 dispatch_timeout,
             ))
             .try_admit(
@@ -413,7 +436,7 @@ impl Queue {
             // Wake the worker early so it stops sleeping; the worker's reply
             // will be rejected by the runtime since `cancel_call` already
             // closed our wait. This send is opportunistic.
-            effects.push(send::<Self, _, _>(addr, WorkerMsg::Cancel(id)));
+            effects.push(send::<Self, _, _>(addr, WorkerMsg::Event(WorkerEvent::Cancel(id))));
         }
         batch(effects)
     }
@@ -698,17 +721,14 @@ fn register_queue(
     config: RunConfig,
 ) -> anyhow::Result<Address<QueueMsg, QueueReply>> {
     let ready = Arc::new(ReadyGate::default());
-    let ready_for_isolate = Arc::clone(&ready);
 
     let address = runtime
-        .register_with_capacity_using::<_, WorkerMsg, _>(config.queue_mailbox, move |self_addr| {
-            Queue::new(self_addr, config, ready_for_isolate)
-        })
+        .register_with_capacity_and_bootstrap::<Queue, WorkerMsg>(
+            Queue::new(config, Arc::clone(&ready)),
+            config.queue_mailbox,
+            QueueMsg::Bootstrap,
+        )
         .map_err(|e| anyhow::anyhow!("register queue: {e:?}"))?;
-
-    runtime
-        .try_send(address, QueueMsg::Bootstrap)
-        .map_err(|e| anyhow::anyhow!("send bootstrap: {e:?}"))?;
 
     wait_until(Duration::from_secs(2), "all workers ready", || ready.ready())?;
     Ok(address)

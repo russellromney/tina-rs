@@ -33,6 +33,9 @@ cargo test --manifest-path examples/systems/system_session_auth/Cargo.toml
   surfaces as `ThreadedRuntimeError::CommandFull`, not a hang.
 - Runtime-owned `sleep_then` for the recurring sweep tick.
 - `CallContext` for caller authority on every public op.
+- `register_with_capacity_and_bootstrap_on` to register each shard's
+  bucket with its startup `Bootstrap` message prefilled atomically,
+  instead of a separate post-register `try_send`.
 
 ## Findings
 
@@ -44,22 +47,16 @@ What felt good:
   on each address. The reply type carries one shard's slice; the host
   sums into the final `SessionStats`.
 - No `Arc::try_unwrap(runtime)` shutdown dance.
+- `register_with_capacity_and_bootstrap_on` removed the
+  register-then-remember-to-send-Bootstrap footgun this README used to
+  flag — one call now does both atomically, with a typed error if the
+  prefill is rejected.
 
 What felt rough:
-- Bootstrap is still a public message variant the host has to
-  remember to `try_send` after `register_with_capacity_on` for each
-  shard. A `register_with_bootstrap_message` or `on_start` hook would
-  remove a footgun.
 - The sweep handler walks the local bucket each tick; the timer is
   re-armed after the handler returns, so a long handler skews the
   next tick. Fine for sessions, would matter for sub-millisecond
   cadence.
-
-## Suggested follow-up
-
-- Consider an `on_start` hook on `register` so isolates with a
-  startup effect (timer, supervisor spawn) do not depend on the host
-  remembering to send one message after register.
 
 Verdict:
 - keep
