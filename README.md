@@ -199,9 +199,10 @@ typed program facts instead of out-of-band conventions.
 
 Tina is not optimized for the shortest happy-path handler.
 
-* Linear request code is often more verbose than `async fn`.
+* Linear request code is often more verbose than `async fn`, though
+  `tina::flow!` closes most of that gap for multi-step requests.
 * Multi-turn workflows add message variants; the suspension points are named,
-  not hidden.
+  not hidden. `flow!` writes the variants and dispatcher — the names stay.
 * Capacity must be chosen and reported. There is no secret unbounded escape
   hatch.
 * Async ecosystem crates usually enter through explicit bridges, not arbitrary
@@ -282,6 +283,56 @@ visible.
 
 That matters for humans, and it matters for LLMs. Copyable local patterns are
 safer than APIs whose important rules live outside the call site.
+
+### Multi-step flows
+
+A multi-step request handler used to mean a hand-rolled continuation enum, a
+match arm per stage, and a keyed pending-reply table. `tina::flow!` generates
+the enum and its dispatcher. The suspension points stay named and the failure
+policy stays in the code you read:
+
+```rust
+tina::flow! {
+    flow PipelineFlow for Pipeline {
+        reply PipelineReply;
+
+        // Stage 1 returned. Continue to validate, or reply now.
+        step Parsed() -> ParseReply {
+            match outcome {
+                CallOutcome::Replied(ParseReply::Ok(v)) => {
+                    call(self.validate, ValidateInput(v), STAGE_TIMEOUT)
+                        .then_with_request(req, |req, outcome| {
+                            tina::ServiceMessage::Event(PipelineEvent::Stage(
+                                PipelineFlow::Validated(req, outcome),
+                            ))
+                        })
+                }
+                CallOutcome::Replied(ParseReply::Failed) => {
+                    reply_to(req, PipelineReply::ParseFailed)
+                }
+                _ => reply_to(req, PipelineReply::Failed),
+            }
+        }
+
+        step Validated() -> ValidateReply {
+            // same shape: continue to the next call, or reply
+            # /* elided */ reply_to(req, PipelineReply::Completed)
+        }
+    }
+}
+```
+
+The caller's `RequestContext` threads through each step as `req`, so answering
+the caller late needs no correlation table. Steps that continue from a non-call
+wake-up (a `sleep(..).then(..)` timer, for example) use `-> raw T` instead of a
+call outcome. See
+[continuation flows](docs/tina-user-guide/29-continuation-flows.md).
+
+Other blessed helpers follow the same visibility rule:
+`register_with_capacity_and_bootstrap` seeds an isolate with a guaranteed-first
+message; `CallJoinSet` / `CallSelectSet` handle join-all and select-next races,
+with an opt-in business-success classifier for "a reply only wins if the
+predicate accepts it."
 
 ### Cancelable deferred calls
 
