@@ -379,6 +379,26 @@ impl IOSocket for DarwinSocket {
         Ok(())
     }
 
+    fn local_addr(&self) -> io::Result<SocketAddr> {
+        let fd = self
+            .fd
+            .borrow()
+            .as_ref()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "socket is closed"))?
+            .raw();
+        socket_addr_from_fd(fd, libc::getsockname)
+    }
+
+    fn peer_addr(&self) -> io::Result<SocketAddr> {
+        let fd = self
+            .fd
+            .borrow()
+            .as_ref()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "socket is closed"))?
+            .raw();
+        socket_addr_from_fd(fd, libc::getpeername)
+    }
+
     fn accept(&self, c: &mut AcceptCompletion) -> io::Result<()> {
         let fd = match &*self.kind.borrow() {
             Some(SocketKind::Listener) => self
@@ -1226,6 +1246,53 @@ fn unlink_if_socket(path: &Path) {
         unsafe {
             libc::unlink(cpath.as_ptr());
         }
+    }
+}
+
+fn socket_addr_from_fd(
+    fd: RawFd,
+    query: unsafe extern "C" fn(RawFd, *mut libc::sockaddr, *mut libc::socklen_t) -> libc::c_int,
+) -> io::Result<SocketAddr> {
+    let mut storage = unsafe { mem::zeroed::<libc::sockaddr_storage>() };
+    let mut len = mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+    let rc = unsafe {
+        query(
+            fd,
+            (&mut storage as *mut libc::sockaddr_storage).cast(),
+            &mut len,
+        )
+    };
+    if rc < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    raw_to_socket_addr(&storage)
+}
+
+fn raw_to_socket_addr(storage: &libc::sockaddr_storage) -> io::Result<SocketAddr> {
+    match storage.ss_family as libc::c_int {
+        libc::AF_INET => {
+            let sockaddr =
+                unsafe { *(storage as *const libc::sockaddr_storage).cast::<libc::sockaddr_in>() };
+            Ok(SocketAddr::from((
+                std::net::Ipv4Addr::from(u32::from_be(sockaddr.sin_addr.s_addr)),
+                u16::from_be(sockaddr.sin_port),
+            )))
+        }
+        libc::AF_INET6 => {
+            let sockaddr =
+                unsafe { *(storage as *const libc::sockaddr_storage).cast::<libc::sockaddr_in6>() };
+            Ok(std::net::SocketAddrV6::new(
+                std::net::Ipv6Addr::from(sockaddr.sin6_addr.s6_addr),
+                u16::from_be(sockaddr.sin6_port),
+                sockaddr.sin6_flowinfo,
+                sockaddr.sin6_scope_id,
+            )
+            .into())
+        }
+        family => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("unsupported sockaddr family {family}"),
+        )),
     }
 }
 

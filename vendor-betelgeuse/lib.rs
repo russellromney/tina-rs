@@ -157,6 +157,12 @@ pub trait IOSocket {
     /// Connects this socket to a Unix-domain `path`.
     fn connect_unix(&self, c: &mut ConnectCompletion, path: &Path) -> stdio::Result<()>;
 
+    /// Returns the socket's local address.
+    fn local_addr(&self) -> stdio::Result<SocketAddr>;
+
+    /// Returns the socket's peer address.
+    fn peer_addr(&self) -> stdio::Result<SocketAddr>;
+
     /// Accepts one inbound connection on a listening socket.
     fn accept(&self, c: &mut AcceptCompletion) -> stdio::Result<()>;
 
