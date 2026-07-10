@@ -87,7 +87,6 @@ impl Isolate for KeyspaceServer {
                     let received_frames = &self.received_frames;
                     let status = decode_chunk(&mut self.framer, &bytes, |frame| {
                         received_frames.lock().unwrap().push(frame.clone());
-                        // Echo back with `ack:` prefix.
                         let mut payload = b"ack:".to_vec();
                         payload.extend_from_slice(&frame);
                         let _ = encode_into(LengthPrefix::U16, &payload, &mut response_buf);
@@ -187,13 +186,10 @@ impl Isolate for KeyspaceClient {
                     LoopStep::Pending(effect) => effect,
                     LoopStep::Done(_) => {
                         self.write_all = None;
-                        // Drive a single read for the first batch of
-                        // responses, then close. Closing after one read
-                        // keeps the smoke from deadlocking on a second
-                        // unwakeable read; the server sees EOF and exits
-                        // cleanly, and the test asserts on
-                        // `server_frames` (which the server populates
-                        // synchronously per parsed frame).
+                        // One read, then close. A second parked read never
+                        // wakes and deadlocks the smoke; the server sees EOF
+                        // and exits. Assertions use `server_frames`, filled
+                        // synchronously per parsed frame.
                         unix_read(self.stream.expect("stream"), 256).then(ClientMsg::Read)
                     }
                     LoopStep::Failed(_) => Effect::Stop,

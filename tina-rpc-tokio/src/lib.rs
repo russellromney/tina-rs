@@ -4,9 +4,8 @@
 
 //! Tokio async-bridge for `tina-rpc` clients.
 //!
-//! Edge adapter. Lives outside `tina-rpc` because the plan rule
-//! is loud: "Tokio `async` convenience must live in bridge crates,
-//! not the Tina-native core."
+//! Edge adapter. Lives outside `tina-rpc` so Tokio `async` convenience
+//! stays in bridge crates, not the Tina-native core.
 //!
 //! What ships:
 //!

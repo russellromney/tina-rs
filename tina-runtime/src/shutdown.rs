@@ -5,7 +5,7 @@
 //! lifetime as before; [`ThreadedShutdownHandle`] hands out cloneable
 //! request/wait access without requiring `Arc::try_unwrap(runtime)`.
 //!
-//! Pinned contract (see `.intent/phases/102-host-control-ergonomics/plan.md`):
+//! Pinned contract:
 //!
 //! - [`ThreadedShutdownHandle::request_shutdown`] is idempotent and
 //!   nonblocking; full command queue → [`ShutdownRequestError::CommandFull`].

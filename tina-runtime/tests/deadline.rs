@@ -1,10 +1,9 @@
 //! End-to-end proofs for [`tina::Deadline`] and [`tina::Context::now`]
 //! on the live runtime.
 //!
-//! The plan's clock rule is the load-bearing constraint: a `Deadline`
-//! that secretly used `std::time::Instant::now()` would be silently
-//! wrong under DST/replay. These tests prove that the runtime stamps
-//! `Context::now()` from its `Clock`, that handlers can build a
+//! A `Deadline` that secretly used `std::time::Instant::now()` would be
+//! silently wrong under DST/replay. These tests prove that the runtime
+//! stamps `Context::now()` from its `Clock`, that handlers can build a
 //! `Deadline` from that `now`, and that the budget shrinks honestly
 //! across handler turns separated by real wall time.
 

@@ -720,10 +720,9 @@ fn tina_requester_stops() -> (Vec<&'static str>, bool) {
     sim.try_send(client, ClientMsg::AskThenStop(worker))
         .unwrap();
     sim.run_until_quiescent();
-    // Rock 5: stopping the requester now emits
-    // `CallCancelled { OwnerStopped }`. The worker's late reply hits
-    // `CallReplyRejected { NoPendingCall }` because the pending entry
-    // was already removed by the cancel-on-stop sweep.
+    // Stopping the requester emits `CallCancelled { OwnerStopped }`. The
+    // worker's late reply hits `CallReplyRejected { NoPendingCall }` because
+    // the pending entry was already removed by the cancel-on-stop sweep.
     let cancelled = sim.trace().iter().any(|event| {
         matches!(
             event.kind(),
