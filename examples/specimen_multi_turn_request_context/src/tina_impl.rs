@@ -2,8 +2,8 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::time::Duration;
 
-use tina::{Address, CallContext, Context, Effect, Isolate, RequestContext, noop, reply_to};
-use tina_runtime::{CallOutcome, RuntimeCall, call, sleep};
+use tina::prelude::*;
+use tina_runtime::{CallOutcome, call_request, sleep};
 use tina_sim::{Simulator, SimulatorConfig};
 
 #[derive(Debug, Clone)]
@@ -16,95 +16,99 @@ pub struct RunReport {
     pub replies: Vec<String>,
 }
 
+// --- Probe ---------------------------------------------------------------
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ProbeReply;
 
+/// Caller-authority request: the only thing an outside caller can ask.
 #[derive(Debug)]
-enum ProbeMsg {
+enum ProbeRequest {
     Request,
+}
+
+/// Internal event: sleep finished for a call in flight.
+#[derive(Debug)]
+enum ProbeEvent {
     SleepDone(RequestContext<ProbeReply>),
 }
 
-#[derive(Debug)]
 struct Probe {
     delay_ms: u64,
 }
 
-impl Isolate for Probe {
-    type Message = ProbeMsg;
-    type Reply = ProbeReply;
-    type Send = tina::Outbound<std::convert::Infallible>;
-    type Spawn = std::convert::Infallible;
-    type SpawnObserved = std::convert::Infallible;
-    type Io = RuntimeCall<ProbeMsg>;
-    type Fact = std::convert::Infallible;
-    type Shard = tina::SingleShard;
-
-    fn handle(
+#[tina_runtime::isolate(event = ProbeEvent, request = ProbeRequest, reply = ProbeReply)]
+impl Probe {
+    fn handle_event(
         &mut self,
-        msg: Self::Message,
-        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+        event: ProbeEvent,
+        _ctx: &mut Context<'_, SingleShard, Self::Reply>,
     ) -> Effect<Self> {
-        match msg {
-            ProbeMsg::Request => noop(),
-            ProbeMsg::SleepDone(req) => reply_to(req, ProbeReply),
+        match event {
+            ProbeEvent::SleepDone(req) => reply_to(req, ProbeReply),
         }
     }
 
-    fn handle_call(&mut self, msg: Self::Message, call: CallContext<'_, Self>) -> Effect<Self> {
-        match msg {
-            ProbeMsg::Request => call
+    fn handle_request(
+        &mut self,
+        request: ProbeRequest,
+        call: RequestCall<'_, Self>,
+    ) -> RequestEffect<Self> {
+        match request {
+            ProbeRequest::Request => call
                 .defer(sleep(Duration::from_millis(self.delay_ms)))
-                .reply(|req, _| ProbeMsg::SleepDone(req)),
-            ProbeMsg::SleepDone(_) => call.reject(tina::CallRejectedReason::UnsupportedMessage),
+                .reply(|req, _| tina::ServiceMessage::Event(ProbeEvent::SleepDone(req))),
         }
     }
 }
+
+// --- Db ------------------------------------------------------------------
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct DbReply;
 
+/// Caller-authority request: the only thing an outside caller can ask.
 #[derive(Debug)]
-enum DbMsg {
+enum DbRequest {
     Request,
+}
+
+/// Internal event: sleep finished for a call in flight.
+#[derive(Debug)]
+enum DbEvent {
     SleepDone(RequestContext<DbReply>),
 }
 
-#[derive(Debug)]
 struct Db {
     delay_ms: u64,
 }
 
-impl Isolate for Db {
-    type Message = DbMsg;
-    type Reply = DbReply;
-    type Send = tina::Outbound<std::convert::Infallible>;
-    type Spawn = std::convert::Infallible;
-    type SpawnObserved = std::convert::Infallible;
-    type Io = RuntimeCall<DbMsg>;
-    type Fact = std::convert::Infallible;
-    type Shard = tina::SingleShard;
-
-    fn handle(
+#[tina_runtime::isolate(event = DbEvent, request = DbRequest, reply = DbReply)]
+impl Db {
+    fn handle_event(
         &mut self,
-        msg: Self::Message,
-        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+        event: DbEvent,
+        _ctx: &mut Context<'_, SingleShard, Self::Reply>,
     ) -> Effect<Self> {
-        match msg {
-            DbMsg::Request => noop(),
-            DbMsg::SleepDone(req) => reply_to(req, DbReply),
+        match event {
+            DbEvent::SleepDone(req) => reply_to(req, DbReply),
         }
     }
 
-    fn handle_call(&mut self, msg: Self::Message, call: CallContext<'_, Self>) -> Effect<Self> {
-        match msg {
-            DbMsg::Request => call
+    fn handle_request(
+        &mut self,
+        request: DbRequest,
+        call: RequestCall<'_, Self>,
+    ) -> RequestEffect<Self> {
+        match request {
+            DbRequest::Request => call
                 .defer(sleep(Duration::from_millis(self.delay_ms)))
-                .reply(|req, _| DbMsg::SleepDone(req)),
-            DbMsg::SleepDone(_) => call.reject(tina::CallRejectedReason::UnsupportedMessage),
+                .reply(|req, _| tina::ServiceMessage::Event(DbEvent::SleepDone(req))),
         }
     }
 }
+
+// --- Service -------------------------------------------------------------
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ServiceReply {
@@ -112,9 +116,15 @@ enum ServiceReply {
     NotReady,
 }
 
+/// Caller-authority request: the only thing an outside caller can ask.
 #[derive(Debug)]
-enum ServiceMsg {
+enum ServiceRequest {
     Start,
+}
+
+/// Internal event: readiness-flow continuation, never caller authority.
+#[derive(Debug)]
+enum ServiceEvent {
     Readiness(ReadinessFlow),
 }
 
@@ -128,10 +138,16 @@ tina::flow! {
 
         step Probed() -> ProbeReply {
             match outcome {
-                CallOutcome::Replied(_) => call(self.db, DbMsg::Request, Duration::from_millis(50))
-                    .then_with_request(req, |req, outcome| {
-                        ServiceMsg::Readiness(ReadinessFlow::Dbed(req, outcome))
-                    }),
+                CallOutcome::Replied(_) => call_request(
+                    self.db,
+                    DbRequest::Request,
+                    Duration::from_millis(50),
+                )
+                .then_with_request(req, |req, outcome| {
+                    tina::ServiceMessage::Event(ServiceEvent::Readiness(ReadinessFlow::Dbed(
+                        req, outcome,
+                    )))
+                }),
                 _ => reply_to(req, ServiceReply::NotReady),
             }
         }
@@ -145,8 +161,8 @@ tina::flow! {
     }
 }
 
-// `flow!` does not derive `Debug`; `ServiceMsg` needs it because a peer holds
-// `Address<ServiceMsg, _>` in a `Debug` enum. Print the outcome, skip `req`.
+// `flow!` does not derive `Debug`; `ServiceEvent` needs it because a peer holds
+// the service address in a `Debug` enum. Print the outcome, skip `req`.
 impl std::fmt::Debug for ReadinessFlow {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -156,81 +172,67 @@ impl std::fmt::Debug for ReadinessFlow {
     }
 }
 
-#[derive(Debug)]
 struct Service {
-    probe: Address<ProbeMsg, ProbeReply>,
-    db: Address<DbMsg, DbReply>,
+    probe: tina::ServiceRequestAddress<ProbeEvent, ProbeRequest, ProbeReply>,
+    db: tina::ServiceRequestAddress<DbEvent, DbRequest, DbReply>,
 }
 
-impl Isolate for Service {
-    type Message = ServiceMsg;
-    type Reply = ServiceReply;
-    type Send = tina::Outbound<std::convert::Infallible>;
-    type Spawn = std::convert::Infallible;
-    type SpawnObserved = std::convert::Infallible;
-    type Io = RuntimeCall<ServiceMsg>;
-    type Fact = std::convert::Infallible;
-    type Shard = tina::SingleShard;
-
-    fn handle(
+#[tina_runtime::isolate(event = ServiceEvent, request = ServiceRequest, reply = ServiceReply)]
+impl Service {
+    fn handle_event(
         &mut self,
-        msg: Self::Message,
-        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+        event: ServiceEvent,
+        _ctx: &mut Context<'_, SingleShard, Self::Reply>,
     ) -> Effect<Self> {
-        match msg {
-            ServiceMsg::Start => noop(),
-            ServiceMsg::Readiness(flow) => self.handle_readiness_flow(flow),
+        match event {
+            ServiceEvent::Readiness(flow) => self.handle_readiness_flow(flow),
         }
     }
 
-    fn handle_call(&mut self, msg: Self::Message, call_ctx: CallContext<'_, Self>) -> Effect<Self> {
-        match msg {
-            ServiceMsg::Start => call_ctx
-                .defer(call(
+    fn handle_request(
+        &mut self,
+        request: ServiceRequest,
+        call: RequestCall<'_, Self>,
+    ) -> RequestEffect<Self> {
+        match request {
+            ServiceRequest::Start => call
+                .defer(call_request(
                     self.probe,
-                    ProbeMsg::Request,
+                    ProbeRequest::Request,
                     Duration::from_millis(50),
                 ))
-                .reply(|req, outcome| ServiceMsg::Readiness(ReadinessFlow::Probed(req, outcome))),
-            ServiceMsg::Readiness(_) => {
-                call_ctx.reject(tina::CallRejectedReason::UnsupportedMessage)
-            }
+                .reply(|req, outcome| {
+                    tina::ServiceMessage::Event(ServiceEvent::Readiness(ReadinessFlow::Probed(
+                        req, outcome,
+                    )))
+                }),
         }
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum ClientReply {}
+// --- Client --------------------------------------------------------------
 
 #[derive(Debug)]
 enum ClientMsg {
-    Start(Address<ServiceMsg, ServiceReply>),
+    Start(tina::ServiceRequestAddress<ServiceEvent, ServiceRequest, ServiceReply>),
     Returned(CallOutcome<ServiceReply>),
 }
 
-#[derive(Debug)]
 struct Client {
     replies: Rc<RefCell<Vec<String>>>,
 }
 
-impl Isolate for Client {
-    type Message = ClientMsg;
-    type Reply = ClientReply;
-    type Send = tina::Outbound<std::convert::Infallible>;
-    type Spawn = std::convert::Infallible;
-    type SpawnObserved = std::convert::Infallible;
-    type Io = RuntimeCall<ClientMsg>;
-    type Fact = std::convert::Infallible;
-    type Shard = tina::SingleShard;
-
+#[tina_runtime::isolate(message = ClientMsg)]
+impl Client {
     fn handle(
         &mut self,
-        msg: Self::Message,
-        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+        msg: ClientMsg,
+        _ctx: &mut Context<'_, SingleShard, Self::Reply>,
     ) -> Effect<Self> {
         match msg {
             ClientMsg::Start(svc) => {
-                call(svc, ServiceMsg::Start, Duration::from_millis(100)).then(ClientMsg::Returned)
+                call_request(svc, ServiceRequest::Start, Duration::from_millis(100))
+                    .then(ClientMsg::Returned)
             }
             ClientMsg::Returned(CallOutcome::Replied(ServiceReply::Ready)) => {
                 self.replies.borrow_mut().push(String::from("ready"));
@@ -264,13 +266,21 @@ impl Isolate for Client {
 
 pub fn run(config: RunConfig) -> anyhow::Result<RunReport> {
     let mut sim = Simulator::new(tina::SingleShard, SimulatorConfig::default());
-    let probe = sim.register(Probe {
+    // Simulator has no `register_split_service`; wrap the raw address as
+    // capability-typed request lanes so `call_request` type-checks.
+    let probe = tina_runtime::SplitServiceHandle::from_address(sim.register(Probe {
         delay_ms: config.probe_delay_ms,
-    });
-    let db = sim.register(Db {
+    }))
+    .requests;
+    let db = tina_runtime::SplitServiceHandle::from_address(sim.register(Db {
         delay_ms: config.db_delay_ms,
-    });
-    let service = sim.register(Service { probe, db });
+    }))
+    .requests;
+    let service = tina_runtime::SplitServiceHandle::from_address(sim.register(Service {
+        probe,
+        db,
+    }))
+    .requests;
     let replies = Rc::new(RefCell::new(Vec::new()));
     let client = sim.register(Client {
         replies: Rc::clone(&replies),

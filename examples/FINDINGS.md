@@ -89,6 +89,58 @@ anti-patterns found via grep) but not each individually migrated;
 `examples/extensions/tina-extension-custom-codec` has two raw
 `impl Isolate` blocks a future pass could look at.
 
+### 2026-07-09 Examples Canonicalization Pass (by-hand follow-up)
+
+Hand-read the remaining reject-arm / mixed-lane isolates and migrated
+the ones that still carried finding-25 anti-patterns. Every touched crate
+builds `--tests --offline` and existing smoke tests pass unchanged.
+
+**Canonicalized (split-service + drop hand-written reject arms):**
+
+- `specimen_multi_turn_request_context` — Probe / Db / Service from raw
+  `impl Isolate` + reject arms → `#[tina_runtime::isolate(event=..,
+  request=..)]`; Client → `#[isolate(message=..)]`; call sites use
+  `call_request` / `SplitServiceHandle::from_address` (sim has no
+  `register_split_service`).
+- `specimen_two_stage_pipeline` — Pipeline finishes the earlier `flow!`
+  migration with split form; stage continuations wrap as
+  `ServiceMessage::Event(PipelineEvent::Stage(...))`.
+- `specimen_request_scope_fanout` — Worker `handle`/`handle_call` mix on
+  one `Wake` message → `WorkerRequest::Run` / `WorkerEvent::Wake`.
+- `system_soak_http_db` — Soak `Request`/`Flow` → split; parks via
+  `call.capture` + `insert_deferred_guarded` (same shape as
+  `system_api_gateway_limits`); host uses `register_split_service`.
+- `system_session_auth` — SessionBucket Bootstrap/Sweep events vs
+  Login/Touch/Logout/Stats requests; bootstrap prefill becomes
+  `ServiceMessage::Event(Bootstrap)`.
+- `system_metrics_shipper` — Shipper Tick/FlushDone events vs
+  Submit/Stats/Stop requests; `reply_and` for size-flush + arm-tick.
+- `system_job_queue` — Queue finishes the earlier Worker-only split;
+  Bootstrap/spawn/call-return events vs Submit/Cancel/Stats requests;
+  `register_with_capacity_and_bootstrap` keeps working with the Event
+  envelope.
+- `perf_native` — ChainService Run request / PingReturned event.
+
+**Still deliberately left (reason):**
+
+- `mini_saas_api` NotifySink / Controller — large HTTP ingress surface;
+  Controller carries multi-flow `NotifyFlow` + body/capacity ceremony;
+  split needs a careful `FromHttpRequest` path, not a drive-by rename.
+- `system_scoped_request_tree` — already unblocked by `FromHttpRequest`
+  (PR #277) but the TreeMsg split is a separate re-architecture of the
+  generic `HttpListener<S, TreeMsg>` parameter; not pure example polish.
+- `system_tenant_rate_limiter` — reject arm is for unreachable policy
+  decisions under Shed, not an event/request lane mix.
+- Pure request/reply isolates (`HttpRequest` counters, keyspace stores)
+  and pure fire-and-forget drivers — nothing to split; reject arm is
+  absent by construction.
+- `examples/extensions/tina-extension-custom-codec` — two raw
+  `impl Isolate` blocks that are pure event loops; macro conversion is
+  mechanical, not a lane-correctness fix. Left for a formatting pass.
+- Driver `register` + `try_send(Begin)` sites — host-owned kick messages
+  are not the register-and-bootstrap footgun (finding 24); the service
+  does not always need Bootstrap before other work.
+
 ### 2026-05-23 Status Pass
 
 The recent Wave A / post-122 / Phase 120 work closed a lot of old pain:
