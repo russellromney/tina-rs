@@ -6,6 +6,8 @@
 
 **Intent corpus:** Sampled only where needed for orientation; this review deliberately did not read the full `.intent/` directory.
 
+**Additive code review:** See [`tina-0.1.0-rust-code-review.md`](tina-0.1.0-rust-code-review.md) for a focused pass over literal Rust correctness, ownership, unsafe boundaries, error handling, and API evolution.
+
 ## Executive summary
 
 Tina has a strong and unusually coherent core: request authority is represented in the type system, overload and cancellation remain observable, live and simulated execution share meaningful semantics, and the project tests failure modes that many early runtimes defer indefinitely. The systems examples show that these ideas compose into credible services rather than only toy actors.
