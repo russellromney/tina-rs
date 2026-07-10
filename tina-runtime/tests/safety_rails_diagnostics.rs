@@ -34,6 +34,7 @@ fn diagnostic_phrases_are_pinned() {
     cases.compile_fail("tests/safety_rails_compile_fail/request_permit_fake_caller.rs");
     cases.compile_fail("tests/safety_rails_compile_fail/request_call_fake_context.rs");
     cases.compile_fail("tests/safety_rails_compile_fail/request_permit_forged.rs");
+    cases.compile_fail("tests/safety_rails_compile_fail/request_permit_mint.rs");
     cases.compile_fail("tests/safety_rails_compile_fail/request_permit_clone.rs");
     cases.compile_fail("tests/safety_rails_compile_fail/request_permit_reuse.rs");
     cases.compile_fail("tests/safety_rails_compile_fail/request_permit_cross_isolate.rs");
