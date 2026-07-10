@@ -4,6 +4,43 @@ This file records completed work.
 
 ## Unreleased
 
+### 0.1.0 release-readiness wave (external review P0/P1 fixes)
+
+An external 0.1.0 review found two release blockers and two live-boundedness
+gaps. All four fixed, each behind an independent adversarial review:
+
+- **Publishable crate graph** (#283). Every internal `path` dependency now
+  carries a `version` requirement, publish metadata (description, repository,
+  keywords) is complete workspace-wide, and a `packaging` CI job runs
+  `cargo package --no-verify` on the zero-prerequisite crates so the graph
+  can't silently regress. Publication order documented. Open decisions
+  recorded in the PR: the vendored Betelgeuse dependency gates `tina-runtime`
+  and its dependents, and crates.io already has an unrelated `tina` crate --
+  both resolved by the planned Tinio rename (`tinio-*` package names,
+  `tinio-betelgeuse` for the fork).
+- **Real copied-service path** (#281). `system_copied_service_path` previously
+  built its report from constants without running a service, and its own smoke
+  test failed; it is now one real split-service isolate on a live
+  `ThreadedRuntime` -- bounded admission with typed `Full`, a ledger step, a
+  leak check that reads the scope's actual post-shutdown state. Two
+  fake-coverage companion crates deleted. New `systems-examples` CI job gates
+  the copied path and `mini_saas_api` on every PR, and `make verify-examples`
+  now includes `examples/systems/*`.
+- **Bounded live trace retention** (#282). `ThreadedRuntimeConfig` and
+  `LocalSystemConfig` defaults moved from `TraceRetention::Full` (memory grows
+  with uptime) to `Bounded(16_384)` with honest `trace_dropped` accounting.
+  `Full` stays the explicit choice for tests/sim/replay; streaming capture is
+  unaffected (the trace observer fires before retention). A new test pins the
+  bound under ~20k-event load.
+- **Bounded timer lane** (#284). Driver timers moved from an unbounded `Vec`
+  with a linear min-scan (quadratic under synchronized deadlines) to a
+  `BTreeMap` keyed `(deadline, insertion_order)` -- O(log n) harvest with the
+  same-deadline FIFO tie-break preserved exactly (zero golden/DST changes).
+  Per-shard capacity (default 262,144, configurable, zero rejected) refuses
+  over-cap arms with a typed `CallError::TimerFull`; a per-advance harvest
+  budget (1,024) keeps a synchronized batch from monopolizing a shard without
+  reordering delivery.
+
 ### CI
 
 - Cut `make verify` CI time via layered caching and a faster test runner:
