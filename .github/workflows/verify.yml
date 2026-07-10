@@ -320,27 +320,37 @@ jobs:
   # revisit promoting it to a scheduled job once we see how often examples
   # actually break.
 
-  # Two systems examples ARE a per-PR gate, unlike the sweep above: they are
-  # the two examples the root README and docs point new users at first
-  # (`system_copied_service_path` is the copied-path skeleton; `mini_saas_api`
-  # is the larger HTTP-fronted shape), so a change that breaks what a user
-  # would actually copy must fail CI, not just a local sweep nobody runs.
-  # Found by an external P0 review: `system_copied_service_path` used to
-  # build its report from constants without running an isolate, runtime, or
-  # shutdown at all, and its own smoke test failed
-  # (`assert_no_leaked_capacity_at_shutdown` panicked with `leak=unchecked`)
-  # — nothing in CI ever ran it, so the break shipped silently. Measured
-  # locally: `mini_saas_api`'s full non-ignored suite (smoke, budget,
-  # graceful_drain, scope_drain, soak, perf) finishes in ~4s once warm, so it
-  # rides along here instead of only in the opt-in `proof-soak` /
-  # `proof-long-soak` Makefile targets; `long_soak` stays `#[ignore]`d and
-  # PR-gate-exempt (`make proof-long-soak` remains the way to run it). Both
-  # crates are separate, unlocked cargo workspaces (same convention as the
-  # `verify-examples` sweep above), so this job caches them individually via
-  # `rust-cache`'s multi-workspace `workspaces:` input instead of relying on
-  # the root workspace's cache key.
+  # Systems examples ARE a per-PR gate, unlike the sweep above:
+  # - `system_copied_service_path` / `mini_saas_api`: the two examples the
+  #   root README and docs point new users at first (copied-path skeleton /
+  #   larger HTTP-fronted shape), so a change that breaks what a user would
+  #   actually copy must fail CI, not just a local sweep nobody runs. Found
+  #   by an external P0 review: `system_copied_service_path` used to build
+  #   its report from constants without running an isolate, runtime, or
+  #   shutdown at all, and its own smoke test failed
+  #   (`assert_no_leaked_capacity_at_shutdown` panicked with `leak=unchecked`)
+  #   — nothing in CI ever ran it, so the break shipped silently. Measured
+  #   locally: `mini_saas_api`'s full non-ignored suite (smoke, budget,
+  #   graceful_drain, scope_drain, soak, perf) finishes in ~4s once warm, so
+  #   it rides along here instead of only in the opt-in `proof-soak` /
+  #   `proof-long-soak` Makefile targets; `long_soak` stays `#[ignore]`d and
+  #   PR-gate-exempt (`make proof-long-soak` remains the way to run it).
+  # - `system_realtime_rooms`, `system_live_replay_bugbox`,
+  #   `system_scoped_request_tree`: the three example suites `make
+  #   proof-fast` promises as "the PR gate" (`.intent`/README docs point at
+  #   proof-fast as the fast systems-level proof). Found unwired the same
+  #   way #281 found the copied-path/mini_saas_api gap: `tina-proof-harness`
+  #   is a workspace member so the `test` job already covers it, but these
+  #   three are separate, excluded workspaces that no CI job ever ran.
+  #   Riding along here instead of a new job keeps one place responsible for
+  #   "example crates as PR gate".
+  #
+  # All five crates are separate, unlocked cargo workspaces (same convention
+  # as the `verify-examples` sweep above), so this job caches them
+  # individually via `rust-cache`'s multi-workspace `workspaces:` input
+  # instead of relying on the root workspace's cache key.
   systems-examples:
-    name: systems examples (copied-path + mini_saas_api) (${{ matrix.os }})
+    name: systems examples (copied-path + mini_saas_api + proof-fast trio) (${{ matrix.os }})
     if: github.event_name == 'pull_request' || github.event_name == 'push'
     runs-on: ${{ matrix.os }}
     strategy:
@@ -365,6 +375,9 @@ jobs:
           workspaces: |
             examples/systems/system_copied_service_path -> target
             examples/systems/mini_saas_api -> target
+            examples/systems/system_realtime_rooms -> target
+            examples/systems/system_live_replay_bugbox -> target
+            examples/systems/system_scoped_request_tree -> target
 
       - name: Set up sccache
         uses: mozilla-actions/sccache-action@v0.0.10
@@ -378,6 +391,21 @@ jobs:
         run: |
           cargo test --manifest-path examples/systems/mini_saas_api/Cargo.toml --tests
           cargo clippy --manifest-path examples/systems/mini_saas_api/Cargo.toml --all-targets -- -D warnings
+
+      - name: system_realtime_rooms (test + clippy; make proof-fast trio)
+        run: |
+          cargo test --manifest-path examples/systems/system_realtime_rooms/Cargo.toml --tests
+          cargo clippy --manifest-path examples/systems/system_realtime_rooms/Cargo.toml --all-targets -- -D warnings
+
+      - name: system_live_replay_bugbox (test + clippy; make proof-fast trio)
+        run: |
+          cargo test --manifest-path examples/systems/system_live_replay_bugbox/Cargo.toml --tests
+          cargo clippy --manifest-path examples/systems/system_live_replay_bugbox/Cargo.toml --all-targets -- -D warnings
+
+      - name: system_scoped_request_tree (test + clippy; make proof-fast trio)
+        run: |
+          cargo test --manifest-path examples/systems/system_scoped_request_tree/Cargo.toml --tests
+          cargo clippy --manifest-path examples/systems/system_scoped_request_tree/Cargo.toml --all-targets -- -D warnings
 
       - name: sccache stats
         if: always()

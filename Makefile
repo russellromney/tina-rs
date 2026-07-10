@@ -123,7 +123,9 @@ perf-check:
 # probes, byte replay). `cargo test -p tina-proof-harness` runs the
 # in-crate corpus and the `protocol_regression` suite. Each test owns
 # its own short timeout; the whole target should finish in well under
-# a minute on a developer machine.
+# a minute on a developer machine. In CI: `tina-proof-harness` rides the
+# workspace `test` job (it's a workspace member); the three standalone
+# example suites run in the `systems-examples` job in verify.yml.
 proof-fast:
 	cargo test --locked -p tina-proof-harness
 	cargo test --manifest-path examples/systems/system_realtime_rooms/Cargo.toml --test bad_peer
