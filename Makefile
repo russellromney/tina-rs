@@ -64,15 +64,23 @@ doc:
 clippy:
 	cargo clippy --locked --workspace --all-targets -- -D warnings
 
-# Walks examples/*/Cargo.toml and the extension smoke crates under
-# examples/extensions/*/Cargo.toml (each is its own cargo workspace,
-# excluded from the main one). Builds + tests each so a workspace-only
-# change can't silently break a downstream specimen or extension crate. These
-# example workspaces intentionally remain unlocked until each one has an
-# explicit lockfile policy. Stops on first failure.
+# Walks examples/*/Cargo.toml, examples/systems/*/Cargo.toml, and the
+# extension smoke crates under examples/extensions/*/Cargo.toml (each is its
+# own cargo workspace, excluded from the main one). Builds + tests each so a
+# workspace-only change can't silently break a downstream specimen, systems
+# example, or extension crate. These example workspaces intentionally remain
+# unlocked until each one has an explicit lockfile policy. Stops on first
+# failure. This is the one authoritative command that validates everything
+# promoted as a user starting point; `examples/systems/*` used to be excluded
+# by the glob (one level too shallow), so the systems examples — including
+# `system_copied_service_path`, the flagship copied-path skeleton — silently
+# sat outside this sweep. `system_copied_service_path` and `mini_saas_api`
+# also run in the `systems-examples` CI job (`.github/workflows/verify.yml`)
+# on every PR; the rest of `examples/systems/*` is local-sweep-only for now
+# (see that job's comment for why).
 verify-examples:
 	@set -e; \
-	for manifest in examples/*/Cargo.toml examples/extensions/*/Cargo.toml; do \
+	for manifest in examples/*/Cargo.toml examples/systems/*/Cargo.toml examples/extensions/*/Cargo.toml; do \
 		echo "==> $$manifest"; \
 		CARGO_TARGET_DIR="$(EXAMPLES_TARGET_DIR)" cargo test --manifest-path "$$manifest"; \
 		CARGO_TARGET_DIR="$(EXAMPLES_TARGET_DIR)" cargo clippy --manifest-path "$$manifest" --all-targets -- -D warnings; \

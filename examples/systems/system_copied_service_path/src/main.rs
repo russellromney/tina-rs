@@ -1,4 +1,5 @@
-fn main() {
-    println!("{}", system_copied_service_path::smoke_line());
+fn main() -> anyhow::Result<()> {
+    let report = system_copied_service_path::run(system_copied_service_path::RunConfig::default())?;
+    println!("{report:#?}");
+    Ok(())
 }
-
