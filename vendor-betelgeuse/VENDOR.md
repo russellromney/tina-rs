@@ -72,3 +72,14 @@ If one is, follow the 2026-07-09 series shape: one isolated commit bringing
 this directory to verbatim upstream tip (it will not build — say so in the
 message), then one commit per patch family re-applied, then update the
 upstream commit hash above and prove the workspace green.
+
+## Publish plan (decided 2026-07-10)
+
+This fork never publishes to crates.io as its own crate. When the workspace
+publishes (the Tinio rename/0.1.0), this directory folds into the runtime
+crate as a module — vendored in the plain sense. `LICENSE.md` (MIT OR
+Apache-2.0) and this file travel with the code, and the runtime crate's
+docs/metadata credit the origin: a fork of Pekka Enberg's Betelgeuse. That
+satisfies both licenses (retain license text + attribution). No upstream
+contributions are planned as part of publishing; the per-family commits from
+the 2026-07-09 re-vendor remain exportable if that ever changes.
