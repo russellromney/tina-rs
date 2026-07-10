@@ -1,4 +1,4 @@
-//! Deterministic-simulator parity for paced buffered HTTP/2 responses.
+//! Deterministic-simulator parity for paced buffered and streamed HTTP/2 responses.
 //!
 //! The live wire test proves a peer can grant credit only after consuming
 //! response bytes. This companion drives the same server state machine through
@@ -12,6 +12,7 @@ use std::sync::Arc;
 use tina::prelude::*;
 use tina_http::{
     Http2Limits, Http2Listener, Http2ListenerMsg, Http2ServerConfig, HttpRequest, HttpResponse,
+    IterBodySource, ResponseChunkMsg, ResponseChunkReply,
 };
 use tina_runtime::{ProtocolFact, RuntimeEventKind, RuntimeFact, stable_trace_hash};
 use tina_sim::{
@@ -39,6 +40,10 @@ impl Shard for SimShard {
 
 struct LargeBufferedService {
     body: Arc<[u8]>,
+}
+
+struct LargeStreamingService {
+    source: Address<ResponseChunkMsg, ResponseChunkReply>,
 }
 
 impl Isolate for LargeBufferedService {
@@ -74,6 +79,45 @@ impl LargeBufferedService {
     }
 }
 
+impl Isolate for LargeStreamingService {
+    tina::isolate_types! {
+        message: HttpRequest,
+        reply: HttpResponse,
+        send: tina::Outbound<Infallible>,
+        spawn: Infallible,
+        io: tina_runtime::RuntimeCall<HttpRequest>,
+        shard: SimShard,
+    }
+
+    fn handle(
+        &mut self,
+        _request: HttpRequest,
+        _ctx: &mut Context<'_, SimShard, Self::Reply>,
+    ) -> Effect<Self> {
+        reply(self.response())
+    }
+
+    fn handle_call(
+        &mut self,
+        _request: HttpRequest,
+        call: tina::CallContext<'_, Self>,
+    ) -> Effect<Self> {
+        call.reply(self.response())
+    }
+}
+
+impl LargeStreamingService {
+    fn response(&self) -> HttpResponse {
+        HttpResponse::stream_known_length(http::StatusCode::OK, BODY_LEN, self.source)
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ResponseMode {
+    Buffered,
+    Streaming,
+}
+
 struct RunResult {
     trace_hash: u64,
     trace_len: usize,
@@ -82,7 +126,12 @@ struct RunResult {
     closed_stream_facts: usize,
 }
 
-fn run_pass(seed: u64, continue_with_credit: bool, concurrent: bool) -> RunResult {
+fn run_pass(
+    seed: u64,
+    continue_with_credit: bool,
+    concurrent: bool,
+    mode: ResponseMode,
+) -> RunResult {
     let bind_addr: SocketAddr = "127.0.0.1:19090".parse().unwrap();
     let peer_addr: SocketAddr = "10.0.0.1:59090".parse().unwrap();
     let inbound_chunks = scripted_peer_input(continue_with_credit, concurrent);
@@ -111,7 +160,17 @@ fn run_pass(seed: u64, continue_with_credit: bool, concurrent: bool) -> RunResul
     };
     let body: Arc<[u8]> = expected_body().into();
     let mut sim = Simulator::new(SimShard, config);
-    let service = sim.register_with_mailbox_capacity(LargeBufferedService { body }, 8);
+    let service = match mode {
+        ResponseMode::Buffered => {
+            sim.register_with_mailbox_capacity(LargeBufferedService { body }, 8)
+        }
+        ResponseMode::Streaming => {
+            let chunks = vec![body.as_ref().to_vec()].into_iter();
+            let source =
+                sim.register_with_mailbox_capacity(IterBodySource::<SimShard>::new(chunks), 8);
+            sim.register_with_mailbox_capacity(LargeStreamingService { source }, 8)
+        }
+    };
     let server_config = Http2ServerConfig {
         limits: Http2Limits {
             max_response_body_bytes: BODY_LEN,
@@ -312,8 +371,8 @@ fn response_data(output: &[u8]) -> (Vec<u8>, usize) {
 
 #[test]
 fn buffered_response_pressure_is_deterministic_and_bounded_to_initial_credit() {
-    let first = run_pass(0xB0D1_5EED, false, false);
-    let replay = run_pass(0xB0D1_5EED, false, false);
+    let first = run_pass(0xB0D1_5EED, false, false, ResponseMode::Buffered);
+    let replay = run_pass(0xB0D1_5EED, false, false, ResponseMode::Buffered);
 
     assert_eq!(first.trace_hash, replay.trace_hash);
     assert_eq!(first.trace_len, replay.trace_len);
@@ -338,9 +397,26 @@ fn buffered_response_pressure_is_deterministic_and_bounded_to_initial_credit() {
 }
 
 #[test]
+fn streamed_response_zero_window_fact_is_deterministic_and_replays() {
+    let first = run_pass(0x57EA_0EED, false, false, ResponseMode::Streaming);
+    let replay = run_pass(0x57EA_0EED, false, false, ResponseMode::Streaming);
+
+    assert_eq!(first.trace_hash, replay.trace_hash);
+    assert_eq!(first.trace_len, replay.trace_len);
+    assert_eq!(first.peer_output, replay.peer_output);
+    assert!(
+        first.flow_control_facts > 0,
+        "streamed response must emit flow-control facts at zero connection credit"
+    );
+    let (body, terminal_frames) = response_data(&first.peer_output);
+    assert_eq!(body, expected_body()[..65_535]);
+    assert_eq!(terminal_frames, 0);
+}
+
+#[test]
 fn credited_buffered_response_is_deterministic_under_short_writes() {
-    let first = run_pass(0xC0ED_17ED, true, false);
-    let replay = run_pass(0xC0ED_17ED, true, false);
+    let first = run_pass(0xC0ED_17ED, true, false, ResponseMode::Buffered);
+    let replay = run_pass(0xC0ED_17ED, true, false, ResponseMode::Buffered);
 
     assert_eq!(first.trace_hash, replay.trace_hash);
     assert_eq!(first.trace_len, replay.trace_len);
@@ -381,8 +457,8 @@ fn data_streams_after_initial_credit(output: &[u8]) -> Vec<u32> {
 
 #[test]
 fn concurrent_buffered_responses_share_credited_quanta_deterministically() {
-    let first = run_pass(0xFA17_5EED, true, true);
-    let replay = run_pass(0xFA17_5EED, true, true);
+    let first = run_pass(0xFA17_5EED, true, true, ResponseMode::Buffered);
+    let replay = run_pass(0xFA17_5EED, true, true, ResponseMode::Buffered);
 
     assert_eq!(first.trace_hash, replay.trace_hash);
     assert_eq!(first.trace_len, replay.trace_len);

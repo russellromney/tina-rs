@@ -1821,7 +1821,7 @@ impl<S: Shard + 'static, M: Http2ServiceMessage> Http2Connection<S, M> {
                 self.send_pending_response(stream_id, pending, effects)?;
             }
             if self.find_stream(stream_id).is_some() {
-                self.flush_response_stream(stream_id)?;
+                self.flush_response_stream(stream_id, effects)?;
             }
             self.flush_response_end(stream_id, effects)?;
             if self.send_window < send_window_before {
@@ -1991,7 +1991,11 @@ impl<S: Shard + 'static, M: Http2ServiceMessage> Http2Connection<S, M> {
         }
     }
 
-    fn flush_response_stream(&mut self, stream_id: u32) -> Result<(), Http2ProtocolError> {
+    fn flush_response_stream(
+        &mut self,
+        stream_id: u32,
+        effects: &mut Vec<Effect<Self>>,
+    ) -> Result<(), Http2ProtocolError> {
         let idx = self
             .find_stream(stream_id)
             .ok_or(Http2ProtocolError::StreamClosed)?;
@@ -2003,6 +2007,19 @@ impl<S: Shard + 'static, M: Http2ServiceMessage> Http2Connection<S, M> {
             .min(self.peer_max_frame_size);
         if allowed == 0 {
             self.report.flow_control_blocked += 1;
+            let side = if self.send_window <= 0 {
+                Http2FlowControlSide::ConnectionSend
+            } else {
+                Http2FlowControlSide::StreamSend
+            };
+            self.emit_protocol_fact(
+                effects,
+                ProtocolFact::Http2FlowControlFull {
+                    connection: self.connection_fact_id(),
+                    stream: Http2StreamId::new(stream_id),
+                    side,
+                },
+            );
             return Ok(());
         }
         // Frame one scheduling quantum directly: header bytes, then drain the
@@ -2873,6 +2890,36 @@ mod tests {
         assert_eq!(conn.write_queue[0][3], FRAME_HEADERS);
         assert!(conn.streams[stream].pending_response.is_some());
         assert_eq!(conn.report.flow_control_blocked, 1);
+    }
+
+    #[test]
+    fn streamed_zero_window_emits_connection_send_flow_control_fact() {
+        let mut conn = unit_connection();
+        conn.push_stream(ActiveStream::new(
+            1,
+            HeaderBlock::default(),
+            DEFAULT_WINDOW,
+            DEFAULT_WINDOW,
+            false,
+        ));
+        let stream = conn.find_stream(1).unwrap();
+        conn.streams[stream].response_pending_data = b"streamed".to_vec();
+        conn.send_window = 0;
+        let mut effects = Vec::new();
+
+        conn.flush_pending_responses(&mut effects).unwrap();
+
+        assert_eq!(conn.report.flow_control_blocked, 1);
+        assert_eq!(conn.streams[stream].response_pending_data, b"streamed");
+        let facts = collect_facts(&effects);
+        assert!(facts.iter().any(|fact| matches!(
+            fact,
+            ProtocolFact::Http2FlowControlFull {
+                stream,
+                side: Http2FlowControlSide::ConnectionSend,
+                ..
+            } if *stream == Http2StreamId::new(1)
+        )));
     }
 
     #[test]

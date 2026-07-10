@@ -2364,20 +2364,29 @@ where
         start: usize,
     ) {
         let Some(stream_index) = self.stream_index(stream) else {
-            self.deliver_completion(call_id, CallOutput::Failed(CallError::InvalidResource));
+            self.deliver_completion(
+                call_id,
+                CallOutput::TcpWroteOwnedFailed {
+                    bytes,
+                    error: CallError::InvalidResource,
+                },
+            );
             return;
         };
 
         let resource = TcpResourceKey::StreamWrite(stream);
         if self.resource_has_active_pending(resource) {
-            self.deliver_completion(call_id, CallOutput::Failed(CallError::ResourceBusy));
+            self.deliver_completion(
+                call_id,
+                CallOutput::TcpWroteOwnedFailed {
+                    bytes,
+                    error: CallError::ResourceBusy,
+                },
+            );
             return;
         }
 
-        let Some(result) = self.stream_write_owned_result(stream_index, bytes, start) else {
-            self.deliver_completion(call_id, CallOutput::Failed(CallError::InvalidResource));
-            return;
-        };
+        let result = self.stream_write_owned_result(stream_index, bytes, start);
 
         self.schedule_tcp_completion(call_id, resource, result);
     }
@@ -2426,10 +2435,7 @@ where
             return;
         }
 
-        let Some(result) = self.stream_write_owned_close_result(stream_index, bytes) else {
-            self.deliver_completion(call_id, CallOutput::Failed(CallError::InvalidResource));
-            return;
-        };
+        let result = self.stream_write_owned_close_result(stream_index, bytes);
         if matches!(result, CallOutput::TcpWroteOwnedClose { closed: true, .. }) {
             self.cancel_backend_calls_for_resource(TcpResourceKey::StreamRead(stream));
         }
@@ -4789,17 +4795,25 @@ where
         stream_index: usize,
         bytes: Vec<u8>,
         start: usize,
-    ) -> Option<CallOutput> {
-        let stream = self.streams.get_mut(stream_index)?;
+    ) -> CallOutput {
+        let Some(stream) = self.streams.get_mut(stream_index) else {
+            return CallOutput::TcpWroteOwnedFailed {
+                bytes,
+                error: CallError::InvalidResource,
+            };
+        };
         if stream.closed {
-            return None;
+            return CallOutput::TcpWroteOwnedFailed {
+                bytes,
+                error: CallError::InvalidResource,
+            };
         }
 
         if start > bytes.len() {
-            return Some(CallOutput::TcpWroteOwnedFailed {
+            return CallOutput::TcpWroteOwnedFailed {
                 bytes,
                 error: CallError::InvariantViolation,
-            });
+            };
         }
         let remaining_capacity = stream.output_capacity.saturating_sub(stream.output.len());
         let count = (bytes.len() - start)
@@ -4808,17 +4822,25 @@ where
         stream
             .output
             .extend_from_slice(&bytes[start..start + count]);
-        Some(CallOutput::TcpWroteOwned { bytes, count })
+        CallOutput::TcpWroteOwned { bytes, count }
     }
 
     pub(crate) fn stream_write_owned_close_result(
         &mut self,
         stream_index: usize,
         bytes: Vec<u8>,
-    ) -> Option<CallOutput> {
-        let stream = self.streams.get_mut(stream_index)?;
+    ) -> CallOutput {
+        let Some(stream) = self.streams.get_mut(stream_index) else {
+            return CallOutput::TcpWroteOwnedFailed {
+                bytes,
+                error: CallError::InvalidResource,
+            };
+        };
         if stream.closed {
-            return None;
+            return CallOutput::TcpWroteOwnedFailed {
+                bytes,
+                error: CallError::InvalidResource,
+            };
         }
 
         let remaining_capacity = stream.output_capacity.saturating_sub(stream.output.len());
@@ -4828,11 +4850,11 @@ where
         if closed {
             stream.closed = true;
         }
-        Some(CallOutput::TcpWroteOwnedClose {
+        CallOutput::TcpWroteOwnedClose {
             bytes,
             count,
             closed,
-        })
+        }
     }
 
     pub(crate) fn promote_ready_udp_datagrams(&mut self, socket_index: usize) {

@@ -22,6 +22,10 @@
 //!     filesystem work and therefore use a bounded worker lane;
 //!   - forbidden-in-handler: direct filesystem or socket work performed by
 //!     user handlers instead of returned Tina effects.
+//! - every Betelgeuse completion is allocated in a `Box` before submission and
+//!   that box is moved into runtime-owned pending state. Betelgeuse retains a
+//!   pointer to the allocation, so completion values must never be embedded
+//!   directly in storage that may move while an operation is armed.
 //! - shutdown cancellation keeps completion slots alive until the backend
 //!   reports that it no longer owns their raw pointers. A driver that cannot
 //!   prove release returns [`DriverShutdownError`] instead of pretending
@@ -216,8 +220,165 @@ impl DriverResourceReport {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DriverShutdownError {
     /// The backend still reports ownership of completion slots after Tina's
-    /// bounded shutdown drain.
+    /// bounded shutdown drain. The driver quarantines the shared loop and all
+    /// completion-bearing lanes so the terminal report remains bounded without
+    /// freeing storage the backend may still access.
     BackendStillOwnsCompletions,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SharedIoDropState {
+    Active,
+    Released,
+    Quarantined,
+}
+
+/// One lifetime unit for every lane backed by the shared Betelgeuse loop.
+///
+/// Betelgeuse stores raw pointers to caller-owned completion boxes. No lane may
+/// drop those boxes independently while another clone of the loop can still
+/// step or while the kernel still owns an operation. A failed bounded drain
+/// therefore quarantines the entire unit: leaking a bounded shutdown-failure
+/// allocation is preferable to freeing memory the backend may still access.
+struct SharedIoLanes {
+    tcp: Option<BetelgeuseTcp>,
+    storage: Option<StorageLane>,
+    tls: Option<TlsLane>,
+    unix: Option<UnixLane>,
+    drop_state: SharedIoDropState,
+    #[cfg(test)]
+    slots_released_probe: Option<std::rc::Rc<std::cell::Cell<bool>>>,
+}
+
+impl SharedIoLanes {
+    fn new(tcp: BetelgeuseTcp, storage: StorageLane, tls: TlsLane, unix: UnixLane) -> Self {
+        Self {
+            tcp: Some(tcp),
+            storage: Some(storage),
+            tls: Some(tls),
+            unix: Some(unix),
+            drop_state: SharedIoDropState::Active,
+            #[cfg(test)]
+            slots_released_probe: None,
+        }
+    }
+
+    fn tcp(&self) -> &BetelgeuseTcp {
+        self.tcp.as_ref().expect("shared TCP lane is present")
+    }
+
+    fn tcp_mut(&mut self) -> &mut BetelgeuseTcp {
+        self.tcp.as_mut().expect("shared TCP lane is present")
+    }
+
+    fn storage(&self) -> &StorageLane {
+        self.storage
+            .as_ref()
+            .expect("shared storage lane is present")
+    }
+
+    fn storage_mut(&mut self) -> &mut StorageLane {
+        self.storage
+            .as_mut()
+            .expect("shared storage lane is present")
+    }
+
+    fn tls(&self) -> &TlsLane {
+        self.tls.as_ref().expect("shared TLS lane is present")
+    }
+
+    fn tls_mut(&mut self) -> &mut TlsLane {
+        self.tls.as_mut().expect("shared TLS lane is present")
+    }
+
+    fn unix(&self) -> &UnixLane {
+        self.unix.as_ref().expect("shared Unix lane is present")
+    }
+
+    fn unix_mut(&mut self) -> &mut UnixLane {
+        self.unix.as_mut().expect("shared Unix lane is present")
+    }
+
+    fn mark_active(&mut self) {
+        self.drop_state = SharedIoDropState::Active;
+    }
+
+    #[cfg(test)]
+    fn set_slots_released_probe(&mut self, probe: std::rc::Rc<std::cell::Cell<bool>>) {
+        self.slots_released_probe = Some(probe);
+    }
+
+    fn record_release(&mut self, result: Result<(), DriverShutdownError>) {
+        self.drop_state = if result.is_ok() {
+            SharedIoDropState::Released
+        } else {
+            SharedIoDropState::Quarantined
+        };
+    }
+
+    fn try_release_for_drop(&mut self) -> Result<(), DriverShutdownError> {
+        let deadline = Instant::now();
+        self.storage_mut().cancel_pending(deadline);
+        let tls_result = self.tls_mut().cancel_pending(deadline);
+        let unix_result = self.unix_mut().cancel_pending(deadline);
+        let tcp_result = self.tcp_mut().cancel_pending(deadline);
+        tls_result.and(unix_result).and(tcp_result)
+    }
+
+    fn quarantine(&mut self) {
+        self.drop_state = SharedIoDropState::Quarantined;
+        if let Some(lane) = self.storage.take() {
+            std::mem::forget(lane);
+        }
+        if let Some(lane) = self.tls.take() {
+            std::mem::forget(lane);
+        }
+        if let Some(lane) = self.unix.take() {
+            std::mem::forget(lane);
+        }
+        if let Some(lane) = self.tcp.take() {
+            std::mem::forget(lane);
+        }
+    }
+}
+
+impl Drop for SharedIoLanes {
+    fn drop(&mut self) {
+        if self.drop_state == SharedIoDropState::Active {
+            // Fail closed before invoking fallible subsystem teardown. If it
+            // panics, quarantine all fields before resuming the unwind so Rust's
+            // automatic field cleanup cannot free backend-owned pointers.
+            self.drop_state = SharedIoDropState::Quarantined;
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                self.try_release_for_drop()
+            })) {
+                Ok(result) => self.record_release(result),
+                Err(payload) => {
+                    self.quarantine();
+                    std::panic::resume_unwind(payload);
+                }
+            }
+        }
+
+        if self.drop_state == SharedIoDropState::Quarantined {
+            // The shared loop is !Send and cannot be handed to a background
+            // reaper. Keep the loop, descriptors, completion boxes, and their
+            // buffers alive together until process exit rather than risk UAF.
+            self.quarantine();
+            return;
+        }
+
+        // The backend reported zero ownership. Drop explicitly so a future
+        // field reorder cannot separate completion storage from loop lifetime.
+        #[cfg(test)]
+        if let Some(probe) = &self.slots_released_probe {
+            probe.set(true);
+        }
+        drop(self.storage.take());
+        drop(self.tls.take());
+        drop(self.unix.take());
+        drop(self.tcp.take());
+    }
 }
 
 /// Betelgeuse-backed runtime driver.
@@ -226,12 +387,9 @@ pub(crate) enum DriverShutdownError {
 /// library with caller-owned typed completion slots. That shape matches Tina's
 /// explicit-stepping, runtime-owned-effects discipline.
 pub(crate) struct BetelgeuseDriver {
-    tcp: BetelgeuseTcp,
-    storage: StorageLane,
+    shared_io: SharedIoLanes,
     dns: DnsLane,
-    tls: TlsLane,
     process: ProcessLane,
-    unix: UnixLane,
     signals: Vec<SignalWaitEntry>,
     signal_capacity: usize,
     /// Pending timers keyed by `(deadline, insertion_order)` so the earliest
@@ -274,14 +432,14 @@ impl BetelgeuseDriver {
 
     pub(crate) fn with_io_loop(io_loop: IOLoopHandle<Global>) -> Self {
         Self {
-            // TLS rides the same Betelgeuse loop as plain TCP — a cloned
-            // handle, not a second socket stack.
-            tls: TlsLane::new(DEFAULT_TLS_LANE_CAPACITY, io_loop.clone()),
-            // Unix-domain sockets ride the same Betelgeuse loop as TCP/TLS —
-            // a cloned handle, not a second socket stack.
-            unix: UnixLane::new(io_loop.clone()),
-            tcp: BetelgeuseTcp::with_io_loop(io_loop),
-            storage: StorageLane::inline(),
+            shared_io: SharedIoLanes::new(
+                BetelgeuseTcp::with_io_loop(io_loop.clone()),
+                StorageLane::inline(),
+                // TLS and Unix ride the same Betelgeuse loop as plain TCP: a
+                // cloned handle, not a second socket stack.
+                TlsLane::new(DEFAULT_TLS_LANE_CAPACITY, io_loop.clone()),
+                UnixLane::new(io_loop),
+            ),
             dns: DnsLane::new(DEFAULT_DNS_LANE_CAPACITY),
             process: ProcessLane::new(DEFAULT_PROCESS_LANE_CAPACITY),
             signals: Vec::with_capacity(
@@ -306,10 +464,12 @@ impl BetelgeuseDriver {
         timer_capacity: usize,
     ) -> Self {
         Self {
-            tls: TlsLane::new(tls_lane_capacity, io_loop.clone()),
-            unix: UnixLane::new(io_loop.clone()),
-            tcp: BetelgeuseTcp::with_io_loop(io_loop.clone()),
-            storage: StorageLane::reactor(io_loop, storage_lane_capacity),
+            shared_io: SharedIoLanes::new(
+                BetelgeuseTcp::with_io_loop(io_loop.clone()),
+                StorageLane::reactor(io_loop.clone(), storage_lane_capacity),
+                TlsLane::new(tls_lane_capacity, io_loop.clone()),
+                UnixLane::new(io_loop),
+            ),
             dns: DnsLane::new(dns_lane_capacity),
             process: ProcessLane::new(process_lane_capacity),
             signals: Vec::with_capacity(signal_capacity.min(INITIAL_DRIVER_PENDING_CAPACITY)),
@@ -330,6 +490,7 @@ impl RuntimeDriver for BetelgeuseDriver {
         request: CallInput,
         now: Instant,
     ) -> Option<DriverCompletion> {
+        self.shared_io.mark_active();
         match request {
             CallInput::Sleep { after } => {
                 // Bounded admission: a full timer lane refuses the arm with a
@@ -353,7 +514,7 @@ impl RuntimeDriver for BetelgeuseDriver {
                 path,
                 bytes,
                 last_journal_index,
-            } => self.storage.submit(
+            } => self.shared_io.storage_mut().submit(
                 call_id,
                 StorageJob::SnapshotCommit {
                     path,
@@ -362,13 +523,14 @@ impl RuntimeDriver for BetelgeuseDriver {
                 },
             ),
             CallInput::SnapshotLoad { path } => self
-                .storage
+                .shared_io
+                .storage_mut()
                 .submit(call_id, StorageJob::SnapshotLoad { path }),
             CallInput::JournalAppend {
                 path,
                 record_index,
                 bytes,
-            } => self.storage.submit(
+            } => self.shared_io.storage_mut().submit(
                 call_id,
                 StorageJob::JournalAppend {
                     path,
@@ -377,22 +539,28 @@ impl RuntimeDriver for BetelgeuseDriver {
                 },
             ),
             CallInput::JournalReplay { path } => self
-                .storage
+                .shared_io
+                .storage_mut()
                 .submit(call_id, StorageJob::JournalReplay { path }),
             CallInput::PathMetadata { path } => self
-                .storage
+                .shared_io
+                .storage_mut()
                 .submit(call_id, StorageJob::PathMetadata { path }),
             CallInput::RenameReplace { from, to } => self
-                .storage
+                .shared_io
+                .storage_mut()
                 .submit(call_id, StorageJob::RenameReplace { from, to }),
             CallInput::RemoveFile { path } => self
-                .storage
+                .shared_io
+                .storage_mut()
                 .submit(call_id, StorageJob::RemoveFile { path }),
-            CallInput::ReadDir { path } => {
-                self.storage.submit(call_id, StorageJob::ReadDir { path })
-            }
+            CallInput::ReadDir { path } => self
+                .shared_io
+                .storage_mut()
+                .submit(call_id, StorageJob::ReadDir { path }),
             CallInput::SyncParent { path } => self
-                .storage
+                .shared_io
+                .storage_mut()
                 .submit(call_id, StorageJob::SyncParent { path }),
             CallInput::DnsLookup {
                 host,
@@ -405,7 +573,7 @@ impl RuntimeDriver for BetelgeuseDriver {
                 root_certificates,
                 alpn_protocols,
                 timeout,
-            } => self.tls.submit_connect(
+            } => self.shared_io.tls_mut().submit_connect(
                 call_id,
                 addr,
                 server_name,
@@ -419,7 +587,7 @@ impl RuntimeDriver for BetelgeuseDriver {
                 certificate_chain,
                 private_key,
                 alpn_protocols,
-            } => self.tls.submit_bind(
+            } => self.shared_io.tls_mut().submit_bind(
                 call_id,
                 addr,
                 certificate_chain,
@@ -427,40 +595,51 @@ impl RuntimeDriver for BetelgeuseDriver {
                 alpn_protocols,
                 now,
             ),
-            CallInput::TlsAccept { listener, timeout } => {
-                self.tls.submit_accept(call_id, listener, timeout, now)
-            }
-            CallInput::TlsListenerClose { listener } => {
-                self.tls.submit_listener_close(call_id, listener)
-            }
+            CallInput::TlsAccept { listener, timeout } => self
+                .shared_io
+                .tls_mut()
+                .submit_accept(call_id, listener, timeout, now),
+            CallInput::TlsListenerClose { listener } => self
+                .shared_io
+                .tls_mut()
+                .submit_listener_close(call_id, listener),
             CallInput::TlsRead {
                 stream,
                 max_len,
                 timeout,
-            } => self.tls.submit_read(call_id, stream, max_len, timeout, now),
+            } => self
+                .shared_io
+                .tls_mut()
+                .submit_read(call_id, stream, max_len, timeout, now),
             CallInput::TlsReadBuf {
                 stream,
                 buffer,
                 max_len,
                 timeout,
             } => self
-                .tls
+                .shared_io
+                .tls_mut()
                 .submit_read_buf(call_id, stream, buffer, max_len, timeout, now),
             CallInput::TlsWrite {
                 stream,
                 bytes,
                 timeout,
-            } => self.tls.submit_write(call_id, stream, bytes, timeout, now),
+            } => self
+                .shared_io
+                .tls_mut()
+                .submit_write(call_id, stream, bytes, timeout, now),
             CallInput::TlsWriteOwned {
                 stream,
                 bytes,
                 timeout,
             } => self
-                .tls
+                .shared_io
+                .tls_mut()
                 .submit_write_owned(call_id, stream, bytes, timeout, now),
-            CallInput::TlsClose { stream, timeout } => {
-                self.tls.submit_close(call_id, stream, timeout, now)
-            }
+            CallInput::TlsClose { stream, timeout } => self
+                .shared_io
+                .tls_mut()
+                .submit_close(call_id, stream, timeout, now),
             CallInput::SignalWait { name, timeout } => {
                 self.submit_signal_wait(call_id, name, timeout, now)
             }
@@ -489,18 +668,20 @@ impl RuntimeDriver for BetelgeuseDriver {
             | CallInput::UnixWrite { .. }
             | CallInput::UnixWriteOwned { .. }
             | CallInput::UnixListenerClose { .. }
-            | CallInput::UnixStreamClose { .. } => self.unix.submit(call_id, request),
-            other => self.tcp.submit(call_id, other),
+            | CallInput::UnixStreamClose { .. } => {
+                self.shared_io.unix_mut().submit(call_id, request)
+            }
+            other => self.shared_io.tcp_mut().submit(call_id, other),
         }
     }
 
     fn advance(&mut self, now: Instant, completed: &mut Vec<DriverCompletion>) {
-        self.tcp.advance(completed);
-        self.storage.advance(completed);
+        self.shared_io.tcp_mut().advance(completed);
+        self.shared_io.storage_mut().advance(completed);
         self.dns.advance(now, completed);
-        self.tls.advance(now, completed);
+        self.shared_io.tls_mut().advance(now, completed);
         self.process.advance(completed);
-        self.unix.advance(completed);
+        self.shared_io.unix_mut().advance(completed);
         self.poll_os_signals(completed);
         self.harvest_signals(now, completed);
         self.harvest_timers(now, completed);
@@ -516,23 +697,23 @@ impl RuntimeDriver for BetelgeuseDriver {
         // syscall; it only reaps slots that already hold a result. Anything
         // still only *queued* (surfaced, not yet executed) is picked up by a
         // later explicit step.
-        self.tcp.harvest(completed);
-        self.unix.harvest(completed);
+        self.shared_io.tcp_mut().harvest(completed);
+        self.shared_io.unix_mut().harvest(completed);
     }
 
     fn take_cancelled_by_close(&mut self) -> Vec<CallId> {
-        let mut cancelled = self.tcp.take_cancelled_by_close();
-        cancelled.extend(self.unix.take_cancelled_by_close());
+        let mut cancelled = self.shared_io.tcp_mut().take_cancelled_by_close();
+        cancelled.extend(self.shared_io.unix_mut().take_cancelled_by_close());
         cancelled
     }
 
     fn has_pending(&self) -> bool {
-        self.tcp.has_pending()
-            || self.storage.has_pending()
+        self.shared_io.tcp().has_pending()
+            || self.shared_io.storage().has_pending()
             || self.dns.has_pending()
-            || self.tls.has_pending()
+            || self.shared_io.tls().has_pending()
             || self.process.has_pending()
-            || self.unix.has_pending()
+            || self.shared_io.unix().has_pending()
             || self.signals.iter().any(|entry| !entry.cancelled)
             || !self.timers.is_empty()
     }
@@ -540,16 +721,18 @@ impl RuntimeDriver for BetelgeuseDriver {
     fn cancel_pending(&mut self, deadline: Instant) -> Result<(), DriverShutdownError> {
         self.timers.clear();
         self.signals.clear();
-        self.storage.cancel_pending(deadline);
+        self.shared_io.storage_mut().cancel_pending(deadline);
         self.dns.cancel_pending(deadline);
-        let tls_result = self.tls.cancel_pending(deadline);
+        let tls_result = self.shared_io.tls_mut().cancel_pending(deadline);
         self.process.cancel_pending(deadline);
         // Unix shares the Betelgeuse loop with TCP; it must release its own
         // completion boxes before the TCP lane runs the final whole-loop
         // release check.
-        let unix_result = self.unix.cancel_pending(deadline);
-        let tcp_result = self.tcp.cancel_pending(deadline);
-        tls_result.and(unix_result).and(tcp_result)
+        let unix_result = self.shared_io.unix_mut().cancel_pending(deadline);
+        let tcp_result = self.shared_io.tcp_mut().cancel_pending(deadline);
+        let result = tls_result.and(unix_result).and(tcp_result);
+        self.shared_io.record_release(result);
+        result
     }
 
     fn cancel(&mut self, call_id: CallId) -> bool {
@@ -559,17 +742,17 @@ impl RuntimeDriver for BetelgeuseDriver {
         self.signals.retain(|entry| entry.call_id != call_id);
         before != self.timers.len()
             || signal_before != self.signals.len()
-            || self.storage.cancel(call_id)
+            || self.shared_io.storage_mut().cancel(call_id)
             || self.dns.cancel(call_id)
-            || self.tls.cancel(call_id)
+            || self.shared_io.tls_mut().cancel(call_id)
             || self.process.cancel(call_id)
-            || self.unix.cancel(call_id)
-            || self.tcp.cancel(call_id)
+            || self.shared_io.unix_mut().cancel(call_id)
+            || self.shared_io.tcp_mut().cancel(call_id)
     }
 
     #[cfg(test)]
     fn io_pending_count(&self) -> usize {
-        self.tcp.pending_count()
+        self.shared_io.tcp().pending_count()
     }
 
     fn notify_signal(&mut self, name: &str, completed: &mut Vec<DriverCompletion>) {
@@ -592,12 +775,12 @@ impl RuntimeDriver for BetelgeuseDriver {
     }
 
     fn resource_report(&self) -> DriverResourceReport {
-        let tcp = self.tcp.resource_report();
-        let tls = self.tls.resource_report();
+        let tcp = self.shared_io.tcp().resource_report();
+        let tls = self.shared_io.tls().resource_report();
         let process_pending = self.process.physical_pending_count();
         DriverResourceReport {
-            listeners: tcp.listeners + tls.listeners + self.unix.listener_count(),
-            streams: tcp.streams + self.unix.stream_count(),
+            listeners: tcp.listeners + tls.listeners + self.shared_io.unix().listener_count(),
+            streams: tcp.streams + self.shared_io.unix().stream_count(),
             tls_streams: tls.tls_streams,
             udp_sockets: tcp.udp_sockets,
             files: tcp.files,
@@ -613,11 +796,11 @@ impl RuntimeDriver for BetelgeuseDriver {
             // but the lane has not yet drained — including work stuck on
             // a worker after a bounded shutdown drain — stays visible.
             pending_calls: tcp.pending_calls
-                + self.storage.physical_pending_count()
+                + self.shared_io.storage().physical_pending_count()
                 + self.dns.physical_pending_count()
                 + tls.pending_calls
                 + process_pending
-                + self.unix.pending_call_count()
+                + self.shared_io.unix().pending_call_count()
                 + self.signals.iter().filter(|entry| !entry.cancelled).count()
                 + self.timers.len(),
         }
@@ -719,7 +902,8 @@ impl std::fmt::Debug for BetelgeuseDriver {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("BetelgeuseDriver")
-            .field("tcp", &self.tcp)
+            .field("tcp", self.shared_io.tcp())
+            .field("shared_io_drop_state", &self.shared_io.drop_state)
             .field("timers", &self.timers.len())
             .finish_non_exhaustive()
     }
@@ -728,6 +912,136 @@ impl std::fmt::Debug for BetelgeuseDriver {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use betelgeuse::io::simulated::SimulatedIO;
+
+    #[derive(Default)]
+    struct SharedIoDropMetrics {
+        steps: std::cell::Cell<usize>,
+        steps_after_slots_released: std::cell::Cell<usize>,
+        cancel_calls: std::cell::Cell<usize>,
+        backend_drops: std::cell::Cell<usize>,
+        panic_on_cancel: std::cell::Cell<bool>,
+        slots_released: std::rc::Rc<std::cell::Cell<bool>>,
+    }
+
+    struct TrackedCancelIo {
+        inner: SimulatedIO,
+        retain_on_cancel: bool,
+        metrics: std::rc::Rc<SharedIoDropMetrics>,
+    }
+
+    impl Drop for TrackedCancelIo {
+        fn drop(&mut self) {
+            self.metrics
+                .backend_drops
+                .set(self.metrics.backend_drops.get() + 1);
+        }
+    }
+
+    impl IO for TrackedCancelIo {
+        fn open(
+            &self,
+            path: &std::path::Path,
+            options: OpenOptions,
+        ) -> std::io::Result<Box<dyn IOFile>> {
+            self.inner.open(path, options)
+        }
+
+        fn socket(&self) -> std::io::Result<Box<dyn IOSocket>> {
+            self.inner.socket()
+        }
+
+        fn mkdir(
+            &self,
+            completion: &mut MkdirCompletion,
+            path: &std::path::Path,
+            mode: u32,
+        ) -> std::io::Result<()> {
+            self.inner.mkdir(completion, path, mode)
+        }
+
+        fn backend_name(&self) -> &'static str {
+            "tracked-cancel"
+        }
+    }
+
+    impl IOLoop for TrackedCancelIo {
+        fn step(&self) -> std::io::Result<bool> {
+            self.metrics.steps.set(self.metrics.steps.get() + 1);
+            if self.metrics.slots_released.get() {
+                self.metrics
+                    .steps_after_slots_released
+                    .set(self.metrics.steps_after_slots_released.get() + 1);
+            }
+            self.inner.step()
+        }
+
+        fn pending_completion_count(&self) -> usize {
+            self.inner.pending_completion_count()
+        }
+
+        fn cancel_pending_completions(&self) -> std::io::Result<()> {
+            self.metrics
+                .cancel_calls
+                .set(self.metrics.cancel_calls.get() + 1);
+            assert!(
+                !self.metrics.panic_on_cancel.get(),
+                "injected cancellation panic"
+            );
+            if self.retain_on_cancel {
+                Ok(())
+            } else {
+                self.inner.cancel_pending_completions()
+            }
+        }
+    }
+
+    fn tracked_cancel_loop(
+        retain_on_cancel: bool,
+    ) -> (
+        IOLoopHandle<Global>,
+        std::rc::Weak<TrackedCancelIo>,
+        std::rc::Rc<SharedIoDropMetrics>,
+    ) {
+        let metrics = std::rc::Rc::new(SharedIoDropMetrics {
+            slots_released: std::rc::Rc::new(std::cell::Cell::new(false)),
+            ..SharedIoDropMetrics::default()
+        });
+        let backend = std::rc::Rc::new(TrackedCancelIo {
+            inner: SimulatedIO::new(),
+            retain_on_cancel,
+            metrics: std::rc::Rc::clone(&metrics),
+        });
+        let weak = std::rc::Rc::downgrade(&backend);
+        let handle = IOLoopHandle::new(backend, Global);
+        (handle, weak, metrics)
+    }
+
+    fn arm_pending_accept(driver: &mut BetelgeuseDriver) {
+        let bound = driver
+            .submit(
+                CallId::new(8_001),
+                CallInput::TcpBind {
+                    addr: "127.0.0.1:0".parse().expect("loopback"),
+                },
+                Instant::now(),
+            )
+            .expect("simulated bind completes inline");
+        let listener = match bound.result {
+            CallOutput::TcpBound { listener, .. } => listener,
+            other => panic!("unexpected bind completion: {other:?}"),
+        };
+        assert!(
+            driver
+                .submit(
+                    CallId::new(8_002),
+                    CallInput::TcpAccept { listener },
+                    Instant::now(),
+                )
+                .is_none(),
+            "accept must remain backend-owned"
+        );
+    }
 
     #[test]
     fn explicit_driver_storage_completes_inline_without_pending_lane() {
@@ -1668,6 +1982,115 @@ mod tests {
     // -------------------------------------------------------------------
 
     #[test]
+    fn failed_mixed_lane_shutdown_quarantines_loop_and_completion_storage_together() {
+        let (io_loop, backend, metrics) = tracked_cancel_loop(true);
+        let mut driver = BetelgeuseDriver::with_io_loop_and_capacities(io_loop, 1, 1, 1, 1, 1, 1);
+        driver
+            .shared_io
+            .set_slots_released_probe(std::rc::Rc::clone(&metrics.slots_released));
+        arm_pending_accept(&mut driver);
+
+        assert_eq!(
+            driver.cancel_pending(Instant::now()),
+            Err(DriverShutdownError::BackendStillOwnsCompletions)
+        );
+        assert_eq!(driver.shared_io.drop_state, SharedIoDropState::Quarantined);
+        let steps_before_drop = metrics.steps.get();
+        drop(driver);
+
+        assert!(
+            backend.upgrade().is_some(),
+            "failed drain must quarantine the shared loop with its slots"
+        );
+        assert!(!metrics.slots_released.get());
+        assert_eq!(metrics.steps.get(), steps_before_drop);
+        assert_eq!(metrics.steps_after_slots_released.get(), 0);
+        assert_eq!(metrics.backend_drops.get(), 0);
+    }
+
+    #[test]
+    fn ordinary_drop_quarantines_when_backend_retains_a_completion() {
+        let (io_loop, backend, metrics) = tracked_cancel_loop(true);
+        let mut driver = BetelgeuseDriver::with_io_loop_and_capacities(io_loop, 1, 1, 1, 1, 1, 1);
+        driver
+            .shared_io
+            .set_slots_released_probe(std::rc::Rc::clone(&metrics.slots_released));
+        arm_pending_accept(&mut driver);
+
+        drop(driver);
+
+        assert!(metrics.cancel_calls.get() > 0);
+        assert!(backend.upgrade().is_some());
+        assert!(!metrics.slots_released.get());
+        assert_eq!(metrics.steps_after_slots_released.get(), 0);
+        assert_eq!(metrics.backend_drops.get(), 0);
+    }
+
+    #[test]
+    fn cancellation_panic_quarantines_before_resuming_unwind() {
+        let (io_loop, backend, metrics) = tracked_cancel_loop(false);
+        let mut driver = BetelgeuseDriver::with_io_loop_and_capacities(io_loop, 1, 1, 1, 1, 1, 1);
+        driver
+            .shared_io
+            .set_slots_released_probe(std::rc::Rc::clone(&metrics.slots_released));
+        arm_pending_accept(&mut driver);
+        metrics.panic_on_cancel.set(true);
+
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(driver)));
+        assert!(panic.is_err());
+        assert!(backend.upgrade().is_some());
+        assert!(!metrics.slots_released.get());
+        assert_eq!(metrics.steps_after_slots_released.get(), 0);
+        assert_eq!(metrics.backend_drops.get(), 0);
+    }
+
+    #[test]
+    fn failed_shutdown_quarantine_is_deterministic_on_replay() {
+        fn run_once() -> (usize, usize, usize, bool) {
+            let (io_loop, _backend, metrics) = tracked_cancel_loop(true);
+            let mut driver =
+                BetelgeuseDriver::with_io_loop_and_capacities(io_loop, 1, 1, 1, 1, 1, 1);
+            driver
+                .shared_io
+                .set_slots_released_probe(std::rc::Rc::clone(&metrics.slots_released));
+            arm_pending_accept(&mut driver);
+            let _ = driver.cancel_pending(Instant::now());
+            drop(driver);
+            (
+                metrics.steps.get(),
+                metrics.cancel_calls.get(),
+                metrics.steps_after_slots_released.get(),
+                metrics.slots_released.get(),
+            )
+        }
+
+        let first = run_once();
+        let replay = run_once();
+        assert_eq!(first, replay);
+        assert_eq!(first.2, 0);
+        assert!(!first.3);
+    }
+
+    #[test]
+    fn successful_shared_loop_shutdown_reclaims_without_post_release_steps() {
+        let (io_loop, backend, metrics) = tracked_cancel_loop(false);
+        let mut driver = BetelgeuseDriver::with_io_loop_and_capacities(io_loop, 1, 1, 1, 1, 1, 1);
+        driver
+            .shared_io
+            .set_slots_released_probe(std::rc::Rc::clone(&metrics.slots_released));
+        arm_pending_accept(&mut driver);
+
+        assert_eq!(driver.cancel_pending(Instant::now()), Ok(()));
+        assert_eq!(driver.shared_io.drop_state, SharedIoDropState::Released);
+        drop(driver);
+
+        assert!(metrics.slots_released.get());
+        assert_eq!(metrics.steps_after_slots_released.get(), 0);
+        assert_eq!(metrics.backend_drops.get(), 1);
+        assert!(backend.upgrade().is_none());
+    }
+
+    #[test]
     fn betelgeuse_tcp_shutdown_returns_within_budget() {
         // Even with an in-flight TCP accept, bounded shutdown must
         // return promptly. The backend may not release the completion
@@ -1987,7 +2410,7 @@ mod tests {
             // Listener gone; the cancelled accept no longer counts as pending.
             assert_eq!(driver.resource_report().listeners, 0);
             assert_eq!(driver.resource_report().pending_driver_call_count(), 0);
-            assert!(!driver.unix.has_pending());
+            assert!(!driver.shared_io.unix().has_pending());
 
             let _ = driver.cancel_pending(Instant::now() + Duration::from_millis(100));
         }
@@ -2026,7 +2449,7 @@ mod tests {
                 thread::sleep(Duration::from_millis(1));
             }
             assert!(!spurious.iter().any(|c| c.call_id == CallId::new(300)));
-            assert!(!driver.unix.has_pending());
+            assert!(!driver.shared_io.unix().has_pending());
 
             let _ = driver.cancel_pending(Instant::now() + Duration::from_millis(100));
         }
@@ -2046,7 +2469,7 @@ mod tests {
                     )
                     .is_none()
             );
-            assert!(driver.unix.has_pending());
+            assert!(driver.shared_io.unix().has_pending());
 
             let budget = Duration::from_millis(100);
             let started = Instant::now();
@@ -2092,7 +2515,7 @@ mod tests {
                 driver.advance(Instant::now(), &mut sink);
             }
             assert!(sink.is_empty(), "no peer, so accept must not complete yet");
-            assert_eq!(driver.unix.physical_pending_len(), 1);
+            assert_eq!(driver.shared_io.unix().physical_pending_len(), 1);
 
             // Close wins over the parked accept.
             let closed = driver
@@ -2122,7 +2545,7 @@ mod tests {
             let result = driver.cancel_pending(Instant::now() + Duration::from_millis(200));
             assert!(result.is_ok(), "shutdown should release the backend slot");
             assert_eq!(
-                driver.unix.physical_pending_len(),
+                driver.shared_io.unix().physical_pending_len(),
                 0,
                 "shutdown must leave no stranded pending entry"
             );
@@ -2179,14 +2602,14 @@ mod tests {
                 driver.advance(Instant::now(), &mut sink);
                 // The runtime never waits on a close-cancelled read.
                 assert_eq!(driver.resource_report().pending_driver_call_count(), 0);
-                assert!(!driver.unix.has_pending());
+                assert!(!driver.shared_io.unix().has_pending());
             }
 
             // Bounded shutdown reaps any close-cancelled tombstones the backend
             // still referenced, leaving nothing stranded.
             let result = driver.cancel_pending(Instant::now() + Duration::from_millis(500));
             assert!(result.is_ok(), "shutdown should release all backend slots");
-            assert_eq!(driver.unix.physical_pending_len(), 0);
+            assert_eq!(driver.shared_io.unix().physical_pending_len(), 0);
         }
 
         #[test]

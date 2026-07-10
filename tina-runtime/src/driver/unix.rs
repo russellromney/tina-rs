@@ -539,10 +539,6 @@ mod imp {
             // the per-shard shutdown budget elapses. Each step gives the
             // backend a chance to release ownership of completion slots.
             loop {
-                if self.pending.is_empty() || Instant::now() >= deadline {
-                    return;
-                }
-                let _ = self.io_loop.step();
                 let mut index = 0;
                 while index < self.pending.len() {
                     if self.pending[index].kind.has_result() {
@@ -551,6 +547,10 @@ mod imp {
                         index += 1;
                     }
                 }
+                if self.pending.is_empty() || Instant::now() >= deadline {
+                    return;
+                }
+                let _ = self.io_loop.step();
             }
         }
 
@@ -836,11 +836,9 @@ mod imp {
         }
     }
 
-    // No `Drop` impl on purpose: the Unix lane shares its Betelgeuse loop
-    // with the TCP lane, and `cancel_pending_completions` is a whole-loop
-    // operation only safe before any lane has dropped (see the TLS lane's
-    // note). On a bare runtime drop the lane's boxes and io_loop handle
-    // simply fall; the backend is torn down without dereferencing them.
+    // No `Drop` impl on purpose: the Unix lane shares its Betelgeuse loop with
+    // TCP/storage/TLS. `SharedIoLanes` owns whole-loop cancellation and the
+    // reclaim-or-quarantine decision before any completion storage can drop.
 
     impl std::fmt::Debug for BetelgeuseUnix {
         fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

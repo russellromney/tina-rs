@@ -1581,6 +1581,134 @@ impl Isolate for WriteProbe {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OwnedWriteCase {
+    InvalidStream,
+    BusyPrimary,
+    BusyRejected,
+    ClosedStream,
+    InvalidStart,
+    CapacityPrimary,
+    CapacityRejected,
+    PartialWrite,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OwnedWriteObservation {
+    case: OwnedWriteCase,
+    error: Option<CallError>,
+    bytes: Vec<u8>,
+    capacity: usize,
+    allocation_preserved: bool,
+    writes: Vec<usize>,
+}
+
+#[derive(Debug, Clone)]
+enum OwnedWriteProbeMsg {
+    Start { bytes: Vec<u8>, start: usize },
+    Completed(Result<TcpWriteOwnedReply, WriteOwnedError>),
+}
+
+#[derive(Debug)]
+struct OwnedWriteProbe {
+    case: OwnedWriteCase,
+    stream: StreamId,
+    write_all: bool,
+    expected_ptr: usize,
+    expected_capacity: usize,
+    cursor: usize,
+    allocation_preserved: bool,
+    writes: Vec<usize>,
+    observed: Arc<Mutex<Vec<OwnedWriteObservation>>>,
+}
+
+impl OwnedWriteProbe {
+    fn new(
+        case: OwnedWriteCase,
+        stream: StreamId,
+        write_all: bool,
+        observed: Arc<Mutex<Vec<OwnedWriteObservation>>>,
+    ) -> Self {
+        Self {
+            case,
+            stream,
+            write_all,
+            expected_ptr: 0,
+            expected_capacity: 0,
+            cursor: 0,
+            allocation_preserved: true,
+            writes: Vec::new(),
+            observed,
+        }
+    }
+
+    fn write_effect(&self, bytes: Vec<u8>, start: usize) -> Effect<Self> {
+        Effect::Io(RuntimeCall::new(
+            CallInput::TcpWriteOwned {
+                stream: self.stream,
+                bytes,
+                start,
+            },
+            |result| OwnedWriteProbeMsg::Completed(result.into_tcp_wrote_owned()),
+        ))
+    }
+}
+
+impl Isolate for OwnedWriteProbe {
+    tina::isolate_types! {
+        message: OwnedWriteProbeMsg,
+        reply: (),
+        send: Outbound<Infallible>,
+        spawn: Infallible,
+        io: RuntimeCall<OwnedWriteProbeMsg>,
+        shard: TestShard,
+    }
+
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
+        match msg {
+            OwnedWriteProbeMsg::Start { bytes, start } => {
+                self.expected_ptr = bytes.as_ptr() as usize;
+                self.expected_capacity = bytes.capacity();
+                self.cursor = start;
+                self.allocation_preserved = true;
+                self.writes.clear();
+                self.write_effect(bytes, start)
+            }
+            OwnedWriteProbeMsg::Completed(result) => {
+                let (bytes, written, error) = match result {
+                    Ok(reply) => (reply.bytes, Some(reply.written), None),
+                    Err(error) => (error.bytes, None, Some(error.error)),
+                };
+                self.allocation_preserved &= bytes.as_ptr() as usize == self.expected_ptr
+                    && bytes.capacity() == self.expected_capacity;
+                if let Some(written) = written {
+                    self.writes.push(written);
+                    self.cursor = self.cursor.saturating_add(written);
+                    if self.write_all && written > 0 && self.cursor < bytes.len() {
+                        return self.write_effect(bytes, self.cursor);
+                    }
+                }
+                self.observed
+                    .lock()
+                    .expect("owned write observations")
+                    .push(OwnedWriteObservation {
+                        case: self.case,
+                        error,
+                        capacity: bytes.capacity(),
+                        bytes,
+                        allocation_preserved: self.allocation_preserved,
+                        writes: std::mem::take(&mut self.writes),
+                    });
+                Effect::Noop
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 enum CloserMsg {
     CloseListener,
@@ -4037,6 +4165,299 @@ fn pending_completion_capacity_exhaustion_surfaces_io_failure() {
             }
         )
     }));
+}
+
+fn owned_payload(bytes: &[u8]) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(32);
+    payload.extend_from_slice(bytes);
+    payload
+}
+
+fn owned_write_observation(
+    observed: &[OwnedWriteObservation],
+    case: OwnedWriteCase,
+) -> &OwnedWriteObservation {
+    observed
+        .iter()
+        .find(|observation| observation.case == case)
+        .unwrap_or_else(|| panic!("missing owned write observation for {case:?}"))
+}
+
+#[test]
+fn owned_tcp_write_failures_preserve_allocation_on_invalid_closed_and_busy_paths() {
+    let mut sim = Simulator::new(
+        TestShard,
+        SimulatorConfig {
+            faults: FaultConfig {
+                tcp_completion: TcpCompletionFaultMode::DelayBySteps {
+                    one_in: 1,
+                    steps: 3,
+                },
+                ..Default::default()
+            },
+            tcp: ScriptedTcpConfig {
+                pending_completion_capacity: 8,
+                listeners: vec![ScriptedListenerConfig {
+                    bind_addr: bind_addr(),
+                    local_addr: local_addr(48_560),
+                    backlog_capacity: 1,
+                    peers: vec![peer_script(1, peer_addr(58_560), Vec::new(), None, 2)],
+                }],
+            },
+            ..Default::default()
+        },
+    );
+    let (listener, _) = bind_listener(&mut sim, bind_addr());
+    let (stream, _) = accept_stream(&mut sim, listener);
+    let observed = Arc::new(Mutex::new(Vec::new()));
+
+    for (case, target, bytes, start) in [
+        (
+            OwnedWriteCase::InvalidStream,
+            StreamId::new(999),
+            b"invalid".as_slice(),
+            0,
+        ),
+        (
+            OwnedWriteCase::InvalidStart,
+            stream,
+            b"start".as_slice(),
+            99,
+        ),
+    ] {
+        let probe = sim.register(OwnedWriteProbe::new(
+            case,
+            target,
+            false,
+            Arc::clone(&observed),
+        ));
+        sim.try_send(
+            probe,
+            OwnedWriteProbeMsg::Start {
+                bytes: owned_payload(bytes),
+                start,
+            },
+        )
+        .unwrap();
+    }
+    sim.run_until_quiescent();
+
+    let primary = sim.register(OwnedWriteProbe::new(
+        OwnedWriteCase::BusyPrimary,
+        stream,
+        false,
+        Arc::clone(&observed),
+    ));
+    let rejected = sim.register(OwnedWriteProbe::new(
+        OwnedWriteCase::BusyRejected,
+        stream,
+        false,
+        Arc::clone(&observed),
+    ));
+    sim.try_send(
+        primary,
+        OwnedWriteProbeMsg::Start {
+            bytes: owned_payload(b"primary"),
+            start: 0,
+        },
+    )
+    .unwrap();
+    sim.try_send(
+        rejected,
+        OwnedWriteProbeMsg::Start {
+            bytes: owned_payload(b"busy"),
+            start: 0,
+        },
+    )
+    .unwrap();
+    sim.run_until_quiescent();
+
+    let closer = sim.register(StreamCloser { stream });
+    sim.try_send(closer, CloserMsg::CloseStream).unwrap();
+    sim.run_until_quiescent();
+    let closed = sim.register(OwnedWriteProbe::new(
+        OwnedWriteCase::ClosedStream,
+        stream,
+        false,
+        Arc::clone(&observed),
+    ));
+    sim.try_send(
+        closed,
+        OwnedWriteProbeMsg::Start {
+            bytes: owned_payload(b"closed"),
+            start: 0,
+        },
+    )
+    .unwrap();
+    sim.run_until_quiescent();
+
+    let observed = observed.lock().expect("owned observations");
+    for (case, error, bytes) in [
+        (
+            OwnedWriteCase::InvalidStream,
+            CallError::InvalidResource,
+            b"invalid".as_slice(),
+        ),
+        (
+            OwnedWriteCase::InvalidStart,
+            CallError::InvariantViolation,
+            b"start".as_slice(),
+        ),
+        (
+            OwnedWriteCase::BusyRejected,
+            CallError::ResourceBusy,
+            b"busy".as_slice(),
+        ),
+        (
+            OwnedWriteCase::ClosedStream,
+            CallError::InvalidResource,
+            b"closed".as_slice(),
+        ),
+    ] {
+        let observation = owned_write_observation(&observed, case);
+        assert_eq!(observation.error, Some(error));
+        assert_eq!(observation.bytes, bytes);
+        assert_eq!(observation.capacity, 32);
+        assert!(observation.allocation_preserved);
+    }
+    assert!(owned_write_observation(&observed, OwnedWriteCase::BusyPrimary).allocation_preserved);
+}
+
+#[test]
+fn owned_tcp_write_completion_capacity_failure_returns_the_original_allocation() {
+    let mut sim = Simulator::new(
+        TestShard,
+        SimulatorConfig {
+            faults: FaultConfig {
+                tcp_completion: TcpCompletionFaultMode::DelayBySteps {
+                    one_in: 1,
+                    steps: 3,
+                },
+                ..Default::default()
+            },
+            tcp: ScriptedTcpConfig {
+                pending_completion_capacity: 1,
+                listeners: vec![ScriptedListenerConfig {
+                    bind_addr: bind_addr(),
+                    local_addr: local_addr(48_570),
+                    backlog_capacity: 2,
+                    peers: vec![
+                        peer_script(1, peer_addr(58_570), Vec::new(), None, 8),
+                        peer_script(1, peer_addr(58_571), Vec::new(), None, 8),
+                    ],
+                }],
+            },
+            ..Default::default()
+        },
+    );
+    let (listener, _) = bind_listener(&mut sim, bind_addr());
+    let (first_stream, _) = accept_stream(&mut sim, listener);
+    let (second_stream, _) = accept_stream(&mut sim, listener);
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let primary = sim.register(OwnedWriteProbe::new(
+        OwnedWriteCase::CapacityPrimary,
+        first_stream,
+        false,
+        Arc::clone(&observed),
+    ));
+    let rejected = sim.register(OwnedWriteProbe::new(
+        OwnedWriteCase::CapacityRejected,
+        second_stream,
+        false,
+        Arc::clone(&observed),
+    ));
+    sim.try_send(
+        primary,
+        OwnedWriteProbeMsg::Start {
+            bytes: owned_payload(b"primary"),
+            start: 0,
+        },
+    )
+    .unwrap();
+    sim.try_send(
+        rejected,
+        OwnedWriteProbeMsg::Start {
+            bytes: owned_payload(b"capacity"),
+            start: 0,
+        },
+    )
+    .unwrap();
+    sim.run_until_quiescent();
+
+    let observed = observed.lock().expect("owned observations");
+    let rejected = owned_write_observation(&observed, OwnedWriteCase::CapacityRejected);
+    assert_eq!(rejected.error, Some(CallError::Io));
+    assert_eq!(rejected.bytes, b"capacity");
+    assert_eq!(rejected.capacity, 32);
+    assert!(rejected.allocation_preserved);
+}
+
+fn run_owned_partial_write_scenario() -> (Vec<OwnedWriteObservation>, ReplayArtifact) {
+    let mut sim = Simulator::new(
+        TestShard,
+        SimulatorConfig {
+            seed: 0x00A1_10C8,
+            faults: FaultConfig {
+                tcp_completion: TcpCompletionFaultMode::DelayBySteps {
+                    one_in: 2,
+                    steps: 2,
+                },
+                ..Default::default()
+            },
+            tcp: ScriptedTcpConfig {
+                pending_completion_capacity: 8,
+                listeners: vec![ScriptedListenerConfig {
+                    bind_addr: bind_addr(),
+                    local_addr: local_addr(48_580),
+                    backlog_capacity: 1,
+                    peers: vec![peer_script(1, peer_addr(58_580), Vec::new(), None, 2)],
+                }],
+            },
+            ..Default::default()
+        },
+    );
+    let (listener, _) = bind_listener(&mut sim, bind_addr());
+    let (stream, _) = accept_stream(&mut sim, listener);
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let probe = sim.register(OwnedWriteProbe::new(
+        OwnedWriteCase::PartialWrite,
+        stream,
+        true,
+        Arc::clone(&observed),
+    ));
+    sim.try_send(
+        probe,
+        OwnedWriteProbeMsg::Start {
+            bytes: owned_payload(b"partial"),
+            start: 0,
+        },
+    )
+    .unwrap();
+    sim.run_until_quiescent();
+    let observations = observed.lock().expect("owned observations").clone();
+    (observations, sim.replay_artifact())
+}
+
+#[test]
+fn owned_tcp_partial_writes_preserve_allocation_and_replay() {
+    let (observed, artifact) = run_owned_partial_write_scenario();
+    let (replayed, replayed_artifact) = run_owned_partial_write_scenario();
+    assert_eq!(replayed, observed);
+    assert_eq!(replayed_artifact, artifact);
+    let observation = owned_write_observation(&observed, OwnedWriteCase::PartialWrite);
+    assert_eq!(observation.error, None);
+    assert_eq!(observation.bytes, b"partial");
+    assert_eq!(observation.capacity, 32);
+    assert!(observation.allocation_preserved);
+    assert_eq!(observation.writes, [2, 2, 2, 1]);
+    assert!(
+        artifact
+            .observed_peer_output()
+            .iter()
+            .any(|output| output.bytes() == b"partial"),
+        "the scripted peer must observe the complete partial-write sequence"
+    );
+    InvariantSuite::standard().assert(artifact.event_record());
 }
 
 #[test]
