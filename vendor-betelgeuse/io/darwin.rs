@@ -49,8 +49,10 @@ impl Drop for OwnedFd {
 }
 
 struct DarwinState {
+    /// Cached kqueue fd owned by this loop.
     kq: RawFd,
     queued: VecDeque<NonNull<CompletionInner>>,
+    watched: Vec<WatchedCompletion>,
 }
 
 impl Drop for DarwinState {
@@ -59,6 +61,13 @@ impl Drop for DarwinState {
             libc::close(self.kq);
         }
     }
+}
+
+#[derive(Clone, Copy)]
+struct WatchedCompletion {
+    completion: NonNull<CompletionInner>,
+    fd: RawFd,
+    filter: i16,
 }
 
 struct DarwinFile {
@@ -96,6 +105,7 @@ impl DarwinIO {
             state: Rc::new(RefCell::new(DarwinState {
                 kq,
                 queued: VecDeque::new(),
+                watched: Vec::new(),
             })),
         })
     }
@@ -184,41 +194,51 @@ impl DarwinIO {
         Ok(Rc::new(OwnedFd::new(fd)))
     }
 
-    fn watch_fd(kq: RawFd, c: NonNull<CompletionInner>, op: &Operation) -> io::Result<()> {
-        let (fd, filter) = match op {
-            Operation::Accept(op) => (op.fd, libc::EVFILT_READ),
-            Operation::Connect(op) => (op.fd, libc::EVFILT_WRITE),
-            Operation::Recv(op) | Operation::RecvBuf(op) => (op.fd, libc::EVFILT_READ),
-            Operation::Send(op) | Operation::SendOwned(op) => (op.fd, libc::EVFILT_WRITE),
-            _ => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "operation cannot be watched by kqueue",
-                ));
-            }
-        };
-
-        let mut change = libc::kevent {
-            ident: fd as libc::uintptr_t,
+    fn watched_completion(
+        c: NonNull<CompletionInner>,
+        op: &Operation,
+    ) -> io::Result<WatchedCompletion> {
+        let (fd, filter) = operation_fd_filter(op)?;
+        Ok(WatchedCompletion {
+            completion: c,
+            fd,
             filter,
-            flags: (libc::EV_ADD | libc::EV_ONESHOT) as u16,
+        })
+    }
+
+    fn watch_fd(kq: RawFd, watched: WatchedCompletion) -> io::Result<()> {
+        let change = libc::kevent {
+            ident: watched.fd as libc::uintptr_t,
+            filter: watched.filter,
+            flags: libc::EV_ADD | libc::EV_ONESHOT,
             fflags: 0,
             data: 0,
-            udata: c.as_ptr().cast(),
+            udata: watched.completion.as_ptr().cast(),
         };
 
-        let rc = unsafe {
-            libc::kevent(
-                kq,
-                &mut change,
-                1,
-                std::ptr::null_mut(),
-                0,
-                std::ptr::null(),
-            )
-        };
+        let rc = unsafe { libc::kevent(kq, &change, 1, std::ptr::null_mut(), 0, std::ptr::null()) };
         if rc < 0 {
             return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    fn delete_watch(kq: RawFd, watched: WatchedCompletion) -> io::Result<()> {
+        let change = libc::kevent {
+            ident: watched.fd as libc::uintptr_t,
+            filter: watched.filter,
+            flags: libc::EV_DELETE,
+            fflags: 0,
+            data: 0,
+            udata: watched.completion.as_ptr().cast(),
+        };
+
+        let rc = unsafe { libc::kevent(kq, &change, 1, std::ptr::null_mut(), 0, std::ptr::null()) };
+        if rc < 0 {
+            let err = io::Error::last_os_error();
+            if err.raw_os_error() != Some(libc::ENOENT) {
+                return Err(err);
+            }
         }
         Ok(())
     }
@@ -643,10 +663,12 @@ impl IO for DarwinIO {
     }
 }
 
-impl IOLoop for DarwinIO {
-    fn step(&self) -> io::Result<bool> {
+impl DarwinIO {
+    /// Submits queued operations: executes each, watching the fd via kqueue when
+    /// it would block, retrying transient ones. Returns whether any queued op
+    /// progressed.
+    fn drain_queued(&self) -> io::Result<bool> {
         let mut progressed = false;
-
         let queued_len = self.state.borrow().queued.len();
         for _ in 0..queued_len {
             let completion_ptr = self
@@ -660,7 +682,9 @@ impl IOLoop for DarwinIO {
             match execute_completion(&self.state, completion) {
                 PollResult::Wait => {
                     let kq = self.state.borrow().kq;
-                    Self::watch_fd(kq, completion_ptr, completion.operation())?;
+                    let watched = Self::watched_completion(completion_ptr, completion.operation())?;
+                    Self::watch_fd(kq, watched)?;
+                    self.state.borrow_mut().watched.push(watched);
                 }
                 PollResult::Retry => {
                     self.state.borrow_mut().queued.push_back(completion_ptr);
@@ -669,7 +693,13 @@ impl IOLoop for DarwinIO {
             }
             progressed = true;
         }
+        Ok(progressed)
+    }
 
+    /// Harvests ready kqueue events with a zero timeout: a nonblocking poll.
+    /// This backend never sleeps; `step` is the only progress primitive.
+    fn poll_events(&self) -> io::Result<bool> {
+        let mut progressed = false;
         let kq = self.state.borrow().kq;
         let mut events: [libc::kevent; 64] = unsafe { MaybeUninit::zeroed().assume_init() };
         let timeout = libc::timespec {
@@ -687,7 +717,13 @@ impl IOLoop for DarwinIO {
             )
         };
         if n < 0 {
-            return Err(io::Error::last_os_error());
+            let err = io::Error::last_os_error();
+            // A kevent interrupted by a signal is a (spurious) wake, not a
+            // failure: return so the caller re-polls.
+            if err.raw_os_error() == Some(libc::EINTR) {
+                return Ok(progressed);
+            }
+            return Err(err);
         }
         if n > 0 {
             progressed = true;
@@ -697,8 +733,12 @@ impl IOLoop for DarwinIO {
             let Some(completion_ptr) = NonNull::new(ev.udata.cast::<CompletionInner>()) else {
                 continue;
             };
+            self.state
+                .borrow_mut()
+                .watched
+                .retain(|watched| watched.completion != completion_ptr);
 
-            if (ev.flags & libc::EV_ERROR as u16) != 0 && ev.data != 0 {
+            if (ev.flags & libc::EV_ERROR) != 0 && ev.data != 0 {
                 let completion = unsafe { completion_ptr.as_ptr().as_mut().expect("non-null") };
                 fail_completion(completion, io::Error::from_raw_os_error(ev.data as i32));
                 continue;
@@ -708,6 +748,43 @@ impl IOLoop for DarwinIO {
         }
 
         Ok(progressed)
+    }
+}
+
+impl IOLoop for DarwinIO {
+    fn step(&self) -> io::Result<bool> {
+        let queued = self.drain_queued()?;
+        let events = self.poll_events()?;
+        Ok(queued || events)
+    }
+
+    fn pending_completion_count(&self) -> usize {
+        let state = self.state.borrow();
+        state.queued.len() + state.watched.len()
+    }
+
+    fn cancel_pending_completions(&self) -> io::Result<()> {
+        let (queued, watched, kq) = {
+            let mut state = self.state.borrow_mut();
+            (
+                std::mem::take(&mut state.queued),
+                std::mem::take(&mut state.watched),
+                state.kq,
+            )
+        };
+
+        for completion_ptr in queued {
+            let completion = unsafe { completion_ptr.as_ptr().as_mut().expect("non-null") };
+            fail_completion(completion, cancelled_error());
+        }
+
+        for watched in watched {
+            Self::delete_watch(kq, watched)?;
+            let completion = unsafe { watched.completion.as_ptr().as_mut().expect("non-null") };
+            fail_completion(completion, cancelled_error());
+        }
+
+        Ok(())
     }
 }
 
@@ -747,6 +824,23 @@ fn fail_completion(c: &mut CompletionInner, err: io::Error) {
         Operation::Mkdir(_) => unsafe { MkdirCompletion::from_inner_mut(c) }.complete(Err(err)),
         Operation::Nop => {}
     }
+}
+
+fn operation_fd_filter(op: &Operation) -> io::Result<(RawFd, i16)> {
+    match op {
+        Operation::Accept(op) => Ok((op.fd, libc::EVFILT_READ)),
+        Operation::Connect(op) => Ok((op.fd, libc::EVFILT_WRITE)),
+        Operation::Recv(op) | Operation::RecvBuf(op) => Ok((op.fd, libc::EVFILT_READ)),
+        Operation::Send(op) | Operation::SendOwned(op) => Ok((op.fd, libc::EVFILT_WRITE)),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "operation cannot be watched by kqueue",
+        )),
+    }
+}
+
+fn cancelled_error() -> io::Error {
+    io::Error::new(io::ErrorKind::Interrupted, "operation cancelled")
 }
 
 /// Runs the syscall for the operation armed in `c` and either parks the

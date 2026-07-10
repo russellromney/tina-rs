@@ -1,6 +1,6 @@
 use std::{
     cell::RefCell,
-    collections::VecDeque,
+    collections::{HashSet, VecDeque},
     ffi::CString,
     io,
     mem::{self, MaybeUninit},
@@ -52,7 +52,7 @@ impl Drop for OwnedFd {
 struct IoUringState {
     ring: IoUring,
     queued: VecDeque<NonNull<CompletionInner>>,
-    inflight: usize,
+    inflight: HashSet<NonNull<CompletionInner>>,
 }
 
 struct IoUringFile {
@@ -88,7 +88,7 @@ impl IoUringIO {
                         state: Rc::new(RefCell::new(IoUringState {
                             ring,
                             queued: VecDeque::new(),
-                            inflight: 0,
+                            inflight: HashSet::new(),
                         })),
                     });
                 }
@@ -794,56 +794,48 @@ impl IO for IoUringIO {
     }
 }
 
-impl IOLoop for IoUringIO {
-    fn step(&self) -> io::Result<bool> {
-        let mut progressed = false;
+impl IoUringIO {
+    /// Pushes queued ops into the submission queue (without calling `submit`).
+    /// Returns the inline `Size` ops to dispatch and whether any op was pushed.
+    /// Shared by `step` and shutdown cancellation.
+    fn fill_submission(state: &mut IoUringState) -> (Vec<NonNull<CompletionInner>>, bool) {
         let mut size_ops = Vec::new();
+        let mut submitted = false;
+        let queued_len = state.queued.len();
+        for _ in 0..queued_len {
+            let completion_ptr = match state.queued.pop_front() {
+                Some(completion) => completion,
+                None => break,
+            };
+            let completion = unsafe { completion_ptr.as_ptr().as_mut().expect("non-null") };
 
-        {
-            let mut state = self.state.borrow_mut();
-            let queued_len = state.queued.len();
-            let mut submitted = 0;
-            for _ in 0..queued_len {
-                let completion_ptr = match state.queued.pop_front() {
-                    Some(completion) => completion,
-                    None => break,
-                };
-                let completion = unsafe { completion_ptr.as_ptr().as_mut().expect("non-null") };
-
-                if matches!(completion.operation(), Operation::Size(_)) {
-                    if state.inflight > 0 {
-                        state.queued.push_front(completion_ptr);
-                        break;
-                    }
-                    size_ops.push(completion_ptr);
-                    progressed = true;
-                    continue;
-                }
-
-                let entry = Self::prepare_entry(completion);
-                let mut submission = state.ring.submission();
-                let pushed = unsafe { submission.push(&entry).is_ok() };
-                drop(submission);
-                if !pushed {
+            if matches!(completion.operation(), Operation::Size(_)) {
+                if !state.inflight.is_empty() {
                     state.queued.push_front(completion_ptr);
                     break;
                 }
-                completion.mark_submitted();
-                state.inflight += 1;
-                submitted += 1;
-                progressed = true;
+                size_ops.push(completion_ptr);
+                continue;
             }
 
-            if submitted > 0 {
-                state.ring.submit()?;
+            let entry = Self::prepare_entry(completion);
+            let mut submission = state.ring.submission();
+            let pushed = unsafe { submission.push(&entry).is_ok() };
+            drop(submission);
+            if !pushed {
+                state.queued.push_front(completion_ptr);
+                break;
             }
+            completion.mark_submitted();
+            state.inflight.insert(completion_ptr);
+            submitted = true;
         }
+        (size_ops, submitted)
+    }
 
-        for completion_ptr in size_ops {
-            let completion = unsafe { completion_ptr.as_ptr().as_mut().expect("non-null") };
-            Self::dispatch_complete(&self.state, completion, 0);
-        }
-
+    /// Harvests ready CQEs into typed completions. Returns whether anything progressed.
+    fn harvest(&self) -> io::Result<bool> {
+        let mut progressed = false;
         let mut completed = Vec::new();
         {
             let mut state = self.state.borrow_mut();
@@ -854,15 +846,17 @@ impl IOLoop for IoUringIO {
                     .completion()
                     .next()
                     .expect("completion length checked above");
-                let completion_ptr = NonNull::new(cqe.user_data() as *mut CompletionInner)
-                    .ok_or_else(|| {
+                let user_data = cqe.user_data();
+                if user_data == 0 {
+                    progressed = true;
+                    continue;
+                }
+                let completion_ptr =
+                    NonNull::new(user_data as *mut CompletionInner).ok_or_else(|| {
                         io::Error::new(io::ErrorKind::InvalidData, "completion pointer missing")
                     })?;
                 let completion = unsafe { completion_ptr.as_ptr().as_mut().expect("non-null") };
-                state.inflight = state
-                    .inflight
-                    .checked_sub(1)
-                    .expect("completion queue retired more requests than submitted");
+                state.inflight.remove(&completion_ptr);
                 if Self::should_retry(completion, cqe.result()) {
                     completion.mark_queued();
                     state.queued.push_back(completion_ptr);
@@ -880,6 +874,73 @@ impl IOLoop for IoUringIO {
         }
 
         Ok(progressed)
+    }
+}
+
+impl IOLoop for IoUringIO {
+    fn step(&self) -> io::Result<bool> {
+        let mut progressed = false;
+        let size_ops;
+        {
+            let mut state = self.state.borrow_mut();
+            let (ops, submitted) = Self::fill_submission(&mut state);
+            size_ops = ops;
+            if submitted {
+                state.ring.submit()?;
+                progressed = true;
+            }
+        }
+
+        for completion_ptr in size_ops {
+            let completion = unsafe { completion_ptr.as_ptr().as_mut().expect("non-null") };
+            Self::dispatch_complete(&self.state, completion, 0);
+            progressed = true;
+        }
+
+        let harvested = self.harvest()?;
+        Ok(progressed || harvested)
+    }
+
+    fn pending_completion_count(&self) -> usize {
+        let state = self.state.borrow();
+        state.queued.len() + state.inflight.len()
+    }
+
+    fn cancel_pending_completions(&self) -> io::Result<()> {
+        let (queued, inflight) = {
+            let mut state = self.state.borrow_mut();
+            (
+                std::mem::take(&mut state.queued),
+                state.inflight.iter().copied().collect::<Vec<_>>(),
+            )
+        };
+
+        for completion_ptr in queued {
+            let completion = unsafe { completion_ptr.as_ptr().as_mut().expect("non-null") };
+            Self::dispatch_complete(&self.state, completion, -libc::EINTR);
+        }
+
+        if inflight.is_empty() {
+            return Ok(());
+        }
+
+        {
+            let mut state = self.state.borrow_mut();
+            for completion_ptr in inflight {
+                let entry = opcode::AsyncCancel::new(completion_ptr.as_ptr() as u64)
+                    .build()
+                    .user_data(0);
+                let mut submission = state.ring.submission();
+                let pushed = unsafe { submission.push(&entry).is_ok() };
+                drop(submission);
+                if !pushed {
+                    break;
+                }
+            }
+            state.ring.submit()?;
+        }
+
+        Ok(())
     }
 }
 

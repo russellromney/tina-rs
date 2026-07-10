@@ -55,7 +55,30 @@ pub trait IOLoop: IO {
     ///
     /// Returns `Ok(true)` when the backend submitted or completed at least one
     /// unit of work during this step, and `Ok(false)` when nothing progressed.
+    ///
+    /// This is the non-blocking drain: it submits queued work and harvests any
+    /// already-ready completions, then returns immediately. It never sleeps.
     fn step(&self) -> stdio::Result<bool>;
+
+    /// Returns how many completion slots the backend still owns by pointer.
+    ///
+    /// This is a lifecycle hook for adapter layers that own completion
+    /// storage. Normal callers should observe typed completion objects. Runtime
+    /// adapters use this during shutdown to know when completion slots can be
+    /// dropped without leaving backend-owned raw pointers behind.
+    fn pending_completion_count(&self) -> usize {
+        0
+    }
+
+    /// Requests cancellation/release for every backend-owned completion slot.
+    ///
+    /// Implementations should complete queued operations with an error or
+    /// request kernel-side cancellation for submitted work. The caller must
+    /// keep the completion slots alive and continue stepping until
+    /// [`IOLoop::pending_completion_count`] reaches zero.
+    fn cancel_pending_completions(&self) -> stdio::Result<()> {
+        Ok(())
+    }
 }
 
 /// Submits file-system and socket operations to the backend.
@@ -225,6 +248,14 @@ impl<A> IO for IOLoopHandle<A> {
 impl<A> IOLoop for IOLoopHandle<A> {
     fn step(&self) -> stdio::Result<bool> {
         self.inner.step()
+    }
+
+    fn pending_completion_count(&self) -> usize {
+        self.inner.pending_completion_count()
+    }
+
+    fn cancel_pending_completions(&self) -> stdio::Result<()> {
+        self.inner.cancel_pending_completions()
     }
 }
 
