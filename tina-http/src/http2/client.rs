@@ -2091,10 +2091,12 @@ impl<S: Shard + 'static> Http2ClientConnection<S> {
                 }
             }
             SETTINGS_ENABLE_PUSH => {
-                let _ = value;
-                // RFC 9113 allows this setting only from clients. Receiving it
-                // from a server is a connection-level protocol error.
-                return Err(Http2ProtocolError::InvalidSettingsValue);
+                // RFC 9113 §6.5.2: a server MAY send SETTINGS_ENABLE_PUSH, but
+                // if it does the value MUST be 0. Any non-zero value (1 or an
+                // out-of-range value) from a server is a connection error.
+                if value != 0 {
+                    return Err(Http2ProtocolError::InvalidSettingsValue);
+                }
             }
             SETTINGS_MAX_CONCURRENT_STREAMS => {
                 self.peer_max_concurrent_streams = Some(value);
@@ -3252,15 +3254,25 @@ mod tests {
     }
 
     #[test]
-    fn client_rejects_enable_push_from_server() {
+    fn client_accepts_enable_push_zero_but_rejects_nonzero_from_server() {
+        // RFC 9113 §6.5.2: a server MAY advertise SETTINGS_ENABLE_PUSH, but
+        // only with value 0. The client must accept 0 (the common "push off"
+        // signal) and reject 1 or any out-of-range value as a connection error.
         let mut client = Http2ClientConnection::<tina::SingleShard>::new(
             test_target(),
             Http2ClientLimits::default(),
         )
         .expect("default client limits are valid");
 
+        client
+            .apply_setting(SETTINGS_ENABLE_PUSH, 0)
+            .expect("server may advertise ENABLE_PUSH=0");
         assert_eq!(
-            client.apply_setting(SETTINGS_ENABLE_PUSH, 0),
+            client.apply_setting(SETTINGS_ENABLE_PUSH, 1),
+            Err(Http2ProtocolError::InvalidSettingsValue)
+        );
+        assert_eq!(
+            client.apply_setting(SETTINGS_ENABLE_PUSH, 2),
             Err(Http2ProtocolError::InvalidSettingsValue)
         );
     }
