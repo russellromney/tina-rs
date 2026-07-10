@@ -1,4 +1,5 @@
 use std::cell::RefCell;
+use std::convert::Infallible;
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -266,21 +267,28 @@ impl Client {
 
 pub fn run(config: RunConfig) -> anyhow::Result<RunReport> {
     let mut sim = Simulator::new(tina::SingleShard, SimulatorConfig::default());
-    // Simulator has no `register_split_service`; wrap the raw address as
-    // capability-typed request lanes so `call_request` type-checks.
-    let probe = tina_runtime::SplitServiceHandle::from_address(sim.register(Probe {
-        delay_ms: config.probe_delay_ms,
-    }))
-    .requests;
-    let db = tina_runtime::SplitServiceHandle::from_address(sim.register(Db {
-        delay_ms: config.db_delay_ms,
-    }))
-    .requests;
-    let service = tina_runtime::SplitServiceHandle::from_address(sim.register(Service {
-        probe,
-        db,
-    }))
-    .requests;
+    let probe = sim
+        .register_split_service::<Probe, ProbeEvent, ProbeRequest, Infallible>(
+            Probe {
+                delay_ms: config.probe_delay_ms,
+            },
+            usize::MAX,
+        )
+        .requests;
+    let db = sim
+        .register_split_service::<Db, DbEvent, DbRequest, Infallible>(
+            Db {
+                delay_ms: config.db_delay_ms,
+            },
+            usize::MAX,
+        )
+        .requests;
+    let service = sim
+        .register_split_service::<Service, ServiceEvent, ServiceRequest, Infallible>(
+            Service { probe, db },
+            usize::MAX,
+        )
+        .requests;
     let replies = Rc::new(RefCell::new(Vec::new()));
     let client = sim.register(Client {
         replies: Rc::clone(&replies),

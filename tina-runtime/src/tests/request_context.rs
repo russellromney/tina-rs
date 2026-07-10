@@ -1424,6 +1424,197 @@ fn isolate_call_cancelable_defer_admits_before_dispatch_and_drains_on_owner_stop
 }
 
 // ---------------------------------------------------------------------------
+// PendingCancelableCall::reply_request on the split-service RequestCall path
+//
+// `HandleSvc` above answers `Full`/`DuplicateKey` from plain `CallContext`,
+// where `reply_to(...)` already returns the right `Effect<Self>` type. A
+// split-service `handle_request` returns `RequestEffect<Self>` instead, so
+// that plain spelling does not type-check there — this is the shape
+// `system_job_queue`'s `Queue::submit` hits, and the scenario
+// `PendingCancelableCall::reply_request` exists to answer.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug)]
+struct SplitHandleSvc {
+    probe: Address<ProbeMsg, ProbeReply>,
+    pending: PendingCancelableCallSet<u64, SvcReply, ProbeReply>,
+}
+
+#[derive(Debug)]
+enum SplitHandleSvcMsg {
+    StartKey(u64),
+    ProbeResult(u64, PendingCancelableTicket, CallOutcome<ProbeReply>),
+}
+
+impl Isolate for SplitHandleSvc {
+    type Message = SplitHandleSvcMsg;
+    type Reply = SvcReply;
+    type Send = Outbound<Infallible>;
+    type Spawn = Infallible;
+    type SpawnObserved = std::convert::Infallible;
+    type Io = RuntimeCall<SplitHandleSvcMsg>;
+    type Fact = ::std::convert::Infallible;
+    type Shard = TestShard;
+
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
+        match msg {
+            SplitHandleSvcMsg::StartKey(_) => noop(),
+            SplitHandleSvcMsg::ProbeResult(key, ticket, outcome) => {
+                match self.pending.remove(&key, ticket) {
+                    Ok(pending) => {
+                        let req = pending.into_request_context();
+                        match outcome {
+                            CallOutcome::Replied(ProbeReply(val)) if val >= 10 => {
+                                reply_to(req, SvcReply::Ready)
+                            }
+                            _ => reply_to(req, SvcReply::NotReady),
+                        }
+                    }
+                    Err(PendingCancelableRemoveError::MissingKey)
+                    | Err(PendingCancelableRemoveError::StaleTicket) => noop(),
+                }
+            }
+        }
+    }
+
+    fn handle_call(&mut self, msg: Self::Message, call_ctx: CallContext<'_, Self>) -> Effect<Self> {
+        match msg {
+            SplitHandleSvcMsg::StartKey(key) => self
+                .start_key(key, tina::RequestCall::new(call_ctx))
+                .into_effect(),
+            SplitHandleSvcMsg::ProbeResult(_, _, _) => {
+                call_ctx.reject(tina::CallRejectedReason::UnsupportedMessage)
+            }
+        }
+    }
+}
+
+impl SplitHandleSvc {
+    fn start_key(
+        &mut self,
+        key: u64,
+        call: tina::RequestCall<'_, Self>,
+    ) -> tina::RequestEffect<Self> {
+        match call
+            .defer_cancelable(call_cancelable(
+                self.probe,
+                ProbeMsg,
+                Duration::from_millis(50),
+            ))
+            .try_admit(&mut self.pending, key, SplitHandleSvcMsg::ProbeResult)
+        {
+            Ok(effect) => effect,
+            Err(PendingCancelableInsertError::Full { token }) => {
+                token.reply_request::<Self>(SvcReply::Busy)
+            }
+            Err(PendingCancelableInsertError::DuplicateKey { token }) => {
+                token.reply_request::<Self>(SvcReply::Duplicate)
+            }
+        }
+    }
+}
+
+#[test]
+fn split_service_pending_cancelable_full_replies_via_reply_request() {
+    // Real Full: capacity 1, two concurrent StartKey calls under distinct
+    // keys, probe holds the first call open so the second sees the set
+    // still occupied when it tries to admit.
+    let (mut runtime, _clock) = new_manual_runtime();
+    let child_calls = Rc::new(RefCell::new(0));
+    let probe = runtime.register(
+        CancelHoldingProbe {
+            pending: Vec::new(),
+            calls: Rc::clone(&child_calls),
+        },
+        TestMailbox::new(8),
+    );
+    let svc = runtime.register(
+        SplitHandleSvc {
+            probe,
+            pending: PendingCancelableCallSet::with_capacity(1),
+        },
+        TestMailbox::new(8),
+    );
+
+    type ClientOut = Rc<RefCell<Vec<(u64, CallOutcome<SvcReply>)>>>;
+
+    #[derive(Debug)]
+    enum SClientMsg {
+        Start {
+            key: u64,
+            svc: Address<SplitHandleSvcMsg, SvcReply>,
+        },
+        Returned(u64, CallOutcome<SvcReply>),
+    }
+
+    #[derive(Debug)]
+    struct SClient {
+        out: ClientOut,
+    }
+
+    impl Isolate for SClient {
+        type Message = SClientMsg;
+        type Reply = ();
+        type Send = Outbound<Infallible>;
+        type Spawn = Infallible;
+        type SpawnObserved = std::convert::Infallible;
+        type Io = RuntimeCall<SClientMsg>;
+        type Fact = ::std::convert::Infallible;
+        type Shard = TestShard;
+
+        fn handle(
+            &mut self,
+            msg: Self::Message,
+            _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+        ) -> Effect<Self> {
+            match msg {
+                SClientMsg::Start { key, svc } => Effect::Io(RuntimeCall::isolate_call(
+                    svc,
+                    SplitHandleSvcMsg::StartKey(key),
+                    Duration::from_millis(100),
+                    move |outcome| SClientMsg::Returned(key, outcome),
+                )),
+                SClientMsg::Returned(key, outcome) => {
+                    self.out.borrow_mut().push((key, outcome));
+                    noop()
+                }
+            }
+        }
+    }
+
+    let out = Rc::new(RefCell::new(Vec::new()));
+    let caller = runtime.register(
+        SClient {
+            out: Rc::clone(&out),
+        },
+        TestMailbox::new(8),
+    );
+
+    runtime
+        .try_send(caller, SClientMsg::Start { key: 1, svc })
+        .unwrap();
+    runtime
+        .try_send(caller, SClientMsg::Start { key: 2, svc })
+        .unwrap();
+    step_to_idle(&mut runtime);
+
+    assert_eq!(
+        *child_calls.borrow(),
+        1,
+        "only the admitted key should reach the child probe"
+    );
+    assert_eq!(
+        out.borrow().as_slice(),
+        [(2, CallOutcome::Replied(SvcReply::Busy))],
+        "the Full admission must settle through reply_request, not panic or hang",
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Abandoned caller settles with ReplyAbandoned + CallReplyAbandoned trace
 // ---------------------------------------------------------------------------
 

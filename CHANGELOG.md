@@ -4,6 +4,29 @@ This file records completed work.
 
 ## Unreleased
 
+### Four split-service API helpers (#292)
+
+The 2026-07-09 examples-canonicalization sweep left four small gaps where
+split-service call sites hand-wrapped around a missing helper
+(`examples/FINDINGS.md`). All four are additive, each proven by migrating
+the exact call-site that surfaced it:
+
+- `tina_sim::Simulator::register_split_service` mirrors
+  `tina_runtime::Runtime::register_split_service`; `specimen_multi_turn_request_context`'s
+  sim path no longer hand-wraps `SplitServiceHandle::from_address(sim.register(...))`.
+- `tina_runtime::PendingCancelableCall::reply_request` turns a
+  `Full`/`DuplicateKey` admission-rejected token into a `RequestEffect`, so a
+  split-service `handle_request` arm can answer typed instead of panicking.
+  `system_job_queue`'s `Queue::submit` drops its `is_full()` pre-check +
+  panic; the Full path now replies `QueueReply::Busy`.
+- `tina_runtime::call_cancelable_request` is the request-lane sibling of
+  `call_cancelable`. Migrates the hand-wrapped `WorkerMsg::Request(...)`
+  dispatch sites in `specimen_request_scope_fanout` and `system_job_queue`.
+- `tina_runtime::ThreadedMultiShardRuntime::call_blocking_request` mirrors
+  the single-shard `ThreadedRuntime::call_blocking_request`. Migrates
+  `system_session_auth` off raw `ServiceMessage::Request` envelopes sent
+  through plain `call_blocking`.
+
 ### Betelgeuse re-vendor and provenance (#286)
 
 Re-vendored `vendor-betelgeuse/` to upstream tip (`6d1f137`) and closed the
