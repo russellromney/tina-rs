@@ -217,7 +217,7 @@ impl ThreadedRuntimeConfig {
             return Err(Error::ZeroHotDrainMaxElapsed);
         }
         if self.idle_repoll_interval.is_zero() {
-            return Err(Error::ZeroIdleRePollInterval);
+            return Err(Error::ZeroIdleRepollInterval);
         }
         if self.idle_wait.is_zero() {
             return Err(Error::ZeroIdleWait);
@@ -279,6 +279,9 @@ pub const DEFAULT_HOST_CALL_DELIVERY_GRACE: Duration = Duration::from_millis(100
 
 /// Maximum time a constructor waits for a worker to prove initialization.
 pub const DEFAULT_STARTUP_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Bounded best-effort join window after startup has already failed.
+pub(crate) const STARTUP_CLEANUP_JOIN_TIMEOUT: Duration = Duration::from_millis(100);
 
 /// Bounded command sender for the worker's explicit command queue.
 pub(crate) struct CommandSender<S, F>
@@ -405,11 +408,6 @@ where
     /// Begin / Returned handlers in the same turn — same parallelism the
     /// old per-call `HostCallDriver` enjoyed — without the per-call mailbox /
     /// isolate-entry / handler-box allocations.
-    ///
-    /// Empty means the worker thread died before publishing addresses (e.g.
-    /// a panicking mailbox factory): `call_blocking` surfaces `WorkerStopped`
-    /// instead of hanging or panicking the constructor, matching the
-    /// deferred-failure model the rest of `ThreadedRuntime`'s API uses.
     dispatchers: Arc<Vec<Address<DispatcherMsg<S>, ()>>>,
     /// Round-robin selector for the dispatcher pool. Wrapping atomic add is
     /// cheap and stays correct under concurrent host-thread access; modulo
@@ -632,6 +630,13 @@ where
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                 let _ = commands.try_send(ThreadedCommand::Shutdown);
+                let cleanup_deadline = Instant::now() + STARTUP_CLEANUP_JOIN_TIMEOUT;
+                while !handle.is_finished() && Instant::now() < cleanup_deadline {
+                    thread::sleep(Duration::from_millis(1));
+                }
+                if handle.is_finished() {
+                    let _ = handle.join();
+                }
                 return Err(StartupError::WorkerHandshakeTimeout {
                     shard: shard_id,
                     timeout: startup_timeout,
@@ -2045,6 +2050,7 @@ pub(crate) fn deliver_shutdown_signal_and_drain_with_remote<S, F, FR>(
 mod startup_tests {
     use super::*;
     use crate::DefaultThreadedMailboxFactory;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use tina::SingleShard;
 
     #[test]
@@ -2091,6 +2097,8 @@ mod startup_tests {
     #[test]
     fn handshake_timeout_is_typed() {
         let timeout = Duration::from_millis(10);
+        let worker_exited = Arc::new(AtomicBool::new(false));
+        let worker_exited_after_run = Arc::clone(&worker_exited);
         let error = ThreadedRuntime::try_with_config_observer_io_loop_and_spawner(
             SingleShard,
             DefaultThreadedMailboxFactory,
@@ -2101,7 +2109,9 @@ mod startup_tests {
             |_name, worker| {
                 thread::Builder::new().spawn(move || {
                     thread::sleep(Duration::from_millis(30));
-                    worker()
+                    let exit = worker();
+                    worker_exited_after_run.store(true, Ordering::Release);
+                    exit
                 })
             },
         )
@@ -2113,5 +2123,9 @@ mod startup_tests {
             StartupError::WorkerHandshakeTimeout { shard, timeout: actual }
                 if shard == ShardId::new(0) && actual == timeout
         ));
+        assert!(
+            worker_exited.load(Ordering::Acquire),
+            "a late worker should consume shutdown and join during the cleanup window"
+        );
     }
 }

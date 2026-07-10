@@ -31,7 +31,7 @@ pub enum ThreadedRuntimeConfigError {
     /// `hot_drain_max_elapsed` is zero.
     ZeroHotDrainMaxElapsed,
     /// `idle_repoll_interval` is zero.
-    ZeroIdleRePollInterval,
+    ZeroIdleRepollInterval,
     /// `idle_wait` is zero.
     ZeroIdleWait,
     /// `control_call_timeout` is zero.
@@ -54,7 +54,7 @@ impl fmt::Display for ThreadedRuntimeConfigError {
             Self::ZeroTimerCapacity => "timer_capacity",
             Self::ZeroHotDrainMaxRounds => "hot_drain_max_rounds",
             Self::ZeroHotDrainMaxElapsed => "hot_drain_max_elapsed",
-            Self::ZeroIdleRePollInterval => "idle_repoll_interval",
+            Self::ZeroIdleRepollInterval => "idle_repoll_interval",
             Self::ZeroIdleWait => "idle_wait",
             Self::ZeroControlCallTimeout => "control_call_timeout",
             Self::ZeroDriverCompletionDrainBudget => "driver_completion_drain_budget",
@@ -107,6 +107,11 @@ pub enum StartupError {
     /// The worker exited without publishing a startup result.
     WorkerHandshakeDisconnected(ShardId),
     /// The worker did not publish a startup result within the bounded wait.
+    ///
+    /// Tina requests shutdown and briefly waits for cleanup before returning.
+    /// Rust cannot cancel a thread blocked indefinitely in user-supplied
+    /// startup code, so such a thread may outlive this error until that code
+    /// returns.
     WorkerHandshakeTimeout {
         /// Shard whose startup did not complete.
         shard: ShardId,

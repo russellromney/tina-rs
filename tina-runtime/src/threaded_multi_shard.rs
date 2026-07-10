@@ -39,8 +39,9 @@ use crate::observer::TraceObserver;
 use crate::sharded::ReplyAdapter;
 use crate::shutdown::{SharedShutdownState, ShutdownWorker, ThreadedShutdownHandle, handle_for};
 use crate::threaded::{
-    CommandSender, DEFAULT_STARTUP_HANDSHAKE_TIMEOUT, ThreadedCommand, ThreadedRuntimeConfig,
-    deliver_shutdown_signal_and_drain_with_remote, panic_payload_message, run_host_call,
+    CommandSender, DEFAULT_STARTUP_HANDSHAKE_TIMEOUT, STARTUP_CLEANUP_JOIN_TIMEOUT,
+    ThreadedCommand, ThreadedRuntimeConfig, deliver_shutdown_signal_and_drain_with_remote,
+    panic_payload_message, run_host_call,
 };
 use crate::trace::{RuntimeEvent, SendRejectedReason};
 use crate::{
@@ -103,7 +104,7 @@ fn cleanup_startup_workers<S, F>(
             let _ = commands.send(ThreadedCommand::Shutdown);
         }
     }
-    let join_deadline = Instant::now() + Duration::from_millis(100);
+    let join_deadline = Instant::now() + STARTUP_CLEANUP_JOIN_TIMEOUT;
     while workers.iter().any(|(_, worker)| !worker.is_finished()) && Instant::now() < join_deadline
     {
         thread::sleep(Duration::from_millis(1));

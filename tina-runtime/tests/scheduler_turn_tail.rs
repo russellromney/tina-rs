@@ -402,6 +402,6 @@ fn zero_idle_repoll_rejected() {
     .expect("zero idle repoll must fail");
     assert!(matches!(
         error,
-        StartupError::InvalidThreadedConfig(ThreadedRuntimeConfigError::ZeroIdleRePollInterval)
+        StartupError::InvalidThreadedConfig(ThreadedRuntimeConfigError::ZeroIdleRepollInterval)
     ));
 }

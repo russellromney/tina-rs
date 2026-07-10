@@ -1,4 +1,5 @@
 use std::collections::VecDeque;
+use std::error::Error;
 use std::io;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -103,6 +104,23 @@ fn io_loop_initialization_error_keeps_platform_source() {
         }
         other => panic!("unexpected startup error: {other:?}"),
     }
+}
+
+#[test]
+fn startup_error_exposes_the_platform_error_as_its_source() {
+    let error = ThreadedRuntime::try_with_config_and_io_loop_factory(
+        SingleShard,
+        DefaultThreadedMailboxFactory,
+        ThreadedRuntimeConfig::default(),
+        || Err(io::Error::other("injected source-chain failure")),
+    )
+    .err()
+    .expect("I/O-loop failure must fail startup");
+
+    let source = error
+        .source()
+        .expect("startup error must retain its source");
+    assert_eq!(source.to_string(), "injected source-chain failure");
 }
 
 #[test]
