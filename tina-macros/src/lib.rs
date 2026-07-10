@@ -637,6 +637,14 @@ enum IoDefault {
     RuntimeCall,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ServiceKind {
+    Legacy,
+    EventOnly,
+    RequestOnly,
+    Split,
+}
+
 fn expand_isolate(args: TokenStream, input: TokenStream, io_default: IoDefault) -> TokenStream {
     let args = parse_macro_input!(args as IsolateArgs);
     let mut item = parse_macro_input!(input as ItemImpl);
@@ -659,28 +667,38 @@ fn build_isolate(
         ));
     }
 
-    let split_service = match (&args.event, &args.request, &args.message) {
-        (Some(_), Some(_), None) => true,
-        (None, None, Some(_)) => false,
-        (Some(_), None, _) | (None, Some(_), _) => {
-            return Err(Error::new_spanned(
-                &item.self_ty,
-                "`event = ...` and `request = ...` must be supplied together",
-            ));
-        }
+    let service_kind = match (&args.event, &args.request, &args.message) {
+        (Some(_), Some(_), None) => ServiceKind::Split,
+        (Some(_), None, None) => ServiceKind::EventOnly,
+        (None, Some(_), None) => ServiceKind::RequestOnly,
+        (None, None, Some(_)) => ServiceKind::Legacy,
         (Some(_), Some(_), Some(_)) => {
             return Err(Error::new_spanned(
                 &item.self_ty,
                 "`message = ...` cannot be combined with `event = ...` / `request = ...`",
             ));
         }
+        (Some(_), None, Some(_)) | (None, Some(_), Some(_)) => {
+            return Err(Error::new_spanned(
+                &item.self_ty,
+                "`message = ...` cannot be combined with `event = ...` or `request = ...`",
+            ));
+        }
         (None, None, None) => {
             return Err(Error::new_spanned(
                 &item.self_ty,
-                "missing required isolate option `message = ...` or `event = ... , request = ...`",
+                "missing required isolate option `message = ...`, `event = ...`, `request = ...`, or `event = ... , request = ...`",
             ));
         }
     };
+    if service_kind == ServiceKind::EventOnly {
+        if let Some(reply) = &args.reply {
+            return Err(Error::new_spanned(
+                reply,
+                "`reply = ...` requires a `request = ...` service lane",
+            ));
+        }
+    }
     let tina_crate = args
         .tina_crate
         .clone()
@@ -689,12 +707,21 @@ fn build_isolate(
         .runtime_crate
         .clone()
         .unwrap_or_else(|| syn::parse_quote!(::tina_runtime));
-    let message = if split_service {
-        let event = args.event.clone().expect("checked above");
-        let request = args.request.clone().expect("checked above");
-        syn::parse_quote!(#tina_crate::ServiceMessage<#event, #request>)
-    } else {
-        args.message.expect("checked above")
+    let message = match service_kind {
+        ServiceKind::Split => {
+            let event = args.event.clone().expect("checked above");
+            let request = args.request.clone().expect("checked above");
+            syn::parse_quote!(#tina_crate::ServiceMessage<#event, #request>)
+        }
+        ServiceKind::EventOnly => {
+            let event = args.event.clone().expect("checked above");
+            syn::parse_quote!(#tina_crate::ServiceMessage<#event, ::core::convert::Infallible>)
+        }
+        ServiceKind::RequestOnly => {
+            let request = args.request.clone().expect("checked above");
+            syn::parse_quote!(#tina_crate::ServiceMessage<::core::convert::Infallible, #request>)
+        }
+        ServiceKind::Legacy => args.message.expect("checked above"),
     };
     // `shard = ...` is optional. Single-shard
     // programs default to `tina::SingleShard`; multi-shard programs
@@ -755,83 +782,123 @@ fn build_isolate(
     let generics = item.generics.clone();
     let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
 
-    let (attrs, msg_name, ctx_name, body, handle_call_tokens, has_handle_call) = if split_service {
+    let (attrs, msg_name, ctx_name, body, handle_call_tokens, has_handle_call) = if service_kind
+        != ServiceKind::Legacy
+    {
         if args.send_only.is_some() {
             return Err(Error::new_spanned(
                 &item.self_ty,
-                "`send_only` cannot be combined with split `event` / `request` services",
+                "`send_only` cannot be combined with `event` / `request` service lanes",
             ));
         }
-        let event_index = item
-            .items
-            .iter()
-            .position(|candidate| {
-                matches!(candidate, ImplItem::Fn(method) if method.sig.ident == "handle_event")
-            })
-            .ok_or_else(|| Error::new_spanned(&item.self_ty, "expected a `fn handle_event(...)` method"))?;
-        let ImplItem::Fn(event_method) = item.items.remove(event_index) else {
-            unreachable!("event_index only matches functions")
+        let event_method = if matches!(service_kind, ServiceKind::EventOnly | ServiceKind::Split) {
+            let event_index = item
+                .items
+                .iter()
+                .position(|candidate| {
+                    matches!(candidate, ImplItem::Fn(method) if method.sig.ident == "handle_event")
+                })
+                .ok_or_else(|| Error::new_spanned(&item.self_ty, "expected a `fn handle_event(...)` method"))?;
+            let ImplItem::Fn(method) = item.items.remove(event_index) else {
+                unreachable!("event_index only matches functions")
+            };
+            Some(method)
+        } else {
+            None
         };
-        let request_index = item
-            .items
-            .iter()
-            .position(|candidate| {
-                matches!(candidate, ImplItem::Fn(method) if method.sig.ident == "handle_request")
-            })
-            .ok_or_else(|| Error::new_spanned(&item.self_ty, "expected a `fn handle_request(...)` method"))?;
-        let ImplItem::Fn(request_method) = item.items.remove(request_index) else {
-            unreachable!("request_index only matches functions")
+        let request_method = if matches!(
+            service_kind,
+            ServiceKind::RequestOnly | ServiceKind::Split
+        ) {
+            let request_index = item
+                    .items
+                    .iter()
+                    .position(|candidate| {
+                        matches!(candidate, ImplItem::Fn(method) if method.sig.ident == "handle_request")
+                    })
+                    .ok_or_else(|| Error::new_spanned(&item.self_ty, "expected a `fn handle_request(...)` method"))?;
+            let ImplItem::Fn(method) = item.items.remove(request_index) else {
+                unreachable!("request_index only matches functions")
+            };
+            Some(method)
+        } else {
+            None
         };
-        let (event_name, event_ctx_name) =
-            validate_handler(&event_method, "handle_event", "event", "ctx")?;
-        let (request_attrs, request_name, call_name, request_body) =
-            validate_call_handler(&request_method, "handle_request", "request", "call")?;
-        require_call_authority_mentioned(&request_body, &call_name)?;
         let service_message_name =
             Ident::new("__tina_service_message", proc_macro2::Span::mixed_site());
-        let event_attrs = event_method.attrs.clone();
-        let event_body = Box::new(event_method.block.clone());
-        // No `#[deny(unused_variables)]` here: it would override the caller's
-        // own lint level on the spliced request body and hard-error a handler
-        // that answers the caller without reading a unit/marker request. The
-        // `RequestEffect<Self>` linear type below already enforces the real
-        // invariant (the caller is answered); reading the payload is optional.
-        let handle_call_tokens = quote! {
-            #(#request_attrs)*
-            fn handle_call(
-                &mut self,
-                #service_message_name: Self::Message,
-                #call_name: #tina_crate::CallContext<'_, Self>,
-            ) -> #tina_crate::Effect<Self> {
-                let #call_name = #tina_crate::RequestCall::new(#call_name);
-                match #service_message_name {
-                    #tina_crate::ServiceMessage::Request(#request_name) => {
-                        let request_effect: #tina_crate::RequestEffect<Self> =
-                            (|| -> #tina_crate::RequestEffect<Self> #request_body)();
-                        request_effect.into_effect()
-                    }
-                    #tina_crate::ServiceMessage::Event(_) => {
-                        #call_name.reject(#tina_crate::CallRejectedReason::UnsupportedMessage)
-                            .into_effect()
-                    }
-                }
-            }
+        let event_name = Ident::new("__tina_event", proc_macro2::Span::mixed_site());
+        let event_ctx_name = Ident::new("__tina_ctx", proc_macro2::Span::mixed_site());
+        let (event_attrs, event_arm) = if let Some(event_method) = event_method {
+            let (name, ctx) = validate_handler(&event_method, "handle_event", "event", "ctx")?;
+            let attrs = event_method.attrs.clone();
+            let event_body = Box::new(event_method.block.clone());
+            (
+                attrs,
+                quote!(#tina_crate::ServiceMessage::Event(#name) => {
+                    let #ctx = #event_ctx_name;
+                    #event_body
+                }),
+            )
+        } else {
+            (
+                Vec::new(),
+                quote!(#tina_crate::ServiceMessage::Event(never) => match never {}),
+            )
         };
         let body = syn::parse_quote!({
             match #event_name {
-                #tina_crate::ServiceMessage::Event(#event_name) => #event_body,
+                #event_arm,
                 #tina_crate::ServiceMessage::Request(_) => {
                     #tina_crate::reject(#tina_crate::CallRejectedReason::UnsupportedMessage)
                 }
             }
         });
+        let (handle_call_tokens, has_handle_call) = if let Some(request_method) = request_method {
+            let (request_attrs, request_name, call_name, request_body) =
+                validate_call_handler(&request_method, "handle_request", "request", "call")?;
+            require_call_authority_mentioned(&request_body, &call_name)?;
+            let called_event_arm = if service_kind == ServiceKind::Split {
+                quote!(#tina_crate::ServiceMessage::Event(_) => {
+                    #call_name.reject(#tina_crate::CallRejectedReason::UnsupportedMessage)
+                        .into_effect()
+                })
+            } else {
+                quote!(#tina_crate::ServiceMessage::Event(never) => match never {})
+            };
+            // No `#[deny(unused_variables)]` here: it would override the caller's
+            // own lint level on the spliced request body. RequestEffect already
+            // enforces that caller authority is consumed.
+            (
+                quote! {
+                    #(#request_attrs)*
+                    fn handle_call(
+                        &mut self,
+                        #service_message_name: Self::Message,
+                        #call_name: #tina_crate::CallContext<'_, Self>,
+                    ) -> #tina_crate::Effect<Self> {
+                        let #call_name = #tina_crate::RequestCall::new(#call_name);
+                        match #service_message_name {
+                            #tina_crate::ServiceMessage::Request(#request_name) => {
+                                let request_effect: #tina_crate::RequestEffect<Self> =
+                                    (|| -> #tina_crate::RequestEffect<Self> #request_body)();
+                                request_effect.into_effect()
+                            }
+                            #called_event_arm,
+                        }
+                    }
+                },
+                true,
+            )
+        } else {
+            (quote! {}, false)
+        };
         (
             event_attrs,
             event_name,
             event_ctx_name,
             body,
             handle_call_tokens,
-            true,
+            has_handle_call,
         )
     } else {
         let handle_index = item
@@ -1061,9 +1128,14 @@ fn validate_call_handler(
     }
 
     if matches!(handle_call.sig.output, ReturnType::Default) {
+        let return_type = if method_name == "handle_request" {
+            "tina::RequestEffect<Self>"
+        } else {
+            "tina::Effect<Self>"
+        };
         return Err(Error::new_spanned(
             &handle_call.sig,
-            format!("{method_name} must return `tina::Effect<Self>`"),
+            format!("{method_name} must return `{return_type}`"),
         ));
     }
 

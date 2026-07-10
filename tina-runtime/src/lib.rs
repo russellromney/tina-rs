@@ -135,7 +135,10 @@ mod host_call;
 mod registration;
 mod remote;
 mod service_handle;
-pub use service_handle::{SendOnlyServiceHandle, ServiceHandle, SplitServiceHandle};
+pub use service_handle::{
+    EventServiceHandle, RequestServiceHandle, SendOnlyServiceHandle, ServiceHandle,
+    SplitServiceHandle,
+};
 
 use remote::{QueuedRemoteEnvelope, SendableQueuedRemoteEnvelope};
 
@@ -305,6 +308,17 @@ pub use tcp_loops::{LoopStep, ReadExactStep, TcpReadExact, TcpReadToEof, TcpWrit
 ///
 /// This is the preferred runtime authoring path. It keeps the handler as normal
 /// Rust code and only fills the repetitive [`tina::Isolate`] associated types.
+///
+/// Choose the smallest service shape that matches the public contract:
+///
+/// - `message = Message` uses the legacy combined-message `handle` method.
+/// - `event = Event` uses only `handle_event` and has no callable lane.
+/// - `request = Request, reply = Reply` uses only `handle_request`.
+/// - `event = Event, request = Request, reply = Reply` uses both typed lanes.
+///
+/// Event/request forms keep the internal [`tina::ServiceMessage`] envelope out
+/// of handlers and work with the matching `Runtime::register_*_service`
+/// methods.
 ///
 /// **The expansion is rooted at `::tina`.** The generated impl names
 /// `::tina::Isolate`, `::tina::Effect`, `::tina::Context`, and friends, so the

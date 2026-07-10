@@ -80,6 +80,19 @@ pub struct SplitServiceHandle<Event, Request, Reply> {
     pub requests: tina::ServiceRequestAddress<Event, Request, Reply>,
 }
 
+/// Event capability returned for an event-only service.
+///
+/// The request lane is uninhabited, so application code receives only the
+/// event address it can actually use.
+pub type EventServiceHandle<Event> = tina::ServiceEventAddress<Event, std::convert::Infallible>;
+
+/// Request capability returned for a request-only service.
+///
+/// The event lane is uninhabited, so application code receives only the
+/// request address it can actually call.
+pub type RequestServiceHandle<Request, Reply> =
+    tina::ServiceRequestAddress<std::convert::Infallible, Request, Reply>;
+
 impl<Event, Request, Reply> Copy for SplitServiceHandle<Event, Request, Reply> {}
 
 impl<Event, Request, Reply> Clone for SplitServiceHandle<Event, Request, Reply> {

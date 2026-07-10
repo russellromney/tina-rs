@@ -19,9 +19,9 @@ use std::time::{Duration, Instant};
 
 use tina::prelude::*;
 use tina_runtime::{
-    CallOutcome, DefaultMailboxFactory, DefaultThreadedMailboxFactory, Runtime,
-    SendOnlyServiceHandle, ServiceHandle, SplitServiceHandle, ThreadedRuntime, call_request,
-    call_typed,
+    CallOutcome, DefaultMailboxFactory, DefaultThreadedMailboxFactory, EventServiceHandle,
+    RequestServiceHandle, Runtime, SendOnlyServiceHandle, ServiceHandle, SplitServiceHandle,
+    ThreadedRuntime, call_request, call_typed,
 };
 
 // ---------------------------------------------------------------------------
@@ -262,7 +262,103 @@ fn call_typed_round_trips_through_call_lane() {
 }
 
 // ---------------------------------------------------------------------------
-// Positive fixture #5: split event/request service. This is the Phase 109
+// Positive fixture #5: single-lane services. These are the smallest public
+// shapes for event-only workers and request-only services: users implement
+// only the handler they own and registration returns only that capability.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug)]
+enum EventOnlyEvent {
+    Record(u32),
+}
+
+struct EventOnlyService {
+    seen: Arc<AtomicU32>,
+}
+
+#[tina_runtime::isolate(event = EventOnlyEvent)]
+impl EventOnlyService {
+    fn handle_event(
+        &mut self,
+        event: EventOnlyEvent,
+        _ctx: &mut Context<'_, SingleShard, Self::Reply>,
+    ) -> Effect<Self> {
+        match event {
+            EventOnlyEvent::Record(value) => {
+                self.seen.store(value, Ordering::Release);
+                noop()
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+enum RequestOnlyRequest {
+    Read,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RequestOnlyReply(u32);
+
+struct RequestOnlyService {
+    value: u32,
+}
+
+#[tina_runtime::isolate(request = RequestOnlyRequest, reply = RequestOnlyReply)]
+impl RequestOnlyService {
+    fn handle_request(
+        &mut self,
+        request: RequestOnlyRequest,
+        caller: RequestCall<'_, Self>,
+    ) -> RequestEffect<Self> {
+        match request {
+            RequestOnlyRequest::Read => caller.reply(RequestOnlyReply(self.value)),
+        }
+    }
+}
+
+#[test]
+fn event_only_service_needs_no_envelope_or_uninhabited_type_arguments() {
+    let mut runtime = Runtime::new(SingleShard, DefaultMailboxFactory);
+    let seen = Arc::new(AtomicU32::new(0));
+    let events = runtime.register_event_service(
+        EventOnlyService {
+            seen: Arc::clone(&seen),
+        },
+        1,
+    );
+    let _: EventServiceHandle<EventOnlyEvent> = events;
+
+    let sent: Result<(), tina::TrySendError<EventOnlyEvent>> =
+        runtime.try_send_event(events, EventOnlyEvent::Record(41));
+    sent.expect("event accepted");
+    assert!(matches!(
+        runtime.try_send_event(events, EventOnlyEvent::Record(42)),
+        Err(tina::TrySendError::Full(EventOnlyEvent::Record(42)))
+    ));
+    while runtime.step() > 0 {}
+
+    assert_eq!(seen.load(Ordering::Acquire), 41);
+}
+
+#[test]
+fn request_only_service_needs_no_envelope_or_uninhabited_type_arguments() {
+    let runtime = ThreadedRuntime::new(SingleShard, DefaultThreadedMailboxFactory);
+    let requests = runtime
+        .register_request_service(RequestOnlyService { value: 42 }, 4)
+        .expect("register request-only service");
+    let _: RequestServiceHandle<RequestOnlyRequest, RequestOnlyReply> = requests;
+
+    let outcome = runtime
+        .call_blocking_request(requests, RequestOnlyRequest::Read, Duration::from_secs(1))
+        .expect("call request-only service");
+
+    assert_eq!(outcome, CallOutcome::Replied(RequestOnlyReply(42)));
+    runtime.shutdown().expect("shutdown");
+}
+
+// ---------------------------------------------------------------------------
+// Positive fixture #6: split event/request service. This is the Phase 109
 // copied path: fire-and-forget events and callable requests are separate
 // domain types, even though they share one mailbox internally.
 // ---------------------------------------------------------------------------
