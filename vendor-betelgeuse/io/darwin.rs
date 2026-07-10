@@ -6,7 +6,7 @@ use std::{
     mem::{self, MaybeUninit},
     net::SocketAddr,
     os::{fd::RawFd, unix::ffi::OsStrExt},
-    path::{Path, PathBuf},
+    path::Path,
     ptr::NonNull,
     rc::Rc,
 };
@@ -16,8 +16,8 @@ use log::trace;
 use crate::{
     AcceptCompletion, AcceptOp, CompletionInner, ConnectCompletion, ConnectOp, FsyncCompletion,
     FsyncOp, IO, IOFile, IOLoop, IOSocket, MkdirCompletion, MkdirOp, OpenOptions, Operation,
-    PReadCompletion, PReadOp, PWriteCompletion, PWriteOp, RecvBufCompletion, RecvCompletion,
-    RecvOp, SendCompletion, SendOp, SendOwnedCompletion, SizeCompletion, SizeOp,
+    PReadCompletion, PReadOp, PWriteCompletion, PWriteOp, RecvCompletion, RecvOp, SendCompletion,
+    SendOp, SizeCompletion, SizeOp,
 };
 
 enum SocketKind {
@@ -49,10 +49,8 @@ impl Drop for OwnedFd {
 }
 
 struct DarwinState {
-    /// Cached kqueue fd owned by this loop.
     kq: RawFd,
     queued: VecDeque<NonNull<CompletionInner>>,
-    watched: Vec<WatchedCompletion>,
 }
 
 impl Drop for DarwinState {
@@ -61,13 +59,6 @@ impl Drop for DarwinState {
             libc::close(self.kq);
         }
     }
-}
-
-#[derive(Clone, Copy)]
-struct WatchedCompletion {
-    completion: NonNull<CompletionInner>,
-    fd: RawFd,
-    filter: i16,
 }
 
 struct DarwinFile {
@@ -79,9 +70,6 @@ struct DarwinSocket {
     state: Rc<RefCell<DarwinState>>,
     fd: Rc<RefCell<Option<Rc<OwnedFd>>>>,
     kind: Rc<RefCell<Option<SocketKind>>>,
-    /// Set for a Unix-domain listener: the socket file this listener owns.
-    /// Cleared (unlinked, if still a socket) when the listener is closed.
-    unix_bind_path: Rc<RefCell<Option<PathBuf>>>,
 }
 
 pub struct DarwinIO {
@@ -105,7 +93,6 @@ impl DarwinIO {
             state: Rc::new(RefCell::new(DarwinState {
                 kq,
                 queued: VecDeque::new(),
-                watched: Vec::new(),
             })),
         })
     }
@@ -179,66 +166,41 @@ impl DarwinIO {
         Ok(Rc::new(OwnedFd::new(fd)))
     }
 
-    fn socket_fd_unix() -> io::Result<Rc<OwnedFd>> {
-        trace!("socket domain=AF_UNIX type=SOCK_STREAM");
-        let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
-        if fd < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        if let Err(err) = set_nonblocking_and_cloexec(fd).and_then(|_| set_no_sigpipe(fd)) {
-            unsafe {
-                libc::close(fd);
+    fn watch_fd(kq: RawFd, c: NonNull<CompletionInner>, op: &Operation) -> io::Result<()> {
+        let (fd, filter) = match op {
+            Operation::Accept(op) => (op.fd, libc::EVFILT_READ),
+            Operation::Connect(op) => (op.fd, libc::EVFILT_WRITE),
+            Operation::Recv(op) => (op.fd, libc::EVFILT_READ),
+            Operation::Send(op) => (op.fd, libc::EVFILT_WRITE),
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "operation cannot be watched by kqueue",
+                ));
             }
-            return Err(err);
-        }
-        Ok(Rc::new(OwnedFd::new(fd)))
-    }
+        };
 
-    fn watched_completion(
-        c: NonNull<CompletionInner>,
-        op: &Operation,
-    ) -> io::Result<WatchedCompletion> {
-        let (fd, filter) = operation_fd_filter(op)?;
-        Ok(WatchedCompletion {
-            completion: c,
-            fd,
+        let mut change = libc::kevent {
+            ident: fd as libc::uintptr_t,
             filter,
-        })
-    }
-
-    fn watch_fd(kq: RawFd, watched: WatchedCompletion) -> io::Result<()> {
-        let change = libc::kevent {
-            ident: watched.fd as libc::uintptr_t,
-            filter: watched.filter,
-            flags: libc::EV_ADD | libc::EV_ONESHOT,
+            flags: (libc::EV_ADD | libc::EV_ONESHOT) as u16,
             fflags: 0,
             data: 0,
-            udata: watched.completion.as_ptr().cast(),
+            udata: c.as_ptr().cast(),
         };
 
-        let rc = unsafe { libc::kevent(kq, &change, 1, std::ptr::null_mut(), 0, std::ptr::null()) };
+        let rc = unsafe {
+            libc::kevent(
+                kq,
+                &mut change,
+                1,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null(),
+            )
+        };
         if rc < 0 {
             return Err(io::Error::last_os_error());
-        }
-        Ok(())
-    }
-
-    fn delete_watch(kq: RawFd, watched: WatchedCompletion) -> io::Result<()> {
-        let change = libc::kevent {
-            ident: watched.fd as libc::uintptr_t,
-            filter: watched.filter,
-            flags: libc::EV_DELETE,
-            fflags: 0,
-            data: 0,
-            udata: watched.completion.as_ptr().cast(),
-        };
-
-        let rc = unsafe { libc::kevent(kq, &change, 1, std::ptr::null_mut(), 0, std::ptr::null()) };
-        if rc < 0 {
-            let err = io::Error::last_os_error();
-            if err.raw_os_error() != Some(libc::ENOENT) {
-                return Err(err);
-            }
         }
         Ok(())
     }
@@ -329,74 +291,38 @@ impl IOSocket for DarwinSocket {
         Ok(())
     }
 
-    fn bind_unix(&self, path: &Path) -> io::Result<()> {
-        let fd = DarwinIO::socket_fd_unix()?;
-        let (storage, len) = unix_sockaddr_to_raw(path)?;
-        // Clear a stale socket file so a re-bind after an unclean exit
-        // succeeds. Only removes a socket inode, never a regular file or
-        // symlink at a user-supplied path.
-        unlink_if_socket(path);
-        trace!("bind_unix fd={} path={}", fd.raw(), path.display());
-        let rc = unsafe {
-            libc::bind(
-                fd.raw(),
-                (&storage as *const libc::sockaddr_storage).cast(),
-                len,
-            )
-        };
-        if rc < 0 {
-            return Err(io::Error::last_os_error());
+    fn connect(&self, c: &mut ConnectCompletion, addr: SocketAddr) -> io::Result<()> {
+        match &*self.kind.borrow() {
+            Some(SocketKind::Listener) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "connect called on listener socket",
+                ));
+            }
+            Some(SocketKind::Stream) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "connect called on already-initialized stream socket",
+                ));
+            }
+            None => {}
         }
-        let rc = unsafe { libc::listen(fd.raw(), 128) };
-        if rc < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        *self.fd.borrow_mut() = Some(fd);
-        *self.kind.borrow_mut() = Some(SocketKind::Listener);
-        *self.unix_bind_path.borrow_mut() = Some(path.to_path_buf());
-        Ok(())
-    }
 
-    fn connect_unix(&self, c: &mut ConnectCompletion, path: &Path) -> io::Result<()> {
-        if self.fd.borrow().is_some() {
-            return Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                "connect called on initialized socket",
-            ));
-        }
-        let fd = DarwinIO::socket_fd_unix()?;
-        let (storage, len) = unix_sockaddr_to_raw(path)?;
-        let inner = c.inner_mut();
-        inner.prepare(Operation::Connect(ConnectOp {
-            fd: fd.raw(),
-            addr: storage,
-            len,
-            attempted: false,
-        }));
+        let fd = DarwinIO::socket_fd(addr)?;
+        let raw_fd = fd.raw();
         *self.fd.borrow_mut() = Some(fd);
         *self.kind.borrow_mut() = Some(SocketKind::Stream);
+
+        let inner = c.inner_mut();
+        inner.prepare(Operation::Connect(ConnectOp {
+            fd: raw_fd,
+            addr,
+            started: false,
+            addr_storage: unsafe { mem::zeroed::<libc::sockaddr_storage>() },
+            addr_len: 0,
+        }));
         queue(&self.state, inner);
         Ok(())
-    }
-
-    fn local_addr(&self) -> io::Result<SocketAddr> {
-        let fd = self
-            .fd
-            .borrow()
-            .as_ref()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "socket is closed"))?
-            .raw();
-        socket_addr_from_fd(fd, libc::getsockname)
-    }
-
-    fn peer_addr(&self) -> io::Result<SocketAddr> {
-        let fd = self
-            .fd
-            .borrow()
-            .as_ref()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "socket is closed"))?
-            .raw();
-        socket_addr_from_fd(fd, libc::getpeername)
     }
 
     fn accept(&self, c: &mut AcceptCompletion) -> io::Result<()> {
@@ -461,48 +387,6 @@ impl IOSocket for DarwinSocket {
         Ok(())
     }
 
-    fn recv_buf(
-        &self,
-        c: &mut RecvBufCompletion,
-        mut buffer: Vec<u8>,
-        max_len: usize,
-    ) -> Result<(), (io::Error, Vec<u8>)> {
-        let fd = match self.fd.borrow().as_ref().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::NotConnected, "recv called on closed socket")
-        }) {
-            Ok(fd) => fd.raw(),
-            Err(error) => return Err((error, buffer)),
-        };
-        match &*self.kind.borrow() {
-            Some(SocketKind::Stream) => {}
-            Some(SocketKind::Listener) => {
-                return Err((
-                    io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "recv called on listener socket",
-                    ),
-                    buffer,
-                ));
-            }
-            None => {
-                return Err((
-                    io::Error::new(io::ErrorKind::NotConnected, "recv called on closed socket"),
-                    buffer,
-                ));
-            }
-        }
-
-        buffer.resize(max_len, 0);
-        let inner = c.inner_mut();
-        inner.prepare(Operation::RecvBuf(RecvOp {
-            fd,
-            buf: buffer,
-            flags: libc::MSG_DONTWAIT,
-        }));
-        queue(&self.state, inner);
-        Ok(())
-    }
-
     fn send(&self, c: &mut SendCompletion, buf: Vec<u8>) -> io::Result<()> {
         let fd = self
             .fd
@@ -534,68 +418,6 @@ impl IOSocket for DarwinSocket {
             buf,
             flags: libc::MSG_DONTWAIT,
         }));
-        queue(&self.state, inner);
-        Ok(())
-    }
-
-    fn send_owned(
-        &self,
-        c: &mut SendOwnedCompletion,
-        buf: Vec<u8>,
-    ) -> Result<(), (io::Error, Vec<u8>)> {
-        let fd = match self.fd.borrow().as_ref().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::NotConnected, "send called on closed socket")
-        }) {
-            Ok(fd) => fd.raw(),
-            Err(error) => return Err((error, buf)),
-        };
-        match &*self.kind.borrow() {
-            Some(SocketKind::Stream) => {}
-            Some(SocketKind::Listener) => {
-                return Err((
-                    io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "send called on listener socket",
-                    ),
-                    buf,
-                ));
-            }
-            None => {
-                return Err((
-                    io::Error::new(io::ErrorKind::NotConnected, "send called on closed socket"),
-                    buf,
-                ));
-            }
-        }
-
-        let inner = c.inner_mut();
-        inner.prepare(Operation::SendOwned(SendOp {
-            fd,
-            buf,
-            flags: libc::MSG_DONTWAIT,
-        }));
-        queue(&self.state, inner);
-        Ok(())
-    }
-
-    fn connect(&self, c: &mut ConnectCompletion, addr: SocketAddr) -> io::Result<()> {
-        if self.fd.borrow().is_some() {
-            return Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                "connect called on initialized socket",
-            ));
-        }
-        let fd = DarwinIO::socket_fd(addr)?;
-        let (storage, len) = socket_addr_to_raw(addr);
-        let inner = c.inner_mut();
-        inner.prepare(Operation::Connect(ConnectOp {
-            fd: fd.raw(),
-            addr: storage,
-            len,
-            attempted: false,
-        }));
-        *self.fd.borrow_mut() = Some(fd);
-        *self.kind.borrow_mut() = Some(SocketKind::Stream);
         queue(&self.state, inner);
         Ok(())
     }
@@ -643,11 +465,6 @@ impl IOSocket for DarwinSocket {
     fn close(&self) {
         self.fd.borrow_mut().take();
         self.kind.borrow_mut().take();
-        // A Unix listener owns its socket file; unlink it on close so a
-        // later bind at the same path is not blocked by a stale inode.
-        if let Some(path) = self.unix_bind_path.borrow_mut().take() {
-            unlink_if_socket(&path);
-        }
     }
 }
 
@@ -664,7 +481,6 @@ impl IO for DarwinIO {
             state: self.state.clone(),
             fd: Rc::new(RefCell::new(None)),
             kind: Rc::new(RefCell::new(None)),
-            unix_bind_path: Rc::new(RefCell::new(None)),
         }))
     }
 
@@ -683,12 +499,10 @@ impl IO for DarwinIO {
     }
 }
 
-impl DarwinIO {
-    /// Submits queued operations: executes each, watching the fd via kqueue when
-    /// it would block, retrying transient ones. Returns whether any queued op
-    /// progressed.
-    fn drain_queued(&self) -> io::Result<bool> {
+impl IOLoop for DarwinIO {
+    fn step(&self) -> io::Result<bool> {
         let mut progressed = false;
+
         let queued_len = self.state.borrow().queued.len();
         for _ in 0..queued_len {
             let completion_ptr = self
@@ -702,9 +516,7 @@ impl DarwinIO {
             match execute_completion(&self.state, completion) {
                 PollResult::Wait => {
                     let kq = self.state.borrow().kq;
-                    let watched = Self::watched_completion(completion_ptr, completion.operation())?;
-                    Self::watch_fd(kq, watched)?;
-                    self.state.borrow_mut().watched.push(watched);
+                    Self::watch_fd(kq, completion_ptr, completion.operation())?;
                 }
                 PollResult::Retry => {
                     self.state.borrow_mut().queued.push_back(completion_ptr);
@@ -713,18 +525,12 @@ impl DarwinIO {
             }
             progressed = true;
         }
-        Ok(progressed)
-    }
 
-    /// Harvests ready kqueue events. `step` passes a zero timeout, so this is a
-    /// nonblocking poll.
-    fn poll_events(&self, timeout: Option<libc::timespec>) -> io::Result<bool> {
-        let mut progressed = false;
         let kq = self.state.borrow().kq;
         let mut events: [libc::kevent; 64] = unsafe { MaybeUninit::zeroed().assume_init() };
-        let timeout_ptr = match &timeout {
-            Some(ts) => ts as *const libc::timespec,
-            None => std::ptr::null(),
+        let timeout = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
         };
         let n = unsafe {
             libc::kevent(
@@ -733,17 +539,11 @@ impl DarwinIO {
                 0,
                 events.as_mut_ptr(),
                 events.len() as i32,
-                timeout_ptr,
+                &timeout,
             )
         };
         if n < 0 {
-            let err = io::Error::last_os_error();
-            // A blocking kevent interrupted by a signal is a (spurious) wake, not
-            // a failure: return so the caller re-polls.
-            if err.raw_os_error() == Some(libc::EINTR) {
-                return Ok(progressed);
-            }
-            return Err(err);
+            return Err(io::Error::last_os_error());
         }
         if n > 0 {
             progressed = true;
@@ -753,12 +553,8 @@ impl DarwinIO {
             let Some(completion_ptr) = NonNull::new(ev.udata.cast::<CompletionInner>()) else {
                 continue;
             };
-            self.state
-                .borrow_mut()
-                .watched
-                .retain(|watched| watched.completion != completion_ptr);
 
-            if (ev.flags & libc::EV_ERROR) != 0 && ev.data != 0 {
+            if (ev.flags & libc::EV_ERROR as u16) != 0 && ev.data != 0 {
                 let completion = unsafe { completion_ptr.as_ptr().as_mut().expect("non-null") };
                 fail_completion(completion, io::Error::from_raw_os_error(ev.data as i32));
                 continue;
@@ -771,75 +567,15 @@ impl DarwinIO {
     }
 }
 
-impl IOLoop for DarwinIO {
-    fn step(&self) -> io::Result<bool> {
-        let queued = self.drain_queued()?;
-        let events = self.poll_events(Some(libc::timespec {
-            tv_sec: 0,
-            tv_nsec: 0,
-        }))?;
-        Ok(queued || events)
-    }
-
-    fn pending_completion_count(&self) -> usize {
-        let state = self.state.borrow();
-        state.queued.len() + state.watched.len()
-    }
-
-    fn cancel_pending_completions(&self) -> io::Result<()> {
-        let (queued, watched, kq) = {
-            let mut state = self.state.borrow_mut();
-            (
-                std::mem::take(&mut state.queued),
-                std::mem::take(&mut state.watched),
-                state.kq,
-            )
-        };
-
-        for completion_ptr in queued {
-            let completion = unsafe { completion_ptr.as_ptr().as_mut().expect("non-null") };
-            fail_completion(completion, cancelled_error());
-        }
-
-        for watched in watched {
-            Self::delete_watch(kq, watched)?;
-            let completion = unsafe { watched.completion.as_ptr().as_mut().expect("non-null") };
-            fail_completion(completion, cancelled_error());
-        }
-
-        Ok(())
-    }
-}
-
 /// Stores the same `io::Error` into whichever typed completion the inner is
 /// the prefix of. Used for the kqueue `EV_ERROR` path, which delivers a
 /// kernel-side errno before the syscall has even run.
 fn fail_completion(c: &mut CompletionInner, err: io::Error) {
     match c.operation() {
         Operation::Accept(_) => unsafe { AcceptCompletion::from_inner_mut(c) }.complete(Err(err)),
-        Operation::Connect(_) => unsafe {
-            ConnectCompletion::from_inner_mut(c).complete(Err(err));
-        },
+        Operation::Connect(_) => unsafe { ConnectCompletion::from_inner_mut(c) }.complete(Err(err)),
         Operation::Recv(_) => unsafe { RecvCompletion::from_inner_mut(c) }.complete(Err(err)),
-        Operation::RecvBuf(_) => unsafe {
-            let buffer = {
-                let Operation::RecvBuf(op) = c.operation_mut() else {
-                    unreachable!()
-                };
-                mem::take(&mut op.buf)
-            };
-            RecvBufCompletion::from_inner_mut(c).complete(Err((err, buffer)));
-        },
         Operation::Send(_) => unsafe { SendCompletion::from_inner_mut(c) }.complete(Err(err)),
-        Operation::SendOwned(_) => unsafe {
-            let buffer = {
-                let Operation::SendOwned(op) = c.operation_mut() else {
-                    unreachable!()
-                };
-                mem::take(&mut op.buf)
-            };
-            SendOwnedCompletion::from_inner_mut(c).complete(Err((err, buffer)));
-        },
         Operation::PRead(_) => unsafe { PReadCompletion::from_inner_mut(c) }.complete(Err(err)),
         Operation::PWrite(_) => unsafe { PWriteCompletion::from_inner_mut(c) }.complete(Err(err)),
         Operation::Fsync(_) => unsafe { FsyncCompletion::from_inner_mut(c) }.complete(Err(err)),
@@ -847,23 +583,6 @@ fn fail_completion(c: &mut CompletionInner, err: io::Error) {
         Operation::Mkdir(_) => unsafe { MkdirCompletion::from_inner_mut(c) }.complete(Err(err)),
         Operation::Nop => {}
     }
-}
-
-fn operation_fd_filter(op: &Operation) -> io::Result<(RawFd, i16)> {
-    match op {
-        Operation::Accept(op) => Ok((op.fd, libc::EVFILT_READ)),
-        Operation::Connect(op) => Ok((op.fd, libc::EVFILT_WRITE)),
-        Operation::Recv(op) | Operation::RecvBuf(op) => Ok((op.fd, libc::EVFILT_READ)),
-        Operation::Send(op) | Operation::SendOwned(op) => Ok((op.fd, libc::EVFILT_WRITE)),
-        _ => Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "operation cannot be watched by kqueue",
-        )),
-    }
-}
-
-fn cancelled_error() -> io::Error {
-    io::Error::new(io::ErrorKind::Interrupted, "operation cancelled")
 }
 
 /// Runs the syscall for the operation armed in `c` and either parks the
@@ -875,12 +594,9 @@ fn cancelled_error() -> io::Error {
 /// take `&mut <kind>Completion` and only set the matching `Operation`, so
 /// the cast back is sound.
 fn execute_completion(state: &Rc<RefCell<DarwinState>>, c: &mut CompletionInner) -> PollResult {
-    match c.operation() {
-        Operation::Accept(_) => {
+    match c.operation_mut() {
+        Operation::Accept(op) => {
             let result = {
-                let Operation::Accept(op) = c.operation_mut() else {
-                    unreachable!()
-                };
                 let accepted =
                     unsafe { libc::accept(op.fd, std::ptr::null_mut(), std::ptr::null_mut()) };
                 if accepted < 0 {
@@ -904,71 +620,74 @@ fn execute_completion(state: &Rc<RefCell<DarwinState>>, c: &mut CompletionInner)
                         state: state.clone(),
                         fd: Rc::new(RefCell::new(Some(Rc::new(OwnedFd::new(accepted))))),
                         kind: Rc::new(RefCell::new(Some(SocketKind::Stream))),
-                        unix_bind_path: Rc::new(RefCell::new(None)),
                     }) as Box<dyn IOSocket>)
                 }
             };
             unsafe { AcceptCompletion::from_inner_mut(c) }.complete(result);
             PollResult::Done
         }
-        Operation::Connect(_) => {
+        Operation::Connect(op) => {
             let result = {
-                let Operation::Connect(op) = c.operation_mut() else {
-                    unreachable!()
-                };
-                if !op.attempted {
-                    op.attempted = true;
+                if !op.started {
+                    let (storage, len) = socket_addr_to_raw(op.addr);
+                    op.addr_storage = storage;
+                    op.addr_len = len;
+
                     let rc = unsafe {
                         libc::connect(
                             op.fd,
-                            (&op.addr as *const libc::sockaddr_storage).cast(),
-                            op.len,
+                            (&op.addr_storage as *const libc::sockaddr_storage).cast(),
+                            op.addr_len,
                         )
                     };
                     if rc == 0 {
                         Ok(())
                     } else {
                         let err = io::Error::last_os_error();
-                        if err.raw_os_error() == Some(libc::EINPROGRESS)
-                            || err.kind() == io::ErrorKind::WouldBlock
-                        {
-                            return PollResult::Wait;
-                        }
                         if err.raw_os_error() == Some(libc::EINTR) {
-                            op.attempted = false;
                             return PollResult::Retry;
+                        }
+                        if err.kind() == io::ErrorKind::WouldBlock
+                            || err.raw_os_error() == Some(libc::EINPROGRESS)
+                            || err.raw_os_error() == Some(libc::EALREADY)
+                        {
+                            op.started = true;
+                            return PollResult::Wait;
                         }
                         Err(err)
                     }
                 } else {
-                    let mut error: libc::c_int = 0;
-                    let mut len = mem::size_of_val(&error) as libc::socklen_t;
+                    let mut so_error: libc::c_int = 0;
+                    let mut so_error_len = mem::size_of::<libc::c_int>() as libc::socklen_t;
                     let rc = unsafe {
                         libc::getsockopt(
                             op.fd,
                             libc::SOL_SOCKET,
                             libc::SO_ERROR,
-                            (&mut error as *mut libc::c_int).cast(),
-                            &mut len,
+                            (&mut so_error as *mut libc::c_int).cast(),
+                            &mut so_error_len,
                         )
                     };
                     if rc < 0 {
-                        Err(io::Error::last_os_error())
-                    } else if error == 0 {
+                        let err = io::Error::last_os_error();
+                        if err.raw_os_error() == Some(libc::EINTR) {
+                            return PollResult::Retry;
+                        }
+                        Err(err)
+                    } else if so_error == 0 {
                         Ok(())
+                    } else if so_error == libc::EINPROGRESS || so_error == libc::EALREADY {
+                        return PollResult::Wait;
                     } else {
-                        Err(io::Error::from_raw_os_error(error))
+                        Err(io::Error::from_raw_os_error(so_error))
                     }
                 }
             };
             unsafe { ConnectCompletion::from_inner_mut(c) }.complete(result);
             PollResult::Done
         }
-        Operation::Recv(_) => {
+        Operation::Recv(op) => {
             let result = {
-                let Operation::Recv(op) = c.operation_mut() else {
-                    unreachable!()
-                };
                 let rc = unsafe {
                     libc::recv(op.fd, op.buf.as_mut_ptr().cast(), op.buf.len(), op.flags)
                 };
@@ -989,35 +708,8 @@ fn execute_completion(state: &Rc<RefCell<DarwinState>>, c: &mut CompletionInner)
             unsafe { RecvCompletion::from_inner_mut(c) }.complete(result);
             PollResult::Done
         }
-        Operation::RecvBuf(_) => {
+        Operation::Send(op) => {
             let result = {
-                let Operation::RecvBuf(op) = c.operation_mut() else {
-                    unreachable!()
-                };
-                let rc = unsafe {
-                    libc::recv(op.fd, op.buf.as_mut_ptr().cast(), op.buf.len(), op.flags)
-                };
-                if rc < 0 {
-                    let err = io::Error::last_os_error();
-                    if err.kind() == io::ErrorKind::WouldBlock {
-                        return PollResult::Wait;
-                    }
-                    if err.raw_os_error() == Some(libc::EINTR) {
-                        return PollResult::Retry;
-                    }
-                    Err((err, mem::take(&mut op.buf)))
-                } else {
-                    Ok((mem::take(&mut op.buf), rc as usize))
-                }
-            };
-            unsafe { RecvBufCompletion::from_inner_mut(c) }.complete(result);
-            PollResult::Done
-        }
-        Operation::Send(_) => {
-            let result = {
-                let Operation::Send(op) = c.operation_mut() else {
-                    unreachable!()
-                };
                 let rc =
                     unsafe { libc::send(op.fd, op.buf.as_ptr().cast(), op.buf.len(), op.flags) };
                 if rc < 0 {
@@ -1036,34 +728,8 @@ fn execute_completion(state: &Rc<RefCell<DarwinState>>, c: &mut CompletionInner)
             unsafe { SendCompletion::from_inner_mut(c) }.complete(result);
             PollResult::Done
         }
-        Operation::SendOwned(_) => {
+        Operation::PRead(op) => {
             let result = {
-                let Operation::SendOwned(op) = c.operation_mut() else {
-                    unreachable!()
-                };
-                let rc =
-                    unsafe { libc::send(op.fd, op.buf.as_ptr().cast(), op.buf.len(), op.flags) };
-                if rc < 0 {
-                    let err = io::Error::last_os_error();
-                    if err.kind() == io::ErrorKind::WouldBlock {
-                        return PollResult::Wait;
-                    }
-                    if err.raw_os_error() == Some(libc::EINTR) {
-                        return PollResult::Retry;
-                    }
-                    Err((err, mem::take(&mut op.buf)))
-                } else {
-                    Ok((mem::take(&mut op.buf), rc as usize))
-                }
-            };
-            unsafe { SendOwnedCompletion::from_inner_mut(c) }.complete(result);
-            PollResult::Done
-        }
-        Operation::PRead(_) => {
-            let result = {
-                let Operation::PRead(op) = c.operation_mut() else {
-                    unreachable!()
-                };
                 let rc = unsafe {
                     libc::pread(
                         op.fd,
@@ -1086,11 +752,8 @@ fn execute_completion(state: &Rc<RefCell<DarwinState>>, c: &mut CompletionInner)
             unsafe { PReadCompletion::from_inner_mut(c) }.complete(result);
             PollResult::Done
         }
-        Operation::PWrite(_) => {
+        Operation::PWrite(op) => {
             let result = {
-                let Operation::PWrite(op) = c.operation_mut() else {
-                    unreachable!()
-                };
                 let rc = unsafe {
                     libc::pwrite(
                         op.fd,
@@ -1112,29 +775,24 @@ fn execute_completion(state: &Rc<RefCell<DarwinState>>, c: &mut CompletionInner)
             unsafe { PWriteCompletion::from_inner_mut(c) }.complete(result);
             PollResult::Done
         }
-        Operation::Fsync(_) => {
+        Operation::Fsync(op) => {
             let result = {
-                let Operation::Fsync(op) = c.operation_mut() else {
-                    unreachable!()
-                };
-                match full_fsync(op.fd) {
-                    Ok(()) => Ok(()),
-                    Err(err) => {
-                        if err.raw_os_error() == Some(libc::EINTR) {
-                            return PollResult::Retry;
-                        }
-                        Err(err)
+                let rc = unsafe { libc::fsync(op.fd) };
+                if rc < 0 {
+                    let err = io::Error::last_os_error();
+                    if err.raw_os_error() == Some(libc::EINTR) {
+                        return PollResult::Retry;
                     }
+                    Err(err)
+                } else {
+                    Ok(())
                 }
             };
             unsafe { FsyncCompletion::from_inner_mut(c) }.complete(result);
             PollResult::Done
         }
-        Operation::Size(_) => {
+        Operation::Size(op) => {
             let result = {
-                let Operation::Size(op) = c.operation_mut() else {
-                    unreachable!()
-                };
                 let mut stat = MaybeUninit::<libc::stat>::uninit();
                 if unsafe { libc::fstat(op.fd, stat.as_mut_ptr()) } == 0 {
                     let stat = unsafe { stat.assume_init() };
@@ -1146,11 +804,8 @@ fn execute_completion(state: &Rc<RefCell<DarwinState>>, c: &mut CompletionInner)
             unsafe { SizeCompletion::from_inner_mut(c) }.complete(result);
             PollResult::Done
         }
-        Operation::Mkdir(_) => {
+        Operation::Mkdir(op) => {
             let result = {
-                let Operation::Mkdir(op) = c.operation_mut() else {
-                    unreachable!()
-                };
                 if unsafe { libc::mkdir(op.path.as_ptr(), op.mode as libc::mode_t) } == 0 {
                     Ok(())
                 } else {
@@ -1227,111 +882,6 @@ fn socket_addr_to_raw(addr: SocketAddr) -> (libc::sockaddr_storage, libc::sockle
     }
 }
 
-/// Packs a filesystem `path` into a `sockaddr_un` carried inside a
-/// `sockaddr_storage`. `len` is the precise `SUN_LEN`: the offset of
-/// `sun_path` plus the path bytes plus the trailing NUL. Pathname Unix
-/// sockets only; abstract-namespace sockets are out of scope.
-fn unix_sockaddr_to_raw(path: &Path) -> io::Result<(libc::sockaddr_storage, libc::socklen_t)> {
-    let bytes = path.as_os_str().as_bytes();
-    let mut sun: libc::sockaddr_un = unsafe { mem::zeroed() };
-    if bytes.len() >= sun.sun_path.len() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("unix socket path too long: {}", path.display()),
-        ));
-    }
-    if bytes.contains(&0) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "unix socket path contains interior NUL",
-        ));
-    }
-    sun.sun_family = libc::AF_UNIX as libc::sa_family_t;
-    for (dst, src) in sun.sun_path.iter_mut().zip(bytes.iter()) {
-        *dst = *src as libc::c_char;
-    }
-    let path_offset = {
-        let base = &sun as *const _ as usize;
-        let path_ptr = &sun.sun_path as *const _ as usize;
-        path_ptr - base
-    };
-    let len = (path_offset + bytes.len() + 1) as libc::socklen_t;
-    sun.sun_len = len as u8;
-
-    let mut storage = unsafe { mem::zeroed::<libc::sockaddr_storage>() };
-    unsafe {
-        std::ptr::write((&mut storage as *mut libc::sockaddr_storage).cast(), sun);
-    }
-    Ok((storage, len))
-}
-
-/// Best-effort removal of a Unix socket file. Removes the path only when it
-/// is a socket inode, so a regular file or symlink a caller placed there is
-/// never destroyed.
-fn unlink_if_socket(path: &Path) {
-    let Ok(cpath) = c_string(path) else {
-        return;
-    };
-    let mut stat = MaybeUninit::<libc::stat>::uninit();
-    let rc = unsafe { libc::lstat(cpath.as_ptr(), stat.as_mut_ptr()) };
-    if rc != 0 {
-        return;
-    }
-    let stat = unsafe { stat.assume_init() };
-    if (stat.st_mode & libc::S_IFMT) == libc::S_IFSOCK {
-        unsafe {
-            libc::unlink(cpath.as_ptr());
-        }
-    }
-}
-
-fn socket_addr_from_fd(
-    fd: RawFd,
-    query: unsafe extern "C" fn(RawFd, *mut libc::sockaddr, *mut libc::socklen_t) -> libc::c_int,
-) -> io::Result<SocketAddr> {
-    let mut storage = unsafe { mem::zeroed::<libc::sockaddr_storage>() };
-    let mut len = mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
-    let rc = unsafe {
-        query(
-            fd,
-            (&mut storage as *mut libc::sockaddr_storage).cast(),
-            &mut len,
-        )
-    };
-    if rc < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    raw_to_socket_addr(&storage)
-}
-
-fn raw_to_socket_addr(storage: &libc::sockaddr_storage) -> io::Result<SocketAddr> {
-    match storage.ss_family as libc::c_int {
-        libc::AF_INET => {
-            let sockaddr =
-                unsafe { *(storage as *const libc::sockaddr_storage).cast::<libc::sockaddr_in>() };
-            Ok(SocketAddr::from((
-                std::net::Ipv4Addr::from(u32::from_be(sockaddr.sin_addr.s_addr)),
-                u16::from_be(sockaddr.sin_port),
-            )))
-        }
-        libc::AF_INET6 => {
-            let sockaddr =
-                unsafe { *(storage as *const libc::sockaddr_storage).cast::<libc::sockaddr_in6>() };
-            Ok(std::net::SocketAddrV6::new(
-                std::net::Ipv6Addr::from(sockaddr.sin6_addr.s6_addr),
-                u16::from_be(sockaddr.sin6_port),
-                sockaddr.sin6_flowinfo,
-                sockaddr.sin6_scope_id,
-            )
-            .into())
-        }
-        family => Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("unsupported sockaddr family {family}"),
-        )),
-    }
-}
-
 fn set_nonblocking_and_cloexec(fd: RawFd) -> io::Result<()> {
     let status = unsafe { libc::fcntl(fd, libc::F_GETFL) };
     if status < 0 {
@@ -1352,25 +902,6 @@ fn set_nonblocking_and_cloexec(fd: RawFd) -> io::Result<()> {
     Ok(())
 }
 
-fn full_fsync(fd: libc::c_int) -> io::Result<()> {
-    let rc = unsafe { libc::fcntl(fd, libc::F_FULLFSYNC) };
-    if rc == 0 {
-        return Ok(());
-    }
-
-    let err = io::Error::last_os_error();
-    if err.raw_os_error() != Some(libc::ENOTSUP) {
-        return Err(err);
-    }
-
-    let rc = unsafe { libc::fsync(fd) };
-    if rc == 0 {
-        Ok(())
-    } else {
-        Err(io::Error::last_os_error())
-    }
-}
-
 fn set_no_sigpipe(fd: RawFd) -> io::Result<()> {
     let on: libc::c_int = 1;
     let rc = unsafe {
@@ -1386,33 +917,4 @@ fn set_no_sigpipe(fd: RawFd) -> io::Result<()> {
         return Err(io::Error::last_os_error());
     }
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use std::io::Write;
-    use std::os::fd::AsRawFd;
-
-    use super::*;
-
-    #[test]
-    fn full_fsync_succeeds_for_regular_file() {
-        let path = std::env::temp_dir().join(format!(
-            "betelgeuse-fullfsync-{}-{}",
-            std::process::id(),
-            std::thread::current().name().unwrap_or("test")
-        ));
-        let mut file = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .read(true)
-            .write(true)
-            .open(&path)
-            .expect("open temp file");
-        file.write_all(b"durable enough for test")
-            .expect("write temp file");
-        full_fsync(file.as_raw_fd()).expect("full fsync regular file");
-        drop(file);
-        let _ = std::fs::remove_file(path);
-    }
 }

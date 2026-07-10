@@ -22,6 +22,7 @@
 
 #![feature(allocator_api)]
 #![feature(coroutine_trait)]
+#![feature(coroutines)]
 #![feature(stmt_expr_attributes)]
 
 use std::{alloc::Allocator, io as stdio, net::SocketAddr, path::Path, rc::Rc};
@@ -34,9 +35,8 @@ pub mod task;
 
 pub use completion::{
     AcceptCompletion, AcceptOp, ConnectCompletion, ConnectOp, FsyncCompletion, FsyncOp,
-    MkdirCompletion, MkdirOp, PReadCompletion, PReadOp, PWriteCompletion, PWriteOp,
-    RecvBufCompletion, RecvCompletion, RecvOp, SendCompletion, SendOp, SendOwnedCompletion,
-    SizeCompletion, SizeOp,
+    MkdirCompletion, MkdirOp, PReadCompletion, PReadOp, PWriteCompletion, PWriteOp, RecvCompletion,
+    RecvOp, SendCompletion, SendOp, SizeCompletion, SizeOp,
 };
 
 pub use completion::{CompletionInner, Operation};
@@ -46,7 +46,7 @@ pub use completion::{CompletionInner, Operation};
 /// An implementation is expected to:
 /// - submit queued work to the kernel as needed
 /// - harvest completed operations
-/// - complete the caller-owned completion objects associated with them
+/// - complete the caller-owned [`Completion`] objects associated with them
 ///
 /// The return value indicates whether this tick observed or produced useful
 /// work. Callers may use that signal for blocking, idling, or simulation logic.
@@ -55,30 +55,7 @@ pub trait IOLoop: IO {
     ///
     /// Returns `Ok(true)` when the backend submitted or completed at least one
     /// unit of work during this step, and `Ok(false)` when nothing progressed.
-    ///
-    /// This is the non-blocking drain: it submits queued work and harvests any
-    /// already-ready completions, then returns immediately. It never sleeps.
     fn step(&self) -> stdio::Result<bool>;
-
-    /// Returns how many completion slots the backend still owns by pointer.
-    ///
-    /// This is a lifecycle hook for adapter layers that own completion
-    /// storage. Normal callers should observe typed completion objects. Runtime
-    /// adapters use this during shutdown to know when completion slots can be
-    /// dropped without leaving backend-owned raw pointers behind.
-    fn pending_completion_count(&self) -> usize {
-        0
-    }
-
-    /// Requests cancellation/release for every backend-owned completion slot.
-    ///
-    /// Implementations should complete queued operations with an error or
-    /// request kernel-side cancellation for submitted work. The caller must
-    /// keep the completion slots alive and continue stepping until
-    /// [`IOLoop::pending_completion_count`] reaches zero.
-    fn cancel_pending_completions(&self) -> stdio::Result<()> {
-        Ok(())
-    }
 }
 
 /// Submits file-system and socket operations to the backend.
@@ -142,59 +119,17 @@ pub trait IOSocket {
     /// Binds the socket to `addr`.
     fn bind(&self, addr: SocketAddr) -> stdio::Result<()>;
 
-    /// Binds the socket to a Unix-domain `path` and starts listening.
-    ///
-    /// Unix-domain sockets are sockets: bind/accept/recv/send/close all
-    /// follow the same completion model as the internet rail. Only the
-    /// addressing differs, so this is a separate entry point rather than an
-    /// overloaded [`IOSocket::bind`]. The accepted streams returned by
-    /// [`IOSocket::accept`] are ordinary stream sockets and need no
-    /// Unix-specific handling. Backends own the socket-file lifecycle: a
-    /// stale socket file at `path` is cleared before bind, and the file is
-    /// unlinked when the listener is [`IOSocket::close`]d.
-    fn bind_unix(&self, path: &Path) -> stdio::Result<()>;
-
-    /// Connects this socket to a Unix-domain `path`.
-    fn connect_unix(&self, c: &mut ConnectCompletion, path: &Path) -> stdio::Result<()>;
-
-    /// Returns the socket's local address.
-    fn local_addr(&self) -> stdio::Result<SocketAddr>;
-
-    /// Returns the socket's peer address.
-    fn peer_addr(&self) -> stdio::Result<SocketAddr>;
+    /// Connects a stream socket to `addr`.
+    fn connect(&self, c: &mut ConnectCompletion, addr: SocketAddr) -> stdio::Result<()>;
 
     /// Accepts one inbound connection on a listening socket.
     fn accept(&self, c: &mut AcceptCompletion) -> stdio::Result<()>;
 
-    /// Connects this socket to `addr`.
-    fn connect(&self, c: &mut ConnectCompletion, addr: SocketAddr) -> stdio::Result<()>;
-
     /// Receives up to `len` bytes from a connected socket.
     fn recv(&self, c: &mut RecvCompletion, len: usize) -> stdio::Result<()>;
 
-    /// Receives up to `max_len` bytes into caller-owned storage.
-    ///
-    /// The completion yields the same buffer back with its length truncated to
-    /// the bytes read. Backends may grow `buffer` if its capacity is too small,
-    /// but callers that keep reusing the returned buffer avoid per-read
-    /// allocation.
-    fn recv_buf(
-        &self,
-        c: &mut RecvBufCompletion,
-        buffer: Vec<u8>,
-        max_len: usize,
-    ) -> Result<(), (stdio::Error, Vec<u8>)>;
-
     /// Sends the contents of `buf` on a connected socket.
     fn send(&self, c: &mut SendCompletion, buf: Vec<u8>) -> stdio::Result<()>;
-
-    /// Sends the contents of `buf` and returns the same buffer with the
-    /// accepted byte count.
-    fn send_owned(
-        &self,
-        c: &mut SendOwnedCompletion,
-        buf: Vec<u8>,
-    ) -> Result<(), (stdio::Error, Vec<u8>)>;
 
     /// Enables or disables the `TCP_NODELAY` socket option.
     ///
@@ -255,14 +190,6 @@ impl<A> IOLoop for IOLoopHandle<A> {
     fn step(&self) -> stdio::Result<bool> {
         self.inner.step()
     }
-
-    fn pending_completion_count(&self) -> usize {
-        self.inner.pending_completion_count()
-    }
-
-    fn cancel_pending_completions(&self) -> stdio::Result<()> {
-        self.inner.cancel_pending_completions()
-    }
 }
 
 /// Creates the native backend for the current target OS as a shared loop-capable handle.
@@ -270,12 +197,12 @@ pub fn io_loop<A: Allocator + Clone>(allocator: A) -> stdio::Result<IOLoopHandle
     #[cfg(target_os = "linux")]
     {
         let inner: Rc<dyn IOLoop> = Rc::new(io::linux::IoUringIO::new()?);
-        Ok(IOLoopHandle::new(inner, allocator))
+        return Ok(IOLoopHandle::new(inner, allocator));
     }
     #[cfg(target_os = "macos")]
     {
         let inner: Rc<dyn IOLoop> = Rc::new(io::darwin::DarwinIO::new()?);
-        Ok(IOLoopHandle::new(inner, allocator))
+        return Ok(IOLoopHandle::new(inner, allocator));
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {

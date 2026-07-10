@@ -32,12 +32,16 @@ Out of scope: wire protocols, framing, buffer pools, state machines, WAL, consen
 
 - **Completion-based, not `async`/`await`.** Callers prepare an operation, hand a `&mut Completion` to the backend, and later observe a semantic result in the same slot. No futures, no executors, no hidden tasks.
 - **Caller owns the slot.** Long-lived state machines keep persistent completion slots; synchronous bootstrap code can allocate one on the stack. The backend never allocates on the hot path.
-- **One interface, many backends.** `IOLoop` drives the backend forward; `IO` submits work. The native backends use the OS; the narrow `io::simulated` backend implements TCP bind/accept/read/write/close without kernel calls, giving tests control over completion delay and partial writes.
+- **One interface, many backends.** `IOLoop` drives the backend forward; `IO` submits work. A simulation backend can implement both without any kernel calls, giving DST full control over time, ordering, and faults.
 
 ## 🧪 Examples
 
 - [`examples/echo`](examples/echo/README.md) - minimal TCP echo server showing the basic `server.step(); io_loop.step();` shape.
 - [`examples/memcached`](examples/memcached/README.md) - in-memory memcached-style server using the same completion-driven model on a less trivial protocol.
+
+## 🚀 Projects Using Betelgeuse
+
+- [tina-rs](https://github.com/russellromney/tina-rs) - a bounded Rust concurrency framework for services built from isolated state machines, using Betelgeuse for runtime I/O.
 
 ## 🔗 References
 

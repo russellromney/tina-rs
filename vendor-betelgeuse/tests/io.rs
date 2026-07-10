@@ -33,16 +33,6 @@ fn free_port() -> u16 {
         .port()
 }
 
-fn unique_unix_path(label: &str) -> std::path::PathBuf {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static SEQ: AtomicU64 = AtomicU64::new(0);
-    let n = SEQ.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir().join(format!(
-        "betelgeuse-unix-{label}-{}-{n}.sock",
-        std::process::id()
-    ))
-}
-
 fn rw_create_truncate() -> OpenOptions {
     OpenOptions {
         read: true,
@@ -286,6 +276,47 @@ io_test! {
 }
 
 io_test! {
+    fn connect_send_recv_with_std_listener(io_loop) -> io::Result<()> {
+        let port = free_port();
+        let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+
+        let listener = std::net::TcpListener::bind(addr).unwrap();
+
+        let client = io_loop.io().socket()?;
+        let mut connect_c = ConnectCompletion::new();
+        client.connect(&mut connect_c, addr)?;
+        while !connect_c.has_result() {
+            io_loop.step()?;
+        }
+        connect_c.take_result().unwrap()?;
+
+        let (mut accepted, _) = listener.accept().unwrap();
+
+        let mut send_c = SendCompletion::new();
+        client.send(&mut send_c, b"ping".to_vec())?;
+        while !send_c.has_result() {
+            io_loop.step()?;
+        }
+        assert_eq!(send_c.take_result().unwrap()?, 4);
+
+        let mut buf = [0u8; 4];
+        accepted.read_exact(&mut buf).unwrap();
+        assert_eq!(&buf, b"ping");
+
+        accepted.write_all(b"pong").unwrap();
+
+        let mut recv_c = RecvCompletion::new();
+        client.recv(&mut recv_c, 4)?;
+        while !recv_c.has_result() {
+            io_loop.step()?;
+        }
+        assert_eq!(&recv_c.take_result().unwrap()?, b"pong");
+
+        Ok(())
+    }
+}
+
+io_test! {
     fn step_returns_false_while_accept_is_still_pending(io_loop) -> io::Result<()> {
         let port = free_port();
         let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
@@ -347,45 +378,6 @@ io_test! {
 }
 
 io_test! {
-    fn connect_send_recv_echo(io_loop) -> io::Result<()> {
-        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
-        let addr = listener.local_addr().unwrap();
-        let server = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let mut buf = [0_u8; 4];
-            stream.read_exact(&mut buf).unwrap();
-            assert_eq!(&buf, b"ping");
-            stream.write_all(b"pong").unwrap();
-        });
-
-        let socket = io_loop.io().socket()?;
-        let mut connect_c = ConnectCompletion::new();
-        socket.connect(&mut connect_c, addr)?;
-        while !connect_c.has_result() {
-            io_loop.step()?;
-        }
-        connect_c.take_result().unwrap()?;
-        assert_eq!(socket.peer_addr()?, addr);
-
-        let mut send_c = SendCompletion::new();
-        socket.send(&mut send_c, b"ping".to_vec())?;
-        while !send_c.has_result() {
-            io_loop.step()?;
-        }
-        assert_eq!(send_c.take_result().unwrap()?, 4);
-
-        let mut recv_c = RecvCompletion::new();
-        socket.recv(&mut recv_c, 4)?;
-        while !recv_c.has_result() {
-            io_loop.step()?;
-        }
-        assert_eq!(&recv_c.take_result().unwrap()?, b"pong");
-        server.join().unwrap();
-        Ok(())
-    }
-}
-
-io_test! {
     fn recv_returns_empty_on_peer_close(io_loop) -> io::Result<()> {
         let port = free_port();
         let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
@@ -411,103 +403,6 @@ io_test! {
         }
         let received = recv_c.take_result().unwrap()?;
         assert!(received.is_empty(), "expected empty recv on EOF");
-        Ok(())
-    }
-}
-
-io_test! {
-    fn unix_bind_accept_connect_send_recv_close(io_loop) -> io::Result<()> {
-        let path = unique_unix_path("echo");
-        let _ = std::fs::remove_file(&path);
-
-        // Server side: bind a Unix-domain listener and arm an accept.
-        let listener = io_loop.io().socket()?;
-        listener.bind_unix(&path)?;
-        let mut accept_c = AcceptCompletion::new();
-        listener.accept(&mut accept_c)?;
-
-        // Client side: connect to the same path through the substrate.
-        let client = io_loop.io().socket()?;
-        let mut connect_c = ConnectCompletion::new();
-        client.connect_unix(&mut connect_c, &path)?;
-
-        while !accept_c.has_result() || !connect_c.has_result() {
-            io_loop.step()?;
-        }
-        let accepted = accept_c.take_result().unwrap()?;
-        connect_c.take_result().unwrap()?;
-
-        // Client -> server.
-        let mut send_c = SendCompletion::new();
-        client.send(&mut send_c, b"ping".to_vec())?;
-        while !send_c.has_result() {
-            io_loop.step()?;
-        }
-        assert_eq!(send_c.take_result().unwrap()?, 4);
-
-        let mut recv_c = RecvCompletion::new();
-        accepted.recv(&mut recv_c, 32)?;
-        while !recv_c.has_result() {
-            io_loop.step()?;
-        }
-        assert_eq!(&recv_c.take_result().unwrap()?, b"ping");
-
-        // Server -> client.
-        let mut send_back = SendCompletion::new();
-        accepted.send(&mut send_back, b"pong".to_vec())?;
-        while !send_back.has_result() {
-            io_loop.step()?;
-        }
-        assert_eq!(send_back.take_result().unwrap()?, 4);
-
-        let mut recv_back = RecvCompletion::new();
-        client.recv(&mut recv_back, 32)?;
-        while !recv_back.has_result() {
-            io_loop.step()?;
-        }
-        assert_eq!(&recv_back.take_result().unwrap()?, b"pong");
-
-        // Closing the listener unlinks its socket file.
-        accepted.close();
-        client.close();
-        listener.close();
-        assert!(!path.exists(), "listener close should unlink the socket file");
-        Ok(())
-    }
-}
-
-io_test! {
-    fn unix_recv_after_peer_close_is_eof(io_loop) -> io::Result<()> {
-        let path = unique_unix_path("eof");
-        let _ = std::fs::remove_file(&path);
-
-        let listener = io_loop.io().socket()?;
-        listener.bind_unix(&path)?;
-        let mut accept_c = AcceptCompletion::new();
-        listener.accept(&mut accept_c)?;
-
-        let client = io_loop.io().socket()?;
-        let mut connect_c = ConnectCompletion::new();
-        client.connect_unix(&mut connect_c, &path)?;
-
-        while !accept_c.has_result() || !connect_c.has_result() {
-            io_loop.step()?;
-        }
-        let accepted = accept_c.take_result().unwrap()?;
-        connect_c.take_result().unwrap()?;
-
-        // Client hangs up; server recv must observe a clean EOF (empty read).
-        client.close();
-        let mut recv_c = RecvCompletion::new();
-        accepted.recv(&mut recv_c, 32)?;
-        while !recv_c.has_result() {
-            io_loop.step()?;
-        }
-        assert!(recv_c.take_result().unwrap()?.is_empty(), "expected EOF");
-
-        accepted.close();
-        listener.close();
-        let _ = std::fs::remove_file(&path);
         Ok(())
     }
 }

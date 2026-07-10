@@ -6,6 +6,7 @@
 
 #![feature(allocator_api)]
 #![feature(coroutines)]
+#![feature(stmt_expr_attributes)]
 
 use std::{
     alloc::{Allocator, Global},
