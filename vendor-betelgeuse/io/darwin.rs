@@ -840,15 +840,15 @@ impl DarwinIO {
         Ok(progressed)
     }
 
-    /// Harvests ready kqueue events. `step` passes a zero timeout, so this is a
-    /// nonblocking poll.
-    fn poll_events(&self, timeout: Option<libc::timespec>) -> io::Result<bool> {
+    /// Harvests ready kqueue events with a zero timeout: a nonblocking poll.
+    /// This backend never sleeps; `step` is the only progress primitive.
+    fn poll_events(&self) -> io::Result<bool> {
         let mut progressed = false;
         let kq = self.state.borrow().kq;
         let mut events: [libc::kevent; 64] = unsafe { MaybeUninit::zeroed().assume_init() };
-        let timeout_ptr = match &timeout {
-            Some(ts) => ts as *const libc::timespec,
-            None => std::ptr::null(),
+        let timeout = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
         };
         let n = unsafe {
             libc::kevent(
@@ -857,13 +857,13 @@ impl DarwinIO {
                 0,
                 events.as_mut_ptr(),
                 events.len() as i32,
-                timeout_ptr,
+                &timeout,
             )
         };
         if n < 0 {
             let err = io::Error::last_os_error();
-            // A blocking kevent interrupted by a signal is a (spurious) wake, not
-            // a failure: return so the caller re-polls.
+            // A kevent interrupted by a signal is a (spurious) wake, not a
+            // failure: return so the caller re-polls.
             if err.raw_os_error() == Some(libc::EINTR) {
                 return Ok(progressed);
             }
@@ -898,10 +898,7 @@ impl DarwinIO {
 impl IOLoop for DarwinIO {
     fn step(&self) -> io::Result<bool> {
         let queued = self.drain_queued()?;
-        let events = self.poll_events(Some(libc::timespec {
-            tv_sec: 0,
-            tv_nsec: 0,
-        }))?;
+        let events = self.poll_events()?;
         Ok(queued || events)
     }
 
@@ -1018,12 +1015,9 @@ fn cancelled_error() -> io::Error {
 /// take `&mut <kind>Completion` and only set the matching `Operation`, so
 /// the cast back is sound.
 fn execute_completion(state: &Rc<RefCell<DarwinState>>, c: &mut CompletionInner) -> PollResult {
-    match c.operation() {
-        Operation::Accept(_) => {
+    match c.operation_mut() {
+        Operation::Accept(op) => {
             let result = {
-                let Operation::Accept(op) = c.operation_mut() else {
-                    unreachable!()
-                };
                 let accepted =
                     unsafe { libc::accept(op.fd, std::ptr::null_mut(), std::ptr::null_mut()) };
                 if accepted < 0 {
@@ -1054,11 +1048,8 @@ fn execute_completion(state: &Rc<RefCell<DarwinState>>, c: &mut CompletionInner)
             unsafe { AcceptCompletion::from_inner_mut(c) }.complete(result);
             PollResult::Done
         }
-        Operation::Connect(_) => {
+        Operation::Connect(op) => {
             let result = {
-                let Operation::Connect(op) = c.operation_mut() else {
-                    unreachable!()
-                };
                 if !op.attempted {
                     op.attempted = true;
                     let rc = unsafe {
@@ -1107,11 +1098,8 @@ fn execute_completion(state: &Rc<RefCell<DarwinState>>, c: &mut CompletionInner)
             unsafe { ConnectCompletion::from_inner_mut(c) }.complete(result);
             PollResult::Done
         }
-        Operation::Recv(_) => {
+        Operation::Recv(op) => {
             let result = {
-                let Operation::Recv(op) = c.operation_mut() else {
-                    unreachable!()
-                };
                 let rc = unsafe {
                     libc::recv(op.fd, op.buf.as_mut_ptr().cast(), op.buf.len(), op.flags)
                 };
@@ -1132,11 +1120,8 @@ fn execute_completion(state: &Rc<RefCell<DarwinState>>, c: &mut CompletionInner)
             unsafe { RecvCompletion::from_inner_mut(c) }.complete(result);
             PollResult::Done
         }
-        Operation::RecvBuf(_) => {
+        Operation::RecvBuf(op) => {
             let result = {
-                let Operation::RecvBuf(op) = c.operation_mut() else {
-                    unreachable!()
-                };
                 let rc = unsafe {
                     libc::recv(op.fd, op.buf.as_mut_ptr().cast(), op.buf.len(), op.flags)
                 };
@@ -1156,11 +1141,8 @@ fn execute_completion(state: &Rc<RefCell<DarwinState>>, c: &mut CompletionInner)
             unsafe { RecvBufCompletion::from_inner_mut(c) }.complete(result);
             PollResult::Done
         }
-        Operation::Send(_) => {
+        Operation::Send(op) => {
             let result = {
-                let Operation::Send(op) = c.operation_mut() else {
-                    unreachable!()
-                };
                 let bytes = &op.buf[op.start..];
                 // SAFETY: `bytes` is a live immutable slice for the duration
                 // of `send`, and the socket retains ownership of `op.fd`.
@@ -1181,11 +1163,8 @@ fn execute_completion(state: &Rc<RefCell<DarwinState>>, c: &mut CompletionInner)
             unsafe { SendCompletion::from_inner_mut(c) }.complete(result);
             PollResult::Done
         }
-        Operation::SendOwned(_) => {
+        Operation::SendOwned(op) => {
             let result = {
-                let Operation::SendOwned(op) = c.operation_mut() else {
-                    unreachable!()
-                };
                 let bytes = &op.buf[op.start..];
                 // SAFETY: `bytes` is a live immutable slice for the duration
                 // of `send`, and the socket retains ownership of `op.fd`.
@@ -1208,11 +1187,8 @@ fn execute_completion(state: &Rc<RefCell<DarwinState>>, c: &mut CompletionInner)
             unsafe { SendOwnedCompletion::from_inner_mut(c) }.complete(result);
             PollResult::Done
         }
-        Operation::PRead(_) => {
+        Operation::PRead(op) => {
             let result = {
-                let Operation::PRead(op) = c.operation_mut() else {
-                    unreachable!()
-                };
                 let rc = unsafe {
                     libc::pread(
                         op.fd,
@@ -1235,13 +1211,8 @@ fn execute_completion(state: &Rc<RefCell<DarwinState>>, c: &mut CompletionInner)
             unsafe { PReadCompletion::from_inner_mut(c) }.complete(result);
             PollResult::Done
         }
-        Operation::PWrite(_) | Operation::PWriteOwned(_) => {
-            let owned = matches!(c.operation(), Operation::PWriteOwned(_));
+        Operation::PWrite(op) => {
             let result = {
-                let op = match c.operation_mut() {
-                    Operation::PWrite(op) | Operation::PWriteOwned(op) => op,
-                    _ => unreachable!(),
-                };
                 // SAFETY: the remaining buffer slice is live for the syscall,
                 // `op.fd` remains owned by the file, and the non-empty range's
                 // offset was validated as representable by `off_t` when armed.
@@ -1263,28 +1234,44 @@ fn execute_completion(state: &Rc<RefCell<DarwinState>>, c: &mut CompletionInner)
                     Ok(rc as usize)
                 }
             };
-            if owned {
-                let buffer = match c.operation_mut() {
-                    Operation::PWriteOwned(op) => mem::take(&mut op.buf),
-                    _ => unreachable!(),
-                };
-                let result = match result {
-                    Ok(count) => Ok((buffer, count)),
-                    Err(error) => Err((error, buffer)),
-                };
-                // SAFETY: the matching IO method armed `PWriteOwned` only in
-                // a `PWriteOwnedCompletion`; the buffer has been moved out.
-                unsafe { PWriteOwnedCompletion::from_inner_mut(c) }.complete(result);
-            } else {
-                unsafe { PWriteCompletion::from_inner_mut(c) }.complete(result);
-            }
+            unsafe { PWriteCompletion::from_inner_mut(c) }.complete(result);
             PollResult::Done
         }
-        Operation::Fsync(_) => {
+        Operation::PWriteOwned(op) => {
             let result = {
-                let Operation::Fsync(op) = c.operation_mut() else {
-                    unreachable!()
+                // SAFETY: the remaining buffer slice is live for the syscall,
+                // `op.fd` remains owned by the file, and the non-empty range's
+                // offset was validated as representable by `off_t` when armed.
+                let rc = unsafe {
+                    libc::pwrite(
+                        op.fd,
+                        op.buf[op.start..].as_ptr().cast(),
+                        op.buf.len() - op.start,
+                        op.offset as libc::off_t,
+                    )
                 };
+                if rc < 0 {
+                    let err = io::Error::last_os_error();
+                    if err.raw_os_error() == Some(libc::EINTR) {
+                        return PollResult::Retry;
+                    }
+                    Err(err)
+                } else {
+                    Ok(rc as usize)
+                }
+            };
+            let buffer = mem::take(&mut op.buf);
+            let result = match result {
+                Ok(count) => Ok((buffer, count)),
+                Err(error) => Err((error, buffer)),
+            };
+            // SAFETY: the matching IO method armed `PWriteOwned` only in a
+            // `PWriteOwnedCompletion`; the buffer has been moved out.
+            unsafe { PWriteOwnedCompletion::from_inner_mut(c) }.complete(result);
+            PollResult::Done
+        }
+        Operation::Fsync(op) => {
+            let result = {
                 match full_fsync(op.fd) {
                     Ok(()) => Ok(()),
                     Err(err) => {
@@ -1298,11 +1285,8 @@ fn execute_completion(state: &Rc<RefCell<DarwinState>>, c: &mut CompletionInner)
             unsafe { FsyncCompletion::from_inner_mut(c) }.complete(result);
             PollResult::Done
         }
-        Operation::Size(_) => {
+        Operation::Size(op) => {
             let result = {
-                let Operation::Size(op) = c.operation_mut() else {
-                    unreachable!()
-                };
                 let mut stat = MaybeUninit::<libc::stat>::uninit();
                 if unsafe { libc::fstat(op.fd, stat.as_mut_ptr()) } == 0 {
                     let stat = unsafe { stat.assume_init() };
@@ -1314,11 +1298,8 @@ fn execute_completion(state: &Rc<RefCell<DarwinState>>, c: &mut CompletionInner)
             unsafe { SizeCompletion::from_inner_mut(c) }.complete(result);
             PollResult::Done
         }
-        Operation::Mkdir(_) => {
+        Operation::Mkdir(op) => {
             let result = {
-                let Operation::Mkdir(op) = c.operation_mut() else {
-                    unreachable!()
-                };
                 if unsafe { libc::mkdir(op.path.as_ptr(), op.mode as libc::mode_t) } == 0 {
                     Ok(())
                 } else {

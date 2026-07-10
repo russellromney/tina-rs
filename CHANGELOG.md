@@ -4,6 +4,22 @@ This file records completed work.
 
 ## Unreleased
 
+### Betelgeuse re-vendor and provenance (#286)
+
+Re-vendored `vendor-betelgeuse/` to upstream tip (`6d1f137`) and closed the
+historical provenance gap: the vendor-base commit is now reconstructed and
+recorded (`97f4f40a`, confirmed two independent ways), with the tina patch set
+replayed one family per commit so each is directly exportable as an upstream
+PR. Upstream delta since our base was trivial (a darwin restyle, adopted, plus
+README commits crediting tina-rs). Also found and fixed undocumented ledger
+drift: the ~1000-line simulated I/O backend is now a documented family, a
+claimed patch family with no code footprint was corrected, and dead
+worker-park residue (a never-called blocking `kevent` path) was excised — the
+darwin backend is now structurally incapable of sleeping. Upstreaming
+assessment and Pekka Enberg coordination plan live in the PR body; deliberate
+darwin connect simplifications (EALREADY/getsockopt-EINTR drops vs upstream)
+are documented in VENDOR.md with a registered one-line hardening option.
+
 ### 0.1.0 release-readiness wave (external review P0/P1 fixes)
 
 An external 0.1.0 review found two release blockers and two live-boundedness

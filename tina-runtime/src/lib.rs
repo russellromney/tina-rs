@@ -8,27 +8,26 @@
 // scoped to this crate.
 #![feature(allocator_api)]
 
-//! Small deterministic single-shard runtime core for `tina-rs`.
+//! Live runtime implementations for `tina-rs`.
 //!
-//! This crate starts with the narrowest useful runtime surface:
+//! Three runtime owners share one isolate/effect contract:
 //!
-//! - deterministic runtime event IDs
-//! - causal links between runtime events
-//! - a tiny single-shard runtime that can host more than one isolate
+//! - `Runtime` — the explicit-step, single-shard primitive: deterministic
+//!   event IDs, causal links, full trace. The unit-test workhorse.
+//! - `LocalSystem` — single-process multi-shard runner with bounded
+//!   shard-pair queues and runtime-owned I/O rails.
+//! - `ThreadedRuntime` — the live thread-per-shard runtime over the vendored
+//!   Betelgeuse substrate: TCP/UDP/DNS/TLS/Unix/file/process/signal and
+//!   snapshot/journal persistence as typed runtime calls.
 //!
-//! The multi-isolate runtime still stays narrow on purpose. It can register
-//! isolates, step them in deterministic order, execute local same-shard
-//! [`tina::Effect::Send`] requests that use [`tina::Outbound`], spawn local
-//! children, and restart direct restartable children. Reply effects are still
-//! traced without execution until a later slice gives them runtime semantics.
+//! Shared discipline across all three: bounded mailboxes and lanes with typed
+//! `Full`/`Closed`/`Timeout` outcomes, isolate calls with mandatory timeouts,
+//! supervision with restart budgets, capacity reports, and a runtime trace
+//! (bounded retention by default on the live owners; `TraceRetention::Full`
+//! stays the explicit choice for tests and replay).
 //!
-//! `Effect::Stop` stays immediate, but `Runtime` also drains and
-//! traces any already-buffered messages that become abandoned when an isolate
-//! stops.
-//!
-//! `Runtime` also captures unwinding panics from handler calls and turns
-//! them into deterministic runtime events. Binaries built with `panic = "abort"`
-//! remain out of scope for this crate.
+//! Handler panics unwind into deterministic runtime events. Binaries built
+//! with `panic = "abort"` remain out of scope for this crate.
 
 use std::alloc::Global;
 use std::any::Any;
