@@ -6,13 +6,15 @@ rust-version.workspace = true
 license.workspace = true
 description = "Bounded Postgres worker around SQLx, for Tina services"
 repository = "https://github.com/russellromney/tina-rs"
+keywords = ["postgres", "sqlx", "database"]
+categories = ["database"]
 
 [lib]
 path = "src/lib.rs"
 
 [dependencies]
-tina = { path = "../tina" }
-tina-runtime = { path = "../tina-runtime" }
+tina = { path = "../tina", version = "0.1.0" }
+tina-runtime = { path = "../tina-runtime", version = "0.1.0" }
 sqlx = { version = "0.8", default-features = false, features = [
     "runtime-tokio-rustls",
     "postgres",

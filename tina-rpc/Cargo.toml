@@ -6,14 +6,16 @@ rust-version.workspace = true
 license.workspace = true
 description = "Tina framed request/reply with bounded in-flight, server-reported wire errors, and visible overload. Not gRPC. Not a general RPC framework."
 repository = "https://github.com/russellromney/tina-rs"
+keywords = ["rpc", "framing", "bounded"]
+categories = ["network-programming"]
 
 [lib]
 path = "src/lib.rs"
 
 [dependencies]
-tina = { path = "../tina" }
-tina-rpc-macros = { path = "../tina-rpc-macros" }
-tina-runtime = { path = "../tina-runtime" }
+tina = { path = "../tina", version = "0.1.0" }
+tina-rpc-macros = { path = "../tina-rpc-macros", version = "0.1.0" }
+tina-runtime = { path = "../tina-runtime", version = "0.1.0" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0", default-features = false, features = ["std"] }
 

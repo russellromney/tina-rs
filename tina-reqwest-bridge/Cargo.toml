@@ -6,13 +6,15 @@ rust-version.workspace = true
 license.workspace = true
 description = "Bounded outbound HTTP worker around reqwest, for Tina services"
 repository = "https://github.com/russellromney/tina-rs"
+keywords = ["http-client", "reqwest", "outbound"]
+categories = ["web-programming::http-client"]
 
 [lib]
 path = "src/lib.rs"
 
 [dependencies]
-tina = { path = "../tina" }
-tina-runtime = { path = "../tina-runtime" }
+tina = { path = "../tina", version = "0.1.0" }
+tina-runtime = { path = "../tina-runtime", version = "0.1.0" }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "http2"] }
 tokio = { version = "1", default-features = false, features = ["rt", "rt-multi-thread", "sync", "time"] }
 http = { version = "1", default-features = false }

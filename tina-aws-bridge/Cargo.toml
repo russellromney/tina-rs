@@ -6,13 +6,15 @@ rust-version.workspace = true
 license.workspace = true
 description = "Bounded AWS SDK workers (S3, SQS, DynamoDB, SNS, Secrets Manager) for Tina services"
 repository = "https://github.com/russellromney/tina-rs"
+keywords = ["aws", "s3", "sqs"]
+categories = ["asynchronous", "network-programming"]
 
 [lib]
 path = "src/lib.rs"
 
 [dependencies]
-tina = { path = "../tina" }
-tina-runtime = { path = "../tina-runtime" }
+tina = { path = "../tina", version = "0.1.0" }
+tina-runtime = { path = "../tina-runtime", version = "0.1.0" }
 aws-sdk-s3 = "1.96"
 aws-sdk-sqs = "1.85"
 aws-sdk-dynamodb = "1.96"

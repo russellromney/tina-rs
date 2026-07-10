@@ -6,13 +6,15 @@ rust-version.workspace = true
 license.workspace = true
 description = "Bounded SQLite worker around rusqlite, for Tina services"
 repository = "https://github.com/russellromney/tina-rs"
+keywords = ["sqlite", "database", "rusqlite"]
+categories = ["database"]
 
 [lib]
 path = "src/lib.rs"
 
 [dependencies]
-tina = { path = "../tina" }
-tina-runtime = { path = "../tina-runtime" }
+tina = { path = "../tina", version = "0.1.0" }
+tina-runtime = { path = "../tina-runtime", version = "0.1.0" }
 rusqlite = { version = "0.32", features = ["bundled"] }
 # Optional tracing scaffolding. No spans/events are emitted yet; the
 # feature surface is here so we can align vocabulary across bridges

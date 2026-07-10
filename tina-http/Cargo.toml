@@ -6,13 +6,15 @@ rust-version.workspace = true
 license.workspace = true
 description = "Native HTTP/1.1 service stack for tina-rs (first form, server side)"
 repository = "https://github.com/russellromney/tina-rs"
+keywords = ["http", "http2", "server"]
+categories = ["web-programming::http-server", "network-programming"]
 
 [lib]
 path = "src/lib.rs"
 
 [dependencies]
-tina = { path = "../tina" }
-tina-runtime = { path = "../tina-runtime" }
+tina = { path = "../tina", version = "0.1.0" }
+tina-runtime = { path = "../tina-runtime", version = "0.1.0" }
 httparse = { version = "1", default-features = false, features = ["std"] }
 http = { version = "1", default-features = false, features = ["std"] }
 base64 = { version = "0.22", default-features = false, features = ["std"] }
@@ -25,10 +27,10 @@ prost = { version = "0.13", default-features = false, features = ["derive"] }
 hpack = "=0.3.0"
 
 [dev-dependencies]
-tina-sim = { path = "../tina-sim" }
+tina-sim = { path = "../tina-sim", version = "0.1.0" }
 # Fold the `rpc_frame` fuzz target's panic-containment property into the per-PR
 # suite: an integration test drives the shipped `decode`/`decode_body` directly.
-tina-rpc = { path = "../tina-rpc" }
+tina-rpc = { path = "../tina-rpc", version = "0.1.0" }
 rustls = { version = "0.23", default-features = false, features = ["std", "ring"] }
 rustls-pki-types = "1"
 rcgen = "0.13"

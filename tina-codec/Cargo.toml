@@ -6,6 +6,8 @@ rust-version.workspace = true
 license.workspace = true
 description = "Sync byte-codec helpers (line and length framing) for Tina isolates"
 repository = "https://github.com/russellromney/tina-rs"
+keywords = ["codec", "framing", "serialization"]
+categories = ["encoding"]
 
 [lib]
 path = "src/lib.rs"

@@ -6,14 +6,16 @@ rust-version.workspace = true
 license.workspace = true
 description = "Tokio async-bridge adapter for tina-rpc clients"
 repository = "https://github.com/russellromney/tina-rs"
+keywords = ["tokio", "rpc", "async-bridge"]
+categories = ["asynchronous", "network-programming"]
 
 [lib]
 path = "src/lib.rs"
 
 [dependencies]
-tina = { path = "../tina" }
-tina-runtime = { path = "../tina-runtime" }
-tina-rpc = { path = "../tina-rpc" }
+tina = { path = "../tina", version = "0.1.0" }
+tina-runtime = { path = "../tina-runtime", version = "0.1.0" }
+tina-rpc = { path = "../tina-rpc", version = "0.1.0" }
 tokio = { version = "1", features = ["sync", "time", "rt", "macros"] }
 tracing = { version = "0.1", default-features = false, features = ["std", "attributes"], optional = true }
 
