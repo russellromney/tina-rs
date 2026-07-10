@@ -30,7 +30,7 @@ use tina::prelude::*;
 use tina_runtime::{
     CallOutcome, CallReplyRejectedReason, DefaultThreadedMailboxFactory,
     DeferredReplyRejectedReason, RequestScope, RequestScopeId, RuntimeEventKind, ScopeCancelCause,
-    SleepReply, ThreadedRuntime, call_cancelable, sleep,
+    SleepReply, ThreadedRuntime, call_cancelable_request, sleep,
 };
 
 /// Number of child rails the driver dispatches per request.
@@ -78,9 +78,6 @@ enum WorkerRequest {
 enum WorkerEvent {
     Wake(SleepReply),
 }
-
-/// Split-service envelope for [`Worker`].
-type WorkerMsg = tina::ServiceMessage<WorkerEvent, WorkerRequest>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WorkerReply;
@@ -140,7 +137,7 @@ enum DriverMsg {
 }
 
 struct Driver {
-    workers: Vec<Address<WorkerMsg, WorkerReply>>,
+    workers: Vec<tina::ServiceRequestAddress<WorkerEvent, WorkerRequest, WorkerReply>>,
     scope: Option<RequestScope>,
     rails_total: u32,
     rails_settled_before_cancel: u32,
@@ -194,7 +191,7 @@ impl Driver {
         let mut effects = Vec::with_capacity(self.workers.len());
         for worker in &self.workers {
             let (effect, handle) =
-                call_cancelable(*worker, WorkerMsg::Request(WorkerRequest::Run), CALL_TIMEOUT)
+                call_cancelable_request(*worker, WorkerRequest::Run, CALL_TIMEOUT)
                     .then(DriverMsg::Returned);
             // Scope is sole canceller for these rails; the worker-return
             // continuation still delivers `Returned` normally for any
@@ -239,14 +236,15 @@ pub fn run() -> anyhow::Result<Report> {
     for _ in 0..FANOUT {
         workers.push(
             runtime
-                .register_with_capacity::<_, Infallible>(
+                .register_split_service::<Worker, WorkerEvent, WorkerRequest, Infallible>(
                     Worker {
                         work: Duration::from_millis(WORK_MS),
                         held: None,
                     },
                     8,
                 )
-                .map_err(|e| anyhow::anyhow!("register worker: {e:?}"))?,
+                .map_err(|e| anyhow::anyhow!("register worker: {e:?}"))?
+                .requests,
         );
     }
 

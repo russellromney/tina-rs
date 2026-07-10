@@ -36,7 +36,7 @@ use tina::{ChildDefinition, prelude::*};
 use tina_runtime::{
     CallOutcome, DefaultThreadedMailboxFactory, PendingCancelableCallSet,
     PendingCancelableInsertError, PendingCancelableRemoveError, PendingCancelableTicket,
-    SleepReply, ThreadedRuntime, call_cancelable, sleep,
+    SleepReply, ThreadedRuntime, call_cancelable_request, sleep,
 };
 
 /// Tunables for one specimen run.
@@ -244,7 +244,7 @@ impl Worker {
 struct Queue {
     config: RunConfig,
     pending: PendingCancelableCallSet<JobId, QueueReply, WorkerReply>,
-    workers: Vec<Option<Address<WorkerMsg, WorkerReply>>>,
+    workers: Vec<Option<tina_runtime::SplitServiceHandle<WorkerEvent, WorkerRequest, WorkerReply>>>,
     worker_busy: Vec<Option<JobId>>,
     next_id: u64,
     stats: QueueStats,
@@ -342,7 +342,9 @@ impl Queue {
     ) -> Effect<Self> {
         match result {
             Ok(child) => {
-                self.workers[slot] = Some(child.address);
+                self.workers[slot] = Some(tina_runtime::SplitServiceHandle::from_address(
+                    child.address,
+                ));
                 self.stats.workers_alive += 1;
                 self.spawned_workers += 1;
                 if self.spawned_workers == self.workers.len() {
@@ -370,26 +372,19 @@ impl Queue {
             self.stats.jobs_busy_rejected += 1;
             return call.reply(QueueReply::Busy);
         };
-        // pending cap = workers. A full pending set while an idle worker
-        // slot exists is an accounting bug; refuse before consuming the
-        // call so we can answer with Busy without a RequestEffect escape.
-        if self.pending.is_full() {
-            self.stats.jobs_busy_rejected += 1;
-            return call.reply(QueueReply::Busy);
-        }
         let id = JobId(self.next_id);
         self.next_id += 1;
         let sleep_ms = self.config.job_sleep_ms;
         let dispatch_timeout = Duration::from_millis(sleep_ms.saturating_mul(4) + 1_000);
 
         let admission = call
-            .defer_cancelable(call_cancelable(
-                worker,
-                WorkerMsg::Request(WorkerRequest::Process {
+            .defer_cancelable(call_cancelable_request(
+                worker.requests,
+                WorkerRequest::Process {
                     id,
                     payload,
                     sleep_ms,
-                }),
+                },
                 dispatch_timeout,
             ))
             .try_admit(
@@ -411,12 +406,16 @@ impl Queue {
                 self.stats.in_flight = self.in_flight_count();
                 effect
             }
-            // Pre-checked is_full / monotonic ids — these arms are
-            // unreachable. Fail loudly rather than invent a RequestEffect
-            // wrapper for a path that should never run.
-            Err(PendingCancelableInsertError::Full { .. }) => {
-                panic!("queue pending full after is_full pre-check — accounting bug")
+            // pending cap = workers, so a full pending set while an idle
+            // worker slot exists should never happen in normal accounting.
+            // If it ever does, answer the caller typed instead of stranding
+            // the already-captured `RequestCall` behind a panic.
+            Err(PendingCancelableInsertError::Full { token }) => {
+                self.stats.jobs_busy_rejected += 1;
+                token.reply_request::<Self>(QueueReply::Busy)
             }
+            // Monotonic `next_id` never repeats, so a duplicate key is a
+            // real accounting bug worth failing loudly on.
             Err(PendingCancelableInsertError::DuplicateKey { .. }) => {
                 panic!("duplicate job id {id:?} — queue accounting bug")
             }
@@ -457,13 +456,13 @@ impl Queue {
         follow_up.push(token.cancel(|key, req, _outcome| {
             QueueMsg::Event(QueueEvent::ParkedCallerCancelled { id: key, req })
         }));
-        if let Some(addr) = worker_addr {
+        if let Some(worker) = worker_addr {
             // Wake the worker early so it stops sleeping; the worker's reply
             // will be rejected by the runtime since `cancel_call` already
             // closed our wait. This send is opportunistic.
-            follow_up.push(send::<Self, _, _>(
-                addr,
-                WorkerMsg::Event(WorkerEvent::Cancel(id)),
+            follow_up.push(tina::send_event::<Self, _, _>(
+                worker.events,
+                WorkerEvent::Cancel(id),
             ));
         }
         call.reply_and(QueueReply::Cancelled(id), follow_up)

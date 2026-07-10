@@ -542,6 +542,25 @@ where
         self.request
     }
 
+    /// Consumes a rejected admission token and answers the original caller
+    /// as a [`tina::RequestEffect`].
+    ///
+    /// `PendingCancelableCallSet::try_insert` (and
+    /// `DeferredCancelableCall::try_admit`) return this token on `Full` /
+    /// `DuplicateKey` because the caller's [`tina::RequestCall`] was already
+    /// captured into the token before the storage decision failed — there is
+    /// no `RequestCall` left to reply through directly, only this token's
+    /// `RequestContext`. Plain (non-split) `handle_call` arms can already
+    /// answer with `tina::reply_to(token.into_request_context(), value)`
+    /// because they return `Effect`; split-service `handle_request` arms
+    /// return `RequestEffect` instead, so this is that path's sibling.
+    pub fn reply_request<I>(self, value: Q) -> tina::RequestEffect<I>
+    where
+        I: tina::Isolate<Reply = Q>,
+    {
+        crate::call::request_effect_from_consumed_effect(tina::reply_to::<I>(self.request, value))
+    }
+
     /// Crate-private accessor for the typed call handle inside the token.
     /// Used by [`crate::scope::DeferredScopedCall::try_admit`] to clone the
     /// shared cell before registering the rail into a [`RequestScope`].

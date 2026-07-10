@@ -841,6 +841,32 @@ where
         }
     }
 
+    /// Blocking host call through a split-service request capability,
+    /// routed to the shard that owns `address`.
+    ///
+    /// This is the multi-shard companion to
+    /// [`crate::ThreadedRuntime::call_blocking_request`]: it wraps the
+    /// request in [`tina::ServiceMessage::Request`] and keeps host code
+    /// from reaching for the raw split envelope address. See
+    /// [`Self::call_blocking`] for the shard-routing and panic contract.
+    pub fn call_blocking_request<Event, Request, Reply>(
+        &self,
+        address: tina::ServiceRequestAddress<Event, Request, Reply>,
+        request: Request,
+        timeout: Duration,
+    ) -> Result<CallOutcome<Reply>, ThreadedRuntimeError>
+    where
+        Event: Send + 'static,
+        Request: Send + 'static,
+        Reply: Send + 'static,
+    {
+        self.call_blocking(
+            address.address().address(),
+            tina::ServiceMessage::Request(request),
+            timeout,
+        )
+    }
+
     fn call_on<R, C>(&self, shard: ShardId, command: C) -> Result<R, ThreadedRuntimeError>
     where
         R: Send + 'static,

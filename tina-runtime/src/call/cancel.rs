@@ -58,6 +58,29 @@ where
     CancelableCall::new(destination, message, timeout)
 }
 
+/// Cancelable-call sibling of [`crate::call_request`] for split service
+/// requests.
+///
+/// This is the request-lane companion to [`call_cancelable`]. Passing an
+/// event address here is a compile error, and request payloads are wrapped
+/// into [`tina::ServiceMessage::Request`] before dispatch.
+pub fn call_cancelable_request<E, Q, R>(
+    destination: tina::ServiceRequestAddress<E, Q, R>,
+    request: Q,
+    timeout: Duration,
+) -> CancelableCall<tina::ServiceMessage<E, Q>, R>
+where
+    E: Send + 'static,
+    Q: Send + 'static,
+    R: 'static,
+{
+    CancelableCall::new(
+        destination.address().address(),
+        tina::ServiceMessage::Request(request),
+        timeout,
+    )
+}
+
 /// Compatibility spelling for [`call_cancelable`].
 #[deprecated(since = "0.1.0", note = "use call_cancelable")]
 pub fn call_with_handle<T, R>(

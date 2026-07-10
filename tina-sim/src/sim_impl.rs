@@ -41,9 +41,9 @@ use tina_runtime::{
     PathMetadataReply, PersistenceTraceInfo, ProcessRunReply, ProcessRunResult, ProcessStatus,
     ReadDirReply, RemoveFileReply, RenameReplaceReply, RestartSkippedReason, RuntimeCall,
     RuntimeCallable, RuntimeEvent, RuntimeEventKind, RuntimeFact, SendOutcome, SendRejectedReason,
-    SignalWaitReply, SnapshotCommitReply, SnapshotImage, SnapshotLoadReply, StreamId,
-    SupervisionRejectedReason, SyncParentReply, TcpAcceptReply, TcpBindReply, TcpConnectReply,
-    TcpListenerCloseReply, TcpReadReply, TcpStreamCloseReply, TcpWriteReply,
+    SignalWaitReply, SnapshotCommitReply, SnapshotImage, SnapshotLoadReply, SplitServiceHandle,
+    StreamId, SupervisionRejectedReason, SyncParentReply, TcpAcceptReply, TcpBindReply,
+    TcpConnectReply, TcpListenerCloseReply, TcpReadReply, TcpStreamCloseReply, TcpWriteReply,
     TerminalCompletionAction, TlsAcceptReply, TlsBindReply, TlsCloseReply, TlsConnectReply,
     TlsListenerCloseReply, TlsListenerId, TlsReadReply, TlsStreamId, TlsWriteReply, UdpBindReply,
     UdpCloseSocketReply, UdpRecvFromReply, UdpSendToReply, UdpSocketId, UnixAcceptReply,
@@ -162,6 +162,47 @@ where
     {
         let address = self.register_entry::<I, Msg, Outbound>(isolate, None, mailbox_capacity);
         Address::new_with_generation(address.shard, address.isolate, address.generation)
+    }
+
+    /// Registers one split event/request isolate and returns split
+    /// capabilities.
+    ///
+    /// Mirrors [`tina_runtime::Runtime::register_split_service`]. The
+    /// simulator wraps the same [`Self::register_with_mailbox_capacity`]
+    /// path used by every other registration entry point, so split-service
+    /// isolates no longer need the caller to hand-wrap
+    /// `SplitServiceHandle::from_address(sim.register(...))` at every call
+    /// site.
+    #[allow(private_bounds)]
+    pub fn register_split_service<I, Event, Request, Outbound>(
+        &mut self,
+        isolate: I,
+        mailbox_capacity: usize,
+    ) -> SplitServiceHandle<Event, Request, I::Reply>
+    where
+        I: Isolate<
+                Message = tina::ServiceMessage<Event, Request>,
+                Shard = S,
+                Send = TinaOutbound<Outbound>,
+                Io = RuntimeCall<tina::ServiceMessage<Event, Request>>,
+            > + tina::CallableIsolate
+            + 'static,
+        I::Io: RuntimeCallable,
+        I::Spawn: IntoErasedSpawn<S> + 'static,
+        I::SpawnObserved: IntoErasedSpawnObserved<S, I::Message> + 'static,
+        I::SpawnObservedRemote: IntoSimRemoteSpawnObserved<S, I::Message> + 'static,
+        I::Reply: 'static,
+        I::Fact: tina_runtime::IntoRuntimeFact + 'static,
+        Event: 'static,
+        Request: 'static,
+        Outbound: 'static,
+    {
+        let address = self
+            .register_with_mailbox_capacity::<I, tina::ServiceMessage<Event, Request>, Outbound>(
+                isolate,
+                mailbox_capacity,
+            );
+        SplitServiceHandle::from_address(address)
     }
 
     /// Configures a registered isolate as supervisor for its direct children.

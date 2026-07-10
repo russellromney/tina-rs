@@ -5,13 +5,13 @@
 //!
 //! - One per-shard `SessionBucket` isolate per shard. No router or
 //!   tracker isolate; the host routes by `ShardPlacement` and calls each
-//!   bucket directly through `ThreadedMultiShardRuntime::call_blocking`.
+//!   bucket directly through `ThreadedMultiShardRuntime::call_blocking_request`.
 //! - Runtime-owned `sleep_then` for the periodic expiry sweep. The sweep
 //!   reschedules itself on every tick — that is the "recurring timer."
 //! - `CallContext` for `Login` / `Touch` / `Logout` / `Stats` caller
 //!   authority.
-//! - `ThreadedMultiShardRuntime::call_blocking` for host-driven scenarios
-//!   on a chosen live shard (no per-test driver isolate).
+//! - `ThreadedMultiShardRuntime::call_blocking_request` for host-driven
+//!   scenarios on a chosen live shard (no per-test driver isolate).
 
 use std::collections::{BTreeMap, HashMap};
 use std::convert::Infallible;
@@ -328,7 +328,7 @@ impl Shard for AuthShard {
 }
 
 type AuthRuntime = ThreadedMultiShardRuntime<AuthShard, DefaultThreadedMailboxFactory>;
-type AuthAddr = Address<SessionAuthMsg, SessionAuthReply>;
+type AuthAddr = tina::ServiceRequestAddress<SessionAuthEvent, SessionAuthRequest, SessionAuthReply>;
 
 /// Host-side view. Wraps the multi-shard runtime, the placement map
 /// from token text to shard id, and one bucket address per shard.
@@ -361,7 +361,10 @@ impl AuthWorld {
                     SessionAuthMsg::Event(SessionAuthEvent::Bootstrap),
                 )
                 .map_err(|e| anyhow::anyhow!("register on shard {}: {e:?}", shard_id.get()))?;
-            addrs_by_shard.insert(*shard_id, addr);
+            addrs_by_shard.insert(
+                *shard_id,
+                tina::ServiceRequestAddress::from_call_address(addr.callable()),
+            );
         }
         Ok(Self {
             runtime,
@@ -386,12 +389,12 @@ impl AuthWorld {
     fn login(&self, user_id: String) -> anyhow::Result<SessionAuthReply> {
         let token = self.mint_token();
         let addr = self.addr_for(&token);
-        match self.runtime.call_blocking(
+        match self.runtime.call_blocking_request(
             addr,
-            SessionAuthMsg::Request(SessionAuthRequest::Login {
+            SessionAuthRequest::Login {
                 user_id,
                 token: token.clone(),
-            }),
+            },
             self.timeout,
         )? {
             CallOutcome::Replied(r) => Ok(r),
@@ -401,9 +404,9 @@ impl AuthWorld {
 
     fn touch(&self, token: SessionToken) -> anyhow::Result<SessionAuthReply> {
         let addr = self.addr_for(&token);
-        match self.runtime.call_blocking(
+        match self.runtime.call_blocking_request(
             addr,
-            SessionAuthMsg::Request(SessionAuthRequest::Touch { token }),
+            SessionAuthRequest::Touch { token },
             self.timeout,
         )? {
             CallOutcome::Replied(r) => Ok(r),
@@ -413,9 +416,9 @@ impl AuthWorld {
 
     fn logout(&self, token: SessionToken) -> anyhow::Result<SessionAuthReply> {
         let addr = self.addr_for(&token);
-        match self.runtime.call_blocking(
+        match self.runtime.call_blocking_request(
             addr,
-            SessionAuthMsg::Request(SessionAuthRequest::Logout { token }),
+            SessionAuthRequest::Logout { token },
             self.timeout,
         )? {
             CallOutcome::Replied(r) => Ok(r),
@@ -439,11 +442,10 @@ impl AuthWorld {
         };
         for (idx, shard_id) in self.shard_ids.iter().enumerate() {
             let addr = self.addrs_by_shard[shard_id];
-            match self.runtime.call_blocking(
-                addr,
-                SessionAuthMsg::Request(SessionAuthRequest::Stats),
-                self.timeout,
-            )? {
+            match self
+                .runtime
+                .call_blocking_request(addr, SessionAuthRequest::Stats, self.timeout)?
+            {
                 CallOutcome::Replied(SessionAuthReply::Stats(s)) => {
                     combined.active += s.active as usize;
                     combined.admitted += s.admitted;
